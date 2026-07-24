@@ -22,6 +22,15 @@ public class IsoExpoSelector {
     public static ArrayList<ExpoPair> fullpairs = new ArrayList<>();
     public static long lastSelectedExposure = 0;
 
+    // Shutter-Priority AE Curve Constants (Google Camera style)
+    private static final long HANDHELD_PHOTO_LIMIT = ExposureIndex.sec / 10;  // 1/10s
+    private static final long HANDHELD_MOTION_LIMIT = ExposureIndex.sec / 15; // 1/15s
+    private static final long HANDHELD_NIGHT_LIMIT = ExposureIndex.sec / 10;  // 1/10s
+
+    private static final long TRIPOD_PHOTO_LIMIT = ExposureIndex.sec;      // 1s
+    private static final long TRIPOD_NIGHT_LIMIT = ExposureIndex.sec;      // 1s
+    private static final long TRIPOD_MOTION_LIMIT = ExposureIndex.sec / 4; // 1/4s
+
     public static void setExpo(CaptureRequest.Builder builder, int step, CaptureController captureController) {
         Log.v(TAG, "InputParams: " +
                 "expo time:" + ExposureIndex.sec2string(ExposureIndex.time2sec(captureController.mPreviewExposureTime)) +
@@ -44,6 +53,39 @@ public class IsoExpoSelector {
         double compensation = Math.pow(2.0,PhotonCamera.getSettings().exposureCompensation);
         pair.normalizeiso100();
         pair.ExpoCompensateLower(1.0/compensation);
+
+        // Apply Shutter-Priority AE Curve (HDR+ E behavior)
+        CameraMode selectedMode = PhotonCamera.getSettings().selectedMode;
+        long handheldLimit;
+        long tripodLimit;
+
+        if (selectedMode == CameraMode.NIGHT) {
+            handheldLimit = HANDHELD_NIGHT_LIMIT;
+            tripodLimit = TRIPOD_NIGHT_LIMIT;
+        } else if (selectedMode == CameraMode.MOTION) {
+            handheldLimit = HANDHELD_MOTION_LIMIT;
+            tripodLimit = TRIPOD_MOTION_LIMIT;
+        } else {
+            handheldLimit = HANDHELD_PHOTO_LIMIT;
+            tripodLimit = TRIPOD_PHOTO_LIMIT;
+        }
+
+        // RAW video keeps its existing exposure behavior and must not inherit
+        // long tripod exposure ceilings intended for computational photos.
+        boolean tripodAllowed =
+                useTripod && selectedMode != CameraMode.RAWVIDEO;
+
+        long maxExposure = tripodAllowed ? tripodLimit : handheldLimit;
+
+        Log.d(TAG, "AE stability: mode=" + selectedMode
+                + " tripodDetected=" + useTripod
+                + " tripodAllowed=" + tripodAllowed
+                + " maxExposure="
+                + ExposureIndex.sec2string(
+                        ExposureIndex.time2sec(maxExposure)));
+
+        pair.applyShutterPriorityCurve(maxExposure);
+
         if (PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT)
         {
             mpy1 = 7000.0;
@@ -71,23 +113,12 @@ public class IsoExpoSelector {
             pair.denormalizeSystem();
             return pair;
         }
-        /*if (pair.exposure < ExposureIndex.sec / 40 && pair.normalizedIso() > 90.0/mpy1) {
-            pair.ReduceIso();
-        }
-        if (pair.exposure < ExposureIndex.sec / 13 && pair.normalizedIso() > 750.0/mpy1) {
-            pair.ReduceIso();
-        }
-        if (pair.exposure < ExposureIndex.sec / 8 && pair.normalizedIso() > 1500.0/mpy1) {
-            if (step != baseFrame || !PhotonCamera.getSettings().eisPhoto) pair.ReduceIso();
-        }
-        if (pair.exposure < ExposureIndex.sec / 8 && pair.normalizedIso() > 1500.0/mpy1) {
-            if (step != baseFrame || !PhotonCamera.getSettings().eisPhoto) pair.ReduceIso(1.25);
-        }*/
+
         if (pair.normalizedIso() >= 12700.0/mpy1) {
             pair.ReduceIso();
         }
         if (useTripod) {
-            pair.UseIso(Math.max(pair.isoanalog/6.0,101));
+            // pair.UseIso(Math.max(pair.isoanalog/6.0,101)); // Replaced by applyShutterPriorityCurve
         }
 
         double currentManExp = captureController.getParamController().getCurrentExposureValue();
@@ -139,20 +170,7 @@ public class IsoExpoSelector {
         if (pair.exposure < ExposureIndex.sec / 90 && PhotonCamera.getSettings().eisPhoto) {
             //HDR = true;
         }
-        if (step%patternSize != 0 && HDR) {
-            if (pair.normalizedIso() <= 240.0/mpy1 && pair.exposure > ExposureIndex.sec / 70.0/mpy1 && PhotonCamera.getSettings().eisPhoto) {
-                pair.ReduceExpo();
-            }
-            if (pair.normalizedIso() <= 500.0/mpy1 && pair.exposure > ExposureIndex.sec / 50.0/mpy1 && PhotonCamera.getSettings().eisPhoto) {
-                pair.ReduceExpo();
-            }
-            if (pair.exposure < ExposureIndex.sec * 3.00 && pair.exposure > ExposureIndex.sec / 3 && pair.normalizedIso() < 3200.0/mpy1 && PhotonCamera.getSettings().eisPhoto) {
-                pair.FixedExpo(1.0 / 8);
-                if (pair.exposure > ExposureIndex.sec / 3) pair.ReduceExpo();
-                if (pair.normalizeCheck())
-                    PhotonCamera.showToast("Wrong parameters: iso:" + pair.iso + " exp:" + pair.exposure);
-            }
-        }
+        
         if(step != -1) {
             if (step == 0) pairs.clear();
             if (pairs.size() < patternSize) {
@@ -314,6 +332,34 @@ public class IsoExpoSelector {
                 }
             }
         }
+
+        /**
+         * Redistributes total exposure energy using a Shutter-Priority strategy.
+         * Prioritizes increasing exposure time up to maxExposure before increasing ISO.
+         */
+        public void applyShutterPriorityCurve(long maxExposure) {
+            double totalExposureEnergy = (double) exposure * iso;
+            
+            // Step 1: Set ISO to minimum to prioritize photon capture quality
+            // Note: 100 is the base for normalized ISO (corresponds to sensor's isolow)
+            iso = 100; 
+            
+            // Step 2: Calculate required exposure time at minimum ISO
+            exposure = (long) (totalExposureEnergy / iso);
+            
+            // Step 3: If calculated exposure exceeds limit, cap it and increase ISO
+            if (exposure > maxExposure) {
+                exposure = Math.min(maxExposure, exposurehigh);
+                iso = (int) (totalExposureEnergy / exposure);
+            }
+            
+            // Final safety normalization
+            normalize();
+            Log.v("IsoExpoSelector", "Applied Curve: Energy=" + (long)totalExposureEnergy + 
+                " -> Result: Exp=" + ExposureIndex.sec2string(ExposureIndex.time2sec(exposure)) + 
+                " ISO=" + iso);
+        }
+
         public void ExpoCompensateLowerExpo(double k) {
             iso /= k;
             if (normalizeCheck()) {
@@ -350,7 +396,7 @@ public class IsoExpoSelector {
         }
 
         public void MinIso() {
-            UseIso(101);
+            UseIso(100);
         }
 
         public void UseIso(double isoUsed) {

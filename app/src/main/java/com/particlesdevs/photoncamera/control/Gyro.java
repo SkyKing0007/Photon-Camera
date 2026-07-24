@@ -363,8 +363,11 @@ public class Gyro {
         }
         return output;
     }
-    public boolean getTripod(){
-        return (tripodShakiness < 25) && PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT;
+    public boolean getTripod() {
+        // Report physical device stability independently of the selected mode.
+        // Each camera mode decides separately how much additional exposure
+        // time it is allowed to use while the phone is tripod-stable.
+        return tripodShakiness < 25;
     }
 
     private void updateOrientationHistory() {
