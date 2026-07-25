@@ -15,6 +15,7 @@ out vec4 Output;
 #define KERNELSIZE 3.5
 #define MSIZE 15
 #define KSIZE (MSIZE-1)/2
+#define KSIZE_SMALL 3
 #define TRANSPOSE 1
 #define INSIZE 1,1
 #define NRcancell (0.90)
@@ -27,6 +28,7 @@ out vec4 Output;
 #define MOIRE 1.0
 #define LUMA 0.0
 #define SHADOWBOOST 0.5
+#define CHROMASTRENGTH 1.0
 #define PI 3.1415926535897932384626433832795
 
 float normpdf(in float x, in float sigma)
@@ -83,18 +85,45 @@ void main() {
     //chromaDiff *= (length(chromaDiff)/(length(chromaDiff)+sigY*64.0));
     chromaDiff *= max(abs(xDelta),abs(yDelta));
     float chromaNoise = max(chromaDiff.r,max(chromaDiff.g,chromaDiff.b))-min(chromaDiff.r,min(chromaDiff.g,chromaDiff.b));
-    float sigZ = max(sigY,min(abs(chromaNoise)*MOIRE,0.2));
+    float sigZ = max(sigY,min(abs(chromaNoise)*MOIRE,0.2)) * CHROMASTRENGTH;
     //sigY += min(abs(chromaNoise)/32.0,0.2);
+
+    // === Edge-aware adaptive kernel ===
+    // Pre-scan: check the perimeter of the kernel for color boundaries.
+    // If any perimeter pixel has RGB distance > threshold from center,
+    // shrink the kernel to KSIZE_SMALL to preserve the color edge.
+    // Noise-adaptive threshold: 3x the noise level
+    float edgeThreshold = max(sqrt(sigY) * 3.0, 0.05);
+    int effectiveKSIZE = KSIZE;
+    bool edgeDetected = false;
+
+    // Check perimeter pixels at KSIZE distance (top, bottom, left, right, diagonals)
+    for (int i = -KSIZE; i <= KSIZE; i += max(KSIZE, 1)) {
+        for (int j = -KSIZE; j <= KSIZE; j += max(KSIZE, 1)) {
+            if (i == 0 && j == 0) continue;
+            vec3 neighbor = texelFetch(InputBuffer, xy + ivec2(i, j), 0).rgb;
+            float dist = length(abs(neighbor - cin));
+            if (dist > edgeThreshold) {
+                edgeDetected = true;
+                break;
+            }
+        }
+        if (edgeDetected) break;
+    }
+
+    if (edgeDetected) {
+        effectiveKSIZE = KSIZE_SMALL;
+    }
+
     float Z = 0.01f;
     float Z2 = 0.01f;
     final_colour += cin*Z;
     final_colour2 += cin*Z;
-    //sigY /= 25.0;
-    // Use hybrid SNN filtering to denoise the image
-    //vec3 cc[4];
-    for (int i=0; i <= KSIZE; ++i)
+
+    // SNN filtering with adaptive kernel size
+    for (int i=0; i <= effectiveKSIZE; ++i)
     {
-        for (int j=0; j <= KSIZE; ++j)
+        for (int j=0; j <= effectiveKSIZE; ++j)
         {
             ivec2 pos = ivec2(i,j);
             ivec2 pos2 = ivec2(-i,-j);
@@ -104,7 +133,7 @@ void main() {
             vec3 cc1 = vec3(texelFetch(InputBuffer, xy+pos2, 0).rgb);
             vec3 cc2 = vec3(texelFetch(InputBuffer, xy+pos3, 0).rgb);
             vec3 cc3 = vec3(texelFetch(InputBuffer, xy+pos4, 0).rgb);
-            // Compute the weights
+            // Compute the weights - full RGB distance (preserves color boundaries)
             vec4 d = vec4(length(abs(cc0-cin)),length(abs(cc1-cin)),length(abs(cc2-cin)),length(abs(cc3-cin)));
             vec4 w = (1.0-d*d/(d*d + sigY));
             vec4 w2 = (1.0-d*d/(d*d + sigZ));
@@ -123,15 +152,10 @@ void main() {
         }
     }
 
-    //if (Z <= 0.002f) {
-    //    Output = vec4(cin,1.0);
-    //} else {
     float br = dot(final_colour/Z,vec3(0.25,0.5,0.25));
     br = mix(dot(cin,vec3(0.25,0.5,0.25)),br,LUMA);
     vec3 resColour = final_colour2/Z2;
     resColour /= max(1e-6,dot(resColour,vec3(0.25,0.5,0.25)));
     resColour = clamp(resColour*br,0.0,1.0);
     Output = vec4(resColour,1.0);
-    //Output = vec4(final_colour/Z,1.0);
-    //}
 }

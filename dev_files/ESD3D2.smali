@@ -26,23 +26,11 @@
     .end annotation
 .end field
 
-.field shadowBoost:F
-    .annotation runtime Lcom/particlesdevs/photoncamera/settings/annotations/Tunable;
-        category = "Denoise"
-        defaultValue = 0.5f
-        description = "Boost denoising in deep shadows to prevent noise amplification after tonemap"
-        max = 2.0f
-        min = 0.0f
-        step = 0.01f
-        title = "Shadow Boost"
-    .end annotation
-.end field
-
 .field maxSize:I
     .annotation runtime Lcom/particlesdevs/photoncamera/settings/annotations/Tunable;
         category = "Denoise"
-        defaultValue = 21.0f
-        description = "Maximum kernel size for denoising"
+        defaultValue = 9.0f
+        description = "Maximum kernel size for denoising. Lower preserves more color (9 recommended)"
         max = 51.0f
         min = 1.0f
         step = 1.0f
@@ -93,6 +81,18 @@
     .end annotation
 .end field
 
+.field shadowBoost:F
+    .annotation runtime Lcom/particlesdevs/photoncamera/settings/annotations/Tunable;
+        category = "Denoise"
+        defaultValue = 0.5f
+        description = "Boost denoising in deep shadows to prevent noise amplification after tonemap"
+        max = 2.0f
+        min = 0.0f
+        step = 0.01f
+        title = "Shadow Boost"
+    .end annotation
+.end field
+
 .field useColorDenoising:Z
     .annotation runtime Lcom/particlesdevs/photoncamera/settings/annotations/Tunable;
         category = "Denoise"
@@ -105,6 +105,18 @@
     .end annotation
 .end field
 
+.field chromaStrength:F
+    .annotation runtime Lcom/particlesdevs/photoncamera/settings/annotations/Tunable;
+        category = "Denoise"
+        defaultValue = 1.0f
+        description = "Chroma denoise strength. Lower preserves more color (try 0.3-0.7)"
+        max = 1.0f
+        min = 0.0f
+        step = 0.05f
+        title = "Chroma Strength"
+    .end annotation
+.end field
+
 
 # virtual methods
 .method public final c()V
@@ -114,7 +126,7 @@
 .end method
 
 .method public final d()V
-    .locals 10
+    .locals 15
 
     iget-boolean v0, p0, Lcom/particlesdevs/photoncamera/processing/opengl/postpipeline/ESD3D2;->enable:Z
 
@@ -238,6 +250,22 @@
 
     mul-float/2addr v0, v5
 
+    iget-object v10, p0, Lcom/particlesdevs/photoncamera/processing/opengl/nodes/Node;->i:Lcom/particlesdevs/photoncamera/processing/opengl/GLProg;
+
+    iget v11, p0, Lcom/particlesdevs/photoncamera/processing/opengl/postpipeline/ESD3D2;->chromaStrength:F
+
+    const/4 v12, 0x1
+
+    new-array v12, v12, [F
+
+    const/4 v13, 0x0
+
+    aput v11, v12, v13
+
+    const-string v11, "CHROMASTRENGTH"
+
+    invoke-virtual {v10, v11, v12}, Lcom/particlesdevs/photoncamera/processing/opengl/GLProg;->l(Ljava/lang/String;[F)V
+
     invoke-virtual {p0, v4, v3, v2, v0}, Lcom/particlesdevs/photoncamera/processing/opengl/postpipeline/ESD3D2;->k(Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;FF)V
 
     iget-object v0, p0, Lcom/particlesdevs/photoncamera/processing/opengl/nodes/Node;->f:Lcom/particlesdevs/photoncamera/processing/opengl/GLBasePipeline;
@@ -280,6 +308,22 @@
 
     iget-object v4, v4, Lcom/particlesdevs/photoncamera/processing/opengl/nodes/Node;->a:Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;
 
+    iget-object v10, v3, Lcom/particlesdevs/photoncamera/processing/opengl/nodes/Node;->i:Lcom/particlesdevs/photoncamera/processing/opengl/GLProg;
+
+    iget v11, v3, Lcom/particlesdevs/photoncamera/processing/opengl/postpipeline/ESD3D2;->chromaStrength:F
+
+    const/4 v12, 0x1
+
+    new-array v12, v12, [F
+
+    const/4 v13, 0x0
+
+    aput v11, v12, v13
+
+    const-string v11, "CHROMASTRENGTH"
+
+    invoke-virtual {v10, v11, v12}, Lcom/particlesdevs/photoncamera/processing/opengl/GLProg;->l(Ljava/lang/String;[F)V
+
     invoke-virtual {p0, v4, v0, v2, v1}, Lcom/particlesdevs/photoncamera/processing/opengl/postpipeline/ESD3D2;->k(Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;FF)V
 
     iget-object v0, v3, Lcom/particlesdevs/photoncamera/processing/opengl/nodes/Node;->f:Lcom/particlesdevs/photoncamera/processing/opengl/GLBasePipeline;
@@ -310,6 +354,20 @@
     iput-object v2, v3, Lcom/particlesdevs/photoncamera/processing/opengl/nodes/Node;->a:Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;
 
     iget v4, v3, Lcom/particlesdevs/photoncamera/processing/opengl/postpipeline/ESD3D2;->moire:F
+
+    iget-object v10, v3, Lcom/particlesdevs/photoncamera/processing/opengl/nodes/Node;->i:Lcom/particlesdevs/photoncamera/processing/opengl/GLProg;
+
+    const-string v11, "CHROMASTRENGTH"
+
+    const/4 v12, 0x1
+
+    new-array v12, v12, [F
+
+    const/4 v13, 0x0
+
+    aput v1, v12, v13
+
+    invoke-virtual {v10, v11, v12}, Lcom/particlesdevs/photoncamera/processing/opengl/GLProg;->l(Ljava/lang/String;[F)V
 
     invoke-virtual {p0, v0, v2, v4, v1}, Lcom/particlesdevs/photoncamera/processing/opengl/postpipeline/ESD3D2;->k(Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;Lcom/particlesdevs/photoncamera/processing/opengl/GLTexture;FF)V
 

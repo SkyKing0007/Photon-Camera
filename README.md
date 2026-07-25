@@ -646,6 +646,83 @@ apksigner sign --ks my-key.jks --out signed.apk modified.apk
 
 ---
 
+---
+
+## v6 Modifications — 2026-07-25
+
+Working modifications applied to PhotonCamera HDR v6, tested and confirmed on device.
+
+### Problem Identified
+
+When "Use Color Denoising" toggle is ON, the ESD3D2 low-resolution denoise pass destroys color information. Teal text appears grey; other colors are desaturated. The root cause was traced through iterative testing:
+
+1. **Guided upsample was NOT the cause** — confirmed by bypassing it with nearest-neighbor upsampling (color still lost)
+2. **ESD3D2 SNN filter at low resolution WAS the cause** — the21×21 kernel (MSIZE=21) spanned color boundaries, and the min(w) subtraction + re-normalization caused instability across those boundaries
+3. **Luma-only SNN weights made it WORSE** — teal and white have similar luminance, so luma-only distance reduced the filter's ability to reject dissimilar colors
+
+### Working Changes
+
+#### 1. Edge-Aware Adaptive Kernel (`esd3d2.glsl`)
+
+Added pre-scan before the SNN loop to detect color boundaries:
+
+- Scans 8 perimeter pixels at KSIZE distance from center
+- Edge threshold: `3 × sqrt(sigY)`, minimum 0.05
+- If any perimeter pixel has RGB distance > threshold → kernel shrinks to KSIZE_SMALL (3)
+- No edge → kernel stays at full MSIZE (denoises flat areas)
+
+This preserves teal text (edge detected → small kernel) while still denoising flat wall surfaces (no edge → full kernel).
+
+#### 2. Max Kernel Default Reduced (`ESD3D2.smali`)
+
+Changed default `maxSize` from 21 to 9 in the @Tunable annotation. Smaller default reduces cross-boundary averaging. Users can still increase via tunables.
+
+#### 3. Chroma Strength Tunable (`ESD3D2.smali` + `esd3d2.glsl`)
+
+Added `chromaStrength` @Tunable field (default 1.0, range 0-1, step 0.05). Injected as `CHROMASTRENGTH` define per-pass:
+- Low-res pass: uses the tunable value
+- Full-res pass: always uses 1.0
+
+Multiplied onto `sigZ` in the shader: `sigZ = max(sigY, min(|chromaDiff|×MOIRE, 0.2)) × CHROMASTRENGTH`
+
+#### 4. Guided Upsample: Noise-Adaptive Regularization (`guidedupsample.glsl`)
+
+Replaced hardcoded `varThreshold = 0.001` with noise-adaptive value:
+```
+varThreshold = 0.1 × (noiseS × avgLuma + noiseO)
+```
+
+This adapts to actual sensor noise levels instead of using a fixed threshold. The 0.1 multiplier was tuned to match the original sharpness while providing better noise handling.
+
+### Changes That Did NOT Work (Reverted)
+
+| Change | Why It Failed |
+|--------|---------------|
+| Luma-only SNN weights | Reduced distance between teal and white (similar luma), causing MORE color averaging |
+| 5×5 guided upsample window | Spanned color boundaries at SCALE=4 (covers 20×20 full-res pixels) |
+| Noise-aware kernel weighting (1/(luma²×noiseS+noiseO)) | Gave dark pixels too much influence, pulling color toward grey |
+| Shadow protection 0.001→0.02 | Too wide, caused blurring in shadow areas |
+| Outlier rejection re-enabled | Over-smoothed, caused sharpness loss |
+
+### Key Finding
+
+The SNN filter's `min(w)` subtraction + re-normalization is inherently unstable at large kernel sizes when crossing color boundaries. The full RGB distance metric is correct for color preservation (rejects dissimilar colors). The fix is to keep the kernel small near edges rather than changing the distance metric.
+
+### Files Modified
+
+- `dev_files/esd3d2.glsl` — Edge-aware adaptive kernel + CHROMASTRENGTH
+- `dev_files/guidedupsample.glsl` — 3×3 window + noise-adaptive regularization
+- `dev_files/ESD3D2.smali` — chromaStrength tunable, maxSize=9, CHROMASTRENGTH per-pass injection
+
+### Build Info
+
+- Apktool 2.10.0 for decompilation/recompilation
+- Android SDK Build-Tools 34.0.0 for zipalign + apksigner (v2/v3 signing)
+- Temurin JDK 17.0.13
+- All modifications via smali editing (no Java recompilation)
+
+---
+
 ## License
 
 This is a reverse engineering analysis for educational and modification purposes.
