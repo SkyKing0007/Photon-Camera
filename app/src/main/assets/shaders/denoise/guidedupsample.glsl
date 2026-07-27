@@ -11,6 +11,19 @@ uniform float noiseO;
 out vec3 Output;
 #import interpolation
 #import median
+
+/*
+ * Guided Upsample v10 — 3x3 window + noise-adaptive regularization
+ *
+ * Original: 3x3 window, hardcoded varThreshold = 0.001
+ * v2-v8: 5x5 window — too large, caused color desaturation on small features
+ * v10: 3x3 window (matches original size) + noise-adaptive regularization
+ *
+ * The5x5 window spanned both teal text and white background even at text center,
+ * causing the regression to fit mixed data and desaturate colors.
+ * 3x3 is small enough to stay within color boundaries for most pixels.
+ */
+
 void computeAB(ivec2 center, out vec3 a, out vec3 b) {
     float momentX  = 0.0;
     vec3  momentY  = vec3(0.0);
@@ -37,9 +50,15 @@ void computeAB(ivec2 center, out vec3 a, out vec3 b) {
     vec3  meanY = momentY * invWs;
     vec3  covXY = momentXY * invWs - meanX * meanY;
     float varX  = momentX2 * invWs - meanX * meanX;
+
+    // Noise-adaptive regularization (replaces hardcoded 0.001)
+    // Uses actual noise level: noiseS * avgLuma + noiseO
+    float avgLuma = clamp(meanX, 0.0, 1.0);
+    float noiseVar = noiseS * avgLuma + noiseO;
+    float varThreshold = noiseVar * 0.1;
+
     // When variance is too low the guide provides no useful signal,
     // so blend linearly toward a=0 (output = meanY) to avoid instability.
-    float varThreshold = 0.001;
     float varWeight    = varX / (varX + varThreshold);
     a = varWeight * covXY / (varX + varThreshold);
     b = meanY - a * meanX;
@@ -82,13 +101,14 @@ void main() {
     float dev = abs(centerDiff - medianDiff);
 
     float br = dot(Output, vec3(1.0/3.0));
-    float noise = sqrt(noiseS * br + noiseO);
     float guideBr = dot(guideCenter, vec3(1.0/3.0));
-    if (dev > threshold) {
-        //guideBr = guideBr - medianDiff;
+    float shadowBlend = smoothstep(0.0, 0.001, guideBr);
+    guideBr = mix(br, guideBr, shadowBlend);
+
+    // In extremely dark areas only, reduce guide influence to prevent color noise
+    // (original behavior preserved)
+    if (br > 1e-6) {
+        Output = (Output / br) * guideBr;
     }
-    //float pd = exp(((centerDiff - medianDiff)*(centerDiff - medianDiff))/(-2.0*noise*noise));
-    //guideBr = mix(br, guideBr, pd);
-    Output = (Output/br) * guideBr;
-    //Output = abs(textureLinear(Guide, gl_FragCoord.xy / vec2(size)).rgb - guideCenter);
+    Output = clamp(Output, 0.0, 1.0);
 }

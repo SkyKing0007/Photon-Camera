@@ -21,7 +21,7 @@ out vec4 result;
 #define UPPERLIM 2.5
 #define OVEREXPOSEMPY 1.0
 #define PI (3.1415926535)
-#define GAMMAFACTOR 0.92
+#define GAMMAFACTOR 0.78
 #define EPS 1e-6
 #import interpolation
 
@@ -48,11 +48,11 @@ float stddev(vec3 XYZ) {
 }
 
 float aces(float x) {
-    const float a = 2.51;
-    const float b = 0.03;
-    const float c = 2.43;
-    const float d = 0.59;
-    const float e = 0.14;
+    const float a = 2.0;
+    const float b = 0.10;
+    const float c = 2.0;
+    const float d = 0.60;
+    const float e = 0.20;
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), 0.0, 1.0);
 }
 

@@ -12,6 +12,28 @@ import com.particlesdevs.photoncamera.util.Math2;
 import org.w3c.dom.Text;
 
 public class ESD3D2 extends Node {
+    @Tunable(
+            title = "Chroma Strength",
+            category = "Denoise",
+            defaultValue = 1.0f,
+            min = 0.0f,
+            max = 1.0f,
+            step = 0.05f,
+            description = "Chroma denoise strength. Lower preserves more color (try 0.3-0.7)"
+    )
+    float chromaStrength = 1.0f;
+
+    @Tunable(
+            title = "Shadow Boost",
+            category = "Denoise",
+            defaultValue = 0.5f,
+            min = 0.0f,
+            max = 2.0f,
+            step = 0.01f,
+            description = "Boost denoising in deep shadows to prevent noise amplification after tonemap"
+    )
+    float shadowBoost = 0.5f;
+
     boolean needClose = false;
     public ESD3D2(boolean closing) {
         super("", "ES3D");
@@ -68,6 +90,8 @@ public class ESD3D2 extends Node {
             glProg.setDefine("NOISEO", NoiseO);
             glProg.setDefine("MOIRE", moire);
             glProg.setDefine("LUMA", luma);
+            glProg.setDefine("CHROMASTRENGTH", chromaStrength);
+            glProg.setDefine("SHADOWBOOST", shadowBoost);
 
             glProg.setDefine("INSIZE", basePipeline.mParameters.rawSize);
             //float ks = 1.0f + Math.min((basePipeline.noiseS+basePipeline.noiseO) * 3.0f * noiseToKernelSize, 34.f);

@@ -57,8 +57,8 @@ void main() {
     float highWeight = 1000.;
 
     // Factor 1: Well-exposedness.
-    vec3 midNormalToAvg = sqrt(unscaledGaussian(midNormal - 0.35, 0.50));
-    vec3 midHighToAvg = sqrt(unscaledGaussian(midHigh - 0.35, 0.50));
+    vec3 midNormalToAvg = sqrt(unscaledGaussian(midNormal - 0.45, 0.50));
+    vec3 midHighToAvg = sqrt(unscaledGaussian(midHigh - 0.45, 0.50));
 
     normalWeight *= midNormalToAvg.x * midNormalToAvg.y * midNormalToAvg.z;
     highWeight *= midHighToAvg.x * midHighToAvg.y * midHighToAvg.z;

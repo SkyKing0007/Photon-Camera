@@ -59,8 +59,8 @@ void main() {
 
     // Factor 1: Well-exposedness.
 
-    vec3 midNormalToAvg = sqrt(unscaledGaussian(vec3(midNormal.r,(midNormal.g+midNormal.b)/2.0,midNormal.a) - 0.35, 0.50));
-    vec3 midHighToAvg = sqrt(unscaledGaussian(vec3(midHigh.r,(midHigh.g+midHigh.b)/2.0,midHigh.a) - 0.35, 0.50));
+    vec3 midNormalToAvg = sqrt(unscaledGaussian(vec3(midNormal.r,(midNormal.g+midNormal.b)/2.0,midNormal.a) - 0.45, 0.50));
+    vec3 midHighToAvg = sqrt(unscaledGaussian(vec3(midHigh.r,(midHigh.g+midHigh.b)/2.0,midHigh.a) - 0.45, 0.50));
 
     normalWeight *= midNormalToAvg.r * midNormalToAvg.g * midNormalToAvg.b;
     highWeight *= midHighToAvg.r * midHighToAvg.g * midHighToAvg.b;

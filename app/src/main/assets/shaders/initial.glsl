@@ -39,7 +39,7 @@ out vec3 Output;
 #define INSIZE 1,1
 #define NEUTRALPOINT 0.0,0.0,0.0
 #define SATURATION 0.0
-#define SATURATION2 1.0
+#define SATURATION2 1.35
 #define PI (3.1415926535)
 #define DYNAMICBL (0.0, 0.0, 0.0)
 #define PRECISION (64.0)
@@ -52,8 +52,8 @@ out vec3 Output;
 #define TONEMAPX2 2.55
 #define TONEMAPX3 -1.6
 #define SATURATIONC 1.0
-#define SATURATIONGAUSS 1.50
-#define SATURATIONRED 0.7
+#define SATURATIONGAUSS 0.80
+#define SATURATIONRED 0.85
 #define EPS (0.0008)
 #define FUSIONGAIN 1.0
 #define FUSION 0
@@ -348,6 +348,7 @@ vec3 saturate(vec3 rgb, float sat2, float sat) {
     float b = rgb.b;
     float br = (r+g+b)/3.0;
     float dfsat = mix(sat2,sat,br*br);
+    dfsat *= 1.17; // HARDCODED saturation boost
     vec3 hsv = rgb2hsv(vec3(rgb.r,rgb.g,rgb.b));
     /*if(hsv.g < 0.5-0.0){
         hsv.g *= mix(1.0,dfsat,hsv.g/(0.5-0.0));
@@ -359,7 +360,7 @@ vec3 saturate(vec3 rgb, float sat2, float sat) {
     //hsv.g *= mix(dfsat,1.0,abs(hsv.g-0.5)/0.1);
     hsv.g *= dfsat;*/
     //hsv.g *= dfsat;
-    hsv.g = reinhard_mono(hsv.g*dfsat, max(1.0,dfsat*0.7));
+    hsv.g = clamp(hsv.g * dfsat, 0.0, 1.0);
     //hsv.g *= SATURATIONC+unscaledGaussian(abs(hsv.g),SATURATIONGAUSS)*(dfsat*1.07-1.0);
     rgb = hsv2rgb(hsv);
     rgb.r = mix((rgb.r+br)/2.0,rgb.r,SATURATIONRED);
