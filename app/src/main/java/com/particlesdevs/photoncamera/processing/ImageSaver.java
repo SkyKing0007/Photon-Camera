@@ -15,6 +15,7 @@ import androidx.exifinterface.media.ExifInterface;
 import com.particlesdevs.photoncamera.api.ParseExif;
 import com.particlesdevs.photoncamera.control.GyroBurst;
 import com.particlesdevs.photoncamera.processing.render.Parameters;
+import com.particlesdevs.photoncamera.processing.ultrahdr.UltraHdrSaver;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -120,9 +121,16 @@ public class ImageSaver {
             exifData.COMPRESSION = String.valueOf(jpgQuality);
             try {
                 OutputStream outputStream = Files.newOutputStream(fileToSave);
-                img.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
-                outputStream.flush();
+                boolean savedAsUltraHdr = UltraHdrSaver.save(img, outputStream, 95);
                 outputStream.close();
+
+                if (!savedAsUltraHdr) {
+                    outputStream = Files.newOutputStream(fileToSave);
+                    img.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
+                    outputStream.flush();
+                    outputStream.close();
+                }
+
                 img.recycle();
                 ExifInterface inter = ParseExif.setAllAttributes(fileToSave.toFile(), exifData);
                 inter.saveAttributes();
