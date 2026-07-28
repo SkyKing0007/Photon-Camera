@@ -226,7 +226,7 @@ public class Parameters {
         exposureTime = ExposureIndex.time2sec(exposure);
 
         int[] blarr = new int[4];
-        BlackLevelPattern level = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+        BlackLevelPattern level = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
         if (result != null) {
             boolean isHuawei = Build.BRAND.equals("Huawei");
 
@@ -317,7 +317,7 @@ public class Parameters {
     public float[] customNeutral;
 
     public void ReCalcColor(boolean customNeutr, CaptureResult result) {
-        CameraCharacteristics characteristics = CaptureController.mCameraCharacteristics;
+        CameraCharacteristics characteristics = CaptureController.getActiveCameraCharacteristics();
         Rational[] neutralR = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT);
         if (!customNeutr)
             for (int i = 0; i < neutralR.length; i++) {

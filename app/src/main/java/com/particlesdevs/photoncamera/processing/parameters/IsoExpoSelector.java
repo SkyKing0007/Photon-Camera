@@ -72,7 +72,7 @@ public class IsoExpoSelector {
     ) {
         try {
             CameraCharacteristics characteristics =
-                    CaptureController.mCameraCharacteristics;
+                    CaptureController.getActiveCameraCharacteristics();
 
             if (characteristics == null) {
                 return Double.NaN;
@@ -489,7 +489,7 @@ public class IsoExpoSelector {
     }
 
     private static int getISOHIGH() {
-        Object key = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+        Object key = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
         if (key == null) return 3200;
         else {
             return (int) ((Range) (key)).getUpper();
@@ -501,14 +501,14 @@ public class IsoExpoSelector {
     }
 
     private static int getISOLOW() {
-        Object key = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+        Object key = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
         if (key == null) return 100;
         else {
             return (int) ((Range) (key)).getLower();
         }
     }
     public static int getISOAnalog() {
-        Object key = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY);
+        Object key = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY);
         if (key == null) return 100;
         else {
             return (int)(key);
@@ -520,7 +520,7 @@ public class IsoExpoSelector {
     }
 
     public static long getEXPHIGH() {
-        Object key = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+        Object key = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
         if (key == null) return ExposureIndex.sec;
         else {
             return (long) ((Range) (key)).getUpper();
@@ -528,7 +528,7 @@ public class IsoExpoSelector {
     }
 
     public static long getEXPLOW() {
-        Object key = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+        Object key = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
         if (key == null) return ExposureIndex.sec / 1000;
         else {
             return (long) ((Range) (key)).getLower();

@@ -62,14 +62,14 @@ public class Camera2ApiAutoFix {
     }
 
     public static void Init() {
-        Camera2ApiAutoFix fix = new Camera2ApiAutoFix(CaptureController.mCameraCharacteristics);
+        Camera2ApiAutoFix fix = new Camera2ApiAutoFix(CaptureController.getActiveCameraCharacteristics());
         fix.ExposureTime();
         fix.ExposureCompensation();
         fix.ISO();
     }
 
     public static void Apply() {
-        CameraCharacteristics characteristics = CaptureController.mCameraCharacteristics;
+        CameraCharacteristics characteristics = CaptureController.getActiveCameraCharacteristics();
         Camera2ApiAutoFix fix = new Camera2ApiAutoFix(characteristics);
         fix.MaxRegionsAF();
     }
@@ -104,7 +104,7 @@ public class Camera2ApiAutoFix {
     }
 
     public void curve() {
-        CameraReflectionApi.set(CaptureController.mCameraCharacteristics, TONEMAP_MAX_CURVE_POINTS, 128);
+        CameraReflectionApi.set(CaptureController.getActiveCameraCharacteristics(), TONEMAP_MAX_CURVE_POINTS, 128);
     }
 
     boolean checkdouble(double in) {
@@ -190,7 +190,7 @@ public class Camera2ApiAutoFix {
     }
     private void ExposureCompensation(){
         Range nrange = new Range(-24, 24);
-        CameraReflectionApi.set(CaptureController.mCameraCharacteristics, CONTROL_AE_COMPENSATION_RANGE,nrange);
+        CameraReflectionApi.set(CaptureController.getActiveCameraCharacteristics(), CONTROL_AE_COMPENSATION_RANGE,nrange);
     }
 
     /*public static void patchWL(CameraCharacteristics characteristics,
@@ -216,7 +216,7 @@ public class Camera2ApiAutoFix {
     public static void WhiteLevel(CaptureResult res, int whitelevel) {
         if (res != null)
             CameraReflectionApi.set(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL, whitelevel);
-        CameraReflectionApi.set(CaptureController.mCameraCharacteristics, CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL, whitelevel);
+        CameraReflectionApi.set(CaptureController.getActiveCameraCharacteristics(), CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL, whitelevel);
     }
 
     public static void BlackLevel(CameraCharacteristics characteristics, CaptureResult res, int[] blacklevel) {
@@ -228,7 +228,7 @@ public class Camera2ApiAutoFix {
                 levelArr[i] = (int) (blacklevel[i]);
             }
             CameraReflectionApi.PatchBL(blackLevel, levelArr);
-            CameraReflectionApi.set(CaptureController.mCameraCharacteristics, CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN, blackLevel);
+            CameraReflectionApi.set(CaptureController.getActiveCameraCharacteristics(), CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN, blackLevel);
         }
 
         float[] dynBL = res.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL);
@@ -307,7 +307,7 @@ public class Camera2ApiAutoFix {
     @SuppressLint("NewApi")
     public void BL() {
         float[] level = result.get(SENSOR_DYNAMIC_BLACK_LEVEL);
-        BlackLevelPattern ptr = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+        BlackLevelPattern ptr = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
         if (ptr == null) return;
         if (level == null) {
             level = new float[4];
@@ -330,13 +330,13 @@ public class Camera2ApiAutoFix {
         Camera2ApiAutoFix.Apply();
 //        captureBuilder.set(CONTROL_AE_MODE, CONTROL_AE_MODE_ON);
         //captureBuilder.set(COLOR_CORRECTION_MODE,COLOR_CORRECTION_MODE_HIGH_QUALITY);
-        int[] stabilizationModes = CaptureController.mCameraCharacteristics.get(LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION);
+        int[] stabilizationModes = CaptureController.getActiveCameraCharacteristics().get(LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION);
         if (stabilizationModes != null && stabilizationModes.length > 1) {
             Log.d(TAG, "LENS_OPTICAL_STABILIZATION_MODE");
 //            captureBuilder.set(LENS_OPTICAL_STABILIZATION_MODE, LENS_OPTICAL_STABILIZATION_MODE_OFF);//Fix ois bugs for preview and burst
             captureBuilder.set(LENS_OPTICAL_STABILIZATION_MODE, LENS_OPTICAL_STABILIZATION_MODE_ON);//Fix ois bugs for preview and burst
         }
         //captureBuilder.set(CONTROL_AE_EXPOSURE_COMPENSATION,-1);
-        Range<Integer> range = CaptureController.mCameraCharacteristics.get(CONTROL_AE_COMPENSATION_RANGE);
+        Range<Integer> range = CaptureController.getActiveCameraCharacteristics().get(CONTROL_AE_COMPENSATION_RANGE);
     }
 }

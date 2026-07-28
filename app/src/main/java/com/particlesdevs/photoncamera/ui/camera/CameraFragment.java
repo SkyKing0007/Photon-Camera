@@ -436,7 +436,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
 
     private RectF getScreenRectFromMeteringRect(MeteringRectangle meteringRectangle) {
         if (captureController.mImageReaderPreview == null) return new RectF();
-        Size size = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+        Size size = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
         if (size == null) {
             size = new Size(captureController.mImageReaderPreview.getWidth(), captureController.mImageReaderPreview.getHeight());
         }

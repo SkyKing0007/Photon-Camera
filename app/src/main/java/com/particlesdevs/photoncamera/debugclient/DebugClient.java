@@ -151,7 +151,7 @@ public class DebugClient {
         CaptureController controller = PhotonCamera.getCaptureController();
         ArrayList<CaptureRequest.Key<?>> captureKeys = new ArrayList<>(controller.mPreviewInputRequest.getKeys());
         ArrayList<CaptureRequest.Key<?>> captureRequestKeys = new ArrayList<>(CaptureController.mPreviewCaptureRequest.getKeys());
-        List<CameraCharacteristics.Key<?>> keys = CaptureController.mCameraCharacteristics.getKeys();
+        List<CameraCharacteristics.Key<?>> keys = CaptureController.getActiveCameraCharacteristics().getKeys();
         List<CaptureResult.Key<?>> resultKeys = CaptureController.mPreviewCaptureResult.getKeys();
         //DebugParameters debugParameters = PhotonCamera.getDebugger().debugParameters;
         */

@@ -17,7 +17,7 @@ public class YUVSaver extends DefaultSaver{
         if (IMAGE_BUFFER.size() == PhotonCamera.getCaptureController().mMeasuredFrameCnt && PhotonCamera.getSettings().frameCount != 1) {
 
 //            hdrxProcessor.start(dngFile, jpgFile, IMAGE_BUFFER, mImage.getFormat(),
-//                        CaptureController.mCameraCharacteristics, CaptureController.mCaptureResult,
+//                        CaptureController.getActiveCameraCharacteristics(), CaptureController.mCaptureResult,
 //                        () -> clearImageReader(mReader));
 
             IMAGE_BUFFER.clear();

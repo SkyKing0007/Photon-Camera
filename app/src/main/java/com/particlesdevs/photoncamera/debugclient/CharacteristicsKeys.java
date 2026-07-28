@@ -14,7 +14,7 @@ class CharacteristicsKeys implements Command{
     List<CameraCharacteristics.Key<?>> keys;
     public CharacteristicsKeys(String[] str){
         commands = str;
-        keys = CaptureController.mCameraCharacteristics.getKeys();
+        keys = CaptureController.getActiveCameraCharacteristics().getKeys();
     }
 
     @Override

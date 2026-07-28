@@ -208,7 +208,18 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     }
 
     private Map<String, CameraCharacteristics> mCameraCharacteristicsMap = new HashMap<>();
-    public static CameraCharacteristics mCameraCharacteristics;
+    /*
+     * Characteristics for the currently selected physical camera.
+     *
+     * Keep access centralized through getActiveCameraCharacteristics() so
+     * camera-specific code does not retain stale references during lens
+     * switching.
+     */
+    private static volatile CameraCharacteristics mCameraCharacteristics;
+
+    public static CameraCharacteristics getActiveCameraCharacteristics() {
+        return mCameraCharacteristics;
+    }
     public static CaptureResult mCaptureResult;
     public static CaptureRequest mCaptureRequest;
 
@@ -1305,17 +1316,35 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     });
     }
     public void UpdateCameraCharacteristics(String cameraId) {
-        PhotonCamera.getSpecificSensor().selectSpecifics(Integer.parseInt(cameraId));
-        CameraCharacteristics characteristics = this.mCameraCharacteristicsMap.get(cameraId);
-        mCameraCharacteristics = characteristics;
-        //Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
-
-        StreamConfigurationMap map = null;
-        if (mCameraCharacteristics != null) {
-            map = mCameraCharacteristics.get(
-                    CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        if (cameraId == null || cameraId.isEmpty()) {
+            Log.e(TAG, "Cannot update camera characteristics: empty camera ID");
+            return;
         }
+
+        CameraCharacteristics characteristics =
+                this.mCameraCharacteristicsMap.get(cameraId);
+
+        if (characteristics == null) {
+            Log.e(TAG, "No camera characteristics found for physical ID: " + cameraId);
+            return;
+        }
+
+        try {
+            PhotonCamera.getSpecificSensor().selectSpecifics(
+                    Integer.parseInt(cameraId)
+            );
+        } catch (NumberFormatException exception) {
+            Log.w(TAG, "Non-numeric physical camera ID: " + cameraId);
+        }
+
+        mCameraCharacteristics = characteristics;
+
+        StreamConfigurationMap map = characteristics.get(
+                CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP
+        );
+
         if (map == null) {
+            Log.e(TAG, "No stream configuration map for physical ID: " + cameraId);
             return;
         }
         ArrayList<Size> allTargets = getAllTargets();

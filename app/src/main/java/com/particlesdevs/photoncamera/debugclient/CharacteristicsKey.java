@@ -15,7 +15,7 @@ class CharacteristicsKey implements Command{
 
     public CharacteristicsKey(String[] str){
         commands = str;
-        keys = CaptureController.mCameraCharacteristics.getKeys();
+        keys = CaptureController.getActiveCameraCharacteristics().getKeys();
     }
     @Override
     public void command(){
@@ -25,7 +25,7 @@ class CharacteristicsKey implements Command{
             Log.v("DebugClient","GetKey:"+key.getName());
             if(commands[1].equals(key.getName())){
                 Log.v("DebugClient","GotKey");
-                mBufferOut.println(CaptureController.mCameraCharacteristics.get(key).toString());
+                mBufferOut.println(CaptureController.getActiveCameraCharacteristics().get(key).toString());
                 return;
             }
         }

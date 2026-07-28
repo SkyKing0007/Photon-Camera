@@ -76,7 +76,7 @@ public class TouchFocus {
         }
         Point size = new Point(captureController.mImageReaderPreview.getWidth(), captureController.mImageReaderPreview.getHeight());
         Point CurUi = new Point(textureView.getWidth(),textureView.getHeight());
-        Size sizee = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+        Size sizee = CaptureController.getActiveCameraCharacteristics().get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
         if (sizee == null) {
             sizee = new Size(size.x, size.y);
         }

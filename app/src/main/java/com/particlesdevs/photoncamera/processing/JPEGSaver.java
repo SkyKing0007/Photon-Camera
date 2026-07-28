@@ -26,7 +26,7 @@ public class JPEGSaver extends DefaultSaver {
                 Files.write(jpgPath, bytes);
 
 //                hdrxProcessor.start(dngFile, jpgFile, IMAGE_BUFFER, mImage.getFormat(),
-//                        CaptureController.mCameraCharacteristics, CaptureController.mCaptureResult,
+//                        CaptureController.getActiveCameraCharacteristics(), CaptureController.mCaptureResult,
 //                        () -> clearImageReader(mReader));
 
                 IMAGE_BUFFER.clear();
