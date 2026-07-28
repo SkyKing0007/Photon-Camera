@@ -2,6 +2,9 @@ package com.particlesdevs.photoncamera.processing.parameters;
 
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.graphics.Rect;
+import android.util.SizeF;
 import com.particlesdevs.photoncamera.util.Log;
 import android.util.Range;
 
@@ -11,6 +14,10 @@ import com.particlesdevs.photoncamera.capture.CaptureController;
 import com.particlesdevs.photoncamera.settings.PreferenceKeys;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Locale;
+import java.util.Set;
 
 public class IsoExpoSelector {
     public static final int baseFrame = 1;
@@ -46,6 +53,277 @@ public class IsoExpoSelector {
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, (int)pair.iso);
         lastSelectedExposure = pair.exposure;
     }
+    private static final double FULL_FRAME_DIAGONAL_MM =
+            Math.hypot(36.0, 24.0);
+
+    private static final Set<String> MAINS_60_HZ_COUNTRIES =
+            new HashSet<>(Arrays.asList(
+                    "US", "CA", "MX", "BR", "CO", "CR", "CU",
+                    "DO", "EC", "GT", "HN", "NI", "PA", "PE",
+                    "PR", "SV", "TW", "KR", "PH", "SA"
+            ));
+
+    /**
+     * Calculates effective 35 mm-equivalent focal length from the active
+     * physical camera metadata and its current crop region.
+     */
+    private static double getEffective35mmFocalLength(
+            CaptureController captureController
+    ) {
+        try {
+            CameraCharacteristics characteristics =
+                    CaptureController.mCameraCharacteristics;
+
+            if (characteristics == null) {
+                return Double.NaN;
+            }
+
+            SizeF sensorSize = characteristics.get(
+                    CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE
+            );
+
+            if (sensorSize == null
+                    || sensorSize.getWidth() <= 0.0f
+                    || sensorSize.getHeight() <= 0.0f) {
+                return Double.NaN;
+            }
+
+            Float focalLength = null;
+
+            if (CaptureController.mPreviewCaptureResult != null) {
+                focalLength = CaptureController.mPreviewCaptureResult.get(
+                        CaptureResult.LENS_FOCAL_LENGTH
+                );
+            }
+
+            if (focalLength == null || focalLength <= 0.0f) {
+                float[] focalLengths = characteristics.get(
+                        CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
+                );
+
+                if (focalLengths == null
+                        || focalLengths.length == 0
+                        || focalLengths[0] <= 0.0f) {
+                    return Double.NaN;
+                }
+
+                focalLength = focalLengths[0];
+            }
+
+            double sensorDiagonal = Math.hypot(
+                    sensorSize.getWidth(),
+                    sensorSize.getHeight()
+            );
+
+            if (!Double.isFinite(sensorDiagonal)
+                    || sensorDiagonal <= 0.0) {
+                return Double.NaN;
+            }
+
+            double nativeEquivalent =
+                    focalLength
+                            * FULL_FRAME_DIAGONAL_MM
+                            / sensorDiagonal;
+
+            double residualCropZoom = 1.0;
+
+            Rect activeArray = characteristics.get(
+                    CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE
+            );
+
+            Rect cropRegion = null;
+
+            if (CaptureController.mPreviewCaptureResult != null) {
+                cropRegion = CaptureController.mPreviewCaptureResult.get(
+                        CaptureResult.SCALER_CROP_REGION
+                );
+            }
+
+            if (activeArray != null
+                    && cropRegion != null
+                    && activeArray.width() > 0
+                    && cropRegion.width() > 0) {
+                residualCropZoom = Math.max(
+                        1.0,
+                        (double) activeArray.width()
+                                / cropRegion.width()
+                );
+
+                // Guard against broken vendor crop metadata.
+                residualCropZoom = Math.min(
+                        residualCropZoom,
+                        20.0
+                );
+            }
+
+            double effectiveEquivalent =
+                    nativeEquivalent * residualCropZoom;
+
+            if (!Double.isFinite(effectiveEquivalent)
+                    || effectiveEquivalent < 8.0
+                    || effectiveEquivalent > 500.0) {
+                return Double.NaN;
+            }
+
+            return effectiveEquivalent;
+        } catch (Exception exception) {
+            Log.w(
+                    TAG,
+                    "Unable to calculate effective focal length",
+                    exception
+            );
+            return Double.NaN;
+        }
+    }
+
+    /**
+     * Creates a deliberately permissive handheld shutter ceiling that still
+     * becomes faster as effective focal length increases.
+     */
+    private static long getFocalLengthAwareLimit(
+            CameraMode selectedMode,
+            double equivalentFocalLength,
+            long fallbackLimit
+    ) {
+        if (!Double.isFinite(equivalentFocalLength)) {
+            return fallbackLimit;
+        }
+
+        double denominator;
+
+        if (selectedMode == CameraMode.MOTION) {
+            denominator = clamp(
+                    equivalentFocalLength / 3.0,
+                    15.0,
+                    80.0
+            );
+        } else {
+            denominator = clamp(
+                    equivalentFocalLength / 4.0,
+                    10.0,
+                    60.0
+            );
+        }
+
+        long limit = (long) (
+                ExposureIndex.sec / denominator
+        );
+
+        Log.d(
+                TAG,
+                "Focal-aware AE: mode=" + selectedMode
+                        + " equivalent="
+                        + String.format(
+                                Locale.US,
+                                "%.1fmm",
+                                equivalentFocalLength
+                        )
+                        + " shutterLimit="
+                        + ExposureIndex.sec2string(
+                                ExposureIndex.time2sec(limit)
+                        )
+        );
+
+        return limit;
+    }
+
+    /**
+     * Reads the preview AE anti-banding result where possible. If the HAL
+     * reports AUTO or nothing, use a locale-based fallback.
+     */
+    private static int detectMainsFrequencyHz() {
+        try {
+            if (CaptureController.mPreviewCaptureResult != null) {
+                Integer antiBanding =
+                        CaptureController.mPreviewCaptureResult.get(
+                                CaptureResult.CONTROL_AE_ANTIBANDING_MODE
+                        );
+
+                if (antiBanding != null) {
+                    if (antiBanding
+                            == CaptureResult
+                            .CONTROL_AE_ANTIBANDING_MODE_50HZ) {
+                        return 50;
+                    }
+
+                    if (antiBanding
+                            == CaptureResult
+                            .CONTROL_AE_ANTIBANDING_MODE_60HZ) {
+                        return 60;
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        String country = Locale.getDefault().getCountry();
+
+        return MAINS_60_HZ_COUNTRIES.contains(country)
+                ? 60
+                : 50;
+    }
+
+    /**
+     * For most mains-powered lighting, brightness modulation occurs at twice
+     * mains frequency. Round down to a whole modulation period so the snapped
+     * exposure is never slower than the blur-safe limit.
+     */
+    private static long snapExposureForFlicker(
+            long exposureLimit,
+            int mainsFrequencyHz
+    ) {
+        if (exposureLimit <= 0
+                || (mainsFrequencyHz != 50
+                && mainsFrequencyHz != 60)) {
+            return exposureLimit;
+        }
+
+        long flickerPeriodNs = Math.round(
+                1_000_000_000.0
+                        / (2.0 * mainsFrequencyHz)
+        );
+
+        // If the focal-length limit is faster than one full flicker period,
+        // retain it rather than making the exposure slower.
+        if (exposureLimit < flickerPeriodNs) {
+            return exposureLimit;
+        }
+
+        long periods = Math.max(
+                1L,
+                exposureLimit / flickerPeriodNs
+        );
+
+        long snapped = periods * flickerPeriodNs;
+
+        Log.d(
+                TAG,
+                "Anti-flicker AE: mains="
+                        + mainsFrequencyHz
+                        + "Hz requested="
+                        + ExposureIndex.sec2string(
+                                ExposureIndex.time2sec(exposureLimit)
+                        )
+                        + " snapped="
+                        + ExposureIndex.sec2string(
+                                ExposureIndex.time2sec(snapped)
+                        )
+        );
+
+        return Math.min(snapped, exposureLimit);
+    }
+
+    private static double clamp(
+            double value,
+            double minimum,
+            double maximum
+    ) {
+        return Math.max(
+                minimum,
+                Math.min(maximum, value)
+        );
+    }
+
     private static double mpy1 = 1.0;
     public static ExpoPair GenerateExpoPair(int step, CaptureController captureController) {
         ExpoPair pair = new ExpoPair(captureController.mPreviewExposureTime, getEXPLOW(), getEXPHIGH(),
@@ -56,26 +334,46 @@ public class IsoExpoSelector {
 
         // Apply Shutter-Priority AE Curve (HDR+ E behavior)
         CameraMode selectedMode = PhotonCamera.getSettings().selectedMode;
-        long handheldLimit;
+        long fallbackHandheldLimit;
         long tripodLimit;
 
         if (selectedMode == CameraMode.NIGHT) {
-            handheldLimit = HANDHELD_NIGHT_LIMIT;
+            fallbackHandheldLimit = HANDHELD_NIGHT_LIMIT;
             tripodLimit = TRIPOD_NIGHT_LIMIT;
         } else if (selectedMode == CameraMode.MOTION) {
-            handheldLimit = HANDHELD_MOTION_LIMIT;
+            fallbackHandheldLimit = HANDHELD_MOTION_LIMIT;
             tripodLimit = TRIPOD_MOTION_LIMIT;
         } else {
-            handheldLimit = HANDHELD_PHOTO_LIMIT;
+            fallbackHandheldLimit = HANDHELD_PHOTO_LIMIT;
             tripodLimit = TRIPOD_PHOTO_LIMIT;
         }
+
+        // Calculate the effective 35 mm-equivalent focal length of the
+        // currently active camera, including residual digital crop.
+        double equivalentFocalLength =
+                getEffective35mmFocalLength(captureController);
+
+        long focalLengthLimit = getFocalLengthAwareLimit(
+                selectedMode,
+                equivalentFocalLength,
+                fallbackHandheldLimit
+        );
 
         // RAW video keeps its existing exposure behavior and must not inherit
         // long tripod exposure ceilings intended for computational photos.
         boolean tripodAllowed =
                 useTripod && selectedMode != CameraMode.RAWVIDEO;
 
-        long maxExposure = tripodAllowed ? tripodLimit : handheldLimit;
+        long maxExposure =
+                tripodAllowed ? tripodLimit : focalLengthLimit;
+
+        // Snap manual exposure to the local lighting flicker period without
+        // ever selecting a slower shutter than the calculated blur ceiling.
+        int mainsFrequencyHz = detectMainsFrequencyHz();
+        maxExposure = snapExposureForFlicker(
+                maxExposure,
+                mainsFrequencyHz
+        );
 
         Log.d(TAG, "AE stability: mode=" + selectedMode
                 + " tripodDetected=" + useTripod
