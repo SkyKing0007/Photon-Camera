@@ -280,9 +280,26 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     public ImageSaver mImageSaver;
     public HashMap<Long, Double> mExposures = new HashMap<>();
 
-    private final ArrayDeque<Image> mZslRingBuffer = new ArrayDeque<>();
+    /*
+     * Motion rolling buffer.
+     *
+     * Frames are copied into ImageFrame immediately, then the camera-owned
+     * Image is closed. This allows the camera HAL and preview to continue
+     * producing buffers while HDRX processes an immutable snapshot.
+     */
+    private final ArrayDeque<ImageFrame> mZslRingBuffer = new ArrayDeque<>();
     private final Object mZslBufferLock = new Object();
+    private final HashMap<Long, Double> mZslExposureEnergy = new HashMap<>();
+    private final HashMap<Long, Long> mZslExposureTimeNs = new HashMap<>();
+    private final HashMap<Long, Integer> mZslSensitivity = new HashMap<>();
     private volatile boolean mZslCapturing = false;
+    private volatile long mMotionShutterTimestampNs = 0L;
+    private volatile long mMotionCaptureStartMs = 0L;
+
+    private static final int MOTION_SELECTION_RESERVE = 8;
+    private static final int MOTION_MAX_RING_FRAMES = 37;
+    private static final int MOTION_MIN_PROCESS_FRAMES = 2;
+    private static final String MOTION_LOG_TAG = "MotionPipeline";
 
     /*
      * Dedicated Motion still-burst ownership.
@@ -324,20 +341,65 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 //            msg.obj = reader;
 //            mImageSaver.processingHandler.sendMessage(msg);
             if (isZslMode()) {
-                Image img = reader.acquireNextImage();
-                if (img == null) return;
-                if (mZslCapturing) {
-                    img.close();
-                    return;
-                }
-                synchronized (mZslBufferLock) {
-                    mZslRingBuffer.addLast(img);
-                    int maxFrames = Math.min(PhotonCamera.getSettings().frameCount, 37);
-                    while (mZslRingBuffer.size() > maxFrames) {
-                        Image old = mZslRingBuffer.pollFirst();
-                        if (old != null) old.close();
+                Image image = null;
+                ImageFrame frame = null;
+
+                try {
+                    image = reader.acquireNextImage();
+                    if (image == null) {
+                        return;
+                    }
+
+                    frame = mImageSaver.implementation.getFrame(image);
+                    frame.timestamp = image.getTimestamp();
+                } catch (Exception e) {
+                    Log.e(
+                            MOTION_LOG_TAG,
+                            "RING_COPY_FAILED "
+                                    + Log.getStackTraceString(e)
+                    );
+                } finally {
+                    if (image != null) {
+                        image.close();
                     }
                 }
+
+                if (frame == null) {
+                    return;
+                }
+
+                synchronized (mZslBufferLock) {
+                    if (mZslCapturing) {
+                        frame.close();
+                        return;
+                    }
+
+                    mZslRingBuffer.addLast(frame);
+
+                    int configured =
+                            Math.max(
+                                    MOTION_MIN_PROCESS_FRAMES,
+                                    PhotonCamera.getSettings().frameCount
+                            );
+
+                    int ringCapacity =
+                            Math.min(
+                                    MOTION_MAX_RING_FRAMES,
+                                    configured + MOTION_SELECTION_RESERVE
+                            );
+
+                    while (mZslRingBuffer.size() > ringCapacity) {
+                        ImageFrame old = mZslRingBuffer.pollFirst();
+
+                        if (old != null) {
+                            mZslExposureEnergy.remove(old.timestamp);
+                            mZslExposureTimeNs.remove(old.timestamp);
+                            mZslSensitivity.remove(old.timestamp);
+                            old.close();
+                        }
+                    }
+                }
+
                 return;
             }
             /*
@@ -585,6 +647,46 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             mFlashed = state != null && state == CaptureResult.FLASH_STATE_PARTIAL || state == CaptureResult.FLASH_STATE_FIRED;
             mPreviewCaptureResult = result;
             mPreviewCaptureRequest = request;
+
+            if (isZslMode()) {
+                Long sensorTimestamp =
+                        result.get(CaptureResult.SENSOR_TIMESTAMP);
+
+                Long actualExposureNs =
+                        result.get(
+                                CaptureResult.SENSOR_EXPOSURE_TIME
+                        );
+
+                Integer actualIso =
+                        result.get(
+                                CaptureResult.SENSOR_SENSITIVITY
+                        );
+
+                if (sensorTimestamp != null
+                        && actualExposureNs != null
+                        && actualIso != null) {
+
+                    synchronized (mZslBufferLock) {
+                        mZslExposureTimeNs.put(
+                                sensorTimestamp,
+                                actualExposureNs
+                        );
+
+                        mZslSensitivity.put(
+                                sensorTimestamp,
+                                actualIso
+                        );
+
+                        mZslExposureEnergy.put(
+                                sensorTimestamp,
+                                ExposureIndex.time2sec(
+                                        actualExposureNs
+                                ) * actualIso
+                        );
+                    }
+                }
+            }
+
             process(result);
             cameraEventsListener.onPreviewCaptureCompleted(result);
             if(PreferenceKeys.getAfMode() == CaptureRequest.CONTROL_AF_MODE_AUTO && !burst && !mTouchFocus.isTouchFocus) {
@@ -1716,9 +1818,15 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         mPreviewRequestBuilder.addTarget(surface);
         synchronized (mZslBufferLock) {
             while (!mZslRingBuffer.isEmpty()) {
-                Image img = mZslRingBuffer.pollFirst();
-                if (img != null) img.close();
+                ImageFrame frame = mZslRingBuffer.pollFirst();
+                if (frame != null) {
+                    frame.close();
+                }
             }
+
+            mZslExposureEnergy.clear();
+            mZslExposureTimeNs.clear();
+            mZslSensitivity.clear();
         }
         // Drain any frames still queued in the RAW ImageReader to prevent them leaking
         // into the next non-ZSL capture's IMAGE_BUFFER
@@ -1942,173 +2050,480 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     }
 
     private boolean isZslMode() {
-        /*
-         * Motion previously drained pre-shutter RAW preview frames from a
-         * rolling buffer. Those frames had preview-oriented timing and weaker
-         * per-frame ownership/metadata than the normal still burst.
-         *
-         * Route Motion through the proven Photo-style post-shutter RAW burst.
-         * Keep this method for easy restoration of ZSL later.
-         */
-        return false;
+        return PhotonCamera.getSettings().selectedMode
+                == CameraMode.MOTION;
     }
 
     private void triggerZslCapture() {
         if (mZslCapturing || CaptureController.isProcessing) {
-            Log.w(TAG, "ZSL: capture already in progress, ignoring");
+            Log.w(
+                    MOTION_LOG_TAG,
+                    "MOTION_REJECTED reason=capture_or_processing_busy"
+            );
             return;
         }
+
         mZslCapturing = true;
         burst = false;
+        mMotionCaptureStartMs =
+                android.os.SystemClock.elapsedRealtime();
+        mMotionShutterTimestampNs =
+                android.os.SystemClock.elapsedRealtimeNanos();
 
-        int frameCount = FrameNumberSelector.getFrames();
-        cameraRotation = PhotonCamera.getGravity().getCameraRotation(mSensorOrientation);
+        final int requestedFrames =
+                Math.max(
+                        MOTION_MIN_PROCESS_FRAMES,
+                        FrameNumberSelector.getFrames()
+                );
+
+        cameraRotation =
+                PhotonCamera.getGravity().getCameraRotation(
+                        mSensorOrientation
+                );
+
         BurstShakiness = new ArrayList<>();
         mExposures = new HashMap<>();
 
-        // Drain raw Image objects from the ring buffer (no copy yet)
-        List<Image> rawImages;
+        final ArrayList<ImageFrame> candidates =
+                new ArrayList<>();
+
         synchronized (mZslBufferLock) {
-            rawImages = new ArrayList<>(mZslRingBuffer);
-            mZslRingBuffer.clear();
+            while (!mZslRingBuffer.isEmpty()) {
+                ImageFrame frame = mZslRingBuffer.pollFirst();
+
+                if (frame != null) {
+                    candidates.add(frame);
+                }
+            }
         }
-
-
-
-        int take = Math.min(rawImages.size(), frameCount);
-        int skip = rawImages.size() - take;
 
         Log.d(
-                TAG,
-                "Motion ZSL selection: configured="
-                        + frameCount
-                        + " buffered="
-                        + rawImages.size()
-                        + " selected="
-                        + take
+                MOTION_LOG_TAG,
+                "MOTION_START"
+                        + " camera="
+                        + physicalID
+                        + " requested="
+                        + requestedFrames
+                        + " candidates="
+                        + candidates.size()
+                        + " shutterNs="
+                        + mMotionShutterTimestampNs
         );
-        for (int i = 0; i < skip; i++) {
-            rawImages.get(i).close();
-        }
 
-        // Populate exposures map from preview capture result — all ZSL frames share preview exposure
-        double previewExpTime = 1.0;
-        double previewISO = 100.0;
-        long exposureTimeNs = 0;
-        if (mPreviewCaptureResult != null) {
-            Long expTimeNs = mPreviewCaptureResult.get(CaptureResult.SENSOR_EXPOSURE_TIME);
-            Integer isoVal = mPreviewCaptureResult.get(CaptureResult.SENSOR_SENSITIVITY);
-            if (expTimeNs != null) {
-                exposureTimeNs = expTimeNs;
-                previewExpTime = expTimeNs / 1_000_000_000.0;
+        /*
+         * The rolling buffer may still be filling immediately after opening
+         * the camera or switching lenses. Preserve the known-good dedicated
+         * post-shutter path as the fallback instead of processing an empty or
+         * unusably small stack.
+         */
+        if (candidates.size() < MOTION_MIN_PROCESS_FRAMES) {
+            for (ImageFrame frame : candidates) {
+                frame.close();
             }
-            if (isoVal != null) previewISO = isoVal.doubleValue();
-        }
-        final double exposureVal = previewExpTime * previewISO;
 
-        // Copy selected Images to ImageFrames only now (on shutter press)
-        List<ImageFrame> selected = new ArrayList<>();
-        for (int i = skip; i < rawImages.size(); i++) {
-            Image img = rawImages.get(i);
-            int rowStride = img.getPlanes()[0].getRowStride();
-            int pixelStride = img.getPlanes()[0].getPixelStride();
-            int width = (img.getFormat() == ImageFormat.RAW10)
-                    ? img.getWidth()
-                    : (pixelStride > 0 ? rowStride / pixelStride : img.getWidth());
-            int height = img.getHeight();
-            int bufCapacity = img.getPlanes()[0].getBuffer().capacity();
-            int offset = 0;
-            if (PhotonCamera.getSettings().aspect169 && width > height) {
-                height = width * 9 / 16;
-                int offsetH = (img.getHeight() - height) / 2;
-                offsetH -= offsetH % 2;
-                offset = rowStride * offsetH;
-                bufCapacity = rowStride * height;
-            }
-            Allocator.binning = PhotonCamera.getSettings().binning;
-            ImageFrame frame = new ImageFrame(img.getPlanes()[0].getBuffer(), img.getFormat(),
-                    width, rowStride, offset, bufCapacity);
-            frame.timestamp = img.getTimestamp();
+            mZslCapturing = false;
 
-            frame.width = width;
-            frame.height = height;
-            if(PhotonCamera.getSettings().binning) {
-                frame.width/= 2;
-                frame.height/= 2;
-            }
-            img.close();
-            mExposures.put(frame.timestamp, exposureVal);
-            selected.add(frame);
-        }
-        int actualCount = selected.size();
-
-        if (actualCount < frameCount) {
             Log.w(
-                    TAG,
-                    "Motion ZSL buffer not full: using "
-                            + actualCount
-                            + " of "
-                            + frameCount
-                            + " configured frames"
+                    MOTION_LOG_TAG,
+                    "RING_NOT_READY candidates="
+                            + candidates.size()
+                            + " action=post_shutter_fallback"
+            );
+
+            captureDedicatedMotionFallback();
+            return;
+        }
+
+        final long[] candidateTimestamps =
+                new long[candidates.size()];
+
+        long representativeExposureNs = 0L;
+
+        for (int i = 0; i < candidates.size(); i++) {
+            ImageFrame frame = candidates.get(i);
+            candidateTimestamps[i] = frame.timestamp;
+
+            Long exposureNs =
+                    mZslExposureTimeNs.get(frame.timestamp);
+
+            if (exposureNs != null && exposureNs > 0L) {
+                representativeExposureNs = exposureNs;
+            }
+        }
+
+        if (representativeExposureNs <= 0L
+                && mPreviewCaptureResult != null) {
+
+            Long previewExposure =
+                    mPreviewCaptureResult.get(
+                            CaptureResult.SENSOR_EXPOSURE_TIME
+                    );
+
+            if (previewExposure != null) {
+                representativeExposureNs = previewExposure;
+            }
+        }
+
+        PhotonCamera.getGyro().buildZslBurstShakiness(
+                candidateTimestamps,
+                Math.max(1L, representativeExposureNs),
+                BurstShakiness
+        );
+
+        PhotonCamera.getGyro().CompleteSequence();
+
+        /*
+         * Balanced frame selection:
+         * - severe-shake frames naturally sort to the end;
+         * - timestamp proximity breaks equal-shake ties;
+         * - enough frames remain for temporal noise reduction;
+         * - the sharpest/stablest frame becomes HDRX reference frame 0.
+         */
+        final class ScoredMotionFrame {
+            final ImageFrame frame;
+            final GyroBurst gyro;
+            final float shake;
+            final long shutterDistanceNs;
+
+            ScoredMotionFrame(
+                    ImageFrame frame,
+                    GyroBurst gyro,
+                    float shake,
+                    long shutterDistanceNs
+            ) {
+                this.frame = frame;
+                this.gyro = gyro;
+                this.shake = shake;
+                this.shutterDistanceNs = shutterDistanceNs;
+            }
+        }
+
+        ArrayList<ScoredMotionFrame> scored =
+                new ArrayList<>();
+
+        for (int i = 0; i < candidates.size(); i++) {
+            ImageFrame frame = candidates.get(i);
+
+            GyroBurst gyro =
+                    i < BurstShakiness.size()
+                            ? BurstShakiness.get(i)
+                            : new GyroBurst(1);
+
+            float shake =
+                    Float.isFinite(gyro.shakiness)
+                            ? gyro.shakiness
+                            : Float.MAX_VALUE;
+
+            long shutterDistanceNs =
+                    Math.abs(
+                            mMotionShutterTimestampNs
+                                    - frame.timestamp
+                    );
+
+            scored.add(
+                    new ScoredMotionFrame(
+                            frame,
+                            gyro,
+                            shake,
+                            shutterDistanceNs
+                    )
             );
         }
 
-        mImageSaver = new ImageSaver(cameraEventsListener);
-        mImageSaver.setFrameCount(actualCount);
-        mImageSaver.setImageFormat(CaptureController.RAW_FORMAT);
-        mImageSaver.implementation = ImageSaverSelector.getImageSaver(CaptureController.RAW_FORMAT, mImageSaver.implementation);
-        mImageSaver.implementation.frameCount = actualCount;
+        scored.sort((left, right) -> {
+            int shakeCompare =
+                    Float.compare(left.shake, right.shake);
 
-        SaverImplementation.IMAGE_BUFFER.clear();
-        SaverImplementation.IMAGE_BUFFER.addAll(selected);
+            if (shakeCompare != 0) {
+                return shakeCompare;
+            }
+
+            return Long.compare(
+                    left.shutterDistanceNs,
+                    right.shutterDistanceNs
+            );
+        });
+
+        int selectedCount =
+                Math.min(requestedFrames, scored.size());
+
+        ArrayList<ImageFrame> selected =
+                new ArrayList<>(selectedCount);
+
+        ArrayList<GyroBurst> selectedGyro =
+                new ArrayList<>(selectedCount);
+
+        HashMap<Long, Double> selectedExposures =
+                new HashMap<>();
+
+        for (int i = 0; i < scored.size(); i++) {
+            ScoredMotionFrame item = scored.get(i);
+
+            if (i < selectedCount) {
+                item.frame.frameGyro = item.gyro;
+                selected.add(item.frame);
+                selectedGyro.add(item.gyro);
+
+                Double exposureEnergy =
+                        mZslExposureEnergy.get(
+                                item.frame.timestamp
+                        );
+
+                if (exposureEnergy == null) {
+                    long exposureNs =
+                            mZslExposureTimeNs.getOrDefault(
+                                    item.frame.timestamp,
+                                    representativeExposureNs
+                            );
+
+                    int sensitivity =
+                            mZslSensitivity.getOrDefault(
+                                    item.frame.timestamp,
+                                    Math.max(100, mPreviewIso)
+                            );
+
+                    exposureEnergy =
+                            ExposureIndex.time2sec(exposureNs)
+                                    * sensitivity;
+                }
+
+                selectedExposures.put(
+                        item.frame.timestamp,
+                        exposureEnergy
+                );
+
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "FRAME"
+                                + " candidate="
+                                + i
+                                + " timestamp="
+                                + item.frame.timestamp
+                                + " dtShutterNs="
+                                + item.shutterDistanceNs
+                                + " shake="
+                                + item.shake
+                                + " exposureNs="
+                                + mZslExposureTimeNs.get(
+                                        item.frame.timestamp
+                                )
+                                + " iso="
+                                + mZslSensitivity.get(
+                                        item.frame.timestamp
+                                )
+                                + " decision=SELECTED"
+                );
+            } else {
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "FRAME"
+                                + " candidate="
+                                + i
+                                + " timestamp="
+                                + item.frame.timestamp
+                                + " dtShutterNs="
+                                + item.shutterDistanceNs
+                                + " shake="
+                                + item.shake
+                                + " decision=REJECTED_BLUR_OR_RESERVE"
+                );
+
+                item.frame.close();
+            }
+        }
+
+        synchronized (mZslBufferLock) {
+            for (ImageFrame frame : selected) {
+                mZslExposureEnergy.remove(frame.timestamp);
+                mZslExposureTimeNs.remove(frame.timestamp);
+                mZslSensitivity.remove(frame.timestamp);
+            }
+        }
+
+        if (selected.size() < MOTION_MIN_PROCESS_FRAMES) {
+            for (ImageFrame frame : selected) {
+                frame.close();
+            }
+
+            mZslCapturing = false;
+
+            Log.e(
+                    MOTION_LOG_TAG,
+                    "MOTION_RESULT=FAILED"
+                            + " stage=FRAME_SELECTION"
+                            + " selected="
+                            + selected.size()
+            );
+
+            cameraEventsListener.onProcessingError(
+                    "Not enough stable Motion frames"
+            );
+            return;
+        }
+
+        mImageSaver = new ImageSaver(cameraEventsListener);
+        mImageSaver.setFrameCount(selected.size());
+        mImageSaver.setImageFormat(CaptureController.RAW_FORMAT);
+
+        mImageSaver.implementation =
+                ImageSaverSelector.getImageSaver(
+                        CaptureController.RAW_FORMAT,
+                        mImageSaver.implementation
+                );
+
+        mImageSaver.implementation.frameCount =
+                selected.size();
+
+        synchronized (SaverImplementation.IMAGE_BUFFER) {
+            SaverImplementation.IMAGE_BUFFER.clear();
+            SaverImplementation.IMAGE_BUFFER.addAll(selected);
+        }
 
         mCaptureResult = mPreviewCaptureResult;
-        mMeasuredFrameCnt = actualCount;
+        mCaptureRequest = mPreviewCaptureRequest;
+        mMeasuredFrameCnt = selected.size();
+        mExposures = selectedExposures;
 
-        cameraEventsListener.onFrameCountSet(actualCount);
-        cameraEventsListener.onCaptureStillPictureStarted("ZSLCaptureStarted!");
+        cameraEventsListener.onFrameCountSet(selected.size());
+        cameraEventsListener.onCaptureStillPictureStarted(
+                "Motion ZSL capture"
+        );
         cameraEventsListener.onBurstPrepared(null);
-        final double frametime = ExposureIndex.time2sec(IsoExpoSelector.GenerateExpoPair(-1, this).exposure);
-        for (int i = 0; i < actualCount; i++) {
+
+        double frameTimeSeconds =
+                representativeExposureNs > 0L
+                        ? ExposureIndex.time2sec(
+                                representativeExposureNs
+                        )
+                        : ExposureIndex.time2sec(
+                                IsoExpoSelector.GenerateExpoPair(
+                                        -1,
+                                        this
+                                ).exposure
+                        );
+
+        for (int i = 0; i < selected.size(); i++) {
             cameraEventsListener.onFrameCaptureStarted(null);
             cameraEventsListener.onFrameCaptureCompleted(
-                    new TimerFrameCountViewModel.FrameCntTime(i, actualCount, frametime));
+                    new TimerFrameCountViewModel.FrameCntTime(
+                            i,
+                            selected.size(),
+                            frameTimeSeconds
+                    )
+            );
         }
+
         cameraEventsListener.onCaptureSequenceCompleted(null);
 
-        long[] frameTimestamps = new long[actualCount];
-        for (int i = 0; i < actualCount; i++) {
-            frameTimestamps[i] = selected.get(i).timestamp;
-        }
-        PhotonCamera.getGyro().buildZslBurstShakiness(frameTimestamps, exposureTimeNs, BurstShakiness);
-
-        // Populate fullpairs the same way setExpo() does for a normal burst
+        /*
+         * Every frame gets its own ExpoPair object. Equal values are allowed,
+         * but mutable pair state must never be shared between frames.
+         */
         IsoExpoSelector.fullpairs.clear();
-        for (int i = 0; i < actualCount; i++) {
-            IsoExpoSelector.fullpairs.add(IsoExpoSelector.GenerateExpoPair(i, this));
+
+        for (int i = 0; i < selected.size(); i++) {
+            IsoExpoSelector.fullpairs.add(
+                    IsoExpoSelector.GenerateExpoPair(i, this)
+            );
         }
 
-        final int capturedCount = actualCount;
+        final ArrayList<GyroBurst> processingGyro =
+                new ArrayList<>(selectedGyro);
+
+        final HashMap<Long, Double> processingExposures =
+                new HashMap<>(selectedExposures);
+
+        final CaptureResult processingResult =
+                mPreviewCaptureResult;
+
+        final CaptureRequest processingRequest =
+                mPreviewCaptureRequest;
+
+        mImageSaver.implementation.bufferLock = false;
+        mImageSaver.updateFrameCount(selected.size());
+
+        /*
+         * Preview repeating was never stopped. HDRX is now entirely
+         * background work from the camera/viewfinder perspective.
+         */
+        Log.d(
+                MOTION_LOG_TAG,
+                "PREVIEW_CONTINUES"
+                        + " selected="
+                        + selected.size()
+                        + " rejected="
+                        + (candidates.size() - selected.size())
+                        + " elapsedMs="
+                        + (
+                            android.os.SystemClock.elapsedRealtime()
+                                    - mMotionCaptureStartMs
+                        )
+        );
+
         processExecutor.execute(() -> {
             try {
-                PhotonCamera.getGyro().CompleteSequence();
-                mBackgroundHandler.post(this::unlockFocus);
-                if (capturedCount == 0) {
-                    Log.w(TAG, "ZSL ring buffer was empty, no frames to process");
-                    cameraEventsListener.onProcessingFinished("ZSL buffer empty");
-                    return;
-                }
-                mImageSaver.implementation.bufferLock = false;
-                mImageSaver.updateFrameCount(capturedCount);
-                mImageSaver.runRaw(mCameraCharacteristics, mPreviewCaptureResult, mPreviewCaptureRequest,
-                        new ArrayList<>(BurstShakiness), cameraRotation, mExposures);
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "HDRX_STARTED frames="
+                                + selected.size()
+                );
+
+                mImageSaver.runRaw(
+                        mCameraCharacteristics,
+                        processingResult,
+                        processingRequest,
+                        processingGyro,
+                        cameraRotation,
+                        processingExposures
+                );
+
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "MOTION_RESULT=SUCCESS"
+                                + " totalElapsedMs="
+                                + (
+                                    android.os.SystemClock.elapsedRealtime()
+                                            - mMotionCaptureStartMs
+                                )
+                );
             } catch (Exception e) {
-                Log.e(TAG, "ZSL runRaw: " + Log.getStackTraceString(e));
-                cameraEventsListener.onProcessingError(e.getLocalizedMessage());
+                Log.e(
+                        MOTION_LOG_TAG,
+                        "MOTION_RESULT=FAILED"
+                                + " stage=HDRX "
+                                + Log.getStackTraceString(e)
+                );
+
+                cameraEventsListener.onProcessingError(
+                        e.getLocalizedMessage()
+                );
             } finally {
                 mZslCapturing = false;
             }
         });
+    }
+
+    /*
+     * Known-good 0.9726135 post-shutter implementation retained only for the
+     * short period after camera/lens startup when the rolling ring is empty.
+     */
+    private void captureDedicatedMotionFallback() {
+        final boolean previousCaptureState = mZslCapturing;
+
+        try {
+            mZslCapturing = false;
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "POST_SHUTTER_FALLBACK_START"
+            );
+
+            captureStillPicturePostShutter();
+        } finally {
+            if (previousCaptureState) {
+                mZslCapturing = false;
+            }
+        }
     }
 
     private void finalizeDedicatedMotionBurst(
@@ -2325,12 +2740,17 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     }
 
     private void captureStillPicture() {
+        if (isZslMode()) {
+            triggerZslCapture();
+            return;
+        }
+
+        captureStillPicturePostShutter();
+    }
+
+    private void captureStillPicturePostShutter() {
         try {
             if (null == mCameraDevice) {
-                return;
-            }
-            if (isZslMode()) {
-                triggerZslCapture();
                 return;
             }
             // This is the CaptureRequest.Builder that we use to take a picture.
