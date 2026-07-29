@@ -33,6 +33,7 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureFailure;
 import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.ColorSpaceTransform;
@@ -353,6 +354,40 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private final HashMap<Long, Integer> mMotionBurstSensitivity =
             new HashMap<>();
 
+    /*
+     * Controlled Motion pre-buffer. The visible preview remains under Xiaomi
+     * AE; these one-shot RAW requests use Photon's 1/15-priority target.
+     */
+    private static final int MOTION_PREBUFFER_MAX_FRAMES = 8;
+    private static final long MOTION_PREBUFFER_MAX_AGE_NS =
+            1_000_000_000L;
+    private static final long MOTION_PREBUFFER_INTERVAL_MS = 90L;
+
+    private final ArrayDeque<ImageFrame> mMotionPrebufferFrames =
+            new ArrayDeque<>();
+    private final HashMap<Long, ImageFrame> mMotionPrebufferPendingFrames =
+            new HashMap<>();
+    private final HashMap<Long, Long> mMotionPrebufferExposureTimeNs =
+            new HashMap<>();
+    private final HashMap<Long, Integer> mMotionPrebufferSensitivity =
+            new HashMap<>();
+
+    private final ArrayList<ImageFrame> mMotionPreselectedFrames =
+            new ArrayList<>();
+    private final HashMap<Long, Long> mMotionPreselectedExposureTimeNs =
+            new HashMap<>();
+    private final HashMap<Long, Integer> mMotionPreselectedSensitivity =
+            new HashMap<>();
+
+    private volatile boolean mMotionPrebufferEnabled = false;
+    private volatile boolean mMotionPrebufferRequestInFlight = false;
+    private volatile long mMotionPrebufferAcceptUntilNs = 0L;
+    private volatile long mMotionPrebufferTargetExposureNs = 0L;
+    private volatile int mMotionPrebufferTargetIso = 0;
+    private volatile int mMotionPrebufferFailureCount = 0;
+    private volatile int mMotionPostShutterFrameOverride = 0;
+    private volatile int mMotionCombinedRequestedFrames = 0;
+
     private final ImageReader.OnImageAvailableListener mOnYuvImageAvailableListener
             = new ImageReader.OnImageAvailableListener() {
         @Override
@@ -456,6 +491,100 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                 mMotionBurstPendingFrames.remove(
                                         oldestTimestamp
                                 );
+
+                        if (stale != null) {
+                            stale.close();
+                        }
+                    }
+                }
+
+                return;
+            }
+
+            if (mMotionPrebufferEnabled
+                    && (
+                        mMotionPrebufferRequestInFlight
+                                || android.os.SystemClock
+                                        .elapsedRealtimeNanos()
+                                        <= mMotionPrebufferAcceptUntilNs
+                                || !mMotionPrebufferExposureTimeNs.isEmpty()
+                    )
+                    && PhotonCamera.getSettings().selectedMode
+                            == CameraMode.MOTION
+                    && !mZslCapturing
+                    && !CaptureController.isProcessing) {
+
+                Image image = null;
+                ImageFrame frame = null;
+
+                try {
+                    image = reader.acquireNextImage();
+
+                    if (image == null) {
+                        return;
+                    }
+
+                    frame =
+                            mImageSaver.implementation
+                                    .getFrame(image);
+
+                    frame.timestamp = image.getTimestamp();
+                } catch (Exception e) {
+                    Log.e(
+                            MOTION_LOG_TAG,
+                            "PREBUFFER_RAW_COPY_FAILED "
+                                    + Log.getStackTraceString(e)
+                    );
+                } finally {
+                    if (image != null) {
+                        image.close();
+                    }
+                }
+
+                if (frame == null) {
+                    return;
+                }
+
+                synchronized (mMotionBurstLock) {
+                    ImageFrame replaced =
+                            mMotionPrebufferPendingFrames.put(
+                                    frame.timestamp,
+                                    frame
+                            );
+
+                    if (replaced != null) {
+                        replaced.close();
+                    }
+
+                    tryMatchMotionPrebufferFrameLocked(
+                            frame.timestamp
+                    );
+
+                    while (mMotionPrebufferPendingFrames.size()
+                            > 24) {
+
+                        Long oldestTimestamp = null;
+
+                        for (Long timestamp
+                                : mMotionPrebufferPendingFrames
+                                        .keySet()) {
+
+                            if (oldestTimestamp == null
+                                    || timestamp
+                                            < oldestTimestamp) {
+                                oldestTimestamp = timestamp;
+                            }
+                        }
+
+                        if (oldestTimestamp == null) {
+                            break;
+                        }
+
+                        ImageFrame stale =
+                                mMotionPrebufferPendingFrames
+                                        .remove(
+                                                oldestTimestamp
+                                        );
 
                         if (stale != null) {
                             stale.close();
@@ -1191,6 +1320,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
      * Closes the current {@link CameraDevice}.
      */
     public void closeCamera() {
+        stopMotionPrebufferPump();
+
         try {
             mCameraOpenCloseLock.acquire();
             if (null != mCaptureSession) {
@@ -1244,6 +1375,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
      * Stops the background thread and its {@link Handler}.
      */
     public void stopBackgroundThread() {
+        stopMotionPrebufferPump();
+
         if (mBackgroundThread == null)
             return;
         mBackgroundThread.quitSafely();
@@ -1885,9 +2018,19 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                             }
                         } else {
                             //if(mSelectedMode != CameraMode.VIDEO)
-                            mCaptureSession.setRepeatingRequest(mPreviewInputRequest,
-                                    mCaptureCallback, mBackgroundHandler);
+                            mCaptureSession.setRepeatingRequest(
+                                    mPreviewInputRequest,
+                                    mCaptureCallback,
+                                    mBackgroundHandler
+                            );
                             unlockFocus();
+
+                            if (PhotonCamera.getSettings().selectedMode
+                                    == CameraMode.MOTION) {
+                                startMotionPrebufferPump();
+                            } else {
+                                stopMotionPrebufferPump();
+                            }
                         }
                     } catch (Exception e) {
                         Log.e(TAG, Log.getStackTraceString(e));
@@ -2620,6 +2763,580 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         }
     }
 
+
+    private double motionEvDifference(
+            double first,
+            double second
+    ) {
+        if (first <= 0.0 || second <= 0.0) {
+            return Double.POSITIVE_INFINITY;
+        }
+
+        return Math.abs(
+                Math.log(first / second)
+                        / Math.log(2.0)
+        );
+    }
+
+    private long[] calculateMotionPrebufferTarget() {
+        Long previewExposureNs = null;
+        Integer previewIso = null;
+
+        if (mPreviewCaptureResult != null) {
+            previewExposureNs =
+                    mPreviewCaptureResult.get(
+                            CaptureResult.SENSOR_EXPOSURE_TIME
+                    );
+
+            previewIso =
+                    mPreviewCaptureResult.get(
+                            CaptureResult.SENSOR_SENSITIVITY
+                    );
+        }
+
+        IsoExpoSelector.ExpoPair selectorPair =
+                IsoExpoSelector.GenerateExpoPair(-1, this);
+
+        Range<Long> exposureRange =
+                mCameraCharacteristics != null
+                        ? mCameraCharacteristics.get(
+                                CameraCharacteristics
+                                        .SENSOR_INFO_EXPOSURE_TIME_RANGE
+                        )
+                        : null;
+
+        Range<Integer> sensitivityRange =
+                mCameraCharacteristics != null
+                        ? mCameraCharacteristics.get(
+                                CameraCharacteristics
+                                        .SENSOR_INFO_SENSITIVITY_RANGE
+                        )
+                        : null;
+
+        long minimumExposureNs =
+                exposureRange != null
+                        ? exposureRange.getLower()
+                        : 1_000_000L;
+
+        long maximumExposureNs =
+                exposureRange != null
+                        ? Math.min(
+                                exposureRange.getUpper(),
+                                66_666_667L
+                        )
+                        : 66_666_667L;
+
+        int minimumIso =
+                sensitivityRange != null
+                        ? sensitivityRange.getLower()
+                        : 50;
+
+        int maximumIso =
+                sensitivityRange != null
+                        ? sensitivityRange.getUpper()
+                        : 12_800;
+
+        double previewEnergy =
+                previewExposureNs != null
+                        && previewExposureNs > 0L
+                        && previewIso != null
+                        && previewIso > 0
+                        ? ExposureIndex.time2sec(
+                                previewExposureNs
+                        ) * previewIso
+                        : 0.0;
+
+        long exposureNs;
+        int iso;
+
+        if (previewEnergy > 0.0) {
+            long exposureAtMinimumIsoNs =
+                    Math.round(
+                            previewEnergy
+                                    / Math.max(
+                                            1,
+                                            minimumIso
+                                    )
+                                    * 1_000_000_000.0
+                    );
+
+            exposureNs =
+                    Math.max(
+                            minimumExposureNs,
+                            Math.min(
+                                    maximumExposureNs,
+                                    exposureAtMinimumIsoNs
+                            )
+                    );
+
+            iso =
+                    (int) Math.round(
+                            previewEnergy
+                                    / ExposureIndex.time2sec(
+                                            exposureNs
+                                    )
+                    );
+
+            iso =
+                    Math.max(
+                            minimumIso,
+                            Math.min(maximumIso, iso)
+                    );
+        } else {
+            exposureNs =
+                    selectorPair != null
+                            ? selectorPair.exposure
+                            : maximumExposureNs;
+
+            iso =
+                    selectorPair != null
+                            ? selectorPair.iso
+                            : minimumIso;
+
+            exposureNs =
+                    Math.max(
+                            minimumExposureNs,
+                            Math.min(
+                                    maximumExposureNs,
+                                    exposureNs
+                            )
+                    );
+
+            iso =
+                    Math.max(
+                            minimumIso,
+                            Math.min(maximumIso, iso)
+                    );
+        }
+
+        return new long[]{exposureNs, iso};
+    }
+
+    private void closeMotionPrebufferLocked() {
+        for (ImageFrame frame : mMotionPrebufferFrames) {
+            if (frame != null) {
+                frame.close();
+            }
+        }
+
+        for (ImageFrame frame
+                : mMotionPrebufferPendingFrames.values()) {
+            if (frame != null) {
+                frame.close();
+            }
+        }
+
+        mMotionPrebufferFrames.clear();
+        mMotionPrebufferPendingFrames.clear();
+        mMotionPrebufferExposureTimeNs.clear();
+        mMotionPrebufferSensitivity.clear();
+    }
+
+    private void pruneMotionPrebufferLocked(
+            long nowNs
+    ) {
+        while (!mMotionPrebufferFrames.isEmpty()) {
+            ImageFrame oldest =
+                    mMotionPrebufferFrames.peekFirst();
+
+            if (oldest == null
+                    || nowNs - oldest.timestamp
+                            <= MOTION_PREBUFFER_MAX_AGE_NS) {
+                break;
+            }
+
+            mMotionPrebufferFrames.pollFirst();
+
+            if (oldest != null) {
+                mMotionPrebufferExposureTimeNs.remove(
+                        oldest.timestamp
+                );
+
+                mMotionPrebufferSensitivity.remove(
+                        oldest.timestamp
+                );
+
+                oldest.close();
+            }
+        }
+    }
+
+    private void tryMatchMotionPrebufferFrameLocked(
+            long timestamp
+    ) {
+        ImageFrame frame =
+                mMotionPrebufferPendingFrames.get(
+                        timestamp
+                );
+
+        Long exposureNs =
+                mMotionPrebufferExposureTimeNs.get(
+                        timestamp
+                );
+
+        Integer iso =
+                mMotionPrebufferSensitivity.get(
+                        timestamp
+                );
+
+        if (frame == null
+                || exposureNs == null
+                || exposureNs <= 0L
+                || iso == null
+                || iso <= 0) {
+            return;
+        }
+
+        mMotionPrebufferPendingFrames.remove(
+                timestamp
+        );
+
+        pruneMotionPrebufferLocked(
+                android.os.SystemClock
+                        .elapsedRealtimeNanos()
+        );
+
+        mMotionPrebufferFrames.addLast(frame);
+
+        while (mMotionPrebufferFrames.size()
+                > MOTION_PREBUFFER_MAX_FRAMES) {
+
+            ImageFrame oldest =
+                    mMotionPrebufferFrames.pollFirst();
+
+            if (oldest != null) {
+                mMotionPrebufferExposureTimeNs.remove(
+                        oldest.timestamp
+                );
+
+                mMotionPrebufferSensitivity.remove(
+                        oldest.timestamp
+                );
+
+                oldest.close();
+            }
+        }
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "PREBUFFER_RAW_MATCHED"
+                        + " timestamp="
+                        + timestamp
+                        + " exposureNs="
+                        + exposureNs
+                        + " iso="
+                        + iso
+                        + " buffered="
+                        + mMotionPrebufferFrames.size()
+                        + "/"
+                        + MOTION_PREBUFFER_MAX_FRAMES
+        );
+    }
+
+    private final CameraCaptureSession.CaptureCallback
+            mMotionPrebufferCaptureCallback =
+            new CameraCaptureSession.CaptureCallback() {
+
+        @Override
+        public void onCaptureCompleted(
+                @NonNull CameraCaptureSession session,
+                @NonNull CaptureRequest request,
+                @NonNull TotalCaptureResult result
+        ) {
+            Long timestamp =
+                    result.get(
+                            CaptureResult.SENSOR_TIMESTAMP
+                    );
+
+            Long exposureNs =
+                    result.get(
+                            CaptureResult.SENSOR_EXPOSURE_TIME
+                    );
+
+            Integer iso =
+                    result.get(
+                            CaptureResult.SENSOR_SENSITIVITY
+                    );
+
+            synchronized (mMotionBurstLock) {
+                if (timestamp != null
+                        && exposureNs != null
+                        && exposureNs > 0L
+                        && iso != null
+                        && iso > 0) {
+
+                    mMotionPrebufferExposureTimeNs.put(
+                            timestamp,
+                            exposureNs
+                    );
+
+                    mMotionPrebufferSensitivity.put(
+                            timestamp,
+                            iso
+                    );
+
+                    tryMatchMotionPrebufferFrameLocked(
+                            timestamp
+                    );
+                }
+
+                mMotionPrebufferRequestInFlight = false;
+                mMotionPrebufferAcceptUntilNs =
+                        android.os.SystemClock
+                                .elapsedRealtimeNanos()
+                                + 500_000_000L;
+
+                mMotionPrebufferFailureCount = 0;
+            }
+
+            scheduleMotionPrebufferPump(
+                    MOTION_PREBUFFER_INTERVAL_MS
+            );
+        }
+
+        @Override
+        public void onCaptureFailed(
+                @NonNull CameraCaptureSession session,
+                @NonNull CaptureRequest request,
+                @NonNull CaptureFailure failure
+        ) {
+            synchronized (mMotionBurstLock) {
+                mMotionPrebufferRequestInFlight = false;
+                mMotionPrebufferFailureCount++;
+
+                if (mMotionPrebufferFailureCount >= 3) {
+                    mMotionPrebufferEnabled = false;
+                    closeMotionPrebufferLocked();
+
+                    Log.e(
+                            MOTION_LOG_TAG,
+                            "PREBUFFER_DISABLED"
+                                    + " reason=repeated_capture_failure"
+                    );
+                }
+            }
+
+            scheduleMotionPrebufferPump(
+                    500L
+            );
+        }
+    };
+
+    private final Runnable mMotionPrebufferRunnable =
+            new Runnable() {
+        @Override
+        public void run() {
+            submitNextMotionPrebufferFrame();
+        }
+    };
+
+    private void scheduleMotionPrebufferPump(
+            long delayMs
+    ) {
+        if (mBackgroundHandler == null) {
+            return;
+        }
+
+        mBackgroundHandler.removeCallbacks(
+                mMotionPrebufferRunnable
+        );
+
+        mBackgroundHandler.postDelayed(
+                mMotionPrebufferRunnable,
+                delayMs
+        );
+    }
+
+    private void startMotionPrebufferPump() {
+        synchronized (mMotionBurstLock) {
+            mMotionPrebufferEnabled = true;
+            mMotionPrebufferFailureCount = 0;
+            mMotionPrebufferRequestInFlight = false;
+            mMotionPrebufferAcceptUntilNs = 0L;
+            mMotionPrebufferTargetExposureNs = 0L;
+            mMotionPrebufferTargetIso = 0;
+            closeMotionPrebufferLocked();
+        }
+
+        scheduleMotionPrebufferPump(250L);
+    }
+
+    private void stopMotionPrebufferPump() {
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.removeCallbacks(
+                    mMotionPrebufferRunnable
+            );
+        }
+
+        synchronized (mMotionBurstLock) {
+            mMotionPrebufferEnabled = false;
+            mMotionPrebufferRequestInFlight = false;
+            mMotionPrebufferAcceptUntilNs = 0L;
+            closeMotionPrebufferLocked();
+        }
+    }
+
+    private void submitNextMotionPrebufferFrame() {
+        if (!mMotionPrebufferEnabled
+                || mBackgroundHandler == null
+                || mCameraDevice == null
+                || mCaptureSession == null
+                || mImageReaderRaw == null
+                || PhotonCamera.getSettings().selectedMode
+                        != CameraMode.MOTION
+                || mZslCapturing
+                || CaptureController.isProcessing
+                || mMotionBurstActive
+                || mMotionPrebufferRequestInFlight) {
+
+            scheduleMotionPrebufferPump(250L);
+            return;
+        }
+
+        final long[] target =
+                calculateMotionPrebufferTarget();
+
+        final long targetExposureNs = target[0];
+        final int targetIso = (int) target[1];
+
+        synchronized (mMotionBurstLock) {
+            pruneMotionPrebufferLocked(
+                    android.os.SystemClock
+                            .elapsedRealtimeNanos()
+            );
+
+            if (mMotionPrebufferTargetExposureNs > 0L
+                    && mMotionPrebufferTargetIso > 0) {
+
+                double shutterDifferenceEv =
+                        motionEvDifference(
+                                targetExposureNs,
+                                mMotionPrebufferTargetExposureNs
+                        );
+
+                double isoDifferenceEv =
+                        motionEvDifference(
+                                targetIso,
+                                mMotionPrebufferTargetIso
+                        );
+
+                if (shutterDifferenceEv > 0.50
+                        || isoDifferenceEv > 0.75) {
+
+                    closeMotionPrebufferLocked();
+
+                    Log.d(
+                            MOTION_LOG_TAG,
+                            "PREBUFFER_FLUSHED"
+                                    + " reason=target_changed"
+                                    + " shutterDifferenceEv="
+                                    + shutterDifferenceEv
+                                    + " isoDifferenceEv="
+                                    + isoDifferenceEv
+                    );
+                }
+            }
+
+            mMotionPrebufferTargetExposureNs =
+                    targetExposureNs;
+
+            mMotionPrebufferTargetIso = targetIso;
+
+            if (mMotionPrebufferFrames.size()
+                    >= MOTION_PREBUFFER_MAX_FRAMES) {
+
+                scheduleMotionPrebufferPump(120L);
+                return;
+            }
+
+            mMotionPrebufferRequestInFlight = true;
+            mMotionPrebufferAcceptUntilNs =
+                    android.os.SystemClock
+                            .elapsedRealtimeNanos()
+                            + 750_000_000L;
+        }
+
+        try {
+            CaptureRequest.Builder builder =
+                    mCameraDevice.createCaptureRequest(
+                            CameraDevice.TEMPLATE_STILL_CAPTURE
+                    );
+
+            builder.addTarget(
+                    mImageReaderRaw.getSurface()
+            );
+
+            builder.set(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_OFF
+            );
+
+            builder.set(
+                    CaptureRequest.SENSOR_EXPOSURE_TIME,
+                    targetExposureNs
+            );
+
+            builder.set(
+                    CaptureRequest.SENSOR_SENSITIVITY,
+                    targetIso
+            );
+
+            builder.set(
+                    CaptureRequest.JPEG_ORIENTATION,
+                    PhotonCamera.getGravity()
+                            .getCameraRotation(
+                                    mSensorOrientation
+                            )
+            );
+
+            configureMotionStabilizationRequest(
+                    builder
+            );
+
+            VendorTagUtils.builderSessionApply(
+                    builder,
+                    true,
+                    useMaximumResolutionKey,
+                    physicalID
+            );
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "PREBUFFER_REQUEST"
+                            + " camera="
+                            + physicalID
+                            + " exposureNs="
+                            + targetExposureNs
+                            + " iso="
+                            + targetIso
+            );
+
+            mCaptureSession.capture(
+                    builder.build(),
+                    mMotionPrebufferCaptureCallback,
+                    mBackgroundHandler
+            );
+        } catch (Exception e) {
+            synchronized (mMotionBurstLock) {
+                mMotionPrebufferRequestInFlight = false;
+                mMotionPrebufferFailureCount++;
+
+                if (mMotionPrebufferFailureCount >= 3) {
+                    mMotionPrebufferEnabled = false;
+                    closeMotionPrebufferLocked();
+                }
+            }
+
+            Log.e(
+                    MOTION_LOG_TAG,
+                    "PREBUFFER_REQUEST_FAILED "
+                            + Log.getStackTraceString(e)
+            );
+
+            scheduleMotionPrebufferPump(500L);
+        }
+    }
+
     private void tryMatchControlledMotionFrameLocked(
             long timestamp
     ) {
@@ -2688,12 +3405,23 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 }
             }
 
+            for (ImageFrame frame : mMotionPreselectedFrames) {
+                if (frame != null) {
+                    frame.close();
+                }
+            }
+
             mMotionBurstFrames.clear();
+            mMotionPreselectedFrames.clear();
             closePendingMotionFramesLocked();
             mMotionBurstExposureTimeNs.clear();
             mMotionBurstSensitivity.clear();
+            mMotionPreselectedExposureTimeNs.clear();
+            mMotionPreselectedSensitivity.clear();
             mMotionBurstExpectedFrames = 0;
             mMotionBurstFirstTimestampNs = 0L;
+            mMotionPostShutterFrameOverride = 0;
+            mMotionCombinedRequestedFrames = 0;
         }
 
         mImageSaver.implementation.bufferLock = false;
@@ -2754,6 +3482,67 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
         final ArrayList<ImageFrame> candidates =
                 new ArrayList<>();
+
+        /*
+         * Freeze the controlled pre-buffer at shutter press. Only recent,
+         * timestamp-matched controlled frames are admitted; the visible
+         * preview remains under normal AE.
+         */
+        synchronized (mMotionBurstLock) {
+            pruneMotionPrebufferLocked(
+                    mMotionShutterTimestampNs
+            );
+
+            while (!mMotionPrebufferFrames.isEmpty()) {
+                ImageFrame frame =
+                        mMotionPrebufferFrames.pollFirst();
+
+                if (frame == null) {
+                    continue;
+                }
+
+                Long exposureNs =
+                        mMotionPrebufferExposureTimeNs.remove(
+                                frame.timestamp
+                        );
+
+                Integer iso =
+                        mMotionPrebufferSensitivity.remove(
+                                frame.timestamp
+                        );
+
+                if (exposureNs != null
+                        && exposureNs > 0L
+                        && iso != null
+                        && iso > 0) {
+
+                    mZslExposureTimeNs.put(
+                            frame.timestamp,
+                            exposureNs
+                    );
+
+                    mZslSensitivity.put(
+                            frame.timestamp,
+                            iso
+                    );
+
+                    mZslExposureEnergy.put(
+                            frame.timestamp,
+                            ExposureIndex.time2sec(
+                                    exposureNs
+                            ) * iso
+                    );
+
+                    candidates.add(frame);
+                } else {
+                    frame.close();
+                }
+            }
+
+            closeMotionPrebufferLocked();
+            mMotionPrebufferRequestInFlight = false;
+            mMotionPrebufferAcceptUntilNs = 0L;
+        }
 
         synchronized (mZslBufferLock) {
             while (!mZslRingBuffer.isEmpty()) {
@@ -3126,664 +3915,112 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         );
 
         /*
-         * The rolling buffer may still be filling immediately after opening
-         * the camera or switching lenses. Preserve the known-good dedicated
-         * post-shutter path as the fallback instead of processing an empty or
-         * unusably small stack.
+         * Controlled hybrid capture:
+         * keep at most eight recent pre-shutter frames, but always reserve at
+         * least one post-shutter frame so the final stack represents the
+         * moment the user pressed the shutter. Any missing frames are captured
+         * by the proven controlled post-shutter path.
          */
-        if (candidates.size() < requestedFrames) {
-            for (ImageFrame frame : candidates) {
-                frame.close();
-            }
-
-            mZslCapturing = false;
-
-            Log.w(
-                    MOTION_LOG_TAG,
-                    "RING_NOT_READY candidates="
-                            + candidates.size()
-                            + " required="
-                            + requestedFrames
-                            + " action=post_shutter_fallback"
-            );
-
-            captureDedicatedMotionFallback();
-            return;
-        }
-
-        final long[] candidateTimestamps =
-                new long[candidates.size()];
-
-        final long[] candidateExposureTimes =
-                new long[candidates.size()];
-
-        long representativeExposureNs = 0L;
-
-        for (int i = 0; i < candidates.size(); i++) {
-            ImageFrame frame = candidates.get(i);
-            candidateTimestamps[i] = frame.timestamp;
-
-            Long exposureNs =
-                    mZslExposureTimeNs.get(frame.timestamp);
-
-            if (exposureNs != null && exposureNs > 0L) {
-                candidateExposureTimes[i] = exposureNs;
-                representativeExposureNs = exposureNs;
-            }
-        }
-
-        if (representativeExposureNs <= 0L
-                && mPreviewCaptureResult != null) {
-
-            Long previewExposure =
-                    mPreviewCaptureResult.get(
-                            CaptureResult.SENSOR_EXPOSURE_TIME
-                    );
-
-            if (previewExposure != null) {
-                representativeExposureNs = previewExposure;
-            }
-        }
-
-        for (int i = 0; i < candidateExposureTimes.length; i++) {
-            if (candidateExposureTimes[i] <= 0L) {
-                candidateExposureTimes[i] =
-                        Math.max(1L, representativeExposureNs);
-            }
-        }
-
-        PhotonCamera.getGyro().buildZslBurstShakiness(
-                candidateTimestamps,
-                candidateExposureTimes,
-                BurstShakiness
-        );
-
-        PhotonCamera.getGyro().CompleteSequence();
-
-        /*
-         * Balanced frame selection:
-         * - severe-shake frames naturally sort to the end;
-         * - timestamp proximity breaks equal-shake ties;
-         * - enough frames remain for temporal noise reduction;
-         * - the sharpest/stablest frame becomes HDRX reference frame 0.
-         */
-        final class ScoredMotionFrame {
-            final ImageFrame frame;
-            final GyroBurst gyro;
-            final float gyroShake;
-            final float rawSharpness;
-            final float oisMotion;
-            final boolean oisActive;
-            final boolean eisActive;
-            final long shutterDistanceNs;
-            final boolean metadataValid;
-
-            float combinedScore;
-            boolean severeBlur;
-
-            ScoredMotionFrame(
-                    ImageFrame frame,
-                    GyroBurst gyro,
-                    float gyroShake,
-                    float rawSharpness,
-                    float oisMotion,
-                    boolean oisActive,
-                    boolean eisActive,
-                    long shutterDistanceNs,
-                    boolean metadataValid
-            ) {
-                this.frame = frame;
-                this.gyro = gyro;
-                this.gyroShake = gyroShake;
-                this.rawSharpness = rawSharpness;
-                this.oisMotion = oisMotion;
-                this.oisActive = oisActive;
-                this.eisActive = eisActive;
-                this.shutterDistanceNs = shutterDistanceNs;
-                this.metadataValid = metadataValid;
-            }
-        }
-
-        ArrayList<ScoredMotionFrame> scored =
-                new ArrayList<>();
-
-        ArrayList<Float> validGyroScores =
-                new ArrayList<>();
-
-        ArrayList<Float> validSharpnessScores =
-                new ArrayList<>();
-
-        long maximumShutterDistanceNs = 1L;
-
-        for (int i = 0; i < candidates.size(); i++) {
-            ImageFrame frame = candidates.get(i);
-
-            GyroBurst gyro =
-                    i < BurstShakiness.size()
-                            ? BurstShakiness.get(i)
-                            : new GyroBurst(1);
-
-            float gyroShake =
-                    Float.isFinite(gyro.shakiness)
-                            ? gyro.shakiness
-                            : Float.MAX_VALUE;
-
-            float rawSharpness =
-                    mZslRawSharpness.getOrDefault(
-                            frame.timestamp,
-                            0.0f
-                    );
-
-            float oisMotion =
-                    mZslOisMotion.getOrDefault(
-                            frame.timestamp,
-                            0.0f
-                    );
-
-            int oisMode =
-                    mZslOisMode.getOrDefault(
-                            frame.timestamp,
-                            CaptureResult
-                                    .LENS_OPTICAL_STABILIZATION_MODE_OFF
-                    );
-
-            int eisMode =
-                    mZslEisMode.getOrDefault(
-                            frame.timestamp,
-                            CaptureResult
-                                    .CONTROL_VIDEO_STABILIZATION_MODE_OFF
-                    );
-
-            boolean metadataValid =
-                    mZslExposureTimeNs.containsKey(
-                            frame.timestamp
-                    )
-                    && mZslSensitivity.containsKey(
-                            frame.timestamp
-                    );
-
-            long shutterDistanceNs =
-                    Math.abs(
-                            mMotionShutterTimestampNs
-                                    - frame.timestamp
-                    );
-
-            maximumShutterDistanceNs =
-                    Math.max(
-                            maximumShutterDistanceNs,
-                            shutterDistanceNs
-                    );
-
-            if (metadataValid
-                    && Float.isFinite(gyroShake)
-                    && gyroShake < Float.MAX_VALUE) {
-
-                validGyroScores.add(gyroShake);
-            }
-
-            if (metadataValid && rawSharpness > 0.0f) {
-                validSharpnessScores.add(rawSharpness);
-            }
-
-            scored.add(
-                    new ScoredMotionFrame(
-                            frame,
-                            gyro,
-                            gyroShake,
-                            rawSharpness,
-                            oisMotion,
-                            oisMode
-                                    == CaptureResult
-                                            .LENS_OPTICAL_STABILIZATION_MODE_ON,
-                            eisMode
-                                    != CaptureResult
-                                            .CONTROL_VIDEO_STABILIZATION_MODE_OFF,
-                            shutterDistanceNs,
-                            metadataValid
-                    )
-            );
-        }
-
-        float medianGyro =
-                Math.max(
-                        0.000001f,
-                        medianFloat(validGyroScores)
-                );
-
-        float medianSharpness =
-                Math.max(
-                        0.000001f,
-                        medianFloat(validSharpnessScores)
-                );
-
-        for (ScoredMotionFrame item : scored) {
-            if (!item.metadataValid) {
-                item.combinedScore = Float.MAX_VALUE;
-                item.severeBlur = true;
-                continue;
-            }
-
-            float normalizedGyro =
-                    item.gyroShake / medianGyro;
-
-            float normalizedSoftness =
-                    medianSharpness
-                            / Math.max(
-                                    0.000001f,
-                                    item.rawSharpness
-                            );
-
-            float normalizedAge =
-                    (float) item.shutterDistanceNs
-                            / maximumShutterDistanceNs;
-
-            /*
-             * OIS-active frames should not be penalized as strongly merely
-             * because the phone gyro recorded motion. The RAW sharpness
-             * measurement remains the final evidence of actual blur.
-             */
-            float gyroWeight =
-                    item.oisActive
-                            ? 0.35f
-                            : 0.65f;
-
-            item.combinedScore =
-                    gyroWeight * normalizedGyro
-                            + 0.85f * normalizedSoftness
-                            + 0.25f * normalizedAge;
-
-            item.severeBlur =
-                    item.rawSharpness
-                            < medianSharpness * 0.35f
-                    && item.gyroShake
-                            > medianGyro * 3.0f;
-        }
-
-        scored.sort((left, right) -> {
-            if (left.metadataValid != right.metadataValid) {
-                return left.metadataValid ? -1 : 1;
-            }
-
-            if (left.severeBlur != right.severeBlur) {
-                return left.severeBlur ? 1 : -1;
-            }
-
-            int scoreCompare =
-                    Float.compare(
-                            left.combinedScore,
-                            right.combinedScore
-                    );
-
-            if (scoreCompare != 0) {
-                return scoreCompare;
-            }
-
-            return Long.compare(
-                    left.shutterDistanceNs,
-                    right.shutterDistanceNs
-            );
-        });
-
-        int selectedCount =
-                Math.min(requestedFrames, scored.size());
-
-        ArrayList<ImageFrame> selected =
-                new ArrayList<>(selectedCount);
-
-        ArrayList<GyroBurst> selectedGyro =
-                new ArrayList<>(selectedCount);
-
-        HashMap<Long, Double> selectedExposures =
-                new HashMap<>();
-
-        HashMap<Long, Long> selectedActualExposureNs =
-                new HashMap<>();
-
-        HashMap<Long, Integer> selectedActualIso =
-                new HashMap<>();
-
-        for (int i = 0; i < scored.size(); i++) {
-            ScoredMotionFrame item = scored.get(i);
-
-            if (i < selectedCount) {
-                item.frame.frameGyro = item.gyro;
-                selected.add(item.frame);
-                selectedGyro.add(item.gyro);
-
-                Double exposureEnergy =
-                        mZslExposureEnergy.get(
-                                item.frame.timestamp
-                        );
-
-                if (exposureEnergy == null) {
-                    long exposureNs =
-                            mZslExposureTimeNs.getOrDefault(
-                                    item.frame.timestamp,
-                                    representativeExposureNs
-                            );
-
-                    int sensitivity =
-                            mZslSensitivity.getOrDefault(
-                                    item.frame.timestamp,
-                                    Math.max(100, mPreviewIso)
-                            );
-
-                    exposureEnergy =
-                            ExposureIndex.time2sec(exposureNs)
-                                    * sensitivity;
-                }
-
-                selectedExposures.put(
-                        item.frame.timestamp,
-                        exposureEnergy
-                );
-
-                Long selectedExposureNs =
-                        mZslExposureTimeNs.get(
-                                item.frame.timestamp
-                        );
-
-                Integer selectedIso =
-                        mZslSensitivity.get(
-                                item.frame.timestamp
-                        );
-
-                if (selectedExposureNs != null
-                        && selectedExposureNs > 0L
-                        && selectedIso != null
-                        && selectedIso > 0) {
-
-                    selectedActualExposureNs.put(
-                            item.frame.timestamp,
-                            selectedExposureNs
-                    );
-
-                    selectedActualIso.put(
-                            item.frame.timestamp,
-                            selectedIso
-                    );
-                }
-
-                Log.d(
-                        MOTION_LOG_TAG,
-                        "FRAME"
-                                + " candidate="
-                                + i
-                                + " timestamp="
-                                + item.frame.timestamp
-                                + " dtShutterNs="
-                                + item.shutterDistanceNs
-                                + " shake="
-                                + item.gyroShake
-                                + " exposureNs="
-                                + mZslExposureTimeNs.get(
-                                        item.frame.timestamp
-                                )
-                                + " iso="
-                                + mZslSensitivity.get(
-                                        item.frame.timestamp
-                                )
-                                + " rawSharpness="
-                                + item.rawSharpness
-                                + " oisActive="
-                                + item.oisActive
-                                + " oisMotion="
-                                + item.oisMotion
-                                + " eisActive="
-                                + item.eisActive
-                                + " score="
-                                + item.combinedScore
-                                + " decision=SELECTED"
-                );
-            } else {
-                Log.d(
-                        MOTION_LOG_TAG,
-                        "FRAME"
-                                + " candidate="
-                                + i
-                                + " timestamp="
-                                + item.frame.timestamp
-                                + " dtShutterNs="
-                                + item.shutterDistanceNs
-                                + " shake="
-                                + item.gyroShake
-                                + " rawSharpness="
-                                + item.rawSharpness
-                                + " oisActive="
-                                + item.oisActive
-                                + " score="
-                                + item.combinedScore
-                                + " metadataValid="
-                                + item.metadataValid
-                                + " decision="
-                                + (
-                                    !item.metadataValid
-                                            ? "REJECTED_INVALID_METADATA"
-                                            : item.severeBlur
-                                                    ? "REJECTED_SEVERE_BLUR"
-                                                    : "NOT_SELECTED_RANK_LIMIT"
-                                )
-                );
-
-                item.frame.close();
-            }
-        }
-
-        synchronized (mZslBufferLock) {
-            for (ImageFrame frame : selected) {
-                mZslExposureEnergy.remove(frame.timestamp);
-                mZslExposureTimeNs.remove(frame.timestamp);
-                mZslSensitivity.remove(frame.timestamp);
-                mZslRawSharpness.remove(frame.timestamp);
-                mZslOisMotion.remove(frame.timestamp);
-                mZslOisMode.remove(frame.timestamp);
-                mZslEisMode.remove(frame.timestamp);
-            }
-        }
-
-        if (selected.size() < MOTION_MIN_PROCESS_FRAMES) {
-            for (ImageFrame frame : selected) {
-                frame.close();
-            }
-
-            mZslCapturing = false;
-
-            Log.e(
-                    MOTION_LOG_TAG,
-                    "MOTION_RESULT=FAILED"
-                            + " stage=FRAME_SELECTION"
-                            + " selected="
-                            + selected.size()
-            );
-
-            cameraEventsListener.onProcessingError(
-                    "Not enough stable Motion frames"
-            );
-            return;
-        }
-
-        mImageSaver = new ImageSaver(cameraEventsListener);
-        mImageSaver.setFrameCount(selected.size());
-        mImageSaver.setImageFormat(CaptureController.RAW_FORMAT);
-
-        mImageSaver.implementation =
-                ImageSaverSelector.getImageSaver(
-                        CaptureController.RAW_FORMAT,
-                        mImageSaver.implementation
-                );
-
-        mImageSaver.implementation.frameCount =
-                selected.size();
-
-        synchronized (SaverImplementation.IMAGE_BUFFER) {
-            SaverImplementation.IMAGE_BUFFER.clear();
-            SaverImplementation.IMAGE_BUFFER.addAll(selected);
-        }
-
-        mCaptureResult = mPreviewCaptureResult;
-        mCaptureRequest = mPreviewCaptureRequest;
-        mMeasuredFrameCnt = selected.size();
-        mExposures = selectedExposures;
-
-        cameraEventsListener.onFrameCountSet(selected.size());
-        cameraEventsListener.onCaptureStillPictureStarted(
-                "Motion ZSL capture"
-        );
-        cameraEventsListener.onBurstPrepared(null);
-
-        double frameTimeSeconds =
-                representativeExposureNs > 0L
-                        ? ExposureIndex.time2sec(
-                                representativeExposureNs
+        candidates.sort(
+                (left, right) ->
+                        Long.compare(
+                                right.timestamp,
+                                left.timestamp
                         )
-                        : ExposureIndex.time2sec(
-                                IsoExpoSelector.GenerateExpoPair(
-                                        -1,
-                                        this
-                                ).exposure
+        );
+
+        final int maximumPreFrames =
+                Math.min(
+                        MOTION_PREBUFFER_MAX_FRAMES,
+                        Math.max(0, requestedFrames - 1)
+                );
+
+        final int preFramesToUse =
+                Math.min(
+                        maximumPreFrames,
+                        candidates.size()
+                );
+
+        synchronized (mMotionBurstLock) {
+            for (ImageFrame old : mMotionPreselectedFrames) {
+                if (old != null) {
+                    old.close();
+                }
+            }
+
+            mMotionPreselectedFrames.clear();
+            mMotionPreselectedExposureTimeNs.clear();
+            mMotionPreselectedSensitivity.clear();
+
+            for (int i = 0; i < candidates.size(); i++) {
+                ImageFrame frame = candidates.get(i);
+
+                Long exposureNs =
+                        mZslExposureTimeNs.remove(
+                                frame.timestamp
                         );
 
-        for (int i = 0; i < selected.size(); i++) {
-            cameraEventsListener.onFrameCaptureStarted(null);
-            cameraEventsListener.onFrameCaptureCompleted(
-                    new TimerFrameCountViewModel.FrameCntTime(
-                            i,
-                            selected.size(),
-                            frameTimeSeconds
-                    )
-            );
-        }
+                Integer iso =
+                        mZslSensitivity.remove(
+                                frame.timestamp
+                        );
 
-        cameraEventsListener.onCaptureSequenceCompleted(null);
+                mZslExposureEnergy.remove(
+                        frame.timestamp
+                );
 
-        /*
-         * Every frame gets its own ExpoPair object. Equal values are allowed,
-         * but mutable pair state must never be shared between frames.
-         */
-        IsoExpoSelector.fullpairs.clear();
+                if (i < preFramesToUse
+                        && exposureNs != null
+                        && exposureNs > 0L
+                        && iso != null
+                        && iso > 0) {
 
-        for (int i = 0; i < selected.size(); i++) {
-            ImageFrame selectedFrame = selected.get(i);
+                    mMotionPreselectedFrames.add(frame);
 
-            IsoExpoSelector.ExpoPair actualPair =
-                    IsoExpoSelector.GenerateExpoPair(
-                            i,
-                            this
+                    mMotionPreselectedExposureTimeNs.put(
+                            frame.timestamp,
+                            exposureNs
                     );
 
-            Long actualExposure =
-                    selectedActualExposureNs.get(
-                            selectedFrame.timestamp
+                    mMotionPreselectedSensitivity.put(
+                            frame.timestamp,
+                            iso
                     );
-
-            Integer actualIso =
-                    selectedActualIso.get(
-                            selectedFrame.timestamp
-                    );
-
-            if (actualExposure != null
-                    && actualExposure > 0L) {
-                actualPair.exposure = actualExposure;
+                } else {
+                    frame.close();
+                }
             }
 
-            if (actualIso != null && actualIso > 0) {
-                actualPair.iso = actualIso;
-            }
+            mMotionCombinedRequestedFrames =
+                    requestedFrames;
 
-            actualPair.layerMpy = 1.0f;
-            selectedFrame.pair = actualPair;
-
-            IsoExpoSelector.fullpairs.add(actualPair);
-
-            Log.d(
-                    MOTION_LOG_TAG,
-                    "ACTUAL_EXPO_PAIR"
-                            + " index="
-                            + i
-                            + " timestamp="
-                            + selectedFrame.timestamp
-                            + " exposureNs="
-                            + actualPair.exposure
-                            + " iso="
-                            + actualPair.iso
-            );
+            mMotionPostShutterFrameOverride =
+                    Math.max(
+                            1,
+                            requestedFrames
+                                    - mMotionPreselectedFrames.size()
+                    );
         }
 
-        final ArrayList<GyroBurst> processingGyro =
-                new ArrayList<>(selectedGyro);
-
-        final HashMap<Long, Double> processingExposures =
-                new HashMap<>(selectedExposures);
-
-        final CaptureResult processingResult =
-                mPreviewCaptureResult;
-
-        final CaptureRequest processingRequest =
-                mPreviewCaptureRequest;
-
-        mImageSaver.implementation.bufferLock = false;
-        mImageSaver.updateFrameCount(selected.size());
-
-        /*
-         * Preview repeating was never stopped. HDRX is now entirely
-         * background work from the camera/viewfinder perspective.
-         */
         Log.d(
                 MOTION_LOG_TAG,
-                "PREVIEW_CONTINUES"
-                        + " selected="
-                        + selected.size()
-                        + " rejected="
-                        + (candidates.size() - selected.size())
-                        + " elapsedMs="
-                        + (
-                            android.os.SystemClock.elapsedRealtime()
-                                    - mMotionCaptureStartMs
-                        )
+                "PREBUFFER_TOP_UP"
+                        + " requested="
+                        + requestedFrames
+                        + " pre="
+                        + preFramesToUse
+                        + " post="
+                        + mMotionPostShutterFrameOverride
+                        + " maxPre="
+                        + maximumPreFrames
         );
 
-        processExecutor.execute(() -> {
-            try {
-                Log.d(
-                        MOTION_LOG_TAG,
-                        "HDRX_STARTED frames="
-                                + selected.size()
-                );
+        mZslCapturing = false;
+        captureDedicatedMotionFallback();
+        return;
 
-                mImageSaver.runRaw(
-                        mCameraCharacteristics,
-                        processingResult,
-                        processingRequest,
-                        processingGyro,
-                        cameraRotation,
-                        processingExposures
-                );
-
-                Log.d(
-                        MOTION_LOG_TAG,
-                        "MOTION_RESULT=SUCCESS"
-                                + " totalElapsedMs="
-                                + (
-                                    android.os.SystemClock.elapsedRealtime()
-                                            - mMotionCaptureStartMs
-                                )
-                );
-            } catch (Exception e) {
-                Log.e(
-                        MOTION_LOG_TAG,
-                        "MOTION_RESULT=FAILED"
-                                + " stage=HDRX "
-                                + Log.getStackTraceString(e)
-                );
-
-                cameraEventsListener.onProcessingError(
-                        e.getLocalizedMessage()
-                );
-            } finally {
-                mZslCapturing = false;
-            }
-        });
     }
+
 
     /*
      * Known-good 0.9726135 post-shutter implementation retained only for the
@@ -3892,8 +4129,17 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
             synchronized (mMotionBurstLock) {
                 mMotionBurstActive = false;
+
                 completedFrames =
-                        new ArrayList<>(mMotionBurstFrames);
+                        new ArrayList<>(
+                                mMotionPreselectedFrames
+                        );
+
+                completedFrames.addAll(
+                        mMotionBurstFrames
+                );
+
+                mMotionPreselectedFrames.clear();
                 mMotionBurstFrames.clear();
                 closePendingMotionFramesLocked();
             }
@@ -3964,9 +4210,28 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                             IsoExpoSelector.GenerateExpoPair(i, this);
 
                     Long actualExposureNs =
-                            mMotionBurstExposureTimeNs.get(completedFrame.timestamp);
+                            mMotionBurstExposureTimeNs.get(
+                                    completedFrame.timestamp
+                            );
+
                     Integer actualIso =
-                            mMotionBurstSensitivity.get(completedFrame.timestamp);
+                            mMotionBurstSensitivity.get(
+                                    completedFrame.timestamp
+                            );
+
+                    if (actualExposureNs == null) {
+                        actualExposureNs =
+                                mMotionPreselectedExposureTimeNs.get(
+                                        completedFrame.timestamp
+                                );
+                    }
+
+                    if (actualIso == null) {
+                        actualIso =
+                                mMotionPreselectedSensitivity.get(
+                                        completedFrame.timestamp
+                                );
+                    }
 
                     if (actualExposureNs != null && actualExposureNs > 0L) {
                         actualPair.exposure = actualExposureNs;
@@ -3987,6 +4252,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 }
                 mMotionBurstExposureTimeNs.clear();
                 mMotionBurstSensitivity.clear();
+                mMotionPreselectedExposureTimeNs.clear();
+                mMotionPreselectedSensitivity.clear();
             }
 
             mImageSaver.implementation.bufferLock = false;
@@ -4048,6 +4315,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             } finally {
                 mImageSaver.implementation.bufferLock = false;
                 mZslCapturing = false;
+                mMotionPostShutterFrameOverride = 0;
+                mMotionCombinedRequestedFrames = 0;
+
+                startMotionPrebufferPump();
 
                 mBackgroundHandler.post(() -> {
                     try {
@@ -4143,7 +4414,25 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             captures = new ArrayList<>();
             BurstShakiness = new ArrayList<>();
             mExposures = new HashMap<>();
-            int frameCount = FrameNumberSelector.getFrames();
+            int frameCount =
+                    FrameNumberSelector.getFrames();
+
+            if (PhotonCamera.getSettings().selectedMode
+                    == CameraMode.MOTION
+                    && mMotionPostShutterFrameOverride > 0) {
+
+                frameCount =
+                        mMotionPostShutterFrameOverride;
+
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "POST_SHUTTER_TOP_UP_COUNT"
+                                + " postFrames="
+                                + frameCount
+                                + " combinedRequested="
+                                + mMotionCombinedRequestedFrames
+                );
+            }
 
             //if (frameCount == 1) frameCount++;
             cameraEventsListener.onFrameCountSet(frameCount);

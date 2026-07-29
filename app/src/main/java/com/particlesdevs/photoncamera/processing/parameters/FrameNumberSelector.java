@@ -8,7 +8,7 @@ public class FrameNumberSelector {
     public static int frameCount;
     public static int throwCount;
     public static int getFrames() {
-        int frames = Math.max(1, PhotonCamera.getSettings().frameCount);
+        int frames = Math.min(50, Math.max(1, PhotonCamera.getSettings().frameCount));
         CameraMode mode = PhotonCamera.getSettings().selectedMode;
 
         if (mode == CameraMode.UNLIMITED || mode == CameraMode.RAWVIDEO) {

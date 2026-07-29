@@ -279,7 +279,16 @@ public class PreferenceKeys {
     }
 
     public static int getFrameCountValue() {
-        return preferenceKeys.settingsManager.getInteger(SCOPE_GLOBAL, Key.KEY_FRAME_COUNT);
+        return Math.min(
+                50,
+                Math.max(
+                        1,
+                        preferenceKeys.settingsManager.getInteger(
+                                SCOPE_GLOBAL,
+                                Key.KEY_FRAME_COUNT
+                        )
+                )
+        );
     }
 
     public static float getSharpnessValue() {

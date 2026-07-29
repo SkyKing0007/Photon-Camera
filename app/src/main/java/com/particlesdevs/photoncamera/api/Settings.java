@@ -54,7 +54,7 @@ public class Settings {
 
     public void loadCache() {
         noiseReduction = PreferenceKeys.isSystemNrOn();
-        frameCount = PreferenceKeys.getFrameCountValue();
+        frameCount = Math.min(50, Math.max(1, PreferenceKeys.getFrameCountValue()));
         align = PreferenceKeys.isDisableAligningOn();
         lumenCount = PreferenceKeys.getLumaNrValue();
         chromaCount = PreferenceKeys.getChromaNrValue();
