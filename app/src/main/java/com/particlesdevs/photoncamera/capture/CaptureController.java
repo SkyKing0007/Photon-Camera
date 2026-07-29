@@ -344,7 +344,9 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private volatile boolean mMotionBurstActive = false;
     private volatile int mMotionBurstExpectedFrames = 0;
     private volatile long mMotionBurstFirstTimestampNs = 0L;
-    private volatile boolean mMotionRollingRawSuspended = false;
+
+    private final HashMap<Long, ImageFrame> mMotionBurstPendingFrames =
+            new HashMap<>();
 
     private final HashMap<Long, Long> mMotionBurstExposureTimeNs =
             new HashMap<>();
@@ -374,6 +376,96 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 //            Message msg = new Message();
 //            msg.obj = reader;
 //            mImageSaver.processingHandler.sendMessage(msg);
+            /*
+             * Controlled Motion must be routed before the normal rolling-ZSL
+             * branch. Motion is itself a ZSL mode, so checking isZslMode()
+             * first previously swallowed every controlled RAW frame.
+             */
+            if (mMotionBurstActive) {
+                Image image = null;
+                ImageFrame frame = null;
+
+                try {
+                    image = reader.acquireNextImage();
+                    if (image == null) {
+                        return;
+                    }
+
+                    frame = mImageSaver.implementation.getFrame(image);
+                    frame.timestamp = image.getTimestamp();
+                } catch (Exception e) {
+                    Log.e(
+                            MOTION_LOG_TAG,
+                            "CONTROLLED_RAW_COPY_FAILED "
+                                    + Log.getStackTraceString(e)
+                    );
+                } finally {
+                    if (image != null) {
+                        image.close();
+                    }
+                }
+
+                if (frame == null) {
+                    return;
+                }
+
+                synchronized (mMotionBurstLock) {
+                    if (!mMotionBurstActive) {
+                        frame.close();
+                        return;
+                    }
+
+                    ImageFrame replaced =
+                            mMotionBurstPendingFrames.put(
+                                    frame.timestamp,
+                                    frame
+                            );
+
+                    if (replaced != null) {
+                        replaced.close();
+                    }
+
+                    tryMatchControlledMotionFrameLocked(
+                            frame.timestamp
+                    );
+
+                    int maximumPending =
+                            Math.max(
+                                    16,
+                                    mMotionBurstExpectedFrames * 4
+                            );
+
+                    while (mMotionBurstPendingFrames.size()
+                            > maximumPending) {
+
+                        Long oldestTimestamp = null;
+
+                        for (Long timestamp
+                                : mMotionBurstPendingFrames.keySet()) {
+                            if (oldestTimestamp == null
+                                    || timestamp < oldestTimestamp) {
+                                oldestTimestamp = timestamp;
+                            }
+                        }
+
+                        if (oldestTimestamp == null) {
+                            break;
+                        }
+
+                        ImageFrame stale =
+                                mMotionBurstPendingFrames.remove(
+                                        oldestTimestamp
+                                );
+
+                        if (stale != null) {
+                            stale.close();
+                        }
+                    }
+                }
+
+                return;
+            }
+
             if (isZslMode()) {
                 Image image = null;
                 ImageFrame frame = null;
@@ -450,76 +542,6 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
              * Do not send these frames through ImageSaver.frameCounter or the
              * Photo/Night collection state.
              */
-            if (mMotionBurstActive) {
-                Image image;
-
-                try {
-                    image = reader.acquireNextImage();
-                } catch (Exception e) {
-                    Log.w(
-                            TAG,
-                            "Motion RAW acquire failed: "
-                                    + Log.getStackTraceString(e)
-                    );
-                    return;
-                }
-
-                if (image == null) {
-                    return;
-                }
-
-                ImageFrame frame = null;
-
-                try {
-                    frame = mImageSaver.implementation.getFrame(image);
-                } catch (Exception e) {
-                    Log.e(
-                            TAG,
-                            "Motion RAW copy failed: "
-                                    + Log.getStackTraceString(e)
-                    );
-                } finally {
-                    image.close();
-                }
-
-                if (frame == null) {
-                    return;
-                }
-
-                frame.timestamp = image.getTimestamp();
-
-                long firstBurstTimestamp = mMotionBurstFirstTimestampNs;
-                if (firstBurstTimestamp <= 0L
-                        || frame.timestamp < firstBurstTimestamp) {
-                    Log.d(MOTION_LOG_TAG,
-                            "CONTROLLED_RAW_DISCARDED timestamp="
-                                    + frame.timestamp
-                                    + " firstBurstTimestamp="
-                                    + firstBurstTimestamp);
-                    frame.close();
-                    return;
-                }
-
-                synchronized (mMotionBurstLock) {
-                    if (mMotionBurstActive
-                            && mMotionBurstFrames.size()
-                            < mMotionBurstExpectedFrames) {
-
-                        mMotionBurstFrames.add(frame);
-
-                        Log.d(
-                                TAG,
-                                "Motion private RAW buffer: "
-                                        + mMotionBurstFrames.size()
-                                        + "/"
-                                        + mMotionBurstExpectedFrames
-                        );
-                    }
-                }
-
-                return;
-            }
-
             if (onUnlimited && !unlimitedStarted) {
                 return;
             }
@@ -2598,59 +2620,106 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         }
     }
 
-    private void suspendMotionRollingRawForBurst()
-            throws CameraAccessException {
-        if (mMotionRollingRawSuspended
-                || mPreviewRequestBuilder == null
-                || mCaptureSession == null
-                || mImageReaderRaw == null) {
+    private void tryMatchControlledMotionFrameLocked(
+            long timestamp
+    ) {
+        if (!mMotionBurstActive
+                || mMotionBurstFrames.size()
+                        >= mMotionBurstExpectedFrames) {
             return;
         }
 
-        mPreviewRequestBuilder.removeTarget(mImageReaderRaw.getSurface());
-        mPreviewInputRequest = mPreviewRequestBuilder.build();
-        mCaptureSession.setRepeatingRequest(
-                mPreviewInputRequest,
-                mCaptureCallback,
-                mBackgroundHandler);
+        ImageFrame frame =
+                mMotionBurstPendingFrames.get(timestamp);
 
-        Image stale;
-        try {
-            while ((stale = mImageReaderRaw.acquireNextImage()) != null) {
-                stale.close();
-            }
-        } catch (Exception ignored) {
+        Long exposureNs =
+                mMotionBurstExposureTimeNs.get(timestamp);
+
+        Integer iso =
+                mMotionBurstSensitivity.get(timestamp);
+
+        if (frame == null
+                || exposureNs == null
+                || exposureNs <= 0L
+                || iso == null
+                || iso <= 0) {
+            return;
         }
 
-        mMotionRollingRawSuspended = true;
-        Log.d(MOTION_LOG_TAG,
-                "ROLLING_RAW_SUSPENDED previewContinues=true");
+        mMotionBurstPendingFrames.remove(timestamp);
+        mMotionBurstFrames.add(frame);
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "CONTROLLED_RAW_MATCHED"
+                        + " timestamp="
+                        + timestamp
+                        + " exposureNs="
+                        + exposureNs
+                        + " iso="
+                        + iso
+                        + " matched="
+                        + mMotionBurstFrames.size()
+                        + "/"
+                        + mMotionBurstExpectedFrames
+        );
     }
 
-    private void resumeMotionRollingRawAfterBurst() {
-        if (!mMotionRollingRawSuspended
-                || mPreviewRequestBuilder == null
-                || mCaptureSession == null
-                || mImageReaderRaw == null) {
-            return;
+    private void closePendingMotionFramesLocked() {
+        for (ImageFrame frame
+                : mMotionBurstPendingFrames.values()) {
+            if (frame != null) {
+                frame.close();
+            }
         }
 
-        try {
-            mPreviewRequestBuilder.addTarget(mImageReaderRaw.getSurface());
-            mPreviewInputRequest = mPreviewRequestBuilder.build();
-            mCaptureSession.setRepeatingRequest(
-                    mPreviewInputRequest,
-                    mCaptureCallback,
-                    mBackgroundHandler);
-            Log.d(MOTION_LOG_TAG,
-                    "ROLLING_RAW_RESUMED previewContinues=true");
-        } catch (Exception e) {
-            Log.e(MOTION_LOG_TAG,
-                    "ROLLING_RAW_RESUME_FAILED "
-                            + Log.getStackTraceString(e));
-        } finally {
-            mMotionRollingRawSuspended = false;
+        mMotionBurstPendingFrames.clear();
+    }
+
+    private void recoverDedicatedMotionCapture(
+            String reason
+    ) {
+        synchronized (mMotionBurstLock) {
+            mMotionBurstActive = false;
+
+            for (ImageFrame frame : mMotionBurstFrames) {
+                if (frame != null) {
+                    frame.close();
+                }
+            }
+
+            mMotionBurstFrames.clear();
+            closePendingMotionFramesLocked();
+            mMotionBurstExposureTimeNs.clear();
+            mMotionBurstSensitivity.clear();
+            mMotionBurstExpectedFrames = 0;
+            mMotionBurstFirstTimestampNs = 0L;
         }
+
+        mImageSaver.implementation.bufferLock = false;
+        mZslCapturing = false;
+
+        Log.e(
+                MOTION_LOG_TAG,
+                "CONTROLLED_BURST_RECOVERED reason="
+                        + reason
+        );
+
+        mBackgroundHandler.post(() -> {
+            try {
+                if (!isDualSession) {
+                    unlockFocus();
+                } else {
+                    createCameraPreviewSession(false);
+                }
+            } catch (Exception e) {
+                Log.e(
+                        MOTION_LOG_TAG,
+                        "CONTROLLED_RECOVERY_PREVIEW_FAILED "
+                                + Log.getStackTraceString(e)
+                );
+            }
+        });
     }
 
     private void triggerZslCapture() {
@@ -3826,6 +3895,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 completedFrames =
                         new ArrayList<>(mMotionBurstFrames);
                 mMotionBurstFrames.clear();
+                closePendingMotionFramesLocked();
             }
 
             if (completedFrames.size() < 2) {
@@ -3833,21 +3903,23 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         TAG,
                         "Dedicated Motion HDRX cancelled: only "
                                 + completedFrames.size()
-                                + " RAW frame(s)"
+                                + " matched RAW frame(s)"
                 );
+
+                for (ImageFrame frame : completedFrames) {
+                    if (frame != null) {
+                        frame.close();
+                    }
+                }
 
                 PhotonCamera.getGyro().CompleteSequence();
 
-                mBackgroundHandler.post(() -> {
-                    if (!isDualSession) {
-                        unlockFocus();
-                    } else {
-                        createCameraPreviewSession(false);
-                    }
-                });
+                recoverDedicatedMotionCapture(
+                        "not_enough_matched_raw"
+                );
 
                 cameraEventsListener.onProcessingError(
-                        "Not enough Motion RAW frames were delivered"
+                        "Not enough matched Motion RAW frames were delivered"
                 );
                 return;
             }
@@ -3974,12 +4046,31 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         e.getLocalizedMessage()
                 );
             } finally {
-                if (isDualSession) {
-                    mBackgroundHandler.post(
-                            () -> createCameraPreviewSession(false));
-                }
-                Log.d(MOTION_LOG_TAG,
-                        "CONTROLLED_HDRX_FINISHED previewWasNeverStopped=true");
+                mImageSaver.implementation.bufferLock = false;
+                mZslCapturing = false;
+
+                mBackgroundHandler.post(() -> {
+                    try {
+                        if (!isDualSession) {
+                            unlockFocus();
+                        } else {
+                            createCameraPreviewSession(false);
+                        }
+                    } catch (Exception e) {
+                        Log.e(
+                                MOTION_LOG_TAG,
+                                "CONTROLLED_FINISH_PREVIEW_FAILED "
+                                        + Log.getStackTraceString(e)
+                        );
+                    }
+                });
+
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "CONTROLLED_HDRX_FINISHED"
+                                + " rawSurfaceStayedAttached=true"
+                                + " captureStateReleased=true"
+                );
             }
         });
     }
@@ -4282,6 +4373,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     mMotionBurstFrames.clear();
                     mMotionBurstExpectedFrames = Math.max(1, frameCount);
                     mMotionBurstFirstTimestampNs = 0L;
+                    closePendingMotionFramesLocked();
                     mMotionBurstExposureTimeNs.clear();
                     mMotionBurstSensitivity.clear();
                     mMotionBurstFinalized.set(false);
@@ -4373,6 +4465,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                             (long) time, actualExposureNs);
                                     mMotionBurstSensitivity.put(
                                             (long) time, iso);
+
+                                    tryMatchControlledMotionFrameLocked(
+                                            (long) time
+                                    );
                                 }
                                 Log.d(MOTION_LOG_TAG,
                                         "CONTROLLED_RESULT timestamp=" + time
@@ -4411,11 +4507,14 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     //activity.runOnUiThread(() -> UpdateCameraCharacteristics(PhotonCamera.getSettings().mCameraID));
                     if (PhotonCamera.getSettings().selectedMode
                             == CameraMode.MOTION) {
-                        resumeMotionRollingRawAfterBurst();
-                        Log.d(MOTION_LOG_TAG,
-                                "CONTROLLED_SEQUENCE_COMPLETED frames="
+                        Log.d(
+                                MOTION_LOG_TAG,
+                                "CONTROLLED_SEQUENCE_COMPLETED"
+                                        + " frames="
                                         + finalFrameCount
-                                        + " previewContinues=true");
+                                        + " rawSurfaceStayedAttached=true"
+                                        + " previewContinues=true"
+                        );
                         finalizeDedicatedMotionBurst(finalFrameCount);
                         return;
                     }
@@ -4493,22 +4592,29 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             } else if (PhotonCamera.getSettings().selectedMode
                     == CameraMode.MOTION) {
                 try {
-                    suspendMotionRollingRawForBurst();
                     synchronized (mMotionBurstLock) {
                         mMotionBurstFirstTimestampNs = 0L;
                         mMotionBurstActive = true;
                     }
-                    Log.d(MOTION_LOG_TAG,
-                            "CONTROLLED_BURST_SUBMITTED frames="
+
+                    Log.d(
+                            MOTION_LOG_TAG,
+                            "CONTROLLED_BURST_SUBMITTED"
+                                    + " frames="
                                     + captures.size()
-                                    + " previewContinues=true");
+                                    + " rawSurfaceStayedAttached=true"
+                                    + " previewContinues=true"
+                    );
+
                     mCaptureSession.captureBurst(
-                            captures, CaptureCallback, mBackgroundHandler);
+                            captures,
+                            CaptureCallback,
+                            mBackgroundHandler
+                    );
                 } catch (Exception e) {
-                    synchronized (mMotionBurstLock) {
-                        mMotionBurstActive = false;
-                    }
-                    resumeMotionRollingRawAfterBurst();
+                    recoverDedicatedMotionCapture(
+                            "submit_failed"
+                    );
                     throw e;
                 }
             } else {
