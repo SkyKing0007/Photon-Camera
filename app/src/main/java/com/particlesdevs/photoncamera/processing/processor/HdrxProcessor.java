@@ -191,27 +191,109 @@ public class HdrxProcessor extends ProcessorBase {
         }
 
         if (images.size() > 10) {
-            int size = (int) (images.size() - FrameNumberSelector.throwCount);
-            Log.d(TAG, "Throw Count:" + size);
-            Log.d(TAG, "Image Count:" + images.size());
-            //if (size == images.size())
-                size = (int) (images.size() * 0.75);
-            for (int i = images.size(); i > size; i--) {
-                ImageFrame cur = images.get(images.size() - 1);
-                float curunlucky = cur.frameGyro.shakiness;
-                if (curunlucky > unluckyavr * unluckypickiness) {
-                    if(normalFrames == 1 && cur.pair.curlayer == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
+            CameraMode selectedMode =
+                    PhotonCamera.getSettings().selectedMode;
+
+            if (selectedMode == CameraMode.MOTION) {
+                /*
+                 * Motion captures the complete per-lens configured burst.
+                 *
+                 * Do not automatically target 75 percent of the frames.
+                 * Remove only frames whose whole-frame gyro shakiness is a
+                 * severe outlier. Local alignment and robustness still
+                 * determine how much each retained frame contributes.
+                 */
+                final int minimumFramesToKeep =
+                        Math.max(8, (int) Math.ceil(images.size() * 0.75));
+
+                final float severeOutlierThreshold =
+                        unluckyavr * 1.80f;
+
+                for (int i = images.size() - 1;
+                     i >= 0 && images.size() > minimumFramesToKeep;
+                     i--) {
+
+                    ImageFrame candidate = images.get(i);
+
+                    if (candidate.frameGyro.shakiness
+                            <= severeOutlierThreshold) {
                         continue;
                     }
-                    if(cur.pair.curlayer == IsoExpoSelector.ExpoPair.exposureLayer.Normal){
+
+                    if (normalFrames == 1
+                            && candidate.pair.curlayer
+                            == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
+                        continue;
+                    }
+
+                    if (candidate.pair.curlayer
+                            == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
                         normalFrames--;
                     }
-                    Log.d(TAG, "Removing unlucky:" + curunlucky + " number:" + images.get(images.size() - 1).number);
-                    images.get(images.size() - 1).close();
-                    images.remove(images.size() - 1);
+
+                    Log.d(
+                            TAG,
+                            "Motion severe-outlier removal: shakiness="
+                                    + candidate.frameGyro.shakiness
+                                    + " threshold="
+                                    + severeOutlierThreshold
+                                    + " frame="
+                                    + candidate.number
+                    );
+
+                    candidate.close();
+                    images.remove(i);
                 }
+
+                Log.d(
+                        TAG,
+                        "Motion frames retained: "
+                                + images.size()
+                                + " of configured burst"
+                );
+            } else {
+                /*
+                 * Preserve the developer's existing Photo and Night behavior.
+                 */
+                int size =
+                        images.size() - FrameNumberSelector.throwCount;
+
+                Log.d(TAG, "Throw Count target:" + size);
+                Log.d(TAG, "Image Count:" + images.size());
+
+                size = (int) (images.size() * 0.75);
+
+                for (int i = images.size(); i > size; i--) {
+                    ImageFrame cur = images.get(images.size() - 1);
+                    float curunlucky = cur.frameGyro.shakiness;
+
+                    if (curunlucky > unluckyavr * unluckypickiness) {
+                        if (normalFrames == 1
+                                && cur.pair.curlayer
+                                == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
+                            continue;
+                        }
+
+                        if (cur.pair.curlayer
+                                == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
+                            normalFrames--;
+                        }
+
+                        Log.d(
+                                TAG,
+                                "Removing unlucky:"
+                                        + curunlucky
+                                        + " number:"
+                                        + cur.number
+                        );
+
+                        cur.close();
+                        images.remove(images.size() - 1);
+                    }
+                }
+
+                Log.d(TAG, "Size after removal:" + images.size());
             }
-            Log.d(TAG, "Size after removal:" + images.size());
         }
 
         float minMpy = 1000.f;

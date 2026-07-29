@@ -1891,6 +1891,16 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
         int take = Math.min(rawImages.size(), frameCount);
         int skip = rawImages.size() - take;
+
+        Log.d(
+                TAG,
+                "Motion ZSL selection: configured="
+                        + frameCount
+                        + " buffered="
+                        + rawImages.size()
+                        + " selected="
+                        + take
+        );
         for (int i = 0; i < skip; i++) {
             rawImages.get(i).close();
         }
@@ -1945,6 +1955,17 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             selected.add(frame);
         }
         int actualCount = selected.size();
+
+        if (actualCount < frameCount) {
+            Log.w(
+                    TAG,
+                    "Motion ZSL buffer not full: using "
+                            + actualCount
+                            + " of "
+                            + frameCount
+                            + " configured frames"
+            );
+        }
 
         mImageSaver = new ImageSaver(cameraEventsListener);
         mImageSaver.setFrameCount(actualCount);
