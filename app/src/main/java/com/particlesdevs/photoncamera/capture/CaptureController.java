@@ -313,6 +313,14 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private volatile int mMotionPreviewMetadataFrames = 0;
     private volatile long mMotionRequestedExposureNs = 0L;
     private volatile int mMotionRequestedIso = 0;
+
+    /*
+     * Capture-time Motion target shared by rolling compatibility and the
+     * dedicated controlled burst. It is recalculated for every shutter press.
+     */
+    private volatile long mMotionTargetExposureNs = 0L;
+    private volatile int mMotionTargetIso = 0;
+
     private volatile boolean mLoggedStabilizationVendorTags = false;
 
     private static final int MOTION_SELECTION_RESERVE = 8;
@@ -1949,6 +1957,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             mMotionPreviewMetadataFrames = 0;
             mMotionRequestedExposureNs = 0L;
             mMotionRequestedIso = 0;
+            mMotionTargetExposureNs = 0L;
+            mMotionTargetIso = 0;
             mLoggedStabilizationVendorTags = false;
         }
         // Drain any frames still queued in the RAW ImageReader to prevent them leaking
@@ -2714,34 +2724,156 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     );
         }
 
-        IsoExpoSelector.ExpoPair desiredMotionPair =
+        IsoExpoSelector.ExpoPair selectorMotionPair =
                 IsoExpoSelector.GenerateExpoPair(-1, this);
 
-        final long desiredMotionExposureNs =
-                desiredMotionPair != null ? desiredMotionPair.exposure : 0L;
-        final int desiredMotionIso =
-                desiredMotionPair != null ? desiredMotionPair.iso : 0;
+        Range<Long> exposureRange =
+                mCameraCharacteristics.get(
+                        CameraCharacteristics
+                                .SENSOR_INFO_EXPOSURE_TIME_RANGE
+                );
 
-        final double latestPreviewEnergy =
-                desiredMotionExposureNs > 0L && desiredMotionIso > 0
-                        ? ExposureIndex.time2sec(desiredMotionExposureNs)
-                                * desiredMotionIso
-                        : (latestPreviewExposureNs != null
-                                && latestPreviewExposureNs > 0L
-                                && latestPreviewIso != null
-                                && latestPreviewIso > 0
-                                ? ExposureIndex.time2sec(latestPreviewExposureNs)
-                                        * latestPreviewIso
-                                : 0.0);
+        Range<Integer> sensitivityRange =
+                mCameraCharacteristics.get(
+                        CameraCharacteristics
+                                .SENSOR_INFO_SENSITIVITY_RANGE
+                );
 
-        Log.d(MOTION_LOG_TAG,
-                "MOTION_TARGET_EXPOSURE desiredExposureNs="
+        final long motionMaximumExposureNs =
+                66_666_667L; // approximately 1/15 second
+
+        long minimumExposureNs =
+                exposureRange != null
+                        ? exposureRange.getLower()
+                        : 1_000_000L;
+
+        long maximumExposureNs =
+                exposureRange != null
+                        ? Math.min(
+                                exposureRange.getUpper(),
+                                motionMaximumExposureNs
+                        )
+                        : motionMaximumExposureNs;
+
+        int minimumIso =
+                sensitivityRange != null
+                        ? sensitivityRange.getLower()
+                        : 50;
+
+        int maximumIso =
+                sensitivityRange != null
+                        ? sensitivityRange.getUpper()
+                        : 12_800;
+
+        double previewEnergy =
+                latestPreviewExposureNs != null
+                        && latestPreviewExposureNs > 0L
+                        && latestPreviewIso != null
+                        && latestPreviewIso > 0
+                        ? ExposureIndex.time2sec(
+                                latestPreviewExposureNs
+                        ) * latestPreviewIso
+                        : 0.0;
+
+        long desiredMotionExposureNs;
+        int desiredMotionIso;
+
+        if (previewEnergy > 0.0) {
+            /*
+             * Prioritize the longest shutter up to 1/15 while preserving the
+             * latest AE brightness. In bright light, shorten only when 1/15
+             * would require ISO below the camera's supported minimum.
+             */
+            long exposureAtMinimumIsoNs = Math.round(
+                    previewEnergy / Math.max(1, minimumIso)
+                            * 1_000_000_000.0
+            );
+
+            desiredMotionExposureNs = Math.max(
+                    minimumExposureNs,
+                    Math.min(
+                            maximumExposureNs,
+                            exposureAtMinimumIsoNs
+                    )
+            );
+
+            desiredMotionIso = (int) Math.round(
+                    previewEnergy
+                            / ExposureIndex.time2sec(
+                                    desiredMotionExposureNs
+                            )
+            );
+
+            desiredMotionIso = Math.max(
+                    minimumIso,
+                    Math.min(maximumIso, desiredMotionIso)
+            );
+        } else {
+            desiredMotionExposureNs =
+                    selectorMotionPair != null
+                            ? selectorMotionPair.exposure
+                            : maximumExposureNs;
+
+            desiredMotionExposureNs = Math.max(
+                    minimumExposureNs,
+                    Math.min(
+                            maximumExposureNs,
+                            desiredMotionExposureNs
+                    )
+            );
+
+            desiredMotionIso =
+                    selectorMotionPair != null
+                            ? selectorMotionPair.iso
+                            : minimumIso;
+
+            desiredMotionIso = Math.max(
+                    minimumIso,
+                    Math.min(maximumIso, desiredMotionIso)
+            );
+        }
+
+        mMotionTargetExposureNs = desiredMotionExposureNs;
+        mMotionTargetIso = desiredMotionIso;
+
+        final double desiredMotionEnergy =
+                ExposureIndex.time2sec(
+                        desiredMotionExposureNs
+                ) * desiredMotionIso;
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_TARGET_EXPOSURE"
+                        + " camera=" + physicalID
+                        + " desiredExposureNs="
                         + desiredMotionExposureNs
-                        + " desiredIso=" + desiredMotionIso
-                        + " previewExposureNs=" + latestPreviewExposureNs
-                        + " previewIso=" + latestPreviewIso);
+                        + " desiredIso="
+                        + desiredMotionIso
+                        + " previewExposureNs="
+                        + latestPreviewExposureNs
+                        + " previewIso="
+                        + latestPreviewIso
+                        + " selectorExposureNs="
+                        + (
+                            selectorMotionPair != null
+                                    ? selectorMotionPair.exposure
+                                    : null
+                        )
+                        + " selectorIso="
+                        + (
+                            selectorMotionPair != null
+                                    ? selectorMotionPair.iso
+                                    : null
+                        )
+                        + " exposureRange="
+                        + exposureRange
+                        + " sensitivityRange="
+                        + sensitivityRange
+        );
 
         final double maximumExposureDifferenceEv = 0.75;
+        final double maximumShutterDifferenceEv = 0.50;
+        final double maximumIsoDifferenceEv = 0.75;
         final long maximumCandidateAgeNs =
                 2_000_000_000L;
 
@@ -2750,6 +2882,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
         int rejectedMissingMetadata = 0;
         int rejectedExposureMismatch = 0;
+        int rejectedShutterMismatch = 0;
+        int rejectedIsoMismatch = 0;
         int rejectedTooOld = 0;
 
         for (ImageFrame frame : candidates) {
@@ -2780,12 +2914,34 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
             double exposureDifferenceEv =
                     metadataValid
-                            && latestPreviewEnergy > 0.0
+                            && desiredMotionEnergy > 0.0
                             && actualEnergy > 0.0
                             ? Math.abs(
                                     Math.log(
                                             actualEnergy
-                                                    / latestPreviewEnergy
+                                                    / desiredMotionEnergy
+                                    ) / Math.log(2.0)
+                            )
+                            : Double.POSITIVE_INFINITY;
+
+            double shutterDifferenceEv =
+                    metadataValid
+                            && desiredMotionExposureNs > 0L
+                            ? Math.abs(
+                                    Math.log(
+                                            (double) actualExposureNs
+                                                    / desiredMotionExposureNs
+                                    ) / Math.log(2.0)
+                            )
+                            : Double.POSITIVE_INFINITY;
+
+            double isoDifferenceEv =
+                    metadataValid
+                            && desiredMotionIso > 0
+                            ? Math.abs(
+                                    Math.log(
+                                            (double) actualIso
+                                                    / desiredMotionIso
                                     ) / Math.log(2.0)
                             )
                             : Double.POSITIVE_INFINITY;
@@ -2797,9 +2953,19 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     exposureDifferenceEv
                             <= maximumExposureDifferenceEv;
 
+            boolean shutterCompatible =
+                    shutterDifferenceEv
+                            <= maximumShutterDifferenceEv;
+
+            boolean isoCompatible =
+                    isoDifferenceEv
+                            <= maximumIsoDifferenceEv;
+
             if (metadataValid
                     && ageValid
-                    && exposureCompatible) {
+                    && exposureCompatible
+                    && shutterCompatible
+                    && isoCompatible) {
 
                 compatibleCandidates.add(frame);
             } else {
@@ -2807,6 +2973,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     rejectedMissingMetadata++;
                 } else if (!ageValid) {
                     rejectedTooOld++;
+                } else if (!shutterCompatible) {
+                    rejectedShutterMismatch++;
+                } else if (!isoCompatible) {
+                    rejectedIsoMismatch++;
                 } else {
                     rejectedExposureMismatch++;
                 }
@@ -2822,15 +2992,27 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                 + actualExposureNs
                                 + " iso="
                                 + actualIso
-                                + " differenceEv="
+                                + " exposureDifferenceEv="
                                 + exposureDifferenceEv
+                                + " shutterDifferenceEv="
+                                + shutterDifferenceEv
+                                + " isoDifferenceEv="
+                                + isoDifferenceEv
+                                + " targetExposureNs="
+                                + desiredMotionExposureNs
+                                + " targetIso="
+                                + desiredMotionIso
                                 + " decision="
                                 + (
                                     !metadataValid
                                             ? "REJECTED_INVALID_METADATA"
                                             : !ageValid
                                                     ? "REJECTED_TOO_OLD"
-                                                    : "REJECTED_EXPOSURE_MISMATCH"
+                                                    : !shutterCompatible
+                                                            ? "REJECTED_SHUTTER_MISMATCH"
+                                                            : !isoCompatible
+                                                                    ? "REJECTED_ISO_MISMATCH"
+                                                                    : "REJECTED_EXPOSURE_MISMATCH"
                                 )
                 );
 
@@ -2866,6 +3048,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         + rejectedMissingMetadata
                         + " rejectedExposureMismatch="
                         + rejectedExposureMismatch
+                        + " rejectedShutterMismatch="
+                        + rejectedShutterMismatch
+                        + " rejectedIsoMismatch="
+                        + rejectedIsoMismatch
                         + " rejectedTooOld="
                         + rejectedTooOld
         );
@@ -3950,14 +4136,29 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     );
 
                     long motionExposure =
-                            selectedExposure != null
-                                    ? selectedExposure
-                                    : IsoExpoSelector.lastSelectedExposure;
+                            mMotionTargetExposureNs > 0L
+                                    ? mMotionTargetExposureNs
+                                    : (
+                                        selectedExposure != null
+                                                ? selectedExposure
+                                                : IsoExpoSelector
+                                                        .lastSelectedExposure
+                                    );
+
+                    int motionIso =
+                            mMotionTargetIso > 0
+                                    ? mMotionTargetIso
+                                    : (
+                                        selectedIso != null
+                                                ? selectedIso
+                                                : mPreviewIso
+                                    );
 
                     /*
-                     * Preserve the Motion selector's exposure directly.
-                     * In low light the handheld Motion limit is approximately
-                     * 1/15 second. ISO remains fixed across the fallback burst.
+                     * Use the exact shutter-time Motion target. In low light
+                     * this prioritizes approximately 1/15 second and reduces
+                     * ISO for both ID2 and ID5. Camera capability ranges are
+                     * still enforced below.
                      */
                     motionExposure = Math.max(
                             1_000_000L,
@@ -3980,23 +4181,53 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         );
                     }
 
+                    Range<Integer> sensitivityRange =
+                            mCameraCharacteristics.get(
+                                    CameraCharacteristics
+                                            .SENSOR_INFO_SENSITIVITY_RANGE
+                            );
+
+                    if (sensitivityRange != null) {
+                        motionIso = Math.max(
+                                sensitivityRange.getLower(),
+                                Math.min(
+                                        sensitivityRange.getUpper(),
+                                        motionIso
+                                )
+                        );
+                    }
+
+                    captureBuilder.set(
+                            CaptureRequest.CONTROL_AE_MODE,
+                            CaptureRequest.CONTROL_AE_MODE_OFF
+                    );
+
                     captureBuilder.set(
                             CaptureRequest.SENSOR_EXPOSURE_TIME,
                             motionExposure
+                    );
+
+                    captureBuilder.set(
+                            CaptureRequest.SENSOR_SENSITIVITY,
+                            motionIso
                     );
 
                     IsoExpoSelector.lastSelectedExposure =
                             motionExposure;
 
                     Log.d(
-                            TAG,
-                            "Motion HDR+ exposure selected once:"
-                                    + " frames="
-                                    + frameCount
-                                    + " exposureNs="
+                            MOTION_LOG_TAG,
+                            "CONTROLLED_REQUEST_TARGET"
+                                    + " camera=" + physicalID
+                                    + " frames=" + frameCount
+                                    + " requestedExposureNs="
                                     + motionExposure
-                                    + " iso="
-                                    + selectedIso
+                                    + " requestedIso="
+                                    + motionIso
+                                    + " exposureRange="
+                                    + exposureRange
+                                    + " sensitivityRange="
+                                    + sensitivityRange
                     );
 
                     /*
