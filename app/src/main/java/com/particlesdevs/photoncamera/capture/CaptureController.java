@@ -335,6 +335,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
     private volatile boolean mMotionBurstActive = false;
     private volatile int mMotionBurstExpectedFrames = 0;
+    private volatile long mMotionBurstFirstTimestampNs = 0L;
+    private volatile boolean mMotionRollingRawSuspended = false;
+
+    private final HashMap<Long, Long> mMotionBurstExposureTimeNs =
+            new HashMap<>();
+    private final HashMap<Long, Integer> mMotionBurstSensitivity =
+            new HashMap<>();
 
     private final ImageReader.OnImageAvailableListener mOnYuvImageAvailableListener
             = new ImageReader.OnImageAvailableListener() {
@@ -468,6 +475,20 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 }
 
                 if (frame == null) {
+                    return;
+                }
+
+                frame.timestamp = image.getTimestamp();
+
+                long firstBurstTimestamp = mMotionBurstFirstTimestampNs;
+                if (firstBurstTimestamp <= 0L
+                        || frame.timestamp < firstBurstTimestamp) {
+                    Log.d(MOTION_LOG_TAG,
+                            "CONTROLLED_RAW_DISCARDED timestamp="
+                                    + frame.timestamp
+                                    + " firstBurstTimestamp="
+                                    + firstBurstTimestamp);
+                    frame.close();
                     return;
                 }
 
@@ -2567,6 +2588,61 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         }
     }
 
+    private void suspendMotionRollingRawForBurst()
+            throws CameraAccessException {
+        if (mMotionRollingRawSuspended
+                || mPreviewRequestBuilder == null
+                || mCaptureSession == null
+                || mImageReaderRaw == null) {
+            return;
+        }
+
+        mPreviewRequestBuilder.removeTarget(mImageReaderRaw.getSurface());
+        mPreviewInputRequest = mPreviewRequestBuilder.build();
+        mCaptureSession.setRepeatingRequest(
+                mPreviewInputRequest,
+                mCaptureCallback,
+                mBackgroundHandler);
+
+        Image stale;
+        try {
+            while ((stale = mImageReaderRaw.acquireNextImage()) != null) {
+                stale.close();
+            }
+        } catch (Exception ignored) {
+        }
+
+        mMotionRollingRawSuspended = true;
+        Log.d(MOTION_LOG_TAG,
+                "ROLLING_RAW_SUSPENDED previewContinues=true");
+    }
+
+    private void resumeMotionRollingRawAfterBurst() {
+        if (!mMotionRollingRawSuspended
+                || mPreviewRequestBuilder == null
+                || mCaptureSession == null
+                || mImageReaderRaw == null) {
+            return;
+        }
+
+        try {
+            mPreviewRequestBuilder.addTarget(mImageReaderRaw.getSurface());
+            mPreviewInputRequest = mPreviewRequestBuilder.build();
+            mCaptureSession.setRepeatingRequest(
+                    mPreviewInputRequest,
+                    mCaptureCallback,
+                    mBackgroundHandler);
+            Log.d(MOTION_LOG_TAG,
+                    "ROLLING_RAW_RESUMED previewContinues=true");
+        } catch (Exception e) {
+            Log.e(MOTION_LOG_TAG,
+                    "ROLLING_RAW_RESUME_FAILED "
+                            + Log.getStackTraceString(e));
+        } finally {
+            mMotionRollingRawSuspended = false;
+        }
+    }
+
     private void triggerZslCapture() {
         if (mZslCapturing || CaptureController.isProcessing) {
             Log.w(
@@ -2638,15 +2714,32 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     );
         }
 
+        IsoExpoSelector.ExpoPair desiredMotionPair =
+                IsoExpoSelector.GenerateExpoPair(-1, this);
+
+        final long desiredMotionExposureNs =
+                desiredMotionPair != null ? desiredMotionPair.exposure : 0L;
+        final int desiredMotionIso =
+                desiredMotionPair != null ? desiredMotionPair.iso : 0;
+
         final double latestPreviewEnergy =
-                latestPreviewExposureNs != null
-                        && latestPreviewExposureNs > 0L
-                        && latestPreviewIso != null
-                        && latestPreviewIso > 0
-                        ? ExposureIndex.time2sec(
-                                latestPreviewExposureNs
-                        ) * latestPreviewIso
-                        : 0.0;
+                desiredMotionExposureNs > 0L && desiredMotionIso > 0
+                        ? ExposureIndex.time2sec(desiredMotionExposureNs)
+                                * desiredMotionIso
+                        : (latestPreviewExposureNs != null
+                                && latestPreviewExposureNs > 0L
+                                && latestPreviewIso != null
+                                && latestPreviewIso > 0
+                                ? ExposureIndex.time2sec(latestPreviewExposureNs)
+                                        * latestPreviewIso
+                                : 0.0);
+
+        Log.d(MOTION_LOG_TAG,
+                "MOTION_TARGET_EXPOSURE desiredExposureNs="
+                        + desiredMotionExposureNs
+                        + " desiredIso=" + desiredMotionIso
+                        + " previewExposureNs=" + latestPreviewExposureNs
+                        + " previewIso=" + latestPreviewIso);
 
         final double maximumExposureDifferenceEv = 0.75;
         final long maximumCandidateAgeNs =
@@ -2759,9 +2852,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         Log.d(
                 MOTION_LOG_TAG,
                 "BUFFER_COMPATIBILITY"
-                        + " latestExposureNs="
+                        + " targetExposureNs="
+                        + desiredMotionExposureNs
+                        + " targetIso="
+                        + desiredMotionIso
+                        + " previewExposureNs="
                         + latestPreviewExposureNs
-                        + " latestIso="
+                        + " previewIso="
                         + latestPreviewIso
                         + " compatible="
                         + candidates.size()
@@ -3601,6 +3698,39 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
              * RAW16Saver.addImage(). Dedicated Motion bypasses addImage(), so
              * signal explicitly that its finalized buffer is ready.
              */
+            IsoExpoSelector.fullpairs.clear();
+            synchronized (mMotionBurstLock) {
+                for (int i = 0; i < completedFrames.size(); i++) {
+                    ImageFrame completedFrame = completedFrames.get(i);
+                    IsoExpoSelector.ExpoPair actualPair =
+                            IsoExpoSelector.GenerateExpoPair(i, this);
+
+                    Long actualExposureNs =
+                            mMotionBurstExposureTimeNs.get(completedFrame.timestamp);
+                    Integer actualIso =
+                            mMotionBurstSensitivity.get(completedFrame.timestamp);
+
+                    if (actualExposureNs != null && actualExposureNs > 0L) {
+                        actualPair.exposure = actualExposureNs;
+                    }
+                    if (actualIso != null && actualIso > 0) {
+                        actualPair.iso = actualIso;
+                    }
+
+                    actualPair.layerMpy = 1.0f;
+                    completedFrame.pair = actualPair;
+                    IsoExpoSelector.fullpairs.add(actualPair);
+
+                    Log.d(MOTION_LOG_TAG,
+                            "CONTROLLED_ACTUAL_EXPO_PAIR index=" + i
+                                    + " timestamp=" + completedFrame.timestamp
+                                    + " exposureNs=" + actualPair.exposure
+                                    + " iso=" + actualPair.iso);
+                }
+                mMotionBurstExposureTimeNs.clear();
+                mMotionBurstSensitivity.clear();
+            }
+
             mImageSaver.implementation.bufferLock = false;
 
             Log.d(
@@ -3658,13 +3788,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         e.getLocalizedMessage()
                 );
             } finally {
-                mBackgroundHandler.post(() -> {
-                    if (!isDualSession) {
-                        unlockFocus();
-                    } else {
-                        createCameraPreviewSession(false);
-                    }
-                });
+                if (isDualSession) {
+                    mBackgroundHandler.post(
+                            () -> createCameraPreviewSession(false));
+                }
+                Log.d(MOTION_LOG_TAG,
+                        "CONTROLLED_HDRX_FINISHED previewWasNeverStopped=true");
             }
         });
     }
@@ -3920,10 +4049,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
                 synchronized (mMotionBurstLock) {
                     mMotionBurstFrames.clear();
-                    mMotionBurstExpectedFrames =
-                            Math.max(1, frameCount);
+                    mMotionBurstExpectedFrames = Math.max(1, frameCount);
+                    mMotionBurstFirstTimestampNs = 0L;
+                    mMotionBurstExposureTimeNs.clear();
+                    mMotionBurstSensitivity.clear();
                     mMotionBurstFinalized.set(false);
-                    mMotionBurstActive = true;
+                    mMotionBurstActive = false;
                 }
 
                 Log.d(
@@ -3956,6 +4087,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
                     if (baseFrameNumber[0] == 0) {
                         baseFrameNumber[0] = frameNumber;
+                        if (PhotonCamera.getSettings().selectedMode
+                                == CameraMode.MOTION) {
+                            mMotionBurstFirstTimestampNs = timestamp;
+                            Log.d(MOTION_LOG_TAG,
+                                    "CONTROLLED_BURST_FIRST_TIMESTAMP timestamp="
+                                            + timestamp);
+                        }
                         if (maxFrameCount[0] != -1) PhotonCamera.getGyro().CaptureGyroBurst();
                         Log.v("BurstCounter", "CaptureStarted with FirstFrameNumber:" + frameNumber);
                     } else {
@@ -3992,8 +4130,25 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                             iso = (int) isoKey;
                         }
                         Object timeKey = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
-                        double exposureTime = ExposureIndex.time2sec((long) timeKey);
-                        mExposures.put((long) time, exposureTime * iso);
+                        if (timeKey != null) {
+                            long actualExposureNs = (long) timeKey;
+                            double exposureTime = ExposureIndex.time2sec(actualExposureNs);
+                            mExposures.put((long) time, exposureTime * iso);
+
+                            if (PhotonCamera.getSettings().selectedMode
+                                    == CameraMode.MOTION) {
+                                synchronized (mMotionBurstLock) {
+                                    mMotionBurstExposureTimeNs.put(
+                                            (long) time, actualExposureNs);
+                                    mMotionBurstSensitivity.put(
+                                            (long) time, iso);
+                                }
+                                Log.d(MOTION_LOG_TAG,
+                                        "CONTROLLED_RESULT timestamp=" + time
+                                                + " exposureNs=" + actualExposureNs
+                                                + " iso=" + iso);
+                            }
+                        }
                     }
                     cameraEventsListener.onFrameCaptureCompleted(
                             new TimerFrameCountViewModel.FrameCntTime(frameCount, maxFrameCount[0], frametime));
@@ -4025,7 +4180,11 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     //activity.runOnUiThread(() -> UpdateCameraCharacteristics(PhotonCamera.getSettings().mCameraID));
                     if (PhotonCamera.getSettings().selectedMode
                             == CameraMode.MOTION) {
-
+                        resumeMotionRollingRawAfterBurst();
+                        Log.d(MOTION_LOG_TAG,
+                                "CONTROLLED_SEQUENCE_COMPLETED frames="
+                                        + finalFrameCount
+                                        + " previewContinues=true");
                         finalizeDedicatedMotionBurst(finalFrameCount);
                         return;
                     }
@@ -4098,11 +4257,32 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             //mCaptureSession.setRepeatingBurst(captures, CaptureCallback, null);
             burst = true;
             Camera2ApiAutoFix.ApplyBurst();
-            if (isDualSession)
+            if (isDualSession) {
                 createCameraPreviewSession(true);
-            else {
-            mCaptureSession.stopRepeating();
-            mCaptureSession.abortCaptures();
+            } else if (PhotonCamera.getSettings().selectedMode
+                    == CameraMode.MOTION) {
+                try {
+                    suspendMotionRollingRawForBurst();
+                    synchronized (mMotionBurstLock) {
+                        mMotionBurstFirstTimestampNs = 0L;
+                        mMotionBurstActive = true;
+                    }
+                    Log.d(MOTION_LOG_TAG,
+                            "CONTROLLED_BURST_SUBMITTED frames="
+                                    + captures.size()
+                                    + " previewContinues=true");
+                    mCaptureSession.captureBurst(
+                            captures, CaptureCallback, mBackgroundHandler);
+                } catch (Exception e) {
+                    synchronized (mMotionBurstLock) {
+                        mMotionBurstActive = false;
+                    }
+                    resumeMotionRollingRawAfterBurst();
+                    throw e;
+                }
+            } else {
+                mCaptureSession.stopRepeating();
+                mCaptureSession.abortCaptures();
                 switch (PhotonCamera.getSettings().selectedMode) {
                     case UNLIMITED:
                         mCaptureSession.setRepeatingBurst(captures, CaptureCallback, mBackgroundHandler);
@@ -4112,7 +4292,6 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         break;
                     case NIGHT:
                     case PHOTO:
-                    case MOTION:
                         mCaptureSession.captureBurst(captures, CaptureCallback, mBackgroundHandler);
                         break;
                 }
