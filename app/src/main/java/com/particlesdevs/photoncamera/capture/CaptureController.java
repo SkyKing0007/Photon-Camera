@@ -111,6 +111,7 @@ import android.media.Image;
 import java.util.ArrayDeque;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import com.particlesdevs.photoncamera.processing.ImageFrame;
@@ -283,6 +284,22 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private final Object mZslBufferLock = new Object();
     private volatile boolean mZslCapturing = false;
 
+    /*
+     * Dedicated Motion still-burst ownership.
+     *
+     * Photo and Night continue using ImageSaver's normal shared collection
+     * path. Motion copies each arriving RAW into this private list, closes the
+     * Image immediately, and hands one immutable batch to HDRX exactly once.
+     */
+    private final Object mMotionBurstLock = new Object();
+    private final ArrayList<ImageFrame> mMotionBurstFrames =
+            new ArrayList<>();
+    private final AtomicBoolean mMotionBurstFinalized =
+            new AtomicBoolean(false);
+
+    private volatile boolean mMotionBurstActive = false;
+    private volatile int mMotionBurstExpectedFrames = 0;
+
     private final ImageReader.OnImageAvailableListener mOnYuvImageAvailableListener
             = new ImageReader.OnImageAvailableListener() {
         @Override
@@ -323,6 +340,67 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 }
                 return;
             }
+            /*
+             * Motion post-shutter bursts have independent image ownership.
+             * Do not send these frames through ImageSaver.frameCounter or the
+             * Photo/Night collection state.
+             */
+            if (mMotionBurstActive) {
+                Image image;
+
+                try {
+                    image = reader.acquireNextImage();
+                } catch (Exception e) {
+                    Log.w(
+                            TAG,
+                            "Motion RAW acquire failed: "
+                                    + Log.getStackTraceString(e)
+                    );
+                    return;
+                }
+
+                if (image == null) {
+                    return;
+                }
+
+                ImageFrame frame = null;
+
+                try {
+                    frame = mImageSaver.implementation.getFrame(image);
+                } catch (Exception e) {
+                    Log.e(
+                            TAG,
+                            "Motion RAW copy failed: "
+                                    + Log.getStackTraceString(e)
+                    );
+                } finally {
+                    image.close();
+                }
+
+                if (frame == null) {
+                    return;
+                }
+
+                synchronized (mMotionBurstLock) {
+                    if (mMotionBurstActive
+                            && mMotionBurstFrames.size()
+                            < mMotionBurstExpectedFrames) {
+
+                        mMotionBurstFrames.add(frame);
+
+                        Log.d(
+                                TAG,
+                                "Motion private RAW buffer: "
+                                        + mMotionBurstFrames.size()
+                                        + "/"
+                                        + mMotionBurstExpectedFrames
+                        );
+                    }
+                }
+
+                return;
+            }
+
             if (onUnlimited && !unlimitedStarted) {
                 return;
             }
@@ -1864,9 +1942,15 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     }
 
     private boolean isZslMode() {
-        return PhotonCamera.getSettings().selectedMode == CameraMode.MOTION
-                && !IsoExpoSelector.HDR
-                && !isDualSession;
+        /*
+         * Motion previously drained pre-shutter RAW preview frames from a
+         * rolling buffer. Those frames had preview-oriented timing and weaker
+         * per-frame ownership/metadata than the normal still burst.
+         *
+         * Route Motion through the proven Photo-style post-shutter RAW burst.
+         * Keep this method for easy restoration of ZSL later.
+         */
+        return false;
     }
 
     private void triggerZslCapture() {
@@ -1888,6 +1972,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             rawImages = new ArrayList<>(mZslRingBuffer);
             mZslRingBuffer.clear();
         }
+
+
 
         int take = Math.min(rawImages.size(), frameCount);
         int skip = rawImages.size() - take;
@@ -2025,6 +2111,219 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         });
     }
 
+    private void finalizeDedicatedMotionBurst(
+            int cameraSequenceFrameCount
+    ) {
+        processExecutor.execute(() -> {
+            final long startMs =
+                    android.os.SystemClock.elapsedRealtime();
+
+            final long maximumWaitMs = Math.max(
+                    5_000L,
+                    Math.min(
+                            15_000L,
+                            mMotionBurstExpectedFrames * 500L
+                    )
+            );
+
+            int lastSize = -1;
+            long unchangedSinceMs = startMs;
+
+            while (true) {
+                int currentSize;
+
+                synchronized (mMotionBurstLock) {
+                    currentSize = mMotionBurstFrames.size();
+                }
+
+                long nowMs =
+                        android.os.SystemClock.elapsedRealtime();
+
+                if (currentSize != lastSize) {
+                    lastSize = currentSize;
+                    unchangedSinceMs = nowMs;
+                }
+
+                boolean complete =
+                        currentSize >= mMotionBurstExpectedFrames;
+
+                boolean settled =
+                        currentSize >= 2
+                                && nowMs - unchangedSinceMs >= 750L
+                                && nowMs - startMs >= 1_250L;
+
+                boolean timedOut =
+                        nowMs - startMs >= maximumWaitMs;
+
+                if (complete || settled || timedOut) {
+                    Log.d(
+                            TAG,
+                            "Dedicated Motion delivery finished:"
+                                    + " requested="
+                                    + mMotionBurstExpectedFrames
+                                    + " cameraSequence="
+                                    + cameraSequenceFrameCount
+                                    + " raw="
+                                    + currentSize
+                                    + " complete="
+                                    + complete
+                                    + " settled="
+                                    + settled
+                                    + " timedOut="
+                                    + timedOut
+                    );
+                    break;
+                }
+
+                try {
+                    Thread.sleep(10L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+
+            if (!mMotionBurstFinalized.compareAndSet(false, true)) {
+                Log.w(
+                        TAG,
+                        "Ignoring duplicate Motion finalization"
+                );
+                return;
+            }
+
+            final ArrayList<ImageFrame> completedFrames;
+
+            synchronized (mMotionBurstLock) {
+                mMotionBurstActive = false;
+                completedFrames =
+                        new ArrayList<>(mMotionBurstFrames);
+                mMotionBurstFrames.clear();
+            }
+
+            if (completedFrames.size() < 2) {
+                Log.e(
+                        TAG,
+                        "Dedicated Motion HDRX cancelled: only "
+                                + completedFrames.size()
+                                + " RAW frame(s)"
+                );
+
+                PhotonCamera.getGyro().CompleteSequence();
+
+                mBackgroundHandler.post(() -> {
+                    if (!isDualSession) {
+                        unlockFocus();
+                    } else {
+                        createCameraPreviewSession(false);
+                    }
+                });
+
+                cameraEventsListener.onProcessingError(
+                        "Not enough Motion RAW frames were delivered"
+                );
+                return;
+            }
+
+            ArrayList<GyroBurst> completedGyro =
+                    new ArrayList<>(BurstShakiness);
+
+            if (completedGyro.size() > completedFrames.size()) {
+                completedGyro = new ArrayList<>(
+                        completedGyro.subList(
+                                0,
+                                completedFrames.size()
+                        )
+                );
+            }
+
+            PhotonCamera.getGyro().CompleteSequence();
+
+            /*
+             * The common HDRX processor still reads IMAGE_BUFFER, but only
+             * this finalized immutable Motion batch is placed there. Photo
+             * and Night never share collection state with Motion.
+             */
+            synchronized (SaverImplementation.IMAGE_BUFFER) {
+                SaverImplementation.IMAGE_BUFFER.clear();
+                SaverImplementation.IMAGE_BUFFER.addAll(
+                        completedFrames
+                );
+            }
+
+            /*
+             * DefaultSaver.runRaw() waits until bufferLock becomes false.
+             * Normal Photo/Night collection releases this flag through
+             * RAW16Saver.addImage(). Dedicated Motion bypasses addImage(), so
+             * signal explicitly that its finalized buffer is ready.
+             */
+            mImageSaver.implementation.bufferLock = false;
+
+            Log.d(
+                    TAG,
+                    "Dedicated Motion buffer handed to saver: frames="
+                            + completedFrames.size()
+                            + " bufferLock="
+                            + mImageSaver.implementation.bufferLock
+            );
+
+            /*
+             * Normal Photo/Night collection calls ImageSaver.initProcess(),
+             * which records the ImageReader format. Dedicated Motion copies
+             * RAW frames directly and therefore must set it explicitly.
+             */
+            mImageSaver.setImageFormat(
+                    android.graphics.ImageFormat.RAW_SENSOR
+            );
+
+            mImageSaver.updateFrameCount(completedFrames.size());
+            mMeasuredFrameCnt = completedFrames.size();
+
+            Log.d(
+                    TAG,
+                    "Dedicated Motion HDRX format="
+                            + android.graphics.ImageFormat.RAW_SENSOR
+            );
+
+            try {
+                Log.d(
+                        TAG,
+                        "Starting dedicated Motion HDRX with "
+                                + completedFrames.size()
+                                + " RAW frames and "
+                                + completedGyro.size()
+                                + " gyro frames"
+                );
+
+                mImageSaver.runRaw(
+                        mCameraCharacteristics,
+                        mCaptureResult,
+                        mCaptureRequest,
+                        completedGyro,
+                        cameraRotation,
+                        new HashMap<>(mExposures)
+                );
+            } catch (Exception e) {
+                Log.e(
+                        TAG,
+                        "Dedicated Motion runRaw: "
+                                + Log.getStackTraceString(e)
+                );
+
+                cameraEventsListener.onProcessingError(
+                        e.getLocalizedMessage()
+                );
+            } finally {
+                mBackgroundHandler.post(() -> {
+                    if (!isDualSession) {
+                        unlockFocus();
+                    } else {
+                        createCameraPreviewSession(false);
+                    }
+                });
+            }
+        });
+    }
+
     private void captureStillPicture() {
         try {
             if (null == mCameraDevice) {
@@ -2088,9 +2387,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             captures = new ArrayList<>();
             BurstShakiness = new ArrayList<>();
             mExposures = new HashMap<>();
-            SaverImplementation.IMAGE_BUFFER.clear();
-
             int frameCount = FrameNumberSelector.getFrames();
+
             //if (frameCount == 1) frameCount++;
             cameraEventsListener.onFrameCountSet(frameCount);
             Log.d(TAG, "HDRFact1:" + paramController.isManualMode() + " HDRFact2:" + PhotonCamera.getSettings().alignAlgorithm);
@@ -2147,19 +2445,145 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 }
             } else {
                 long[] times = new long[frameCount];
-                for (int i = 0; i < frameCount; i++) {
-                    IsoExpoSelector.setExpo(captureBuilder, i, this);
-                    times[i] = IsoExpoSelector.lastSelectedExposure;
-                    captures.add(captureBuilder.build());
-                    mCaptureRequest = captureBuilder.build();
+
+                boolean motionMode =
+                        PhotonCamera.getSettings().selectedMode
+                                == CameraMode.MOTION;
+
+                if (motionMode) {
+                    /*
+                     * Select the Motion exposure exactly once. Every request in the
+                     * burst must use the same ISO and shutter, matching the classic
+                     * equal-exposure HDR+ strategy.
+                     */
+                    IsoExpoSelector.setExpo(
+                            captureBuilder,
+                            0,
+                            this
+                    );
+
+                    Long selectedExposure = captureBuilder.get(
+                            CaptureRequest.SENSOR_EXPOSURE_TIME
+                    );
+
+                    Integer selectedIso = captureBuilder.get(
+                            CaptureRequest.SENSOR_SENSITIVITY
+                    );
+
+                    long motionExposure =
+                            selectedExposure != null
+                                    ? selectedExposure
+                                    : IsoExpoSelector.lastSelectedExposure;
+
+                    /*
+                     * Mild -0.5 EV highlight protection by shortening shutter.
+                     * ISO stays fixed for all frames.
+                     */
+                    motionExposure = Math.max(
+                            1_000_000L,
+                            Math.round(
+                                    motionExposure / Math.sqrt(2.0)
+                            )
+                    );
+
+                    Range<Long> exposureRange =
+                            mCameraCharacteristics.get(
+                                    CameraCharacteristics
+                                            .SENSOR_INFO_EXPOSURE_TIME_RANGE
+                            );
+
+                    if (exposureRange != null) {
+                        motionExposure = Math.max(
+                                exposureRange.getLower(),
+                                Math.min(
+                                        exposureRange.getUpper(),
+                                        motionExposure
+                                )
+                        );
+                    }
+
+                    captureBuilder.set(
+                            CaptureRequest.SENSOR_EXPOSURE_TIME,
+                            motionExposure
+                    );
+
+                    IsoExpoSelector.lastSelectedExposure =
+                            motionExposure;
+
+                    Log.d(
+                            TAG,
+                            "Motion HDR+ exposure selected once:"
+                                    + " frames="
+                                    + frameCount
+                                    + " exposureNs="
+                                    + motionExposure
+                                    + " iso="
+                                    + selectedIso
+                    );
+
+                    /*
+                     * Build every Motion request from the same finalized builder.
+                     * Do not call IsoExpoSelector again inside this loop.
+                     */
+                    for (int i = 0; i < frameCount; i++) {
+                        CaptureRequest frameRequest =
+                                captureBuilder.build();
+
+                        captures.add(frameRequest);
+                        times[i] = motionExposure;
+                        mCaptureRequest = frameRequest;
+                    }
+                } else {
+                    /*
+                     * Preserve the existing Photo and Night exposure sequence.
+                     */
+                    for (int i = 0; i < frameCount; i++) {
+                        IsoExpoSelector.setExpo(
+                                captureBuilder,
+                                i,
+                                this
+                        );
+
+                        times[i] =
+                                IsoExpoSelector.lastSelectedExposure;
+
+                        CaptureRequest frameRequest =
+                                captureBuilder.build();
+
+                        captures.add(frameRequest);
+                        mCaptureRequest = frameRequest;
+                    }
                 }
-                PhotonCamera.getGyro().PrepareGyroBurst(times, BurstShakiness);
+
+                PhotonCamera.getGyro().PrepareGyroBurst(
+                        times,
+                        BurstShakiness
+                );
             }
 
             //img
             Log.d(TAG, "FrameCount:" + frameCount);
             mImageSaver = new ImageSaver(cameraEventsListener);
             mImageSaver.setFrameCount(frameCount);
+
+            if (PhotonCamera.getSettings().selectedMode
+                    == CameraMode.MOTION) {
+
+                synchronized (mMotionBurstLock) {
+                    mMotionBurstFrames.clear();
+                    mMotionBurstExpectedFrames =
+                            Math.max(1, frameCount);
+                    mMotionBurstFinalized.set(false);
+                    mMotionBurstActive = true;
+                }
+
+                Log.d(
+                        TAG,
+                        "Dedicated Motion burst started: expected="
+                                + mMotionBurstExpectedFrames
+                );
+            }
+
 //            final int[] burstcount = {0, 0, frameCount};
             /*if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 mImageReaderRaw.discardFreeBuffers();
@@ -2250,6 +2674,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     //unlockFocus();
                     //Surface texture related
                     //activity.runOnUiThread(() -> UpdateCameraCharacteristics(PhotonCamera.getSettings().mCameraID));
+                    if (PhotonCamera.getSettings().selectedMode
+                            == CameraMode.MOTION) {
+
+                        finalizeDedicatedMotionBurst(finalFrameCount);
+                        return;
+                    }
+
                     if (PhotonCamera.getSettings().selectedMode != CameraMode.UNLIMITED && PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
                         //processExecutor.submit(() -> mImageSaver.runRaw(mCameraCharacteristics, mCaptureResult, new ArrayList<>(BurstShakiness), cameraRotation));
                         /*taskResults.removeIf(Future::isDone); //remove already completed results

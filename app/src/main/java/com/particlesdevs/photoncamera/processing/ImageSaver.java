@@ -101,9 +101,47 @@ public class ImageSaver {
         frameCounter++;
     }
 
-    public void runRaw(CameraCharacteristics characteristics, CaptureResult captureResult, CaptureRequest captureRequest, ArrayList<GyroBurst> burstShakiness, int cameraRotation, HashMap<Long, Double> exposures) {
+    public void runRaw(
+            CameraCharacteristics characteristics,
+            CaptureResult captureResult,
+            CaptureRequest captureRequest,
+            ArrayList<GyroBurst> burstShakiness,
+            int cameraRotation,
+            HashMap<Long, Double> exposures
+    ) {
         TunableInjector.inject(SETTINGS);
-        implementation.runRaw(imageFormat,characteristics,captureResult, captureRequest,burstShakiness,cameraRotation, exposures);
+
+        /*
+         * Normal Photo and Night capture set imageFormat through
+         * initProcess(ImageReader). Dedicated Motion copies RAW frames
+         * directly, so imageFormat can remain zero unless it is normalized
+         * here at the final RAW-processing boundary.
+         */
+        int effectiveImageFormat = imageFormat;
+
+        if (effectiveImageFormat == 0) {
+            effectiveImageFormat =
+                    android.graphics.ImageFormat.RAW_SENSOR;
+
+            Log.w(
+                    TAG,
+                    "runRaw received unset image format; "
+                            + "forcing RAW_SENSOR="
+                            + effectiveImageFormat
+            );
+        }
+
+        imageFormat = effectiveImageFormat;
+
+        implementation.runRaw(
+                effectiveImageFormat,
+                characteristics,
+                captureResult,
+                captureRequest,
+                burstShakiness,
+                cameraRotation,
+                exposures
+        );
     }
 
     public void processStart(CameraCharacteristics characteristics, CaptureResult captureResult, CaptureRequest captureRequest, int cameraRotation) {

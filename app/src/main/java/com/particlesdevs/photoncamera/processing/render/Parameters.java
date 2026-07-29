@@ -72,6 +72,14 @@ public class Parameters {
     public float gammaCurve = 2.0f;
     public SpecificSettingSensor sensorSpecifics;
 
+    /**
+     * RAW frames actually retained after whole-frame pruning.
+     * This is deliberately separate from the configured frame
+     * count because rejected or unavailable frames must not make
+     * the post pipeline assume a cleaner stack than it received.
+     */
+    public int retainedFrameCount = 1;
+
     public int tile = 16;
     public int tilesX = 0;
     public Point alignmentSize = new Point(0, 0);
@@ -600,6 +608,7 @@ public class Parameters {
         return "parameters:\n" +
                 "\n hasGainMap=" + hasGainMap +
                 "\n FrameCount=" + FrameNumberSelector.frameCount +
+                "\n RetainedFrameCount=" + retainedFrameCount +
                 "\n CameraID=" + PhotonCamera.getSettings().mCameraID +
                 "\n DenoiseOn=" + PhotonCamera.getSettings().hdrxNR +
                 "\n Sharp=" + FltFormat(PreferenceKeys.getSharpnessValue()) +

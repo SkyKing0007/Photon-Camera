@@ -135,9 +135,46 @@ public class HdrxProcessor extends ProcessorBase {
             //frame.image = mImageFramesToProcess.get(i);
             //Log.d(TAG,"Timestamp:"+frame.image.getTimestamp());
             //frame.pair = IsoExpoSelector.pairs.get(i % IsoExpoSelector.patternSize);
-            frame.pair = IsoExpoSelector.fullpairs.get(i);
+            /*
+             * Photo/Night normally create one exposure pair per request.
+             * Equal-exposure Motion intentionally calculates exposure once,
+             * so fullpairs contains one entry shared by the whole burst.
+             */
+            if (IsoExpoSelector.fullpairs.isEmpty()) {
+                throw new IllegalStateException(
+                        "No exposure pairs available for HDRX"
+                );
+            }
+
+            int exposurePairIndex =
+                    i % IsoExpoSelector.fullpairs.size();
+
+            frame.pair = IsoExpoSelector.fullpairs.get(
+                    exposurePairIndex
+            );
             frame.number = i;
-            frame.pair.layerMpy = (float) (exposures.get(mImageFramesToProcess.get(i).getTimestamp()) / minExpo);
+
+            Double frameExposure = exposures.get(
+                    mImageFramesToProcess.get(i).getTimestamp()
+            );
+
+            if (frameExposure == null) {
+                /*
+                 * All Motion requests have identical ISO and shutter.
+                 * A missing HAL timestamp entry may safely use minExpo.
+                 */
+                frameExposure = minExpo;
+
+                Log.w(
+                        TAG,
+                        "Missing exposure metadata for frame "
+                                + i
+                                + "; using equal-burst exposure"
+                );
+            }
+
+            frame.pair.layerMpy =
+                    (float) (frameExposure / minExpo);
             if (frame.pair.layerMpy > 1.0) {
                 frame.pair.curlayer = IsoExpoSelector.ExpoPair.exposureLayer.High;
             } else {
@@ -369,7 +406,18 @@ public class HdrxProcessor extends ProcessorBase {
             }
         }
 
-        processingParameters.noiseModeler.computeStackingNoiseModel(images.size());
+        processingParameters.retainedFrameCount =
+                Math.max(1, images.size());
+
+        processingParameters.noiseModeler.computeStackingNoiseModel(
+                processingParameters.retainedFrameCount
+        );
+
+        Log.d(
+                TAG,
+                "Final Motion stack retained frames="
+                        + processingParameters.retainedFrameCount
+        );
 
         PostPipeline pipeline = new PostPipeline();
 
@@ -385,6 +433,15 @@ public class HdrxProcessor extends ProcessorBase {
         }
         imageFile = Paths.get(imageFile.toAbsolutePath() + ".jpg");
         //Saves the final bitmap
+        /* Refresh finalized processing metadata before saving. */
+        exifData.IMAGE_DESCRIPTION = processingParameters.toString();
+
+        Log.d(
+                TAG,
+                "Saving final metadata: retained="
+                        + processingParameters.retainedFrameCount
+        );
+
         boolean imageSaved = ImageSaver.Util.saveBitmapAsJPG(imageFile, img,
                 ImageSaver.JPG_QUALITY, exifData);
 

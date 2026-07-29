@@ -98,40 +98,6 @@ void main() {
     // Read the four neighboring tile vectors first. Their agreement acts as
     // a conservative alignment-confidence estimate. Large disagreement is
     // common near motion boundaries, weak texture, or incorrect tile matches.
-    vec2 tileAlignment[4];
-    float meanX = 0.0;
-    float meanY = 0.0;
-
-    for (int i = 0; i < 4; i++) {
-        ivec2 confidenceTile = clamp(
-                ivec2((TILE * xy) / TILE_AL + ivec2(i % 2, i / 2)),
-                ivec2(0),
-                alignmentSize - 1
-        );
-
-        tileAlignment[i] = vec4ToAlignment(
-                texelFetch(alignmentTexture, confidenceTile + shift, 0)
-        );
-
-        meanX += tileAlignment[i].x;
-        meanY += tileAlignment[i].y;
-    }
-
-    vec2 meanAlignment = vec2(meanX, meanY) * 0.25;
-    float alignmentVariance = 0.0;
-
-    for (int i = 0; i < 4; i++) {
-        vec2 delta = tileAlignment[i] - meanAlignment;
-        alignmentVariance += dot(delta, delta);
-    }
-
-    alignmentVariance *= 0.25;
-
-    // Full confidence when neighboring vectors agree within roughly one
-    // pixel. Fade toward the reference frame as disagreement grows.
-    float alignmentConfidence =
-            1.0 - smoothstep(1.0, 16.0, alignmentVariance);
-
     //ivec2 alignPrev = ivec2(xy);
     for (int i = 0; i < 4; i++) {
         ivec2 xyT = clamp(ivec2((TILE*xy)/TILE_AL + ivec2(i % 2, i / 2)),ivec2(0),alignmentSize-1);
@@ -167,20 +133,10 @@ void main() {
                            vec4(0.48),
                            vec4(0.51));
 
-        // First preserve the existing choice between the unwarped and
-        // aligned secondary-frame samples.
-        vec4 selectedAlter =
-                mix(bayerNone, bayerAlter, photometricPreference);
-
-        // bayerBase is already in the target exposure domain, while secondary
-        // samples are multiplied by exposure later. Convert it back so that a
-        // low-confidence tile contributes the reference frame rather than an
-        // incorrectly aligned or unaligned secondary frame.
-        vec4 referenceEquivalent =
-                bayerBase / max(exposure, 1e-6);
-
+        // Preserve the existing photometric choice between the unwarped
+        // and aligned sample from the secondary frame.
         bayerAlter =
-                mix(referenceEquivalent, selectedAlter, alignmentConfidence);
+                mix(bayerNone, bayerAlter, photometricPreference);
 
         //vec4 hp2 = imageLoad(hotPixTexture, aligned * TILE);
         //bayerAlter = bayerAlter * vec4(1.0-hp2) + imageLoad(avrTexture, aligned * TILE) * hp2;
