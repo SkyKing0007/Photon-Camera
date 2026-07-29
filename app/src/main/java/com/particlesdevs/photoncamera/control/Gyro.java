@@ -17,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.Queue;
 
@@ -267,22 +268,72 @@ public class Gyro {
      * @param exposureTimeNs  exposure duration (nanoseconds) to define each frame's time window
      * @param result          list to receive one GyroBurst entry per frame
      */
-    public void buildZslBurstShakiness(long[] frameTimestamps, long exposureTimeNs, ArrayList<GyroBurst> result) {
+    public void buildZslBurstShakiness(
+            long[] frameTimestamps,
+            long exposureTimeNs,
+            ArrayList<GyroBurst> result
+    ) {
+        long[] exposureTimes =
+                new long[frameTimestamps.length];
+
+        Arrays.fill(
+                exposureTimes,
+                Math.max(exposureTimeNs, 1L)
+        );
+
+        buildZslBurstShakiness(
+                frameTimestamps,
+                exposureTimes,
+                result
+        );
+    }
+
+    public void buildZslBurstShakiness(
+            long[] frameTimestamps,
+            long[] exposureTimesNs,
+            ArrayList<GyroBurst> result
+    ) {
         this.BurstShakiness = result;
-        for (long frameTs : frameTimestamps) {
-            long windowStart = frameTs - Math.max(exposureTimeNs, 1);
+
+        for (int frameIndex = 0;
+                frameIndex < frameTimestamps.length;
+                frameIndex++) {
+
+            long frameTs = frameTimestamps[frameIndex];
+
+            long exposureTimeNs =
+                    frameIndex < exposureTimesNs.length
+                            ? exposureTimesNs[frameIndex]
+                            : 1L;
+
+            long windowStart =
+                    frameTs - Math.max(exposureTimeNs, 1L);
+
             long windowEnd = frameTs;
+
             GyroBurst burst = new GyroBurst(gyroCircle);
             int sampleCount = 0;
+
             for (int i = 0; i < gyroCircle; i++) {
                 long ts = circleBurst.timestampss[i];
-                if (ts >= windowStart && ts <= windowEnd && sampleCount < gyroCircle) {
-                    burst.movementss[0][sampleCount] = circleBurst.movementss[0][i];
-                    burst.movementss[1][sampleCount] = circleBurst.movementss[1][i];
-                    burst.movementss[2][sampleCount] = circleBurst.movementss[2][i];
+
+                if (ts >= windowStart
+                        && ts <= windowEnd
+                        && sampleCount < gyroCircle) {
+
+                    burst.movementss[0][sampleCount] =
+                            circleBurst.movementss[0][i];
+
+                    burst.movementss[1][sampleCount] =
+                            circleBurst.movementss[1][i];
+
+                    burst.movementss[2][sampleCount] =
+                            circleBurst.movementss[2][i];
+
                     sampleCount++;
                 }
             }
+
             burst.samples = sampleCount;
             result.add(burst);
         }

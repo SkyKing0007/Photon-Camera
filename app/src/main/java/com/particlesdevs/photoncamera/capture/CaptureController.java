@@ -38,6 +38,7 @@ import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.ColorSpaceTransform;
 import android.hardware.camera2.params.MeteringRectangle;
 import android.hardware.camera2.params.OutputConfiguration;
+import android.hardware.camera2.params.OisSample;
 import android.hardware.camera2.params.SessionConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.CamcorderProfile;
@@ -109,6 +110,8 @@ import java.util.Map;
 import java.util.Objects;
 import android.media.Image;
 import java.util.ArrayDeque;
+import java.nio.ByteOrder;
+import java.nio.ShortBuffer;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -292,9 +295,25 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private final HashMap<Long, Double> mZslExposureEnergy = new HashMap<>();
     private final HashMap<Long, Long> mZslExposureTimeNs = new HashMap<>();
     private final HashMap<Long, Integer> mZslSensitivity = new HashMap<>();
+
+    private final HashMap<Long, Float> mZslRawSharpness =
+            new HashMap<>();
+    private final HashMap<Long, Float> mZslOisMotion =
+            new HashMap<>();
+    private final HashMap<Long, Integer> mZslOisMode =
+            new HashMap<>();
+    private final HashMap<Long, Integer> mZslEisMode =
+            new HashMap<>();
+
     private volatile boolean mZslCapturing = false;
     private volatile long mMotionShutterTimestampNs = 0L;
     private volatile long mMotionCaptureStartMs = 0L;
+
+    private volatile boolean mMotionRollingExposureConfigured = false;
+    private volatile int mMotionPreviewMetadataFrames = 0;
+    private volatile long mMotionRequestedExposureNs = 0L;
+    private volatile int mMotionRequestedIso = 0;
+    private volatile boolean mLoggedStabilizationVendorTags = false;
 
     private static final int MOTION_SELECTION_RESERVE = 8;
     private static final int MOTION_MAX_RING_FRAMES = 37;
@@ -352,6 +371,11 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
                     frame = mImageSaver.implementation.getFrame(image);
                     frame.timestamp = image.getTimestamp();
+
+                    mZslRawSharpness.put(
+                            frame.timestamp,
+                            calculateRawSharpness(frame)
+                    );
                 } catch (Exception e) {
                     Log.e(
                             MOTION_LOG_TAG,
@@ -395,6 +419,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                             mZslExposureEnergy.remove(old.timestamp);
                             mZslExposureTimeNs.remove(old.timestamp);
                             mZslSensitivity.remove(old.timestamp);
+                            mZslRawSharpness.remove(old.timestamp);
+                            mZslOisMotion.remove(old.timestamp);
+                            mZslOisMode.remove(old.timestamp);
+                            mZslEisMode.remove(old.timestamp);
                             old.close();
                         }
                     }
@@ -683,6 +711,57 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                         actualExposureNs
                                 ) * actualIso
                         );
+
+                        Integer actualOisMode =
+                                result.get(
+                                        CaptureResult
+                                                .LENS_OPTICAL_STABILIZATION_MODE
+                                );
+
+                        Integer actualEisMode =
+                                result.get(
+                                        CaptureResult
+                                                .CONTROL_VIDEO_STABILIZATION_MODE
+                                );
+
+                        if (actualOisMode != null) {
+                            mZslOisMode.put(
+                                    sensorTimestamp,
+                                    actualOisMode
+                            );
+                        }
+
+                        if (actualEisMode != null) {
+                            mZslEisMode.put(
+                                    sensorTimestamp,
+                                    actualEisMode
+                            );
+                        }
+
+                        if (Build.VERSION.SDK_INT
+                                >= Build.VERSION_CODES.P) {
+
+                            OisSample[] oisSamples =
+                                    result.get(
+                                            CaptureResult
+                                                    .STATISTICS_OIS_SAMPLES
+                                    );
+
+                            mZslOisMotion.put(
+                                    sensorTimestamp,
+                                    calculateOisMotion(oisSamples)
+                            );
+                        }
+                    }
+                }
+
+                logStabilizationVendorTags(result);
+
+                if (!mMotionRollingExposureConfigured) {
+                    mMotionPreviewMetadataFrames++;
+
+                    if (mMotionPreviewMetadataFrames >= 5) {
+                        configureMotionRollingExposure();
                     }
                 }
             }
@@ -1827,6 +1906,16 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             mZslExposureEnergy.clear();
             mZslExposureTimeNs.clear();
             mZslSensitivity.clear();
+            mZslRawSharpness.clear();
+            mZslOisMotion.clear();
+            mZslOisMode.clear();
+            mZslEisMode.clear();
+
+            mMotionRollingExposureConfigured = false;
+            mMotionPreviewMetadataFrames = 0;
+            mMotionRequestedExposureNs = 0L;
+            mMotionRequestedIso = 0;
+            mLoggedStabilizationVendorTags = false;
         }
         // Drain any frames still queued in the RAW ImageReader to prevent them leaking
         // into the next non-ZSL capture's IMAGE_BUFFER
@@ -1837,7 +1926,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             } catch (Exception ignored) {}
         }
         if (isZslMode()) {
-            mPreviewRequestBuilder.addTarget(mImageReaderRaw.getSurface());
+            mPreviewRequestBuilder.addTarget(
+                    mImageReaderRaw.getSurface()
+            );
+
+            configureMotionStabilizationRequest(
+                    mPreviewRequestBuilder
+            );
         }
         mPreviewMeteringAF = mPreviewRequestBuilder.get(CONTROL_AF_REGIONS);
         mPreviewAFMode = PreferenceKeys.getAfMode();
@@ -2054,6 +2149,351 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 == CameraMode.MOTION;
     }
 
+    private float calculateRawSharpness(ImageFrame frame) {
+        if (frame == null
+                || frame.buffer == null
+                || frame.width < 8
+                || frame.height < 8) {
+            return 0.0f;
+        }
+
+        try {
+            ShortBuffer raw =
+                    frame.buffer
+                            .duplicate()
+                            .order(ByteOrder.nativeOrder())
+                            .asShortBuffer();
+
+            int width = frame.width;
+            int height = frame.height;
+
+            int stepX = Math.max(8, width / 96);
+            int stepY = Math.max(8, height / 72);
+
+            double gradientSum = 0.0;
+            int samples = 0;
+
+            /*
+             * Sample primarily green CFA positions. This avoids a full RAW
+             * conversion and keeps the ImageReader callback lightweight.
+             */
+            for (int y = stepY; y < height - stepY; y += stepY) {
+                int greenY = (y & ~1) + 1;
+
+                for (int x = stepX; x < width - stepX; x += stepX) {
+                    int greenX = x & ~1;
+
+                    int centerIndex = greenY * width + greenX;
+                    int rightIndex = centerIndex + 2;
+                    int downIndex = centerIndex + width * 2;
+
+                    if (downIndex >= raw.limit()
+                            || rightIndex >= raw.limit()) {
+                        continue;
+                    }
+
+                    int center = raw.get(centerIndex) & 0xffff;
+                    int right = raw.get(rightIndex) & 0xffff;
+                    int down = raw.get(downIndex) & 0xffff;
+
+                    gradientSum += Math.abs(right - center);
+                    gradientSum += Math.abs(down - center);
+                    samples += 2;
+                }
+            }
+
+            return samples > 0
+                    ? (float) (gradientSum / samples)
+                    : 0.0f;
+        } catch (Exception e) {
+            Log.w(
+                    MOTION_LOG_TAG,
+                    "RAW_SHARPNESS_FAILED "
+                            + Log.getStackTraceString(e)
+            );
+            return 0.0f;
+        }
+    }
+
+    private float calculateOisMotion(OisSample[] samples) {
+        if (samples == null || samples.length < 2) {
+            return 0.0f;
+        }
+
+        float path = 0.0f;
+
+        for (int i = 1; i < samples.length; i++) {
+            float dx =
+                    samples[i].getXshift()
+                            - samples[i - 1].getXshift();
+
+            float dy =
+                    samples[i].getYshift()
+                            - samples[i - 1].getYshift();
+
+            path += Math.hypot(dx, dy);
+        }
+
+        return path;
+    }
+
+    private float medianFloat(ArrayList<Float> values) {
+        if (values.isEmpty()) {
+            return 0.0f;
+        }
+
+        ArrayList<Float> sorted = new ArrayList<>(values);
+        Collections.sort(sorted);
+
+        int middle = sorted.size() / 2;
+
+        if ((sorted.size() & 1) == 0) {
+            return (
+                    sorted.get(middle - 1)
+                            + sorted.get(middle)
+            ) * 0.5f;
+        }
+
+        return sorted.get(middle);
+    }
+
+    private void configureMotionStabilizationRequest(
+            CaptureRequest.Builder builder
+    ) {
+        if (builder == null || mCameraCharacteristics == null) {
+            return;
+        }
+
+        try {
+            int[] oisModes =
+                    mCameraCharacteristics.get(
+                            CameraCharacteristics
+                                    .LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION
+                    );
+
+            if (oisModes != null) {
+                for (int mode : oisModes) {
+                    if (mode
+                            == CaptureRequest
+                                    .LENS_OPTICAL_STABILIZATION_MODE_ON) {
+
+                        builder.set(
+                                CaptureRequest
+                                        .LENS_OPTICAL_STABILIZATION_MODE,
+                                CaptureRequest
+                                        .LENS_OPTICAL_STABILIZATION_MODE_ON
+                        );
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            Log.w(
+                    MOTION_LOG_TAG,
+                    "OIS_ENABLE_FAILED "
+                            + Log.getStackTraceString(e)
+            );
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                int[] oisDataModes =
+                        mCameraCharacteristics.get(
+                                CameraCharacteristics
+                                        .STATISTICS_INFO_AVAILABLE_OIS_DATA_MODES
+                        );
+
+                if (oisDataModes != null) {
+                    for (int mode : oisDataModes) {
+                        if (mode
+                                == CaptureRequest
+                                        .STATISTICS_OIS_DATA_MODE_ON) {
+
+                            builder.set(
+                                    CaptureRequest
+                                            .STATISTICS_OIS_DATA_MODE,
+                                    CaptureRequest
+                                            .STATISTICS_OIS_DATA_MODE_ON
+                            );
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                Log.w(
+                        MOTION_LOG_TAG,
+                        "OIS_DATA_ENABLE_FAILED "
+                                + Log.getStackTraceString(e)
+                );
+            }
+        }
+    }
+
+    private void configureMotionRollingExposure() {
+        if (!isZslMode()
+                || mMotionRollingExposureConfigured
+                || mPreviewRequestBuilder == null
+                || mCaptureSession == null) {
+            return;
+        }
+
+        try {
+            /*
+             * Use the same exposure selection as the working dedicated
+             * equal-exposure Motion burst, including its mild -0.5 EV
+             * shutter reduction.
+             */
+            IsoExpoSelector.setExpo(
+                    mPreviewRequestBuilder,
+                    0,
+                    this
+            );
+
+            Long selectedExposure =
+                    mPreviewRequestBuilder.get(
+                            CaptureRequest.SENSOR_EXPOSURE_TIME
+                    );
+
+            Integer selectedIso =
+                    mPreviewRequestBuilder.get(
+                            CaptureRequest.SENSOR_SENSITIVITY
+                    );
+
+            long motionExposure =
+                    selectedExposure != null
+                            ? selectedExposure
+                            : IsoExpoSelector.lastSelectedExposure;
+
+            motionExposure = Math.max(
+                    1_000_000L,
+                    Math.round(
+                            motionExposure / Math.sqrt(2.0)
+                    )
+            );
+
+            Range<Long> exposureRange =
+                    mCameraCharacteristics.get(
+                            CameraCharacteristics
+                                    .SENSOR_INFO_EXPOSURE_TIME_RANGE
+                    );
+
+            if (exposureRange != null) {
+                motionExposure = Math.max(
+                        exposureRange.getLower(),
+                        Math.min(
+                                exposureRange.getUpper(),
+                                motionExposure
+                        )
+                );
+            }
+
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.SENSOR_EXPOSURE_TIME,
+                    motionExposure
+            );
+
+            configureMotionStabilizationRequest(
+                    mPreviewRequestBuilder
+            );
+
+            mMotionRequestedExposureNs = motionExposure;
+            mMotionRequestedIso =
+                    selectedIso != null
+                            ? selectedIso
+                            : mPreviewIso;
+
+            mMotionRollingExposureConfigured = true;
+
+            synchronized (mZslBufferLock) {
+                while (!mZslRingBuffer.isEmpty()) {
+                    ImageFrame frame =
+                            mZslRingBuffer.pollFirst();
+
+                    if (frame != null) {
+                        frame.close();
+                    }
+                }
+
+                mZslExposureEnergy.clear();
+                mZslExposureTimeNs.clear();
+                mZslSensitivity.clear();
+                mZslRawSharpness.clear();
+                mZslOisMotion.clear();
+                mZslOisMode.clear();
+                mZslEisMode.clear();
+            }
+
+            mPreviewInputRequest =
+                    mPreviewRequestBuilder.build();
+
+            mCaptureSession.setRepeatingRequest(
+                    mPreviewInputRequest,
+                    mCaptureCallback,
+                    mBackgroundHandler
+            );
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "ROLLING_EXPOSURE_CONFIGURED"
+                            + " requestedExposureNs="
+                            + mMotionRequestedExposureNs
+                            + " requestedIso="
+                            + mMotionRequestedIso
+            );
+        } catch (Exception e) {
+            mMotionRollingExposureConfigured = false;
+
+            Log.e(
+                    MOTION_LOG_TAG,
+                    "ROLLING_EXPOSURE_FAILED "
+                            + Log.getStackTraceString(e)
+            );
+        }
+    }
+
+    private void logStabilizationVendorTags(
+            TotalCaptureResult result
+    ) {
+        if (mLoggedStabilizationVendorTags || result == null) {
+            return;
+        }
+
+        mLoggedStabilizationVendorTags = true;
+
+        try {
+            for (CaptureResult.Key<?> key : result.getKeys()) {
+                String name =
+                        key.getName().toLowerCase(Locale.US);
+
+                if (name.contains("ois")
+                        || name.contains("eis")
+                        || name.contains("stabil")
+                        || name.contains("gyro")
+                        || name.contains("motion")
+                        || name.contains("shake")
+                        || name.contains("lens.shift")) {
+
+                    Object value = result.get(key);
+
+                    Log.d(
+                            MOTION_LOG_TAG,
+                            "STABILIZATION_VENDOR_TAG"
+                                    + " name="
+                                    + key.getName()
+                                    + " value="
+                                    + String.valueOf(value)
+                    );
+                }
+            }
+        } catch (Exception e) {
+            Log.w(
+                    MOTION_LOG_TAG,
+                    "VENDOR_TAG_ENUMERATION_FAILED "
+                            + Log.getStackTraceString(e)
+            );
+        }
+    }
+
     private void triggerZslCapture() {
         if (mZslCapturing || CaptureController.isProcessing) {
             Log.w(
@@ -2137,6 +2577,9 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         final long[] candidateTimestamps =
                 new long[candidates.size()];
 
+        final long[] candidateExposureTimes =
+                new long[candidates.size()];
+
         long representativeExposureNs = 0L;
 
         for (int i = 0; i < candidates.size(); i++) {
@@ -2147,6 +2590,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     mZslExposureTimeNs.get(frame.timestamp);
 
             if (exposureNs != null && exposureNs > 0L) {
+                candidateExposureTimes[i] = exposureNs;
                 representativeExposureNs = exposureNs;
             }
         }
@@ -2164,9 +2608,16 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             }
         }
 
+        for (int i = 0; i < candidateExposureTimes.length; i++) {
+            if (candidateExposureTimes[i] <= 0L) {
+                candidateExposureTimes[i] =
+                        Math.max(1L, representativeExposureNs);
+            }
+        }
+
         PhotonCamera.getGyro().buildZslBurstShakiness(
                 candidateTimestamps,
-                Math.max(1L, representativeExposureNs),
+                candidateExposureTimes,
                 BurstShakiness
         );
 
@@ -2182,24 +2633,50 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         final class ScoredMotionFrame {
             final ImageFrame frame;
             final GyroBurst gyro;
-            final float shake;
+            final float gyroShake;
+            final float rawSharpness;
+            final float oisMotion;
+            final boolean oisActive;
+            final boolean eisActive;
             final long shutterDistanceNs;
+            final boolean metadataValid;
+
+            float combinedScore;
+            boolean severeBlur;
 
             ScoredMotionFrame(
                     ImageFrame frame,
                     GyroBurst gyro,
-                    float shake,
-                    long shutterDistanceNs
+                    float gyroShake,
+                    float rawSharpness,
+                    float oisMotion,
+                    boolean oisActive,
+                    boolean eisActive,
+                    long shutterDistanceNs,
+                    boolean metadataValid
             ) {
                 this.frame = frame;
                 this.gyro = gyro;
-                this.shake = shake;
+                this.gyroShake = gyroShake;
+                this.rawSharpness = rawSharpness;
+                this.oisMotion = oisMotion;
+                this.oisActive = oisActive;
+                this.eisActive = eisActive;
                 this.shutterDistanceNs = shutterDistanceNs;
+                this.metadataValid = metadataValid;
             }
         }
 
         ArrayList<ScoredMotionFrame> scored =
                 new ArrayList<>();
+
+        ArrayList<Float> validGyroScores =
+                new ArrayList<>();
+
+        ArrayList<Float> validSharpnessScores =
+                new ArrayList<>();
+
+        long maximumShutterDistanceNs = 1L;
 
         for (int i = 0; i < candidates.size(); i++) {
             ImageFrame frame = candidates.get(i);
@@ -2209,10 +2686,44 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                             ? BurstShakiness.get(i)
                             : new GyroBurst(1);
 
-            float shake =
+            float gyroShake =
                     Float.isFinite(gyro.shakiness)
                             ? gyro.shakiness
                             : Float.MAX_VALUE;
+
+            float rawSharpness =
+                    mZslRawSharpness.getOrDefault(
+                            frame.timestamp,
+                            0.0f
+                    );
+
+            float oisMotion =
+                    mZslOisMotion.getOrDefault(
+                            frame.timestamp,
+                            0.0f
+                    );
+
+            int oisMode =
+                    mZslOisMode.getOrDefault(
+                            frame.timestamp,
+                            CaptureResult
+                                    .LENS_OPTICAL_STABILIZATION_MODE_OFF
+                    );
+
+            int eisMode =
+                    mZslEisMode.getOrDefault(
+                            frame.timestamp,
+                            CaptureResult
+                                    .CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                    );
+
+            boolean metadataValid =
+                    mZslExposureTimeNs.containsKey(
+                            frame.timestamp
+                    )
+                    && mZslSensitivity.containsKey(
+                            frame.timestamp
+                    );
 
             long shutterDistanceNs =
                     Math.abs(
@@ -2220,22 +2731,114 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                     - frame.timestamp
                     );
 
+            maximumShutterDistanceNs =
+                    Math.max(
+                            maximumShutterDistanceNs,
+                            shutterDistanceNs
+                    );
+
+            if (metadataValid
+                    && Float.isFinite(gyroShake)
+                    && gyroShake < Float.MAX_VALUE) {
+
+                validGyroScores.add(gyroShake);
+            }
+
+            if (metadataValid && rawSharpness > 0.0f) {
+                validSharpnessScores.add(rawSharpness);
+            }
+
             scored.add(
                     new ScoredMotionFrame(
                             frame,
                             gyro,
-                            shake,
-                            shutterDistanceNs
+                            gyroShake,
+                            rawSharpness,
+                            oisMotion,
+                            oisMode
+                                    == CaptureResult
+                                            .LENS_OPTICAL_STABILIZATION_MODE_ON,
+                            eisMode
+                                    != CaptureResult
+                                            .CONTROL_VIDEO_STABILIZATION_MODE_OFF,
+                            shutterDistanceNs,
+                            metadataValid
                     )
             );
         }
 
-        scored.sort((left, right) -> {
-            int shakeCompare =
-                    Float.compare(left.shake, right.shake);
+        float medianGyro =
+                Math.max(
+                        0.000001f,
+                        medianFloat(validGyroScores)
+                );
 
-            if (shakeCompare != 0) {
-                return shakeCompare;
+        float medianSharpness =
+                Math.max(
+                        0.000001f,
+                        medianFloat(validSharpnessScores)
+                );
+
+        for (ScoredMotionFrame item : scored) {
+            if (!item.metadataValid) {
+                item.combinedScore = Float.MAX_VALUE;
+                item.severeBlur = true;
+                continue;
+            }
+
+            float normalizedGyro =
+                    item.gyroShake / medianGyro;
+
+            float normalizedSoftness =
+                    medianSharpness
+                            / Math.max(
+                                    0.000001f,
+                                    item.rawSharpness
+                            );
+
+            float normalizedAge =
+                    (float) item.shutterDistanceNs
+                            / maximumShutterDistanceNs;
+
+            /*
+             * OIS-active frames should not be penalized as strongly merely
+             * because the phone gyro recorded motion. The RAW sharpness
+             * measurement remains the final evidence of actual blur.
+             */
+            float gyroWeight =
+                    item.oisActive
+                            ? 0.35f
+                            : 0.65f;
+
+            item.combinedScore =
+                    gyroWeight * normalizedGyro
+                            + 0.85f * normalizedSoftness
+                            + 0.25f * normalizedAge;
+
+            item.severeBlur =
+                    item.rawSharpness
+                            < medianSharpness * 0.35f
+                    && item.gyroShake
+                            > medianGyro * 3.0f;
+        }
+
+        scored.sort((left, right) -> {
+            if (left.metadataValid != right.metadataValid) {
+                return left.metadataValid ? -1 : 1;
+            }
+
+            if (left.severeBlur != right.severeBlur) {
+                return left.severeBlur ? 1 : -1;
+            }
+
+            int scoreCompare =
+                    Float.compare(
+                            left.combinedScore,
+                            right.combinedScore
+                    );
+
+            if (scoreCompare != 0) {
+                return scoreCompare;
             }
 
             return Long.compare(
@@ -2302,7 +2905,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                 + " dtShutterNs="
                                 + item.shutterDistanceNs
                                 + " shake="
-                                + item.shake
+                                + item.gyroShake
                                 + " exposureNs="
                                 + mZslExposureTimeNs.get(
                                         item.frame.timestamp
@@ -2311,6 +2914,16 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                 + mZslSensitivity.get(
                                         item.frame.timestamp
                                 )
+                                + " rawSharpness="
+                                + item.rawSharpness
+                                + " oisActive="
+                                + item.oisActive
+                                + " oisMotion="
+                                + item.oisMotion
+                                + " eisActive="
+                                + item.eisActive
+                                + " score="
+                                + item.combinedScore
                                 + " decision=SELECTED"
                 );
             } else {
@@ -2324,8 +2937,23 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                 + " dtShutterNs="
                                 + item.shutterDistanceNs
                                 + " shake="
-                                + item.shake
-                                + " decision=REJECTED_BLUR_OR_RESERVE"
+                                + item.gyroShake
+                                + " rawSharpness="
+                                + item.rawSharpness
+                                + " oisActive="
+                                + item.oisActive
+                                + " score="
+                                + item.combinedScore
+                                + " metadataValid="
+                                + item.metadataValid
+                                + " decision="
+                                + (
+                                    !item.metadataValid
+                                            ? "REJECTED_INVALID_METADATA"
+                                            : item.severeBlur
+                                                    ? "REJECTED_SEVERE_BLUR"
+                                                    : "NOT_SELECTED_RANK_LIMIT"
+                                )
                 );
 
                 item.frame.close();
@@ -2337,6 +2965,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 mZslExposureEnergy.remove(frame.timestamp);
                 mZslExposureTimeNs.remove(frame.timestamp);
                 mZslSensitivity.remove(frame.timestamp);
+                mZslRawSharpness.remove(frame.timestamp);
+                mZslOisMotion.remove(frame.timestamp);
+                mZslOisMode.remove(frame.timestamp);
+                mZslEisMode.remove(frame.timestamp);
             }
         }
 
@@ -2422,8 +3054,49 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         IsoExpoSelector.fullpairs.clear();
 
         for (int i = 0; i < selected.size(); i++) {
-            IsoExpoSelector.fullpairs.add(
-                    IsoExpoSelector.GenerateExpoPair(i, this)
+            ImageFrame selectedFrame = selected.get(i);
+
+            IsoExpoSelector.ExpoPair actualPair =
+                    IsoExpoSelector.GenerateExpoPair(
+                            i,
+                            this
+                    );
+
+            Long actualExposure =
+                    mZslExposureTimeNs.get(
+                            selectedFrame.timestamp
+                    );
+
+            Integer actualIso =
+                    mZslSensitivity.get(
+                            selectedFrame.timestamp
+                    );
+
+            if (actualExposure != null
+                    && actualExposure > 0L) {
+                actualPair.exposure = actualExposure;
+            }
+
+            if (actualIso != null && actualIso > 0) {
+                actualPair.iso = actualIso;
+            }
+
+            actualPair.layerMpy = 1.0f;
+            selectedFrame.pair = actualPair;
+
+            IsoExpoSelector.fullpairs.add(actualPair);
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "ACTUAL_EXPO_PAIR"
+                            + " index="
+                            + i
+                            + " timestamp="
+                            + selectedFrame.timestamp
+                            + " exposureNs="
+                            + actualPair.exposure
+                            + " iso="
+                            + actualPair.iso
             );
         }
 
