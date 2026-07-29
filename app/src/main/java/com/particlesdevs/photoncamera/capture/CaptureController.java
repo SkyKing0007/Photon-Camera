@@ -757,11 +757,24 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
                 logStabilizationVendorTags(result);
 
+                /*
+                 * Keep the shared preview/RAW repeating request under normal
+                 * auto-exposure. A permanent manual exposure here caused the
+                 * viewfinder and rolling RAW stream to remain stuck at the
+                 * brightness of the scene seen shortly after camera startup.
+                 */
                 if (!mMotionRollingExposureConfigured) {
                     mMotionPreviewMetadataFrames++;
 
-                    if (mMotionPreviewMetadataFrames >= 5) {
-                        configureMotionRollingExposure();
+                    if (mMotionPreviewMetadataFrames == 5) {
+                        Log.d(
+                                MOTION_LOG_TAG,
+                                "ROLLING_AE_ACTIVE"
+                                        + " previewExposureNs="
+                                        + actualExposureNs
+                                        + " previewIso="
+                                        + actualIso
+                        );
                     }
                 }
             }
@@ -1930,6 +1943,21 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     mImageReaderRaw.getSurface()
             );
 
+            /*
+             * The viewfinder and rolling RAW stream share this repeating
+             * request. Leave exposure under continuous AE so scene changes
+             * are followed normally before and after shutter press.
+             */
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_MODE,
+                    CaptureRequest.CONTROL_MODE_AUTO
+            );
+
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON
+            );
+
             configureMotionStabilizationRequest(
                     mPreviewRequestBuilder
             );
@@ -2475,13 +2503,58 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
                     Object value = result.get(key);
 
+                    String formattedValue;
+
+                    if (value == null) {
+                        formattedValue = "null";
+                    } else if (value.getClass().isArray()) {
+                        int arrayLength =
+                                java.lang.reflect.Array.getLength(value);
+
+                        StringBuilder arrayText =
+                                new StringBuilder("[");
+
+                        int displayedValues =
+                                Math.min(arrayLength, 32);
+
+                        for (int i = 0;
+                                i < displayedValues;
+                                i++) {
+
+                            if (i > 0) {
+                                arrayText.append(", ");
+                            }
+
+                            arrayText.append(
+                                    String.valueOf(
+                                            java.lang.reflect.Array.get(
+                                                    value,
+                                                    i
+                                            )
+                                    )
+                            );
+                        }
+
+                        if (arrayLength > displayedValues) {
+                            arrayText.append(
+                                    ", ... total="
+                                            + arrayLength
+                            );
+                        }
+
+                        arrayText.append("]");
+                        formattedValue = arrayText.toString();
+                    } else {
+                        formattedValue = String.valueOf(value);
+                    }
+
                     Log.d(
                             MOTION_LOG_TAG,
                             "STABILIZATION_VENDOR_TAG"
                                     + " name="
                                     + key.getName()
                                     + " value="
-                                    + String.valueOf(value)
+                                    + formattedValue
                     );
                 }
             }
@@ -2550,13 +2623,163 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         + mMotionShutterTimestampNs
         );
 
+        Long latestPreviewExposureNs = null;
+        Integer latestPreviewIso = null;
+
+        if (mPreviewCaptureResult != null) {
+            latestPreviewExposureNs =
+                    mPreviewCaptureResult.get(
+                            CaptureResult.SENSOR_EXPOSURE_TIME
+                    );
+
+            latestPreviewIso =
+                    mPreviewCaptureResult.get(
+                            CaptureResult.SENSOR_SENSITIVITY
+                    );
+        }
+
+        final double latestPreviewEnergy =
+                latestPreviewExposureNs != null
+                        && latestPreviewExposureNs > 0L
+                        && latestPreviewIso != null
+                        && latestPreviewIso > 0
+                        ? ExposureIndex.time2sec(
+                                latestPreviewExposureNs
+                        ) * latestPreviewIso
+                        : 0.0;
+
+        final double maximumExposureDifferenceEv = 0.75;
+        final long maximumCandidateAgeNs =
+                2_000_000_000L;
+
+        final ArrayList<ImageFrame> compatibleCandidates =
+                new ArrayList<>();
+
+        int rejectedMissingMetadata = 0;
+        int rejectedExposureMismatch = 0;
+        int rejectedTooOld = 0;
+
+        for (ImageFrame frame : candidates) {
+            Long actualExposureNs =
+                    mZslExposureTimeNs.get(frame.timestamp);
+
+            Integer actualIso =
+                    mZslSensitivity.get(frame.timestamp);
+
+            long ageNs =
+                    Math.abs(
+                            mMotionShutterTimestampNs
+                                    - frame.timestamp
+                    );
+
+            boolean metadataValid =
+                    actualExposureNs != null
+                            && actualExposureNs > 0L
+                            && actualIso != null
+                            && actualIso > 0;
+
+            double actualEnergy =
+                    metadataValid
+                            ? ExposureIndex.time2sec(
+                                    actualExposureNs
+                            ) * actualIso
+                            : 0.0;
+
+            double exposureDifferenceEv =
+                    metadataValid
+                            && latestPreviewEnergy > 0.0
+                            && actualEnergy > 0.0
+                            ? Math.abs(
+                                    Math.log(
+                                            actualEnergy
+                                                    / latestPreviewEnergy
+                                    ) / Math.log(2.0)
+                            )
+                            : Double.POSITIVE_INFINITY;
+
+            boolean ageValid =
+                    ageNs <= maximumCandidateAgeNs;
+
+            boolean exposureCompatible =
+                    exposureDifferenceEv
+                            <= maximumExposureDifferenceEv;
+
+            if (metadataValid
+                    && ageValid
+                    && exposureCompatible) {
+
+                compatibleCandidates.add(frame);
+            } else {
+                if (!metadataValid) {
+                    rejectedMissingMetadata++;
+                } else if (!ageValid) {
+                    rejectedTooOld++;
+                } else {
+                    rejectedExposureMismatch++;
+                }
+
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "FRAME_PREFILTER"
+                                + " timestamp="
+                                + frame.timestamp
+                                + " ageNs="
+                                + ageNs
+                                + " exposureNs="
+                                + actualExposureNs
+                                + " iso="
+                                + actualIso
+                                + " differenceEv="
+                                + exposureDifferenceEv
+                                + " decision="
+                                + (
+                                    !metadataValid
+                                            ? "REJECTED_INVALID_METADATA"
+                                            : !ageValid
+                                                    ? "REJECTED_TOO_OLD"
+                                                    : "REJECTED_EXPOSURE_MISMATCH"
+                                )
+                );
+
+                mZslExposureEnergy.remove(frame.timestamp);
+                mZslExposureTimeNs.remove(frame.timestamp);
+                mZslSensitivity.remove(frame.timestamp);
+                mZslRawSharpness.remove(frame.timestamp);
+                mZslOisMotion.remove(frame.timestamp);
+                mZslOisMode.remove(frame.timestamp);
+                mZslEisMode.remove(frame.timestamp);
+
+                frame.close();
+            }
+        }
+
+        candidates.clear();
+        candidates.addAll(compatibleCandidates);
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "BUFFER_COMPATIBILITY"
+                        + " latestExposureNs="
+                        + latestPreviewExposureNs
+                        + " latestIso="
+                        + latestPreviewIso
+                        + " compatible="
+                        + candidates.size()
+                        + " rejectedMissingMetadata="
+                        + rejectedMissingMetadata
+                        + " rejectedExposureMismatch="
+                        + rejectedExposureMismatch
+                        + " rejectedTooOld="
+                        + rejectedTooOld
+        );
+
         /*
          * The rolling buffer may still be filling immediately after opening
          * the camera or switching lenses. Preserve the known-good dedicated
          * post-shutter path as the fallback instead of processing an empty or
          * unusably small stack.
          */
-        if (candidates.size() < MOTION_MIN_PROCESS_FRAMES) {
+        if (candidates.size() < requestedFrames) {
             for (ImageFrame frame : candidates) {
                 frame.close();
             }
@@ -2567,6 +2790,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     MOTION_LOG_TAG,
                     "RING_NOT_READY candidates="
                             + candidates.size()
+                            + " required="
+                            + requestedFrames
                             + " action=post_shutter_fallback"
             );
 
@@ -2859,6 +3084,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         HashMap<Long, Double> selectedExposures =
                 new HashMap<>();
 
+        HashMap<Long, Long> selectedActualExposureNs =
+                new HashMap<>();
+
+        HashMap<Long, Integer> selectedActualIso =
+                new HashMap<>();
+
         for (int i = 0; i < scored.size(); i++) {
             ScoredMotionFrame item = scored.get(i);
 
@@ -2894,6 +3125,32 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         item.frame.timestamp,
                         exposureEnergy
                 );
+
+                Long selectedExposureNs =
+                        mZslExposureTimeNs.get(
+                                item.frame.timestamp
+                        );
+
+                Integer selectedIso =
+                        mZslSensitivity.get(
+                                item.frame.timestamp
+                        );
+
+                if (selectedExposureNs != null
+                        && selectedExposureNs > 0L
+                        && selectedIso != null
+                        && selectedIso > 0) {
+
+                    selectedActualExposureNs.put(
+                            item.frame.timestamp,
+                            selectedExposureNs
+                    );
+
+                    selectedActualIso.put(
+                            item.frame.timestamp,
+                            selectedIso
+                    );
+                }
 
                 Log.d(
                         MOTION_LOG_TAG,
@@ -3063,12 +3320,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     );
 
             Long actualExposure =
-                    mZslExposureTimeNs.get(
+                    selectedActualExposureNs.get(
                             selectedFrame.timestamp
                     );
 
             Integer actualIso =
-                    mZslSensitivity.get(
+                    selectedActualIso.get(
                             selectedFrame.timestamp
                     );
 
@@ -3569,14 +3826,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                     : IsoExpoSelector.lastSelectedExposure;
 
                     /*
-                     * Mild -0.5 EV highlight protection by shortening shutter.
-                     * ISO stays fixed for all frames.
+                     * Preserve the Motion selector's exposure directly.
+                     * In low light the handheld Motion limit is approximately
+                     * 1/15 second. ISO remains fixed across the fallback burst.
                      */
                     motionExposure = Math.max(
                             1_000_000L,
-                            Math.round(
-                                    motionExposure / Math.sqrt(2.0)
-                            )
+                            motionExposure
                     );
 
                     Range<Long> exposureRange =
