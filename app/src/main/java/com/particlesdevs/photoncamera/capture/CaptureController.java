@@ -3148,17 +3148,36 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     }
 
     private void startMotionPrebufferPump() {
+        /*
+         * Disabled in build 0.9726144.
+         *
+         * The 0.9726143 implementation submitted controlled full-resolution
+         * RAW captures while preview was active. Those long-exposure requests
+         * interrupted the repeating preview, caused visible exposure flicker,
+         * and could restart while the previous HDRX shot still owned RAW
+         * frames.
+         *
+         * Keep all pre-buffer state empty so normal preview and the dedicated
+         * shutter-triggered Motion RAW burst remain isolated.
+         */
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.removeCallbacks(mMotionPrebufferRunnable);
+        }
+
         synchronized (mMotionBurstLock) {
-            mMotionPrebufferEnabled = true;
-            mMotionPrebufferFailureCount = 0;
+            mMotionPrebufferEnabled = false;
             mMotionPrebufferRequestInFlight = false;
             mMotionPrebufferAcceptUntilNs = 0L;
             mMotionPrebufferTargetExposureNs = 0L;
             mMotionPrebufferTargetIso = 0;
+            mMotionPrebufferFailureCount = 0;
             closeMotionPrebufferLocked();
         }
 
-        scheduleMotionPrebufferPump(250L);
+        Log.d(
+                TAG,
+                "MOTION_PREBUFFER_DISABLED build=0.9726144"
+        );
     }
 
     private void stopMotionPrebufferPump() {
