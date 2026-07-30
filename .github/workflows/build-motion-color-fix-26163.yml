@@ -1,1 +1,150 @@
+name: Build Motion Color Fix 26163
 
+on:
+  push:
+    branches:
+      - experimental-effective-stack
+    paths:
+      - '.github/workflows/build-motion-color-fix-26163.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build PhotonCamera 0.9726163
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout experimental branch
+        uses: actions/checkout@v4
+        with:
+          ref: experimental-effective-stack
+          fetch-depth: 1
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK 36
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;35.0.0" \
+            "platform-tools"
+
+      - name: Apply Motion color-path correction
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SHADER="app/src/main/assets/shaders/initial.glsl"
+          VERSION="app/version.properties"
+
+          grep -Fq \
+            'pRGB = corr*sensorToIntermediate*(pRGB*neutralPoint);' \
+            "$SHADER"
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          shader_path = Path("app/src/main/assets/shaders/initial.glsl")
+          version_path = Path("app/version.properties")
+
+          shader = shader_path.read_text()
+
+          old = "    pRGB = corr*sensorToIntermediate*(pRGB*neutralPoint);"
+          new = """    /*
+     * Build 26163:
+     *
+     * sensorToIntermediate is calculated from the DNG forward and
+     * calibration matrices using SENSOR_NEUTRAL_COLOR_POINT. It already
+     * maps the captured camera neutral to D50 white. Multiplying pRGB by
+     * neutralPoint here applies the neutral a second time, suppressing red
+     * and blue relative to green in HDR and outdoor scenes.
+     */
+    pRGB = corr*sensorToIntermediate*pRGB;"""
+
+          if shader.count(old) != 1:
+              raise SystemExit(
+                  f"Expected one final neutral multiplication, found "
+                  f"{shader.count(old)}"
+              )
+
+          shader_path.write_text(shader.replace(old, new, 1))
+
+          version = version_path.read_text()
+
+          if "VERSION_BUILD=26157" not in version:
+              raise SystemExit(
+                  "Expected public branch VERSION_BUILD=26157"
+              )
+
+          version_path.write_text(
+              version.replace(
+                  "VERSION_BUILD=26157",
+                  "VERSION_BUILD=26163",
+                  1,
+              )
+          )
+          PY
+
+          grep -Fq \
+            'pRGB = corr*sensorToIntermediate*pRGB;' \
+            "$SHADER"
+
+          if grep -Fq \
+            'pRGB = corr*sensorToIntermediate*(pRGB*neutralPoint);' \
+            "$SHADER"; then
+            echo "Old double-neutral expression remains"
+            exit 1
+          fi
+
+          grep -q '^VERSION_BUILD=26163$' "$VERSION"
+
+          git diff --check
+          git diff -- "$SHADER" "$VERSION"
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          chmod +x gradlew
+          ./gradlew clean assembleDebug --stacktrace
+
+      - name: Locate and rename APK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          APK="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' | head -1)"
+
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "Debug APK not found"
+            find app/build/outputs -type f || true
+            exit 1
+          fi
+
+          mkdir -p artifact
+          cp "$APK" \
+            "artifact/PhotonCamera-0.9726163-motion-double-neutral-fix-debug.apk"
+
+          sha256sum \
+            "artifact/PhotonCamera-0.9726163-motion-double-neutral-fix-debug.apk" \
+            | tee artifact/SHA256.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotonCamera-0.9726163-motion-color-fix
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14
