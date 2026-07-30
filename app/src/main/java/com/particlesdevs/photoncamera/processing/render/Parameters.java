@@ -284,8 +284,35 @@ public class Parameters {
             } catch (Exception e){
                 Log.d(TAG, "Error retrieving lens shading map, disabling gain map: " + Log.getStackTraceString(e));
             }
-            hotPixels = result.get(CaptureResult.STATISTICS_HOT_PIXEL_MAP);
-            ReCalcColor(false, result);
+            hotPixels =
+                    result.get(
+                            CaptureResult.STATISTICS_HOT_PIXEL_MAP
+                    );
+
+            float[] motionPreviewNeutral =
+                    CaptureController.getMotionProcessingNeutral();
+
+            if (motionPreviewNeutral != null
+                    && motionPreviewNeutral.length >= 3) {
+
+                customNeutral = motionPreviewNeutral;
+                ReCalcColor(true, result);
+
+                Log.d(
+                        TAG,
+                        "MOTION_COLOR_NEUTRAL_OVERRIDE"
+                                + " previewNeutral="
+                                + Arrays.toString(
+                                        motionPreviewNeutral
+                                )
+                                + " controlledIso="
+                                + iso
+                                + " controlledExposureTime="
+                                + exposureTime
+                );
+            } else {
+                ReCalcColor(false, result);
+            }
         }
         if (!usedDynamic)
             if (level != null) {

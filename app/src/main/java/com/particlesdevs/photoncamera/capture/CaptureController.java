@@ -322,6 +322,22 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private volatile long mMotionTargetExposureNs = 0L;
     private volatile int mMotionTargetIso = 0;
 
+    /*
+     * Motion processing must use the white balance measured by the visible
+     * continuously auto-balanced preview. The controlled manual RAW burst
+     * still owns exposure, ISO, noise profile, timestamps, and EXIF.
+     */
+    private static volatile float[] mMotionProcessingNeutral = null;
+
+    public static float[] getMotionProcessingNeutral() {
+        if (PhotonCamera.getSettings().selectedMode != CameraMode.MOTION) {
+            return null;
+        }
+
+        float[] neutral = mMotionProcessingNeutral;
+        return neutral != null ? neutral.clone() : null;
+    }
+
     private volatile boolean mLoggedStabilizationVendorTags = false;
 
     private static final int MOTION_SELECTION_RESERVE = 8;
@@ -642,10 +658,15 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                     PhotonCamera.getSettings().frameCount
                             );
 
+                    /*
+                     * The passive Motion pre-buffer is always capped at eight
+                     * frames. For slider totals below eight, never retain more
+                     * frames than the requested final stack.
+                     */
                     int ringCapacity =
                             Math.min(
-                                    MOTION_MAX_RING_FRAMES,
-                                    configured + MOTION_SELECTION_RESERVE
+                                    MOTION_PREBUFFER_MAX_FRAMES,
+                                    configured
                             );
 
                     while (mZslRingBuffer.size() > ringCapacity) {
@@ -837,24 +858,73 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         public void onCaptureCompleted(@NonNull CameraCaptureSession session,
                                        @NonNull CaptureRequest request,
                                        @NonNull TotalCaptureResult result) {
-            Object exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
-            Object iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
-            Object focus = result.get(CaptureResult.LENS_FOCUS_DISTANCE);
-            Rational[] mTemp = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT);
-            if (exposure != null) mPreviewExposureTime = (long) exposure;
-            if (iso != null) mPreviewIso = (int) iso;
-            if (focus != null) mFocus = (float) focus;
-            if (mTemp != null) mPreviewTemp = mTemp;
-            if (mPreviewTemp == null) {
-                mPreviewTemp = new Rational[3];
-                for (int i = 0; i < mPreviewTemp.length; i++)
-                    mPreviewTemp[i] = new Rational(101, 100);
+            /*
+             * CaptureRequest.getTargets() is not available on this project's
+             * Android API surface. The repeating preview callback receives the
+             * exact request object stored in mPreviewInputRequest, while the
+             * RAW-only prebuffer uses a separate request object.
+             */
+            boolean visiblePreviewResult =
+                    request == mPreviewInputRequest;
+
+            /*
+             * Photo and Night retain their original behavior. In Motion,
+             * RAW-only prebuffer/manual results must not overwrite the latest
+             * visible-preview AE/AWB metadata.
+             */
+            if (!isZslMode() || visiblePreviewResult) {
+                Object exposure =
+                        result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+                Object iso =
+                        result.get(CaptureResult.SENSOR_SENSITIVITY);
+                Object focus =
+                        result.get(CaptureResult.LENS_FOCUS_DISTANCE);
+                Rational[] mTemp =
+                        result.get(
+                                CaptureResult.SENSOR_NEUTRAL_COLOR_POINT
+                        );
+
+                if (exposure != null) {
+                    mPreviewExposureTime = (long) exposure;
+                }
+                if (iso != null) {
+                    mPreviewIso = (int) iso;
+                }
+                if (focus != null) {
+                    mFocus = (float) focus;
+                }
+                if (mTemp != null && mTemp.length >= 3) {
+                    mPreviewTemp = mTemp;
+                }
+                if (mPreviewTemp == null) {
+                    mPreviewTemp = new Rational[3];
+                    for (int i = 0; i < mPreviewTemp.length; i++) {
+                        mPreviewTemp[i] = new Rational(101, 100);
+                    }
+                }
+
+                mColorSpaceTransform =
+                        result.get(
+                                CaptureResult.COLOR_CORRECTION_TRANSFORM
+                        );
+
+                Integer state =
+                        result.get(CaptureResult.FLASH_STATE);
+
+                mFlashed =
+                        state != null
+                                && (
+                                    state
+                                            == CaptureResult
+                                                    .FLASH_STATE_PARTIAL
+                                    || state
+                                            == CaptureResult
+                                                    .FLASH_STATE_FIRED
+                                );
+
+                mPreviewCaptureResult = result;
+                mPreviewCaptureRequest = request;
             }
-            mColorSpaceTransform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM);
-            Integer state = result.get(CaptureResult.FLASH_STATE);
-            mFlashed = state != null && state == CaptureResult.FLASH_STATE_PARTIAL || state == CaptureResult.FLASH_STATE_FIRED;
-            mPreviewCaptureResult = result;
-            mPreviewCaptureRequest = request;
 
             if (isZslMode()) {
                 Long sensorTimestamp =
@@ -938,10 +1008,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 logStabilizationVendorTags(result);
 
                 /*
-                 * Keep the shared preview/RAW repeating request under normal
-                 * auto-exposure. A permanent manual exposure here caused the
-                 * viewfinder and rolling RAW stream to remain stuck at the
-                 * brightness of the scene seen shortly after camera startup.
+                 * Allow AE to settle briefly, then convert the already-active
+                 * preview + RAW repeating request to one controlled Motion
+                 * exposure. This is not a standalone capture pump: preview
+                 * and RAW remain outputs of the same repeating request.
                  */
                 if (!mMotionRollingExposureConfigured) {
                     mMotionPreviewMetadataFrames++;
@@ -949,12 +1019,19 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     if (mMotionPreviewMetadataFrames == 5) {
                         Log.d(
                                 MOTION_LOG_TAG,
-                                "ROLLING_AE_ACTIVE"
+                                "ROLLING_AE_WARMUP_COMPLETE"
                                         + " previewExposureNs="
                                         + actualExposureNs
                                         + " previewIso="
                                         + actualIso
                         );
+
+                        if (mBackgroundHandler != null) {
+                            mBackgroundHandler.post(
+                                    CaptureController.this
+                                            ::configureMotionRollingExposure
+                            );
+                        }
                     }
                 }
             }
@@ -2563,89 +2640,37 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
         try {
             /*
-             * Use the same exposure selection as the working dedicated
-             * equal-exposure Motion burst, including its mild -0.5 EV
-             * shutter reduction.
+             * Keep Xiaomi AE continuously active on the shared preview+RAW
+             * repeating request. The rolling ring therefore follows the scene
+             * in real time and remains capable of true 30 fps.
+             *
+             * Photon selects its controlled shutter ladder only when the user
+             * presses the shutter. Compatible recent AE frames are retained;
+             * any mismatched frames are replaced by controlled post frames.
              */
-            IsoExpoSelector.setExpo(
-                    mPreviewRequestBuilder,
-                    0,
-                    this
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_MODE,
+                    CaptureRequest.CONTROL_MODE_AUTO
             );
 
-            Long selectedExposure =
-                    mPreviewRequestBuilder.get(
-                            CaptureRequest.SENSOR_EXPOSURE_TIME
-                    );
-
-            Integer selectedIso =
-                    mPreviewRequestBuilder.get(
-                            CaptureRequest.SENSOR_SENSITIVITY
-                    );
-
-            long motionExposure =
-                    selectedExposure != null
-                            ? selectedExposure
-                            : IsoExpoSelector.lastSelectedExposure;
-
-            motionExposure = Math.max(
-                    1_000_000L,
-                    Math.round(
-                            motionExposure / Math.sqrt(2.0)
-                    )
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_ON
             );
-
-            Range<Long> exposureRange =
-                    mCameraCharacteristics.get(
-                            CameraCharacteristics
-                                    .SENSOR_INFO_EXPOSURE_TIME_RANGE
-                    );
-
-            if (exposureRange != null) {
-                motionExposure = Math.max(
-                        exposureRange.getLower(),
-                        Math.min(
-                                exposureRange.getUpper(),
-                                motionExposure
-                        )
-                );
-            }
 
             mPreviewRequestBuilder.set(
                     CaptureRequest.SENSOR_EXPOSURE_TIME,
-                    motionExposure
+                    null
+            );
+
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.SENSOR_SENSITIVITY,
+                    null
             );
 
             configureMotionStabilizationRequest(
                     mPreviewRequestBuilder
             );
-
-            mMotionRequestedExposureNs = motionExposure;
-            mMotionRequestedIso =
-                    selectedIso != null
-                            ? selectedIso
-                            : mPreviewIso;
-
-            mMotionRollingExposureConfigured = true;
-
-            synchronized (mZslBufferLock) {
-                while (!mZslRingBuffer.isEmpty()) {
-                    ImageFrame frame =
-                            mZslRingBuffer.pollFirst();
-
-                    if (frame != null) {
-                        frame.close();
-                    }
-                }
-
-                mZslExposureEnergy.clear();
-                mZslExposureTimeNs.clear();
-                mZslSensitivity.clear();
-                mZslRawSharpness.clear();
-                mZslOisMotion.clear();
-                mZslOisMode.clear();
-                mZslEisMode.clear();
-            }
 
             mPreviewInputRequest =
                     mPreviewRequestBuilder.build();
@@ -2656,20 +2681,29 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     mBackgroundHandler
             );
 
+            mMotionRequestedExposureNs =
+                    Math.max(1L, mPreviewExposureTime);
+            mMotionRequestedIso =
+                    Math.max(1, mPreviewIso);
+            mMotionRollingExposureConfigured = true;
+
             Log.d(
                     MOTION_LOG_TAG,
-                    "ROLLING_EXPOSURE_CONFIGURED"
-                            + " requestedExposureNs="
+                    "MOTION_CONTINUOUS_AE_ACTIVE"
+                            + " camera=" + physicalID
+                            + " latestAeExposureNs="
                             + mMotionRequestedExposureNs
-                            + " requestedIso="
+                            + " latestAeIso="
                             + mMotionRequestedIso
+                            + " previewAndRawShareAe=true"
+                            + " manualRollingLock=false"
             );
         } catch (Exception e) {
             mMotionRollingExposureConfigured = false;
 
             Log.e(
                     MOTION_LOG_TAG,
-                    "ROLLING_EXPOSURE_FAILED "
+                    "MOTION_CONTINUOUS_AE_FAILED "
                             + Log.getStackTraceString(e)
             );
         }
@@ -3586,6 +3620,51 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         + mMotionShutterTimestampNs
         );
 
+        Rational[] previewNeutralRational = null;
+
+        if (mPreviewCaptureResult != null) {
+            previewNeutralRational =
+                    mPreviewCaptureResult.get(
+                            CaptureResult.SENSOR_NEUTRAL_COLOR_POINT
+                    );
+        }
+
+        if (previewNeutralRational != null
+                && previewNeutralRational.length >= 3) {
+
+            mMotionProcessingNeutral = new float[]{
+                    previewNeutralRational[0].floatValue(),
+                    previewNeutralRational[1].floatValue(),
+                    previewNeutralRational[2].floatValue()
+            };
+
+            Integer previewAwbState =
+                    mPreviewCaptureResult.get(
+                            CaptureResult.CONTROL_AWB_STATE
+                    );
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "MOTION_PREVIEW_NEUTRAL_SNAPSHOT"
+                            + " camera=" + physicalID
+                            + " neutral="
+                            + java.util.Arrays.toString(
+                                    mMotionProcessingNeutral
+                            )
+                            + " awbState=" + previewAwbState
+            );
+        } else {
+            mMotionProcessingNeutral = null;
+
+            Log.w(
+                    MOTION_LOG_TAG,
+                    "MOTION_PREVIEW_NEUTRAL_SNAPSHOT"
+                            + " camera=" + physicalID
+                            + " neutralUnavailable=true"
+                            + " fallback=controlledResult"
+            );
+        }
+
         Long latestPreviewExposureNs = null;
         Integer latestPreviewIso = null;
 
@@ -3656,21 +3735,29 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         int desiredMotionIso;
 
         if (previewEnergy > 0.0) {
-            /*
-             * Prioritize the longest shutter up to 1/15 while preserving the
-             * latest AE brightness. In bright light, shorten only when 1/15
-             * would require ISO below the camera's supported minimum.
-             */
-            long exposureAtMinimumIsoNs = Math.round(
-                    previewEnergy / Math.max(1, minimumIso)
-                            * 1_000_000_000.0
-            );
+            final long oneOver120Ns = 8_333_333L;
+            final long oneOver60Ns = 16_666_667L;
+            final long oneOver30Ns = 33_333_333L;
+            final long oneOver20Ns = 50_000_000L;
+            final long oneOver15Ns = 66_666_667L;
+
+            if (latestPreviewExposureNs <= 10_000_000L) {
+                desiredMotionExposureNs = oneOver120Ns;
+            } else if (latestPreviewExposureNs <= 24_000_000L) {
+                desiredMotionExposureNs = oneOver60Ns;
+            } else if (latestPreviewExposureNs <= 42_000_000L) {
+                desiredMotionExposureNs = oneOver30Ns;
+            } else if (latestPreviewExposureNs <= 58_000_000L) {
+                desiredMotionExposureNs = oneOver20Ns;
+            } else {
+                desiredMotionExposureNs = oneOver15Ns;
+            }
 
             desiredMotionExposureNs = Math.max(
                     minimumExposureNs,
                     Math.min(
                             maximumExposureNs,
-                            exposureAtMinimumIsoNs
+                            desiredMotionExposureNs
                     )
             );
 
@@ -3684,6 +3771,20 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             desiredMotionIso = Math.max(
                     minimumIso,
                     Math.min(maximumIso, desiredMotionIso)
+            );
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "MOTION_SHUTTER_LADDER_DECISION"
+                            + " camera=" + physicalID
+                            + " aeExposureNs="
+                            + latestPreviewExposureNs
+                            + " aeIso="
+                            + latestPreviewIso
+                            + " targetExposureNs="
+                            + desiredMotionExposureNs
+                            + " targetIso="
+                            + desiredMotionIso
             );
         } else {
             desiredMotionExposureNs =
@@ -3710,8 +3811,170 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             );
         }
 
+        /*
+         * Photon owns the full shutter x ISO pair for the controlled Motion
+         * stack. Xiaomi AE remains only the live scene meter for the preview.
+         * Photon's selector is primary, with a one-stop floor against severe
+         * RAW underexposure and an upper limit at fresh AE-equivalent energy.
+         */
+        final long aeLadderExposureNs =
+                desiredMotionExposureNs;
+        final int aeLadderIso =
+                desiredMotionIso;
+        final double aeLadderEnergy =
+                ExposureIndex.time2sec(
+                        Math.max(1L, aeLadderExposureNs)
+                ) * Math.max(1, aeLadderIso);
+
+        boolean photonSelectorValid =
+                selectorMotionPair != null
+                        && selectorMotionPair.exposure > 0L
+                        && selectorMotionPair.iso > 0;
+
+        long photonExposureNs =
+                photonSelectorValid
+                        ? selectorMotionPair.exposure
+                        : aeLadderExposureNs;
+
+        photonExposureNs = Math.max(
+                minimumExposureNs,
+                Math.min(maximumExposureNs, photonExposureNs)
+        );
+
+        int photonIso =
+                photonSelectorValid
+                        ? selectorMotionPair.iso
+                        : aeLadderIso;
+
+        photonIso = Math.max(
+                minimumIso,
+                Math.min(maximumIso, photonIso)
+        );
+
+        double photonEnergy =
+                ExposureIndex.time2sec(
+                        Math.max(1L, photonExposureNs)
+                ) * Math.max(1, photonIso);
+
+        final double oneStopSafetyFloorEnergy =
+                previewEnergy > 0.0
+                        ? previewEnergy * 0.5
+                        : aeLadderEnergy * 0.5;
+
+        final double maximumAllowedEnergy =
+                previewEnergy > 0.0
+                        ? previewEnergy
+                        : aeLadderEnergy;
+
+        double selectedEnergy = photonEnergy;
+
+        if (selectedEnergy < oneStopSafetyFloorEnergy) {
+            selectedEnergy = oneStopSafetyFloorEnergy;
+        }
+
+        if (maximumAllowedEnergy > 0.0
+                && selectedEnergy > maximumAllowedEnergy) {
+            selectedEnergy = maximumAllowedEnergy;
+        }
+
+        int safetyAdjustedIso =
+                (int) Math.round(
+                        selectedEnergy
+                                / ExposureIndex.time2sec(
+                                        Math.max(1L, photonExposureNs)
+                                )
+                );
+
+        safetyAdjustedIso = Math.max(
+                minimumIso,
+                Math.min(maximumIso, safetyAdjustedIso)
+        );
+
+        desiredMotionExposureNs =
+                photonExposureNs;
+        desiredMotionIso =
+                safetyAdjustedIso;
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_PHOTON_ENERGY_POLICY"
+                        + " camera=" + physicalID
+                        + " previewExposureNs="
+                        + latestPreviewExposureNs
+                        + " previewIso="
+                        + latestPreviewIso
+                        + " previewEnergy="
+                        + previewEnergy
+                        + " aeLadderExposureNs="
+                        + aeLadderExposureNs
+                        + " aeLadderIso="
+                        + aeLadderIso
+                        + " selectorValid="
+                        + photonSelectorValid
+                        + " selectorExposureNs="
+                        + (
+                            selectorMotionPair != null
+                                    ? selectorMotionPair.exposure
+                                    : null
+                        )
+                        + " selectorIso="
+                        + (
+                            selectorMotionPair != null
+                                    ? selectorMotionPair.iso
+                                    : null
+                        )
+                        + " selectorEnergy="
+                        + photonEnergy
+                        + " safetyFloorEnergy="
+                        + oneStopSafetyFloorEnergy
+                        + " maximumEnergy="
+                        + maximumAllowedEnergy
+                        + " finalExposureNs="
+                        + desiredMotionExposureNs
+                        + " finalIso="
+                        + desiredMotionIso
+                        + " finalEnergy="
+                        + (
+                            ExposureIndex.time2sec(
+                                    desiredMotionExposureNs
+                            ) * desiredMotionIso
+                        )
+        );
+
+        /*
+         * Keep the established target-reporting structure. The authoritative
+         * pair now comes from Photon's selector with the one-stop safety floor.
+         * Continuous preview AE remains untouched.
+         */
+        final long legacyDesiredMotionExposureNs =
+                desiredMotionExposureNs;
+        final int legacyDesiredMotionIso =
+                desiredMotionIso;
+
+        final boolean rollingTargetAvailable = false;
+
         mMotionTargetExposureNs = desiredMotionExposureNs;
         mMotionTargetIso = desiredMotionIso;
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_CAPTURE_TARGET_REUSED"
+                        + " camera=" + physicalID
+                        + " rollingTargetAvailable="
+                        + rollingTargetAvailable
+                        + " rollingExposureNs="
+                        + mMotionRequestedExposureNs
+                        + " rollingIso="
+                        + mMotionRequestedIso
+                        + " legacyExposureNs="
+                        + legacyDesiredMotionExposureNs
+                        + " legacyIso="
+                        + legacyDesiredMotionIso
+                        + " finalExposureNs="
+                        + desiredMotionExposureNs
+                        + " finalIso="
+                        + desiredMotionIso
+        );
 
         final double desiredMotionEnergy =
                 ExposureIndex.time2sec(
@@ -3951,7 +4214,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         final int maximumPreFrames =
                 Math.min(
                         MOTION_PREBUFFER_MAX_FRAMES,
-                        Math.max(0, requestedFrames - 1)
+                        requestedFrames
                 );
 
         final int preFramesToUse =
@@ -4032,6 +4295,20 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         + mMotionPostShutterFrameOverride
                         + " maxPre="
                         + maximumPreFrames
+        );
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_POST_TARGET_FROM_FRESH_AE"
+                        + " camera=" + physicalID
+                        + " exposureNs="
+                        + mMotionTargetExposureNs
+                        + " iso="
+                        + mMotionTargetIso
+                        + " preselectedFrames="
+                        + mMotionPreselectedFrames.size()
+                        + " requestedTotal="
+                        + mMotionCombinedRequestedFrames
         );
 
         mZslCapturing = false;
@@ -4275,6 +4552,65 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 mMotionPreselectedSensitivity.clear();
             }
 
+            /*
+             * HDRX looks up exposure energy by each RAW timestamp. The
+             * post-shutter callback populated mExposures only for controlled
+             * burst frames, so add every finalized pre-shutter frame here
+             * from its actual matched shutter and ISO metadata.
+             */
+            for (ImageFrame completedFrame : completedFrames) {
+                if (completedFrame == null
+                        || completedFrame.pair == null
+                        || completedFrame.pair.exposure <= 0L
+                        || completedFrame.pair.iso <= 0) {
+                    continue;
+                }
+
+                mExposures.put(
+                        completedFrame.timestamp,
+                        ExposureIndex.time2sec(
+                                completedFrame.pair.exposure
+                        ) * completedFrame.pair.iso
+                );
+            }
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "COMBINED_EXPOSURE_MAP_READY"
+                            + " frames=" + completedFrames.size()
+                            + " entries=" + mExposures.size()
+            );
+
+            /*
+             * Gyro history currently exists only for the post-shutter burst.
+             * Do not allow a shorter list to become index-shifted against the
+             * combined RAW stack. Pad missing pre-shutter positions with
+             * neutral entries copied from the nearest available sample.
+             */
+            if (!completedFrames.isEmpty()
+                    && completedGyro.size() < completedFrames.size()) {
+
+                GyroBurst fallbackGyro =
+                        !completedGyro.isEmpty()
+                                ? completedGyro.get(0)
+                                : null;
+
+                while (fallbackGyro != null
+                        && completedGyro.size()
+                                < completedFrames.size()) {
+                    completedGyro.add(0, fallbackGyro);
+                }
+
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "COMBINED_GYRO_PADDED"
+                                + " frames=" + completedFrames.size()
+                                + " gyro=" + completedGyro.size()
+                                + " fallbackAvailable="
+                                + (fallbackGyro != null)
+                );
+            }
+
             mImageSaver.implementation.bufferLock = false;
 
             Log.d(
@@ -4337,15 +4673,94 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 mMotionPostShutterFrameOverride = 0;
                 mMotionCombinedRequestedFrames = 0;
 
+                /*
+                 * The preview builder is restored to Xiaomi AE by the normal
+                 * preview recovery path. Reset the passive-ring state so five
+                 * fresh AE metadata frames are observed, then reconfigure one
+                 * controlled repeating preview+RAW request for the next shot.
+                 */
+                /*
+                 * Preserve the rolling target so preview can resume without
+                 * an AE-on brightness flash. Clear only the one-shot
+                 * post-shutter target.
+                 */
+                mMotionPreviewMetadataFrames = 0;
+                mMotionTargetExposureNs = 0L;
+                mMotionTargetIso = 0;
+
+                synchronized (mZslBufferLock) {
+                    while (!mZslRingBuffer.isEmpty()) {
+                        ImageFrame stale =
+                                mZslRingBuffer.pollFirst();
+
+                        if (stale != null) {
+                            stale.close();
+                        }
+                    }
+
+                    mZslExposureEnergy.clear();
+                    mZslExposureTimeNs.clear();
+                    mZslSensitivity.clear();
+                    mZslRawSharpness.clear();
+                    mZslOisMotion.clear();
+                    mZslOisMode.clear();
+                    mZslEisMode.clear();
+                }
+
                 startMotionPrebufferPump();
+
+                mMotionRollingExposureConfigured = true;
+                mMotionTargetExposureNs = 0L;
+                mMotionTargetIso = 0;
 
                 mBackgroundHandler.post(() -> {
                     try {
-                        if (!isDualSession) {
-                            unlockFocus();
-                        } else {
-                            createCameraPreviewSession(false);
+                        if (mPreviewRequestBuilder != null
+                                && mCaptureSession != null) {
+
+                            mPreviewRequestBuilder.set(
+                                    CaptureRequest.CONTROL_MODE,
+                                    CaptureRequest.CONTROL_MODE_AUTO
+                            );
+
+                            mPreviewRequestBuilder.set(
+                                    CaptureRequest.CONTROL_AE_MODE,
+                                    CaptureRequest.CONTROL_AE_MODE_ON
+                            );
+
+                            mPreviewRequestBuilder.set(
+                                    CaptureRequest.SENSOR_EXPOSURE_TIME,
+                                    null
+                            );
+
+                            mPreviewRequestBuilder.set(
+                                    CaptureRequest.SENSOR_SENSITIVITY,
+                                    null
+                            );
+
+                            configureMotionStabilizationRequest(
+                                    mPreviewRequestBuilder
+                            );
+
+                            mPreviewInputRequest =
+                                    mPreviewRequestBuilder.build();
+
+                            mCaptureSession.setRepeatingRequest(
+                                    mPreviewInputRequest,
+                                    mCaptureCallback,
+                                    mBackgroundHandler
+                            );
+
+                            Log.d(
+                                    MOTION_LOG_TAG,
+                                    "MOTION_CONTINUOUS_AE_RESTORED"
+                                            + " camera=" + physicalID
+                                            + " noManualExposureRestore=true"
+                                            + " previewSurfaceExcludedFromBurst=true"
+                            );
                         }
+
+                        startMotionPrebufferPump();
                     } catch (Exception e) {
                         Log.e(
                                 MOTION_LOG_TAG,
@@ -4360,6 +4775,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         "CONTROLLED_HDRX_FINISHED"
                                 + " rawSurfaceStayedAttached=true"
                                 + " captureStateReleased=true"
+                                + " passiveRingReset=true"
                 );
             }
         });
@@ -4398,7 +4814,18 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             } else {
                 captureBuilder.addTarget(mImageReaderRaw.getSurface());
                 CameraMode selectedMode = PhotonCamera.getSettings().selectedMode;
-                if(frametime > 0.06 && !isDualSession || selectedMode == CameraMode.RAWVIDEO || selectedMode == CameraMode.UNLIMITED || (!IsoExpoSelector.HDR)) {
+                if (
+                        selectedMode != CameraMode.MOTION
+                                && (
+                                    frametime > 0.06
+                                            && !isDualSession
+                                        || selectedMode
+                                                == CameraMode.RAWVIDEO
+                                        || selectedMode
+                                                == CameraMode.UNLIMITED
+                                        || (!IsoExpoSelector.HDR)
+                                )
+                ) {
                     captureBuilder.addTarget(surface);
                 }
             }
