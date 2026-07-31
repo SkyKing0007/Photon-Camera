@@ -3,6 +3,7 @@ package com.particlesdevs.photoncamera.ui.camera.binding;
 import android.util.DisplayMetrics;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.animation.OvershootInterpolator;
 import android.widget.CheckedTextView;
 
 import androidx.constraintlayout.widget.ConstraintLayout;
@@ -86,12 +87,26 @@ public class CustomBinding {
         if (viewGroup != null)
             if (visible)
                 viewGroup.post(() -> {
-                    viewGroup.animate().setDuration(200).alpha(1).translationY(0).scaleX(1).scaleY(1).start();
                     viewGroup.setVisibility(View.VISIBLE);
+                    viewGroup.setPivotX(viewGroup.getWidth() * 0.82f);
+                    viewGroup.setPivotY(0f);
+                    viewGroup.animate()
+                            .setInterpolator(new OvershootInterpolator(0.85f))
+                            .setDuration(320)
+                            .alpha(1f)
+                            .translationY(0f)
+                            .scaleX(1f)
+                            .scaleY(1f)
+                            .start();
                 });
             else
-                viewGroup.post(() -> viewGroup.animate().setDuration(200).alpha(0).translationY(-viewGroup.getResources().getDimension(R.dimen.standard_125))
-                        .scaleX(0).scaleY(0).withEndAction(() -> viewGroup.setVisibility(View.INVISIBLE))
+                viewGroup.post(() -> viewGroup.animate()
+                        .setDuration(190)
+                        .alpha(0f)
+                        .translationY(-viewGroup.getResources().getDimension(R.dimen.standard_125) * 0.35f)
+                        .scaleX(0.94f)
+                        .scaleY(0.94f)
+                        .withEndAction(() -> viewGroup.setVisibility(View.INVISIBLE))
                         .start());
     }
 

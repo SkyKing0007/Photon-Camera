@@ -371,6 +371,29 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             new HashMap<>();
 
     /*
+     * Build 26166:
+     *
+     * Keep the four-channel dynamic black level belonging to every
+     * controlled RAW timestamp. Processing uses a validated burst median,
+     * never an arbitrary last-frame value.
+     */
+    private final HashMap<Long, float[]> mMotionBurstDynamicBlackLevel =
+            new HashMap<>();
+
+    private static volatile float[] mMotionValidatedBlackLevel = null;
+    private static volatile String mMotionValidatedBlackLevelSource =
+            "unavailable";
+
+    public static float[] getMotionValidatedBlackLevel() {
+        float[] selected = mMotionValidatedBlackLevel;
+        return selected != null ? selected.clone() : null;
+    }
+
+    public static String getMotionValidatedBlackLevelSource() {
+        return mMotionValidatedBlackLevelSource;
+    }
+
+    /*
      * Controlled Motion pre-buffer. The visible preview remains under Xiaomi
      * AE; these one-shot RAW requests use Photon's 1/15-priority target.
      */
@@ -3390,6 +3413,254 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         }
     }
 
+    private float[] getMotionStaticBlackLevel() {
+        int[] staticValues = new int[]{64, 64, 64, 64};
+
+        CameraCharacteristics characteristics =
+                getActiveCameraCharacteristics();
+
+        if (characteristics != null) {
+            android.hardware.camera2.params.BlackLevelPattern pattern =
+                    characteristics.get(
+                            CameraCharacteristics
+                                    .SENSOR_BLACK_LEVEL_PATTERN
+                    );
+
+            if (pattern != null) {
+                pattern.copyTo(staticValues, 0);
+            }
+        }
+
+        return new float[]{
+                staticValues[0],
+                staticValues[1],
+                staticValues[2],
+                staticValues[3]
+        };
+    }
+
+    private int getMotionStaticWhiteLevel() {
+        CameraCharacteristics characteristics =
+                getActiveCameraCharacteristics();
+
+        if (characteristics != null) {
+            Integer whiteLevel =
+                    characteristics.get(
+                            CameraCharacteristics
+                                    .SENSOR_INFO_WHITE_LEVEL
+                    );
+
+            if (whiteLevel != null && whiteLevel > 0) {
+                return whiteLevel;
+            }
+        }
+
+        return 1023;
+    }
+
+    private boolean isValidMotionDynamicBlackLevel(
+            float[] candidate,
+            int whiteLevel
+    ) {
+        if (candidate == null || candidate.length < 4) {
+            return false;
+        }
+
+        float maximumAllowed =
+                Math.max(
+                        256.0f,
+                        Math.max(1, whiteLevel) * 0.25f
+                );
+
+        float minimum = Float.POSITIVE_INFINITY;
+        float maximum = Float.NEGATIVE_INFINITY;
+
+        for (int i = 0; i < 4; i++) {
+            float value = candidate[i];
+
+            if (!Float.isFinite(value)
+                    || value < 0.0f
+                    || value >= maximumAllowed) {
+                return false;
+            }
+
+            minimum = Math.min(minimum, value);
+            maximum = Math.max(maximum, value);
+        }
+
+        float maximumChannelSpread =
+                Math.max(
+                        64.0f,
+                        Math.max(1, whiteLevel) * 0.08f
+                );
+
+        return maximum - minimum <= maximumChannelSpread;
+    }
+
+    private float medianMotionValue(
+            ArrayList<Float> values
+    ) {
+        Collections.sort(values);
+
+        int size = values.size();
+        int middle = size / 2;
+
+        if ((size & 1) == 1) {
+            return values.get(middle);
+        }
+
+        return (
+                values.get(middle - 1)
+                        + values.get(middle)
+        ) * 0.5f;
+    }
+
+    private void selectMotionValidatedBlackLevelLocked(
+            ArrayList<ImageFrame> completedFrames
+    ) {
+        float[] staticBlackLevel = getMotionStaticBlackLevel();
+        int whiteLevel = getMotionStaticWhiteLevel();
+
+        ArrayList<float[]> samples = new ArrayList<>();
+
+        for (ImageFrame frame : completedFrames) {
+            if (frame == null) {
+                continue;
+            }
+
+            float[] sample =
+                    mMotionBurstDynamicBlackLevel.get(
+                            frame.timestamp
+                    );
+
+            if (isValidMotionDynamicBlackLevel(
+                    sample,
+                    whiteLevel
+            )) {
+                samples.add(sample.clone());
+            }
+        }
+
+        int requiredSamples =
+                Math.max(
+                        3,
+                        (int) Math.ceil(
+                                completedFrames.size() * 0.75
+                        )
+                );
+
+        float[] selected = staticBlackLevel.clone();
+        String source = "staticFallback";
+        String reason = "insufficientSamples";
+
+        float maximumObservedRange =
+                Float.POSITIVE_INFINITY;
+
+        if (samples.size() >= requiredSamples) {
+            float[] median = new float[4];
+            maximumObservedRange = 0.0f;
+
+            for (int channel = 0; channel < 4; channel++) {
+                ArrayList<Float> channelValues =
+                        new ArrayList<>();
+
+                float channelMinimum =
+                        Float.POSITIVE_INFINITY;
+                float channelMaximum =
+                        Float.NEGATIVE_INFINITY;
+
+                for (float[] sample : samples) {
+                    float value = sample[channel];
+
+                    channelValues.add(value);
+                    channelMinimum =
+                            Math.min(channelMinimum, value);
+                    channelMaximum =
+                            Math.max(channelMaximum, value);
+                }
+
+                median[channel] =
+                        medianMotionValue(channelValues);
+
+                maximumObservedRange =
+                        Math.max(
+                                maximumObservedRange,
+                                channelMaximum - channelMinimum
+                        );
+            }
+
+            float medianMinimum =
+                    Math.min(
+                            Math.min(median[0], median[1]),
+                            Math.min(median[2], median[3])
+                    );
+
+            float medianMaximum =
+                    Math.max(
+                            Math.max(median[0], median[1]),
+                            Math.max(median[2], median[3])
+                    );
+
+            float stabilityLimit =
+                    Math.max(
+                            8.0f,
+                            whiteLevel * 0.02f
+                    );
+
+            float channelSpreadLimit =
+                    Math.max(
+                            64.0f,
+                            whiteLevel * 0.08f
+                    );
+
+            boolean stable =
+                    maximumObservedRange <= stabilityLimit;
+
+            boolean plausible =
+                    isValidMotionDynamicBlackLevel(
+                            median,
+                            whiteLevel
+                    )
+                            && medianMaximum - medianMinimum
+                                    <= channelSpreadLimit;
+
+            if (stable && plausible) {
+                selected = median;
+                source = "dynamicMedian";
+                reason = "validated";
+            } else if (!stable) {
+                reason = "burstVariation";
+            } else {
+                reason = "implausibleMedian";
+            }
+        }
+
+        mMotionValidatedBlackLevel = selected.clone();
+        mMotionValidatedBlackLevelSource = source;
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_26166_BLACK_LEVEL_SELECTED"
+                        + " source=" + source
+                        + " reason=" + reason
+                        + " samples="
+                        + samples.size()
+                        + "/"
+                        + completedFrames.size()
+                        + " required="
+                        + requiredSamples
+                        + " selected="
+                        + Arrays.toString(selected)
+                        + " static="
+                        + Arrays.toString(staticBlackLevel)
+                        + " maxObservedRange="
+                        + maximumObservedRange
+                        + " whiteLevel="
+                        + whiteLevel
+                        + " cfaOrder=R_G1_G2_B"
+        );
+    }
+
     private void tryMatchControlledMotionFrameLocked(
             long timestamp
     ) {
@@ -3469,6 +3740,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             closePendingMotionFramesLocked();
             mMotionBurstExposureTimeNs.clear();
             mMotionBurstSensitivity.clear();
+            mMotionBurstDynamicBlackLevel.clear();
+            mMotionValidatedBlackLevel = null;
+            mMotionValidatedBlackLevelSource =
+                    "recoveryCleared";
             mMotionPreselectedExposureTimeNs.clear();
             mMotionPreselectedSensitivity.clear();
             mMotionBurstExpectedFrames = 0;
@@ -4217,11 +4492,22 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         requestedFrames
                 );
 
-        final int preFramesToUse =
-                Math.min(
-                        maximumPreFrames,
-                        candidates.size()
-                );
+        /*
+         * Build 26165 color-stability checkpoint:
+         *
+         * The rolling RAW candidates are produced by the live
+         * TEMPLATE_PREVIEW request with preview + RAW targets, while the
+         * controlled post-shutter RAWs use TEMPLATE_STILL_CAPTURE with a RAW
+         * target. Mixing those two HAL paths has produced intermittent
+         * green/cyan output even when exposure and AWB metadata appear close.
+         *
+         * Keep collecting and validating the rolling ring, but do not feed
+         * its frames into HDRX until every RAW carries its own complete
+         * CaptureResult/CaptureRequest and both paths are proven compatible.
+         * The requested stack is therefore filled with homogeneous
+         * post-shutter still-capture RAWs.
+         */
+        final int preFramesToUse = 0;
 
         synchronized (mMotionBurstLock) {
             for (ImageFrame old : mMotionPreselectedFrames) {
@@ -4295,6 +4581,20 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         + mMotionPostShutterFrameOverride
                         + " maxPre="
                         + maximumPreFrames
+                        + " colorStabilityPostOnly=true"
+                        + " rollingCandidatesStillCollected="
+                        + candidates.size()
+        );
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_26165_HOMOGENEOUS_RAW_STACK"
+                        + " preframesContributing=0"
+                        + " postframesRequested="
+                        + mMotionPostShutterFrameOverride
+                        + " previewTemplateRawExcluded=true"
+                        + " stillTemplateRawOnly=true"
+                        + " shutterPolicyUnchanged=true"
         );
 
         Log.d(
@@ -4433,6 +4733,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
                 completedFrames.addAll(
                         mMotionBurstFrames
+                );
+
+                selectMotionValidatedBlackLevelLocked(
+                        completedFrames
                 );
 
                 mMotionPreselectedFrames.clear();
@@ -4672,6 +4976,14 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 mZslCapturing = false;
                 mMotionPostShutterFrameOverride = 0;
                 mMotionCombinedRequestedFrames = 0;
+
+                synchronized (mMotionBurstLock) {
+                    mMotionBurstDynamicBlackLevel.clear();
+                }
+
+                mMotionValidatedBlackLevel = null;
+                mMotionValidatedBlackLevelSource =
+                        "processingComplete";
 
                 /*
                  * The preview builder is restored to Xiaomi AE by the normal
@@ -5111,6 +5423,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     closePendingMotionFramesLocked();
                     mMotionBurstExposureTimeNs.clear();
                     mMotionBurstSensitivity.clear();
+                    mMotionBurstDynamicBlackLevel.clear();
+                    mMotionValidatedBlackLevel = null;
+                    mMotionValidatedBlackLevelSource =
+                            "collecting";
                     mMotionBurstFinalized.set(false);
                     mMotionBurstActive = false;
                 }
@@ -5200,6 +5516,60 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                             (long) time, actualExposureNs);
                                     mMotionBurstSensitivity.put(
                                             (long) time, iso);
+
+                                    float[] dynamicBlackLevel =
+                                            result.get(
+                                                    CaptureResult
+                                                            .SENSOR_DYNAMIC_BLACK_LEVEL
+                                            );
+
+                                    Integer dynamicWhiteLevel =
+                                            result.get(
+                                                    CaptureResult
+                                                            .SENSOR_DYNAMIC_WHITE_LEVEL
+                                            );
+
+                                    int validationWhiteLevel =
+                                            dynamicWhiteLevel != null
+                                                    && dynamicWhiteLevel > 0
+                                                    ? dynamicWhiteLevel
+                                                    : getMotionStaticWhiteLevel();
+
+                                    boolean dynamicBlackLevelValid =
+                                            isValidMotionDynamicBlackLevel(
+                                                    dynamicBlackLevel,
+                                                    validationWhiteLevel
+                                            );
+
+                                    if (dynamicBlackLevelValid) {
+                                        mMotionBurstDynamicBlackLevel.put(
+                                                (long) time,
+                                                dynamicBlackLevel.clone()
+                                        );
+                                    } else {
+                                        mMotionBurstDynamicBlackLevel.remove(
+                                                (long) time
+                                        );
+                                    }
+
+                                    Log.d(
+                                            MOTION_LOG_TAG,
+                                            "CONTROLLED_BLACK_LEVEL"
+                                                    + " timestamp=" + time
+                                                    + " dynamic="
+                                                    + Arrays.toString(
+                                                            dynamicBlackLevel
+                                                    )
+                                                    + " valid="
+                                                    + dynamicBlackLevelValid
+                                                    + " static="
+                                                    + Arrays.toString(
+                                                            getMotionStaticBlackLevel()
+                                                    )
+                                                    + " whiteLevel="
+                                                    + validationWhiteLevel
+                                                    + " cfaOrder=R_G1_G2_B"
+                                    );
 
                                     tryMatchControlledMotionFrameLocked(
                                             (long) time

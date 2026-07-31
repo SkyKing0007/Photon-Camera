@@ -4,6 +4,9 @@ uniform sampler2D InputBuffer;
 uniform float mpy;
 uniform float whiteMax;
 uniform float applyGammaMix;
+uniform float indoorHdrStrength;
+uniform float lowerMidLift;
+uniform float highlightCompression;
 out vec4 Output;
 vec3 reinhard_extended(vec3 v, float max_white){
     vec3 numerator = v * (vec3(1.0f) + (v / vec3(max_white * max_white)));
@@ -50,4 +53,66 @@ void main() {
     //Output.rgb = reinhard_extended(inp.rgb * mpy, mpy);
     Output.rgb = tonemap(mix(inp.rgb,sqrt(inp.rgb), applyGammaMix), mpy);
     Output.rgb = mix(Output.rgb,Output.rgb * Output.rgb, applyGammaMix);
+
+    float luma =
+            dot(
+                    Output.rgb,
+                    vec3(0.299, 0.587, 0.114)
+            );
+
+    float lowerMidMask =
+            smoothstep(
+                    0.08,
+                    0.22,
+                    luma
+            )
+            * (
+                    1.0
+                            - smoothstep(
+                                    0.52,
+                                    0.72,
+                                    luma
+                            )
+            );
+
+    Output.rgb *=
+            1.0
+                    + lowerMidLift
+                    * lowerMidMask;
+
+    luma =
+            dot(
+                    Output.rgb,
+                    vec3(0.299, 0.587, 0.114)
+            );
+
+    float highlightMask =
+            smoothstep(
+                    0.52,
+                    0.92,
+                    luma
+            );
+
+    vec3 compressedHighlights =
+            Output.rgb
+                    / (
+                            vec3(1.0)
+                                    + 0.55
+                                    * Output.rgb
+                    );
+
+    Output.rgb =
+            mix(
+                    Output.rgb,
+                    compressedHighlights,
+                    highlightCompression
+                            * highlightMask
+            );
+
+    Output.rgb =
+            clamp(
+                    Output.rgb,
+                    0.0,
+                    1.0
+            );
 }

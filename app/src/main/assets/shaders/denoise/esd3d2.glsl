@@ -29,6 +29,8 @@ out vec4 Output;
 #define LUMA 0.0
 #define SHADOWBOOST 0.5
 #define CHROMASTRENGTH 1.0
+#define MOTIONNOISEBLEND 0.0
+#define MOTIONSTABLEWEIGHTS 0.0
 #define PI 3.1415926535897932384626433832795
 
 float normpdf(in float x, in float sigma)
@@ -77,7 +79,18 @@ void main() {
     vec3 final_colour2 = vec3(0.0);
     float sigX = 2.5;
     //float sigY = (noisefactor*noisefactor*NOISES + NOISEO + 0.0000001);
-    float sigY = max(NOISES*noisefactor + NOISES*NOISES * 3.0/8.0 + noiseO, 0.0000001);
+    /*
+     * Build 26167:
+     * ESD3D2Run supplies modeled read noise through the NOISEO define.
+     * The former lowercase noiseO uniform was unset here, suppressing
+     * read-noise protection in deep shadows.
+     */
+    float sigY = max(
+            NOISES*noisefactor
+                    + NOISES*NOISES * 3.0/8.0
+                    + NOISEO,
+            0.0000001
+    );
     // Shadow boost: inflate sigY in deep shadows where tonemap will later lift
     float shadowFactor = 1.0 + SHADOWBOOST * clamp(1.0 - noisefactor * 2.0, 0.0, 1.0);
     sigY *= shadowFactor;
@@ -93,7 +106,21 @@ void main() {
     // If any perimeter pixel has RGB distance > threshold from center,
     // shrink the kernel to KSIZE_SMALL to preserve the color edge.
     // Noise-adaptive threshold: 3x the noise level
-    float edgeThreshold = max(sqrt(sigY) * 3.0, 0.05);
+    float edgeThreshold =
+            max(
+                    sqrt(sigY)
+                            * mix(
+                                    3.0,
+                                    5.0,
+                                    MOTIONNOISEBLEND
+                            ),
+                    mix(
+                            0.05,
+                            0.08,
+                            MOTIONNOISEBLEND
+                    )
+            );
+
     int effectiveKSIZE = KSIZE;
     bool edgeDetected = false;
 
@@ -102,7 +129,42 @@ void main() {
         for (int j = -KSIZE; j <= KSIZE; j += max(KSIZE, 1)) {
             if (i == 0 && j == 0) continue;
             vec3 neighbor = texelFetch(InputBuffer, xy + ivec2(i, j), 0).rgb;
-            float dist = length(abs(neighbor - cin));
+
+            float rgbDistance =
+                    length(
+                            abs(
+                                    neighbor - cin
+                            )
+                    );
+
+            float neighborLuma =
+                    dot(
+                            neighbor,
+                            vec3(0.25, 0.5, 0.25)
+                    );
+
+            float centerLuma =
+                    dot(
+                            cin,
+                            vec3(0.25, 0.5, 0.25)
+                    );
+
+            float lumaDistance =
+                    abs(
+                            neighborLuma - centerLuma
+                    );
+
+            /*
+             * At high ISO, chroma speckles must not masquerade as hard color
+             * boundaries and collapse the denoise support to KSIZE_SMALL.
+             */
+            float dist =
+                    mix(
+                            rgbDistance,
+                            lumaDistance,
+                            MOTIONNOISEBLEND
+                    );
+
             if (dist > edgeThreshold) {
                 edgeDetected = true;
                 break;
@@ -137,13 +199,76 @@ void main() {
             vec4 d = vec4(length(abs(cc0-cin)),length(abs(cc1-cin)),length(abs(cc2-cin)),length(abs(cc3-cin)));
             vec4 w = (1.0-d*d/(d*d + sigY));
             vec4 w2 = (1.0-d*d/(d*d + sigZ));
-            float wm = min(min(min(w[0],w[1]),w[2]),w[3])*1.0;
-            vec4 ws = w - wm;
-            ws /= length(ws) + 0.000001;
-            vec4 w2s = w2 - wm;
-            w2s /= length(w2s) + 0.000001;
-            w *= ws;
-            w2 *= w2s;
+
+            vec4 stableW =
+                    max(
+                            w,
+                            vec4(0.0)
+                    );
+
+            vec4 stableW2 =
+                    max(
+                            w2,
+                            vec4(0.0)
+                    );
+
+            float wm =
+                    min(
+                            min(
+                                    min(w[0], w[1]),
+                                    w[2]
+                            ),
+                            w[3]
+                    );
+
+            float wm2 =
+                    min(
+                            min(
+                                    min(w2[0], w2[1]),
+                                    w2[2]
+                            ),
+                            w2[3]
+                    );
+
+            vec4 ws =
+                    w - wm;
+
+            ws /=
+                    length(ws)
+                            + 0.000001;
+
+            vec4 w2s =
+                    w2 - wm2;
+
+            w2s /=
+                    length(w2s)
+                            + 0.000001;
+
+            vec4 sparseW =
+                    w * ws;
+
+            vec4 sparseW2 =
+                    w2 * w2s;
+
+            /*
+             * The original sparse SNN weights can connect random residual
+             * noise into worms. Blend toward ordinary bilateral weights only
+             * for noisy Motion captures.
+             */
+            w =
+                    mix(
+                            sparseW,
+                            stableW,
+                            MOTIONSTABLEWEIGHTS
+                    );
+
+            w2 =
+                    mix(
+                            sparseW2,
+                            stableW2,
+                            MOTIONSTABLEWEIGHTS
+                    );
+
             float f1 = normpdf(float(i),KERNELSIZE)*normpdf(float(j),KERNELSIZE);
             final_colour += f1*mat4x3(cc0,cc1,cc2,cc3)*w;
             final_colour2 += f1*mat4x3(cc0,cc1,cc2,cc3)*w2;

@@ -191,8 +191,64 @@ public class HdrxProcessor extends ProcessorBase {
         }
         ISO /= mImageFramesToProcess.size();
 
-        processingParameters.FillDynamicParameters(captureResult, captureRequest,ISO);
-        processingParameters.cameraRotation = cameraRotation;
+        Log.d(
+                TAG,
+                "MOTION_DYNAMIC_METADATA_INPUT"
+                        + " averagePairIso=" + ISO
+                        + " captureResultIso="
+                        + captureResult.get(
+                                CaptureResult.SENSOR_SENSITIVITY
+                        )
+                        + " requestIso="
+                        + captureRequest.get(
+                                CaptureRequest.SENSOR_SENSITIVITY
+                        )
+                        + " captureResultExposureNs="
+                        + captureResult.get(
+                                CaptureResult.SENSOR_EXPOSURE_TIME
+                        )
+                        + " requestExposureNs="
+                        + captureRequest.get(
+                                CaptureRequest.SENSOR_EXPOSURE_TIME
+                        )
+                        + " captureResultNeutral="
+                        + java.util.Arrays.toString(
+                                captureResult.get(
+                                        CaptureResult
+                                                .SENSOR_NEUTRAL_COLOR_POINT
+                                )
+                        )
+        );
+
+        processingParameters.FillDynamicParameters(
+                captureResult,
+                captureRequest,
+                ISO
+        );
+
+        processingParameters.cameraRotation =
+                cameraRotation;
+
+        Log.d(
+                TAG,
+                "MOTION_DYNAMIC_METADATA_SELECTED"
+                        + " iso="
+                        + processingParameters.iso
+                        + " exposureSeconds="
+                        + processingParameters.exposureTime
+                        + " whitePoint="
+                        + java.util.Arrays.toString(
+                                processingParameters.whitePoint
+                        )
+                        + " cfaPattern="
+                        + processingParameters.cfaPattern
+                        + " whiteLevel="
+                        + processingParameters.whiteLevel
+                        + " blackLevel="
+                        + java.util.Arrays.toString(
+                                processingParameters.blackLevel
+                        )
+        );
 
         exifData.IMAGE_DESCRIPTION = processingParameters.toString();
         ImageFrameDeblur imageFrameDeblur = new ImageFrameDeblur(processingParameters);
@@ -375,6 +431,20 @@ public class HdrxProcessor extends ProcessorBase {
         //        IsoExpoSelector.getMPY() - 40.)*6400.f / (6.2f*IsoExpoSelector.getISOAnalog());
 
         ByteBuffer output = null;
+        boolean motionContributionMeasured = false;
+        float motionEffectiveFrameCount = 1.0f;
+        float motionEffectiveStackRatio = 1.0f;
+        float motionContributionMean = 1.0f;
+        float motionContributionP10 = 1.0f;
+        float motionContributionP25 = 1.0f;
+        float motionContributionP50 = 1.0f;
+        float motionContributionP75 = 1.0f;
+        float motionContributionP90 = 1.0f;
+        float motionContributionBelow4 = 0.0f;
+        float motionContributionBelow8 = 0.0f;
+        float motionContributionBelow12 = 0.0f;
+        float motionContributionBelow16 = 0.0f;
+
         Log.d(TAG, "Packing");
         //WrapperAl.packImages();
         Log.d(TAG, "Packed");
@@ -382,8 +452,61 @@ public class HdrxProcessor extends ProcessorBase {
             PyramidMerging pyramidMerging = new PyramidMerging(new Point(width, height), images);
             pyramidMerging.parameters = processingParameters;
             pyramidMerging.Run();
-            pyramidMerging.close();
+
+            motionContributionMeasured =
+                    pyramidMerging
+                            .hasMotionContributionMeasurement();
+
+            motionEffectiveFrameCount =
+                    pyramidMerging
+                            .getMotionEffectiveFrameCount();
+
+            motionEffectiveStackRatio =
+                    pyramidMerging
+                            .getMotionEffectiveStackRatio();
+
+            motionContributionMean =
+                    pyramidMerging
+                            .getMotionContributionMean();
+
+            motionContributionP10 =
+                    pyramidMerging
+                            .getMotionContributionP10();
+
+            motionContributionP25 =
+                    pyramidMerging
+                            .getMotionContributionP25();
+
+            motionContributionP50 =
+                    pyramidMerging
+                            .getMotionContributionP50();
+
+            motionContributionP75 =
+                    pyramidMerging
+                            .getMotionContributionP75();
+
+            motionContributionP90 =
+                    pyramidMerging
+                            .getMotionContributionP90();
+
+            motionContributionBelow4 =
+                    pyramidMerging
+                            .getMotionContributionBelow4();
+
+            motionContributionBelow8 =
+                    pyramidMerging
+                            .getMotionContributionBelow8();
+
+            motionContributionBelow12 =
+                    pyramidMerging
+                            .getMotionContributionBelow12();
+
+            motionContributionBelow16 =
+                    pyramidMerging
+                            .getMotionContributionBelow16();
+
             output = pyramidMerging.Output;
+            pyramidMerging.close();
             for (int i = 0; i < images.size(); i++) {
                 images.get(i).close();
             }
@@ -393,6 +516,117 @@ public class HdrxProcessor extends ProcessorBase {
             images.get(0).buffer = null;
         }
         Log.d(TAG, "HDRX Alignment elapsed:" + (System.currentTimeMillis() - startTime) + " ms");
+
+        processingParameters.retainedFrameCount =
+                Math.max(
+                        1,
+                        images.size()
+                );
+
+        processingParameters.localContributionMeasured =
+                cameraMode == CameraMode.MOTION
+                        && motionContributionMeasured;
+
+        if (processingParameters.localContributionMeasured) {
+            processingParameters.effectiveFrameCount =
+                    Math.max(
+                            1.0f,
+                            Math.min(
+                                    processingParameters.retainedFrameCount,
+                                    motionEffectiveFrameCount
+                            )
+                    );
+
+            processingParameters.effectiveStackRatio =
+                    Math.max(
+                            1.0f
+                                    / processingParameters.retainedFrameCount,
+                            Math.min(
+                                    1.0f,
+                                    motionEffectiveStackRatio
+                            )
+                    );
+
+            processingParameters.localContributionMean =
+                    motionContributionMean;
+
+            processingParameters.localContributionP10 =
+                    motionContributionP10;
+
+            processingParameters.localContributionP25 =
+                    motionContributionP25;
+
+            processingParameters.localContributionP50 =
+                    motionContributionP50;
+
+            processingParameters.localContributionP75 =
+                    motionContributionP75;
+
+            processingParameters.localContributionP90 =
+                    motionContributionP90;
+
+            processingParameters.localContributionBelow4 =
+                    motionContributionBelow4;
+
+            processingParameters.localContributionBelow8 =
+                    motionContributionBelow8;
+
+            processingParameters.localContributionBelow12 =
+                    motionContributionBelow12;
+
+            processingParameters.localContributionBelow16 =
+                    motionContributionBelow16;
+        } else {
+            processingParameters.effectiveFrameCount =
+                    processingParameters.retainedFrameCount;
+
+            processingParameters.effectiveStackRatio =
+                    1.0f;
+        }
+
+        processingParameters.subpixelSampleDiversity =
+                0.0f;
+
+        processingParameters.noiseModeler.computeStackingNoiseModel(
+                processingParameters.effectiveFrameCount
+        );
+
+        Log.d(
+                TAG,
+                "MOTION_26172_LOCAL_STACK_MODEL"
+                        + " retained="
+                        + processingParameters.retainedFrameCount
+                        + " measured="
+                        + processingParameters.localContributionMeasured
+                        + " effective="
+                        + processingParameters.effectiveFrameCount
+                        + " ratio="
+                        + processingParameters.effectiveStackRatio
+                        + " mean="
+                        + processingParameters.localContributionMean
+                        + " p10="
+                        + processingParameters.localContributionP10
+                        + " p25="
+                        + processingParameters.localContributionP25
+                        + " p50="
+                        + processingParameters.localContributionP50
+                        + " p75="
+                        + processingParameters.localContributionP75
+                        + " p90="
+                        + processingParameters.localContributionP90
+                        + " below4="
+                        + processingParameters.localContributionBelow4
+                        + " below8="
+                        + processingParameters.localContributionBelow8
+                        + " below12="
+                        + processingParameters.localContributionBelow12
+                        + " below16="
+                        + processingParameters.localContributionBelow16
+                        + " dngNoiseModelSelectedBeforeSave=true"
+                        + " jpegNoiseModelUpdated=true"
+                        + " adaptiveNoiseSettingUnchanged=true"
+        );
+
         if ((saveRAW >= 1) && alignAlgorithm != 2) {
             boolean imageSaved = ImageSaver.Util.saveStackedRaw(dngFile, output,
                     processingParameters);
@@ -406,17 +640,22 @@ public class HdrxProcessor extends ProcessorBase {
             }
         }
 
-        processingParameters.retainedFrameCount =
-                Math.max(1, images.size());
-
-        processingParameters.noiseModeler.computeStackingNoiseModel(
-                processingParameters.retainedFrameCount
-        );
-
         Log.d(
                 TAG,
-                "Final Motion stack retained frames="
+                "MOTION_26172_COLOR_AND_STACK_HANDOFF"
+                        + " retained="
                         + processingParameters.retainedFrameCount
+                        + " effective="
+                        + processingParameters.effectiveFrameCount
+                        + " ratio="
+                        + processingParameters.effectiveStackRatio
+                        + " localContributionMeasured="
+                        + processingParameters.localContributionMeasured
+                        + " processingCore=26171"
+                        + " colorNeutral=burstValidated"
+                        + " matrixConvention=unchanged"
+                        + " gainMapConvention=unchanged"
+                        + " adaptiveNoiseSettingUnchanged=true"
         );
 
         PostPipeline pipeline = new PostPipeline();
@@ -425,12 +664,26 @@ public class HdrxProcessor extends ProcessorBase {
         Allocator.free(output);
 
         img = overlay(img, pipeline.debugData.toArray(new Bitmap[0]));
-        try {
-            processingEventsListener.onProcessingFinished("HdrX JPG Processing Finished");
+
+        /*
+         * Preserve Photo/Night UI timing. Motion completion is delayed until
+         * after the JPEG is written and the ImageSaved callback is delivered.
+         */
+        if (cameraMode != CameraMode.MOTION) {
+            try {
+                processingEventsListener.onProcessingFinished(
+                        "HdrX JPG Processing Finished"
+                );
+            }
+            catch (Exception e){
+                Log.d(
+                        TAG,
+                        "Error in processingEventsListener.onProcessingFinished:"
+                                + Log.getStackTraceString(e)
+                );
+            }
         }
-        catch (Exception e){
-            Log.d(TAG,"Error in processingEventsListener.onProcessingFinished:"+Log.getStackTraceString(e));
-        }
+
         imageFile = Paths.get(imageFile.toAbsolutePath() + ".jpg");
         //Saves the final bitmap
         /* Refresh finalized processing metadata before saving. */
@@ -440,16 +693,69 @@ public class HdrxProcessor extends ProcessorBase {
                 TAG,
                 "Saving final metadata: retained="
                         + processingParameters.retainedFrameCount
+                        + " effective="
+                        + processingParameters.effectiveFrameCount
+                        + " effectiveRatio="
+                        + processingParameters.effectiveStackRatio
+                        + " subpixelDiversity="
+                        + processingParameters.subpixelSampleDiversity
         );
 
         boolean imageSaved = ImageSaver.Util.saveBitmapAsJPG(imageFile, img,
                 ImageSaver.JPG_QUALITY, exifData);
 
+        boolean saveCallbackDelivered = false;
+
         try {
-            processingEventsListener.notifyImageSavedStatus(imageSaved, imageFile);
+            processingEventsListener.notifyImageSavedStatus(
+                    imageSaved,
+                    imageFile
+            );
+            saveCallbackDelivered = true;
         }
         catch (Exception e){
-            Log.d(TAG,"Error in processingEventsListener.notifyImageSavedStatus:"+Log.getStackTraceString(e));
+            Log.d(
+                    TAG,
+                    "Error in processingEventsListener.notifyImageSavedStatus:"
+                            + Log.getStackTraceString(e)
+            );
+        }
+
+        if (cameraMode == CameraMode.MOTION) {
+            boolean fileExists =
+                    imageFile != null
+                            && imageFile.toFile().exists();
+
+            long fileBytes =
+                    fileExists
+                            ? imageFile.toFile().length()
+                            : 0L;
+
+            Log.d(
+                    TAG,
+                    "MOTION_26166_IMAGE_SAVED_COMPLETE"
+                            + " success=" + imageSaved
+                            + " callbackDelivered="
+                            + saveCallbackDelivered
+                            + " exists=" + fileExists
+                            + " bytes=" + fileBytes
+                            + " path=" + imageFile
+            );
+
+            try {
+                processingEventsListener.onProcessingFinished(
+                        imageSaved
+                                ? "HdrX JPG Saved"
+                                : "HdrX JPG Save Failed"
+                );
+            }
+            catch (Exception e){
+                Log.d(
+                        TAG,
+                        "Error in Motion post-save onProcessingFinished:"
+                                + Log.getStackTraceString(e)
+                );
+            }
         }
 
         pipeline.close();

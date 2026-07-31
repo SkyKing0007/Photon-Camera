@@ -318,6 +318,27 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
         glProg.setTexture("IntenseCurve",interpolatedCurve);
         glProg.setTexture("GainMap", ((PostPipeline)basePipeline).GainMap);
         glProg.setVar("toneMapCoeffs", -2.f+2.f*toneMix, 3.f-3.f*toneMix, toneMix, 0.f);
+        Log.d(
+                Name,
+                "MOTION_26161_FINAL_COLOR_PATH"
+                        + " cfaPattern="
+                        + basePipeline.mParameters.cfaPattern
+                        + " whitePoint="
+                        + Arrays.toString(
+                                basePipeline.mParameters.whitePoint
+                        )
+                        + " sensorToIntermediate="
+                        + Arrays.toString(
+                                basePipeline.mParameters.sensorToProPhoto
+                        )
+                        + " intermediateToSRGB="
+                        + Arrays.toString(cct)
+                        + " hasGainMap="
+                        + basePipeline.mParameters.hasGainMap
+                        + " gainMapSize="
+                        + basePipeline.mParameters.mapSize
+        );
+
         Log.d(Name,"sensorToIntermediate: "+ Arrays.toString(basePipeline.mParameters.sensorToProPhoto));
         glProg.setVar("sensorToIntermediate",basePipeline.mParameters.sensorToProPhoto);
         Log.d(Name,"intermediateToSRGB: "+ Arrays.toString(cct));

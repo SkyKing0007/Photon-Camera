@@ -5,6 +5,7 @@ import android.widget.TextView;
 
 import com.particlesdevs.photoncamera.app.PhotonCamera;
 import com.particlesdevs.photoncamera.util.Log;
+import android.view.MotionEvent;
 import android.view.View;
 import android.widget.ImageButton;
 import android.widget.ProgressBar;
@@ -18,10 +19,9 @@ import com.particlesdevs.photoncamera.databinding.LayoutMainTopbarBinding;
 import com.particlesdevs.photoncamera.settings.PreferenceKeys;
 import com.particlesdevs.photoncamera.settings.TunableInjector;
 import com.particlesdevs.photoncamera.settings.annotations.Tunable;
-import com.particlesdevs.photoncamera.ui.camera.views.modeswitcher.wefika.horizontalpicker.HorizontalPicker;
+import com.particlesdevs.photoncamera.ui.camera.views.modeswitcher.LiquidModePicker;
 import com.particlesdevs.photoncamera.util.Utilities;
 
-import java.util.Arrays;
 
 import static androidx.constraintlayout.widget.ConstraintSet.GONE;
 
@@ -32,6 +32,23 @@ import static androidx.constraintlayout.widget.ConstraintSet.GONE;
  */
 public class CameraUIViewImpl implements CameraUIView {
     private static final String TAG = "CameraUIView";
+    private static final String[] MODE_DISPLAY_LABELS = {
+            "MOTION",
+            "VIDEO",
+            "PHOTO",
+            "PORTRAIT",
+            "NIGHT",
+            "PRO"
+    };
+
+    private static final CameraMode[] MODE_ACTION_ORDER = {
+            CameraMode.MOTION,
+            CameraMode.VIDEO,
+            CameraMode.PHOTO,
+            CameraMode.PHOTO,
+            CameraMode.NIGHT,
+            CameraMode.UNLIMITED
+    };
 
     @Tunable(
             title = "Enable Quad Resolution",
@@ -48,8 +65,15 @@ public class CameraUIViewImpl implements CameraUIView {
     private final ProgressBar mCaptureProgressBar;
     private final ImageButton mShutterButton;
     private final ProgressBar mProcessingProgressBar;
-    private final HorizontalPicker mModePicker;
+    private final LiquidModePicker mModePicker;
     private final TextView mVideoRecordingInfo;
+    private View formatSelectorPill;
+    private View formatExpandedPanel;
+    private View quadStatusContainer;
+    private View quadStatusToggleButton;
+    private TextView formatActiveLabel;
+    private TextView quadStatusLabel;
+    private boolean formatPanelOpen;
     private LayoutMainTopbarBinding topbar;
     private LayoutBottombuttonsBinding bottombuttons;
     private CameraUIEventsListener uiEventsListener;
@@ -66,6 +90,7 @@ public class CameraUIViewImpl implements CameraUIView {
         this.mVideoRecordingInfo = cameraFragment.cameraFragmentBinding.getRoot().findViewById(R.id.video_recording_info);
         this.initListeners();
         this.initModeSwitcher();
+        this.initLiquidUi();
         this.currentState = new PhotoMotionModeState(); //init mode
         initModeState(CameraMode.valueOf(PreferenceKeys.getCameraModeOrdinal()));
     }
@@ -100,10 +125,169 @@ public class CameraUIViewImpl implements CameraUIView {
     }
 
     private void initModeSwitcher() {
-        this.mModePicker.setValues(Arrays.stream(CameraMode.nameIds()).map(cameraFragment.activity::getString).toArray(String[]::new));
+        this.mModePicker.setValues(MODE_DISPLAY_LABELS);
+        this.mModePicker.setSideItems(0);
         this.mModePicker.setOverScrollMode(View.OVER_SCROLL_NEVER);
-        this.mModePicker.setOnItemSelectedListener(index -> switchToMode(CameraMode.valueOf(index)));
-        this.mModePicker.setSelectedItem(PreferenceKeys.getCameraModeOrdinal());
+        this.mModePicker.setOnItemSelectedListener(index -> {
+            if (index >= 0 && index < MODE_ACTION_ORDER.length) {
+                this.mModePicker.collapseToIndex(index);
+                switchToMode(MODE_ACTION_ORDER[index]);
+            }
+        });
+        this.mModePicker.collapseToIndex(
+                indexOfMode(
+                        CameraMode.valueOf(
+                                PreferenceKeys.getCameraModeOrdinal()
+                        )
+                )
+        );
+    }
+
+    private int indexOfMode(CameraMode mode) {
+        for (int i = 0; i < MODE_ACTION_ORDER.length; i++) {
+            if (MODE_ACTION_ORDER[i] == mode) return i;
+        }
+        return 0;
+    }
+
+    private void initLiquidUi() {
+        View root = cameraFragment.cameraFragmentBinding.getRoot();
+        formatSelectorPill = root.findViewById(R.id.format_selector_pill);
+        formatExpandedPanel = root.findViewById(R.id.format_expanded_panel);
+        quadStatusContainer = root.findViewById(R.id.quad_status_container);
+        quadStatusToggleButton = root.findViewById(R.id.quad_status_toggle_button);
+        formatActiveLabel = root.findViewById(R.id.format_active_label);
+        quadStatusLabel = root.findViewById(R.id.quad_status_label);
+
+        View formatJpg = root.findViewById(R.id.format_jpg_button);
+        View formatRaw = root.findViewById(R.id.format_raw_button);
+        View formatRawJpg = root.findViewById(R.id.format_raw_jpg_button);
+        View manualControls = root.findViewById(R.id.manual_controls_button);
+
+        formatSelectorPill.setOnClickListener(v -> toggleFormatPanel());
+        formatJpg.setOnClickListener(v -> selectFormat(0));
+        formatRawJpg.setOnClickListener(v -> selectFormat(1));
+        formatRaw.setOnClickListener(v -> selectFormat(2));
+        quadStatusToggleButton.setOnClickListener(v -> {
+            if (uiEventsListener != null) uiEventsListener.onClick(v);
+        });
+        if (manualControls != null) {
+            manualControls.setOnClickListener(v -> {
+                if (uiEventsListener != null) uiEventsListener.onClick(v);
+            });
+        }
+
+        installPressAnimation(
+                formatSelectorPill,
+                formatJpg,
+                formatRaw,
+                formatRawJpg,
+                quadStatusToggleButton,
+                topbar.countdownTimerButton,
+                topbar.flashButton,
+                topbar.settingsButton,
+                bottombuttons.galleryImageButton,
+                bottombuttons.flipCameraButton,
+                bottombuttons.shutterButton
+        );
+        refreshFormatStatus();
+    }
+
+    private void installPressAnimation(View... views) {
+        for (View view : views) {
+            if (view == null) continue;
+            view.setOnTouchListener((target, event) -> {
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        target.animate().scaleX(0.91f).scaleY(0.91f).alpha(0.84f)
+                                .setDuration(90).start();
+                        break;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        target.animate().scaleX(1f).scaleY(1f).alpha(1f)
+                                .setDuration(210).start();
+                        break;
+                    default:
+                        break;
+                }
+                return false;
+            });
+        }
+    }
+
+    private void toggleFormatPanel() {
+        if (formatExpandedPanel == null) return;
+        formatPanelOpen = !formatPanelOpen;
+        if (formatPanelOpen) {
+            refreshFormatStatus();
+            formatExpandedPanel.setVisibility(View.VISIBLE);
+            formatExpandedPanel.setAlpha(0f);
+            formatExpandedPanel.setTranslationY(-12f);
+            formatExpandedPanel.setScaleX(0.94f);
+            formatExpandedPanel.setScaleY(0.94f);
+            formatExpandedPanel.animate()
+                    .alpha(1f)
+                    .translationY(0f)
+                    .scaleX(1f)
+                    .scaleY(1f)
+                    .setDuration(260)
+                    .start();
+        } else {
+            formatExpandedPanel.animate()
+                    .alpha(0f)
+                    .translationY(-12f)
+                    .scaleX(0.94f)
+                    .scaleY(0.94f)
+                    .setDuration(190)
+                    .withEndAction(() -> formatExpandedPanel.setVisibility(View.GONE))
+                    .start();
+        }
+    }
+
+    private void collapseFormatPanel() {
+        if (!formatPanelOpen) return;
+        toggleFormatPanel();
+    }
+
+    private void selectFormat(int value) {
+        PreferenceKeys.setSaveRaw(value);
+        refreshFormatStatus();
+        collapseFormatPanel();
+        cameraFragment.updateSettingsBar();
+    }
+
+    private void refreshFormatStatus() {
+        if (formatActiveLabel == null) return;
+        int saveRaw = PreferenceKeys.isSaveRaw();
+        switch (saveRaw) {
+            case 2:
+                formatActiveLabel.setText("RAW");
+                break;
+            case 1:
+                formatActiveLabel.setText("JPG+RAW");
+                break;
+            case 0:
+            default:
+                formatActiveLabel.setText("JPG");
+                break;
+        }
+
+        boolean quadEnabled = enableQuadRes && PreferenceKeys.isQuadBayerOn();
+        if (quadStatusContainer != null) {
+            quadStatusContainer.setVisibility(quadEnabled ? View.VISIBLE : View.GONE);
+        }
+        if (quadStatusLabel != null) {
+            quadStatusLabel.setText("48/64MP");
+        }
+        if (quadStatusToggleButton != null) {
+            quadStatusToggleButton.setVisibility(enableQuadRes ? View.VISIBLE : View.GONE);
+            if (quadStatusToggleButton instanceof TextView) {
+                ((TextView) quadStatusToggleButton).setText(
+                        PreferenceKeys.isQuadBayerOn()
+                                ? "QUAD 48/64MP  ON"
+                                : "QUAD 48/64MP  OFF");
+            }
+        }
     }
 
     @Override
@@ -169,6 +353,7 @@ public class CameraUIViewImpl implements CameraUIView {
             PreferenceKeys.setQuadBayer(false);
         }
         this.topbar.setQuadVisible(enableQuadRes);
+        refreshFormatStatus();
         cameraFragment.cameraFragmentBinding.invalidateAll();
         currentState.reConfigureModeViews(CameraMode.valueOf(PreferenceKeys.getCameraModeOrdinal()));
         this.resetCaptureProgressBar();

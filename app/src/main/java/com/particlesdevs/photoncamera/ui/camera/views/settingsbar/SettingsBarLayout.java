@@ -51,7 +51,7 @@ public class SettingsBarLayout extends RelativeLayout implements SettingsBarList
     public SettingsBarLayout(@NonNull Context context, @Nullable AttributeSet attrs) {
         super(context, attrs);
         vibration = PhotonCamera.getVibration();
-        setBackgroundResource(R.drawable.exif_background);
+        setBackgroundResource(R.drawable.liquid_glass_panel);
 
         ScrollView scrollView = new ScrollView(context);
         scrollView.setId(R.id.settings_bar_scroll_view);
@@ -71,13 +71,23 @@ public class SettingsBarLayout extends RelativeLayout implements SettingsBarList
         settingsButtonContainerParam.setMargins(dp(5), dp(0), dp(5), dp(5));
         settingsButtonContainerParam.addRule(RelativeLayout.ALIGN_PARENT_BOTTOM);
 
+        ImageButton manualButton = new ImageButton(context);
+        manualButton.setId(R.id.manual_controls_button);
+        manualButton.setImageResource(R.drawable.ic_exposure);
+        manualButton.setContentDescription("Manual controls");
+        manualButton.setBackgroundResource(R.drawable.liquid_glass_icon_button);
+        manualButton.setPadding(dp(9), dp(9), dp(9), dp(9));
+
         ImageButton settingsButton = new ImageButton(context);
         settingsButton.setImageResource(R.drawable.ic_settings);
-        settingsButton.setBackgroundResource(getResolvedAttr(context, android.R.attr.selectableItemBackgroundBorderless));
-        settingsButton.setPadding(dp(10), dp(5), dp(10), dp(5));
+        settingsButton.setContentDescription("Open settings");
+        settingsButton.setBackgroundResource(R.drawable.liquid_glass_icon_button);
+        settingsButton.setPadding(dp(9), dp(9), dp(9), dp(9));
         settingsButton.setOnClickListener(v -> context.startActivity(new Intent(context, SettingsActivity.class)));
-        LayoutParams buttonParam = new LayoutParams(dp(35), dp(35));
-        buttonParam.setMargins(dp(10), dp(2.5f), dp(20), dp(2.5f));
+
+        LayoutParams buttonParam = new LayoutParams(dp(40), dp(40));
+        buttonParam.setMargins(dp(6), dp(0), dp(6), dp(0));
+        settingsButtonContainer.addView(manualButton, buttonParam);
         settingsButtonContainer.addView(settingsButton, buttonParam);
 
         RelativeLayout.LayoutParams scrollViewParam = new RelativeLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);

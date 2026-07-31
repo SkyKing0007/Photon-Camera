@@ -35,6 +35,17 @@
     @Tunable(title = "Apply gamma mix", category = "Auto Exposure", min = 0.0f, max = 1.0f, step = 0.01f, defaultValue = 0.1f, description = "Blend between AE color space sRGB-linear")
     float applyGammaMix;
 
+    @Tunable(
+            title = "Motion high-ISO tone gain limit",
+            description = "Maximum post-exposure gain at ISO 3200. The 4.0 default matched the GCam reference brightness better.",
+            category = "Motion Noise Tuning",
+            min = 3.0f,
+            max = 9.0f,
+            defaultValue = 4.0f,
+            step = 0.1f
+    )
+    float motionHighIsoGainLimit = 4.0f;
+
 
     public AutoExposure() {
         super("", "AutoExposure");
@@ -130,6 +141,62 @@
             Log.d("AutoExposure", "Clamping gain by max from " + mpy + " to " + gainMax);
             mpy = gainMax;
         }
+
+        if (com.particlesdevs.photoncamera.app.PhotonCamera
+                .getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+
+            float motionIso =
+                    Math.max(
+                            1.0f,
+                            basePipeline.mParameters.iso
+                    );
+
+            float highIsoBlend =
+                    Math2.clamp(
+                            (motionIso - 400.0f) / 2800.0f,
+                            0.0f,
+                            1.0f
+                    );
+
+            float highIsoGainLimit =
+                    Math.min(
+                            gainMax,
+                            motionHighIsoGainLimit
+                    );
+
+            float motionGainLimit =
+                    Math2.mix(
+                            gainMax,
+                            highIsoGainLimit,
+                            highIsoBlend
+                    );
+
+            float gainBeforeMotionGuard =
+                    mpy;
+
+            if (mpy > motionGainLimit) {
+                mpy =
+                        motionGainLimit;
+            }
+
+            Log.d(
+                    "AutoExposure",
+                    "MOTION_26171_TONE_TUNABLE"
+                            + " iso=" + motionIso
+                            + " highIsoBlend="
+                            + highIsoBlend
+                            + " gainBefore="
+                            + gainBeforeMotionGuard
+                            + " configuredHighIsoLimit="
+                            + motionHighIsoGainLimit
+                            + " gainLimit="
+                            + motionGainLimit
+                            + " gainAfter=" + mpy
+                            + " lowIsoBehaviorPreserved=true"
+            );
+        }
+
         float normL = 0.0f;
         float normR = 0.0f;
         for (int i = 0; i < histSize; i++) {
@@ -150,6 +217,43 @@
             glProg.setVar("whiteMax", mpy);
         }
         glProg.setVar("applyGammaMix", applyGammaMix);
+
+        float indoorHdrStrength =
+                ((PostPipeline) basePipeline)
+                        .indoorHdrSceneStrength;
+
+        float lowerMidLift =
+                0.22f
+                        * indoorHdrStrength;
+
+        float highlightCompression =
+                0.32f
+                        * indoorHdrStrength;
+
+        glProg.setVar(
+                "indoorHdrStrength",
+                indoorHdrStrength
+        );
+        glProg.setVar(
+                "lowerMidLift",
+                lowerMidLift
+        );
+        glProg.setVar(
+                "highlightCompression",
+                highlightCompression
+        );
+
+        Log.d(
+                "AutoExposure",
+                "MOTION_26179_INDOOR_HDR_TONE"
+                        + " strength=" + indoorHdrStrength
+                        + " lowerMidLift=" + lowerMidLift
+                        + " highlightCompression="
+                        + highlightCompression
+                        + " globalShadowLift=false"
+                        + " nightModeAffected=false"
+        );
+
         WorkingTexture = basePipeline.getMain();
         glProg.drawBlocks(WorkingTexture);
         glProg.closed = true;

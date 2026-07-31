@@ -262,6 +262,21 @@ public class PyramidMerging extends GLOneScript {
     GLTexture alter;
     GLTexture alignmentTex;
     GLTexture hotPix;
+    GLTexture motionContributionMap;
+
+    private boolean motionContributionMeasured = false;
+    private float motionEffectiveFrameCount = 1.0f;
+    private float motionEffectiveStackRatio = 1.0f;
+    private float motionContributionMean = 1.0f;
+    private float motionContributionP10 = 1.0f;
+    private float motionContributionP25 = 1.0f;
+    private float motionContributionP50 = 1.0f;
+    private float motionContributionP75 = 1.0f;
+    private float motionContributionP90 = 1.0f;
+    private float motionContributionBelow4 = 0.0f;
+    private float motionContributionBelow8 = 0.0f;
+    private float motionContributionBelow12 = 0.0f;
+    private float motionContributionBelow16 = 0.0f;
     //GLTexture noiseMap;
     GLUtils.Pyramid pyramid;
     GLUtils.Pyramid pyramidBase;
@@ -275,6 +290,387 @@ public class PyramidMerging extends GLOneScript {
     double noiseMpyLow;
     @Tunable(title = "Adaptive High", category = "Merge", min = 1.0f, max = 4.0f, step = 1.0f/2.0f, defaultValue = 3)
     double noiseMpyHigh;
+
+    @Tunable(
+            title = "Motion merge noise recovery",
+            description = "Restores aligned alternate-frame differences only when they are consistent with predicted sensor noise. This lets independent noise average instead of repeatedly carrying the reference-frame pattern.",
+            category = "Motion Noise Tuning",
+            min = 0.0f,
+            max = 1.0f,
+            defaultValue = 0.75f,
+            step = 0.05f
+    )
+    float motionNoiseDifferenceRecovery = 0.75f;
+
+    @Tunable(
+            title = "Motion merge recovery gate",
+            description = "Width of the noise-consistent recovery gate. Higher values recover more alternate-frame difference but may increase ghosting if alignment is poor.",
+            category = "Motion Noise Tuning",
+            min = 1.0f,
+            max = 3.0f,
+            defaultValue = 1.50f,
+            step = 0.10f
+    )
+    float motionNoiseRecoveryGate = 1.50f;
+
+
+    @Tunable(
+            title = "Motion effective-stack percentile",
+            description = "Percentile of the measured local contribution map used for the global DNG/JPEG noise model. 0.25 protects low-contribution regions without letting small moving objects dominate.",
+            category = "Motion Noise Tuning",
+            min = 0.10f,
+            max = 0.50f,
+            defaultValue = 0.25f,
+            step = 0.05f
+    )
+    float motionEffectiveStackPercentile = 0.25f;
+
+    public boolean hasMotionContributionMeasurement() {
+        return motionContributionMeasured;
+    }
+
+    public float getMotionEffectiveFrameCount() {
+        return motionEffectiveFrameCount;
+    }
+
+    public float getMotionEffectiveStackRatio() {
+        return motionEffectiveStackRatio;
+    }
+
+    public float getMotionContributionMean() {
+        return motionContributionMean;
+    }
+
+    public float getMotionContributionP10() {
+        return motionContributionP10;
+    }
+
+    public float getMotionContributionP25() {
+        return motionContributionP25;
+    }
+
+    public float getMotionContributionP50() {
+        return motionContributionP50;
+    }
+
+    public float getMotionContributionP75() {
+        return motionContributionP75;
+    }
+
+    public float getMotionContributionP90() {
+        return motionContributionP90;
+    }
+
+    public float getMotionContributionBelow4() {
+        return motionContributionBelow4;
+    }
+
+    public float getMotionContributionBelow8() {
+        return motionContributionBelow8;
+    }
+
+    public float getMotionContributionBelow12() {
+        return motionContributionBelow12;
+    }
+
+    public float getMotionContributionBelow16() {
+        return motionContributionBelow16;
+    }
+
+    private float contributionPercentile(
+            int[] histogram,
+            long total,
+            float percentile,
+            int retainedFrames
+    ) {
+        if (histogram == null || histogram.length == 0 || total <= 0) {
+            return retainedFrames;
+        }
+
+        long target =
+                Math.max(
+                        1L,
+                        (long) Math.ceil(
+                                total
+                                        * Math2.clamp(
+                                                percentile,
+                                                0.0f,
+                                                1.0f
+                                        )
+                        )
+                );
+
+        long cumulative = 0L;
+
+        for (int i = 0; i < histogram.length; i++) {
+            cumulative += Math.max(0, histogram[i]);
+
+            if (cumulative >= target) {
+                float ratio =
+                        (float) i
+                                / (float) Math.max(
+                                        1,
+                                        histogram.length - 1
+                                );
+
+                return Math2.clamp(
+                        ratio * retainedFrames,
+                        1.0f,
+                        retainedFrames
+                );
+            }
+        }
+
+        return retainedFrames;
+    }
+
+    private float contributionBelow(
+            int[] histogram,
+            long total,
+            float frameThreshold,
+            int retainedFrames
+    ) {
+        if (histogram == null || histogram.length == 0 || total <= 0) {
+            return 0.0f;
+        }
+
+        long below = 0L;
+
+        for (int i = 0; i < histogram.length; i++) {
+            float ratio =
+                    (float) i
+                            / (float) Math.max(
+                                    1,
+                                    histogram.length - 1
+                            );
+
+            float frames =
+                    ratio * retainedFrames;
+
+            if (frames < frameThreshold) {
+                below += Math.max(0, histogram[i]);
+            }
+        }
+
+        return Math2.clamp(
+                (float) below / (float) total,
+                0.0f,
+                1.0f
+        );
+    }
+
+    private void analyzeMotionContribution(
+            int retainedFrames
+    ) {
+        if (motionContributionMap == null || retainedFrames <= 0) {
+            return;
+        }
+
+        final int histogramSize = 256;
+
+        GLHistogram contributionHistogram =
+                new GLHistogram(
+                        glProg,
+                        histogramSize
+                );
+
+        contributionHistogram.Rc = true;
+        contributionHistogram.Gc = false;
+        contributionHistogram.Bc = false;
+        contributionHistogram.Ac = false;
+        contributionHistogram.resize = 4;
+        contributionHistogram.exposure[0] = 1.0f;
+
+        int[][] histogramOutput =
+                contributionHistogram.Compute(
+                        motionContributionMap
+                );
+
+        contributionHistogram.close();
+
+        int[] histogram =
+                histogramOutput != null
+                                && histogramOutput.length > 0
+                        ? histogramOutput[0]
+                        : null;
+
+        if (histogram == null || histogram.length == 0) {
+            Log.w(
+                    Name,
+                    "MOTION_26172_LOCAL_CONTRIBUTION_FAILED"
+                            + " reason=emptyHistogram"
+            );
+            return;
+        }
+
+        long total = 0L;
+        double weightedRatio = 0.0;
+
+        for (int i = 0; i < histogram.length; i++) {
+            int count =
+                    Math.max(
+                            0,
+                            histogram[i]
+                    );
+
+            total += count;
+            weightedRatio +=
+                    (
+                            (double) i
+                                    / (double) Math.max(
+                                            1,
+                                            histogram.length - 1
+                                    )
+                    )
+                            * count;
+        }
+
+        if (total <= 0L) {
+            Log.w(
+                    Name,
+                    "MOTION_26172_LOCAL_CONTRIBUTION_FAILED"
+                            + " reason=zeroSamples"
+            );
+            return;
+        }
+
+        motionContributionMean =
+                Math2.clamp(
+                        (float) (weightedRatio / total)
+                                * retainedFrames,
+                        1.0f,
+                        retainedFrames
+                );
+
+        motionContributionP10 =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        0.10f,
+                        retainedFrames
+                );
+
+        motionContributionP25 =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        0.25f,
+                        retainedFrames
+                );
+
+        motionContributionP50 =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        0.50f,
+                        retainedFrames
+                );
+
+        motionContributionP75 =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        0.75f,
+                        retainedFrames
+                );
+
+        motionContributionP90 =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        0.90f,
+                        retainedFrames
+                );
+
+        motionEffectiveFrameCount =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        motionEffectiveStackPercentile,
+                        retainedFrames
+                );
+
+        motionEffectiveStackRatio =
+                Math2.clamp(
+                        motionEffectiveFrameCount
+                                / Math.max(
+                                        1.0f,
+                                        retainedFrames
+                                ),
+                        1.0f / Math.max(1.0f, retainedFrames),
+                        1.0f
+                );
+
+        motionContributionBelow4 =
+                contributionBelow(
+                        histogram,
+                        total,
+                        4.0f,
+                        retainedFrames
+                );
+
+        motionContributionBelow8 =
+                contributionBelow(
+                        histogram,
+                        total,
+                        8.0f,
+                        retainedFrames
+                );
+
+        motionContributionBelow12 =
+                contributionBelow(
+                        histogram,
+                        total,
+                        12.0f,
+                        retainedFrames
+                );
+
+        motionContributionBelow16 =
+                contributionBelow(
+                        histogram,
+                        total,
+                        16.0f,
+                        retainedFrames
+                );
+
+        motionContributionMeasured = true;
+
+        Log.d(
+                Name,
+                "MOTION_26172_LOCAL_CONTRIBUTION"
+                        + " retained=" + retainedFrames
+                        + " measuredSamples=" + total
+                        + " selectedPercentile="
+                        + motionEffectiveStackPercentile
+                        + " effective="
+                        + motionEffectiveFrameCount
+                        + " ratio="
+                        + motionEffectiveStackRatio
+                        + " mean="
+                        + motionContributionMean
+                        + " p10="
+                        + motionContributionP10
+                        + " p25="
+                        + motionContributionP25
+                        + " p50="
+                        + motionContributionP50
+                        + " p75="
+                        + motionContributionP75
+                        + " p90="
+                        + motionContributionP90
+                        + " below4="
+                        + motionContributionBelow4
+                        + " below8="
+                        + motionContributionBelow8
+                        + " below12="
+                        + motionContributionBelow12
+                        + " below16="
+                        + motionContributionBelow16
+                        + " contributionDefinition=preservedIndependentDifference"
+                        + " outputResolution=rawHalf"
+                        + " histogramStride=4"
+        );
+    }
 
     @Override
     public void Run() {
@@ -505,6 +901,107 @@ public class PyramidMerging extends GLOneScript {
         double noiseMin = 1e-6;
         noiseS = (float)Math.max(noiseS * noisempy * adaptiveNMpy * adaptiveNMpy,noiseMin);
         noiseO = (float)Math.max(noiseO * noisempy * adaptiveNMpy * adaptiveNMpy,noiseMin);
+
+        final boolean motionEqualExposureStack =
+                PhotonCamera.getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+
+        /*
+         * vec4 length is approximately two times one-channel sigma.
+         * 1.5 therefore gives an approximately three-sigma vector allowance.
+         */
+        final float motionNoiseAllowance =
+                motionEqualExposureStack
+                        ? 1.5f
+                        : 0.0f;
+
+        if (motionEqualExposureStack) {
+            Log.d(
+                    "PyramidMerging",
+                    "MOTION_26168_MERGE_NOISE_AWARE"
+                            + " frames=" + images.size()
+                            + " perFrameNoiseS=" + noiseS
+                            + " perFrameNoiseO=" + noiseO
+                            + " vectorSigmaAllowance="
+                            + motionNoiseAllowance
+                            + " equalExposure=true"
+                            + " runningAveragePreserved=true"
+                            + " noFramesDiscarded=true"
+            );
+        }
+
+        final boolean trackMotionContribution =
+                motionEqualExposureStack
+                        && images.size() > 1;
+
+        if (trackMotionContribution) {
+            motionContributionMap =
+                    new GLTexture(
+                            rawHalf,
+                            /*
+                             * Build 26173:
+                             *
+                             * GLSL ES 3.10 does not permit r16f as an image
+                             * format qualifier. Use the core-supported r32f
+                             * single-channel image format instead.
+                             */
+                            new GLFormat(
+                                    GLFormat.DataType.FLOAT_32,
+                                    1
+                            ),
+                            null,
+                            GL_NEAREST,
+                            GL_CLAMP_TO_EDGE
+                    );
+
+            glProg.setLayout(
+                    tile,
+                    tile,
+                    1
+            );
+
+            glProg.useAssetProgram(
+                    "merge/contributioninit",
+                    true
+            );
+
+            glProg.setVar(
+                    "initialContribution",
+                    1.0f
+                            / Math.max(
+                                    1,
+                                    images.size()
+                            )
+            );
+
+            glProg.setTextureCompute(
+                    "outTexture",
+                    motionContributionMap,
+                    true
+            );
+
+            glProg.computeAuto(
+                    motionContributionMap.mSize,
+                    1
+            );
+
+            Log.d(
+                    Name,
+                    "MOTION_26172_CONTRIBUTION_TRACKING"
+                            + " enabled=true"
+                            + " retained=" + images.size()
+                            + " initialBaseContribution="
+                            + 1.0f / Math.max(1, images.size())
+                            + " mapSize="
+                            + motionContributionMap.mSize.x
+                            + "x"
+                            + motionContributionMap.mSize.y
+                            + " storageFormat=R32F"
+                            + " glslEs310Compatible=true"
+                            + " adaptiveNoiseSettingUnchanged=true"
+            );
+        }
+
         if(enableHotPixelCorrection)
             hotPixels();
 
@@ -699,17 +1196,76 @@ public class PyramidMerging extends GLOneScript {
             }
 
             glProg.setLayout(tile, tile, 1);
-            glProg.useAssetProgram("merge/merge11", true);
+
+            if (motionEqualExposureStack) {
+                glProg.useAssetProgram(
+                        "merge/motionmerge11",
+                        true
+                );
+            } else {
+                glProg.useAssetProgram(
+                        "merge/merge11",
+                        true
+                );
+            }
             glProg.setVar("cfaPattern", parameters.cfaPattern);
             glProg.setTexture("inTex", inputBase);
             glProg.setTextureCompute("inTexture", base, false);
             //glProg.setTexture("alterTexture", inputAlter);
             glProg.setTextureCompute("diffTexture", diff.gauss[0], false);
             glProg.setTextureCompute("diffOrTexture", baseDiffOr, false);
+
+            if (motionEqualExposureStack) {
+                glProg.setTextureCompute(
+                        "contributionTexture",
+                        motionContributionMap,
+                        android.opengl.GLES31.GL_READ_WRITE
+                );
+
+                glProg.setVar(
+                        "contributionIncrement",
+                        1.0f
+                                / Math.max(
+                                        1,
+                                        images.size()
+                                )
+                );
+            }
+
             base = getBase();
             glProg.setTextureCompute("outTexture", base, true);
             glProg.setVar("noiseS", noiseS);
             glProg.setVar("noiseO", noiseO);
+            glProg.setVar(
+                    "motionEqualStack",
+                    motionEqualExposureStack
+                            ? 1
+                            : 0
+            );
+            glProg.setVar(
+                    "motionNoiseAllowance",
+                    motionNoiseAllowance
+            );
+
+            if (motionEqualExposureStack) {
+                glProg.setVar(
+                        "motionNoiseRecoveryStrength",
+                        Math2.clamp(
+                                motionNoiseDifferenceRecovery,
+                                0.0f,
+                                1.0f
+                        )
+                );
+
+                glProg.setVar(
+                        "motionNoiseRecoveryGate",
+                        Math.max(
+                                1.0f,
+                                motionNoiseRecoveryGate
+                        )
+                );
+            }
+
             glProg.setVar("whiteLevel", (float) (parameters.whiteLevel));
             glProg.setVar("blackLevel", blackLevel);
             glProg.setVar("analogBalance", analogBalance);
@@ -730,6 +1286,12 @@ public class PyramidMerging extends GLOneScript {
             //glProg.setVar("exposure", exposure);
             //glProg.setVar("weight",  1.0f);
             glProg.computeAuto(base.mSize, 1);
+        }
+
+        if (trackMotionContribution) {
+            analyzeMotionContribution(
+                    images.size()
+            );
         }
 
         /*
@@ -789,6 +1351,10 @@ public class PyramidMerging extends GLOneScript {
         alignmentTex.close();
         diffFlow.close();
         baseDiffOr.close();
+        if (motionContributionMap != null) {
+            motionContributionMap.close();
+            motionContributionMap = null;
+        }
         //noiseMap.close();
         for (int i = 0; i < pyramid.gauss.length; i++) {
             pyramid.gauss[i].close();

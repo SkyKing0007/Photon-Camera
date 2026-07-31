@@ -72,8 +72,27 @@ final class CameraUIController implements CameraUIEventsListener,
                         break;
                 }
                 break;
-            case R.id.settings_button:
-                cameraFragment.launchSettings();
+            case R.id.settings_button: {
+                boolean controlsVisible = cameraFragment.cameraFragmentBinding
+                        .getUimodel().isSettingsBarVisibility();
+                cameraFragment.cameraFragmentBinding
+                        .getUimodel().setSettingsBarVisibility(!controlsVisible);
+                break;
+            }
+
+            case R.id.manual_controls_button:
+                cameraFragment.cameraFragmentBinding
+                        .getUimodel().setSettingsBarVisibility(false);
+                cameraFragment.toggleManualControls();
+                break;
+
+            case R.id.quad_status_toggle_button:
+                PreferenceKeys.setQuadBayer(!PreferenceKeys.isQuadBayerOn());
+                cameraFragment.showSnackBar(
+                        cameraFragment.getString(R.string.quad_bayer_toggle_text)
+                                + ':' + onOff(PreferenceKeys.isQuadBayerOn()));
+                this.restartCamera();
+                cameraFragment.updateSettingsBar();
                 break;
 
             case R.id.hdrx_toggle_button:

@@ -39,6 +39,13 @@ public class PostPipeline extends GLBasePipeline {
     float fusionGain = 1.f;
     float softLight = 1.f;
 
+    /*
+     * Build 26179:
+     * Strength of the Motion indoor bright-window HDR scene gate.
+     * Zero preserves the complete existing pipeline, including Night mode.
+     */
+    float indoorHdrSceneStrength = 0.0f;
+
     public PostPipeline() {
         super("PostPipeline");
     }
@@ -77,6 +84,28 @@ public class PostPipeline extends GLBasePipeline {
     )
     int demosaicingMethod = 1;
 
+    @Tunable(
+            title = "Motion residual variance boost",
+            description = "Maximum extra downstream noise variance at ISO 3200. 0 disables the extra boost; 0.80 gives a 1.80x model.",
+            category = "Motion Noise Tuning",
+            min = 0.0f,
+            max = 2.0f,
+            defaultValue = 0.80f,
+            step = 0.05f
+    )
+    float motionResidualVarianceBoost = 0.80f;
+
+    @Tunable(
+            title = "Motion measured residual variance boost",
+            description = "Optional extra downstream variance after the measured local effective-stack model is active. The default is zero to avoid counting the same correction twice.",
+            category = "Motion Noise Tuning",
+            min = 0.0f,
+            max = 1.0f,
+            defaultValue = 0.0f,
+            step = 0.05f
+    )
+    float motionMeasuredResidualVarianceBoost = 0.0f;
+
     public Bitmap Run(ByteBuffer inBuffer, Parameters parameters) {
         mParameters = parameters;
         mSettings = PhotonCamera.getSettings();
@@ -94,13 +123,82 @@ public class PostPipeline extends GLBasePipeline {
         Log.d("PostPipeline", "noisempy:" + noisempy);
         noiseS *= noisempy;
         noiseO *= noisempy;
-        Log.d("PostPipeline", "NoiseS:" + noiseS + "\n" + "NoiseO:" + noiseO);
+
+        float motionResidualNoiseMpy = 1.0f;
         /*if (!PhotonCamera.getSettings().hdrxNR) {
             noiseO = 0.f;
             noiseS = 0.f;
         }*/
         noiseO = Math.max(noiseO, 1.0f/4096.0f);
         noiseS = Math.max(noiseS, Float.MIN_NORMAL);
+
+        /*
+         * Build 26168:
+         * Apply residual Motion variance after the normal Photon floors.
+         * This keeps every captured/merged frame and leaves the effective
+         * frame diagnostic unchanged.
+         */
+        if (mSettings.selectedMode == CameraMode.MOTION) {
+            float motionIso =
+                    Math.max(
+                            1.0f,
+                            mParameters.iso
+                    );
+
+            float highIsoBlend =
+                    com.particlesdevs.photoncamera.util.Math2.clamp(
+                            (motionIso - 400.0f) / 2800.0f,
+                            0.0f,
+                            1.0f
+                    );
+
+            float configuredResidualBoost =
+                    mParameters.localContributionMeasured
+                            ? motionMeasuredResidualVarianceBoost
+                            : motionResidualVarianceBoost;
+
+            motionResidualNoiseMpy =
+                    1.0f
+                            + configuredResidualBoost
+                            * highIsoBlend;
+
+            noiseS *= motionResidualNoiseMpy;
+            noiseO *= motionResidualNoiseMpy;
+
+            Log.d(
+                    "PostPipeline",
+                    "MOTION_26172_LOCAL_NOISE_HANDOFF"
+                            + " iso=" + motionIso
+                            + " retainedFrames="
+                            + mParameters.retainedFrameCount
+                            + " effectiveMeasured="
+                            + mParameters.effectiveFrameCount
+                            + " effectiveRatio="
+                            + mParameters.effectiveStackRatio
+                            + " localContributionMeasured="
+                            + mParameters.localContributionMeasured
+                            + " varianceMultiplier="
+                            + motionResidualNoiseMpy
+                            + " configuredFallbackBoost="
+                            + motionResidualVarianceBoost
+                            + " configuredMeasuredBoost="
+                            + motionMeasuredResidualVarianceBoost
+                            + " appliedConfiguredBoost="
+                            + configuredResidualBoost
+                            + " appliedAfterNoiseFloor=true"
+                            + " dngAndJpegModelShareEffectiveCount=true"
+                            + " adaptiveNoiseSettingUnchanged=true"
+            );
+        }
+
+        Log.d(
+                "PostPipeline",
+                "NoiseS:" + noiseS
+                        + "\nNoiseO:" + noiseO
+                        + "\nMotionResidualNoiseMpy:"
+                        + motionResidualNoiseMpy
+        );
+
         Point rawSliced = parameters.rawSize;
         cropSize = new Point(parameters.rawSize);
         if (PhotonCamera.getSettings().aspect169) {
@@ -203,6 +301,12 @@ public class PostPipeline extends GLBasePipeline {
         //add(new Equalization());
 
         add(new Initial());
+
+        if (mSettings.selectedMode == CameraMode.MOTION
+                && mSettings.hdrxNR) {
+            add(new MotionLumaDenoise());
+            add(new MotionChromaDenoise());
+        }
 
         add(new AutoExposure());
 

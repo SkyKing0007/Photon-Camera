@@ -1,21 +1,8 @@
 /*
  *
- *  PhotonCamera
+ *  PhotonCamera / Iris Camera UI
  *  AuxButtonsViewModel.java
- *  Copyright (C) 2020 - 2021  Vibhor
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, either version 3 of the License, or
- *  (at your option) any later version.
  *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
- * /
  */
 
 package com.particlesdevs.photoncamera.ui.camera.viewmodel;
@@ -35,34 +22,79 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * ViewModel which connects {@link AuxButtonsModel} with {@link CameraFragment}
+ * ViewModel which connects {@link AuxButtonsModel} with {@link CameraFragment}.
+ *
+ * Lens buttons are always sorted from the lowest optical zoom factor to the
+ * highest. This gives 0.6x, 1x, 3x, 4.1x on the current device while staying
+ * data-driven for other OEM camera arrangements.
  */
 public class AuxButtonsViewModel extends ViewModel {
-    private static final Comparator<CameraLensData> SORT_BY_ZOOM_FACTOR = (o1, o2) -> -Double.compare(o1.getZoomFactor(), o2.getZoomFactor());
-    private final AuxButtonsModel auxButtonsModel = new AuxButtonsModel();
+    private static final Comparator<CameraLensData> SORT_BY_ZOOM_FACTOR =
+            Comparator.comparingDouble(CameraLensData::getZoomFactor)
+                    .thenComparing(CameraLensData::getCameraId);
+
+    private final AuxButtonsModel auxButtonsModel =
+            new AuxButtonsModel();
+
     private boolean initialized = false;
     private boolean isEnabled = true;
 
-    public void initCameraLists(Map<String, CameraLensData> cameraLensDataMap) {
+    public void initCameraLists(
+            Map<String, CameraLensData> cameraLensDataMap
+    ) {
         if (!initialized) {
-            List<CameraLensData> frontCameras = new ArrayList<>();
-            List<CameraLensData> backCameras = new ArrayList<>();
-            cameraLensDataMap.forEach((id, cameraLensData) -> {
-                if (cameraLensData.getFacing() == CameraCharacteristics.LENS_FACING_BACK)
-                    backCameras.add(cameraLensData);
-                else if (cameraLensData.getFacing() == CameraCharacteristics.LENS_FACING_FRONT)
-                    frontCameras.add(cameraLensData);
-            });
-            backCameras.sort(SORT_BY_ZOOM_FACTOR);
-            frontCameras.sort(SORT_BY_ZOOM_FACTOR);
-            auxButtonsModel.setBackCameras(backCameras);
-            auxButtonsModel.setFrontCameras(frontCameras);
+            List<CameraLensData> frontCameras =
+                    new ArrayList<>();
+
+            List<CameraLensData> backCameras =
+                    new ArrayList<>();
+
+            cameraLensDataMap.forEach(
+                    (id, cameraLensData) -> {
+                        if (cameraLensData.getFacing()
+                                == CameraCharacteristics
+                                        .LENS_FACING_BACK) {
+                            backCameras.add(
+                                    cameraLensData
+                            );
+                        } else if (
+                                cameraLensData.getFacing()
+                                        == CameraCharacteristics
+                                                .LENS_FACING_FRONT
+                        ) {
+                            frontCameras.add(
+                                    cameraLensData
+                            );
+                        }
+                    }
+            );
+
+            backCameras.sort(
+                    SORT_BY_ZOOM_FACTOR
+            );
+
+            frontCameras.sort(
+                    SORT_BY_ZOOM_FACTOR
+            );
+
+            auxButtonsModel.setBackCameras(
+                    backCameras
+            );
+
+            auxButtonsModel.setFrontCameras(
+                    frontCameras
+            );
+
             initialized = true;
         }
     }
 
-    public void setAuxButtonListener(AuxButtonsLayout.AuxButtonListener auxButtonListener) {
-        auxButtonsModel.setAuxButtonListener(auxButtonListener);
+    public void setAuxButtonListener(
+            AuxButtonsLayout.AuxButtonListener auxButtonListener
+    ) {
+        auxButtonsModel.setAuxButtonListener(
+                auxButtonListener
+        );
     }
 
     public boolean isEnabled() {
@@ -75,7 +107,9 @@ public class AuxButtonsViewModel extends ViewModel {
     }
 
     public void setActiveId(String cameraId) {
-        auxButtonsModel.setCurrentCameraId(cameraId);
+        auxButtonsModel.setCurrentCameraId(
+                cameraId
+        );
     }
 
     public AuxButtonsModel getAuxButtonsModel() {

@@ -336,6 +336,14 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
         super.onPause();
     }
 
+    void toggleManualControls() {
+        if (manualModeConsole.isPanelVisible()) {
+            mSwipe.SwipeDown();
+        } else {
+            mSwipe.SwipeUp();
+        }
+    }
+
     @Override
     public boolean onBackPressed() {
         boolean handleBack = false;
