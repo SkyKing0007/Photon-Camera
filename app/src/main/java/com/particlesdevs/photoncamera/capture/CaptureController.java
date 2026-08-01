@@ -4041,7 +4041,21 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             int isoAt30 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver30Ns));
             int isoAt20 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver20Ns));
 
-            if (isoAt120 <= Math.min(maximumIso, 1600)) {
+            if (isoAt120 < minimumIso) {
+                /*
+                 * Build 26213 bright-scene correction:
+                 *
+                 * 1/120 is not a fastest-shutter limit. If preserving preview
+                 * exposure energy at 1/120 would require ISO below the sensor
+                 * minimum, hold minimum ISO and shorten shutter continuously.
+                 */
+                desiredMotionExposureNs =
+                        Math.round(
+                                previewEnergy
+                                        / Math.max(1, minimumIso)
+                                        * 1_000_000_000.0
+                        );
+            } else if (isoAt120 <= Math.min(maximumIso, 1600)) {
                 desiredMotionExposureNs = oneOver120Ns;
             } else if (isoAt60 <= Math.min(maximumIso, 3200)) {
                 desiredMotionExposureNs = oneOver60Ns;
@@ -4062,8 +4076,11 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     + " previewExposureNs=" + latestPreviewExposureNs
                     + " previewIso=" + latestPreviewIso
                     + " previewEnergy=" + previewEnergy
-                    + " isoAt120=" + isoAt120
-                    + " isoAt60=" + isoAt60
+                    + " minimumIso=" + minimumIso
+                            + " brightContinuous="
+                            + (isoAt120 < minimumIso)
+                            + " isoAt120=" + isoAt120
+                            + " isoAt60=" + isoAt60
                     + " isoAt30=" + isoAt30
                     + " isoAt20=" + isoAt20
                     + " selectedExposureNs=" + desiredMotionExposureNs
