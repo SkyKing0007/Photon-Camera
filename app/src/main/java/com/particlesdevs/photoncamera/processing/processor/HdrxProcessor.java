@@ -444,6 +444,8 @@ public class HdrxProcessor extends ProcessorBase {
         float motionContributionBelow8 = 0.0f;
         float motionContributionBelow12 = 0.0f;
         float motionContributionBelow16 = 0.0f;
+        ArrayList<Float> motionPerFrameContributionDeltaMean =
+                new ArrayList<>();
 
         Log.d(TAG, "Packing");
         //WrapperAl.packImages();
@@ -504,6 +506,10 @@ public class HdrxProcessor extends ProcessorBase {
             motionContributionBelow16 =
                     pyramidMerging
                             .getMotionContributionBelow16();
+
+            motionPerFrameContributionDeltaMean =
+                    pyramidMerging
+                            .getMotionPerFrameContributionDeltaMean();
 
             output = pyramidMerging.Output;
             pyramidMerging.close();
@@ -586,6 +592,149 @@ public class HdrxProcessor extends ProcessorBase {
 
         processingParameters.subpixelSampleDiversity =
                 0.0f;
+
+        if (cameraMode == CameraMode.MOTION) {
+            double slowShutterContributionSum = 0.0;
+            int slowShutterContributionCount = 0;
+            double fastShutterContributionSum = 0.0;
+            int fastShutterContributionCount = 0;
+
+            double blurSum = 0.0;
+            double contributionSum = 0.0;
+            double blurContributionSum = 0.0;
+            double blurSquareSum = 0.0;
+            double contributionSquareSum = 0.0;
+            int correlationCount = 0;
+
+            for (int i = 1; i < images.size(); i++) {
+                ImageFrame frame = images.get(i);
+                int diagnosticIndex = i - 1;
+
+                float contributionDelta =
+                        diagnosticIndex
+                                        < motionPerFrameContributionDeltaMean
+                                                .size()
+                                ? motionPerFrameContributionDeltaMean
+                                        .get(diagnosticIndex)
+                                : frame.diagnosticContributionDeltaMean;
+
+                float gyroShakiness =
+                        frame.frameGyro != null
+                                ? frame.frameGyro.shakiness
+                                : 0.0f;
+
+                double shutterMs =
+                        frame.diagnosticExposureNs > 0L
+                                ? frame.diagnosticExposureNs
+                                        / 1_000_000.0
+                                : 0.0;
+
+                double blurProduct =
+                        shutterMs
+                                * Math.max(
+                                        gyroShakiness,
+                                        frame.diagnosticOisMotion
+                                );
+
+                if (shutterMs >= 45.0) {
+                    slowShutterContributionSum +=
+                            contributionDelta;
+                    slowShutterContributionCount++;
+                } else {
+                    fastShutterContributionSum +=
+                            contributionDelta;
+                    fastShutterContributionCount++;
+                }
+
+                blurSum += blurProduct;
+                contributionSum += contributionDelta;
+                blurContributionSum +=
+                        blurProduct * contributionDelta;
+                blurSquareSum +=
+                        blurProduct * blurProduct;
+                contributionSquareSum +=
+                        contributionDelta * contributionDelta;
+                correlationCount++;
+            }
+
+            double slowMean =
+                    slowShutterContributionCount > 0
+                            ? slowShutterContributionSum
+                                    / slowShutterContributionCount
+                            : Double.NaN;
+
+            double fastMean =
+                    fastShutterContributionCount > 0
+                            ? fastShutterContributionSum
+                                    / fastShutterContributionCount
+                            : Double.NaN;
+
+            double correlationNumerator =
+                    correlationCount
+                                    * blurContributionSum
+                            - blurSum * contributionSum;
+
+            double correlationDenominator =
+                    Math.sqrt(
+                            Math.max(
+                                    0.0,
+                                    (
+                                            correlationCount
+                                                    * blurSquareSum
+                                            - blurSum * blurSum
+                                    )
+                                            * (
+                                                    correlationCount
+                                                            * contributionSquareSum
+                                                    - contributionSum
+                                                            * contributionSum
+                                            )
+                            )
+                    );
+
+            double blurContributionCorrelation =
+                    correlationCount >= 2
+                                    && correlationDenominator > 1e-12
+                            ? correlationNumerator
+                                    / correlationDenominator
+                            : Double.NaN;
+
+            processingParameters.temporalPerFrameDiagnosticCount =
+                    motionPerFrameContributionDeltaMean.size();
+
+            processingParameters
+                    .temporalSlowShutterContributionMean =
+                    (float) slowMean;
+
+            processingParameters
+                    .temporalFastShutterContributionMean =
+                    (float) fastMean;
+
+            processingParameters
+                    .temporalBlurContributionCorrelation =
+                    (float) blurContributionCorrelation;
+
+            Log.d(
+                    TAG,
+                    "MOTION_26215_SLOW_SHUTTER_CORRELATION"
+                            + " slowThresholdMs=45.0"
+                            + " slowCount="
+                            + slowShutterContributionCount
+                            + " slowContributionMean="
+                            + slowMean
+                            + " fastCount="
+                            + fastShutterContributionCount
+                            + " fastContributionMean="
+                            + fastMean
+                            + " blurContributionCorrelation="
+                            + blurContributionCorrelation
+                            + " correlationDefinition="
+                            + "pearsonShutterMotionVsContribution"
+                            + " perFrameDiagnostics="
+                            + motionPerFrameContributionDeltaMean
+                                    .size()
+            );
+        }
 
         processingParameters.noiseModeler.computeStackingNoiseModel(
                 processingParameters.effectiveFrameCount

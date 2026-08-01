@@ -118,6 +118,14 @@ public class Parameters {
     public float localContributionBelow12 = 0.0f;
     public float localContributionBelow16 = 0.0f;
 
+    /*
+     * Build 26215 aggregate temporal diagnostics.
+     */
+    public int temporalPerFrameDiagnosticCount = 0;
+    public float temporalSlowShutterContributionMean = Float.NaN;
+    public float temporalFastShutterContributionMean = Float.NaN;
+    public float temporalBlurContributionCorrelation = Float.NaN;
+
     /**
      * Placeholder diagnostics for the planned same-size handheld
      * multi-frame super-resolution stage. Build 26158 does not alter output
@@ -988,6 +996,10 @@ public class Parameters {
                 "\n ContributionBelow8=" + FltFormat(localContributionBelow8) +
                 "\n ContributionBelow12=" + FltFormat(localContributionBelow12) +
                 "\n ContributionBelow16=" + FltFormat(localContributionBelow16) +
+                "\n TemporalPerFrameDiagnosticCount=" + temporalPerFrameDiagnosticCount +
+                "\n TemporalSlowShutterContributionMean=" + FltFormat(temporalSlowShutterContributionMean) +
+                "\n TemporalFastShutterContributionMean=" + FltFormat(temporalFastShutterContributionMean) +
+                "\n TemporalBlurContributionCorrelation=" + FltFormat(temporalBlurContributionCorrelation) +
                 "\n CameraID=" + PhotonCamera.getSettings().mCameraID +
                 "\n DenoiseOn=" + PhotonCamera.getSettings().hdrxNR +
                 "\n Sharp=" + FltFormat(PreferenceKeys.getSharpnessValue()) +

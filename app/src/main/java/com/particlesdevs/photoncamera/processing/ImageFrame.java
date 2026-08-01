@@ -23,6 +23,19 @@ public class ImageFrame {
     public int number;
     public IsoExpoSelector.ExpoPair pair;
 
+    /*
+     * Build 26215 diagnostic-only metadata. These fields do not alter merge
+     * selection or rendering.
+     */
+    public long diagnosticExposureNs = 0L;
+    public int diagnosticIso = 0;
+    public float diagnosticOisMotion = 0.0f;
+    public float diagnosticContributionDeltaMean = 0.0f;
+    public float diagnosticContributionCumulativeMean = 1.0f;
+    public float diagnosticContributionCumulativeP10 = 1.0f;
+    public float diagnosticContributionCumulativeP25 = 1.0f;
+    public float diagnosticLowContributionFraction = 0.0f;
+
     public long getTimestamp() {
         return timestamp;
     }

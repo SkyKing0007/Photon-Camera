@@ -372,6 +372,18 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             new HashMap<>();
 
     /*
+     * Build 26215 integrated temporal-stack diagnostics.
+     * OIS motion and delivery counters remain capture-local and do not alter
+     * frame selection or processing.
+     */
+    private final HashMap<Long, Float> mMotionBurstOisMotion =
+            new HashMap<>();
+    private volatile int mMotionDiagnosticSubmittedFrames = 0;
+    private volatile int mMotionDiagnosticCompletedResults = 0;
+    private volatile int mMotionDiagnosticMatchedRawFrames = 0;
+    private volatile int mMotionDiagnosticCaptureFailures = 0;
+
+    /*
      * Build 26166:
      *
      * Keep the four-channel dynamic black level belonging to every
@@ -3708,6 +3720,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
         mMotionBurstPendingFrames.remove(timestamp);
         mMotionBurstFrames.add(frame);
+        mMotionDiagnosticMatchedRawFrames++;
 
         Log.d(
                 MOTION_LOG_TAG,
@@ -4852,6 +4865,18 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
                     actualPair.layerMpy = 1.0f;
                     completedFrame.pair = actualPair;
+                    completedFrame.diagnosticExposureNs =
+                            actualPair.exposure;
+                    completedFrame.diagnosticIso =
+                            actualPair.iso;
+                    Float actualOisMotion =
+                            mMotionBurstOisMotion.get(
+                                    completedFrame.timestamp
+                            );
+                    completedFrame.diagnosticOisMotion =
+                            actualOisMotion != null
+                                    ? actualOisMotion
+                                    : 0.0f;
                     IsoExpoSelector.fullpairs.add(actualPair);
 
                     Log.d(MOTION_LOG_TAG,
@@ -4862,6 +4887,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 }
                 mMotionBurstExposureTimeNs.clear();
                 mMotionBurstSensitivity.clear();
+                mMotionBurstOisMotion.clear();
                 mMotionPreselectedExposureTimeNs.clear();
                 mMotionPreselectedSensitivity.clear();
             }
@@ -4893,6 +4919,25 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     "COMBINED_EXPOSURE_MAP_READY"
                             + " frames=" + completedFrames.size()
                             + " entries=" + mExposures.size()
+            );
+
+            Log.d(
+                    MOTION_LOG_TAG,
+                    "MOTION_26215_DELIVERY_SUMMARY"
+                            + " submitted="
+                            + mMotionDiagnosticSubmittedFrames
+                            + " completedResults="
+                            + mMotionDiagnosticCompletedResults
+                            + " matchedRaw="
+                            + mMotionDiagnosticMatchedRawFrames
+                            + " finalFrames="
+                            + completedFrames.size()
+                            + " pendingRaw="
+                            + mMotionBurstPendingFrames.size()
+                            + " captureFailures="
+                            + mMotionDiagnosticCaptureFailures
+                            + " cameraSequence="
+                            + cameraSequenceFrameCount
             );
 
             /*
@@ -5440,7 +5485,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     closePendingMotionFramesLocked();
                     mMotionBurstExposureTimeNs.clear();
                     mMotionBurstSensitivity.clear();
+                    mMotionBurstOisMotion.clear();
                     mMotionBurstDynamicBlackLevel.clear();
+                    mMotionDiagnosticSubmittedFrames = Math.max(1, frameCount);
+                    mMotionDiagnosticCompletedResults = 0;
+                    mMotionDiagnosticMatchedRawFrames = 0;
+                    mMotionDiagnosticCaptureFailures = 0;
                     mMotionValidatedBlackLevel = null;
                     mMotionValidatedBlackLevelSource =
                             "collecting";
@@ -5534,6 +5584,25 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                     mMotionBurstSensitivity.put(
                                             (long) time, iso);
 
+                                    float controlledOisMotion = 0.0f;
+                                    if (Build.VERSION.SDK_INT
+                                            >= Build.VERSION_CODES.P) {
+                                        OisSample[] controlledOisSamples =
+                                                result.get(
+                                                        CaptureResult
+                                                                .STATISTICS_OIS_SAMPLES
+                                                );
+                                        controlledOisMotion =
+                                                calculateOisMotion(
+                                                        controlledOisSamples
+                                                );
+                                    }
+                                    mMotionBurstOisMotion.put(
+                                            (long) time,
+                                            controlledOisMotion
+                                    );
+                                    mMotionDiagnosticCompletedResults++;
+
                                     float[] dynamicBlackLevel =
                                             result.get(
                                                     CaptureResult
@@ -5603,12 +5672,23 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                         ? Math.log(actualEnergy / requestedEnergy) / Math.log(2.0)
                                         : Double.NaN;
 
+                                Float controlledOisMotion =
+                                        mMotionBurstOisMotion.get(
+                                                (long) time
+                                        );
                                 Log.d(MOTION_LOG_TAG,"CONTROLLED_RESULT"
+                                        + " frameIndex=" + frameCount
                                         + " timestamp=" + time
                                         + " requestedExposureNs=" + requestedExposureNs
                                         + " requestedIso=" + requestedIso
                                         + " actualExposureNs=" + actualExposureNs
                                         + " actualIso=" + iso
+                                        + " oisMotion="
+                                        + (
+                                            controlledOisMotion != null
+                                                    ? controlledOisMotion
+                                                    : 0.0f
+                                        )
                                         + " resultDifferenceEv=" + resultDifferenceEv);
                             }
                         }
@@ -5623,6 +5703,28 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     //if(frameCount == 0)
                         mCaptureResult = result;
                     if (maxFrameCount[0] != -1) PhotonCamera.getGyro().CaptureGyroBurst();
+                }
+
+                @Override
+                public void onCaptureFailed(
+                        @NonNull CameraCaptureSession session,
+                        @NonNull CaptureRequest request,
+                        @NonNull CaptureFailure failure
+                ) {
+                    if (PhotonCamera.getSettings().selectedMode
+                            == CameraMode.MOTION) {
+                        mMotionDiagnosticCaptureFailures++;
+                        Log.w(
+                                MOTION_LOG_TAG,
+                                "CONTROLLED_CAPTURE_FAILED"
+                                        + " frameNumber="
+                                        + failure.getFrameNumber()
+                                        + " reason="
+                                        + failure.getReason()
+                                        + " wasImageCaptured="
+                                        + failure.wasImageCaptured()
+                        );
+                    }
                 }
 
                 @Override

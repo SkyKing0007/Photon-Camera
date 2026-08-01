@@ -277,6 +277,16 @@ public class PyramidMerging extends GLOneScript {
     private float motionContributionBelow8 = 0.0f;
     private float motionContributionBelow12 = 0.0f;
     private float motionContributionBelow16 = 0.0f;
+    private final ArrayList<Float> motionPerFrameContributionDeltaMean =
+            new ArrayList<>();
+    private final ArrayList<Float> motionPerFrameContributionCumulativeMean =
+            new ArrayList<>();
+    private final ArrayList<Float> motionPerFrameContributionCumulativeP10 =
+            new ArrayList<>();
+    private final ArrayList<Float> motionPerFrameContributionCumulativeP25 =
+            new ArrayList<>();
+    private final ArrayList<Float> motionPerFrameLowContributionFraction =
+            new ArrayList<>();
     //GLTexture noiseMap;
     GLUtils.Pyramid pyramid;
     GLUtils.Pyramid pyramidBase;
@@ -377,6 +387,26 @@ public class PyramidMerging extends GLOneScript {
         return motionContributionBelow16;
     }
 
+    public ArrayList<Float> getMotionPerFrameContributionDeltaMean() {
+        return new ArrayList<>(motionPerFrameContributionDeltaMean);
+    }
+
+    public ArrayList<Float> getMotionPerFrameContributionCumulativeMean() {
+        return new ArrayList<>(motionPerFrameContributionCumulativeMean);
+    }
+
+    public ArrayList<Float> getMotionPerFrameContributionCumulativeP10() {
+        return new ArrayList<>(motionPerFrameContributionCumulativeP10);
+    }
+
+    public ArrayList<Float> getMotionPerFrameContributionCumulativeP25() {
+        return new ArrayList<>(motionPerFrameContributionCumulativeP25);
+    }
+
+    public ArrayList<Float> getMotionPerFrameLowContributionFraction() {
+        return new ArrayList<>(motionPerFrameLowContributionFraction);
+    }
+
     private float contributionPercentile(
             int[] histogram,
             long total,
@@ -457,6 +487,108 @@ public class PyramidMerging extends GLOneScript {
                 0.0f,
                 1.0f
         );
+    }
+
+    private float[] measureMotionContributionSnapshot(
+            int retainedFrames
+    ) {
+        if (motionContributionMap == null || retainedFrames <= 0) {
+            return null;
+        }
+
+        final int histogramSize = 256;
+        GLHistogram contributionHistogram =
+                new GLHistogram(
+                        glProg,
+                        histogramSize
+                );
+
+        contributionHistogram.Rc = true;
+        contributionHistogram.Gc = false;
+        contributionHistogram.Bc = false;
+        contributionHistogram.Ac = false;
+        contributionHistogram.resize = 4;
+        contributionHistogram.exposure[0] = 1.0f;
+
+        int[][] histogramOutput =
+                contributionHistogram.Compute(
+                        motionContributionMap
+                );
+
+        contributionHistogram.close();
+
+        int[] histogram =
+                histogramOutput != null
+                                && histogramOutput.length > 0
+                        ? histogramOutput[0]
+                        : null;
+
+        if (histogram == null || histogram.length == 0) {
+            return null;
+        }
+
+        long total = 0L;
+        double weightedRatio = 0.0;
+
+        for (int i = 0; i < histogram.length; i++) {
+            int count = Math.max(0, histogram[i]);
+            total += count;
+            weightedRatio +=
+                    (
+                            (double) i
+                                    / (double) Math.max(
+                                            1,
+                                            histogram.length - 1
+                                    )
+                    )
+                            * count;
+        }
+
+        if (total <= 0L) {
+            return null;
+        }
+
+        float mean =
+                Math2.clamp(
+                        (float) (weightedRatio / total)
+                                * retainedFrames,
+                        1.0f,
+                        retainedFrames
+                );
+
+        float p10 =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        0.10f,
+                        retainedFrames
+                );
+
+        float p25 =
+                contributionPercentile(
+                        histogram,
+                        total,
+                        0.25f,
+                        retainedFrames
+                );
+
+        float belowHalf =
+                contributionBelow(
+                        histogram,
+                        total,
+                        Math.max(
+                                2.0f,
+                                retainedFrames * 0.50f
+                        ),
+                        retainedFrames
+                );
+
+        return new float[]{
+                mean,
+                p10,
+                p25,
+                belowHalf
+        };
     }
 
     private void analyzeMotionContribution(
@@ -1286,6 +1418,107 @@ public class PyramidMerging extends GLOneScript {
             //glProg.setVar("exposure", exposure);
             //glProg.setVar("weight",  1.0f);
             glProg.computeAuto(base.mSize, 1);
+
+            if (trackMotionContribution) {
+                float[] snapshot =
+                        measureMotionContributionSnapshot(
+                                images.size()
+                        );
+
+                if (snapshot != null) {
+                    float previousMean =
+                            motionPerFrameContributionCumulativeMean
+                                    .isEmpty()
+                                    ? 1.0f
+                                    : motionPerFrameContributionCumulativeMean
+                                            .get(
+                                                    motionPerFrameContributionCumulativeMean
+                                                            .size() - 1
+                                            );
+
+                    float deltaMean =
+                            Math.max(
+                                    0.0f,
+                                    snapshot[0] - previousMean
+                            );
+
+                    frame.diagnosticContributionDeltaMean =
+                            deltaMean;
+                    frame.diagnosticContributionCumulativeMean =
+                            snapshot[0];
+                    frame.diagnosticContributionCumulativeP10 =
+                            snapshot[1];
+                    frame.diagnosticContributionCumulativeP25 =
+                            snapshot[2];
+                    frame.diagnosticLowContributionFraction =
+                            snapshot[3];
+
+                    motionPerFrameContributionDeltaMean.add(
+                            deltaMean
+                    );
+                    motionPerFrameContributionCumulativeMean.add(
+                            snapshot[0]
+                    );
+                    motionPerFrameContributionCumulativeP10.add(
+                            snapshot[1]
+                    );
+                    motionPerFrameContributionCumulativeP25.add(
+                            snapshot[2]
+                    );
+                    motionPerFrameLowContributionFraction.add(
+                            snapshot[3]
+                    );
+
+                    float gyroShakiness =
+                            frame.frameGyro != null
+                                    ? frame.frameGyro.shakiness
+                                    : 0.0f;
+
+                    double shutterMs =
+                            frame.diagnosticExposureNs > 0L
+                                    ? frame.diagnosticExposureNs
+                                            / 1_000_000.0
+                                    : 0.0;
+
+                    double blurExposureProduct =
+                            shutterMs
+                                    * Math.max(
+                                            gyroShakiness,
+                                            frame.diagnosticOisMotion
+                                    );
+
+                    Log.d(
+                            Name,
+                            "MOTION_26215_PER_FRAME_CONTRIBUTION"
+                                    + " mergeOrder=" + f
+                                    + " sourceIndex=" + ind
+                                    + " timestamp=" + frame.timestamp
+                                    + " exposureNs="
+                                    + frame.diagnosticExposureNs
+                                    + " iso=" + frame.diagnosticIso
+                                    + " gyroShakiness="
+                                    + gyroShakiness
+                                    + " oisMotion="
+                                    + frame.diagnosticOisMotion
+                                    + " shutterMs="
+                                    + shutterMs
+                                    + " blurExposureProduct="
+                                    + blurExposureProduct
+                                    + " contributionDeltaMean="
+                                    + deltaMean
+                                    + " cumulativeMean="
+                                    + snapshot[0]
+                                    + " cumulativeP10="
+                                    + snapshot[1]
+                                    + " cumulativeP25="
+                                    + snapshot[2]
+                                    + " lowContributionFraction="
+                                    + snapshot[3]
+                                    + " ghostingAlignmentProxy="
+                                    + snapshot[3]
+                    );
+                }
+            }
         }
 
         if (trackMotionContribution) {
