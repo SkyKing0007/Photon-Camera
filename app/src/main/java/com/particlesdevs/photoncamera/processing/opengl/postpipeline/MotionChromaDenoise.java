@@ -25,10 +25,10 @@ public class MotionChromaDenoise extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 1.0f,
-            defaultValue = 0.34f,
+            defaultValue = 0.30f,
             step = 0.01f
     )
-    float motionChromaCleanupMaximum = 0.34f;
+    float motionChromaCleanupMaximum = 0.30f;
 
     @Tunable(
             title = "Motion chroma radius",
@@ -36,10 +36,10 @@ public class MotionChromaDenoise extends Node {
             category = "Motion Noise Tuning",
             min = 4,
             max = 48,
-            defaultValue = 16,
+            defaultValue = 8,
             step = 1
     )
-    int motionChromaRadiusPixels = 16;
+    int motionChromaRadiusPixels = 8;
 
     @Tunable(
             title = "Motion chroma guide tolerance",
@@ -112,9 +112,28 @@ public class MotionChromaDenoise extends Node {
                         1.0f
                 );
 
+        float measuredRatio =
+                basePipeline.mParameters.localContributionMeasured
+                        ? basePipeline.mParameters.effectiveStackRatio
+                        : 1.0f;
+
+        float lowConfidence =
+                Math2.clamp(
+                        1.0f - measuredRatio,
+                        0.0f,
+                        1.0f
+                );
+
         float strength =
                 motionChromaCleanupMaximum
                         * highIsoBlend;
+
+        strength *=
+                Math2.mix(
+                        0.72f,
+                        1.0f,
+                        Math.max(highIsoBlend, lowConfidence)
+                );
 
         if (strength <= 0.001f) {
             Log.d(
@@ -137,17 +156,35 @@ public class MotionChromaDenoise extends Node {
                         highIsoBlend
                 );
 
+        int adaptiveRadiusPixels;
+
+        if (motionIso >= 4000.0f || lowConfidence >= 0.35f) {
+            adaptiveRadiusPixels = 12;
+        } else if (motionIso >= 1800.0f || lowConfidence >= 0.20f) {
+            adaptiveRadiusPixels = 8;
+        } else {
+            adaptiveRadiusPixels = 4;
+        }
+
+        adaptiveRadiusPixels =
+                Math.min(
+                        motionChromaRadiusPixels + 4,
+                        adaptiveRadiusPixels
+                );
+
         int sampleStep =
                 Math.max(
                         1,
                         Math.round(
-                                motionChromaRadiusPixels
-                                        / 4.0f
+                                adaptiveRadiusPixels / 4.0f
                         )
                 );
 
-        int actualRadiusPixels =
-                sampleStep * 4;
+        int actualRadiusPixels = sampleStep * 4;
+
+        boolean useSecondPass =
+                motionIso >= 2800.0f
+                        || lowConfidence >= 0.30f;
 
         configurePass(
                 0,
@@ -175,6 +212,24 @@ public class MotionChromaDenoise extends Node {
         );
 
         glProg.closed = true;
+
+        if (!useSecondPass) {
+            WorkingTexture = basePipeline.main3;
+
+            Log.d(
+                    Name,
+                    "MOTION_26217_ADAPTIVE_CHROMA"
+                            + " iso=" + motionIso
+                            + " effectiveRatio=" + measuredRatio
+                            + " lowConfidence=" + lowConfidence
+                            + " strength=" + strength
+                            + " radiusPixels=" + actualRadiusPixels
+                            + " passes=1"
+                            + " detailPreserving=true"
+            );
+
+            return;
+        }
 
         configurePass(
                 1,
@@ -214,7 +269,7 @@ public class MotionChromaDenoise extends Node {
                         + " highIsoBlend=" + highIsoBlend
                         + " strength=" + strength
                         + " guideSigma=" + guideSigma
-                        + " passes=2"
+                        + " passes=" + (useSecondPass ? 2 : 1)
                         + " kernelRadiusSamples=4"
                         + " sampleStepPixels=" + sampleStep
                         + " requestedRadiusPixels="

@@ -48,10 +48,10 @@ public class Sharpen2 extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 1.0f,
-            defaultValue = 0.60f,
+            defaultValue = 0.45f,
             step = 0.05f
     )
-    float motionFinalSharpeningFloor = 0.60f;
+    float motionFinalSharpeningFloor = 0.45f;
     @Override
     public void Run() {
         glProg.setDefine("INTENSE",denoiseActivity);
@@ -103,8 +103,8 @@ public class Sharpen2 extends Node {
 
             temporalConfidenceScale =
                     com.particlesdevs.photoncamera.util.Math2.clamp(
-                            0.30f + 0.70f * measuredRatio,
-                            0.30f,
+                            0.20f + 0.80f * measuredRatio,
+                            0.20f,
                             1.0f
                     );
         }
@@ -114,7 +114,7 @@ public class Sharpen2 extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26216_FINAL_SHARP_CONFIDENCE"
+                "MOTION_26217_FINAL_SHARP_CONFIDENCE"
                         + " effectiveRatio="
                         + basePipeline.mParameters.effectiveStackRatio
                         + " measured="

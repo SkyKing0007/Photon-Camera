@@ -4153,6 +4153,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             int isoAt30 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver30Ns));
             int isoAt20 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver20Ns));
 
+            double adaptiveBrightHeadroomEv = 0.0;
+
             if (isoAt120 < minimumIso) {
                 /*
                  * Build 26213 bright-scene correction:
@@ -4161,12 +4163,49 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                  * exposure energy at 1/120 would require ISO below the sensor
                  * minimum, hold minimum ISO and shorten shutter continuously.
                  */
+                final double brightnessBeyondMinimumIso =
+                        Math.max(
+                                1.0,
+                                minimumIso
+                                        / Math.max(
+                                                1.0,
+                                                isoAt120
+                                        )
+                        );
+
+                adaptiveBrightHeadroomEv =
+                        brightnessBeyondMinimumIso >= 4.0
+                                ? 0.20
+                                : (
+                                    brightnessBeyondMinimumIso >= 2.0
+                                            ? 0.10
+                                            : 0.0
+                                );
+
                 final double brightSceneHeadroomMultiplier =
-                        Math.pow(2.0, -0.6);
+                        Math.pow(
+                                2.0,
+                                -adaptiveBrightHeadroomEv
+                        );
 
                 final double brightSceneCaptureEnergy =
                         previewEnergy
                                 * brightSceneHeadroomMultiplier;
+
+                Log.d(
+                        MOTION_LOG_TAG,
+                        "MOTION_26217_ADAPTIVE_HEADROOM"
+                                + " isoAt120=" + isoAt120
+                                + " minimumIso=" + minimumIso
+                                + " brightnessRatio="
+                                + brightnessBeyondMinimumIso
+                                + " headroomEv="
+                                + adaptiveBrightHeadroomEv
+                                + " previewEnergy="
+                                + previewEnergy
+                                + " captureEnergy="
+                                + brightSceneCaptureEnergy
+                );
 
                 desiredMotionExposureNs =
                         Math.round(
@@ -4199,7 +4238,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                             + " brightContinuous="
                             + (isoAt120 < minimumIso)
                             + " brightHeadroomEv="
-                            + (isoAt120 < minimumIso ? 0.6 : 0.0)
+                            + adaptiveBrightHeadroomEv
                             + " isoAt120=" + isoAt120
                             + " isoAt60=" + isoAt60
                     + " isoAt30=" + isoAt30

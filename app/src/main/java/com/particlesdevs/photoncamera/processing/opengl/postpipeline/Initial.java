@@ -254,14 +254,19 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
         glProg.setDefine("NEUTRALPOINT",WP);
         glProg.setDefine("INSIZE",basePipeline.workSize);
         glProg.setDefine("CONTRAST", (float) basePipeline.mSettings.contrastMpy);
-        float appliedShadows =
-                (float) basePipeline.mSettings.shadows;
+        boolean motionToneRecovery =
+                basePipeline.mSettings.selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
 
-        /*
-         * Build 26216:
-         * Remove the extra Motion-only -0.10 shadow penalty. The configured
-         * shadow value now passes through unchanged.
-         */
+        float appliedShadows =
+                (float) basePipeline.mSettings.shadows
+                        + (motionToneRecovery ? 0.12f : 0.0f);
+
+        float appliedLtmMix =
+                motionToneRecovery
+                        ? Math.max(ltmMix, 0.18f)
+                        : ltmMix;
+
         glProg.setDefine("SHADOWS", appliedShadows);
         Log.d(
                 Name,
@@ -273,7 +278,17 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
                         + " highlightsUnchanged=true"
         );
         glProg.setDefine("VIGNETTE", vignetteCorrection);
-        glProg.setDefine("LTMMIX", ltmMix);
+        glProg.setDefine("LTMMIX", appliedLtmMix);
+        Log.d(
+                Name,
+                "MOTION_26217_TONE_RECOVERY"
+                        + " motion=" + motionToneRecovery
+                        + " configuredShadows="
+                        + basePipeline.mSettings.shadows
+                        + " appliedShadows=" + appliedShadows
+                        + " configuredLtmMix=" + ltmMix
+                        + " appliedLtmMix=" + appliedLtmMix
+        );
         float[][] cube = null;
         ColorCorrectionTransform.CorrectionMode mode =  basePipeline.mParameters.CCT.correctionMode;
         if(mode == ColorCorrectionTransform.CorrectionMode.CUBES || mode == ColorCorrectionTransform.CorrectionMode.CUBE){

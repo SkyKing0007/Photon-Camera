@@ -14,10 +14,10 @@ public class CaptureSharpening extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 1.0f,
-            defaultValue = 0.55f,
+            defaultValue = 0.45f,
             step = 0.05f
     )
-    float motionCaptureSharpeningFloor = 0.55f;
+    float motionCaptureSharpeningFloor = 0.45f;
 
     public CaptureSharpening() {
         super("", "CaptureSharpening");
@@ -76,8 +76,8 @@ public class CaptureSharpening extends Node {
 
             temporalConfidenceScale =
                     com.particlesdevs.photoncamera.util.Math2.clamp(
-                            0.35f + 0.65f * measuredRatio,
-                            0.35f,
+                            0.25f + 0.75f * measuredRatio,
+                            0.25f,
                             1.0f
                     );
         }
@@ -87,7 +87,7 @@ public class CaptureSharpening extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26216_CAPTURE_SHARP_CONFIDENCE"
+                "MOTION_26217_CAPTURE_SHARP_CONFIDENCE"
                         + " effectiveRatio="
                         + basePipeline.mParameters.effectiveStackRatio
                         + " measured="
