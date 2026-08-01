@@ -4035,74 +4035,44 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             final long oneOver20Ns = 50_000_000L;
             final long oneOver15Ns = 66_666_667L;
 
-            if (latestPreviewExposureNs <= 10_000_000L) {
+            /* Build 26212: fastest shutter whose required ISO remains reasonable. */
+            int isoAt120 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver120Ns));
+            int isoAt60 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver60Ns));
+            int isoAt30 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver30Ns));
+            int isoAt20 = (int) Math.round(previewEnergy / ExposureIndex.time2sec(oneOver20Ns));
+
+            if (isoAt120 <= Math.min(maximumIso, 1600)) {
                 desiredMotionExposureNs = oneOver120Ns;
-            } else if (latestPreviewExposureNs <= 24_000_000L) {
+            } else if (isoAt60 <= Math.min(maximumIso, 3200)) {
                 desiredMotionExposureNs = oneOver60Ns;
-            } else if (latestPreviewExposureNs <= 42_000_000L) {
+            } else if (isoAt30 <= Math.min(maximumIso, 5000)) {
                 desiredMotionExposureNs = oneOver30Ns;
-            } else if (latestPreviewExposureNs <= 58_000_000L) {
+            } else if (isoAt20 <= Math.min(maximumIso, 6400)) {
                 desiredMotionExposureNs = oneOver20Ns;
             } else {
                 desiredMotionExposureNs = oneOver15Ns;
             }
 
-            desiredMotionExposureNs = Math.max(
-                    minimumExposureNs,
-                    Math.min(
-                            maximumExposureNs,
-                            desiredMotionExposureNs
-                    )
-            );
+            desiredMotionExposureNs = Math.max(minimumExposureNs,Math.min(maximumExposureNs,desiredMotionExposureNs));
+            desiredMotionIso = (int) Math.round(previewEnergy / ExposureIndex.time2sec(desiredMotionExposureNs));
+            desiredMotionIso = Math.max(minimumIso,Math.min(maximumIso,desiredMotionIso));
 
-            desiredMotionIso = (int) Math.round(
-                    previewEnergy
-                            / ExposureIndex.time2sec(
-                                    desiredMotionExposureNs
-                            )
-            );
-
-            desiredMotionIso = Math.max(
-                    minimumIso,
-                    Math.min(maximumIso, desiredMotionIso)
-            );
-
-            Log.d(
-                    MOTION_LOG_TAG,
-                    "MOTION_SHUTTER_LADDER_DECISION"
-                            + " camera=" + physicalID
-                            + " aeExposureNs="
-                            + latestPreviewExposureNs
-                            + " aeIso="
-                            + latestPreviewIso
-                            + " targetExposureNs="
-                            + desiredMotionExposureNs
-                            + " targetIso="
-                            + desiredMotionIso
-            );
+            Log.d(MOTION_LOG_TAG,"MOTION_ADAPTIVE_LADDER_26212"
+                    + " camera=" + physicalID
+                    + " previewExposureNs=" + latestPreviewExposureNs
+                    + " previewIso=" + latestPreviewIso
+                    + " previewEnergy=" + previewEnergy
+                    + " isoAt120=" + isoAt120
+                    + " isoAt60=" + isoAt60
+                    + " isoAt30=" + isoAt30
+                    + " isoAt20=" + isoAt20
+                    + " selectedExposureNs=" + desiredMotionExposureNs
+                    + " selectedIso=" + desiredMotionIso);
         } else {
-            desiredMotionExposureNs =
-                    selectorMotionPair != null
-                            ? selectorMotionPair.exposure
-                            : maximumExposureNs;
-
-            desiredMotionExposureNs = Math.max(
-                    minimumExposureNs,
-                    Math.min(
-                            maximumExposureNs,
-                            desiredMotionExposureNs
-                    )
-            );
-
-            desiredMotionIso =
-                    selectorMotionPair != null
-                            ? selectorMotionPair.iso
-                            : minimumIso;
-
-            desiredMotionIso = Math.max(
-                    minimumIso,
-                    Math.min(maximumIso, desiredMotionIso)
-            );
+            desiredMotionExposureNs = selectorMotionPair != null ? selectorMotionPair.exposure : maximumExposureNs;
+            desiredMotionExposureNs = Math.max(minimumExposureNs,Math.min(maximumExposureNs,desiredMotionExposureNs));
+            desiredMotionIso = selectorMotionPair != null ? selectorMotionPair.iso : minimumIso;
+            desiredMotionIso = Math.max(minimumIso,Math.min(maximumIso,desiredMotionIso));
         }
 
         /*
@@ -4175,19 +4145,14 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 (int) Math.round(
                         selectedEnergy
                                 / ExposureIndex.time2sec(
-                                        Math.max(1L, photonExposureNs)
+                                        Math.max(1L, desiredMotionExposureNs)
                                 )
                 );
 
-        safetyAdjustedIso = Math.max(
-                minimumIso,
-                Math.min(maximumIso, safetyAdjustedIso)
-        );
+        safetyAdjustedIso = Math.max(minimumIso,Math.min(maximumIso,safetyAdjustedIso));
 
-        desiredMotionExposureNs =
-                photonExposureNs;
-        desiredMotionIso =
-                safetyAdjustedIso;
+        /* Keep the adaptive ladder shutter; use Photon only as an energy safety check. */
+        desiredMotionIso = safetyAdjustedIso;
 
         Log.d(
                 MOTION_LOG_TAG,
@@ -5594,10 +5559,24 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                             (long) time
                                     );
                                 }
-                                Log.d(MOTION_LOG_TAG,
-                                        "CONTROLLED_RESULT timestamp=" + time
-                                                + " exposureNs=" + actualExposureNs
-                                                + " iso=" + iso);
+                                Long requestedExposureNs = request.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+                                Integer requestedIso = request.get(CaptureRequest.SENSOR_SENSITIVITY);
+                                double requestedEnergy = requestedExposureNs != null && requestedExposureNs > 0L
+                                                && requestedIso != null && requestedIso > 0
+                                        ? ExposureIndex.time2sec(requestedExposureNs) * requestedIso
+                                        : 0.0;
+                                double actualEnergy = ExposureIndex.time2sec(actualExposureNs) * iso;
+                                double resultDifferenceEv = requestedEnergy > 0.0 && actualEnergy > 0.0
+                                        ? Math.log(actualEnergy / requestedEnergy) / Math.log(2.0)
+                                        : Double.NaN;
+
+                                Log.d(MOTION_LOG_TAG,"CONTROLLED_RESULT"
+                                        + " timestamp=" + time
+                                        + " requestedExposureNs=" + requestedExposureNs
+                                        + " requestedIso=" + requestedIso
+                                        + " actualExposureNs=" + actualExposureNs
+                                        + " actualIso=" + iso
+                                        + " resultDifferenceEv=" + resultDifferenceEv);
                             }
                         }
                     }
