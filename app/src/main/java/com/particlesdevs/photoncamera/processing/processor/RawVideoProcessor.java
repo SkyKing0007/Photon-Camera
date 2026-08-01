@@ -28,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class RawVideoProcessor extends ProcessorBase {
@@ -46,6 +47,7 @@ public class RawVideoProcessor extends ProcessorBase {
     private DngCreator dngCreator = null;
     private ExecutorService writeExecutor = null;
     private boolean isRecording = false;
+    private volatile boolean outputReady = false;
 
     private long recordingStartMs = 0;    private long availableBytesAtStart = 0;
     private int frameWidth = 0;
@@ -95,13 +97,24 @@ public class RawVideoProcessor extends ProcessorBase {
             availableBytesAtStart = statFs.getAvailableBlocksLong() * statFs.getBlockSizeLong();
         } catch (Exception ignored) {}
         this.callback = callback;
-        // Create output folder if not exists
+        // Create output folder before starting audio, gyro, or frame writes.
+        outputReady = false;
         try {
             Files.createDirectories(outputFolder);
-            if(!PreferenceKeys.isRawVideoWriteZip())
+            if (!PreferenceKeys.isRawVideoWriteZip()) {
                 Files.createDirectories(outputFolder.resolve(".dng"));
+            }
+            outputReady = Files.isDirectory(outputFolder);
+            Log.d(TAG, "RAWVIDEO_OUTPUT_READY path=" + outputFolder
+                    + " ready=" + outputReady
+                    + " zip=" + PreferenceKeys.isRawVideoWriteZip());
         } catch (IOException e) {
-            Log.d(TAG, "Failed to create output directory: " + outputFolder + ", error: " + Log.getStackTraceString(e));
+            Log.e(TAG, "RAWVIDEO_OUTPUT_CREATE_FAILED path=" + outputFolder
+                    + " error=" + Log.getStackTraceString(e));
+            outputReady = false;
+        }
+        if (!outputReady) {
+            return;
         }
         dngBuffers = new ByteBuffer[writeBufferSize];
         writeBufferCounter = 0;
@@ -121,6 +134,11 @@ public class RawVideoProcessor extends ProcessorBase {
     int shift = 0;
     @SuppressLint("DefaultLocale")
     public void videoCycle(Image image) {
+        if (!outputReady) {
+            Log.e(TAG, "RAWVIDEO_FRAME_DROPPED_OUTPUT_NOT_READY");
+            image.close();
+            return;
+        }
         int format = image.getFormat();
         int startCounter = videoCounter;
 
@@ -262,13 +280,42 @@ public class RawVideoProcessor extends ProcessorBase {
 
     public void videoEnd() {
         isRecording = false;
+        Log.d(TAG, "RAWVIDEO_END_BEGIN path=" + outputFolder
+                + " frames=" + videoCounter
+                + " pendingWrites=" + pendingWrites.get());
 
         PhotonCamera.getGyro().stopVideoRecording();
         rawAudioRecorder.stop();
-        if (writeExecutor != null) {
-            writeExecutor.shutdown();
-            dngCreator.closeArchive();
-            writeExecutor = null;
+
+        ExecutorService executor = writeExecutor;
+        writeExecutor = null;
+        if (executor != null) {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    Log.e(TAG, "RAWVIDEO_WRITE_DRAIN_TIMEOUT pendingWrites="
+                            + pendingWrites.get());
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                executor.shutdownNow();
+            }
         }
+
+        if (dngCreator != null) {
+            try {
+                dngCreator.closeArchive();
+            } catch (Exception e) {
+                Log.e(TAG, "RAWVIDEO_ARCHIVE_CLOSE_FAILED "
+                        + Log.getStackTraceString(e));
+            }
+            dngCreator = null;
+        }
+
+        outputReady = false;
+        Log.d(TAG, "RAWVIDEO_END_COMPLETE path=" + outputFolder
+                + " frames=" + videoCounter
+                + " pendingWrites=" + pendingWrites.get());
     }
 }

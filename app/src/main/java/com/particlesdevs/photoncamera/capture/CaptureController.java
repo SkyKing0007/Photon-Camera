@@ -275,6 +275,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     public int cameraRotation;
     public boolean onUnlimited = false;
     public boolean unlimitedStarted = false;
+    private volatile boolean continuousCaptureFinalizing = false;
     public boolean mFlashed = false;
     public ArrayList<GyroBurst> BurstShakiness;
     /**
@@ -1078,6 +1079,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             // This method is called when the camera is opened.  We start camera preview here.
             mCameraOpenCloseLock.release();
             mCameraDevice = cameraDevice;
+            onUnlimited = false;
+            unlimitedStarted = false;
+            continuousCaptureFinalizing = false;
+            mState = STATE_PREVIEW;
             mImageSaver = new ImageSaver(cameraEventsListener);
             createCameraPreviewSession(false);
         }
@@ -2087,6 +2092,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     // When the session is ready, we start displaying the preview.
                     mCaptureSession = cameraCaptureSession;
                     try {
+                        if (mCaptureSession != cameraCaptureSession
+                                || mCameraDevice == null) {
+                            Log.d(TAG, "Ignoring stale preview-session callback: "
+                                    + cameraCaptureSession);
+                            cameraCaptureSession.close();
+                            return;
+                        }
                         // Auto focus should be continuous for camera preview.
                         //mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
                         // Flash is automatically enabled when necessary.
@@ -2118,7 +2130,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                             }
                         } else {
                             //if(mSelectedMode != CameraMode.VIDEO)
-                            mCaptureSession.setRepeatingRequest(
+                            cameraCaptureSession.setRepeatingRequest(
                                     mPreviewInputRequest,
                                     mCaptureCallback,
                                     mBackgroundHandler
@@ -2308,6 +2320,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
      * finished.
      */
     public void unlockFocus() {
+        if (mPreviewRequestBuilder == null
+                || mCaptureSession == null
+                || mBackgroundHandler == null) {
+            Log.d(TAG, "unlockFocus(): ignored while camera session is rebuilding");
+            return;
+        }
+
         try {
             // Reset the auto-focus trigger
             //mCaptureSession.stopRepeating();
@@ -5831,18 +5850,97 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         return (SystemClock.elapsedRealtime() - mCaptureTimer) > PRECAPTURE_TIMEOUT_MS;
     }
 
-    public void callUnlimitedEnd() {
+    public void callUnlimitedEnd(boolean rebuildPreviewAfterStop) {
         onUnlimited = false;
-        //mImageSaver.unlimitedEnd();
-        mBackgroundHandler.post(() -> mImageSaver.processEnd());
-        abortCaptures();
-        createCameraPreviewSession(false);
         unlimitedStarted = false;
+        mState = STATE_PREVIEW;
+
+        /*
+         * Stop camera delivery first, then finish the RAW Video archive before
+         * restartCamera() destroys the current CameraBackground HandlerThread.
+         * This keeps processor state, camera state, and UI state in one ordered
+         * transition instead of allowing old callbacks to cross into Motion.
+         */
+        abortCaptures();
+
+        if (!continuousCaptureFinalizing) {
+            continuousCaptureFinalizing = true;
+            try {
+                if (mImageSaver != null) {
+                    mImageSaver.processEnd();
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "CONTINUOUS_CAPTURE_FINALIZE_FAILED "
+                        + Log.getStackTraceString(e));
+            } finally {
+                continuousCaptureFinalizing = false;
+                Log.d(TAG, "CONTINUOUS_CAPTURE_FINALIZE_COMPLETE_SYNC");
+            }
+        }
+
+        if (rebuildPreviewAfterStop
+                && mCameraDevice != null
+                && mBackgroundHandler != null) {
+            createCameraPreviewSession(false);
+        }
+    }
+
+    public void callUnlimitedEnd() {
+        callUnlimitedEnd(true);
     }
 
     public void callUnlimitedStart() {
+        callUnlimitedStartWithRetry(0);
+    }
+
+    private void callUnlimitedStartWithRetry(int attempt) {
+        if (continuousCaptureFinalizing) {
+            if (attempt < 20) {
+                new Handler(Looper.getMainLooper()).postDelayed(
+                        () -> callUnlimitedStartWithRetry(attempt + 1),
+                        100L
+                );
+            } else {
+                onUnlimited = false;
+                unlimitedStarted = false;
+                Log.w(TAG, "RAW Video start timed out waiting for finalization");
+            }
+            return;
+        }
+
+        if (mPreviewRequestBuilder == null
+                || mCaptureSession == null
+                || mCameraDevice == null
+                || mBackgroundHandler == null) {
+            onUnlimited = false;
+            unlimitedStarted = false;
+
+            if (attempt < 20) {
+                Log.d(TAG, "RAW Video start waiting for camera attempt=" + attempt);
+                new Handler(Looper.getMainLooper()).postDelayed(
+                        () -> callUnlimitedStartWithRetry(attempt + 1),
+                        100L
+                );
+            } else {
+                Log.w(TAG, "RAW Video start timed out waiting for camera");
+            }
+            return;
+        }
+
         onUnlimited = true;
-        takePicture();
+        unlimitedStarted = false;
+
+        /*
+         * RAW Video is a continuous stream, not a single still capture.
+         * After returning from Motion, the generic takePicture()/lockFocus()
+         * state machine can remain waiting on an AF transition that never
+         * arrives. Reset the capture state and enter the proven RAW builder
+         * directly so every recording start follows the same deterministic
+         * path.
+         */
+        mState = STATE_PREVIEW;
+        Log.d(TAG, "RAW Video direct capture start attempt=" + attempt);
+        captureStillPicture();
     }
 
     public void VideoEnd() {

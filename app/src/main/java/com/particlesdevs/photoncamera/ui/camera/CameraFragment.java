@@ -253,6 +253,9 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
         settingsBarEntryProvider.addEntries(cameraFragmentBinding.settingsBar);
         this.mCameraUIView.refresh(CaptureController.isProcessing);
     }
+    void clearTimerFrameCountForModeTransition() {
+        timerFrameCountViewModel.clearFrameTimeCnt();
+    }
 
     @Override
     public void onSaveInstanceState(@NonNull Bundle outState) {
@@ -681,6 +684,11 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
         @Override
         public void onProcessingStarted(String processName) {
             logD("onProcessingStarted: " + processName + " Processing Started");
+            if (PhotonCamera.getSettings().selectedMode == CameraMode.RAWVIDEO) {
+                mCameraUIView.setProcessingProgressBarIndeterminate(false);
+                mCameraUIView.activateShutterButton(true);
+                return;
+            }
             mCameraUIView.setProcessingProgressBarIndeterminate(true);
             mCameraUIView.activateShutterButton(true);
             showNotification(processName);
@@ -704,7 +712,9 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
             mCameraUIView.setProcessingProgressBarIndeterminate(false);
             mCameraUIView.activateShutterButton(true);
             mCameraUIView.lockUIForBurst(false);
-            stopNotification();
+            if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                stopNotification();
+            }
 
         }
 

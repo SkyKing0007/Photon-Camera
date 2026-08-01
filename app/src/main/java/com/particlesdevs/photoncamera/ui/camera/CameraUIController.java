@@ -38,6 +38,24 @@ final class CameraUIController implements CameraUIEventsListener,
         this.cameraFragment = cameraFragment;
     }
 
+    private void restoreVideoIdleScaleAfterStop(View view) {
+        /*
+         * The liquid-button touch animation finishes at scale 1.0.
+         * The approved Video/RAW Video idle button uses scale 0.84.
+         * Run after that animation so stopped state exactly matches
+         * the initial default state.
+         */
+        view.postDelayed(() -> {
+            view.animate().cancel();
+            view.setScaleX(0.84f);
+            view.setScaleY(0.84f);
+            view.setPressed(false);
+            view.setActivated(true);
+            view.jumpDrawablesToCurrentState();
+            view.invalidate();
+        }, 240L);
+    }
+
     @SuppressLint("NonConstantResourceId")
     @Override
     public void onClick(View view) {
@@ -53,12 +71,18 @@ final class CameraUIController implements CameraUIEventsListener,
                         break;
                     case UNLIMITED:
                     case RAWVIDEO:
-                        if (!cameraFragment.captureController.onUnlimited) {
+                        if (!cameraFragment.captureController.unlimitedStarted) {
+                            cameraFragment.captureController.onUnlimited = false;
+                            cameraFragment.captureController.unlimitedStarted = false;
                             cameraFragment.captureController.callUnlimitedStart();
                             view.setActivated(false);
                         } else {
                             cameraFragment.captureController.callUnlimitedEnd();
                             view.setActivated(true);
+                            if (PhotonCamera.getSettings().selectedMode
+                                    == CameraMode.RAWVIDEO) {
+                                restoreVideoIdleScaleAfterStop(view);
+                            }
                         }
                         break;
                     case VIDEO:
@@ -68,6 +92,7 @@ final class CameraUIController implements CameraUIEventsListener,
                         } else {
                             cameraFragment.captureController.VideoEnd();
                             view.setActivated(true);
+                            restoreVideoIdleScaleAfterStop(view);
                         }
                         break;
                 }
@@ -191,6 +216,39 @@ final class CameraUIController implements CameraUIEventsListener,
 
     @Override
     public void onCameraModeChanged(CameraMode cameraMode) {
+        CameraMode previousMode = PhotonCamera.getSettings().selectedMode;
+        if ((previousMode == CameraMode.RAWVIDEO
+                || previousMode == CameraMode.UNLIMITED)
+                && previousMode != cameraMode
+                && cameraFragment.captureController.onUnlimited) {
+            Log.d(TAG, "Stopping active continuous capture before mode change: "
+                    + previousMode + " -> " + cameraMode);
+            /*
+             * restartCamera() below owns the replacement session. Building a
+             * temporary preview session here races its onConfigured callback
+             * against the restart and leaves RAW Video unable to start again.
+             */
+            cameraFragment.captureController.callUnlimitedEnd(false);
+        }
+
+        /*
+         * RAW Video is a streaming writer, not an HDR processor. It never owns
+         * the normal processing callback lifecycle, so any process-wide
+         * isProcessing=true value that survives RAW Video exit is stale.
+         * Clear it before Motion refreshes its still-mode processing ring.
+         */
+        if (previousMode == CameraMode.RAWVIDEO && previousMode != cameraMode) {
+            CaptureController.isProcessing = false;
+            Log.d(TAG, "Cleared stale processing state after RAW Video exit");
+        }
+
+        if (cameraMode == CameraMode.RAWVIDEO
+                && previousMode != CameraMode.RAWVIDEO) {
+            cameraFragment.captureController.onUnlimited = false;
+            cameraFragment.captureController.unlimitedStarted = false;
+            Log.d(TAG, "Reset RAW Video start state on mode entry");
+        }
+
         PreferenceKeys.setCameraModeOrdinal(cameraMode.ordinal());
         Log.d(TAG, "onCameraModeChanged() called with: cameraMode = [" + cameraMode + "]");
         switch (cameraMode) {
