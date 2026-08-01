@@ -39,6 +39,7 @@ public class CaptureSharpening extends Node {
         float strength = basePipeline.mParameters.sensorSpecifics.captureSharpeningIntense*str;
 
         float motionSharpScale = 1.0f;
+        float temporalConfidenceScale = 1.0f;
 
         if (com.particlesdevs.photoncamera.app.PhotonCamera
                 .getSettings().selectedMode
@@ -65,7 +66,35 @@ public class CaptureSharpening extends Node {
                               )
                             * highIsoBlend;
 
-            strength *= motionSharpScale;
+            if (com.particlesdevs.photoncamera.app.PhotonCamera
+                .getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            float measuredRatio =
+                    basePipeline.mParameters.localContributionMeasured
+                            ? basePipeline.mParameters.effectiveStackRatio
+                            : 1.0f;
+
+            temporalConfidenceScale =
+                    com.particlesdevs.photoncamera.util.Math2.clamp(
+                            0.35f + 0.65f * measuredRatio,
+                            0.35f,
+                            1.0f
+                    );
+        }
+
+        strength *= motionSharpScale;
+        strength *= temporalConfidenceScale;
+
+        Log.d(
+                Name,
+                "MOTION_26216_CAPTURE_SHARP_CONFIDENCE"
+                        + " effectiveRatio="
+                        + basePipeline.mParameters.effectiveStackRatio
+                        + " measured="
+                        + basePipeline.mParameters.localContributionMeasured
+                        + " confidenceScale="
+                        + temporalConfidenceScale
+        );
 
             Log.d(
                     Name,

@@ -304,8 +304,14 @@ public class PostPipeline extends GLBasePipeline {
 
         if (mSettings.selectedMode == CameraMode.MOTION
                 && mSettings.hdrxNR) {
-            add(new MotionLumaDenoise());
-            add(new MotionChromaDenoise());
+            /*
+         * Build 26216:
+         * Bypass dedicated post-tone luma cleanup because it can consolidate
+         * residual temporal noise into blotches. Keep the separate coarse
+         * chroma cleanup stage.
+         */
+        // add(new MotionLumaDenoise());
+        add(new MotionChromaDenoise());
         }
 
         add(new AutoExposure());

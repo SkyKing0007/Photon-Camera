@@ -324,6 +324,16 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private volatile int mMotionTargetIso = 0;
 
     /*
+     * Build 26216:
+     * Use a median of the five most recent actual preview exposure-energy
+     * samples so one unstable Xiaomi AE result cannot darken the full burst.
+     */
+    private final double[] mMotionPreviewEnergyHistory =
+            new double[5];
+    private int mMotionPreviewEnergyHistoryCount = 0;
+    private int mMotionPreviewEnergyHistoryIndex = 0;
+
+    /*
      * Motion processing must use the white balance measured by the visible
      * continuously auto-balanced preview. The controlled manual RAW burst
      * still owns exposure, ISO, noise profile, timestamps, and EXIF.
@@ -997,6 +1007,29 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                         actualExposureNs
                                 ) * actualIso
                         );
+
+                        double actualPreviewEnergy =
+                                ExposureIndex.time2sec(
+                                        actualExposureNs
+                                ) * actualIso;
+
+                        synchronized (mZslBufferLock) {
+                            mMotionPreviewEnergyHistory[
+                                    mMotionPreviewEnergyHistoryIndex
+                            ] = actualPreviewEnergy;
+
+                            mMotionPreviewEnergyHistoryIndex =
+                                    (
+                                            mMotionPreviewEnergyHistoryIndex
+                                                    + 1
+                                    )
+                                            % mMotionPreviewEnergyHistory.length;
+
+                            if (mMotionPreviewEnergyHistoryCount
+                                    < mMotionPreviewEnergyHistory.length) {
+                                mMotionPreviewEnergyHistoryCount++;
+                            }
+                        }
 
                         Integer actualOisMode =
                                 result.get(
@@ -2248,6 +2281,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             mMotionRequestedIso = 0;
             mMotionTargetExposureNs = 0L;
             mMotionTargetIso = 0;
+            java.util.Arrays.fill(
+                    mMotionPreviewEnergyHistory,
+                    0.0
+            );
+            mMotionPreviewEnergyHistoryCount = 0;
+            mMotionPreviewEnergyHistoryIndex = 0;
             mLoggedStabilizationVendorTags = false;
         }
         // Drain any frames still queued in the RAW ImageReader to prevent them leaking
@@ -2864,6 +2903,61 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 Math.log(first / second)
                         / Math.log(2.0)
         );
+    }
+
+    private double getStableMotionPreviewEnergy(
+            double latestPreviewEnergy
+    ) {
+        double[] validHistory;
+
+        synchronized (mZslBufferLock) {
+            if (mMotionPreviewEnergyHistoryCount <= 0) {
+                return latestPreviewEnergy;
+            }
+
+            validHistory =
+                    new double[mMotionPreviewEnergyHistoryCount];
+
+            for (int i = 0;
+                 i < mMotionPreviewEnergyHistoryCount;
+                 i++) {
+                validHistory[i] =
+                        mMotionPreviewEnergyHistory[i];
+            }
+        }
+
+        java.util.Arrays.sort(validHistory);
+
+        int middle = validHistory.length / 2;
+        double median =
+                (validHistory.length & 1) == 0
+                        ? (
+                                validHistory[middle - 1]
+                                        + validHistory[middle]
+                        ) * 0.5
+                        : validHistory[middle];
+
+        if (median <= 0.0) {
+            return latestPreviewEnergy;
+        }
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_26216_STABLE_PREVIEW_ENERGY"
+                        + " latest=" + latestPreviewEnergy
+                        + " median=" + median
+                        + " samples=" + validHistory.length
+                        + " latestVsMedianEv="
+                        + (
+                            latestPreviewEnergy > 0.0
+                                    ? Math.log(
+                                            latestPreviewEnergy / median
+                                    ) / Math.log(2.0)
+                                    : Double.NaN
+                        )
+        );
+
+        return median;
     }
 
     private long[] calculateMotionPrebufferTarget() {
@@ -4028,7 +4122,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         ? sensitivityRange.getUpper()
                         : 12_800;
 
-        double previewEnergy =
+        double latestPreviewEnergy =
                 latestPreviewExposureNs != null
                         && latestPreviewExposureNs > 0L
                         && latestPreviewIso != null
@@ -4037,6 +4131,11 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                 latestPreviewExposureNs
                         ) * latestPreviewIso
                         : 0.0;
+
+        double previewEnergy =
+                getStableMotionPreviewEnergy(
+                        latestPreviewEnergy
+                );
 
         long desiredMotionExposureNs;
         int desiredMotionIso;

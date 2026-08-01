@@ -254,13 +254,14 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
         glProg.setDefine("NEUTRALPOINT",WP);
         glProg.setDefine("INSIZE",basePipeline.workSize);
         glProg.setDefine("CONTRAST", (float) basePipeline.mSettings.contrastMpy);
-        float appliedShadows = (float) basePipeline.mSettings.shadows;
-        if (basePipeline.mSettings.selectedMode
-                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
-            // Build 26211: gently open Motion lower midtones while
-            // preserving the true black floor and highlight mapping.
-            appliedShadows -= 0.10f;
-        }
+        float appliedShadows =
+                (float) basePipeline.mSettings.shadows;
+
+        /*
+         * Build 26216:
+         * Remove the extra Motion-only -0.10 shadow penalty. The configured
+         * shadow value now passes through unchanged.
+         */
         glProg.setDefine("SHADOWS", appliedShadows);
         Log.d(
                 Name,

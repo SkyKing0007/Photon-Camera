@@ -66,6 +66,7 @@ public class Sharpen2 extends Node {
         float sharpness = Math.max(PreferenceKeys.getSharpnessValue(), 0.0f);
 
         float motionSharpScale = 1.0f;
+        float temporalConfidenceScale = 1.0f;
 
         if (com.particlesdevs.photoncamera.app.PhotonCamera
                 .getSettings().selectedMode
@@ -92,7 +93,37 @@ public class Sharpen2 extends Node {
                               )
                             * highIsoBlend;
 
-            sharpness *= motionSharpScale;
+            if (com.particlesdevs.photoncamera.app.PhotonCamera
+                .getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            float measuredRatio =
+                    basePipeline.mParameters.localContributionMeasured
+                            ? basePipeline.mParameters.effectiveStackRatio
+                            : 1.0f;
+
+            temporalConfidenceScale =
+                    com.particlesdevs.photoncamera.util.Math2.clamp(
+                            0.30f + 0.70f * measuredRatio,
+                            0.30f,
+                            1.0f
+                    );
+        }
+
+        sharpness *= motionSharpScale;
+        sharpness *= temporalConfidenceScale;
+
+        Log.d(
+                Name,
+                "MOTION_26216_FINAL_SHARP_CONFIDENCE"
+                        + " effectiveRatio="
+                        + basePipeline.mParameters.effectiveStackRatio
+                        + " measured="
+                        + basePipeline.mParameters.localContributionMeasured
+                        + " confidenceScale="
+                        + temporalConfidenceScale
+                        + " appliedStrength="
+                        + sharpness
+        );
 
             Log.d(
                     Name,
