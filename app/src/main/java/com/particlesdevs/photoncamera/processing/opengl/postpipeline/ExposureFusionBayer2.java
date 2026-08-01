@@ -479,23 +479,23 @@ public class ExposureFusionBayer2 extends Node {
             float lowIsoBlend =
                     1.0f
                             - Math2.smoothstep(
-                                    500.0f,
                                     1200.0f,
+                                    3200.0f,
                                     motionIso
                             );
 
             float shadowLiftNeed =
                     Math2.smoothstep(
-                            1.40f,
-                            3.50f,
+                            1.15f,
+                            2.80f,
                             overexposure
                     );
 
             float highlightProtectionNeed =
                     1.0f
                             - Math2.smoothstep(
-                                    0.58f,
-                                    0.95f,
+                                    0.70f,
+                                    1.00f,
                                     underexposure
                             );
 

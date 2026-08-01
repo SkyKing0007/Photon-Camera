@@ -93,7 +93,7 @@ public class PostPipeline extends GLBasePipeline {
             defaultValue = 0.55f,
             step = 0.05f
     )
-    float motionResidualVarianceBoost = 0.55f;
+    float motionResidualVarianceBoost = 0.25f;
 
     @Tunable(
             title = "Motion measured residual variance boost",

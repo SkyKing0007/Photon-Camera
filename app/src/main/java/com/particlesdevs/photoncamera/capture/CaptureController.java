@@ -4173,14 +4173,15 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                         )
                         );
 
-                adaptiveBrightHeadroomEv =
-                        brightnessBeyondMinimumIso >= 4.0
-                                ? 0.20
-                                : (
-                                    brightnessBeyondMinimumIso >= 2.0
-                                            ? 0.10
-                                            : 0.0
-                                );
+                /*
+                 * Build 26218:
+                 * Xiaomi preview AE is consistently highlight-biased in the
+                 * tested outdoor HDR scenes. Do not subtract headroom here.
+                 * Add a restrained +0.25 EV only in the continuous
+                 * minimum-ISO bright branch so foregrounds receive cleaner
+                 * source data without changing normal indoor exposure.
+                 */
+                adaptiveBrightHeadroomEv = -0.25;
 
                 final double brightSceneHeadroomMultiplier =
                         Math.pow(
@@ -4199,7 +4200,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                 + " minimumIso=" + minimumIso
                                 + " brightnessRatio="
                                 + brightnessBeyondMinimumIso
-                                + " headroomEv="
+                                + " captureCompensationEv="
                                 + adaptiveBrightHeadroomEv
                                 + " previewEnergy="
                                 + previewEnergy
@@ -4213,9 +4214,9 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                         / Math.max(1, minimumIso)
                                         * 1_000_000_000.0
                         );
-            } else if (isoAt120 <= Math.min(maximumIso, 1600)) {
+            } else if (isoAt120 <= Math.min(maximumIso, 600)) {
                 desiredMotionExposureNs = oneOver120Ns;
-            } else if (isoAt60 <= Math.min(maximumIso, 3200)) {
+            } else if (isoAt60 <= Math.min(maximumIso, 2400)) {
                 desiredMotionExposureNs = oneOver60Ns;
             } else if (isoAt30 <= Math.min(maximumIso, 5000)) {
                 desiredMotionExposureNs = oneOver30Ns;

@@ -258,13 +258,34 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
                 basePipeline.mSettings.selectedMode
                         == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
 
+        /*
+         * Build 26218:
+         * Use measured HDR-scene strength instead of applying the same lift
+         * to every Motion image.
+         */
+        float motionHdrStrength =
+                motionToneRecovery
+                        ? ((PostPipeline) basePipeline)
+                                .indoorHdrSceneStrength
+                        : 0.0f;
+
+        float motionShadowRecovery =
+                motionToneRecovery
+                        ? 0.06f + 0.14f * motionHdrStrength
+                        : 0.0f;
+
         float appliedShadows =
                 (float) basePipeline.mSettings.shadows
-                        + (motionToneRecovery ? 0.12f : 0.0f);
+                        + motionShadowRecovery;
 
         float appliedLtmMix =
                 motionToneRecovery
-                        ? Math.max(ltmMix, 0.18f)
+                        ? Math.max(
+                                ltmMix,
+                                0.08f
+                                        + 0.18f
+                                        * motionHdrStrength
+                        )
                         : ltmMix;
 
         glProg.setDefine("SHADOWS", appliedShadows);
@@ -286,6 +307,7 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
                         + " configuredShadows="
                         + basePipeline.mSettings.shadows
                         + " appliedShadows=" + appliedShadows
+                        + " hdrStrength=" + motionHdrStrength
                         + " configuredLtmMix=" + ltmMix
                         + " appliedLtmMix=" + appliedLtmMix
         );

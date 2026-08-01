@@ -21,7 +21,7 @@ public class ESD3D2 extends Node {
             step = 0.05f,
             description = "Chroma denoise strength. Lower preserves more color (try 0.3-0.7)"
     )
-    float chromaStrength = 1.0f;
+    float chromaStrength = 0.78f;
 
     @Tunable(
             title = "Shadow Boost",
@@ -43,7 +43,7 @@ public class ESD3D2 extends Node {
             defaultValue = 0.05f,
             step = 0.01f
     )
-    float motionLumaEdgeBlendMaximum = 0.05f;
+    float motionLumaEdgeBlendMaximum = 0.02f;
 
     @Tunable(
             title = "Motion ESD stable-weight blend",
@@ -54,7 +54,7 @@ public class ESD3D2 extends Node {
             defaultValue = 0.04f,
             step = 0.01f
     )
-    float motionStableWeightBlendMaximum = 0.04f;
+    float motionStableWeightBlendMaximum = 0.00f;
 
     @Tunable(
             title = "Motion ESD shadow boost maximum",
@@ -65,7 +65,7 @@ public class ESD3D2 extends Node {
             defaultValue = 0.55f,
             step = 0.01f
     )
-    float motionShadowBoostMaximum = 0.55f;
+    float motionShadowBoostMaximum = 0.52f;
 
     boolean needClose = false;
     public ESD3D2(boolean closing) {
@@ -215,7 +215,7 @@ public class ESD3D2 extends Node {
             float appliedLuma =
                     Math2.mix(
                             luma,
-                            luma * 0.72f,
+                            luma * 0.55f,
                             indoorHdrStrength
                     );
 
@@ -247,7 +247,7 @@ public class ESD3D2 extends Node {
             kernelSize =
                     Math2.mix(
                             (float) kernelSize,
-                            (float) kernelSize * 0.78f,
+                            (float) kernelSize * 0.62f,
                             indoorHdrStrength
                     );
 
@@ -261,7 +261,7 @@ public class ESD3D2 extends Node {
 
             Log.d(
                     "ESD3D",
-                    "MOTION_26179_INDOOR_HDR_DETAIL"
+                    "MOTION_26218_UPSTREAM_DETAIL"
                             + " kernelSize=" + kernelSize
                             + " MSIZE=" + msize
                             + " indoorHdrStrength="

@@ -223,7 +223,7 @@
                         .indoorHdrSceneStrength;
 
         float lowerMidLift =
-                0.22f
+                0.30f
                         * indoorHdrStrength;
 
         float highlightCompression =
