@@ -4049,9 +4049,16 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                  * exposure energy at 1/120 would require ISO below the sensor
                  * minimum, hold minimum ISO and shorten shutter continuously.
                  */
+                final double brightSceneHeadroomMultiplier =
+                        Math.pow(2.0, -0.6);
+
+                final double brightSceneCaptureEnergy =
+                        previewEnergy
+                                * brightSceneHeadroomMultiplier;
+
                 desiredMotionExposureNs =
                         Math.round(
-                                previewEnergy
+                                brightSceneCaptureEnergy
                                         / Math.max(1, minimumIso)
                                         * 1_000_000_000.0
                         );
@@ -4079,6 +4086,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     + " minimumIso=" + minimumIso
                             + " brightContinuous="
                             + (isoAt120 < minimumIso)
+                            + " brightHeadroomEv="
+                            + (isoAt120 < minimumIso ? 0.6 : 0.0)
                             + " isoAt120=" + isoAt120
                             + " isoAt60=" + isoAt60
                     + " isoAt30=" + isoAt30
@@ -5299,16 +5308,18 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                      * ISO for both ID2 and ID5. Camera capability ranges are
                      * still enforced below.
                      */
-                    motionExposure = Math.max(
-                            1_000_000L,
-                            motionExposure
-                    );
-
                     Range<Long> exposureRange =
                             mCameraCharacteristics.get(
                                     CameraCharacteristics
                                             .SENSOR_INFO_EXPOSURE_TIME_RANGE
                             );
+
+                    motionExposure = Math.max(
+                            exposureRange != null
+                                    ? exposureRange.getLower()
+                                    : 1L,
+                            motionExposure
+                    );
 
                     if (exposureRange != null) {
                         motionExposure = Math.max(
@@ -5363,8 +5374,13 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                                     + motionExposure
                                     + " requestedIso="
                                     + motionIso
-                                    + " exposureRange="
-                                    + exposureRange
+                                    + " exposureRange=" + exposureRange
+                                    + " minimumExposureAppliedNs="
+                                    + (
+                                        exposureRange != null
+                                                ? exposureRange.getLower()
+                                                : 1L
+                                    )
                                     + " sensitivityRange="
                                     + sensitivityRange
                     );
