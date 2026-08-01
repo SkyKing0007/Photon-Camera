@@ -25,10 +25,10 @@ public class MotionChromaDenoise extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 1.0f,
-            defaultValue = 0.45f,
+            defaultValue = 0.34f,
             step = 0.01f
     )
-    float motionChromaCleanupMaximum = 0.45f;
+    float motionChromaCleanupMaximum = 0.34f;
 
     @Tunable(
             title = "Motion chroma radius",
@@ -36,10 +36,10 @@ public class MotionChromaDenoise extends Node {
             category = "Motion Noise Tuning",
             min = 4,
             max = 48,
-            defaultValue = 24,
+            defaultValue = 16,
             step = 1
     )
-    int motionChromaRadiusPixels = 24;
+    int motionChromaRadiusPixels = 16;
 
     @Tunable(
             title = "Motion chroma guide tolerance",
@@ -47,10 +47,10 @@ public class MotionChromaDenoise extends Node {
             category = "Motion Noise Tuning",
             min = 0.02f,
             max = 0.15f,
-            defaultValue = 0.08f,
+            defaultValue = 0.055f,
             step = 0.01f
     )
-    float motionChromaGuideSigmaMaximum = 0.08f;
+    float motionChromaGuideSigmaMaximum = 0.055f;
 
     @Tunable(
             title = "Motion shadow color neutralization",

@@ -51,10 +51,10 @@ public class ESD3D2 extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 0.65f,
-            defaultValue = 0.10f,
+            defaultValue = 0.04f,
             step = 0.01f
     )
-    float motionStableWeightBlendMaximum = 0.10f;
+    float motionStableWeightBlendMaximum = 0.04f;
 
     @Tunable(
             title = "Motion ESD shadow boost maximum",

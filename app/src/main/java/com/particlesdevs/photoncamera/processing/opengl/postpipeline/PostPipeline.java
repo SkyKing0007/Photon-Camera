@@ -90,10 +90,10 @@ public class PostPipeline extends GLBasePipeline {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 2.0f,
-            defaultValue = 0.80f,
+            defaultValue = 0.55f,
             step = 0.05f
     )
-    float motionResidualVarianceBoost = 0.80f;
+    float motionResidualVarianceBoost = 0.55f;
 
     @Tunable(
             title = "Motion measured residual variance boost",

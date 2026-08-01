@@ -48,10 +48,10 @@ public class Sharpen2 extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 1.0f,
-            defaultValue = 0.25f,
+            defaultValue = 0.60f,
             step = 0.05f
     )
-    float motionFinalSharpeningFloor = 0.25f;
+    float motionFinalSharpeningFloor = 0.60f;
     @Override
     public void Run() {
         glProg.setDefine("INTENSE",denoiseActivity);

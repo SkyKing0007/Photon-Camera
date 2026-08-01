@@ -25,10 +25,10 @@ public class MotionLumaDenoise extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 0.60f,
-            defaultValue = 0.14f,
+            defaultValue = 0.08f,
             step = 0.01f
     )
-    float motionLumaCleanupMaximum = 0.14f;
+    float motionLumaCleanupMaximum = 0.08f;
 
     @Tunable(
             title = "Motion luma noise threshold",
@@ -47,10 +47,10 @@ public class MotionLumaDenoise extends Node {
             category = "Motion Noise Tuning",
             min = 1,
             max = 3,
-            defaultValue = 2,
+            defaultValue = 1,
             step = 1
     )
-    int motionLumaKernelRadius = 2;
+    int motionLumaKernelRadius = 1;
 
     public MotionLumaDenoise() {
         super("", "MotionLumaDenoise");

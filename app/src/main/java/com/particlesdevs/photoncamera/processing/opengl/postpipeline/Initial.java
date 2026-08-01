@@ -254,7 +254,23 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
         glProg.setDefine("NEUTRALPOINT",WP);
         glProg.setDefine("INSIZE",basePipeline.workSize);
         glProg.setDefine("CONTRAST", (float) basePipeline.mSettings.contrastMpy);
-        glProg.setDefine("SHADOWS", (float) basePipeline.mSettings.shadows);
+        float appliedShadows = (float) basePipeline.mSettings.shadows;
+        if (basePipeline.mSettings.selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            // Build 26211: gently open Motion lower midtones while
+            // preserving the true black floor and highlight mapping.
+            appliedShadows -= 0.10f;
+        }
+        glProg.setDefine("SHADOWS", appliedShadows);
+        Log.d(
+                Name,
+                "MOTION_26211_TONE_DETAIL"
+                        + " selectedMode=" + basePipeline.mSettings.selectedMode
+                        + " configuredShadows=" + basePipeline.mSettings.shadows
+                        + " appliedShadows=" + appliedShadows
+                        + " blackFloorPreserved=true"
+                        + " highlightsUnchanged=true"
+        );
         glProg.setDefine("VIGNETTE", vignetteCorrection);
         glProg.setDefine("LTMMIX", ltmMix);
         float[][] cube = null;

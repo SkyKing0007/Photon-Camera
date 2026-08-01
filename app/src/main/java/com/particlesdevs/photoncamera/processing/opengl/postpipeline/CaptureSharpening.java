@@ -14,10 +14,10 @@ public class CaptureSharpening extends Node {
             category = "Motion Noise Tuning",
             min = 0.0f,
             max = 1.0f,
-            defaultValue = 0.25f,
+            defaultValue = 0.55f,
             step = 0.05f
     )
-    float motionCaptureSharpeningFloor = 0.25f;
+    float motionCaptureSharpeningFloor = 0.55f;
 
     public CaptureSharpening() {
         super("", "CaptureSharpening");
