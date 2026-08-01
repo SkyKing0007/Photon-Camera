@@ -15,6 +15,8 @@ uniform float weight2;
 uniform float exposure;
 uniform float noiseS;
 uniform float noiseO;
+uniform int motionEqualStack;
+uniform float motionNoiseAllowance;
 uniform float whiteLevel;
 uniform vec4 blackLevel;
 uniform vec4 analogBalance;
@@ -84,7 +86,33 @@ void main() {
     //diff = diffOrigin * (diff.x / (dot(diffOrigin, vec4(0.25)) + EPS));
     //diff = clamp(diff, min(diffOrigin, vec4(0.0)), max(diffOrigin, vec4(0.0)));
     //diff *= ((((noise*noise)/(noise*noise + diff*diff))));
-    float lDiff = clamp(length(diff), EPS, sqrt(length(variance)*1.4826 + EPS));
+    float localDifferenceCap =
+            sqrt(length(variance)*1.4826 + EPS);
+
+    if (motionEqualStack == 1) {
+        /*
+         * Build 26168:
+         * Do not let a noisy reference frame become a common component of
+         * every reconstructed alternate merely because local scene variance
+         * is small. Permit the expected independent per-frame sensor-noise
+         * difference, then retain the existing running-average weight.
+         */
+        float predictedNoiseCap =
+                length(noise) * motionNoiseAllowance;
+
+        localDifferenceCap =
+                max(
+                        localDifferenceCap,
+                        predictedNoiseCap
+                );
+    }
+
+    float lDiff =
+            clamp(
+                    length(diff),
+                    EPS,
+                    localDifferenceCap
+            );
     //float lDiff = length(diff);
     diff = diffOrigin / (length(diffOrigin) + EPS) * lDiff;
     //diff *= ((((noise*noise)/(noise*noise + diff*diff))));

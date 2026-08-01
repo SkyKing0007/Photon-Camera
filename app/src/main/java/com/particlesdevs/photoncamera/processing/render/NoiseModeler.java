@@ -83,12 +83,67 @@ public class NoiseModeler {
     }
 
     public void computeStackingNoiseModel(){
-        computeStackingNoiseModel(FrameNumberSelector.frameCount);
+        computeStackingNoiseModel(
+                (float) FrameNumberSelector.frameCount
+        );
     }
+
     public void computeStackingNoiseModel(int FrameCnt){
-        computeModel[0] = new Pair<>(adaptiveMpy * baseModel[0].first/ (FrameCnt*0.9),adaptiveMpy * baseModel[0].second/ (FrameCnt*0.9));
-        computeModel[1] = new Pair<>(adaptiveMpy * baseModel[1].first/ (FrameCnt*0.9),adaptiveMpy * baseModel[1].second/ (FrameCnt*0.9));
-        computeModel[2] = new Pair<>(adaptiveMpy * baseModel[2].first/ (FrameCnt*0.9),adaptiveMpy * baseModel[2].second/ (FrameCnt*0.9));
+        computeStackingNoiseModel(
+                (float) FrameCnt
+        );
+    }
+
+    public void computeStackingNoiseModel(float frameCount){
+        float safeFrameCount =
+                Math.max(
+                        1.0f,
+                        frameCount
+                );
+
+        double denominator =
+                safeFrameCount * 0.9;
+
+        computeModel[0] =
+                new Pair<>(
+                        adaptiveMpy
+                                * baseModel[0].first
+                                / denominator,
+                        adaptiveMpy
+                                * baseModel[0].second
+                                / denominator
+                );
+
+        computeModel[1] =
+                new Pair<>(
+                        adaptiveMpy
+                                * baseModel[1].first
+                                / denominator,
+                        adaptiveMpy
+                                * baseModel[1].second
+                                / denominator
+                );
+
+        computeModel[2] =
+                new Pair<>(
+                        adaptiveMpy
+                                * baseModel[2].first
+                                / denominator,
+                        adaptiveMpy
+                                * baseModel[2].second
+                                / denominator
+                );
+
+        Log.d(
+                TAG,
+                "MOTION_26172_STACKING_NOISE_MODEL"
+                        + " requestedEffectiveFrames="
+                        + frameCount
+                        + " safeEffectiveFrames="
+                        + safeFrameCount
+                        + " denominator="
+                        + denominator
+        );
     }
     private double computeNoiseModelS(double Sensitivity,Pair<Double,Double> sGenerator) {
         double returning = sGenerator.first * Sensitivity + sGenerator.second;

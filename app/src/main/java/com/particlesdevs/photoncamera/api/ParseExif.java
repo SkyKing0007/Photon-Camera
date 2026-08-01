@@ -148,7 +148,7 @@ public class ParseExif {
     public static class ExifData {
         public final String MODEL = Build.MODEL;
         public final String MAKE = Build.BRAND;
-        public final String COPYRIGHT = "PhotonCamera";
+        public final String COPYRIGHT = "Iris Camera";
         public String SENSITIVITY_TYPE;
         public String PHOTOGRAPHIC_SENSITIVITY;
         public String APERTURE_VALUE;

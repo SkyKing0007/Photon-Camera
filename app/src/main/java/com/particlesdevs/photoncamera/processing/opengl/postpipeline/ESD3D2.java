@@ -34,6 +34,39 @@ public class ESD3D2 extends Node {
     )
     float shadowBoost = 0.5f;
 
+    @Tunable(
+            title = "Motion ESD luma-edge blend",
+            description = "Maximum high-ISO use of luma instead of RGB for ESD edge detection. Lower preserves colored fine detail.",
+            category = "Motion Noise Tuning",
+            min = 0.0f,
+            max = 0.30f,
+            defaultValue = 0.05f,
+            step = 0.01f
+    )
+    float motionLumaEdgeBlendMaximum = 0.05f;
+
+    @Tunable(
+            title = "Motion ESD stable-weight blend",
+            description = "Maximum high-ISO blend toward dense bilateral weights. High values can make foliage and grass mushy.",
+            category = "Motion Noise Tuning",
+            min = 0.0f,
+            max = 0.65f,
+            defaultValue = 0.10f,
+            step = 0.01f
+    )
+    float motionStableWeightBlendMaximum = 0.10f;
+
+    @Tunable(
+            title = "Motion ESD shadow boost maximum",
+            description = "Maximum ESD shadow-noise tolerance reached at ISO 3200.",
+            category = "Motion Noise Tuning",
+            min = 0.50f,
+            max = 1.20f,
+            defaultValue = 0.55f,
+            step = 0.01f
+    )
+    float motionShadowBoostMaximum = 0.55f;
+
     boolean needClose = false;
     public ESD3D2(boolean closing) {
         super("", "ES3D");
@@ -88,18 +121,155 @@ public class ESD3D2 extends Node {
             Log.d(Name, "NoiseS:" + NoiseS + ", NoiseO:" + NoiseO);
             glProg.setDefine("NOISES", NoiseS);
             glProg.setDefine("NOISEO", NoiseO);
+            float appliedShadowBoost =
+                    shadowBoost;
+
+            float motionNoiseBlend =
+                    0.0f;
+
+            float motionStableWeights =
+                    0.0f;
+
+            if (com.particlesdevs.photoncamera.app.PhotonCamera
+                    .getSettings().selectedMode
+                    == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+
+                float motionIso =
+                        Math.max(
+                                1.0f,
+                                basePipeline.mParameters.iso
+                        );
+
+                float highIsoBlend =
+                        Math2.clamp(
+                                (motionIso - 400.0f) / 2800.0f,
+                                0.0f,
+                                1.0f
+                        );
+
+                /*
+                 * Build 26169:
+                 * Keep ESD3D2 primarily RGB-edge aware. The dedicated
+                 * MotionChromaDenoise node handles broad chroma blotches
+                 * without widening the luma-detail filter globally.
+                 */
+                /*
+                 * Build 26170:
+                 * Stable bilateral weights suppress connected noise worms
+                 * without restoring the broad luma softness from 26168.
+                 */
+                motionNoiseBlend =
+                        motionLumaEdgeBlendMaximum
+                                * highIsoBlend;
+
+                motionStableWeights =
+                        motionStableWeightBlendMaximum
+                                * highIsoBlend;
+
+                appliedShadowBoost =
+                        Math.max(
+                                shadowBoost,
+                                Math2.mix(
+                                        shadowBoost,
+                                        motionShadowBoostMaximum,
+                                        highIsoBlend
+                                )
+                        );
+
+                Log.d(
+                        Name,
+                        "MOTION_26171_ESD3D2_TUNABLE"
+                                + " iso=" + motionIso
+                                + " scale=" + scale
+                                + " NoiseS=" + NoiseS
+                                + " NoiseO=" + NoiseO
+                                + " chromaStrength="
+                                + chromaStrength
+                                + " shadowBoostConfigured="
+                                + shadowBoost
+                                + " shadowBoostApplied="
+                                + appliedShadowBoost
+                                + " motionNoiseBlend="
+                                + motionNoiseBlend
+                                + " motionNoiseBlendMaximum="
+                                + motionLumaEdgeBlendMaximum
+                                + " stableWeightBlend="
+                                + motionStableWeights
+                                + " stableWeightBlendMaximum="
+                                + motionStableWeightBlendMaximum
+                                + " motionShadowBoostMaximum="
+                                + motionShadowBoostMaximum
+                                + " chromaMinimumIndependent=true"
+                                + " edgeMetric="
+                                + "rgbDominant"
+                                + " dedicatedLumaStage=true"
+                                + " dedicatedCoarseChromaStage=true"
+                                + " readNoiseSource=NOISEO"
+                );
+            }
+
+            float indoorHdrStrength =
+                    ((PostPipeline) basePipeline)
+                            .indoorHdrSceneStrength;
+
+            float appliedLuma =
+                    Math2.mix(
+                            luma,
+                            luma * 0.72f,
+                            indoorHdrStrength
+                    );
+
             glProg.setDefine("MOIRE", moire);
-            glProg.setDefine("LUMA", luma);
+            glProg.setDefine("LUMA", appliedLuma);
             glProg.setDefine("CHROMASTRENGTH", chromaStrength);
-            glProg.setDefine("SHADOWBOOST", shadowBoost);
+            glProg.setDefine(
+                    "SHADOWBOOST",
+                    appliedShadowBoost
+            );
+            glProg.setDefine(
+                    "MOTIONNOISEBLEND",
+                    motionNoiseBlend
+            );
+            glProg.setDefine(
+                    "MOTIONSTABLEWEIGHTS",
+                    motionStableWeights
+            );
 
             glProg.setDefine("INSIZE", basePipeline.mParameters.rawSize);
             //float ks = 1.0f + Math.min((basePipeline.noiseS+basePipeline.noiseO) * 3.0f * noiseToKernelSize, 34.f);
             //int msize = 7 + (int)ks - (int)ks%2;
             double noiseMpy = Math.max((NoiseS+NoiseO)/noiseTarget, 0.0000001);
-            double kernelSize = 1.0f + Math.sqrt(noiseMpy) * noiseToKernelSize;
-            int msize = Math.min(minSize + (int)kernelSize - (int)kernelSize%2, maxSize);
-            Log.d("ESD3D", "KernelSize: "+kernelSize+" MSIZE: "+msize);
+            double kernelSize =
+                    1.0f
+                            + Math.sqrt(noiseMpy)
+                            * noiseToKernelSize;
+
+            kernelSize =
+                    Math2.mix(
+                            (float) kernelSize,
+                            (float) kernelSize * 0.78f,
+                            indoorHdrStrength
+                    );
+
+            int msize =
+                    Math.min(
+                            minSize
+                                    + (int) kernelSize
+                                    - (int) kernelSize % 2,
+                            maxSize
+                    );
+
+            Log.d(
+                    "ESD3D",
+                    "MOTION_26179_INDOOR_HDR_DETAIL"
+                            + " kernelSize=" + kernelSize
+                            + " MSIZE=" + msize
+                            + " indoorHdrStrength="
+                            + indoorHdrStrength
+                            + " lumaConfigured=" + luma
+                            + " lumaApplied=" + appliedLuma
+                            + " nightModeAffected=false"
+            );
             glProg.setDefine("KERNELSIZE", (float)(kernelSize));
             glProg.setDefine("MSIZE", msize);
             glProg.useAssetProgram("denoise/esd3d2");

@@ -87,9 +87,25 @@ public class SettingsBarEntryView extends LinearLayout {
                 button.setId(buttonModel.getId());
                 button.setImageResource(buttonModel.getButtonDrawableId());
                 button.setImageTintList(new ColorStateList(new int[][]{new int[]{android.R.attr.state_selected}, new int[]{-android.R.attr.state_selected}}, new int[]{Color.BLACK, Color.WHITE}));
-                button.setBackgroundResource(R.drawable.aux_button_background);
+                button.setBackgroundResource(R.drawable.liquid_glass_icon_button);
                 button.setCropToPadding(false);
                 button.setOnClickListener(buttonModel.getButtonClickListener());
+                button.setOnTouchListener((view, event) -> {
+                    switch (event.getActionMasked()) {
+                        case android.view.MotionEvent.ACTION_DOWN:
+                            view.animate().scaleX(0.88f).scaleY(0.88f).alpha(0.82f)
+                                    .setDuration(85).start();
+                            break;
+                        case android.view.MotionEvent.ACTION_UP:
+                        case android.view.MotionEvent.ACTION_CANCEL:
+                            view.animate().scaleX(1f).scaleY(1f).alpha(1f)
+                                    .setDuration(190).start();
+                            break;
+                        default:
+                            break;
+                    }
+                    return false;
+                });
                 button.setSelected(buttonModel.isSelected());
                 imageButtons.add(button);
             }

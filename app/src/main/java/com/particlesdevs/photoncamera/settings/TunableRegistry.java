@@ -12,6 +12,9 @@ public final class TunableRegistry {
     public static final Class<?>[] TUNABLE_CLASSES = {
         com.particlesdevs.photoncamera.ui.camera.CameraUIViewImpl.class,
         com.particlesdevs.photoncamera.processing.opengl.postpipeline.Sharpen2.class,
+        com.particlesdevs.photoncamera.processing.opengl.postpipeline.CaptureSharpening.class,
+        com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionLumaDenoise.class,
+        com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionChromaDenoise.class,
         com.particlesdevs.photoncamera.processing.opengl.postpipeline.PostPipeline.class,
         com.particlesdevs.photoncamera.processing.opengl.postpipeline.ESD3D2.class,
         com.particlesdevs.photoncamera.processing.opengl.postpipeline.AutoExposure.class,

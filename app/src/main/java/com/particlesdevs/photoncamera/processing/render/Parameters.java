@@ -80,6 +80,52 @@ public class Parameters {
      */
     public int retainedFrameCount = 1;
 
+    /**
+     * Conservative global estimate of useful temporal contribution.
+     *
+     * Retained frames are not equivalent to fully contributing frames:
+     * alignment uncertainty, local motion and robust pyramid filtering can
+     * reduce the usable temporal depth. Post denoise must therefore use this
+     * value rather than blindly assuming every retained RAW contributed
+     * everywhere.
+     */
+    public float effectiveFrameCount = 1.0f;
+
+    /**
+     * Fraction of the nominal retained burst represented by the conservative
+     * effective stack estimate. This is diagnostic groundwork for a future
+     * spatial confidence map and handheld multi-frame reconstruction.
+     */
+    public float effectiveStackRatio = 1.0f;
+
+    /**
+     * Build 26172 local merge-contribution diagnostics.
+     *
+     * These values describe how much independent alternate-frame difference
+     * survived alignment and robust pyramid reconstruction. They are measured
+     * before demosaic and are therefore valid for both the saved DNG metadata
+     * and the JPEG noise-model handoff.
+     */
+    public boolean localContributionMeasured = false;
+    public float localContributionMean = 1.0f;
+    public float localContributionP10 = 1.0f;
+    public float localContributionP25 = 1.0f;
+    public float localContributionP50 = 1.0f;
+    public float localContributionP75 = 1.0f;
+    public float localContributionP90 = 1.0f;
+    public float localContributionBelow4 = 0.0f;
+    public float localContributionBelow8 = 0.0f;
+    public float localContributionBelow12 = 0.0f;
+    public float localContributionBelow16 = 0.0f;
+
+    /**
+     * Placeholder diagnostics for the planned same-size handheld
+     * multi-frame super-resolution stage. Build 26158 does not alter output
+     * dimensions or reconstruct additional samples.
+     */
+    public float subpixelSampleDiversity = 0.0f;
+    public float highlightClippedFraction = 0.0f;
+
     public int tile = 16;
     public int tilesX = 0;
     public Point alignmentSize = new Point(0, 0);
@@ -238,10 +284,104 @@ public class Parameters {
         if (result != null) {
             boolean isHuawei = Build.BRAND.equals("Huawei");
 
-            if(useDynamicBlackLevel) {
-                float[] dynbl = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL);
-                if (dynbl != null) {
-                    System.arraycopy(dynbl, 0, blackLevel, 0, 4);
+            /*
+             * Build 26166:
+             *
+             * Motion uses a validated median collected from the timestamp-
+             * matched controlled burst. The global user setting remains
+             * unchanged for Photo, Night, Video and RAW Video.
+             */
+            float[] motionValidatedBlackLevel =
+                    CaptureController
+                            .getMotionValidatedBlackLevel();
+
+            boolean motionBlackLevelValid =
+                    motionValidatedBlackLevel != null
+                            && motionValidatedBlackLevel.length >= 4;
+
+            if (motionBlackLevelValid) {
+                float maximumAllowed =
+                        Math.max(
+                                256.0f,
+                                Math.max(1, whiteLevel) * 0.25f
+                        );
+
+                for (int i = 0; i < 4; i++) {
+                    float value =
+                            motionValidatedBlackLevel[i];
+
+                    if (!Float.isFinite(value)
+                            || value < 0.0f
+                            || value >= maximumAllowed) {
+                        motionBlackLevelValid = false;
+                        break;
+                    }
+                }
+            }
+
+            if (PhotonCamera.getSettings().selectedMode
+                    == com.particlesdevs.photoncamera.api.CameraMode.MOTION
+                    && motionBlackLevelValid) {
+
+                System.arraycopy(
+                        motionValidatedBlackLevel,
+                        0,
+                        blackLevel,
+                        0,
+                        4
+                );
+
+                usedDynamic = true;
+
+                Log.d(
+                        TAG,
+                        "MOTION_26166_BLACK_LEVEL_APPLIED"
+                                + " source="
+                                + CaptureController
+                                        .getMotionValidatedBlackLevelSource()
+                                + " selected="
+                                + Arrays.toString(blackLevel)
+                                + " userDynamicSetting="
+                                + useDynamicBlackLevel
+                                + " appliedBeforeAlignment=true"
+                );
+            } else if (useDynamicBlackLevel) {
+                float[] dynbl =
+                        result.get(
+                                CaptureResult
+                                        .SENSOR_DYNAMIC_BLACK_LEVEL
+                        );
+
+                boolean validDynamic =
+                        dynbl != null && dynbl.length >= 4;
+
+                if (validDynamic) {
+                    float maximumAllowed =
+                            Math.max(
+                                    256.0f,
+                                    Math.max(1, whiteLevel) * 0.25f
+                            );
+
+                    for (int i = 0; i < 4; i++) {
+                        float value = dynbl[i];
+
+                        if (!Float.isFinite(value)
+                                || value < 0.0f
+                                || value >= maximumAllowed) {
+                            validDynamic = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (validDynamic) {
+                    System.arraycopy(
+                            dynbl,
+                            0,
+                            blackLevel,
+                            0,
+                            4
+                    );
                     usedDynamic = true;
                 }
             }
@@ -284,6 +424,47 @@ public class Parameters {
             } catch (Exception e){
                 Log.d(TAG, "Error retrieving lens shading map, disabling gain map: " + Log.getStackTraceString(e));
             }
+            if (gainMap != null
+                    && gainMap.length >= 4) {
+
+                double gainR = 0.0;
+                double gainG1 = 0.0;
+                double gainG2 = 0.0;
+                double gainB = 0.0;
+                int gainSamples = 0;
+
+                for (int i = 0;
+                     i + 3 < gainMap.length;
+                     i += 4) {
+
+                    gainR += gainMap[i];
+                    gainG1 += gainMap[i + 1];
+                    gainG2 += gainMap[i + 2];
+                    gainB += gainMap[i + 3];
+                    gainSamples++;
+                }
+
+                if (gainSamples > 0) {
+                    Log.d(
+                            TAG,
+                            "MOTION_GAIN_MAP_CHANNELS"
+                                    + " hasGainMap=" + hasGainMap
+                                    + " mapSize=" + mapSize
+                                    + " samples=" + gainSamples
+                                    + " avgR="
+                                    + gainR / gainSamples
+                                    + " avgG1="
+                                    + gainG1 / gainSamples
+                                    + " avgG2="
+                                    + gainG2 / gainSamples
+                                    + " avgB="
+                                    + gainB / gainSamples
+                                    + " cfaPattern="
+                                    + cfaPattern
+                    );
+                }
+            }
+
             hotPixels =
                     result.get(
                             CaptureResult.STATISTICS_HOT_PIXEL_MAP
@@ -292,27 +473,69 @@ public class Parameters {
             float[] motionPreviewNeutral =
                     CaptureController.getMotionProcessingNeutral();
 
-            if (motionPreviewNeutral != null
-                    && motionPreviewNeutral.length >= 3) {
+            Rational[] burstNeutralR =
+                    result.get(
+                            CaptureResult.SENSOR_NEUTRAL_COLOR_POINT
+                    );
 
-                customNeutral = motionPreviewNeutral;
-                ReCalcColor(true, result);
+            float[] burstNeutral =
+                    neutralToFloatArray(
+                            burstNeutralR
+                    );
 
-                Log.d(
-                        TAG,
-                        "MOTION_COLOR_NEUTRAL_OVERRIDE"
-                                + " previewNeutral="
-                                + Arrays.toString(
-                                        motionPreviewNeutral
-                                )
-                                + " controlledIso="
-                                + iso
-                                + " controlledExposureTime="
-                                + exposureTime
-                );
-            } else {
-                ReCalcColor(false, result);
-            }
+            boolean burstNeutralValid =
+                    isValidNeutral(
+                            burstNeutral
+                    );
+
+            boolean previewNeutralValid =
+                    isValidNeutral(
+                            motionPreviewNeutral
+                    );
+
+            /*
+             * Build 26164:
+             *
+             * Use the standard Photon color path with the same CaptureResult
+             * already supplied to FillDynamicParameters. This keeps the
+             * neutral point, color transforms, calibration transforms and
+             * forward matrices tied to one metadata source.
+             *
+             * Preview and burst neutral values remain diagnostics only.
+             * They must not override the standard result-based calculation.
+             */
+            ReCalcColor(false, result);
+
+            Log.d(
+                    TAG,
+                    "MOTION_COLOR_REFERENCE_METADATA"
+                            + " source=captureResult"
+                            + " burstNeutral="
+                            + Arrays.toString(
+                                    burstNeutral
+                            )
+                            + " previewNeutral="
+                            + Arrays.toString(
+                                    motionPreviewNeutral
+                            )
+                            + " burstNeutralValid="
+                            + burstNeutralValid
+                            + " previewNeutralValid="
+                            + previewNeutralValid
+                            + " neutralDistance="
+                            + neutralDistance(
+                                    burstNeutral,
+                                    motionPreviewNeutral
+                            )
+                            + " selectedWhitePoint="
+                            + Arrays.toString(
+                                    whitePoint
+                            )
+                            + " controlledIso="
+                            + iso
+                            + " controlledExposureTime="
+                            + exposureTime
+            );
         }
         if (!usedDynamic)
             if (level != null) {
@@ -322,6 +545,25 @@ public class Parameters {
         if(blackLevelOverride >= 0) {
             for (int i = 0; i < 4; i++) blackLevel[i] = blackLevelOverride;
         }
+
+        if (PhotonCamera.getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            Log.d(
+                    TAG,
+                    "MOTION_26166_BLACK_LEVEL_FINAL"
+                            + " selected="
+                            + Arrays.toString(blackLevel)
+                            + " usedValidatedOrDynamic="
+                            + usedDynamic
+                            + " override="
+                            + blackLevelOverride
+                            + " whiteLevel="
+                            + whiteLevel
+                            + " cfaPattern="
+                            + cfaPattern
+            );
+        }
+
         Float aperture = result.get(CaptureResult.LENS_APERTURE);
         if (aperture == null) {
             aperture = request.get(CaptureRequest.LENS_APERTURE);
@@ -351,15 +593,112 @@ public class Parameters {
 
     public float[] customNeutral;
 
+    private float[] neutralToFloatArray(
+            Rational[] neutral
+    ) {
+        if (neutral == null || neutral.length < 3) {
+            return null;
+        }
+
+        float[] converted = new float[3];
+
+        for (int i = 0; i < 3; i++) {
+            if (neutral[i] == null) {
+                return null;
+            }
+
+            converted[i] =
+                    neutral[i].floatValue();
+        }
+
+        return converted;
+    }
+
+    private boolean isValidNeutral(
+            float[] neutral
+    ) {
+        if (neutral == null || neutral.length < 3) {
+            return false;
+        }
+
+        for (int i = 0; i < 3; i++) {
+            float value = neutral[i];
+
+            if (!Float.isFinite(value)
+                    || value <= 0.01f
+                    || value > 8.0f) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private float neutralDistance(
+            float[] first,
+            float[] second
+    ) {
+        if (!isValidNeutral(first)
+                || !isValidNeutral(second)) {
+            return -1.0f;
+        }
+
+        float sum = 0.0f;
+
+        for (int i = 0; i < 3; i++) {
+            float denominator =
+                    Math.max(
+                            Math.abs(first[i]),
+                            1e-6f
+                    );
+
+            float relative =
+                    (first[i] - second[i])
+                            / denominator;
+
+            sum += relative * relative;
+        }
+
+        return (float) Math.sqrt(sum / 3.0f);
+    }
+
     public void ReCalcColor(boolean customNeutr, CaptureResult result) {
         CameraCharacteristics characteristics = CaptureController.getActiveCameraCharacteristics();
-        Rational[] neutralR = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT);
-        if (!customNeutr)
-            for (int i = 0; i < neutralR.length; i++) {
-                whitePoint[i] = neutralR[i].floatValue();
+        Rational[] neutralR =
+                result.get(
+                        CaptureResult.SENSOR_NEUTRAL_COLOR_POINT
+                );
+
+        if (!customNeutr) {
+            float[] resultNeutral =
+                    neutralToFloatArray(
+                            neutralR
+                    );
+
+            if (isValidNeutral(resultNeutral)) {
+                whitePoint =
+                        resultNeutral;
+            } else {
+                Log.w(
+                        TAG,
+                        "Invalid SENSOR_NEUTRAL_COLOR_POINT; "
+                                + "preserving whitePoint="
+                                + Arrays.toString(
+                                        whitePoint
+                                )
+                );
             }
-        else {
-            whitePoint = customNeutral;
+        } else if (isValidNeutral(customNeutral)) {
+            whitePoint =
+                    customNeutral.clone();
+        } else {
+            Log.w(
+                    TAG,
+                    "Invalid custom neutral; preserving whitePoint="
+                            + Arrays.toString(
+                                    whitePoint
+                            )
+            );
         }
         int ref1 = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1);
         int ref2;
@@ -636,6 +975,19 @@ public class Parameters {
                 "\n hasGainMap=" + hasGainMap +
                 "\n FrameCount=" + FrameNumberSelector.frameCount +
                 "\n RetainedFrameCount=" + retainedFrameCount +
+                "\n EffectiveFrameCount=" + FltFormat(effectiveFrameCount) +
+                "\n EffectiveStackRatio=" + FltFormat(effectiveStackRatio) +
+                "\n ContributionMeasured=" + localContributionMeasured +
+                "\n ContributionMean=" + FltFormat(localContributionMean) +
+                "\n ContributionP10=" + FltFormat(localContributionP10) +
+                "\n ContributionP25=" + FltFormat(localContributionP25) +
+                "\n ContributionP50=" + FltFormat(localContributionP50) +
+                "\n ContributionP75=" + FltFormat(localContributionP75) +
+                "\n ContributionP90=" + FltFormat(localContributionP90) +
+                "\n ContributionBelow4=" + FltFormat(localContributionBelow4) +
+                "\n ContributionBelow8=" + FltFormat(localContributionBelow8) +
+                "\n ContributionBelow12=" + FltFormat(localContributionBelow12) +
+                "\n ContributionBelow16=" + FltFormat(localContributionBelow16) +
                 "\n CameraID=" + PhotonCamera.getSettings().mCameraID +
                 "\n DenoiseOn=" + PhotonCamera.getSettings().hdrxNR +
                 "\n Sharp=" + FltFormat(PreferenceKeys.getSharpnessValue()) +

@@ -50,11 +50,8 @@ public class SettingsBarEntryProvider extends ViewModel {
     private final List<SettingsBarEntryModel> allEntries = new ArrayList<>(8);
 
     public SettingsBarEntryProvider() {
-//        allEntries.add(hdrxEntry);
-        allEntries.add(flashEntry);
-        allEntries.add(timerEntry);
-        allEntries.add(saveRawEntry);
-        allEntries.add(quadEntry);
+        // Flash and timer live in the top-right controls.
+        // RAW/JPG and Quad Bayer live in the top-left status selector.
         allEntries.add(eisEntry);
         allEntries.add(fpsEntry);
         allEntries.add(gridEntry);

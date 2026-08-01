@@ -466,6 +466,71 @@ public class ExposureFusionBayer2 extends Node {
         overexposure = Math.min(256.f,overexposure);
         underexposure = Math.max(1.f/256.f,underexposure);
 
+        float indoorHdrSceneStrength = 0.0f;
+        if (com.particlesdevs.photoncamera.app.PhotonCamera
+                .getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            float motionIso =
+                    Math.max(
+                            1.0f,
+                            basePipeline.mParameters.iso
+                    );
+
+            float lowIsoBlend =
+                    1.0f
+                            - Math2.smoothstep(
+                                    500.0f,
+                                    1200.0f,
+                                    motionIso
+                            );
+
+            float shadowLiftNeed =
+                    Math2.smoothstep(
+                            1.40f,
+                            3.50f,
+                            overexposure
+                    );
+
+            float highlightProtectionNeed =
+                    1.0f
+                            - Math2.smoothstep(
+                                    0.58f,
+                                    0.95f,
+                                    underexposure
+                            );
+
+            indoorHdrSceneStrength =
+                    Math2.clamp(
+                            lowIsoBlend
+                                    * shadowLiftNeed
+                                    * highlightProtectionNeed,
+                            0.0f,
+                            1.0f
+                    );
+
+            ((PostPipeline) basePipeline)
+                    .indoorHdrSceneStrength =
+                    indoorHdrSceneStrength;
+
+            Log.d(
+                    Name,
+                    "MOTION_26179_INDOOR_HDR_GATE"
+                            + " iso=" + motionIso
+                            + " overexposure=" + overexposure
+                            + " underexposure=" + underexposure
+                            + " lowIsoBlend=" + lowIsoBlend
+                            + " shadowLiftNeed=" + shadowLiftNeed
+                            + " highlightProtectionNeed="
+                            + highlightProtectionNeed
+                            + " strength=" + indoorHdrSceneStrength
+                            + " nightModeAffected=false"
+                            + " globalShadowLift=false"
+            );
+        } else {
+            ((PostPipeline) basePipeline)
+                    .indoorHdrSceneStrength = 0.0f;
+        }
+
 
         if(useSymmetricExposureFork){
             float mpy = overexposure*underexposure;

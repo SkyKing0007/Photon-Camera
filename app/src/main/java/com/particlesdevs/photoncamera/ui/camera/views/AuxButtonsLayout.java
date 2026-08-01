@@ -1,27 +1,15 @@
 /*
  *
- *  PhotonCamera
+ *  PhotonCamera / Iris Camera UI
  *  AuxButtonsLayout.java
- *  Copyright (C) 2020 - 2021  Vibhor
- *  This program is free software: you can redistribute it and/or modify
- *  it under the terms of the GNU General Public License as published by
- *  the Free Software Foundation, either version 3 of the License, or
- *  (at your option) any later version.
  *
- *  This program is distributed in the hope that it will be useful,
- *  but WITHOUT ANY WARRANTY; without even the implied warranty of
- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
- * /
  */
 
 package com.particlesdevs.photoncamera.ui.camera.views;
 
 import android.content.Context;
 import android.util.AttributeSet;
+import android.util.TypedValue;
 import android.view.View;
 import android.widget.Button;
 import android.widget.LinearLayout;
@@ -33,44 +21,52 @@ import com.particlesdevs.photoncamera.ui.camera.binding.CustomBinding;
 import com.particlesdevs.photoncamera.ui.camera.data.CameraLensData;
 import com.particlesdevs.photoncamera.ui.camera.model.AuxButtonsModel;
 
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 
 /**
- * Container for multi-camera buttons.
- * <p>
- * This layout's functionality is dependent on {@link AuxButtonsModel} which is provided
- * through DataBinding {@link CustomBinding#setAuxButtonModel(AuxButtonsLayout, AuxButtonsModel)}.
+ * Compact horizontal optical-lens selector.
  */
 public class AuxButtonsLayout extends LinearLayout {
+    private static final Comparator<CameraLensData> SORT_BY_ZOOM_FACTOR =
+            Comparator.comparingDouble(CameraLensData::getZoomFactor)
+                    .thenComparing(CameraLensData::getCameraId);
 
-    /**
-     * this map stores dynamically generated view-ids and corresponding camera-ids attached to that view(or button)
-     * for functional purpose
-     */
-    private final HashMap<Integer, String> auxButtonsMap = new HashMap<>();
+    private final HashMap<Integer, String> auxButtonsMap =
+            new HashMap<>();
 
-    private final LinearLayout.LayoutParams buttonParams;
     private AuxButtonListener auxButtonListener;
     private AuxButtonsModel auxButtonsModel;
 
-    public AuxButtonsLayout(Context context, @Nullable AttributeSet attrs) {
+    public AuxButtonsLayout(
+            Context context,
+            @Nullable AttributeSet attrs
+    ) {
         super(context, attrs);
-
-        int margin = (int) context.getResources().getDimension(R.dimen.aux_button_internal_margin);
-        int size = (int) context.getResources().getDimension(R.dimen.aux_button_size);
-        buttonParams = new LinearLayout.LayoutParams(size, size);
-        buttonParams.setMargins(margin, margin, margin, margin);
     }
 
-    private static String getAuxButtonName(float zoomFactor) {
-        return String.format(Locale.US, "%.1fx", (zoomFactor - 0.049)).replace(".0", "");
+    private static String getAuxButtonName(
+            float zoomFactor
+    ) {
+        return String.format(
+                Locale.US,
+                "%.1fx",
+                zoomFactor - 0.049f
+        ).replace(".0", "");
     }
 
-    public void setAuxButtonsModel(AuxButtonsModel auxButtonsModel) {
-        this.auxButtonsModel = auxButtonsModel;
-        auxButtonListener = auxButtonsModel.getAuxButtonListener();
+    public void setAuxButtonsModel(
+            AuxButtonsModel auxButtonsModel
+    ) {
+        this.auxButtonsModel =
+                auxButtonsModel;
+
+        auxButtonListener =
+                auxButtonsModel
+                        .getAuxButtonListener();
     }
 
     public void setActiveId(String activeId) {
@@ -78,68 +74,240 @@ public class AuxButtonsLayout extends LinearLayout {
     }
 
     private void refresh(String cameraId) {
-        if (auxButtonsModel == null) return;
-        List<CameraLensData> front = auxButtonsModel.getFrontCameras();
-        List<CameraLensData> back = auxButtonsModel.getBackCameras();
-        if (front == null || back == null) return;
-        if (!isFront(cameraId, front))
-            this.setAuxButtons(back, cameraId);
-        else
-            this.setAuxButtons(front, cameraId);
+        if (auxButtonsModel == null) {
+            return;
+        }
+
+        List<CameraLensData> front =
+                auxButtonsModel
+                        .getFrontCameras();
+
+        List<CameraLensData> back =
+                auxButtonsModel
+                        .getBackCameras();
+
+        if (front == null
+                || back == null) {
+            return;
+        }
+
+        if (!isFront(cameraId, front)) {
+            setAuxButtons(
+                    back,
+                    cameraId
+            );
+        } else {
+            setAuxButtons(
+                    front,
+                    cameraId
+            );
+        }
     }
 
-    private boolean isFront(String cameraId, List<CameraLensData> frontCameras) {
-        return frontCameras.stream().anyMatch(cameraLensData -> cameraLensData.getCameraId().equals(cameraId));
+    private boolean isFront(
+            String cameraId,
+            List<CameraLensData> frontCameras
+    ) {
+        return frontCameras.stream().anyMatch(
+                cameraLensData ->
+                        cameraLensData
+                                .getCameraId()
+                                .equals(cameraId)
+        );
     }
 
-    private void setAuxButtons(List<CameraLensData> cameraLensDataList, String activeId) {
+    private void setAuxButtons(
+            List<CameraLensData> source,
+            String activeId
+    ) {
         removeAllViews();
         auxButtonsMap.clear();
-        cameraLensDataList.forEach(cameraLensData -> addNewButton(cameraLensData.getCameraId(), getAuxButtonName(cameraLensData.getZoomFactor())));
-        setListenerAndSelected(activeId);
+
+        List<CameraLensData> ordered =
+                new ArrayList<>(source);
+
+        ordered.sort(
+                SORT_BY_ZOOM_FACTOR
+        );
+
+        for (CameraLensData cameraLensData
+                : ordered) {
+            addNewButton(
+                    cameraLensData
+                            .getCameraId(),
+                    getAuxButtonName(
+                            cameraLensData
+                                    .getZoomFactor()
+                    )
+            );
+        }
+
+        setListenerAndSelected(
+                activeId
+        );
+
         updateVisibility();
     }
 
-    private void setListenerAndSelected(String activeId) {
-        View.OnClickListener auxButtonListener = this::onAuxButtonClick;
-        for (int i = 0; i < getChildCount(); i++) {
-            View button = getChildAt(i);
-            button.setOnClickListener(auxButtonListener);
-            if (activeId.equals(auxButtonsMap.get(button.getId())))
-                button.setSelected(true);
+    private void setListenerAndSelected(
+            String activeId
+    ) {
+        View.OnClickListener listener =
+                this::onAuxButtonClick;
+
+        for (int index = 0;
+                index < getChildCount();
+                index++) {
+            View button =
+                    getChildAt(index);
+
+            button.setOnClickListener(
+                    listener
+            );
+
+            boolean selected =
+                    activeId.equals(
+                            auxButtonsMap.get(
+                                    button.getId()
+                            )
+                    );
+
+            button.setSelected(
+                    selected
+            );
         }
     }
 
     private void updateVisibility() {
-        setVisibility(getChildCount() > 1 ? View.VISIBLE : View.INVISIBLE);
+        setVisibility(
+                getChildCount() > 1
+                        ? View.VISIBLE
+                        : View.INVISIBLE
+        );
     }
 
-    private void onAuxButtonClick(View view) {
-        if (auxButtonsModel.isEnabled()) {
-            for (int i = 0; i < getChildCount(); i++) {
-                View child = getChildAt(i);
-                child.setSelected(view.equals(child));
-            }
-            if (auxButtonListener != null)
-                auxButtonListener.onAuxButtonClicked(auxButtonsMap.get(view.getId()));
+    private void onAuxButtonClick(
+            View view
+    ) {
+        if (!auxButtonsModel.isEnabled()) {
+            return;
+        }
+
+        for (int index = 0;
+                index < getChildCount();
+                index++) {
+            View child =
+                    getChildAt(index);
+
+            child.setSelected(
+                    view.equals(child)
+            );
+        }
+
+        if (auxButtonListener != null) {
+            auxButtonListener
+                    .onAuxButtonClicked(
+                            auxButtonsMap.get(
+                                    view.getId()
+                            )
+                    );
         }
     }
 
-    private void addNewButton(String cameraId, String buttonText) {
-        Button b = new Button(getContext());
-        b.setLayoutParams(buttonParams);
-        b.setText(buttonText);
-        b.setTextAppearance(R.style.AuxButtonText);
-        b.setBackgroundResource(R.drawable.aux_button_background);
-        b.setStateListAnimator(null);
-        b.setTransformationMethod(null);
-        int buttonId = View.generateViewId();
-        b.setId(buttonId);
-        this.auxButtonsMap.put(buttonId, cameraId);
-        addView(b);
+    private void addNewButton(
+            String cameraId,
+            String buttonText
+    ) {
+        Button button =
+                new Button(getContext());
+
+        LayoutParams params =
+                new LayoutParams(
+                        LayoutParams.WRAP_CONTENT,
+                        dp(38)
+                );
+
+        params.setMargins(
+                dp(2),
+                0,
+                dp(2),
+                0
+        );
+
+        button.setLayoutParams(
+                params
+        );
+
+        button.setMinWidth(
+                dp(42)
+        );
+
+        button.setMinimumWidth(
+                dp(42)
+        );
+
+        button.setPadding(
+                dp(8),
+                0,
+                dp(8),
+                0
+        );
+
+        button.setText(
+                buttonText
+        );
+
+        button.setTextAppearance(
+                R.style.AuxButtonText
+        );
+
+        button.setTextColor(
+                getResources().getColorStateList(
+                        R.color.iris_lens_text,
+                        getContext().getTheme()
+                )
+        );
+
+        button.setBackgroundResource(
+                R.drawable
+                        .iris_lens_button_background
+        );
+
+        button.setStateListAnimator(null);
+        button.setTransformationMethod(null);
+        button.setAllCaps(false);
+
+        int buttonId =
+                View.generateViewId();
+
+        button.setId(
+                buttonId
+        );
+
+        auxButtonsMap.put(
+                buttonId,
+                cameraId
+        );
+
+        addView(
+                button
+        );
+    }
+
+    private int dp(float value) {
+        return Math.round(
+                TypedValue.applyDimension(
+                        TypedValue.COMPLEX_UNIT_DIP,
+                        value,
+                        getResources()
+                                .getDisplayMetrics()
+                )
+        );
     }
 
     public interface AuxButtonListener {
-        void onAuxButtonClicked(String cameraId);
+        void onAuxButtonClicked(
+                String cameraId
+        );
     }
 }
