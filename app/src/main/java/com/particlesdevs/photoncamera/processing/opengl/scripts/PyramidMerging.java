@@ -1525,6 +1525,27 @@ public class PyramidMerging extends GLOneScript {
             analyzeMotionContribution(
                     images.size()
             );
+
+            Log.d(
+                    Name,
+                    "MOTION_26219_REFERENCE_DETAIL"
+                            + " algorithm=textureAwareTemporalRetention"
+                            + " textureRatioStart=1.35"
+                            + " textureRatioFull=4.50"
+                            + " minimumTemporalScale=0.42"
+                            + " contributionUncertainStart=0.35"
+                            + " contributionUncertainFull=0.85"
+                            + " contributionMean="
+                            + motionContributionMean
+                            + " contributionP10="
+                            + motionContributionP10
+                            + " contributionP25="
+                            + motionContributionP25
+                            + " effectiveFrameCount="
+                            + motionEffectiveFrameCount
+                            + " effectiveStackRatio="
+                            + motionEffectiveStackRatio
+            );
         }
 
         /*

@@ -96,10 +96,84 @@ void main() {
     float predictedNoiseCap =
             length(noise) * motionNoiseAllowance;
 
+    /*
+     * Build 26219: texture-aware temporal reference retention.
+     *
+     * "variance" measures local Bayer structure from the incoming frame.
+     * When that structure is only at the predicted sensor-noise level, keep
+     * normal temporal averaging. When it rises clearly above predicted noise,
+     * reduce the permitted per-frame update so the first/reference-derived
+     * microtexture is not repeatedly averaged into broad smooth patches.
+     *
+     * The contribution map makes this conservative in low-contribution or
+     * alignment-uncertain pixels, where reference retention is most useful.
+     * Chroma cleanup remains later in the pipeline and is not weakened here.
+     */
+    float localTextureSignal =
+            sqrt(
+                    max(
+                            length(variance),
+                            EPS
+                    )
+            );
+
+    float textureToNoiseRatio =
+            localTextureSignal
+                    / max(
+                            predictedNoiseCap,
+                            EPS
+                    );
+
+    float textureConfidence =
+            smoothstep(
+                    1.35,
+                    4.50,
+                    textureToNoiseRatio
+            );
+
+    float localContribution =
+            clamp(
+                    imageLoad(
+                            contributionTexture,
+                            xy
+                    ).r,
+                    0.0,
+                    1.0
+            );
+
+    float uncertainContribution =
+            1.0
+                    - smoothstep(
+                            0.35,
+                            0.85,
+                            localContribution
+                    );
+
+    float referenceRetention =
+            clamp(
+                    textureConfidence
+                            * mix(
+                                    0.65,
+                                    1.0,
+                                    uncertainContribution
+                            ),
+                    0.0,
+                    1.0
+            );
+
+    float temporalUpdateScale =
+            mix(
+                    1.0,
+                    0.42,
+                    referenceRetention
+            );
+
+    localDifferenceCap *= temporalUpdateScale;
+
     localDifferenceCap =
             max(
                     localDifferenceCap,
-                    predictedNoiseCap
+                    predictedNoiseCap * 0.72
             );
 
     float reconstructedDifference =
