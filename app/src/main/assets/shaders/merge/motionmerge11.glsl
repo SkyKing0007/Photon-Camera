@@ -97,37 +97,50 @@ void main() {
             length(noise) * motionNoiseAllowance;
 
     /*
-     * Build 26219: texture-aware temporal reference retention.
+     * Build 26220: normalized texture-aware reference retention.
      *
-     * "variance" measures local Bayer structure from the incoming frame.
-     * When that structure is only at the predicted sensor-noise level, keep
-     * normal temporal averaging. When it rises clearly above predicted noise,
-     * reduce the permitted per-frame update so the first/reference-derived
-     * microtexture is not repeatedly averaged into broad smooth patches.
+     * 26219 compared two vector-length expressions whose practical scales
+     * were not guaranteed to match, so the retention mask could remain nearly
+     * inactive. 26220 converts both local Bayer variation and predicted sensor
+     * noise to comparable per-channel RMS amplitudes before forming the ratio.
      *
-     * The contribution map makes this conservative in low-contribution or
-     * alignment-uncertain pixels, where reference retention is most useful.
-     * Chroma cleanup remains later in the pipeline and is not weakened here.
+     * Flat/noisy regions keep temporal averaging. Fine structure rising above
+     * predicted noise strongly limits repeated updates, retaining more of the
+     * first/reference-derived foliage, fur, fabric, hair and text detail.
      */
-    float localTextureSignal =
+    float localTextureRms =
             sqrt(
                     max(
-                            length(variance),
+                            dot(
+                                    variance,
+                                    vec4(0.25)
+                            ),
+                            EPS
+                    )
+            );
+
+    float predictedNoiseRms =
+            sqrt(
+                    max(
+                            dot(
+                                    noise * noise,
+                                    vec4(0.25)
+                            ),
                             EPS
                     )
             );
 
     float textureToNoiseRatio =
-            localTextureSignal
+            localTextureRms
                     / max(
-                            predictedNoiseCap,
+                            predictedNoiseRms,
                             EPS
                     );
 
     float textureConfidence =
             smoothstep(
-                    1.35,
-                    4.50,
+                    1.05,
+                    2.50,
                     textureToNoiseRatio
             );
 
@@ -144,8 +157,8 @@ void main() {
     float uncertainContribution =
             1.0
                     - smoothstep(
-                            0.35,
-                            0.85,
+                            0.30,
+                            0.80,
                             localContribution
                     );
 
@@ -153,7 +166,7 @@ void main() {
             clamp(
                     textureConfidence
                             * mix(
-                                    0.65,
+                                    0.78,
                                     1.0,
                                     uncertainContribution
                             ),
@@ -164,7 +177,7 @@ void main() {
     float temporalUpdateScale =
             mix(
                     1.0,
-                    0.42,
+                    0.18,
                     referenceRetention
             );
 
@@ -173,7 +186,7 @@ void main() {
     localDifferenceCap =
             max(
                     localDifferenceCap,
-                    predictedNoiseCap * 0.72
+                    predictedNoiseCap * 0.30
             );
 
     float reconstructedDifference =

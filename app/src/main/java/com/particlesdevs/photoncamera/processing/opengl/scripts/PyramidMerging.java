@@ -1330,6 +1330,18 @@ public class PyramidMerging extends GLOneScript {
             glProg.setLayout(tile, tile, 1);
 
             if (motionEqualExposureStack) {
+                Log.d(
+                        Name,
+                        "MOTION_26220_SHADER_SELECTED"
+                                + " shader=merge/motionmerge11"
+                                + " frames=" + images.size()
+                                + " normalizedTextureRetention=true"
+                                + " textureRatioStart=1.05"
+                                + " textureRatioFull=2.50"
+                                + " minimumTemporalScale=0.18"
+                                + " minimumDifferenceFloor=0.30"
+                );
+
                 glProg.useAssetProgram(
                         "merge/motionmerge11",
                         true
@@ -1528,13 +1540,13 @@ public class PyramidMerging extends GLOneScript {
 
             Log.d(
                     Name,
-                    "MOTION_26219_REFERENCE_DETAIL"
-                            + " algorithm=textureAwareTemporalRetention"
-                            + " textureRatioStart=1.35"
-                            + " textureRatioFull=4.50"
-                            + " minimumTemporalScale=0.42"
-                            + " contributionUncertainStart=0.35"
-                            + " contributionUncertainFull=0.85"
+                    "MOTION_26220_REFERENCE_DETAIL"
+                            + " algorithm=normalizedTextureAwareTemporalRetention"
+                            + " textureRatioStart=1.05"
+                            + " textureRatioFull=2.50"
+                            + " minimumTemporalScale=0.18"
+                            + " contributionUncertainStart=0.30"
+                            + " contributionUncertainFull=0.80"
                             + " contributionMean="
                             + motionContributionMean
                             + " contributionP10="
