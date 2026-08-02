@@ -255,12 +255,38 @@ void main() {
                         )
                 );
 
+        /*
+         * Build 26229:
+         * Lower the absolute floor only in genuinely dark regions. Bright
+         * regions retain the conservative 26228 floor. The modeled-noise and
+         * same-CFA spatial-deviation tests remain mandatory.
+         */
+        float localBrightness =
+                dot(
+                        max(
+                                max(correctedBase, correctedCandidate),
+                                mean
+                        ),
+                        vec4(0.25)
+                );
+
+        float adaptiveAbsoluteFloor =
+                mix(
+                        0.012,
+                        0.025,
+                        smoothstep(
+                                0.035,
+                                0.20,
+                                localBrightness
+                        )
+                );
+
         vec4 impulseThreshold =
                 max(
-                        noise * 8.0,
+                        noise * 5.0,
                         max(
-                                spatialDeviation * 2.75,
-                                vec4(0.025)
+                                spatialDeviation * 2.0,
+                                vec4(adaptiveAbsoluteFloor)
                         )
                 );
 
@@ -291,7 +317,7 @@ void main() {
         if (
                 candidateResidual.r > impulseThreshold.r
                         && candidateResidual.r
-                                > max(candidateOtherR, 0.0) * 1.35
+                                > max(candidateOtherR, 0.0) * 1.20
                                         + noise.r * 2.0
         ) {
             correctedCandidate.r =
@@ -304,7 +330,7 @@ void main() {
         } else if (
                 baseResidual.r > impulseThreshold.r
                         && baseResidual.r
-                                > max(baseOtherR, 0.0) * 1.35
+                                > max(baseOtherR, 0.0) * 1.20
                                         + noise.r * 2.0
         ) {
             correctedBase.r =
@@ -319,7 +345,7 @@ void main() {
         if (
                 candidateResidual.g > impulseThreshold.g
                         && candidateResidual.g
-                                > max(candidateOtherG1, 0.0) * 1.35
+                                > max(candidateOtherG1, 0.0) * 1.20
                                         + noise.g * 2.0
         ) {
             correctedCandidate.g =
@@ -332,7 +358,7 @@ void main() {
         } else if (
                 baseResidual.g > impulseThreshold.g
                         && baseResidual.g
-                                > max(baseOtherG1, 0.0) * 1.35
+                                > max(baseOtherG1, 0.0) * 1.20
                                         + noise.g * 2.0
         ) {
             correctedBase.g =
@@ -347,7 +373,7 @@ void main() {
         if (
                 candidateResidual.b > impulseThreshold.b
                         && candidateResidual.b
-                                > max(candidateOtherG2, 0.0) * 1.35
+                                > max(candidateOtherG2, 0.0) * 1.20
                                         + noise.b * 2.0
         ) {
             correctedCandidate.b =
@@ -360,7 +386,7 @@ void main() {
         } else if (
                 baseResidual.b > impulseThreshold.b
                         && baseResidual.b
-                                > max(baseOtherG2, 0.0) * 1.35
+                                > max(baseOtherG2, 0.0) * 1.20
                                         + noise.b * 2.0
         ) {
             correctedBase.b =
@@ -375,7 +401,7 @@ void main() {
         if (
                 candidateResidual.a > impulseThreshold.a
                         && candidateResidual.a
-                                > max(candidateOtherB, 0.0) * 1.35
+                                > max(candidateOtherB, 0.0) * 1.20
                                         + noise.a * 2.0
         ) {
             correctedCandidate.a =
@@ -388,7 +414,7 @@ void main() {
         } else if (
                 baseResidual.a > impulseThreshold.a
                         && baseResidual.a
-                                > max(baseOtherB, 0.0) * 1.35
+                                > max(baseOtherB, 0.0) * 1.20
                                         + noise.a * 2.0
         ) {
             correctedBase.a =

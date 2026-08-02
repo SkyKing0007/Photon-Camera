@@ -389,6 +389,151 @@ public class HdrxProcessor extends ProcessorBase {
             }
         }
 
+        /*
+         * Build 26229 — retained Motion stack exposure consistency audit.
+         *
+         * This does not reject or alter frames. It records the exact metadata
+         * carried into alignment so low-light softness can be separated into
+         * shutter blur, exposure inconsistency, or insufficient temporal
+         * contribution without creating a separate diagnostic APK.
+         */
+        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
+            int metadataFrames = 0;
+            int missingExposureFrames = 0;
+            int missingIsoFrames = 0;
+
+            long minimumExposureNs = Long.MAX_VALUE;
+            long maximumExposureNs = 0L;
+            int minimumIso = Integer.MAX_VALUE;
+            int maximumIso = 0;
+
+            double minimumEnergy = Double.POSITIVE_INFINITY;
+            double maximumEnergy = 0.0;
+            double energyLog2Sum = 0.0;
+            double energyLog2SquareSum = 0.0;
+
+            for (ImageFrame frame : images) {
+                long exposureNs = frame.diagnosticExposureNs;
+                int frameIso = frame.diagnosticIso;
+
+                if (exposureNs <= 0L) {
+                    missingExposureFrames++;
+                }
+                if (frameIso <= 0) {
+                    missingIsoFrames++;
+                }
+
+                if (exposureNs <= 0L || frameIso <= 0) {
+                    continue;
+                }
+
+                metadataFrames++;
+                minimumExposureNs =
+                        Math.min(minimumExposureNs, exposureNs);
+                maximumExposureNs =
+                        Math.max(maximumExposureNs, exposureNs);
+                minimumIso =
+                        Math.min(minimumIso, frameIso);
+                maximumIso =
+                        Math.max(maximumIso, frameIso);
+
+                double energy =
+                        (double) exposureNs * (double) frameIso;
+
+                minimumEnergy =
+                        Math.min(minimumEnergy, energy);
+                maximumEnergy =
+                        Math.max(maximumEnergy, energy);
+
+                double energyLog2 =
+                        Math.log(energy) / Math.log(2.0);
+
+                energyLog2Sum += energyLog2;
+                energyLog2SquareSum += energyLog2 * energyLog2;
+            }
+
+            double exposureSpreadEv =
+                    metadataFrames > 0
+                                    && minimumExposureNs > 0L
+                            ? Math.log(
+                                    (double) maximumExposureNs
+                                            / (double) minimumExposureNs
+                            ) / Math.log(2.0)
+                            : Double.NaN;
+
+            double isoSpreadEv =
+                    metadataFrames > 0
+                                    && minimumIso > 0
+                            ? Math.log(
+                                    (double) maximumIso
+                                            / (double) minimumIso
+                            ) / Math.log(2.0)
+                            : Double.NaN;
+
+            double energySpreadEv =
+                    metadataFrames > 0
+                                    && minimumEnergy > 0.0
+                            ? Math.log(
+                                    maximumEnergy / minimumEnergy
+                            ) / Math.log(2.0)
+                            : Double.NaN;
+
+            double energyMeanLog2 =
+                    metadataFrames > 0
+                            ? energyLog2Sum / metadataFrames
+                            : Double.NaN;
+
+            double energyVarianceLog2 =
+                    metadataFrames > 0
+                            ? Math.max(
+                                    0.0,
+                                    energyLog2SquareSum
+                                            / metadataFrames
+                                            - energyMeanLog2
+                                                * energyMeanLog2
+                            )
+                            : Double.NaN;
+
+            double energyStdDevEv =
+                    metadataFrames > 0
+                            ? Math.sqrt(energyVarianceLog2)
+                            : Double.NaN;
+
+            Log.d(
+                    TAG,
+                    "MOTION_26229_EXPOSURE_CONSISTENCY"
+                            + " retainedFrames=" + images.size()
+                            + " metadataFrames=" + metadataFrames
+                            + " missingExposureFrames="
+                            + missingExposureFrames
+                            + " missingIsoFrames="
+                            + missingIsoFrames
+                            + " exposureMinNs="
+                            + (
+                                    minimumExposureNs
+                                            == Long.MAX_VALUE
+                                            ? 0L
+                                            : minimumExposureNs
+                            )
+                            + " exposureMaxNs="
+                            + maximumExposureNs
+                            + " exposureSpreadEv="
+                            + exposureSpreadEv
+                            + " isoMin="
+                            + (
+                                    minimumIso
+                                            == Integer.MAX_VALUE
+                                            ? 0
+                                            : minimumIso
+                            )
+                            + " isoMax=" + maximumIso
+                            + " isoSpreadEv=" + isoSpreadEv
+                            + " energySpreadEv=" + energySpreadEv
+                            + " energyStdDevEv=" + energyStdDevEv
+                            + " renderingChanged=false"
+            );
+        }
+
         float minMpy = 1000.f;
         for (int i = 0; i < images.size(); i++) {
             if (images.get(i).pair.layerMpy < minMpy) {

@@ -289,6 +289,120 @@ public class ESD3D2 extends Node {
                             )
                             : 1.00f;
 
+            /*
+             * Build 26229:
+             * Preserve a little more micro-texture only when a Motion capture
+             * is both genuinely low-light and supported by a strong measured
+             * temporal stack. This does not increase sharpening and does not
+             * reduce denoise globally.
+             */
+            float lowLightTextureBoost = 0.0f;
+            float lowLightTextureScene = 0.0f;
+            float lowLightTextureConfidence = 0.0f;
+            float effectiveRatioConfidence = 0.0f;
+            float lowerPercentileConfidence = 0.0f;
+
+            if (
+                    motionNoiseProfile
+                            && basePipeline.mParameters
+                                    .localContributionMeasured
+            ) {
+                float motionIso =
+                        Math.max(
+                                1.0f,
+                                basePipeline.mParameters.iso
+                        );
+
+                lowLightTextureScene =
+                        Math2.clamp(
+                                (motionIso - 1600.0f) / 3200.0f,
+                                0.0f,
+                                1.0f
+                        );
+
+                effectiveRatioConfidence =
+                        Math2.clamp(
+                                (
+                                        basePipeline.mParameters
+                                                .effectiveStackRatio
+                                                - 0.45f
+                                ) / 0.35f,
+                                0.0f,
+                                1.0f
+                        );
+
+                lowerPercentileConfidence =
+                        Math2.clamp(
+                                (
+                                        basePipeline.mParameters
+                                                .localContributionP25
+                                                - 0.35f
+                                ) / 0.35f,
+                                0.0f,
+                                1.0f
+                        );
+
+                lowLightTextureConfidence =
+                        Math.min(
+                                effectiveRatioConfidence,
+                                lowerPercentileConfidence
+                        );
+
+                lowLightTextureBoost =
+                        0.06f
+                                * lowLightTextureScene
+                                * lowLightTextureConfidence;
+
+                texturePreservation =
+                        Math2.clamp(
+                                texturePreservation
+                                        * (
+                                                1.0f
+                                                        + lowLightTextureBoost
+                                        ),
+                                0.50f,
+                                2.00f
+                        );
+            }
+
+            Log.d(
+                    Name,
+                    "MOTION_26229_LOWLIGHT_TEXTURE"
+                            + " enabled=" + motionNoiseProfile
+                            + " measured="
+                            + basePipeline.mParameters
+                                    .localContributionMeasured
+                            + " iso="
+                            + basePipeline.mParameters.iso
+                            + " retainedFrames="
+                            + basePipeline.mParameters
+                                    .retainedFrameCount
+                            + " effectiveFrames="
+                            + basePipeline.mParameters
+                                    .effectiveFrameCount
+                            + " effectiveRatio="
+                            + basePipeline.mParameters
+                                    .effectiveStackRatio
+                            + " contributionP25="
+                            + basePipeline.mParameters
+                                    .localContributionP25
+                            + " lowLightScene="
+                            + lowLightTextureScene
+                            + " effectiveRatioConfidence="
+                            + effectiveRatioConfidence
+                            + " lowerPercentileConfidence="
+                            + lowerPercentileConfidence
+                            + " combinedConfidence="
+                            + lowLightTextureConfidence
+                            + " boostFraction="
+                            + lowLightTextureBoost
+                            + " textureApplied="
+                            + texturePreservation
+                            + " maximumBoostFraction=0.06"
+                            + " sharpeningChanged=false"
+                            + " broadDenoiseChanged=false"
+            );
+
             glProg.setDefine("TEXTUREPRESERVATION", texturePreservation);
             glProg.setDefine("MOIRE", moire);
             glProg.setDefine("LUMA", appliedLuma);
