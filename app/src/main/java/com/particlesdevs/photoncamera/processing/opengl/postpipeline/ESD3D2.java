@@ -6,6 +6,7 @@ import com.particlesdevs.photoncamera.R;
 import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
 import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
 import com.particlesdevs.photoncamera.settings.PreferenceKeys;
+import com.particlesdevs.photoncamera.settings.MotionLensNoiseProfile;
 import com.particlesdevs.photoncamera.processing.render.NoiseModeler;
 import com.particlesdevs.photoncamera.settings.annotations.Tunable;
 import com.particlesdevs.photoncamera.util.Math2;
@@ -131,6 +132,36 @@ public class ESD3D2 extends Node {
             float motionStableWeights =
                     0.0f;
 
+            float storedLuma =
+                    PreferenceKeys.getFloat(
+                            PreferenceKeys.Key.KEY_MOTION_LUMA_STRENGTH
+                    );
+            float storedChroma =
+                    PreferenceKeys.getFloat(
+                            PreferenceKeys.Key.KEY_MOTION_CHROMA_STRENGTH
+                    );
+            float storedTexture =
+                    PreferenceKeys.getFloat(
+                            PreferenceKeys.Key.KEY_MOTION_TEXTURE_PRESERVATION
+                    );
+            float storedSpatial =
+                    PreferenceKeys.getFloat(
+                            PreferenceKeys.Key.KEY_MOTION_SPATIAL_DENOISE
+                    );
+            float storedShadow =
+                    PreferenceKeys.getFloat(
+                            PreferenceKeys.Key.KEY_MOTION_SHADOW_CLEANUP
+                    );
+
+            MotionLensNoiseProfile.Resolved automaticLensProfile =
+                    MotionLensNoiseProfile.resolve(
+                            storedLuma,
+                            storedChroma,
+                            storedTexture,
+                            storedSpatial,
+                            storedShadow
+                    );
+
             if (com.particlesdevs.photoncamera.app.PhotonCamera
                     .getSettings().selectedMode
                     == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
@@ -177,9 +208,7 @@ public class ESD3D2 extends Node {
 
                 float perLensShadowCleanup =
                         Math2.clamp(
-                                PreferenceKeys.getFloat(
-                                        PreferenceKeys.Key.KEY_MOTION_SHADOW_CLEANUP
-                                ),
+                                automaticLensProfile.shadow,
                                 0.50f,
                                 1.50f
                         );
@@ -238,9 +267,7 @@ public class ESD3D2 extends Node {
             float configuredLuma =
                     motionNoiseProfile
                             ? Math2.clamp(
-                                PreferenceKeys.getFloat(
-                                        PreferenceKeys.Key.KEY_MOTION_LUMA_STRENGTH
-                                ),
+                                automaticLensProfile.luma,
                                 0.40f,
                                 1.00f
                             )
@@ -256,9 +283,7 @@ public class ESD3D2 extends Node {
             float texturePreservation =
                     motionNoiseProfile
                             ? Math2.clamp(
-                                PreferenceKeys.getFloat(
-                                        PreferenceKeys.Key.KEY_MOTION_TEXTURE_PRESERVATION
-                                ),
+                                automaticLensProfile.texture,
                                 0.50f,
                                 2.00f
                             )
@@ -300,9 +325,7 @@ public class ESD3D2 extends Node {
             float spatialDenoiseStrength =
                     motionNoiseProfile
                             ? Math2.clamp(
-                                PreferenceKeys.getFloat(
-                                        PreferenceKeys.Key.KEY_MOTION_SPATIAL_DENOISE
-                                ),
+                                automaticLensProfile.spatial,
                                 0.50f,
                                 1.50f
                             )
@@ -387,10 +410,20 @@ public class ESD3D2 extends Node {
                             + " perLensShadowCleanup="
                             + (
                                 motionNoiseProfile
-                                        ? PreferenceKeys.getFloat(
-                                            PreferenceKeys.Key.KEY_MOTION_SHADOW_CLEANUP
-                                        )
+                                        ? automaticLensProfile.shadow
                                         : 1.0f
+                            )
+                            + " autoLensType="
+                            + (
+                                motionNoiseProfile
+                                        ? automaticLensProfile.lensType
+                                        : MotionLensNoiseProfile.LensType.STANDARD
+                            )
+                            + " autoEquivalentMm="
+                            + (
+                                motionNoiseProfile
+                                        ? automaticLensProfile.equivalentFocalLengthMm
+                                        : Float.NaN
                             )
                             + " chromaIndependent=true"
                             + " nightModeAffected=false"
