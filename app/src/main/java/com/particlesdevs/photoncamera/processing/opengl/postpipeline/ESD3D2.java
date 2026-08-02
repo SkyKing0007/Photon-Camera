@@ -5,6 +5,7 @@ import com.particlesdevs.photoncamera.util.Log;
 import com.particlesdevs.photoncamera.R;
 import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
 import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+import com.particlesdevs.photoncamera.settings.PreferenceKeys;
 import com.particlesdevs.photoncamera.processing.render.NoiseModeler;
 import com.particlesdevs.photoncamera.settings.annotations.Tunable;
 import com.particlesdevs.photoncamera.util.Math2;
@@ -174,6 +175,15 @@ public class ESD3D2 extends Node {
                  */
                 float lowIsoMotionShadowBoost = 0.15f;
 
+                float perLensShadowCleanup =
+                        Math2.clamp(
+                                PreferenceKeys.getFloat(
+                                        PreferenceKeys.Key.KEY_MOTION_SHADOW_CLEANUP
+                                ),
+                                0.50f,
+                                1.50f
+                        );
+
                 appliedShadowBoost =
                         Math2.mix(
                                 lowIsoMotionShadowBoost,
@@ -182,7 +192,7 @@ public class ESD3D2 extends Node {
                                         motionShadowBoostMaximum
                                 ),
                                 highIsoBlend
-                        );
+                        ) * perLensShadowCleanup;
 
                 Log.d(
                         Name,
@@ -220,13 +230,41 @@ public class ESD3D2 extends Node {
                     ((PostPipeline) basePipeline)
                             .indoorHdrSceneStrength;
 
+            boolean motionNoiseProfile =
+                    com.particlesdevs.photoncamera.app.PhotonCamera
+                            .getSettings().selectedMode
+                            == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+
+            float configuredLuma =
+                    motionNoiseProfile
+                            ? Math2.clamp(
+                                PreferenceKeys.getFloat(
+                                        PreferenceKeys.Key.KEY_MOTION_LUMA_STRENGTH
+                                ),
+                                0.40f,
+                                1.00f
+                            )
+                            : luma;
+
             float appliedLuma =
                     Math2.mix(
-                            luma,
-                            luma * 0.55f,
+                            configuredLuma,
+                            configuredLuma * 0.55f,
                             indoorHdrStrength
                     );
 
+            float texturePreservation =
+                    motionNoiseProfile
+                            ? Math2.clamp(
+                                PreferenceKeys.getFloat(
+                                        PreferenceKeys.Key.KEY_MOTION_TEXTURE_PRESERVATION
+                                ),
+                                0.50f,
+                                2.00f
+                            )
+                            : 1.00f;
+
+            glProg.setDefine("TEXTUREPRESERVATION", texturePreservation);
             glProg.setDefine("MOIRE", moire);
             glProg.setDefine("LUMA", appliedLuma);
             glProg.setDefine("CHROMASTRENGTH", chromaStrength);
@@ -258,6 +296,19 @@ public class ESD3D2 extends Node {
                             (float) kernelSize * 0.62f,
                             indoorHdrStrength
                     );
+
+            float spatialDenoiseStrength =
+                    motionNoiseProfile
+                            ? Math2.clamp(
+                                PreferenceKeys.getFloat(
+                                        PreferenceKeys.Key.KEY_MOTION_SPATIAL_DENOISE
+                                ),
+                                0.50f,
+                                1.50f
+                            )
+                            : 1.00f;
+
+            kernelSize *= spatialDenoiseStrength;
 
             int msize;
             boolean motionMode =
@@ -330,7 +381,18 @@ public class ESD3D2 extends Node {
                             + " textureLumaModerateFactor=0.82"
                             + " textureLumaStrongFactor=0.70"
                             + " flatLumaUnchanged=true"
-                            + " chromaUnchanged=true"
+                            + " perLensLuma=" + configuredLuma
+                            + " perLensTexturePreservation=" + texturePreservation
+                            + " perLensSpatialDenoise=" + spatialDenoiseStrength
+                            + " perLensShadowCleanup="
+                            + (
+                                motionNoiseProfile
+                                        ? PreferenceKeys.getFloat(
+                                            PreferenceKeys.Key.KEY_MOTION_SHADOW_CLEANUP
+                                        )
+                                        : 1.0f
+                            )
+                            + " chromaIndependent=true"
                             + " nightModeAffected=false"
             );
             glProg.setDefine("KERNELSIZE", (float)(kernelSize));

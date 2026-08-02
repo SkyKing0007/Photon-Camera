@@ -29,6 +29,7 @@ out vec4 Output;
 #define INTENSE 1.0
 #define MOIRE 1.0
 #define LUMA 0.0
+#define TEXTUREPRESERVATION 1.0
 #define SHADOWBOOST 0.5
 #define CHROMASTRENGTH 1.0
 #define MOTIONNOISEBLEND 0.0
@@ -156,16 +157,26 @@ void main() {
     float localTextureRange = localLumaMaximum - localLumaMinimum;
     float modeledNoiseAmplitude = sqrt(max(sigY, 0.0000001));
 
+    float safeTexturePreservation =
+            max(
+                    TEXTUREPRESERVATION,
+                    0.25
+            );
+
     float moderateTextureThreshold =
             max(
-                    0.018,
-                    modeledNoiseAmplitude * 1.35
+                    0.018 / safeTexturePreservation,
+                    modeledNoiseAmplitude
+                            * 1.35
+                            / safeTexturePreservation
             );
 
     float strongTextureThreshold =
             max(
-                    0.035,
-                    modeledNoiseAmplitude * 2.40
+                    0.035 / safeTexturePreservation,
+                    modeledNoiseAmplitude
+                            * 2.40
+                            / safeTexturePreservation
             );
 
     /*

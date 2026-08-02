@@ -480,6 +480,17 @@ public class PreferenceKeys {
         KEY_CAMERA_SOUNDS(R.string.pref_camera_sounds_key),
         KEY_CHROMA_NR_SEEKBAR(R.string.pref_chroma_nr_seekbar_key),
         KEY_LUMA_NR_SEEKBAR(R.string.pref_luma_nr_seekbar_key),
+
+        /*
+         * Build 26225:
+         * Normal preferences, intentionally not pref_tunable_*.
+         * PreferenceKeys automatically stores them in the active lens JSON.
+         */
+        KEY_MOTION_LUMA_STRENGTH(R.string.pref_motion_luma_strength_key),
+        KEY_MOTION_CHROMA_STRENGTH(R.string.pref_motion_chroma_strength_key),
+        KEY_MOTION_TEXTURE_PRESERVATION(R.string.pref_motion_texture_preservation_key),
+        KEY_MOTION_SPATIAL_DENOISE(R.string.pref_motion_spatial_denoise_key),
+        KEY_MOTION_SHADOW_CLEANUP(R.string.pref_motion_shadow_cleanup_key),
         KEY_COMPRESSOR_SEEKBAR(R.string.pref_compressor_seekbar_key),
         KEY_NOISESTR_SEEKBAR(R.string.pref_noise_seekbar_key),
         KEY_MERGE_SEEKBAR(R.string.pref_merge_seekbar_key),

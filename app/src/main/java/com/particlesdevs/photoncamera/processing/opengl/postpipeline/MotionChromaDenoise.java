@@ -3,6 +3,7 @@ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
 import com.particlesdevs.photoncamera.api.CameraMode;
 import com.particlesdevs.photoncamera.app.PhotonCamera;
 import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+import com.particlesdevs.photoncamera.settings.PreferenceKeys;
 import com.particlesdevs.photoncamera.settings.annotations.Tunable;
 import com.particlesdevs.photoncamera.util.Log;
 import com.particlesdevs.photoncamera.util.Math2;
@@ -138,10 +139,25 @@ public class MotionChromaDenoise extends Node {
                         1.0f
                 );
 
+        float perLensChromaMaximum =
+                Math2.clamp(
+                        PreferenceKeys.getFloat(
+                                PreferenceKeys.Key.KEY_MOTION_CHROMA_STRENGTH
+                        ),
+                        0.0f,
+                        0.60f
+                );
+
+        float perLensExtremeNightMaximum =
+                Math.min(
+                        0.76f,
+                        perLensChromaMaximum + 0.16f
+                );
+
         float maximumStrength =
                 Math2.mix(
-                        motionChromaCleanupMaximum,
-                        motionExtremeNightChromaMaximum,
+                        perLensChromaMaximum,
+                        perLensExtremeNightMaximum,
                         extremeNightBlend
                 );
 
@@ -246,6 +262,9 @@ public class MotionChromaDenoise extends Node {
                             + " strength=" + strength
                             + " radiusPixels=" + actualRadiusPixels
                             + " passes=1"
+                            + " perLensChromaMaximum=" + perLensChromaMaximum
+                            + " perLensExtremeNightMaximum="
+                            + perLensExtremeNightMaximum
                             + " detailPreserving=true"
             );
 
