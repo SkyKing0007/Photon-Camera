@@ -251,19 +251,67 @@ public class ESD3D2 extends Node {
                             indoorHdrStrength
                     );
 
-            int msize =
+            int msize;
+            boolean motionMode =
+                    com.particlesdevs.photoncamera.app.PhotonCamera
+                            .getSettings().selectedMode
+                            == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+
+            float motionIso =
+                    motionMode
+                            ? Math.max(
+                                    1.0f,
+                                    basePipeline.mParameters.iso
+                            )
+                            : 0.0f;
+
+            int appliedMinSize =
+                    motionMode
+                            ? (
+                                motionIso < 800.0f
+                                        ? 3
+                                        : (
+                                            motionIso < 1600.0f
+                                                    ? 5
+                                                    : 7
+                                        )
+                            )
+                            : minSize;
+
+            int appliedMaxSize =
+                    motionMode
+                            ? (
+                                motionIso < 800.0f
+                                        ? 9
+                                        : (
+                                            motionIso < 1600.0f
+                                                    ? 13
+                                                    : (
+                                                        motionIso < 3200.0f
+                                                                ? 17
+                                                                : maxSize
+                                                    )
+                                        )
+                            )
+                            : maxSize;
+
+            msize =
                     Math.min(
-                            minSize
+                            appliedMinSize
                                     + (int) kernelSize
                                     - (int) kernelSize % 2,
-                            maxSize
+                            appliedMaxSize
                     );
 
             Log.d(
                     "ESD3D",
-                    "MOTION_26218_UPSTREAM_DETAIL"
+                    "MOTION_26221_ESD_DETAIL"
                             + " kernelSize=" + kernelSize
                             + " MSIZE=" + msize
+                            + " appliedMinSize=" + appliedMinSize
+                            + " appliedMaxSize=" + appliedMaxSize
+                            + " motionMode=" + motionMode
+                            + " motionIso=" + motionIso
                             + " indoorHdrStrength="
                             + indoorHdrStrength
                             + " lumaConfigured=" + luma
@@ -298,32 +346,170 @@ public class ESD3D2 extends Node {
             WorkingTexture = previousNode.WorkingTexture;
             return;
         }
-        float N = (float) Math.sqrt(0.5 * basePipeline.noiseS + basePipeline.noiseO);
+
+        boolean motionMode =
+                com.particlesdevs.photoncamera.app.PhotonCamera
+                        .getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+
+        float N =
+                (float) Math.sqrt(
+                        0.5 * basePipeline.noiseS
+                                + basePipeline.noiseO
+                );
+
         float targetN = noiseTarget;
-        float scaleF = Math2.clamp(N/targetN, 1.0f, 4.0f);
-        int scale = (int)(scaleF + 0.5f);
-        GLTexture outp;
-        Log.d(Name, "Scaling factor:" + scale);
-        if(!useColorDenoising){
-            outp = previousNode.WorkingTexture;
+        float scaleF;
+
+        if (motionMode) {
+            /*
+             * Build 26221:
+             * PostPipeline forces noiseO to at least 1/4096. The old N/targetN
+             * formula therefore forced scale 4 even at moderate ISO.
+             * Remove that known floor before mapping excess noise to scale.
+             */
+            float forcedReadNoiseFloor =
+                    (float) Math.sqrt(1.0f / 4096.0f);
+
+            float excessNoise =
+                    Math.max(
+                            0.0f,
+                            N - forcedReadNoiseFloor
+                    );
+
+            scaleF =
+                    Math2.clamp(
+                            1.0f + excessNoise / targetN,
+                            1.0f,
+                            4.0f
+                    );
         } else {
-            if (scale != 1) {
-                basePipeline.main4 = glUtils.gaussdown(previousNode.WorkingTexture, scale);
-                WorkingTexture = basePipeline.getMain();
-                ESD3DRun(basePipeline.main4, WorkingTexture, 0.0f, scaleF * 0.75f);
-                outp = basePipeline.getMain();
-                guidedUpsample(WorkingTexture, basePipeline.main4, previousNode.WorkingTexture, outp, scale);
-            } else {
-                WorkingTexture = basePipeline.getMain();
-                ESD3DRun(previousNode.WorkingTexture, WorkingTexture, 0.0f, 1.0f);
-                outp = basePipeline.getMain();
-                guidedUpsample(WorkingTexture, previousNode.WorkingTexture, previousNode.WorkingTexture, outp, scale);
-            }
+            scaleF =
+                    Math2.clamp(
+                            N / targetN,
+                            1.0f,
+                            4.0f
+                    );
         }
-        WorkingTexture = basePipeline.getMain();
-        ESD3DRun(outp, WorkingTexture, moire, 1.0f);
+
+        int scale = (int) (scaleF + 0.5f);
+
+        Log.d(
+                Name,
+                "MOTION_26221_ESD_SCALE"
+                        + " motionMode=" + motionMode
+                        + " N=" + N
+                        + " targetN=" + targetN
+                        + " scaleF=" + scaleF
+                        + " scale=" + scale
+                        + " singlePassMotion=true"
+        );
+
+        if (motionMode) {
+            /*
+             * Motion receives exactly one ESD pass.
+             *
+             * scale 1: one full-resolution pass.
+             * scale 2-4: one low-resolution pass followed by guided upsample.
+             * Do not denoise the reconstructed full-resolution image again.
+             */
+            if (!useColorDenoising || scale == 1) {
+                WorkingTexture = basePipeline.getMain();
+                ESD3DRun(
+                        previousNode.WorkingTexture,
+                        WorkingTexture,
+                        moire,
+                        1.0f
+                );
+            } else {
+                basePipeline.main4 =
+                        glUtils.gaussdown(
+                                previousNode.WorkingTexture,
+                                scale
+                        );
+
+                GLTexture lowDenoised = basePipeline.getMain();
+
+                ESD3DRun(
+                        basePipeline.main4,
+                        lowDenoised,
+                        moire,
+                        scaleF * 0.75f
+                );
+
+                WorkingTexture = basePipeline.getMain();
+
+                guidedUpsample(
+                        lowDenoised,
+                        basePipeline.main4,
+                        previousNode.WorkingTexture,
+                        WorkingTexture,
+                        scale
+                );
+            }
+        } else {
+            /*
+             * Preserve established behavior for all non-Motion modes.
+             */
+            GLTexture outp;
+
+            if (!useColorDenoising) {
+                outp = previousNode.WorkingTexture;
+            } else {
+                if (scale != 1) {
+                    basePipeline.main4 =
+                            glUtils.gaussdown(
+                                    previousNode.WorkingTexture,
+                                    scale
+                            );
+
+                    WorkingTexture = basePipeline.getMain();
+
+                    ESD3DRun(
+                            basePipeline.main4,
+                            WorkingTexture,
+                            0.0f,
+                            scaleF * 0.75f
+                    );
+
+                    outp = basePipeline.getMain();
+
+                    guidedUpsample(
+                            WorkingTexture,
+                            basePipeline.main4,
+                            previousNode.WorkingTexture,
+                            outp,
+                            scale
+                    );
+                } else {
+                    WorkingTexture = basePipeline.getMain();
+
+                    ESD3DRun(
+                            previousNode.WorkingTexture,
+                            WorkingTexture,
+                            0.0f,
+                            1.0f
+                    );
+
+                    outp = basePipeline.getMain();
+
+                    guidedUpsample(
+                            WorkingTexture,
+                            previousNode.WorkingTexture,
+                            previousNode.WorkingTexture,
+                            outp,
+                            scale
+                    );
+                }
+            }
+
+            WorkingTexture = basePipeline.getMain();
+            ESD3DRun(outp, WorkingTexture, moire, 1.0f);
+        }
+
         glProg.closed = true;
-        if(basePipeline.main4 != null){
+
+        if (basePipeline.main4 != null) {
             basePipeline.main4.close();
             basePipeline.main4 = null;
         }
