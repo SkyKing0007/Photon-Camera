@@ -115,7 +115,25 @@ public class HdrxProcessor extends ProcessorBase {
         Log.d(TAG, "Api WhiteLevel:" + characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL));
         Log.d(TAG, "Api BlackLevel:" + characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN));
         Parameters processingParameters = new Parameters();
-        processingParameters.FillConstParameters(characteristics, new Point(width, height));
+        processingParameters.motionCapture =
+                cameraMode == CameraMode.MOTION;
+        processingParameters.FillConstParameters(
+                characteristics,
+                new Point(width, height)
+        );
+
+        if (processingParameters.motionCapture) {
+            Log.w(
+                    TAG,
+                    "MOTION_26232_DIAGNOSTIC_BEGIN"
+                            + " configuredCameraMode=" + cameraMode
+                            + " liveUiMode="
+                            + PhotonCamera.getSettings().selectedMode
+                            + " inputFrames="
+                            + mImageFramesToProcess.size()
+                            + " immutableMotionCapture=true"
+            );
+        }
         // sort by timestamp first
         mImageFramesToProcess.sort(Comparator.comparingLong(ImageFrame::getTimestamp));
         double minExpo = exposures.get(mImageFramesToProcess.get(0).getTimestamp());
@@ -397,7 +415,8 @@ public class HdrxProcessor extends ProcessorBase {
          * shutter blur, exposure inconsistency, or insufficient temporal
          * contribution without creating a separate diagnostic APK.
          */
-        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
+        if (processingParameters.motionCapture) {
+
             int metadataFrames = 0;
             int missingExposureFrames = 0;
             int missingIsoFrames = 0;
@@ -501,7 +520,7 @@ public class HdrxProcessor extends ProcessorBase {
 
             Log.d(
                     TAG,
-                    "MOTION_26229_EXPOSURE_CONSISTENCY"
+                    "MOTION_26232_EXPOSURE_CONSISTENCY"
                             + " retainedFrames=" + images.size()
                             + " metadataFrames=" + metadataFrames
                             + " missingExposureFrames="
@@ -955,6 +974,28 @@ public class HdrxProcessor extends ProcessorBase {
         PostPipeline pipeline = new PostPipeline();
 
         Bitmap img = pipeline.Run(output, processingParameters);
+
+        if (processingParameters.motionCapture) {
+            Log.w(
+                    TAG,
+                    "MOTION_26232_DIAGNOSTIC_END"
+                            + " retainedFrames="
+                            + processingParameters.retainedFrameCount
+                            + " effectiveFrames="
+                            + processingParameters.effectiveFrameCount
+                            + " effectiveRatio="
+                            + processingParameters.effectiveStackRatio
+                            + " contributionMeasured="
+                            + processingParameters.localContributionMeasured
+                            + " contributionP25="
+                            + processingParameters.localContributionP25
+                            + " iso=" + processingParameters.iso
+                            + " exposureSeconds="
+                            + processingParameters.exposureTime
+                            + " completedPipeline=true"
+            );
+        }
+
         Allocator.free(output);
 
         img = overlay(img, pipeline.debugData.toArray(new Bitmap[0]));

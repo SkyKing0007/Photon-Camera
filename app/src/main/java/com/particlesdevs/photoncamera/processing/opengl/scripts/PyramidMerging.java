@@ -952,7 +952,7 @@ public class PyramidMerging extends GLOneScript {
             for (int i = 0; i < numVarianceBins; i++) {
                 wWindow = Math2.mix(Math.max(wWindow, weights[i]), weights[i], 0.025f);
                 weights[i] = 0.5f + wWindow / wSum;
-                Log.d("DynamicNoise", "Variance weight: " + weights[i]);
+                // Build 26231: per-bin DynamicNoise logging suppressed to preserve saved-log capacity.
             }
             // Weighted linear regression: variance = NoiseS * brightness + NoiseO
             double sumW = 0, sumWb = 0, sumWv = 0, sumWb2 = 0, sumWbv = 0;
@@ -974,7 +974,7 @@ public class PyramidMerging extends GLOneScript {
                 variance *= 1.4826;
                 variance = Math.pow(variance, 2.0);
 
-                Log.d("DynamicNoise", "vin:"+ vin + " bin: " + bin + " Variance raw: " + variance + " brightness: " + brightness + " count: " + count);
+                // Build 26231: per-bin DynamicNoise logging suppressed to preserve saved-log capacity.
                 double w = count * 1.0f;
                 sumW += w;
                 sumWb += w * brightness;
@@ -990,7 +990,7 @@ public class PyramidMerging extends GLOneScript {
                     double fitS = (sumW * sumWbv - sumWb * sumWv) / denom;
                     double fitO = (sumWv - fitS * sumWb) / sumW;
                     fitS = Math.max(fitS, 1e-10);
-                    Log.d("DynamicNoise",  "Fit S:" + fitS + " O:" + fitO);
+                // Build 26231: per-bin DynamicNoise logging suppressed to preserve saved-log capacity.
                     // Keep at least 5% of original read noise so we don't collapse to zero on noisy sensors
                     double minO = 0.05 * noiseO;
                     fitO = Math.max(fitO, minO);
@@ -1029,15 +1029,33 @@ public class PyramidMerging extends GLOneScript {
             }
         }
         parameters.noiseModeler.setAdaptiveMpy(adaptiveNMpy);
+
+        if (parameters.motionCapture) {
+            Log.w(
+                    "DynamicNoise",
+                    "MOTION_26232_DYNAMIC_NOISE_SUMMARY"
+                            + " adaptiveMpy=" + adaptiveNMpy
+                            + " noiseS=" + noiseS
+                            + " noiseO=" + noiseO
+                            + " perBinLogging=false"
+                            + " savedLogProtected=true"
+            );
+        }
+
         double noisempy = Math.pow(2.0, PhotonCamera.getSettings().mergeStrength);
         //double noiseMin = 1.0/(double)parameters.whiteLevel;
         double noiseMin = 1e-6;
         noiseS = (float)Math.max(noiseS * noisempy * adaptiveNMpy * adaptiveNMpy,noiseMin);
         noiseO = (float)Math.max(noiseO * noisempy * adaptiveNMpy * adaptiveNMpy,noiseMin);
 
+        /*
+         * Build 26230:
+         * The live selectedMode can change while HDRX runs. Use the immutable
+         * capture identity carried in Parameters so Motion merge, counters and
+         * contribution diagnostics cannot silently disable themselves.
+         */
         final boolean motionEqualExposureStack =
-                PhotonCamera.getSettings().selectedMode
-                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+                parameters.motionCapture;
 
         /*
          * vec4 length is approximately two times one-channel sigma.
@@ -1151,7 +1169,7 @@ public class PyramidMerging extends GLOneScript {
 
             Log.d(
                     Name,
-                    "MOTION_26228_TEMPORAL_IMPULSE"
+                    "MOTION_26232_TEMPORAL_IMPULSE_RETIRED"
                             + " enabled=true"
                             + " scope=motionOnly"
                             + " thresholdSigma=5.0"
@@ -1404,11 +1422,6 @@ public class PyramidMerging extends GLOneScript {
                                         images.size()
                                 )
                 );
-
-                glProg.setBufferCompute(
-                        "TemporalImpulseStats",
-                        motionImpulseStats
-                );
             }
 
             base = getBase();
@@ -1640,33 +1653,6 @@ public class PyramidMerging extends GLOneScript {
 
     @Override
     public void AfterRun() {
-        if (motionImpulseStats != null) {
-            int[] impulseStats =
-                    motionImpulseStats.readBufferIntegers(false);
-
-            if (impulseStats != null && impulseStats.length >= 5) {
-                Log.d(
-                        Name,
-                        "MOTION_26228_TEMPORAL_IMPULSE_RESULT"
-                                + " totalChannelCorrections="
-                                + impulseStats[0]
-                                + " R=" + impulseStats[1]
-                                + " G1=" + impulseStats[2]
-                                + " G2=" + impulseStats[3]
-                                + " B=" + impulseStats[4]
-                                + " interpretation=perFrameChannelEvents"
-                );
-            } else {
-                Log.d(
-                        Name,
-                        "MOTION_26228_TEMPORAL_IMPULSE_RESULT"
-                                + " unavailable=true"
-                );
-            }
-
-            motionImpulseStats.close();
-            motionImpulseStats = null;
-        }
 
         if(hotPixelBuffer != null) hotPixelBuffer.close();
         inputAlter.close();

@@ -259,10 +259,12 @@ public class ESD3D2 extends Node {
                     ((PostPipeline) basePipeline)
                             .indoorHdrSceneStrength;
 
+            /*
+             * Build 26230:
+             * Use immutable capture identity rather than the live UI mode.
+             */
             boolean motionNoiseProfile =
-                    com.particlesdevs.photoncamera.app.PhotonCamera
-                            .getSettings().selectedMode
-                            == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+                    basePipeline.mParameters.motionCapture;
 
             float configuredLuma =
                     motionNoiseProfile
@@ -290,85 +292,75 @@ public class ESD3D2 extends Node {
                             : 1.00f;
 
             /*
-             * Build 26229:
-             * Preserve a little more micro-texture only when a Motion capture
-             * is both genuinely low-light and supported by a strong measured
-             * temporal stack. This does not increase sharpening and does not
-             * reduce denoise globally.
+             * Build 26230:
+             * Do not increase texture preservation globally. The global stack
+             * measurements only authorize a small spatially local edge gate in
+             * esd3d2.glsl. Flat/noisy regions keep the exact 26227/26229 ESD
+             * settings.
              */
-            float lowLightTextureBoost = 0.0f;
-            float lowLightTextureScene = 0.0f;
-            float lowLightTextureConfidence = 0.0f;
-            float effectiveRatioConfidence = 0.0f;
-            float lowerPercentileConfidence = 0.0f;
-
-            if (
+            float lowLightScene =
                     motionNoiseProfile
-                            && basePipeline.mParameters
-                                    .localContributionMeasured
-            ) {
-                float motionIso =
-                        Math.max(
-                                1.0f,
-                                basePipeline.mParameters.iso
-                        );
-
-                lowLightTextureScene =
-                        Math2.clamp(
-                                (motionIso - 1600.0f) / 3200.0f,
+                            ? Math2.clamp(
+                                (
+                                        basePipeline.mParameters.iso
+                                                - 1600.0f
+                                ) / 3200.0f,
                                 0.0f,
                                 1.0f
-                        );
+                            )
+                            : 0.0f;
 
-                effectiveRatioConfidence =
-                        Math2.clamp(
+            float effectiveRatioConfidence =
+                    motionNoiseProfile
+                                    && basePipeline.mParameters
+                                            .localContributionMeasured
+                            ? Math2.clamp(
                                 (
                                         basePipeline.mParameters
                                                 .effectiveStackRatio
-                                                - 0.45f
-                                ) / 0.35f,
+                                                - 0.50f
+                                ) / 0.30f,
                                 0.0f,
                                 1.0f
-                        );
+                            )
+                            : 0.0f;
 
-                lowerPercentileConfidence =
-                        Math2.clamp(
+            float lowerPercentileConfidence =
+                    motionNoiseProfile
+                                    && basePipeline.mParameters
+                                            .localContributionMeasured
+                            ? Math2.clamp(
                                 (
                                         basePipeline.mParameters
                                                 .localContributionP25
-                                                - 0.35f
-                                ) / 0.35f,
+                                                - 0.40f
+                                ) / 0.30f,
                                 0.0f,
                                 1.0f
-                        );
+                            )
+                            : 0.0f;
 
-                lowLightTextureConfidence =
-                        Math.min(
-                                effectiveRatioConfidence,
-                                lowerPercentileConfidence
-                        );
+            float temporalEdgeAuthorization =
+                    Math.min(
+                            effectiveRatioConfidence,
+                            lowerPercentileConfidence
+                    );
 
-                lowLightTextureBoost =
-                        0.06f
-                                * lowLightTextureScene
-                                * lowLightTextureConfidence;
+            glProg.setDefine(
+                    "MOTIONLOWLIGHTSCENE",
+                    lowLightScene
+            );
+            glProg.setDefine(
+                    "MOTIONEDGECONFIDENCE",
+                    temporalEdgeAuthorization
+            );
 
-                texturePreservation =
-                        Math2.clamp(
-                                texturePreservation
-                                        * (
-                                                1.0f
-                                                        + lowLightTextureBoost
-                                        ),
-                                0.50f,
-                                2.00f
-                        );
-            }
-
-            Log.d(
+            Log.w(
                     Name,
-                    "MOTION_26229_LOWLIGHT_TEXTURE"
+                    "MOTION_26232_EDGE_TEXTURE"
                             + " enabled=" + motionNoiseProfile
+                            + " immutableMotionCapture="
+                            + basePipeline.mParameters.motionCapture
                             + " measured="
                             + basePipeline.mParameters
                                     .localContributionMeasured
@@ -387,18 +379,11 @@ public class ESD3D2 extends Node {
                             + basePipeline.mParameters
                                     .localContributionP25
                             + " lowLightScene="
-                            + lowLightTextureScene
-                            + " effectiveRatioConfidence="
-                            + effectiveRatioConfidence
-                            + " lowerPercentileConfidence="
-                            + lowerPercentileConfidence
-                            + " combinedConfidence="
-                            + lowLightTextureConfidence
-                            + " boostFraction="
-                            + lowLightTextureBoost
-                            + " textureApplied="
-                            + texturePreservation
-                            + " maximumBoostFraction=0.06"
+                            + lowLightScene
+                            + " edgeAuthorization="
+                            + temporalEdgeAuthorization
+                            + " maxLocalSmoothingReduction=0.10"
+                            + " globalTextureBoost=0"
                             + " sharpeningChanged=false"
                             + " broadDenoiseChanged=false"
             );

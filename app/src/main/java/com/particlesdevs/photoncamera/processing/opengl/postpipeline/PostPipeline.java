@@ -237,6 +237,8 @@ public class PostPipeline extends GLBasePipeline {
         boolean nightMode = PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT;
         add(new Bayer2Float());
         add(new ExposureFusionBayer2());
+
+
         switch (PhotonCamera.getSettings().cfaPattern) {
             case -2: {
                 add(new DemosaicQUAD());
@@ -281,6 +283,8 @@ public class PostPipeline extends GLBasePipeline {
                 if (PhotonCamera.getSettings().hdrxNR) {
                     add(new ESD3D2(true));
                 }
+
+
                 //add(new ImpulsePixelFilter());
                 break;
             }
@@ -316,6 +320,16 @@ public class PostPipeline extends GLBasePipeline {
 
         add(new AutoExposure());
 
+        /*
+         * Build 26232:
+         * Restore a small amount of GCam-like narrow mid-frequency contrast
+         * only where temporal stack confidence and local edge support agree.
+         * This is luma-only and is not a global sharpening increase.
+         */
+        if (mParameters.motionCapture
+                && mSettings.hdrxNR) {
+            add(new MotionMicroContrast());
+        }
 
         //add(new GlobalToneMapping());
 

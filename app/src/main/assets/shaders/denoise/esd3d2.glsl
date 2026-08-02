@@ -34,6 +34,8 @@ out vec4 Output;
 #define CHROMASTRENGTH 1.0
 #define MOTIONNOISEBLEND 0.0
 #define MOTIONSTABLEWEIGHTS 0.0
+#define MOTIONLOWLIGHTSCENE 0.0
+#define MOTIONEDGECONFIDENCE 0.0
 #define PI 3.1415926535897932384626433832795
 
 float normpdf(in float x, in float sigma)
@@ -195,12 +197,112 @@ void main() {
      */
     float textureAwareLuma = LUMA;
 
+    /*
+     * Build 26230:
+     * Temporal stack confidence is global, but the adjustment is spatially
+     * local. Only pixels already classified as real fine structure receive up
+     * to five percent less ESD luma smoothing. Flat/noisy regions are unchanged.
+     */
+    /*
+     * Build 26231:
+     * Refine fine-text rendering without sharpening. Thin text strokes and
+     * repeated line structure are identified by directional luma gradients,
+     * while isolated single-pixel noise is rejected by requiring support on
+     * opposing sides of the center.
+     */
+    float centerLuma3 =
+            dot(
+                    cin,
+                    vec3(0.25, 0.5, 0.25)
+            );
+
+    float leftLuma =
+            dot(
+                    texelFetch(InputBuffer, xy + ivec2(-1, 0), 0).rgb,
+                    vec3(0.25, 0.5, 0.25)
+            );
+
+    float rightLuma =
+            dot(
+                    texelFetch(InputBuffer, xy + ivec2(1, 0), 0).rgb,
+                    vec3(0.25, 0.5, 0.25)
+            );
+
+    float topLuma =
+            dot(
+                    texelFetch(InputBuffer, xy + ivec2(0, -1), 0).rgb,
+                    vec3(0.25, 0.5, 0.25)
+            );
+
+    float bottomLuma =
+            dot(
+                    texelFetch(InputBuffer, xy + ivec2(0, 1), 0).rgb,
+                    vec3(0.25, 0.5, 0.25)
+            );
+
+    float horizontalStroke =
+            min(
+                    abs(centerLuma3 - leftLuma),
+                    abs(centerLuma3 - rightLuma)
+            );
+
+    float verticalStroke =
+            min(
+                    abs(centerLuma3 - topLuma),
+                    abs(centerLuma3 - bottomLuma)
+            );
+
+    float supportedDirectionalStroke =
+            max(
+                    horizontalStroke,
+                    verticalStroke
+            );
+
+    float directionalThreshold =
+            max(
+                    modeledNoiseAmplitude * 1.15,
+                    0.010 / safeTexturePreservation
+            );
+
+    float directionalTextConfidence =
+            smoothstep(
+                    directionalThreshold,
+                    directionalThreshold * 2.20,
+                    supportedDirectionalStroke
+            );
+
+    float localFineEdgeStrength =
+            max(
+                    smoothstep(
+                            moderateTextureThreshold,
+                            max(
+                                    strongTextureThreshold,
+                                    moderateTextureThreshold + 0.000001
+                            ),
+                            localTextureRange
+                    ),
+                    directionalTextConfidence
+            );
+
+    float localEdgeAgreement =
+            MOTIONLOWLIGHTSCENE
+                    * MOTIONEDGECONFIDENCE
+                    * localFineEdgeStrength;
+
+    float localSmoothingScale =
+            1.0 - 0.10 * localEdgeAgreement;
+
     if (localTextureRange >= strongTextureThreshold) {
         effectiveKSIZE = min(effectiveKSIZE, KSIZE_STRONG_TEXTURE);
-        textureAwareLuma = LUMA * 0.70;
-    } else if (localTextureRange >= moderateTextureThreshold) {
+        textureAwareLuma =
+                LUMA * 0.70 * localSmoothingScale;
+    } else if (
+            localTextureRange >= moderateTextureThreshold
+                    || directionalTextConfidence > 0.35
+    ) {
         effectiveKSIZE = min(effectiveKSIZE, KSIZE_TEXTURE);
-        textureAwareLuma = LUMA * 0.82;
+        textureAwareLuma =
+                LUMA * 0.82 * localSmoothingScale;
     }
 
     // Check perimeter pixels at KSIZE distance (top, bottom, left, right, diagonals)

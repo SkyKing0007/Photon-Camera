@@ -36,6 +36,14 @@ public class Parameters {
     private static final String TAG = "Parameters";
     private int analogIso;
     public int iso;
+
+    /*
+     * Build 26230:
+     * Immutable identity of the capture being processed. Do not re-read the
+     * live UI mode from PhotonCamera settings after asynchronous HDRX starts.
+     */
+    public boolean motionCapture = false;
+
     public double exposureTime = 1.0/30.0; // Default to 1/30s if not available
     public byte cfaPattern;
     public Point rawSize;
