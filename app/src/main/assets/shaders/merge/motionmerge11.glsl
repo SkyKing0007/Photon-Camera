@@ -9,6 +9,16 @@ layout(rgba16f, binding = 1) uniform highp readonly image2D diffTexture;
 layout(rgba16f, binding = 2) uniform highp writeonly image2D outTexture;
 layout(rgba16f, binding = 3) uniform highp readonly image2D diffOrTexture;
 layout(r32f, binding = 4) uniform highp image2D contributionTexture;
+
+/*
+ * Build 26228:
+ * Motion-only temporal chroma-impulse statistics. Each correction is one
+ * individual CFA channel, not a spatial blur or whole-pixel replacement.
+ * Index 0 = total, 1 = R, 2 = G1, 3 = G2, 4 = B.
+ */
+layout(std430, binding = 5) buffer TemporalImpulseStats {
+    uint impulseStats[];
+};
 #define TILE 2
 #define CONCAT 1
 uniform float weight;
@@ -37,6 +47,11 @@ vec4 getBayerVec(ivec2 coords, highp usampler2D tex){
 
 vec4 robustWeight(vec4 w){
     return vec4(min(w.r, min(w.g, min(w.b, w.a))));
+}
+
+void recordTemporalImpulse(int channel) {
+    atomicAdd(impulseStats[0], 1u);
+    atomicAdd(impulseStats[channel + 1], 1u);
 }
 
 #define EPS 1e-6
@@ -214,6 +229,186 @@ void main() {
             )
     );
 
-    imageStore(outTexture, xy, mix(base, diff/analogBalance+bayer, weight));
+    /*
+     * Build 26228 — conservative temporal chroma-impulse rejection.
+     *
+     * The aligned alternate candidate is already represented by
+     * diff / analogBalance + bayer. Compare it with:
+     *   1. the running temporal base,
+     *   2. the same-CFA 3x3 spatial median,
+     *   3. the modeled per-channel noise.
+     *
+     * A channel is corrected only when it is a strong positive impulse,
+     * spatially unsupported, temporally unsupported, and substantially more
+     * abnormal than the other three CFA channels. This avoids treating hair,
+     * fabric, foliage, text edges, or ordinary luminance detail as defects.
+     */
+    vec4 correctedBase = base;
+    vec4 correctedCandidate = diff / analogBalance + bayer;
+
+    if (motionEqualStack == 1) {
+        vec4 spatialDeviation =
+                sqrt(
+                        max(
+                                variance,
+                                vec4(EPS)
+                        )
+                );
+
+        vec4 impulseThreshold =
+                max(
+                        noise * 8.0,
+                        max(
+                                spatialDeviation * 2.75,
+                                vec4(0.025)
+                        )
+                );
+
+        vec4 candidateResidual =
+                correctedCandidate
+                        - max(
+                                correctedBase,
+                                mean
+                        );
+
+        vec4 baseResidual =
+                correctedBase
+                        - max(
+                                correctedCandidate,
+                                mean
+                        );
+
+        float candidateOtherR = max(max(candidateResidual.g, candidateResidual.b), candidateResidual.a);
+        float candidateOtherG1 = max(max(candidateResidual.r, candidateResidual.b), candidateResidual.a);
+        float candidateOtherG2 = max(max(candidateResidual.r, candidateResidual.g), candidateResidual.a);
+        float candidateOtherB = max(max(candidateResidual.r, candidateResidual.g), candidateResidual.b);
+
+        float baseOtherR = max(max(baseResidual.g, baseResidual.b), baseResidual.a);
+        float baseOtherG1 = max(max(baseResidual.r, baseResidual.b), baseResidual.a);
+        float baseOtherG2 = max(max(baseResidual.r, baseResidual.g), baseResidual.a);
+        float baseOtherB = max(max(baseResidual.r, baseResidual.g), baseResidual.b);
+
+        if (
+                candidateResidual.r > impulseThreshold.r
+                        && candidateResidual.r
+                                > max(candidateOtherR, 0.0) * 1.35
+                                        + noise.r * 2.0
+        ) {
+            correctedCandidate.r =
+                    clamp(
+                            mix(correctedBase.r, mean.r, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(0);
+        } else if (
+                baseResidual.r > impulseThreshold.r
+                        && baseResidual.r
+                                > max(baseOtherR, 0.0) * 1.35
+                                        + noise.r * 2.0
+        ) {
+            correctedBase.r =
+                    clamp(
+                            mix(correctedCandidate.r, mean.r, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(0);
+        }
+
+        if (
+                candidateResidual.g > impulseThreshold.g
+                        && candidateResidual.g
+                                > max(candidateOtherG1, 0.0) * 1.35
+                                        + noise.g * 2.0
+        ) {
+            correctedCandidate.g =
+                    clamp(
+                            mix(correctedBase.g, mean.g, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(1);
+        } else if (
+                baseResidual.g > impulseThreshold.g
+                        && baseResidual.g
+                                > max(baseOtherG1, 0.0) * 1.35
+                                        + noise.g * 2.0
+        ) {
+            correctedBase.g =
+                    clamp(
+                            mix(correctedCandidate.g, mean.g, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(1);
+        }
+
+        if (
+                candidateResidual.b > impulseThreshold.b
+                        && candidateResidual.b
+                                > max(candidateOtherG2, 0.0) * 1.35
+                                        + noise.b * 2.0
+        ) {
+            correctedCandidate.b =
+                    clamp(
+                            mix(correctedBase.b, mean.b, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(2);
+        } else if (
+                baseResidual.b > impulseThreshold.b
+                        && baseResidual.b
+                                > max(baseOtherG2, 0.0) * 1.35
+                                        + noise.b * 2.0
+        ) {
+            correctedBase.b =
+                    clamp(
+                            mix(correctedCandidate.b, mean.b, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(2);
+        }
+
+        if (
+                candidateResidual.a > impulseThreshold.a
+                        && candidateResidual.a
+                                > max(candidateOtherB, 0.0) * 1.35
+                                        + noise.a * 2.0
+        ) {
+            correctedCandidate.a =
+                    clamp(
+                            mix(correctedBase.a, mean.a, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(3);
+        } else if (
+                baseResidual.a > impulseThreshold.a
+                        && baseResidual.a
+                                > max(baseOtherB, 0.0) * 1.35
+                                        + noise.a * 2.0
+        ) {
+            correctedBase.a =
+                    clamp(
+                            mix(correctedCandidate.a, mean.a, 0.20),
+                            0.0,
+                            1.0
+                    );
+            recordTemporalImpulse(3);
+        }
+    }
+
+    imageStore(
+            outTexture,
+            xy,
+            mix(
+                    correctedBase,
+                    correctedCandidate,
+                    weight
+            )
+    );
     //imageStore(outTexture, xy, diff);
 }

@@ -263,6 +263,7 @@ public class PyramidMerging extends GLOneScript {
     GLTexture alignmentTex;
     GLTexture hotPix;
     GLTexture motionContributionMap;
+    GLBuffer motionImpulseStats;
 
     private boolean motionContributionMeasured = false;
     private float motionEffectiveFrameCount = 1.0f;
@@ -1134,6 +1135,35 @@ public class PyramidMerging extends GLOneScript {
             );
         }
 
+        /*
+         * Build 26228:
+         * Allocate five Motion-only counters for conservative temporal
+         * single-CFA-channel impulse correction.
+         */
+        if (motionEqualExposureStack) {
+            motionImpulseStats =
+                    new GLBuffer(
+                            5,
+                            new GLFormat(
+                                    GLFormat.DataType.UNSIGNED_32
+                            )
+                    );
+
+            Log.d(
+                    Name,
+                    "MOTION_26228_TEMPORAL_IMPULSE"
+                            + " enabled=true"
+                            + " scope=motionOnly"
+                            + " thresholdSigma=8.0"
+                            + " spatialDeviationMultiplier=2.75"
+                            + " absoluteFloor=0.025"
+                            + " channelIsolationRatio=1.35"
+                            + " replacement=temporal80_spatial20"
+                            + " broadDenoiseChanged=false"
+                            + " esdChanged=false"
+            );
+        }
+
         if(enableHotPixelCorrection)
             hotPixels();
 
@@ -1374,6 +1404,11 @@ public class PyramidMerging extends GLOneScript {
                                         images.size()
                                 )
                 );
+
+                glProg.setBufferCompute(
+                        "TemporalImpulseStats",
+                        motionImpulseStats
+                );
             }
 
             base = getBase();
@@ -1605,6 +1640,34 @@ public class PyramidMerging extends GLOneScript {
 
     @Override
     public void AfterRun() {
+        if (motionImpulseStats != null) {
+            int[] impulseStats =
+                    motionImpulseStats.readBufferIntegers(false);
+
+            if (impulseStats != null && impulseStats.length >= 5) {
+                Log.d(
+                        Name,
+                        "MOTION_26228_TEMPORAL_IMPULSE_RESULT"
+                                + " totalChannelCorrections="
+                                + impulseStats[0]
+                                + " R=" + impulseStats[1]
+                                + " G1=" + impulseStats[2]
+                                + " G2=" + impulseStats[3]
+                                + " B=" + impulseStats[4]
+                                + " interpretation=perFrameChannelEvents"
+                );
+            } else {
+                Log.d(
+                        Name,
+                        "MOTION_26228_TEMPORAL_IMPULSE_RESULT"
+                                + " unavailable=true"
+                );
+            }
+
+            motionImpulseStats.close();
+            motionImpulseStats = null;
+        }
+
         if(hotPixelBuffer != null) hotPixelBuffer.close();
         inputAlter.close();
         alter.close();
