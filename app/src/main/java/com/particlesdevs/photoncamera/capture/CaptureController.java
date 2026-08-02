@@ -4332,6 +4332,98 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         /* Keep the adaptive ladder shutter; use Photon only as an energy safety check. */
         desiredMotionIso = safetyAdjustedIso;
 
+        /*
+         * Build 26223:
+         * Re-project extreme-low-light exposure onto a practical ISO derived
+         * from fresh preview metadata, preserving selected exposure energy.
+         */
+        final long preProjectionExposureNs = desiredMotionExposureNs;
+        final int preProjectionIso = desiredMotionIso;
+
+        final boolean practicalIsoProjectionEligible =
+                previewEnergy > 0.0
+                        && latestPreviewIso != null
+                        && latestPreviewIso >= 2000
+                        && desiredMotionIso
+                                > Math.round(latestPreviewIso * 1.08)
+                        && desiredMotionExposureNs < maximumExposureNs;
+
+        int practicalIsoCeiling =
+                latestPreviewIso != null
+                        ? (int) Math.round(latestPreviewIso * 1.05)
+                        : maximumIso;
+
+        practicalIsoCeiling =
+                Math.max(
+                        minimumIso,
+                        Math.min(maximumIso, practicalIsoCeiling)
+                );
+
+        boolean practicalIsoProjectionApplied = false;
+
+        if (practicalIsoProjectionEligible) {
+            long projectedExposureNs =
+                    Math.round(
+                            selectedEnergy
+                                    / Math.max(1, practicalIsoCeiling)
+                                    * 1_000_000_000.0
+                    );
+
+            projectedExposureNs =
+                    Math.max(
+                            desiredMotionExposureNs,
+                            Math.min(maximumExposureNs, projectedExposureNs)
+                    );
+
+            int projectedIso =
+                    (int) Math.round(
+                            selectedEnergy
+                                    / ExposureIndex.time2sec(
+                                            Math.max(1L, projectedExposureNs)
+                                    )
+                    );
+
+            projectedIso =
+                    Math.max(
+                            minimumIso,
+                            Math.min(practicalIsoCeiling, projectedIso)
+                    );
+
+            double projectedEnergy =
+                    ExposureIndex.time2sec(projectedExposureNs)
+                            * projectedIso;
+
+            if (projectedExposureNs > desiredMotionExposureNs
+                    && projectedEnergy > 0.0) {
+                desiredMotionExposureNs = projectedExposureNs;
+                desiredMotionIso = projectedIso;
+                practicalIsoProjectionApplied = true;
+            }
+        }
+
+        Log.d(
+                MOTION_LOG_TAG,
+                "MOTION_26223_PRACTICAL_ISO_PROJECTION"
+                        + " camera=" + physicalID
+                        + " advertisedMaximumIso=" + maximumIso
+                        + " previewExposureNs=" + latestPreviewExposureNs
+                        + " previewIso=" + latestPreviewIso
+                        + " previewEnergy=" + previewEnergy
+                        + " selectedEnergy=" + selectedEnergy
+                        + " practicalIsoCeiling=" + practicalIsoCeiling
+                        + " eligible=" + practicalIsoProjectionEligible
+                        + " applied=" + practicalIsoProjectionApplied
+                        + " preExposureNs=" + preProjectionExposureNs
+                        + " preIso=" + preProjectionIso
+                        + " finalExposureNs=" + desiredMotionExposureNs
+                        + " finalIso=" + desiredMotionIso
+                        + " finalEnergy="
+                        + (
+                            ExposureIndex.time2sec(desiredMotionExposureNs)
+                                    * desiredMotionIso
+                        )
+        );
+
         Log.d(
                 MOTION_LOG_TAG,
                 "MOTION_PHOTON_ENERGY_POLICY"
