@@ -88,11 +88,16 @@ public final class MotionLensNoiseProfile {
         float automaticShadow = BASE_SHADOW;
 
         if (type == LensType.TELEPHOTO) {
-            automaticLuma = 0.75f;
-            automaticChroma = 0.35f;
-            automaticTexture = 1.25f;
-            automaticSpatial = 0.90f;
-            automaticShadow = 1.10f;
+            /*
+             * Build 26227 Telephoto Detail Profile v2:
+             * preserve substantially more mid/high-ISO telephoto texture
+             * while retaining the existing ISO-adaptive cleanup paths.
+             */
+            automaticLuma = 0.65f;
+            automaticChroma = 0.30f;
+            automaticTexture = 1.35f;
+            automaticSpatial = 0.80f;
+            automaticShadow = 1.00f;
         } else if (type == LensType.ULTRAWIDE) {
             automaticLuma = 0.85f;
             automaticChroma = 0.35f;
