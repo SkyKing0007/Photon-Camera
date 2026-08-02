@@ -327,6 +327,10 @@ public class ESD3D2 extends Node {
                             + " lowIsoShadowBoost=0.15"
                             + " shadowBoostApplied=" + appliedShadowBoost
                             + " nightHighIsoProtectionRetained=true"
+                            + " textureLumaModerateFactor=0.82"
+                            + " textureLumaStrongFactor=0.70"
+                            + " flatLumaUnchanged=true"
+                            + " chromaUnchanged=true"
                             + " nightModeAffected=false"
             );
             glProg.setDefine("KERNELSIZE", (float)(kernelSize));

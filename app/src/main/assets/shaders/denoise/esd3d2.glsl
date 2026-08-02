@@ -168,10 +168,28 @@ void main() {
                     modeledNoiseAmplitude * 2.40
             );
 
+    /*
+     * Build 26224:
+     * Keep the configured ESD luma value as the maximum for flat/noisy
+     * regions. In locally structured texture, retain more of the original
+     * luminance while leaving chroma filtering fully independent.
+     *
+     * With configured LUMA=0.8:
+     * - flat/noisy area: 0.80
+     * - moderate texture: 0.656
+     * - strong texture: 0.56
+     *
+     * If Java lowers LUMA for HDR conditions, these factors scale that
+     * already-reduced value rather than replacing it.
+     */
+    float textureAwareLuma = LUMA;
+
     if (localTextureRange >= strongTextureThreshold) {
         effectiveKSIZE = min(effectiveKSIZE, KSIZE_STRONG_TEXTURE);
+        textureAwareLuma = LUMA * 0.70;
     } else if (localTextureRange >= moderateTextureThreshold) {
         effectiveKSIZE = min(effectiveKSIZE, KSIZE_TEXTURE);
+        textureAwareLuma = LUMA * 0.82;
     }
 
     // Check perimeter pixels at KSIZE distance (top, bottom, left, right, diagonals)
@@ -328,7 +346,7 @@ void main() {
     }
 
     float br = dot(final_colour/Z,vec3(0.25,0.5,0.25));
-    br = mix(dot(cin,vec3(0.25,0.5,0.25)),br,LUMA);
+    br = mix(dot(cin,vec3(0.25,0.5,0.25)),br,textureAwareLuma);
     vec3 resColour = final_colour2/Z2;
     resColour /= max(1e-6,dot(resColour,vec3(0.25,0.5,0.25)));
     resColour = clamp(resColour*br,0.0,1.0);
