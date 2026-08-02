@@ -16,6 +16,8 @@ out vec4 Output;
 #define MSIZE 15
 #define KSIZE (MSIZE-1)/2
 #define KSIZE_SMALL 3
+#define KSIZE_TEXTURE 2
+#define KSIZE_STRONG_TEXTURE 1
 #define TRANSPOSE 1
 #define INSIZE 1,1
 #define NRcancell (0.90)
@@ -124,6 +126,54 @@ void main() {
     int effectiveKSIZE = KSIZE;
     bool edgeDetected = false;
 
+    /*
+     * Build 26222:
+     * Dense low-contrast texture such as foliage, grass, fur and shingles
+     * can evade the old perimeter-only edge test. Measure local 3x3 luma
+     * structure relative to modeled noise and reduce only spatial support,
+     * without changing the established LUMA strength.
+     */
+    float localLumaMinimum = 10000.0;
+    float localLumaMaximum = -10000.0;
+
+    for (int localY = -1; localY <= 1; localY++) {
+        for (int localX = -1; localX <= 1; localX++) {
+            float localLuma =
+                    dot(
+                            texelFetch(
+                                    InputBuffer,
+                                    xy + ivec2(localX, localY),
+                                    0
+                            ).rgb,
+                            vec3(0.25, 0.5, 0.25)
+                    );
+
+            localLumaMinimum = min(localLumaMinimum, localLuma);
+            localLumaMaximum = max(localLumaMaximum, localLuma);
+        }
+    }
+
+    float localTextureRange = localLumaMaximum - localLumaMinimum;
+    float modeledNoiseAmplitude = sqrt(max(sigY, 0.0000001));
+
+    float moderateTextureThreshold =
+            max(
+                    0.018,
+                    modeledNoiseAmplitude * 1.35
+            );
+
+    float strongTextureThreshold =
+            max(
+                    0.035,
+                    modeledNoiseAmplitude * 2.40
+            );
+
+    if (localTextureRange >= strongTextureThreshold) {
+        effectiveKSIZE = min(effectiveKSIZE, KSIZE_STRONG_TEXTURE);
+    } else if (localTextureRange >= moderateTextureThreshold) {
+        effectiveKSIZE = min(effectiveKSIZE, KSIZE_TEXTURE);
+    }
+
     // Check perimeter pixels at KSIZE distance (top, bottom, left, right, diagonals)
     for (int i = -KSIZE; i <= KSIZE; i += max(KSIZE, 1)) {
         for (int j = -KSIZE; j <= KSIZE; j += max(KSIZE, 1)) {
@@ -174,7 +224,7 @@ void main() {
     }
 
     if (edgeDetected) {
-        effectiveKSIZE = KSIZE_SMALL;
+        effectiveKSIZE = min(effectiveKSIZE, KSIZE_SMALL);
     }
 
     float Z = 0.01f;

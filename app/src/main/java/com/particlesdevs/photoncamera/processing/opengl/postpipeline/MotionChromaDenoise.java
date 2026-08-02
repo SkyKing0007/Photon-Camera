@@ -30,6 +30,13 @@ public class MotionChromaDenoise extends Node {
     )
     float motionChromaCleanupMaximum = 0.30f;
 
+    /*
+     * Build 26222:
+     * Extra cleanup reserved for extreme low-light Motion captures. The
+     * shader still gates it with dark, flat and saturation protection.
+     */
+    float motionExtremeNightChromaMaximum = 0.46f;
+
     @Tunable(
             title = "Motion chroma radius",
             description = "Requested full-resolution chroma radius in pixels. Internally rounded to the nearest four-pixel step.",
@@ -124,9 +131,21 @@ public class MotionChromaDenoise extends Node {
                         1.0f
                 );
 
-        float strength =
-                motionChromaCleanupMaximum
-                        * highIsoBlend;
+        float extremeNightBlend =
+                Math2.clamp(
+                        (motionIso - 2800.0f) / 2400.0f,
+                        0.0f,
+                        1.0f
+                );
+
+        float maximumStrength =
+                Math2.mix(
+                        motionChromaCleanupMaximum,
+                        motionExtremeNightChromaMaximum,
+                        extremeNightBlend
+                );
+
+        float strength = maximumStrength * highIsoBlend;
 
         strength *=
                 Math2.mix(
@@ -158,7 +177,9 @@ public class MotionChromaDenoise extends Node {
 
         int adaptiveRadiusPixels;
 
-        if (motionIso >= 4000.0f || lowConfidence >= 0.35f) {
+        if (motionIso >= 4000.0f) {
+            adaptiveRadiusPixels = 16;
+        } else if (lowConfidence >= 0.35f) {
             adaptiveRadiusPixels = 12;
         } else if (motionIso >= 1800.0f || lowConfidence >= 0.20f) {
             adaptiveRadiusPixels = 8;
@@ -168,7 +189,7 @@ public class MotionChromaDenoise extends Node {
 
         adaptiveRadiusPixels =
                 Math.min(
-                        motionChromaRadiusPixels + 4,
+                        motionChromaRadiusPixels + 8,
                         adaptiveRadiusPixels
                 );
 

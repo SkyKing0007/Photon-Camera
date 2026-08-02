@@ -166,14 +166,22 @@ public class ESD3D2 extends Node {
                         motionStableWeightBlendMaximum
                                 * highIsoBlend;
 
+                /*
+                 * Build 26222:
+                 * Keep the established base ESD luma strength at 0.8.
+                 * Reduce only Motion luma shadow expansion at low/moderate
+                 * ISO, then smoothly restore established high-ISO protection.
+                 */
+                float lowIsoMotionShadowBoost = 0.15f;
+
                 appliedShadowBoost =
-                        Math.max(
-                                shadowBoost,
-                                Math2.mix(
+                        Math2.mix(
+                                lowIsoMotionShadowBoost,
+                                Math.max(
                                         shadowBoost,
-                                        motionShadowBoostMaximum,
-                                        highIsoBlend
-                                )
+                                        motionShadowBoostMaximum
+                                ),
+                                highIsoBlend
                         );
 
                 Log.d(
@@ -282,7 +290,7 @@ public class ESD3D2 extends Node {
                     motionMode
                             ? (
                                 motionIso < 800.0f
-                                        ? 9
+                                        ? 7
                                         : (
                                             motionIso < 1600.0f
                                                     ? 13
@@ -316,6 +324,9 @@ public class ESD3D2 extends Node {
                             + indoorHdrStrength
                             + " lumaConfigured=" + luma
                             + " lumaApplied=" + appliedLuma
+                            + " lowIsoShadowBoost=0.15"
+                            + " shadowBoostApplied=" + appliedShadowBoost
+                            + " nightHighIsoProtectionRetained=true"
                             + " nightModeAffected=false"
             );
             glProg.setDefine("KERNELSIZE", (float)(kernelSize));
