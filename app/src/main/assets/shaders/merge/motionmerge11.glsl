@@ -31,6 +31,13 @@ uniform float motionNoiseAllowance;
 uniform float motionNoiseRecoveryStrength;
 uniform float motionNoiseRecoveryGate;
 uniform float contributionIncrement;
+uniform float motionTemporalConfidence;
+uniform int motionMergeOrdinal;
+uniform highp sampler2D motionAlignmentTexture;
+uniform ivec2 motionAlignmentShift;
+uniform ivec2 motionAlignmentSize;
+uniform ivec2 motionRawHalf;
+uniform int motionAlignmentTile;
 uniform float whiteLevel;
 uniform vec4 blackLevel;
 uniform vec4 analogBalance;
@@ -55,7 +62,42 @@ void recordTemporalImpulse(int channel) {
 }
 
 #define EPS 1e-6
+vec2 decodeAlignmentVector(vec4 packed) {
+    return packed.xy * vec2(motionRawHalf) + packed.zw;
+}
+float geometricAlignmentConfidence(ivec2 xy) {
+    ivec2 tileCoord = clamp(xy / max(1, motionAlignmentTile / 2), ivec2(0), motionAlignmentSize - ivec2(1));
+    ivec2 atlasCoord = motionAlignmentShift + tileCoord;
+    ivec2 atlasMin = motionAlignmentShift;
+    ivec2 atlasMax = motionAlignmentShift + motionAlignmentSize - ivec2(1);
+    vec2 c = decodeAlignmentVector(texelFetch(motionAlignmentTexture, clamp(atlasCoord, atlasMin, atlasMax), 0));
+    vec2 l = decodeAlignmentVector(texelFetch(motionAlignmentTexture, clamp(atlasCoord + ivec2(-1,0), atlasMin, atlasMax), 0));
+    vec2 r = decodeAlignmentVector(texelFetch(motionAlignmentTexture, clamp(atlasCoord + ivec2(1,0), atlasMin, atlasMax), 0));
+    vec2 u = decodeAlignmentVector(texelFetch(motionAlignmentTexture, clamp(atlasCoord + ivec2(0,-1), atlasMin, atlasMax), 0));
+    vec2 d = decodeAlignmentVector(texelFetch(motionAlignmentTexture, clamp(atlasCoord + ivec2(0,1), atlasMin, atlasMax), 0));
+    vec2 m = 0.25 * (l+r+u+d);
+    float outlier = length(c-m) + 0.125*(length(l-m)+length(r-m)+length(u-m)+length(d-m));
+    return 1.0 - smoothstep(0.35, 2.20, outlier);
+}
+float expandedOcclusionDisagreement(ivec2 xy) {
+    float mx = 0.0;
+    for (int oy=-1; oy<=1; oy++) {
+        for (int ox=-1; ox<=1; ox++) {
+            ivec2 p = clamp(
+                    xy + ivec2(ox,oy),
+                    ivec2(0),
+                    imageSize(diffOrTexture)-ivec2(1));
+            vec4 residual = abs(imageLoad(diffOrTexture,p));
+            float scalarResidual = max(
+                    max(residual.r, residual.g),
+                    max(residual.b, residual.a));
+            mx = max(mx, scalarResidual);
+        }
+    }
+    return mx;
+}
 void main() {
+
     ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
     vec4 base = imageLoad(inTexture, xy);
     vec4 noise = sqrt(max(base * noiseS + noiseO,EPS));
@@ -225,10 +267,27 @@ void main() {
                             vec4(EPS)
                     );
 
+    vec4 candidateBaseResidual =
+            mergeCandidate
+                    - base;
+
+    vec4 candidateReferenceResidual =
+            mergeCandidate
+                    - bayer;
+
     float temporalDisagreement =
-            length(
-                    mergeCandidate
-                            - base
+            max(
+                    length(candidateBaseResidual),
+                    max(
+                            max(
+                                    abs(candidateBaseResidual.r),
+                                    abs(candidateBaseResidual.g)
+                            ),
+                            max(
+                                    abs(candidateBaseResidual.b),
+                                    abs(candidateBaseResidual.a)
+                            )
+                    ) * 2.0
             );
 
     /*
@@ -239,9 +298,18 @@ void main() {
      * or a dark structural edge is correctly aligned.
      */
     float immutableReferenceDisagreement =
-            length(
-                    mergeCandidate
-                            - bayer
+            max(
+                    length(candidateReferenceResidual),
+                    max(
+                            max(
+                                    abs(candidateReferenceResidual.r),
+                                    abs(candidateReferenceResidual.g)
+                            ),
+                            max(
+                                    abs(candidateReferenceResidual.b),
+                                    abs(candidateReferenceResidual.a)
+                            )
+                    ) * 2.0
             );
 
     float baseSpatialError =
@@ -287,9 +355,9 @@ void main() {
      */
     float temporalDisagreementGate =
             smoothstep(
-                    modeledNoiseMagnitude * 1.10,
-                    modeledNoiseMagnitude * 3.50
-                            + 0.010,
+                    modeledNoiseMagnitude * 0.75,
+                    modeledNoiseMagnitude * 2.20
+                            + 0.006,
                     temporalDisagreement
             );
 
@@ -325,9 +393,9 @@ void main() {
      */
     float immutableReferenceMismatchGate =
             smoothstep(
-                    modeledNoiseMagnitude * 0.85,
-                    modeledNoiseMagnitude * 2.75
-                            + 0.006,
+                    modeledNoiseMagnitude * 0.60,
+                    modeledNoiseMagnitude * 1.85
+                            + 0.004,
                     immutableReferenceDisagreement
             );
 
@@ -362,15 +430,45 @@ void main() {
      * the existing full-stack denoise.
      */
     float localMergeConfidence =
-            1.0
-                    - smoothstep(
-                            0.12,
-                            0.72,
-                            localMergeDisagreement
-                    );
+            1.0 - smoothstep(0.035, 0.30, localMergeDisagreement);
+    float geometricConfidence = geometricAlignmentConfidence(xy);
+    float occlusionDisagreement = expandedOcclusionDisagreement(xy);
+    float occlusionConfidence = 1.0 - smoothstep(
+            predictedNoiseCap * 2.0 + 0.01,
+            predictedNoiseCap * 7.0 + 0.08,
+            occlusionDisagreement);
+    float accumulatedAgreement = clamp(
+            imageLoad(contributionTexture, xy).r,
+            0.0,
+            1.0);
+    float consensusConfidence = smoothstep(
+            contributionIncrement * 0.50,
+            contributionIncrement * 2.25,
+            accumulatedAgreement);
+    float consensusGate = motionMergeOrdinal <= 2
+            ? 1.0
+            : mix(0.62, 1.0, consensusConfidence);
+    float hardValidity = min(
+            geometricConfidence,
+            occlusionConfidence);
+    float softAgreement =
+            localMergeConfidence
+                    * localMergeConfidence
+                    * motionTemporalConfidence;
+    float trustedMergeConfidence = clamp(
+            hardValidity
+                    * softAgreement
+                    * consensusGate,
+            0.0,
+            1.0);
+    if (geometricConfidence < 0.12
+            || occlusionConfidence < 0.10
+            || localMergeConfidence < 0.08) {
+        trustedMergeConfidence = 0.0;
+    }
 
-    lDiff *= localMergeConfidence;
-    preservedIndependentFraction *= localMergeConfidence;
+    lDiff *= trustedMergeConfidence;
+    preservedIndependentFraction *= trustedMergeConfidence;
 
     // Reconstruct from the original temporal direction after local gating.
     diff = diffOrigin / (originDifference + EPS) * lDiff;
@@ -389,7 +487,8 @@ void main() {
                     clamp(
                             previousContribution
                                     + contributionIncrement
-                                            * preservedIndependentFraction,
+                                            * preservedIndependentFraction
+                                            * trustedMergeConfidence,
                             0.0,
                             1.0
                     ),
@@ -424,7 +523,7 @@ void main() {
     float finalMergeWeight =
             clamp(
                     weight
-                            * localMergeConfidence,
+                            * trustedMergeConfidence,
                     0.0,
                     1.0
             );
@@ -467,7 +566,7 @@ void main() {
                     fineStructureGate
                             * (
                                     1.0
-                                            - localMergeConfidence
+                                            - trustedMergeConfidence
                             ),
                     0.0,
                     1.0

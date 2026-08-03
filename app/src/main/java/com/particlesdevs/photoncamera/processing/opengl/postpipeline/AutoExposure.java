@@ -94,6 +94,26 @@
         float mpy = (histSize / 256.0f) * target / avg;
         float gainBeforeAllGuards = mpy;
 
+        int totalHistogramCountEarly = histNormR + histNormG + histNormB;
+        int dark03Count = 0, dark05Count = 0, dark10Count = 0, dark20Count = 0;
+        int dark03End = Math.max(1, (int)(histSize * 0.03f));
+        int dark05End = Math.max(1, (int)(histSize * 0.05f));
+        int dark10End = Math.max(1, (int)(histSize * 0.10f));
+        int dark20End = Math.max(1, (int)(histSize * 0.20f));
+        for (int i = 0; i < dark20End; i++) {
+            int n = result[0][i] + result[1][i] + result[2][i];
+            dark20Count += n;
+            if (i < dark10End) dark10Count += n;
+            if (i < dark05End) dark05Count += n;
+            if (i < dark03End) dark03Count += n;
+        }
+        float dark03Fraction = totalHistogramCountEarly > 0 ? (float)dark03Count / totalHistogramCountEarly : 0.0f;
+        float dark05Fraction = totalHistogramCountEarly > 0 ? (float)dark05Count / totalHistogramCountEarly : 0.0f;
+        float dark10Fraction = totalHistogramCountEarly > 0 ? (float)dark10Count / totalHistogramCountEarly : 0.0f;
+        float dark20Fraction = totalHistogramCountEarly > 0 ? (float)dark20Count / totalHistogramCountEarly : 0.0f;
+        float darkPixelStrength = Math2.clamp(Math.max(Math2.smoothstep(0.025f, 0.16f, dark05Fraction), Math.max(Math2.smoothstep(0.10f, 0.46f, dark10Fraction), Math2.smoothstep(0.28f, 0.72f, dark20Fraction))), 0.0f, 1.0f);
+        ((PostPipeline)basePipeline).motionDarkPixelStrength = darkPixelStrength;
+
         sum = 0;
         int cnt2 = 0;
         float sumR = 0.0f;
@@ -134,8 +154,65 @@
 
         float gainNoiseMax = (float) (noiseMax / Math.sqrt(basePipeline.noiseS * 0.5 + basePipeline.noiseO));
         gainNoiseMax = Math.max(gainNoiseMax, 1.0f);
+
+        /*
+         * Build 26267:
+         * Preserve the normal noise estimate, but provide a conservative
+         * low-ISO Motion gain floor so bright-window interiors are not
+         * globally clamped to 1.0x.
+         */
+        float motionIsoForGain =
+                Math.max(
+                        1.0f,
+                        basePipeline.mParameters.iso
+                );
+
+        boolean motionModeForGain =
+                com.particlesdevs.photoncamera.app.PhotonCamera
+                        .getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+
+        float motionLowIsoBlend =
+                1.0f
+                        - Math2.smoothstep(
+                                400.0f,
+                                2200.0f,
+                                motionIsoForGain
+                        );
+
+        float motionBaseRecoveryFloor = Math2.mix(1.35f, 2.45f, motionLowIsoBlend);
+        float motionAdaptiveRecoveryMaximum = Math2.mix(1.55f, 3.55f, motionLowIsoBlend);
+        float motionExposureRecoveryFloor = Math2.mix(motionBaseRecoveryFloor, motionAdaptiveRecoveryMaximum, darkPixelStrength);
+
+        float gainNoiseMaxBeforeMotionFloor =
+                gainNoiseMax;
+
+        if (motionModeForGain) {
+            gainNoiseMax =
+                    Math.max(
+                            gainNoiseMax,
+                            motionExposureRecoveryFloor
+                    );
+        }
+
         if (mpy > gainNoiseMax) {
-            Log.d("AutoExposure", "Clamping gain by noise from " + mpy + " to " + gainNoiseMax);
+            Log.d(
+                    "AutoExposure",
+                    "Clamping gain by noise from " + mpy
+                            + " to " + gainNoiseMax
+                            + " baseNoiseLimit="
+                            + gainNoiseMaxBeforeMotionFloor
+                            + " motionFloor="
+                            + motionExposureRecoveryFloor
+                            + " motionLowIsoBlend=" + motionLowIsoBlend
+                            + " dark03=" + dark03Fraction
+                            + " dark05=" + dark05Fraction
+                            + " dark10=" + dark10Fraction
+                            + " dark20=" + dark20Fraction
+                            + " darkPixelStrength=" + darkPixelStrength
+                            + " adaptiveMaximum=" + motionAdaptiveRecoveryMaximum
+                            + " build=26269"
+            );
             mpy = gainNoiseMax;
         }
         if(mpy > gainMax) {
@@ -200,6 +277,16 @@
 
         float gainAfterAllGuards = mpy;
 
+        Log.d("AutoExposure", "MOTION_26269_FINAL_DISPLAY_GAIN_PLAN"
+                + " capturedIso=" + basePipeline.mParameters.iso
+                + " requestedGain=" + gainBeforeAllGuards
+                + " guardedGain=" + gainAfterAllGuards
+                + " effectiveFrames=" + basePipeline.mParameters.effectiveFrameCount
+                + " effectiveRatio=" + basePipeline.mParameters.effectiveStackRatio
+                + " contributionP25=" + basePipeline.mParameters.localContributionP25
+                + " capturedIsoPhysicalModel=true"
+                + " exifIsoExcluded=true");
+
         float normL = 0.0f;
         float normR = 0.0f;
         for (int i = 0; i < histSize; i++) {
@@ -209,6 +296,7 @@
         }
         Log.d("AutoExposure", "Reinhard normalizer:" + normR + " normL:" + normL + " base Mpy:" + mpy);
         mpy *= normL / normR;
+        ((PostPipeline)basePipeline).motionAppliedDisplayGain = Math.max(1.0f, mpy);
 
         whiteMax *= mpy;
         Log.d("AutoExposure", "Reinhard white max (top 0.5%): " + whiteMax);
@@ -305,8 +393,96 @@
                 .motionHighlightSceneStrength =
                 highlightRecoveryStrength;
 
+        /*
+         * Build 26267:
+         * Detect bright-window/dark-interior scenes directly from the
+         * rendered histogram when the earlier detector returns zero.
+         */
+        float normalizedAverage =
+                avg
+                        / Math.max(
+                                1.0f,
+                                histSize - 1.0f
+                        );
+
+        float histogramDarkInteriorStrength =
+                1.0f
+                        - Math2.smoothstep(
+                                0.09f,
+                                0.24f,
+                                normalizedAverage
+                        );
+
+        float histogramHighlightContext =
+                Math.max(
+                        Math2.smoothstep(
+                                0.0015f,
+                                0.030f,
+                                brightTail90Fraction
+                        ),
+                        Math2.smoothstep(
+                                0.00025f,
+                                0.006f,
+                                brightTail98Fraction
+                        )
+                );
+
+        float darkOccupancyHdrStrength =
+                Math2.clamp(
+                        darkPixelStrength
+                                * Math2.mix(
+                                        0.72f,
+                                        1.0f,
+                                        histogramHighlightContext
+                                ),
+                        0.0f,
+                        1.0f
+                );
+
+        float histogramIndoorHdrStrength =
+                Math2.clamp(
+                        Math.max(
+                                histogramDarkInteriorStrength
+                                        * histogramHighlightContext,
+                                darkOccupancyHdrStrength
+                        ),
+                        0.0f,
+                        1.0f
+                );
+
+        /*
+         * Build 26271:
+         * A backlit-window scene needs both a meaningful dark interior and a
+         * bright tail. This keeps the special shoulder out of ordinary scenes.
+         */
+        float backlitWindowStrength =
+                Math2.clamp(
+                        Math2.smoothstep(
+                                0.10f,
+                                0.52f,
+                                dark20Fraction
+                        )
+                                * Math.max(
+                                        Math2.smoothstep(
+                                                0.0020f,
+                                                0.025f,
+                                                brightTail90Fraction
+                                        ),
+                                        Math2.smoothstep(
+                                                0.00035f,
+                                                0.0050f,
+                                                brightTail98Fraction
+                                        )
+                                ),
+                        0.0f,
+                        1.0f
+                );
+
         float indoorHdrStrength =
-                shadowRecoveryStrength;
+                Math.max(
+                        shadowRecoveryStrength,
+                        histogramIndoorHdrStrength
+                );
 
         /*
          * Build 26250:
@@ -333,16 +509,9 @@
          * Only genuinely weak stacks reduce the lift, preventing noisy
          * single-frame-like shadows from being over-expanded.
          */
-        float shadowStackConfidence =
-                Math2.mix(
-                        0.68f,
-                        1.0f,
-                        Math2.smoothstep(
-                                0.35f,
-                                0.80f,
-                                effectiveStackRatio
-                        )
-                );
+        float p25Ratio = basePipeline.mParameters.localContributionMeasured ? Math2.clamp(basePipeline.mParameters.localContributionP25, 0.0f, 1.0f) : effectiveStackRatio;
+        float globalStackSupport = Math2.clamp(0.35f * p25Ratio + 0.65f * effectiveStackRatio, 0.0f, 1.0f);
+        float shadowStackConfidence = Math2.mix(0.70f, 1.0f, Math2.smoothstep(0.28f, 0.76f, globalStackSupport));
 
         /*
          * Build 26253:
@@ -351,13 +520,24 @@
          * than the approximately 2.47x seen in 26252.
          */
         float lowerMidLift =
-                0.22f
-                        * shadowRecoveryStrength
+                0.34f
+                        * indoorHdrStrength
                         * shadowStackConfidence;
 
+        /*
+         * Preserve upper midtones and put the extra compression mainly into
+         * the bright-window shoulder. The shader applies this progressively.
+         */
         float highlightCompression =
-                0.62f
-                        * highlightRecoveryStrength;
+                Math2.clamp(
+                        0.54f
+                                * highlightRecoveryStrength
+                                + 0.22f
+                                * backlitWindowStrength,
+                        0.0f,
+                        0.72f
+                );
+        ((PostPipeline)basePipeline).motionAppliedLowerMidLift = lowerMidLift;
 
         glProg.setVar(
                 "indoorHdrStrength",
@@ -370,6 +550,10 @@
         glProg.setVar(
                 "highlightCompression",
                 highlightCompression
+        );
+        glProg.setVar(
+                "backlitWindowStrength",
+                backlitWindowStrength
         );
 
         MotionToneExifDiagnostics.recordAutoExposure(
@@ -392,7 +576,7 @@
 
         Log.d(
                 "AutoExposure",
-                "MOTION_26179_INDOOR_HDR_TONE"
+                "MOTION_26271_BACKLIT_WINDOW_HDR_COLOR"
                         + " shadowStrength=" + shadowRecoveryStrength
                         + " shadowStackConfidence="
                         + shadowStackConfidence
@@ -400,9 +584,23 @@
                         + " brightTail98=" + brightTail98Fraction
                         + " highlightStrength="
                         + highlightRecoveryStrength
+                        + " normalizedAverage="
+                        + normalizedAverage
+                        + " histogramDarkInteriorStrength="
+                        + histogramDarkInteriorStrength
+                        + " histogramHighlightContext="
+                        + histogramHighlightContext
+                        + " histogramIndoorHdrStrength="
+                        + histogramIndoorHdrStrength
+                        + " backlitWindowStrength="
+                        + backlitWindowStrength
+                        + " indoorHdrStrength="
+                        + indoorHdrStrength
                         + " lowerMidLift=" + lowerMidLift
                         + " highlightCompression="
                         + highlightCompression
+                        + " highlightColorfulnessPreservation=centerChroma"
+                        + " brightChromaProtection=true"
                         + " globalShadowLift=false"
                         + " nightModeAffected=false"
         );

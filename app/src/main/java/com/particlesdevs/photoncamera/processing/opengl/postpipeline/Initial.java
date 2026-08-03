@@ -290,9 +290,8 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
                         ? 0.04f + 0.08f * motionHdrStrength
                         : 0.0f;
 
-        float appliedShadows =
-                (float) basePipeline.mSettings.shadows
-                        - motionShadowRecovery;
+        float configuredShadows = (float)basePipeline.mSettings.shadows;
+        float appliedShadows = motionToneRecovery ? Math.max(0.0f, configuredShadows - motionShadowRecovery) : configuredShadows;
 
         float appliedLtmMix =
                 motionToneRecovery
@@ -307,7 +306,7 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
         glProg.setDefine("SHADOWS", appliedShadows);
 
         MotionToneExifDiagnostics.recordInitial(
-                (float) basePipeline.mSettings.shadows,
+                configuredShadows,
                 appliedShadows,
                 ltmMix,
                 appliedLtmMix

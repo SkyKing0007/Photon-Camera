@@ -15,6 +15,12 @@ out vec4 Output;
 #define NOISES 0.0
 #define SHADOWNEUTRALIZATION 0.0
 #define NOISEO 0.0
+#define BRIGHTPROTECTSTART 0.42
+#define BRIGHTPROTECTEND 0.76
+#define CHROMAEDGELOW 0.018
+#define CHROMAEDGEHIGH 0.105
+#define CHROMASIMILARITYMIN 0.028
+#define CHROMASIMILARITYMAX 0.145
 
 float lumaValue(vec3 rgb) {
     return dot(
@@ -115,6 +121,9 @@ void main() {
     float localGradient =
             0.0;
 
+    float localChromaGradient =
+            0.0;
+
     const ivec2 localOffsets[4] =
             ivec2[4](
                     ivec2(-1, 0),
@@ -147,6 +156,13 @@ void main() {
                                 localLuma - centerLuma
                         )
                 );
+
+        vec2 localChroma = opponentChroma(
+                texelFetch(GuideBuffer, localCoordinate, 0).rgb);
+
+        localChromaGradient = max(
+                localChromaGradient,
+                length(localChroma - opponentChroma(guideCenter)));
     }
 
     float flatThresholdLow =
@@ -172,10 +188,15 @@ void main() {
     float darkMask =
             1.0
                     - smoothstep(
-                            0.58,
-                            0.92,
+                            BRIGHTPROTECTSTART,
+                            BRIGHTPROTECTEND,
                             centerLuma
                     );
+
+    float chromaEdgeLow = max(CHROMAEDGELOW, noiseSigma * 0.80);
+    float chromaEdgeHigh = max(CHROMAEDGEHIGH, noiseSigma * 3.25);
+    float chromaTextureMask =
+            1.0 - smoothstep(chromaEdgeLow, chromaEdgeHigh, localChromaGradient);
 
     float centerSaturation =
             length(
@@ -254,32 +275,44 @@ void main() {
                 );
 
         /*
-         * Do not compare sample chroma with the center chroma. The 26169
-         * comparison caused pixels inside a colored cloud to reinforce that
-         * same cloud. Only strongly saturated real colors are downweighted.
+         * Build 26271:
+         * Compare neighbor chroma with the center so green foliage is not
+         * averaged strongly with pale blinds, gray sky, glare, or bark.
+         * The tolerance expands with estimated noise in dark regions.
          */
-        float sampleSaturation =
+        float chromaDistance =
                 length(
-                        opponentChroma(
-                                sampleGuide
-                        )
+                        sampleChroma
+                                - centerChroma
                 );
 
-        float sampleColorProtection =
+        float chromaSimilarityLow =
+                max(
+                        CHROMASIMILARITYMIN,
+                        noiseSigma * 0.95
+                );
+
+        float chromaSimilarityHigh =
+                max(
+                        CHROMASIMILARITYMAX,
+                        noiseSigma * 4.5
+                );
+
+        float chromaSimilarityWeight =
                 1.0
                         - smoothstep(
-                                0.45,
-                                0.85,
-                                sampleSaturation
+                                chromaSimilarityLow,
+                                chromaSimilarityHigh,
+                                chromaDistance
                         );
 
         float sampleWeight =
                 spatialWeight
                         * lumaGuideWeight
                         * mix(
-                                0.15,
+                                0.08,
                                 1.0,
-                                sampleColorProtection
+                                chromaSimilarityWeight
                           );
 
         accumulatedChroma +=
@@ -296,14 +329,44 @@ void main() {
                             / accumulatedWeight
                     : centerChroma;
 
-    float blend =
+    float requestedBlend =
             clamp(
                     CHROMASTRENGTH
                             * flatMask
                             * darkMask
+                            * chromaTextureMask
                             * saturatedCenterProtection,
                     0.0,
                     1.0
+            );
+
+    /*
+     * Retain at least 94% of center chroma in bright textured regions and at
+     * least 82% through midtones. Dark noisy regions retain the full cleanup.
+     */
+    float maximumAllowedBlend =
+            mix(
+                    1.0,
+                    mix(
+                            0.18,
+                            0.06,
+                            smoothstep(
+                                    0.42,
+                                    0.76,
+                                    centerLuma
+                            )
+                    ),
+                    smoothstep(
+                            0.24,
+                            0.56,
+                            centerLuma
+                    )
+            );
+
+    float blend =
+            min(
+                    requestedBlend,
+                    maximumAllowedBlend
             );
 
     vec2 outputChroma =

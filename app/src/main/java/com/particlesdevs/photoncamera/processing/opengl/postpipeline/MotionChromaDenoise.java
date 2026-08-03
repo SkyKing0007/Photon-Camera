@@ -97,6 +97,14 @@ public class MotionChromaDenoise extends Node {
         );
         glProg.setDefine("NOISES", basePipeline.noiseS);
         glProg.setDefine("NOISEO", basePipeline.noiseO);
+
+        /* Build 26270: protect bright textured color without global saturation. */
+        glProg.setDefine("BRIGHTPROTECTSTART", 0.42f);
+        glProg.setDefine("BRIGHTPROTECTEND", 0.76f);
+        glProg.setDefine("CHROMAEDGELOW", 0.018f);
+        glProg.setDefine("CHROMAEDGEHIGH", 0.105f);
+        glProg.setDefine("CHROMASIMILARITYMIN", 0.028f);
+        glProg.setDefine("CHROMASIMILARITYMAX", 0.145f);
     }
 
     @Override
@@ -114,9 +122,15 @@ public class MotionChromaDenoise extends Node {
                         basePipeline.mParameters.iso
                 );
 
+        /*
+         * Build 26261:
+         * The old curve produced only about 0.096 chroma strength near
+         * ISO 1600 on telephoto. Start earlier and ramp faster now that
+         * alignment corruption is no longer masquerading as color detail.
+         */
         float highIsoBlend =
                 Math2.clamp(
-                        (motionIso - 600.0f) / 2600.0f,
+                        (motionIso - 250.0f) / 1700.0f,
                         0.0f,
                         1.0f
                 );
@@ -179,19 +193,22 @@ public class MotionChromaDenoise extends Node {
                         extremeNightBlend
                 );
 
-        float strength = maximumStrength * highIsoBlend;
-
-        strength *=
-                Math2.mix(
-                        0.72f,
-                        1.0f,
-                        Math.max(highIsoBlend, lowConfidence)
-                );
+        float sceneShadowLift = Math2.clamp(((PostPipeline)basePipeline).motionShadowSceneStrength, 0.0f, 1.0f);
+        float displayGainEstimate = Math.max(1.0f, ((PostPipeline)basePipeline).motionAppliedDisplayGain);
+        float lowerMidLift = Math2.clamp(((PostPipeline)basePipeline).motionAppliedLowerMidLift, 0.0f, 0.50f);
+        float displayLiftBlend = Math2.clamp((displayGainEstimate - 1.0f) / 2.55f + 0.55f * lowerMidLift, 0.0f, 1.0f);
+        float visibleNoiseBlend = Math.max(
+                highIsoBlend,
+                Math.max(lowConfidence, displayLiftBlend));
+        float strength = Math.min(
+                0.88f,
+                maximumStrength * Math2.mix(highIsoBlend, 1.0f, 0.72f * displayLiftBlend));
+        strength *= Math2.mix(0.76f, 1.08f, visibleNoiseBlend);
 
         if (strength <= 0.001f) {
             Log.d(
                     Name,
-                    "MOTION_26171_CHROMA_TUNABLE"
+                    "MOTION_26271_CENTER_CHROMA_PRESERVATION"
                             + " iso=" + motionIso
                             + " enabled=false"
                             + " reason=belowIso600"
@@ -204,18 +221,21 @@ public class MotionChromaDenoise extends Node {
 
         float guideSigma =
                 Math2.mix(
-                        0.040f,
-                        motionChromaGuideSigmaMaximum,
+                        0.038f,
+                        Math.min(
+                                motionChromaGuideSigmaMaximum,
+                                0.052f
+                        ),
                         highIsoBlend
                 );
 
         int adaptiveRadiusPixels;
 
-        if (motionIso >= 4000.0f) {
+        if (motionIso >= 3600.0f || displayLiftBlend >= 0.82f) {
             adaptiveRadiusPixels = 16;
-        } else if (lowConfidence >= 0.35f) {
+        } else if (lowConfidence >= 0.30f || displayLiftBlend >= 0.55f) {
             adaptiveRadiusPixels = 12;
-        } else if (motionIso >= 1800.0f || lowConfidence >= 0.20f) {
+        } else if (motionIso >= 1000.0f || lowConfidence >= 0.14f || displayLiftBlend >= 0.25f) {
             adaptiveRadiusPixels = 8;
         } else {
             adaptiveRadiusPixels = 4;
@@ -238,8 +258,9 @@ public class MotionChromaDenoise extends Node {
         int actualRadiusPixels = sampleStep * 4;
 
         boolean useSecondPass =
-                motionIso >= 2800.0f
-                        || lowConfidence >= 0.30f;
+                motionIso >= 1800.0f
+                        || lowConfidence >= 0.20f
+                        || displayLiftBlend >= 0.30f;
 
         configurePass(
                 0,
@@ -273,11 +294,15 @@ public class MotionChromaDenoise extends Node {
 
             Log.d(
                     Name,
-                    "MOTION_26217_ADAPTIVE_CHROMA"
+                    "MOTION_26271_CENTER_CHROMA_PRESERVATION"
                             + " iso=" + motionIso
                             + " effectiveRatio=" + measuredRatio
                             + " lowConfidence=" + lowConfidence
                             + " strength=" + strength
+                            + " sceneShadowLift=" + sceneShadowLift
+                            + " displayGainEstimate=" + displayGainEstimate
+                            + " displayLiftBlend=" + displayLiftBlend
+                            + " visibleNoiseBlend=" + visibleNoiseBlend
                             + " radiusPixels=" + actualRadiusPixels
                             + " passes=1"
                             + " perLensChromaMaximum=" + perLensChromaMaximum
@@ -286,6 +311,9 @@ public class MotionChromaDenoise extends Node {
                             + automaticLensProfile.equivalentFocalLengthMm
                             + " perLensExtremeNightMaximum="
                             + perLensExtremeNightMaximum
+                            + " brightProtection=0.42..0.76"
+                            + " chromaEdgeProtection=0.018..0.105"
+                            + " highlightColorfulnessPreservation=centerChroma"
                             + " detailPreserving=true"
             );
 
@@ -324,7 +352,7 @@ public class MotionChromaDenoise extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26171_CHROMA_TUNABLE"
+                "MOTION_26271_CENTER_CHROMA_PRESERVATION"
                         + " iso=" + motionIso
                         + " enabled=true"
                         + " highIsoBlend=" + highIsoBlend
@@ -341,12 +369,15 @@ public class MotionChromaDenoise extends Node {
                         + actualRadiusPixels * 2
                         + " centerChromaSimilarityUsed=false"
                         + " sampleSaturationProtected=true"
+                        + " brightProtection=0.42..0.76"
+                        + " chromaEdgeProtection=0.018..0.105"
+                        + " highlightColorfulnessPreservation=centerChroma"
                         + " deepestShadowNeutralityGuard="
                         + motionShadowNeutralization
                         + " representation=Y_RminusG_BminusG"
                         + " lumaPreserved=true"
                         + " noiseAwareFlatMask=true"
-                        + " placement=afterLumaBeforeAutoExposure"
+                        + " placement=afterAutoExposure"
         );
     }
 }

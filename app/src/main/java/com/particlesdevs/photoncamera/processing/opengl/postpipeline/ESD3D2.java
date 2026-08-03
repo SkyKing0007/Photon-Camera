@@ -56,7 +56,13 @@ public class ESD3D2 extends Node {
             defaultValue = 0.04f,
             step = 0.01f
     )
-    float motionStableWeightBlendMaximum = 0.00f;
+    /*
+     * Build 26261:
+     * Restore a small high-ISO stable-weight contribution. Zero left
+     * connected luma/chroma residuals as worm-like patterns; 0.08 is
+     * intentionally far below the earlier softness-producing range.
+     */
+    float motionStableWeightBlendMaximum = 0.12f;
 
     @Tunable(
             title = "Motion ESD shadow boost maximum",
@@ -118,9 +124,48 @@ public class ESD3D2 extends Node {
         {
             float NoiseS = basePipeline.noiseS;
             float NoiseO = basePipeline.noiseO;
+            float motionDisplayGainEstimate = 1.0f;
+            float motionVisibleNoiseVarianceScale = 1.0f;
+            float motionEffectiveWeakness = 0.0f;
+
+            if (com.particlesdevs.photoncamera.app.PhotonCamera.getSettings().selectedMode
+                    == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+                float sceneShadowLift = Math2.clamp(
+                        ((PostPipeline) basePipeline).motionShadowSceneStrength,
+                        0.0f,
+                        1.0f);
+                float measuredRatio = basePipeline.mParameters.localContributionMeasured
+                        ? Math2.clamp(basePipeline.mParameters.effectiveStackRatio, 0.0f, 1.0f)
+                        : 1.0f;
+                float lowerPercentileRatio = basePipeline.mParameters.localContributionMeasured
+                        ? Math2.clamp(basePipeline.mParameters.localContributionP25, 0.0f, 1.0f)
+                        : measuredRatio;
+                float mixedStackSupport = Math2.clamp(0.65f * measuredRatio + 0.35f * lowerPercentileRatio, 0.0f, 1.0f);
+                motionEffectiveWeakness = 1.0f - mixedStackSupport;
+                float lowIsoLiftPotential = 1.0f - Math2.smoothstep(500.0f, 2200.0f, basePipeline.mParameters.iso);
+                motionDisplayGainEstimate = 1.0f + 1.55f * Math.max(sceneShadowLift, 0.45f * lowIsoLiftPotential);
+                float visibleAmplitudeScale = motionDisplayGainEstimate
+                        * (1.0f + 0.40f * motionEffectiveWeakness);
+                motionVisibleNoiseVarianceScale = Math2.clamp(
+                        visibleAmplitudeScale * visibleAmplitudeScale,
+                        1.0f,
+                        4.25f);
+                NoiseS *= motionVisibleNoiseVarianceScale;
+                NoiseO *= motionVisibleNoiseVarianceScale;
+            }
+
             NoiseS /= scale;
             NoiseO /= scale;
-            Log.d(Name, "NoiseS:" + NoiseS + ", NoiseO:" + NoiseO);
+            Log.d(Name, "MOTION_26269_VISIBLE_NOISE_MODEL"
+                    + " capturedIso=" + basePipeline.mParameters.iso
+                    + " physicalNoiseS=" + basePipeline.noiseS
+                    + " physicalNoiseO=" + basePipeline.noiseO
+                    + " displayGainEstimate=" + motionDisplayGainEstimate
+                    + " effectiveWeakness=" + motionEffectiveWeakness
+                    + " visibleVarianceScale=" + motionVisibleNoiseVarianceScale
+                    + " modeledNoiseS=" + NoiseS
+                    + " modeledNoiseO=" + NoiseO
+                    + " exifIsoNotUsed=true");
             glProg.setDefine("NOISES", NoiseS);
             glProg.setDefine("NOISEO", NoiseO);
             float appliedShadowBoost =
@@ -362,11 +407,20 @@ public class ESD3D2 extends Node {
                             lowLightScene
                     );
 
+            float sceneShadowLiftForTexture =
+                    motionNoiseProfile
+                            ? Math2.clamp(
+                                    ((PostPipeline) basePipeline).motionShadowSceneStrength,
+                                    0.0f,
+                                    1.0f)
+                            : 0.0f;
+
             float temporalEdgeAuthorization =
                     Math2.clamp(
                             localStructureBaseline
-                                    + 0.30f
-                                            * contributionConfidence,
+                                    + 0.30f * contributionConfidence
+                                    - 0.20f * sceneShadowLiftForTexture
+                                            * (1.0f - contributionConfidence),
                             0.0f,
                             0.85f
                     );
@@ -533,8 +587,8 @@ public class ESD3D2 extends Node {
                             + " lowIsoShadowBoost=0.15"
                             + " shadowBoostApplied=" + appliedShadowBoost
                             + " nightHighIsoProtectionRetained=true"
-                            + " textureLumaModerateFactor=0.82"
-                            + " textureLumaStrongFactor=0.70"
+                            + " textureLumaModerateFactor=0.84"
+                            + " textureLumaStrongFactor=0.74"
                             + " flatLumaUnchanged=true"
                             + " perLensLuma=" + configuredLuma
                             + " perLensTexturePreservation=" + texturePreservation

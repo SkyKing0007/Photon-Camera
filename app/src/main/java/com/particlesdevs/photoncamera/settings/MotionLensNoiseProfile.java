@@ -93,14 +93,21 @@ public final class MotionLensNoiseProfile {
              * preserve substantially more mid/high-ISO telephoto texture
              * while retaining the existing ISO-adaptive cleanup paths.
              */
-            automaticLuma = 0.65f;
-            automaticChroma = 0.30f;
-            automaticTexture = 1.35f;
-            automaticSpatial = 0.80f;
-            automaticShadow = 1.00f;
-        } else if (type == LensType.ULTRAWIDE) {
+            /*
+             * Build 26261:
+             * Safe alignment-grid mapping removed the false structural
+             * residuals that the earlier telephoto profile was protecting.
+             * Keep luma detail conservative, but strengthen chroma cleanup
+             * and allow a little more spatial suppression of connected
+             * residual noise and fabric worms.
+             */
+            automaticLuma = 0.58f;
+            automaticChroma = 0.50f;
+            automaticTexture = 1.30f;
+            automaticSpatial = 0.82f;
+            automaticShadow = 0.95f;} else if (type == LensType.ULTRAWIDE) {
             automaticLuma = 0.85f;
-            automaticChroma = 0.35f;
+            automaticChroma = 0.42f;
             automaticTexture = 1.10f;
             automaticSpatial = 1.10f;
             automaticShadow = 1.15f;

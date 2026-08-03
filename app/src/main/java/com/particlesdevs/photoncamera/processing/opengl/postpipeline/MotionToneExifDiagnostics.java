@@ -208,10 +208,10 @@ public final class MotionToneExifDiagnostics {
 
     public static String userComment() {
         synchronized (LOCK) {
-            return "PHOTON_MOTION_TONE_MERGE_V26260"
+            return "PHOTON_MOTION_TONE_MERGE_V26271"
                     + ";motion=" + motion
                     + ";shader=autoexposure/apply"
-                    + ";shaderMarker=BUILD_26260_SAFE_ALIGNMENT_GRID_WARP"
+                    + ";shaderMarker=BUILD_26271_BACKLIT_WINDOW_HDR_COLOR_V1"
                     + ";iso=" + f(iso)
                     + ";effectiveFrames=" + f(effectiveFrames)
                     + ";effectiveRatio=" + f(effectiveRatio)
@@ -234,7 +234,7 @@ public final class MotionToneExifDiagnostics {
                     + f(histogramHighlightStrength)
                     + ";shadowStackConfidence="
                     + f(shadowStackConfidence)
-                    + ";mergeGuard=darkStructureHardReferenceLockV5;alignment=floatBilinearQuadraticV1;warp=safeSharedGridValidatedWarpV3;alignmentInput=initializedMildHighPassV1"
+                    + ";mergeGuard=darkStructureHardReferenceLockV5;alignment=floatBilinearQuadraticV1;warp=safeSharedGridValidatedWarpV3;denoise=scopedSeparateLumaChromaV3;alignment=balancedTimestampGeometricOcclusionConsensusV2;alignmentInput=initializedMildHighPassV1"
                     + ";configuredShadows=" + f(configuredShadows)
                     + ";appliedShadows=" + f(appliedShadows)
                     + ";configuredLtm=" + f(configuredLtm)

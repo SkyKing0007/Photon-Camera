@@ -82,8 +82,14 @@ public class CaptureSharpening extends Node {
                     );
         }
 
+        float sceneShadowLift = com.particlesdevs.photoncamera.util.Math2.clamp(((PostPipeline)basePipeline).motionShadowSceneStrength, 0.0f, 1.0f);
+        float actualDisplayGain = Math.max(1.0f, ((PostPipeline)basePipeline).motionAppliedDisplayGain);
+        float actualLowerMidLift = com.particlesdevs.photoncamera.util.Math2.clamp(((PostPipeline)basePipeline).motionAppliedLowerMidLift, 0.0f, 0.50f);
+        float visibleLiftBlend = com.particlesdevs.photoncamera.util.Math2.clamp((actualDisplayGain - 1.0f) / 2.55f + 0.50f * actualLowerMidLift, 0.0f, 1.0f);
+        float displayGainSharpenScale = com.particlesdevs.photoncamera.util.Math2.mix(1.0f, 0.48f, visibleLiftBlend * (1.0f - 0.45f * basePipeline.mParameters.effectiveStackRatio));
         strength *= motionSharpScale;
         strength *= temporalConfidenceScale;
+        strength *= displayGainSharpenScale;
 
         Log.d(
                 Name,
@@ -94,6 +100,8 @@ public class CaptureSharpening extends Node {
                         + basePipeline.mParameters.localContributionMeasured
                         + " confidenceScale="
                         + temporalConfidenceScale
+                        + " sceneShadowLift=" + sceneShadowLift
+                        + " displayGainSharpenScale=" + displayGainSharpenScale
         );
 
             Log.d(

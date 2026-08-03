@@ -7,6 +7,7 @@ uniform float applyGammaMix;
 uniform float indoorHdrStrength;
 uniform float lowerMidLift;
 uniform float highlightCompression;
+uniform float backlitWindowStrength;
 out vec4 Output;
 vec3 reinhard_extended(vec3 v, float max_white){
     vec3 numerator = v * (vec3(1.0f) + (v / vec3(max_white * max_white)));
@@ -87,16 +88,16 @@ void main() {
      */
     float blackProtection =
             smoothstep(
-                    0.004,
-                    0.025,
+                    0.0015,
+                    0.014,
                     luma
             );
 
     float upperMidProtection =
             1.0
                     - smoothstep(
-                            0.18,
-                            0.36,
+                            0.22,
+                            0.46,
                             luma
                     );
 
@@ -107,8 +108,8 @@ void main() {
     float deepShadowWeight =
             1.0
                     - smoothstep(
-                            0.035,
-                            0.12,
+                            0.022,
+                            0.11,
                             luma
                     );
 
@@ -152,27 +153,200 @@ void main() {
                     vec3(0.299, 0.587, 0.114)
             );
 
+    /*
+     * Build 26271:
+     * Keep upper midtones distinct, then progressively compress the true
+     * highlight shoulder. Preserve center chroma directly rather than trying
+     * to reconstruct saturation after it has already been compressed.
+     */
     float highlightMask =
             smoothstep(
-                    0.52,
-                    0.92,
+                    0.62,
+                    0.94,
                     luma
+            );
+
+    float strongHighlightMask =
+            smoothstep(
+                    0.80,
+                    0.985,
+                    luma
+            );
+
+    vec3 preHighlightColor =
+            Output.rgb;
+
+    float preHighlightLuma =
+            luma;
+
+    vec3 preHighlightChroma =
+            preHighlightColor
+                    - vec3(preHighlightLuma);
+
+    float shoulderCoefficient =
+            mix(
+                    0.42,
+                    0.68,
+                    backlitWindowStrength
             );
 
     vec3 compressedHighlights =
             Output.rgb
                     / (
                             vec3(1.0)
-                                    + 0.55
+                                    + shoulderCoefficient
                                     * Output.rgb
                     );
 
-    Output.rgb =
+    float shoulderBlend =
+            clamp(
+                    highlightCompression
+                            * (
+                                    0.42
+                                            * highlightMask
+                                            + 0.58
+                                            * strongHighlightMask
+                              ),
+                    0.0,
+                    0.78
+            );
+
+    vec3 compressedOutput =
             mix(
                     Output.rgb,
                     compressedHighlights,
-                    highlightCompression
-                            * highlightMask
+                    shoulderBlend
+            );
+
+    float compressedLuma =
+            dot(
+                    compressedOutput,
+                    vec3(0.299, 0.587, 0.114)
+            );
+
+    /*
+     * Direct center-chroma retention. This does not multiply saturation; it
+     * prevents the shoulder from collapsing existing non-clipped color.
+     */
+    float nonClipProtection =
+            1.0
+                    - smoothstep(
+                            0.94,
+                            0.995,
+                            max(
+                                    preHighlightColor.r,
+                                    max(
+                                            preHighlightColor.g,
+                                            preHighlightColor.b
+                                    )
+                            )
+                    );
+
+    float chromaRetention =
+            clamp(
+                    (
+                            0.86
+                                    + 0.10
+                                    * backlitWindowStrength
+                    )
+                            * nonClipProtection,
+                    0.0,
+                    0.96
+            );
+
+    vec3 retainedColor =
+            vec3(compressedLuma)
+                    + preHighlightChroma
+                            * mix(
+                                    compressedLuma
+                                            / max(preHighlightLuma, 0.0001),
+                                    1.0,
+                                    chromaRetention
+                              );
+
+    /*
+     * Restore a small amount of local luminance separation in the bright
+     * region. The detail signal comes from the pre-tone input and is clamped
+     * tightly to avoid halos.
+     */
+    ivec2 size =
+            textureSize(
+                    InputBuffer,
+                    0
+            );
+
+    ivec2 maxCoord =
+            size - ivec2(1);
+
+    float inputCenterLuma =
+            dot(
+                    inp.rgb,
+                    vec3(0.299, 0.587, 0.114)
+            );
+
+    float inputNeighborAverage =
+            0.25
+                    * (
+                            dot(
+                                    texelFetch(
+                                            InputBuffer,
+                                            clamp(xy + ivec2(-2, 0), ivec2(0), maxCoord),
+                                            0
+                                    ).rgb,
+                                    vec3(0.299, 0.587, 0.114)
+                            )
+                                    + dot(
+                                            texelFetch(
+                                                    InputBuffer,
+                                                    clamp(xy + ivec2(2, 0), ivec2(0), maxCoord),
+                                                    0
+                                            ).rgb,
+                                            vec3(0.299, 0.587, 0.114)
+                                      )
+                                    + dot(
+                                            texelFetch(
+                                                    InputBuffer,
+                                                    clamp(xy + ivec2(0, -2), ivec2(0), maxCoord),
+                                                    0
+                                            ).rgb,
+                                            vec3(0.299, 0.587, 0.114)
+                                      )
+                                    + dot(
+                                            texelFetch(
+                                                    InputBuffer,
+                                                    clamp(xy + ivec2(0, 2), ivec2(0), maxCoord),
+                                                    0
+                                            ).rgb,
+                                            vec3(0.299, 0.587, 0.114)
+                                      )
+                      );
+
+    float localDetail =
+            clamp(
+                    inputCenterLuma
+                            - inputNeighborAverage,
+                    -0.025,
+                    0.025
+            );
+
+    float detailStrength =
+            0.32
+                    * backlitWindowStrength
+                    * highlightMask
+                    * nonClipProtection;
+
+    retainedColor +=
+            vec3(
+                    localDetail
+                            * detailStrength
+            );
+
+    Output.rgb =
+            mix(
+                    compressedOutput,
+                    retainedColor,
+                    0.72
+                            * nonClipProtection
             );
 
     Output.rgb =

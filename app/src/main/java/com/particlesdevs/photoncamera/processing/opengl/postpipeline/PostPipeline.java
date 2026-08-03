@@ -52,6 +52,9 @@ public class PostPipeline extends GLBasePipeline {
      */
     float motionShadowSceneStrength = 0.0f;
     float motionHighlightSceneStrength = 0.0f;
+    float motionAppliedDisplayGain = 1.0f;
+    float motionAppliedLowerMidLift = 0.0f;
+    float motionDarkPixelStrength = 0.0f;
 
     /*
      * Compatibility mirror for older diagnostics and unchanged nodes.
@@ -343,19 +346,14 @@ public class PostPipeline extends GLBasePipeline {
 
         add(new Initial());
 
+        add(new AutoExposure());
+
         if (mSettings.selectedMode == CameraMode.MOTION
                 && mSettings.hdrxNR) {
-            /*
-         * Build 26216:
-         * Bypass dedicated post-tone luma cleanup because it can consolidate
-         * residual temporal noise into blotches. Keep the separate coarse
-         * chroma cleanup stage.
-         */
-        // add(new MotionLumaDenoise());
-        add(new MotionChromaDenoise());
+            // MotionLumaDenoise remains bypassed to avoid blotchy consolidation.
+            // add(new MotionLumaDenoise());
+            add(new MotionChromaDenoise());
         }
-
-        add(new AutoExposure());
 
         /*
          * Build 26232:

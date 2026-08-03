@@ -1271,14 +1271,95 @@ public class PyramidMerging extends GLOneScript {
         float maxBlack = Math.max(blackLevel[0], Math.max(blackLevel[1], Math.max(blackLevel[2], blackLevel[3])));
         float minLevel = (float) (1.0/(double)(parameters.whiteLevel-maxBlack));
 
-        for (int f = 0; f < images.size(); f++) {
-            if(f == minExpIdx) continue;
-            int ind = f;
-            if(ind == 0){
-                ind = minExpIdx;
+        /*
+         * Build 26265:
+         * Timestamp-centered candidate selection plus per-pixel geometric,
+         * structural, occlusion, and consensus confidence.
+         */
+        final ImageFrame motionReferenceFrame = images.get(minExpIdx);
+        final float motionReferenceShakiness =
+                motionReferenceFrame.frameGyro != null
+                        ? Math.max(0.0f, motionReferenceFrame.frameGyro.shakiness)
+                        : 0.0f;
+        final long motionReferenceExposureNs =
+                motionReferenceFrame.diagnosticExposureNs > 0L
+                        ? motionReferenceFrame.diagnosticExposureNs
+                        : 8333333L;
+        final float motionBlurRisk =
+                Math.max(motionReferenceShakiness, motionReferenceFrame.diagnosticOisMotion)
+                        * (motionReferenceExposureNs / 1000000.0f);
+        final float motionRiskBlend =
+                Math.max(0.0f, Math.min(1.0f, motionBlurRisk / 0.030f));
+        final long motionTemporalRadiusNs =
+                (long) (166000000L - 66000000L * motionRiskBlend);
+        final int motionAlternateLimit =
+                motionEqualExposureStack
+                        ? Math.min(8, Math.max(5, Math.round(8.0f - 3.0f * motionRiskBlend)))
+                        : Integer.MAX_VALUE;
+        ArrayList<Integer> mergeIndices = new ArrayList<>();
+
+        if (motionEqualExposureStack) {
+            final long referenceTimestamp = images.get(minExpIdx).timestamp;
+            ArrayList<Integer> candidates = new ArrayList<>();
+            for (int i = 0; i < images.size(); i++) {
+                if (i == minExpIdx) continue;
+                long ts = images.get(i).timestamp;
+                long distance = referenceTimestamp > 0L && ts > 0L
+                        ? Math.abs(ts - referenceTimestamp)
+                        : Long.MAX_VALUE;
+                if (distance <= motionTemporalRadiusNs) candidates.add(i);
             }
+            candidates.sort((a, b) -> {
+                ImageFrame frameA = images.get(a);
+                ImageFrame frameB = images.get(b);
+                double timeA = Math.abs(frameA.timestamp - referenceTimestamp) / 1000000.0;
+                double timeB = Math.abs(frameB.timestamp - referenceTimestamp) / 1000000.0;
+                double gyroA = frameA.frameGyro != null ? Math.max(0.0f, frameA.frameGyro.shakiness) : 0.0;
+                double gyroB = frameB.frameGyro != null ? Math.max(0.0f, frameB.frameGyro.shakiness) : 0.0;
+                double scoreA = timeA + gyroA * 18000.0 * (0.35 + 0.65 * motionRiskBlend);
+                double scoreB = timeB + gyroB * 18000.0 * (0.35 + 0.65 * motionRiskBlend);
+                return Double.compare(scoreA, scoreB);
+            });
+            for (int i = 0; i < candidates.size() && mergeIndices.size() < motionAlternateLimit; i++) {
+                mergeIndices.add(candidates.get(i));
+            }
+            if (mergeIndices.isEmpty()) {
+                for (int i = 0; i < images.size() && mergeIndices.size() < motionAlternateLimit; i++) {
+                    if (i != minExpIdx) mergeIndices.add(i);
+                }
+            }
+            StringBuilder selected = new StringBuilder(
+                    "MOTION_26268_GYRO_TIMESTAMP_ADAPTIVE_SELECTION referenceIndex=" + minExpIdx
+                            + " referenceTimestamp=" + referenceTimestamp
+                            + " radiusNs=" + motionTemporalRadiusNs
+                            + " alternateLimit=" + motionAlternateLimit
+                            + " referenceExposureNs=" + motionReferenceExposureNs
+                            + " referenceShakiness=" + motionReferenceShakiness
+                            + " motionBlurRisk=" + motionBlurRisk
+                            + " motionRiskBlend=" + motionRiskBlend
+                            + " selected=" + mergeIndices.size());
+            for (int index : mergeIndices) {
+                selected.append(" [index=").append(index)
+                        .append(",deltaNs=")
+                        .append(images.get(index).timestamp - referenceTimestamp)
+                        .append("]");
+            }
+            Log.d(Name, selected.toString());
+        } else {
+            for (int f = 0; f < images.size(); f++) {
+                if (f == minExpIdx) continue;
+                int ind = f;
+                if (ind == 0) ind = minExpIdx;
+                mergeIndices.add(ind);
+            }
+        }
+
+        int motionAlternatesProcessed = 0;
+        for (int mergePosition = 0; mergePosition < mergeIndices.size(); mergePosition++) {
+            int ind = mergeIndices.get(mergePosition);
             ImageFrame frame = images.get(ind);
             float exposure = 1.f/frame.pair.layerMpy;
+            if (motionEqualExposureStack) motionAlternatesProcessed++;
             Point shift = PyramidAlignment.alignmentShift(parameters, ind);
             //int f = 1;
             Log.d("PyramidMerging", "load:"+frame.pair.curlayer.name() + " " + frame.pair.layerMpy);
@@ -1386,8 +1467,12 @@ public class PyramidMerging extends GLOneScript {
                                 + " normalizedTextureRetention=true"
                                 + " textureRatioStart=1.05"
                                 + " textureRatioFull=2.50"
-                                + " minimumTemporalScale=0.18"
-                                + " minimumDifferenceFloor=0.30"
+                                + " minimumTemporalScale=0.00"
+                                + " minimumDifferenceFloor=0.00"
+                                + " alternateLimit=" + motionAlternateLimit
+                                + " temporalRadiusNs=" + motionTemporalRadiusNs
+                                + " localConfidence=balancedGeometricStructuralOcclusionConsensusV2"
+                                + " contributionDefinition=trustedSelectedMergeWeight"
                 );
 
                 glProg.useAssetProgram(
@@ -1419,7 +1504,7 @@ public class PyramidMerging extends GLOneScript {
                         1.0f
                                 / Math.max(
                                         1,
-                                        images.size()
+                                        mergeIndices.size() + 1
                                 )
                 );
             }
@@ -1456,6 +1541,32 @@ public class PyramidMerging extends GLOneScript {
                                 motionNoiseRecoveryGate
                         )
                 );
+
+                long referenceTimestamp = images.get(minExpIdx).timestamp;
+                long frameDistanceNs = referenceTimestamp > 0L && frame.timestamp > 0L
+                        ? Math.abs(frame.timestamp - referenceTimestamp)
+                        : motionTemporalRadiusNs;
+                float normalizedTemporalDistance = Math2.clamp(
+                        (float) frameDistanceNs / (float) Math.max(1L, motionTemporalRadiusNs),
+                        0.0f,
+                        1.0f);
+                float motionTemporalConfidence = Math2.clamp(
+                        1.0f - 0.42f * normalizedTemporalDistance,
+                        0.58f,
+                        1.0f);
+                glProg.setVar(
+                        "motionTemporalConfidence",
+                        motionTemporalConfidence
+                );
+                glProg.setVar(
+                        "motionMergeOrdinal",
+                        motionAlternatesProcessed
+                );
+                glProg.setTexture("motionAlignmentTexture", alignmentTex);
+                glProg.setVar("motionAlignmentShift", shift);
+                glProg.setVar("motionAlignmentSize", parameters.alignmentSize);
+                glProg.setVar("motionRawHalf", rawHalf);
+                glProg.setVar("motionAlignmentTile", parameters.tile);
             }
 
             glProg.setVar("whiteLevel", (float) (parameters.whiteLevel));
@@ -1550,7 +1661,7 @@ public class PyramidMerging extends GLOneScript {
                     Log.d(
                             Name,
                             "MOTION_26215_PER_FRAME_CONTRIBUTION"
-                                    + " mergeOrder=" + f
+                                    + " mergeOrder=" + mergePosition
                                     + " sourceIndex=" + ind
                                     + " timestamp=" + frame.timestamp
                                     + " exposureNs="
