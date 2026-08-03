@@ -71,6 +71,35 @@ vec2 vec4ToAlignment(vec4 alignment) {
     converted.xy += alignment.zw;
     return converted;
 }
+
+/*
+ * Build 26259:
+ * Sample the half-resolution RGGB-vector texture at a floating coordinate.
+ * Each vec4 component remains in its own CFA plane.
+ */
+vec4 sampleAlterLinear(vec2 coords) {
+    ivec2 size = imageSize(alterTexture);
+    vec2 safe = clamp(
+            coords,
+            vec2(0.0),
+            vec2(size - ivec2(1))
+    );
+
+    ivec2 p0 = ivec2(floor(safe));
+    ivec2 p1 = min(p0 + ivec2(1), size - ivec2(1));
+    vec2 f = fract(safe);
+
+    vec4 a = imageLoad(alterTexture, p0);
+    vec4 b = imageLoad(alterTexture, ivec2(p1.x, p0.y));
+    vec4 c = imageLoad(alterTexture, ivec2(p0.x, p1.y));
+    vec4 d = imageLoad(alterTexture, p1);
+
+    return mix(
+            mix(a, b, f.x),
+            mix(c, d, f.x),
+            f.y
+    );
+}
 vec2 hash22(vec2 p)
 {
     vec3 p3 = fract(vec3(p.xyx) * vec3(.1031, .1030, .0973));
@@ -92,60 +121,231 @@ void main() {
     w[2] = windowxy4((TILE*xy)%TILE_AL + ivec2(TILE_AL,0));
     w[1] = windowxy4((TILE*xy)%TILE_AL + ivec2(0,TILE_AL));
     w[0] = windowxy4((TILE*xy)%TILE_AL + ivec2(TILE_AL));
-    vec4 alignedSum = vec4(0.0);
+            vec4 alignedSum = vec4(0.0);
     vec4 bayerNone = imageLoad(alterTexture, xy);
 
-    // Read the four neighboring tile vectors first. Their agreement acts as
-    // a conservative alignment-confidence estimate. Large disagreement is
-    // common near motion boundaries, weak texture, or incorrect tile matches.
-    //ivec2 alignPrev = ivec2(xy);
+    /*
+     * Build 26260:
+     * Safe alignment-grid mapping.
+     *
+     * The previous warp could clamp a base grid coordinate, add shift later,
+     * then fetch outside the valid alignment texture. It also clamped invalid
+     * warped image coordinates, turning bad vectors into repeated columns or
+     * large smeared regions.
+     *
+     * This path:
+     * 1. derives one explicit grid coordinate from the half-resolution Bayer
+     *    texel domain;
+     * 2. adds shift before validation;
+     * 3. requires the complete 2x2 tile neighborhood to be valid;
+     * 4. uses one shared bilinear flow for the entire RGGB-vector texel;
+     * 5. rejects excessive or inconsistent vectors;
+     * 6. rejects warped coordinates that leave the image;
+     * 7. falls back cleanly to the unwarped alternate sample.
+     */
+
+    vec2 gridPosition =
+            (vec2(xy) * float(TILE))
+                    / float(TILE_AL);
+
+    ivec2 gridBase = ivec2(floor(gridPosition));
+    vec2 gridFraction = fract(gridPosition);
+
+    ivec2 gridCoords[4];
+    gridCoords[0] = gridBase + ivec2(0, 0) + shift;
+    gridCoords[1] = gridBase + ivec2(1, 0) + shift;
+    gridCoords[2] = gridBase + ivec2(0, 1) + shift;
+    gridCoords[3] = gridBase + ivec2(1, 1) + shift;
+
+    bool validGridNeighborhood = true;
+
     for (int i = 0; i < 4; i++) {
-        ivec2 xyT = clamp(ivec2((TILE*xy)/TILE_AL + ivec2(i % 2, i / 2)),ivec2(0),alignmentSize-1);
-        vec4 alignLoad = texelFetch(alignmentTexture, xyT + shift, 0);
-        //ivec2 xyT = (TILE*xy)/TILE_AL;
-        /*vec2 seed = hash22(vec2(xyT)/vec2(alignmentSize));
-        float mpy = 1.0;
-        if(seed.x < 0.1) {
-            mpy = 50.0;
-        }*/
-        //mpy = (seed.x + seed.y) * 5.0;
-        ivec2 align = ivec2(vec4ToAlignment(alignLoad));
-        //vec2 align = texture(alignmentTexture, uv + vec2(i % 2, i / 2) / uvScale).xy;
-        ivec2 aligned = clamp(xy + align, ivec2(0), outSize - ivec2(1));
-        //ivec2 alignedFull = aligned * TILE;
-        //aligned = ivec2(clamp(aligned, ivec2(0), ivec2(outSize - 1)));
-        /*bvec2 lt = lessThan(aligned, ivec2(0));
-        aligned = aligned * ivec2(not(lt)) + ivec2(-aligned) * ivec2(lt);
-        bvec2 gt = greaterThan(aligned, ivec2(outSize - 1));
-        aligned = (2 * ivec2(outSize) - aligned - 1) * ivec2(gt) + aligned * ivec2(not(gt));*/
-        vec4 bayerAlter = imageLoad(alterTexture, aligned);
-
-        //vec4 bayerPrev = getBayerVec(alignPrev * TILE, alterTexture);
-        vec4 w1 = (abs(bayerAlter*vec4(exposure) - bayerBase));
-        vec4 w2 = (abs(bayerNone*vec4(exposure) - bayerBase));
-        //vec4 w3 = (abs(bayerPrev*vec4(exposure) - bayerBase));
-        /*if(dot(w3,vec4(0.25)) < dot(w2,vec4(0.25))) {
-            bayerNone = mix(bayerPrev, bayerNone, clamp(w3/(w2+w3+0.0001),vec4(0.0),vec4(1.0)));
-            w2 = w3;
-        }*/
-        vec4 photometricPreference =
-                smoothstep(w2 / (w1 + w2 + vec4(1e-6)),
-                           vec4(0.48),
-                           vec4(0.51));
-
-        // Preserve the existing photometric choice between the unwarped
-        // and aligned sample from the secondary frame.
-        bayerAlter =
-                mix(bayerNone, bayerAlter, photometricPreference);
-
-        //vec4 hp2 = imageLoad(hotPixTexture, aligned * TILE);
-        //bayerAlter = bayerAlter * vec4(1.0-hp2) + imageLoad(avrTexture, aligned * TILE) * hp2;
-        alignedSum += bayerAlter * w[i];
-        //bayerPrev = bayerAlter;
+        validGridNeighborhood =
+                validGridNeighborhood
+                        && all(
+                                greaterThanEqual(
+                                        gridCoords[i],
+                                        ivec2(0)
+                                )
+                        )
+                        && all(
+                                lessThan(
+                                        gridCoords[i],
+                                        alignmentSize
+                                )
+                        );
     }
 
+    float bilinearWeights[4];
+    bilinearWeights[0] =
+            (1.0 - gridFraction.x)
+                    * (1.0 - gridFraction.y);
+    bilinearWeights[1] =
+            gridFraction.x
+                    * (1.0 - gridFraction.y);
+    bilinearWeights[2] =
+            (1.0 - gridFraction.x)
+                    * gridFraction.y;
+    bilinearWeights[3] =
+            gridFraction.x
+                    * gridFraction.y;
 
-    alignedSum = clamp(alignedSum, vec4(0.0), vec4(1.0));
+    vec2 sharedFlow = vec2(0.0);
+    vec2 tileFlows[4];
+
+    if (validGridNeighborhood) {
+        for (int i = 0; i < 4; i++) {
+            vec4 alignLoad =
+                    texelFetch(
+                            alignmentTexture,
+                            gridCoords[i],
+                            0
+                    );
+
+            tileFlows[i] = vec4ToAlignment(alignLoad);
+            sharedFlow += tileFlows[i] * bilinearWeights[i];
+        }
+    } else {
+        for (int i = 0; i < 4; i++) {
+            tileFlows[i] = vec2(0.0);
+        }
+    }
+
+    float maximumFlowDisagreement = 0.0;
+
+    for (int i = 0; i < 4; i++) {
+        maximumFlowDisagreement =
+                max(
+                        maximumFlowDisagreement,
+                        length(tileFlows[i] - sharedFlow)
+                );
+    }
+
+    float flowMagnitude = length(sharedFlow);
+
+    /*
+     * Conservative limits prevent one bad tile or corrupt decode from
+     * displacing a large image region. Values are in half-resolution
+     * RGGB-vector texel units.
+     */
+    float vectorConsistency =
+            1.0
+                    - smoothstep(
+                            0.40,
+                            1.20,
+                            maximumFlowDisagreement
+                    );
+
+    float magnitudeConfidence =
+            1.0
+                    - smoothstep(
+                            6.0,
+                            12.0,
+                            flowMagnitude
+                    );
+
+    vec2 warpedCoordinate =
+            vec2(xy) + sharedFlow;
+
+    ivec2 alterSize = imageSize(alterTexture);
+
+    bool validWarpCoordinate =
+            all(
+                    greaterThanEqual(
+                            warpedCoordinate,
+                            vec2(0.0)
+                    )
+            )
+                    && all(
+                            lessThanEqual(
+                                    warpedCoordinate,
+                                    vec2(alterSize - ivec2(1))
+                            )
+                    );
+
+    vec4 bayerAligned = bayerNone;
+
+    if (
+        validGridNeighborhood
+                && validWarpCoordinate
+                && flowMagnitude < 12.0
+    ) {
+        bayerAligned =
+                sampleAlterLinear(
+                        warpedCoordinate
+                );
+    }
+
+    vec4 alignedErrorChannels =
+            abs(
+                    bayerAligned * vec4(exposure)
+                            - bayerBase
+            );
+
+    vec4 unwarpedErrorChannels =
+            abs(
+                    bayerNone * vec4(exposure)
+                            - bayerBase
+            );
+
+    float alignedError =
+            dot(
+                    alignedErrorChannels,
+                    vec4(0.25)
+            );
+
+    float unwarpedError =
+            dot(
+                    unwarpedErrorChannels,
+                    vec4(0.25)
+            );
+
+    float photometricAdvantage =
+            (unwarpedError - alignedError)
+                    / (
+                            unwarpedError
+                                    + alignedError
+                                    + 1.0e-6
+                    );
+
+    float photometricConfidence =
+            smoothstep(
+                    0.015,
+                    0.080,
+                    photometricAdvantage
+            );
+
+    float validityConfidence =
+            validGridNeighborhood && validWarpCoordinate
+                    ? 1.0
+                    : 0.0;
+
+    float warpConfidence =
+            photometricConfidence
+                    * vectorConsistency
+                    * magnitudeConfidence
+                    * validityConfidence;
+
+    float hardWarpAcceptance =
+            smoothstep(
+                    0.50,
+                    0.75,
+                    warpConfidence
+            );
+
+    alignedSum =
+            mix(
+                    bayerNone,
+                    bayerAligned,
+                    hardWarpAcceptance
+            );
+
+    alignedSum =
+            clamp(
+                    alignedSum,
+                    vec4(0.0),
+                    vec4(1.0)
+            );
     alignedSum *= vec4(exposure);
     float target = 1.0;
     if(exposure <= 0.9){

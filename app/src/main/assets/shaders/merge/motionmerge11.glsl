@@ -231,9 +231,28 @@ void main() {
                             - base
             );
 
+    /*
+     * Build 26256:
+     * Compare every reconstructed candidate against both the recursive merge
+     * and the immutable Bayer reference. The recursive base may already carry
+     * sub-pixel blur, so agreement with it alone cannot prove that fine text
+     * or a dark structural edge is correctly aligned.
+     */
+    float immutableReferenceDisagreement =
+            length(
+                    mergeCandidate
+                            - bayer
+            );
+
     float baseSpatialError =
             length(
                     base
+                            - mean
+            );
+
+    float immutableReferenceEdge =
+            length(
+                    bayer
                             - mean
             );
 
@@ -299,11 +318,39 @@ void main() {
             spatialConsistencyGate
                     * edgeSupportGate;
 
+    /*
+     * Dark lettering and upholstery seams can have low absolute signal while
+     * still containing a real edge. Normalize candidate/reference mismatch by
+     * modeled noise and require support from the immutable reference edge.
+     */
+    float immutableReferenceMismatchGate =
+            smoothstep(
+                    modeledNoiseMagnitude * 0.85,
+                    modeledNoiseMagnitude * 2.75
+                            + 0.006,
+                    immutableReferenceDisagreement
+            );
+
+    float immutableReferenceEdgeGate =
+            smoothstep(
+                    modeledNoiseMagnitude * 0.20,
+                    modeledNoiseMagnitude * 1.60
+                            + 0.003,
+                    immutableReferenceEdge
+            );
+
+    float immutableReferenceEdgeDisagreement =
+            immutableReferenceMismatchGate
+                    * immutableReferenceEdgeGate;
+
     float localMergeDisagreement =
             clamp(
                     max(
-                            temporalEdgeDisagreement,
-                            spatialEdgeDisagreement
+                            max(
+                                    temporalEdgeDisagreement,
+                                    spatialEdgeDisagreement
+                            ),
+                            immutableReferenceEdgeDisagreement
                     ),
                     0.0,
                     1.0
@@ -389,22 +436,33 @@ void main() {
                     finalMergeWeight
             );
 
-    vec4 referenceHighFrequency =
+    /*
+     * Build 26256:
+     * Use true immutable reference detail. 26255 mistakenly derived
+     * "reference" high frequency from correctedBase, which is the recursive
+     * accumulation and can already contain the ghost contour we are trying to
+     * remove.
+     */
+    vec4 immutableReferenceHighFrequency =
+            bayer
+                    - mean;
+
+    vec4 accumulatedHighFrequency =
             correctedBase
                     - mean;
 
     float referenceDetailMagnitude =
-            length(referenceHighFrequency);
+            length(immutableReferenceHighFrequency);
 
     float fineStructureGate =
             smoothstep(
-                    modeledNoiseMagnitude * 0.20,
-                    modeledNoiseMagnitude * 1.80
-                            + 0.004,
+                    modeledNoiseMagnitude * 0.15,
+                    modeledNoiseMagnitude * 1.45
+                            + 0.003,
                     referenceDetailMagnitude
             );
 
-    float referenceDetailLock =
+    float confidenceDrivenReferenceLock =
             clamp(
                     fineStructureGate
                             * (
@@ -415,23 +473,78 @@ void main() {
                     1.0
             );
 
-    vec4 mergedLowFrequency =
-            mix(
+    /*
+     * Build 26257:
+     * 26256 produced no visible change, proving the mismatch-driven confidence
+     * rarely crossed its threshold in the affected dark structures.
+     *
+     * Use the immutable reference neighborhood itself to identify dark
+     * structural detail. This does not classify every dark pixel as unsafe:
+     * smooth dark surfaces keep fineStructureGate near zero. A dark
+     * neighborhood with a real edge, lettering, grille opening, or upholstery
+     * seam receives a direct reference-detail lock independent of the
+     * post-warp mismatch score.
+     */
+    float immutableNeighborhoodLuma =
+            dot(
                     mean,
-                    temporallyMerged,
-                    0.72
+                    vec4(0.25)
             );
 
-    vec4 referenceDetailOutput =
-            mergedLowFrequency
-                    + referenceHighFrequency;
+    float darkNeighborhoodGate =
+            1.0
+                    - smoothstep(
+                            0.16,
+                            0.38,
+                            immutableNeighborhoodLuma
+                    );
+
+    float referenceStructureSupport =
+            max(
+                    referenceDetailMagnitude,
+                    sqrt(
+                            length(variance)
+                                    + EPS
+                    )
+            );
+
+    float darkStructureEdgeGate =
+            smoothstep(
+                    modeledNoiseMagnitude * 0.10,
+                    modeledNoiseMagnitude * 1.15
+                            + 0.002,
+                    referenceStructureSupport
+            );
+
+    float hardDarkStructureReferenceLock =
+            clamp(
+                    darkNeighborhoodGate
+                            * darkStructureEdgeGate
+                            * 0.96,
+                    0.0,
+                    0.96
+            );
+
+    float referenceDetailLock =
+            max(
+                    confidenceDrivenReferenceLock,
+                    hardDarkStructureReferenceLock
+            );
+
+    /*
+     * Preserve the temporally merged low-frequency result, but replace the
+     * suspect accumulated high-frequency component with the immutable Bayer
+     * reference component. The forced path is limited to dark structural
+     * detail; smooth shadows retain the temporal stack.
+     */
+    vec4 referenceDetailCorrection =
+            immutableReferenceHighFrequency
+                    - accumulatedHighFrequency;
 
     vec4 finalOutput =
-            mix(
-                    temporallyMerged,
-                    referenceDetailOutput,
-                    referenceDetailLock
-            );
+            temporallyMerged
+                    + referenceDetailCorrection
+                    * referenceDetailLock;
 
     imageStore(
             outTexture,

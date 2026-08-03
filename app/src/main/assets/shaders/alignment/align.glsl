@@ -29,6 +29,25 @@ vec4 getPixel(ivec2 coords, highp sampler2D tex) {
     return texelFetch(tex, coords, 0);
 }
 
+/*
+ * Build 26258:
+ * Preserve fractional coordinates during alignment-cost sampling.
+ */
+vec4 getPixelLinear(vec2 coords, highp sampler2D tex) {
+    ivec2 size = textureSize(tex, 0);
+    vec2 safe = clamp(coords, vec2(0.0), vec2(size - ivec2(1)));
+    ivec2 p0 = ivec2(floor(safe));
+    ivec2 p1 = min(p0 + ivec2(1), size - ivec2(1));
+    vec2 f = fract(safe);
+
+    vec4 a = texelFetch(tex, p0, 0);
+    vec4 b = texelFetch(tex, ivec2(p1.x, p0.y), 0);
+    vec4 c = texelFetch(tex, ivec2(p0.x, p1.y), 0);
+    vec4 d = texelFetch(tex, p1, 0);
+
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
 vec4 getPixelLaplacian(ivec2 coords, highp sampler2D tex) {
     ivec2 size = textureSize(tex, 0);
     coords = clamp(coords, ivec2(1), size - ivec2(2));
@@ -67,7 +86,7 @@ float brightness(vec4 color) {
     //return median4(color);
 }
 
-mat4 getSharedDifferences(ivec2 xy, ivec2 prevOffset) {
+mat4 getSharedDifferences(ivec2 xy, vec2 prevOffset) {
     mat4 differences;
     float value = 0.0;
     float maxNoise = sqrt(noiseS + noiseO)*1.0/integralNorm;
@@ -78,7 +97,7 @@ mat4 getSharedDifferences(ivec2 xy, ivec2 prevOffset) {
     for (int i = 0; i < 4; i++) {
         for (int j = 0; j < 4; j++) {
             //differences[i][j] = dot(abs(diff), vec4(0.25));
-            vec4 alterValue = clamp(getPixel(xy + ivec2(i-1, j-1) + prevOffset, alterTexture), 0.0, exposure);
+            vec4 alterValue = clamp(getPixelLinear(vec2(xy + ivec2(i-1, j-1)) + prevOffset, alterTexture), 0.0, exposure);
             //alterValue *= sqrt((alterValue*alterValue)/(alterValue*alterValue + maxNoise*maxNoise));
             //float luma = brightness(baseValue) - brightness(alterValue);
             //float luma = texture(baseCurve, vec2(brightness(baseValue), 0.5)).r - texture(alterCurve, vec2(brightness(alterValue),0.5)).r;
@@ -107,7 +126,7 @@ mat4 getOffsetDifferences(ivec2 xy) {
             if(i == 3 && j == 3) {
                 prevOffset = vec2(0.0);
             }
-            vec4 alterValue = clamp(getPixel(xy + ivec2(prevOffset), alterTexture), 0.0, exposure);
+            vec4 alterValue = clamp(getPixelLinear(vec2(xy) + prevOffset, alterTexture), 0.0, exposure);
             //alterValue *= sqrt((alterValue*alterValue)/(alterValue*alterValue + maxNoise*maxNoise));
             //alterValue = (alterValue-alterMin) / (alterMax-alterMin);
             //differences[i][j] = dot(abs(diff), vec4(0.25));
@@ -182,58 +201,99 @@ highp vec2 getPrevOffset(ivec2 tile_xy) {
 
 // Compute alignment between base and alter textures
 highp vec3 computeAlignment(ivec2 tile_xy, vec2 prevOffset) {
-    // Fill inputDifferences array with 4 calls to getSharedDifferences
     ivec2 localOffsets[OFFSETS];
     localOffsets[0] = ivec2(0, 0);
     localOffsets[1] = ivec2(1, 0);
     localOffsets[2] = ivec2(-1, 0);
     localOffsets[3] = ivec2(0, 1);
     localOffsets[4] = ivec2(0, -1);
-/*#if OFFSETS > 4
-    localOffsets[4] = ivec2(-1, 0);
-    localOffsets[5] = ivec2(0, -1);
-    localOffsets[6] = ivec2(-1, -1);
-    localOffsets[7] = ivec2(-1, 1);
-    localOffsets[8] = ivec2(1, -1);
-#endif*/
-    // Local thread ID within work group
-    ivec2 localID = ivec2(gl_LocalInvocationID.xy) - ivec2(TILE/2, TILE/2); // 0 - TILE-1
-    int localIndex = int(gl_LocalInvocationIndex); // 0 - TILE*TILE-1
-    // split to 4 calls to increase scan window size and sum calls
+
+    ivec2 localID =
+            ivec2(gl_LocalInvocationID.xy)
+                    - ivec2(TILE/2, TILE/2);
+    int localIndex = int(gl_LocalInvocationIndex);
+
     mat4 temp = mat4(0.0);
+
     for (int i = 0; i < OFFSETS; i++) {
-        int targetIndex = localIndex + i * TILE*TILE;
-        temp += getSharedDifferences((tile_xy+localOffsets[i]) * TILE + localID, ivec2(prevOffset));
+        temp += getSharedDifferences(
+                (tile_xy + localOffsets[i]) * TILE + localID,
+                prevOffset
+        );
     }
+
     inputDifferences[localIndex] = temp;
-    // Ensure all threads have written to shared memory
     barrier();
-    // Sum the differences to get final mat4 sum
-    mat4 sum = mat4(0.0);
-    // Parallel reduction for summing
+
     for (int stride = TILE * TILE / 2; stride > 0; stride >>= 1) {
         if (localIndex < stride) {
-            inputDifferences[localIndex] += inputDifferences[localIndex + stride];
+            inputDifferences[localIndex] +=
+                    inputDifferences[localIndex + stride];
         }
+
         barrier();
     }
-    // First thread has the final sum
-    sum = inputDifferences[0];
-    // Use mat4 sum to find the best offset from (-1,-1) to (1,1)
+
+    mat4 sum = inputDifferences[0];
+
     highp vec2 bestOffset = prevOffset;
     float minDiff = sum[0][0];
+    int bestI = 0;
+    int bestJ = 0;
 
     for (int j = 0; j < 4; j++) {
         for (int i = 0; i < 4; i++) {
             if (sum[i][j] < minDiff) {
                 minDiff = sum[i][j];
-                bestOffset = prevOffset + vec2(i-1, j-1);
+                bestI = i;
+                bestJ = j;
+                bestOffset = prevOffset + vec2(i - 1, j - 1);
             }
         }
     }
+
+    /*
+     * Build 26258:
+     * Fit the local matching-cost minimum to retain subpixel movement.
+     */
+    vec2 subpixelRefinement = vec2(0.0);
+
+    if (bestI > 0 && bestI < 3) {
+        float leftCost = sum[bestI - 1][bestJ];
+        float centerCostX = sum[bestI][bestJ];
+        float rightCost = sum[bestI + 1][bestJ];
+        float curvatureX =
+                leftCost - 2.0 * centerCostX + rightCost;
+
+        if (abs(curvatureX) > 1.0e-6) {
+            subpixelRefinement.x = clamp(
+                    0.5 * (leftCost - rightCost) / curvatureX,
+                    -0.5,
+                    0.5
+            );
+        }
+    }
+
+    if (bestJ > 0 && bestJ < 3) {
+        float upCost = sum[bestI][bestJ - 1];
+        float centerCostY = sum[bestI][bestJ];
+        float downCost = sum[bestI][bestJ + 1];
+        float curvatureY =
+                upCost - 2.0 * centerCostY + downCost;
+
+        if (abs(curvatureY) > 1.0e-6) {
+            subpixelRefinement.y = clamp(
+                    0.5 * (upCost - downCost) / curvatureY,
+                    -0.5,
+                    0.5
+            );
+        }
+    }
+
+    bestOffset += subpixelRefinement;
+
     return vec3(bestOffset.x, bestOffset.y, minDiff);
 }
-
 void main() {
     //ivec2 tile_xy = ivec2(gl_GlobalInvocationID.xy)/TILE;
     ivec2 tile_xy = ivec2(gl_WorkGroupID.xy);

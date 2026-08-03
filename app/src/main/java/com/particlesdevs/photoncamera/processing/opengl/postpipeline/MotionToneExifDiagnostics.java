@@ -202,16 +202,16 @@ public final class MotionToneExifDiagnostics {
             if (!motion) {
                 return "Photon 26251 tone diagnostics: non-Motion capture";
             }
-            return "Photon 26255 balanced tone and reference-detail lock diagnostics; shader=autoexposure/apply; see UserComment";
+            return "Photon 26260 balanced tone and safe alignment-grid diagnostics; shader=autoexposure/apply; see UserComment";
         }
     }
 
     public static String userComment() {
         synchronized (LOCK) {
-            return "PHOTON_MOTION_TONE_MERGE_V26255"
+            return "PHOTON_MOTION_TONE_MERGE_V26260"
                     + ";motion=" + motion
                     + ";shader=autoexposure/apply"
-                    + ";shaderMarker=BUILD_26255_REFERENCE_DETAIL_LOCK"
+                    + ";shaderMarker=BUILD_26260_SAFE_ALIGNMENT_GRID_WARP"
                     + ";iso=" + f(iso)
                     + ";effectiveFrames=" + f(effectiveFrames)
                     + ";effectiveRatio=" + f(effectiveRatio)
@@ -234,7 +234,7 @@ public final class MotionToneExifDiagnostics {
                     + f(histogramHighlightStrength)
                     + ";shadowStackConfidence="
                     + f(shadowStackConfidence)
-                    + ";mergeGuard=referenceDetailLockV3"
+                    + ";mergeGuard=darkStructureHardReferenceLockV5;alignment=floatBilinearQuadraticV1;warp=safeSharedGridValidatedWarpV3;alignmentInput=initializedMildHighPassV1"
                     + ";configuredShadows=" + f(configuredShadows)
                     + ";appliedShadows=" + f(appliedShadows)
                     + ";configuredLtm=" + f(configuredLtm)
