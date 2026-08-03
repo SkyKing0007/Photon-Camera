@@ -44,6 +44,20 @@ public class PostPipeline extends GLBasePipeline {
      * Strength of the Motion indoor bright-window HDR scene gate.
      * Zero preserves the complete existing pipeline, including Night mode.
      */
+    /*
+     * Build 26252:
+     * Shadow recovery and highlight compression are separate decisions.
+     * The older shared strength allowed a zero highlight gate to disable
+     * clearly needed shadow recovery.
+     */
+    float motionShadowSceneStrength = 0.0f;
+    float motionHighlightSceneStrength = 0.0f;
+
+    /*
+     * Compatibility mirror for older diagnostics and unchanged nodes.
+     * It follows shadow strength because that was the failed path proven by
+     * the 26251 EXIF record.
+     */
     float indoorHdrSceneStrength = 0.0f;
 
     public PostPipeline() {
@@ -109,6 +123,18 @@ public class PostPipeline extends GLBasePipeline {
     public Bitmap Run(ByteBuffer inBuffer, Parameters parameters) {
         mParameters = parameters;
         mSettings = PhotonCamera.getSettings();
+
+        /* Build 26251: reset the JPEG EXIF tone diagnostic for this run. */
+        MotionToneExifDiagnostics.reset(
+                mSettings.selectedMode == CameraMode.MOTION,
+                Math.max(1.0f, mParameters.iso),
+                mParameters.effectiveFrameCount,
+                mParameters.effectiveStackRatio,
+                mParameters.localContributionMeasured,
+                0.0f,
+                0.0f
+        );
+
         workSize = new Point(mParameters.rawSize.x, mParameters.rawSize.y);
         NoiseModeler modeler = mParameters.noiseModeler;
         noiseS = modeler.computeModel[0].first.floatValue() +
@@ -123,6 +149,17 @@ public class PostPipeline extends GLBasePipeline {
         Log.d("PostPipeline", "noisempy:" + noisempy);
         noiseS *= noisempy;
         noiseO *= noisempy;
+
+        /* Refresh modeled noise after normal Photon multipliers are applied. */
+        MotionToneExifDiagnostics.reset(
+                mSettings.selectedMode == CameraMode.MOTION,
+                Math.max(1.0f, mParameters.iso),
+                mParameters.effectiveFrameCount,
+                mParameters.effectiveStackRatio,
+                mParameters.localContributionMeasured,
+                noiseS,
+                noiseO
+        );
 
         float motionResidualNoiseMpy = 1.0f;
         /*if (!PhotonCamera.getSettings().hdrxNR) {
@@ -328,7 +365,13 @@ public class PostPipeline extends GLBasePipeline {
          */
         if (mParameters.motionCapture
                 && mSettings.hdrxNR) {
-            add(new MotionMicroContrast());
+            /*
+             * Build 26246 A/B:
+             * Temporarily bypass MotionMicroContrast so surviving edge
+             * enhancement cannot hide whether ESD preserved real texture.
+             * Merge, alignment and sharpening nodes remain unchanged.
+             */
+            // add(new MotionMicroContrast());
         }
 
         //add(new GlobalToneMapping());

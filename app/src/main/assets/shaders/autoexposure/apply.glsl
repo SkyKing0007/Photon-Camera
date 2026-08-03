@@ -60,25 +60,91 @@ void main() {
                     vec3(0.299, 0.587, 0.114)
             );
 
-    float lowerMidMask =
+    /*
+     * Build 26252:
+     * Independent tone strengths are supplied by Java. Shadow recovery is no
+     * longer disabled by a zero highlight gate, and the shoulder is driven by
+     * histogram bright-tail occupancy.
+     *
+     * Based on the earlier 26250 curve:
+     * Earlier and broader toe expansion.
+     *
+     * 26249 began too late and tapered too early, so the lower percentiles
+     * remained decisively darker than GCam. Start recovery closer to black,
+     * keep it active longer through the lower midtones, and weight the boost
+     * toward true shadow structure rather than upper-mid luminance.
+     *
+     * Highlight handling is still performed by the existing shoulder path;
+     * its strength is increased from Java by the 26250 highlightCompression
+     * change above.
+     */
+    /*
+     * Build 26253:
+     * Narrow the recovery to true shadows and early lower midtones.
+     * Mathematical black remains protected, strongest recovery is centered
+     * around approximately 0.01-0.06, and the gain approaches unity before
+     * the middle of the tonal range.
+     */
+    float blackProtection =
             smoothstep(
-                    0.08,
-                    0.22,
+                    0.004,
+                    0.025,
+                    luma
+            );
+
+    float upperMidProtection =
+            1.0
+                    - smoothstep(
+                            0.18,
+                            0.36,
+                            luma
+                    );
+
+    float lowerMidMask =
+            blackProtection
+                    * upperMidProtection;
+
+    float deepShadowWeight =
+            1.0
+                    - smoothstep(
+                            0.035,
+                            0.12,
+                            luma
+                    );
+
+    float midShadowWeight =
+            smoothstep(
+                    0.04,
+                    0.14,
                     luma
             )
             * (
                     1.0
                             - smoothstep(
-                                    0.52,
-                                    0.72,
+                                    0.16,
+                                    0.30,
                                     luma
                             )
             );
 
-    Output.rgb *=
+    float shapedGain =
             1.0
                     + lowerMidLift
-                    * lowerMidMask;
+                    * lowerMidMask
+                    * (
+                            0.55
+                                    + 1.70
+                                    * deepShadowWeight
+                                    + 0.25
+                                    * midShadowWeight
+                    );
+
+    Output.rgb =
+            clamp(
+                    Output.rgb * shapedGain,
+                    0.0,
+                    1.0
+            );
 
     luma =
             dot(

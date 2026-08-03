@@ -157,7 +157,18 @@ void main() {
     }
 
     float localTextureRange = localLumaMaximum - localLumaMinimum;
-    float modeledNoiseAmplitude = sqrt(max(sigY, 0.0000001));
+    /*
+     * Build 26247:
+     * SHADOWBOOST should strengthen actual denoise in deep shadows, but it
+     * must not also raise the threshold used to decide whether real local
+     * structure exists. Use the pre-shadow noise estimate for texture
+     * classification while retaining boosted sigY for the SNN filter itself.
+     */
+    float textureClassifierNoise =
+            sigY / max(shadowFactor, 1.0);
+
+    float modeledNoiseAmplitude =
+            sqrt(max(textureClassifierNoise, 0.0000001));
 
     float safeTexturePreservation =
             max(
@@ -258,16 +269,25 @@ void main() {
                     verticalStroke
             );
 
+    /*
+     * Build 26248:
+     * Tune from the versus_3 closet fabric example, not from a fixed ISO
+     * range. The opposing-side requirement remains, so isolated one-sided
+     * noise does not automatically qualify as fabric structure.
+     *
+     * Lower the structure threshold enough to recognize faint repeated weave
+     * and fibers while keeping modeled noise in the decision.
+     */
     float directionalThreshold =
             max(
-                    modeledNoiseAmplitude * 1.15,
-                    0.010 / safeTexturePreservation
+                    modeledNoiseAmplitude * 0.90,
+                    0.0075 / safeTexturePreservation
             );
 
     float directionalTextConfidence =
             smoothstep(
                     directionalThreshold,
-                    directionalThreshold * 2.20,
+                    directionalThreshold * 1.85,
                     supportedDirectionalStroke
             );
 
@@ -284,25 +304,48 @@ void main() {
                     directionalTextConfidence
             );
 
+    /*
+     * Build 26247:
+     * The previous equation multiplied by MOTIONLOWLIGHTSCENE, which made
+     * the additional texture protection exactly zero in bright and normal
+     * indoor scenes. Local structure is now the primary gate.
+     *
+     * Contribution confidence is a modest bonus, not a requirement.
+     * Extreme low light tapers the protection to avoid retaining flat noise.
+     */
+    float sceneTextureAllowance =
+            mix(
+                    1.0,
+                    0.45,
+                    MOTIONLOWLIGHTSCENE
+            );
+
+    float confidenceBonus =
+            mix(
+                    0.75,
+                    1.0,
+                    MOTIONEDGECONFIDENCE
+            );
+
     float localEdgeAgreement =
-            MOTIONLOWLIGHTSCENE
-                    * MOTIONEDGECONFIDENCE
-                    * localFineEdgeStrength;
+            localFineEdgeStrength
+                    * sceneTextureAllowance
+                    * confidenceBonus;
 
     float localSmoothingScale =
-            1.0 - 0.10 * localEdgeAgreement;
+            1.0 - 0.30 * localEdgeAgreement;
 
     if (localTextureRange >= strongTextureThreshold) {
         effectiveKSIZE = min(effectiveKSIZE, KSIZE_STRONG_TEXTURE);
         textureAwareLuma =
-                LUMA * 0.70 * localSmoothingScale;
+                LUMA * 0.58 * localSmoothingScale;
     } else if (
             localTextureRange >= moderateTextureThreshold
-                    || directionalTextConfidence > 0.35
+                    || directionalTextConfidence > 0.22
     ) {
         effectiveKSIZE = min(effectiveKSIZE, KSIZE_TEXTURE);
         textureAwareLuma =
-                LUMA * 0.82 * localSmoothingScale;
+                LUMA * 0.76 * localSmoothingScale;
     }
 
     // Check perimeter pixels at KSIZE distance (top, bottom, left, right, diagonals)

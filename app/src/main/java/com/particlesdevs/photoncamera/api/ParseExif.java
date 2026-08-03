@@ -7,6 +7,7 @@ import com.particlesdevs.photoncamera.util.Log;
 import androidx.exifinterface.media.ExifInterface;
 import com.particlesdevs.photoncamera.app.PhotonCamera;
 import com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector;
+import com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionToneExifDiagnostics;
 
 import java.io.File;
 import java.io.IOException;
@@ -123,6 +124,19 @@ public class ParseExif {
         inter.setAttribute(TAG_COMPRESSION, data.COMPRESSION);
         inter.setAttribute(TAG_COLOR_SPACE, data.COLOR_SPACE);
         inter.setAttribute(TAG_EXIF_VERSION, data.EXIF_VERSION);
+
+        /*
+         * Build 26251: persist Motion tone diagnostics in the JPEG itself so
+         * missing or truncated logcat output cannot hide the active path.
+         */
+        inter.setAttribute(
+                ExifInterface.TAG_IMAGE_DESCRIPTION,
+                MotionToneExifDiagnostics.imageDescription()
+        );
+        inter.setAttribute(
+                ExifInterface.TAG_USER_COMMENT,
+                MotionToneExifDiagnostics.userComment()
+        );
         inter.setAttribute(TAG_IMAGE_DESCRIPTION, data.IMAGE_DESCRIPTION);
         return inter;
     }

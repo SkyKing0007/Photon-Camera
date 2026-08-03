@@ -476,37 +476,84 @@ public class ExposureFusionBayer2 extends Node {
                             basePipeline.mParameters.iso
                     );
 
-            float lowIsoBlend =
-                    1.0f
-                            - Math2.smoothstep(
-                                    1200.0f,
-                                    3200.0f,
-                                    motionIso
-                            );
-
+            /*
+             * Build 26249:
+             * Detect scene dynamic range from the exposure-fusion measurements
+             * themselves. ISO is not a scene-dynamic-range measurement and
+             * previously collapsed valid window and outdoor foliage scenes.
+             *
+             * Geometric combination requires both meaningful shadow demand and
+             * highlight demand, but does not suppress partial evidence as
+             * severely as multiplying three unrelated gates.
+             */
             float shadowLiftNeed =
                     Math2.smoothstep(
-                            1.15f,
-                            2.80f,
+                            1.08f,
+                            2.60f,
                             overexposure
                     );
 
             float highlightProtectionNeed =
                     1.0f
                             - Math2.smoothstep(
-                                    0.70f,
+                                    0.76f,
                                     1.00f,
                                     underexposure
                             );
 
-            indoorHdrSceneStrength =
+            float dynamicRangeNeed =
+                    (float) Math.sqrt(
+                            Math.max(
+                                    0.0f,
+                                    shadowLiftNeed
+                                            * highlightProtectionNeed
+                            )
+                    );
+
+            /*
+             * Build 26252:
+             * Do not multiply shadow recovery by highlight demand.
+             * The 26251 EXIF evidence showed shadowNeed=0.996433 while
+             * highlightNeed=0, which incorrectly disabled all toe recovery.
+             */
+            float motionShadowSceneStrength =
                     Math2.clamp(
-                            lowIsoBlend
-                                    * shadowLiftNeed
-                                    * highlightProtectionNeed,
+                            shadowLiftNeed,
                             0.0f,
                             1.0f
                     );
+
+            float motionHighlightSceneStrength =
+                    Math2.clamp(
+                            highlightProtectionNeed,
+                            0.0f,
+                            1.0f
+                    );
+
+            ((PostPipeline) basePipeline)
+                    .motionShadowSceneStrength =
+                    motionShadowSceneStrength;
+
+            ((PostPipeline) basePipeline)
+                    .motionHighlightSceneStrength =
+                    motionHighlightSceneStrength;
+
+            indoorHdrSceneStrength =
+                    motionShadowSceneStrength;
+
+            MotionToneExifDiagnostics.recordDetector(
+                    overexposure,
+                    underexposure,
+                    shadowLiftNeed,
+                    highlightProtectionNeed,
+                    dynamicRangeNeed,
+                    motionShadowSceneStrength
+            );
+
+            MotionToneExifDiagnostics.recordSeparatedStrengths(
+                    motionShadowSceneStrength,
+                    motionHighlightSceneStrength
+            );
 
             ((PostPipeline) basePipeline)
                     .indoorHdrSceneStrength =
@@ -518,11 +565,16 @@ public class ExposureFusionBayer2 extends Node {
                             + " iso=" + motionIso
                             + " overexposure=" + overexposure
                             + " underexposure=" + underexposure
-                            + " lowIsoBlend=" + lowIsoBlend
+                            + " isoInformationalOnly=" + motionIso
                             + " shadowLiftNeed=" + shadowLiftNeed
                             + " highlightProtectionNeed="
                             + highlightProtectionNeed
-                            + " strength=" + indoorHdrSceneStrength
+                            + " dynamicRangeNeed=" + dynamicRangeNeed
+                            + " shadowStrength=" + motionShadowSceneStrength
+                            + " fusionHighlightStrength="
+                            + motionHighlightSceneStrength
+                            + " sharedGateRemoved=true"
+                            + " isoGateRemoved=true"
                             + " nightModeAffected=false"
                             + " globalShadowLift=false"
             );

@@ -92,6 +92,7 @@
 
         float avg = sum / cnt;
         float mpy = (histSize / 256.0f) * target / avg;
+        float gainBeforeAllGuards = mpy;
 
         sum = 0;
         int cnt2 = 0;
@@ -197,6 +198,8 @@
             );
         }
 
+        float gainAfterAllGuards = mpy;
+
         float normL = 0.0f;
         float normR = 0.0f;
         for (int i = 0; i < histSize; i++) {
@@ -218,17 +221,143 @@
         }
         glProg.setVar("applyGammaMix", applyGammaMix);
 
-        float indoorHdrStrength =
+        float shadowRecoveryStrength =
                 ((PostPipeline) basePipeline)
-                        .indoorHdrSceneStrength;
+                        .motionShadowSceneStrength;
 
+        /*
+         * Build 26252:
+         * Derive the actual highlight shoulder from the rendered histogram.
+         * Count the top 10% and top 2% independently so a bright window,
+         * lamp, or sky can request highlight compression without controlling
+         * whether shadows are allowed to open.
+         */
+        int brightTail90Count = 0;
+        int brightTail98Count = 0;
+        int totalHistogramCount =
+                histNormR
+                        + histNormG
+                        + histNormB;
+
+        int brightTail90Start =
+                Math.max(
+                        0,
+                        (int) (histSize * 0.90f)
+                );
+
+        int brightTail98Start =
+                Math.max(
+                        0,
+                        (int) (histSize * 0.98f)
+                );
+
+        for (int i = brightTail90Start; i < histSize; i++) {
+            brightTail90Count +=
+                    result[0][i]
+                            + result[1][i]
+                            + result[2][i];
+        }
+
+        for (int i = brightTail98Start; i < histSize; i++) {
+            brightTail98Count +=
+                    result[0][i]
+                            + result[1][i]
+                            + result[2][i];
+        }
+
+        float brightTail90Fraction =
+                totalHistogramCount > 0
+                        ? ((float) brightTail90Count)
+                                / ((float) totalHistogramCount)
+                        : 0.0f;
+
+        float brightTail98Fraction =
+                totalHistogramCount > 0
+                        ? ((float) brightTail98Count)
+                                / ((float) totalHistogramCount)
+                        : 0.0f;
+
+        /*
+         * Build 26253:
+         * 26252 under-reacted to bright windows and lamps. Make the shoulder
+         * respond earlier to both broad bright-tail occupancy and concentrated
+         * near-white occupancy, independently of shadow recovery.
+         */
+        float highlightRecoveryStrength =
+                Math2.clamp(
+                        Math.max(
+                                Math2.smoothstep(
+                                        0.004f,
+                                        0.035f,
+                                        brightTail90Fraction
+                                ),
+                                Math2.smoothstep(
+                                        0.0005f,
+                                        0.008f,
+                                        brightTail98Fraction
+                                )
+                        ),
+                        0.0f,
+                        1.0f
+                );
+
+        ((PostPipeline) basePipeline)
+                .motionHighlightSceneStrength =
+                highlightRecoveryStrength;
+
+        float indoorHdrStrength =
+                shadowRecoveryStrength;
+
+        /*
+         * Build 26250:
+         * Correct-next-adjustment after the 26249 A/B review.
+         *
+         * The goal is not more generic shadow gain. The goal is to reshape
+         * tone recovery so it starts earlier, spans a broader toe/lower-mid
+         * zone, and pairs with a stronger shoulder so window and outdoor
+         * highlights do not climb while the room or foliage shadows open.
+         *
+         * This is still picture-driven and was chosen to address the closet,
+         * bright-window, and outdoor foliage comparisons without introducing
+         * a hard ISO band.
+         */
+        float effectiveStackRatio =
+                Math2.clamp(
+                        basePipeline.mParameters.effectiveStackRatio,
+                        0.0f,
+                        1.0f
+                );
+
+        /*
+         * A healthy stack may use the complete measured shadow strength.
+         * Only genuinely weak stacks reduce the lift, preventing noisy
+         * single-frame-like shadows from being over-expanded.
+         */
+        float shadowStackConfidence =
+                Math2.mix(
+                        0.68f,
+                        1.0f,
+                        Math2.smoothstep(
+                                0.35f,
+                                0.80f,
+                                effectiveStackRatio
+                        )
+                );
+
+        /*
+         * Build 26253:
+         * Cap the tone correction at a practical magnitude. With a fully
+         * activated scene, the narrowed shader curve peaks near 1.55x rather
+         * than the approximately 2.47x seen in 26252.
+         */
         float lowerMidLift =
-                0.30f
-                        * indoorHdrStrength;
+                0.22f
+                        * shadowRecoveryStrength
+                        * shadowStackConfidence;
 
         float highlightCompression =
-                0.32f
-                        * indoorHdrStrength;
+                0.62f
+                        * highlightRecoveryStrength;
 
         glProg.setVar(
                 "indoorHdrStrength",
@@ -243,10 +372,34 @@
                 highlightCompression
         );
 
+        MotionToneExifDiagnostics.recordAutoExposure(
+                avg,
+                gainBeforeAllGuards,
+                gainAfterAllGuards,
+                mpy,
+                whiteMax,
+                lowerMidLift,
+                highlightCompression
+        );
+
+        MotionToneExifDiagnostics.recordHistogramTone(
+                brightTail90Fraction,
+                brightTail98Fraction,
+                shadowRecoveryStrength,
+                highlightRecoveryStrength,
+                shadowStackConfidence
+        );
+
         Log.d(
                 "AutoExposure",
                 "MOTION_26179_INDOOR_HDR_TONE"
-                        + " strength=" + indoorHdrStrength
+                        + " shadowStrength=" + shadowRecoveryStrength
+                        + " shadowStackConfidence="
+                        + shadowStackConfidence
+                        + " brightTail90=" + brightTail90Fraction
+                        + " brightTail98=" + brightTail98Fraction
+                        + " highlightStrength="
+                        + highlightRecoveryStrength
                         + " lowerMidLift=" + lowerMidLift
                         + " highlightCompression="
                         + highlightCompression

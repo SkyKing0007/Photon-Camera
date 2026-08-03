@@ -266,29 +266,53 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
         float motionHdrStrength =
                 motionToneRecovery
                         ? ((PostPipeline) basePipeline)
-                                .indoorHdrSceneStrength
+                                .motionShadowSceneStrength
                         : 0.0f;
 
+        /*
+         * Build 26248:
+         * The versus_3 bright-window sample retained highlight detail after
+         * 26247 but still rendered the room darker than the GCam reference.
+         * Increase only the existing Motion shadow and local-tone recovery.
+         * The black floor and highlight path remain unchanged.
+         */
+        /*
+         * Build 26253:
+         * Keep the independent shadow-strength architecture, but stop
+         * compounding a near-maximum Initial curve change, near-maximum LTM,
+         * and a strong AutoExposure toe gain.
+         *
+         * Initial now supplies only modest broad support. The narrower shader
+         * curve below performs the measured deep-shadow recovery.
+         */
         float motionShadowRecovery =
                 motionToneRecovery
-                        ? 0.06f + 0.14f * motionHdrStrength
+                        ? 0.04f + 0.08f * motionHdrStrength
                         : 0.0f;
 
         float appliedShadows =
                 (float) basePipeline.mSettings.shadows
-                        + motionShadowRecovery;
+                        - motionShadowRecovery;
 
         float appliedLtmMix =
                 motionToneRecovery
                         ? Math.max(
                                 ltmMix,
                                 0.08f
-                                        + 0.18f
+                                        + 0.10f
                                         * motionHdrStrength
                         )
                         : ltmMix;
 
         glProg.setDefine("SHADOWS", appliedShadows);
+
+        MotionToneExifDiagnostics.recordInitial(
+                (float) basePipeline.mSettings.shadows,
+                appliedShadows,
+                ltmMix,
+                appliedLtmMix
+        );
+
         Log.d(
                 Name,
                 "MOTION_26211_TONE_DETAIL"

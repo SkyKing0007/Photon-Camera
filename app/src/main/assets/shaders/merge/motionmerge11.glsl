@@ -202,7 +202,130 @@ void main() {
                             1.0
                     );
 
-    //float lDiff = length(diff);
+    /*
+     * Build 26252:
+     * Local temporal-retention guard for disagreement-prone structural edges.
+     *
+     * A globally healthy stack can still contain a small region where the
+     * aligned alternate disagrees with both the running base and the same-CFA
+     * spatial neighborhood. That produced the translucent/doubled speaker
+     * edge in the supplied artifact sample.
+     *
+     * The guard stays neutral in stable regions. It reduces temporal
+     * retention only when:
+     * 1. candidate/base disagreement exceeds modeled noise;
+     * 2. the candidate is less spatially consistent than the running base;
+     * 3. meaningful local edge structure is present.
+     */
+    vec4 mergeCandidate =
+            bayer
+                    + diff
+                    / max(
+                            analogBalance,
+                            vec4(EPS)
+                    );
+
+    float temporalDisagreement =
+            length(
+                    mergeCandidate
+                            - base
+            );
+
+    float baseSpatialError =
+            length(
+                    base
+                            - mean
+            );
+
+    float candidateSpatialError =
+            length(
+                    mergeCandidate
+                            - mean
+            );
+
+    float modeledNoiseMagnitude =
+            max(
+                    length(noise),
+                    EPS
+            );
+
+    float localEdgeStrength =
+            max(
+                    baseSpatialError,
+                    sqrt(length(variance) + EPS)
+            );
+
+    /*
+     * Build 26254:
+     * The first local guard still allowed fine lettering to soften because
+     * three gates were multiplied together. A weak value from any one gate
+     * could hide real temporal disagreement at a small structural edge.
+     *
+     * Treat temporal disagreement and spatial inconsistency as alternative
+     * evidence, while still requiring local edge support. Thresholds begin
+     * closer to modeled noise so lettering and grille perforations are
+     * protected before they become visibly doubled.
+     */
+    float temporalDisagreementGate =
+            smoothstep(
+                    modeledNoiseMagnitude * 1.10,
+                    modeledNoiseMagnitude * 3.50
+                            + 0.010,
+                    temporalDisagreement
+            );
+
+    float spatialConsistencyGate =
+            smoothstep(
+                    modeledNoiseMagnitude * 0.35,
+                    modeledNoiseMagnitude * 2.00
+                            + 0.006,
+                    candidateSpatialError
+                            - baseSpatialError
+            );
+
+    float edgeSupportGate =
+            smoothstep(
+                    modeledNoiseMagnitude * 0.30,
+                    modeledNoiseMagnitude * 2.25
+                            + 0.007,
+                    localEdgeStrength
+            );
+
+    float temporalEdgeDisagreement =
+            temporalDisagreementGate
+                    * edgeSupportGate;
+
+    float spatialEdgeDisagreement =
+            spatialConsistencyGate
+                    * edgeSupportGate;
+
+    float localMergeDisagreement =
+            clamp(
+                    max(
+                            temporalEdgeDisagreement,
+                            spatialEdgeDisagreement
+                    ),
+                    0.0,
+                    1.0
+            );
+
+    /*
+     * A clearly inconsistent structural pixel falls fully back to the running
+     * reference. Stable pixels retain confidence 1.0 and therefore preserve
+     * the existing full-stack denoise.
+     */
+    float localMergeConfidence =
+            1.0
+                    - smoothstep(
+                            0.12,
+                            0.72,
+                            localMergeDisagreement
+                    );
+
+    lDiff *= localMergeConfidence;
+    preservedIndependentFraction *= localMergeConfidence;
+
+    // Reconstruct from the original temporal direction after local gating.
     diff = diffOrigin / (originDifference + EPS) * lDiff;
     //diff *= ((((noise*noise)/(noise*noise + diff*diff))));
 
@@ -238,13 +361,85 @@ void main() {
      */
     vec4 correctedBase = base;
     vec4 correctedCandidate = diff / analogBalance + bayer;
-    imageStore(
-            outTexture,
-            xy,
+    /*
+     * Build 26255:
+     * Reference-detail lock for fine static structure.
+     *
+     * 26254 reduced the candidate blend, but repeated sub-pixel averaging
+     * could still soften lettering and upholstery seams. Preserve the current
+     * reference detail whenever local temporal disagreement overlaps real
+     * structural detail, while still allowing low-frequency temporal denoise.
+     *
+     * The local median is used only as a low-frequency anchor. High-frequency
+     * content from correctedBase is retained progressively as confidence
+     * falls. Stable regions keep the original temporal blend.
+     */
+    float finalMergeWeight =
+            clamp(
+                    weight
+                            * localMergeConfidence,
+                    0.0,
+                    1.0
+            );
+
+    vec4 temporallyMerged =
             mix(
                     correctedBase,
                     correctedCandidate,
-                    weight
+                    finalMergeWeight
+            );
+
+    vec4 referenceHighFrequency =
+            correctedBase
+                    - mean;
+
+    float referenceDetailMagnitude =
+            length(referenceHighFrequency);
+
+    float fineStructureGate =
+            smoothstep(
+                    modeledNoiseMagnitude * 0.20,
+                    modeledNoiseMagnitude * 1.80
+                            + 0.004,
+                    referenceDetailMagnitude
+            );
+
+    float referenceDetailLock =
+            clamp(
+                    fineStructureGate
+                            * (
+                                    1.0
+                                            - localMergeConfidence
+                            ),
+                    0.0,
+                    1.0
+            );
+
+    vec4 mergedLowFrequency =
+            mix(
+                    mean,
+                    temporallyMerged,
+                    0.72
+            );
+
+    vec4 referenceDetailOutput =
+            mergedLowFrequency
+                    + referenceHighFrequency;
+
+    vec4 finalOutput =
+            mix(
+                    temporallyMerged,
+                    referenceDetailOutput,
+                    referenceDetailLock
+            );
+
+    imageStore(
+            outTexture,
+            xy,
+            clamp(
+                    finalOutput,
+                    0.0,
+                    1.0
             )
     );
     //imageStore(outTexture, xy, diff);

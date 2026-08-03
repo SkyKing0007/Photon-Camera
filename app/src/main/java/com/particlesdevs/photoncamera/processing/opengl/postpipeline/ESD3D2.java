@@ -340,10 +340,35 @@ public class ESD3D2 extends Node {
                             )
                             : 0.0f;
 
-            float temporalEdgeAuthorization =
+            /*
+             * Build 26246:
+             * Real low-contrast fabric, foliage, fur and bark can have weak
+             * contribution-map confidence even when local structure is valid.
+             * Keep the shader's local edge/noise test as the primary gate.
+             * Contribution confidence now adds protection instead of being a
+             * hard requirement. Taper the baseline in extreme low light so
+             * flat dark noise still receives strong cleanup.
+             */
+            float contributionConfidence =
                     Math.min(
                             effectiveRatioConfidence,
                             lowerPercentileConfidence
+                    );
+
+            float localStructureBaseline =
+                    Math2.mix(
+                            0.55f,
+                            0.28f,
+                            lowLightScene
+                    );
+
+            float temporalEdgeAuthorization =
+                    Math2.clamp(
+                            localStructureBaseline
+                                    + 0.30f
+                                            * contributionConfidence,
+                            0.0f,
+                            0.85f
                     );
 
             glProg.setDefine(
@@ -382,7 +407,15 @@ public class ESD3D2 extends Node {
                             + lowLightScene
                             + " edgeAuthorization="
                             + temporalEdgeAuthorization
-                            + " maxLocalSmoothingReduction=0.10"
+                            + " maxLocalSmoothingReduction=0.30"
+                            + " brightSceneTextureAllowance=1.00"
+                            + " extremeLowLightTextureAllowance=0.45"
+                            + " shadowBoostExcludedFromTextureThreshold=true"
+                            + " pictureDrivenClosetTexture=true"
+                            + " fixedIsoRangeUsed=false"
+                            + " directionalNoiseMultiplier=0.90"
+                            + " directionalFloor=0.0075"
+                            + " directionalActivation=0.22"
                             + " globalTextureBoost=0"
                             + " sharpeningChanged=false"
                             + " broadDenoiseChanged=false"
