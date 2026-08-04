@@ -11,6 +11,9 @@ layout(rgba8, binding = 1) uniform highp readonly image2D hotPixTexture;
 layout(rgba16f, binding = 2) uniform highp readonly image2D baseTexture;
 layout(rgba16f, binding = 3) uniform highp writeonly image2D outTexture;
 layout(rgba16f, binding = 4) uniform highp readonly image2D alterTexture;
+layout(r32f, binding = 5) uniform highp writeonly image2D warpConfidenceTexture;
+layout(rgba32f, binding = 6) uniform highp writeonly image2D mergeConfidenceDiagnosticTexture;
+layout(rgba32f, binding = 7) uniform highp writeonly image2D mergeValidityDiagnosticTexture;
 
 uniform float minLevel;
 uniform float whiteLevel;
@@ -20,6 +23,7 @@ uniform float exposureLow;
 uniform bool createDiff;
 uniform float noiseS;
 uniform float noiseO;
+uniform int motionEqualExposureStack;
 uniform ivec2 border;
 uniform ivec2 shift;
 uniform ivec2 alignmentSize;
@@ -151,30 +155,70 @@ void main() {
     ivec2 gridBase = ivec2(floor(gridPosition));
     vec2 gridFraction = fract(gridPosition);
 
-    ivec2 gridCoords[4];
-    gridCoords[0] = gridBase + ivec2(0, 0) + shift;
-    gridCoords[1] = gridBase + ivec2(1, 0) + shift;
-    gridCoords[2] = gridBase + ivec2(0, 1) + shift;
-    gridCoords[3] = gridBase + ivec2(1, 1) + shift;
+    /*
+     * Build 26278 coordinate-space repair:
+     *
+     * localGridCoords are coordinates inside the logical alignment result for
+     * this frame and are validated only against alignmentSize.
+     *
+     * atlasGridCoords are the shifted physical texture addresses and are
+     * validated only against textureSize(alignmentTexture, 0).
+     *
+     * Alignment vectors continue to be fetched from atlasGridCoords. Invalid
+     * local tiles or invalid atlas addresses still receive zero alternate
+     * contribution. The 12-pixel flow limit remains unchanged.
+     */
+    ivec2 localGridCoords[4];
+    localGridCoords[0] = gridBase + ivec2(0, 0);
+    localGridCoords[1] = gridBase + ivec2(1, 0);
+    localGridCoords[2] = gridBase + ivec2(0, 1);
+    localGridCoords[3] = gridBase + ivec2(1, 1);
 
-    bool validGridNeighborhood = true;
+    ivec2 atlasGridCoords[4];
+    atlasGridCoords[0] = localGridCoords[0] + shift;
+    atlasGridCoords[1] = localGridCoords[1] + shift;
+    atlasGridCoords[2] = localGridCoords[2] + shift;
+    atlasGridCoords[3] = localGridCoords[3] + shift;
+
+    ivec2 alignmentAtlasSize = textureSize(alignmentTexture, 0);
+    bool validLocalGridNeighborhood = true;
+    bool validAtlasNeighborhood = true;
 
     for (int i = 0; i < 4; i++) {
-        validGridNeighborhood =
-                validGridNeighborhood
+        validLocalGridNeighborhood =
+                validLocalGridNeighborhood
                         && all(
                                 greaterThanEqual(
-                                        gridCoords[i],
+                                        localGridCoords[i],
                                         ivec2(0)
                                 )
                         )
                         && all(
                                 lessThan(
-                                        gridCoords[i],
+                                        localGridCoords[i],
                                         alignmentSize
                                 )
                         );
+
+        validAtlasNeighborhood =
+                validAtlasNeighborhood
+                        && all(
+                                greaterThanEqual(
+                                        atlasGridCoords[i],
+                                        ivec2(0)
+                                )
+                        )
+                        && all(
+                                lessThan(
+                                        atlasGridCoords[i],
+                                        alignmentAtlasSize
+                                )
+                        );
     }
+
+    bool validGridNeighborhood =
+            validLocalGridNeighborhood
+                    && validAtlasNeighborhood;
 
     float bilinearWeights[4];
     bilinearWeights[0] =
@@ -198,7 +242,7 @@ void main() {
             vec4 alignLoad =
                     texelFetch(
                             alignmentTexture,
-                            gridCoords[i],
+                            atlasGridCoords[i],
                             0
                     );
 
@@ -315,14 +359,89 @@ void main() {
                     photometricAdvantage
             );
 
+    /*
+     * Build 26275:
+     * Equal-exposure Motion accepts stable aligned frames when their residual
+     * is compatible with the expected sensor noise. This avoids rejecting
+     * static regions merely because the warped and unwarped errors are both
+     * already small.
+     */
+    float expectedNoise =
+            max(
+                    dot(noise, vec4(0.25)),
+                    1.0e-4
+            );
+
+    float normalizedAlignedResidual =
+            alignedError / expectedNoise;
+
+    float residualConfidence =
+            1.0
+                    - smoothstep(
+                            1.25,
+                            4.00,
+                            normalizedAlignedResidual
+                    );
+
+    float motionPhotometricConfidence =
+            clamp(
+                    residualConfidence
+                            + 0.20
+                                    * photometricConfidence
+                                    * (1.0 - residualConfidence),
+                    0.0,
+                    1.0
+            );
+
+    float confidenceSource =
+            motionEqualExposureStack != 0
+                    ? motionPhotometricConfidence
+                    : photometricConfidence;
+
     float validityConfidence =
             validGridNeighborhood && validWarpCoordinate
                     ? 1.0
                     : 0.0;
 
+    /*
+     * Build 26279:
+     * The 26278 capture proved that local/atlas addressing, warp bounds, and
+     * residual agreement are valid across almost the whole frame, while
+     * vectorConsistency still has a zero median. That made the multiplicative
+     * confidence below discard noise-compatible aligned RAW samples.
+     *
+     * For equal-exposure Motion only, allow exceptionally strong residual
+     * agreement to recover vector confidence. This recovery:
+     *   - uses only the already-warped alternate;
+     *   - remains bounded by magnitudeConfidence;
+     *   - remains bounded by validityConfidence;
+     *   - cannot bypass the unchanged 12-pixel hard limit below;
+     *   - remains subject to downstream local/occlusion confidence.
+     *
+     * Non-Motion behavior preserves the original vector-confidence path.
+     */
+    float residualSupportedVectorConfidence =
+            motionEqualExposureStack != 0
+                    ? 0.72
+                            * smoothstep(
+                                    0.96,
+                                    0.995,
+                                    residualConfidence
+                            )
+                            * magnitudeConfidence
+                    : 0.0;
+
+    float effectiveVectorConfidence =
+            motionEqualExposureStack != 0
+                    ? max(
+                            vectorConsistency,
+                            residualSupportedVectorConfidence
+                    )
+                    : vectorConsistency;
+
     float warpConfidence =
-            photometricConfidence
-                    * vectorConsistency
+            confidenceSource
+                    * effectiveVectorConfidence
                     * magnitudeConfidence
                     * validityConfidence;
 
@@ -335,16 +454,73 @@ void main() {
      * Only a strongly accepted warp may contribute. Otherwise reconstruct a
      * zero alternate difference from the immutable reference Bayer sample.
      */
-    float hardWarpAcceptance =
-            warpConfidence >= 0.72
-                    ? 1.0
-                    : 0.0;
+    /*
+     * Build 26274:
+     * merge0 exclusively owns geometric warp confidence. Unsafe warps remain
+     * reference-only. Plausible warps may contribute gradually, but only from
+     * the aligned alternate; the unwarped alternate is never restored.
+     */
+    float gradedWarpAcceptance =
+            smoothstep(
+                    0.28,
+                    0.72,
+                    warpConfidence
+            );
+
+    if (!validGridNeighborhood
+            || !validWarpCoordinate
+            || flowMagnitude >= 12.0
+            || warpConfidence < 0.28) {
+        gradedWarpAcceptance = 0.0;
+    }
+
+    imageStore(
+            warpConfidenceTexture,
+            xy,
+            vec4(gradedWarpAcceptance, 0.0, 0.0, 1.0)
+    );
+
+    /*
+     * Build 26276 diagnostic only:
+     * R=residualConfidence
+     * G=vectorConsistency
+     * B=warpConfidence before grading
+     * A=gradedWarpAcceptance
+     */
+    imageStore(
+            mergeConfidenceDiagnosticTexture,
+            xy,
+            vec4(
+                    residualConfidence,
+                    vectorConsistency,
+                    warpConfidence,
+                    gradedWarpAcceptance
+            )
+    );
+
+    /*
+     * Build 26277 diagnostic only:
+     * R=validGridNeighborhood
+     * G=validWarpCoordinate
+     * B=flowMagnitude normalized to the 12-pixel hard limit
+     * A=magnitudeConfidence
+     */
+    imageStore(
+            mergeValidityDiagnosticTexture,
+            xy,
+            vec4(
+                    validGridNeighborhood ? 1.0 : 0.0,
+                    validWarpCoordinate ? 1.0 : 0.0,
+                    clamp(flowMagnitude / 12.0, 0.0, 1.0),
+                    magnitudeConfidence
+            )
+    );
 
     alignedSum =
             mix(
                     bayer,
                     bayerAligned,
-                    hardWarpAcceptance
+                    gradedWarpAcceptance
             );
 
     alignedSum =

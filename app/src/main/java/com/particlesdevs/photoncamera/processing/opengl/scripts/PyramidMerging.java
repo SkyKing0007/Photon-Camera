@@ -263,6 +263,10 @@ public class PyramidMerging extends GLOneScript {
     GLTexture alignmentTex;
     GLTexture hotPix;
     GLTexture motionContributionMap;
+    GLTexture motionWarpConfidenceMap;
+    GLTexture motionMergeConfidenceDiagnosticMap;
+    GLTexture motionMergeValidityDiagnosticMap;
+    GLTexture motionMergeDecisionDiagnosticMap;
     GLBuffer motionImpulseStats;
 
     private boolean motionContributionMeasured = false;
@@ -487,6 +491,242 @@ public class PyramidMerging extends GLOneScript {
                 (float) below / (float) total,
                 0.0f,
                 1.0f
+        );
+    }
+
+    private float normalizedHistogramPercentile(
+            int[] histogram,
+            long total,
+            float percentile
+    ) {
+        if (histogram == null || histogram.length == 0 || total <= 0L) {
+            return 0.0f;
+        }
+
+        long target =
+                Math.max(
+                        1L,
+                        Math.round(
+                                Math2.clamp(percentile, 0.0f, 1.0f)
+                                        * total
+                        )
+                );
+
+        long cumulative = 0L;
+
+        for (int i = 0; i < histogram.length; i++) {
+            cumulative += Math.max(0, histogram[i]);
+
+            if (cumulative >= target) {
+                return (float) i
+                        / (float) Math.max(1, histogram.length - 1);
+            }
+        }
+
+        return 1.0f;
+    }
+
+    private float normalizedHistogramFractionBelow(
+            int[] histogram,
+            long total,
+            float threshold
+    ) {
+        if (histogram == null || histogram.length == 0 || total <= 0L) {
+            return 0.0f;
+        }
+
+        long count = 0L;
+
+        for (int i = 0; i < histogram.length; i++) {
+            float value =
+                    (float) i
+                            / (float) Math.max(1, histogram.length - 1);
+
+            if (value < threshold) {
+                count += Math.max(0, histogram[i]);
+            }
+        }
+
+        return Math2.clamp(
+                (float) count / (float) total,
+                0.0f,
+                1.0f
+        );
+    }
+
+    private float normalizedHistogramFractionRange(
+            int[] histogram,
+            long total,
+            float lowerInclusive,
+            float upperExclusive
+    ) {
+        if (histogram == null || histogram.length == 0 || total <= 0L) {
+            return 0.0f;
+        }
+
+        long count = 0L;
+
+        for (int i = 0; i < histogram.length; i++) {
+            float value =
+                    (float) i
+                            / (float) Math.max(1, histogram.length - 1);
+
+            if (value >= lowerInclusive && value < upperExclusive) {
+                count += Math.max(0, histogram[i]);
+            }
+        }
+
+        return Math2.clamp(
+                (float) count / (float) total,
+                0.0f,
+                1.0f
+        );
+    }
+
+    private String summarizeDiagnosticChannel(
+            String name,
+            int[] histogram
+    ) {
+        if (histogram == null || histogram.length == 0) {
+            return name + "=missing";
+        }
+
+        long total = 0L;
+        double weighted = 0.0;
+
+        for (int i = 0; i < histogram.length; i++) {
+            int count = Math.max(0, histogram[i]);
+            total += count;
+            weighted +=
+                    (
+                            (double) i
+                                    / (double) Math.max(1, histogram.length - 1)
+                    )
+                            * count;
+        }
+
+        if (total <= 0L) {
+            return name + "=empty";
+        }
+
+        float mean = (float) (weighted / total);
+        float p10 = normalizedHistogramPercentile(histogram, total, 0.10f);
+        float p25 = normalizedHistogramPercentile(histogram, total, 0.25f);
+        float p50 = normalizedHistogramPercentile(histogram, total, 0.50f);
+        float p75 = normalizedHistogramPercentile(histogram, total, 0.75f);
+        float p90 = normalizedHistogramPercentile(histogram, total, 0.90f);
+
+        float below005 =
+                normalizedHistogramFractionBelow(
+                        histogram,
+                        total,
+                        0.05f
+                );
+
+        float below028 =
+                normalizedHistogramFractionBelow(
+                        histogram,
+                        total,
+                        0.28f
+                );
+
+        float graded028To072 =
+                normalizedHistogramFractionRange(
+                        histogram,
+                        total,
+                        0.28f,
+                        0.72f
+                );
+
+        float atOrAbove072 =
+                1.0f
+                        - normalizedHistogramFractionBelow(
+                                histogram,
+                                total,
+                                0.72f
+                        );
+
+        return name
+                + "Mean=" + mean
+                + " " + name + "P10=" + p10
+                + " " + name + "P25=" + p25
+                + " " + name + "P50=" + p50
+                + " " + name + "P75=" + p75
+                + " " + name + "P90=" + p90
+                + " " + name + "Below005=" + below005
+                + " " + name + "Below028=" + below028
+                + " " + name + "Graded028To072=" + graded028To072
+                + " " + name + "AtOrAbove072=" + atOrAbove072;
+    }
+
+    private void logMotionDiagnosticTexture(
+            String stage,
+            GLTexture texture,
+            int mergeOrder,
+            int sourceIndex,
+            long timestamp,
+            String[] channelNames
+    ) {
+        if (texture == null || channelNames == null || channelNames.length != 4) {
+            return;
+        }
+
+        final int histogramSize = 256;
+        GLHistogram histogram = new GLHistogram(glProg, histogramSize);
+
+        histogram.Rc = true;
+        histogram.Gc = true;
+        histogram.Bc = true;
+        histogram.Ac = true;
+        histogram.resize = 4;
+        histogram.exposure[0] = 1.0f;
+        histogram.exposure[1] = 1.0f;
+        histogram.exposure[2] = 1.0f;
+        histogram.exposure[3] = 1.0f;
+
+        int[][] output = histogram.Compute(texture);
+        histogram.close();
+
+        if (output == null || output.length < 4) {
+            Log.w(
+                    Name,
+                    "MOTION_26276_CONFIDENCE_DIAGNOSTIC_FAILED"
+                            + " stage=" + stage
+                            + " mergeOrder=" + mergeOrder
+                            + " sourceIndex=" + sourceIndex
+                            + " timestamp=" + timestamp
+                            + " reason=missingHistogram"
+            );
+            return;
+        }
+
+        Log.d(
+                Name,
+                "MOTION_26276_CONFIDENCE_DIAGNOSTIC"
+                        + " stage=" + stage
+                        + " mergeOrder=" + mergeOrder
+                        + " sourceIndex=" + sourceIndex
+                        + " timestamp=" + timestamp
+                        + " "
+                        + summarizeDiagnosticChannel(
+                                channelNames[0],
+                                output[0]
+                        )
+                        + " "
+                        + summarizeDiagnosticChannel(
+                                channelNames[1],
+                                output[1]
+                        )
+                        + " "
+                        + summarizeDiagnosticChannel(
+                                channelNames[2],
+                                output[2]
+                        )
+                        + " "
+                        + summarizeDiagnosticChannel(
+                                channelNames[3],
+                                output[3]
+                        )
         );
     }
 
@@ -1085,6 +1325,60 @@ public class PyramidMerging extends GLOneScript {
                 motionEqualExposureStack
                         && images.size() > 1;
 
+        /*
+         * Build 26274:
+         * merge0 always writes its confidence output, so this texture must
+         * exist for every merge invocation. Motion-only downstream stages
+         * consume it when the equal-exposure stack path is active.
+         */
+        motionWarpConfidenceMap =
+                new GLTexture(
+                        rawHalf,
+                        new GLFormat(
+                                GLFormat.DataType.FLOAT_32,
+                                1
+                        ),
+                        null,
+                        GL_NEAREST,
+                        GL_CLAMP_TO_EDGE
+                );
+
+        motionMergeConfidenceDiagnosticMap =
+                new GLTexture(
+                        rawHalf,
+                        new GLFormat(
+                                GLFormat.DataType.FLOAT_32,
+                                4
+                        ),
+                        null,
+                        GL_NEAREST,
+                        GL_CLAMP_TO_EDGE
+                );
+
+        motionMergeValidityDiagnosticMap =
+                new GLTexture(
+                        rawHalf,
+                        new GLFormat(
+                                GLFormat.DataType.FLOAT_32,
+                                4
+                        ),
+                        null,
+                        GL_NEAREST,
+                        GL_CLAMP_TO_EDGE
+                );
+
+        motionMergeDecisionDiagnosticMap =
+                new GLTexture(
+                        rawHalf,
+                        new GLFormat(
+                                GLFormat.DataType.FLOAT_32,
+                                4
+                        ),
+                        null,
+                        GL_NEAREST,
+                        GL_CLAMP_TO_EDGE
+                );
+
         if (trackMotionContribution) {
             motionContributionMap =
                     new GLTexture(
@@ -1290,11 +1584,38 @@ public class PyramidMerging extends GLOneScript {
                         * (motionReferenceExposureNs / 1000000.0f);
         final float motionRiskBlend =
                 Math.max(0.0f, Math.min(1.0f, motionBlurRisk / 0.030f));
-        final long motionTemporalRadiusNs =
-                (long) (166000000L - 66000000L * motionRiskBlend);
+        /*
+         * Build 26280:
+         * Keep every retained equal-exposure Motion RAW frame in the candidate
+         * pool. Timestamp distance and gyro motion now determine processing
+         * order only; they no longer hard-exclude frames before local alignment.
+         *
+         * Safety remains local and unchanged:
+         *   - 26278 local/atlas coordinate validation;
+         *   - 26279 residual-supported warp confidence;
+         *   - unchanged 12-pixel flow rejection;
+         *   - persistent confidence and downstream occlusion protection;
+         *   - reference-only fallback for rejected pixels.
+         */
+        final long motionTemporalRadiusNs = Long.MAX_VALUE;
+        long motionTemporalSpanNs = 1L;
+        if (motionEqualExposureStack) {
+            long referenceTimestampForSpan = images.get(minExpIdx).timestamp;
+            for (int i = 0; i < images.size(); i++) {
+                if (i == minExpIdx) continue;
+                long candidateTimestamp = images.get(i).timestamp;
+                if (referenceTimestampForSpan > 0L && candidateTimestamp > 0L) {
+                    motionTemporalSpanNs =
+                            Math.max(
+                                    motionTemporalSpanNs,
+                                    Math.abs(candidateTimestamp - referenceTimestampForSpan)
+                            );
+                }
+            }
+        }
         final int motionAlternateLimit =
                 motionEqualExposureStack
-                        ? Math.min(8, Math.max(5, Math.round(8.0f - 3.0f * motionRiskBlend)))
+                        ? Math.max(0, images.size() - 1)
                         : Integer.MAX_VALUE;
         ArrayList<Integer> mergeIndices = new ArrayList<>();
 
@@ -1302,12 +1623,7 @@ public class PyramidMerging extends GLOneScript {
             final long referenceTimestamp = images.get(minExpIdx).timestamp;
             ArrayList<Integer> candidates = new ArrayList<>();
             for (int i = 0; i < images.size(); i++) {
-                if (i == minExpIdx) continue;
-                long ts = images.get(i).timestamp;
-                long distance = referenceTimestamp > 0L && ts > 0L
-                        ? Math.abs(ts - referenceTimestamp)
-                        : Long.MAX_VALUE;
-                if (distance <= motionTemporalRadiusNs) candidates.add(i);
+                if (i != minExpIdx) candidates.add(i);
             }
             candidates.sort((a, b) -> {
                 ImageFrame frameA = images.get(a);
@@ -1316,32 +1632,44 @@ public class PyramidMerging extends GLOneScript {
                 double timeB = Math.abs(frameB.timestamp - referenceTimestamp) / 1000000.0;
                 double gyroA = frameA.frameGyro != null ? Math.max(0.0f, frameA.frameGyro.shakiness) : 0.0;
                 double gyroB = frameB.frameGyro != null ? Math.max(0.0f, frameB.frameGyro.shakiness) : 0.0;
-                double scoreA = timeA + gyroA * 18000.0 * (0.35 + 0.65 * motionRiskBlend);
-                double scoreB = timeB + gyroB * 18000.0 * (0.35 + 0.65 * motionRiskBlend);
+                double oisA = Math.max(0.0f, frameA.diagnosticOisMotion);
+                double oisB = Math.max(0.0f, frameB.diagnosticOisMotion);
+                double scoreA =
+                        timeA
+                                + gyroA * 18000.0 * (0.35 + 0.65 * motionRiskBlend)
+                                + oisA * 18000.0;
+                double scoreB =
+                        timeB
+                                + gyroB * 18000.0 * (0.35 + 0.65 * motionRiskBlend)
+                                + oisB * 18000.0;
                 return Double.compare(scoreA, scoreB);
             });
-            for (int i = 0; i < candidates.size() && mergeIndices.size() < motionAlternateLimit; i++) {
-                mergeIndices.add(candidates.get(i));
-            }
-            if (mergeIndices.isEmpty()) {
-                for (int i = 0; i < images.size() && mergeIndices.size() < motionAlternateLimit; i++) {
-                    if (i != minExpIdx) mergeIndices.add(i);
-                }
-            }
+            mergeIndices.addAll(candidates);
+
             StringBuilder selected = new StringBuilder(
-                    "MOTION_26268_GYRO_TIMESTAMP_ADAPTIVE_SELECTION referenceIndex=" + minExpIdx
+                    "MOTION_26280_FULL_BURST_ADAPTIVE_ORDERING referenceIndex=" + minExpIdx
                             + " referenceTimestamp=" + referenceTimestamp
-                            + " radiusNs=" + motionTemporalRadiusNs
+                            + " radiusNs=unbounded"
+                            + " retainedFrames=" + images.size()
                             + " alternateLimit=" + motionAlternateLimit
                             + " referenceExposureNs=" + motionReferenceExposureNs
                             + " referenceShakiness=" + motionReferenceShakiness
                             + " motionBlurRisk=" + motionBlurRisk
                             + " motionRiskBlend=" + motionRiskBlend
                             + " selected=" + mergeIndices.size());
-            for (int index : mergeIndices) {
-                selected.append(" [index=").append(index)
+            for (int rank = 0; rank < mergeIndices.size(); rank++) {
+                int index = mergeIndices.get(rank);
+                ImageFrame selectedFrame = images.get(index);
+                selected.append(" [rank=").append(rank)
+                        .append(",index=").append(index)
                         .append(",deltaNs=")
-                        .append(images.get(index).timestamp - referenceTimestamp)
+                        .append(selectedFrame.timestamp - referenceTimestamp)
+                        .append(",gyro=")
+                        .append(selectedFrame.frameGyro != null
+                                ? selectedFrame.frameGyro.shakiness
+                                : 0.0f)
+                        .append(",ois=")
+                        .append(selectedFrame.diagnosticOisMotion)
                         .append("]");
             }
             Log.d(Name, selected.toString());
@@ -1361,6 +1689,18 @@ public class PyramidMerging extends GLOneScript {
             float exposure = 1.f/frame.pair.layerMpy;
             if (motionEqualExposureStack) motionAlternatesProcessed++;
             Point shift = PyramidAlignment.alignmentShift(parameters, ind);
+
+            if (motionEqualExposureStack) {
+                Log.d(
+                        Name,
+                        "MOTION_26277_ALIGNMENT_ADDRESS"
+                                + " mergeOrder=" + mergePosition
+                                + " sourceIndex=" + ind
+                                + " timestamp=" + frame.timestamp
+                                + " shiftX=" + shift.x
+                                + " shiftY=" + shift.y
+                );
+            }
             //int f = 1;
             Log.d("PyramidMerging", "load:"+frame.pair.curlayer.name() + " " + frame.pair.layerMpy);
             inputAlter.loadData(frame.buffer);
@@ -1401,6 +1741,10 @@ public class PyramidMerging extends GLOneScript {
             glProg.setVar("createDiff", 1);
             glProg.setVar("noiseS", noiseS);
             glProg.setVar("noiseO", noiseO);
+            glProg.setVar(
+                    "motionEqualExposureStack",
+                    motionEqualExposureStack ? 1 : 0
+            );
             glProg.setVar("border", border);
             glProg.setVar("shift", shift);
             glProg.setVar("alignmentSize", parameters.alignmentSize);
@@ -1411,7 +1755,67 @@ public class PyramidMerging extends GLOneScript {
             //glProg.setTextureCompute("avrTexture", avrFrames, false);
             //glProg.setTextureCompute("hotPixTexture", hotPix, false);
             glProg.setTextureCompute("outTexture", baseDiff, true);
+            glProg.setTextureCompute(
+                    "warpConfidenceTexture",
+                    motionWarpConfidenceMap,
+                    true
+            );
+            glProg.setTextureCompute(
+                    "mergeConfidenceDiagnosticTexture",
+                    motionMergeConfidenceDiagnosticMap,
+                    true
+            );
+            glProg.setTextureCompute(
+                    "mergeValidityDiagnosticTexture",
+                    motionMergeValidityDiagnosticMap,
+                    true
+            );
             glProg.computeAuto(baseDiff.mSize, 1);
+
+            if (motionEqualExposureStack) {
+                logMotionDiagnosticTexture(
+                        "merge0",
+                        motionMergeConfidenceDiagnosticMap,
+                        mergePosition,
+                        ind,
+                        frame.timestamp,
+                        new String[]{
+                                "residual",
+                                "vector",
+                                "warp",
+                                "graded"
+                        }
+                );
+
+                logMotionDiagnosticTexture(
+                        "merge0Validity",
+                        motionMergeValidityDiagnosticMap,
+                        mergePosition,
+                        ind,
+                        frame.timestamp,
+                        new String[]{
+                                "validGrid",
+                                "validWarp",
+                                "flowNorm",
+                                "magnitude"
+                        }
+                );
+            }
+
+            if (motionEqualExposureStack && mergePosition == 0) {
+                Log.d(
+                        Name,
+                        "MOTION_26275_WARP_CONFIDENCE"
+                                + " owner=merge0"
+                                + " source=noiseNormalizedAlignedResidual"
+                                + " residualFullConfidenceSigma=1.25"
+                                + " residualZeroConfidenceSigma=4.00"
+                                + " photometricAdvantageBonus=0.20"
+                                + " gradedAcceptanceStart=0.28"
+                                + " gradedAcceptanceFull=0.72"
+                                + " unalignedFallback=false"
+                );
+            }
 
             // apply optical flow
             //glProg.setLayout(tile, tile, 1);
@@ -1498,6 +1902,16 @@ public class PyramidMerging extends GLOneScript {
                         motionContributionMap,
                         android.opengl.GLES31.GL_READ_WRITE
                 );
+                glProg.setTextureCompute(
+                        "warpConfidenceTexture",
+                        motionWarpConfidenceMap,
+                        false
+                );
+                glProg.setTextureCompute(
+                        "mergeDecisionDiagnosticTexture",
+                        motionMergeDecisionDiagnosticMap,
+                        true
+                );
 
                 glProg.setVar(
                         "contributionIncrement",
@@ -1547,12 +1961,18 @@ public class PyramidMerging extends GLOneScript {
                         ? Math.abs(frame.timestamp - referenceTimestamp)
                         : motionTemporalRadiusNs;
                 float normalizedTemporalDistance = Math2.clamp(
-                        (float) frameDistanceNs / (float) Math.max(1L, motionTemporalRadiusNs),
+                        (float) frameDistanceNs / (float) Math.max(1L, motionTemporalSpanNs),
                         0.0f,
                         1.0f);
+                /*
+                 * All retained frames remain candidates. More distant frames
+                 * are tapered rather than excluded, reducing long-baseline
+                 * contamination while still allowing strong local evidence to
+                 * contribute.
+                 */
                 float motionTemporalConfidence = Math2.clamp(
-                        1.0f - 0.42f * normalizedTemporalDistance,
-                        0.58f,
+                        1.0f - 0.55f * normalizedTemporalDistance,
+                        0.45f,
                         1.0f);
                 glProg.setVar(
                         "motionTemporalConfidence",
@@ -1589,6 +2009,22 @@ public class PyramidMerging extends GLOneScript {
             //glProg.setVar("exposure", exposure);
             //glProg.setVar("weight",  1.0f);
             glProg.computeAuto(base.mSize, 1);
+
+            if (motionEqualExposureStack) {
+                logMotionDiagnosticTexture(
+                        "motionmerge11",
+                        motionMergeDecisionDiagnosticMap,
+                        mergePosition,
+                        ind,
+                        frame.timestamp,
+                        new String[]{
+                                "persistent",
+                                "local",
+                                "occlusion",
+                                "trusted"
+                        }
+                );
+            }
 
             if (trackMotionContribution) {
                 float[] snapshot =
@@ -1780,6 +2216,22 @@ public class PyramidMerging extends GLOneScript {
         if (motionContributionMap != null) {
             motionContributionMap.close();
             motionContributionMap = null;
+        }
+        if (motionWarpConfidenceMap != null) {
+            motionWarpConfidenceMap.close();
+            motionWarpConfidenceMap = null;
+        }
+        if (motionMergeConfidenceDiagnosticMap != null) {
+            motionMergeConfidenceDiagnosticMap.close();
+            motionMergeConfidenceDiagnosticMap = null;
+        }
+        if (motionMergeValidityDiagnosticMap != null) {
+            motionMergeValidityDiagnosticMap.close();
+            motionMergeValidityDiagnosticMap = null;
+        }
+        if (motionMergeDecisionDiagnosticMap != null) {
+            motionMergeDecisionDiagnosticMap.close();
+            motionMergeDecisionDiagnosticMap = null;
         }
         //noiseMap.close();
         for (int i = 0; i < pyramid.gauss.length; i++) {

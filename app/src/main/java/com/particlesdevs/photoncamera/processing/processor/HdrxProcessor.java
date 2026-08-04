@@ -96,6 +96,20 @@ public class HdrxProcessor extends ProcessorBase {
         } catch (Exception e) {
             Log.e(TAG, ProcessingEventsListener.FAILED_MSG);
             Log.e(TAG, "Error in HdrX Processing:"+Log.getStackTraceString(e));
+            if (cameraMode == CameraMode.MOTION) {
+                Log.e(
+                        TAG,
+                        "MOTION_26280_PROCESSING_COMPLETE"
+                                + " success=false"
+                                + " stage=HdrxProcessor.Run"
+                                + " error=" + e.getClass().getSimpleName()
+                );
+                boolean flushed = Log.flushAndWait(5000L);
+                android.util.Log.d(
+                        TAG,
+                        "MOTION_26280_LOG_FLUSH success=" + flushed
+                );
+            }
             callback.onFailed();
             processingEventsListener.onProcessingError("HdrX Processing Failed");
         }
@@ -754,8 +768,32 @@ public class HdrxProcessor extends ProcessorBase {
                     1.0f;
         }
 
+        processingParameters.nativeResolutionSrEnabled =
+                cameraMode == CameraMode.MOTION;
+
+        processingParameters.motionAlternatesSelected =
+                cameraMode == CameraMode.MOTION
+                        ? Math.max(0, processingParameters.retainedFrameCount - 1)
+                        : 0;
+
+        processingParameters.motionAlternatesProcessed =
+                processingParameters.motionAlternatesSelected;
+
+        processingParameters.motionProcessingComplete =
+                cameraMode == CameraMode.MOTION;
+
         processingParameters.subpixelSampleDiversity =
-                0.0f;
+                cameraMode == CameraMode.MOTION
+                        && processingParameters.retainedFrameCount > 1
+                        ? Math.max(
+                                0.0f,
+                                Math.min(
+                                        1.0f,
+                                        (processingParameters.effectiveFrameCount - 1.0f)
+                                                / (processingParameters.retainedFrameCount - 1.0f)
+                                )
+                        )
+                        : 0.0f;
 
         if (cameraMode == CameraMode.MOTION) {
             double slowShutterContributionSum = 0.0;
@@ -1095,6 +1133,38 @@ public class HdrxProcessor extends ProcessorBase {
 
         pipeline.close();
 
+        if (cameraMode == CameraMode.MOTION) {
+            Log.d(
+                    TAG,
+                    "MOTION_26280_PROCESSING_COMPLETE"
+                            + " success=" + imageSaved
+                            + " retained="
+                            + processingParameters.retainedFrameCount
+                            + " effective="
+                            + processingParameters.effectiveFrameCount
+                            + " ratio="
+                            + processingParameters.effectiveStackRatio
+                            + " localContributionMeasured="
+                            + processingParameters.localContributionMeasured
+                            + " localMean="
+                            + processingParameters.localContributionMean
+                            + " localP10="
+                            + processingParameters.localContributionP10
+                            + " localP25="
+                            + processingParameters.localContributionP25
+                            + " localP50="
+                            + processingParameters.localContributionP50
+                            + " localP75="
+                            + processingParameters.localContributionP75
+                            + " localP90="
+                            + processingParameters.localContributionP90
+            );
+            boolean flushed = Log.flushAndWait(5000L);
+            android.util.Log.d(
+                    TAG,
+                    "MOTION_26280_LOG_FLUSH success=" + flushed
+            );
+        }
 
         Allocator.getMemoryCount();
         callback.onFinished();

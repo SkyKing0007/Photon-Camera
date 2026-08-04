@@ -9,6 +9,8 @@ layout(rgba16f, binding = 1) uniform highp readonly image2D diffTexture;
 layout(rgba16f, binding = 2) uniform highp writeonly image2D outTexture;
 layout(rgba16f, binding = 3) uniform highp readonly image2D diffOrTexture;
 layout(r32f, binding = 4) uniform highp image2D contributionTexture;
+layout(r32f, binding = 6) uniform highp readonly image2D warpConfidenceTexture;
+layout(rgba32f, binding = 7) uniform highp writeonly image2D mergeDecisionDiagnosticTexture;
 
 /*
  * Build 26228:
@@ -431,7 +433,19 @@ void main() {
      */
     float localMergeConfidence =
             1.0 - smoothstep(0.035, 0.30, localMergeDisagreement);
-    float geometricConfidence = geometricAlignmentConfidence(xy);
+
+    /*
+     * Build 26274:
+     * Consume merge0's exact geometric decision instead of reconstructing a
+     * second, conflicting confidence from neighboring vectors.
+     */
+    float persistentWarpConfidence =
+            clamp(
+                    imageLoad(warpConfidenceTexture, xy).r,
+                    0.0,
+                    1.0
+            );
+
     float occlusionDisagreement = expandedOcclusionDisagreement(xy);
     float occlusionConfidence = 1.0 - smoothstep(
             predictedNoiseCap * 2.0 + 0.01,
@@ -445,36 +459,64 @@ void main() {
             contributionIncrement * 0.50,
             contributionIncrement * 2.25,
             accumulatedAgreement);
+
     /*
-     * Build 26273:
-     * Early alternate frames must not bypass consensus. Contamination added
-     * at the start becomes part of the recursive base and is difficult for
-     * later confidence logic to remove.
+     * Keep consensus active, but avoid the cold-start feedback loop where an
+     * initially empty contribution map prevents otherwise valid frames from
+     * ever establishing consensus.
      */
     float consensusGate =
             mix(
-                    0.48,
+                    0.68,
                     1.0,
                     consensusConfidence
             );
-    float hardValidity = min(
-            geometricConfidence,
-            occlusionConfidence);
-    float softAgreement =
-            localMergeConfidence
-                    * localMergeConfidence
-                    * motionTemporalConfidence;
-    float trustedMergeConfidence = clamp(
-            hardValidity
-                    * softAgreement
-                    * consensusGate,
+
+    float structuralConfidence = clamp(
+            min(
+                    occlusionConfidence,
+                    localMergeConfidence
+                            * motionTemporalConfidence
+                            * consensusGate
+            ),
             0.0,
-            1.0);
-    if (geometricConfidence < 0.12
+            1.0
+    );
+
+    /*
+     * Persistent warp confidence is a strict upper bound. Later stages may
+     * reduce a geometrically valid contribution, but cannot override or
+     * recreate the alignment decision.
+     */
+    float trustedMergeConfidence =
+            min(
+                    persistentWarpConfidence,
+                    structuralConfidence
+            );
+
+    if (persistentWarpConfidence < 0.05
             || occlusionConfidence < 0.10
-            || localMergeConfidence < 0.08) {
+            || localMergeConfidence < 0.05) {
         trustedMergeConfidence = 0.0;
     }
+
+    /*
+     * Build 26276 diagnostic only:
+     * R=persistentWarpConfidence
+     * G=localMergeConfidence
+     * B=occlusionConfidence
+     * A=trustedMergeConfidence
+     */
+    imageStore(
+            mergeDecisionDiagnosticTexture,
+            xy,
+            vec4(
+                    persistentWarpConfidence,
+                    localMergeConfidence,
+                    occlusionConfidence,
+                    trustedMergeConfidence
+            )
+    );
 
     lDiff *= trustedMergeConfidence;
     preservedIndependentFraction *= trustedMergeConfidence;
@@ -496,7 +538,8 @@ void main() {
                     clamp(
                             previousContribution
                                     + contributionIncrement
-                                            * preservedIndependentFraction,
+                                            * preservedIndependentFraction
+                                            * nativeSrScalarConfidence,
                             0.0,
                             1.0
                     ),
@@ -515,6 +558,64 @@ void main() {
      */
     vec4 correctedBase = base;
     vec4 correctedCandidate = diff / analogBalance + bayer;
+
+    /*
+     * Build 26281 native-resolution robust CFA accumulator.
+     *
+     * Photon already aligns every alternate into the four-channel rawHalf CFA
+     * domain. Keep the same binned output geometry, but weight each CFA plane
+     * independently so one bad or saturated channel cannot contaminate all
+     * channels in the texel.
+     *
+     * This is reference anchored: only the already-aligned candidate is used,
+     * and trustedMergeConfidence remains the geometric/occlusion upper bound.
+     */
+    vec4 nativeSrNoiseScale =
+            max(
+                    noise * 2.75 + vec4(0.004),
+                    vec4(EPS)
+            );
+
+    vec4 nativeSrNormalizedResidual =
+            abs(correctedCandidate - correctedBase)
+                    / nativeSrNoiseScale;
+
+    vec4 nativeSrRobustConfidence =
+            vec4(1.0)
+                    / (
+                            vec4(1.0)
+                                    + nativeSrNormalizedResidual
+                                            * nativeSrNormalizedResidual
+                    );
+
+    vec4 nativeSrSignalPeak =
+            max(
+                    max(correctedCandidate, correctedBase),
+                    bayer
+            );
+
+    vec4 nativeSrSaturationConfidence =
+            vec4(1.0)
+                    - smoothstep(
+                            vec4(0.94),
+                            vec4(0.995),
+                            nativeSrSignalPeak
+                    );
+
+    vec4 nativeSrChannelConfidence =
+            clamp(
+                    vec4(trustedMergeConfidence)
+                            * nativeSrRobustConfidence
+                            * nativeSrSaturationConfidence,
+                    vec4(0.0),
+                    vec4(1.0)
+            );
+
+    float nativeSrScalarConfidence =
+            dot(
+                    nativeSrChannelConfidence,
+                    vec4(0.25)
+            );
     /*
      * Build 26255:
      * Reference-detail lock for fine static structure.
@@ -528,12 +629,12 @@ void main() {
      * content from correctedBase is retained progressively as confidence
      * falls. Stable regions keep the original temporal blend.
      */
-    float finalMergeWeight =
+    vec4 finalMergeWeight =
             clamp(
-                    weight
-                            * trustedMergeConfidence,
-                    0.0,
-                    1.0
+                    vec4(weight)
+                            * nativeSrChannelConfidence,
+                    vec4(0.0),
+                    vec4(1.0)
             );
 
     vec4 temporallyMerged =

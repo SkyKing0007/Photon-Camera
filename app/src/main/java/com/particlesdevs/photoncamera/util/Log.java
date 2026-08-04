@@ -16,6 +16,8 @@ import java.io.FileWriter;
 import java.io.OutputStreamWriter;
 import java.text.SimpleDateFormat;
 import java.util.Locale;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 public class Log {
     private static final String PHOTON_LOG_SUBFOLDER = "PhotonLog";
@@ -292,6 +294,33 @@ public class Log {
         logEnabled = enabled;
     }
     
+    /*
+     * Build 26280:
+     * Drain all queued log writes and flush the active file before a completed
+     * Motion capture is shared or copied. The latch is posted after all prior
+     * writeToFile() work, so successful return means the completion marker and
+     * final effective-frame statistics have reached the BufferedWriter.
+     */
+    public static boolean flushAndWait(long timeoutMs) {
+        if (logHandler == null) return false;
+
+        CountDownLatch latch = new CountDownLatch(1);
+        logHandler.post(() -> {
+            try {
+                flushBuffer();
+            } finally {
+                latch.countDown();
+            }
+        });
+
+        try {
+            return latch.await(Math.max(1L, timeoutMs), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
     // Cleanup method to call when app is closing
     public static void shutdown() {
         if (logHandler != null) {

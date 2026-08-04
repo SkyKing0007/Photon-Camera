@@ -142,6 +142,14 @@ public class Parameters {
     public float subpixelSampleDiversity = 0.0f;
     public float highlightClippedFraction = 0.0f;
 
+    /*
+     * Build 26281 JPEG-embedded Motion reconstruction summary.
+     */
+    public boolean nativeResolutionSrEnabled = false;
+    public int motionAlternatesSelected = 0;
+    public int motionAlternatesProcessed = 0;
+    public boolean motionProcessingComplete = false;
+
     public int tile = 16;
     public int tilesX = 0;
     public Point alignmentSize = new Point(0, 0);
@@ -1008,6 +1016,12 @@ public class Parameters {
                 "\n TemporalSlowShutterContributionMean=" + FltFormat(temporalSlowShutterContributionMean) +
                 "\n TemporalFastShutterContributionMean=" + FltFormat(temporalFastShutterContributionMean) +
                 "\n TemporalBlurContributionCorrelation=" + FltFormat(temporalBlurContributionCorrelation) +
+                "\n NativeResolutionSrEnabled=" + nativeResolutionSrEnabled +
+                "\n MotionAlternatesSelected=" + motionAlternatesSelected +
+                "\n MotionAlternatesProcessed=" + motionAlternatesProcessed +
+                "\n MotionProcessingComplete=" + motionProcessingComplete +
+                "\n SubpixelSampleDiversity=" + FltFormat(subpixelSampleDiversity) +
+                "\n HighlightClippedFraction=" + FltFormat(highlightClippedFraction) +
                 "\n CameraID=" + PhotonCamera.getSettings().mCameraID +
                 "\n DenoiseOn=" + PhotonCamera.getSettings().hdrxNR +
                 "\n Sharp=" + FltFormat(PreferenceKeys.getSharpnessValue()) +
