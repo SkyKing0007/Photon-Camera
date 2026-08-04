@@ -538,7 +538,21 @@ public class IsoExpoSelector {
 
     //==================================Class : ExpoPair==================================//
 
-    public static class ExpoPair {
+    public static class ExpoPair implements Cloneable {
+        /*
+         * Build 26294:
+         * Every ImageFrame must own independent layer/curlayer state.
+         * Motion previously shared one mutable ExpoPair across the full burst.
+         * MOTION_26294_INDEPENDENT_EXPOSURE_STATE
+         */
+        public ExpoPair copyForFrame() {
+            try {
+                return (ExpoPair) super.clone();
+            } catch (CloneNotSupportedException exception) {
+                throw new AssertionError(exception);
+            }
+        }
+
         public enum exposureLayer{
             Low,
             Normal,

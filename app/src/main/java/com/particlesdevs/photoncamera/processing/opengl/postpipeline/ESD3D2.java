@@ -239,9 +239,26 @@ public class ESD3D2 extends Node {
                         motionLumaEdgeBlendMaximum
                                 * highIsoBlend;
 
+                /*
+                 * Build 26289:
+                 * Sparse SNN weights can connect residual noise into worms.
+                 * Retain the established high-ISO base blend, then add only a
+                 * confidence-derived stable-weight contribution when measured
+                 * temporal support is weak. Strong stacks remain unchanged.
+                 */
+                /*
+                 * Build 26295: sparse-SNN anti-worm baseline for healthy and
+                 * weak Motion stacks alike.
+                 * MOTION_26295_ESD_HEALTHY_STACK_ANTI_WORM
+                 */
                 motionStableWeights =
-                        motionStableWeightBlendMaximum
-                                * highIsoBlend;
+                        Math2.clamp(
+                                0.08f
+                                        + motionStableWeightBlendMaximum * highIsoBlend
+                                        + 0.16f * motionEffectiveWeakness,
+                                0.0f,
+                                0.28f
+                        );
 
                 /*
                  * Build 26222:

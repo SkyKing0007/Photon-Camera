@@ -8,6 +8,9 @@ uniform float indoorHdrStrength;
 uniform float lowerMidLift;
 uniform float highlightCompression;
 uniform float backlitWindowStrength;
+uniform float generalizedBroadHdrStrength;
+uniform float indoorBacklitStrength;
+uniform float outdoorBroadHdrStrength;
 out vec4 Output;
 vec3 reinhard_extended(vec3 v, float max_white){
     vec3 numerator = v * (vec3(1.0f) + (v / vec3(max_white * max_white)));
@@ -132,81 +135,42 @@ void main() {
                     vec3(0.299, 0.587, 0.114)
             );
 
-    float highlightMask =
-            smoothstep(
-                    0.58,
-                    0.94,
-                    liftedLuma
-            );
-
-    float strongHighlightMask =
-            smoothstep(
-                    0.78,
-                    1.04,
-                    liftedLuma
-            );
-
+    /*
+     * Build 26295: preserve upper-mid separation, compress true highlights in
+     * luminance, and restrain only risky near-clipped chroma.
+     * MOTION_26295_LUMA_DOMAIN_PROGRESSIVE_SHOULDER
+     */
+    float shoulderStart = mix(0.72, 0.64, indoorBacklitStrength);
+    float highlightMask = smoothstep(shoulderStart, 0.98, liftedLuma);
+    float strongHighlightMask = smoothstep(0.84, 1.06, liftedLuma);
     float shoulderCoefficient =
-            mix(
-                    0.48,
-                    0.76,
-                    backlitWindowStrength
-            );
-
-    vec3 compressedColor =
-            liftedColor
-                    / (
-                            vec3(1.0)
-                                    + shoulderCoefficient
-                                    * liftedColor
-                      );
-
+            mix(1.65, 2.55, max(indoorBacklitStrength, outdoorBroadHdrStrength));
+    float highlightExcess = max(liftedLuma - shoulderStart, 0.0);
+    float compressedExcess =
+            highlightExcess / (1.0 + shoulderCoefficient * highlightExcess);
+    float compressedLuma = shoulderStart + compressedExcess;
     float shoulderBlend =
             clamp(
                     highlightCompression
-                            * (
-                                    0.32
-                                            * highlightMask
-                                    + 0.68
-                                            * strongHighlightMask
-                              ),
+                            * (0.20 * highlightMask + 0.80 * strongHighlightMask),
                     0.0,
-                    0.84
+                    0.86
             );
-
-    vec3 shoulderColor =
-            mix(
-                    liftedColor,
-                    compressedColor,
-                    shoulderBlend
-            );
-
-    float sourceLuma =
-            liftedLuma;
-
-    vec3 sourceChroma =
-            liftedColor
-                    - vec3(sourceLuma);
-
-    float shoulderLuma =
-            dot(
-                    shoulderColor,
-                    vec3(0.299, 0.587, 0.114)
-            );
-
-    float requestedChromaScale =
-            mix(
-                    shoulderLuma
-                            / max(sourceLuma, 0.0001),
-                    0.96,
-                    0.70
-                            * highlightMask
-            );
-
+    float shoulderLuma = mix(liftedLuma, compressedLuma, shoulderBlend);
+    vec3 sourceChroma = liftedColor - vec3(liftedLuma);
+    float sourceChromaMagnitude = length(sourceChroma);
+    float maximumChannel = max(liftedColor.r, max(liftedColor.g, liftedColor.b));
+    float highlightColorRisk =
+            smoothstep(0.76, 1.02, maximumChannel)
+                    * smoothstep(0.045, 0.28, sourceChromaMagnitude)
+                    * generalizedBroadHdrStrength;
+    float luminancePreservingChromaScale =
+            shoulderLuma / max(liftedLuma, 0.0001);
+    float highlightChromaRestraint = mix(1.0, 0.88, highlightColorRisk);
     vec3 requestedChroma =
             sourceChroma
-                    * requestedChromaScale;
-
+                    * luminancePreservingChromaScale
+                    * highlightChromaRestraint;
     float positiveHeadroom =
             min(
                     requestedChroma.r > 0.0
@@ -221,7 +185,6 @@ void main() {
                                     : 1.0
                     )
             );
-
     float negativeHeadroom =
             min(
                     requestedChroma.r < 0.0
@@ -236,21 +199,8 @@ void main() {
                                     : 1.0
                     )
             );
-
-    float safeChromaScale =
-            clamp(
-                    min(
-                            positiveHeadroom,
-                            negativeHeadroom
-                    ),
-                    0.0,
-                    1.0
-            );
-
-    Output.rgb =
-            vec3(shoulderLuma)
-                    + requestedChroma
-                            * safeChromaScale;
+    float safeChromaScale = clamp(min(positiveHeadroom, negativeHeadroom),0.0,1.0);
+    Output.rgb = vec3(shoulderLuma) + requestedChroma * safeChromaScale;
 
     Output.rgb =
             clamp(

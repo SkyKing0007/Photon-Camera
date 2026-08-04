@@ -313,12 +313,12 @@ void main() {
          * dark monitor borders from entering saturated objects, and red
          * objects from acquiring black chroma rims.
          */
+        /* MOTION_26295_DEEP_FLAT_CHROMA_RELAXATION */
+        float deepFlatRelaxation =
+                flatMask * (1.0 - smoothstep(0.08, 0.30, centerLuma));
+        float boundaryMinimum = mix(0.015, 0.075, deepFlatRelaxation);
         float boundaryProtection =
-                mix(
-                        0.015,
-                        1.0,
-                        chromaSimilarityWeight
-                );
+                mix(boundaryMinimum, 1.0, chromaSimilarityWeight);
 
         float sampleWeight =
                 spatialWeight
@@ -340,6 +340,61 @@ void main() {
                     : centerChroma;
 
     /*
+     * Build 26289:
+     * At saturated boundaries, permit chroma-magnitude cleanup but reject a
+     * large hue rotation toward an unlike-color neighbor. This directly
+     * targets cyan/blue rims around red objects without desaturating the
+     * object's interior or changing luminance.
+     */
+    float centerChromaMagnitude =
+            length(centerChroma);
+
+    float filteredChromaMagnitude =
+            length(filteredChroma);
+
+    float hueAgreement =
+            dot(
+                    centerChroma
+                            / max(centerChromaMagnitude, 0.000001),
+                    filteredChroma
+                            / max(filteredChromaMagnitude, 0.000001)
+            );
+
+    float saturatedBoundaryMask =
+            smoothstep(
+                    0.20,
+                    0.48,
+                    centerChromaMagnitude
+            )
+                    * smoothstep(
+                            chromaEdgeLow,
+                            chromaEdgeHigh,
+                            localChromaGradient
+                    );
+
+    float hueRotationProtection =
+            saturatedBoundaryMask
+                    * (
+                        1.0
+                                - smoothstep(
+                                        0.72,
+                                        0.96,
+                                        hueAgreement
+                                )
+                    );
+
+    filteredChroma =
+            mix(
+                    filteredChroma,
+                    centerChroma,
+                    clamp(
+                            0.92 * hueRotationProtection,
+                            0.0,
+                            0.92
+                    )
+            );
+
+    /*
      * Chroma cleanup is strongest only where the area is both flat and
      * color-stable. Thin foliage, saturated red edges, cables and text retain
      * the center chroma instead of being converted into worms or outlines.
@@ -351,10 +406,10 @@ void main() {
      */
     float flatDarkBoost =
             mix(
-                    1.18,
+                    1.28,
                     1.0,
                     smoothstep(
-                            0.10,
+                            0.08,
                             0.34,
                             centerLuma
                     )
@@ -365,13 +420,36 @@ void main() {
                     * chromaTextureMask
                     * flatDarkBoost;
 
+    /*
+     * Build 26288:
+     * Preserve unlike-color boundary protection, but permit modest cleanup
+     * inside a saturated material only when the material is locally flat and
+     * chroma-consistent. This targets ceiling-corner clouds and olive/brown
+     * drift inside the yellow panel without desaturating its boundary.
+     */
+    float uniformMaterialMask =
+            flatMask
+                    * chromaTextureMask
+                    * chromaTextureMask
+                    * smoothstep(
+                            0.18,
+                            0.42,
+                            centerSaturation
+                    );
+
+    float materialChromaAllowance =
+            max(
+                    saturatedCenterProtection,
+                    0.34 * uniformMaterialMask
+            );
+
     float requestedBlend =
             clamp(
                     CHROMASTRENGTH
                             * flatMask
                             * darkMask
                             * edgeSafeCleanup
-                            * saturatedCenterProtection,
+                            * materialChromaAllowance,
                     0.0,
                     1.0
             );

@@ -1296,6 +1296,14 @@ public class PyramidMerging extends GLOneScript {
          */
         final boolean motionEqualExposureStack =
                 parameters.motionCapture;
+        /*
+         * Build 26292 scope repair:
+         * HdrxProcessor removes the unique short auxiliary frame before this
+         * object is constructed. Therefore every frame reaching the Motion
+         * temporal merge is again part of the homogeneous normal-exposure
+         * stack, and no later local counter is needed here.
+         * MOTION_26292_HOMOGENEOUS_INPUT_AFTER_AUX_EXTRACTION
+         */
 
         /*
          * vec4 length is approximately two times one-channel sigma.

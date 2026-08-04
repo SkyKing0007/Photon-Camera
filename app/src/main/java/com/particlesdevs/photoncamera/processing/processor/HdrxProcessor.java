@@ -25,6 +25,7 @@ import com.particlesdevs.photoncamera.processing.render.Parameters;
 import com.particlesdevs.photoncamera.util.Allocator;
 
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
@@ -99,7 +100,7 @@ public class HdrxProcessor extends ProcessorBase {
             if (cameraMode == CameraMode.MOTION) {
                 Log.e(
                         TAG,
-                        "MOTION_26286_HIGHLIGHT_SHADOW_CHROMA_HALO_COMPLETE"
+                        "MOTION_26289_CONFIDENCE_RESIDUAL_HUE_GUARD_COMPLETE"
                                 + " success=false"
                                 + " stage=HdrxProcessor.Run"
                                 + " error=" + e.getClass().getSimpleName()
@@ -158,6 +159,10 @@ public class HdrxProcessor extends ProcessorBase {
         ArrayList<ImageFrame> images = new ArrayList<>();
         int ISO = 0;
         int normalFrames = 0;
+        /* MOTION_26292_AUXILIARY_HIGHLIGHT_STATE */
+        ImageFrame motionAuxiliaryHighlightFrame = null;
+        double motionAuxiliaryHighlightEnergy = 0.0;
+        double motionNormalReferenceEnergy = 0.0;
         if(BurstShakiness.size() < mImageFramesToProcess.size()){
             Log.d(TAG,"Warning: Gyro data size:"+BurstShakiness.size()+" is less than image size:"+mImageFramesToProcess.size());
         }
@@ -183,7 +188,7 @@ public class HdrxProcessor extends ProcessorBase {
 
             frame.pair = IsoExpoSelector.fullpairs.get(
                     exposurePairIndex
-            );
+            ).copyForFrame();
             frame.number = i;
 
             Double frameExposure = exposures.get(
@@ -222,6 +227,58 @@ public class HdrxProcessor extends ProcessorBase {
             ISO += frame.pair.iso;
         }
         ISO /= mImageFramesToProcess.size();
+
+        /* MOTION_26292_EXTRACT_SHORT_BEFORE_MERGE */
+        if (processingParameters.motionCapture && images.size() >= 6) {
+            int shortestIndex = -1;
+            double shortestEnergy = Double.POSITIVE_INFINITY;
+            double secondShortestEnergy = Double.POSITIVE_INFINITY;
+            for (int i = 0; i < images.size(); i++) {
+                Double energy = exposures.get(images.get(i).timestamp);
+                if (energy == null || energy <= 0.0) continue;
+                if (energy < shortestEnergy) {
+                    secondShortestEnergy = shortestEnergy;
+                    shortestEnergy = energy;
+                    shortestIndex = i;
+                } else if (energy < secondShortestEnergy) {
+                    secondShortestEnergy = energy;
+                }
+            }
+            double bracketRatio = shortestEnergy > 0.0 && secondShortestEnergy < Double.POSITIVE_INFINITY
+                    ? secondShortestEnergy / shortestEnergy : 1.0;
+            if (shortestIndex >= 0 && bracketRatio >= 1.75) {
+                motionAuxiliaryHighlightFrame = images.remove(shortestIndex);
+                motionAuxiliaryHighlightEnergy = shortestEnergy;
+                motionNormalReferenceEnergy = secondShortestEnergy;
+                normalFrames = 0;
+                double normalMinEnergy = Double.POSITIVE_INFINITY;
+                for (ImageFrame frame : images) {
+                    Double energy = exposures.get(frame.timestamp);
+                    if (energy != null && energy > 0.0) normalMinEnergy = Math.min(normalMinEnergy, energy);
+                }
+                if (!(normalMinEnergy > 0.0) || normalMinEnergy == Double.POSITIVE_INFINITY) {
+                    throw new IllegalStateException("No valid normal Motion exposure after auxiliary extraction");
+                }
+                for (ImageFrame frame : images) {
+                    Double energy = exposures.get(frame.timestamp);
+                    if (energy == null || energy <= 0.0) energy = normalMinEnergy;
+                    frame.pair.layerMpy = (float)(energy / normalMinEnergy);
+                    if (frame.pair.layerMpy > 1.0001f) {
+                        frame.pair.curlayer = IsoExpoSelector.ExpoPair.exposureLayer.High;
+                    } else {
+                        frame.pair.curlayer = IsoExpoSelector.ExpoPair.exposureLayer.Normal;
+                        normalFrames++;
+                    }
+                }
+                Log.d(TAG,"MOTION_26292_AUXILIARY_EXTRACTED shortIndex="+shortestIndex
+                        +" shortEnergy="+shortestEnergy+" normalEnergy="+secondShortestEnergy
+                        +" bracketRatio="+bracketRatio+" normalFramesRemaining="+images.size()
+                        +" shortExcludedFromMotionMerge=true");
+            } else {
+                Log.d(TAG,"MOTION_26292_AUXILIARY_NOT_FOUND shortestIndex="+shortestIndex
+                        +" bracketRatio="+bracketRatio+" frames="+images.size());
+            }
+        }
 
         Log.d(
                 TAG,
@@ -285,6 +342,35 @@ public class HdrxProcessor extends ProcessorBase {
         exifData.IMAGE_DESCRIPTION = processingParameters.toString();
         ImageFrameDeblur imageFrameDeblur = new ImageFrameDeblur(processingParameters);
         imageFrameDeblur.firstFrameGyro = images.get(0).frameGyro.clone();
+
+        if (motionAuxiliaryHighlightFrame != null) {
+            imageFrameDeblur.processDeblurPosition(
+                    motionAuxiliaryHighlightFrame
+            );
+
+            Log.d(
+                    TAG,
+                    "MOTION_26294_AUXILIARY_GLOBAL_ALIGNMENT_DIAGNOSTIC"
+                            + " frameNumber="
+                            + motionAuxiliaryHighlightFrame.number
+                            + " posX="
+                            + motionAuxiliaryHighlightFrame.posx
+                            + " posY="
+                            + motionAuxiliaryHighlightFrame.posy
+                            + " rotation="
+                            + motionAuxiliaryHighlightFrame.rotation
+                            + " shakiness="
+                            + (
+                                motionAuxiliaryHighlightFrame.frameGyro != null
+                                        ? motionAuxiliaryHighlightFrame
+                                                .frameGyro.shakiness
+                                        : Float.NaN
+                              )
+                            + " pixelFusionEnabled=false"
+                            + " localWarpStillRequired=true"
+            );
+        }
+
         for (int i = 0; i < images.size(); i++)
             imageFrameDeblur.processDeblurPosition(images.get(i));
         if (mImageFramesToProcess.size() >= 3)
@@ -350,6 +436,7 @@ public class HdrxProcessor extends ProcessorBase {
                             == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
                         continue;
                     }
+
 
                     if (candidate.pair.curlayer
                             == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
@@ -691,8 +778,21 @@ public class HdrxProcessor extends ProcessorBase {
 
             output = pyramidMerging.Output;
             pyramidMerging.close();
-            for (int i = 0; i < images.size(); i++) {
-                images.get(i).close();
+            if (motionAuxiliaryHighlightFrame != null
+                    && motionAuxiliaryHighlightFrame.buffer != null
+                    && motionAuxiliaryHighlightEnergy > 0.0
+                    && motionNormalReferenceEnergy > motionAuxiliaryHighlightEnergy) {
+                applyMotionAuxiliaryHighlightFusion(
+                        output,
+                        motionAuxiliaryHighlightFrame.buffer,
+                        processingParameters,
+                        motionNormalReferenceEnergy / motionAuxiliaryHighlightEnergy
+                );
+            }
+            for (int i = 0; i < images.size(); i++) images.get(i).close();
+            if (motionAuxiliaryHighlightFrame != null) {
+                motionAuxiliaryHighlightFrame.close();
+                motionAuxiliaryHighlightFrame = null;
             }
             IncreaseWLBL(processingParameters);
         } else {
@@ -1136,7 +1236,7 @@ public class HdrxProcessor extends ProcessorBase {
         if (cameraMode == CameraMode.MOTION) {
             Log.d(
                     TAG,
-                    "MOTION_26286_HIGHLIGHT_SHADOW_CHROMA_HALO_COMPLETE"
+                    "MOTION_26289_CONFIDENCE_RESIDUAL_HUE_GUARD_COMPLETE"
                             + " success=" + imageSaved
                             + " retained="
                             + processingParameters.retainedFrameCount
@@ -1168,6 +1268,208 @@ public class HdrxProcessor extends ProcessorBase {
 
         Allocator.getMemoryCount();
         callback.onFinished();
+    }
+
+
+    private void applyMotionAuxiliaryHighlightFusion(
+            ByteBuffer normalMerged,
+            ByteBuffer shortRaw,
+            Parameters parameters,
+            double exposureScale
+    ) {
+        Log.d(
+                TAG,
+                "MOTION_26294_AUXILIARY_DIAGNOSTIC_BEGIN"
+                        + " exposureScale=" + exposureScale
+        );
+
+        if (normalMerged == null
+                || shortRaw == null
+                || parameters == null
+                || parameters.rawSize == null
+                || exposureScale <= 1.0) {
+            Log.w(TAG, "MOTION_26293_AUXILIARY_SKIPPED reason=invalid_input");
+            return;
+        }
+
+        final int width = parameters.rawSize.x;
+        final int height = parameters.rawSize.y;
+        final int requiredBytes = width * height * 2;
+
+        if (normalMerged.capacity() < requiredBytes
+                || shortRaw.capacity() < requiredBytes) {
+            Log.w(TAG, "MOTION_26293_AUXILIARY_SKIPPED reason=buffer_capacity");
+            return;
+        }
+
+        ByteBuffer normal =
+                normalMerged.duplicate().order(ByteOrder.nativeOrder());
+        ByteBuffer shortBuffer =
+                shortRaw.duplicate().order(ByteOrder.nativeOrder());
+
+        final float sensorWhite = Math.max(1.0f, parameters.whiteLevel);
+        final float[] black = parameters.blackLevel;
+        final float[] fullBlack = new float[4];
+
+        for (int i = 0; i < 4; i++) {
+            fullBlack[i] = black[i] * 65535.0f / sensorWhite;
+        }
+
+        long examinedQuads = 0L;
+        long partialQuads = 0L;
+        long fullClipQuads = 0L;
+        long anchorRejected = 0L;
+        long edgeRejected = 0L;
+        long recoverableChannels = 0L;
+
+        /*
+         * Recover only partially clipped Bayer quads. Unclipped channels anchor
+         * local brightness; the short frame supplies channel ratios. Fully
+         * clipped cores and strong same-CFA edges are left unchanged.
+         * MOTION_26293_PARTIAL_CHANNEL_RATIO_RECOVERY
+         */
+        for (int y = 2; y < height - 3; y += 2) {
+            for (int x = 2; x < width - 3; x += 2) {
+                examinedQuads++;
+                float[] n = new float[4];
+                float[] s = new float[4];
+                int[] bi = new int[4];
+                int clipped = 0;
+                int anchors = 0;
+                float scaleSum = 0.0f;
+
+                for (int q = 0; q < 4; q++) {
+                    int qx = x + (q & 1);
+                    int qy = y + ((q >> 1) & 1);
+                    int index = qy * width + qx;
+                    int cfa = ((qy & 1) << 1) | (qx & 1);
+                    bi[q] = index * 2;
+                    int nv = normal.getShort(bi[q]) & 0xffff;
+                    int sv = shortBuffer.getShort(bi[q]) & 0xffff;
+                    n[q] = Math.max(0.0f, Math.min(
+                            1.0f,
+                            (nv - fullBlack[cfa])
+                                    / Math.max(1.0f, 65535.0f - fullBlack[cfa])
+                    ));
+                    s[q] = Math.max(0.0f, Math.min(
+                            1.0f,
+                            (sv - black[cfa])
+                                    / Math.max(1.0f, sensorWhite - black[cfa])
+                    ));
+                    if (n[q] >= 0.985f) {
+                        clipped++;
+                    } else if (n[q] >= 0.18f
+                            && s[q] >= 0.05f
+                            && s[q] <= 0.92f) {
+                        scaleSum += n[q] / s[q];
+                        anchors++;
+                    }
+                }
+
+                if (clipped == 0) continue;
+                if (clipped == 4) {
+                    fullClipQuads++;
+                    continue;
+                }
+                partialQuads++;
+                if (anchors == 0) {
+                    anchorRejected++;
+                    continue;
+                }
+
+                float localScale = Math.max(
+                        0.50f,
+                        Math.min((float) exposureScale * 1.08f,
+                                scaleSum / anchors)
+                );
+
+                for (int q = 0; q < 4; q++) {
+                    if (n[q] < 0.985f || s[q] <= 0.03f || s[q] >= 0.94f) {
+                        continue;
+                    }
+
+                    int qx = x + (q & 1);
+                    int qy = y + ((q >> 1) & 1);
+                    int index = qy * width + qx;
+                    int cfa = ((qy & 1) << 1) | (qx & 1);
+                    int[] offsets = {-2, 2, -2 * width, 2 * width};
+                    float maxShortGradient = 0.0f;
+                    float minNormalNeighbor = 1.0f;
+
+                    for (int offset : offsets) {
+                        int ni = index + offset;
+                        int nx = ni % width;
+                        int ny = ni / width;
+                        int nc = ((ny & 1) << 1) | (nx & 1);
+                        int sv = shortBuffer.getShort(ni * 2) & 0xffff;
+                        int nv = normal.getShort(ni * 2) & 0xffff;
+                        float sn = Math.max(0.0f, Math.min(
+                                1.0f,
+                                (sv - black[nc])
+                                        / Math.max(1.0f, sensorWhite - black[nc])
+                        ));
+                        float nn = Math.max(0.0f, Math.min(
+                                1.0f,
+                                (nv - fullBlack[nc])
+                                        / Math.max(1.0f, 65535.0f - fullBlack[nc])
+                        ));
+                        maxShortGradient = Math.max(
+                                maxShortGradient,
+                                Math.abs(sn - s[q])
+                        );
+                        minNormalNeighbor = Math.min(minNormalNeighbor, nn);
+                    }
+
+                    if (minNormalNeighbor < 0.975f
+                            || maxShortGradient * localScale > 0.055f) {
+                        edgeRejected++;
+                        continue;
+                    }
+
+                    float predicted = Math.max(
+                            0.0f,
+                            Math.min(1.0f, s[q] * localScale)
+                    );
+                    if (predicted >= 0.982f
+                            || predicted >= n[q] - 0.006f) {
+                        continue;
+                    }
+
+                    float amount = Math.max(
+                            0.0f,
+                            Math.min(1.0f, (n[q] - 0.985f) / 0.015f)
+                    );
+                    float fused = n[q] + (predicted - n[q]) * (0.72f * amount);
+                    /*
+                     * Build 26294:
+                     * Diagnostic only. Do not modify the merged Bayer output
+                     * until the short RAW has a validated local warp and
+                     * radiance-domain fusion.
+                     * MOTION_26294_CPU_FUSION_DISABLED
+                     */
+                    recoverableChannels++;
+                }
+            }
+        }
+
+        normalMerged.position(0);
+        shortRaw.position(0);
+        Log.d(
+                TAG,
+                "MOTION_26294_AUXILIARY_DIAGNOSTIC_COMPLETE"
+                        + " exposureScale=" + exposureScale
+                        + " examinedQuads=" + examinedQuads
+                        + " partialQuads=" + partialQuads
+                        + " fullClipQuads=" + fullClipQuads
+                        + " anchorRejected=" + anchorRejected
+                        + " edgeRejected=" + edgeRejected
+                        + " recoverableChannels=" + recoverableChannels
+                        + " pixelFusionEnabled=false"
+                        + " requiresLocalAlignment=true"
+                        + " normalTemporalFramesPreserved=true"
+                        + " shortEnteredMotionMerge=false"
+                        + " fullClipCoreInvented=false"
+        );
     }
 
 }

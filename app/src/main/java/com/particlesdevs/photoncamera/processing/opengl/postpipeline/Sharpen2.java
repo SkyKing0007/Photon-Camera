@@ -54,6 +54,61 @@ public class Sharpen2 extends Node {
     float motionFinalSharpeningFloor = 0.45f;
     @Override
     public void Run() {
+        float motionResidualNoiseScale = 1.0f;
+
+        if (com.particlesdevs.photoncamera.app.PhotonCamera
+                .getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            float effectiveRatio =
+                    basePipeline.mParameters.localContributionMeasured
+                            ? Math.max(
+                                0.0f,
+                                Math.min(
+                                    1.0f,
+                                    basePipeline.mParameters.effectiveStackRatio
+                                )
+                            )
+                            : 1.0f;
+            float lowerRatio =
+                    basePipeline.mParameters.localContributionMeasured
+                            ? Math.max(
+                                0.0f,
+                                Math.min(
+                                    1.0f,
+                                    basePipeline.mParameters.localContributionP25
+                                )
+                            )
+                            : effectiveRatio;
+            float stackSupport =
+                    Math.max(
+                            0.0f,
+                            Math.min(
+                                    1.0f,
+                                    0.65f * effectiveRatio
+                                            + 0.35f * lowerRatio
+                            )
+                    );
+            float sceneShadowLift =
+                    Math.max(
+                            0.0f,
+                            Math.min(
+                                    1.0f,
+                                    ((PostPipeline) basePipeline)
+                                            .motionShadowSceneStrength
+                            )
+                    );
+            motionResidualNoiseScale =
+                    Math.max(
+                            1.0f,
+                            Math.min(
+                                    2.60f,
+                                    1.0f
+                                            + 1.15f * (1.0f - stackSupport)
+                                            + 0.85f * sceneShadowLift
+                            )
+                    );
+        }
+
         glProg.setDefine("INTENSE",denoiseActivity);
         glProg.setDefine("INSIZE",basePipeline.mParameters.rawSize);
         glProg.setDefine("SHARPSIZE",sharpSize);
@@ -61,6 +116,16 @@ public class Sharpen2 extends Node {
         glProg.setDefine("SHARPMAX",sharpMax);
         glProg.setDefine("NOISES",basePipeline.noiseS);
         glProg.setDefine("NOISEO",basePipeline.noiseO);
+        glProg.setDefine(
+                "MOTIONRESIDUALNOISESCALE",
+                motionResidualNoiseScale
+        );
+        glProg.setDefine(
+                "MOTIONHALORESTRAINT",
+                com.particlesdevs.photoncamera.app.PhotonCamera
+                                .getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION
+        );
         glProg.useAssetProgram("sharpening/lsharpening3");
         glProg.setVar("size", sharpSize);
         float sharpness = Math.max(PreferenceKeys.getSharpnessValue(), 0.0f);
@@ -153,6 +218,55 @@ public class Sharpen2 extends Node {
             );
         }
 
+        /*
+         * Build 26294:
+         * Do not turn weak-stack shadow residuals into worms, colored rims,
+         * or false carpet texture.
+         * MOTION_26294_FINAL_WEAK_STACK_SHARPEN_RESTRAINT
+         */
+        if (basePipeline.mParameters.motionCapture
+                && basePipeline.mParameters.localContributionMeasured) {
+
+            float support =
+                    Math.max(
+                            0.0f,
+                            Math.min(
+                                    1.0f,
+                                    (
+                                        basePipeline.mParameters
+                                                .localContributionP10
+                                                - 3.0f
+                                    ) / 5.0f
+                            )
+                    );
+
+            float weakStackSharpScale =
+                    0.72f + (1.0f - 0.72f) * support;
+
+            sharpness *= weakStackSharpScale;
+
+            Log.d(
+                    Name,
+                    "MOTION_26294_FINAL_WEAK_STACK_SHARPEN_RESTRAINT"
+                            + " localP10="
+                            + basePipeline.mParameters
+                                    .localContributionP10
+                            + " scale="
+                            + weakStackSharpScale
+                            + " appliedStrength="
+                            + sharpness
+            );
+        }
+
+        /* MOTION_26295_FINAL_RESIDUAL_RESTRAINT */
+        if (basePipeline.mParameters.motionCapture) {
+            float isoResidual = com.particlesdevs.photoncamera.util.Math2.clamp(
+                    (basePipeline.mParameters.iso - 500.0f) / 2200.0f, 0.0f, 1.0f);
+            float liftResidual = com.particlesdevs.photoncamera.util.Math2.clamp(
+                    ((PostPipeline) basePipeline).motionAppliedLowerMidLift / 0.34f, 0.0f, 1.0f);
+            sharpness *= com.particlesdevs.photoncamera.util.Math2.mix(
+                    1.0f, 0.82f, Math.max(isoResidual, liftResidual));
+        }
         glProg.setVar("strength", sharpness);
         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
         glProg.setTexture("BlurBuffer",previousNode.WorkingTexture);

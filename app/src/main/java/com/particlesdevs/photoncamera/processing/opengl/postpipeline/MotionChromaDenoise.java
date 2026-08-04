@@ -89,6 +89,56 @@ public class MotionChromaDenoise extends Node {
         glProg.setDefine("DIRECTION", direction);
         glProg.setDefine("KSIZE", 4);
         glProg.setDefine("SAMPLESTEP", sampleStep);
+        /*
+         * Build 26294:
+         * A weak local-contribution tail means some shadow regions received
+         * too few useful temporal samples. Increase only the existing
+         * edge-aware Motion chroma cleanup in those captures.
+         * MOTION_26294_WEAK_STACK_CHROMA_CLEANUP
+         */
+        float weakStackChromaBoost = 1.0f;
+
+        if (basePipeline.mParameters.motionCapture
+                && basePipeline.mParameters.localContributionMeasured) {
+
+            float support =
+                    Math.max(
+                            0.0f,
+                            Math.min(
+                                    1.0f,
+                                    (
+                                        basePipeline.mParameters
+                                                .localContributionP10
+                                                - 3.0f
+                                    ) / 5.0f
+                            )
+                    );
+
+            weakStackChromaBoost =
+                    1.22f + (1.0f - 1.22f) * support;
+
+            strength = Math.min(
+                    0.90f,
+                    strength * weakStackChromaBoost
+            );
+
+            Log.d(
+                    Name,
+                    "MOTION_26294_WEAK_STACK_CHROMA_CLEANUP"
+                            + " localP10="
+                            + basePipeline.mParameters
+                                    .localContributionP10
+                            + " boost="
+                            + weakStackChromaBoost
+                            + " appliedStrength="
+                            + strength
+            );
+        }
+
+        /* MOTION_26295_HEALTHY_STACK_CHROMA_CLOUD_CLEANUP */
+        if (basePipeline.mParameters.motionCapture) {
+            strength = Math.min(0.92f, strength * 1.18f);
+        }
         glProg.setDefine("CHROMASTRENGTH", strength);
         glProg.setDefine("GUIDESIGMA", guideSigma);
         glProg.setDefine(
@@ -217,7 +267,7 @@ public class MotionChromaDenoise extends Node {
         if (strength <= 0.001f) {
             Log.d(
                     Name,
-                    "MOTION_26286_FLAT_SHADOW_CHROMA_REPAIR"
+                    "MOTION_26289_CONFIDENCE_RESIDUAL_HUE_GUARD"
                             + " iso=" + motionIso
                             + " enabled=false"
                             + " reason=belowIso600"
@@ -240,11 +290,12 @@ public class MotionChromaDenoise extends Node {
 
         int adaptiveRadiusPixels;
 
-        if (motionIso >= 3600.0f || displayLiftBlend >= 0.82f) {
+        /* MOTION_26295_COARSE_CHROMA_CLOUD_RADIUS */
+        if (motionIso >= 2800.0f || displayLiftBlend >= 0.72f) {
             adaptiveRadiusPixels = 16;
-        } else if (lowConfidence >= 0.30f || displayLiftBlend >= 0.55f) {
+        } else if (motionIso >= 1200.0f || lowConfidence >= 0.18f || displayLiftBlend >= 0.28f) {
             adaptiveRadiusPixels = 12;
-        } else if (motionIso >= 1000.0f || lowConfidence >= 0.14f || displayLiftBlend >= 0.25f) {
+        } else if (motionIso >= 700.0f || lowConfidence >= 0.08f || displayLiftBlend >= 0.14f) {
             adaptiveRadiusPixels = 8;
         } else {
             adaptiveRadiusPixels = 4;
@@ -303,7 +354,7 @@ public class MotionChromaDenoise extends Node {
 
             Log.d(
                     Name,
-                    "MOTION_26286_FLAT_SHADOW_CHROMA_REPAIR"
+                    "MOTION_26289_CONFIDENCE_RESIDUAL_HUE_GUARD"
                             + " iso=" + motionIso
                             + " effectiveRatio=" + measuredRatio
                             + " lowConfidence=" + lowConfidence
@@ -361,7 +412,7 @@ public class MotionChromaDenoise extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26286_FLAT_SHADOW_CHROMA_REPAIR"
+                "MOTION_26289_CONFIDENCE_RESIDUAL_HUE_GUARD"
                         + " iso=" + motionIso
                         + " enabled=true"
                         + " highIsoBlend=" + highIsoBlend

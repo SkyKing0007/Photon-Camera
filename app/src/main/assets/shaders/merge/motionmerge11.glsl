@@ -44,6 +44,7 @@ uniform float whiteLevel;
 uniform vec4 blackLevel;
 uniform vec4 analogBalance;
 uniform int cfaPattern;
+
 #import median
 uint getBayer(ivec2 coords, highp usampler2D tex){
     return texelFetch(tex,coords,0).r;

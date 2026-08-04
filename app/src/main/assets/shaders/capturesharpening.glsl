@@ -13,6 +13,10 @@ out vec3 Output;
 #define SHARPSIZEKER 3.0
 #define SHARPSTR 1.0
 #define INSIZE 0,0
+#define MOTIONHALORESTRAINT 0
+#define NOISES 0.0
+#define NOISEO 0.0
+#define MOTIONRESIDUALNOISESCALE 1.0
 #import gaussian
 void main() {
     ivec2 xy = ivec2(gl_FragCoord.xy);
@@ -33,6 +37,58 @@ void main() {
     mask/=pdfsize;
     mask = cur-mask;
 
-    cur+=(mask.r+mask.g+mask.b)*(float(SHARPSTR)/3.0);
+    float sharpenDelta =
+            (mask.r + mask.g + mask.b)
+                    * (float(SHARPSTR) / 3.0);
+#if MOTIONHALORESTRAINT
+    /*
+     * Build 26289:
+     * Do not convert near-noise-floor positive residuals into connected
+     * carpet worms or hard clumps. Strong real edges remain authorized.
+     */
+    float centerLuma = dot(cur, vec3(0.299, 0.587, 0.114));
+    float visibleNoiseAmplitude =
+            sqrt(
+                    max(
+                            NOISES * max(centerLuma, 0.0) + NOISEO,
+                            0.000001
+                    )
+            ) * MOTIONRESIDUALNOISESCALE;
+
+    float residualMagnitude =
+            abs(sharpenDelta);
+
+    float residualDetailGate =
+            smoothstep(
+                    visibleNoiseAmplitude * 1.55,
+                    visibleNoiseAmplitude * 3.80 + 0.000001,
+                    residualMagnitude
+            );
+
+    float channelEdgeStrength =
+            max(
+                    abs(mask.r),
+                    max(abs(mask.g), abs(mask.b))
+            );
+
+    float realEdgeGate =
+            smoothstep(
+                    visibleNoiseAmplitude * 2.80,
+                    visibleNoiseAmplitude * 7.00 + 0.000001,
+                    channelEdgeStrength
+            );
+
+    sharpenDelta *=
+            max(
+                    residualDetailGate,
+                    realEdgeGate
+            );
+
+    /* Retain the successful 26288 dark-side halo restraint. */
+    float negativeAllowance =
+            mix(0.0015, 0.0050, smoothstep(0.06, 0.42, centerLuma));
+    sharpenDelta = max(sharpenDelta, -negativeAllowance);
+#endif
+    cur += sharpenDelta;
     Output = clamp(cur,0.0,1.0);
 }

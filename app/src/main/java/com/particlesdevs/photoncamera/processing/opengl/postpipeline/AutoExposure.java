@@ -552,14 +552,68 @@
          * flattening the ground, low bush, car and tree trunk into one narrow
          * highlight band. Compression begins later and remains gentler.
          */
+        /*
+         * Build 26295: audited broad-HDR signal for both bright-window
+         * interiors and bright-sky outdoor scenes.
+         * MOTION_26295_AUDITED_BROAD_HDR_SIGNAL
+         */
+        float broadHdrShadowContext =
+                Math2.clamp(
+                        Math.max(
+                                dark20Fraction,
+                                histogramDarkInteriorStrength
+                        ),
+                        0.0f,
+                        1.0f
+                );
+
+        float generalizedBroadHdrStrength =
+                Math2.clamp(
+                        histogramHighlightContext
+                                * Math2.smoothstep(
+                                        0.08f,
+                                        0.46f,
+                                        broadHdrShadowContext
+                                  ),
+                        0.0f,
+                        1.0f
+                );
+
+        float indoorBacklitStrength =
+                Math.max(
+                        backlitWindowStrength,
+                        histogramIndoorHdrStrength
+                                * generalizedBroadHdrStrength
+                );
+
+        float outdoorBroadHdrStrength =
+                generalizedBroadHdrStrength
+                        * (1.0f - 0.72f * backlitWindowStrength);
+
         float highlightCompression =
                 Math2.clamp(
-                        0.52f
-                                * highlightRecoveryStrength
-                                + 0.22f
-                                * backlitWindowStrength,
+                        Math.max(
+                                0.52f * highlightRecoveryStrength
+                                        + 0.22f * backlitWindowStrength,
+                                0.12f
+                                        + 0.34f
+                                        * generalizedBroadHdrStrength
+                        ),
                         0.0f,
                         0.70f
+                );
+
+        lowerMidLift *=
+                Math2.mix(
+                        1.0f,
+                        0.76f,
+                        indoorBacklitStrength
+                );
+
+        lowerMidLift =
+                Math.max(
+                        lowerMidLift,
+                        0.018f * outdoorBroadHdrStrength
                 );
         ((PostPipeline)basePipeline).motionAppliedLowerMidLift = lowerMidLift;
 
@@ -579,6 +633,9 @@
                 "backlitWindowStrength",
                 backlitWindowStrength
         );
+        glProg.setVar("generalizedBroadHdrStrength", generalizedBroadHdrStrength);
+        glProg.setVar("indoorBacklitStrength", indoorBacklitStrength);
+        glProg.setVar("outdoorBroadHdrStrength", outdoorBroadHdrStrength);
 
         MotionToneExifDiagnostics.recordAutoExposure(
                 avg,
@@ -600,7 +657,7 @@
 
         Log.d(
                 "AutoExposure",
-                "MOTION_26286_HIGHLIGHT_SHAPE_PRESERVATION"
+                "MOTION_26295_AUDITED_BROAD_HDR_SIGNAL"
                         + " shadowStrength=" + shadowRecoveryStrength
                         + " shadowStackConfidence="
                         + shadowStackConfidence
@@ -620,6 +677,12 @@
                         + backlitWindowStrength
                         + " indoorHdrStrength="
                         + indoorHdrStrength
+                        + " generalizedBroadHdrStrength="
+                        + generalizedBroadHdrStrength
+                        + " indoorBacklitStrength="
+                        + indoorBacklitStrength
+                        + " outdoorBroadHdrStrength="
+                        + outdoorBroadHdrStrength
                         + " lowerMidLift=" + lowerMidLift
                         + " highlightCompression="
                         + highlightCompression

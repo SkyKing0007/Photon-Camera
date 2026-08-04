@@ -124,9 +124,125 @@ public class CaptureSharpening extends Node {
             );
         }
 
+        float motionResidualNoiseScale = 1.0f;
+
+        if (com.particlesdevs.photoncamera.app.PhotonCamera
+                .getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            float effectiveRatio =
+                    basePipeline.mParameters.localContributionMeasured
+                            ? Math.max(
+                                0.0f,
+                                Math.min(
+                                    1.0f,
+                                    basePipeline.mParameters.effectiveStackRatio
+                                )
+                            )
+                            : 1.0f;
+            float lowerRatio =
+                    basePipeline.mParameters.localContributionMeasured
+                            ? Math.max(
+                                0.0f,
+                                Math.min(
+                                    1.0f,
+                                    basePipeline.mParameters.localContributionP25
+                                )
+                            )
+                            : effectiveRatio;
+            float stackSupport =
+                    Math.max(
+                            0.0f,
+                            Math.min(
+                                    1.0f,
+                                    0.65f * effectiveRatio
+                                            + 0.35f * lowerRatio
+                            )
+                    );
+            float sceneShadowLift =
+                    Math.max(
+                            0.0f,
+                            Math.min(
+                                    1.0f,
+                                    ((PostPipeline) basePipeline)
+                                            .motionShadowSceneStrength
+                            )
+                    );
+            motionResidualNoiseScale =
+                    Math.max(
+                            1.0f,
+                            Math.min(
+                                    2.60f,
+                                    1.0f
+                                            + 1.15f * (1.0f - stackSupport)
+                                            + 0.85f * sceneShadowLift
+                            )
+                    );
+        }
+
+        /*
+         * Build 26294:
+         * Do not turn weak-stack shadow residuals into worms, colored rims,
+         * or false carpet texture.
+         * MOTION_26294_CAPTURE_WEAK_STACK_SHARPEN_RESTRAINT
+         */
+        if (basePipeline.mParameters.motionCapture
+                && basePipeline.mParameters.localContributionMeasured) {
+
+            float support =
+                    Math.max(
+                            0.0f,
+                            Math.min(
+                                    1.0f,
+                                    (
+                                        basePipeline.mParameters
+                                                .localContributionP10
+                                                - 3.0f
+                                    ) / 5.0f
+                            )
+                    );
+
+            float weakStackSharpScale =
+                    0.72f + (1.0f - 0.72f) * support;
+
+            strength *= weakStackSharpScale;
+
+            Log.d(
+                    Name,
+                    "MOTION_26294_CAPTURE_WEAK_STACK_SHARPEN_RESTRAINT"
+                            + " localP10="
+                            + basePipeline.mParameters
+                                    .localContributionP10
+                            + " scale="
+                            + weakStackSharpScale
+                            + " appliedStrength="
+                            + strength
+            );
+        }
+
+        /* MOTION_26295_CAPTURE_RESIDUAL_RESTRAINT */
+        if (basePipeline.mParameters.motionCapture) {
+            float isoResidual = com.particlesdevs.photoncamera.util.Math2.clamp(
+                    (basePipeline.mParameters.iso - 500.0f) / 2200.0f, 0.0f, 1.0f);
+            float liftResidual = com.particlesdevs.photoncamera.util.Math2.clamp(
+                    ((PostPipeline) basePipeline).motionAppliedLowerMidLift / 0.34f, 0.0f, 1.0f);
+            strength *= com.particlesdevs.photoncamera.util.Math2.mix(
+                    1.0f, 0.84f, Math.max(isoResidual, liftResidual));
+        }
         glProg.setDefine("SHARPSTR",strength);
         glProg.setDefine("SHARPSIZEKER",size);
         glProg.setDefine("INSIZE",basePipeline.workSize);
+        glProg.setDefine("NOISES",basePipeline.noiseS);
+        glProg.setDefine("NOISEO",basePipeline.noiseO);
+        glProg.setDefine(
+                "MOTIONRESIDUALNOISESCALE",
+                motionResidualNoiseScale
+        );
+        glProg.setDefine(
+                "MOTIONHALORESTRAINT",
+                com.particlesdevs.photoncamera.app.PhotonCamera
+                                .getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION
+        );
         glProg.useAssetProgram("capturesharpening");
         glProg.setTexture("InputBuffer",previousNode.WorkingTexture);
 

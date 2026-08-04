@@ -13,6 +13,8 @@ out vec3 Output;
 #define NOISEO 0.0
 #define NOISES 0.0
 #define INTENSE 1.0
+#define MOTIONHALORESTRAINT 0
+#define MOTIONRESIDUALNOISESCALE 1.0
 #import coords
 #import gaussian
 float pdfSharp(float i, float sig) {
@@ -88,7 +90,35 @@ void main() {
     sharp = dot(center.rgb,vec3(0.1,0.8,0.1)) - sharp/ksum;
     // normalize using Wiener filter
     float sw = (sharp*sharp)/(sharp*sharp + N*N + 0.0001);
-    sharp*=W*sw;
-    Output = sharp + center.rgb;
+    float sharpenDelta = sharp * W * sw;
+#if MOTIONHALORESTRAINT
+    /*
+     * Build 26289:
+     * The existing Wiener term uses the physical noise model. Expand its
+     * rejection range for weak stacks and lifted shadows before allowing
+     * either sign of sharpening residual to reach the output.
+     */
+    float centerLuma = dot(center.rgb, vec3(0.1, 0.8, 0.1));
+    float visibleNoiseAmplitude =
+            max(
+                    N * MOTIONRESIDUALNOISESCALE,
+                    0.0001
+            );
+
+    float residualGate =
+            smoothstep(
+                    visibleNoiseAmplitude * 1.35,
+                    visibleNoiseAmplitude * 3.20 + 0.000001,
+                    abs(sharpenDelta)
+            );
+
+    sharpenDelta *= residualGate;
+
+    /* Retain the successful 26288 dark-side halo restraint. */
+    float negativeAllowance =
+            mix(0.0012, 0.0042, smoothstep(0.06, 0.42, centerLuma));
+    sharpenDelta = max(sharpenDelta, -negativeAllowance);
+#endif
+    Output = sharpenDelta + center.rgb;
     Output = clamp(Output,0.0,1.0);
 }

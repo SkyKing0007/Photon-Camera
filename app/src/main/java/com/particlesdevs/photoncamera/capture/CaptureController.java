@@ -5662,17 +5662,98 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     );
 
                     /*
-                     * Build every Motion request from the same finalized builder.
-                     * Do not call IsoExpoSelector again inside this loop.
+                     * Build 26293:
+                     * Keep every configured normal Motion frame and append one
+                     * additional short RAW. The short frame remains auxiliary
+                     * and never enters motionmerge11.
+                     * MOTION_26293_EXTRA_SHORT_FRAME_NO_TEMPORAL_PENALTY
                      */
-                    for (int i = 0; i < frameCount; i++) {
-                        CaptureRequest frameRequest =
-                                captureBuilder.build();
+                    final int motionNormalFrameCount = frameCount;
+                    final boolean motionHighlightBracketEnabled =
+                            motionNormalFrameCount >= 6
+                                    && motionExposure <= 33_333_333L
+                                    && motionIso <= 3200;
+                    /* MOTION_26295_DEEPER_AUXILIARY_DIAGNOSTIC */
+                    final double motionHighlightFrameEv = 2.30;
+                    final long motionHighlightExposure =
+                            motionHighlightBracketEnabled
+                                    ? Math.max(
+                                            exposureRange != null
+                                                    ? exposureRange.getLower()
+                                                    : 1L,
+                                            Math.round(
+                                                    motionExposure
+                                                            / Math.pow(
+                                                                    2.0,
+                                                                    motionHighlightFrameEv
+                                                            )
+                                            )
+                                      )
+                                    : motionExposure;
 
+                    if (motionHighlightBracketEnabled) {
+                        times = java.util.Arrays.copyOf(
+                                times,
+                                motionNormalFrameCount + 1
+                        );
+                        frameCount = motionNormalFrameCount + 1;
+                    }
+
+                    for (int i = 0; i < motionNormalFrameCount; i++) {
+                        captureBuilder.set(
+                                CaptureRequest.SENSOR_EXPOSURE_TIME,
+                                motionExposure
+                        );
+                        captureBuilder.set(
+                                CaptureRequest.SENSOR_SENSITIVITY,
+                                motionIso
+                        );
+                        CaptureRequest frameRequest = captureBuilder.build();
                         captures.add(frameRequest);
                         times[i] = motionExposure;
                         mCaptureRequest = frameRequest;
                     }
+
+                    if (motionHighlightBracketEnabled) {
+                        captureBuilder.set(
+                                CaptureRequest.SENSOR_EXPOSURE_TIME,
+                                motionHighlightExposure
+                        );
+                        captureBuilder.set(
+                                CaptureRequest.SENSOR_SENSITIVITY,
+                                motionIso
+                        );
+                        CaptureRequest highlightRequest =
+                                captureBuilder.build();
+                        captures.add(highlightRequest);
+                        times[motionNormalFrameCount] =
+                                motionHighlightExposure;
+                        /*
+                         * Build 26294:
+                         * Do not replace the authoritative normal-stack request
+                         * with the appended short auxiliary request.
+                         * MOTION_26294_NORMAL_METADATA_REQUEST_OWNERSHIP
+                         */
+                        Log.d(
+                                MOTION_LOG_TAG,
+                                "MOTION_26293_AUXILIARY_REQUEST"
+                                        + " normalFrameCount="
+                                        + motionNormalFrameCount
+                                        + " totalFrames=" + frameCount
+                                        + " normalExposureNs="
+                                        + motionExposure
+                                        + " shortExposureNs="
+                                        + motionHighlightExposure
+                                        + " iso=" + motionIso
+                                        + " bracketEv="
+                                        + motionHighlightFrameEv
+                        );
+                    }
+
+                    captureBuilder.set(
+                            CaptureRequest.SENSOR_EXPOSURE_TIME,
+                            motionExposure
+                    );
                 } else {
                     /*
                      * Preserve the existing Photo and Night exposure sequence.
@@ -5931,8 +6012,57 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         mImageSaver.processStart(mCameraCharacteristics, result, request, cameraRotation);
                         unlimitedStarted = true;
                     }
-                    //if(frameCount == 0)
+                    /*
+                     * Build 26294:
+                     * Keep the capture result whose exposure matches the normal
+                     * processing request. The appended short result remains
+                     * timestamp-matched in the per-frame maps but cannot become
+                     * global HDRX metadata.
+                     * MOTION_26294_NORMAL_METADATA_RESULT_OWNERSHIP
+                     */
+                    boolean acceptProcessingMetadata = true;
+
+                    if (PhotonCamera.getSettings().selectedMode
+                            == CameraMode.MOTION
+                            && mCaptureRequest != null) {
+
+                        Long processingExposureNs =
+                                mCaptureRequest.get(
+                                        CaptureRequest.SENSOR_EXPOSURE_TIME
+                                );
+
+                        Long completedExposureNs =
+                                result.get(
+                                        CaptureResult.SENSOR_EXPOSURE_TIME
+                                );
+
+                        if (processingExposureNs != null
+                                && completedExposureNs != null
+                                && !processingExposureNs.equals(
+                                        completedExposureNs
+                                )) {
+                            acceptProcessingMetadata = false;
+
+                            Log.d(
+                                    MOTION_LOG_TAG,
+                                    "MOTION_26294_AUXILIARY_METADATA_ISOLATED"
+                                            + " processingExposureNs="
+                                            + processingExposureNs
+                                            + " completedExposureNs="
+                                            + completedExposureNs
+                                            + " timestamp="
+                                            + result.get(
+                                                    CaptureResult
+                                                            .SENSOR_TIMESTAMP
+                                              )
+                            );
+                        }
+                    }
+
+                    if (acceptProcessingMetadata) {
                         mCaptureResult = result;
+                    }
+
                     if (maxFrameCount[0] != -1) PhotonCamera.getGyro().CaptureGyroBurst();
                 }
 
