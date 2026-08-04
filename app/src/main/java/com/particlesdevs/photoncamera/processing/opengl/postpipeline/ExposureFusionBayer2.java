@@ -411,7 +411,23 @@ public class ExposureFusionBayer2 extends Node {
         }
 
 
-        overExposeMpy = 1.0f + (float) PhotonCamera.getSettings().compressor;
+        /*
+         * Build 26287:
+         * The active default pipeline uses ExposureFusionBayer2. The shader's
+         * COMPRESSOR define is currently inert because its only shader use is
+         * commented out. The live compressor-controlled halo path is therefore
+         * overExposeMpy = 1 + compressor below.
+         *
+         * The developer-recommended compressor value -1 makes this multiplier
+         * exactly zero. Apply that exact behavior only to Motion; all other
+         * modes keep the user's existing compressor value unchanged.
+         * MOTION_26287_PROVEN_COMPRESSOR_MINUS1_HALO_FIX
+         */
+        overExposeMpy =
+                PhotonCamera.getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION
+                        ? 0.0f
+                        : 1.0f + (float) PhotonCamera.getSettings().compressor;
         // Note: toneCurveX and toneCurveY arrays are not yet supported by Tunable system
         // They are initialized based on curvePointsCount above
         ArrayList<Float> curveX = new ArrayList<>();

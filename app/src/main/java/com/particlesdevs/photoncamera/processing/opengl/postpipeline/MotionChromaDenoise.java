@@ -101,10 +101,13 @@ public class MotionChromaDenoise extends Node {
         /* Build 26270: protect bright textured color without global saturation. */
         glProg.setDefine("BRIGHTPROTECTSTART", 0.42f);
         glProg.setDefine("BRIGHTPROTECTEND", 0.76f);
-        glProg.setDefine("CHROMAEDGELOW", 0.018f);
-        glProg.setDefine("CHROMAEDGEHIGH", 0.105f);
-        glProg.setDefine("CHROMASIMILARITYMIN", 0.028f);
-        glProg.setDefine("CHROMASIMILARITYMAX", 0.145f);
+        /* Build 26285: stricter color-edge separation for foliage/sky,
+         * saturated red objects, monitor borders and other unlike-color
+         * boundaries. Flat dark regions still receive broad cleanup. */
+        glProg.setDefine("CHROMAEDGELOW", 0.014f);
+        glProg.setDefine("CHROMAEDGEHIGH", 0.072f);
+        glProg.setDefine("CHROMASIMILARITYMIN", 0.020f);
+        glProg.setDefine("CHROMASIMILARITYMAX", 0.095f);
     }
 
     @Override
@@ -200,15 +203,21 @@ public class MotionChromaDenoise extends Node {
         float visibleNoiseBlend = Math.max(
                 highIsoBlend,
                 Math.max(lowConfidence, displayLiftBlend));
+        /*
+         * Build 26286:
+         * Increase cleanup only for visibly noisy, lifted, flat shadows. Edge
+         * protection remains controlled in the shader, so foliage, cables,
+         * text and saturated objects retain their existing color boundaries.
+         */
         float strength = Math.min(
                 0.88f,
-                maximumStrength * Math2.mix(highIsoBlend, 1.0f, 0.72f * displayLiftBlend));
-        strength *= Math2.mix(0.82f, 1.16f, visibleNoiseBlend);
+                maximumStrength * Math2.mix(highIsoBlend, 1.0f, 0.68f * displayLiftBlend));
+        strength *= Math2.mix(0.86f, 1.16f, visibleNoiseBlend);
 
         if (strength <= 0.001f) {
             Log.d(
                     Name,
-                    "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
+                    "MOTION_26286_FLAT_SHADOW_CHROMA_REPAIR"
                             + " iso=" + motionIso
                             + " enabled=false"
                             + " reason=belowIso600"
@@ -294,7 +303,7 @@ public class MotionChromaDenoise extends Node {
 
             Log.d(
                     Name,
-                    "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
+                    "MOTION_26286_FLAT_SHADOW_CHROMA_REPAIR"
                             + " iso=" + motionIso
                             + " effectiveRatio=" + measuredRatio
                             + " lowConfidence=" + lowConfidence
@@ -352,7 +361,7 @@ public class MotionChromaDenoise extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
+                "MOTION_26286_FLAT_SHADOW_CHROMA_REPAIR"
                         + " iso=" + motionIso
                         + " enabled=true"
                         + " highIsoBlend=" + highIsoBlend

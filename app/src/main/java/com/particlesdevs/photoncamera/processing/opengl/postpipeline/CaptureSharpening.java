@@ -88,11 +88,11 @@ public class CaptureSharpening extends Node {
         float visibleLiftBlend = com.particlesdevs.photoncamera.util.Math2.clamp((actualDisplayGain - 1.0f) / 2.55f + 0.50f * actualLowerMidLift, 0.0f, 1.0f);
         float displayGainSharpenScale = com.particlesdevs.photoncamera.util.Math2.mix(
                 1.0f,
-                0.30f,
+                0.16f,
                 visibleLiftBlend
                         * (
                                 1.0f
-                                        - 0.62f
+                                        - 0.48f
                                         * basePipeline.mParameters.effectiveStackRatio
                           )
         );
@@ -102,7 +102,7 @@ public class CaptureSharpening extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26217_CAPTURE_SHARP_CONFIDENCE"
+                "MOTION_26286_CAPTURE_HALO_RESTRAINT"
                         + " effectiveRatio="
                         + basePipeline.mParameters.effectiveStackRatio
                         + " measured="

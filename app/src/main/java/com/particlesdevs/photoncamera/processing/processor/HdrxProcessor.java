@@ -99,7 +99,7 @@ public class HdrxProcessor extends ProcessorBase {
             if (cameraMode == CameraMode.MOTION) {
                 Log.e(
                         TAG,
-                        "MOTION_26280_PROCESSING_COMPLETE"
+                        "MOTION_26286_HIGHLIGHT_SHADOW_CHROMA_HALO_COMPLETE"
                                 + " success=false"
                                 + " stage=HdrxProcessor.Run"
                                 + " error=" + e.getClass().getSimpleName()
@@ -1136,7 +1136,7 @@ public class HdrxProcessor extends ProcessorBase {
         if (cameraMode == CameraMode.MOTION) {
             Log.d(
                     TAG,
-                    "MOTION_26280_PROCESSING_COMPLETE"
+                    "MOTION_26286_HIGHLIGHT_SHADOW_CHROMA_HALO_COMPLETE"
                             + " success=" + imageSaved
                             + " retained="
                             + processingParameters.retainedFrameCount

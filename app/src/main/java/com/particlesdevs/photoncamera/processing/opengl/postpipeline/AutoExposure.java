@@ -478,11 +478,25 @@
                         1.0f
                 );
 
-        float indoorHdrStrength =
+        /*
+         * Build 26285:
+         * Backlit interiors must not be processed as maximum generic indoor
+         * shadow-lift scenes. Preserve enough interior recovery, but reduce the
+         * broad lift as the bright-window evidence becomes stronger.
+         */
+        float rawIndoorHdrStrength =
                 Math.max(
                         shadowRecoveryStrength,
                         histogramIndoorHdrStrength
                 );
+
+        float indoorHdrStrength =
+                rawIndoorHdrStrength
+                        * Math2.mix(
+                                1.0f,
+                                0.70f,
+                                backlitWindowStrength
+                        );
 
         /*
          * Build 26250:
@@ -520,7 +534,11 @@
          * than the approximately 2.47x seen in 26252.
          */
         float lowerMidLift =
-                0.42f
+                Math2.mix(
+                        0.34f,
+                        0.25f,
+                        backlitWindowStrength
+                )
                         * indoorHdrStrength
                         * shadowStackConfidence;
 
@@ -528,14 +546,20 @@
          * Preserve upper midtones and put the extra compression mainly into
          * the bright-window shoulder. The shader applies this progressively.
          */
+        /*
+         * Build 26286:
+         * Keep the 26285 backlit classification and color rendition, but avoid
+         * flattening the ground, low bush, car and tree trunk into one narrow
+         * highlight band. Compression begins later and remains gentler.
+         */
         float highlightCompression =
                 Math2.clamp(
-                        0.62f
+                        0.52f
                                 * highlightRecoveryStrength
-                                + 0.18f
+                                + 0.22f
                                 * backlitWindowStrength,
                         0.0f,
-                        0.76f
+                        0.70f
                 );
         ((PostPipeline)basePipeline).motionAppliedLowerMidLift = lowerMidLift;
 
@@ -576,7 +600,7 @@
 
         Log.d(
                 "AutoExposure",
-                "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
+                "MOTION_26286_HIGHLIGHT_SHAPE_PRESERVATION"
                         + " shadowStrength=" + shadowRecoveryStrength
                         + " shadowStackConfidence="
                         + shadowStackConfidence

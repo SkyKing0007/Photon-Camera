@@ -115,11 +115,11 @@ public class Sharpen2 extends Node {
         float visibleLiftBlend = com.particlesdevs.photoncamera.util.Math2.clamp((actualDisplayGain - 1.0f) / 2.55f + 0.50f * actualLowerMidLift, 0.0f, 1.0f);
         float displayGainSharpenScale = com.particlesdevs.photoncamera.util.Math2.mix(
                 1.0f,
-                0.24f,
+                0.10f,
                 visibleLiftBlend
                         * (
                                 1.0f
-                                        - 0.62f
+                                        - 0.46f
                                         * basePipeline.mParameters.effectiveStackRatio
                           )
         );
@@ -129,7 +129,7 @@ public class Sharpen2 extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26217_FINAL_SHARP_CONFIDENCE"
+                "MOTION_26286_FINAL_HALO_RESTRAINT"
                         + " effectiveRatio="
                         + basePipeline.mParameters.effectiveStackRatio
                         + " measured="

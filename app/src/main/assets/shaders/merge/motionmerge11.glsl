@@ -152,8 +152,37 @@ void main() {
     float localDifferenceCap =
             sqrt(length(variance)*1.4826 + EPS);
 
+    /*
+     * Build 26284 integrated shadow recovery.
+     *
+     * Keep the proven scalar merge architecture. Only scale the existing
+     * modeled-noise allowance in deep shadows, where high-ISO random noise was
+     * being interpreted as motion or occlusion. Bright regions and edges retain
+     * the prior thresholds. Persistent warp and occlusion confidence remain
+     * strict upper bounds, so this cannot restore unaligned alternates.
+     */
+    float shadowSignal =
+            clamp(
+                    dot(base, vec4(0.25)),
+                    0.0,
+                    1.0
+            );
+
+    float shadowNoiseRecovery =
+            mix(
+                    1.38,
+                    1.0,
+                    smoothstep(
+                            0.035,
+                            0.20,
+                            shadowSignal
+                    )
+            );
+
     float predictedNoiseCap =
-            length(noise) * motionNoiseAllowance;
+            length(noise)
+                    * motionNoiseAllowance
+                    * shadowNoiseRecovery;
 
     /*
      * Build 26221:
@@ -538,8 +567,7 @@ void main() {
                     clamp(
                             previousContribution
                                     + contributionIncrement
-                                            * preservedIndependentFraction
-                                            * nativeSrScalarConfidence,
+                                            * preservedIndependentFraction,
                             0.0,
                             1.0
                     ),
@@ -558,64 +586,6 @@ void main() {
      */
     vec4 correctedBase = base;
     vec4 correctedCandidate = diff / analogBalance + bayer;
-
-    /*
-     * Build 26281 native-resolution robust CFA accumulator.
-     *
-     * Photon already aligns every alternate into the four-channel rawHalf CFA
-     * domain. Keep the same binned output geometry, but weight each CFA plane
-     * independently so one bad or saturated channel cannot contaminate all
-     * channels in the texel.
-     *
-     * This is reference anchored: only the already-aligned candidate is used,
-     * and trustedMergeConfidence remains the geometric/occlusion upper bound.
-     */
-    vec4 nativeSrNoiseScale =
-            max(
-                    noise * 2.75 + vec4(0.004),
-                    vec4(EPS)
-            );
-
-    vec4 nativeSrNormalizedResidual =
-            abs(correctedCandidate - correctedBase)
-                    / nativeSrNoiseScale;
-
-    vec4 nativeSrRobustConfidence =
-            vec4(1.0)
-                    / (
-                            vec4(1.0)
-                                    + nativeSrNormalizedResidual
-                                            * nativeSrNormalizedResidual
-                    );
-
-    vec4 nativeSrSignalPeak =
-            max(
-                    max(correctedCandidate, correctedBase),
-                    bayer
-            );
-
-    vec4 nativeSrSaturationConfidence =
-            vec4(1.0)
-                    - smoothstep(
-                            vec4(0.94),
-                            vec4(0.995),
-                            nativeSrSignalPeak
-                    );
-
-    vec4 nativeSrChannelConfidence =
-            clamp(
-                    vec4(trustedMergeConfidence)
-                            * nativeSrRobustConfidence
-                            * nativeSrSaturationConfidence,
-                    vec4(0.0),
-                    vec4(1.0)
-            );
-
-    float nativeSrScalarConfidence =
-            dot(
-                    nativeSrChannelConfidence,
-                    vec4(0.25)
-            );
     /*
      * Build 26255:
      * Reference-detail lock for fine static structure.
@@ -629,12 +599,12 @@ void main() {
      * content from correctedBase is retained progressively as confidence
      * falls. Stable regions keep the original temporal blend.
      */
-    vec4 finalMergeWeight =
+    float finalMergeWeight =
             clamp(
-                    vec4(weight)
-                            * nativeSrChannelConfidence,
-                    vec4(0.0),
-                    vec4(1.0)
+                    weight
+                            * trustedMergeConfidence,
+                    0.0,
+                    1.0
             );
 
     vec4 temporallyMerged =

@@ -306,14 +306,24 @@ void main() {
                                 chromaDistance
                         );
 
+        /*
+         * Build 26285:
+         * Unlike-color neighbors must contribute almost nothing at strong
+         * boundaries. This prevents pale sky from entering pine needles,
+         * dark monitor borders from entering saturated objects, and red
+         * objects from acquiring black chroma rims.
+         */
+        float boundaryProtection =
+                mix(
+                        0.015,
+                        1.0,
+                        chromaSimilarityWeight
+                );
+
         float sampleWeight =
                 spatialWeight
                         * lumaGuideWeight
-                        * mix(
-                                0.08,
-                                1.0,
-                                chromaSimilarityWeight
-                          );
+                        * boundaryProtection;
 
         accumulatedChroma +=
                 sampleChroma
@@ -329,12 +339,38 @@ void main() {
                             / accumulatedWeight
                     : centerChroma;
 
+    /*
+     * Chroma cleanup is strongest only where the area is both flat and
+     * color-stable. Thin foliage, saturated red edges, cables and text retain
+     * the center chroma instead of being converted into worms or outlines.
+     */
+    /*
+     * Build 26286:
+     * Preserve the strict edge behavior from 26285, but allow visibly flat,
+     * dark regions to receive stronger low-frequency chroma cleanup.
+     */
+    float flatDarkBoost =
+            mix(
+                    1.18,
+                    1.0,
+                    smoothstep(
+                            0.10,
+                            0.34,
+                            centerLuma
+                    )
+            );
+
+    float edgeSafeCleanup =
+            chromaTextureMask
+                    * chromaTextureMask
+                    * flatDarkBoost;
+
     float requestedBlend =
             clamp(
                     CHROMASTRENGTH
                             * flatMask
                             * darkMask
-                            * chromaTextureMask
+                            * edgeSafeCleanup
                             * saturatedCenterProtection,
                     0.0,
                     1.0
@@ -346,19 +382,19 @@ void main() {
      */
     float maximumAllowedBlend =
             mix(
-                    1.0,
+                    0.97,
                     mix(
-                            0.18,
-                            0.06,
+                            0.12,
+                            0.035,
                             smoothstep(
-                                    0.42,
-                                    0.76,
+                                    0.40,
+                                    0.74,
                                     centerLuma
                             )
                     ),
                     smoothstep(
-                            0.24,
-                            0.56,
+                            0.22,
+                            0.54,
                             centerLuma
                     )
             );

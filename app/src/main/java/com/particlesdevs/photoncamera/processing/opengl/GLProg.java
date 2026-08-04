@@ -143,13 +143,26 @@ public class GLProg implements AutoCloseable {
             } else {
                 nShader = compileShader(GL_COMPUTE_SHADER, shader);
                 program = glCreateProgram();
+                if (program == 0) {
+                    throw new RuntimeException("Could not create compute program.");
+                }
                 glAttachShader(program,nShader);
                 glLinkProgram(program);
+
+                final int[] linkStatus = new int[1];
+                glGetProgramiv(program, GL_LINK_STATUS, linkStatus, 0);
+                if (linkStatus[0] == 0) {
+                    String infoLog = glGetProgramInfoLog(program);
+                    Log.e(TAG, "Compute program link failed: " + infoLog);
+                    glDeleteProgram(program);
+                    throw new RuntimeException("Compute program link failed: " + infoLog);
+                }
+                mPrograms.add(program);
             }
             currentShader = nShader;
-            glGetError();
+            throwOnGlError("before glUseProgram");
             glUseProgram(program);
-            checkEglError("glUseProgram");
+            throwOnGlError("glUseProgram");
             Defines.clear();
             changedDef = false;
             mCurrentProgramActive = program;
@@ -157,6 +170,19 @@ public class GLProg implements AutoCloseable {
         }
         mTextureBinds.clear();
         mNewTextureId = 0;
+    }
+
+    private void throwOnGlError(String stage) {
+        int error = glGetError();
+        if (error != GL_NO_ERROR) {
+            String message =
+                    "OpenGL error at "
+                            + stage
+                            + ": 0x"
+                            + Integer.toHexString(error);
+            Log.e(TAG, message);
+            throw new RuntimeException(message);
+        }
     }
 
     /**
@@ -178,9 +204,10 @@ public class GLProg implements AutoCloseable {
             glGetShaderiv(shaderHandle, GL_COMPILE_STATUS, compileStatus,0);
             // If the compilation failed, delete the shader.
             if (compileStatus[0] == 0) {
-                Log.e(TAG, "Error compiling shader: " + glGetShaderInfoLog(shaderHandle));
+                String infoLog = glGetShaderInfoLog(shaderHandle);
+                Log.e(TAG, "Shader compile failed: " + infoLog);
                 glDeleteShader(shaderHandle);
-                shaderHandle = 0;
+                throw new RuntimeException("Shader compile failed: " + infoLog);
             }
         }
         if (shaderHandle == 0) {
@@ -248,9 +275,13 @@ public class GLProg implements AutoCloseable {
         glDispatchCompute(size.x/glComputeLayout.xy.x + x,
                 size.y/glComputeLayout.xy.y + y,
                 z/glComputeLayout.z + z0);
+        throwOnGlError("glDispatchCompute(auto)");
         glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+        throwOnGlError("texture memory barrier(auto)");
         glMemoryBarrier(GL_ALL_SHADER_BITS);
+        throwOnGlError("all-shader memory barrier(auto)");
         glFinish();
+        throwOnGlError("glFinish(auto)");
     }
     public void computeManual(int x,int y, int z) {
         if(!isCompute) {
@@ -258,9 +289,13 @@ public class GLProg implements AutoCloseable {
             return;
         }
         glDispatchCompute(x, y, z);
+        throwOnGlError("glDispatchCompute(manual)");
         glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+        throwOnGlError("texture memory barrier(manual)");
         glMemoryBarrier(GL_ALL_SHADER_BITS);
+        throwOnGlError("all-shader memory barrier(manual)");
         glFinish();
+        throwOnGlError("glFinish(manual)");
     }
 
 
@@ -376,7 +411,11 @@ public class GLProg implements AutoCloseable {
         }
         glBindImageTexture(computeLayout.binding,
                 tex.mTextureID, 0, false, 0, access, tex.mFormat.getGLFormatInternal());
-        checkEglError("glBindImageTexture tex.mTextureID:"+tex.mTextureID);
+        throwOnGlError(
+                "glBindImageTexture "
+                        + var
+                        + " texture="
+                        + tex.mTextureID);
     }
 
     public void setVar(String name, int... vars) {
