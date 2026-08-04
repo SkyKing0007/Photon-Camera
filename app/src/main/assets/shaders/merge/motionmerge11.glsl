@@ -445,9 +445,18 @@ void main() {
             contributionIncrement * 0.50,
             contributionIncrement * 2.25,
             accumulatedAgreement);
-    float consensusGate = motionMergeOrdinal <= 2
-            ? 1.0
-            : mix(0.62, 1.0, consensusConfidence);
+    /*
+     * Build 26273:
+     * Early alternate frames must not bypass consensus. Contamination added
+     * at the start becomes part of the recursive base and is difficult for
+     * later confidence logic to remove.
+     */
+    float consensusGate =
+            mix(
+                    0.48,
+                    1.0,
+                    consensusConfidence
+            );
     float hardValidity = min(
             geometricConfidence,
             occlusionConfidence);
@@ -487,8 +496,7 @@ void main() {
                     clamp(
                             previousContribution
                                     + contributionIncrement
-                                            * preservedIndependentFraction
-                                            * trustedMergeConfidence,
+                                            * preservedIndependentFraction,
                             0.0,
                             1.0
                     ),

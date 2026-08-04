@@ -208,10 +208,10 @@ public final class MotionToneExifDiagnostics {
 
     public static String userComment() {
         synchronized (LOCK) {
-            return "PHOTON_MOTION_TONE_MERGE_V26271"
+            return "PHOTON_MOTION_TONE_MERGE_V26272"
                     + ";motion=" + motion
                     + ";shader=autoexposure/apply"
-                    + ";shaderMarker=BUILD_26271_BACKLIT_WINDOW_HDR_COLOR_V1"
+                    + ";shaderMarker=BUILD_26272_HDR_SHADOW_ARTIFACT_REPAIR_V1"
                     + ";iso=" + f(iso)
                     + ";effectiveFrames=" + f(effectiveFrames)
                     + ";effectiveRatio=" + f(effectiveRatio)

@@ -323,7 +323,10 @@ public class ESD3D2 extends Node {
             float appliedLuma =
                     Math2.mix(
                             configuredLuma,
-                            configuredLuma * 0.55f,
+                            Math.min(
+                                    1.10f,
+                                    configuredLuma * 1.12f
+                            ),
                             indoorHdrStrength
                     );
 
@@ -471,8 +474,9 @@ public class ESD3D2 extends Node {
                             + " directionalFloor=0.0075"
                             + " directionalActivation=0.22"
                             + " globalTextureBoost=0"
-                            + " sharpeningChanged=false"
-                            + " broadDenoiseChanged=false"
+                            + " sharpeningChanged=true"
+                            + " hdrShadowDenoisePreserved=true"
+                            + " connectedWormSuppression=true"
             );
 
             glProg.setDefine("TEXTUREPRESERVATION", texturePreservation);
@@ -504,7 +508,7 @@ public class ESD3D2 extends Node {
             kernelSize =
                     Math2.mix(
                             (float) kernelSize,
-                            (float) kernelSize * 0.62f,
+                            (float) kernelSize * 1.18f,
                             indoorHdrStrength
                     );
 

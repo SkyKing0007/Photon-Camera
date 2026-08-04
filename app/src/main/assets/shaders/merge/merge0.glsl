@@ -141,7 +141,7 @@ void main() {
      * 4. uses one shared bilinear flow for the entire RGGB-vector texel;
      * 5. rejects excessive or inconsistent vectors;
      * 6. rejects warped coordinates that leave the image;
-     * 7. falls back cleanly to the unwarped alternate sample.
+     * 7. rejects uncertain warps to zero alternate contribution.
      */
 
     vec2 gridPosition =
@@ -326,16 +326,23 @@ void main() {
                     * magnitudeConfidence
                     * validityConfidence;
 
+    /*
+     * Build 26273:
+     * Keep the verified 26260 grid mapping and subpixel sampler unchanged.
+     * A geometrically uncertain alternate must not fall back to its unwarped
+     * position because that produces a temporal double image.
+     *
+     * Only a strongly accepted warp may contribute. Otherwise reconstruct a
+     * zero alternate difference from the immutable reference Bayer sample.
+     */
     float hardWarpAcceptance =
-            smoothstep(
-                    0.50,
-                    0.75,
-                    warpConfidence
-            );
+            warpConfidence >= 0.72
+                    ? 1.0
+                    : 0.0;
 
     alignedSum =
             mix(
-                    bayerNone,
+                    bayer,
                     bayerAligned,
                     hardWarpAcceptance
             );

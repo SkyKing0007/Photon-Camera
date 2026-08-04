@@ -203,12 +203,12 @@ public class MotionChromaDenoise extends Node {
         float strength = Math.min(
                 0.88f,
                 maximumStrength * Math2.mix(highIsoBlend, 1.0f, 0.72f * displayLiftBlend));
-        strength *= Math2.mix(0.76f, 1.08f, visibleNoiseBlend);
+        strength *= Math2.mix(0.82f, 1.16f, visibleNoiseBlend);
 
         if (strength <= 0.001f) {
             Log.d(
                     Name,
-                    "MOTION_26271_CENTER_CHROMA_PRESERVATION"
+                    "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
                             + " iso=" + motionIso
                             + " enabled=false"
                             + " reason=belowIso600"
@@ -294,7 +294,7 @@ public class MotionChromaDenoise extends Node {
 
             Log.d(
                     Name,
-                    "MOTION_26271_CENTER_CHROMA_PRESERVATION"
+                    "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
                             + " iso=" + motionIso
                             + " effectiveRatio=" + measuredRatio
                             + " lowConfidence=" + lowConfidence
@@ -352,7 +352,7 @@ public class MotionChromaDenoise extends Node {
 
         Log.d(
                 Name,
-                "MOTION_26271_CENTER_CHROMA_PRESERVATION"
+                "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
                         + " iso=" + motionIso
                         + " enabled=true"
                         + " highIsoBlend=" + highIsoBlend

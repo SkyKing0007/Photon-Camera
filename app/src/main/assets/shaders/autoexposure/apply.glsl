@@ -62,292 +62,195 @@ void main() {
             );
 
     /*
-     * Build 26252:
-     * Independent tone strengths are supplied by Java. Shadow recovery is no
-     * longer disabled by a zero highlight gate, and the shoulder is driven by
-     * histogram bright-tail occupancy.
-     *
-     * Based on the earlier 26250 curve:
-     * Earlier and broader toe expansion.
-     *
-     * 26249 began too late and tapered too early, so the lower percentiles
-     * remained decisively darker than GCam. Start recovery closer to black,
-     * keep it active longer through the lower midtones, and weight the boost
-     * toward true shadow structure rather than upper-mid luminance.
-     *
-     * Highlight handling is still performed by the existing shoulder path;
-     * its strength is increased from Java by the 26250 highlightCompression
-     * change above.
-     */
-    /*
-     * Build 26253:
-     * Narrow the recovery to true shadows and early lower midtones.
-     * Mathematical black remains protected, strongest recovery is centered
-     * around approximately 0.01-0.06, and the gain approaches unity before
-     * the middle of the tonal range.
+     * Build 26272:
+     * Keep values in floating-point headroom until the final output clamp.
      */
     float blackProtection =
             smoothstep(
-                    0.0015,
-                    0.014,
+                    0.0025,
+                    0.018,
                     luma
             );
 
-    float upperMidProtection =
+    float lowerMidProtection =
             1.0
                     - smoothstep(
-                            0.22,
-                            0.46,
+                            0.34,
+                            0.62,
                             luma
                     );
 
-    float lowerMidMask =
+    float shadowMask =
             blackProtection
-                    * upperMidProtection;
+                    * lowerMidProtection;
 
     float deepShadowWeight =
             1.0
                     - smoothstep(
-                            0.022,
-                            0.11,
+                            0.028,
+                            0.15,
                             luma
                     );
 
-    float midShadowWeight =
+    float lowerMidWeight =
             smoothstep(
-                    0.04,
-                    0.14,
+                    0.07,
+                    0.20,
                     luma
             )
-            * (
-                    1.0
-                            - smoothstep(
-                                    0.16,
-                                    0.30,
-                                    luma
-                            )
-            );
+                    * (
+                            1.0
+                                    - smoothstep(
+                                            0.30,
+                                            0.52,
+                                            luma
+                                      )
+                      );
 
     float shapedGain =
             1.0
                     + lowerMidLift
-                    * lowerMidMask
+                    * shadowMask
                     * (
-                            0.55
-                                    + 1.70
+                            0.58
+                                    + 1.15
                                     * deepShadowWeight
-                                    + 0.25
-                                    * midShadowWeight
-                    );
+                                    + 0.52
+                                    * lowerMidWeight
+                      );
 
-    Output.rgb =
-            clamp(
-                    Output.rgb * shapedGain,
-                    0.0,
-                    1.0
+    vec3 liftedColor =
+            max(
+                    Output.rgb
+                            * shapedGain,
+                    vec3(0.0)
             );
 
-    luma =
+    float liftedLuma =
             dot(
-                    Output.rgb,
+                    liftedColor,
                     vec3(0.299, 0.587, 0.114)
             );
 
-    /*
-     * Build 26271:
-     * Keep upper midtones distinct, then progressively compress the true
-     * highlight shoulder. Preserve center chroma directly rather than trying
-     * to reconstruct saturation after it has already been compressed.
-     */
     float highlightMask =
             smoothstep(
-                    0.62,
+                    0.58,
                     0.94,
-                    luma
+                    liftedLuma
             );
 
     float strongHighlightMask =
             smoothstep(
-                    0.80,
-                    0.985,
-                    luma
+                    0.78,
+                    1.04,
+                    liftedLuma
             );
-
-    vec3 preHighlightColor =
-            Output.rgb;
-
-    float preHighlightLuma =
-            luma;
-
-    vec3 preHighlightChroma =
-            preHighlightColor
-                    - vec3(preHighlightLuma);
 
     float shoulderCoefficient =
             mix(
-                    0.42,
-                    0.68,
+                    0.48,
+                    0.76,
                     backlitWindowStrength
             );
 
-    vec3 compressedHighlights =
-            Output.rgb
+    vec3 compressedColor =
+            liftedColor
                     / (
                             vec3(1.0)
                                     + shoulderCoefficient
-                                    * Output.rgb
-                    );
+                                    * liftedColor
+                      );
 
     float shoulderBlend =
             clamp(
                     highlightCompression
                             * (
-                                    0.42
+                                    0.32
                                             * highlightMask
-                                            + 0.58
+                                    + 0.68
                                             * strongHighlightMask
                               ),
                     0.0,
-                    0.78
+                    0.84
             );
 
-    vec3 compressedOutput =
+    vec3 shoulderColor =
             mix(
-                    Output.rgb,
-                    compressedHighlights,
+                    liftedColor,
+                    compressedColor,
                     shoulderBlend
             );
 
-    float compressedLuma =
+    float sourceLuma =
+            liftedLuma;
+
+    vec3 sourceChroma =
+            liftedColor
+                    - vec3(sourceLuma);
+
+    float shoulderLuma =
             dot(
-                    compressedOutput,
+                    shoulderColor,
                     vec3(0.299, 0.587, 0.114)
             );
 
-    /*
-     * Direct center-chroma retention. This does not multiply saturation; it
-     * prevents the shoulder from collapsing existing non-clipped color.
-     */
-    float nonClipProtection =
-            1.0
-                    - smoothstep(
-                            0.94,
-                            0.995,
-                            max(
-                                    preHighlightColor.r,
-                                    max(
-                                            preHighlightColor.g,
-                                            preHighlightColor.b
-                                    )
-                            )
-                    );
+    float requestedChromaScale =
+            mix(
+                    shoulderLuma
+                            / max(sourceLuma, 0.0001),
+                    0.96,
+                    0.70
+                            * highlightMask
+            );
 
-    float chromaRetention =
-            clamp(
-                    (
-                            0.86
-                                    + 0.10
-                                    * backlitWindowStrength
+    vec3 requestedChroma =
+            sourceChroma
+                    * requestedChromaScale;
+
+    float positiveHeadroom =
+            min(
+                    requestedChroma.r > 0.0
+                            ? (1.0 - shoulderLuma) / max(requestedChroma.r, 0.000001)
+                            : 1.0,
+                    min(
+                            requestedChroma.g > 0.0
+                                    ? (1.0 - shoulderLuma) / max(requestedChroma.g, 0.000001)
+                                    : 1.0,
+                            requestedChroma.b > 0.0
+                                    ? (1.0 - shoulderLuma) / max(requestedChroma.b, 0.000001)
+                                    : 1.0
                     )
-                            * nonClipProtection,
-                    0.0,
-                    0.96
             );
 
-    vec3 retainedColor =
-            vec3(compressedLuma)
-                    + preHighlightChroma
-                            * mix(
-                                    compressedLuma
-                                            / max(preHighlightLuma, 0.0001),
-                                    1.0,
-                                    chromaRetention
-                              );
-
-    /*
-     * Restore a small amount of local luminance separation in the bright
-     * region. The detail signal comes from the pre-tone input and is clamped
-     * tightly to avoid halos.
-     */
-    ivec2 size =
-            textureSize(
-                    InputBuffer,
-                    0
+    float negativeHeadroom =
+            min(
+                    requestedChroma.r < 0.0
+                            ? shoulderLuma / max(-requestedChroma.r, 0.000001)
+                            : 1.0,
+                    min(
+                            requestedChroma.g < 0.0
+                                    ? shoulderLuma / max(-requestedChroma.g, 0.000001)
+                                    : 1.0,
+                            requestedChroma.b < 0.0
+                                    ? shoulderLuma / max(-requestedChroma.b, 0.000001)
+                                    : 1.0
+                    )
             );
 
-    ivec2 maxCoord =
-            size - ivec2(1);
-
-    float inputCenterLuma =
-            dot(
-                    inp.rgb,
-                    vec3(0.299, 0.587, 0.114)
-            );
-
-    float inputNeighborAverage =
-            0.25
-                    * (
-                            dot(
-                                    texelFetch(
-                                            InputBuffer,
-                                            clamp(xy + ivec2(-2, 0), ivec2(0), maxCoord),
-                                            0
-                                    ).rgb,
-                                    vec3(0.299, 0.587, 0.114)
-                            )
-                                    + dot(
-                                            texelFetch(
-                                                    InputBuffer,
-                                                    clamp(xy + ivec2(2, 0), ivec2(0), maxCoord),
-                                                    0
-                                            ).rgb,
-                                            vec3(0.299, 0.587, 0.114)
-                                      )
-                                    + dot(
-                                            texelFetch(
-                                                    InputBuffer,
-                                                    clamp(xy + ivec2(0, -2), ivec2(0), maxCoord),
-                                                    0
-                                            ).rgb,
-                                            vec3(0.299, 0.587, 0.114)
-                                      )
-                                    + dot(
-                                            texelFetch(
-                                                    InputBuffer,
-                                                    clamp(xy + ivec2(0, 2), ivec2(0), maxCoord),
-                                                    0
-                                            ).rgb,
-                                            vec3(0.299, 0.587, 0.114)
-                                      )
-                      );
-
-    float localDetail =
+    float safeChromaScale =
             clamp(
-                    inputCenterLuma
-                            - inputNeighborAverage,
-                    -0.025,
-                    0.025
-            );
-
-    float detailStrength =
-            0.32
-                    * backlitWindowStrength
-                    * highlightMask
-                    * nonClipProtection;
-
-    retainedColor +=
-            vec3(
-                    localDetail
-                            * detailStrength
+                    min(
+                            positiveHeadroom,
+                            negativeHeadroom
+                    ),
+                    0.0,
+                    1.0
             );
 
     Output.rgb =
-            mix(
-                    compressedOutput,
-                    retainedColor,
-                    0.72
-                            * nonClipProtection
-            );
+            vec3(shoulderLuma)
+                    + requestedChroma
+                            * safeChromaScale;
 
     Output.rgb =
             clamp(

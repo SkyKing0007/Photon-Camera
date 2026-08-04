@@ -520,7 +520,7 @@
          * than the approximately 2.47x seen in 26252.
          */
         float lowerMidLift =
-                0.34f
+                0.42f
                         * indoorHdrStrength
                         * shadowStackConfidence;
 
@@ -530,12 +530,12 @@
          */
         float highlightCompression =
                 Math2.clamp(
-                        0.54f
+                        0.62f
                                 * highlightRecoveryStrength
-                                + 0.22f
+                                + 0.18f
                                 * backlitWindowStrength,
                         0.0f,
-                        0.72f
+                        0.76f
                 );
         ((PostPipeline)basePipeline).motionAppliedLowerMidLift = lowerMidLift;
 
@@ -576,7 +576,7 @@
 
         Log.d(
                 "AutoExposure",
-                "MOTION_26271_BACKLIT_WINDOW_HDR_COLOR"
+                "MOTION_26272_HDR_SHADOW_ARTIFACT_REPAIR"
                         + " shadowStrength=" + shadowRecoveryStrength
                         + " shadowStackConfidence="
                         + shadowStackConfidence
@@ -599,7 +599,7 @@
                         + " lowerMidLift=" + lowerMidLift
                         + " highlightCompression="
                         + highlightCompression
-                        + " highlightColorfulnessPreservation=centerChroma"
+                        + " highlightColorfulnessPreservation=headroomSafe"
                         + " brightChromaProtection=true"
                         + " globalShadowLift=false"
                         + " nightModeAffected=false"
