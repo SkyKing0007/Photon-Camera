@@ -348,6 +348,7 @@ vec3 saturate(vec3 rgb, float sat2, float sat) {
     float b = rgb.b;
     float br = (r+g+b)/3.0;
     float dfsat = mix(sat2,sat,br*br);
+    dfsat *= 1.2; // HARDCODED saturation boost
     vec3 hsv = rgb2hsv(vec3(rgb.r,rgb.g,rgb.b));
     /*if(hsv.g < 0.5-0.0){
         hsv.g *= mix(1.0,dfsat,hsv.g/(0.5-0.0));

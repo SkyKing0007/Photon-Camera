@@ -16,9 +16,14 @@
 package com.particlesdevs.photoncamera.ui.settings.custompreferences;
 
 import android.content.Context;
+import android.content.res.ColorStateList;
 import android.content.res.TypedArray;
+import android.graphics.Color;
 import android.util.AttributeSet;
 
+import androidx.annotation.NonNull;
+import androidx.appcompat.widget.SwitchCompat;
+import androidx.preference.PreferenceViewHolder;
 import androidx.preference.SwitchPreferenceCompat;
 
 import com.particlesdevs.photoncamera.app.PhotonCamera;
@@ -44,6 +49,44 @@ public class ManagedSwitchPreference extends SwitchPreferenceCompat {
 
     public ManagedSwitchPreference(Context context, AttributeSet attrs, int defStyle) {
         super(context, attrs, defStyle);
+    }
+
+    private static ColorStateList irisThumbTint() {
+        return new ColorStateList(
+                new int[][]{
+                        new int[]{android.R.attr.state_checked},
+                        new int[]{}
+                },
+                new int[]{
+                        Color.rgb(255, 204, 0),
+                        Color.rgb(190, 190, 190)
+                }
+        );
+    }
+
+    private static ColorStateList irisTrackTint() {
+        return new ColorStateList(
+                new int[][]{
+                        new int[]{android.R.attr.state_checked},
+                        new int[]{}
+                },
+                new int[]{
+                        Color.argb(150, 255, 204, 0),
+                        Color.argb(110, 120, 120, 120)
+                }
+        );
+    }
+
+    @Override
+    public void onBindViewHolder(@NonNull PreferenceViewHolder holder) {
+        super.onBindViewHolder(holder);
+        android.view.View switchWidget =
+                holder.findViewById(androidx.preference.R.id.switchWidget);
+        if (switchWidget instanceof SwitchCompat) {
+            SwitchCompat switchCompat = (SwitchCompat) switchWidget;
+            switchCompat.setThumbTintList(irisThumbTint());
+            switchCompat.setTrackTintList(irisTrackTint());
+        }
     }
 
     @Override

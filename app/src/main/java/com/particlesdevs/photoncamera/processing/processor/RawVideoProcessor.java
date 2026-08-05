@@ -28,6 +28,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class RawVideoProcessor extends ProcessorBase {
@@ -265,10 +266,36 @@ public class RawVideoProcessor extends ProcessorBase {
 
         PhotonCamera.getGyro().stopVideoRecording();
         rawAudioRecorder.stop();
-        if (writeExecutor != null) {
-            writeExecutor.shutdown();
-            dngCreator.closeArchive();
-            writeExecutor = null;
+
+        ExecutorService executor = writeExecutor;
+        writeExecutor = null;
+
+        if (executor != null) {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    Log.e(TAG, "RAWVIDEO_WRITE_DRAIN_TIMEOUT pendingWrites="
+                            + pendingWrites.get());
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                executor.shutdownNow();
+            }
         }
+
+        if (dngCreator != null) {
+            try {
+                dngCreator.closeArchive();
+            } catch (Exception e) {
+                Log.e(TAG, "RAWVIDEO_ARCHIVE_CLOSE_FAILED "
+                        + Log.getStackTraceString(e));
+            }
+            dngCreator = null;
+        }
+
+        Log.d(TAG, "RAWVIDEO_END_COMPLETE path=" + outputFolder
+                + " frames=" + videoCounter
+                + " pendingWrites=" + pendingWrites.get());
     }
 }

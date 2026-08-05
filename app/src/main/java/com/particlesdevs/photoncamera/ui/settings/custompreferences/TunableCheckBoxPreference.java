@@ -2,11 +2,13 @@ package com.particlesdevs.photoncamera.ui.settings.custompreferences;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.util.AttributeSet;
 import android.widget.TextView;
 
 import androidx.annotation.NonNull;
+import androidx.appcompat.widget.SwitchCompat;
 import androidx.preference.PreferenceViewHolder;
 import androidx.preference.SwitchPreferenceCompat;
 
@@ -59,6 +61,37 @@ public class TunableCheckBoxPreference extends SwitchPreferenceCompat {
     @Override
     public void onBindViewHolder(@NonNull PreferenceViewHolder holder) {
         super.onBindViewHolder(holder);
+
+        android.view.View switchWidget =
+                holder.findViewById(androidx.preference.R.id.switchWidget);
+        if (switchWidget instanceof SwitchCompat) {
+            SwitchCompat switchCompat = (SwitchCompat) switchWidget;
+
+            ColorStateList thumbTint = new ColorStateList(
+                    new int[][]{
+                            new int[]{android.R.attr.state_checked},
+                            new int[]{}
+                    },
+                    new int[]{
+                            Color.rgb(255, 204, 0),
+                            Color.rgb(190, 190, 190)
+                    }
+            );
+
+            ColorStateList trackTint = new ColorStateList(
+                    new int[][]{
+                            new int[]{android.R.attr.state_checked},
+                            new int[]{}
+                    },
+                    new int[]{
+                            Color.argb(150, 255, 204, 0),
+                            Color.argb(110, 120, 120, 120)
+                    }
+            );
+
+            switchCompat.setThumbTintList(thumbTint);
+            switchCompat.setTrackTintList(trackTint);
+        }
         
         // Get reference to title view for color indication
         mTitleView = (TextView) holder.findViewById(android.R.id.title);

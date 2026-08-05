@@ -7,6 +7,7 @@ import android.hardware.camera2.CaptureResult;
 import com.particlesdevs.photoncamera.processing.processor.RawVideoProcessor;
 import com.particlesdevs.photoncamera.util.Log;
 import com.particlesdevs.photoncamera.api.ParseExif;
+import com.particlesdevs.photoncamera.api.CameraMode;
 import com.particlesdevs.photoncamera.app.PhotonCamera;
 import com.particlesdevs.photoncamera.control.GyroBurst;
 import com.particlesdevs.photoncamera.processing.processor.HdrxProcessor;
@@ -19,6 +20,7 @@ public class DefaultSaver extends SaverImplementation {
     private static final String TAG = "DefaultSaver";
     final UnlimitedProcessor mUnlimitedProcessor;
     final RawVideoProcessor mRawVideoProcessor;
+    private CameraMode activeContinuousMode = null;
     final HdrxProcessor hdrxProcessor;
 
     public DefaultSaver(ProcessingEventsListener processingEventsListener) {
@@ -107,7 +109,9 @@ public class DefaultSaver extends SaverImplementation {
         super.processStart(imageFormat, characteristics, captureResult, captureRequest, cameraRotation);
         Path dngFile = ImagePath.newDNGFilePath();
         Path jpgFile = ImagePath.newImageFilePath();
-        switch (PhotonCamera.getSettings().selectedMode) {
+        activeContinuousMode = PhotonCamera.getSettings().selectedMode;
+        Log.d(TAG, "processStart continuousMode=" + activeContinuousMode);
+        switch (activeContinuousMode) {
             case UNLIMITED:
                 mUnlimitedProcessor.configure(PhotonCamera.getSettings().rawSaver);
                 mUnlimitedProcessor.unlimitedStart(
@@ -136,7 +140,13 @@ public class DefaultSaver extends SaverImplementation {
     }
 
     public void processEnd() {
-        switch (PhotonCamera.getSettings().selectedMode){
+        CameraMode modeToEnd = activeContinuousMode;
+        Log.d(TAG, "processEnd activeContinuousMode=" + modeToEnd
+                + " selectedMode=" + PhotonCamera.getSettings().selectedMode);
+        if (modeToEnd == null) {
+            return;
+        }
+        switch (modeToEnd) {
             case UNLIMITED:
                 mUnlimitedProcessor.unlimitedEnd();
                 break;
