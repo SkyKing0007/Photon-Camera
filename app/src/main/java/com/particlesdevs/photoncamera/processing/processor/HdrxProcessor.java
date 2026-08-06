@@ -107,6 +107,10 @@ public class HdrxProcessor extends ProcessorBase {
                     e.getClass().getSimpleName()
                             + ": " + String.valueOf(e.getMessage()));
         }
+        finally {
+            // IRIS_26338_MOTION_METRICS_FINALLY
+            MotionMetrics.end();
+        }
     }
 
     private void ApplyHdrX() {

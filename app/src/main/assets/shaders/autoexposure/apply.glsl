@@ -4,6 +4,10 @@ uniform sampler2D InputBuffer;
 uniform float mpy;
 uniform float whiteMax;
 uniform float applyGammaMix;
+uniform float irisHdrIndoorBacklitStrength;
+uniform float irisHdrOutdoorBroadStrength;
+uniform float irisHdrHighlightCompression;
+uniform float irisHdrLowerMidLift;
 out vec4 Output;
 vec3 reinhard_extended(vec3 v, float max_white){
     vec3 numerator = v * (vec3(1.0f) + (v / vec3(max_white * max_white)));
@@ -50,4 +54,167 @@ void main() {
     //Output.rgb = reinhard_extended(inp.rgb * mpy, mpy);
     Output.rgb = tonemap(mix(inp.rgb,sqrt(inp.rgb), applyGammaMix), mpy);
     Output.rgb = mix(Output.rgb,Output.rgb * Output.rgb, applyGammaMix);
+    /*
+     * Iris 26335: progressive highlight shoulder followed by selective
+     * lower-midtone lift. The operations are performed in luminance and then
+     * recombined with bounded chroma to reduce colored highlight halos.
+     *
+     * IRIS_26335_PROGRESSIVE_HDR_TONE
+     */
+    float irisHdrLuma =
+            dot(Output.rgb, vec3(0.299, 0.587, 0.114));
+
+    float irisHdrShoulderStart =
+            mix(
+                    0.72,
+                    0.64,
+                    irisHdrIndoorBacklitStrength
+            );
+
+    float irisHdrHighlightMask =
+            smoothstep(
+                    irisHdrShoulderStart,
+                    0.98,
+                    irisHdrLuma
+            );
+
+    float irisHdrStrongHighlightMask =
+            smoothstep(
+                    0.84,
+                    1.04,
+                    irisHdrLuma
+            );
+
+    float irisHdrShoulderCoefficient =
+            mix(
+                    1.55,
+                    2.65,
+                    max(
+                            irisHdrIndoorBacklitStrength,
+                            irisHdrOutdoorBroadStrength
+                    )
+            );
+
+    float irisHdrHighlightExcess =
+            max(
+                    irisHdrLuma - irisHdrShoulderStart,
+                    0.0
+            );
+
+    float irisHdrCompressedLuma =
+            irisHdrShoulderStart
+                    + irisHdrHighlightExcess
+                            / (
+                                    1.0
+                                            + irisHdrShoulderCoefficient
+                                                    * irisHdrHighlightExcess
+                              );
+
+    float irisHdrShoulderBlend =
+            clamp(
+                    irisHdrHighlightCompression
+                            * (
+                                    0.18 * irisHdrHighlightMask
+                                            + 0.82
+                                                    * irisHdrStrongHighlightMask
+                              ),
+                    0.0,
+                    0.90
+            );
+
+    float irisHdrToneLuma =
+            mix(
+                    irisHdrLuma,
+                    irisHdrCompressedLuma,
+                    irisHdrShoulderBlend
+            );
+
+    float irisHdrBlackProtection =
+            smoothstep(
+                    0.035,
+                    0.13,
+                    irisHdrToneLuma
+            );
+
+    float irisHdrUpperMidProtection =
+            1.0
+                    - smoothstep(
+                            0.46,
+                            0.76,
+                            irisHdrToneLuma
+                      );
+
+    float irisHdrLowerMidMask =
+            irisHdrBlackProtection
+                    * irisHdrUpperMidProtection;
+
+    float irisHdrLiftAmount =
+            irisHdrLowerMidLift
+                    * irisHdrLowerMidMask
+                    * (1.0 - irisHdrToneLuma);
+
+    float irisHdrOutputLuma =
+            clamp(
+                    irisHdrToneLuma + irisHdrLiftAmount,
+                    0.0,
+                    1.0
+            );
+
+    vec3 irisHdrChroma =
+            Output.rgb - vec3(irisHdrLuma);
+
+    float irisHdrPositiveHeadroom =
+            min(
+                    irisHdrChroma.r > 0.0
+                            ? (1.0 - irisHdrOutputLuma)
+                                    / max(irisHdrChroma.r, 0.000001)
+                            : 1.0,
+                    min(
+                            irisHdrChroma.g > 0.0
+                                    ? (1.0 - irisHdrOutputLuma)
+                                            / max(irisHdrChroma.g, 0.000001)
+                                    : 1.0,
+                            irisHdrChroma.b > 0.0
+                                    ? (1.0 - irisHdrOutputLuma)
+                                            / max(irisHdrChroma.b, 0.000001)
+                                    : 1.0
+                    )
+            );
+
+    float irisHdrNegativeHeadroom =
+            min(
+                    irisHdrChroma.r < 0.0
+                            ? irisHdrOutputLuma
+                                    / max(-irisHdrChroma.r, 0.000001)
+                            : 1.0,
+                    min(
+                            irisHdrChroma.g < 0.0
+                                    ? irisHdrOutputLuma
+                                            / max(-irisHdrChroma.g, 0.000001)
+                                    : 1.0,
+                            irisHdrChroma.b < 0.0
+                                    ? irisHdrOutputLuma
+                                            / max(-irisHdrChroma.b, 0.000001)
+                                    : 1.0
+                    )
+            );
+
+    float irisHdrSafeChromaScale =
+            clamp(
+                    min(
+                            irisHdrPositiveHeadroom,
+                            irisHdrNegativeHeadroom
+                    ),
+                    0.0,
+                    1.0
+            );
+
+    Output.rgb =
+            clamp(
+                    vec3(irisHdrOutputLuma)
+                            + irisHdrChroma
+                                    * irisHdrSafeChromaScale,
+                    0.0,
+                    1.0
+            );
 }

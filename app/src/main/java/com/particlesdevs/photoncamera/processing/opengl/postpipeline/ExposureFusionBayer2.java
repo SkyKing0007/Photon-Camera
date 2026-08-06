@@ -97,8 +97,74 @@ public class ExposureFusionBayer2 extends Node {
         }
         var gain =  Math.max(128/(avr/w + 1),1.f);
         Log.d(Name,"Overexp pos:"+avr/w);
-        float gainNoiseMax = Math.max((float) (noiseMax / Math.sqrt(basePipeline.noiseS * 0.5 + basePipeline.noiseO)), 1.0f);
-        if(gain > gainNoiseMax) {
+        float gainNoiseMax = Math.max(
+                (float) (
+                        noiseMax / Math.sqrt(basePipeline.noiseS * 0.5 + basePipeline.noiseO)
+                ),
+                1.0f
+        );
+
+        boolean iris26340Motion =
+                com.particlesdevs.photoncamera.app.PhotonCamera
+                        .getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+
+        float iris26340Iso = Math.max(1.0f, basePipeline.mParameters.iso);
+        float iris26340IsoRisk =
+                com.particlesdevs.photoncamera.util.Math2.smoothstep(
+                        800.0f,
+                        6400.0f,
+                        iris26340Iso
+                );
+
+        float iris26340EffectiveRatio =
+                com.particlesdevs.photoncamera.processing.MotionMetrics.isActive()
+                        ? com.particlesdevs.photoncamera.processing.MotionMetrics.effectiveStackRatio()
+                        : 1.0f;
+        iris26340EffectiveRatio =
+                com.particlesdevs.photoncamera.util.Math2.clamp(
+                        iris26340EffectiveRatio,
+                        0.20f,
+                        1.0f
+                );
+
+        float iris26340EmergencyGainMax =
+                com.particlesdevs.photoncamera.util.Math2.clamp(
+                        2.10f
+                                + 1.20f * iris26340EffectiveRatio
+                                - 0.60f * iris26340IsoRisk,
+                        1.60f,
+                        3.30f
+                );
+
+        if (iris26340Motion) {
+            if (gain > iris26340EmergencyGainMax) {
+                Log.d(
+                        Name,
+                        "IRIS_26340_MOTION_NOISE_TONE_DECOUPLING"
+                                + " stage=ExposureFusionBayer2"
+                                + " requested=" + gain
+                                + " oldAdaptiveLimit=" + gainNoiseMax
+                                + " emergencyLimit=" + iris26340EmergencyGainMax
+                                + " iso=" + iris26340Iso
+                                + " effectiveRatio=" + iris26340EffectiveRatio
+                                + " action=emergencyClamp"
+                );
+                gain = iris26340EmergencyGainMax;
+            } else {
+                Log.d(
+                        Name,
+                        "IRIS_26340_MOTION_NOISE_TONE_DECOUPLING"
+                                + " stage=ExposureFusionBayer2"
+                                + " requested=" + gain
+                                + " oldAdaptiveLimit=" + gainNoiseMax
+                                + " emergencyLimit=" + iris26340EmergencyGainMax
+                                + " iso=" + iris26340Iso
+                                + " effectiveRatio=" + iris26340EffectiveRatio
+                                + " action=adaptiveBrightnessClampBypassed"
+                );
+            }
+        } else if(gain > gainNoiseMax) {
             Log.d(Name, "Clamping gain by noise from " + gain + " to " + gainNoiseMax);
             gain = gainNoiseMax;
         }
