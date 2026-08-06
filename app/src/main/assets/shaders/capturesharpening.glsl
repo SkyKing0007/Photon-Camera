@@ -12,6 +12,7 @@ out vec3 Output;
 #define SHARPSIZE 5
 #define SHARPSIZEKER 3.0
 #define SHARPSTR 1.0
+#define MOTION_SHADOW_PROTECT 0.0
 #define INSIZE 0,0
 #import gaussian
 void main() {
@@ -32,6 +33,11 @@ void main() {
     }
     mask/=pdfsize;
     mask = cur-mask;
+
+    /* IRIS_26347_SHADOW_SHARPEN_SAFETY */
+    float iris26347Luma = dot(cur, vec3(0.299, 0.587, 0.114));
+    float iris26347Shadow = 1.0 - smoothstep(0.035, 0.22, iris26347Luma);
+    mask *= 1.0 - 0.78 * iris26347Shadow * float(MOTION_SHADOW_PROTECT);
 
     cur+=(mask.r+mask.g+mask.b)*(float(SHARPSTR)/3.0);
     Output = clamp(cur,0.0,1.0);

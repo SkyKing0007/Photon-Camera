@@ -226,6 +226,13 @@ public class HdrxProcessor extends ProcessorBase {
                 }
             }
             Log.d(TAG, "Size after removal:" + images.size());
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "FRAME_RETENTION",
+                    "inputFrames=" + mImageFramesToProcess.size()
+                            + " retainedFrames=" + images.size()
+                            + " targetFraction=0.75"
+                            + " averageShakiness=" + unluckyavr
+                            + " pickiness=" + unluckypickiness);
         }
 
         float minMpy = 1000.f;

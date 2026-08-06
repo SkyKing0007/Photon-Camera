@@ -79,6 +79,13 @@ public class ExposureFusionBayer2 extends Node {
         vectored.close();
     }
 
+    @Tunable(
+            title = "Motion ExposureFusion Gain Max",
+            category = "Motion HDR Brightness",
+            description = "Maximum global ExposureFusion gain in Motion. Lower values reduce shadow-noise and chroma-blotch amplification.",
+            min = 1.0f, max = 3.30f, step = 0.05f, defaultValue = 1.30f)
+    float iris26349MotionExposureFusionGainMax = 1.30f;
+
     float autoExposureHigh(){
         float avr = 0.f;
         float w = 0.01f;
@@ -128,42 +135,21 @@ public class ExposureFusionBayer2 extends Node {
                         1.0f
                 );
 
-        float iris26340EmergencyGainMax =
-                com.particlesdevs.photoncamera.util.Math2.clamp(
-                        2.10f
-                                + 1.20f * iris26340EffectiveRatio
-                                - 0.60f * iris26340IsoRisk,
-                        1.60f,
-                        3.30f
-                );
+        float iris26349RequestedGain = gain;
+        float iris26349MotionGainMax = com.particlesdevs.photoncamera.util.Math2.clamp(
+                iris26349MotionExposureFusionGainMax, 1.0f, 3.30f);
 
         if (iris26340Motion) {
-            if (gain > iris26340EmergencyGainMax) {
-                Log.d(
-                        Name,
-                        "IRIS_26340_MOTION_NOISE_TONE_DECOUPLING"
-                                + " stage=ExposureFusionBayer2"
-                                + " requested=" + gain
-                                + " oldAdaptiveLimit=" + gainNoiseMax
-                                + " emergencyLimit=" + iris26340EmergencyGainMax
-                                + " iso=" + iris26340Iso
-                                + " effectiveRatio=" + iris26340EffectiveRatio
-                                + " action=emergencyClamp"
-                );
-                gain = iris26340EmergencyGainMax;
-            } else {
-                Log.d(
-                        Name,
-                        "IRIS_26340_MOTION_NOISE_TONE_DECOUPLING"
-                                + " stage=ExposureFusionBayer2"
-                                + " requested=" + gain
-                                + " oldAdaptiveLimit=" + gainNoiseMax
-                                + " emergencyLimit=" + iris26340EmergencyGainMax
-                                + " iso=" + iris26340Iso
-                                + " effectiveRatio=" + iris26340EffectiveRatio
-                                + " action=adaptiveBrightnessClampBypassed"
-                );
-            }
+            gain = Math.min(gain, iris26349MotionGainMax);
+            String details = "requested=" + iris26349RequestedGain
+                    + " configuredMax=" + iris26349MotionGainMax
+                    + " applied=" + gain
+                    + " clamped=" + (gain < iris26349RequestedGain)
+                    + " oldNoiseLimit=" + gainNoiseMax
+                    + " iso=" + iris26340Iso
+                    + " effectiveRatio=" + iris26340EffectiveRatio;
+            Log.d(Name, "IRIS_26349_INTEGRATED_MOTION_QUALITY stage=ExposureFusionBayer2 " + details);
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState("EXPOSURE_FUSION", details);
         } else if(gain > gainNoiseMax) {
             Log.d(Name, "Clamping gain by noise from " + gain + " to " + gainNoiseMax);
             gain = gainNoiseMax;

@@ -8,6 +8,7 @@ uniform float irisHdrIndoorBacklitStrength;
 uniform float irisHdrOutdoorBroadStrength;
 uniform float irisHdrHighlightCompression;
 uniform float irisHdrLowerMidLift;
+uniform float irisHdrShadowChromaProtection;
 out vec4 Output;
 vec3 reinhard_extended(vec3 v, float max_white){
     vec3 numerator = v * (vec3(1.0f) + (v / vec3(max_white * max_white)));
@@ -208,6 +209,16 @@ void main() {
                     0.0,
                     1.0
             );
+
+    /* IRIS_26347_HDR_SHADOW_CHROMA_SAFETY
+     * Preserve lifted luminance; fade only unreliable chroma close to black.
+     */
+    float iris26347NearBlack = 1.0 - smoothstep(0.035, 0.28, irisHdrOutputLuma);
+    float iris26347ChromaRetention = mix(
+            1.0,
+            0.18,
+            clamp(iris26347NearBlack * irisHdrShadowChromaProtection, 0.0, 1.0));
+    irisHdrSafeChromaScale *= iris26347ChromaRetention;
 
     Output.rgb =
             clamp(

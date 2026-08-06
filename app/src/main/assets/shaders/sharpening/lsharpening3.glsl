@@ -13,6 +13,7 @@ out vec3 Output;
 #define NOISEO 0.0
 #define NOISES 0.0
 #define INTENSE 1.0
+#define MOTION_SHADOW_PROTECT 0.0
 #import coords
 #import gaussian
 float pdfSharp(float i, float sig) {
@@ -89,6 +90,15 @@ void main() {
     // normalize using Wiener filter
     float sw = (sharp*sharp)/(sharp*sharp + N*N + 0.0001);
     sharp*=W*sw;
+
+    /* IRIS_26347_SHADOW_SHARPEN_SAFETY
+     * Preserve midtone and highlight detail while reducing only unreliable
+     * near-black sharpening in high-risk Motion captures.
+     */
+    float iris26347Luma = dot(center, vec3(0.299, 0.587, 0.114));
+    float iris26347Shadow = 1.0 - smoothstep(0.035, 0.22, iris26347Luma);
+    sharp *= 1.0 - 0.78 * iris26347Shadow * float(MOTION_SHADOW_PROTECT);
+
     Output = sharp + center.rgb;
     Output = clamp(Output,0.0,1.0);
 }

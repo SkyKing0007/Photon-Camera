@@ -285,6 +285,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private int mMotionActualCandidateIso = 0;
     private int mMotionActualCandidateFrames = 0;
     private static final int MOTION_ACTUAL_GENERATION_CONFIRM_FRAMES = 6;
+    private int mMotionAeProbeFrames = 0;
 private long mMotionUnifiedLastUpdateMs = 0L;
     private static final long MOTION_UNIFIED_UPDATE_MIN_MS = 450L;
 
@@ -298,9 +299,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
     private int mMotionCandidateZone = 0;
     private int mMotionCandidateFrames = 0;
     private int mMotionActiveZone = 0;
-    private static final int MOTION_AE_WARMUP_FRAMES = 24;
-    private static final int MOTION_ZONE_CONFIRM_FRAMES = 30;
-    private static final int MOTION_MANUAL_RESAMPLE_FRAMES = 240;
+    // IRIS_26345_FAST_BOUNDED_METERING
+    private static final int MOTION_AE_WARMUP_FRAMES = 6;
+    private static final int MOTION_ZONE_CONFIRM_FRAMES = 4;
+    private static final int MOTION_MANUAL_RESAMPLE_FRAMES = 45;
+    private static final int MOTION_AE_PROBE_MAX_FRAMES = 24;
     private static final long MOTION_ZONE_30_ENERGY = 12_000_000_000L;
     private static final long MOTION_ZONE_20_ENERGY = 22_000_000_000L;
     private static final long MOTION_ZONE_15_ENERGY = 36_000_000_000L;
@@ -358,10 +361,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                     img.close();
                     return;
                 }
-                if (mMotionAeProbeActive) {
-                    img.close();
-                    return;
-                }
+                // Keep buffering during AE probe. Eligibility is decided from
+                // actual exposure/ISO groups at shutter time.
                 // Metadata can arrive after the Image callback. Buffer first;
                 // validate timestamp/exposure when shutter is pressed.
                 synchronized (mZslBufferLock) {
@@ -1186,35 +1187,28 @@ private long mMotionUnifiedLastUpdateMs = 0L;
     }
 
     private void restoreMotionPreviewAe() {
-        try {
-            setAEMode(mPreviewRequestBuilder, PreferenceKeys.getAeMode());
-            mPreviewRequestBuilder.set(
-                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                    getSelectedFpsRange());
-            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null);
-            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, null);
-            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, null);
-
-            mMotionAeProbeActive = true;
-            mMotionManualLadderActive = false;
-            mMotionManualFrames = 0;
-            mMotionAeWarmupFrames = 0;
-            mMotionCandidateZone = 0;
-            mMotionCandidateFrames = 0;
-            mMotionActualCandidateExposureNs = 0L;
-            mMotionActualCandidateIso = 0;
-            mMotionActualCandidateFrames = 0;
-            mMotionLastLadderDecision = "";
-            rebuildPreviewBuilder();
-            Log.i(TAG, "MOTION_AE_PROBE_STARTED"
-                    + " generation=" + mMotionUnifiedGeneration
-                    + " previousZone=" + mMotionActiveZone
-                    + " ringPreserved=true");
-        } catch (IllegalArgumentException | IllegalStateException e) {
-            mMotionAeProbeActive = false;
-            Log.e(TAG, "Motion AE probe failed: "
-                    + Log.getStackTraceString(e));
-        }
+        /*
+         * IRIS_26346_CONTINUOUS_AE_GROUPS
+         *
+         * Motion preview now remains under one continuous AE request. The old
+         * implementation switched the repeating request from manual exposure
+         * back to AE, rebuilt it, then switched back to manual. That request
+         * oscillation was the source of the visible preview flash.
+         *
+         * Keep this private helper as a state reset for compatibility, but do
+         * not mutate or resubmit the preview request here.
+         */
+        mMotionAeProbeActive = false;
+        mMotionManualLadderActive = false;
+        mMotionManualFrames = 0;
+        mMotionAeWarmupFrames = 0;
+        mMotionAeProbeFrames = 0;
+        mMotionCandidateZone = 0;
+        mMotionCandidateFrames = 0;
+        mMotionActualCandidateExposureNs = 0L;
+        mMotionActualCandidateIso = 0;
+        mMotionActualCandidateFrames = 0;
+        mMotionLastLadderDecision = "";
     }
     private int chooseMotionBrightnessZone(
             long exposureEnergy,
@@ -1299,9 +1293,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         if (!isZslMode()
                 || mZslCapturing
                 || burst
-                || isProcessing
-                || mPreviewRequestBuilder == null
-                || mCaptureSession == null) {
+                || isProcessing) {
             return;
         }
 
@@ -1309,47 +1301,52 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
         Integer actualIso =
                 result.get(CaptureResult.SENSOR_SENSITIVITY);
-        if (actualExposure == null || actualIso == null) return;
+        if (actualExposure == null || actualIso == null
+                || actualExposure <= 0L || actualIso <= 0) {
+            return;
+        }
 
-        if (mMotionManualLadderActive) {
-            if (motionExposureMatches(result)) {
-                mMotionUnifiedSettledFrames++;
-                mMotionActualCandidateExposureNs = 0L;
-                mMotionActualCandidateIso = 0;
-                mMotionActualCandidateFrames = 0;
-            } else {
-                mMotionUnifiedSettledFrames = 0;
+        /*
+         * Continuous AE observer only. This callback records actual exposure
+         * groups and never changes or resubmits the preview request.
+         */
+        mMotionAeProbeActive = false;
+        mMotionManualLadderActive = false;
+        mMotionManualFrames = 0;
 
-                boolean sameActualCandidate = false;
-                if (mMotionActualCandidateExposureNs > 0L
-                        && mMotionActualCandidateIso > 0) {
-                    long candidateExposureTolerance = Math.max(
-                            750_000L,
-                            mMotionActualCandidateExposureNs / 12L);
-                    int candidateIsoTolerance = Math.max(
-                            2,
-                            mMotionActualCandidateIso / 10);
-                    sameActualCandidate =
-                            Math.abs(actualExposure
-                                    - mMotionActualCandidateExposureNs)
-                                    <= candidateExposureTolerance
-                            && Math.abs(actualIso
-                                    - mMotionActualCandidateIso)
-                                    <= candidateIsoTolerance;
-                }
+        boolean sameCandidate = false;
+        if (mMotionActualCandidateExposureNs > 0L
+                && mMotionActualCandidateIso > 0) {
+            long exposureTolerance = Math.max(
+                    750_000L,
+                    mMotionActualCandidateExposureNs / 12L);
+            int isoTolerance = Math.max(
+                    2,
+                    mMotionActualCandidateIso / 10);
 
-                if (sameActualCandidate) {
-                    mMotionActualCandidateFrames++;
-                } else {
-                    mMotionActualCandidateExposureNs = actualExposure;
-                    mMotionActualCandidateIso = actualIso;
-                    mMotionActualCandidateFrames = 1;
-                }
+            sameCandidate =
+                    Math.abs(actualExposure
+                            - mMotionActualCandidateExposureNs)
+                            <= exposureTolerance
+                    && Math.abs(actualIso
+                            - mMotionActualCandidateIso)
+                            <= isoTolerance;
+        }
 
-                if (mMotionActualCandidateFrames
-                        >= MOTION_ACTUAL_GENERATION_CONFIRM_FRAMES) {
-                    boolean actualGenerationChanged =
-                            Math.abs(actualExposure
+        if (sameCandidate) {
+            mMotionActualCandidateFrames++;
+        } else {
+            mMotionActualCandidateExposureNs = actualExposure;
+            mMotionActualCandidateIso = actualIso;
+            mMotionActualCandidateFrames = 1;
+        }
+
+        if (mMotionActualCandidateFrames
+                >= MOTION_ACTUAL_GENERATION_CONFIRM_FRAMES) {
+            boolean groupChanged =
+                    mMotionUnifiedExposureNs <= 0L
+                            || mMotionUnifiedIso <= 0
+                            || Math.abs(actualExposure
                                     - mMotionUnifiedExposureNs)
                                     > Math.max(
                                             750_000L,
@@ -1358,238 +1355,20 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                                     - mMotionUnifiedIso)
                                     > Math.max(2, actualIso / 10);
 
-                    if (actualGenerationChanged) {
-                        long requestedExposure =
-                                mMotionUnifiedExposureNs;
-                        int requestedIso = mMotionUnifiedIso;
+            mMotionUnifiedExposureNs = actualExposure;
+            mMotionUnifiedIso = actualIso;
+            mMotionUnifiedSettledFrames =
+                    mMotionActualCandidateFrames;
 
-                        mMotionUnifiedExposureNs = actualExposure;
-                        mMotionUnifiedIso = actualIso;
-                        mMotionUnifiedSettledFrames = 1;
-                        mMotionUnifiedGeneration++;
-                        clearMotionUnifiedBuffer();
-
-                        Log.w(TAG, "MOTION_ACTUAL_GENERATION_ADOPTED"
-                                + " generation="
-                                + mMotionUnifiedGeneration
-                                + " requestedExposureNs="
-                                + requestedExposure
-                                + " requestedIso=" + requestedIso
-                                + " actualExposureNs="
-                                + actualExposure
-                                + " actualIso=" + actualIso
-                                + " confirmedFrames="
-                                + mMotionActualCandidateFrames);
-                    } else {
-                        mMotionUnifiedSettledFrames++;
-                    }
-
-                    mMotionActualCandidateExposureNs = 0L;
-                    mMotionActualCandidateIso = 0;
-                    mMotionActualCandidateFrames = 0;
-                }
+            if (groupChanged) {
+                Log.i(TAG, "MOTION_CONTINUOUS_AE_GROUP"
+                        + " exposureNs=" + actualExposure
+                        + " iso=" + actualIso
+                        + " stableFrames="
+                        + mMotionActualCandidateFrames
+                        + " ringCleared=false"
+                        + " previewRebuilt=false");
             }
-
-            mMotionManualFrames++;
-            if (mMotionManualFrames >= MOTION_MANUAL_RESAMPLE_FRAMES) {
-                restoreMotionPreviewAe();
-            }
-            return;
-        }
-        mMotionAeWarmupFrames++;
-        if (mMotionAeWarmupFrames < MOTION_AE_WARMUP_FRAMES) return;
-
-        long exposureEnergy;
-        try {
-            exposureEnergy = Math.multiplyExact(
-                    actualExposure,
-                    (long) actualIso);
-        } catch (ArithmeticException overflow) {
-            exposureEnergy = Long.MAX_VALUE;
-        }
-
-        int gyroShakiness = PhotonCamera.getGyro() == null
-                ? 0
-                : Math.max(
-                        0,
-                        PhotonCamera.getGyro().getFilteredShakiness());
-
-        int brightnessZone = chooseMotionBrightnessZone(
-                exposureEnergy,
-                actualIso);
-        int motionLimitZone = chooseMotionGyroLimitZone(
-                gyroShakiness);
-        int desiredZone = Math.min(
-                brightnessZone,
-                motionLimitZone);
-
-        if (desiredZone == 0) {
-            String reason = brightnessZone == 0
-                    ? "sceneNotDarkEnough"
-                    : "gyroLimit";
-            logMotionLadderDecision(
-                    brightnessZone,
-                    motionLimitZone,
-                    desiredZone,
-                    exposureEnergy,
-                    actualExposure,
-                    actualIso,
-                    gyroShakiness,
-                    reason);
-            mMotionCandidateZone = 0;
-            mMotionCandidateFrames = 0;
-            return;
-        }
-
-        if (desiredZone == mMotionCandidateZone) {
-            mMotionCandidateFrames++;
-        } else {
-            mMotionCandidateZone = desiredZone;
-            mMotionCandidateFrames = 1;
-            logMotionLadderDecision(
-                    brightnessZone,
-                    motionLimitZone,
-                    desiredZone,
-                    exposureEnergy,
-                    actualExposure,
-                    actualIso,
-                    gyroShakiness,
-                    "candidateChanged");
-        }
-
-        if (mMotionCandidateFrames < MOTION_ZONE_CONFIRM_FRAMES) {
-            return;
-        }
-
-        long now = android.os.SystemClock.elapsedRealtime();
-        if (now - mMotionUnifiedLastUpdateMs
-                < MOTION_UNIFIED_UPDATE_MIN_MS) return;
-
-        Integer antibandingMode =
-                result.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE);
-
-        long desiredExposure = exposureForMotionZone(
-                desiredZone,
-                antibandingMode);
-
-        desiredExposure = Math.max(
-                com.particlesdevs.photoncamera.processing.parameters
-                        .IsoExpoSelector.getEXPLOW(),
-                Math.min(
-                        com.particlesdevs.photoncamera.processing.parameters
-                                .IsoExpoSelector.getEXPHIGH(),
-                        desiredExposure));
-
-        int desiredIso = (int) Math.round(
-                ((double) exposureEnergy / Math.max(1L, desiredExposure))
-                        * (desiredZone == 1 ? 0.72
-                        : desiredZone == 2 ? 0.68 : 0.85));
-
-        desiredIso = Math.max(
-                com.particlesdevs.photoncamera.processing.parameters
-                        .IsoExpoSelector.getISOLOW(),
-                Math.min(
-                        com.particlesdevs.photoncamera.processing.parameters
-                                .IsoExpoSelector.getISOHIGH(),
-                        desiredIso));
-
-        int maximumUsefulIso =
-                Math.max(
-                        com.particlesdevs.photoncamera.processing.parameters
-                                .IsoExpoSelector.getISOLOW(),
-                        (int) Math.floor(actualIso
-                                * (desiredZone == 1 ? 1.65
-                                : desiredZone == 2 ? 1.40 : 1.20)));
-
-        if (desiredIso > maximumUsefulIso) {
-            mMotionCandidateZone = 0;
-            mMotionCandidateFrames = 0;
-            Log.i(TAG, "MOTION_ZONE_REJECTED"
-                    + " reason=insufficientIsoBenefit"
-                    + " brightnessZone=" + brightnessZone
-                    + " motionLimitZone=" + motionLimitZone
-                    + " state=" + (desiredZone == 1 ? "MOTION_60" : desiredZone == 2 ? "MOTION_30" : "MOTION_15")
-                    + " aeExposureNs=" + actualExposure
-                    + " aeIso=" + actualIso
-                    + " desiredExposureNs=" + desiredExposure
-                    + " desiredIso=" + desiredIso
-                    + " maximumUsefulIso=" + maximumUsefulIso
-                    + " gyroShakiness=" + gyroShakiness);
-            return;
-        }
-
-        Range<Integer> fpsRange =
-                chooseMotionUnifiedFpsRange(desiredExposure);
-
-        long frameDuration = Math.max(
-                desiredExposure,
-                1_000_000_000L
-                        / Math.max(1, fpsRange.getUpper()));
-
-        try {
-            mPreviewRequestBuilder.set(
-                    CaptureRequest.CONTROL_AE_MODE,
-                    CaptureRequest.CONTROL_AE_MODE_OFF);
-            mPreviewRequestBuilder.set(
-                    CaptureRequest.FLASH_MODE,
-                    CaptureRequest.FLASH_MODE_OFF);
-            mPreviewRequestBuilder.set(
-                    CaptureRequest.SENSOR_EXPOSURE_TIME,
-                    desiredExposure);
-            mPreviewRequestBuilder.set(
-                    CaptureRequest.SENSOR_SENSITIVITY,
-                    desiredIso);
-            mPreviewRequestBuilder.set(
-                    CaptureRequest.SENSOR_FRAME_DURATION,
-                    frameDuration);
-            mPreviewRequestBuilder.set(
-                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                    fpsRange);
-
-            boolean committedStateChanged =
-                    desiredZone != mMotionActiveZone
-                            || Math.abs(desiredExposure - mMotionUnifiedExposureNs)
-                            > Math.max(750_000L, desiredExposure / 12L)
-                            || Math.abs(desiredIso - mMotionUnifiedIso)
-                            > Math.max(2, desiredIso / 10);
-
-            mMotionAeProbeActive = false;
-            mMotionManualLadderActive = true;
-            mMotionManualFrames = 0;
-            mMotionActualCandidateExposureNs = 0L;
-            mMotionActualCandidateIso = 0;
-            mMotionActualCandidateFrames = 0;
-            mMotionActiveZone = desiredZone;
-            mMotionUnifiedExposureNs = desiredExposure;
-            mMotionUnifiedIso = desiredIso;
-            mMotionUnifiedSettledFrames = 0;
-            mMotionUnifiedLastUpdateMs = now;
-            mMotionCandidateFrames = 0;
-
-            if (committedStateChanged) {
-                mMotionUnifiedGeneration++;
-                clearMotionUnifiedBuffer();
-            }
-            rebuildPreviewBuilder();
-
-            Log.i(TAG, "MOTION_THREE_STATE_APPLIED"
-                    + " generation=" + mMotionUnifiedGeneration
-                    + " state=" + (desiredZone == 1 ? "MOTION_60" : desiredZone == 2 ? "MOTION_30" : "MOTION_15")
-                    + " aeEnergy=" + exposureEnergy
-                    + " aeExposureNs=" + actualExposure
-                    + " aeIso=" + actualIso
-                    + " zone30MinIso=" + MOTION_ZONE_30_MIN_AE_ISO
-                    + " zone15MinIso=" + MOTION_ZONE_15_MIN_AE_ISO
-                    + " gyroShakiness=" + gyroShakiness
-                    + " antibanding=" + antibandingMode
-                    + " exposureNs=" + desiredExposure
-                    + " iso=" + desiredIso
-                    + " frameDurationNs=" + frameDuration
-                    + " fpsRange=" + fpsRange
-                    + " aeProbe=" + mMotionAeProbeActive);
-        } catch (IllegalArgumentException | IllegalStateException e) {
-            Log.e(TAG, "Motion multi-zone exposure update failed: "
-                    + Log.getStackTraceString(e));
         }
     }
 
@@ -2549,15 +2328,110 @@ private long mMotionUnifiedLastUpdateMs = 0L;
 
         pollMotionTopUp();
     }    // IRIS_26343_GENERATION_SAFE_ZSL
+    private boolean motionExposurePairMatches(
+            TotalCaptureResult first,
+            TotalCaptureResult second) {
+        if (first == null || second == null) return false;
+
+        Long firstExposure =
+                first.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer firstIso =
+                first.get(CaptureResult.SENSOR_SENSITIVITY);
+        Long secondExposure =
+                second.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer secondIso =
+                second.get(CaptureResult.SENSOR_SENSITIVITY);
+
+        if (firstExposure == null || firstIso == null
+                || secondExposure == null || secondIso == null
+                || firstExposure <= 0L || secondExposure <= 0L
+                || firstIso <= 0 || secondIso <= 0) {
+            return false;
+        }
+
+        long exposureReference = Math.max(
+                firstExposure,
+                secondExposure);
+        int isoReference = Math.max(firstIso, secondIso);
+        long exposureTolerance = Math.max(
+                750_000L,
+                exposureReference / 12L);
+        int isoTolerance = Math.max(2, isoReference / 10);
+
+        return Math.abs(firstExposure - secondExposure)
+                        <= exposureTolerance
+                && Math.abs(firstIso - secondIso)
+                        <= isoTolerance;
+    }
+
+    private TotalCaptureResult findBestMotionExposureGroup(
+            List<Image> images,
+            int startIndex) {
+        if (images == null || images.isEmpty()) return null;
+
+        TotalCaptureResult bestResult = null;
+        int bestCount = 0;
+
+        /*
+         * Search newest to oldest. A strictly greater count replaces the
+         * winner, so ties remain biased toward the newest populated group.
+         */
+        for (int candidateIndex = images.size() - 1;
+                candidateIndex >= Math.max(0, startIndex);
+                candidateIndex--) {
+            Image candidateImage = images.get(candidateIndex);
+            if (candidateImage == null) continue;
+
+            TotalCaptureResult candidateResult =
+                    findNearestZslResult(
+                            candidateImage.getTimestamp());
+            if (candidateResult == null) continue;
+
+            int matching = 0;
+            for (int frameIndex = Math.max(0, startIndex);
+                    frameIndex < images.size();
+                    frameIndex++) {
+                Image frameImage = images.get(frameIndex);
+                if (frameImage == null) continue;
+
+                TotalCaptureResult frameResult =
+                        findNearestZslResult(
+                                frameImage.getTimestamp());
+                if (motionExposurePairMatches(
+                        frameResult,
+                        candidateResult)) {
+                    matching++;
+                }
+            }
+
+            if (matching > bestCount) {
+                bestCount = matching;
+                bestResult = candidateResult;
+            }
+        }
+
+        return bestResult;
+    }
+
     private int countValidMotionFrames() {
         int valid = 0;
         synchronized (mZslBufferLock) {
-            for (Image image : mZslRingBuffer) {
+            List<Image> bufferedImages =
+                    new ArrayList<>(mZslRingBuffer);
+            TotalCaptureResult bestGroup =
+                    findBestMotionExposureGroup(
+                            bufferedImages,
+                            0);
+
+            for (Image image : bufferedImages) {
                 if (image == null) continue;
                 TotalCaptureResult frameResult =
-                        findNearestZslResult(image.getTimestamp());
-                if (!mMotionManualLadderActive
-                        || motionExposureMatches(frameResult)) {
+                        findNearestZslResult(
+                                image.getTimestamp());
+
+                if (motionExposurePairMatches(
+                        frameResult,
+                        bestGroup)) {
                     valid++;
                 }
             }
@@ -2604,7 +2478,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                     "BUFFER_NOT_READY",
                     "buffered=" + buffered + " valid=" + validBuffered
                             + " minimum=" + mMotionTopUpMinimumFrames
-                            + " elapsedMs=" + elapsed);
+                            + " elapsedMs=" + elapsed
+                            + " aeProbe=" + mMotionAeProbeActive
+                            + " probeFrames=" + mMotionAeProbeFrames);
             recoverMotionCaptureAfterEarlyExit(
                     "BUFFER_NOT_READY",
                     "Motion buffer preparing");
@@ -2722,10 +2598,20 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         // Copy selected Images to ImageFrames only now (on shutter press)
         List<ImageFrame> selected = new ArrayList<>();
         HashMap<Long, TotalCaptureResult> selectedResults = new HashMap<>();
+
+        TotalCaptureResult bestExposureGroup =
+                findBestMotionExposureGroup(
+                        rawImages,
+                        skip);
+
         for (int i = skip; i < rawImages.size(); i++) {
             Image img = rawImages.get(i);
             TotalCaptureResult frameResult = findNearestZslResult(img.getTimestamp());
-            if (mMotionManualLadderActive && !motionExposureMatches(frameResult)) {
+            boolean exposureAccepted =
+                    motionExposurePairMatches(
+                            frameResult,
+                            bestExposureGroup);
+            if (!exposureAccepted) {
                 img.close();
                 continue;
             }

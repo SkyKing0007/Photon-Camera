@@ -37,6 +37,26 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
     @Tunable(title = "Apply gamma mix", category = "Auto Exposure", min = 0.0f, max = 1.0f, step = 0.01f, defaultValue = 0.1f, description = "Blend between AE color space sRGB-linear")
     float applyGammaMix;
 
+    @Tunable(title = "Use Fixed Motion AutoExposure Gain", category = "Motion HDR Brightness",
+            description = "Use the selected fixed global AutoExposure multiplier in Motion instead of the automatic value.",
+            min = 0, max = 1, step = 1, defaultValue = 1)
+    boolean iris26349UseFixedMotionAutoExposureGain = true;
+
+    @Tunable(title = "Motion AutoExposure Fixed Gain", category = "Motion HDR Brightness",
+            description = "Fixed Motion AutoExposure multiplier. 1.00 adds no global exposure gain.",
+            min = 0.80f, max = 2.00f, step = 0.05f, defaultValue = 1.00f)
+    float iris26349MotionAutoExposureFixedGain = 1.00f;
+
+    @Tunable(title = "Motion AutoExposure Gain Max", category = "Motion HDR Brightness",
+            description = "Maximum Motion AutoExposure multiplier when fixed mode is disabled.",
+            min = 1.00f, max = 3.80f, step = 0.05f, defaultValue = 1.25f)
+    float iris26349MotionAutoExposureGainMax = 1.25f;
+
+    @Tunable(title = "Motion Adaptive HDR Enable", category = "Motion HDR Brightness",
+            description = "Enable Motion spatial HDR detection, highlight compression and selective lower-mid recovery.",
+            min = 0, max = 1, step = 1, defaultValue = 1)
+    boolean iris26349MotionAdaptiveHdrEnable = true;
+
 
     public AutoExposure() {
         super("", "AutoExposure");
@@ -83,6 +103,7 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
 
         float avg = sum / cnt;
         float mpy = (histSize / 256.0f) * target / avg;
+        float iris26349RequestedAutoExposureMpy = mpy;
 
         sum = 0;
         int cnt2 = 0;
@@ -147,43 +168,26 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
         iris26340EffectiveRatio =
                 Math2.clamp(iris26340EffectiveRatio, 0.20f, 1.0f);
 
-        float iris26340EmergencyGainMax =
-                Math2.clamp(
-                        2.35f
-                                + 1.45f * iris26340EffectiveRatio
-                                - 0.70f * iris26340IsoRisk,
-                        1.75f,
-                        3.80f
-                );
-
         if (iris26340Motion) {
-            if (mpy > iris26340EmergencyGainMax) {
-                Log.d(
-                        "AutoExposure",
-                        "IRIS_26340_MOTION_NOISE_TONE_DECOUPLING"
-                                + " stage=AutoExposure"
-                                + " requested=" + mpy
-                                + " oldAdaptiveLimit=" + gainNoiseMax
-                                + " emergencyLimit=" + iris26340EmergencyGainMax
-                                + " iso=" + iris26340Iso
-                                + " effectiveRatio=" + iris26340EffectiveRatio
-                                + " action=emergencyClamp"
-                );
-                mpy = iris26340EmergencyGainMax;
+            float configuredAutoMax = Math2.clamp(iris26349MotionAutoExposureGainMax, 1.0f, 3.80f);
+            float fixedGain = Math2.clamp(iris26349MotionAutoExposureFixedGain, 0.80f, 2.00f);
+            if (iris26349UseFixedMotionAutoExposureGain) {
+                mpy = fixedGain;
             } else {
-                Log.d(
-                        "AutoExposure",
-                        "IRIS_26340_MOTION_NOISE_TONE_DECOUPLING"
-                                + " stage=AutoExposure"
-                                + " requested=" + mpy
-                                + " oldAdaptiveLimit=" + gainNoiseMax
-                                + " emergencyLimit=" + iris26340EmergencyGainMax
-                                + " iso=" + iris26340Iso
-                                + " effectiveRatio=" + iris26340EffectiveRatio
-                                + " action=adaptiveBrightnessClampBypassed"
-                );
+                mpy = Math.min(mpy, configuredAutoMax);
             }
+            String details = "requested=" + iris26349RequestedAutoExposureMpy
+                    + " fixedMode=" + iris26349UseFixedMotionAutoExposureGain
+                    + " fixedGain=" + fixedGain
+                    + " configuredAutoMax=" + configuredAutoMax
+                    + " preReinhardApplied=" + mpy
+                    + " oldNoiseLimit=" + gainNoiseMax
+                    + " iso=" + iris26340Iso
+                    + " effectiveRatio=" + iris26340EffectiveRatio;
+            Log.d("AutoExposure", "IRIS_26349_INTEGRATED_MOTION_QUALITY stage=AutoExposure " + details);
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState("AUTO_EXPOSURE_PRE_REINHARD", details);
         } else if (mpy > gainNoiseMax) {
+
             Log.d("AutoExposure", "Clamping gain by noise from " + mpy + " to " + gainNoiseMax);
             mpy = gainNoiseMax;
         }
@@ -739,6 +743,13 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                         0.0f,
                         0.34f
                 );
+        if (iris26340Motion && !iris26349MotionAdaptiveHdrEnable) {
+            irisHdrIndoorBacklitStrength = 0.0f;
+            irisHdrOutdoorBroadStrength = 0.0f;
+            irisHdrHighlightCompression = 0.0f;
+            irisHdrLowerMidLift = 0.0f;
+        }
+
         glProg.setVar(
                 "irisHdrIndoorBacklitStrength",
                 irisHdrIndoorBacklitStrength
@@ -755,6 +766,25 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                 "irisHdrLowerMidLift",
                 irisHdrLowerMidLift
         );
+
+        /* IRIS_26347_HDR_SHADOW_CHROMA_SAFETY
+         * Keep luminance lift. Restrain only unreliable near-black chroma when HDR is active.
+         */
+        float iris26347HdrStrength = Math.max(
+                irisHdrIndoorBacklitStrength,
+                irisHdrOutdoorBroadStrength);
+        float iris26349ResidualColorRisk = Math2.clamp(
+                0.45f + 0.55f * (1.0f - irisHdrShadowRecoverability),
+                0.0f,
+                1.0f);
+        float iris26347ShadowChromaProtection = Math2.clamp(
+                iris26347HdrStrength * iris26349ResidualColorRisk,
+                0.0f,
+                1.0f);
+        if (iris26340Motion && !iris26349MotionAdaptiveHdrEnable) {
+            iris26347ShadowChromaProtection = 0.0f;
+        }
+        glProg.setVar("irisHdrShadowChromaProtection", iris26347ShadowChromaProtection);
 
         Log.d(
                 "AutoExposure",
@@ -782,9 +812,31 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                         + " broadDrConfidence=" + irisHdrBroadDynamicRangeConfidence
                         + " nightConfidence=" + irisHdrNightConfidence
                         + " shadowRecoverability=" + irisHdrShadowRecoverability
+                        + " shadowChromaProtection=" + iris26347ShadowChromaProtection
                         + " iso=" + irisHdrIso
                         + " exposureSeconds=" + irisHdrExposureSeconds
         );
+        if (iris26340Motion) {
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "ADAPTIVE_HDR",
+                    "adaptiveHdrEnabled=" + iris26349MotionAdaptiveHdrEnable
+                            + " requestedAutoMpy=" + iris26349RequestedAutoExposureMpy
+                            + " finalAutoMpy=" + mpy
+                            + " average=" + irisHdrNormalizedAverage
+                            + " p10=" + irisHdrP10
+                            + " p50=" + irisHdrP50
+                            + " p95=" + irisHdrP95
+                            + " p99=" + irisHdrP99
+                            + " indoorBacklit=" + irisHdrIndoorBacklitStrength
+                            + " outdoorBroad=" + irisHdrOutdoorBroadStrength
+                            + " highlightCompression=" + irisHdrHighlightCompression
+                            + " lowerMidLift=" + irisHdrLowerMidLift
+                            + " shadowRecoverability=" + irisHdrShadowRecoverability
+                            + " shadowChromaProtection=" + iris26347ShadowChromaProtection
+                            + " iso=" + irisHdrIso
+                            + " exposureSeconds=" + irisHdrExposureSeconds);
+        }
+
         histogram.close();
         irisHdrSpatialHistogram.close();
         WorkingTexture = basePipeline.getMain();

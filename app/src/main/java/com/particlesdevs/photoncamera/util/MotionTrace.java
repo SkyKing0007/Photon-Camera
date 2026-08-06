@@ -100,6 +100,14 @@ public final class MotionTrace {
         Log.flushMotionNow();
     }
 
+    public static void processingState(String stage, String details) {
+        String message = "PIPELINE_STATE"
+                + " stage=" + sanitize(stage)
+                + " details=" + sanitize(details)
+                + " thread=" + Thread.currentThread().getName();
+        writeInfo(message);
+    }
+
     private static void writeInfo(String message) {
         Log.d(TAG, message);
         Log.writeMotionTrace("I", message);
