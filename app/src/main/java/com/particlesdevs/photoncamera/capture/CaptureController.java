@@ -280,20 +280,27 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private int mMotionUnifiedIso = 0;
     private long mMotionUnifiedGeneration = 0L;
     private int mMotionUnifiedSettledFrames = 0;
-    private long mMotionUnifiedLastUpdateMs = 0L;
+        // IRIS_26344_ACTUAL_EXPOSURE_GENERATION
+    private long mMotionActualCandidateExposureNs = 0L;
+    private int mMotionActualCandidateIso = 0;
+    private int mMotionActualCandidateFrames = 0;
+    private static final int MOTION_ACTUAL_GENERATION_CONFIRM_FRAMES = 6;
+private long mMotionUnifiedLastUpdateMs = 0L;
     private static final long MOTION_UNIFIED_UPDATE_MIN_MS = 450L;
 
     // Keep preview AE active long enough to measure the scene, then enter
     // one confirmed shutter zone. Zone 0 remains automatic.
     private int mMotionAeWarmupFrames = 0;
     private boolean mMotionManualLadderActive = false;
+    private boolean mMotionAeProbeActive = false;
+    // IRIS_26341_MOTION_THREE_STATE_PREVIEW
     private int mMotionManualFrames = 0;
     private int mMotionCandidateZone = 0;
     private int mMotionCandidateFrames = 0;
     private int mMotionActiveZone = 0;
     private static final int MOTION_AE_WARMUP_FRAMES = 24;
-    private static final int MOTION_ZONE_CONFIRM_FRAMES = 3;
-    private static final int MOTION_MANUAL_RESAMPLE_FRAMES = 60;
+    private static final int MOTION_ZONE_CONFIRM_FRAMES = 30;
+    private static final int MOTION_MANUAL_RESAMPLE_FRAMES = 240;
     private static final long MOTION_ZONE_30_ENERGY = 12_000_000_000L;
     private static final long MOTION_ZONE_20_ENERGY = 22_000_000_000L;
     private static final long MOTION_ZONE_15_ENERGY = 36_000_000_000L;
@@ -348,6 +355,10 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 Image img = reader.acquireNextImage();
                 if (img == null) return;
                 if (mZslCapturing && !mMotionTopUpActive) {
+                    img.close();
+                    return;
+                }
+                if (mMotionAeProbeActive) {
                     img.close();
                     return;
                 }
@@ -1120,30 +1131,36 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     }
 
     private Range<Integer> chooseMotionUnifiedFpsRange(long exposureNs) {
-        int sensorFps = (int) Math.max(1L,
-                Math.min(30L, 1_000_000_000L / Math.max(1L, exposureNs)));
+        final int targetFps = exposureNs > 34_000_000L ? 15 : 30;
         Range<Integer>[] ranges = mCameraCharacteristics == null ? null
                 : mCameraCharacteristics.get(
                         CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
         if (ranges == null || ranges.length == 0) {
-            return new Range<>(sensorFps, 30);
+            return new Range<>(targetFps, targetFps);
         }
-        Range<Integer> best = null;
-        int bestScore = Integer.MAX_VALUE;
+
+        Range<Integer> containing = null;
+        int containingScore = Integer.MAX_VALUE;
         for (Range<Integer> range : ranges) {
             int lower = range.getLower();
             int upper = range.getUpper();
-            if (upper < sensorFps) continue;
-            int score = Math.abs(upper - 30) * 10
-                    + Math.abs(lower - sensorFps);
-            if (score < bestScore) {
-                best = range;
-                bestScore = score;
+            if (lower == targetFps && upper == targetFps) {
+                return range;
+            }
+            if (lower <= targetFps && upper >= targetFps) {
+                int score = (upper - lower) * 100
+                        + Math.abs(upper - targetFps)
+                        + Math.abs(lower - targetFps);
+                if (score < containingScore) {
+                    containing = range;
+                    containingScore = score;
+                }
             }
         }
-        return best == null ? FpsRangeAuto : best;
+        return containing == null
+                ? new Range<>(targetFps, targetFps)
+                : containing;
     }
-
     private void clearMotionUnifiedBuffer() {
         synchronized (mZslBufferLock) {
             while (!mZslRingBuffer.isEmpty()) {
@@ -1178,27 +1195,27 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             mPreviewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, null);
             mPreviewRequestBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, null);
 
+            mMotionAeProbeActive = true;
             mMotionManualLadderActive = false;
             mMotionManualFrames = 0;
             mMotionAeWarmupFrames = 0;
             mMotionCandidateZone = 0;
             mMotionCandidateFrames = 0;
-            mMotionActiveZone = 0;
+            mMotionActualCandidateExposureNs = 0L;
+            mMotionActualCandidateIso = 0;
+            mMotionActualCandidateFrames = 0;
             mMotionLastLadderDecision = "";
-            mMotionUnifiedExposureNs = 0L;
-            mMotionUnifiedIso = 0;
-            mMotionUnifiedSettledFrames = 0;
-            mMotionUnifiedGeneration++;
-            clearMotionUnifiedBuffer();
             rebuildPreviewBuilder();
-            Log.i(TAG, "MOTION_AE_RESTORED generation="
-                    + mMotionUnifiedGeneration);
+            Log.i(TAG, "MOTION_AE_PROBE_STARTED"
+                    + " generation=" + mMotionUnifiedGeneration
+                    + " previousZone=" + mMotionActiveZone
+                    + " ringPreserved=true");
         } catch (IllegalArgumentException | IllegalStateException e) {
-            Log.e(TAG, "Motion AE restore failed: "
+            mMotionAeProbeActive = false;
+            Log.e(TAG, "Motion AE probe failed: "
                     + Log.getStackTraceString(e));
         }
     }
-
     private int chooseMotionBrightnessZone(
             long exposureEnergy,
             int aeIso) {
@@ -1208,26 +1225,19 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             return 3;
         }
 
-        if (exposureEnergy >= MOTION_ZONE_20_ENERGY
-                && aeIso >= MOTION_ZONE_20_MIN_AE_ISO) {
+        if (exposureEnergy >= MOTION_ZONE_30_ENERGY
+                && aeIso >= MOTION_ZONE_30_MIN_AE_ISO) {
             return 2;
         }
 
-        if (exposureEnergy >= MOTION_ZONE_30_ENERGY
-                && aeIso >= MOTION_ZONE_30_MIN_AE_ISO) {
-            return 1;
-        }
-
-        return 0;
+        return 1;
     }
-
     private int chooseMotionGyroLimitZone(int gyroShakiness) {
-        // This project already treats roughly 25 as steady and roughly 400
-        // as shaky. The previous >140 hard veto was therefore too strict.
+        // Zone 3 (1/15) requires a very steady camera. Zone 2 (1/30) tolerates
+        // moderate movement. Zone 1 (1/60) remains available for shaky scenes.
         if (gyroShakiness <= 35) return 3;
-        if (gyroShakiness <= 70) return 2;
-        if (gyroShakiness <= 260) return 1;
-        return 0;
+        if (gyroShakiness <= 180) return 2;
+        return 1;
     }
 
     private void logMotionLadderDecision(
@@ -1273,17 +1283,15 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 == CaptureResult.CONTROL_AE_ANTIBANDING_MODE_50HZ;
 
         if (fiftyHz) {
-            if (zone >= 2) return 1_000_000_000L / 20L;
-            if (zone == 1) return 1_000_000_000L / 25L;
-            return 1_000_000_000L / 50L;
+            if (zone >= 3) return 1_000_000_000L / 20L;
+            if (zone == 2) return 1_000_000_000L / 30L;
+            return 1_000_000_000L / 60L;
         }
 
         if (zone >= 3) return 1_000_000_000L / 15L;
-        if (zone == 2) return 1_000_000_000L / 20L;
-        if (zone == 1) return 1_000_000_000L / 30L;
+        if (zone == 2) return 1_000_000_000L / 30L;
         return 1_000_000_000L / 60L;
     }
-
     private void updateMotionUnifiedExposure(
             @NonNull CaptureRequest completedRequest,
             @NonNull TotalCaptureResult result) {
@@ -1306,8 +1314,80 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         if (mMotionManualLadderActive) {
             if (motionExposureMatches(result)) {
                 mMotionUnifiedSettledFrames++;
+                mMotionActualCandidateExposureNs = 0L;
+                mMotionActualCandidateIso = 0;
+                mMotionActualCandidateFrames = 0;
             } else {
                 mMotionUnifiedSettledFrames = 0;
+
+                boolean sameActualCandidate = false;
+                if (mMotionActualCandidateExposureNs > 0L
+                        && mMotionActualCandidateIso > 0) {
+                    long candidateExposureTolerance = Math.max(
+                            750_000L,
+                            mMotionActualCandidateExposureNs / 12L);
+                    int candidateIsoTolerance = Math.max(
+                            2,
+                            mMotionActualCandidateIso / 10);
+                    sameActualCandidate =
+                            Math.abs(actualExposure
+                                    - mMotionActualCandidateExposureNs)
+                                    <= candidateExposureTolerance
+                            && Math.abs(actualIso
+                                    - mMotionActualCandidateIso)
+                                    <= candidateIsoTolerance;
+                }
+
+                if (sameActualCandidate) {
+                    mMotionActualCandidateFrames++;
+                } else {
+                    mMotionActualCandidateExposureNs = actualExposure;
+                    mMotionActualCandidateIso = actualIso;
+                    mMotionActualCandidateFrames = 1;
+                }
+
+                if (mMotionActualCandidateFrames
+                        >= MOTION_ACTUAL_GENERATION_CONFIRM_FRAMES) {
+                    boolean actualGenerationChanged =
+                            Math.abs(actualExposure
+                                    - mMotionUnifiedExposureNs)
+                                    > Math.max(
+                                            750_000L,
+                                            actualExposure / 12L)
+                            || Math.abs(actualIso
+                                    - mMotionUnifiedIso)
+                                    > Math.max(2, actualIso / 10);
+
+                    if (actualGenerationChanged) {
+                        long requestedExposure =
+                                mMotionUnifiedExposureNs;
+                        int requestedIso = mMotionUnifiedIso;
+
+                        mMotionUnifiedExposureNs = actualExposure;
+                        mMotionUnifiedIso = actualIso;
+                        mMotionUnifiedSettledFrames = 1;
+                        mMotionUnifiedGeneration++;
+                        clearMotionUnifiedBuffer();
+
+                        Log.w(TAG, "MOTION_ACTUAL_GENERATION_ADOPTED"
+                                + " generation="
+                                + mMotionUnifiedGeneration
+                                + " requestedExposureNs="
+                                + requestedExposure
+                                + " requestedIso=" + requestedIso
+                                + " actualExposureNs="
+                                + actualExposure
+                                + " actualIso=" + actualIso
+                                + " confirmedFrames="
+                                + mMotionActualCandidateFrames);
+                    } else {
+                        mMotionUnifiedSettledFrames++;
+                    }
+
+                    mMotionActualCandidateExposureNs = 0L;
+                    mMotionActualCandidateIso = 0;
+                    mMotionActualCandidateFrames = 0;
+                }
             }
 
             mMotionManualFrames++;
@@ -1316,7 +1396,6 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             }
             return;
         }
-
         mMotionAeWarmupFrames++;
         if (mMotionAeWarmupFrames < MOTION_AE_WARMUP_FRAMES) return;
 
@@ -1402,8 +1481,9 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         desiredExposure));
 
         int desiredIso = (int) Math.round(
-                (double) exposureEnergy
-                        / Math.max(1L, desiredExposure));
+                ((double) exposureEnergy / Math.max(1L, desiredExposure))
+                        * (desiredZone == 1 ? 0.72
+                        : desiredZone == 2 ? 0.68 : 0.85));
 
         desiredIso = Math.max(
                 com.particlesdevs.photoncamera.processing.parameters
@@ -1417,7 +1497,9 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 Math.max(
                         com.particlesdevs.photoncamera.processing.parameters
                                 .IsoExpoSelector.getISOLOW(),
-                        (int) Math.floor(actualIso * 0.67));
+                        (int) Math.floor(actualIso
+                                * (desiredZone == 1 ? 1.65
+                                : desiredZone == 2 ? 1.40 : 1.20)));
 
         if (desiredIso > maximumUsefulIso) {
             mMotionCandidateZone = 0;
@@ -1426,7 +1508,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     + " reason=insufficientIsoBenefit"
                     + " brightnessZone=" + brightnessZone
                     + " motionLimitZone=" + motionLimitZone
-                    + " zone=" + desiredZone
+                    + " state=" + (desiredZone == 1 ? "MOTION_60" : desiredZone == 2 ? "MOTION_30" : "MOTION_15")
                     + " aeExposureNs=" + actualExposure
                     + " aeIso=" + actualIso
                     + " desiredExposureNs=" + desiredExposure
@@ -1464,34 +1546,47 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                     CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
                     fpsRange);
 
+            boolean committedStateChanged =
+                    desiredZone != mMotionActiveZone
+                            || Math.abs(desiredExposure - mMotionUnifiedExposureNs)
+                            > Math.max(750_000L, desiredExposure / 12L)
+                            || Math.abs(desiredIso - mMotionUnifiedIso)
+                            > Math.max(2, desiredIso / 10);
+
+            mMotionAeProbeActive = false;
             mMotionManualLadderActive = true;
             mMotionManualFrames = 0;
+            mMotionActualCandidateExposureNs = 0L;
+            mMotionActualCandidateIso = 0;
+            mMotionActualCandidateFrames = 0;
             mMotionActiveZone = desiredZone;
             mMotionUnifiedExposureNs = desiredExposure;
             mMotionUnifiedIso = desiredIso;
-            mMotionUnifiedGeneration++;
             mMotionUnifiedSettledFrames = 0;
             mMotionUnifiedLastUpdateMs = now;
             mMotionCandidateFrames = 0;
 
-            clearMotionUnifiedBuffer();
+            if (committedStateChanged) {
+                mMotionUnifiedGeneration++;
+                clearMotionUnifiedBuffer();
+            }
             rebuildPreviewBuilder();
 
-            Log.i(TAG, "MOTION_UNIFIED_REQUEST_APPLIED"
+            Log.i(TAG, "MOTION_THREE_STATE_APPLIED"
                     + " generation=" + mMotionUnifiedGeneration
-                    + " zone=" + desiredZone
+                    + " state=" + (desiredZone == 1 ? "MOTION_60" : desiredZone == 2 ? "MOTION_30" : "MOTION_15")
                     + " aeEnergy=" + exposureEnergy
                     + " aeExposureNs=" + actualExposure
                     + " aeIso=" + actualIso
                     + " zone30MinIso=" + MOTION_ZONE_30_MIN_AE_ISO
-                    + " zone20MinIso=" + MOTION_ZONE_20_MIN_AE_ISO
                     + " zone15MinIso=" + MOTION_ZONE_15_MIN_AE_ISO
                     + " gyroShakiness=" + gyroShakiness
                     + " antibanding=" + antibandingMode
                     + " exposureNs=" + desiredExposure
                     + " iso=" + desiredIso
                     + " frameDurationNs=" + frameDuration
-                    + " fpsRange=" + fpsRange);
+                    + " fpsRange=" + fpsRange
+                    + " aeProbe=" + mMotionAeProbeActive);
         } catch (IllegalArgumentException | IllegalStateException e) {
             Log.e(TAG, "Motion multi-zone exposure update failed: "
                     + Log.getStackTraceString(e));
@@ -2453,7 +2548,23 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                         + " timeoutMs=" + MOTION_TOP_UP_TIMEOUT_MS);
 
         pollMotionTopUp();
+    }    // IRIS_26343_GENERATION_SAFE_ZSL
+    private int countValidMotionFrames() {
+        int valid = 0;
+        synchronized (mZslBufferLock) {
+            for (Image image : mZslRingBuffer) {
+                if (image == null) continue;
+                TotalCaptureResult frameResult =
+                        findNearestZslResult(image.getTimestamp());
+                if (!mMotionManualLadderActive
+                        || motionExposureMatches(frameResult)) {
+                    valid++;
+                }
+            }
+        }
+        return valid;
     }
+
 
     private void pollMotionTopUp() {
         if (!mMotionTopUpActive) {
@@ -2465,19 +2576,21 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             buffered = mZslRingBuffer.size();
         }
 
+        int validBuffered = countValidMotionFrames();
+
         long elapsed = android.os.SystemClock.elapsedRealtime()
                 - mMotionTopUpStartMs;
 
-        boolean targetReady = buffered >= mMotionTopUpTargetFrames;
+        boolean targetReady = validBuffered >= mMotionTopUpTargetFrames;
         boolean timedOut = elapsed >= MOTION_TOP_UP_TIMEOUT_MS;
 
         if (targetReady
-                || (timedOut && buffered >= mMotionTopUpMinimumFrames)) {
+                || (timedOut && validBuffered >= mMotionTopUpMinimumFrames)) {
             mMotionTopUpActive = false;
             com.particlesdevs.photoncamera.util.MotionTrace.state(
                     mMotionDiagnosticShotId,
                     "TOP_UP_END",
-                    "buffered=" + buffered
+                    "buffered=" + buffered + " valid=" + validBuffered
                             + " targetReady=" + targetReady
                             + " timedOut=" + timedOut
                             + " elapsedMs=" + elapsed);
@@ -2486,17 +2599,14 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         }
 
         if (timedOut) {
-            mMotionTopUpActive = false;
-            mZslCapturing = false;
-            burst = false;
-            mState = STATE_PREVIEW;
             com.particlesdevs.photoncamera.util.MotionTrace.finish(
                     mMotionDiagnosticShotId,
                     "BUFFER_NOT_READY",
-                    "buffered=" + buffered
+                    "buffered=" + buffered + " valid=" + validBuffered
                             + " minimum=" + mMotionTopUpMinimumFrames
                             + " elapsedMs=" + elapsed);
-            cameraEventsListener.onProcessingFinished(
+            recoverMotionCaptureAfterEarlyExit(
+                    "BUFFER_NOT_READY",
                     "Motion buffer preparing");
             return;
         }
@@ -2504,7 +2614,48 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         mBackgroundHandler.postDelayed(
                 this::pollMotionTopUp,
                 MOTION_TOP_UP_POLL_MS);
+    }    // IRIS_26342_MOTION_CAPTURE_RECOVERY
+    private void recoverMotionCaptureAfterEarlyExit(
+            @NonNull String traceResult,
+            @NonNull String userMessage) {
+        mMotionTopUpActive = false;
+        mZslCapturing = false;
+        burst = false;
+        mState = STATE_PREVIEW;
+
+        if (mBackgroundHandler != null) {
+            mBackgroundHandler.post(this::unlockFocus);
+        }
+
+        Runnable restoreUi = () -> {
+            try {
+                cameraEventsListener.onCaptureSequenceCompleted(null);
+            } catch (Exception sequenceError) {
+                Log.e(TAG, "Motion early-exit sequence cleanup failed: "
+                        + Log.getStackTraceString(sequenceError));
+            }
+
+            try {
+                cameraEventsListener.onProcessingFinished(userMessage);
+            } catch (Exception processingError) {
+                Log.e(TAG, "Motion early-exit shutter cleanup failed: "
+                        + Log.getStackTraceString(processingError));
+            }
+        };
+
+        if (activity != null) {
+            activity.runOnUiThread(restoreUi);
+        } else {
+            new Handler(Looper.getMainLooper()).post(restoreUi);
+        }
+
+        Log.w(TAG, "MOTION_CAPTURE_RECOVERED"
+                + " result=" + traceResult
+                + " generation=" + mMotionUnifiedGeneration
+                + " settled=" + mMotionUnifiedSettledFrames
+                + " aeProbe=" + mMotionAeProbeActive);
     }
+
 
     private void finalizeMotionZslCapture() {
         int frameCount = mMotionTopUpTargetFrames > 0
@@ -2519,9 +2670,32 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
         // Drain raw Image objects from the ring buffer (no copy yet)
         List<Image> rawImages;
+        int validAtDrain;
         synchronized (mZslBufferLock) {
-            rawImages = new ArrayList<>(mZslRingBuffer);
-            mZslRingBuffer.clear();
+            validAtDrain = countValidMotionFrames();
+            if (validAtDrain >= mMotionTopUpMinimumFrames) {
+                rawImages = new ArrayList<>(mZslRingBuffer);
+                mZslRingBuffer.clear();
+            } else {
+                rawImages = null;
+            }
+        }
+
+        if (rawImages == null) {
+            Log.w(TAG, "MOTION_DRAIN_DEFERRED"
+                    + " valid=" + validAtDrain
+                    + " minimum=" + mMotionTopUpMinimumFrames
+                    + " generation=" + mMotionUnifiedGeneration);
+            com.particlesdevs.photoncamera.util.MotionTrace.finish(
+                    mMotionDiagnosticShotId,
+                    "VALID_BUFFER_NOT_READY",
+                    "valid=" + validAtDrain
+                            + " minimum=" + mMotionTopUpMinimumFrames
+                            + " generation=" + mMotionUnifiedGeneration);
+            recoverMotionCaptureAfterEarlyExit(
+                    "VALID_BUFFER_NOT_READY",
+                    "Motion buffer preparing");
+            return;
         }
 
         int take = Math.min(rawImages.size(), frameCount);
@@ -2530,7 +2704,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             rawImages.get(i).close();
         }
 
-        // Populate exposures map from preview capture result — all ZSL frames share preview exposure
+        // Populate exposures map from preview capture result ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â all ZSL frames share preview exposure
         double previewExpTime = 1.0;
         double previewISO = 100.0;
         long exposureTimeNs = 0;
@@ -2671,16 +2845,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             com.particlesdevs.photoncamera.util.MotionTrace.finish(
                     mMotionDiagnosticShotId,
                     "EMPTY_BUFFER",
-                    "generation=" + mMotionUnifiedGeneration
-                            + " settled="
+                    "generation=" + mMotionUnifiedGeneration + " validAtDrain=" + validAtDrain + " settled="
                             + mMotionUnifiedSettledFrames);
             SaverImplementation.IMAGE_BUFFER.clear();
-            synchronized (mZslBufferLock) { mZslResultMap.clear(); }
-            mZslCapturing = false;
-            burst = false;
-            mState = STATE_PREVIEW;
-            mBackgroundHandler.post(this::unlockFocus);
-            cameraEventsListener.onProcessingFinished("ZSL buffer not ready");
+            recoverMotionCaptureAfterEarlyExit(
+                    "EMPTY_BUFFER",
+                    "ZSL buffer not ready");
             return;
         }
 
