@@ -1,5 +1,7 @@
 package com.particlesdevs.photoncamera.processing.render;
 
+import com.particlesdevs.photoncamera.processing.MotionMetrics;
+
 import com.particlesdevs.photoncamera.util.Log;
 import android.util.Pair;
 
@@ -86,9 +88,13 @@ public class NoiseModeler {
         computeStackingNoiseModel(FrameNumberSelector.frameCount);
     }
     public void computeStackingNoiseModel(int FrameCnt){
-        computeModel[0] = new Pair<>(adaptiveMpy * baseModel[0].first/ (FrameCnt*0.9),adaptiveMpy * baseModel[0].second/ (FrameCnt*0.9));
-        computeModel[1] = new Pair<>(adaptiveMpy * baseModel[1].first/ (FrameCnt*0.9),adaptiveMpy * baseModel[1].second/ (FrameCnt*0.9));
-        computeModel[2] = new Pair<>(adaptiveMpy * baseModel[2].first/ (FrameCnt*0.9),adaptiveMpy * baseModel[2].second/ (FrameCnt*0.9));
+        float effectiveFrameCnt = Math.max(1, FrameCnt);
+        if (MotionMetrics.isActive()) {
+            effectiveFrameCnt = Math.max(1.0f, MotionMetrics.effectiveFrames());
+        }
+        computeModel[0] = new Pair<>(adaptiveMpy * baseModel[0].first/ (effectiveFrameCnt*0.9),adaptiveMpy * baseModel[0].second/ (effectiveFrameCnt*0.9));
+        computeModel[1] = new Pair<>(adaptiveMpy * baseModel[1].first/ (effectiveFrameCnt*0.9),adaptiveMpy * baseModel[1].second/ (effectiveFrameCnt*0.9));
+        computeModel[2] = new Pair<>(adaptiveMpy * baseModel[2].first/ (effectiveFrameCnt*0.9),adaptiveMpy * baseModel[2].second/ (effectiveFrameCnt*0.9));
     }
     private double computeNoiseModelS(double Sensitivity,Pair<Double,Double> sGenerator) {
         double returning = sGenerator.first * Sensitivity + sGenerator.second;

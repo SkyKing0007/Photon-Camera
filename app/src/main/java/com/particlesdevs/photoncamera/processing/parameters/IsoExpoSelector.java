@@ -4,6 +4,7 @@ import android.graphics.Rect;
 import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CaptureRequest;
 import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.TotalCaptureResult;
 import com.particlesdevs.photoncamera.util.Log;
 import android.util.Range;
 import android.util.SizeF;
@@ -19,6 +20,7 @@ import java.util.Locale;
 public class IsoExpoSelector {
     public static final int baseFrame = 1;
     private static final String TAG = "IsoExpoSelector";
+    public static volatile String lastMotionExposureDiagnostics = "";
     public static boolean HDR = false;
     public static boolean useTripod = false;
     public static final int patternSize = 3;
@@ -69,6 +71,174 @@ public class IsoExpoSelector {
         builder.set(CaptureRequest.SENSOR_SENSITIVITY, (int)pair.iso);
         lastSelectedExposure = pair.exposure;
     }
+    public static ExpoPair createEqualExposureZslPair(CaptureController captureController,
+                                                       TotalCaptureResult frameResult) {
+        long exposure = captureController.mPreviewExposureTime;
+        int iso = captureController.mPreviewIso;
+        if (frameResult != null) {
+            Long e = frameResult.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+            Integer s = frameResult.get(CaptureResult.SENSOR_SENSITIVITY);
+            if (e != null) exposure = e;
+            if (s != null) iso = s;
+        }
+        ExpoPair pair = new ExpoPair(exposure, getEXPLOW(), getEXPHIGH(), iso,
+                getISOLOW(), getISOHIGH(), getISOAnalog());
+        pair.curlayer = ExpoPair.exposureLayer.Normal;
+        pair.layerMpy = 1.0f;
+        return pair;
+    }
+
+    private static long clampExposure(long exposureNs) {
+        return Math.max(getEXPLOW(), Math.min(getEXPHIGH(), exposureNs));
+    }
+
+    private static long motionCameraLimitNs() {
+        if (useTripod || PhotonCamera.getGyro() == null) {
+            return ExposureIndex.sec / 15;
+        }
+        int shakiness = Math.max(0, PhotonCamera.getGyro().getFilteredShakiness());
+        if (shakiness <= 35) return ExposureIndex.sec / 15;
+        if (shakiness <= 70) return ExposureIndex.sec / 20;
+        if (shakiness <= 140) return ExposureIndex.sec / 30;
+        if (shakiness <= 260) return ExposureIndex.sec / 60;
+        return ExposureIndex.sec / 120;
+    }
+
+    private static double motionEffectiveFocalLength35mm() {
+        double focalLength35mm = 24.0;
+        CameraCharacteristics characteristics = CaptureController.mCameraCharacteristics;
+        CaptureResult result = CaptureController.mPreviewCaptureResult;
+        if (characteristics != null) {
+            Float focal = result == null ? null : result.get(CaptureResult.LENS_FOCAL_LENGTH);
+            float[] available = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+            SizeF sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+            if (focal == null && available != null && available.length > 0) focal = available[0];
+            if (focal != null && sensorSize != null && sensorSize.getWidth() > 0.0f) {
+                focalLength35mm = (36.0 / sensorSize.getWidth()) * focal;
+            }
+        }
+
+        float zoom = 1.0f;
+        if (result != null) {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                Float zoomRatio = result.get(CaptureResult.CONTROL_ZOOM_RATIO);
+                if (zoomRatio != null && zoomRatio > 0.0f) zoom = zoomRatio;
+            } else if (characteristics != null) {
+                Rect crop = result.get(CaptureResult.SCALER_CROP_REGION);
+                Rect active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+                if (crop != null && active != null && crop.width() > 0) {
+                    zoom = (float) active.width() / crop.width();
+                }
+            }
+        }
+        return Math.max(10.0, focalLength35mm * zoom);
+    }
+
+    private static boolean motionOisAvailable() {
+        CameraCharacteristics characteristics = CaptureController.mCameraCharacteristics;
+        if (characteristics == null) return false;
+        int[] modes = characteristics.get(
+                CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION);
+        if (modes == null) return false;
+        for (int mode : modes) {
+            if (mode == CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON) return true;
+        }
+        return false;
+    }
+
+    private static long motionFocalLimitNs() {
+        double focal35 = motionEffectiveFocalLength35mm();
+        double oisAllowance = motionOisAvailable() ? 8.0 : 1.0;
+        double denominator = Math.max(15.0, focal35 / oisAllowance);
+        return clampExposure((long) (ExposureIndex.sec / denominator));
+    }
+
+    private static long quantizeMotionAntiFlicker(long desiredNs, long maximumSafeNs) {
+        CaptureResult result = CaptureController.mPreviewCaptureResult;
+        Integer antiBand = result == null ? null :
+                result.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE);
+
+        long quantum;
+        if (antiBand != null &&
+                antiBand == CaptureResult.CONTROL_AE_ANTIBANDING_MODE_50HZ) {
+            quantum = ExposureIndex.sec / 100;
+        } else {
+            quantum = ExposureIndex.sec / 120;
+        }
+
+        desiredNs = Math.min(desiredNs, maximumSafeNs);
+        if (desiredNs < quantum) return clampExposure(desiredNs);
+
+        long steps = Math.max(1L, Math.round((double) desiredNs / quantum));
+        long quantized = steps * quantum;
+        while (quantized > maximumSafeNs && steps > 1L) {
+            steps--;
+            quantized = steps * quantum;
+        }
+        return clampExposure(Math.min(quantized, maximumSafeNs));
+    }
+
+    private static void applyMotionExposurePolicy(ExpoPair pair) {
+        final double exposureEnergy = Math.max(1.0, pair.exposure * (double) pair.iso);
+        final int normalizedIsoFloor = MIN_ISO_NORMALIZED;
+        final int normalizedIsoCeiling = Math.max(
+                normalizedIsoFloor,
+                (int) Math.round(pair.isohigh * (100.0 / Math.max(1, pair.isolow))));
+
+        long luminanceSelected = clampExposure(
+                (long) Math.round(exposureEnergy / normalizedIsoFloor));
+        luminanceSelected = Math.min(luminanceSelected, ExposureIndex.sec / 15);
+
+        long cameraLimit = motionCameraLimitNs();
+        long focalLimit = motionFocalLimitNs();
+
+        // A true image-domain subject-motion signal is not implemented yet.
+        // Therefore, the very-dark policy must not pretend that uncalibrated
+        // camera/focal heuristics are subject-motion evidence.
+        long subjectLimit = ExposureIndex.sec / 15;
+        boolean veryDark = luminanceSelected >= ExposureIndex.sec / 15;
+
+        long maximumSafe;
+        if (veryDark) {
+            // Authoritative policy: in a genuinely very-dark scene, preserve
+            // approximately 1/15 s and reduce ISO accordingly. Local temporal
+            // confidence protects moving boundaries until subject-motion
+            // analysis is implemented.
+            maximumSafe = ExposureIndex.sec / 15;
+        } else {
+            maximumSafe = Math.min(cameraLimit, Math.min(focalLimit, subjectLimit));
+        }
+
+        long constrained = Math.min(luminanceSelected, maximumSafe);
+        long finalExposure = quantizeMotionAntiFlicker(constrained, maximumSafe);
+
+        int finalIso = (int) Math.round(exposureEnergy / Math.max(1.0, finalExposure));
+        finalIso = Math.max(normalizedIsoFloor, Math.min(normalizedIsoCeiling, finalIso));
+
+        pair.exposure = finalExposure;
+        pair.iso = finalIso;
+
+        int shakiness = PhotonCamera.getGyro() == null
+                ? -1 : PhotonCamera.getGyro().getFilteredShakiness();
+        lastMotionExposureDiagnostics =
+                "MotionExposurePolicy=v26321"
+                + ";VeryDark=" + veryDark
+                + ";ExposureEnergy=" + String.format(Locale.US, "%.0f", exposureEnergy)
+                + ";LuminanceSelectedNs=" + luminanceSelected
+                + ";CameraLimitNs=" + cameraLimit
+                + ";FocalLimitNs=" + focalLimit
+                + ";SubjectLimitNs=" + subjectLimit
+                + ";MaximumSafeNs=" + maximumSafe
+                + ";RequestedExposureNs=" + finalExposure
+                + ";RequestedIsoNormalized=" + finalIso
+                + ";Focal35mm=" + String.format(Locale.US, "%.1f",
+                    motionEffectiveFocalLength35mm())
+                + ";OisAvailable=" + motionOisAvailable()
+                + ";GyroShakiness=" + shakiness;
+
+        Log.i(TAG, lastMotionExposureDiagnostics);
+    }
+
     private static double mpy1 = 1.0;
     public static ExpoPair GenerateExpoPair(int step, CaptureController captureController) {
         ExpoPair pair = new ExpoPair(captureController.mPreviewExposureTime, getEXPLOW(), getEXPHIGH(),
@@ -131,12 +301,12 @@ public class IsoExpoSelector {
             capEnd = Math.min(capEnd, ExposureIndex.sec / 15);
             capStart = Math.min(capStart, capEnd);
         }
-        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION && !useTripod) {
-            capEnd = Math.min(capEnd, ExposureIndex.sec / 60);
-            capStart = Math.min(capStart, capEnd);
-        }
 
-        pair.applyShutterPriorityCurve(capStart, capEnd, CAP_RAMP_STOPS);
+        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION && !useTripod) {
+            applyMotionExposurePolicy(pair);
+        } else {
+            pair.applyShutterPriorityCurve(capStart, capEnd, CAP_RAMP_STOPS);
+        }
 
         if (pair.normalizedIso() >= 12700.0/mpy1) {
             pair.ReduceIso();
@@ -214,7 +384,7 @@ public class IsoExpoSelector {
         return (int) (in * getMPY());
     }
 
-    private static int getISOHIGH() {
+    public static int getISOHIGH() {
         Object key = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
         if (key == null) return 3200;
         else {
@@ -226,7 +396,7 @@ public class IsoExpoSelector {
         return mpyIso(getISOHIGH());
     }
 
-    private static int getISOLOW() {
+    public static int getISOLOW() {
         Object key = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
         if (key == null) return 100;
         else {

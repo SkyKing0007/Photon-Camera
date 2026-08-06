@@ -9,6 +9,7 @@ import com.particlesdevs.photoncamera.util.Log;
 
 import com.particlesdevs.photoncamera.app.PhotonCamera;
 import com.particlesdevs.photoncamera.processing.ImageFrame;
+import com.particlesdevs.photoncamera.processing.MotionMetrics;
 import com.particlesdevs.photoncamera.processing.opengl.GLCoreBlockProcessing;
 import com.particlesdevs.photoncamera.processing.opengl.GLDrawParams;
 import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
@@ -32,14 +33,16 @@ import static com.particlesdevs.photoncamera.processing.processor.ProcessorBase.
 public class PyramidMerging extends GLOneScript {
     public Parameters parameters;
     ArrayList<ImageFrame> images;
+    private final boolean motionMode;
     //ByteBuffer alignment;
     GLProg glProg;
     GLUtils glUtils;
-    public PyramidMerging(Point size,ArrayList<ImageFrame> images) {
+    public PyramidMerging(Point size, ArrayList<ImageFrame> images, boolean motionMode) {
         super(size, new GLCoreBlockProcessing(size,new GLFormat(GLFormat.DataType.UNSIGNED_16), GLDrawParams.Allocate.Direct),"", "PyramidMerging", true);
         this.glProg = glOne.glProgram;
         this.images = images;
         //this.alignment = alignment;
+        this.motionMode = motionMode;
     }
 
     float downScalePerLevel = 2.0f;
@@ -599,6 +602,11 @@ public class PyramidMerging extends GLOneScript {
         int minExpIdx = 0;
         int lowCnt = 0;
         for (int i = 1; i < images.size(); i++) {
+            if (motionMode) {
+                MotionMetrics.addFrameConfidence(
+                        MotionMetrics.cameraMotionConfidence()
+                );
+            }
             ImageFrame frame = images.get(i);
             float exposure = 1.f/frame.pair.layerMpy;
             Log.d("PyramidMerging", "exposure: " + exposure);
@@ -656,6 +664,7 @@ public class PyramidMerging extends GLOneScript {
             glProg.setVar("minLevel",minLevel);
             glProg.setVar("exposure", exposure);
             glProg.setVar("analogBalance", analogBalance);
+            glProg.setVar("motionMode", motionMode ? 1 : 0);
             if(exposure >= 0.95f) {
                 if(lowCnt > 1)
                     glProg.setVar("exposureLow", minExp - 0.05f);
@@ -738,6 +747,8 @@ public class PyramidMerging extends GLOneScript {
             glProg.setVar("whiteLevel", (float) (parameters.whiteLevel));
             glProg.setVar("blackLevel", blackLevel);
             glProg.setVar("analogBalance", analogBalance);
+            glProg.setVar("motionMode", motionMode ? 1 : 0);
+            glProg.setVar("effectiveStackRatio", MotionMetrics.effectiveStackRatio());
             //glProg.setVar("weight",  1.0f/(images.size()));
             //glProg.setVar("weight", 1.0f/(counter.get(exposure)+1.f));
             //glProg.setVar("weight2", 1.0f/(counter.get(exposure)+1.f));

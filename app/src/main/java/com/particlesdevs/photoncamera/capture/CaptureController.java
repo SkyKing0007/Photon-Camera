@@ -114,6 +114,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import com.particlesdevs.photoncamera.processing.ImageFrame;
+import com.particlesdevs.photoncamera.processing.MotionBatch;
+import com.particlesdevs.photoncamera.processing.MotionMetrics;
 import com.particlesdevs.photoncamera.processing.ImageSaverSelector;
 import com.particlesdevs.photoncamera.processing.SaverImplementation;
 
@@ -271,6 +273,53 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     private final ArrayDeque<Image> mZslRingBuffer = new ArrayDeque<>();
     private final Object mZslBufferLock = new Object();
     private volatile boolean mZslCapturing = false;
+    private final HashMap<Long, TotalCaptureResult> mZslResultMap = new HashMap<>();
+    private static final int MAX_ZSL_RESULT_METADATA = 48;
+
+    private long mMotionUnifiedExposureNs = 0L;
+    private int mMotionUnifiedIso = 0;
+    private long mMotionUnifiedGeneration = 0L;
+    private int mMotionUnifiedSettledFrames = 0;
+    private long mMotionUnifiedLastUpdateMs = 0L;
+    private static final long MOTION_UNIFIED_UPDATE_MIN_MS = 450L;
+
+    // Keep preview AE active long enough to measure the scene, then enter
+    // one confirmed shutter zone. Zone 0 remains automatic.
+    private int mMotionAeWarmupFrames = 0;
+    private boolean mMotionManualLadderActive = false;
+    private int mMotionManualFrames = 0;
+    private int mMotionCandidateZone = 0;
+    private int mMotionCandidateFrames = 0;
+    private int mMotionActiveZone = 0;
+    private static final int MOTION_AE_WARMUP_FRAMES = 24;
+    private static final int MOTION_ZONE_CONFIRM_FRAMES = 3;
+    private static final int MOTION_MANUAL_RESAMPLE_FRAMES = 60;
+    private static final long MOTION_ZONE_30_ENERGY = 12_000_000_000L;
+    private static final long MOTION_ZONE_20_ENERGY = 22_000_000_000L;
+    private static final long MOTION_ZONE_15_ENERGY = 36_000_000_000L;
+
+    private static final int MOTION_ZONE_30_MIN_AE_ISO = 1000;
+    private static final int MOTION_ZONE_20_MIN_AE_ISO = 1600;
+    private static final int MOTION_ZONE_15_MIN_AE_ISO = 2400;
+
+    private long mMotionLastLoggedRequestedExposureNs = Long.MIN_VALUE;
+    private long mMotionLastLoggedActualExposureNs = Long.MIN_VALUE;
+    private int mMotionLastLoggedRequestedIso = Integer.MIN_VALUE;
+    private int mMotionLastLoggedActualIso = Integer.MIN_VALUE;
+    private String mMotionLastLadderDecision = "";
+
+    private long mMotionDiagnosticShotId = 0L;
+
+    // Responsive hybrid ZSL: wait briefly for the passive rolling ring to
+    // reach the requested count, then process whatever current-generation
+    // frames are available above the safe minimum.
+    private boolean mMotionTopUpActive = false;
+    private long mMotionTopUpStartMs = 0L;
+    private int mMotionTopUpTargetFrames = 0;
+    private int mMotionTopUpMinimumFrames = 0;
+    private static final long MOTION_TOP_UP_TIMEOUT_MS = 1400L;
+    private static final long MOTION_TOP_UP_POLL_MS = 25L;
+    private static final long MOTION_VERY_DARK_ENERGY_THRESHOLD = 30_000_000_000L;
 
     private final ImageReader.OnImageAvailableListener mOnYuvImageAvailableListener
             = new ImageReader.OnImageAvailableListener() {
@@ -298,10 +347,12 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             if (isZslMode()) {
                 Image img = reader.acquireNextImage();
                 if (img == null) return;
-                if (mZslCapturing) {
+                if (mZslCapturing && !mMotionTopUpActive) {
                     img.close();
                     return;
                 }
+                // Metadata can arrive after the Image callback. Buffer first;
+                // validate timestamp/exposure when shutter is pressed.
                 synchronized (mZslBufferLock) {
                     mZslRingBuffer.addLast(img);
                     int maxFrames = Math.min(PhotonCamera.getSettings().frameCount, 37);
@@ -474,6 +525,68 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             process(partialResult);
         }
 
+        private boolean shouldLogMotionExposure(
+                Long requestedExposure,
+                Long actualExposure,
+                Integer requestedIso,
+                Integer actualIso) {
+
+            long reqExp = requestedExposure == null
+                    ? Long.MIN_VALUE : requestedExposure;
+            long actExp = actualExposure == null
+                    ? Long.MIN_VALUE : actualExposure;
+            int reqIso = requestedIso == null
+                    ? Integer.MIN_VALUE : requestedIso;
+            int actIso = actualIso == null
+                    ? Integer.MIN_VALUE : actualIso;
+
+            boolean first = mMotionLastLoggedActualExposureNs
+                    == Long.MIN_VALUE;
+
+            boolean requestChanged =
+                    reqExp != mMotionLastLoggedRequestedExposureNs
+                    || reqIso != mMotionLastLoggedRequestedIso;
+
+            boolean actualExposureChanged = first;
+            if (!first
+                    && actExp > 0
+                    && mMotionLastLoggedActualExposureNs > 0) {
+                long high = Math.max(
+                        actExp,
+                        mMotionLastLoggedActualExposureNs);
+                long low = Math.min(
+                        actExp,
+                        mMotionLastLoggedActualExposureNs);
+                actualExposureChanged = high >= low + low / 4;
+            }
+
+            boolean actualIsoChanged = first;
+            if (!first
+                    && actIso > 0
+                    && mMotionLastLoggedActualIso > 0) {
+                int high = Math.max(
+                        actIso,
+                        mMotionLastLoggedActualIso);
+                int low = Math.min(
+                        actIso,
+                        mMotionLastLoggedActualIso);
+                actualIsoChanged = high >= low + low / 4;
+            }
+
+            if (!(first
+                    || requestChanged
+                    || actualExposureChanged
+                    || actualIsoChanged)) {
+                return false;
+            }
+
+            mMotionLastLoggedRequestedExposureNs = reqExp;
+            mMotionLastLoggedActualExposureNs = actExp;
+            mMotionLastLoggedRequestedIso = reqIso;
+            mMotionLastLoggedActualIso = actIso;
+            return true;
+        }
+
         @Override
         public void onCaptureCompleted(@NonNull CameraCaptureSession session,
                                        @NonNull CaptureRequest request,
@@ -485,6 +598,9 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             if (exposure != null) mPreviewExposureTime = (long) exposure;
             if (iso != null) mPreviewIso = (int) iso;
             if (focus != null) mFocus = (float) focus;
+            if (isZslMode()) {
+                updateMotionUnifiedExposure(request, result);
+            }
             if (mTemp != null) mPreviewTemp = mTemp;
             if (mPreviewTemp == null) {
                 mPreviewTemp = new Rational[3];
@@ -496,6 +612,68 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             mFlashed = state != null && state == CaptureResult.FLASH_STATE_PARTIAL || state == CaptureResult.FLASH_STATE_FIRED;
             mPreviewCaptureResult = result;
             mPreviewCaptureRequest = request;
+            Long sensorTimestamp = result.get(CaptureResult.SENSOR_TIMESTAMP);
+            if (sensorTimestamp != null && PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
+                synchronized (mZslBufferLock) {
+                    mZslResultMap.put(sensorTimestamp, result);
+                    while (mZslResultMap.size() > MAX_ZSL_RESULT_METADATA) {
+                        Long oldest = Collections.min(mZslResultMap.keySet());
+                        mZslResultMap.remove(oldest);
+                    }
+                }
+                Long requestedExposure =
+                        request.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+                Long actualMotionExposure =
+                        result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+                Integer requestedMotionIso =
+                        request.get(CaptureRequest.SENSOR_SENSITIVITY);
+                Integer actualMotionIso =
+                        result.get(CaptureResult.SENSOR_SENSITIVITY);
+
+                if (shouldLogMotionExposure(
+                        requestedExposure,
+                        actualMotionExposure,
+                        requestedMotionIso,
+                        actualMotionIso)) {
+                    Log.d(TAG, "MotionExposureChange camera=" + physicalID
+                            + " timestamp=" + sensorTimestamp
+                            + " requested=" + requestedExposure
+                            + " actual=" + actualMotionExposure
+                            + " requestedIso=" + requestedMotionIso
+                            + " actualIso=" + actualMotionIso
+                            + " generation=" + mMotionUnifiedGeneration
+                            + " activeZone=" + mMotionActiveZone);
+                }
+
+                String diagnosticBase =
+                        com.particlesdevs.photoncamera.processing.parameters
+                                .IsoExpoSelector.lastMotionExposureDiagnostics;
+                int previousUnified =
+                        diagnosticBase.indexOf(";UnifiedGeneration=");
+                if (previousUnified >= 0) {
+                    diagnosticBase = diagnosticBase.substring(0, previousUnified);
+                }
+                com.particlesdevs.photoncamera.processing.parameters
+                        .IsoExpoSelector.lastMotionExposureDiagnostics =
+                        diagnosticBase
+                        + ";UnifiedGeneration=" + mMotionUnifiedGeneration
+                        + ";UnifiedSettledFrames=" + mMotionUnifiedSettledFrames
+                        + ";UnifiedRequestedExposureNs="
+                            + request.get(CaptureRequest.SENSOR_EXPOSURE_TIME)
+                        + ";UnifiedRequestedIso="
+                            + request.get(CaptureRequest.SENSOR_SENSITIVITY)
+                        + ";UnifiedActualExposureNs="
+                            + result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                        + ";UnifiedActualIso="
+                            + result.get(CaptureResult.SENSOR_SENSITIVITY)
+                        + ";PhysicalCameraId=" + physicalID
+                        + ";ManualLadderActive=" + mMotionManualLadderActive
+                        + ";AeWarmupFrames=" + mMotionAeWarmupFrames
+                        + ";MotionCandidateZone=" + mMotionCandidateZone
+                        + ";MotionCandidateFrames=" + mMotionCandidateFrames
+                        + ";MotionActiveZone=" + mMotionActiveZone
+                        + ";ManualFrames=" + mMotionManualFrames;
+            }
             process(result);
             cameraEventsListener.onPreviewCaptureCompleted(result);
             if(PreferenceKeys.getAfMode() == CaptureRequest.CONTROL_AF_MODE_AUTO && !burst && !mTouchFocus.isTouchFocus) {
@@ -940,7 +1118,386 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             default: return FpsRangeAuto;
         }
     }
-    
+
+    private Range<Integer> chooseMotionUnifiedFpsRange(long exposureNs) {
+        int sensorFps = (int) Math.max(1L,
+                Math.min(30L, 1_000_000_000L / Math.max(1L, exposureNs)));
+        Range<Integer>[] ranges = mCameraCharacteristics == null ? null
+                : mCameraCharacteristics.get(
+                        CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
+        if (ranges == null || ranges.length == 0) {
+            return new Range<>(sensorFps, 30);
+        }
+        Range<Integer> best = null;
+        int bestScore = Integer.MAX_VALUE;
+        for (Range<Integer> range : ranges) {
+            int lower = range.getLower();
+            int upper = range.getUpper();
+            if (upper < sensorFps) continue;
+            int score = Math.abs(upper - 30) * 10
+                    + Math.abs(lower - sensorFps);
+            if (score < bestScore) {
+                best = range;
+                bestScore = score;
+            }
+        }
+        return best == null ? FpsRangeAuto : best;
+    }
+
+    private void clearMotionUnifiedBuffer() {
+        synchronized (mZslBufferLock) {
+            while (!mZslRingBuffer.isEmpty()) {
+                Image image = mZslRingBuffer.pollFirst();
+                if (image != null) image.close();
+            }
+            mZslResultMap.clear();
+        }
+    }
+
+    private boolean motionExposureMatches(TotalCaptureResult result) {
+        if (result == null || mMotionUnifiedExposureNs <= 0L
+                || mMotionUnifiedIso <= 0) return false;
+        Long exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+        if (exposure == null || iso == null) return false;
+        long exposureTolerance = Math.max(750_000L,
+                mMotionUnifiedExposureNs / 12L);
+        int isoTolerance = Math.max(2, mMotionUnifiedIso / 10);
+        return Math.abs(exposure - mMotionUnifiedExposureNs)
+                        <= exposureTolerance
+                && Math.abs(iso - mMotionUnifiedIso) <= isoTolerance;
+    }
+
+    private void restoreMotionPreviewAe() {
+        try {
+            setAEMode(mPreviewRequestBuilder, PreferenceKeys.getAeMode());
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    getSelectedFpsRange());
+            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, null);
+            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, null);
+            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_FRAME_DURATION, null);
+
+            mMotionManualLadderActive = false;
+            mMotionManualFrames = 0;
+            mMotionAeWarmupFrames = 0;
+            mMotionCandidateZone = 0;
+            mMotionCandidateFrames = 0;
+            mMotionActiveZone = 0;
+            mMotionLastLadderDecision = "";
+            mMotionUnifiedExposureNs = 0L;
+            mMotionUnifiedIso = 0;
+            mMotionUnifiedSettledFrames = 0;
+            mMotionUnifiedGeneration++;
+            clearMotionUnifiedBuffer();
+            rebuildPreviewBuilder();
+            Log.i(TAG, "MOTION_AE_RESTORED generation="
+                    + mMotionUnifiedGeneration);
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            Log.e(TAG, "Motion AE restore failed: "
+                    + Log.getStackTraceString(e));
+        }
+    }
+
+    private int chooseMotionBrightnessZone(
+            long exposureEnergy,
+            int aeIso) {
+
+        if (exposureEnergy >= MOTION_ZONE_15_ENERGY
+                && aeIso >= MOTION_ZONE_15_MIN_AE_ISO) {
+            return 3;
+        }
+
+        if (exposureEnergy >= MOTION_ZONE_20_ENERGY
+                && aeIso >= MOTION_ZONE_20_MIN_AE_ISO) {
+            return 2;
+        }
+
+        if (exposureEnergy >= MOTION_ZONE_30_ENERGY
+                && aeIso >= MOTION_ZONE_30_MIN_AE_ISO) {
+            return 1;
+        }
+
+        return 0;
+    }
+
+    private int chooseMotionGyroLimitZone(int gyroShakiness) {
+        // This project already treats roughly 25 as steady and roughly 400
+        // as shaky. The previous >140 hard veto was therefore too strict.
+        if (gyroShakiness <= 35) return 3;
+        if (gyroShakiness <= 70) return 2;
+        if (gyroShakiness <= 260) return 1;
+        return 0;
+    }
+
+    private void logMotionLadderDecision(
+            int brightnessZone,
+            int motionLimitZone,
+            int desiredZone,
+            long exposureEnergy,
+            long actualExposure,
+            int actualIso,
+            int gyroShakiness,
+            String reason) {
+
+        String signature = brightnessZone
+                + ":" + motionLimitZone
+                + ":" + desiredZone
+                + ":" + reason;
+
+        if (signature.equals(mMotionLastLadderDecision)) {
+            return;
+        }
+
+        mMotionLastLadderDecision = signature;
+
+        Log.i(TAG, "MOTION_LADDER_DECISION"
+                + " reason=" + reason
+                + " brightnessZone=" + brightnessZone
+                + " motionLimitZone=" + motionLimitZone
+                + " desiredZone=" + desiredZone
+                + " aeEnergy=" + exposureEnergy
+                + " aeExposureNs=" + actualExposure
+                + " aeIso=" + actualIso
+                + " gyroShakiness=" + gyroShakiness
+                + " candidateZone=" + mMotionCandidateZone
+                + " candidateFrames=" + mMotionCandidateFrames);
+    }
+
+    private long exposureForMotionZone(
+            int zone,
+            Integer antibandingMode) {
+
+        boolean fiftyHz = antibandingMode != null
+                && antibandingMode
+                == CaptureResult.CONTROL_AE_ANTIBANDING_MODE_50HZ;
+
+        if (fiftyHz) {
+            if (zone >= 2) return 1_000_000_000L / 20L;
+            if (zone == 1) return 1_000_000_000L / 25L;
+            return 1_000_000_000L / 50L;
+        }
+
+        if (zone >= 3) return 1_000_000_000L / 15L;
+        if (zone == 2) return 1_000_000_000L / 20L;
+        if (zone == 1) return 1_000_000_000L / 30L;
+        return 1_000_000_000L / 60L;
+    }
+
+    private void updateMotionUnifiedExposure(
+            @NonNull CaptureRequest completedRequest,
+            @NonNull TotalCaptureResult result) {
+
+        if (!isZslMode()
+                || mZslCapturing
+                || burst
+                || isProcessing
+                || mPreviewRequestBuilder == null
+                || mCaptureSession == null) {
+            return;
+        }
+
+        Long actualExposure =
+                result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer actualIso =
+                result.get(CaptureResult.SENSOR_SENSITIVITY);
+        if (actualExposure == null || actualIso == null) return;
+
+        if (mMotionManualLadderActive) {
+            if (motionExposureMatches(result)) {
+                mMotionUnifiedSettledFrames++;
+            } else {
+                mMotionUnifiedSettledFrames = 0;
+            }
+
+            mMotionManualFrames++;
+            if (mMotionManualFrames >= MOTION_MANUAL_RESAMPLE_FRAMES) {
+                restoreMotionPreviewAe();
+            }
+            return;
+        }
+
+        mMotionAeWarmupFrames++;
+        if (mMotionAeWarmupFrames < MOTION_AE_WARMUP_FRAMES) return;
+
+        long exposureEnergy;
+        try {
+            exposureEnergy = Math.multiplyExact(
+                    actualExposure,
+                    (long) actualIso);
+        } catch (ArithmeticException overflow) {
+            exposureEnergy = Long.MAX_VALUE;
+        }
+
+        int gyroShakiness = PhotonCamera.getGyro() == null
+                ? 0
+                : Math.max(
+                        0,
+                        PhotonCamera.getGyro().getFilteredShakiness());
+
+        int brightnessZone = chooseMotionBrightnessZone(
+                exposureEnergy,
+                actualIso);
+        int motionLimitZone = chooseMotionGyroLimitZone(
+                gyroShakiness);
+        int desiredZone = Math.min(
+                brightnessZone,
+                motionLimitZone);
+
+        if (desiredZone == 0) {
+            String reason = brightnessZone == 0
+                    ? "sceneNotDarkEnough"
+                    : "gyroLimit";
+            logMotionLadderDecision(
+                    brightnessZone,
+                    motionLimitZone,
+                    desiredZone,
+                    exposureEnergy,
+                    actualExposure,
+                    actualIso,
+                    gyroShakiness,
+                    reason);
+            mMotionCandidateZone = 0;
+            mMotionCandidateFrames = 0;
+            return;
+        }
+
+        if (desiredZone == mMotionCandidateZone) {
+            mMotionCandidateFrames++;
+        } else {
+            mMotionCandidateZone = desiredZone;
+            mMotionCandidateFrames = 1;
+            logMotionLadderDecision(
+                    brightnessZone,
+                    motionLimitZone,
+                    desiredZone,
+                    exposureEnergy,
+                    actualExposure,
+                    actualIso,
+                    gyroShakiness,
+                    "candidateChanged");
+        }
+
+        if (mMotionCandidateFrames < MOTION_ZONE_CONFIRM_FRAMES) {
+            return;
+        }
+
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - mMotionUnifiedLastUpdateMs
+                < MOTION_UNIFIED_UPDATE_MIN_MS) return;
+
+        Integer antibandingMode =
+                result.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE);
+
+        long desiredExposure = exposureForMotionZone(
+                desiredZone,
+                antibandingMode);
+
+        desiredExposure = Math.max(
+                com.particlesdevs.photoncamera.processing.parameters
+                        .IsoExpoSelector.getEXPLOW(),
+                Math.min(
+                        com.particlesdevs.photoncamera.processing.parameters
+                                .IsoExpoSelector.getEXPHIGH(),
+                        desiredExposure));
+
+        int desiredIso = (int) Math.round(
+                (double) exposureEnergy
+                        / Math.max(1L, desiredExposure));
+
+        desiredIso = Math.max(
+                com.particlesdevs.photoncamera.processing.parameters
+                        .IsoExpoSelector.getISOLOW(),
+                Math.min(
+                        com.particlesdevs.photoncamera.processing.parameters
+                                .IsoExpoSelector.getISOHIGH(),
+                        desiredIso));
+
+        int maximumUsefulIso =
+                Math.max(
+                        com.particlesdevs.photoncamera.processing.parameters
+                                .IsoExpoSelector.getISOLOW(),
+                        (int) Math.floor(actualIso * 0.67));
+
+        if (desiredIso > maximumUsefulIso) {
+            mMotionCandidateZone = 0;
+            mMotionCandidateFrames = 0;
+            Log.i(TAG, "MOTION_ZONE_REJECTED"
+                    + " reason=insufficientIsoBenefit"
+                    + " brightnessZone=" + brightnessZone
+                    + " motionLimitZone=" + motionLimitZone
+                    + " zone=" + desiredZone
+                    + " aeExposureNs=" + actualExposure
+                    + " aeIso=" + actualIso
+                    + " desiredExposureNs=" + desiredExposure
+                    + " desiredIso=" + desiredIso
+                    + " maximumUsefulIso=" + maximumUsefulIso
+                    + " gyroShakiness=" + gyroShakiness);
+            return;
+        }
+
+        Range<Integer> fpsRange =
+                chooseMotionUnifiedFpsRange(desiredExposure);
+
+        long frameDuration = Math.max(
+                desiredExposure,
+                1_000_000_000L
+                        / Math.max(1, fpsRange.getUpper()));
+
+        try {
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_OFF);
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.FLASH_MODE,
+                    CaptureRequest.FLASH_MODE_OFF);
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.SENSOR_EXPOSURE_TIME,
+                    desiredExposure);
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.SENSOR_SENSITIVITY,
+                    desiredIso);
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.SENSOR_FRAME_DURATION,
+                    frameDuration);
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    fpsRange);
+
+            mMotionManualLadderActive = true;
+            mMotionManualFrames = 0;
+            mMotionActiveZone = desiredZone;
+            mMotionUnifiedExposureNs = desiredExposure;
+            mMotionUnifiedIso = desiredIso;
+            mMotionUnifiedGeneration++;
+            mMotionUnifiedSettledFrames = 0;
+            mMotionUnifiedLastUpdateMs = now;
+            mMotionCandidateFrames = 0;
+
+            clearMotionUnifiedBuffer();
+            rebuildPreviewBuilder();
+
+            Log.i(TAG, "MOTION_UNIFIED_REQUEST_APPLIED"
+                    + " generation=" + mMotionUnifiedGeneration
+                    + " zone=" + desiredZone
+                    + " aeEnergy=" + exposureEnergy
+                    + " aeExposureNs=" + actualExposure
+                    + " aeIso=" + actualIso
+                    + " zone30MinIso=" + MOTION_ZONE_30_MIN_AE_ISO
+                    + " zone20MinIso=" + MOTION_ZONE_20_MIN_AE_ISO
+                    + " zone15MinIso=" + MOTION_ZONE_15_MIN_AE_ISO
+                    + " gyroShakiness=" + gyroShakiness
+                    + " antibanding=" + antibandingMode
+                    + " exposureNs=" + desiredExposure
+                    + " iso=" + desiredIso
+                    + " frameDurationNs=" + frameDuration
+                    + " fpsRange=" + fpsRange);
+        } catch (IllegalArgumentException | IllegalStateException e) {
+            Log.e(TAG, "Motion multi-zone exposure update failed: "
+                    + Log.getStackTraceString(e));
+        }
+    }
+
     public void rebuildPreviewBuilder() {
         if(burst) return;
         try {
@@ -1305,7 +1862,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
     });
     }
     public void UpdateCameraCharacteristics(String cameraId) {
-        PhotonCamera.getSpecificSensor().selectSpecifics(Integer.parseInt(cameraId));
+        PhotonCamera.getSpecificSensor().selectSpecifics(
+                Integer.parseInt(cameraId));
         CameraCharacteristics characteristics = this.mCameraCharacteristicsMap.get(cameraId);
         mCameraCharacteristics = characteristics;
         //Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
@@ -1836,8 +2394,24 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
     private boolean isZslMode() {
         return PhotonCamera.getSettings().selectedMode == CameraMode.MOTION
-                && !IsoExpoSelector.HDR
                 && !isDualSession;
+    }
+
+    private TotalCaptureResult findNearestZslResult(long timestamp) {
+        synchronized (mZslBufferLock) {
+            TotalCaptureResult exact = mZslResultMap.get(timestamp);
+            if (exact != null) return exact;
+            long bestDelta = Long.MAX_VALUE;
+            TotalCaptureResult best = null;
+            for (Map.Entry<Long, TotalCaptureResult> entry : mZslResultMap.entrySet()) {
+                long delta = Math.abs(entry.getKey() - timestamp);
+                if (delta < bestDelta) {
+                    bestDelta = delta;
+                    best = entry.getValue();
+                }
+            }
+            return bestDelta <= 40_000_000L ? best : null;
+        }
     }
 
     private void triggerZslCapture() {
@@ -1845,10 +2419,100 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
             Log.w(TAG, "ZSL: capture already in progress, ignoring");
             return;
         }
+
         mZslCapturing = true;
         burst = false;
+        mMotionTopUpActive = true;
+        mMotionTopUpStartMs = android.os.SystemClock.elapsedRealtime();
+        mMotionTopUpTargetFrames = Math.max(
+                1,
+                Math.min(PhotonCamera.getSettings().frameCount, 37));
+        mMotionTopUpMinimumFrames = Math.min(
+                mMotionTopUpTargetFrames,
+                Math.max(6, Math.min(8, mMotionTopUpTargetFrames)));
 
-        int frameCount = FrameNumberSelector.getFrames();
+        int buffered;
+        synchronized (mZslBufferLock) {
+            buffered = mZslRingBuffer.size();
+        }
+
+        mMotionDiagnosticShotId =
+                com.particlesdevs.photoncamera.util.MotionTrace.beginShot(
+                        physicalID,
+                        mMotionTopUpTargetFrames,
+                        buffered,
+                        mMotionManualLadderActive,
+                        mMotionUnifiedGeneration);
+
+        com.particlesdevs.photoncamera.util.MotionTrace.state(
+                mMotionDiagnosticShotId,
+                "TOP_UP_BEGIN",
+                "buffered=" + buffered
+                        + " target=" + mMotionTopUpTargetFrames
+                        + " minimum=" + mMotionTopUpMinimumFrames
+                        + " timeoutMs=" + MOTION_TOP_UP_TIMEOUT_MS);
+
+        pollMotionTopUp();
+    }
+
+    private void pollMotionTopUp() {
+        if (!mMotionTopUpActive) {
+            return;
+        }
+
+        int buffered;
+        synchronized (mZslBufferLock) {
+            buffered = mZslRingBuffer.size();
+        }
+
+        long elapsed = android.os.SystemClock.elapsedRealtime()
+                - mMotionTopUpStartMs;
+
+        boolean targetReady = buffered >= mMotionTopUpTargetFrames;
+        boolean timedOut = elapsed >= MOTION_TOP_UP_TIMEOUT_MS;
+
+        if (targetReady
+                || (timedOut && buffered >= mMotionTopUpMinimumFrames)) {
+            mMotionTopUpActive = false;
+            com.particlesdevs.photoncamera.util.MotionTrace.state(
+                    mMotionDiagnosticShotId,
+                    "TOP_UP_END",
+                    "buffered=" + buffered
+                            + " targetReady=" + targetReady
+                            + " timedOut=" + timedOut
+                            + " elapsedMs=" + elapsed);
+            finalizeMotionZslCapture();
+            return;
+        }
+
+        if (timedOut) {
+            mMotionTopUpActive = false;
+            mZslCapturing = false;
+            burst = false;
+            mState = STATE_PREVIEW;
+            com.particlesdevs.photoncamera.util.MotionTrace.finish(
+                    mMotionDiagnosticShotId,
+                    "BUFFER_NOT_READY",
+                    "buffered=" + buffered
+                            + " minimum=" + mMotionTopUpMinimumFrames
+                            + " elapsedMs=" + elapsed);
+            cameraEventsListener.onProcessingFinished(
+                    "Motion buffer preparing");
+            return;
+        }
+
+        mBackgroundHandler.postDelayed(
+                this::pollMotionTopUp,
+                MOTION_TOP_UP_POLL_MS);
+    }
+
+    private void finalizeMotionZslCapture() {
+        int frameCount = mMotionTopUpTargetFrames > 0
+                ? mMotionTopUpTargetFrames
+                : Math.max(
+                        1,
+                        Math.min(PhotonCamera.getSettings().frameCount, 37));
+        int candidateCount = frameCount;
         cameraRotation = PhotonCamera.getGravity().getCameraRotation(mSensorOrientation);
         BurstShakiness = new ArrayList<>();
         mExposures = new HashMap<>();
@@ -1883,8 +2547,14 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
 
         // Copy selected Images to ImageFrames only now (on shutter press)
         List<ImageFrame> selected = new ArrayList<>();
+        HashMap<Long, TotalCaptureResult> selectedResults = new HashMap<>();
         for (int i = skip; i < rawImages.size(); i++) {
             Image img = rawImages.get(i);
+            TotalCaptureResult frameResult = findNearestZslResult(img.getTimestamp());
+            if (mMotionManualLadderActive && !motionExposureMatches(frameResult)) {
+                img.close();
+                continue;
+            }
             int rowStride = img.getPlanes()[0].getRowStride();
             int pixelStride = img.getPlanes()[0].getPixelStride();
             int width = (img.getFormat() == ImageFormat.RAW10)
@@ -1912,7 +2582,16 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
                 frame.height/= 2;
             }
             img.close();
-            mExposures.put(frame.timestamp, exposureVal);
+            long actualExposureNs = exposureTimeNs;
+            int actualIso = (int)previewISO;
+            if (frameResult != null) {
+                Long e = frameResult.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+                Integer s = frameResult.get(CaptureResult.SENSOR_SENSITIVITY);
+                if (e != null) actualExposureNs = e;
+                if (s != null) actualIso = s;
+                selectedResults.put(frame.timestamp, frameResult);
+            }
+            mExposures.put(frame.timestamp, ExposureIndex.time2sec(actualExposureNs) * actualIso);
             selected.add(frame);
         }
         int actualCount = selected.size();
@@ -1926,13 +2605,34 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         SaverImplementation.IMAGE_BUFFER.clear();
         SaverImplementation.IMAGE_BUFFER.addAll(selected);
 
+        // Publish the actual immutable Motion batch size before processing.
+        // The existing JPEG ImageDescription/EXIF path reads this field.
+        final int motionSelectedFrameCount = selected.size();
+        com.particlesdevs.photoncamera.processing.parameters
+                .FrameNumberSelector.frameCount =
+                motionSelectedFrameCount;
+
+        com.particlesdevs.photoncamera.util.MotionTrace.state(
+                mMotionDiagnosticShotId,
+                "JPEG_EXIF_FRAMECOUNT",
+                "selectedFrameCount=" + motionSelectedFrameCount
+                        + " publishedFrameCount="
+                        + com.particlesdevs.photoncamera.processing.parameters
+                                .FrameNumberSelector.frameCount);
+
+        // Ownership has transferred to the immutable processing batch.
+        // Re-open the passive ring immediately for the next scene. A second
+        // shutter is still blocked by CaptureController.isProcessing.
+        mZslCapturing = false;
+        mMotionTopUpActive = false;
+
         mCaptureResult = mPreviewCaptureResult;
         mMeasuredFrameCnt = actualCount;
 
         cameraEventsListener.onFrameCountSet(actualCount);
         cameraEventsListener.onCaptureStillPictureStarted("ZSLCaptureStarted!");
         cameraEventsListener.onBurstPrepared(null);
-        final double frametime = ExposureIndex.time2sec(IsoExpoSelector.GenerateExpoPair(-1, this).exposure);
+        final double frametime = exposureTimeNs > 0 ? ExposureIndex.time2sec(exposureTimeNs) : previewExpTime;
         for (int i = 0; i < actualCount; i++) {
             cameraEventsListener.onFrameCaptureStarted(null);
             cameraEventsListener.onFrameCaptureCompleted(
@@ -1946,31 +2646,90 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
         }
         PhotonCamera.getGyro().buildZslBurstShakiness(frameTimestamps, exposureTimeNs, BurstShakiness);
 
-        // Populate fullpairs the same way setExpo() does for a normal burst
         IsoExpoSelector.fullpairs.clear();
         for (int i = 0; i < actualCount; i++) {
-            IsoExpoSelector.fullpairs.add(IsoExpoSelector.GenerateExpoPair(i, this));
+            ImageFrame frame = selected.get(i);
+            IsoExpoSelector.fullpairs.add(IsoExpoSelector.createEqualExposureZslPair(
+                    this, selectedResults.get(frame.timestamp)));
         }
 
         final int capturedCount = actualCount;
+
+        com.particlesdevs.photoncamera.util.MotionTrace.state(
+                mMotionDiagnosticShotId,
+                "BUFFER_SELECTED",
+                "capturedCount=" + capturedCount
+                        + " requestedSetting="
+                        + PhotonCamera.getSettings().frameCount
+                        + " candidateCount=" + candidateCount
+                        + " topUpTarget=" + mMotionTopUpTargetFrames
+                        + " topUpMinimum=" + mMotionTopUpMinimumFrames
+                        + " generation=" + mMotionUnifiedGeneration);
+
+        if (capturedCount == 0) {
+            Log.w(TAG, "ZSL ring buffer had no valid current-generation frames");
+            com.particlesdevs.photoncamera.util.MotionTrace.finish(
+                    mMotionDiagnosticShotId,
+                    "EMPTY_BUFFER",
+                    "generation=" + mMotionUnifiedGeneration
+                            + " settled="
+                            + mMotionUnifiedSettledFrames);
+            SaverImplementation.IMAGE_BUFFER.clear();
+            synchronized (mZslBufferLock) { mZslResultMap.clear(); }
+            mZslCapturing = false;
+            burst = false;
+            mState = STATE_PREVIEW;
+            mBackgroundHandler.post(this::unlockFocus);
+            cameraEventsListener.onProcessingFinished("ZSL buffer not ready");
+            return;
+        }
+
+        final MotionBatch motionBatch = new MotionBatch(
+                selected, new ArrayList<>(BurstShakiness), mExposures, selectedResults,
+                selectedResults.isEmpty() ? mPreviewCaptureResult
+                        : selectedResults.get(selected.get(selected.size() - 1).timestamp),
+                mPreviewCaptureRequest, CaptureController.RAW_FORMAT, cameraRotation, candidateCount);
         processExecutor.execute(() -> {
             try {
                 PhotonCamera.getGyro().CompleteSequence();
                 mBackgroundHandler.post(this::unlockFocus);
-                if (capturedCount == 0) {
-                    Log.w(TAG, "ZSL ring buffer was empty, no frames to process");
-                    cameraEventsListener.onProcessingFinished("ZSL buffer empty");
-                    return;
-                }
-                mImageSaver.implementation.bufferLock = false;
-                mImageSaver.updateFrameCount(capturedCount);
-                mImageSaver.runRaw(mCameraCharacteristics, mPreviewCaptureResult, mPreviewCaptureRequest,
-                        new ArrayList<>(BurstShakiness), cameraRotation, mExposures);
+                MotionMetrics.begin(
+                        motionBatch.candidateCount,
+                        motionBatch.retainedCount,
+                        motionBatch.gyro
+                );
+                mImageSaver.runMotionRaw(mCameraCharacteristics, motionBatch);
             } catch (Exception e) {
-                Log.e(TAG, "ZSL runRaw: " + Log.getStackTraceString(e));
-                cameraEventsListener.onProcessingError(e.getLocalizedMessage());
+                com.particlesdevs.photoncamera.util.MotionTrace.error(
+                        mMotionDiagnosticShotId,
+                        "CAPTURE_OR_PROCESSING",
+                        e);
+                Log.e(TAG, "ZSL runRaw full exception: "
+                        + Log.getStackTraceString(e));
+                String message = e.getClass().getSimpleName()
+                        + ": " + String.valueOf(e.getLocalizedMessage());
+                cameraEventsListener.onProcessingError(message);
             } finally {
+                com.particlesdevs.photoncamera.util.MotionTrace.finish(
+                        mMotionDiagnosticShotId,
+                        "FINALLY",
+                        "mZslCapturing=" + mZslCapturing
+                                + " burst=" + burst
+                                + " state=" + mState);
+                // Do not clear mZslResultMap here: the passive ring may
+                // already contain the next scene's frames and metadata.
                 mZslCapturing = false;
+                burst = false;
+                mState = STATE_PREVIEW;
+                SaverImplementation.IMAGE_BUFFER.clear();
+                mBackgroundHandler.post(this::unlockFocus);
+                try {
+                    cameraEventsListener.onProcessingFinished(
+                            "Motion processing ended");
+                } catch (Exception cleanupError) {
+                    Log.e(TAG, "Motion shutter cleanup callback failed: "
+                            + Log.getStackTraceString(cleanupError));
+                }
             }
         });
     }

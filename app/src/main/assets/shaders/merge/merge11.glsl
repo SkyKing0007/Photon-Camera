@@ -19,6 +19,8 @@ uniform float whiteLevel;
 uniform vec4 blackLevel;
 uniform vec4 analogBalance;
 uniform int cfaPattern;
+uniform int motionMode;
+uniform float effectiveStackRatio;
 #import median
 uint getBayer(ivec2 coords, highp usampler2D tex){
     return texelFetch(tex,coords,0).r;
@@ -88,6 +90,15 @@ void main() {
     //float lDiff = length(diff);
     diff = diffOrigin / (length(diffOrigin) + EPS) * lDiff;
     //diff *= ((((noise*noise)/(noise*noise + diff*diff))));
-    imageStore(outTexture, xy, mix(base, diff/analogBalance+bayer, weight));
+    float mergeWeight = weight;
+    if (motionMode != 0) {
+        float residualMagnitude = length(diffOrigin);
+        float modeledNoise = max(length(noise), EPS);
+        float localConfidence = 1.0 - smoothstep(
+                modeledNoise * 2.5, modeledNoise * 6.0, residualMagnitude);
+        mergeWeight *= clamp(localConfidence, 0.0, 1.0);
+        mergeWeight *= clamp(effectiveStackRatio, 0.05, 1.0);
+    }
+    imageStore(outTexture, xy, mix(base, diff/analogBalance+bayer, mergeWeight));
     //imageStore(outTexture, xy, diff);
 }

@@ -209,6 +209,10 @@ case R.id.flash_button:
 
     @Override
     public void onCameraModeChanged(CameraMode cameraMode) {
+        if (cameraMode == CameraMode.MOTION) {
+            PreferenceKeys.setBracketingMode(0);
+            IsoExpoSelector.HDR = false;
+        }
         CameraMode previousMode = PhotonCamera.getSettings().selectedMode;
         if ((previousMode == CameraMode.RAWVIDEO
                 || previousMode == CameraMode.UNLIMITED)
@@ -326,8 +330,12 @@ case R.id.flash_button:
                         PreferenceKeys.setBatterySaver(value.equals(1));
                         break;
                     case BRACKETING:
+                        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
+                            PreferenceKeys.setBracketingMode(0);
+                            IsoExpoSelector.HDR = false;
+                            break;
+                        }
                         PreferenceKeys.setBracketingMode((Integer) value);
-                        // Update HDR class to use the new bracketing mode
                         IsoExpoSelector.HDR = (Integer) value > 0;
                         break;
 

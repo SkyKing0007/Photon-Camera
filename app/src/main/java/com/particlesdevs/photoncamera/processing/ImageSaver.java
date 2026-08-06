@@ -101,6 +101,21 @@ public class ImageSaver {
         frameCounter++;
     }
 
+    public void runMotionRaw(android.hardware.camera2.CameraCharacteristics characteristics,
+                             MotionBatch batch) {
+        setFrameCount(batch.retainedCount);
+        setImageFormat(batch.imageFormat);
+        implementation = ImageSaverSelector.getImageSaver(batch.imageFormat, implementation);
+        implementation.frameCount = batch.retainedCount;
+        SaverImplementation.IMAGE_BUFFER.clear();
+        SaverImplementation.IMAGE_BUFFER.addAll(batch.frames);
+        implementation.bufferLock = false;
+        updateFrameCount(batch.retainedCount);
+        runRaw(characteristics, batch.referenceResult, batch.referenceRequest,
+                new java.util.ArrayList<>(batch.gyro), batch.rotation,
+                new java.util.HashMap<>(batch.exposures));
+    }
+
     public void runRaw(CameraCharacteristics characteristics, CaptureResult captureResult, CaptureRequest captureRequest, ArrayList<GyroBurst> burstShakiness, int cameraRotation, HashMap<Long, Double> exposures) {
         TunableInjector.inject(SETTINGS);
         implementation.runRaw(imageFormat,characteristics,captureResult, captureRequest,burstShakiness,cameraRotation, exposures);

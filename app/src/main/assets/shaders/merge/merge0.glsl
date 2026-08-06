@@ -25,6 +25,7 @@ uniform ivec2 shift;
 uniform ivec2 alignmentSize;
 uniform ivec2 rawHalf;
 uniform vec4 analogBalance;
+uniform int motionMode;
 #define TILE 2
 #define CONCAT 1
 #define M_PI 3.1415926535897932384626433832795
@@ -124,7 +125,10 @@ void main() {
             bayerNone = mix(bayerPrev, bayerNone, clamp(w3/(w2+w3+0.0001),vec4(0.0),vec4(1.0)));
             w2 = w3;
         }*/
-        bayerAlter = mix(bayerNone, bayerAlter, smoothstep(w2/(w1+w2),vec4(0.48),vec4(0.51)));
+        if (motionMode == 0) {
+            bayerAlter = mix(bayerNone, bayerAlter,
+                    smoothstep(w2/(w1+w2), vec4(0.48), vec4(0.51)));
+        }
 
         //vec4 hp2 = imageLoad(hotPixTexture, aligned * TILE);
         //bayerAlter = bayerAlter * vec4(1.0-hp2) + imageLoad(avrTexture, aligned * TILE) * hp2;

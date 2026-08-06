@@ -36,7 +36,9 @@ public class GLPreview extends GLSurfaceView {
 
         setEGLContextClientVersion(2);
         setRenderer(mRenderer);
-        setRenderMode(GLSurfaceView.RENDERMODE_WHEN_DIRTY);
+        // Keep redrawing the latest preview texture while the unified
+        // sensor request uses a slow Motion exposure.
+        setRenderMode(GLSurfaceView.RENDERMODE_CONTINUOUSLY);
     }
 
     public void fireOnSurfaceTextureAvailable(SurfaceTexture surfaceTexture, int w, int h) {

@@ -18,6 +18,12 @@ import java.text.SimpleDateFormat;
 import java.util.Locale;
 
 public class Log {
+    private static boolean shouldSkipPersistentSpam(
+            String tag,
+            String message) {
+        return "DynamicNoise".equals(tag);
+    }
+
     private static final String PHOTON_LOG_SUBFOLDER = "PhotonLog";
 
     private static java.io.File logDir = null;
@@ -39,6 +45,12 @@ public class Log {
     private static String currentDate = null;
     private static final int BUFFER_FLUSH_INTERVAL = 1000; // Flush every 1 second
 
+    private static HandlerThread motionLogThread;
+    private static Handler motionLogHandler;
+    private static BufferedWriter motionBufferedWriter = null;
+    private static String motionCurrentDate = null;
+    private static String motionLogFileName = null;
+
     static {
         initLogThread();
     }
@@ -47,6 +59,12 @@ public class Log {
         logThread = new HandlerThread("LogWriterThread");
         logThread.start();
         logHandler = new Handler(logThread.getLooper());
+
+        motionLogThread =
+                new HandlerThread("MotionLogWriterThread");
+        motionLogThread.start();
+        motionLogHandler =
+                new Handler(motionLogThread.getLooper());
 
         // Schedule periodic flush
         schedulePeriodicFlush();
@@ -139,6 +157,117 @@ public class Log {
         return new java.io.File(logDir, currentLogFileName);
     }
 
+    private static DocumentFile getMotionLogFileDocumentFile() {
+        DocumentFile folder = getLogFolderDocumentFile();
+        if (folder == null || !folder.isDirectory()) return null;
+
+        String today =
+                dateFormatter.get().format(new java.util.Date());
+
+        if (motionCurrentDate == null
+                || !motionCurrentDate.equals(today)) {
+            motionCurrentDate = today;
+            motionLogFileName =
+                    "motion-trace-" + today + ".txt";
+            closeMotionWriter();
+        }
+
+        DocumentFile file =
+                folder.findFile(motionLogFileName);
+
+        if (file != null && file.exists()) {
+            return file;
+        }
+
+        return folder.createFile(
+                "text/plain",
+                motionLogFileName);
+    }
+
+    private static void closeMotionWriter() {
+        if (motionBufferedWriter != null) {
+            try {
+                motionBufferedWriter.close();
+            } catch (Exception ignored) {
+            }
+            motionBufferedWriter = null;
+        }
+    }
+
+    public static void flushMotionNow() {
+        if (motionLogHandler != null) {
+            motionLogHandler.post(() -> {
+                if (motionBufferedWriter != null) {
+                    try {
+                        motionBufferedWriter.flush();
+                    } catch (Exception ignored) {
+                    }
+                }
+            });
+        }
+    }
+
+    public static void writeMotionTrace(
+            String level,
+            String message) {
+
+        if (!logEnabled
+                || motionLogHandler == null
+                || logContext == null
+                || !SimpleStorageHelper.hasStorageAccess(
+                        logContext)) {
+            return;
+        }
+
+        long timestamp = System.currentTimeMillis();
+
+        motionLogHandler.post(() -> {
+            try {
+                DocumentFile file =
+                        getMotionLogFileDocumentFile();
+
+                if (file == null || !file.exists()) {
+                    return;
+                }
+
+                if (motionBufferedWriter == null) {
+                    java.io.OutputStream os =
+                            DocumentFileUtils.openOutputStream(
+                                    file,
+                                    logContext,
+                                    true);
+
+                    if (os == null) return;
+
+                    motionBufferedWriter =
+                            new BufferedWriter(
+                                    new OutputStreamWriter(os),
+                                    4096);
+                }
+
+                String time =
+                        timeFormatter.get().format(
+                                new java.util.Date(timestamp));
+
+                motionBufferedWriter.write(
+                        time
+                                + " "
+                                + level
+                                + "/MotionTrace: "
+                                + message);
+                motionBufferedWriter.newLine();
+
+                motionBufferedWriter.flush();
+            } catch (Exception e) {
+                closeMotionWriter();
+                android.util.Log.w(
+                        "MotionTrace",
+                        "Authorized Motion trace write failed",
+                        e);
+            }
+        });
+    }
+
     private static void cleanupOldLogs() {
         if (logContext != null) {
             DocumentFile folder = getLogFolderDocumentFile();
@@ -199,7 +328,12 @@ public class Log {
         }
     }
 
+    public static void flushNow() {
+        logHandler.post(Log::flushBuffer);
+    }
+
     private static void writeToFile(String level, String tag, String message) {
+        if (shouldSkipPersistentSpam(tag, message)) return;
         boolean useSimpleStorage = (logContext != null && SimpleStorageHelper.hasStorageAccess(logContext));
         if (!logEnabled) return;
         if (!useSimpleStorage && logDir == null) return;
@@ -235,7 +369,7 @@ public class Log {
     }
 
     public static void d(String tag, String message) {
-        if(!logEnabled) return;
+        if(!logEnabled || shouldSkipPersistentSpam(tag, message)) return;
         android.util.Log.d(tag, message);
         writeToFile("D", tag, message);
     }
@@ -271,7 +405,7 @@ public class Log {
     }
 
     public static void v(String tag, String s) {
-        if(!logEnabled) return;
+        if(!logEnabled || shouldSkipPersistentSpam(tag, s)) return;
         android.util.Log.v(tag, s);
         writeToFile("V", tag, s);
     }

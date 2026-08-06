@@ -19,10 +19,25 @@ file(DOWNLOAD
         https://raw.githubusercontent.com/ParticlesDevs/tinydng/refs/heads/master/tiny_dng_writer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/deps/tiny_dng_writer.h)
 
-if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/technicallyflac.h)
+set(TECHNICALLYFLAC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/deps/technicallyflac.h)
+
+if(NOT EXISTS ${TECHNICALLYFLAC_HEADER})
     file(DOWNLOAD
-            https://raw.githubusercontent.com/jprjr/technicallyflac/main/technicallyflac.h
-            ${CMAKE_CURRENT_SOURCE_DIR}/deps/technicallyflac.h)
+            https://raw.githubusercontent.com/Aritile/technicallyflac/main/technicallyflac.h
+            ${TECHNICALLYFLAC_HEADER}
+            STATUS TECHNICALLYFLAC_DOWNLOAD_STATUS
+            TLS_VERIFY ON)
+    list(GET TECHNICALLYFLAC_DOWNLOAD_STATUS 0 TECHNICALLYFLAC_STATUS_CODE)
+    list(GET TECHNICALLYFLAC_DOWNLOAD_STATUS 1 TECHNICALLYFLAC_STATUS_MESSAGE)
+    if(NOT TECHNICALLYFLAC_STATUS_CODE EQUAL 0)
+        message(FATAL_ERROR
+                "technicallyflac download failed: ${TECHNICALLYFLAC_STATUS_MESSAGE}")
+    endif()
+endif()
+
+file(SIZE ${TECHNICALLYFLAC_HEADER} TECHNICALLYFLAC_HEADER_SIZE)
+if(TECHNICALLYFLAC_HEADER_SIZE EQUAL 0)
+    message(FATAL_ERROR "technicallyflac header is empty")
 endif()
 
 if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/deps/archive.h)

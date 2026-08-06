@@ -46,6 +46,46 @@ public class ParseExif {
         else return "";
     }
 
+    private static String firstNonEmpty(String primary, String fallback) {
+        if (primary != null && !primary.trim().isEmpty()) {
+            return primary.trim();
+        }
+        if (fallback != null && !fallback.trim().isEmpty()) {
+            return fallback.trim();
+        }
+        return "";
+    }
+
+    private static Long safeParseLong(String value, String fieldName) {
+        if (value == null || value.trim().isEmpty()) {
+            Log.w(TAG, "Missing numeric EXIF field: " + fieldName);
+            return null;
+        }
+
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "Invalid numeric EXIF field " + fieldName
+                    + " value=" + value);
+            return null;
+        }
+    }
+
+    private static Double safeParseDouble(String value, String fieldName) {
+        if (value == null || value.trim().isEmpty()) {
+            Log.w(TAG, "Missing decimal EXIF field: " + fieldName);
+            return null;
+        }
+
+        try {
+            return Double.parseDouble(value.trim());
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "Invalid decimal EXIF field " + fieldName
+                    + " value=" + value);
+            return null;
+        }
+    }
+
     public static ExifData parse(CaptureResult result, CaptureRequest request) {
         ExifData data = new ExifData();
 
@@ -77,16 +117,27 @@ public class ParseExif {
         data.SENSITIVITY_TYPE = String.valueOf(ExifInterface.SENSITIVITY_TYPE_ISO_SPEED);
         data.PHOTOGRAPHIC_SENSITIVITY = String.valueOf(isonum);
         data.F_NUMBER = resultget(result, LENS_APERTURE);
-        String focal = resultget(result, LENS_FOCAL_LENGTH);
-        if (!focal.isEmpty()) {
-            focal = requestget(request, CaptureRequest.LENS_FOCAL_LENGTH);
-            data.FOCAL_LENGTH = ((int) (100 * Double.parseDouble(focal))) + "/100";
+        String focal = firstNonEmpty(
+                resultget(result, LENS_FOCAL_LENGTH),
+                requestget(request, CaptureRequest.LENS_FOCAL_LENGTH));
+        Double focalValue = safeParseDouble(focal, "LENS_FOCAL_LENGTH");
+        if (focalValue != null) {
+            data.FOCAL_LENGTH =
+                    ((int) Math.round(100.0 * focalValue)) + "/100";
         }
-        data.APERTURE_VALUE = String.valueOf(result.get(LENS_APERTURE));
-        String exposure = resultget(result, SENSOR_EXPOSURE_TIME);
-        if (!exposure.isEmpty()) {
-            exposure = requestget(request, CaptureRequest.SENSOR_EXPOSURE_TIME);
-            data.EXPOSURE_TIME = getTime(Long.parseLong(exposure));
+        data.APERTURE_VALUE = firstNonEmpty(
+                resultget(result, LENS_APERTURE),
+                requestget(request, CaptureRequest.LENS_APERTURE));
+        String exposure = firstNonEmpty(
+                resultget(result, SENSOR_EXPOSURE_TIME),
+                requestget(request, CaptureRequest.SENSOR_EXPOSURE_TIME));
+        Long exposureNs = safeParseLong(
+                exposure,
+                "SENSOR_EXPOSURE_TIME");
+        if (exposureNs != null && exposureNs > 0L) {
+            data.EXPOSURE_TIME = getTime(exposureNs);
+        } else {
+            Log.w(TAG, "Skipping EXIF exposure time because metadata is unavailable");
         }
         data.DATETIME = sFormatter.format(new Date(System.currentTimeMillis()));
         data.COMPRESSION = "97";

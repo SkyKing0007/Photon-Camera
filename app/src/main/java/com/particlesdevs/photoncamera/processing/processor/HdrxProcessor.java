@@ -15,6 +15,7 @@ import com.particlesdevs.photoncamera.app.PhotonCamera;
 import com.particlesdevs.photoncamera.capture.CaptureController;
 import com.particlesdevs.photoncamera.control.GyroBurst;
 import com.particlesdevs.photoncamera.processing.ImageFrame;
+import com.particlesdevs.photoncamera.processing.MotionMetrics;
 import com.particlesdevs.photoncamera.processing.ImageFrameDeblur;
 import com.particlesdevs.photoncamera.processing.ImageSaver;
 import com.particlesdevs.photoncamera.processing.ProcessingEventsListener;
@@ -95,9 +96,16 @@ public class HdrxProcessor extends ProcessorBase {
 //            }
         } catch (Exception e) {
             Log.e(TAG, ProcessingEventsListener.FAILED_MSG);
-            Log.e(TAG, "Error in HdrX Processing:"+Log.getStackTraceString(e));
+            Log.e(TAG, "Error in HdrX Processing:"
+                    + Log.getStackTraceString(e));
+            com.particlesdevs.photoncamera.util.MotionTrace.error(
+                    -1L,
+                    "HDRX_PROCESSOR",
+                    e);
             callback.onFailed();
-            processingEventsListener.onProcessingError("HdrX Processing Failed");
+            processingEventsListener.onProcessingError(
+                    e.getClass().getSimpleName()
+                            + ": " + String.valueOf(e.getMessage()));
         }
     }
 
@@ -157,7 +165,9 @@ public class HdrxProcessor extends ProcessorBase {
         processingParameters.FillDynamicParameters(captureResult, captureRequest,ISO);
         processingParameters.cameraRotation = cameraRotation;
 
-        exifData.IMAGE_DESCRIPTION = processingParameters.toString();
+        exifData.IMAGE_DESCRIPTION = processingParameters.toString()
+                + "\n" + com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector
+                .lastMotionExposureDiagnostics;
         ImageFrameDeblur imageFrameDeblur = new ImageFrameDeblur(processingParameters);
         imageFrameDeblur.firstFrameGyro = images.get(0).frameGyro.clone();
         for (int i = 0; i < images.size(); i++)
@@ -260,7 +270,8 @@ public class HdrxProcessor extends ProcessorBase {
         //WrapperAl.packImages();
         Log.d(TAG, "Packed");
         if(images.size() > 1) {
-            PyramidMerging pyramidMerging = new PyramidMerging(new Point(width, height), images);
+            PyramidMerging pyramidMerging = new PyramidMerging(
+                    new Point(width, height), images, cameraMode == CameraMode.MOTION);
             pyramidMerging.parameters = processingParameters;
             pyramidMerging.Run();
             pyramidMerging.close();
