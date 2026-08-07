@@ -57,6 +57,9 @@ out vec3 Output;
 #define EPS (0.0008)
 #define FUSIONGAIN 1.0
 #define FUSION 0
+#ifndef IRIS_26361_MOTION_SINGLE_FUSION_TONE
+#define IRIS_26361_MOTION_SINGLE_FUSION_TONE 0
+#endif
 #define luminocity(x) dot(x.rgb, vec3(0.299, 0.587, 0.114))
 #define MINP 1.0
 #define NOISEO 0.0
@@ -434,7 +437,22 @@ vec3 applyColorSpace(vec3 pRGB,float tonemapGain, float gainsVal){
     //pRGB = saturate(pRGB,br);
 
     pRGB = gammaCorrectPixel2(pRGB);
+
+    /*
+     * IRIS_26361_MOTION_SINGLE_FUSION_TONE_OWNER
+     *
+     * FusionMap already controls amplitude above through:
+     *   pRGB *= mix(tonemapGain, 1.0, LTMMIX)
+     *
+     * In Motion, keep that local correction once, then run the polynomial
+     * tonemap with neutral gain so the same adaptive signal is not applied
+     * serially a second time. Non-Motion keeps the legacy expression.
+     */
+#if IRIS_26361_MOTION_SINGLE_FUSION_TONE == 1
+    pRGB = tonemap(pRGB, 1.0);
+#else
     pRGB = tonemap(pRGB, mix(1.0,tonemapGain,LTMMIX));
+#endif
     pRGB = mix(pRGB*pRGB*pRGB*TONEMAPX3 + pRGB*pRGB*TONEMAPX2 + pRGB*TONEMAPX1,pRGB,min(pRGB*0.8+0.55,1.0));
 
     return pRGB;

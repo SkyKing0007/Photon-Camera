@@ -2713,6 +2713,119 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                     this, selectedResults.get(frame.timestamp)));
         }
 
+        /*
+         * IRIS_26360_PER_FRAME_ACTUAL_METADATA
+         * Logging only. This does not alter frame selection, exposure,
+         * image buffers, merge weights, or processing.
+         */
+        if (actualCount > 0) {
+            double[] iris26360Energies = new double[actualCount];
+            Double iris26360RefObj =
+                    mExposures.get(selected.get(actualCount - 1).timestamp);
+            double iris26360ReferenceEnergy =
+                    iris26360RefObj == null ? 0.0 : iris26360RefObj;
+            double iris26360Sum = 0.0;
+
+            for (int iris26360Index = 0;
+                 iris26360Index < actualCount;
+                 iris26360Index++) {
+                ImageFrame iris26360Frame = selected.get(iris26360Index);
+                TotalCaptureResult iris26360Result =
+                        selectedResults.get(iris26360Frame.timestamp);
+
+                Long iris26360ResultTs = iris26360Result == null
+                        ? null
+                        : iris26360Result.get(CaptureResult.SENSOR_TIMESTAMP);
+                Long iris26360ExposureNs = iris26360Result == null
+                        ? null
+                        : iris26360Result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+                Integer iris26360Iso = iris26360Result == null
+                        ? null
+                        : iris26360Result.get(CaptureResult.SENSOR_SENSITIVITY);
+
+                Double iris26360EnergyObj =
+                        mExposures.get(iris26360Frame.timestamp);
+                double iris26360Energy =
+                        iris26360EnergyObj == null
+                                ? 0.0
+                                : iris26360EnergyObj;
+
+                iris26360Energies[iris26360Index] = iris26360Energy;
+                iris26360Sum += iris26360Energy;
+
+                long iris26360MatchDeltaNs =
+                        iris26360ResultTs == null
+                                ? Long.MIN_VALUE
+                                : Math.abs(
+                                        iris26360ResultTs
+                                                - iris26360Frame.timestamp);
+                double iris26360Ratio =
+                        iris26360ReferenceEnergy > 0.0
+                                ? iris26360Energy
+                                        / iris26360ReferenceEnergy
+                                : Double.NaN;
+
+                com.particlesdevs.photoncamera.util.MotionTrace.state(
+                        mMotionDiagnosticShotId,
+                        "FRAME_META",
+                        "index=" + iris26360Index
+                                + " rawTimestamp="
+                                + iris26360Frame.timestamp
+                                + " resultTimestamp="
+                                + iris26360ResultTs
+                                + " matchDeltaNs="
+                                + iris26360MatchDeltaNs
+                                + " exposureNs="
+                                + iris26360ExposureNs
+                                + " iso=" + iris26360Iso
+                                + " exposureEnergy="
+                                + iris26360Energy
+                                + " energyRatioToReference="
+                                + iris26360Ratio);
+            }
+
+            double[] iris26360Sorted =
+                    java.util.Arrays.copyOf(
+                            iris26360Energies,
+                            iris26360Energies.length);
+            java.util.Arrays.sort(iris26360Sorted);
+
+            double iris26360Mean = iris26360Sum / actualCount;
+            double iris26360Variance = 0.0;
+            for (double iris26360Energy : iris26360Energies) {
+                double iris26360Delta =
+                        iris26360Energy - iris26360Mean;
+                iris26360Variance +=
+                        iris26360Delta * iris26360Delta;
+            }
+            iris26360Variance /= actualCount;
+            double iris26360Std = Math.sqrt(iris26360Variance);
+            double iris26360Cv =
+                    iris26360Mean > 0.0
+                            ? iris26360Std / iris26360Mean
+                            : Double.NaN;
+            double iris26360Median =
+                    (actualCount & 1) == 1
+                            ? iris26360Sorted[actualCount / 2]
+                            : 0.5 * (
+                                    iris26360Sorted[actualCount / 2 - 1]
+                                            + iris26360Sorted[actualCount / 2]);
+
+            com.particlesdevs.photoncamera.util.MotionTrace.state(
+                    mMotionDiagnosticShotId,
+                    "FRAME_META_SUMMARY",
+                    "count=" + actualCount
+                            + " minEnergy=" + iris26360Sorted[0]
+                            + " medianEnergy=" + iris26360Median
+                            + " maxEnergy="
+                            + iris26360Sorted[actualCount - 1]
+                            + " meanEnergy=" + iris26360Mean
+                            + " stdEnergy=" + iris26360Std
+                            + " coefficientOfVariation=" + iris26360Cv
+                            + " referenceEnergy="
+                            + iris26360ReferenceEnergy);
+        }
+
         final int capturedCount = actualCount;
 
         com.particlesdevs.photoncamera.util.MotionTrace.state(

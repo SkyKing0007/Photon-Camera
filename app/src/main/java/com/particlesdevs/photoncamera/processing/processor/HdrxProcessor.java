@@ -134,6 +134,79 @@ public class HdrxProcessor extends ProcessorBase {
         for (int i = 1; i < mImageFramesToProcess.size(); i++) {
             minExpo = Math.min(minExpo, exposures.get(mImageFramesToProcess.get(i).getTimestamp()));
         }
+
+        /*
+         * IRIS_26363_MOTION_REFERENCE_OWNERSHIP
+         *
+         * Motion already carries a timestamp-matched CaptureResult. Keep the
+         * merged Bayer reference anchored to that same physical RAW instead
+         * of silently replacing it with the darkest/minimum-energy frame.
+         */
+        final boolean iris26363MotionReferenceOwnership =
+                cameraMode == CameraMode.MOTION;
+        long iris26363ReferenceTimestamp = Long.MIN_VALUE;
+        double iris26363ReferenceEnergy = minExpo;
+
+        if (iris26363MotionReferenceOwnership) {
+            Long iris26363ResultTimestamp =
+                    captureResult == null
+                            ? null
+                            : captureResult.get(CaptureResult.SENSOR_TIMESTAMP);
+            long iris26363TargetTimestamp =
+                    iris26363ResultTimestamp != null
+                            ? iris26363ResultTimestamp
+                            : mImageFramesToProcess.get(
+                                    mImageFramesToProcess.size() - 1).getTimestamp();
+
+            long iris26363BestDelta = Long.MAX_VALUE;
+            for (ImageFrame iris26363Frame : mImageFramesToProcess) {
+                Double iris26363EnergyObj =
+                        exposures.get(iris26363Frame.getTimestamp());
+                if (iris26363EnergyObj == null
+                        || iris26363EnergyObj <= 0.0) {
+                    continue;
+                }
+
+                long iris26363Delta = Math.abs(
+                        iris26363Frame.getTimestamp()
+                                - iris26363TargetTimestamp);
+                if (iris26363Delta < iris26363BestDelta) {
+                    iris26363BestDelta = iris26363Delta;
+                    iris26363ReferenceTimestamp =
+                            iris26363Frame.getTimestamp();
+                    iris26363ReferenceEnergy =
+                            iris26363EnergyObj;
+                }
+            }
+
+            if (iris26363ReferenceTimestamp == Long.MIN_VALUE) {
+                ImageFrame iris26363Fallback =
+                        mImageFramesToProcess.get(
+                                mImageFramesToProcess.size() - 1);
+                iris26363ReferenceTimestamp =
+                        iris26363Fallback.getTimestamp();
+                Double iris26363FallbackEnergy =
+                        exposures.get(iris26363ReferenceTimestamp);
+                if (iris26363FallbackEnergy != null
+                        && iris26363FallbackEnergy > 0.0) {
+                    iris26363ReferenceEnergy =
+                            iris26363FallbackEnergy;
+                }
+            }
+
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "MOTION_REFERENCE_OWNERSHIP",
+                    "metadataTimestamp=" + iris26363ResultTimestamp
+                            + " chosenRawTimestamp="
+                            + iris26363ReferenceTimestamp
+                            + " matchDeltaNs="
+                            + iris26363BestDelta
+                            + " referenceEnergy="
+                            + iris26363ReferenceEnergy
+                            + " minBurstEnergy=" + minExpo
+                            + " policy=metadataMatchedReference"
+                            + " captureAeBehavior=unchanged");
+        }
         Log.d(TAG, "Wrapper.init");
         ArrayList<ImageFrame> images = new ArrayList<>();
         int ISO = 0;
@@ -149,12 +222,29 @@ public class HdrxProcessor extends ProcessorBase {
             //frame.pair = IsoExpoSelector.pairs.get(i % IsoExpoSelector.patternSize);
             frame.pair = IsoExpoSelector.fullpairs.get(i);
             frame.number = i;
-            frame.pair.layerMpy = (float) (exposures.get(mImageFramesToProcess.get(i).getTimestamp()) / minExpo);
-            if (frame.pair.layerMpy > 1.0) {
-                frame.pair.curlayer = IsoExpoSelector.ExpoPair.exposureLayer.High;
-            } else {
-                frame.pair.curlayer = IsoExpoSelector.ExpoPair.exposureLayer.Normal;
+            double iris26363FrameEnergy =
+                    exposures.get(mImageFramesToProcess.get(i).getTimestamp());
+            if (iris26363MotionReferenceOwnership) {
+                // Actual exposure-energy ratio relative to the owned reference.
+                // PyramidMerging uses 1/layerMpy to radiometrically normalize
+                // the alternate to this reference. It is not an HDR bracket.
+                frame.pair.layerMpy = (float) (
+                        iris26363FrameEnergy
+                                / Math.max(iris26363ReferenceEnergy, 1e-12));
+                frame.pair.curlayer =
+                        IsoExpoSelector.ExpoPair.exposureLayer.Normal;
                 normalFrames++;
+            } else {
+                frame.pair.layerMpy = (float) (
+                        iris26363FrameEnergy / minExpo);
+                if (frame.pair.layerMpy > 1.0) {
+                    frame.pair.curlayer =
+                            IsoExpoSelector.ExpoPair.exposureLayer.High;
+                } else {
+                    frame.pair.curlayer =
+                            IsoExpoSelector.ExpoPair.exposureLayer.Normal;
+                    normalFrames++;
+                }
             }
             /*if(i == mImageFramesToProcess.size()-1){
                 int ind = Math.max(0,mImageFramesToProcess.size()-2);
@@ -214,6 +304,12 @@ public class HdrxProcessor extends ProcessorBase {
                 ImageFrame cur = images.get(images.size() - 1);
                 float curunlucky = cur.frameGyro.shakiness;
                 if (curunlucky > unluckyavr * unluckypickiness) {
+                    if (iris26363MotionReferenceOwnership
+                            && cur.timestamp
+                                    == iris26363ReferenceTimestamp) {
+                        // Preserve the RAW that owns downstream dynamic metadata.
+                        continue;
+                    }
                     if(normalFrames == 1 && cur.pair.curlayer == IsoExpoSelector.ExpoPair.exposureLayer.Normal) {
                         continue;
                     }
@@ -236,28 +332,42 @@ public class HdrxProcessor extends ProcessorBase {
         }
 
         float minMpy = 1000.f;
-        for (int i = 0; i < images.size(); i++) {
-            if (images.get(i).pair.layerMpy < minMpy) {
-                minMpy = images.get(i).pair.layerMpy;
-            }
-        }
-        /*
-        if (images.get(0).pair.layerMpy != minMpy) {
-            Log.d(TAG,"Replace 0 with minMpy");
-            for (int i = 1; i < images.size(); i++) {
-                if (images.get(i).pair.layerMpy == minMpy) {
-                    ImageFrame frame = images.get(0);
-                    images.set(0, images.get(i));
-                    images.set(i, frame);
+        int selected = 0;
+
+        if (iris26363MotionReferenceOwnership) {
+            boolean iris26363ReferenceFound = false;
+            for (int i = 0; i < images.size(); i++) {
+                if (images.get(i).timestamp
+                        == iris26363ReferenceTimestamp) {
+                    selected = i;
+                    iris26363ReferenceFound = true;
                     break;
                 }
             }
-        }*/
-        int selected = 0;
-        for (int i = 0; i < images.size(); i++) {
-            if(images.get(i).pair.layerMpy == minMpy){
-                selected = i;
-                break;
+
+            if (!iris26363ReferenceFound) {
+                long iris26363BestDelta = Long.MAX_VALUE;
+                for (int i = 0; i < images.size(); i++) {
+                    long iris26363Delta = Math.abs(
+                            images.get(i).timestamp
+                                    - iris26363ReferenceTimestamp);
+                    if (iris26363Delta < iris26363BestDelta) {
+                        iris26363BestDelta = iris26363Delta;
+                        selected = i;
+                    }
+                }
+            }
+        } else {
+            for (int i = 0; i < images.size(); i++) {
+                if (images.get(i).pair.layerMpy < minMpy) {
+                    minMpy = images.get(i).pair.layerMpy;
+                }
+            }
+            for (int i = 0; i < images.size(); i++) {
+                if(images.get(i).pair.layerMpy == minMpy){
+                    selected = i;
+                    break;
+                }
             }
         }
 
@@ -266,6 +376,16 @@ public class HdrxProcessor extends ProcessorBase {
             ImageFrame frame = images.get(0);
             images.set(0, images.get(selected));
             images.set(selected, frame);
+        }
+
+        if (iris26363MotionReferenceOwnership) {
+            images.get(0).pair.layerMpy = 1.0f;
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "MOTION_REFERENCE_AFTER_RETENTION",
+                    "rawTimestamp=" + images.get(0).timestamp
+                            + " layerMpy=" + images.get(0).pair.layerMpy
+                            + " retainedFrames=" + images.size()
+                            + " policy=ownedReferencePreserved");
         }
         selected = 0;
 

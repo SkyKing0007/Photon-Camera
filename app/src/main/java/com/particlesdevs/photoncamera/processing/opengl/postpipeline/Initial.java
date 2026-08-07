@@ -267,6 +267,30 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
                 cube = basePipeline.mParameters.CCT.cubes[0].cube;
         }
         if(((PostPipeline)basePipeline).FusionMap != null) glProg.setDefine("FUSION", 1);
+
+        /*
+         * IRIS_26361_MOTION_SINGLE_FUSION_TONE_OWNER
+         *
+         * Motion only: FusionMap-derived tonemapGain keeps its original first
+         * application in initial.glsl, but does not control the later polynomial
+         * tonemap gain a second time.
+         */
+        boolean iris26361MotionSingleFusionTone =
+                com.particlesdevs.photoncamera.processing.MotionMetrics.isActive();
+        glProg.setDefine(
+                "IRIS_26361_MOTION_SINGLE_FUSION_TONE",
+                iris26361MotionSingleFusionTone ? 1 : 0);
+
+        if (iris26361MotionSingleFusionTone) {
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "INITIAL_BASE_TONE_POLICY",
+                    "singleFusionToneOwner=true"
+                            + " fusionGain="
+                            + ((PostPipeline)basePipeline).fusionGain
+                            + " ltmMix=" + ltmMix
+                            + " captureAeBehavior=unchanged");
+        }
+
         glProg.useAssetProgram("initial");
         if(mode == ColorCorrectionTransform.CorrectionMode.CUBE || mode == ColorCorrectionTransform.CorrectionMode.CUBES){
             glProg.setVar("CUBE0",cube[0]);

@@ -280,6 +280,10 @@ public class PyramidMerging extends GLOneScript {
     @Tunable(title = "Adaptive High", category = "Merge", min = 1.0f, max = 4.0f, step = 1.0f/2.0f, defaultValue = 3)
     double noiseMpyHigh;
 
+    float iris26350MotionFineDetailProtection = 0.55f;
+
+    float iris26350MotionFineDetailNoiseThreshold = 1.75f;
+
     @Override
     public void Run() {
         com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
@@ -598,6 +602,13 @@ public class PyramidMerging extends GLOneScript {
         inputAlter = new GLTexture(parameters.rawSize, new GLFormat(GLFormat.DataType.UNSIGNED_16, 1), null, GL_NEAREST, GL_MIRRORED_REPEAT);
         //alignmentTex = new GLTexture(aSize, new GLFormat(GLFormat.DataType.FLOAT_32, 2), alignment, GL_NEAREST, GL_MIRRORED_REPEAT);
 
+        /*
+         * IRIS_26363_MOTION_SINGLE_EXPOSURE_ACCUMULATOR
+         *
+         * Motion layerMpy is now only the actual radiometric normalization
+         * ratio to the owned reference. It must not create an HDR low/high
+         * split or a second accumulator.
+         */
         float minExp = 1.f;
         int minExpIdx = 0;
         int lowCnt = 0;
@@ -610,12 +621,14 @@ public class PyramidMerging extends GLOneScript {
             ImageFrame frame = images.get(i);
             float exposure = 1.f/frame.pair.layerMpy;
             Log.d("PyramidMerging", "exposure: " + exposure);
-            if(exposure < 0.95f) {
-                lowCnt++;
-            }
-            if(exposure < minExp) {
-                minExpIdx = i;
-                minExp = exposure;
+            if (!motionMode) {
+                if(exposure < 0.95f) {
+                    lowCnt++;
+                }
+                if(exposure < minExp) {
+                    minExpIdx = i;
+                    minExp = exposure;
+                }
             }
         }
         //counter.put(1.0f,1.0f);
@@ -665,7 +678,9 @@ public class PyramidMerging extends GLOneScript {
             glProg.setVar("exposure", exposure);
             glProg.setVar("analogBalance", analogBalance);
             glProg.setVar("motionMode", motionMode ? 1 : 0);
-            if(exposure >= 0.95f) {
+            if (motionMode) {
+                glProg.setVar("exposureLow", 0.0f);
+            } else if(exposure >= 0.95f) {
                 if(lowCnt > 1)
                     glProg.setVar("exposureLow", minExp - 0.05f);
                 else {
@@ -749,12 +764,22 @@ public class PyramidMerging extends GLOneScript {
             glProg.setVar("analogBalance", analogBalance);
             glProg.setVar("motionMode", motionMode ? 1 : 0);
             glProg.setVar("effectiveStackRatio", MotionMetrics.effectiveStackRatio());
+            glProg.setVar("motionFineDetailProtection",
+                    motionMode ? Math2.clamp(iris26350MotionFineDetailProtection, 0.0f, 0.80f) : 0.0f);
+            glProg.setVar("motionFineDetailNoiseThreshold",
+                    Math2.clamp(iris26350MotionFineDetailNoiseThreshold, 1.0f, 4.0f));
             //glProg.setVar("weight",  1.0f/(images.size()));
             //glProg.setVar("weight", 1.0f/(counter.get(exposure)+1.f));
             //glProg.setVar("weight2", 1.0f/(counter.get(exposure)+1.f));
             //glProg.setVar("weight", 1.0f/(f+1.f));
             //glProg.setVar("weight", 1.0f/(counter.get(exposure)));
-            if(exposure >= 0.95f){
+            if (motionMode) {
+                // One running average for all Motion alternates. Their actual
+                // shutter/ISO difference was already normalized in merge0.
+                glProg.setVar("weight", 1.0f/cnt1);
+                glProg.setVar("exposure", 1.0f);
+                cnt1+=1.0f;
+            } else if(exposure >= 0.95f){
                 glProg.setVar("weight", 1.0f/cnt1);
                 glProg.setVar("exposure", minExp);
                 cnt1+=1.0f;
@@ -766,6 +791,21 @@ public class PyramidMerging extends GLOneScript {
             //glProg.setVar("exposure", exposure);
             //glProg.setVar("weight",  1.0f);
             glProg.computeAuto(base.mSize, 1);
+        }
+
+        if (motionMode) {
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "MOTION_EXPOSURE_NORMALIZATION",
+                    "referenceLayerMpy=" + images.get(0).pair.layerMpy
+                            + " accumulator=singleEqualExposure"
+                            + " perFrameActualNormalization=true"
+                            + " genericHdrSplit=false");
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "TEMPORAL_DETAIL",
+                    "fineDetailProtection=" + iris26350MotionFineDetailProtection
+                            + " noiseThreshold=" + iris26350MotionFineDetailNoiseThreshold
+                            + " effectiveStackRatio=" + MotionMetrics.effectiveStackRatio()
+                            + " frames=" + images.size());
         }
 
         /*
