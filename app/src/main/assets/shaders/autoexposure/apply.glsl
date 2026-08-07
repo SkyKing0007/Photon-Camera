@@ -9,6 +9,15 @@ uniform float irisHdrOutdoorBroadStrength;
 uniform float irisHdrHighlightCompression;
 uniform float irisHdrLowerMidLift;
 uniform float irisHdrShadowChromaProtection;
+uniform float irisHdrAbsoluteBlackPreserve;
+uniform float irisHdrDeepShadowStart;
+uniform float irisHdrFullShadowPoint;
+uniform float irisHdrDeepShadowStrength;
+uniform float irisHdrUpperMidProtectStart;
+uniform float irisHdrUpperMidProtectEnd;
+uniform float irisHdrDeepShadowSafety;
+uniform float irisHdrChromaPreservationStrength;
+uniform float irisHdrMinimumShadowColorRetention;
 out vec4 Output;
 vec3 reinhard_extended(vec3 v, float max_white){
     vec3 numerator = v * (vec3(1.0f) + (v / vec3(max_white * max_white)));
@@ -61,14 +70,15 @@ void main() {
      * recombined with bounded chroma to reduce colored highlight halos.
      *
      * IRIS_26335_PROGRESSIVE_HDR_TONE
+     * IRIS_26353_BRIGHTNESS_PRESERVING_SHOULDER
      */
     float irisHdrLuma =
             dot(Output.rgb, vec3(0.299, 0.587, 0.114));
 
     float irisHdrShoulderStart =
             mix(
+                    0.80,
                     0.72,
-                    0.64,
                     irisHdrIndoorBacklitStrength
             );
 
@@ -115,8 +125,8 @@ void main() {
             clamp(
                     irisHdrHighlightCompression
                             * (
-                                    0.18 * irisHdrHighlightMask
-                                            + 0.82
+                                    0.05 * irisHdrHighlightMask
+                                            + 0.95
                                                     * irisHdrStrongHighlightMask
                               ),
                     0.0,
@@ -130,24 +140,38 @@ void main() {
                     irisHdrShoulderBlend
             );
 
+
+    /*
+     * IRIS_26355_CONTEXT_AWARE_HDR_TONE_CURVE
+     */
+    float iris26355AbsoluteBlackGate =
+            smoothstep(irisHdrAbsoluteBlackPreserve,
+                    irisHdrDeepShadowStart,
+                    irisHdrToneLuma);
+
+    float iris26355FullShadowGate =
+            smoothstep(irisHdrDeepShadowStart,
+                    irisHdrFullShadowPoint,
+                    irisHdrToneLuma);
+
+    float iris26355DeepShadowEligibility =
+            irisHdrDeepShadowStrength * irisHdrDeepShadowSafety;
+
     float irisHdrBlackProtection =
-            smoothstep(
-                    0.035,
-                    0.13,
-                    irisHdrToneLuma
-            );
+            iris26355AbsoluteBlackGate
+                    * mix(iris26355DeepShadowEligibility,
+                            1.0,
+                            iris26355FullShadowGate);
 
     float irisHdrUpperMidProtection =
-            1.0
-                    - smoothstep(
-                            0.46,
-                            0.76,
-                            irisHdrToneLuma
-                      );
+            1.0 - smoothstep(irisHdrUpperMidProtectStart,
+                    irisHdrUpperMidProtectEnd,
+                    irisHdrToneLuma);
 
     float irisHdrLowerMidMask =
-            irisHdrBlackProtection
-                    * irisHdrUpperMidProtection;
+            clamp(irisHdrBlackProtection * irisHdrUpperMidProtection,
+                    0.0,
+                    1.0);
 
     float irisHdrLiftAmount =
             irisHdrLowerMidLift
@@ -161,41 +185,49 @@ void main() {
                     1.0
             );
 
+
     vec3 irisHdrChroma =
             Output.rgb - vec3(irisHdrLuma);
 
+    /*
+     * IRIS_26358_STABLE_SOURCE_CHROMA
+     * Keep the source chroma magnitude stable. Existing gamut and near-black
+     * safety may reduce unreliable chroma, but HDR lift no longer boosts it.
+     */
+    vec3 iris26356PreservedChroma = irisHdrChroma;
+
     float irisHdrPositiveHeadroom =
             min(
-                    irisHdrChroma.r > 0.0
+                    iris26356PreservedChroma.r > 0.0
                             ? (1.0 - irisHdrOutputLuma)
-                                    / max(irisHdrChroma.r, 0.000001)
+                                    / max(iris26356PreservedChroma.r, 0.000001)
                             : 1.0,
                     min(
-                            irisHdrChroma.g > 0.0
+                            iris26356PreservedChroma.g > 0.0
                                     ? (1.0 - irisHdrOutputLuma)
-                                            / max(irisHdrChroma.g, 0.000001)
+                                            / max(iris26356PreservedChroma.g, 0.000001)
                                     : 1.0,
-                            irisHdrChroma.b > 0.0
+                            iris26356PreservedChroma.b > 0.0
                                     ? (1.0 - irisHdrOutputLuma)
-                                            / max(irisHdrChroma.b, 0.000001)
+                                            / max(iris26356PreservedChroma.b, 0.000001)
                                     : 1.0
                     )
             );
 
     float irisHdrNegativeHeadroom =
             min(
-                    irisHdrChroma.r < 0.0
+                    iris26356PreservedChroma.r < 0.0
                             ? irisHdrOutputLuma
-                                    / max(-irisHdrChroma.r, 0.000001)
+                                    / max(-iris26356PreservedChroma.r, 0.000001)
                             : 1.0,
                     min(
-                            irisHdrChroma.g < 0.0
+                            iris26356PreservedChroma.g < 0.0
                                     ? irisHdrOutputLuma
-                                            / max(-irisHdrChroma.g, 0.000001)
+                                            / max(-iris26356PreservedChroma.g, 0.000001)
                                     : 1.0,
-                            irisHdrChroma.b < 0.0
+                            iris26356PreservedChroma.b < 0.0
                                     ? irisHdrOutputLuma
-                                            / max(-irisHdrChroma.b, 0.000001)
+                                            / max(-iris26356PreservedChroma.b, 0.000001)
                                     : 1.0
                     )
             );
@@ -216,15 +248,14 @@ void main() {
     float iris26347NearBlack = 1.0 - smoothstep(0.035, 0.28, irisHdrOutputLuma);
     float iris26347ChromaRetention = mix(
             1.0,
-            0.18,
+            irisHdrMinimumShadowColorRetention,
             clamp(iris26347NearBlack * irisHdrShadowChromaProtection, 0.0, 1.0));
     irisHdrSafeChromaScale *= iris26347ChromaRetention;
 
     Output.rgb =
             clamp(
                     vec3(irisHdrOutputLuma)
-                            + irisHdrChroma
-                                    * irisHdrSafeChromaScale,
+                            + iris26356PreservedChroma * irisHdrSafeChromaScale,
                     0.0,
                     1.0
             );

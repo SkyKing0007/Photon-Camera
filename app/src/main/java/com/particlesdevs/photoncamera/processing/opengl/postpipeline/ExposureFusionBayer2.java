@@ -83,8 +83,8 @@ public class ExposureFusionBayer2 extends Node {
             title = "Motion ExposureFusion Gain Max",
             category = "Motion HDR Brightness",
             description = "Maximum global ExposureFusion gain in Motion. Lower values reduce shadow-noise and chroma-blotch amplification.",
-            min = 1.0f, max = 3.30f, step = 0.05f, defaultValue = 1.30f)
-    float iris26349MotionExposureFusionGainMax = 1.30f;
+            min = 1.0f, max = 3.30f, step = 0.05f, defaultValue = 1.75f)
+    float iris26349MotionExposureFusionGainMax = 1.75f;
 
     float autoExposureHigh(){
         float avr = 0.f;

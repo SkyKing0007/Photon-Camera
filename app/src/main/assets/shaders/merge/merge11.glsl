@@ -21,6 +21,8 @@ uniform vec4 analogBalance;
 uniform int cfaPattern;
 uniform int motionMode;
 uniform float effectiveStackRatio;
+uniform float motionFineDetailProtection;
+uniform float motionFineDetailNoiseThreshold;
 #import median
 uint getBayer(ivec2 coords, highp usampler2D tex){
     return texelFetch(tex,coords,0).r;
@@ -96,7 +98,26 @@ void main() {
         float modeledNoise = max(length(noise), EPS);
         float localConfidence = 1.0 - smoothstep(
                 modeledNoise * 2.5, modeledNoise * 6.0, residualMagnitude);
+
+        /* IRIS_26350_MOTION_FINE_DETAIL_RETENTION
+         * Reduce alternate-frame influence around bright, reference-supported
+         * fine structure. This preserves thin spikes and avoids rounded chroma
+         * outlines without increasing ghost-producing alternate contribution.
+         */
+        float referenceSignal = dot(max(bayer, vec4(0.0)), vec4(0.25));
+        float referenceStructure = length(bayer - mean);
+        float usableSignal = smoothstep(0.025, 0.16, referenceSignal);
+        float fineDetailEvidence = smoothstep(
+                modeledNoise * motionFineDetailNoiseThreshold,
+                modeledNoise * (motionFineDetailNoiseThreshold + 2.25),
+                referenceStructure) * usableSignal;
+        float fineDetailRetention = mix(
+                1.0,
+                1.0 - clamp(motionFineDetailProtection, 0.0, 0.80),
+                fineDetailEvidence);
+
         mergeWeight *= clamp(localConfidence, 0.0, 1.0);
+        mergeWeight *= fineDetailRetention;
         mergeWeight *= clamp(effectiveStackRatio, 0.05, 1.0);
     }
     imageStore(outTexture, xy, mix(base, diff/analogBalance+bayer, mergeWeight));

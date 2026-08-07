@@ -39,8 +39,8 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
 
     @Tunable(title = "Use Fixed Motion AutoExposure Gain", category = "Motion HDR Brightness",
             description = "Use the selected fixed global AutoExposure multiplier in Motion instead of the automatic value.",
-            min = 0, max = 1, step = 1, defaultValue = 1)
-    boolean iris26349UseFixedMotionAutoExposureGain = true;
+            min = 0, max = 1, step = 1, defaultValue = 0)
+    boolean iris26349UseFixedMotionAutoExposureGain = false;
 
     @Tunable(title = "Motion AutoExposure Fixed Gain", category = "Motion HDR Brightness",
             description = "Fixed Motion AutoExposure multiplier. 1.00 adds no global exposure gain.",
@@ -49,13 +49,73 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
 
     @Tunable(title = "Motion AutoExposure Gain Max", category = "Motion HDR Brightness",
             description = "Maximum Motion AutoExposure multiplier when fixed mode is disabled.",
-            min = 1.00f, max = 3.80f, step = 0.05f, defaultValue = 1.25f)
-    float iris26349MotionAutoExposureGainMax = 1.25f;
+            min = 1.00f, max = 3.80f, step = 0.05f, defaultValue = 1.50f)
+    float iris26349MotionAutoExposureGainMax = 1.50f;
 
     @Tunable(title = "Motion Adaptive HDR Enable", category = "Motion HDR Brightness",
             description = "Enable Motion spatial HDR detection, highlight compression and selective lower-mid recovery.",
             min = 0, max = 1, step = 1, defaultValue = 1)
     boolean iris26349MotionAdaptiveHdrEnable = true;
+
+    @Tunable(title = "Motion HDR Highlight Compression Strength", category = "Motion HDR Tone",
+            description = "Scales adaptive highlight compression. 1.00 is full detector-requested strength.",
+            min = 0.0f, max = 2.00f, step = 0.05f, defaultValue = 0.70f)
+    float iris26353MotionHdrHighlightStrength = 0.70f;
+
+    @Tunable(title = "Motion HDR Lower-Mid Lift Strength", category = "Motion HDR Tone",
+            description = "Scales recoverable foreground, face, tree, cabin and interior lower-mid brightness.",
+            min = 0.0f, max = 2.50f, step = 0.05f, defaultValue = 1.35f)
+    float iris26353MotionHdrLowerMidStrength = 1.35f;
+
+    @Tunable(title = "Motion HDR Night Shadow Recovery", category = "Motion HDR Tone",
+            description = "Controls recoverable object lift at night. Deep blacks remain protected in the shader.",
+            min = 0.0f, max = 1.50f, step = 0.05f, defaultValue = 0.65f)
+    float iris26353MotionHdrNightShadowRecovery = 0.65f;
+
+    @Tunable(title = "Motion HDR Shadow Color Safety", category = "Motion HDR Tone",
+            description = "Scales near-black chroma restraint when HDR shadow recovery is active.",
+            min = 0.0f, max = 1.50f, step = 0.05f, defaultValue = 1.00f)
+    float iris26353MotionHdrShadowColorSafety = 1.00f;
+
+    @Tunable(title = "Motion HDR Chroma Preservation Strength", category = "Motion HDR Color",
+            description = "Preserves colorfulness when HDR raises shadow and lower-mid luminance.",
+            min = 0.0f, max = 1.50f, step = 0.05f, defaultValue = 1.00f)
+    float iris26356MotionHdrChromaPreservation = 1.00f;
+
+    @Tunable(title = "Motion HDR Minimum Shadow Color Retention", category = "Motion HDR Color",
+            description = "Minimum chroma retained in unreliable HDR shadows before gamut limiting.",
+            min = 0.15f, max = 1.00f, step = 0.05f, defaultValue = 0.45f)
+    float iris26356MotionHdrMinimumShadowColorRetention = 0.45f;
+
+    @Tunable(title = "Motion HDR Absolute Black Preserve", category = "Motion HDR Tone Curve",
+            description = "Luma below this point remains essentially protected from HDR shadow lifting.",
+            min = 0.0f, max = 0.05f, step = 0.002f, defaultValue = 0.012f)
+    float iris26355HdrAbsoluteBlackPreserve = 0.012f;
+
+    @Tunable(title = "Motion HDR Deep Shadow Recovery Start", category = "Motion HDR Tone Curve",
+            description = "Begins gentle recovery of very dark but potentially useful scene detail.",
+            min = 0.005f, max = 0.08f, step = 0.002f, defaultValue = 0.018f)
+    float iris26355HdrDeepShadowStart = 0.018f;
+
+    @Tunable(title = "Motion HDR Full Shadow Recovery Point", category = "Motion HDR Tone Curve",
+            description = "Luma point where lower-mid HDR recovery becomes fully eligible.",
+            min = 0.04f, max = 0.20f, step = 0.005f, defaultValue = 0.105f)
+    float iris26355HdrFullShadowPoint = 0.105f;
+
+    @Tunable(title = "Motion HDR Deep Shadow Recovery Strength", category = "Motion HDR Tone Curve",
+            description = "How much requested HDR lift may enter the deep-shadow toe before full eligibility.",
+            min = 0.0f, max = 1.0f, step = 0.05f, defaultValue = 0.40f)
+    float iris26355HdrDeepShadowStrength = 0.40f;
+
+    @Tunable(title = "Motion HDR Upper-Mid Protect Start", category = "Motion HDR Tone Curve",
+            description = "Begins protecting already-visible upper midtones from additional HDR shadow lift.",
+            min = 0.30f, max = 0.65f, step = 0.01f, defaultValue = 0.46f)
+    float iris26355HdrUpperMidProtectStart = 0.46f;
+
+    @Tunable(title = "Motion HDR Upper-Mid Protect End", category = "Motion HDR Tone Curve",
+            description = "Luma point where additional lower-mid HDR lift is fully removed.",
+            min = 0.55f, max = 0.90f, step = 0.01f, defaultValue = 0.76f)
+    float iris26355HdrUpperMidProtectEnd = 0.76f;
 
 
     public AutoExposure() {
@@ -651,30 +711,42 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                         irisHdrNightConfidence
                 );
 
-        float irisHdrBacklitConfidence =
-                irisHdrMotionGate
-                        * Math.max(
-                                irisHdrSpatialSeparation,
-                                irisHdrAdjacencyConfidence
-                          )
+        /* IRIS_26350_MULTI_PATH_HDR_DETECTOR */
+        float iris26350SpatialBacklitPath =
+                Math.max(irisHdrSpatialSeparation, irisHdrAdjacencyConfidence)
                         * irisHdrSubjectDarkness
                         * irisHdrHighlightEvidence
-                        * Math.max(
-                                irisHdrGlobalRangeConfidence,
-                                irisHdrExtremeRangeConfidence
-                          )
+                        * Math.max(irisHdrGlobalRangeConfidence, irisHdrExtremeRangeConfidence);
+
+        float iris26350DarkMedianConfidence =
+                1.0f - Math2.smoothstep(0.14f, 0.40f, irisHdrP50);
+
+        float iris26350HighlightTailConfidence =
+                Math.max(
+                        Math2.smoothstep(0.58f, 0.92f, irisHdrP99),
+                        Math2.smoothstep(0.30f, 0.68f, irisHdrP99 - irisHdrP50));
+
+        float iris26350HistogramBacklitPath =
+                iris26350DarkMedianConfidence
+                        * iris26350HighlightTailConfidence
+                        * Math.max(irisHdrGlobalRangeConfidence, irisHdrExtremeRangeConfidence)
+                        * Math.max(irisHdrBrightAreaConfidence, irisHdrHighlightRisk);
+
+        float irisHdrBacklitConfidence =
+                irisHdrMotionGate
+                        * Math.max(iris26350SpatialBacklitPath,
+                                0.82f * iris26350HistogramBacklitPath)
                         * irisHdrNightSuppression;
+
+        float iris26350BroadRangePath =
+                Math.max(irisHdrGlobalRangeConfidence, irisHdrExtremeRangeConfidence)
+                        * Math.max(irisHdrBrightAreaConfidence, irisHdrHighlightRisk)
+                        * Math2.smoothstep(0.22f, 0.62f, irisHdrNormalizedAverage);
 
         float irisHdrBroadDynamicRangeConfidence =
                 irisHdrMotionGate
-                        * Math.max(
-                                irisHdrGlobalRangeConfidence,
-                                irisHdrExtremeRangeConfidence
-                          )
-                        * Math.max(
-                                irisHdrBrightAreaConfidence,
-                                irisHdrHighlightRisk
-                          );
+                        * iris26350BroadRangePath
+                        * irisHdrNightSuppression;
 
         float irisHdrShadowRecoverability =
                 irisHdrStackSafety
@@ -713,36 +785,237 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                         1.0f
                 );
 
+        /*
+         * IRIS_26353_BRIGHTNESS_PRESERVING_ADAPTIVE_HDR
+         *
+         * The detector classifies HDR context, but cannot broadly darken the
+         * scene. Compression is reserved for real upper-highlight pressure.
+         * Foreground recovery is independently driven by subject/median darkness,
+         * with low-ISO daylight relief and conservative night recovery.
+         */
+        float iris26353RawBacklitContext =
+                Math.max(
+                        iris26350SpatialBacklitPath,
+                        0.82f * iris26350HistogramBacklitPath);
+
+        float iris26353RawBroadContext =
+                iris26350BroadRangePath;
+
+        float iris26353DarkSubjectNeed =
+                Math.max(
+                        irisHdrSubjectDarkness,
+                        iris26350DarkMedianConfidence);
+
+        float iris26353ExtremeHighlightPressure =
+                Math.max(
+                        Math2.smoothstep(0.010f, 0.110f, irisHdrNearClipArea),
+                        Math2.smoothstep(0.86f, 0.995f, irisHdrP99));
+
+        float iris26353ActualHighlightPressure =
+                Math2.clamp(
+                        0.40f * irisHdrHighlightRisk
+                                + 0.20f * irisHdrBrightAreaConfidence
+                                + 0.16f * irisHdrGlobalRangeConfidence
+                                + 0.14f * iris26350HighlightTailConfidence
+                                + 0.10f * iris26353ExtremeHighlightPressure,
+                        0.0f,
+                        1.0f);
+
+        float iris26353LowIsoConfidence =
+                1.0f - Math2.smoothstep(700.0f, 2400.0f, irisHdrIso);
+
+        float iris26353ShortExposureConfidence =
+                1.0f - Math2.smoothstep(
+                        1.0f / 80.0f,
+                        1.0f / 18.0f,
+                        irisHdrExposureSeconds);
+
+        float iris26353DaylightRecoveryRelief =
+                iris26353LowIsoConfidence
+                        * iris26353ShortExposureConfidence
+                        * (1.0f - irisHdrNightConfidence);
+
+        float iris26353ForegroundRecoverability =
+                Math2.mix(
+                        irisHdrShadowRecoverability,
+                        1.0f,
+                        0.72f * iris26353DaylightRecoveryRelief);
+
+        /*
+         * IRIS_26355_CONTEXT_AWARE_DEEP_SHADOW_SAFETY
+         */
+        float iris26355DeepShadowSafety =
+                Math2.clamp(
+                        iris26353ForegroundRecoverability
+                                * Math2.mix(
+                                        1.0f,
+                                        0.30f,
+                                        irisHdrNightConfidence),
+                        0.0f,
+                        1.0f);
+
+        /*
+         * Night reduces noisy lifting more strongly than highlight protection.
+         */
+        float iris26353NightHighlightSafety =
+                Math2.mix(1.0f, 0.82f, irisHdrNightConfidence);
+
+        float iris26353CompressionContext =
+                irisHdrMotionGate
+                        * Math.max(
+                                iris26353RawBacklitContext,
+                                iris26353RawBroadContext)
+                        * iris26353NightHighlightSafety;
+
+        float iris26353NormalCompressionDemand =
+                iris26353CompressionContext
+                        * iris26353ActualHighlightPressure
+                        * Math2.mix(
+                                0.38f,
+                                0.72f,
+                                iris26353ExtremeHighlightPressure);
+
+        float iris26353ExtremeSourceDemand =
+                irisHdrMotionGate
+                        * iris26353ExtremeHighlightPressure
+                        * Math.max(
+                                irisHdrHighlightEvidence,
+                                Math.max(
+                                        iris26353RawBacklitContext,
+                                        iris26353RawBroadContext))
+                        * Math2.mix(
+                                0.54f,
+                                0.88f,
+                                iris26353ExtremeHighlightPressure)
+                        * iris26353NightHighlightSafety;
+
         float irisHdrHighlightCompression =
                 Math2.clamp(
                         Math.max(
-                                irisHdrIndoorBacklitStrength,
-                                irisHdrOutdoorBroadStrength
-                        )
-                                * Math2.mix(
-                                        0.62f,
-                                        0.95f,
-                                        Math.max(
-                                                irisHdrHighlightRisk,
-                                                irisHdrGlobalRangeConfidence
-                                        )
-                                  ),
+                                iris26353NormalCompressionDemand,
+                                iris26353ExtremeSourceDemand)
+                                * Math2.clamp(
+                                        iris26353MotionHdrHighlightStrength,
+                                        0.0f,
+                                        2.0f),
                         0.0f,
-                        0.95f
-                );
+                        0.90f);
+
+        float iris26353ForegroundContext =
+                Math.max(
+                        iris26353RawBacklitContext,
+                        0.72f * iris26353RawBroadContext);
+
+        float iris26353DaylightBaseLift =
+                irisHdrMotionGate
+                        * iris26353ForegroundContext
+                        * iris26353DarkSubjectNeed
+                        * iris26353ForegroundRecoverability
+                        * Math2.mix(
+                                0.18f,
+                                0.34f,
+                                iris26353ForegroundContext);
+
+        float iris26353ExtremeForegroundLift =
+                irisHdrMotionGate
+                        * iris26353ExtremeHighlightPressure
+                        * iris26353ForegroundContext
+                        * iris26353DarkSubjectNeed
+                        * iris26353ForegroundRecoverability
+                        * 0.30f;
+
+        float iris26353LargeNightSourceContext =
+                irisHdrNightConfidence
+                        * Math.max(
+                                irisHdrBrightAreaConfidence,
+                                irisHdrConnectedBrightConfidence)
+                        * iris26353DarkSubjectNeed;
+
+        float iris26353NightObjectLift =
+                iris26353LargeNightSourceContext
+                        * irisHdrShadowRecoverability
+                        * Math2.clamp(
+                                iris26353MotionHdrNightShadowRecovery,
+                                0.0f,
+                                1.50f)
+                        * 0.18f;
+
+        float iris26353CompressionBalanceFloor =
+                irisHdrHighlightCompression
+                        * iris26353DarkSubjectNeed
+                        * iris26353ForegroundRecoverability
+                        * Math2.smoothstep(
+                                0.14f,
+                                0.56f,
+                                iris26353ForegroundContext)
+                        * Math2.mix(
+                                0.42f,
+                                0.62f,
+                                iris26353ExtremeHighlightPressure);
+
+        /*
+         * IRIS_26358_SIMPLIFIED_SHADOW_CONTROLLER
+         *
+         * Highlight-tail evidence is NOT allowed to directly force shadow lift.
+         * Shadow recovery is driven by dark-region need, then bounded by
+         * recoverability. Highlight pressure remains responsible for the shoulder.
+         */
+        float iris26358ShadowNeed =
+                Math2.clamp(
+                        0.55f * iris26350DarkMedianConfidence
+                                + 0.30f * irisHdrSubjectDarkness
+                                + 0.15f * (1.0f - irisHdrNormalizedAverage),
+                        0.0f,
+                        1.0f);
+
+        float iris26358BacklitAssist =
+                Math2.clamp(
+                        Math.max(
+                                iris26350SpatialBacklitPath,
+                                0.50f * iris26353RawBroadContext),
+                        0.0f,
+                        1.0f);
+
+        float iris26358ShadowContext =
+                Math2.clamp(
+                        0.70f * iris26358ShadowNeed
+                                + 0.30f * iris26358BacklitAssist,
+                        0.0f,
+                        1.0f);
+
+        float iris26358NoiseMotionSafety =
+                Math2.clamp(
+                        iris26353ForegroundRecoverability
+                                * Math2.mix(
+                                        1.0f,
+                                        0.55f,
+                                        irisHdrNightConfidence),
+                        0.0f,
+                        1.0f);
+
+        /*
+         * This stage is a bounded correction, not the primary exposure renderer.
+         * Earlier stable traces were typically around ~0.08-0.15 lower-mid lift.
+         */
+        float iris26358LowerMidBase =
+                irisHdrMotionGate
+                        * iris26358ShadowContext
+                        * iris26358NoiseMotionSafety
+                        * Math2.mix(
+                                0.06f,
+                                0.16f,
+                                iris26358ShadowContext);
 
         float irisHdrLowerMidLift =
                 Math2.clamp(
-                        irisHdrIndoorBacklitStrength
-                                * irisHdrShadowRecoverability
-                                * Math2.mix(
-                                        0.16f,
-                                        0.34f,
-                                        irisHdrSubjectDarkness
-                                  ),
+                        iris26358LowerMidBase
+                                * Math2.clamp(
+                                        iris26353MotionHdrLowerMidStrength,
+                                        0.0f,
+                                        2.50f),
                         0.0f,
-                        0.34f
-                );
+                        0.20f);
+
         if (iris26340Motion && !iris26349MotionAdaptiveHdrEnable) {
             irisHdrIndoorBacklitStrength = 0.0f;
             irisHdrOutdoorBroadStrength = 0.0f;
@@ -767,24 +1040,65 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                 irisHdrLowerMidLift
         );
 
+        glProg.setVar("irisHdrAbsoluteBlackPreserve",
+                Math2.clamp(iris26355HdrAbsoluteBlackPreserve, 0.0f, 0.05f));
+        glProg.setVar("irisHdrDeepShadowStart",
+                Math2.clamp(Math.max(iris26355HdrDeepShadowStart,
+                        iris26355HdrAbsoluteBlackPreserve + 0.002f), 0.005f, 0.08f));
+        glProg.setVar("irisHdrFullShadowPoint",
+                Math2.clamp(Math.max(iris26355HdrFullShadowPoint,
+                        iris26355HdrDeepShadowStart + 0.010f), 0.04f, 0.20f));
+        glProg.setVar("irisHdrDeepShadowStrength",
+                Math2.clamp(iris26355HdrDeepShadowStrength, 0.0f, 1.0f));
+        glProg.setVar("irisHdrUpperMidProtectStart",
+                Math2.clamp(iris26355HdrUpperMidProtectStart, 0.30f, 0.65f));
+        glProg.setVar("irisHdrUpperMidProtectEnd",
+                Math2.clamp(Math.max(iris26355HdrUpperMidProtectEnd,
+                        iris26355HdrUpperMidProtectStart + 0.05f), 0.55f, 0.90f));
+        glProg.setVar("irisHdrDeepShadowSafety", iris26355DeepShadowSafety);
+
         /* IRIS_26347_HDR_SHADOW_CHROMA_SAFETY
          * Keep luminance lift. Restrain only unreliable near-black chroma when HDR is active.
          */
         float iris26347HdrStrength = Math.max(
                 irisHdrIndoorBacklitStrength,
                 irisHdrOutdoorBroadStrength);
-        float iris26349ResidualColorRisk = Math2.clamp(
-                0.45f + 0.55f * (1.0f - irisHdrShadowRecoverability),
+
+        /*
+         * IRIS_26356_CONTEXT_MATCHED_HDR_COLOR_SAFETY
+         * Match chroma reliability to the same context-aware safety used by
+         * the successful 26355 deep-shadow brightness recovery.
+         */
+        float iris26356HdrColorReliability = Math2.clamp(
+                iris26355DeepShadowSafety
+                        * Math2.mix(
+                                1.0f,
+                                0.82f,
+                                irisHdrNightConfidence),
+                0.0f,
+                1.0f);
+        float iris26356ResidualColorRisk = Math2.clamp(
+                0.10f + 0.90f * (1.0f - iris26356HdrColorReliability),
                 0.0f,
                 1.0f);
         float iris26347ShadowChromaProtection = Math2.clamp(
-                iris26347HdrStrength * iris26349ResidualColorRisk,
+                iris26347HdrStrength
+                        * iris26356ResidualColorRisk
+                        * Math2.clamp(
+                                iris26353MotionHdrShadowColorSafety,
+                                0.0f,
+                                1.50f),
                 0.0f,
                 1.0f);
         if (iris26340Motion && !iris26349MotionAdaptiveHdrEnable) {
             iris26347ShadowChromaProtection = 0.0f;
         }
         glProg.setVar("irisHdrShadowChromaProtection", iris26347ShadowChromaProtection);
+
+        glProg.setVar("irisHdrChromaPreservationStrength",
+                Math2.clamp(iris26356MotionHdrChromaPreservation, 0.0f, 1.50f));
+        glProg.setVar("irisHdrMinimumShadowColorRetention",
+                Math2.clamp(iris26356MotionHdrMinimumShadowColorRetention, 0.15f, 1.0f));
 
         Log.d(
                 "AutoExposure",
@@ -798,8 +1112,28 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                         + " effectiveRatio=" + irisHdrEffectiveStackRatio
                         + " indoorBacklit=" + irisHdrIndoorBacklitStrength
                         + " outdoorBroad=" + irisHdrOutdoorBroadStrength
+                        + " actualHighlightPressure=" + iris26353ActualHighlightPressure
+                        + " compressionSceneContext=" + iris26353CompressionContext
+                        + " extremeSourceDemand=" + iris26353ExtremeSourceDemand
+                        + " extremeHighlightPressure=" + iris26353ExtremeHighlightPressure
+                        + " darkSubjectNeed=" + iris26353DarkSubjectNeed
+                        + " daylightForegroundContext=" + iris26353ForegroundContext
+                        + " compressionBalanceFloor=" + iris26353CompressionBalanceFloor
+                        + " largeNightSourceContext=" + iris26353LargeNightSourceContext
+                        + " highlightStrengthTunable=" + iris26353MotionHdrHighlightStrength
+                        + " lowerMidStrengthTunable=" + iris26353MotionHdrLowerMidStrength
+                        + " nightShadowRecoveryTunable=" + iris26353MotionHdrNightShadowRecovery
+                        + " shadowColorSafetyTunable=" + iris26353MotionHdrShadowColorSafety
+                            + " highlightStrengthTunable=" + iris26353MotionHdrHighlightStrength
+                            + " lowerMidStrengthTunable=" + iris26353MotionHdrLowerMidStrength
+                            + " nightShadowRecoveryTunable=" + iris26353MotionHdrNightShadowRecovery
+                            + " shadowColorSafetyTunable=" + iris26353MotionHdrShadowColorSafety
                         + " highlightCompression=" + irisHdrHighlightCompression
                         + " lowerMidLift=" + irisHdrLowerMidLift
+                        + " iris26358ShadowNeed=" + iris26358ShadowNeed
+                        + " iris26358BacklitAssist=" + iris26358BacklitAssist
+                        + " iris26358ShadowContext=" + iris26358ShadowContext
+                        + " iris26358NoiseMotionSafety=" + iris26358NoiseMotionSafety
                         + " subjectMean=" + irisHdrSubjectMean
                         + " brightArea=" + irisHdrBrightArea
                         + " nearClipArea=" + irisHdrNearClipArea
@@ -808,6 +1142,10 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                         + " brightRegions=" + irisHdrLargeBrightRegions
                         + " highlightEvidence=" + irisHdrHighlightEvidence
                         + " nightSuppression=" + irisHdrNightSuppression
+                        + " spatialBacklitPath=" + iris26350SpatialBacklitPath
+                        + " histogramBacklitPath=" + iris26350HistogramBacklitPath
+                        + " darkMedianConfidence=" + iris26350DarkMedianConfidence
+                        + " highlightTailConfidence=" + iris26350HighlightTailConfidence
                         + " backlitConfidence=" + irisHdrBacklitConfidence
                         + " broadDrConfidence=" + irisHdrBroadDynamicRangeConfidence
                         + " nightConfidence=" + irisHdrNightConfidence
@@ -827,8 +1165,18 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                             + " p50=" + irisHdrP50
                             + " p95=" + irisHdrP95
                             + " p99=" + irisHdrP99
+                            + " spatialBacklitPath=" + iris26350SpatialBacklitPath
+                            + " histogramBacklitPath=" + iris26350HistogramBacklitPath
                             + " indoorBacklit=" + irisHdrIndoorBacklitStrength
                             + " outdoorBroad=" + irisHdrOutdoorBroadStrength
+                            + " actualHighlightPressure=" + iris26353ActualHighlightPressure
+                            + " compressionSceneContext=" + iris26353CompressionContext
+                            + " extremeSourceDemand=" + iris26353ExtremeSourceDemand
+                            + " extremeHighlightPressure=" + iris26353ExtremeHighlightPressure
+                            + " darkSubjectNeed=" + iris26353DarkSubjectNeed
+                            + " daylightForegroundContext=" + iris26353ForegroundContext
+                            + " compressionBalanceFloor=" + iris26353CompressionBalanceFloor
+                            + " largeNightSourceContext=" + iris26353LargeNightSourceContext
                             + " highlightCompression=" + irisHdrHighlightCompression
                             + " lowerMidLift=" + irisHdrLowerMidLift
                             + " shadowRecoverability=" + irisHdrShadowRecoverability

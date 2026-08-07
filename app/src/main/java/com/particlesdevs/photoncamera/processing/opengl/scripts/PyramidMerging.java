@@ -280,6 +280,16 @@ public class PyramidMerging extends GLOneScript {
     @Tunable(title = "Adaptive High", category = "Merge", min = 1.0f, max = 4.0f, step = 1.0f/2.0f, defaultValue = 3)
     double noiseMpyHigh;
 
+    @Tunable(title = "Motion Fine Detail Protection", category = "Motion Merge Detail",
+            description = "Protects narrow reference-supported structures from temporal averaging.",
+            min = 0.0f, max = 0.80f, step = 0.05f, defaultValue = 0.55f)
+    float iris26350MotionFineDetailProtection = 0.55f;
+
+    @Tunable(title = "Motion Fine Detail Noise Threshold", category = "Motion Merge Detail",
+            description = "Minimum local structure above modeled noise before fine-detail protection activates.",
+            min = 1.0f, max = 4.0f, step = 0.25f, defaultValue = 1.75f)
+    float iris26350MotionFineDetailNoiseThreshold = 1.75f;
+
     @Override
     public void Run() {
         com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
@@ -749,6 +759,10 @@ public class PyramidMerging extends GLOneScript {
             glProg.setVar("analogBalance", analogBalance);
             glProg.setVar("motionMode", motionMode ? 1 : 0);
             glProg.setVar("effectiveStackRatio", MotionMetrics.effectiveStackRatio());
+            glProg.setVar("motionFineDetailProtection",
+                    motionMode ? Math2.clamp(iris26350MotionFineDetailProtection, 0.0f, 0.80f) : 0.0f);
+            glProg.setVar("motionFineDetailNoiseThreshold",
+                    Math2.clamp(iris26350MotionFineDetailNoiseThreshold, 1.0f, 4.0f));
             //glProg.setVar("weight",  1.0f/(images.size()));
             //glProg.setVar("weight", 1.0f/(counter.get(exposure)+1.f));
             //glProg.setVar("weight2", 1.0f/(counter.get(exposure)+1.f));
@@ -766,6 +780,15 @@ public class PyramidMerging extends GLOneScript {
             //glProg.setVar("exposure", exposure);
             //glProg.setVar("weight",  1.0f);
             glProg.computeAuto(base.mSize, 1);
+        }
+
+        if (motionMode) {
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "TEMPORAL_DETAIL",
+                    "fineDetailProtection=" + iris26350MotionFineDetailProtection
+                            + " noiseThreshold=" + iris26350MotionFineDetailNoiseThreshold
+                            + " effectiveStackRatio=" + MotionMetrics.effectiveStackRatio()
+                            + " frames=" + images.size());
         }
 
         /*
