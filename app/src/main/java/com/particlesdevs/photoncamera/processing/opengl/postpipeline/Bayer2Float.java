@@ -107,6 +107,10 @@ public class Bayer2Float extends Node {
         postPipeline.regenerationSense = 1.f;
         Log.d(Name, "Regeneration:" + postPipeline.regenerationSense);
         glProg.setVar("Regeneration", postPipeline.regenerationSense);
+        glProg.setVar("CanonicalExposureGain",
+                Math.max(1.0f, basePipeline.mParameters.motionCanonicalExposureGain));
+        Log.d(Name, "IRIS_26394 CanonicalExposureGain:"
+                + basePipeline.mParameters.motionCanonicalExposureGain);
         glProg.setVar("MinimalInd", minimal);
         Point wsize = new Point(basePipeline.mParameters.rawSize);
         basePipeline.main2 = new GLTexture(wsize, new GLFormat(GLFormat.DataType.FLOAT_16, GLDrawParams.WorkDim), null, GL_LINEAR, GL_CLAMP_TO_EDGE);

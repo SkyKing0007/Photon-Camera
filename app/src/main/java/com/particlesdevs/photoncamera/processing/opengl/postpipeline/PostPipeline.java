@@ -94,6 +94,19 @@ public class PostPipeline extends GLBasePipeline {
         Log.d("PostPipeline", "noisempy:" + noisempy);
         noiseS *= noisempy;
         noiseO *= noisempy;
+
+        /* IRIS_26394_MOTION_CANONICAL_NOISE_DOMAIN
+         * y=g*x, Var(x)=S*x+O -> S'=g*S, O'=g^2*O.
+         */
+        float iris26394CanonicalGain =
+                Math.max(1.0f, mParameters.motionCanonicalExposureGain);
+        if (iris26394CanonicalGain > 1.0f) {
+            noiseS *= iris26394CanonicalGain;
+            noiseO *= iris26394CanonicalGain * iris26394CanonicalGain;
+        }
+        Log.d("PostPipeline",
+                "IRIS_26394_CANONICAL_NOISE gain=" + iris26394CanonicalGain
+                        + " noiseS=" + noiseS + " noiseO=" + noiseO);
         Log.d("PostPipeline", "NoiseS:" + noiseS + "\n" + "NoiseO:" + noiseO);
         /*if (!PhotonCamera.getSettings().hdrxNR) {
             noiseO = 0.f;
@@ -123,6 +136,11 @@ public class PostPipeline extends GLBasePipeline {
         glint = new GLInterface(glproc);
         stackFrame = inBuffer;
         glint.parameters = parameters;
+        if (com.particlesdevs.photoncamera.app.PhotonCamera
+                .getSettings().selectedMode
+                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+            iris26387LogMergedBayerInput(stackFrame);
+        }
 
         // Inject tunable values for PostPipeline (since it doesn't extend Node)
         com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
@@ -133,6 +151,47 @@ public class PostPipeline extends GLBasePipeline {
         Allocator.free(resImg.byteBuffer);
         GLTexture.closeAll();
         return res;
+    }
+
+    /* IRIS_26387_WHITE_STAGE_DIAGNOSTIC */
+    private void iris26387LogMergedBayerInput(ByteBuffer source) {
+        if (source == null) return;
+        try {
+            ByteBuffer b = source.duplicate().order(java.nio.ByteOrder.nativeOrder());
+            int words = b.remaining() / 2;
+            if (words <= 0) return;
+            int step = Math.max(1, words / 8192);
+            java.util.ArrayList<Float> values = new java.util.ArrayList<>();
+            double sum = 0.0;
+            int min = 65535;
+            int max = 0;
+            for (int i = 0; i < words; i += step) {
+                int v = b.getShort(b.position() + i * 2) & 0xffff;
+                min = Math.min(min, v);
+                max = Math.max(max, v);
+                sum += v;
+                values.add((float)v);
+            }
+            java.util.Collections.sort(values);
+            int n = values.size();
+            float p01 = values.get(Math.min(n-1, Math.max(0, Math.round((n-1)*0.01f))));
+            float p10 = values.get(Math.min(n-1, Math.max(0, Math.round((n-1)*0.10f))));
+            float p50 = values.get(Math.min(n-1, Math.max(0, Math.round((n-1)*0.50f))));
+            float p90 = values.get(Math.min(n-1, Math.max(0, Math.round((n-1)*0.90f))));
+            float p99 = values.get(Math.min(n-1, Math.max(0, Math.round((n-1)*0.99f))));
+            String line = "IRIS_26387_STAGE_STATS stage=MERGE_OUTPUT_UINT16"
+                    + " samples=" + n + " min=" + min + " mean=" + (sum/n)
+                    + " max=" + max + " p01=" + p01 + " p10=" + p10
+                    + " p50=" + p50 + " p90=" + p90 + " p99=" + p99
+                    + " parameterWhiteLevel=" + mParameters.whiteLevel
+                    + " black0=" + (mParameters.blackLevel != null && mParameters.blackLevel.length > 0
+                            ? mParameters.blackLevel[0] : Float.NaN);
+            Log.d("IRIS26387", line);
+            try { com.particlesdevs.photoncamera.util.MotionTrace.processingState("WHITE_STAGE_26387", line); }
+            catch (Throwable ignored) {}
+        } catch (Throwable t) {
+            Log.e("IRIS26387", "IRIS_26387_STAGE_STATS stage=MERGE_OUTPUT_UINT16 error=" + t.getClass().getSimpleName());
+        }
     }
 
     private void BuildDefaultPipeline() {

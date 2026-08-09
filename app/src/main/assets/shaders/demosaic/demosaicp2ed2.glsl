@@ -28,7 +28,8 @@ uniform int yOffset;
 #define greenmin (0.00001)
 //#define greenmax (0.9)
 #define greenmax (0.99999)
-shared float sharedDtcv[12][12]; // Shared memory for dtcv values within the workgroup
+/* IRIS_26389_DEMOSAIC_SHARED_HALO */
+shared float sharedDtcv[13][13]; // 8x8 tile plus required halo
 
 // Helper function to determine Bayer pattern at a given position
 // 0: R, 1: G (at red row), 2: G (at blue row), 3: B

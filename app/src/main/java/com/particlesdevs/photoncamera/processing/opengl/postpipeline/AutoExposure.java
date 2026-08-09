@@ -205,6 +205,16 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
         float iris26366NearClipSafety = 0.0f;
         float iris26366PercentileLift = 0.0f;
 
+        /*
+         * IRIS_26381_EVIDENCE_AWARE_SHADOW_PRESERVATION
+         * Global bridge until true local temporal support exists.
+         */
+        float iris26381IntegrationSupport = 0.0f;
+        float iris26381TemporalSupport = 0.0f;
+        float iris26381HighIsoSoftPenalty = 1.0f;
+        float iris26381SupportedShadowConfidence = 0.0f;
+        float iris26381EvidenceShadowLift = 0.0f;
+
         if (iris26340Motion) {
             float configuredAutoMax = Math2.clamp(iris26349MotionAutoExposureGainMax, 1.0f, 3.80f);
             float fixedGain = Math2.clamp(iris26349MotionAutoExposureFixedGain, 0.80f, 2.00f);
@@ -231,10 +241,27 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                             0.60f,
                             0.95f,
                             iris26340EffectiveRatio);
+            /*
+             * IRIS_26381_STACK_EXPOSURE_BEATS_ISO_VETO
+             * Strong stack support + long actual integration can outweigh
+             * high ISO. ISO remains only a bounded soft penalty.
+             */
+            iris26381IntegrationSupport =
+                    Math2.smoothstep(
+                            1.0f / 120.0f,
+                            1.0f / 18.0f,
+                            (float)basePipeline.mParameters.exposureTime);
+            iris26381TemporalSupport = iris26366StackSafety;
+            iris26381HighIsoSoftPenalty =
+                    0.72f + 0.28f * iris26366IsoSafety;
+
             iris26366CleanSupport =
                     Math2.clamp(
-                            iris26366IsoSafety
-                                    * iris26366StackSafety,
+                            iris26381TemporalSupport
+                                    * (0.35f
+                                            + 0.65f
+                                                    * iris26381IntegrationSupport)
+                                    * iris26381HighIsoSoftPenalty,
                             0.0f,
                             1.0f);
             iris26366RequestNeed =
@@ -271,6 +298,12 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                     + " isoSafety26366=" + iris26366IsoSafety
                     + " stackSafety26366=" + iris26366StackSafety
                     + " cleanSupport26366=" + iris26366CleanSupport
+                    + " integrationSupport26381="
+                    + iris26381IntegrationSupport
+                    + " temporalSupport26381="
+                    + iris26381TemporalSupport
+                    + " highIsoSoftPenalty26381="
+                    + iris26381HighIsoSoftPenalty
                     + " requestNeed26366=" + iris26366RequestNeed
                     + " preReinhardApplied=" + mpy
                     + " oldNoiseLimit=" + gainNoiseMax
@@ -283,6 +316,23 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
             Log.d("AutoExposure", "Clamping gain by noise from " + mpy + " to " + gainNoiseMax);
             mpy = gainNoiseMax;
         }
+        /*
+         * IRIS_26395_SINGLE_EXPOSURE_AUTHORITY
+         * Motion canonical RAW exposure is the sole large-scale
+         * exposure authority. AutoExposure is display-residual only.
+         */
+        if (iris26340Motion) {
+            float iris26395RequestedPreResidual = mpy;
+            mpy = Math2.clamp(mpy, 0.90f, 1.10f);
+            Log.d(
+                    "AutoExposure",
+                    "IRIS_26395_RESIDUAL_PRE_REINHARD"
+                            + " requested=" + iris26395RequestedPreResidual
+                            + " applied=" + mpy
+                            + " canonicalGain="
+                            + basePipeline.mParameters.motionCanonicalExposureGain);
+        }
+
         if(mpy > gainMax) {
             Log.d("AutoExposure", "Clamping gain by max from " + mpy + " to " + gainMax);
             if (iris26340Motion) {
@@ -306,7 +356,21 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
             iris26365ReinhardFactor =
                     normR != 0.0f ? normL / normR : Float.NaN;
         }
-        mpy *= normL / normR;
+        float iris26395ReinhardFactor =
+                normR > 1.0e-6f ? normL / normR : 1.0f;
+        mpy *= iris26395ReinhardFactor;
+        if (iris26340Motion) {
+            float iris26395RequestedPostReinhard = mpy;
+            mpy = Math2.clamp(mpy, 0.90f, 1.10f);
+            Log.d(
+                    "AutoExposure",
+                    "IRIS_26395_RESIDUAL_POST_REINHARD"
+                            + " reinhardFactor=" + iris26395ReinhardFactor
+                            + " requested=" + iris26395RequestedPostReinhard
+                            + " applied=" + mpy
+                            + " canonicalGain="
+                            + basePipeline.mParameters.motionCanonicalExposureGain);
+        }
 
         whiteMax *= mpy;
         if (iris26340Motion) {
@@ -1113,12 +1177,33 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                                 0.28f,
                                 iris26366ShadowDeficit);
 
+        /*
+         * IRIS_26381_EVIDENCE_AWARE_SHADOW_PRESERVATION
+         * Strong stack + actual integration + existing recoverability +
+         * highlight headroom can preserve supported dark information even
+         * at high ISO. apply.glsl blackProtection remains unchanged.
+         */
+        iris26381SupportedShadowConfidence =
+                irisHdrMotionGate
+                        * iris26381TemporalSupport
+                        * iris26381IntegrationSupport
+                        * irisHdrShadowRecoverability
+                        * iris26366HighlightHeadroom
+                        * iris26366NearClipSafety;
+
+        iris26381EvidenceShadowLift =
+                0.10f
+                        * iris26381SupportedShadowConfidence
+                        * iris26366ShadowDeficit;
+
         if (iris26340Motion) {
             irisHdrLowerMidLift =
                     Math2.clamp(
                             Math.max(
                                     irisHdrLowerMidLift,
-                                    iris26366PercentileLift),
+                                    Math.max(
+                                            iris26366PercentileLift,
+                                            iris26381EvidenceShadowLift)),
                             0.0f,
                             0.30f);
         }
@@ -1385,6 +1470,16 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                             + " highlightCompression="
                             + irisHdrHighlightCompression
                             + " lowerMidLift=" + irisHdrLowerMidLift
+                            + " supportedShadowConfidence26381="
+                            + iris26381SupportedShadowConfidence
+                            + " evidenceShadowLift26381="
+                            + iris26381EvidenceShadowLift
+                            + " integrationSupport26381="
+                            + iris26381IntegrationSupport
+                            + " temporalSupport26381="
+                            + iris26381TemporalSupport
+                            + " highIsoSoftPenalty26381="
+                            + iris26381HighIsoSoftPenalty
                             + " shadowDeficit26366="
                             + iris26366ShadowDeficit
                             + " highlightHeadroom26366="

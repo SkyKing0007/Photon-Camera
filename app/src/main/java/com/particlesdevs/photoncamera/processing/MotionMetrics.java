@@ -15,6 +15,11 @@ public final class MotionMetrics {
     private static volatile double cameraMotionConfidence = 1.0;
     private static final AtomicInteger measuredFrames = new AtomicInteger(1);
 
+    /* IRIS_26383_REGIONAL_TEMPORAL_SUPPORT */
+    private static volatile float[] localSupportGrid = null;
+    private static volatile int localSupportWidth = 0;
+    private static volatile int localSupportHeight = 0;
+
     private MotionMetrics() {}
 
     public static synchronized void begin(int candidates, int retained, List<GyroBurst> gyro) {
@@ -24,6 +29,9 @@ public final class MotionMetrics {
         cameraMotionConfidence = estimateCameraMotionConfidence(gyro);
         accumulatedFrameConfidence = 1.0;
         measuredFrames.set(1);
+        localSupportGrid = null;
+        localSupportWidth = 0;
+        localSupportHeight = 0;
     }
 
     private static double estimateCameraMotionConfidence(List<GyroBurst> gyro) {
@@ -102,7 +110,36 @@ public final class MotionMetrics {
         return active;
     }
 
+    public static synchronized void setLocalSupportGrid(
+            float[] grid, int width, int height) {
+        if (!active || grid == null || width <= 0 || height <= 0
+                || grid.length < width * height) {
+            localSupportGrid = null;
+            localSupportWidth = 0;
+            localSupportHeight = 0;
+            return;
+        }
+        localSupportGrid = grid.clone();
+        localSupportWidth = width;
+        localSupportHeight = height;
+    }
+
+    public static boolean hasLocalSupportGrid() {
+        return active && localSupportGrid != null
+                && localSupportWidth > 0 && localSupportHeight > 0;
+    }
+
+    public static synchronized float[] localSupportGridCopy() {
+        return localSupportGrid == null ? null : localSupportGrid.clone();
+    }
+
+    public static int localSupportWidth() { return localSupportWidth; }
+    public static int localSupportHeight() { return localSupportHeight; }
+
     public static synchronized void end() {
         active = false;
+        localSupportGrid = null;
+        localSupportWidth = 0;
+        localSupportHeight = 0;
     }
 }

@@ -11,6 +11,7 @@ uniform vec4 blackLevel;
 uniform vec3 whitePoint;
 uniform int CfaPattern;
 uniform uint whitelevel;
+uniform float CanonicalExposureGain;
 uniform int MinimalInd;
 #define BLR (0.0)
 #define BLG (0.0)
@@ -70,6 +71,9 @@ void main() {
                 Output = gains.b*(Output-level.b-BLB)/(1.0-level.b);
             }
         }
+    // IRIS_26394_MOTION_CANONICAL_RAW_EXPOSURE
+    // Global linear exposure only. No ADRC/local curve.
+    Output *= CanonicalExposureGain;
     Output = clamp(Output/balance,0.0,1.0);
     #endif
     #if TESTPATTERN == 1

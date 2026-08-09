@@ -44,7 +44,16 @@ public class Demosaic3 extends Node {
         GLTexture outp;
         int tile = 8;
         startT();
-        WorkingTexture = basePipeline.main3;
+        /*
+         * IRIS_26389_DEMOSAIC_IG_PING_PONG
+         * Keep the IG/gradient guide in an independent texture so the final
+         * RGB pass never reads and writes basePipeline.main3 simultaneously.
+         */
+        GLTexture iris26389IgGuide =
+                new GLTexture(basePipeline.main3.mSize,
+                        basePipeline.main3.mFormat,
+                        null);
+        WorkingTexture = iris26389IgGuide;
         glProg.setLayout(tile,tile,1);
         glProg.useAssetProgram("demosaic/demosaicp0ig",true);
         glProg.setTextureCompute("inTexture", glTexture,false);
@@ -58,7 +67,7 @@ public class Demosaic3 extends Node {
         glProg.setLayout(tile,tile,1);
         glProg.useAssetProgram("demosaic/demosaicp12ec",true);
         glProg.setTextureCompute("inTexture",glTexture, false);
-        glProg.setTextureCompute("igTexture",basePipeline.main3, false);
+        glProg.setTextureCompute("igTexture",iris26389IgGuide, false);
         glProg.setTextureCompute("outTexture",outp, true);
         glProg.computeManual(WorkingTexture.mSize.x/tile,WorkingTexture.mSize.y/tile,1);
         endT("demosaicp12ec");
@@ -67,10 +76,19 @@ public class Demosaic3 extends Node {
         glProg.setLayout(tile,tile,1);
         glProg.useAssetProgram("demosaic/demosaicp12fc",true);
         glProg.setTextureCompute("inTexture",glTexture, false);
-        glProg.setTextureCompute("igTexture",basePipeline.main3, false);
+        glProg.setTextureCompute("igTexture",iris26389IgGuide, false);
+        /*
+         * IRIS_26389_DEMOSAIC_GREEN_PING_PONG
+         * demosaicp12fc must not read and write the same image.
+         */
+        GLTexture iris26389RefinedGreen =
+                new GLTexture(outp.mSize, outp.mFormat, null);
         glProg.setTextureCompute("greenTexture",outp, false);
-        glProg.setTextureCompute("outTexture",outp, true);
-        glProg.computeManual(WorkingTexture.mSize.x/tile,WorkingTexture.mSize.y/tile,1);
+        glProg.setTextureCompute("outTexture",iris26389RefinedGreen, true);
+        glProg.computeManual(
+                iris26389RefinedGreen.mSize.x/tile,
+                iris26389RefinedGreen.mSize.y/tile,
+                1);
         endT("demosaicp12fc");
         //glProg.drawBlocks(WorkingTexture);
 
@@ -82,13 +100,17 @@ public class Demosaic3 extends Node {
         //glProg.useFileProgram(FileManager.sPHOTON_TUNING_DIR + "demosaicp2ec.glsl",true);
         glProg.useAssetProgram("demosaic/demosaicp2ed2",true);
         glProg.setTextureCompute("inTexture", glTexture,false);
-        glProg.setTextureCompute("greenTexture", outp,false);
-        glProg.setTextureCompute("igTexture", basePipeline.main3,false);
+        glProg.setTextureCompute("greenTexture", iris26389RefinedGreen,false);
+        glProg.setTextureCompute("igTexture", iris26389IgGuide,false);
         glProg.setTextureCompute("outTexture", WorkingTexture,true);
         glProg.setVar("neutral", basePipeline.mParameters.whitePoint[0], basePipeline.mParameters.whitePoint[1], basePipeline.mParameters.whitePoint[1], basePipeline.mParameters.whitePoint[2]);
         //glProg.setVar("neutral", 1.f, 1.f, 1.f, 1.f);
         glProg.computeManual(WorkingTexture.mSize.x/tile,WorkingTexture.mSize.y/tile,1);
         glProg.close();
+
+        iris26389RefinedGreen.close();
+        iris26389IgGuide.close();
+
         endT("demosaicp2ec");
         WorkingTexture = basePipeline.swap3();
     }

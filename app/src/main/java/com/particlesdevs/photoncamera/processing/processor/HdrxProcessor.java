@@ -397,6 +397,24 @@ public class HdrxProcessor extends ProcessorBase {
         //        IsoExpoSelector.getMPY() - 40.)*6400.f / (6.2f*IsoExpoSelector.getISOAnalog());
 
         ByteBuffer output = null;
+
+        /*
+         * IRIS_26379_PRODUCTION_DIAGNOSTIC_CLEANUP
+         *
+         * Remove the 26370-26378 full-resolution CPU diagnostic/hot-pixel
+         * passes from normal Motion processing. The utility source remains
+         * available for explicit audit builds, but a normal shutter does not
+         * scan or mutate RAW buffers here.
+         */
+        if (cameraMode == CameraMode.MOTION) {
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "PRODUCTION_CLEANUP_26379",
+                    "cpuRawDiagnostics=false"
+                            + " transientRawReplacement=false"
+                            + " persistentCpuRepair=false"
+                            + " hfCpuScan=false");
+        }
+
         Log.d(TAG, "Packing");
         //WrapperAl.packImages();
         Log.d(TAG, "Packed");
@@ -407,6 +425,7 @@ public class HdrxProcessor extends ProcessorBase {
             pyramidMerging.Run();
             pyramidMerging.close();
             output = pyramidMerging.Output;
+
             for (int i = 0; i < images.size(); i++) {
                 images.get(i).close();
             }
@@ -427,6 +446,23 @@ public class HdrxProcessor extends ProcessorBase {
                 Allocator.getMemoryCount();
                 return;
             }
+        }
+
+        /* IRIS_26394_MOTION_CANONICAL_RAW_EXPOSURE */
+        if (cameraMode == CameraMode.MOTION) {
+            processingParameters.motionCanonicalExposureGain =
+                    computeMotionCanonicalExposureGain(
+                            output, width, height, processingParameters);
+            Log.d(TAG, "IRIS_26394_CANONICAL_RAW_GAIN="
+                    + processingParameters.motionCanonicalExposureGain);
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "IRIS_26394_CANONICAL_RAW_EXPOSURE",
+                    "gain=" + processingParameters.motionCanonicalExposureGain
+                            + " source=mergedRawBlackSubtracted"
+                            + " dngMutation=false"
+                            + " mergeMutation=false");
+        } else {
+            processingParameters.motionCanonicalExposureGain = 1.0f;
         }
 
         processingParameters.noiseModeler.computeStackingNoiseModel(images.size());
@@ -460,6 +496,158 @@ public class HdrxProcessor extends ProcessorBase {
 
         Allocator.getMemoryCount();
         callback.onFinished();
+    }
+
+
+    /*
+     * IRIS_26394 canonical exposure estimator.
+     * x = clamp((raw-black)/(white-black), 0, 1)
+     * p50 target = 0.055 linear
+     * p90 target = 0.20 linear
+     * p99.5 after gain <= 0.90
+     * gain <= 8x (+3 EV)
+     */
+    private float computeMotionCanonicalExposureGain(
+            ByteBuffer raw,
+            int width,
+            int height,
+            Parameters parameters) {
+        if (raw == null || width <= 0 || height <= 0
+                || parameters == null || parameters.whiteLevel <= 0) {
+            return 1.0f;
+        }
+
+        final float targetP50 = 0.055f;
+        final float targetP90 = 0.20f;
+        final float safeP995 = 0.90f;
+        final float maxGain = 8.0f;
+        final float epsilon = 1.0e-6f;
+        final int bins = 4096;
+
+        int[] hist = new int[bins];
+        long samples = 0L;
+        long floorSamples = 0L;
+
+        java.nio.ByteBuffer view = raw.duplicate();
+        view.clear();
+        view.order(java.nio.ByteOrder.nativeOrder());
+        java.nio.ShortBuffer shorts = view.asShortBuffer();
+
+        int availablePixels = shorts.capacity();
+        long requestedPixels = (long) width * (long) height;
+        int pixelCount = (int) Math.min(
+                (long) availablePixels,
+                Math.min(requestedPixels, (long) Integer.MAX_VALUE));
+        if (pixelCount <= 0) return 1.0f;
+
+        double targetBaseSamples = 120000.0;
+        int step = Math.max(
+                2,
+                (int) Math.floor(
+                        Math.sqrt(
+                                Math.max(
+                                        1.0,
+                                        ((double) pixelCount) / targetBaseSamples))));
+
+        float white = (float) parameters.whiteLevel;
+
+        for (int y = 0; y < height; y += step) {
+            for (int x = 0; x < width; x += step) {
+                for (int dy = 0; dy < 2; dy++) {
+                    int yy = y + dy;
+                    if (yy >= height) continue;
+                    for (int dx = 0; dx < 2; dx++) {
+                        int xx = x + dx;
+                        if (xx >= width) continue;
+                        int index = yy * width + xx;
+                        if (index < 0 || index >= pixelCount) continue;
+
+                        int rawValue = java.lang.Short.toUnsignedInt(shorts.get(index));
+                        int blackIndex = ((yy & 1) << 1) | (xx & 1);
+                        float black = parameters.blackLevel[blackIndex];
+                        float span = Math.max(1.0f, white - black);
+                        float normalized = (rawValue - black) / span;
+                        normalized = Math.max(0.0f, Math.min(1.0f, normalized));
+                        if (normalized <= 0.005f) {
+                            floorSamples++;
+                        }
+
+                        int bin = Math.min(
+                                bins - 1,
+                                Math.max(0, (int) (normalized * (bins - 1))));
+                        hist[bin]++;
+                        samples++;
+                    }
+                }
+            }
+        }
+
+        if (samples < 64L) return 1.0f;
+
+        float p50 = histogramQuantile(hist, samples, 0.50f);
+        float p90 = histogramQuantile(hist, samples, 0.90f);
+        float p995 = histogramQuantile(hist, samples, 0.995f);
+        float floorFraction = floorSamples / (float) samples;
+
+        /*
+         * IRIS_26395_PHOTON_STARVATION_GAIN_CEILING
+         * Lots of unused highlight headroom is NOT evidence that a
+         * photon-starved RAW can safely tolerate a huge lift.
+         * Use actual merged-RAW floor occupancy as an independent
+         * signal-quality ceiling. <=10% near-floor keeps full range;
+         * >=55% near-floor limits canonical lift to about 2x.
+         */
+        float floorRisk = Math.max(
+                0.0f,
+                Math.min(
+                        1.0f,
+                        (floorFraction - 0.10f) / 0.45f));
+        float floorQuality = 1.0f - floorRisk;
+        float signalGainLimit =
+                2.0f + 6.0f * floorQuality * floorQuality;
+
+        float gain50 = targetP50 / Math.max(p50, epsilon);
+        float gain90 = targetP90 / Math.max(p90, epsilon);
+        float sceneGain = (float) Math.sqrt(
+                Math.max(1.0f, gain50) * Math.max(1.0f, gain90));
+        float headroomGain = safeP995 / Math.max(p995, epsilon);
+
+        float gain = Math.min(
+                sceneGain,
+                Math.min(headroomGain, signalGainLimit));
+        gain = Math.max(1.0f, Math.min(maxGain, gain));
+        if (gain < 1.02f) gain = 1.0f;
+
+        Log.d(TAG,
+                "IRIS_26394_CANONICAL_RAW_STATS"
+                        + " samples=" + samples
+                        + " p50=" + p50
+                        + " p90=" + p90
+                        + " p995=" + p995
+                        + " floorFraction=" + floorFraction
+                        + " signalGainLimit=" + signalGainLimit
+                        + " gain50=" + gain50
+                        + " gain90=" + gain90
+                        + " sceneGain=" + sceneGain
+                        + " headroomGain=" + headroomGain
+                        + " finalGain=" + gain);
+        return gain;
+    }
+
+    private float histogramQuantile(int[] hist, long total, float quantile) {
+        if (hist == null || hist.length == 0 || total <= 0L) return 0.0f;
+        long target = Math.max(
+                1L,
+                (long) Math.ceil(
+                        Math.max(0.0, Math.min(1.0, quantile)) * (double) total));
+        long cumulative = 0L;
+        for (int i = 0; i < hist.length; i++) {
+            cumulative += hist[i];
+            if (cumulative >= target) {
+                return ((float) i) / ((float) (hist.length - 1));
+            }
+        }
+        return 1.0f;
     }
 
 }

@@ -44,6 +44,9 @@ public class Parameters {
     public float[] whitePoint = new float[3];
     public int whiteLevel = 1023;
     public static int mergeWhiteLevel = 65535;
+
+    /* IRIS_26394_MOTION_CANONICAL_RAW_EXPOSURE */
+    public float motionCanonicalExposureGain = 1.0f;
     public int realWL = -1;
     public boolean hasGainMap;
     public Point mapSize;

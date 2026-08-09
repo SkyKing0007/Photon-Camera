@@ -363,8 +363,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 }
                 // Keep buffering during AE probe. Eligibility is decided from
                 // actual exposure/ISO groups at shutter time.
-                // Metadata can arrive after the Image callback. Buffer first;
-                // validate timestamp/exposure when shutter is pressed.
+                // Metadata can arrive after the Image callback.
+                // Measure only a sparse RAW sample; the frame is not changed.
+                sampleMotion26380RawCaptureQuality(img);
+
+                // Buffer first; validate timestamp/exposure when shutter is pressed.
                 synchronized (mZslBufferLock) {
                     mZslRingBuffer.addLast(img);
                     int maxFrames = Math.min(PhotonCamera.getSettings().frameCount, 37);
@@ -612,6 +615,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             if (focus != null) mFocus = (float) focus;
             if (isZslMode()) {
                 updateMotionUnifiedExposure(request, result);
+                /* IRIS_26386_STABLE_HAL_AE_AUTHORITY */
+                // Asynchronous RAW evidence is diagnostic only; HAL AE owns live preview.
+                // updateMotion26368AdaptiveAeBias(result);
             }
             if (mTemp != null) mPreviewTemp = mTemp;
             if (mPreviewTemp == null) {
@@ -1178,12 +1184,567 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         Long exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
         Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
         if (exposure == null || iso == null) return false;
-        long exposureTolerance = Math.max(750_000L,
-                mMotionUnifiedExposureNs / 12L);
+        /*
+         * IRIS_26379_UNIFIED_EXPOSURE_EQUIVALENCE
+         * One definition of "same actual exposure" for short Motion RAWs.
+         */
+        long exposureTolerance =
+                iris26378MotionExposureToleranceNs(
+                        mMotionUnifiedExposureNs,
+                        exposure);
         int isoTolerance = Math.max(2, mMotionUnifiedIso / 10);
         return Math.abs(exposure - mMotionUnifiedExposureNs)
                         <= exposureTolerance
                 && Math.abs(iso - mMotionUnifiedIso) <= isoTolerance;
+    }
+
+    /*
+     * IRIS_26368_MOTION_ADAPTIVE_AE_BIAS
+     *
+     * System/HAL AE remains fully enabled. This helper never sets
+     * SENSOR_EXPOSURE_TIME or SENSOR_SENSITIVITY.
+     *
+     * 26367 controls:
+     * - good bright HDR control: ~2.72 ms / ISO 50 -> no intervention
+     * - problematic direct-bright scenes: ~0.11-0.50 ms / ISO 50
+     * - genuine low light: ~30-40 ms / ISO ~3200 -> no intervention
+     */
+    /*
+     * IRIS_26377_BLACK_FLOOR_CAPTURE_BIAS
+     *
+     * Evidence-informed extension of 26368. System AE stays ON.
+     * The goal is to acquire photons instead of digitally lifting RAW-floor
+     * emptiness. This remains bounded and applies only through the existing
+     * short-shutter + low-ISO confidence gates.
+     */
+    private static final float MOTION_26368_AE_MAX_EXTRA_EV = 0.80f;
+    private static final long MOTION_26368_AE_FULL_NS = 600000L;
+    private static final long MOTION_26368_AE_ZERO_NS = 2000000L;
+    private static final int MOTION_26368_AE_FULL_ISO = 70;
+    private static final int MOTION_26368_AE_ZERO_ISO = 220;
+    /*
+     * IRIS_26378_ACTUAL_READY_PREBUFFER
+     *
+     * Keep the 26377 +0.80 EV ceiling unchanged. Reduce only the response
+     * latency so the continuously running RAW ring reaches the already
+     * requested exposure state sooner after framing changes.
+     */
+    private static final int MOTION_26368_AE_CONFIRM_FRAMES = 6;
+    private static final long MOTION_26368_AE_MIN_UPDATE_MS = 400L;
+
+    private boolean mMotion26368AeBaseReady = false;
+    private int mMotion26368AeBaseSteps = 0;
+    private int mMotion26368AeAppliedExtraSteps = 0;
+    private int mMotion26368AeCandidateExtraSteps = 0;
+    private int mMotion26368AeCandidateFrames = 0;
+    private long mMotion26368AeLastUpdateMs = 0L;
+
+    /*
+     * IRIS_26380_RAW_CAPTURE_QUALITY
+     * Sparse evidence from the same live RAW stream Motion captures.
+     */
+    private volatile long mMotion26380RawSignalTimestampNs = 0L;
+    private volatile float mMotion26380RawFloorFraction = Float.NaN;
+    private volatile float mMotion26380RawShadowFraction = Float.NaN;
+    private volatile float mMotion26380RawHighlightFraction = Float.NaN;
+    private volatile float mMotion26380RawMeanSignal = Float.NaN;
+    private volatile int mMotion26380RawSampleCount = 0;
+
+    /* IRIS_26382_CAPTURE_STATE_HANDOFF */
+    private volatile long mMotion26382LastOpportunityCeilingNs = 0L;
+    private volatile float mMotion26382LastRawNeed = 0.0f;
+
+    private static float motion26368Clamp01(float value) {
+        return Math.max(0.0f, Math.min(1.0f, value));
+    }
+
+    /*
+     * IRIS_26380_SPARSE_RAW_SIGNAL_SAMPLER
+     *
+     * About 48 x 36 coarse cells, sampling a 2x2 CFA quad per cell.
+     * This does not mutate or copy the RAW frame.
+     */
+    private void sampleMotion26380RawCaptureQuality(@NonNull Image image) {
+        if (!isZslMode() || mCameraCharacteristics == null) {
+            return;
+        }
+
+        try {
+            Integer whiteLevel =
+                    mCameraCharacteristics.get(
+                            CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
+            android.hardware.camera2.params.BlackLevelPattern blackPattern =
+                    mCameraCharacteristics.get(
+                            CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+
+            if (whiteLevel == null
+                    || whiteLevel <= 0
+                    || blackPattern == null
+                    || image.getPlanes() == null
+                    || image.getPlanes().length == 0) {
+                return;
+            }
+
+            Image.Plane plane = image.getPlanes()[0];
+            java.nio.ByteBuffer buffer =
+                    plane.getBuffer().duplicate()
+                            .order(java.nio.ByteOrder.nativeOrder());
+
+            int rowStride = plane.getRowStride();
+            int pixelStride = plane.getPixelStride();
+            int width = image.getWidth();
+            int height = image.getHeight();
+
+            if (rowStride <= 0
+                    || pixelStride < 2
+                    || width < 8
+                    || height < 8) {
+                return;
+            }
+
+            int stepX = Math.max(4, width / 48);
+            int stepY = Math.max(4, height / 36);
+
+            long count = 0L;
+            long floorCount = 0L;
+            long shadowCount = 0L;
+            long highlightCount = 0L;
+            double signalSum = 0.0;
+
+            for (int y = 2; y < height - 2; y += stepY) {
+                for (int x = 2; x < width - 2; x += stepX) {
+                    for (int dy = 0; dy < 2; dy++) {
+                        for (int dx = 0; dx < 2; dx++) {
+                            int sx = x + dx;
+                            int sy = y + dy;
+                            int index = sy * rowStride + sx * pixelStride;
+
+                            if (index < 0 || index + 1 >= buffer.limit()) {
+                                continue;
+                            }
+
+                            int raw = buffer.getShort(index) & 0xffff;
+                            int black =
+                                    blackPattern.getOffsetForIndex(
+                                            sx & 1,
+                                            sy & 1);
+                            int span = Math.max(1, whiteLevel - black);
+
+                            float signal =
+                                    motion26368Clamp01(
+                                            (raw - black) / (float) span);
+
+                            signalSum += signal;
+                            count++;
+
+                            if (signal <= 0.010f) floorCount++;
+                            if (signal <= 0.040f) shadowCount++;
+                            if (signal >= 0.980f) highlightCount++;
+                        }
+                    }
+                }
+            }
+
+            if (count < 64L) {
+                return;
+            }
+
+            mMotion26380RawSignalTimestampNs = image.getTimestamp();
+            mMotion26380RawFloorFraction = floorCount / (float) count;
+            mMotion26380RawShadowFraction = shadowCount / (float) count;
+            mMotion26380RawHighlightFraction = highlightCount / (float) count;
+            mMotion26380RawMeanSignal = (float) (signalSum / count);
+            mMotion26380RawSampleCount =
+                    (int) Math.min(Integer.MAX_VALUE, count);
+
+        } catch (Throwable throwable) {
+            Log.w(
+                    TAG,
+                    "IRIS_26380 sparse RAW signal sampling skipped: "
+                            + throwable.getClass().getSimpleName());
+        }
+    }
+
+    /*
+     * IRIS_26381_DYNAMIC_MOTION_SHUTTER_OPPORTUNITY
+     * Public Camera2 only. Advisory to system AE; no direct shutter/ISO set.
+     */
+    private long iris26381MotionOpportunityCeilingNs(
+            @NonNull TotalCaptureResult result) {
+        final long absoluteDarkCeilingNs = 1_000_000_000L / 15L;
+        final long fastFloorNs = 1_000_000_000L / 120L;
+        double equivalent35mm = Double.NaN;
+
+        try {
+            Float focal = result.get(CaptureResult.LENS_FOCAL_LENGTH);
+            android.util.SizeF sensor =
+                    mCameraCharacteristics == null
+                            ? null
+                            : mCameraCharacteristics.get(
+                                    CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+            if (focal != null && focal > 0.0f
+                    && sensor != null
+                    && sensor.getWidth() > 0.0f
+                    && sensor.getHeight() > 0.0f) {
+                double sensorDiagonal =
+                        Math.hypot(sensor.getWidth(), sensor.getHeight());
+                if (sensorDiagonal > 0.0) {
+                    equivalent35mm =
+                            focal * Math.hypot(36.0, 24.0) / sensorDiagonal;
+                }
+            }
+        } catch (Throwable ignored) {}
+
+        long focalCeilingNs = absoluteDarkCeilingNs;
+        if (Double.isFinite(equivalent35mm)
+                && equivalent35mm >= 8.0
+                && equivalent35mm <= 500.0) {
+            double denominator =
+                    Math.max(15.0, Math.min(80.0, equivalent35mm / 3.0));
+            focalCeilingNs = (long)(1_000_000_000.0 / denominator);
+            focalCeilingNs =
+                    Math.min(
+                            absoluteDarkCeilingNs,
+                            Math.max(fastFloorNs, focalCeilingNs));
+        }
+
+        double cameraConfidence = 1.0;
+        try {
+            cameraConfidence =
+                    com.particlesdevs.photoncamera.processing.MotionMetrics
+                            .cameraMotionConfidence();
+        } catch (Throwable ignored) {}
+        cameraConfidence = Math.max(0.0, Math.min(1.0, cameraConfidence));
+
+        long motionAwareCeilingNs =
+                fastFloorNs
+                        + (long)((focalCeilingNs - fastFloorNs)
+                                * cameraConfidence);
+
+        return Math.max(
+                fastFloorNs,
+                Math.min(absoluteDarkCeilingNs, motionAwareCeilingNs));
+    }
+
+    private void updateMotion26368AdaptiveAeBias(
+            @NonNull TotalCaptureResult result) {
+        if (PhotonCamera.getSettings().selectedMode != CameraMode.MOTION
+                || mPreviewRequestBuilder == null
+                || mCaptureSession == null
+                || mCameraCharacteristics == null) {
+            return;
+        }
+
+        Integer aeMode = result.get(CaptureResult.CONTROL_AE_MODE);
+        Long actualExposure =
+                result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer actualIso =
+                result.get(CaptureResult.SENSOR_SENSITIVITY);
+
+        if (aeMode == null
+                || aeMode == CaptureResult.CONTROL_AE_MODE_OFF
+                || actualExposure == null
+                || actualIso == null
+                || actualExposure <= 0L
+                || actualIso <= 0) {
+            return;
+        }
+
+        android.util.Range<Integer> aeRange =
+                mCameraCharacteristics.get(
+                        android.hardware.camera2.CameraCharacteristics
+                                .CONTROL_AE_COMPENSATION_RANGE);
+        android.util.Rational aeStep =
+                mCameraCharacteristics.get(
+                        android.hardware.camera2.CameraCharacteristics
+                                .CONTROL_AE_COMPENSATION_STEP);
+
+        if (aeRange == null
+                || aeStep == null
+                || aeRange.getUpper() <= 0
+                || aeStep.floatValue() <= 0.0f) {
+            return;
+        }
+
+        Integer currentSteps =
+                mPreviewRequestBuilder.get(
+                        CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
+
+        if (!mMotion26368AeBaseReady) {
+            mMotion26368AeBaseSteps =
+                    currentSteps != null ? currentSteps : 0;
+            mMotion26368AeBaseSteps =
+                    Math.max(
+                            aeRange.getLower(),
+                            Math.min(
+                                    aeRange.getUpper(),
+                                    mMotion26368AeBaseSteps));
+            mMotion26368AeBaseReady = true;
+        }
+
+        float shutterConfidence =
+                motion26368Clamp01(
+                        (float) (MOTION_26368_AE_ZERO_NS
+                                - actualExposure)
+                                / (float) (MOTION_26368_AE_ZERO_NS
+                                - MOTION_26368_AE_FULL_NS));
+
+        float isoConfidence =
+                motion26368Clamp01(
+                        (float) (MOTION_26368_AE_ZERO_ISO
+                                - actualIso)
+                                / (float) (MOTION_26368_AE_ZERO_ISO
+                                - MOTION_26368_AE_FULL_ISO));
+
+        float brightSceneConfidence =
+                shutterConfidence * isoConfidence;
+
+        /*
+         * IRIS_26380_SCENE_RELATIVE_EXPOSURE_NEED
+         *
+         * RAW signal is primary when fresh. ISO is only a soft modifier.
+         */
+        Long iris26380ResultTimestamp =
+                result.get(CaptureResult.SENSOR_TIMESTAMP);
+
+        long iris26380RawAgeNs =
+                iris26380ResultTimestamp == null
+                        || mMotion26380RawSignalTimestampNs <= 0L
+                        ? Long.MAX_VALUE
+                        : Math.abs(
+                                iris26380ResultTimestamp
+                                        - mMotion26380RawSignalTimestampNs);
+
+        boolean iris26380RawFresh =
+                iris26380RawAgeNs <= 150_000_000L
+                        && !Float.isNaN(mMotion26380RawFloorFraction)
+                        && !Float.isNaN(mMotion26380RawShadowFraction)
+                        && !Float.isNaN(mMotion26380RawHighlightFraction)
+                        && !Float.isNaN(mMotion26380RawMeanSignal)
+                        && mMotion26380RawSampleCount >= 64;
+
+        float iris26380FloorPressure =
+                iris26380RawFresh
+                        ? motion26368Clamp01(
+                                (mMotion26380RawFloorFraction - 0.18f)
+                                        / (0.55f - 0.18f))
+                        : 0.0f;
+
+        float iris26380ShadowPressure =
+                iris26380RawFresh
+                        ? motion26368Clamp01(
+                                (mMotion26380RawShadowFraction - 0.35f)
+                                        / (0.78f - 0.35f))
+                        : 0.0f;
+
+        float iris26380HighlightPressure =
+                iris26380RawFresh
+                        ? motion26368Clamp01(
+                                (mMotion26380RawHighlightFraction - 0.002f)
+                                        / (0.035f - 0.002f))
+                        : 0.0f;
+
+        float iris26380HighlightSafety =
+                1.0f - iris26380HighlightPressure;
+
+        float iris26380MeanDarkness =
+                iris26380RawFresh
+                        ? 1.0f
+                                - motion26368Clamp01(
+                                        (mMotion26380RawMeanSignal - 0.050f)
+                                                / (0.220f - 0.050f))
+                        : 0.0f;
+
+        float iris26380RawNeed =
+                iris26380RawFresh
+                        ? Math.max(
+                                iris26380FloorPressure,
+                                0.70f * iris26380ShadowPressure)
+                                * iris26380HighlightSafety
+                                * (0.45f + 0.55f * iris26380MeanDarkness)
+                        : 0.0f;
+
+        /*
+         * IRIS_26381_DYNAMIC_MOTION_SHUTTER_OPPORTUNITY
+         * Replace 26380's fixed ~33 ms ceiling with a focal/camera-motion
+         * aware ceiling that can approach the established 1/15 s dark limit.
+         */
+        long iris26381OpportunityCeilingNs =
+                iris26381MotionOpportunityCeilingNs(result);
+        mMotion26382LastOpportunityCeilingNs = iris26381OpportunityCeilingNs;
+
+        float iris26380ShutterOpportunity =
+                iris26381OpportunityCeilingNs <= 2_000_000L
+                        ? 0.0f
+                        : motion26368Clamp01(
+                                (iris26381OpportunityCeilingNs
+                                        - actualExposure)
+                                        / (float)Math.max(
+                                                1L,
+                                                iris26381OpportunityCeilingNs
+                                                        - 2_000_000L));
+
+        /*
+         * ISO is deliberately only a soft modifier.
+         */
+        float iris26380IsoModifier =
+                0.72f + 0.28f * isoConfidence;
+
+        /*
+         * IRIS_26382_RAW_QUALITY_DRIVES_PRESSURE
+         *
+         * 26381 correctly found the legal shutter ceiling, but multiplied
+         * severe RAW starvation by the remaining-distance fraction. That
+         * made pressure collapse near the ceiling even when RAW quality had
+         * not improved. Keep a bounded pressure floor while more legal
+         * integration time exists; let RAW quality/highlights terminate it.
+         */
+        float iris26382OpportunityEligibility =
+                iris26380ShutterOpportunity > 0.015f ? 1.0f : 0.0f;
+        float iris26382SevereNeed =
+                motion26368Clamp01((iris26380RawNeed - 0.45f) / 0.45f);
+        float iris26382PressureShape =
+                Math.max(
+                        iris26380ShutterOpportunity,
+                        iris26382OpportunityEligibility
+                                * (0.55f + 0.25f * iris26382SevereNeed));
+
+        float iris26380RawRequestedExtraEv =
+                MOTION_26368_AE_MAX_EXTRA_EV
+                        * iris26380RawNeed
+                        * iris26382PressureShape
+                        * iris26380IsoModifier;
+        mMotion26382LastRawNeed = iris26380RawNeed;
+
+        float iris26380MetadataFallbackEv =
+                MOTION_26368_AE_MAX_EXTRA_EV
+                        * brightSceneConfidence;
+
+        float requestedExtraEv =
+                iris26380RawFresh
+                        ? iris26380RawRequestedExtraEv
+                        : iris26380MetadataFallbackEv;
+
+        int requestedExtraSteps =
+                Math.max(
+                        0,
+                        Math.round(
+                                requestedExtraEv
+                                        / aeStep.floatValue()));
+
+        int maximumExtraSteps =
+                Math.max(
+                        0,
+                        aeRange.getUpper()
+                                - mMotion26368AeBaseSteps);
+
+        requestedExtraSteps =
+                Math.min(
+                        requestedExtraSteps,
+                        maximumExtraSteps);
+
+        if (requestedExtraSteps
+                != mMotion26368AeCandidateExtraSteps) {
+            mMotion26368AeCandidateExtraSteps =
+                    requestedExtraSteps;
+            mMotion26368AeCandidateFrames = 1;
+        } else {
+            mMotion26368AeCandidateFrames++;
+        }
+
+        if (mMotion26368AeCandidateFrames
+                < MOTION_26368_AE_CONFIRM_FRAMES) {
+            return;
+        }
+
+        if (requestedExtraSteps
+                == mMotion26368AeAppliedExtraSteps) {
+            return;
+        }
+
+        long nowMs = android.os.SystemClock.elapsedRealtime();
+        if (nowMs - mMotion26368AeLastUpdateMs
+                < MOTION_26368_AE_MIN_UPDATE_MS) {
+            return;
+        }
+
+        int finalSteps =
+                Math.max(
+                        aeRange.getLower(),
+                        Math.min(
+                                aeRange.getUpper(),
+                                mMotion26368AeBaseSteps
+                                        + requestedExtraSteps));
+
+        try {
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+                    finalSteps);
+
+            mMotion26368AeAppliedExtraSteps =
+                    requestedExtraSteps;
+            mMotion26368AeLastUpdateMs = nowMs;
+
+            rebuildPreviewBuilder();
+
+            Log.i(
+                    TAG,
+                    "IRIS_26368_MOTION_ADAPTIVE_AE_BIAS"
+                            + " exposureNs=" + actualExposure
+                            + " iso=" + actualIso
+                            + " shutterConfidence="
+                            + shutterConfidence
+                            + " isoConfidence="
+                            + isoConfidence
+                            + " brightSceneConfidence="
+                            + brightSceneConfidence
+                            + " iris26377BlackFloorCaptureBias=true"
+                            + " iris26380RawFresh=" + iris26380RawFresh
+                            + " iris26380RawAgeNs=" + iris26380RawAgeNs
+                            + " iris26380FloorFraction="
+                            + mMotion26380RawFloorFraction
+                            + " iris26380ShadowFraction="
+                            + mMotion26380RawShadowFraction
+                            + " iris26380HighlightFraction="
+                            + mMotion26380RawHighlightFraction
+                            + " iris26380MeanSignal="
+                            + mMotion26380RawMeanSignal
+                            + " iris26380RawSamples="
+                            + mMotion26380RawSampleCount
+                            + " iris26380RawNeed=" + iris26380RawNeed
+                            + " iris26380ShutterOpportunity="
+                            + iris26380ShutterOpportunity
+                            + " iris26381OpportunityCeilingNs="
+                            + iris26381OpportunityCeilingNs
+                            + " iris26380IsoModifier="
+                            + iris26380IsoModifier
+                            + " iris26380RawRequestedExtraEv="
+                            + iris26380RawRequestedExtraEv
+                            + " iris26382PressureShape="
+                            + iris26382PressureShape
+                            + " iris26382SevereNeed="
+                            + iris26382SevereNeed
+                            + " iris26380MetadataFallbackEv="
+                            + iris26380MetadataFallbackEv
+                            + " baseSteps="
+                            + mMotion26368AeBaseSteps
+                            + " extraSteps="
+                            + requestedExtraSteps
+                            + " finalSteps="
+                            + finalSteps
+                            + " stepEv="
+                            + aeStep.floatValue()
+                            + " appliedExtraEv="
+                            + (requestedExtraSteps
+                                    * aeStep.floatValue())
+                            + " aeMode=" + aeMode);
+        } catch (IllegalArgumentException
+                | IllegalStateException exception) {
+            Log.e(
+                    TAG,
+                    "IRIS_26368 AE compensation update failed: "
+                            + Log.getStackTraceString(exception));
+        }
     }
 
     private void restoreMotionPreviewAe() {
@@ -2328,6 +2889,33 @@ private long mMotionUnifiedLastUpdateMs = 0L;
 
         pollMotionTopUp();
     }    // IRIS_26343_GENERATION_SAFE_ZSL
+    /*
+     * IRIS_26378_SHORT_EXPOSURE_GROUP_PRECISION
+     *
+     * The previous 750 us minimum tolerance merged ~0.286 ms and ~0.60 ms
+     * into one "equal exposure" group. That allowed the stale dark first-shot
+     * RAWs to satisfy the top-up even after system AE had moved brighter.
+     *
+     * Below 2 ms use a 100 us / 12.5% floor. Above 2 ms retain the historical
+     * 750 us tolerance, preserving indoor/night grouping behavior.
+     */
+    private long iris26378MotionExposureToleranceNs(
+            long firstExposure,
+            long secondExposure) {
+        long exposureReference =
+                Math.max(firstExposure, secondExposure);
+
+        if (exposureReference <= 2_000_000L) {
+            return Math.max(
+                    100_000L,
+                    exposureReference / 8L);
+        }
+
+        return Math.max(
+                750_000L,
+                exposureReference / 12L);
+    }
+
     private boolean motionExposurePairMatches(
             TotalCaptureResult first,
             TotalCaptureResult second) {
@@ -2349,19 +2937,56 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             return false;
         }
 
-        long exposureReference = Math.max(
-                firstExposure,
-                secondExposure);
-        int isoReference = Math.max(firstIso, secondIso);
-        long exposureTolerance = Math.max(
-                750_000L,
-                exposureReference / 12L);
-        int isoTolerance = Math.max(2, isoReference / 10);
+        long exposureTolerance =
+                iris26378MotionExposureToleranceNs(
+                        firstExposure,
+                        secondExposure);
+
+        int isoReference =
+                Math.max(firstIso, secondIso);
+        int isoTolerance =
+                Math.max(2, isoReference / 10);
 
         return Math.abs(firstExposure - secondExposure)
                         <= exposureTolerance
                 && Math.abs(firstIso - secondIso)
                         <= isoTolerance;
+    }
+
+    /*
+     * IRIS_26378_SHADOW_DATA_READINESS
+     *
+     * Actual returned sensor metadata, never requested metadata:
+     *   2 = >=0.50 ms at ISO <=100 (ready)
+     *   1 = 0.40-0.50 ms at ISO <=100 (transitional)
+     *   0 = <0.40 ms at ISO <=100 (stale/dark)
+     *  -1 = not the bright/base-ISO class
+     */
+    private int iris26378ShadowReadiness(
+            TotalCaptureResult result) {
+        if (result == null) return -1;
+
+        Long exposure =
+                result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer iso =
+                result.get(CaptureResult.SENSOR_SENSITIVITY);
+
+        if (exposure == null
+                || iso == null
+                || exposure <= 0L
+                || iso <= 0
+                || iso > 100) {
+            return -1;
+        }
+
+        if (exposure >= 500_000L) return 2;
+        if (exposure >= 400_000L) return 1;
+        return 0;
+    }
+
+    private boolean iris26378PreferShadowReadyGroup() {
+        /* IRIS_26386_HAL_AE_GROUP_SELECTION */
+        return false;
     }
 
     private TotalCaptureResult findBestMotionExposureGroup(
@@ -2371,10 +2996,21 @@ private long mMotionUnifiedLastUpdateMs = 0L;
 
         TotalCaptureResult bestResult = null;
         int bestCount = 0;
+        int bestReadiness = Integer.MIN_VALUE;
+
+        boolean preferReady =
+                iris26378PreferShadowReadyGroup();
 
         /*
-         * Search newest to oldest. A strictly greater count replaces the
-         * winner, so ties remain biased toward the newest populated group.
+         * IRIS_26378_ACTUAL_READY_GROUP_SELECTION
+         *
+         * Search newest to oldest as before.
+         *
+         * If the existing bright-scene AE bias is active, actual sensor
+         * readiness outranks raw group count:
+         * ready >=0.50ms > transitional > stale <0.40ms.
+         *
+         * Outside that bright/base-ISO class, behavior remains count-first.
          */
         for (int candidateIndex = images.size() - 1;
                 candidateIndex >= Math.max(0, startIndex);
@@ -2397,6 +3033,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 TotalCaptureResult frameResult =
                         findNearestZslResult(
                                 frameImage.getTimestamp());
+
                 if (motionExposurePairMatches(
                         frameResult,
                         candidateResult)) {
@@ -2404,8 +3041,39 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 }
             }
 
-            if (matching > bestCount) {
+            int readiness =
+                    iris26378ShadowReadiness(
+                            candidateResult);
+
+            boolean candidateInBrightClass =
+                    readiness >= 0;
+
+            boolean bestInBrightClass =
+                    bestReadiness >= 0;
+
+            boolean replace;
+
+            if (preferReady
+                    && candidateInBrightClass) {
+                if (!bestInBrightClass) {
+                    replace = true;
+                } else if (readiness > bestReadiness) {
+                    replace = true;
+                } else if (readiness == bestReadiness) {
+                    replace = matching > bestCount;
+                } else {
+                    replace = false;
+                }
+            } else if (preferReady
+                    && bestInBrightClass) {
+                replace = false;
+            } else {
+                replace = matching > bestCount;
+            }
+
+            if (replace) {
                 bestCount = matching;
+                bestReadiness = readiness;
                 bestResult = candidateResult;
             }
         }
@@ -2458,8 +3126,113 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         boolean targetReady = validBuffered >= mMotionTopUpTargetFrames;
         boolean timedOut = elapsed >= MOTION_TOP_UP_TIMEOUT_MS;
 
-        if (targetReady
-                || (timedOut && validBuffered >= mMotionTopUpMinimumFrames)) {
+        /*
+         * IRIS_26378_PREBUFFER_READINESS_TRACE
+         *
+         * countValidMotionFrames() now follows the same actual-ready group
+         * selector used during final drain.
+         */
+        TotalCaptureResult iris26378BestResult = null;
+        int iris26378Readiness = -1;
+        long iris26378BestExposureNs = -1L;
+        int iris26378BestIso = -1;
+
+        synchronized (mZslBufferLock) {
+            java.util.List<Image> iris26378Images =
+                    new java.util.ArrayList<>(mZslRingBuffer);
+            iris26378BestResult =
+                    findBestMotionExposureGroup(
+                            iris26378Images,
+                            0);
+        }
+
+        if (iris26378BestResult != null) {
+            iris26378Readiness =
+                    iris26378ShadowReadiness(
+                            iris26378BestResult);
+            Long iris26378Exp =
+                    iris26378BestResult.get(
+                            CaptureResult.SENSOR_EXPOSURE_TIME);
+            Integer iris26378Iso =
+                    iris26378BestResult.get(
+                            CaptureResult.SENSOR_SENSITIVITY);
+
+            if (iris26378Exp != null) {
+                iris26378BestExposureNs =
+                        iris26378Exp;
+            }
+            if (iris26378Iso != null) {
+                iris26378BestIso =
+                        iris26378Iso;
+            }
+        }
+
+        /*
+         * IRIS_26379_AUTHORITATIVE_SHADOW_READINESS
+         *
+         * 26378 only logged readiness. It did not participate in completion,
+         * so readiness=0 could still finalize immediately from frame count.
+         */
+        boolean iris26379ShadowPolicyActive =
+                iris26378PreferShadowReadyGroup()
+                        && iris26378Readiness >= 0;
+
+        boolean iris26379TargetExposureReady =
+                !iris26379ShadowPolicyActive
+                        || iris26378Readiness >= 2;
+
+        boolean iris26379TimeoutExposureAcceptable =
+                !iris26379ShadowPolicyActive
+                        || iris26378Readiness >= 1;
+
+        /*
+         * IRIS_26382_RAW_ADEQUACY_READINESS
+         * A full frame count is not sufficient when the live RAW is still
+         * severely floor-starved, highlights are safe, and the current
+         * exposure remains materially below the same dynamic Motion ceiling.
+         */
+        boolean iris26382RawEvidenceFreshEnough =
+                !Float.isNaN(mMotion26380RawFloorFraction)
+                        && !Float.isNaN(mMotion26380RawShadowFraction)
+                        && !Float.isNaN(mMotion26380RawHighlightFraction)
+                        && mMotion26380RawSampleCount >= 64;
+        boolean iris26382SeverelyStarved =
+                iris26382RawEvidenceFreshEnough
+                        && (mMotion26380RawFloorFraction >= 0.38f
+                                || mMotion26380RawShadowFraction >= 0.88f)
+                        && mMotion26380RawHighlightFraction < 0.010f;
+        boolean iris26382MoreIntegrationAvailable =
+                mMotion26382LastOpportunityCeilingNs > 0L
+                        && mMotionUnifiedExposureNs > 0L
+                        && mMotionUnifiedExposureNs
+                                < (long)(0.92
+                                        * mMotion26382LastOpportunityCeilingNs);
+        /* IRIS_26386_RAW_EVIDENCE_ADVISORY_ONLY */
+        boolean iris26382RawAdequacyReady = true;
+
+        boolean iris26379TargetReady =
+                targetReady
+                        && iris26379TargetExposureReady
+                        && iris26382RawAdequacyReady;
+
+        boolean iris26379TimeoutReady =
+                timedOut
+                        && validBuffered >= mMotionTopUpMinimumFrames
+                        && iris26379TimeoutExposureAcceptable;
+
+        /*
+         * IRIS_26383_TIMEOUT_FINALIZES_MINIMUM
+         * The 1.4 s deadline is the safety valve. If minimum valid actual-
+         * exposure frames exist, finalize the best available group rather
+         * than aborting only because the older readiness rank is still zero.
+         * Normal pre-timeout completion still obeys 26382 RAW adequacy.
+         */
+        boolean iris26383TimeoutMinimumReady =
+                timedOut
+                        && validBuffered >= mMotionTopUpMinimumFrames;
+
+        if (iris26379TargetReady
+                || iris26383TimeoutMinimumReady) {
             mMotionTopUpActive = false;
             com.particlesdevs.photoncamera.util.MotionTrace.state(
                     mMotionDiagnosticShotId,
@@ -2467,7 +3240,45 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                     "buffered=" + buffered + " valid=" + validBuffered
                             + " targetReady=" + targetReady
                             + " timedOut=" + timedOut
-                            + " elapsedMs=" + elapsed);
+                            + " elapsedMs=" + elapsed
+                            + " iris26378Readiness="
+                            + iris26378Readiness
+                            + " iris26378BestExposureNs="
+                            + iris26378BestExposureNs
+                            + " iris26378BestIso="
+                            + iris26378BestIso
+                            + " iris26378AppliedExtraSteps="
+                            + mMotion26368AeAppliedExtraSteps
+                            + " iris26379ShadowPolicyActive="
+                            + iris26379ShadowPolicyActive
+                            + " iris26379TargetExposureReady="
+                            + iris26379TargetExposureReady
+                            + " iris26379TimeoutExposureAcceptable="
+                            + iris26379TimeoutExposureAcceptable
+                            + " iris26379TargetReady="
+                            + iris26379TargetReady
+                            + " iris26382RawAdequacyReady="
+                            + iris26382RawAdequacyReady
+                            + " iris26382SeverelyStarved="
+                            + iris26382SeverelyStarved
+                            + " iris26382MoreIntegrationAvailable="
+                            + iris26382MoreIntegrationAvailable
+                            + " iris26382LastOpportunityCeilingNs="
+                            + mMotion26382LastOpportunityCeilingNs
+                            + " iris26379TimeoutReady="
+                            + iris26379TimeoutReady
+                            + " iris26383TimeoutMinimumReady="
+                            + iris26383TimeoutMinimumReady
+                            + " iris26380RawFloorFraction="
+                            + mMotion26380RawFloorFraction
+                            + " iris26380RawShadowFraction="
+                            + mMotion26380RawShadowFraction
+                            + " iris26380RawHighlightFraction="
+                            + mMotion26380RawHighlightFraction
+                            + " iris26380RawMeanSignal="
+                            + mMotion26380RawMeanSignal
+                            + " iris26380RawSamples="
+                            + mMotion26380RawSampleCount);
             finalizeMotionZslCapture();
             return;
         }
@@ -2480,7 +3291,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                             + " minimum=" + mMotionTopUpMinimumFrames
                             + " elapsedMs=" + elapsed
                             + " aeProbe=" + mMotionAeProbeActive
-                            + " probeFrames=" + mMotionAeProbeFrames);
+                            + " probeFrames=" + mMotionAeProbeFrames
+                            + " iris26379ExposureReadiness="
+                            + iris26378Readiness
+                            + " iris26379ExposureGateRejected="
+                            + (iris26379ShadowPolicyActive
+                                    && !iris26379TimeoutExposureAcceptable));
             recoverMotionCaptureAfterEarlyExit(
                     "BUFFER_NOT_READY",
                     "Motion buffer preparing");
@@ -2497,6 +3313,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         mMotionTopUpActive = false;
         mZslCapturing = false;
         burst = false;
+
+        /*
+         * IRIS_26383_ABORT_UI_RESET
+         * This helper is pre-processing recovery. Clear the global busy latch
+         * so BUFFER_NOT_READY/EMPTY_BUFFER cannot leave the shutter stuck.
+         */
+        isProcessing = false;
         mState = STATE_PREVIEW;
 
         if (mBackgroundHandler != null) {
@@ -2525,6 +3348,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             new Handler(Looper.getMainLooper()).post(restoreUi);
         }
 
+        Log.w(TAG, "IRIS_26383_ABORT_UI_RESET"
+                + " isProcessing=" + isProcessing
+                + " result=" + traceResult);
         Log.w(TAG, "MOTION_CAPTURE_RECOVERED"
                 + " result=" + traceResult
                 + " generation=" + mMotionUnifiedGeneration
@@ -2830,7 +3656,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
 
         com.particlesdevs.photoncamera.util.MotionTrace.state(
                 mMotionDiagnosticShotId,
-                "BUFFER_SELECTED",
+                /*
+         * IRIS_26378_FINAL_ACTUAL_READY_SELECTION
+         * Final selected frames use the same precise exposure grouping and
+         * readiness-prioritized selector as top-up counting.
+         */
+        "BUFFER_SELECTED",
                 "capturedCount=" + capturedCount
                         + " requestedSetting="
                         + PhotonCamera.getSettings().frameCount
