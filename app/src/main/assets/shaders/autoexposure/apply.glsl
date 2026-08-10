@@ -18,6 +18,7 @@ uniform float irisHdrUpperMidProtectEnd;
 uniform float irisHdrDeepShadowSafety;
 uniform float irisHdrChromaPreservationStrength;
 uniform float irisHdrMinimumShadowColorRetention;
+uniform float irisLabMaxShadowLiftEv;
 out vec4 Output;
 vec3 reinhard_extended(vec3 v, float max_white){
     vec3 numerator = v * (vec3(1.0f) + (v / vec3(max_white * max_white)));
@@ -211,6 +212,18 @@ void main() {
             irisHdrLowerMidLift
                     * irisHdrLowerMidMask
                     * (1.0 - irisHdrToneLuma);
+
+    /*
+     * IRIS_26405_ADAPTIVE_SHADOW_LIFT_CEILING
+     * This is a ceiling on EXISTING local recovery, not a new exposure lift.
+     * It scales with source luma, so true zero remains zero and cannot be
+     * disguised as recovered photon data.
+     */
+    float iris26405MaxLiftFromEv =
+            max(0.0, irisHdrToneLuma)
+                    * (exp2(clamp(irisLabMaxShadowLiftEv, 0.0, 6.0)) - 1.0);
+    irisHdrLiftAmount =
+            min(irisHdrLiftAmount, iris26405MaxLiftFromEv);
 
     float irisHdrOutputLuma =
             clamp(

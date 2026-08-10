@@ -128,6 +128,29 @@ void main() {
         if (motionMode == 0) {
             bayerAlter = mix(bayerNone, bayerAlter,
                     smoothstep(w2/(w1+w2), vec4(0.48), vec4(0.51)));
+        } else {
+            /*
+             * IRIS_26398_MOTION_EARLY_WARP_SANITY
+             *
+             * Motion previously accepted every locally aligned sample here.
+             * That allowed a wrong local warp to enter baseDiff, then be spread
+             * through the Laplacian/Gaussian reconstruction before merge11 had
+             * any chance to reject it.
+             *
+             * Compare aligned and unaligned alternate error against the owned
+             * reference in this pre-pyramid domain. Trust the warp only when
+             * it is materially better. Equal/ambiguous evidence falls back
+             * toward the unwarped alternate instead of blending a displaced edge.
+             */
+            float iris26398AlignedError = dot(w1, vec4(0.25));
+            float iris26398UnalignedError = dot(w2, vec4(0.25));
+            float iris26398ErrorSum =
+                    iris26398AlignedError + iris26398UnalignedError + 1.0e-6;
+            float iris26398AlignedErrorRatio =
+                    iris26398AlignedError / iris26398ErrorSum;
+            float iris26398WarpTrust =
+                    1.0 - smoothstep(0.42, 0.48, iris26398AlignedErrorRatio);
+            bayerAlter = mix(bayerNone, bayerAlter, iris26398WarpTrust);
         }
 
         //vec4 hp2 = imageLoad(hotPixTexture, aligned * TILE);

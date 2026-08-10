@@ -7,6 +7,10 @@ out vec2 result;
 uniform int yOffset;
 #define DH (0.0)
 #define FUSIONGAIN 1.0
+#ifndef IRIS_26403_MOTION_FUSION_ZIPPER_STABILITY
+#define IRIS_26403_MOTION_FUSION_ZIPPER_STABILITY 0
+#endif
+uniform float MotionFusionMapRegressionDamping;
 #define NORM 64.0
 #define luminocity(x) dot(x.rgb, vec3(0.299, 0.587, 0.114))
 float gammaInverse(float x) {
@@ -57,6 +61,36 @@ void main() {
     float varX = momentX2 * invWs - meanX * meanX;
     // Handle zero variance case with epsilon for stability
     float a = covXY / (max(varX, 0.0) + 0.0001);
+
+#if IRIS_26403_MOTION_FUSION_ZIPPER_STABILITY == 1
+    /*
+     * IRIS_26403_MOTION_FUSION_ZIPPER_STABILITY
+     *
+     * Do not change the 26361 fused/base target. Only distrust extreme local
+     * regression slopes when the guide has weak variance or sits in the bright
+     * highlight domain. This targets alternating A/B cells at hard shelf/light
+     * boundaries while leaving ordinary texture/midtones effectively unchanged.
+     *
+     * Recompute b after slope damping so the fitted line still passes through
+     * (meanX, meanY): local mean brightness is preserved.
+     */
+    float iris26403Var = max(varX, 0.0);
+    float iris26403LowVarianceRisk =
+            1.0 - smoothstep(0.0006, 0.0040, iris26403Var);
+    float iris26403SteepSlopeRisk =
+            smoothstep(1.25, 3.00, abs(a));
+    float iris26403HighlightRisk =
+            smoothstep(0.68, 0.94, meanX);
+    float iris26403RegressionRisk =
+            clamp(
+                    iris26403SteepSlopeRisk
+                    * max(iris26403LowVarianceRisk, iris26403HighlightRisk),
+                    0.0,
+                    1.0);
+    float iris26403BoundedA = clamp(a, -1.50, 1.50);
+    a = mix(a, iris26403BoundedA, clamp(MotionFusionMapRegressionDamping, 0.0, 1.0) * iris26403RegressionRisk);
+#endif
+
     float b = meanY - a * meanX;
     result = vec2(a,b);
     //result=(((br2+0.00001)/((br)+0.00001)));

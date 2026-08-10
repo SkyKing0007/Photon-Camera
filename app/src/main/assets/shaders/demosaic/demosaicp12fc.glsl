@@ -10,7 +10,10 @@ layout(rgba16f, binding = 2) uniform highp readonly image2D igTexture;
 layout(rgba16f, binding = 3) uniform highp writeonly image2D outTexture;
 #define alpha 3.75
 #define L 7
-#define THRESHOLD 1.3
+#ifndef IRIS_LAB_GREEN_REFINE_THRESHOLD
+#define IRIS_LAB_GREEN_REFINE_THRESHOLD 1.3
+#endif
+#define THRESHOLD IRIS_LAB_GREEN_REFINE_THRESHOLD
 #define EPS 0.0001
 uniform int yOffset;
 

@@ -15,13 +15,22 @@ uniform int yOffset;
 //#define EPS2 0.001
 #define EPS 1e-6
 #define EPS2 1e-3
-#define alpha 3.75
+#ifndef IRIS_LAB_FINAL_ALPHA
+#define IRIS_LAB_FINAL_ALPHA 3.75
+#endif
+#define alpha IRIS_LAB_FINAL_ALPHA
 #define NOISEO 0.0
 #define NOISES 0.0
-#define BETA 0.42
+#ifndef IRIS_LAB_FINAL_BETA
+#define IRIS_LAB_FINAL_BETA 0.42
+#endif
+#define BETA IRIS_LAB_FINAL_BETA
 //#define BETA 0.0
 //#define THRESHOLD 1.9
-#define THRESHOLD 1.9
+#ifndef IRIS_LAB_FINAL_THRESHOLD
+#define IRIS_LAB_FINAL_THRESHOLD 1.9
+#endif
+#define THRESHOLD IRIS_LAB_FINAL_THRESHOLD
 
 #define L 1
 //#define greenmin (0.08)

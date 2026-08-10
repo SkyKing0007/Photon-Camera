@@ -25,6 +25,9 @@ import java.util.ArrayList;
 
 public class PostPipeline extends GLBasePipeline {
     public ByteBuffer stackFrame;
+
+    /* IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF */
+    public ByteBuffer motionV2FloatCfa;
     public ByteBuffer lowFrame;
     public ByteBuffer highFrame;
     public GLTexture FusionMap;
@@ -76,6 +79,21 @@ public class PostPipeline extends GLBasePipeline {
         step = 1.0f
     )
     int demosaicingMethod = 1;
+
+    /*
+     * IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF
+     * Motion V2 enters PostPipeline already normalized into FLOAT16 CFA planes.
+     */
+    public Bitmap RunMotionV2FloatCfa(
+            ByteBuffer reconstructedCfa,
+            Parameters parameters) {
+        if (reconstructedCfa == null) {
+            throw new IllegalArgumentException(
+                    "Motion V2 reconstructed CFA buffer is null");
+        }
+        motionV2FloatCfa = reconstructedCfa;
+        return Run(null, parameters);
+    }
 
     public Bitmap Run(ByteBuffer inBuffer, Parameters parameters) {
         mParameters = parameters;
@@ -196,8 +214,71 @@ public class PostPipeline extends GLBasePipeline {
 
     private void BuildDefaultPipeline() {
         boolean nightMode = PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT;
+
+        /* IRIS_26410_MOTION_V2_ISOLATED_POST_GRAPH */
+        if (mParameters.motionV2Active) {
+            /*
+             * IRIS_26414_MOTION_V2_FLOAT_CFA_POST_GRAPH
+             * Temporal reconstruction is already in normalized FLOAT16 CFA.
+             */
+            add(new MotionV2CfaInput());
+            /*
+             * IRIS_26425_RESOLVED_CFA_ROUTING_AUTHORITY
+             *
+             * Parameters.cfaPattern is the Camera2-resolved sensor CFA after
+             * optional user override. Settings.cfaPattern may still be -1
+             * ("automatic"), so it must not decide the runtime image carrier.
+             */
+            boolean directBayer =
+                    mParameters.cfaPattern >= 0 && mParameters.cfaPattern <= 3;
+            if (directBayer) {
+                /*
+                 * IRIS_26424_DIRECT_MULTIFRAME_RGB_POST_GRAPH
+                 * Standard Bayer image formation already produced full-
+                 * resolution linear camera RGB. No separate demosaic runs.
+                 */
+                add(new StageTelemetry("V2_POST_DIRECT_MULTIFRAME_RGB"));
+            } else {
+                add(new StageTelemetry("V2_POST_FLOAT_CFA_INPUT_FALLBACK"));
+                switch (mSettings.cfaPattern) {
+                    case -2:
+                        add(new DemosaicQUAD());
+                        break;
+                    case 4:
+                        add(new MonoDemosaic());
+                        break;
+                    default:
+                        add(new MotionV2CfaDemosaic());
+                        break;
+                }
+                add(new StageTelemetry("V2_POST_DEMOSAIC_FALLBACK"));
+            }
+                    /*
+                     * IRIS_26418_MOTION_V2_OWNED_IMAGE_FORMATION
+                     * Linear camera RGB -> direct HAL linear sRGB ->
+                     * residual luma/chroma denoise -> tone/output.
+                     */
+            add(new MotionV2ColorTransform());
+            add(new MotionV2Denoise());
+
+            add(new StageTelemetry("V2_POST_LUMA_CHROMA_RECONSTRUCTION"));
+            add(new MotionV2Render());
+            add(new StageTelemetry("V2_POST_RENDER"));
+            add(new RotateWatermark(getRotation()));
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "IRIS_26410_MOTION_V2_POST_GRAPH",
+                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"
+                            + " directMultiframeRgb=" + directBayer
+                            + " exposureFusion=false esd=false ablc=false"
+                            + " initial=false autoExposure=false"
+                            + " captureSharpening=false correctingFlow=false sharpen2=false");
+            return;
+        }
+
         add(new Bayer2Float());
+        add(new StageTelemetry("POST_BAYER2FLOAT"));
         add(new ExposureFusionBayer2());
+        add(new StageTelemetry("POST_EXPOSURE_FUSION_BAYER2"));
         switch (PhotonCamera.getSettings().cfaPattern) {
             case -2: {
                 add(new DemosaicQUAD());
@@ -239,14 +320,17 @@ public class PostPipeline extends GLBasePipeline {
                             break;
                     }
                 }
+                add(new StageTelemetry("POST_DEMOSAIC"));
                 if (PhotonCamera.getSettings().hdrxNR) {
                     add(new ESD3D2(true));
                 }
+                add(new StageTelemetry("POST_ESD3D2_OR_BYPASS"));
                 //add(new ImpulsePixelFilter());
                 break;
             }
         }
         add(new ABLC());
+        add(new StageTelemetry("POST_ABLC"));
         /*
          * * * All filters after demosaicing * * *
          */
@@ -262,8 +346,10 @@ public class PostPipeline extends GLBasePipeline {
         //add(new Equalization());
 
         add(new Initial());
+        add(new StageTelemetry("POST_INITIAL"));
 
         add(new AutoExposure());
+        add(new StageTelemetry("POST_AUTOEXPOSURE"));
 
 
         //add(new GlobalToneMapping());

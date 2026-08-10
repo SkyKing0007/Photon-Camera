@@ -13,6 +13,15 @@ uniform int CfaPattern;
 uniform uint whitelevel;
 uniform float CanonicalExposureGain;
 uniform int MinimalInd;
+#ifndef IRIS_26403_MOTION_HIGHLIGHT_SHOULDER
+#define IRIS_26403_MOTION_HIGHLIGHT_SHOULDER 0
+#endif
+#ifndef IRIS_26412_MOTION_V2_WIDE_LINEAR
+#define IRIS_26412_MOTION_V2_WIDE_LINEAR 0
+#endif
+uniform int MotionHighlightShoulderEnable;
+uniform float MotionHighlightShoulderStart;
+uniform float MotionHighlightShoulderStrength;
 #define BLR (0.0)
 #define BLG (0.0)
 #define BLB (0.0)
@@ -74,7 +83,55 @@ void main() {
     // IRIS_26394_MOTION_CANONICAL_RAW_EXPOSURE
     // Global linear exposure only. No ADRC/local curve.
     Output *= CanonicalExposureGain;
-    Output = clamp(Output/balance,0.0,1.0);
+
+    /*
+     * IRIS_26403_MOTION_HIGHLIGHT_PRESERVATION
+     *
+     * 26402 proved that hard-clamping here can erase highlight ordering before
+     * demosaic/LTM. Keep the downstream 0..1 contract, but replace the Motion
+     * hard ceiling with a C1-continuous rational shoulder:
+     *
+     *   x <= 0.84 : exactly unchanged
+     *   x >  0.84 : progressively compressed toward 1.0
+     *
+     * At x=1.0 the output is 0.92. Values above 1 remain ordered rather than
+     * collapsing to one flat plateau. Photo/Night retain the exact old clamp.
+     */
+    float iris26403Linear = max(Output/balance, 0.0);
+#if IRIS_26412_MOTION_V2_WIDE_LINEAR == 1
+    // IRIS_26412: keep HDR headroom through demosaic/reconstruction.
+    Output = max(iris26403Linear, 0.0);
+#elif IRIS_26403_MOTION_HIGHLIGHT_SHOULDER == 1
+    /*
+     * IRIS_26404_MOTION_IQ_LAB
+     * Strength 0 reproduces the pre-26403 hard-clamp result.
+     * Strength 1 reproduces the 26403 rational shoulder.
+     */
+    float iris26404ShoulderStart =
+            clamp(MotionHighlightShoulderStart, 0.75, 0.98);
+    float iris26404ShoulderSpan =
+            max(1.0 - iris26404ShoulderStart, 0.001);
+    float iris26404Excess =
+            max(iris26403Linear - iris26404ShoulderStart, 0.0);
+    float iris26404Compressed =
+            iris26404ShoulderStart
+            + iris26404Excess
+              / (1.0 + iris26404Excess / iris26404ShoulderSpan);
+    float iris26404Shouldered =
+            iris26403Linear <= iris26404ShoulderStart
+                    ? iris26403Linear
+                    : iris26404Compressed;
+    float iris26404Strength =
+            MotionHighlightShoulderEnable == 1
+                    ? clamp(MotionHighlightShoulderStrength, 0.0, 1.0)
+                    : 0.0;
+    Output = clamp(
+            mix(iris26403Linear, iris26404Shouldered, iris26404Strength),
+            0.0,
+            1.0);
+#else
+    Output = clamp(iris26403Linear,0.0,1.0);
+#endif
     #endif
     #if TESTPATTERN == 1
         ivec2 diag = ivec2(xy.x+xy.y,xy.x-xy.y);

@@ -160,6 +160,97 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                         .getSettings().selectedMode
                         == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
 
+        /*
+         * IRIS_26405_MAIN_MOTION_IQ_LAB
+         * These are parameters of the existing adaptive detector. No physical
+         * shutter/ISO command and no new global exposure engine is introduced.
+         */
+        boolean iris26405Lab =
+                iris26340Motion
+                        && com.particlesdevs.photoncamera.settings.MotionIqLab.active();
+        float iris26405RecoveryStrength = 1.0f;
+        float iris26405LocalGlobalBlend = 0.0f;
+        float iris26405ResidualAuthority = 1.0f;
+        float iris26405InspectionBoost = 0.0f;
+        float iris26405FloorProtection = 1.0f;
+        float iris26405NoiseStackConfidence = 1.0f;
+        float iris26405ShadowTargetLuma = 0.105f;
+        float iris26405MaxShadowLiftEv = 6.0f;
+        boolean iris26405ShadowRecoveryEnable = true;
+
+        if (iris26405Lab) {
+            iris26349MotionAdaptiveHdrEnable = true;
+            iris26353MotionHdrHighlightStrength =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "adaptive_highlight_compression", 0.70f);
+            iris26353MotionHdrLowerMidStrength =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "lower_mid_strength", 1.35f);
+            iris26353MotionHdrShadowColorSafety =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "shadow_color_safety", 1.00f);
+            iris26356MotionHdrChromaPreservation =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "chroma_preservation", 1.00f);
+            iris26356MotionHdrMinimumShadowColorRetention =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "min_shadow_color_retention", 0.45f);
+
+            iris26405ShadowRecoveryEnable =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getBool(
+                            "shadow_recovery_enable", true);
+            iris26405RecoveryStrength =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "shadow_recovery_strength", 1.0f),
+                            0.0f, 3.0f);
+            iris26405LocalGlobalBlend =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "shadow_local_global_blend", 0.0f),
+                            0.0f, 1.0f);
+            iris26405ResidualAuthority =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "residual_ae_authority", 1.0f),
+                            0.0f, 5.0f);
+            iris26405InspectionBoost =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "shadow_inspection_boost", 0.0f),
+                            0.0f, 1.0f);
+            iris26405FloorProtection =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "shadow_floor_protection", 1.0f),
+                            0.0f, 2.0f);
+            iris26405NoiseStackConfidence =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "shadow_noise_stack_confidence", 1.0f),
+                            0.0f, 2.0f);
+            iris26405ShadowTargetLuma =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "shadow_target_luma", 0.105f),
+                            0.04f, 0.20f);
+            iris26405MaxShadowLiftEv =
+                    Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "shadow_max_lift_ev", 6.0f),
+                            0.0f, 6.0f);
+        }
+
+        float iris26405EffectiveResidualAuthority =
+                iris26405Lab
+                        ? Math2.clamp(
+                                iris26405ResidualAuthority
+                                        + Math.max(iris26405RecoveryStrength - 1.0f, 0.0f)
+                                                * iris26405LocalGlobalBlend
+                                                * 2.0f,
+                                0.0f, 5.0f)
+                        : 1.0f;
+
         float iris26340Iso = Math.max(1.0f, basePipeline.mParameters.iso);
         float iris26340IsoRisk =
                 Math2.smoothstep(800.0f, 6400.0f, iris26340Iso);
@@ -277,18 +368,22 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                                             * iris26366CleanSupport
                                             * iris26366RequestNeed);
 
+            /*
+             * IRIS_26399_REMOVE_DUPLICATE_PRE_RESIDUAL_BRIGHTNESS_OWNER
+             *
+             * 26366 remains as evidence/diagnostics, but it must not mutate
+             * Motion brightness before the single residual controller.
+             * Fixed-gain debug mode remains intentionally authoritative when
+             * explicitly enabled.
+             */
             if (iris26349UseFixedMotionAutoExposureGain) {
                 mpy = fixedGain;
+                iris26365WinningLimiter = "fixedMotionGain";
             } else {
-                mpy = Math.min(mpy, iris26366DynamicAutoMax);
+                mpy = iris26349RequestedAutoExposureMpy;
+                iris26365WinningLimiter = "residualAuthority26399";
             }
             iris26365AfterMotionPolicy = mpy;
-            if (iris26349UseFixedMotionAutoExposureGain) {
-                iris26365WinningLimiter = "fixedMotionGain";
-            } else if (iris26366DynamicAutoMax + 0.000001f
-                    < iris26365RequestedMpy) {
-                iris26365WinningLimiter = "motionAdaptiveMax26366";
-            }
 
             String details = "requested=" + iris26349RequestedAutoExposureMpy
                     + " fixedMode=" + iris26349UseFixedMotionAutoExposureGain
@@ -321,18 +416,130 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
          * Motion canonical RAW exposure is the sole large-scale
          * exposure authority. AutoExposure is display-residual only.
          */
+        float iris26397ResidualMax = 1.10f;
         if (iris26340Motion) {
-            float iris26395RequestedPreResidual = mpy;
-            mpy = Math2.clamp(mpy, 0.90f, 1.10f);
+            /*
+             * IRIS_26399_IMMUTABLE_BRIGHTNESS_REQUEST_PROVENANCE
+             * Consume the request saved immediately after histogram demand was
+             * computed, before any Motion policy could mutate mpy.
+             */
+            float iris26395RequestedPreResidual =
+                    iris26349RequestedAutoExposureMpy;
+
+            /*
+             * IRIS_26398_OCCUPANCY_AWARE_RESIDUAL_BRIGHTNESS
+             *
+             * 26397 let the extreme top ~0.5% whiteMax veto the entire image.
+             * In the failing indoor scenes ~1% near-white lamps collapsed the
+             * residual ceiling to 1.10x even though most of the frame remained
+             * substantially darker.
+             *
+             * Use the already-computed post-Initial histogram to distinguish
+             * broad highlight occupancy from isolated lamps/speculars. This does
+             * not replace Adaptive HDR; it only decides how much residual global
+             * correction is safe BEFORE Adaptive HDR performs spatial highlight
+             * compression and lower-mid redistribution.
+             */
+            int iris26398HistTotal = histNormR + histNormG + histNormB;
+            int iris26398P95Target =
+                    Math.max(1, (int) Math.ceil(0.95 * iris26398HistTotal));
+            int iris26398Running = 0;
+            int iris26398P95Bin = histSize - 1;
+            int iris26398NearClipCount = 0;
+            int iris26398NearClipStart =
+                    Math.max(0, Math.min((int) Math.floor(0.94 * (histSize - 1)), histSize - 1));
+
+            for (int iris26398I = 0; iris26398I < histSize; iris26398I++) {
+                int iris26398BinCount =
+                        result[0][iris26398I]
+                                + result[1][iris26398I]
+                                + result[2][iris26398I];
+                iris26398Running += iris26398BinCount;
+                if (iris26398Running >= iris26398P95Target
+                        && iris26398P95Bin == histSize - 1) {
+                    iris26398P95Bin = iris26398I;
+                }
+                if (iris26398I >= iris26398NearClipStart) {
+                    iris26398NearClipCount += iris26398BinCount;
+                }
+            }
+
+            float iris26398P95 =
+                    iris26398P95Bin / Math.max(1.0f, histSize - 1.0f);
+            float iris26398NearClipArea =
+                    iris26398HistTotal > 0
+                            ? iris26398NearClipCount / (float) iris26398HistTotal
+                            : 1.0f;
+
+            float iris26398BroadHighlightPressure =
+                    Math.max(
+                            Math2.smoothstep(0.72f, 0.94f, iris26398P95),
+                            Math2.smoothstep(0.08f, 0.35f, iris26398NearClipArea));
+            float iris26398BroadHighlightHeadroom =
+                    1.0f - Math2.clamp(iris26398BroadHighlightPressure, 0.0f, 1.0f);
+
+            float iris26398NormalizedAverage =
+                    avg / Math.max(1.0f, histSize - 1.0f);
+            float iris26398BrightnessNeed =
+                    Math2.smoothstep(
+                            1.10f,
+                            2.80f,
+                            iris26395RequestedPreResidual);
+            float iris26398RecoverableSupport =
+                    Math2.clamp(
+                            0.30f
+                                    + 0.70f
+                                            * Math.max(
+                                                    iris26366CleanSupport,
+                                                    0.70f * iris26340EffectiveRatio),
+                            0.30f,
+                            1.0f);
+            float iris26398DeepDarkRestraint =
+                    Math2.mix(
+                            0.72f,
+                            1.0f,
+                            Math2.smoothstep(
+                                    0.075f,
+                                    0.20f,
+                                    iris26398NormalizedAverage));
+
+            iris26397ResidualMax =
+                    Math2.clamp(
+                            1.10f
+                                    + 0.70f
+                                            * iris26398BrightnessNeed
+                                            * iris26398BroadHighlightHeadroom
+                                            * iris26398RecoverableSupport
+                                            * iris26398DeepDarkRestraint,
+                            1.10f,
+                            1.80f);
+
+            mpy =
+                    Math2.clamp(
+                            mpy,
+                            1.0f
+                                    - 0.10f
+                                            * Math.min(
+                                                    iris26405EffectiveResidualAuthority,
+                                                    1.0f),
+                            1.0f
+                                    + (iris26397ResidualMax - 1.0f)
+                                            * iris26405EffectiveResidualAuthority);
             Log.d(
                     "AutoExposure",
-                    "IRIS_26395_RESIDUAL_PRE_REINHARD"
+                    "IRIS_26399_OWNERSHIP_CLEAN_RESIDUAL_BRIGHTNESS"
                             + " requested=" + iris26395RequestedPreResidual
                             + " applied=" + mpy
+                            + " residualMax=" + iris26397ResidualMax
+                            + " normalizedAverage=" + iris26398NormalizedAverage
+                            + " p95=" + iris26398P95
+                            + " nearClipArea=" + iris26398NearClipArea
+                            + " broadHighlightHeadroom=" + iris26398BroadHighlightHeadroom
+                            + " whiteMaxDiagnosticOnly=" + whiteMax
+                            + " recoverableSupport=" + iris26398RecoverableSupport
                             + " canonicalGain="
                             + basePipeline.mParameters.motionCanonicalExposureGain);
         }
-
         if(mpy > gainMax) {
             Log.d("AutoExposure", "Clamping gain by max from " + mpy + " to " + gainMax);
             if (iris26340Motion) {
@@ -361,13 +568,24 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
         mpy *= iris26395ReinhardFactor;
         if (iris26340Motion) {
             float iris26395RequestedPostReinhard = mpy;
-            mpy = Math2.clamp(mpy, 0.90f, 1.10f);
+            mpy =
+                    Math2.clamp(
+                            mpy,
+                            1.0f
+                                    - 0.10f
+                                            * Math.min(
+                                                    iris26405EffectiveResidualAuthority,
+                                                    1.0f),
+                            1.0f
+                                    + (iris26397ResidualMax - 1.0f)
+                                            * iris26405EffectiveResidualAuthority);
             Log.d(
                     "AutoExposure",
-                    "IRIS_26395_RESIDUAL_POST_REINHARD"
+                    "IRIS_26399_OWNERSHIP_CLEAN_POST_REINHARD"
                             + " reinhardFactor=" + iris26395ReinhardFactor
                             + " requested=" + iris26395RequestedPostReinhard
                             + " applied=" + mpy
+                            + " residualMax=" + iris26397ResidualMax
                             + " canonicalGain="
                             + basePipeline.mParameters.motionCanonicalExposureGain);
         }
@@ -1208,6 +1426,36 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                             0.30f);
         }
 
+        if (iris26405Lab) {
+            if (!iris26405ShadowRecoveryEnable) {
+                irisHdrLowerMidLift = 0.0f;
+            } else {
+                /*
+                 * Existing detector remains the source of scene need.
+                 * Recovery Strength changes only how much of that evidence is
+                 * rendered. Extra recovery can remain local or donate some
+                 * authority to the residual AE path through Local/Global Blend.
+                 */
+                float iris26405LocalRecoveryScale =
+                        iris26405RecoveryStrength
+                                * (1.0f
+                                        - 0.50f
+                                                * Math.max(
+                                                        iris26405RecoveryStrength - 1.0f,
+                                                        0.0f)
+                                                * iris26405LocalGlobalBlend);
+                iris26405LocalRecoveryScale =
+                        Math2.clamp(iris26405LocalRecoveryScale, 0.0f, 3.0f);
+
+                irisHdrLowerMidLift =
+                        Math2.clamp(
+                                irisHdrLowerMidLift * iris26405LocalRecoveryScale
+                                        + 0.55f * iris26405InspectionBoost,
+                                0.0f,
+                                0.75f);
+            }
+        }
+
         if (iris26340Motion && !iris26349MotionAdaptiveHdrEnable) {
             irisHdrIndoorBacklitStrength = 0.0f;
             irisHdrOutdoorBroadStrength = 0.0f;
@@ -1232,14 +1480,32 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
                 irisHdrLowerMidLift
         );
 
+        float iris26405AbsoluteBlackPreserve =
+                iris26405Lab
+                        ? iris26355HdrAbsoluteBlackPreserve
+                                * iris26405FloorProtection
+                                * (1.0f - 0.90f * iris26405InspectionBoost)
+                        : iris26355HdrAbsoluteBlackPreserve;
+        float iris26405DeepShadowStart =
+                iris26405Lab
+                        ? Math.max(
+                                0.003f,
+                                iris26355HdrDeepShadowStart
+                                        * Math2.mix(1.0f, 0.45f, iris26405InspectionBoost))
+                        : iris26355HdrDeepShadowStart;
+        float iris26405FullShadowPoint =
+                iris26405Lab
+                        ? iris26405ShadowTargetLuma
+                        : iris26355HdrFullShadowPoint;
+
         glProg.setVar("irisHdrAbsoluteBlackPreserve",
-                Math2.clamp(iris26355HdrAbsoluteBlackPreserve, 0.0f, 0.05f));
+                Math2.clamp(iris26405AbsoluteBlackPreserve, 0.0f, 0.05f));
         glProg.setVar("irisHdrDeepShadowStart",
-                Math2.clamp(Math.max(iris26355HdrDeepShadowStart,
-                        iris26355HdrAbsoluteBlackPreserve + 0.002f), 0.005f, 0.08f));
+                Math2.clamp(Math.max(iris26405DeepShadowStart,
+                        iris26405AbsoluteBlackPreserve + 0.002f), 0.003f, 0.08f));
         glProg.setVar("irisHdrFullShadowPoint",
-                Math2.clamp(Math.max(iris26355HdrFullShadowPoint,
-                        iris26355HdrDeepShadowStart + 0.010f), 0.04f, 0.20f));
+                Math2.clamp(Math.max(iris26405FullShadowPoint,
+                        iris26405DeepShadowStart + 0.010f), 0.04f, 0.20f));
         glProg.setVar("irisHdrDeepShadowStrength",
                 Math2.clamp(iris26355HdrDeepShadowStrength, 0.0f, 1.0f));
         glProg.setVar("irisHdrUpperMidProtectStart",
@@ -1247,7 +1513,14 @@ import com.particlesdevs.photoncamera.processing.MotionMetrics;
         glProg.setVar("irisHdrUpperMidProtectEnd",
                 Math2.clamp(Math.max(iris26355HdrUpperMidProtectEnd,
                         iris26355HdrUpperMidProtectStart + 0.05f), 0.55f, 0.90f));
-        glProg.setVar("irisHdrDeepShadowSafety", iris26355DeepShadowSafety);
+                glProg.setVar(
+                "irisHdrDeepShadowSafety",
+                Math2.clamp(
+                        iris26355DeepShadowSafety
+                                * (iris26405Lab ? iris26405NoiseStackConfidence : 1.0f),
+                        0.0f,
+                        1.0f));
+        glProg.setVar("irisLabMaxShadowLiftEv", iris26405Lab ? iris26405MaxShadowLiftEv : 6.0f);
 
         /* IRIS_26347_HDR_SHADOW_CHROMA_SAFETY
          * Keep luminance lift. Restrain only unreliable near-black chroma when HDR is active.

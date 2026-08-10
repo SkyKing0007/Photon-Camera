@@ -38,6 +38,52 @@ public class Demosaic3 extends Node {
     @Override
     public void Run() {
         // Values are automatically injected in BeforeRun()!
+        /*
+         * IRIS_26405_MAIN_MOTION_IQ_LAB
+         * Important audit result: legacy Grad/Fuse Java fields are orphaned
+         * in active Demosaic3. Main menu therefore controls the constants that
+         * are actually used by p0ig/p12ec/p12fc/p2ed2.
+         */
+        /*
+         * IRIS_26409_MOTION_V2_CLEAN_DEMOSAIC_BASELINE
+         * V2 starts from the fixed Demosaic3 defaults. Do not let current
+         * Motion IQ-Lab experiments compensate for upstream RAW geometry.
+         */
+        boolean iris26405DemosaicLab =
+                !basePipeline.mParameters.motionV2Active
+                        && com.particlesdevs.photoncamera.settings.MotionIqLab.active();
+        float iris26405GradientAlpha =
+                iris26405DemosaicLab
+                        ? com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                "demosaic_gradient_alpha", 3.75f)
+                        : 3.75f;
+        float iris26405GreenEdgeThreshold =
+                iris26405DemosaicLab
+                        ? com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                "demosaic_green_edge_threshold", 1.30f)
+                        : 1.30f;
+        float iris26405GreenRefineThreshold =
+                iris26405DemosaicLab
+                        ? com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                "demosaic_green_refine_threshold", 1.30f)
+                        : 1.30f;
+        float iris26405FinalAlpha =
+                iris26405DemosaicLab
+                        ? com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                "demosaic_final_alpha", 3.75f)
+                        : 3.75f;
+        float iris26405FinalThreshold =
+                iris26405DemosaicLab
+                        ? com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                "demosaic_final_threshold", 1.90f)
+                        : 1.90f;
+        float iris26405FinalBeta =
+                iris26405DemosaicLab
+                        ? com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                "demosaic_final_beta", 0.42f)
+                        : 0.42f;
+
+
         GLTexture glTexture;
         glTexture = previousNode.WorkingTexture;
         //Gradients
@@ -55,6 +101,7 @@ public class Demosaic3 extends Node {
                         null);
         WorkingTexture = iris26389IgGuide;
         glProg.setLayout(tile,tile,1);
+        glProg.setDefine("IRIS_LAB_GRADIENT_ALPHA", iris26405GradientAlpha);
         glProg.useAssetProgram("demosaic/demosaicp0ig",true);
         glProg.setTextureCompute("inTexture", glTexture,false);
         glProg.setTextureCompute("outTexture", WorkingTexture,true);
@@ -65,6 +112,7 @@ public class Demosaic3 extends Node {
         startT();
         outp = basePipeline.getMain();
         glProg.setLayout(tile,tile,1);
+        glProg.setDefine("IRIS_LAB_GREEN_EDGE_THRESHOLD", iris26405GreenEdgeThreshold);
         glProg.useAssetProgram("demosaic/demosaicp12ec",true);
         glProg.setTextureCompute("inTexture",glTexture, false);
         glProg.setTextureCompute("igTexture",iris26389IgGuide, false);
@@ -74,6 +122,7 @@ public class Demosaic3 extends Node {
 
         startT();
         glProg.setLayout(tile,tile,1);
+        glProg.setDefine("IRIS_LAB_GREEN_REFINE_THRESHOLD", iris26405GreenRefineThreshold);
         glProg.useAssetProgram("demosaic/demosaicp12fc",true);
         glProg.setTextureCompute("inTexture",glTexture, false);
         glProg.setTextureCompute("igTexture",iris26389IgGuide, false);
@@ -98,6 +147,9 @@ public class Demosaic3 extends Node {
         glProg.setDefine("greenmax",greenMax);
         glProg.setLayout(tile,tile,1);
         //glProg.useFileProgram(FileManager.sPHOTON_TUNING_DIR + "demosaicp2ec.glsl",true);
+        glProg.setDefine("IRIS_LAB_FINAL_ALPHA", iris26405FinalAlpha);
+        glProg.setDefine("IRIS_LAB_FINAL_THRESHOLD", iris26405FinalThreshold);
+        glProg.setDefine("IRIS_LAB_FINAL_BETA", iris26405FinalBeta);
         glProg.useAssetProgram("demosaic/demosaicp2ed2",true);
         glProg.setTextureCompute("inTexture", glTexture,false);
         glProg.setTextureCompute("greenTexture", iris26389RefinedGreen,false);

@@ -23,6 +23,14 @@ import static com.particlesdevs.photoncamera.util.Math2.mix;
 
 public class ExposureFusionBayer2 extends Node {
 
+    @Tunable(
+            title = "FusionMap Regression Damping",
+            description = "Motion only. 0 = exact pre-26403 FusionMap regression; 0.85 = the 26403 zipper experiment.",
+            category = "Motion IQ Fusion",
+            min = 0.0f, max = 1.0f, defaultValue = 0.85f, step = 0.05f
+    )
+    float motionFusionMapRegressionDamping = 0.85f;
+
     public ExposureFusionBayer2() {
         super("", "FusionBayer");
     }
@@ -171,7 +179,27 @@ public class ExposureFusionBayer2 extends Node {
     GLTexture fusionMap(GLTexture in,GLTexture br,float str){
         glProg.setDefine("DH","("+dehaze+")");
         glProg.setDefine("FUSIONGAIN",((PostPipeline)(basePipeline)).fusionGain);
+
+        /*
+         * IRIS_26403_MOTION_FUSION_ZIPPER_STABILITY
+         * Preserve the proven 26361 FusionMap domain/ratio. Motion only adds
+         * confidence damping inside the existing local A/B regression.
+         */
+        boolean iris26403MotionFusionZipperStability =
+                com.particlesdevs.photoncamera.processing.MotionMetrics.isActive();
+        glProg.setDefine(
+                "IRIS_26403_MOTION_FUSION_ZIPPER_STABILITY",
+                iris26403MotionFusionZipperStability ? 1 : 0);
+
         glProg.useAssetProgram("ltm/fusionmap",false);
+
+        // IRIS_26404_MOTION_IQ_LAB
+        glProg.setVar(
+                "MotionFusionMapRegressionDamping",
+                iris26403MotionFusionZipperStability
+                        ? com.particlesdevs.photoncamera.util.Math2.clamp(
+                                motionFusionMapRegressionDamping, 0.0f, 1.0f)
+                        : 0.0f);
         glProg.setTexture("InputBuffer",in);
         glProg.setTexture("BrBuffer",br);
         glProg.setVar("factor", str);
@@ -414,6 +442,11 @@ public class ExposureFusionBayer2 extends Node {
     
     @Override
     public void Run() {
+        if (com.particlesdevs.photoncamera.settings.MotionIqLab.active()) {
+            motionFusionMapRegressionDamping =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "fusionmap_regression_damping", 0.85f);
+        }
         if (!enable) {
             WorkingTexture = previousNode.WorkingTexture;
             glProg.closed = true;

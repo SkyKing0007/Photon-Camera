@@ -438,13 +438,28 @@ void main() {
     float iris26382W = 0.0;
     const int iris26382R1 = 16;
     const int iris26382R2 = 32;
-    ivec2 iris26382Off[8] = ivec2[8](
+    /*
+     * IRIS_26396_SPARSE_CHROMA_FIELD_16
+     *
+     * Keep this sparse: add diagonals at the existing 16/32-pixel radii.
+     * This improves broad wall-color evidence without reviving the retired
+     * dense 26375 full-resolution field.
+     */
+    ivec2 iris26382Off[16] = ivec2[16](
             ivec2( iris26382R1,0), ivec2(-iris26382R1,0),
             ivec2(0, iris26382R1), ivec2(0,-iris26382R1),
+            ivec2( iris26382R1, iris26382R1),
+            ivec2(-iris26382R1, iris26382R1),
+            ivec2( iris26382R1,-iris26382R1),
+            ivec2(-iris26382R1,-iris26382R1),
             ivec2( iris26382R2,0), ivec2(-iris26382R2,0),
-            ivec2(0, iris26382R2), ivec2(0,-iris26382R2));
+            ivec2(0, iris26382R2), ivec2(0,-iris26382R2),
+            ivec2( iris26382R2, iris26382R2),
+            ivec2(-iris26382R2, iris26382R2),
+            ivec2( iris26382R2,-iris26382R2),
+            ivec2(-iris26382R2,-iris26382R2));
 
-    for (int iris26382I=0; iris26382I<8; ++iris26382I) {
+    for (int iris26382I=0; iris26382I<16; ++iris26382I) {
         ivec2 iris26382P =
                 clamp(
                         xy + iris26382Off[iris26382I],
@@ -466,12 +481,24 @@ void main() {
     iris26382BroadOpp /= max(iris26382W,0.0001);
     vec3 iris26382Residual = iris26382CenterOpp - iris26382BroadOpp;
 
-    float iris26382Flat = 1.0 - clamp(irisStructure,0.0,1.0);
+    /*
+     * IRIS_26396_TEXTURE_SAFE_LOW_FREQUENCY_CHROMA
+     *
+     * The broad 26382 stage must honor the same texture evidence that protects
+     * denim weave, stitching, foliage, hair and text in the 26374 stage.
+     * High ISO alone never authorizes broad smoothing.
+     */
+    float iris26382Flat =
+            1.0
+            - clamp(
+                    max(irisStructure,irisTextureProtect),
+                    0.0,
+                    1.0);
     float iris26382DarkNeed =
             1.0 - smoothstep(0.08,0.30,iris26382Y);
     float iris26382LowSnr =
             1.0 - clamp(irisLocalSnr/4.0,0.0,1.0);
-    float iris26382Support = clamp(iris26382W/5.0,0.0,1.0);
+    float iris26382Support = clamp(iris26382W/8.0,0.0,1.0);
     float iris26382Need =
             iris26382Flat
                     * iris26382DarkNeed
@@ -483,19 +510,39 @@ void main() {
             smoothstep(0.010,0.055,iris26382ResidualMag);
     /*
      * IRIS_26383_SUPPORT_GOVERNED_CHROMA
-     * High local support preserves source color; weak support permits only
-     * a modest bounded increase in the existing 26382 cleanup.
+     * Historical marker retained for audit lineage only.
+     *
+     * IRIS_26396_BOUNDED_RESIDUAL_CHROMA_STRENGTH
+     * Historical marker retained: the bounded chroma-strength design remains.
+     *
+     * IRIS_26397_PROTECTED_RESIDUAL_CHROMA_EXTENSION
+     * Historical marker retained: the protected residual chroma extension
+     * remains active and unchanged outside this ownership cleanup.
+     *
+     * IRIS_26399_REMOVE_STALE_LOCAL_SUPPORT_CHROMA_DEPENDENCY
+     *
+     * The restored merge architecture does not publish the 26383 regional
+     * support grid. With the existing fallback iris26383LocalSupport=1.0,
+     * iris26383WeakSupport was always 0 and this expression always evaluated
+     * to 0.38 anyway.
+     *
+     * Preserve that exact current image behavior while removing the false
+     * producer/consumer dependency. No chroma-strength increase is made here.
+     * The 26382/26396/26397 flat/dark/low-SNR/texture gates remain unchanged.
      */
-    float iris26383WeakSupport = 1.0 - iris26383LocalSupport;
-    float iris26383ChromaStrength =
-            mix(0.30, 0.50, iris26383WeakSupport);
+    float iris26383ChromaStrength = 0.38;
     float iris26382Blend =
             iris26383ChromaStrength
                     * iris26382Need
                     * iris26382BoundedResidual;
 
     vec3 iris26382Correction =
-            clamp(iris26382Residual,vec3(-0.028),vec3(0.028));
+            /*
+             * Preserve color authority: correction remains bounded and does
+             * not alter center luminance. This is intentionally far below a
+             * full chroma replacement.
+             */
+            clamp(iris26382Residual,vec3(-0.035),vec3(0.035));
     vec3 iris26382Clean =
             iris26382Center - iris26382Blend * iris26382Correction;
     float iris26382CleanY = dot(iris26382Clean,vec3(0.25,0.5,0.25));

@@ -418,9 +418,37 @@ public class HdrxProcessor extends ProcessorBase {
         Log.d(TAG, "Packing");
         //WrapperAl.packImages();
         Log.d(TAG, "Packed");
-        if(images.size() > 1) {
+        /*
+         * IRIS_26409_MOTION_V2_INDEPENDENT_RAW_OWNER
+         *
+         * Motion no longer enters PyramidMerging in V2 milestone 1.
+         * The metadata-owned reference RAW is the structural owner.
+         * Auxiliary contribution is deliberately zero until the new
+         * confidence/residual fusion math is introduced in V2 itself.
+         */
+        if (cameraMode == CameraMode.MOTION) {
+            processingParameters.motionV2Active = true;
+            MotionV2Merger.Result iris26409V2 =
+                    MotionV2CfaReconstruction.reconstruct(
+                            new Point(width, height),
+                            images,
+                            iris26363ReferenceTimestamp,
+                            processingParameters);
+            output = iris26409V2.raw;
+            processingParameters.motionV2EffectiveSupport =
+                    iris26409V2.effectiveSupport;
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "IRIS_26409_MOTION_V2_FOUNDATION",
+                    "referenceTimestamp=" + iris26409V2.referenceTimestamp
+                            + " inputFrames=" + iris26409V2.inputFrames
+                            + " effectiveSupport="
+                            + iris26409V2.effectiveSupport
+                            + " currentPyramidMergeBypassed=true"
+                            + " reconstruction=IRIS_26413_REFERENCE_PRESERVING_CFA"
+                            + " auxiliaryContribution=confidenceWeighted");
+        } else if(images.size() > 1) {
             PyramidMerging pyramidMerging = new PyramidMerging(
-                    new Point(width, height), images, cameraMode == CameraMode.MOTION);
+                    new Point(width, height), images, false);
             pyramidMerging.parameters = processingParameters;
             pyramidMerging.Run();
             pyramidMerging.close();
@@ -435,7 +463,14 @@ public class HdrxProcessor extends ProcessorBase {
             images.get(0).buffer = null;
         }
         Log.d(TAG, "HDRX Alignment elapsed:" + (System.currentTimeMillis() - startTime) + " ms");
-        if ((saveRAW >= 1) && alignAlgorithm != 2) {
+        /*
+         * IRIS_26414_MOTION_V2_FLOAT_CFA_DNG_GUARD
+         * Motion V2 output is now a FLOAT16 CFA carrier at this point.
+         * Do not serialize it through the legacy RAW16 DNG writer.
+         */
+        if ((saveRAW >= 1)
+                && alignAlgorithm != 2
+                && cameraMode != CameraMode.MOTION) {
             boolean imageSaved = ImageSaver.Util.saveStackedRaw(dngFile, output,
                     processingParameters);
             processingEventsListener.notifyImageSavedStatus(imageSaved, dngFile);
@@ -448,29 +483,62 @@ public class HdrxProcessor extends ProcessorBase {
             }
         }
 
-        /* IRIS_26394_MOTION_CANONICAL_RAW_EXPOSURE */
+        /*
+         * IRIS_26409_MOTION_V2_NORMALIZATION_OWNER
+         * V2 owns its normalization math. The old Iris floor-risk canonical
+         * estimator is not used by Motion V2.
+         */
         if (cameraMode == CameraMode.MOTION) {
-            processingParameters.motionCanonicalExposureGain =
-                    computeMotionCanonicalExposureGain(
-                            output, width, height, processingParameters);
-            Log.d(TAG, "IRIS_26394_CANONICAL_RAW_GAIN="
-                    + processingParameters.motionCanonicalExposureGain);
+            /*
+             * IRIS_26414_REFERENCE_RAW_NORMALIZATION_BEFORE_FLOAT_RECON
+             * MotionV2CfaReconstruction computed this from the physical
+             * reference RAW before the burst buffers were closed.
+             */
             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
-                    "IRIS_26394_CANONICAL_RAW_EXPOSURE",
+                    "IRIS_26414_MOTION_V2_NORMALIZATION",
                     "gain=" + processingParameters.motionCanonicalExposureGain
-                            + " source=mergedRawBlackSubtracted"
-                            + " dngMutation=false"
-                            + " mergeMutation=false");
+                            + " source=ownedReferenceRawPreReconstruction"
+                            + " floatCarrierNotReparsed=true"
+                            + " floorSuppression=false");
         } else {
             processingParameters.motionCanonicalExposureGain = 1.0f;
         }
 
-        processingParameters.noiseModeler.computeStackingNoiseModel(images.size());
+        /*
+         * IRIS_26409_MOTION_V2_TRUTHFUL_SUPPORT
+         * Milestone 1 contains one effective structural sample, regardless of
+         * how many RAWs arrived in the batch.
+         */
+        /*
+         * IRIS_26414_MOTION_V2_SUPPORT_DRIVEN_NOISE_MODEL
+         * Use the actually measured temporal contribution instead of the old
+         * reference-only support=1 assumption.
+         */
+        processingParameters.noiseModeler.computeStackingNoiseModel(
+                cameraMode == CameraMode.MOTION
+                        ? Math.max(
+                                1,
+                                Math.round(
+                                        processingParameters.motionV2EffectiveSupport))
+                        : images.size());
 
         PostPipeline pipeline = new PostPipeline();
 
-        Bitmap img = pipeline.Run(output, processingParameters);
-        Allocator.free(output);
+        Bitmap img;
+        if (cameraMode == CameraMode.MOTION) {
+            /*
+             * IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF
+             * No reconstructed-CFA -> RAW16 -> Bayer2Float round trip.
+             */
+            img = pipeline.RunMotionV2FloatCfa(
+                    output,
+                    processingParameters);
+            output = null;
+        } else {
+            img = pipeline.Run(output, processingParameters);
+            Allocator.free(output);
+            output = null;
+        }
 
         img = overlay(img, pipeline.debugData.toArray(new Bitmap[0]));
         try {
@@ -586,50 +654,105 @@ public class HdrxProcessor extends ProcessorBase {
 
         float p50 = histogramQuantile(hist, samples, 0.50f);
         float p90 = histogramQuantile(hist, samples, 0.90f);
+        float p99 = histogramQuantile(hist, samples, 0.99f);
         float p995 = histogramQuantile(hist, samples, 0.995f);
         float floorFraction = floorSamples / (float) samples;
 
         /*
-         * IRIS_26395_PHOTON_STARVATION_GAIN_CEILING
-         * Lots of unused highlight headroom is NOT evidence that a
-         * photon-starved RAW can safely tolerate a huge lift.
-         * Use actual merged-RAW floor occupancy as an independent
-         * signal-quality ceiling. <=10% near-floor keeps full range;
-         * >=55% near-floor limits canonical lift to about 2x.
+         * IRIS_26402_SCENE_AWARE_CANONICAL_NORMALIZATION
+         *
+         * A tiny extreme highlight/specular tail must not veto normalization
+         * of the other ~99% of the merged RAW. Use p99 as the broad-highlight
+         * headroom authority and retain p99.5 only as diagnostic evidence.
+         *
+         * This is intentionally compatible with equal-exposure HDR+ logic:
+         * broad highlights/cloud fields remain protected because they occupy
+         * enough area to raise p99, while isolated bulbs/speculars are allowed
+         * to roll into the later highlight/tone pipeline instead of forcing
+         * the entire frame dark.
+         *
+         * Shadow amplification trust is separately limited by:
+         * - actual near-floor occupancy,
+         * - effective temporal stack support,
+         * - and ISO/noise risk.
          */
+        final float safeP99 = 0.88f;
+        final float canonicalMaxGain26402 = 4.0f;
+
         float floorRisk = Math.max(
                 0.0f,
                 Math.min(
                         1.0f,
                         (floorFraction - 0.10f) / 0.45f));
-        float floorQuality = 1.0f - floorRisk;
+
+        float effectiveStackRatio =
+                MotionMetrics.isActive()
+                        ? MotionMetrics.effectiveStackRatio()
+                        : 1.0f;
+        effectiveStackRatio =
+                Math.max(0.10f, Math.min(1.0f, effectiveStackRatio));
+
+        float iso =
+                Math.max(1.0f, parameters.iso);
+        float isoRisk =
+                Math.max(
+                        0.0f,
+                        Math.min(
+                                1.0f,
+                                (iso - 800.0f) / 2400.0f));
+
+        float recoverability =
+                effectiveStackRatio
+                        * (1.0f - 0.60f * isoRisk);
+
         float signalGainLimit =
-                2.0f + 6.0f * floorQuality * floorQuality;
+                2.0f
+                        + 4.0f
+                        * recoverability
+                        * (1.0f - 0.55f * floorRisk);
+        signalGainLimit =
+                Math.max(1.5f, Math.min(6.0f, signalGainLimit));
 
         float gain50 = targetP50 / Math.max(p50, epsilon);
         float gain90 = targetP90 / Math.max(p90, epsilon);
         float sceneGain = (float) Math.sqrt(
                 Math.max(1.0f, gain50) * Math.max(1.0f, gain90));
-        float headroomGain = safeP995 / Math.max(p995, epsilon);
+
+        float broadHighlightHeadroomGain =
+                safeP99 / Math.max(p99, epsilon);
 
         float gain = Math.min(
                 sceneGain,
-                Math.min(headroomGain, signalGainLimit));
-        gain = Math.max(1.0f, Math.min(maxGain, gain));
+                Math.min(
+                        broadHighlightHeadroomGain,
+                        signalGainLimit));
+        gain =
+                Math.max(
+                        1.0f,
+                        Math.min(
+                                Math.min(maxGain, canonicalMaxGain26402),
+                                gain));
         if (gain < 1.02f) gain = 1.0f;
 
         Log.d(TAG,
                 "IRIS_26394_CANONICAL_RAW_STATS"
+                        + " build=26402"
                         + " samples=" + samples
                         + " p50=" + p50
                         + " p90=" + p90
+                        + " p99=" + p99
                         + " p995=" + p995
                         + " floorFraction=" + floorFraction
+                        + " effectiveStackRatio=" + effectiveStackRatio
+                        + " iso=" + iso
+                        + " isoRisk=" + isoRisk
+                        + " recoverability=" + recoverability
                         + " signalGainLimit=" + signalGainLimit
                         + " gain50=" + gain50
                         + " gain90=" + gain90
                         + " sceneGain=" + sceneGain
-                        + " headroomGain=" + headroomGain
+                        + " broadHighlightHeadroomGain="
+                        + broadHighlightHeadroomGain
                         + " finalGain=" + gain);
         return gain;
     }

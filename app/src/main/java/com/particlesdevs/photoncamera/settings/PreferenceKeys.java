@@ -105,7 +105,7 @@ public class PreferenceKeys {
             Map<String, ?> map = settingsManager.getDefaultPreferences().getAll();
             map.keySet().removeAll(COMMON_KEYS);
             // Exclude tunable preferences - they should be global, not per-lens
-            map.keySet().removeIf(key -> key != null && key.startsWith("pref_tunable_"));
+            map.keySet().removeIf(key -> key != null && (key.startsWith("pref_tunable_") || key.startsWith("pref_motion_iq_")));
             String json = GSON.toJson(map);
             for (String cameraId : ids) { //Makes a copy of default settings for each camera
                 settingsManager.setInitial(Key.PER_LENS_FILE_NAME.mValue, PER_LENS_KEY_PREFIX + cameraId, json);
@@ -118,7 +118,7 @@ public class PreferenceKeys {
         Map<String, ?> map = settingsManager.getDefaultPreferences().getAll();
         map.keySet().removeAll(COMMON_KEYS);
         // Exclude tunable preferences - they should be global, not per-lens
-        map.keySet().removeIf(key -> key != null && key.startsWith("pref_tunable_"));
+        map.keySet().removeIf(key -> key != null && (key.startsWith("pref_tunable_") || key.startsWith("pref_motion_iq_")));
         String hashmapAsJson = GSON.toJson(map);
         String alreadySavedJSON = settingsManager.getString(Key.PER_LENS_FILE_NAME.mValue, PER_LENS_KEY_PREFIX + cameraID, "");
         if (!alreadySavedJSON.equals(hashmapAsJson)) {
@@ -140,7 +140,7 @@ public class PreferenceKeys {
         for (Map.Entry<String, ?> e : map.entrySet()) {
             String key = e.getKey();
             // Skip tunable preferences - they should be global, not per-lens
-            if (key != null && key.startsWith("pref_tunable_")) {
+            if (key != null && (key.startsWith("pref_tunable_") || key.startsWith("pref_motion_iq_"))) {
                 continue;
             }
             Object value = e.getValue();

@@ -47,6 +47,9 @@ public class Parameters {
 
     /* IRIS_26394_MOTION_CANONICAL_RAW_EXPOSURE */
     public float motionCanonicalExposureGain = 1.0f;
+    /* IRIS_26409_MOTION_V2_STATE */
+    public boolean motionV2Active = false;
+    public float motionV2EffectiveSupport = 1.0f;
     public int realWL = -1;
     public boolean hasGainMap;
     public Point mapSize;
@@ -54,6 +57,22 @@ public class Parameters {
     public float[] gainMap;
     public float[] proPhotoToSRGB = new float[9];
     public float[] sensorToProPhoto = new float[9];
+
+    /*
+     * IRIS_26418_MOTION_V2_DIRECT_HAL_COLOR_METADATA
+     *
+     * V2 does not consume Photon's derived sensorToProPhoto/CCT color path.
+     * These fields transport the Camera2 capture-result color contract directly:
+     *   color gains: R, G_even, G_odd, B
+     *   transform: row-major sensor RGB -> output linear sRGB
+     */
+    public float[] motionV2ColorGains = new float[]{1f, 1f, 1f, 1f};
+    public float[] motionV2ColorTransform = new float[]{
+            1f,0f,0f,
+            0f,1f,0f,
+            0f,0f,1f
+    };
+    public boolean motionV2DirectColorValid = false;
     public float tonemapStrength = 1.4f;
     public float[] customTonemap;
     public Point[] hotPixels;
@@ -336,6 +355,45 @@ public class Parameters {
 
     public void ReCalcColor(boolean customNeutr, CaptureResult result) {
         CameraCharacteristics characteristics = CaptureController.mCameraCharacteristics;
+
+        /*
+         * IRIS_26418_MOTION_V2_DIRECT_HAL_COLOR_METADATA
+         * Capture the reference result's documented Camera2 color contract
+         * before any Photon-specific color calculations mutate/replace matrices.
+         */
+        motionV2DirectColorValid = false;
+        try {
+            android.hardware.camera2.params.RggbChannelVector v2g =
+                    result.get(CaptureResult.COLOR_CORRECTION_GAINS);
+            android.hardware.camera2.params.ColorSpaceTransform v2m =
+                    result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM);
+            if (v2g != null && v2m != null) {
+                motionV2ColorGains[0] = v2g.getRed();
+                motionV2ColorGains[1] = v2g.getGreenEven();
+                motionV2ColorGains[2] = v2g.getGreenOdd();
+                motionV2ColorGains[3] = v2g.getBlue();
+
+                android.util.Rational[] v2r = new android.util.Rational[9];
+                v2m.copyElements(v2r, 0);
+                boolean sane = true;
+                for (int i = 0; i < 9; i++) {
+                    motionV2ColorTransform[i] = v2r[i].floatValue();
+                    sane &= Float.isFinite(motionV2ColorTransform[i]);
+                }
+                for (int i = 0; i < 4; i++) {
+                    sane &= Float.isFinite(motionV2ColorGains[i])
+                            && motionV2ColorGains[i] > 0.0f;
+                }
+                motionV2DirectColorValid = sane;
+                Log.d(TAG, "IRIS_26418_V2_DIRECT_COLOR"
+                        + " valid=" + motionV2DirectColorValid
+                        + " gains=" + Arrays.toString(motionV2ColorGains)
+                        + " transform=" + Arrays.toString(motionV2ColorTransform));
+            }
+        } catch (Throwable t) {
+            motionV2DirectColorValid = false;
+            Log.e(TAG, "IRIS_26418_V2_DIRECT_COLOR metadata failure", t);
+        }
         Rational[] neutralR = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT);
         if (!customNeutr)
             for (int i = 0; i < neutralR.length; i++) {
@@ -603,6 +661,9 @@ public class Parameters {
         params.gainMap = gainMap.clone();
         params.proPhotoToSRGB = proPhotoToSRGB.clone();
         params.sensorToProPhoto = sensorToProPhoto.clone();
+        params.motionV2ColorGains = motionV2ColorGains.clone();
+        params.motionV2ColorTransform = motionV2ColorTransform.clone();
+        params.motionV2DirectColorValid = motionV2DirectColorValid;
         params.tonemapStrength = tonemapStrength;
         params.customTonemap = customTonemap.clone();
         params.hotPixels = hotPixels.clone();

@@ -9,6 +9,7 @@ import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
 import com.particlesdevs.photoncamera.processing.opengl.GLImage;
 import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
 import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+import com.particlesdevs.photoncamera.settings.annotations.Tunable;
 import com.particlesdevs.photoncamera.util.BufferUtils;
 import java.io.IOException;
 
@@ -18,6 +19,35 @@ import static android.opengl.GLES20.GL_MIRRORED_REPEAT;
 import static android.opengl.GLES20.GL_NEAREST;
 
 public class Bayer2Float extends Node {
+
+    /*
+     * IRIS_26404_MOTION_IQ_LAB
+     * Runtime-injected before every node Run(), so these can be changed
+     * between captures without rebuilding the APK.
+     */
+    @Tunable(
+            title = "Highlight Shoulder Enable",
+            description = "Motion only. 0 restores the pre-26403 hard-clamp behavior; 1 enables the highlight-preserving shoulder.",
+            category = "Motion IQ Highlight",
+            min = 0.0f, max = 1.0f, defaultValue = 1.0f, step = 1.0f
+    )
+    boolean motionHighlightShoulderEnable = true;
+
+    @Tunable(
+            title = "Highlight Shoulder Start",
+            description = "Motion only. Linear signal below this value is left unchanged.",
+            category = "Motion IQ Highlight",
+            min = 0.75f, max = 0.98f, defaultValue = 0.84f, step = 0.01f
+    )
+    float motionHighlightShoulderStart = 0.84f;
+
+    @Tunable(
+            title = "Highlight Shoulder Strength",
+            description = "Motion only. 0 = no shoulder, 1 = exact 26403 shoulder strength.",
+            category = "Motion IQ Highlight",
+            min = 0.0f, max = 1.0f, defaultValue = 1.0f, step = 0.05f
+    )
+    float motionHighlightShoulderStrength = 1.0f;
 
     public Bayer2Float() {
         super("", "Bayer2Float");
@@ -38,6 +68,17 @@ public class Bayer2Float extends Node {
     GLTexture kod;
     @Override
     public void Run() {
+        if (com.particlesdevs.photoncamera.settings.MotionIqLab.active()) {
+            motionHighlightShoulderEnable =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getBool(
+                            "highlight_shoulder_enable", true);
+            motionHighlightShoulderStart =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "highlight_shoulder_start", 0.84f);
+            motionHighlightShoulderStrength =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                            "highlight_shoulder_strength", 1.0f);
+        }
         PostPipeline postPipeline = (PostPipeline) basePipeline;
         Point rawSize = basePipeline.mParameters.rawSize;
 
@@ -67,7 +108,48 @@ public class Bayer2Float extends Node {
         glProg.setDefine("QUAD", basePipeline.mSettings.cfaPattern == -2);
         glProg.setDefine("RGBLAYOUT",basePipeline.mSettings.alignAlgorithm == 2);
         glProg.setDefine("TESTPATTERN",testPattern);
+
+        /*
+         * IRIS_26403_MOTION_HIGHLIGHT_PRESERVATION
+         * Motion only. Keep Photo/Night on the exact legacy Bayer normalization.
+         * The shader applies a smooth high-end shoulder instead of destroying
+         * highlight ordering with a hard 1.0 clamp.
+         */
+        /* IRIS_26410_MOTION_V2_HIGHLIGHT_OWNER */
+        boolean iris26410V2Highlight = basePipeline.mParameters.motionV2Active;
+        boolean iris26403MotionHighlightPreservation =
+                iris26410V2Highlight
+                        || com.particlesdevs.photoncamera.processing.MotionMetrics.isActive();
+        glProg.setDefine(
+                "IRIS_26403_MOTION_HIGHLIGHT_SHOULDER",
+                iris26403MotionHighlightPreservation ? 1 : 0);
+        glProg.setDefine("IRIS_26412_MOTION_V2_WIDE_LINEAR",
+                basePipeline.mParameters.motionV2Active ? 1 : 0);
+
         glProg.useAssetProgram("tofloat");
+
+        /*
+         * IRIS_26404_MOTION_IQ_LAB
+         * Use uniforms rather than compile-time constants so values selected
+         * in Tunables are consumed on the next capture.
+         */
+        glProg.setVar(
+                "MotionHighlightShoulderEnable",
+                iris26410V2Highlight
+                        ? 1
+                        : (iris26403MotionHighlightPreservation && motionHighlightShoulderEnable ? 1 : 0));
+        glProg.setVar(
+                "MotionHighlightShoulderStart",
+                iris26410V2Highlight
+                        ? 0.84f
+                        : com.particlesdevs.photoncamera.util.Math2.clamp(
+                                motionHighlightShoulderStart, 0.75f, 0.98f));
+        glProg.setVar(
+                "MotionHighlightShoulderStrength",
+                iris26410V2Highlight
+                        ? 1.0f
+                        : com.particlesdevs.photoncamera.util.Math2.clamp(
+                                motionHighlightShoulderStrength, 0.0f, 1.0f));
         glProg.setTexture("InputBuffer", in);
         glProg.setVar("CfaPattern", basePipeline.mParameters.cfaPattern);
         glProg.setVar("patSize", 2);

@@ -10,7 +10,10 @@ uniform int yOffset;
 //out vec3 Output;
 #define EPS 0.0001
 #define EPS2 0.001
-#define alpha 3.75
+#ifndef IRIS_LAB_GRADIENT_ALPHA
+#define IRIS_LAB_GRADIENT_ALPHA 3.75
+#endif
+#define alpha IRIS_LAB_GRADIENT_ALPHA
 #define BETA 0.42
 //#define BETA 0.0
 #define THRESHOLD 1.9

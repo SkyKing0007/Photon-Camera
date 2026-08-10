@@ -116,7 +116,30 @@ void main() {
                 1.0 - clamp(motionFineDetailProtection, 0.0, 0.80),
                 fineDetailEvidence);
 
+        /*
+         * IRIS_26397_STATIC_EDGE_GHOST_VETO
+         *
+         * Keep the recovered 26367/26392 alignment geometry untouched.
+         * The failure seen on the speaker is an acceptance problem: a locally
+         * imperfect warp can still receive weight near a hard static edge.
+         *
+         * Around strong reference-supported structure, demand a much smaller
+         * residual than the general 2.5-6 sigma confidence window. Flat areas
+         * retain the existing merge behavior.
+         */
+        float iris26397StaticEdgeConfidence =
+                1.0 - smoothstep(
+                        modeledNoise * 1.35,
+                        modeledNoise * 3.20,
+                        residualMagnitude);
+        float iris26397StaticEdgeVeto =
+                mix(
+                        1.0,
+                        clamp(iris26397StaticEdgeConfidence, 0.0, 1.0),
+                        fineDetailEvidence);
+
         mergeWeight *= clamp(localConfidence, 0.0, 1.0);
+        mergeWeight *= iris26397StaticEdgeVeto;
         mergeWeight *= fineDetailRetention;
         mergeWeight *= clamp(effectiveStackRatio, 0.05, 1.0);
     }

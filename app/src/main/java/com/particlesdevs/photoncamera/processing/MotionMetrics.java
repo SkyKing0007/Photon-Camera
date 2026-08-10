@@ -136,6 +136,37 @@ public final class MotionMetrics {
     public static int localSupportWidth() { return localSupportWidth; }
     public static int localSupportHeight() { return localSupportHeight; }
 
+    /*
+     * IRIS_26413_MOTION_V2_TRUTHFUL_LOCAL_SUPPORT
+     *
+     * V2 publishes measured temporal support from its own reconstruction.
+     * The scalar is the spatial mean effective sample count. The coarse grid
+     * preserves regional support for later confidence-aware denoise/tone use.
+     */
+    public static synchronized void publishV2Support(
+            float effectiveSupport,
+            float[] supportGrid,
+            int supportWidth,
+            int supportHeight) {
+        accumulatedFrameConfidence = Math.max(
+                1.0,
+                Math.min(retainedFrames, effectiveSupport));
+        measuredFrames.set(retainedFrames);
+
+        if (supportGrid != null
+                && supportWidth > 0
+                && supportHeight > 0
+                && supportGrid.length == supportWidth * supportHeight) {
+            localSupportGrid = supportGrid.clone();
+            localSupportWidth = supportWidth;
+            localSupportHeight = supportHeight;
+        } else {
+            localSupportGrid = null;
+            localSupportWidth = 0;
+            localSupportHeight = 0;
+        }
+    }
+
     public static synchronized void end() {
         active = false;
         localSupportGrid = null;

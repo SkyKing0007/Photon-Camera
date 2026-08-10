@@ -80,6 +80,7 @@ public class ABLC extends Node {
     @SuppressLint("DefaultLocale")
     @Override
     public void Run() {
+
         if(!enable){
             WorkingTexture = super.previousNode.WorkingTexture;
             return;
@@ -129,13 +130,36 @@ public class ABLC extends Node {
                     0.00035f, 0.00150f, iris26347Reliability);
             float iris26347CorrectionStrength = com.particlesdevs.photoncamera.util.Math2.mix(
                     0.54f, 0.86f, iris26347Reliability);
+            float iris26405Neutralization =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.active()
+                            ? com.particlesdevs.photoncamera.util.Math2.clamp(
+                                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                            "ablc_neutralization_strength", 1.0f),
+                                    0.0f, 1.0f)
+                            : 1.0f;
+            float iris26405CorrectionScale =
+                    com.particlesdevs.photoncamera.settings.MotionIqLab.active()
+                            ? com.particlesdevs.photoncamera.util.Math2.clamp(
+                                    com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                            "ablc_correction_strength", 1.0f),
+                                    0.0f, 1.5f)
+                            : 1.0f;
             for (int i = 0; i < blackLevels.length; i++) {
-                float delta = com.particlesdevs.photoncamera.util.Math2.clamp(
-                        blackLevels[i] - iris26347Common,
-                        -iris26347ChannelAllowance,
-                        iris26347ChannelAllowance);
+                float iris26405RawDelta = blackLevels[i] - iris26347Common;
+                float iris26405SafeDelta =
+                        com.particlesdevs.photoncamera.util.Math2.clamp(
+                                iris26405RawDelta,
+                                -iris26347ChannelAllowance,
+                                iris26347ChannelAllowance);
+                float delta =
+                        com.particlesdevs.photoncamera.util.Math2.mix(
+                                iris26405RawDelta,
+                                iris26405SafeDelta,
+                                iris26405Neutralization);
                 blackLevels[i] = Math.max(0.0f,
-                        (iris26347Common + delta) * iris26347CorrectionStrength);
+                        (iris26347Common + delta)
+                                * iris26347CorrectionStrength
+                                * iris26405CorrectionScale);
             }
             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
                     "ABLC",

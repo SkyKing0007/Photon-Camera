@@ -151,6 +151,12 @@ public class ESD3D2 extends Node {
             if (iris26372Motion) {
                 iris26372AppliedLuma =
                         Math2.mix(0.65f, 0.40f, iris26372StackQuality);
+                if (com.particlesdevs.photoncamera.settings.MotionIqLab.active()) {
+                    iris26372AppliedLuma *= Math2.clamp(
+                            com.particlesdevs.photoncamera.settings.MotionIqLab.getFloat(
+                                    "esd_luma_scale", 1.0f),
+                            0.0f, 2.0f);
+                }
 
                 if (iris26372StackQuality >= 0.80f) {
                     iris26372MaxSize = Math.min(maxSize, 13);
@@ -302,6 +308,7 @@ public class ESD3D2 extends Node {
 
     @Override
     public void Run() {
+
         if (!enable) {
             WorkingTexture = previousNode.WorkingTexture;
             return;
@@ -312,7 +319,21 @@ public class ESD3D2 extends Node {
         int scale = (int)(scaleF + 0.5f);
         GLTexture outp;
         Log.d(Name, "Scaling factor:" + scale);
-        if(!useColorDenoising){
+        /*
+         * IRIS_26396_MOTION_RESIDUAL_CHROMA_OWNER
+         *
+         * Motion's signal-aware final ESD shader is the sole residual-chroma
+         * authority. Do not let a persisted global tunable silently add/remove
+         * the legacy broad color prepass. Photo/Night retain old behavior.
+         */
+        final boolean iris26396MotionResidualChromaOwner =
+                com.particlesdevs.photoncamera.app.PhotonCamera
+                        .getSettings().selectedMode
+                        == com.particlesdevs.photoncamera.api.CameraMode.MOTION;
+        final boolean iris26396UseLegacyColorPrepass =
+                !iris26396MotionResidualChromaOwner && useColorDenoising;
+
+        if(!iris26396UseLegacyColorPrepass){
             outp = previousNode.WorkingTexture;
         } else {
             if (scale != 1) {

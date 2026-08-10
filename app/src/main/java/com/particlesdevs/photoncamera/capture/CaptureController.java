@@ -318,6 +318,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
     private int mMotionLastLoggedActualIso = Integer.MIN_VALUE;
     private String mMotionLastLadderDecision = "";
 
+    /* IRIS_26412_MOTION_V2_EXPOSURE_AUTHORITY */
+    private boolean mMotionV2AeBaseReady = false;
+    private int mMotionV2AeBaseSteps = 0;
+    private int mMotionV2AeAppliedSteps = Integer.MIN_VALUE;
+    private long mMotionV2AeLastUpdateMs = 0L;
+
     private long mMotionDiagnosticShotId = 0L;
 
     // Responsive hybrid ZSL: wait briefly for the passive rolling ring to
@@ -615,6 +621,16 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             if (focus != null) mFocus = (float) focus;
             if (isZslMode()) {
                 updateMotionUnifiedExposure(request, result);
+                /*
+                 * IRIS_26413_MOTION_V2_HAL_AE_STABLE_PREVIEW
+                 *
+                 * 26412 proved that a second continuously-running RAW-derived
+                 * AE-compensation loop can fight the HAL AE controller and
+                 * produce visible preview oscillation. Keep system/HAL AE as
+                 * the live preview authority. V2 still uses actual RAW/result
+                 * metadata for capture processing and JPEG normalization.
+                 */
+                /* updateMotionV2ExposureAuthority(result); intentionally dormant */
                 /* IRIS_26386_STABLE_HAL_AE_AUTHORITY */
                 // Asynchronous RAW evidence is diagnostic only; HAL AE owns live preview.
                 // updateMotion26368AdaptiveAeBias(result);
@@ -1426,6 +1442,87 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 Math.min(absoluteDarkCeilingNs, motionAwareCeilingNs));
     }
 
+    /*
+     * IRIS_26412_MOTION_V2_EXPOSURE_AUTHORITY
+     *
+     * Keep HAL AE ON. V2 supplies only a slowly-changing compensation target
+     * derived from actual RAW starvation, highlight safety, and the existing
+     * focal/motion-aware shutter opportunity. No AE-off/manual shutter toggling.
+     */
+    private void updateMotionV2ExposureAuthority(
+            @NonNull TotalCaptureResult result) {
+        if (!isZslMode() || mZslCapturing || burst || isProcessing
+                || mPreviewRequestBuilder == null || mCaptureSession == null
+                || mCameraCharacteristics == null) return;
+
+        Integer aeMode=result.get(CaptureResult.CONTROL_AE_MODE);
+        Long actualExposure=result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+        Integer actualIso=result.get(CaptureResult.SENSOR_SENSITIVITY);
+        Long ts=result.get(CaptureResult.SENSOR_TIMESTAMP);
+        if(aeMode==null || aeMode==CaptureResult.CONTROL_AE_MODE_OFF
+                || actualExposure==null || actualIso==null || ts==null
+                || actualExposure<=0L || actualIso<=0) return;
+
+        android.util.Range<Integer> range=mCameraCharacteristics.get(
+                CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+        android.util.Rational step=mCameraCharacteristics.get(
+                CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+        if(range==null || step==null || step.floatValue()<=0.0f) return;
+
+        Integer current=mPreviewRequestBuilder.get(
+                CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
+        if(!mMotionV2AeBaseReady){
+            mMotionV2AeBaseSteps=current!=null?current:0;
+            mMotionV2AeBaseSteps=Math.max(range.getLower(),Math.min(range.getUpper(),mMotionV2AeBaseSteps));
+            mMotionV2AeBaseReady=true;
+        }
+
+        long age=Math.abs(ts-mMotion26380RawSignalTimestampNs);
+        boolean fresh=age<=180_000_000L && mMotion26380RawSampleCount>=64
+                && !Float.isNaN(mMotion26380RawFloorFraction)
+                && !Float.isNaN(mMotion26380RawShadowFraction)
+                && !Float.isNaN(mMotion26380RawHighlightFraction)
+                && !Float.isNaN(mMotion26380RawMeanSignal);
+        if(!fresh) return;
+
+        float floorNeed=motion26368Clamp01((mMotion26380RawFloorFraction-0.10f)/(0.58f-0.10f));
+        float shadowNeed=motion26368Clamp01((mMotion26380RawShadowFraction-0.24f)/(0.78f-0.24f));
+        float meanNeed=1.0f-motion26368Clamp01((mMotion26380RawMeanSignal-0.035f)/(0.18f-0.035f));
+        float rawNeed=Math.max(floorNeed,0.72f*shadowNeed)*(0.40f+0.60f*meanNeed);
+
+        float highlightSafety=1.0f-0.75f*motion26368Clamp01(
+                (mMotion26380RawHighlightFraction-0.008f)/(0.10f-0.008f));
+        long shutterCeiling=iris26381MotionOpportunityCeilingNs(result);
+        float shutterOpportunity=motion26368Clamp01(
+                (shutterCeiling-actualExposure)/(float)Math.max(1L,shutterCeiling));
+        float requestedExtraEv=1.65f*rawNeed*highlightSafety*(0.45f+0.55f*shutterOpportunity);
+        requestedExtraEv=Math.max(0.0f,requestedExtraEv);
+
+        int extraSteps=Math.round(requestedExtraEv/step.floatValue());
+        int target=Math.max(range.getLower(),Math.min(range.getUpper(),mMotionV2AeBaseSteps+extraSteps));
+        long now=android.os.SystemClock.elapsedRealtime();
+        if(mMotionV2AeAppliedSteps!=Integer.MIN_VALUE
+                && Math.abs(target-mMotionV2AeAppliedSteps)<1) return;
+        if(now-mMotionV2AeLastUpdateMs<500L) return;
+
+        try{
+            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,target);
+            mMotionV2AeAppliedSteps=target;
+            mMotionV2AeLastUpdateMs=now;
+            rebuildPreviewBuilder();
+            Log.i(TAG,"IRIS_26412_V2_EXPOSURE_PLAN"
+                    +" actualExposureNs="+actualExposure+" actualIso="+actualIso
+                    +" rawFloor="+mMotion26380RawFloorFraction
+                    +" rawShadow="+mMotion26380RawShadowFraction
+                    +" rawHighlight="+mMotion26380RawHighlightFraction
+                    +" rawMean="+mMotion26380RawMeanSignal
+                    +" shutterCeilingNs="+shutterCeiling
+                    +" rawNeed="+rawNeed+" requestedExtraEv="+requestedExtraEv
+                    +" compensationSteps="+target+" halAeRemainsOn=true");
+        }catch(IllegalArgumentException|IllegalStateException e){
+            Log.w(TAG,"IRIS_26412 V2 exposure authority skipped: "+e.getClass().getSimpleName());
+        }
+    }
     private void updateMotion26368AdaptiveAeBias(
             @NonNull TotalCaptureResult result) {
         if (PhotonCamera.getSettings().selectedMode != CameraMode.MOTION
