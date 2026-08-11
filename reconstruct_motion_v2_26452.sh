@@ -901,21 +901,32 @@ mkdir -p "$REPLAY_26435_SNAPSHOT"
 [[ -d "$REPLAY_26435_SNAPSHOT/app" ]] \
     || fail "Complete 26435 app snapshot missing"
 
-find "$REPLAY_26435_SNAPSHOT/app" \
-    -type f \
-    -print0 \
-    | sort -z \
-    | xargs -0 sha256sum \
-    | sed "s#  $REPLAY_26435_SNAPSHOT/##" \
-    > "$REPLAY_ROOT/26435_snapshot_app_sha256.txt"
+(
+    cd "$REPLAY_26435_SNAPSHOT"
+
+    find app \
+        -type f \
+        -print0 \
+        | sort -z \
+        | xargs -0 sha256sum \
+        > "$REPLAY_ROOT/26435_snapshot_app_sha256.txt"
+)
 
 [[ -s "$REPLAY_ROOT/26435_snapshot_app_sha256.txt" ]] \
     || fail "26435 snapshot hash manifest missing"
 
-cmp -s \
+if ! cmp -s \
     "$REPLAY_ROOT/26435_replayed_app_sha256.txt" \
-    "$REPLAY_ROOT/26435_snapshot_app_sha256.txt" \
-    || fail "Saved complete 26435 snapshot is not byte-identical to Gate 4 replay state"
+    "$REPLAY_ROOT/26435_snapshot_app_sha256.txt"
+then
+    echo "Gate 4 replay vs snapshot manifest difference:"
+    diff -u \
+        "$REPLAY_ROOT/26435_replayed_app_sha256.txt" \
+        "$REPLAY_ROOT/26435_snapshot_app_sha256.txt" \
+        | head -n 120 || true
+
+    fail "Saved complete 26435 snapshot is not byte-identical to Gate 4 replay state"
+fi
 
 echo "PASS: complete source-only 26435 app snapshot saved and hash-verified"
 
