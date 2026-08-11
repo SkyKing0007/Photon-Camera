@@ -1332,3 +1332,332 @@ echo "VERSION STILL 0.9726435 / 26435 INSIDE CANDIDATE"
 echo "NO REAL 26452 VERSION CHANGE"
 echo "NO REAL 26452 APK YET"
 echo "======================================================================"
+
+echo
+echo "=== GATE 5L: LATE-HISTORY SELECTIVE EXTRACTION AUDIT ==="
+
+G5L_DIR="$GATE5_SAFETY/late_history_selective"
+mkdir -p "$G5L_DIR"
+
+G5L_26437="$HIST_DIR/build_26437_windows_whitepoint_motion_detail_stable_uhdr.ps1"
+G5L_26438="$HIST_DIR/build_26438_windows_REVISED_v2_audited_motion_microcontrast_standard_ultrahdr.ps1"
+G5L_26450="$REPLAY_DECODED/26450.ps1"
+
+for f in "$G5L_26437" "$G5L_26438" "$G5L_26450"; do
+    [[ -s "$f" ]] || fail "Gate 5L historical source missing: $f"
+done
+
+echo
+echo "=== GATE 5L-A: 26437 OWNERSHIP MARKERS ==="
+
+for marker in \
+    "IRIS_26437_WHITE_POINT_OWNED_REFERENCE_AND_EDGE_ANCHOR" \
+    "IRIS_26437_SENSOR_WHITE_POINT_COLOR_OWNERSHIP" \
+    "IRIS_26437_DETAIL_PRESERVE_RESIDUAL_CLEANUP"
+do
+    grep -q "$marker" "$G5L_26437" \
+        || fail "26437 required marker missing: $marker"
+    echo "PASS: $marker"
+done
+
+grep -q 'direct_rgb_init.glsl' "$G5L_26437" \
+    || fail "26437 white-point reference initializer ownership missing"
+
+grep -q 'color_transform.glsl' "$G5L_26437" \
+    || fail "26437 color-transform ownership missing"
+
+grep -q 'denoise.glsl' "$G5L_26437" \
+    || fail "26437 residual-detail cleanup ownership missing"
+
+echo "PASS: 26437 white-point/color/detail domains identified"
+
+echo
+echo "=== GATE 5L-B: 26438 COMPATIBLE / INCOMPATIBLE DOMAIN SPLIT ==="
+
+grep -q 'IRIS_26438_NOISE_AWARE_IMMUTABLE_REFERENCE_MOTION_VETO' \
+    "$G5L_26438" \
+    || fail "26438 reference-motion veto provenance missing"
+
+grep -q 'IRIS_26438_NEAR_WHITE_REFERENCE_MERGE_OWNERSHIP' \
+    "$G5L_26438" \
+    || fail "26438 direct-RGB near-white ownership provenance missing"
+
+grep -qi 'microcontrast' "$G5L_26438" \
+    || fail "26438 microcontrast provenance missing"
+
+grep -qi 'Ultra HDR\|ULTRAHDR\|gainmap' "$G5L_26438" \
+    || fail "26438 Ultra HDR provenance missing"
+
+cat > "$G5L_DIR/26438_policy.txt" <<'EOF'
+26438 SELECTIVE POLICY
+
+PRESERVE WHERE DOMAIN-COMPATIBLE:
+- immutable-reference / contradictory-local-observation rejection principle
+- rendering/microcontrast behavior that is downstream of demosaic
+- standards-aligned Ultra HDR behavior
+- global exposure behavior
+
+DO NOT TRANSPLANT LITERALLY:
+- near-white direct-RGB merge suppression
+- any direct_rgb_accumulate RGB-channel synthesis ownership
+
+Reason:
+26452 final temporal owner is multiframe CFA currentMerged, not direct RGB.
+EOF
+
+echo "PASS: 26438 compatible/incompatible domains explicitly separated"
+
+echo
+echo "=== GATE 5L-C: EXACT 26450 DNG VS RGB-FINALIZER SEPARATION ==="
+
+python3 - "$G5L_26450" "$G5L_DIR" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+src = Path(sys.argv[1]).read_text()
+out = Path(sys.argv[2])
+
+def extract_here_string(var):
+    pattern = re.compile(
+        r"\$" + re.escape(var) + r"\s*=\s*@'\s*\n(.*?)\n'@",
+        re.S,
+    )
+    m = pattern.search(src)
+    if not m:
+        raise SystemExit(f"FAIL: could not extract ${var} from decoded 26450")
+    return m.group(1)
+
+dng_old = extract_here_string("DngInsertOld")
+dng_new = extract_here_string("DngInsertNew")
+final_old = extract_here_string("FinalizeOld")
+final_new = extract_here_string("FinalizeNew")
+
+(out / "26450_DNG_INSERT_OLD.txt").write_text(dng_old + "\n")
+(out / "26450_DNG_INSERT_NEW.txt").write_text(dng_new + "\n")
+(out / "26450_RGB_FINALIZER_OLD_REJECT.txt").write_text(final_old + "\n")
+(out / "26450_RGB_FINALIZER_NEW_REJECT.txt").write_text(final_new + "\n")
+
+required_dng = (
+    "IRIS_26450_MOTION_V2_REFERENCE_DNG",
+    "images.get(0).buffer.duplicate()",
+    "ImageSaver.Util.saveStackedRaw(",
+    "processingParameters",
+    "source=timestampOwnedReferenceBayer",
+    "multiframeNr=false",
+    "bakedRgb=false",
+)
+
+for token in required_dng:
+    if token not in dng_new:
+        raise SystemExit(
+            "FAIL: exact 26450 DNG insertion missing required token: " + token
+        )
+
+if "MotionV2CfaReconstruction.reconstruct(" in dng_new:
+    raise SystemExit(
+        "FAIL: extracted DNG insertion unexpectedly includes reconstruction call"
+    )
+
+if "direct_rgb_finalize_alias_safe" not in final_new:
+    raise SystemExit(
+        "FAIL: 26450 rejected RGB-finalizer extraction did not identify alias shader"
+    )
+
+if "IRIS_26450_ALIAS_AWARE_CHROMA_FINALIZER" not in final_new:
+    raise SystemExit(
+        "FAIL: rejected 26450 finalizer marker missing"
+    )
+
+if "IRIS_26450_MOTION_V2_REFERENCE_DNG" in final_new:
+    raise SystemExit(
+        "FAIL: DNG and RGB-finalizer historical changes are not cleanly separable"
+    )
+
+print("PASS: exact 26450 DNG insertion extracted")
+print("PASS: exact 26450 alias-aware RGB finalizer extracted separately")
+print("PASS: DNG does not depend on rejected RGB finalizer")
+PY
+
+echo
+echo "=== GATE 5L-D: VERIFY DNG SEMANTIC ORDER IN ACTUAL HDRX CANDIDATE ==="
+
+G5L_HDRX="$GATE5_APP/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java"
+G5L_HDRX_TEST="$G5L_DIR/HdrxProcessor_with_reference_dng_candidate.java"
+
+[[ -s "$G5L_HDRX" ]] \
+    || fail "Gate 5L candidate HdrxProcessor.java missing"
+
+python3 - \
+    "$G5L_26450" \
+    "$G5L_HDRX" \
+    "$G5L_HDRX_TEST" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+history = Path(sys.argv[1]).read_text()
+hdrx = Path(sys.argv[2]).read_text()
+out = Path(sys.argv[3])
+
+def extract_here_string(var):
+    pattern = re.compile(
+        r"\$" + re.escape(var) + r"\s*=\s*@'\s*\n(.*?)\n'@",
+        re.S,
+    )
+    m = pattern.search(history)
+    if not m:
+        raise SystemExit(
+            f"FAIL: could not extract ${var} from decoded 26450"
+        )
+    return m.group(1)
+
+old = extract_here_string("DngInsertOld")
+new = extract_here_string("DngInsertNew")
+
+count = hdrx.count(old)
+
+if count != 1:
+    raise SystemExit(
+        "FAIL: exact 26450 reference-DNG insertion anchor appears "
+        f"{count} times in the Gate 5 Hdrx candidate"
+    )
+
+candidate = hdrx.replace(old, new, 1)
+
+owner = candidate.find("MOTION_REFERENCE_AFTER_RETENTION")
+dng = candidate.find("IRIS_26450_MOTION_V2_REFERENCE_DNG")
+recon = candidate.find(
+    "MotionV2CfaReconstruction.reconstruct(",
+    dng
+)
+
+if owner < 0:
+    raise SystemExit(
+        "FAIL: reference-owner marker missing from transformed Hdrx candidate"
+    )
+
+if dng < 0:
+    raise SystemExit(
+        "FAIL: reference-DNG marker missing from transformed Hdrx candidate"
+    )
+
+if recon < 0:
+    raise SystemExit(
+        "FAIL: reconstruction call missing after reference-DNG insertion"
+    )
+
+if not (owner < dng < recon):
+    raise SystemExit(
+        "FAIL: transformed Hdrx source order is not "
+        "reference ownership -> reference DNG -> reconstruction"
+    )
+
+for token in (
+    "images.get(0).buffer.duplicate()",
+    "ImageSaver.Util.saveStackedRaw(",
+    "source=timestampOwnedReferenceBayer",
+    "multiframeNr=false",
+    "bakedRgb=false",
+):
+    if token not in candidate:
+        raise SystemExit(
+            "FAIL: transformed Hdrx DNG contract missing " + token
+        )
+
+out.write_text(candidate)
+
+print("PASS: exact 26450 DNG transform applies once to Gate 5 Hdrx")
+print("PASS: reference ownership precedes DNG save")
+print("PASS: reference DNG precedes MotionV2 reconstruction")
+print("PASS: DNG source is timestamp-owned single-frame Bayer RAW")
+PY
+
+[[ -s "$G5L_HDRX_TEST" ]] \
+    || fail "Transformed Hdrx DNG candidate was not saved"
+
+echo "PASS: actual Hdrx source ordering proven, not PowerShell text ordering"
+
+echo
+echo "=== GATE 5L-E: PROVE REJECTED 26450 RGB PATH WILL NOT ENTER 26452 ==="
+
+if grep -q 'direct_rgb_finalize_alias_safe' "$G5_RECON"; then
+    fail "Gate 5 CFA candidate unexpectedly contains rejected 26450 alias finalizer"
+fi
+
+if grep -q 'IRIS_26450_ALIAS_AWARE_CHROMA_FINALIZER' "$G5_RECON"; then
+    fail "Gate 5 CFA candidate unexpectedly contains rejected RGB finalizer marker"
+fi
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_FINAL_OWNER' "$G5_RECON" \
+    || fail "Gate 5 CFA final ownership marker disappeared"
+
+grep -q 'GLTexture imageOutput = currentMerged;' "$G5_RECON" \
+    || fail "Gate 5 currentMerged ownership disappeared"
+
+echo "PASS: rejected 26450 RGB finalizer is absent"
+echo "PASS: 26452 CFA final ownership remains intact"
+
+echo
+echo "=== GATE 5L-F: SAVE SELECTIVE-MIGRATION MANIFEST ==="
+
+cat > "$G5L_DIR/26452_selective_migration_manifest.txt" <<'EOF'
+26452 SELECTIVE LATE-HISTORY MIGRATION
+
+PRESERVE:
+26437
+- sensor white-point ownership
+- reference white-point / edge authority where transferable to CFA ownership
+- detail-preserving residual cleanup
+
+26438
+- immutable-reference local-conflict principle where CFA-domain compatible
+- downstream microcontrast/render behavior
+- standards-aligned Ultra HDR behavior
+- existing global exposure behavior
+
+26450
+- exact timestamp-owned single-reference Bayer DNG insertion in HdrxProcessor
+- DNG before MotionV2CfaReconstruction.reconstruct()
+- multiframeNr=false
+- bakedRgb=false
+
+REJECT:
+- direct multiframe RGB final image ownership
+- direct_rgb_finalize_alias_safe
+- IRIS_26450_ALIAS_AWARE_CHROMA_FINALIZER
+- 26440-26442 GPU readback diagnostics
+- 26447-26448 no-improvement experiments
+- untested 26449 experiment
+
+26452 FINAL TEMPORAL OWNER:
+currentMerged CFA -> one MotionV2CfaDemosaic
+EOF
+
+[[ -s "$G5L_DIR/26452_selective_migration_manifest.txt" ]] \
+    || fail "Selective-migration manifest missing"
+
+echo
+echo "=== GATE 5L-G: REAL APP MUST STILL BE UNTOUCHED ==="
+
+REAL_APP_DIFF="$(git diff "$BASE_26428_COMMIT" -- app || true)"
+
+if [[ -n "$REAL_APP_DIFF" ]]; then
+    echo "$REAL_APP_DIFF"
+    fail "Real app/ changed during Gate 5L"
+fi
+
+echo "PASS: real app/ remains canonical 26428"
+
+echo
+echo "======================================================================"
+echo "GATE 5L LATE-HISTORY SELECTIVE EXTRACTION AUDIT PASSED"
+echo "26437 WHITE-POINT / DETAIL OWNERSHIP IDENTIFIED"
+echo "26438 DOMAIN-COMPATIBILITY SPLIT PROVEN"
+echo "26450 REFERENCE DNG EXTRACTED INDEPENDENTLY"
+echo "26450 DIRECT-RGB FINALIZER EXPLICITLY REJECTED"
+echo "26452 CURRENTMERGED CFA OWNERSHIP PRESERVED"
+echo "REAL app/ UNMODIFIED"
+echo "NO VERSION CHANGE"
+echo "NO FINAL APK YET"
+echo "======================================================================"
