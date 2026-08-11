@@ -447,27 +447,45 @@ echo "PASS: 26450 decoded payload carried forward"
 echo
 echo "=== GATE 3D: AUDIT LATE PAYLOAD PRODUCER / CARRIER / CONSUMER EVIDENCE ==="
 
-for PAYLOAD in \
+# Each historical build touched a different part of the V2 graph.
+# Validate the domain each build actually owned instead of falsely requiring
+# every payload to reference MotionV2CfaReconstruction.java.
+
+grep -qi 'MotionV2CfaReconstruction' \
     "$REPLAY_DECODED/26439.ps1" \
+    || fail "26439 decoded payload lacks reconstruction ownership evidence"
+
+grep -qi 'direct_rgb_accumulate' \
     "$REPLAY_DECODED/26443.ps1" \
+    || fail "26443 decoded payload lacks direct-RGB accumulator evidence"
+
+grep -qi 'reference' \
+    "$REPLAY_DECODED/26443.ps1" \
+    || fail "26443 decoded payload lacks reference-first/local-ownership evidence"
+
+grep -qi 'direct_rgb_accumulate' \
     "$REPLAY_DECODED/26445.ps1" \
+    || fail "26445 decoded payload lacks direct-RGB accumulator evidence"
+
+grep -qi 'color_transform' \
+    "$REPLAY_DECODED/26445.ps1" \
+    || fail "26445 decoded payload lacks color/channel-validity evidence"
+
+grep -qi 'MotionV2ColorTransform' \
+    "$REPLAY_DECODED/26445.ps1" \
+    || fail "26445 decoded payload lacks Motion V2 color-owner evidence"
+
+grep -qi 'support' \
     "$REPLAY_DECODED/26446.ps1" \
-    "$REPLAY_DECODED/26450.ps1"
-do
-    grep -qi 'MotionV2CfaReconstruction' "$PAYLOAD" \
-        || fail "$(basename "$PAYLOAD") lacks MotionV2CfaReconstruction provenance"
-
-    echo "PASS: $(basename "$PAYLOAD") references MotionV2CfaReconstruction"
-done
-
-grep -qi 'reference' "$REPLAY_DECODED/26443.ps1" \
-    || fail "26443 decoded payload lacks reference-first evidence"
-
-grep -qi 'channel' "$REPLAY_DECODED/26445.ps1" \
-    || fail "26445 decoded payload lacks channel-validity evidence"
-
-grep -qi 'support' "$REPLAY_DECODED/26446.ps1" \
     || fail "26446 decoded payload lacks local-support evidence"
+
+grep -qi 'direct_rgb_accumulate\|MotionV2LocalSupportDenoise\|PostPipeline' \
+    "$REPLAY_DECODED/26446.ps1" \
+    || fail "26446 decoded payload lacks expected support consumer/producer evidence"
+
+grep -qi 'MotionV2CfaReconstruction' \
+    "$REPLAY_DECODED/26450.ps1" \
+    || fail "26450 decoded payload lacks reconstruction provenance"
 
 grep -qi 'direct_rgb_finalize_alias_safe\|alias.safe\|alias-safe' \
     "$REPLAY_DECODED/26450.ps1" \
@@ -477,6 +495,15 @@ grep -qi 'reference[_ -]*dng' \
     "$REPLAY_DECODED/26450.ps1" \
     || fail "26450 decoded payload lacks reference-DNG provenance"
 
+grep -qi 'HdrxProcessor' \
+    "$REPLAY_DECODED/26450.ps1" \
+    || fail "26450 decoded payload lacks reference-DNG Hdrx plumbing"
+
+echo "PASS: 26439 reconstruction ownership provenance"
+echo "PASS: 26443 reference-first accumulator provenance"
+echo "PASS: 26445 channel/color ownership provenance"
+echo "PASS: 26446 local-support provenance"
+echo "PASS: 26450 reconstruction/finalizer/reference-DNG provenance"
 echo "PASS: late historical producer/carrier/consumer evidence verified"
 
 echo
