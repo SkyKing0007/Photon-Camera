@@ -344,3 +344,190 @@ echo "======================================================================"
 echo "HISTORICAL REPLAY PROVENANCE PASSED"
 echo "NO APPLICATION SOURCE MODIFIED"
 echo "======================================================================"
+
+echo
+echo "=== GATE 3: TEMPORARY 26452 CANDIDATE FOUNDATION ==="
+
+CANDIDATE_ROOT="motion_v2_26452_candidate"
+CANDIDATE_APP="$CANDIDATE_ROOT/app"
+REPLAY_DECODED="$SAFETY_DIR/decoded_replay"
+
+rm -rf "$CANDIDATE_ROOT"
+mkdir -p "$CANDIDATE_ROOT" "$REPLAY_DECODED"
+
+echo
+echo "=== GATE 3A: CREATE EXACT DISPOSABLE 26428 APPLICATION COPY ==="
+
+git archive "$BASE_26428_COMMIT" app \
+    | tar -x -C "$CANDIDATE_ROOT"
+
+[[ -d "$CANDIDATE_APP" ]] \
+    || fail "Temporary candidate app tree was not created"
+
+grep -q '^VERSION_NAME=0\.9726428$' \
+    "$CANDIDATE_APP/version.properties" \
+    || fail "Temporary candidate is not version 0.9726428"
+
+grep -q '^VERSION_BUILD=26428$' \
+    "$CANDIDATE_APP/version.properties" \
+    || fail "Temporary candidate is not build 26428"
+
+echo "PASS: exact committed 26428 app copied to disposable candidate"
+
+echo
+echo "=== GATE 3B: PROVE REAL app/ IS STILL UNTOUCHED ==="
+
+REAL_APP_DIFF="$(git diff "$BASE_26428_COMMIT" -- app || true)"
+
+if [[ -n "$REAL_APP_DIFF" ]]; then
+    echo "$REAL_APP_DIFF"
+    fail "Real app/ changed before temporary reconstruction"
+fi
+
+echo "PASS: real app/ remains byte-identical to canonical 26428"
+
+echo
+echo "=== GATE 3C: DECODE LATE WINDOWS HISTORICAL PAYLOADS ==="
+
+decode_launcher_payload() {
+    local launcher="$1"
+    local output="$2"
+    local label="$3"
+
+    [[ -s "$launcher" ]] \
+        || fail "$label launcher missing or empty"
+
+    local encoded
+    encoded="$(
+        sed -n 's/.*FromBase64String("\([^"]*\)").*/\1/p' "$launcher" \
+            | head -n 1
+    )"
+
+    [[ -n "$encoded" ]] \
+        || fail "$label embedded Base64 payload not found"
+
+    printf '%s' "$encoded" \
+        | base64 --decode > "$output" \
+        || fail "$label payload decode failed"
+
+    [[ -s "$output" ]] \
+        || fail "$label decoded payload is empty"
+
+    echo "PASS: $label decoded -> $output"
+}
+
+decode_launcher_payload \
+    "$HIST_DIR/launch_resume_build_26439_after_gate8_v2_MINIMAL.ps1" \
+    "$REPLAY_DECODED/26439.ps1" \
+    "26439"
+
+decode_launcher_payload \
+    "$HIST_DIR/launch_build_26443_reference_first_local_ownership.ps1" \
+    "$REPLAY_DECODED/26443.ps1" \
+    "26443"
+
+decode_launcher_payload \
+    "$HIST_DIR/launch_build_26445_specular_channel_validity_v2.ps1" \
+    "$REPLAY_DECODED/26445.ps1" \
+    "26445"
+
+decode_launcher_payload \
+    "$HIST_DIR/launch_build_26446_corrected_published_robustness_true_local_support.ps1" \
+    "$REPLAY_DECODED/26446.ps1" \
+    "26446"
+
+cp "$PAYLOAD_26450_DECODED" \
+    "$REPLAY_DECODED/26450.ps1"
+
+[[ -s "$REPLAY_DECODED/26450.ps1" ]] \
+    || fail "26450 decoded replay payload missing"
+
+echo "PASS: 26450 decoded payload carried forward"
+
+echo
+echo "=== GATE 3D: AUDIT LATE PAYLOAD PRODUCER / CARRIER / CONSUMER EVIDENCE ==="
+
+for PAYLOAD in \
+    "$REPLAY_DECODED/26439.ps1" \
+    "$REPLAY_DECODED/26443.ps1" \
+    "$REPLAY_DECODED/26445.ps1" \
+    "$REPLAY_DECODED/26446.ps1" \
+    "$REPLAY_DECODED/26450.ps1"
+do
+    grep -qi 'MotionV2CfaReconstruction' "$PAYLOAD" \
+        || fail "$(basename "$PAYLOAD") lacks MotionV2CfaReconstruction provenance"
+
+    echo "PASS: $(basename "$PAYLOAD") references MotionV2CfaReconstruction"
+done
+
+grep -qi 'reference' "$REPLAY_DECODED/26443.ps1" \
+    || fail "26443 decoded payload lacks reference-first evidence"
+
+grep -qi 'channel' "$REPLAY_DECODED/26445.ps1" \
+    || fail "26445 decoded payload lacks channel-validity evidence"
+
+grep -qi 'support' "$REPLAY_DECODED/26446.ps1" \
+    || fail "26446 decoded payload lacks local-support evidence"
+
+grep -qi 'direct_rgb_finalize_alias_safe\|alias.safe\|alias-safe' \
+    "$REPLAY_DECODED/26450.ps1" \
+    || fail "26450 decoded payload lacks direct-RGB finalizer provenance"
+
+grep -qi 'reference[_ -]*dng' \
+    "$REPLAY_DECODED/26450.ps1" \
+    || fail "26450 decoded payload lacks reference-DNG provenance"
+
+echo "PASS: late historical producer/carrier/consumer evidence verified"
+
+echo
+echo "=== GATE 3E: PROVE CFA-TO-CFA FOUNDATION EXISTS IN CANONICAL SOURCE ==="
+
+CANDIDATE_RECON="$CANDIDATE_APP/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java"
+
+[[ -s "$CANDIDATE_RECON" ]] \
+    || fail "Candidate MotionV2CfaReconstruction.java missing"
+
+grep -q 'cfa_reconstruct_accumulate' "$CANDIDATE_RECON" \
+    || fail "Candidate lacks CFA-to-CFA accumulator"
+
+grep -q 'currentMerged' "$CANDIDATE_RECON" \
+    || fail "Candidate lacks currentMerged CFA carrier"
+
+grep -q 'currentDirectRgb' "$CANDIDATE_RECON" \
+    || fail "Candidate lacks direct-RGB comparison carrier"
+
+grep -q 'directBayer ? currentDirectRgb : currentMerged' "$CANDIDATE_RECON" \
+    || fail "Expected 26428 final carrier ownership expression not found"
+
+echo "PASS: CFA-to-CFA currentMerged producer exists"
+echo "PASS: direct-RGB is currently the standard-Bayer final owner"
+echo "PASS: exact ownership point for 26452 is identified"
+
+echo
+echo "=== GATE 3F: SNAPSHOT TEMPORARY CANDIDATE BEFORE HISTORICAL REPLAY ==="
+
+find "$CANDIDATE_APP" \
+    -type f \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > "$SAFETY_DIR/26452_candidate_before_replay_sha256.txt"
+
+[[ -s "$SAFETY_DIR/26452_candidate_before_replay_sha256.txt" ]] \
+    || fail "Candidate pre-replay hash manifest missing"
+
+git diff "$BASE_26428_COMMIT" -- app \
+    > "$SAFETY_DIR/26452_real_app_before_replay.patch"
+
+[[ ! -s "$SAFETY_DIR/26452_real_app_before_replay.patch" ]] \
+    || fail "Real app/ changed during Gate 3"
+
+echo
+echo "======================================================================"
+echo "GATE 3 TEMPORARY CANDIDATE FOUNDATION PASSED"
+echo "CFA-TO-CFA PRODUCER CONFIRMED"
+echo "DIRECT-RGB FINAL OWNERSHIP POINT CONFIRMED"
+echo "REAL APPLICATION SOURCE STILL UNMODIFIED"
+echo "NO VERSION INCREMENT"
+echo "NO 26452 BUILD YET"
+echo "======================================================================"
