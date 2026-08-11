@@ -593,6 +593,25 @@ git clone --no-hardlinks . "$REPLAY_REPO" \
         > "$REPLAY_LOGS/branch.log" 2>&1 \
         || fail "Could not create historical replay branch"
 
+# Historical build scripts insist on fetching their original branch from
+# "origin". Keep those safety checks intact, but make origin completely local
+# to this disposable replay clone so no real branch can be fetched or changed.
+git remote set-url origin "$REPLAY_REPO" \
+    || fail "Could not isolate historical replay origin"
+
+git fetch origin experimental-clean-photon-rebuild \
+    > "$REPLAY_LOGS/self_origin_fetch.log" 2>&1 \
+    || fail "Could not initialize isolated historical origin"
+
+REMOTE_REPLAY_HEAD="$(
+    git rev-parse refs/remotes/origin/experimental-clean-photon-rebuild
+)"
+
+[[ "$REMOTE_REPLAY_HEAD" == "$BASE_26428_COMMIT" ]] \
+    || fail "Isolated replay origin does not point to canonical 26428"
+
+echo "PASS: historical origin isolated inside throwaway replay clone"
+
     [[ "$(git rev-parse HEAD)" == "$BASE_26428_COMMIT" ]] \
         || fail "Replay clone is not canonical 26428"
 
