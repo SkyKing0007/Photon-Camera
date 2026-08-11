@@ -1880,8 +1880,25 @@ grep -q 'targetFraction=1.0' "$G5M_HDRX" || fail "26436 all-frame target missing
 grep -q 'globalGyroDiscard=false' "$G5M_HDRX" || fail "26436 local-not-global rejection missing"
 if grep -q 'perFrameCap' "$G5M_DACC"; then fail "26436 hard per-frame cap returned"; fi
 if grep -q 'referenceCeiling' "$G5M_DACC"; then fail "26436 hard support ceiling returned"; fi
-grep -q '^VERSION_NAME=0\.9726436$' "$G5M_VERSION" || fail "26436 candidate version name wrong"
-grep -q '^VERSION_BUILD=26436$' "$G5M_VERSION" || fail "26436 candidate build wrong"
+G5M_VERSION_NORMALIZED="$G5M_DIR/26436_version_normalized.txt"
+tr -d '\r' < "$G5M_VERSION" > "$G5M_VERSION_NORMALIZED"
+
+grep -qx 'VERSION_NAME=0.9726436' "$G5M_VERSION_NORMALIZED" \
+    || {
+        echo "Historical 26436 version.properties after CRLF normalization:"
+        cat "$G5M_VERSION_NORMALIZED" || true
+        fail "26436 candidate version name wrong after CRLF normalization"
+    }
+
+grep -qx 'VERSION_BUILD=26436' "$G5M_VERSION_NORMALIZED" \
+    || {
+        echo "Historical 26436 version.properties after CRLF normalization:"
+        cat "$G5M_VERSION_NORMALIZED" || true
+        fail "26436 candidate build wrong after CRLF normalization"
+    }
+
+echo "PASS: historical 26436 semantic version = 0.9726436 / 26436"
+echo "PASS: CRLF accepted semantically; exact bytes remain protected by Gate 5M-I SHA-256"
 
 echo
 echo "=== GATE 5M-I: VERIFY 26437 EXPECTED HASH CONTRACT ==="
