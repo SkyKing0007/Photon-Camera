@@ -1701,9 +1701,6 @@ grep -q '=== GATE 3: REAL GLSL VALIDATION ===' "$G5M_SOURCE" \
 echo "PASS: exact historical 26436 candidate construction source identified"
 
 echo
-echo "=== GATE 5M-B: PROVE INPUT IS EXACT GREEN 26435 REPLAY ==="
-
-echo
 echo "=== GATE 5M-B: CREATE FRESH EXACT 26435 INPUT REPO ==="
 
 G5M_REPO="$G5M_DIR/repo_26435_exact"
@@ -1722,9 +1719,9 @@ git -C "$G5M_REPO" checkout --detach "$BASE_26428_COMMIT" \
     >/dev/null 2>&1 \
     || fail "Gate 5M could not reset isolated repo to canonical 26428"
 
-git -C "$G5M_REPO" switch -c experimental-clean-photon-rebuild \
+git -C "$G5M_REPO" checkout -B experimental-clean-photon-rebuild "$BASE_26428_COMMIT" \
     >/dev/null 2>&1 \
-    || fail "Gate 5M could not create historical replay branch"
+    || fail "Gate 5M could not reset isolated historical replay branch to canonical 26428"
 
 git -C "$G5M_REPO" apply --binary "$G5M_26435_PATCH" \
     || fail "Gate 5M could not apply exact saved 26429->26435 replay patch"
@@ -1767,9 +1764,31 @@ fi
 git -C "$G5M_REPO" diff --check \
     || fail "Fresh reconstructed 26435 tree failed git diff --check"
 
-echo "PASS: fresh 26435 repo reconstructed from pre-Gate-5 saved patch"
-echo "PASS: no 26452 CFA-carrier changes exist in Gate 5M input"
+G5M_26435_HASHES="$G5M_DIR/fresh_26435_app_sha256.txt"
 
+(
+    cd "$G5M_REPO"
+
+    find app \
+        -type f \
+        ! -path 'app/build/*' \
+        -print0 \
+        | sort -z \
+        | xargs -0 sha256sum \
+        > "$G5M_26435_HASHES"
+)
+
+[[ -s "$G5M_26435_HASHES" ]] \
+    || fail "Fresh Gate 5M 26435 hash manifest missing"
+
+cmp -s \
+    "$REPLAY_ROOT/26435_replayed_app_sha256.txt" \
+    "$G5M_26435_HASHES" \
+    || fail "Fresh Gate 5M repo is not byte-identical to saved Gate 4 26435 app state"
+
+echo "PASS: fresh 26435 repo reconstructed from pre-Gate-5 saved patch"
+echo "PASS: fresh 26435 app is byte-identical to saved Gate 4 replay state"
+echo "PASS: no 26452 CFA-carrier changes exist in Gate 5M input"
 echo "PASS: exact reconstructed 26435 input proven"
 
 echo
@@ -1778,7 +1797,7 @@ echo "=== GATE 5M-C: CREATE CANDIDATE-ONLY HISTORICAL 26436 SCRIPT ==="
 python3 - \
     "$G5M_SOURCE" \
     "$G5M_SCRIPT" \
-    "$REPLAY_REPO" \
+    "$G5M_REPO" \
     "$G5M_OUT" <<'PY'
 from pathlib import Path
 import sys
@@ -1861,9 +1880,6 @@ echo "PASS: candidate-only 26436 replay script generated"
 echo
 echo "=== GATE 5M-D: POWERSHELL PARSER / PLATFORM PROOF ==="
 
-echo
-echo "=== GATE 5M-D: POWERSHELL PARSER / PLATFORM PROOF ==="
-
 command -v pwsh >/dev/null 2>&1 \
     || fail "pwsh is unavailable on GitHub runner; 26436 replay not attempted"
 
@@ -1919,12 +1935,10 @@ unset G5M_SCRIPT_FOR_PWSH
 
 echo "PASS: candidate-only 26436 PowerShell parses on runner"
 
-echo "PASS: candidate-only 26436 PowerShell parses on runner"
-
 echo
-echo "=== GATE 5M-E: SNAPSHOT REPLAY APP BEFORE 26436 CANDIDATE CONSTRUCTION ==="
+echo "=== GATE 5M-E: SNAPSHOT FRESH 26435 APP BEFORE 26436 CANDIDATE CONSTRUCTION ==="
 
-find "$REPLAY_REPO/app" \
+find "$G5M_REPO/app" \
     -type f \
     ! -path '*/build/*' \
     -print0 \
@@ -1941,7 +1955,7 @@ echo
 echo "=== GATE 5M-F: EXECUTE EXACT HISTORICAL 26436 CANDIDATE GENERATOR ==="
 
 (
-    cd "$REPLAY_REPO"
+    cd "$G5M_REPO"
 
     pwsh -NoLogo -NoProfile -File "$G5M_SCRIPT"
 ) > "$G5M_LOG" 2>&1 \
@@ -2153,9 +2167,9 @@ find "$G5M_EXPORT" \
 echo "PASS: exact 26436 candidate snapshot saved"
 
 echo
-echo "=== GATE 5M-K: PROVE DISPOSABLE REPLAY SOURCE WAS NOT APPLIED ==="
+echo "=== GATE 5M-K: PROVE FRESH 26435 SOURCE WAS NOT APPLIED ==="
 
-find "$REPLAY_REPO/app" \
+find "$G5M_REPO/app" \
     -type f \
     ! -path '*/build/*' \
     -print0 \
@@ -2168,7 +2182,7 @@ cmp -s \
     "$G5M_DIR/replay_app_after_26436_candidate.sha256" \
     || fail "Historical 26436 candidate generator unexpectedly modified replay app/"
 
-echo "PASS: even disposable replay app remained unchanged by Gate 5M"
+echo "PASS: fresh isolated 26435 app remained unchanged by Gate 5M"
 
 echo
 echo "=== GATE 5M-L: REAL APPLICATION MUST STILL BE UNTOUCHED ==="
