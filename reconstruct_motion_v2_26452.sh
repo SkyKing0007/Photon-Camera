@@ -1940,3 +1940,885 @@ echo "REAL app/ UNMODIFIED"
 echo "NO VERSION CHANGE IN REAL app/"
 echo "NO FINAL 26452 APK YET"
 echo "======================================================================"
+
+echo
+echo "======================================================================"
+echo "GATE 6: REAL 0.9726452 / 26452 CANDIDATE CONSTRUCTION + BUILD"
+echo "======================================================================"
+
+G6_STAMP="$(date +%Y%m%d_%H%M%S)_$$"
+G6_ROOT="$(pwd)/motion_v2_26452_real_$G6_STAMP"
+G6_REPO="$G6_ROOT/late_history_repo"
+G6_LOGS="$G6_ROOT/logs"
+G6_PS="$G6_ROOT/powershell"
+G6_SAFETY="$(pwd)/motion_v2_26452_real_safety_$G6_STAMP"
+G6_EXPORT="$(pwd)/motion-v2-build-output"
+
+mkdir -p "$G6_ROOT" "$G6_LOGS" "$G6_PS" "$G6_SAFETY" "$G6_EXPORT"
+
+echo
+echo "=== GATE 6A: CREATE EXACT 26436 LATE-HISTORY MIGRATION BASE ==="
+
+rm -rf "$G6_REPO"
+git clone --no-hardlinks . "$G6_REPO" > "$G6_LOGS/clone.log" 2>&1 \
+    || fail "Gate 6 could not create isolated late-history repo"
+
+git -C "$G6_REPO" checkout --detach "$BASE_26428_COMMIT" >/dev/null 2>&1 \
+    || fail "Gate 6 could not checkout canonical 26428"
+
+git -C "$G6_REPO" checkout -B experimental-clean-photon-rebuild "$BASE_26428_COMMIT" >/dev/null 2>&1 \
+    || fail "Gate 6 could not reset isolated historical branch"
+
+[[ -d "$G5M_26436_APP" ]] \
+    || fail "Gate 6 exact Gate 5M 26436 candidate is unavailable"
+
+find "$G6_REPO/app" -mindepth 1 -maxdepth 1 -exec rm -rf {} + \
+    || fail "Gate 6 could not clear throwaway app tree"
+
+cp -a "$G5M_26436_APP/." "$G6_REPO/app/" \
+    || fail "Gate 6 could not install exact 26436 candidate"
+
+G6_ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+printf 'sdk.dir=%s\n' "$G6_ANDROID_SDK" > "$G6_REPO/local.properties"
+
+G6_VERSION_NORMALIZED="$G6_ROOT/version_26436.txt"
+tr -d '\r' < "$G6_REPO/app/version.properties" > "$G6_VERSION_NORMALIZED"
+grep -qx 'VERSION_NAME=0.9726436' "$G6_VERSION_NORMALIZED" \
+    || fail "Gate 6 late-history base is not version 0.9726436"
+grep -qx 'VERSION_BUILD=26436' "$G6_VERSION_NORMALIZED" \
+    || fail "Gate 6 late-history base is not build 26436"
+
+g6_hash_check() {
+    local rel="$1"
+    local expected="$2"
+    local label="$3"
+    local actual
+    actual="$(sha_upper "$G6_REPO/$rel")"
+    [[ "$actual" == "$expected" ]] || {
+        echo "File: $rel"
+        echo "Expected: $expected"
+        echo "Actual: $actual"
+        fail "Gate 6 exact 26436 base mismatch: $label"
+    }
+    echo "PASS: $label"
+}
+
+g6_hash_check 'app/src/main/assets/shaders/motionv2/direct_rgb_init.glsl' \
+    '7BABF08973ABD74AF81BBC7E3D543443C1ECE745AED6C43A036690CD44CB3B8A' \
+    '26436 direct_rgb_init'
+g6_hash_check 'app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl' \
+    'E5ECB4966AF49DDAF656EF2A7B94A17FF62E8FAC110D0B80A8500965D5A40C47' \
+    '26436 direct_rgb_accumulate'
+g6_hash_check 'app/src/main/assets/shaders/motionv2/color_transform.glsl' \
+    '642DDD94D9374C9792A652561AE82C67ADD73D1FB810551A9CC157FD15AAADF1' \
+    '26436 color_transform'
+g6_hash_check 'app/src/main/assets/shaders/motionv2/denoise.glsl' \
+    '420BAB6F8D917BF8A37D5B6F5864080A1179C04AB90FBD51C0474E45898C3A1C' \
+    '26436 denoise shader'
+g6_hash_check \
+    'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Denoise.java' \
+    'C451D4D98BAEA223638CDA2CA116400881440A153720A358BF1C00D1AC381C20' \
+    '26436 MotionV2Denoise.java'
+g6_hash_check 'app/src/main/assets/shaders/motionv2/render.glsl' \
+    'FEBC6CCD70249EE036EEAD47C266DA4A3D7133209555CBCC1A584B1E3A066D7D' \
+    '26436 render shader'
+
+echo "PASS: exact 26436 late-history migration base installed"
+
+echo
+echo "=== GATE 6B: MATERIALIZE LATE HISTORICAL POWERSHELL SOURCES ==="
+
+cp "$HIST_DIR/build_26437_windows_whitepoint_motion_detail_stable_uhdr.ps1" "$G6_PS/26437.source.ps1"
+cp "$HIST_DIR/build_26438_windows_REVISED_v2_audited_motion_microcontrast_standard_ultrahdr.ps1" "$G6_PS/26438.source.ps1"
+cp "$REPLAY_DECODED/26439.ps1" "$G6_PS/26439.source.ps1"
+cp "$REPLAY_DECODED/26443.ps1" "$G6_PS/26443.source.ps1"
+cp "$REPLAY_DECODED/26445.ps1" "$G6_PS/26445.source.ps1"
+cp "$REPLAY_DECODED/26446.ps1" "$G6_PS/26446.source.ps1"
+
+for f in "$G6_PS/26437.source.ps1" "$G6_PS/26438.source.ps1" \
+         "$G6_PS/26439.source.ps1" "$G6_PS/26443.source.ps1" \
+         "$G6_PS/26445.source.ps1" "$G6_PS/26446.source.ps1"
+do
+    [[ -s "$f" ]] || fail "Gate 6 historical PowerShell source missing: $f"
+done
+
+echo "PASS: late historical PowerShell sources materialized"
+
+prepare_g6_candidate_script() {
+    local source="$1"
+    local output="$2"
+    local current_version="$3"
+    local current_build="$4"
+    local target_version="$5"
+    local target_build="$6"
+    local selective="$7"
+
+    python3 - "$source" "$output" "$G6_REPO" \
+        "$current_version" "$current_build" "$target_version" "$target_build" "$selective" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+repo = sys.argv[3]
+cur_v = sys.argv[4]
+cur_b = sys.argv[5]
+target_v = sys.argv[6]
+target_b = sys.argv[7]
+selective = sys.argv[8] == "1"
+
+text = src.read_text(encoding="utf-8-sig")
+text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+repo_assign = re.compile(r'(?m)^\$Repo\s*=\s*"[^"\n]*Photon-Camera-clean-rebuild"\s*$')
+matches = list(repo_assign.finditer(text))
+if len(matches) != 1:
+    raise SystemExit(f"FAIL: historical Repo assignment count={len(matches)}")
+text = repo_assign.sub('$Repo = "' + repo.replace("\\", "\\\\") + '"', text, count=1)
+
+text = text.replace('"git.exe"', '"git"').replace("'git.exe'", "'git'")
+
+version_tokens = sorted({
+    m.group(1) for m in re.finditer(r'VERSION_NAME=(0\.9726\d+)', text)
+    if m.group(1) != target_v
+})
+build_tokens = sorted({
+    int(m.group(1)) for m in re.finditer(r'VERSION_BUILD=(264\d+)', text)
+    if m.group(1) != target_b
+})
+
+if selective:
+    old_v = version_tokens[-1] if version_tokens else None
+    old_b = str(build_tokens[-1]) if build_tokens else None
+
+    if old_v and old_v != cur_v:
+        text = text.replace(f"VERSION_NAME={old_v}", f"VERSION_NAME={cur_v}")
+        text = re.sub(
+            r'(?m)^(\$OldVersion\s*=\s*")[^"]+(")\s*$',
+            lambda m: m.group(1) + cur_v + m.group(2),
+            text
+        )
+
+    if old_b and old_b != cur_b:
+        text = text.replace(f"VERSION_BUILD={old_b}", f"VERSION_BUILD={cur_b}")
+        text = re.sub(
+            r'(?m)^(\$OldBuild\s*=\s*")[^"]+(")\s*$',
+            lambda m: m.group(1) + cur_b + m.group(2),
+            text
+        )
+
+    h0 = re.search(r'(?m)^Write-Host\s+"===\s*GATE\s+0[^"]*"\s*$', text)
+    h1 = re.search(r'(?m)^Write-Host\s+"===\s*GATE\s+1[^"]*"\s*$', text)
+    if not h0 or not h1 or h1.start() <= h0.end():
+        raise SystemExit("FAIL: selective migration could not isolate Gate 0/Gate 1")
+
+    proof = (
+        'Write-Host "=== GATE 0: SELECTIVE PRESERVED-HISTORY INPUT PROOF ==="\n'
+        '$Branch = (& git branch --show-current).Trim()\n'
+        '$Head = (& git rev-parse HEAD).Trim()\n'
+        'if ($Branch -ne "experimental-clean-photon-rebuild") { Fail ("wrong branch: " + $Branch) }\n'
+        'if ($Head -ne "aac8ea5a0f518142b0f8ad60ce34c9a165e4611b") { Fail ("wrong HEAD: " + $Head) }\n'
+        '$SelectiveVersion = [IO.File]::ReadAllText((Join-Path $Repo "app\\version.properties"))\n'
+        f'if ($SelectiveVersion -notmatch "(?m)^VERSION_NAME={re.escape(cur_v)}`r?$" -or '
+        f'$SelectiveVersion -notmatch "(?m)^VERSION_BUILD={re.escape(cur_b)}`r?$") '
+        '{ Fail "selective migration input version mismatch" }\n'
+        f'Write-Host "PASS: selective preserved-history input = {cur_v} / {cur_b}"\n'
+    )
+    text = text[:h0.start()] + proof + "\n" + text[h1.start():]
+
+headings = list(re.finditer(r'(?m)^Write-Host\s+"===\s*GATE\s+[^"]*"\s*$', text))
+cut = None
+for m in headings:
+    title = m.group(0).upper()
+    if any(k in title for k in ("GLSL", "APPLY", "JAVAC", " APK BUILD", " BUILD ")):
+        prefix = text[:m.start()].upper()
+        if "CANDIDATE" in prefix or "TEMPORARY" in prefix:
+            cut = m.start()
+            break
+
+if cut is None:
+    raise SystemExit("FAIL: no safe post-candidate truncation gate found")
+
+text = text[:cut]
+text += (
+    '\nWrite-Host ""\n'
+    f'Write-Host "PASS: GATE6 candidate-only historical transform {target_b}"\n'
+    'Write-Host "NO HISTORICAL SOURCE APPLY / JAVAC / APK BUILD EXECUTED"\n'
+)
+dst.write_text(text, encoding="utf-8")
+PY
+
+    [[ -s "$output" ]] || fail "Prepared Gate 6 PowerShell script is empty"
+    pwsh -NoLogo -NoProfile -File "$G5M_PARSER" "$output" \
+        || fail "Prepared Gate 6 PowerShell does not parse: $target_build"
+}
+
+apply_g6_historical_candidate() {
+    local build="$1"
+    local current_version="$2"
+    local current_build="$3"
+    local target_version="$4"
+    local source="$5"
+    local selective="$6"
+
+    local prepared="$G6_PS/$build.candidate_only.ps1"
+    local log="$G6_LOGS/$build.candidate.log"
+
+    rm -rf "$G6_REPO/fresh_iris_outputs"
+
+    prepare_g6_candidate_script "$source" "$prepared" "$current_version" \
+        "$current_build" "$target_version" "$build" "$selective"
+
+    (
+        cd "$G6_REPO"
+        pwsh -NoLogo -NoProfile -File "$prepared"
+    ) > "$log" 2>&1 || {
+        tail -n 220 "$log" || true
+        fail "Gate 6 historical candidate transform failed: $build"
+    }
+
+    grep -q "PASS: GATE6 candidate-only historical transform $build" "$log" \
+        || fail "Gate 6 candidate completion banner missing: $build"
+
+    local candidate_version
+    candidate_version="$(
+        find "$G6_REPO/fresh_iris_outputs" -type f \
+            -path '*/candidate*/app/version.properties' -print \
+        | while read -r vf; do
+            if tr -d '\r' < "$vf" | grep -qx "VERSION_BUILD=$build"; then
+                printf '%s\n' "$vf"
+            fi
+          done | tail -n 1
+    )"
+
+    [[ -n "$candidate_version" && -f "$candidate_version" ]] \
+        || fail "Gate 6 could not locate $build candidate app"
+
+    local candidate_app
+    candidate_app="$(dirname "$candidate_version")"
+
+    (
+        cd "$candidate_app"
+        find . -type f -print0
+    ) | while IFS= read -r -d '' rel; do
+        rel="${rel#./}"
+        mkdir -p "$G6_REPO/app/$(dirname "$rel")"
+        cp -p "$candidate_app/$rel" "$G6_REPO/app/$rel"
+    done
+
+    local normalized="$G6_ROOT/version_$build.txt"
+    tr -d '\r' < "$G6_REPO/app/version.properties" > "$normalized"
+    grep -qx "VERSION_NAME=$target_version" "$normalized" \
+        || fail "Gate 6 overlay $build has wrong VERSION_NAME"
+    grep -qx "VERSION_BUILD=$build" "$normalized" \
+        || fail "Gate 6 overlay $build has wrong VERSION_BUILD"
+
+    grep -R -q "IRIS_${build}_" "$G6_REPO/app/src/main" \
+        || fail "Gate 6 overlay $build lacks its historical IRIS marker"
+
+    git -C "$G6_REPO" diff --check \
+        || fail "Gate 6 overlay $build failed git diff --check"
+
+    echo "PASS: historical $build candidate overlaid"
+}
+
+echo
+echo "=== GATE 6C: REPLAY PRESERVED LATE IMAGE HISTORY THROUGH 26446 ==="
+
+apply_g6_historical_candidate 26437 0.9726436 26436 0.9726437 "$G6_PS/26437.source.ps1" 0
+apply_g6_historical_candidate 26438 0.9726437 26437 0.9726438 "$G6_PS/26438.source.ps1" 0
+apply_g6_historical_candidate 26439 0.9726438 26438 0.9726439 "$G6_PS/26439.source.ps1" 0
+
+# 26440-26442 were diagnostic GPU-readback experiments and are excluded.
+apply_g6_historical_candidate 26443 0.9726439 26439 0.9726443 "$G6_PS/26443.source.ps1" 1
+apply_g6_historical_candidate 26445 0.9726443 26443 0.9726445 "$G6_PS/26445.source.ps1" 1
+apply_g6_historical_candidate 26446 0.9726445 26445 0.9726446 "$G6_PS/26446.source.ps1" 1
+
+echo
+echo "=== GATE 6D: VERIFY 26446 SUPPORT OWNERSHIP BEFORE 26452 ==="
+
+G6_RECON="$G6_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java"
+G6_INPUT="$G6_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java"
+G6_POST="$G6_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java"
+G6_DEMOSAIC="$G6_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaDemosaic.java"
+G6_LOCAL="$G6_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2LocalSupportDenoise.java"
+G6_FINALIZER="$G6_REPO/app/src/main/assets/shaders/motionv2/direct_rgb_finalize_frame_support.glsl"
+G6_VERSION="$G6_REPO/app/version.properties"
+
+for f in "$G6_RECON" "$G6_INPUT" "$G6_POST" "$G6_DEMOSAIC" \
+         "$G6_LOCAL" "$G6_FINALIZER" "$G6_VERSION"
+do
+    [[ -s "$f" ]] || fail "Gate 6 expected 26446 file missing: $f"
+done
+
+grep -q 'IRIS_26446_TRUE_FRAME_SUPPORT_TEXTURES' "$G6_RECON" \
+    || fail "26446 true frame-support producer missing"
+grep -q 'IRIS_26446_LOCAL_FRAME_SUPPORT_CARRIER' "$G6_RECON" \
+    || fail "26446 direct-RGB-alpha support carrier missing"
+grep -q 'IRIS_26446_TRUE_LOCAL_SUPPORT_DENOISE' "$G6_LOCAL" \
+    || fail "26446 local-support consumer missing"
+grep -q 'supportSource=directRgbAlpha' "$G6_LOCAL" \
+    || fail "26446 local-support consumer does not prove direct-RGB-alpha dependency"
+grep -q 'add(new MotionV2LocalSupportDenoise());' "$G6_POST" \
+    || fail "26446 local-support node inactive before 26452"
+
+echo "PASS: 26446 support producer/carrier/consumer dependency proven"
+
+echo
+echo "=== GATE 6D1: APPLY EXACT 26450 REFERENCE-DNG-ONLY MIGRATION ==="
+
+G6_HDRX="$G6_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java"
+G6_DNG_OLD="$G5L_DIR/26450_DNG_INSERT_OLD.txt"
+G6_DNG_NEW="$G5L_DIR/26450_DNG_INSERT_NEW.txt"
+
+for f in "$G6_HDRX" "$G6_DNG_OLD" "$G6_DNG_NEW"; do
+    [[ -s "$f" ]] || fail "Gate 6 DNG migration prerequisite missing: $f"
+done
+
+python3 - "$G6_HDRX" "$G6_DNG_OLD" "$G6_DNG_NEW" <<'PY'
+from pathlib import Path
+import sys
+
+hdrx = Path(sys.argv[1])
+old_file = Path(sys.argv[2])
+new_file = Path(sys.argv[3])
+
+text = hdrx.read_text()
+old = old_file.read_text().rstrip("\n")
+new = new_file.read_text().rstrip("\n")
+
+count = text.count(old)
+if count != 1:
+    raise SystemExit(
+        "FAIL: exact 26450 reference-DNG insertion anchor count="
+        + str(count)
+        + " on late-history Hdrx"
+    )
+
+if "IRIS_26450_MOTION_V2_REFERENCE_DNG" in text:
+    raise SystemExit("FAIL: 26450 reference-DNG marker already present before migration")
+
+text = text.replace(old, new, 1)
+
+ref = text.find("MOTION_REFERENCE_AFTER_RETENTION")
+dng = text.find("IRIS_26450_MOTION_V2_REFERENCE_DNG")
+recon = text.find("MotionV2CfaReconstruction.reconstruct(")
+
+if ref < 0:
+    raise SystemExit("FAIL: reference-retention marker missing after DNG migration")
+if dng < 0:
+    raise SystemExit("FAIL: reference-DNG marker missing after migration")
+if recon < 0:
+    raise SystemExit("FAIL: MotionV2 reconstruction call missing after DNG migration")
+if not (ref < dng < recon):
+    raise SystemExit(
+        "FAIL: required Hdrx order is not reference-retention -> reference-DNG -> reconstruction"
+    )
+
+for required in (
+    "source=timestampOwnedReferenceBayer",
+    "multiframeNr=false",
+    "bakedRgb=false",
+    "images.get(0).buffer.duplicate()",
+):
+    if required not in text:
+        raise SystemExit("FAIL: migrated reference-DNG contract missing " + required)
+
+hdrx.write_text(text)
+
+print("PASS: exact 26450 reference-DNG-only migration applied once")
+print("PASS: timestamp-owned reference Bayer DNG precedes V2 reconstruction")
+print("PASS: no direct-RGB finalizer dependency introduced")
+PY
+
+grep -q 'IRIS_26450_MOTION_V2_REFERENCE_DNG' "$G6_HDRX"     || fail "26450 reference-DNG marker missing after exact migration"
+grep -q 'source=timestampOwnedReferenceBayer' "$G6_HDRX"     || fail "26450 timestamp-owned reference-DNG source marker missing"
+
+if grep -q 'direct_rgb_finalize_alias_safe' "$G6_RECON"; then
+    fail "Rejected 26450 alias-aware direct-RGB finalizer entered Gate 6"
+fi
+
+echo "PASS: exact 26450 reference DNG preserved independently"
+echo "PASS: rejected 26450 direct-RGB finalizer remains absent"
+
+echo
+echo "=== GATE 6E: APPLY 26452 CFA OWNERSHIP TO TEMPORARY TREE ==="
+
+python3 - "$G6_RECON" "$G6_INPUT" "$G6_POST" "$G6_VERSION" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+recon = Path(sys.argv[1])
+cfa_input = Path(sys.argv[2])
+post = Path(sys.argv[3])
+version = Path(sys.argv[4])
+
+s = recon.read_text()
+marker = "IRIS_26446_LOCAL_FRAME_SUPPORT_CARRIER"
+if s.count(marker) != 1:
+    raise SystemExit(f"FAIL: 26446 support-carrier marker count={s.count(marker)}")
+mi = s.index(marker)
+start = s.rfind("            /*", 0, mi)
+needle = "            imageOutput.BufferLoad();"
+end0 = s.find(needle, mi)
+if start < 0 or end0 < 0:
+    raise SystemExit("FAIL: could not isolate 26446 final carrier block")
+end = end0 + len(needle)
+
+replacement = """            /*
+             * IRIS_26452_MULTIFRAME_CFA_FINAL_OWNER
+             *
+             * Final temporal ownership remains in multiframe CFA currentMerged.
+             * 26446 frame support lived in direct-RGB alpha; it is not copied
+             * into CFA alpha and cannot own the final image.
+             */
+            GLTexture imageOutput = currentMerged;
+            imageOutput.BufferLoad();"""
+s = s[:start] + replacement + s[end:]
+
+if "motionv2/direct_rgb_finalize_frame_support" in s:
+    raise SystemExit("FAIL: direct-RGB support finalizer still called")
+
+s = s.replace(
+    '+ " directMultiframeRgb=" + directBayer',
+    '+ " directMultiframeRgbComputed=" + directBayer'
+    '+ " directMultiframeRgbFinalOwner=false"'
+)
+s = s.replace(
+    '+ " separateDemosaic=" + (!directBayer)',
+    '+ " separateDemosaic=true"'
+)
+
+old_size = """+ " size=" + (directBayer
+                            ? raw.x + "x" + raw.y
+                            : rawHalf.x + "x" + rawHalf.y)"""
+if old_size in s:
+    s = s.replace(old_size, '+ " size=" + rawHalf.x + "x" + rawHalf.y', 1)
+
+recon.write_text(s)
+
+s = cfa_input.read_text()
+old = """        boolean directBayer =
+                basePipeline.mParameters.cfaPattern >= 0
+                        && basePipeline.mParameters.cfaPattern <= 3;
+        if (directBayer) {
+            WorkingTexture = new GLTexture(
+                    raw,
+                    new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                    view,
+                    GL_LINEAR,
+                    GL_CLAMP_TO_EDGE);
+        } else {
+            WorkingTexture = new GLTexture(
+                    half,
+                    new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                    view,
+                    GL_NEAREST,
+                    GL_CLAMP_TO_EDGE);
+        }"""
+new = """        /*
+         * IRIS_26452_MULTIFRAME_CFA_INPUT_OWNER
+         *
+         * Standard Bayer crosses as packed multiframe CFA and remains nearest
+         * sampled until the one Motion V2-owned demosaic.
+         */
+        WorkingTexture = new GLTexture(
+                half,
+                new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                view,
+                GL_NEAREST,
+                GL_CLAMP_TO_EDGE);"""
+if s.count(old) != 1:
+    raise SystemExit(f"FAIL: MotionV2CfaInput branch count={s.count(old)}")
+s = s.replace(old, new, 1)
+s = s.replace(
+    '(directBayer ? "directRgbFullRes" : "packedCfaHalfRes")',
+    '"packedMultiframeCfaHalfRes"'
+)
+s = s.replace(
+    '+ " directMultiframeRgb=" + directBayer',
+    '+ " directMultiframeRgbFinalOwner=false"'
+)
+cfa_input.write_text(s)
+
+s = post.read_text()
+old_branch = """            if (directBayer) {
+                /*
+                 * IRIS_26424_DIRECT_MULTIFRAME_RGB_POST_GRAPH
+                 * Standard Bayer image formation already produced full-
+                 * resolution linear camera RGB. No separate demosaic runs.
+                 */
+                add(new StageTelemetry("V2_POST_DIRECT_MULTIFRAME_RGB"));
+            } else {"""
+new_branch = """            if (directBayer) {
+                /*
+                 * IRIS_26452_MULTIFRAME_CFA_SINGLE_DEMOSAIC
+                 *
+                 * Standard Bayer arrives as aligned multiframe packed CFA.
+                 * Exactly one Motion V2 demosaic converts it to camera RGB.
+                 */
+                add(new StageTelemetry("V2_POST_MULTIFRAME_CFA"));
+                add(new MotionV2CfaDemosaic());
+                add(new StageTelemetry("V2_POST_SINGLE_CFA_DEMOSAIC"));
+            } else {"""
+if s.count(old_branch) != 1:
+    raise SystemExit(f"FAIL: PostPipeline direct-Bayer branch count={s.count(old_branch)}")
+s = s.replace(old_branch, new_branch, 1)
+
+support_marker = "IRIS_26446_LOCAL_SUPPORT_CONSUMER_ORDER"
+if s.count(support_marker) != 1:
+    raise SystemExit(f"FAIL: 26446 local-support marker count={s.count(support_marker)}")
+mi = s.index(support_marker)
+support_start = s.rfind("            /*", 0, mi)
+color_add = '            add(new MotionV2ColorTransform());'
+support_end = s.find(color_add, mi)
+if support_start < 0 or support_end < 0:
+    raise SystemExit("FAIL: could not isolate 26446 local-support consumer block")
+
+replacement_support = """            /*
+             * IRIS_26452_LOCAL_SUPPORT_DEFERRED_SEPARATE_CFA_SUPPORT_REQUIRED
+             *
+             * 26446 MotionV2LocalSupportDenoise consumed direct-RGB alpha.
+             * CFA ownership has no such alpha contract. Do not invent support=1
+             * and do not reinterpret CFA channels as support.
+             */
+"""
+s = s[:support_start] + replacement_support + s[support_end:]
+if 'add(new MotionV2LocalSupportDenoise());' in s:
+    raise SystemExit("FAIL: direct-RGB-alpha local-support consumer remains active")
+
+s = s.replace(
+    '"nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,TrueLocalSupportDenoise,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"',
+    '"nodes=MotionV2CfaInput,MultiframeCFA,SingleMotionV2CfaDemosaic,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"'
+)
+s = s.replace(
+    '+ " directMultiframeRgb=" + directBayer',
+    '+ " directMultiframeRgbFinalOwner=false"'
+    '+ " standardBayerSingleDemosaic=" + directBayer'
+)
+post.write_text(s)
+
+v = version.read_text().replace("\r\n", "\n").replace("\r", "\n")
+v, n1 = re.subn(r'(?m)^VERSION_NAME=.*$', 'VERSION_NAME=0.9726452', v, count=1)
+v, n2 = re.subn(r'(?m)^VERSION_BUILD=.*$', 'VERSION_BUILD=26452', v, count=1)
+if n1 != 1 or n2 != 1:
+    raise SystemExit(f"FAIL: version replacement counts name={n1} build={n2}")
+version.write_text(v)
+
+print("candidate/source validation PASS")
+print("Temporary-copy validation: PASS")
+PY
+
+echo
+echo "=== GATE 6F: TEMPORARY PRODUCER / CARRIER / CONSUMER PROOF ==="
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_FINAL_OWNER' "$G6_RECON" \
+    || fail "26452 CFA final-owner marker missing"
+grep -q 'GLTexture imageOutput = currentMerged;' "$G6_RECON" \
+    || fail "26452 currentMerged final owner missing"
+grep -q 'currentSupport' "$G6_RECON" \
+    || fail "26452 separate CFA support producer disappeared"
+if grep -q 'motionv2/direct_rgb_finalize_frame_support' "$G6_RECON"; then
+    fail "26446 direct-RGB-alpha finalizer still called"
+fi
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_INPUT_OWNER' "$G6_INPUT" \
+    || fail "26452 packed-CFA bridge marker missing"
+grep -q 'GL_NEAREST' "$G6_INPUT" \
+    || fail "26452 packed CFA bridge lost nearest sampling"
+grep -q 'IRIS_26452_MULTIFRAME_CFA_SINGLE_DEMOSAIC' "$G6_POST" \
+    || fail "26452 single-demosaic route missing"
+grep -q 'IRIS_26452_LOCAL_SUPPORT_DEFERRED_SEPARATE_CFA_SUPPORT_REQUIRED' "$G6_POST" \
+    || fail "26452 local-support deferral marker missing"
+if grep -q 'add(new MotionV2LocalSupportDenoise());' "$G6_POST"; then
+    fail "direct-RGB-alpha local-support consumer still active"
+fi
+grep -q 'add(new MotionV2ColorTransform());' "$G6_POST" \
+    || fail "MotionV2ColorTransform disappeared"
+grep -q 'add(new MotionV2Denoise());' "$G6_POST" \
+    || fail "MotionV2Denoise disappeared"
+grep -q 'add(new MotionV2Render());' "$G6_POST" \
+    || fail "MotionV2Render disappeared"
+
+grep -q 'IRIS_26450_MOTION_V2_REFERENCE_DNG' "$G6_HDRX" \
+    || fail "26450 reference DNG disappeared from temporary 26452 tree"
+python3 - "$G6_HDRX" <<'PY'
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+r = text.find("MOTION_REFERENCE_AFTER_RETENTION")
+d = text.find("IRIS_26450_MOTION_V2_REFERENCE_DNG")
+m = text.find("MotionV2CfaReconstruction.reconstruct(")
+if min(r, d, m) < 0 or not (r < d < m):
+    raise SystemExit(
+        "FAIL: temporary 26452 Hdrx order is not "
+        "reference-retention -> reference-DNG -> reconstruction"
+    )
+print("PASS: temporary 26452 reference-DNG semantic order")
+PY
+
+tr -d '\r' < "$G6_VERSION" > "$G6_ROOT/version_26452.txt"
+grep -qx 'VERSION_NAME=0.9726452' "$G6_ROOT/version_26452.txt" \
+    || fail "Temporary candidate version name is not 0.9726452"
+grep -qx 'VERSION_BUILD=26452' "$G6_ROOT/version_26452.txt" \
+    || fail "Temporary candidate build is not 26452"
+
+git -C "$G6_REPO" diff --check \
+    || fail "Temporary 26452 candidate failed git diff --check"
+
+echo "PASS: producer = currentMerged multiframe CFA"
+echo "PASS: support remains separate; no fake CFA alpha support"
+echo "PASS: bridge = packed CFA / GL_NEAREST"
+echo "PASS: standard Bayer consumer = one MotionV2CfaDemosaic"
+echo "PASS: residual MotionV2Denoise / render retained"
+
+echo
+echo "=== GATE 6G: REAL JAVAC PROOF ON TEMPORARY 26452 TREE ==="
+
+G6_JAVAC_LOG="$G6_LOGS/26452_candidate_javac.txt"
+(
+    cd "$G6_REPO"
+    chmod +x ./gradlew
+    ./gradlew :app:compileDebugJavaWithJavac --stacktrace
+) > "$G6_JAVAC_LOG" 2>&1 || {
+    tail -n 220 "$G6_JAVAC_LOG" || true
+    fail "Temporary 26452 candidate Javac proof failed"
+}
+
+grep -q 'BUILD SUCCESSFUL' "$G6_JAVAC_LOG" \
+    || fail "Temporary 26452 Javac log lacks BUILD SUCCESSFUL"
+
+echo "candidate/source validation PASS"
+echo "Temporary-copy validation: PASS"
+echo "PASS: real Javac accepted temporary 26452 tree"
+
+echo
+echo "=== GATE 6H: FRESH REAL BACKUP / PATCH / PROTECTED HASHES ==="
+
+REAL_BEFORE_DIFF="$(git diff "$BASE_26428_COMMIT" -- app || true)"
+[[ -z "$REAL_BEFORE_DIFF" ]] || {
+    echo "$REAL_BEFORE_DIFF"
+    fail "Real app/ is not canonical 26428 before real 26452 apply"
+}
+
+REAL_UNTRACKED_APP="$(git ls-files --others --exclude-standard app || true)"
+[[ -z "$REAL_UNTRACKED_APP" ]] || {
+    echo "$REAL_UNTRACKED_APP"
+    fail "Untracked files exist inside real app/ before 26452 apply"
+}
+
+G6_BACKUP_BRANCH="backup/pre-real-26452-cfa-$G6_STAMP"
+git branch "$G6_BACKUP_BRANCH" HEAD \
+    || fail "Could not create fresh real 26452 backup branch"
+
+G6_PRE_PATCH="$G6_SAFETY/26452_pre_edit_binary.patch"
+git diff --binary HEAD -- app > "$G6_PRE_PATCH" \
+    || fail "Could not create real pre-edit binary patch"
+
+G6_INTENTIONAL="$G6_SAFETY/26452_intentional_app_paths.txt"
+{
+    git -C "$G6_REPO" diff --name-only "$BASE_26428_COMMIT" -- app
+    git -C "$G6_REPO" ls-files --others --exclude-standard app
+} | sort -u > "$G6_INTENTIONAL"
+
+[[ -s "$G6_INTENTIONAL" ]] || fail "26452 intentional path list is empty"
+
+G6_PROTECTED_BEFORE="$G6_SAFETY/26452_protected_before.sha256"
+while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    if grep -Fxq "$rel" "$G6_INTENTIONAL"; then continue; fi
+    [[ -f "$rel" ]] || continue
+    printf '%s  %s\n' "$(sha_upper "$rel")" "$rel"
+done < <(git ls-files app) | sort > "$G6_PROTECTED_BEFORE"
+
+[[ -s "$G6_PROTECTED_BEFORE" ]] || fail "Protected pre-edit hash manifest is empty"
+
+git -C "$G6_REPO" diff --binary "$BASE_26428_COMMIT" -- app \
+    > "$G6_SAFETY/26452_validated_candidate.patch"
+
+echo "PASS: fresh backup branch = $G6_BACKUP_BRANCH"
+echo "PASS: binary pre-edit patch created"
+echo "PASS: protected source hashes captured"
+
+echo
+echo "=== GATE 6I: APPLY EXACT VALIDATED CANDIDATE DIFF TO REAL app/ ==="
+
+while IFS=$'\t' read -r status rel rest; do
+    [[ -n "${status:-}" && -n "${rel:-}" ]] || continue
+    case "$status" in
+        M|A)
+            mkdir -p "$(dirname "$rel")"
+            cp -p "$G6_REPO/$rel" "$rel"
+            ;;
+        D)
+            rm -f "$rel"
+            ;;
+        R*|C*)
+            fail "Unexpected rename/copy status: $status $rel $rest"
+            ;;
+        *)
+            fail "Unexpected tracked diff status: $status $rel"
+            ;;
+    esac
+done < <(git -C "$G6_REPO" diff --name-status "$BASE_26428_COMMIT" -- app)
+
+while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    mkdir -p "$(dirname "$rel")"
+    cp -p "$G6_REPO/$rel" "$rel"
+done < <(git -C "$G6_REPO" ls-files --others --exclude-standard app)
+
+echo "PASS: exact temporary candidate applied to real app/"
+
+echo
+echo "=== GATE 6J: PROTECTED HASH + PRE-BUILD SAFETY PROOF ==="
+
+G6_PROTECTED_AFTER="$G6_SAFETY/26452_protected_after.sha256"
+while IFS= read -r rel; do
+    [[ -n "$rel" ]] || continue
+    if grep -Fxq "$rel" "$G6_INTENTIONAL"; then continue; fi
+    [[ -f "$rel" ]] || continue
+    printf '%s  %s\n' "$(sha_upper "$rel")" "$rel"
+done < <(git ls-files app) | sort > "$G6_PROTECTED_AFTER"
+
+cmp -s "$G6_PROTECTED_BEFORE" "$G6_PROTECTED_AFTER" || {
+    diff -u "$G6_PROTECTED_BEFORE" "$G6_PROTECTED_AFTER" | head -n 160 || true
+    fail "Protected application source changed during real 26452 apply"
+}
+
+REAL_RECON="app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java"
+REAL_INPUT="app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java"
+REAL_POST="app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java"
+REAL_HDRX="app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java"
+REAL_VERSION="app/version.properties"
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_FINAL_OWNER' "$REAL_RECON" \
+    || fail "Real 26452 currentMerged ownership marker missing"
+grep -q 'GLTexture imageOutput = currentMerged;' "$REAL_RECON" \
+    || fail "Real 26452 currentMerged final owner missing"
+grep -q 'currentSupport' "$REAL_RECON" \
+    || fail "Real 26452 separate support producer missing"
+if grep -q 'motionv2/direct_rgb_finalize_frame_support' "$REAL_RECON"; then
+    fail "Real path still calls direct-RGB support finalizer"
+fi
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_INPUT_OWNER' "$REAL_INPUT" \
+    || fail "Real packed-CFA bridge marker missing"
+grep -q 'IRIS_26452_MULTIFRAME_CFA_SINGLE_DEMOSAIC' "$REAL_POST" \
+    || fail "Real single-demosaic route missing"
+grep -q 'IRIS_26452_LOCAL_SUPPORT_DEFERRED_SEPARATE_CFA_SUPPORT_REQUIRED' "$REAL_POST" \
+    || fail "Real local-support deferral marker missing"
+if grep -q 'add(new MotionV2LocalSupportDenoise());' "$REAL_POST"; then
+    fail "Real direct-RGB-alpha local-support consumer still active"
+fi
+
+grep -q 'IRIS_26450_MOTION_V2_REFERENCE_DNG' "$REAL_HDRX"     || fail "Real 26452 lost timestamp-owned reference DNG"
+grep -q 'source=timestampOwnedReferenceBayer' "$REAL_HDRX"     || fail "Real 26452 reference DNG lost timestamp-owned source contract"
+
+python3 - "$REAL_HDRX" <<'PY'
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+r = text.find("MOTION_REFERENCE_AFTER_RETENTION")
+d = text.find("IRIS_26450_MOTION_V2_REFERENCE_DNG")
+m = text.find("MotionV2CfaReconstruction.reconstruct(")
+if min(r, d, m) < 0 or not (r < d < m):
+    raise SystemExit(
+        "FAIL: real 26452 Hdrx order is not "
+        "reference-retention -> reference-DNG -> reconstruction"
+    )
+print("PASS: real 26452 timestamp-owned reference-DNG order")
+PY
+
+tr -d '\r' < "$REAL_VERSION" > "$G6_ROOT/real_version_26452.txt"
+grep -qx 'VERSION_NAME=0.9726452' "$G6_ROOT/real_version_26452.txt" \
+    || fail "Real VERSION_NAME is not 0.9726452"
+grep -qx 'VERSION_BUILD=26452' "$G6_ROOT/real_version_26452.txt" \
+    || fail "Real VERSION_BUILD is not 26452"
+
+git diff --check -- app || fail "Real 26452 app diff failed git diff --check"
+
+echo "candidate/source validation PASS"
+echo "Temporary-copy validation: PASS"
+echo "PRE-BUILD SAFETY PROOF PASSED"
+echo "PASS: currentMerged CFA -> packed CFA -> one V2 demosaic"
+echo "PASS: direct temporal RGB final ownership = FALSE"
+echo "PASS: fake local support = FALSE"
+echo "PASS: 26450 timestamp-owned reference DNG preserved"
+echo "PASS: version/build = 0.9726452 / 26452"
+
+echo
+echo "=== GATE 6K: BUILD REAL 0.9726452 / 26452 APK ==="
+
+G6_BUILD_LOG="$G6_SAFETY/26452_real_build.txt"
+chmod +x ./gradlew
+./gradlew :app:assembleDebug --stacktrace > "$G6_BUILD_LOG" 2>&1 || {
+    tail -n 240 "$G6_BUILD_LOG" || true
+    fail "Real 26452 Gradle build failed"
+}
+grep -q 'BUILD SUCCESSFUL' "$G6_BUILD_LOG" || {
+    tail -n 240 "$G6_BUILD_LOG" || true
+    fail "Real 26452 build log lacks literal BUILD SUCCESSFUL"
+}
+
+G6_BUILT_APK="$(
+    find app/build/outputs/apk/debug -type f -name '*.apk' \
+        -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-
+)"
+[[ -n "$G6_BUILT_APK" && -f "$G6_BUILT_APK" ]] \
+    || fail "Real 26452 build succeeded but no APK was found"
+
+G6_APK_OUT="$(pwd)/IrisCamera-0.9726452-26452-multiframe-cfa-single-demosaic-debug.apk"
+cp -p "$G6_BUILT_APK" "$G6_APK_OUT" || fail "Could not copy final 26452 APK"
+G6_APK_SHA="$(sha_upper "$G6_APK_OUT")"
+
+G6_RESULT="$G6_SAFETY/26452_RESULT.txt"
+{
+    echo "Motion V2 26452 REAL BUILD RESULT"
+    echo "================================"
+    echo "branch=$(git branch --show-current)"
+    echo "head=$(git rev-parse HEAD)"
+    echo "backup_branch=$G6_BACKUP_BRANCH"
+    echo "version=0.9726452"
+    echo "build=26452"
+    echo "apk=$G6_APK_OUT"
+    echo "apk_sha256=$G6_APK_SHA"
+    echo
+    echo "Architecture:"
+    echo "  final temporal owner = currentMerged multiframe CFA"
+    echo "  bridge = packed CFA / GL_NEAREST"
+    echo "  standard Bayer demosaic = one MotionV2CfaDemosaic"
+    echo "  direct temporal RGB final owner = false"
+    echo "  26446 direct-RGB-alpha local-support consumer = inactive"
+    echo "  fake CFA alpha support = false"
+    echo "  MotionV2Denoise / MotionV2Render = retained"
+    echo
+    echo "26450 reference DNG = preserved; timestamp-owned single Bayer RAW before V2 reconstruction"
+    echo "BUILD SUCCESSFUL"
+} > "$G6_RESULT"
+
+cp -p "$G6_PRE_PATCH" "$G6_EXPORT/"
+cp -p "$G6_SAFETY/26452_validated_candidate.patch" "$G6_EXPORT/"
+cp -p "$G6_INTENTIONAL" "$G6_EXPORT/"
+cp -p "$G6_PROTECTED_BEFORE" "$G6_EXPORT/"
+cp -p "$G6_PROTECTED_AFTER" "$G6_EXPORT/"
+cp -p "$G6_BUILD_LOG" "$G6_EXPORT/"
+cp -p "$G6_RESULT" "$G6_EXPORT/"
+cp -p "$G6_APK_OUT" "$G6_EXPORT/"
+
+echo
+echo "======================================================================"
+echo "REAL MOTION V2 26452 BUILD SUCCESS"
+echo "VERSION / BUILD: 0.9726452 / 26452"
+echo "CURRENTMERGED MULTIFRAME CFA OWNS FINAL TEMPORAL IMAGE"
+echo "STANDARD BAYER DEMOSAIC COUNT: ONE"
+echo "DIRECT TEMPORAL RGB FINAL OWNERSHIP: FALSE"
+echo "26446 DIRECT-RGB-ALPHA LOCAL SUPPORT CONSUMER: INACTIVE"
+echo "26450 TIMESTAMP-OWNED REFERENCE DNG: PRESERVED"
+echo "PRE-BUILD SAFETY PROOF PASSED"
+echo "BUILD SUCCESSFUL"
+echo "APK: $G6_APK_OUT"
+echo "APK SHA256: $G6_APK_SHA"
+echo "======================================================================"
