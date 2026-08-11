@@ -558,3 +558,250 @@ echo "REAL APPLICATION SOURCE STILL UNMODIFIED"
 echo "NO VERSION INCREMENT"
 echo "NO 26452 BUILD YET"
 echo "======================================================================"
+
+echo
+echo "=== GATE 4: ISOLATED HISTORICAL REPLAY 26429 -> 26435 ==="
+
+REPLAY_STAMP="$(date +%Y%m%d_%H%M%S)_$$"
+REPLAY_ROOT="$SAFETY_DIR/replay_26429_26435_$REPLAY_STAMP"
+REPLAY_REPO="$REPLAY_ROOT/repo"
+REPLAY_AUX="$REPLAY_ROOT/aux"
+REPLAY_PATCHED="$REPLAY_ROOT/patched_scripts"
+REPLAY_LOGS="$REPLAY_ROOT/logs"
+
+mkdir -p \
+    "$REPLAY_ROOT" \
+    "$REPLAY_AUX" \
+    "$REPLAY_PATCHED" \
+    "$REPLAY_LOGS"
+
+echo
+echo "=== GATE 4A: CREATE THROWAWAY REPLAY REPOSITORY ==="
+
+git clone --no-hardlinks . "$REPLAY_REPO" \
+    > "$REPLAY_LOGS/clone.log" 2>&1 \
+    || fail "Could not create isolated replay clone"
+
+(
+    cd "$REPLAY_REPO"
+
+    git checkout --detach "$BASE_26428_COMMIT" \
+        > "$REPLAY_LOGS/checkout.log" 2>&1 \
+        || fail "Could not checkout canonical 26428 in replay clone"
+
+    git switch -c experimental-clean-photon-rebuild \
+        > "$REPLAY_LOGS/branch.log" 2>&1 \
+        || fail "Could not create historical replay branch"
+
+    [[ "$(git rev-parse HEAD)" == "$BASE_26428_COMMIT" ]] \
+        || fail "Replay clone is not canonical 26428"
+
+    grep -q '^VERSION_NAME=0\.9726428$' app/version.properties \
+        || fail "Replay clone version is not 0.9726428"
+
+    grep -q '^VERSION_BUILD=26428$' app/version.properties \
+        || fail "Replay clone build is not 26428"
+)
+
+echo "PASS: isolated canonical 26428 replay repository created"
+
+echo
+echo "=== GATE 4B: INSTALL/VERIFY GLSL VALIDATOR ==="
+
+if ! command -v glslangValidator >/dev/null 2>&1; then
+    sudo apt-get update -qq \
+        > "$REPLAY_LOGS/apt_update.log" 2>&1 \
+        || fail "apt update failed while preparing GLSL validator"
+
+    sudo apt-get install -y glslang-tools \
+        > "$REPLAY_LOGS/apt_glslang.log" 2>&1 \
+        || fail "glslang-tools installation failed"
+fi
+
+command -v glslangValidator >/dev/null 2>&1 \
+    || fail "glslangValidator unavailable"
+
+echo "PASS: real glslangValidator available"
+
+echo
+echo "=== GATE 4C: INSTALL NON-BUILDING GRADLE REPLAY SHIM ==="
+
+mv "$REPLAY_REPO/gradlew" \
+   "$REPLAY_REPO/gradlew.real"
+
+cat > "$REPLAY_REPO/gradlew" <<'GRADLE_SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p app/build/outputs/apk/debug
+
+printf 'historical-replay-placeholder\n' \
+    > app/build/outputs/apk/debug/app-debug.apk
+
+printf 'historical-replay-placeholder\n' \
+    > app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
+
+echo "Historical replay Gradle shim"
+echo "No APK is being accepted from this isolated replay."
+echo "BUILD SUCCESSFUL in 0s"
+GRADLE_SHIM
+
+chmod +x "$REPLAY_REPO/gradlew"
+
+echo "PASS: historical scripts cannot perform a real intermediate APK build"
+
+echo
+echo "=== GATE 4D: PATCH ONLY HISTORICAL ENVIRONMENT PATHS ==="
+
+REPLAY_SCRIPTS=(
+    "build_26429_codespace_shared_guide_reference_structure.sh"
+    "build_26430_codespace_v2_ownership_headroom_cleanup.sh"
+    "build_26431_codespace_allframes_body_lens_ownership_v2.sh"
+    "build_26432_codespace_stack_robust_true_ultrahdr_final.sh"
+    "resume_26433_fix_ultrahdr_javac_type_and_build.sh"
+    "build_26434_codespace_stable_base_smooth_motion_ultrahdr_v2.sh"
+    "build_26435_codespace_exact26430_sdr_lowfreq_ultrahdr_v2.sh"
+)
+
+for SCRIPT_NAME in "${REPLAY_SCRIPTS[@]}"; do
+    SOURCE_SCRIPT="$HIST_DIR/$SCRIPT_NAME"
+    PATCHED_SCRIPT="$REPLAY_PATCHED/$SCRIPT_NAME"
+
+    [[ -s "$SOURCE_SCRIPT" ]] \
+        || fail "Historical replay source missing: $SCRIPT_NAME"
+
+    python3 - \
+        "$SOURCE_SCRIPT" \
+        "$PATCHED_SCRIPT" \
+        "$REPLAY_REPO" \
+        "$REPLAY_AUX" <<'PY'
+from pathlib import Path
+import sys
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+repo = sys.argv[3]
+aux = sys.argv[4]
+
+text = src.read_text()
+
+# Environment relocation only.
+# Historical image-processing transforms remain byte-for-byte untouched.
+text = text.replace(
+    "/workspaces/Photon-Camera-fresh-iris",
+    repo
+)
+text = text.replace(
+    "/workspaces/Photon-Camera",
+    aux
+)
+
+dst.write_text(text)
+PY
+
+    chmod +x "$PATCHED_SCRIPT"
+
+    [[ -s "$PATCHED_SCRIPT" ]] \
+        || fail "Patched replay script is empty: $SCRIPT_NAME"
+
+    echo "PASS: environment-relocated $SCRIPT_NAME"
+done
+
+echo
+echo "=== GATE 4E: REPLAY 26429 -> 26435 IN ORDER ==="
+
+for SCRIPT_NAME in "${REPLAY_SCRIPTS[@]}"; do
+    echo
+    echo "--- REPLAY: $SCRIPT_NAME ---"
+
+    (
+        cd "$REPLAY_REPO"
+
+        bash "$REPLAY_PATCHED/$SCRIPT_NAME"
+    ) > "$REPLAY_LOGS/$SCRIPT_NAME.log" 2>&1 \
+      || {
+          echo "Historical replay failed: $SCRIPT_NAME"
+          tail -n 120 "$REPLAY_LOGS/$SCRIPT_NAME.log" || true
+          fail "Isolated historical replay stopped safely"
+      }
+
+    echo "PASS: $SCRIPT_NAME"
+done
+
+echo
+echo "=== GATE 4F: VERIFY 26435 REPLAY STATE ==="
+
+grep -q '^VERSION_NAME=0\.9726435$' \
+    "$REPLAY_REPO/app/version.properties" \
+    || fail "Historical replay did not reach version 0.9726435"
+
+grep -q '^VERSION_BUILD=26435$' \
+    "$REPLAY_REPO/app/version.properties" \
+    || fail "Historical replay did not reach build 26435"
+
+grep -q 'IRIS_26429_SHARED_GUIDE_ROBUSTNESS_REFERENCE_STRUCTURE' \
+    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" \
+    || fail "26429 shared-guide reconstruction state missing"
+
+grep -q 'IRIS_26431_MOTION_V2_ALL_FRAME_HANDOFF' \
+    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java" \
+    || fail "26431 all-retained-frame handoff missing"
+
+grep -q 'targetFraction=1.0' \
+    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java" \
+    || fail "26431 all-frame target missing"
+
+grep -q 'globalGyroDiscard=false' \
+    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java" \
+    || fail "26431 local rather than global frame rejection missing"
+
+grep -q 'IRIS_26435_' \
+    "$REPLAY_REPO/app/src/main/assets/shaders/motionv2/render.glsl" \
+    || fail "26435 render/headroom state missing"
+
+echo "PASS: 26429 -> 26435 historical image-processing state reconstructed"
+
+echo
+echo "=== GATE 4G: SAVE REPLAY PATCH + HASH PROOF ==="
+
+(
+    cd "$REPLAY_REPO"
+
+    git diff --binary "$BASE_26428_COMMIT" -- app \
+        > "../26429_to_26435_replay.patch"
+
+    find app \
+        -type f \
+        ! -path 'app/build/*' \
+        -print0 \
+        | sort -z \
+        | xargs -0 sha256sum \
+        > "../26435_replayed_app_sha256.txt"
+)
+
+[[ -s "$REPLAY_ROOT/26429_to_26435_replay.patch" ]] \
+    || fail "26429->26435 replay patch is empty"
+
+[[ -s "$REPLAY_ROOT/26435_replayed_app_sha256.txt" ]] \
+    || fail "26435 replay hash manifest missing"
+
+echo
+echo "=== GATE 4H: REAL APPLICATION MUST STILL BE UNTOUCHED ==="
+
+REAL_APP_DIFF="$(git diff "$BASE_26428_COMMIT" -- app || true)"
+
+if [[ -n "$REAL_APP_DIFF" ]]; then
+    echo "$REAL_APP_DIFF"
+    fail "Real app/ changed during isolated historical replay"
+fi
+
+echo "PASS: real app/ remains byte-identical to canonical 26428"
+
+echo
+echo "======================================================================"
+echo "GATE 4 ISOLATED HISTORICAL REPLAY 26429 -> 26435 PASSED"
+echo "HISTORICAL TRANSFORMS RAN ONLY INSIDE THROWAWAY REPLAY REPOSITORY"
+echo "REAL app/ UNMODIFIED"
+echo "NO REAL INTERMEDIATE APK BUILDS"
+echo "NO VERSION CHANGE IN REAL app/"
+echo "======================================================================"
