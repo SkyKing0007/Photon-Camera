@@ -882,6 +882,44 @@ echo "=== GATE 4G: SAVE REPLAY PATCH + HASH PROOF ==="
     || fail "26435 replay hash manifest missing"
 
 echo
+echo "=== GATE 4G1: SAVE COMPLETE SOURCE-ONLY 26435 APP SNAPSHOT ==="
+
+REPLAY_26435_SNAPSHOT="$REPLAY_ROOT/26435_replayed_app_snapshot"
+mkdir -p "$REPLAY_26435_SNAPSHOT"
+
+(
+    cd "$REPLAY_REPO"
+
+    tar \
+        --exclude='app/build' \
+        -cf - app
+) | (
+    cd "$REPLAY_26435_SNAPSHOT"
+    tar -xf -
+) || fail "Could not save complete source-only 26435 app snapshot"
+
+[[ -d "$REPLAY_26435_SNAPSHOT/app" ]] \
+    || fail "Complete 26435 app snapshot missing"
+
+find "$REPLAY_26435_SNAPSHOT/app" \
+    -type f \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    | sed "s#  $REPLAY_26435_SNAPSHOT/##" \
+    > "$REPLAY_ROOT/26435_snapshot_app_sha256.txt"
+
+[[ -s "$REPLAY_ROOT/26435_snapshot_app_sha256.txt" ]] \
+    || fail "26435 snapshot hash manifest missing"
+
+cmp -s \
+    "$REPLAY_ROOT/26435_replayed_app_sha256.txt" \
+    "$REPLAY_ROOT/26435_snapshot_app_sha256.txt" \
+    || fail "Saved complete 26435 snapshot is not byte-identical to Gate 4 replay state"
+
+echo "PASS: complete source-only 26435 app snapshot saved and hash-verified"
+
+echo
 echo "=== GATE 4H: REAL APPLICATION MUST STILL BE UNTOUCHED ==="
 
 REAL_APP_DIFF="$(git diff "$BASE_26428_COMMIT" -- app || true)"
@@ -1704,10 +1742,10 @@ echo
 echo "=== GATE 5M-B: CREATE FRESH EXACT 26435 INPUT REPO ==="
 
 G5M_REPO="$G5M_DIR/repo_26435_exact"
-G5M_26435_PATCH="$REPLAY_ROOT/26429_to_26435_replay.patch"
+G5M_26435_SNAPSHOT="$REPLAY_ROOT/26435_replayed_app_snapshot/app"
 
-[[ -s "$G5M_26435_PATCH" ]] \
-    || fail "Gate 5M saved 26429->26435 replay patch missing"
+[[ -d "$G5M_26435_SNAPSHOT" ]] \
+    || fail "Gate 5M complete Gate 4 26435 app snapshot missing"
 
 rm -rf "$G5M_REPO"
 
@@ -1723,8 +1761,14 @@ git -C "$G5M_REPO" checkout -B experimental-clean-photon-rebuild "$BASE_26428_CO
     >/dev/null 2>&1 \
     || fail "Gate 5M could not reset isolated historical replay branch to canonical 26428"
 
-git -C "$G5M_REPO" apply --binary "$G5M_26435_PATCH" \
-    || fail "Gate 5M could not apply exact saved 26429->26435 replay patch"
+# This is a known disposable clone. Replace only its app/ tree with the exact,
+# already-hash-verified Gate 4 26435 source snapshot. This preserves new or
+# untracked historical source files that a plain git diff patch cannot carry.
+rm -rf "$G5M_REPO/app"
+mkdir -p "$G5M_REPO/app"
+
+cp -a "$G5M_26435_SNAPSHOT/." "$G5M_REPO/app/" \
+    || fail "Gate 5M could not restore exact Gate 4 26435 app snapshot"
 
 echo
 echo "=== GATE 5M-B1: PROVE FRESH INPUT IS EXACT RECONSTRUCTED 26435 ==="
@@ -1786,7 +1830,7 @@ cmp -s \
     "$G5M_26435_HASHES" \
     || fail "Fresh Gate 5M repo is not byte-identical to saved Gate 4 26435 app state"
 
-echo "PASS: fresh 26435 repo reconstructed from pre-Gate-5 saved patch"
+echo "PASS: fresh 26435 repo restored from complete Gate 4 source snapshot"
 echo "PASS: fresh 26435 app is byte-identical to saved Gate 4 replay state"
 echo "PASS: no 26452 CFA-carrier changes exist in Gate 5M input"
 echo "PASS: exact reconstructed 26435 input proven"
