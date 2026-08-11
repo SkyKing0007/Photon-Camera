@@ -1661,3 +1661,445 @@ echo "REAL app/ UNMODIFIED"
 echo "NO VERSION CHANGE"
 echo "NO FINAL APK YET"
 echo "======================================================================"
+
+echo
+echo "=== GATE 5M: EXACT ISOLATED 26436 CANDIDATE RECONSTRUCTION ==="
+
+G5M_DIR="$GATE5_SAFETY/exact_26436_reconstruction"
+G5M_OUT="$G5M_DIR/output"
+G5M_SCRIPT="$G5M_DIR/build_26436_candidate_only.ps1"
+G5M_LOG="$G5M_DIR/26436_candidate_replay.log"
+G5M_SOURCE="$HIST_DIR/build_26436_windows_integrated_motion_architecture.ps1"
+
+mkdir -p "$G5M_DIR" "$G5M_OUT"
+
+[[ -s "$G5M_SOURCE" ]] \
+    || fail "Gate 5M historical 26436 source script missing"
+
+echo
+echo "=== GATE 5M-A: PROVE 26436 HISTORICAL DEPENDENCY CONTRACT ==="
+
+for marker in \
+    'IRIS_26436_REFERENCE_SEEDED_TEMPORAL_CONSENSUS_INIT' \
+    'IRIS_26436_REFERENCE_SEEDED_TEMPORAL_CONSENSUS' \
+    'IRIS_26436_REFERENCE_RESIDUAL_SHARED_COLOR_MERGE' \
+    'IRIS_26436_REFERENCE_TIME_ORDERED_TEMPORAL_CONSENSUS' \
+    'IRIS_26436_REFERENCE_RIGID_LOCAL_ALIGNMENT' \
+    'IRIS_26436_BROAD_REGION_CHROMA_PROTECTED_GAINMAP' \
+    'IRIS_26436_MOTION_V2_CHROMA_SAFE_ULTRAHDR'
+do
+    grep -q "$marker" "$G5M_SOURCE" \
+        || fail "26436 historical marker missing: $marker"
+done
+
+grep -q 'candidate/source validation PASS' "$G5M_SOURCE" \
+    || fail "26436 historical candidate validation gate missing"
+
+grep -q '=== GATE 3: REAL GLSL VALIDATION ===' "$G5M_SOURCE" \
+    || fail "Could not identify safe candidate-only truncation point"
+
+echo "PASS: exact historical 26436 candidate construction source identified"
+
+echo
+echo "=== GATE 5M-B: PROVE INPUT IS EXACT GREEN 26435 REPLAY ==="
+
+grep -q '^VERSION_NAME=0\.9726435$' \
+    "$REPLAY_REPO/app/version.properties" \
+    || fail "Gate 5M replay input is not version 0.9726435"
+
+grep -q '^VERSION_BUILD=26435$' \
+    "$REPLAY_REPO/app/version.properties" \
+    || fail "Gate 5M replay input is not build 26435"
+
+grep -q 'IRIS_26429_SHARED_GUIDE_ROBUSTNESS_REFERENCE_STRUCTURE' \
+    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" \
+    || fail "Gate 5M input lost 26429 reconstruction foundation"
+
+grep -q 'IRIS_26431_MOTION_V2_ALL_FRAME_HANDOFF' \
+    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java" \
+    || fail "Gate 5M input lost 26431 all-frame handoff"
+
+grep -q 'IRIS_26435_' \
+    "$REPLAY_REPO/app/src/main/assets/shaders/motionv2/render.glsl" \
+    || fail "Gate 5M input lost 26435 render state"
+
+echo "PASS: exact reconstructed 26435 input proven"
+
+echo
+echo "=== GATE 5M-C: CREATE CANDIDATE-ONLY HISTORICAL 26436 SCRIPT ==="
+
+python3 - \
+    "$G5M_SOURCE" \
+    "$G5M_SCRIPT" \
+    "$REPLAY_REPO" \
+    "$G5M_OUT" <<'PY'
+from pathlib import Path
+import sys
+
+src = Path(sys.argv[1])
+dst = Path(sys.argv[2])
+repo = sys.argv[3]
+out = sys.argv[4]
+
+text = src.read_text(encoding="utf-8-sig")
+
+# Relocate ONLY the historical environment.
+# Do not alter any image-processing payload, Replace-Once anchor,
+# numerical constant, marker, or candidate transformation.
+old_repo = r'C:\Users\nhann\Documents\GitHub\Photon-Camera-clean-rebuild'
+if old_repo not in text:
+    raise SystemExit("FAIL: exact 26436 historical repo path anchor missing")
+
+text = text.replace(old_repo, repo, 1)
+
+old_out = '$Out = Join-Path $Repo "fresh_iris_outputs"'
+new_out = f'$Out = "{out}"'
+
+if text.count(old_out) != 1:
+    raise SystemExit(
+        "FAIL: expected exactly one 26436 historical output-root anchor; "
+        f"found {text.count(old_out)}"
+    )
+
+text = text.replace(old_out, new_out, 1)
+
+# We need the historical candidate generator and its own architecture checks,
+# but NOT its Windows-only GLSL validation, source apply, Javac, or APK build.
+cut = 'Write-Host "=== GATE 3: REAL GLSL VALIDATION ==="'
+pos = text.find(cut)
+
+if pos < 0:
+    raise SystemExit(
+        "FAIL: could not find exact 26436 candidate-only truncation point"
+    )
+
+candidate_only = text[:pos]
+
+candidate_only += r'''
+
+Write-Host ""
+Write-Host "=============================================================="
+Write-Host "GATE 5M HISTORICAL 26436 CANDIDATE-ONLY REPLAY PASSED"
+Write-Host "NO HISTORICAL SOURCE APPLY EXECUTED"
+Write-Host "NO HISTORICAL JAVAC EXECUTED"
+Write-Host "NO HISTORICAL APK BUILD EXECUTED"
+Write-Host "=============================================================="
+'''
+
+# Safety proof that none of the forbidden historical execution stages remain.
+for forbidden in (
+    '=== GATE 4: APPLY EXACT VALIDATED CANDIDATES ===',
+    '=== GATE 5: JAVAC PROOF ===',
+    '=== GATE 6: BUILD 0.9726436 / 26436 ===',
+    '.\\gradlew.bat :app:assembleDebug',
+):
+    if forbidden in candidate_only:
+        raise SystemExit(
+            "FAIL: candidate-only historical script still contains forbidden "
+            "execution stage: " + forbidden
+        )
+
+dst.write_text(candidate_only)
+
+print("PASS: exact 26436 transform logic preserved")
+print("PASS: environment paths relocated only")
+print("PASS: script truncated before historical source apply/build")
+PY
+
+[[ -s "$G5M_SCRIPT" ]] \
+    || fail "Gate 5M candidate-only PowerShell script was not created"
+
+echo "PASS: candidate-only 26436 replay script generated"
+
+echo
+echo "=== GATE 5M-D: POWERSHELL PARSER / PLATFORM PROOF ==="
+
+command -v pwsh >/dev/null 2>&1 \
+    || fail "pwsh is unavailable on GitHub runner; 26436 replay not attempted"
+
+pwsh -NoLogo -NoProfile -Command \
+    '$t=$null;$e=$null;[System.Management.Automation.Language.Parser]::ParseFile(
+        $args[0],[ref]$t,[ref]$e
+    ) | Out-Null;
+    if($e.Count -gt 0){
+        $e | ForEach-Object { Write-Host $_.Message };
+        exit 1
+    }' \
+    "$G5M_SCRIPT" \
+    || fail "Gate 5M candidate-only PowerShell parser validation failed"
+
+echo "PASS: candidate-only 26436 PowerShell parses on runner"
+
+echo
+echo "=== GATE 5M-E: SNAPSHOT REPLAY APP BEFORE 26436 CANDIDATE CONSTRUCTION ==="
+
+find "$REPLAY_REPO/app" \
+    -type f \
+    ! -path '*/build/*' \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > "$G5M_DIR/replay_app_before_26436_candidate.sha256"
+
+[[ -s "$G5M_DIR/replay_app_before_26436_candidate.sha256" ]] \
+    || fail "Gate 5M pre-candidate replay hash manifest missing"
+
+echo "PASS: replay app pre-state hashed"
+
+echo
+echo "=== GATE 5M-F: EXECUTE EXACT HISTORICAL 26436 CANDIDATE GENERATOR ==="
+
+(
+    cd "$REPLAY_REPO"
+
+    pwsh -NoLogo -NoProfile -File "$G5M_SCRIPT"
+) > "$G5M_LOG" 2>&1 \
+    || {
+        tail -n 180 "$G5M_LOG" || true
+        fail "Exact historical 26436 candidate reconstruction failed safely"
+    }
+
+grep -q 'candidate/source validation PASS' "$G5M_LOG" \
+    || {
+        tail -n 180 "$G5M_LOG" || true
+        fail "Historical 26436 candidate/source validation PASS missing"
+    }
+
+grep -q 'Temporary-copy validation: PASS' "$G5M_LOG" \
+    || {
+        tail -n 180 "$G5M_LOG" || true
+        fail "Historical 26436 temporary-copy validation PASS missing"
+    }
+
+grep -q 'GATE 5M HISTORICAL 26436 CANDIDATE-ONLY REPLAY PASSED' \
+    "$G5M_LOG" \
+    || fail "Gate 5M terminal candidate-only proof missing"
+
+echo "PASS: exact historical 26436 candidate generator completed"
+
+echo
+echo "=== GATE 5M-G: LOCATE HISTORICAL 26436 CANDIDATE ==="
+
+G5M_CANDIDATE="$(
+    find "$G5M_OUT" \
+        -type d \
+        -path '*/windows_26436_integrated_migration_*/candidate' \
+        -print \
+        | sort \
+        | tail -n 1
+)"
+
+[[ -n "$G5M_CANDIDATE" && -d "$G5M_CANDIDATE" ]] \
+    || {
+        find "$G5M_OUT" -maxdepth 4 -type d -print || true
+        fail "Historical 26436 candidate directory was not found"
+    }
+
+G5M_26436_APP="$G5M_CANDIDATE/app"
+
+[[ -d "$G5M_26436_APP" ]] \
+    || fail "Historical 26436 candidate app tree missing"
+
+echo "PASS: candidate = $G5M_26436_APP"
+
+echo
+echo "=== GATE 5M-H: VERIFY EXACT 26436 CANDIDATE ARCHITECTURE ==="
+
+G5M_RECON="$G5M_26436_APP/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java"
+G5M_ALIGNJ="$G5M_26436_APP/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Alignment.java"
+G5M_ALIGNF="$G5M_26436_APP/src/main/assets/shaders/motionv2/alignment_local_flow.glsl"
+G5M_DINIT="$G5M_26436_APP/src/main/assets/shaders/motionv2/direct_rgb_init.glsl"
+G5M_DACC="$G5M_26436_APP/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl"
+G5M_HDRX="$G5M_26436_APP/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java"
+G5M_POST="$G5M_26436_APP/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java"
+G5M_COLORG="$G5M_26436_APP/src/main/assets/shaders/motionv2/color_transform.glsl"
+G5M_DENOISEG="$G5M_26436_APP/src/main/assets/shaders/motionv2/denoise.glsl"
+G5M_RENDERG="$G5M_26436_APP/src/main/assets/shaders/motionv2/render.glsl"
+G5M_GAINMAP="$G5M_26436_APP/src/main/assets/shaders/motionv2/gainmap.glsl"
+G5M_UHDR="$G5M_26436_APP/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java"
+G5M_VERSION="$G5M_26436_APP/version.properties"
+
+for f in \
+    "$G5M_RECON" \
+    "$G5M_ALIGNJ" \
+    "$G5M_ALIGNF" \
+    "$G5M_DINIT" \
+    "$G5M_DACC" \
+    "$G5M_HDRX" \
+    "$G5M_POST" \
+    "$G5M_COLORG" \
+    "$G5M_DENOISEG" \
+    "$G5M_RENDERG" \
+    "$G5M_GAINMAP" \
+    "$G5M_UHDR" \
+    "$G5M_VERSION"
+do
+    [[ -s "$f" ]] || fail "Gate 5M expected candidate file missing: $f"
+done
+
+for pair in \
+    "$G5M_DINIT|IRIS_26436_REFERENCE_SEEDED_TEMPORAL_CONSENSUS_INIT" \
+    "$G5M_DACC|IRIS_26436_REFERENCE_SEEDED_TEMPORAL_CONSENSUS" \
+    "$G5M_DACC|IRIS_26436_REFERENCE_RESIDUAL_SHARED_COLOR_MERGE" \
+    "$G5M_RECON|IRIS_26436_REFERENCE_TIME_ORDERED_TEMPORAL_CONSENSUS" \
+    "$G5M_RECON|IRIS_26436_PERMANENT_SPATIAL_SUPPORT_TELEMETRY" \
+    "$G5M_ALIGNJ|IRIS_26436_PERMANENT_ALIGNMENT_TELEMETRY" \
+    "$G5M_ALIGNF|IRIS_26436_REFERENCE_RIGID_LOCAL_ALIGNMENT" \
+    "$G5M_HDRX|IRIS_26431_MOTION_V2_ALL_FRAME_HANDOFF" \
+    "$G5M_POST|IRIS_26432_TRUE_V2_ULTRAHDR_ATTACH" \
+    "$G5M_COLORG|IRIS_26430_SENSOR_CLIP_COLOR_SAFETY_ONLY" \
+    "$G5M_DENOISEG|IRIS_26430_LIGHT_SUPPORT_OWNED_RESIDUAL_CLEANUP" \
+    "$G5M_RENDERG|IRIS_26435_EXACT_26430_HEADROOM_BASE_MINUS_032EV" \
+    "$G5M_GAINMAP|IRIS_26436_BROAD_REGION_CHROMA_PROTECTED_GAINMAP" \
+    "$G5M_UHDR|IRIS_26436_MOTION_V2_CHROMA_SAFE_ULTRAHDR"
+do
+    file="${pair%%|*}"
+    marker="${pair#*|}"
+
+    grep -q "$marker" "$file" \
+        || fail "Gate 5M 26436 candidate missing marker: $marker"
+done
+
+grep -q 'targetFraction=1.0' "$G5M_HDRX" \
+    || fail "26436 candidate lost all-frame targetFraction=1.0"
+
+grep -q 'globalGyroDiscard=false' "$G5M_HDRX" \
+    || fail "26436 candidate lost local-not-global rejection policy"
+
+if grep -q 'perFrameCap' "$G5M_DACC"; then
+    fail "26436 candidate unexpectedly contains hard per-frame cap"
+fi
+
+if grep -q 'referenceCeiling' "$G5M_DACC"; then
+    fail "26436 candidate unexpectedly contains hard total-support ceiling"
+fi
+
+grep -q '^VERSION_NAME=0\.9726436$' "$G5M_VERSION" \
+    || fail "Historical candidate did not reach 0.9726436"
+
+grep -q '^VERSION_BUILD=26436$' "$G5M_VERSION" \
+    || fail "Historical candidate did not reach build 26436"
+
+echo "PASS: exact 26436 dependency architecture reconstructed"
+
+echo
+echo "=== GATE 5M-I: VERIFY 26437 EXPECTED HASH CONTRACT ==="
+
+check_hash() {
+    local file="$1"
+    local expected="$2"
+    local label="$3"
+
+    local actual
+    actual="$(sha_upper "$file")"
+
+    if [[ "$actual" != "$expected" ]]; then
+        echo "File:     $file"
+        echo "Expected: $expected"
+        echo "Actual:   $actual"
+        fail "Gate 5M 26436 -> 26437 hash contract mismatch: $label"
+    fi
+
+    echo "PASS: $label"
+}
+
+check_hash \
+    "$G5M_DINIT" \
+    "7BABF08973ABD74AF81BBC7E3D543443C1ECE745AED6C43A036690CD44CB3B8A" \
+    "26436 direct_rgb_init"
+
+check_hash \
+    "$G5M_DACC" \
+    "E5ECB4966AF49DDAF656EF2A7B94A17FF62E8FAC110D0B80A8500965D5A40C47" \
+    "26436 direct_rgb_accumulate"
+
+check_hash \
+    "$G5M_COLORG" \
+    "642DDD94D9374C9792A652561AE82C67ADD73D1FB810551A9CC157FD15AAADF1" \
+    "26436 color_transform"
+
+check_hash \
+    "$G5M_DENOISEG" \
+    "420BAB6F8D917BF8A37D5B6F5864080A1179C04AB90FBD51C0474E45898C3A1C" \
+    "26436 denoise shader"
+
+check_hash \
+    "$G5M_26436_APP/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Denoise.java" \
+    "C451D4D98BAEA223638CDA2CA116400881440A153720A358BF1C00D1AC381C20" \
+    "26436 MotionV2Denoise.java"
+
+check_hash \
+    "$G5M_RENDERG" \
+    "FEBC6CCD70249EE036EEAD47C266DA4A3D7133209555CBCC1A584B1E3A066D7D" \
+    "26436 render shader"
+
+check_hash \
+    "$G5M_VERSION" \
+    "245C2610BB7FD9741D467BF08D6F6AE89035C50077AC79A0EE94CCF75A589667" \
+    "26436 version.properties"
+
+echo "PASS: 26437 historical script would accept this exact 26436 state"
+
+echo
+echo "=== GATE 5M-J: SAVE 26436 SOURCE-ONLY SNAPSHOT + HASHES ==="
+
+G5M_EXPORT="$G5M_DIR/exact_26436_candidate_app"
+mkdir -p "$G5M_EXPORT"
+
+cp -a "$G5M_26436_APP/." "$G5M_EXPORT/" \
+    || fail "Could not export exact 26436 candidate app"
+
+find "$G5M_EXPORT" \
+    -type f \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > "$G5M_DIR/exact_26436_candidate_sha256.txt"
+
+[[ -s "$G5M_DIR/exact_26436_candidate_sha256.txt" ]] \
+    || fail "Gate 5M exact 26436 hash manifest missing"
+
+echo "PASS: exact 26436 candidate snapshot saved"
+
+echo
+echo "=== GATE 5M-K: PROVE DISPOSABLE REPLAY SOURCE WAS NOT APPLIED ==="
+
+find "$REPLAY_REPO/app" \
+    -type f \
+    ! -path '*/build/*' \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > "$G5M_DIR/replay_app_after_26436_candidate.sha256"
+
+cmp -s \
+    "$G5M_DIR/replay_app_before_26436_candidate.sha256" \
+    "$G5M_DIR/replay_app_after_26436_candidate.sha256" \
+    || fail "Historical 26436 candidate generator unexpectedly modified replay app/"
+
+echo "PASS: even disposable replay app remained unchanged by Gate 5M"
+
+echo
+echo "=== GATE 5M-L: REAL APPLICATION MUST STILL BE UNTOUCHED ==="
+
+REAL_APP_DIFF="$(git diff "$BASE_26428_COMMIT" -- app || true)"
+
+if [[ -n "$REAL_APP_DIFF" ]]; then
+    echo "$REAL_APP_DIFF"
+    fail "Real app/ changed during Gate 5M"
+fi
+
+echo "PASS: real app/ remains byte-identical to canonical 26428"
+
+echo
+echo "======================================================================"
+echo "GATE 5M EXACT ISOLATED 26436 RECONSTRUCTION PASSED"
+echo "EXACT HISTORICAL 26436 CANDIDATE TRANSFORMS EXECUTED"
+echo "26437 INPUT HASH CONTRACT PASSED"
+echo "26436 REFERENCE-RIGID / TEMPORAL-CONSENSUS FOUNDATION PROVEN"
+echo "26436 TRUE V2 ULTRA HDR FOUNDATION PROVEN"
+echo "DISPOSABLE REPLAY app/ UNMODIFIED"
+echo "REAL app/ UNMODIFIED"
+echo "NO VERSION CHANGE IN REAL app/"
+echo "NO FINAL 26452 APK YET"
+echo "======================================================================"
