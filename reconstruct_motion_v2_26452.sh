@@ -186,3 +186,134 @@ echo "  $PRE_EDIT_MANIFEST"
 echo
 echo "NO APPLICATION SOURCE MODIFIED"
 echo "======================================================================"
+
+echo
+echo "=== GATE 2: HISTORICAL REPLAY PROVENANCE ==="
+
+HIST_DIR="historical_replay"
+[[ -d "$HIST_DIR" ]] || fail "Missing historical_replay directory"
+
+REQUIRED_HISTORY=(
+    "build_26429_codespace_shared_guide_reference_structure.sh"
+    "build_26430_codespace_v2_ownership_headroom_cleanup.sh"
+    "build_26431_codespace_allframes_body_lens_ownership_v2.sh"
+    "build_26432_codespace_stack_robust_true_ultrahdr_final.sh"
+    "resume_26433_fix_ultrahdr_javac_type_and_build.sh"
+    "build_26434_codespace_stable_base_smooth_motion_ultrahdr_v2.sh"
+    "build_26435_codespace_exact26430_sdr_lowfreq_ultrahdr_v2.sh"
+    "build_26436_windows_integrated_motion_architecture.ps1"
+    "build_26437_windows_whitepoint_motion_detail_stable_uhdr.ps1"
+    "build_26438_windows_REVISED_v2_audited_motion_microcontrast_standard_ultrahdr.ps1"
+    "launch_resume_build_26439_after_gate8_v2_MINIMAL.ps1"
+    "launch_build_26443_reference_first_local_ownership.ps1"
+    "launch_build_26445_specular_channel_validity_v2.ps1"
+    "launch_build_26446_corrected_published_robustness_true_local_support.ps1"
+    "launch_build_26450_alias_aware_chroma_reference_dng_REVISED.ps1"
+)
+
+for HISTORY_FILE in "${REQUIRED_HISTORY[@]}"; do
+    FULL_HISTORY_PATH="$HIST_DIR/$HISTORY_FILE"
+
+    [[ -s "$FULL_HISTORY_PATH" ]] \
+        || fail "Missing or empty historical replay source: $HISTORY_FILE"
+
+    echo "PASS: $HISTORY_FILE"
+done
+
+HIST_FILE_COUNT="$(
+    find "$HIST_DIR" -maxdepth 1 -type f | wc -l | tr -d ' '
+)"
+
+if [[ "$HIST_FILE_COUNT" -ne 15 ]]; then
+    fail "Expected exactly 15 historical replay files; found $HIST_FILE_COUNT"
+fi
+
+echo
+echo "=== GATE 2A: REQUIRED ARCHITECTURE EVIDENCE ==="
+
+grep -q 'IRIS_26429' \
+    "$HIST_DIR/build_26429_codespace_shared_guide_reference_structure.sh" \
+    || fail "26429 reconstruction ownership evidence missing"
+
+grep -q 'targetFraction' \
+    "$HIST_DIR/build_26431_codespace_allframes_body_lens_ownership_v2.sh" \
+    || fail "26431 all-frame ownership evidence missing"
+
+grep -q 'globalGyroDiscard' \
+    "$HIST_DIR/build_26431_codespace_allframes_body_lens_ownership_v2.sh" \
+    || fail "26431 gyro-discard ownership evidence missing"
+
+grep -qi 'ultrahdr' \
+    "$HIST_DIR/build_26432_codespace_stack_robust_true_ultrahdr_final.sh" \
+    || fail "26432 Ultra HDR provenance missing"
+
+grep -qi 'reference' \
+    "$HIST_DIR/build_26436_windows_integrated_motion_architecture.ps1" \
+    || fail "26436 reference-ownership provenance missing"
+
+grep -qi 'whitepoint\|white.point' \
+    "$HIST_DIR/build_26437_windows_whitepoint_motion_detail_stable_uhdr.ps1" \
+    || fail "26437 white-point ownership provenance missing"
+
+grep -qi 'microcontrast' \
+    "$HIST_DIR/build_26438_windows_REVISED_v2_audited_motion_microcontrast_standard_ultrahdr.ps1" \
+    || fail "26438 revised provenance missing"
+
+grep -qi 'reference_first\|reference.first\|reference-first' \
+    "$HIST_DIR/launch_build_26443_reference_first_local_ownership.ps1" \
+    || fail "26443 reference-first provenance missing"
+
+grep -qi 'channel_validity\|channel.validity\|channel-validity' \
+    "$HIST_DIR/launch_build_26445_specular_channel_validity_v2.ps1" \
+    || fail "26445 channel-validity provenance missing"
+
+grep -qi 'local_support\|local.support\|local-support' \
+    "$HIST_DIR/launch_build_26446_corrected_published_robustness_true_local_support.ps1" \
+    || fail "26446 local-support provenance missing"
+
+grep -qi 'reference_dng\|reference.dng\|reference-dng' \
+    "$HIST_DIR/launch_build_26450_alias_aware_chroma_reference_dng_REVISED.ps1" \
+    || fail "26450 reference-DNG provenance missing"
+
+echo
+echo "PASS: required historical architecture evidence is present"
+
+echo
+echo "=== GATE 2B: EXPLICIT REPLAY POLICY ==="
+
+cat <<'EOF'
+PRESERVE:
+  26429 shared guide / physical-reference reconstruction foundation
+  26431 all-retained-frame eligibility and local contribution ownership
+  26432+ true Motion V2 Ultra HDR plumbing
+  26436 reference-rigid alignment / temporal consensus
+  26437 white-point-owned color behavior
+  26438 audited Motion microcontrast / standard UHDR behavior
+  26439 temporal ownership refinements
+  26443 reference-first moving/uncertain-content ownership
+  26445 channel/specular validity where compatible
+  26446 robustness/local-support semantics where domain-compatible
+  26450 timestamp-owned reference RAW DNG plumbing
+
+DO NOT PRESERVE AS FINAL IMAGE OWNER:
+  direct multiframe RGB temporal synthesis
+  26450 alias-aware direct-RGB finalizer
+  diagnostic 26440-26442 GPU readbacks
+  26447/26448 no-improvement direct-RGB experiments
+  untested 26449 highlight experiment
+
+26452 TARGET:
+  aligned retained RAW burst
+    -> reference-first local confidence
+    -> multiframe CFA-to-CFA currentMerged
+    -> one Motion V2 CFA demosaic
+    -> V2 color
+    -> V2 denoise/render
+    -> Ultra HDR
+EOF
+
+echo
+echo "======================================================================"
+echo "HISTORICAL REPLAY PROVENANCE PASSED"
+echo "NO APPLICATION SOURCE MODIFIED"
+echo "======================================================================"
