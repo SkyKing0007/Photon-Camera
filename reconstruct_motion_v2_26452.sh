@@ -653,8 +653,13 @@ git -C "$REPLAY_REPO" update-index --assume-unchanged gradlew \
 
 echo "PASS: replay-only gradlew change isolated from historical dirty-tree checks"
 
-mv "$REPLAY_REPO/gradlew" \
-   "$REPLAY_REPO/gradlew.real"
+# Preserve the real wrapper OUTSIDE the disposable Git worktree so historical
+# clean-tree checks cannot mistake the backup wrapper for project content.
+cp "$REPLAY_REPO/gradlew" \
+   "$REPLAY_ROOT/gradlew.real"
+
+[[ -s "$REPLAY_ROOT/gradlew.real" ]] \
+    || fail "Could not preserve original replay Gradle wrapper"
 
 cat > "$REPLAY_REPO/gradlew" <<'GRADLE_SHIM'
 #!/usr/bin/env bash
@@ -674,6 +679,19 @@ echo "BUILD SUCCESSFUL in 0s"
 GRADLE_SHIM
 
 chmod +x "$REPLAY_REPO/gradlew"
+
+# 26432-26435 require local.properties even though this isolated replay never
+# performs a real Android build. Supply the runner's real SDK location without
+# placing any machine-specific configuration in the real repository.
+REPLAY_ANDROID_SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+
+printf 'sdk.dir=%s\n' "$REPLAY_ANDROID_SDK" \
+    > "$REPLAY_REPO/local.properties"
+
+grep -q '^sdk\.dir=' "$REPLAY_REPO/local.properties" \
+    || fail "Replay-only local.properties was not created"
+
+echo "PASS: replay-only Android SDK pointer installed"
 
 echo "PASS: historical scripts cannot perform a real intermediate APK build"
 
@@ -722,6 +740,32 @@ text = text.replace(
     "/workspaces/Photon-Camera",
     aux
 )
+
+# Keep every historical log, safety directory, generated APK and result file
+# outside the disposable Git worktree. Several later scripts derive OUT from
+# $SRC rather than using the old /workspaces/Photon-Camera path directly.
+text = text.replace(
+    'OUT="$SRC/fresh_iris_outputs"',
+    f'OUT="{aux}/fresh_iris_outputs"'
+)
+text = text.replace(
+    'OUTDIR="$SRC/fresh_iris_outputs"',
+    f'OUTDIR="{aux}/fresh_iris_outputs"'
+)
+
+# Repair a known historical 26430 validation bug only.
+# Its candidate source intentionally documents that it does NOT consume
+# basePipeline.noiseS/noiseO/noiseRstr, while the old plain grep mistakenly
+# treats those explanatory comments as executable consumption.
+if src.name == "build_26430_codespace_v2_ownership_headroom_cleanup.sh":
+    text = text.replace(
+        """! grep -q 'basePipeline\\.noiseS' "$CDENOISE_JAVA" || fail "Photon noiseS still consumed by Motion V2"
+! grep -q 'basePipeline\\.noiseO' "$CDENOISE_JAVA" || fail "Photon noiseO still consumed by Motion V2"
+! grep -q 'noiseRstr' "$CDENOISE_JAVA" || fail "Photon noiseRstr still consumed by Motion V2\"""",
+        """! grep -q 'glProg\\.setVar("noiseS"' "$CDENOISE_JAVA" || fail "Executable Photon noiseS binding still consumed by Motion V2"
+! grep -q 'glProg\\.setVar("noiseO"' "$CDENOISE_JAVA" || fail "Executable Photon noiseO binding still consumed by Motion V2"
+! grep -q 'mSettings\\.noiseRstr\\|PhotonCamera\\.getSettings().noiseRstr' "$CDENOISE_JAVA" || fail "Executable Photon noiseRstr consumption still present in Motion V2\""""
+    )
 
 dst.write_text(text)
 PY
