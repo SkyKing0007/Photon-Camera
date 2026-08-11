@@ -271,9 +271,36 @@ grep -qi 'local_support\|local.support\|local-support' \
     "$HIST_DIR/launch_build_26446_corrected_published_robustness_true_local_support.ps1" \
     || fail "26446 local-support provenance missing"
 
-grep -qi 'reference_dng\|reference.dng\|reference-dng' \
-    "$HIST_DIR/launch_build_26450_alias_aware_chroma_reference_dng_REVISED.ps1" \
-    || fail "26450 reference-DNG provenance missing"
+# 26450 is a thin PowerShell launcher.  Its actual historical build script is
+# embedded as one Base64 FromBase64String(...) payload, so validate the decoded
+# provenance rather than grepping the wrapper for plaintext markers.
+PAYLOAD_26450_FILE="$HIST_DIR/launch_build_26450_alias_aware_chroma_reference_dng_REVISED.ps1"
+PAYLOAD_26450_B64="$(
+    sed -n 's/.*FromBase64String("\([^"]*\)").*/\1/p' "$PAYLOAD_26450_FILE"
+)"
+
+[[ -n "$PAYLOAD_26450_B64" ]] \
+    || fail "26450 embedded historical payload was not found"
+
+PAYLOAD_26450_DECODED="$SAFETY_DIR/26450_decoded_provenance.ps1"
+
+printf '%s' "$PAYLOAD_26450_B64" \
+    | base64 --decode > "$PAYLOAD_26450_DECODED" \
+    || fail "26450 embedded historical payload could not be decoded"
+
+[[ -s "$PAYLOAD_26450_DECODED" ]] \
+    || fail "26450 decoded historical payload is empty"
+
+grep -qi 'reference[_ -]*dng' "$PAYLOAD_26450_DECODED" \
+    || fail "26450 decoded payload has no reference-DNG provenance"
+
+grep -qi 'HdrxProcessor' "$PAYLOAD_26450_DECODED" \
+    || fail "26450 decoded payload has no HdrxProcessor reference-DNG plumbing"
+
+grep -qi 'MotionV2CfaReconstruction' "$PAYLOAD_26450_DECODED" \
+    || fail "26450 decoded payload has no Motion V2 reconstruction provenance"
+
+echo "PASS: 26450 embedded reference-DNG provenance decoded and verified"
 
 echo
 echo "PASS: required historical architecture evidence is present"
