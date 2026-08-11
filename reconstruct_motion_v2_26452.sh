@@ -1703,25 +1703,72 @@ echo "PASS: exact historical 26436 candidate construction source identified"
 echo
 echo "=== GATE 5M-B: PROVE INPUT IS EXACT GREEN 26435 REPLAY ==="
 
+echo
+echo "=== GATE 5M-B: CREATE FRESH EXACT 26435 INPUT REPO ==="
+
+G5M_REPO="$G5M_DIR/repo_26435_exact"
+G5M_26435_PATCH="$REPLAY_ROOT/26429_to_26435_replay.patch"
+
+[[ -s "$G5M_26435_PATCH" ]] \
+    || fail "Gate 5M saved 26429->26435 replay patch missing"
+
+rm -rf "$G5M_REPO"
+
+git clone --no-hardlinks "$REPLAY_REPO" "$G5M_REPO" \
+    >/dev/null 2>&1 \
+    || fail "Gate 5M isolated repo clone failed"
+
+git -C "$G5M_REPO" checkout --detach "$BASE_26428_COMMIT" \
+    >/dev/null 2>&1 \
+    || fail "Gate 5M could not reset isolated repo to canonical 26428"
+
+git -C "$G5M_REPO" switch -c experimental-clean-photon-rebuild \
+    >/dev/null 2>&1 \
+    || fail "Gate 5M could not create historical replay branch"
+
+git -C "$G5M_REPO" apply --binary "$G5M_26435_PATCH" \
+    || fail "Gate 5M could not apply exact saved 26429->26435 replay patch"
+
+echo
+echo "=== GATE 5M-B1: PROVE FRESH INPUT IS EXACT RECONSTRUCTED 26435 ==="
+
 grep -q '^VERSION_NAME=0\.9726435$' \
-    "$REPLAY_REPO/app/version.properties" \
-    || fail "Gate 5M replay input is not version 0.9726435"
+    "$G5M_REPO/app/version.properties" \
+    || fail "Fresh Gate 5M input is not version 0.9726435"
 
 grep -q '^VERSION_BUILD=26435$' \
-    "$REPLAY_REPO/app/version.properties" \
-    || fail "Gate 5M replay input is not build 26435"
+    "$G5M_REPO/app/version.properties" \
+    || fail "Fresh Gate 5M input is not build 26435"
 
 grep -q 'IRIS_26429_SHARED_GUIDE_ROBUSTNESS_REFERENCE_STRUCTURE' \
-    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" \
-    || fail "Gate 5M input lost 26429 reconstruction foundation"
+    "$G5M_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" \
+    || fail "Fresh Gate 5M input lacks 26429 reconstruction foundation"
 
 grep -q 'IRIS_26431_MOTION_V2_ALL_FRAME_HANDOFF' \
-    "$REPLAY_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java" \
-    || fail "Gate 5M input lost 26431 all-frame handoff"
+    "$G5M_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java" \
+    || fail "Fresh Gate 5M input lacks 26431 all-frame handoff"
 
 grep -q 'IRIS_26435_' \
-    "$REPLAY_REPO/app/src/main/assets/shaders/motionv2/render.glsl" \
-    || fail "Gate 5M input lost 26435 render state"
+    "$G5M_REPO/app/src/main/assets/shaders/motionv2/render.glsl" \
+    || fail "Fresh Gate 5M input lacks 26435 render state"
+
+if grep -q 'IRIS_26452_MULTIFRAME_CFA_FINAL_OWNER' \
+    "$G5M_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java"
+then
+    fail "Gate 5 26452 carrier transform leaked into fresh 26435 input"
+fi
+
+if grep -q 'IRIS_26452_MULTIFRAME_CFA_SINGLE_DEMOSAIC' \
+    "$G5M_REPO/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java"
+then
+    fail "Gate 5 26452 PostPipeline transform leaked into fresh 26435 input"
+fi
+
+git -C "$G5M_REPO" diff --check \
+    || fail "Fresh reconstructed 26435 tree failed git diff --check"
+
+echo "PASS: fresh 26435 repo reconstructed from pre-Gate-5 saved patch"
+echo "PASS: no 26452 CFA-carrier changes exist in Gate 5M input"
 
 echo "PASS: exact reconstructed 26435 input proven"
 
@@ -1814,19 +1861,63 @@ echo "PASS: candidate-only 26436 replay script generated"
 echo
 echo "=== GATE 5M-D: POWERSHELL PARSER / PLATFORM PROOF ==="
 
+echo
+echo "=== GATE 5M-D: POWERSHELL PARSER / PLATFORM PROOF ==="
+
 command -v pwsh >/dev/null 2>&1 \
     || fail "pwsh is unavailable on GitHub runner; 26436 replay not attempted"
 
-pwsh -NoLogo -NoProfile -Command \
-    '$t=$null;$e=$null;[System.Management.Automation.Language.Parser]::ParseFile(
-        $args[0],[ref]$t,[ref]$e
-    ) | Out-Null;
-    if($e.Count -gt 0){
-        $e | ForEach-Object { Write-Host $_.Message };
+[[ -s "$G5M_SCRIPT" ]] \
+    || fail "Gate 5M candidate-only PowerShell script missing before parser check"
+
+G5M_SCRIPT_ABS="$(realpath "$G5M_SCRIPT")"
+
+[[ -n "$G5M_SCRIPT_ABS" && -f "$G5M_SCRIPT_ABS" ]] \
+    || fail "Gate 5M could not resolve absolute PowerShell script path"
+
+export G5M_SCRIPT_FOR_PWSH="$G5M_SCRIPT_ABS"
+
+pwsh -NoLogo -NoProfile -Command '
+    $p = $env:G5M_SCRIPT_FOR_PWSH
+
+    if ([string]::IsNullOrWhiteSpace($p)) {
+        Write-Host "FAIL: G5M_SCRIPT_FOR_PWSH is empty"
         exit 1
-    }' \
-    "$G5M_SCRIPT" \
+    }
+
+    if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {
+        Write-Host ("FAIL: PowerShell script path does not exist: " + $p)
+        exit 1
+    }
+
+    $tokens = $null
+    $errors = $null
+
+    [System.Management.Automation.Language.Parser]::ParseFile(
+        $p,
+        [ref]$tokens,
+        [ref]$errors
+    ) | Out-Null
+
+    if ($errors.Count -gt 0) {
+        foreach ($e in $errors) {
+            Write-Host (
+                "PARSER ERROR line "
+                + $e.Extent.StartLineNumber
+                + ": "
+                + $e.Message
+            )
+        }
+        exit 1
+    }
+
+    Write-Host ("PASS: parsed " + $p)
+' \
     || fail "Gate 5M candidate-only PowerShell parser validation failed"
+
+unset G5M_SCRIPT_FOR_PWSH
+
+echo "PASS: candidate-only 26436 PowerShell parses on runner"
 
 echo "PASS: candidate-only 26436 PowerShell parses on runner"
 
