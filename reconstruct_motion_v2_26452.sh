@@ -767,6 +767,31 @@ if src.name == "build_26430_codespace_v2_ownership_headroom_cleanup.sh":
 ! grep -q 'mSettings\\.noiseRstr\\|PhotonCamera\\.getSettings().noiseRstr' "$CDENOISE_JAVA" || fail "Executable Photon noiseRstr consumption still present in Motion V2\""""
     )
 
+    # Repair the duplicated 26430 Gate-5 lineage checks too. These old checks
+    # grep whole files and can mistake explanatory comments for executable code.
+    old_gate5 = r"""! grep -q 'basePipeline\.noiseS' "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Denoise.java" || fail "Photon noiseS leaked back into Motion"
+! grep -q 'basePipeline\.noiseO' "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Denoise.java" || fail "Photon noiseO leaked back into Motion"
+! grep -q 'uniform float noiseS' "app/src/main/assets/shaders/motionv2/denoise.glsl" || fail "Generic noiseS shader path leaked back"
+! grep -q 'uniform float noiseO' "app/src/main/assets/shaders/motionv2/denoise.glsl" || fail "Generic noiseO shader path leaked back"
+! grep -q 'start=0.70' "app/src/main/assets/shaders/motionv2/render.glsl" || fail "26420 fixed shoulder leaked back"
+! grep -q 'transformedLoss' "app/src/main/assets/shaders/motionv2/color_transform.glsl" || fail "26427 output-space neutralization leaked back"
+"""
+
+    new_gate5 = r"""! grep -q 'glProg\.setVar("noiseS"' "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Denoise.java" || fail "Executable Photon noiseS binding leaked back into Motion"
+! grep -q 'glProg\.setVar("noiseO"' "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Denoise.java" || fail "Executable Photon noiseO binding leaked back into Motion"
+! grep -Eq '^[[:space:]]*uniform[[:space:]]+float[[:space:]]+noiseS[[:space:]]*;' "app/src/main/assets/shaders/motionv2/denoise.glsl" || fail "Executable generic noiseS shader uniform leaked back"
+! grep -Eq '^[[:space:]]*uniform[[:space:]]+float[[:space:]]+noiseO[[:space:]]*;' "app/src/main/assets/shaders/motionv2/denoise.glsl" || fail "Executable generic noiseO shader uniform leaked back"
+! grep -Eq '^[[:space:]]*const[[:space:]]+float[[:space:]]+start[[:space:]]*=[[:space:]]*0\.70[[:space:]]*;' "app/src/main/assets/shaders/motionv2/render.glsl" || fail "Executable 0.70 shoulder leaked back"
+! grep -Eq '^[[:space:]]*(float|vec2|vec3|vec4)[[:space:]]+transformedLoss([[:space:]]|=|;)' "app/src/main/assets/shaders/motionv2/color_transform.glsl" || fail "Executable transformedLoss path leaked back"
+"""
+
+    if old_gate5 not in text:
+        raise SystemExit(
+            "FAIL: expected 26430 Gate-5 lineage block not found for replay repair"
+        )
+
+    text = text.replace(old_gate5, new_gate5, 1)
+    
 dst.write_text(text)
 PY
 
