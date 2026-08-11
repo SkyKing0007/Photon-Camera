@@ -2079,6 +2079,23 @@ text = repo_assign.sub('$Repo = "' + repo.replace("\\", "\\\\") + '"', text, cou
 
 text = text.replace('"git.exe"', '"git"').replace("'git.exe'", "'git'")
 
+# Linux PowerShell portability for historical Windows scripts.
+# PowerShell provider cmdlets can accept backslash paths on Linux, while
+# raw .NET System.IO methods do not reinterpret backslash as a Unix path
+# separator. Normalize only quoted repository-relative app\... literals.
+quoted_app_path = re.compile(
+    r"(?P<q>['\"])(?P<p>app\\[^'\"\n\r]+)(?P=q)"
+)
+
+def normalize_app_literal(match):
+    q = match.group("q")
+    p = match.group("p").replace("\\", "/")
+    return q + p + q
+
+text, normalized_app_literal_count = quoted_app_path.subn(
+    normalize_app_literal, text
+)
+
 version_tokens = sorted({
     m.group(1) for m in re.finditer(r'VERSION_NAME=(0\.9726\d+)', text)
     if m.group(1) != target_v
@@ -2119,7 +2136,7 @@ if selective:
         '$Head = (& git rev-parse HEAD).Trim()\n'
         'if ($Branch -ne "experimental-clean-photon-rebuild") { Fail ("wrong branch: " + $Branch) }\n'
         'if ($Head -ne "aac8ea5a0f518142b0f8ad60ce34c9a165e4611b") { Fail ("wrong HEAD: " + $Head) }\n'
-        '$SelectiveVersion = [IO.File]::ReadAllText((Join-Path $Repo "app\\version.properties"))\n'
+        '$SelectiveVersion = [IO.File]::ReadAllText((Join-Path $Repo "app/version.properties"))\n'
         f'if ($SelectiveVersion -notmatch "(?m)^VERSION_NAME={re.escape(cur_v)}`r?$" -or '
         f'$SelectiveVersion -notmatch "(?m)^VERSION_BUILD={re.escape(cur_b)}`r?$") '
         '{ Fail "selective migration input version mismatch" }\n'
@@ -2146,12 +2163,49 @@ text += (
     f'Write-Host "PASS: GATE6 candidate-only historical transform {target_b}"\n'
     'Write-Host "NO HISTORICAL SOURCE APPLY / JAVAC / APK BUILD EXECUTED"\n'
 )
+
+windows_checkout = re.findall(
+    r"(?i)[A-Z]:\\Users\\[^'\"\n\r]+", text
+)
+if windows_checkout:
+    raise SystemExit(
+        "FAIL: unresolved Windows checkout path(s) remain in prepared "
+        + str(target_b) + ": " + repr(windows_checkout[:5])
+    )
+
+remaining_backslash_app = re.findall(
+    r"['\"]app\\[^'\"\n\r]+['\"]", text
+)
+if remaining_backslash_app:
+    raise SystemExit(
+        "FAIL: unresolved quoted app-backslash path(s) remain in prepared "
+        + str(target_b) + ": " + repr(remaining_backslash_app[:8])
+    )
+
+if "candidate" not in text.lower() and "temporary" not in text.lower():
+    raise SystemExit(
+        "FAIL: prepared historical script lacks candidate/temporary proof text: "
+        + str(target_b)
+    )
+
 dst.write_text(text, encoding="utf-8")
+print(
+    f"PASS: normalized {normalized_app_literal_count} quoted app path literals "
+    f"for Linux PowerShell in historical {target_b}"
+)
+print(f"PASS: no unresolved Windows checkout/app-backslash literals in {target_b}")
 PY
 
     [[ -s "$output" ]] || fail "Prepared Gate 6 PowerShell script is empty"
+
     pwsh -NoLogo -NoProfile -File "$G5M_PARSER" "$output" \
         || fail "Prepared Gate 6 PowerShell does not parse: $target_build"
+
+    if grep -Eq '[A-Za-z]:\\Users\\' "$output"; then
+        fail "Prepared Gate 6 PowerShell still contains a Windows checkout path: $target_build"
+    fi
+
+    echo "PASS: Gate 6 historical $target_build parser + path portability preflight"
 }
 
 apply_g6_historical_candidate() {
@@ -2174,6 +2228,9 @@ apply_g6_historical_candidate() {
         cd "$G6_REPO"
         pwsh -NoLogo -NoProfile -File "$prepared"
     ) > "$log" 2>&1 || {
+        echo "--- Gate 6 $build prepared-script path audit ---"
+        grep -nE 'app[/\\]version\.properties|[A-Za-z]:\\Users\\|\[IO\.File\]::(ReadAllText|WriteAllText)' "$prepared"             | head -n 120 || true
+        echo "--- Gate 6 $build execution log tail ---"
         tail -n 220 "$log" || true
         fail "Gate 6 historical candidate transform failed: $build"
     }
@@ -2222,6 +2279,22 @@ apply_g6_historical_candidate() {
 
     echo "PASS: historical $build candidate overlaid"
 }
+
+echo
+echo "=== GATE 6B1: PREPARE + PARSE ALL SIX LATE-HISTORY WRAPPERS BEFORE EXECUTION ==="
+
+prepare_g6_candidate_script "$G6_PS/26437.source.ps1" "$G6_PS/26437.preflight.ps1" 0.9726436 26436 0.9726437 26437 0
+prepare_g6_candidate_script "$G6_PS/26438.source.ps1" "$G6_PS/26438.preflight.ps1" 0.9726437 26437 0.9726438 26438 0
+prepare_g6_candidate_script "$G6_PS/26439.source.ps1" "$G6_PS/26439.preflight.ps1" 0.9726438 26438 0.9726439 26439 0
+prepare_g6_candidate_script "$G6_PS/26443.source.ps1" "$G6_PS/26443.preflight.ps1" 0.9726439 26439 0.9726443 26443 1
+prepare_g6_candidate_script "$G6_PS/26445.source.ps1" "$G6_PS/26445.preflight.ps1" 0.9726443 26443 0.9726445 26445 1
+prepare_g6_candidate_script "$G6_PS/26446.source.ps1" "$G6_PS/26446.preflight.ps1" 0.9726445 26445 0.9726446 26446 1
+
+for pf in "$G6_PS"/*.preflight.ps1; do
+    [[ -s "$pf" ]] || fail "Gate 6 all-history preflight output missing: $pf"
+done
+
+echo "PASS: all six late-history candidate wrappers parse and pass Linux path audit before replay"
 
 echo
 echo "=== GATE 6C: REPLAY PRESERVED LATE IMAGE HISTORY THROUGH 26446 ==="
