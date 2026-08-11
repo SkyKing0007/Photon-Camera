@@ -645,6 +645,14 @@ echo "PASS: real glslangValidator available"
 echo
 echo "=== GATE 4C: INSTALL NON-BUILDING GRADLE REPLAY SHIM ==="
 
+# The replay-only Gradle shim intentionally changes the tracked wrapper inside
+# this disposable clone. Hide only that known file from historical dirty-tree
+# checks; application source remains fully visible to Git.
+git -C "$REPLAY_REPO" update-index --assume-unchanged gradlew \
+    || fail "Could not isolate replay-only Gradle wrapper change"
+
+echo "PASS: replay-only gradlew change isolated from historical dirty-tree checks"
+
 mv "$REPLAY_REPO/gradlew" \
    "$REPLAY_REPO/gradlew.real"
 
