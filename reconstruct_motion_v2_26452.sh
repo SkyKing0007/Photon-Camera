@@ -901,3 +901,434 @@ echo "REAL app/ UNMODIFIED"
 echo "NO REAL INTERMEDIATE APK BUILDS"
 echo "NO VERSION CHANGE IN REAL app/"
 echo "======================================================================"
+
+echo
+echo "=== GATE 5: 26452 CFA-TO-CFA FINAL-CARRIER CANDIDATE ==="
+
+GATE5_REPO="$REPLAY_REPO"
+GATE5_APP="$GATE5_REPO/app"
+GATE5_SAFETY="$REPLAY_ROOT/gate5_26452_cfa_carrier"
+GATE5_SNAPSHOT="$GATE5_SAFETY/candidate_app"
+
+mkdir -p "$GATE5_SAFETY"
+
+G5_RECON="$GATE5_APP/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java"
+G5_INPUT="$GATE5_APP/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java"
+G5_POST="$GATE5_APP/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java"
+G5_DEMOSAIC="$GATE5_APP/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaDemosaic.java"
+G5_VERSION="$GATE5_APP/version.properties"
+
+echo
+echo "=== GATE 5A: PROVE EXACT REPLAYED INPUT STATE ==="
+
+grep -q '^VERSION_NAME=0\.9726435$' "$G5_VERSION" \
+    || fail "Gate 5 input is not replayed version 0.9726435"
+
+grep -q '^VERSION_BUILD=26435$' "$G5_VERSION" \
+    || fail "Gate 5 input is not replayed build 26435"
+
+grep -q 'IRIS_26429_SHARED_GUIDE_ROBUSTNESS_REFERENCE_STRUCTURE' \
+    "$G5_RECON" \
+    || fail "Gate 5 lacks replayed 26429 reconstruction foundation"
+
+grep -q 'cfa_reconstruct_accumulate' "$G5_RECON" \
+    || fail "CFA-to-CFA accumulator missing before Gate 5"
+
+grep -q 'currentMerged' "$G5_RECON" \
+    || fail "CFA currentMerged carrier missing before Gate 5"
+
+grep -q 'currentDirectRgb' "$G5_RECON" \
+    || fail "Direct-RGB comparison carrier missing before Gate 5"
+
+grep -q 'directBayer ? currentDirectRgb : currentMerged' "$G5_RECON" \
+    || fail "Expected pre-26452 final carrier expression missing"
+
+grep -q 'IRIS_26415_MOTION_V2_PACKED_CFA_DOMAIN' "$G5_DEMOSAIC" \
+    || fail "Motion V2 packed-CFA demosaic contract missing"
+
+grep -q 'expectedPacked' "$G5_DEMOSAIC" \
+    || fail "Motion V2 demosaic packed-dimension validation missing"
+
+grep -q 'new Point(raw.x / 2, raw.y / 2)' "$G5_DEMOSAIC" \
+    || fail "Motion V2 demosaic does not require packed half-resolution CFA"
+
+echo "PASS: replayed 26435 producer/carrier/consumer state proven"
+
+echo
+echo "=== GATE 5B: SNAPSHOT REAL APP BEFORE CANDIDATE TRANSFORM ==="
+
+git diff --binary "$BASE_26428_COMMIT" -- app \
+    > "$GATE5_SAFETY/real_app_before_gate5.patch"
+
+[[ ! -s "$GATE5_SAFETY/real_app_before_gate5.patch" ]] \
+    || fail "Real app/ changed before Gate 5 candidate work"
+
+echo "PASS: real app/ still canonical 26428"
+
+echo
+echo "=== GATE 5C: SAVE PRE-TRANSFORM REPLAY HASHES ==="
+
+for rel in \
+    "app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" \
+    "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java" \
+    "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java" \
+    "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaDemosaic.java"
+do
+    printf '%s  %s\n' \
+        "$(sha_upper "$GATE5_REPO/$rel")" \
+        "$rel"
+done > "$GATE5_SAFETY/pre_transform_target_hashes.txt"
+
+echo "PASS: Gate 5 target hashes recorded"
+
+echo
+echo "=== GATE 5D: APPLY CARRIER TRANSFORM ONLY TO THROWAWAY REPLAY ==="
+
+python3 - \
+    "$G5_RECON" \
+    "$G5_INPUT" \
+    "$G5_POST" <<'PY'
+from pathlib import Path
+import sys
+
+recon = Path(sys.argv[1])
+cfa_input = Path(sys.argv[2])
+post = Path(sys.argv[3])
+
+# -------------------------------------------------------------------------
+# 1. Reconstruction:
+#    temporal CFA-to-CFA currentMerged becomes the final image carrier.
+#    Direct RGB remains calculated only as non-owning comparison telemetry.
+# -------------------------------------------------------------------------
+s = recon.read_text()
+
+old = "GLTexture imageOutput = directBayer ? currentDirectRgb : currentMerged;"
+new = """/*
+             * IRIS_26452_MULTIFRAME_CFA_FINAL_OWNER
+             *
+             * Temporal ownership remains in the sensor CFA domain.
+             * currentMerged contains the reference-first multiframe CFA result.
+             * Direct temporal RGB may still be computed for comparison telemetry,
+             * but it cannot own the image crossing into PostPipeline.
+             */
+            GLTexture imageOutput = currentMerged;"""
+
+if s.count(old) != 1:
+    raise SystemExit(
+        "FAIL: expected exactly one direct-RGB final-owner expression; "
+        f"found {s.count(old)}"
+    )
+
+s = s.replace(old, new, 1)
+
+# The final carrier is now packed half-resolution CFA for Bayer as well.
+old_size = """+ " size=" + (directBayer
+                            ? raw.x + "x" + raw.y
+                            : rawHalf.x + "x" + rawHalf.y)"""
+new_size = """+ " size=" + rawHalf.x + "x" + rawHalf.y"""
+
+if s.count(old_size) != 1:
+    raise SystemExit(
+        "FAIL: expected exactly one old final-carrier size telemetry block; "
+        f"found {s.count(old_size)}"
+    )
+
+s = s.replace(old_size, new_size, 1)
+
+s = s.replace(
+    '+ " directMultiframeRgb=" + directBayer',
+    '+ " directMultiframeRgbComputed=" + directBayer'
+    '+ " directMultiframeRgbFinalOwner=false"',
+    1
+)
+
+s = s.replace(
+    '+ " separateDemosaic=" + (!directBayer)',
+    '+ " separateDemosaic=true"',
+    1
+)
+
+recon.write_text(s)
+
+# -------------------------------------------------------------------------
+# 2. MotionV2CfaInput:
+#    the bridge now always uploads the reconstruction as packed half-res CFA.
+#    This preserves exact CFA cell values with GL_NEAREST.
+# -------------------------------------------------------------------------
+s = cfa_input.read_text()
+
+old = """        boolean directBayer =
+                basePipeline.mParameters.cfaPattern >= 0
+                        && basePipeline.mParameters.cfaPattern <= 3;
+        if (directBayer) {
+            WorkingTexture = new GLTexture(
+                    raw,
+                    new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                    view,
+                    GL_LINEAR,
+                    GL_CLAMP_TO_EDGE);
+        } else {
+            WorkingTexture = new GLTexture(
+                    half,
+                    new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                    view,
+                    GL_NEAREST,
+                    GL_CLAMP_TO_EDGE);
+        }"""
+
+new = """        /*
+         * IRIS_26452_MULTIFRAME_CFA_INPUT_OWNER
+         *
+         * Standard Bayer no longer arrives as temporally synthesized RGB.
+         * The owned reconstruction carrier is the packed half-resolution
+         * multiframe CFA result and must remain nearest-sampled until the
+         * single Motion V2 demosaic.
+         */
+        WorkingTexture = new GLTexture(
+                half,
+                new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                view,
+                GL_NEAREST,
+                GL_CLAMP_TO_EDGE);"""
+
+if s.count(old) != 1:
+    raise SystemExit(
+        "FAIL: expected exactly one direct-RGB/CFA input branch; "
+        f"found {s.count(old)}"
+    )
+
+s = s.replace(old, new, 1)
+
+s = s.replace(
+    '(directBayer ? "directRgbFullRes" : "packedCfaHalfRes")',
+    '"packedMultiframeCfaHalfRes"',
+)
+
+s = s.replace(
+    '+ " directMultiframeRgb=" + directBayer',
+    '+ " directMultiframeRgbFinalOwner=false"',
+)
+
+cfa_input.write_text(s)
+
+# -------------------------------------------------------------------------
+# 3. PostPipeline:
+#    standard Bayer must now perform exactly one MotionV2CfaDemosaic.
+#    Special CFA fallback behavior remains unchanged.
+# -------------------------------------------------------------------------
+s = post.read_text()
+
+old = """            if (directBayer) {
+                /*
+                 * IRIS_26424_DIRECT_MULTIFRAME_RGB_POST_GRAPH
+                 * Standard Bayer image formation already produced full-
+                 * resolution linear camera RGB. No separate demosaic runs.
+                 */
+                add(new StageTelemetry("V2_POST_DIRECT_MULTIFRAME_RGB"));
+            } else {"""
+
+new = """            if (directBayer) {
+                /*
+                 * IRIS_26452_MULTIFRAME_CFA_SINGLE_DEMOSAIC
+                 *
+                 * Standard Bayer now arrives as the aligned multiframe
+                 * packed-CFA result. One V2-owned demosaic converts that
+                 * sensor-domain carrier to full-resolution camera RGB.
+                 */
+                add(new StageTelemetry("V2_POST_MULTIFRAME_CFA"));
+                add(new MotionV2CfaDemosaic());
+                add(new StageTelemetry("V2_POST_SINGLE_CFA_DEMOSAIC"));
+            } else {"""
+
+if s.count(old) != 1:
+    raise SystemExit(
+        "FAIL: expected exactly one standard-Bayer direct-RGB post branch; "
+        f"found {s.count(old)}"
+    )
+
+s = s.replace(old, new, 1)
+
+s = s.replace(
+    '"nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"',
+    '"nodes=MotionV2CfaInput,MultiframeCFA,SingleMotionV2CfaDemosaic,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"',
+    1
+)
+
+s = s.replace(
+    '+ " directMultiframeRgb=" + directBayer',
+    '+ " directMultiframeRgbFinalOwner=false"'
+    '+ " standardBayerSingleDemosaic=" + directBayer',
+    1
+)
+
+post.write_text(s)
+
+print("candidate/source validation PASS")
+PY
+
+echo "Temporary-copy transformation: PASS"
+
+echo
+echo "=== GATE 5E: OWNERSHIP / DOMAIN VALIDATION ==="
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_FINAL_OWNER' "$G5_RECON" \
+    || fail "26452 CFA final-owner marker missing"
+
+grep -q 'GLTexture imageOutput = currentMerged;' "$G5_RECON" \
+    || fail "currentMerged is not the Gate 5 final carrier"
+
+if grep -q 'directBayer ? currentDirectRgb : currentMerged' "$G5_RECON"; then
+    fail "Direct RGB still conditionally owns the final reconstruction output"
+fi
+
+grep -q 'cfa_reconstruct_accumulate' "$G5_RECON" \
+    || fail "CFA temporal accumulator disappeared"
+
+grep -q 'currentSupport' "$G5_RECON" \
+    || fail "Separate CFA support carrier disappeared"
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_INPUT_OWNER' "$G5_INPUT" \
+    || fail "26452 packed-CFA input marker missing"
+
+grep -q 'packedMultiframeCfaHalfRes' "$G5_INPUT" \
+    || fail "Packed multiframe CFA input telemetry missing"
+
+grep -q 'GL_NEAREST' "$G5_INPUT" \
+    || fail "Packed CFA input no longer proves nearest sampling"
+
+grep -q 'IRIS_26452_MULTIFRAME_CFA_SINGLE_DEMOSAIC' "$G5_POST" \
+    || fail "26452 single-demosaic routing marker missing"
+
+grep -q 'V2_POST_SINGLE_CFA_DEMOSAIC' "$G5_POST" \
+    || fail "Single CFA demosaic telemetry missing"
+
+grep -q 'add(new MotionV2CfaDemosaic());' "$G5_POST" \
+    || fail "MotionV2CfaDemosaic is not present in V2 post graph"
+
+grep -q 'IRIS_26415_MOTION_V2_PACKED_CFA_DOMAIN' "$G5_DEMOSAIC" \
+    || fail "Existing packed-CFA demosaic contract was lost"
+
+grep -q 'sensorNeutralFallback=true' "$G5_DEMOSAIC" \
+    || fail "Existing sensor-neutral highlight fallback was lost"
+
+echo "PASS: producer = multiframe CFA currentMerged"
+echo "PASS: support = separate currentSupport carrier"
+echo "PASS: bridge = packed half-resolution FLOAT32 CFA / GL_NEAREST"
+echo "PASS: consumer = one MotionV2CfaDemosaic"
+echo "PASS: direct temporal RGB has no final-image ownership"
+
+echo
+echo "=== GATE 5F: PROVE VERSION DID NOT MOVE ==="
+
+grep -q '^VERSION_NAME=0\.9726435$' "$G5_VERSION" \
+    || fail "Gate 5 candidate unexpectedly changed version name"
+
+grep -q '^VERSION_BUILD=26435$' "$G5_VERSION" \
+    || fail "Gate 5 candidate unexpectedly changed build number"
+
+echo "PASS: candidate remains 26435 because real 26452 has not been applied"
+
+echo
+echo "=== GATE 5G: RESTORE REAL GRADLE WRAPPER INSIDE THROWAWAY REPLAY ==="
+
+cp "$REPLAY_ROOT/gradlew.real" "$GATE5_REPO/gradlew" \
+    || fail "Could not restore real Gradle wrapper in throwaway replay"
+
+chmod +x "$GATE5_REPO/gradlew"
+
+git -C "$GATE5_REPO" update-index --no-assume-unchanged gradlew \
+    || fail "Could not restore normal Gradle index handling in replay repo"
+
+echo "PASS: throwaway replay now uses the real Gradle wrapper"
+
+echo
+echo "=== GATE 5H: REAL JAVAC PROOF OF CFA-CARRIER CANDIDATE ==="
+
+GATE5_JAVAC_LOG="$GATE5_SAFETY/gate5_javac.txt"
+
+(
+    cd "$GATE5_REPO"
+
+    ./gradlew :app:compileDebugJavaWithJavac --stacktrace
+) > "$GATE5_JAVAC_LOG" 2>&1 \
+    || {
+        tail -n 160 "$GATE5_JAVAC_LOG" || true
+        fail "Gate 5 real Javac proof failed"
+    }
+
+grep -q 'BUILD SUCCESSFUL' "$GATE5_JAVAC_LOG" \
+    || {
+        tail -n 160 "$GATE5_JAVAC_LOG" || true
+        fail "Gate 5 Javac did not report BUILD SUCCESSFUL"
+    }
+
+echo "PASS: real Javac accepted the 26452 CFA-carrier candidate"
+
+echo
+echo "=== GATE 5I: SAVE EXPLORER/BROWSER-VISIBLE SOURCE-ONLY CANDIDATE ==="
+
+mkdir -p "$GATE5_SNAPSHOT"
+
+# Save only tracked application source/configuration from the transformed
+# throwaway replay. Do not copy Gradle-generated app/build products into the
+# candidate snapshot.
+(
+    cd "$GATE5_REPO"
+
+    while IFS= read -r -d '' rel; do
+        src="$GATE5_REPO/$rel"
+        dst="$GATE5_SNAPSHOT/${rel#app/}"
+
+        mkdir -p "$(dirname "$dst")"
+        cp -p "$src" "$dst"
+    done < <(git ls-files -z app)
+)
+
+[[ -f "$GATE5_SNAPSHOT/version.properties" ]] \
+    || fail "Gate 5 source-only snapshot is missing version.properties"
+
+find "$GATE5_SNAPSHOT" \
+    -type f \
+    -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    > "$GATE5_SAFETY/gate5_candidate_sha256.txt"
+
+[[ -s "$GATE5_SAFETY/gate5_candidate_sha256.txt" ]] \
+    || fail "Gate 5 candidate hash manifest missing"
+
+(
+    cd "$GATE5_REPO"
+    git diff --binary "$BASE_26428_COMMIT" -- app \
+        > "$GATE5_SAFETY/gate5_candidate_vs_26428.patch"
+)
+
+[[ -s "$GATE5_SAFETY/gate5_candidate_vs_26428.patch" ]] \
+    || fail "Gate 5 candidate patch is empty"
+
+echo "PASS: candidate snapshot, hashes and binary patch saved"
+
+echo
+echo "=== GATE 5J: FINAL REAL-APP NON-MODIFICATION PROOF ==="
+
+REAL_APP_DIFF="$(git diff "$BASE_26428_COMMIT" -- app || true)"
+
+if [[ -n "$REAL_APP_DIFF" ]]; then
+    echo "$REAL_APP_DIFF"
+    fail "Real app/ changed during Gate 5"
+fi
+
+echo "PASS: real app/ remains byte-identical to canonical 26428"
+
+echo
+echo "======================================================================"
+echo "GATE 5 26452 CFA-TO-CFA FINAL-CARRIER CANDIDATE PASSED"
+echo "CURRENTMERGED CFA OWNS FINAL TEMPORAL IMAGE"
+echo "STANDARD BAYER RUNS ONE MOTION V2 CFA DEMOSAIC"
+echo "DIRECT TEMPORAL RGB FINAL OWNERSHIP = FALSE"
+echo "REAL JAVAC = PASS"
+echo "REAL app/ UNMODIFIED"
+echo "VERSION STILL 0.9726435 / 26435 INSIDE CANDIDATE"
+echo "NO REAL 26452 VERSION CHANGE"
+echo "NO REAL 26452 APK YET"
+echo "======================================================================"
