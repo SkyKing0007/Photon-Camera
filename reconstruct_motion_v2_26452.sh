@@ -31,7 +31,7 @@ pass() {
 }
 
 echo "======================================================================"
-echo "MOTION V2 26452 — V11 FULL-CHAIN HISTORICAL RECOVERY AUDIT"
+echo "MOTION V2 26452 — V12 FULL-CHAIN HISTORICAL RECOVERY + LF AUDIT"
 echo "======================================================================"
 
 # ---------------------------------------------------------------------------
@@ -477,6 +477,108 @@ absolute_start = section_start + matches[0].start()
 absolute_end = section_start + matches[0].end()
 text = text[:absolute_start] + new_assignment + text[absolute_end:]
 
+# -----------------------------------------------------------------------
+# IRIS_26452_V12_REPLAY_PYTHON_LF_COMPAT
+#
+# Retained 26429-26435 scripts were authored on Linux/Codespaces. Windows
+# Python text writes with newline=None translate LF into CRLF. Historical
+# scripts then correctly reject those rewritten bytes with git diff --check.
+#
+# Keep git diff --check and keep historical payload bytes unchanged.
+# Replay-only Python is made to preserve Linux LF text-write semantics.
+# Binary I/O is untouched.
+# -----------------------------------------------------------------------
+
+gate4e_marker = 'echo "=== GATE 4E: REPLAY 26429 -> 26435 IN ORDER ==="\n'
+if text.count(gate4e_marker) != 1:
+    raise SystemExit(
+        f"FAIL: V12 Gate 4E insertion marker count={text.count(gate4e_marker)} expected=1"
+    )
+
+lf_compat = r"""
+# IRIS_26452_V12_REPLAY_PYTHON_LF_COMPAT
+IRIS_REPLAY_PY_LF="$REPLAY_AUX/python_lf_compat"
+mkdir -p "$IRIS_REPLAY_PY_LF"
+
+cat > "$IRIS_REPLAY_PY_LF/sitecustomize.py" <<'PY_LF_SITE'
+import builtins
+import io
+
+_ORIG_BUILTINS_OPEN = builtins.open
+_ORIG_IO_OPEN = io.open
+
+def _needs_lf(mode, newline):
+    if newline is not None:
+        return False
+    if "b" in mode:
+        return False
+    return any(flag in mode for flag in ("w", "a", "x", "+"))
+
+def _builtins_open(
+    file, mode="r", buffering=-1, encoding=None, errors=None,
+    newline=None, closefd=True, opener=None
+):
+    if _needs_lf(mode, newline):
+        newline = "\n"
+    return _ORIG_BUILTINS_OPEN(
+        file, mode, buffering, encoding, errors, newline, closefd, opener
+    )
+
+def _io_open(
+    file, mode="r", buffering=-1, encoding=None, errors=None,
+    newline=None, closefd=True, opener=None
+):
+    if _needs_lf(mode, newline):
+        newline = "\n"
+    return _ORIG_IO_OPEN(
+        file, mode, buffering, encoding, errors, newline, closefd, opener
+    )
+
+builtins.open = _builtins_open
+io.open = _io_open
+PY_LF_SITE
+
+export PYTHONPATH="$IRIS_REPLAY_PY_LF${PYTHONPATH:+:$PYTHONPATH}"
+
+IRIS_LF_SMOKE="$REPLAY_AUX/python_lf_smoke"
+mkdir -p "$IRIS_LF_SMOKE"
+
+python3 - "$IRIS_LF_SMOKE" <<'PY_LF_TEST'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+a = root / "builtins.txt"
+b = root / "pathlib.txt"
+c = root / "binary.bin"
+
+with open(a, "w", encoding="utf-8") as f:
+    f.write("a\nb\n")
+
+b.write_text("c\nd\n", encoding="utf-8")
+
+with open(c, "wb") as f:
+    f.write(b"\x00\r\n\xff")
+
+for p in (a, b):
+    data = p.read_bytes()
+    if b"\r\n" in data:
+        raise SystemExit(f"FAIL: replay Python LF compatibility emitted CRLF: {p}")
+    if data.count(b"\n") != 2:
+        raise SystemExit(f"FAIL: replay Python LF smoke newline count wrong: {p}")
+
+if c.read_bytes() != b"\x00\r\n\xff":
+    raise SystemExit("FAIL: replay Python LF compatibility altered binary I/O")
+
+print("PASS: replay-only Python text writes are LF-stable on Windows")
+print("PASS: replay-only Python binary writes remain byte-preserving")
+PY_LF_TEST
+
+echo "PASS: Linux/Codespaces Python text newline semantics restored for historical replay"
+"""
+
+text = text.replace(gate4e_marker, lf_compat + "\n" + gate4e_marker, 1)
+
 # Update V9's own full generated-source audit to assert the corrected semantics.
 old_required = (
     "    'historical glslangValidator interface backed by real Windows NDK glslc.exe',\n"
@@ -537,6 +639,7 @@ for required in (
     "REAL_GLSLANG_VALIDATOR",
     "build_26439_windows_v2_temporal_channel_ownership.ps1",
     "IRIS_26452_GATE6B1_HARDENED_TRUNCATION_CONTRACT",
+    "IRIS_26452_V12_REPLAY_PYTHON_LF_COMPAT",
 ):
     if required not in text:
         raise SystemExit("FAIL: V11 generated contract missing: " + required)
@@ -579,6 +682,9 @@ for required in (
     "IRIS_26452_WINDOWS_NESTED_CLONE_EXACT_BYTES",
     "build_26439_windows_v2_temporal_channel_ownership.ps1",
     "REAL_GLSLANG_VALIDATOR",
+    "IRIS_26452_V12_REPLAY_PYTHON_LF_COMPAT",
+    "sitecustomize.py",
+    "replay-only Python text writes are LF-stable on Windows",
 ):
     if required not in text:
         raise SystemExit("FAIL: generated V11 required marker missing: " + required)
@@ -622,7 +728,7 @@ pass "app/ remained untouched"
 # ---------------------------------------------------------------------------
 echo
 echo "======================================================================"
-echo "V11 FULL-CHAIN PRE-EXECUTION AUDIT PASSED"
+echo "V12 FULL-CHAIN PRE-EXECUTION AUDIT PASSED"
 echo "EXECUTING IMMUTABLE V9 RECOVERY WITH ONLY ESSL SEMANTIC CORRECTION"
 echo "======================================================================"
 
