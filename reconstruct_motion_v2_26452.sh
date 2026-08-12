@@ -169,9 +169,9 @@ precision highp float;
 layout(local_size_x=1, local_size_y=1, local_size_z=1) in;
 uniform sampler2D inputTexture;
 uniform float exposure;
-uniform vec2 imageSize;
+uniform vec2 irisImageSize;
 void main() {
-    vec2 uv=(vec2(gl_GlobalInvocationID.xy)+vec2(0.5))/imageSize;
+    vec2 uv=(vec2(gl_GlobalInvocationID.xy)+vec2(0.5))/irisImageSize;
     float v=texture(inputTexture,uv).r*exposure;
     if(v < -1.0){ return; }
 }
