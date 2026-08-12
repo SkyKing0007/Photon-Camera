@@ -1,4 +1,4 @@
-name: Motion V2 Windows Native Reconstruction V10
+name: Motion V2 Windows Native Reconstruction V11 Full Audit
 
 on:
   push:
@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   reconstruct-and-build:
-    name: Disposable Windows E2E reconstruction V10
+    name: Disposable Windows E2E reconstruction V11
     runs-on: windows-latest
     timeout-minutes: 90
 
@@ -21,21 +21,53 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Prove branch and V9 provenance
+      - name: Rematerialize exact reconstruction inputs from Git objects
         shell: bash
         run: |
           set -euo pipefail
           git config core.autocrlf false
           git config core.eol lf
-          BRANCH="$(git branch --show-current)"
-          [[ "$BRANCH" == "experimental-mobile-26452-cfa-to-cfa" ]] || exit 1
-          [[ "$BRANCH" != "dev" ]] || exit 1
-          git rev-parse c156d3748f460e4499ade9c488828a47e96662f9:reconstruct_motion_v2_26452.sh \
-            | grep -qx 'f1062dc4f3aa8418af2f08c10ffc1463332c3149'
-          grep -q 'V10 REAL ESSL VALIDATION' reconstruct_motion_v2_26452.sh
+
+          INPUT_COUNT=0
+          while IFS= read -r -d '' path; do
+            [[ "$path" == app/* || "$path" == historical_replay/* || "$path" == "reconstruct_motion_v2_26452.sh" ]] || {
+              echo "FAIL: unexpected reconstruction input path: $path"
+              exit 1
+            }
+            tmp="${path}.iris_git_blob_tmp"
+            git cat-file blob "HEAD:$path" > "$tmp"
+            mv -f "$tmp" "$path"
+            INPUT_COUNT=$((INPUT_COUNT + 1))
+          done < <(git ls-files -z -- app historical_replay reconstruct_motion_v2_26452.sh)
+
+          [[ "$INPUT_COUNT" -gt 100 ]] || { echo "FAIL: suspicious input count $INPUT_COUNT"; exit 1; }
+
+          VERIFY_COUNT=0
+          while IFS= read -r -d '' path; do
+            expected="$(git rev-parse "HEAD:$path")"
+            actual="$(git hash-object --no-filters "$path")"
+            [[ "$actual" == "$expected" ]] || {
+              echo "FAIL: committed-byte mismatch: $path"
+              exit 1
+            }
+            VERIFY_COUNT=$((VERIFY_COUNT + 1))
+          done < <(git ls-files -z -- app historical_replay reconstruct_motion_v2_26452.sh)
+          [[ "$VERIFY_COUNT" -eq "$INPUT_COUNT" ]]
+
+          EXPECTED_LAUNCHER_BLOB="3d7bfe4d336cbcf732ed4041ad1ac8ca9aea6b30"
+          [[ "$(git rev-parse HEAD:reconstruct_motion_v2_26452.sh)" == "$EXPECTED_LAUNCHER_BLOB" ]] || {
+            echo "FAIL: committed V11 launcher blob mismatch"
+            exit 1
+          }
+          [[ "$(git hash-object --no-filters reconstruct_motion_v2_26452.sh)" == "$EXPECTED_LAUNCHER_BLOB" ]] || {
+            echo "FAIL: worktree V11 launcher blob mismatch"
+            exit 1
+          }
+
           echo "candidate/source validation PASS"
           echo "Temporary-copy validation: PASS"
           echo "PRE-BUILD SAFETY PROOF PASSED"
+          echo "PASS: reconstruction inputs rematerialized from exact Git blobs"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
@@ -46,7 +78,7 @@ jobs:
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Install deterministic Windows NDK
+      - name: Install and verify deterministic Windows NDK
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -58,62 +90,82 @@ jobs:
           }
           if (-not $SdkManager) { throw "sdkmanager.bat not found" }
           & $SdkManager "ndk;27.3.13750724"
-          if ($LASTEXITCODE -ne 0) { throw "Failed to install NDK" }
+          if ($LASTEXITCODE -ne 0) { throw "Failed to install NDK 27.3.13750724" }
           $Glslc = Join-Path $env:ANDROID_HOME "ndk\27.3.13750724\shader-tools\windows-x86_64\glslc.exe"
           if (-not (Test-Path -LiteralPath $Glslc -PathType Leaf)) { throw "glslc.exe missing" }
           & $Glslc --version
           if ($LASTEXITCODE -ne 0) { throw "glslc.exe did not execute" }
           Write-Host "PASS: deterministic Windows NDK glslc.exe verified"
 
-      - name: Install real Khronos GLSL ESSL validator
+      - name: Install and falsify-test real Khronos ESSL validator
         shell: bash
         run: |
           set -euo pipefail
           MSYS_BASH="C:/msys64/usr/bin/bash.exe"
-          [[ -f "$MSYS_BASH" ]] || { echo "FAIL: MSYS2 bash not found"; exit 1; }
+          [[ -f "$MSYS_BASH" ]] || { echo "FAIL: MSYS2 bash missing"; exit 1; }
           "$MSYS_BASH" -lc "pacman -Sy --noconfirm --needed mingw-w64-ucrt-x86_64-glslang"
+
           REAL_GLSLANG="C:/msys64/ucrt64/bin/glslangValidator.exe"
           [[ -f "$REAL_GLSLANG" ]] || { echo "FAIL: glslangValidator.exe missing"; exit 1; }
           "$REAL_GLSLANG" --version
-          SMOKE="$RUNNER_TEMP/iris_v10_essl_workflow_smoke"
-          rm -rf "$SMOKE"
-          mkdir -p "$SMOKE"
-          cat > "$SMOKE/legal_photon_style.comp" <<'EOF'
+
+          SMOKE="$RUNNER_TEMP/iris_v11_essl_smoke"
+          rm -rf "$SMOKE" && mkdir -p "$SMOKE"
+          cat > "$SMOKE/legal.comp" <<'GLSL'
           #version 310 es
           precision highp float;
-          layout(local_size_x=1, local_size_y=1, local_size_z=1) in;
+          precision highp image2D;
+          layout(local_size_x=1,local_size_y=1,local_size_z=1) in;
           uniform sampler2D inputTexture;
-          uniform float exposure;
-          uniform vec2 irisImageSize;
+          uniform float exposureGain;
+          uniform vec2 irisImageExtent;
+          layout(rgba16f,binding=0) uniform highp writeonly image2D outImage;
           void main(){
-              vec2 uv=(vec2(gl_GlobalInvocationID.xy)+vec2(0.5))/irisImageSize;
-              float v=texture(inputTexture,uv).r*exposure;
-              if(v < -1.0){ return; }
+              ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+              vec2 uv=(vec2(p)+vec2(0.5))/max(irisImageExtent,vec2(1.0));
+              imageStore(outImage,p,vec4(texture(inputTexture,uv).r*exposureGain));
           }
-          EOF
-          "$REAL_GLSLANG" -S comp "$SMOKE/legal_photon_style.comp"
-          cat > "$SMOKE/invalid.comp" <<'EOF'
+          GLSL
+          "$REAL_GLSLANG" -S comp "$SMOKE/legal.comp"
+
+          cat > "$SMOKE/invalid.comp" <<'GLSL'
           #version 310 es
           layout(local_size_x=1) in;
           void main( {
-          EOF
+          GLSL
           if "$REAL_GLSLANG" -S comp "$SMOKE/invalid.comp" >/dev/null 2>&1; then
-            echo "FAIL: validator accepted intentionally invalid GLSL"
+            echo "FAIL: ESSL validator accepted intentionally invalid GLSL"
             exit 1
           fi
+
           echo "REAL_GLSLANG_VALIDATOR=$REAL_GLSLANG" >> "$GITHUB_ENV"
           echo "candidate/source validation PASS"
           echo "Temporary-copy validation: PASS"
           echo "PRE-BUILD SAFETY PROOF PASSED"
+          echo "PASS: real Khronos ESSL positive + negative smoke tests"
+
+      - name: Prove branch and pinned V11 launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="$(git branch --show-current)"
+          [[ "$BRANCH" == "experimental-mobile-26452-cfa-to-cfa" ]] || { echo "FAIL: wrong branch $BRANCH"; exit 1; }
+          [[ "$BRANCH" != "dev" ]]
+          EXPECTED_LAUNCHER_BLOB="3d7bfe4d336cbcf732ed4041ad1ac8ca9aea6b30"
+          [[ "$(git rev-parse HEAD:reconstruct_motion_v2_26452.sh)" == "$EXPECTED_LAUNCHER_BLOB" ]]
+          [[ "$(git hash-object --no-filters reconstruct_motion_v2_26452.sh)" == "$EXPECTED_LAUNCHER_BLOB" ]]
+          grep -q 'V11 FULL-CHAIN HISTORICAL RECOVERY AUDIT' reconstruct_motion_v2_26452.sh
+          for tool in git bash pwsh python3 cygpath sha256sum tar base64; do command -v "$tool"; done
+          echo "PASS: branch / V11 launcher / toolchain contract proven"
 
       - name: Full disposable Windows reconstruction and APK build
         shell: bash
         run: |
           set -euo pipefail
-          [[ "${OS:-}" == "Windows_NT" ]] || exit 1
-          [[ -n "${REAL_GLSLANG_VALIDATOR:-}" ]] || exit 1
+          [[ "${OS:-}" == "Windows_NT" ]] || { echo "FAIL: expected Windows_NT"; exit 1; }
+          [[ -n "${REAL_GLSLANG_VALIDATOR:-}" ]] || { echo "FAIL: REAL_GLSLANG_VALIDATOR missing"; exit 1; }
 
-          AUDIT_ROOT="${RUNNER_TEMP}/iris_26452_v10_e2e_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+          AUDIT_ROOT="${RUNNER_TEMP}/iris_26452_v11_e2e_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
           AUDIT_REPO="$AUDIT_ROOT/repo"
           EVIDENCE="$GITHUB_WORKSPACE/motion-v2-e2e-evidence"
           rm -rf "$AUDIT_ROOT" "$EVIDENCE" "$GITHUB_WORKSPACE/motion-v2-build-output"
@@ -123,6 +175,20 @@ jobs:
           git -C "$AUDIT_REPO" config core.autocrlf false
           git -C "$AUDIT_REPO" config core.eol lf
           git -C "$AUDIT_REPO" checkout -B experimental-mobile-26452-cfa-to-cfa "$GITHUB_SHA"
+          [[ "$(git -C "$AUDIT_REPO" rev-parse HEAD)" == "$GITHUB_SHA" ]]
+
+          FILE_COUNT=0
+          while IFS= read -r -d '' path; do
+            expected="$(git -C "$AUDIT_REPO" rev-parse "HEAD:$path")"
+            actual="$(git -C "$AUDIT_REPO" hash-object --no-filters "$AUDIT_REPO/$path")"
+            [[ "$actual" == "$expected" ]] || { echo "FAIL: disposable byte mismatch $path"; exit 1; }
+            FILE_COUNT=$((FILE_COUNT + 1))
+          done < <(git -C "$AUDIT_REPO" ls-files -z app historical_replay reconstruct_motion_v2_26452.sh)
+          [[ "$FILE_COUNT" -gt 100 ]]
+
+          EXPECTED_LAUNCHER_BLOB="3d7bfe4d336cbcf732ed4041ad1ac8ca9aea6b30"
+          [[ "$(git -C "$AUDIT_REPO" rev-parse HEAD:reconstruct_motion_v2_26452.sh)" == "$EXPECTED_LAUNCHER_BLOB" ]]
+          [[ "$(git -C "$AUDIT_REPO" hash-object --no-filters "$AUDIT_REPO/reconstruct_motion_v2_26452.sh")" == "$EXPECTED_LAUNCHER_BLOB" ]]
 
           chmod +x "$AUDIT_REPO/reconstruct_motion_v2_26452.sh"
           set +e
@@ -135,27 +201,37 @@ jobs:
           [[ "$RC" -eq 0 ]] || { echo "FAIL: full disposable reconstruction returned $RC"; exit "$RC"; }
 
           OUT="$AUDIT_REPO/motion-v2-build-output"
-          [[ -f "$OUT/version.properties" ]] || { echo "FAIL: version.properties missing"; exit 1; }
+          [[ -f "$OUT/version.properties" ]] || { echo "FAIL: final version.properties missing"; exit 1; }
           grep -q '^VERSION_NAME=0\.9726452$' "$OUT/version.properties"
           grep -q '^VERSION_BUILD=26452$' "$OUT/version.properties"
           APK_COUNT="$(find "$OUT" -maxdepth 1 -type f -name '*.apk' | wc -l | tr -d ' ')"
           [[ "$APK_COUNT" -ge 1 ]] || { echo "FAIL: no APK produced"; exit 1; }
+
           cp -a "$OUT" "$GITHUB_WORKSPACE/motion-v2-build-output"
           cp "$OUT/version.properties" "$EVIDENCE/final_version.properties"
           sha256sum "$GITHUB_WORKSPACE"/motion-v2-build-output/*.apk > "$EVIDENCE/apk_sha256.txt"
+
+          while IFS= read -r -d '' path; do
+            expected="$(git rev-parse "HEAD:$path")"
+            actual="$(git hash-object --no-filters "$path")"
+            [[ "$actual" == "$expected" ]] || { echo "FAIL: primary checkout modified $path"; exit 1; }
+          done < <(git ls-files -z -- app historical_replay reconstruct_motion_v2_26452.sh)
+          git diff --exit-code -- app historical_replay reconstruct_motion_v2_26452.sh
+
           echo "candidate/source validation PASS"
           echo "Temporary-copy validation: PASS"
           echo "PRE-BUILD SAFETY PROOF PASSED"
           echo "BUILD SUCCESSFUL"
-          echo "PASS: expected 0.9726452 / 26452 output verified"
+          echo "PASS: expected 0.9726452 / 26452 APK verified"
+          echo "PASS: primary checkout remained untouched"
 
-      - name: Verify final APK
+      - name: Verify final artifact package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $Output = Join-Path $PWD "motion-v2-build-output"
           $VersionFile = Join-Path $Output "version.properties"
-          if (-not (Test-Path -LiteralPath $VersionFile -PathType Leaf)) { throw "Final version.properties missing" }
+          if (-not (Test-Path -LiteralPath $VersionFile -PathType Leaf)) { throw "version.properties missing" }
           $Version = Get-Content -LiteralPath $VersionFile -Raw
           if ($Version -notmatch '(?m)^VERSION_NAME=0\.9726452$') { throw "Final VERSION_NAME is not 0.9726452" }
           if ($Version -notmatch '(?m)^VERSION_BUILD=26452$') { throw "Final VERSION_BUILD is not 26452" }
@@ -171,7 +247,7 @@ jobs:
       - name: Upload Motion V2 APK and audit evidence
         uses: actions/upload-artifact@v4
         with:
-          name: motion-v2-windows-v10-${{ github.run_number }}
+          name: motion-v2-windows-v11-full-audit-${{ github.run_number }}
           path: |
             motion-v2-build-output/
             motion-v2-e2e-evidence/
