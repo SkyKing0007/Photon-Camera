@@ -112,16 +112,24 @@ start = text.index(start_anchor)
 end = text.index(end_anchor, start)
 old_block = text[start:end]
 
-for required in (
-    r"^Write-Host\\s+",
+# Prove this is the audited vulnerable 4be6661 Gate 6B1 detector without
+# depending on the spelling/escaping of its PowerShell-heading regex.
+semantic_requirements = (
+    "headings = list(re.finditer(",
     'if any(k in title for k in ("GLSL", "APPLY", "JAVAC", " APK BUILD", " BUILD "))',
     'raise SystemExit("FAIL: no safe post-candidate truncation gate found")',
-):
+)
+for required in semantic_requirements:
     if required not in old_block:
         raise SystemExit(
-            "FAIL: vulnerable detector does not match audited 4be6661 form: "
+            "FAIL: vulnerable detector does not match audited 4be6661 semantics: "
             + required
         )
+
+if "Write-Host" not in old_block:
+    raise SystemExit(
+        "FAIL: audited 4be6661 vulnerable detector no longer appears Write-Host-only"
+    )
 
 new_block = r"""
 # -------------------------------------------------------------------------
@@ -275,8 +283,13 @@ if text.count(marker) != 1:
 patched_start = text.index(marker)
 patched_end = text.index("text = text[:cut]", patched_start)
 patched_block = text[patched_start:patched_end]
-if r"^Write-Host\\s+" in patched_block:
-    raise SystemExit("FAIL: Write-Host-only Gate 6B1 detector survived patch")
+
+# Prove the old heading-scanner construction itself is gone, without comparing
+# escaped regex spelling.
+if "headings = list(re.finditer(" in patched_block:
+    raise SystemExit(
+        "FAIL: old Write-Host-only Gate 6B1 heading scanner survived patch"
+    )
 
 dst.write_text(text, encoding="utf-8")
 print("PASS: exact one-block Gate 6B1 transformation applied")
@@ -494,4 +507,4 @@ echo
 chmod +x "$GENERATED"
 exec bash "$GENERATED"
 
-# Delivered revision: 2026-08-12 Gate 6B1 logger-agnostic truncation hardening.
+# Delivered revision v2: 2026-08-12 semantic Gate 6B1 hardening.
