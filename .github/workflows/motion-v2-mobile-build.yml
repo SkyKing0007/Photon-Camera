@@ -1,4 +1,4 @@
-name: Motion V2 Mobile APK Build
+name: Motion V2 Windows Native Reconstruction
 
 on:
   push:
@@ -10,17 +10,17 @@ permissions:
   contents: read
 
 jobs:
-  build-debug-apk:
-    name: Build Motion V2 Debug APK
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+  reconstruct-and-build:
+    name: Windows-native Motion V2 reconstruction
+    runs-on: windows-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout experimental source
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-        
+
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
@@ -30,90 +30,116 @@ jobs:
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@v4
 
-      - name: Run Motion V2 reconstruction safety gates
+      - name: Verify Windows Android SDK and install deterministic NDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:ANDROID_HOME) {
+            throw "ANDROID_HOME is not set"
+          }
+
+          Write-Host "ANDROID_HOME=$env:ANDROID_HOME"
+
+          $SdkManager = Join-Path $env:ANDROID_HOME "cmdline-tools\latest\bin\sdkmanager.bat"
+          if (-not (Test-Path -LiteralPath $SdkManager -PathType Leaf)) {
+            $SdkManager = Get-ChildItem `
+              -Path (Join-Path $env:ANDROID_HOME "cmdline-tools") `
+              -Filter "sdkmanager.bat" `
+              -Recurse `
+              -File |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+
+          if (-not $SdkManager -or -not (Test-Path -LiteralPath $SdkManager -PathType Leaf)) {
+            throw "sdkmanager.bat not found"
+          }
+
+          & $SdkManager "ndk;27.3.13750724"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to install NDK 27.3.13750724"
+          }
+
+          $Glslc = Join-Path $env:ANDROID_HOME "ndk\27.3.13750724\shader-tools\windows-x86_64\glslc.exe"
+          if (-not (Test-Path -LiteralPath $Glslc -PathType Leaf)) {
+            throw "Expected Windows NDK glslc.exe missing: $Glslc"
+          }
+
+          & $Glslc --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows NDK glslc.exe did not execute"
+          }
+
+          Write-Host "PASS: deterministic Windows NDK glslc.exe verified"
+
+      - name: Verify branch before reconstruction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $Branch = git branch --show-current
+          if ($Branch.Trim() -ne "experimental-mobile-26452-cfa-to-cfa") {
+            throw "Unexpected branch: $Branch"
+          }
+
+          if ($Branch.Trim() -eq "dev") {
+            throw "Refusing to run on dev"
+          }
+
+          Write-Host "PASS: branch = $($Branch.Trim())"
+          Write-Host "HEAD: $(git rev-parse HEAD)"
+
+      - name: Run Windows-native Motion V2 reconstruction and build
         shell: bash
         run: |
+          set -euo pipefail
+
+          [[ "${OS:-}" == "Windows_NT" ]] || {
+            echo "FAIL: expected Windows_NT"
+            exit 1
+          }
+
+          command -v cygpath
+          command -v pwsh
+          command -v python3
+
           chmod +x ./reconstruct_motion_v2_26452.sh
           ./reconstruct_motion_v2_26452.sh
 
-      - name: Verify branch and source version
-        shell: bash
+      - name: Verify reconstructed build output
+        shell: pwsh
         run: |
-          set -euo pipefail
+          $ErrorActionPreference = "Stop"
 
-          echo "Git ref: ${GITHUB_REF}"
-          echo "Commit: ${GITHUB_SHA}"
+          $Output = Join-Path $PWD "motion-v2-build-output"
+          if (-not (Test-Path -LiteralPath $Output -PathType Container)) {
+            throw "motion-v2-build-output directory missing"
+          }
 
-          if [[ "${GITHUB_REF}" != "refs/heads/experimental-mobile-26452-cfa-to-cfa" ]]; then
-            echo "ERROR: Refusing to build unexpected branch: ${GITHUB_REF}"
-            exit 1
-          fi
+          $VersionFile = Join-Path $Output "version.properties"
+          if (-not (Test-Path -LiteralPath $VersionFile -PathType Leaf)) {
+            throw "version.properties missing from reconstruction output"
+          }
 
-          echo
-          echo "app/version.properties:"
-          cat app/version.properties
+          Get-Content -LiteralPath $VersionFile
 
-          echo
-          echo "Gradle wrapper:"
-          grep '^distributionUrl=' gradle/wrapper/gradle-wrapper.properties
+          $Apks = @(Get-ChildItem -LiteralPath $Output -Filter "*.apk" -File)
+          if ($Apks.Count -lt 1) {
+            throw "No APK produced by reconstruction"
+          }
 
-          echo
-          echo "PRE-BUILD BRANCH SAFETY CHECK PASSED"
+          foreach ($Apk in $Apks) {
+            $Hash = Get-FileHash -Algorithm SHA256 -LiteralPath $Apk.FullName
+            Write-Host "APK: $($Apk.Name)"
+            Write-Host "SHA256: $($Hash.Hash)"
+          }
 
-      - name: Make Gradle wrapper executable
-        run: chmod +x ./gradlew
-
-      - name: Build debug APK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ./gradlew :app:assembleDebug --stacktrace
-
-          echo
-          echo "APK files produced:"
-          find app/build/outputs/apk/debug -type f -name '*.apk' -print
-
-          APK_COUNT="$(find app/build/outputs/apk/debug -type f -name '*.apk' | wc -l)"
-
-          if [[ "${APK_COUNT}" -lt 1 ]]; then
-            echo "ERROR: Gradle completed but no debug APK was found."
-            exit 1
-          fi
-
-          echo
-          echo "BUILD SUCCESSFUL APK VERIFICATION PASSED"
-
-      - name: Collect build information
-        if: success()
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p motion-v2-build-output
-
-          cp app/version.properties motion-v2-build-output/version.properties
-
-          find app/build/outputs/apk/debug \
-            -type f \
-            -name '*.apk' \
-            -exec cp {} motion-v2-build-output/ \;
-
-          {
-            echo "branch=${GITHUB_REF_NAME}"
-            echo "commit=${GITHUB_SHA}"
-            echo "run=${GITHUB_RUN_ID}"
-            echo
-            sha256sum motion-v2-build-output/*.apk
-          } > motion-v2-build-output/build-proof.txt
-
-          cat motion-v2-build-output/build-proof.txt
+          Write-Host "BUILD SUCCESSFUL APK VERIFICATION PASSED"
 
       - name: Upload Motion V2 APK
-        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: motion-v2-debug-${{ github.run_number }}
+          name: motion-v2-windows-native-${{ github.run_number }}
           path: motion-v2-build-output/
           if-no-files-found: error
           retention-days: 14

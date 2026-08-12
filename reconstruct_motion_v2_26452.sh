@@ -86,98 +86,6 @@ echo "PASS: binary pre-run app patch saved: $PRE_PATCH"
 echo "PASS: pre-run state saved: $STATE"
 
 echo
-echo "=== REVISION GATE R1.5: LINUX NDK GLSLC COMPATIBILITY ==="
-
-SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
-if [[ -z "$SDK_ROOT" ]]; then
-    fail "ANDROID_SDK_ROOT/ANDROID_HOME is not set on the GitHub Actions runner"
-fi
-[[ -d "$SDK_ROOT" ]] || fail "Android SDK root does not exist: $SDK_ROOT"
-
-NDK_ROOT="$SDK_ROOT/ndk"
-mkdir -p "$NDK_ROOT"
-
-# Android NDK r12+ ships glslc under <ndk>/shader-tools/.  Historical Windows
-# scripts look specifically for shader-tools/windows-x86_64/glslc.exe.
-# On Linux, provide a compatibility symlink to the real Linux NDK binary.
-FOUND_REAL_GLSLC=0
-
-install_glslc_aliases() {
-    local ndk linux_glslc win_dir win_alias
-    for ndk in "$NDK_ROOT"/*; do
-        [[ -d "$ndk" ]] || continue
-        linux_glslc="$ndk/shader-tools/linux-x86_64/glslc"
-        [[ -x "$linux_glslc" ]] || continue
-
-        FOUND_REAL_GLSLC=1
-        win_dir="$ndk/shader-tools/windows-x86_64"
-        win_alias="$win_dir/glslc.exe"
-
-        mkdir -p "$win_dir"
-        ln -sfn ../linux-x86_64/glslc "$win_alias"
-
-        [[ -x "$win_alias" ]] \
-            || fail "Linux glslc compatibility alias is not executable: $win_alias"
-
-        echo "PASS: real Linux glslc = $linux_glslc"
-        echo "PASS: historical Windows alias = $win_alias"
-    done
-}
-
-install_glslc_aliases
-
-if [[ "$FOUND_REAL_GLSLC" -ne 1 ]]; then
-    SDKMANAGER=""
-    for candidate in \
-        "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-        "$SDK_ROOT/cmdline-tools/bin/sdkmanager" \
-        "$SDK_ROOT/tools/bin/sdkmanager"
-    do
-        if [[ -x "$candidate" ]]; then
-            SDKMANAGER="$candidate"
-            break
-        fi
-    done
-
-    [[ -n "$SDKMANAGER" ]] \
-        || fail "No installed NDK glslc and sdkmanager is unavailable"
-
-    NDK_PACKAGE="ndk;27.3.13750724"
-    echo "No usable NDK glslc was preinstalled; installing deterministic $NDK_PACKAGE"
-
-    yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
-    "$SDKMANAGER" "$NDK_PACKAGE" \
-        || fail "sdkmanager failed to install $NDK_PACKAGE"
-
-    FOUND_REAL_GLSLC=0
-    install_glslc_aliases
-fi
-
-[[ "$FOUND_REAL_GLSLC" -eq 1 ]] \
-    || fail "No real Linux Android NDK glslc is available after deterministic setup"
-
-# Prove PowerShell can see and execute the same .exe-named alias the historical
-# Windows scripts will discover.  This validates the compatibility mechanism
-# before any historical candidate transformation is executed.
-PROBE_ALIAS="$(
-    find "$NDK_ROOT" \
-        -type l \
-        -path '*/shader-tools/windows-x86_64/glslc.exe' \
-        -print \
-        | sort -V \
-        | tail -n 1
-)"
-[[ -n "$PROBE_ALIAS" ]] || fail "No historical glslc.exe compatibility alias was created"
-
-pwsh -NoLogo -NoProfile -Command \
-    '$p=$args[0]; if(-not (Test-Path -LiteralPath $p)){exit 11}; & $p --version; exit $LASTEXITCODE' \
-    "$PROBE_ALIAS" \
-    || fail "PowerShell could not execute the Linux glslc compatibility alias"
-
-echo "PASS: PowerShell historical glslc.exe path executes real Linux NDK glslc"
-echo "PASS: no historical replay source file was modified"
-
-echo
 echo "=== REVISION GATE R2: SURGICAL GATE 6B1 TRANSFORMATION ==="
 
 python3 - "$CANONICAL_COPY" "$GENERATED" <<'PY'
@@ -503,6 +411,95 @@ for fragment in required_v4_fragments:
             "FAIL: V4 provenance structural fragment missing: " + fragment
         )
 
+# -------------------------------------------------------------------------
+# IRIS_26452_WINDOWS_NATIVE_REPLAY_PATHS
+# -------------------------------------------------------------------------
+
+windows_rewrites = (
+    (
+        'python3 - "$G5M_SOURCE" "$G5M_SCRIPT" "$G5M_REPO" "$G5M_OUT" <<\'PY\'',
+        'python3 - "$G5M_SOURCE" "$G5M_SCRIPT" "$(cygpath -w "$G5M_REPO")" "$G5M_OUT" <<\'PY\'',
+        "Gate 5M PowerShell repository path",
+    ),
+    (
+        'python3 - "$source" "$output" "$G6_REPO" \\\n',
+        'python3 - "$source" "$output" "$(cygpath -w "$G6_REPO")" \\\n',
+        "Gate 6 PowerShell repository path",
+    ),
+)
+
+for old, new, label in windows_rewrites:
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(
+            "FAIL: Windows-native rewrite anchor count for "
+            + label
+            + " = "
+            + str(count)
+        )
+    text = text.replace(old, new, 1)
+
+windows_gate_anchor = 'echo "MOTION V2 26452 RECONSTRUCTION"\n'
+if text.count(windows_gate_anchor) != 1:
+    raise SystemExit(
+        "FAIL: canonical reconstruction banner anchor count="
+        + str(text.count(windows_gate_anchor))
+    )
+
+windows_gate = (
+    'if [[ "${OS:-}" != "Windows_NT" ]]; then\n'
+    '    fail "This reconstruction path requires GitHub Actions windows-latest"\n'
+    'fi\n'
+    'command -v cygpath >/dev/null 2>&1 || fail "cygpath unavailable in Git Bash"\n'
+    'command -v pwsh >/dev/null 2>&1 || fail "PowerShell 7 unavailable on Windows runner"\n'
+    'echo "PASS: Windows-native Git Bash + PowerShell environment proven"\n'
+)
+
+text = text.replace(
+    windows_gate_anchor,
+    windows_gate_anchor + windows_gate,
+    1,
+)
+
+ndk_gate_anchor = 'echo "=== GATE 0A: BRANCH SAFETY ==="\n'
+if text.count(ndk_gate_anchor) != 1:
+    raise SystemExit(
+        "FAIL: canonical Gate 0A anchor count="
+        + str(text.count(ndk_gate_anchor))
+    )
+
+ndk_gate = '''WINDOWS_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+[[ -n "$WINDOWS_SDK_ROOT" ]] || fail "ANDROID_SDK_ROOT/ANDROID_HOME missing"
+WINDOWS_NDK_GLSLC="$(
+    find "$WINDOWS_SDK_ROOT/ndk" \
+        -type f \
+        -path '*/shader-tools/windows-x86_64/glslc.exe' \
+        -print 2>/dev/null \
+        | sort -V \
+        | tail -n 1
+)"
+[[ -n "$WINDOWS_NDK_GLSLC" ]] || fail "Real Windows NDK glslc.exe not found"
+[[ -f "$WINDOWS_NDK_GLSLC" ]] || fail "Windows NDK glslc.exe path is not a file"
+"$WINDOWS_NDK_GLSLC" --version >/dev/null \
+    || fail "Real Windows NDK glslc.exe could not execute from Git Bash"
+echo "PASS: real Windows NDK glslc.exe = $WINDOWS_NDK_GLSLC"
+'''
+
+text = text.replace(
+    ndk_gate_anchor,
+    ndk_gate_anchor + ndk_gate + "\n",
+    1,
+)
+
+for required in (
+    '$(cygpath -w "$G5M_REPO")',
+    '$(cygpath -w "$G6_REPO")',
+    'This reconstruction path requires GitHub Actions windows-latest',
+    'Real Windows NDK glslc.exe not found',
+):
+    if required not in text:
+        raise SystemExit("FAIL: Windows-native structural proof missing: " + required)
+
 marker = "IRIS_26452_GATE6B1_HARDENED_TRUNCATION_CONTRACT"
 if text.count(marker) != 1:
     raise SystemExit(
@@ -753,4 +750,4 @@ echo
 chmod +x "$GENERATED"
 exec bash "$GENERATED"
 
-# Delivered revision v6: 2026-08-12 Linux NDK glslc compatibility + structural provenance.
+# Windows-native replacement path: 2026-08-12. No Linux PowerShell emulation.
