@@ -766,6 +766,170 @@ else:
 PY
 
 echo
+echo "=== REVISION GATE R4W: COMPLETE WINDOWS PRE-EXECUTION AUDIT ==="
+
+[[ "${OS:-}" == "Windows_NT" ]] \
+    || fail "R4W requires GitHub Actions Windows"
+
+# Every external Unix-style command used by the orchestration must be present
+# in Git Bash before the generated reconstruction is allowed to execute.
+REQUIRED_BASH_TOOLS=(
+    bash git python3 pwsh cygpath
+    sha256sum awk sed grep base64 tar diff
+    find xargs sort wc tr chmod cp mv rm mkdir cat
+)
+
+for tool in "${REQUIRED_BASH_TOOLS[@]}"; do
+    command -v "$tool" >/dev/null 2>&1 \
+        || fail "R4W missing required Windows Git-Bash tool: $tool"
+done
+
+echo "PASS: complete Git-Bash/PowerShell toolchain present"
+
+# The Windows workflow installs the deterministic NDK before this launcher.
+WINDOWS_SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+[[ -n "$WINDOWS_SDK_ROOT" ]] \
+    || fail "R4W Android SDK root missing"
+
+R4W_GLSLC="$(
+    find "$WINDOWS_SDK_ROOT/ndk" \
+        -type f \
+        -path '*/shader-tools/windows-x86_64/glslc.exe' \
+        -print 2>/dev/null \
+        | sort -V \
+        | tail -n 1
+)"
+
+[[ -n "$R4W_GLSLC" && -f "$R4W_GLSLC" ]] \
+    || fail "R4W real Windows NDK glslc.exe missing"
+
+"$R4W_GLSLC" --version >/dev/null 2>&1 \
+    || fail "R4W real Windows NDK glslc.exe cannot execute"
+
+echo "PASS: real Windows NDK GLSL compiler executes"
+
+# Audit the fully generated reconstruction, not merely this outer launcher.
+python3 - "$GENERATED" <<'PY'
+from pathlib import Path
+import ast
+import re
+import sys
+
+p = Path(sys.argv[1])
+text = p.read_text(encoding="utf-8")
+
+# These may appear in comments/diagnostic strings in an outer patcher, but must
+# not survive as executable dependencies in the fully generated reconstruction.
+forbidden = {
+    "sudo apt-get": "Linux package manager",
+    "apt-get update": "Linux package manager",
+    "linux-x86_64": "Linux NDK executable",
+    "/workspaces/": "Codespaces checkout path",
+    "/usr/local/": "Linux local binary path",
+}
+
+for token, label in forbidden.items():
+    if token in text:
+        raise SystemExit(
+            f"FAIL: R4W generated reconstruction still contains {label}: {token}"
+        )
+
+# Gate 4B must have been replaced with the native Windows compiler proof.
+required = (
+    "=== GATE 4B: VERIFY REAL WINDOWS NDK GLSL COMPILER ===",
+    "windows-x86_64/glslc.exe",
+    "This reconstruction path requires GitHub Actions windows-latest",
+    '$(cygpath -w "$G5M_REPO")',
+    '$(cygpath -w "$G6_REPO")',
+    "build_26439_windows_v2_temporal_channel_ownership.ps1",
+)
+for token in required:
+    if token not in text:
+        raise SystemExit(
+            "FAIL: R4W generated reconstruction missing required Windows contract: "
+            + token
+        )
+
+# Parse every Python heredoc that will execute inside the generated script, and
+# additionally prove common module-qualified references have matching imports.
+pattern = re.compile(r"<<'PY'\n(?P<body>.*?)\nPY(?:\n|$)", re.DOTALL)
+bodies = [m.group("body") for m in pattern.finditer(text)]
+if not bodies:
+    raise SystemExit("FAIL: R4W generated reconstruction contains no Python heredocs")
+
+for index, body in enumerate(bodies, 1):
+    try:
+        tree = ast.parse(body)
+    except SyntaxError as ex:
+        raise SystemExit(
+            f"FAIL: R4W generated Python heredoc {index} syntax error: {ex}"
+        )
+
+    imports = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imports.add(node.module.split(".")[0])
+
+    module_refs = {
+        name for name in ("re", "sys", "os", "json", "base64", "hashlib",
+                          "subprocess", "shutil", "tempfile")
+        if re.search(rf"\b{name}\.", body)
+    }
+    missing = sorted(module_refs - imports)
+    if missing:
+        raise SystemExit(
+            f"FAIL: R4W generated Python heredoc {index} missing imports: {missing}"
+        )
+
+print(f"PASS: {len(bodies)} generated Python heredocs parsed with import audit")
+print("PASS: no Linux-only executable dependencies survive generated reconstruction")
+print("PASS: required Windows-native reconstruction contracts present")
+PY
+
+# Parse every historical PowerShell source now, before historical replay.
+R4W_PS_PARSER="$SAFETY_DIR/r4w_parse_all_history.ps1"
+cat > "$R4W_PS_PARSER" <<'PWSH'
+param([Parameter(Mandatory = $true)][string]$HistoryDir)
+
+$ErrorActionPreference = "Stop"
+$files = @(Get-ChildItem -LiteralPath $HistoryDir -Filter "*.ps1" -File)
+
+if ($files.Count -lt 1) {
+    throw "FAIL: no historical PowerShell files found"
+}
+
+foreach ($file in $files) {
+    $tokens = $null
+    $errors = $null
+    [System.Management.Automation.Language.Parser]::ParseFile(
+        $file.FullName,
+        [ref]$tokens,
+        [ref]$errors
+    ) | Out-Null
+
+    if ($errors.Count -gt 0) {
+        $errors | ForEach-Object { Write-Host $_.Message }
+        throw "FAIL: historical PowerShell parser error: $($file.Name)"
+    }
+
+    Write-Host "PASS: parser $($file.Name)"
+}
+
+Write-Host "PASS: all historical PowerShell files parse"
+PWSH
+
+pwsh -NoLogo -NoProfile -File "$R4W_PS_PARSER" "$(cygpath -w "$HIST_DIR")" \
+    || fail "R4W historical PowerShell parser audit failed"
+
+echo
+echo "candidate/source validation PASS"
+echo "Temporary-copy validation: PASS"
+echo "PRE-BUILD SAFETY PROOF PASSED"
+echo "PASS: COMPLETE WINDOWS PRE-EXECUTION AUDIT"
+echo
+
 echo "=== REVISION GATE R5: PATCH MANIFEST + PRE-EXEC SOURCE INTEGRITY ==="
 
 REVISION_PATCH="$SAFETY_DIR/reconstruction_gate6b1_revision.patch"
