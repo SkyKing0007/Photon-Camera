@@ -543,6 +543,23 @@ if "sudo apt-get" in text or "glslang-tools" in text:
 if '=== GATE 4B: VERIFY REAL WINDOWS NDK GLSL COMPILER ===' not in text:
     raise SystemExit("FAIL: Windows-native Gate 4B was not installed")
 
+# Remove the three canonical Linux SDK fallbacks. On Windows Actions the SDK
+# root must come from ANDROID_SDK_ROOT or ANDROID_HOME, both proven before replay.
+linux_sdk_expr = '${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}'
+windows_sdk_expr = '${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}'
+
+linux_sdk_count = text.count(linux_sdk_expr)
+if linux_sdk_count != 3:
+    raise SystemExit(
+        "FAIL: expected exactly 3 canonical Linux SDK fallbacks, found "
+        + str(linux_sdk_count)
+    )
+
+text = text.replace(linux_sdk_expr, windows_sdk_expr)
+
+if "/usr/local/lib/android/sdk" in text:
+    raise SystemExit("FAIL: Linux Android SDK fallback survived Windows rewrite")
+
 for required in (
     '$(cygpath -w "$G5M_REPO")',
     '$(cygpath -w "$G6_REPO")',
@@ -824,7 +841,6 @@ forbidden = {
     "sudo apt-get": "Linux package manager",
     "apt-get update": "Linux package manager",
     "linux-x86_64": "Linux NDK executable",
-    "/workspaces/": "Codespaces checkout path",
     "/usr/local/": "Linux local binary path",
 }
 
@@ -833,6 +849,48 @@ for token, label in forbidden.items():
         raise SystemExit(
             f"FAIL: R4W generated reconstruction still contains {label}: {token}"
         )
+
+# /workspaces/... is a special case. The canonical reconstruction intentionally
+# contains those historical literals inside one embedded Python relocation
+# transformer whose job is to replace them before historical scripts execute.
+# Prove those are the ONLY surviving occurrences and that the relocation
+# contract itself is intact.
+reloc_marker = "# Environment relocation only."
+reloc_pos = text.find(reloc_marker)
+if reloc_pos < 0:
+    raise SystemExit("FAIL: R4W environment-relocation transformer missing")
+
+# Locate the enclosing embedded-Python heredoc.
+heredoc_start = text.rfind("<<'PY'", 0, reloc_pos)
+heredoc_end = text.find("\nPY", reloc_pos)
+if heredoc_start < 0 or heredoc_end < 0 or heredoc_end <= heredoc_start:
+    raise SystemExit("FAIL: R4W could not isolate relocation Python heredoc")
+
+reloc_body = text[heredoc_start:heredoc_end]
+outside_reloc = text[:heredoc_start] + text[heredoc_end:]
+
+if "/workspaces/" in outside_reloc:
+    raise SystemExit(
+        "FAIL: R4W executable/non-relocation Codespaces path survived outside relocation transformer"
+    )
+
+required_old_paths = (
+    "/workspaces/Photon-Camera-fresh-iris",
+    "/workspaces/Photon-Camera",
+)
+for old_path in required_old_paths:
+    if old_path not in reloc_body:
+        raise SystemExit(
+            "FAIL: R4W historical relocation literal missing: " + old_path
+        )
+
+# The relocation block may mention the old paths in comments, but every literal
+# must stay within this isolated transformer. No shell/PowerShell stage may use
+# them directly.
+if "text.replace(" not in reloc_body or "repo" not in reloc_body or "aux" not in reloc_body:
+    raise SystemExit("FAIL: R4W relocation transformer semantics incomplete")
+
+print("PASS: historical Codespaces literals are confined to relocation transformer")
 
 # Gate 4B must have been replaced with the native Windows compiler proof.
 required = (
