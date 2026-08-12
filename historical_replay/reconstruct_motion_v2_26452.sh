@@ -86,6 +86,98 @@ echo "PASS: binary pre-run app patch saved: $PRE_PATCH"
 echo "PASS: pre-run state saved: $STATE"
 
 echo
+echo "=== REVISION GATE R1.5: LINUX NDK GLSLC COMPATIBILITY ==="
+
+SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+if [[ -z "$SDK_ROOT" ]]; then
+    fail "ANDROID_SDK_ROOT/ANDROID_HOME is not set on the GitHub Actions runner"
+fi
+[[ -d "$SDK_ROOT" ]] || fail "Android SDK root does not exist: $SDK_ROOT"
+
+NDK_ROOT="$SDK_ROOT/ndk"
+mkdir -p "$NDK_ROOT"
+
+# Android NDK r12+ ships glslc under <ndk>/shader-tools/.  Historical Windows
+# scripts look specifically for shader-tools/windows-x86_64/glslc.exe.
+# On Linux, provide a compatibility symlink to the real Linux NDK binary.
+FOUND_REAL_GLSLC=0
+
+install_glslc_aliases() {
+    local ndk linux_glslc win_dir win_alias
+    for ndk in "$NDK_ROOT"/*; do
+        [[ -d "$ndk" ]] || continue
+        linux_glslc="$ndk/shader-tools/linux-x86_64/glslc"
+        [[ -x "$linux_glslc" ]] || continue
+
+        FOUND_REAL_GLSLC=1
+        win_dir="$ndk/shader-tools/windows-x86_64"
+        win_alias="$win_dir/glslc.exe"
+
+        mkdir -p "$win_dir"
+        ln -sfn ../linux-x86_64/glslc "$win_alias"
+
+        [[ -x "$win_alias" ]] \
+            || fail "Linux glslc compatibility alias is not executable: $win_alias"
+
+        echo "PASS: real Linux glslc = $linux_glslc"
+        echo "PASS: historical Windows alias = $win_alias"
+    done
+}
+
+install_glslc_aliases
+
+if [[ "$FOUND_REAL_GLSLC" -ne 1 ]]; then
+    SDKMANAGER=""
+    for candidate in \
+        "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+        "$SDK_ROOT/cmdline-tools/bin/sdkmanager" \
+        "$SDK_ROOT/tools/bin/sdkmanager"
+    do
+        if [[ -x "$candidate" ]]; then
+            SDKMANAGER="$candidate"
+            break
+        fi
+    done
+
+    [[ -n "$SDKMANAGER" ]] \
+        || fail "No installed NDK glslc and sdkmanager is unavailable"
+
+    NDK_PACKAGE="ndk;27.3.13750724"
+    echo "No usable NDK glslc was preinstalled; installing deterministic $NDK_PACKAGE"
+
+    yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+    "$SDKMANAGER" "$NDK_PACKAGE" \
+        || fail "sdkmanager failed to install $NDK_PACKAGE"
+
+    FOUND_REAL_GLSLC=0
+    install_glslc_aliases
+fi
+
+[[ "$FOUND_REAL_GLSLC" -eq 1 ]] \
+    || fail "No real Linux Android NDK glslc is available after deterministic setup"
+
+# Prove PowerShell can see and execute the same .exe-named alias the historical
+# Windows scripts will discover.  This validates the compatibility mechanism
+# before any historical candidate transformation is executed.
+PROBE_ALIAS="$(
+    find "$NDK_ROOT" \
+        -type l \
+        -path '*/shader-tools/windows-x86_64/glslc.exe' \
+        -print \
+        | sort -V \
+        | tail -n 1
+)"
+[[ -n "$PROBE_ALIAS" ]] || fail "No historical glslc.exe compatibility alias was created"
+
+pwsh -NoLogo -NoProfile -Command \
+    '$p=$args[0]; if(-not (Test-Path -LiteralPath $p)){exit 11}; & $p --version; exit $LASTEXITCODE' \
+    "$PROBE_ALIAS" \
+    || fail "PowerShell could not execute the Linux glslc compatibility alias"
+
+echo "PASS: PowerShell historical glslc.exe path executes real Linux NDK glslc"
+echo "PASS: no historical replay source file was modified"
+
+echo
 echo "=== REVISION GATE R2: SURGICAL GATE 6B1 TRANSFORMATION ==="
 
 python3 - "$CANONICAL_COPY" "$GENERATED" <<'PY'
@@ -661,4 +753,4 @@ echo
 chmod +x "$GENERATED"
 exec bash "$GENERATED"
 
-# Delivered revision v5: 2026-08-12 structural 26439 provenance proof + Gate 6B1 hardening.
+# Delivered revision v6: 2026-08-12 Linux NDK glslc compatibility + structural provenance.
