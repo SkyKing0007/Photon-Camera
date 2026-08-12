@@ -654,6 +654,200 @@ for repo_var in ("REPLAY_REPO", "G5M_REPO", "G6_REPO"):
                 "FAIL: nested clone exact-byte contract missing: " + contract
             )
 
+
+# -------------------------------------------------------------------------
+# IRIS_26452_HISTORICAL_LINEAGE_WINDOWS_GLSL
+# -------------------------------------------------------------------------
+
+hist_glsl_anchor = (
+    'echo "PASS: real Windows NDK glslc.exe available for historical GLSL validation"\n'
+)
+if text.count(hist_glsl_anchor) != 1:
+    raise SystemExit(
+        "FAIL: historical GLSL compatibility anchor count="
+        + str(text.count(hist_glsl_anchor))
+    )
+
+hist_glsl_block = r'''
+HIST_GLSL_BIN="$REPLAY_AUX/windows_glsl_compat"
+mkdir -p "$HIST_GLSL_BIN"
+
+cat > "$HIST_GLSL_BIN/glslangValidator" <<'GLSLANG_COMPAT'
+#!/usr/bin/env bash
+set -euo pipefail
+
+stage=""
+source_file=""
+
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -S)
+            [[ "$#" -ge 2 ]] || {
+                echo "glslangValidator compatibility: -S requires a stage" >&2
+                exit 2
+            }
+            stage="$2"
+            shift 2
+            ;;
+        -*)
+            echo "glslangValidator compatibility: unsupported option $1" >&2
+            exit 2
+            ;;
+        *)
+            [[ -z "$source_file" ]] || {
+                echo "glslangValidator compatibility: multiple source files unsupported" >&2
+                exit 2
+            }
+            source_file="$1"
+            shift
+            ;;
+    esac
+done
+
+[[ -n "$stage" ]] || {
+    echo "glslangValidator compatibility: missing -S stage" >&2
+    exit 2
+}
+[[ -n "$source_file" && -f "$source_file" ]] || {
+    echo "glslangValidator compatibility: source file missing: $source_file" >&2
+    exit 2
+}
+
+case "$stage" in
+    comp) glslc_stage="compute" ;;
+    frag) glslc_stage="fragment" ;;
+    *)
+        echo "glslangValidator compatibility: unsupported stage $stage" >&2
+        exit 2
+        ;;
+esac
+
+out_file="${source_file}.iris_glslc_validation.spv"
+trap 'rm -f "$out_file"' EXIT
+
+"${WINDOWS_NDK_GLSLC:?WINDOWS_NDK_GLSLC missing}" \
+    -fshader-stage="$glslc_stage" \
+    "$source_file" \
+    -o "$out_file"
+
+[[ -s "$out_file" ]] || {
+    echo "glslangValidator compatibility: glslc produced no SPIR-V" >&2
+    exit 1
+}
+GLSLANG_COMPAT
+
+chmod +x "$HIST_GLSL_BIN/glslangValidator"
+export WINDOWS_NDK_GLSLC
+export PATH="$HIST_GLSL_BIN:$PATH"
+
+command -v glslangValidator >/dev/null 2>&1 \
+    || fail "Historical glslangValidator compatibility shim unavailable"
+
+HIST_GLSL_SMOKE="$REPLAY_AUX/windows_glsl_compat_smoke"
+mkdir -p "$HIST_GLSL_SMOKE"
+
+cat > "$HIST_GLSL_SMOKE/compute.comp" <<'EOF_COMP'
+#version 310 es
+layout(local_size_x=1, local_size_y=1, local_size_z=1) in;
+void main() {}
+EOF_COMP
+
+cat > "$HIST_GLSL_SMOKE/fragment.frag" <<'EOF_FRAG'
+#version 310 es
+precision highp float;
+layout(location=0) out vec4 outColor;
+void main() { outColor = vec4(0.0); }
+EOF_FRAG
+
+glslangValidator -S comp "$HIST_GLSL_SMOKE/compute.comp" \
+    || fail "Historical compute GLSL compatibility smoke test failed"
+glslangValidator -S frag "$HIST_GLSL_SMOKE/fragment.frag" \
+    || fail "Historical fragment GLSL compatibility smoke test failed"
+
+echo "PASS: historical glslangValidator interface backed by real Windows NDK glslc.exe"
+'''
+
+text = text.replace(hist_glsl_anchor, hist_glsl_anchor + hist_glsl_block, 1)
+
+early_loop_anchor = 'for SCRIPT_NAME in "${REPLAY_SCRIPTS[@]}"; do\n'
+if text.count(early_loop_anchor) != 1:
+    raise SystemExit(
+        "FAIL: early replay loop anchor count="
+        + str(text.count(early_loop_anchor))
+    )
+
+early_maps = r'''
+declare -A REPLAY_EXPECTED_BUILD
+declare -A REPLAY_EXPECTED_VERSION
+
+REPLAY_EXPECTED_BUILD["build_26429_codespace_shared_guide_reference_structure.sh"]="26429"
+REPLAY_EXPECTED_BUILD["build_26430_codespace_v2_ownership_headroom_cleanup.sh"]="26430"
+REPLAY_EXPECTED_BUILD["build_26431_codespace_allframes_body_lens_ownership_v2.sh"]="26431"
+REPLAY_EXPECTED_BUILD["build_26432_codespace_stack_robust_true_ultrahdr_final.sh"]="26432"
+REPLAY_EXPECTED_BUILD["resume_26433_fix_ultrahdr_javac_type_and_build.sh"]="26433"
+REPLAY_EXPECTED_BUILD["build_26434_codespace_stable_base_smooth_motion_ultrahdr_v2.sh"]="26434"
+REPLAY_EXPECTED_BUILD["build_26435_codespace_exact26430_sdr_lowfreq_ultrahdr_v2.sh"]="26435"
+
+REPLAY_EXPECTED_VERSION["build_26429_codespace_shared_guide_reference_structure.sh"]="0.9726429"
+REPLAY_EXPECTED_VERSION["build_26430_codespace_v2_ownership_headroom_cleanup.sh"]="0.9726430"
+REPLAY_EXPECTED_VERSION["build_26431_codespace_allframes_body_lens_ownership_v2.sh"]="0.9726431"
+REPLAY_EXPECTED_VERSION["build_26432_codespace_stack_robust_true_ultrahdr_final.sh"]="0.9726432"
+REPLAY_EXPECTED_VERSION["resume_26433_fix_ultrahdr_javac_type_and_build.sh"]="0.9726433"
+REPLAY_EXPECTED_VERSION["build_26434_codespace_stable_base_smooth_motion_ultrahdr_v2.sh"]="0.9726434"
+REPLAY_EXPECTED_VERSION["build_26435_codespace_exact26430_sdr_lowfreq_ultrahdr_v2.sh"]="0.9726435"
+
+'''
+text = text.replace(early_loop_anchor, early_maps + early_loop_anchor, 1)
+
+early_pass_anchor = '    echo "PASS: $SCRIPT_NAME"\ndone\n'
+if text.count(early_pass_anchor) != 1:
+    raise SystemExit(
+        "FAIL: early replay PASS anchor count="
+        + str(text.count(early_pass_anchor))
+    )
+
+early_checks = r'''    EXPECTED_STAGE_BUILD="${REPLAY_EXPECTED_BUILD[$SCRIPT_NAME]:-}"
+    EXPECTED_STAGE_VERSION="${REPLAY_EXPECTED_VERSION[$SCRIPT_NAME]:-}"
+
+    [[ -n "$EXPECTED_STAGE_BUILD" && -n "$EXPECTED_STAGE_VERSION" ]] \
+        || fail "No lineage contract registered for $SCRIPT_NAME"
+
+    grep -q "^VERSION_BUILD=${EXPECTED_STAGE_BUILD}$" \
+        "$REPLAY_REPO/app/version.properties" \
+        || fail "$SCRIPT_NAME did not produce build $EXPECTED_STAGE_BUILD"
+
+    grep -q "^VERSION_NAME=${EXPECTED_STAGE_VERSION}$" \
+        "$REPLAY_REPO/app/version.properties" \
+        || fail "$SCRIPT_NAME did not produce version $EXPECTED_STAGE_VERSION"
+
+    grep -q 'candidate/source validation PASS' \
+        "$REPLAY_LOGS/$SCRIPT_NAME.log" \
+        || fail "$SCRIPT_NAME log lacks candidate/source validation PASS"
+
+    grep -q 'Temporary-copy validation: PASS' \
+        "$REPLAY_LOGS/$SCRIPT_NAME.log" \
+        || fail "$SCRIPT_NAME log lacks Temporary-copy validation PASS"
+
+    echo "PASS: $SCRIPT_NAME -> $EXPECTED_STAGE_VERSION / $EXPECTED_STAGE_BUILD"
+done
+'''
+text = text.replace(early_pass_anchor, early_checks, 1)
+
+for required_hist_contract in (
+    'HIST_GLSL_BIN="$REPLAY_AUX/windows_glsl_compat"',
+    'glslangValidator -S comp "$HIST_GLSL_SMOKE/compute.comp"',
+    'glslangValidator -S frag "$HIST_GLSL_SMOKE/fragment.frag"',
+    'REPLAY_EXPECTED_BUILD["build_26429_codespace_shared_guide_reference_structure.sh"]="26429"',
+    'REPLAY_EXPECTED_BUILD["build_26435_codespace_exact26430_sdr_lowfreq_ultrahdr_v2.sh"]="26435"',
+    'log lacks candidate/source validation PASS',
+    'log lacks Temporary-copy validation PASS',
+):
+    if required_hist_contract not in text:
+        raise SystemExit(
+            "FAIL: historical-lineage generated contract missing: "
+            + required_hist_contract
+        )
+
 for required in (
     '$(cygpath -w "$G5M_REPO")',
     '$(cygpath -w "$G6_REPO")',
@@ -1077,6 +1271,21 @@ if unsafe_nested:
         + repr(unsafe_nested)
     )
 
+for required_token in (
+    'HIST_GLSL_BIN="$REPLAY_AUX/windows_glsl_compat"',
+    'historical glslangValidator interface backed by real Windows NDK glslc.exe',
+    'REPLAY_EXPECTED_BUILD["build_26429_codespace_shared_guide_reference_structure.sh"]="26429"',
+    'REPLAY_EXPECTED_BUILD["build_26435_codespace_exact26430_sdr_lowfreq_ultrahdr_v2.sh"]="26435"',
+    'log lacks candidate/source validation PASS',
+    'log lacks Temporary-copy validation PASS',
+):
+    if required_token not in text:
+        raise SystemExit(
+            "FAIL: R4W historical lineage/GLSL contract missing: " + required_token
+        )
+
+print("PASS: historical Linux GLSL dependency replaced by Windows NDK glslc compatibility")
+print("PASS: retained 26429->26435 replay has per-stage lineage validation")
 print("PASS: all 3 nested reconstruction clones set LF policy before checkout")
 print(f"PASS: {len(bodies)} generated Python heredocs parsed with import audit")
 print("PASS: no Linux-only executable dependencies survive generated reconstruction")
