@@ -769,12 +769,29 @@ echo "PASS: historical glslangValidator interface backed by real Windows NDK gls
 
 text = text.replace(hist_glsl_anchor, hist_glsl_anchor + hist_glsl_block, 1)
 
-early_loop_anchor = 'for SCRIPT_NAME in "${REPLAY_SCRIPTS[@]}"; do\n'
-if text.count(early_loop_anchor) != 1:
+gate4e_heading = 'echo "=== GATE 4E: REPLAY 26429 -> 26435 IN ORDER ==="\n'
+gate4f_heading = 'echo "=== GATE 4F: VERIFY 26435 REPLAY STATE ==="\n'
+if text.count(gate4e_heading) != 1:
     raise SystemExit(
-        "FAIL: early replay loop anchor count="
-        + str(text.count(early_loop_anchor))
+        "FAIL: Gate 4E heading count="
+        + str(text.count(gate4e_heading))
     )
+
+gate4e_pos = text.index(gate4e_heading) + len(gate4e_heading)
+gate4f_pos = text.find(gate4f_heading, gate4e_pos)
+if gate4f_pos < 0:
+    raise SystemExit("FAIL: Gate 4F heading not found after Gate 4E")
+
+early_loop_anchor = 'for SCRIPT_NAME in "${REPLAY_SCRIPTS[@]}"; do\n'
+early_loop_pos = text.find(early_loop_anchor, gate4e_pos, gate4f_pos)
+if early_loop_pos < 0:
+    raise SystemExit("FAIL: Gate 4E replay loop not found")
+if text.find(
+    early_loop_anchor,
+    early_loop_pos + len(early_loop_anchor),
+    gate4f_pos,
+) >= 0:
+    raise SystemExit("FAIL: multiple replay loops found inside Gate 4E")
 
 early_maps = r'''
 declare -A REPLAY_EXPECTED_BUILD
@@ -797,14 +814,25 @@ REPLAY_EXPECTED_VERSION["build_26434_codespace_stable_base_smooth_motion_ultrahd
 REPLAY_EXPECTED_VERSION["build_26435_codespace_exact26430_sdr_lowfreq_ultrahdr_v2.sh"]="0.9726435"
 
 '''
-text = text.replace(early_loop_anchor, early_maps + early_loop_anchor, 1)
+text = (
+    text[:early_loop_pos]
+    + early_maps
+    + text[early_loop_pos:]
+)
+gate4e_pos = text.index(gate4e_heading) + len(gate4e_heading)
+gate4f_pos = text.find(gate4f_heading, gate4e_pos)
+early_loop_pos = text.find(early_loop_anchor, gate4e_pos, gate4f_pos)
 
 early_pass_anchor = '    echo "PASS: $SCRIPT_NAME"\ndone\n'
-if text.count(early_pass_anchor) != 1:
-    raise SystemExit(
-        "FAIL: early replay PASS anchor count="
-        + str(text.count(early_pass_anchor))
-    )
+early_pass_pos = text.find(early_pass_anchor, early_loop_pos, gate4f_pos)
+if early_pass_pos < 0:
+    raise SystemExit("FAIL: Gate 4E replay PASS/done anchor not found")
+if text.find(
+    early_pass_anchor,
+    early_pass_pos + len(early_pass_anchor),
+    gate4f_pos,
+) >= 0:
+    raise SystemExit("FAIL: multiple PASS/done anchors found inside Gate 4E")
 
 early_checks = r'''    EXPECTED_STAGE_BUILD="${REPLAY_EXPECTED_BUILD[$SCRIPT_NAME]:-}"
     EXPECTED_STAGE_VERSION="${REPLAY_EXPECTED_VERSION[$SCRIPT_NAME]:-}"
@@ -831,7 +859,11 @@ early_checks = r'''    EXPECTED_STAGE_BUILD="${REPLAY_EXPECTED_BUILD[$SCRIPT_NAM
     echo "PASS: $SCRIPT_NAME -> $EXPECTED_STAGE_VERSION / $EXPECTED_STAGE_BUILD"
 done
 '''
-text = text.replace(early_pass_anchor, early_checks, 1)
+text = (
+    text[:early_pass_pos]
+    + early_checks
+    + text[early_pass_pos + len(early_pass_anchor):]
+)
 
 for required_hist_contract in (
     'HIST_GLSL_BIN="$REPLAY_AUX/windows_glsl_compat"',
