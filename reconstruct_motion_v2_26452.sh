@@ -91,6 +91,7 @@ echo "=== REVISION GATE R2: SURGICAL GATE 6B1 TRANSFORMATION ==="
 python3 - "$CANONICAL_COPY" "$GENERATED" <<'PY'
 from pathlib import Path
 import sys
+import re
 
 src = Path(sys.argv[1])
 dst = Path(sys.argv[2])
