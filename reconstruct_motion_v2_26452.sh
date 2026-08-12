@@ -560,6 +560,100 @@ text = text.replace(linux_sdk_expr, windows_sdk_expr)
 if "/usr/local/lib/android/sdk" in text:
     raise SystemExit("FAIL: Linux Android SDK fallback survived Windows rewrite")
 
+
+# -------------------------------------------------------------------------
+# IRIS_26452_WINDOWS_NESTED_CLONE_EXACT_BYTES
+#
+# The reconstruction creates three additional Git repositories on the Windows
+# runner. Ordinary `git clone` performs a checkout before repository-local
+# line-ending policy can be changed, which can turn LF shader bytes into CRLF
+# and break historical exact-source SHA256 gates.
+#
+# Rewrite ALL three nested clones to:
+#   clone --no-checkout
+#   set core.autocrlf=false and core.eol=lf
+#   only then perform the historical checkout
+# -------------------------------------------------------------------------
+
+nested_clone_rewrites = (
+    (
+        'git clone --no-hardlinks . "$REPLAY_REPO" \\\n'
+        '    > "$REPLAY_LOGS/clone.log" 2>&1 \\\n'
+        '    || fail "Could not create isolated replay clone"\n'
+        '\n'
+        '(\n'
+        '    cd "$REPLAY_REPO"\n'
+        '\n'
+        '    git checkout --detach "$BASE_26428_COMMIT" \\\n',
+        'git clone --no-hardlinks --no-checkout . "$REPLAY_REPO" \\\n'
+        '    > "$REPLAY_LOGS/clone.log" 2>&1 \\\n'
+        '    || fail "Could not create isolated replay clone"\n'
+        '\n'
+        'git -C "$REPLAY_REPO" config core.autocrlf false\n'
+        'git -C "$REPLAY_REPO" config core.eol lf\n'
+        '\n'
+        '(\n'
+        '    cd "$REPLAY_REPO"\n'
+        '\n'
+        '    git checkout --detach "$BASE_26428_COMMIT" \\\n',
+        "Gate 4A replay clone",
+    ),
+    (
+        'git clone --no-hardlinks . "$G5M_REPO" >/dev/null 2>&1 || fail "Gate 5M isolated canonical clone failed"\n'
+        'git -C "$G5M_REPO" checkout --detach "$BASE_26428_COMMIT" >/dev/null 2>&1 || fail "Gate 5M canonical checkout failed"\n',
+        'git clone --no-hardlinks --no-checkout . "$G5M_REPO" >/dev/null 2>&1 || fail "Gate 5M isolated canonical clone failed"\n'
+        'git -C "$G5M_REPO" config core.autocrlf false\n'
+        'git -C "$G5M_REPO" config core.eol lf\n'
+        'git -C "$G5M_REPO" checkout --detach "$BASE_26428_COMMIT" >/dev/null 2>&1 || fail "Gate 5M canonical checkout failed"\n',
+        "Gate 5M canonical clone",
+    ),
+    (
+        'git clone --no-hardlinks . "$G6_REPO" > "$G6_LOGS/clone.log" 2>&1 \\\n'
+        '    || fail "Gate 6 could not create isolated late-history repo"\n'
+        '\n'
+        'git -C "$G6_REPO" checkout --detach "$BASE_26428_COMMIT" >/dev/null 2>&1 \\\n',
+        'git clone --no-hardlinks --no-checkout . "$G6_REPO" > "$G6_LOGS/clone.log" 2>&1 \\\n'
+        '    || fail "Gate 6 could not create isolated late-history repo"\n'
+        '\n'
+        'git -C "$G6_REPO" config core.autocrlf false\n'
+        'git -C "$G6_REPO" config core.eol lf\n'
+        '\n'
+        'git -C "$G6_REPO" checkout --detach "$BASE_26428_COMMIT" >/dev/null 2>&1 \\\n',
+        "Gate 6 late-history clone",
+    ),
+)
+
+for old, new, label in nested_clone_rewrites:
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(
+            "FAIL: nested Windows clone rewrite anchor count for "
+            + label + " = " + str(count)
+        )
+    text = text.replace(old, new, 1)
+
+# No ordinary nested reconstruction clone may remain.
+remaining_nested = re.findall(
+    r'git clone --no-hardlinks(?! --no-checkout)\s+\.\s+"\$(?:REPLAY_REPO|G5M_REPO|G6_REPO)"',
+    text,
+)
+if remaining_nested:
+    raise SystemExit(
+        "FAIL: ordinary Windows nested clone survived rewrite: "
+        + repr(remaining_nested)
+    )
+
+for repo_var in ("REPLAY_REPO", "G5M_REPO", "G6_REPO"):
+    required_contracts = (
+        f'git -C "${repo_var}" config core.autocrlf false',
+        f'git -C "${repo_var}" config core.eol lf',
+    )
+    for contract in required_contracts:
+        if contract not in text:
+            raise SystemExit(
+                "FAIL: nested clone exact-byte contract missing: " + contract
+            )
+
 for required in (
     '$(cygpath -w "$G5M_REPO")',
     '$(cygpath -w "$G6_REPO")',
@@ -941,6 +1035,49 @@ for index, body in enumerate(bodies, 1):
             f"FAIL: R4W generated Python heredoc {index} missing imports: {missing}"
         )
 
+# Every Git clone created by the generated reconstruction must establish the
+# Windows line-ending policy BEFORE checkout. This is recursive protection:
+# outer workflow -> disposable build clone -> all reconstruction-created clones.
+nested_clone_contracts = (
+    (
+        'git clone --no-hardlinks --no-checkout . "$REPLAY_REPO"',
+        'git -C "$REPLAY_REPO" config core.autocrlf false',
+        'git -C "$REPLAY_REPO" config core.eol lf',
+        "Gate 4A",
+    ),
+    (
+        'git clone --no-hardlinks --no-checkout . "$G5M_REPO"',
+        'git -C "$G5M_REPO" config core.autocrlf false',
+        'git -C "$G5M_REPO" config core.eol lf',
+        "Gate 5M",
+    ),
+    (
+        'git clone --no-hardlinks --no-checkout . "$G6_REPO"',
+        'git -C "$G6_REPO" config core.autocrlf false',
+        'git -C "$G6_REPO" config core.eol lf',
+        "Gate 6",
+    ),
+)
+
+for clone_line, autocrlf_line, eol_line, label in nested_clone_contracts:
+    for required_line in (clone_line, autocrlf_line, eol_line):
+        if required_line not in text:
+            raise SystemExit(
+                f"FAIL: R4W {label} nested clone byte contract missing: "
+                + required_line
+            )
+
+unsafe_nested = re.findall(
+    r'git clone --no-hardlinks(?! --no-checkout)\s+\.\s+"\$(?:REPLAY_REPO|G5M_REPO|G6_REPO)"',
+    text,
+)
+if unsafe_nested:
+    raise SystemExit(
+        "FAIL: R4W unsafe nested Windows clone survived: "
+        + repr(unsafe_nested)
+    )
+
+print("PASS: all 3 nested reconstruction clones set LF policy before checkout")
 print(f"PASS: {len(bodies)} generated Python heredocs parsed with import audit")
 print("PASS: no Linux-only executable dependencies survive generated reconstruction")
 print("PASS: required Windows-native reconstruction contracts present")
