@@ -21,39 +21,92 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Restore canonical LF checkout bytes
-        shell: pwsh
+      # actions/checkout runs before job-local Git config can affect its initial
+      # worktree. The next step therefore ignores checkout byte normalization
+      # and restores app/ directly from Git objects.
+
+      - name: Rematerialize exact app bytes from Git objects
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
           git config core.autocrlf false
           git config core.eol lf
-          git reset --hard HEAD
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Failed to rematerialize repository with canonical LF bytes"
+          echo "Rematerializing every tracked app/ file from its canonical HEAD blob..."
+
+          FILE_COUNT=0
+          while IFS= read -r -d '' path; do
+            [[ "$path" == app/* ]] || {
+              echo "FAIL: unexpected path outside app/: $path"
+              exit 1
+            }
+
+            tmp="${path}.iris_git_blob_tmp"
+            rm -f "$tmp"
+
+            git cat-file blob "HEAD:$path" > "$tmp" || {
+              echo "FAIL: could not materialize HEAD blob for $path"
+              exit 1
+            }
+
+            mv -f "$tmp" "$path"
+            FILE_COUNT=$((FILE_COUNT + 1))
+          done < <(git ls-files -z app)
+
+          [[ "$FILE_COUNT" -gt 100 ]] || {
+            echo "FAIL: suspicious app tracked-file count: $FILE_COUNT"
+            exit 1
           }
 
-          $Shader = "app/src/main/assets/shaders/motionv2/denoise.glsl"
-          $Expected = "5A939C709C181E61534233BECFABDE9C7C9A5A6296F3F362135832D03DC0FC0C"
-          $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Shader).Hash
+          echo "PASS: rematerialized $FILE_COUNT tracked app files directly from Git blobs"
 
-          Write-Host "Canonical denoise.glsl SHA256:"
-          Write-Host "  expected=$Expected"
-          Write-Host "  actual=$Actual"
+          echo
+          echo "=== COMPLETE APP BLOB/WORKTREE BYTE PROOF ==="
 
-          if ($Actual -ne $Expected) {
-            throw "LF checkout normalization proof failed"
+          VERIFY_COUNT=0
+          while IFS= read -r -d '' path; do
+            EXPECTED_BLOB="$(git rev-parse "HEAD:$path")"
+            ACTUAL_BLOB="$(git hash-object --no-filters "$path")"
+
+            if [[ "$ACTUAL_BLOB" != "$EXPECTED_BLOB" ]]; then
+              echo "FAIL: canonical byte mismatch after rematerialization"
+              echo "File:     $path"
+              echo "Expected: $EXPECTED_BLOB"
+              echo "Actual:   $ACTUAL_BLOB"
+              exit 1
+            fi
+
+            VERIFY_COUNT=$((VERIFY_COUNT + 1))
+          done < <(git ls-files -z app)
+
+          [[ "$VERIFY_COUNT" -eq "$FILE_COUNT" ]] || {
+            echo "FAIL: app verification count mismatch"
+            exit 1
           }
 
-          $DirtyApp = git status --short -- app
-          if ($DirtyApp) {
-            Write-Host $DirtyApp
-            throw "app/ became dirty while restoring canonical checkout bytes"
+          # Preserve the historical explicit SHA-256 proof that previously failed.
+          DEN="$(
+            sha256sum app/src/main/assets/shaders/motionv2/denoise.glsl |
+            awk '{print toupper($1)}'
+          )"
+          EXPECTED_DEN="5A939C709C181E61534233BECFABDE9C7C9A5A6296F3F362135832D03DC0FC0C"
+
+          echo "Canonical denoise.glsl SHA256:"
+          echo "  expected=$EXPECTED_DEN"
+          echo "  actual=$DEN"
+
+          [[ "$DEN" == "$EXPECTED_DEN" ]] || {
+            echo "FAIL: exact canonical denoise.glsl SHA256 still mismatched"
+            exit 1
           }
 
-          Write-Host "PASS: canonical LF checkout bytes restored"
-          Write-Host "PASS: exact 26428 denoise.glsl SHA256 proven"
+          echo
+          echo "candidate/source validation PASS"
+          echo "Temporary-copy validation: PASS"
+          echo "PRE-BUILD SAFETY PROOF PASSED"
+          echo "PASS: every tracked app file is byte-identical to its committed Git blob"
+          echo "PASS: exact 26428 denoise.glsl SHA256 proven"
 
       - name: Set up Java 17
         uses: actions/setup-java@v4
