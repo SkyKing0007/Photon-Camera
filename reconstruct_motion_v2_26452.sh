@@ -395,8 +395,21 @@ echo "PASS: Gate 6 26439 materialized from production transformer"
 j = text.index(g6_anchor) + len(g6_anchor)
 text = text[:j] + g6_extra + text[j:]
 
-if text.count('IRIS_26452_GATE6_26439_PRODUCTION_PROVENANCE_FIX') != 1:
-    raise SystemExit('FAIL: V4 provenance marker count mismatch')
+# Structural V4 provenance proof.  Do not count the marker string itself:
+# that would count both this injected stage and any assertion that mentions it.
+required_v4_fragments = (
+    '"build_26439_windows_v2_temporal_channel_ownership.ps1"',
+    'Expected exactly 16 historical replay files',
+    '$REPLAY_DECODED/26439.resume.ps1',
+    '26439 production transformer -> $REPLAY_DECODED/26439.ps1',
+    '26439 production transformer and resume-only verifier are separated',
+    'Gate 6 26439 materialized from production transformer',
+)
+for fragment in required_v4_fragments:
+    if fragment not in text:
+        raise SystemExit(
+            "FAIL: V4 provenance structural fragment missing: " + fragment
+        )
 
 marker = "IRIS_26452_GATE6B1_HARDENED_TRUNCATION_CONTRACT"
 if text.count(marker) != 1:
@@ -648,4 +661,4 @@ echo
 chmod +x "$GENERATED"
 exec bash "$GENERATED"
 
-# Delivered revision v4: 2026-08-12 exact 26439 production-transformer provenance + Gate 6B1 hardening.
+# Delivered revision v5: 2026-08-12 structural 26439 provenance proof + Gate 6B1 hardening.
