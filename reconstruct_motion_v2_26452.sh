@@ -947,6 +947,19 @@ print("PASS: required Windows-native reconstruction contracts present")
 PY
 
 # Parse every historical PowerShell source now, before historical replay.
+R4W_HISTORY_DIR="historical_replay"
+[[ -d "$R4W_HISTORY_DIR" ]] \
+    || fail "R4W historical replay directory missing: $R4W_HISTORY_DIR"
+
+R4W_HISTORY_COUNT="$(
+    find "$R4W_HISTORY_DIR" -maxdepth 1 -type f -name '*.ps1' | wc -l | tr -d ' '
+)"
+[[ "$R4W_HISTORY_COUNT" -ge 1 ]] \
+    || fail "R4W found no historical PowerShell files to parse"
+
+echo "PASS: R4W historical replay directory = $R4W_HISTORY_DIR"
+echo "PASS: R4W historical PowerShell file count = $R4W_HISTORY_COUNT"
+
 R4W_PS_PARSER="$SAFETY_DIR/r4w_parse_all_history.ps1"
 cat > "$R4W_PS_PARSER" <<'PWSH'
 param([Parameter(Mandatory = $true)][string]$HistoryDir)
@@ -978,7 +991,7 @@ foreach ($file in $files) {
 Write-Host "PASS: all historical PowerShell files parse"
 PWSH
 
-pwsh -NoLogo -NoProfile -File "$R4W_PS_PARSER" "$(cygpath -w "$HIST_DIR")" \
+pwsh -NoLogo -NoProfile -File "$R4W_PS_PARSER" "$(cygpath -w "$R4W_HISTORY_DIR")" \
     || fail "R4W historical PowerShell parser audit failed"
 
 echo
