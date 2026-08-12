@@ -266,6 +266,137 @@ print(
 
 """
 text = text[:start] + new_block + text[end:]
+# -------------------------------------------------------------------------
+# IRIS_26452_GATE6_26439_PRODUCTION_PROVENANCE_FIX
+# -------------------------------------------------------------------------
+
+req_old = (
+    '    "build_26438_windows_REVISED_v2_audited_motion_microcontrast_standard_ultrahdr.ps1"\n'
+    '    "launch_resume_build_26439_after_gate8_v2_MINIMAL.ps1"\n'
+)
+req_new = (
+    '    "build_26438_windows_REVISED_v2_audited_motion_microcontrast_standard_ultrahdr.ps1"\n'
+    '    "build_26439_windows_v2_temporal_channel_ownership.ps1"\n'
+    '    "launch_resume_build_26439_after_gate8_v2_MINIMAL.ps1"\n'
+)
+if text.count(req_old) != 1:
+    raise SystemExit('FAIL: canonical REQUIRED_HISTORY 26438/26439 anchor count=' + str(text.count(req_old)))
+text = text.replace(req_old, req_new, 1)
+
+count_old = (
+    'if [[ "$HIST_FILE_COUNT" -ne 15 ]]; then\n'
+    '    fail "Expected exactly 15 historical replay files; found $HIST_FILE_COUNT"\n'
+    'fi'
+)
+count_new = (
+    'if [[ "$HIST_FILE_COUNT" -ne 16 ]]; then\n'
+    '    fail "Expected exactly 16 historical replay files; found $HIST_FILE_COUNT"\n'
+    'fi'
+)
+if text.count(count_old) != 1:
+    raise SystemExit('FAIL: canonical historical file-count anchor count=' + str(text.count(count_old)))
+text = text.replace(count_old, count_new, 1)
+
+prov_anchor = '    || fail "26438 revised provenance missing"\n'
+if text.count(prov_anchor) != 1:
+    raise SystemExit('FAIL: canonical 26438 provenance anchor count=' + str(text.count(prov_anchor)))
+prov_insert = '''
+grep -q '26439 MOTION V2 TEMPORAL + CHANNEL OWNERSHIP' \
+    "$HIST_DIR/build_26439_windows_v2_temporal_channel_ownership.ps1" \
+    || fail "26439 production transformer identity missing"
+
+grep -q 'Transform-Reconstruction' \
+    "$HIST_DIR/build_26439_windows_v2_temporal_channel_ownership.ps1" \
+    || fail "26439 production reconstruction transformer missing"
+
+grep -q 'Transform-Accumulator' \
+    "$HIST_DIR/build_26439_windows_v2_temporal_channel_ownership.ps1" \
+    || fail "26439 production accumulator transformer missing"
+
+grep -q 'candidate/source validation PASS' \
+    "$HIST_DIR/build_26439_windows_v2_temporal_channel_ownership.ps1" \
+    || fail "26439 production candidate validation proof missing"
+
+grep -q 'Temporary-copy validation: PASS' \
+    "$HIST_DIR/build_26439_windows_v2_temporal_channel_ownership.ps1" \
+    || fail "26439 production temporary-copy validation proof missing"
+
+grep -q '=== GATE 5: APPLY EXACT VALIDATED TRANSFORMATION ===' \
+    "$HIST_DIR/build_26439_windows_v2_temporal_channel_ownership.ps1" \
+    || fail "26439 production exact-apply boundary missing"
+
+echo "PASS: 26439 production transformer provenance verified"
+'''
+i = text.index(prov_anchor) + len(prov_anchor)
+text = text[:i] + '\n' + prov_insert + text[i:]
+
+decode_old = (
+    'decode_launcher_payload \\\n'
+    '    "$HIST_DIR/launch_resume_build_26439_after_gate8_v2_MINIMAL.ps1" \\\n'
+    '    "$REPLAY_DECODED/26439.ps1" \\\n'
+    '    "26439"\n'
+)
+if text.count(decode_old) != 1:
+    raise SystemExit('FAIL: canonical resume-as-transformer decode anchor count=' + str(text.count(decode_old)))
+decode_new = '''cp \
+    "$HIST_DIR/build_26439_windows_v2_temporal_channel_ownership.ps1" \
+    "$REPLAY_DECODED/26439.ps1"
+
+[[ -s "$REPLAY_DECODED/26439.ps1" ]] \
+    || fail "26439 production transformer copy is empty"
+
+echo "PASS: 26439 production transformer -> $REPLAY_DECODED/26439.ps1"
+
+decode_launcher_payload \
+    "$HIST_DIR/launch_resume_build_26439_after_gate8_v2_MINIMAL.ps1" \
+    "$REPLAY_DECODED/26439.resume.ps1" \
+    "26439 resume-only verification"
+'''
+text = text.replace(decode_old, decode_new, 1)
+
+gate_anchor = (
+    '# Each historical build touched a different part of the V2 graph.\n'
+    '# Validate the domain each build actually owned instead of falsely requiring\n'
+    '# every payload to reference MotionV2CfaReconstruction.java.\n'
+)
+if text.count(gate_anchor) != 1:
+    raise SystemExit('FAIL: canonical Gate 3D anchor count=' + str(text.count(gate_anchor)))
+gate_insert = '''
+grep -q 'Transform-Reconstruction' "$REPLAY_DECODED/26439.ps1" \
+    || fail "26439 Gate 6 source is not the production reconstruction transformer"
+grep -q 'Transform-Accumulator' "$REPLAY_DECODED/26439.ps1" \
+    || fail "26439 Gate 6 source is not the production accumulator transformer"
+grep -q '=== GATE 5: APPLY EXACT VALIDATED TRANSFORMATION ===' "$REPLAY_DECODED/26439.ps1" \
+    || fail "26439 Gate 6 production exact-apply boundary missing"
+grep -q '26439 RESUME-ONLY BUILD' "$REPLAY_DECODED/26439.resume.ps1" \
+    || fail "26439 resume-only verifier identity missing"
+grep -q 'NO SOURCE EDITS' "$REPLAY_DECODED/26439.resume.ps1" \
+    || fail "26439 resume-only no-source-edits contract missing"
+if grep -q '26439 RESUME-ONLY BUILD' "$REPLAY_DECODED/26439.ps1"; then
+    fail "26439 resume-only verifier was incorrectly selected as Gate 6 transformer"
+fi
+echo "PASS: 26439 production transformer and resume-only verifier are separated"
+'''
+text = text.replace(gate_anchor, gate_anchor + '\n' + gate_insert, 1)
+
+g6_anchor = 'cp "$REPLAY_DECODED/26439.ps1" "$G6_PS/26439.source.ps1"\n'
+if text.count(g6_anchor) != 1:
+    raise SystemExit('FAIL: canonical Gate 6 26439 materialization anchor count=' + str(text.count(g6_anchor)))
+g6_extra = '''
+grep -q 'Transform-Reconstruction' "$G6_PS/26439.source.ps1" \
+    || fail "Gate 6 26439 source lost production transformer identity"
+grep -q 'Transform-Accumulator' "$G6_PS/26439.source.ps1" \
+    || fail "Gate 6 26439 source lost accumulator transformer identity"
+if grep -q '26439 RESUME-ONLY BUILD' "$G6_PS/26439.source.ps1"; then
+    fail "Gate 6 26439 source is resume-only verifier"
+fi
+echo "PASS: Gate 6 26439 materialized from production transformer"
+'''
+j = text.index(g6_anchor) + len(g6_anchor)
+text = text[:j] + g6_extra + text[j:]
+
+if text.count('IRIS_26452_GATE6_26439_PRODUCTION_PROVENANCE_FIX') != 1:
+    raise SystemExit('FAIL: V4 provenance marker count mismatch')
 
 marker = "IRIS_26452_GATE6B1_HARDENED_TRUNCATION_CONTRACT"
 if text.count(marker) != 1:
@@ -517,4 +648,4 @@ echo
 chmod +x "$GENERATED"
 exec bash "$GENERATED"
 
-# Delivered revision v3: 2026-08-12 chronological candidate-validation Gate 6B1 hardening.
+# Delivered revision v4: 2026-08-12 exact 26439 production-transformer provenance + Gate 6B1 hardening.
