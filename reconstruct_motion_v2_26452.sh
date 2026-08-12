@@ -143,39 +143,20 @@ new_block = r"""
 # work.
 # -------------------------------------------------------------------------
 
-def _last_proof(patterns, body):
-    hits = []
-    for pattern in patterns:
-        hits.extend(re.finditer(pattern, body, re.IGNORECASE | re.MULTILINE))
-    if not hits:
-        return None
-    return max(hits, key=lambda m: m.end())
-
-candidate_proof = _last_proof(
-    (
-        r"candidate/source\s+validation\s*:?\s*PASS",
-        r"candidate[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
-    ),
-    text,
+candidate_patterns = (
+    r"candidate/source\s+validation\s*:?\s*PASS",
+    r"candidate[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
 )
-temporary_proof = _last_proof(
-    (
-        r"Temporary-copy\s+validation\s*:?\s*PASS",
-        r"temporary[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
-    ),
-    text,
+temporary_patterns = (
+    r"Temporary-copy\s+validation\s*:?\s*PASS",
+    r"temporary[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
 )
 
-if candidate_proof is None:
-    raise SystemExit(
-        f"FAIL: historical {target_b} lacks a candidate validation PASS proof"
+def _has_proof(patterns, body):
+    return any(
+        re.search(pattern, body, re.IGNORECASE | re.MULTILINE)
+        for pattern in patterns
     )
-if temporary_proof is None:
-    raise SystemExit(
-        f"FAIL: historical {target_b} lacks a temporary-copy validation PASS proof"
-    )
-
-proof_end = max(candidate_proof.end(), temporary_proof.end())
 
 # Match any PowerShell statement containing a quoted === GATE ... === heading:
 # Write-Host, Safety, Pass, or another logger.
@@ -183,50 +164,62 @@ gate_heading = re.compile(
     r"(?im)^[^\r\n]*[\"']===\s*GATE\s+[^\"'\r\n]*===[\"'][^\r\n]*$"
 )
 
+# Candidate-only compiler validation is SAFE and must be allowed to run.
+# Historical 26437 produces Temporary-copy validation PASS inside its REAL GLSL
+# gate and does not touch real source until the following APPLY gate.
 danger_tokens = (
     "APPLY",
-    "REAL GLSL",
-    "GLSLC",
-    "JAVAC",
-    "APK BUILD",
     "SOURCE WRITE",
     "REAL SOURCE",
+    "JAVAC",
+    "APK BUILD",
     "GRADLE",
 )
 generic_build = re.compile(r"\bBUILD\b", re.IGNORECASE)
 
 headings = list(gate_heading.finditer(text))
-post_proof_headings = [m for m in headings if m.start() >= proof_end]
+if not headings:
+    raise SystemExit(
+        f"FAIL: historical {target_b} contains no recognizable Gate headings"
+    )
 
 cut = None
 cut_title = None
 
-for m in post_proof_headings:
+# Chronological safety contract:
+# choose the FIRST dangerous gate whose prefix has ALREADY completed both
+# candidate/source and temporary-copy validation.  Do not use the last proof
+# occurrence globally because old scripts repeat PASS messages in summaries.
+for m in headings:
     title = m.group(0).upper()
     dangerous = any(token in title for token in danger_tokens)
 
-    # Candidate construction may legitimately contain BUILD in a heading.
+    # BUILD can describe candidate construction; only treat it as dangerous
+    # when it is not explicitly a candidate/temporary build stage.
     if generic_build.search(title):
         if "CANDIDATE" not in title and "TEMPORARY" not in title:
             dangerous = True
 
-    if dangerous:
+    if not dangerous:
+        continue
+
+    prefix = text[:m.start()]
+    if (
+        _has_proof(candidate_patterns, prefix)
+        and _has_proof(temporary_patterns, prefix)
+    ):
         cut = m.start()
         cut_title = m.group(0).strip()
         break
 
 if cut is None:
-    diagnostic = [m.group(0).strip() for m in post_proof_headings[:12]]
+    diagnostic = [m.group(0).strip() for m in headings[:24]]
     raise SystemExit(
-        "FAIL: no safe post-candidate truncation gate found for historical "
+        "FAIL: no source-apply/build gate occurs after both validation proofs "
+        + "for historical "
         + str(target_b)
-        + "; later gate headings="
+        + "; gate headings="
         + repr(diagnostic)
-    )
-
-if cut <= proof_end:
-    raise SystemExit(
-        f"FAIL: historical {target_b} truncation does not follow both validation proofs"
     )
 
 prefix = text[:cut]
@@ -342,45 +335,31 @@ python3 <<'PY'
 import re
 
 def find_cut(text, target_b):
-    def last_proof(patterns, body):
-        hits = []
-        for pattern in patterns:
-            hits.extend(re.finditer(pattern, body, re.IGNORECASE | re.MULTILINE))
-        return max(hits, key=lambda m: m.end()) if hits else None
-
-    candidate_proof = last_proof(
-        (
-            r"candidate/source\s+validation\s*:?\s*PASS",
-            r"candidate[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
-        ),
-        text,
+    candidate_patterns = (
+        r"candidate/source\s+validation\s*:?\s*PASS",
+        r"candidate[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
     )
-    temporary_proof = last_proof(
-        (
-            r"Temporary-copy\s+validation\s*:?\s*PASS",
-            r"temporary[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
-        ),
-        text,
+    temporary_patterns = (
+        r"Temporary-copy\s+validation\s*:?\s*PASS",
+        r"temporary[^\r\n]{0,120}validation[^\r\n]{0,80}\bPASS\b",
     )
 
-    if candidate_proof is None or temporary_proof is None:
-        raise AssertionError(f"{target_b}: validation proof missing")
-
-    proof_end = max(candidate_proof.end(), temporary_proof.end())
+    def has_proof(patterns, body):
+        return any(
+            re.search(pattern, body, re.IGNORECASE | re.MULTILINE)
+            for pattern in patterns
+        )
 
     gate_heading = re.compile(
         r"(?im)^[^\r\n]*[\"']===\s*GATE\s+[^\"'\r\n]*===[\"'][^\r\n]*$"
     )
     danger_tokens = (
-        "APPLY", "REAL GLSL", "GLSLC", "JAVAC", "APK BUILD",
-        "SOURCE WRITE", "REAL SOURCE", "GRADLE",
+        "APPLY", "SOURCE WRITE", "REAL SOURCE", "JAVAC",
+        "APK BUILD", "GRADLE",
     )
     generic_build = re.compile(r"\bBUILD\b", re.IGNORECASE)
 
     for m in gate_heading.finditer(text):
-        if m.start() < proof_end:
-            continue
-
         title = m.group(0).upper()
         dangerous = any(token in title for token in danger_tokens)
 
@@ -391,25 +370,34 @@ def find_cut(text, target_b):
         if not dangerous:
             continue
 
+        prefix = text[:m.start()]
+        if not (
+            has_proof(candidate_patterns, prefix)
+            and has_proof(temporary_patterns, prefix)
+        ):
+            continue
+
         suffix = text[m.start():]
         if not re.search(
             r"(?i)(Copy-Item|Move-Item|Set-Content|WriteAllText|gradlew|assembleDebug|"
-            r"compileDebugJavaWithJavac|glslc|JAVAC|SOURCE APPLY|APPLY EXACT)",
+            r"compileDebugJavaWithJavac|SOURCE APPLY|APPLY EXACT)",
             suffix,
         ):
             raise AssertionError(f"{target_b}: no executable suffix evidence")
 
         return m.group(0).strip()
 
-    raise AssertionError(f"{target_b}: no cut")
-
+    raise AssertionError(f"{target_b}: no safe source-apply/build cut")
 cases = {
     "26437": (
         'Write-Host "=== GATE 2: BUILD ALL 26437 TEMPORARY CANDIDATES ==="\n'
         'Write-Host "candidate/source validation PASS"\n'
-        'Write-Host "Temporary-copy validation: PASS"\n'
-        'Write-Host "=== GATE 3: REAL GLSL VALIDATION ==="\n'
+        'Write-Host "=== GATE 3: REAL GLSL COMPILER VALIDATION ==="\n'
         '& $glslc $Candidate\n'
+        'Write-Host "REAL GLSL COMPILER PROOF: PASS"\n'
+        'Write-Host "Temporary-copy validation: PASS"\n'
+        'Write-Host "=== GATE 4: APPLY EXACT VALIDATED CANDIDATES ==="\n'
+        'Copy-Item -LiteralPath $Candidate -Destination $Real\n'
     ),
     "26438": (
         'Pass "candidate/source validation PASS"\n'
@@ -446,6 +434,28 @@ cases = {
 for build, body in cases.items():
     heading = find_cut(body, build)
     print(f"PASS: detector unit {build} -> {heading}")
+
+# Exact historical-26437 ordering regression:
+# candidate/source PASS -> candidate-only REAL GLSL -> temporary-copy PASS ->
+# real APPLY.  The safe truncation MUST be Gate 4 APPLY.
+historical_26437_order = (
+    'Write-Host "=== GATE 2A: TEMPORARY CANDIDATE ARCHITECTURE PROOF ==="\n'
+    'Write-Host "candidate/source validation PASS"\n'
+    'Write-Host "=== GATE 3: REAL GLSL COMPILER VALIDATION ==="\n'
+    '& $Glslc @Args\n'
+    'Write-Host "REAL GLSL COMPILER PROOF: PASS"\n'
+    'Write-Host "Temporary-copy validation: PASS"\n'
+    'Write-Host "=== GATE 4: APPLY EXACT VALIDATED CANDIDATES ==="\n'
+    'Copy-Item -LiteralPath $From -Destination $Rel -Force\n'
+    'Write-Host "candidate/source validation PASS"\n'
+    'Write-Host "Temporary-copy validation: PASS"\n'
+    'Write-Host "PRE-BUILD SAFETY PROOF PASSED"\n'
+    'Write-Host "=== GATE 5: JAVAC PROOF ==="\n'
+    '& .\\gradlew.bat :app:compileDebugJavaWithJavac\n'
+)
+hist37 = find_cut(historical_26437_order, "26437-exact-order")
+assert "GATE 4: APPLY EXACT VALIDATED CANDIDATES" in hist37
+print("PASS: exact 26437 ordering truncates at Gate 4 APPLY, after GLSL + temporary-copy proof")
 
 negative = (
     'Write-Host "=== GATE 2: BUILD ALL TEMPORARY CANDIDATES ==="\n'
@@ -507,4 +517,4 @@ echo
 chmod +x "$GENERATED"
 exec bash "$GENERATED"
 
-# Delivered revision v2: 2026-08-12 semantic Gate 6B1 hardening.
+# Delivered revision v3: 2026-08-12 chronological candidate-validation Gate 6B1 hardening.
