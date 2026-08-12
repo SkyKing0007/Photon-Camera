@@ -491,6 +491,57 @@ text = text.replace(
     1,
 )
 
+
+# Replace the canonical Linux-only GLSL validator installer with the real
+# Windows Android NDK compiler already proven above. The canonical script only
+# installs/checks glslangValidator in Gate 4B; no later stage consumes it.
+gate4b_pattern = re.compile(
+    r'echo\s*\n'
+    r'echo "=== GATE 4B: INSTALL/VERIFY GLSL VALIDATOR ==="\n'
+    r'.*?'
+    r'echo "PASS: real glslangValidator available"\n'
+    r'\n'
+    r'echo\s*\n'
+    r'(?=echo "=== GATE 4C: INSTALL NON-BUILDING GRADLE REPLAY SHIM ===")',
+    re.DOTALL,
+)
+
+gate4b_matches = list(gate4b_pattern.finditer(text))
+if len(gate4b_matches) != 1:
+    raise SystemExit(
+        "FAIL: canonical Linux Gate 4B GLSL-validator block count="
+        + str(len(gate4b_matches))
+    )
+
+gate4b_windows = (
+    'echo\n'
+    'echo "=== GATE 4B: VERIFY REAL WINDOWS NDK GLSL COMPILER ==="\n'
+    '\n'
+    '[[ -n "${WINDOWS_NDK_GLSLC:-}" ]] \\\n'
+    '    || fail "WINDOWS_NDK_GLSLC was not established by Gate 0A"\n'
+    '\n'
+    '[[ -f "$WINDOWS_NDK_GLSLC" ]] \\\n'
+    '    || fail "Real Windows NDK glslc.exe disappeared before replay"\n'
+    '\n'
+    '"$WINDOWS_NDK_GLSLC" --version \\\n'
+    '    > "$REPLAY_LOGS/windows_ndk_glslc_version.log" 2>&1 \\\n'
+    '    || fail "Windows NDK glslc.exe validation failed"\n'
+    '\n'
+    'echo "PASS: real Windows NDK glslc.exe available for historical GLSL validation"\n'
+    '\n'
+    'echo\n'
+)
+
+text = gate4b_pattern.sub(gate4b_windows, text, count=1)
+
+if "sudo apt-get" in text or "glslang-tools" in text:
+    raise SystemExit(
+        "FAIL: Linux GLSL validator installation survived Windows-native rewrite"
+    )
+
+if '=== GATE 4B: VERIFY REAL WINDOWS NDK GLSL COMPILER ===' not in text:
+    raise SystemExit("FAIL: Windows-native Gate 4B was not installed")
+
 for required in (
     '$(cygpath -w "$G5M_REPO")',
     '$(cygpath -w "$G6_REPO")',
