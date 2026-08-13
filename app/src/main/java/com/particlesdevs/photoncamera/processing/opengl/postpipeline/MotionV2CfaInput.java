@@ -63,7 +63,15 @@ public final class MotionV2CfaInput extends Node {
          */
         boolean directBayer =
                 basePipeline.mParameters.cfaPattern >= 0
-                        && basePipeline.mParameters.cfaPattern <= 3;
+                        && basePipeline.mParameters.cfaPattern <= 3
+                        && raw.x > 0
+                        && raw.y > 0
+                        && (raw.x % 2) == 0
+                        && (raw.y % 2) == 0;
+        /*
+         * IRIS_26462_WRONSKI_DIRECT_RGB_INPUT_OWNER
+         * Standard Bayer receives full-resolution linear camera RGB.
+         */
         if (directBayer) {
             WorkingTexture = new GLTexture(
                     raw,

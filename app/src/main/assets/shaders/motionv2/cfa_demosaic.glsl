@@ -245,6 +245,241 @@ float reconstructColor(
             0.0);
 }
 
+/*
+ * IRIS_26460_CROSS_PHASE_PLATEAU_CHROMA
+ *
+ * The remaining magenta/cyan dot pattern is not limited to clipped highlights.
+ * Offline reconstruction from the clean timestamp-owned DNG reproduced a
+ * strong false-magenta trophy pixel at only ~11% of the sensor clip level.
+ *
+ * The old interpolation asks whether nearby samples of ONE target color agree
+ * with one another. Two same-CFA-phase samples can agree while both are wrong:
+ * a sub-pixel luminance edge can land on the target-color row/column and be
+ * misread as chroma.
+ *
+ * New authority test:
+ *   1. gather only physically measured sites of the requested R/B color;
+ *   2. reject those sites as chroma references when their four adjacent
+ *      measured GREEN photosites prove that the site lies directly on a steep
+ *      luminance transition;
+ *   3. estimate a local white-balanced target/green ratio from the remaining
+ *      locally homogeneous ("plateau") evidence;
+ *   4. only on a strong green/luma edge, and only when the normal demosaic
+ *      ratio is a large outlier from that coherent plateau evidence, pull the
+ *      target chroma toward the plateau ratio.
+ *
+ * Green/luma geometry is never filtered or replaced. This is not a generic
+ * chroma blur, not highlight neutralization, not 26453 post-denoise, not the
+ * 26454 measured-site same-phase consensus, and not the rejected direct-RGB
+ * merge path.
+ */
+float plateauChromaRatio(
+        ivec2 p,
+        int targetColor,
+        float greenCenter,
+        out float support,
+        out float ratioSpread) {
+    float targetGain = gainForColor(targetColor);
+    float greenGain = gainForColor(1);
+
+    float sumRatio = 0.0;
+    float sumRatioSq = 0.0;
+    float sumW = 0.0;
+
+    for (int oy = -2; oy <= 2; oy++) {
+        for (int ox = -2; ox <= 2; ox++) {
+            ivec2 q = safeFullPoint(p + ivec2(ox, oy));
+            if (cfaColor(q) != targetColor) continue;
+
+            float targetRaw = rawAt(q);
+            float targetTrust = rawReliability(targetRaw);
+            if (targetTrust <= 0.002) continue;
+
+            float greenQ = greenAt(q);
+            float greenTrust = rawReliability(greenQ);
+
+            /*
+             * At a physical R/B photosite, all four cardinal +/-1 neighbors are
+             * physical GREEN photosites in a 2x2 Bayer mosaic. Their range is
+             * therefore direct cross-phase evidence, not interpolated RGB.
+             */
+            float gl = rawAt(q + ivec2(-1, 0));
+            float gr = rawAt(q + ivec2( 1, 0));
+            float gu = rawAt(q + ivec2( 0,-1));
+            float gd = rawAt(q + ivec2( 0, 1));
+            float greenMin = min(min(gl, gr), min(gu, gd));
+            float greenMax = max(max(gl, gr), max(gu, gd));
+            float greenRangeBalanced =
+                    (greenMax - greenMin) * greenGain;
+
+            float greenBalanced = max(greenQ * greenGain, 0.0);
+            float edgeScale =
+                    0.025
+                    + 0.18 * sqrt(greenBalanced)
+                    + 0.015 * greenBalanced;
+
+            /*
+             * A target-color sample sitting directly on a steep luma edge is
+             * poor chroma authority because CFA phase and scene position are
+             * inseparable there. Plateau samples retain full authority.
+             */
+            float plateauTrust =
+                    1.0 - smoothstep(
+                            0.35,
+                            1.25,
+                            greenRangeBalanced
+                                    / max(edgeScale, 1.0e-6));
+            if (plateauTrust <= 0.001) continue;
+
+            float targetBalanced =
+                    max(targetRaw * targetGain, 0.0);
+            float ratio =
+                    clamp(
+                            targetBalanced
+                                    / max(greenBalanced, 0.008),
+                            0.05,
+                            4.0);
+
+            float r2 = float(ox * ox + oy * oy);
+            float spatial =
+                    1.0 / (1.0 + 0.35 * r2);
+
+            /*
+             * Prefer plateau evidence on the same luma side of the edge as the
+             * current physical green sample. This avoids borrowing a bright
+             * object's color into a dark neighbor or vice versa.
+             */
+            float greenDelta =
+                    abs(
+                            greenBalanced
+                                    - greenCenter * greenGain);
+            float rangeWeight =
+                    1.0 / (0.040 + greenDelta);
+
+            float w =
+                    spatial
+                    * targetTrust
+                    * mix(0.20, 1.0, greenTrust)
+                    * plateauTrust
+                    * rangeWeight;
+
+            sumRatio += w * ratio;
+            sumRatioSq += w * ratio * ratio;
+            sumW += w;
+        }
+    }
+
+    support = sumW;
+    if (sumW <= 1.0e-6) {
+        ratioSpread = 1.0;
+        return 1.0;
+    }
+
+    float meanRatio = sumRatio / sumW;
+    float variance =
+            max(
+                    sumRatioSq / sumW
+                            - meanRatio * meanRatio,
+                    0.0);
+    ratioSpread = sqrt(variance);
+    return meanRatio;
+}
+
+float crossPhaseSafeColor(
+        ivec2 p,
+        int targetColor,
+        float greenCenter,
+        float baseColor) {
+    float greenGain = gainForColor(1);
+    float targetGain = gainForColor(targetColor);
+    float centerBalanced =
+            max(greenCenter * greenGain, 0.0);
+
+    /*
+     * Detect only a genuine high-frequency green/luma transition. This leaves
+     * flat walls, broad colors, fabric, foliage interiors and normal low-light
+     * chroma on the existing 26452/26453 path.
+     */
+    float gl = greenAt(p + ivec2(-1, 0)) * greenGain;
+    float gr = greenAt(p + ivec2( 1, 0)) * greenGain;
+    float gu = greenAt(p + ivec2( 0,-1)) * greenGain;
+    float gd = greenAt(p + ivec2( 0, 1)) * greenGain;
+    float greenMin =
+            min(centerBalanced, min(min(gl, gr), min(gu, gd)));
+    float greenMax =
+            max(centerBalanced, max(max(gl, gr), max(gu, gd)));
+    float greenRange = greenMax - greenMin;
+
+    float edgeScale =
+            0.025
+            + 0.18 * sqrt(centerBalanced)
+            + 0.015 * centerBalanced;
+    float edgeEvidence =
+            smoothstep(
+                    0.45,
+                    1.35,
+                    greenRange / max(edgeScale, 1.0e-6));
+
+    if (edgeEvidence <= 0.0) {
+        return baseColor;
+    }
+
+    float plateauSupport;
+    float plateauSpread;
+    float plateauRatio =
+            plateauChromaRatio(
+                    p,
+                    targetColor,
+                    greenCenter,
+                    plateauSupport,
+                    plateauSpread);
+
+    float supportConfidence =
+            smoothstep(0.18, 0.80, plateauSupport);
+    float consensusConfidence =
+            1.0 - smoothstep(
+                    0.28,
+                    0.85,
+                    plateauSpread);
+
+    float baseRatio =
+            max(baseColor * targetGain, 0.0)
+                    / max(centerBalanced, 0.008);
+    float ratioMismatch =
+            abs(baseRatio - plateauRatio);
+
+    /*
+     * Small ratio differences are ordinary demosaic/color detail and remain
+     * untouched. The correction begins only when the normal result becomes a
+     * large cross-phase outlier on a proven luma edge.
+     */
+    float mismatchEvidence =
+            smoothstep(
+                    0.22,
+                    0.80,
+                    ratioMismatch);
+
+    float correction = clamp(
+            edgeEvidence
+                    * supportConfidence
+                    * consensusConfidence
+                    * mismatchEvidence,
+            0.0,
+            0.88);
+
+    float safeRatio =
+            mix(
+                    baseRatio,
+                    plateauRatio,
+                    correction);
+
+    return max(
+            safeRatio
+                    * centerBalanced
+                    / targetGain,
+            0.0);
+}
+
 void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     ivec2 size = fullSize();
@@ -254,8 +489,27 @@ void main() {
     }
 
     float green = greenAt(p);
-    float red = reconstructColor(p, 0, green);
-    float blue = reconstructColor(p, 2, green);
+
+    /*
+     * Preserve the proven 26452/26453 reconstruction as the base estimate.
+     * The 26460 cross-phase gate may alter only R/B chroma authority at a
+     * proven high-frequency green/luma edge. Green itself is untouched.
+     */
+    float redBase = reconstructColor(p, 0, green);
+    float blueBase = reconstructColor(p, 2, green);
+
+    float red =
+            crossPhaseSafeColor(
+                    p,
+                    0,
+                    green,
+                    redBase);
+    float blue =
+            crossPhaseSafeColor(
+                    p,
+                    2,
+                    green,
+                    blueBase);
 
     /*
      * No upper clamp. Canonical highlight headroom is retained for the

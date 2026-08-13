@@ -1,180 +1,127 @@
 #define LAYOUT //
 LAYOUT
 precision highp float;
-precision highp sampler2D;
 precision highp image2D;
-
 uniform highp sampler2D flowTexture;
-
-layout(rgba16f, binding = 0) uniform highp readonly image2D currentRgb;
-layout(rgba16f, binding = 1) uniform highp readonly image2D currentSupport;
-layout(rgba16f, binding = 2) uniform highp readonly image2D alterCfa;
-layout(rgba16f, binding = 3) uniform highp writeonly image2D outRgb;
-layout(rgba16f, binding = 4) uniform highp writeonly image2D outSupport;
-
+uniform highp sampler2D robustnessTexture;
+/*
+ * IRIS_26464_GLES31_WRONSKI_PING_PONG_FLOAT32
+ *
+ * GLSL ES requires non-r32 image formats such as rgba32f to be qualified
+ * readonly and/or writeonly. Persistent Wronski accumulation is therefore
+ * expressed as previous sampler textures -> writeonly next images.
+ * The math remains exactly num_next = num_prev + addNum and
+ * den_next = den_prev + addDen, with one divide only after the full burst.
+ */
+uniform highp sampler2D previousNumerator;
+uniform highp sampler2D previousDenominator;
+uniform highp sampler2D previousFrameSupport;
+layout(rgba16f,binding=0) uniform highp readonly image2D alterCfa;
+layout(rgba32f,binding=1) uniform highp readonly image2D alterCov;
+layout(rgba32f,binding=2) uniform highp writeonly image2D outNumerator;
+layout(rgba32f,binding=3) uniform highp writeonly image2D outDenominator;
+layout(rgba32f,binding=4) uniform highp writeonly image2D outFrameSupport;
 uniform ivec2 rawSize;
 uniform ivec2 rawHalf;
 uniform int cfaPattern;
-uniform float noiseS;
-uniform float noiseO;
 uniform float maximumSupport;
-uniform float sensorClipLevel;
-uniform vec3 sensorGains;
+uniform float clipR;
+uniform float clipG;
+uniform float clipB;
 
-/*
- * IRIS_26426_TRUE_PER_OBSERVATION_NORMALIZED_CONVOLUTION
- *
- * This replaces the 26424/26425 "build one RGB candidate per frame, then
- * average RGB candidates" approximation.
- *
- * Each real CFA photosite is treated as a scalar observation:
- *   scalar RAW observation
- *       x structure-aware geometric kernel
- *       x alignment confidence
- *       x scalar RAW-domain robustness
- *       x saturation reliability
- *   -> per-channel numerator / denominator.
- *
- * No auxiliary frame ever becomes a completed RGB image before fusion.
+int componentIndex(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+int componentColor(int c){
+    if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}
+    if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}
+    if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
+    if(c==3)return 0;if(c==0)return 2;return 1;
+}
+float clipForColor(int c){return c==0?clipR:(c==2?clipB:clipG);}
+float sampleValidity(float v,int c){
+    float clip=max(clipForColor(c),1e-6);
+    return 1.0-smoothstep(0.985*clip,0.998*clip,v);
+}
+float cfaAt(ivec2 p){
+    p=clamp(p,ivec2(0),rawSize-ivec2(1));
+    vec4 v=imageLoad(alterCfa,p>>1);
+    int c=componentIndex(p);
+    return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));
+}
+mat2 covAt(ivec2 p){
+    p=clamp(p,ivec2(0),rawHalf-ivec2(1));
+    vec4 v=imageLoad(alterCov,p);
+    return mat2(v.x,v.y,v.z,v.w);
+}
+mat2 interpolateCov(vec2 gp){
+    ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));
+    ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));
+    vec2 f=fract(gp);
+    mat2 c00=covAt(fl);
+    mat2 c01=covAt(ivec2(ce.x,fl.y));
+    mat2 c10=covAt(ivec2(fl.x,ce.y));
+    mat2 c11=covAt(ce);
+    return c00*((1.0-f.x)*(1.0-f.y))
+         + c01*(f.x*(1.0-f.y))
+         + c10*((1.0-f.x)*f.y)
+         + c11*(f.x*f.y);
+}
+mat2 invertCov(mat2 m){
+    float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];
+    if(abs(d)<=1e-10) return mat2(1,0,0,1);
+    return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;
+}
+
+/* IRIS_26463_WRONSKI_PUBLIC_AUX_ACCUMULATION
+ * Public merge() coordinate contract at scale=1:
+ * lr = output+0.5; lr_mov=lr+flow; center=int(lr_mov);
+ * distance uses lr_mov-0.5; covariance position=lr_mov/2-0.5.
+ * Num/den remain FLOAT32 running accumulators and are divided only once.
  */
+/* IRIS_26465_WRONSKI_CFA_SATURATION_PROVENANCE
+ * The published Wronski num/den recurrence is untouched. G/B/A in the
+ * existing frame-support carrier accumulate unsaturated R/G/B kernel support
+ * using the same sample positions, covariance and robustness weights.
+ */
+void main(){
+    ivec2 outP=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(outP,rawSize))) return;
 
-int componentIndex(ivec2 p) {
-    return ((p.y & 1) << 1) | (p.x & 1);
-}
+    vec2 uv=(vec2(outP)+0.5)/vec2(rawSize);
+    vec2 rawFlow=2.0*texture(flowTexture,uv).xy;
+    vec2 lr=vec2(outP)+0.5;
+    vec2 lrMov=lr+rawFlow;
+    if(lrMov.x<0.0||lrMov.y<0.0||lrMov.x>=float(rawSize.x)||lrMov.y>=float(rawSize.y)) return;
 
-int componentColor(int c) {
-    if (cfaPattern == 0) {
-        if (c == 0) return 0;
-        if (c == 3) return 2;
-        return 1;
-    } else if (cfaPattern == 1) {
-        if (c == 1) return 0;
-        if (c == 2) return 2;
-        return 1;
-    } else if (cfaPattern == 2) {
-        if (c == 2) return 0;
-        if (c == 1) return 2;
-        return 1;
+    ivec2 robustP=clamp(ivec2(lr),ivec2(0),rawSize-ivec2(1));
+    float R=clamp(texelFetch(robustnessTexture,robustP,0).r,0.0,1.0);
+    vec2 kmap=lrMov/2.0-0.5;
+    mat2 invCov=invertCov(interpolateCov(kmap));
+
+    ivec2 center=ivec2(lrMov);
+    vec2 movTarget=lrMov-0.5;
+    vec3 addNum=vec3(0),addDen=vec3(0),addValidDen=vec3(0);
+    for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){
+        ivec2 p=center+ivec2(ix,iy);
+        if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize))) continue;
+        int c=componentColor(componentIndex(p));
+        vec2 d=vec2(p)-movTarget;
+        float z=max(dot(d,invCov*d),0.0);
+        float w=exp(-0.5*z)*R;
+        float cfaSample=cfaAt(p);
+        addNum[c]+=w*cfaSample;
+        addDen[c]+=w;
+        addValidDen[c]+=w*sampleValidity(cfaSample,c);
     }
-    if (c == 3) return 0;
-    if (c == 0) return 2;
-    return 1;
-}
+    vec4 n=texelFetch(previousNumerator,outP,0);
+    n.rgb+=addNum;
+    imageStore(outNumerator,outP,n);
 
-float physicalSample(ivec2 rawPos) {
-    ivec2 p = clamp(rawPos,ivec2(0),rawSize-ivec2(1));
-    vec4 v = imageLoad(alterCfa,p>>1);
-    int c = componentIndex(p);
-    if (c == 0) return v.r;
-    if (c == 1) return v.g;
-    if (c == 2) return v.b;
-    return v.a;
-}
+    vec4 d=texelFetch(previousDenominator,outP,0);
+    d.rgb+=addDen;
+    imageStore(outDenominator,outP,d);
 
-float currentLuma(ivec2 p) {
-    ivec2 q = clamp(p,ivec2(0),rawSize-ivec2(1));
-    vec3 rgb = max(imageLoad(currentRgb,q).rgb,vec3(0.0));
-    return dot(rgb,vec3(0.25,0.50,0.25));
-}
-
-void structureAt(ivec2 xy, out vec2 normal, out float edgeStrength) {
-    float gx = currentLuma(xy+ivec2(1,0)) - currentLuma(xy-ivec2(1,0));
-    float gy = currentLuma(xy+ivec2(0,1)) - currentLuma(xy-ivec2(0,1));
-    vec2 g = vec2(gx,gy);
-    float mag = length(g);
-    float center = max(currentLuma(xy),0.02);
-    edgeStrength = clamp(mag/(0.05+0.40*center),0.0,1.0);
-    normal = mag > 1.0e-6 ? g/mag : vec2(1.0,0.0);
-}
-
-vec2 accumulateObservations(
-        vec2 sourceCoord,
-        int wantedColor,
-        float prediction,
-        vec2 normal,
-        float edgeStrength,
-        float alignmentConfidence) {
-    ivec2 base = ivec2(floor(sourceCoord));
-    vec2 tangent = vec2(-normal.y,normal.x);
-
-    float sigmaAlong = mix(1.25,2.10,edgeStrength);
-    float sigmaAcross = mix(1.25,0.44,edgeStrength);
-    float invAlong2 = 1.0/max(sigmaAlong*sigmaAlong,0.04);
-    float invAcross2 = 1.0/max(sigmaAcross*sigmaAcross,0.04);
-
-    float numerator = 0.0;
-    float denominator = 0.0;
-    float clip = max(sensorClipLevel,1.0e-6);
-
-    // Scalar prediction uncertainty in the canonical sensor/noise domain.
-    float sigma = sqrt(max(max(prediction,0.0)*noiseS+noiseO,1.0e-8));
-    float robustStart = mix(4.0,5.5,edgeStrength);
-    float robustEnd = mix(9.0,12.0,edgeStrength);
-
-    for (int oy=-3; oy<=3; oy++) {
-        for (int ox=-3; ox<=3; ox++) {
-            ivec2 p = base+ivec2(ox,oy);
-            if (any(lessThan(p,ivec2(0))) || any(greaterThanEqual(p,rawSize))) continue;
-            if (componentColor(componentIndex(p)) != wantedColor) continue;
-
-            float value = physicalSample(p);
-            vec2 d = (vec2(p)+vec2(0.5))-(sourceCoord+vec2(0.5));
-            float along = dot(d,tangent);
-            float across = dot(d,normal);
-            float metric = along*along*invAlong2 + across*across*invAcross2;
-            float spatial = exp(-0.5*metric);
-
-            // No forced 4-8% floor: clipped samples have zero chromatic authority.
-            float saturation = 1.0-smoothstep(0.930*clip,0.985*clip,value);
-
-            // Robustness is applied to the SCALAR RAW observation, not to an
-            // already-demosaiced RGB candidate.
-            float z = abs(value-prediction)/max(sigma,1.0e-5);
-            float robust = 1.0-smoothstep(robustStart,robustEnd,z);
-
-            float w = spatial * alignmentConfidence * saturation * robust;
-            numerator += value*w;
-            denominator += w;
-        }
-    }
-    return vec2(numerator,denominator);
-}
-
-void main() {
-    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(xy,rawSize))) return;
-
-    vec3 cur = max(imageLoad(currentRgb,xy).rgb,vec3(0.0));
-    vec3 oldSupport = max(imageLoad(currentSupport,xy).rgb,vec3(1.0e-4));
-
-    // MotionV2Alignment publishes flow in packed-CFA pixels.
-    vec2 uv = (vec2(xy)+vec2(0.5))/vec2(max(rawSize,ivec2(1)));
-    vec4 flow = texture(flowTexture,uv);
-    vec2 rawFlow = flow.xy*2.0;
-    float alignmentConfidence = clamp(flow.z,0.0,1.0);
-    vec2 sourceCoord = vec2(xy)+rawFlow;
-
-    vec2 normal;
-    float edgeStrength;
-    structureAt(xy,normal,edgeStrength);
-
-    vec2 rObs = accumulateObservations(
-            sourceCoord,0,cur.r,normal,edgeStrength,alignmentConfidence);
-    vec2 gObs = accumulateObservations(
-            sourceCoord,1,cur.g,normal,edgeStrength,alignmentConfidence);
-    vec2 bObs = accumulateObservations(
-            sourceCoord,2,cur.b,normal,edgeStrength,alignmentConfidence);
-
-    vec3 obsNumerator = vec3(rObs.x,gObs.x,bObs.x);
-    vec3 obsWeight = vec3(rObs.y,gObs.y,bObs.y);
-
-    // currentRgb * currentSupport is the running numerator. This is
-    // mathematically equivalent to normalizing only after all frames while
-    // avoiding another three full-resolution sum textures.
-    vec3 numerator = cur*oldSupport + obsNumerator;
-    vec3 newSupport = min(vec3(maximumSupport*8.0),oldSupport+obsWeight);
-    vec3 merged = numerator/max(newSupport,vec3(1.0e-5));
-
-    imageStore(outRgb,xy,vec4(max(merged,vec3(0.0)),1.0));
-    imageStore(outSupport,xy,vec4(newSupport,1.0));
+    vec4 fs=texelFetch(previousFrameSupport,outP,0);
+    fs.r=min(max(maximumSupport,1.0),max(fs.r,1.0)+R);
+    fs.gba+=addValidDen;
+    imageStore(outFrameSupport,outP,fs);
 }

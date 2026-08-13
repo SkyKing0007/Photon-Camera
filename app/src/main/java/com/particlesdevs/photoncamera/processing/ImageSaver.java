@@ -155,6 +155,34 @@ public class ImageSaver {
                 return false;
             }
         }
+        /** IRIS_26432_MOTION_V2_DIRECT_GAINMAP_JPEG */
+        public static boolean saveBitmapAsJPGMotionV2(
+                Path fileToSave,
+                Bitmap img,
+                int jpgQuality,
+                ParseExif.ExifData exifData) {
+            exifData.COMPRESSION = String.valueOf(jpgQuality);
+            try {
+                boolean saved;
+                try (OutputStream outputStream = Files.newOutputStream(fileToSave)) {
+                    saved = img.compress(
+                            Bitmap.CompressFormat.JPEG,
+                            jpgQuality,
+                            outputStream);
+                    outputStream.flush();
+                }
+                if (!saved) return false;
+
+                img.recycle();
+                ExifInterface inter = ParseExif.setAllAttributes(
+                        fileToSave.toFile(), exifData);
+                inter.saveAttributes();
+                return true;
+            } catch (IOException e) {
+                e.printStackTrace();
+                return false;
+            }
+        }
 
         /*public static boolean saveBitmapAsAVIF(Path fileToSave, Bitmap img, int jpgQuality, ParseExif.ExifData exifData) {
             exifData.COMPRESSION = String.valueOf(jpgQuality);

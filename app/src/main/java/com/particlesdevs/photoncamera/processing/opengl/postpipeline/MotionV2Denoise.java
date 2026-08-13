@@ -4,9 +4,16 @@ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
 import com.particlesdevs.photoncamera.util.Log;
 
 /**
- * IRIS_26411_MOTION_V2_LUMA_CHROMA_RECONSTRUCTION
- * Reference-only residual cleanup. Structural/luma evidence is protected;
- * R-G and B-G chroma residuals are cleaned more strongly.
+ * IRIS_26430_MOTION_V2_OWNED_RESIDUAL_CLEANUP
+ *
+ * 26411's reference-era denoiser is retired.
+ *
+ * 26430 consumes only Motion V2's measured effective temporal support.
+ * It does NOT consume basePipeline.noiseS/noiseO, Photon noiseRstr,
+ * ESD strengths, or generic post-processing denoise controls.
+ *
+ * The temporal reconstruction is now the primary denoiser. This stage performs
+ * only light residual 3x3 cleanup and never sharpens.
  */
 public final class MotionV2Denoise extends Node {
     public MotionV2Denoise() { super("", "MotionV2Denoise"); }
@@ -17,18 +24,27 @@ public final class MotionV2Denoise extends Node {
         if (!basePipeline.mParameters.motionV2Active) {
             throw new IllegalStateException("MotionV2Denoise used outside Motion V2");
         }
+
+        float effectiveSupport = Math.max(
+                1.0f, basePipeline.mParameters.motionV2EffectiveSupport);
+
         glProg.useAssetProgram("motionv2/denoise");
         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
-        glProg.setVar("noiseS", Math.max(basePipeline.noiseS, 1.0e-8f));
-        glProg.setVar("noiseO", Math.max(basePipeline.noiseO, 1.0e-8f));
-        glProg.setVar("effectiveSupport",
-                Math.max(1.0f, basePipeline.mParameters.motionV2EffectiveSupport));
+        glProg.setVar("effectiveSupport", effectiveSupport);
+
         WorkingTexture = basePipeline.getMain();
         glProg.drawBlocks(WorkingTexture);
         glProg.closed = true;
-        Log.d(Name, "IRIS_26411_V2_LUMA_CHROMA_RECONSTRUCTION"
-                + " luma=detailGatedResidual chroma=greenGuidedOpponent"
-                + " sharpening=false effectiveSupport="
-                + basePipeline.mParameters.motionV2EffectiveSupport);
+
+        Log.d(Name, "IRIS_26437_DETAIL_PRESERVE_RESIDUAL_CLEANUP"
+                + " effectiveSupport=" + effectiveSupport
+                + " kernel=3x3"
+                + " referenceEdgeAnchor=true"
+                + " whitePointOwnedHighlights=true"
+                + " residualCleanupReduced=true"
+                + " photonNoiseStateConsumed=false"
+                + " noiseRstrConsumed=false"
+                + " temporalReconstructionPrimaryDenoiser=true"
+                + " sharpening=false");
     }
 }

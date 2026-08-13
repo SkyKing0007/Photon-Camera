@@ -147,7 +147,38 @@ public class GLCoreBlockProcessing extends GLContext implements AutoCloseable {
         GLProg program = super.mProgram;
         GLBlockDivider divider = new GLBlockDivider(size.y, GLDrawParams.TileSize);
         int[] row = new int[2];
-        ByteBuffer mBlockBuffert = mBlockBuffer;
+        /*
+         * IRIS_26457_SAFE_FULL_RES_DIAGNOSTIC_READBACK
+         *
+         * Restores the proven 26304 format-correct stage-readback protection.
+         *
+         * mBlockBuffer belongs to the normal pipeline output format. A debug
+         * readback may request more bytes per tile (for example native-width
+         * RGBA8 C capture). Reusing a smaller normal buffer caused the exact
+         * runtime failure:
+         *
+         *   newLimit > capacity: (4194304 > 3145728)
+         *
+         * Allocate a temporary direct block buffer only when the requested
+         * readback format needs more bytes. Normal processing and any
+         * readback that already fits continue using the original buffer.
+         * MOTION_26304_FORMAT_CORRECT_STAGE_READBACK
+         */
+        final int requestedBlockBytes =
+                size.x
+                        * GLDrawParams.TileSize
+                        * glFormat.mFormat.mSize
+                        * glFormat.mChannels;
+
+        final boolean temporaryBlockBuffer =
+                mBlockBuffer == null
+                        || mBlockBuffer.capacity() < requestedBlockBytes;
+
+        ByteBuffer mBlockBuffert =
+                temporaryBlockBuffer
+                        ? ByteBuffer.allocateDirect(requestedBlockBytes)
+                        : mBlockBuffer;
+
         mOutBuffer.position(0);
         mBlockBuffert.position(0);
         while (divider.nextBlock(row)) {
@@ -174,6 +205,11 @@ public class GLCoreBlockProcessing extends GLContext implements AutoCloseable {
         }
         mOutBuffer.position(0);
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        if (temporaryBlockBuffer) {
+            mBlockBuffert.clear();
+        }
+
         return mOutBuffer;
     }
 

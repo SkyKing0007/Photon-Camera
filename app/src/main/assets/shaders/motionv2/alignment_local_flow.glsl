@@ -14,13 +14,13 @@ float patchCost(ivec2 p, ivec2 candidateShift) {
     ivec2 sz=textureSize(ReferenceGuide,0);
     float sum=0.0;
     float count=0.0;
-    for(int y=-1;y<=1;y++){
-        for(int x=-1;x<=1;x++){
+    for(int y=-2;y<=2;y++){
+        for(int x=-2;x<=2;x++){
             ivec2 r=clamp(p+ivec2(x,y),ivec2(0),sz-ivec2(1));
             ivec2 a=clamp(r+candidateShift,ivec2(0),sz-ivec2(1));
             float rv=texelFetch(ReferenceGuide,r,0).r;
             float av=texelFetch(AlterGuide,a,0).r;
-            sum+=min(abs(rv-av),0.10);
+            sum+=min(abs(rv-av),0.075);
             count+=1.0;
         }
     }
@@ -81,20 +81,33 @@ void main() {
             abs(texelFetch(ReferenceGuide,u,0).r-
                 texelFetch(ReferenceGuide,d,0).r));
 
-    float photometric=1.0-smoothstep(0.020,0.105,best);
+    float photometric=1.0-smoothstep(0.010,0.060,best);
     float uniqueness=smoothstep(
-            0.0015,
-            0.020,
+            0.0020,
+            0.016,
             max(secondBest-best,0.0));
-    float structureTrust=smoothstep(0.001,0.018,structure);
+    float structureTrust=smoothstep(0.002,0.025,structure);
 
     /*
-     * Flat regions may legitimately align from the global estimate, so they
-     * retain a conservative confidence floor instead of becoming holes.
+     * IRIS_26436_REFERENCE_RIGID_LOCAL_ALIGNMENT
+     * Local deformation has no authority unless immutable-reference evidence
+     * is both photometrically good and useful. Ambiguous regions stay on the
+     * rigid global transform, preventing local line bending.
      */
-    float confidence=photometric
-            * mix(0.48,1.0,max(uniqueness,structureTrust));
-    confidence=clamp(confidence,0.0,1.0);
+    float evidence=max(uniqueness,structureTrust);
+    float refineAuthority=clamp(photometric*evidence,0.0,1.0);
+    refineAuthority*=refineAuthority;
+    residual*=refineAuthority;
+
+    /*
+     * The old ~0.48 floor is intentionally gone. A bad or moving local patch
+     * can reach zero confidence. Flat good patches keep modest trust but use
+     * rigid global geometry because refineAuthority is small.
+     */
+    float confidence=clamp(
+            max(0.28*photometric,photometric*evidence),
+            0.0,1.0);
+    if(best>0.070) confidence=0.0;
 
     vec2 flowPacked=
             (vec2(globalShiftGuide)+residual)*guideScale;

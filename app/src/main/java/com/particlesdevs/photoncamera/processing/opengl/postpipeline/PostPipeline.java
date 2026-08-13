@@ -17,6 +17,7 @@ import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
 import com.particlesdevs.photoncamera.processing.parameters.ResolutionSolution;
 import com.particlesdevs.photoncamera.processing.render.NoiseModeler;
 import com.particlesdevs.photoncamera.processing.render.Parameters;
+import com.particlesdevs.photoncamera.processing.ultrahdr.MotionV2UltraHdr;
 import com.particlesdevs.photoncamera.settings.annotations.Tunable;
 import com.particlesdevs.photoncamera.util.Allocator;
 
@@ -28,6 +29,10 @@ public class PostPipeline extends GLBasePipeline {
 
     /* IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF */
     public ByteBuffer motionV2FloatCfa;
+
+    /* IRIS_26432_TRUE_V2_GAINMAP_HANDOFF */
+    public Bitmap motionV2GainMapBitmap;
+    public float motionV2GainMapMaxRatio = 1.0f;
     public ByteBuffer lowFrame;
     public ByteBuffer highFrame;
     public GLTexture FusionMap;
@@ -166,6 +171,29 @@ public class PostPipeline extends GLBasePipeline {
         BuildDefaultPipeline();
         GLImage resImg = runAll();
         Bitmap res = resImg.getBufferedImage();
+
+        /*
+         * IRIS_26432_TRUE_V2_ULTRAHDR_ATTACH
+         * Gain map came from pre-tone extended-linear Motion V2 signal.
+         */
+        if (mParameters.motionV2Active && motionV2GainMapBitmap != null) {
+            boolean attached = MotionV2UltraHdr.attach(
+                    res,
+                    motionV2GainMapBitmap,
+                    getRotation(),
+                    motionV2GainMapMaxRatio);
+            try {
+                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                        "IRIS_26432_TRUE_V2_ULTRAHDR",
+                        "attached=" + attached
+                                + " source=extendedLinearPreTone"
+                                + " sdrBasePreserved=true"
+                                + " bodyGainUnity=true"
+                                + " maxRatio=" + motionV2GainMapMaxRatio);
+            } catch (Throwable ignored) {}
+            motionV2GainMapBitmap = null;
+        }
+
         Allocator.free(resImg.byteBuffer);
         GLTexture.closeAll();
         return res;
@@ -231,7 +259,12 @@ public class PostPipeline extends GLBasePipeline {
              */
             boolean directBayer =
                     mParameters.cfaPattern >= 0 && mParameters.cfaPattern <= 3;
-            if (directBayer) {
+            /*
+             * IRIS_26451_REFERENCE_SAFE_DEMOSAIC_ISOLATION
+             * Standard Bayer is packed CFA in this controlled build.
+             */
+            boolean directRgbCarrier = directBayer;
+            if (directRgbCarrier) {
                 /*
                  * IRIS_26424_DIRECT_MULTIFRAME_RGB_POST_GRAPH
                  * Standard Bayer image formation already produced full-
@@ -258,6 +291,15 @@ public class PostPipeline extends GLBasePipeline {
                      * Linear camera RGB -> direct HAL linear sRGB ->
                      * residual luma/chroma denoise -> tone/output.
                      */
+            /*
+             * IRIS_26446_LOCAL_SUPPORT_CONSUMER_ORDER
+             * Direct RGB alpha still carries true frame-equivalent support here.
+             */
+            if (false && directRgbCarrier) { /* IRIS_26462_WRONSKI_TEMPORAL_RECON_OWNS_PRIMARY_DENOISE */ add(new MotionV2LocalSupportDenoise()); add(new StageTelemetry("V2_POST_TRUE_LOCAL_SUPPORT_DENOISE")); }
+            if (directBayer && !directRgbCarrier) {
+                add(new StageTelemetry(
+                        "V2_POST_REFERENCE_SAFE_DEMOSAIC_ISOLATION"));
+            }
             add(new MotionV2ColorTransform());
             add(new MotionV2Denoise());
 
@@ -267,7 +309,7 @@ public class PostPipeline extends GLBasePipeline {
             add(new RotateWatermark(getRotation()));
             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
                     "IRIS_26410_MOTION_V2_POST_GRAPH",
-                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"
+                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,TrueLocalSupportDenoise,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"
                             + " directMultiframeRgb=" + directBayer
                             + " exposureFusion=false esd=false ablc=false"
                             + " initial=false autoExposure=false"

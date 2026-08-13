@@ -294,7 +294,22 @@ public class HdrxProcessor extends ProcessorBase {
             images.set(highind, frame);
         }
 
-        if (images.size() > 10) {
+        /*
+         * IRIS_26431_MOTION_V2_ALL_FRAME_HANDOFF
+         * Motion V2 owns local rejection. Do not globally throw away Motion RAWs.
+         */
+        if (cameraMode == CameraMode.MOTION) {
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "FRAME_RETENTION",
+                    "inputFrames=" + mImageFramesToProcess.size()
+                            + " retainedFrames=" + images.size()
+                            + " targetFraction=1.0"
+                            + " globalGyroDiscard=false"
+                            + " localConfidenceAuthority=MotionV2"
+                            + " referenceFallback=true"
+                            + " averageShakiness=" + unluckyavr
+                            + " pickinessDiagnosticOnly=" + unluckypickiness);
+        } else if (images.size() > 10) {
             int size = (int) (images.size() - FrameNumberSelector.throwCount);
             Log.d(TAG, "Throw Count:" + size);
             Log.d(TAG, "Image Count:" + images.size());
@@ -386,6 +401,37 @@ public class HdrxProcessor extends ProcessorBase {
                             + " layerMpy=" + images.get(0).pair.layerMpy
                             + " retainedFrames=" + images.size()
                             + " policy=ownedReferencePreserved");
+
+            /*
+             * IRIS_26450_MOTION_V2_REFERENCE_DNG
+             * Save the true timestamp-owned Bayer reference while its original
+             * RAW buffer is still alive. This is single-frame sensor RAW:
+             * no multiframe NR, no demosaic, no V2 RGB processing.
+             */
+            ByteBuffer iris26450ReferenceDng =
+                    images.get(0).buffer == null
+                            ? null
+                            : images.get(0).buffer.duplicate();
+            if (iris26450ReferenceDng == null) {
+                throw new IllegalStateException(
+                        "Motion V2 reference DNG buffer is null");
+            }
+            iris26450ReferenceDng.position(0);
+            boolean iris26450DngSaved =
+                    ImageSaver.Util.saveStackedRaw(
+                            dngFile,
+                            iris26450ReferenceDng,
+                            processingParameters);
+            processingEventsListener.notifyImageSavedStatus(
+                    iris26450DngSaved,
+                    dngFile);
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "IRIS_26450_MOTION_V2_REFERENCE_DNG",
+                    "saved=" + iris26450DngSaved
+                            + " rawTimestamp=" + images.get(0).timestamp
+                            + " source=timestampOwnedReferenceBayer"
+                            + " multiframeNr=false"
+                            + " bakedRgb=false");
         }
         selected = 0;
 
@@ -549,8 +595,24 @@ public class HdrxProcessor extends ProcessorBase {
         }
         imageFile = Paths.get(imageFile.toAbsolutePath() + ".jpg");
         //Saves the final bitmap
-        boolean imageSaved = ImageSaver.Util.saveBitmapAsJPG(imageFile, img,
-                ImageSaver.JPG_QUALITY, exifData);
+        final boolean imageSaved;
+        if (cameraMode == CameraMode.MOTION) {
+            /*
+             * IRIS_26432_MOTION_V2_TRUE_LINEAR_GAINMAP
+             * Generic bitmap-derived Ultra HDR is bypassed for Motion.
+             */
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "IRIS_26431_MOTION_V2_JPEG_OWNERSHIP",
+                    "syntheticBitmapGainMap=false"
+                            + " sdrBase=true"
+                            + " trueV2LinearGainMap=true"
+                            + " bodyGainUnity=true");
+            imageSaved = ImageSaver.Util.saveBitmapAsJPGMotionV2(
+                    imageFile, img, ImageSaver.JPG_QUALITY, exifData);
+        } else {
+            imageSaved = ImageSaver.Util.saveBitmapAsJPG(
+                    imageFile, img, ImageSaver.JPG_QUALITY, exifData);
+        }
 
         try {
             processingEventsListener.notifyImageSavedStatus(imageSaved, imageFile);

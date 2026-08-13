@@ -2,160 +2,93 @@
 LAYOUT
 precision highp float;
 precision highp image2D;
-
-layout(rgba16f, binding = 0) uniform highp readonly image2D referenceCfa;
-layout(rgba16f, binding = 1) uniform highp writeonly image2D outRgb;
-layout(rgba16f, binding = 2) uniform highp writeonly image2D outSupport;
-
+layout(rgba16f,binding=0) uniform highp readonly image2D referenceCfa;
+layout(rgba32f,binding=1) uniform highp readonly image2D referenceCov;
+layout(rgba32f,binding=2) uniform highp writeonly image2D outNumerator;
+layout(rgba32f,binding=3) uniform highp writeonly image2D outDenominator;
+layout(rgba32f,binding=4) uniform highp writeonly image2D outFrameSupport;
 uniform ivec2 rawSize;
+uniform ivec2 rawHalf;
 uniform int cfaPattern;
-uniform float sensorClipLevel;
-uniform vec3 sensorGains;
+uniform float clipR;
+uniform float clipG;
+uniform float clipB;
 
-/*
- * IRIS_26426_TRUE_NORMALIZED_CONVOLUTION_INIT
- *
- * The reference frame initializes a native-resolution camera-RGB estimate and
- * per-channel support from REAL CFA observations. No named demosaic stage and
- * no completed RGB candidate from an auxiliary frame exists.
- *
- * Structure-aware geometry:
- *   - estimate a local edge direction from real green CFA observations;
- *   - elongate the kernel along an edge;
- *   - contract it across the edge.
- *
- * Saturated photosites carry zero chromatic authority. If a channel has no
- * trustworthy local photosite, use a sensor-neutral green-derived fallback.
+int componentIndex(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+int componentColor(int c){
+    if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}
+    if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}
+    if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
+    if(c==3)return 0;if(c==0)return 2;return 1;
+}
+float clipForColor(int c){return c==0?clipR:(c==2?clipB:clipG);}
+float sampleValidity(float v,int c){
+    float clip=max(clipForColor(c),1e-6);
+    return 1.0-smoothstep(0.985*clip,0.998*clip,v);
+}
+float cfaAt(ivec2 p){
+    p=clamp(p,ivec2(0),rawSize-ivec2(1));
+    vec4 v=imageLoad(referenceCfa,p>>1);
+    int c=componentIndex(p);
+    return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));
+}
+mat2 covAt(ivec2 p){
+    p=clamp(p,ivec2(0),rawHalf-ivec2(1));
+    vec4 v=imageLoad(referenceCov,p);
+    return mat2(v.x,v.y,v.z,v.w);
+}
+mat2 interpolateCov(vec2 greyPos){
+    vec2 gp=greyPos;
+    ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));
+    ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));
+    vec2 f=fract(gp);
+    mat2 c00=covAt(fl);
+    mat2 c01=covAt(ivec2(ce.x,fl.y));
+    mat2 c10=covAt(ivec2(fl.x,ce.y));
+    mat2 c11=covAt(ce);
+    return c00*((1.0-f.x)*(1.0-f.y))
+         + c01*(f.x*(1.0-f.y))
+         + c10*((1.0-f.x)*f.y)
+         + c11*(f.x*f.y);
+}
+mat2 invertCov(mat2 m){
+    float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];
+    if(abs(d)<=1e-10) return mat2(1,0,0,1);
+    return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;
+}
+
+/* IRIS_26463_WRONSKI_PUBLIC_REFERENCE_ACCUMULATION
+ * Direct translation of merge_ref(): reference robustness=1, covariance
+ * interpolated on Bayer-quad grid, 3x3 physical CFA gather, independent RGB
+ * numerator/denominator. No per-frame normalization.
  */
+void main(){
+    ivec2 outP=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(outP,rawSize))) return;
 
-int componentIndex(ivec2 p) {
-    return ((p.y & 1) << 1) | (p.x & 1);
-}
+    vec2 coarse=vec2(outP); // public scale=1 coarse_ref_sub_pos
+    vec2 greyPos=(coarse-vec2(0.5))/2.0;
+    mat2 invCov=invertCov(interpolateCov(greyPos));
+    ivec2 center=ivec2(round(coarse));
+    vec3 num=vec3(0), den=vec3(0), validDen=vec3(0);
 
-int componentColor(int c) {
-    if (cfaPattern == 0) {          // RGGB
-        if (c == 0) return 0;
-        if (c == 3) return 2;
-        return 1;
-    } else if (cfaPattern == 1) {   // GRBG
-        if (c == 1) return 0;
-        if (c == 2) return 2;
-        return 1;
-    } else if (cfaPattern == 2) {   // GBRG
-        if (c == 2) return 0;
-        if (c == 1) return 2;
-        return 1;
-    }                               // BGGR
-    if (c == 3) return 0;
-    if (c == 0) return 2;
-    return 1;
-}
-
-float physicalSample(ivec2 rawPos) {
-    ivec2 p = clamp(rawPos, ivec2(0), rawSize - ivec2(1));
-    vec4 v = imageLoad(referenceCfa, p >> 1);
-    int c = componentIndex(p);
-    if (c == 0) return v.r;
-    if (c == 1) return v.g;
-    if (c == 2) return v.b;
-    return v.a;
-}
-
-float greenNear(ivec2 center) {
-    float sum = 0.0;
-    float wsum = 0.0;
-    for (int oy=-2; oy<=2; oy++) {
-        for (int ox=-2; ox<=2; ox++) {
-            ivec2 p = center + ivec2(ox,oy);
-            if (any(lessThan(p,ivec2(0))) || any(greaterThanEqual(p,rawSize))) continue;
-            if (componentColor(componentIndex(p)) != 1) continue;
-            float d2 = float(ox*ox + oy*oy);
-            float w = 1.0 / (0.5 + d2);
-            sum += physicalSample(p) * w;
-            wsum += w;
-        }
+    for(int iy=-1;iy<=1;iy++) for(int ix=-1;ix<=1;ix++){
+        ivec2 p=center+ivec2(ix,iy);
+        if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize))) continue;
+        int c=componentColor(componentIndex(p));
+        vec2 d=vec2(p)-coarse;
+        float z=max(dot(d,invCov*d),0.0);
+        float w=exp(-0.5*z);
+        float cfaSample=cfaAt(p);
+        num[c]+=cfaSample*w;
+        den[c]+=w;
+        validDen[c]+=w*sampleValidity(cfaSample,c);
     }
-    return wsum > 1.0e-6 ? sum/wsum : 0.0;
-}
-
-void structureAt(ivec2 xy, out vec2 normal, out float edgeStrength) {
-    float gx = greenNear(xy + ivec2(2,0)) - greenNear(xy - ivec2(2,0));
-    float gy = greenNear(xy + ivec2(0,2)) - greenNear(xy - ivec2(0,2));
-    vec2 g = vec2(gx,gy);
-    float mag = length(g);
-    float center = max(greenNear(xy), 0.02);
-    edgeStrength = clamp(mag / (0.08 + 0.45*center), 0.0, 1.0);
-    normal = mag > 1.0e-6 ? g/mag : vec2(1.0,0.0);
-}
-
-vec2 accumulateChannel(
-        vec2 target,
-        int wantedColor,
-        vec2 normal,
-        float edgeStrength) {
-    ivec2 base = ivec2(floor(target));
-    vec2 tangent = vec2(-normal.y, normal.x);
-
-    float sigmaAlong = mix(1.20, 2.00, edgeStrength);
-    float sigmaAcross = mix(1.20, 0.48, edgeStrength);
-    float invAlong2 = 1.0 / max(sigmaAlong*sigmaAlong, 0.04);
-    float invAcross2 = 1.0 / max(sigmaAcross*sigmaAcross, 0.04);
-
-    float sum = 0.0;
-    float weight = 0.0;
-    float clip = max(sensorClipLevel, 1.0e-6);
-
-    for (int oy=-3; oy<=3; oy++) {
-        for (int ox=-3; ox<=3; ox++) {
-            ivec2 p = base + ivec2(ox,oy);
-            if (any(lessThan(p,ivec2(0))) || any(greaterThanEqual(p,rawSize))) continue;
-            if (componentColor(componentIndex(p)) != wantedColor) continue;
-
-            float value = physicalSample(p);
-            vec2 d = (vec2(p)+vec2(0.5)) - (target+vec2(0.5));
-            float along = dot(d,tangent);
-            float across = dot(d,normal);
-            float metric = along*along*invAlong2 + across*across*invAcross2;
-            float spatial = exp(-0.5*metric);
-
-            // Once a CFA channel clips, it is no longer valid chromatic evidence.
-            float saturation = 1.0 - smoothstep(0.930*clip, 0.985*clip, value);
-            float w = spatial * saturation;
-
-            sum += value*w;
-            weight += w;
-        }
-    }
-    return vec2(sum,weight);
-}
-
-float neutralFromGreen(float green, int wantedColor) {
-    vec3 gains = max(sensorGains, vec3(1.0e-6));
-    float greenGain = gains.g;
-    if (wantedColor == 0) return green * greenGain / gains.r;
-    if (wantedColor == 2) return green * greenGain / gains.b;
-    return green;
-}
-
-void main() {
-    ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
-    if (any(greaterThanEqual(xy,rawSize))) return;
-
-    vec2 normal;
-    float edgeStrength;
-    structureAt(xy,normal,edgeStrength);
-
-    vec2 gAcc = accumulateChannel(vec2(xy),1,normal,edgeStrength);
-    float g = gAcc.y > 1.0e-5 ? gAcc.x/gAcc.y : greenNear(xy);
-
-    vec2 rAcc = accumulateChannel(vec2(xy),0,normal,edgeStrength);
-    vec2 bAcc = accumulateChannel(vec2(xy),2,normal,edgeStrength);
-
-    float r = rAcc.y > 1.0e-5 ? rAcc.x/rAcc.y : neutralFromGreen(g,0);
-    float b = bAcc.y > 1.0e-5 ? bAcc.x/bAcc.y : neutralFromGreen(g,2);
-
-    // Support is true accumulated kernel weight, independently per channel.
-    vec3 support = vec3(rAcc.y, gAcc.y, bAcc.y);
-    imageStore(outRgb,xy,vec4(max(vec3(r,g,b),vec3(0.0)),1.0));
-    imageStore(outSupport,xy,vec4(max(support,vec3(1.0e-4)),1.0));
+    imageStore(outNumerator,outP,vec4(num,0));
+    imageStore(outDenominator,outP,vec4(den,1));
+    /* IRIS_26465_CFA_UNSATURATED_SUPPORT_CARRIER
+     * R stores historical frame-equivalent support. G/B/A carry the
+     * independent unsaturated Wronski denominator for R/G/B.
+     */
+    imageStore(outFrameSupport,outP,vec4(1,validDen));
 }

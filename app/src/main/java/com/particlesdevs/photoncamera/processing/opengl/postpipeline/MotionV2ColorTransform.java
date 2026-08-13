@@ -4,10 +4,15 @@ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
 import com.particlesdevs.photoncamera.util.Log;
 
 /**
- * IRIS_26418_MOTION_V2_OWNED_COLOR_TRANSFORM
+ * IRIS_26430_MOTION_V2_COLOR_SAFETY_ONLY
  *
- * Applies the Camera2 reference-result color contract directly.
+ * Applies the timestamp-owned Camera2 reference-result color contract directly.
  * No Photon sensorToProPhoto, ProPhoto, CCT, Initial, or legacy color node.
+ *
+ * 26430 lineage rule:
+ * 26429 fixed the dominant CFA edge false-color failure. Highlight color repair
+ * is therefore reduced to a near-physical-sensor-clip safety net instead of
+ * acting as normal highlight tone/gamut processing.
  */
 public final class MotionV2ColorTransform extends Node {
     public MotionV2ColorTransform() { super("", "MotionV2ColorTransform"); }
@@ -29,24 +34,13 @@ public final class MotionV2ColorTransform extends Node {
             throw new IllegalStateException("Invalid Motion V2 direct color metadata dimensions");
         }
 
-        /*
-         * Demosaic produces one green channel from both Bayer greens.
-         * Use their arithmetic mean here. We log the split so a future
-         * per-green CFA gain stage can be justified by measured evidence.
-         */
         float greenGain = 0.5f * (g[1] + g[2]);
+        float sensorClipLevel = Math.max(
+                1.0f, basePipeline.mParameters.motionCanonicalExposureGain);
 
         glProg.useAssetProgram("motionv2/color_transform");
         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
         glProg.setVar("sensorGains", new float[]{g[0], greenGain, g[3]});
-        /*
-         * IRIS_26419_V2_SENSOR_SATURATION_DOMAIN
-         * raw_to_cfa maps normalized sensor white to canonicalExposureGain.
-         * Passing that ceiling lets the color shader identify when camera RGB
-         * has stopped being a trustworthy chromatic measurement.
-         */
-        float sensorClipLevel = Math.max(
-                1.0f, basePipeline.mParameters.motionCanonicalExposureGain);
         glProg.setVar("sensorClipLevel", sensorClipLevel);
         glProg.setVar("colorRow0", new float[]{m[0],m[1],m[2]});
         glProg.setVar("colorRow1", new float[]{m[3],m[4],m[5]});
@@ -56,13 +50,17 @@ public final class MotionV2ColorTransform extends Node {
         glProg.drawBlocks(WorkingTexture);
         glProg.closed = true;
 
-        Log.d(Name, "IRIS_26418_V2_COLOR"
+        Log.d(Name, "IRIS_26430_V2_COLOR"
                 + " gainsRGeGoB=" + java.util.Arrays.toString(g)
                 + " greenMean=" + greenGain
                 + " matrixRowMajor=" + java.util.Arrays.toString(m)
-                + " sensorClipLevel=" + Math.max(
-                        1.0f, basePipeline.mParameters.motionCanonicalExposureGain)
-                + " saturationAware=true"
+                + " sensorClipLevel=" + sensorClipLevel
+                + " camera2ColorAuthority=true"
+                + " sensorOnlyHighlightSafety=false"
+                + " transformedOverflowNeutralization=true"
+                + " neighborHueReconstruction=false"
+                + " perChannelSensorValidity=true"
+                + " lumaOwnedHighlightChroma=true"
                 + " explicitDotRows=true");
     }
 }

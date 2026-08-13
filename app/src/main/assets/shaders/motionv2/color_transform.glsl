@@ -10,14 +10,14 @@ uniform vec3 colorRow2;
 out vec3 Output;
 
 /*
- * IRIS_26427_COHERENT_NEUTRAL_HIGHLIGHT_CLIP
+ * IRIS_26430_SENSOR_CLIP_COLOR_SAFETY_ONLY
  *
- * Extreme highlights are allowed to clip. The requirement is that they clip
- * coherently rather than exposing unequal R/G/B clipping as magenta/cyan
- * zipper structure.
+ * 26429 repaired the dominant R/G/B edge-registration/robustness failure.
+ * Therefore ordinary extended-linear highlights must pass through untouched.
  *
- * Camera2 WB gains and the timestamp-owned sensor -> linear-sRGB matrix remain
- * authoritative. No neighboring hue is imported.
+ * Only camera-space samples approaching the physical sensor ceiling are allowed
+ * to lose chroma authority. There is no output-space "overflow" neutralization,
+ * no neighboring hue donor and no normal highlight tone mapping here.
  */
 
 float max3(vec3 v) { return max(v.r,max(v.g,v.b)); }
@@ -30,82 +30,109 @@ vec3 transformBalanced(vec3 balanced) {
             dot(colorRow2,balanced));
 }
 
+/*
+ * IRIS_26437_SENSOR_WHITE_POINT_COLOR_OWNERSHIP
+ *
+ * Repair chroma before white balance / matrix conversion, while camera-space
+ * samples can still be compared to the real sensor white point.
+ */
+vec3 sensorNeutralFromGreen(vec3 cameraRgb) {
+    vec3 gains=max(sensorGains,vec3(1.0e-6));
+    float g=max(cameraRgb.g,0.0);
+    return vec3(
+            g*gains.g/gains.r,
+            g,
+            g*gains.g/gains.b);
+}
+
 void main() {
     ivec2 xy=ivec2(gl_FragCoord.xy);
     vec3 cameraRgb=max(texelFetch(InputBuffer,xy,0).rgb,vec3(0.0));
 
     float sensorClip=max(sensorClipLevel,1.0e-6);
     vec3 sensorRelative=cameraRgb/sensorClip;
+    float peakRelative=max3(sensorRelative);
 
     /*
-     * One confidence for the highlight, not three independent clipping
-     * decisions. As any physical camera channel loses authority, confidence
-     * falls continuously.
+     * IRIS_26445_PER_CHANNEL_SENSOR_VALIDITY
+     *
+     * A reflective/white pixel does not become "bad RGB" all at once. Track
+     * reliability independently for R/G/B so one saturated photosite does not
+     * force an abrupt green-derived neutral replacement for the whole pixel.
      */
-    vec3 sensorReliable=vec3(1.0)-smoothstep(
+    vec3 channelLoss=smoothstep(
             vec3(0.900),
-            vec3(0.985),
+            vec3(0.995),
             sensorRelative);
-    float sensorLoss=1.0-min3(sensorReliable);
+    float leastLoss=min3(channelLoss);
+    float greatestLoss=max3(channelLoss);
+    float partialChannelLoss=
+            clamp(greatestLoss-leastLoss,0.0,1.0);
 
     /*
-     * Apply the actual HAL color contract first. The legacy pre-transform
-     * neighboring-hue reconstruction is intentionally absent.
+     * Build a small, smooth neighborhood risk mask. Only the confidence mask is
+     * spatially averaged; image structure itself is never blurred. This removes
+     * the Bayer-scale hard contours visible on white TV boxes, thin leaves and
+     * reflective metal.
+     */
+    ivec2 size=textureSize(InputBuffer,0);
+    float riskSum=0.0;
+    float riskWeight=0.0;
+    for(int oy=-1;oy<=1;oy++) {
+        for(int ox=-1;ox<=1;ox++) {
+            ivec2 p=clamp(xy+ivec2(ox,oy),ivec2(0),size-ivec2(1));
+            vec3 n=max(texelFetch(InputBuffer,p,0).rgb,vec3(0.0));
+            vec3 nr=n/sensorClip;
+            vec3 nl=smoothstep(vec3(0.900),vec3(0.995),nr);
+            float np=max3(nr);
+            float nPartial=max3(nl)-min3(nl);
+            float spatial=(ox==0 && oy==0)?2.0:1.0;
+            float r=
+                    smoothstep(0.82,1.00,np)
+                    *mix(0.25,1.0,clamp(nPartial,0.0,1.0));
+            riskSum+=r*spatial;
+            riskWeight+=spatial;
+        }
+    }
+    float neighborhoodRisk=
+            riskSum/max(riskWeight,1.0e-6);
+
+    /*
+     * IRIS_26445_LUMA_OWNED_HIGHLIGHT_CHROMA
+     *
+     * Apply the Camera2 gains/matrix to the measured signal first. Then, only
+     * where per-channel sensor validity is being lost, compress chroma around
+     * the transformed luminance axis. Luma/edge geometry remains the exact
+     * reference-owned value. This replaces 26437's green-derived whole-pixel
+     * neutralization and its hard terminal switch.
      */
     vec3 balanced=cameraRgb*sensorGains;
     vec3 linearSrgb=max(transformBalanced(balanced),vec3(0.0));
 
-    float outMax=max3(linearSrgb);
-    float outMin=min3(linearSrgb);
-    float y=max(dot(linearSrgb,vec3(0.2126,0.7152,0.0722)),0.0);
 
-    /*
-     * Protect ordinary saturated colors. Output-space neutralization requires
-     * HIGH LUMINANCE, not merely one large RGB component. Therefore a vivid
-     * red/blue object is not made white just because one channel is large.
-     */
-    float brightHighlight=smoothstep(0.62,0.90,y);
+    float y=max(
+            dot(linearSrgb,vec3(0.2126,0.7152,0.0722)),
+            0.0);
+    vec3 neutralLinear=vec3(y);
 
-    /*
-     * Catch WB/matrix expansion: a sensor sample may still be below physical
-     * white while transformed linear RGB is already beyond display headroom.
-     * Channel spread matters only inside a genuinely bright highlight.
-     */
-    float spread=(outMax-outMin)/max(outMax,1.0e-6);
-    float overflow=smoothstep(0.94,1.10,outMax);
-    float suspiciousSpread=smoothstep(0.08,0.30,spread);
-    float transformedLoss=brightHighlight*overflow*suspiciousSpread;
+    float localValidityRisk=
+            smoothstep(0.04,0.55,partialChannelLoss)
+            *smoothstep(0.82,1.00,peakRelative);
+    float terminalWhiteRisk=
+            smoothstep(0.970,1.020,peakRelative);
 
-    /*
-     * Physical sensor saturation is also only allowed to neutralize a bright
-     * highlight. This avoids changing a normally exposed saturated surface.
-     */
-    float physicalLoss=brightHighlight*sensorLoss;
-    float colorAuthorityLoss=max(physicalLoss,transformedLoss);
+    float chromaCompression=clamp(
+            max(
+                    localValidityRisk,
+                    0.72*terminalWhiteRisk)
+            *mix(0.82,1.0,neighborhoodRisk),
+            0.0,
+            0.92);
 
-    /*
-     * Continuous authority transition:
-     * valid color -> reduced chroma -> neutral highlight.
-     */
-    float neutralize=smoothstep(0.10,0.72,colorAuthorityLoss);
+    linearSrgb=mix(
+            linearSrgb,
+            neutralLinear,
+            chromaCompression);
 
-    /*
-     * Preserve highlight energy. As color authority vanishes, converge toward
-     * equal RGB at the brightest transformed channel. Render may then compress
-     * or clip that value normally, but it cannot become magenta/cyan.
-     */
-    float neutralEnergy=max(outMax,y);
-    vec3 coherentRgb=mix(linearSrgb,vec3(neutralEnergy),neutralize);
-
-    /*
-     * Terminal coherent clip. At this point highlight color is intentionally
-     * considered unrecoverable.
-     */
-    float terminal=
-            smoothstep(0.68,0.96,colorAuthorityLoss)
-            * smoothstep(0.78,1.02,y);
-    float terminalEnergy=max3(coherentRgb);
-    coherentRgb=mix(coherent,vec3(terminalEnergy),terminal);
-
-    Output=max(coherentRgb,vec3(0.0));
+    Output=max(linearSrgb,vec3(0.0));
 }
