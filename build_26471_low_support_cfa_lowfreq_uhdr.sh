@@ -84,6 +84,11 @@ GAINMAP="app/src/main/assets/shaders/motionv2/gainmap.glsl"
 LOWSUP="app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl"
 VERSION="app/version.properties"
 for f in "$RECON" "$GAINMAP" "$VERSION"; do mkdir -p "$TMP/candidate/$(dirname "$f")"; cp "$f" "$TMP/candidate/$f"; done
+# Candidate validation reads these unchanged 26469/26470 lineage files.
+# Copy them into the temporary candidate tree so validation is self-contained.
+for f in   "app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl"   "app/src/main/assets/shaders/motionv2/mfsr_kernel_covariance.glsl"   "app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java"   "app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java"; do
+  mkdir -p "$TMP/candidate/$(dirname "$f")"; cp "$f" "$TMP/candidate/$f"
+done
 mkdir -p "$TMP/candidate/$(dirname "$LOWSUP")"
 
 cat > "$TMP/candidate/$LOWSUP" <<'GLSL_LOW_SUPPORT'
