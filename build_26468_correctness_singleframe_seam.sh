@@ -62,7 +62,23 @@ awk '
   /^chmod \+x \.\/gradlew$/ { exit }
   { print }
 ' "$BASE_26467_SCRIPT" > "$PRECURSOR"
-sed -i 's/OUTDIR="build_26467_outputs"/OUTDIR="'"$TMP"'\/26467_precursor_outputs"/' "$PRECURSOR"
+
+python3 - "$PRECURSOR" "$TMP/26467_precursor_outputs" <<'PY_PRECURSOR_OUTDIR'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+replacement = 'OUTDIR="' + sys.argv[2] + '"'
+text = path.read_text()
+anchor = 'OUTDIR="build_26467_outputs"'
+count = text.count(anchor)
+if count != 1:
+    raise SystemExit(
+        f"26467 precursor OUTDIR anchor expected exactly 1, found {count}")
+path.write_text(text.replace(anchor, replacement, 1))
+print("26467 precursor OUTDIR rewrite: PASS")
+PY_PRECURSOR_OUTDIR
+
 chmod +x "$PRECURSOR"
 
 bash -n "$PRECURSOR" || fail "26467 transform-only precursor syntax"
