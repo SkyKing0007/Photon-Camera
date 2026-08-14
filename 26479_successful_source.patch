@@ -1,0 +1,2991 @@
+diff --git a/app/src/main/assets/shaders/motionv2/alignment_guide.glsl b/app/src/main/assets/shaders/motionv2/alignment_guide.glsl
+index 1915a894..c6d9a65e 100644
+--- a/app/src/main/assets/shaders/motionv2/alignment_guide.glsl
++++ b/app/src/main/assets/shaders/motionv2/alignment_guide.glsl
+@@ -9,39 +9,26 @@ layout(r32f, binding=0) uniform highp writeonly image2D OutputGuide;
+ uniform int guideScale;
+ uniform float signalScale;
+ 
+-#ifndef CFAPATTERN
+-#define CFAPATTERN 0
+-#endif
+-
+-/* IRIS_26420_V2_ALIGNMENT_GREEN_GUIDE */
+-/* IRIS_26421_GLES_R32F_ALIGNMENT_GUIDE */
+-float packedGreen(vec4 v) {
+-#if CFAPATTERN == 0 || CFAPATTERN == 3
+-    return 0.5*(v.g+v.b);
+-#else
+-    return 0.5*(v.r+v.a);
+-#endif
+-}
+-
++/*
++ * IRIS_26475_WRONSKI_BAYER_QUAD_ALIGNMENT_GUIDE
++ *
++ * Wronski 2019 does not disclose the exact CFA->gray registration prefilter.
++ * IPOL Sec. 2.1 explicitly identifies averaging each 2x2 Bayer quad as the
++ * cheap/fast strategy likely used by the original mobile implementation and
++ * says it is the option to use to be closer to Wronski's original method.
++ *
++ * InputCfa is already packed as one RGBA texel per physical 2x2 Bayer quad,
++ * so this is the exact arithmetic mean of the four physical CFA samples.
++ * No 26473 5x5 "FFT-equivalent" approximation remains.
++ */
+ void main() {
+     ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+-    ivec2 outSize=imageSize(OutputGuide);
+-    if(any(greaterThanEqual(q,outSize))) return;
+-
+-    ivec2 inSize=textureSize(InputCfa,0);
+-    ivec2 start=q*guideScale;
+-    float sum=0.0;
+-    float count=0.0;
+-
+-    for(int y=0;y<4;y++){
+-        for(int x=0;x<4;x++){
+-            if(x>=guideScale || y>=guideScale) continue;
+-            ivec2 p=clamp(start+ivec2(x,y),ivec2(0),inSize-ivec2(1));
+-            vec4 c=max(texelFetch(InputCfa,p,0),vec4(0.0));
+-            sum+=packedGreen(c)/max(signalScale,1.0e-6);
+-            count+=1.0;
+-        }
+-    }
++    ivec2 os=imageSize(OutputGuide);
++    if(any(greaterThanEqual(q,os))) return;
++    ivec2 is=textureSize(InputCfa,0);
++    ivec2 p=clamp(q,ivec2(0),is-ivec2(1));
++    vec4 v=max(texelFetch(InputCfa,p,0),vec4(0.0));
++    float g=0.25*(v.r+v.g+v.b+v.a)/max(signalScale,1.0e-6);
++    imageStore(OutputGuide,q,vec4(g,0.0,0.0,0.0));
++}
+ 
+-    imageStore(OutputGuide,q,vec4(sum/max(count,1.0),0.0,0.0,0.0));
+-}
+\ No newline at end of file
+diff --git a/app/src/main/assets/shaders/motionv2/color_transform.glsl b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+index c6d4ff0c..203e501c 100644
+--- a/app/src/main/assets/shaders/motionv2/color_transform.glsl
++++ b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+@@ -9,130 +9,14 @@ uniform vec3 colorRow1;
+ uniform vec3 colorRow2;
+ out vec3 Output;
+ 
+-/*
+- * IRIS_26430_SENSOR_CLIP_COLOR_SAFETY_ONLY
+- *
+- * 26429 repaired the dominant R/G/B edge-registration/robustness failure.
+- * Therefore ordinary extended-linear highlights must pass through untouched.
+- *
+- * Only camera-space samples approaching the physical sensor ceiling are allowed
+- * to lose chroma authority. There is no output-space "overflow" neutralization,
+- * no neighboring hue donor and no normal highlight tone mapping here.
+- */
+-
+-float max3(vec3 v) { return max(v.r,max(v.g,v.b)); }
+-float min3(vec3 v) { return min(v.r,min(v.g,v.b)); }
+-
+-vec3 transformBalanced(vec3 balanced) {
+-    return vec3(
+-            dot(colorRow0,balanced),
+-            dot(colorRow1,balanced),
+-            dot(colorRow2,balanced));
+-}
+-
+-/*
+- * IRIS_26437_SENSOR_WHITE_POINT_COLOR_OWNERSHIP
+- *
+- * Repair chroma before white balance / matrix conversion, while camera-space
+- * samples can still be compared to the real sensor white point.
+- */
+-vec3 sensorNeutralFromGreen(vec3 cameraRgb) {
+-    vec3 gains=max(sensorGains,vec3(1.0e-6));
+-    float g=max(cameraRgb.g,0.0);
+-    return vec3(
+-            g*gains.g/gains.r,
+-            g,
+-            g*gains.g/gains.b);
+-}
+-
++/* IRIS_26478_CAMERA2_COLOR_ONLY_NO_HIGHLIGHT_CHROMA_REPAIR */
+ void main() {
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+     vec3 cameraRgb=max(texelFetch(InputBuffer,xy,0).rgb,vec3(0.0));
+-
+-    float sensorClip=max(sensorClipLevel,1.0e-6);
+-    vec3 sensorRelative=cameraRgb/sensorClip;
+-    float peakRelative=max3(sensorRelative);
+-
+-    /*
+-     * IRIS_26445_PER_CHANNEL_SENSOR_VALIDITY
+-     *
+-     * A reflective/white pixel does not become "bad RGB" all at once. Track
+-     * reliability independently for R/G/B so one saturated photosite does not
+-     * force an abrupt green-derived neutral replacement for the whole pixel.
+-     */
+-    vec3 channelLoss=smoothstep(
+-            vec3(0.900),
+-            vec3(0.995),
+-            sensorRelative);
+-    float leastLoss=min3(channelLoss);
+-    float greatestLoss=max3(channelLoss);
+-    float partialChannelLoss=
+-            clamp(greatestLoss-leastLoss,0.0,1.0);
+-
+-    /*
+-     * Build a small, smooth neighborhood risk mask. Only the confidence mask is
+-     * spatially averaged; image structure itself is never blurred. This removes
+-     * the Bayer-scale hard contours visible on white TV boxes, thin leaves and
+-     * reflective metal.
+-     */
+-    ivec2 size=textureSize(InputBuffer,0);
+-    float riskSum=0.0;
+-    float riskWeight=0.0;
+-    for(int oy=-1;oy<=1;oy++) {
+-        for(int ox=-1;ox<=1;ox++) {
+-            ivec2 p=clamp(xy+ivec2(ox,oy),ivec2(0),size-ivec2(1));
+-            vec3 n=max(texelFetch(InputBuffer,p,0).rgb,vec3(0.0));
+-            vec3 nr=n/sensorClip;
+-            vec3 nl=smoothstep(vec3(0.900),vec3(0.995),nr);
+-            float np=max3(nr);
+-            float nPartial=max3(nl)-min3(nl);
+-            float spatial=(ox==0 && oy==0)?2.0:1.0;
+-            float r=
+-                    smoothstep(0.82,1.00,np)
+-                    *mix(0.25,1.0,clamp(nPartial,0.0,1.0));
+-            riskSum+=r*spatial;
+-            riskWeight+=spatial;
+-        }
+-    }
+-    float neighborhoodRisk=
+-            riskSum/max(riskWeight,1.0e-6);
+-
+-    /*
+-     * IRIS_26445_LUMA_OWNED_HIGHLIGHT_CHROMA
+-     *
+-     * Apply the Camera2 gains/matrix to the measured signal first. Then, only
+-     * where per-channel sensor validity is being lost, compress chroma around
+-     * the transformed luminance axis. Luma/edge geometry remains the exact
+-     * reference-owned value. This replaces 26437's green-derived whole-pixel
+-     * neutralization and its hard terminal switch.
+-     */
+-    vec3 balanced=cameraRgb*sensorGains;
+-    vec3 linearSrgb=max(transformBalanced(balanced),vec3(0.0));
+-
+-
+-    float y=max(
+-            dot(linearSrgb,vec3(0.2126,0.7152,0.0722)),
+-            0.0);
+-    vec3 neutralLinear=vec3(y);
+-
+-    float localValidityRisk=
+-            smoothstep(0.04,0.55,partialChannelLoss)
+-            *smoothstep(0.82,1.00,peakRelative);
+-    float terminalWhiteRisk=
+-            smoothstep(0.970,1.020,peakRelative);
+-
+-    float chromaCompression=clamp(
+-            max(
+-                    localValidityRisk,
+-                    0.72*terminalWhiteRisk)
+-            *mix(0.82,1.0,neighborhoodRisk),
+-            0.0,
+-            0.92);
+-
+-    linearSrgb=mix(
+-            linearSrgb,
+-            neutralLinear,
+-            chromaCompression);
+-
++    vec3 balanced=cameraRgb*max(sensorGains,vec3(1.0e-6));
++    vec3 linearSrgb=vec3(
++            dot(colorRow0,balanced),
++            dot(colorRow1,balanced),
++            dot(colorRow2,balanced));
+     Output=max(linearSrgb,vec3(0.0));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl b/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
+index 23471a64..3baf9bc2 100644
+--- a/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
++++ b/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
+@@ -4,15 +4,6 @@ precision highp float;
+ precision highp image2D;
+ uniform highp sampler2D flowTexture;
+ uniform highp sampler2D robustnessTexture;
+-/*
+- * IRIS_26464_GLES31_WRONSKI_PING_PONG_FLOAT32
+- *
+- * GLSL ES requires non-r32 image formats such as rgba32f to be qualified
+- * readonly and/or writeonly. Persistent Wronski accumulation is therefore
+- * expressed as previous sampler textures -> writeonly next images.
+- * The math remains exactly num_next = num_prev + addNum and
+- * den_next = den_prev + addDen, with one divide only after the full burst.
+- */
+ uniform highp sampler2D previousNumerator;
+ uniform highp sampler2D previousDenominator;
+ uniform highp sampler2D previousFrameSupport;
+@@ -36,11 +27,6 @@ int componentColor(int c){
+     if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
+     if(c==3)return 0;if(c==0)return 2;return 1;
+ }
+-float clipForColor(int c){return c==0?clipR:(c==2?clipB:clipG);}
+-float sampleValidity(float v,int c){
+-    float clip=max(clipForColor(c),1e-6);
+-    return 1.0-smoothstep(0.985*clip,0.998*clip,v);
+-}
+ float cfaAt(ivec2 p){
+     p=clamp(p,ivec2(0),rawSize-ivec2(1));
+     vec4 v=imageLoad(alterCfa,p>>1);
+@@ -71,17 +57,7 @@ mat2 invertCov(mat2 m){
+     return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;
+ }
+ 
+-/* IRIS_26463_WRONSKI_PUBLIC_AUX_ACCUMULATION
+- * Public merge() coordinate contract at scale=1:
+- * lr = output+0.5; lr_mov=lr+flow; center=int(lr_mov);
+- * distance uses lr_mov-0.5; covariance position=lr_mov/2-0.5.
+- * Num/den remain FLOAT32 running accumulators and are divided only once.
+- */
+-/* IRIS_26465_WRONSKI_CFA_SATURATION_PROVENANCE
+- * The published Wronski num/den recurrence is untouched. G/B/A in the
+- * existing frame-support carrier accumulate unsaturated R/G/B kernel support
+- * using the same sample positions, covariance and robustness weights.
+- */
++/* IRIS_26478_WRONSKI_PUBLIC_AUX_ACCUMULATION_NO_SATURATION_SIDECHANNEL */
+ void main(){
+     ivec2 outP=ivec2(gl_GlobalInvocationID.xy);
+     if(any(greaterThanEqual(outP,rawSize))) return;
+@@ -99,7 +75,7 @@ void main(){
+ 
+     ivec2 center=ivec2(lrMov);
+     vec2 movTarget=lrMov-0.5;
+-    vec3 addNum=vec3(0),addDen=vec3(0),addValidDen=vec3(0);
++    vec3 addNum=vec3(0.0),addDen=vec3(0.0);
+     for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){
+         ivec2 p=center+ivec2(ix,iy);
+         if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize))) continue;
+@@ -110,8 +86,8 @@ void main(){
+         float cfaSample=cfaAt(p);
+         addNum[c]+=w*cfaSample;
+         addDen[c]+=w;
+-        addValidDen[c]+=w*sampleValidity(cfaSample,c);
+     }
++
+     vec4 n=texelFetch(previousNumerator,outP,0);
+     n.rgb+=addNum;
+     imageStore(outNumerator,outP,n);
+@@ -121,7 +97,7 @@ void main(){
+     imageStore(outDenominator,outP,d);
+ 
+     vec4 fs=texelFetch(previousFrameSupport,outP,0);
+-    fs.r=min(max(maximumSupport,1.0),max(fs.r,1.0)+R);
+-    fs.gba+=addValidDen;
++    fs.r=min(max(maximumSupport-1.0,0.0),max(fs.r,0.0)+R);
++    fs.gba=vec3(0.0);
+     imageStore(outFrameSupport,outP,fs);
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/direct_rgb_init.glsl b/app/src/main/assets/shaders/motionv2/direct_rgb_init.glsl
+index cdd3d136..4ff09f81 100644
+--- a/app/src/main/assets/shaders/motionv2/direct_rgb_init.glsl
++++ b/app/src/main/assets/shaders/motionv2/direct_rgb_init.glsl
+@@ -14,81 +14,11 @@ uniform float clipR;
+ uniform float clipG;
+ uniform float clipB;
+ 
+-int componentIndex(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+-int componentColor(int c){
+-    if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}
+-    if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}
+-    if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
+-    if(c==3)return 0;if(c==0)return 2;return 1;
+-}
+-float clipForColor(int c){return c==0?clipR:(c==2?clipB:clipG);}
+-float sampleValidity(float v,int c){
+-    float clip=max(clipForColor(c),1e-6);
+-    return 1.0-smoothstep(0.985*clip,0.998*clip,v);
+-}
+-float cfaAt(ivec2 p){
+-    p=clamp(p,ivec2(0),rawSize-ivec2(1));
+-    vec4 v=imageLoad(referenceCfa,p>>1);
+-    int c=componentIndex(p);
+-    return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));
+-}
+-mat2 covAt(ivec2 p){
+-    p=clamp(p,ivec2(0),rawHalf-ivec2(1));
+-    vec4 v=imageLoad(referenceCov,p);
+-    return mat2(v.x,v.y,v.z,v.w);
+-}
+-mat2 interpolateCov(vec2 greyPos){
+-    vec2 gp=greyPos;
+-    ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));
+-    ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));
+-    vec2 f=fract(gp);
+-    mat2 c00=covAt(fl);
+-    mat2 c01=covAt(ivec2(ce.x,fl.y));
+-    mat2 c10=covAt(ivec2(fl.x,ce.y));
+-    mat2 c11=covAt(ce);
+-    return c00*((1.0-f.x)*(1.0-f.y))
+-         + c01*(f.x*(1.0-f.y))
+-         + c10*((1.0-f.x)*f.y)
+-         + c11*(f.x*f.y);
+-}
+-mat2 invertCov(mat2 m){
+-    float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];
+-    if(abs(d)<=1e-10) return mat2(1,0,0,1);
+-    return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;
+-}
+-
+-/* IRIS_26463_WRONSKI_PUBLIC_REFERENCE_ACCUMULATION
+- * Direct translation of merge_ref(): reference robustness=1, covariance
+- * interpolated on Bayer-quad grid, 3x3 physical CFA gather, independent RGB
+- * numerator/denominator. No per-frame normalization.
+- */
++/* IRIS_26478_WRONSKI_AUX_FIRST_ZERO_ACCUMULATOR_NO_SATURATION_SIDECHANNEL */
+ void main(){
+-    ivec2 outP=ivec2(gl_GlobalInvocationID.xy);
+-    if(any(greaterThanEqual(outP,rawSize))) return;
+-
+-    vec2 coarse=vec2(outP); // public scale=1 coarse_ref_sub_pos
+-    vec2 greyPos=(coarse-vec2(0.5))/2.0;
+-    mat2 invCov=invertCov(interpolateCov(greyPos));
+-    ivec2 center=ivec2(round(coarse));
+-    vec3 num=vec3(0), den=vec3(0), validDen=vec3(0);
+-
+-    for(int iy=-1;iy<=1;iy++) for(int ix=-1;ix<=1;ix++){
+-        ivec2 p=center+ivec2(ix,iy);
+-        if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize))) continue;
+-        int c=componentColor(componentIndex(p));
+-        vec2 d=vec2(p)-coarse;
+-        float z=max(dot(d,invCov*d),0.0);
+-        float w=exp(-0.5*z);
+-        float cfaSample=cfaAt(p);
+-        num[c]+=cfaSample*w;
+-        den[c]+=w;
+-        validDen[c]+=w*sampleValidity(cfaSample,c);
+-    }
+-    imageStore(outNumerator,outP,vec4(num,0));
+-    imageStore(outDenominator,outP,vec4(den,1));
+-    /* IRIS_26465_CFA_UNSATURATED_SUPPORT_CARRIER
+-     * R stores historical frame-equivalent support. G/B/A carry the
+-     * independent unsaturated Wronski denominator for R/G/B.
+-     */
+-    imageStore(outFrameSupport,outP,vec4(1,validDen));
++    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
++    if(any(greaterThanEqual(p,rawSize))) return;
++    imageStore(outNumerator,p,vec4(0.0));
++    imageStore(outDenominator,p,vec4(0.0));
++    imageStore(outFrameSupport,p,vec4(0.0));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 7e5281a2..42793bb5 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -1,6 +1,5 @@
+ precision highp float;
+ precision mediump sampler2D;
+-
+ uniform sampler2D HdrBuffer;
+ uniform sampler2D SdrBuffer;
+ uniform ivec2 gainMapSize;
+@@ -8,16 +7,94 @@ uniform float hdrExposureScale;
+ uniform float maxGainRatio;
+ out vec4 Output;
+ 
+-/* IRIS_26438_MATCHED_FOOTPRINT_STANDARD_GAINMAP */
+-const float UHDR_OFFSET = 0.015625;
++/*
++ * IRIS_26472_SDR_AUTHORITATIVE_UHDR_HEADROOM
++ * IRIS_26472_EDGE_CONSTRAINED_GAIN_SPIKE_LIMITER
++ *
++ * UHDR contract:
++ * - SDR/base is the sole spatial-detail authority.
++ * - No UHDR denoise, blur, sharpening, microcontrast, texture enhancement,
++ *   texture suppression, or normal spatial smoothing.
++ * - The center raw log-gain passes through unchanged by default.
++ * - A compact 3x3 SDR-guided neighborhood is used ONLY to identify an
++ *   isolated/thin pathological gain excursion that could render as the
++ *   26470 razor halo.
++ * - Strong SDR luminance boundaries exclude cross-surface neighbors so HDR
++ *   headroom cannot bleed across walls/window frames.
++ */
++const float UHDR_OFFSET=0.015625;
++const float SAME_SURFACE_LOG_LUMA=0.20;
++const float SPIKE_BASE_LOG2=0.18;
++const float SPIKE_SIGMA_MULT=2.25;
++
+ float luminance(vec3 c){return dot(c,vec3(0.2126,0.7152,0.0722));}
+-float srgbDecode(float x){x=clamp(x,0.0,1.0);return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);}
+-vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));}
+-float hdrLocalLogLumaMean(vec2 uv){
+- vec2 texel=1.0/vec2(textureSize(HdrBuffer,0));float sum=0.0;float wsum=0.0;
+- for(int oy=-2;oy<=2;oy++)for(int ox=-2;ox<=2;ox++){float r2=float(ox*ox+oy*oy);float w=exp(-0.55*r2);vec3 c=max(texture(HdrBuffer,clamp(uv+vec2(float(ox),float(oy))*texel,vec2(0.0),vec2(1.0))).rgb,vec3(0.0));sum+=w*log(1.0e-4+max(luminance(c),0.0));wsum+=w;}return sum/max(wsum,1.0e-6);
++float srgbDecode(float x){
++    x=clamp(x,0.0,1.0);
++    return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);
++}
++vec3 srgbDecode(vec3 c){
++    return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));
++}
++float sdrLogLuma(vec2 uv){
++    uv=clamp(uv,vec2(0.0),vec2(1.0));
++    vec3 sdr=srgbDecode(texture(SdrBuffer,uv).rgb);
++    return log(UHDR_OFFSET+max(luminance(sdr),0.0));
++}
++float rawLogGain(vec2 uv,float maxLog){
++    uv=clamp(uv,vec2(0.0),vec2(1.0));
++    vec3 hdr=max(texture(HdrBuffer,uv).rgb,vec3(0.0))*hdrExposureScale;
++    vec3 sdr=srgbDecode(texture(SdrBuffer,uv).rgb);
++    float ratio=clamp(
++        (max(luminance(hdr),0.0)+UHDR_OFFSET)/
++        (max(luminance(sdr),0.0)+UHDR_OFFSET),
++        1.0,max(maxGainRatio,1.001));
++    return clamp(log2(ratio),0.0,maxLog);
++}
++void main(){
++    vec2 gm=max(vec2(gainMapSize),vec2(1.0));
++    vec2 uv=gl_FragCoord.xy/gm;
++    float maxLog=max(log2(max(maxGainRatio,1.001)),1.0e-6);
++
++    float centerGain=rawLogGain(uv,maxLog);
++    float centerGuide=sdrLogLuma(uv);
++
++    float sum=0.0;
++    float sumSq=0.0;
++    float weight=0.0;
++    float support=0.0;
++
++    for(int oy=-1;oy<=1;oy++) for(int ox=-1;ox<=1;ox++){
++        if(ox==0 && oy==0) continue;
++        vec2 q=uv+vec2(float(ox),float(oy))/gm;
++        float guide=sdrLogLuma(q);
++        float dg=abs(guide-centerGuide);
++        float sameSurface=1.0-smoothstep(
++            SAME_SURFACE_LOG_LUMA*0.70,
++            SAME_SURFACE_LOG_LUMA,
++            dg);
++        if(sameSurface<=0.0) continue;
++
++        float g=rawLogGain(q,maxLog);
++        sum+=sameSurface*g;
++        sumSq+=sameSurface*g*g;
++        weight+=sameSurface;
++        support+=step(0.50,sameSurface);
++    }
++
++    // Default path: exact center gain is preserved.
++    float outGain=centerGain;
++
++    // Correct only a statistically isolated/thin same-surface gain spike.
++    if(weight>2.5 && support>=3.0){
++        float mean=sum/weight;
++        float variance=max(sumSq/weight-mean*mean,0.0);
++        float sigma=sqrt(variance);
++        float residual=abs(centerGain-mean);
++        float threshold=max(SPIKE_BASE_LOG2,SPIKE_SIGMA_MULT*sigma);
++        float spike=smoothstep(threshold,threshold+0.12,residual);
++        outGain=mix(centerGain,mean,spike);
++    }
++
++    float encoded=clamp(outGain/maxLog,0.0,1.0);
++    Output=vec4(encoded,encoded,encoded,1.0);
+ }
+-vec3 applyHdrMicrocontrast(vec2 uv,vec3 rgb){rgb=max(rgb,vec3(0.0));float y=max(luminance(rgb),0.0);if(y<=1.0e-7)return rgb;float detail=log(1.0e-4+y)-hdrLocalLogLumaMean(uv);detail=clamp(detail,-0.20,0.20);float gate=smoothstep(0.025,0.12,y)*(1.0-smoothstep(0.55,0.92,y));return rgb*exp(0.42*gate*detail);}
+-vec3 matchedHdrFootprint(vec2 uv){vec2 texel=1.0/vec2(textureSize(HdrBuffer,0));vec3 sum=vec3(0.0);for(int oy=0;oy<4;oy++)for(int ox=0;ox<4;ox++){vec2 d=(vec2(float(ox),float(oy))-vec2(1.5))*texel;vec2 suv=clamp(uv+d,vec2(0.0),vec2(1.0));vec3 c=max(texture(HdrBuffer,suv).rgb,vec3(0.0));sum+=applyHdrMicrocontrast(suv,c);}return sum*(1.0/16.0);}
+-vec3 matchedSdrFootprint(vec2 uv){vec2 texel=1.0/vec2(textureSize(SdrBuffer,0));vec3 sum=vec3(0.0);for(int oy=0;oy<4;oy++)for(int ox=0;ox<4;ox++){vec2 d=(vec2(float(ox),float(oy))-vec2(1.5))*texel;vec3 c=texture(SdrBuffer,clamp(uv+d,vec2(0.0),vec2(1.0))).rgb;sum+=srgbDecode(c);}return sum*(1.0/16.0);}
+-void main(){vec2 uv=gl_FragCoord.xy/vec2(max(gainMapSize,ivec2(1)));vec3 hdr=matchedHdrFootprint(uv)*hdrExposureScale;vec3 sdr=matchedSdrFootprint(uv);float hdrY=max(luminance(hdr),0.0);float sdrY=max(luminance(sdr),0.0);float ratio=clamp((hdrY+UHDR_OFFSET)/(sdrY+UHDR_OFFSET),1.0,max(maxGainRatio,1.001));float encoded=log2(ratio)/max(log2(max(maxGainRatio,1.001)),1.0e-6);encoded=clamp(encoded,0.0,1.0);Output=vec4(encoded,encoded,encoded,1.0);}
+\ No newline at end of file
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_block_match.glsl b/app/src/main/assets/shaders/motionv2/mfsr_block_match.glsl
+index 11c16eb4..d260db67 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_block_match.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_block_match.glsl
+@@ -9,13 +9,20 @@ layout(rgba16f,binding=0) uniform highp writeonly image2D OutputFlow;
+ uniform ivec2 levelSize;
+ uniform int tileSize;
+ uniform int searchRadius;
+-uniform int distanceMetric; // 0 L1, 1 L2
++uniform int distanceMetric;
+ uniform int hasPrevious;
+ uniform float previousToCurrentScale;
+ 
+-float sampleGuide(sampler2D t,ivec2 p) {
+-    p=clamp(p,ivec2(0),levelSize-ivec2(1));
+-    return texelFetch(t,p,0).r;
++/* IRIS_26473_IPOL_ALIGNMENT_BOUNDARY_SEMANTICS */
++float sampleReference(ivec2 p) {
++    ivec2 s=levelSize;
++    ivec2 q=ivec2((p.x%s.x+s.x)%s.x,(p.y%s.y+s.y)%s.y);
++    return texelFetch(ReferenceGuide,q,0).r;
++}
++float sampleMoving(ivec2 p) {
++    if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,levelSize)))
++        return 0.0;
++    return texelFetch(MovingGuide,p,0).r;
+ }
+ void main() {
+     ivec2 tile=ivec2(gl_GlobalInvocationID.xy);
+@@ -42,9 +49,8 @@ void main() {
+             for(int xx=0;xx<64;xx++) {
+                 if(xx>=tileSize) continue;
+                 ivec2 rp=tile*tileSize+ivec2(xx,yy);
+-                if(any(greaterThanEqual(rp,levelSize))) continue;
+-                float a=sampleGuide(ReferenceGuide,rp);
+-                float b=sampleGuide(MovingGuide,rp+sh);
++                float a=sampleReference(rp);
++                float b=sampleMoving(rp+sh);
+                 float d=a-b;
+                 e += distanceMetric==0 ? abs(d) : d*d;
+                 n++;
+@@ -55,4 +61,4 @@ void main() {
+     }
+     float confidence=exp(-best/max(1e-5,0.02+best));
+     imageStore(OutputFlow,tile,vec4(vec2(bestShift),confidence,best));
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl b/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl
+index bba87461..1f18ed3d 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl
+@@ -10,32 +10,22 @@ uniform float wbR;
+ uniform float wbG;
+ uniform float wbB;
+ 
+-/* IRIS_26463_WRONSKI_PUBLIC_DIVIDE_ONCE_FINALIZER
+- * Public super_resolution.py divides num/den only once after every frame.
+- * Wronski was run in its WB signal domain; divide those gains here only to
+- * return completed RGB to Photon's proven sensor-linear Camera2 color stage.
+- */
+-/* IRIS_26465_FULLY_CLIPPED_NEUTRAL_HIGHLIGHT_RECOVERY
+- * If all three CFA colors have lost unsaturated support, chroma is no longer
+- * physically observed. Preserve balanced-domain highlight luminance and
+- * collapse only that unsupported chroma toward neutral. If any channel still
+- * has substantial unsaturated support, preserve the Wronski color unchanged.
+- */
++/* IRIS_26478_WRONSKI_PURE_DIVIDE_ONCE_FINALIZER */
+ void main(){
+     ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+     if(any(greaterThanEqual(p,imageSize(outRgb)))) return;
++
+     vec3 num=imageLoad(currentNumerator,p).rgb;
+     vec3 den=max(imageLoad(currentDenominator,p).rgb,vec3(1e-12));
+     vec3 wbRgb=num/den;
+-    vec4 support=imageLoad(currentFrameSupport,p);
+-    vec3 validDen=max(support.gba,vec3(0.0));
+-    vec3 validRatio=clamp(validDen/den,vec3(0.0),vec3(1.0));
+-    float strongestValid=max(validRatio.r,max(validRatio.g,validRatio.b));
+-    float unsupportedAll=1.0-smoothstep(0.08,0.35,strongestValid);
+-    float highlightLevel=max(wbRgb.r,max(wbRgb.g,wbRgb.b));
+-    vec3 neutralWb=vec3(highlightLevel);
+-    wbRgb=mix(wbRgb,neutralWb,unsupportedAll);
+-    vec3 sensorRgb=wbRgb/vec3(max(wbR,1e-6),max(wbG,1e-6),max(wbB,1e-6));
+-    float fs=max(support.r,1.0);
+-    imageStore(outRgb,p,vec4(max(sensorRgb,vec3(0)),fs));
++    vec3 sensorRgb=wbRgb/vec3(
++            max(wbR,1e-6),
++            max(wbG,1e-6),
++            max(wbB,1e-6));
++
++    float auxiliaryRobustness=
++            max(imageLoad(currentFrameSupport,p).r,0.0);
++    float frameSupport=1.0+auxiliaryRobustness;
++
++    imageStore(outRgb,p,vec4(max(sensorRgb,vec3(0.0)),frameSupport));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_ica_refine.glsl b/app/src/main/assets/shaders/motionv2/mfsr_ica_refine.glsl
+index 1500adfd..d87a2a53 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_ica_refine.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_ica_refine.glsl
+@@ -5,28 +5,35 @@ precision highp image2D;
+ uniform highp sampler2D ReferenceGuide;
+ uniform highp sampler2D MovingGuide;
+ uniform highp sampler2D BlockFlow;
++uniform highp sampler2D ReferenceGradient;
++uniform highp sampler2D InverseHessian;
+ layout(rgba16f,binding=0) uniform highp writeonly image2D OutputFlow;
+ uniform ivec2 levelSize;
+ uniform int tileSize;
+-uniform int iterations;
+ 
+-float bilinear(sampler2D t,vec2 p) {
+-    vec2 mx=vec2(levelSize)-vec2(1.001);
+-    p=clamp(p,vec2(0.0),mx);
++float movingAt(vec2 p) {
++    if(p.x<0.0||p.y<0.0||p.x>float(levelSize.x-1)||p.y>float(levelSize.y-1))
++        return 0.0;
+     ivec2 p0=ivec2(floor(p));
+     ivec2 p1=min(p0+ivec2(1),levelSize-ivec2(1));
+     vec2 f=fract(p);
+-    float a=mix(texelFetch(t,p0,0).r,texelFetch(t,ivec2(p1.x,p0.y),0).r,f.x);
+-    float b=mix(texelFetch(t,ivec2(p0.x,p1.y),0).r,texelFetch(t,p1,0).r,f.x);
++    float a=mix(texelFetch(MovingGuide,p0,0).r,
++                texelFetch(MovingGuide,ivec2(p1.x,p0.y),0).r,f.x);
++    float b=mix(texelFetch(MovingGuide,ivec2(p0.x,p1.y),0).r,
++                texelFetch(MovingGuide,p1,0).r,f.x);
+     return mix(a,b,f.y);
+ }
+-float refAt(ivec2 p) {
+-    p=clamp(p,ivec2(0),levelSize-ivec2(1));
+-    return texelFetch(ReferenceGuide,p,0).r;
++float refCircular(ivec2 p) {
++    ivec2 q=ivec2((p.x%levelSize.x+levelSize.x)%levelSize.x,
++                  (p.y%levelSize.y+levelSize.y)%levelSize.y);
++    return texelFetch(ReferenceGuide,q,0).r;
+ }
+ 
+-/* IRIS_26462_WRONSKI_INVERSE_COMPOSITIONAL_ALIGNMENT
+- * Hessian from reference gradients; three additive IC updates.
++/*
++ * IRIS_26475_IPOL_ICA_FINE_ONLY_THREE_ITERATIONS
++ * IPOL Algorithm 2: multi-scale BM first, then exactly three ICA iterations
++ * on the final fine tiles. Wronski states exactly three LK refinements after
++ * block matching; whether LK was repeated at each pyramid stage is unspecified.
+  */
+ void main() {
+     ivec2 tile=ivec2(gl_GlobalInvocationID.xy);
+@@ -34,43 +41,32 @@ void main() {
+     if(any(greaterThanEqual(tile,grid))) return;
+ 
+     vec4 seed=texelFetch(BlockFlow,tile,0);
+-    vec2 flow=seed.xy;
+-
+-    float H00=0.0,H01=0.0,H11=0.0;
+-    for(int yy=0;yy<64;yy++) {
+-        if(yy>=tileSize) continue;
+-        for(int xx=0;xx<64;xx++) {
+-            if(xx>=tileSize) continue;
+-            ivec2 p=tile*tileSize+ivec2(xx,yy);
+-            if(any(greaterThanEqual(p,levelSize))) continue;
+-            float gx=0.5*(refAt(p+ivec2(1,0))-refAt(p-ivec2(1,0)));
+-            float gy=0.5*(refAt(p+ivec2(0,1))-refAt(p-ivec2(0,1)));
+-            H00+=gx*gx; H01+=gx*gy; H11+=gy*gy;
+-        }
++    vec4 ih=texelFetch(InverseHessian,tile,0);
++    if(dot(abs(ih),vec4(1.0))<=1.0e-12){
++        imageStore(OutputFlow,tile,seed);
++        return;
+     }
+-    float det=max(H00*H11-H01*H01,1e-8);
+ 
+-    for(int iter=0;iter<3;iter++) {
+-        if(iter>=iterations) break;
++    vec2 flow=seed.xy;
++    for(int iter=0;iter<3;iter++){
+         float b0=0.0,b1=0.0;
+-        for(int yy=0;yy<64;yy++) {
++        for(int yy=0;yy<64;yy++){
+             if(yy>=tileSize) continue;
+-            for(int xx=0;xx<64;xx++) {
++            for(int xx=0;xx<64;xx++){
+                 if(xx>=tileSize) continue;
+                 ivec2 p=tile*tileSize+ivec2(xx,yy);
+                 if(any(greaterThanEqual(p,levelSize))) continue;
+-                float gx=0.5*(refAt(p+ivec2(1,0))-refAt(p-ivec2(1,0)));
+-                float gy=0.5*(refAt(p+ivec2(0,1))-refAt(p-ivec2(0,1)));
+-                float residual=bilinear(MovingGuide,vec2(p)+flow)-refAt(p);
+-                b0 += -gx*residual;
+-                b1 += -gy*residual;
++                vec2 g=texelFetch(ReferenceGradient,p,0).rg;
++                float residual=movingAt(vec2(p)+flow)-refCircular(p);
++                b0 += -g.x*residual;
++                b1 += -g.y*residual;
+             }
+         }
+         vec2 d=vec2(
+-                ( H11*b0-H01*b1)/det,
+-                (-H01*b0+H00*b1)/det);
+-        d=clamp(d,vec2(-1.5),vec2(1.5));
++            ih.r*b0 + ih.g*b1,
++            ih.b*b0 + ih.a*b1);
+         flow+=d;
+     }
+-    imageStore(OutputFlow,tile,vec4(flow,seed.z,seed.w));
+-}
+\ No newline at end of file
++    imageStore(OutputFlow,tile,vec4(flow,seed.zw));
++}
++
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_kernel_covariance.glsl b/app/src/main/assets/shaders/motionv2/mfsr_kernel_covariance.glsl
+index c3589b56..998830fd 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_kernel_covariance.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_kernel_covariance.glsl
+@@ -62,13 +62,19 @@ void main(){
+     float l1=max(0.5*(tr+disc),0.0);
+     float l2=max(0.5*(tr-disc),0.0);
+ 
++    /* IRIS_26469_STABLE_SYMMETRIC_TENSOR_EIGENVECTOR
++     * Two algebraically equivalent lambda1 eigenvectors are evaluated and the
++     * better-conditioned one is selected. This removes the diagonal-edge
++     * cancellation of (M-lambda2*I)*[1,1] without changing Wronski eigenvalues
++     * or the published kernel-selection law.
++     */
++    vec2 va=vec2(jxy,l1-jxx);
++    vec2 vb=vec2(l1-jyy,jxy);
++    float na=dot(va,va);
++    float nb=dot(vb,vb);
+     vec2 e1;
+-    if(abs(jxy)<1e-12 && abs(jxx-jyy)<1e-12) e1=vec2(1.0,0.0);
+-    else {
+-        e1=vec2(jxx+jxy-l2,jxy+jyy-l2);
+-        if(dot(e1,e1)<1e-16) e1=jxx>=jyy?vec2(1,0):vec2(0,1);
+-        else e1=normalize(e1);
+-    }
++    if(max(na,nb)>1e-20) e1=normalize(na>=nb?va:vb);
++    else e1=jxx>=jyy?vec2(1.0,0.0):vec2(0.0,1.0);
+     vec2 e2=vec2(-e1.y,e1.x);
+ 
+     float A=1.0+sqrt(max((l1-l2)/max(l1+l2,1e-20),0.0));
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_robustness.glsl b/app/src/main/assets/shaders/motionv2/mfsr_robustness.glsl
+index eda6e0ac..5afcb7b9 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_robustness.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_robustness.glsl
+@@ -3,14 +3,13 @@ LAYOUT
+ precision highp float;
+ precision highp image2D;
+ uniform highp sampler2D flowTexture;
++uniform highp sampler2D noiseCurve;
+ layout(rgba16f,binding=0) uniform highp readonly image2D referenceCfa;
+ layout(rgba16f,binding=1) uniform highp readonly image2D alterCfa;
+ layout(r32f,binding=2) uniform highp writeonly image2D outRobustness;
+ uniform ivec2 rawSize;
+ uniform ivec2 rawHalf;
+ uniform int cfaPattern;
+-uniform float noiseS;
+-uniform float noiseO;
+ uniform int tileSizeRaw;
+ uniform float wbR;
+ uniform float wbG;
+@@ -28,7 +27,8 @@ vec3 guideReference(ivec2 q){
+     float s[4]=float[4](v.r,v.g,v.b,v.a);
+     vec3 o=vec3(0); float ng=0.0;
+     for(int i=0;i<4;i++){
+-        int c=colorOf(i); float x=s[i]/(c==0?max(wbR,1e-6):(c==2?max(wbB,1e-6):max(wbG,1e-6)));
++        int c=colorOf(i);
++        float x=s[i]/(c==0?max(wbR,1e-6):(c==2?max(wbB,1e-6):max(wbG,1e-6)));
+         if(c==0)o.r=x; else if(c==2)o.b=x; else {o.g+=x;ng+=1.0;}
+     }
+     o.g/=max(ng,1.0); return o;
+@@ -39,7 +39,8 @@ vec3 guideAlter(ivec2 q){
+     float s[4]=float[4](v.r,v.g,v.b,v.a);
+     vec3 o=vec3(0); float ng=0.0;
+     for(int i=0;i<4;i++){
+-        int c=colorOf(i); float x=s[i]/(c==0?max(wbR,1e-6):(c==2?max(wbB,1e-6):max(wbG,1e-6)));
++        int c=colorOf(i);
++        float x=s[i]/(c==0?max(wbR,1e-6):(c==2?max(wbB,1e-6):max(wbG,1e-6)));
+         if(c==0)o.r=x; else if(c==2)o.b=x; else {o.g+=x;ng+=1.0;}
+     }
+     o.g/=max(ng,1.0); return o;
+@@ -82,68 +83,52 @@ vec3 dogsonAlt(vec2 lr){
+     }
+     return sm/max(sw,1e-8);
+ }
+-float normalPdf(float x){return 0.3989422804014327*exp(-0.5*x*x);}
+-float normalCdf(float x){
+-    // Abramowitz-Stegun 7.1.26, deterministic substitute for public MC expectation.
+-    float ax=abs(x); float t=1.0/(1.0+0.2316419*ax);
+-    float poly=t*(0.319381530+t*(-0.356563782+t*(1.781477937+t*(-1.821255978+t*1.330274429))));
+-    float c=1.0-normalPdf(ax)*poly; return x>=0.0?c:1.0-c;
+-}
+-float clippedVariance(float mu,float sig){
+-    sig=max(sig,1e-7); float a=(0.0-mu)/sig,b=(1.0-mu)/sig;
+-    float Pa=normalCdf(a),Pb=normalCdf(b),P=Pb-Pa;
+-    float pha=normalPdf(a),phb=normalPdf(b),phiDiff=pha-phb;
+-    float tail=1.0-Pb;
+-    float e1=mu*P+sig*phiDiff+tail;
+-    float e2=(mu*mu+sig*sig)*P+2.0*mu*sig*phiDiff+sig*sig*(a*pha-b*phb)+tail;
+-    return max(e2-e1*e1,1e-12);
+-}
+ vec2 denseRawFlowAt(ivec2 rawP){
+     ivec2 q=clamp(rawP>>1,ivec2(0),rawHalf-ivec2(1));
+     return 2.0*texelFetch(flowTexture,q,0).xy;
+ }
++vec2 ipolNoise(float brightness){
++    int idx=clamp(int(round(1000.0*clamp(brightness,0.0,1.0))),0,1000);
++    return texelFetch(noiseCurve,ivec2(idx,0),0).rg;
++}
+ 
+-/* IRIS_26463_WRONSKI_PUBLIC_ROBUSTNESS_GEOMETRY
+- * Algorithms 6-9 geometry: 3x3 guide local stats, Dogson biquadratic
+- * upsample/warp to physical RAW coordinates, flow-irregularity S, threshold,
+- * followed by the separate 5x5 local-min pass. Public MC noise curves are
+- * represented by deterministic clipped-Gaussian expected moments from the
+- * same alpha/beta noise model (platform-equivalent, no stale Photon noiseS use).
+- */
++/* IRIS_26473_IPOL_FAST_MC_ROBUSTNESS_CURVES */
+ void main(){
+     ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+     if(any(greaterThanEqual(p,rawSize))) return;
+     vec2 rawFlow=denseRawFlowAt(p);
+     vec2 refLR=(vec2(p)+0.5)/2.0-0.5;
+     vec2 altLR=(vec2(p)+rawFlow+0.5)/2.0-0.5;
+-    if(altLR.x<0.0||altLR.y<0.0||altLR.x>=float(rawHalf.x)||altLR.y>=float(rawHalf.y)){
++    if(altLR.x<0.0||altLR.y<0.0||
++       altLR.x>=float(rawHalf.x)||altLR.y>=float(rawHalf.y)){
+         imageStore(outRobustness,p,vec4(0)); return;
+     }
++
+     vec3 refMu,refVar;dogsonRef(refLR,refMu,refVar);
+     vec3 altMu=dogsonAlt(altLR);
+     vec3 dp=abs(refMu-altMu);
++
+     float d2=0.0,sigma2=0.0;
+-    const float sampleStdFactor=0.9138749; // E[np.std 9 Gaussian samples, ddof=0] / sigma
+-    const float diffMeanFactor=0.3761264;  // E|mean9_a-mean9_b| / sigma
+     for(int c=0;c<3;c++){
+-        float b=clamp(refMu[c],0.0,1.0);
+-        float sig=sqrt(max(noiseO+noiseS*b,1e-12));
+-        float varClip=clippedVariance(b,sig);
+-        float sigmaT=sampleStdFactor*sqrt(varClip);
+-        float dT=diffMeanFactor*sqrt(varClip);
++        vec2 curve=ipolNoise(refMu[c]);
++        float sigmaT=max(curve.x,1.0e-8);
++        float dT=max(curve.y,1.0e-8);
+         float dp2=dp[c]*dp[c];
+-        float shrink=dp2/max(dp2+dT*dT,1e-12);
++        float shrink=dp2/max(dp2+dT*dT,1.0e-12);
+         d2+=dp2*shrink*shrink;
+         sigma2+=max(refVar[c],sigmaT*sigmaT);
+     }
++
+     vec2 mn=vec2(3.402823e38),mx=vec2(-3.402823e38);
+     int ts=max(tileSizeRaw,1);
+     for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){
+-        ivec2 q=clamp(p+ivec2(x,y)*ts,ivec2(0),rawSize-ivec2(1));
++        ivec2 q=clamp(
++            p+ivec2(x,y)*ts,ivec2(0),rawSize-ivec2(1));
+         vec2 f=denseRawFlowAt(q); mn=min(mn,f);mx=max(mx,f);
+     }
+     vec2 span=mx-mn;
+     float S=dot(span,span)>0.8*0.8?2.0:12.0;
+-    float R=clamp(S*exp(-d2/max(sigma2,1e-12))-0.12,0.0,1.0);
++    float R=clamp(
++        S*exp(-d2/max(sigma2,1.0e-12))-0.12,0.0,1.0);
+     imageStore(outRobustness,p,vec4(R));
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 9c64b534..e109cc1b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1270,6 +1270,23 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private volatile long mMotion26382LastOpportunityCeilingNs = 0L;
+     private volatile float mMotion26382LastRawNeed = 0.0f;
+ 
++    /*
++     * IRIS_26478_GOOGLE_STYLE_HIGHLIGHT_SAFE_EQUAL_EXPOSURE_BURST
++     *
++     * Photon-specific acquisition adaptation, not claimed as unpublished
++     * Google production code. The published HDR+ principle is an equal-
++     * exposure RAW burst exposed low enough to retain highlights.
++     *
++     * Use the existing 0.2% sparse-RAW highlight onset and request one stop
++     * less AE exposure only AFTER shutter press. Old prebuffer frames are
++     * cleared so reconstruction receives one actual exposure group.
++     */
++    private static final float MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER = 0.002f;
++    private static final float MOTION_26478_HIGHLIGHT_PROTECTION_EV = 1.0f;
++    private boolean mMotion26478HighlightSafeBiasApplied = false;
++    private int mMotion26478HighlightSafeBaseSteps = 0;
++    private int mMotion26478HighlightSafeTargetSteps = 0;
++
+     private static float motion26368Clamp01(float value) {
+         return Math.max(0.0f, Math.min(1.0f, value));
+     }
+@@ -2946,6 +2963,141 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
++    /*
++     * IRIS_26478_GOOGLE_STYLE_HIGHLIGHT_SAFE_EQUAL_EXPOSURE_BURST
++     * Shutter-time only; the continuous preview RAW-AE loop stays dormant.
++     */
++    private boolean applyMotion26478HighlightSafeBurstBiasIfNeeded() {
++        if (!isZslMode()
++                || mPreviewRequestBuilder == null
++                || mCaptureSession == null
++                || mCameraCharacteristics == null
++                || mPreviewCaptureResult == null
++                || mMotion26380RawSampleCount < 64
++                || Float.isNaN(mMotion26380RawHighlightFraction)) {
++            return false;
++        }
++
++        Long previewTimestamp =
++                mPreviewCaptureResult.get(CaptureResult.SENSOR_TIMESTAMP);
++        long rawAgeNs =
++                previewTimestamp == null
++                                || mMotion26380RawSignalTimestampNs <= 0L
++                        ? Long.MAX_VALUE
++                        : Math.abs(
++                                previewTimestamp
++                                        - mMotion26380RawSignalTimestampNs);
++        boolean rawFresh = rawAgeNs <= 180_000_000L;
++        if (!rawFresh
++                || mMotion26380RawHighlightFraction
++                        < MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER) {
++            return false;
++        }
++
++        android.util.Range<Integer> range =
++                mCameraCharacteristics.get(
++                        CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
++        android.util.Rational step =
++                mCameraCharacteristics.get(
++                        CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
++        if (range == null || step == null || step.floatValue() <= 0.0f) {
++            Log.w(TAG,
++                    "IRIS_26478_HIGHLIGHT_SAFE_CAPTURE unavailable"
++                            + " reason=noAeCompensationRange");
++            return false;
++        }
++
++        Integer current =
++                mPreviewRequestBuilder.get(
++                        CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
++        int baseSteps = current != null ? current : 0;
++        baseSteps =
++                Math.max(
++                        range.getLower(),
++                        Math.min(range.getUpper(), baseSteps));
++
++        int protectionSteps =
++                Math.max(
++                        1,
++                        Math.round(
++                                MOTION_26478_HIGHLIGHT_PROTECTION_EV
++                                        / step.floatValue()));
++        int targetSteps =
++                Math.max(
++                        range.getLower(),
++                        Math.min(
++                                range.getUpper(),
++                                baseSteps - protectionSteps));
++        if (targetSteps >= baseSteps) {
++            return false;
++        }
++
++        try {
++            mPreviewRequestBuilder.set(
++                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
++                    targetSteps);
++
++            mMotion26478HighlightSafeBiasApplied = true;
++            mMotion26478HighlightSafeBaseSteps = baseSteps;
++            mMotion26478HighlightSafeTargetSteps = targetSteps;
++
++            clearMotionUnifiedBuffer();
++            rebuildPreviewBuilder();
++
++            Log.i(TAG,
++                    "IRIS_26478_HIGHLIGHT_SAFE_CAPTURE_APPLIED"
++                            + " rawHighlightFraction="
++                            + mMotion26380RawHighlightFraction
++                            + " trigger="
++                            + MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER
++                            + " rawAgeNs=" + rawAgeNs
++                            + " requestedProtectionEv="
++                            + MOTION_26478_HIGHLIGHT_PROTECTION_EV
++                            + " aeStepEv=" + step.floatValue()
++                            + " baseSteps=" + baseSteps
++                            + " targetSteps=" + targetSteps
++                            + " halAeRemainsOn=true"
++                            + " prebufferCleared=true"
++                            + " equalExposureGroupRequired=true");
++            return true;
++        } catch (IllegalArgumentException | IllegalStateException error) {
++            mMotion26478HighlightSafeBiasApplied = false;
++            Log.w(TAG,
++                    "IRIS_26478_HIGHLIGHT_SAFE_CAPTURE skipped "
++                            + error.getClass().getSimpleName());
++            return false;
++        }
++    }
++
++    private void restoreMotion26478HighlightSafeBurstBias() {
++        if (!mMotion26478HighlightSafeBiasApplied
++                || mPreviewRequestBuilder == null
++                || mCaptureSession == null) {
++            mMotion26478HighlightSafeBiasApplied = false;
++            return;
++        }
++
++        int restoreSteps = mMotion26478HighlightSafeBaseSteps;
++        int usedSteps = mMotion26478HighlightSafeTargetSteps;
++        try {
++            mPreviewRequestBuilder.set(
++                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
++                    restoreSteps);
++            rebuildPreviewBuilder();
++            Log.i(TAG,
++                    "IRIS_26478_HIGHLIGHT_SAFE_CAPTURE_RESTORED"
++                            + " usedSteps=" + usedSteps
++                            + " restoredSteps=" + restoreSteps
++                            + " halAeRemainsOn=true");
++        } catch (IllegalArgumentException | IllegalStateException error) {
++            Log.w(TAG,
++                    "IRIS_26478_HIGHLIGHT_SAFE_CAPTURE_RESTORE skipped "
++                            + error.getClass().getSimpleName());
++        } finally {
++            mMotion26478HighlightSafeBiasApplied = false;
++        }
++    }
++
+     private void triggerZslCapture() {
+         if (mZslCapturing || CaptureController.isProcessing) {
+             Log.w(TAG, "ZSL: capture already in progress, ignoring");
+@@ -2955,6 +3107,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mZslCapturing = true;
+         burst = false;
+         mMotionTopUpActive = true;
++
++        final boolean iris26478HighlightSafeBurst =
++                applyMotion26478HighlightSafeBurstBiasIfNeeded();
++
+         mMotionTopUpStartMs = android.os.SystemClock.elapsedRealtime();
+         mMotionTopUpTargetFrames = Math.max(
+                 1,
+@@ -2982,7 +3138,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 "buffered=" + buffered
+                         + " target=" + mMotionTopUpTargetFrames
+                         + " minimum=" + mMotionTopUpMinimumFrames
+-                        + " timeoutMs=" + MOTION_TOP_UP_TIMEOUT_MS);
++                        + " timeoutMs=" + MOTION_TOP_UP_TIMEOUT_MS
++                        + " iris26478HighlightSafeBurst="
++                        + iris26478HighlightSafeBurst
++                        + " iris26478RawHighlightFraction="
++                        + mMotion26380RawHighlightFraction
++                        + " iris26478AeTargetSteps="
++                        + mMotion26478HighlightSafeTargetSteps);
+ 
+         pollMotionTopUp();
+     }    // IRIS_26343_GENERATION_SAFE_ZSL
+@@ -3408,6 +3570,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             @NonNull String traceResult,
+             @NonNull String userMessage) {
+         mMotionTopUpActive = false;
++        restoreMotion26478HighlightSafeBurstBias();
+         mZslCapturing = false;
+         burst = false;
+ 
+@@ -3457,6 +3620,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+ 
+     private void finalizeMotionZslCapture() {
++        /*
++         * Top-up is stopped before this method; restoring live preview AE
++         * cannot alter the already-buffered equal-exposure RAW group.
++         */
++        restoreMotion26478HighlightSafeBurstBias();
++
+         int frameCount = mMotionTopUpTargetFrames > 0
+                 ? mMotionTopUpTargetFrames
+                 : Math.max(
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 4efac5a4..1c212317 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -53,10 +53,11 @@ public final class MotionV2Render extends Node {
+         pipeline.motionV2GainMapMaxRatio = 1.0f;
+ 
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+-            Point raw = basePipeline.mParameters.rawSize;
++            /* IRIS_26470_UHDR_RENDER_GEOMETRY_AUTHORITY */
++            Point renderedSdrSize = new Point(WorkingTexture.mSize);
+             Point gainSize = new Point(
+-                    Math.max(1, raw.x / GAINMAP_DOWNSAMPLE),
+-                    Math.max(1, raw.y / GAINMAP_DOWNSAMPLE));
++                    Math.max(1, renderedSdrSize.x / GAINMAP_DOWNSAMPLE),
++                    Math.max(1, renderedSdrSize.y / GAINMAP_DOWNSAMPLE));
+ 
+             float maxGainRatio = Math.max(
+                     2.0f,
+@@ -151,6 +152,11 @@ public final class MotionV2Render extends Node {
+                 pipeline.motionV2GainMapBitmap = gainMap;
+                 pipeline.motionV2GainMapMaxRatio = maxGainRatio;
+ 
++                Log.d(Name, "IRIS_26470_UHDR_GAINMAP_GEOMETRY"
++                        + " renderedSdr=" + renderedSdrSize.x + "x" + renderedSdrSize.y
++                        + " gainMap=" + gainSize.x + "x" + gainSize.y
++                        + " downsample=" + GAINMAP_DOWNSAMPLE
++                        + " authority=actualRenderedSdrTexture");
+                 Log.d(Name, "IRIS_26436_V2_GAINMAP"
+                         + " size=" + gainSize.x + "x" + gainSize.y
+                         + " maxRatio=" + maxGainRatio
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 6159d302..9027df3e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -104,39 +104,36 @@ public class PostPipeline extends GLBasePipeline {
+         mParameters = parameters;
+         mSettings = PhotonCamera.getSettings();
+         workSize = new Point(mParameters.rawSize.x, mParameters.rawSize.y);
+-        NoiseModeler modeler = mParameters.noiseModeler;
+-        noiseS = modeler.computeModel[0].first.floatValue() +
+-                modeler.computeModel[1].first.floatValue() +
+-                modeler.computeModel[2].first.floatValue();
+-        noiseO = modeler.computeModel[0].second.floatValue() +
+-                modeler.computeModel[1].second.floatValue() +
+-                modeler.computeModel[2].second.floatValue();
+-        noiseS /= 3.f;
+-        noiseO /= 3.f;
+-        double noisempy = Math.pow(2.0, mSettings.noiseRstr + constShift);
+-        Log.d("PostPipeline", "noisempy:" + noisempy);
+-        noiseS *= noisempy;
+-        noiseO *= noisempy;
+-
+-        /* IRIS_26394_MOTION_CANONICAL_NOISE_DOMAIN
+-         * y=g*x, Var(x)=S*x+O -> S'=g*S, O'=g^2*O.
+-         */
+-        float iris26394CanonicalGain =
+-                Math.max(1.0f, mParameters.motionCanonicalExposureGain);
+-        if (iris26394CanonicalGain > 1.0f) {
+-            noiseS *= iris26394CanonicalGain;
+-            noiseO *= iris26394CanonicalGain * iris26394CanonicalGain;
++        if (mParameters.motionV2Active) {
++            /*
++             * IRIS_26477_NO_PHOTON_POST_NOISE_STATE
++             * Active Motion V2 nodes do not consume generic Photon noise state.
++             */
++            noiseS = 0.0f;
++            noiseO = 0.0f;
++            Log.d("PostPipeline",
++                    "IRIS_26477_NO_PHOTON_POST_NOISE_STATE"
++                            + " noiseModeler=false"
++                            + " noiseRstr=false"
++                            + " esd=false"
++                            + " residualSpatialDenoise=false");
++        } else {
++            NoiseModeler modeler = mParameters.noiseModeler;
++            noiseS = modeler.computeModel[0].first.floatValue() +
++                    modeler.computeModel[1].first.floatValue() +
++                    modeler.computeModel[2].first.floatValue();
++            noiseO = modeler.computeModel[0].second.floatValue() +
++                    modeler.computeModel[1].second.floatValue() +
++                    modeler.computeModel[2].second.floatValue();
++            noiseS /= 3.f;
++            noiseO /= 3.f;
++            double noisempy = Math.pow(2.0, mSettings.noiseRstr + constShift);
++            Log.d("PostPipeline", "noisempy:" + noisempy);
++            noiseS *= noisempy;
++            noiseO *= noisempy;
++            noiseO = Math.max(noiseO, 1.0f/4096.0f);
++            noiseS = Math.max(noiseS, Float.MIN_NORMAL);
+         }
+-        Log.d("PostPipeline",
+-                "IRIS_26394_CANONICAL_NOISE gain=" + iris26394CanonicalGain
+-                        + " noiseS=" + noiseS + " noiseO=" + noiseO);
+-        Log.d("PostPipeline", "NoiseS:" + noiseS + "\n" + "NoiseO:" + noiseO);
+-        /*if (!PhotonCamera.getSettings().hdrxNR) {
+-            noiseO = 0.f;
+-            noiseS = 0.f;
+-        }*/
+-        noiseO = Math.max(noiseO, 1.0f/4096.0f);
+-        noiseS = Math.max(noiseS, Float.MIN_NORMAL);
+         Point rawSliced = parameters.rawSize;
+         cropSize = new Point(parameters.rawSize);
+         if (PhotonCamera.getSettings().aspect169) {
+@@ -300,17 +297,30 @@ public class PostPipeline extends GLBasePipeline {
+                 add(new StageTelemetry(
+                         "V2_POST_REFERENCE_SAFE_DEMOSAIC_ISOLATION"));
+             }
++            /*
++             * IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY
++             * Wronski is complete before scene/display exposure is applied.
++             */
++            add(new MotionV2DisplayExposure());
++            add(new StageTelemetry("V2_POST_DISPLAY_EXPOSURE_AFTER_WRONSKI"));
+             add(new MotionV2ColorTransform());
+-            add(new MotionV2Denoise());
+ 
+-            add(new StageTelemetry("V2_POST_LUMA_CHROMA_RECONSTRUCTION"));
++            /*
++             * IRIS_26477_WRONSKI_PRIMARY_DENOISE_ONLY
++             * Pure comparison build: no residual spatial denoise after Wronski.
++             */
++            add(new StageTelemetry("V2_POST_WRONSKI_PRIMARY_DENOISE_ONLY"));
+             add(new MotionV2Render());
+             add(new StageTelemetry("V2_POST_RENDER"));
+             add(new RotateWatermark(getRotation()));
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+-                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,TrueLocalSupportDenoise,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"
++                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2DisplayExposure,MotionV2ColorTransform,MotionV2Render,RotateWatermark"
+                             + " directMultiframeRgb=" + directBayer
++                            + " strictWronskiAuthority26477=true"
++                            + " displayExposureAfterWronski=true"
++                            + " residualSpatialDenoise=false"
++                            + " photonNoiseState=false"
+                             + " exposureFusion=false esd=false ablc=false"
+                             + " initial=false autoExposure=false"
+                             + " captureSharpening=false correctingFlow=false sharpen2=false");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index e7178e44..e86fb36e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -257,6 +257,9 @@ public class HdrxProcessor extends ProcessorBase {
+         ISO /= mImageFramesToProcess.size();
+ 
+         processingParameters.FillDynamicParameters(captureResult, captureRequest,ISO);
++        if (cameraMode == CameraMode.MOTION) {
++            configureStrictWronskiSensorAuthority(processingParameters);
++        }
+         processingParameters.cameraRotation = cameraRotation;
+ 
+         exifData.IMAGE_DESCRIPTION = processingParameters.toString()
+@@ -403,35 +406,52 @@ public class HdrxProcessor extends ProcessorBase {
+                             + " policy=ownedReferencePreserved");
+ 
+             /*
+-             * IRIS_26450_MOTION_V2_REFERENCE_DNG
+-             * Save the true timestamp-owned Bayer reference while its original
+-             * RAW buffer is still alive. This is single-frame sensor RAW:
+-             * no multiframe NR, no demosaic, no V2 RGB processing.
++             * IRIS_26467_MOTION_OUTPUT_MODE_AUTHORITY
++             * Motion obeys the same user JPG / RAW / JPG+RAW selection as
++             * the rest of Photon. The 26450 timestamp-owned reference DNG is
++             * preserved only when saveRAW requests RAW output.
+              */
+-            ByteBuffer iris26450ReferenceDng =
+-                    images.get(0).buffer == null
+-                            ? null
+-                            : images.get(0).buffer.duplicate();
+-            if (iris26450ReferenceDng == null) {
+-                throw new IllegalStateException(
+-                        "Motion V2 reference DNG buffer is null");
++            if (saveRAW >= 1) {
++                ByteBuffer iris26450ReferenceDng =
++                        images.get(0).buffer == null
++                                ? null
++                                : images.get(0).buffer.duplicate();
++                if (iris26450ReferenceDng == null) {
++                    throw new IllegalStateException(
++                            "Motion V2 reference DNG buffer is null");
++                }
++                iris26450ReferenceDng.position(0);
++                boolean iris26450DngSaved =
++                        ImageSaver.Util.saveStackedRaw(
++                                dngFile,
++                                iris26450ReferenceDng,
++                                processingParameters);
++                processingEventsListener.notifyImageSavedStatus(
++                        iris26450DngSaved,
++                        dngFile);
++                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                        "IRIS_26450_MOTION_V2_REFERENCE_DNG",
++                        "saved=" + iris26450DngSaved
++                                + " rawTimestamp=" + images.get(0).timestamp
++                                + " source=timestampOwnedReferenceBayer"
++                                + " multiframeNr=false"
++                                + " bakedRgb=false"
++                                + " userSaveRaw=" + saveRAW);
++
++                if (saveRAW == 2) {
++                    for (ImageFrame image : images) {
++                        if (image != null) image.close();
++                    }
++                    processingEventsListener.onProcessingFinished(
++                            "Motion RAW Processing Finished");
++                    callback.onFinished();
++                    return;
++                }
++            } else {
++                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                        "IRIS_26467_MOTION_OUTPUT_MODE_AUTHORITY",
++                        "userSaveRaw=0 referenceDngSaved=false jpegRequested=true");
+             }
+-            iris26450ReferenceDng.position(0);
+-            boolean iris26450DngSaved =
+-                    ImageSaver.Util.saveStackedRaw(
+-                            dngFile,
+-                            iris26450ReferenceDng,
+-                            processingParameters);
+-            processingEventsListener.notifyImageSavedStatus(
+-                    iris26450DngSaved,
+-                    dngFile);
+-            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+-                    "IRIS_26450_MOTION_V2_REFERENCE_DNG",
+-                    "saved=" + iris26450DngSaved
+-                            + " rawTimestamp=" + images.get(0).timestamp
+-                            + " source=timestampOwnedReferenceBayer"
+-                            + " multiframeNr=false"
+-                            + " bakedRgb=false");
+         }
+         selected = 0;
+ 
+@@ -560,13 +580,16 @@ public class HdrxProcessor extends ProcessorBase {
+          * Use the actually measured temporal contribution instead of the old
+          * reference-only support=1 assumption.
+          */
+-        processingParameters.noiseModeler.computeStackingNoiseModel(
+-                cameraMode == CameraMode.MOTION
+-                        ? Math.max(
+-                                1,
+-                                Math.round(
+-                                        processingParameters.motionV2EffectiveSupport))
+-                        : images.size());
++        if (cameraMode != CameraMode.MOTION) {
++            processingParameters.noiseModeler.computeStackingNoiseModel(images.size());
++        } else {
++            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                    "IRIS_26477_PHOTON_STACK_NOISE_BYPASS",
++                    "noiseModeler.computeStackingNoiseModel=false"
++                            + " wronskiNoiseOwner=Camera2_IPOL"
++                            + " effectiveSupport="
++                            + processingParameters.motionV2EffectiveSupport);
++        }
+ 
+         PostPipeline pipeline = new PostPipeline();
+ 
+@@ -629,6 +652,120 @@ public class HdrxProcessor extends ProcessorBase {
+     }
+ 
+ 
++    /*
++     * IRIS_26477_STRICT_WRONSKI_SENSOR_AUTHORITY
++     * Hard boundary between Photon settings and Wronski reconstruction.
++     */
++    private void configureStrictWronskiSensorAuthority(Parameters p) {
++        if (p == null || characteristics == null || captureResult == null) {
++            throw new IllegalStateException(
++                    "26477 strict Wronski requires Camera2 characteristics + timestamp result");
++        }
++
++        Integer cfa = characteristics.get(
++                CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT);
++        if (cfa == null || cfa < 0 || cfa > 3) {
++            throw new IllegalStateException(
++                    "26477 strict Wronski requires standard Camera2 Bayer CFA; cfa=" + cfa);
++        }
++
++        android.hardware.camera2.params.BlackLevelPattern staticBlack =
++                characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
++        if (staticBlack == null) {
++            throw new IllegalStateException(
++                    "26477 strict Wronski missing SENSOR_BLACK_LEVEL_PATTERN");
++        }
++        int[] staticBl = new int[4];
++        staticBlack.copyTo(staticBl, 0);
++        float[] strictBl = new float[] {
++                staticBl[0], staticBl[1], staticBl[2], staticBl[3]
++        };
++        float[] dynamicBl =
++                captureResult.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL);
++        if (dynamicBl != null && dynamicBl.length >= 4) {
++            boolean finite = true;
++            for (int i = 0; i < 4; i++) {
++                finite &= Float.isFinite(dynamicBl[i]) && dynamicBl[i] >= 0.0f;
++            }
++            if (finite) {
++                System.arraycopy(dynamicBl, 0, strictBl, 0, 4);
++            }
++        }
++
++        Integer strictWhite =
++                captureResult.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL);
++        if (strictWhite == null || strictWhite <= 0) {
++            strictWhite = characteristics.get(
++                    CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
++        }
++        if (strictWhite == null || strictWhite <= 0) {
++            throw new IllegalStateException(
++                    "26477 strict Wronski missing sensor white level");
++        }
++
++        android.util.Pair<Double, Double>[] profile =
++                captureResult.get(CaptureResult.SENSOR_NOISE_PROFILE);
++        if (profile == null || profile.length == 0) {
++            throw new IllegalStateException(
++                    "26477 strict Wronski missing SENSOR_NOISE_PROFILE; Photon fallback forbidden");
++        }
++
++        double strictS;
++        double strictO;
++        if (profile.length >= 4) {
++            strictS = (
++                    profile[0].first
++                            + 0.5 * (profile[1].first + profile[2].first)
++                            + profile[3].first) / 3.0;
++            strictO = (
++                    profile[0].second
++                            + 0.5 * (profile[1].second + profile[2].second)
++                            + profile[3].second) / 3.0;
++        } else if (profile.length >= 3) {
++            strictS = (
++                    profile[0].first + profile[1].first + profile[2].first) / 3.0;
++            strictO = (
++                    profile[0].second + profile[1].second + profile[2].second) / 3.0;
++        } else {
++            strictS = profile[0].first;
++            strictO = profile[0].second;
++        }
++
++        if (!Double.isFinite(strictS) || !Double.isFinite(strictO)
++                || strictS <= 0.0 || strictO < 0.0) {
++            throw new IllegalStateException(
++                    "26477 invalid Camera2 noise profile S=" + strictS + " O=" + strictO);
++        }
++
++        // Overwrite reconstruction-critical fields after TunableInjector.
++        p.blackLevel = strictBl;
++        p.whiteLevel = strictWhite;
++        p.cfaPattern = (byte)(int)cfa;
++        p.motionV2WronskiNoiseS = (float)strictS;
++        p.motionV2WronskiNoiseO = (float)strictO;
++        p.motionV2StrictWronskiSensorValid = true;
++
++        String authority =
++                "IRIS_26477_STRICT_WRONSKI_SENSOR_AUTHORITY"
++                        + " cfaSource=CameraCharacteristics"
++                        + " blackSource=Camera2"
++                        + " whiteSource=Camera2"
++                        + " noiseSource=CaptureResult.SENSOR_NOISE_PROFILE"
++                        + " photonAdaptiveNoise=false"
++                        + " photonNoiseModeler=false"
++                        + " dynamicNoiseStore=false"
++                        + " blackLevelOverride=false"
++                        + " whiteLevelOverride=false"
++                        + " cfaOverride=false"
++                        + " noiseS=" + p.motionV2WronskiNoiseS
++                        + " noiseO=" + p.motionV2WronskiNoiseO
++                        + " whiteLevel=" + p.whiteLevel
++                        + " cfa=" + p.cfaPattern;
++        Log.d(TAG, authority);
++        com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                "MOTION_WRONSKI_SENSOR_AUTHORITY", authority);
++    }
++
+     /*
+      * IRIS_26394 canonical exposure estimator.
+      * x = clamp((raw-black)/(white-black), 0, 1)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index 7627cc56..dc7a4856 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -10,7 +10,6 @@ import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+ import com.particlesdevs.photoncamera.processing.opengl.GLOneScript;
+ import com.particlesdevs.photoncamera.processing.opengl.GLProg;
+ import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+-import com.particlesdevs.photoncamera.processing.render.NoiseModeler;
+ import com.particlesdevs.photoncamera.processing.render.Parameters;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+@@ -35,6 +34,7 @@ import static android.opengl.GLES20.GL_NEAREST;
+  * MotionV2Alignment owns the fractional displacement field.
+  * Legacy PyramidAlignment/PyramidMerging/merge0/merge11 are not used by V2.
+  */
++/* IRIS_26474_DIRECT_WRONSKI_SUPPORT_MAP_AUTHORITY */
+ public final class MotionV2CfaReconstruction extends GLOneScript {
+     private static final String TAG = "MotionV2CfaRecon";
+ 
+@@ -87,10 +87,6 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+         if (inputImages == null || inputImages.isEmpty()) {
+             throw new IllegalStateException("Motion V2 reconstruction received no RAW frames");
+         }
+-        if (inputImages.size() == 1) {
+-            return MotionV2Merger.referenceFoundation(inputImages, referenceTimestamp);
+-        }
+-
+         ImageFrame reference = null;
+         ArrayList<ImageFrame> ordered = new ArrayList<>(inputImages.size());
+         for (ImageFrame frame : inputImages) {
+@@ -140,21 +136,15 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+          * Correct only explicitly mapped sites before RAW->CFA, alignment and
+          * fusion. Two-pixel neighbours stay on the same Bayer/CFA component.
+          */
++        /*
++         * IRIS_26477_STRICT_WRONSKI_NO_PHOTON_PREMERGE_REPAIR
++         * No Photon/Iris RAW mutation before Wronski reconstruction.
++         */
+         int mappedHotPixelsCorrected = 0;
+-        for (ImageFrame ownedFrame : ordered) {
+-            if (ownedFrame != null && ownedFrame.buffer != null) {
+-                mappedHotPixelsCorrected += correctKnownHotPixels(
+-                        ownedFrame.buffer,
+-                        size.x,
+-                        size.y,
+-                        parameters);
+-            }
+-        }
+-        Log.d(TAG, "IRIS_26423_KNOWN_HOT_PIXEL_SANITIZE"
+-                + " corrected=" + mappedHotPixelsCorrected
+-                + " frames=" + ordered.size()
+-                + " beforeAlignment=true"
+-                + " sameCfaNeighbors=true");
++        Log.d(TAG, "IRIS_26477_STRICT_WRONSKI_NO_PHOTON_PREMERGE_REPAIR"
++                + " mappedHotPixelMutation=false"
++                + " corrected=0"
++                + " frames=" + ordered.size());
+ 
+         parameters.motionCanonicalExposureGain =
+                 MotionV2Merger.computeReferenceGain(
+@@ -196,13 +186,32 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+         final int frameCount = images.size();
+         final int tile = 8;
+ 
++        if (frameCount == 1) {
++            Log.d(TAG, "IRIS_26468_SINGLE_FRAME_FULL_MOTION_PIPELINE"
++                    + " retainedFrames=1"
++                    + " auxiliaryAlignment=false"
++                    + " directRgbReconstruction=true"
++                    + " downstreamMotionPostPipeline=true"
++                    + " diagnosticControl=true");
++            try {
++                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                        "IRIS_26468_SINGLE_FRAME_FULL_MOTION_PIPELINE",
++                        "retainedFrames=1 auxiliaryAlignment=false"
++                                + " directRgbReconstruction=true"
++                                + " downstreamMotionPostPipeline=true");
++            } catch (Throwable ignored) {}
++        }
++
+         /*
+          * IRIS_26420_MOTION_V2_CANONICAL_GAIN_APPLIED_ONCE
+          * computeReferenceGain() owns scene normalization. Apply it at the
+          * first linear sensor conversion, equally to reference and auxiliaries.
+          */
+-        final float canonicalGain =
+-                Math.max(1.0f, parameters.motionCanonicalExposureGain);
++        /*
++         * IRIS_26477_WRONSKI_CANONICAL_SENSOR_DOMAIN
++         * Display normalization is downstream of Wronski.
++         */
++        final float canonicalGain = 1.0f;
+ 
+         /*
+          * IRIS_26418_MOTION_V2_RAW_CODE_DOMAIN
+@@ -219,43 +228,32 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 parameters.blackLevel[3]
+         };
+ 
+-        float noiseS = 1.0e-6f;
+-        float noiseO = 1.0e-6f;
+-        NoiseModeler modeler = parameters.noiseModeler;
+-        if (modeler != null && modeler.baseModel != null
+-                && modeler.baseModel.length >= 3) {
+-            noiseS = (
+-                    modeler.baseModel[0].first.floatValue()
+-                            + modeler.baseModel[1].first.floatValue()
+-                            + modeler.baseModel[2].first.floatValue()) / 3.0f;
+-            noiseO = (
+-                    modeler.baseModel[0].second.floatValue()
+-                            + modeler.baseModel[1].second.floatValue()
+-                            + modeler.baseModel[2].second.floatValue()) / 3.0f;
++        if (!parameters.motionV2StrictWronskiSensorValid) {
++            throw new IllegalStateException(
++                    "26477 Wronski missing strict Camera2 sensor authority");
+         }
+-        noiseS = Math.max(noiseS, 1.0e-7f);
+-        noiseO = Math.max(noiseO, 1.0e-8f);
+-
+-        /*
+-         * IRIS_26420_V2_CANONICAL_NOISE_DOMAIN
+-         * y=g*x => Var(y)=g*S*y + g^2*O in the canonical signal domain.
+-         */
+-        noiseS *= canonicalGain;
+-        noiseO *= canonicalGain * canonicalGain;
+-
+-        /*
+-         * IRIS_26462_WRONSKI_PUBLIC_SNR_TUNING
+-         * Public implementation clamps SNR to [6,30] and linearly tunes:
+-         * kDetail .33->.25, kDenoise 5->3, Dth .81->.71, Dtr 1.24->1.0.
+-         */
+-        final float mfsrSnr = Math.max(
+-                6.0f,
+-                Math.min(
+-                        30.0f,
+-                        0.18f / (float)Math.sqrt(
+-                                Math.max(
+-                                        noiseS * 0.18f + noiseO,
+-                                        1.0e-8f))));
++        float noiseS = Math.max(parameters.motionV2WronskiNoiseS, 1.0e-7f);
++        float noiseO = Math.max(parameters.motionV2WronskiNoiseO, 1.0e-8f);
++        Log.d(TAG, "IRIS_26477_WRONSKI_NOISE_AUTHORITY"
++                + " source=CaptureResult.SENSOR_NOISE_PROFILE"
++                + " photonNoiseModeler=false"
++                + " dynamicNoiseStore=false"
++                + " adaptiveNoiseTunable=false"
++                + " noiseRstr=false"
++                + " displayGainInsideWronski=false"
++                + " noiseS=" + noiseS
++                + " noiseO=" + noiseO);
++
++        final MotionV2IpolNoiseCurve.Curve ipolNoiseCurve =
++                MotionV2IpolNoiseCurve.build(
++                        noiseS,
++                        noiseO,
++                        images.get(0).buffer,
++                        raw,
++                        blackLevel,
++                        (float) parameters.whiteLevel,
++                        canonicalGain);
++        final float mfsrSnr = ipolNoiseCurve.snr;
+         final float mfsrT = (mfsrSnr - 6.0f) / 24.0f;
+         final float mfsrKDetail = 0.33f + mfsrT * (0.25f - 0.33f);
+         final float mfsrKDenoise = 5.0f + mfsrT * (3.0f - 5.0f);
+@@ -266,11 +264,28 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+         final int mfsrTileSize =
+                 mfsrSnr <= 14.0f ? 64 : (mfsrSnr <= 22.0f ? 32 : 16);
+ 
++        Log.d(TAG, "IRIS_26477_WRONSKI_RECONSTRUCTION_AUTHORITY"
++                + " reconstructionOwner=Wronski_IPOL"
++                + " sensorDomainGain=1.0"
++                + " displayGain=" + parameters.motionCanonicalExposureGain
++                + " legacyPyramidAlignment=false"
++                + " legacyPyramidMerge=false"
++                + " photonAdaptiveNoise=false"
++                + " photonNoiseRstr=false"
++                + " photonHotPixelPremerge=false"
++                + " mfsrSnr=" + mfsrSnr
++                + " kDetail=" + mfsrKDetail
++                + " kDenoise=" + mfsrKDenoise
++                + " Dth=" + mfsrDth
++                + " Dtr=" + mfsrDtr);
++
+         GLTexture referenceRaw = null;
+         GLTexture referenceCfa = null;
++        GLTexture ipolNoiseCurveTexture = null;
+         /* IRIS_26463_WRONSKI_WB_DOMAIN_REFERENCE */
+         GLTexture wronskiReferenceCfa = null;
+         GLTexture wronskiReferenceCov = null;
++        MotionV2WronskiAlignment.PreparedReference wronskiPreparedAlignment = null;
+         GLTexture mergedA = null;
+         GLTexture mergedB = null;
+         GLTexture supportA = null;
+@@ -366,6 +381,26 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         / Math.max(directSensorGains[2], 1.0e-6f)};
+ 
+         try {
++            if (directBayer) {
++                ipolNoiseCurve.rgba32f.position(0);
++                ipolNoiseCurveTexture = new GLTexture(
++                        new Point(1001, 1),
++                        new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                        ipolNoiseCurve.rgba32f,
++                        GL_NEAREST,
++                        GL_CLAMP_TO_EDGE);
++                Log.d(TAG,
++                        "IRIS_26473_IPOL_FAST_MC_CURVES"
++                        + " brightnessEntries=1001"
++                        + " referenceMean=" + ipolNoiseCurve.referenceMean
++                        + " snr=" + ipolNoiseCurve.snr
++                        + " nonlinearLowEnd=" + ipolNoiseCurve.nonlinearLowEnd
++                        + " nonlinearHighStart=" + ipolNoiseCurve.nonlinearHighStart
++                        + " clippingModel=true"
++                        + " varianceInterpolation=true"
++                        + " deterministicMobileMonteCarlo=true");
++            }
++
+             /*
+              * IRIS_26420_MOTION_V2_NO_LEGACY_ALIGNMENT
+              * Motion V2 now owns the geometric producer and consumer.
+@@ -451,6 +486,23 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 glProg.computeAuto(rawHalf, 1);
+             }
+ 
++            if (directBayer) {
++                /*
++                 * IRIS_26467_WRONSKI_REFERENCE_PREP_ONCE
++                 * Reference geometry is immutable for this burst. Prepare its
++                 * guide/pyramid once instead of rebuilding it for every
++                 * auxiliary frame.
++                 */
++                wronskiPreparedAlignment =
++                        MotionV2WronskiAlignment.prepareReference(
++                                rawHalf,
++                                parameters.cfaPattern,
++                                canonicalGain,
++                                mfsrSnr,
++                                glProg,
++                                wronskiReferenceCfa);
++            }
++
+             mergedA = new GLTexture(
+                     rawHalf,
+                     new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+@@ -733,6 +785,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                             frame.pair.layerMpy, 1.0e-6f)
+                                     : 1.0f);
+ 
++                    long iris26468RawToCfaStart = System.currentTimeMillis();
+                     glProg.setLayout(tile, tile, 1);
+                     glProg.useAssetProgram("motionv2/raw_to_cfa", true);
+                     glProg.setVar("whiteLevel", (float) parameters.whiteLevel);
+@@ -741,8 +794,11 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     glProg.setTexture("inTexture", rawInput);
+                     glProg.setTextureCompute("outTexture", alterCfa, true);
+                     glProg.computeAuto(rawHalf, 1);
++                    long iris26468RawToCfaMs =
++                            System.currentTimeMillis() - iris26468RawToCfaStart;
+ 
+                     if (directBayer) {
++                        long iris26468WbStart = System.currentTimeMillis();
+                         final float wronskiWbR = directSensorGains[0]
+                                 / Math.max(directSensorGains[1], 1.0e-6f);
+                         final float wronskiWbB = directSensorGains[2]
+@@ -760,7 +816,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.setTextureCompute("inputCfa", alterCfa, false);
+                         glProg.setTextureCompute("outputCfa", wronskiAlterCfa, true);
+                         glProg.computeAuto(rawHalf, 1);
++                        long iris26468WbMs =
++                                System.currentTimeMillis() - iris26468WbStart;
+ 
++                        long iris26468CovStart = System.currentTimeMillis();
+                         wronskiAlterCov = new GLTexture(
+                                 rawHalf,
+                                 new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+@@ -779,20 +838,24 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.setTextureCompute("inputCfa", wronskiAlterCfa, false);
+                         glProg.setTextureCompute("outputCov", wronskiAlterCov, true);
+                         glProg.computeAuto(rawHalf, 1);
++                        long iris26468CovMs =
++                                System.currentTimeMillis() - iris26468CovStart;
++                        Log.d(TAG, "IRIS_26468_STAGE_TIMING"
++                                + " frame=" + i
++                                + " rawToCfaMs=" + iris26468RawToCfaMs
++                                + " wbCfaMs=" + iris26468WbMs
++                                + " covarianceMs=" + iris26468CovMs);
+                     }
+ 
+                     MotionV2Alignment.Result ownedAlignment = null;
+                     try {
+-                        long alignmentStart = System.currentTimeMillis();
++                        long frameProcessingStart = System.currentTimeMillis();
++                        long alignmentOnlyStart = System.currentTimeMillis();
+                         ownedAlignment =
+                                 directBayer
+-                                        ? MotionV2WronskiAlignment.align(
+-                                                rawHalf,
+-                                                parameters.cfaPattern,
+-                                                canonicalGain,
+-                                                mfsrSnr,
++                                        ? MotionV2WronskiAlignment.alignPrepared(
++                                                wronskiPreparedAlignment,
+                                                 glProg,
+-                                                wronskiReferenceCfa,
+                                                 wronskiAlterCfa)
+                                         : MotionV2Alignment.align(
+                                                 rawHalf,
+@@ -801,6 +864,8 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                                 glProg,
+                                                 referenceCfa,
+                                                 alterCfa);
++                        long alignmentOnlyMs =
++                                System.currentTimeMillis() - alignmentOnlyStart;
+ 
+                         glProg.setLayout(tile, tile, 1);
+                         glProg.useAssetProgram(
+@@ -840,6 +905,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                              * IRIS_26462_FULL_PUBLISHED_WRONSKI_MFSR
+                              * Robustness -> 5x5 min -> independent RGB merge.
+                              */
++                            long iris26468RobustStart = System.currentTimeMillis();
+                             GLTexture mfsrRobustRaw = new GLTexture(
+                                     raw,
+                                     new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+@@ -861,8 +927,9 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 glProg.setVar(
+                                         "cfaPattern",
+                                         (int) parameters.cfaPattern);
+-                                glProg.setVar("noiseS", noiseS);
+-                                glProg.setVar("noiseO", noiseO);
++                                glProg.setTexture(
++                                        "noiseCurve",
++                                        ipolNoiseCurveTexture);
+                                 glProg.setVar(
+                                         "tileSizeRaw",
+                                         Math.max(1, mfsrTileSize));
+@@ -887,7 +954,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         mfsrRobustRaw,
+                                         true);
+                                 glProg.computeAuto(raw, 1);
++                                long iris26468RobustMs =
++                                        System.currentTimeMillis() - iris26468RobustStart;
+ 
++                                long iris26468ErodeStart = System.currentTimeMillis();
+                                 glProg.setLayout(tile, tile, 1);
+                                 glProg.useAssetProgram(
+                                         "motionv2/mfsr_robustness_erode", true);
+@@ -899,7 +969,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         mfsrRobustMin,
+                                         true);
+                                 glProg.computeAuto(raw, 1);
++                                long iris26468ErodeMs =
++                                        System.currentTimeMillis() - iris26468ErodeStart;
+ 
++                                long iris26468AccumulateStart = System.currentTimeMillis();
+                                 glProg.setLayout(tile, tile, 1);
+                                 glProg.useAssetProgram(
+                                         "motionv2/direct_rgb_accumulate", true);
+@@ -951,6 +1024,15 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         nextDirectFrameSupport,
+                                         true);
+                                 glProg.computeAuto(raw, 1);
++                                long iris26468AccumulateMs =
++                                        System.currentTimeMillis()
++                                                - iris26468AccumulateStart;
++                                Log.d(TAG, "IRIS_26468_STAGE_TIMING"
++                                        + " frame=" + i
++                                        + " robustnessMs=" + iris26468RobustMs
++                                        + " erosion5x5Ms=" + iris26468ErodeMs
++                                        + " directRgbAccumulateMs="
++                                        + iris26468AccumulateMs);
+                             } finally {
+                                 mfsrRobustMin.close();
+                                 mfsrRobustRaw.close();
+@@ -1051,7 +1133,9 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         Log.d(TAG, "IRIS_26420_V2_ALIGNMENT_FRAME"
+                                 + " frame=" + i
+                                 + " elapsedMs="
+-                                + (System.currentTimeMillis()-alignmentStart)
++                                + (System.currentTimeMillis()-frameProcessingStart)
++                                + " alignmentOnlyMs=" + alignmentOnlyMs
++                                + " referencePreparedOnce=" + directBayer
+                                 + " globalDxPacked="
+                                 + ownedAlignment.globalDxPacked
+                                 + " globalDyPacked="
+@@ -1131,6 +1215,22 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 } catch (Throwable ignored) {}
+             }
+ 
++            /* IRIS_26472_WRONSKI_PUBLIC_ACCUMULATED_ROBUSTNESS_REFERENCE_MERGE */
++            if (directBayer) {
++                glProg.setLayout(tile, tile, 1);
++                glProg.useAssetProgram("motionv2/mfsr_low_support_reference", true);
++                glProg.setVar("rawSize", raw); glProg.setVar("rawHalf", rawHalf); glProg.setVar("cfaPattern", (int) parameters.cfaPattern);
++                glProg.setVar("clipR", canonicalGain * wronskiGlobalWbR); glProg.setVar("clipG", canonicalGain * wronskiGlobalWbG); glProg.setVar("clipB", canonicalGain * wronskiGlobalWbB);
++                glProg.setTextureCompute("referenceCfa", wronskiReferenceCfa, false); glProg.setTextureCompute("referenceCov", wronskiReferenceCov, false);
++                glProg.setTextureCompute("currentNumerator", currentDirectRgb, false); glProg.setTextureCompute("currentDenominator", currentDirectSupport, false); glProg.setTextureCompute("currentFrameSupport", currentDirectFrameSupport, false);
++                glProg.setTextureCompute("outNumerator", nextDirectRgb, true); glProg.setTextureCompute("outDenominator", nextDirectSupport, true); glProg.setTextureCompute("outFrameSupport", nextDirectFrameSupport, true);
++                glProg.computeAuto(raw, 1);
++                GLTexture s1=currentDirectRgb; currentDirectRgb=nextDirectRgb; nextDirectRgb=s1;
++                GLTexture s2=currentDirectSupport; currentDirectSupport=nextDirectSupport; nextDirectSupport=s2;
++                GLTexture s3=currentDirectFrameSupport; currentDirectFrameSupport=nextDirectFrameSupport; nextDirectFrameSupport=s3;
++                Log.d(TAG, "IRIS_26478_WRONSKI_REFERENCE_ADD_ONCE ipolAccumulatedRobustnessDenoiser=false referenceRadius=1 covarianceMultiplier=1 referenceOverwrite=false referenceAddOnce=true saturationValidity=false");
++            }
++
+             /*
+              * IRIS_26416_MOTION_V2_PROVEN_FLOAT32_BRIDGE
+              *
+@@ -1184,7 +1284,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 glProg.computeAuto(raw, 1);
+                 imageOutput = nextDirectRgb;
+                 Log.d(TAG,
+-                        "IRIS_26465_WRONSKI_PLUS_PROVEN_CFA_SATURATION_VALIDITY"
++                        "IRIS_26478_PURE_WRONSKI_DIRECT_RGB"
+                         + " publishedMethod=true"
+                         + " perFrameCovariance=true"
+                         + " alignedCovarianceInterpolation=true"
+@@ -1196,9 +1296,9 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         + " directPhysicalCfa=true"
+                         + " separateDemosaic=false"
+                         + " sharpening=false"
+-                        + " saturationValidity=true"
+-                        + " fullyClippedNeutralRecovery=true"
+-                        + " partialColorPreserved=true");
++                        + " censoredHighlightDualEvidence=false"
++                        + " sharedSpatialClipCoherence=false"
++                        + " clippedSamplesOrdinaryObservations=true");
+             } else {
+                 imageOutput = currentMerged;
+             }
+@@ -1209,6 +1309,24 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             output.order(ByteOrder.nativeOrder());
+             output.position(0);
+ 
++            /* IRIS_26474_DNG_COLOR_SHADOW_CALL */
++            MotionV2DngColorShadow.logShadow(parameters);
++
++            Log.d(TAG, "IRIS_26468_PRE_DENOISE_DIRECT_RGB_HANDOFF"
++                    + " carrier=rgba32f"
++                    + " fullResolution=" + directBayer
++                    + " frameCount=" + frameCount
++                    + " beforeMotionV2ColorTransform=true"
++                    + " beforeMotionV2Denoise=true"
++                    + " imageMathUnchanged=true");
++            try {
++                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                        "IRIS_26468_PRE_DENOISE_DIRECT_RGB_HANDOFF",
++                        "carrier=rgba32f frameCount=" + frameCount
++                                + " beforeColorTransform=true"
++                                + " beforeDenoise=true");
++            } catch (Throwable ignored) {}
++
+             Log.d(TAG, "IRIS_26416_V2_PROVEN_FLOAT32_BRIDGE"
+                     + " sourceInternal=rgba32f"
+                     + " transfer=rgba32f"
+@@ -1313,20 +1431,36 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             StringBuilder supportGrid12x8 = new StringBuilder();
+             float supportRoughness = 0.0f;
+             int supportRoughCount = 0;
++            float iris26468StrongestSeamDelta = 0.0f;
++            int iris26468SeamX = -1;
++            int iris26468SeamY = -1;
++            String iris26468SeamOrientation = "none";
+             for (int y = 0; y < summary.gridHeight; y++) {
+                 for (int x = 0; x < summary.gridWidth; x++) {
+                     int idx = y * summary.gridWidth + x;
+                     float c = summary.coarseGrid[idx];
+                     if (x + 1 < summary.gridWidth) {
+-                        supportRoughness += Math.abs(
+-                                c - summary.coarseGrid[idx + 1]);
++                        float d = Math.abs(c - summary.coarseGrid[idx + 1]);
++                        supportRoughness += d;
+                         supportRoughCount++;
++                        if (d > iris26468StrongestSeamDelta) {
++                            iris26468StrongestSeamDelta = d;
++                            iris26468SeamX = x;
++                            iris26468SeamY = y;
++                            iris26468SeamOrientation = "verticalBoundary";
++                        }
+                     }
+                     if (y + 1 < summary.gridHeight) {
+-                        supportRoughness += Math.abs(
+-                                c - summary.coarseGrid[
+-                                        idx + summary.gridWidth]);
++                        float d = Math.abs(
++                                c - summary.coarseGrid[idx + summary.gridWidth]);
++                        supportRoughness += d;
+                         supportRoughCount++;
++                        if (d > iris26468StrongestSeamDelta) {
++                            iris26468StrongestSeamDelta = d;
++                            iris26468SeamX = x;
++                            iris26468SeamY = y;
++                            iris26468SeamOrientation = "horizontalBoundary";
++                        }
+                     }
+                 }
+             }
+@@ -1358,6 +1492,39 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     + " meanNeighborDelta=" + supportRoughness
+                     + " retainedFrames=" + frameCount
+                     + " loggingOnly=true");
++            Log.d(TAG, "IRIS_26468_PROCESSING_SEAM_DIAGNOSTIC"
++                    + " strongestSupportDelta=" + iris26468StrongestSeamDelta
++                    + " gridX=" + iris26468SeamX
++                    + " gridY=" + iris26468SeamY
++                    + " orientation=" + iris26468SeamOrientation
++                    + " grid=" + summary.gridWidth + "x" + summary.gridHeight
++                    + " geometryUnchanged=true");
++            try {
++                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                        "IRIS_26468_PROCESSING_SEAM_DIAGNOSTIC",
++                        "strongestSupportDelta=" + iris26468StrongestSeamDelta
++                                + " gridX=" + iris26468SeamX
++                                + " gridY=" + iris26468SeamY
++                                + " orientation=" + iris26468SeamOrientation
++                                + " geometryUnchanged=true");
++            } catch (Throwable ignored) {}
++
++            if (directBayer && output != null) {
++                /*
++                 * IRIS_26478_SPEAKER_SUPPORT_DIAGNOSTIC
++                 * IRIS_26478_SPEAKER_SUPPORT_DIAGNOSTIC_ANCHOR_V2
++                 * Correlates the SAME IRIS_26436 local support map with the
++                 * already-read pure-Wronski direct RGB. Read-only telemetry.
++                 */
++                iris26478LogSpeakerSupportEdges(
++                        summary,
++                        supportGrid12x8.toString(),
++                        output.duplicate(),
++                        raw.x,
++                        raw.y,
++                        frameCount,
++                        parameters);
++            }
+ 
+             Log.d(TAG, "IRIS_26413_V2_CFA_RECONSTRUCTION"
+                     + " referenceTimestamp=" + referenceTimestamp
+@@ -1397,6 +1564,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             } catch (Throwable ignored) {}
+         } finally {
+             /* IRIS_26413 pack-fix: no temporary uint16 result texture is allocated. */
++            if (ipolNoiseCurveTexture != null) ipolNoiseCurveTexture.close();
+             if (directFrameSupportB != null) directFrameSupportB.close();
+             if (directFrameSupportA != null) directFrameSupportA.close();
+             if (directSupportB != null) directSupportB.close();
+@@ -1408,6 +1576,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             if (mergedB != null) mergedB.close();
+             if (mergedA != null) mergedA.close();
+             if (wronskiReferenceCov != null) wronskiReferenceCov.close();
++            if (wronskiPreparedAlignment != null) wronskiPreparedAlignment.close();
+             if (wronskiReferenceCfa != null) wronskiReferenceCfa.close();
+             if (referenceCfa != null) referenceCfa.close();
+             if (referenceRaw != null) referenceRaw.close();
+@@ -1925,6 +2094,310 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 n);
+     }
+ 
++    private static float[] iris26478SampleFinalDirectRgb(
++            FloatBuffer values,
++            int width,
++            int height,
++            int x,
++            int y) {
++        int sx = Math.max(0, Math.min(width - 1, x));
++        int sy = Math.max(0, Math.min(height - 1, y));
++        int base = (sy * width + sx) * 4;
++        if (base + 3 >= values.limit()) {
++            return new float[]{Float.NaN, Float.NaN, Float.NaN, Float.NaN};
++        }
++        return new float[]{
++                values.get(base),
++                values.get(base + 1),
++                values.get(base + 2),
++                values.get(base + 3)};
++    }
++
++    /*
++     * Exact linear diagnostic mirror:
++     * MotionV2DisplayExposure -> Camera2 gains -> Camera2 3x3 matrix.
++     * The active pipeline remains authoritative; this result is logging only.
++     */
++    private static float[] iris26478PredictActiveColor(
++            float[] direct,
++            Parameters parameters,
++            float displayGain) {
++        if (direct == null
++                || direct.length < 3
++                || parameters == null
++                || parameters.motionV2ColorGains == null
++                || parameters.motionV2ColorGains.length != 4
++                || parameters.motionV2ColorTransform == null
++                || parameters.motionV2ColorTransform.length != 9) {
++            return new float[]{Float.NaN, Float.NaN, Float.NaN};
++        }
++
++        float[] g = parameters.motionV2ColorGains;
++        float[] m = parameters.motionV2ColorTransform;
++        float greenGain = 0.5f * (g[1] + g[2]);
++
++        float r = Math.max(0.0f, direct[0]) * displayGain * g[0];
++        float gg = Math.max(0.0f, direct[1]) * displayGain * greenGain;
++        float b = Math.max(0.0f, direct[2]) * displayGain * g[3];
++
++        return new float[]{
++                Math.max(0.0f, m[0] * r + m[1] * gg + m[2] * b),
++                Math.max(0.0f, m[3] * r + m[4] * gg + m[5] * b),
++                Math.max(0.0f, m[6] * r + m[7] * gg + m[8] * b)};
++    }
++
++    /*
++     * IRIS_26478_SPEAKER_SUPPORT_DIAGNOSTIC
++     * Uses the exact existing SupportSummary from IRIS_26436 and reports
++     * the four strongest adjacent support discontinuities.
++     */
++    private static void iris26478LogSpeakerSupportEdges(
++            SupportSummary summary,
++            String grid12x8,
++            ByteBuffer rgbaBytes,
++            int width,
++            int height,
++            int frameCount,
++            Parameters parameters) {
++        if (summary == null
++                || summary.coarseGrid == null
++                || rgbaBytes == null
++                || width <= 0
++                || height <= 0) {
++            return;
++        }
++
++        String mapMessage =
++                "grid12x8=" + grid12x8
++                        + " mean=" + summary.mean
++                        + " p10=" + summary.p10
++                        + " p50=" + summary.p50
++                        + " p90=" + summary.p90
++                        + " retainedFrames=" + frameCount
++                        + " source=existingIRIS_26436LocalSupport"
++                        + " sameLocalSupportMap=true"
++                        + " diagnosticOnly=true"
++                        + " feedsImageMath=false";
++        Log.d(TAG, "IRIS_26478_SPEAKER_SUPPORT_MAP " + mapMessage);
++        try {
++            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                    "IRIS_26478_SPEAKER_SUPPORT_MAP",
++                    mapMessage);
++        } catch (Throwable ignored) {}
++
++        final int topN = 4;
++        float[] bestDelta = new float[topN];
++        int[] axGrid = new int[topN];
++        int[] ayGrid = new int[topN];
++        int[] bxGrid = new int[topN];
++        int[] byGrid = new int[topN];
++        String[] orientation = new String[topN];
++
++        for (int gy = 0; gy < summary.gridHeight; gy++) {
++            for (int gx = 0; gx < summary.gridWidth; gx++) {
++                int gi = gy * summary.gridWidth + gx;
++
++                if (gx + 1 < summary.gridWidth) {
++                    iris26478InsertSupportEdge(
++                            Math.abs(
++                                    summary.coarseGrid[gi]
++                                            - summary.coarseGrid[gi + 1]),
++                            gx,
++                            gy,
++                            gx + 1,
++                            gy,
++                            "verticalBoundary",
++                            bestDelta,
++                            axGrid,
++                            ayGrid,
++                            bxGrid,
++                            byGrid,
++                            orientation);
++                }
++                if (gy + 1 < summary.gridHeight) {
++                    iris26478InsertSupportEdge(
++                            Math.abs(
++                                    summary.coarseGrid[gi]
++                                            - summary.coarseGrid[
++                                                    gi + summary.gridWidth]),
++                            gx,
++                            gy,
++                            gx,
++                            gy + 1,
++                            "horizontalBoundary",
++                            bestDelta,
++                            axGrid,
++                            ayGrid,
++                            bxGrid,
++                            byGrid,
++                            orientation);
++                }
++            }
++        }
++
++        FloatBuffer values =
++                rgbaBytes.duplicate()
++                        .order(ByteOrder.nativeOrder())
++                        .asFloatBuffer();
++
++        float displayGain =
++                Math.max(
++                        1.0f,
++                        parameters != null
++                                ? parameters.motionCanonicalExposureGain
++                                : 1.0f);
++
++        for (int rank = 0; rank < topN; rank++) {
++            if (!(bestDelta[rank] > 0.0f) || orientation[rank] == null) {
++                continue;
++            }
++
++            int ax =
++                    iris26478GridCenterToPixel(
++                            axGrid[rank],
++                            summary.gridWidth,
++                            width);
++            int ay =
++                    iris26478GridCenterToPixel(
++                            ayGrid[rank],
++                            summary.gridHeight,
++                            height);
++            int bx =
++                    iris26478GridCenterToPixel(
++                            bxGrid[rank],
++                            summary.gridWidth,
++                            width);
++            int by =
++                    iris26478GridCenterToPixel(
++                            byGrid[rank],
++                            summary.gridHeight,
++                            height);
++
++            float[] directA =
++                    iris26478SampleFinalDirectRgb(
++                            values,
++                            width,
++                            height,
++                            ax,
++                            ay);
++            float[] directB =
++                    iris26478SampleFinalDirectRgb(
++                            values,
++                            width,
++                            height,
++                            bx,
++                            by);
++            float[] colorA =
++                    iris26478PredictActiveColor(
++                            directA,
++                            parameters,
++                            displayGain);
++            float[] colorB =
++                    iris26478PredictActiveColor(
++                            directB,
++                            parameters,
++                            displayGain);
++
++            float supportA =
++                    summary.coarseGrid[
++                            ayGrid[rank] * summary.gridWidth
++                                    + axGrid[rank]];
++            float supportB =
++                    summary.coarseGrid[
++                            byGrid[rank] * summary.gridWidth
++                                    + bxGrid[rank]];
++
++            String edgeMessage =
++                    "rank=" + (rank + 1)
++                            + " supportDelta=" + bestDelta[rank]
++                            + " orientation=" + orientation[rank]
++                            + " gridA=" + axGrid[rank] + "," + ayGrid[rank]
++                            + " gridB=" + bxGrid[rank] + "," + byGrid[rank]
++                            + " supportA=" + supportA
++                            + " supportB=" + supportB
++                            + " pixelA=" + ax + "," + ay
++                            + " pixelB=" + bx + "," + by
++                            + " xNormA=" + ax / (float)Math.max(1, width - 1)
++                            + " yNormA=" + ay / (float)Math.max(1, height - 1)
++                            + " xNormB=" + bx / (float)Math.max(1, width - 1)
++                            + " yNormB=" + by / (float)Math.max(1, height - 1)
++                            + " directA="
++                            + directA[0] + "," + directA[1] + "," + directA[2]
++                            + " directB="
++                            + directB[0] + "," + directB[1] + "," + directB[2]
++                            + " finalAlphaA=" + directA[3]
++                            + " finalAlphaB=" + directB[3]
++                            + " displayGain=" + displayGain
++                            + " colorA="
++                            + colorA[0] + "," + colorA[1] + "," + colorA[2]
++                            + " colorB="
++                            + colorB[0] + "," + colorB[1] + "," + colorB[2]
++                            + " colorPrediction=MotionV2DisplayExposure_then_Camera2GainsMatrix"
++                            + " sameLocalSupportMap=true"
++                            + " diagnosticOnly=true"
++                            + " feedsImageMath=false";
++
++            Log.d(TAG, "IRIS_26478_SPEAKER_SUPPORT_EDGE " + edgeMessage);
++            try {
++                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                        "IRIS_26478_SPEAKER_SUPPORT_EDGE",
++                        edgeMessage);
++            } catch (Throwable ignored) {}
++        }
++    }
++
++    private static int iris26478GridCenterToPixel(
++            int cell,
++            int gridExtent,
++            int imageExtent) {
++        return Math.max(
++                0,
++                Math.min(
++                        imageExtent - 1,
++                        Math.round(
++                                (cell + 0.5f)
++                                        * imageExtent
++                                        / gridExtent
++                                        - 0.5f)));
++    }
++
++    private static void iris26478InsertSupportEdge(
++            float delta,
++            int ax,
++            int ay,
++            int bx,
++            int by,
++            String edgeOrientation,
++            float[] bestDelta,
++            int[] axGrid,
++            int[] ayGrid,
++            int[] bxGrid,
++            int[] byGrid,
++            String[] orientation) {
++        for (int rank = 0; rank < bestDelta.length; rank++) {
++            if (delta <= bestDelta[rank]) continue;
++
++            for (int shift = bestDelta.length - 1;
++                    shift > rank;
++                    shift--) {
++                bestDelta[shift] = bestDelta[shift - 1];
++                axGrid[shift] = axGrid[shift - 1];
++                ayGrid[shift] = ayGrid[shift - 1];
++                bxGrid[shift] = bxGrid[shift - 1];
++                byGrid[shift] = byGrid[shift - 1];
++                orientation[shift] = orientation[shift - 1];
++            }
++
++            bestDelta[rank] = delta;
++            axGrid[rank] = ax;
++            ayGrid[rank] = ay;
++            bxGrid[rank] = bx;
++            byGrid[rank] = by;
++            orientation[rank] = edgeOrientation;
++            return;
++        }
++    }
++
+     private static SupportSummary summarizeSupport(
+             ByteBuffer bytes,
+             int width,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+index 2e57b00c..7951c02a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+@@ -12,16 +12,11 @@ import static android.opengl.GLES20.GL_LINEAR;
+ import static android.opengl.GLES20.GL_NEAREST;
+ 
+ /**
+- * IRIS_26462_WRONSKI_PUBLISHED_COARSE_TO_FINE_ALIGNMENT
++ * IRIS_26473_IPOL_WRONSKI_ALIGNMENT_COMPLETION
++ * IRIS_26467_WRONSKI_REFERENCE_PREP_ONCE
+  *
+- * Published Wronski/IPOL architecture:
+- * - four levels
+- * - factors fine->coarse 1,2,4,4
+- * - search radii 1,4,4,4
+- * - L1 at finest, L2 at coarser levels
+- * - three inverse-compositional Lucas-Kanade refinements per level
+- *
+- * Final flow is dense, continuous and expressed in packed-CFA coordinates.
++ * Preserves the proven 26467 prepared-reference API and burst lifetime while
++ * completing the remaining public/IPOL alignment differences.
+  */
+ public final class MotionV2WronskiAlignment {
+     private static final String TAG = "MotionV2WronskiAlign";
+@@ -33,34 +28,63 @@ public final class MotionV2WronskiAlignment {
+                 Math.max(1, (p.y + d - 1) / d));
+     }
+ 
+-    public static MotionV2Alignment.Result align(
++    public static final class PreparedReference implements AutoCloseable {
++        private final Point rawHalf;
++        private final int cfaPattern;
++        private final float signalScale;
++        private final float snr;
++        private GLTexture[] levels;
++        private GLTexture referenceGradient;
++        private GLTexture fineInverseHessian;
++
++        private PreparedReference(
++                Point rawHalf,
++                int cfaPattern,
++                float signalScale,
++                float snr,
++                GLTexture[] levels,
++                GLTexture referenceGradient,
++                GLTexture fineInverseHessian) {
++            this.rawHalf = new Point(rawHalf);
++            this.cfaPattern = cfaPattern;
++            this.signalScale = signalScale;
++            this.snr = snr;
++            this.levels = levels;
++            this.referenceGradient = referenceGradient;
++            this.fineInverseHessian = fineInverseHessian;
++        }
++
++        @Override
++        public void close() {
++            if (levels == null) return;
++            for (GLTexture t : levels) {
++                if (t != null) t.close();
++            }
++            levels = null;
++            if (referenceGradient != null) {
++                referenceGradient.close();
++                referenceGradient = null;
++            }
++            if (fineInverseHessian != null) {
++                fineInverseHessian.close();
++                fineInverseHessian = null;
++            }
++        }
++    }
++
++    private static GLTexture[] buildGuidePyramid(
+             Point rawHalf,
+             int cfaPattern,
+             float signalScale,
+-            float snr,
+             GLProg glProg,
+-            GLTexture referenceCfa,
+-            GLTexture alterCfa) {
++            GLTexture cfa) {
+ 
+-        final int baseTile = snr <= 14.0f ? 64 : (snr <= 22.0f ? 32 : 16);
+-        final int[] tile = new int[] {
+-                baseTile, baseTile, baseTile, Math.max(8, baseTile / 2)
+-        };
+-        final int[] radius = new int[] {1, 4, 4, 4};
+-        final int[] metric = new int[] {0, 1, 1, 1}; // 0=L1, 1=L2
+         final int[] stepFactor = new int[] {1, 2, 4, 4};
+-
+-        GLTexture[] ref = new GLTexture[4];
+-        GLTexture[] alt = new GLTexture[4];
+-        GLTexture previousFlow = null;
+-        GLTexture denseFlow = null;
++        GLTexture[] guide = new GLTexture[4];
++        GLTexture[] tmp = new GLTexture[4];
+ 
+         try {
+-            ref[0] = new GLTexture(
+-                    rawHalf,
+-                    new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+-                    null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+-            alt[0] = new GLTexture(
++            guide[0] = new GLTexture(
+                     rawHalf,
+                     new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+                     null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+@@ -70,48 +94,154 @@ public final class MotionV2WronskiAlignment {
+             glProg.useAssetProgram("motionv2/alignment_guide", true);
+             glProg.setVar("guideScale", 1);
+             glProg.setVar("signalScale", Math.max(signalScale,1.0e-6f));
+-            glProg.setTexture("InputCfa", referenceCfa);
+-            glProg.setTextureCompute("OutputGuide", ref[0], true);
++            glProg.setTexture("InputCfa", cfa);
++            glProg.setTextureCompute("OutputGuide", guide[0], true);
+             glProg.computeAuto(rawHalf,1);
+ 
+-            glProg.setDefine("CFAPATTERN", cfaPattern);
+-            glProg.setLayout(8,8,1);
+-            glProg.useAssetProgram("motionv2/alignment_guide", true);
+-            glProg.setVar("guideScale", 1);
+-            glProg.setVar("signalScale", Math.max(signalScale,1.0e-6f));
+-            glProg.setTexture("InputCfa", alterCfa);
+-            glProg.setTextureCompute("OutputGuide", alt[0], true);
+-            glProg.computeAuto(rawHalf,1);
+-
+-            Point[] levelSize = new Point[4];
+-            levelSize[0] = rawHalf;
++            Point prev = rawHalf;
+             for (int l=1;l<4;l++) {
+-                levelSize[l] = divCeil(levelSize[l-1], stepFactor[l]);
+-                ref[l] = new GLTexture(
+-                        levelSize[l],
++                Point levelSize = divCeil(prev, stepFactor[l]);
++
++                tmp[l] = new GLTexture(
++                        prev,
+                         new GLFormat(GLFormat.DataType.FLOAT_32,1),
+                         null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                alt[l] = new GLTexture(
+-                        levelSize[l],
++                guide[l] = new GLTexture(
++                        levelSize,
+                         new GLFormat(GLFormat.DataType.FLOAT_32,1),
+                         null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+ 
++                // Public cuda_downsample(): separable Gaussian with
++                // sigma=factor/2, radius=4*sigma, then decimation.
+                 glProg.setLayout(8,8,1);
+-                glProg.useAssetProgram("motionv2/mfsr_pyramid_down", true);
++                glProg.useAssetProgram("motionv2/mfsr_pyramid_gaussian", true);
+                 glProg.setVar("factor", stepFactor[l]);
+-                glProg.setTexture("InputGuide", ref[l-1]);
+-                glProg.setTextureCompute("OutputGuide", ref[l], true);
+-                glProg.computeAuto(levelSize[l],1);
++                glProg.setVar("direction", 0);
++                glProg.setTexture("InputGuide", guide[l-1]);
++                glProg.setTextureCompute("OutputGuide", tmp[l], true);
++                glProg.computeAuto(prev,1);
+ 
+                 glProg.setLayout(8,8,1);
+-                glProg.useAssetProgram("motionv2/mfsr_pyramid_down", true);
++                glProg.useAssetProgram("motionv2/mfsr_pyramid_gaussian", true);
+                 glProg.setVar("factor", stepFactor[l]);
+-                glProg.setTexture("InputGuide", alt[l-1]);
+-                glProg.setTextureCompute("OutputGuide", alt[l], true);
+-                glProg.computeAuto(levelSize[l],1);
++                glProg.setVar("direction", 1);
++                glProg.setTexture("InputGuide", tmp[l]);
++                glProg.setTextureCompute("OutputGuide", guide[l], true);
++                glProg.computeAuto(levelSize,1);
++
++                tmp[l].close();
++                tmp[l] = null;
++                prev = levelSize;
++            }
++            return guide;
++        } catch (Throwable t) {
++            for (GLTexture texture : tmp) {
++                if (texture != null) {
++                    try { texture.close(); } catch (Throwable ignored) {}
++                }
++            }
++            for (GLTexture texture : guide) {
++                if (texture != null) {
++                    try { texture.close(); } catch (Throwable ignored) {}
++                }
++            }
++            throw t;
++        }
++    }
++
++    public static PreparedReference prepareReference(
++            Point rawHalf,
++            int cfaPattern,
++            float signalScale,
++            float snr,
++            GLProg glProg,
++            GLTexture referenceCfa) {
++
++        long start = System.currentTimeMillis();
++        GLTexture[] ref = buildGuidePyramid(
++                rawHalf, cfaPattern, signalScale, glProg, referenceCfa);
++
++        final int baseTile = snr <= 14.0f ? 64 : (snr <= 22.0f ? 32 : 16);
++        final Point fineGrid = new Point(
++                Math.max(1,(rawHalf.x + baseTile - 1)/baseTile),
++                Math.max(1,(rawHalf.y + baseTile - 1)/baseTile));
++
++        GLTexture referenceGradient = new GLTexture(
++                rawHalf,
++                new GLFormat(GLFormat.DataType.FLOAT_32,4),
++                null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++        glProg.setLayout(8,8,1);
++        glProg.useAssetProgram("motionv2/mfsr_ica_reference_gradient", true);
++        glProg.setVar("levelSize", rawHalf);
++        glProg.setTexture("ReferenceGuide", ref[0]);
++        glProg.setTextureCompute("OutputGradient", referenceGradient, true);
++        glProg.computeAuto(rawHalf,1);
++
++        GLTexture fineInverseHessian = new GLTexture(
++                fineGrid,
++                new GLFormat(GLFormat.DataType.FLOAT_32,4),
++                null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++        glProg.setLayout(8,8,1);
++        glProg.useAssetProgram("motionv2/mfsr_ica_reference_hessian", true);
++        glProg.setVar("levelSize", rawHalf);
++        glProg.setVar("tileSize", baseTile);
++        glProg.setTexture("ReferenceGradient", referenceGradient);
++        glProg.setTextureCompute("OutputInverseHessian", fineInverseHessian, true);
++        glProg.computeAuto(fineGrid,1);
++
++        Log.d(TAG,
++                "IRIS_26467_WRONSKI_REFERENCE_PREP_ONCE"
++                + " elapsedMs=" + (System.currentTimeMillis() - start)
++                + " levels=4"
++                + " reusedAcrossAuxiliaries=true"
++                + " guide=bayerQuadAverage"
++                + " icaReferenceGradientPreparedOnce=true gradientCarrier=RGBA32F_RG_used"
++                + " icaReferenceHessianPreparedOnce=true"
++                + " ipol26475=true");
++
++        return new PreparedReference(
++                rawHalf, cfaPattern, signalScale, snr, ref,
++                referenceGradient, fineInverseHessian);
++    }
++
++    public static MotionV2Alignment.Result alignPrepared(
++            PreparedReference prepared,
++            GLProg glProg,
++            GLTexture alterCfa) {
++
++        if (prepared == null || prepared.levels == null) {
++            throw new IllegalStateException("Wronski prepared reference is closed");
++        }
++
++        final Point rawHalf = prepared.rawHalf;
++        final float snr = prepared.snr;
++        final int baseTile = snr <= 14.0f ? 64 : (snr <= 22.0f ? 32 : 16);
++        final int[] tile = new int[] {
++                baseTile, baseTile, baseTile, Math.max(8, baseTile / 2)
++        };
++        final int[] radius = new int[] {1, 4, 4, 4};
++        final int[] metric = new int[] {0, 1, 1, 1};
++        final int[] stepFactor = new int[] {1, 2, 4, 4};
++
++        final GLTexture[] ref = prepared.levels;
++        GLTexture[] alt = null;
++        GLTexture previousFlow = null;
++        GLTexture denseFlow = null;
++
++        try {
++            alt = buildGuidePyramid(
++                    rawHalf,
++                    prepared.cfaPattern,
++                    prepared.signalScale,
++                    glProg,
++                    alterCfa);
++
++            Point[] levelSize = new Point[4];
++            levelSize[0] = rawHalf;
++            for (int l=1;l<4;l++) {
++                levelSize[l] = divCeil(levelSize[l-1], stepFactor[l]);
+             }
+ 
+-            // Coarsest -> finest.
+             for (int l=3;l>=0;l--) {
+                 Point grid = new Point(
+                         Math.max(1,(levelSize[l].x + tile[l]-1)/tile[l]),
+@@ -121,10 +251,6 @@ public final class MotionV2WronskiAlignment {
+                         grid,
+                         new GLFormat(GLFormat.DataType.FLOAT_16,4),
+                         null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+-                GLTexture refined = new GLTexture(
+-                        grid,
+-                        new GLFormat(GLFormat.DataType.FLOAT_16,4),
+-                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+ 
+                 glProg.setLayout(8,8,1);
+                 glProg.useAssetProgram("motionv2/mfsr_block_match", true);
+@@ -138,27 +264,40 @@ public final class MotionV2WronskiAlignment {
+                         l < 3 ? (float)stepFactor[l+1] : 1.0f);
+                 glProg.setTexture("ReferenceGuide", ref[l]);
+                 glProg.setTexture("MovingGuide", alt[l]);
+-                // Any valid texture may be bound when hasPrevious=0; it is not read.
+                 glProg.setTexture(
+                         "PreviousFlow",
+                         previousFlow != null ? previousFlow : ref[l]);
+                 glProg.setTextureCompute("OutputFlow", block, true);
+                 glProg.computeAuto(grid,1);
+ 
+-                glProg.setLayout(8,8,1);
+-                glProg.useAssetProgram("motionv2/mfsr_ica_refine", true);
+-                glProg.setVar("levelSize", levelSize[l]);
+-                glProg.setVar("tileSize", tile[l]);
+-                glProg.setVar("iterations", 3);
+-                glProg.setTexture("ReferenceGuide", ref[l]);
+-                glProg.setTexture("MovingGuide", alt[l]);
+-                glProg.setTexture("BlockFlow", block);
+-                glProg.setTextureCompute("OutputFlow", refined, true);
+-                glProg.computeAuto(grid,1);
++                GLTexture nextFlow = block;
++
++                if (l == 0) {
++                    GLTexture refined = new GLTexture(
++                            grid,
++                            new GLFormat(GLFormat.DataType.FLOAT_16,4),
++                            null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                    glProg.setLayout(8,8,1);
++                    glProg.useAssetProgram("motionv2/mfsr_ica_refine", true);
++                    glProg.setVar("levelSize", levelSize[l]);
++                    glProg.setVar("tileSize", tile[l]);
++                    glProg.setTexture("ReferenceGuide", ref[l]);
++                    glProg.setTexture("MovingGuide", alt[l]);
++                    glProg.setTexture("BlockFlow", block);
++                    glProg.setTexture(
++                            "ReferenceGradient",
++                            prepared.referenceGradient);
++                    glProg.setTexture(
++                            "InverseHessian",
++                            prepared.fineInverseHessian);
++                    glProg.setTextureCompute("OutputFlow", refined, true);
++                    glProg.computeAuto(grid,1);
++                    block.close();
++                    nextFlow = refined;
++                }
+ 
+-                block.close();
+                 if (previousFlow != null) previousFlow.close();
+-                previousFlow = refined;
++                previousFlow = nextFlow;
+             }
+ 
+             denseFlow = new GLTexture(
+@@ -175,14 +314,22 @@ public final class MotionV2WronskiAlignment {
+             glProg.computeAuto(rawHalf,1);
+ 
+             Log.d(TAG,
+-                    "IRIS_26462_WRONSKI_PUBLISHED_ALIGNMENT"
++                    "IRIS_26473_IPOL_WRONSKI_ALIGNMENT_COMPLETION"
+                     + " snr=" + snr
+                     + " baseTile=" + baseTile
++                    + " guide=bayerQuadAverageLikelyOriginalWronski"
++                    + " gaussianSigma=factorHalf"
++                    + " gaussianRadius=fourSigma"
+                     + " factors=1,2,4,4"
+                     + " radii=1,4,4,4"
+                     + " metrics=L1,L2,L2,L2"
+-                    + " icaIterations=3"
+-                    + " flowUpscale=nearest" + " subpixelFromICA=true");
++                    + " icaIterations=3FineOnly"
++                    + " icaReferencePrecompute=true"
++                    + " icaUpdateClamp=false"
++                    + " referenceBoundary=circular"
++                    + " movingBoundary=zero"
++                    + " flowUpscale=nearest"
++                    + " referencePreparedOnce=true");
+ 
+             GLTexture keep = denseFlow;
+             denseFlow = null;
+@@ -191,10 +338,25 @@ public final class MotionV2WronskiAlignment {
+         } finally {
+             if (denseFlow != null) denseFlow.close();
+             if (previousFlow != null) previousFlow.close();
+-            for (int i=0;i<4;i++) {
+-                if (ref[i] != null) ref[i].close();
+-                if (alt[i] != null) alt[i].close();
++            if (alt != null) {
++                for (GLTexture t : alt) {
++                    if (t != null) t.close();
++                }
+             }
+         }
+     }
+-}
+\ No newline at end of file
++
++    public static MotionV2Alignment.Result align(
++            Point rawHalf,
++            int cfaPattern,
++            float signalScale,
++            float snr,
++            GLProg glProg,
++            GLTexture referenceCfa,
++            GLTexture alterCfa) {
++        try (PreparedReference prepared = prepareReference(
++                rawHalf, cfaPattern, signalScale, snr, glProg, referenceCfa)) {
++            return alignPrepared(prepared, glProg, alterCfa);
++        }
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index d9d7fea6..7f42cd9f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -73,6 +73,16 @@ public class Parameters {
+             0f,0f,1f
+     };
+     public boolean motionV2DirectColorValid = false;
++
++    /*
++     * IRIS_26477_STRICT_WRONSKI_SENSOR_AUTHORITY
++     * Non-tunable Motion-only sensor contract populated directly from
++     * timestamp-owned Camera2 metadata after generic Photon tunable injection.
++     */
++    public boolean motionV2StrictWronskiSensorValid = false;
++    public float motionV2WronskiNoiseS = Float.NaN;
++    public float motionV2WronskiNoiseO = Float.NaN;
++
+     public float tonemapStrength = 1.4f;
+     public float[] customTonemap;
+     public Point[] hotPixels;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
+index fac5dfb9..aaae02dc 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
+@@ -46,13 +46,25 @@ public final class MotionV2UltraHdr {
+                         unrotatedGainMap.getWidth(),
+                         unrotatedGainMap.getHeight(),
+                         matrix,
+-                        true);
++                        false);
+                 if (oriented != unrotatedGainMap
+                         && !unrotatedGainMap.isRecycled()) {
+                     unrotatedGainMap.recycle();
+                 }
+             }
+ 
++            /* IRIS_26470_UHDR_EXACT_ORTHOGONAL_GEOMETRY */
++            float baseAspect = sdrBase.getHeight() > 0
++                    ? sdrBase.getWidth() / (float) sdrBase.getHeight() : 0.0f;
++            float gainAspect = oriented.getHeight() > 0
++                    ? oriented.getWidth() / (float) oriented.getHeight() : 0.0f;
++            float aspectError = Math.abs(baseAspect - gainAspect);
++            Log.d(TAG, "IRIS_26470_UHDR_ATTACH_GEOMETRY"
++                    + " base=" + sdrBase.getWidth() + "x" + sdrBase.getHeight()
++                    + " gain=" + oriented.getWidth() + "x" + oriented.getHeight()
++                    + " rotation=" + rotation
++                    + " exactOrthogonalRotation=true interpolation=false"
++                    + " aspectError=" + aspectError);
+             float safeMax = Math.max(1.50f, Math.min(2.5f, maxRatio));
+             Gainmap gainmap = new Gainmap(oriented);
+             gainmap.setRatioMin(MIN_RATIO, MIN_RATIO, MIN_RATIO);
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index dc66435e..0f829ab4 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -1,122 +1,78 @@
+-<?xml version="1.0" encoding="utf-8"?>
+-<PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android" xmlns:app="http://schemas.android.com/apk/res-auto" android:orderingFromXml="true" android:title="@string/settings" android:key="prefscreen">
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_general_key" android:title="@string/general">
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_wide169_key" android:defaultValue="@bool/pref_wide169_default" android:layout="@layout/preference_with_margin" android:title="@string/wide169" android:summary="" android:icon="@drawable/ic_burst_mode_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_binning_key" android:defaultValue="@bool/pref_binning_default" android:layout="@layout/preference_with_margin" android:title="@string/binning" android:summary="" android:icon="@drawable/ic_burst_mode_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_energy_safe_key" android:defaultValue="@bool/pref_energy_safe_default" android:layout="@layout/preference_with_margin" android:title="@string/energy_saving" android:summary="" android:icon="@drawable/leaf_icon_15" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_camera_sounds_key" android:defaultValue="@bool/pref_camera_sounds_default" android:layout="@layout/preference_with_margin" android:title="@string/camera_sounds" android:summary="" android:icon="@drawable/ic_camera_sounds" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_hide_gallery_icon_key" android:defaultValue="@bool/pref_hide_gallery_icon_default" android:layout="@layout/preference_with_margin" android:title="@string/hide_gallery_icon" android:summary="" android:icon="@drawable/ic_watermark" />
+-        <ListPreference android:key="@string/pref_show_grid_key" android:defaultValue="@string/pref_show_grid_default" android:layout="@layout/preference_with_margin" android:title="@string/turn_on_grid" app:useSimpleSummaryProvider="true" android:summary="" android:entries="@array/vf_grid_entries" android:entryValues="@array/vf_grid_entryvalues" android:icon="@drawable/ic_settings_grid" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_show_roundedge_key" android:defaultValue="@bool/pref_show_roundedge_default" android:layout="@layout/preference_with_margin" android:title="@string/turn_on_round_edges" android:summary="" android:icon="@drawable/ic_rounded_corner" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_show_watermark_key" android:defaultValue="@bool/pref_show_watermark_default" android:layout="@layout/preference_with_margin" android:title="@string/turn_on_watermark" android:summary="" android:icon="@drawable/ic_watermark" />
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_af_mode_key" android:title="@string/af_mode" app:useSimpleSummaryProvider="true" android:icon="@drawable/ic_focus" android:entries="@array/af_mode_entries" android:entryValues="@array/af_mode_entryvalues" android:defaultValue="@string/pref_af_mode_default_value" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_show_afdata_key" android:defaultValue="@bool/pref_show_afdata_default" android:layout="@layout/preference_with_margin" android:title="@string/turn_on_afdata" android:summary="" android:icon="@drawable/ic_developer" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:title="@string/pref_save_per_lens_string" android:layout="@layout/preference_with_margin" android:key="@string/pref_save_per_lens_settings" android:icon="@drawable/ic_multi_lens" app:defaultValue="false" />
++<?xml version='1.0' encoding='utf-8'?>
++<PreferenceScreen xmlns:ns0="http://schemas.android.com/apk/res/android" xmlns:ns1="http://schemas.android.com/apk/res-auto" ns0:orderingFromXml="true" ns0:title="@string/settings" ns0:key="prefscreen">
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_general_key" ns0:title="@string/general">
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_wide169_key" ns0:defaultValue="@bool/pref_wide169_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/wide169" ns0:summary="" ns0:icon="@drawable/ic_burst_mode_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_binning_key" ns0:defaultValue="@bool/pref_binning_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/binning" ns0:summary="" ns0:icon="@drawable/ic_burst_mode_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_energy_safe_key" ns0:defaultValue="@bool/pref_energy_safe_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/energy_saving" ns0:summary="" ns0:icon="@drawable/leaf_icon_15" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_camera_sounds_key" ns0:defaultValue="@bool/pref_camera_sounds_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/camera_sounds" ns0:summary="" ns0:icon="@drawable/ic_camera_sounds" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_hide_gallery_icon_key" ns0:defaultValue="@bool/pref_hide_gallery_icon_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/hide_gallery_icon" ns0:summary="" ns0:icon="@drawable/ic_watermark" />
++        <ListPreference ns0:key="@string/pref_show_grid_key" ns0:defaultValue="@string/pref_show_grid_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/turn_on_grid" ns1:useSimpleSummaryProvider="true" ns0:summary="" ns0:entries="@array/vf_grid_entries" ns0:entryValues="@array/vf_grid_entryvalues" ns0:icon="@drawable/ic_settings_grid" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_show_roundedge_key" ns0:defaultValue="@bool/pref_show_roundedge_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/turn_on_round_edges" ns0:summary="" ns0:icon="@drawable/ic_rounded_corner" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_show_watermark_key" ns0:defaultValue="@bool/pref_show_watermark_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/turn_on_watermark" ns0:summary="" ns0:icon="@drawable/ic_watermark" />
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_af_mode_key" ns0:title="@string/af_mode" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_focus" ns0:entries="@array/af_mode_entries" ns0:entryValues="@array/af_mode_entryvalues" ns0:defaultValue="@string/pref_af_mode_default_value" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_show_afdata_key" ns0:defaultValue="@bool/pref_show_afdata_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/turn_on_afdata" ns0:summary="" ns0:icon="@drawable/ic_developer" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:title="@string/pref_save_per_lens_string" ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_save_per_lens_settings" ns0:icon="@drawable/ic_multi_lens" ns1:defaultValue="false" />
+     </PreferenceCategory>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_photo_key" android:title="@string/photo_settings">
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_frame_count_key" android:layout="@layout/preference_seekbar" android:title="@string/frame_count" android:defaultValue="@string/pref_framecount_default" app:maxValue="200" app:minValue="1" android:icon="@drawable/ic_burst_mode_black_24dp" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_photo_key" ns0:title="@string/photo_settings">
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_frame_count_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/frame_count" ns0:defaultValue="@string/pref_framecount_default" ns1:maxValue="200" ns1:minValue="1" ns0:icon="@drawable/ic_burst_mode_black_24dp" />
+     </PreferenceCategory>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_video_key" android:title="@string/video_settings">
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_video_resolution_key" android:title="@string/video_resolution" app:useSimpleSummaryProvider="true" android:icon="@drawable/ic_saturation" android:entries="@array/video_resolution_entries" android:entryValues="@array/video_resolution_entryvalues" android:defaultValue="@string/pref_video_resolution_default" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_video_key" ns0:title="@string/video_settings">
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_video_resolution_key" ns0:title="@string/video_resolution" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_saturation" ns0:entries="@array/video_resolution_entries" ns0:entryValues="@array/video_resolution_entryvalues" ns0:defaultValue="@string/pref_video_resolution_default" />
+     </PreferenceCategory>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_rawvideo_key" android:title="@string/raw_video_settings">
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_rawvideo_downscale_4x_key" android:defaultValue="false" android:layout="@layout/preference_with_margin" android:title="@string/rawvideo_downscale_4x" android:summary="" android:icon="@drawable/ic_burst_mode_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_rawvideo_write_zip_key" android:defaultValue="true" android:layout="@layout/preference_with_margin" android:title="@string/rawvideo_write_zip" android:summary="" android:icon="@drawable/ic_save" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_rawvideo_crop_169_key" android:defaultValue="true" android:layout="@layout/preference_with_margin" android:title="@string/rawvideo_crop_169" android:summary="" android:icon="@drawable/ic_burst_mode_black_24dp" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_rawvideo_key" ns0:title="@string/raw_video_settings">
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_rawvideo_downscale_4x_key" ns0:defaultValue="false" ns0:layout="@layout/preference_with_margin" ns0:title="@string/rawvideo_downscale_4x" ns0:summary="" ns0:icon="@drawable/ic_burst_mode_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_rawvideo_write_zip_key" ns0:defaultValue="true" ns0:layout="@layout/preference_with_margin" ns0:title="@string/rawvideo_write_zip" ns0:summary="" ns0:icon="@drawable/ic_save" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_rawvideo_crop_169_key" ns0:defaultValue="true" ns0:layout="@layout/preference_with_margin" ns0:title="@string/rawvideo_crop_169" ns0:summary="" ns0:icon="@drawable/ic_burst_mode_black_24dp" />
+     </PreferenceCategory>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_jpg_key" android:title="@string/jpg">
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_enable_system_nr_key" android:defaultValue="@bool/pref_system_nr_default" android:layout="@layout/preference_with_margin" android:title="@string/turn_on_system_nr" android:summary="" android:icon="@drawable/ic_gradient_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_disable_aligning_key" android:defaultValue="@bool/pref_disable_align_default" android:layout="@layout/preference_with_margin" android:title="@string/disable_aligning" android:summary="" android:icon="@drawable/ic_format_align_justify_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_chroma_nr_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/chroma_nr_count" android:summary="" android:defaultValue="@string/pref_chroma_seekbar_default" app:maxValue="65" app:minValue="1" android:icon="@drawable/ic_burst_mode_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_luma_nr_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/luma_nr_count" android:summary="" android:defaultValue="@string/pref_luma_seekbar_default" app:maxValue="65" app:minValue="1" android:icon="@drawable/ic_grain_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_enhanced_processing_key" android:defaultValue="@bool/pref_enhanced_processing_default" android:layout="@layout/preference_with_margin" android:title="@string/enhanced_processing" android:summary="" android:icon="@drawable/ic_tune_black_24dp" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_jpg_key" ns0:title="@string/jpg">
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_enable_system_nr_key" ns0:defaultValue="@bool/pref_system_nr_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/turn_on_system_nr" ns0:summary="" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_disable_aligning_key" ns0:defaultValue="@bool/pref_disable_align_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/disable_aligning" ns0:summary="" ns0:icon="@drawable/ic_format_align_justify_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_chroma_nr_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/chroma_nr_count" ns0:summary="" ns0:defaultValue="@string/pref_chroma_seekbar_default" ns1:maxValue="65" ns1:minValue="1" ns0:icon="@drawable/ic_burst_mode_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_luma_nr_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/luma_nr_count" ns0:summary="" ns0:defaultValue="@string/pref_luma_seekbar_default" ns1:maxValue="65" ns1:minValue="1" ns0:icon="@drawable/ic_grain_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_enhanced_processing_key" ns0:defaultValue="@bool/pref_enhanced_processing_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/enhanced_processing" ns0:summary="" ns0:icon="@drawable/ic_tune_black_24dp" />
+     </PreferenceCategory>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_hdrx_key" android:title="@string/hdrx">
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_save_raw_key" android:title="@string/raw" app:useSimpleSummaryProvider="true" android:icon="@drawable/ic_raw" android:summary="" android:entries="@array/raw_mode_entries" android:entryValues="@array/raw_mode_entryvalues" android:defaultValue="@string/pref_raw_mode_default_value" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="@string/pref_hdrx_nr_key" android:defaultValue="@bool/pref_hdrx_nr_default" android:layout="@layout/preference_with_margin" android:title="@string/hdrxNR" android:summary="" android:icon="@drawable/ic_gradient_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_sharpness_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/sharpness" android:summary="" android:defaultValue="@string/pref_sharpness_seekbar_default" app:maxValue="1.0" app:minValue="-0.2" app:isFloat="true" app:stepPerUnit="20" android:icon="@drawable/ic_grain_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_saturation_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/saturation" android:summary="" android:defaultValue="@string/pref_saturation_seekbar_default" app:maxValue="3" app:minValue="0" app:isFloat="true" app:stepPerUnit="10" android:icon="@drawable/ic_saturation" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_contrast_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/contrast" android:summary="" android:defaultValue="@string/pref_contrast_seekbar_default" app:maxValue="3" app:minValue="0" app:isFloat="true" app:stepPerUnit="10" android:icon="@drawable/ic_saturation" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_expocompensation_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/expocompensation" android:summary="" android:defaultValue="@string/pref_expocompensation_seekbar_default" app:maxValue="4" app:minValue="-4" app:isFloat="true" app:stepPerUnit="10" android:icon="@drawable/ic_saturation" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_noise_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/noise_reduction_str" android:summary="" android:defaultValue="@string/pref_noise_seekbar_default" app:maxValue="4" app:minValue="-6" app:isFloat="true" app:stepPerUnit="10" android:icon="@drawable/ic_compressor" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_merge_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/noise_merge_str" android:summary="" android:defaultValue="@string/pref_noise_merge_seekbar_default" app:maxValue="8" app:minValue="-4" app:isFloat="true" app:stepPerUnit="10" android:icon="@drawable/ic_compressor" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_shadows_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/shadows" android:summary="" android:defaultValue="@string/pref_gain_seekbar_default" app:maxValue="2.0" app:minValue="-1.0" app:isFloat="true" app:stepPerUnit="10" android:icon="@drawable/ic_compressor" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference android:key="@string/pref_compressor_seekbar_key" android:layout="@layout/preference_seekbar" android:title="@string/compressor" android:summary="" android:defaultValue="@string/pref_compressor_seekbar_default" app:maxValue="8.0" app:minValue="-1.0" app:isFloat="true" app:stepPerUnit="10" android:icon="@drawable/ic_compressor" />
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_cfa_key" android:title="@string/cfa" app:useSimpleSummaryProvider="true" android:icon="@drawable/ic_bayer" android:entries="@array/cfapat_entries" android:entryValues="@array/cfapat_entryValues" android:defaultValue="@string/pref_cfa_default_value" />
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_align_method_key" app:useSimpleSummaryProvider="true" android:title="@string/align_method" android:icon="@drawable/ic_burst_mode_black_24dp" android:entries="@array/alignset_entries" android:entryValues="@array/alignset_entryValues" android:defaultValue="@string/pref_align_method_default" />
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_color_method_key" app:useSimpleSummaryProvider="true" android:title="@string/color_method" android:icon="@drawable/ic_saturation" android:entries="@array/colorset_entries" android:entryValues="@array/colorset_entryValues" android:defaultValue="@string/pref_align_method_default" />
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_peak_method_key" app:useSimpleSummaryProvider="true" android:title="@string/focus_peaking" android:icon="@drawable/ic_saturation" android:entries="@array/focuspeakset_entries" android:entryValues="@array/focuspeakset_entryValues" android:defaultValue="@string/pref_focus_peak_default" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_horizon" android:title="@string/show_horizon_on_preview" android:summary="" android:defaultValue="false" android:icon="@drawable/ic_tune_black_24dp" />
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_preview_format_key" app:useSimpleSummaryProvider="true" android:title="@string/preview_format" android:icon="@drawable/ic_saturation" android:entries="@array/preview_format_entries" android:entryValues="@array/preview_format_entryValues" android:defaultValue="@string/pref_preview_format_default" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_hdrx_key" ns0:title="@string/hdrx">
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_save_raw_key" ns0:title="@string/raw" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_raw" ns0:summary="" ns0:entries="@array/raw_mode_entries" ns0:entryValues="@array/raw_mode_entryvalues" ns0:defaultValue="@string/pref_raw_mode_default_value" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_hdrx_nr_key" ns0:defaultValue="@bool/pref_hdrx_nr_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/hdrxNR" ns0:summary="" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_sharpness_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/sharpness" ns0:summary="" ns0:defaultValue="@string/pref_sharpness_seekbar_default" ns1:maxValue="1.0" ns1:minValue="-0.2" ns1:isFloat="true" ns1:stepPerUnit="20" ns0:icon="@drawable/ic_grain_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_saturation_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/saturation" ns0:summary="" ns0:defaultValue="@string/pref_saturation_seekbar_default" ns1:maxValue="3" ns1:minValue="0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_contrast_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/contrast" ns0:summary="" ns0:defaultValue="@string/pref_contrast_seekbar_default" ns1:maxValue="3" ns1:minValue="0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_expocompensation_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/expocompensation" ns0:summary="" ns0:defaultValue="@string/pref_expocompensation_seekbar_default" ns1:maxValue="4" ns1:minValue="-4" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_noise_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/noise_reduction_str" ns0:summary="" ns0:defaultValue="@string/pref_noise_seekbar_default" ns1:maxValue="4" ns1:minValue="-6" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_compressor" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_merge_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/noise_merge_str" ns0:summary="" ns0:defaultValue="@string/pref_noise_merge_seekbar_default" ns1:maxValue="8" ns1:minValue="-4" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_compressor" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_shadows_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/shadows" ns0:summary="" ns0:defaultValue="@string/pref_gain_seekbar_default" ns1:maxValue="2.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_compressor" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="@string/pref_compressor_seekbar_key" ns0:layout="@layout/preference_seekbar" ns0:title="@string/compressor" ns0:summary="" ns0:defaultValue="@string/pref_compressor_seekbar_default" ns1:maxValue="8.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_compressor" />
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_cfa_key" ns0:title="@string/cfa" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_bayer" ns0:entries="@array/cfapat_entries" ns0:entryValues="@array/cfapat_entryValues" ns0:defaultValue="@string/pref_cfa_default_value" />
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_align_method_key" ns1:useSimpleSummaryProvider="true" ns0:title="@string/align_method" ns0:icon="@drawable/ic_burst_mode_black_24dp" ns0:entries="@array/alignset_entries" ns0:entryValues="@array/alignset_entryValues" ns0:defaultValue="@string/pref_align_method_default" />
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_color_method_key" ns1:useSimpleSummaryProvider="true" ns0:title="@string/color_method" ns0:icon="@drawable/ic_saturation" ns0:entries="@array/colorset_entries" ns0:entryValues="@array/colorset_entryValues" ns0:defaultValue="@string/pref_align_method_default" />
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_peak_method_key" ns1:useSimpleSummaryProvider="true" ns0:title="@string/focus_peaking" ns0:icon="@drawable/ic_saturation" ns0:entries="@array/focuspeakset_entries" ns0:entryValues="@array/focuspeakset_entryValues" ns0:defaultValue="@string/pref_focus_peak_default" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_horizon" ns0:title="@string/show_horizon_on_preview" ns0:summary="" ns0:defaultValue="false" ns0:icon="@drawable/ic_tune_black_24dp" />
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_preview_format_key" ns1:useSimpleSummaryProvider="true" ns0:title="@string/preview_format" ns0:icon="@drawable/ic_saturation" ns0:entries="@array/preview_format_entries" ns0:entryValues="@array/preview_format_entryValues" ns0:defaultValue="@string/pref_preview_format_default" />
+     </PreferenceCategory>
+-    <PreferenceScreen android:layout="@layout/preference_with_margin" android:title="Motion IQ Lab" android:summary="Live Motion image-quality controls; master off restores the normal build path" android:key="pref_motion_iq_lab_submenu" android:icon="@drawable/ic_tune_black_24dp">
+-        <PreferenceCategory android:layout="@layout/preference_category_layout" android:title="Lab Control">
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="pref_motion_iq_master_enable" android:defaultValue="false" android:layout="@layout/preference_with_margin" android:title="Enable Main-Menu IQ Overrides" android:summary="OFF = exact normal 26405/26404 processing path. ON = controls below override Motion on the next capture." android:icon="@drawable/ic_tune_black_24dp" />
+-        </PreferenceCategory>
+-        <PreferenceCategory android:layout="@layout/preference_category_layout" android:title="Demosaic">
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_demosaic_gradient_alpha" android:layout="@layout/preference_seekbar" android:title="Gradient Alpha" android:summary="Active p0 gradient metric. Baseline 3.75." android:defaultValue="3.75" app:minValue="0.5" app:maxValue="8" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_demosaic_green_edge_threshold" android:layout="@layout/preference_seekbar" android:title="Green Edge Threshold" android:summary="Active p12ec directional green threshold. Baseline 1.30." android:defaultValue="1.30" app:minValue="0.5" app:maxValue="3" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_demosaic_green_refine_threshold" android:layout="@layout/preference_seekbar" android:title="Green Refine Threshold" android:summary="Active p12fc green refinement gate. Baseline 1.30." android:defaultValue="1.30" app:minValue="0.5" app:maxValue="3" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_demosaic_final_alpha" android:layout="@layout/preference_seekbar" android:title="Final Color Alpha" android:summary="Active p2 color-difference gradient alpha. Baseline 3.75." android:defaultValue="3.75" app:minValue="0.5" app:maxValue="8" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_demosaic_final_threshold" android:layout="@layout/preference_seekbar" android:title="Final Color Edge Threshold" android:summary="Active p2 edge-direction threshold. Baseline 1.90." android:defaultValue="1.90" app:minValue="0.5" app:maxValue="4" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_demosaic_final_beta" android:layout="@layout/preference_seekbar" android:title="Final Color Mix / Beta" android:summary="Active p2 mix of center versus interpolated color difference. Baseline 0.42." android:defaultValue="0.42" app:minValue="0" app:maxValue="1" app:isFloat="true" app:stepPerUnit="100" />
+-        </PreferenceCategory>
+-        <PreferenceCategory android:layout="@layout/preference_category_layout" android:title="Shadow Floor / ABLC">
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_ablc_correction_strength" android:layout="@layout/preference_seekbar" android:title="ABLC Correction Strength" android:summary="1 = current Iris subtraction; 0.5 = half; 0 = calculate but apply no subtraction" android:defaultValue="1.0" app:minValue="0" app:maxValue="1.5" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_ablc_neutralization_strength" android:layout="@layout/preference_seekbar" android:title="ABLC Channel Neutralization" android:summary="1 = current Iris common-black channel safety; 0 = retain raw ABL channel deltas" android:defaultValue="1.0" app:minValue="0" app:maxValue="1" app:isFloat="true" app:stepPerUnit="20" />
+-        </PreferenceCategory>
+-        <PreferenceCategory android:layout="@layout/preference_category_layout" android:title="Adaptive Shadow &amp; Tone">
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="pref_motion_iq_shadow_recovery_enable" android:defaultValue="true" android:layout="@layout/preference_with_margin" android:title="Adaptive Shadow Recovery" android:summary="Uses the existing scene/stack/noise/highlight detector; does not alter physical HAL exposure" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_recovery_strength" android:layout="@layout/preference_seekbar" android:title="Shadow Recovery Strength" android:summary="Scales the scene-adaptive lower-mid recovery; 1 = current behavior" android:defaultValue="1.0" app:minValue="0" app:maxValue="3" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_max_lift_ev" android:layout="@layout/preference_seekbar" android:title="Max Shadow Lift EV" android:summary="Local safety ceiling. 6 EV is intentionally non-binding for the normal baseline." android:defaultValue="6.0" app:minValue="0" app:maxValue="6" app:isFloat="true" app:stepPerUnit="10" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_target_luma" android:layout="@layout/preference_seekbar" android:title="Shadow Target Luma" android:summary="Where the deep-shadow gate reaches full eligibility; current baseline 0.105" android:defaultValue="0.105" app:minValue="0.04" app:maxValue="0.20" app:isFloat="true" app:stepPerUnit="100" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_lower_mid_strength" android:layout="@layout/preference_seekbar" android:title="Lower-Mid Lift Strength" android:summary="Existing adaptive HDR generator parameter; baseline 1.35" android:defaultValue="1.35" app:minValue="0" app:maxValue="2.5" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_floor_protection" android:layout="@layout/preference_seekbar" android:title="Shadow Floor Protection" android:summary="Scales the current absolute-black gate. 1 = current; 0 lets the inspection path reach closer to black." android:defaultValue="1.0" app:minValue="0" app:maxValue="2" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_noise_stack_confidence" android:layout="@layout/preference_seekbar" android:title="Noise / Stack Confidence" android:summary="Scales existing deep-shadow recoverability. 1 = current evidence-aware behavior." android:defaultValue="1.0" app:minValue="0" app:maxValue="2" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_local_global_blend" android:layout="@layout/preference_seekbar" android:title="Local / Global Blend" android:summary="0 = extra recovery stays local; 1 = extra recovery also grants residual AE authority" android:defaultValue="0.0" app:minValue="0" app:maxValue="1" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_residual_ae_authority" android:layout="@layout/preference_seekbar" android:title="Residual AE Authority" android:summary="1 = current +/-10% display residual; 0 = exactly 1x; higher allows more late global assistance" android:defaultValue="1.0" app:minValue="0" app:maxValue="5" app:isFloat="true" app:stepPerUnit="10" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_inspection_boost" android:layout="@layout/preference_seekbar" android:title="Shadow Inspection Boost" android:summary="Diagnostic local lift to reveal hidden black holes/chroma without Lightroom. 0 = off." android:defaultValue="0.0" app:minValue="0" app:maxValue="1" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_shadow_color_safety" android:layout="@layout/preference_seekbar" android:title="Shadow Color Protection" android:summary="Existing near-black chroma protection; baseline 1.0" android:defaultValue="1.0" app:minValue="0" app:maxValue="1.5" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_chroma_preservation" android:layout="@layout/preference_seekbar" android:title="Chroma Preservation" android:summary="Existing HDR chroma preservation; baseline 1.0" android:defaultValue="1.0" app:minValue="0" app:maxValue="1.5" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_min_shadow_color_retention" android:layout="@layout/preference_seekbar" android:title="Minimum Shadow Color Retention" android:summary="Lowest retained chroma near black when protection is active; baseline 0.45" android:defaultValue="0.45" app:minValue="0.15" app:maxValue="1" app:isFloat="true" app:stepPerUnit="20" />
+-        </PreferenceCategory>
+-        <PreferenceCategory android:layout="@layout/preference_category_layout" android:title="Highlights">
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:key="pref_motion_iq_highlight_shoulder_enable" android:defaultValue="true" android:layout="@layout/preference_with_margin" android:title="Highlight Shoulder Enable" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_highlight_shoulder_start" android:layout="@layout/preference_seekbar" android:title="Highlight Shoulder Start" android:defaultValue="0.84" app:minValue="0.75" app:maxValue="0.98" app:isFloat="true" app:stepPerUnit="100" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_highlight_shoulder_strength" android:layout="@layout/preference_seekbar" android:title="Highlight Shoulder Strength" android:defaultValue="1.0" app:minValue="0" app:maxValue="1" app:isFloat="true" app:stepPerUnit="20" />
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_adaptive_highlight_compression" android:layout="@layout/preference_seekbar" android:title="Adaptive HDR Highlight Compression" android:summary="Existing scene-adaptive highlight strength; baseline 0.70" android:defaultValue="0.70" app:minValue="0" app:maxValue="2" app:isFloat="true" app:stepPerUnit="20" />
+-        </PreferenceCategory>
+-        <PreferenceCategory android:layout="@layout/preference_category_layout" android:title="Fusion">
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_fusionmap_regression_damping" android:layout="@layout/preference_seekbar" android:title="FusionMap Regression Damping" android:summary="0 = pre-26403 regression; 0.85 = 26403/26404 experiment" android:defaultValue="0.85" app:minValue="0" app:maxValue="1" app:isFloat="true" app:stepPerUnit="20" />
+-        </PreferenceCategory>
+-        <PreferenceCategory android:layout="@layout/preference_category_layout" android:title="Motion Denoise Override">
+-            <com.particlesdevs.photoncamera.ui.settings.custompreferences.MotionIqLabSeekBarPreference android:key="pref_motion_iq_esd_luma_scale" android:layout="@layout/preference_seekbar" android:title="Motion Luma Denoise Scale" android:summary="Scales the actual stack-adaptive Motion luma strength. 1 = current behavior." android:defaultValue="1.0" app:minValue="0" app:maxValue="2" app:isFloat="true" app:stepPerUnit="20" />
+-        </PreferenceCategory>
+-    </PreferenceScreen>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_theme_category_key" android:title="@string/theme">
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_theme_key" android:title="@string/theme" app:useSimpleSummaryProvider="true" android:icon="@drawable/ic_theme" android:entries="@array/theme_entries" android:entryValues="@array/theme_entryValues" android:defaultValue="@string/pref_theme_default_value" />
+-        <ListPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_theme_accent_key" android:title="@string/theme_accent" app:useSimpleSummaryProvider="true" android:icon="@drawable/ic_saturation" android:entries="@array/theme_accent_entries" android:entryValues="@array/theme_accent_entryValues" android:defaultValue="@string/pref_theme_accent_default_value" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference android:layout="@layout/preference_with_margin" android:key="@string/pref_show_gradient_key" android:title="@string/show_gradient" android:summary="" android:icon="@drawable/ic_gradient_black_24dp" android:defaultValue="@bool/pref_show_gradient_def_value" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_theme_category_key" ns0:title="@string/theme">
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_theme_key" ns0:title="@string/theme" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_theme" ns0:entries="@array/theme_entries" ns0:entryValues="@array/theme_entryValues" ns0:defaultValue="@string/pref_theme_default_value" />
++        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_theme_accent_key" ns0:title="@string/theme_accent" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_saturation" ns0:entries="@array/theme_accent_entries" ns0:entryValues="@array/theme_accent_entryValues" ns0:defaultValue="@string/pref_theme_accent_default_value" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_show_gradient_key" ns0:title="@string/show_gradient" ns0:summary="" ns0:icon="@drawable/ic_gradient_black_24dp" ns0:defaultValue="@bool/pref_show_gradient_def_value" />
+     </PreferenceCategory>
+-    <PreferenceScreen android:layout="@layout/preference_with_margin" android:title="Tunable Settings" android:summary="Advanced tunable parameters" android:key="pref_tunable_submenu" android:icon="@drawable/ic_tune_black_24dp">
+-        <!-- Tunable preferences will be added here dynamically -->
++    <PreferenceScreen ns0:layout="@layout/preference_with_margin" ns0:title="Tunable Settings" ns0:summary="Advanced tunable parameters" ns0:key="pref_tunable_submenu" ns0:icon="@drawable/ic_tune_black_24dp">
++        
+     </PreferenceScreen>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_device_key" android:title="@string/pref_category_device_key_title">
+-        <Preference android:layout="@layout/preference_with_margin" android:key="@string/pref_fetch_configurations_key" android:title="@string/fetch_configurations" android:summary="@string/fetch_configurations_summary" android:icon="@drawable/ic_refresh" android:persistent="false" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_device_key" ns0:title="@string/pref_category_device_key_title">
++        <Preference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_fetch_configurations_key" ns0:title="@string/fetch_configurations" ns0:summary="@string/fetch_configurations_summary" ns0:icon="@drawable/ic_refresh" ns0:persistent="false" />
+     </PreferenceCategory>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_backup_restore" android:title="@string/backup_restore">
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.BackupPreferences android:icon="@drawable/ic_save" android:layout="@layout/preference_with_margin" android:title="@string/backup" android:key="@string/pref_backup_preferences_key" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.RestorePreference android:icon="@drawable/ic_restore" android:layout="@layout/preference_with_margin" android:title="@string/restore" android:key="@string/pref_restore_preferences_key" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ResetPreferences android:icon="@drawable/ic_refresh" android:layout="@layout/preference_with_margin" android:title="@string/reset" android:key="@string/pref_reset_preferences_key" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_backup_restore" ns0:title="@string/backup_restore">
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.BackupPreferences ns0:icon="@drawable/ic_save" ns0:layout="@layout/preference_with_margin" ns0:title="@string/backup" ns0:key="@string/pref_backup_preferences_key" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.RestorePreference ns0:icon="@drawable/ic_restore" ns0:layout="@layout/preference_with_margin" ns0:title="@string/restore" ns0:key="@string/pref_restore_preferences_key" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ResetPreferences ns0:icon="@drawable/ic_refresh" ns0:layout="@layout/preference_with_margin" ns0:title="@string/reset" ns0:key="@string/pref_reset_preferences_key" />
+     </PreferenceCategory>
+-    <PreferenceCategory android:layout="@layout/preference_category_layout" android:key="@string/pref_category_about_key" android:title="@string/about">
+-        <PreferenceScreen android:layout="@layout/preference_with_margin" android:title="@string/about" android:key="@string/pref_about_key" android:icon="@drawable/ic_baseline_info_24">
+-            <Preference android:layout="@layout/preference_about" android:title="@string/app_name" android:summary="@string/photon_camera_summary" android:key="@string/pref_photoncamera" android:enabled="false" android:icon="@drawable/ic_splash"></Preference>
+-            <Preference android:key="@string/pref_version_key" android:title="@string/version_title" android:layout="@layout/preference_about" android:summary="@string/version_summary" android:enabled="false" />
+-            <Preference android:layout="@layout/preference_about" app:singleLineTitle="true" android:enabled="false" android:persistent="false" android:key="@string/pref_this_device_key" />
+-            <Preference android:layout="@layout/preference_about" android:key="@string/pref_contributors_key" android:icon="@drawable/ic_github" android:title="@string/contributors_title" android:summary="eszdman, assasinfil, killerink, mirai, Urnyx05, vibhorSrv, snajdovski" />
+-            <Preference android:layout="@layout/preference_about" android:title="@string/telegram" android:icon="@drawable/ic_telegram" android:key="@string/pref_telegram_channel_key" />
+-            <Preference android:layout="@layout/preference_about" android:title="@string/supported_devices" android:enabled="false" android:persistent="false" android:key="@string/all_devices_names" />
++    <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_about_key" ns0:title="@string/about">
++        <PreferenceScreen ns0:layout="@layout/preference_with_margin" ns0:title="@string/about" ns0:key="@string/pref_about_key" ns0:icon="@drawable/ic_baseline_info_24">
++            <Preference ns0:layout="@layout/preference_about" ns0:title="@string/app_name" ns0:summary="@string/photon_camera_summary" ns0:key="@string/pref_photoncamera" ns0:enabled="false" ns0:icon="@drawable/ic_splash" />
++            <Preference ns0:key="@string/pref_version_key" ns0:title="@string/version_title" ns0:layout="@layout/preference_about" ns0:summary="@string/version_summary" ns0:enabled="false" />
++            <Preference ns0:layout="@layout/preference_about" ns1:singleLineTitle="true" ns0:enabled="false" ns0:persistent="false" ns0:key="@string/pref_this_device_key" />
++            <Preference ns0:layout="@layout/preference_about" ns0:key="@string/pref_contributors_key" ns0:icon="@drawable/ic_github" ns0:title="@string/contributors_title" ns0:summary="eszdman, assasinfil, killerink, mirai, Urnyx05, vibhorSrv, snajdovski" />
++            <Preference ns0:layout="@layout/preference_about" ns0:title="@string/telegram" ns0:icon="@drawable/ic_telegram" ns0:key="@string/pref_telegram_channel_key" />
++            <Preference ns0:layout="@layout/preference_about" ns0:title="@string/supported_devices" ns0:enabled="false" ns0:persistent="false" ns0:key="@string/all_devices_names" />
+         </PreferenceScreen>
+     </PreferenceCategory>
+ </PreferenceScreen>
+\ No newline at end of file
+diff --git a/app/version.properties b/app/version.properties
+index a51a1042..d17381de 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726466
+-VERSION_BUILD=26466
++VERSION_NAME=0.9726479
++VERSION_BUILD=26479
