@@ -642,10 +642,10 @@ write(HDRX, t)
 t = read(RECON)
 # Method signature: tolerate whitespace but require exactly one public reconstruct.
 t = regex_once(t,
-    r"public static MotionV2Merger\.Result reconstruct\(\s*Point size,\s*List<ImageFrame> inputImages,\s*long referenceTimestamp,\s*Parameters parameters\) \{",
+    r"public static MotionV2Merger\.Result reconstruct\(\s*Point size,\s*ArrayList<ImageFrame> inputImages,\s*long referenceTimestamp,\s*Parameters parameters\) \{",
     """public static MotionV2Merger.Result reconstruct(
             Point size,
-            List<ImageFrame> inputImages,
+            ArrayList<ImageFrame> inputImages,
             long referenceTimestamp,
             Parameters parameters,
             ImageFrame shortHighlightFrame) {""",
