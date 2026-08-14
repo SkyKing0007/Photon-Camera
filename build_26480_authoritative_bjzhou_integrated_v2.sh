@@ -2,14 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="f56d9ce75c00f1dbccc2ecc8c030406a0c6ed26d"
+EXPECTED_PARENT="d63389429cfa7d5ce9a92f49b5cfcaa7d5c117ae"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-deferred-dng-anchor-fix"
+BACKUP_BRANCH="backup-26480-v2-before-dng-marker-boundary-fix"
 
 REPLAY_HASHES="26479_successful_after.sha256"
 PRECURSOR_26479="build_26479_authoritative_v10_workflow_object_guard_fix.sh"
@@ -20,7 +20,7 @@ POST="transform_26480_bjzhou_integrated_v2_post.py"
 
 REPLAY_HASHES_SHA="900729d32ddc3d621bd51f21ff6afde74d0e34a5531d9593a2c6bc8ecaa193e7"
 PRECURSOR_SHA="8e9efcc2c6c5bab636a8de2290ab234a38c15aa8c9f8414598aa7d52f5466969"
-POST_SHA="7f0d394191a7e62ece96594df71d5deff136614c1d0b2652036d399e4ded124d"
+POST_SHA="0fecdff9a00d34545e7f77522e248057f62ac2d9f2bffae8620326ad73d4239a"
 TRANSFORM_SHA="091a8e1222ca2de32f7ab8730d2cc975daaaee4f9e61405316e6907c34ecb06c"
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
@@ -54,7 +54,7 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 deferred-DNG anchor correction must be direct child of exact ArrayList scope-gate HEAD"
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 DNG marker-boundary correction must be direct child of exact deferred-DNG-anchor HEAD"
 [[ "$(git diff --name-only HEAD^ HEAD | sort)" == $'build_26480_authoritative_bjzhou_integrated_v2.sh
 transform_26480_bjzhou_integrated_v2_post.py' ]] || fail "26480 deferred-DNG anchor correction commit must change exactly guarded build script + V2 post-transform"
 git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 infrastructure is not descended from exact successful 26479 V10 head"

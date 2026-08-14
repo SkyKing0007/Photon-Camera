@@ -337,8 +337,24 @@ ins='''        selected = 0;
         Log.d(TAG, "White Level:" + processingParameters.whiteLevel);
 '''
 t=once(t,anchor,ins,'noise source hierarchy')
-# Replace 26479 immediate reference-DNG section (V1 left it) via marker-scoped regex.
-pat=r'''            /\*\n             \* IRIS_26450_MOTION_V2_REFERENCE_DNG.*?\n        \}\n        selected = 0;'''
+# Replace 26479 immediate reference-DNG section using deterministic marker boundaries.
+# Do not depend on indentation or an assumed number of closing braces.
+marker='IRIS_26450_MOTION_V2_REFERENCE_DNG'
+end_marker='\n        selected = 0;'
+if t.count(marker)!=1:
+    raise SystemExit('replace immediate Motion DNG marker count='+str(t.count(marker)))
+marker_pos=t.index(marker)
+block_start=t.rfind('            /*',0,marker_pos)
+if block_start<0:
+    raise SystemExit('replace immediate Motion DNG start marker missing')
+end_pos=t.find(end_marker,marker_pos)
+if end_pos<0:
+    raise SystemExit('replace immediate Motion DNG end marker missing')
+# Include exactly the ownership-closing brace immediately before selected=0.
+close_pos=t.rfind('\n        }',marker_pos,end_pos)
+if close_pos<0:
+    raise SystemExit('replace immediate Motion DNG ownership close missing')
+block_end=end_pos+len(end_marker)
 rep='''            /* IRIS_26480_DEFERRED_DNG_OUTPUT_V2 */
             iris26480DeferredDng = null;
             if (saveRAW >= 1) {
@@ -357,7 +373,8 @@ rep='''            /* IRIS_26480_DEFERRED_DNG_OUTPUT_V2 */
             }
         }
         selected = 0;'''
-t=rx(t,pat,rep,'replace immediate Motion DNG')
+t=t[:block_start]+rep+t[block_end:]
+print('26480 deferred DNG marker-boundary replacement PASS')
 # Queue DNG after JPEG saved.
 anchor='''        try {
             processingEventsListener.notifyImageSavedStatus(imageSaved, imageFile);
