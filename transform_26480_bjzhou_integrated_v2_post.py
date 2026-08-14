@@ -235,8 +235,25 @@ t=rx(t,r'''        boolean iris26480ShortRawReady = false;.*?        boolean iri
         boolean iris26480ShortGateReady=!mMotion26480ShortRequested||iris26480ShortRawReady
                 ||iris26480ShortDoneWithoutAcceptedFrame||iris26480ShortExpired;''','replace V1 poll gate')
 # Short frame and normal frame metadata use exact helper.
-t=rx(t,r'''                shortFrame\.motionV2ShortHighlightFrame = true;.*?                if \(frameResult != null\) \{\n                    android\.util\.Pair<Double, Double>\[\] np =.*?                \}\n''',
-     '''                populateMotion26480FrameMetadata(shortFrame, frameResult, true);\n''','short metadata helper')
+# Replace the whole nested V1 short metadata/noise block by semantic boundaries;
+# a non-greedy regex can stop inside the nested noise-profile loop.
+short_start='                shortFrame.motionV2ShortHighlightFrame = true;\n'
+short_end='                mExposures.put(shortFrame.timestamp, shortFrame.motionV2ExposureEnergy);\n'
+if t.count(short_start)!=1:
+    raise SystemExit('short metadata start count='+str(t.count(short_start)))
+ss=t.index(short_start)
+se=t.find(short_end,ss)
+if se<0:
+    raise SystemExit('short metadata end missing')
+short_rep='''                shortFrame.motionV2ActualExposureNs = shortExpNs;
+                shortFrame.motionV2ActualIso = shortIso;
+                shortFrame.motionV2ExposureEnergy = ExposureIndex.time2sec(shortExpNs) * shortIso;
+                populateMotion26480FrameMetadata(shortFrame, frameResult, true);
+                if (shortFrame.motionV2ExposureEnergy <= 0.0)
+                    shortFrame.motionV2ExposureEnergy = ExposureIndex.time2sec(shortExpNs) * shortIso;
+                if (frameResult != null) selectedResults.put(shortFrame.timestamp, frameResult);
+'''
+t=t[:ss]+short_rep+t[se:]
 t=once(t,'''            frame.motionV2ActualExposureNs = actualExposureNs;
             frame.motionV2ActualIso = actualIso;
             frame.motionV2ExposureEnergy = ExposureIndex.time2sec(actualExposureNs) * actualIso;
@@ -311,6 +328,7 @@ t=once(t,'''        ImageFrame iris26480ShortHighlightFrame = null;\n''','''    
 t=t.replace('candidate != null && candidate.motionV2ShortHighlightFrame',
             'candidate != null && candidate.motionV2FrameRole == ImageFrame.MotionV2FrameRole.HIGHLIGHT_SHORT',1)
 t=t.replace('IRIS_26480_SHORT_FRAME_SPLIT_BEFORE_WRONSKI_V1','IRIS_26480_SHORT_FRAME_SPLIT_BEFORE_WRONSKI_V2')
+t=t.replace('+ " shortInWronskiList=false");', '+ " shortInWronskiList=false short excluded from Wronski=true");', 1)
 # Noise source resolution after reference selection.
 anchor='''        selected = 0;
 
@@ -487,7 +505,6 @@ for label, needle in [
     ('UI checkpoint', ui_anchor),
     ('scratch close', summary_anchor),
     ('temporal covariance noise', 'glProg.setVar(\"noiseS\", noiseS);\n                        glProg.setVar(\"noiseO\", noiseO);'),
-    ('temporal robustness noise', 'glProg.setVar(\"noiseS\", noiseS);\n                                glProg.setVar(\"noiseO\", noiseO);'),
     ('V1 recovery marker', 'IRIS_26480_ALIGNED_SHORT_SENSOR_HIGHLIGHT_RECOVERY_V1'),
 ]:
     _need(label, needle)
@@ -500,7 +517,7 @@ anchor=seq_anchor
 rep='''            /* IRIS_26480_FRAME_SEQUENTIAL_SCRATCH_REUSE_V2 */
             GLTexture iris26480RawScratch=null,iris26480CfaScratch=null,iris26480WbCfaScratch=null;
             GLTexture iris26480CovScratch=null,iris26480RobustRawScratch=null,iris26480RobustMinScratch=null;
-            for (int i = 1; i < images.size(); i++) {
+            for (int i = 1; i < frameCount; i++) {
                 ImageFrame frame = images.get(i);
                 float[] iris26480Noise=iris26480FrameNoise(frame,noiseS,noiseO,canonicalGain);
                 final float iris26480FrameNoiseS=iris26480Noise[0],iris26480FrameNoiseO=iris26480Noise[1];
@@ -551,19 +568,39 @@ new='''                        if(iris26480CovScratch==null)iris26480CovScratch=
 t=once(t,old,new,'cov reuse')
 # Per-frame noise must be substituted ONLY inside the temporal loop.
 # The immutable reference covariance uses burst/reference noise and is intentionally preserved.
+# Exact 26479 robustness consumes an IPOL noiseCurve texture instead of scalar S/O.
 loop_marker='IRIS_26480_FRAME_SEQUENTIAL_SCRATCH_REUSE_V2'
 loop_pos=t.index(loop_marker)
 prefix=t[:loop_pos]; suffix=t[loop_pos:]
 old_cov='glProg.setVar("noiseS", noiseS);\n                        glProg.setVar("noiseO", noiseO);'
-old_rob='glProg.setVar("noiseS", noiseS);\n                                glProg.setVar("noiseO", noiseO);'
 if suffix.count(old_cov)<1:
     raise SystemExit('temporal covariance noise anchor missing')
-if suffix.count(old_rob)<1:
-    raise SystemExit('temporal robustness noise anchor missing')
 suffix=suffix.replace(old_cov,
     'glProg.setVar("noiseS", iris26480FrameNoiseS);\n                        glProg.setVar("noiseO", iris26480FrameNoiseO);',1)
-suffix=suffix.replace(old_rob,
-    'glProg.setVar("noiseS", iris26480FrameNoiseS);\n                                glProg.setVar("noiseO", iris26480FrameNoiseO);',1)
+rob_anchor='''                                glProg.useAssetProgram(
+                                        "motionv2/mfsr_robustness", true);
+'''
+rob_insert=rob_anchor+'''                                MotionV2IpolNoiseCurve.Curve iris26480FrameCurve =
+                                        MotionV2IpolNoiseCurve.build(
+                                                iris26480FrameNoiseS,
+                                                iris26480FrameNoiseO,
+                                                frame.buffer,
+                                                raw,
+                                                blackLevel,
+                                                (float) parameters.whiteLevel,
+                                                canonicalGain);
+                                iris26480FrameCurve.rgba32f.position(0);
+                                ipolNoiseCurveTexture.loadData(iris26480FrameCurve.rgba32f);
+                                Log.d(TAG, "IRIS_26480_PER_FRAME_ROBUSTNESS_NOISE"
+                                        + " frame=" + i
+                                        + " source=" + frame.motionV2NoiseProfileSource
+                                        + " noiseS=" + iris26480FrameNoiseS
+                                        + " noiseO=" + iris26480FrameNoiseO
+                                        + " ipolTextureReloaded=true");
+'''
+if suffix.count(rob_anchor)!=1:
+    raise SystemExit('per-frame IPOL robustness anchor count='+str(suffix.count(rob_anchor)))
+suffix=suffix.replace(rob_anchor,rob_insert,1)
 t=prefix+suffix
 # robustness reuse if exact V1/current allocation exists.
 old='''                            GLTexture mfsrRobustRaw = new GLTexture(
@@ -734,6 +771,14 @@ if 'readonly image2D referenceCfa' not in sh or 'readonly image2D shortCfa' not 
     raise SystemExit('image access qualifier contract')
 # No scene-specific speaker call.
 if re.findall(r'(?m)^\s{12,}iris26478LogSpeakerSupportEdges\(',rec): raise SystemExit('speaker diagnostic call remains')
+if 'shortFrame.motionV2NoiseS = (float)(sSum / n);' in cap:
+    raise SystemExit('stale nested V1 short-noise fragment remains')
+if 'short excluded from Wronski=true' not in hdr:
+    raise SystemExit('Wronski short-isolation proof marker missing')
+if 'IRIS_26480_PER_FRAME_ROBUSTNESS_NOISE' not in rec:
+    raise SystemExit('per-frame IPOL robustness-noise adaptation missing')
+if 'for (int i = 1; i < frameCount; i++)' not in rec:
+    raise SystemExit('exact frameCount temporal loop lost')
 print('26480 integrated V2 post-transform validation PASS')
 print('preview stability / RAW-only explicit role PASS')
 print('actual TET + 0.35EV short admission PASS')
