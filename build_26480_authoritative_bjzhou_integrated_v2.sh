@@ -2,14 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="c65de7591ea4f120991b89ce55363cf353f443bb"
+EXPECTED_PARENT="2807bf872ab3a955646eecb9ac7bbc26d1952d3f"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-reconstruct-arraylist-anchor-fix"
+BACKUP_BRANCH="backup-26480-v2-before-arraylist-scope-gate-fix"
 
 REPLAY_HASHES="26479_successful_after.sha256"
 PRECURSOR_26479="build_26479_authoritative_v10_workflow_object_guard_fix.sh"
@@ -54,7 +54,7 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 transform-anchor correction must be direct child of exact proven-procedure infrastructure HEAD"
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 ArrayList scope-gate correction must be direct child of exact ArrayList-anchor infrastructure HEAD"
 [[ "$(git diff --name-only HEAD^ HEAD | sort)" == "build_26480_authoritative_bjzhou_integrated_v2.sh" ]] || fail "26480 proven-procedure correction commit must change only guarded build script"
 git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 infrastructure is not descended from exact successful 26479 V10 head"
 [[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
