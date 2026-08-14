@@ -2,14 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="c594ee5733235bd6d3d53be0cb4b0ca316074d91"
+EXPECTED_PARENT="af3e658ae246d0e74f00671cb99c2e2e02a3299f"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-local-simulated-build-fix"
+BACKUP_BRANCH="backup-26480-v2-before-scoped-whitespace-fix"
 
 REPLAY_HASHES="26479_successful_after.sha256"
 PRECURSOR_26479="build_26479_authoritative_v10_workflow_object_guard_fix.sh"
@@ -20,7 +20,7 @@ POST="transform_26480_bjzhou_integrated_v2_post.py"
 
 REPLAY_HASHES_SHA="900729d32ddc3d621bd51f21ff6afde74d0e34a5531d9593a2c6bc8ecaa193e7"
 PRECURSOR_SHA="8e9efcc2c6c5bab636a8de2290ab234a38c15aa8c9f8414598aa7d52f5466969"
-POST_SHA="3fb9e395adbf712dc3052623536f057c7a598cc794c67bd3e46e0ac820fa0353"
+POST_SHA="4885d0efcfd318f079cfae20d2eee7581dd0c2dea89e6f0b84fb1d3f95ebbb79"
 TRANSFORM_SHA="091a8e1222ca2de32f7ab8730d2cc975daaaee4f9e61405316e6907c34ecb06c"
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
@@ -54,9 +54,9 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 local-simulated build correction must be direct child of exact full-reconstruction-preflight HEAD"
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 scoped-whitespace correction must be direct child of exact local-simulated-build HEAD"
 [[ "$(git diff --name-only HEAD^ HEAD | sort)" == $'build_26480_authoritative_bjzhou_integrated_v2.sh
-transform_26480_bjzhou_integrated_v2_post.py' ]] || fail "26480 local-simulated build correction commit must change exactly guarded build script + V2 post-transform"
+transform_26480_bjzhou_integrated_v2_post.py' ]] || fail "26480 scoped-whitespace correction commit must change exactly guarded build script + V2 post-transform"
 git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 infrastructure is not descended from exact successful 26479 V10 head"
 [[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
 for required in \
@@ -229,7 +229,13 @@ PY_SCOPE
 # Scoped whitespace proof: only 26480 deltas, never historical 26479 whitespace.
 while IFS= read -r rel; do
   if [[ -f "$PRE/$rel" && -f "$CAND/$rel" ]]; then
-    git diff --no-index --check -- "$PRE/$rel" "$CAND/$rel" >/dev/null || fail "26480 scoped whitespace check failed: $rel"
+    set +e
+    git diff --no-index --check -- "$PRE/$rel" "$CAND/$rel" >/dev/null 2>&1
+    rc=$?
+    set -e
+    # --no-index returns 1 for an ordinary clean content difference.
+    # Real --check errors add bit 2 (for example rc=3 for trailing whitespace).
+    [[ "$rc" -le 1 ]] || fail "26480 scoped whitespace check failed: $rel rc=$rc"
   fi
 done < "$TMP/allowed.txt"
 pass "26480 scoped whitespace proof"

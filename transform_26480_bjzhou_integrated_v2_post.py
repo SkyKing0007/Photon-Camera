@@ -216,7 +216,7 @@ t=t.replace('applyMotion26480ShortHighlightBiasIfNeeded()','applyMotion26480Expl
 t=rx(t,r'''\n\s*/\* IRIS_26480_SHORT_ACTUAL_METADATA_MATCH_V1 \*/.*?\n\s*while \(mZslResultMap\.size\(\) > MAX_ZSL_RESULT_METADATA\) \{''',
      '\n                    while (mZslResultMap.size() > MAX_ZSL_RESULT_METADATA) {','remove V1 preview-result short detector')
 # V1 restore calls are retired.
-t=t.replace('restoreMotion26480ShortHighlightBias();','')
+t=re.sub(r'^[ \t]*restoreMotion26480ShortHighlightBias\(\);[ \t]*\n','',t,flags=re.M)
 # Replace V1 poll timeout semantics with bounded optional short gate.
 t=rx(t,r'''        boolean iris26480ShortRawReady = false;.*?        boolean iris26480ShortGateReady = !mMotion26480ShortRequested\n                \|\| iris26480ShortRawReady;''',r'''        boolean iris26480ShortRawReady = false;
         if (mMotion26480ShortResultTimestampNs > 0L) {
