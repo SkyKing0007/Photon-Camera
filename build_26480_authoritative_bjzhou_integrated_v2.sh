@@ -2,13 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="028c77b6970801d2d360d45917f811286b6aaa39"
+EXPECTED_PARENT="093766319a95af2990ce1f67bd410ed2911f0850"
+EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-infrastructure-before-app-modification"
+BACKUP_BRANCH="backup-26480-v2-before-replay-bootstrap-fix"
 
 REPLAY_PATCH="26479_successful_source.patch"
 REPLAY_HASHES="26479_successful_after.sha256"
@@ -51,18 +52,22 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 infrastructure commit must be direct child of exact successful 26479 V10 head"
-EXPECTED_INFRA="$(printf '%s\n' \
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 replay-bootstrap correction must be direct child of exact V2 infrastructure commit"
+[[ "$(git rev-parse HEAD~2)" == "$EXPECTED_26479_V10" ]] || fail "26480 V2 infrastructure is not rooted directly on exact successful 26479 V10 head"
+EXPECTED_FIX_SCOPE="build_26480_authoritative_bjzhou_integrated_v2.sh"
+ACTUAL_FIX_SCOPE="$(git diff --name-only HEAD^ HEAD | sort)"
+[[ "$ACTUAL_FIX_SCOPE" == "$EXPECTED_FIX_SCOPE" ]] || { echo "ACTUAL:"; printf '%s\n' "$ACTUAL_FIX_SCOPE"; fail "26480 replay-bootstrap correction commit must change only the guarded build script"; }
+[[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
+for required in \
   '.github/workflows/build-26480-authoritative-bjzhou-integrated-v2.yml' \
   '26479_successful_after.sha256' \
   '26479_successful_source.patch' \
-  'build_26480_authoritative_bjzhou_integrated_v2.sh' \
   'transform_26480_bjzhou_integrated_v2.py' \
   'transform_26480_bjzhou_integrated_v2_post.py' \
-  'transform_26480_precursor_v1.py' | sort)"
-ACTUAL_INFRA="$(git diff --name-only HEAD^ HEAD | sort)"
-[[ "$ACTUAL_INFRA" == "$EXPECTED_INFRA" ]] || { echo "ACTUAL:"; printf '%s\n' "$ACTUAL_INFRA"; echo "EXPECTED:"; printf '%s\n' "$EXPECTED_INFRA"; fail "26480 infrastructure commit scope mismatch"; }
-[[ "$(git diff --name-only HEAD^ HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure commit directly changed app source"
+  'transform_26480_precursor_v1.py' \
+  'build_26479_authoritative_v10_workflow_object_guard_fix.sh'; do
+  [[ -f "$required" ]] || fail "required replay/build file missing: $required"
+done
 git cat-file -e "$EXPECTED_APP_BASE^{commit}" || fail "verified app base unavailable"
 git diff --quiet "$EXPECTED_APP_BASE" -- app/src/main app/version.properties || fail "committed app source differs from verified app base before guarded replay"
 
@@ -98,18 +103,38 @@ PRE="$TMP/exact-26479-before"
 cleanup(){
   set +e
   if [[ -d "$CAND" ]]; then git worktree remove --force "$CAND" >/dev/null 2>&1 || true; fi
+  if [[ -n "${HIST:-}" && -d "${HIST:-}" ]]; then git worktree remove --force "$HIST" >/dev/null 2>&1 || true; fi
   rm -rf "$TMP"
 }
 trap cleanup EXIT
 
-git worktree add --detach "$CAND" "$EXPECTED_APP_BASE" >/dev/null
+HIST="$TMP/historical-26479-v10-replay"
+git worktree add --detach "$HIST" "$EXPECTED_26479_V10" >/dev/null
+HIST_V10="$HIST/build_26479_authoritative_v10_workflow_object_guard_fix.sh"
+[[ -f "$HIST_V10" ]] || fail "historical exact V10 replay script missing"
+[[ "$(git -C "$HIST" hash-object build_26479_authoritative_v10_workflow_object_guard_fix.sh)" == "19ed813a7d1a7f6992147cb9df884da67156ad08" ]] || fail "historical V10 replay script blob mismatch"
+HIST_TRANSFORM_ONLY="$TMP/26479_v10_transform_only.sh"
+awk '/^rm -f \.\/\*\.apk$/ { exit } { print }' "$HIST_V10" > "$HIST_TRANSFORM_ONLY"
+grep -q 'python3 "$PORT_TRANSFORM" "$CAND79"' "$HIST_TRANSFORM_ONLY" || fail "historical V10 transform-only extraction ended before 26479 portability transform"
+! grep -q '^\./gradlew ' "$HIST_TRANSFORM_ONLY" || fail "historical transform-only replay unexpectedly contains Gradle"
+chmod +x "$HIST_TRANSFORM_ONLY"
 (
-  cd "$CAND"
-  git apply --check "$REPO/$REPLAY_PATCH"
-  git apply "$REPO/$REPLAY_PATCH"
+  cd "$HIST"
+  GITHUB_REF_NAME="$EXPECTED_BRANCH" bash "$HIST_TRANSFORM_ONLY"
   sha256sum -c "$REPO/$REPLAY_HASHES"
 )
-pass "exact successful 26479 source reconstructed in temporary worktree"
+pass "exact successful 26479 historical V10 replay including generated files PASS"
+
+git worktree add --detach "$CAND" "$EXPECTED_APP_BASE" >/dev/null
+rm -rf "$CAND/app/src/main"
+mkdir -p "$CAND/app/src"
+cp -a "$HIST/app/src/main" "$CAND/app/src/main"
+cp "$HIST/app/version.properties" "$CAND/app/version.properties"
+(
+  cd "$CAND"
+  sha256sum -c "$REPO/$REPLAY_HASHES"
+)
+pass "exact successful 26479 source reconstructed in temporary candidate worktree"
 
 mkdir -p "$PRE"
 while IFS= read -r rel; do
