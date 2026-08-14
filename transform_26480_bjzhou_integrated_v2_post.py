@@ -338,7 +338,7 @@ ins='''        selected = 0;
 '''
 t=once(t,anchor,ins,'noise source hierarchy')
 # Replace 26479 immediate reference-DNG section (V1 left it) via marker-scoped regex.
-pat=r'''            /\*\n             \* IRIS_26450_MOTION_V2_REFERENCE_DNG.*?\n            \}\n        \}\n        selected = 0;'''
+pat=r'''            /\*\n             \* IRIS_26450_MOTION_V2_REFERENCE_DNG.*?\n        \}\n        selected = 0;'''
 rep='''            /* IRIS_26480_DEFERRED_DNG_OUTPUT_V2 */
             iris26480DeferredDng = null;
             if (saveRAW >= 1) {
