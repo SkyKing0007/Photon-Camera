@@ -409,7 +409,7 @@ write(HDRX,t)
 
 # ---- Reconstruction: per-frame noise, sequential reuse, diagnostics, faithful recovery ----
 t=read(RECON)
-t=once(t,'public final class MotionV2CfaReconstruction {\n','''public final class MotionV2CfaReconstruction {
+t=once(t,'public final class MotionV2CfaReconstruction extends GLOneScript {\n','''public final class MotionV2CfaReconstruction extends GLOneScript {
     /* IRIS_26480_PER_FRAME_WRONSKI_NOISE_ADAPTATION_V2 */
     private static float[] iris26480FrameNoise(ImageFrame f,float fallbackS,float fallbackO,float gain){
         float s=fallbackS,o=fallbackO;if(f!=null&&f.motionV2NoiseProfileValid&&f.motionV2NoiseProfile.length>=8){
