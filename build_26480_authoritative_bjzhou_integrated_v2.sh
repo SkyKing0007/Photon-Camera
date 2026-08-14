@@ -2,23 +2,22 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="034f35a4f8e54eeaa3685202c30fc4fd4ea4a6d0"
+EXPECTED_PARENT="f28445b65c785e0a5f3c1b6f134581c0754529e3"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-direct-payload-followup"
+BACKUP_BRANCH="backup-26480-v2-before-proven-live-precursor-replay"
 
-REPLAY_PATCH="26479_successful_source.patch"
 REPLAY_HASHES="26479_successful_after.sha256"
-PAYLOAD_ROOT="26479_generated_payloads"
+PRECURSOR_26479="build_26479_authoritative_v10_workflow_object_guard_fix.sh"
+PRECURSOR_26479_BLOB="7a105dcb8f67cc530499c6db029c188e71972e40"
 TRANSFORM="transform_26480_bjzhou_integrated_v2.py"
 PRECURSOR="transform_26480_precursor_v1.py"
 POST="transform_26480_bjzhou_integrated_v2_post.py"
 
-REPLAY_PATCH_SHA="996aac3986f658663d23b53d698f4657f0c01c65c3f725de3fc362fde88ab417"
 REPLAY_HASHES_SHA="900729d32ddc3d621bd51f21ff6afde74d0e34a5531d9593a2c6bc8ecaa193e7"
 PRECURSOR_SHA="62f4716e402a5525416ae869c378342465d9b78cc5d3bea3b516096e86cd03aa"
 POST_SHA="6d61e5a4ea1a578c262b014a6af7333c59f476d89832870fabbbfa471744f143"
@@ -49,84 +48,42 @@ date -Iseconds || true
 
 # -------------------------------------------------------------------------
 # GATE 0: exact infrastructure lineage and package identity.
+# Proven 26472-26476 model: one infrastructure-only follow-up commit,
+# exact precursor identity, no committed app-source edits.
 # -------------------------------------------------------------------------
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 payload-followup must be direct child of exact direct-replay infrastructure HEAD"
-git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 V2 infrastructure is not descended from exact successful 26479 V10 head"
-cat > /tmp/26480_expected_infra_scope.txt <<'EOF_INFRA_SCOPE'
-build_26480_authoritative_bjzhou_integrated_v2.sh
-26479_generated_payloads/app/src/main/assets/shaders/motionv2/display_exposure.glsl
-26479_generated_payloads/app/src/main/assets/shaders/motionv2/mfsr_ica_reference_gradient.glsl
-26479_generated_payloads/app/src/main/assets/shaders/motionv2/mfsr_ica_reference_hessian.glsl
-26479_generated_payloads/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
-26479_generated_payloads/app/src/main/assets/shaders/motionv2/mfsr_pyramid_gaussian.glsl
-26479_generated_payloads/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
-26479_generated_payloads/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2DngColorShadow.java
-26479_generated_payloads/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2IpolNoiseCurve.java
-EOF_INFRA_SCOPE
-EXPECTED_FIX_SCOPE="$(sort /tmp/26480_expected_infra_scope.txt)"
-ACTUAL_FIX_SCOPE="$(git diff --name-only 8454c8ad4de25fbda0deee044aa3078d86b3db10 HEAD | sort)"
-[[ "$ACTUAL_FIX_SCOPE" == "$EXPECTED_FIX_SCOPE" ]] || { echo "ACTUAL:"; printf '%s\n' "$ACTUAL_FIX_SCOPE"; echo "EXPECTED:"; printf '%s\n' "$EXPECTED_FIX_SCOPE"; fail "26480 cumulative direct-replay infrastructure scope mismatch"; }
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 proven-procedure correction must be direct child of exact payload-followup infrastructure HEAD"
+[[ "$(git diff --name-only HEAD^ HEAD | sort)" == "build_26480_authoritative_bjzhou_integrated_v2.sh" ]] || fail "26480 proven-procedure correction commit must change only guarded build script"
+git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 infrastructure is not descended from exact successful 26479 V10 head"
 [[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
 for required in \
   '.github/workflows/build-26480-authoritative-bjzhou-integrated-v2.yml' \
   '26479_successful_after.sha256' \
-  '26479_successful_source.patch' \
+  'build_26479_authoritative_v10_workflow_object_guard_fix.sh' \
   'transform_26480_bjzhou_integrated_v2.py' \
   'transform_26480_bjzhou_integrated_v2_post.py' \
   'transform_26480_precursor_v1.py'; do
-  [[ -f "$required" ]] || fail "required replay/build file missing: $required"
+  [[ -f "$required" ]] || fail "required proven build file missing: $required"
 done
 git cat-file -e "$EXPECTED_APP_BASE^{commit}" || fail "verified app base unavailable"
 git diff --quiet "$EXPECTED_APP_BASE" -- app/src/main app/version.properties || fail "committed app source differs from verified app base before guarded replay"
 
-[[ -f "$REPLAY_PATCH" && "$(sha "$REPLAY_PATCH")" == "$REPLAY_PATCH_SHA" ]] || fail "26479 replay patch identity mismatch"
 [[ -f "$REPLAY_HASHES" && "$(sha "$REPLAY_HASHES")" == "$REPLAY_HASHES_SHA" ]] || fail "26479 replay hash manifest identity mismatch"
+[[ -f "$PRECURSOR_26479" && "$(git hash-object "$PRECURSOR_26479")" == "$PRECURSOR_26479_BLOB" ]] || fail "exact successful 26479 V10 precursor blob mismatch"
 [[ -f "$PRECURSOR" && "$(sha "$PRECURSOR")" == "$PRECURSOR_SHA" ]] || fail "26480 precursor identity mismatch"
 [[ -f "$POST" && "$(sha "$POST")" == "$POST_SHA" ]] || fail "26480 V2 post-transform identity mismatch"
 [[ -f "$TRANSFORM" && "$(sha "$TRANSFORM")" == "$TRANSFORM_SHA" ]] || fail "26480 integrated transform identity mismatch"
 python3 -m py_compile "$PRECURSOR" "$POST" "$TRANSFORM"
 bash -n "$0"
-# The eight files below were generated/untracked in the historical 26479 build,
-# so git diff could not carry them in 26479_successful_source.patch. They are
-# packaged here as byte-exact payloads and individually pinned to the successful
-# 26479 artifact/hash manifest. No historical build script is executed.
-cat > /tmp/26480_payload_hashes.txt <<'EOF_PAYLOAD_HASHES'
-a68be9b3e4658fdfcab3a322a5c1b918863c27c581b468d2e29b16bea23a39f8  app/src/main/assets/shaders/motionv2/display_exposure.glsl
-ce8e62025c7a7056bbf89c430dd21661ec3a804a033777ca2659f252fafd15ca  app/src/main/assets/shaders/motionv2/mfsr_ica_reference_gradient.glsl
-22ff5a07662d699eb6badcc375cf6851ff138a801a86800e8eee53d54224c52c  app/src/main/assets/shaders/motionv2/mfsr_ica_reference_hessian.glsl
-87f1a7e1880cfd6b15eada503cc5ffd5c227e369930a2587be294a1267fc3865  app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
-81d0a4647eaaa3af08c8b7dac0a146d5ff2724bb69467cb2421056ae36b329b1  app/src/main/assets/shaders/motionv2/mfsr_pyramid_gaussian.glsl
-cf6d4f433b74b8802ee1f8c4e9b2aef064ce51b02db690c43509d78a02e074ab  app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
-655b7e1580df03e36bc742264c5173ff45c9221fa3d671aea1b2cae869dfcdcf  app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2DngColorShadow.java
-2efaaccf54ee561e4c7061916ba72d9c13b1120522094587a66cb46d5b14c4d1  app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2IpolNoiseCurve.java
-EOF_PAYLOAD_HASHES
-(
-  cd "$PAYLOAD_ROOT"
-  sha256sum -c /tmp/26480_payload_hashes.txt
-) || fail "26479 generated payload identity proof failed"
-pass "eight exact successful-26479 generated payload hashes PASS"
+pass "exact branch/head/precursor/package identity gate"
 
-restore_exact_26479(){
-  local target="$1"
-  (
-    cd "$target"
-    git apply --check "$REPO/$REPLAY_PATCH"
-    git apply "$REPO/$REPLAY_PATCH"
-    while read -r expected rel; do
-      [[ -n "$rel" ]] || continue
-      mkdir -p "$(dirname "$rel")"
-      cp "$REPO/$PAYLOAD_ROOT/$rel" "$rel"
-      actual="$(sha256sum "$rel" | awk '{print $1}')"
-      [[ "$actual" == "$expected" ]] || fail "restored payload hash mismatch: $rel"
-    done < /tmp/26480_payload_hashes.txt
-    sha256sum -c "$REPO/$REPLAY_HASHES"
-  )
-}
-
-pass "exact branch/head/package identity gate"
+git diff --binary "$EXPECTED_APP_BASE" -- app/src/main app/version.properties > "$OUTDIR/26480_initial_pre_edit_binary.patch"
+find app/src/main -type f -print0 | sort -z | xargs -0 sha256sum > "$OUTDIR/26480_initial_protected.sha256"
+sha256sum app/version.properties >> "$OUTDIR/26480_initial_protected.sha256"
+pass "initial binary pre-edit patch created before source modification"
+pass "initial protected-file hashes captured before source modification"
 
 # -------------------------------------------------------------------------
 # GATE 1: backup branch BEFORE any candidate or live app-source modification.
@@ -143,7 +100,9 @@ REMOTE_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_BRANCH" | awk '{print 
 pass "exact pre-app-modification backup branch"
 
 # -------------------------------------------------------------------------
-# GATE 2: build a FULL temporary candidate first. Live app source stays clean.
+# GATE 2: reproduce exact successful 26479 on the LIVE checked-out branch,
+# using the SAME transform-only precursor pattern as successful 26472-26476.
+# No detached historical replay and no payload subsystem.
 # -------------------------------------------------------------------------
 TMP="$(mktemp -d)"
 CAND="$TMP/candidate-worktree"
@@ -155,34 +114,75 @@ cleanup(){
 }
 trap cleanup EXIT
 
-git worktree add --detach "$CAND" "$EXPECTED_APP_BASE" >/dev/null
-restore_exact_26479 "$CAND"
-pass "exact successful 26479 source reconstructed directly in temporary candidate worktree"
+V10_TRANSFORM_ONLY="$TMP/26479_v10_transform_only.sh"
+awk '/^rm -f \.\/\*\.apk$/ { exit } { print }' "$PRECURSOR_26479" > "$V10_TRANSFORM_ONLY"
+grep -q 'python3 "$PORT_TRANSFORM" "$CAND79"' "$V10_TRANSFORM_ONLY" || fail "26479 V10 transform-only extraction ended before portability transform"
+! grep -q '^\./gradlew ' "$V10_TRANSFORM_ONLY" || fail "26479 transform-only precursor unexpectedly contains Gradle"
 
-mkdir -p "$PRE"
-while IFS= read -r rel; do
-  mkdir -p "$PRE/$(dirname "$rel")"
-  cp "$CAND/$rel" "$PRE/$rel"
-done < <(find "$CAND/app/src/main" -type f -printf '%P\n' | sed 's#^#app/src/main/#' | sort)
-mkdir -p "$PRE/app"
-cp "$CAND/app/version.properties" "$PRE/app/version.properties"
-
-# TRUE pre-edit/recovery patch exists BEFORE any 26480 transform and before
-# any live app-source modification. Intent-to-add makes the eight historical
-# generated files part of the binary patch instead of silently omitting them.
-(
-  cd "$CAND"
-  git add -N app/src/main app/version.properties
-  git diff --binary "$EXPECTED_APP_BASE" -- app/src/main app/version.properties > "$REPO/$PRE_EDIT"
-  git reset -- app/src/main app/version.properties >/dev/null
+python3 - "$V10_TRANSFORM_ONLY" "$EXPECTED_PARENT" "$TMP/26479_precursor_outputs" <<'PY_V10_REWRITE'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]); t=p.read_text()
+old='EXPECTED_INFRA_PARENT="b74d76bbda3b0464142ba84a46e4e9692ba69fbf"'
+new='EXPECTED_INFRA_PARENT="'+sys.argv[2]+'"'
+if t.count(old)!=1:
+    raise SystemExit('26479 V10 EXPECTED_INFRA_PARENT anchor count='+str(t.count(old)))
+t=t.replace(old,new,1)
+old_out='OUTDIR="build_26479_outputs"'
+new_out='OUTDIR="'+sys.argv[3]+'"'
+if t.count(old_out)!=1:
+    raise SystemExit('26479 V10 OUTDIR anchor count='+str(t.count(old_out)))
+t=t.replace(old_out,new_out,1)
+start='BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"'
+end='pass "branch/head exact V10-on-V9 lineage gate"'
+i=t.find(start); j=t.find(end,i)
+if i<0 or j<0:
+    raise SystemExit('26479 V10 lineage gate anchors missing')
+j += len(end)
+replacement=(
+    'BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"\n'
+    '[[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"\n'
+    '[[ "$(git rev-parse HEAD^)" == "$EXPECTED_INFRA_PARENT" ]] || fail "26479 transform-only precursor parent mismatch"\n'
+    'pass "branch/head rewritten for proven transform-only precursor replay"'
 )
-[[ -s "$PRE_EDIT" ]] || fail "true exact-26479 pre-edit binary patch empty"
+t=t[:i]+replacement+t[j:]
+p.write_text(t)
+print('26479 V10 transform-only precursor rewrite: PASS')
+PY_V10_REWRITE
+chmod +x "$V10_TRANSFORM_ONLY"
+bash -n "$V10_TRANSFORM_ONLY" || fail "26479 V10 transform-only precursor syntax"
+bash "$V10_TRANSFORM_ONLY"
+
+grep -q '^VERSION_NAME=0\.9726479$' app/version.properties || fail "exact 26479 replay version"
+grep -q '^VERSION_BUILD=26479$' app/version.properties || fail "exact 26479 replay build"
+sha256sum -c "$REPLAY_HASHES" || fail "exact successful 26479 full hash manifest replay failed"
+find app/src/main -type f -print0 | sort -z | xargs -0 sha256sum > "$BEFORE_HASH"
+sha256sum app/version.properties >> "$BEFORE_HASH"
+cmp -s "$BEFORE_HASH" "$REPLAY_HASHES" || fail "live exact-26479 hash listing differs from authoritative successful manifest"
+pass "exact successful 26479 V10 source reproduced on checked-out experimental branch"
+
+git add -N app/src/main app/version.properties
+git diff --binary "$EXPECTED_APP_BASE" -- app/src/main app/version.properties > "$PRE_EDIT"
+git reset -- app/src/main app/version.properties >/dev/null
+[[ -s "$PRE_EDIT" ]] || fail "true 26480 pre-edit binary patch is empty"
+git apply --check --reverse "$PRE_EDIT" || fail "true 26480 pre-edit patch cannot reverse exact 26479 state"
+cp "$PRE_EDIT" "$OUTDIR/26480_candidate_pre_edit_binary.patch"
+pass "TRUE 26480 pre-edit binary patch created before 26480 source modification"
+
+mkdir -p "$PRE/app/src" "$PRE/app"
+cp -a app/src/main "$PRE/app/src/main"
+cp app/version.properties "$PRE/app/version.properties"
+
+git worktree add --detach "$CAND" "$CURRENT_HEAD" >/dev/null
+rm -rf "$CAND/app/src/main"
+mkdir -p "$CAND/app/src"
+cp -a app/src/main "$CAND/app/src/main"
+cp app/version.properties "$CAND/app/version.properties"
 (
   cd "$CAND"
-  git apply --check --reverse "$REPO/$PRE_EDIT"
-) || fail "true pre-edit patch cannot reverse exact reconstructed 26479 candidate"
-cp "$PRE_EDIT" "$OUTDIR/26480_candidate_pre_edit_binary.patch"
-pass "binary pre-edit/recovery patch created before 26480 source modification"
+  sha256sum -c "$REPO/$REPLAY_HASHES"
+) || fail "temporary candidate did not start from exact successful 26479"
+pass "temporary candidate starts from exact successful 26479"
 
 # Apply the single integrated transform. The V1 precursor is immediately
 # replaced by the V2 post-transform inside one process; V1 is never built.
@@ -414,16 +414,14 @@ pass "FULL TEMPORARY CANDIDATE GRADLE BUILD PASS"
 pass "Temporary-copy validation: PASS"
 
 # -------------------------------------------------------------------------
-# GATE 3: only now reconstruct exact 26479 in LIVE tree. The true binary
-# pre-edit/recovery patch was already created/proved from the exact temporary
-# 26479 candidate BEFORE this first live source modification.
+# GATE 3: temporary candidate already built successfully. LIVE tree remains
+# the exact 26479 precursor state established before the 26480 transform.
 # -------------------------------------------------------------------------
-restore_exact_26479 "$REPO"
 find app/src/main -type f -print0 | sort -z | xargs -0 sha256sum > "$BEFORE_HASH"
 sha256sum app/version.properties >> "$BEFORE_HASH"
-cmp -s "$BEFORE_HASH" "$REPLAY_HASHES" || fail "live exact-26479 hash listing differs from authoritative manifest"
+cmp -s "$BEFORE_HASH" "$REPLAY_HASHES" || fail "live exact-26479 state drifted during temporary candidate build"
 git apply --check --reverse "$PRE_EDIT" || fail "pre-edit binary patch cannot reverse live exact 26479"
-pass "LIVE exact successful 26479 reconstruction + pre-edit recovery proof PASS"
+pass "LIVE exact successful 26479 state + pre-edit recovery proof PASS"
 
 # Apply EXACT already-built candidate files, never rerun a transformation on live source.
 while IFS= read -r rel; do
@@ -469,7 +467,7 @@ echo "candidate/source validation PASS"
 echo "Temporary-copy validation: PASS"
 echo "PRE-BUILD SAFETY PROOF PASSED"
 echo "  exact backup branch before source modification PASS"
-echo "  direct exact successful 26479 patch+payload/hash manifest PASS"
+echo "  proven live-branch 26479 V10 transform-only precursor + full hash manifest PASS"
 echo "  candidate pre-edit patch before candidate modification PASS"
 echo "  full transformed temporary candidate Gradle build PASS"
 echo "  GLSL reserved-keyword/format/function-parameter scan PASS"
