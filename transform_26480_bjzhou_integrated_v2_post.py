@@ -415,7 +415,7 @@ rep='''        try {
                 old=android.os.Process.getThreadPriority(tid);android.os.Process.setThreadPriority(tid,android.os.Process.THREAD_PRIORITY_BACKGROUND);
                 dngBytes.position(0);boolean saved=ImageSaver.Util.saveStackedRaw(dngPath,dngBytes,dngParams);
                 processingEventsListener.notifyImageSavedStatus(saved,dngPath);Log.d(TAG,"IRIS_26480_DEFERRED_DNG_FINISHED saved="+saved);
-            }catch(Throwable e){Log.e(TAG,"IRIS_26480_DEFERRED_DNG_FAILED "+Log.getStackTraceString(e));}
+            }catch(Exception e){Log.e(TAG,"IRIS_26480_DEFERRED_DNG_FAILED "+Log.getStackTraceString(e));}
             finally{try{Allocator.free(dngBytes);}catch(Throwable ignored){}if(old!=null)try{android.os.Process.setThreadPriority(android.os.Process.myTid(),old);}catch(Throwable ignored){}}});
             iris26480DeferredDng=null;
         }
@@ -436,6 +436,64 @@ t=once(t,'public final class MotionV2CfaReconstruction extends GLOneScript {\n',
         return new float[]{Math.max(s,1e-7f)*gain,Math.max(o,1e-8f)*gain*gain};
     }
 ''','noise helper')
+# Explicitly carry wrapper-owned reference/short frames into the GL script Run() scope.
+field_anchor='''    private final ArrayList<ImageFrame> images;
+    private final long referenceTimestamp;
+'''
+field_rep='''    private final ArrayList<ImageFrame> images;
+    private final long referenceTimestamp;
+    /* IRIS_26480_RECON_FRAME_OWNERSHIP_V3 */
+    private final ImageFrame referenceFrame;
+    private final ImageFrame shortHighlightFrame;
+'''
+t=once(t,field_anchor,field_rep,'reconstruction owned frame fields')
+ctor_anchor='''            ArrayList<ImageFrame> orderedImages,
+            long referenceTimestamp,
+            Parameters parameters) {
+'''
+ctor_rep='''            ArrayList<ImageFrame> orderedImages,
+            long referenceTimestamp,
+            Parameters parameters,
+            ImageFrame referenceFrame,
+            ImageFrame shortHighlightFrame) {
+'''
+t=once(t,ctor_anchor,ctor_rep,'reconstruction constructor frame args')
+assign_anchor='''        this.images = orderedImages;
+        this.referenceTimestamp = referenceTimestamp;
+        this.parameters = parameters;
+'''
+assign_rep='''        this.images = orderedImages;
+        this.referenceTimestamp = referenceTimestamp;
+        this.referenceFrame = referenceFrame;
+        this.shortHighlightFrame = shortHighlightFrame;
+        this.parameters = parameters;
+'''
+t=once(t,assign_anchor,assign_rep,'reconstruction constructor frame ownership')
+call_anchor='''            script = new MotionV2CfaReconstruction(
+                    size, ordered, referenceTimestamp, parameters);
+'''
+call_rep='''            script = new MotionV2CfaReconstruction(
+                    size, ordered, referenceTimestamp, parameters, reference, shortHighlightFrame);
+'''
+t=once(t,call_anchor,call_rep,'reconstruction constructor frame pass')
+# Wrapper is the lifetime owner of the separate short frame; Run() only borrows it.
+close_anchor='''            for (ImageFrame frame : inputImages) {
+                if (frame != null) {
+                    try { frame.close(); } catch (Throwable ignored) {}
+                }
+            }
+'''
+close_rep='''            for (ImageFrame frame : inputImages) {
+                if (frame != null) {
+                    try { frame.close(); } catch (Throwable ignored) {}
+                }
+            }
+            if (shortHighlightFrame != null && !inputImages.contains(shortHighlightFrame)) {
+                try { shortHighlightFrame.close(); } catch (Throwable ignored) {}
+            }
+'''
+t=once(t,close_anchor,close_rep,'short frame wrapper ownership close')
+
 # V1 marker -> V2
 t=t.replace('IRIS_26480_DISABLE_SPEAKER_EDGE_DIAGNOSTIC_V1','IRIS_26480_DISABLE_SPEAKER_EDGE_DIAGNOSTIC_V2')
 # Diagnostic support readback off.
@@ -665,12 +723,12 @@ recovery='''            /* IRIS_26480_BJZHOU_RCD_BENTO_SHORT_RECOVERY_V2 */
             GLTexture iris26480ReadbackOutput=imageOutput,iris26480ShortRaw=null,iris26480ShortCfa=null;
             GLTexture iris26480ShortWbCfa=null,iris26480Recovered=null;MotionV2Alignment.Result iris26480ShortAlignment=null;
             try{
-                if(directBayer&&shortHighlightFrame!=null&&shortHighlightFrame.buffer!=null&&reference!=null
-                        &&reference.motionV2ExposureEnergy>0.0&&shortHighlightFrame.motionV2ExposureEnergy>0.0
-                        &&shortHighlightFrame.motionV2ExposureEnergy<reference.motionV2ExposureEnergy
+                if(directBayer&&shortHighlightFrame!=null&&shortHighlightFrame.buffer!=null&&referenceFrame!=null
+                        &&referenceFrame.motionV2ExposureEnergy>0.0&&shortHighlightFrame.motionV2ExposureEnergy>0.0
+                        &&shortHighlightFrame.motionV2ExposureEnergy<referenceFrame.motionV2ExposureEnergy
                         &&wronskiPreparedAlignment!=null){
                     float shortToNormalScale=(float)Math.max(1.0,Math.min(8.0,
-                            reference.motionV2ExposureEnergy/shortHighlightFrame.motionV2ExposureEnergy));
+                            referenceFrame.motionV2ExposureEnergy/shortHighlightFrame.motionV2ExposureEnergy));
                     iris26480ShortRaw=new GLTexture(raw,new GLFormat(GLFormat.DataType.UNSIGNED_16,1),
                             shortHighlightFrame.buffer,GL_NEAREST,GL_CLAMP_TO_EDGE);
                     iris26480ShortCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
@@ -700,10 +758,22 @@ recovery='''            /* IRIS_26480_BJZHOU_RCD_BENTO_SHORT_RECOVERY_V2 */
             }finally{
                 if(iris26480ShortAlignment!=null)iris26480ShortAlignment.close();if(iris26480ShortWbCfa!=null)iris26480ShortWbCfa.close();
                 if(iris26480ShortCfa!=null)iris26480ShortCfa.close();if(iris26480ShortRaw!=null)iris26480ShortRaw.close();
-                if(iris26480Recovered!=null)iris26480Recovered.close();if(shortHighlightFrame!=null)shortHighlightFrame.close();
+                if(iris26480Recovered!=null)iris26480Recovered.close();
             }
 '''
 t=t[:m.start()]+recovery+t[m.end():]
+for marker in [
+    'IRIS_26480_RECON_FRAME_OWNERSHIP_V3',
+    'private final ImageFrame referenceFrame;',
+    'private final ImageFrame shortHighlightFrame;',
+    'parameters, reference, shortHighlightFrame);',
+    'referenceFrame.motionV2ExposureEnergy',
+]:
+    if marker not in t:
+        raise SystemExit('26480 compile-regression guard missing: '+marker)
+if 'if(shortHighlightFrame!=null)shortHighlightFrame.close();' in t:
+    raise SystemExit('26480 compile-regression guard: Run() must not own short frame close')
+print('26480 reconstruction frame-scope compile preflight PASS')
 write(RECON,t)
 
 # ---- overwrite recovery shader with bjzhou RCD-domain opposed-color math ----

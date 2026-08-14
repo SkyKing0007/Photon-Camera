@@ -2,14 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="afe83c42fdbda06ca113ed3429a48ce463d90c6b"
+EXPECTED_PARENT="2a88086a783e83b2e10250e29eaca015a376af94"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-physical-threshold-guard-fix"
+BACKUP_BRANCH="backup-26480-v2-before-java-compile-ownership-fix"
 
 REPLAY_HASHES="26479_successful_after.sha256"
 PRECURSOR_26479="build_26479_authoritative_v10_workflow_object_guard_fix.sh"
@@ -20,7 +20,7 @@ POST="transform_26480_bjzhou_integrated_v2_post.py"
 
 REPLAY_HASHES_SHA="900729d32ddc3d621bd51f21ff6afde74d0e34a5531d9593a2c6bc8ecaa193e7"
 PRECURSOR_SHA="8e9efcc2c6c5bab636a8de2290ab234a38c15aa8c9f8414598aa7d52f5466969"
-POST_SHA="4885d0efcfd318f079cfae20d2eee7581dd0c2dea89e6f0b84fb1d3f95ebbb79"
+POST_SHA="47287986519daab36a244c2cc9cbadffe478395f4465662b9068362fa0e1d9c9"
 TRANSFORM_SHA="091a8e1222ca2de32f7ab8730d2cc975daaaee4f9e61405316e6907c34ecb06c"
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
@@ -54,8 +54,8 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 physical-threshold guard correction must be direct child of exact scoped-whitespace HEAD"
-[[ "$(git diff --name-only HEAD^ HEAD | sort)" == 'build_26480_authoritative_bjzhou_integrated_v2.sh' ]] || fail "26480 physical-threshold guard correction commit must change exactly guarded build script"
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 Java compile ownership correction must be direct child of exact physical-threshold HEAD"
+[[ "$(git diff --name-only HEAD^ HEAD | sort)" == $'build_26480_authoritative_bjzhou_integrated_v2.sh\ntransform_26480_bjzhou_integrated_v2_post.py' ]] || fail "26480 Java compile ownership correction commit must change exactly guarded build script + V2 post-transform"
 git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 infrastructure is not descended from exact successful 26479 V10 head"
 [[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
 for required in \
@@ -318,6 +318,17 @@ grep -Eq 'highlightCeiling"[[:space:]]*,[[:space:]]*8\.0f' "$RECON" || fail "8x 
 # Wronski normal merge remains isolated from short frame.
 grep -q 'role=HIGHLIGHT_SHORT' "$CAP" || fail "short capture role missing"
 grep -q 'short excluded from Wronski' "$HDRX" || fail "short/Wronski isolation proof missing"
+
+# Java compile-scope/API regression proof for 26480 generated ownership.
+grep -q 'IRIS_26480_RECON_FRAME_OWNERSHIP_V3' "$RECON" || fail "reconstruction frame ownership marker missing"
+grep -q 'private final ImageFrame referenceFrame;' "$RECON" || fail "reference frame field missing"
+grep -q 'private final ImageFrame shortHighlightFrame;' "$RECON" || fail "short highlight field missing"
+grep -q 'parameters, reference, shortHighlightFrame);' "$RECON" || fail "reconstruction constructor ownership pass missing"
+grep -q 'referenceFrame.motionV2ExposureEnergy' "$RECON" || fail "recovery does not use owned reference frame"
+grep -q 'catch(Exception e){Log.e(TAG,"IRIS_26480_DEFERRED_DNG_FAILED "+Log.getStackTraceString(e));}' "$HDRX" || fail "deferred DNG Log API catch type incompatible"
+! grep -q 'catch(Throwable e){Log.e(TAG,"IRIS_26480_DEFERRED_DNG_FAILED "+Log.getStackTraceString(e));}' "$HDRX" || fail "stale Throwable/Log API compile failure remains"
+! grep -q 'if(shortHighlightFrame!=null)shortHighlightFrame.close();' "$RECON" || fail "Run() still closes wrapper-owned short frame"
+pass "26480 Java compile ownership/API proof"
 for marker in \
   IRIS_26477_STRICT_WRONSKI_SENSOR_AUTHORITY \
   IRIS_26477_WRONSKI_NOISE_AUTHORITY \
