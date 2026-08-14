@@ -2,14 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="af3e658ae246d0e74f00671cb99c2e2e02a3299f"
+EXPECTED_PARENT="afe83c42fdbda06ca113ed3429a48ce463d90c6b"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-scoped-whitespace-fix"
+BACKUP_BRANCH="backup-26480-v2-before-physical-threshold-guard-fix"
 
 REPLAY_HASHES="26479_successful_after.sha256"
 PRECURSOR_26479="build_26479_authoritative_v10_workflow_object_guard_fix.sh"
@@ -54,9 +54,8 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 scoped-whitespace correction must be direct child of exact local-simulated-build HEAD"
-[[ "$(git diff --name-only HEAD^ HEAD | sort)" == $'build_26480_authoritative_bjzhou_integrated_v2.sh
-transform_26480_bjzhou_integrated_v2_post.py' ]] || fail "26480 scoped-whitespace correction commit must change exactly guarded build script + V2 post-transform"
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 physical-threshold guard correction must be direct child of exact scoped-whitespace HEAD"
+[[ "$(git diff --name-only HEAD^ HEAD | sort)" == 'build_26480_authoritative_bjzhou_integrated_v2.sh' ]] || fail "26480 physical-threshold guard correction commit must change exactly guarded build script"
 git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 infrastructure is not descended from exact successful 26479 V10 head"
 [[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
 for required in \
@@ -313,8 +312,8 @@ grep -q '0.5\*(rr+rg)' "$SHORT" || fail "RCD opposed blue reconstruction missing
 grep -q 'highlightClipThreshold' "$SHORT" || fail "RCD clip threshold uniform missing"
 grep -q 'highlightCeiling' "$SHORT" || fail "RCD reconstruction ceiling missing"
 grep -q 'IRIS_26480_BJZHOU_RCD_BENTO_SHORT_RECOVERY' "$RECON" || fail "short recovery integration missing"
-grep -q 'highlightClipThreshold", 0.985f' "$RECON" || fail "0.985 physical clip threshold missing"
-grep -q 'highlightCeiling", 8.0f' "$RECON" || fail "8x calculation ceiling missing"
+grep -Eq 'highlightClipThreshold"[[:space:]]*,[[:space:]]*0\.985f' "$RECON" || fail "0.985 physical clip threshold missing"
+grep -Eq 'highlightCeiling"[[:space:]]*,[[:space:]]*8\.0f' "$RECON" || fail "8x calculation ceiling missing"
 
 # Wronski normal merge remains isolated from short frame.
 grep -q 'role=HIGHLIGHT_SHORT' "$CAP" || fail "short capture role missing"
