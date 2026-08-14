@@ -2,14 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="8454c8ad4de25fbda0deee044aa3078d86b3db10"
+EXPECTED_PARENT="034f35a4f8e54eeaa3685202c30fc4fd4ea4a6d0"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-direct-26479-replay"
+BACKUP_BRANCH="backup-26480-v2-before-direct-payload-followup"
 
 REPLAY_PATCH="26479_successful_source.patch"
 REPLAY_HASHES="26479_successful_after.sha256"
@@ -53,10 +53,8 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 direct-replay correction must be direct child of exact blob-fix infrastructure HEAD"
-[[ "$(git rev-parse HEAD~2)" == "c4ccb0bd3ddc224de7dad10d5ffd682ac3097988" ]] || fail "26480 direct-replay chain missing exact replay-bootstrap fix"
-[[ "$(git rev-parse HEAD~3)" == "093766319a95af2990ce1f67bd410ed2911f0850" ]] || fail "26480 direct-replay chain missing exact original V2 infrastructure commit"
-[[ "$(git rev-parse HEAD~4)" == "$EXPECTED_26479_V10" ]] || fail "26480 V2 infrastructure is not rooted directly on exact successful 26479 V10 head"
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 payload-followup must be direct child of exact direct-replay infrastructure HEAD"
+git merge-base --is-ancestor "$EXPECTED_26479_V10" HEAD || fail "26480 V2 infrastructure is not descended from exact successful 26479 V10 head"
 cat > /tmp/26480_expected_infra_scope.txt <<'EOF_INFRA_SCOPE'
 build_26480_authoritative_bjzhou_integrated_v2.sh
 26479_generated_payloads/app/src/main/assets/shaders/motionv2/display_exposure.glsl
@@ -69,8 +67,8 @@ build_26480_authoritative_bjzhou_integrated_v2.sh
 26479_generated_payloads/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2IpolNoiseCurve.java
 EOF_INFRA_SCOPE
 EXPECTED_FIX_SCOPE="$(sort /tmp/26480_expected_infra_scope.txt)"
-ACTUAL_FIX_SCOPE="$(git diff --name-only HEAD^ HEAD | sort)"
-[[ "$ACTUAL_FIX_SCOPE" == "$EXPECTED_FIX_SCOPE" ]] || { echo "ACTUAL:"; printf '%s\n' "$ACTUAL_FIX_SCOPE"; echo "EXPECTED:"; printf '%s\n' "$EXPECTED_FIX_SCOPE"; fail "26480 direct-replay correction commit scope mismatch"; }
+ACTUAL_FIX_SCOPE="$(git diff --name-only 8454c8ad4de25fbda0deee044aa3078d86b3db10 HEAD | sort)"
+[[ "$ACTUAL_FIX_SCOPE" == "$EXPECTED_FIX_SCOPE" ]] || { echo "ACTUAL:"; printf '%s\n' "$ACTUAL_FIX_SCOPE"; echo "EXPECTED:"; printf '%s\n' "$EXPECTED_FIX_SCOPE"; fail "26480 cumulative direct-replay infrastructure scope mismatch"; }
 [[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
 for required in \
   '.github/workflows/build-26480-authoritative-bjzhou-integrated-v2.yml' \
