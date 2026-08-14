@@ -2,14 +2,14 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_PARENT="093766319a95af2990ce1f67bd410ed2911f0850"
+EXPECTED_PARENT="c4ccb0bd3ddc224de7dad10d5ffd682ac3097988"
 EXPECTED_26479_V10="028c77b6970801d2d360d45917f811286b6aaa39"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 NEW_VERSION="0.9726480"
 NEW_BUILD="26480"
 OUTDIR="build_26480_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-bjzhou-integrated-motion-v2-debug.apk"
-BACKUP_BRANCH="backup-26480-v2-before-replay-bootstrap-fix"
+BACKUP_BRANCH="backup-26480-v2-before-replay-bootstrap-blob-fix"
 
 REPLAY_PATCH="26479_successful_source.patch"
 REPLAY_HASHES="26479_successful_after.sha256"
@@ -52,11 +52,12 @@ date -Iseconds || true
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 CURRENT_HEAD="$(git rev-parse HEAD)"
-[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 replay-bootstrap correction must be direct child of exact V2 infrastructure commit"
-[[ "$(git rev-parse HEAD~2)" == "$EXPECTED_26479_V10" ]] || fail "26480 V2 infrastructure is not rooted directly on exact successful 26479 V10 head"
+[[ "$(git rev-parse HEAD^)" == "$EXPECTED_PARENT" ]] || fail "26480 blob-identity correction must be direct child of exact replay-bootstrap fix commit"
+[[ "$(git rev-parse HEAD~2)" == "093766319a95af2990ce1f67bd410ed2911f0850" ]] || fail "26480 blob-fix chain missing exact original V2 infrastructure commit"
+[[ "$(git rev-parse HEAD~3)" == "$EXPECTED_26479_V10" ]] || fail "26480 V2 infrastructure is not rooted directly on exact successful 26479 V10 head"
 EXPECTED_FIX_SCOPE="build_26480_authoritative_bjzhou_integrated_v2.sh"
 ACTUAL_FIX_SCOPE="$(git diff --name-only HEAD^ HEAD | sort)"
-[[ "$ACTUAL_FIX_SCOPE" == "$EXPECTED_FIX_SCOPE" ]] || { echo "ACTUAL:"; printf '%s\n' "$ACTUAL_FIX_SCOPE"; fail "26480 replay-bootstrap correction commit must change only the guarded build script"; }
+[[ "$ACTUAL_FIX_SCOPE" == "$EXPECTED_FIX_SCOPE" ]] || { echo "ACTUAL:"; printf '%s\n' "$ACTUAL_FIX_SCOPE"; fail "26480 blob-identity correction commit must change only the guarded build script"; }
 [[ "$(git diff --name-only "$EXPECTED_26479_V10" HEAD -- app/src/main app/version.properties | wc -l)" -eq 0 ]] || fail "26480 infrastructure chain directly changed app source"
 for required in \
   '.github/workflows/build-26480-authoritative-bjzhou-integrated-v2.yml' \
@@ -112,7 +113,7 @@ HIST="$TMP/historical-26479-v10-replay"
 git worktree add --detach "$HIST" "$EXPECTED_26479_V10" >/dev/null
 HIST_V10="$HIST/build_26479_authoritative_v10_workflow_object_guard_fix.sh"
 [[ -f "$HIST_V10" ]] || fail "historical exact V10 replay script missing"
-[[ "$(git -C "$HIST" hash-object build_26479_authoritative_v10_workflow_object_guard_fix.sh)" == "19ed813a7d1a7f6992147cb9df884da67156ad08" ]] || fail "historical V10 replay script blob mismatch"
+[[ "$(git -C "$HIST" hash-object build_26479_authoritative_v10_workflow_object_guard_fix.sh)" == "7a105dcb8f67cc530499c6db029c188e71972e40" ]] || fail "historical V10 replay script blob mismatch"
 HIST_TRANSFORM_ONLY="$TMP/26479_v10_transform_only.sh"
 awk '/^rm -f \.\/\*\.apk$/ { exit } { print }' "$HIST_V10" > "$HIST_TRANSFORM_ONLY"
 grep -q 'python3 "$PORT_TRANSFORM" "$CAND79"' "$HIST_TRANSFORM_ONLY" || fail "historical V10 transform-only extraction ended before 26479 portability transform"
