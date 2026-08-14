@@ -2,7 +2,7 @@
 set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-EXPECTED_INFRA_PARENT="be24c16cb091e753852b900384dbde6f8d32744e"
+EXPECTED_INFRA_PARENT="a5fa756f8b5cf1101e807b776728d08225f3e53e"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 
 BACKUP_BRANCH="backup-26477-v3-before-26478-pure-wronski-highlight-safe"
@@ -32,14 +32,16 @@ HASH_26477="$OUTDIR/26478_exact_26477.sha256"
 HASH_AFTER="$OUTDIR/26478_after.sha256"
 
 exec > >(tee "$AUDIT") 2>&1
-echo "=== 26478 V3 AUTHORITATIVE PURE WRONSKI + HIGHLIGHT-SAFE + SPEAKER DIAGNOSTIC ==="
+echo "=== 26478 V3 CORRECTED AUTHORITATIVE PURE WRONSKI + HIGHLIGHT-SAFE + SPEAKER DIAGNOSTIC ==="
 date -Iseconds || true
 
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $BRANCH"
 [[ "$(git rev-parse HEAD^)" == "$EXPECTED_INFRA_PARENT" ]] || \
-  fail "26478 infrastructure commit must be direct child of exact 26477 V3"
-pass "branch/head lineage gate"
+  fail "26478 correction commit must be direct child of exact failed infrastructure commit"
+[[ "$(git rev-parse HEAD~2)" == "be24c16cb091e753852b900384dbde6f8d32744e" ]] || \
+  fail "26478 correction chain must descend exactly from 26477 V3"
+pass "branch/head two-commit lineage gate"
 
 REMOTE_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_BRANCH" | awk '{print $1}')"
 [[ "$REMOTE_BACKUP" == "$BACKUP_TARGET" ]] || \
@@ -341,7 +343,7 @@ echo "  git diff --check PASS"
 echo "  version/build increment in same guarded Gradle script PASS"
 
 cat > "$REPORT" <<EOF
-26478 AUTHORITATIVE PURE WRONSKI + HIGHLIGHT-SAFE + SPEAKER DIAGNOSTIC
+26478 V3 CORRECTED AUTHORITATIVE PURE WRONSKI + HIGHLIGHT-SAFE + SPEAKER DIAGNOSTIC
 ========================================================================
 Rollback:
   $BACKUP_BRANCH -> $BACKUP_TARGET
