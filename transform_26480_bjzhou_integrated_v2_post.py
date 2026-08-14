@@ -423,10 +423,80 @@ t=t.replace('IRIS_26480_DISABLE_SPEAKER_EDGE_DIAGNOSTIC_V1','IRIS_26480_DISABLE_
 # Diagnostic support readback off.
 t=t.replace('if (directBayer && currentDirectSupport != null) {',
             'if (false && /* IRIS_26480_DISABLE_DIRECT_SUPPORT_GPU_READBACK_V2 */ directBayer && currentDirectSupport != null) {',1)
-# Sequential declarations before loop.
-anchor='''            for (int i = 1; i < images.size(); i++) {
+# Comprehensive exact-26479 reconstruction preflight.
+# Validate the full remaining anchor set BEFORE mutating this section so one CI run
+# reports all compatibility problems instead of failing one anchor at a time.
+_preflight = []
+def _need(label, needle, minimum=1):
+    count = t.count(needle)
+    if count < minimum:
+        _preflight.append(f'{label}: count={count} expected>={minimum}')
+
+seq_anchor='''            for (int i = 1; i < frameCount; i++) {
                 ImageFrame frame = images.get(i);
 '''
+raw_cfa_anchor='''                    rawInput = new GLTexture(
+                            raw,
+                            new GLFormat(GLFormat.DataType.UNSIGNED_16, 1),
+                            frame.buffer,
+                            GL_NEAREST,
+                            GL_CLAMP_TO_EDGE);
+                    alterCfa = new GLTexture(
+                            rawHalf,
+                            new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+                            null,
+                            GL_NEAREST,
+                            GL_CLAMP_TO_EDGE);
+'''
+wb_anchor='''                        wronskiAlterCfa = new GLTexture(
+                                rawHalf,
+                                new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+                                null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+'''
+cov_anchor='''                        wronskiAlterCov = new GLTexture(
+                                rawHalf,
+                                new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                                null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+'''
+robust_anchor='''                            GLTexture mfsrRobustRaw = new GLTexture(
+                                    raw,
+                                    new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+                                    null,
+                                    GL_NEAREST,
+                                    GL_CLAMP_TO_EDGE);
+                            GLTexture mfsrRobustMin = new GLTexture(
+                                    raw,
+                                    new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+                                    null,
+                                    GL_NEAREST,
+                                    GL_CLAMP_TO_EDGE);
+'''
+ui_anchor='''                    GLTexture swapSupport = currentSupport;
+                    currentSupport = nextSupport;
+                    nextSupport = swapSupport;
+'''
+summary_anchor='''            /*
+             * IRIS_26440_TEMPORAL_BIN_SUMMARY
+'''
+for label, needle in [
+    ('sequential loop', seq_anchor),
+    ('RAW/CFA reuse', raw_cfa_anchor),
+    ('WB reuse', wb_anchor),
+    ('cov reuse', cov_anchor),
+    ('robust reuse', robust_anchor),
+    ('UI checkpoint', ui_anchor),
+    ('scratch close', summary_anchor),
+    ('temporal covariance noise', 'glProg.setVar(\"noiseS\", noiseS);\n                        glProg.setVar(\"noiseO\", noiseO);'),
+    ('temporal robustness noise', 'glProg.setVar(\"noiseS\", noiseS);\n                                glProg.setVar(\"noiseO\", noiseO);'),
+    ('V1 recovery marker', 'IRIS_26480_ALIGNED_SHORT_SENSOR_HIGHLIGHT_RECOVERY_V1'),
+]:
+    _need(label, needle)
+if _preflight:
+    raise SystemExit('26480 reconstruction preflight FAIL\n' + '\n'.join(_preflight))
+print('26480 reconstruction full-anchor preflight PASS')
+
+# Sequential declarations before loop.
+anchor=seq_anchor
 rep='''            /* IRIS_26480_FRAME_SEQUENTIAL_SCRATCH_REUSE_V2 */
             GLTexture iris26480RawScratch=null,iris26480CfaScratch=null,iris26480WbCfaScratch=null;
             GLTexture iris26480CovScratch=null,iris26480RobustRawScratch=null,iris26480RobustMinScratch=null;
