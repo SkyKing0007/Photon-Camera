@@ -1,0 +1,1025 @@
+diff --git a/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl b/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
+index 3baf9bc..ddb0e1e 100644
+--- a/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
++++ b/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
+@@ -16,9 +16,6 @@ uniform ivec2 rawSize;
+ uniform ivec2 rawHalf;
+ uniform int cfaPattern;
+ uniform float maximumSupport;
+-uniform float clipR;
+-uniform float clipG;
+-uniform float clipB;
+ 
+ int componentIndex(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+ int componentColor(int c){
+@@ -27,77 +24,36 @@ int componentColor(int c){
+     if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
+     if(c==3)return 0;if(c==0)return 2;return 1;
+ }
+-float cfaAt(ivec2 p){
+-    p=clamp(p,ivec2(0),rawSize-ivec2(1));
+-    vec4 v=imageLoad(alterCfa,p>>1);
+-    int c=componentIndex(p);
+-    return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));
++float cfaAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));vec4 v=imageLoad(alterCfa,p>>1);int c=componentIndex(p);return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));}
++float greenAt(ivec2 p){
++    p=clamp(p,ivec2(0),rawSize-ivec2(1));int color=componentColor(componentIndex(p));if(color==1)return cfaAt(p);
++    float s=0.0,w=0.0;const ivec2 d0=ivec2(1,0),d1=ivec2(-1,0),d2=ivec2(0,1),d3=ivec2(0,-1);ivec2 d[4]=ivec2[4](d0,d1,d2,d3);
++    for(int i=0;i<4;i++){ivec2 q=clamp(p+d[i],ivec2(0),rawSize-ivec2(1));if(componentColor(componentIndex(q))==1){s+=cfaAt(q);w+=1.0;}}
++    return s/max(w,1.0);
+ }
+-mat2 covAt(ivec2 p){
+-    p=clamp(p,ivec2(0),rawHalf-ivec2(1));
+-    vec4 v=imageLoad(alterCov,p);
+-    return mat2(v.x,v.y,v.z,v.w);
+-}
+-mat2 interpolateCov(vec2 gp){
+-    ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));
+-    ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));
+-    vec2 f=fract(gp);
+-    mat2 c00=covAt(fl);
+-    mat2 c01=covAt(ivec2(ce.x,fl.y));
+-    mat2 c10=covAt(ivec2(fl.x,ce.y));
+-    mat2 c11=covAt(ce);
+-    return c00*((1.0-f.x)*(1.0-f.y))
+-         + c01*(f.x*(1.0-f.y))
+-         + c10*((1.0-f.x)*f.y)
+-         + c11*(f.x*f.y);
+-}
+-mat2 invertCov(mat2 m){
+-    float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];
+-    if(abs(d)<=1e-10) return mat2(1,0,0,1);
+-    return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;
+-}
+-
+-/* IRIS_26478_WRONSKI_PUBLIC_AUX_ACCUMULATION_NO_SATURATION_SIDECHANNEL */
++mat2 covAt(ivec2 p){p=clamp(p,ivec2(0),rawHalf-ivec2(1));vec4 v=imageLoad(alterCov,p);return mat2(v.x,v.y,v.z,v.w);}
++mat2 interpolateCov(vec2 gp){ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));vec2 f=fract(gp);mat2 c00=covAt(fl),c01=covAt(ivec2(ce.x,fl.y)),c10=covAt(ivec2(fl.x,ce.y)),c11=covAt(ce);return c00*((1.0-f.x)*(1.0-f.y))+c01*(f.x*(1.0-f.y))+c10*((1.0-f.x)*f.y)+c11*(f.x*f.y);}
++mat2 invertCov(mat2 m){float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];if(abs(d)<=1e-10)return mat2(1,0,0,1);return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;}
++
++/* IRIS_26483_BJZHOU_JOINT_GREEN_OPPONENT_WRONSKI
++ * Semantic accumulator = [G, R-G, B-G].  All chroma is anchored to the same
++ * local green structure and the same reference-owned flow/robustness, preventing
++ * three independent RGB regressions from choosing incompatible support at edges.
++ */
+ void main(){
+-    ivec2 outP=ivec2(gl_GlobalInvocationID.xy);
+-    if(any(greaterThanEqual(outP,rawSize))) return;
+-
+-    vec2 uv=(vec2(outP)+0.5)/vec2(rawSize);
+-    vec2 rawFlow=2.0*texture(flowTexture,uv).xy;
+-    vec2 lr=vec2(outP)+0.5;
+-    vec2 lrMov=lr+rawFlow;
+-    if(lrMov.x<0.0||lrMov.y<0.0||lrMov.x>=float(rawSize.x)||lrMov.y>=float(rawSize.y)) return;
+-
+-    ivec2 robustP=clamp(ivec2(lr),ivec2(0),rawSize-ivec2(1));
+-    float R=clamp(texelFetch(robustnessTexture,robustP,0).r,0.0,1.0);
+-    vec2 kmap=lrMov/2.0-0.5;
+-    mat2 invCov=invertCov(interpolateCov(kmap));
+-
+-    ivec2 center=ivec2(lrMov);
+-    vec2 movTarget=lrMov-0.5;
++    ivec2 outP=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(outP,rawSize)))return;
++    vec2 uv=(vec2(outP)+0.5)/vec2(rawSize);vec2 rawFlow=2.0*texture(flowTexture,uv).xy;vec2 lr=vec2(outP)+0.5;vec2 lrMov=lr+rawFlow;
++    if(lrMov.x<0.0||lrMov.y<0.0||lrMov.x>=float(rawSize.x)||lrMov.y>=float(rawSize.y))return;
++    ivec2 robustP=clamp(outP>>1,ivec2(0),rawHalf-ivec2(1));float R=clamp(texelFetch(robustnessTexture,robustP,0).r,0.0,1.0);
++    mat2 invCov=invertCov(interpolateCov(lrMov/2.0-0.5));ivec2 center=ivec2(lrMov);vec2 movTarget=lrMov-0.5;
+     vec3 addNum=vec3(0.0),addDen=vec3(0.0);
+     for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){
+-        ivec2 p=center+ivec2(ix,iy);
+-        if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize))) continue;
+-        int c=componentColor(componentIndex(p));
+-        vec2 d=vec2(p)-movTarget;
+-        float z=max(dot(d,invCov*d),0.0);
+-        float w=exp(-0.5*z)*R;
+-        float cfaSample=cfaAt(p);
+-        addNum[c]+=w*cfaSample;
+-        addDen[c]+=w;
++        ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;
++        int c=componentColor(componentIndex(p));vec2 d=vec2(p)-movTarget;float z=max(dot(d,invCov*d),0.0);float w=exp(-0.5*z)*R;float sample=cfaAt(p);
++        if(c==1){addNum.x+=w*sample;addDen.x+=w;}
++        else{float g=greenAt(p);float opponent=sample-g;if(c==0){addNum.y+=w*opponent;addDen.y+=w;}else{addNum.z+=w*opponent;addDen.z+=w;}}
+     }
+-
+-    vec4 n=texelFetch(previousNumerator,outP,0);
+-    n.rgb+=addNum;
+-    imageStore(outNumerator,outP,n);
+-
+-    vec4 d=texelFetch(previousDenominator,outP,0);
+-    d.rgb+=addDen;
+-    imageStore(outDenominator,outP,d);
+-
+-    vec4 fs=texelFetch(previousFrameSupport,outP,0);
+-    fs.r=min(max(maximumSupport-1.0,0.0),max(fs.r,0.0)+R);
+-    fs.gba=vec3(0.0);
+-    imageStore(outFrameSupport,outP,fs);
++    vec4 n=texelFetch(previousNumerator,outP,0);n.rgb+=addNum;imageStore(outNumerator,outP,n);
++    vec4 d=texelFetch(previousDenominator,outP,0);d.rgb+=addDen;imageStore(outDenominator,outP,d);
++    vec4 fs=texelFetch(previousFrameSupport,outP,0);fs.r=min(max(maximumSupport-1.0,0.0),max(fs.r,0.0)+R);fs.gba=vec3(0.0);imageStore(outFrameSupport,outP,fs);
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl b/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl
+index 1f18ed3..30f555c 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl
+@@ -6,26 +6,16 @@ layout(rgba32f,binding=0) uniform highp readonly image2D currentNumerator;
+ layout(rgba32f,binding=1) uniform highp readonly image2D currentDenominator;
+ layout(rgba32f,binding=2) uniform highp readonly image2D currentFrameSupport;
+ layout(rgba32f,binding=3) uniform highp writeonly image2D outRgb;
+-uniform float wbR;
+-uniform float wbG;
+-uniform float wbB;
++uniform float wbR;uniform float wbG;uniform float wbB;
+ 
+-/* IRIS_26478_WRONSKI_PURE_DIVIDE_ONCE_FINALIZER */
++/* IRIS_26483_JOINT_GREEN_OPPONENT_FINALIZE_ONCE
++ * Normalize semantic [G,R-G,B-G] once, reconstruct calculation-domain RGB,
++ * then remove temporary calculation WB exactly once.
++ */
+ void main(){
+-    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+-    if(any(greaterThanEqual(p,imageSize(outRgb)))) return;
+-
+-    vec3 num=imageLoad(currentNumerator,p).rgb;
+-    vec3 den=max(imageLoad(currentDenominator,p).rgb,vec3(1e-12));
+-    vec3 wbRgb=num/den;
+-    vec3 sensorRgb=wbRgb/vec3(
+-            max(wbR,1e-6),
+-            max(wbG,1e-6),
+-            max(wbB,1e-6));
+-
+-    float auxiliaryRobustness=
+-            max(imageLoad(currentFrameSupport,p).r,0.0);
+-    float frameSupport=1.0+auxiliaryRobustness;
+-
+-    imageStore(outRgb,p,vec4(max(sensorRgb,vec3(0.0)),frameSupport));
++    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,imageSize(outRgb))))return;
++    vec3 num=imageLoad(currentNumerator,p).rgb;vec3 den=max(imageLoad(currentDenominator,p).rgb,vec3(1e-12));
++    float g=num.x/den.x;float rg=num.y/den.y;float bg=num.z/den.z;vec3 wbRgb=vec3(g+rg,g,g+bg);
++    vec3 sensorRgb=wbRgb/vec3(max(wbR,1e-6),max(wbG,1e-6),max(wbB,1e-6));
++    float frameSupport=1.0+max(imageLoad(currentFrameSupport,p).r,0.0);imageStore(outRgb,p,vec4(max(sensorRgb,vec3(0.0)),frameSupport));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl b/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl
+new file mode 100644
+index 0000000..dacdca1
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl
+@@ -0,0 +1,85 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp image2D;
++uniform highp sampler2D ReferenceGuide;
++uniform highp sampler2D MovingGuide;
++uniform highp sampler2D InitialFlow;
++uniform highp sampler2D ReferenceGradient;
++uniform highp sampler2D InverseHessian;
++layout(rgba16f,binding=0) uniform highp writeonly image2D OutputFlow;
++uniform ivec2 levelSize;
++uniform int tileSize;
++uniform int hasInitial;
++uniform float initialToCurrentScale;
++uniform int iterations;
++
++float movingAt(vec2 p){
++    if(p.x<0.0||p.y<0.0||p.x>float(levelSize.x-1)||p.y>float(levelSize.y-1)) return 0.0;
++    ivec2 p0=ivec2(floor(p));
++    ivec2 p1=min(p0+ivec2(1),levelSize-ivec2(1));
++    vec2 f=fract(p);
++    float a=mix(texelFetch(MovingGuide,p0,0).r,texelFetch(MovingGuide,ivec2(p1.x,p0.y),0).r,f.x);
++    float b=mix(texelFetch(MovingGuide,ivec2(p0.x,p1.y),0).r,texelFetch(MovingGuide,p1,0).r,f.x);
++    return mix(a,b,f.y);
++}
++float refCircular(ivec2 p){
++    ivec2 q=ivec2((p.x%levelSize.x+levelSize.x)%levelSize.x,(p.y%levelSize.y+levelSize.y)%levelSize.y);
++    return texelFetch(ReferenceGuide,q,0).r;
++}
++vec2 initialFlow(ivec2 tile,ivec2 grid){
++    if(hasInitial==0) return vec2(0.0);
++    vec2 uv=(vec2(tile)+0.5)/vec2(grid);
++    return texture(InitialFlow,clamp(uv,vec2(0.0),vec2(1.0))).xy*initialToCurrentScale;
++}
++
++/* IRIS_26483_BJZHOU_LEVELWISE_REFERENCE_PRODUCT_LK
++ * Adapt the current RAWmax/MGC alignment execution principle: immutable reference
++ * gradient/Hessian products are prepared once per pyramid level, then every auxiliary
++ * performs only level-local LK updates. Coarse-to-fine flow remains reference-owned.
++ */
++void main(){
++    ivec2 tile=ivec2(gl_GlobalInvocationID.xy);
++    ivec2 grid=imageSize(OutputFlow);
++    if(any(greaterThanEqual(tile,grid))) return;
++
++    vec4 ih=texelFetch(InverseHessian,tile,0);
++    vec2 flow=initialFlow(tile,grid);
++    if(dot(abs(ih),vec4(1.0))>1.0e-12){
++        for(int iter=0;iter<3;iter++){
++            if(iter>=iterations) continue;
++            float b0=0.0,b1=0.0;
++            for(int yy=0;yy<32;yy++){
++                if(yy>=tileSize) continue;
++                for(int xx=0;xx<32;xx++){
++                    if(xx>=tileSize) continue;
++                    ivec2 p=tile*tileSize+ivec2(xx,yy);
++                    if(any(greaterThanEqual(p,levelSize))) continue;
++                    vec2 g=texelFetch(ReferenceGradient,p,0).rg;
++                    float residual=movingAt(vec2(p)+flow)-refCircular(p);
++                    b0+=-g.x*residual;
++                    b1+=-g.y*residual;
++                }
++            }
++            vec2 d=vec2(ih.r*b0+ih.g*b1,ih.b*b0+ih.a*b1);
++            // Match RAWmax/MGC bounded level-wise LK behavior: one pyramid pixel per iteration.
++            flow+=clamp(d,vec2(-1.0),vec2(1.0));
++        }
++    }
++
++    float residualSum=0.0;
++    int n=0;
++    for(int yy=0;yy<32;yy+=2){
++        if(yy>=tileSize) continue;
++        for(int xx=0;xx<32;xx+=2){
++            if(xx>=tileSize) continue;
++            ivec2 p=tile*tileSize+ivec2(xx,yy);
++            if(any(greaterThanEqual(p,levelSize))) continue;
++            residualSum+=abs(movingAt(vec2(p)+flow)-refCircular(p));
++            n++;
++        }
++    }
++    float meanResidual=residualSum/float(max(n,1));
++    float confidence=exp(-meanResidual/max(0.02,1.0e-5));
++    imageStore(OutputFlow,tile,vec4(flow,clamp(confidence,0.0,1.0),meanResidual));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl b/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
+index f60f4a5..81d6fcc 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
+@@ -13,82 +13,19 @@ layout(rgba32f,binding=7) uniform highp writeonly image2D outFrameSupport;
+ uniform ivec2 rawSize;
+ uniform ivec2 rawHalf;
+ uniform int cfaPattern;
+-uniform float clipR;
+-uniform float clipG;
+-uniform float clipB;
+-
+-/*
+- * IRIS_26478_WRONSKI_REFERENCE_ADD_ONCE_NO_IPOL_ACCUMULATED_DENOISER
+- * IPOL's public default config disables accumulated_robustness_denoiser.merge.
+- * Always add the immutable reference with the ordinary radius-1 kernel.
+- */
+ int componentIndex(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+-int componentColor(int c){
+-    if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}
+-    if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}
+-    if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
+-    if(c==3)return 0;if(c==0)return 2;return 1;
+-}
+-float cfaAt(ivec2 p){
+-    p=clamp(p,ivec2(0),rawSize-ivec2(1));
+-    vec4 v=imageLoad(referenceCfa,p>>1);
+-    int c=componentIndex(p);
+-    return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));
+-}
+-mat2 covAt(ivec2 p){
+-    p=clamp(p,ivec2(0),rawHalf-ivec2(1));
+-    vec4 v=imageLoad(referenceCov,p);
+-    return mat2(v.x,v.y,v.z,v.w);
+-}
+-mat2 interpolateCov(vec2 gp){
+-    ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));
+-    ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));
+-    vec2 f=fract(gp);
+-    mat2 c00=covAt(fl);
+-    mat2 c01=covAt(ivec2(ce.x,fl.y));
+-    mat2 c10=covAt(ivec2(fl.x,ce.y));
+-    mat2 c11=covAt(ce);
+-    return c00*((1.0-f.x)*(1.0-f.y))
+-         + c01*(f.x*(1.0-f.y))
+-         + c10*((1.0-f.x)*f.y)
+-         + c11*(f.x*f.y);
+-}
+-mat2 invertCov(mat2 m){
+-    float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];
+-    if(abs(d)<=1e-10) return mat2(1,0,0,1);
+-    return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;
+-}
++int componentColor(int c){if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}if(c==3)return 0;if(c==0)return 2;return 1;}
++float cfaAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));vec4 v=imageLoad(referenceCfa,p>>1);int c=componentIndex(p);return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));}
++float greenAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));if(componentColor(componentIndex(p))==1)return cfaAt(p);float s=0.0,w=0.0;ivec2 d[4]=ivec2[4](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1));for(int i=0;i<4;i++){ivec2 q=clamp(p+d[i],ivec2(0),rawSize-ivec2(1));if(componentColor(componentIndex(q))==1){s+=cfaAt(q);w+=1.0;}}return s/max(w,1.0);}
++mat2 covAt(ivec2 p){p=clamp(p,ivec2(0),rawHalf-ivec2(1));vec4 v=imageLoad(referenceCov,p);return mat2(v.x,v.y,v.z,v.w);}
++mat2 interpolateCov(vec2 gp){ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));vec2 f=fract(gp);mat2 c00=covAt(fl),c01=covAt(ivec2(ce.x,fl.y)),c10=covAt(ivec2(fl.x,ce.y)),c11=covAt(ce);return c00*((1.0-f.x)*(1.0-f.y))+c01*(f.x*(1.0-f.y))+c10*((1.0-f.x)*f.y)+c11*(f.x*f.y);}
++mat2 invertCov(mat2 m){float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];if(abs(d)<=1e-10)return mat2(1,0,0,1);return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;}
+ 
++/* IRIS_26483_JOINT_REFERENCE_ADD_ONCE */
+ void main(){
+-    ivec2 outP=ivec2(gl_GlobalInvocationID.xy);
+-    if(any(greaterThanEqual(outP,rawSize))) return;
+-
+-    vec4 oldNum=imageLoad(currentNumerator,outP);
+-    vec4 oldDen=imageLoad(currentDenominator,outP);
+-    vec4 fs=imageLoad(currentFrameSupport,outP);
+-
+-    vec2 coarse=vec2(outP);
+-    vec2 greyPos=(coarse-vec2(0.5))/2.0;
+-    mat2 invCov=invertCov(interpolateCov(greyPos));
+-    ivec2 center=ivec2(round(coarse));
+-    vec3 refNum=vec3(0.0),refDen=vec3(0.0);
+-
+-    const int RAD=1;
+-    for(int iy=-RAD;iy<=RAD;iy++) for(int ix=-RAD;ix<=RAD;ix++){
+-        ivec2 p=center+ivec2(ix,iy);
+-        if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize))) continue;
+-        int c=componentColor(componentIndex(p));
+-        vec2 delta=vec2(p)-coarse;
+-        float z=max(dot(delta,invCov*delta),0.0);
+-        float w=exp(-0.5*z);
+-        /* IRIS_26479_ADRENO_GLSL_SAMPLE_KEYWORD_PORTABILITY */
+-        float cfaSample=cfaAt(p);
+-        refNum[c]+=cfaSample*w;
+-        refDen[c]+=w;
+-    }
+-
+-    imageStore(outNumerator,outP,vec4(oldNum.rgb+refNum,0.0));
+-    imageStore(outDenominator,outP,vec4(oldDen.rgb+refDen,1.0));
+-    // fs.r remains auxiliary robustness; finalizer adds the reference once.
+-    imageStore(outFrameSupport,outP,vec4(max(fs.r,0.0),0.0,0.0,0.0));
++    ivec2 outP=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(outP,rawSize)))return;
++    vec4 oldNum=imageLoad(currentNumerator,outP),oldDen=imageLoad(currentDenominator,outP),fs=imageLoad(currentFrameSupport,outP);
++    vec2 coarse=vec2(outP);mat2 invCov=invertCov(interpolateCov((coarse-vec2(0.5))/2.0));ivec2 center=ivec2(round(coarse));vec3 refNum=vec3(0),refDen=vec3(0);
++    for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;int c=componentColor(componentIndex(p));vec2 delta=vec2(p)-coarse;float z=max(dot(delta,invCov*delta),0.0);float w=exp(-0.5*z);float sample=cfaAt(p);if(c==1){refNum.x+=sample*w;refDen.x+=w;}else{float opp=sample-greenAt(p);if(c==0){refNum.y+=opp*w;refDen.y+=w;}else{refNum.z+=opp*w;refDen.z+=w;}}}
++    imageStore(outNumerator,outP,vec4(oldNum.rgb+refNum,0.0));imageStore(outDenominator,outP,vec4(oldDen.rgb+refDen,1.0));imageStore(outFrameSupport,outP,vec4(max(fs.r,0.0),0,0,0));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl b/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl
+new file mode 100644
+index 0000000..86905a4
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl
+@@ -0,0 +1,58 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp image2D;
++uniform highp sampler2D flowTexture;
++uniform highp sampler2D noiseCurve;
++layout(rgba16f,binding=0) uniform highp readonly image2D referenceCfa;
++layout(rgba16f,binding=1) uniform highp readonly image2D alterCfa;
++layout(r32f,binding=2) uniform highp writeonly image2D outRobustness;
++uniform ivec2 rawHalf;
++uniform int cfaPattern;
++uniform int tileSizePacked;
++uniform float wbR;
++uniform float wbG;
++uniform float wbB;
++
++int colorOf(int c){
++    if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}
++    if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}
++    if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
++    if(c==3)return 0;if(c==0)return 2;return 1;
++}
++vec3 guideReference(ivec2 q){
++    q=clamp(q,ivec2(0),rawHalf-ivec2(1));vec4 v=imageLoad(referenceCfa,q);float s[4]=float[4](v.r,v.g,v.b,v.a);vec3 o=vec3(0.0);float ng=0.0;
++    for(int i=0;i<4;i++){int c=colorOf(i);float g=c==0?max(wbR,1e-6):(c==2?max(wbB,1e-6):max(wbG,1e-6));float x=s[i]/g;if(c==0)o.r=x;else if(c==2)o.b=x;else{o.g+=x;ng+=1.0;}}o.g/=max(ng,1.0);return o;
++}
++vec3 guideAlter(ivec2 q){
++    q=clamp(q,ivec2(0),rawHalf-ivec2(1));vec4 v=imageLoad(alterCfa,q);float s[4]=float[4](v.r,v.g,v.b,v.a);vec3 o=vec3(0.0);float ng=0.0;
++    for(int i=0;i<4;i++){int c=colorOf(i);float g=c==0?max(wbR,1e-6):(c==2?max(wbB,1e-6):max(wbG,1e-6));float x=s[i]/g;if(c==0)o.r=x;else if(c==2)o.b=x;else{o.g+=x;ng+=1.0;}}o.g/=max(ng,1.0);return o;
++}
++void localStatsRef(ivec2 q,out vec3 mu,out vec3 var){
++    vec3 s=vec3(0),ss=vec3(0);
++    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec3 v=guideReference(q+ivec2(x,y));s+=v;ss+=v*v;}
++    mu=s/9.0;var=max(ss/9.0-mu*mu,vec3(0));
++}
++vec3 localMeanAlt(ivec2 q){vec3 s=vec3(0);for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++)s+=guideAlter(q+ivec2(x,y));return s/9.0;}
++float dogson(float x){float a=abs(x);if(a<=0.5)return -2.0*a*a+1.0;if(a<=1.5)return a*a-2.5*a+1.5;return 0.0;}
++void dogsonRef(vec2 p,out vec3 mu,out vec3 var){ivec2 c=ivec2(round(p));vec3 sm=vec3(0),sv=vec3(0);float sw=0.0;for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){ivec2 q=clamp(c+ivec2(x,y),ivec2(0),rawHalf-ivec2(1));float w=dogson(float(q.x)-p.x)*dogson(float(q.y)-p.y);vec3 m,v;localStatsRef(q,m,v);sm+=m*w;sv+=v*w;sw+=w;}mu=sm/max(sw,1e-8);var=sv/max(sw,1e-8);}
++vec3 dogsonAlt(vec2 p){ivec2 c=ivec2(round(p));vec3 sm=vec3(0);float sw=0.0;for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){ivec2 q=clamp(c+ivec2(x,y),ivec2(0),rawHalf-ivec2(1));float w=dogson(float(q.x)-p.x)*dogson(float(q.y)-p.y);sm+=localMeanAlt(q)*w;sw+=w;}return sm/max(sw,1e-8);}
++vec2 ipolNoise(float b){int idx=clamp(int(round(1000.0*clamp(b,0.0,1.0))),0,1000);return texelFetch(noiseCurve,ivec2(idx,0),0).rg;}
++
++/* IRIS_26483_HALF_RES_ROBUSTNESS_ON_BAYER_QUADS
++ * Robustness evidence is intrinsically built from packed Bayer-quad statistics.
++ * Evaluate it once per Bayer quad instead of four times per physical RAW pixel.
++ */
++void main(){
++    ivec2 q=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(q,rawHalf)))return;
++    vec2 flow=texelFetch(flowTexture,q,0).xy;
++    vec2 alt=vec2(q)+flow;
++    if(alt.x<0.0||alt.y<0.0||alt.x>=float(rawHalf.x)||alt.y>=float(rawHalf.y)){imageStore(outRobustness,q,vec4(0));return;}
++    vec3 refMu,refVar;dogsonRef(vec2(q),refMu,refVar);vec3 altMu=dogsonAlt(alt);vec3 dp=abs(refMu-altMu);
++    float d2=0.0,sigma2=0.0;
++    for(int c=0;c<3;c++){vec2 curve=ipolNoise(refMu[c]);float sigmaT=max(curve.x,1e-8),dT=max(curve.y,1e-8);float dp2=dp[c]*dp[c];float shrink=dp2/max(dp2+dT*dT,1e-12);d2+=dp2*shrink*shrink;sigma2+=max(refVar[c],sigmaT*sigmaT);}
++    vec2 mn=vec2(3.402823e38),mx=vec2(-3.402823e38);int ts=max(tileSizePacked,1);
++    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){ivec2 qq=clamp(q+ivec2(x,y)*ts,ivec2(0),rawHalf-ivec2(1));vec2 f=texelFetch(flowTexture,qq,0).xy;mn=min(mn,f);mx=max(mx,f);}
++    vec2 span=mx-mn;float S=dot(span,span)>0.2?2.0:12.0;
++    float R=clamp(S*exp(-d2/max(sigma2,1e-12))-0.12,0.0,1.0);imageStore(outRobustness,q,vec4(R));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_support_downsample.glsl b/app/src/main/assets/shaders/motionv2/mfsr_support_downsample.glsl
+new file mode 100644
+index 0000000..f41e240
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_support_downsample.glsl
+@@ -0,0 +1,17 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp image2D;
++layout(rgba32f,binding=0) uniform highp readonly image2D frameSupport;
++layout(r32f,binding=1) uniform highp writeonly image2D outSupport;
++
++/* IRIS_26483_DIRECT_SUPPORT_TELEMETRY_DOWNSAMPLE
++ * Diagnostic-only: replace the legacy per-frame CFA merge/support path with one
++ * end-of-burst 2x2 reduction of the authoritative direct-Wronski frame support.
++ */
++void main(){
++    ivec2 q=ivec2(gl_GlobalInvocationID.xy);ivec2 sz=imageSize(outSupport);if(any(greaterThanEqual(q,sz)))return;
++    ivec2 b=q*2;ivec2 src=imageSize(frameSupport)-ivec2(1);float s=0.0;
++    for(int y=0;y<2;y++)for(int x=0;x<2;x++)s+=max(imageLoad(frameSupport,min(b+ivec2(x,y),src)).r,0.0);
++    imageStore(outSupport,q,vec4(1.0+0.25*s));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_wb_cfa.glsl b/app/src/main/assets/shaders/motionv2/mfsr_wb_cfa.glsl
+index dca34ca..d61cd1c 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_wb_cfa.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_wb_cfa.glsl
+@@ -52,25 +52,23 @@ float opposedEstimate(ivec2 center,int targetColor,float fallback,out float supp
+     else{root=0.5*(rr+rg);support=min(wr,wg);}
+     support=smoothstep(0.25,1.25,support);
+     allLost=1.0-smoothstep(0.10,0.75,wr+wg+wbv);
+-    return max(pow(max(root,0.0),power),fallback);
++    return pow(max(root,0.0),power);
+ }
+ float repairClipped(ivec2 p,int color,float fallback,float physical){
+     float support=0.0,allLost=0.0;
+     float opposed=opposedEstimate(p,color,fallback,support,allLost);
+-    float clipMask=smoothstep(physicalClipThreshold,0.9995,physical);
++    float clipMask=smoothstep(physicalClipThreshold,0.9975,physical);
+     float repaired=mix(fallback,opposed,clipMask*support);
+-    float neutralTerminal=max(sensorExposureScale,1.0e-6)*max(wbR,max(wbG,wbB));
++    float neutralTerminal=max(sensorExposureScale,1.0e-6)*min(wbR,min(wbG,wbB));
+     return mix(repaired,neutralTerminal,clipMask*allLost);
+ }
+ 
+-/* IRIS_26482_BJZHOU_CFA_CALCULATION_DOMAIN_CLIP_AUTHORITY
++/* IRIS_26483_BJZHOU_SOFT_HEADROOM_CFA_AUTHORITY
+  * The existing Wronski loader already uses calculation-only relative WB gains.
+- * 26482 completes that architecture by judging clipping in the physical normalized
+- * sensor domain (before exposure/canonical scaling), reconstructing only clipped
+- * photosites from reliable opposed CFA colors in that same calculation domain,
+- * using a neutral calculation-domain terminal only when all local hue authority is
+- * gone, and leaving mfsr_finalize to remove the calculation gains exactly once.
+- * Ordinary unclipped pixels retain the original one-imageLoad fast path.
++ * 26483 starts authority roll-off before hard clipping, lets reliable opposed-color
++ * evidence replace a damaged sample downward as well as upward, and uses a common
++ * calculation-domain neutral terminal when every local color has lost hue authority.
++ * mfsr_finalize still removes the calculation gains exactly once.
+  */
+ void main(){
+     ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index 5f18cd8..f3e8ede 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -484,7 +484,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         images.get(0).pair != null
+                                 ? 1.0f / Math.max(images.get(0).pair.layerMpy, 1.0e-6f)
+                                 : 1.0f));
+-                glProg.setVar("physicalClipThreshold", 0.985f);
++                glProg.setVar("physicalClipThreshold", 0.94f);
+                 glProg.setTextureCompute("inputCfa", referenceCfa, false);
+                 glProg.setTextureCompute("outputCfa", wronskiReferenceCfa, true);
+                 glProg.computeAuto(rawHalf, 1);
+@@ -526,42 +526,25 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 wronskiReferenceCfa);
+             }
+ 
+-            mergedA = new GLTexture(
+-                    rawHalf,
+-                    new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                    null,
+-                    GL_NEAREST,
+-                    GL_CLAMP_TO_EDGE);
+-            mergedB = new GLTexture(
+-                    rawHalf,
+-                    new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                    null,
+-                    GL_NEAREST,
+-                    GL_CLAMP_TO_EDGE);
+-            supportA = new GLTexture(
+-                    rawHalf,
+-                    new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+-                    null,
+-                    GL_NEAREST,
+-                    GL_CLAMP_TO_EDGE);
+-            supportB = new GLTexture(
+-                    rawHalf,
+-                    new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+-                    null,
+-                    GL_NEAREST,
+-                    GL_CLAMP_TO_EDGE);
+-
+-            glProg.setLayout(tile, tile, 1);
+-            glProg.useAssetProgram("motionv2/cfa_reconstruct_init", true);
+-            glProg.setTextureCompute("referenceTexture", referenceCfa, false);
+-            glProg.setTextureCompute("outTexture", mergedA, true);
+-            glProg.setTextureCompute("outSupport", supportA, true);
+-            glProg.computeAuto(rawHalf, 1);
+-
+-            GLTexture currentMerged = mergedA;
+-            GLTexture nextMerged = mergedB;
+-            GLTexture currentSupport = supportA;
+-            GLTexture nextSupport = supportB;
++            /* IRIS_26483_REMOVE_UNUSED_DIRECT_BAYER_LEGACY_CFA_MERGE
++             * Standard-Bayer Motion publishes only the direct Wronski RGB owner.  The old
++             * packed-CFA merge/support chain was still dispatched every auxiliary solely for
++             * telemetry.  Keep it only for the non-standard fallback path.
++             */
++            GLTexture currentMerged = null;
++            GLTexture nextMerged = null;
++            GLTexture currentSupport = null;
++            GLTexture nextSupport = null;
++            if (!directBayer) {
++                mergedA = new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                mergedB = new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                supportA = new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                supportB = new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/cfa_reconstruct_init",true);
++                glProg.setTextureCompute("referenceTexture",referenceCfa,false);glProg.setTextureCompute("outTexture",mergedA,true);
++                glProg.setTextureCompute("outSupport",supportA,true);glProg.computeAuto(rawHalf,1);
++                currentMerged=mergedA;nextMerged=mergedB;currentSupport=supportA;nextSupport=supportB;
++            }
+ 
+             GLTexture currentDirectRgb = null;
+             GLTexture nextDirectRgb = null;
+@@ -736,7 +719,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 } catch (Throwable ignored) {}
+             }
+ 
+-            /* IRIS_26480_FRAME_SEQUENTIAL_SCRATCH_REUSE_V2 */
++            /* IRIS_26483_BJZHOU_ONLINE_FRAME_SEQUENTIAL_MERGE
++             * One auxiliary upload -> WB/CFA -> covariance -> cached-reference LK ->
++             * half-res robustness -> immediate semantic accumulation -> scratch reuse.
++             */
+             GLTexture iris26480RawScratch=null,iris26480CfaScratch=null,iris26480WbCfaScratch=null;
+             GLTexture iris26480CovScratch=null,iris26480RobustRawScratch=null,iris26480RobustMinScratch=null;
+             for (int i = 1; i < frameCount; i++) {
+@@ -836,7 +822,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.setVar("wbG", 1.0f);
+                         glProg.setVar("wbB", wronskiWbB);
+                         glProg.setVar("sensorExposureScale", exposure);
+-                        glProg.setVar("physicalClipThreshold", 0.985f);
++                        glProg.setVar("physicalClipThreshold", 0.94f);
+                         glProg.setTextureCompute("inputCfa", alterCfa, false);
+                         glProg.setTextureCompute("outputCfa", wronskiAlterCfa, true);
+                         glProg.computeAuto(rawHalf, 1);
+@@ -890,63 +876,36 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         long alignmentOnlyMs =
+                                 System.currentTimeMillis() - alignmentOnlyStart;
+ 
+-                        glProg.setLayout(tile, tile, 1);
+-                        glProg.useAssetProgram(
+-                                "motionv2/cfa_reconstruct_accumulate", true);
+-                        glProg.setVar("rawHalf", rawHalf);
+-                        /*
+-                         * IRIS_26452_PHASE_AWARE_CFA_BINDINGS
+-                         * Flow is packed-CFA displacement; the shader converts it
+-                         * exactly once into physical RAW-pixel displacement.
+-                         */
+-                        glProg.setVar("rawSize", raw);
+-                        glProg.setVar("cfaPattern", (int) parameters.cfaPattern);
+-                        glProg.setVar("temporalDistanceMs", temporalDistanceMs);
+-                        glProg.setVar("noiseS", noiseS);
+-                        glProg.setVar("noiseO", noiseO);
+-                        glProg.setVar("maximumSupport", (float) frameCount);
+-                        glProg.setVar("sensorClipLevel", canonicalGain);
+-                        glProg.setTexture(
+-                                "flowTexture",
+-                                ownedAlignment.flowTexture);
+-                        glProg.setTextureCompute(
+-                                "referenceTexture", referenceCfa, false);
+-                        glProg.setTextureCompute(
+-                                "currentTexture", currentMerged, false);
+-                        glProg.setTextureCompute(
+-                                "alterTexture", alterCfa, false);
+-                        glProg.setTextureCompute(
+-                                "currentSupport", currentSupport, false);
+-                        glProg.setTextureCompute(
+-                                "outTexture", nextMerged, true);
+-                        glProg.setTextureCompute(
+-                                "outSupport", nextSupport, true);
+-                        glProg.computeAuto(rawHalf, 1);
++                        if (!directBayer) {
++                            glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/cfa_reconstruct_accumulate",true);
++                            glProg.setVar("rawHalf",rawHalf);glProg.setVar("rawSize",raw);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);
++                            glProg.setVar("temporalDistanceMs",temporalDistanceMs);glProg.setVar("noiseS",noiseS);glProg.setVar("noiseO",noiseO);
++                            glProg.setVar("maximumSupport",(float)frameCount);glProg.setVar("sensorClipLevel",canonicalGain);
++                            glProg.setTexture("flowTexture",ownedAlignment.flowTexture);glProg.setTextureCompute("referenceTexture",referenceCfa,false);
++                            glProg.setTextureCompute("currentTexture",currentMerged,false);glProg.setTextureCompute("alterTexture",alterCfa,false);
++                            glProg.setTextureCompute("currentSupport",currentSupport,false);glProg.setTextureCompute("outTexture",nextMerged,true);
++                            glProg.setTextureCompute("outSupport",nextSupport,true);glProg.computeAuto(rawHalf,1);
++                        }
+ 
+                         if (directBayer) {
+                             /*
+                              * IRIS_26462_FULL_PUBLISHED_WRONSKI_MFSR
+-                             * Robustness -> 5x5 min -> independent RGB merge.
++                             * Robustness -> 5x5 min -> joint green/opponent online merge.
+                              */
+                             long iris26468RobustStart = System.currentTimeMillis();
+-                            if(iris26480RobustRawScratch==null)iris26480RobustRawScratch=new GLTexture(raw,
++                            if(iris26480RobustRawScratch==null)iris26480RobustRawScratch=new GLTexture(rawHalf,
+                                     new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-                            if(iris26480RobustMinScratch==null)iris26480RobustMinScratch=new GLTexture(raw,
++                            if(iris26480RobustMinScratch==null)iris26480RobustMinScratch=new GLTexture(rawHalf,
+                                     new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                             GLTexture mfsrRobustRaw=iris26480RobustRawScratch,mfsrRobustMin=iris26480RobustMinScratch;
+                             try {
+                                 glProg.setLayout(tile, tile, 1);
+                                 glProg.useAssetProgram(
+-                                        "motionv2/mfsr_robustness", true);
++                                        "motionv2/mfsr_robustness_half", true);
+                                 MotionV2IpolNoiseCurve.Curve iris26480FrameCurve =
+-                                        MotionV2IpolNoiseCurve.build(
++                                        MotionV2IpolNoiseCurve.buildNoiseTableOnly(
+                                                 iris26480FrameNoiseS,
+-                                                iris26480FrameNoiseO,
+-                                                frame.buffer,
+-                                                raw,
+-                                                blackLevel,
+-                                                (float) parameters.whiteLevel,
+-                                                canonicalGain);
++                                                iris26480FrameNoiseO);
+                                 iris26480FrameCurve.rgba32f.position(0);
+                                 ipolNoiseCurveTexture.loadData(iris26480FrameCurve.rgba32f);
+                                 Log.d(TAG, "IRIS_26480_PER_FRAME_ROBUSTNESS_NOISE"
+@@ -954,8 +913,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         + " source=" + frame.motionV2NoiseProfileSource
+                                         + " noiseS=" + iris26480FrameNoiseS
+                                         + " noiseO=" + iris26480FrameNoiseO
+-                                        + " ipolTextureReloaded=true");
+-                                glProg.setVar("rawSize", raw);
++                                        + " ipolTextureReloaded=true rawCpuScan=false");
+                                 glProg.setVar("rawHalf", rawHalf);
+                                 glProg.setVar(
+                                         "cfaPattern",
+@@ -964,7 +922,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         "noiseCurve",
+                                         ipolNoiseCurveTexture);
+                                 glProg.setVar(
+-                                        "tileSizeRaw",
++                                        "tileSizePacked",
+                                         Math.max(1, mfsrTileSize));
+                                 glProg.setVar(
+                                         "wbR",
+@@ -986,7 +944,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         "outRobustness",
+                                         mfsrRobustRaw,
+                                         true);
+-                                glProg.computeAuto(raw, 1);
++                                glProg.computeAuto(rawHalf, 1);
+                                 long iris26468RobustMs =
+                                         System.currentTimeMillis() - iris26468RobustStart;
+ 
+@@ -1001,7 +959,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         "OutputRobustness",
+                                         mfsrRobustMin,
+                                         true);
+-                                glProg.computeAuto(raw, 1);
++                                glProg.computeAuto(rawHalf, 1);
+                                 long iris26468ErodeMs =
+                                         System.currentTimeMillis() - iris26468ErodeStart;
+ 
+@@ -1064,7 +1022,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                         + " frame=" + i
+                                         + " robustnessMs=" + iris26468RobustMs
+                                         + " erosion5x5Ms=" + iris26468ErodeMs
+-                                        + " directRgbAccumulateMs="
++                                        + " jointOpponentAccumulateMs="
+                                         + iris26468AccumulateMs);
+                             } finally {
+                                 /* robustness scratch retained */
+@@ -1183,15 +1141,16 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         if (ownedAlignment != null) ownedAlignment.close();
+                     }
+ 
+-                    GLTexture swapMerged = currentMerged;
+-                    currentMerged = nextMerged;
+-                    nextMerged = swapMerged;
+-
+-                    GLTexture swapSupport = currentSupport;
+-                    currentSupport = nextSupport;
+-                    nextSupport = swapSupport;
+-                    /* IRIS_26480_UI_BREATHING_CHECKPOINT_V2 */
+-                    android.opengl.GLES30.glFlush(); Thread.yield();
++                    if (!directBayer) {
++                        GLTexture swapMerged=currentMerged;currentMerged=nextMerged;nextMerged=swapMerged;
++                        GLTexture swapSupport=currentSupport;currentSupport=nextSupport;nextSupport=swapSupport;
++                    }
++                    /* IRIS_26483_ONLINE_COMMAND_STREAM_UI_YIELD
++                     * Keep one ordered GLES stream like RAWmax/MGC.  Avoid forcing a flush after
++                     * every auxiliary; submit a breathing checkpoint every fourth frame only.
++                     */
++                    if ((i & 3) == 0) android.opengl.GLES30.glFlush();
++                    Thread.yield();
+                 } finally {
+                     wronskiAlterCov=null; /* persistent */
+                     wronskiAlterCfa=null; /* persistent */
+@@ -1206,6 +1165,9 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             if(iris26480WbCfaScratch!=null)iris26480WbCfaScratch.close();
+             if(iris26480CfaScratch!=null)iris26480CfaScratch.close();
+             if(iris26480RawScratch!=null)iris26480RawScratch.close();
++            Log.d(TAG,"IRIS_26483_ONLINE_MERGE_COMPLETE frames="+frameCount
++                    +" alignment=levelwiseLK referenceProductsAllLevels=true robustnessResolution=rawHalf"
++                    +" legacyDirectBayerCfaMergePasses=0 perFrameGlFlush=false jointSemantic=G,R-G,B-G");
+ 
+             /*
+              * IRIS_26440_TEMPORAL_BIN_SUMMARY
+@@ -1365,7 +1327,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     iris26480ShortWbCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_wb_cfa",true);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);
+                     glProg.setVar("wbR",r);glProg.setVar("wbG",1.0f);glProg.setVar("wbB",b);
+-                    glProg.setVar("sensorExposureScale",1.0f);glProg.setVar("physicalClipThreshold",0.985f);
++                    glProg.setVar("sensorExposureScale",1.0f);glProg.setVar("physicalClipThreshold",0.94f);
+                     glProg.setTextureCompute("inputCfa",iris26480ShortCfa,false);glProg.setTextureCompute("outputCfa",iris26480ShortWbCfa,true);glProg.computeAuto(rawHalf,1);
+                     iris26480ShortAlignment=MotionV2WronskiAlignment.alignPrepared(wronskiPreparedAlignment,glProg,iris26480ShortWbCfa);
+                     iris26480Recovered=new GLTexture(raw,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+@@ -1443,7 +1405,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 + directSummary.lowB
+                         + " imbalanceP95=" + directSummary.imbalanceP95
+                         + " sampledPixels=" + directSummary.samples
+-                        + " perChannel=true"
++                        + " semanticChannels=G,RminusG,BminusG"
+                         + " imageMathUnchangedByTelemetry=true");
+                 try {
+                     com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+@@ -1463,15 +1425,22 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+              * Deliberate readback only for truthful support accounting.
+              * The image reconstruction itself remains GPU-side.
+              */
+-            currentSupport.BufferLoad();
+-            ByteBuffer supportBytes = currentSupport.textureBuffer(
+-                    new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+-                    true);
+-            SupportSummary summary = summarizeSupport(
+-                    supportBytes,
+-                    rawHalf.x,
+-                    rawHalf.y,
+-                    frameCount);
++            GLTexture iris26483SupportTelemetry = null;
++            ByteBuffer supportBytes;
++            if (directBayer) {
++                iris26483SupportTelemetry = new GLTexture(rawHalf,
++                        new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_support_downsample",true);
++                glProg.setTextureCompute("frameSupport",currentDirectFrameSupport,false);
++                glProg.setTextureCompute("outSupport",iris26483SupportTelemetry,true);glProg.computeAuto(rawHalf,1);
++                iris26483SupportTelemetry.BufferLoad();
++                supportBytes=iris26483SupportTelemetry.textureBuffer(new GLFormat(GLFormat.DataType.FLOAT_32,1),true);
++            } else {
++                currentSupport.BufferLoad();
++                supportBytes=currentSupport.textureBuffer(new GLFormat(GLFormat.DataType.FLOAT_32,1),true);
++            }
++            SupportSummary summary=summarizeSupport(supportBytes,rawHalf.x,rawHalf.y,frameCount);
++            if (iris26483SupportTelemetry != null) iris26483SupportTelemetry.close();
+ 
+             effectiveSupport = summary.mean;
+             supportP10 = summary.p10;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2IpolNoiseCurve.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2IpolNoiseCurve.java
+index 620642e..0e6051e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2IpolNoiseCurve.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2IpolNoiseCurve.java
+@@ -69,6 +69,43 @@ public final class MotionV2IpolNoiseCurve {
+         }
+     }
+ 
++    /**
++     * IRIS_26483_IPOL_NO_RESCAN_PER_AUXILIARY
++     * The robustness texture values depend only on alpha/beta.  Per-frame Camera2
++     * noise metadata therefore does not require rescanning every RAW merely to
++     * rebuild the same 1001-entry sigma/diff table.  This preserves the exact
++     * robustness curve while removing a full CPU RAW traversal per auxiliary.
++     */
++    public static Curve buildNoiseTableOnly(float alpha, float beta) {
++        alpha = Math.max(alpha, 1.0e-9f);
++        beta = Math.max(beta, 0.0f);
++        final long key = ((long)Float.floatToIntBits(alpha) << 32)
++                ^ (Float.floatToIntBits(beta) & 0xffffffffL);
++        Table table;
++        boolean hit;
++        synchronized (TABLE_CACHE) {
++            table = TABLE_CACHE.get(key);
++            hit = table != null;
++        }
++        if (table == null) {
++            table = buildExactTable(alpha, beta);
++            synchronized (TABLE_CACHE) { TABLE_CACHE.put(key, table); }
++        }
++        ByteBuffer tex = ByteBuffer.allocateDirect((LEVELS + 1) * 16)
++                .order(ByteOrder.nativeOrder());
++        for (int i = 0; i <= LEVELS; i++) {
++            tex.putFloat(table.sigma[i]);
++            tex.putFloat(table.diff[i]);
++            tex.putFloat(i / (float)LEVELS);
++            tex.putFloat(1.0f);
++        }
++        tex.position(0);
++        Log.d(TAG, "IRIS_26483_IPOL_NO_RESCAN_PER_AUXILIARY"
++                + " hit=" + hit + " alpha=" + alpha + " beta=" + beta
++                + " rawCpuScan=false curveMathChanged=false");
++        return new Curve(tex, 0.18f, 0.0f, table.imin, table.imax);
++    }
++
+     public static Curve build(float alpha, float beta, ByteBuffer referenceRaw,
+                               Point rawSize, float[] blackLevel, float whiteLevel,
+                               float canonicalGain) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+index 5760d9e..5f6355c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+@@ -12,17 +12,24 @@ import static android.opengl.GLES20.GL_LINEAR;
+ import static android.opengl.GLES20.GL_NEAREST;
+ 
+ /**
+- * IRIS_26482_WRONSKI_SEQUENTIAL_ALIGNMENT_SCRATCH
++ * IRIS_26483_BJZHOU_ONLINE_LEVELWISE_LK_ALIGNMENT
+  *
+- * Wronski/IPOL equations, levels, radii, metrics and three fine ICA iterations
+- * are unchanged. Only allocations are moved from every auxiliary frame into the
+- * prepared-reference burst lifetime, following the frame-sequential GLES scratch
+- * principle: commands stay in one ordered context, so scratch can be overwritten
+- * on the next frame after the prior frame's dependent commands have been submitted.
++ * Adapted from the current RAWmax/MGC execution architecture rather than legacy
++ * Hdrx/PyramidMerging: one immutable reference pyramid, reference-only gradient /
++ * Hessian products prepared once at every level, then one frame-sequential
++ * coarse-to-fine LK pass per auxiliary using reusable scratch textures.
++ *
++ * Safety invariants remain Iris-owned: the reference geometry is authoritative;
++ * no unaligned alternate is ever returned; consumers still receive a dense flow
++ * texture owned by MotionV2Alignment.Result and may zero unsafe evidence later.
+  */
+ public final class MotionV2WronskiAlignment {
+     private static final String TAG = "MotionV2WronskiAlign";
+     private static final int[] STEP = new int[] {1,2,4,4};
++    // Same finest->coarsest level schedule used by current RAWmax/MGC.
++    private static final int[] TILE = new int[] {32,32,16,8};
++    private static final int[] ITERATIONS = new int[] {2,3,3,3};
++
+     private MotionV2WronskiAlignment() {}
+ 
+     private static Point divCeil(Point p,int d){
+@@ -33,20 +40,20 @@ public final class MotionV2WronskiAlignment {
+         for(int l=1;l<4;l++)s[l]=divCeil(s[l-1],STEP[l]);
+         return s;
+     }
++    private static Point grid(Point level,int tile){
++        return new Point(Math.max(1,(level.x+tile-1)/tile),Math.max(1,(level.y+tile-1)/tile));
++    }
+     private static void closeTexture(GLTexture t){if(t!=null)try{t.close();}catch(Throwable ignored){}}
+     private static void closeArray(GLTexture[] a){if(a!=null)for(GLTexture t:a)closeTexture(t);}
+ 
+     private static final class AlignmentScratch implements AutoCloseable {
+         final GLTexture[] guide=new GLTexture[4];
+         final GLTexture[] gaussianTmp=new GLTexture[4];
+-        final GLTexture[] blockFlow=new GLTexture[4];
+-        GLTexture fineRefined;
++        final GLTexture[] flow=new GLTexture[4];
+         boolean active;
+ 
+-        AlignmentScratch(Point rawHalf,float snr){
++        AlignmentScratch(Point rawHalf){
+             Point[] level=levelSizes(rawHalf);
+-            int baseTile=snr<=14.0f?64:(snr<=22.0f?32:16);
+-            int[] tile=new int[]{baseTile,baseTile,baseTile,Math.max(8,baseTile/2)};
+             try{
+                 guide[0]=new GLTexture(level[0],new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                 for(int l=1;l<4;l++){
+@@ -54,38 +61,33 @@ public final class MotionV2WronskiAlignment {
+                     guide[l]=new GLTexture(level[l],new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
+                 }
+                 for(int l=0;l<4;l++){
+-                    Point grid=new Point(Math.max(1,(level[l].x+tile[l]-1)/tile[l]),Math.max(1,(level[l].y+tile[l]-1)/tile[l]));
+-                    blockFlow[l]=new GLTexture(grid,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    flow[l]=new GLTexture(grid(level[l],TILE[l]),new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                 }
+-                Point fineGrid=new Point(Math.max(1,(level[0].x+tile[0]-1)/tile[0]),Math.max(1,(level[0].y+tile[0]-1)/tile[0]));
+-                fineRefined=new GLTexture(fineGrid,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+             }catch(Throwable t){close();throw t;}
+         }
+         void begin(){if(active)throw new IllegalStateException("Wronski alignment scratch overlap");active=true;}
+         void end(){active=false;}
+-        @Override public void close(){active=false;closeArray(guide);closeArray(gaussianTmp);closeArray(blockFlow);closeTexture(fineRefined);fineRefined=null;}
++        @Override public void close(){active=false;closeArray(guide);closeArray(gaussianTmp);closeArray(flow);}
+     }
+ 
+     public static final class PreparedReference implements AutoCloseable {
+         private final Point rawHalf;
+         private final int cfaPattern;
+         private final float signalScale;
+-        private final float snr;
+         private GLTexture[] levels;
+-        private GLTexture referenceGradient;
+-        private GLTexture fineInverseHessian;
++        private GLTexture[] gradients;
++        private GLTexture[] inverseHessians;
+         private AlignmentScratch scratch;
+ 
+-        private PreparedReference(Point rawHalf,int cfaPattern,float signalScale,float snr,
+-                GLTexture[] levels,GLTexture referenceGradient,GLTexture fineInverseHessian,
++        private PreparedReference(Point rawHalf,int cfaPattern,float signalScale,
++                GLTexture[] levels,GLTexture[] gradients,GLTexture[] inverseHessians,
+                 AlignmentScratch scratch){
+-            this.rawHalf=new Point(rawHalf);this.cfaPattern=cfaPattern;this.signalScale=signalScale;this.snr=snr;
+-            this.levels=levels;this.referenceGradient=referenceGradient;this.fineInverseHessian=fineInverseHessian;this.scratch=scratch;
++            this.rawHalf=new Point(rawHalf);this.cfaPattern=cfaPattern;this.signalScale=signalScale;
++            this.levels=levels;this.gradients=gradients;this.inverseHessians=inverseHessians;this.scratch=scratch;
+         }
+         @Override public void close(){
+-            if(levels!=null){closeArray(levels);levels=null;}
+-            closeTexture(referenceGradient);referenceGradient=null;
+-            closeTexture(fineInverseHessian);fineInverseHessian=null;
++            closeArray(levels);levels=null;closeArray(gradients);gradients=null;
++            closeArray(inverseHessians);inverseHessians=null;
+             if(scratch!=null){scratch.close();scratch=null;}
+         }
+     }
+@@ -125,55 +127,47 @@ public final class MotionV2WronskiAlignment {
+     }
+ 
+     public static PreparedReference prepareReference(Point rawHalf,int cfaPattern,float signalScale,float snr,GLProg glProg,GLTexture referenceCfa){
+-        long start=System.currentTimeMillis();GLTexture[] ref=null;GLTexture gradient=null,hessian=null;AlignmentScratch scratch=null;
++        long start=System.currentTimeMillis();GLTexture[] ref=null,grad=null,hess=null;AlignmentScratch scratch=null;
+         try{
+-            ref=buildGuidePyramid(rawHalf,cfaPattern,signalScale,glProg,referenceCfa);
+-            int baseTile=snr<=14.0f?64:(snr<=22.0f?32:16);
+-            Point fineGrid=new Point(Math.max(1,(rawHalf.x+baseTile-1)/baseTile),Math.max(1,(rawHalf.y+baseTile-1)/baseTile));
+-            gradient=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-            glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_ica_reference_gradient",true);glProg.setVar("levelSize",rawHalf);
+-            glProg.setTexture("ReferenceGuide",ref[0]);glProg.setTextureCompute("OutputGradient",gradient,true);glProg.computeAuto(rawHalf,1);
+-            hessian=new GLTexture(fineGrid,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-            glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_ica_reference_hessian",true);glProg.setVar("levelSize",rawHalf);glProg.setVar("tileSize",baseTile);
+-            glProg.setTexture("ReferenceGradient",gradient);glProg.setTextureCompute("OutputInverseHessian",hessian,true);glProg.computeAuto(fineGrid,1);
+-            scratch=new AlignmentScratch(rawHalf,snr);
+-            Log.d(TAG,"IRIS_26482_WRONSKI_REFERENCE_PREP_AND_SEQUENTIAL_SCRATCH elapsedMs="+(System.currentTimeMillis()-start)
+-                    +" levels=4 referenceProductsReused=true scratchTexturesReused=true perAuxGuideAllocations=0 perAuxTileFlowAllocations=0 icaIterations=3FineOnly");
+-            return new PreparedReference(rawHalf,cfaPattern,signalScale,snr,ref,gradient,hessian,scratch);
+-        }catch(Throwable t){closeArray(ref);closeTexture(gradient);closeTexture(hessian);if(scratch!=null)scratch.close();throw t;}
++            Point[] level=levelSizes(rawHalf);ref=buildGuidePyramid(rawHalf,cfaPattern,signalScale,glProg,referenceCfa);
++            grad=new GLTexture[4];hess=new GLTexture[4];
++            for(int l=0;l<4;l++){
++                grad[l]=new GLTexture(level[l],new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_ica_reference_gradient",true);glProg.setVar("levelSize",level[l]);
++                glProg.setTexture("ReferenceGuide",ref[l]);glProg.setTextureCompute("OutputGradient",grad[l],true);glProg.computeAuto(level[l],1);
++                Point g=grid(level[l],TILE[l]);hess[l]=new GLTexture(g,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_ica_reference_hessian",true);glProg.setVar("levelSize",level[l]);glProg.setVar("tileSize",TILE[l]);
++                glProg.setTexture("ReferenceGradient",grad[l]);glProg.setTextureCompute("OutputInverseHessian",hess[l],true);glProg.computeAuto(g,1);
++            }
++            scratch=new AlignmentScratch(rawHalf);
++            Log.d(TAG,"IRIS_26483_REFERENCE_PRODUCTS_ALL_LEVELS elapsedMs="+(System.currentTimeMillis()-start)
++                    +" levels=4 steps=1,2,4,4 tileStrides=32,32,16,8 lkIterations=2,3,3,3 referenceProductsPreparedOnce=true");
++            return new PreparedReference(rawHalf,cfaPattern,signalScale,ref,grad,hess,scratch);
++        }catch(Throwable t){closeArray(ref);closeArray(grad);closeArray(hess);if(scratch!=null)scratch.close();throw t;}
+     }
+ 
+     public static MotionV2Alignment.Result alignPrepared(PreparedReference p,GLProg glProg,GLTexture alterCfa){
+         if(p==null||p.levels==null||p.scratch==null)throw new IllegalStateException("Wronski prepared reference is closed");
+-        long start=System.currentTimeMillis();int baseTile=p.snr<=14.0f?64:(p.snr<=22.0f?32:16);
+-        int[] tile=new int[]{baseTile,baseTile,baseTile,Math.max(8,baseTile/2)};int[] radius=new int[]{1,4,4,4};int[] metric=new int[]{0,1,1,1};
+-        Point[] level=levelSizes(p.rawHalf);AlignmentScratch s=p.scratch;GLTexture dense=null;GLTexture previous=null;
++        long start=System.currentTimeMillis();Point[] level=levelSizes(p.rawHalf);AlignmentScratch s=p.scratch;GLTexture dense=null;GLTexture previous=null;
+         s.begin();
+         try{
+             fillGuidePyramid(p,glProg,alterCfa);
+             for(int l=3;l>=0;l--){
+-                Point grid=new Point(Math.max(1,(level[l].x+tile[l]-1)/tile[l]),Math.max(1,(level[l].y+tile[l]-1)/tile[l]));
+-                GLTexture block=s.blockFlow[l];
+-                glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_block_match",true);glProg.setVar("levelSize",level[l]);glProg.setVar("tileSize",tile[l]);
+-                glProg.setVar("searchRadius",radius[l]);glProg.setVar("distanceMetric",metric[l]);glProg.setVar("hasPrevious",previous!=null?1:0);
+-                glProg.setVar("previousToCurrentScale",l<3?(float)STEP[l+1]:1.0f);glProg.setTexture("ReferenceGuide",p.levels[l]);glProg.setTexture("MovingGuide",s.guide[l]);
+-                glProg.setTexture("PreviousFlow",previous!=null?previous:p.levels[l]);glProg.setTextureCompute("OutputFlow",block,true);glProg.computeAuto(grid,1);
+-                GLTexture next=block;
+-                if(l==0){
+-                    glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_ica_refine",true);glProg.setVar("levelSize",level[l]);glProg.setVar("tileSize",tile[l]);
+-                    glProg.setTexture("ReferenceGuide",p.levels[l]);glProg.setTexture("MovingGuide",s.guide[l]);glProg.setTexture("BlockFlow",block);
+-                    glProg.setTexture("ReferenceGradient",p.referenceGradient);glProg.setTexture("InverseHessian",p.fineInverseHessian);
+-                    glProg.setTextureCompute("OutputFlow",s.fineRefined,true);glProg.computeAuto(grid,1);next=s.fineRefined;
+-                }
+-                previous=next;
++                Point g=grid(level[l],TILE[l]);GLTexture out=s.flow[l];
++                glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_lk_refine_level",true);
++                glProg.setVar("levelSize",level[l]);glProg.setVar("tileSize",TILE[l]);glProg.setVar("hasInitial",previous!=null?1:0);
++                glProg.setVar("initialToCurrentScale",previous!=null?(float)STEP[l+1]:1.0f);glProg.setVar("iterations",ITERATIONS[l]);
++                glProg.setTexture("ReferenceGuide",p.levels[l]);glProg.setTexture("MovingGuide",s.guide[l]);
++                glProg.setTexture("InitialFlow",previous!=null?previous:p.levels[l]);glProg.setTexture("ReferenceGradient",p.gradients[l]);glProg.setTexture("InverseHessian",p.inverseHessians[l]);
++                glProg.setTextureCompute("OutputFlow",out,true);glProg.computeAuto(g,1);previous=out;
+             }
+             dense=new GLTexture(p.rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-            glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_flow_expand",true);glProg.setVar("outputSize",p.rawHalf);glProg.setVar("tileSize",baseTile);
++            glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_flow_expand",true);glProg.setVar("outputSize",p.rawHalf);glProg.setVar("tileSize",TILE[0]);
+             glProg.setTexture("TileFlow",previous);glProg.setTextureCompute("OutputFlow",dense,true);glProg.computeAuto(p.rawHalf,1);
+             GLTexture keep=dense;dense=null;
+-            Log.d(TAG,"IRIS_26482_WRONSKI_ALIGNMENT_SUBMIT elapsedMs="+(System.currentTimeMillis()-start)
+-                    +" snr="+p.snr+" baseTile="+baseTile+" levels=4 factors=1,2,4,4 radii=1,4,4,4 metrics=L1,L2,L2,L2"
+-                    +" icaIterations=3FineOnly referencePreparedOnce=true sequentialScratchReuse=true mathChanged=false");
++            Log.d(TAG,"IRIS_26483_BJZHOU_ONLINE_LK_SUBMIT elapsedMs="+(System.currentTimeMillis()-start)
++                    +" levels=4 steps=1,2,4,4 tileStrides=32,32,16,8 lkIterations=2,3,3,3 blockSearchPasses=0"
++                    +" referenceProductsPreparedOnce=true sequentialScratchReuse=true denseFlowFrameOwned=true");
+             return new MotionV2Alignment.Result(keep,0.0f,0.0f,1.0f,0.0f);
+         }finally{s.end();if(dense!=null)dense.close();}
+     }
