@@ -17,7 +17,7 @@ TRANSFORM26485_SHA="2e04a8e250d0fb64ca3e4a7763ed4943203d7f1ae740283018a7fb1b90c9
 TRANSFORM26486="transform_26486_full_bjzhou_censored_opponent_latency_v1.py"
 TRANSFORM26486_SHA="3030fa2543c6593711f8822a770c78de25e9347c65717420ffde291c1aad0eca"
 TRANSFORM="transform_26487_reconstruction_correctness_latency_v2.py"
-TRANSFORM_SHA="3e6413d3711e3fb570c0514cffd6bae6bad6e6864cf68de9b3df388ef6238654"
+TRANSFORM_SHA="0580c756d1180554621aa4e7a1848271511fc2094a692b16b3b209df9bda5d77"
 
 NEW_VERSION="0.9726487"
 NEW_BUILD="26487"
@@ -43,7 +43,7 @@ AFTERHASH="$OUTDIR/26487_after.sha256"
 PREBUILDHASH="$OUTDIR/26487_prebuild_canonical.sha256"
 
 exec > >(tee "$AUDIT") 2>&1
-echo "=== 26487 RECONSTRUCTION CORRECTNESS + BOUNDED LATENCY V2 ==="
+echo "=== 26487 RECONSTRUCTION CORRECTNESS + BOUNDED LATENCY V2 SHADERFIX ==="
 date -Iseconds || true
 
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
@@ -411,23 +411,30 @@ app/src/main/assets/shaders/motionv2/short_highlight_recover.glsl
 app/src/main/assets/shaders/motionv2/mfsr_26487_diag_sample.glsl
 EOF
 
-python3 - "$CAND" "$TMP/shaders.txt" <<'PY'
+python3 - "$CAND" "$TMP/shaders.txt" "$TRANSFORM" <<'PY'
 from pathlib import Path
-import sys
-root=Path(sys.argv[1])
-for rel in Path(sys.argv[2]).read_text().splitlines():
-    p=root/rel
-    if not p.is_file(): raise SystemExit("missing shader "+rel)
-    for n,line in enumerate(p.read_text().splitlines(),1):
-        if line.count("layout(")>1:
-            raise SystemExit(f"runtime layout parser hazard {rel}:{n}: {line}")
-        if "layout(" in line:
-            inside=line[line.find("(")+1:line.rfind(")")]
-            for token in inside.split(","):
-                t=token.replace(" ","")
-                if t.startswith("binding="): int(t.split("=",1)[1])
-print("Photon runtime layout-parser compatibility PASS for 26487 shader graph")
+import importlib.util,sys
+root=Path(sys.argv[1]); listing=Path(sys.argv[2]); transform=Path(sys.argv[3])
+spec=importlib.util.spec_from_file_location("iris26487_transform_runtime",transform)
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaders={rel:(root/rel).read_text() for rel in listing.read_text().splitlines()}
+m.validate_photon_runtime_layout_parser(shaders)
 PY
+
+# A standard GLSL compiler catches reserved keywords, but run the same lexical gate
+# before glslang so the failure names the exact identifier/file/line. This covers the
+# prior Photon failures involving sample/common/coherent/precision and the rest of the
+# GLSL/GLSL-ES reserved namespace, including function parameters and locals.
+python3 - "$CAND" "$TMP/shaders.txt" "$TRANSFORM" <<'PY'
+from pathlib import Path
+import importlib.util,sys
+root=Path(sys.argv[1]); listing=Path(sys.argv[2]); transform=Path(sys.argv[3])
+spec=importlib.util.spec_from_file_location("iris26487_transform",transform)
+m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+shaders={rel:(root/rel).read_text() for rel in listing.read_text().splitlines()}
+m.validate_glsl_reserved_identifiers(shaders)
+PY
+pass "complete 26487 shader graph reserved-identifier lexical PASS"
 
 : > "$SHADERLOG"
 compile_shader(){
@@ -459,7 +466,7 @@ while IFS= read -r rel; do
     f="$CAND/$rel"
     ! grep -Eq 'layout\((rg32f|rg16f|r16f)[^)]*\)[^;]*writeonly image2D' "$f" \
         || fail "Adreno hazardous writable format $(basename "$f")"
-    ! grep -Eq '\b(float|vec[234]|int|ivec[234]|uint|uvec[234]|bool)\s+(sample|common|coherent)\b' "$f" \
+    ! grep -Eq '\b(float|vec[234]|int|ivec[234]|uint|uvec[234]|bool|mat[234])\s+(sample|common|coherent|precision)\b' "$f" \
         || fail "reserved GLSL identifier declaration in $(basename "$f")"
 done < "$TMP/shaders.txt"
 pass "Adreno runtime-portability guards"
