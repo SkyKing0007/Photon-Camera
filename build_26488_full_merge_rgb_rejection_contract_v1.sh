@@ -3,8 +3,8 @@ set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
-BACKUP_BRANCH="backup-26487-tested-before-26488-merge-rgb-rejection-diagnostics"
-BACKUP_EXPECTED="19fb9f98538b0d1456a9a1942008d0e67a3fa574"
+BACKUP_BRANCH="backup-26488-failed-r16ui-before-26488-v2-gles-format-fix"
+BACKUP_EXPECTED="a827834a73264a5f7e9b0568e4ec635f9c7993d9"
 
 BASE26483_PATCH="26483_successful_source.patch"
 BASE26483_PATCH_SHA="a993c2c9e12cba8098623fab8b83f0965b9ad2016eded6fd857f55935a1c11db"
@@ -19,7 +19,7 @@ TRANSFORM26486_SHA="3030fa2543c6593711f8822a770c78de25e9347c65717420ffde291c1aad
 TRANSFORM26487="transform_26487_reconstruction_correctness_latency_v2.py"
 TRANSFORM26487_SHA="0580c756d1180554621aa4e7a1848271511fc2094a692b16b3b209df9bda5d77"
 TRANSFORM="transform_26488_full_merge_rgb_rejection_contract_v1.py"
-TRANSFORM_SHA="603382a42a7bcfe6016c41c2a9c1246901c5dfd37d840503cd0a5f583e3d2a04"
+TRANSFORM_SHA="18ee188dfa25563e839c9d9a76ab6961e738ccc061df88a5b7fd861bc5d8112d"
 
 NEW_VERSION="0.9726488"
 NEW_BUILD="26488"
@@ -350,6 +350,12 @@ for name,t in (("MGC guide",guide),("covariance",cov),("chroma guide",chroma)):
 if "inputCfa" in guide or "inputCfa" in cov: raise SystemExit("FLOAT16 CFA still owns native MGC guide/covariance")
 if "referenceGray" not in reduce4 or "/ 16383.0" not in reduce4:
     raise SystemExit("rejection reduce4 does not consume exact Raw16ToGray scale")
+if "layout(r32ui,binding=0)" not in gray:
+    raise SystemExit("reference-gray compute output is not GLES-safe r32ui")
+if "iris26488ReferenceGray = new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.UNSIGNED_32,1)" not in recon:
+    raise SystemExit("reference-gray Java texture is not matching R32UI/UNSIGNED_32")
+if "iris26488ReferenceGray = new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.UNSIGNED_16,1)" in recon:
+    raise SystemExit("illegal 26488 R16UI image-store carrier survived")
 if "32767.0" not in gray or "0.25" not in gray or "0.5" not in gray:
     raise SystemExit("Raw16ToGray clamp/filter contract incomplete")
 if "uniform float gain;" not in gray or "uniform vec4 blackLevel;" not in gray:
@@ -525,8 +531,9 @@ spec=importlib.util.spec_from_file_location("iris26488_transform",transform)
 m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 shaders={rel:(root/rel).read_text() for rel in listing.read_text().splitlines()}
 m.validate_glsl_reserved_identifiers(shaders)
+m.validate_gles_image_store_formats(shaders)
 PY
-pass "complete 26488 shader graph reserved-identifier lexical PASS"
+pass "complete 26488 shader graph reserved-identifier + GLES image-format PASS"
 
 : > "$SHADERLOG"
 compile_shader(){
@@ -556,8 +563,8 @@ pass "complete 26488 shader graph glslangValidator PASS"
 
 while IFS= read -r rel; do
     f="$CAND/$rel"
-    ! grep -Eq 'layout\((rg32f|rg16f|r16f)[^)]*\)[^;]*writeonly image2D' "$f" \
-        || fail "Adreno hazardous writable format $(basename "$f")"
+    ! grep -Eq 'layout\((rg32f|rg16f|r16f|r16ui|rg16ui)[^)]*\)[^;]*(u?image2D|iimage2D)' "$f" \
+        || fail "GLES/Adreno hazardous writable image format $(basename "$f")"
     ! grep -Eq '\b(float|vec[234]|int|ivec[234]|uint|uvec[234]|bool|mat[234])\s+(sample|common|coherent|precision)\b' "$f" \
         || fail "reserved GLSL identifier declaration in $(basename "$f")"
 done < "$TMP/shaders.txt"
@@ -707,7 +714,7 @@ Rejection=reference luma now uses recovered Raw16ToGray contract: per-phase blac
 LensShading=Camera2 four-channel gain map applied in linear semantic RGB normalizer as R, average(Gr,Gb), B before one calculation-WB removal; identity map if unavailable
 Diagnostics=per-aux 24x18 atlases report flow variation/interpolation-cancel/unblocker/initial rejection, pixelDifference/postRejection/finalWeight/initial accept, and physical 0.985 R/G/B/quad clipping; 48x36 report actual frame support and G/RG/BG denominators
 NumericalGate=model-only equation smoke test must remain high-support and is explicitly NOT claimed as proof of phone effective-frame count; phone stage telemetry is authoritative
-BuildSafety=exact tested 26487 reconstruction, exact backup proof, binary pre-edit patch before 26488 transform, strict 11-file allowlist, all other tested-26487 app source protected, Java lexical, exact Photon getLayouts simulation, full GLSL reserved-word scan, glslang full graph, Adreno guards, temporary Gradle, candidate/final source parity, and version increment + final Gradle in one guarded block
+BuildSafety=exact tested 26487 reconstruction, exact backup proof, binary pre-edit patch before 26488 transform, strict 11-file allowlist, all other tested-26487 app source protected, Java lexical, exact Photon getLayouts simulation, full GLSL reserved-word scan, GLES 3.1 image-format whitelist, glslang full graph, Adreno guards, temporary Gradle, candidate/final source parity, and version increment + final Gradle in one guarded block
 EOF
 sha256sum "$APK_NAME" "$SOURCEPATCH" "$AFTERHASH" "$REPORT" "$DELTAOUT" \
     > "$OUTDIR/26488_artifact_hashes.sha256"
