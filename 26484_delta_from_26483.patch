@@ -1,0 +1,494 @@
+diff --git a/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl b/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
+index 0ff12a9..f1be128 100644
+--- a/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
++++ b/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
+@@ -7,6 +7,9 @@ uniform highp sampler2D robustnessTexture;
+ uniform highp sampler2D previousNumerator;
+ uniform highp sampler2D previousDenominator;
+ uniform highp sampler2D previousFrameSupport;
++uniform highp sampler2D chromaGuide;
++uniform float greenNoiseS;
++uniform float greenNoiseO;
+ layout(rgba16f,binding=0) uniform highp readonly image2D alterCfa;
+ layout(rgba32f,binding=1) uniform highp readonly image2D alterCov;
+ layout(rgba32f,binding=2) uniform highp writeonly image2D outNumerator;
+@@ -25,17 +28,17 @@ int componentColor(int c){
+     if(c==3)return 0;if(c==0)return 2;return 1;
+ }
+ float cfaAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));vec4 v=imageLoad(alterCfa,p>>1);int c=componentIndex(p);return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));}
+-float greenAt(ivec2 p){
+-    p=clamp(p,ivec2(0),rawSize-ivec2(1));int color=componentColor(componentIndex(p));if(color==1)return cfaAt(p);
+-    float s=0.0,w=0.0;const ivec2 d0=ivec2(1,0),d1=ivec2(-1,0),d2=ivec2(0,1),d3=ivec2(0,-1);ivec2 d[4]=ivec2[4](d0,d1,d2,d3);
+-    for(int i=0;i<4;i++){ivec2 q=clamp(p+d[i],ivec2(0),rawSize-ivec2(1));if(componentColor(componentIndex(q))==1){s+=cfaAt(q);w+=1.0;}}
+-    return s/max(w,1.0);
+-}
++float greenAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));return texelFetch(chromaGuide,p,0).r;}
++float chromaGuideWeight(float sampleGreen,float targetGreen){float sig=max(max(sampleGreen,targetGreen),0.0);float variance=max(greenNoiseS*sig+greenNoiseO,0.0);float sigma=max(2.5*sqrt(variance),1.0/160.0);float d=(sampleGreen-targetGreen)/sigma;return exp(-0.5*d*d);}
+ mat2 covAt(ivec2 p){p=clamp(p,ivec2(0),rawHalf-ivec2(1));vec4 v=imageLoad(alterCov,p);return mat2(v.x,v.y,v.z,v.w);}
+ mat2 interpolateCov(vec2 gp){ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));vec2 f=fract(gp);mat2 c00=covAt(fl),c01=covAt(ivec2(ce.x,fl.y)),c10=covAt(ivec2(fl.x,ce.y)),c11=covAt(ce);return c00*((1.0-f.x)*(1.0-f.y))+c01*(f.x*(1.0-f.y))+c10*((1.0-f.x)*f.y)+c11*(f.x*f.y);}
+ mat2 invertCov(mat2 m){float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];if(abs(d)<=1e-10)return mat2(1,0,0,1);return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;}
+ 
+-/* IRIS_26483_BJZHOU_JOINT_GREEN_OPPONENT_WRONSKI
++/* IRIS_26484_BJZHOU_COMPLETE_JOINT_OPPONENT_WEIGHTING
++ * Target green uses the same spatial kernel as chroma; R-G/B-G observations are additionally
++ * gated by edge-directed green agreement relative to physical green noise.
++ *
++ * IRIS_26483_BJZHOU_JOINT_GREEN_OPPONENT_WRONSKI
+  * Semantic accumulator = [G, R-G, B-G].  All chroma is anchored to the same
+  * local green structure and the same reference-owned flow/robustness, preventing
+  * three independent RGB regressions from choosing incompatible support at edges.
+@@ -46,13 +49,10 @@ void main(){
+     if(lrMov.x<0.0||lrMov.y<0.0||lrMov.x>=float(rawSize.x)||lrMov.y>=float(rawSize.y))return;
+     ivec2 robustP=clamp(outP>>1,ivec2(0),rawHalf-ivec2(1));float R=clamp(texelFetch(robustnessTexture,robustP,0).r,0.0,1.0);
+     mat2 invCov=invertCov(interpolateCov(lrMov/2.0-0.5));ivec2 center=ivec2(lrMov);vec2 movTarget=lrMov-0.5;
+-    vec3 addNum=vec3(0.0),addDen=vec3(0.0);
+-    for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){
+-        ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;
+-        int c=componentColor(componentIndex(p));vec2 d=vec2(p)-movTarget;float z=max(dot(d,invCov*d),0.0);float w=exp(-0.5*z)*R;float cfaSample=cfaAt(p);
+-        if(c==1){addNum.x+=w*cfaSample;addDen.x+=w;}
+-        else{float g=greenAt(p);float opponent=cfaSample-g;if(c==0){addNum.y+=w*opponent;addDen.y+=w;}else{addNum.z+=w*opponent;addDen.z+=w;}}
+-    }
++    vec3 addNum=vec3(0.0),addDen=vec3(0.0);float greenSum=0.0,greenWeight=0.0;
++    for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;int c=componentColor(componentIndex(p));if(c!=1)continue;vec2 dd=vec2(p)-movTarget;float z=max(dot(dd,invCov*dd),0.0);float w=exp(-0.5*z);greenSum+=w*cfaAt(p);greenWeight+=w;}
++    float targetGreen=greenSum/max(greenWeight,1e-8);addNum.x+=greenSum*R;addDen.x+=greenWeight*R;
++    for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;int c=componentColor(componentIndex(p));if(c==1)continue;vec2 dd=vec2(p)-movTarget;float z=max(dot(dd,invCov*dd),0.0);float sw=exp(-0.5*z);float localGreen=greenAt(p);float w=sw*chromaGuideWeight(localGreen,targetGreen)*R;float opponent=cfaAt(p)-localGreen;if(c==0){addNum.y+=w*opponent;addDen.y+=w;}else{addNum.z+=w*opponent;addDen.z+=w;}}
+     vec4 n=texelFetch(previousNumerator,outP,0);n.rgb+=addNum;imageStore(outNumerator,outP,n);
+     vec4 d=texelFetch(previousDenominator,outP,0);d.rgb+=addDen;imageStore(outDenominator,outP,d);
+     vec4 fs=texelFetch(previousFrameSupport,outP,0);fs.r=min(max(maximumSupport-1.0,0.0),max(fs.r,0.0)+R);fs.gba=vec3(0.0);imageStore(outFrameSupport,outP,fs);
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_chroma_guide.glsl b/app/src/main/assets/shaders/motionv2/mfsr_chroma_guide.glsl
+new file mode 100644
+index 0000000..81fd24f
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_chroma_guide.glsl
+@@ -0,0 +1,12 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp image2D;
++layout(rgba16f,binding=0) uniform highp readonly image2D inputCfa;
++layout(r32f,binding=1) uniform highp writeonly image2D outputGreen;
++uniform ivec2 rawSize;uniform int cfaPattern;
++int ci(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}int color(int c){if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}if(c==3)return 0;if(c==0)return 2;return 1;}
++float cfa(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));vec4 v=imageLoad(inputCfa,p>>1);int c=ci(p);return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));}
++float edgeGreen(ivec2 p,float center){float gL=cfa(p+ivec2(-1,0)),gR=cfa(p+ivec2(1,0)),gU=cfa(p+ivec2(0,-1)),gD=cfa(p+ivec2(0,1));float cL2=cfa(p+ivec2(-2,0)),cR2=cfa(p+ivec2(2,0)),cU2=cfa(p+ivec2(0,-2)),cD2=cfa(p+ivec2(0,2));float hLin=.5*(gL+gR),vLin=.5*(gU+gD);float hCorr=clamp(.25*(2.0*center-cL2-cR2),-.5*abs(gL-gR),.5*abs(gL-gR));float vCorr=clamp(.25*(2.0*center-cU2-cD2),-.5*abs(gU-gD),.5*abs(gU-gD));float h=hLin+hCorr,v=vLin+vCorr;float gh=abs(gL-gR)+abs(2.0*center-cL2-cR2),gv=abs(gU-gD)+abs(2.0*center-cU2-cD2);float bh=gv/max(gh+gv,1e-7);float g=mix(v,h,bh);return clamp(g,min(min(gL,gR),min(gU,gD)),max(max(gL,gR),max(gU,gD)));}
++/* IRIS_26484_BJZHOU_EDGE_DIRECTED_GREEN_GUIDE */
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,rawSize)))return;float c=cfa(p);float g=color(ci(p))==1?c:edgeGreen(p,c);imageStore(outputGreen,p,vec4(g));}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl b/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl
+index 1b6f8cd..870b7ee 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl
+@@ -6,16 +6,19 @@ uniform highp sampler2D TileFlow;
+ layout(rgba16f,binding=0) uniform highp writeonly image2D OutputFlow;
+ uniform ivec2 outputSize;
+ uniform int tileSize;
+-
+-/* IRIS_26462_WRONSKI_NEAREST_TILE_FLOW_EXPAND
+- * Public/IPOL configuration uses nearest flow upscaling. Subpixel precision
+- * remains in each tile flow because ICA refines it in float coordinates.
++uniform float interpolationTolerance;
++vec2 fAt(ivec2 p){ivec2 s=textureSize(TileFlow,0);return texelFetch(TileFlow,clamp(p,ivec2(0),s-ivec2(1)),0).xy;}
++/* IRIS_26484_BJZHOU_SAFE_SPATIAL_FLOW_RECONSTRUCTION
++ * Interpolate only when all four neighboring tile vectors agree with the base vector inside the
++ * MGC tolerance. Otherwise preserve the whole base vector. Z carries local 3x3 flow variation for
++ * rejection; W remains reserved.
+  */
+-void main() {
+-    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+-    if(any(greaterThanEqual(p,outputSize))) return;
+-    ivec2 gs=textureSize(TileFlow,0);
+-    ivec2 tile=clamp(p/max(tileSize,1),ivec2(0),gs-ivec2(1));
+-    vec4 f=texelFetch(TileFlow,tile,0);
+-    imageStore(OutputFlow,p,f);
+-}
+\ No newline at end of file
++void main(){
++ ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,outputSize)))return;int ts=max(tileSize,1);ivec2 gs=textureSize(TileFlow,0);
++ ivec2 tile=clamp(p/ts,ivec2(0),gs-ivec2(1));ivec2 off=p-tile*ts;vec2 base=fAt(tile);vec2 outF=base;
++ bool left=off.x<=ts/2,top=off.y<=ts/2;ivec2 t00=ivec2(left?tile.x-1:tile.x,top?tile.y-1:tile.y);vec2 f00=fAt(t00),f10=fAt(t00+ivec2(1,0)),f01=fAt(t00+ivec2(0,1)),f11=fAt(t00+ivec2(1,1));float th=float(ts)*interpolationTolerance;
++ bool cancel=any(greaterThanEqual(abs(f00-base),vec2(th)))||any(greaterThanEqual(abs(f10-base),vec2(th)))||any(greaterThanEqual(abs(f01-base),vec2(th)))||any(greaterThanEqual(abs(f11-base),vec2(th)));
++ if(!cancel){float ux=float(p.x)/float(ts)-(float(t00.x)+0.5);float uy=float(p.y)/float(ts)-(float(t00.y)+0.5);outF=mix(mix(f00,f10,ux),mix(f01,f11,ux),uy);}
++ vec2 mn=vec2(3.4e38),mx=vec2(-3.4e38);for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 v=fAt(tile+ivec2(x,y));mn=min(mn,v);mx=max(mx,v);}float variation=length((mx-mn)/max(vec2(outputSize),vec2(1.0)));
++ imageStore(OutputFlow,p,vec4(outF,variation,cancel?1.0:0.0));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl b/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl
+index dacdca1..284c88e 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl
+@@ -23,9 +23,8 @@ float movingAt(vec2 p){
+     float b=mix(texelFetch(MovingGuide,ivec2(p0.x,p1.y),0).r,texelFetch(MovingGuide,p1,0).r,f.x);
+     return mix(a,b,f.y);
+ }
+-float refCircular(ivec2 p){
+-    ivec2 q=ivec2((p.x%levelSize.x+levelSize.x)%levelSize.x,(p.y%levelSize.y+levelSize.y)%levelSize.y);
+-    return texelFetch(ReferenceGuide,q,0).r;
++float referenceAt(ivec2 p){
++    return texelFetch(ReferenceGuide,clamp(p,ivec2(0),levelSize-ivec2(1)),0).r;
+ }
+ vec2 initialFlow(ivec2 tile,ivec2 grid){
+     if(hasInitial==0) return vec2(0.0);
+@@ -33,7 +32,10 @@ vec2 initialFlow(ivec2 tile,ivec2 grid){
+     return texture(InitialFlow,clamp(uv,vec2(0.0),vec2(1.0))).xy*initialToCurrentScale;
+ }
+ 
+-/* IRIS_26483_BJZHOU_LEVELWISE_REFERENCE_PRODUCT_LK
++/* IRIS_26484_BJZHOU_CLAMPED_LEVELWISE_LK
++ * No circular frame-edge addressing: reference/current samples clamp to the valid image.
++ *
++ * IRIS_26483_BJZHOU_LEVELWISE_REFERENCE_PRODUCT_LK
+  * Adapt the current RAWmax/MGC alignment execution principle: immutable reference
+  * gradient/Hessian products are prepared once per pyramid level, then every auxiliary
+  * performs only level-local LK updates. Coarse-to-fine flow remains reference-owned.
+@@ -56,7 +58,7 @@ void main(){
+                     ivec2 p=tile*tileSize+ivec2(xx,yy);
+                     if(any(greaterThanEqual(p,levelSize))) continue;
+                     vec2 g=texelFetch(ReferenceGradient,p,0).rg;
+-                    float residual=movingAt(vec2(p)+flow)-refCircular(p);
++                    float residual=movingAt(vec2(p)+flow)-referenceAt(p);
+                     b0+=-g.x*residual;
+                     b1+=-g.y*residual;
+                 }
+@@ -75,7 +77,7 @@ void main(){
+             if(xx>=tileSize) continue;
+             ivec2 p=tile*tileSize+ivec2(xx,yy);
+             if(any(greaterThanEqual(p,levelSize))) continue;
+-            residualSum+=abs(movingAt(vec2(p)+flow)-refCircular(p));
++            residualSum+=abs(movingAt(vec2(p)+flow)-referenceAt(p));
+             n++;
+         }
+     }
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_lk_select_candidate.glsl b/app/src/main/assets/shaders/motionv2/mfsr_lk_select_candidate.glsl
+new file mode 100644
+index 0000000..37a9cb9
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_lk_select_candidate.glsl
+@@ -0,0 +1,33 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp image2D;
++uniform highp sampler2D ReferenceGuide;
++uniform highp sampler2D MovingGuide;
++uniform highp sampler2D CoarseFlow;
++layout(rgba16f,binding=0) uniform highp writeonly image2D OutputFlow;
++uniform ivec2 levelSize;
++uniform ivec2 coarseGridSize;
++uniform int coarseTileSize;
++uniform int targetTileSize;
++uniform float coarseToTargetScale;
++float atRef(ivec2 p){return texelFetch(ReferenceGuide,clamp(p,ivec2(0),levelSize-ivec2(1)),0).r;}
++float atMov(ivec2 p){return texelFetch(MovingGuide,clamp(p,ivec2(0),levelSize-ivec2(1)),0).r;}
++ivec2 clampTile(ivec2 p){return clamp(p,ivec2(0),coarseGridSize-ivec2(1));}
++vec2 flowAt(ivec2 p){return texelFetch(CoarseFlow,clampTile(p),0).xy*coarseToTargetScale;}
++float costAt(ivec2 origin,vec2 f){ivec2 d=ivec2(round(f));float c=0.0;float n=0.0;for(int y=0;y<32;y+=2){if(y>=targetTileSize)continue;for(int x=0;x<32;x+=2){if(x>=targetTileSize)continue;ivec2 p=origin+ivec2(x,y);if(any(greaterThanEqual(p,levelSize)))continue;c+=abs(atRef(p)-atMov(p+d));n+=1.0;}}return c/max(n,1.0);}
++/* IRIS_26484_BJZHOU_THREE_CANDIDATE_L1_UPSAMPLE
++ * Preserve whole coarse vectors at motion boundaries. For each finer tile, test the nearest
++ * coarse flow plus the next-nearest candidate on X and Y in the target-level image, then pass
++ * the best whole vector into LK. This avoids synthesizing a motion vector between objects.
++ */
++void main(){
++ ivec2 t=ivec2(gl_GlobalInvocationID.xy);ivec2 tg=imageSize(OutputFlow);if(any(greaterThanEqual(t,tg)))return;
++ vec2 center=(vec2(t)+0.5)*float(targetTileSize);
++ vec2 cg=center/(max(coarseToTargetScale,1e-6)*float(coarseTileSize))-vec2(0.5);
++ vec2 nr=round(cg);ivec2 near=clampTile(ivec2(nr));ivec2 nx=clampTile(ivec2(nr)+ivec2(cg.x<nr.x?-1:1,0));ivec2 ny=clampTile(ivec2(nr)+ivec2(0,cg.y<nr.y?-1:1));
++ ivec2 origin=t*targetTileSize;vec2 best=flowAt(near);float bestCost=costAt(origin,best);float idx=0.0;
++ vec2 fx=flowAt(nx);float cx=costAt(origin,fx);if(cx<bestCost){best=fx;bestCost=cx;idx=1.0;}
++ vec2 fy=flowAt(ny);float cy=costAt(origin,fy);if(cy<bestCost){best=fy;bestCost=cy;idx=2.0;}
++ imageStore(OutputFlow,t,vec4(best,bestCost,idx));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl b/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
+index 8fcabd8..28004b1 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
+@@ -13,19 +13,26 @@ layout(rgba32f,binding=7) uniform highp writeonly image2D outFrameSupport;
+ uniform ivec2 rawSize;
+ uniform ivec2 rawHalf;
+ uniform int cfaPattern;
++uniform highp sampler2D chromaGuide;
++uniform float greenNoiseS;
++uniform float greenNoiseO;
+ int componentIndex(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+ int componentColor(int c){if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}if(c==3)return 0;if(c==0)return 2;return 1;}
+ float cfaAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));vec4 v=imageLoad(referenceCfa,p>>1);int c=componentIndex(p);return c==0?v.r:(c==1?v.g:(c==2?v.b:v.a));}
+-float greenAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));if(componentColor(componentIndex(p))==1)return cfaAt(p);float s=0.0,w=0.0;ivec2 d[4]=ivec2[4](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1));for(int i=0;i<4;i++){ivec2 q=clamp(p+d[i],ivec2(0),rawSize-ivec2(1));if(componentColor(componentIndex(q))==1){s+=cfaAt(q);w+=1.0;}}return s/max(w,1.0);}
++float greenAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));return texelFetch(chromaGuide,p,0).r;}
++float chromaGuideWeight(float sampleGreen,float targetGreen){float sig=max(max(sampleGreen,targetGreen),0.0);float variance=max(greenNoiseS*sig+greenNoiseO,0.0);float sigma=max(2.5*sqrt(variance),1.0/160.0);float d=(sampleGreen-targetGreen)/sigma;return exp(-0.5*d*d);}
+ mat2 covAt(ivec2 p){p=clamp(p,ivec2(0),rawHalf-ivec2(1));vec4 v=imageLoad(referenceCov,p);return mat2(v.x,v.y,v.z,v.w);}
+ mat2 interpolateCov(vec2 gp){ivec2 fl=ivec2(max(floor(gp),vec2(0.0)));ivec2 ce=min(fl+ivec2(1),rawHalf-ivec2(1));vec2 f=fract(gp);mat2 c00=covAt(fl),c01=covAt(ivec2(ce.x,fl.y)),c10=covAt(ivec2(fl.x,ce.y)),c11=covAt(ce);return c00*((1.0-f.x)*(1.0-f.y))+c01*(f.x*(1.0-f.y))+c10*((1.0-f.x)*f.y)+c11*(f.x*f.y);}
+ mat2 invertCov(mat2 m){float d=m[0][0]*m[1][1]-m[0][1]*m[1][0];if(abs(d)<=1e-10)return mat2(1,0,0,1);return mat2(m[1][1],-m[0][1],-m[1][0],m[0][0])/d;}
+ 
++/* IRIS_26484_BJZHOU_REFERENCE_OPPONENT_GUIDE_MATCH
++ * Reference uses the same green/opponent kernel and noise-aware guide weighting as auxiliaries.
++ */
+ /* IRIS_26483_JOINT_REFERENCE_ADD_ONCE */
+ void main(){
+     ivec2 outP=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(outP,rawSize)))return;
+     vec4 oldNum=imageLoad(currentNumerator,outP),oldDen=imageLoad(currentDenominator,outP),fs=imageLoad(currentFrameSupport,outP);
+     vec2 coarse=vec2(outP);mat2 invCov=invertCov(interpolateCov((coarse-vec2(0.5))/2.0));ivec2 center=ivec2(round(coarse));vec3 refNum=vec3(0),refDen=vec3(0);
+-    for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;int c=componentColor(componentIndex(p));vec2 delta=vec2(p)-coarse;float z=max(dot(delta,invCov*delta),0.0);float w=exp(-0.5*z);float cfaSample=cfaAt(p);if(c==1){refNum.x+=cfaSample*w;refDen.x+=w;}else{float opp=cfaSample-greenAt(p);if(c==0){refNum.y+=opp*w;refDen.y+=w;}else{refNum.z+=opp*w;refDen.z+=w;}}}
++    float gs=0.0,gw=0.0;for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;int c=componentColor(componentIndex(p));if(c!=1)continue;vec2 delta=vec2(p)-coarse;float w=exp(-0.5*max(dot(delta,invCov*delta),0.0));gs+=cfaAt(p)*w;gw+=w;}float targetGreen=gs/max(gw,1e-8);refNum.x+=gs;refDen.x+=gw;for(int iy=-1;iy<=1;iy++)for(int ix=-1;ix<=1;ix++){ivec2 p=center+ivec2(ix,iy);if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,rawSize)))continue;int c=componentColor(componentIndex(p));if(c==1)continue;vec2 delta=vec2(p)-coarse;float sw=exp(-0.5*max(dot(delta,invCov*delta),0.0));float lg=greenAt(p);float w=sw*chromaGuideWeight(lg,targetGreen);float opp=cfaAt(p)-lg;if(c==0){refNum.y+=opp*w;refDen.y+=w;}else{refNum.z+=opp*w;refDen.z+=w;}}
+     imageStore(outNumerator,outP,vec4(oldNum.rgb+refNum,0.0));imageStore(outDenominator,outP,vec4(oldDen.rgb+refDen,1.0));imageStore(outFrameSupport,outP,vec4(max(fs.r,0.0),0,0,0));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl b/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl
+new file mode 100644
+index 0000000..7995320
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl
+@@ -0,0 +1,10 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;precision highp image2D;
++layout(rgba16f,binding=0) uniform highp readonly image2D inputCfa;layout(rgba32f,binding=1) uniform highp writeonly image2D outputCov;
++uniform ivec2 rawHalf;uniform int cfaPattern;uniform float noiseS;uniform float noiseO;
++vec4 qAt(ivec2 q){return imageLoad(inputCfa,clamp(q,ivec2(0),rawHalf-ivec2(1)));}
++vec4 canon(vec4 v){if(cfaPattern==0)return v;if(cfaPattern==1)return vec4(v.g,v.r,v.a,v.b);if(cfaPattern==2)return vec4(v.b,v.a,v.r,v.g);return vec4(v.a,v.b,v.g,v.r);}
++void grad(float dx,float dy,inout vec4 t){t+=vec4(dx*dx,dy*dy,dx*dy,0);}
++/* IRIS_26484_BJZHOU_STRUCTURE_ADAPTIVE_RGB_PRECISION */
++void main(){ivec2 c=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(c,rawHalf)))return;float g0[9],g1[9];float gs=0,gs2=0;vec4 ten=vec4(0);for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec4 v=canon(qAt(c+ivec2(x,y)));int i=(y+1)*3+x+1;g0[i]=v.g;g1[i]=v.b;gs+=v.g+v.b;gs2+=v.g*v.g+v.b*v.b;}for(int y=0;y<2;y++)for(int x=0;x<2;x++){float a=g0[y*3+x],b=g0[y*3+x+1],d=g1[y*3+x],e=g1[y*3+x+1],f=g0[(y+1)*3+x],h=g0[(y+1)*3+x+1],i=g1[(y+1)*3+x],j=g1[(y+1)*3+x+1];grad(.5*((e-b)+(h-d)),.5*((b-d)+(e-h)),ten);grad(.5*((h-d)+(i-f)),.5*((h-i)+(d-f)),ten);grad(.5*(h-a),.5*(b-f),ten);grad(.5*(j-d),.5*(e-i),ten);}ten/=16.0;float trace=ten.x+ten.y,diff=ten.x-ten.y,disc=sqrt(max(diff*diff+4.0*ten.z*ten.z,0.0));float l1=.5*(trace+disc),l2=.5*(trace-disc);vec2 e1=vec2(1,0);if(abs(ten.z)>1e-4)e1=normalize(vec2(ten.z,l1-ten.x))*-sign(ten.z);else if(ten.x<ten.y)e1=vec2(0,1);vec2 e2=vec2(-e1.y,e1.x);float s1=sqrt(max(l1,0)),s2=sqrt(max(l2,0));float mean=gs/18.0,var=max(gs2/18.0-mean*mean,0.0),greenNoise=max(noiseS*max(mean,0.0)+noiseO,1e-8);l1*=l1/max(l1+.75*greenNoise,1e-8);float strength=sqrt(max(l1,0)),coh=(s1-s2)/(s1+s2+1e-6);float corrStd=sqrt(var*var/max(var+greenNoise,1e-8));float dom=max(strength,corrStd)-.001;float blur=clamp(1.0-dom*142.8571429,0,1);float a=mix(4.0,6.0,min(coh,strength*5.0));float p1=mix(a,1.0,blur),p2=mix(mix(4.0,1.3333333,coh),1.0,blur);mat2 R=mat2(e1,e2);mat2 P=transpose(R)*mat2(p1*p1,0,0,p2*p2)*R;imageStore(outputCov,c,vec4(P[0][0],P[0][1],P[1][0],P[1][1]));}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl b/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl
+index 86905a4..0b9f212 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl
+@@ -39,13 +39,18 @@ void dogsonRef(vec2 p,out vec3 mu,out vec3 var){ivec2 c=ivec2(round(p));vec3 sm=
+ vec3 dogsonAlt(vec2 p){ivec2 c=ivec2(round(p));vec3 sm=vec3(0);float sw=0.0;for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){ivec2 q=clamp(c+ivec2(x,y),ivec2(0),rawHalf-ivec2(1));float w=dogson(float(q.x)-p.x)*dogson(float(q.y)-p.y);sm+=localMeanAlt(q)*w;sw+=w;}return sm/max(sw,1e-8);}
+ vec2 ipolNoise(float b){int idx=clamp(int(round(1000.0*clamp(b,0.0,1.0))),0,1000);return texelFetch(noiseCurve,ivec2(idx,0),0).rg;}
+ 
+-/* IRIS_26483_HALF_RES_ROBUSTNESS_ON_BAYER_QUADS
++/* IRIS_26484_BJZHOU_FLOW_VARIATION_REJECTION_CORE
++ * Flow variation from the safe spatial reconstruction becomes an explicit motion prior;
++ * photometric residual is normalized by the per-frame physical noise curve before admission.
++ * Existing 5x5 conservative erosion remains the final spatial rejection expansion.
++ *
++ * IRIS_26483_HALF_RES_ROBUSTNESS_ON_BAYER_QUADS
+  * Robustness evidence is intrinsically built from packed Bayer-quad statistics.
+  * Evaluate it once per Bayer quad instead of four times per physical RAW pixel.
+  */
+ void main(){
+     ivec2 q=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(q,rawHalf)))return;
+-    vec2 flow=texelFetch(flowTexture,q,0).xy;
++    vec4 flowState=texelFetch(flowTexture,q,0);vec2 flow=flowState.xy;
+     vec2 alt=vec2(q)+flow;
+     if(alt.x<0.0||alt.y<0.0||alt.x>=float(rawHalf.x)||alt.y>=float(rawHalf.y)){imageStore(outRobustness,q,vec4(0));return;}
+     vec3 refMu,refVar;dogsonRef(vec2(q),refMu,refVar);vec3 altMu=dogsonAlt(alt);vec3 dp=abs(refMu-altMu);
+@@ -53,6 +58,5 @@ void main(){
+     for(int c=0;c<3;c++){vec2 curve=ipolNoise(refMu[c]);float sigmaT=max(curve.x,1e-8),dT=max(curve.y,1e-8);float dp2=dp[c]*dp[c];float shrink=dp2/max(dp2+dT*dT,1e-12);d2+=dp2*shrink*shrink;sigma2+=max(refVar[c],sigmaT*sigmaT);}
+     vec2 mn=vec2(3.402823e38),mx=vec2(-3.402823e38);int ts=max(tileSizePacked,1);
+     for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){ivec2 qq=clamp(q+ivec2(x,y)*ts,ivec2(0),rawHalf-ivec2(1));vec2 f=texelFetch(flowTexture,qq,0).xy;mn=min(mn,f);mx=max(mx,f);}
+-    vec2 span=mx-mn;float S=dot(span,span)>0.2?2.0:12.0;
+-    float R=clamp(S*exp(-d2/max(sigma2,1e-12))-0.12,0.0,1.0);imageStore(outRobustness,q,vec4(R));
++    vec2 span=mx-mn;float motionPrior=max(flowState.z,length(span)/max(length(vec2(rawHalf)),1.0));float robustnessBoost=motionPrior>9.88235261e-5?6.0:1.0;float photometric=exp2(min(-0.07*d2/max(sigma2,1e-12),0.0));float unblocker=clamp(motionPrior*32.0,0.0,0.95);float R=min(1.0-unblocker,photometric);R=pow(clamp(R,0.0,1.0),robustnessBoost>1.0?1.15:1.0);imageStore(outRobustness,q,vec4(R));
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 61f85b6..62d06b1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -2818,6 +2818,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      */
+     public void unlockFocus() {
+         try {
++            /* IRIS_26484_UNLOCK_FOCUS_NULL_BUILDER_GUARD */
++            if (captureBuilder == null || mCaptureSession == null) {
++                Log.w(TAG, "26484 unlockFocus skipped: builder/session unavailable");
++                mState = STATE_PREVIEW;
++                return;
++            }
+             // Reset the auto-focus trigger
+             //mCaptureSession.stopRepeating();
+             //mCaptureSession.abortCaptures();
+@@ -3162,6 +3168,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         burst = false;
+         mMotionTopUpActive = true;
+ 
++        /* IRIS_26484_IMMEDIATE_MOTION_SHUTTER_ACK
++         * UI acknowledgement is not gated by the 1.4 s RAW top-up readiness loop. The actual
++         * processing batch still waits for normal capture readiness; this only removes the frozen
++         * shutter/animation perception.
++         */
++        try { cameraEventsListener.onCaptureStillPictureStarted("ZSLCaptureStarted!"); }
++        catch (Exception uiError) { Log.e(TAG,"26484 immediate shutter ack failed",uiError); }
++
+         final boolean iris26480ShortHighlightRequested =
+                 applyMotion26480ExplicitShortCaptureIfNeeded();
+ 
+@@ -3938,7 +3952,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMeasuredFrameCnt = actualCount;
+ 
+         cameraEventsListener.onFrameCountSet(actualCount);
+-        cameraEventsListener.onCaptureStillPictureStarted("ZSLCaptureStarted!");
++        /* IRIS_26484_SHUTTER_ACK_ALREADY_SENT_AT_PRESS */
+         cameraEventsListener.onBurstPrepared(null);
+         final double frametime = exposureTimeNs > 0 ? ExposureIndex.time2sec(exposureTimeNs) : previewExpTime;
+         for (int i = 0; i < actualCount; i++) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index f3e8ede..b94c5e7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -303,6 +303,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+         /* IRIS_26463_WRONSKI_WB_DOMAIN_REFERENCE */
+         GLTexture wronskiReferenceCfa = null;
+         GLTexture wronskiReferenceCov = null;
++        GLTexture wronskiReferenceChromaGuide = null;
+         MotionV2WronskiAlignment.PreparedReference wronskiPreparedAlignment = null;
+         GLTexture mergedA = null;
+         GLTexture mergedB = null;
+@@ -494,19 +495,17 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                         null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+                 glProg.setLayout(tile, tile, 1);
+-                glProg.useAssetProgram("motionv2/mfsr_kernel_covariance", true);
++                glProg.useAssetProgram("motionv2/mfsr_mgc_covariance", true);
+                 glProg.setVar("rawHalf", rawHalf);
+                 glProg.setVar("noiseS", noiseS);
+                 glProg.setVar("noiseO", noiseO);
+-                glProg.setVar("kDetail", mfsrKDetail);
+-                glProg.setVar("kDenoise", mfsrKDenoise);
+-                glProg.setVar("Dth", mfsrDth);
+-                glProg.setVar("Dtr", mfsrDtr);
+-                glProg.setVar("kStretch", mfsrKStretch);
+-                glProg.setVar("kShrink", mfsrKShrink);
++                glProg.setVar("cfaPattern", (int) parameters.cfaPattern);
+                 glProg.setTextureCompute("inputCfa", wronskiReferenceCfa, false);
+                 glProg.setTextureCompute("outputCov", wronskiReferenceCov, true);
+                 glProg.computeAuto(rawHalf, 1);
++
++                wronskiReferenceChromaGuide = new GLTexture(raw,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_chroma_guide",true);glProg.setVar("rawSize",raw);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setTextureCompute("inputCfa",wronskiReferenceCfa,false);glProg.setTextureCompute("outputGreen",wronskiReferenceChromaGuide,true);glProg.computeAuto(raw,1);
+             }
+ 
+             if (directBayer) {
+@@ -719,12 +718,13 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 } catch (Throwable ignored) {}
+             }
+ 
+-            /* IRIS_26483_BJZHOU_ONLINE_FRAME_SEQUENTIAL_MERGE
++            /* IRIS_26484_BJZHOU_COUPLED_ALIGNMENT_REJECTION_OPPONENT_MERGE
++     * IRIS_26483_BJZHOU_ONLINE_FRAME_SEQUENTIAL_MERGE
+              * One auxiliary upload -> WB/CFA -> covariance -> cached-reference LK ->
+              * half-res robustness -> immediate semantic accumulation -> scratch reuse.
+              */
+             GLTexture iris26480RawScratch=null,iris26480CfaScratch=null,iris26480WbCfaScratch=null;
+-            GLTexture iris26480CovScratch=null,iris26480RobustRawScratch=null,iris26480RobustMinScratch=null;
++            GLTexture iris26480CovScratch=null,iris26480ChromaGuideScratch=null,iris26480RobustRawScratch=null,iris26480RobustMinScratch=null;
+             for (int i = 1; i < frameCount; i++) {
+                 ImageFrame frame = images.get(i);
+                 float[] iris26480Noise=iris26480FrameNoise(frame,noiseS,noiseO,canonicalGain);
+@@ -779,6 +779,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 GLTexture alterCfa = null;
+                 GLTexture wronskiAlterCfa = null;
+                 GLTexture wronskiAlterCov = null;
++                GLTexture wronskiAlterChromaGuide = null;
+                 try {
+                     if(iris26480RawScratch==null)iris26480RawScratch=new GLTexture(raw,
+                             new GLFormat(GLFormat.DataType.UNSIGNED_16,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+@@ -834,19 +835,15 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                         wronskiAlterCov=iris26480CovScratch;
+                         glProg.setLayout(tile, tile, 1);
+-                        glProg.useAssetProgram("motionv2/mfsr_kernel_covariance", true);
++                        glProg.useAssetProgram("motionv2/mfsr_mgc_covariance", true);
+                         glProg.setVar("rawHalf", rawHalf);
+                         glProg.setVar("noiseS", iris26480FrameNoiseS);
+                         glProg.setVar("noiseO", iris26480FrameNoiseO);
+-                        glProg.setVar("kDetail", mfsrKDetail);
+-                        glProg.setVar("kDenoise", mfsrKDenoise);
+-                        glProg.setVar("Dth", mfsrDth);
+-                        glProg.setVar("Dtr", mfsrDtr);
+-                        glProg.setVar("kStretch", mfsrKStretch);
+-                        glProg.setVar("kShrink", mfsrKShrink);
++                        glProg.setVar("cfaPattern", (int) parameters.cfaPattern);
+                         glProg.setTextureCompute("inputCfa", wronskiAlterCfa, false);
+                         glProg.setTextureCompute("outputCov", wronskiAlterCov, true);
+                         glProg.computeAuto(rawHalf, 1);
++                        if(iris26480ChromaGuideScratch==null)iris26480ChromaGuideScratch=new GLTexture(raw,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);wronskiAlterChromaGuide=iris26480ChromaGuideScratch;glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_chroma_guide",true);glProg.setVar("rawSize",raw);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setTextureCompute("inputCfa",wronskiAlterCfa,false);glProg.setTextureCompute("outputGreen",wronskiAlterChromaGuide,true);glProg.computeAuto(raw,1);
+                         long iris26468CovMs =
+                                 System.currentTimeMillis() - iris26468CovStart;
+                         Log.d(TAG, "IRIS_26468_STAGE_TIMING"
+@@ -994,6 +991,8 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 glProg.setTexture(
+                                         "previousFrameSupport",
+                                         currentDirectFrameSupport);
++                                glProg.setTexture("chromaGuide",wronskiAlterChromaGuide);
++                                glProg.setVar("greenNoiseS",iris26480FrameNoiseS);glProg.setVar("greenNoiseO",iris26480FrameNoiseO);
+                                 glProg.setTextureCompute(
+                                         "alterCfa",
+                                         wronskiAlterCfa,
+@@ -1162,6 +1161,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             if(iris26480RobustMinScratch!=null)iris26480RobustMinScratch.close();
+             if(iris26480RobustRawScratch!=null)iris26480RobustRawScratch.close();
+             if(iris26480CovScratch!=null)iris26480CovScratch.close();
++            if(iris26480ChromaGuideScratch!=null)iris26480ChromaGuideScratch.close();
+             if(iris26480WbCfaScratch!=null)iris26480WbCfaScratch.close();
+             if(iris26480CfaScratch!=null)iris26480CfaScratch.close();
+             if(iris26480RawScratch!=null)iris26480RawScratch.close();
+@@ -1224,6 +1224,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 glProg.setLayout(tile, tile, 1);
+                 glProg.useAssetProgram("motionv2/mfsr_low_support_reference", true);
+                 glProg.setVar("rawSize", raw); glProg.setVar("rawHalf", rawHalf); glProg.setVar("cfaPattern", (int) parameters.cfaPattern);
++                    glProg.setTexture("chromaGuide",wronskiReferenceChromaGuide);glProg.setVar("greenNoiseS",noiseS);glProg.setVar("greenNoiseO",noiseO);
+                 glProg.setVar("clipR", canonicalGain * wronskiGlobalWbR); glProg.setVar("clipG", canonicalGain * wronskiGlobalWbG); glProg.setVar("clipB", canonicalGain * wronskiGlobalWbB);
+                 glProg.setTextureCompute("referenceCfa", wronskiReferenceCfa, false); glProg.setTextureCompute("referenceCov", wronskiReferenceCov, false);
+                 glProg.setTextureCompute("currentNumerator", currentDirectRgb, false); glProg.setTextureCompute("currentDenominator", currentDirectSupport, false); glProg.setTextureCompute("currentFrameSupport", currentDirectFrameSupport, false);
+@@ -1592,6 +1593,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             if (mergedB != null) mergedB.close();
+             if (mergedA != null) mergedA.close();
+             if (wronskiReferenceCov != null) wronskiReferenceCov.close();
++            if (wronskiReferenceChromaGuide != null) wronskiReferenceChromaGuide.close();
+             if (wronskiPreparedAlignment != null) wronskiPreparedAlignment.close();
+             if (wronskiReferenceCfa != null) wronskiReferenceCfa.close();
+             if (referenceCfa != null) referenceCfa.close();
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+index 5f6355c..3cce6b9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+@@ -50,6 +50,8 @@ public final class MotionV2WronskiAlignment {
+         final GLTexture[] guide=new GLTexture[4];
+         final GLTexture[] gaussianTmp=new GLTexture[4];
+         final GLTexture[] flow=new GLTexture[4];
++        final GLTexture[] selected=new GLTexture[4];
++        GLTexture mergeGrid;
+         boolean active;
+ 
+         AlignmentScratch(Point rawHalf){
+@@ -62,12 +64,14 @@ public final class MotionV2WronskiAlignment {
+                 }
+                 for(int l=0;l<4;l++){
+                     flow[l]=new GLTexture(grid(level[l],TILE[l]),new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    if(l<3)selected[l]=new GLTexture(grid(level[l],TILE[l]),new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                 }
++                mergeGrid=new GLTexture(grid(level[0],8),new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+             }catch(Throwable t){close();throw t;}
+         }
+         void begin(){if(active)throw new IllegalStateException("Wronski alignment scratch overlap");active=true;}
+         void end(){active=false;}
+-        @Override public void close(){active=false;closeArray(guide);closeArray(gaussianTmp);closeArray(flow);}
++        @Override public void close(){active=false;closeArray(guide);closeArray(gaussianTmp);closeArray(flow);closeArray(selected);closeTexture(mergeGrid);mergeGrid=null;}
+     }
+ 
+     public static final class PreparedReference implements AutoCloseable {
+@@ -153,19 +157,21 @@ public final class MotionV2WronskiAlignment {
+         try{
+             fillGuidePyramid(p,glProg,alterCfa);
+             for(int l=3;l>=0;l--){
+-                Point g=grid(level[l],TILE[l]);GLTexture out=s.flow[l];
++                Point g=grid(level[l],TILE[l]);GLTexture out=s.flow[l];GLTexture initial=previous;
++                if(previous!=null){GLTexture selected=s.selected[l];glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_lk_select_candidate",true);glProg.setVar("levelSize",level[l]);glProg.setVar("coarseGridSize",grid(level[l+1],TILE[l+1]));glProg.setVar("coarseTileSize",TILE[l+1]);glProg.setVar("targetTileSize",TILE[l]);glProg.setVar("coarseToTargetScale",(float)STEP[l+1]);glProg.setTexture("ReferenceGuide",p.levels[l]);glProg.setTexture("MovingGuide",s.guide[l]);glProg.setTexture("CoarseFlow",previous);glProg.setTextureCompute("OutputFlow",selected,true);glProg.computeAuto(g,1);initial=selected;}
+                 glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_lk_refine_level",true);
+-                glProg.setVar("levelSize",level[l]);glProg.setVar("tileSize",TILE[l]);glProg.setVar("hasInitial",previous!=null?1:0);
+-                glProg.setVar("initialToCurrentScale",previous!=null?(float)STEP[l+1]:1.0f);glProg.setVar("iterations",ITERATIONS[l]);
++                glProg.setVar("levelSize",level[l]);glProg.setVar("tileSize",TILE[l]);glProg.setVar("hasInitial",initial!=null?1:0);
++                glProg.setVar("initialToCurrentScale",1.0f);glProg.setVar("iterations",ITERATIONS[l]);
+                 glProg.setTexture("ReferenceGuide",p.levels[l]);glProg.setTexture("MovingGuide",s.guide[l]);
+-                glProg.setTexture("InitialFlow",previous!=null?previous:p.levels[l]);glProg.setTexture("ReferenceGradient",p.gradients[l]);glProg.setTexture("InverseHessian",p.inverseHessians[l]);
++                glProg.setTexture("InitialFlow",initial!=null?initial:p.levels[l]);glProg.setTexture("ReferenceGradient",p.gradients[l]);glProg.setTexture("InverseHessian",p.inverseHessians[l]);
+                 glProg.setTextureCompute("OutputFlow",out,true);glProg.computeAuto(g,1);previous=out;
+             }
++            Point mergeGridSize=grid(level[0],8);glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_lk_select_candidate",true);glProg.setVar("levelSize",level[0]);glProg.setVar("coarseGridSize",grid(level[0],TILE[0]));glProg.setVar("coarseTileSize",TILE[0]);glProg.setVar("targetTileSize",8);glProg.setVar("coarseToTargetScale",1.0f);glProg.setTexture("ReferenceGuide",p.levels[0]);glProg.setTexture("MovingGuide",s.guide[0]);glProg.setTexture("CoarseFlow",previous);glProg.setTextureCompute("OutputFlow",s.mergeGrid,true);glProg.computeAuto(mergeGridSize,1);previous=s.mergeGrid;
+             dense=new GLTexture(p.rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-            glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_flow_expand",true);glProg.setVar("outputSize",p.rawHalf);glProg.setVar("tileSize",TILE[0]);
++            glProg.setLayout(8,8,1);glProg.useAssetProgram("motionv2/mfsr_flow_expand",true);glProg.setVar("outputSize",p.rawHalf);glProg.setVar("tileSize",8);glProg.setVar("interpolationTolerance",1.0f/16.0f);
+             glProg.setTexture("TileFlow",previous);glProg.setTextureCompute("OutputFlow",dense,true);glProg.computeAuto(p.rawHalf,1);
+             GLTexture keep=dense;dense=null;
+-            Log.d(TAG,"IRIS_26483_BJZHOU_ONLINE_LK_SUBMIT elapsedMs="+(System.currentTimeMillis()-start)
++            Log.d(TAG,"IRIS_26484_BJZHOU_COMPLETE_FLOW_CHAIN elapsedMs="+(System.currentTimeMillis()-start)
+                     +" levels=4 steps=1,2,4,4 tileStrides=32,32,16,8 lkIterations=2,3,3,3 blockSearchPasses=0"
+                     +" referenceProductsPreparedOnce=true sequentialScratchReuse=true denseFlowFrameOwned=true");
+             return new MotionV2Alignment.Result(keep,0.0f,0.0f,1.0f,0.0f);

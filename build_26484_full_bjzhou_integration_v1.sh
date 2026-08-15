@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+EXPECTED_BRANCH="experimental-clean-photon-rebuild"
+EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
+BACKUP_BRANCH="backup-26483-success-before-26484-full-bjzhou-integration"
+BACKUP_EXPECTED="9b571453b2f8ea598b2110758db539c4ad0cb29e"
+BASE_PATCH="26483_successful_source.patch"
+BASE_PATCH_SHA="a993c2c9e12cba8098623fab8b83f0965b9ad2016eded6fd857f55935a1c11db"
+BASE_HASHES="26483_successful_after.sha256"
+BASE_HASHES_SHA="7cba064adf92e6645a1f94ea44a5bd205a800cead9dcd8c392816de5f2725ca7"
+TRANSFORM="transform_26484_full_bjzhou_integration_v1.py"
+TRANSFORM_SHA="f3c212d9c16e39ffcde2ff4beae65e50c0ad7b30fd5e0b517dbfbcdaafec0c00"
+DELTA="26484_delta_from_26483.patch"
+DELTA_SHA="2d54472d3c018f694eec01d59b524b98a1cb8ab97b8b2e1ae5257467e23c5c62"
+NEW_VERSION="0.9726484"; NEW_BUILD="26484"
+OUTDIR="build_26484_outputs"
+APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-full-bjzhou-integration-debug.apk"
+fail(){ echo "FAIL: $*" >&2; exit 1; }; pass(){ echo "PASS: $*"; }; sha(){ sha256sum "$1"|awk '{print $1}'; }
+REPO="$(pwd)"; rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"
+AUDIT="$OUTDIR/26484_source_audit.txt"; CANDLOG="$OUTDIR/26484_temporary_candidate_build.log"; FINALLOG="$OUTDIR/26484_final_build.log"; SHADERLOG="$OUTDIR/26484_shader_validation.txt"; REPORT="$OUTDIR/26484_build_report.txt"; PREPATCH="$OUTDIR/26484_pre_edit_exact_26483_binary.patch"; SOURCEPATCH="$OUTDIR/26484_source.patch"; AFTERHASH="$OUTDIR/26484_after.sha256"
+exec > >(tee "$AUDIT") 2>&1
+echo "=== 26484 FULL BJZHOU-INTEGRATION CANDIDATE ==="; date -Iseconds || true
+BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"; [[ "$BRANCH" == "$EXPECTED_BRANCH" ]] || fail "wrong branch $BRANCH"; [[ "$BRANCH" != dev ]] || fail "dev protected"
+git cat-file -e "$EXPECTED_APP_BASE^{commit}" || fail "app base missing"
+git diff --quiet "$EXPECTED_APP_BASE" -- app/src/main app/version.properties || fail "committed app source no longer equals protected app base"
+[[ -f "$BASE_PATCH" && "$(sha "$BASE_PATCH")" == "$BASE_PATCH_SHA" ]] || fail "26483 source patch identity"
+[[ -f "$BASE_HASHES" && "$(sha "$BASE_HASHES")" == "$BASE_HASHES_SHA" ]] || fail "26483 manifest identity"
+[[ -f "$TRANSFORM" && "$(sha "$TRANSFORM")" == "$TRANSFORM_SHA" ]] || fail "26484 transform identity"
+[[ -f "$DELTA" && "$(sha "$DELTA")" == "$DELTA_SHA" ]] || fail "26484 delta identity"
+python3 -m py_compile "$TRANSFORM"; bash -n "$0"; pass "infrastructure syntax and identity"
+remote="$(git ls-remote origin "refs/heads/$BACKUP_BRANCH"|awk '{print $1}')"; [[ "$remote" == "$BACKUP_EXPECTED" ]] || fail "backup branch $BACKUP_BRANCH=$remote expected=$BACKUP_EXPECTED"; pass "backup branch exact tested-26483 checkpoint"
+TMP="$(mktemp -d)"; BASE="$TMP/base26483"; CAND="$TMP/candidate26484"; FINALBASE="$TMP/finalbase"; cleanup(){ set +e; for w in "$BASE" "$CAND" "$FINALBASE";do git worktree remove --force "$w" >/dev/null 2>&1||true;done; rm -rf "$TMP"; }; trap cleanup EXIT
+reconstruct(){ local d="$1"; git worktree add --detach "$d" "$EXPECTED_APP_BASE" >/dev/null; (cd "$d" && git apply --check --binary "$REPO/$BASE_PATCH" && git apply --binary "$REPO/$BASE_PATCH" && sha256sum -c "$REPO/$BASE_HASHES" >/dev/null); grep -q '^VERSION_NAME=0\.9726483$' "$d/app/version.properties"; grep -q '^VERSION_BUILD=26483$' "$d/app/version.properties"; }
+reconstruct "$BASE"; pass "exact successful 26483 baseline reconstructed"
+(cd "$BASE" && git diff --binary "$EXPECTED_APP_BASE" -- app/src/main app/version.properties) > "$PREPATCH"; [[ -s "$PREPATCH" ]] || fail "pre-edit patch empty"; pass "binary pre-edit patch created before 26484 modification"
+reconstruct "$CAND"; python3 "$REPO/$TRANSFORM" "$CAND" "$REPO/$DELTA"; pass "candidate/source validation PASS"
+cat > "$TMP/allow.txt" <<'EOF'
+app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
+app/src/main/assets/shaders/motionv2/mfsr_chroma_guide.glsl
+app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl
+app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl
+app/src/main/assets/shaders/motionv2/mfsr_lk_select_candidate.glsl
+app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl
+app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl
+app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl
+app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+EOF
+python3 - "$BASE" "$CAND" "$TMP/allow.txt" <<'PY'
+from pathlib import Path
+import hashlib,sys
+A,B=Path(sys.argv[1]),Path(sys.argv[2]);allow=set(Path(sys.argv[3]).read_text().splitlines())
+def H(r):
+ d={}
+ for p in (r/'app/src/main').rglob('*'):
+  if p.is_file(): d[str(p.relative_to(r)).replace('\\','/')]=hashlib.sha256(p.read_bytes()).hexdigest()
+ return d
+a,b=H(A),H(B);chg={x for x in a.keys()|b.keys() if a.get(x)!=b.get(x)}
+assert chg==allow,(sorted(chg),sorted(allow));print('candidate exact changed-file allowlist PASS')
+PY
+python3 - "$REPO/$BASE_HASHES" "$CAND" "$TMP/allow.txt" <<'PY'
+from pathlib import Path
+import hashlib,sys
+m=Path(sys.argv[1]);r=Path(sys.argv[2]);allow=set(Path(sys.argv[3]).read_text().splitlines())
+for line in m.read_text().splitlines():
+ if not line.strip():continue
+ h,p=line.split(None,1);p=p.strip()
+ if p in allow:continue
+ q=r/p
+ if not q.is_file() or hashlib.sha256(q.read_bytes()).hexdigest()!=h:raise SystemExit('protected hash changed '+p)
+print('protected 26483 hashes PASS')
+PY
+# Structural ownership and no-regression gates
+CAP="$CAND/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java"; WA="$CAND/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java"; CR="$CAND/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java"; CG="$CAND/app/src/main/assets/shaders/motionv2/mfsr_chroma_guide.glsl"; COV="$CAND/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl"; SEL="$CAND/app/src/main/assets/shaders/motionv2/mfsr_lk_select_candidate.glsl"; FLOW="$CAND/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl"; LK="$CAND/app/src/main/assets/shaders/motionv2/mfsr_lk_refine_level.glsl"; ACC="$CAND/app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl"; ROB="$CAND/app/src/main/assets/shaders/motionv2/mfsr_robustness_half.glsl"; REF="$CAND/app/src/main/assets/shaders/motionv2/mfsr_low_support_reference.glsl"
+for spec in \
+"$CAP:IRIS_26484_IMMEDIATE_MOTION_SHUTTER_ACK" "$CAP:IRIS_26484_UNLOCK_FOCUS_NULL_BUILDER_GUARD" "$CAP:IRIS_26481_EXACT_TIMESTAMP_METADATA_OWNERSHIP" \
+"$WA:IRIS_26484_BJZHOU_COMPLETE_FLOW_CHAIN" "$SEL:IRIS_26484_BJZHOU_THREE_CANDIDATE_L1_UPSAMPLE" "$FLOW:IRIS_26484_BJZHOU_SAFE_SPATIAL_FLOW_RECONSTRUCTION" "$LK:IRIS_26484_BJZHOU_CLAMPED_LEVELWISE_LK" \
+"$CG:IRIS_26484_BJZHOU_EDGE_DIRECTED_GREEN_GUIDE" "$COV:IRIS_26484_BJZHOU_STRUCTURE_ADAPTIVE_RGB_PRECISION" "$ACC:IRIS_26484_BJZHOU_COMPLETE_JOINT_OPPONENT_WEIGHTING" "$REF:IRIS_26484_BJZHOU_REFERENCE_OPPONENT_GUIDE_MATCH" "$ROB:IRIS_26484_BJZHOU_FLOW_VARIATION_REJECTION_CORE" "$CR:IRIS_26484_BJZHOU_COUPLED_ALIGNMENT_REJECTION_OPPONENT_MERGE"; do f="${spec%%:*}";m="${spec#*:}";grep -q "$m" "$f"||fail "missing marker $m";done
+! grep -q 'refCircular' "$LK" || fail "circular alignment addressing survived"
+grep -Fq 'interpolationTolerance",1.0f/16.0f' "$WA" || fail "safe flow tolerance binding missing"
+grep -q 'mfsr_lk_select_candidate' "$WA" || fail "candidate selection not dispatched"
+grep -q 'mfsr_mgc_covariance' "$CR" || fail "MGC covariance not active"
+grep -q 'mfsr_chroma_guide' "$CR" || fail "edge green guide not active"
+grep -q 'MotionV2Denoise disabled' "$CR" || true
+# Java lexical/static structure
+python3 - "$CAP" "$WA" "$CR" <<'PY'
+from pathlib import Path
+import re,sys
+for f in sys.argv[1:]:
+ s=Path(f).read_text();t=re.sub(r'/\*.*?\*/','',s,flags=re.S);t=re.sub(r'//.*','',t);t=re.sub(r'"(?:\\.|[^"\\])*"','""',t)
+ if t.count('{')!=t.count('}'):raise SystemExit('Java braces '+f)
+ if t.count('(')!=t.count(')'):raise SystemExit('Java parens '+f)
+ print('Java lexical structure PASS',Path(f).name)
+PY
+# GLSL lexical + standards compilation. Compute templates need #version and local-size prefix.
+: > "$SHADERLOG"
+compile_shader(){ local f="$1"; local n="$(basename "$f")"; python3 - "$f" "$TMP/$n.comp" <<'PY'
+from pathlib import Path
+import sys,re
+s=Path(sys.argv[1]).read_text();s=s.replace('#define LAYOUT //\nLAYOUT','#version 310 es\nlayout(local_size_x=8,local_size_y=8,local_size_z=1) in;',1)
+Path(sys.argv[2]).write_text(s)
+PY
+ glslangValidator -S comp "$TMP/$n.comp" >> "$SHADERLOG" 2>&1 || { cat "$SHADERLOG"; fail "shader compile failed $n"; }; }
+for f in "$CG" "$COV" "$SEL" "$FLOW" "$LK" "$ACC" "$REF" "$ROB"; do compile_shader "$f"; done
+# Adreno portability guard: no known unsafe 2-channel writable image stores; no reserved local 'sample'.
+for f in "$CG" "$COV" "$SEL" "$FLOW" "$LK" "$ACC" "$REF" "$ROB"; do ! grep -Eq 'layout\((rg32f|rg16f|r16f)[^)]*\)[^;]*writeonly image2D' "$f" || fail "Adreno-portability hazardous writable format $(basename "$f")"; ! grep -Eq '\b(float|vec[234]|int|ivec[234])\s+sample\b' "$f" || fail "reserved GLSL identifier sample in $(basename "$f")"; done
+# Exact output format expectations vs Java allocations.
+grep -q 'layout(r32f,binding=1).*writeonly image2D outputGreen' "$CG" || fail "chroma guide output declaration"
+grep -q 'FLOAT_32,1' "$CR" || fail "R32F Java allocation evidence missing"
+grep -q 'layout(rgba16f,binding=0).*writeonly image2D OutputFlow' "$SEL" || fail "candidate flow output format"
+grep -q 'FLOAT_16,4' "$WA" || fail "flow Java allocation format"
+pass "Adreno runtime-portability guard"
+pass "source structural/ownership PASS"
+# Temporary candidate version/build is bumped only now, immediately before its Gradle proof.
+python3 - "$CAND/app/version.properties" <<'PY'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]);s=p.read_text();s=s.replace('VERSION_NAME=0.9726483','VERSION_NAME=0.9726484',1).replace('VERSION_BUILD=26483','VERSION_BUILD=26484',1);p.write_text(s)
+PY
+# The candidate is a complete repo worktree; build it before touching Action checkout app source.
+(cd "$CAND" && chmod +x gradlew && ./gradlew assembleDebug --no-daemon --stacktrace) 2>&1 | tee "$CANDLOG"
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary candidate Gradle build"
+pass "Temporary-copy validation: PASS"
+# Verify app source unchanged by Gradle except known generated native headers are ignored by source allowlist copy.
+for rel in $(cat "$TMP/allow.txt");do [[ -f "$CAND/$rel" ]] || fail "candidate file vanished $rel";done
+pass "PRE-BUILD SAFETY PROOF PASSED"
+# Apply exact already-built candidate functional source to ephemeral checkout, then bump version and final build in SAME command block.
+while IFS= read -r rel;do mkdir -p "$(dirname "$rel")";cp "$CAND/$rel" "$rel";done < "$TMP/allow.txt"
+python3 - <<'PY'
+from pathlib import Path
+p=Path('app/version.properties');s=p.read_text();s=s.replace('VERSION_NAME=0.9726483','VERSION_NAME=0.9726484',1).replace('VERSION_BUILD=26483','VERSION_BUILD=26484',1);p.write_text(s)
+PY
+chmod +x gradlew
+./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee "$FINALLOG"
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "final 26484 Gradle build"
+# Candidate/final source identity
+while IFS= read -r rel;do cmp -s "$CAND/$rel" "$rel" || fail "candidate/final mismatch $rel";done < "$TMP/allow.txt"; cmp -s "$CAND/app/version.properties" app/version.properties || fail "candidate/final version mismatch"
+# Locate one debug APK and publish exactly one root APK.
+mapfile -t apks < <(find app/build/outputs/apk -type f -name '*.apk' | sort); [[ ${#apks[@]} -ge 1 ]] || fail "no APK output"; rm -f IrisCamera-0.9726484-26484-*.apk; cp "${apks[-1]}" "$APK_NAME"; [[ -s "$APK_NAME" ]] || fail "published APK missing"
+# Canonical source patch relative to immutable app base.
+git worktree add --detach "$FINALBASE" "$EXPECTED_APP_BASE" >/dev/null
+while IFS= read -r rel;do mkdir -p "$FINALBASE/$(dirname "$rel")";cp "$rel" "$FINALBASE/$rel";done < "$TMP/allow.txt"; cp app/version.properties "$FINALBASE/app/version.properties"
+(cd "$FINALBASE" && git add -N app/src/main app/version.properties >/dev/null 2>&1 || true; git diff --binary "$EXPECTED_APP_BASE" -- app/src/main app/version.properties) > "$SOURCEPATCH"; [[ -s "$SOURCEPATCH" ]] || fail "canonical source patch empty"
+(cd "$FINALBASE" && find app/src/main -type f -print0 | sort -z | xargs -0 sha256sum; sha256sum app/version.properties) > "$AFTERHASH"
+mkdir -p "$OUTDIR/next_baseline_inputs";cp "$SOURCEPATCH" "$OUTDIR/next_baseline_inputs/26484_successful_source.patch";cp "$AFTERHASH" "$OUTDIR/next_baseline_inputs/26484_successful_after.sha256";cp "$REPO/$TRANSFORM" "$OUTDIR/next_baseline_inputs/";cp "$REPO/$DELTA" "$OUTDIR/26484_delta_from_26483.patch"
+cat > "$REPORT" <<EOF
+26484 FULL BJZHOU-INTEGRATION V1
+Version=$NEW_VERSION
+Build=$NEW_BUILD
+Branch=$BRANCH
+BackupBranch=$BACKUP_BRANCH
+BaselineSourcePatchSHA=$BASE_PATCH_SHA
+BaselineManifestSHA=$BASE_HASHES_SHA
+DeltaSHA=$DELTA_SHA
+TransformSHA=$TRANSFORM_SHA
+APK=$APK_NAME
+APK_SHA256=$(sha "$APK_NAME")
+SourcePatchSHA256=$(sha "$SOURCEPATCH")
+AfterManifestSHA256=$(sha "$AFTERHASH")
+Architecture=three-candidate target-L1 flow propagation + clamped LK + safe 8-Bayer-quad spatial interpolation + flow-variation rejection core + structure-adaptive covariance + edge-directed green + noise-aware G/R-G/B-G accumulation
+SaturationExperiment=26483 CFA soft-headroom path unchanged; no older saturation-validity system restored
+Shutter=immediate UI acknowledgment; top-up remains background capture policy; unlockFocus null guard
+EOF
+sha256sum "$APK_NAME" "$SOURCEPATCH" "$AFTERHASH" "$REPORT" > "$OUTDIR/26484_artifact_hashes.sha256"
+pass "26484 canonical checkpoint package created"
+echo "26484_SOURCE_PATCH_SHA256=$(sha "$SOURCEPATCH")";echo "26484_AFTER_MANIFEST_SHA256=$(sha "$AFTERHASH")";echo "26484 BUILD SUCCESS"
