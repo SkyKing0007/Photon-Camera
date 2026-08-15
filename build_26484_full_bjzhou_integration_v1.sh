@@ -181,12 +181,53 @@ pass "Temporary-copy validation: PASS"
 # Verify app source unchanged by Gradle except known generated native headers are ignored by source allowlist copy.
 for rel in $(cat "$TMP/allow.txt");do [[ -f "$CAND/$rel" ]] || fail "candidate file vanished $rel";done
 pass "PRE-BUILD SAFETY PROOF PASSED"
-# Apply exact already-built candidate functional source to ephemeral checkout, then bump version and final build in SAME command block.
+# Reconstruct the COMPLETE successful 26483 source in the final ephemeral checkout.
+# This is required because the committed checkout intentionally remains at EXPECTED_APP_BASE;
+# copying only the 26484 allowlist would omit the rest of the proven 26483 dependency graph.
+git apply --check --binary "$BASE_PATCH"
+git apply --binary "$BASE_PATCH"
+sha256sum -c "$BASE_HASHES" >/dev/null
+grep -q '^VERSION_NAME=0\.9726483$' app/version.properties || fail "final full-26483 reconstruction version"
+grep -q '^VERSION_BUILD=26483$' app/version.properties || fail "final full-26483 reconstruction build"
+pass "final exact successful 26483 baseline reconstructed"
+
+# Overlay only the already-built 26484 functional delta, then bump version and final build
+# in the SAME guarded command block.
 while IFS= read -r rel;do mkdir -p "$(dirname "$rel")";cp "$CAND/$rel" "$rel";done < "$TMP/allow.txt"
 python3 - <<'PY'
 from pathlib import Path
 p=Path('app/version.properties');s=p.read_text();s=s.replace('VERSION_NAME=0.9726483','VERSION_NAME=0.9726484',1).replace('VERSION_BUILD=26483','VERSION_BUILD=26484',1);p.write_text(s)
 PY
+
+# Full candidate/final canonical-source parity BEFORE final Gradle.
+python3 - "$CAND" "$(pwd)" <<'PY'
+from pathlib import Path
+import hashlib,sys
+a,b=Path(sys.argv[1]),Path(sys.argv[2])
+skip={
+'app/src/main/cpp/deps/archive.h',
+'app/src/main/cpp/deps/archive_entry.h',
+'app/src/main/cpp/deps/technicallyflac.h',
+'app/src/main/cpp/deps/tiny_dng_writer.h',
+}
+def files(root):
+    out={}
+    for base in [root/'app/src/main']:
+        for p in base.rglob('*'):
+            if p.is_file():
+                rel=str(p.relative_to(root)).replace('\\','/')
+                if rel in skip: continue
+                out[rel]=hashlib.sha256(p.read_bytes()).hexdigest()
+    vp=root/'app/version.properties'
+    out['app/version.properties']=hashlib.sha256(vp.read_bytes()).hexdigest()
+    return out
+x,y=files(a),files(b)
+if x!=y:
+    bad=sorted({k for k in x.keys()|y.keys() if x.get(k)!=y.get(k)})
+    raise SystemExit('candidate/final canonical source mismatch before Gradle: '+repr(bad[:50]))
+print('full candidate/final canonical source parity PASS')
+PY
+
 chmod +x gradlew
 ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee "$FINALLOG"
 [[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "final 26484 Gradle build"
