@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EXPECTED_BRANCH="experimental-effective-stack"
+EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 BACKUP_BRANCH="backup-26485-tested-before-26486-full-bjzhou-censored-opponent-latency"
 BACKUP_EXPECTED="1e7c59581c273995ea3cb3baa08e1103b2ae20e0"
