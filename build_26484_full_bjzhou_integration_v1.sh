@@ -86,12 +86,61 @@ grep -q 'MotionV2Denoise disabled' "$CR" || true
 # Java lexical/static structure
 python3 - "$CAP" "$WA" "$CR" <<'PY'
 from pathlib import Path
-import re,sys
-for f in sys.argv[1:]:
- s=Path(f).read_text();t=re.sub(r'/\*.*?\*/','',s,flags=re.S);t=re.sub(r'//.*','',t);t=re.sub(r'"(?:\\.|[^"\\])*"','""',t)
- if t.count('{')!=t.count('}'):raise SystemExit('Java braces '+f)
- if t.count('(')!=t.count(')'):raise SystemExit('Java parens '+f)
- print('Java lexical structure PASS',Path(f).name)
+import sys
+
+def java_code_only(src: str) -> str:
+    # Preserve only actual Java code. Ignore comments, ordinary strings, character literals,
+    # and Java text blocks so delimiter characters inside literals cannot trip the structure gate.
+    out=[]; i=0; n=len(src); state='code'
+    while i<n:
+        if state=='code':
+            if src.startswith('//',i): state='line'; out.extend('  '); i+=2; continue
+            if src.startswith('/*',i): state='block'; out.extend('  '); i+=2; continue
+            if src.startswith('\"\"\"',i): state='text'; out.extend('   '); i+=3; continue
+            c=src[i]
+            if c=='\"': state='string'; out.append(' '); i+=1; continue
+            if c=="'": state='char'; out.append(' '); i+=1; continue
+            out.append(c); i+=1; continue
+        if state=='line':
+            c=src[i]; out.append('\n' if c=='\n' else ' '); i+=1
+            if c=='\n': state='code'
+            continue
+        if state=='block':
+            if src.startswith('*/',i): out.extend('  '); i+=2; state='code'; continue
+            out.append('\n' if src[i]=='\n' else ' '); i+=1; continue
+        if state=='text':
+            if src.startswith('\"\"\"',i): out.extend('   '); i+=3; state='code'; continue
+            # Backslash is not a general text-block terminator; keep line numbers only.
+            out.append('\n' if src[i]=='\n' else ' '); i+=1; continue
+        if state in ('string','char'):
+            c=src[i]
+            if c=='\\':
+                out.append(' '); i+=1
+                if i<n: out.append('\n' if src[i]=='\n' else ' '); i+=1
+                continue
+            out.append('\n' if c=='\n' else ' '); i+=1
+            if (state=='string' and c=='\"') or (state=='char' and c=="'"): state='code'
+            continue
+    if state in ('block','string','char','text'):
+        raise SystemExit('Java unterminated lexical state: '+state)
+    return ''.join(out)
+
+def verify(path: str):
+    code=java_code_only(Path(path).read_text())
+    pairs={'}':'{',')':'(',']':'['}; stack=[]
+    line=1
+    for c in code:
+        if c=='\n': line+=1; continue
+        if c in '{([': stack.append((c,line))
+        elif c in '})]':
+            if not stack or stack[-1][0]!=pairs[c]:
+                raise SystemExit(f'Java delimiter mismatch {path} line={line} token={c!r}')
+            stack.pop()
+    if stack:
+        c,ln=stack[-1]; raise SystemExit(f'Java unclosed delimiter {path} line={ln} token={c!r}')
+    print('Java lexical structure PASS',Path(path).name)
+
+for f in sys.argv[1:]: verify(f)
 PY
 # GLSL lexical + standards compilation. Compute templates need #version and local-size prefix.
 : > "$SHADERLOG"
