@@ -3,8 +3,8 @@ set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
-BACKUP_BRANCH="backup-26488-failed-r16ui-before-26488-v2-gles-format-fix"
-BACKUP_EXPECTED="a827834a73264a5f7e9b0568e4ec635f9c7993d9"
+BACKUP_BRANCH="backup-26488-v2-java-scope-failure-before-26488-v3-scope-fix"
+BACKUP_EXPECTED="2d51d42596efe3480434bc47f96947e622182ee2"
 
 BASE26483_PATCH="26483_successful_source.patch"
 BASE26483_PATCH_SHA="a993c2c9e12cba8098623fab8b83f0965b9ad2016eded6fd857f55935a1c11db"
@@ -19,7 +19,7 @@ TRANSFORM26486_SHA="3030fa2543c6593711f8822a770c78de25e9347c65717420ffde291c1aad
 TRANSFORM26487="transform_26487_reconstruction_correctness_latency_v2.py"
 TRANSFORM26487_SHA="0580c756d1180554621aa4e7a1848271511fc2094a692b16b3b209df9bda5d77"
 TRANSFORM="transform_26488_full_merge_rgb_rejection_contract_v1.py"
-TRANSFORM_SHA="18ee188dfa25563e839c9d9a76ab6961e738ccc061df88a5b7fd861bc5d8112d"
+TRANSFORM_SHA="3393d3716a0e57b92ec3195edecb5cc9b5a7a3af6c08adcade340ed82c2ba744"
 
 NEW_VERSION="0.9726488"
 NEW_BUILD="26488"
@@ -35,6 +35,7 @@ rm -rf "$OUTDIR"
 mkdir -p "$OUTDIR"
 AUDIT="$OUTDIR/26488_source_audit.txt"
 CANDLOG="$OUTDIR/26488_temporary_candidate_build.log"
+JAVACLOG="$OUTDIR/26488_temporary_candidate_javac.log"
 FINALLOG="$OUTDIR/26488_final_build.log"
 SHADERLOG="$OUTDIR/26488_shader_validation.txt"
 REPORT="$OUTDIR/26488_build_report.txt"
@@ -45,7 +46,7 @@ AFTERHASH="$OUTDIR/26488_after.sha256"
 PREBUILDHASH="$OUTDIR/26488_prebuild_canonical.sha256"
 
 exec > >(tee "$AUDIT") 2>&1
-echo "=== 26488 FULL BJZHOU MERGERGB + REJECTION CONTRACT ==="
+echo "=== 26488 V3 FULL BJZHOU MERGERGB + REJECTION CONTRACT / JAVA SCOPE FIX ==="
 date -Iseconds || true
 
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
@@ -167,7 +168,40 @@ pass "binary pre-edit exact-26487 patch created before modification"
 
 reconstruct26487 "$CAND"
 python3 "$REPO/$TRANSFORM" "$CAND"
-pass "26488 temporary candidate transform PASS"
+pass "26488 V3 temporary candidate transform PASS"
+
+# Independent generated-Java ownership/scope gate. This deliberately does not trust
+# the transform's own validator: the build script rechecks the two exact scope contracts
+# that caused the failed V2 candidate Javac build.
+python3 - "$CAND/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" <<'PY'
+from pathlib import Path
+import re,sys
+s=Path(sys.argv[1]).read_text()
+graph=s.find("IRIS_26487_RECONSTRUCTION_CORRECTNESS_BJZHOU_GRAPH")
+if graph<0: raise SystemExit("missing reconstruction graph marker")
+tail=s[graph:]
+if re.search(r"\bwronskiWb[RB]\b",tail):
+    raise SystemExit("block-local wronskiWbR/B survives after alignment scope")
+if tail.count("wronskiGlobalWbR")<2 or tail.count("wronskiGlobalWbB")<2:
+    raise SystemExit("method-scope WB authority missing from native MGC graph")
+owner=s.find("IRIS_26488_V3_DIAGNOSTIC_SCOPE_OWNER")
+if owner<0: raise SystemExit("V3 diagnostic scope owner missing")
+size=s.find("final Point iris26487DiagSize = new Point(48,36);",owner)
+a=s.find("GLTexture iris26487DiagTexture = null;",owner)
+b=s.find("GLTexture iris26488DenominatorDiagTexture = null;",owner)
+t=s.find("try{",owner)
+r=s.find("IRIS_26488_COARSE_SUPPORT_AND_DENOMINATOR_TELEMETRY",owner)
+if min(size,a,b,t,r)<0 or not(owner<size<t and owner<a<t and owner<b<t<r):
+    raise SystemExit("diagnostic resource scope does not span post-drain readback")
+if "GLTexture iris26487DiagTexture = new GLTexture(" in s or "GLTexture iris26488DenominatorDiagTexture = new GLTexture(" in s:
+    raise SystemExit("diagnostic texture redeclared in nested scope")
+if "if (iris26488DenominatorDiagTexture != null) iris26488DenominatorDiagTexture.close();" not in s:
+    raise SystemExit("denominator diagnostic null-safe close missing")
+if "if (iris26487DiagTexture != null) iris26487DiagTexture.close();" not in s:
+    raise SystemExit("support diagnostic null-safe close missing")
+print("26488 V3 independent generated-Java scope ownership PASS")
+PY
+pass "26488 V3 generated-Java scope ownership PASS"
 
 cat > "$TMP/allow.txt" <<'EOF'
 app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
@@ -175,7 +209,6 @@ app/src/main/assets/shaders/motionv2/direct_rgb_accumulate.glsl
 app/src/main/assets/shaders/motionv2/mfsr_26487_diag_sample.glsl
 app/src/main/assets/shaders/motionv2/mfsr_26488_stage_diag.glsl
 app/src/main/assets/shaders/motionv2/mfsr_bjzhou_guide.glsl
-app/src/main/assets/shaders/motionv2/mfsr_mgc_reference_gray.glsl
 app/src/main/assets/shaders/motionv2/mfsr_bjzhou_rejection_reduce4.glsl
 app/src/main/assets/shaders/motionv2/mfsr_chroma_guide.glsl
 app/src/main/assets/shaders/motionv2/mfsr_finalize.glsl
@@ -595,12 +628,25 @@ vp=root/"app/version.properties";rows.append(("app/version.properties",hashlib.s
 out.write_text("".join(f"{h}  {r}\n" for r,h in sorted(rows)))
 PY
 
+# Compile generated Java explicitly before the full candidate APK build. This is the
+# authoritative symbol/scope gate that the failed 26488 V2 run exposed.
 (
     cd "$CAND"
     chmod +x gradlew
+    ./gradlew :app:compileDebugJavaWithJavac --no-daemon --stacktrace
+) 2>&1 | tee "$JAVACLOG"
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary 26488 V3 candidate Java compile"
+(
+    cd "$CAND"
+    sha256sum -c "$TMP/candidate_prebuild.sha256" >/dev/null
+) || fail "temporary Javac mutated canonical candidate source"
+pass "26488 V3 candidate Java compile: PASS"
+
+(
+    cd "$CAND"
     ./gradlew assembleDebug --no-daemon --stacktrace
 ) 2>&1 | tee "$CANDLOG"
-[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary 26488 candidate Gradle build"
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary 26488 V3 candidate Gradle build"
 (
     cd "$CAND"
     sha256sum -c "$TMP/candidate_prebuild.sha256" >/dev/null
