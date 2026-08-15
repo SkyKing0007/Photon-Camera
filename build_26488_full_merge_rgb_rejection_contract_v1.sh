@@ -3,8 +3,8 @@ set -euo pipefail
 
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
-BACKUP_BRANCH="backup-26488-v2-java-scope-failure-before-26488-v3-scope-fix"
-BACKUP_EXPECTED="2d51d42596efe3480434bc47f96947e622182ee2"
+BACKUP_BRANCH="backup-26488-v3-runtime-floatbuffer-before-26488-v4-lens-upload-fix"
+BACKUP_EXPECTED="741903febbf0a5156c11234f3db07e5dc5004975"
 
 BASE26483_PATCH="26483_successful_source.patch"
 BASE26483_PATCH_SHA="a993c2c9e12cba8098623fab8b83f0965b9ad2016eded6fd857f55935a1c11db"
@@ -19,12 +19,12 @@ TRANSFORM26486_SHA="3030fa2543c6593711f8822a770c78de25e9347c65717420ffde291c1aad
 TRANSFORM26487="transform_26487_reconstruction_correctness_latency_v2.py"
 TRANSFORM26487_SHA="0580c756d1180554621aa4e7a1848271511fc2094a692b16b3b209df9bda5d77"
 TRANSFORM="transform_26488_full_merge_rgb_rejection_contract_v1.py"
-TRANSFORM_SHA="3393d3716a0e57b92ec3195edecb5cc9b5a7a3af6c08adcade340ed82c2ba744"
+TRANSFORM_SHA="b7710d343aa26b1215178821983f4ff3f742ad07d1ca556de2d272fbc36664c0"
 
 NEW_VERSION="0.9726488"
 NEW_BUILD="26488"
 OUTDIR="build_26488_outputs"
-APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-full-merge-rgb-rejection-contract-debug.apk"
+APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-v4-runtime-hardened-merge-rgb-debug.apk"
 
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 pass(){ echo "PASS: $*"; }
@@ -46,7 +46,7 @@ AFTERHASH="$OUTDIR/26488_after.sha256"
 PREBUILDHASH="$OUTDIR/26488_prebuild_canonical.sha256"
 
 exec > >(tee "$AUDIT") 2>&1
-echo "=== 26488 V3 FULL BJZHOU MERGERGB + REJECTION CONTRACT / JAVA SCOPE FIX ==="
+echo "=== 26488 V4 MERGERGB + REJECTION CONTRACT / PHONE RUNTIME HARDENING ==="
 date -Iseconds || true
 
 BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
@@ -79,7 +79,7 @@ pass "infrastructure syntax and identity"
 remote="$(git ls-remote origin "refs/heads/$BACKUP_BRANCH" | awk '{print $1}')"
 [[ "$remote" == "$BACKUP_EXPECTED" ]] \
     || fail "backup branch $BACKUP_BRANCH=$remote expected=$BACKUP_EXPECTED"
-pass "backup branch exact successful 26487 checkpoint"
+pass "backup branch exact tested 26488 V4 runtime-failure checkpoint"
 
 TMP="$(mktemp -d)"
 BASE="$TMP/base26487"
@@ -168,7 +168,7 @@ pass "binary pre-edit exact-26487 patch created before modification"
 
 reconstruct26487 "$CAND"
 python3 "$REPO/$TRANSFORM" "$CAND"
-pass "26488 V3 temporary candidate transform PASS"
+pass "26488 V4 temporary candidate transform PASS"
 
 # Independent generated-Java ownership/scope gate. This deliberately does not trust
 # the transform's own validator: the build script rechecks the two exact scope contracts
@@ -195,13 +195,68 @@ if min(size,a,b,t,r)<0 or not(owner<size<t and owner<a<t and owner<b<t<r):
     raise SystemExit("diagnostic resource scope does not span post-drain readback")
 if "GLTexture iris26487DiagTexture = new GLTexture(" in s or "GLTexture iris26488DenominatorDiagTexture = new GLTexture(" in s:
     raise SystemExit("diagnostic texture redeclared in nested scope")
-if "if (iris26488DenominatorDiagTexture != null) iris26488DenominatorDiagTexture.close();" not in s:
-    raise SystemExit("denominator diagnostic null-safe close missing")
-if "if (iris26487DiagTexture != null) iris26487DiagTexture.close();" not in s:
-    raise SystemExit("support diagnostic null-safe close missing")
-print("26488 V3 independent generated-Java scope ownership PASS")
+if "iris26488CloseDiagnosticTexture(iris26488DenominatorDiagTexture);" not in s:
+    raise SystemExit("denominator diagnostic V4 lifecycle close missing")
+if "iris26488CloseDiagnosticTexture(iris26487DiagTexture);" not in s:
+    raise SystemExit("support diagnostic V4 lifecycle close missing")
+print("26488 V4 independent generated-Java scope ownership PASS")
 PY
-pass "26488 V3 generated-Java scope ownership PASS"
+pass "26488 V4 generated-Java scope ownership PASS"
+
+# Independent phone-runtime carrier/lifetime gate. The V3 phone crash was a Java-runtime
+# type mismatch that javac cannot detect: GLTexture accepts Buffer but casts non-null uploads
+# to ByteBuffer internally. Verify the exact shared API contract and every new 26488 upload/readback
+# ownership rule before any candidate Gradle work.
+python3 - \
+  "$CAND/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" \
+  "$CAND/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java" \
+  "$CAND/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java" <<'PY'
+from pathlib import Path
+import re,sys
+recon=Path(sys.argv[1]).read_text(); gltex=Path(sys.argv[2]).read_text(); frame=Path(sys.argv[3]).read_text()
+if "(ByteBuffer) pixels" not in gltex:
+    raise SystemExit("GLTexture non-null upload ByteBuffer cast contract changed; re-audit required")
+if "public ByteBuffer buffer;" not in frame:
+    raise SystemExit("ImageFrame RAW buffer is no longer statically ByteBuffer")
+if "FloatBuffer.wrap(iris26488LensValues)" in recon:
+    raise SystemExit("unsafe V3 HeapFloatBuffer lens upload survived")
+for token in (
+    "IRIS_26488_V4_DIRECT_BYTEBUFFER_LENS_UPLOAD",
+    "ByteBuffer iris26488LensUpload = ByteBuffer",
+    ".allocateDirect(iris26488LensFloatCount * 4)",
+    ".order(ByteOrder.nativeOrder())",
+    "iris26488LensUpload.asFloatBuffer().put(iris26488LensValues, 0, iris26488LensFloatCount);",
+    "IRIS_26488_V4_READBACK_FRAMEBUFFER_LIFETIME_OWNER",
+    "android.opengl.GLES30.glDeleteFramebuffers",
+    "iris26488ReleaseReadbackFramebuffer(iris26480ReadbackOutput);",
+    "IRIS_26488_V4_STAGE_DIAGNOSTIC_ALLOCATION_SKIPPED",
+    "IRIS_26488_V4_STAGE_DIAGNOSTIC_DISPATCH_SKIPPED",
+    "IRIS_26488_V4_STAGE_DIAGNOSTIC_READBACK_SKIPPED",
+    "IRIS_26488_V4_COARSE_DIAGNOSTIC_DISPATCH_SKIPPED",
+    "IRIS_26488_V4_COARSE_DIAGNOSTIC_READBACK_SKIPPED",
+    "IRIS_26488_V4_DISABLE_UNUSED_TUNING_FILE_IO",
+):
+    if token not in recon: raise SystemExit("missing V4 runtime token: "+token)
+ctor=re.search(r"MotionV2CfaReconstruction\(.*?\)\s*\{(.*?)this\.images",recon,re.S)
+if ctor is None or '"MotionV2CfaReconstruction",\n                false);' not in ctor.group(1):
+    raise SystemExit("Motion V2 unused tuning file I/O still enabled")
+if "getTuning(" in recon:
+    raise SystemExit("Motion V2 tuning disabled despite active tuning consumer")
+# The only new non-null CPU upload introduced by 26488 is lens shading; it must be ByteBuffer.
+lens=re.search(r"iris26488LensShading\s*=\s*new GLTexture\((.*?)\);",recon,re.S)
+if lens is None or "iris26488LensUpload" not in lens.group(1):
+    raise SystemExit("lens upload is not direct ByteBuffer carrier")
+# Keep the one-drain latency architecture and ensure telemetry can no longer be fatal by construction.
+if recon.count("finishDeferredCompute(") != 1:
+    raise SystemExit("single Motion GPU drain ownership changed")
+if "SupportSummary summary = new SupportSummary(1.0f,1.0f,1.0f,1.0f," not in recon:
+    raise SystemExit("coarse diagnostic fail-open support fallback missing")
+# Shared GLTexture is intentionally protected/unmodified; Motion owns matching framebuffer teardown.
+if "glDeleteFramebuffers" in gltex:
+    raise SystemExit("shared GLTexture changed unexpectedly; V4 must remain Motion-only")
+print("26488 V4 independent phone-runtime carrier/lifetime gate PASS")
+PY
+pass "26488 V4 phone-runtime carrier/lifetime PASS"
 
 cat > "$TMP/allow.txt" <<'EOF'
 app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
@@ -635,18 +690,18 @@ PY
     chmod +x gradlew
     ./gradlew :app:compileDebugJavaWithJavac --no-daemon --stacktrace
 ) 2>&1 | tee "$JAVACLOG"
-[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary 26488 V3 candidate Java compile"
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary 26488 V4 candidate Java compile"
 (
     cd "$CAND"
     sha256sum -c "$TMP/candidate_prebuild.sha256" >/dev/null
 ) || fail "temporary Javac mutated canonical candidate source"
-pass "26488 V3 candidate Java compile: PASS"
+pass "26488 V4 candidate Java compile: PASS"
 
 (
     cd "$CAND"
     ./gradlew assembleDebug --no-daemon --stacktrace
 ) 2>&1 | tee "$CANDLOG"
-[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary 26488 V3 candidate Gradle build"
+[[ "${PIPESTATUS[0]}" -eq 0 ]] || fail "temporary 26488 V4 candidate Gradle build"
 (
     cd "$CAND"
     sha256sum -c "$TMP/candidate_prebuild.sha256" >/dev/null
@@ -760,7 +815,7 @@ Rejection=reference luma now uses recovered Raw16ToGray contract: per-phase blac
 LensShading=Camera2 four-channel gain map applied in linear semantic RGB normalizer as R, average(Gr,Gb), B before one calculation-WB removal; identity map if unavailable
 Diagnostics=per-aux 24x18 atlases report flow variation/interpolation-cancel/unblocker/initial rejection, pixelDifference/postRejection/finalWeight/initial accept, and physical 0.985 R/G/B/quad clipping; 48x36 report actual frame support and G/RG/BG denominators
 NumericalGate=model-only equation smoke test must remain high-support and is explicitly NOT claimed as proof of phone effective-frame count; phone stage telemetry is authoritative
-BuildSafety=exact tested 26487 reconstruction, exact backup proof, binary pre-edit patch before 26488 transform, strict 11-file allowlist, all other tested-26487 app source protected, Java lexical, exact Photon getLayouts simulation, full GLSL reserved-word scan, GLES 3.1 image-format whitelist, glslang full graph, Adreno guards, temporary Gradle, candidate/final source parity, and version increment + final Gradle in one guarded block
+BuildSafety=exact tested 26487 reconstruction, exact V3-runtime-failure backup proof, binary pre-edit patch before 26488 transform, strict 11-file allowlist, all other tested-26487 app source protected, Java lexical, generated runtime ByteBuffer/lifetime/tuning gate, exact Photon getLayouts simulation, full GLSL reserved-word scan, GLES 3.1 image-format whitelist, glslang full graph, Adreno guards, temporary Javac+Gradle, candidate/final source parity, and version increment + final Gradle in one guarded block
 EOF
 sha256sum "$APK_NAME" "$SOURCEPATCH" "$AFTERHASH" "$REPORT" "$DELTAOUT" \
     > "$OUTDIR/26488_artifact_hashes.sha256"
