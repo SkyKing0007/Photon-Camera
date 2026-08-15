@@ -11,7 +11,7 @@ BASE_HASHES_SHA="7cba064adf92e6645a1f94ea44a5bd205a800cead9dcd8c392816de5f2725ca
 TRANSFORM="transform_26484_full_bjzhou_integration_v1.py"
 TRANSFORM_SHA="f3c212d9c16e39ffcde2ff4beae65e50c0ad7b30fd5e0b517dbfbcdaafec0c00"
 DELTA="26484_delta_from_26483.patch"
-DELTA_SHA="cf33262a9d6bec1ec691739db6d2d9093b92f98fa9d1eb6921b74297470ef0ba"
+DELTA_SHA="18fbb861c3c49f4ad8399f29aa60ca3e85df57ffacc794b8b6a2206b42197ac3"
 NEW_VERSION="0.9726484"; NEW_BUILD="26484"
 OUTDIR="build_26484_outputs"
 APK_NAME="IrisCamera-${NEW_VERSION}-${NEW_BUILD}-full-bjzhou-integration-debug.apk"
@@ -82,6 +82,8 @@ grep -Fq 'interpolationTolerance",1.0f/16.0f' "$WA" || fail "safe flow tolerance
 grep -q 'mfsr_lk_select_candidate' "$WA" || fail "candidate selection not dispatched"
 grep -q 'mfsr_mgc_covariance' "$CR" || fail "MGC covariance not active"
 grep -q 'mfsr_chroma_guide' "$CR" || fail "edge green guide not active"
+grep -Fq 'if (mPreviewRequestBuilder == null || mCaptureSession == null)' "$CAP" || fail "26484 unlockFocus preview-builder/session guard missing"
+! grep -Fq 'if (captureBuilder == null || mCaptureSession == null)' "$CAP" || fail "invalid local captureBuilder guard survived in unlockFocus"
 grep -q 'MotionV2Denoise disabled' "$CR" || true
 # Java lexical/static structure
 python3 - "$CAP" "$WA" "$CR" <<'PY'
