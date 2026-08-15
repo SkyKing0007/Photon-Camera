@@ -1407,8 +1407,8 @@ float sharedChromaValidity(ivec2 p){
     float own=siteValidity(p);float same=own;float n=1.0;ivec2 d[4]=ivec2[4](ivec2(2,0),ivec2(-2,0),ivec2(0,2),ivec2(0,-2));
     for(int i=0;i<4;i++){same+=siteValidity(p+d[i]);n+=1.0;}same/=n;
     float clipMax=0.0;for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++)clipMax=max(clipMax,1.0-siteValidity(p+ivec2(x,y)));
-    float common=1.0-0.35*smoothstep(0.10,0.90,clipMax);
-    return clamp((0.60*own+0.40*same)*common,0.0,1.0);
+    float sharedValidity=1.0-0.35*smoothstep(0.10,0.90,clipMax);
+    return clamp((0.60*own+0.40*same)*sharedValidity,0.0,1.0);
 }
 float greenAt(ivec2 p){p=clamp(p,ivec2(0),rawSize-ivec2(1));return texelFetch(chromaGuide,p,0).r;}
 float chromaGuideWeight(float sampleGreen,float targetGreen){float sig=max(max(sampleGreen,targetGreen),0.0);float variance=max(greenNoiseS*sig+greenNoiseO,0.0);float sigma=max(2.5*sqrt(variance),1.0/160.0);float d=(sampleGreen-targetGreen)/sigma;return exp(-0.5*d*d);}
@@ -1540,7 +1540,7 @@ uniform highp sampler2D flowTexture;
 layout(r32f,binding=0) uniform highp writeonly image2D outUnblocker;
 uniform ivec2 rawHalf;
 /* IRIS_26486_BJZHOU_REJECTION_UNBLOCKER */
-void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,rawHalf)))return;vec4 f=texelFetch(flowTexture,p,0);float variation=max(f.z,0.0);float cancelled=step(0.5,f.w);vec2 mn=f.xy,mx=f.xy;for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 q=texelFetch(flowTexture,clamp(p+ivec2(x,y),ivec2(0),rawHalf-ivec2(1)),0).xy;mn=min(mn,q);mx=max(mx,q);}float span=length(mx-mn);float coherent=(1.0-cancelled)*exp(-80.0*variation)*exp(-0.18*span);imageStore(outUnblocker,p,vec4(clamp(coherent,0.0,1.0)));}
+void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,rawHalf)))return;vec4 f=texelFetch(flowTexture,p,0);float variation=max(f.z,0.0);float cancelled=step(0.5,f.w);vec2 mn=f.xy,mx=f.xy;for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 q=texelFetch(flowTexture,clamp(p+ivec2(x,y),ivec2(0),rawHalf-ivec2(1)),0).xy;mn=min(mn,q);mx=max(mx,q);}float span=length(mx-mn);float flowCoherence=(1.0-cancelled)*exp(-80.0*variation)*exp(-0.18*span);imageStore(outUnblocker,p,vec4(clamp(flowCoherence,0.0,1.0)));}
 ''')
 
 write(shader_dir / "mfsr_bjzhou_rejection_base.glsl", r'''#define LAYOUT //
