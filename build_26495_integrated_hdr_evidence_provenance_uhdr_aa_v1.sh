@@ -144,8 +144,18 @@ changed={r for r in a if a[r]!=b[r]}
 if changed!=allowed: raise SystemExit(f'scope mismatch changed={sorted(changed)} expected={sorted(allowed)}')
 print('PASS: exact scope: only seven intended 26495 files changed; other 849 canonical files byte-identical')
 PY_SCOPE
-( cd "$CAND" && git diff --check -- app/src/main app/version.properties ) || fail "candidate whitespace/diff check"
-pass "temporary-copy transform + exact scope + whitespace validation"
+# Validate whitespace only in the exact successful 26494 -> 26495 delta.
+# The canonical 26494 source itself contains historical trailing whitespace in
+# unchanged files (for example preferences.xml), so checking CAND against the
+# much older Git app base would falsely attribute inherited whitespace to 26495.
+DIFFCHECK="$TMP/26494_to_26495_diff_check.txt"
+set +e
+git diff --no-index --check -- "$BASE/app/src/main" "$CAND/app/src/main" > "$DIFFCHECK" 2>&1
+diffcheck_rc=$?
+set -e
+[[ "$diffcheck_rc" -le 1 ]] || { cat "$DIFFCHECK"; fail "candidate introduced whitespace error"; }
+[[ ! -s "$DIFFCHECK" ]] || { cat "$DIFFCHECK"; fail "candidate introduced whitespace error"; }
+pass "temporary-copy transform + exact scope + 26494-to-26495 delta whitespace validation"
 
 # Gate 4: architecture/regression invariants. These are ownership proofs, not image-tuning greps.
 CAP="$CAND/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java"
