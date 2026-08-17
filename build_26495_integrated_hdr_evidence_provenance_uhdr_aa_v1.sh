@@ -261,7 +261,18 @@ pass "version incremented to 0.9726495 / 26495 in build command"
 git diff --no-index --binary "$BASE/app" "$CAND/app" > "$DELTA" || [[ $? -eq 1 ]] || fail "delta generation"
 [[ -s "$DELTA" ]] || fail "26495 delta empty"
 
-# Gate 7: Java/Android compiler and full APK build are authoritative.
+# Gate 7: snapshot the exact canonical 26495 candidate, then let the Android/native
+# toolchain build. CMake is known to download four ignored dependency headers into
+# app/src/main/cpp/deps during native compilation; those are build side-effects,
+# not canonical source and must never contaminate the next source baseline.
+PREBUILD_CANONICAL="$TMP/26495_prebuild_canonical.sha256"
+(
+    cd "$CAND"
+    { find app/src/main -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum; sha256sum app/version.properties; } > "$PREBUILD_CANONICAL"
+)
+[[ "$(wc -l < "$PREBUILD_CANONICAL")" -eq 856 ]] || fail "pre-build canonical 26495 count not 856"
+
+# Java/Android compiler and full APK build are authoritative.
 (
     cd "$CAND"
     ./gradlew --no-daemon :app:compileDebugJavaWithJavac
@@ -274,14 +285,58 @@ cp "${APKS[0]}" "$REPO/$APK_NAME"
 [[ -s "$REPO/$APK_NAME" ]] || fail "final APK missing"
 sha256sum "$REPO/$APK_NAME" > "$OUTDIR/$APK_NAME.sha256"
 
-# Gate 8: retain the exact successful post-transform source as next baseline.
+# Gate 8: prove native build side-effects are exactly the four known ignored
+# dependency headers, and prove all 856 canonical files are byte-identical to the
+# pre-build candidate. Then remove only those transient headers before archiving.
+python3 - "$CAND" "$PREBUILD_CANONICAL" <<'PY_POSTBUILD'
+from pathlib import Path
+import hashlib,sys
+root=Path(sys.argv[1]); pre=Path(sys.argv[2])
+expected={}
+for line in pre.read_text().splitlines():
+    if line.strip():
+        h,rel=line.split(None,1); expected[rel.strip()]=h
+if len(expected)!=856:
+    raise SystemExit(f'pre-build canonical manifest count={len(expected)} expected=856')
+actual={str(p.relative_to(root)) for p in (root/'app/src/main').rglob('*') if p.is_file()} | {'app/version.properties'}
+known_generated={
+    'app/src/main/cpp/deps/archive.h',
+    'app/src/main/cpp/deps/archive_entry.h',
+    'app/src/main/cpp/deps/technicallyflac.h',
+    'app/src/main/cpp/deps/tiny_dng_writer.h',
+}
+extra=actual-set(expected)
+missing=set(expected)-actual
+if missing:
+    raise SystemExit('canonical source missing after build: '+repr(sorted(missing)))
+if extra!=known_generated:
+    raise SystemExit('unexpected post-build source side-effects: '+repr(sorted(extra))+' expected='+repr(sorted(known_generated)))
+for rel,h in expected.items():
+    got=hashlib.sha256((root/rel).read_bytes()).hexdigest()
+    if got!=h:
+        raise SystemExit(f'canonical source mutated by build: {rel} pre={h} post={got}')
+for rel in sorted(known_generated):
+    p=root/rel
+    if not p.is_file() or p.stat().st_size<=0:
+        raise SystemExit('known generated dependency missing/empty after successful native build: '+rel)
+print('PASS: post-build source = 856 canonical files byte-identical + exactly 4 known CMake dependency headers')
+PY_POSTBUILD
+rm -f \
+    "$CAND/app/src/main/cpp/deps/archive.h" \
+    "$CAND/app/src/main/cpp/deps/archive_entry.h" \
+    "$CAND/app/src/main/cpp/deps/technicallyflac.h" \
+    "$CAND/app/src/main/cpp/deps/tiny_dng_writer.h"
+
 (
     cd "$CAND"
     { find app/src/main -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum; sha256sum app/version.properties; } > "$AFTERHASH"
     tar -czf "$NEXTBUNDLE" app/src/main app/version.properties
 )
-[[ "$(wc -l < "$AFTERHASH")" -eq 856 ]] || fail "26495 successful manifest count not 856"
+[[ "$(wc -l < "$AFTERHASH")" -eq 856 ]] || fail "26495 canonical successful manifest count not 856 after removing known build side-effects"
+cmp -s "$PREBUILD_CANONICAL" "$AFTERHASH" || fail "post-build canonical manifest differs from exact pre-build 26495 candidate"
+[[ "$(tar -tzf "$NEXTBUNDLE" | grep -v '/$' | wc -l)" -eq 856 ]] || fail "26495 canonical successful bundle file count not 856"
 sha256sum "$NEXTBUNDLE" "$AFTERHASH" "$DELTA" > "$OUTDIR/26495_artifact_hashes.sha256"
+pass "post-build canonical source integrity + transient CMake dependency exclusion"
 
 cat > "$REPORT" <<EOF
 26495 BUILD SUCCESS
