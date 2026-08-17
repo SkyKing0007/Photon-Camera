@@ -1,0 +1,629 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 623ba89..cc7ad78 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -9,31 +9,8 @@ uniform float hdrExposureScale;
+ uniform float maxGainRatio;
+ out vec4 Output;
+ 
+-/* IRIS_26496_GUIDED_LOG_GAIN_DECIMATION
+- * 26495 blurred HDR and SDR independently before division. Across a strong edge,
+- * those two fields do not share the same tone relationship, so their quotient can
+- * create a broad gain halo. 26496 forms the physical multiplicative relationship
+- * FIRST at full resolution, converts it to log2 gain, then anti-aliases that gain
+- * field for 4:1 decimation. SDR luminance is only a guide that prevents large gain
+- * from bleeding across a strong object edge; the full-resolution SDR base is never
+- * filtered or changed.
+- */
+ const float UHDR_OFFSET = 0.015625;
+ const int DOWNSAMPLE = 4;
+-const int FILTER_TAPS = 10;
+-const int FILTER_START = -3; /* -3..+6 is centered on the 4x4 cell center at 1.5. */
+-const float GUIDE_SIGMA_EV = 0.90;
+-const float KERNEL[FILTER_TAPS] = float[FILTER_TAPS](
+-        0.042229693589,
+-        0.070339090351,
+-        0.103129012812,
+-        0.133097613729,
+-        0.151204589518,
+-        0.151204589518,
+-        0.133097613729,
+-        0.103129012812,
+-        0.070339090351,
+-        0.042229693589);
+ 
+ float luminance(vec3 c){return dot(c,vec3(0.2126,0.7152,0.0722));}
+ float srgbDecode(float x){
+@@ -49,15 +26,14 @@ float hdrLumaAt(ivec2 p) {
+     p=clamp(p,ivec2(0),sourceSize-ivec2(1));
+     return max(luminance(max(texelFetch(HdrBuffer,p,0).rgb,vec3(0.0))*hdrExposureScale),0.0);
+ }
+-float centerGuideLuma(ivec2 base) {
+-    return 0.25*(sdrLumaAt(base+ivec2(1,1))+sdrLumaAt(base+ivec2(2,1))
+-            +sdrLumaAt(base+ivec2(1,2))+sdrLumaAt(base+ivec2(2,2)));
+-}
+-float guideWeight(float centerLuma,float sampleLuma) {
+-    float ev=abs(log2((sampleLuma+UHDR_OFFSET)/(centerLuma+UHDR_OFFSET)));
+-    float z=ev/GUIDE_SIGMA_EV;
+-    return exp(-0.5*z*z);
+-}
++
++/* IRIS_26497_NONOVERLAP_LOG_GAIN_FOOTPRINT
++ * SDR is the full-resolution spatial-detail authority. Form the multiplicative
++ * HDR/SDR relationship per full-resolution pixel, then average log-gain only
++ * inside this gain pixel's exact non-overlapping 4x4 ownership footprint.
++ * No neighboring gain cell contributes, so UHDR cannot create the 26495/26496
++ * cross-edge brightness veil that made the sharp SDR base look blurred.
++ */
+ void main(){
+     ivec2 gp=ivec2(gl_FragCoord.xy);
+     if(any(greaterThanEqual(gp,gainMapSize))){
+@@ -66,26 +42,19 @@ void main(){
+     }
+     ivec2 base=gp*DOWNSAMPLE;
+     float maxLog=max(log2(max(maxGainRatio,1.001)),1.0e-6);
+-    float centerLuma=centerGuideLuma(base);
+-    float sum=0.0;
+-    float weightSum=0.0;
+-    for(int ky=0;ky<FILTER_TAPS;++ky){
+-        for(int kx=0;kx<FILTER_TAPS;++kx){
+-            ivec2 sp=clamp(base+ivec2(FILTER_START+kx,FILTER_START+ky),
+-                    ivec2(0),sourceSize-ivec2(1));
+-            float spatial=KERNEL[kx]*KERNEL[ky];
++    float logSum=0.0;
++    float count=0.0;
++    for(int oy=0;oy<DOWNSAMPLE;++oy){
++        for(int ox=0;ox<DOWNSAMPLE;++ox){
++            ivec2 sp=clamp(base+ivec2(ox,oy),ivec2(0),sourceSize-ivec2(1));
+             float sdr=sdrLumaAt(sp);
+             float hdr=hdrLumaAt(sp);
+             float ratio=clamp((hdr+UHDR_OFFSET)/(sdr+UHDR_OFFSET),
+                     1.0,max(maxGainRatio,1.001));
+-            float logGain=clamp(log2(ratio),0.0,maxLog);
+-            float guide=guideWeight(centerLuma,sdr);
+-            float w=spatial*guide;
+-            sum+=w*logGain;
+-            weightSum+=w;
++            logSum+=clamp(log2(ratio),0.0,maxLog);
++            count+=1.0;
+         }
+     }
+-    float filteredLogGain=sum/max(weightSum,1.0e-12);
+-    float encoded=clamp(filteredLogGain/maxLog,0.0,1.0);
++    float encoded=clamp((logSum/max(count,1.0))/maxLog,0.0,1.0);
+     Output=vec4(encoded,encoded,encoded,1.0);
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26489_write.glsl b/app/src/main/assets/shaders/motionv2/rcd26489_write.glsl
+index c364e00..f9e028f 100644
+--- a/app/src/main/assets/shaders/motionv2/rcd26489_write.glsl
++++ b/app/src/main/assets/shaders/motionv2/rcd26489_write.glsl
+@@ -3,18 +3,10 @@ LAYOUT
+ precision highp float;
+ precision highp int;
+ precision highp image2D;
+-layout(std430, binding = 0) readonly buffer CfaBuf {
+-    float cfa[];
+-};
+-layout(std430, binding = 1) readonly buffer RedBuf {
+-    float red[];
+-};
+-layout(std430, binding = 2) readonly buffer GreenBuf {
+-    float green[];
+-};
+-layout(std430, binding = 3) readonly buffer BlueBuf {
+-    float blue[];
+-};
++layout(std430, binding = 0) readonly buffer CfaBuf { float cfa[]; };
++layout(std430, binding = 1) readonly buffer RedBuf { float red[]; };
++layout(std430, binding = 2) readonly buffer GreenBuf { float green[]; };
++layout(std430, binding = 3) readonly buffer BlueBuf { float blue[]; };
+ layout(rgba16f, binding = 9) writeonly uniform highp image2D OutputRgb;
+ uniform ivec2 rawSize;
+ uniform ivec2 bandSize;
+@@ -24,72 +16,25 @@ uniform int coreRows;
+ uniform int cfaPattern;
+ uniform vec3 calculationWb;
+ 
+-/* IRIS_26490_BJZHOU_RCD_PHOTO_BORDER_MIRROR_1TO1
+- * Preserve the virtual PPG coordinate. Each sample is reflected in full-photo coordinates,
+- * then mapped back into this band's halo. Clamping the virtual center changes Bayer parity and
+- * is not equivalent to the reference PPG border semantics.
+- */
+-int mirrorIndex(int value,int size){
+-    if(size<=1)return 0;
+-    int period=2*(size-1);
+-    int wrapped=value%period;
+-    if(wrapped<0)wrapped+=period;
+-    return wrapped<size?wrapped:period-wrapped;
+-}
+-ivec2 mirrorLocal(ivec2 p){
+-    ivec2 gp=ivec2(p.x,bandOriginY+p.y);
+-    ivec2 safeGlobal=ivec2(mirrorIndex(gp.x,rawSize.x),mirrorIndex(gp.y,rawSize.y));
+-    return ivec2(safeGlobal.x,safeGlobal.y-bandOriginY);
+-}
+-int idxAt(ivec2 p){ivec2 safe=mirrorLocal(p);return safe.y*bandSize.x+safe.x;}
+-int phaseAtSafeLocal(ivec2 p){ivec2 gp=ivec2(p.x,bandOriginY+p.y);return (gp.x&1)|((gp.y&1)<<1);}
+-int colorAt(ivec2 p){ivec2 safe=mirrorLocal(p);int q=phaseAtSafeLocal(safe);if(cfaPattern==0)return q==0?0:(q==3?2:1);if(cfaPattern==1)return q==1?0:(q==2?2:1);if(cfaPattern==2)return q==2?0:(q==1?2:1);return q==3?0:(q==0?2:1);}
+-float raw(ivec2 p){return cfa[idxAt(p)];}
+-float ppgGreen(ivec2 p){
+-    if(colorAt(p)==1) return max(raw(p),0.0);
+-    float c=raw(p);
+-    float xm=raw(p+ivec2(-1,0)), xp=raw(p+ivec2(1,0));
+-    float xm2=raw(p+ivec2(-2,0)), xp2=raw(p+ivec2(2,0));
+-    float xm3=raw(p+ivec2(-3,0)), xp3=raw(p+ivec2(3,0));
+-    float ym=raw(p+ivec2(0,-1)), yp=raw(p+ivec2(0,1));
+-    float ym2=raw(p+ivec2(0,-2)), yp2=raw(p+ivec2(0,2));
+-    float ym3=raw(p+ivec2(0,-3)), yp3=raw(p+ivec2(0,3));
+-    float gx=2.0*(xm+c+xp)-xm2-xp2;
+-    float gy=2.0*(ym+c+yp)-ym2-yp2;
+-    float dx=3.0*(abs(xm2-c)+abs(xp2-c)+abs(xm-xp))
+-        +2.0*(abs(xp3-xp)+abs(xm3-xm));
+-    float dy=3.0*(abs(ym2-c)+abs(yp2-c)+abs(ym-yp))
+-        +2.0*(abs(yp3-yp)+abs(ym3-ym));
+-    float outg=dx>dy?clamp(0.25*gy,min(ym,yp),max(ym,yp))
+-                    :clamp(0.25*gx,min(xm,xp),max(xm,xp));
+-    return max(outg,0.0);
++int idxAt(ivec2 p) {
++    p = clamp(p, ivec2(0), bandSize - ivec2(1));
++    return p.y * bandSize.x + p.x;
+ }
+-vec3 ppg(ivec2 p){
+-    int own=colorAt(p); float c=max(raw(p),0.0),gg=ppgGreen(p); vec3 outc=vec3(0.0,gg,0.0);
+-    if(own==0||own==2){
+-        if(own==0) outc.r=c; else outc.b=c;
+-        ivec2 a=ivec2(-1,-1),bb=ivec2(1,-1),cc=ivec2(-1,1),d=ivec2(1,1);
+-        float e1=abs(raw(p+a)-raw(p+d))+abs(ppgGreen(p+a)-gg)+abs(ppgGreen(p+d)-gg);
+-        float e2=abs(raw(p+bb)-raw(p+cc))+abs(ppgGreen(p+bb)-gg)+abs(ppgGreen(p+cc)-gg);
+-        float v1=0.5*(raw(p+a)+raw(p+d)+2.0*gg-ppgGreen(p+a)-ppgGreen(p+d));
+-        float v2=0.5*(raw(p+bb)+raw(p+cc)+2.0*gg-ppgGreen(p+bb)-ppgGreen(p+cc));
+-        float v=e1<e2?v1:(e2<e1?v2:0.5*(v1+v2)); if(own==0) outc.b=v; else outc.r=v;
+-    } else {
+-        outc.g=c; bool horizontalRed=colorAt(p+ivec2(1,0))==0;
+-        float h=0.5*(raw(p+ivec2(-1,0))+raw(p+ivec2(1,0))+2.0*c-ppgGreen(p+ivec2(-1,0))-ppgGreen(p+ivec2(1,0)));
+-        float v=0.5*(raw(p+ivec2(0,-1))+raw(p+ivec2(0,1))+2.0*c-ppgGreen(p+ivec2(0,-1))-ppgGreen(p+ivec2(0,1)));
+-        if(horizontalRed){outc.r=h;outc.b=v;}else{outc.r=v;outc.b=h;}
+-    }
+-    return max(outc,vec3(0.0));
+-}
+-void main(){
+-    ivec2 gid=ivec2(gl_GlobalInvocationID.xy);
+-    if(gid.x>=rawSize.x||gid.y>=coreRows) return;
+-    ivec2 lp=ivec2(gid.x,coreLocalY+gid.y);
+-    ivec2 gp=ivec2(gid.x,bandOriginY+lp.y);
+-    vec3 rgb;
+-    bool boundary=gp.x<9||gp.y<9||gp.x+9>=rawSize.x||gp.y+9>=rawSize.y;
+-    if(boundary) rgb=ppg(lp); else {int i=idxAt(lp);rgb=max(vec3(red[i],green[i],blue[i]),vec3(0.0));}
+-    rgb/=max(calculationWb,vec3(1.0e-6));
+-    imageStore(OutputRgb,gp,vec4(rgb,1.0));
++
++/* IRIS_26497_SINGLE_RCD_BORDER_AUTHORITY
++ * All directional RCD buffers are already evaluated for the complete band,
++ * including true photo edges using the same clamped-domain support as the
++ * preceding RCD passes. 26496 discarded those completed values in the outer
++ * nine pixels and switched to an unrelated PPG reconstruction, producing a
++ * visible color strip/discontinuity. Write one RCD solution from edge to edge.
++ */
++void main() {
++    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
++    if (gid.x >= rawSize.x || gid.y >= coreRows) return;
++    ivec2 lp = ivec2(gid.x, coreLocalY + gid.y);
++    ivec2 gp = ivec2(gid.x, bandOriginY + lp.y);
++    int i = idxAt(lp);
++    vec3 rgb = max(vec3(red[i], green[i], blue[i]), vec3(0.0));
++    rgb /= max(calculationWb, vec3(1.0e-6));
++    imageStore(OutputRgb, gp, vec4(rgb, 1.0));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26496_chroma_complete.glsl b/app/src/main/assets/shaders/motionv2/rcd26496_chroma_complete.glsl
+index 96e0d4d..9384b5a 100644
+--- a/app/src/main/assets/shaders/motionv2/rcd26496_chroma_complete.glsl
++++ b/app/src/main/assets/shaders/motionv2/rcd26496_chroma_complete.glsl
+@@ -8,7 +8,6 @@ uniform highp sampler2D HighlightProvenance;
+ layout(std430, binding = 1) buffer RedBuf { float red[]; };
+ layout(std430, binding = 2) readonly buffer GreenBuf { float green[]; };
+ layout(std430, binding = 3) buffer BlueBuf { float blue[]; };
+-/* Reuse buffers whose 26494 directional jobs are complete. No new full-band buffers. */
+ layout(std430, binding = 4) buffer AffectedBuf { float affected[]; };
+ layout(std430, binding = 5) buffer RedSeedBuf { float redSeed[]; };
+ layout(std430, binding = 6) buffer RedWeightBuf { float redWeight[]; };
+@@ -22,7 +21,7 @@ uniform int cfaPattern;
+ uniform int mode;
+ 
+ const float PROVENANCE_CENSORED = 1.0;
+-const int FILTER_RADIUS = 5;
++const int FILTER_RADIUS = 4;
+ 
+ int idxAt(ivec2 p) {
+     p = clamp(p, ivec2(0), bandSize - ivec2(1));
+@@ -61,8 +60,6 @@ bool packedCodeHasCensored(float encoded) {
+ bool nearbyCensored(ivec2 p) {
+     ivec2 packedSize = rawSize / 2;
+     ivec2 pc = globalAt(p) >> 1;
+-    /* 3x3 packed neighborhood covers the physical support that can feed the
+-     * original RCD color interpolation around a clipped Bayer site. */
+     for (int oy = -1; oy <= 1; ++oy) {
+         for (int ox = -1; ox <= 1; ++ox) {
+             ivec2 q = clamp(pc + ivec2(ox, oy), ivec2(0), packedSize - ivec2(1));
+@@ -71,7 +68,6 @@ bool nearbyCensored(ivec2 p) {
+     }
+     return false;
+ }
+-float g(ivec2 p) { return green[idxAt(p)]; }
+ 
+ void seedPass(ivec2 p) {
+     int i = idxAt(p);
+@@ -86,59 +82,105 @@ void seedPass(ivec2 p) {
+ 
+ float spatialWeight(ivec2 d) {
+     float d2 = float(d.x * d.x + d.y * d.y);
+-    return exp(-0.18 * d2);
++    return exp(-0.22 * d2);
+ }
+ float guideWeight(float centerGreen, float sampleGreen) {
+     float scale = max(max(abs(centerGreen), abs(sampleGreen)), 0.05);
+     float rel = abs(sampleGreen - centerGreen) / scale;
+-    return exp(-10.0 * rel * rel);
++    return exp(-14.0 * rel * rel);
+ }
+-float confidenceFromWeight(float w) {
+-    return smoothstep(0.15, 0.75, w);
++int sectorOf(ivec2 d) {
++    if (abs(d.x) >= abs(d.y)) return d.x < 0 ? 0 : 1;
++    return d.y < 0 ? 2 : 3;
+ }
+ 
+-void completionPass(ivec2 p) {
+-    int i = idxAt(p);
+-    if (affected[i] < 0.5) return; /* Exact 26494 output outside censor influence. */
+-
+-    float gc = green[i];
+-    float sumR = 0.0, sumRw = 0.0;
+-    float sumB = 0.0, sumBw = 0.0;
++/* IRIS_26497_COHERENT_MULTI_DIRECTION_CHROMA
++ * CENSORED color is missing data, not a desaturation target. Build chroma only
++ * from physically trusted NORMAL/SHORT_VALIDATED R-G or B-G observations, and
++ * require those observations to arrive from at least two independent spatial
++ * directions with mutually consistent opponent color. A single sparse short
++ * sample can therefore never paint a magenta/cyan block into a censored region.
++ */
++float coherentChroma(
++        ivec2 p, bool wantRed, float centerGreen, out float confidence) {
++    vec4 sum = vec4(0.0);
++    vec4 sumSq = vec4(0.0);
++    vec4 weight = vec4(0.0);
+     for (int oy = -FILTER_RADIUS; oy <= FILTER_RADIUS; ++oy) {
+         for (int ox = -FILTER_RADIUS; ox <= FILTER_RADIUS; ++ox) {
++            if (ox == 0 && oy == 0) continue;
+             ivec2 d = ivec2(ox, oy);
+             ivec2 q = clamp(p + d, ivec2(0), bandSize - ivec2(1));
+             int qi = idxAt(q);
+-            float sw = spatialWeight(d) * guideWeight(gc, green[qi]);
+-            float rw = sw * redWeight[qi];
+-            float bw = sw * blueWeight[qi];
+-            sumR += rw * redSeed[qi];
+-            sumRw += rw;
+-            sumB += bw * blueSeed[qi];
+-            sumBw += bw;
++            float physical = wantRed ? redWeight[qi] : blueWeight[qi];
++            if (physical < 0.5) continue;
++            float sw = spatialWeight(d) * guideWeight(centerGreen, green[qi]);
++            if (sw <= 1.0e-6) continue;
++            float v = wantRed ? redSeed[qi] : blueSeed[qi];
++            int s = sectorOf(d);
++            sum[s] += sw * v;
++            sumSq[s] += sw * v * v;
++            weight[s] += sw;
+         }
+     }
+ 
+-    float dr = sumRw > 1.0e-6 ? sumR / sumRw : 0.0;
+-    float db = sumBw > 1.0e-6 ? sumB / sumBw : 0.0;
+-    dr *= confidenceFromWeight(sumRw);
+-    db *= confidenceFromWeight(sumBw);
++    vec4 mean = vec4(0.0);
++    vec4 variance = vec4(0.0);
++    int sectors = 0;
++    float totalW = 0.0;
++    float totalMean = 0.0;
++    for (int s = 0; s < 4; ++s) {
++        if (weight[s] < 0.18) continue;
++        mean[s] = sum[s] / weight[s];
++        variance[s] = max(sumSq[s] / weight[s] - mean[s] * mean[s], 0.0);
++        sectors++;
++        totalW += weight[s];
++        totalMean += weight[s] * mean[s];
++    }
++    if (sectors < 2 || totalW <= 1.0e-6) {
++        confidence = 0.0;
++        return 0.0;
++    }
++    totalMean /= totalW;
++
++    float disagreement = 0.0;
++    float internalVariance = 0.0;
++    float validW = 0.0;
++    for (int s = 0; s < 4; ++s) {
++        if (weight[s] < 0.18) continue;
++        float dv = mean[s] - totalMean;
++        disagreement += weight[s] * dv * dv;
++        internalVariance += weight[s] * variance[s];
++        validW += weight[s];
++    }
++    float sigma = sqrt(max((disagreement + internalVariance) / max(validW, 1.0e-6), 0.0));
++    float scale = max(abs(totalMean), 0.045);
++    float relativeDispersion = sigma / scale;
++    float directionConfidence = smoothstep(1.5, 3.0, float(sectors));
++    float agreementConfidence = 1.0 - smoothstep(0.18, 0.42, relativeDispersion);
++    float supportConfidence = smoothstep(0.45, 1.35, totalW);
++    confidence = directionConfidence * agreementConfidence * supportConfidence;
++    return totalMean * confidence;
++}
++
++void completionPass(ivec2 p) {
++    int i = idxAt(p);
++    if (affected[i] < 0.5) return;
++
++    float gc = green[i];
++    float rConfidence = 0.0;
++    float bConfidence = 0.0;
++    float dr = coherentChroma(p, true, gc, rConfidence);
++    float db = coherentChroma(p, false, gc, bConfidence);
+ 
+     int c = colorAt(p);
+     bool ownTrusted = !ownCensored(p);
+-    /* A real NORMAL/SHORT_VALIDATED physical R or B observation is immutable.
+-     * Only missing/interpolated opponent chroma is completed. When support is
+-     * weak, the residual smoothly approaches neutral instead of snapping at a
+-     * binary threshold. Green/luminance geometry remains the exact 26494 RCD result. */
+     if (!(ownTrusted && c == 0)) red[i] = max(0.0, gc + dr);
+     if (!(ownTrusted && c == 2)) blue[i] = max(0.0, gc + db);
+ }
+ 
+-/* IRIS_26496_RCD_MISSING_CHROMA_NORMALIZED_CONVOLUTION
+- * mode=0 seeds only physically measured NORMAL/SHORT_VALIDATED R-G/B-G and an
+- * affected mask. mode=1 completes missing opponent chroma around censored sites
+- * using the already-reconstructed green field as an edge guide. The original
+- * nine 26494 RCD directional passes run first and are byte-identical. */
++/* mode=0 seeds immutable physical chroma evidence. mode=1 completes only
++ * missing opponent chroma after the original 26494 RCD geometry is finished. */
+ void main() {
+     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+     if (any(greaterThanEqual(p, bandSize))) return;
+diff --git a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+index 2aef559..7a2b8d6 100644
+--- a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
++++ b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+@@ -23,12 +23,6 @@ const float PROVENANCE_NORMAL = 0.0;
+ const float PROVENANCE_CENSORED = 1.0;
+ const float PROVENANCE_SHORT_VALIDATED = 2.0;
+ 
+-/* IRIS_26496_SHORT_FAILURE_REASON_TELEMETRY
+- * Diagnostic-only counters. They are read after the existing single GPU ownership
+- * drain and never feed image math. Each failure reason is counted per physical
+- * clipped phase, with a small short-RAW value histogram so exposure depth can be
+- * chosen from evidence instead of guessing another EV.
+- */
+ const uint D_TOTAL_CLIPPED = 0u;
+ const uint D_SHORT_SAFE = 1u;
+ const uint D_SHORT_CLIPPED = 2u;
+@@ -95,8 +89,17 @@ vec4 phaseSafeBilinear(vec2 packedCenter) {
+ vec4 shortSafe(vec4 v) { return vec4(1.0) - step(vec4(shortClipThreshold), v); }
+ vec4 normalSafe(vec4 v) { return vec4(1.0) - step(vec4(0.90), v); }
+ 
+-/* Existing correspondence proof is preserved. */
+-bool validateObservableCorrespondence(
++/* IRIS_26497_SHORT_CORRESPONDENCE_REFINEMENT
++ * mfsr_flow_expand.w means interpolation was cancelled and the whole base tile
++ * vector was preserved. It does NOT mean the base vector is invalid. 26496
++ * incorrectly converted that safe fallback into zero highlight evidence.
++ *
++ * For clipped sites, refine the predicted short-frame correspondence locally on
++ * unsaturated physical CFA evidence. Structured regions require a unique best
++ * match. Smooth regions may be accepted only with tighter radiometric agreement,
++ * where a subpixel ambiguity cannot create an edge/color displacement.
++ */
++void evaluateCorrespondence(
+         ivec2 p, vec2 source, out float meanRelativeError,
+         out float structure, out float supportCount) {
+     float errorSum = 0.0;
+@@ -137,7 +140,46 @@ bool validateObservableCorrespondence(
+     structure = lumaCount >= 4.0
+             ? (lumaMax - lumaMin) / max(lumaMean, 0.03)
+             : 0.0;
+-    return supportCount >= 12.0 && meanRelativeError <= 0.12 && structure >= 0.08;
++}
++
++bool refineObservableCorrespondence(
++        ivec2 p, vec2 predicted, out vec2 refined,
++        out float bestError, out float structure, out float supportCount) {
++    bestError = 1.0e20;
++    float secondError = 1.0e20;
++    refined = predicted;
++    structure = 0.0;
++    supportCount = 0.0;
++    bool found = false;
++    for (int sy = -1; sy <= 1; ++sy) {
++        for (int sx = -1; sx <= 1; ++sx) {
++            vec2 candidate = predicted + 0.5 * vec2(float(sx), float(sy));
++            if (candidate.x < 0.0 || candidate.y < 0.0 ||
++                    candidate.x >= float(packedSize.x) ||
++                    candidate.y >= float(packedSize.y)) continue;
++            float e, s, n;
++            evaluateCorrespondence(p, candidate, e, s, n);
++            if (n < 12.0) continue;
++            found = true;
++            if (e < bestError) {
++                secondError = bestError;
++                bestError = e;
++                refined = candidate;
++                structure = s;
++                supportCount = n;
++            } else if (e < secondError) {
++                secondError = e;
++            }
++        }
++    }
++    if (!found) return false;
++
++    if (structure >= 0.08) {
++        float margin = secondError - bestError;
++        bool exceptionallyGood = bestError <= 0.055;
++        return bestError <= 0.12 && (exceptionallyGood || margin >= 0.010);
++    }
++    return supportCount >= 16.0 && bestError <= 0.060;
+ }
+ 
+ void storeState(ivec2 p, vec4 cfa, vec4 state) {
+@@ -145,10 +187,11 @@ void storeState(ivec2 p, vec4 cfa, vec4 state) {
+     imageStore(outProvenance, p, vec4(encodePhaseStates(state), 0.0, 0.0, 0.0));
+ }
+ 
+-/* IRIS_26494_PER_PHASE_SHORT_VALIDATION
+- * Unsaturated normal phases remain exactly measured when another phase clips.
+- * Only a clipped phase whose short observation is individually unsaturated may
+- * become SHORT_VALIDATED, and only after the existing observable-ring proof.
++/* IRIS_26497_PHYSICAL_SHORT_VALIDATION
++ * NORMAL remains measured. SHORT_VALIDATED is granted only after unsaturated
++ * short evidence survives corrected flow semantics, local correspondence
++ * refinement, and the existing physical radiometry check. CENSORED remains
++ * explicitly unknown rather than being promoted by downstream color heuristics.
+  */
+ void main() {
+     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+@@ -165,18 +208,28 @@ void main() {
+     vec2 uv = (vec2(p) + vec2(0.5)) / vec2(packedSize);
+     vec4 flowState = texture(flowTexture, uv);
+     float variation = max(flowState.z, 0.0);
+-    float cancelled = step(0.5, flowState.w);
+-    float flowConfidence = (1.0 - cancelled) * exp(-80.0 * variation);
+-    vec2 source = vec2(p) + vec2(0.5) + flowState.xy;
+-    if (source.x < 0.0 || source.y < 0.0 ||
+-            source.x >= float(packedSize.x) || source.y >= float(packedSize.y) ||
+-            flowConfidence < minimumFlowConfidence) {
++    /* flowState.w is interpolation-cancel/base-vector-preserved, not invalid. */
++    float flowConfidence = exp(-80.0 * variation);
++    vec2 predicted = vec2(p) + vec2(0.5) + flowState.xy;
++    if (flowConfidence < minimumFlowConfidence) {
+         addMask(D_FLOW_REJECT, D_PHASE_FLOW_REJECT, clipMask);
+         addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+ 
++    vec2 source;
++    float meanError;
++    float structure;
++    float supportCount;
++    if (!refineObservableCorrespondence(
++            p, predicted, source, meanError, structure, supportCount)) {
++        addMask(D_CORR_REJECT, D_PHASE_CORR_REJECT, clipMask);
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
++        storeState(p, normal, clipMask);
++        return;
++    }
++
+     vec4 shortCenter = phaseSafeBilinear(source);
+     vec4 recoverMask = clipMask * shortSafe(shortCenter);
+     vec4 shortClippedMask = clipMask - recoverMask;
+@@ -189,16 +242,6 @@ void main() {
+         return;
+     }
+ 
+-    float meanError;
+-    float structure;
+-    float supportCount;
+-    if (!validateObservableCorrespondence(p, source, meanError, structure, supportCount)) {
+-        addMask(D_CORR_REJECT, D_PHASE_CORR_REJECT, recoverMask);
+-        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+-        storeState(p, normal, clipMask);
+-        return;
+-    }
+-
+     vec4 shortEquivalent = shortCenter * shortToNormalScale * referenceExposureScale;
+     float requiredScale = 1.0;
+     for (int i = 0; i < 4; ++i) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
+index e969d28..8dd12ce 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
+@@ -18,13 +18,12 @@ import static android.opengl.GLES31.GL_DYNAMIC_DRAW;
+ import static android.opengl.GLES31.glMemoryBarrier;
+ 
+ /**
+- * IRIS_26489_POSTMERGE_RCD_DEMOSAIC_OWNER
++ * IRIS_26497_POSTMERGE_RCD_SINGLE_AUTHORITY
+  *
+- * Motion's temporal owner stops at a fused Bayer lattice. This node runs a banded, full
+- * directional RCD reconstruction after the burst is complete. The equations are split into the
+- * same physical stages as the reference RCD pipeline: calculation-domain populate, VH direction,
+- * low-pass support, green reconstruction, diagonal residual/direction, opposite colour,
+- * red/blue-at-green, then one camera-RGB write. PPG is confined to the true photo border.
++ * Motion's temporal owner stops at a fused Bayer lattice. This node runs the banded directional
++ * RCD reconstruction after the burst is complete. 26497 removes the old true-border PPG handoff:
++ * one completed RCD solution now owns the full image from edge to edge, followed by coherent
++ * provenance-aware missing-chroma completion only where physical color is unavailable.
+  */
+ public final class MotionV2RcdDemosaic extends Node {
+     private static final int BAND_CORE_ROWS = 256;
+@@ -291,14 +290,16 @@ public final class MotionV2RcdDemosaic extends Node {
+                 + " bands=" + bands
+                 + " haloRows=" + RCD_HALO_ROWS
+                 + " maxScratchMiB=" + (maxScratchBytes / (1024L * 1024L))
+-                + " ppg=truePhotoBorderOnly"
++                + " ppg=false"
++                + " singleRcdBorderAuthority=true"
+                 + " temporalRgbSynthesis=false"
+                 + " calculationWbRemovedAtOutput=true"
+                 + " explicitHighlightProvenance=true"
+                 + " original26494DirectionalPassesByteIdentical=true"
+-                + " censoredChromaCompletion=edgeGuidedNormalizedConvolution"
++                + " censoredChromaCompletion=coherentMultiDirectionPhysicalEvidence"
+                 + " chromaSeeds=normalOrShortValidatedPhysicalSitesOnly"
+-                + " weakSupportSmoothlyNeutral=true"
++                + " isolatedShortSeedCannotPropagate=true"
++                + " weakOrDisagreeingSupportNeutral=true"
+                 + " extraFullBandScratchBuffers=0"
+                 + " reusedScratchBuffers=vh,lpf,pdiff,qdiff,pq"
+                 + " rcdReclassificationForbidden=true"
+@@ -313,7 +314,9 @@ public final class MotionV2RcdDemosaic extends Node {
+                             + " bands=" + bands
+                             + " halo=" + RCD_HALO_ROWS
+                             + " maxScratchMiB=" + (maxScratchBytes / (1024L * 1024L))
+-                            + " ppgBorderOnly=true");
++                            + " ppgBorderOnly=false"
++                            + " singleRcdBorderAuthority=true"
++                            + " coherentChromaCompletion=true");
+         } catch (Throwable ignored) {}
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index 03dfc72..ded88e1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -1521,9 +1521,12 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     glProg.setVar("shortToNormalScale",shortToNormalScale);
+                     glProg.setVar("physicalClipThreshold",IRIS26487_CLIP_THRESHOLD);
+                     glProg.setVar("shortClipThreshold",IRIS26487_CLIP_THRESHOLD);
+-                    /* IRIS_26490_SHORT_FLOW_RELIABILITY_HOST
+-                     * Reuse the proven 26486 short-highlight flow floor. Z/W come from
+-                     * mfsr_flow_expand as variation/interpolation-cancel evidence.
++                    /* IRIS_26497_SHORT_CORRESPONDENCE_HOST
++                     * Keep the proven variation floor, but the shader now interprets
++                     * mfsr_flow_expand.w correctly: interpolation cancellation preserves
++                     * the whole base tile vector and is not itself an invalid warp.
++                     * Structured clipped sites receive a bounded local correspondence
++                     * refinement before any short sample can become color authority.
+                      */
+                     glProg.setVar("minimumFlowConfidence",0.30f);
+                     glProg.setVar("referenceExposureScale",iris26487ReferenceExposureScale);
+@@ -1549,7 +1552,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             +" timestamp="+shortHighlightFrame.timestamp
+                             +" shortExcludedFromNormalAccumulator=true"
+                             +" shortExtendedRadianceState=true"
+-                            +" recoveredBeforeDemosaic=true rgbRepair=false");
++                            +" recoveredBeforeDemosaic=true rgbRepair=false"
++                            +" interpolationCancelMeansBaseFlow=true"
++                            +" localCorrespondenceRefine=3x3HalfPacked"
++                            +" structuredUniqueMatchRequired=true");
+ 
+                 }
+                 /* IRIS_26488_TINY_DIAGNOSTICS_BEFORE_SINGLE_GPU_DRAIN
