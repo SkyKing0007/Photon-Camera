@@ -1,0 +1,1726 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 5a63f27..139f4ad 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -4,53 +4,27 @@ precision mediump sampler2D;
+ uniform sampler2D HdrBuffer;
+ uniform sampler2D SdrBuffer;
+ uniform ivec2 gainMapSize;
+-uniform ivec2 sourceSize;
+ uniform float hdrExposureScale;
+ uniform float maxGainRatio;
+-out vec4 Output;
++out float Output;
+ 
+-/* IRIS_26494_MATCHED_FOOTPRINT_UHDR_GAINMAP
+- * Each 1/4-resolution gain value represents its exact corresponding 4x4 source
+- * footprint. HDR and SDR luminance are integrated first; the ratio is formed once
+- * afterward. This is anti-aliased decimation, not a blur of an aliased gain map.
+- * SDR remains the sole full-resolution spatial-detail authority.
++/* IRIS_26498_FULL_RESOLUTION_ULTRAHDR_GAIN_AUTHORITY
++ * Android Ultra HDR permits a gain map at the same resolution as the primary.
++ * Generate the standard logarithmic gain per primary pixel, so the decoder never
++ * has to spatially resample a lower-resolution brightness edge over the sharp SDR
++ * base. The SDR image remains the exact spatial/color primary; UHDR changes only
++ * the per-pixel display gain.
+  */
+ const float UHDR_OFFSET = 0.015625;
+-const int FOOTPRINT = 4;
+ float luminance(vec3 c){return dot(c,vec3(0.2126,0.7152,0.0722));}
+-float srgbDecode(float x){
+-    x=clamp(x,0.0,1.0);
+-    return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);
+-}
++float srgbDecode(float x){x=clamp(x,0.0,1.0);return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);}
+ vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));}
+-void footprintLuminance(ivec2 gainPixel, out float hdrMean, out float sdrMean) {
+-    ivec2 base = gainPixel * FOOTPRINT;
+-    float hdrSum = 0.0;
+-    float sdrSum = 0.0;
+-    for (int oy = 0; oy < FOOTPRINT; ++oy) {
+-        for (int ox = 0; ox < FOOTPRINT; ++ox) {
+-            ivec2 sp = clamp(base + ivec2(ox, oy), ivec2(0), sourceSize - ivec2(1));
+-            vec3 hdr = max(texelFetch(HdrBuffer, sp, 0).rgb, vec3(0.0)) * hdrExposureScale;
+-            vec3 sdr = srgbDecode(texelFetch(SdrBuffer, sp, 0).rgb);
+-            hdrSum += max(luminance(hdr), 0.0);
+-            sdrSum += max(luminance(sdr), 0.0);
+-        }
+-    }
+-    hdrMean = hdrSum / float(FOOTPRINT * FOOTPRINT);
+-    sdrMean = sdrSum / float(FOOTPRINT * FOOTPRINT);
+-}
+ void main(){
+-    ivec2 gp = ivec2(gl_FragCoord.xy);
+-    if (any(greaterThanEqual(gp, gainMapSize))) {
+-        Output = vec4(0.0,0.0,0.0,1.0);
+-        return;
+-    }
+-    float hdrMean;
+-    float sdrMean;
+-    footprintLuminance(gp, hdrMean, sdrMean);
+-    float maxLog=max(log2(max(maxGainRatio,1.001)),1.0e-6);
+-    float ratio=clamp((hdrMean+UHDR_OFFSET)/(sdrMean+UHDR_OFFSET),
+-            1.0,max(maxGainRatio,1.001));
+-    float encoded=clamp(log2(ratio)/maxLog,0.0,1.0);
+-    Output=vec4(encoded,encoded,encoded,1.0);
++    ivec2 p=ivec2(gl_FragCoord.xy);
++    if(any(greaterThanEqual(p,gainMapSize))){Output=0.0;return;}
++    float hdr=max(luminance(max(texelFetch(HdrBuffer,p,0).rgb,vec3(0.0))*hdrExposureScale),0.0);
++    float sdr=max(luminance(srgbDecode(texelFetch(SdrBuffer,p,0).rgb)),0.0);
++    float safeMax=max(maxGainRatio,1.001);
++    float ratio=clamp((hdr+UHDR_OFFSET)/(sdr+UHDR_OFFSET),1.0,safeMax);
++    Output=clamp(log2(ratio)/max(log2(safeMax),1.0e-6),0.0,1.0);
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_diag_residual.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_diag_residual.glsl
+new file mode 100644
+index 0000000..376039b
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_diag_residual.glsl
+@@ -0,0 +1,7 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;precision highp int;
++layout(std430,binding=0)readonly buffer CfaBuf{float cfa[];};layout(std430,binding=6)buffer PBuf{float pdiff[];};layout(std430,binding=7)buffer QBuf{float qdiff[];};layout(std430,binding=9)readonly buffer TrustBuf{float trust[];};uniform ivec2 bandSize;
++int idxAt(ivec2 p){p=clamp(p,ivec2(0),bandSize-ivec2(1));return p.y*bandSize.x+p.x;}float raw(ivec2 p){return cfa[idxAt(p)];}float tr(ivec2 p){return trust[idxAt(p)];}float sq(float v){return v*v;}
++bool trustedBox(ivec2 p){for(int y=-3;y<=3;++y)for(int x=-3;x<=3;++x)if((abs(x)==abs(y)||x==0||y==0)&&tr(p+ivec2(x,y))<0.5)return false;return true;}
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,bandSize)))return;int i=idxAt(p);if(p.x<4||p.y<4||p.x+4>=bandSize.x||p.y+4>=bandSize.y||!trustedBox(p)){pdiff[i]=qdiff[i]=1.0e-10;return;}float a=raw(p+ivec2(-3,-3))-raw(p+ivec2(-1,-1))-raw(p+ivec2(1,1))+raw(p+ivec2(3,3))-3.0*(raw(p+ivec2(-2,-2))+raw(p+ivec2(2,2)))+6.0*raw(p);float b=raw(p+ivec2(3,-3))-raw(p+ivec2(1,-1))-raw(p+ivec2(-1,1))+raw(p+ivec2(-3,3))-3.0*(raw(p+ivec2(2,-2))+raw(p+ivec2(-2,2)))+6.0*raw(p);pdiff[i]=max(sq(a),1.0e-10);qdiff[i]=max(sq(b),1.0e-10);}
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_green.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_green.glsl
+new file mode 100644
+index 0000000..465190e
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_green.glsl
+@@ -0,0 +1,20 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;precision highp int;
++layout(std430,binding=0)readonly buffer CfaBuf{float cfa[];};
++layout(std430,binding=2)buffer GreenBuf{float green[];};
++layout(std430,binding=4)readonly buffer VhBuf{float vh[];};
++layout(std430,binding=5)readonly buffer LpfBuf{float lpf[];};
++layout(std430,binding=9)readonly buffer TrustBuf{float trust[];};
++uniform ivec2 bandSize;uniform int bandOriginY;uniform int cfaPattern;
++int idxAt(ivec2 p){p=clamp(p,ivec2(0),bandSize-ivec2(1));return p.y*bandSize.x+p.x;}float raw(ivec2 p){return cfa[idxAt(p)];}float low(ivec2 p){return lpf[idxAt(p)];}float tr(ivec2 p){return trust[idxAt(p)];}
++int phaseAt(ivec2 p){ivec2 gp=ivec2(p.x,bandOriginY+p.y);return(gp.x&1)|((gp.y&1)<<1);}int colorAt(ivec2 p){int q=phaseAt(p);if(cfaPattern==0)return q==0?0:(q==3?2:1);if(cfaPattern==1)return q==1?0:(q==2?2:1);if(cfaPattern==2)return q==2?0:(q==1?2:1);return q==3?0:(q==0?2:1);}
++float safePair(ivec2 a,ivec2 b,out bool ok){ok=tr(a)>0.5&&tr(b)>0.5;return ok?0.5*(raw(a)+raw(b)):0.0;}
++float safeGreenCross(ivec2 p){bool hv,vv;float h=safePair(p+ivec2(-1,0),p+ivec2(1,0),hv);float v=safePair(p+ivec2(0,-1),p+ivec2(0,1),vv);if(hv&&vv){float hd=abs(raw(p+ivec2(-1,0))-raw(p+ivec2(1,0)));float vd=abs(raw(p+ivec2(0,-1))-raw(p+ivec2(0,1)));return hd<vd?h:(vd<hd?v:0.5*(h+v));}if(hv)return h;if(vv)return v;float s=0.0,w=0.0;ivec2 d[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));for(int k=0;k<4;++k){float t=tr(p+d[k]);s+=t*raw(p+d[k]);w+=t;}return w>0.5?s/w:max(raw(p),0.0);}
++float safeSameGreen(ivec2 p){bool h,v;float hm=safePair(p+ivec2(-2,0),p+ivec2(2,0),h);float vm=safePair(p+ivec2(0,-2),p+ivec2(0,2),v);if(h&&v)return 0.5*(hm+vm);if(h)return hm;if(v)return vm;return safeGreenCross(p);}
++bool originalNeighborhoodTrusted(ivec2 p){for(int k=-4;k<=4;++k){if(tr(p+ivec2(k,0))<0.5||tr(p+ivec2(0,k))<0.5)return false;}return true;}
++/* IRIS_26498_RCD_GREEN_NEVER_USES_CENSORED_AS_DIRECTIONAL_MEASUREMENT */
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,bandSize)))return;int i=idxAt(p);int ccol=colorAt(p);
++ if(ccol==1){green[i]=tr(p)>0.5?raw(p):safeSameGreen(p);return;}
++ if(p.x<5||p.y<5||p.x+5>=bandSize.x||p.y+5>=bandSize.y||tr(p)<0.5||!originalNeighborhoodTrusted(p)){green[i]=safeGreenCross(p);return;}
++ const float e=1.0e-5;float c=raw(p);float ng=e+abs(raw(p+ivec2(0,-1))-raw(p+ivec2(0,1)))+abs(c-raw(p+ivec2(0,-2)))+abs(raw(p+ivec2(0,-1))-raw(p+ivec2(0,-3)))+abs(raw(p+ivec2(0,-2))-raw(p+ivec2(0,-4)));float sg=e+abs(raw(p+ivec2(0,1))-raw(p+ivec2(0,-1)))+abs(c-raw(p+ivec2(0,2)))+abs(raw(p+ivec2(0,1))-raw(p+ivec2(0,3)))+abs(raw(p+ivec2(0,2))-raw(p+ivec2(0,4)));float wg=e+abs(raw(p+ivec2(-1,0))-raw(p+ivec2(1,0)))+abs(c-raw(p+ivec2(-2,0)))+abs(raw(p+ivec2(-1,0))-raw(p+ivec2(-3,0)))+abs(raw(p+ivec2(-2,0))-raw(p+ivec2(-4,0)));float eg=e+abs(raw(p+ivec2(1,0))-raw(p+ivec2(-1,0)))+abs(c-raw(p+ivec2(2,0)))+abs(raw(p+ivec2(1,0))-raw(p+ivec2(3,0)))+abs(raw(p+ivec2(2,0))-raw(p+ivec2(4,0)));float lc=low(p);float n=raw(p+ivec2(0,-1))*(2.0*lc)/(e+lc+low(p+ivec2(0,-1)));float s=raw(p+ivec2(0,1))*(2.0*lc)/(e+lc+low(p+ivec2(0,1)));float w=raw(p+ivec2(-1,0))*(2.0*lc)/(e+lc+low(p+ivec2(-1,0)));float ee=raw(p+ivec2(1,0))*(2.0*lc)/(e+lc+low(p+ivec2(1,0)));float v=(sg*n+ng*s)/(ng+sg);float h=(wg*ee+eg*w)/(eg+wg);green[i]=mix(v,h,clamp(vh[i],0.0,1.0));}
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_green_rb.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_green_rb.glsl
+new file mode 100644
+index 0000000..5114cbc
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_green_rb.glsl
+@@ -0,0 +1,10 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;precision highp int;
++layout(std430,binding=1)buffer RedBuf{float red[];};layout(std430,binding=2)readonly buffer GreenBuf{float green[];};layout(std430,binding=3)buffer BlueBuf{float blue[];};layout(std430,binding=4)readonly buffer VhBuf{float vh[];};layout(std430,binding=9)readonly buffer TrustBuf{float trust[];};uniform ivec2 bandSize;uniform int bandOriginY;uniform int cfaPattern;
++int idxAt(ivec2 p){p=clamp(p,ivec2(0),bandSize-ivec2(1));return p.y*bandSize.x+p.x;}int phaseAt(ivec2 p){ivec2 gp=ivec2(p.x,bandOriginY+p.y);return(gp.x&1)|((gp.y&1)<<1);}int colorAt(ivec2 p){int q=phaseAt(p);if(cfaPattern==0)return q==0?0:(q==3?2:1);if(cfaPattern==1)return q==1?0:(q==2?2:1);if(cfaPattern==2)return q==2?0:(q==1?2:1);return q==3?0:(q==0?2:1);}float g(ivec2 p){return green[idxAt(p)];}float r(ivec2 p){return red[idxAt(p)];}float b(ivec2 p){return blue[idxAt(p)];}float tr(ivec2 p){return trust[idxAt(p)];}
++bool fullTrusted(ivec2 p,bool wantRed){bool horizontal=colorAt(p+ivec2(1,0))==(wantRed?0:2);ivec2 a=horizontal?ivec2(-1,0):ivec2(0,-1);ivec2 z=horizontal?ivec2(1,0):ivec2(0,1);ivec2 a3=3*a,z3=3*z;return tr(p)>0.5&&tr(p+a)>0.5&&tr(p+z)>0.5&&tr(p+a3)>0.5&&tr(p+z3)>0.5;}
++float safeAxis(ivec2 p,bool wantRed){float gc=g(p);bool horizontal=colorAt(p+ivec2(1,0))==(wantRed?0:2);ivec2 a=horizontal?ivec2(-1,0):ivec2(0,-1);ivec2 z=horizontal?ivec2(1,0):ivec2(0,1);if(tr(p+a)<0.5||tr(p+z)<0.5)return gc;float ca=(wantRed?r(p+a):b(p+a))-g(p+a);float cz=(wantRed?r(p+z):b(p+z))-g(p+z);float mean=0.5*(ca+cz);float rel=abs(ca-cz)/max(abs(mean),0.045);float conf=1.0-smoothstep(0.22,0.42,rel);return max(0.0,gc+mean*conf);}
++float originalEstimate(ivec2 p,bool wantRed){const float e=1.0e-5;float gc=g(p);float n2=e+abs(gc-g(p+ivec2(0,-2)));float s2=e+abs(gc-g(p+ivec2(0,2)));float w2=e+abs(gc-g(p+ivec2(-2,0)));float e2=e+abs(gc-g(p+ivec2(2,0)));float n=wantRed?r(p+ivec2(0,-1)):b(p+ivec2(0,-1));float s=wantRed?r(p+ivec2(0,1)):b(p+ivec2(0,1));float w=wantRed?r(p+ivec2(-1,0)):b(p+ivec2(-1,0));float ee=wantRed?r(p+ivec2(1,0)):b(p+ivec2(1,0));float n3=wantRed?r(p+ivec2(0,-3)):b(p+ivec2(0,-3));float s3=wantRed?r(p+ivec2(0,3)):b(p+ivec2(0,3));float w3=wantRed?r(p+ivec2(-3,0)):b(p+ivec2(-3,0));float e3=wantRed?r(p+ivec2(3,0)):b(p+ivec2(3,0));float commonV=abs(n-s),commonH=abs(w-ee);float gradN=n2+commonV+abs(n-n3);float gradS=s2+commonV+abs(s-s3);float gradW=w2+commonH+abs(w-w3);float gradE=e2+commonH+abs(ee-e3);float dn=n-g(p+ivec2(0,-1));float ds=s-g(p+ivec2(0,1));float dw=w-g(p+ivec2(-1,0));float de=ee-g(p+ivec2(1,0));float vertical=(gradN*ds+gradS*dn)/(gradN+gradS);float horizontal=(gradE*dw+gradW*de)/(gradE+gradW);return max(0.0,gc+mix(vertical,horizontal,clamp(vh[idxAt(p)],0.0,1.0)));}
++/* IRIS_26498_RCD_GREEN_SITE_CHROMA_REQUIRES_TWO_SIDED_PHYSICAL_EVIDENCE */
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,bandSize)))return;if(colorAt(p)!=1)return;red[idxAt(p)]=fullTrusted(p,true)?originalEstimate(p,true):safeAxis(p,true);blue[idxAt(p)]=fullTrusted(p,false)?originalEstimate(p,false):safeAxis(p,false);}
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_lpf.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_lpf.glsl
+new file mode 100644
+index 0000000..6c52aef
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_lpf.glsl
+@@ -0,0 +1,18 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++layout(std430,binding=0)readonly buffer CfaBuf{float cfa[];};
++layout(std430,binding=5)buffer LpfBuf{float lpf[];};
++layout(std430,binding=9)readonly buffer TrustBuf{float trust[];};
++uniform ivec2 bandSize;
++int idxAt(ivec2 p){p=clamp(p,ivec2(0),bandSize-ivec2(1));return p.y*bandSize.x+p.x;}
++float raw(ivec2 p){return cfa[idxAt(p)];}float tr(ivec2 p){return trust[idxAt(p)];}
++void addTerm(inout float s,inout float w,ivec2 p,float k){float t=tr(p);s+=k*t*raw(p);w+=k*t;}
++/* IRIS_26498_RCD_LPF_NORMALIZED_MISSING_DATA */
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,bandSize)))return;
++ float all=tr(p)*tr(p+ivec2(-1,0))*tr(p+ivec2(1,0))*tr(p+ivec2(0,-1))*tr(p+ivec2(0,1))*tr(p+ivec2(-1,-1))*tr(p+ivec2(1,-1))*tr(p+ivec2(-1,1))*tr(p+ivec2(1,1));
++ if(all>0.5){float v=raw(p)+0.5*(raw(p+ivec2(-1,0))+raw(p+ivec2(1,0))+raw(p+ivec2(0,-1))+raw(p+ivec2(0,1)))+0.25*(raw(p+ivec2(-1,-1))+raw(p+ivec2(1,-1))+raw(p+ivec2(-1,1))+raw(p+ivec2(1,1)));lpf[idxAt(p)]=v;return;}
++ float s=0.0,w=0.0;addTerm(s,w,p,1.0);addTerm(s,w,p+ivec2(-1,0),0.5);addTerm(s,w,p+ivec2(1,0),0.5);addTerm(s,w,p+ivec2(0,-1),0.5);addTerm(s,w,p+ivec2(0,1),0.5);addTerm(s,w,p+ivec2(-1,-1),0.25);addTerm(s,w,p+ivec2(1,-1),0.25);addTerm(s,w,p+ivec2(-1,1),0.25);addTerm(s,w,p+ivec2(1,1),0.25);
++ lpf[idxAt(p)]=w>1.0e-6?(s/w)*4.0:4.0*max(raw(p),0.0);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_opposite.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_opposite.glsl
+new file mode 100644
+index 0000000..0e8cd97
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_opposite.glsl
+@@ -0,0 +1,10 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;precision highp int;
++layout(std430,binding=1)buffer RedBuf{float red[];};layout(std430,binding=2)readonly buffer GreenBuf{float green[];};layout(std430,binding=3)buffer BlueBuf{float blue[];};layout(std430,binding=8)readonly buffer PqBuf{float pq[];};layout(std430,binding=9)readonly buffer TrustBuf{float trust[];};uniform ivec2 bandSize;uniform int bandOriginY;uniform int cfaPattern;
++int idxAt(ivec2 p){p=clamp(p,ivec2(0),bandSize-ivec2(1));return p.y*bandSize.x+p.x;}int phaseAt(ivec2 p){ivec2 gp=ivec2(p.x,bandOriginY+p.y);return(gp.x&1)|((gp.y&1)<<1);}int colorAt(ivec2 p){int q=phaseAt(p);if(cfaPattern==0)return q==0?0:(q==3?2:1);if(cfaPattern==1)return q==1?0:(q==2?2:1);if(cfaPattern==2)return q==2?0:(q==1?2:1);return q==3?0:(q==0?2:1);}float g(ivec2 p){return green[idxAt(p)];}float r(ivec2 p){return red[idxAt(p)];}float b(ivec2 p){return blue[idxAt(p)];}float tr(ivec2 p){return trust[idxAt(p)];}float dir(ivec2 p){return pq[idxAt(p)];}
++bool fullTrusted(ivec2 p){ivec2 d[8]=ivec2[8](ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1),ivec2(1,1),ivec2(-3,-3),ivec2(3,-3),ivec2(-3,3),ivec2(3,3));for(int k=0;k<8;++k)if(tr(p+d[k])<0.5)return false;return tr(p)>0.5;}
++float safeOpposite(ivec2 p,bool wantRed){float gc=g(p);ivec2 d[4]=ivec2[4](ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1),ivec2(1,1));float sum=0.0,sum2=0.0,w=0.0;for(int k=0;k<4;++k){ivec2 q=p+d[k];if(tr(q)<0.5)continue;float chroma=(wantRed?r(q):b(q))-g(q);float gw=exp(-10.0*pow(abs(g(q)-gc)/max(max(g(q),gc),0.05),2.0));sum+=gw*chroma;sum2+=gw*chroma*chroma;w+=gw;}if(w<1.5)return gc;float mean=sum/w;float sigma=sqrt(max(sum2/w-mean*mean,0.0));float rel=sigma/max(abs(mean),0.045);float conf=1.0-smoothstep(0.22,0.42,rel);return max(0.0,gc+mean*conf);}
++float originalOpposite(ivec2 p,bool wantRed){const float e=1.0e-5;float gc=g(p);float nw=wantRed?r(p+ivec2(-1,-1)):b(p+ivec2(-1,-1));float ne=wantRed?r(p+ivec2(1,-1)):b(p+ivec2(1,-1));float sw=wantRed?r(p+ivec2(-1,1)):b(p+ivec2(-1,1));float se=wantRed?r(p+ivec2(1,1)):b(p+ivec2(1,1));float gradNw=e+abs(nw-se)+abs(nw-(wantRed?r(p+ivec2(-3,-3)):b(p+ivec2(-3,-3))))+abs(gc-g(p+ivec2(-2,-2)));float gradNe=e+abs(ne-sw)+abs(ne-(wantRed?r(p+ivec2(3,-3)):b(p+ivec2(3,-3))))+abs(gc-g(p+ivec2(2,-2)));float gradSw=e+abs(ne-sw)+abs(sw-(wantRed?r(p+ivec2(-3,3)):b(p+ivec2(-3,3))))+abs(gc-g(p+ivec2(-2,2)));float gradSe=e+abs(nw-se)+abs(se-(wantRed?r(p+ivec2(3,3)):b(p+ivec2(3,3))))+abs(gc-g(p+ivec2(2,2)));float dnW=nw-g(p+ivec2(-1,-1));float dnE=ne-g(p+ivec2(1,-1));float dsW=sw-g(p+ivec2(-1,1));float dsE=se-g(p+ivec2(1,1));float alongP=(gradNw*dsE+gradSe*dnW)/(gradNw+gradSe);float alongQ=(gradNe*dsW+gradSw*dnE)/(gradNe+gradSw);return max(0.0,gc+mix(alongP,alongQ,clamp(dir(p),0.0,1.0)));}
++/* IRIS_26498_RCD_OPPONENT_CHROMA_REQUIRES_PHYSICAL_CONSENSUS */
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,bandSize)))return;int c=colorAt(p);if(c==0)blue[idxAt(p)]=fullTrusted(p)?originalOpposite(p,false):safeOpposite(p,false);else if(c==2)red[idxAt(p)]=fullTrusted(p)?originalOpposite(p,true):safeOpposite(p,true);}
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_populate.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_populate.glsl
+new file mode 100644
+index 0000000..9f952ae
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_populate.glsl
+@@ -0,0 +1,147 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++precision highp sampler2D;
++
++uniform highp sampler2D InputBayer;
++uniform highp sampler2D HighlightProvenance;
++uniform highp sampler2D LensShadingMap;
++layout(std430, binding = 0) buffer CfaBuf { float cfa[]; };
++layout(std430, binding = 1) buffer RedBuf { float red[]; };
++layout(std430, binding = 2) buffer GreenBuf { float green[]; };
++layout(std430, binding = 3) buffer BlueBuf { float blue[]; };
++layout(std430, binding = 9) buffer TrustBuf { float trust[]; };
++uniform ivec2 rawSize;
++uniform ivec2 bandSize;
++uniform ivec2 bandOrigin;
++uniform int cfaPattern;
++uniform vec3 calculationWb;
++uniform vec3 sensorGains;
++uniform float highlightCeiling;
++uniform int useLensShading;
++
++const float PROVENANCE_CENSORED = 1.0;
++
++int mirrorIndex(int value, int size) {
++    if (size <= 1) return 0;
++    int period = 2 * (size - 1);
++    int wrapped = value % period;
++    if (wrapped < 0) wrapped += period;
++    return wrapped < size ? wrapped : period - wrapped;
++}
++ivec2 physicalAt(ivec2 lp) {
++    ivec2 virtualGlobal = bandOrigin + lp;
++    return ivec2(mirrorIndex(virtualGlobal.x, rawSize.x),
++                 mirrorIndex(virtualGlobal.y, rawSize.y));
++}
++int phaseAtPhysical(ivec2 p) { return (p.x & 1) | ((p.y & 1) << 1); }
++int colorAtPhysical(ivec2 p) {
++    int q = phaseAtPhysical(p);
++    if (cfaPattern == 0) return q == 0 ? 0 : (q == 3 ? 2 : 1);
++    if (cfaPattern == 1) return q == 1 ? 0 : (q == 2 ? 2 : 1);
++    if (cfaPattern == 2) return q == 2 ? 0 : (q == 1 ? 2 : 1);
++    return q == 3 ? 0 : (q == 0 ? 2 : 1);
++}
++float phaseComponent(vec4 v, int q) {
++    return q == 0 ? v.r : (q == 1 ? v.g : (q == 2 ? v.b : v.a));
++}
++float phaseDivisor(int q) {
++    return q == 0 ? 1.0 : (q == 1 ? 3.0 : (q == 2 ? 9.0 : 27.0));
++}
++float provenanceAtPhysical(ivec2 p) {
++    float code = texelFetch(HighlightProvenance, p >> 1, 0).r;
++    float digit = floor(code / phaseDivisor(phaseAtPhysical(p)));
++    return mod(digit, 3.0);
++}
++bool isCensoredPhysical(ivec2 p) {
++    return abs(provenanceAtPhysical(p) - PROVENANCE_CENSORED) < 0.25;
++}
++float fusedAtPhysical(ivec2 p) {
++    vec4 v = texelFetch(InputBayer, p >> 1, 0);
++    return phaseComponent(v, phaseAtPhysical(p));
++}
++vec3 shadingRgbPhysical(ivec2 p) {
++    if (useLensShading == 0) return vec3(1.0);
++    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(rawSize);
++    vec4 g = texture(LensShadingMap, clamp(uv, vec2(0.0), vec2(1.0)));
++    return max(vec3(g.r, 0.5 * (g.g + g.b), g.a), vec3(0.0));
++}
++float wbForColor(int col) { return col == 0 ? calculationWb.r : (col == 2 ? calculationWb.b : calculationWb.g); }
++float gainForColor(int col) { return col == 0 ? sensorGains.r : (col == 2 ? sensorGains.b : sensorGains.g); }
++float calculationPhysical(ivec2 p) {
++    int col = colorAtPhysical(p);
++    vec3 lsc = shadingRgbPhysical(p);
++    return clamp(fusedAtPhysical(p) * lsc[col] * max(wbForColor(col), 1.0e-6),
++                 0.0, highlightCeiling);
++}
++float balancedPhysical(ivec2 p) {
++    int col = colorAtPhysical(p);
++    return calculationPhysical(p) * gainForColor(col) / max(wbForColor(col), 1.0e-6);
++}
++bool trustedSamePhasePhysical(ivec2 p, out float value) {
++    p = ivec2(mirrorIndex(p.x, rawSize.x), mirrorIndex(p.y, rawSize.y));
++    if (isCensoredPhysical(p)) { value = 0.0; return false; }
++    value = balancedPhysical(p);
++    return true;
++}
++float censoredNeutralBalanced(ivec2 p) {
++    ivec2 origin = (p >> 1) << 1;
++    float lowerBound = 0.0;
++    for (int py = 0; py < 2; ++py) {
++        for (int px = 0; px < 2; ++px) {
++            ivec2 q = ivec2(mirrorIndex(origin.x + px, rawSize.x),
++                            mirrorIndex(origin.y + py, rawSize.y));
++            lowerBound = max(lowerBound, balancedPhysical(q));
++        }
++    }
++    return lowerBound;
++}
++float constrainedSamePhaseBalanced(ivec2 p, float neutralLowerBound) {
++    float l, r, u, d;
++    bool hl = trustedSamePhasePhysical(p + ivec2(-2, 0), l) &&
++              trustedSamePhasePhysical(p + ivec2( 2, 0), r);
++    bool hv = trustedSamePhasePhysical(p + ivec2(0, -2), u) &&
++              trustedSamePhasePhysical(p + ivec2(0,  2), d);
++    float best = neutralLowerBound;
++    float bestCost = 1.0e20;
++    if (hl) {
++        float meanH = 0.5 * (l + r);
++        float costH = abs(l - r) / max(meanH, 0.04);
++        if (costH <= 0.18 && costH < bestCost) { best = max(neutralLowerBound, meanH); bestCost = costH; }
++    }
++    if (hv) {
++        float meanV = 0.5 * (u + d);
++        float costV = abs(u - d) / max(meanV, 0.04);
++        if (costV <= 0.18 && costV < bestCost) best = max(neutralLowerBound, meanV);
++    }
++    return best;
++}
++
++/* IRIS_26498_RCD_PROVENANCE_SEED_AUTHORITY
++ * A CENSORED phase receives a brightness-safe placeholder so the numerical RCD
++ * lattice remains finite, but TrustBuf=0 preserves the fact that the placeholder
++ * is not a sensor measurement. Every later directional/color pass must respect
++ * that trust bit. Virtual mirrored halo samples provide full-photo boundary
++ * conditions without changing Bayer parity.
++ */
++void main() {
++    ivec2 lp = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(lp, bandSize))) return;
++    ivec2 pp = physicalAt(lp);
++    int idx = lp.y * bandSize.x + lp.x;
++    int col = colorAtPhysical(pp);
++    bool measured = !isCensoredPhysical(pp);
++    float value = calculationPhysical(pp);
++    if (!measured) {
++        float neutralBalanced = censoredNeutralBalanced(pp);
++        float reconstructedBalanced = constrainedSamePhaseBalanced(pp, neutralBalanced);
++        value = reconstructedBalanced * wbForColor(col) / max(gainForColor(col), 1.0e-6);
++        value = min(max(value, 0.0), highlightCeiling);
++    }
++    cfa[idx] = value;
++    red[idx] = col == 0 ? value : 0.0;
++    green[idx] = col == 1 ? value : 0.0;
++    blue[idx] = col == 2 ? value : 0.0;
++    trust[idx] = measured ? 1.0 : 0.0;
++}
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_vh_direction.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_vh_direction.glsl
+new file mode 100644
+index 0000000..052837d
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_vh_direction.glsl
+@@ -0,0 +1,24 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++layout(std430, binding = 0) readonly buffer CfaBuf { float cfa[]; };
++layout(std430, binding = 4) buffer VhBuf { float vh[]; };
++layout(std430, binding = 9) readonly buffer TrustBuf { float trust[]; };
++uniform ivec2 bandSize;
++int idxAt(ivec2 p){p=clamp(p,ivec2(0),bandSize-ivec2(1));return p.y*bandSize.x+p.x;}
++float raw(ivec2 p){return cfa[idxAt(p)];}
++float tr(ivec2 p){return trust[idxAt(p)];}
++float sq(float v){return v*v;}
++float axisResidual(ivec2 p,ivec2 d){return sq(raw(p-3*d)-raw(p-d)-raw(p+d)+raw(p+3*d)-3.0*(raw(p-2*d)+raw(p+2*d))+6.0*raw(p));}
++bool axisTrusted(ivec2 p,ivec2 d){for(int k=-4;k<=4;++k)if(tr(p+k*d)<0.5)return false;return true;}
++/* IRIS_26498_RCD_DIRECTION_USES_MEASURED_EVIDENCE_ONLY */
++void main(){
++ ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,bandSize)))return;int i=idxAt(p);
++ if(p.x<4||p.y<4||p.x+4>=bandSize.x||p.y+4>=bandSize.y){vh[i]=0.5;return;}
++ bool vOk=axisTrusted(p,ivec2(0,1));bool hOk=axisTrusted(p,ivec2(1,0));
++ if(!vOk&&!hOk){vh[i]=0.5;return;} if(vOk&&!hOk){vh[i]=0.0;return;} if(!vOk&&hOk){vh[i]=1.0;return;}
++ float vertical=axisResidual(p+ivec2(0,-1),ivec2(0,1))+axisResidual(p,ivec2(0,1))+axisResidual(p+ivec2(0,1),ivec2(0,1));
++ float horizontal=axisResidual(p+ivec2(-1,0),ivec2(1,0))+axisResidual(p,ivec2(1,0))+axisResidual(p+ivec2(1,0),ivec2(1,0));
++ vertical=max(vertical,1.0e-10);horizontal=max(horizontal,1.0e-10);vh[i]=vertical/(vertical+horizontal);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26498_write.glsl b/app/src/main/assets/shaders/motionv2/rcd26498_write.glsl
+new file mode 100644
+index 0000000..356da77
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26498_write.glsl
+@@ -0,0 +1,11 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;precision highp int;precision highp image2D;
++layout(std430,binding=1)readonly buffer RedBuf{float red[];};layout(std430,binding=2)readonly buffer GreenBuf{float green[];};layout(std430,binding=3)readonly buffer BlueBuf{float blue[];};layout(rgba16f,binding=9)writeonly uniform highp image2D OutputRgb;uniform ivec2 rawSize;uniform ivec2 bandSize;uniform ivec2 bandOrigin;uniform int coreLocalX;uniform int coreLocalY;uniform int coreRows;uniform vec3 calculationWb;
++int idxAt(ivec2 p){return p.y*bandSize.x+p.x;}
++/* IRIS_26498_RCD_TRUE_MIRRORED_HALO_BORDER
++ * Every physical output pixel is at least 12 samples inside the virtual mirrored
++ * RCD band, so the same directional reconstruction owns center and photo border.
++ * No clamped edge kernel and no PPG algorithm switch remain.
++ */
++void main(){ivec2 gid=ivec2(gl_GlobalInvocationID.xy);if(gid.x>=rawSize.x||gid.y>=coreRows)return;ivec2 lp=ivec2(coreLocalX+gid.x,coreLocalY+gid.y);ivec2 gp=ivec2(gid.x,bandOrigin.y+lp.y);int i=idxAt(lp);vec3 rgb=max(vec3(red[i],green[i],blue[i]),vec3(0.0));rgb/=max(calculationWb,vec3(1.0e-6));imageStore(OutputRgb,gp,vec4(rgb,1.0));}
+diff --git a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+index a392430..7a2b8d6 100644
+--- a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
++++ b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+@@ -9,6 +9,9 @@ uniform highp sampler2D shortCfa;
+ uniform highp sampler2D flowTexture;
+ layout(rgba32f, binding = 0) uniform highp writeonly image2D outCfa;
+ layout(r32f, binding = 1) uniform highp writeonly image2D outProvenance;
++layout(std430, binding = 2) buffer ShortDiagBuf {
++    uint shortDiag[];
++};
+ uniform ivec2 packedSize;
+ uniform float referenceExposureScale;
+ uniform float shortToNormalScale;
+@@ -20,6 +23,51 @@ const float PROVENANCE_NORMAL = 0.0;
+ const float PROVENANCE_CENSORED = 1.0;
+ const float PROVENANCE_SHORT_VALIDATED = 2.0;
+ 
++const uint D_TOTAL_CLIPPED = 0u;
++const uint D_SHORT_SAFE = 1u;
++const uint D_SHORT_CLIPPED = 2u;
++const uint D_FLOW_REJECT = 3u;
++const uint D_CORR_REJECT = 4u;
++const uint D_RADIOMETRY_REJECT = 5u;
++const uint D_VALIDATED = 6u;
++const uint D_STILL_CENSORED = 7u;
++const uint D_BIN_LT50 = 8u;
++const uint D_BIN_50_70 = 9u;
++const uint D_BIN_70_85 = 10u;
++const uint D_BIN_85_95 = 11u;
++const uint D_BIN_95_CLIP = 12u;
++const uint D_PHASE_TOTAL = 16u;
++const uint D_PHASE_VALIDATED = 20u;
++const uint D_PHASE_SHORT_CLIPPED = 24u;
++const uint D_PHASE_FLOW_REJECT = 28u;
++const uint D_PHASE_CORR_REJECT = 32u;
++const uint D_PHASE_RADIOMETRY_REJECT = 36u;
++const uint D_PHASE_STILL_CENSORED = 40u;
++
++void addMask(uint totalIndex, uint phaseBase, vec4 mask) {
++    for (int i = 0; i < 4; ++i) {
++        if (mask[i] > 0.5) {
++            atomicAdd(shortDiag[totalIndex], 1u);
++            atomicAdd(shortDiag[phaseBase + uint(i)], 1u);
++        }
++    }
++}
++void addTotalOnly(uint index, vec4 mask) {
++    for (int i = 0; i < 4; ++i) if (mask[i] > 0.5) atomicAdd(shortDiag[index], 1u);
++}
++void classifyShortSamples(vec4 shortCenter, vec4 clipMask) {
++    for (int i = 0; i < 4; ++i) {
++        if (clipMask[i] <= 0.5) continue;
++        float v = shortCenter[i];
++        if (v >= shortClipThreshold) continue;
++        if (v < 0.50) atomicAdd(shortDiag[D_BIN_LT50], 1u);
++        else if (v < 0.70) atomicAdd(shortDiag[D_BIN_50_70], 1u);
++        else if (v < 0.85) atomicAdd(shortDiag[D_BIN_70_85], 1u);
++        else if (v < 0.95) atomicAdd(shortDiag[D_BIN_85_95], 1u);
++        else atomicAdd(shortDiag[D_BIN_95_CLIP], 1u);
++    }
++}
++
+ float sum4(vec4 v) { return dot(v, vec4(1.0)); }
+ float encodePhaseStates(vec4 s) { return dot(s, vec4(1.0, 3.0, 9.0, 27.0)); }
+ 
+@@ -41,8 +89,17 @@ vec4 phaseSafeBilinear(vec2 packedCenter) {
+ vec4 shortSafe(vec4 v) { return vec4(1.0) - step(vec4(shortClipThreshold), v); }
+ vec4 normalSafe(vec4 v) { return vec4(1.0) - step(vec4(0.90), v); }
+ 
+-/* Existing correspondence proof is preserved. */
+-bool validateObservableCorrespondence(
++/* IRIS_26497_SHORT_CORRESPONDENCE_REFINEMENT
++ * mfsr_flow_expand.w means interpolation was cancelled and the whole base tile
++ * vector was preserved. It does NOT mean the base vector is invalid. 26496
++ * incorrectly converted that safe fallback into zero highlight evidence.
++ *
++ * For clipped sites, refine the predicted short-frame correspondence locally on
++ * unsaturated physical CFA evidence. Structured regions require a unique best
++ * match. Smooth regions may be accepted only with tighter radiometric agreement,
++ * where a subpixel ambiguity cannot create an edge/color displacement.
++ */
++void evaluateCorrespondence(
+         ivec2 p, vec2 source, out float meanRelativeError,
+         out float structure, out float supportCount) {
+     float errorSum = 0.0;
+@@ -83,7 +140,46 @@ bool validateObservableCorrespondence(
+     structure = lumaCount >= 4.0
+             ? (lumaMax - lumaMin) / max(lumaMean, 0.03)
+             : 0.0;
+-    return supportCount >= 12.0 && meanRelativeError <= 0.12 && structure >= 0.08;
++}
++
++bool refineObservableCorrespondence(
++        ivec2 p, vec2 predicted, out vec2 refined,
++        out float bestError, out float structure, out float supportCount) {
++    bestError = 1.0e20;
++    float secondError = 1.0e20;
++    refined = predicted;
++    structure = 0.0;
++    supportCount = 0.0;
++    bool found = false;
++    for (int sy = -1; sy <= 1; ++sy) {
++        for (int sx = -1; sx <= 1; ++sx) {
++            vec2 candidate = predicted + 0.5 * vec2(float(sx), float(sy));
++            if (candidate.x < 0.0 || candidate.y < 0.0 ||
++                    candidate.x >= float(packedSize.x) ||
++                    candidate.y >= float(packedSize.y)) continue;
++            float e, s, n;
++            evaluateCorrespondence(p, candidate, e, s, n);
++            if (n < 12.0) continue;
++            found = true;
++            if (e < bestError) {
++                secondError = bestError;
++                bestError = e;
++                refined = candidate;
++                structure = s;
++                supportCount = n;
++            } else if (e < secondError) {
++                secondError = e;
++            }
++        }
++    }
++    if (!found) return false;
++
++    if (structure >= 0.08) {
++        float margin = secondError - bestError;
++        bool exceptionallyGood = bestError <= 0.055;
++        return bestError <= 0.12 && (exceptionallyGood || margin >= 0.010);
++    }
++    return supportCount >= 16.0 && bestError <= 0.060;
+ }
+ 
+ void storeState(ivec2 p, vec4 cfa, vec4 state) {
+@@ -91,10 +187,11 @@ void storeState(ivec2 p, vec4 cfa, vec4 state) {
+     imageStore(outProvenance, p, vec4(encodePhaseStates(state), 0.0, 0.0, 0.0));
+ }
+ 
+-/* IRIS_26494_PER_PHASE_SHORT_VALIDATION
+- * Unsaturated normal phases remain exactly measured when another phase clips.
+- * Only a clipped phase whose short observation is individually unsaturated may
+- * become SHORT_VALIDATED, and only after the existing observable-ring proof.
++/* IRIS_26497_PHYSICAL_SHORT_VALIDATION
++ * NORMAL remains measured. SHORT_VALIDATED is granted only after unsaturated
++ * short evidence survives corrected flow semantics, local correspondence
++ * refinement, and the existing physical radiometry check. CENSORED remains
++ * explicitly unknown rather than being promoted by downstream color heuristics.
+  */
+ void main() {
+     ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+@@ -106,31 +203,41 @@ void main() {
+         storeState(p, normal, vec4(PROVENANCE_NORMAL));
+         return;
+     }
++    addMask(D_TOTAL_CLIPPED, D_PHASE_TOTAL, clipMask);
+ 
+     vec2 uv = (vec2(p) + vec2(0.5)) / vec2(packedSize);
+     vec4 flowState = texture(flowTexture, uv);
+     float variation = max(flowState.z, 0.0);
+-    float cancelled = step(0.5, flowState.w);
+-    float flowConfidence = (1.0 - cancelled) * exp(-80.0 * variation);
+-    vec2 source = vec2(p) + vec2(0.5) + flowState.xy;
+-    if (source.x < 0.0 || source.y < 0.0 ||
+-            source.x >= float(packedSize.x) || source.y >= float(packedSize.y) ||
+-            flowConfidence < minimumFlowConfidence) {
++    /* flowState.w is interpolation-cancel/base-vector-preserved, not invalid. */
++    float flowConfidence = exp(-80.0 * variation);
++    vec2 predicted = vec2(p) + vec2(0.5) + flowState.xy;
++    if (flowConfidence < minimumFlowConfidence) {
++        addMask(D_FLOW_REJECT, D_PHASE_FLOW_REJECT, clipMask);
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+ 
+-    vec4 shortCenter = phaseSafeBilinear(source);
+-    vec4 recoverMask = clipMask * shortSafe(shortCenter);
+-    if (sum4(recoverMask) < 0.5) {
++    vec2 source;
++    float meanError;
++    float structure;
++    float supportCount;
++    if (!refineObservableCorrespondence(
++            p, predicted, source, meanError, structure, supportCount)) {
++        addMask(D_CORR_REJECT, D_PHASE_CORR_REJECT, clipMask);
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+ 
+-    float meanError;
+-    float structure;
+-    float supportCount;
+-    if (!validateObservableCorrespondence(p, source, meanError, structure, supportCount)) {
++    vec4 shortCenter = phaseSafeBilinear(source);
++    vec4 recoverMask = clipMask * shortSafe(shortCenter);
++    vec4 shortClippedMask = clipMask - recoverMask;
++    addTotalOnly(D_SHORT_SAFE, recoverMask);
++    addMask(D_SHORT_CLIPPED, D_PHASE_SHORT_CLIPPED, shortClippedMask);
++    classifyShortSamples(shortCenter, clipMask);
++    if (sum4(recoverMask) < 0.5) {
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+@@ -144,6 +251,8 @@ void main() {
+         }
+     }
+     if (requiredScale > 1.25) {
++        addMask(D_RADIOMETRY_REJECT, D_PHASE_RADIOMETRY_REJECT, recoverMask);
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+@@ -158,5 +267,9 @@ void main() {
+             state[i] = PROVENANCE_SHORT_VALIDATED;
+         }
+     }
++    addMask(D_VALIDATED, D_PHASE_VALIDATED, recoverMask);
++    if (sum4(shortClippedMask) > 0.5) {
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, shortClippedMask);
++    }
+     storeState(p, recovered, state);
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index a2a1eee..bb9fb46 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1309,6 +1309,25 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private volatile float mMotion26380RawMeanSignal = Float.NaN;
+     private volatile int mMotion26380RawSampleCount = 0;
+ 
++    /* IRIS_26496_SPATIALLY_PERSISTENT_HIGHLIGHT_TRIGGER
++     * A global clipped-pixel percentage misses tiny but visually dominant LEDs,
++     * chandelier rims, flowers and window glints. Keep the per-frame sampler cheap,
++     * but dither its coarse lattice over a 3x3 sequence and remember recent coherent
++     * clipping. A single hot pixel cannot trigger the short RAW: either at least two
++     * sampled physical phases clip in the frame or one sampled 2x2 CFA quad contains
++     * two clipped phases. False-positive short capture is safe because the auxiliary
++     * never enters the normal Motion accumulator.
++     */
++    private volatile int mMotion26496RawHighlightSampleCount = 0;
++    private volatile int mMotion26496RawCoherentHighlightCells = 0;
++    private volatile int mMotion26496RawPeakQuadHighlightPhases = 0;
++    private volatile int mMotion26496RawDitherIndex = 0;
++    private volatile long mMotion26496RecentHighlightEvidenceTimestampNs = 0L;
++    private final java.util.concurrent.atomic.AtomicInteger mMotion26496SparseDitherCounter =
++            new java.util.concurrent.atomic.AtomicInteger(0);
++    private static final int MOTION_26496_MIN_HIGHLIGHT_SAMPLES = 2;
++    private static final long MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS = 400_000_000L;
++
+     /* IRIS_26382_CAPTURE_STATE_HANDOFF */
+     private volatile long mMotion26382LastOpportunityCeilingNs = 0L;
+     private volatile float mMotion26382LastRawNeed = 0.0f;
+@@ -1336,10 +1355,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * separate highlight-recovery observation, never a normal fusion frame.
+      * Exposure role is determined from ACTUAL Camera2 exposure*ISO metadata.
+      */
+-    private static final double MOTION_26480_SHORT_EXPOSURE_DIVISOR = 3.0;
+-    private static final float MOTION_26480_SHORT_PROTECTION_EV = 1.5849625f; // log2(3)
++    /* IRIS_26495_PHYSICAL_SHORT_HEADROOM_2P5EV
++     * One isolated auxiliary RAW is now 2.5 EV below the normal reference when
++     * hardware permits. This changes only the evidence acquisition depth; normal
++     * ZSL exposure, ISO, Wronski accumulation, display exposure, and tone remain
++     * untouched. 2^2.5 = sqrt(32) = 5.656854249492381.
++     */
++    private static final float MOTION_26480_SHORT_PROTECTION_EV = 2.5f;
++    private static final double MOTION_26480_SHORT_EXPOSURE_DIVISOR =
++            5.656854249492381;
+     private static final long MOTION_26480_SHORT_WAIT_MS = 300L;
+-    private static final double MOTION_26480_SHORT_TARGET_RATIO = 1.0 / 3.0;
++    private static final double MOTION_26480_SHORT_TARGET_RATIO =
++            1.0 / MOTION_26480_SHORT_EXPOSURE_DIVISOR;
+     private static final double MOTION_26480_SHORT_TOLERANCE_EV = 0.35;
+     private static final double MOTION_26480_SHORT_RATIO_MIN =
+             MOTION_26480_SHORT_TARGET_RATIO / Math.pow(2.0, MOTION_26480_SHORT_TOLERANCE_EV);
+@@ -1459,6 +1486,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26380RawSampleCount =
+                     (int) Math.min(Integer.MAX_VALUE, count);
+ 
++            /* Keep all 26380 AE/readiness statistics above byte-for-byte equivalent
++             * to 26494. The 26496 small-highlight detector is a separate read-only
++             * pass so it cannot perturb normal exposure authority. */
++            sampleMotion26496SpatialHighlightEvidence(
++                    image, buffer, rowStride, pixelStride, width, height,
++                    whiteLevel, blackPattern);
++
+         } catch (Throwable throwable) {
+             Log.w(
+                     TAG,
+@@ -1467,6 +1501,65 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
++
++    private void sampleMotion26496SpatialHighlightEvidence(
++            @NonNull Image image,
++            @NonNull java.nio.ByteBuffer buffer,
++            int rowStride,
++            int pixelStride,
++            int width,
++            int height,
++            int whiteLevel,
++            @NonNull android.hardware.camera2.params.BlackLevelPattern blackPattern) {
++        try {
++            int stepX = Math.max(4, width / 48);
++            int stepY = Math.max(4, height / 36);
++            int ditherIndex = Math.floorMod(
++                    mMotion26496SparseDitherCounter.getAndIncrement(), 9);
++            int ditherX = (ditherIndex % 3) * Math.max(1, stepX / 3);
++            int ditherY = (ditherIndex / 3) * Math.max(1, stepY / 3);
++            int highlightSamples = 0;
++            int coherentCells = 0;
++            int peakQuadPhases = 0;
++
++            for (int y = 2 + ditherY; y < height - 2; y += stepY) {
++                for (int x = 2 + ditherX; x < width - 2; x += stepX) {
++                    int quadPhases = 0;
++                    for (int dy = 0; dy < 2; ++dy) {
++                        for (int dx = 0; dx < 2; ++dx) {
++                            int sx = x + dx;
++                            int sy = y + dy;
++                            int index = sy * rowStride + sx * pixelStride;
++                            if (index < 0 || index + 1 >= buffer.limit()) continue;
++                            int raw = buffer.getShort(index) & 0xffff;
++                            int black = blackPattern.getOffsetForIndex(sx & 1, sy & 1);
++                            int span = Math.max(1, whiteLevel - black);
++                            float signal = motion26368Clamp01((raw - black) / (float) span);
++                            if (signal >= 0.980f) {
++                                highlightSamples++;
++                                quadPhases++;
++                            }
++                        }
++                    }
++                    peakQuadPhases = Math.max(peakQuadPhases, quadPhases);
++                    if (quadPhases >= 2) coherentCells++;
++                }
++            }
++
++            mMotion26496RawHighlightSampleCount = highlightSamples;
++            mMotion26496RawCoherentHighlightCells = coherentCells;
++            mMotion26496RawPeakQuadHighlightPhases = peakQuadPhases;
++            mMotion26496RawDitherIndex = ditherIndex;
++            if (highlightSamples >= MOTION_26496_MIN_HIGHLIGHT_SAMPLES
++                    || coherentCells > 0) {
++                mMotion26496RecentHighlightEvidenceTimestampNs = image.getTimestamp();
++            }
++        } catch (Throwable throwable) {
++            Log.w(TAG, "IRIS_26496 spatial highlight sampler skipped: "
++                    + throwable.getClass().getSimpleName());
++        }
++    }
++
+     /*
+      * IRIS_26381_DYNAMIC_MOTION_SHUTTER_OPPORTUNITY
+      * Public Camera2 only. Advisory to system AE; no direct shutter/ISO set.
+@@ -3059,8 +3152,35 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         Integer baseIso = mPreviewCaptureResult.get(CaptureResult.SENSOR_SENSITIVITY);
+         long rawAgeNs = previewTimestamp == null || mMotion26380RawSignalTimestampNs <= 0L
+                 ? Long.MAX_VALUE : Math.abs(previewTimestamp - mMotion26380RawSignalTimestampNs);
++        long highlightEvidenceAgeNs = previewTimestamp == null
++                || mMotion26496RecentHighlightEvidenceTimestampNs <= 0L
++                ? Long.MAX_VALUE
++                : Math.abs(previewTimestamp - mMotion26496RecentHighlightEvidenceTimestampNs);
++        boolean legacyFractionTrigger =
++                mMotion26380RawHighlightFraction >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER;
++        boolean currentSpatialTrigger =
++                mMotion26496RawHighlightSampleCount >= MOTION_26496_MIN_HIGHLIGHT_SAMPLES
++                        || mMotion26496RawCoherentHighlightCells > 0;
++        boolean recentSpatialTrigger =
++                highlightEvidenceAgeNs <= MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS;
++        boolean highlightTrigger = legacyFractionTrigger
++                || currentSpatialTrigger
++                || recentSpatialTrigger;
++        Log.i(TAG, "IRIS_26496_SHORT_TRIGGER_DECISION"
++                + " rawAgeMs=" + (rawAgeNs == Long.MAX_VALUE ? -1L : rawAgeNs / 1_000_000L)
++                + " evidenceAgeMs=" + (highlightEvidenceAgeNs == Long.MAX_VALUE
++                        ? -1L : highlightEvidenceAgeNs / 1_000_000L)
++                + " fraction=" + mMotion26380RawHighlightFraction
++                + " highlightSamples=" + mMotion26496RawHighlightSampleCount
++                + " coherentCells=" + mMotion26496RawCoherentHighlightCells
++                + " peakQuadPhases=" + mMotion26496RawPeakQuadHighlightPhases
++                + " ditherIndex=" + mMotion26496RawDitherIndex
++                + " legacyFractionTrigger=" + legacyFractionTrigger
++                + " currentSpatialTrigger=" + currentSpatialTrigger
++                + " recentSpatialTrigger=" + recentSpatialTrigger
++                + " requestShort=" + (rawAgeNs <= 180_000_000L && highlightTrigger));
+         if (rawAgeNs > 180_000_000L
+-                || mMotion26380RawHighlightFraction < MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER
++                || !highlightTrigger
+                 || baseExp == null || baseExp <= 0L || baseIso == null || baseIso <= 0) return false;
+ 
+         ticket.baselineEnergy = ExposureIndex.time2sec(baseExp) * baseIso;
+@@ -3094,6 +3214,30 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+             if (er != null) reqExp = Math.max(er.getLower(), Math.min(er.getUpper(), reqExp));
+             if (sr != null) reqIso = Math.max(sr.getLower(), Math.min(sr.getUpper(), reqIso));
++
++            /* IRIS_26495_CLAMP_AWARE_SHORT_RADIOMETRY
++             * Camera2 may clamp the requested 2.5 EV shutter to the physical
++             * exposure-time range. The request tag/ticket already owns the role;
++             * validate actual metadata around the exposure we could really request,
++             * not around an unreachable nominal ratio. Physical short clipping is
++             * still tested later per CFA phase before SHORT_VALIDATED is granted.
++             */
++            final double requestedEnergy = ExposureIndex.time2sec(reqExp) * reqIso;
++            if (!(requestedEnergy > 0.0) || !(requestedEnergy < ticket.baselineEnergy)) {
++                Log.w(TAG, "IRIS_26495_SHORT_REQUEST_NO_PHYSICAL_HEADROOM"
++                        + " baselineEnergy=" + ticket.baselineEnergy
++                        + " requestedEnergy=" + requestedEnergy
++                        + " requestedExposureNs=" + reqExp
++                        + " requestedIso=" + reqIso);
++                return false;
++            }
++            final double requestedRatio = requestedEnergy / ticket.baselineEnergy;
++            final double toleranceFactor = Math.pow(2.0, MOTION_26480_SHORT_TOLERANCE_EV);
++            final double requestedRatioMin = requestedRatio / toleranceFactor;
++            final double requestedRatioMax = Math.min(0.999999, requestedRatio * toleranceFactor);
++            final double requestedHeadroomEv = Math.log(ticket.baselineEnergy / requestedEnergy)
++                    / Math.log(2.0);
++
+             b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, reqExp);
+             b.set(CaptureRequest.SENSOR_SENSITIVITY, reqIso);
+@@ -3146,8 +3290,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     }
+                     double energy = ExposureIndex.time2sec(exp) * iso;
+                     double ratio = energy / ticket.baselineEnergy;
+-                    boolean accepted = ratio >= MOTION_26480_SHORT_RATIO_MIN
+-                            && ratio <= MOTION_26480_SHORT_RATIO_MAX
++                    double actualHeadroomEv = Math.log(ticket.baselineEnergy / energy)
++                            / Math.log(2.0);
++                    boolean accepted = ratio >= requestedRatioMin
++                            && ratio <= requestedRatioMax
+                             && energy < ticket.baselineEnergy;
+                     if (accepted) {
+                         ticket.resultTimestampNs = ts;
+@@ -3161,15 +3307,26 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                         || ticket.captureStartedTimestampNs == ts)
+                                 + " requestedExposureNs=" + requestedExp
+                                 + " requestedIso=" + requestedIso
++                                + " requestedRatio=" + requestedRatio
++                                + " requestedHeadroomEv=" + requestedHeadroomEv
++                                + " nominalTargetRatio=" + MOTION_26480_SHORT_TARGET_RATIO
++                                + " nominalProtectionEv=" + MOTION_26480_SHORT_PROTECTION_EV
+                                 + " actualExposureNs=" + exp + " actualIso=" + iso
+-                                + " ratio=" + ratio + " shutterGate=false");
++                                + " ratio=" + ratio
++                                + " actualHeadroomEv=" + actualHeadroomEv
++                                + " allowedAroundClampedRequest=" + requestedRatioMin + ".." + requestedRatioMax
++                                + " shutterGate=false");
+                         boolean iris26489StagedDelivered =
+                                 tryDeliverMotion26489StagedShortRaw(ticket, result);
+                         if (!iris26489StagedDelivered) scheduleMotion26486ShortDelivery(ticket);
+                     } else {
+                         ticket.closeStaged();
+                         clearMotion26490CaptureShortTicket(ticket, "actual_exposure_rejected");
+-                        Log.w(TAG, "IRIS_26486_SHORT_ACTUAL_REJECTED ratio=" + ratio);
++                        Log.w(TAG, "IRIS_26486_SHORT_ACTUAL_REJECTED ratio=" + ratio
++                                + " actualHeadroomEv=" + actualHeadroomEv
++                                + " requestedRatio=" + requestedRatio
++                                + " requestedHeadroomEv=" + requestedHeadroomEv
++                                + " allowedAroundClampedRequest=" + requestedRatioMin + ".." + requestedRatioMax);
+                     }
+                 }
+                 @Override public void onCaptureFailed(@NonNull CameraCaptureSession session,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
+index 2e76769..d808e95 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
+@@ -18,17 +18,18 @@ import static android.opengl.GLES31.GL_DYNAMIC_DRAW;
+ import static android.opengl.GLES31.glMemoryBarrier;
+ 
+ /**
+- * IRIS_26489_POSTMERGE_RCD_DEMOSAIC_OWNER
++ * IRIS_26498_PROVENANCE_INSIDE_RCD_AND_TRUE_MIRRORED_BOUNDARY
+  *
+- * Motion's temporal owner stops at a fused Bayer lattice. This node runs a banded, full
+- * directional RCD reconstruction after the burst is complete. The equations are split into the
+- * same physical stages as the reference RCD pipeline: calculation-domain populate, VH direction,
+- * low-pass support, green reconstruction, diagonal residual/direction, opposite colour,
+- * red/blue-at-green, then one camera-RGB write. PPG is confined to the true photo border.
++ * Motion's temporal owner ends at the fused Bayer lattice. CENSORED phases remain explicitly
++ * non-measurements throughout RCD through a per-pixel trust buffer. The RCD numerical lattice
++ * can contain a finite brightness placeholder, but directional/color decisions may not treat it
++ * as physical evidence. A fixed 12-pixel virtual mirror halo surrounds every core band, including
++ * the true photo boundary, so the same RCD algorithm owns the entire image without PPG switching
++ * or clamped-kernel edge semantics.
+  */
+ public final class MotionV2RcdDemosaic extends Node {
+     private static final int BAND_CORE_ROWS = 256;
+-    private static final int RCD_HALO_ROWS = 12;
++    private static final int RCD_HALO = 12;
+ 
+     public MotionV2RcdDemosaic() {
+         super("", "MotionV2RcdDemosaic");
+@@ -55,23 +56,23 @@ public final class MotionV2RcdDemosaic extends Node {
+             throw new IllegalStateException("MotionV2RcdDemosaic used outside Motion V2");
+         }
+         if (previousNode == null || previousNode.WorkingTexture == null) {
+-            throw new IllegalStateException("26489 fused Bayer input is missing");
++            throw new IllegalStateException("26498 fused Bayer input is missing");
+         }
+         Point raw = basePipeline.mParameters.rawSize;
+         Point packed = new Point(raw.x / 2, raw.y / 2);
+         if (!previousNode.WorkingTexture.mSize.equals(packed)) {
+             throw new IllegalStateException(
+-                    "26489 packed Bayer dimensions mismatch expected=" + packed
++                    "26498 packed Bayer dimensions mismatch expected=" + packed
+                             + " actual=" + previousNode.WorkingTexture.mSize);
+         }
+         if (raw.x <= 0 || raw.y <= 0 || (raw.x & 1) != 0 || (raw.y & 1) != 0) {
+-            throw new IllegalStateException("26489 RCD requires even native Bayer dimensions");
++            throw new IllegalStateException("26498 RCD requires even native Bayer dimensions");
+         }
+ 
+         float[] gains = basePipeline.mParameters.motionV2ColorGains;
+         if (!basePipeline.mParameters.motionV2DirectColorValid
+                 || gains == null || gains.length != 4) {
+-            throw new IllegalStateException("26489 RCD requires timestamp-owned HAL color gains");
++            throw new IllegalStateException("26498 RCD requires timestamp-owned HAL color gains");
+         }
+         float greenGain = Math.max(0.5f * (gains[1] + gains[2]), 1.0e-6f);
+         float wbR = Math.max(gains[0] / greenGain, 1.0e-6f);
+@@ -103,36 +104,36 @@ public final class MotionV2RcdDemosaic extends Node {
+         PostPipeline postPipeline = (PostPipeline) basePipeline;
+         if (postPipeline.motionV2HighlightProvenanceTexture == null) {
+             lsc.close();
+-            throw new IllegalStateException(
+-                    "26492 RCD missing explicit highlight provenance texture");
++            throw new IllegalStateException("26498 RCD missing explicit highlight provenance texture");
+         }
+ 
+         WorkingTexture = basePipeline.getMain();
+         if (WorkingTexture == null) {
+             lsc.close();
+-            throw new IllegalStateException("26489 full RCD output allocation failed");
++            throw new IllegalStateException("26498 full RCD output allocation failed");
+         }
+ 
+         int bands = 0;
+         long maxScratchBytes = 0L;
+-        Log.d(Name, "IRIS_26490_RCD_EXPOSURE_DOMAIN"
++        Log.d(Name, "IRIS_26498_RCD_EXPOSURE_DOMAIN"
+                 + " sensorDomainWhite=1.0"
+                 + " displayGain=" + basePipeline.mParameters.motionV2DisplayGain
+                 + " displayGainInsideRcd=false"
+-                + " highlightThreshold=0.985"
+                 + " fusedBayerPhysicalSensorNormalized=true"
+-                + " shortRecoveryExecuted="
+-                + basePipeline.mParameters.motionV2ShortHighlightRecoveryExecuted);
++                + " provenanceInsideDirectionalRcd=true"
++                + " truePhotoMirrorHalo=" + RCD_HALO);
+         try {
+             for (int coreY = 0; coreY < raw.y; coreY += BAND_CORE_ROWS) {
+                 int coreRows = Math.min(BAND_CORE_ROWS, raw.y - coreY);
+-                int bandTop = Math.max(0, coreY - RCD_HALO_ROWS);
+-                int bandBottom = Math.min(raw.y, coreY + coreRows + RCD_HALO_ROWS);
+-                int bandRows = bandBottom - bandTop;
+-                int coreLocalY = coreY - bandTop;
+-                Point bandSize = new Point(raw.x, bandRows);
+-                int pixels = Math.multiplyExact(raw.x, bandRows);
+-                long scratchBytes = (long) pixels * 9L * Float.BYTES;
++                int bandOriginX = -RCD_HALO;
++                int bandOriginY = coreY - RCD_HALO;
++                int coreLocalX = RCD_HALO;
++                int coreLocalY = RCD_HALO;
++                Point bandSize = new Point(
++                        raw.x + 2 * RCD_HALO,
++                        coreRows + 2 * RCD_HALO);
++                int pixels = Math.multiplyExact(bandSize.x, bandSize.y);
++                long scratchBytes = (long) pixels * 10L * Float.BYTES;
+                 maxScratchBytes = Math.max(maxScratchBytes, scratchBytes);
+ 
+                 try (GLBuffer cfa = scratch(pixels);
+@@ -143,62 +144,63 @@ public final class MotionV2RcdDemosaic extends Node {
+                      GLBuffer lpf = scratch(pixels);
+                      GLBuffer pdiff = scratch(pixels);
+                      GLBuffer qdiff = scratch(pixels);
+-                     GLBuffer pq = scratch(pixels)) {
++                     GLBuffer pq = scratch(pixels);
++                     GLBuffer trust = scratch(pixels)) {
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_populate", true);
++                    glProg.useAssetProgram("motionv2/rcd26498_populate", true);
+                     glProg.setTexture("InputBayer", previousNode.WorkingTexture);
+-                    glProg.setTexture("HighlightProvenance",
+-                            postPipeline.motionV2HighlightProvenanceTexture);
++                    glProg.setTexture("HighlightProvenance", postPipeline.motionV2HighlightProvenanceTexture);
+                     glProg.setTexture("LensShadingMap", lsc);
+                     glProg.setBufferCompute("CfaBuf", cfa);
+                     glProg.setBufferCompute("RedBuf", red);
+                     glProg.setBufferCompute("GreenBuf", green);
+                     glProg.setBufferCompute("BlueBuf", blue);
++                    glProg.setBufferCompute("TrustBuf", trust);
+                     glProg.setVar("rawSize", raw);
+                     glProg.setVar("bandSize", bandSize);
+-                    glProg.setVar("bandOriginY", bandTop);
++                    glProg.setVar("bandOrigin", bandOriginX, bandOriginY);
+                     glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
+                     glProg.setVar("calculationWb", wbR, 1.0f, wbB);
+-                    /* IRIS_26491_NEUTRAL_CENSOR_SENSOR_GAIN_BRIDGE */
+                     glProg.setVar("sensorGains", gains[0], greenGain, gains[3]);
+-                    final float iris26490PhysicalSensorWhite = 1.0f;
+-                    glProg.setVar("sensorClipLevel", iris26490PhysicalSensorWhite);
+-                    glProg.setVar("highlightThreshold", 0.985f);
+                     glProg.setVar("highlightCeiling", 8.0f);
+                     glProg.setVar("useLensShading", hasLsc ? 1 : 0);
+                     dispatch(bandSize);
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_vh_direction", true);
++                    glProg.useAssetProgram("motionv2/rcd26498_vh_direction", true);
+                     glProg.setBufferCompute("CfaBuf", cfa);
+                     glProg.setBufferCompute("VhBuf", vh);
++                    glProg.setBufferCompute("TrustBuf", trust);
+                     glProg.setVar("bandSize", bandSize);
+                     dispatch(bandSize);
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_lpf", true);
++                    glProg.useAssetProgram("motionv2/rcd26498_lpf", true);
+                     glProg.setBufferCompute("CfaBuf", cfa);
+                     glProg.setBufferCompute("LpfBuf", lpf);
++                    glProg.setBufferCompute("TrustBuf", trust);
+                     glProg.setVar("bandSize", bandSize);
+                     dispatch(bandSize);
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_green", true);
++                    glProg.useAssetProgram("motionv2/rcd26498_green", true);
+                     glProg.setBufferCompute("CfaBuf", cfa);
+                     glProg.setBufferCompute("GreenBuf", green);
+                     glProg.setBufferCompute("VhBuf", vh);
+                     glProg.setBufferCompute("LpfBuf", lpf);
++                    glProg.setBufferCompute("TrustBuf", trust);
+                     glProg.setVar("bandSize", bandSize);
+-                    glProg.setVar("bandOriginY", bandTop);
++                    glProg.setVar("bandOriginY", bandOriginY);
+                     glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
+                     dispatch(bandSize);
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_diag_residual", true);
++                    glProg.useAssetProgram("motionv2/rcd26498_diag_residual", true);
+                     glProg.setBufferCompute("CfaBuf", cfa);
+                     glProg.setBufferCompute("PBuf", pdiff);
+                     glProg.setBufferCompute("QBuf", qdiff);
++                    glProg.setBufferCompute("TrustBuf", trust);
+                     glProg.setVar("bandSize", bandSize);
+                     dispatch(bandSize);
+ 
+@@ -211,76 +213,68 @@ public final class MotionV2RcdDemosaic extends Node {
+                     dispatch(bandSize);
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_opposite", true);
++                    glProg.useAssetProgram("motionv2/rcd26498_opposite", true);
+                     glProg.setBufferCompute("RedBuf", red);
+                     glProg.setBufferCompute("GreenBuf", green);
+                     glProg.setBufferCompute("BlueBuf", blue);
+                     glProg.setBufferCompute("PqBuf", pq);
++                    glProg.setBufferCompute("TrustBuf", trust);
+                     glProg.setVar("bandSize", bandSize);
+-                    glProg.setVar("bandOriginY", bandTop);
++                    glProg.setVar("bandOriginY", bandOriginY);
+                     glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
+                     dispatch(bandSize);
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_green_rb", true);
++                    glProg.useAssetProgram("motionv2/rcd26498_green_rb", true);
+                     glProg.setBufferCompute("RedBuf", red);
+                     glProg.setBufferCompute("GreenBuf", green);
+                     glProg.setBufferCompute("BlueBuf", blue);
+                     glProg.setBufferCompute("VhBuf", vh);
++                    glProg.setBufferCompute("TrustBuf", trust);
+                     glProg.setVar("bandSize", bandSize);
+-                    glProg.setVar("bandOriginY", bandTop);
++                    glProg.setVar("bandOriginY", bandOriginY);
+                     glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
+                     dispatch(bandSize);
+ 
+                     glProg.setLayout(8, 8, 1);
+-                    glProg.useAssetProgram("motionv2/rcd26489_write", true);
+-                    glProg.setBufferCompute("CfaBuf", cfa);
++                    glProg.useAssetProgram("motionv2/rcd26498_write", true);
+                     glProg.setBufferCompute("RedBuf", red);
+                     glProg.setBufferCompute("GreenBuf", green);
+                     glProg.setBufferCompute("BlueBuf", blue);
+                     glProg.setTextureCompute("OutputRgb", WorkingTexture, true);
+                     glProg.setVar("rawSize", raw);
+                     glProg.setVar("bandSize", bandSize);
+-                    glProg.setVar("bandOriginY", bandTop);
++                    glProg.setVar("bandOrigin", bandOriginX, bandOriginY);
++                    glProg.setVar("coreLocalX", coreLocalX);
+                     glProg.setVar("coreLocalY", coreLocalY);
+                     glProg.setVar("coreRows", coreRows);
+-                    glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
+                     glProg.setVar("calculationWb", wbR, 1.0f, wbB);
+                     dispatch(new Point(raw.x, coreRows));
+                 }
+                 bands++;
+             }
+-            /* No per-band CPU fence: one GL context owns all nine-pass bands and later post nodes.
+-             * A barrier is sufficient to publish the last imageStore to downstream GPU consumers. */
+             glMemoryBarrier(GL_ALL_BARRIER_BITS);
+             glProg.closed = true;
+         } finally {
+             lsc.close();
+         }
+ 
+-        Log.d(Name, "IRIS_26489_POSTMERGE_RCD_DOMAIN"
+-                + " implementation=bandedDirectionalRcd"
+-                + " passes=9"
++        String state = "implementation=provenanceAwareDirectionalRcd"
+                 + " bands=" + bands
+-                + " haloRows=" + RCD_HALO_ROWS
++                + " halo=" + RCD_HALO
+                 + " maxScratchMiB=" + (maxScratchBytes / (1024L * 1024L))
+-                + " ppg=truePhotoBorderOnly"
+-                + " temporalRgbSynthesis=false"
+-                + " calculationWbRemovedAtOutput=true"
+-                + " explicitHighlightProvenance=true"
+-                + " rcdReclassificationForbidden=true"
+-                + " neutralCensoredFallback=true"
+-                + " neutralFallbackUsesTimestampOwnedSensorGains=true"
+-                + " lensShading=" + hasLsc
+-                + " oldCrossPhasePlateauActive=false");
++                + " ppg=false"
++                + " clampedPhotoBoundary=false"
++                + " trueMirroredPhotoHalo=true"
++                + " censoredPlaceholderCanSteerDirection=false"
++                + " censoredPlaceholderCanSeedOpponentColor=false"
++                + " trustedNormalAndShortValidatedRemainOriginalRcd=true"
++                + " postRcdChromaCompletion=false"
++                + " lensShading=" + hasLsc;
++        Log.d(Name, "IRIS_26498_POSTMERGE_RCD_DOMAIN " + state);
+         try {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+-                    "IRIS_26489_POSTMERGE_RCD_DOMAIN",
+-                    "implementation=bandedDirectionalRcd"
+-                            + " bands=" + bands
+-                            + " halo=" + RCD_HALO_ROWS
+-                            + " maxScratchMiB=" + (maxScratchBytes / (1024L * 1024L))
+-                            + " ppgBorderOnly=true");
++                    "IRIS_26498_POSTMERGE_RCD_DOMAIN", state);
+         } catch (Throwable ignored) {}
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index c19f6d2..c1e4d6c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -17,13 +17,14 @@ import static android.opengl.GLES20.GL_LINEAR;
+ /**
+  * IRIS_26435_EXACT_26430_BASE_LOW_FREQUENCY_TRUE_GAINMAP
+  *
+- * The complete 26430 SDR color/highlight/tone path is restored separately.
+- * This renderer adds only one 0.80 linear post-tone scale (~-0.322 EV).
+- * Ultra HDR uses that same scale, so it cannot become a second exposure lift.
++ * IRIS_26498_FULL_RESOLUTION_UHDR_PRIMARY_DETAIL_AUTHORITY
++ * The complete 26430 SDR color/highlight/tone path remains unchanged. Ultra HDR
++ * now carries a one-to-one gain sample for every primary pixel, eliminating the
++ * quarter-resolution interpolation that measurably softened the UHDR rendition.
+  */
+ public final class MotionV2Render extends Node {
+     private static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
+-    private static final int GAINMAP_DOWNSAMPLE = 4;
++    private static final int GAINMAP_DOWNSAMPLE = 1;
+ 
+     public MotionV2Render() { super("", "MotionV2Render"); }
+     @Override public void Compile() {}
+@@ -55,9 +56,7 @@ public final class MotionV2Render extends Node {
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+             /* IRIS_26470_UHDR_RENDER_GEOMETRY_AUTHORITY */
+             Point renderedSdrSize = new Point(WorkingTexture.mSize);
+-            Point gainSize = new Point(
+-                    Math.max(1, renderedSdrSize.x / GAINMAP_DOWNSAMPLE),
+-                    Math.max(1, renderedSdrSize.y / GAINMAP_DOWNSAMPLE));
++            Point gainSize = new Point(renderedSdrSize);
+ 
+             float maxGainRatio = Math.max(
+                     2.0f,
+@@ -67,7 +66,7 @@ public final class MotionV2Render extends Node {
+             try {
+                 gainTexture = new GLTexture(
+                         gainSize,
+-                        new GLFormat(GLFormat.DataType.SIMPLE_8, 4),
++                        new GLFormat(GLFormat.DataType.SIMPLE_8, 1),
+                         null,
+                         GL_LINEAR,
+                         GL_CLAMP_TO_EDGE);
+@@ -76,14 +75,13 @@ public final class MotionV2Render extends Node {
+                 glProg.setTexture("HdrBuffer", extendedLinearHdr);
+                 glProg.setTexture("SdrBuffer", WorkingTexture);
+                 glProg.setVar("gainMapSize", gainSize);
+-                glProg.setVar("sourceSize", renderedSdrSize);
+                 glProg.setVar("hdrExposureScale", OUTPUT_EXPOSURE_SCALE);
+                 glProg.setVar("maxGainRatio", maxGainRatio);
+                 glProg.drawBlocks(gainTexture);
+ 
+                 gainTexture.BufferLoad();
+                 GLFormat readFormat =
+-                        new GLFormat(GLFormat.DataType.SIMPLE_8, 4);
++                        new GLFormat(GLFormat.DataType.SIMPLE_8, 1);
+                 ByteBuffer rgba =
+                         gainTexture.textureBuffer(readFormat, true);
+                 rgba.position(0);
+@@ -93,7 +91,7 @@ public final class MotionV2Render extends Node {
+                 int nonUnity = 0;
+                 int peakCode = 0;
+                 for (int i = 0; i < pixels; i++) {
+-                    int code = rgba.get(i * 4) & 0xff;
++                    int code = rgba.get(i) & 0xff;
+                     if (code > 0) nonUnity++;
+                     peakCode = Math.max(peakCode, code);
+                     alpha.put((byte)code);
+@@ -116,7 +114,7 @@ public final class MotionV2Render extends Node {
+                     for (int gx = 0; gx < gridW; gx++) {
+                         int sx = Math.min(gainSize.x - 1,
+                                 (int)(((gx + 0.5f) * gainSize.x) / gridW));
+-                        int code = rgba.get((sy * gainSize.x + sx) * 4) & 0xff;
++                        int code = rgba.get(sy * gainSize.x + sx) & 0xff;
+                         if (code < 16) grid.append('0');
+                         grid.append(Integer.toHexString(code));
+                     }
+@@ -126,15 +124,15 @@ public final class MotionV2Render extends Node {
+                 long roughCount = 0L;
+                 for (int y = 0; y < gainSize.y; y++) {
+                     for (int x = 0; x < gainSize.x; x++) {
+-                        int idx = (y * gainSize.x + x) * 4;
++                        int idx = y * gainSize.x + x;
+                         int c = rgba.get(idx) & 0xff;
+                         if (x + 1 < gainSize.x) {
+-                            int r = rgba.get(idx + 4) & 0xff;
++                            int r = rgba.get(idx + 1) & 0xff;
+                             roughSum += Math.abs(c - r);
+                             roughCount++;
+                         }
+                         if (y + 1 < gainSize.y) {
+-                            int d = rgba.get(idx + gainSize.x * 4) & 0xff;
++                            int d = rgba.get(idx + gainSize.x) & 0xff;
+                             roughSum += Math.abs(c - d);
+                             roughCount++;
+                         }
+@@ -168,14 +166,14 @@ public final class MotionV2Render extends Node {
+                         + " provenance=actualGainMapBeforeJpegAttach"
+                         + " grid12x8=" + grid
+                         + " source=extendedLinearPreTone"
+-                        + " lowFrequencyMap=true"
++                        + " fullResolutionGainMap=true"
+                         + " downsample=" + GAINMAP_DOWNSAMPLE
+-                        + " widthFraction=0.25"
+-                        + " heightFraction=0.25"
++                        + " widthFraction=1.0"
++                        + " heightFraction=1.0"
+                         + " quotientOffset=0.015625"
+                         + " standardLogGainEncoding=true"
+-                        + " broadRenditionNotEdgeTexture=true"
+-                        + " matchedSourceFootprint=4x4"
++                        + " gainMapResamplingRequired=false"
++                        + " primarySpatialDetailAuthority=true"
+                         + " pointDecimation=false"
+                         + " postAliasSpikeRepair=false"
+                         + " midtoneGainUnity=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 6babd64..e02e3f9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -311,12 +311,12 @@ public class PostPipeline extends GLBasePipeline {
+             add(new MotionV2DisplayExposure());
+             add(new StageTelemetry("V2_POST_DISPLAY_EXPOSURE_AFTER_WRONSKI"));
+             add(new MotionV2ColorTransform());
++            add(new StageTelemetry("V2_POST_CAMERA2_COLOR_TRANSFORM"));
+ 
+             /*
+              * IRIS_26477_WRONSKI_PRIMARY_DENOISE_ONLY
+              * Pure comparison build: no residual spatial denoise after Wronski.
+              */
+-            add(new StageTelemetry("V2_POST_WRONSKI_PRIMARY_DENOISE_ONLY"));
+             add(new MotionV2Render());
+             add(new StageTelemetry("V2_POST_RENDER"));
+             add(new RotateWatermark(getRotation()));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java
+index a1707f1..2ddfc56 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java
+@@ -1,26 +1,37 @@
+ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+ 
++import android.graphics.Point;
++
+ import com.particlesdevs.photoncamera.api.CameraMode;
+ import com.particlesdevs.photoncamera.app.PhotonCamera;
++import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+ import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+ import com.particlesdevs.photoncamera.processing.opengl.scripts.GLHistogram;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.FloatBuffer;
++import java.util.ArrayList;
++import java.util.Collections;
++
++import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
++import static android.opengl.GLES20.GL_NEAREST;
++
+ /*
+- * IRIS_26400_MOTION_STAGE_BRIGHTNESS_TELEMETRY
++ * IRIS_26498_STAGE_CHROMA_ORIGIN_TELEMETRY
+  *
+- * Diagnostic pass-through only.
+- *
+- * This node never writes pixels, never allocates an output image texture,
+- * never changes WorkingTexture ownership, and never changes pipeline math.
+- * It computes a sparse GPU histogram of the texture produced by the previous
+- * node, reads only the 256-bin histogram buffers, logs compact statistics, and
+- * passes the exact same GLTexture object to the next node.
++ * Diagnostic pass-through only. The exact input GLTexture object continues to the next node.
++ * In addition to historical brightness histograms, a sparse 32x24 readback measures spatial
++ * log(R/G) and log(B/G) variation in low-gradient cells. Absolute white balance is irrelevant:
++ * standard deviation of log color ratios tells us where broad false chroma first appears.
+  */
+ public class StageTelemetry extends Node {
+     private static final int HIST_SIZE = 256;
+     private static final int SAMPLE_RESIZE = 12;
++    private static final int PROBE_W = 32;
++    private static final int PROBE_H = 24;
+     private final String stage;
+ 
+     public StageTelemetry(String stage) {
+@@ -28,151 +39,152 @@ public class StageTelemetry extends Node {
+         this.stage = stage;
+     }
+ 
+-    @Override
+-    public void Compile() {
+-    }
++    @Override public void Compile() {}
+ 
+-    private static float percentile(
+-            int[] histogram,
+-            long total,
+-            double fraction) {
+-        if (histogram == null || histogram.length == 0 || total <= 0L) {
+-            return Float.NaN;
+-        }
++    private static float percentile(int[] histogram, long total, double fraction) {
++        if (histogram == null || histogram.length == 0 || total <= 0L) return Float.NaN;
+         long target = Math.max(1L, (long)Math.ceil(total * fraction));
+         long cumulative = 0L;
+         for (int i = 0; i < histogram.length; i++) {
+             cumulative += histogram[i];
+-            if (cumulative >= target) {
+-                return i / (float)(histogram.length - 1);
+-            }
++            if (cumulative >= target) return i / (float)(histogram.length - 1);
+         }
+         return 1.0f;
+     }
+ 
+-    @Override
+-    public void Run() {
+-        GLTexture source = previousNode == null
+-                ? null
+-                : previousNode.WorkingTexture;
++    private static double std(ArrayList<Double> v) {
++        if (v.size() < 2) return Double.NaN;
++        double m = 0.0;
++        for (double x : v) m += x;
++        m /= v.size();
++        double s = 0.0;
++        for (double x : v) { double d = x - m; s += d * d; }
++        return Math.sqrt(s / Math.max(1, v.size() - 1));
++    }
+ 
+-        /*
+-         * Pass through the identical texture object first. Even if telemetry
+-         * fails, image ownership remains unchanged.
+-         */
+-        WorkingTexture = source;
++    private float[] semantic(float a, float b, float c, float d, boolean cfa) {
++        if (!cfa) return new float[]{a, b, c, Float.NaN};
++        int pattern = (int) basePipeline.mParameters.cfaPattern;
++        switch (pattern) {
++            case 0: return new float[]{a, 0.5f * (b + c), d, b - c};
++            case 1: return new float[]{b, 0.5f * (a + d), c, a - d};
++            case 2: return new float[]{c, 0.5f * (a + d), b, a - d};
++            default:return new float[]{d, 0.5f * (b + c), a, b - c};
++        }
++    }
++
++    private String chromaOriginStats(GLTexture source) {
++        GLTexture probe = null;
++        try {
++            Point ps = new Point(PROBE_W, PROBE_H);
++            probe = new GLTexture(ps, new GLFormat(GLFormat.DataType.FLOAT_32, 4), null,
++                    GL_NEAREST, GL_CLAMP_TO_EDGE);
++            glProg.useProgram(
++                    "precision highp float;\n"
++                    + "uniform sampler2D InputBuffer;\n"
++                    + "uniform vec2 OutputSize;\n"
++                    + "out vec4 Output;\n"
++                    + "void main(){vec2 uv=gl_FragCoord.xy/OutputSize;Output=texture(InputBuffer,uv);}\n");
++            glProg.setTexture("InputBuffer", source);
++            glProg.setVar("OutputSize", (float)PROBE_W, (float)PROBE_H);
++            glProg.drawBlocks(probe);
++            glProg.closed = true;
++            probe.BufferLoad();
++            ByteBuffer bytes = probe.textureBuffer(new GLFormat(GLFormat.DataType.FLOAT_32, 4), true);
++            bytes.order(ByteOrder.nativeOrder());
++            FloatBuffer fb = bytes.asFloatBuffer();
++            float[][][] rgb = new float[PROBE_H][PROBE_W][4];
++            boolean cfa = stage.contains("FUSED_BAYER_CANONICAL");
++            for (int y = 0; y < PROBE_H; ++y) {
++                for (int x = 0; x < PROBE_W; ++x) {
++                    float a = fb.get(), b = fb.get(), c = fb.get(), d = fb.get();
++                    rgb[y][x] = semantic(a,b,c,d,cfa);
++                }
++            }
+ 
+-        if (PhotonCamera.getSettings().selectedMode != CameraMode.MOTION
+-                || source == null) {
+-            return;
++            ArrayList<Double> rg = new ArrayList<>();
++            ArrayList<Double> bg = new ArrayList<>();
++            ArrayList<Double> gsplit = new ArrayList<>();
++            final double eps = 0.01;
++            for (int y = 0; y + 1 < PROBE_H; ++y) {
++                for (int x = 0; x + 1 < PROBE_W; ++x) {
++                    float[] p = rgb[y][x];
++                    float[] rx = rgb[y][x+1];
++                    float[] dy = rgb[y+1][x];
++                    double l = (p[0] + 2.0*p[1] + p[2]) * 0.25;
++                    double lr = (rx[0] + 2.0*rx[1] + rx[2]) * 0.25;
++                    double ld = (dy[0] + 2.0*dy[1] + dy[2]) * 0.25;
++                    if (!Double.isFinite(l) || l < 0.03 || l > 0.90) continue;
++                    double relX = Math.abs(l-lr)/Math.max(Math.max(l,lr),0.05);
++                    double relY = Math.abs(l-ld)/Math.max(Math.max(l,ld),0.05);
++                    if (relX > 0.06 || relY > 0.06) continue;
++                    if (p[0] <= -eps || p[1] <= -eps || p[2] <= -eps) continue;
++                    rg.add(Math.log((p[0]+eps)/(p[1]+eps)));
++                    bg.add(Math.log((p[2]+eps)/(p[1]+eps)));
++                    if (cfa && Float.isFinite(p[3])) {
++                        gsplit.add((double)p[3] / Math.max(Math.abs(p[1]), 0.03));
++                    }
++                }
++            }
++            return " flatCells=" + rg.size()
++                    + " flatLogRGStd=" + std(rg)
++                    + " flatLogBGStd=" + std(bg)
++                    + " flatGreenPhaseSplitStd=" + std(gsplit)
++                    + " probe=" + PROBE_W + "x" + PROBE_H
++                    + " domain=" + (cfa ? "packedCfaSemanticRatios" : "rgbRatios");
++        } catch (Throwable t) {
++            return " chromaProbeError=" + t.getClass().getSimpleName();
++        } finally {
++            if (probe != null) try { probe.close(); } catch (Throwable ignored) {}
+         }
++    }
++
++    @Override
++    public void Run() {
++        GLTexture source = previousNode == null ? null : previousNode.WorkingTexture;
++        WorkingTexture = source;
++        if (PhotonCamera.getSettings().selectedMode != CameraMode.MOTION || source == null) return;
+ 
+         GLHistogram histogram = null;
+         try {
+-            histogram =
+-                    new GLHistogram(
+-                            basePipeline.glint.glProcessing,
+-                            HIST_SIZE);
+-            histogram.Rc = true;
+-            histogram.Gc = true;
+-            histogram.Bc = true;
+-            histogram.Ac = false;
++            histogram = new GLHistogram(basePipeline.glint.glProcessing, HIST_SIZE);
++            histogram.Rc = true; histogram.Gc = true; histogram.Bc = true; histogram.Ac = false;
+             histogram.resize = SAMPLE_RESIZE;
+-
+             int[][] channels = histogram.Compute(source);
+             int[] combined = new int[HIST_SIZE];
+-
+-            long total = 0L;
+-            double weighted = 0.0;
+-            long floorCount = 0L;
+-            long darkCount = 0L;
+-            long nearClipCount = 0L;
+-
++            long total = 0L; double weighted = 0.0; long floorCount = 0L, darkCount = 0L, nearClipCount = 0L;
+             for (int i = 0; i < HIST_SIZE; i++) {
+-                int c =
+-                        channels[0][i]
+-                                + channels[1][i]
+-                                + channels[2][i];
+-                combined[i] = c;
+-                total += c;
+-                weighted += (double)c * i;
+-
+-                if (i <= 2) {
+-                    floorCount += c;
+-                }
+-                if (i <= 10) {
+-                    darkCount += c;
+-                }
+-                if (i >= 250) {
+-                    nearClipCount += c;
+-                }
+-            }
+-
+-            float mean =
+-                    total > 0L
+-                            ? (float)(weighted
+-                                    / (double)total
+-                                    / (HIST_SIZE - 1.0))
+-                            : Float.NaN;
+-
+-            float p01 = percentile(combined, total, 0.01);
+-            float p10 = percentile(combined, total, 0.10);
+-            float p50 = percentile(combined, total, 0.50);
+-            float p90 = percentile(combined, total, 0.90);
+-            float p95 = percentile(combined, total, 0.95);
+-            float p99 = percentile(combined, total, 0.99);
+-
+-            float floorFraction =
+-                    total > 0L ? floorCount / (float)total : Float.NaN;
+-            float darkFraction =
+-                    total > 0L ? darkCount / (float)total : Float.NaN;
+-            float nearClipFraction =
+-                    total > 0L ? nearClipCount / (float)total : Float.NaN;
+-
+-            String message =
+-                    "IRIS_26400_STAGE_TELEMETRY"
+-                            + " stage=" + stage
+-                            + " mean=" + mean
+-                            + " p01=" + p01
+-                            + " p10=" + p10
+-                            + " p50=" + p50
+-                            + " p90=" + p90
+-                            + " p95=" + p95
+-                            + " p99=" + p99
+-                            + " floorLe1pct=" + floorFraction
+-                            + " darkLe4pct=" + darkFraction
+-                            + " nearClipGe98pct=" + nearClipFraction
+-                            + " sampleResize=" + SAMPLE_RESIZE
+-                            + " size=" + source.mSize.x + "x" + source.mSize.y
+-                            + " sameTexturePassThrough=true";
+-
+-            Log.i("IRIS26400", message);
+-            try {
+-                com.particlesdevs.photoncamera.util.MotionTrace
+-                        .processingState(
+-                                "STAGE_TELEMETRY_26400",
+-                                message);
+-            } catch (Throwable ignored) {
+-                Log.d("IRIS26400",
+-                        "MotionTrace unavailable for stage=" + stage);
++                int c = channels[0][i] + channels[1][i] + channels[2][i];
++                combined[i] = c; total += c; weighted += (double)c * i;
++                if (i <= 2) floorCount += c; if (i <= 10) darkCount += c; if (i >= 250) nearClipCount += c;
+             }
++            float mean = total > 0L ? (float)(weighted / (double)total / (HIST_SIZE - 1.0)) : Float.NaN;
++            String chroma = chromaOriginStats(source);
++            String message = "IRIS_26498_STAGE_TELEMETRY"
++                    + " stage=" + stage
++                    + " mean=" + mean
++                    + " p01=" + percentile(combined,total,0.01)
++                    + " p10=" + percentile(combined,total,0.10)
++                    + " p50=" + percentile(combined,total,0.50)
++                    + " p90=" + percentile(combined,total,0.90)
++                    + " p95=" + percentile(combined,total,0.95)
++                    + " p99=" + percentile(combined,total,0.99)
++                    + " floorLe1pct=" + (total>0L?floorCount/(float)total:Float.NaN)
++                    + " darkLe4pct=" + (total>0L?darkCount/(float)total:Float.NaN)
++                    + " nearClipGe98pct=" + (total>0L?nearClipCount/(float)total:Float.NaN)
++                    + chroma
++                    + " sameTexturePassThrough=true";
++            Log.i("IRIS26498", message);
++            try { com.particlesdevs.photoncamera.util.MotionTrace.processingState("STAGE_TELEMETRY_26498", message); }
++            catch (Throwable ignored) {}
+         } catch (Throwable throwable) {
+-            Log.e(
+-                    "IRIS26400",
+-                    "IRIS_26400_STAGE_TELEMETRY"
+-                            + " stage=" + stage
+-                            + " error="
+-                            + throwable.getClass().getSimpleName()
+-                            + " sameTexturePassThrough=true");
++            Log.e("IRIS26498", "IRIS_26498_STAGE_TELEMETRY stage=" + stage
++                    + " error=" + throwable.getClass().getSimpleName()
++                    + " sameTexturePassThrough=true");
+         } finally {
+-            if (histogram != null) {
+-                histogram.close();
+-            }
+-            /*
+-             * Reassert identical pass-through after histogram program switching.
+-             */
++            if (histogram != null) histogram.close();
+             WorkingTexture = source;
+             glProg.closed = true;
+         }
+     }
+-}
+\ No newline at end of file
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index 1903ed3..ded88e1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -6,6 +6,7 @@ import com.particlesdevs.photoncamera.processing.ImageFrame;
+ import com.particlesdevs.photoncamera.processing.MotionBatch;
+ import com.particlesdevs.photoncamera.processing.MotionMetrics;
+ import com.particlesdevs.photoncamera.processing.opengl.GLCoreBlockProcessing;
++import com.particlesdevs.photoncamera.processing.opengl.GLBuffer;
+ import com.particlesdevs.photoncamera.processing.opengl.GLDrawParams;
+ import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+ import com.particlesdevs.photoncamera.processing.opengl.GLOneScript;
+@@ -1459,6 +1460,11 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             /* IRIS_26480_BJZHOU_RCD_BENTO_SHORT_RECOVERY_V2 */
+             GLTexture iris26480ReadbackOutput=imageOutput,iris26480ShortRaw=null,iris26480ShortCfa=null;
+             GLTexture iris26480ShortWbCfa=null,iris26480Recovered=null;MotionV2Alignment.Result iris26480ShortAlignment=null;
++            /* IRIS_26496_SHORT_FAILURE_DIAGNOSTIC_OWNER
++             * Tiny 64-uint SSBO only; no full-frame diagnostic carrier. It is read after the
++             * existing one-and-only final GPU drain and cannot affect reconstruction math.
++             */
++            GLBuffer iris26496ShortDiag = null;
+             /* IRIS_26488_V3_DIAGNOSTIC_SCOPE_OWNER
+              * The coarse diagnostic resources must survive the short-recovery try/finally because
+              * their readback occurs after that block. Keep ownership in the enclosing reconstruction
+@@ -1506,15 +1512,21 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     iris26480Recovered=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     iris26492RecoveredProvenance=new GLTexture(
+                             rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    iris26496ShortDiag = new GLBuffer(
++                            64, new GLFormat(GLFormat.DataType.UNSIGNED_32));
++                    iris26496ShortDiag.uploadBuffer(new int[64], 64);
+                     glProg.setLayout(tile,tile,1);
+                     glProg.useAssetProgram("motionv2/short_highlight_bayer_recover",true);
+                     glProg.setVar("packedSize",rawHalf);
+                     glProg.setVar("shortToNormalScale",shortToNormalScale);
+                     glProg.setVar("physicalClipThreshold",IRIS26487_CLIP_THRESHOLD);
+                     glProg.setVar("shortClipThreshold",IRIS26487_CLIP_THRESHOLD);
+-                    /* IRIS_26490_SHORT_FLOW_RELIABILITY_HOST
+-                     * Reuse the proven 26486 short-highlight flow floor. Z/W come from
+-                     * mfsr_flow_expand as variation/interpolation-cancel evidence.
++                    /* IRIS_26497_SHORT_CORRESPONDENCE_HOST
++                     * Keep the proven variation floor, but the shader now interprets
++                     * mfsr_flow_expand.w correctly: interpolation cancellation preserves
++                     * the whole base tile vector and is not itself an invalid warp.
++                     * Structured clipped sites receive a bounded local correspondence
++                     * refinement before any short sample can become color authority.
+                      */
+                     glProg.setVar("minimumFlowConfidence",0.30f);
+                     glProg.setVar("referenceExposureScale",iris26487ReferenceExposureScale);
+@@ -1523,6 +1535,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     glProg.setTexture("flowTexture",iris26480ShortAlignment.flowTexture);
+                     glProg.setTextureCompute("outCfa",iris26480Recovered,true);
+                     glProg.setTextureCompute("outProvenance",iris26492RecoveredProvenance,true);
++                    glProg.setBufferCompute("ShortDiagBuf", iris26496ShortDiag);
+                     glProg.computeAutoDeferred(rawHalf,1);
+                     iris26480ReadbackOutput=iris26480Recovered;
+                     iris26492ReadbackProvenance=iris26492RecoveredProvenance;
+@@ -1539,7 +1552,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             +" timestamp="+shortHighlightFrame.timestamp
+                             +" shortExcludedFromNormalAccumulator=true"
+                             +" shortExtendedRadianceState=true"
+-                            +" recoveredBeforeDemosaic=true rgbRepair=false");
++                            +" recoveredBeforeDemosaic=true rgbRepair=false"
++                            +" interpolationCancelMeansBaseFlow=true"
++                            +" localCorrespondenceRefine=3x3HalfPacked"
++                            +" structuredUniqueMatchRequired=true");
+ 
+                 }
+                 /* IRIS_26488_TINY_DIAGNOSTICS_BEFORE_SINGLE_GPU_DRAIN
+@@ -1581,6 +1597,69 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     iris26488ReleaseReadbackFramebuffer(iris26480ReadbackOutput);
+                 }
+                 iris26487OutputReadbackMs = (System.nanoTime()-iris26487ReadbackStartNs)/1000000L;
++                if (iris26496ShortDiag != null) {
++                    try {
++                        int[] d = iris26496ShortDiag.readBufferIntegers(false);
++                        if (d != null && d.length >= 44) {
++                            long total = Integer.toUnsignedLong(d[0]);
++                            long safe = Integer.toUnsignedLong(d[1]);
++                            long shortClipped = Integer.toUnsignedLong(d[2]);
++                            long flowRejected = Integer.toUnsignedLong(d[3]);
++                            long correspondenceRejected = Integer.toUnsignedLong(d[4]);
++                            long radiometryRejected = Integer.toUnsignedLong(d[5]);
++                            long validated = Integer.toUnsignedLong(d[6]);
++                            long stillCensored = Integer.toUnsignedLong(d[7]);
++                            float coverage = total > 0L ? validated / (float) total : 0.0f;
++                            Log.d(TAG, "IRIS_26496_SHORT_FAILURE_REASONS"
++                                    + " totalNormalClipped=" + total
++                                    + " shortSafeCandidate=" + safe
++                                    + " shortPhysicallyClipped=" + shortClipped
++                                    + " flowRejected=" + flowRejected
++                                    + " correspondenceRejected=" + correspondenceRejected
++                                    + " radiometryRejected=" + radiometryRejected
++                                    + " shortValidated=" + validated
++                                    + " stillCensored=" + stillCensored
++                                    + " recoveryCoverage=" + coverage
++                                    + " shortValueBinsLt50_50to70_70to85_85to95_95toClip="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 8, 13))
++                                    + " clippedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 16, 20))
++                                    + " validatedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 20, 24))
++                                    + " shortClippedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 24, 28))
++                                    + " flowRejectedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 28, 32))
++                                    + " correspondenceRejectedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 32, 36))
++                                    + " radiometryRejectedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 36, 40))
++                                    + " stillCensoredByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 40, 44))
++                                    + " imageMathUnchangedByTelemetry=true"
++                                    + " oneGpuDrain=true");
++                            if (total != validated + stillCensored) {
++                                Log.w(TAG, "IRIS_26496_SHORT_DIAGNOSTIC_ACCOUNTING_MISMATCH"
++                                        + " total=" + total
++                                        + " validatedPlusStill=" + (validated + stillCensored));
++                            }
++                            try {
++                                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                                        "IRIS_26496_SHORT_FAILURE_REASONS",
++                                        "total=" + total
++                                                + " shortClipped=" + shortClipped
++                                                + " flowRejected=" + flowRejected
++                                                + " corrRejected=" + correspondenceRejected
++                                                + " radiometryRejected=" + radiometryRejected
++                                                + " validated=" + validated
++                                                + " stillCensored=" + stillCensored
++                                                + " coverage=" + coverage);
++                            } catch (Throwable ignored) {}
++                        }
++                    } catch (Throwable shortDiagError) {
++                        Log.w(TAG, "IRIS_26496_SHORT_DIAGNOSTIC_READBACK_SKIPPED", shortDiagError);
++                    }
++                }
+                 if (directBayer && iris26492ReadbackProvenance != null) {
+                     try {
+                         iris26492ReadbackProvenance.BufferLoad();
+@@ -1658,6 +1737,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 if(iris26480ShortAlignment!=null)iris26480ShortAlignment.close();if(iris26480ShortWbCfa!=null)iris26480ShortWbCfa.close();
+                 if(iris26480ShortCfa!=null)iris26480ShortCfa.close();if(iris26480ShortRaw!=null)iris26480ShortRaw.close();
+                 if(iris26480Recovered!=null)iris26480Recovered.close();
++                if(iris26496ShortDiag!=null)iris26496ShortDiag.close();
+                 if(iris26492RecoveredProvenance!=null)iris26492RecoveredProvenance.close();
+                 if(iris26492BaseProvenance!=null)iris26492BaseProvenance.close();
+             }
