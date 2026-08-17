@@ -18,7 +18,7 @@ V7_SHA="ed5470179aea9514c15d52dcb35613c7925778c6"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_TAR_SHA="ce5be58fa20b9e28786b9c6e4355743066fe92e78791b50b5ee2df568c5ae9e1"
 BASE_MANIFEST_SHA="9af4b1cf5411b5cae445c3e2b782e07d824c3d4a2bcd16f3c7cf28ba79b5a74f"
-PATCH_SHA="74937118a7f832396a8d9847802a8c59cd4bb6596ca991170f986688365f40de"
+PATCH_SHA="df736ae0cdc002cb867e60ecf792d9c2c28311699255fa98e7aaa71fdb8282ec"
 
 rm -rf "$OUT" "$WORK"
 mkdir -p "$OUT" "$BASE" "$CAND"
@@ -96,6 +96,8 @@ for rel,stage in items:
  cp=subprocess.run(['glslangValidator','-S',stage,str(tmp)],capture_output=True,text=True)
  log.append(f'{rel}: rc={cp.returncode}\n{cp.stdout}{cp.stderr}')
  if cp.returncode:
+  diagnostic=f'{rel}: rc={cp.returncode}\n{cp.stdout}{cp.stderr}'
+  print(diagnostic, file=sys.stderr, flush=True)
   (out/'26500_glsl_validation.txt').write_text('\n'.join(log)); raise SystemExit(cp.returncode)
 (out/'26500_glsl_validation.txt').write_text('\n'.join(log))
 # Reproduce the custom GLInterface line parser for the changed compute shader.

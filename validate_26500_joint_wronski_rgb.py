@@ -66,6 +66,8 @@ need(block(acc,'if (referenceFrame != 0) {','        return;')==block(base_acc,'
 render=text('src/main/assets/shaders/motionv2/render.glsl')
 for m in ['IRIS_26500_WHITE_TARGET_AFTER_EXISTING_OUTPUT_EXPOSURE','IRIS_26500_GENTLE_NEUTRAL_WHITE_ROLLOFF','preScaleDisplayWhite','neutralMix']: need(m in render,'render invariant missing '+m)
 need('return rgb/max(peak' not in render,'old unconditional hue-preserving overflow rule survived')
+headroom_fn=block(render,'vec3 mapExtendedLinearHeadroom(vec3 rgb) {','\n}')
+need('const float start=0.50;' in headroom_fn,'headroom shoulder start is not declared in mapExtendedLinearHeadroom scope')
 def uniforms(src): return set(re.findall(r'\buniform\s+(?:highp\s+|mediump\s+|lowp\s+)?[A-Za-z0-9_]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*;',src))
 for asset,start,end in [('joint_green_26500.glsl','useAssetProgram("motionv2/joint_green_26500")','glProg.drawBlocks(greenGuide);'),('joint_rgb_26500.glsl','useAssetProgram("motionv2/joint_rgb_26500")','glProg.drawBlocks(WorkingTexture);')]:
     src=text('src/main/assets/shaders/motionv2/'+asset); a=host.index(start); b=host.index(end,a); seg=host[a:b]
