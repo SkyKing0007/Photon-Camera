@@ -1,0 +1,637 @@
+diff --git a/app/src/main/assets/shaders/motionv2/joint_green_26500.glsl b/app/src/main/assets/shaders/motionv2/joint_green_26500.glsl
+new file mode 100644
+index 0000000..df005b8
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/joint_green_26500.glsl
+@@ -0,0 +1,133 @@
++precision highp float;
++precision highp int;
++precision highp sampler2D;
++
++uniform highp sampler2D InputBayer;
++uniform highp sampler2D HighlightProvenance;
++uniform highp sampler2D LensShadingMap;
++uniform ivec2 rawSize;
++uniform int cfaPattern;
++uniform vec3 calculationWb;
++uniform float highlightCeiling;
++uniform int useLensShading;
++
++const float PROVENANCE_CENSORED = 1.0;
++
++int mirrorIndex(int value, int size) {
++    if (size <= 1) return 0;
++    int period = 2 * (size - 1);
++    int wrapped = value % period;
++    if (wrapped < 0) wrapped += period;
++    return wrapped < size ? wrapped : period - wrapped;
++}
++ivec2 mirrorRaw(ivec2 p) {
++    return ivec2(mirrorIndex(p.x, rawSize.x), mirrorIndex(p.y, rawSize.y));
++}
++int phaseAt(ivec2 p) { return (p.x & 1) | ((p.y & 1) << 1); }
++int colorAt(ivec2 p) {
++    int q = phaseAt(p);
++    if (cfaPattern == 0) return q == 0 ? 0 : (q == 3 ? 2 : 1);
++    if (cfaPattern == 1) return q == 1 ? 0 : (q == 2 ? 2 : 1);
++    if (cfaPattern == 2) return q == 2 ? 0 : (q == 1 ? 2 : 1);
++    return q == 3 ? 0 : (q == 0 ? 2 : 1);
++}
++float phaseComponent(vec4 v, int q) {
++    return q == 0 ? v.r : (q == 1 ? v.g : (q == 2 ? v.b : v.a));
++}
++float phaseDivisor(int q) {
++    return q == 0 ? 1.0 : (q == 1 ? 3.0 : (q == 2 ? 9.0 : 27.0));
++}
++float provenanceAt(ivec2 p) {
++    p = mirrorRaw(p);
++    float code = texelFetch(HighlightProvenance, p >> 1, 0).r;
++    float digit = floor(code / phaseDivisor(phaseAt(p)));
++    return mod(digit, 3.0);
++}
++bool trustedAt(ivec2 p) {
++    return abs(provenanceAt(p) - PROVENANCE_CENSORED) >= 0.25;
++}
++float fusedAt(ivec2 p) {
++    p = mirrorRaw(p);
++    vec4 v = texelFetch(InputBayer, p >> 1, 0);
++    return phaseComponent(v, phaseAt(p));
++}
++vec3 shadingRgb(ivec2 p) {
++    if (useLensShading == 0) return vec3(1.0);
++    p = mirrorRaw(p);
++    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(rawSize);
++    vec4 g = texture(LensShadingMap, clamp(uv, vec2(0.0), vec2(1.0)));
++    return max(vec3(g.r, 0.5 * (g.g + g.b), g.a), vec3(0.0));
++}
++float calculationSample(ivec2 p) {
++    p = mirrorRaw(p);
++    int c = colorAt(p);
++    vec3 lsc = shadingRgb(p);
++    float wb = c == 0 ? calculationWb.r : (c == 2 ? calculationWb.b : calculationWb.g);
++    return min(max(fusedAt(p) * lsc[c] * max(wb, 1.0e-6), 0.0), highlightCeiling);
++}
++float neutralLowerBound(ivec2 p) {
++    p = mirrorRaw(p);
++    ivec2 o = (p >> 1) << 1;
++    float lower = 0.0;
++    for (int y = 0; y < 2; ++y) {
++        for (int x = 0; x < 2; ++x) {
++            lower = max(lower, calculationSample(o + ivec2(x, y)));
++        }
++    }
++    return lower;
++}
++bool trustedGreen(ivec2 p, out float v) {
++    p = mirrorRaw(p);
++    if (colorAt(p) != 1 || !trustedAt(p)) { v = 0.0; return false; }
++    v = calculationSample(p);
++    return true;
++}
++
++out float Output;
++
++/* IRIS_26500_PHYSICAL_GREEN_STRUCTURE_GUIDE
++ * CENSORED green never becomes structural authority. NORMAL and SHORT_VALIDATED
++ * are the only physical green observations. The neutral lower bound is used only
++ * when actual green evidence disappears, never as chroma evidence.
++ */
++void main() {
++    ivec2 p = ivec2(gl_FragCoord.xy);
++    if (any(greaterThanEqual(p, rawSize))) { Output = 0.0; return; }
++
++    float direct;
++    if (trustedGreen(p, direct)) { Output = direct; return; }
++
++    float l, r, u, d;
++    bool h = trustedGreen(p + ivec2(-1, 0), l) && trustedGreen(p + ivec2(1, 0), r);
++    bool v = trustedGreen(p + ivec2(0, -1), u) && trustedGreen(p + ivec2(0, 1), d);
++    float green = neutralLowerBound(p);
++    if (h || v) {
++        float hm = h ? 0.5 * (l + r) : 0.0;
++        float vm = v ? 0.5 * (u + d) : 0.0;
++        if (h && v) {
++            float hc = abs(l - r);
++            float vc = abs(u - d);
++            float wh = 1.0 / max(hc, 1.0e-5);
++            float wv = 1.0 / max(vc, 1.0e-5);
++            green = max((hm * wh + vm * wv) / (wh + wv), green);
++        } else {
++            green = max(h ? hm : vm, green);
++        }
++        Output = green;
++        return;
++    }
++
++    float sum = 0.0;
++    float weight = 0.0;
++    for (int y = -2; y <= 2; ++y) {
++        for (int x = -2; x <= 2; ++x) {
++            float g;
++            if (!trustedGreen(p + ivec2(x, y), g)) continue;
++            float w = exp2(-0.45 * float(x * x + y * y));
++            sum += g * w;
++            weight += w;
++        }
++    }
++    if (weight > 1.0e-6) green = max(sum / weight, green);
++    Output = green;
++}
+diff --git a/app/src/main/assets/shaders/motionv2/joint_rgb_26500.glsl b/app/src/main/assets/shaders/motionv2/joint_rgb_26500.glsl
+new file mode 100644
+index 0000000..90593f2
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/joint_rgb_26500.glsl
+@@ -0,0 +1,168 @@
++precision highp float;
++precision highp int;
++precision highp sampler2D;
++
++uniform highp sampler2D InputBayer;
++uniform highp sampler2D HighlightProvenance;
++uniform highp sampler2D LensShadingMap;
++uniform ivec2 rawSize;
++uniform int cfaPattern;
++uniform vec3 calculationWb;
++uniform float highlightCeiling;
++uniform int useLensShading;
++
++const float PROVENANCE_CENSORED = 1.0;
++
++int mirrorIndex(int value, int size) {
++    if (size <= 1) return 0;
++    int period = 2 * (size - 1);
++    int wrapped = value % period;
++    if (wrapped < 0) wrapped += period;
++    return wrapped < size ? wrapped : period - wrapped;
++}
++ivec2 mirrorRaw(ivec2 p) {
++    return ivec2(mirrorIndex(p.x, rawSize.x), mirrorIndex(p.y, rawSize.y));
++}
++int phaseAt(ivec2 p) { return (p.x & 1) | ((p.y & 1) << 1); }
++int colorAt(ivec2 p) {
++    int q = phaseAt(p);
++    if (cfaPattern == 0) return q == 0 ? 0 : (q == 3 ? 2 : 1);
++    if (cfaPattern == 1) return q == 1 ? 0 : (q == 2 ? 2 : 1);
++    if (cfaPattern == 2) return q == 2 ? 0 : (q == 1 ? 2 : 1);
++    return q == 3 ? 0 : (q == 0 ? 2 : 1);
++}
++float phaseComponent(vec4 v, int q) {
++    return q == 0 ? v.r : (q == 1 ? v.g : (q == 2 ? v.b : v.a));
++}
++float phaseDivisor(int q) {
++    return q == 0 ? 1.0 : (q == 1 ? 3.0 : (q == 2 ? 9.0 : 27.0));
++}
++float provenanceAt(ivec2 p) {
++    p = mirrorRaw(p);
++    float code = texelFetch(HighlightProvenance, p >> 1, 0).r;
++    float digit = floor(code / phaseDivisor(phaseAt(p)));
++    return mod(digit, 3.0);
++}
++bool trustedAt(ivec2 p) {
++    return abs(provenanceAt(p) - PROVENANCE_CENSORED) >= 0.25;
++}
++float fusedAt(ivec2 p) {
++    p = mirrorRaw(p);
++    vec4 v = texelFetch(InputBayer, p >> 1, 0);
++    return phaseComponent(v, phaseAt(p));
++}
++vec3 shadingRgb(ivec2 p) {
++    if (useLensShading == 0) return vec3(1.0);
++    p = mirrorRaw(p);
++    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(rawSize);
++    vec4 g = texture(LensShadingMap, clamp(uv, vec2(0.0), vec2(1.0)));
++    return max(vec3(g.r, 0.5 * (g.g + g.b), g.a), vec3(0.0));
++}
++float calculationSample(ivec2 p) {
++    p = mirrorRaw(p);
++    int c = colorAt(p);
++    vec3 lsc = shadingRgb(p);
++    float wb = c == 0 ? calculationWb.r : (c == 2 ? calculationWb.b : calculationWb.g);
++    return min(max(fusedAt(p) * lsc[c] * max(wb, 1.0e-6), 0.0), highlightCeiling);
++}
++float neutralLowerBound(ivec2 p) {
++    p = mirrorRaw(p);
++    ivec2 o = (p >> 1) << 1;
++    float lower = 0.0;
++    for (int y = 0; y < 2; ++y) {
++        for (int x = 0; x < 2; ++x) {
++            lower = max(lower, calculationSample(o + ivec2(x, y)));
++        }
++    }
++    return lower;
++}
++bool trustedGreen(ivec2 p, out float v) {
++    p = mirrorRaw(p);
++    if (colorAt(p) != 1 || !trustedAt(p)) { v = 0.0; return false; }
++    v = calculationSample(p);
++    return true;
++}
++
++uniform highp sampler2D GreenGuide;
++uniform float noiseS;
++uniform float noiseO;
++out vec3 Output;
++
++/* IRIS_26500_EVIDENCE_COMPLETE_JOINT_RGB
++ * Native-resolution G/(R-G)/(B-G) reconstruction after Wronski and Short-A.
++ * The rejected historical direct_rgb_* accumulation path remains inactive.
++ */
++float greenAt(ivec2 p) {
++    p = mirrorRaw(p);
++    return texelFetch(GreenGuide, p, 0).r;
++}
++float greenLscAt(ivec2 p) { return max(shadingRgb(p).g, 1.0e-4); }
++float chromaNoiseSigma(float green, ivec2 p) {
++    float lsc = greenLscAt(p);
++    float variance = max(lsc * max(noiseS, 0.0) * max(green, 0.0)
++            + lsc * lsc * max(noiseO, 0.0), 1.0e-10);
++    return max(1.8 * sqrt(variance), 1.0 / 2048.0);
++}
++float localCensoredFraction(ivec2 p) {
++    p = mirrorRaw(p);
++    ivec2 o = (p >> 1) << 1;
++    float count = 0.0;
++    for (int y = 0; y < 2; ++y) {
++        for (int x = 0; x < 2; ++x) {
++            count += abs(provenanceAt(o + ivec2(x, y)) - PROVENANCE_CENSORED) < 0.25 ? 1.0 : 0.0;
++        }
++    }
++    return 0.25 * count;
++}
++float reconstructOpponent(ivec2 p, int wantedColor, float targetGreen,
++                          out float confidence) {
++    float sum = 0.0;
++    float weight = 0.0;
++    float sigma = chromaNoiseSigma(targetGreen, p);
++    for (int y = -2; y <= 2; ++y) {
++        for (int x = -2; x <= 2; ++x) {
++            ivec2 q = mirrorRaw(p + ivec2(x, y));
++            if (colorAt(q) != wantedColor || !trustedAt(q)) continue;
++            float localGreen = greenAt(q);
++            float spatial = exp2(-0.30 * float(x * x + y * y));
++            float nd = (localGreen - targetGreen) / sigma;
++            float guide = exp(-0.5 * nd * nd);
++            float w = spatial * guide;
++            sum += (calculationSample(q) - localGreen) * w;
++            weight += w;
++        }
++    }
++    if (weight <= 1.0e-7) { confidence = 0.0; return 0.0; }
++    float opponent = sum / weight;
++    float support = smoothstep(0.08, 0.35, weight);
++    /* IRIS_26500_NOISE_SIGNIFICANCE_SHADOW_CHROMA */
++    float snr = abs(opponent) / max(sigma, 1.0e-7);
++    float statistical = smoothstep(1.25, 3.5, snr);
++    confidence = support * statistical;
++    return opponent * confidence;
++}
++void main() {
++    ivec2 p = ivec2(gl_FragCoord.xy);
++    if (any(greaterThanEqual(p, rawSize))) { Output = vec3(0.0); return; }
++
++    float green = greenAt(p);
++    float rConfidence;
++    float bConfidence;
++    float rg = reconstructOpponent(p, 0, green, rConfidence);
++    float bg = reconstructOpponent(p, 2, green, bConfidence);
++
++    /* CENSORED is brightness-only. Short-A state 2 is trusted automatically.
++     * The two chroma axes lose authority together as unresolved physical phases
++     * increase, so a fully unresolved cell becomes neutral rather than invented opponent colour. */
++    float censoredFraction = localCensoredFraction(p);
++    float physicalChroma = 1.0 - smoothstep(0.0, 1.0, censoredFraction);
++    float pairedEvidence = min(rConfidence, bConfidence);
++    float highlightPair = mix(1.0, pairedEvidence, censoredFraction);
++    float chromaAuthority = physicalChroma * highlightPair;
++    rg *= chromaAuthority;
++    bg *= chromaAuthority;
++
++    vec3 calculationRgb = max(vec3(green + rg, green, green + bg), vec3(0.0));
++    /* Exact calculation-domain round trip: temporary WB cannot leak downstream. */
++    Output = calculationRgb / max(calculationWb, vec3(1.0e-6));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl b/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl
+index a44a62e..ff46cd5 100644
+--- a/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl
++++ b/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl
+@@ -128,22 +128,40 @@ void main() {
+         vec2 rawTarget = 2.0 * sourcePacked + vec2(phaseOffset(phase)) - vec2(1.0);
+         float sum = 0.0;
+         float weight = 0.0;
++        float fullKernelWeight = 0.0;
++        int validKernelSamples = 0;
+         for (int dy = -1; dy <= 1; ++dy) {
+             for (int dx = -1; dx <= 1; ++dx) {
+                 ivec2 packedSample = packedCenter + ivec2(dx, dy);
+-                if (any(lessThan(packedSample, ivec2(0))) ||
+-                    any(greaterThanEqual(packedSample, packedSize))) continue;
+                 ivec2 rawSample = packedSample * 2 + phaseOffset(phase);
+                 float spatial = kernelWeight(vec2(rawSample) - rawTarget, precisionMatrix);
++                fullKernelWeight += spatial;
++                if (any(lessThan(packedSample, ivec2(0))) ||
++                    any(greaterThanEqual(packedSample, packedSize))) continue;
++                validKernelSamples++;
+                 float joint = spatial * frameWeight;
+                 sum += sensorNormalizedAt(rawSample, phase) * exposureScale * joint;
+                 weight += joint;
+             }
+         }
+         if (weight > 1.0e-8) {
+-            numerator[phase] += sum;
+-            denominator[phase] += weight;
+-            support[phase] += frameWeight;
++            /*
++             * IRIS_26500_REFERENCE_OWNED_PHYSICAL_EDGE_TAPER
++             * Interior math is exactly unchanged because available/full == 1. At a true
++             * source boundary the one-sided auxiliary footprint loses authority continuously;
++             * the immutable reference contribution above is never reduced or mirrored into
++             * temporal evidence. This fixes the producer contract instead of masking the JPEG.
++             */
++            float availableKernelWeight = weight / max(frameWeight, 1.0e-8);
++            float edgeCoverage = validKernelSamples == 9
++                    ? 1.0
++                    : clamp(
++                            availableKernelWeight / max(fullKernelWeight, 1.0e-8),
++                            0.0,
++                            1.0);
++            numerator[phase] += sum * edgeCoverage;
++            denominator[phase] += weight * edgeCoverage;
++            support[phase] += frameWeight * edgeCoverage;
+         }
+     }
+ 
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 494c184..aac8dde 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -97,7 +97,13 @@ float mapHeadroomLuminance(float y) {
+             log(1.0+logShape*x)
+             /log(1.0+logShape);
+ 
+-    return start+(1.0-start)*shaped;
++    /* IRIS_26500_WHITE_TARGET_AFTER_EXISTING_OUTPUT_EXPOSURE
++     * The previous 1.0 pre-scale ceiling became only 0.80 after the proven output
++     * exposure, structurally preventing clean white clipping. Map to the inverse
++     * of that existing scale so the final SDR endpoint can actually reach 1.0.
++     */
++    float preScaleDisplayWhite=1.0/max(outputExposureScale,1.0e-6);
++    return start+(preScaleDisplayWhite-start)*shaped;
+ }
+ 
+ vec3 mapExtendedLinearHeadroom(vec3 rgb) {
+@@ -118,7 +124,20 @@ vec3 mapExtendedLinearHeadroom(vec3 rgb) {
+      * clamp is introduced here.
+      */
+     float mappedGuide=mapHeadroomLuminance(guide);
+-    return rgb*(mappedGuide/guide);
++    vec3 mapped=rgb*(mappedGuide/guide);
++
++    /* IRIS_26500_GENTLE_NEUTRAL_WHITE_ROLLOFF
++     * Real colour is retained through most of the shoulder. Only the final part
++     * of physical headroom converges continuously to neutral display white. This
++     * is the approved clipping behaviour: no hue invention, no hard grey shelf.
++     */
++    float whitePoint=max(sceneWhite,start+0.05);
++    float headroomPosition=clamp(
++            (guide-start)/max(whitePoint-start,1.0e-6),
++            0.0,
++            1.0);
++    float neutralMix=smoothstep(0.82,1.0,headroomPosition);
++    return mix(mapped,vec3(mappedGuide),neutralMix);
+ }
+ 
+ /*
+@@ -138,7 +157,9 @@ vec3 fitDisplayGamut(vec3 rgb) {
+      * foliage approached display white. Uniform RGB scaling preserves channel
+      * ratios/hue and trades only highlight luminance for display gamut.
+      */
+-    return rgb/max(peak,1.0e-6);
++    vec3 hueSafe=rgb/max(peak,1.0e-6);
++    float overflow=clamp((peak-1.0)/0.25,0.0,1.0);
++    return mix(hueSafe,vec3(1.0),smoothstep(0.0,1.0,overflow));
+ }
+ 
+ void main() {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+index b772f6a..801bab3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+@@ -55,9 +55,10 @@ public final class MotionV2CfaInput extends Node {
+ 
+         /* IRIS_26489_FUSED_BAYER_FLOAT32_BRIDGE_OWNER
+          * Every standard Bayer Motion shot now crosses the GL-context bridge as one
+-         * half-resolution RGBA32F packed Bayer lattice. RGB synthesis is forbidden
+-         * before the post-merge RCD owner. Special CFA formats retain the same packed
+-         * carrier dimensions.
++         * half-resolution RGBA32F packed Bayer lattice. RGB synthesis remains forbidden
++         * before the post-bridge image-formation owner. Special CFA formats retain the same
++         * packed carrier dimensions. 26500 replaces the separate post-merge RCD with the
++         * evidence-complete joint RGB owner.
+          */
+         boolean directBayer =
+                 basePipeline.mParameters.cfaPattern >= 0
+@@ -129,6 +130,8 @@ public final class MotionV2CfaInput extends Node {
+                 + " raw16RoundTrip=false"
+                 + " float16Transfer=false"
+                 + " directMultiframeRgb=false"
++                + " jointRgbPostOwner26500=" + directBayer
++                + " separateRcd=false"
+                 + " fusedBayerCanonical=" + directBayer
+                 + " highlightProvenanceR32F=" + directBayer);
+         try {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2JointRgbReconstruct.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2JointRgbReconstruct.java
+new file mode 100644
+index 0000000..46e6abe
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2JointRgbReconstruct.java
+@@ -0,0 +1,148 @@
++package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
++
++import android.graphics.Point;
++
++import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
++import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
++import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
++import com.particlesdevs.photoncamera.util.Log;
++
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++
++import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
++import static android.opengl.GLES20.GL_LINEAR;
++
++/**
++ * IRIS_26500_JOINT_WRONSKI_RGB_OWNER
++ *
++ * Converts the final Wronski/Short-A packed CFA + per-phase provenance directly
++ * into native-resolution camera-linear RGB using one G/(R-G)/(B-G) reconstruction.
++ * The rejected historical direct_rgb_* accumulator remains inactive.
++ */
++public final class MotionV2JointRgbReconstruct extends Node {
++    public MotionV2JointRgbReconstruct() {
++        super("", "MotionV2JointRgbReconstruct");
++    }
++
++    @Override public void Compile() {}
++
++    @Override
++    public void Run() {
++        if (!basePipeline.mParameters.motionV2Active) {
++            throw new IllegalStateException("26500 joint RGB used outside Motion V2");
++        }
++        if (previousNode == null || previousNode.WorkingTexture == null) {
++            throw new IllegalStateException("26500 packed Wronski CFA input is missing");
++        }
++
++        Point raw = basePipeline.mParameters.rawSize;
++        Point packed = new Point(raw.x / 2, raw.y / 2);
++        if (raw.x <= 0 || raw.y <= 0 || (raw.x & 1) != 0 || (raw.y & 1) != 0
++                || !previousNode.WorkingTexture.mSize.equals(packed)) {
++            throw new IllegalStateException("26500 joint RGB requires exact even standard Bayer geometry");
++        }
++
++        PostPipeline pipeline = (PostPipeline) basePipeline;
++        if (pipeline.motionV2HighlightProvenanceTexture == null) {
++            throw new IllegalStateException("26500 joint RGB requires per-phase highlight provenance");
++        }
++        float[] gains = basePipeline.mParameters.motionV2ColorGains;
++        if (!basePipeline.mParameters.motionV2DirectColorValid
++                || gains == null || gains.length != 4) {
++            throw new IllegalStateException("26500 joint RGB requires timestamp-owned HAL color gains");
++        }
++        if (!basePipeline.mParameters.motionV2StrictWronskiSensorValid
++                || !Float.isFinite(basePipeline.mParameters.motionV2WronskiNoiseS)
++                || !Float.isFinite(basePipeline.mParameters.motionV2WronskiNoiseO)) {
++            throw new IllegalStateException("26500 joint RGB requires strict Camera2 Wronski noise authority");
++        }
++
++        float greenGain = Math.max(0.5f * (gains[1] + gains[2]), 1.0e-6f);
++        float wbR = Math.max(gains[0] / greenGain, 1.0e-6f);
++        float wbB = Math.max(gains[3] / greenGain, 1.0e-6f);
++        float noiseS = Math.max(basePipeline.mParameters.motionV2WronskiNoiseS, 0.0f);
++        float noiseO = Math.max(basePipeline.mParameters.motionV2WronskiNoiseO, 0.0f);
++
++        boolean hasLsc = basePipeline.mParameters.hasGainMap
++                && basePipeline.mParameters.mapSize != null
++                && basePipeline.mParameters.mapSize.x > 0
++                && basePipeline.mParameters.mapSize.y > 0
++                && basePipeline.mParameters.gainMap != null
++                && basePipeline.mParameters.gainMap.length
++                        >= basePipeline.mParameters.mapSize.x * basePipeline.mParameters.mapSize.y * 4;
++        Point lscSize = hasLsc ? new Point(basePipeline.mParameters.mapSize) : new Point(1, 1);
++        float[] lscValues = hasLsc
++                ? basePipeline.mParameters.gainMap
++                : new float[]{1.0f, 1.0f, 1.0f, 1.0f};
++        int lscFloatCount = lscSize.x * lscSize.y * 4;
++        ByteBuffer lscUpload = ByteBuffer.allocateDirect(lscFloatCount * Float.BYTES)
++                .order(ByteOrder.nativeOrder());
++        lscUpload.asFloatBuffer().put(lscValues, 0, lscFloatCount);
++        lscUpload.position(0);
++
++        try (GLTexture lsc = new GLTexture(
++                lscSize,
++                new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                lscUpload,
++                GL_LINEAR,
++                GL_CLAMP_TO_EDGE)) {
++            try (GLTexture greenGuide = new GLTexture(
++                    raw,
++                    new GLFormat(GLFormat.DataType.FLOAT_16, 1),
++                    null,
++                    GL_LINEAR,
++                    GL_CLAMP_TO_EDGE)) {
++                glProg.useAssetProgram("motionv2/joint_green_26500");
++                glProg.setTexture("InputBayer", previousNode.WorkingTexture);
++                glProg.setTexture("HighlightProvenance", pipeline.motionV2HighlightProvenanceTexture);
++                glProg.setTexture("LensShadingMap", lsc);
++                glProg.setVar("rawSize", raw);
++                glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
++                glProg.setVar("calculationWb", wbR, 1.0f, wbB);
++                glProg.setVar("highlightCeiling", 8.0f);
++                glProg.setVar("useLensShading", hasLsc ? 1 : 0);
++                glProg.drawBlocks(greenGuide);
++
++                glProg.useAssetProgram("motionv2/joint_rgb_26500");
++                glProg.setTexture("InputBayer", previousNode.WorkingTexture);
++                glProg.setTexture("HighlightProvenance", pipeline.motionV2HighlightProvenanceTexture);
++                glProg.setTexture("LensShadingMap", lsc);
++                glProg.setTexture("GreenGuide", greenGuide);
++                glProg.setVar("rawSize", raw);
++                glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
++                glProg.setVar("calculationWb", wbR, 1.0f, wbB);
++                glProg.setVar("noiseS", noiseS);
++                glProg.setVar("noiseO", noiseO);
++                glProg.setVar("highlightCeiling", 8.0f);
++                glProg.setVar("useLensShading", hasLsc ? 1 : 0);
++
++                WorkingTexture = basePipeline.getMain();
++                if (WorkingTexture == null || !WorkingTexture.mSize.equals(raw)) {
++                    throw new IllegalStateException("26500 full-resolution RGB allocation failed");
++                }
++                glProg.drawBlocks(WorkingTexture);
++                glProg.closed = true;
++            }
++        }
++
++        String line = "IRIS_26500_JOINT_WRONSKI_RGB_OWNER"
++                + " nativeResolution=true"
++                + " semantics=G_RminusG_BminusG"
++                + " oldDirectRgbShadersActive=false"
++                + " separateRcd=false"
++                + " normalAndShortValidatedColorAuthority=true"
++                + " censoredBrightnessOnly=true"
++                + " shadowChromaNoiseAuthority=WRONSKI_CAMERA2_SxPlusO"
++                + " noiseS=" + noiseS
++                + " noiseO=" + noiseO
++                + " calculationWb=" + wbR + ",1.0," + wbB
++                + " cameraDomainRestoredExactlyOnce=true"
++                + " lsc=" + (hasLsc ? (lscSize.x + "x" + lscSize.y) : "identity");
++        Log.d(Name, line);
++        try {
++            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                    "IRIS_26500_JOINT_WRONSKI_RGB_OWNER", line);
++        } catch (Throwable ignored) {}
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index e02e3f9..2f24437 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -265,16 +265,16 @@ public class PostPipeline extends GLBasePipeline {
+              * IRIS_26451_REFERENCE_SAFE_DEMOSAIC_ISOLATION
+              * Standard Bayer is packed CFA in this controlled build.
+              */
+-            /* IRIS_26489_FUSED_BAYER_CANONICAL_POST_GRAPH
+-             * Standard Bayer no longer arrives as direct RGB. The temporal owner publishes
+-             * one fused Bayer lattice and the dedicated post-merge RCD-domain node owns the
+-             * first RGB/highlight synthesis.
++            /* IRIS_26500_EVIDENCE_COMPLETE_JOINT_RGB_POST_OWNER
++             * Wronski temporal fusion and Short-A provenance remain authoritative. Standard
++             * Bayer now crosses to RGB once through the native-resolution joint G/(R-G)/(B-G)
++             * owner; the separate post-merge RCD is intentionally inactive.
+              */
+-            boolean directRgbCarrier = false;
++            boolean directRgbCarrier = directBayer;
+             if (directBayer) {
+                 add(new StageTelemetry("V2_POST_FUSED_BAYER_CANONICAL"));
+-                add(new MotionV2RcdDemosaic());
+-                add(new StageTelemetry("V2_POST_RCD_AFTER_TEMPORAL_MERGE"));
++                add(new MotionV2JointRgbReconstruct());
++                add(new StageTelemetry("V2_POST_JOINT_WRONSKI_RGB_26500"));
+             } else {
+                 add(new StageTelemetry("V2_POST_FLOAT_CFA_INPUT_FALLBACK"));
+                 switch (mSettings.cfaPattern) {
+@@ -322,8 +322,10 @@ public class PostPipeline extends GLBasePipeline {
+             add(new RotateWatermark(getRotation()));
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+-                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2DisplayExposure,MotionV2ColorTransform,MotionV2Render,RotateWatermark"
+-                            + " directMultiframeRgb=" + directBayer
++                    "nodes=MotionV2CfaInput,JointWronskiRGB-or-CFAFallback,MotionV2DisplayExposure,MotionV2ColorTransform,MotionV2Render,RotateWatermark"
++                            + " directMultiframeRgb=" + directRgbCarrier
++                            + " jointWronskiRgb26500=" + directBayer
++                            + " separateRcd=false"
+                             + " strictWronskiAuthority26477=true"
+                             + " displayExposureAfterWronski=true"
+                             + " residualSpatialDenoise=false"
