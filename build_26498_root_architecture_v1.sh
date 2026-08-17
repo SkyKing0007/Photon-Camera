@@ -8,8 +8,10 @@ hash_eq(){ local f="$1" e="$2"; [[ -f "$f" ]] || fail "missing protected file $f
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 EXPECTED_INFRA_26497="00deeae2c82518511988ca6267b2e6071300cba6"
 EXPECTED_INFRA_26494="287590c2e847522cac06752ecdc6be4c0ca3b42a"
+EXPECTED_FAILED_26498_V1="350d1b655afc58ae75f72e139b2f24961e17a7a3"
 EXPECTED_APP_BASE="8233415edf738bf35c0fe1c4907f5dfe51de31a4"
 BACKUP_BRANCH="backup-26497-tested-regression-before-26498-root-architecture"
+FAILED_V1_BACKUP_BRANCH="backup-26498-v1-guard-failed-before-v1.1-short-b-gate"
 BASELINE_BUNDLE="26494_successful_app_source.tar.gz"
 BASELINE_BUNDLE_SHA="ee4ccb614d9cb216e2e39a76adc8f72ce9fe2a07daa75eb6f705e958502e010b"
 BASELINE_MANIFEST="26494_successful_after.sha256"
@@ -49,13 +51,17 @@ BRANCH="${GITHUB_REF_NAME:-$(git branch --show-current)}"
 [[ "$BRANCH" != "dev" ]] || fail "dev is protected"
 git cat-file -e "$EXPECTED_INFRA_26497^{commit}" || fail "26497 infrastructure checkpoint unavailable"
 git cat-file -e "$EXPECTED_INFRA_26494^{commit}" || fail "26494 infrastructure checkpoint unavailable"
+git cat-file -e "$EXPECTED_FAILED_26498_V1^{commit}" || fail "failed 26498 V1 checkpoint unavailable"
 git cat-file -e "$EXPECTED_APP_BASE^{commit}" || fail "protected app base unavailable"
 git merge-base --is-ancestor "$EXPECTED_INFRA_26497" HEAD || fail "HEAD does not descend from tested 26497"
 git merge-base --is-ancestor "$EXPECTED_INFRA_26494" HEAD || fail "HEAD does not descend from 26494"
+git merge-base --is-ancestor "$EXPECTED_FAILED_26498_V1" HEAD || fail "HEAD does not descend from failed 26498 V1 package commit"
 git diff --quiet "$EXPECTED_APP_BASE" -- app/src/main app/version.properties || fail "committed app source changed; infrastructure-only workflow contract violated"
 backup="$(git ls-remote origin "refs/heads/$BACKUP_BRANCH" | awk '{print $1}')"
 [[ "$backup" == "$EXPECTED_INFRA_26497" ]] || fail "required pre-26498 backup missing/moved: $BACKUP_BRANCH=$backup expected=$EXPECTED_INFRA_26497"
-pass "tested 26497 lineage + protected app tree + exact pre-26498 backup"
+failed_v1_backup="$(git ls-remote origin "refs/heads/$FAILED_V1_BACKUP_BRANCH" | awk '{print $1}')"
+[[ "$failed_v1_backup" == "$EXPECTED_FAILED_26498_V1" ]] || fail "required failed-26498-v1 backup missing/moved: $FAILED_V1_BACKUP_BRANCH=$failed_v1_backup expected=$EXPECTED_FAILED_26498_V1"
+pass "tested 26497 lineage + failed 26498 V1 lineage + protected app tree + both exact backups"
 
 # Gate 1: immutable package and root-architecture math identities.
 [[ -f "$BASELINE_BUNDLE" && "$(sha "$BASELINE_BUNDLE")" == "$BASELINE_BUNDLE_SHA" ]] || fail "26494 source bundle identity mismatch"
@@ -173,7 +179,39 @@ grep -q 'IRIS_26497_SHORT_CORRESPONDENCE_REFINEMENT' "$SHORT" || fail "proven 26
 grep -q 'float flowConfidence = exp(-80.0 \* variation);' "$SHORT" || fail "flow semantic correction missing"
 ! grep -q 'cancelled=step\|cancelled = step' "$SHORT" || fail "old interpolation-cancel hard rejection survived"
 grep -q 'IRIS_26496_SHORT_FAILURE_DIAGNOSTIC_OWNER' "$RECON" || fail "short evidence telemetry missing"
-! grep -Eqi 'short[[:space:]_-]*b([^a-zA-Z]|$)|SHORT_B' "$SHORT" "$RECON" "$CAP" || fail "unexpected Short B introduced"
+# V1.1: prove the active short architecture structurally instead of grepping for
+# "SHORT_B" (which falsely matched the legitimate marker SHORT_BATCH_BOUNDARY).
+python3 - "$CAP" <<'PY_SHORT_ARCH'
+from pathlib import Path
+import re,sys
+s=Path(sys.argv[1]).read_text()
+active_name='applyMotion26486ExplicitShortCaptureIfNeeded'
+legacy_name='applyMotion26480ExplicitShortCaptureIfNeeded'
+# Exactly one definition and one call of the active asynchronous Short-A path.
+active_defs=len(re.findall(r'private\s+boolean\s+'+active_name+r'\s*\(',s))
+active_calls=len(re.findall(r'(?<!boolean\s)'+active_name+r'\s*\(iris26486ShortTicket\s*\)',s))
+if active_defs!=1 or active_calls!=1:
+    raise SystemExit(f'active Short-A ownership mismatch defs={active_defs} calls={active_calls}')
+# The historical synchronous method may remain as dead source, but must have no call site.
+legacy_defs=len(re.findall(r'private\s+boolean\s+'+legacy_name+r'\s*\(\s*\)',s))
+legacy_mentions=s.count(legacy_name+'()')
+if legacy_defs!=1 or legacy_mentions!=1:
+    raise SystemExit(f'legacy short path unexpectedly active defs={legacy_defs} mentions={legacy_mentions}')
+# There is one short request identity constant and one physical active capture inside the
+# active method body. This proves one auxiliary exposure owner without substring guesses.
+if s.count('private static final String MOTION_26480_SHORT_TAG = "IRIS_26480_HIGHLIGHT_SHORT";')!=1:
+    raise SystemExit('short request identity constant mismatch')
+start=s.index('private boolean '+active_name+'(')
+end=s.index('private boolean '+legacy_name+'()',start)
+body=s[start:end]
+if body.count('b.setTag(MOTION_26480_SHORT_TAG);')!=1:
+    raise SystemExit('active Short-A tag count mismatch')
+if len(re.findall(r'mCaptureSession\.capture\s*\(b\.build\(\)',body))!=1:
+    raise SystemExit('active Short-A physical capture count mismatch')
+if body.count('MOTION_26480_SHORT_PROTECTION_EV')<1:
+    raise SystemExit('active Short-A protection policy missing')
+print('PASS: structural single Short-A capture ownership; no Short-B owner')
+PY_SHORT_ARCH
 
 # New RCD authority: provenance is carried INSIDE the directional solution, not patched after RGB.
 grep -q 'IRIS_26498_PROVENANCE_INSIDE_RCD_AND_TRUE_MIRRORED_BOUNDARY' "$RCDHOST" || fail "26498 RCD host missing"
