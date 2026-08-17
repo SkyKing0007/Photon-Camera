@@ -1,0 +1,841 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 5a63f27..623ba89 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -9,48 +9,83 @@ uniform float hdrExposureScale;
+ uniform float maxGainRatio;
+ out vec4 Output;
+ 
+-/* IRIS_26494_MATCHED_FOOTPRINT_UHDR_GAINMAP
+- * Each 1/4-resolution gain value represents its exact corresponding 4x4 source
+- * footprint. HDR and SDR luminance are integrated first; the ratio is formed once
+- * afterward. This is anti-aliased decimation, not a blur of an aliased gain map.
+- * SDR remains the sole full-resolution spatial-detail authority.
++/* IRIS_26496_GUIDED_LOG_GAIN_DECIMATION
++ * 26495 blurred HDR and SDR independently before division. Across a strong edge,
++ * those two fields do not share the same tone relationship, so their quotient can
++ * create a broad gain halo. 26496 forms the physical multiplicative relationship
++ * FIRST at full resolution, converts it to log2 gain, then anti-aliases that gain
++ * field for 4:1 decimation. SDR luminance is only a guide that prevents large gain
++ * from bleeding across a strong object edge; the full-resolution SDR base is never
++ * filtered or changed.
+  */
+ const float UHDR_OFFSET = 0.015625;
+-const int FOOTPRINT = 4;
++const int DOWNSAMPLE = 4;
++const int FILTER_TAPS = 10;
++const int FILTER_START = -3; /* -3..+6 is centered on the 4x4 cell center at 1.5. */
++const float GUIDE_SIGMA_EV = 0.90;
++const float KERNEL[FILTER_TAPS] = float[FILTER_TAPS](
++        0.042229693589,
++        0.070339090351,
++        0.103129012812,
++        0.133097613729,
++        0.151204589518,
++        0.151204589518,
++        0.133097613729,
++        0.103129012812,
++        0.070339090351,
++        0.042229693589);
++
+ float luminance(vec3 c){return dot(c,vec3(0.2126,0.7152,0.0722));}
+ float srgbDecode(float x){
+     x=clamp(x,0.0,1.0);
+     return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);
+ }
+ vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));}
+-void footprintLuminance(ivec2 gainPixel, out float hdrMean, out float sdrMean) {
+-    ivec2 base = gainPixel * FOOTPRINT;
+-    float hdrSum = 0.0;
+-    float sdrSum = 0.0;
+-    for (int oy = 0; oy < FOOTPRINT; ++oy) {
+-        for (int ox = 0; ox < FOOTPRINT; ++ox) {
+-            ivec2 sp = clamp(base + ivec2(ox, oy), ivec2(0), sourceSize - ivec2(1));
+-            vec3 hdr = max(texelFetch(HdrBuffer, sp, 0).rgb, vec3(0.0)) * hdrExposureScale;
+-            vec3 sdr = srgbDecode(texelFetch(SdrBuffer, sp, 0).rgb);
+-            hdrSum += max(luminance(hdr), 0.0);
+-            sdrSum += max(luminance(sdr), 0.0);
+-        }
+-    }
+-    hdrMean = hdrSum / float(FOOTPRINT * FOOTPRINT);
+-    sdrMean = sdrSum / float(FOOTPRINT * FOOTPRINT);
++float sdrLumaAt(ivec2 p) {
++    p=clamp(p,ivec2(0),sourceSize-ivec2(1));
++    return max(luminance(srgbDecode(texelFetch(SdrBuffer,p,0).rgb)),0.0);
++}
++float hdrLumaAt(ivec2 p) {
++    p=clamp(p,ivec2(0),sourceSize-ivec2(1));
++    return max(luminance(max(texelFetch(HdrBuffer,p,0).rgb,vec3(0.0))*hdrExposureScale),0.0);
++}
++float centerGuideLuma(ivec2 base) {
++    return 0.25*(sdrLumaAt(base+ivec2(1,1))+sdrLumaAt(base+ivec2(2,1))
++            +sdrLumaAt(base+ivec2(1,2))+sdrLumaAt(base+ivec2(2,2)));
++}
++float guideWeight(float centerLuma,float sampleLuma) {
++    float ev=abs(log2((sampleLuma+UHDR_OFFSET)/(centerLuma+UHDR_OFFSET)));
++    float z=ev/GUIDE_SIGMA_EV;
++    return exp(-0.5*z*z);
+ }
+ void main(){
+-    ivec2 gp = ivec2(gl_FragCoord.xy);
+-    if (any(greaterThanEqual(gp, gainMapSize))) {
+-        Output = vec4(0.0,0.0,0.0,1.0);
++    ivec2 gp=ivec2(gl_FragCoord.xy);
++    if(any(greaterThanEqual(gp,gainMapSize))){
++        Output=vec4(0.0,0.0,0.0,1.0);
+         return;
+     }
+-    float hdrMean;
+-    float sdrMean;
+-    footprintLuminance(gp, hdrMean, sdrMean);
++    ivec2 base=gp*DOWNSAMPLE;
+     float maxLog=max(log2(max(maxGainRatio,1.001)),1.0e-6);
+-    float ratio=clamp((hdrMean+UHDR_OFFSET)/(sdrMean+UHDR_OFFSET),
+-            1.0,max(maxGainRatio,1.001));
+-    float encoded=clamp(log2(ratio)/maxLog,0.0,1.0);
++    float centerLuma=centerGuideLuma(base);
++    float sum=0.0;
++    float weightSum=0.0;
++    for(int ky=0;ky<FILTER_TAPS;++ky){
++        for(int kx=0;kx<FILTER_TAPS;++kx){
++            ivec2 sp=clamp(base+ivec2(FILTER_START+kx,FILTER_START+ky),
++                    ivec2(0),sourceSize-ivec2(1));
++            float spatial=KERNEL[kx]*KERNEL[ky];
++            float sdr=sdrLumaAt(sp);
++            float hdr=hdrLumaAt(sp);
++            float ratio=clamp((hdr+UHDR_OFFSET)/(sdr+UHDR_OFFSET),
++                    1.0,max(maxGainRatio,1.001));
++            float logGain=clamp(log2(ratio),0.0,maxLog);
++            float guide=guideWeight(centerLuma,sdr);
++            float w=spatial*guide;
++            sum+=w*logGain;
++            weightSum+=w;
++        }
++    }
++    float filteredLogGain=sum/max(weightSum,1.0e-12);
++    float encoded=clamp(filteredLogGain/maxLog,0.0,1.0);
+     Output=vec4(encoded,encoded,encoded,1.0);
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/rcd26496_chroma_complete.glsl b/app/src/main/assets/shaders/motionv2/rcd26496_chroma_complete.glsl
+new file mode 100644
+index 0000000..96e0d4d
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/rcd26496_chroma_complete.glsl
+@@ -0,0 +1,146 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++precision highp sampler2D;
++
++uniform highp sampler2D HighlightProvenance;
++layout(std430, binding = 1) buffer RedBuf { float red[]; };
++layout(std430, binding = 2) readonly buffer GreenBuf { float green[]; };
++layout(std430, binding = 3) buffer BlueBuf { float blue[]; };
++/* Reuse buffers whose 26494 directional jobs are complete. No new full-band buffers. */
++layout(std430, binding = 4) buffer AffectedBuf { float affected[]; };
++layout(std430, binding = 5) buffer RedSeedBuf { float redSeed[]; };
++layout(std430, binding = 6) buffer RedWeightBuf { float redWeight[]; };
++layout(std430, binding = 7) buffer BlueSeedBuf { float blueSeed[]; };
++layout(std430, binding = 8) buffer BlueWeightBuf { float blueWeight[]; };
++
++uniform ivec2 rawSize;
++uniform ivec2 bandSize;
++uniform int bandOriginY;
++uniform int cfaPattern;
++uniform int mode;
++
++const float PROVENANCE_CENSORED = 1.0;
++const int FILTER_RADIUS = 5;
++
++int idxAt(ivec2 p) {
++    p = clamp(p, ivec2(0), bandSize - ivec2(1));
++    return p.y * bandSize.x + p.x;
++}
++ivec2 globalAt(ivec2 p) { return ivec2(p.x, bandOriginY + p.y); }
++int phaseAtGlobal(ivec2 gp) { return (gp.x & 1) | ((gp.y & 1) << 1); }
++int colorAt(ivec2 p) {
++    int q = phaseAtGlobal(globalAt(p));
++    if (cfaPattern == 0) return q == 0 ? 0 : (q == 3 ? 2 : 1);
++    if (cfaPattern == 1) return q == 1 ? 0 : (q == 2 ? 2 : 1);
++    if (cfaPattern == 2) return q == 2 ? 0 : (q == 1 ? 2 : 1);
++    return q == 3 ? 0 : (q == 0 ? 2 : 1);
++}
++float phaseDivisor(int q) {
++    return q == 0 ? 1.0 : (q == 1 ? 3.0 : (q == 2 ? 9.0 : 27.0));
++}
++float provenanceAtGlobal(ivec2 gp) {
++    gp = clamp(gp, ivec2(0), rawSize - ivec2(1));
++    float code = texelFetch(HighlightProvenance, gp >> 1, 0).r;
++    float digit = floor(code / phaseDivisor(phaseAtGlobal(gp)));
++    return mod(digit, 3.0);
++}
++bool ownCensored(ivec2 p) {
++    return abs(provenanceAtGlobal(globalAt(p)) - PROVENANCE_CENSORED) < 0.25;
++}
++bool packedCodeHasCensored(float encoded) {
++    int code = clamp(int(floor(encoded + 0.5)), 0, 80);
++    for (int i = 0; i < 4; ++i) {
++        int state = code % 3;
++        if (state == 1) return true;
++        code /= 3;
++    }
++    return false;
++}
++bool nearbyCensored(ivec2 p) {
++    ivec2 packedSize = rawSize / 2;
++    ivec2 pc = globalAt(p) >> 1;
++    /* 3x3 packed neighborhood covers the physical support that can feed the
++     * original RCD color interpolation around a clipped Bayer site. */
++    for (int oy = -1; oy <= 1; ++oy) {
++        for (int ox = -1; ox <= 1; ++ox) {
++            ivec2 q = clamp(pc + ivec2(ox, oy), ivec2(0), packedSize - ivec2(1));
++            if (packedCodeHasCensored(texelFetch(HighlightProvenance, q, 0).r)) return true;
++        }
++    }
++    return false;
++}
++float g(ivec2 p) { return green[idxAt(p)]; }
++
++void seedPass(ivec2 p) {
++    int i = idxAt(p);
++    int c = colorAt(p);
++    bool trusted = !ownCensored(p);
++    redSeed[i] = (trusted && c == 0) ? red[i] - green[i] : 0.0;
++    redWeight[i] = (trusted && c == 0) ? 1.0 : 0.0;
++    blueSeed[i] = (trusted && c == 2) ? blue[i] - green[i] : 0.0;
++    blueWeight[i] = (trusted && c == 2) ? 1.0 : 0.0;
++    affected[i] = nearbyCensored(p) ? 1.0 : 0.0;
++}
++
++float spatialWeight(ivec2 d) {
++    float d2 = float(d.x * d.x + d.y * d.y);
++    return exp(-0.18 * d2);
++}
++float guideWeight(float centerGreen, float sampleGreen) {
++    float scale = max(max(abs(centerGreen), abs(sampleGreen)), 0.05);
++    float rel = abs(sampleGreen - centerGreen) / scale;
++    return exp(-10.0 * rel * rel);
++}
++float confidenceFromWeight(float w) {
++    return smoothstep(0.15, 0.75, w);
++}
++
++void completionPass(ivec2 p) {
++    int i = idxAt(p);
++    if (affected[i] < 0.5) return; /* Exact 26494 output outside censor influence. */
++
++    float gc = green[i];
++    float sumR = 0.0, sumRw = 0.0;
++    float sumB = 0.0, sumBw = 0.0;
++    for (int oy = -FILTER_RADIUS; oy <= FILTER_RADIUS; ++oy) {
++        for (int ox = -FILTER_RADIUS; ox <= FILTER_RADIUS; ++ox) {
++            ivec2 d = ivec2(ox, oy);
++            ivec2 q = clamp(p + d, ivec2(0), bandSize - ivec2(1));
++            int qi = idxAt(q);
++            float sw = spatialWeight(d) * guideWeight(gc, green[qi]);
++            float rw = sw * redWeight[qi];
++            float bw = sw * blueWeight[qi];
++            sumR += rw * redSeed[qi];
++            sumRw += rw;
++            sumB += bw * blueSeed[qi];
++            sumBw += bw;
++        }
++    }
++
++    float dr = sumRw > 1.0e-6 ? sumR / sumRw : 0.0;
++    float db = sumBw > 1.0e-6 ? sumB / sumBw : 0.0;
++    dr *= confidenceFromWeight(sumRw);
++    db *= confidenceFromWeight(sumBw);
++
++    int c = colorAt(p);
++    bool ownTrusted = !ownCensored(p);
++    /* A real NORMAL/SHORT_VALIDATED physical R or B observation is immutable.
++     * Only missing/interpolated opponent chroma is completed. When support is
++     * weak, the residual smoothly approaches neutral instead of snapping at a
++     * binary threshold. Green/luminance geometry remains the exact 26494 RCD result. */
++    if (!(ownTrusted && c == 0)) red[i] = max(0.0, gc + dr);
++    if (!(ownTrusted && c == 2)) blue[i] = max(0.0, gc + db);
++}
++
++/* IRIS_26496_RCD_MISSING_CHROMA_NORMALIZED_CONVOLUTION
++ * mode=0 seeds only physically measured NORMAL/SHORT_VALIDATED R-G/B-G and an
++ * affected mask. mode=1 completes missing opponent chroma around censored sites
++ * using the already-reconstructed green field as an edge guide. The original
++ * nine 26494 RCD directional passes run first and are byte-identical. */
++void main() {
++    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(p, bandSize))) return;
++    if (mode == 0) seedPass(p); else completionPass(p);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+index a392430..2aef559 100644
+--- a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
++++ b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+@@ -9,6 +9,9 @@ uniform highp sampler2D shortCfa;
+ uniform highp sampler2D flowTexture;
+ layout(rgba32f, binding = 0) uniform highp writeonly image2D outCfa;
+ layout(r32f, binding = 1) uniform highp writeonly image2D outProvenance;
++layout(std430, binding = 2) buffer ShortDiagBuf {
++    uint shortDiag[];
++};
+ uniform ivec2 packedSize;
+ uniform float referenceExposureScale;
+ uniform float shortToNormalScale;
+@@ -20,6 +23,57 @@ const float PROVENANCE_NORMAL = 0.0;
+ const float PROVENANCE_CENSORED = 1.0;
+ const float PROVENANCE_SHORT_VALIDATED = 2.0;
+ 
++/* IRIS_26496_SHORT_FAILURE_REASON_TELEMETRY
++ * Diagnostic-only counters. They are read after the existing single GPU ownership
++ * drain and never feed image math. Each failure reason is counted per physical
++ * clipped phase, with a small short-RAW value histogram so exposure depth can be
++ * chosen from evidence instead of guessing another EV.
++ */
++const uint D_TOTAL_CLIPPED = 0u;
++const uint D_SHORT_SAFE = 1u;
++const uint D_SHORT_CLIPPED = 2u;
++const uint D_FLOW_REJECT = 3u;
++const uint D_CORR_REJECT = 4u;
++const uint D_RADIOMETRY_REJECT = 5u;
++const uint D_VALIDATED = 6u;
++const uint D_STILL_CENSORED = 7u;
++const uint D_BIN_LT50 = 8u;
++const uint D_BIN_50_70 = 9u;
++const uint D_BIN_70_85 = 10u;
++const uint D_BIN_85_95 = 11u;
++const uint D_BIN_95_CLIP = 12u;
++const uint D_PHASE_TOTAL = 16u;
++const uint D_PHASE_VALIDATED = 20u;
++const uint D_PHASE_SHORT_CLIPPED = 24u;
++const uint D_PHASE_FLOW_REJECT = 28u;
++const uint D_PHASE_CORR_REJECT = 32u;
++const uint D_PHASE_RADIOMETRY_REJECT = 36u;
++const uint D_PHASE_STILL_CENSORED = 40u;
++
++void addMask(uint totalIndex, uint phaseBase, vec4 mask) {
++    for (int i = 0; i < 4; ++i) {
++        if (mask[i] > 0.5) {
++            atomicAdd(shortDiag[totalIndex], 1u);
++            atomicAdd(shortDiag[phaseBase + uint(i)], 1u);
++        }
++    }
++}
++void addTotalOnly(uint index, vec4 mask) {
++    for (int i = 0; i < 4; ++i) if (mask[i] > 0.5) atomicAdd(shortDiag[index], 1u);
++}
++void classifyShortSamples(vec4 shortCenter, vec4 clipMask) {
++    for (int i = 0; i < 4; ++i) {
++        if (clipMask[i] <= 0.5) continue;
++        float v = shortCenter[i];
++        if (v >= shortClipThreshold) continue;
++        if (v < 0.50) atomicAdd(shortDiag[D_BIN_LT50], 1u);
++        else if (v < 0.70) atomicAdd(shortDiag[D_BIN_50_70], 1u);
++        else if (v < 0.85) atomicAdd(shortDiag[D_BIN_70_85], 1u);
++        else if (v < 0.95) atomicAdd(shortDiag[D_BIN_85_95], 1u);
++        else atomicAdd(shortDiag[D_BIN_95_CLIP], 1u);
++    }
++}
++
+ float sum4(vec4 v) { return dot(v, vec4(1.0)); }
+ float encodePhaseStates(vec4 s) { return dot(s, vec4(1.0, 3.0, 9.0, 27.0)); }
+ 
+@@ -106,6 +160,7 @@ void main() {
+         storeState(p, normal, vec4(PROVENANCE_NORMAL));
+         return;
+     }
++    addMask(D_TOTAL_CLIPPED, D_PHASE_TOTAL, clipMask);
+ 
+     vec2 uv = (vec2(p) + vec2(0.5)) / vec2(packedSize);
+     vec4 flowState = texture(flowTexture, uv);
+@@ -116,13 +171,20 @@ void main() {
+     if (source.x < 0.0 || source.y < 0.0 ||
+             source.x >= float(packedSize.x) || source.y >= float(packedSize.y) ||
+             flowConfidence < minimumFlowConfidence) {
++        addMask(D_FLOW_REJECT, D_PHASE_FLOW_REJECT, clipMask);
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+ 
+     vec4 shortCenter = phaseSafeBilinear(source);
+     vec4 recoverMask = clipMask * shortSafe(shortCenter);
++    vec4 shortClippedMask = clipMask - recoverMask;
++    addTotalOnly(D_SHORT_SAFE, recoverMask);
++    addMask(D_SHORT_CLIPPED, D_PHASE_SHORT_CLIPPED, shortClippedMask);
++    classifyShortSamples(shortCenter, clipMask);
+     if (sum4(recoverMask) < 0.5) {
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+@@ -131,6 +193,8 @@ void main() {
+     float structure;
+     float supportCount;
+     if (!validateObservableCorrespondence(p, source, meanError, structure, supportCount)) {
++        addMask(D_CORR_REJECT, D_PHASE_CORR_REJECT, recoverMask);
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+@@ -144,6 +208,8 @@ void main() {
+         }
+     }
+     if (requiredScale > 1.25) {
++        addMask(D_RADIOMETRY_REJECT, D_PHASE_RADIOMETRY_REJECT, recoverMask);
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+     }
+@@ -158,5 +224,9 @@ void main() {
+             state[i] = PROVENANCE_SHORT_VALIDATED;
+         }
+     }
++    addMask(D_VALIDATED, D_PHASE_VALIDATED, recoverMask);
++    if (sum4(shortClippedMask) > 0.5) {
++        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, shortClippedMask);
++    }
+     storeState(p, recovered, state);
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index a2a1eee..bb9fb46 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1309,6 +1309,25 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private volatile float mMotion26380RawMeanSignal = Float.NaN;
+     private volatile int mMotion26380RawSampleCount = 0;
+ 
++    /* IRIS_26496_SPATIALLY_PERSISTENT_HIGHLIGHT_TRIGGER
++     * A global clipped-pixel percentage misses tiny but visually dominant LEDs,
++     * chandelier rims, flowers and window glints. Keep the per-frame sampler cheap,
++     * but dither its coarse lattice over a 3x3 sequence and remember recent coherent
++     * clipping. A single hot pixel cannot trigger the short RAW: either at least two
++     * sampled physical phases clip in the frame or one sampled 2x2 CFA quad contains
++     * two clipped phases. False-positive short capture is safe because the auxiliary
++     * never enters the normal Motion accumulator.
++     */
++    private volatile int mMotion26496RawHighlightSampleCount = 0;
++    private volatile int mMotion26496RawCoherentHighlightCells = 0;
++    private volatile int mMotion26496RawPeakQuadHighlightPhases = 0;
++    private volatile int mMotion26496RawDitherIndex = 0;
++    private volatile long mMotion26496RecentHighlightEvidenceTimestampNs = 0L;
++    private final java.util.concurrent.atomic.AtomicInteger mMotion26496SparseDitherCounter =
++            new java.util.concurrent.atomic.AtomicInteger(0);
++    private static final int MOTION_26496_MIN_HIGHLIGHT_SAMPLES = 2;
++    private static final long MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS = 400_000_000L;
++
+     /* IRIS_26382_CAPTURE_STATE_HANDOFF */
+     private volatile long mMotion26382LastOpportunityCeilingNs = 0L;
+     private volatile float mMotion26382LastRawNeed = 0.0f;
+@@ -1336,10 +1355,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * separate highlight-recovery observation, never a normal fusion frame.
+      * Exposure role is determined from ACTUAL Camera2 exposure*ISO metadata.
+      */
+-    private static final double MOTION_26480_SHORT_EXPOSURE_DIVISOR = 3.0;
+-    private static final float MOTION_26480_SHORT_PROTECTION_EV = 1.5849625f; // log2(3)
++    /* IRIS_26495_PHYSICAL_SHORT_HEADROOM_2P5EV
++     * One isolated auxiliary RAW is now 2.5 EV below the normal reference when
++     * hardware permits. This changes only the evidence acquisition depth; normal
++     * ZSL exposure, ISO, Wronski accumulation, display exposure, and tone remain
++     * untouched. 2^2.5 = sqrt(32) = 5.656854249492381.
++     */
++    private static final float MOTION_26480_SHORT_PROTECTION_EV = 2.5f;
++    private static final double MOTION_26480_SHORT_EXPOSURE_DIVISOR =
++            5.656854249492381;
+     private static final long MOTION_26480_SHORT_WAIT_MS = 300L;
+-    private static final double MOTION_26480_SHORT_TARGET_RATIO = 1.0 / 3.0;
++    private static final double MOTION_26480_SHORT_TARGET_RATIO =
++            1.0 / MOTION_26480_SHORT_EXPOSURE_DIVISOR;
+     private static final double MOTION_26480_SHORT_TOLERANCE_EV = 0.35;
+     private static final double MOTION_26480_SHORT_RATIO_MIN =
+             MOTION_26480_SHORT_TARGET_RATIO / Math.pow(2.0, MOTION_26480_SHORT_TOLERANCE_EV);
+@@ -1459,6 +1486,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26380RawSampleCount =
+                     (int) Math.min(Integer.MAX_VALUE, count);
+ 
++            /* Keep all 26380 AE/readiness statistics above byte-for-byte equivalent
++             * to 26494. The 26496 small-highlight detector is a separate read-only
++             * pass so it cannot perturb normal exposure authority. */
++            sampleMotion26496SpatialHighlightEvidence(
++                    image, buffer, rowStride, pixelStride, width, height,
++                    whiteLevel, blackPattern);
++
+         } catch (Throwable throwable) {
+             Log.w(
+                     TAG,
+@@ -1467,6 +1501,65 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
++
++    private void sampleMotion26496SpatialHighlightEvidence(
++            @NonNull Image image,
++            @NonNull java.nio.ByteBuffer buffer,
++            int rowStride,
++            int pixelStride,
++            int width,
++            int height,
++            int whiteLevel,
++            @NonNull android.hardware.camera2.params.BlackLevelPattern blackPattern) {
++        try {
++            int stepX = Math.max(4, width / 48);
++            int stepY = Math.max(4, height / 36);
++            int ditherIndex = Math.floorMod(
++                    mMotion26496SparseDitherCounter.getAndIncrement(), 9);
++            int ditherX = (ditherIndex % 3) * Math.max(1, stepX / 3);
++            int ditherY = (ditherIndex / 3) * Math.max(1, stepY / 3);
++            int highlightSamples = 0;
++            int coherentCells = 0;
++            int peakQuadPhases = 0;
++
++            for (int y = 2 + ditherY; y < height - 2; y += stepY) {
++                for (int x = 2 + ditherX; x < width - 2; x += stepX) {
++                    int quadPhases = 0;
++                    for (int dy = 0; dy < 2; ++dy) {
++                        for (int dx = 0; dx < 2; ++dx) {
++                            int sx = x + dx;
++                            int sy = y + dy;
++                            int index = sy * rowStride + sx * pixelStride;
++                            if (index < 0 || index + 1 >= buffer.limit()) continue;
++                            int raw = buffer.getShort(index) & 0xffff;
++                            int black = blackPattern.getOffsetForIndex(sx & 1, sy & 1);
++                            int span = Math.max(1, whiteLevel - black);
++                            float signal = motion26368Clamp01((raw - black) / (float) span);
++                            if (signal >= 0.980f) {
++                                highlightSamples++;
++                                quadPhases++;
++                            }
++                        }
++                    }
++                    peakQuadPhases = Math.max(peakQuadPhases, quadPhases);
++                    if (quadPhases >= 2) coherentCells++;
++                }
++            }
++
++            mMotion26496RawHighlightSampleCount = highlightSamples;
++            mMotion26496RawCoherentHighlightCells = coherentCells;
++            mMotion26496RawPeakQuadHighlightPhases = peakQuadPhases;
++            mMotion26496RawDitherIndex = ditherIndex;
++            if (highlightSamples >= MOTION_26496_MIN_HIGHLIGHT_SAMPLES
++                    || coherentCells > 0) {
++                mMotion26496RecentHighlightEvidenceTimestampNs = image.getTimestamp();
++            }
++        } catch (Throwable throwable) {
++            Log.w(TAG, "IRIS_26496 spatial highlight sampler skipped: "
++                    + throwable.getClass().getSimpleName());
++        }
++    }
++
+     /*
+      * IRIS_26381_DYNAMIC_MOTION_SHUTTER_OPPORTUNITY
+      * Public Camera2 only. Advisory to system AE; no direct shutter/ISO set.
+@@ -3059,8 +3152,35 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         Integer baseIso = mPreviewCaptureResult.get(CaptureResult.SENSOR_SENSITIVITY);
+         long rawAgeNs = previewTimestamp == null || mMotion26380RawSignalTimestampNs <= 0L
+                 ? Long.MAX_VALUE : Math.abs(previewTimestamp - mMotion26380RawSignalTimestampNs);
++        long highlightEvidenceAgeNs = previewTimestamp == null
++                || mMotion26496RecentHighlightEvidenceTimestampNs <= 0L
++                ? Long.MAX_VALUE
++                : Math.abs(previewTimestamp - mMotion26496RecentHighlightEvidenceTimestampNs);
++        boolean legacyFractionTrigger =
++                mMotion26380RawHighlightFraction >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER;
++        boolean currentSpatialTrigger =
++                mMotion26496RawHighlightSampleCount >= MOTION_26496_MIN_HIGHLIGHT_SAMPLES
++                        || mMotion26496RawCoherentHighlightCells > 0;
++        boolean recentSpatialTrigger =
++                highlightEvidenceAgeNs <= MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS;
++        boolean highlightTrigger = legacyFractionTrigger
++                || currentSpatialTrigger
++                || recentSpatialTrigger;
++        Log.i(TAG, "IRIS_26496_SHORT_TRIGGER_DECISION"
++                + " rawAgeMs=" + (rawAgeNs == Long.MAX_VALUE ? -1L : rawAgeNs / 1_000_000L)
++                + " evidenceAgeMs=" + (highlightEvidenceAgeNs == Long.MAX_VALUE
++                        ? -1L : highlightEvidenceAgeNs / 1_000_000L)
++                + " fraction=" + mMotion26380RawHighlightFraction
++                + " highlightSamples=" + mMotion26496RawHighlightSampleCount
++                + " coherentCells=" + mMotion26496RawCoherentHighlightCells
++                + " peakQuadPhases=" + mMotion26496RawPeakQuadHighlightPhases
++                + " ditherIndex=" + mMotion26496RawDitherIndex
++                + " legacyFractionTrigger=" + legacyFractionTrigger
++                + " currentSpatialTrigger=" + currentSpatialTrigger
++                + " recentSpatialTrigger=" + recentSpatialTrigger
++                + " requestShort=" + (rawAgeNs <= 180_000_000L && highlightTrigger));
+         if (rawAgeNs > 180_000_000L
+-                || mMotion26380RawHighlightFraction < MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER
++                || !highlightTrigger
+                 || baseExp == null || baseExp <= 0L || baseIso == null || baseIso <= 0) return false;
+ 
+         ticket.baselineEnergy = ExposureIndex.time2sec(baseExp) * baseIso;
+@@ -3094,6 +3214,30 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+             if (er != null) reqExp = Math.max(er.getLower(), Math.min(er.getUpper(), reqExp));
+             if (sr != null) reqIso = Math.max(sr.getLower(), Math.min(sr.getUpper(), reqIso));
++
++            /* IRIS_26495_CLAMP_AWARE_SHORT_RADIOMETRY
++             * Camera2 may clamp the requested 2.5 EV shutter to the physical
++             * exposure-time range. The request tag/ticket already owns the role;
++             * validate actual metadata around the exposure we could really request,
++             * not around an unreachable nominal ratio. Physical short clipping is
++             * still tested later per CFA phase before SHORT_VALIDATED is granted.
++             */
++            final double requestedEnergy = ExposureIndex.time2sec(reqExp) * reqIso;
++            if (!(requestedEnergy > 0.0) || !(requestedEnergy < ticket.baselineEnergy)) {
++                Log.w(TAG, "IRIS_26495_SHORT_REQUEST_NO_PHYSICAL_HEADROOM"
++                        + " baselineEnergy=" + ticket.baselineEnergy
++                        + " requestedEnergy=" + requestedEnergy
++                        + " requestedExposureNs=" + reqExp
++                        + " requestedIso=" + reqIso);
++                return false;
++            }
++            final double requestedRatio = requestedEnergy / ticket.baselineEnergy;
++            final double toleranceFactor = Math.pow(2.0, MOTION_26480_SHORT_TOLERANCE_EV);
++            final double requestedRatioMin = requestedRatio / toleranceFactor;
++            final double requestedRatioMax = Math.min(0.999999, requestedRatio * toleranceFactor);
++            final double requestedHeadroomEv = Math.log(ticket.baselineEnergy / requestedEnergy)
++                    / Math.log(2.0);
++
+             b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, reqExp);
+             b.set(CaptureRequest.SENSOR_SENSITIVITY, reqIso);
+@@ -3146,8 +3290,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     }
+                     double energy = ExposureIndex.time2sec(exp) * iso;
+                     double ratio = energy / ticket.baselineEnergy;
+-                    boolean accepted = ratio >= MOTION_26480_SHORT_RATIO_MIN
+-                            && ratio <= MOTION_26480_SHORT_RATIO_MAX
++                    double actualHeadroomEv = Math.log(ticket.baselineEnergy / energy)
++                            / Math.log(2.0);
++                    boolean accepted = ratio >= requestedRatioMin
++                            && ratio <= requestedRatioMax
+                             && energy < ticket.baselineEnergy;
+                     if (accepted) {
+                         ticket.resultTimestampNs = ts;
+@@ -3161,15 +3307,26 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                         || ticket.captureStartedTimestampNs == ts)
+                                 + " requestedExposureNs=" + requestedExp
+                                 + " requestedIso=" + requestedIso
++                                + " requestedRatio=" + requestedRatio
++                                + " requestedHeadroomEv=" + requestedHeadroomEv
++                                + " nominalTargetRatio=" + MOTION_26480_SHORT_TARGET_RATIO
++                                + " nominalProtectionEv=" + MOTION_26480_SHORT_PROTECTION_EV
+                                 + " actualExposureNs=" + exp + " actualIso=" + iso
+-                                + " ratio=" + ratio + " shutterGate=false");
++                                + " ratio=" + ratio
++                                + " actualHeadroomEv=" + actualHeadroomEv
++                                + " allowedAroundClampedRequest=" + requestedRatioMin + ".." + requestedRatioMax
++                                + " shutterGate=false");
+                         boolean iris26489StagedDelivered =
+                                 tryDeliverMotion26489StagedShortRaw(ticket, result);
+                         if (!iris26489StagedDelivered) scheduleMotion26486ShortDelivery(ticket);
+                     } else {
+                         ticket.closeStaged();
+                         clearMotion26490CaptureShortTicket(ticket, "actual_exposure_rejected");
+-                        Log.w(TAG, "IRIS_26486_SHORT_ACTUAL_REJECTED ratio=" + ratio);
++                        Log.w(TAG, "IRIS_26486_SHORT_ACTUAL_REJECTED ratio=" + ratio
++                                + " actualHeadroomEv=" + actualHeadroomEv
++                                + " requestedRatio=" + requestedRatio
++                                + " requestedHeadroomEv=" + requestedHeadroomEv
++                                + " allowedAroundClampedRequest=" + requestedRatioMin + ".." + requestedRatioMax);
+                     }
+                 }
+                 @Override public void onCaptureFailed(@NonNull CameraCaptureSession session,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
+index 2e76769..e969d28 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
+@@ -232,6 +232,33 @@ public final class MotionV2RcdDemosaic extends Node {
+                     glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
+                     dispatch(bandSize);
+ 
++                    /* IRIS_26496_RCD_CHROMA_COMPLETION_REUSE
++                     * The original nine-pass 26494 RCD directional geometry above is untouched.
++                     * After green_rb, vh/lpf/pdiff/qdiff/pq have completed their original jobs,
++                     * so reuse those five existing buffers for a two-dispatch missing-chroma
++                     * completion. Peak scratch remains exactly nine FLOAT32 band buffers.
++                     */
++                    glProg.setLayout(8, 8, 1);
++                    glProg.useAssetProgram("motionv2/rcd26496_chroma_complete", true);
++                    glProg.setTexture("HighlightProvenance",
++                            postPipeline.motionV2HighlightProvenanceTexture);
++                    glProg.setBufferCompute("RedBuf", red);
++                    glProg.setBufferCompute("GreenBuf", green);
++                    glProg.setBufferCompute("BlueBuf", blue);
++                    glProg.setBufferCompute("AffectedBuf", vh);
++                    glProg.setBufferCompute("RedSeedBuf", lpf);
++                    glProg.setBufferCompute("RedWeightBuf", pdiff);
++                    glProg.setBufferCompute("BlueSeedBuf", qdiff);
++                    glProg.setBufferCompute("BlueWeightBuf", pq);
++                    glProg.setVar("rawSize", raw);
++                    glProg.setVar("bandSize", bandSize);
++                    glProg.setVar("bandOriginY", bandTop);
++                    glProg.setVar("cfaPattern", (int) basePipeline.mParameters.cfaPattern);
++                    glProg.setVar("mode", 0);
++                    dispatch(bandSize);
++                    glProg.setVar("mode", 1);
++                    dispatch(bandSize);
++
+                     glProg.setLayout(8, 8, 1);
+                     glProg.useAssetProgram("motionv2/rcd26489_write", true);
+                     glProg.setBufferCompute("CfaBuf", cfa);
+@@ -259,8 +286,8 @@ public final class MotionV2RcdDemosaic extends Node {
+         }
+ 
+         Log.d(Name, "IRIS_26489_POSTMERGE_RCD_DOMAIN"
+-                + " implementation=bandedDirectionalRcd"
+-                + " passes=9"
++                + " implementation=bandedDirectionalRcdPlusProvenanceChromaCompletion"
++                + " passes=11"
+                 + " bands=" + bands
+                 + " haloRows=" + RCD_HALO_ROWS
+                 + " maxScratchMiB=" + (maxScratchBytes / (1024L * 1024L))
+@@ -268,6 +295,12 @@ public final class MotionV2RcdDemosaic extends Node {
+                 + " temporalRgbSynthesis=false"
+                 + " calculationWbRemovedAtOutput=true"
+                 + " explicitHighlightProvenance=true"
++                + " original26494DirectionalPassesByteIdentical=true"
++                + " censoredChromaCompletion=edgeGuidedNormalizedConvolution"
++                + " chromaSeeds=normalOrShortValidatedPhysicalSitesOnly"
++                + " weakSupportSmoothlyNeutral=true"
++                + " extraFullBandScratchBuffers=0"
++                + " reusedScratchBuffers=vh,lpf,pdiff,qdiff,pq"
+                 + " rcdReclassificationForbidden=true"
+                 + " neutralCensoredFallback=true"
+                 + " neutralFallbackUsesTimestampOwnedSensorGains=true"
+@@ -276,7 +309,7 @@ public final class MotionV2RcdDemosaic extends Node {
+         try {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26489_POSTMERGE_RCD_DOMAIN",
+-                    "implementation=bandedDirectionalRcd"
++                    "implementation=bandedDirectionalRcdPlusProvenanceChromaCompletion"
+                             + " bands=" + bands
+                             + " halo=" + RCD_HALO_ROWS
+                             + " maxScratchMiB=" + (maxScratchBytes / (1024L * 1024L))
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index c19f6d2..b98adad 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -175,7 +175,11 @@ public final class MotionV2Render extends Node {
+                         + " quotientOffset=0.015625"
+                         + " standardLogGainEncoding=true"
+                         + " broadRenditionNotEdgeTexture=true"
+-                        + " matchedSourceFootprint=4x4"
++                        + " fullResolutionLogGainFirst=true"
++                        + " preDecimationFilterDomain=logGain"
++                        + " sdrGuidedEdgeStopSigmaEv=0.90"
++                        + " positiveGaussianSpatialKernel=10x10"
++                        + " independentHdrSdrPrefilter=false"
+                         + " pointDecimation=false"
+                         + " postAliasSpikeRepair=false"
+                         + " midtoneGainUnity=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index 1903ed3..f41dffc 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -1459,6 +1459,11 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             /* IRIS_26480_BJZHOU_RCD_BENTO_SHORT_RECOVERY_V2 */
+             GLTexture iris26480ReadbackOutput=imageOutput,iris26480ShortRaw=null,iris26480ShortCfa=null;
+             GLTexture iris26480ShortWbCfa=null,iris26480Recovered=null;MotionV2Alignment.Result iris26480ShortAlignment=null;
++            /* IRIS_26496_SHORT_FAILURE_DIAGNOSTIC_OWNER
++             * Tiny 64-uint SSBO only; no full-frame diagnostic carrier. It is read after the
++             * existing one-and-only final GPU drain and cannot affect reconstruction math.
++             */
++            GLBuffer iris26496ShortDiag = null;
+             /* IRIS_26488_V3_DIAGNOSTIC_SCOPE_OWNER
+              * The coarse diagnostic resources must survive the short-recovery try/finally because
+              * their readback occurs after that block. Keep ownership in the enclosing reconstruction
+@@ -1506,6 +1511,9 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     iris26480Recovered=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     iris26492RecoveredProvenance=new GLTexture(
+                             rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    iris26496ShortDiag = new GLBuffer(
++                            64, new GLFormat(GLFormat.DataType.UNSIGNED_32));
++                    iris26496ShortDiag.uploadBuffer(new int[64], 64);
+                     glProg.setLayout(tile,tile,1);
+                     glProg.useAssetProgram("motionv2/short_highlight_bayer_recover",true);
+                     glProg.setVar("packedSize",rawHalf);
+@@ -1523,6 +1531,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     glProg.setTexture("flowTexture",iris26480ShortAlignment.flowTexture);
+                     glProg.setTextureCompute("outCfa",iris26480Recovered,true);
+                     glProg.setTextureCompute("outProvenance",iris26492RecoveredProvenance,true);
++                    glProg.setBufferCompute("ShortDiagBuf", iris26496ShortDiag);
+                     glProg.computeAutoDeferred(rawHalf,1);
+                     iris26480ReadbackOutput=iris26480Recovered;
+                     iris26492ReadbackProvenance=iris26492RecoveredProvenance;
+@@ -1581,6 +1590,69 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     iris26488ReleaseReadbackFramebuffer(iris26480ReadbackOutput);
+                 }
+                 iris26487OutputReadbackMs = (System.nanoTime()-iris26487ReadbackStartNs)/1000000L;
++                if (iris26496ShortDiag != null) {
++                    try {
++                        int[] d = iris26496ShortDiag.readBufferIntegers(false);
++                        if (d != null && d.length >= 44) {
++                            long total = Integer.toUnsignedLong(d[0]);
++                            long safe = Integer.toUnsignedLong(d[1]);
++                            long shortClipped = Integer.toUnsignedLong(d[2]);
++                            long flowRejected = Integer.toUnsignedLong(d[3]);
++                            long correspondenceRejected = Integer.toUnsignedLong(d[4]);
++                            long radiometryRejected = Integer.toUnsignedLong(d[5]);
++                            long validated = Integer.toUnsignedLong(d[6]);
++                            long stillCensored = Integer.toUnsignedLong(d[7]);
++                            float coverage = total > 0L ? validated / (float) total : 0.0f;
++                            Log.d(TAG, "IRIS_26496_SHORT_FAILURE_REASONS"
++                                    + " totalNormalClipped=" + total
++                                    + " shortSafeCandidate=" + safe
++                                    + " shortPhysicallyClipped=" + shortClipped
++                                    + " flowRejected=" + flowRejected
++                                    + " correspondenceRejected=" + correspondenceRejected
++                                    + " radiometryRejected=" + radiometryRejected
++                                    + " shortValidated=" + validated
++                                    + " stillCensored=" + stillCensored
++                                    + " recoveryCoverage=" + coverage
++                                    + " shortValueBinsLt50_50to70_70to85_85to95_95toClip="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 8, 13))
++                                    + " clippedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 16, 20))
++                                    + " validatedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 20, 24))
++                                    + " shortClippedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 24, 28))
++                                    + " flowRejectedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 28, 32))
++                                    + " correspondenceRejectedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 32, 36))
++                                    + " radiometryRejectedByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 36, 40))
++                                    + " stillCensoredByPhase="
++                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 40, 44))
++                                    + " imageMathUnchangedByTelemetry=true"
++                                    + " oneGpuDrain=true");
++                            if (total != validated + stillCensored) {
++                                Log.w(TAG, "IRIS_26496_SHORT_DIAGNOSTIC_ACCOUNTING_MISMATCH"
++                                        + " total=" + total
++                                        + " validatedPlusStill=" + (validated + stillCensored));
++                            }
++                            try {
++                                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                                        "IRIS_26496_SHORT_FAILURE_REASONS",
++                                        "total=" + total
++                                                + " shortClipped=" + shortClipped
++                                                + " flowRejected=" + flowRejected
++                                                + " corrRejected=" + correspondenceRejected
++                                                + " radiometryRejected=" + radiometryRejected
++                                                + " validated=" + validated
++                                                + " stillCensored=" + stillCensored
++                                                + " coverage=" + coverage);
++                            } catch (Throwable ignored) {}
++                        }
++                    } catch (Throwable shortDiagError) {
++                        Log.w(TAG, "IRIS_26496_SHORT_DIAGNOSTIC_READBACK_SKIPPED", shortDiagError);
++                    }
++                }
+                 if (directBayer && iris26492ReadbackProvenance != null) {
+                     try {
+                         iris26492ReadbackProvenance.BufferLoad();
+@@ -1658,6 +1730,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 if(iris26480ShortAlignment!=null)iris26480ShortAlignment.close();if(iris26480ShortWbCfa!=null)iris26480ShortWbCfa.close();
+                 if(iris26480ShortCfa!=null)iris26480ShortCfa.close();if(iris26480ShortRaw!=null)iris26480ShortRaw.close();
+                 if(iris26480Recovered!=null)iris26480Recovered.close();
++                if(iris26496ShortDiag!=null)iris26496ShortDiag.close();
+                 if(iris26492RecoveredProvenance!=null)iris26492RecoveredProvenance.close();
+                 if(iris26492BaseProvenance!=null)iris26492BaseProvenance.close();
+             }
