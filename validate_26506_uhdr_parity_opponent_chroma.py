@@ -66,6 +66,16 @@ def long_semantic_weight(weights):
     return min(weights)
 
 
+def active_java_text(src: str) -> str:
+    # Architecture gates must inspect executable Java, not inherited comments or
+    # telemetry strings that merely name removed historical implementations.
+    src=re.sub(r'/\*.*?\*/',' ',src,flags=re.S)
+    src=re.sub(r'//[^\n]*',' ',src)
+    src=re.sub(r'"(?:\\.|[^"\\])*"','""',src)
+    src=re.sub(r"'(?:\\.|[^'\\])*'","''",src)
+    return src
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('candidate',type=Path)
@@ -238,8 +248,13 @@ def main():
     assert abs(math.log(nominal_body_ratio,2)-0.32192809488736235) < 1e-9
 
     # No known architecture regressions.
+    # IRIS_26506_V2_ACTIVE_ARCHITECTURE_GATE: scan executable Java after removing
+    # comments/string literals so historical text cannot cause a false positive.
     all_changed='\n'.join(text(x) for x in EXPECTED if (c/x).is_file())
-    assert 'PyramidAlignment' not in all_changed
+    for rel in sorted(x for x in EXPECTED if x.endswith('.java')):
+        executable=active_java_text(text(rel))
+        assert re.search(r'\bPyramidAlignment\b',executable) is None, (
+            f'active PyramidAlignment reference found in {rel}')
     assert 'ADRC fallback' not in all_changed
     assert 'single-frame whole-photo fallback' not in all_changed
     assert 'ParseExif' not in (c/'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java').read_text()
