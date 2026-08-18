@@ -45,8 +45,20 @@ public class Parameters {
     public int whiteLevel = 1023;
     public static int mergeWhiteLevel = 65535;
 
-    /* IRIS_26394_MOTION_CANONICAL_RAW_EXPOSURE */
+    /* IRIS_26490_MOTION_SENSOR_DOMAIN_SENTINEL
+     * Active Motion V2 reconstruction is always black-subtracted / white-normalized sensor
+     * radiance. This legacy field is deliberately pinned to unity so an old sensor-domain
+     * consumer cannot accidentally inherit scene/display normalization again.
+     */
     public float motionCanonicalExposureGain = 1.0f;
+    /* IRIS_26490_MOTION_DISPLAY_GAIN_AUTHORITY
+     * Scene brightness normalization applied only after temporal Bayer fusion + RCD.
+     */
+    public float motionV2DisplayGain = 1.0f;
+    /* IRIS_26490_SHORT_RECOVERY_EXECUTED_STATE_OWNER
+     * Diagnostic lifecycle state only. It must never alter per-pixel RCD mathematics.
+     */
+    public boolean motionV2ShortHighlightRecoveryExecuted = false;
     /* IRIS_26409_MOTION_V2_STATE */
     public boolean motionV2Active = false;
     public float motionV2EffectiveSupport = 1.0f;
@@ -73,6 +85,16 @@ public class Parameters {
             0f,0f,1f
     };
     public boolean motionV2DirectColorValid = false;
+
+    /*
+     * IRIS_26477_STRICT_WRONSKI_SENSOR_AUTHORITY
+     * Non-tunable Motion-only sensor contract populated directly from
+     * timestamp-owned Camera2 metadata after generic Photon tunable injection.
+     */
+    public boolean motionV2StrictWronskiSensorValid = false;
+    public float motionV2WronskiNoiseS = Float.NaN;
+    public float motionV2WronskiNoiseO = Float.NaN;
+
     public float tonemapStrength = 1.4f;
     public float[] customTonemap;
     public Point[] hotPixels;

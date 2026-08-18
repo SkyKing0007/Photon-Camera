@@ -29,6 +29,11 @@ public class PostPipeline extends GLBasePipeline {
 
     /* IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF */
     public ByteBuffer motionV2FloatCfa;
+    /* IRIS_26501_FULL_RES_CAMERA_RGB_BRIDGE */
+    public boolean motionV2DirectRgbCarrier = false;
+    /* IRIS_26492_EXPLICIT_HIGHLIGHT_PROVENANCE_BRIDGE */
+    public ByteBuffer motionV2HighlightProvenance;
+    public GLTexture motionV2HighlightProvenanceTexture;
 
     /* IRIS_26432_TRUE_V2_GAINMAP_HANDOFF */
     public Bitmap motionV2GainMapBitmap;
@@ -91,12 +96,25 @@ public class PostPipeline extends GLBasePipeline {
      */
     public Bitmap RunMotionV2FloatCfa(
             ByteBuffer reconstructedCfa,
+            ByteBuffer highlightProvenance,
             Parameters parameters) {
         if (reconstructedCfa == null) {
             throw new IllegalArgumentException(
                     "Motion V2 reconstructed CFA buffer is null");
         }
         motionV2FloatCfa = reconstructedCfa;
+        /* IRIS_26501_EXPLICIT_RGB_CARRIER_CONTRACT
+         * Standard Bayer reconstruction publishes full-resolution camera-linear RGB.
+         * Do not infer carrier semantics from whether a diagnostic provenance buffer happened
+         * to be returned; provenance was already consumed inside the reconstruction owner.
+         */
+        motionV2DirectRgbCarrier = parameters != null
+                && parameters.cfaPattern >= 0 && parameters.cfaPattern <= 3;
+        motionV2HighlightProvenance = motionV2DirectRgbCarrier ? null : highlightProvenance;
+        Log.d("PostPipeline", "IRIS_26501_RGB_BRIDGE_CONTRACT directRgbCarrier="
+                + motionV2DirectRgbCarrier
+                + " carrierAuthority=explicitStandardBayerReconstruction"
+                + " provenanceConsumedUpstream=" + motionV2DirectRgbCarrier);
         return Run(null, parameters);
     }
 
@@ -104,39 +122,36 @@ public class PostPipeline extends GLBasePipeline {
         mParameters = parameters;
         mSettings = PhotonCamera.getSettings();
         workSize = new Point(mParameters.rawSize.x, mParameters.rawSize.y);
-        NoiseModeler modeler = mParameters.noiseModeler;
-        noiseS = modeler.computeModel[0].first.floatValue() +
-                modeler.computeModel[1].first.floatValue() +
-                modeler.computeModel[2].first.floatValue();
-        noiseO = modeler.computeModel[0].second.floatValue() +
-                modeler.computeModel[1].second.floatValue() +
-                modeler.computeModel[2].second.floatValue();
-        noiseS /= 3.f;
-        noiseO /= 3.f;
-        double noisempy = Math.pow(2.0, mSettings.noiseRstr + constShift);
-        Log.d("PostPipeline", "noisempy:" + noisempy);
-        noiseS *= noisempy;
-        noiseO *= noisempy;
-
-        /* IRIS_26394_MOTION_CANONICAL_NOISE_DOMAIN
-         * y=g*x, Var(x)=S*x+O -> S'=g*S, O'=g^2*O.
-         */
-        float iris26394CanonicalGain =
-                Math.max(1.0f, mParameters.motionCanonicalExposureGain);
-        if (iris26394CanonicalGain > 1.0f) {
-            noiseS *= iris26394CanonicalGain;
-            noiseO *= iris26394CanonicalGain * iris26394CanonicalGain;
+        if (mParameters.motionV2Active) {
+            /*
+             * IRIS_26477_NO_PHOTON_POST_NOISE_STATE
+             * Active Motion V2 nodes do not consume generic Photon noise state.
+             */
+            noiseS = 0.0f;
+            noiseO = 0.0f;
+            Log.d("PostPipeline",
+                    "IRIS_26477_NO_PHOTON_POST_NOISE_STATE"
+                            + " noiseModeler=false"
+                            + " noiseRstr=false"
+                            + " esd=false"
+                            + " residualSpatialDenoise=false");
+        } else {
+            NoiseModeler modeler = mParameters.noiseModeler;
+            noiseS = modeler.computeModel[0].first.floatValue() +
+                    modeler.computeModel[1].first.floatValue() +
+                    modeler.computeModel[2].first.floatValue();
+            noiseO = modeler.computeModel[0].second.floatValue() +
+                    modeler.computeModel[1].second.floatValue() +
+                    modeler.computeModel[2].second.floatValue();
+            noiseS /= 3.f;
+            noiseO /= 3.f;
+            double noisempy = Math.pow(2.0, mSettings.noiseRstr + constShift);
+            Log.d("PostPipeline", "noisempy:" + noisempy);
+            noiseS *= noisempy;
+            noiseO *= noisempy;
+            noiseO = Math.max(noiseO, 1.0f/4096.0f);
+            noiseS = Math.max(noiseS, Float.MIN_NORMAL);
         }
-        Log.d("PostPipeline",
-                "IRIS_26394_CANONICAL_NOISE gain=" + iris26394CanonicalGain
-                        + " noiseS=" + noiseS + " noiseO=" + noiseO);
-        Log.d("PostPipeline", "NoiseS:" + noiseS + "\n" + "NoiseO:" + noiseO);
-        /*if (!PhotonCamera.getSettings().hdrxNR) {
-            noiseO = 0.f;
-            noiseS = 0.f;
-        }*/
-        noiseO = Math.max(noiseO, 1.0f/4096.0f);
-        noiseS = Math.max(noiseS, Float.MIN_NORMAL);
         Point rawSliced = parameters.rawSize;
         cropSize = new Point(parameters.rawSize);
         if (PhotonCamera.getSettings().aspect169) {
@@ -259,18 +274,20 @@ public class PostPipeline extends GLBasePipeline {
              */
             boolean directBayer =
                     mParameters.cfaPattern >= 0 && mParameters.cfaPattern <= 3;
-            /*
-             * IRIS_26451_REFERENCE_SAFE_DEMOSAIC_ISOLATION
-             * Standard Bayer is packed CFA in this controlled build.
+            /* IRIS_26501_REFERENCE_SAFE_RGB_ISOLATION
+             * Standard Bayer Motion is already full-resolution camera-linear RGB.
+             * Only non-standard CFA formats retain the historical packed-CFA fallback.
              */
-            boolean directRgbCarrier = directBayer;
+            /* IRIS_26501_PROPER_PER_FRAME_RGB_POST_GRAPH
+             * Standard Bayer arrives as native full-resolution camera-linear RGB.
+             * No Bayer/RCD/demosaic stage may reinterpret that semantic carrier.
+             */
+            boolean directRgbCarrier = directBayer && motionV2DirectRgbCarrier;
             if (directRgbCarrier) {
-                /*
-                 * IRIS_26424_DIRECT_MULTIFRAME_RGB_POST_GRAPH
-                 * Standard Bayer image formation already produced full-
-                 * resolution linear camera RGB. No separate demosaic runs.
-                 */
-                add(new StageTelemetry("V2_POST_DIRECT_MULTIFRAME_RGB"));
+                add(new StageTelemetry("V2_POST_PROPER_PER_FRAME_RGB"));
+            } else if (directBayer) {
+                throw new IllegalStateException(
+                        "26501 standard Bayer Motion reached post graph without direct RGB carrier");
             } else {
                 add(new StageTelemetry("V2_POST_FLOAT_CFA_INPUT_FALLBACK"));
                 switch (mSettings.cfaPattern) {
@@ -300,17 +317,30 @@ public class PostPipeline extends GLBasePipeline {
                 add(new StageTelemetry(
                         "V2_POST_REFERENCE_SAFE_DEMOSAIC_ISOLATION"));
             }
+            /*
+             * IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY
+             * Wronski is complete before scene/display exposure is applied.
+             */
+            add(new MotionV2DisplayExposure());
+            add(new StageTelemetry("V2_POST_DISPLAY_EXPOSURE_AFTER_WRONSKI"));
             add(new MotionV2ColorTransform());
-            add(new MotionV2Denoise());
+            add(new StageTelemetry("V2_POST_CAMERA2_COLOR_TRANSFORM"));
 
-            add(new StageTelemetry("V2_POST_LUMA_CHROMA_RECONSTRUCTION"));
+            /*
+             * IRIS_26477_WRONSKI_PRIMARY_DENOISE_ONLY
+             * Pure comparison build: no residual spatial denoise after Wronski.
+             */
             add(new MotionV2Render());
             add(new StageTelemetry("V2_POST_RENDER"));
             add(new RotateWatermark(getRotation()));
             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
                     "IRIS_26410_MOTION_V2_POST_GRAPH",
-                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,TrueLocalSupportDenoise,MotionV2ColorTransform,MotionV2Denoise,MotionV2Render,RotateWatermark"
-                            + " directMultiframeRgb=" + directBayer
+                    "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2DisplayExposure,MotionV2ColorTransform,MotionV2Render,RotateWatermark"
+                            + " directMultiframeRgb=" + directRgbCarrier
+                            + " strictWronskiAuthority26477=true"
+                            + " displayExposureAfterWronski=true"
+                            + " residualSpatialDenoise=false"
+                            + " photonNoiseState=false"
                             + " exposureFusion=false esd=false ablc=false"
                             + " initial=false autoExposure=false"
                             + " captureSharpening=false correctingFlow=false sharpen2=false");

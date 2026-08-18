@@ -17,13 +17,14 @@ import static android.opengl.GLES20.GL_LINEAR;
 /**
  * IRIS_26435_EXACT_26430_BASE_LOW_FREQUENCY_TRUE_GAINMAP
  *
- * The complete 26430 SDR color/highlight/tone path is restored separately.
- * This renderer adds only one 0.80 linear post-tone scale (~-0.322 EV).
- * Ultra HDR uses that same scale, so it cannot become a second exposure lift.
+ * IRIS_26498_FULL_RESOLUTION_UHDR_PRIMARY_DETAIL_AUTHORITY
+ * The complete 26430 SDR color/highlight/tone path remains unchanged. Ultra HDR
+ * now carries a one-to-one gain sample for every primary pixel, eliminating the
+ * quarter-resolution interpolation that measurably softened the UHDR rendition.
  */
 public final class MotionV2Render extends Node {
     private static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
-    private static final int GAINMAP_DOWNSAMPLE = 4;
+    private static final int GAINMAP_DOWNSAMPLE = 1;
 
     public MotionV2Render() { super("", "MotionV2Render"); }
     @Override public void Compile() {}
@@ -36,10 +37,10 @@ public final class MotionV2Render extends Node {
 
         final GLTexture extendedLinearHdr = previousNode.WorkingTexture;
 
-        float canonicalSensorWhite = Math.max(
-                1.0f, basePipeline.mParameters.motionCanonicalExposureGain);
+        float postDisplaySensorWhite = Math.max(
+                1.0f, basePipeline.mParameters.motionV2DisplayGain);
         float sceneWhite = Math.max(
-                1.0f, Math.min(6.0f, 0.90f * canonicalSensorWhite));
+                1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));
                 glProg.useAssetProgram("motionv2/render");
         glProg.setTexture("InputBuffer", extendedLinearHdr);
         glProg.setVar("sceneWhite", sceneWhite);
@@ -53,20 +54,19 @@ public final class MotionV2Render extends Node {
         pipeline.motionV2GainMapMaxRatio = 1.0f;
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            Point raw = basePipeline.mParameters.rawSize;
-            Point gainSize = new Point(
-                    Math.max(1, raw.x / GAINMAP_DOWNSAMPLE),
-                    Math.max(1, raw.y / GAINMAP_DOWNSAMPLE));
+            /* IRIS_26470_UHDR_RENDER_GEOMETRY_AUTHORITY */
+            Point renderedSdrSize = new Point(WorkingTexture.mSize);
+            Point gainSize = new Point(renderedSdrSize);
 
             float maxGainRatio = Math.max(
                     2.0f,
-                    Math.min(2.5f, OUTPUT_EXPOSURE_SCALE * canonicalSensorWhite));
+                    Math.min(2.5f, OUTPUT_EXPOSURE_SCALE * postDisplaySensorWhite));
 
             GLTexture gainTexture = null;
             try {
                 gainTexture = new GLTexture(
                         gainSize,
-                        new GLFormat(GLFormat.DataType.SIMPLE_8, 4),
+                        new GLFormat(GLFormat.DataType.SIMPLE_8, 1),
                         null,
                         GL_LINEAR,
                         GL_CLAMP_TO_EDGE);
@@ -81,7 +81,7 @@ public final class MotionV2Render extends Node {
 
                 gainTexture.BufferLoad();
                 GLFormat readFormat =
-                        new GLFormat(GLFormat.DataType.SIMPLE_8, 4);
+                        new GLFormat(GLFormat.DataType.SIMPLE_8, 1);
                 ByteBuffer rgba =
                         gainTexture.textureBuffer(readFormat, true);
                 rgba.position(0);
@@ -91,7 +91,7 @@ public final class MotionV2Render extends Node {
                 int nonUnity = 0;
                 int peakCode = 0;
                 for (int i = 0; i < pixels; i++) {
-                    int code = rgba.get(i * 4) & 0xff;
+                    int code = rgba.get(i) & 0xff;
                     if (code > 0) nonUnity++;
                     peakCode = Math.max(peakCode, code);
                     alpha.put((byte)code);
@@ -114,7 +114,7 @@ public final class MotionV2Render extends Node {
                     for (int gx = 0; gx < gridW; gx++) {
                         int sx = Math.min(gainSize.x - 1,
                                 (int)(((gx + 0.5f) * gainSize.x) / gridW));
-                        int code = rgba.get((sy * gainSize.x + sx) * 4) & 0xff;
+                        int code = rgba.get(sy * gainSize.x + sx) & 0xff;
                         if (code < 16) grid.append('0');
                         grid.append(Integer.toHexString(code));
                     }
@@ -124,15 +124,15 @@ public final class MotionV2Render extends Node {
                 long roughCount = 0L;
                 for (int y = 0; y < gainSize.y; y++) {
                     for (int x = 0; x < gainSize.x; x++) {
-                        int idx = (y * gainSize.x + x) * 4;
+                        int idx = y * gainSize.x + x;
                         int c = rgba.get(idx) & 0xff;
                         if (x + 1 < gainSize.x) {
-                            int r = rgba.get(idx + 4) & 0xff;
+                            int r = rgba.get(idx + 1) & 0xff;
                             roughSum += Math.abs(c - r);
                             roughCount++;
                         }
                         if (y + 1 < gainSize.y) {
-                            int d = rgba.get(idx + gainSize.x * 4) & 0xff;
+                            int d = rgba.get(idx + gainSize.x) & 0xff;
                             roughSum += Math.abs(c - d);
                             roughCount++;
                         }
@@ -151,6 +151,11 @@ public final class MotionV2Render extends Node {
                 pipeline.motionV2GainMapBitmap = gainMap;
                 pipeline.motionV2GainMapMaxRatio = maxGainRatio;
 
+                Log.d(Name, "IRIS_26470_UHDR_GAINMAP_GEOMETRY"
+                        + " renderedSdr=" + renderedSdrSize.x + "x" + renderedSdrSize.y
+                        + " gainMap=" + gainSize.x + "x" + gainSize.y
+                        + " downsample=" + GAINMAP_DOWNSAMPLE
+                        + " authority=actualRenderedSdrTexture");
                 Log.d(Name, "IRIS_26436_V2_GAINMAP"
                         + " size=" + gainSize.x + "x" + gainSize.y
                         + " maxRatio=" + maxGainRatio
@@ -161,13 +166,16 @@ public final class MotionV2Render extends Node {
                         + " provenance=actualGainMapBeforeJpegAttach"
                         + " grid12x8=" + grid
                         + " source=extendedLinearPreTone"
-                        + " lowFrequencyMap=true"
+                        + " fullResolutionGainMap=true"
                         + " downsample=" + GAINMAP_DOWNSAMPLE
-                        + " widthFraction=0.25"
-                        + " heightFraction=0.25"
+                        + " widthFraction=1.0"
+                        + " heightFraction=1.0"
                         + " quotientOffset=0.015625"
                         + " standardLogGainEncoding=true"
-                        + " broadRenditionNotEdgeTexture=true"
+                        + " gainMapResamplingRequired=false"
+                        + " primarySpatialDetailAuthority=true"
+                        + " pointDecimation=false"
+                        + " postAliasSpikeRepair=false"
                         + " midtoneGainUnity=true"
                         + " sdrAndHdrExposureScale=" + OUTPUT_EXPOSURE_SCALE);
             } finally {
@@ -181,7 +189,7 @@ public final class MotionV2Render extends Node {
 
         Log.d(Name, "IRIS_26436_V2_RENDER"
                 + " canonicalSignalAlreadyApplied=true"
-                + " canonicalSensorWhite=" + canonicalSensorWhite
+                + " postDisplaySensorWhite=" + postDisplaySensorWhite
                 + " sceneWhite=" + sceneWhite
                                 + " toneCurve26430ExactBase=true"
                 + " outputExposureScale=" + OUTPUT_EXPOSURE_SCALE

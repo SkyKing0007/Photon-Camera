@@ -62,13 +62,19 @@ void main(){
     float l1=max(0.5*(tr+disc),0.0);
     float l2=max(0.5*(tr-disc),0.0);
 
+    /* IRIS_26469_STABLE_SYMMETRIC_TENSOR_EIGENVECTOR
+     * Two algebraically equivalent lambda1 eigenvectors are evaluated and the
+     * better-conditioned one is selected. This removes the diagonal-edge
+     * cancellation of (M-lambda2*I)*[1,1] without changing Wronski eigenvalues
+     * or the published kernel-selection law.
+     */
+    vec2 va=vec2(jxy,l1-jxx);
+    vec2 vb=vec2(l1-jyy,jxy);
+    float na=dot(va,va);
+    float nb=dot(vb,vb);
     vec2 e1;
-    if(abs(jxy)<1e-12 && abs(jxx-jyy)<1e-12) e1=vec2(1.0,0.0);
-    else {
-        e1=vec2(jxx+jxy-l2,jxy+jyy-l2);
-        if(dot(e1,e1)<1e-16) e1=jxx>=jyy?vec2(1,0):vec2(0,1);
-        else e1=normalize(e1);
-    }
+    if(max(na,nb)>1e-20) e1=normalize(na>=nb?va:vb);
+    else e1=jxx>=jyy?vec2(1.0,0.0):vec2(0.0,1.0);
     vec2 e2=vec2(-e1.y,e1.x);
 
     float A=1.0+sqrt(max((l1-l2)/max(l1+l2,1e-20),0.0));

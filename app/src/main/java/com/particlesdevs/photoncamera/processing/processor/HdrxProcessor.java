@@ -33,9 +33,18 @@ import java.util.Comparator;
 import java.util.HashMap;
 
 public class HdrxProcessor extends ProcessorBase {
+    /* IRIS_26480_DEFERRED_DNG_OUTPUT_V2 */
+    private static final java.util.concurrent.ExecutorService MOTION_26480_OUTPUT_EXECUTOR =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread out = new Thread(r, "MotionDeferredOutput"); out.setDaemon(true); return out;
+            });
     private static final String TAG = "HdrxProcessor";
     private ArrayList<ImageFrame> mImageFramesToProcess;
     private HashMap<Long, Double> exposures;
+    private java.util.List<com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair>
+            mMotion26486ExposurePairs;
+    private com.particlesdevs.photoncamera.processing.MotionBatch.ShortHighlightSlot
+            mMotion26486ShortSlot;
     private int imageFormat;
     /* config */
     private int alignAlgorithm;
@@ -81,7 +90,40 @@ public class HdrxProcessor extends ProcessorBase {
         Run();
     }
 
+    /* IRIS_26486_HDRX_MOTIONBATCH_ENTRY */
+    public void startMotion(Path dngFile, Path imageFile,
+                      ParseExif.ExifData exifData,
+                      ArrayList<GyroBurst> BurstShakiness,
+                      ArrayList<ImageFrame> imageBuffer,
+                      HashMap<Long, Double> exposures,
+                      int imageFormat, int cameraRotation,
+                      CameraCharacteristics characteristics,
+                      CaptureResult captureResult, CaptureRequest captureRequest,
+                      java.util.List<com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair> exposurePairs,
+                      com.particlesdevs.photoncamera.processing.MotionBatch.ShortHighlightSlot shortSlot,
+                      ProcessingCallback callback) {
+        this.mMotion26486ExposurePairs = new java.util.ArrayList<>();
+        if (exposurePairs != null) for (com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair source : exposurePairs) {
+            com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair copy =
+                    new com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair(source);
+            copy.curlayer = com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair.exposureLayer.Normal;
+            copy.layerMpy = 1.0f;
+            this.mMotion26486ExposurePairs.add(copy);
+        }
+        this.mMotion26486ShortSlot = shortSlot;
+        start(dngFile, imageFile, exifData, BurstShakiness, imageBuffer, exposures,
+                imageFormat, cameraRotation, characteristics, captureResult,
+                captureRequest, callback);
+    }
+
     public void Run() {
+        Integer iris26480OriginalPriority=null;
+        if(cameraMode==CameraMode.MOTION){try{int tid=android.os.Process.myTid();
+            iris26480OriginalPriority=android.os.Process.getThreadPriority(tid);
+            if(iris26480OriginalPriority<android.os.Process.THREAD_PRIORITY_BACKGROUND)
+                android.os.Process.setThreadPriority(tid,android.os.Process.THREAD_PRIORITY_BACKGROUND);
+            Log.d(TAG,"IRIS_26480_BACKGROUND_PROCESSING_PRIORITY active="+android.os.Process.getThreadPriority(tid));
+        }catch(Throwable ignored){}}
         try {
             Camera2ApiAutoFix.ApplyRes(captureResult);
             if (imageFormat == CaptureController.RAW_FORMAT) {
@@ -110,6 +152,13 @@ public class HdrxProcessor extends ProcessorBase {
         finally {
             // IRIS_26338_MOTION_METRICS_FINALLY
             MotionMetrics.end();
+            if (mMotion26486ShortSlot != null) {
+                mMotion26486ShortSlot.sealAndClose();
+                mMotion26486ShortSlot = null;
+            }
+            mMotion26486ExposurePairs = null;
+            if(iris26480OriginalPriority!=null)try{android.os.Process.setThreadPriority(
+                    android.os.Process.myTid(),iris26480OriginalPriority);}catch(Throwable ignored){}
         }
     }
 
@@ -121,6 +170,31 @@ public class HdrxProcessor extends ProcessorBase {
 
         long startTime = System.currentTimeMillis();
         Log.d(TAG, "ApplyHdrX() mImageFramesToProcess.size():" + mImageFramesToProcess.size());
+
+        /* IRIS_26480_SHORT_FRAME_SPLIT_BEFORE_WRONSKI_V2 */
+        ImageFrame iris26480ShortHighlightFrame = null;
+        ByteBuffer iris26480DeferredDng = null;
+        if (cameraMode == CameraMode.MOTION) {
+            for (int i = mImageFramesToProcess.size() - 1; i >= 0; i--) {
+                ImageFrame candidate = mImageFramesToProcess.get(i);
+                if (candidate != null && candidate.motionV2FrameRole == ImageFrame.MotionV2FrameRole.HIGHLIGHT_SHORT) {
+                    if (iris26480ShortHighlightFrame == null) {
+                        iris26480ShortHighlightFrame = candidate;
+                    } else {
+                        candidate.close();
+                    }
+                    mImageFramesToProcess.remove(i);
+                }
+            }
+            if (mImageFramesToProcess.isEmpty()) {
+                if (iris26480ShortHighlightFrame != null) iris26480ShortHighlightFrame.close();
+                throw new IllegalStateException("26480 short frame cannot replace normal Wronski group");
+            }
+            Log.d(TAG, "IRIS_26480_SHORT_FRAME_SPLIT_BEFORE_WRONSKI"
+                    + " normalFrames=" + mImageFramesToProcess.size()
+                    + " shortPresent=" + (iris26480ShortHighlightFrame != null)
+                    + " shortInWronskiList=false short excluded from Wronski=true");
+        }
         int width = mImageFramesToProcess.get(0).width;
         int height = mImageFramesToProcess.get(0).height;
         Log.d(TAG, "APPLY HDRX: buffer:" + mImageFramesToProcess.get(0).buffer.asShortBuffer().remaining());
@@ -220,7 +294,19 @@ public class HdrxProcessor extends ProcessorBase {
             //frame.image = mImageFramesToProcess.get(i);
             //Log.d(TAG,"Timestamp:"+frame.image.getTimestamp());
             //frame.pair = IsoExpoSelector.pairs.get(i % IsoExpoSelector.patternSize);
-            frame.pair = IsoExpoSelector.fullpairs.get(i);
+            if (cameraMode == CameraMode.MOTION) {
+                if (mMotion26486ExposurePairs == null
+                        || i >= mMotion26486ExposurePairs.size()) {
+                    throw new IllegalStateException(
+                            "26486 MotionBatch exposure-pair ownership mismatch");
+                }
+                frame.pair = new IsoExpoSelector.ExpoPair(
+                        mMotion26486ExposurePairs.get(i));
+                frame.pair.curlayer = IsoExpoSelector.ExpoPair.exposureLayer.Normal;
+                frame.pair.layerMpy = 1.0f;
+            } else {
+                frame.pair = IsoExpoSelector.fullpairs.get(i);
+            }
             frame.number = i;
             double iris26363FrameEnergy =
                     exposures.get(mImageFramesToProcess.get(i).getTimestamp());
@@ -257,6 +343,9 @@ public class HdrxProcessor extends ProcessorBase {
         ISO /= mImageFramesToProcess.size();
 
         processingParameters.FillDynamicParameters(captureResult, captureRequest,ISO);
+        if (cameraMode == CameraMode.MOTION) {
+            configureStrictWronskiSensorAuthority(processingParameters);
+        }
         processingParameters.cameraRotation = cameraRotation;
 
         exifData.IMAGE_DESCRIPTION = processingParameters.toString()
@@ -402,40 +491,38 @@ public class HdrxProcessor extends ProcessorBase {
                             + " retainedFrames=" + images.size()
                             + " policy=ownedReferencePreserved");
 
-            /*
-             * IRIS_26450_MOTION_V2_REFERENCE_DNG
-             * Save the true timestamp-owned Bayer reference while its original
-             * RAW buffer is still alive. This is single-frame sensor RAW:
-             * no multiframe NR, no demosaic, no V2 RGB processing.
-             */
-            ByteBuffer iris26450ReferenceDng =
-                    images.get(0).buffer == null
-                            ? null
-                            : images.get(0).buffer.duplicate();
-            if (iris26450ReferenceDng == null) {
-                throw new IllegalStateException(
-                        "Motion V2 reference DNG buffer is null");
+            /* IRIS_26480_DEFERRED_DNG_OUTPUT_V2 */
+            iris26480DeferredDng = null;
+            if (saveRAW >= 1) {
+                if (images.get(0).buffer == null) throw new IllegalStateException("Motion V2 reference DNG buffer is null");
+                if (saveRAW == 2) {
+                    ByteBuffer immediate=images.get(0).buffer.duplicate(); immediate.position(0);
+                    boolean saved=ImageSaver.Util.saveStackedRaw(dngFile,immediate,processingParameters);
+                    processingEventsListener.notifyImageSavedStatus(saved,dngFile);
+                    for(ImageFrame im:images)if(im!=null)im.close();
+                    if(iris26480ShortHighlightFrame!=null){iris26480ShortHighlightFrame.close();iris26480ShortHighlightFrame=null;}
+                    processingEventsListener.onProcessingFinished("Motion RAW Processing Finished");callback.onFinished();return;
+                }
+                ByteBuffer v=images.get(0).buffer.duplicate();v.position(0);
+                iris26480DeferredDng=Allocator.allocateAndCopy(v.capacity(),v,0);iris26480DeferredDng.position(0);
+                Log.d(TAG,"IRIS_26480_DEFERRED_DNG_CAPTURED bytes="+iris26480DeferredDng.capacity());
             }
-            iris26450ReferenceDng.position(0);
-            boolean iris26450DngSaved =
-                    ImageSaver.Util.saveStackedRaw(
-                            dngFile,
-                            iris26450ReferenceDng,
-                            processingParameters);
-            processingEventsListener.notifyImageSavedStatus(
-                    iris26450DngSaved,
-                    dngFile);
-            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
-                    "IRIS_26450_MOTION_V2_REFERENCE_DNG",
-                    "saved=" + iris26450DngSaved
-                            + " rawTimestamp=" + images.get(0).timestamp
-                            + " source=timestampOwnedReferenceBayer"
-                            + " multiframeNr=false"
-                            + " bakedRgb=false");
         }
         selected = 0;
 
-
+        /* IRIS_26480_PER_FRAME_NOISE_SOURCE_TRACKING_V2 */
+        if(cameraMode==CameraMode.MOTION&&!images.isEmpty()){
+            ImageFrame baseNoise=images.get(0);boolean baseValid=baseNoise.motionV2NoiseProfileValid;
+            for(ImageFrame f:images){if(f==null)continue;
+                if(!f.motionV2NoiseProfileValid&&baseValid){System.arraycopy(baseNoise.motionV2NoiseProfile,0,
+                        f.motionV2NoiseProfile,0,f.motionV2NoiseProfile.length);f.motionV2NoiseProfileValid=true;
+                    f.motionV2NoiseProfileSource="CAMERA2_BASE_FRAME";f.motionV2NoiseS=baseNoise.motionV2NoiseS;f.motionV2NoiseO=baseNoise.motionV2NoiseO;}
+                else if(!f.motionV2NoiseProfileValid)f.motionV2NoiseProfileSource="WRONSKI_EXISTING_FALLBACK";
+                com.particlesdevs.photoncamera.util.MotionTrace.processingState("IRIS_26480_FRAME_NOISE_SOURCE",
+                        "timestamp="+f.timestamp+" source="+f.motionV2NoiseProfileSource+" valid="+f.motionV2NoiseProfileValid
+                        +" normalizedSensorVariance=true rawCodeRangeRescale=false");
+            }
+        }
 
         Log.d(TAG, "White Level:" + processingParameters.whiteLevel);
         Log.d(TAG, "Wrapper.loadFrame");
@@ -443,6 +530,7 @@ public class HdrxProcessor extends ProcessorBase {
         //        IsoExpoSelector.getMPY() - 40.)*6400.f / (6.2f*IsoExpoSelector.getISOAnalog());
 
         ByteBuffer output = null;
+        ByteBuffer motionV2HighlightProvenance = null;
 
         /*
          * IRIS_26379_PRODUCTION_DIAGNOSTIC_CLEANUP
@@ -474,13 +562,21 @@ public class HdrxProcessor extends ProcessorBase {
          */
         if (cameraMode == CameraMode.MOTION) {
             processingParameters.motionV2Active = true;
+            if (iris26480ShortHighlightFrame != null) {
+                if (mMotion26486ShortSlot != null)
+                    mMotion26486ShortSlot.offer(iris26480ShortHighlightFrame);
+                else iris26480ShortHighlightFrame.close();
+                iris26480ShortHighlightFrame = null;
+            }
             MotionV2Merger.Result iris26409V2 =
                     MotionV2CfaReconstruction.reconstruct(
                             new Point(width, height),
                             images,
                             iris26363ReferenceTimestamp,
-                            processingParameters);
+                            processingParameters,
+                            mMotion26486ShortSlot);
             output = iris26409V2.raw;
+            motionV2HighlightProvenance = iris26409V2.highlightProvenance;
             processingParameters.motionV2EffectiveSupport =
                     iris26409V2.effectiveSupport;
             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
@@ -541,13 +637,17 @@ public class HdrxProcessor extends ProcessorBase {
              * reference RAW before the burst buffers were closed.
              */
             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
-                    "IRIS_26414_MOTION_V2_NORMALIZATION",
-                    "gain=" + processingParameters.motionCanonicalExposureGain
-                            + " source=ownedReferenceRawPreReconstruction"
-                            + " floatCarrierNotReparsed=true"
-                            + " floorSuppression=false");
+                    "IRIS_26490_MOTION_V2_DOMAIN_OWNERSHIP",
+                    "sensorDomainScale=" + processingParameters.motionCanonicalExposureGain
+                            + " displayGain=" + processingParameters.motionV2DisplayGain
+                            + " sensorDomainOwner=WronskiNormalizedRaw"
+                            + " displayGainOwner=MotionV2DisplayExposure"
+                            + " displayGainBeforeRcd=false"
+                            + " floatCarrierNotReparsed=true");
         } else {
             processingParameters.motionCanonicalExposureGain = 1.0f;
+            processingParameters.motionV2DisplayGain = 1.0f;
+            processingParameters.motionV2ShortHighlightRecoveryExecuted = false;
         }
 
         /*
@@ -560,13 +660,16 @@ public class HdrxProcessor extends ProcessorBase {
          * Use the actually measured temporal contribution instead of the old
          * reference-only support=1 assumption.
          */
-        processingParameters.noiseModeler.computeStackingNoiseModel(
-                cameraMode == CameraMode.MOTION
-                        ? Math.max(
-                                1,
-                                Math.round(
-                                        processingParameters.motionV2EffectiveSupport))
-                        : images.size());
+        if (cameraMode != CameraMode.MOTION) {
+            processingParameters.noiseModeler.computeStackingNoiseModel(images.size());
+        } else {
+            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                    "IRIS_26477_PHOTON_STACK_NOISE_BYPASS",
+                    "noiseModeler.computeStackingNoiseModel=false"
+                            + " wronskiNoiseOwner=Camera2_BJZHOU_MGC"
+                            + " effectiveSupport="
+                            + processingParameters.motionV2EffectiveSupport);
+        }
 
         PostPipeline pipeline = new PostPipeline();
 
@@ -578,6 +681,7 @@ public class HdrxProcessor extends ProcessorBase {
              */
             img = pipeline.RunMotionV2FloatCfa(
                     output,
+                    motionV2HighlightProvenance,
                     processingParameters);
             output = null;
         } else {
@@ -620,6 +724,16 @@ public class HdrxProcessor extends ProcessorBase {
         catch (Exception e){
             Log.d(TAG,"Error in processingEventsListener.notifyImageSavedStatus:"+Log.getStackTraceString(e));
         }
+        if(cameraMode==CameraMode.MOTION&&iris26480DeferredDng!=null){
+            final ByteBuffer dngBytes=iris26480DeferredDng;final Path dngPath=dngFile;final Parameters dngParams=processingParameters;
+            MOTION_26480_OUTPUT_EXECUTOR.execute(()->{Integer old=null;try{int tid=android.os.Process.myTid();
+                old=android.os.Process.getThreadPriority(tid);android.os.Process.setThreadPriority(tid,android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                dngBytes.position(0);boolean saved=ImageSaver.Util.saveStackedRaw(dngPath,dngBytes,dngParams);
+                processingEventsListener.notifyImageSavedStatus(saved,dngPath);Log.d(TAG,"IRIS_26480_DEFERRED_DNG_FINISHED saved="+saved);
+            }catch(Exception e){Log.e(TAG,"IRIS_26480_DEFERRED_DNG_FAILED "+Log.getStackTraceString(e));}
+            finally{try{Allocator.free(dngBytes);}catch(Throwable ignored){}if(old!=null)try{android.os.Process.setThreadPriority(android.os.Process.myTid(),old);}catch(Throwable ignored){}}});
+            iris26480DeferredDng=null;
+        }
 
         pipeline.close();
 
@@ -628,6 +742,120 @@ public class HdrxProcessor extends ProcessorBase {
         callback.onFinished();
     }
 
+
+    /*
+     * IRIS_26477_STRICT_WRONSKI_SENSOR_AUTHORITY
+     * Hard boundary between Photon settings and Wronski reconstruction.
+     */
+    private void configureStrictWronskiSensorAuthority(Parameters p) {
+        if (p == null || characteristics == null || captureResult == null) {
+            throw new IllegalStateException(
+                    "26477 strict Wronski requires Camera2 characteristics + timestamp result");
+        }
+
+        Integer cfa = characteristics.get(
+                CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT);
+        if (cfa == null || cfa < 0 || cfa > 3) {
+            throw new IllegalStateException(
+                    "26477 strict Wronski requires standard Camera2 Bayer CFA; cfa=" + cfa);
+        }
+
+        android.hardware.camera2.params.BlackLevelPattern staticBlack =
+                characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+        if (staticBlack == null) {
+            throw new IllegalStateException(
+                    "26477 strict Wronski missing SENSOR_BLACK_LEVEL_PATTERN");
+        }
+        int[] staticBl = new int[4];
+        staticBlack.copyTo(staticBl, 0);
+        float[] strictBl = new float[] {
+                staticBl[0], staticBl[1], staticBl[2], staticBl[3]
+        };
+        float[] dynamicBl =
+                captureResult.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL);
+        if (dynamicBl != null && dynamicBl.length >= 4) {
+            boolean finite = true;
+            for (int i = 0; i < 4; i++) {
+                finite &= Float.isFinite(dynamicBl[i]) && dynamicBl[i] >= 0.0f;
+            }
+            if (finite) {
+                System.arraycopy(dynamicBl, 0, strictBl, 0, 4);
+            }
+        }
+
+        Integer strictWhite =
+                captureResult.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL);
+        if (strictWhite == null || strictWhite <= 0) {
+            strictWhite = characteristics.get(
+                    CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
+        }
+        if (strictWhite == null || strictWhite <= 0) {
+            throw new IllegalStateException(
+                    "26477 strict Wronski missing sensor white level");
+        }
+
+        android.util.Pair<Double, Double>[] profile =
+                captureResult.get(CaptureResult.SENSOR_NOISE_PROFILE);
+        if (profile == null || profile.length == 0) {
+            throw new IllegalStateException(
+                    "26477 strict Wronski missing SENSOR_NOISE_PROFILE; Photon fallback forbidden");
+        }
+
+        double strictS;
+        double strictO;
+        if (profile.length >= 4) {
+            strictS = (
+                    profile[0].first
+                            + 0.5 * (profile[1].first + profile[2].first)
+                            + profile[3].first) / 3.0;
+            strictO = (
+                    profile[0].second
+                            + 0.5 * (profile[1].second + profile[2].second)
+                            + profile[3].second) / 3.0;
+        } else if (profile.length >= 3) {
+            strictS = (
+                    profile[0].first + profile[1].first + profile[2].first) / 3.0;
+            strictO = (
+                    profile[0].second + profile[1].second + profile[2].second) / 3.0;
+        } else {
+            strictS = profile[0].first;
+            strictO = profile[0].second;
+        }
+
+        if (!Double.isFinite(strictS) || !Double.isFinite(strictO)
+                || strictS <= 0.0 || strictO < 0.0) {
+            throw new IllegalStateException(
+                    "26477 invalid Camera2 noise profile S=" + strictS + " O=" + strictO);
+        }
+
+        // Overwrite reconstruction-critical fields after TunableInjector.
+        p.blackLevel = strictBl;
+        p.whiteLevel = strictWhite;
+        p.cfaPattern = (byte)(int)cfa;
+        p.motionV2WronskiNoiseS = (float)strictS;
+        p.motionV2WronskiNoiseO = (float)strictO;
+        p.motionV2StrictWronskiSensorValid = true;
+
+        String authority =
+                "IRIS_26477_STRICT_WRONSKI_SENSOR_AUTHORITY"
+                        + " cfaSource=CameraCharacteristics"
+                        + " blackSource=Camera2"
+                        + " whiteSource=Camera2"
+                        + " noiseSource=CaptureResult.SENSOR_NOISE_PROFILE"
+                        + " photonAdaptiveNoise=false"
+                        + " photonNoiseModeler=false"
+                        + " dynamicNoiseStore=false"
+                        + " blackLevelOverride=false"
+                        + " whiteLevelOverride=false"
+                        + " cfaOverride=false"
+                        + " noiseS=" + p.motionV2WronskiNoiseS
+                        + " noiseO=" + p.motionV2WronskiNoiseO
+                        + " whiteLevel=" + p.whiteLevel
+                        + " cfa=" + p.cfaPattern;
+        Log.d(TAG, authority);
+        com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                "MOTION_WRONSKI_SENSOR_AUTHORITY", authority);
+    }
 
     /*
      * IRIS_26394 canonical exposure estimator.

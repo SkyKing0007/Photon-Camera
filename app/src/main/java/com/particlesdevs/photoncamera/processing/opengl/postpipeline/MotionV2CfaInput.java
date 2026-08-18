@@ -17,8 +17,9 @@ import static android.opengl.GLES20.GL_NEAREST;
 /**
  * IRIS_26414_MOTION_V2_FLOAT_CFA_INPUT
  *
- * First V2 post node. The temporal reconstructor already produced normalized
- * FLOAT16 RGBA CFA planes, so Bayer2Float must not run again.
+ * First V2 post node. Standard Bayer Motion now arrives as full-resolution
+ * camera-linear RGBA32F from the proper per-frame Spatial RGB owner; special CFA
+ * formats retain the historical packed float fallback. Bayer2Float must not run again.
  *
  * IRIS_26415_MOTION_V2_GL_LIFECYCLE_OWNER
  *
@@ -53,37 +54,34 @@ public final class MotionV2CfaInput extends Node {
         ByteBuffer view = source.duplicate();
         view.position(0);
 
-        /*
-         * IRIS_26424_DIRECT_MULTIFRAME_RGB_INPUT
-         *
-         * Standard Bayer (0..3) arrives from the owned burst reconstructor as
-         * full-resolution linear camera RGB. The proven 26416 FLOAT32 bridge
-         * remains unchanged. Special CFA formats retain the prior packed-CFA
-         * fallback carrier.
+        /* IRIS_26501_PROPER_PER_FRAME_RGB_FLOAT32_BRIDGE_OWNER
+         * Standard Bayer crosses the context boundary as native full-resolution RGBA32F
+         * camera-linear RGB. Special CFA formats retain the historical half-resolution carrier.
          */
         boolean directBayer =
                 basePipeline.mParameters.cfaPattern >= 0
                         && basePipeline.mParameters.cfaPattern <= 3
-                        && raw.x > 0
-                        && raw.y > 0
-                        && (raw.x % 2) == 0
-                        && (raw.y % 2) == 0;
-        /*
-         * IRIS_26462_WRONSKI_DIRECT_RGB_INPUT_OWNER
-         * Standard Bayer receives full-resolution linear camera RGB.
-         */
-        if (directBayer) {
-            WorkingTexture = new GLTexture(
-                    raw,
-                    new GLFormat(GLFormat.DataType.FLOAT_32, 4),
-                    view,
-                    GL_LINEAR,
-                    GL_CLAMP_TO_EDGE);
-        } else {
-            WorkingTexture = new GLTexture(
+                        && raw.x > 0 && raw.y > 0
+                        && (raw.x % 2) == 0 && (raw.y % 2) == 0;
+        boolean directRgbCarrier = directBayer && pipeline.motionV2DirectRgbCarrier;
+        WorkingTexture = new GLTexture(
+                directRgbCarrier ? raw : half,
+                new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                view,
+                GL_NEAREST,
+                GL_CLAMP_TO_EDGE);
+
+        if (directBayer && !directRgbCarrier) {
+            throw new IllegalStateException(
+                    "26501 standard Bayer input is not the full-resolution RGB carrier");
+        }
+        if (!directRgbCarrier && pipeline.motionV2HighlightProvenance != null) {
+            ByteBuffer provenanceView = pipeline.motionV2HighlightProvenance.duplicate();
+            provenanceView.position(0);
+            pipeline.motionV2HighlightProvenanceTexture = new GLTexture(
                     half,
-                    new GLFormat(GLFormat.DataType.FLOAT_32, 4),
-                    view,
+                    new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+                    provenanceView,
                     GL_NEAREST,
                     GL_CLAMP_TO_EDGE);
         }
@@ -118,8 +116,8 @@ public final class MotionV2CfaInput extends Node {
                 GL_CLAMP_TO_EDGE);
         basePipeline.texnum = 0;
 
-        Log.d(Name, "IRIS_26416_V2_FLOAT32_INPUT"
-                + " carrier=" + (directBayer ? "directRgbFullRes" : "packedCfaHalfRes")
+        Log.d(Name, "IRIS_26501_V2_FLOAT32_RGB_INPUT"
+                + " carrier=" + (directRgbCarrier ? "properPerFrameCameraRgbFullRes" : "packedCfaHalfRes")
                 + " transferFormat=rgba32f"
                 + " bytesPerChannel=4"
                 + " rgbPingPong=" + raw.x + "x" + raw.y
@@ -128,11 +126,13 @@ public final class MotionV2CfaInput extends Node {
                 + " Bayer2FloatBypassed=true"
                 + " raw16RoundTrip=false"
                 + " float16Transfer=false"
-                + " directMultiframeRgb=" + directBayer);
+                + " directMultiframeRgb=" + directRgbCarrier
+                + " fusedBayerCanonical=false"
+                + " highlightProvenanceConsumedUpstream=" + directRgbCarrier);
         try {
             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
                     "IRIS_26415_MOTION_V2_GL_LIFECYCLE_OWNER",
-                    "carrier=" + (directBayer ? "directRgbFullRes" : "packedCfaHalfRes")
+                    "carrier=" + (directRgbCarrier ? "properPerFrameCameraRgbFullRes" : "packedCfaHalfRes")
                             + " rgbPingPong=" + raw.x + "x" + raw.y
                             + " main1=true main2=true main3=true"
                             + " texnumReset=0"

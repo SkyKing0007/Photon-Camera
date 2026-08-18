@@ -9,13 +9,20 @@ layout(rgba16f,binding=0) uniform highp writeonly image2D OutputFlow;
 uniform ivec2 levelSize;
 uniform int tileSize;
 uniform int searchRadius;
-uniform int distanceMetric; // 0 L1, 1 L2
+uniform int distanceMetric;
 uniform int hasPrevious;
 uniform float previousToCurrentScale;
 
-float sampleGuide(sampler2D t,ivec2 p) {
-    p=clamp(p,ivec2(0),levelSize-ivec2(1));
-    return texelFetch(t,p,0).r;
+/* IRIS_26473_IPOL_ALIGNMENT_BOUNDARY_SEMANTICS */
+float sampleReference(ivec2 p) {
+    ivec2 s=levelSize;
+    ivec2 q=ivec2((p.x%s.x+s.x)%s.x,(p.y%s.y+s.y)%s.y);
+    return texelFetch(ReferenceGuide,q,0).r;
+}
+float sampleMoving(ivec2 p) {
+    if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,levelSize)))
+        return 0.0;
+    return texelFetch(MovingGuide,p,0).r;
 }
 void main() {
     ivec2 tile=ivec2(gl_GlobalInvocationID.xy);
@@ -42,9 +49,8 @@ void main() {
             for(int xx=0;xx<64;xx++) {
                 if(xx>=tileSize) continue;
                 ivec2 rp=tile*tileSize+ivec2(xx,yy);
-                if(any(greaterThanEqual(rp,levelSize))) continue;
-                float a=sampleGuide(ReferenceGuide,rp);
-                float b=sampleGuide(MovingGuide,rp+sh);
+                float a=sampleReference(rp);
+                float b=sampleMoving(rp+sh);
                 float d=a-b;
                 e += distanceMetric==0 ? abs(d) : d*d;
                 n++;

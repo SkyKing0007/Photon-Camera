@@ -97,16 +97,48 @@ float mapHeadroomLuminance(float y) {
             log(1.0+logShape*x)
             /log(1.0+logShape);
 
-    return start+(1.0-start)*shaped;
+    /* IRIS_26501_WHITE_TARGET_AFTER_EXISTING_OUTPUT_EXPOSURE
+     * The previous 1.0 pre-scale ceiling became only 0.80 after the proven output
+     * exposure, structurally preventing clean white clipping. Map to the inverse
+     * of that existing scale so the final SDR endpoint can actually reach 1.0.
+     */
+    float preScaleDisplayWhite=1.0/max(outputExposureScale,1.0e-6);
+    return start+(preScaleDisplayWhite-start)*shaped;
 }
 
 vec3 mapExtendedLinearHeadroom(vec3 rgb) {
     rgb=max(rgb,vec3(0.0));
     float y=max(luminance(rgb),0.0);
-    if(y<=1.0e-7) return rgb;
+    float peak=max3(rgb);
+    float guide=max(y,peak);
+    if(guide<=1.0e-7) return rgb;
 
-    float mappedY=mapHeadroomLuminance(y);
-    return rgb*(mappedY/y);
+    /* IRIS_26480_MAX_RGB_HIGHLIGHT_TONE_GUIDE_V2
+     * Saturated channels participate in the shoulder decision directly.
+     * Uniform scaling preserves hue/channel ratios.
+     */
+    /* IRIS_26491_EXTENDED_LINEAR_CHROMA_PRESERVING_HIGHLIGHT_COMPRESSION
+     * Scene exposure arrived in extended-linear RGB from MotionV2DisplayExposure.
+     * Compression is one scalar derived from the max-RGB/luma guide, so values
+     * keep channel ratios until the final display-gamut fit. No per-channel 1.0
+     * clamp is introduced here.
+     */
+    float mappedGuide=mapHeadroomLuminance(guide);
+    vec3 mapped=rgb*(mappedGuide/guide);
+
+    /* IRIS_26501_GENTLE_NEUTRAL_WHITE_ROLLOFF
+     * Real colour is retained through most of the shoulder. Only the final part
+     * of physical headroom converges continuously to neutral display white. This
+     * is the approved clipping behaviour: no hue invention, no hard grey shelf.
+     */
+    const float start=0.50;
+    float whitePoint=max(sceneWhite,start+0.05);
+    float headroomPosition=clamp(
+            (guide-start)/max(whitePoint-start,1.0e-6),
+            0.0,
+            1.0);
+    float neutralMix=smoothstep(0.82,1.0,headroomPosition);
+    return mix(mapped,vec3(mappedGuide),neutralMix);
 }
 
 /*
@@ -126,20 +158,29 @@ vec3 fitDisplayGamut(vec3 rgb) {
      * foliage approached display white. Uniform RGB scaling preserves channel
      * ratios/hue and trades only highlight luminance for display gamut.
      */
-    return rgb/max(peak,1.0e-6);
+    vec3 hueSafe=rgb/max(peak,1.0e-6);
+    float overflow=clamp((peak-1.0)/0.25,0.0,1.0);
+    return mix(hueSafe,vec3(1.0),smoothstep(0.0,1.0,overflow));
 }
 
 void main() {
     ivec2 xy=ivec2(gl_FragCoord.xy);
+    ivec2 sourceXY=xy;
+    /* IRIS_26491_FINAL_OUTPUT_LEFT_EDGE_MIRROR_ONE_PIXEL
+     * The successful 26490 four-edge RCD mirror stays untouched. Only the known
+     * final x==0 output defect is replaced with the already-renderable x==1 source.
+     */
+    ivec2 sourceSize=textureSize(InputBuffer,0);
+    if(sourceXY.x==0 && sourceSize.x>1) sourceXY.x=1;
     vec3 linearSrgb=max(
-            texelFetch(InputBuffer,xy,0).rgb,
+            texelFetch(InputBuffer,sourceXY,0).rgb,
             vec3(0.0));
 
     /*
      * Apply the same pre-tone local-contrast intent that the HDR target uses.
      * The existing headroom mapper and 0.80 exposure remain unchanged.
      */
-    linearSrgb=applyReferenceSafeMicrocontrast(xy,linearSrgb);
+    linearSrgb=applyReferenceSafeMicrocontrast(sourceXY,linearSrgb);
     linearSrgb=mapExtendedLinearHeadroom(linearSrgb);
 
     /*

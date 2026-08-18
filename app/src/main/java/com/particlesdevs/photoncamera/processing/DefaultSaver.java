@@ -30,6 +30,57 @@ public class DefaultSaver extends SaverImplementation {
         this.mRawVideoProcessor = new RawVideoProcessor(processingEventsListener);
     }
 
+    /* IRIS_26486_DEFAULTSAVER_MOTIONBATCH_SOLE_OWNER
+     * Motion owns copied RAWs in the immutable batch. No static IMAGE_BUFFER,
+     * no busy-wait, and no cross-shot slicing/reassignment are involved.
+     */
+    public void runMotionBatch(CameraCharacteristics characteristics, MotionBatch batch) {
+        if (batch == null || batch.frames == null || batch.frames.size() < 2) {
+            throw new IllegalStateException("26486 MotionBatch requires at least two normal RAW frames");
+        }
+        /* IRIS_26486_SERIALIZED_LEGACY_METADATA_COMPATIBILITY
+         * These globals are written only here, on the one serialized processing lane.
+         * Capture of the next shot never mutates them.
+         */
+        com.particlesdevs.photoncamera.processing.parameters.FrameNumberSelector.frameCount =
+                batch.retainedCount;
+        com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.fullpairs.clear();
+        for (com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair source
+                : batch.exposurePairs) {
+            com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair copy =
+                    new com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair(source);
+            copy.curlayer = com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector
+                    .ExpoPair.exposureLayer.Normal;
+            copy.layerMpy = 1.0f;
+            com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.fullpairs.add(copy);
+        }
+        super.runRaw(batch.imageFormat, characteristics, batch.referenceResult,
+                batch.referenceRequest, new ArrayList<>(batch.gyro), batch.rotation,
+                new HashMap<>(batch.exposures));
+        hdrxProcessor.configure(
+                PhotonCamera.getSettings().alignAlgorithm,
+                PhotonCamera.getSettings().rawSaver,
+                PhotonCamera.getSettings().selectedMode);
+        Path dngFile = ImagePath.newDNGFilePath();
+        Path imageFile = ImagePath.newImageFilePath();
+        ArrayList<ImageFrame> ownedFrames = new ArrayList<>(batch.frames);
+        hdrxProcessor.startMotion(
+                dngFile,
+                imageFile,
+                ParseExif.parse(batch.referenceResult, batch.referenceRequest),
+                new ArrayList<>(batch.gyro),
+                ownedFrames,
+                new HashMap<>(batch.exposures),
+                batch.imageFormat,
+                batch.rotation,
+                characteristics,
+                batch.referenceResult,
+                batch.referenceRequest,
+                batch.exposurePairs,
+                batch.shortHighlightSlot,
+                processingCallback);
+    }
+
     public void runRaw(int imageFormat, CameraCharacteristics characteristics, CaptureResult captureResult, CaptureRequest captureRequest, ArrayList<GyroBurst> burstShakiness, int cameraRotation, HashMap<Long, Double> exposures) {
         super.runRaw(imageFormat, characteristics, captureResult,captureRequest, burstShakiness, cameraRotation, exposures);
         //Wait for one frame at least.

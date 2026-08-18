@@ -8,28 +8,27 @@ uniform int cfaPattern;
 uniform float wbR;
 uniform float wbG;
 uniform float wbB;
-
 int componentColor(int c){
     if(cfaPattern==0){if(c==0)return 0;if(c==3)return 2;return 1;}
     if(cfaPattern==1){if(c==1)return 0;if(c==2)return 2;return 1;}
     if(cfaPattern==2){if(c==2)return 0;if(c==1)return 2;return 1;}
     if(c==3)return 0;if(c==0)return 2;return 1;
 }
-float gainFor(int c){ return c==0?wbR:(c==2?wbB:wbG); }
-
-/* IRIS_26463_WRONSKI_PUBLIC_RAW_WB_DOMAIN
- * Public loader normalizes each CFA sample then multiplies by camera WB
- * normalized to green before the Wronski core.
+float gainForColor(int c){return c==0?wbR:(c==2?wbB:wbG);}
+/* IRIS_26487_SINGLE_CLIPPING_AUTHORITY_WB_ONLY
+ * Calculation-domain WB is a linear scale only. No clipped CFA sample is
+ * synthesized or hue-repaired here. Physical clipping is carried separately
+ * from pre-WB CFA and treated as censored evidence by merge/recovery stages.
  */
 void main(){
-    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
     ivec2 sz=imageSize(outputCfa);
-    if(any(greaterThanEqual(p,sz))) return;
-    vec4 v=imageLoad(inputCfa,p);
-    vec4 o;
-    o.r=v.r*gainFor(componentColor(0));
-    o.g=v.g*gainFor(componentColor(1));
-    o.b=v.b*gainFor(componentColor(2));
-    o.a=v.a*gainFor(componentColor(3));
-    imageStore(outputCfa,p,o);
+    if(any(greaterThanEqual(q,sz))) return;
+    vec4 camera=max(imageLoad(inputCfa,q),vec4(0.0));
+    vec4 gains=vec4(
+        gainForColor(componentColor(0)),
+        gainForColor(componentColor(1)),
+        gainForColor(componentColor(2)),
+        gainForColor(componentColor(3)));
+    imageStore(outputCfa,q,camera*max(gains,vec4(1.0e-6)));
 }

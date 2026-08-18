@@ -101,19 +101,17 @@ public class ImageSaver {
         frameCounter++;
     }
 
+    /* IRIS_26486_MOTIONBATCH_DIRECT_SAVER_HANDOFF */
     public void runMotionRaw(android.hardware.camera2.CameraCharacteristics characteristics,
                              MotionBatch batch) {
-        setFrameCount(batch.retainedCount);
+        setFrameCount(batch.processingFrameCount);
         setImageFormat(batch.imageFormat);
         implementation = ImageSaverSelector.getImageSaver(batch.imageFormat, implementation);
-        implementation.frameCount = batch.retainedCount;
-        SaverImplementation.IMAGE_BUFFER.clear();
-        SaverImplementation.IMAGE_BUFFER.addAll(batch.frames);
-        implementation.bufferLock = false;
-        updateFrameCount(batch.retainedCount);
-        runRaw(characteristics, batch.referenceResult, batch.referenceRequest,
-                new java.util.ArrayList<>(batch.gyro), batch.rotation,
-                new java.util.HashMap<>(batch.exposures));
+        implementation.frameCount = batch.processingFrameCount;
+        if (!(implementation instanceof DefaultSaver)) {
+            throw new IllegalStateException("26486 Motion requires DefaultSaver direct batch handoff");
+        }
+        ((DefaultSaver) implementation).runMotionBatch(characteristics, batch);
     }
 
     public void runRaw(CameraCharacteristics characteristics, CaptureResult captureResult, CaptureRequest captureRequest, ArrayList<GyroBurst> burstShakiness, int cameraRotation, HashMap<Long, Double> exposures) {

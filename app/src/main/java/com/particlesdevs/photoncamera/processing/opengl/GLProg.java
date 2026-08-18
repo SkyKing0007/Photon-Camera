@@ -35,6 +35,14 @@ public class GLProg implements AutoCloseable {
     public boolean closed = true;
     public boolean isCompute = false;
     public int currentShader;
+    /* IRIS_26487_MOTION_DEFERRED_GPU_SUBMISSION
+     * Motion V2 may enqueue dependent compute work without a CPU-blocking glFinish after
+     * every dispatch. Legacy computeAuto/computeManual remain byte-for-byte synchronous
+     * for all non-Motion callers. glMemoryBarrier(GL_ALL_BARRIER_BITS) establishes the
+     * GPU-side dependency; finishDeferredCompute() is the explicit CPU ownership boundary.
+     */
+    private int mDeferredComputeDispatches = 0;
+    private long mDeferredComputeSubmitNs = 0L;
     public final static String glVersion = "#version 310 es\n";
     final String vertexShaderSource = glVersion +
             "precision mediump float;\n" +
@@ -261,6 +269,63 @@ public class GLProg implements AutoCloseable {
         glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
         glMemoryBarrier(GL_ALL_SHADER_BITS);
         glFinish();
+    }
+
+    public void resetDeferredComputeStats() {
+        mDeferredComputeDispatches = 0;
+        mDeferredComputeSubmitNs = 0L;
+    }
+
+    public void computeAutoDeferred(Point size, int z) {
+        if(!isCompute) {
+            new Exception("Program must be compute!").printStackTrace();
+            return;
+        }
+        GLComputeLayout glComputeLayout = mComputeLayouts.get("in");
+        if(glComputeLayout == null){
+            new Exception("glComputeLayout is null").printStackTrace();
+            return;
+        }
+        int x = size.x % glComputeLayout.xy.x == 0 ? 0 : 1;
+        int y = size.y % glComputeLayout.xy.y == 0 ? 0 : 1;
+        int z0 = z % glComputeLayout.z == 0 ? 0 : 1;
+        long submitStartNs = System.nanoTime();
+        glDispatchCompute(
+                size.x / glComputeLayout.xy.x + x,
+                size.y / glComputeLayout.xy.y + y,
+                z / glComputeLayout.z + z0);
+        /* One GLES context owns the Motion chain. A memory barrier orders imageStore/imageLoad
+         * and later texture fetches without forcing the CPU to wait for GPU completion. */
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        mDeferredComputeDispatches++;
+        mDeferredComputeSubmitNs += System.nanoTime() - submitStartNs;
+    }
+
+    public void computeManualDeferred(int x, int y, int z) {
+        if(!isCompute) {
+            new Exception("Program must be compute!").printStackTrace();
+            return;
+        }
+        long submitStartNs = System.nanoTime();
+        glDispatchCompute(x, y, z);
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        mDeferredComputeDispatches++;
+        mDeferredComputeSubmitNs += System.nanoTime() - submitStartNs;
+    }
+
+    public long finishDeferredCompute(String label) {
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+        long waitStartNs = System.nanoTime();
+        glFinish();
+        long waitNs = System.nanoTime() - waitStartNs;
+        Log.d(TAG, "IRIS_26487_MOTION_DEFERRED_GPU_DRAIN"
+                + " label=" + label
+                + " dispatches=" + mDeferredComputeDispatches
+                + " cpuSubmitMs=" + (mDeferredComputeSubmitNs / 1000000L)
+                + " drainMs=" + (waitNs / 1000000L));
+        mDeferredComputeDispatches = 0;
+        mDeferredComputeSubmitNs = 0L;
+        return waitNs / 1000000L;
     }
 
 

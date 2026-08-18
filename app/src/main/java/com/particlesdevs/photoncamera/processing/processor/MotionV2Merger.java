@@ -28,12 +28,19 @@ public final class MotionV2Merger {
         public final long referenceTimestamp;
         public final int inputFrames;
         public final float effectiveSupport;
+        /* IRIS_26492_EXPLICIT_HIGHLIGHT_PROVENANCE_BRIDGE
+         * One exact float32 state per packed CFA observation: 0=NORMAL_MEASURED,
+         * 1=CENSORED_UNKNOWN_CHROMA, 2=SHORT_VALIDATED.
+         */
+        public final ByteBuffer highlightProvenance;
 
-        Result(ByteBuffer raw, long referenceTimestamp, int inputFrames, float effectiveSupport) {
+        Result(ByteBuffer raw, long referenceTimestamp, int inputFrames,
+                float effectiveSupport, ByteBuffer highlightProvenance) {
             this.raw = raw;
             this.referenceTimestamp = referenceTimestamp;
             this.inputFrames = inputFrames;
             this.effectiveSupport = effectiveSupport;
+            this.highlightProvenance = highlightProvenance;
         }
     }
 
@@ -74,18 +81,21 @@ public final class MotionV2Merger {
                 + " auxiliaryContribution=0"
                 + " structuralOwner=reference");
 
-        return new Result(output, referenceTimestamp, frames.size(), 1.0f);
+        return new Result(output, referenceTimestamp, frames.size(), 1.0f, null);
     }
 
     /**
      * Independent V2 display-normalization estimator.
+     * IRIS_26490_EXPLICIT_DISPLAY_DOMAIN: the returned scalar must never be used as a RAW
+     * white level, sensor clip threshold, Wronski exposure scale, or short-HDR exposure ratio.
      *
      * This samples the owned RAW but never mutates it. Near-black samples remain
      * valid image data; unlike the previous Iris estimator, floor occupancy is
      * not used to suppress gain. Broad p99 highlight headroom remains the limit.
      */
-    public static float computeReferenceGain(
-            ByteBuffer raw, int width, int height, Parameters parameters) {
+    public static float computeDisplayGain(
+            ByteBuffer raw, int width, int height, Parameters parameters,
+            double referenceExposureEnergy) {
         if (raw == null || width <= 0 || height <= 0
                 || parameters == null || parameters.whiteLevel <= 0
                 || parameters.blackLevel == null || parameters.blackLevel.length < 4) {
@@ -168,9 +178,18 @@ public final class MotionV2Merger {
 
         float adaptiveReduction = 1.0f /
                 (1.0f + 0.55f * occupancyPressure + 1.35f * trueClipPressure);
-        float gain = Math.max(1.0f, candidateGain * adaptiveReduction);
+
+        /*
+         * IRIS_26492_SINGLE_SCENE_BODY_EXPOSURE_AUTHORITY
+         *
+         * p50/p90 are the only semantic authority for Motion display exposure.
+         * Camera2 exposure energy remains diagnostic metadata only: a bright lamp can
+         * make HAL choose a short exposure, but that capture decision must not veto
+         * the independently measured room/midtone brightness. Highlight occupancy and
+         * true clipping are local-HDR telemetry only and cannot lower this gain.
+         */
+        float gain = Math.max(1.0f, Math.min(candidateGain, 16.0f));
         if (!Float.isFinite(gain)) gain = 1.0f;
-        gain = Math.min(gain, 16.0f); // numerical guard only
         if (gain < 1.02f) gain = 1.0f;
 
         Log.d(TAG, "IRIS_26411_V2_SCENE_BALANCED_GAIN"
@@ -188,9 +207,12 @@ public final class MotionV2Merger {
                 + " predictedWhiteFraction=" + predictedWhiteFraction
                 + " predictedHighFraction=" + predictedHighFraction
                 + " trueRawClipFraction=" + trueRawClipFraction
-                + " adaptiveReduction=" + adaptiveReduction
+                + " adaptiveReductionDiagnosticOnly=" + adaptiveReduction
+                + " referenceExposureEnergyDiagnosticOnly=" + referenceExposureEnergy
+                + " exposureEnergyHasVeto=false"
                 + " floorSuppression=false"
-                + " highlightIsConstraintNotAuthority=true"
+                + " midtonesOwnGlobalExposure=true"
+                + " highlightsOwnLocalHdr=true"
                 + " finalGain=" + gain);
         return gain;
     }

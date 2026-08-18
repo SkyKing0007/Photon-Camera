@@ -18,15 +18,26 @@ public class GLBuffer implements AutoCloseable {
     public GLFormat mFormat;
     public ByteBuffer byteBuffer;
     public GLBuffer(int size,GLFormat mFormat){
-        this(size,mFormat,GL_STATIC_DRAW);
+        this(size,mFormat,GL_STATIC_DRAW,true);
     }
     public GLBuffer(int size,GLFormat mFormat,int mode){
+        this(size,mFormat,mode,true);
+    }
+    /* IRIS_26489_GPU_ONLY_SSBO_ALLOCATION
+     * Large Motion RCD scratch buffers never need a Java-side mirror. Existing constructors keep
+     * their exact historical CPU-mirror behavior; only explicit Motion callers can opt out.
+     */
+    public GLBuffer(int size,GLFormat mFormat,int mode,boolean allocateCpuMirror){
         this.mFormat = new GLFormat(mFormat);
         this.size = size;
         this.byteSize = size*mFormat.mFormat.mSize;
         this.mode = mode;
-        byteBuffer = ByteBuffer.allocateDirect(byteSize);
-        byteBuffer.order(ByteOrder.nativeOrder());
+        if(allocateCpuMirror) {
+            byteBuffer = ByteBuffer.allocateDirect(byteSize);
+            byteBuffer.order(ByteOrder.nativeOrder());
+        } else {
+            byteBuffer = null;
+        }
         int [] IDPointer = new int[1];
         glGenBuffers(1, IDPointer,0);
         mBufferID = IDPointer[0];
@@ -53,7 +64,8 @@ public class GLBuffer implements AutoCloseable {
         Buffering(size);
     }
     public void Buffering(int size){
-        glBufferData(GL_SHADER_STORAGE_BUFFER, byteSize, byteBuffer.asIntBuffer(), mode);
+        glBufferData(GL_SHADER_STORAGE_BUFFER, byteSize,
+                byteBuffer == null ? null : byteBuffer.asIntBuffer(), mode);
         checkEglError("clear buffer:"+mBufferID);
     }
     public int[] readBufferIntegers(boolean clear)
@@ -100,7 +112,7 @@ public class GLBuffer implements AutoCloseable {
         return output;
     }
     public void Clear(){
-        byteBuffer.clear();
+        if(byteBuffer != null) byteBuffer.clear();
     }
     
     public void uploadBuffer(int[] data, int count) {

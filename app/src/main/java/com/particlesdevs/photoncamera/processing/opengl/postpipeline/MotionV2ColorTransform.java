@@ -35,13 +35,10 @@ public final class MotionV2ColorTransform extends Node {
         }
 
         float greenGain = 0.5f * (g[1] + g[2]);
-        float sensorClipLevel = Math.max(
-                1.0f, basePipeline.mParameters.motionCanonicalExposureGain);
 
         glProg.useAssetProgram("motionv2/color_transform");
         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
         glProg.setVar("sensorGains", new float[]{g[0], greenGain, g[3]});
-        glProg.setVar("sensorClipLevel", sensorClipLevel);
         glProg.setVar("colorRow0", new float[]{m[0],m[1],m[2]});
         glProg.setVar("colorRow1", new float[]{m[3],m[4],m[5]});
         glProg.setVar("colorRow2", new float[]{m[6],m[7],m[8]});
@@ -50,17 +47,13 @@ public final class MotionV2ColorTransform extends Node {
         glProg.drawBlocks(WorkingTexture);
         glProg.closed = true;
 
-        Log.d(Name, "IRIS_26430_V2_COLOR"
+        Log.d(Name, "IRIS_26482_CAMERA2_COLOR_ONLY_AFTER_CFA_AUTHORITY"
                 + " gainsRGeGoB=" + java.util.Arrays.toString(g)
                 + " greenMean=" + greenGain
                 + " matrixRowMajor=" + java.util.Arrays.toString(m)
-                + " sensorClipLevel=" + sensorClipLevel
                 + " camera2ColorAuthority=true"
-                + " sensorOnlyHighlightSafety=false"
-                + " transformedOverflowNeutralization=true"
-                + " neighborHueReconstruction=false"
-                + " perChannelSensorValidity=true"
-                + " lumaOwnedHighlightChroma=true"
-                + " explicitDotRows=true");
+                + " postRgbClipInference=false"
+                + " cfaClipAuthorityUpstream=true"
+                + " camera2WbAppliedOnce=true");
     }
 }

@@ -46,13 +46,25 @@ public final class MotionV2UltraHdr {
                         unrotatedGainMap.getWidth(),
                         unrotatedGainMap.getHeight(),
                         matrix,
-                        true);
+                        false);
                 if (oriented != unrotatedGainMap
                         && !unrotatedGainMap.isRecycled()) {
                     unrotatedGainMap.recycle();
                 }
             }
 
+            /* IRIS_26470_UHDR_EXACT_ORTHOGONAL_GEOMETRY */
+            float baseAspect = sdrBase.getHeight() > 0
+                    ? sdrBase.getWidth() / (float) sdrBase.getHeight() : 0.0f;
+            float gainAspect = oriented.getHeight() > 0
+                    ? oriented.getWidth() / (float) oriented.getHeight() : 0.0f;
+            float aspectError = Math.abs(baseAspect - gainAspect);
+            Log.d(TAG, "IRIS_26470_UHDR_ATTACH_GEOMETRY"
+                    + " base=" + sdrBase.getWidth() + "x" + sdrBase.getHeight()
+                    + " gain=" + oriented.getWidth() + "x" + oriented.getHeight()
+                    + " rotation=" + rotation
+                    + " exactOrthogonalRotation=true interpolation=false"
+                    + " aspectError=" + aspectError);
             float safeMax = Math.max(1.50f, Math.min(2.5f, maxRatio));
             Gainmap gainmap = new Gainmap(oriented);
             gainmap.setRatioMin(MIN_RATIO, MIN_RATIO, MIN_RATIO);
