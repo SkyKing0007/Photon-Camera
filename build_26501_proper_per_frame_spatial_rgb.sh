@@ -10,6 +10,7 @@ WORK="$ROOT/.build_26501_proper_spatial_rgb_work"
 BASE="$WORK/base26499"
 CAND="$WORK/candidate26501"
 PATCH="$ROOT/26501_proper_per_frame_spatial_rgb_runtime.patch"
+V6_PATCH="$ROOT/26501_v6_glsl_portability_runtime_fix.patch"
 BASE_TAR="$ROOT/26499_v7_successful_app_source.tar.gz"
 BASE_MANIFEST="$ROOT/26499_v7_successful_after.sha256"
 VALIDATOR="$ROOT/validate_26501_proper_spatial_rgb.py"
@@ -19,6 +20,7 @@ EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_TAR_SHA="ce5be58fa20b9e28786b9c6e4355743066fe92e78791b50b5ee2df568c5ae9e1"
 BASE_MANIFEST_SHA="9af4b1cf5411b5cae445c3e2b782e07d824c3d4a2bcd16f3c7cf28ba79b5a74f"
 PATCH_SHA="49dfedc17f93c636f90140125ee127a2429f3afb3c365832d97bb74e40318386"
+V6_PATCH_SHA="db574aec0e3b67504fddf64d2129cb7a2a782f27eba3271f730acb1fa05df0e6"
 
 rm -rf "$OUT" "$WORK"
 mkdir -p "$OUT" "$BASE" "$CAND"
@@ -36,12 +38,13 @@ if [[ -s "$DIRECT_RUNTIME_DIFF" ]]; then
   git diff --name-status "$V7_SHA"..HEAD -- app/src/main app/version.properties >&2 || true
   fail "handoff commit directly modified runtime app source"
 fi
-for f in "$PATCH" "$BASE_TAR" "$BASE_MANIFEST" "$VALIDATOR" "$INTEGRITY"; do
+for f in "$PATCH" "$V6_PATCH" "$BASE_TAR" "$BASE_MANIFEST" "$VALIDATOR" "$INTEGRITY"; do
   [[ -f "$f" ]] || fail "missing handoff file: $(basename "$f")"
 done
 [[ "$(sha "$BASE_TAR")" == "$BASE_TAR_SHA" ]] || fail "26499 successful source tar hash mismatch"
 [[ "$(sha "$BASE_MANIFEST")" == "$BASE_MANIFEST_SHA" ]] || fail "26499 successful manifest hash mismatch"
 [[ "$(sha "$PATCH")" == "$PATCH_SHA" ]] || fail "26501 runtime patch hash mismatch"
+[[ "$(sha "$V6_PATCH")" == "$V6_PATCH_SHA" ]] || fail "26501 V6 GLSL portability patch hash mismatch"
 echo "PASS: exact 26499/V7 successful-source artifact is the only runtime base"
 
 echo "=== 26501 GATE 2: RECONSTRUCT EXACT SUCCESSFUL 26499 SOURCE ==="
@@ -56,9 +59,23 @@ BASE_COUNT="$({ find "$BASE/app/src/main" -type f -print; echo "$BASE/app/versio
 cp -a "$BASE/app" "$CAND/app"
 echo "PASS: exact successful 26499 source reconstructed and hash-verified (865/865)"
 
-echo "=== 26501 GATE 3: APPLY ONLY THE AUDITED PROPER SPATIAL RGB PATCH ==="
+echo "=== 26501 GATE 3: APPLY AUDITED SPATIAL RGB + V6 GLSL PORTABILITY PATCHES ==="
 patch --dry-run -p1 -d "$CAND" < "$PATCH" > "$OUT/26501_patch_dry_run.txt"
 patch -p1 -d "$CAND" < "$PATCH" > "$OUT/26501_patch_apply.txt"
+V6_SHADER_REL="app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl"
+cp "$CAND/$V6_SHADER_REL" "$OUT/26501_v5_contribute_pre_v6.glsl"
+patch --dry-run -p1 -d "$CAND" < "$V6_PATCH" > "$OUT/26501_v6_glsl_patch_dry_run.txt"
+patch -p1 -d "$CAND" < "$V6_PATCH" > "$OUT/26501_v6_glsl_patch_apply.txt"
+python3 - "$OUT/26501_v5_contribute_pre_v6.glsl" "$CAND/$V6_SHADER_REL" <<'PY'
+from pathlib import Path
+import sys
+before=Path(sys.argv[1]).read_text()
+after=Path(sys.argv[2]).read_text()
+restored=after.replace('ownedPixel','sample').replace('precisionMatrix','precision').replace('packedCoord','packed')
+if restored!=before:
+ raise SystemExit('V6 GLSL portability patch changed more than reserved identifier names')
+print('PASS: V6 GLSL portability patch is identifier-only; reconstruction math is byte-equivalent')
+PY
 python3 "$VALIDATOR" "$CAND" --base "$BASE" | tee "$OUT/26501_prebuild_validator.txt"
 python3 - "$BASE/app" "$CAND/app" "$OUT/26501_scope.txt" <<'PY'
 from pathlib import Path
@@ -88,6 +105,29 @@ items=[
  ('app/src/main/assets/shaders/motionv2/render.glsl','frag'),
  ('app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl','comp'),
 ]
+
+# Reject GLSL reserved words when they are used as declared identifiers.
+# This is intentionally declaration-aware so legal keyword statements such as
+# `precision highp float;` are not false positives.
+reserved={
+ 'sample','precision','packed','common','partition','active','asm','class','union','enum','typedef','template','this','resource','goto',
+ 'inline','noinline','public','static','extern','external','interface','long','short','half','fixed','unsigned','superp','input','output',
+ 'hvec2','hvec3','hvec4','fvec2','fvec3','fvec4','sampler3DRect','filter','sizeof','cast','namespace','using','row_major'
+}
+type_re=r'(?:bool|int|uint|float|double|vec[234]|ivec[234]|uvec[234]|bvec[234]|dvec[234]|mat[234](?:x[234])?|dmat[234](?:x[234])?|[iu]?sampler\w+|[iu]?image\w+)'
+for rel,_ in items:
+ src=(root/rel).read_text()
+ clean=re.sub(r'/\*.*?\*/',' ',src,flags=re.S)
+ clean=re.sub(r'//.*',' ',clean)
+ hits=[]
+ for m in re.finditer(r'\b'+type_re+r'\s+([A-Za-z_]\w*)',clean):
+  if m.group(1) in reserved:
+   line=clean.count('\n',0,m.start())+1
+   hits.append((line,m.group(1)))
+ if hits:
+  raise SystemExit(f'{rel}: GLSL reserved declared identifiers: {hits}')
+print('PASS: no GLSL reserved identifiers are used as declarations across 7 preflight shaders')
+
 log=[]
 for rel,stage in items:
  p=root/rel; src=p.read_text()
@@ -206,7 +246,7 @@ for generated in archive.h archive_entry.h technicallyflac.h tiny_dng_writer.h; 
     fail "generated dependency leaked into successful source: $generated"
   fi
 done
-sha256sum "$PATCH" "$BASE_TAR" "$BASE_MANIFEST" "$FINAL" "$OUT/26501_successful_app_source.tar.gz" > "$OUT/26501_artifact_hashes.sha256"
+sha256sum "$PATCH" "$V6_PATCH" "$BASE_TAR" "$BASE_MANIFEST" "$FINAL" "$OUT/26501_successful_app_source.tar.gz" > "$OUT/26501_artifact_hashes.sha256"
 cat > "$OUT/26501_build_report.txt" <<EOF
 26501 Proper Per-Frame Spatial RGB
 Branch: $BRANCH
@@ -216,6 +256,7 @@ Version: 0.9726501 / 26501
 APK: $(basename "$FINAL")
 APK SHA256: $(sha "$FINAL")
 Runtime scope: 5 modified + 4 new files; no removals
+V6 GLSL portability: reserved local identifiers renamed only; reconstruction equations unchanged
 Normal stack: frame 0 + every admitted Wronski normal contributes native RAW semantic G/R-G/B-G exactly once
 Persistent RGB owner: two additive RGBA16F accumulators; normalize exactly once after burst/HDR roles
 Alignment/rejection: 26499 Wronski geometry, covariance/rejection authority preserved
