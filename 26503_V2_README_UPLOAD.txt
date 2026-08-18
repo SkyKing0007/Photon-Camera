@@ -47,3 +47,10 @@ V5 reached Gradle javac and failed because the seed referenced a field that does
 
 COMMIT SENTENCE
   26503 V6: use MotionMetrics retained-frame owner and add Java symbol preflight
+
+
+V7 POST-BUILD AUDIT CORRECTION (2026-08-18)
+- Gradle in V6 completed successfully; the red job was caused only by an invalid post-build DEX assertion.
+- IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK is a Java source comment and is now verified against exact built source, not DEX.
+- DEX checks remain only for real runtime strings.
+- No Motion/HDR/image-quality/EXIF source transform changed versus V6.

@@ -168,13 +168,21 @@ from zipfile import ZipFile
 import hashlib,sys
 apk=Path(sys.argv[1]); root=Path(sys.argv[2]); assets=['short_highlight_bayer_recover.glsl','display_exposure.glsl','render.glsl','color_transform.glsl','mfsr_spatial_rgb_normalize_26501.glsl','mfsr_spatial_rgb_contribute_26501.glsl']
 h=lambda b:hashlib.sha256(b).hexdigest()
+# IRIS_26503_POSTBUILD_SOURCE_ONLY_PROVENANCE_DISABLE_AUDIT
+# The provenance-disable token is a Java source comment attached to a constant-false
+# diagnostic branch. javac is expected to discard comments, so it is invalid to require
+# that token in DEX. Prove that edit against the exact built source instead.
+cfa=(root/'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java').read_bytes()
+assert b'if (false && /* IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK */' in cfa, \
+       b'26503 provenance readback is not source-disabled'
 with ZipFile(apk) as z:
  for n in assets:
   p='assets/shaders/motionv2/'+n; want=h((root/'app/src/main/assets/shaders/motionv2'/n).read_bytes()); got=h(z.read(p)); assert got==want,(n,got,want)
  dex=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex'))
- for m in [b'IRIS_26503_FROZEN_CAPTURE_SCENE_KEY_GAIN',b'IRIS_26503_SINGLE_EXPOSURE_SHADOW_AUTHORITY',b'IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK']:
+ # These two markers are actual runtime log strings and therefore are valid DEX checks.
+ for m in [b'IRIS_26503_FROZEN_CAPTURE_SCENE_KEY_GAIN',b'IRIS_26503_SINGLE_EXPOSURE_SHADOW_AUTHORITY']:
   assert m in dex,m
-print('PASS: APK/source shader parity + required 26503 Java markers in DEX')
+print('PASS: APK/source shader parity + runtime Java markers in DEX + source-only provenance-disable proof')
 PY
 pass "GATE 5 exactly one 26503 APK built from direct canonical-26502 delta"
 
