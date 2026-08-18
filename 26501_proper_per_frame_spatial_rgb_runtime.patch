@@ -1,0 +1,1356 @@
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_chroma_guide_26501.glsl b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_chroma_guide_26501.glsl
+new file mode 100644
+index 0000000..f969ac5
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_chroma_guide_26501.glsl
+@@ -0,0 +1,80 @@
++precision highp float;
++precision highp int;
++precision highp usampler2D;
++
++uniform highp usampler2D rawTexture;
++uniform ivec2 rawSize;
++uniform int cfaPattern;
++uniform vec4 blackLevel;
++uniform float whiteLevel;
++uniform float exposureScale;
++uniform float wbR;
++uniform float wbB;
++out float Output;
++
++/* IRIS_26501_PER_FRAME_NATIVE_GREEN_GUIDE
++ * 1.27.1-style edge-directed green is built independently for every RAW frame.
++ * Native green sites are preserved. R/B sites are reconstructed only from native
++ * green neighbours plus the same-colour second-neighbour correction. R/B values
++ * are never allowed to become a generic green lower bound.
++ */
++int phaseAt(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
++int colorAt(ivec2 p){
++    int q=phaseAt(p);
++    if(cfaPattern==0)return q==0?0:(q==3?2:1);
++    if(cfaPattern==1)return q==1?0:(q==2?2:1);
++    if(cfaPattern==2)return q==2?0:(q==1?2:1);
++    return q==3?0:(q==0?2:1);
++}
++int clampPhaseCoordinate(int v,int extent){
++    int phase=v&1;
++    if(phase>=extent)return extent-1;
++    int last=phase+2*((extent-1-phase)/2);
++    return clamp(v,phase,last);
++}
++ivec2 phaseClamp(ivec2 p){
++    return ivec2(clampPhaseCoordinate(p.x,rawSize.x),clampPhaseCoordinate(p.y,rawSize.y));
++}
++float wbForColor(int c){return c==0?wbR:(c==2?wbB:1.0);}
++float gainedRaw(ivec2 p){
++    p=phaseClamp(p);
++    int phase=phaseAt(p);
++    float rawValue=float(texelFetch(rawTexture,p,0).r);
++    float black=blackLevel[phase];
++    float sensor=max(rawValue-black,0.0)/max(whiteLevel-black,1.0);
++    return sensor*exposureScale*wbForColor(colorAt(p));
++}
++float greenAtNonGreen(ivec2 p,float center){
++    float gL=gainedRaw(p+ivec2(-1,0));
++    float gR=gainedRaw(p+ivec2( 1,0));
++    float gU=gainedRaw(p+ivec2(0,-1));
++    float gD=gainedRaw(p+ivec2(0, 1));
++    float cL2=gainedRaw(p+ivec2(-2,0));
++    float cR2=gainedRaw(p+ivec2( 2,0));
++    float cU2=gainedRaw(p+ivec2(0,-2));
++    float cD2=gainedRaw(p+ivec2(0, 2));
++    float horizontalLinear=0.5*(gL+gR);
++    float verticalLinear=0.5*(gU+gD);
++    float horizontalCorrection=clamp(
++            0.25*(2.0*center-cL2-cR2),
++            -0.5*abs(gL-gR),0.5*abs(gL-gR));
++    float verticalCorrection=clamp(
++            0.25*(2.0*center-cU2-cD2),
++            -0.5*abs(gU-gD),0.5*abs(gU-gD));
++    float horizontal=horizontalLinear+horizontalCorrection;
++    float vertical=verticalLinear+verticalCorrection;
++    float gradientH=abs(gL-gR)+abs(2.0*center-cL2-cR2);
++    float gradientV=abs(gU-gD)+abs(2.0*center-cU2-cD2);
++    float blendH=gradientV/max(gradientH+gradientV,1.0e-7);
++    float green=mix(vertical,horizontal,blendH);
++    float nativeMin=min(min(gL,gR),min(gU,gD));
++    float nativeMax=max(max(gL,gR),max(gU,gD));
++    return clamp(green,nativeMin,nativeMax);
++}
++void main(){
++    ivec2 p=ivec2(gl_FragCoord.xy);
++    if(any(greaterThanEqual(p,rawSize))){Output=0.0;return;}
++    float center=gainedRaw(p);
++    int c=colorAt(p);
++    Output=c==1?center:greenAtNonGreen(p,center);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
+new file mode 100644
+index 0000000..005e5cf
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
+@@ -0,0 +1,176 @@
++precision highp float;
++precision highp int;
++precision highp usampler2D;
++
++uniform highp usampler2D rawTexture;
++uniform highp sampler2D chromaGuide;
++uniform highp sampler2D flowTexture;
++uniform highp sampler2D robustnessTexture;
++uniform highp sampler2D covarianceTexture;
++uniform highp sampler2D semanticPhaseWeightTexture;
++uniform ivec2 rawSize;
++uniform ivec2 packedSize;
++uniform int cfaPattern;
++uniform vec4 blackLevel;
++uniform float whiteLevel;
++uniform float exposureScale;
++uniform float wbR;
++uniform float wbB;
++uniform vec2 greenNoise;
++uniform float chromaEdgeNoiseSigmas;
++uniform float chromaEdgeSigmaFloor;
++uniform int referenceFrame;
++uniform int useFrameWeight;
++uniform int useSemanticPhaseWeight;
++uniform float physicalClipThreshold;
++
++layout(location=0) out vec4 SemanticAndGreenWeight;
++layout(location=1) out vec4 OpponentWeights;
++
++/* IRIS_26501_WRONSKI_PER_FRAME_SPATIAL_RGB_OWNER
++ * Each accepted RAW frame contributes semantic G / (R-G) / (B-G) evidence before
++ * any Bayer collapse. Wronski flow, covariance and final rejection weight remain
++ * authoritative. Two persistent RGBA16F render targets accumulate additively;
++ * there is no read/write RGB ping-pong image.
++ */
++int phaseAt(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
++int colorAt(ivec2 p){
++    int q=phaseAt(p);
++    if(cfaPattern==0)return q==0?0:(q==3?2:1);
++    if(cfaPattern==1)return q==1?0:(q==2?2:1);
++    if(cfaPattern==2)return q==2?0:(q==1?2:1);
++    return q==3?0:(q==0?2:1);
++}
++float wbForColor(int c){return c==0?wbR:(c==2?wbB:1.0);}
++bool inBounds(ivec2 p){return all(greaterThanEqual(p,ivec2(0)))&&all(lessThan(p,rawSize));}
++int clampPhaseCoordinate(int v,int extent){
++    int phase=v&1;
++    if(phase>=extent)return extent-1;
++    int last=phase+2*((extent-1-phase)/2);
++    return clamp(v,phase,last);
++}
++ivec2 phaseClamp(ivec2 p){
++    return ivec2(clampPhaseCoordinate(p.x,rawSize.x),clampPhaseCoordinate(p.y,rawSize.y));
++}
++bool ownedSample(ivec2 requested,out ivec2 sample){
++    if(inBounds(requested)){sample=requested;return true;}
++    if(referenceFrame!=0){sample=phaseClamp(requested);return true;}
++    sample=ivec2(0);return false;
++}
++float physicalSensor(ivec2 p){
++    int phase=phaseAt(p);
++    float rawValue=float(texelFetch(rawTexture,p,0).r);
++    float black=blackLevel[phase];
++    return max(rawValue-black,0.0)/max(whiteLevel-black,1.0);
++}
++float gainedRaw(ivec2 p){return physicalSensor(p)*exposureScale*wbForColor(colorAt(p));}
++float greenAt(ivec2 p){return texelFetch(chromaGuide,p,0).r;}
++mat2 precisionAt(vec2 sourceRaw){
++    vec2 uv=clamp((sourceRaw+vec2(0.5))/vec2(rawSize),vec2(0.0),vec2(1.0));
++    vec4 v=texture(covarianceTexture,uv);
++    return mat2(v.x,v.y,v.z,v.w);
++}
++float spatialWeight(vec2 offset,mat2 precision){
++    float d=max(dot(offset,precision*offset),0.0);
++    return exp2(-0.5*d)+0.00005;
++}
++float phaseComponent(vec4 v,int q){return q==0?v.r:(q==1?v.g:(q==2?v.b:v.a));}
++vec3 semanticAxisPhaseWeight(ivec2 outputPixel){
++    if(useSemanticPhaseWeight==0)return vec3(1.0);
++    ivec2 packed=clamp(outputPixel>>1,ivec2(0),packedSize-ivec2(1));
++    vec4 phaseWeight=max(texelFetch(semanticPhaseWeightTexture,packed,0),vec4(0.0));
++    float rWeight=0.0,bWeight=0.0,gWeight=0.0;
++    int greenCount=0;
++    for(int q=0;q<4;++q){
++        ivec2 phasePixel=ivec2(q&1,q>>1);
++        int c=colorAt(phasePixel);
++        float w=phaseComponent(phaseWeight,q);
++        if(c==0)rWeight=w;
++        else if(c==2)bWeight=w;
++        else{gWeight+=w;greenCount++;}
++    }
++    gWeight/=float(max(greenCount,1));
++    /* Axis order is G, R-G, B-G. */
++    return clamp(vec3(gWeight,rWeight,bWeight),vec3(0.0),vec3(1.0));
++}
++float frameWeightAt(ivec2 outputPixel){
++    if(useFrameWeight==0)return 1.0;
++    ivec2 packed=outputPixel>>1;
++    vec2 uv=(vec2(packed)+vec2(0.5))/vec2(packedSize);
++    return clamp(texture(robustnessTexture,uv).r,0.0,1.0);
++}
++vec2 sourceRawAt(ivec2 outputPixel){
++    if(referenceFrame!=0)return vec2(outputPixel);
++    ivec2 packed=outputPixel>>1;
++    vec2 uv=(vec2(packed)+vec2(0.5))/vec2(packedSize);
++    vec2 packedFlow=texture(flowTexture,uv).xy;
++    return vec2(outputPixel)+2.0*packedFlow;
++}
++float chromaGuideWeight(float localGreen,float targetGreen){
++    float signal=max(max(localGreen,targetGreen),0.0);
++    float variance=max(greenNoise.x*signal+greenNoise.y,1.0e-10);
++    float sigma=max(chromaEdgeSigmaFloor,chromaEdgeNoiseSigmas*sqrt(variance));
++    float normalized=(localGreen-targetGreen)/max(sigma,1.0e-7);
++    return exp(-0.5*normalized*normalized);
++}
++void main(){
++    ivec2 outP=ivec2(gl_FragCoord.xy);
++    SemanticAndGreenWeight=vec4(0.0);
++    OpponentWeights=vec4(0.0);
++    if(any(greaterThanEqual(outP,rawSize)))return;
++    float fw=frameWeightAt(outP);
++    if(fw<=0.0)return;
++    vec2 sourceRaw=sourceRawAt(outP);
++    if(sourceRaw.x<0.0||sourceRaw.y<0.0||sourceRaw.x>float(rawSize.x-1)||sourceRaw.y>float(rawSize.y-1))return;
++
++    vec2 samplePosition=sourceRaw+vec2(0.5);
++    ivec2 anchor=ivec2(floor(samplePosition));
++    vec2 subpixelOffset=vec2(anchor)+vec2(0.5)-samplePosition;
++    mat2 precision=precisionAt(sourceRaw);
++    vec3 semantic=vec3(0.0);
++    vec3 weights=vec3(0.0);
++
++    /* Native green owns structure. Missing auxiliary edge samples are skipped rather
++     * than mirrored; therefore their authority naturally falls relative to frame 0. */
++    for(int dy=-1;dy<=1;++dy){
++        for(int dx=-1;dx<=1;++dx){
++            ivec2 requested=anchor+ivec2(dx,dy);
++            ivec2 q;
++            if(!ownedSample(requested,q)||colorAt(q)!=1)continue;
++            if(physicalSensor(q)>=physicalClipThreshold)continue;
++            float w=spatialWeight(vec2(dx,dy)+subpixelOffset,precision);
++            semantic.x+=gainedRaw(q)*w;
++            weights.x+=w;
++        }
++    }
++    if(weights.x<=1.0e-8)return;
++    float targetGreen=semantic.x/weights.x;
++
++    for(int dy=-1;dy<=1;++dy){
++        for(int dx=-1;dx<=1;++dx){
++            ivec2 requested=anchor+ivec2(dx,dy);
++            ivec2 q;
++            if(!ownedSample(requested,q))continue;
++            int c=colorAt(q);
++            if(c==1)continue;
++            if(physicalSensor(q)>=physicalClipThreshold)continue;
++            float spatial=spatialWeight(vec2(dx,dy)+subpixelOffset,precision);
++            float localGreen=greenAt(q);
++            float w=spatial*chromaGuideWeight(localGreen,targetGreen);
++            float opponent=gainedRaw(q)-localGreen;
++            if(c==0){semantic.y+=opponent*w;weights.y+=w;}
++            else{semantic.z+=opponent*w;weights.z+=w;}
++        }
++    }
++
++    vec3 axisWeight=semanticAxisPhaseWeight(outP)*fw;
++    SemanticAndGreenWeight=vec4(
++            semantic.x*axisWeight.x,
++            semantic.y*axisWeight.y,
++            semantic.z*axisWeight.z,
++            weights.x*axisWeight.x);
++    OpponentWeights=vec4(
++            weights.y*axisWeight.y,
++            weights.z*axisWeight.z,
++            0.0,0.0);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl
+new file mode 100644
+index 0000000..534b96f
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl
+@@ -0,0 +1,97 @@
++precision highp float;
++precision highp int;
++
++uniform highp sampler2D semanticAccumulator;
++uniform highp sampler2D opponentWeightAccumulator;
++uniform highp sampler2D fallbackCfa;
++uniform highp sampler2D highlightProvenance;
++uniform highp sampler2D lensShadingMap;
++uniform ivec2 rawSize;
++uniform ivec2 packedSize;
++uniform vec3 cameraDomainScale;
++uniform int useLensShading;
++out vec4 Output;
++
++/* IRIS_26501_SPATIAL_RGB_NORMALIZE_EXACTLY_ONCE
++ * Semantic averages are normalized once after the final admitted frame. Lens
++ * shading is applied only after complete camera RGB exists. The temporary
++ * calculation white balance is removed exactly once before the downstream
++ * Camera2 color transform. Censored highlight fallback is brightness-only.
++ */
++float phaseDivisor(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
++float packedCensoredFraction(ivec2 packedP){
++    packedP=clamp(packedP,ivec2(0),packedSize-ivec2(1));
++    float code=texelFetch(highlightProvenance,packedP,0).r;
++    float count=0.0;
++    for(int q=0;q<4;++q){
++        float state=mod(floor(code/phaseDivisor(q)),3.0);
++        count+=abs(state-1.0)<0.25?1.0:0.0;
++    }
++    return 0.25*count;
++}
++float smoothCensoredFraction(ivec2 rawP){
++    /* IRIS_26501_PHASE_INVARIANT_CENSORED_ROLLOFF
++     * Provenance is packed per 2x2 CFA cell, but the RGB carrier is full resolution.
++     * Bilinearly expand the censored fraction before reducing chroma so a single
++     * packed-cell transition cannot reappear as a hard 2x2 highlight stair-step.
++     */
++    vec2 packedPosition=0.5*vec2(rawP)-vec2(0.5);
++    ivec2 lo=ivec2(floor(packedPosition));
++    ivec2 hi=lo+ivec2(1);
++    vec2 f=fract(packedPosition);
++    float a=packedCensoredFraction(lo);
++    float b=packedCensoredFraction(ivec2(hi.x,lo.y));
++    float c=packedCensoredFraction(ivec2(lo.x,hi.y));
++    float d=packedCensoredFraction(hi);
++    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
++}
++float packedNeutralAt(ivec2 packedP){
++    packedP=clamp(packedP,ivec2(0),packedSize-ivec2(1));
++    vec4 v=max(texelFetch(fallbackCfa,packedP,0),vec4(0.0));
++    return max(max(v.r,v.g),max(v.b,v.a));
++}
++float neutralFallback(ivec2 rawP){
++    vec2 packedPosition=(vec2(rawP)+vec2(0.5))*0.5-vec2(0.25);
++    vec2 p=packedPosition-vec2(0.5);
++    ivec2 lo=ivec2(floor(p));
++    vec2 f=fract(p);
++    ivec2 hi=lo+ivec2(1);
++    float a=packedNeutralAt(lo);
++    float b=packedNeutralAt(ivec2(hi.x,lo.y));
++    float c=packedNeutralAt(ivec2(lo.x,hi.y));
++    float d=packedNeutralAt(hi);
++    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
++}
++vec3 lensShadingRgb(ivec2 rawP){
++    if(useLensShading==0)return vec3(1.0);
++    vec2 uv=(vec2(rawP)+vec2(0.5))/vec2(rawSize);
++    vec4 g=texture(lensShadingMap,clamp(uv,vec2(0.0),vec2(1.0)));
++    return max(vec3(g.r,0.5*(g.g+g.b),g.a),vec3(0.0));
++}
++void main(){
++    ivec2 p=ivec2(gl_FragCoord.xy);
++    if(any(greaterThanEqual(p,rawSize))){Output=vec4(0.0);return;}
++    vec4 semantic=texelFetch(semanticAccumulator,p,0);
++    vec4 opponentWeights=texelFetch(opponentWeightAccumulator,p,0);
++    float gWeight=semantic.a;
++    float rWeight=opponentWeights.r;
++    float bWeight=opponentWeights.g;
++    float green=gWeight>1.0e-7?semantic.r/gWeight:0.0;
++    float rg=rWeight>1.0e-7?semantic.g/rWeight:0.0;
++    float bg=bWeight>1.0e-7?semantic.b/bWeight:0.0;
++    vec3 calculationRgb=max(vec3(green+rg,green,green+bg),vec3(0.0));
++
++    /* If physical colour evidence is absent/censored, never reconstruct hue from
++     * missing CFA phases. Use one phase-invariant neutral brightness instead. */
++    float censored=smoothCensoredFraction(p);
++    bool missing=gWeight<=1.0e-7||rWeight<=1.0e-7||bWeight<=1.0e-7;
++    float neutralMix=smoothstep(0.0,0.75,censored);
++    if(missing)neutralMix=1.0;
++    if(neutralMix>0.0){
++        float neutral=neutralFallback(p);
++        calculationRgb=mix(calculationRgb,vec3(max(neutral,green)),neutralMix);
++    }
++    calculationRgb*=lensShadingRgb(p);
++    vec3 cameraRgb=calculationRgb*cameraDomainScale;
++    Output=vec4(max(cameraRgb,vec3(0.0)),min(gWeight,65504.0));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl
+new file mode 100644
+index 0000000..58d778f
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl
+@@ -0,0 +1,25 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp image2D;
++uniform highp sampler2D highlightProvenance;
++layout(rgba32f,binding=0) uniform highp writeonly image2D outWeight;
++uniform ivec2 packedSize;
++
++/* IRIS_26501_SHORT_VALIDATED_SEMANTIC_PHASE_WEIGHT
++ * Preserve the existing Short-A validator phase by phase. Each packed texel stores
++ * R/G1/G2/B authority independently; a validated red phase can never authorize a
++ * neighbouring green or blue phase. Native short RAW is still the only color source.
++ */
++float phaseDivisor(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
++void main(){
++    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
++    if(any(greaterThanEqual(p,packedSize)))return;
++    float code=texelFetch(highlightProvenance,p,0).r;
++    vec4 weight=vec4(0.0);
++    for(int q=0;q<4;++q){
++        float state=mod(floor(code/phaseDivisor(q)),3.0);
++        weight[q]=abs(state-2.0)<0.25?1.0:0.0;
++    }
++    imageStore(outWeight,p,weight);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 494c184..fea8a13 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -97,7 +97,13 @@ float mapHeadroomLuminance(float y) {
+             log(1.0+logShape*x)
+             /log(1.0+logShape);
+ 
+-    return start+(1.0-start)*shaped;
++    /* IRIS_26501_WHITE_TARGET_AFTER_EXISTING_OUTPUT_EXPOSURE
++     * The previous 1.0 pre-scale ceiling became only 0.80 after the proven output
++     * exposure, structurally preventing clean white clipping. Map to the inverse
++     * of that existing scale so the final SDR endpoint can actually reach 1.0.
++     */
++    float preScaleDisplayWhite=1.0/max(outputExposureScale,1.0e-6);
++    return start+(preScaleDisplayWhite-start)*shaped;
+ }
+ 
+ vec3 mapExtendedLinearHeadroom(vec3 rgb) {
+@@ -118,7 +124,21 @@ vec3 mapExtendedLinearHeadroom(vec3 rgb) {
+      * clamp is introduced here.
+      */
+     float mappedGuide=mapHeadroomLuminance(guide);
+-    return rgb*(mappedGuide/guide);
++    vec3 mapped=rgb*(mappedGuide/guide);
++
++    /* IRIS_26501_GENTLE_NEUTRAL_WHITE_ROLLOFF
++     * Real colour is retained through most of the shoulder. Only the final part
++     * of physical headroom converges continuously to neutral display white. This
++     * is the approved clipping behaviour: no hue invention, no hard grey shelf.
++     */
++    const float start=0.50;
++    float whitePoint=max(sceneWhite,start+0.05);
++    float headroomPosition=clamp(
++            (guide-start)/max(whitePoint-start,1.0e-6),
++            0.0,
++            1.0);
++    float neutralMix=smoothstep(0.82,1.0,headroomPosition);
++    return mix(mapped,vec3(mappedGuide),neutralMix);
+ }
+ 
+ /*
+@@ -138,7 +158,9 @@ vec3 fitDisplayGamut(vec3 rgb) {
+      * foliage approached display white. Uniform RGB scaling preserves channel
+      * ratios/hue and trades only highlight luminance for display gamut.
+      */
+-    return rgb/max(peak,1.0e-6);
++    vec3 hueSafe=rgb/max(peak,1.0e-6);
++    float overflow=clamp((peak-1.0)/0.25,0.0,1.0);
++    return mix(hueSafe,vec3(1.0),smoothstep(0.0,1.0,overflow));
+ }
+ 
+ void main() {
+diff --git a/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl b/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl
+index 4f25f09..cf3a927 100644
+--- a/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl
++++ b/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl
+@@ -10,6 +10,7 @@ uniform highp sampler2D shadowCfa;
+ uniform highp sampler2D flowTexture;
+ uniform highp sampler2D frameSupport;
+ layout(rgba32f, binding = 0) uniform highp writeonly image2D outCfa;
++layout(rgba32f, binding = 1) uniform highp writeonly image2D outSemanticWeight;
+ layout(std430, binding = 3) buffer ShadowDiagBuf {
+     uint shadowDiag[];
+ };
+@@ -70,18 +71,32 @@ void main(){
+     vec4 merged=texelFetch(mergedCfa,p,0), ref=texelFetch(referenceCfa,p,0);
+     vec4 mergedSensor=merged/max(referenceExposureScale,1.0e-6);
+     vec4 refSensor=ref/max(referenceExposureScale,1.0e-6);
+-    if(max4(mergedSensor)>=deepShadowPackCeiling||max4(refSensor)>=deepShadowPackCeiling){imageStore(outCfa,p,merged);return;}
++    if(max4(mergedSensor)>=deepShadowPackCeiling||max4(refSensor)>=deepShadowPackCeiling){
++        imageStore(outCfa,p,merged);
++        imageStore(outSemanticWeight,p,vec4(0.0));
++        return;
++    }
+     vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize); vec4 fs=texture(flowTexture,uv);
+     float cancelled=step(0.5,fs.w);
+     float flowConfidence=(1.0-cancelled)*exp(-80.0*max(fs.z,0.0));
+     vec2 source=vec2(p)+vec2(0.5)+fs.xy;
+-    if(source.x<0.0||source.y<0.0||source.x>=float(packedSize.x)||source.y>=float(packedSize.y)){atomicAdd(shadowDiag[6],1u);imageStore(outCfa,p,merged);return;}
+-    if(flowConfidence<minimumFlowConfidence){atomicAdd(shadowDiag[3],1u);imageStore(outCfa,p,merged);return;}
++    if(source.x<0.0||source.y<0.0||source.x>=float(packedSize.x)||source.y>=float(packedSize.y)){
++        atomicAdd(shadowDiag[6],1u); imageStore(outCfa,p,merged);
++        imageStore(outSemanticWeight,p,vec4(0.0)); return;
++    }
++    if(flowConfidence<minimumFlowConfidence){
++        atomicAdd(shadowDiag[3],1u); imageStore(outCfa,p,merged);
++        imageStore(outSemanticWeight,p,vec4(0.0)); return;
++    }
+     float corrErr,corrSupport;
+-    if(!validateReferenceOwnedCorrespondence(p,source,corrErr,corrSupport)){atomicAdd(shadowDiag[7],1u);imageStore(outCfa,p,merged);return;}
++    if(!validateReferenceOwnedCorrespondence(p,source,corrErr,corrSupport)){
++        atomicAdd(shadowDiag[7],1u); imageStore(outCfa,p,merged);
++        imageStore(outSemanticWeight,p,vec4(0.0)); return;
++    }
+     atomicAdd(shadowDiag[2],1u);
+     vec4 sh=phaseSafeShadow(source); vec4 shEqSensor=sh*shadowToNormalScale;
+     vec4 shEq=shEqSensor*referenceExposureScale; vec4 outv=merged; bool any=false;
++    vec4 semanticPhaseWeight=vec4(0.0);
+     float corrConf=1.0-smoothstep(0.06,0.10,corrErr);
+     for(int phase=0;phase<4;++phase){
+         if(mergedSensor[phase]>=deepShadowThreshold||refSensor[phase]>=deepShadowPackCeiling)continue;
+@@ -97,9 +112,16 @@ void main(){
+         if(shadowExposureRatio<requiredRatio){atomicAdd(shadowDiag[9],1u);continue;}
+         float benefit=smoothstep(requiredRatio,min(4.0,requiredRatio+0.75),shadowExposureRatio);
+         float blend=maxShadowBlend*corrConf*max(benefit,0.25);
+-        outv[phase]=mix(merged[phase],shEq[phase],clamp(blend,0.0,maxShadowBlend));
++        blend=clamp(blend,0.0,maxShadowBlend);
++        outv[phase]=mix(merged[phase],shEq[phase],blend);
++        semanticPhaseWeight[phase]=blend;
+         atomicAdd(shadowDiag[5],1u); atomicAdd(shadowDiag[16+phase],1u); any=true;
+     }
+     if(any)atomicAdd(shadowDiag[13],1u);
+     imageStore(outCfa,p,max(outv,vec4(0.0)));
++    /* IRIS_26501_SHADOW_VALIDATED_SEMANTIC_WEIGHT
++     * Reuse the exact reference-owned correspondence/SNR decision phase by phase as
++     * the native shadow RAW semantic authority. One accepted phase never authorizes another.
++     * The helper CFA is never color input. */
++    imageStore(outSemanticWeight,p,semanticPhaseWeight);
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+index b772f6a..d51d23d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+@@ -17,8 +17,9 @@ import static android.opengl.GLES20.GL_NEAREST;
+ /**
+  * IRIS_26414_MOTION_V2_FLOAT_CFA_INPUT
+  *
+- * First V2 post node. The temporal reconstructor already produced normalized
+- * FLOAT16 RGBA CFA planes, so Bayer2Float must not run again.
++ * First V2 post node. Standard Bayer Motion now arrives as full-resolution
++ * camera-linear RGBA32F from the proper per-frame Spatial RGB owner; special CFA
++ * formats retain the historical packed float fallback. Bayer2Float must not run again.
+  *
+  * IRIS_26415_MOTION_V2_GL_LIFECYCLE_OWNER
+  *
+@@ -53,31 +54,28 @@ public final class MotionV2CfaInput extends Node {
+         ByteBuffer view = source.duplicate();
+         view.position(0);
+ 
+-        /* IRIS_26489_FUSED_BAYER_FLOAT32_BRIDGE_OWNER
+-         * Every standard Bayer Motion shot now crosses the GL-context bridge as one
+-         * half-resolution RGBA32F packed Bayer lattice. RGB synthesis is forbidden
+-         * before the post-merge RCD owner. Special CFA formats retain the same packed
+-         * carrier dimensions.
++        /* IRIS_26501_PROPER_PER_FRAME_RGB_FLOAT32_BRIDGE_OWNER
++         * Standard Bayer crosses the context boundary as native full-resolution RGBA32F
++         * camera-linear RGB. Special CFA formats retain the historical half-resolution carrier.
+          */
+         boolean directBayer =
+                 basePipeline.mParameters.cfaPattern >= 0
+                         && basePipeline.mParameters.cfaPattern <= 3
+-                        && raw.x > 0
+-                        && raw.y > 0
+-                        && (raw.x % 2) == 0
+-                        && (raw.y % 2) == 0;
++                        && raw.x > 0 && raw.y > 0
++                        && (raw.x % 2) == 0 && (raw.y % 2) == 0;
++        boolean directRgbCarrier = directBayer && pipeline.motionV2DirectRgbCarrier;
+         WorkingTexture = new GLTexture(
+-                half,
++                directRgbCarrier ? raw : half,
+                 new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+                 view,
+                 GL_NEAREST,
+                 GL_CLAMP_TO_EDGE);
+ 
+-        if (directBayer) {
+-            if (pipeline.motionV2HighlightProvenance == null) {
+-                throw new IllegalStateException(
+-                        "26492 standard Bayer Motion input is missing highlight provenance");
+-            }
++        if (directBayer && !directRgbCarrier) {
++            throw new IllegalStateException(
++                    "26501 standard Bayer input is not the full-resolution RGB carrier");
++        }
++        if (!directRgbCarrier && pipeline.motionV2HighlightProvenance != null) {
+             ByteBuffer provenanceView = pipeline.motionV2HighlightProvenance.duplicate();
+             provenanceView.position(0);
+             pipeline.motionV2HighlightProvenanceTexture = new GLTexture(
+@@ -118,8 +116,8 @@ public final class MotionV2CfaInput extends Node {
+                 GL_CLAMP_TO_EDGE);
+         basePipeline.texnum = 0;
+ 
+-        Log.d(Name, "IRIS_26416_V2_FLOAT32_INPUT"
+-                + " carrier=" + (directBayer ? "fusedBayerPackedHalfRes" : "packedCfaHalfRes")
++        Log.d(Name, "IRIS_26501_V2_FLOAT32_RGB_INPUT"
++                + " carrier=" + (directRgbCarrier ? "properPerFrameCameraRgbFullRes" : "packedCfaHalfRes")
+                 + " transferFormat=rgba32f"
+                 + " bytesPerChannel=4"
+                 + " rgbPingPong=" + raw.x + "x" + raw.y
+@@ -128,13 +126,13 @@ public final class MotionV2CfaInput extends Node {
+                 + " Bayer2FloatBypassed=true"
+                 + " raw16RoundTrip=false"
+                 + " float16Transfer=false"
+-                + " directMultiframeRgb=false"
+-                + " fusedBayerCanonical=" + directBayer
+-                + " highlightProvenanceR32F=" + directBayer);
++                + " directMultiframeRgb=" + directRgbCarrier
++                + " fusedBayerCanonical=false"
++                + " highlightProvenanceConsumedUpstream=" + directRgbCarrier);
+         try {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26415_MOTION_V2_GL_LIFECYCLE_OWNER",
+-                    "carrier=" + (directBayer ? "fusedBayerPackedHalfRes" : "packedCfaHalfRes")
++                    "carrier=" + (directRgbCarrier ? "properPerFrameCameraRgbFullRes" : "packedCfaHalfRes")
+                             + " rgbPingPong=" + raw.x + "x" + raw.y
+                             + " main1=true main2=true main3=true"
+                             + " texnumReset=0"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index e02e3f9..55d75ed 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -29,6 +29,8 @@ public class PostPipeline extends GLBasePipeline {
+ 
+     /* IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF */
+     public ByteBuffer motionV2FloatCfa;
++    /* IRIS_26501_FULL_RES_CAMERA_RGB_BRIDGE */
++    public boolean motionV2DirectRgbCarrier = false;
+     /* IRIS_26492_EXPLICIT_HIGHLIGHT_PROVENANCE_BRIDGE */
+     public ByteBuffer motionV2HighlightProvenance;
+     public GLTexture motionV2HighlightProvenanceTexture;
+@@ -101,7 +103,18 @@ public class PostPipeline extends GLBasePipeline {
+                     "Motion V2 reconstructed CFA buffer is null");
+         }
+         motionV2FloatCfa = reconstructedCfa;
+-        motionV2HighlightProvenance = highlightProvenance;
++        /* IRIS_26501_EXPLICIT_RGB_CARRIER_CONTRACT
++         * Standard Bayer reconstruction publishes full-resolution camera-linear RGB.
++         * Do not infer carrier semantics from whether a diagnostic provenance buffer happened
++         * to be returned; provenance was already consumed inside the reconstruction owner.
++         */
++        motionV2DirectRgbCarrier = parameters != null
++                && parameters.cfaPattern >= 0 && parameters.cfaPattern <= 3;
++        motionV2HighlightProvenance = motionV2DirectRgbCarrier ? null : highlightProvenance;
++        Log.d("PostPipeline", "IRIS_26501_RGB_BRIDGE_CONTRACT directRgbCarrier="
++                + motionV2DirectRgbCarrier
++                + " carrierAuthority=explicitStandardBayerReconstruction"
++                + " provenanceConsumedUpstream=" + motionV2DirectRgbCarrier);
+         return Run(null, parameters);
+     }
+ 
+@@ -261,20 +274,20 @@ public class PostPipeline extends GLBasePipeline {
+              */
+             boolean directBayer =
+                     mParameters.cfaPattern >= 0 && mParameters.cfaPattern <= 3;
+-            /*
+-             * IRIS_26451_REFERENCE_SAFE_DEMOSAIC_ISOLATION
+-             * Standard Bayer is packed CFA in this controlled build.
++            /* IRIS_26501_REFERENCE_SAFE_RGB_ISOLATION
++             * Standard Bayer Motion is already full-resolution camera-linear RGB.
++             * Only non-standard CFA formats retain the historical packed-CFA fallback.
+              */
+-            /* IRIS_26489_FUSED_BAYER_CANONICAL_POST_GRAPH
+-             * Standard Bayer no longer arrives as direct RGB. The temporal owner publishes
+-             * one fused Bayer lattice and the dedicated post-merge RCD-domain node owns the
+-             * first RGB/highlight synthesis.
++            /* IRIS_26501_PROPER_PER_FRAME_RGB_POST_GRAPH
++             * Standard Bayer arrives as native full-resolution camera-linear RGB.
++             * No Bayer/RCD/demosaic stage may reinterpret that semantic carrier.
+              */
+-            boolean directRgbCarrier = false;
+-            if (directBayer) {
+-                add(new StageTelemetry("V2_POST_FUSED_BAYER_CANONICAL"));
+-                add(new MotionV2RcdDemosaic());
+-                add(new StageTelemetry("V2_POST_RCD_AFTER_TEMPORAL_MERGE"));
++            boolean directRgbCarrier = directBayer && motionV2DirectRgbCarrier;
++            if (directRgbCarrier) {
++                add(new StageTelemetry("V2_POST_PROPER_PER_FRAME_RGB"));
++            } else if (directBayer) {
++                throw new IllegalStateException(
++                        "26501 standard Bayer Motion reached post graph without direct RGB carrier");
+             } else {
+                 add(new StageTelemetry("V2_POST_FLOAT_CFA_INPUT_FALLBACK"));
+                 switch (mSettings.cfaPattern) {
+@@ -323,7 +336,7 @@ public class PostPipeline extends GLBasePipeline {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+                     "nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2DisplayExposure,MotionV2ColorTransform,MotionV2Render,RotateWatermark"
+-                            + " directMultiframeRgb=" + directBayer
++                            + " directMultiframeRgb=" + directRgbCarrier
+                             + " strictWronskiAuthority26477=true"
+                             + " displayExposureAfterWronski=true"
+                             + " residualSpatialDenoise=false"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index 96ccdf4..1fd9290 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -137,6 +137,136 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+         }
+     }
+ 
++    /* IRIS_26501_PROPER_PER_FRAME_SPATIAL_RGB_FBO_OWNER
++     * Two RGBA16F render targets survive the whole burst. Every admitted frame adds
++     * semantic sums and their independent weights with GL_ONE/GL_ONE blending.
++     * No accumulator is sampled while attached and no RGBA32F read/write image is used.
++     */
++    private static int iris26501CreateRgbAccumulatorFramebuffer(
++            GLTexture semanticAccumulator, GLTexture opponentWeightAccumulator) {
++        int[] ids = new int[1];
++        android.opengl.GLES30.glGenFramebuffers(1, ids, 0);
++        int framebuffer = ids[0];
++        if (framebuffer == 0) {
++            throw new IllegalStateException("26501 RGB accumulator framebuffer allocation failed");
++        }
++        android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, framebuffer);
++        android.opengl.GLES30.glFramebufferTexture2D(
++                android.opengl.GLES30.GL_FRAMEBUFFER, android.opengl.GLES30.GL_COLOR_ATTACHMENT0,
++                android.opengl.GLES30.GL_TEXTURE_2D, semanticAccumulator.mTextureID, 0);
++        android.opengl.GLES30.glFramebufferTexture2D(
++                android.opengl.GLES30.GL_FRAMEBUFFER, android.opengl.GLES30.GL_COLOR_ATTACHMENT1,
++                android.opengl.GLES30.GL_TEXTURE_2D, opponentWeightAccumulator.mTextureID, 0);
++        android.opengl.GLES30.glDrawBuffers(
++                2, new int[]{
++                        android.opengl.GLES30.GL_COLOR_ATTACHMENT0,
++                        android.opengl.GLES30.GL_COLOR_ATTACHMENT1}, 0);
++        int status = android.opengl.GLES30.glCheckFramebufferStatus(android.opengl.GLES30.GL_FRAMEBUFFER);
++        android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, 0);
++        if (status != android.opengl.GLES30.GL_FRAMEBUFFER_COMPLETE) {
++            android.opengl.GLES30.glDeleteFramebuffers(1, new int[]{framebuffer}, 0);
++            throw new IllegalStateException(
++                    "26501 RGB accumulator framebuffer incomplete status=0x"
++                            + Integer.toHexString(status));
++        }
++        return framebuffer;
++    }
++
++    private static void iris26501ClearRgbAccumulators(int framebuffer, Point raw) {
++        android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, framebuffer);
++        android.opengl.GLES30.glViewport(0, 0, raw.x, raw.y);
++        android.opengl.GLES30.glDisable(android.opengl.GLES30.GL_BLEND);
++        android.opengl.GLES30.glClearBufferfv(
++                android.opengl.GLES30.GL_COLOR, 0, new float[]{0f, 0f, 0f, 0f}, 0);
++        android.opengl.GLES30.glClearBufferfv(
++                android.opengl.GLES30.GL_COLOR, 1, new float[]{0f, 0f, 0f, 0f}, 0);
++        android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, 0);
++    }
++
++    private static void iris26501RenderChromaGuide(
++            GLProg glProg, Point raw, GLTexture rawTexture, GLTexture guideTexture,
++            int cfaPattern, float[] blackLevel, float whiteLevel, float exposureScale,
++            float wbR, float wbB) {
++        glProg.useAssetProgram("motionv2/mfsr_spatial_rgb_chroma_guide_26501");
++        glProg.setVar("rawSize", raw);
++        glProg.setVar("cfaPattern", cfaPattern);
++        glProg.setVar("blackLevel", blackLevel);
++        glProg.setVar("whiteLevel", whiteLevel);
++        glProg.setVar("exposureScale", exposureScale);
++        glProg.setVar("wbR", wbR);
++        glProg.setVar("wbB", wbB);
++        glProg.setTexture("rawTexture", rawTexture);
++        android.opengl.GLES30.glDisable(android.opengl.GLES30.GL_BLEND);
++        guideTexture.BufferLoad();
++        glProg.drawBlocks(raw.x, raw.y);
++        android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, 0);
++    }
++
++    private static void iris26501RenderRgbCovariance(
++            GLProg glProg, Point raw, Point rawHalf, Point guideSize,
++            GLTexture rawTexture, GLTexture covarianceTexture,
++            int cfaPattern, float[] blackLevel, float whiteLevel, float exposureScale,
++            float wbR, float wbB, float greenNoiseS, float greenNoiseO) {
++        glProg.setLayout(8, 8, 1);
++        glProg.useAssetProgram("motionv2/mfsr_mgc_covariance", true);
++        glProg.setVar("rawSize", raw);
++        glProg.setVar("rawHalf", rawHalf);
++        glProg.setVar("guideSize", guideSize);
++        glProg.setVar("noiseS", greenNoiseS);
++        glProg.setVar("noiseO", greenNoiseO);
++        glProg.setVar("cfaPattern", cfaPattern);
++        glProg.setVar("blackLevel", blackLevel);
++        glProg.setVar("whiteLevel", whiteLevel);
++        glProg.setVar("exposureScale", exposureScale);
++        glProg.setVar("wbR", wbR);
++        glProg.setVar("wbB", wbB);
++        glProg.setTexture("rawTexture", rawTexture);
++        glProg.setTextureCompute("outputCov", covarianceTexture, true);
++        glProg.computeAutoDeferred(guideSize, 1);
++    }
++
++    private static void iris26501ContributeRgbFrame(
++            GLProg glProg, int framebuffer, Point raw, Point packed,
++            GLTexture rawTexture, GLTexture chromaGuide, GLTexture flowTexture,
++            GLTexture robustnessTexture, GLTexture covarianceTexture,
++            GLTexture semanticPhaseWeightTexture,
++            int cfaPattern, float[] blackLevel, float whiteLevel, float exposureScale,
++            float wbR, float wbB, float greenNoiseS, float greenNoiseO,
++            boolean referenceFrame, boolean useFrameWeight, boolean useSemanticPhaseWeight) {
++        glProg.useAssetProgram("motionv2/mfsr_spatial_rgb_contribute_26501");
++        glProg.setVar("rawSize", raw);
++        glProg.setVar("packedSize", packed);
++        glProg.setVar("cfaPattern", cfaPattern);
++        glProg.setVar("blackLevel", blackLevel);
++        glProg.setVar("whiteLevel", whiteLevel);
++        glProg.setVar("exposureScale", exposureScale);
++        glProg.setVar("wbR", wbR);
++        glProg.setVar("wbB", wbB);
++        glProg.setVar("greenNoise", greenNoiseS, greenNoiseO);
++        /* Same ownership as 1.27.1: noise controls edge agreement, never a post-merge
++         * chroma survival threshold. The floor prevents a zero-width edge kernel. */
++        /* PhotonCamera 1.27.1 current Spatial RGB constants. */
++        glProg.setVar("chromaEdgeNoiseSigmas", 2.5f);
++        glProg.setVar("chromaEdgeSigmaFloor", 1.0f / 160.0f);
++        glProg.setVar("referenceFrame", referenceFrame ? 1 : 0);
++        glProg.setVar("useFrameWeight", useFrameWeight ? 1 : 0);
++        glProg.setVar("useSemanticPhaseWeight", useSemanticPhaseWeight ? 1 : 0);
++        glProg.setVar("physicalClipThreshold", IRIS26488_HIGHLIGHT_CLIP_THRESHOLD);
++        glProg.setTexture("rawTexture", rawTexture);
++        glProg.setTexture("chromaGuide", chromaGuide);
++        glProg.setTexture("flowTexture", flowTexture);
++        glProg.setTexture("robustnessTexture", robustnessTexture);
++        glProg.setTexture("covarianceTexture", covarianceTexture);
++        glProg.setTexture("semanticPhaseWeightTexture", semanticPhaseWeightTexture);
++        android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, framebuffer);
++        android.opengl.GLES30.glEnable(android.opengl.GLES30.GL_BLEND);
++        android.opengl.GLES30.glBlendEquation(android.opengl.GLES30.GL_FUNC_ADD);
++        android.opengl.GLES30.glBlendFunc(android.opengl.GLES30.GL_ONE, android.opengl.GLES30.GL_ONE);
++        glProg.drawBlocks(raw.x, raw.y);
++        android.opengl.GLES30.glDisable(android.opengl.GLES30.GL_BLEND);
++        android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, 0);
++    }
++
+     private final ArrayList<ImageFrame> images;
+     private final long referenceTimestamp;
+     /* IRIS_26480_RECON_FRAME_OWNERSHIP_V3 */
+@@ -447,6 +577,17 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+          */
+         GLTexture directFrameSupportA = null;
+         GLTexture directFrameSupportB = null;
++
++        /* IRIS_26501_PROPER_PER_FRAME_SPATIAL_RGB_OWNER */
++        GLTexture iris26501SemanticAccumulator = null;
++        GLTexture iris26501OpponentWeightAccumulator = null;
++        GLTexture iris26501ChromaGuideScratch = null;
++        GLTexture iris26501RgbCovScratch = null;
++        GLTexture iris26501RgbOutput = null;
++        GLTexture iris26501LensShading = null;
++        int iris26501RgbFramebuffer = 0;
++        int iris26501SemanticContributedFrames = 0;
++        int iris26501SemanticHdrContributedFrames = 0;
+         /*
+          * IRIS_26462_HAL_STANDARD_BAYER_WRONSKI_GUARD
+          * Published direct-RGB reconstruction is enabled only for standard
+@@ -736,10 +877,11 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 directFrameSupportA = new GLTexture(
+                         iris26489AccumulatorSize, new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+                         null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+-                /* Final fused Bayer remains the proven RGBA32F packed CFA bridge. */
+-                directRgbB = new GLTexture(
+-                        rawHalf, new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+-                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                /* IRIS_26501_DELAY_HELPER_BAYER_OUTPUT_ALLOCATION
++                 * The RGBA32F helper fused Bayer is not needed until all normal frames have
++                 * contributed. Delay its 50 MiB-class allocation so the proper full-resolution
++                 * semantic RGB accumulators do not overlap it during the whole burst.
++                 */
+ 
+                 glProg.setLayout(tile, tile, 1);
+                 glProg.useAssetProgram("motionv2/mfsr_bayer_accumulator_clear", true);
+@@ -752,7 +894,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 currentDirectRgb = directRgbA;
+                 currentDirectSupport = directSupportA;
+                 currentDirectFrameSupport = directFrameSupportA;
+-                nextDirectRgb = directRgbB;
++                nextDirectRgb = null;
+ 
+                 glProg.setLayout(tile, tile, 1);
+                 glProg.useAssetProgram("motionv2/mfsr_bayer_accumulate", true);
+@@ -777,6 +919,54 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 glProg.computeAutoDeferred(rawHalf, 1);
+                 iris26489ContributedFrames++;
+                 Log.d(TAG, "IRIS_26489_BAYER_REFERENCE_CONTRIBUTED frame=0 referenceIdentity=true");
++
++                /* IRIS_26501_REFERENCE_SEMANTIC_CONTRIBUTION
++                 * Keep the proven Bayer accumulator alive only for Short-A/provenance diagnostics.
++                 * Final RGB ownership starts here and frame 0 executes the same semantic path as
++                 * every auxiliary. Two RGBA16F accumulators survive until one final normalization.
++                 */
++                iris26501SemanticAccumulator = new GLTexture(
++                        raw, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
++                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                iris26501OpponentWeightAccumulator = new GLTexture(
++                        raw, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
++                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                iris26501ChromaGuideScratch = new GLTexture(
++                        raw, new GLFormat(GLFormat.DataType.FLOAT_16, 1),
++                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                iris26501RgbCovScratch = new GLTexture(
++                        iris26487GuideSize, new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                        null, GL_LINEAR, GL_CLAMP_TO_EDGE);
++                iris26501RgbFramebuffer = iris26501CreateRgbAccumulatorFramebuffer(
++                        iris26501SemanticAccumulator, iris26501OpponentWeightAccumulator);
++                iris26501ClearRgbAccumulators(iris26501RgbFramebuffer, raw);
++                float[] iris26501ReferenceBlack = images.get(0).motionV2BlackLevelValid
++                        ? images.get(0).motionV2BlackLevel : blackLevel;
++                float iris26501ReferenceWhite = images.get(0).motionV2WhiteLevelValid
++                        ? images.get(0).motionV2WhiteLevel : (float) parameters.whiteLevel;
++                iris26501RenderChromaGuide(
++                        glProg, raw, referenceRaw, iris26501ChromaGuideScratch,
++                        (int) parameters.cfaPattern, iris26501ReferenceBlack, iris26501ReferenceWhite,
++                        iris26487ReferenceExposureScale, wronskiGlobalWbR, wronskiGlobalWbB);
++                iris26501RenderRgbCovariance(
++                        glProg, raw, rawHalf, iris26487GuideSize,
++                        referenceRaw, iris26501RgbCovScratch,
++                        (int) parameters.cfaPattern, iris26501ReferenceBlack, iris26501ReferenceWhite,
++                        iris26487ReferenceExposureScale, wronskiGlobalWbR, wronskiGlobalWbB,
++                        iris26487ReferenceWbNoise[1], iris26487ReferenceWbNoise[4]);
++                iris26501ContributeRgbFrame(
++                        glProg, iris26501RgbFramebuffer, raw, rawHalf,
++                        referenceRaw, iris26501ChromaGuideScratch, wronskiReferenceGuide,
++                        wronskiReferenceGuide, iris26501RgbCovScratch, wronskiReferenceGuide,
++                        (int) parameters.cfaPattern, iris26501ReferenceBlack, iris26501ReferenceWhite,
++                        iris26487ReferenceExposureScale, wronskiGlobalWbR, wronskiGlobalWbB,
++                        iris26487ReferenceWbNoise[1], iris26487ReferenceWbNoise[4],
++                        true, false, false);
++                iris26501SemanticContributedFrames++;
++                Log.i(TAG, "IRIS_26501_SPATIAL_RGB_REFERENCE_CONTRIBUTED"
++                        + " frame=0 semantic=G,R-G,B-G"
++                        + " additiveBlend=true normalizeNow=false"
++                        + " rgba16fAccumulators=2");
+             }
+ 
+             /*
+@@ -974,6 +1164,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     Iris26487Noise iris26487SensorNoise=iris26487FrameNoise(frame,noiseS,noiseO);
+                     float[] iris26487WbNoise=iris26487WbNoiseRgb(iris26487SensorNoise,(int)parameters.cfaPattern,exposure,wronskiGlobalWbR,wronskiGlobalWbB);
+                     float[] iris26487GreenPhysicalNoise=iris26487GreenPhysicalNoise(iris26487SensorNoise,(int)parameters.cfaPattern);
++                    float[] iris26501FrameBlack = frame.motionV2BlackLevelValid
++                            ? frame.motionV2BlackLevel : blackLevel;
++                    float iris26501FrameWhite = frame.motionV2WhiteLevelValid
++                            ? frame.motionV2WhiteLevel : (float) parameters.whiteLevel;
+ 
+                     long iris26468RawToCfaStart = System.currentTimeMillis();
+                     glProg.setLayout(tile, tile, 1);
+@@ -1029,6 +1223,22 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.setTexture("rawTexture",rawInput);
+                         glProg.setTextureCompute("outputCov", wronskiAlterCov, true);
+                         glProg.computeAutoDeferred(iris26487GuideSize, 1);
++
++                        /* IRIS_26501_PER_FRAME_CHROMA_GUIDE
++                         * Built while this frame's native RAW and calculation-domain calibration
++                         * are still authoritative. It is consumed after Wronski rejection finalizes
++                         * this same frame's contribution weight.
++                         */
++                        iris26501RenderChromaGuide(
++                                glProg, raw, rawInput, iris26501ChromaGuideScratch,
++                                (int) parameters.cfaPattern, iris26501FrameBlack, iris26501FrameWhite,
++                                exposure, wronskiWbR, wronskiWbB);
++                        iris26501RenderRgbCovariance(
++                                glProg, raw, rawHalf, iris26487GuideSize,
++                                rawInput, iris26501RgbCovScratch,
++                                (int) parameters.cfaPattern, iris26501FrameBlack, iris26501FrameWhite,
++                                exposure, wronskiWbR, wronskiWbB,
++                                iris26487WbNoise[1], iris26487WbNoise[4]);
+                         /* IRIS_26489_REMOVE_PREMERGE_COLOR_SYNTHESIS_AUX
+                          * Covariance/rejection remain; chroma/highlight synthesis is post-merge only.
+                          */
+@@ -1156,6 +1366,25 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             }
+                             long iris26487RejectMs=System.currentTimeMillis()-iris26487RejectStart;
+ 
++                            /* IRIS_26501_PER_FRAME_SEMANTIC_ACCUMULATION
++                             * Wronski flow/covariance/final rejection remain the frame authority.
++                             * RGB evidence is accumulated now, before the helper Bayer stack can
++                             * collapse temporal colour information.
++                             */
++                            long iris26501RgbAccumulateStart=System.currentTimeMillis();
++                            iris26501ContributeRgbFrame(
++                                    glProg, iris26501RgbFramebuffer, raw, rawHalf,
++                                    rawInput, iris26501ChromaGuideScratch, ownedAlignment.flowTexture,
++                                    iris26487FinalWeightScratch, iris26501RgbCovScratch,
++                                    iris26487FinalWeightScratch,
++                                    (int) parameters.cfaPattern, iris26501FrameBlack, iris26501FrameWhite,
++                                    exposure, wronskiGlobalWbR, wronskiGlobalWbB,
++                                    iris26487WbNoise[1], iris26487WbNoise[4],
++                                    false, true, false);
++                            iris26501SemanticContributedFrames++;
++                            long iris26501RgbAccumulateMs=
++                                    System.currentTimeMillis()-iris26501RgbAccumulateStart;
++
+                             long iris26487AccumulateStart=System.currentTimeMillis();
+                             glProg.setLayout(tile,tile,1);
+                             glProg.useAssetProgram("motionv2/mfsr_bayer_accumulate",true);
+@@ -1183,7 +1412,9 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             Log.d(TAG,"IRIS_26489_BJZHOU_BAYER_ACCUMULATE frame="+i
+                                     +" rejectionMs="+iris26487RejectMs
+                                     +" accumulateMs="+iris26487AccumulateMs
+-                                    +" persistentAccumulator=true normalizeNow=false rgbSynthesis=false");
++                                    +" spatialRgbAccumulateMs="+iris26501RgbAccumulateMs
++                                    +" persistentAccumulator=true normalizeNow=false"
++                                    +" semanticRgbBeforeBayerCollapse=true");
+ 
+ 
+                             /*
+@@ -1387,6 +1618,16 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         + " contributed=" + iris26489ContributedFrames
+                         + " expected=" + iris26489ExpectedAdmittedFrames
+                         + " referenceFrame0=true normalizeCount=1");
++                if (iris26501SemanticContributedFrames != iris26489AdmittedFrames) {
++                    throw new IllegalStateException(
++                            "IRIS_26501_SPATIAL_RGB_CONTRIBUTION_INVARIANT_FAILED semantic="
++                                    + iris26501SemanticContributedFrames
++                                    + " admitted=" + iris26489AdmittedFrames);
++                }
++                Log.i(TAG, "IRIS_26501_SPATIAL_RGB_CONTRIBUTION_INVARIANT_PASS"
++                        + " admitted=" + iris26489AdmittedFrames
++                        + " semanticContributed=" + iris26501SemanticContributedFrames
++                        + " referenceFrame0=true normalizeCountPending=1");
+                 try {
+                     com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                             "IRIS_26489_ACCUMULATOR_INVARIANT_PASS",
+@@ -1398,11 +1639,17 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+ 
+             /* IRIS_26416_MOTION_V2_PROVEN_FLOAT32_BRIDGE
+              * The proven four-byte FLOAT32 transfer remains the cross-context stabilization
+-             * boundary. 26489 changes the carrier semantics from full-resolution RGB to one
+-             * half-resolution packed fused Bayer lattice.
++             * boundary. 26501 keeps the 26499 packed Bayer result only as a helper carrier for
++             * HDR provenance/neutral fallback; the final public carrier is full-resolution
++             * camera-linear RGB from the per-frame semantic accumulator.
+              */
+             GLTexture imageOutput;
+             if (directBayer) {
++                /* IRIS_26501_DELAY_HELPER_BAYER_OUTPUT_ALLOCATION */
++                directRgbB = new GLTexture(
++                        rawHalf, new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                nextDirectRgb = directRgbB;
+                 /* IRIS_26489_BJZHOU_BAYER_NORMALIZE_EXACTLY_ONCE */
+                 glProg.setLayout(tile, tile, 1);
+                 glProg.useAssetProgram("motionv2/mfsr_bayer_normalize", true);
+@@ -1412,14 +1659,14 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 glProg.setTextureCompute("outCfa", nextDirectRgb, true);
+                 glProg.computeAutoDeferred(rawHalf, 1);
+                 imageOutput = nextDirectRgb;
+-                Log.d(TAG, "IRIS_26489_FUSED_BAYER_CANONICAL_OUTPUT"
++                Log.d(TAG, "IRIS_26489_FUSED_BAYER_HELPER_OUTPUT"
+                         + " frame0Reference=true"
+                         + " persistentAccumulator=true"
+                         + " admitted=" + iris26489AdmittedFrames
+                         + " contributed=" + iris26489ContributedFrames
+                         + " normalizeCount=1"
+-                        + " rgbSynthesisInMerge=false"
+-                        + " highlightSynthesisInMerge=false"
++                        + " ordinaryColorAuthority=false"
++                        + " hdrProvenanceBrightnessHelper=true"
+                         + " packedSize=" + rawHalf.x + "x" + rawHalf.y);
+             } else {
+                 imageOutput = currentMerged;
+@@ -1464,6 +1711,8 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             GLTexture iris26480ReadbackOutput=imageOutput,iris26480ShortRaw=null,iris26480ShortCfa=null;
+             GLTexture iris26480ShortWbCfa=null,iris26480Recovered=null;MotionV2Alignment.Result iris26480ShortAlignment=null;
+             GLTexture irisV13ShadowRaw=null,irisV13ShadowCfa=null,irisV13ShadowWbCfa=null,irisV13ShadowRecovered=null;
++            GLTexture iris26501ShadowWeight=null,iris26501ShadowCov=null;
++            GLTexture iris26501ShortWeight=null,iris26501ShortCov=null;
+             MotionV2Alignment.Result irisV13ShadowAlignment=null; GLBuffer irisV13ShadowDiag=null;
+             long irisV13ShadowAlignDispatchMs=0L,irisV13ShadowFuseDispatchMs=0L;
+             /* IRIS_26496_SHORT_FAILURE_DIAGNOSTIC_OWNER
+@@ -1515,8 +1764,32 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.computeAutoDeferred(rawHalf,1);
+                         irisV13ShadowAlignment=MotionV2WronskiAlignment.alignPrepared(wronskiPreparedAlignment,glProg,irisV13ShadowWbCfa);
+                         irisV13ShadowAlignDispatchMs=(System.nanoTime()-irisV13AlignStart)/1000000L;
++
++                        /* IRIS_26501_SHADOW_AUX_SEMANTIC_PREP
++                         * Build the same per-frame green/covariance evidence as every normal frame.
++                         * The shadow validation shader below alone decides where this frame is allowed
++                         * to contribute; no helper-Bayer color is consumed by the RGB owner.
++                         */
++                        Iris26487Noise iris26501ShadowSensorNoise=
++                                iris26487FrameNoise(irisV13ShadowAuxFrame,noiseS,noiseO);
++                        float[] iris26501ShadowWbNoise=iris26487WbNoiseRgb(
++                                iris26501ShadowSensorNoise,(int)parameters.cfaPattern,
++                                alignmentScale,rr,bb);
++                        iris26501ShadowCov=new GLTexture(
++                                iris26487GuideSize,new GLFormat(GLFormat.DataType.FLOAT_32,4),
++                                null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        iris26501RenderRgbCovariance(
++                                glProg,raw,rawHalf,iris26487GuideSize,
++                                irisV13ShadowRaw,iris26501ShadowCov,
++                                (int)parameters.cfaPattern,shadowBlack,shadowWhite,alignmentScale,rr,bb,
++                                iris26501ShadowWbNoise[1],iris26501ShadowWbNoise[4]);
++                        iris26501RenderChromaGuide(
++                                glProg,raw,irisV13ShadowRaw,iris26501ChromaGuideScratch,
++                                (int)parameters.cfaPattern,shadowBlack,shadowWhite,alignmentScale,rr,bb);
++
+                         long irisV13FuseStart=System.nanoTime();
+                         irisV13ShadowRecovered=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        iris26501ShadowWeight=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                         irisV13ShadowDiag=new GLBuffer(32,new GLFormat(GLFormat.DataType.UNSIGNED_32));
+                         irisV13ShadowDiag.uploadBuffer(new int[32],32);
+                         
+@@ -1531,8 +1804,18 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.setTexture("mergedCfa",imageOutput);glProg.setTexture("referenceCfa",referenceCfa);
+                         glProg.setTexture("shadowCfa",irisV13ShadowCfa);glProg.setTexture("flowTexture",irisV13ShadowAlignment.flowTexture);
+                         glProg.setTexture("frameSupport",currentDirectFrameSupport);glProg.setTextureCompute("outCfa",irisV13ShadowRecovered,true);
++                        glProg.setTextureCompute("outSemanticWeight",iris26501ShadowWeight,true);
+                         glProg.setBufferCompute("ShadowDiagBuf",irisV13ShadowDiag);glProg.computeAutoDeferred(rawHalf,1);
+                         irisV13ShadowFuseDispatchMs=(System.nanoTime()-irisV13FuseStart)/1000000L;
++                        iris26501ContributeRgbFrame(
++                                glProg,iris26501RgbFramebuffer,raw,rawHalf,
++                                irisV13ShadowRaw,iris26501ChromaGuideScratch,
++                                irisV13ShadowAlignment.flowTexture,iris26501ShadowWeight,iris26501ShadowCov,
++                                iris26501ShadowWeight,
++                                (int)parameters.cfaPattern,shadowBlack,shadowWhite,alignmentScale,rr,bb,
++                                iris26501ShadowWbNoise[1],iris26501ShadowWbNoise[4],
++                                false,false,true);
++                        iris26501SemanticHdrContributedFrames++;
+                         imageOutput=irisV13ShadowRecovered;iris26480ReadbackOutput=irisV13ShadowRecovered;
+                         Log.i(TAG,"IRIS_26498_V13_SHADOW_AUX_DISPATCH"
+                                 +" shadowToNormalScale="+irisV13ShadowToNormal
+@@ -1579,6 +1862,25 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     /* IRIS_26487_SHORT_WB_LINEAR_ONLY */
+                     glProg.setTextureCompute("inputCfa",iris26480ShortCfa,false);glProg.setTextureCompute("outputCfa",iris26480ShortWbCfa,true);glProg.computeAutoDeferred(rawHalf,1);
+                     iris26480ShortAlignment=MotionV2WronskiAlignment.alignPrepared(wronskiPreparedAlignment,glProg,iris26480ShortWbCfa);
++                    Iris26487Noise iris26501ShortSensorNoise=
++                            iris26487FrameNoise(shortHighlightFrame,noiseS,noiseO);
++                    float[] iris26501ShortWbNoise=iris26487WbNoiseRgb(
++                            iris26501ShortSensorNoise,(int)parameters.cfaPattern,
++                            iris26490ShortAlignmentScale,r,b);
++                    iris26501ShortCov=new GLTexture(
++                            iris26487GuideSize,new GLFormat(GLFormat.DataType.FLOAT_32,4),
++                            null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                    iris26501RenderRgbCovariance(
++                            glProg,raw,rawHalf,iris26487GuideSize,
++                            iris26480ShortRaw,iris26501ShortCov,
++                            (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
++                            iris26490ShortAlignmentScale,r,b,
++                            iris26501ShortWbNoise[1],iris26501ShortWbNoise[4]);
++                    iris26501RenderChromaGuide(
++                            glProg,raw,iris26480ShortRaw,iris26501ChromaGuideScratch,
++                            (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
++                            iris26490ShortAlignmentScale,r,b);
++
+                     iris26480Recovered=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     iris26492RecoveredProvenance=new GLTexture(
+                             rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+@@ -1609,6 +1911,31 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     glProg.setTextureCompute("outProvenance",iris26492RecoveredProvenance,true);
+                     glProg.setBufferCompute("ShortDiagBuf", iris26496ShortDiag);
+                     glProg.computeAutoDeferred(rawHalf,1);
++
++                    /* IRIS_26501_SHORT_A_SEMANTIC_CONTRIBUTION
++                     * Existing Short-A validation produces the admission mask; the actual camera
++                     * color comes directly from the aligned native short RAW through the same
++                     * G/R-G/B-G semantic path as normal frames.
++                     */
++                    iris26501ShortWeight=new GLTexture(
++                            rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),
++                            null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    glProg.setLayout(tile,tile,1);
++                    glProg.useAssetProgram("motionv2/mfsr_spatial_rgb_short_weight_26501",true);
++                    glProg.setVar("packedSize",rawHalf);
++                    glProg.setTexture("highlightProvenance",iris26492RecoveredProvenance);
++                    glProg.setTextureCompute("outWeight",iris26501ShortWeight,true);
++                    glProg.computeAutoDeferred(rawHalf,1);
++                    iris26501ContributeRgbFrame(
++                            glProg,iris26501RgbFramebuffer,raw,rawHalf,
++                            iris26480ShortRaw,iris26501ChromaGuideScratch,
++                            iris26480ShortAlignment.flowTexture,iris26501ShortWeight,iris26501ShortCov,
++                            iris26501ShortWeight,
++                            (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
++                            iris26490ShortAlignmentScale,r,b,
++                            iris26501ShortWbNoise[1],iris26501ShortWbNoise[4],
++                            false,false,true);
++                    iris26501SemanticHdrContributedFrames++;
+                     iris26480ReadbackOutput=iris26480Recovered;
+                     iris26492ReadbackProvenance=iris26492RecoveredProvenance;
+                     parameters.motionV2ShortHighlightRecoveryExecuted = true;
+@@ -1630,6 +1957,87 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             +" structuredUniqueMatchRequired=true");
+ 
+                 }
++
++                if (directBayer) {
++                    /* IRIS_26501_PROPER_SPATIAL_RGB_FINAL_NORMALIZATION
++                     * Normal equal-exposure frames already live in the semantic accumulators.
++                     * The helper fused/recovered Bayer carrier is now brightness/provenance only:
++                     * it can provide a neutral value when physical colour is censored, but it can
++                     * never become ordinary RGB/chroma authority.
++                     */
++                    if (iris26501SemanticAccumulator == null
++                            || iris26501OpponentWeightAccumulator == null
++                            || iris26492ReadbackProvenance == null
++                            || iris26480ReadbackOutput == null) {
++                        throw new IllegalStateException(
++                                "26501 proper Spatial RGB finalization is missing an owner");
++                    }
++                    boolean iris26501HasLsc = parameters.hasGainMap
++                            && parameters.mapSize != null
++                            && parameters.mapSize.x > 0
++                            && parameters.mapSize.y > 0
++                            && parameters.gainMap != null
++                            && parameters.gainMap.length
++                                    >= parameters.mapSize.x * parameters.mapSize.y * 4;
++                    Point iris26501LscSize = iris26501HasLsc
++                            ? new Point(parameters.mapSize) : new Point(1, 1);
++                    float[] iris26501LscValues = iris26501HasLsc
++                            ? parameters.gainMap : new float[]{1f, 1f, 1f, 1f};
++                    int iris26501LscFloatCount = iris26501LscSize.x * iris26501LscSize.y * 4;
++                    ByteBuffer iris26501LscUpload = ByteBuffer
++                            .allocateDirect(iris26501LscFloatCount * Float.BYTES)
++                            .order(ByteOrder.nativeOrder());
++                    iris26501LscUpload.asFloatBuffer().put(
++                            iris26501LscValues, 0, iris26501LscFloatCount);
++                    iris26501LscUpload.position(0);
++                    iris26501LensShading = new GLTexture(
++                            iris26501LscSize, new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                            iris26501LscUpload, GL_LINEAR, GL_CLAMP_TO_EDGE);
++
++                    iris26501RgbOutput = new GLTexture(
++                            raw, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
++                            null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                    glProg.useAssetProgram("motionv2/mfsr_spatial_rgb_normalize_26501");
++                    glProg.setVar("rawSize", raw);
++                    glProg.setVar("packedSize", rawHalf);
++                    glProg.setVar(
++                            "cameraDomainScale",
++                            1.0f / Math.max(wronskiGlobalWbR, 1.0e-6f),
++                            1.0f,
++                            1.0f / Math.max(wronskiGlobalWbB, 1.0e-6f));
++                    glProg.setVar("useLensShading", iris26501HasLsc ? 1 : 0);
++                    glProg.setTexture("semanticAccumulator", iris26501SemanticAccumulator);
++                    glProg.setTexture(
++                            "opponentWeightAccumulator", iris26501OpponentWeightAccumulator);
++                    glProg.setTexture("fallbackCfa", iris26480ReadbackOutput);
++                    glProg.setTexture("highlightProvenance", iris26492ReadbackProvenance);
++                    glProg.setTexture("lensShadingMap", iris26501LensShading);
++                    android.opengl.GLES30.glDisable(android.opengl.GLES30.GL_BLEND);
++                    iris26501RgbOutput.BufferLoad();
++                    glProg.drawBlocks(raw.x, raw.y);
++                    android.opengl.GLES30.glBindFramebuffer(android.opengl.GLES30.GL_FRAMEBUFFER, 0);
++                    iris26480ReadbackOutput = iris26501RgbOutput;
++                    Log.i(TAG, "IRIS_26501_PROPER_SPATIAL_RGB_OUTPUT"
++                            + " semanticFrames=" + iris26501SemanticContributedFrames
++                            + " normalizeCount=1"
++                            + " fullResolution=" + raw.x + "x" + raw.y
++                            + " lensShadingAfterRgb=" + iris26501HasLsc
++                            + " calculationWbRemovedExactlyOnce=true"
++                            + " helperBayerColorAuthority=false"
++                            + " semanticHdrContributions=" + iris26501SemanticHdrContributedFrames
++                            + " shortValidatedColorFromNativeRaw="
++                            + parameters.motionV2ShortHighlightRecoveryExecuted);
++                    try {
++                        com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                                "IRIS_26501_PROPER_SPATIAL_RGB_OUTPUT",
++                                "semanticFrames=" + iris26501SemanticContributedFrames
++                                        + " normalizeCount=1"
++                                        + " fullRes=true"
++                                        + " lscAfterRgb=" + iris26501HasLsc
++                                        + " helperBayerColorAuthority=false"
++                                        + " semanticHdrContributions=" + iris26501SemanticHdrContributedFrames);
++                    } catch (Throwable ignored) {}
++                }
+                 /* IRIS_26488_TINY_DIAGNOSTICS_BEFORE_SINGLE_GPU_DRAIN
+                  * Queue the coarse support/semantic-denominator diagnostic BEFORE the existing
+                  * single Motion ownership drain. It is read only after that same drain, so 26488
+@@ -1833,6 +2241,8 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 }
+             }finally{
+                 if(iris26480ShortAlignment!=null)iris26480ShortAlignment.close();if(iris26480ShortWbCfa!=null)iris26480ShortWbCfa.close();
++                if(iris26501ShortWeight!=null)iris26501ShortWeight.close();if(iris26501ShortCov!=null)iris26501ShortCov.close();
++                if(iris26501ShadowWeight!=null)iris26501ShadowWeight.close();if(iris26501ShadowCov!=null)iris26501ShadowCov.close();
+                 if(iris26480ShortCfa!=null)iris26480ShortCfa.close();if(iris26480ShortRaw!=null)iris26480ShortRaw.close();
+                 if(iris26480Recovered!=null)iris26480Recovered.close();
+                 if(irisV13ShadowAlignment!=null)irisV13ShadowAlignment.close();if(irisV13ShadowWbCfa!=null)irisV13ShadowWbCfa.close();
+@@ -1847,30 +2257,29 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             }
+ 
+             Log.d(TAG, "IRIS_26416_V2_PROVEN_FLOAT32_BRIDGE"
+-                    + " sourceInternal=rgba32f"
++                    + " sourceInternal=rgba16f"
+                     + " transfer=rgba32f"
+                     + " bytesPerChannel=4"
+                     + " glType=GL_FLOAT"
+-                    + " size=" + rawHalf.x + "x" + rawHalf.y
++                    + " size=" + raw.x + "x" + raw.y
+                     + " raw16Repack=false"
+-                    + " float16Transfer=false"
++                    + " finalFloat16Storage=true"
+                     + " legacyMerge00=false"
+-                    + " directMultiframeRgb=false"
+-                    + " fusedBayerCanonical=" + directBayer
+-                    + " normalizedConvolution=true"
+-                    + " float32BurstAccumulators=" + directBayer
+-                    + " accumulatorCarrier=R32F_raw_sized_2x2_phase"
++                    + " directMultiframeRgb=" + directBayer
++                    + " helperFusedBayerCanonical=" + directBayer
++                    + " helperBayerColorAuthority=false"
++                    + " semanticAccumulator=2xRGBA16F_additive"
++                    + " semanticFrames=" + iris26501SemanticContributedFrames
++                    + " semanticHdrFrames=" + iris26501SemanticHdrContributedFrames
+                     + " divideOnceAfterBurst=" + directBayer
+                     + " perFrameCovariance=" + directBayer
+-                    + " publicHalfPixelMergeGeometry=" + directBayer
+-                    + " perFrameRgbCandidate=false"
++                    + " perFrameRgbEvidence=" + directBayer
+                     + " anisotropicKernel=true"
+-                    + " clippedChromaFloor=false"
+-                    + " sharedGuideRobustness=" + directBayer
+-                    + " rgbPredictionRobustness=false"
+-                    + " referenceCfaStructure=" + directBayer
+-                    + " orderIndependentWeights=" + directBayer
+-                    + " crossEdgeSigmaMin=0.72"
++                    + " postSnrChromaErase=false"
++                    + " lensShadingAfterRgb=true"
++                    + " calculationWbRemovedExactlyOnce=true"
++                    + " chromaEdgeNoiseSigmas=2.5"
++                    + " chromaEdgeSigmaFloor=0.00625"
+                     + " separateDemosaic=true"
+                     + " hdrHeadroomPreserved=true");
+ 
+@@ -2103,8 +2512,12 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                     + " confidenceZeroReturnsReference=true"
+                     + " sharedCfaFlow=true"
+                     + " subpixelSampling=truePerObservationNormalizedConvolution"
+-                    + " directMultiframeRgb=false"
+-                    + " fusedBayerCanonical=" + directBayer
++                    + " directMultiframeRgb=" + directBayer
++                    + " properPerFrameSpatialRgb=" + directBayer
++                    + " helperFusedBayerOnly=" + directBayer
++                    + " helperBayerColorAuthority=false"
++                    + " semanticFrames=" + iris26501SemanticContributedFrames
++                    + " semanticHdrFrames=" + iris26501SemanticHdrContributedFrames
+                     + " legacyPyramidMerge=false"
+                     + " legacyPyramidAlignment=false"
+                     + " v2OwnedContinuousAlignment=true"
+@@ -2129,6 +2542,27 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 + " confidenceZeroReferenceFallback=true");
+             } catch (Throwable ignored) {}
+         } finally {
++            /* IRIS_26501_PROPER_SPATIAL_RGB_LIFETIME_OWNER
++             * Custom MRT framebuffer must be deleted as a framebuffer before its attached
++             * textures are closed. BufferLoad-created framebuffers use the matching helper.
++             */
++            if (iris26501RgbFramebuffer != 0) {
++                try {
++                    android.opengl.GLES30.glDeleteFramebuffers(
++                            1, new int[]{iris26501RgbFramebuffer}, 0);
++                } catch (Throwable cleanupError) {
++                    Log.w(TAG, "IRIS_26501_RGB_FBO_RELEASE_WARNING", cleanupError);
++                }
++                iris26501RgbFramebuffer = 0;
++            }
++            iris26488ReleaseReadbackFramebuffer(iris26501ChromaGuideScratch);
++            iris26488ReleaseReadbackFramebuffer(iris26501RgbOutput);
++            if (iris26501LensShading != null) iris26501LensShading.close();
++            if (iris26501RgbOutput != null) iris26501RgbOutput.close();
++            if (iris26501ChromaGuideScratch != null) iris26501ChromaGuideScratch.close();
++            if (iris26501RgbCovScratch != null) iris26501RgbCovScratch.close();
++            if (iris26501OpponentWeightAccumulator != null) iris26501OpponentWeightAccumulator.close();
++            if (iris26501SemanticAccumulator != null) iris26501SemanticAccumulator.close();
+             /* IRIS_26413 pack-fix: no temporary uint16 result texture is allocated. */
+             if (directFrameSupportB != null) directFrameSupportB.close();
+             if (directFrameSupportA != null) directFrameSupportA.close();
