@@ -148,7 +148,7 @@ CANONICAL_HEAD="$(git rev-parse HEAD)"
 
 echo "=== GATE 4: BUILD 26503 DIRECTLY FROM CANONICAL 26502 ==="
 cp -a "$PRE/app/." "$AFTER/app/"
-# Reuse the already-audited conservative C/D seed against exact 26502, then deterministic A/B/E/speed/EXIF transforms.
+# Reuse the already-audited conservative C/D seed against exact 26502, then deterministic A/B/E/speed transforms; tested-26502 EXIF remains frozen.
 patch --dry-run --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$AFTER" < "$SEED_26503" > "$OUT/26503_seed_dry.txt"
 patch --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$AFTER" < "$SEED_26503" > "$OUT/26503_seed_apply.txt"
 assert_no_artifacts "$AFTER"
@@ -159,7 +159,7 @@ set +e; git diff --no-index --binary "$PRE/app" "$AFTER/app" > "$OUT/26503_V2_EX
 [[ "$rc" -eq 1 && -s "$OUT/26503_V2_EXACT_RUNTIME_DELTA_FROM_26502.patch" ]] || fail "26503 exact delta patch generation failed"
 sha256sum "$OUT/26503_V2_EXACT_RUNTIME_DELTA_FROM_26502.patch" > "$OUT/26503_V2_EXACT_RUNTIME_DELTA_FROM_26502.patch.sha256"
 python3 "$VALIDATOR_26503" "$AFTER" --base-root "$PRE" --seed-validator "$SEED_VALIDATOR" | tee "$OUT/26503_v2_validator.txt"
-pass "GATE 4 26503 is a direct exact eight-file delta from canonical tested 26502"
+pass "GATE 4 26503 is a direct exact seven-file delta from canonical tested 26502"
 
 echo "=== GATE 5: REAL GLSL / JAVA / OWNER PREFLIGHT ==="
 command -v glslangValidator >/dev/null 2>&1 || fail "glslangValidator missing"
@@ -188,8 +188,7 @@ mkdir -p "$WORK/javac_parse"
 javac -proc:none -Xmaxerrs 10000 -d "$WORK/javac_parse" \
  "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java" \
  "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" \
- "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java" \
- "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java" > "$OUT/26503_javac_parse.log" 2>&1 || true
+ "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java" > "$OUT/26503_javac_parse.log" 2>&1 || true
 python3 - "$OUT/26503_javac_parse.log" <<'PY'
 from pathlib import Path
 import sys
@@ -206,7 +205,7 @@ echo "  E pixel-local effective-stack shadow permission PASS"
 echo "  F border-bar proof gate/no band-aid PASS"
 echo "  G exact 26502 architecture firewall PASS"
 echo "  Speed diagnostic-only GPU readback disable PASS"
-echo "  EXIF actual Camera2 ISO authority PASS"
+echo "  EXIF tested-26502 Photon ISO100 normalization FROZEN PASS"
 
 echo "=== GATE 6: VERSION 0.9726503 / 26503 + BUILD IN SAME GUARDED BLOCK ==="
 python3 - "$AFTER/app/version.properties" <<'PY'
@@ -235,7 +234,7 @@ with ZipFile(apk) as z:
  for n in assets:
   p='assets/shaders/motionv2/'+n; want=h((root/'app/src/main/assets/shaders/motionv2'/n).read_bytes()); got=h(z.read(p)); assert got==want,(n,got,want)
  dex=b''.join(z.read(n) for n in z.namelist() if n.startswith('classes') and n.endswith('.dex'))
- for m in [b'IRIS_26503_FROZEN_CAPTURE_SCENE_KEY_GAIN',b'IRIS_26503_SINGLE_EXPOSURE_SHADOW_AUTHORITY',b'IRIS_26503_ACTUAL_CAPTURE_RESULT_ISO_EXIF',b'IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK']:
+ for m in [b'IRIS_26503_FROZEN_CAPTURE_SCENE_KEY_GAIN',b'IRIS_26503_SINGLE_EXPOSURE_SHADOW_AUTHORITY',b'IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK']:
   assert m in dex,m
 print('PASS: APK/source shader parity + required 26503 Java markers in DEX')
 PY
@@ -259,9 +258,9 @@ C=Camera2 matrix frozen; render white painting removed; hue-preserving extended-
 D=Strict 26502 Tier1 Short-A first; boundary Tier2 only when Tier1 unobservable.
 E=True local frame-equivalent support carried in RGB alpha to the one display node; weak local stack gets less shadow lift.
 F=No border mask/desaturation; semantic support-count proof did not authorize reconstruction band-aid.
-G=Exact eight-file delta from tested 26502; all other runtime bytes frozen.
+G=Exact seven-file delta from tested 26502; all other runtime bytes frozen, including ParseExif.java.
 Speed=Diagnostic-only full direct-RGB support and heavy per-phase provenance GPU readbacks disabled; real effective-support readback retained.
-EXIF=Actual CaptureResult ISO, no historical getMPY multiplication.
+EXIF=Tested-26502 Photon ISO100-normalized convention preserved byte-for-byte; getMPY remains unchanged.
 Promote26503Requested=$PROMOTE_26503_SOURCE
 EOF
 if [[ "$PROMOTE_26503_SOURCE" == "true" ]]; then

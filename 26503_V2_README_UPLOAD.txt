@@ -5,7 +5,7 @@ WHAT THIS HANDOFF DOES
 2. Creates NO backup branch and requires NO new backup branch.
 3. Reconstructs exact tested 26502 one final time only to synchronize app/src/main with the tested APK runtime.
 4. Commits/pushes that exact tested 26502 source as the canonical app/src/main if it is not already canonical.
-5. Builds 26503 as a direct exact eight-file delta from canonical 26502.
+5. Builds 26503 as a direct exact seven-file delta from canonical 26502.
 6. Does NOT promote untested 26503 source on the normal first run.
 7. Emits exactly one named 26503 APK plus the proof bundle.
 
@@ -40,4 +40,9 @@ Only after 26503 is judged successful should the same workflow be run manually w
 That promotes accepted 26503 into app/src/main so 26504 starts directly from 26503 under the new canonical-source rule.
 
 LAYMAN VERSION
-26502 becomes the actual engine sitting in the source tree. 26503 is made by changing only eight proven owners on that engine. The first run gives you 26503 to test but keeps tested 26502 as the official engine. If 26503 is good, then and only then we make 26503 the new official engine.
+26502 becomes the actual engine sitting in the source tree. 26503 is made by changing only seven proven owners on that engine. The first run gives you 26503 to test but keeps tested 26502 as the official engine. If 26503 is good, then and only then we make 26503 the new official engine.
+
+V3 BUILDFIX / EXIF RESTORE
+- Fixes the glslang 16.5.0 bootstrap: the release has four matching Linux x86-64 archives, so the workflow now selects exactly glslang-16.5.0-linux-x86_64-release.tar.gz instead of asserting the broad filter returns one item.
+- Removes the proposed ParseExif rewrite completely. Tested-26502 Photon ISO100-normalized EXIF behavior using IsoExpoSelector.getMPY() is frozen byte-for-byte for cross-device compatibility.
+- No runtime source was changed by the failed V2 run because failure occurred in the glslang bootstrap before canonicalization/build.

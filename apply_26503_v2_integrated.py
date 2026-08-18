@@ -361,13 +361,6 @@ def cfa_host(src: str) -> str:
         fail('CFA: heavy provenance marker exists but no diagnostic-only readback scope could be proven; refusing unsafe speed edit')
     return src
 
-# EXIF truthfulness; no image math.
-def parse_exif(src: str) -> str:
-    old='''        Integer iso = result.get(SENSOR_SENSITIVITY);\n        int isonum = 100;\n        if (iso != null) isonum = (int) (iso * IsoExpoSelector.getMPY());'''
-    new='''        Integer iso = result.get(SENSOR_SENSITIVITY);\n        int isonum = 100;\n        /* IRIS_26503_ACTUAL_CAPTURE_RESULT_ISO_EXIF\n         * SENSOR_SENSITIVITY is already the actual Camera2 ISO for this frame.\n         * Do not multiply it by Photon's historical minimum-ISO normalization. */\n        if (iso != null) isonum = iso;'''
-    return one(src,old,new,'EXIF actual ISO')
-
-
 def main():
     global ROOT
     ap=argparse.ArgumentParser()
@@ -378,7 +371,6 @@ def main():
     edit('app/src/main/assets/shaders/motionv2/display_exposure.glsl',display_shader)
     edit('app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java',display_java)
     edit('app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java',cfa_host)
-    edit('app/src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java',parse_exif)
-    print('PASS: 26503 V2 deterministic A/B/E/performance/EXIF transforms applied')
+    print('PASS: 26503 V2 deterministic A/B/E/performance transforms applied; Photon ISO100-normalized EXIF preserved')
 
 if __name__=='__main__': main()

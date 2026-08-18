@@ -5,7 +5,6 @@ import argparse, hashlib, importlib.util, math, re
 ALLOWED={
  'src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java',
  'src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java',
- 'src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java',
  'src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java',
  'src/main/assets/shaders/motionv2/display_exposure.glsl',
  'src/main/assets/shaders/motionv2/render.glsl',
@@ -93,7 +92,7 @@ def source_tests(root,base):
     assert sha(color)==BASE_COLOR_SHA,sha(color)
     assert sha(contrib)==BASE_CONTRIB_SHA,sha(contrib)
 
-    # Exact 8-file delta firewall.
+    # Exact 7-file delta firewall; ParseExif must remain byte-identical to tested 26502.
     def collect(rootp): return {p.relative_to(rootp).as_posix():sha(p) for p in rootp.rglob('*') if p.is_file()}
     a=collect(R); b=collect(B); new=sorted(set(a)-set(b)); rem=sorted(set(b)-set(a)); mod=sorted(k for k in set(a)&set(b) if a[k]!=b[k])
     assert not new,new; assert not rem,rem; assert set(mod)==ALLOWED,(mod,sorted(ALLOWED))
@@ -132,10 +131,11 @@ def source_tests(root,base):
     assert 'IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK' in cfa
     assert 'currentSupport.BufferLoad();' in cfa and 'MotionMetrics.publishV2Support(' in cfa
 
-    # EXIF truthfulness.
-    assert 'IRIS_26503_ACTUAL_CAPTURE_RESULT_ISO_EXIF' in exif
+    # Preserve Photon's cross-device ISO100-normalized EXIF convention byte-for-byte.
+    base_exif=(B/'src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java').read_text()
+    assert exif==base_exif,'ParseExif.java changed; 26503 must preserve tested-26502 ISO normalization'
     sens=exif[exif.index('Integer iso = result.get(SENSOR_SENSITIVITY);'):exif.index('data.SENSITIVITY_TYPE')]
-    assert 'isonum = iso;' in sens and 'IsoExpoSelector.getMPY()' not in sens
+    assert 'IsoExpoSelector.getMPY()' in sens and 'isonum = iso;' not in sens
 
     # F/G forbidden band-aids and architecture re-entry.
     joined='\n'.join((merger,cfa,exif,dj,ds,norm,render,short)).lower()
@@ -143,7 +143,7 @@ def source_tests(root,base):
         assert bad not in joined,bad
     assert 'IRIS_26501_WRONSKI_PER_FRAME_SPATIAL_RGB_OWNER' in (R/CONTRIB).read_text()
     assert 'IRIS_26502_STACK_AWARE_SEMANTIC_NORMALIZE' in norm
-    print('PASS SOURCE A-G: exact eight-file delta; Camera2 matrix and Spatial-RGB contributor frozen; local support carrier, speed gates and truthful EXIF verified')
+    print('PASS SOURCE A-G: exact seven-file delta; Camera2 matrix, Spatial-RGB contributor, and Photon ISO100-normalized EXIF frozen; local support carrier and speed gates verified')
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('root',type=Path); ap.add_argument('--base-root',type=Path,required=True); ap.add_argument('--seed-validator',type=Path,required=True); a=ap.parse_args()
@@ -152,5 +152,5 @@ def main():
     seed=load_seed(a.seed_validator)
     print(seed.test_highlight_math())
     print(seed.test_short_math())
-    print('PASS: 26503 V2 integrated A-G + speed + EXIF validator complete')
+    print('PASS: 26503 V2 integrated A-G + speed validator complete; tested-26502 EXIF convention preserved')
 if __name__=='__main__': main()
