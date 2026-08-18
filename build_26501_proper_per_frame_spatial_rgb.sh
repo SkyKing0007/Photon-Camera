@@ -30,7 +30,9 @@ BRANCH="$(git branch --show-current)"
 [[ "$BRANCH" != "dev" ]] || fail "refusing dev"
 git merge-base --is-ancestor "$V7_SHA" HEAD || fail "26499/V7 commit is not an ancestor of HEAD"
 # Handoff commits remain infrastructure-only. Runtime is reconstructed from the exact successful V7 artifact.
-if git diff --name-only "$V7_SHA"..HEAD -- app/src/main app/version.properties | grep -q .; then
+DIRECT_RUNTIME_DIFF="$OUT/26501_direct_runtime_diff.txt"
+git diff --name-only "$V7_SHA"..HEAD -- app/src/main app/version.properties > "$DIRECT_RUNTIME_DIFF"
+if [[ -s "$DIRECT_RUNTIME_DIFF" ]]; then
   git diff --name-status "$V7_SHA"..HEAD -- app/src/main app/version.properties >&2 || true
   fail "handoff commit directly modified runtime app source"
 fi
@@ -197,8 +199,12 @@ echo "=== 26501 GATE 7: EMIT CLEAN SUCCESSFUL SOURCE CHECKPOINT ==="
 ( cd "$CAND" && tar --sort=name --mtime='UTC 2026-08-17 00:00:00' --owner=0 --group=0 --numeric-owner -czf "$OUT/26501_successful_app_source.tar.gz" app/src/main app/version.properties )
 ( cd "$CAND" && { find app/src/main -type f -print; echo app/version.properties; } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done ) > "$OUT/26501_successful_after.sha256"
 [[ "$(wc -l < "$OUT/26501_successful_after.sha256")" -eq 869 ]] || fail "26501 successful source manifest expected 869 files"
+SUCCESS_TAR_LIST="$OUT/26501_successful_app_source.list"
+tar -tzf "$OUT/26501_successful_app_source.tar.gz" > "$SUCCESS_TAR_LIST"
 for generated in archive.h archive_entry.h technicallyflac.h tiny_dng_writer.h; do
-  ! tar -tzf "$OUT/26501_successful_app_source.tar.gz" | grep -qx "app/src/main/cpp/deps/$generated" || fail "generated dependency leaked into successful source: $generated"
+  if grep -Fxq "app/src/main/cpp/deps/$generated" "$SUCCESS_TAR_LIST"; then
+    fail "generated dependency leaked into successful source: $generated"
+  fi
 done
 sha256sum "$PATCH" "$BASE_TAR" "$BASE_MANIFEST" "$FINAL" "$OUT/26501_successful_app_source.tar.gz" > "$OUT/26501_artifact_hashes.sha256"
 cat > "$OUT/26501_build_report.txt" <<EOF
