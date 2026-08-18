@@ -2,6 +2,16 @@
 set -euo pipefail
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
+assert_no_patch_artifacts(){
+  local label="$1"
+  local report="$OUT/${label}_patch_artifacts.txt"
+  find "$CAND/app" -type f \( -name '*.orig' -o -name '*.rej' \) -print | LC_ALL=C sort > "$report"
+  if [[ -s "$report" ]]; then
+    cat "$report" >&2
+    fail "$label emitted forbidden .orig/.rej patch artifacts"
+  fi
+  echo "PASS: $label emitted no .orig/.rej patch artifacts"
+}
 ROOT="$(pwd)"
 OUT="$ROOT/build_26502_stack_aware_chroma_highlight_outputs"
 WORK="$ROOT/.build_26502_stack_aware_chroma_highlight_work"
@@ -19,6 +29,8 @@ INTEGRITY="$ROOT/verify_26501_source_integrity.py"
 V7_SHA="ed5470179aea9514c15d52dcb35613c7925778c6"
 V6_HEAD="c6415d57a0d276b6ba7d4948df45ed15ea88a410"
 BACKUP_BRANCH="backup-26501-v6-before-26502-20260818"
+V1_HANDOFF_HEAD="4e9971ec70abeb6533e675dc1bb3509d46af552f"
+BUILDFIX_BACKUP_BRANCH="backup-26502-v1-before-buildfix-20260818"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_TAR_SHA="ce5be58fa20b9e28786b9c6e4355743066fe92e78791b50b5ee2df568c5ae9e1"
 BASE_MANIFEST_SHA="9af4b1cf5411b5cae445c3e2b782e07d824c3d4a2bcd16f3c7cf28ba79b5a74f"
@@ -35,6 +47,8 @@ git merge-base --is-ancestor "$V7_SHA" HEAD || fail "26499/V7 commit is not an a
 git merge-base --is-ancestor "$V6_HEAD" HEAD || fail "26501 V6 commit is not an ancestor of HEAD"
 git rev-parse --verify "origin/$BACKUP_BRANCH" >/dev/null 2>&1 || fail "verified V6 backup branch is missing from origin"
 [[ "$(git rev-parse "origin/$BACKUP_BRANCH")" == "$V6_HEAD" ]] || fail "V6 backup branch no longer points to exact V6 commit"
+git rev-parse --verify "origin/$BUILDFIX_BACKUP_BRANCH" >/dev/null 2>&1 || fail "26502 V1 build-fix backup branch is missing from origin"
+[[ "$(git rev-parse "origin/$BUILDFIX_BACKUP_BRANCH")" == "$V1_HANDOFF_HEAD" ]] || fail "26502 V1 build-fix backup branch no longer points to exact pushed V1 commit"
 DIRECT_RUNTIME_DIFF="$OUT/26502_direct_runtime_diff.txt"; git diff --name-only "$V7_SHA"..HEAD -- app/src/main app/version.properties > "$DIRECT_RUNTIME_DIFF"
 if [[ -s "$DIRECT_RUNTIME_DIFF" ]]; then git diff --name-status "$V7_SHA"..HEAD -- app/src/main app/version.properties >&2 || true; fail "handoff commit directly modified runtime app source"; fi
 for f in "$PATCH_26501" "$V6_PATCH" "$PATCH_26502" "$PRECHANGE" "$BASE_TAR" "$BASE_MANIFEST" "$VALIDATOR_26501" "$VALIDATOR_26502" "$INTEGRITY"; do [[ -f "$f" ]] || fail "missing handoff file: $(basename "$f")"; done
@@ -45,7 +59,7 @@ for f in "$PATCH_26501" "$V6_PATCH" "$PATCH_26502" "$PRECHANGE" "$BASE_TAR" "$BA
 [[ "$(sha "$PATCH_26502")" == "$PATCH_26502_SHA" ]] || fail "26502 runtime patch hash mismatch"
 [[ "$(sha "$PRECHANGE")" == "$PRECHANGE_SHA" ]] || fail "26502 pre-change checkpoint hash mismatch"
 [[ "$(sha "$VALIDATOR_26502")" == "$VALIDATOR_26502_SHA" ]] || fail "26502 validator hash mismatch"
-echo "PASS: exact tested 26501 V6 backup + patch checkpoint verified before 26502 source transform"
+echo "PASS: exact tested 26501 V6 backup + frozen 26502 V1 build-fix backup + patch checkpoint verified before source transform"
 
 echo "=== 26502 GATE 2: RECONSTRUCT EXACT SUCCESSFUL 26499 SOURCE ==="
 tar -xzf "$BASE_TAR" -C "$BASE"; [[ -f "$BASE/app/version.properties" ]] || fail "base extraction missing version"
@@ -57,9 +71,11 @@ BASE_COUNT="$({ find "$BASE/app/src/main" -type f -print; echo "$BASE/app/versio
 cp -a "$BASE/app" "$CAND/app"; echo "PASS: exact successful 26499 source reconstructed and hash-verified (865/865)"
 
 echo "=== 26502 GATE 3: REBUILD TESTED V6, THEN APPLY ONLY NARROW 26502 DELTA ==="
-patch --dry-run -p1 -d "$CAND" < "$PATCH_26501" > "$OUT/26501_patch_dry_run.txt"; patch -p1 -d "$CAND" < "$PATCH_26501" > "$OUT/26501_patch_apply.txt"
+patch --dry-run --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$CAND" < "$PATCH_26501" > "$OUT/26501_patch_dry_run.txt"; patch --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$CAND" < "$PATCH_26501" > "$OUT/26501_patch_apply.txt"
+assert_no_patch_artifacts "26501_runtime_patch"
 V6_SHADER_REL="app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl"; cp "$CAND/$V6_SHADER_REL" "$OUT/26501_v5_contribute_pre_v6.glsl"
-patch --dry-run -p1 -d "$CAND" < "$V6_PATCH" > "$OUT/26501_v6_glsl_patch_dry_run.txt"; patch -p1 -d "$CAND" < "$V6_PATCH" > "$OUT/26501_v6_glsl_patch_apply.txt"
+patch --dry-run --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$CAND" < "$V6_PATCH" > "$OUT/26501_v6_glsl_patch_dry_run.txt"; patch --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$CAND" < "$V6_PATCH" > "$OUT/26501_v6_glsl_patch_apply.txt"
+assert_no_patch_artifacts "26501_v6_glsl_patch"
 python3 - "$OUT/26501_v5_contribute_pre_v6.glsl" "$CAND/$V6_SHADER_REL" <<'PY'
 from pathlib import Path
 import sys
@@ -75,7 +91,8 @@ b,c,o=map(Path,sys.argv[1:]); h=lambda p:hashlib.sha256(p.read_bytes()).hexdiges
 new=sorted(set(cf)-set(bf)); rem=sorted(set(bf)-set(cf)); mod=sorted(k for k in bf.keys()&cf.keys() if h(bf[k])!=h(cf[k])); o.write_text('MODIFIED\n'+'\n'.join(mod)+'\nNEW\n'+'\n'.join(new)+'\nREMOVED\n'+'\n'.join(rem)+'\n'); assert len(mod)==5,(len(mod),mod); assert len(new)==4,(len(new),new); assert not rem,rem
 Path(str(o)+'.json').write_text(json.dumps({k:h(v) for k,v in cf.items()},sort_keys=True,indent=2)); print('PASS: exact tested V6 runtime reconstructed: 5 modified + 4 new')
 PY
-patch --dry-run -p1 -d "$CAND" < "$PATCH_26502" > "$OUT/26502_patch_dry_run.txt"; patch -p1 -d "$CAND" < "$PATCH_26502" > "$OUT/26502_patch_apply.txt"
+patch --dry-run --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$CAND" < "$PATCH_26502" > "$OUT/26502_patch_dry_run.txt"; patch --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 -d "$CAND" < "$PATCH_26502" > "$OUT/26502_patch_apply.txt"
+assert_no_patch_artifacts "26502_runtime_patch"
 python3 "$VALIDATOR_26502" "$CAND" --patch "$PATCH_26502" | tee "$OUT/26502_prebuild_validator.txt"
 python3 - "$CAND/app" "$OUT/26501_v6_scope.txt.json" "$OUT/26502_delta_scope.txt" <<'PY'
 from pathlib import Path
@@ -90,6 +107,7 @@ import hashlib,sys
 b,c,o=map(Path,sys.argv[1:]); h=lambda p:hashlib.sha256(p.read_bytes()).hexdigest(); bf={p.relative_to(b).as_posix():p for p in b.rglob('*') if p.is_file()}; cf={p.relative_to(c).as_posix():p for p in c.rglob('*') if p.is_file()}; new=sorted(set(cf)-set(bf)); rem=sorted(set(bf)-set(cf)); mod=sorted(k for k in bf.keys()&cf.keys() if h(bf[k])!=h(cf[k])); o.write_text('MODIFIED\n'+'\n'.join(mod)+'\nNEW\n'+'\n'.join(new)+'\nREMOVED\n'+'\n'.join(rem)+'\n'); assert len(mod)==5,(len(mod),mod); assert len(new)==4,(len(new),new); assert not rem,rem; print('PASS: final 26502 remains inside V6 5-modified + 4-new architecture envelope')
 PY
 
+assert_no_patch_artifacts "26502_preflight_final_candidate"
 echo "=== 26502 GATE 4: REAL GLSL / JAVA / FROZEN-PATH PREFLIGHT ==="
 command -v glslangValidator >/dev/null 2>&1 || fail "glslangValidator missing on runner"
 python3 - "$CAND" "$OUT" <<'PY'
