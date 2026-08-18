@@ -1,0 +1,368 @@
+diff --git a/app/src/main/assets/shaders/motionv2/display_exposure.glsl b/app/src/main/assets/shaders/motionv2/display_exposure.glsl
+index 748b943..da2ffac 100644
+--- a/app/src/main/assets/shaders/motionv2/display_exposure.glsl
++++ b/app/src/main/assets/shaders/motionv2/display_exposure.glsl
+@@ -3,11 +3,39 @@ precision mediump sampler2D;
+ 
+ uniform sampler2D InputBuffer;
+ uniform float displayGain;
++uniform float shadowRecoveryStrength;
++uniform float shadowFloorStop;
+ out vec3 Output;
+ 
+ /* IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY */
++/* IRIS_26503_EVIDENCE_BASED_STACK_AWARE_SHADOW_RECOVERY
++ * motionV2DisplayGain remains the one large-scale exposure authority.  The
++ * additional term is deliberately local: it is at most ten percent, scales all
++ * channels together, stops at the measured dark floor, and fades completely out
++ * before midtones.  It therefore cannot become a second global exposure owner or
++ * invent chroma in unsupported black-level noise.
++ */
++float luminance(vec3 c) {
++    return dot(c, vec3(0.2126, 0.7152, 0.0722));
++}
++vec3 recoverSupportedShadow(vec3 displayed, vec3 sensorRgb) {
++    displayed = max(displayed, vec3(0.0));
++    sensorRgb = max(sensorRgb, vec3(0.0));
++    float sensorY = max(luminance(sensorRgb), 0.0);
++    float displayedY = max(luminance(displayed), 0.0);
++    if (sensorY <= 1.0e-8 || shadowRecoveryStrength <= 0.0) return displayed;
++    /* Floor ownership stays in the pre-display sensor-linear domain so a large
++     * displayGain cannot turn unsupported black-level noise into "recoverable"
++     * signal merely by making it numerically brighter. */
++    float floorWidth = max(0.006, 1.5 * shadowFloorStop);
++    float floorGate = smoothstep(shadowFloorStop, shadowFloorStop + floorWidth, sensorY);
++    float shadowGate = 1.0 - smoothstep(0.12, 0.30, displayedY);
++    float scale = 1.0 + clamp(shadowRecoveryStrength, 0.0, 0.10) * floorGate * shadowGate;
++    return displayed * scale;
++}
+ void main() {
+     ivec2 p = ivec2(gl_FragCoord.xy);
+     vec3 c = max(texelFetch(InputBuffer, p, 0).rgb, vec3(0.0));
+-    Output = c * max(displayGain, 1.0);
++    vec3 displayed = c * max(displayGain, 1.0);
++    Output = recoverSupportedShadow(displayed, c);
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index fea8a13..0024489 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -126,19 +126,14 @@ vec3 mapExtendedLinearHeadroom(vec3 rgb) {
+     float mappedGuide=mapHeadroomLuminance(guide);
+     vec3 mapped=rgb*(mappedGuide/guide);
+ 
+-    /* IRIS_26501_GENTLE_NEUTRAL_WHITE_ROLLOFF
+-     * Real colour is retained through most of the shoulder. Only the final part
+-     * of physical headroom converges continuously to neutral display white. This
+-     * is the approved clipping behaviour: no hue invention, no hard grey shelf.
++    /* IRIS_26503_UPSTREAM_EXHAUSTION_OWNS_WHITE
++     * 26502 already knows whether physical Bayer/Short-A evidence is genuinely
++     * exhausted.  Do not create a second visible white-convergence decision from
++     * render headroom position.  Uniform scalar compression preserves the hue of
++     * recoverable warm walls/lamps; truly exhausted upstream-neutral pixels remain
++     * neutral because equal channels stay equal under the same scalar.
+      */
+-    const float start=0.50;
+-    float whitePoint=max(sceneWhite,start+0.05);
+-    float headroomPosition=clamp(
+-            (guide-start)/max(whitePoint-start,1.0e-6),
+-            0.0,
+-            1.0);
+-    float neutralMix=smoothstep(0.82,1.0,headroomPosition);
+-    return mix(mapped,vec3(mappedGuide),neutralMix);
++    return mapped;
+ }
+ 
+ /*
+@@ -158,9 +153,11 @@ vec3 fitDisplayGamut(vec3 rgb) {
+      * foliage approached display white. Uniform RGB scaling preserves channel
+      * ratios/hue and trades only highlight luminance for display gamut.
+      */
+-    vec3 hueSafe=rgb/max(peak,1.0e-6);
+-    float overflow=clamp((peak-1.0)/0.25,0.0,1.0);
+-    return mix(hueSafe,vec3(1.0),smoothstep(0.0,1.0,overflow));
++    /* IRIS_26503_HUE_PRESERVING_EXTENDED_RANGE_GAMUT
++     * Final display-gamut fit is one uniform RGB scale.  No independent channel
++     * clipping and no overflow-driven white mix are allowed here.
++     */
++    return rgb/max(peak,1.0e-6);
+ }
+ 
+ void main() {
+diff --git a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+index 44ec711..6feeba7 100644
+--- a/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
++++ b/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+@@ -144,8 +144,164 @@ void evaluateCorrespondence(
+             : 0.0;
+ }
+ 
++/* IRIS_26503_BOUNDARY_ANCHORED_SHORT_OBSERVABILITY
++ * Keep the proven 26502 radius-2 structured/smooth test as Tier 1.  The only
++ * new authority is a conservative Tier-2 fallback for the specific case where
++ * Tier 1 has too little unsaturated reference support to decide at all.
++ *
++ * Tier 2 never overrides a local mismatch/ambiguity.  It samples sparse, wider
++ * reference-owned anchors at the already-predicted Wronski displacement, requires
++ * strong flow coherence, multi-direction support including an opposing pair,
++ * tight exposure-normalized radiometry, and zero strong contradictory anchors.
++ * The clipped center still cannot certify itself and no new displacement search is
++ * invented.  If these conditions fail, output/provenance remain exactly 26502.
++ */
++ivec2 boundaryDirectionOffset(int direction, int radius) {
++    int halfRadius = max(radius / 2, 1);
++    if (direction == 0) return ivec2(-radius, 0);
++    if (direction == 1) return ivec2( radius, 0);
++    if (direction == 2) return ivec2(0, -radius);
++    if (direction == 3) return ivec2(0,  radius);
++    if (direction == 4) return ivec2(-radius, -radius);
++    if (direction == 5) return ivec2( radius,  radius);
++    if (direction == 6) return ivec2( radius, -radius);
++    if (direction == 7) return ivec2(-radius,  radius);
++    if (direction == 8) return ivec2(-halfRadius, -radius);
++    if (direction == 9) return ivec2( halfRadius,  radius);
++    if (direction == 10) return ivec2( halfRadius, -radius);
++    if (direction == 11) return ivec2(-halfRadius,  radius);
++    if (direction == 12) return ivec2(-radius, -halfRadius);
++    if (direction == 13) return ivec2( radius,  halfRadius);
++    if (direction == 14) return ivec2( radius, -halfRadius);
++    return ivec2(-radius, halfRadius);
++}
++
++bool validateBoundaryAnchoredCorrespondence(
++        ivec2 p, vec2 predicted, float flowConfidence,
++        out float meanRelativeError, out float supportCount) {
++    meanRelativeError = 1.0e20;
++    supportCount = 0.0;
++
++    /* Wider authority is deliberately stricter than ordinary Short-A flow use. */
++    if (flowConfidence < max(minimumFlowConfidence, 0.85)) return false;
++
++    /* If any center phases remain physically measurable, they are a direct guard
++     * against shifting Short-A color across an object boundary.  Only non-clipped,
++     * non-dark center phases participate; truly exhausted centers are not guessed. */
++    vec4 centerNormal = texelFetch(normalCfa, p, 0) /
++            max(referenceExposureScale, 1.0e-6);
++    vec4 centerClipMask = step(vec4(physicalClipThreshold), centerNormal);
++    vec4 centerShort = phaseSafeBilinear(predicted);
++    vec4 centerUsable = (vec4(1.0) - centerClipMask) * normalSafe(centerNormal) *
++            shortSafe(centerShort) * step(vec4(0.010001), centerNormal);
++    float centerCount = sum4(centerUsable);
++    if (centerCount > 0.5) {
++        vec4 centerEquivalent = centerShort * shortToNormalScale;
++        vec4 centerRel = abs(centerNormal - centerEquivalent) /
++                max(centerNormal, vec4(0.04));
++        float centerError = dot(centerRel, centerUsable) / centerCount;
++        if (centerError > 0.070) return false;
++    }
++
++    float errorSum = 0.0;
++    float acceptedAnchors = 0.0;
++    float strongConflicts = 0.0;
++    float seen0 = 0.0, seen1 = 0.0, seen2 = 0.0, seen3 = 0.0;
++    float seen4 = 0.0, seen5 = 0.0, seen6 = 0.0, seen7 = 0.0;
++    float seen8 = 0.0, seen9 = 0.0, seen10 = 0.0, seen11 = 0.0;
++    float seen12 = 0.0, seen13 = 0.0, seen14 = 0.0, seen15 = 0.0;
++    ivec2 maxP = packedSize - ivec2(1);
++
++    /* Search outward independently on sixteen spokes.  The FIRST observable
++     * unsaturated anchor on a spoke owns that spoke; we never skip nearby
++     * contradictory/ambiguous evidence to borrow agreement from a farther object.
++     * The half-axis spokes catch sub-radius color/edge displacement that eight
++     * cardinal/diagonal anchors alone can miss.  4/8/16/32/64 packed pixels reach
++     * 8..128 native RAW pixels while evaluating at most eighty sparse anchors. */
++    for (int direction = 0; direction < 16; ++direction) {
++        for (int ring = 0; ring < 5; ++ring) {
++            int radius = ring == 0 ? 4 : (ring == 1 ? 8 :
++                    (ring == 2 ? 16 : (ring == 3 ? 32 : 64)));
++            ivec2 offset = boundaryDirectionOffset(direction, radius);
++            ivec2 q = p + offset;
++            if (any(lessThan(q, ivec2(0))) || any(greaterThan(q, maxP))) continue;
++            vec2 qs = predicted + vec2(float(offset.x), float(offset.y));
++            if (qs.x < 0.0 || qs.y < 0.0 ||
++                    qs.x >= float(packedSize.x) || qs.y >= float(packedSize.y)) continue;
++
++            vec4 nSensor = texelFetch(referenceCfa, q, 0) /
++                    max(referenceExposureScale, 1.0e-6);
++            vec4 sRaw = phaseSafeBilinear(qs);
++            vec4 mask = normalSafe(nSensor) * shortSafe(sRaw) *
++                    step(vec4(0.010001), nSensor);
++            float count = sum4(mask);
++            if (count < 1.5) continue;
++
++            vec4 sEquivalent = sRaw * shortToNormalScale;
++            vec4 rel = abs(nSensor - sEquivalent) / max(nSensor, vec4(0.04));
++            float anchorError = dot(rel, mask) / count;
++
++            /* First observable boundary on this spoke is decisive. */
++            if (anchorError > 0.12) {
++                strongConflicts += 1.0;
++                break;
++            }
++            if (anchorError <= 0.055) {
++                acceptedAnchors += 1.0;
++                supportCount += count;
++                errorSum += anchorError * count;
++                if (direction == 0) seen0 = 1.0;
++                else if (direction == 1) seen1 = 1.0;
++                else if (direction == 2) seen2 = 1.0;
++                else if (direction == 3) seen3 = 1.0;
++                else if (direction == 4) seen4 = 1.0;
++                else if (direction == 5) seen5 = 1.0;
++                else if (direction == 6) seen6 = 1.0;
++                else if (direction == 7) seen7 = 1.0;
++                else if (direction == 8) seen8 = 1.0;
++                else if (direction == 9) seen9 = 1.0;
++                else if (direction == 10) seen10 = 1.0;
++                else if (direction == 11) seen11 = 1.0;
++                else if (direction == 12) seen12 = 1.0;
++                else if (direction == 13) seen13 = 1.0;
++                else if (direction == 14) seen14 = 1.0;
++                else seen15 = 1.0;
++            }
++            /* 0.055..0.12 is ambiguous: do not accept and do not look past it. */
++            break;
++        }
++    }
++
++    if (supportCount > 0.0) meanRelativeError = errorSum / supportCount;
++    float directionCount = seen0 + seen1 + seen2 + seen3 + seen4 + seen5 +
++            seen6 + seen7 + seen8 + seen9 + seen10 + seen11 + seen12 +
++            seen13 + seen14 + seen15;
++    float opposingPairs =
++            (seen0 * seen1 > 0.5 ? 1.0 : 0.0) +
++            (seen2 * seen3 > 0.5 ? 1.0 : 0.0) +
++            (seen4 * seen5 > 0.5 ? 1.0 : 0.0) +
++            (seen6 * seen7 > 0.5 ? 1.0 : 0.0) +
++            (seen8 * seen9 > 0.5 ? 1.0 : 0.0) +
++            (seen10 * seen11 > 0.5 ? 1.0 : 0.0) +
++            (seen12 * seen13 > 0.5 ? 1.0 : 0.0) +
++            (seen14 * seen15 > 0.5 ? 1.0 : 0.0);
++
++    /* All-four-phase clipping has no surviving center color guard, so demand a
++     * wider geometric proof than partial clipping.  Partial clipping keeps its
++     * measured normal phases and therefore needs fewer boundary spokes. */
++    bool allCenterPhasesClipped = sum4(centerClipMask) > 3.5;
++    float requiredDirections = allCenterPhasesClipped ? 6.0 : 4.0;
++    float requiredPairs = allCenterPhasesClipped ? 2.0 : 1.0;
++    float requiredSupport = allCenterPhasesClipped ? 18.0 : 12.0;
++
++    return strongConflicts < 0.5 &&
++            acceptedAnchors >= requiredDirections &&
++            directionCount >= requiredDirections && opposingPairs >= requiredPairs &&
++            supportCount >= requiredSupport && meanRelativeError <= 0.045;
++}
++
+ bool refineObservableCorrespondence(
+-        ivec2 p, vec2 predicted, out vec2 refined,
++        ivec2 p, vec2 predicted, float flowConfidence, out vec2 refined,
+         out float bestError, out float structure, out float supportCount) {
+     bestError = 1.0e20;
+     float secondError = 1.0e20;
+@@ -174,14 +330,24 @@ bool refineObservableCorrespondence(
+             }
+         }
+     }
+-    if (!found) return false;
+ 
+-    if (structure >= 0.08) {
+-        float margin = secondError - bestError;
+-        bool exceptionallyGood = bestError <= 0.055;
+-        return bestError <= 0.12 && (exceptionallyGood || margin >= 0.010);
++    if (found) {
++        /* Exact 26502 Tier-1 decision.  A sufficient local observation that
++         * disagrees or is ambiguous is final: Tier 2 is forbidden to override it. */
++        if (structure >= 0.08) {
++            float margin = secondError - bestError;
++            bool exceptionallyGood = bestError <= 0.055;
++            return bestError <= 0.12 && (exceptionallyGood || margin >= 0.010);
++        }
++        return supportCount >= 16.0 && bestError <= 0.060;
+     }
+-    return supportCount >= 16.0 && bestError <= 0.060;
++
++    /* No Tier-1 candidate had even 12 usable physical phase samples.  Only this
++     * insufficient-observability state is eligible for boundary-anchored proof. */
++    refined = predicted;
++    structure = 0.0;
++    return validateBoundaryAnchoredCorrespondence(
++            p, predicted, flowConfidence, bestError, supportCount);
+ }
+ 
+ void storeState(ivec2 p, vec4 cfa, vec4 state) {
+@@ -225,7 +391,7 @@ void main() {
+     float structure;
+     float supportCount;
+     if (!refineObservableCorrespondence(
+-            p, predicted, source, meanError, structure, supportCount)) {
++            p, predicted, flowConfidence, source, meanError, structure, supportCount)) {
+         addMask(D_CORR_REJECT, D_PHASE_CORR_REJECT, clipMask);
+         addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+index 1685a3a..00be538 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+@@ -22,19 +22,61 @@ public final class MotionV2DisplayExposure extends Node {
+                     "MotionV2DisplayExposure used outside Motion V2");
+         }
+ 
++        /* IRIS_26503_SINGLE_EXPOSURE_SHADOW_AUTHORITY
++         * Keep the tested Motion display gain as the sole large-scale exposure
++         * multiplier.  Shadow latitude is a separate, local, evidence-bounded
++         * correction derived from the actually measured Motion V2 stack.
++         */
+         float gain = Math.max(
+                 1.0f,
+                 basePipeline.mParameters.motionV2DisplayGain);
++        float retainedFrames = Math.max(
++                1.0f,
++                (float) basePipeline.mParameters.retainedFrameCount);
++        float effectiveSupport = Math.max(
++                1.0f,
++                basePipeline.mParameters.motionV2EffectiveSupport);
++        float effectiveStackRatio = Math.max(
++                0.10f,
++                Math.min(1.0f, effectiveSupport / retainedFrames));
++        float stackDepthConfidence = Math.max(
++                0.0f,
++                Math.min(1.0f, (effectiveSupport - 1.0f) / 7.0f));
++        float iso = Math.max(1.0f, (float) basePipeline.mParameters.iso);
++        float isoRisk = Math.max(
++                0.0f,
++                Math.min(1.0f, (iso - 800.0f) / 3200.0f));
++        float shadowRecoverability =
++                effectiveStackRatio
++                        * (0.35f + 0.65f * stackDepthConfidence)
++                        * (1.0f - 0.55f * isoRisk);
++        float shadowRecoveryStrength = Math.max(
++                0.0f,
++                Math.min(0.10f, 0.10f * shadowRecoverability));
++        float shadowFloorStop = 0.006f + 0.010f * isoRisk;
+ 
+         glProg.useAssetProgram("motionv2/display_exposure");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+         glProg.setVar("displayGain", gain);
++        glProg.setVar("shadowRecoveryStrength", shadowRecoveryStrength);
++        glProg.setVar("shadowFloorStop", shadowFloorStop);
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
+ 
+-        Log.d(Name, "IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY"
++        Log.d(Name, "IRIS_26503_SINGLE_EXPOSURE_SHADOW_AUTHORITY"
+                 + " displayGain=" + gain
++                + " largeScaleOwner=motionV2DisplayGain"
++                + " globalResidualGain=1.0"
++                + " retainedFrames=" + retainedFrames
++                + " effectiveSupport=" + effectiveSupport
++                + " effectiveStackRatio=" + effectiveStackRatio
++                + " iso=" + iso
++                + " isoRisk=" + isoRisk
++                + " shadowRecoverability=" + shadowRecoverability
++                + " shadowRecoveryStrength=" + shadowRecoveryStrength
++                + " shadowFloorStop=" + shadowFloorStop
++                + " localHueScaleOnly=true"
+                 + " insideWronski=false"
+                 + " photonAutoExposure=false"
+                 + " photonExposureFusion=false"
