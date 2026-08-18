@@ -100,8 +100,13 @@ def source_tests(root,base):
     # A and old single-domain invariant.
     for tok in ('IRIS_26503_FROZEN_CAPTURE_SCENE_KEY_GAIN','ev100','targetP50','targetP90','hdrShadowProtection','liveAeFeedback=false','frozenReferenceCaptureState=true'):
         assert tok in merger,tok
-    assert 'sensorDomainGain=1.0' in cfa and 'displayGainOwner=MotionV2DisplayExposure' in cfa
-    assert cfa.count('MotionV2Merger.computeReferenceGain')==1
+    assert 'sensorDomainGain=1.0' in cfa
+    assert cfa.count('parameters.motionV2DisplayGain =')==1
+    assert cfa.count('MotionV2Merger.computeDisplayGain(')==1
+    assert cfa.count('MotionV2Merger.computeDisplayGain')==1
+    assert 'public static float computeDisplayGain(' in merger
+    assert 'IRIS_26503_KEEP_26502_SPARSE_GAIN_SAMPLING' in merger
+    assert 'public static float computeReferenceGain(' not in merger
 
     # B/E local support carrier and sole consumption.
     assert 'uniform highp sampler2D frameSupportTexture;' in norm
@@ -126,10 +131,17 @@ def source_tests(root,base):
         assert tok in short,tok
     assert 'return supportCount >= 16.0 && bestError <= 0.060;' in short
 
-    # Performance: disable only diagnostics; retain real effective support readback.
-    assert 'IRIS_26503_DISABLE_HEAVY_DIRECT_RGB_SUPPORT_READBACK' in cfa
-    assert 'IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK' in cfa
-    assert 'currentSupport.BufferLoad();' in cfa and 'MotionMetrics.publishV2Support(' in cfa
+    # Performance: 26502 had already disabled obsolete direct-support readback. Freeze it.
+    # 26503 disables only the remaining direct-RGB CPU provenance telemetry block; GPU
+    # provenance has already been consumed by the semantic normalizer.
+    assert 'IRIS_26480_DISABLE_DIRECT_SUPPORT_GPU_READBACK_V2' in cfa
+    assert 'if (false && /* IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK */ directBayer && iris26492ReadbackProvenance != null) {' in cfa
+    assert 'iris26488ReadDiagnosticFloatRgba(iris26487DiagTexture)' in cfa
+    assert 'MotionMetrics.publishV2Support(' in cfa
+    post=(R/'src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java').read_text()
+    base_post=(B/'src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java').read_text()
+    assert post==base_post,'PostPipeline changed outside seven-file firewall'
+    assert 'motionV2HighlightProvenance = motionV2DirectRgbCarrier ? null : highlightProvenance;' in post
 
     # Preserve Photon's cross-device ISO100-normalized EXIF convention byte-for-byte.
     base_exif=(B/'src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java').read_text()
@@ -143,7 +155,7 @@ def source_tests(root,base):
         assert bad not in joined,bad
     assert 'IRIS_26501_WRONSKI_PER_FRAME_SPATIAL_RGB_OWNER' in (R/CONTRIB).read_text()
     assert 'IRIS_26502_STACK_AWARE_SEMANTIC_NORMALIZE' in norm
-    print('PASS SOURCE A-G: exact seven-file delta; Camera2 matrix, Spatial-RGB contributor, and Photon ISO100-normalized EXIF frozen; local support carrier and speed gates verified')
+    print('PASS SOURCE A-G: exact seven-file delta; canonical computeDisplayGain owner, Camera2 matrix, Spatial-RGB contributor, and Photon ISO100-normalized EXIF frozen; local support carrier and direct-RGB provenance speed gate verified')
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('root',type=Path); ap.add_argument('--base-root',type=Path,required=True); ap.add_argument('--seed-validator',type=Path,required=True); a=ap.parse_args()

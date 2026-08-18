@@ -43,101 +43,6 @@ def replace_function(src: str, signature_token: str, replacement: str, label: st
         i+=1
     fail(f'{label}: closing brace not found')
 
-def method_bounds_containing(src: str, marker: str):
-    pos=src.find(marker)
-    if pos<0: return None
-    # Diagnostic helpers are private/static void in the current source. Choose the nearest
-    # preceding void method whose balanced body contains the marker.
-    candidates=[]
-    for m in re.finditer(r'(?m)^\s*(?:private\s+|public\s+|protected\s+)?(?:static\s+)?void\s+[A-Za-z_]\w*\s*\(', src[:pos]):
-        candidates.append(m.start())
-    for start in reversed(candidates):
-        brace=src.find('{',start)
-        if brace<0 or brace>pos: continue
-        depth=0
-        for i in range(brace,len(src)):
-            if src[i]=='{': depth+=1
-            elif src[i]=='}':
-                depth-=1
-                if depth==0:
-                    if i>pos: return start,brace,i
-                    break
-    return None
-
-def _brace_pairs(src: str):
-    """Return balanced Java brace pairs while ignoring comments and quoted literals."""
-    stack=[]; pairs=[]
-    in_str=False; in_char=False; esc=False; in_line=False; in_block=False
-    i=0
-    while i<len(src):
-        ch=src[i]; nxt=src[i+1] if i+1<len(src) else ''
-        if in_line:
-            if ch=='\n': in_line=False
-        elif in_block:
-            if ch=='*' and nxt=='/': in_block=False; i+=1
-        elif in_str:
-            if esc: esc=False
-            elif ch=='\\': esc=True
-            elif ch=='"': in_str=False
-        elif in_char:
-            if esc: esc=False
-            elif ch=='\\': esc=True
-            elif ch=="'": in_char=False
-        else:
-            if ch=='/' and nxt=='/': in_line=True; i+=1
-            elif ch=='/' and nxt=='*': in_block=True; i+=1
-            elif ch=='"': in_str=True
-            elif ch=="'": in_char=True
-            elif ch=='{': stack.append(i)
-            elif ch=='}':
-                if not stack: fail('Java brace parser saw unmatched closing brace')
-                pairs.append((stack.pop(),i))
-        i+=1
-    if stack: fail('Java brace parser saw unmatched opening brace')
-    return pairs
-
-def _diagnostic_only(body: str) -> bool:
-    # Positive proof: a GPU->CPU readback plus its diagnostic texture/buffer owner.
-    if 'BufferLoad' not in body or ('textureBuffer' not in body and 'TextureBuffer' not in body):
-        return False
-    # Negative proof: never suppress GPU image production, ownership, cleanup or metrics
-    # that the renderer consumes. Logging/math around a BufferLoad is okay; dispatch is not.
-    forbidden=(
-        'computeAuto', 'drawBlocks', 'setTextureCompute', 'glProg.draw',
-        'glProg.useProgram', 'glProg.close', 'currentSupport.BufferLoad()',
-        'MotionMetrics.publishV2Support(', 'return current', 'return output',
-    )
-    return not any(x in body for x in forbidden)
-
-def disable_diag_method(src: str, marker: str, disable_marker: str) -> tuple[str,bool]:
-    """Disable the smallest provably readback-only lexical scope containing marker.
-
-    26492-26502 diagnostics moved between helper methods and inline scoped blocks over
-    several builds.  Search smallest-first instead of assuming one historical method
-    shape.  This avoids both a fragile anchor failure and, more importantly, ever
-    disabling the enclosing reconstruction method when that method also dispatches GPU
-    image math.
-    """
-    pos=src.find(marker)
-    if pos<0: return src,False
-    candidates=sorted(
-        ((a,b) for a,b in _brace_pairs(src) if a<pos<b),
-        key=lambda ab: ab[1]-ab[0])
-    for brace,end in candidates:
-        body=src[brace+1:end]
-        if not _diagnostic_only(body):
-            continue
-        indent=re.search(r'(?m)^(\s*)[^\n]*$',src[:brace].split('\n')[-1] if False else '')
-        # Keep the original lexical scope and declarations intact; the constant-false
-        # child scope makes the diagnostic unreachable without perturbing surrounding code.
-        wrapped=(
-            '\n        /* '+disable_marker+'\n'
-            '         * Proven diagnostic-only GPU readback disabled; image math and the\n'
-            '         * functional currentSupport/MotionMetrics path remain untouched. */\n'
-            '        if (false) {'+body+'\n        }\n    ')
-        return src[:brace+1]+wrapped+src[end:],True
-    return src,False
-
 ROOT=None
 
 def edit(rel: str, fn):
@@ -154,49 +59,53 @@ def motion_merger(src: str) -> str:
     replacement=r'''    /* IRIS_26503_FROZEN_CAPTURE_SCENE_KEY_GAIN
      * The large Motion display multiplier remains a single downstream rendering
      * authority, but darkness is no longer interpreted as an error by fixed p50/p90
-     * targets.  The selected reference CaptureResult is already the frozen shutter-time
-     * HAL/preview exposure state.  Its actual aperture/exposure/ISO creates a one-way
+     * targets. The selected reference CaptureResult is already the frozen shutter-time
+     * HAL/preview exposure state. Its actual aperture/exposure/ISO creates a one-way
      * scene key: no value here is fed back to Camera2 or live AE.
      *
-     * Very-low-EV scenes are allowed to remain dark.  Bright high-dynamic-range scenes
-     * whose median is mostly interior/shadow receive additional shadow-dominance
-     * protection so a dark car cabin cannot force the whole frame several stops brighter.
-     * Normally exposed scenes converge to the proven 26502 histogram targets.
+     * Keep the proven 26502 sparse RAW histogram sampling so exposure estimation stays
+     * cheap. Very-low-EV scenes are allowed to remain dark. Bright HDR scenes whose
+     * median is mostly interior/shadow receive additional shadow-dominance protection.
      */
-    public static float computeReferenceGain(
-            ByteBuffer buffer,
-            int width,
-            int height,
-            Parameters parameters) {
-        if (buffer == null || width <= 0 || height <= 0 || parameters == null) {
+    public static float computeDisplayGain(
+            ByteBuffer raw, int width, int height, Parameters parameters,
+            double referenceExposureEnergy) {
+        if (raw == null || width <= 0 || height <= 0
+                || parameters == null || parameters.whiteLevel <= 0
+                || parameters.blackLevel == null || parameters.blackLevel.length < 4) {
             return 1.0f;
         }
 
-        ByteBuffer src = buffer.duplicate().order(ByteOrder.nativeOrder());
-        int samples = Math.min(width * height, src.capacity() / 2);
-        if (samples <= 0) return 1.0f;
-
-        final int bins = 1024;
-        long[] histogram = new long[bins];
+        /* IRIS_26503_KEEP_26502_SPARSE_GAIN_SAMPLING
+         * Preserve the proven ~256x192 estimator footprint instead of scanning millions
+         * of RAW pixels on the CPU. This change must not become a processing-time regression. */
+        final int bins = 2048;
+        final int[] histogram = new int[bins];
         long total = 0L;
-        float white = Math.max(parameters.whiteLevel, 1.0f);
-        float[] black = parameters.blackLevel != null && parameters.blackLevel.length >= 4
-                ? parameters.blackLevel : new float[]{0f,0f,0f,0f};
+        ByteBuffer view = raw.duplicate().order(ByteOrder.nativeOrder());
+        view.clear();
+        ShortBuffer shorts = view.asShortBuffer();
+        int sx = Math.max(1, width / 256);
+        int sy = Math.max(1, height / 192);
+        float white = parameters.whiteLevel;
 
-        /* Sample the physical RAW directly.  Four-pixel stride keeps the estimator cheap
-         * while preserving the same scene statistics across Bayer phases. */
-        for (int index = 0; index < samples; index += 4) {
-            int x = index % width;
-            int y = index / width;
-            int phase = ((y & 1) << 1) | (x & 1);
-            float b = black[Math.max(0, Math.min(3, phase))];
-            float value = Short.toUnsignedInt(src.getShort(index * 2));
-            float normalized = Math.max(0.0f, value - b) / Math.max(white - b, 1.0f);
-            int bin = Math.max(0, Math.min(bins - 1, Math.round(normalized * (bins - 1))));
-            histogram[bin]++;
-            total++;
+        for (int y = sy / 2; y < height; y += sy) {
+            for (int x = sx / 2; x < width; x += sx) {
+                int index = y * width + x;
+                if (index < 0 || index >= shorts.limit()) continue;
+                int rawValue = Short.toUnsignedInt(shorts.get(index));
+                int phase = ((y & 1) << 1) | (x & 1);
+                float black = parameters.blackLevel[phase];
+                float span = Math.max(1.0f, white - black);
+                float normalized = (rawValue - black) / span;
+                float measured = Math.max(0.0f, Math.min(1.0f, normalized));
+                int bin = Math.min(bins - 1,
+                        Math.max(0, (int)(measured * (bins - 1))));
+                histogram[bin]++;
+                total++;
+            }
         }
-        if (total <= 0L) return 1.0f;
+        if (total < 64L) return 1.0f;
 
         float p50 = quantile(histogram, total, 0.50f);
         float p90 = quantile(histogram, total, 0.90f);
@@ -209,7 +118,7 @@ def motion_merger(src: str) -> str:
                 && exposureSeconds > 0.0 && exposureSeconds < 30.0
                 && Float.isFinite(iso) && iso > 0.0f
                 && Float.isFinite(aperture) && aperture > 0.1f;
-        float ev100 = 6.0f; // invalid metadata falls back to the proven normal-scene policy
+        float ev100 = 6.0f;
         if (frozenCaptureValid) {
             double ev = Math.log((aperture * aperture) / exposureSeconds) / Math.log(2.0)
                     - Math.log(iso / 100.0) / Math.log(2.0);
@@ -222,9 +131,6 @@ def motion_merger(src: str) -> str:
         float targetP50 = mix(0.0020f, 0.050f, darknessSceneKey);
         float targetP90 = mix(0.0120f, 0.180f, darknessSceneKey);
 
-        /* High EV + tiny median relative to p99 describes a bright scene whose frame is
-         * dominated by dark foreground (the car test). Preserve that intended contrast
-         * instead of asking the median to look like an ordinary evenly-lit photograph. */
         float medianToHighlight = p50 / Math.max(p99, 0.0020f);
         float brightScene = frozenCaptureValid ? smoothstep(6.0f, 10.0f, ev100) : 0.0f;
         float shadowDominance = 1.0f - smoothstep(0.060f, 0.200f, medianToHighlight);
@@ -234,17 +140,19 @@ def motion_merger(src: str) -> str:
 
         float gain50 = targetP50 / Math.max(p50, 1.0e-5f);
         float gain90 = targetP90 / Math.max(p90, 1.0e-5f);
-        float sceneGain = (float) Math.sqrt(
+        float sceneGain = (float)Math.sqrt(
                 Math.max(1.0f, gain50) * Math.max(1.0f, gain90));
         sceneGain = Math.max(1.0f, Math.min(16.0f, sceneGain));
 
-        /* Keep 26502's highlight occupancy veto.  This veto can only lower the global
-         * display gain; it cannot brighten shadows or change live exposure. */
+        /* Highlight occupancy is a one-way veto only. It can lower display lift, never
+         * increase it and never feed Camera2/live AE. */
         float predictedNearClip = fractionAbove(
                 histogram, total, Math.min(1.0f, 0.985f / Math.max(sceneGain, 1.0f)));
         float occupancyPressure = smoothstep(0.015f, 0.18f, predictedNearClip);
-        float occupancyLimitedGain = mix(sceneGain, 1.0f, occupancyPressure);
-        float gain = Math.max(1.0f, Math.min(16.0f, occupancyLimitedGain));
+        float gain = Math.max(1.0f,
+                Math.min(16.0f, mix(sceneGain, 1.0f, occupancyPressure)));
+        if (!Float.isFinite(gain)) gain = 1.0f;
+        if (gain < 1.02f) gain = 1.0f;
 
         Log.d(TAG, "IRIS_26503_FROZEN_CAPTURE_SCENE_KEY_GAIN"
                 + " rawP50=" + p50
@@ -263,12 +171,17 @@ def motion_merger(src: str) -> str:
                 + " unconstrainedGain=" + sceneGain
                 + " predictedNearClip=" + predictedNearClip
                 + " displayGain=" + gain
+                + " referenceExposureEnergyDiagnosticOnly=" + referenceExposureEnergy
                 + " globalExposureOwner=true"
                 + " liveAeFeedback=false"
                 + " frozenReferenceCaptureState=true");
         return gain;
     }'''
-    return replace_function(src,'    public static float computeReferenceGain(',replacement,'MotionV2Merger.computeReferenceGain')
+    return replace_function(
+            src,
+            '    public static float computeDisplayGain(',
+            replacement,
+            'MotionV2Merger.computeDisplayGain')
 
 # B/E — carry true local frame-equivalent support in RGB alpha without changing RGB math.
 def normalizer(src: str) -> str:
@@ -336,29 +249,28 @@ def cfa_host(src: str) -> str:
         '                    glProg.setTexture("frameSupportTexture", currentDirectFrameSupport);\n',
         'CFA normalizer local support binding')
 
-    marker='IRIS_26426_DIRECT_RGB_CHANNEL_SUPPORT_TELEMETRY'
-    pos=src.find(marker)
-    if pos<0: fail('CFA: direct RGB diagnostic marker missing')
-    cond='if (directBayer && currentDirectSupport != null) {'
-    ci=src.find(cond,pos)
-    if ci<0 or ci-pos>1600: fail('CFA: direct support readback condition not found near marker')
-    src=src[:ci]+'''if (false && /* IRIS_26503_DISABLE_HEAVY_DIRECT_RGB_SUPPORT_READBACK */\n                    (directBayer && currentDirectSupport != null)) {'''+src[ci+len(cond):]
+    # 26502 already disabled the obsolete full direct-support readback. Freeze that
+    # proven state instead of trying to re-disable it with a stale historical anchor.
+    already_disabled = (
+        'if (false && /* IRIS_26480_DISABLE_DIRECT_SUPPORT_GPU_READBACK_V2 */ '
+        'directBayer && currentDirectSupport != null) {'
+    )
+    if already_disabled not in src:
+        fail('CFA: canonical 26502 direct-support diagnostic-disable invariant missing')
 
-    # The per-phase provenance diagnostic was invaluable during 26492-26502 but the logs
-    # show it can stall seconds after RGB is already complete. Disable the diagnostic-only
-    # method as a whole only when the reconstructed source proves it is readback-only.
-    provenance_markers=[
-        'IRIS_26494_PER_PHASE_HIGHLIGHT_PROVENANCE',
-        'IRIS_26492_EXPLICIT_HIGHLIGHT_PROVENANCE',
-    ]
-    disabled=False
-    for pm in provenance_markers:
-        if pm in src:
-            candidate,ok=disable_diag_method(src,pm,'IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK')
-            if ok:
-                src=candidate; disabled=True; break
-    if not disabled:
-        fail('CFA: heavy provenance marker exists but no diagnostic-only readback scope could be proven; refusing unsafe speed edit')
+    # The remaining full provenance readback is post-normalization telemetry only for
+    # standard Bayer/direct-RGB. PostPipeline explicitly discards this CPU carrier for
+    # direct RGB because provenance has already been consumed GPU-side by the normalizer.
+    provenance_condition = 'if (directBayer && iris26492ReadbackProvenance != null) {'
+    provenance_disabled = (
+        'if (false && /* IRIS_26503_DISABLE_HEAVY_PROVENANCE_READBACK */ '
+        'directBayer && iris26492ReadbackProvenance != null) {'
+    )
+    src = one(
+        src,
+        provenance_condition,
+        provenance_disabled,
+        'CFA direct-RGB provenance diagnostic readback disable')
     return src
 
 def main():
