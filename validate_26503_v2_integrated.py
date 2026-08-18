@@ -83,6 +83,8 @@ def source_tests(root,base):
     cfa=(R/'src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java').read_text()
     exif=(R/'src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java').read_text()
     dj=(R/'src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java').read_text()
+    parameters_java=(R/'src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java').read_text()
+    motion_metrics_java=(R/'src/main/java/com/particlesdevs/photoncamera/processing/MotionMetrics.java').read_text()
     ds=(R/'src/main/assets/shaders/motionv2/display_exposure.glsl').read_text()
     norm=(R/'src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl').read_text()
     render=(R/'src/main/assets/shaders/motionv2/render.glsl').read_text()
@@ -117,6 +119,15 @@ def source_tests(root,base):
     assert 'carrier.a' in ds and 'uniform float retainedFrames;' in ds
     assert dj.count('glProg.setVar("displayGain", gain);')==1
     assert dj.count('glProg.setVar("retainedFrames", retainedFrames);')==1
+    # Java owner/symbol contract: transformed display code may only reference real Parameters fields,
+    # and retained frame count comes from the existing MotionMetrics owner rather than an invented field.
+    refs=set(re.findall(r'basePipeline\.mParameters\.([A-Za-z_]\w*)',dj))
+    declared=set(re.findall(r'(?m)^\s*(?:public|protected|private)?\s*(?:static\s+)?(?:final\s+)?[A-Za-z_][\w<>\[\].?, ]*\s+([A-Za-z_]\w*)\s*(?:=|;)',parameters_java))
+    missing=sorted(refs-declared)
+    assert not missing,('MotionV2DisplayExposure unresolved Parameters fields',missing)
+    assert 'retainedFrameCount' not in dj,'nonexistent Parameters.retainedFrameCount survived'
+    assert 'com.particlesdevs.photoncamera.processing.MotionMetrics.retainedFrames()' in dj
+    assert re.search(r'public\s+static\s+int\s+retainedFrames\s*\(\s*\)',motion_metrics_java), 'MotionMetrics.retainedFrames() owner missing'
     assert 'globalResidualGain=1.0' in dj and 'pixelLocalSupportFromCarrierAlpha=true' in dj
 
     # C: no post-physical white painting; Camera2 transform untouched.

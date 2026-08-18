@@ -21,7 +21,7 @@ FINAL_HASHES = {
     DISPLAY.as_posix(): '3ab7f631e41e0e300250f370f7d3f008efacd09fa0541a80c65ec749d586721a',
     RENDER.as_posix(): '39886a4256f6a53ffe70869798f5a1f23d0fb03e9386bc78e5ad938030469fb1',
     COLOR.as_posix(): BASE_HASHES[COLOR.as_posix()],
-    DISPLAY_JAVA.as_posix(): '035d2f2f904d95b8d58d177ec31de49689b5f69cd1fda5ac9e4a6384b1969ada',
+    DISPLAY_JAVA.as_posix(): 'c186727609309e66908ceb89fb66277c9ac267fbe3c490d6f61f85de32fffb27',
 }
 EXPECTED_PATCH_PATHS = {
     SHORT.as_posix(), DISPLAY.as_posix(), RENDER.as_posix(), DISPLAY_JAVA.as_posix()
@@ -272,8 +272,9 @@ def source_tests(root: Path, base_root: Path|None, patch: Path|None):
             assert m in txt,m
     j=(root/DISPLAY_JAVA).read_text(); d=(root/DISPLAY).read_text(); r=(root/RENDER).read_text(); c=(root/COLOR).read_text(); s=(root/SHORT).read_text()
     # A/B/E ownership and host/shader interface.
-    for tok in ('motionV2DisplayGain','motionV2EffectiveSupport','retainedFrameCount','basePipeline.mParameters.iso','shadowRecoveryStrength','shadowFloorStop','globalResidualGain=1.0','localHueScaleOnly=true'):
+    for tok in ('motionV2DisplayGain','motionV2EffectiveSupport','com.particlesdevs.photoncamera.processing.MotionMetrics.retainedFrames()','basePipeline.mParameters.iso','shadowRecoveryStrength','shadowFloorStop','globalResidualGain=1.0','localHueScaleOnly=true'):
         assert tok in j,tok
+    assert 'retainedFrameCount' not in j, 'obsolete/nonexistent Parameters.retainedFrameCount survived'
     assert j.count('glProg.setVar("displayGain"')==1
     assert j.count('glProg.setVar("shadowRecoveryStrength"')==1
     assert j.count('glProg.setVar("shadowFloorStop"')==1

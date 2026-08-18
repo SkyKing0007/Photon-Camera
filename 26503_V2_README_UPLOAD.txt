@@ -1,4 +1,4 @@
-26503 V5 Direct-Canonical Scene-Faithful A-G handoff
+26503 V6 Direct-Canonical retained-frame-owner build-fix handoff
 
 WHAT THIS HANDOFF DOES
 1. Verifies branch experimental-clean-photon-rebuild and canonical tested-26502 commit 6118984523296945a0910e55ddaa4d3126184059.
@@ -22,15 +22,12 @@ V5 also audits the next performance anchor instead of waiting for another Action
 - Functional effective-support metrics remain active.
 
 BUILD INFRASTRUCTURE
-The Khronos glslang bootstrap is the exact proven 26501/26502-style block restored in V4 and is unchanged in V5.
+The Khronos glslang bootstrap is the exact proven 26501/26502-style block restored in V4 and remains unchanged in V6.
 
 VSCODE.DEV UPLOAD
 Upload/replace every file from this ZIP at the matching repository path on branch:
   experimental-clean-photon-rebuild
 Keep the nested .github/workflows path exactly as supplied.
-
-COMMIT SENTENCE
-  26503 V5: build directly from canonical 26502 and fix computeDisplayGain transform
 
 Keep promote_26503_source=false for this build.
 
@@ -44,3 +41,9 @@ Send the final GitHub Actions output/proof or say the run completed. Do not inst
 
 AFTER ON-DEVICE ACCEPTANCE
 Only after 26503 is judged successful should the workflow be run manually with promote_26503_source=true. That promotes accepted 26503 into app/src/main so 26504 starts directly from 26503.
+
+V6 JAVAC CORRECTION
+V5 reached Gradle javac and failed because the seed referenced a field that does not exist: Parameters.retainedFrameCount. The real established owner is MotionMetrics.retainedFrames(). V6 changes only that ownership reference in the intended 26503 candidate and adds a pre-Gradle Java field/method ownership audit so this class of nonexistent Parameters symbol is caught before the expensive Gradle build.
+
+COMMIT SENTENCE
+  26503 V6: use MotionMetrics retained-frame owner and add Java symbol preflight
