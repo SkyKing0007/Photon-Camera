@@ -46,3 +46,10 @@ V3 BUILDFIX / EXIF RESTORE
 - Fixes the glslang 16.5.0 bootstrap: the release has four matching Linux x86-64 archives, so the workflow now selects exactly glslang-16.5.0-linux-x86_64-release.tar.gz instead of asserting the broad filter returns one item.
 - Removes the proposed ParseExif rewrite completely. Tested-26502 Photon ISO100-normalized EXIF behavior using IsoExpoSelector.getMPY() is frozen byte-for-byte for cross-device compatibility.
 - No runtime source was changed by the failed V2 run because failure occurred in the glslang bootstrap before canonicalization/build.
+
+V4 PROVEN-BUILDPATH CORRECTION
+- Reverts the entire glslang bootstrap to the exact already-proven 26502 workflow method.
+- Removes the unproven dynamic `find -type f -name glslangValidator` bootstrap introduced in V3.
+- No Motion/RAW/HDR runtime code changes versus V3.
+- EXIF remains frozen to tested-26502 behavior.
+- New standing build rule: proven infrastructure blocks from the latest successful build are reused unchanged unless a failure directly proves they must change.
