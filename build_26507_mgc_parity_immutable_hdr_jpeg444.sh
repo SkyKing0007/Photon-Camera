@@ -159,6 +159,13 @@ PYJAVA
 # Preserve all core invariants.
 grep -F 'IRIS_26507_MGC_RAW_HALF_GUIDE_PARITY' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" >/dev/null
 grep -F 'IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java" >/dev/null
+grep -F 'final boolean iris26507ShortExpected =' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java" >/dev/null
+grep -F 'iris26486ShortTicket != null && iris26486ShortTicket.requested' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java" >/dev/null
+grep -F 'final boolean iris26507LongExpected = mMotion26505LongRequested;' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java" >/dev/null
+grep -F 'iris26507ShortExpected, iris26507LongExpected, 80L' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java" >/dev/null
+if grep -F 'iris26480ShortHighlightRequested, iris26505LongRequested, 80L' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java" >/dev/null; then fail "stale out-of-scope aux freeze locals survived"; fi
+grep -F 'Log.e(TAG,"IRIS_26507_JPEG444_FAILED",t);' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java" >/dev/null
+if grep -F 'Log.getStackTraceString(t)' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java" >/dev/null; then fail "JPEG444 uses Exception-only stack helper with Throwable"; fi
 grep -F 'IRIS_26507_SHORT_A_SHARED_MGC_PRECHROMA_GATE' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" >/dev/null
 grep -F 'IRIS_26507_LONG_A_SHARED_MGC_PRECHROMA_GATE' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" >/dev/null
 grep -F 'IRIS_26507_FULL_HDR_DISPLAY_CAPACITY_PARITY' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java" >/dev/null

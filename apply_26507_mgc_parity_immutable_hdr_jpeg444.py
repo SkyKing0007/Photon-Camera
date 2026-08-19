@@ -113,23 +113,32 @@ def motion_batch(src:str)->str:
 
 def capture_controller(src:str)->str:
     if 'IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY' in src: fail('CaptureController already 26507')
-    old='''        if (iris26486ShortTicket != null) scheduleMotion26486ShortDelivery(iris26486ShortTicket);
+    old='''        mMotion26480ShortRequested = false;
+        mMotion26480ShortRequestCompleted = false;
+        mMotion26480ShortResultTimestampNs = 0L;
+        if (iris26486ShortTicket != null) scheduleMotion26486ShortDelivery(iris26486ShortTicket);
         final long iris26486ShotId = mMotionDiagnosticShotId;
 '''
-    new='''        if (iris26486ShortTicket != null) scheduleMotion26486ShortDelivery(iris26486ShortTicket);
-        /* IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY
-         * Normal Wronski ownership is already frozen. Give only explicitly requested
-         * auxiliaries one bounded processing-side completion window, then permanently
-         * seal both slots. Any later exact callback is rejected by offer() and closed.
+    new='''        /* IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY
+         * Snapshot the persistent generation owners before historical Short-A request
+         * fields are cleared. These are valid in finalizeMotionZslCapture(); the old
+         * shutter-method locals are intentionally not referenced here.
          */
+        final boolean iris26507ShortExpected =
+                iris26486ShortTicket != null && iris26486ShortTicket.requested;
+        final boolean iris26507LongExpected = mMotion26505LongRequested;
+        mMotion26480ShortRequested = false;
+        mMotion26480ShortRequestCompleted = false;
+        mMotion26480ShortResultTimestampNs = 0L;
+        if (iris26486ShortTicket != null) scheduleMotion26486ShortDelivery(iris26486ShortTicket);
         long iris26507FreezeStartNs=System.nanoTime();
         iris26486ShortSlot.freezeExpectedAuxiliaries(
-                iris26480ShortHighlightRequested, iris26505LongRequested, 80L);
+                iris26507ShortExpected, iris26507LongExpected, 80L);
         long iris26507FreezeMs=(System.nanoTime()-iris26507FreezeStartNs)/1_000_000L;
         Log.i(TAG,"IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY"
-                +" shortExpected="+iris26480ShortHighlightRequested
+                +" shortExpected="+iris26507ShortExpected
                 +" shortPresent="+iris26486ShortSlot.hasFrame()
-                +" longExpected="+iris26505LongRequested
+                +" longExpected="+iris26507LongExpected
                 +" longPresent="+iris26486ShortSlot.shadowAuxSlot.hasFrame()
                 +" freezeWaitMs="+iris26507FreezeMs
                 +" timeoutMs=80 lateOffersRejectedBySealedSlot=true shutterWait=false");
@@ -472,7 +481,7 @@ public final class MotionV2Jpeg444Encoder {
                     && isJpegRNative(output.toString());
             Log.i(TAG,"IRIS_26507_JPEG444 encoded="+ok+" gainmap=true subsampling=444 jpegR="+ok);
             return ok;
-        }catch(Throwable t){Log.e(TAG,"IRIS_26507_JPEG444_FAILED "+Log.getStackTraceString(t));return false;}
+        }catch(Throwable t){Log.e(TAG,"IRIS_26507_JPEG444_FAILED",t);return false;}
         finally{try{if(base!=null)Files.deleteIfExists(base);}catch(Throwable ignored){}try{if(gain!=null)Files.deleteIfExists(gain);}catch(Throwable ignored){}}
     }
     private static native boolean writeNative(Bitmap bitmap,String path,int quality);

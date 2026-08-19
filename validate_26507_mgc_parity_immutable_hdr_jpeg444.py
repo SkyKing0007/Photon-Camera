@@ -53,6 +53,12 @@ def main():
     must(t['batch'],'awaitExpectedAndSeal','slot deadline seal')
     must(t['capture'],'IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY','capture freeze')
     must(t['capture'],'freezeExpectedAuxiliaries','capture freeze call')
+    must(t['capture'],'final boolean iris26507ShortExpected =','Short-A persistent freeze owner')
+    must(t['capture'],'iris26486ShortTicket != null && iris26486ShortTicket.requested','Short-A generation ticket expectation')
+    must(t['capture'],'final boolean iris26507LongExpected = mMotion26505LongRequested;','Long-A persistent freeze owner')
+    must(t['capture'],'iris26507ShortExpected, iris26507LongExpected, 80L','freeze uses in-scope persistent owners')
+    if 'iris26480ShortHighlightRequested, iris26505LongRequested, 80L' in t['capture']:
+        fail('stale out-of-scope 26507 freeze locals survived')
     must(t['capture'],'timeoutMs=80','freeze telemetry')
     must(t['capture'],'lateOffersRejectedBySealedSlot=true','late offer policy')
 
@@ -97,6 +103,9 @@ def main():
     must(t['save'],'IRIS_26507_MOTION_JPEG444','Motion saver 444')
     must(t['save'],'MotionV2Jpeg444Encoder.write','Motion saver native path')
     must(t['jpegjava'],'IRIS_26507_TRUE_JPEG444_JPEGR','Java 444 owner')
+    must(t['jpegjava'],'Log.e(TAG,"IRIS_26507_JPEG444_FAILED",t);','Throwable-safe JPEG444 logging')
+    if 'Log.getStackTraceString(t)' in t['jpegjava']:
+        fail('JPEG444 uses Exception-only Log.getStackTraceString(Throwable)')
     must(t['jni'],'TJPARAM_SUBSAMP,TJSAMP_444','TurboJPEG 444')
     must(t['jni'],'TJPF_RGBA','RGBA source')
     must(t['jpegr'],'uhdr_enc_set_compressed_image','preserve compressed base')

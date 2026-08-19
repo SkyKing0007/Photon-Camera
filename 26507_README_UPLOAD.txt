@@ -36,3 +36,10 @@ Suggested commit message: 26507: fix MGC geometry and unify HDR chroma rejection
 - Adds explicit dependency-layout failures instead of silent `test -f` exits.
 - Matches bjzhou CMake's root libultrahdr include contract and disables unused TurboJPEG tools/tests/Java targets.
 - No RAW/2, Wronski/MGC, Short-A, Long-A, UHDR signal, or JPEG 4:4:4 runtime math changed from 26507 V2.
+
+
+26507 V4 Java build correction:
+- Fixes the immutable-aux freeze to snapshot in-scope persistent generation owners: Short ticket.requested and mMotion26505LongRequested.
+- Fixes JPEG444 Throwable logging to use Photon Log.e(..., Throwable), which preserves native-link Error reporting and compiles on this branch.
+- Adds explicit Gate 4 guards for both compile failures so these exact regressions cannot recur silently.
+- No RAW/2 MGC equations, Short/Long rejection math, UHDR signal math, or native JPEG 4:4:4 math changed from V3.
