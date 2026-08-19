@@ -144,12 +144,19 @@ h=(Path(sys.argv[1])/'app/src/main/java/com/particlesdevs/photoncamera/processin
 checks=[
  'setTexture("referenceToBridgeFlow"','setTexture("bridgeToShortFlow"','setTextureCompute("outFlow"',
  'setTexture("candidateProvenance"','setTexture("mgcWeight"','setTextureCompute("outRegion"',
- 'setTexture("regionIn"','setTexture("regionMask"','setTextureCompute("outCfa"','setTextureCompute("outProvenance"',
+ 'setTexture("regionIn"','setTexture("regionTexture"','setTextureCompute("outCfa"','setTextureCompute("outProvenance"',
  'setTexture("semanticAccumulator"','setTexture("opponentWeightAccumulator"','setBufferCompute("SupportDiagBuf"',
  'setBufferCompute("GeometryDiagBuf"']
 for c in checks: assert c in h,'missing host binding '+c
+# IRIS_26509_V2_BINDING_PROOF_REGION_TEXTURE
+# Cross-check the exact finalizer sampler name against the generated shader so this proof
+# cannot drift to a stale invented name such as the V1-only 'regionMask'.
+shader=(Path(sys.argv[1])/'app/src/main/assets/shaders/motionv2/mfsr_short_region_finalize_26509.glsl').read_text()
+assert 'uniform highp sampler2D regionTexture;' in shader, 'finalizer shader regionTexture sampler missing'
+assert 'setTexture("regionTexture",iris26509RegionRead)' in h, 'finalizer host regionTexture binding missing'
+assert 'regionMask' not in shader, 'stale regionMask sampler unexpectedly present in finalizer shader'
 assert h.count('setBufferCompute("GeometryDiagBuf",iris26509GeometryDiag)')==3
-print('PASS: type-aware 26509 host binding proof')
+print('PASS: type-aware 26509 host binding proof + exact finalizer regionTexture contract')
 PYBIND
 # Protected runtime invariants that were not supposed to change.
 grep -F 'IRIS_26507_MGC_RAW_HALF_GUIDE_PARITY' "$AFTER/app/src/main/assets/shaders/motionv2/mfsr_bjzhou_guide.glsl" >/dev/null

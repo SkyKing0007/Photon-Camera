@@ -1,3 +1,14 @@
+26509 V2 BINDING-PROOF CORRECTION (NO IMAGE-MATH CHANGE)
+
+The first 26509 handoff reached Gate 4 after the 12 changed/new shaders compiled successfully with pinned glslang 16.5.0, then stopped on a false host-binding assertion. The generated finalizer shader and Java host both correctly use the sampler name `regionTexture`; the V1 proof mistakenly demanded nonexistent `regionMask`.
+
+V2 changes ONLY the proof/handoff layer:
+- Gate 4 now requires `setTexture("regionTexture", iris26509RegionRead)`.
+- Gate 4 cross-checks that mfsr_short_region_finalize_26509.glsl declares `uniform highp sampler2D regionTexture;`.
+- Gate 4 rejects a stale `regionMask` sampler in that finalizer.
+- 26509 runtime delta, transform, validator, thresholds, geometry math, Short/Long behavior, exposure logic, UHDR/JPEG_R behavior, version and build number are unchanged.
+- Target remains VERSION_NAME=0.9726509 / VERSION_BUILD=26509 because no 26509 APK was produced.
+
 Photon Camera 26509 — Direct Successful-26507 Root Correction
 ==============================================================
 
