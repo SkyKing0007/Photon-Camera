@@ -1,0 +1,517 @@
+diff -ruN candidate/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl base/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl
+--- candidate/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl	2026-08-19 17:53:58.442248073 +0000
++++ base/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl	2026-08-18 00:00:00.000000000 +0000
+@@ -8,8 +8,6 @@
+ uniform highp sampler2D lensShadingMap;
+ uniform highp sampler2D frameSupportTexture;
+ uniform highp sampler2D lowSupportReferenceRgb;
+-uniform highp sampler2D shortBentoWeightTexture;
+-uniform int useShortBentoMask;
+ uniform ivec2 rawSize;
+ uniform ivec2 packedSize;
+ uniform vec3 cameraDomainScale;
+@@ -41,19 +39,11 @@
+     }
+     return false;
+ }
+-bool bentoColorCovered(ivec2 packedP){
+-    if(useShortBentoMask==0)return false;
+-    packedP=clamp(packedP,ivec2(0),packedSize-ivec2(1));
+-    return texelFetch(shortBentoWeightTexture,packedP,0).r>0.5;
+-}
+ bool expandedCensoredDecision(ivec2 packedP){
+-    /* A coherently Bento-covered parent pack owns its color. Do not let an adjacent
+-     * unresolved pack expand neutralization back across a validated Short boundary. */
+-    if(bentoColorCovered(packedP))return false;
+     for(int oy=-1;oy<=1;++oy){
+         for(int ox=-1;ox<=1;++ox){
+             ivec2 q=clamp(packedP+ivec2(ox,oy),ivec2(0),packedSize-ivec2(1));
+-            if(packedHasCensored(q)&&!bentoColorCovered(q))return true;
++            if(packedHasCensored(q))return true;
+         }
+     }
+     return false;
+@@ -149,30 +139,6 @@
+     float noiseLike=1.0-smoothstep(1.50,3.25,z);
+     return 1.0-0.82*darkGate*noiseLike;
+ }
+-/* IRIS_26511_PROPAGATED_CHROMA_ONLY_FINISH
+- * Conservative substitute for the missing 1.27.1 propagated MGC chroma authority.
+- * Luma is never filtered. Only an opponent-channel outlier is pulled toward same-luma
+- * neighboring evidence, with thresholds derived from the propagated shot/read model and
+- * local effective frame support. Strong authority is limited to specular/highlight signal
+- * or support-transition/motion-risk regions seen in the user's failures.
+- */
+-float propagatedOpponentBlend(
+-        float centerOpponent,float localOpponent,float signalA,float signalB,
+-        float shotA,float readA,float shotB,float readB,
+-        float localFrameSupport,float localQuality,float supportTransitionRisk,
+-        float physicalHighlight){
+-    float n=max(localFrameSupport,1.0);
+-    float sigma=sqrt(max(
+-            (shotA*max(signalA,0.0)+readA + shotB*max(signalB,0.0)+readB)/n,
+-            1.0e-10));
+-    float residual=abs(centerOpponent-localOpponent);
+-    float threshold=max(3.0*sigma,0.008+0.035*max(signalB,0.02));
+-    float outlier=smoothstep(threshold,2.5*threshold,residual);
+-    float specularRisk=smoothstep(0.50,0.82,physicalHighlight);
+-    float motionRisk=supportTransitionRisk*(1.0-smoothstep(8.0,12.0,localFrameSupport));
+-    float regionRisk=max(specularRisk,motionRisk);
+-    return clamp(0.55*regionRisk*outlier*localQuality,0.0,0.55);
+-}
+ void main(){
+     ivec2 p=ivec2(gl_FragCoord.xy);
+     if(any(greaterThanEqual(p,rawSize))){Output=vec4(0.0);return;}
+@@ -281,17 +247,6 @@
+     rg=mix(rg,referenceRg,clamp(rReferenceChromaAuthority,0.0,1.0));
+     bg=mix(bg,referenceBg,clamp(bReferenceChromaAuthority,0.0,1.0));
+ 
+-    float rPropagatedBlend=propagatedOpponentBlend(
+-            rg,localRg,max(green+rg,0.0),green,
+-            noiseShotRgb.r,noiseReadRgb.r,noiseShotRgb.g,noiseReadRgb.g,
+-            localFrameSupport,localQr,supportTransitionRisk,physicalHighlight);
+-    float bPropagatedBlend=propagatedOpponentBlend(
+-            bg,localBg,max(green+bg,0.0),green,
+-            noiseShotRgb.b,noiseReadRgb.b,noiseShotRgb.g,noiseReadRgb.g,
+-            localFrameSupport,localQb,supportTransitionRisk,physicalHighlight);
+-    rg=mix(rg,localRg,rPropagatedBlend);
+-    bg=mix(bg,localBg,bPropagatedBlend);
+-
+     vec3 calculationRgb=max(
+             vec3(green+rg,green,green+bg),vec3(0.0));
+     calculationRgb=mix(
+diff -ruN candidate/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl base/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl
+--- candidate/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl	2026-08-19 17:52:24.128495837 +0000
++++ base/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl	2026-08-18 00:00:00.000000000 +0000
+@@ -3,76 +3,76 @@
+ precision highp float;
+ precision highp image2D;
+ uniform highp sampler2D highlightProvenance;
+-uniform highp sampler2D bentoCandidate;
+-uniform highp sampler2D flowTexture;
+ layout(rgba32f,binding=0) uniform highp writeonly image2D outWeight;
+-layout(std430,binding=1) buffer ShortDiagBuf { uint shortDiag[]; };
+ uniform ivec2 packedSize;
+ 
+-/* IRIS_26511_BENTO_COHERENT_RGB_REGION
+- * 1.27.1 Bento principle adapted without replacing stable 26507 Wronski geometry:
+- * Normal-vs-Short color authority is one scalar region decision shared by G/R-G/B-G.
+- * Directly validated packs seed the region. A pack rejected ONLY by the stricter Short
+- * correspondence test may be admitted when it is a small hole inside a strongly validated,
+- * flow-coherent neighborhood. Flow/radiometry/physical-Short failures can never be filled.
++/* IRIS_26501_SHORT_VALIDATED_SEMANTIC_PHASE_WEIGHT
++ * Preserve the existing Short-A validator phase by phase. Each packed texel stores
++ * R/G1/G2/B authority independently; a validated red phase can never authorize a
++ * neighbouring green or blue phase. Native short RAW is still the only color source.
+  */
+-const uint D_BENTO_DIRECT=47u;
+-const uint D_BENTO_CORR_FILLED=48u;
+-const uint D_BENTO_CORR_UNFILLED=49u;
+-const uint D_BENTO_COLOR_PACKS=50u;
+-
+-float candidateAt(ivec2 p){
+-    if(any(lessThan(p,ivec2(0)))||any(greaterThanEqual(p,packedSize)))return 0.0;
+-    return texelFetch(bentoCandidate,p,0).r;
+-}
+-vec2 flowAt(ivec2 p){
++float phaseDivisor(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
++float phaseState(ivec2 p,int q){
+     p=clamp(p,ivec2(0),packedSize-ivec2(1));
+-    vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize);
+-    return texture(flowTexture,uv).xy;
++    float code=texelFetch(highlightProvenance,p,0).r;
++    return mod(floor(code/phaseDivisor(q)),3.0);
+ }
+-bool directSeed(ivec2 p){return candidateAt(p)>0.75;}
+-bool correspondenceOnlyHole(ivec2 p){
+-    float c=candidateAt(p);return c>0.25&&c<0.75;
++bool packedHasCensored(ivec2 p){
++    for(int q=0;q<4;++q)if(abs(phaseState(p,q)-1.0)<0.25)return true;
++    return false;
++}
++bool packedHasShortValidated(ivec2 p){
++    for(int q=0;q<4;++q)if(abs(phaseState(p,q)-2.0)<0.25)return true;
++    return false;
++}
++float neighborhoodCensoredFraction(ivec2 p){
++    float censored=0.0,total=0.0;
++    for(int oy=-2;oy<=2;++oy){
++        for(int ox=-2;ox<=2;++ox){
++            ivec2 q=p+ivec2(ox,oy);
++            if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,packedSize)))continue;
++            total+=1.0;
++            if(packedHasCensored(q))censored+=1.0;
++        }
++    }
++    return total>0.0?censored/total:1.0;
+ }
+-
+ void main(){
+     ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+     if(any(greaterThanEqual(p,packedSize)))return;
+-    float authority=0.0;
+-    if(directSeed(p)){
+-        authority=1.0;
+-        atomicAdd(shortDiag[D_BENTO_DIRECT],1u);
+-    }else if(correspondenceOnlyHole(p)){
+-        vec2 centerFlow=flowAt(p);
+-        float nearCount=0.0;
+-        float wideCount=0.0;
+-        float q0=0.0,q1=0.0,q2=0.0,q3=0.0;
+-        for(int oy=-2;oy<=2;++oy){
+-            for(int ox=-2;ox<=2;++ox){
++    float code=texelFetch(highlightProvenance,p,0).r;
++    vec4 weight=vec4(0.0);
++
++    /* IRIS_26506_SHORT_A_SPATIAL_PROVENANCE_COHERENCE
++     * A partially measured quad may still use Short-A in the helper Bayer to
++     * preserve real luminance/headroom, but it cannot inject isolated RGB/chroma
++     * into the semantic accumulator. Fully measured quads retain Short-A color,
++     * smoothly reduced only when surrounded by unresolved clipped neighbors.
++     * This converts dotted SHORT_VALIDATED/CENSORED islands into coherent color
++     * transitions without globally relaxing correspondence or inventing detail.
++     */
++    if(!packedHasCensored(p)){
++        /* IRIS_26507_GPU_LOCAL_8_CONNECTED_SHORT_TOPOLOGY */
++        float connectedShortNeighbors=0.0;
++        float unresolvedNeighbors=0.0;
++        for(int oy=-1;oy<=1;++oy){
++            for(int ox=-1;ox<=1;++ox){
+                 if(ox==0&&oy==0)continue;
+                 ivec2 q=p+ivec2(ox,oy);
+-                if(!directSeed(q))continue;
+-                vec2 df=abs(flowAt(q)-centerFlow);
+-                /* Consider only neighbors whose Wronski displacement agrees to a quarter
+-                 * packed pixel (half a sensor pixel). We do not invent/interpolate new flow. */
+-                if(max(df.x,df.y)>0.25)continue;
+-                wideCount+=1.0;
+-                if(max(abs(ox),abs(oy))<=1)nearCount+=1.0;
+-                if(ox<=0&&oy<=0)q0=1.0;
+-                if(ox>=0&&oy<=0)q1=1.0;
+-                if(ox<=0&&oy>=0)q2=1.0;
+-                if(ox>=0&&oy>=0)q3=1.0;
++                if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,packedSize)))continue;
++                if(packedHasCensored(q))unresolvedNeighbors+=1.0;
++                else if(packedHasShortValidated(q))connectedShortNeighbors+=1.0;
+             }
+         }
+-        float quadrantCount=q0+q1+q2+q3;
+-        /* Fill only small correspondence holes embedded in a real Short region. */
+-        if(nearCount>=3.0&&wideCount>=8.0&&quadrantCount>=3.0){
+-            authority=1.0;
+-            atomicAdd(shortDiag[D_BENTO_CORR_FILLED],1u);
+-        }else{
+-            atomicAdd(shortDiag[D_BENTO_CORR_UNFILLED],1u);
++        float topologyGate=smoothstep(0.5,2.5,connectedShortNeighbors);
++        float unresolvedGate=1.0-smoothstep(2.0,6.0,unresolvedNeighbors);
++        float boundaryRisk=smoothstep(
++                0.04,0.40,neighborhoodCensoredFraction(p));
++        float coherence=(1.0-0.85*boundaryRisk)*topologyGate*unresolvedGate;
++        for(int q=0;q<4;++q){
++            float state=mod(floor(code/phaseDivisor(q)),3.0);
++            weight[q]=abs(state-2.0)<0.25?coherence:0.0;
+         }
+     }
+-    if(authority>0.5)atomicAdd(shortDiag[D_BENTO_COLOR_PACKS],1u);
+-    imageStore(outWeight,p,vec4(authority));
++    imageStore(outWeight,p,weight);
+ }
+diff -ruN candidate/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl base/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+--- candidate/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl	2026-08-19 17:53:58.442103967 +0000
++++ base/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl	2026-08-18 00:00:00.000000000 +0000
+@@ -11,11 +11,6 @@
+ uniform highp sampler2D flowTexture;
+ layout(rgba32f, binding = 0) uniform highp writeonly image2D outCfa;
+ layout(r32f, binding = 1) uniform highp writeonly image2D outProvenance;
+-/* IRIS_26511_BENTO_REGION_CANDIDATE_OWNER
+- * 0.0=no Bento color authority; 0.5=correspondence-only reject eligible for
+- * coherent-region recovery; 1.0=directly validated coherent Short candidate.
+- */
+-layout(r32f, binding = 3) uniform highp writeonly image2D outBentoCandidate;
+ layout(std430, binding = 2) buffer ShortDiagBuf {
+     uint shortDiag[];
+ };
+@@ -363,9 +358,6 @@
+     imageStore(outCfa, p, cfa);
+     imageStore(outProvenance, p, vec4(encodePhaseStates(state), 0.0, 0.0, 0.0));
+ }
+-void storeBentoCandidate(ivec2 p, float candidate) {
+-    imageStore(outBentoCandidate, p, vec4(candidate, 0.0, 0.0, 0.0));
+-}
+ 
+ /* IRIS_26497_PHYSICAL_SHORT_VALIDATION
+  * NORMAL remains measured. SHORT_VALIDATED is granted only after unsaturated
+@@ -380,7 +372,6 @@
+     vec4 normalSensor = normal / max(referenceExposureScale, 1.0e-6);
+     vec4 clipMask = step(vec4(physicalClipThreshold), normalSensor);
+     if (sum4(clipMask) < 0.5) {
+-        storeBentoCandidate(p, 0.0);
+         storeState(p, normal, vec4(PROVENANCE_NORMAL));
+         return;
+     }
+@@ -393,7 +384,6 @@
+     float flowConfidence = exp(-80.0 * variation);
+     vec2 predicted = vec2(p) + vec2(0.5) + flowState.xy;
+     if (flowConfidence < minimumFlowConfidence) {
+-        storeBentoCandidate(p, 0.0);
+         addMask(D_FLOW_REJECT, D_PHASE_FLOW_REJECT, clipMask);
+         addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+@@ -406,23 +396,6 @@
+     float supportCount;
+     if (!refineObservableCorrespondence(
+             p, predicted, flowConfidence, source, meanError, structure, supportCount)) {
+-        /* Only an otherwise safe Short sample may become a region-fill candidate.
+-         * Flow rejection, physical Short clipping, and later radiometry failures remain hard stops. */
+-        vec4 predictedShort = phaseSafeBilinear(predicted);
+-        float predictedSafeCount = sum4(shortSafe(predictedShort));
+-        vec4 referenceCenter = texelFetch(referenceCfa, p, 0) /
+-                max(referenceExposureScale, 1.0e-6);
+-        vec4 measurableCenter = (vec4(1.0) - clipMask) * normalSafe(referenceCenter) *
+-                shortSafe(predictedShort) * step(vec4(0.010001), referenceCenter);
+-        float measurableCount = sum4(measurableCenter);
+-        float centerError = 0.0;
+-        if (measurableCount > 0.5) {
+-            vec4 equivalent = predictedShort * shortToNormalScale;
+-            vec4 rel = abs(referenceCenter - equivalent) / max(referenceCenter, vec4(0.04));
+-            centerError = dot(rel, measurableCenter) / measurableCount;
+-        }
+-        bool centerGuard = measurableCount < 0.5 || centerError <= 0.070;
+-        storeBentoCandidate(p, predictedSafeCount > 3.5 && centerGuard ? 0.5 : 0.0);
+         addMask(D_CORR_REJECT, D_PHASE_CORR_REJECT, clipMask);
+         addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+@@ -436,7 +409,6 @@
+     addMask(D_SHORT_CLIPPED, D_PHASE_SHORT_CLIPPED, shortClippedMask);
+     classifyShortSamples(shortCenter, clipMask);
+     if (sum4(recoverMask) < 0.5) {
+-        storeBentoCandidate(p, 0.0);
+         addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+         return;
+@@ -451,7 +423,6 @@
+         }
+     }
+     if (requiredScale > 1.25) {
+-        storeBentoCandidate(p, 0.0);
+         addMask(D_RADIOMETRY_REJECT, D_PHASE_RADIOMETRY_REJECT, recoverMask);
+         addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+         storeState(p, normal, clipMask);
+@@ -469,10 +440,6 @@
+         }
+     }
+     addMask(D_VALIDATED, D_PHASE_VALIDATED, recoverMask);
+-    /* Whole-color Bento authority is stricter than helper-Bayer recovery: every physical
+-     * Short phase at the aligned center must remain unsaturated. This prevents one Short
+-     * color axis from surviving when another is already clipped. */
+-    storeBentoCandidate(p, sum4(shortSafe(shortCenter)) > 3.5 ? 1.0 : 0.0);
+     /* IRIS_26506_SHORT_A_PACK_COHERENCE_DIAGNOSTICS
+      * Track whether recovered Short-A color forms a fully measured quad or a
+      * mixed SHORT_VALIDATED/CENSORED boundary. Image math is unchanged here;
+diff -ruN candidate/app/src/main/cpp/CMakeLists.txt base/app/src/main/cpp/CMakeLists.txt
+--- candidate/app/src/main/cpp/CMakeLists.txt	2026-08-19 18:02:33.927524015 +0000
++++ base/app/src/main/cpp/CMakeLists.txt	2026-08-18 00:00:00.000000000 +0000
+@@ -116,11 +116,6 @@
+ set(REQUIRE_SIMD ON CACHE BOOL "" FORCE)
+ set(WITH_SIMD ON CACHE BOOL "" FORCE)
+ add_subdirectory(${IRIS26507_JPEG} ${CMAKE_CURRENT_BINARY_DIR}/iris26507-libjpeg-turbo)
+-# IRIS_26511_DEBUG_APK_JPEG_OPTIMIZATION_OWNER
+-# Motion test APKs are debug builds, but JPEG encoding is production image-output work.
+-# Force optimization only on the pinned JPEG codecs; quality/subsampling/quantization stay unchanged.
+-target_compile_options(turbojpeg-static PRIVATE -O3)
+-target_compile_options(jpeg-static PRIVATE -O3)
+ find_package(Threads REQUIRED)
+ file(GLOB IRIS26507_UHDR_CORE "${IRIS26507_UHDR}/lib/src/*.cpp")
+ file(GLOB IRIS26507_UHDR_NEON "${IRIS26507_UHDR}/lib/src/dsp/arm/*.cpp")
+@@ -146,6 +141,5 @@
+     ${IRIS26507_UHDR}
+     ${IRIS26507_UHDR}/lib/include
+     ${CMAKE_CURRENT_SOURCE_DIR})
+-target_compile_options(motionv2jpeg PRIVATE -O3)
+ target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static iris26507-ultrahdr log jnigraphics android z)
+ 
+diff -ruN candidate/app/src/main/cpp/motionv2_jpeg444_jni.cpp base/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+--- candidate/app/src/main/cpp/motionv2_jpeg444_jni.cpp	2026-08-19 17:52:24.130892410 +0000
++++ base/app/src/main/cpp/motionv2_jpeg444_jni.cpp	2026-08-18 00:00:00.000000000 +0000
+@@ -8,11 +8,10 @@
+ #include <turbojpeg.h>
+ #include "motionv2_jpeg_r_encoder.h"
+ #define TAG "MotionV2Jpeg444"
+-/* IRIS_26511_JPEG_HUFFMAN_SPEED_OWNER: quantization/quality/4:4:4 unchanged. */
+ namespace { struct U{JNIEnv*e;jstring s;const char*c;U(JNIEnv*e,jstring s):e(e),s(s),c(s?e->GetStringUTFChars(s,nullptr):nullptr){}~U(){if(c)e->ReleaseStringUTFChars(s,c);}};
+ bool write(const char*p,const unsigned char*d,size_t n){FILE*f=fopen(p,"wb");if(!f)return false;size_t w=fwrite(d,1,n,f);int a=fflush(f),b=fclose(f);return w==n&&a==0&&b==0;}
+ bool f3(JNIEnv*e,jfloatArray a,std::array<float,3>*o){if(!a||e->GetArrayLength(a)!=3)return false;e->GetFloatArrayRegion(a,0,3,o->data());return !e->ExceptionCheck();}}
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);if(!h){AndroidBitmap_unlockPixels(e,bitmap);return JNI_FALSE;}int q=std::clamp((int)quality,1,100);bool cfg=tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,TJSAMP_444)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,0)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,TJPF_RGBA,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_encodeGainmapNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||(i.format!=ANDROID_BITMAP_FORMAT_A_8&&i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888))return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);int pf=i.format==ANDROID_BITMAP_FORMAT_A_8?TJPF_GRAY:TJPF_RGBA;int ss=i.format==ANDROID_BITMAP_FORMAT_A_8?TJSAMP_GRAY:TJSAMP_444;int q=std::clamp((int)quality,1,100);bool cfg=h&&tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,ss)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,0)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,pf,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);if(h)tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
++extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);if(!h){AndroidBitmap_unlockPixels(e,bitmap);return JNI_FALSE;}int q=std::clamp((int)quality,1,100);bool cfg=tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,TJSAMP_444)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,1)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,TJPF_RGBA,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
++extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_encodeGainmapNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||(i.format!=ANDROID_BITMAP_FORMAT_A_8&&i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888))return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);int pf=i.format==ANDROID_BITMAP_FORMAT_A_8?TJPF_GRAY:TJPF_RGBA;int ss=i.format==ANDROID_BITMAP_FORMAT_A_8?TJSAMP_GRAY:TJSAMP_444;int q=std::clamp((int)quality,1,100);bool cfg=h&&tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,ss)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,1)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,pf,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);if(h)tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_packageJpegRNative(JNIEnv*e,jclass,jstring b,jstring g,jstring o,jint gamut,jfloatArray rmin,jfloatArray rmax,jfloatArray gamma,jfloatArray es,jfloatArray eh,jfloat ds,jfloat dh,jboolean use){U ub(e,b),ug(e,g),uo(e,o);if(!ub.c||!ug.c||!uo.c)return JNI_FALSE;iris26507::GainmapMetadata m;if(!f3(e,rmin,&m.ratioMin)||!f3(e,rmax,&m.ratioMax)||!f3(e,gamma,&m.gamma)||!f3(e,es,&m.epsilonSdr)||!f3(e,eh,&m.epsilonHdr))return JNI_FALSE;m.displaySdr=ds;m.displayHdr=dh;m.useBaseColorSpace=use==JNI_TRUE;std::string err;return iris26507::packageJpegR(ub.c,ug.c,uo.c,gamut,m,&err)?JNI_TRUE:JNI_FALSE;}
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_isJpegRNative(JNIEnv*e,jclass,jstring p){U u(e,p);return u.c&&iris26507::isJpegR(u.c)?JNI_TRUE:JNI_FALSE;}
+diff -ruN candidate/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java base/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+--- candidate/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java	2026-08-19 17:52:24.130781397 +0000
++++ base/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java	2026-08-18 00:00:00.000000000 +0000
+@@ -698,26 +698,6 @@
+             Log.d(TAG,"Error in processingEventsListener.onProcessingFinished:"+Log.getStackTraceString(e));
+         }
+         imageFile = Paths.get(imageFile.toAbsolutePath() + ".jpg");
+-        /* IRIS_26511_ASYNC_JPEGR_NORMAL_PRIORITY_OWNER
+-         * Pixel math is complete and immutable. Release capture/UI ownership before the
+-         * expensive JPEG_R file work, but keep the output worker at normal CPU priority.
+-         */
+-        if(cameraMode==CameraMode.MOTION){
+-            final Path outPath=imageFile;final Bitmap outBitmap=img;final ParseExif.ExifData outExif=exifData;
+-            final ByteBuffer outDng=iris26480DeferredDng;final Path outDngPath=dngFile;final Parameters outDngParams=processingParameters;
+-            iris26480DeferredDng=null;final long queuedNs=System.nanoTime();
+-            MOTION_26480_OUTPUT_EXECUTOR.execute(()->{boolean saved=false;try{
+-                try{android.os.Process.setThreadPriority(android.os.Process.myTid(),android.os.Process.THREAD_PRIORITY_DEFAULT);}catch(Throwable ignored){}
+-                saved=ImageSaver.Util.saveBitmapAsJPGMotionV2(outPath,outBitmap,ImageSaver.JPG_QUALITY,outExif);
+-                processingEventsListener.notifyImageSavedStatus(saved,outPath);
+-                if(outDng!=null){outDng.position(0);boolean ds=ImageSaver.Util.saveStackedRaw(outDngPath,outDng,outDngParams);processingEventsListener.notifyImageSavedStatus(ds,outDngPath);}
+-                Log.i(TAG,"IRIS_26511_ASYNC_JPEGR_OUTPUT_COMPLETE saved="+saved+" queuedToSavedMs="+((System.nanoTime()-queuedNs)/1000000L));
+-            }catch(Exception e){Log.e(TAG,"IRIS_26511_ASYNC_JPEGR_OUTPUT_FAILED "+Log.getStackTraceString(e));try{processingEventsListener.notifyImageSavedStatus(false,outPath);}catch(Throwable ignored){}
+-            }finally{if(outBitmap!=null&&!outBitmap.isRecycled())try{outBitmap.recycle();}catch(Throwable ignored){}if(outDng!=null)try{Allocator.free(outDng);}catch(Throwable ignored){}}});
+-            pipeline.close();Allocator.getMemoryCount();
+-            Log.i(TAG,"IRIS_26511_CAPTURE_RELEASE_BEFORE_JPEGR_SAVE captureUnlockedAfterImmutableOutputTransfer=true outputPriority=default");
+-            callback.onFinished();return;
+-        }
+         //Saves the final bitmap
+         final boolean imageSaved;
+         if (cameraMode == CameraMode.MOTION) {
+diff -ruN candidate/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java base/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+--- candidate/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java	2026-08-19 17:52:24.130570996 +0000
++++ base/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java	2026-08-18 00:00:00.000000000 +0000
+@@ -1723,7 +1723,7 @@
+             GLTexture iris26480ShortWbCfa=null,iris26480Recovered=null;MotionV2Alignment.Result iris26480ShortAlignment=null;
+             GLTexture irisV13ShadowRaw=null,irisV13ShadowCfa=null,irisV13ShadowWbCfa=null,irisV13ShadowRecovered=null;
+             GLTexture iris26501ShadowWeight=null,iris26501ShadowCov=null;
+-            GLTexture iris26501ShortWeight=null,iris26501ShortCov=null,iris26511ShortBentoCandidate=null;
++            GLTexture iris26501ShortWeight=null,iris26501ShortCov=null;
+             MotionV2Alignment.Result irisV13ShadowAlignment=null; GLBuffer irisV13ShadowDiag=null;
+             long irisV13ShadowAlignDispatchMs=0L,irisV13ShadowFuseDispatchMs=0L;
+             /* IRIS_26496_SHORT_FAILURE_DIAGNOSTIC_OWNER
+@@ -1926,8 +1926,6 @@
+                     iris26480Recovered=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     iris26492RecoveredProvenance=new GLTexture(
+                             rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-                    iris26511ShortBentoCandidate=new GLTexture(
+-                            rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     iris26496ShortDiag = new GLBuffer(
+                             64, new GLFormat(GLFormat.DataType.UNSIGNED_32));
+                     iris26496ShortDiag.uploadBuffer(new int[64], 64);
+@@ -1953,7 +1951,6 @@
+                     glProg.setTexture("flowTexture",iris26480ShortAlignment.flowTexture);
+                     glProg.setTextureCompute("outCfa",iris26480Recovered,true);
+                     glProg.setTextureCompute("outProvenance",iris26492RecoveredProvenance,true);
+-                    glProg.setTextureCompute("outBentoCandidate",iris26511ShortBentoCandidate,true);
+                     glProg.setBufferCompute("ShortDiagBuf", iris26496ShortDiag);
+                     glProg.computeAutoDeferred(rawHalf,1);
+ 
+@@ -1969,10 +1966,7 @@
+                     glProg.useAssetProgram("motionv2/mfsr_spatial_rgb_short_weight_26501",true);
+                     glProg.setVar("packedSize",rawHalf);
+                     glProg.setTexture("highlightProvenance",iris26492RecoveredProvenance);
+-                    glProg.setTexture("bentoCandidate",iris26511ShortBentoCandidate);
+-                    glProg.setTexture("flowTexture",iris26480ShortAlignment.flowTexture);
+                     glProg.setTextureCompute("outWeight",iris26501ShortWeight,true);
+-                    glProg.setBufferCompute("ShortDiagBuf",iris26496ShortDiag);
+                     glProg.computeAutoDeferred(rawHalf,1);
+ 
+                     /* IRIS_26507_SHORT_A_SHARED_MGC_PRECHROMA_GATE */
+@@ -2123,9 +2117,6 @@
+                     /* IRIS_26504_LOCAL_SUPPORT_AND_NOISE_TO_NORMALIZER */
+                     glProg.setTexture("frameSupportTexture", currentDirectFrameSupport);
+                     glProg.setTexture("lowSupportReferenceRgb", iris26505LowSupportReference);
+-                    glProg.setVar("useShortBentoMask",iris26501ShortWeight!=null?1:0);
+-                    glProg.setTexture("shortBentoWeightTexture",
+-                            iris26501ShortWeight!=null?iris26501ShortWeight:iris26492ReadbackProvenance);
+                     glProg.setVar("noiseShotRgb", new float[]{
+                             iris26487ReferenceWbNoise[0],
+                             iris26487ReferenceWbNoise[1],
+@@ -2270,11 +2261,6 @@
+                                     + " shortPacksAny=" + Integer.toUnsignedLong(d[44])
+                                     + " shortPacksMixedCensored=" + Integer.toUnsignedLong(d[45])
+                                     + " shortPacksFullyKnown=" + Integer.toUnsignedLong(d[46])
+-                                    + " bentoDirectPacks=" + Integer.toUnsignedLong(d[47])
+-                                    + " bentoCorrespondenceFilledPacks=" + Integer.toUnsignedLong(d[48])
+-                                    + " bentoCorrespondenceUnfilledPacks=" + Integer.toUnsignedLong(d[49])
+-                                    + " bentoColorPacks=" + Integer.toUnsignedLong(d[50])
+-                                    + " IRIS_26511_BENTO_COHERENT_RGB_REGION=true"
+                                     + " IRIS_26506_SHORT_A_SPATIAL_PROVENANCE_COHERENCE=true"
+                                     + " imageMathChangedOnlyBySemanticColorCoherence=true"
+                                     + " oneGpuDrain=true");
+@@ -2375,7 +2361,7 @@
+                 }
+             }finally{
+                 if(iris26480ShortAlignment!=null)iris26480ShortAlignment.close();if(iris26480ShortWbCfa!=null)iris26480ShortWbCfa.close();
+-                if(iris26501ShortWeight!=null)iris26501ShortWeight.close();if(iris26501ShortCov!=null)iris26501ShortCov.close();if(iris26511ShortBentoCandidate!=null)iris26511ShortBentoCandidate.close();
++                if(iris26501ShortWeight!=null)iris26501ShortWeight.close();if(iris26501ShortCov!=null)iris26501ShortCov.close();
+                 if(iris26501ShadowWeight!=null)iris26501ShadowWeight.close();if(iris26501ShadowCov!=null)iris26501ShadowCov.close();
+                 if(iris26480ShortCfa!=null)iris26480ShortCfa.close();if(iris26480ShortRaw!=null)iris26480ShortRaw.close();
+                 if(iris26480Recovered!=null)iris26480Recovered.close();
+diff -ruN candidate/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java base/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+--- candidate/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java	2026-08-19 17:52:24.130825404 +0000
++++ base/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java	2026-08-18 00:00:00.000000000 +0000
+@@ -3,59 +3,36 @@
+ import android.graphics.Bitmap;
+ import android.graphics.Gainmap;
+ import android.os.Build;
+-import android.os.Process;
+ import com.particlesdevs.photoncamera.util.Log;
+ import java.nio.file.Path;
+ import java.nio.file.Files;
+-import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.Future;
+ 
+ /** IRIS_26507_TRUE_JPEG444_JPEGR */
+ public final class MotionV2Jpeg444Encoder {
+     private static final String TAG="MotionV2Jpeg444Encoder";
+     private static final int GAINMAP_QUALITY=95;
+-    /* IRIS_26511_PARALLEL_JPEGR_ENCODE_OWNER: independent base/gain JPEGs encode concurrently. */
+-    private static final ExecutorService ENCODE_EXECUTOR=Executors.newFixedThreadPool(2,r->{
+-        Thread t=new Thread(r,"MotionJpegEncode");t.setDaemon(true);return t;
+-    });
+     static { System.loadLibrary("motionv2jpeg"); }
+     private MotionV2Jpeg444Encoder(){}
+-    private static void normalPriority(){try{Process.setThreadPriority(Process.myTid(),Process.THREAD_PRIORITY_DEFAULT);}catch(Throwable ignored){}}
+     public static boolean write(Path output, Bitmap bitmap, int quality){
+         if(output==null||bitmap==null||bitmap.isRecycled())return false;
+         Path base=null,gain=null;
+         try{
+             boolean hasGain=Build.VERSION.SDK_INT>=34&&bitmap.hasGainmap();
+             if(!hasGain){
+-                normalPriority();
+                 boolean ok=writeNative(bitmap,output.toString(),Math.max(1,Math.min(100,quality)));
+                 Log.i(TAG,"IRIS_26507_JPEG444 encoded="+ok+" gainmap=false subsampling=444");return ok;
+             }
+             Gainmap gm=bitmap.getGainmap(); if(gm==null)return false;
+-            base=output.resolveSibling("."+output.getFileName()+".26511.base.jpg");
+-            gain=output.resolveSibling("."+output.getFileName()+".26511.gain.jpg");
++            base=output.resolveSibling("."+output.getFileName()+".26507.base.jpg");
++            gain=output.resolveSibling("."+output.getFileName()+".26507.gain.jpg");
+             Files.deleteIfExists(base);Files.deleteIfExists(gain);Files.deleteIfExists(output);
++            if(!writeNative(bitmap,base.toString(),Math.max(1,Math.min(100,quality))))return false;
+             Bitmap contents=gm.getGainmapContents();
+-            if(contents==null||contents.isRecycled())return false;
+-            final Path basePath=base, gainPath=gain;
+-            final int baseQuality=Math.max(1,Math.min(100,quality));
+-            long t0=System.nanoTime();
+-            Future<Boolean> baseFuture=ENCODE_EXECUTOR.submit(()->{normalPriority();return writeNative(bitmap,basePath.toString(),baseQuality);});
+-            Future<Boolean> gainFuture=ENCODE_EXECUTOR.submit(()->{normalPriority();return encodeGainmapNative(contents,gainPath.toString(),GAINMAP_QUALITY);});
+-            boolean baseOk=baseFuture.get();
+-            boolean gainOk=gainFuture.get();
+-            long tEncoded=System.nanoTime();
+-            if(!baseOk||!gainOk)return false;
++            if(contents==null||contents.isRecycled()||!encodeGainmapNative(contents,gain.toString(),GAINMAP_QUALITY))return false;
+             boolean ok=packageJpegRNative(base.toString(),gain.toString(),output.toString(),0,
+                     gm.getRatioMin(),gm.getRatioMax(),gm.getGamma(),gm.getEpsilonSdr(),gm.getEpsilonHdr(),
+                     gm.getMinDisplayRatioForHdrTransition(),gm.getDisplayRatioForFullHdr(),true)
+                     && isJpegRNative(output.toString());
+-            long tEnd=System.nanoTime();
+-            Log.i(TAG,"IRIS_26511_JPEG444_PARALLEL_TIMING encodeWallMs="+((tEncoded-t0)/1000000L)
+-                    +" packageValidateMs="+((tEnd-tEncoded)/1000000L)
+-                    +" parallelBaseGain=true outputPriority=default optimizeHuffman=false quality="+quality
+-                    +" gainQuality="+GAINMAP_QUALITY);
+             Log.i(TAG,"IRIS_26507_JPEG444 encoded="+ok+" gainmap=true subsampling=444 jpegR="+ok);
+             return ok;
+         }catch(Throwable t){Log.e(TAG,"IRIS_26507_JPEG444_FAILED",t);return false;}
