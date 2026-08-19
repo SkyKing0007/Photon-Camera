@@ -62,7 +62,7 @@ def contributor(src:str)->str:
     old='vec2 uv=clamp((sourceRaw+vec2(0.5))/vec2(rawSize),vec2(0.0),vec2(1.0));'
     new='vec2 uv=clamp((sourceRaw+vec2(1.0))/vec2(rawSize),vec2(0.0),vec2(1.0));'
     src=one(src,old,new,'covariance Bayer-quad center UV')
-    marker='/* IRIS_26501_NATIVE_SPATIAL_RGB_CONTRIBUTION'
+    marker='/* IRIS_26501_WRONSKI_PER_FRAME_SPATIAL_RGB_OWNER'
     src=one(src,marker,
         '/* IRIS_26507_COVARIANCE_QUAD_CENTER_UV\n * RAW/2 covariance texels are centered on sensor coordinates 2*q+1; therefore\n * normalized lookup is (sourceRaw+1)/rawSize.\n */\n\n'+marker,
         'covariance center marker')
