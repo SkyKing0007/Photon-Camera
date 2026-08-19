@@ -43,3 +43,10 @@ Suggested commit message: 26507: fix MGC geometry and unify HDR chroma rejection
 - Fixes JPEG444 Throwable logging to use Photon Log.e(..., Throwable), which preserves native-link Error reporting and compiles on this branch.
 - Adds explicit Gate 4 guards for both compile failures so these exact regressions cannot recur silently.
 - No RAW/2 MGC equations, Short/Long rejection math, UHDR signal math, or native JPEG 4:4:4 math changed from V3.
+
+
+26507 V5 post-build proof correction (verification only):
+- Gradle V4 built successfully; the failure was a false APK assertion that required Java source comments to survive into DEX.
+- Post-build proof is now type-aware: runtime telemetry is checked in DEX, GLSL ownership markers are checked in packaged shader assets, and libmotionv2jpeg.so is checked as a native APK library.
+- Short/Long pre-chroma ownership comments remain source-validated in Gate 4 and are intentionally not required in DEX.
+- No Motion/HDR runtime source transform, RAW/2 MGC math, auxiliary rejection, UHDR math, or JPEG444 implementation changed from V4.

@@ -191,18 +191,41 @@ mapfile -t APKS < <(find app/build -type f -name '*.apk' | sort)
 [[ "${#APKS[@]}" -eq 1 ]] || fail "expected exactly one APK, found ${#APKS[@]}"
 [[ "$(basename "${APKS[0]}")" == "IrisCamera-0.9726507-26507-debug.apk" ]] || fail "unexpected APK identity $(basename "${APKS[0]}")"
 FINAL="$ROOT/IrisCamera-0.9726507-26507-mgc-parity-immutable-hdr-jpeg444-debug.apk"; rm -f "$FINAL"; cp "${APKS[0]}" "$FINAL"
-# APK binary/source markers + native library proof.
+# IRIS_26507_V5_TYPED_POSTBUILD_PROOF
+# Prove each artifact in the representation where it can actually survive compilation:
+# runtime Java telemetry in DEX, GLSL ownership markers in packaged shader assets,
+# and the native 4:4:4 bridge as an APK shared library. Java source comments are
+# already proven by Gate 4 and must never be required to survive into DEX.
 python3 - "$FINAL" <<'PYAPK'
 import sys,zipfile
 p=sys.argv[1]
 with zipfile.ZipFile(p) as z:
  names=set(z.namelist())
- libs=[n for n in names if n.endswith('/libmotionv2jpeg.so')]
+ libs=sorted(n for n in names if n.endswith('/libmotionv2jpeg.so'))
  assert libs, 'libmotionv2jpeg.so missing from APK'
- dex=b''.join(z.read(n) for n in names if n.endswith('.dex'))
- for marker in [b'IRIS_26507_MGC_GEOMETRY',b'IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY',b'IRIS_26507_SHORT_A_SHARED_MGC_PRECHROMA_GATE',b'IRIS_26507_LONG_A_SHARED_MGC_PRECHROMA_GATE',b'IRIS_26507_FULL_HDR_DISPLAY_CAPACITY_PARITY',b'IRIS_26507_JPEG444']:
-  assert marker in dex, marker
- print('PASS: APK contains 26507 runtime markers and libmotionv2jpeg.so')
+ dex_names=sorted(n for n in names if n.endswith('.dex'))
+ assert dex_names, 'APK contains no DEX files'
+ dex=b''.join(z.read(n) for n in dex_names)
+ runtime_dex_markers=[
+  b'IRIS_26507_MGC_GEOMETRY',
+  b'IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY',
+  b'IRIS_26507_FULL_HDR_DISPLAY_CAPACITY_PARITY',
+  b'IRIS_26507_JPEG444',
+ ]
+ for marker in runtime_dex_markers:
+  assert marker in dex, b'missing runtime DEX marker: '+marker
+ packaged_shader_markers={
+  'assets/shaders/motionv2/mfsr_bjzhou_guide.glsl': b'IRIS_26507_MGC_RAW_HALF_GUIDE_PARITY',
+  'assets/shaders/motionv2/mfsr_bjzhou_rejection_base.glsl': b'IRIS_26507_DYNAMIC_MGC_FLOW_THRESHOLD',
+  'assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl': b'IRIS_26507_COVARIANCE_QUAD_CENTER_UV',
+  'assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl': b'IRIS_26507_GPU_LOCAL_8_CONNECTED_SHORT_TOPOLOGY',
+ }
+ for suffix,marker in packaged_shader_markers.items():
+  matches=[n for n in names if n.endswith(suffix)]
+  assert len(matches)==1, f'expected one packaged shader {suffix}, found {matches}'
+  payload=z.read(matches[0])
+  assert marker in payload, b'missing packaged shader marker: '+marker
+ print('PASS: APK typed proof: runtime DEX telemetry + packaged 26507 shaders + libmotionv2jpeg.so')
 PYAPK
 sha256sum "$FINAL" > "$OUT/26507_APK.sha256"
 # Successful source checkpoint excludes fetched third-party tree from compact project-source archive; dependency manifest/commit above proves it separately.
