@@ -181,28 +181,65 @@ PYVER
 rm -rf app/src/main
 cp -a "$AFTER/app/src/main" app/src/main
 cp "$AFTER/app/version.properties" app/version.properties
-# IRIS_26509_V3_AUDITED_RUNTIME_EXCLUDES_FETCHED_NATIVE_TREE
-# Gradle must not mutate Photon runtime source.  The fetched third_party_26507 tree
-# is a pinned build dependency, not part of the canonical successful-source archive;
-# it was already authenticated above by BJZHOU_HEAD + BJZHOU_MANIFEST and may contain
-# CMake-generated/configured files during native compilation.
+# IRIS_26509_V4_AUDITED_RUNTIME_EXCLUDES_ONLY_KNOWN_BUILD_GENERATED_DEPS
+# Two source-tree locations have independent build-dependency authority and are not
+# canonical Photon runtime source:
+#   1) third_party_26507: pinned bjzhou native tree, authenticated above by commit + manifest.
+#   2) cpp/deps generated headers: Photon CMakeLists.txt itself downloads exactly four
+#      headers during CMake configure.  Their *names/location* are proved here; hashes are
+#      emitted after Gradle.  CMakeLists.txt itself remains inside the immutable manifest.
+CMAKE_SRC="app/src/main/cpp/CMakeLists.txt"
+for needle in   'deps/tiny_dng_writer.h'   'deps/technicallyflac.h'   'deps/archive.h'   'deps/archive_entry.h'; do
+  grep -F "$needle" "$CMAKE_SRC" >/dev/null || fail "CMake generated-dependency contract missing: $needle"
+done
+
+assert_cpp_deps_exact(){
+  local phase="$1" expected actual
+  if [[ "$phase" == "pre" ]]; then
+    expected=$'.gitignore'
+  else
+    expected=$'.gitignore\narchive.h\narchive_entry.h\ntechnicallyflac.h\ntiny_dng_writer.h'
+  fi
+  actual="$(find app/src/main/cpp/deps -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+  [[ "$actual" == "$expected" ]] || {
+    printf 'Expected cpp/deps (%s):\n%s\nActual:\n%s\n' "$phase" "$expected" "$actual" >&2
+    fail "unexpected app/src/main/cpp/deps contents during $phase-build proof"
+  }
+}
+
+# Successful 26507 source has only the tracked .gitignore before CMake runs.
+assert_cpp_deps_exact pre
+
 audited_runtime_manifest(){
   {
-    find app/src/main -type f ! -path 'app/src/main/cpp/third_party_26507/*' -print
+    find app/src/main -type f       ! -path 'app/src/main/cpp/third_party_26507/*'       ! -path 'app/src/main/cpp/deps/*' -print
+    # Keep the tracked deps sentinel under immutable authority while excluding only
+    # the four CMake-downloaded headers.
+    echo app/src/main/cpp/deps/.gitignore
     echo app/version.properties
   } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done
 }
 audited_runtime_manifest > "$OUT/26509_pre_gradle_audited_runtime.sha256"
 chmod +x ./gradlew
 ./gradlew clean :app:assembleDebug --stacktrace
+
+# IRIS_26509_V4_GENERATED_CPP_DEPS_EXACT_ALLOWLIST
+# After a successful native configure/build, only these four CMake-declared generated
+# headers may have appeared beside the tracked .gitignore.  Any additional path fails.
+assert_cpp_deps_exact post
+(
+  cd app/src/main/cpp/deps
+  sha256sum .gitignore archive.h archive_entry.h technicallyflac.h tiny_dng_writer.h
+) > "$OUT/26509_post_gradle_generated_cpp_deps.sha256"
+
 audited_runtime_manifest > "$OUT/26509_post_gradle_audited_runtime.sha256"
 if ! cmp -s "$OUT/26509_pre_gradle_audited_runtime.sha256" "$OUT/26509_post_gradle_audited_runtime.sha256"; then
-  # IRIS_26509_V3_SOURCE_DIFF_DIAGNOSTIC
+  # IRIS_26509_V4_SOURCE_DIFF_DIAGNOSTIC
   diff -u "$OUT/26509_pre_gradle_audited_runtime.sha256" "$OUT/26509_post_gradle_audited_runtime.sha256" \
     | tee "$OUT/26509_gradle_runtime_source_diff.txt" >&2 || true
   fail "Gradle mutated audited Photon runtime source; see 26509_gradle_runtime_source_diff.txt"
 fi
-pass "Gradle preserved audited Photon runtime source; fetched native dependency tree excluded by separate pinned authority"
+pass "Gradle preserved audited Photon runtime; only exact CMake-declared cpp/deps headers were generated"
 mapfile -t APKS < <(find app/build -type f -name '*.apk' | sort)
 [[ "${#APKS[@]}" -eq 1 ]] || fail "expected exactly one APK, found ${#APKS[@]}"
 [[ "$(basename "${APKS[0]}")" == "IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-debug.apk" ]] || fail "unexpected APK identity $(basename "${APKS[0]}")"

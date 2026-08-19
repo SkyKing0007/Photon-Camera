@@ -138,3 +138,12 @@ V3 SOURCE-INTEGRITY PROOF FIX (no runtime/image-math change)
 - V3 preserves that same authority split: the bjzhou tree is authenticated before Gradle; the post-Gradle immutable-source proof covers Photon app/src/main excluding third_party_26507 plus app/version.properties.
 - If Gradle ever changes actual Photon runtime source, V3 emits an exact unified pre/post hash diff before failing.
 - 26509 runtime delta, image math, flow thresholds, MGC, Short/Long HDR, exposure controller, UHDR, JPEG_R and target version/build remain byte-identical to V2.
+
+V4 GENERATED CPP/DEPS INTEGRITY PROOF FIX (no runtime/image-math change)
+- V3 reached BUILD SUCCESSFUL and then correctly printed the exact source diff: CMake created four headers under app/src/main/cpp/deps/.
+- Photon app/src/main/cpp/CMakeLists.txt explicitly downloads tiny_dng_writer.h, technicallyflac.h, archive.h, and archive_entry.h into that source-tree deps directory during native configure.
+- V4 keeps CMakeLists.txt and the tracked deps/.gitignore under immutable Photon-runtime authority, while excluding only those four known CMake-generated header paths from the pre/post immutable manifest.
+- Before Gradle, cpp/deps must contain exactly .gitignore. After Gradle, it must contain exactly .gitignore plus the four CMake-declared headers; any extra generated path fails.
+- V4 emits 26509_post_gradle_generated_cpp_deps.sha256 so the generated dependency bytes remain visible in the proof bundle.
+- third_party_26507 remains separately authenticated by the pinned bjzhou commit + dependency manifest, exactly as in V3/26507.
+- 26509 runtime delta, image math, flow thresholds, MGC, Short/Long HDR, exposure controller, UHDR, JPEG_R and target 0.9726509/26509 remain byte-identical to V3.
