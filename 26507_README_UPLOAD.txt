@@ -30,3 +30,9 @@ The Action reconstructs exact tested 26506, emits a pre-change patch/archive BEF
 UPLOAD
 Extract this ZIP at repository root with hidden .github preserved. Commit/push the handoff files only; the workflow reconstructs runtime source during Actions.
 Suggested commit message: 26507: fix MGC geometry and unify HDR chroma rejection
+
+26507 V3 native-gate correction (handoff infrastructure only):
+- Corrects the pinned bjzhou libultrahdr public API path to libultrahdr/ultrahdr_api.h.
+- Adds explicit dependency-layout failures instead of silent `test -f` exits.
+- Matches bjzhou CMake's root libultrahdr include contract and disables unused TurboJPEG tools/tests/Java targets.
+- No RAW/2, Wronski/MGC, Short-A, Long-A, UHDR signal, or JPEG 4:4:4 runtime math changed from 26507 V2.

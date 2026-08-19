@@ -104,6 +104,14 @@ def main():
     must(t['cmake'],'IRIS_26507_TRUE_JPEG444_JPEGR','CMake 444')
     must(t['cmake'],'turbojpeg-static','TurboJPEG target')
     must(t['cmake'],'iris26507-ultrahdr','libultrahdr target')
+    must(t['cmake'],'IRIS_26507_V3_NATIVE_DEPENDENCY_LAYOUT_PROOF','native layout proof marker')
+    must(t['cmake'],'${IRIS26507_UHDR}/ultrahdr_api.h','libultrahdr public root header')
+    must(t['cmake'],'${IRIS26507_UHDR}/lib/src/ultrahdr_api.cpp','libultrahdr core source proof')
+    must(t['cmake'],'set(WITH_TESTS OFF CACHE BOOL "" FORCE)','TurboJPEG tests disabled')
+    must(t['cmake'],'set(WITH_TOOLS OFF CACHE BOOL "" FORCE)','TurboJPEG tools disabled')
+    must(t['cmake'],'set(WITH_JAVA OFF CACHE BOOL "" FORCE)','TurboJPEG Java disabled')
+    if '${IRIS26507_UHDR}/lib/include/ultrahdr_api.h' in t['cmake']:
+        fail('obsolete libultrahdr public-header path survived')
 
     if a.base_root and not (a.base_root/'app/src/main').is_dir(): fail('base-root missing app/src/main')
     print('PASS: 26507 root-fix ownership validated: RAW/2 MGC, immutable aux, shared Short/Long pre-chroma rejection, GPU Short topology, UHDR display-capacity parity, true JPEG 4:4:4')

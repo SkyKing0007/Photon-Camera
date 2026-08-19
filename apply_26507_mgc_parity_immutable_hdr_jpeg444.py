@@ -385,12 +385,21 @@ set(IRIS26507_UHDR ${IRIS26507_THIRD_PARTY}/libultrahdr)
 if(NOT EXISTS ${IRIS26507_JPEG}/CMakeLists.txt)
     message(FATAL_ERROR "26507 pinned libjpeg-turbo source missing")
 endif()
-if(NOT EXISTS ${IRIS26507_UHDR}/lib/include/ultrahdr_api.h)
-    message(FATAL_ERROR "26507 pinned libultrahdr source missing")
+# IRIS_26507_V3_NATIVE_DEPENDENCY_LAYOUT_PROOF
+# libultrahdr exposes ultrahdr_api.h from its source root; lib/include contains
+# the internal ultrahdr/* headers. Match the pinned bjzhou build contract exactly.
+if(NOT EXISTS ${IRIS26507_UHDR}/ultrahdr_api.h)
+    message(FATAL_ERROR "26507 pinned libultrahdr root ultrahdr_api.h missing")
+endif()
+if(NOT EXISTS ${IRIS26507_UHDR}/lib/src/ultrahdr_api.cpp)
+    message(FATAL_ERROR "26507 pinned libultrahdr core source missing")
 endif()
 set(ENABLE_SHARED OFF CACHE BOOL "" FORCE)
 set(ENABLE_STATIC ON CACHE BOOL "" FORCE)
 set(WITH_TURBOJPEG ON CACHE BOOL "" FORCE)
+set(WITH_TESTS OFF CACHE BOOL "" FORCE)
+set(WITH_TOOLS OFF CACHE BOOL "" FORCE)
+set(WITH_JAVA OFF CACHE BOOL "" FORCE)
 set(REQUIRE_SIMD ON CACHE BOOL "" FORCE)
 set(WITH_SIMD ON CACHE BOOL "" FORCE)
 add_subdirectory(${IRIS26507_JPEG} ${CMAKE_CURRENT_BINARY_DIR}/iris26507-libjpeg-turbo)
@@ -416,6 +425,7 @@ set_target_properties(motionv2jpeg PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUI
 target_include_directories(motionv2jpeg PRIVATE
     ${IRIS26507_JPEG}/src
     ${CMAKE_CURRENT_BINARY_DIR}/iris26507-libjpeg-turbo
+    ${IRIS26507_UHDR}
     ${IRIS26507_UHDR}/lib/include
     ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static iris26507-ultrahdr log jnigraphics android z)
