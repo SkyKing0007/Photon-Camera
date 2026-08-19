@@ -467,15 +467,17 @@ float stateAt(ivec2 p,int q){p=clamp(p,ivec2(0),packedSize-ivec2(1));float c=tex
 bool candidate(ivec2 p){for(int q=0;q<4;++q)if(abs(stateAt(p,q)-2.0)<0.25)return true;return false;}
 bool globalActiveNeighbor(ivec2 p){for(int oy=-1;oy<=1;++oy)for(int ox=-1;ox<=1;++ox){if(ox==0&&oy==0)continue;ivec2 n=p+ivec2(ox,oy);if(any(lessThan(n,ivec2(0)))||any(greaterThanEqual(n,packedSize)))continue;if(texelFetch(regionIn,n,0).r>0.5)return true;}return false;}
 /* IRIS_26508_GPU_8_CONNECTED_REGION_PROPAGATION
+ * IRIS_26508_V3_GLSL_RESERVED_IDENTIFIER_FIX: regionActive replaces the GLSL
+ * ES reserved identifier `active`; propagation math and topology are unchanged.
  * One dispatch imports activity across workgroup boundaries, then floods each
  * 8x8 tile in shared memory. Four host passes therefore propagate coherent region
  * ownership across multiple tiles without any CPU/full-frame readback.
  */
 void main(){
  ivec2 p=ivec2(gl_GlobalInvocationID.xy);ivec2 l=ivec2(gl_LocalInvocationID.xy);int li=int(gl_LocalInvocationIndex);
- bool inside=all(lessThan(p,packedSize));bool valid=false;bool active=false;
- if(inside){vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize);valid=candidate(p)&&texture(mgcWeight,uv).r>0.04;active=valid&&(texelFetch(regionIn,p,0).r>0.5||globalActiveNeighbor(p));}
- iris26508Valid[li]=valid?1u:0u;iris26508Active[li]=active?1u:0u;barrier();
+ bool inside=all(lessThan(p,packedSize));bool valid=false;bool regionActive=false;
+ if(inside){vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize);valid=candidate(p)&&texture(mgcWeight,uv).r>0.04;regionActive=valid&&(texelFetch(regionIn,p,0).r>0.5||globalActiveNeighbor(p));}
+ iris26508Valid[li]=valid?1u:0u;iris26508Active[li]=regionActive?1u:0u;barrier();
  for(int iter=0;iter<8;++iter){
   uint next=iris26508Active[li];
   if(next==0u&&iris26508Valid[li]!=0u){for(int oy=-1;oy<=1;++oy)for(int ox=-1;ox<=1;++ox){if(ox==0&&oy==0)continue;int nx=l.x+ox,ny=l.y+oy;if(nx<0||ny<0||nx>=8||ny>=8)continue;int ni=ny*8+nx;if(iris26508Active[ni]!=0u)next=1u;}}

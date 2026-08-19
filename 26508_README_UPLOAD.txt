@@ -90,3 +90,13 @@ motion/disocclusion may remain censored.
 - Motion/HDR transform intent and all 9 intended runtime-file changes are otherwise unchanged.
 
 Suggested corrective commit message: 26508 V2: fix exact diagnostic anchor and retain proven build gates
+
+26508 V3 GLSL reserved-word correction (no imaging-math change):
+- Gate 4 in V2 correctly stopped before Gradle because GLSL ES reserves `active`; the new region-propagation shader used it as a local boolean identifier.
+- Renames only that local identifier from `active` to `regionActive`; topology, thresholds, dispatch count, MGC, Short/Long ownership, HDR math, JPEG_R/UHDR, and output version/build are unchanged.
+- Adds a GLSL ES reserved-identifier preflight across all six new/replaced 26508 shader bodies before the existing pinned glslang 16.5.0 compile.
+- Verifies backup-26508-v2-before-glsl-reserved-word-fix-20260818 points exactly to V2 commit 80be166dbe8e90aae05b9d512d67a285aa52b2f6.
+- Retains the exact 26506/26507 canonical reconstruction, pre-change proof, native dependency layout, Java/GLSL preflight, version+Gradle Gate 5, source-integrity, one-APK, typed APK, and manifest checks.
+- Build remains 0.9726508 / 26508 because V2 stopped in Gate 4 and produced no APK.
+
+Suggested corrective commit message: 26508 V3: fix GLSL reserved identifier and retain proven build gates
