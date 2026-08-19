@@ -38,6 +38,10 @@ PROTECTED=[
 'app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl',
 'app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl',
 ]
+NATIVE_DEPENDENCY_TREES=(
+('app/src/main/cpp/libjpeg-turbo','app/src/main/cpp/third_party_26507/libjpeg-turbo'),
+('app/src/main/cpp/libultrahdr','app/src/main/cpp/third_party_26507/libultrahdr'),
+)
 
 def h(p:Path): return hashlib.sha256(p.read_bytes()).hexdigest()
 def need(text:str,needle:str,label:str):
@@ -77,12 +81,33 @@ def compare_upstream(cand:Path,up:Path,imp):
         assert src.read_bytes()==dst.read_bytes(),f'upstream byte drift {dst.relative_to(cand)}'
     print(f'PASS: {len(pairs)} imported 1.27.1 files are byte-identical to pinned upstream')
 
+def compare_native_dependencies(cand:Path,up:Path):
+    imported=set()
+    total=0
+    for src_rel,dst_rel in NATIVE_DEPENDENCY_TREES:
+        srcdir=up/src_rel; dstdir=cand/dst_rel
+        assert srcdir.is_dir(),f'missing upstream native dependency tree {src_rel}'
+        assert dstdir.is_dir(),f'missing candidate native dependency tree {dst_rel}'
+        sf={p.relative_to(srcdir).as_posix():p for p in srcdir.rglob('*') if p.is_file()}
+        df={p.relative_to(dstdir).as_posix():p for p in dstdir.rglob('*') if p.is_file()}
+        assert sf.keys()==df.keys(),(
+            f'native dependency file-set drift {dst_rel}: '
+            f'extra={sorted(df.keys()-sf.keys())!r} missing={sorted(sf.keys()-df.keys())!r}'
+        )
+        for rel in sorted(sf):
+            assert sf[rel].read_bytes()==df[rel].read_bytes(),f'native dependency byte drift {dst_rel}/{rel}'
+            imported.add(f'{dst_rel}/{rel}')
+            total+=1
+    print(f'PASS: {total} native JPEG/UHDR dependency files are byte-identical to pinned upstream')
+    return imported
+
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('--base',type=Path,required=True); ap.add_argument('--candidate',type=Path,required=True); ap.add_argument('--importer',type=Path,required=True); ap.add_argument('--upstream',type=Path)
     a=ap.parse_args(); base=a.base.resolve(); cand=a.candidate.resolve(); imp=load_importer(a.importer.resolve())
     bf,cf=files(base),files(cand)
     changed={r for r in set(bf)|set(cf) if r not in bf or r not in cf or h(bf[r])!=h(cf[r])}
     imported=set()
+    native_imported=set()
     if a.upstream:
         compare_upstream(cand,a.upstream.resolve(),imp)
         for n in imp.PROCESSOR: imported.add(f'app/src/main/java/com/hinnka/mycamera/processor/{n}')
@@ -91,9 +116,10 @@ def main():
         imported.add('app/src/main/cpp/mgc1271_upstream/mgc_strength_map_scaler.cpp')
         srcdir=a.upstream.resolve()/'app/src/main/cpp/mgc_denoise_static'
         imported.update('app/src/main/cpp/mgc1271_upstream/mgc_denoise_static/'+p.relative_to(srcdir).as_posix() for p in srcdir.rglob('*') if p.is_file())
-    expected=ADAPTER_CHANGED|imported
+        native_imported=compare_native_dependencies(cand,a.upstream.resolve())
+    expected=ADAPTER_CHANGED|imported|native_imported
     assert changed==expected,'unexpected candidate delta:\n extra='+repr(sorted(changed-expected))+'\n missing='+repr(sorted(expected-changed))
-    print(f'PASS: exact candidate delta = {len(ADAPTER_CHANGED)} adapter paths + {len(imported)} pinned-upstream paths')
+    print(f'PASS: exact candidate delta = {len(ADAPTER_CHANGED)} adapter paths + {len(imported)} pinned MGC paths + {len(native_imported)} pinned native dependency paths')
     for r in PROTECTED:
         assert r in bf and r in cf and bf[r].read_bytes()==cf[r].read_bytes(),f'protected 26507 drift: {r}'
     print('PASS: Wronski/GLTexture/post/UHDR/JPEG protected files remain byte-identical to successful 26507')
