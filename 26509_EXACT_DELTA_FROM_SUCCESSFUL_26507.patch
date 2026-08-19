@@ -1,0 +1,1973 @@
+diff --git a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_bjzhou_rejection_base.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_bjzhou_rejection_base.glsl
+index 5893225..0260a5c 100644
+--- a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_bjzhou_rejection_base.glsl
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_bjzhou_rejection_base.glsl
+@@ -8,6 +8,12 @@ uniform highp sampler2D flowTexture;
+ uniform highp sampler2D unblockerTexture;
+ layout(r32f,binding=0) uniform highp writeonly image2D outReverseWeight;
+ layout(r32f,binding=1) uniform highp writeonly image2D outPixelDifference;
++/* IRIS_26509_PHYSICAL_BOUNDARY_ZERO_EVIDENCE
++ * A warped auxiliary coordinate outside the true packed sensor frame is absent
++ * evidence. Do not mirror it back into the image for MGC validation.
++ */
++/* IRIS_26509_MGC_CONSUMES_CONTINUOUS_FLOW_UNCERTAINTY */
++layout(std430,binding=5) buffer GeometryDiagBuf{uint geometryDiag[];};
+ uniform ivec2 rawHalf;
+ uniform ivec2 guideSize;
+ uniform vec3 referenceNoiseShot;
+@@ -20,14 +26,29 @@ uniform float flowVariationThreshold;
+  * a RAW/2 guide while Iris actually allocated RAW/4. Host now owns the exact
+  * geometry-derived threshold.
+  */
+-vec2 mirrorUv(vec2 uv){uv=mod(uv,2.0);return mix(uv,2.0-uv,greaterThan(uv,vec2(1.0)));}
+ vec4 sampleBiquadraticAbsolute(sampler2D image,vec2 uv){vec2 ts=1.0/vec2(guideSize);vec2 f=fract(uv*vec2(guideSize));vec2 c=f*f-f+0.5;vec2 w0=uv-c*ts,w1=uv+c*ts;vec4 s=abs(texture(image,vec2(w0.x,w0.y)))+abs(texture(image,vec2(w0.x,w1.y)))+abs(texture(image,vec2(w1.x,w1.y)))+abs(texture(image,vec2(w1.x,w0.y)));s.w/=1024.0;return 0.25*s;}
+ vec3 nvar(vec3 shot,vec3 read,float signal){return max(shot*max(signal,0.0)+read,vec3(1.0e-10));}
+ float q8(float v){return round(255.0*clamp(v,0.0,1.0))/255.0;}
+ /* IRIS_26487_BJZHOU_REJECTION_EXACT_EQUATION */
+ void main(){
+     ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,rawHalf)))return;
+-    vec2 uv=(vec2(p)+0.5)/vec2(rawHalf);vec4 flow=texture(flowTexture,uv);vec2 warped=mirrorUv(uv+flow.xy/vec2(rawHalf));
++    /* IRIS_26509_SAMPLED_GEOMETRY_DIAGNOSTICS
++     * Image math remains full-resolution; only counters are sampled 1/256 to avoid
++     * turning diagnostic atomics into a processing-time regression.
++     */
++    bool diagnosticSample=((p.x&15)==0)&&((p.y&15)==0);
++    bool border=p.x<8||p.y<8||p.x>=rawHalf.x-8||p.y>=rawHalf.y-8;
++    if(diagnosticSample){atomicAdd(geometryDiag[0],1u);if(border)atomicAdd(geometryDiag[5],1u);}
++    vec2 uv=(vec2(p)+0.5)/vec2(rawHalf);vec4 flow=texture(flowTexture,uv);
++    float uncertainty=clamp(flow.w,0.0,1.0);
++    if(diagnosticSample&&uncertainty>0.0)atomicAdd(geometryDiag[1],1u);
++    if(diagnosticSample&&uncertainty>=0.5)atomicAdd(geometryDiag[2],1u);
++    if(diagnosticSample&&border&&uncertainty>0.0)atomicAdd(geometryDiag[7],1u);
++    vec2 warped=uv+flow.xy/vec2(rawHalf);
++    if(any(lessThan(warped,vec2(0.0)))||any(greaterThanEqual(warped,vec2(1.0)))){
++        if(diagnosticSample){atomicAdd(geometryDiag[3],1u);if(border)atomicAdd(geometryDiag[6],1u);}
++        imageStore(outReverseWeight,p,vec4(1.0));imageStore(outPixelDifference,p,vec4(0.0));return;
++    }
+     float unblocker=texture(unblockerTexture,uv).r;if(flow.z<flowVariationThreshold)unblocker=0.0;bool motionPrior=flow.z>flowVariationThreshold;
+     vec4 reference=texture(referenceGuide,uv);bool greenOnly=reference.w<0.0;reference.w=abs(reference.w)/1024.0;
+     vec4 current=sampleBiquadraticAbsolute(currentGuide,warped);
+@@ -41,5 +62,7 @@ void main(){
+     float distance=greenOnly?0.35*diffSq.g:0.07*dot(diffSq,vec3(1.0/3.0));
+     float pixelDistance=greenOnly?0.35*pixelDistanceSq.g:0.07*dot(pixelDistanceSq,vec3(1.0/3.0));
+     float pixelDifference=exp2(min(-pixelDistance,0.0));distance*=boost;float frameWeight=exp2(min(-distance,0.0));float weight=min(1.0-unblocker,frameWeight);
++    float geometryConfidence=1.0-uncertainty;weight*=geometryConfidence;
++    if(diagnosticSample&&geometryConfidence<=0.25)atomicAdd(geometryDiag[4],1u);
+     imageStore(outReverseWeight,p,vec4(q8(1.0-weight)));imageStore(outPixelDifference,p,vec4(q8(pixelDifference)));
+ }
+diff --git a/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_bridge_flow_compose_26509.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_bridge_flow_compose_26509.glsl
+new file mode 100644
+index 0000000..815aa8b
+--- /dev/null
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_bridge_flow_compose_26509.glsl
+@@ -0,0 +1,24 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++precision highp image2D;
++uniform highp sampler2D referenceToBridgeFlow;
++uniform highp sampler2D bridgeToShortFlow;
++uniform ivec2 packedSize;
++layout(rgba16f,binding=0) uniform highp writeonly image2D outFlow;
++/* IRIS_26509_WRONSKI_BRIDGE_FLOW_COMPOSITION
++ * Compose reference->nearest-Normal and nearest-Normal->Short Wronski flows.
++ * No bridge radiance enters this texture; it carries geometry/variation only.
++ */
++void main(){
++ ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,packedSize)))return;
++ vec4 a=texelFetch(referenceToBridgeFlow,p,0);
++ vec2 bridgeCenter=vec2(p)+vec2(0.5)+a.xy;
++ if(bridgeCenter.x<0.0||bridgeCenter.y<0.0||bridgeCenter.x>=float(packedSize.x)||bridgeCenter.y>=float(packedSize.y)){
++  imageStore(outFlow,p,vec4(0.0,0.0,1.0,1.0));return;
++ }
++ vec2 uv=bridgeCenter/vec2(packedSize);
++ vec4 b=texture(bridgeToShortFlow,clamp(uv,vec2(0.0),vec2(1.0)));
++ imageStore(outFlow,p,vec4(a.xy+b.xy,max(max(a.z,0.0),max(b.z,0.0)),max(clamp(a.w,0.0,1.0),clamp(b.w,0.0,1.0))));
++}
+diff --git a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl
+index 870b7ee..370304e 100644
+--- a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_flow_expand.glsl
+@@ -8,17 +8,25 @@ uniform ivec2 outputSize;
+ uniform int tileSize;
+ uniform float interpolationTolerance;
+ vec2 fAt(ivec2 p){ivec2 s=textureSize(TileFlow,0);return texelFetch(TileFlow,clamp(p,ivec2(0),s-ivec2(1)),0).xy;}
+-/* IRIS_26484_BJZHOU_SAFE_SPATIAL_FLOW_RECONSTRUCTION
+- * Interpolate only when all four neighboring tile vectors agree with the base vector inside the
+- * MGC tolerance. Otherwise preserve the whole base vector. Z carries local 3x3 flow variation for
+- * rejection; W remains reserved.
++/* IRIS_26509_CONTINUOUS_DENSE_FLOW_UNCERTAINTY_OWNER
++ * Previous code switched an entire finest-grid tile to one constant base vector when
++ * any of four neighbors crossed a hard disagreement threshold. Always reconstruct the
++ * bilinear vector field instead. W now carries continuous normalized disagreement;
++ * MGC consumes that uncertainty so geometry risk reduces evidence instead of creating
++ * 8x8-packed / ~16x16-RAW displacement blocks. Z retains the native local variation.
+  */
+ void main(){
+- ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,outputSize)))return;int ts=max(tileSize,1);ivec2 gs=textureSize(TileFlow,0);
+- ivec2 tile=clamp(p/ts,ivec2(0),gs-ivec2(1));ivec2 off=p-tile*ts;vec2 base=fAt(tile);vec2 outF=base;
+- bool left=off.x<=ts/2,top=off.y<=ts/2;ivec2 t00=ivec2(left?tile.x-1:tile.x,top?tile.y-1:tile.y);vec2 f00=fAt(t00),f10=fAt(t00+ivec2(1,0)),f01=fAt(t00+ivec2(0,1)),f11=fAt(t00+ivec2(1,1));float th=float(ts)*interpolationTolerance;
+- bool cancel=any(greaterThanEqual(abs(f00-base),vec2(th)))||any(greaterThanEqual(abs(f10-base),vec2(th)))||any(greaterThanEqual(abs(f01-base),vec2(th)))||any(greaterThanEqual(abs(f11-base),vec2(th)));
+- if(!cancel){float ux=float(p.x)/float(ts)-(float(t00.x)+0.5);float uy=float(p.y)/float(ts)-(float(t00.y)+0.5);outF=mix(mix(f00,f10,ux),mix(f01,f11,ux),uy);}
+- vec2 mn=vec2(3.4e38),mx=vec2(-3.4e38);for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 v=fAt(tile+ivec2(x,y));mn=min(mn,v);mx=max(mx,v);}float variation=length((mx-mn)/max(vec2(outputSize),vec2(1.0)));
+- imageStore(OutputFlow,p,vec4(outF,variation,cancel?1.0:0.0));
++ ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,outputSize)))return;
++ int ts=max(tileSize,1);ivec2 gs=textureSize(TileFlow,0);
++ ivec2 tile=clamp(p/ts,ivec2(0),gs-ivec2(1));ivec2 off=p-tile*ts;
++ bool left=off.x<=ts/2,top=off.y<=ts/2;ivec2 t00=ivec2(left?tile.x-1:tile.x,top?tile.y-1:tile.y);
++ vec2 f00=fAt(t00),f10=fAt(t00+ivec2(1,0)),f01=fAt(t00+ivec2(0,1)),f11=fAt(t00+ivec2(1,1));
++ float ux=float(p.x)/float(ts)-(float(t00.x)+0.5);float uy=float(p.y)/float(ts)-(float(t00.y)+0.5);
++ vec2 outF=mix(mix(f00,f10,ux),mix(f01,f11,ux),uy);
++ float th=max(float(ts)*interpolationTolerance,1.0e-6);
++ float disagreement=max(max(max(abs(f00.x-outF.x),abs(f00.y-outF.y)),max(abs(f10.x-outF.x),abs(f10.y-outF.y))),max(max(abs(f01.x-outF.x),abs(f01.y-outF.y)),max(abs(f11.x-outF.x),abs(f11.y-outF.y))));
++ float uncertainty=clamp(disagreement/th,0.0,1.0);
++ vec2 mn=vec2(3.4e38),mx=vec2(-3.4e38);for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){vec2 v=fAt(tile+ivec2(x,y));mn=min(mn,v);mx=max(mx,v);}
++ float variation=length((mx-mn)/max(vec2(outputSize),vec2(1.0)));
++ imageStore(OutputFlow,p,vec4(outF,variation,uncertainty));
+ }
+diff --git a/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_finalize_26509.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_finalize_26509.glsl
+new file mode 100644
+index 0000000..c120710
+--- /dev/null
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_finalize_26509.glsl
+@@ -0,0 +1,29 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++precision highp image2D;
++uniform highp sampler2D normalCfa;
++uniform highp sampler2D candidateCfa;
++uniform highp sampler2D candidateProvenance;
++uniform highp sampler2D mgcWeight;
++uniform highp sampler2D regionTexture;
++uniform ivec2 packedSize;
++layout(rgba32f,binding=0) uniform highp writeonly image2D outCfa;
++layout(r32f,binding=1) uniform highp writeonly image2D outProvenance;
++layout(std430,binding=2) buffer ShortDiagBuf{uint shortDiag[];};
++const uint D_RECOVERED=6u,D_UNRECOVERABLE=7u,D_TOPOLOGY_REJECT=14u;
++const uint P_RECOVERED=20u,P_UNRECOVERABLE=40u,P_TOPOLOGY_REJECT=48u;
++float divv(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
++float component(vec4 v,int q){return q==0?v.r:(q==1?v.g:(q==2?v.b:v.a));}
++void setComponent(inout vec4 v,int q,float x){if(q==0)v.r=x;else if(q==1)v.g=x;else if(q==2)v.b=x;else v.a=x;}
++float stateFrom(float code,int q){return mod(floor(code/divv(q)),3.0);}
++float encode(vec4 s){return dot(s,vec4(1.0,3.0,9.0,27.0));}
++/* IRIS_26509_REGION_TO_FINAL_PROVENANCE_AUTHORITY */
++void main(){
++ ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,packedSize)))return;
++ vec4 normal=texelFetch(normalCfa,p,0),candidateRgb=texelFetch(candidateCfa,p,0);float code=texelFetch(candidateProvenance,p,0).r;
++ vec4 outv=normal,state=vec4(0.0);vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize);float mgc=clamp(texture(mgcWeight,uv).r,0.0,1.0);bool region=texelFetch(regionTexture,p,0).r>0.5;
++ for(int q=0;q<4;++q){float s=stateFrom(code,q);if(abs(s-2.0)<0.25){if(region&&mgc>0.04){setComponent(outv,q,component(candidateRgb,q));state[q]=2.0;atomicAdd(shortDiag[D_RECOVERED],1u);atomicAdd(shortDiag[P_RECOVERED+uint(q)],1u);}else{state[q]=1.0;if(mgc>0.04){atomicAdd(shortDiag[D_TOPOLOGY_REJECT],1u);atomicAdd(shortDiag[P_TOPOLOGY_REJECT+uint(q)],1u);}atomicAdd(shortDiag[D_UNRECOVERABLE],1u);atomicAdd(shortDiag[P_UNRECOVERABLE+uint(q)],1u);}}else{state[q]=s;if(abs(s-1.0)<0.25){atomicAdd(shortDiag[D_UNRECOVERABLE],1u);atomicAdd(shortDiag[P_UNRECOVERABLE+uint(q)],1u);}}}
++ imageStore(outCfa,p,outv);imageStore(outProvenance,p,vec4(encode(state),0.0,0.0,0.0));
++}
+diff --git a/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_propagate_26509.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_propagate_26509.glsl
+new file mode 100644
+index 0000000..0a160c9
+--- /dev/null
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_propagate_26509.glsl
+@@ -0,0 +1,33 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++precision highp image2D;
++uniform highp sampler2D candidateProvenance;
++uniform highp sampler2D mgcWeight;
++uniform highp sampler2D regionIn;
++uniform ivec2 packedSize;
++layout(r32f,binding=0) uniform highp writeonly image2D outRegion;
++shared uint iris26509Active[64];
++shared uint iris26509Valid[64];
++float divv(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
++float stateAt(ivec2 p,int q){p=clamp(p,ivec2(0),packedSize-ivec2(1));float c=texelFetch(candidateProvenance,p,0).r;return mod(floor(c/divv(q)),3.0);}
++bool candidate(ivec2 p){for(int q=0;q<4;++q)if(abs(stateAt(p,q)-2.0)<0.25)return true;return false;}
++bool globalActiveNeighbor(ivec2 p){for(int oy=-1;oy<=1;++oy)for(int ox=-1;ox<=1;++ox){if(ox==0&&oy==0)continue;ivec2 n=p+ivec2(ox,oy);if(any(lessThan(n,ivec2(0)))||any(greaterThanEqual(n,packedSize)))continue;if(texelFetch(regionIn,n,0).r>0.5)return true;}return false;}
++/* IRIS_26509_GPU_8_CONNECTED_REGION_PROPAGATION
++ * One dispatch imports activity across workgroup boundaries, then floods each
++ * 8x8 tile in shared memory. Four host passes therefore propagate coherent region
++ * ownership across multiple tiles without any CPU/full-frame readback.
++ */
++void main(){
++ ivec2 p=ivec2(gl_GlobalInvocationID.xy);ivec2 l=ivec2(gl_LocalInvocationID.xy);int li=int(gl_LocalInvocationIndex);
++ bool inside=all(lessThan(p,packedSize));bool valid=false;bool regionActive=false;
++ if(inside){vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize);valid=candidate(p)&&texture(mgcWeight,uv).r>0.04;regionActive=valid&&(texelFetch(regionIn,p,0).r>0.5||globalActiveNeighbor(p));}
++ iris26509Valid[li]=valid?1u:0u;iris26509Active[li]=regionActive?1u:0u;barrier();
++ for(int iter=0;iter<8;++iter){
++  uint next=iris26509Active[li];
++  if(next==0u&&iris26509Valid[li]!=0u){for(int oy=-1;oy<=1;++oy)for(int ox=-1;ox<=1;++ox){if(ox==0&&oy==0)continue;int nx=l.x+ox,ny=l.y+oy;if(nx<0||ny<0||nx>=8||ny>=8)continue;int ni=ny*8+nx;if(iris26509Active[ni]!=0u)next=1u;}}
++  barrier();iris26509Active[li]=next;barrier();
++ }
++ if(inside)imageStore(outRegion,p,vec4(iris26509Active[li]!=0u?1.0:0.0,0.0,0.0,1.0));
++}
+diff --git a/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_seed_26509.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_seed_26509.glsl
+new file mode 100644
+index 0000000..1c653f2
+--- /dev/null
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_short_region_seed_26509.glsl
+@@ -0,0 +1,27 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;
++precision highp int;
++precision highp image2D;
++uniform highp sampler2D candidateProvenance;
++uniform highp sampler2D mgcWeight;
++uniform ivec2 packedSize;
++layout(r32f,binding=0) uniform highp writeonly image2D outRegion;
++layout(std430,binding=2) buffer ShortDiagBuf{uint shortDiag[];};
++const uint D_MGC_REJECT=13u;const uint P_MGC_REJECT=44u;
++float divv(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
++float stateAt(ivec2 p,int q){p=clamp(p,ivec2(0),packedSize-ivec2(1));float c=texelFetch(candidateProvenance,p,0).r;return mod(floor(c/divv(q)),3.0);}
++bool candidate(ivec2 p){for(int q=0;q<4;++q)if(abs(stateAt(p,q)-2.0)<0.25)return true;return false;}
++bool measuredNormal(ivec2 p){for(int q=0;q<4;++q)if(abs(stateAt(p,q))<0.25)return true;return false;}
++void main(){
++ ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,packedSize)))return;
++ bool c=candidate(p);vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize);float w=clamp(texture(mgcWeight,uv).r,0.0,1.0);
++ if(c&&w<=0.04){for(int q=0;q<4;++q)if(abs(stateAt(p,q)-2.0)<0.25){atomicAdd(shortDiag[D_MGC_REJECT],1u);atomicAdd(shortDiag[P_MGC_REJECT+uint(q)],1u);}}
++ float candidateNeighbors=0.0,normalNeighbors=0.0;
++ for(int oy=-1;oy<=1;++oy)for(int ox=-1;ox<=1;++ox){if(ox==0&&oy==0)continue;ivec2 n=p+ivec2(ox,oy);if(any(lessThan(n,ivec2(0)))||any(greaterThanEqual(n,packedSize)))continue;if(candidate(n))candidateNeighbors+=1.0;if(measuredNormal(n))normalNeighbors+=1.0;}
++ /* IRIS_26509_GPU_REGION_BOUNDARY_SEED: a measured in-pack phase or a normal
++  * neighboring boundary anchors the object; fully clipped interiors are reached
++  * only by subsequent constrained 8-connected propagation. */
++ bool seed=c&&w>0.20&&(measuredNormal(p)||(normalNeighbors>=1.0&&candidateNeighbors>=1.0));
++ imageStore(outRegion,p,vec4(seed?1.0:0.0,0.0,0.0,1.0));
++}
+diff --git a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
+index ba1a37b..2edcadf 100644
+--- a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
+@@ -38,6 +38,12 @@ layout(location=1) out vec4 OpponentWeights;
+  * authoritative. Two persistent RGBA16F render targets accumulate additively;
+  * there is no read/write RGB ping-pong image.
+  */
++/* IRIS_26509_PHASE_BALANCED_AUX_BOUNDARY_SUPPORT
++ * Reference interpolation may same-CFA clamp because frame 0 is the physical owner.
++ * An auxiliary never invents an out-of-frame neighbor. If either R-G or B-G has no
++ * physical support after the existing 3x3 gather, reject that auxiliary output pixel
++ * as a whole so G/R-G/B-G denominators cannot diverge into a colored boundary strip.
++ */
+ int phaseAt(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+ int colorAt(ivec2 p){
+     int q=phaseAt(p);
+@@ -168,6 +174,7 @@ void main(){
+         }
+     }
+ 
++    if(referenceFrame==0&&(weights.y<=1.0e-8||weights.z<=1.0e-8))return;
+     vec3 axisWeight=semanticAxisPhaseWeight(outP)*fw;
+     SemanticAndGreenWeight=vec4(
+             semantic.x*axisWeight.x,
+diff --git a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl
+index 746e628..cedd4ec 100644
+--- a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_normalize_26501.glsl
+@@ -261,11 +261,18 @@ void main(){
+     float physicalHighlightGate=smoothstep(0.45,0.72,physicalHighlight);
+     bool colorIncomplete=physicalHighlightGate>0.001&&expandedIncomplete;
+ 
+-    if(colorIncomplete||gWeight<=SUPPORT_EPS){
+-        float stableNeutral=max(
+-                calculationRgb.g,
+-                max(neutral,green)*max(lsc.g,0.0));
+-        calculationRgb=vec3(max(stableNeutral,0.0));
++    /* IRIS_26509_CONTINUOUS_UNRECOVERABLE_HIGHLIGHT_EXHAUSTION
++     * Do not turn every censored neighborhood into a hard neutral-white box. Short
++     * reconstruction is authoritative first. Only genuinely endpoint-like unresolved
++     * sensor saturation converges smoothly to neutral; missing green remains emergency.
++     */
++    float endpointSignal=max(max(neutral,green),physicalHighlight);
++    float neutralAuthority=(colorIncomplete?physicalHighlightGate:0.0)
++            *smoothstep(0.94,0.995,endpointSignal);
++    if(gWeight<=SUPPORT_EPS)neutralAuthority=1.0;
++    if(neutralAuthority>0.0){
++        float stableNeutral=max(calculationRgb.g,max(neutral,green)*max(lsc.g,0.0));
++        calculationRgb=mix(calculationRgb,vec3(max(stableNeutral,0.0)),clamp(neutralAuthority,0.0,1.0));
+     }
+ 
+     vec3 cameraRgb=calculationRgb*cameraDomainScale;
+diff --git a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl
+index 58f7f07..639e1d9 100644
+--- a/successful26507/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl
+@@ -1,78 +1,15 @@
+ #define LAYOUT //
+ LAYOUT
+ precision highp float;
++precision highp int;
+ precision highp image2D;
+ uniform highp sampler2D highlightProvenance;
+-layout(rgba32f,binding=0) uniform highp writeonly image2D outWeight;
+ uniform ivec2 packedSize;
+-
+-/* IRIS_26501_SHORT_VALIDATED_SEMANTIC_PHASE_WEIGHT
+- * Preserve the existing Short-A validator phase by phase. Each packed texel stores
+- * R/G1/G2/B authority independently; a validated red phase can never authorize a
+- * neighbouring green or blue phase. Native short RAW is still the only color source.
++layout(rgba32f,binding=0) uniform highp writeonly image2D outWeight;
++float divv(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
++/* IRIS_26509_REGION_FINAL_SHORT_PHASE_WEIGHT
++ * Region membership has already finalized provenance. This pass contains no local
++ * topology heuristic; each physically retained SHORT_VALIDATED phase gets unit
++ * semantic permission and MGC remains the independent frame-weight authority.
+  */
+-float phaseDivisor(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}
+-float phaseState(ivec2 p,int q){
+-    p=clamp(p,ivec2(0),packedSize-ivec2(1));
+-    float code=texelFetch(highlightProvenance,p,0).r;
+-    return mod(floor(code/phaseDivisor(q)),3.0);
+-}
+-bool packedHasCensored(ivec2 p){
+-    for(int q=0;q<4;++q)if(abs(phaseState(p,q)-1.0)<0.25)return true;
+-    return false;
+-}
+-bool packedHasShortValidated(ivec2 p){
+-    for(int q=0;q<4;++q)if(abs(phaseState(p,q)-2.0)<0.25)return true;
+-    return false;
+-}
+-float neighborhoodCensoredFraction(ivec2 p){
+-    float censored=0.0,total=0.0;
+-    for(int oy=-2;oy<=2;++oy){
+-        for(int ox=-2;ox<=2;++ox){
+-            ivec2 q=p+ivec2(ox,oy);
+-            if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,packedSize)))continue;
+-            total+=1.0;
+-            if(packedHasCensored(q))censored+=1.0;
+-        }
+-    }
+-    return total>0.0?censored/total:1.0;
+-}
+-void main(){
+-    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+-    if(any(greaterThanEqual(p,packedSize)))return;
+-    float code=texelFetch(highlightProvenance,p,0).r;
+-    vec4 weight=vec4(0.0);
+-
+-    /* IRIS_26506_SHORT_A_SPATIAL_PROVENANCE_COHERENCE
+-     * A partially measured quad may still use Short-A in the helper Bayer to
+-     * preserve real luminance/headroom, but it cannot inject isolated RGB/chroma
+-     * into the semantic accumulator. Fully measured quads retain Short-A color,
+-     * smoothly reduced only when surrounded by unresolved clipped neighbors.
+-     * This converts dotted SHORT_VALIDATED/CENSORED islands into coherent color
+-     * transitions without globally relaxing correspondence or inventing detail.
+-     */
+-    if(!packedHasCensored(p)){
+-        /* IRIS_26507_GPU_LOCAL_8_CONNECTED_SHORT_TOPOLOGY */
+-        float connectedShortNeighbors=0.0;
+-        float unresolvedNeighbors=0.0;
+-        for(int oy=-1;oy<=1;++oy){
+-            for(int ox=-1;ox<=1;++ox){
+-                if(ox==0&&oy==0)continue;
+-                ivec2 q=p+ivec2(ox,oy);
+-                if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,packedSize)))continue;
+-                if(packedHasCensored(q))unresolvedNeighbors+=1.0;
+-                else if(packedHasShortValidated(q))connectedShortNeighbors+=1.0;
+-            }
+-        }
+-        float topologyGate=smoothstep(0.5,2.5,connectedShortNeighbors);
+-        float unresolvedGate=1.0-smoothstep(2.0,6.0,unresolvedNeighbors);
+-        float boundaryRisk=smoothstep(
+-                0.04,0.40,neighborhoodCensoredFraction(p));
+-        float coherence=(1.0-0.85*boundaryRisk)*topologyGate*unresolvedGate;
+-        for(int q=0;q<4;++q){
+-            float state=mod(floor(code/phaseDivisor(q)),3.0);
+-            weight[q]=abs(state-2.0)<0.25?coherence:0.0;
+-        }
+-    }
+-    imageStore(outWeight,p,weight);
+-}
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,packedSize)))return;float code=texelFetch(highlightProvenance,p,0).r;vec4 w=vec4(0.0);for(int q=0;q<4;++q){float s=mod(floor(code/divv(q)),3.0);w[q]=abs(s-2.0)<0.25?1.0:0.0;}imageStore(outWeight,p,w);}
+diff --git a/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_support_diag_26509.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_support_diag_26509.glsl
+new file mode 100644
+index 0000000..d1359e0
+--- /dev/null
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/mfsr_support_diag_26509.glsl
+@@ -0,0 +1,6 @@
++#define LAYOUT //
++LAYOUT
++precision highp float;precision highp int;uniform highp sampler2D semanticAccumulator;uniform highp sampler2D opponentWeightAccumulator;uniform ivec2 rawSize;layout(std430,binding=6) buffer SupportDiagBuf{uint supportDiag[];};
++/* IRIS_26509_OPPONENT_SUPPORT_DIAGNOSTIC_OWNER: tiny sampled atomic summary only; never image math. */
++/* IRIS_26509_SAMPLED_SUPPORT_DIAGNOSTICS: 1/256 pixels; diagnostics cannot become a processing-time regression. */
++void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,rawSize)))return;if((p.x&15)!=0||(p.y&15)!=0)return;vec4 s=texelFetch(semanticAccumulator,p,0);vec2 o=texelFetch(opponentWeightAccumulator,p,0).rg;if(s.a<=1.0e-8)return;atomicAdd(supportDiag[0],1u);bool rz=o.r<=1.0e-8,bz=o.g<=1.0e-8,rl=o.r<0.15*s.a,bl=o.g<0.15*s.a;if(rz)atomicAdd(supportDiag[1],1u);if(bz)atomicAdd(supportDiag[2],1u);if(rz||bz)atomicAdd(supportDiag[3],1u);if(rl)atomicAdd(supportDiag[4],1u);if(bl)atomicAdd(supportDiag[5],1u);bool border=p.x<16||p.y<16||p.x>=rawSize.x-16||p.y>=rawSize.y-16;if(border){atomicAdd(supportDiag[6],1u);if(rz||bz)atomicAdd(supportDiag[7],1u);if(rl||bl)atomicAdd(supportDiag[8],1u);}else{atomicAdd(supportDiag[9],1u);if(rz||bz)atomicAdd(supportDiag[10],1u);if(rl||bl)atomicAdd(supportDiag[11],1u);}}
+diff --git a/successful26507/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl
+index f7317f7..8a2ca29 100644
+--- a/successful26507/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/shadow_aux_bayer_fuse.glsl
+@@ -33,6 +33,13 @@ uniform float maxShadowBlend;
+  * eligible only when actual exposure-energy gain beats its local temporal support,
+  * so the auxiliary is used only where it predicts a physical shadow-SNR benefit.
+  */
++/* IRIS_26509_LONG_RETAINS_ISOLATED_SHADOW_ONLY_OWNER
++ * Preserve the exact 26506 quad-coherent Long color authority and the 26507 MGC
++ * pre-gate. Only replace the hard flow-cancel switch with continuous uncertainty.
++ * Long may reach the shared semantic framebuffer only through the pre-existing
++ * 26507 quad-coherent shadowSemanticWeight mask. It never receives unrestricted
++ * Normal-style admission and never replaces the Normal geometry owner.
++ */
+ float sum4(vec4 v){return dot(v,vec4(1.0));}
+ float max4(vec4 v){return max(max(v.x,v.y),max(v.z,v.w));}
+ vec4 shadowSafe(vec4 v){return vec4(1.0)-step(vec4(shadowClipThreshold),v);}
+@@ -77,8 +84,7 @@ void main(){
+         return;
+     }
+     vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize); vec4 fs=texture(flowTexture,uv);
+-    float cancelled=step(0.5,fs.w);
+-    float flowConfidence=(1.0-cancelled)*exp(-80.0*max(fs.z,0.0));
++    float flowConfidence=(1.0-clamp(fs.w,0.0,1.0))*exp(-80.0*max(fs.z,0.0));
+     vec2 source=vec2(p)+vec2(0.5)+fs.xy;
+     if(source.x<0.0||source.y<0.0||source.x>=float(packedSize.x)||source.y>=float(packedSize.y)){
+         atomicAdd(shadowDiag[6],1u); imageStore(outCfa,p,merged);
+@@ -115,7 +121,11 @@ void main(){
+         blend=clamp(blend,0.0,maxShadowBlend);
+         outv[phase]=mix(merged[phase],shEq[phase],blend);
+         semanticPhaseWeight[phase]=blend;
+-        atomicAdd(shadowDiag[5],1u); atomicAdd(shadowDiag[16+phase],1u); any=true;
++        atomicAdd(shadowDiag[5],1u); atomicAdd(shadowDiag[16+phase],1u);
++        if(mergedSensor[phase]<deepShadowThreshold)atomicAdd(shadowDiag[20],1u);
++        else if(mergedSensor[phase]<deepShadowPackCeiling)atomicAdd(shadowDiag[21],1u);
++        else atomicAdd(shadowDiag[22],1u);
++        any=true;
+     }
+     if(any)atomicAdd(shadowDiag[13],1u);
+     imageStore(outCfa,p,max(outv,vec4(0.0)));
+diff --git a/successful26507/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl b/candidate26509/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+index 370bea9..ea3eaac 100644
+--- a/successful26507/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
++++ b/candidate26509/app/src/main/assets/shaders/motionv2/short_highlight_bayer_recover.glsl
+@@ -5,459 +5,140 @@ precision highp int;
+ precision highp image2D;
+ 
+ uniform highp sampler2D normalCfa;
+-/* IRIS_26498_V13_REFERENCE_CFA_CORRESPONDENCE_AUTHORITY */
+-uniform highp sampler2D referenceCfa;
++uniform highp sampler2D bridgeCfa;
+ uniform highp sampler2D shortCfa;
+-uniform highp sampler2D flowTexture;
++uniform highp sampler2D bridgeFlowTexture;
++uniform highp sampler2D composedFlowTexture;
+ layout(rgba32f, binding = 0) uniform highp writeonly image2D outCfa;
+ layout(r32f, binding = 1) uniform highp writeonly image2D outProvenance;
+-layout(std430, binding = 2) buffer ShortDiagBuf {
+-    uint shortDiag[];
+-};
++layout(std430, binding = 2) buffer ShortDiagBuf { uint shortDiag[]; };
+ uniform ivec2 packedSize;
+ uniform float referenceExposureScale;
++uniform float bridgeToNormalScale;
+ uniform float shortToNormalScale;
+ uniform float physicalClipThreshold;
+ uniform float shortClipThreshold;
+-uniform float minimumFlowConfidence;
+-
+-const float PROVENANCE_NORMAL = 0.0;
+-const float PROVENANCE_CENSORED = 1.0;
+-const float PROVENANCE_SHORT_VALIDATED = 2.0;
+-
+-const uint D_TOTAL_CLIPPED = 0u;
+-const uint D_SHORT_SAFE = 1u;
+-const uint D_SHORT_CLIPPED = 2u;
+-const uint D_FLOW_REJECT = 3u;
+-const uint D_CORR_REJECT = 4u;
+-const uint D_RADIOMETRY_REJECT = 5u;
+-const uint D_VALIDATED = 6u;
+-const uint D_STILL_CENSORED = 7u;
+-const uint D_BIN_LT50 = 8u;
+-const uint D_BIN_50_70 = 9u;
+-const uint D_BIN_70_85 = 10u;
+-const uint D_BIN_85_95 = 11u;
+-const uint D_BIN_95_CLIP = 12u;
+-const uint D_PHASE_TOTAL = 16u;
+-const uint D_PHASE_VALIDATED = 20u;
+-const uint D_PHASE_SHORT_CLIPPED = 24u;
+-const uint D_PHASE_FLOW_REJECT = 28u;
+-const uint D_PHASE_CORR_REJECT = 32u;
+-const uint D_PHASE_RADIOMETRY_REJECT = 36u;
+-const uint D_PHASE_STILL_CENSORED = 40u;
+-/* IRIS_26506_SHORT_A_PACK_COHERENCE_DIAGNOSTICS */
+-const uint D_PACK_SHORT_ANY = 44u;
+-const uint D_PACK_SHORT_MIXED_CENSORED = 45u;
+-const uint D_PACK_SHORT_FULLY_KNOWN = 46u;
+-
+-void addMask(uint totalIndex, uint phaseBase, vec4 mask) {
+-    for (int i = 0; i < 4; ++i) {
+-        if (mask[i] > 0.5) {
+-            atomicAdd(shortDiag[totalIndex], 1u);
+-            atomicAdd(shortDiag[phaseBase + uint(i)], 1u);
+-        }
+-    }
+-}
+-void addTotalOnly(uint index, vec4 mask) {
+-    for (int i = 0; i < 4; ++i) if (mask[i] > 0.5) atomicAdd(shortDiag[index], 1u);
+-}
+-void classifyShortSamples(vec4 shortCenter, vec4 clipMask) {
+-    for (int i = 0; i < 4; ++i) {
+-        if (clipMask[i] <= 0.5) continue;
+-        float v = shortCenter[i];
+-        if (v >= shortClipThreshold) continue;
+-        if (v < 0.50) atomicAdd(shortDiag[D_BIN_LT50], 1u);
+-        else if (v < 0.70) atomicAdd(shortDiag[D_BIN_50_70], 1u);
+-        else if (v < 0.85) atomicAdd(shortDiag[D_BIN_70_85], 1u);
+-        else if (v < 0.95) atomicAdd(shortDiag[D_BIN_85_95], 1u);
+-        else atomicAdd(shortDiag[D_BIN_95_CLIP], 1u);
+-    }
++uniform float minimumBridgeConfidence;
++uniform int bridgeAvailable;
++
++const float PROVENANCE_NORMAL=0.0;
++const float PROVENANCE_CENSORED=1.0;
++const float PROVENANCE_SHORT_CANDIDATE=2.0;
++const uint D_TOTAL_CLIPPED=0u;
++const uint D_SHORT_SAFE=1u;
++const uint D_SHORT_CLIPPED=2u;
++const uint D_NO_BRIDGE=3u;
++const uint D_BRIDGE_GEOMETRY_REJECT=4u;
++const uint D_RADIOMETRY_REJECT=5u;
++const uint D_RECOVERED=6u;
++const uint D_UNRECOVERABLE=7u;
++const uint D_MGC_REJECT=13u;
++const uint D_TOPOLOGY_REJECT=14u;
++const uint D_CANDIDATE=15u;
++const uint P_TOTAL=16u;
++const uint P_RECOVERED=20u;
++const uint P_SHORT_CLIPPED=24u;
++const uint P_NO_BRIDGE=28u;
++const uint P_BRIDGE_GEOMETRY=32u;
++const uint P_RADIOMETRY=36u;
++const uint P_UNRECOVERABLE=40u;
++const uint P_MGC_REJECT=44u;
++const uint P_TOPOLOGY_REJECT=48u;
++const uint P_CANDIDATE=52u;
++
++float sum4(vec4 v){return dot(v,vec4(1.0));}
++float encodePhaseStates(vec4 s){return dot(s,vec4(1.0,3.0,9.0,27.0));}
++void addMask(uint totalIndex,uint phaseBase,vec4 mask){
++    for(int i=0;i<4;++i)if(mask[i]>0.5){atomicAdd(shortDiag[totalIndex],1u);atomicAdd(shortDiag[phaseBase+uint(i)],1u);}
+ }
+-
+-float sum4(vec4 v) { return dot(v, vec4(1.0)); }
+-float encodePhaseStates(vec4 s) { return dot(s, vec4(1.0, 3.0, 9.0, 27.0)); }
+-
+-vec4 phaseSafeBilinear(vec2 packedCenter) {
+-    vec2 p = packedCenter - vec2(0.5);
+-    ivec2 lo = ivec2(floor(p));
+-    vec2 f = fract(p);
+-    ivec2 maxP = packedSize - ivec2(1);
+-    ivec2 p00 = clamp(lo, ivec2(0), maxP);
+-    ivec2 p10 = clamp(lo + ivec2(1,0), ivec2(0), maxP);
+-    ivec2 p01 = clamp(lo + ivec2(0,1), ivec2(0), maxP);
+-    ivec2 p11 = clamp(lo + ivec2(1,1), ivec2(0), maxP);
+-    vec4 a = texelFetch(shortCfa, p00, 0);
+-    vec4 b = texelFetch(shortCfa, p10, 0);
+-    vec4 c = texelFetch(shortCfa, p01, 0);
+-    vec4 d = texelFetch(shortCfa, p11, 0);
+-    return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
++void addTotalOnly(uint index,vec4 mask){for(int i=0;i<4;++i)if(mask[i]>0.5)atomicAdd(shortDiag[index],1u);}
++vec4 samplePhaseSafe(highp sampler2D tex,vec2 packedCenter){
++    vec2 p=packedCenter-vec2(0.5);ivec2 lo=ivec2(floor(p));vec2 f=fract(p);ivec2 mx=packedSize-ivec2(1);
++    ivec2 p00=clamp(lo,ivec2(0),mx),p10=clamp(lo+ivec2(1,0),ivec2(0),mx);
++    ivec2 p01=clamp(lo+ivec2(0,1),ivec2(0),mx),p11=clamp(lo+ivec2(1,1),ivec2(0),mx);
++    vec4 a=texelFetch(tex,p00,0),b=texelFetch(tex,p10,0),c=texelFetch(tex,p01,0),d=texelFetch(tex,p11,0);
++    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
+ }
+-vec4 shortSafe(vec4 v) { return vec4(1.0) - step(vec4(shortClipThreshold), v); }
+-vec4 normalSafe(vec4 v) { return vec4(1.0) - step(vec4(0.90), v); }
++vec4 shortSafe(vec4 v){return vec4(1.0)-step(vec4(shortClipThreshold),v);}
++void storeState(ivec2 p,vec4 cfa,vec4 state){imageStore(outCfa,p,cfa);imageStore(outProvenance,p,vec4(encodePhaseStates(state),0.0,0.0,0.0));}
+ 
+-/* IRIS_26497_SHORT_CORRESPONDENCE_REFINEMENT
+- * mfsr_flow_expand.w means interpolation was cancelled and the whole base tile
+- * vector was preserved. It does NOT mean the base vector is invalid. 26496
+- * incorrectly converted that safe fallback into zero highlight evidence.
+- *
+- * For clipped sites, refine the predicted short-frame correspondence locally on
+- * unsaturated physical CFA evidence. Structured regions require a unique best
+- * match. Smooth regions may be accepted only with tighter radiometric agreement,
+- * where a subpixel ambiguity cannot create an edge/color displacement.
++/* IRIS_26509_PHYSICAL_NORMAL_CLIP_AUTHORITY
++ * normalCfa is bound to the immutable physical reference CFA, never the temporally
++ * fused helper. Dividing by referenceExposureScale therefore reconstructs the
++ * actual Normal sensor-domain clipping decision before temporal averaging.
+  */
+-void evaluateCorrespondence(
+-        ivec2 p, vec2 source, out float meanRelativeError,
+-        out float structure, out float supportCount) {
+-    float errorSum = 0.0;
+-    supportCount = 0.0;
+-    float lumaMin = 1.0e20;
+-    float lumaMax = 0.0;
+-    float lumaSum = 0.0;
+-    float lumaCount = 0.0;
+-    ivec2 maxP = packedSize - ivec2(1);
+-    for (int oy = -2; oy <= 2; ++oy) {
+-        for (int ox = -2; ox <= 2; ++ox) {
+-            if (max(abs(ox), abs(oy)) != 2) continue;
+-            ivec2 q = p + ivec2(ox, oy);
+-            if (any(lessThan(q, ivec2(0))) || any(greaterThan(q, maxP))) continue;
+-            vec2 qs = source + vec2(float(ox), float(oy));
+-            if (qs.x < 0.0 || qs.y < 0.0 ||
+-                    qs.x >= float(packedSize.x) || qs.y >= float(packedSize.y)) continue;
+-            vec4 nSensor = texelFetch(referenceCfa, q, 0) /
+-                    max(referenceExposureScale, 1.0e-6);
+-            vec4 sRaw = phaseSafeBilinear(qs);
+-            vec4 mask = normalSafe(nSensor) * shortSafe(sRaw) *
+-                    step(vec4(0.010001), nSensor);
+-            float count = sum4(mask);
+-            if (count < 1.5) continue;
+-            vec4 sEquivalent = sRaw * shortToNormalScale;
+-            vec4 rel = abs(nSensor - sEquivalent) / max(nSensor, vec4(0.04));
+-            errorSum += dot(rel, mask);
+-            supportCount += count;
+-            float luma = dot(nSensor, vec4(0.25));
+-            lumaMin = min(lumaMin, luma);
+-            lumaMax = max(lumaMax, luma);
+-            lumaSum += luma;
+-            lumaCount += 1.0;
+-        }
+-    }
+-    meanRelativeError = supportCount > 0.0 ? errorSum / supportCount : 1.0e20;
+-    float lumaMean = lumaCount > 0.0 ? lumaSum / lumaCount : 0.0;
+-    structure = lumaCount >= 4.0
+-            ? (lumaMax - lumaMin) / max(lumaMean, 0.03)
+-            : 0.0;
+-}
+-
+-/* IRIS_26503_BOUNDARY_ANCHORED_SHORT_OBSERVABILITY
+- * Keep the proven 26502 radius-2 structured/smooth test as Tier 1.  The only
+- * new authority is a conservative Tier-2 fallback for the specific case where
+- * Tier 1 has too little unsaturated reference support to decide at all.
+- *
+- * Tier 2 never overrides a local mismatch/ambiguity.  It samples sparse, wider
+- * reference-owned anchors at the already-predicted Wronski displacement, requires
+- * strong flow coherence, multi-direction support including an opposing pair,
+- * tight exposure-normalized radiometry, and zero strong contradictory anchors.
+- * The clipped center still cannot certify itself and no new displacement search is
+- * invented.  If these conditions fail, output/provenance remain exactly 26502.
+- */
+-ivec2 boundaryDirectionOffset(int direction, int radius) {
+-    int halfRadius = max(radius / 2, 1);
+-    if (direction == 0) return ivec2(-radius, 0);
+-    if (direction == 1) return ivec2( radius, 0);
+-    if (direction == 2) return ivec2(0, -radius);
+-    if (direction == 3) return ivec2(0,  radius);
+-    if (direction == 4) return ivec2(-radius, -radius);
+-    if (direction == 5) return ivec2( radius,  radius);
+-    if (direction == 6) return ivec2( radius, -radius);
+-    if (direction == 7) return ivec2(-radius,  radius);
+-    if (direction == 8) return ivec2(-halfRadius, -radius);
+-    if (direction == 9) return ivec2( halfRadius,  radius);
+-    if (direction == 10) return ivec2( halfRadius, -radius);
+-    if (direction == 11) return ivec2(-halfRadius,  radius);
+-    if (direction == 12) return ivec2(-radius, -halfRadius);
+-    if (direction == 13) return ivec2( radius,  halfRadius);
+-    if (direction == 14) return ivec2( radius, -halfRadius);
+-    return ivec2(-radius, halfRadius);
+-}
+-
+-bool validateBoundaryAnchoredCorrespondence(
+-        ivec2 p, vec2 predicted, float flowConfidence,
+-        out float meanRelativeError, out float supportCount) {
+-    meanRelativeError = 1.0e20;
+-    supportCount = 0.0;
+-
+-    /* Wider authority is deliberately stricter than ordinary Short-A flow use. */
+-    if (flowConfidence < max(minimumFlowConfidence, 0.85)) return false;
+-
+-    /* If any center phases remain physically measurable, they are a direct guard
+-     * against shifting Short-A color across an object boundary.  Only non-clipped,
+-     * non-dark center phases participate; truly exhausted centers are not guessed. */
+-    vec4 centerNormal = texelFetch(normalCfa, p, 0) /
+-            max(referenceExposureScale, 1.0e-6);
+-    vec4 centerClipMask = step(vec4(physicalClipThreshold), centerNormal);
+-    vec4 centerShort = phaseSafeBilinear(predicted);
+-    vec4 centerUsable = (vec4(1.0) - centerClipMask) * normalSafe(centerNormal) *
+-            shortSafe(centerShort) * step(vec4(0.010001), centerNormal);
+-    float centerCount = sum4(centerUsable);
+-    if (centerCount > 0.5) {
+-        vec4 centerEquivalent = centerShort * shortToNormalScale;
+-        vec4 centerRel = abs(centerNormal - centerEquivalent) /
+-                max(centerNormal, vec4(0.04));
+-        float centerError = dot(centerRel, centerUsable) / centerCount;
+-        if (centerError > 0.070) return false;
+-    }
+-
+-    float errorSum = 0.0;
+-    float acceptedAnchors = 0.0;
+-    float strongConflicts = 0.0;
+-    float seen0 = 0.0, seen1 = 0.0, seen2 = 0.0, seen3 = 0.0;
+-    float seen4 = 0.0, seen5 = 0.0, seen6 = 0.0, seen7 = 0.0;
+-    float seen8 = 0.0, seen9 = 0.0, seen10 = 0.0, seen11 = 0.0;
+-    float seen12 = 0.0, seen13 = 0.0, seen14 = 0.0, seen15 = 0.0;
+-    ivec2 maxP = packedSize - ivec2(1);
+-
+-    /* Search outward independently on sixteen spokes.  The FIRST observable
+-     * unsaturated anchor on a spoke owns that spoke; we never skip nearby
+-     * contradictory/ambiguous evidence to borrow agreement from a farther object.
+-     * The half-axis spokes catch sub-radius color/edge displacement that eight
+-     * cardinal/diagonal anchors alone can miss.  4/8/16/32/64 packed pixels reach
+-     * 8..128 native RAW pixels while evaluating at most eighty sparse anchors. */
+-    for (int direction = 0; direction < 16; ++direction) {
+-        for (int ring = 0; ring < 5; ++ring) {
+-            int radius = ring == 0 ? 4 : (ring == 1 ? 8 :
+-                    (ring == 2 ? 16 : (ring == 3 ? 32 : 64)));
+-            ivec2 offset = boundaryDirectionOffset(direction, radius);
+-            ivec2 q = p + offset;
+-            if (any(lessThan(q, ivec2(0))) || any(greaterThan(q, maxP))) continue;
+-            vec2 qs = predicted + vec2(float(offset.x), float(offset.y));
+-            if (qs.x < 0.0 || qs.y < 0.0 ||
+-                    qs.x >= float(packedSize.x) || qs.y >= float(packedSize.y)) continue;
+-
+-            vec4 nSensor = texelFetch(referenceCfa, q, 0) /
+-                    max(referenceExposureScale, 1.0e-6);
+-            vec4 sRaw = phaseSafeBilinear(qs);
+-            vec4 mask = normalSafe(nSensor) * shortSafe(sRaw) *
+-                    step(vec4(0.010001), nSensor);
+-            float count = sum4(mask);
+-            if (count < 1.5) continue;
+-
+-            vec4 sEquivalent = sRaw * shortToNormalScale;
+-            vec4 rel = abs(nSensor - sEquivalent) / max(nSensor, vec4(0.04));
+-            float anchorError = dot(rel, mask) / count;
+-
+-            /* First observable boundary on this spoke is decisive. */
+-            if (anchorError > 0.12) {
+-                strongConflicts += 1.0;
+-                break;
+-            }
+-            if (anchorError <= 0.055) {
+-                acceptedAnchors += 1.0;
+-                supportCount += count;
+-                errorSum += anchorError * count;
+-                if (direction == 0) seen0 = 1.0;
+-                else if (direction == 1) seen1 = 1.0;
+-                else if (direction == 2) seen2 = 1.0;
+-                else if (direction == 3) seen3 = 1.0;
+-                else if (direction == 4) seen4 = 1.0;
+-                else if (direction == 5) seen5 = 1.0;
+-                else if (direction == 6) seen6 = 1.0;
+-                else if (direction == 7) seen7 = 1.0;
+-                else if (direction == 8) seen8 = 1.0;
+-                else if (direction == 9) seen9 = 1.0;
+-                else if (direction == 10) seen10 = 1.0;
+-                else if (direction == 11) seen11 = 1.0;
+-                else if (direction == 12) seen12 = 1.0;
+-                else if (direction == 13) seen13 = 1.0;
+-                else if (direction == 14) seen14 = 1.0;
+-                else seen15 = 1.0;
+-            }
+-            /* 0.055..0.12 is ambiguous: do not accept and do not look past it. */
+-            break;
+-        }
+-    }
+-
+-    if (supportCount > 0.0) meanRelativeError = errorSum / supportCount;
+-    float directionCount = seen0 + seen1 + seen2 + seen3 + seen4 + seen5 +
+-            seen6 + seen7 + seen8 + seen9 + seen10 + seen11 + seen12 +
+-            seen13 + seen14 + seen15;
+-    float opposingPairs =
+-            (seen0 * seen1 > 0.5 ? 1.0 : 0.0) +
+-            (seen2 * seen3 > 0.5 ? 1.0 : 0.0) +
+-            (seen4 * seen5 > 0.5 ? 1.0 : 0.0) +
+-            (seen6 * seen7 > 0.5 ? 1.0 : 0.0) +
+-            (seen8 * seen9 > 0.5 ? 1.0 : 0.0) +
+-            (seen10 * seen11 > 0.5 ? 1.0 : 0.0) +
+-            (seen12 * seen13 > 0.5 ? 1.0 : 0.0) +
+-            (seen14 * seen15 > 0.5 ? 1.0 : 0.0);
+-
+-    /* All-four-phase clipping has no surviving center color guard, so demand a
+-     * wider geometric proof than partial clipping.  Partial clipping keeps its
+-     * measured normal phases and therefore needs fewer boundary spokes. */
+-    bool allCenterPhasesClipped = sum4(centerClipMask) > 3.5;
+-    float requiredDirections = allCenterPhasesClipped ? 6.0 : 4.0;
+-    float requiredPairs = allCenterPhasesClipped ? 2.0 : 1.0;
+-    float requiredSupport = allCenterPhasesClipped ? 18.0 : 12.0;
+-
+-    return strongConflicts < 0.5 &&
+-            acceptedAnchors >= requiredDirections &&
+-            directionCount >= requiredDirections && opposingPairs >= requiredPairs &&
+-            supportCount >= requiredSupport && meanRelativeError <= 0.045;
+-}
+-
+-bool refineObservableCorrespondence(
+-        ivec2 p, vec2 predicted, float flowConfidence, out vec2 refined,
+-        out float bestError, out float structure, out float supportCount) {
+-    bestError = 1.0e20;
+-    float secondError = 1.0e20;
+-    refined = predicted;
+-    structure = 0.0;
+-    supportCount = 0.0;
+-    bool found = false;
+-    for (int sy = -1; sy <= 1; ++sy) {
+-        for (int sx = -1; sx <= 1; ++sx) {
+-            vec2 candidate = predicted + 0.5 * vec2(float(sx), float(sy));
+-            if (candidate.x < 0.0 || candidate.y < 0.0 ||
+-                    candidate.x >= float(packedSize.x) ||
+-                    candidate.y >= float(packedSize.y)) continue;
+-            float e, s, n;
+-            evaluateCorrespondence(p, candidate, e, s, n);
+-            if (n < 12.0) continue;
+-            found = true;
+-            if (e < bestError) {
+-                secondError = bestError;
+-                bestError = e;
+-                refined = candidate;
+-                structure = s;
+-                supportCount = n;
+-            } else if (e < secondError) {
+-                secondError = e;
+-            }
+-        }
+-    }
+-
+-    if (found) {
+-        /* Exact 26502 Tier-1 decision.  A sufficient local observation that
+-         * disagrees or is ambiguous is final: Tier 2 is forbidden to override it. */
+-        if (structure >= 0.08) {
+-            float margin = secondError - bestError;
+-            bool exceptionallyGood = bestError <= 0.055;
+-            return bestError <= 0.12 && (exceptionallyGood || margin >= 0.010);
+-        }
+-        return supportCount >= 16.0 && bestError <= 0.060;
+-    }
+-
+-    /* No Tier-1 candidate had even 12 usable physical phase samples.  Only this
+-     * insufficient-observability state is eligible for boundary-anchored proof. */
+-    refined = predicted;
+-    structure = 0.0;
+-    return validateBoundaryAnchoredCorrespondence(
+-            p, predicted, flowConfidence, bestError, supportCount);
+-}
+-
+-void storeState(ivec2 p, vec4 cfa, vec4 state) {
+-    imageStore(outCfa, p, cfa);
+-    imageStore(outProvenance, p, vec4(encodePhaseStates(state), 0.0, 0.0, 0.0));
+-}
+-
+-/* IRIS_26497_PHYSICAL_SHORT_VALIDATION
+- * NORMAL remains measured. SHORT_VALIDATED is granted only after unsaturated
+- * short evidence survives corrected flow semantics, local correspondence
+- * refinement, and the existing physical radiometry check. CENSORED remains
+- * explicitly unknown rather than being promoted by downstream color heuristics.
++/* IRIS_26509_SHORT_TO_NEAREST_NORMAL_BRIDGE_AUTHORITY
++ * The old 26497 direct reference-ring support-count / best-vs-second-best proof is
++ * intentionally gone. Wronski supplies reference->bridge and bridge->Short flow;
++ * this shader only checks that composed geometry is finite/coherent and, where a
++ * bridge phase is physically observable, that exposure-normalized bridge and Short
++ * agree. A fully clipped bridge center is not rejected merely for lacking normal
++ * reference pixels. The bridge is geometry-only and is never copied into output.
+  */
+-void main() {
+-    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+-    if (any(greaterThanEqual(p, packedSize))) return;
+-    vec4 normal = texelFetch(normalCfa, p, 0);
+-    vec4 normalSensor = normal / max(referenceExposureScale, 1.0e-6);
+-    vec4 clipMask = step(vec4(physicalClipThreshold), normalSensor);
+-    if (sum4(clipMask) < 0.5) {
+-        storeState(p, normal, vec4(PROVENANCE_NORMAL));
+-        return;
+-    }
+-    addMask(D_TOTAL_CLIPPED, D_PHASE_TOTAL, clipMask);
+-
+-    vec2 uv = (vec2(p) + vec2(0.5)) / vec2(packedSize);
+-    vec4 flowState = texture(flowTexture, uv);
+-    float variation = max(flowState.z, 0.0);
+-    /* flowState.w is interpolation-cancel/base-vector-preserved, not invalid. */
+-    float flowConfidence = exp(-80.0 * variation);
+-    vec2 predicted = vec2(p) + vec2(0.5) + flowState.xy;
+-    if (flowConfidence < minimumFlowConfidence) {
+-        addMask(D_FLOW_REJECT, D_PHASE_FLOW_REJECT, clipMask);
+-        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+-        storeState(p, normal, clipMask);
+-        return;
+-    }
+-
+-    vec2 source;
+-    float meanError;
+-    float structure;
+-    float supportCount;
+-    if (!refineObservableCorrespondence(
+-            p, predicted, flowConfidence, source, meanError, structure, supportCount)) {
+-        addMask(D_CORR_REJECT, D_PHASE_CORR_REJECT, clipMask);
+-        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+-        storeState(p, normal, clipMask);
+-        return;
+-    }
+-
+-    vec4 shortCenter = phaseSafeBilinear(source);
+-    vec4 recoverMask = clipMask * shortSafe(shortCenter);
+-    vec4 shortClippedMask = clipMask - recoverMask;
+-    addTotalOnly(D_SHORT_SAFE, recoverMask);
+-    addMask(D_SHORT_CLIPPED, D_PHASE_SHORT_CLIPPED, shortClippedMask);
+-    classifyShortSamples(shortCenter, clipMask);
+-    if (sum4(recoverMask) < 0.5) {
+-        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+-        storeState(p, normal, clipMask);
+-        return;
+-    }
+-
+-    vec4 shortEquivalent = shortCenter * shortToNormalScale * referenceExposureScale;
+-    float requiredScale = 1.0;
+-    for (int i = 0; i < 4; ++i) {
+-        if (recoverMask[i] > 0.5) {
+-            requiredScale = max(requiredScale,
+-                    normal[i] / max(shortEquivalent[i], 1.0e-6));
++/* IRIS_26509_BRIDGE_GEOMETRY_ONLY_NEVER_CONTRIBUTES_RGB */
++void main(){
++    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,packedSize)))return;
++    vec4 normal=texelFetch(normalCfa,p,0);
++    vec4 normalSensor=normal/max(referenceExposureScale,1.0e-6);
++    vec4 clipMask=step(vec4(physicalClipThreshold),normalSensor);
++    if(sum4(clipMask)<0.5){storeState(p,normal,vec4(PROVENANCE_NORMAL));return;}
++    addMask(D_TOTAL_CLIPPED,P_TOTAL,clipMask);
++    if(bridgeAvailable==0){
++        addMask(D_NO_BRIDGE,P_NO_BRIDGE,clipMask);
++        addMask(D_UNRECOVERABLE,P_UNRECOVERABLE,clipMask);
++        storeState(p,normal,clipMask);return;
++    }
++    vec2 uv=(vec2(p)+vec2(0.5))/vec2(packedSize);
++    vec4 rb=texture(bridgeFlowTexture,uv);
++    vec4 rs=texture(composedFlowTexture,uv);
++    vec2 bridgeCenter=vec2(p)+vec2(0.5)+rb.xy;
++    vec2 shortCenter=vec2(p)+vec2(0.5)+rs.xy;
++    bool finiteGeometry=all(lessThan(abs(vec4(rb.xy,rs.xy)),vec4(65504.0)));
++    bool inBounds=bridgeCenter.x>=0.0&&bridgeCenter.y>=0.0&&shortCenter.x>=0.0&&shortCenter.y>=0.0
++            &&bridgeCenter.x<float(packedSize.x)&&bridgeCenter.y<float(packedSize.y)
++            &&shortCenter.x<float(packedSize.x)&&shortCenter.y<float(packedSize.y);
++    float geometryUncertainty=max(clamp(rb.w,0.0,1.0),clamp(rs.w,0.0,1.0));
++    float flowConfidence=(1.0-geometryUncertainty)*exp(-80.0*max(max(rb.z,0.0),max(rs.z,0.0)));
++    if(!finiteGeometry||!inBounds||flowConfidence<minimumBridgeConfidence){
++        addMask(D_BRIDGE_GEOMETRY_REJECT,P_BRIDGE_GEOMETRY,clipMask);
++        storeState(p,normal,clipMask);return;
++    }
++    vec4 bridgePhysical=samplePhaseSafe(bridgeCfa,bridgeCenter);
++    vec4 shortPhysical=samplePhaseSafe(shortCfa,shortCenter);
++    vec4 recoverMask=clipMask*shortSafe(shortPhysical);
++    vec4 shortClippedMask=clipMask-recoverMask;
++    addTotalOnly(D_SHORT_SAFE,recoverMask);
++    addMask(D_SHORT_CLIPPED,P_SHORT_CLIPPED,shortClippedMask);
++    if(sum4(recoverMask)<0.5){storeState(p,normal,clipMask);return;}
++
++    vec4 bridgeEquivalent=bridgePhysical*bridgeToNormalScale*referenceExposureScale;
++    vec4 shortEquivalent=shortPhysical*shortToNormalScale*referenceExposureScale;
++    vec4 bridgeObservable=(vec4(1.0)-step(vec4(0.90),bridgePhysical))*shortSafe(shortPhysical)
++            *step(vec4(0.010001),bridgePhysical);
++    float observable=sum4(bridgeObservable);
++    if(observable>0.5){
++        vec4 rel=abs(bridgeEquivalent-shortEquivalent)/max(bridgeEquivalent,vec4(0.04));
++        float meanRel=dot(rel,bridgeObservable)/observable;
++        if(meanRel>0.20){
++            addMask(D_BRIDGE_GEOMETRY_REJECT,P_BRIDGE_GEOMETRY,recoverMask);
++            storeState(p,normal,clipMask);return;
+         }
+     }
+-    if (requiredScale > 1.25) {
+-        addMask(D_RADIOMETRY_REJECT, D_PHASE_RADIOMETRY_REJECT, recoverMask);
+-        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, clipMask);
+-        storeState(p, normal, clipMask);
+-        return;
+-    }
+-    shortEquivalent *= requiredScale;
+ 
+-    vec4 recovered = normal;
+-    vec4 state = clipMask;
+-    for (int i = 0; i < 4; ++i) {
+-        if (recoverMask[i] > 0.5) {
+-            float blend = smoothstep(physicalClipThreshold, 1.0, normalSensor[i]);
+-            recovered[i] = mix(normal[i], shortEquivalent[i], blend);
+-            state[i] = PROVENANCE_SHORT_VALIDATED;
+-        }
+-    }
+-    addMask(D_VALIDATED, D_PHASE_VALIDATED, recoverMask);
+-    /* IRIS_26506_SHORT_A_PACK_COHERENCE_DIAGNOSTICS
+-     * Track whether recovered Short-A color forms a fully measured quad or a
+-     * mixed SHORT_VALIDATED/CENSORED boundary. Image math is unchanged here;
+-     * the semantic-weight shader below consumes this provenance spatially.
+-     */
+-    float validatedCount=0.0;
+-    float censoredCount=0.0;
+-    for(int i=0;i<4;++i){
+-        if(abs(state[i]-PROVENANCE_SHORT_VALIDATED)<0.25)validatedCount+=1.0;
+-        if(abs(state[i]-PROVENANCE_CENSORED)<0.25)censoredCount+=1.0;
+-    }
+-    if(validatedCount>0.5){
+-        atomicAdd(shortDiag[D_PACK_SHORT_ANY],1u);
+-        if(censoredCount>0.5)atomicAdd(shortDiag[D_PACK_SHORT_MIXED_CENSORED],1u);
+-        else atomicAdd(shortDiag[D_PACK_SHORT_FULLY_KNOWN],1u);
++    float requiredScale=1.0;
++    for(int i=0;i<4;++i)if(recoverMask[i]>0.5)
++        requiredScale=max(requiredScale,normal[i]/max(shortEquivalent[i],1.0e-6));
++    if(requiredScale>1.25){
++        addMask(D_RADIOMETRY_REJECT,P_RADIOMETRY,recoverMask);
++        storeState(p,normal,clipMask);return;
+     }
+-    if (sum4(shortClippedMask) > 0.5) {
+-        addMask(D_STILL_CENSORED, D_PHASE_STILL_CENSORED, shortClippedMask);
++    shortEquivalent*=requiredScale;
++    vec4 candidate=normal;vec4 state=clipMask;
++    for(int i=0;i<4;++i)if(recoverMask[i]>0.5){
++        float blend=smoothstep(physicalClipThreshold,1.0,normalSensor[i]);
++        candidate[i]=mix(normal[i],shortEquivalent[i],blend);
++        state[i]=PROVENANCE_SHORT_CANDIDATE;
+     }
+-    storeState(p, recovered, state);
++    addMask(D_CANDIDATE,P_CANDIDATE,recoverMask);
++    storeState(p,candidate,state);
+ }
+diff --git a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index afb3ab0..ae12efb 100644
+--- a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -324,6 +324,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private int mMotionV2AeAppliedSteps = Integer.MIN_VALUE;
+     private long mMotionV2AeLastUpdateMs = 0L;
+ 
++    /* IRIS_26509_STABLE_RAW_SIGNAL_NORMAL_EXPOSURE_INTEGRATOR
++     * HAL AE remains the live exposure engine. This state is only a slow,
++     * hysteretic scene-bias integrator. CaptureRequest SENSOR_* keys are not
++     * treated as target sensor values while AE is ON.
++     */
++    private float mMotion26509NormalStarvationEma = Float.NaN;
++    private int mMotion26509AeCandidateDirection = 0;
++    private int mMotion26509AeCandidateFrames = 0;
++    private static final int MOTION_26509_AE_CONFIRM_FRAMES = 8;
++    private static final long MOTION_26509_AE_MIN_UPDATE_MS = 850L;
++    private static final float MOTION_26509_AE_MAX_EXTRA_EV = 2.25f;
++    private static final float MOTION_26509_AE_SLEW_EV = 0.50f;
++
+     private long mMotionDiagnosticShotId = 0L;
+ 
+     // Responsive hybrid ZSL: wait briefly for the passive rolling ring to
+@@ -417,6 +430,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     img.close();
+                     return;
+                 }
++                boolean iris26509BridgeCandidateCopied = stageMotion26509NormalGeometryBridge(iris26489ShortTicket, img);
++                if (iris26509BridgeCandidateCopied) Log.d(TAG,"IRIS_26509_BRIDGE_SURVIVED_CAPTURE_EARLY_CLOSE timestamp="+img.getTimestamp());
+                 if (mZslCapturing && !mMotionTopUpActive) {
+                     if (iris26489ShortCandidateCopied) {
+                         Log.d(TAG, "IRIS_26489_SHORT_RAW_SURVIVED_EARLY_CLOSE timestamp="
+@@ -698,7 +713,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                  * the live preview authority. V2 still uses actual RAW/result
+                  * metadata for capture processing and JPEG normalization.
+                  */
+-                /* updateMotionV2ExposureAuthority(result); intentionally dormant */
++                /* IRIS_26509_STABLE_RAW_EXPOSURE_AUTHORITY_ACTIVE */
++                updateMotionV2ExposureAuthority(result);
+                 /* IRIS_26386_STABLE_HAL_AE_AUTHORITY */
+                 // Asynchronous RAW evidence is diagnostic only; HAL AE owns live preview.
+                 // updateMotion26368AdaptiveAeBias(result);
+@@ -1653,6 +1669,17 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * derived from actual RAW starvation, highlight safety, and the existing
+      * focal/motion-aware shutter opportunity. No AE-off/manual shutter toggling.
+      */
++    /* IRIS_26509_NORMAL_RAW_SIGNAL_EXPOSURE_AUTHORITY
++     * Root correction for the dark-Normal / bright-highlight conflict:
++     * - HAL AE stays ON (no manual preview shutter ladder).
++     * - Short owns clipped-highlight evidence.
++     * - Normal exposure receives only a slowly integrated positive AE bias when
++     *   the live physical RAW itself is broadly photon-starved.
++     * - A wide hysteresis band holds the current bias, avoiding the 26412
++     *   brighten/darken feedback oscillation.
++     * - CaptureRequest SENSOR_EXPOSURE_TIME/SENSITIVITY are diagnostics only
++     *   while CONTROL_AE_MODE is ON; they are never used as an exposure target.
++     */
+     private void updateMotionV2ExposureAuthority(
+             @NonNull TotalCaptureResult result) {
+         if (!isZslMode() || mZslCapturing || burst || isProcessing
+@@ -1671,13 +1698,15 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+         android.util.Rational step=mCameraCharacteristics.get(
+                 CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+-        if(range==null || step==null || step.floatValue()<=0.0f) return;
++        if(range==null || step==null || range.getUpper()<=range.getLower()
++                || step.floatValue()<=0.0f) return;
+ 
+         Integer current=mPreviewRequestBuilder.get(
+                 CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
+         if(!mMotionV2AeBaseReady){
+             mMotionV2AeBaseSteps=current!=null?current:0;
+             mMotionV2AeBaseSteps=Math.max(range.getLower(),Math.min(range.getUpper(),mMotionV2AeBaseSteps));
++            mMotionV2AeAppliedSteps=current!=null?current:mMotionV2AeBaseSteps;
+             mMotionV2AeBaseReady=true;
+         }
+ 
+@@ -1689,44 +1718,92 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 && !Float.isNaN(mMotion26380RawMeanSignal);
+         if(!fresh) return;
+ 
+-        float floorNeed=motion26368Clamp01((mMotion26380RawFloorFraction-0.10f)/(0.58f-0.10f));
+-        float shadowNeed=motion26368Clamp01((mMotion26380RawShadowFraction-0.24f)/(0.78f-0.24f));
++        float floorNeed=motion26368Clamp01((mMotion26380RawFloorFraction-0.12f)/(0.58f-0.12f));
++        float shadowNeed=motion26368Clamp01((mMotion26380RawShadowFraction-0.28f)/(0.78f-0.28f));
+         float meanNeed=1.0f-motion26368Clamp01((mMotion26380RawMeanSignal-0.035f)/(0.18f-0.035f));
+-        float rawNeed=Math.max(floorNeed,0.72f*shadowNeed)*(0.40f+0.60f*meanNeed);
++        float broadStarvation=Math.max(floorNeed,0.82f*shadowNeed)*(0.30f+0.70f*meanNeed);
++        if(Float.isNaN(mMotion26509NormalStarvationEma)) {
++            mMotion26509NormalStarvationEma=broadStarvation;
++        } else {
++            mMotion26509NormalStarvationEma=0.88f*mMotion26509NormalStarvationEma
++                    +0.12f*broadStarvation;
++        }
+ 
+-        float highlightSafety=1.0f-0.75f*motion26368Clamp01(
+-                (mMotion26380RawHighlightFraction-0.008f)/(0.10f-0.008f));
++        long highlightAge=ts-mMotion26496RecentHighlightEvidenceTimestampNs;
++        boolean shortHighlightAuthorityAvailable=highlightAge>=0L
++                && highlightAge<=MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS;
++        float broadClip=motion26368Clamp01((mMotion26380RawHighlightFraction-0.025f)/(0.12f-0.025f));
+         long shutterCeiling=iris26381MotionOpportunityCeilingNs(result);
+         float shutterOpportunity=motion26368Clamp01(
+                 (shutterCeiling-actualExposure)/(float)Math.max(1L,shutterCeiling));
+-        float requestedExtraEv=1.65f*rawNeed*highlightSafety*(0.45f+0.55f*shutterOpportunity);
+-        requestedExtraEv=Math.max(0.0f,requestedExtraEv);
+ 
+-        int extraSteps=Math.round(requestedExtraEv/step.floatValue());
+-        int target=Math.max(range.getLower(),Math.min(range.getUpper(),mMotionV2AeBaseSteps+extraSteps));
++        /* Hysteretic error, not an absolute target. The existing applied bias is
++         * retained while RAW evidence lives in the hold band. That is the key
++         * difference from 26412's self-cancelling absolute-bias controller. */
++        float highThreshold=0.34f;
++        float lowThreshold=0.16f;
++        int desiredDirection=0;
++        if(mMotion26509NormalStarvationEma>=highThreshold
++                && (shortHighlightAuthorityAvailable || broadClip<0.72f)
++                && shutterOpportunity>0.08f) {
++            desiredDirection=1;
++        } else if(mMotion26509NormalStarvationEma<=lowThreshold
++                || (!shortHighlightAuthorityAvailable && broadClip>=0.82f)) {
++            desiredDirection=-1;
++        }
++
++        if(desiredDirection==mMotion26509AeCandidateDirection) {
++            mMotion26509AeCandidateFrames++;
++        } else {
++            mMotion26509AeCandidateDirection=desiredDirection;
++            mMotion26509AeCandidateFrames=1;
++        }
++        if(desiredDirection==0 || mMotion26509AeCandidateFrames<MOTION_26509_AE_CONFIRM_FRAMES) return;
++
+         long now=android.os.SystemClock.elapsedRealtime();
+-        if(mMotionV2AeAppliedSteps!=Integer.MIN_VALUE
+-                && Math.abs(target-mMotionV2AeAppliedSteps)<1) return;
+-        if(now-mMotionV2AeLastUpdateMs<500L) return;
++        if(now-mMotionV2AeLastUpdateMs<MOTION_26509_AE_MIN_UPDATE_MS) return;
++
++        int applied=mMotionV2AeAppliedSteps==Integer.MIN_VALUE
++                ?mMotionV2AeBaseSteps:mMotionV2AeAppliedSteps;
++        int maxExtraSteps=Math.max(0,Math.round(MOTION_26509_AE_MAX_EXTRA_EV/step.floatValue()));
++        int slewSteps=Math.max(1,Math.round(MOTION_26509_AE_SLEW_EV/step.floatValue()));
++        int minTarget=mMotionV2AeBaseSteps;
++        int maxTarget=Math.min(range.getUpper(),mMotionV2AeBaseSteps+maxExtraSteps);
++        int target=applied+desiredDirection*slewSteps;
++        target=Math.max(minTarget,Math.min(maxTarget,target));
++        target=Math.max(range.getLower(),Math.min(range.getUpper(),target));
++        if(target==applied) {
++            mMotion26509AeCandidateFrames=0;
++            return;
++        }
+ 
+         try{
+             mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,target);
+             mMotionV2AeAppliedSteps=target;
+             mMotionV2AeLastUpdateMs=now;
++            mMotion26509AeCandidateFrames=0;
+             rebuildPreviewBuilder();
+-            Log.i(TAG,"IRIS_26412_V2_EXPOSURE_PLAN"
++            float appliedExtraEv=(target-mMotionV2AeBaseSteps)*step.floatValue();
++            Log.i(TAG,"IRIS_26509_NORMAL_EXPOSURE_BIAS"
+                     +" actualExposureNs="+actualExposure+" actualIso="+actualIso
+                     +" rawFloor="+mMotion26380RawFloorFraction
+                     +" rawShadow="+mMotion26380RawShadowFraction
+                     +" rawHighlight="+mMotion26380RawHighlightFraction
+                     +" rawMean="+mMotion26380RawMeanSignal
++                    +" starvation="+broadStarvation
++                    +" starvationEma="+mMotion26509NormalStarvationEma
++                    +" shortHighlightAuthority="+shortHighlightAuthorityAvailable
+                     +" shutterCeilingNs="+shutterCeiling
+-                    +" rawNeed="+rawNeed+" requestedExtraEv="+requestedExtraEv
+-                    +" compensationSteps="+target+" halAeRemainsOn=true");
++                    +" shutterOpportunity="+shutterOpportunity
++                    +" direction="+desiredDirection
++                    +" compensationSteps="+target
++                    +" appliedExtraEv="+appliedExtraEv
++                    +" halAeRemainsOn=true requestSensorKeysAreNotAeTargets=true");
+         }catch(IllegalArgumentException|IllegalStateException e){
+-            Log.w(TAG,"IRIS_26412 V2 exposure authority skipped: "+e.getClass().getSimpleName());
++            Log.w(TAG,"IRIS_26509 Normal exposure authority skipped: "+e.getClass().getSimpleName());
+         }
+     }
++
+     private void updateMotion26368AdaptiveAeBias(
+             @NonNull TotalCaptureResult result) {
+         if (PhotonCamera.getSettings().selectedMode != CameraMode.MOTION
+@@ -3490,6 +3567,93 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
++    /* IRIS_26509_CAPTURE_SIDE_GEOMETRY_BRIDGE
++     * Preserve a nearer normal-exposure RAW that would otherwise be closed while
++     * the intentional Short/Long requests are in flight. Exact Short and exact Long
++     * ownership are checked earlier in the RAW callback and therefore can never be
++     * reclassified as this bridge. Missing result metadata may be refreshed once at
++     * the immutable processing boundary; final host validation rejects it otherwise.
++     */
++    private boolean stageMotion26509NormalGeometryBridge(
++            Motion26486ShortTicket ticket, Image img) {
++        if (ticket == null || img == null || !ticket.requested
++                || ticket.slot == null || ticket.slot.geometryBridgeSlot.isSealed()
++                || ticket.iris26509GenerationId != mMotionUnifiedGeneration) return false;
++        final long ts = img.getTimestamp();
++        final long shortTimestamp = ticket.expectedTimestampNs();
++        /* IRIS_26509_BRIDGE_COPY_ONLY_IF_TIMESTAMP_CLOSER
++         * Do not full-RAW-copy speculative normals before Camera2 has given the
++         * exact Short timestamp. Once known, copy only a candidate that is closer
++         * than the currently owned bridge. This prevents bridge selection itself
++         * from becoming a capture-latency regression.
++         */
++        if (shortTimestamp <= 0L || ts == shortTimestamp) return false;
++        final long existingBridgeTimestamp = ticket.slot.geometryBridgeSlot.timestamp();
++        if (existingBridgeTimestamp > 0L
++                && Math.abs(ts - shortTimestamp) >= Math.abs(existingBridgeTimestamp - shortTimestamp)) return false;
++        Motion26505LongTicket longTicket = mMotion26505CaptureLongTicket;
++        if (longTicket != null) {
++            long longTimestamp = longTicket.expectedTimestampNs();
++            if (longTimestamp > 0L && ts == longTimestamp) return false;
++        }
++        TotalCaptureResult exact;
++        synchronized (mZslBufferLock) { exact = mZslResultMap.get(ts); }
++        if (exact != null) {
++            Long exp = exact.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++            Integer iso = exact.get(CaptureResult.SENSOR_SENSITIVITY);
++            double baseline = ExposureIndex.time2sec(mMotionUnifiedExposureNs)
++                    * Math.max(mMotionUnifiedIso, 0);
++            if (exp == null || exp <= 0L || iso == null || iso <= 0) return false;
++            double energy = ExposureIndex.time2sec(exp) * iso;
++            if (baseline > 0.0) {
++                double ratio = energy / baseline;
++                if (ratio < 0.72 || ratio > 1.38) return false;
++            }
++        }
++        ImageFrame copy;
++        try {
++            copy = copyMotion26505LongFrame(img, exact);
++        } catch (Throwable t) {
++            Log.w(TAG,"IRIS_26509_BRIDGE_COPY_SKIPPED timestamp="+ts
++                    +" reason="+t.getClass().getSimpleName());
++            return false;
++        }
++        if (copy == null) return false;
++        copy.motionV2FrameRole = ImageFrame.MotionV2FrameRole.NORMAL;
++        copy.motionV2ShortHighlightFrame = false;
++        boolean accepted = ticket.slot.geometryBridgeSlot.offerNearest(copy, shortTimestamp);
++        if (accepted) {
++            Log.d(TAG,"IRIS_26509_BRIDGE_CANDIDATE_STAGED"
++                    +" timestamp="+ts
++                    +" shortTimestampKnown="+(shortTimestamp>0L)
++                    +" exactMetadataNow="+(exact!=null)
++                    +" generation="+ticket.iris26509GenerationId
++                    +" geometryOnly=true pixelContributor=false");
++        }
++        return accepted;
++    }
++
++    private void freezeMotion26509GeometryBridgeMetadata(
++            MotionBatch.ShortHighlightSlot slot) {
++        if (slot == null) return;
++        ImageFrame bridge = slot.geometryBridgeSlot.peek();
++        if (bridge != null && (bridge.motionV2ActualExposureNs <= 0L
++                || bridge.motionV2ActualIso <= 0)) {
++            TotalCaptureResult exact;
++            synchronized (mZslBufferLock) { exact = mZslResultMap.get(bridge.timestamp); }
++            if (exact != null) populateMotion26480FrameMetadata(bridge, exact, false);
++        }
++        bridge = slot.geometryBridgeSlot.peek();
++        slot.geometryBridgeSlot.seal();
++        Log.i(TAG,"IRIS_26509_FROZEN_GEOMETRY_BRIDGE"
++                +" present="+(bridge!=null)
++                +" timestamp="+(bridge==null?0L:bridge.timestamp)
++                +" actualExposureNs="+(bridge==null?0L:bridge.motionV2ActualExposureNs)
++                +" actualIso="+(bridge==null?0:bridge.motionV2ActualIso)
++                +" role="+(bridge==null?"NONE":bridge.motionV2FrameRole)
++                +" immutable=true geometryOnly=true pixelContributor=false shutterWait=false");
++    }
++
+     /* IRIS_26486_NONBLOCKING_SHORT_HIGHLIGHT_TICKET
+      * A short RAW is an optional asynchronous observation. It never gates the
+      * normal shutter and its callback state belongs to one Motion generation.
+@@ -4157,6 +4321,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             while ((frame = stagedRaw.pollFirst()) != null) frame.close();
+         }
+         synchronized int stagedCount() { return stagedRaw.size(); }
++        volatile long iris26509GenerationId = -1L;
+         volatile boolean requested = false;
+         volatile boolean completed = false;
+         volatile long captureStartedTimestampNs = 0L;
+@@ -4332,6 +4497,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             clearMotion26505LongTicket(iris26505PreviousLongTicket, "new_generation");
+         }
+         final Motion26486ShortTicket iris26486ShortTicket = new Motion26486ShortTicket();
++        iris26486ShortTicket.iris26509GenerationId = mMotionUnifiedGeneration;
+         mMotion26486CaptureShortTicket = iris26486ShortTicket;
+         final boolean iris26480ShortHighlightRequested =
+                 applyMotion26486ExplicitShortCaptureIfNeeded(iris26486ShortTicket);
+@@ -5578,6 +5744,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         long iris26507FreezeStartNs=System.nanoTime();
+         iris26486ShortSlot.freezeExpectedAuxiliaries(
+                 iris26507ShortExpected, iris26507LongExpected, 80L);
++        freezeMotion26509GeometryBridgeMetadata(iris26486ShortSlot);
+         long iris26507FreezeMs=(System.nanoTime()-iris26507FreezeStartNs)/1_000_000L;
+         Log.i(TAG,"IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY"
+                 +" shortExpected="+iris26507ShortExpected
+diff --git a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/MotionBatch.java b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/MotionBatch.java
+index bbc28f9..686833b 100644
+--- a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/MotionBatch.java
++++ b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/MotionBatch.java
+@@ -22,6 +22,62 @@ public final class MotionBatch {
+      * A distinct one-shot owner for one brighter pre-shutter RAW. It is not the
+      * Short-A slot and never appears in MotionBatch.frames.
+      */
++    /* IRIS_26509_NEAREST_NORMAL_GEOMETRY_BRIDGE_OWNER
++     * One copied NORMAL RAW may survive the capture-time early-close solely as a
++     * geometry bridge for Short-A. It is never inserted into MotionBatch.frames and
++     * never becomes a pixel/RGB contributor. Before Short timestamp identity exists,
++     * newest wins; afterwards the closest timestamp wins deterministically.
++     */
++    public static final class GeometryBridgeSlot {
++        private ImageFrame frame;
++        private boolean sealed = false;
++        public synchronized boolean offerNearest(ImageFrame candidate,long shortTimestampNs) {
++            if (candidate == null) return false;
++            if (sealed || candidate.motionV2FrameRole != ImageFrame.MotionV2FrameRole.NORMAL) {
++                try { candidate.close(); } catch (Throwable ignored) {}
++                return false;
++            }
++            boolean replace = frame == null;
++            if (!replace) {
++                if (shortTimestampNs > 0L) {
++                    long oldDistance = Math.abs(frame.timestamp - shortTimestampNs);
++                    long newDistance = Math.abs(candidate.timestamp - shortTimestampNs);
++                    replace = newDistance < oldDistance
++                            || (newDistance == oldDistance && candidate.timestamp > frame.timestamp);
++                } else {
++                    replace = candidate.timestamp > frame.timestamp;
++                }
++            }
++            if (!replace) {
++                try { candidate.close(); } catch (Throwable ignored) {}
++                return false;
++            }
++            if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
++            frame = candidate;
++            notifyAll();
++            return true;
++        }
++        public synchronized ImageFrame peek() { return frame; }
++        public synchronized boolean hasFrame() { return frame != null; }
++        public synchronized long timestamp() { return frame == null ? 0L : frame.timestamp; }
++        public synchronized void seal() { sealed = true; notifyAll(); }
++        public synchronized boolean isSealed() { return sealed; }
++        public synchronized ImageFrame takeAndSeal() {
++            sealed = true;
++            ImageFrame out = frame;
++            frame = null;
++            return out;
++        }
++        public synchronized void sealAndClose() {
++            sealed = true;
++            if (frame != null) {
++                try { frame.close(); } catch (Throwable ignored) {}
++                frame = null;
++            }
++            notifyAll();
++        }
++    }
++
+     public static final class ShadowAuxSlot {
+         private ImageFrame frame;
+         private boolean sealed = false;
+@@ -68,6 +124,7 @@ public final class MotionBatch {
+ 
+     public static final class ShortHighlightSlot {
+         public final ShadowAuxSlot shadowAuxSlot = new ShadowAuxSlot();
++        public final GeometryBridgeSlot geometryBridgeSlot = new GeometryBridgeSlot();
+         private ImageFrame frame;
+         private boolean sealed = false;
+         public synchronized boolean offer(ImageFrame candidate) {
+@@ -93,6 +150,7 @@ public final class MotionBatch {
+                 frame = null;
+             }
+             shadowAuxSlot.sealAndClose();
++            geometryBridgeSlot.sealAndClose();
+         }
+         /* IRIS_26507_IMMUTABLE_AUX_FREEZE */
+         private synchronized void awaitExpectedAndSeal(boolean expected,long deadlineNs) {
+diff --git a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index f39490b..0203e17 100644
+--- a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -698,6 +698,40 @@ public class HdrxProcessor extends ProcessorBase {
+             Log.d(TAG,"Error in processingEventsListener.onProcessingFinished:"+Log.getStackTraceString(e));
+         }
+         imageFile = Paths.get(imageFile.toAbsolutePath() + ".jpg");
++        /* IRIS_26509_ASYNC_JPEGR_OUTPUT_OWNER
++         * Motion image math is complete and the Bitmap/Gainmap are immutable here.
++         * Move 4:4:4 JPEG_R + EXIF + deferred DNG I/O to the existing serialized
++         * output executor, close the pipeline, then release capture immediately.
++         */
++        if(cameraMode==CameraMode.MOTION){
++            final Path iris26509ImagePath=imageFile;
++            final Bitmap iris26509Bitmap=img;
++            final ParseExif.ExifData iris26509Exif=exifData;
++            final ByteBuffer iris26509DngBytes=iris26480DeferredDng;
++            final Path iris26509DngPath=dngFile;
++            final Parameters iris26509DngParams=processingParameters;
++            iris26480DeferredDng=null;
++            final long iris26509QueuedNs=System.nanoTime();
++            MOTION_26480_OUTPUT_EXECUTOR.execute(()->{Integer oldPriority=null;boolean iris26509Saved=false;try{
++                int tid=android.os.Process.myTid();oldPriority=android.os.Process.getThreadPriority(tid);
++                android.os.Process.setThreadPriority(tid,android.os.Process.THREAD_PRIORITY_BACKGROUND);
++                iris26509Saved=ImageSaver.Util.saveBitmapAsJPGMotionV2(iris26509ImagePath,iris26509Bitmap,ImageSaver.JPG_QUALITY,iris26509Exif);
++                processingEventsListener.notifyImageSavedStatus(iris26509Saved,iris26509ImagePath);
++                if(iris26509DngBytes!=null){iris26509DngBytes.position(0);boolean dngSaved=ImageSaver.Util.saveStackedRaw(iris26509DngPath,iris26509DngBytes,iris26509DngParams);processingEventsListener.notifyImageSavedStatus(dngSaved,iris26509DngPath);}
++                Log.i(TAG,"IRIS_26509_ASYNC_JPEGR_OUTPUT_COMPLETE saved="+iris26509Saved+" queuedToSavedMs="+((System.nanoTime()-iris26509QueuedNs)/1000000L));
++            }catch(Exception e){
++                Log.e(TAG,"IRIS_26509_ASYNC_JPEGR_OUTPUT_FAILED "+Log.getStackTraceString(e));
++                try{processingEventsListener.notifyImageSavedStatus(false,iris26509ImagePath);}catch(Throwable ignored){}
++            }finally{
++                /* IRIS_26509_ASYNC_BITMAP_LIFETIME_OWNER: 26507 recycles only after successful encode. */
++                if(iris26509Bitmap!=null&&!iris26509Bitmap.isRecycled())try{iris26509Bitmap.recycle();}catch(Throwable ignored){}
++                if(iris26509DngBytes!=null)try{Allocator.free(iris26509DngBytes);}catch(Throwable ignored){}
++                if(oldPriority!=null)try{android.os.Process.setThreadPriority(android.os.Process.myTid(),oldPriority);}catch(Throwable ignored){}
++            }});
++            pipeline.close();Allocator.getMemoryCount();
++            Log.i(TAG,"IRIS_26509_CAPTURE_RELEASE_BEFORE_JPEGR_SAVE captureUnlockedAfterImmutableOutputTransfer=true");
++            callback.onFinished();return;
++        }
+         //Saves the final bitmap
+         final boolean imageSaved;
+         if (cameraMode == CameraMode.MOTION) {
+diff --git a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index d7002b0..7ef9056 100644
+--- a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -598,6 +598,11 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+         int iris26501RgbFramebuffer = 0;
+         int iris26501SemanticContributedFrames = 0;
+         int iris26501SemanticHdrContributedFrames = 0;
++        /* IRIS_26509_TRUTHFUL_GEOMETRY_DIAGNOSTIC_OWNER */
++        GLBuffer iris26509GeometryDiag=new GLBuffer(16,new GLFormat(GLFormat.DataType.UNSIGNED_32));
++        iris26509GeometryDiag.uploadBuffer(new int[16],16);
++        GLBuffer iris26509SupportDiag=new GLBuffer(16,new GLFormat(GLFormat.DataType.UNSIGNED_32));
++        iris26509SupportDiag.uploadBuffer(new int[16],16);
+         /*
+          * IRIS_26462_HAL_STANDARD_BAYER_WRONSKI_GUARD
+          * Published direct-RGB reconstruction is enabled only for standard
+@@ -1324,7 +1329,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             glProg.setVar("greenShot",iris26487GreenPhysicalNoise[0]);glProg.setVar("greenRead",iris26487GreenPhysicalNoise[1]);
+                             glProg.setTexture("physicalCfa",alterCfa);glProg.setTextureCompute("outUnblocker",iris26487UnblockerScratch,true);glProg.computeAutoDeferred(iris26487UnblockerSize,1);
+ 
+-                            glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_base",true);
++                            glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_base",true);glProg.setBufferCompute("GeometryDiagBuf",iris26509GeometryDiag);
+                             glProg.setVar("rawHalf",rawHalf);glProg.setVar("guideSize",iris26487GuideSize);
+                             glProg.setVar("referenceNoiseShot",new float[]{iris26487ReferenceWbNoise[0],iris26487ReferenceWbNoise[1],iris26487ReferenceWbNoise[2]});
+                             glProg.setVar("referenceNoiseRead",new float[]{iris26487ReferenceWbNoise[3],iris26487ReferenceWbNoise[4],iris26487ReferenceWbNoise[5]});
+@@ -1711,6 +1716,8 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             /* IRIS_26486_LATE_NONBLOCKING_SHORT_TAKE */
+             ImageFrame shortHighlightFrame = shortHighlightSlot == null
+                     ? null : shortHighlightSlot.takeAndSeal();
++            ImageFrame iris26509GeometryBridgeFrame = shortHighlightSlot == null
++                    ? null : shortHighlightSlot.geometryBridgeSlot.takeAndSeal();
+             Log.d(TAG, "IRIS_26490_SHORT_RECONSTRUCTION_BOUNDARY"
+                     + " present=" + (shortHighlightFrame != null)
+                     + " timestamp=" + (shortHighlightFrame == null ? -1L : shortHighlightFrame.timestamp)
+@@ -1725,6 +1732,12 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             GLTexture iris26501ShadowWeight=null,iris26501ShadowCov=null;
+             GLTexture iris26501ShortWeight=null,iris26501ShortCov=null;
+             MotionV2Alignment.Result irisV13ShadowAlignment=null; GLBuffer irisV13ShadowDiag=null;
++            /* IRIS_26509_AUX_MGC_LIFETIME_OWNER: dedicated post-normal-loop MGC resources are reused by isolated Long and corrected Short. */
++            GLTexture iris26509AuxGuide=null,iris26509AuxUnblocker=null,iris26509AuxRejectA=null,iris26509AuxRejectB=null,iris26509AuxRejectC=null;
++            GLTexture iris26509AuxSmallLuma=null,iris26509AuxSmallRaw=null,iris26509AuxSmallFiltered=null,iris26509AuxFinalWeight=null;
++            GLTexture iris26509BridgeRaw=null,iris26509BridgeCfa=null,iris26509BridgeWbCfa=null,iris26509ComposedFlow=null;
++            GLTexture iris26509ShortCandidateCfa=null,iris26509ShortCandidateProvenance=null,iris26509RegionA=null,iris26509RegionB=null;
++            MotionV2Alignment.Result iris26509ReferenceToBridgeAlignment=null,iris26509BridgeToShortAlignment=null;
+             long irisV13ShadowAlignDispatchMs=0L,irisV13ShadowFuseDispatchMs=0L;
+             /* IRIS_26496_SHORT_FAILURE_DIAGNOSTIC_OWNER
+              * Tiny 64-uint SSBO only; no full-frame diagnostic carrier. It is read after the
+@@ -1740,6 +1753,18 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             GLTexture iris26487DiagTexture = null;
+             GLTexture iris26488DenominatorDiagTexture = null;
+             try{
++                /* IRIS_26509_POST_NORMAL_AUX_MGC_LIFETIME_OWNER */
++                if(directBayer&&(irisV13ShadowAuxFrame!=null||shortHighlightFrame!=null)){
++                        if(iris26509AuxGuide==null)iris26509AuxGuide=new GLTexture(iris26487GuideSize,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxUnblocker==null)iris26509AuxUnblocker=new GLTexture(iris26487UnblockerSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxRejectA==null)iris26509AuxRejectA=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxRejectB==null)iris26509AuxRejectB=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxRejectC==null)iris26509AuxRejectC=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxSmallLuma==null)iris26509AuxSmallLuma=new GLTexture(iris26487RejectSmallSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxSmallRaw==null)iris26509AuxSmallRaw=new GLTexture(iris26487RejectSmallSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxSmallFiltered==null)iris26509AuxSmallFiltered=new GLTexture(iris26487RejectSmallSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxFinalWeight==null)iris26509AuxFinalWeight=new GLTexture(iris26487MergeWeightSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                }
+                 /* IRIS_26498_V13_SHADOW_AUX_REFERENCE_OWNED_ALIGNMENT
+                  * One pre-shutter auxiliary, never in the accumulator. It writes a separate packed
+                  * CFA only when local reference correspondence and a per-phase exposure/support SNR proof pass.
+@@ -1828,31 +1853,31 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.setVar("wbR",rr);glProg.setVar("wbB",bb);
+                         glProg.setVar("noiseShot",new float[]{iris26501ShadowWbNoise[0],iris26501ShadowWbNoise[1],iris26501ShadowWbNoise[2]});
+                         glProg.setVar("noiseRead",new float[]{iris26501ShadowWbNoise[3],iris26501ShadowWbNoise[4],iris26501ShadowWbNoise[5]});
+-                        glProg.setTexture("rawTexture",irisV13ShadowRaw);glProg.setTextureCompute("outputGuide",iris26487GuideScratch,true);glProg.computeAutoDeferred(iris26487GuideSize,1);
++                        glProg.setTexture("rawTexture",irisV13ShadowRaw);glProg.setTextureCompute("outputGuide",iris26509AuxGuide,true);glProg.computeAutoDeferred(iris26487GuideSize,1);
+                         glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_unblocker",true);
+                         glProg.setVar("rawHalf",rawHalf);glProg.setVar("unblockerSize",iris26487UnblockerSize);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setVar("physicalExposureScale",alignmentScale);
+                         glProg.setVar("greenShot",iris26507ShadowGreenPhysicalNoise[0]);glProg.setVar("greenRead",iris26507ShadowGreenPhysicalNoise[1]);
+-                        glProg.setTexture("physicalCfa",irisV13ShadowCfa);glProg.setTextureCompute("outUnblocker",iris26487UnblockerScratch,true);glProg.computeAutoDeferred(iris26487UnblockerSize,1);
+-                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_base",true);
++                        glProg.setTexture("physicalCfa",irisV13ShadowCfa);glProg.setTextureCompute("outUnblocker",iris26509AuxUnblocker,true);glProg.computeAutoDeferred(iris26487UnblockerSize,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_base",true);glProg.setBufferCompute("GeometryDiagBuf",iris26509GeometryDiag);
+                         glProg.setVar("rawHalf",rawHalf);glProg.setVar("guideSize",iris26487GuideSize);
+                         glProg.setVar("referenceNoiseShot",new float[]{iris26487ReferenceWbNoise[0],iris26487ReferenceWbNoise[1],iris26487ReferenceWbNoise[2]});
+                         glProg.setVar("referenceNoiseRead",new float[]{iris26487ReferenceWbNoise[3],iris26487ReferenceWbNoise[4],iris26487ReferenceWbNoise[5]});
+                         glProg.setVar("currentNoiseShot",new float[]{iris26501ShadowWbNoise[0],iris26501ShadowWbNoise[1],iris26501ShadowWbNoise[2]});
+                         glProg.setVar("currentNoiseRead",new float[]{iris26501ShadowWbNoise[3],iris26501ShadowWbNoise[4],iris26501ShadowWbNoise[5]});
+                         glProg.setVar("flowVariationThreshold",iris26507FlowVariationThreshold);
+-                        glProg.setTexture("referenceGuide",wronskiReferenceGuide);glProg.setTexture("currentGuide",iris26487GuideScratch);
+-                        glProg.setTexture("flowTexture",irisV13ShadowAlignment.flowTexture);glProg.setTexture("unblockerTexture",iris26487UnblockerScratch);
+-                        glProg.setTextureCompute("outReverseWeight",iris26487RejectFullA,true);glProg.setTextureCompute("outPixelDifference",iris26487RejectFullB,true);glProg.computeAutoDeferred(rawHalf,1);
+-                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_h",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26487RejectFullB);glProg.setTextureCompute("outEvidence",iris26487RejectFullC,true);glProg.computeAutoDeferred(rawHalf,1);
+-                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_v",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26487RejectFullC);glProg.setTextureCompute("outEvidence",iris26487RejectFullB,true);glProg.computeAutoDeferred(rawHalf,1);
+-                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_reduce4",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487RejectSmallSize);glProg.setTexture("referenceGray",iris26488ReferenceGray);glProg.setTexture("inputRejection",iris26487RejectFullA);glProg.setTextureCompute("outLuma",iris26487RejectSmallLuma,true);glProg.setTextureCompute("outRejection",iris26487RejectSmallRaw,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
+-                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_bilateral",true);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("inputLuma",iris26487RejectSmallLuma);glProg.setTexture("inputRejection",iris26487RejectSmallRaw);glProg.setTextureCompute("outFiltered",iris26487RejectSmallFiltered,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
+-                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_postprocess",true);glProg.setVar("fullSize",rawHalf);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("originalRejection",iris26487RejectFullA);glProg.setTexture("filteredRejection",iris26487RejectSmallFiltered);glProg.setTexture("pixelDifference",iris26487RejectFullB);glProg.setTextureCompute("outRejection",iris26487RejectFullC,true);glProg.computeAutoDeferred(rawHalf,1);
+-                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_dilate",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487MergeWeightSize);glProg.setTexture("inputRejection",iris26487RejectFullC);glProg.setTextureCompute("outWeight",iris26487FinalWeightScratch,true);glProg.computeAutoDeferred(iris26487MergeWeightSize,1);
++                        glProg.setTexture("referenceGuide",wronskiReferenceGuide);glProg.setTexture("currentGuide",iris26509AuxGuide);
++                        glProg.setTexture("flowTexture",irisV13ShadowAlignment.flowTexture);glProg.setTexture("unblockerTexture",iris26509AuxUnblocker);
++                        glProg.setTextureCompute("outReverseWeight",iris26509AuxRejectA,true);glProg.setTextureCompute("outPixelDifference",iris26509AuxRejectB,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_h",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26509AuxRejectB);glProg.setTextureCompute("outEvidence",iris26509AuxRejectC,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_v",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26509AuxRejectC);glProg.setTextureCompute("outEvidence",iris26509AuxRejectB,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_reduce4",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487RejectSmallSize);glProg.setTexture("referenceGray",iris26488ReferenceGray);glProg.setTexture("inputRejection",iris26509AuxRejectA);glProg.setTextureCompute("outLuma",iris26509AuxSmallLuma,true);glProg.setTextureCompute("outRejection",iris26509AuxSmallRaw,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_bilateral",true);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("inputLuma",iris26509AuxSmallLuma);glProg.setTexture("inputRejection",iris26509AuxSmallRaw);glProg.setTextureCompute("outFiltered",iris26509AuxSmallFiltered,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_postprocess",true);glProg.setVar("fullSize",rawHalf);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("originalRejection",iris26509AuxRejectA);glProg.setTexture("filteredRejection",iris26509AuxSmallFiltered);glProg.setTexture("pixelDifference",iris26509AuxRejectB);glProg.setTextureCompute("outRejection",iris26509AuxRejectC,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_dilate",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487MergeWeightSize);glProg.setTexture("inputRejection",iris26509AuxRejectC);glProg.setTextureCompute("outWeight",iris26509AuxFinalWeight,true);glProg.computeAutoDeferred(iris26487MergeWeightSize,1);
+                         iris26501ContributeRgbFrame(
+                                 glProg,iris26501RgbFramebuffer,raw,rawHalf,
+                                 irisV13ShadowRaw,iris26501ChromaGuideScratch,
+-                                irisV13ShadowAlignment.flowTexture,iris26487FinalWeightScratch,iris26501ShadowCov,
++                                irisV13ShadowAlignment.flowTexture,iris26509AuxFinalWeight,iris26501ShadowCov,
+                                 iris26501ShadowWeight,
+                                 (int)parameters.cfaPattern,shadowBlack,shadowWhite,alignmentScale,rr,bb,
+                                 iris26501ShadowWbNoise[1],iris26501ShadowWbNoise[4],
+@@ -1873,164 +1898,114 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         &&referenceFrame.motionV2ExposureEnergy>0.0&&shortHighlightFrame.motionV2ExposureEnergy>0.0
+                         &&shortHighlightFrame.motionV2ExposureEnergy<referenceFrame.motionV2ExposureEnergy
+                         &&wronskiPreparedAlignment!=null){
+-                    float shortToNormalScale=(float)Math.max(1.0,Math.min(8.0,
+-                            referenceFrame.motionV2ExposureEnergy/shortHighlightFrame.motionV2ExposureEnergy));
+-                    iris26480ShortRaw=new GLTexture(raw,new GLFormat(GLFormat.DataType.UNSIGNED_16,1),
+-                            shortHighlightFrame.buffer,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    float shortToNormalScale=(float)Math.max(1.0,Math.min(8.0,referenceFrame.motionV2ExposureEnergy/shortHighlightFrame.motionV2ExposureEnergy));
++                    iris26480ShortRaw=new GLTexture(raw,new GLFormat(GLFormat.DataType.UNSIGNED_16,1),shortHighlightFrame.buffer,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     iris26480ShortCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-                    float[] iris26490ShortBlack = shortHighlightFrame.motionV2BlackLevelValid
+-                            ? shortHighlightFrame.motionV2BlackLevel
+-                            : blackLevel;
+-                    float iris26490ShortWhite = shortHighlightFrame.motionV2WhiteLevelValid
+-                            ? shortHighlightFrame.motionV2WhiteLevel
+-                            : (float)parameters.whiteLevel;
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/raw_to_cfa",true);
+-                    glProg.setVar("whiteLevel",iris26490ShortWhite);glProg.setVar("blackLevel",iris26490ShortBlack);
+-                    glProg.setVar("exposure",1.0f);glProg.setTexture("inTexture",iris26480ShortRaw);
+-                    glProg.setTextureCompute("outTexture",iris26480ShortCfa,true);glProg.computeAutoDeferred(rawHalf,1);
++                    float[] iris26490ShortBlack=shortHighlightFrame.motionV2BlackLevelValid?shortHighlightFrame.motionV2BlackLevel:blackLevel;
++                    float iris26490ShortWhite=shortHighlightFrame.motionV2WhiteLevelValid?shortHighlightFrame.motionV2WhiteLevel:(float)parameters.whiteLevel;
++                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/raw_to_cfa",true);glProg.setVar("whiteLevel",iris26490ShortWhite);glProg.setVar("blackLevel",iris26490ShortBlack);glProg.setVar("exposure",1.0f);glProg.setTexture("inTexture",iris26480ShortRaw);glProg.setTextureCompute("outTexture",iris26480ShortCfa,true);glProg.computeAutoDeferred(rawHalf,1);
+                     float r=directSensorGains[0]/Math.max(directSensorGains[1],1e-6f),b=directSensorGains[2]/Math.max(directSensorGains[1],1e-6f);
+-                    iris26480ShortWbCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-                    /* IRIS_26490_SHORT_ALIGNMENT_RADIOMETRIC_NORMALIZATION
+-                     * LK uses a brightness-constancy residual. Normalize only the temporary short
+-                     * alignment proxy into the normal-reference radiance domain using measured
+-                     * exposure energy. The physical short CFA above remains unscaled for clipping
+-                     * tests and real highlight replacement.
+-                     */
+                     float iris26490ShortAlignmentScale=shortToNormalScale*iris26487ReferenceExposureScale;
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_wb_cfa",true);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);
+-                    glProg.setVar("wbR",r*iris26490ShortAlignmentScale);
+-                    glProg.setVar("wbG",iris26490ShortAlignmentScale);
+-                    glProg.setVar("wbB",b*iris26490ShortAlignmentScale);
+-                    /* IRIS_26487_SHORT_WB_LINEAR_ONLY */
+-                    glProg.setTextureCompute("inputCfa",iris26480ShortCfa,false);glProg.setTextureCompute("outputCfa",iris26480ShortWbCfa,true);glProg.computeAutoDeferred(rawHalf,1);
+-                    iris26480ShortAlignment=MotionV2WronskiAlignment.alignPrepared(wronskiPreparedAlignment,glProg,iris26480ShortWbCfa);
+-                    Iris26487Noise iris26501ShortSensorNoise=
+-                            iris26487FrameNoise(shortHighlightFrame,noiseS,noiseO);
+-                    float[] iris26501ShortWbNoise=iris26487WbNoiseRgb(
+-                            iris26501ShortSensorNoise,(int)parameters.cfaPattern,
+-                            iris26490ShortAlignmentScale,r,b);
+-                    iris26501ShortCov=new GLTexture(
+-                            iris26487GuideSize,new GLFormat(GLFormat.DataType.FLOAT_32,4),
+-                            null,GL_LINEAR,GL_CLAMP_TO_EDGE);
+-                    iris26501RenderRgbCovariance(
+-                            glProg,raw,rawHalf,iris26487GuideSize,
+-                            iris26480ShortRaw,iris26501ShortCov,
+-                            (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
+-                            iris26490ShortAlignmentScale,r,b,
+-                            iris26501ShortWbNoise[1],iris26501ShortWbNoise[4]);
+-                    iris26501RenderChromaGuide(
+-                            glProg,raw,iris26480ShortRaw,iris26501ChromaGuideScratch,
+-                            (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
+-                            iris26490ShortAlignmentScale,r,b);
+-
+-                    iris26480Recovered=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-                    iris26492RecoveredProvenance=new GLTexture(
+-                            rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-                    iris26496ShortDiag = new GLBuffer(
+-                            64, new GLFormat(GLFormat.DataType.UNSIGNED_32));
+-                    iris26496ShortDiag.uploadBuffer(new int[64], 64);
+-                    glProg.setLayout(tile,tile,1);
+-                    glProg.useAssetProgram("motionv2/short_highlight_bayer_recover",true);
+-                    glProg.setVar("packedSize",rawHalf);
+-                    glProg.setVar("shortToNormalScale",shortToNormalScale);
+-                    glProg.setVar("physicalClipThreshold",IRIS26487_CLIP_THRESHOLD);
+-                    glProg.setVar("shortClipThreshold",IRIS26487_CLIP_THRESHOLD);
+-                    /* IRIS_26497_SHORT_CORRESPONDENCE_HOST
+-                     * Keep the proven variation floor, but the shader now interprets
+-                     * mfsr_flow_expand.w correctly: interpolation cancellation preserves
+-                     * the whole base tile vector and is not itself an invalid warp.
+-                     * Structured clipped sites receive a bounded local correspondence
+-                     * refinement before any short sample can become color authority.
+-                     */
+-                    glProg.setVar("minimumFlowConfidence",0.30f);
+-                    glProg.setVar("referenceExposureScale",iris26487ReferenceExposureScale);
+-                    glProg.setTexture("normalCfa",imageOutput);
+-                    /* IRIS_26498_V13_SHORT_REFERENCE_OWNS_CORRESPONDENCE; merged CFA owns need/target. */
+-                    glProg.setTexture("referenceCfa",referenceCfa);
+-                    glProg.setTexture("shortCfa",iris26480ShortCfa);
+-                    glProg.setTexture("flowTexture",iris26480ShortAlignment.flowTexture);
+-                    glProg.setTextureCompute("outCfa",iris26480Recovered,true);
+-                    glProg.setTextureCompute("outProvenance",iris26492RecoveredProvenance,true);
+-                    glProg.setBufferCompute("ShortDiagBuf", iris26496ShortDiag);
+-                    glProg.computeAutoDeferred(rawHalf,1);
+-
+-                    /* IRIS_26501_SHORT_A_SEMANTIC_CONTRIBUTION
+-                     * Existing Short-A validation produces the admission mask; the actual camera
+-                     * color comes directly from the aligned native short RAW through the same
+-                     * G/R-G/B-G semantic path as normal frames.
+-                     */
+-                    iris26501ShortWeight=new GLTexture(
+-                            rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),
+-                            null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+-                    glProg.setLayout(tile,tile,1);
+-                    glProg.useAssetProgram("motionv2/mfsr_spatial_rgb_short_weight_26501",true);
+-                    glProg.setVar("packedSize",rawHalf);
+-                    glProg.setTexture("highlightProvenance",iris26492RecoveredProvenance);
+-                    glProg.setTextureCompute("outWeight",iris26501ShortWeight,true);
+-                    glProg.computeAutoDeferred(rawHalf,1);
+-
+-                    /* IRIS_26507_SHORT_A_SHARED_MGC_PRECHROMA_GATE */
+-                    float[] iris26507ShortGreenPhysicalNoise=iris26487GreenPhysicalNoise(
+-                            iris26501ShortSensorNoise,(int)parameters.cfaPattern);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_guide",true);
+-                    glProg.setVar("rawSize",raw);glProg.setVar("guideSize",iris26487GuideSize);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);
+-                    glProg.setVar("blackLevel",iris26490ShortBlack);glProg.setVar("whiteLevel",iris26490ShortWhite);glProg.setVar("exposureScale",iris26490ShortAlignmentScale);
+-                    glProg.setVar("wbR",r);glProg.setVar("wbB",b);
+-                    glProg.setVar("noiseShot",new float[]{iris26501ShortWbNoise[0],iris26501ShortWbNoise[1],iris26501ShortWbNoise[2]});
+-                    glProg.setVar("noiseRead",new float[]{iris26501ShortWbNoise[3],iris26501ShortWbNoise[4],iris26501ShortWbNoise[5]});
+-                    glProg.setTexture("rawTexture",iris26480ShortRaw);glProg.setTextureCompute("outputGuide",iris26487GuideScratch,true);glProg.computeAutoDeferred(iris26487GuideSize,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_unblocker",true);
+-                    glProg.setVar("rawHalf",rawHalf);glProg.setVar("unblockerSize",iris26487UnblockerSize);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setVar("physicalExposureScale",iris26490ShortAlignmentScale);
+-                    glProg.setVar("greenShot",iris26507ShortGreenPhysicalNoise[0]);glProg.setVar("greenRead",iris26507ShortGreenPhysicalNoise[1]);
+-                    glProg.setTexture("physicalCfa",iris26480ShortCfa);glProg.setTextureCompute("outUnblocker",iris26487UnblockerScratch,true);glProg.computeAutoDeferred(iris26487UnblockerSize,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_base",true);
+-                    glProg.setVar("rawHalf",rawHalf);glProg.setVar("guideSize",iris26487GuideSize);
+-                    glProg.setVar("referenceNoiseShot",new float[]{iris26487ReferenceWbNoise[0],iris26487ReferenceWbNoise[1],iris26487ReferenceWbNoise[2]});
+-                    glProg.setVar("referenceNoiseRead",new float[]{iris26487ReferenceWbNoise[3],iris26487ReferenceWbNoise[4],iris26487ReferenceWbNoise[5]});
+-                    glProg.setVar("currentNoiseShot",new float[]{iris26501ShortWbNoise[0],iris26501ShortWbNoise[1],iris26501ShortWbNoise[2]});
+-                    glProg.setVar("currentNoiseRead",new float[]{iris26501ShortWbNoise[3],iris26501ShortWbNoise[4],iris26501ShortWbNoise[5]});
+-                    glProg.setVar("flowVariationThreshold",iris26507FlowVariationThreshold);
+-                    glProg.setTexture("referenceGuide",wronskiReferenceGuide);glProg.setTexture("currentGuide",iris26487GuideScratch);
+-                    glProg.setTexture("flowTexture",iris26480ShortAlignment.flowTexture);glProg.setTexture("unblockerTexture",iris26487UnblockerScratch);
+-                    glProg.setTextureCompute("outReverseWeight",iris26487RejectFullA,true);glProg.setTextureCompute("outPixelDifference",iris26487RejectFullB,true);glProg.computeAutoDeferred(rawHalf,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_h",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26487RejectFullB);glProg.setTextureCompute("outEvidence",iris26487RejectFullC,true);glProg.computeAutoDeferred(rawHalf,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_v",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26487RejectFullC);glProg.setTextureCompute("outEvidence",iris26487RejectFullB,true);glProg.computeAutoDeferred(rawHalf,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_reduce4",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487RejectSmallSize);glProg.setTexture("referenceGray",iris26488ReferenceGray);glProg.setTexture("inputRejection",iris26487RejectFullA);glProg.setTextureCompute("outLuma",iris26487RejectSmallLuma,true);glProg.setTextureCompute("outRejection",iris26487RejectSmallRaw,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_bilateral",true);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("inputLuma",iris26487RejectSmallLuma);glProg.setTexture("inputRejection",iris26487RejectSmallRaw);glProg.setTextureCompute("outFiltered",iris26487RejectSmallFiltered,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_postprocess",true);glProg.setVar("fullSize",rawHalf);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("originalRejection",iris26487RejectFullA);glProg.setTexture("filteredRejection",iris26487RejectSmallFiltered);glProg.setTexture("pixelDifference",iris26487RejectFullB);glProg.setTextureCompute("outRejection",iris26487RejectFullC,true);glProg.computeAutoDeferred(rawHalf,1);
+-                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_dilate",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487MergeWeightSize);glProg.setTexture("inputRejection",iris26487RejectFullC);glProg.setTextureCompute("outWeight",iris26487FinalWeightScratch,true);glProg.computeAutoDeferred(iris26487MergeWeightSize,1);
+-                    iris26501ContributeRgbFrame(
+-                            glProg,iris26501RgbFramebuffer,raw,rawHalf,
+-                            iris26480ShortRaw,iris26501ChromaGuideScratch,
+-                            iris26480ShortAlignment.flowTexture,iris26487FinalWeightScratch,iris26501ShortCov,
+-                            iris26501ShortWeight,
+-                            (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
+-                            iris26490ShortAlignmentScale,r,b,
+-                            iris26501ShortWbNoise[1],iris26501ShortWbNoise[4],
+-                            false,true,true);
+-                    iris26501SemanticHdrContributedFrames++;
+-                    iris26480ReadbackOutput=iris26480Recovered;
+-                    iris26492ReadbackProvenance=iris26492RecoveredProvenance;
+-                    parameters.motionV2ShortHighlightRecoveryExecuted = true;
+-                    Log.d(TAG,"IRIS_26490_BENTO_SHORT_SENSOR_DOMAIN_BAYER_RECOVERY"
+-                            +" shortToNormalScale="+shortToNormalScale
+-                            +" shortAlignmentScale="+iris26490ShortAlignmentScale
+-                            +" shortAlignmentRadiometricallyNormalized=true"
+-                            +" referenceExposureScale="+iris26487ReferenceExposureScale
+-                            +" shortWhiteLevel="+iris26490ShortWhite
+-                            +" normalWhiteLevel="+parameters.whiteLevel
+-                            +" shortBlack="+java.util.Arrays.toString(iris26490ShortBlack)
+-                            +" normalBlack="+java.util.Arrays.toString(blackLevel)
+-                            +" timestamp="+shortHighlightFrame.timestamp
+-                            +" shortExcludedFromNormalAccumulator=true"
+-                            +" shortExtendedRadianceState=true"
+-                            +" recoveredBeforeDemosaic=true rgbRepair=false"
+-                            +" interpolationCancelMeansBaseFlow=true"
+-                            +" localCorrespondenceRefine=3x3HalfPacked"
+-                            +" structuredUniqueMatchRequired=true");
++                    iris26480ShortWbCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_wb_cfa",true);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setVar("wbR",r*iris26490ShortAlignmentScale);glProg.setVar("wbG",iris26490ShortAlignmentScale);glProg.setVar("wbB",b*iris26490ShortAlignmentScale);glProg.setTextureCompute("inputCfa",iris26480ShortCfa,false);glProg.setTextureCompute("outputCfa",iris26480ShortWbCfa,true);glProg.computeAutoDeferred(rawHalf,1);
++
++                    boolean iris26509BridgeUsable=iris26509GeometryBridgeFrame!=null
++                            &&iris26509GeometryBridgeFrame.buffer!=null
++                            &&iris26509GeometryBridgeFrame.motionV2FrameRole==ImageFrame.MotionV2FrameRole.NORMAL
++                            &&iris26509GeometryBridgeFrame.motionV2ActualExposureNs>0L
++                            &&iris26509GeometryBridgeFrame.motionV2ActualIso>0
++                            &&iris26509GeometryBridgeFrame.motionV2ExposureEnergy>0.0;
++                    double iris26509BridgeEnergyRatio=iris26509BridgeUsable?iris26509GeometryBridgeFrame.motionV2ExposureEnergy/referenceFrame.motionV2ExposureEnergy:0.0;
++                    long iris26509ReferenceToShortDeltaNs=Math.abs(shortHighlightFrame.timestamp-referenceFrame.timestamp);
++                    long iris26509BridgeToShortDeltaNs=iris26509BridgeUsable?Math.abs(shortHighlightFrame.timestamp-iris26509GeometryBridgeFrame.timestamp):Long.MAX_VALUE;
++                    iris26509BridgeUsable=iris26509BridgeUsable&&iris26509BridgeEnergyRatio>=0.80&&iris26509BridgeEnergyRatio<=1.25
++                            &&iris26509BridgeToShortDeltaNs<iris26509ReferenceToShortDeltaNs;
++                    float iris26509BridgeToNormalScale=iris26509BridgeUsable?(float)(referenceFrame.motionV2ExposureEnergy/iris26509GeometryBridgeFrame.motionV2ExposureEnergy):1.0f;
++                    Log.i(TAG,"IRIS_26509_NEAREST_NORMAL_BRIDGE_SELECTION"
++                            +" finalReferenceTimestamp="+referenceFrame.timestamp
++                            +" bridgeTimestamp="+(iris26509GeometryBridgeFrame==null?0L:iris26509GeometryBridgeFrame.timestamp)
++                            +" shortTimestamp="+shortHighlightFrame.timestamp
++                            +" referenceToShortDeltaMs="+(iris26509ReferenceToShortDeltaNs/1000000.0)
++                            +" bridgeToShortDeltaMs="+(iris26509BridgeToShortDeltaNs==Long.MAX_VALUE?-1.0:iris26509BridgeToShortDeltaNs/1000000.0)
++                            +" bridgeEnergyRatio="+iris26509BridgeEnergyRatio
++                            +" bridgeUsable="+iris26509BridgeUsable
++                            +" sameGenerationCaptureOwner=true nearestWithinFrozenCandidates=true"
++                            +" geometryOnly=true pixelContributor=false unrelatedFallback=false");
++
++                    if(iris26509BridgeUsable){
++                        iris26509BridgeRaw=new GLTexture(raw,new GLFormat(GLFormat.DataType.UNSIGNED_16,1),iris26509GeometryBridgeFrame.buffer,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        iris26509BridgeCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        float[] bridgeBlack=iris26509GeometryBridgeFrame.motionV2BlackLevelValid?iris26509GeometryBridgeFrame.motionV2BlackLevel:blackLevel;
++                        float bridgeWhite=iris26509GeometryBridgeFrame.motionV2WhiteLevelValid?iris26509GeometryBridgeFrame.motionV2WhiteLevel:(float)parameters.whiteLevel;
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/raw_to_cfa",true);glProg.setVar("whiteLevel",bridgeWhite);glProg.setVar("blackLevel",bridgeBlack);glProg.setVar("exposure",1.0f);glProg.setTexture("inTexture",iris26509BridgeRaw);glProg.setTextureCompute("outTexture",iris26509BridgeCfa,true);glProg.computeAutoDeferred(rawHalf,1);
++                        iris26509BridgeWbCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        float bridgeAlignmentScale=iris26509BridgeToNormalScale*iris26487ReferenceExposureScale;
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_wb_cfa",true);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setVar("wbR",r*bridgeAlignmentScale);glProg.setVar("wbG",bridgeAlignmentScale);glProg.setVar("wbB",b*bridgeAlignmentScale);glProg.setTextureCompute("inputCfa",iris26509BridgeCfa,false);glProg.setTextureCompute("outputCfa",iris26509BridgeWbCfa,true);glProg.computeAutoDeferred(rawHalf,1);
++                        iris26509ReferenceToBridgeAlignment=MotionV2WronskiAlignment.alignPrepared(wronskiPreparedAlignment,glProg,iris26509BridgeWbCfa);
++                        MotionV2WronskiAlignment.PreparedReference iris26509BridgePrepared=null;
++                        try{
++                            iris26509BridgePrepared=MotionV2WronskiAlignment.prepareReference(rawHalf,parameters.cfaPattern,canonicalGain,mfsrSnr,glProg,iris26509BridgeWbCfa);
++                            iris26509BridgeToShortAlignment=MotionV2WronskiAlignment.alignPrepared(iris26509BridgePrepared,glProg,iris26480ShortWbCfa);
++                        }finally{if(iris26509BridgePrepared!=null)iris26509BridgePrepared.close();}
++                        iris26509ComposedFlow=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bridge_flow_compose_26509",true);glProg.setVar("packedSize",rawHalf);glProg.setTexture("referenceToBridgeFlow",iris26509ReferenceToBridgeAlignment.flowTexture);glProg.setTexture("bridgeToShortFlow",iris26509BridgeToShortAlignment.flowTexture);glProg.setTextureCompute("outFlow",iris26509ComposedFlow,true);glProg.computeAutoDeferred(rawHalf,1);
++                    }
+ 
++                    Iris26487Noise iris26501ShortSensorNoise=iris26487FrameNoise(shortHighlightFrame,noiseS,noiseO);
++                    float[] iris26501ShortWbNoise=iris26487WbNoiseRgb(iris26501ShortSensorNoise,(int)parameters.cfaPattern,iris26490ShortAlignmentScale,r,b);
++                    iris26501ShortCov=new GLTexture(iris26487GuideSize,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                    iris26501RenderRgbCovariance(glProg,raw,rawHalf,iris26487GuideSize,iris26480ShortRaw,iris26501ShortCov,(int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,iris26490ShortAlignmentScale,r,b,iris26501ShortWbNoise[1],iris26501ShortWbNoise[4]);
++                    iris26501RenderChromaGuide(glProg,raw,iris26480ShortRaw,iris26501ChromaGuideScratch,(int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,iris26490ShortAlignmentScale,r,b);
++
++                    iris26509ShortCandidateCfa=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    iris26509ShortCandidateProvenance=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                    iris26496ShortDiag=new GLBuffer(64,new GLFormat(GLFormat.DataType.UNSIGNED_32));iris26496ShortDiag.uploadBuffer(new int[64],64);
++                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/short_highlight_bayer_recover",true);glProg.setVar("packedSize",rawHalf);glProg.setVar("shortToNormalScale",shortToNormalScale);glProg.setVar("bridgeToNormalScale",iris26509BridgeToNormalScale);glProg.setVar("physicalClipThreshold",IRIS26487_CLIP_THRESHOLD);glProg.setVar("shortClipThreshold",IRIS26487_CLIP_THRESHOLD);glProg.setVar("minimumBridgeConfidence",0.30f);glProg.setVar("referenceExposureScale",iris26487ReferenceExposureScale);glProg.setVar("bridgeAvailable",iris26509BridgeUsable?1:0);glProg.setTexture("normalCfa",referenceCfa);glProg.setTexture("bridgeCfa",iris26509BridgeUsable?iris26509BridgeCfa:referenceCfa);glProg.setTexture("shortCfa",iris26480ShortCfa);glProg.setTexture("bridgeFlowTexture",iris26509BridgeUsable?iris26509ReferenceToBridgeAlignment.flowTexture:referenceCfa);glProg.setTexture("composedFlowTexture",iris26509BridgeUsable?iris26509ComposedFlow:referenceCfa);glProg.setTextureCompute("outCfa",iris26509ShortCandidateCfa,true);glProg.setTextureCompute("outProvenance",iris26509ShortCandidateProvenance,true);glProg.setBufferCompute("ShortDiagBuf",iris26496ShortDiag);glProg.computeAutoDeferred(rawHalf,1);
++
++                    if(iris26509BridgeUsable){
++                        if(iris26509AuxGuide==null)iris26509AuxGuide=new GLTexture(iris26487GuideSize,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxUnblocker==null)iris26509AuxUnblocker=new GLTexture(iris26487UnblockerSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxRejectA==null)iris26509AuxRejectA=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxRejectB==null)iris26509AuxRejectB=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxRejectC==null)iris26509AuxRejectC=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxSmallLuma==null)iris26509AuxSmallLuma=new GLTexture(iris26487RejectSmallSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxSmallRaw==null)iris26509AuxSmallRaw=new GLTexture(iris26487RejectSmallSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxSmallFiltered==null)iris26509AuxSmallFiltered=new GLTexture(iris26487RejectSmallSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        if(iris26509AuxFinalWeight==null)iris26509AuxFinalWeight=new GLTexture(iris26487MergeWeightSize,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                        float[] iris26509ShortGreenPhysicalNoise=iris26487GreenPhysicalNoise(iris26501ShortSensorNoise,(int)parameters.cfaPattern);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_guide",true);glProg.setVar("rawSize",raw);glProg.setVar("guideSize",iris26487GuideSize);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setVar("blackLevel",iris26490ShortBlack);glProg.setVar("whiteLevel",iris26490ShortWhite);glProg.setVar("exposureScale",iris26490ShortAlignmentScale);glProg.setVar("wbR",r);glProg.setVar("wbB",b);glProg.setVar("noiseShot",new float[]{iris26501ShortWbNoise[0],iris26501ShortWbNoise[1],iris26501ShortWbNoise[2]});glProg.setVar("noiseRead",new float[]{iris26501ShortWbNoise[3],iris26501ShortWbNoise[4],iris26501ShortWbNoise[5]});glProg.setTexture("rawTexture",iris26480ShortRaw);glProg.setTextureCompute("outputGuide",iris26509AuxGuide,true);glProg.computeAutoDeferred(iris26487GuideSize,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_unblocker",true);glProg.setVar("rawHalf",rawHalf);glProg.setVar("unblockerSize",iris26487UnblockerSize);glProg.setVar("cfaPattern",(int)parameters.cfaPattern);glProg.setVar("physicalExposureScale",iris26490ShortAlignmentScale);glProg.setVar("greenShot",iris26509ShortGreenPhysicalNoise[0]);glProg.setVar("greenRead",iris26509ShortGreenPhysicalNoise[1]);glProg.setTexture("physicalCfa",iris26480ShortCfa);glProg.setTextureCompute("outUnblocker",iris26509AuxUnblocker,true);glProg.computeAutoDeferred(iris26487UnblockerSize,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_base",true);glProg.setBufferCompute("GeometryDiagBuf",iris26509GeometryDiag);glProg.setVar("rawHalf",rawHalf);glProg.setVar("guideSize",iris26487GuideSize);glProg.setVar("referenceNoiseShot",new float[]{iris26487ReferenceWbNoise[0],iris26487ReferenceWbNoise[1],iris26487ReferenceWbNoise[2]});glProg.setVar("referenceNoiseRead",new float[]{iris26487ReferenceWbNoise[3],iris26487ReferenceWbNoise[4],iris26487ReferenceWbNoise[5]});glProg.setVar("currentNoiseShot",new float[]{iris26501ShortWbNoise[0],iris26501ShortWbNoise[1],iris26501ShortWbNoise[2]});glProg.setVar("currentNoiseRead",new float[]{iris26501ShortWbNoise[3],iris26501ShortWbNoise[4],iris26501ShortWbNoise[5]});glProg.setVar("flowVariationThreshold",iris26507FlowVariationThreshold);glProg.setTexture("referenceGuide",wronskiReferenceGuide);glProg.setTexture("currentGuide",iris26509AuxGuide);glProg.setTexture("flowTexture",iris26509ComposedFlow);glProg.setTexture("unblockerTexture",iris26509AuxUnblocker);glProg.setTextureCompute("outReverseWeight",iris26509AuxRejectA,true);glProg.setTextureCompute("outPixelDifference",iris26509AuxRejectB,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_h",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26509AuxRejectB);glProg.setTextureCompute("outEvidence",iris26509AuxRejectC,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_clipped_gaussian_v",true);glProg.setVar("size",rawHalf);glProg.setTexture("inputEvidence",iris26509AuxRejectC);glProg.setTextureCompute("outEvidence",iris26509AuxRejectB,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_reduce4",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487RejectSmallSize);glProg.setTexture("referenceGray",iris26488ReferenceGray);glProg.setTexture("inputRejection",iris26509AuxRejectA);glProg.setTextureCompute("outLuma",iris26509AuxSmallLuma,true);glProg.setTextureCompute("outRejection",iris26509AuxSmallRaw,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_bilateral",true);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("inputLuma",iris26509AuxSmallLuma);glProg.setTexture("inputRejection",iris26509AuxSmallRaw);glProg.setTextureCompute("outFiltered",iris26509AuxSmallFiltered,true);glProg.computeAutoDeferred(iris26487RejectSmallSize,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_postprocess",true);glProg.setVar("fullSize",rawHalf);glProg.setVar("smallSize",iris26487RejectSmallSize);glProg.setTexture("originalRejection",iris26509AuxRejectA);glProg.setTexture("filteredRejection",iris26509AuxSmallFiltered);glProg.setTexture("pixelDifference",iris26509AuxRejectB);glProg.setTextureCompute("outRejection",iris26509AuxRejectC,true);glProg.computeAutoDeferred(rawHalf,1);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_bjzhou_rejection_dilate",true);glProg.setVar("inputSize",rawHalf);glProg.setVar("outputSize",iris26487MergeWeightSize);glProg.setTexture("inputRejection",iris26509AuxRejectC);glProg.setTextureCompute("outWeight",iris26509AuxFinalWeight,true);glProg.computeAutoDeferred(iris26487MergeWeightSize,1);
++
++                        iris26509RegionA=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);iris26509RegionB=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_short_region_seed_26509",true);glProg.setVar("packedSize",rawHalf);glProg.setTexture("candidateProvenance",iris26509ShortCandidateProvenance);glProg.setTexture("mgcWeight",iris26509AuxFinalWeight);glProg.setTextureCompute("outRegion",iris26509RegionA,true);glProg.setBufferCompute("ShortDiagBuf",iris26496ShortDiag);glProg.computeAutoDeferred(rawHalf,1);
++                        GLTexture iris26509RegionRead=iris26509RegionA,iris26509RegionWrite=iris26509RegionB;
++                        for(int iris26509RegionPass=0;iris26509RegionPass<4;++iris26509RegionPass){glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_short_region_propagate_26509",true);glProg.setVar("packedSize",rawHalf);glProg.setTexture("candidateProvenance",iris26509ShortCandidateProvenance);glProg.setTexture("mgcWeight",iris26509AuxFinalWeight);glProg.setTexture("regionIn",iris26509RegionRead);glProg.setTextureCompute("outRegion",iris26509RegionWrite,true);glProg.computeAutoDeferred(rawHalf,1);GLTexture iris26509Swap=iris26509RegionRead;iris26509RegionRead=iris26509RegionWrite;iris26509RegionWrite=iris26509Swap;}
++                        iris26480Recovered=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);iris26492RecoveredProvenance=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,1),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
++                        glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_short_region_finalize_26509",true);glProg.setVar("packedSize",rawHalf);glProg.setTexture("normalCfa",referenceCfa);glProg.setTexture("candidateCfa",iris26509ShortCandidateCfa);glProg.setTexture("candidateProvenance",iris26509ShortCandidateProvenance);glProg.setTexture("mgcWeight",iris26509AuxFinalWeight);glProg.setTexture("regionTexture",iris26509RegionRead);glProg.setTextureCompute("outCfa",iris26480Recovered,true);glProg.setTextureCompute("outProvenance",iris26492RecoveredProvenance,true);glProg.setBufferCompute("ShortDiagBuf",iris26496ShortDiag);glProg.computeAutoDeferred(rawHalf,1);
++                        iris26501ShortWeight=new GLTexture(rawHalf,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_spatial_rgb_short_weight_26501",true);glProg.setVar("packedSize",rawHalf);glProg.setTexture("highlightProvenance",iris26492RecoveredProvenance);glProg.setTextureCompute("outWeight",iris26501ShortWeight,true);glProg.computeAutoDeferred(rawHalf,1);
++                        iris26501ContributeRgbFrame(glProg,iris26501RgbFramebuffer,raw,rawHalf,iris26480ShortRaw,iris26501ChromaGuideScratch,iris26509ComposedFlow,iris26509AuxFinalWeight,iris26501ShortCov,iris26501ShortWeight,(int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,iris26490ShortAlignmentScale,r,b,iris26501ShortWbNoise[1],iris26501ShortWbNoise[4],false,true,true);
++                        iris26501SemanticHdrContributedFrames++;
++                        iris26480ReadbackOutput=iris26480Recovered;iris26492ReadbackProvenance=iris26492RecoveredProvenance;parameters.motionV2ShortHighlightRecoveryExecuted=true;
++                        Log.i(TAG,"IRIS_26509_SHORT_PHYSICAL_REFERENCE_BRIDGE_MGC_REGION_OWNER bridge=true composedWronski=true mgc=true gpuRegionPasses=4 regionTileFlood=8x8 bridgePixelContributor=false oneFinalRgbOwner=true");
++                    }else{
++                        iris26480ReadbackOutput=iris26509ShortCandidateCfa;iris26492ReadbackProvenance=iris26509ShortCandidateProvenance;parameters.motionV2ShortHighlightRecoveryExecuted=false;
++                        Log.w(TAG,"IRIS_26509_SHORT_BRIDGE_UNAVAILABLE noDirectReferenceFallback=true recoveryIntentionallyCensored=true");
++                    }
++                }
++                /* IRIS_26509_OPPONENT_SUPPORT_DIAGNOSTIC_DISPATCH */
++                if(directBayer){
++                    glProg.setLayout(tile,tile,1);glProg.useAssetProgram("motionv2/mfsr_support_diag_26509",true);
++                    glProg.setVar("rawSize",raw);glProg.setTexture("semanticAccumulator",iris26501SemanticAccumulator);
++                    glProg.setTexture("opponentWeightAccumulator",iris26501OpponentWeightAccumulator);
++                    glProg.setBufferCompute("SupportDiagBuf",iris26509SupportDiag);glProg.computeAutoDeferred(raw,1);
+                 }
+-
+                 if (directBayer) {
+                     /* IRIS_26501_PROPER_SPATIAL_RGB_FINAL_NORMALIZATION
+                      * Normal equal-exposure frames already live in the semantic accumulators.
+@@ -2219,72 +2194,49 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         }
+                     } catch(Throwable shadowDiagError){Log.w(TAG,"IRIS_26498_V13_SHADOW_DIAG_SKIPPED",shadowDiagError);}
+                 }
++                /* IRIS_26509_ROOT_CAUSE_DIAGNOSTIC_RESULT */
++                try{
++                    int[] g=iris26509GeometryDiag.readBufferIntegers(false);int[] s=iris26509SupportDiag.readBufferIntegers(false);
++                    if(g!=null&&g.length>=8){long total=Integer.toUnsignedLong(g[0]);long uncertain=Integer.toUnsignedLong(g[1]);long strong=Integer.toUnsignedLong(g[2]);long oob=Integer.toUnsignedLong(g[3]);long geomReject=Integer.toUnsignedLong(g[4]);long border=Integer.toUnsignedLong(g[5]);long borderOob=Integer.toUnsignedLong(g[6]);long borderUncertain=Integer.toUnsignedLong(g[7]);float d=Math.max(total,1L);Log.i(TAG,"IRIS_26509_GEOMETRY_RESULT totalMgcPixels="+total+" uncertain="+uncertain+" uncertainPct="+(100.0f*uncertain/d)+" strongUncertain="+strong+" outOfBounds="+oob+" outOfBoundsPct="+(100.0f*oob/d)+" geometrySuppressed="+geomReject+" borderPixels="+border+" borderOob="+borderOob+" borderUncertain="+borderUncertain+" fakeConfidenceRemoved=true");}
++                    if(s!=null&&s.length>=12){Log.i(TAG,"IRIS_26509_SUPPORT_RESULT valid="+Integer.toUnsignedLong(s[0])+" rZero="+Integer.toUnsignedLong(s[1])+" bZero="+Integer.toUnsignedLong(s[2])+" eitherZero="+Integer.toUnsignedLong(s[3])+" rLow="+Integer.toUnsignedLong(s[4])+" bLow="+Integer.toUnsignedLong(s[5])+" borderValid="+Integer.toUnsignedLong(s[6])+" borderZero="+Integer.toUnsignedLong(s[7])+" borderLow="+Integer.toUnsignedLong(s[8])+" interiorValid="+Integer.toUnsignedLong(s[9])+" interiorZero="+Integer.toUnsignedLong(s[10])+" interiorLow="+Integer.toUnsignedLong(s[11]));}
++                    if(irisV13ShadowDiag!=null){int[] l=irisV13ShadowDiag.readBufferIntegers(false);if(l!=null&&l.length>=23)Log.i(TAG,"IRIS_26509_LONG_BUCKET_RESULT shadowAccepted="+Integer.toUnsignedLong(l[20])+" midtoneAccepted="+Integer.toUnsignedLong(l[21])+" highlightAccepted="+Integer.toUnsignedLong(l[22])+" isolatedShadowOwner=true shadowSemanticGateRequired=true unrestrictedLongCommonAdmission=false");}
++                }catch(Throwable e){Log.w(TAG,"IRIS_26509_ROOT_DIAGNOSTIC_READBACK_SKIPPED",e);}
+                 if (iris26496ShortDiag != null) {
+                     try {
+-                        int[] d = iris26496ShortDiag.readBufferIntegers(false);
+-                        if (d != null && d.length >= 47) {
+-                            long total = Integer.toUnsignedLong(d[0]);
+-                            long safe = Integer.toUnsignedLong(d[1]);
+-                            long shortClipped = Integer.toUnsignedLong(d[2]);
+-                            long flowRejected = Integer.toUnsignedLong(d[3]);
+-                            long correspondenceRejected = Integer.toUnsignedLong(d[4]);
+-                            long radiometryRejected = Integer.toUnsignedLong(d[5]);
+-                            long validated = Integer.toUnsignedLong(d[6]);
+-                            long stillCensored = Integer.toUnsignedLong(d[7]);
+-                            float coverage = total > 0L ? validated / (float) total : 0.0f;
+-                            Log.d(TAG, "IRIS_26496_SHORT_FAILURE_REASONS"
+-                                    + " totalNormalClipped=" + total
+-                                    + " shortSafeCandidate=" + safe
+-                                    + " shortPhysicallyClipped=" + shortClipped
+-                                    + " flowRejected=" + flowRejected
+-                                    + " correspondenceRejected=" + correspondenceRejected
+-                                    + " radiometryRejected=" + radiometryRejected
+-                                    + " shortValidated=" + validated
+-                                    + " stillCensored=" + stillCensored
+-                                    + " recoveryCoverage=" + coverage
+-                                    + " shortValueBinsLt50_50to70_70to85_85to95_95toClip="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 8, 13))
+-                                    + " clippedByPhase="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 16, 20))
+-                                    + " validatedByPhase="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 20, 24))
+-                                    + " shortClippedByPhase="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 24, 28))
+-                                    + " flowRejectedByPhase="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 28, 32))
+-                                    + " correspondenceRejectedByPhase="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 32, 36))
+-                                    + " radiometryRejectedByPhase="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 36, 40))
+-                                    + " stillCensoredByPhase="
+-                                    + java.util.Arrays.toString(java.util.Arrays.copyOfRange(d, 40, 44))
+-                                    + " shortPacksAny=" + Integer.toUnsignedLong(d[44])
+-                                    + " shortPacksMixedCensored=" + Integer.toUnsignedLong(d[45])
+-                                    + " shortPacksFullyKnown=" + Integer.toUnsignedLong(d[46])
+-                                    + " IRIS_26506_SHORT_A_SPATIAL_PROVENANCE_COHERENCE=true"
+-                                    + " imageMathChangedOnlyBySemanticColorCoherence=true"
+-                                    + " oneGpuDrain=true");
+-                            if (total != validated + stillCensored) {
+-                                Log.w(TAG, "IRIS_26496_SHORT_DIAGNOSTIC_ACCOUNTING_MISMATCH"
+-                                        + " total=" + total
+-                                        + " validatedPlusStill=" + (validated + stillCensored));
+-                            }
+-                            try {
+-                                com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+-                                        "IRIS_26496_SHORT_FAILURE_REASONS",
+-                                        "total=" + total
+-                                                + " shortClipped=" + shortClipped
+-                                                + " flowRejected=" + flowRejected
+-                                                + " corrRejected=" + correspondenceRejected
+-                                                + " radiometryRejected=" + radiometryRejected
+-                                                + " validated=" + validated
+-                                                + " stillCensored=" + stillCensored
+-                                                + " coverage=" + coverage);
+-                            } catch (Throwable ignored) {}
++                        int[] d=iris26496ShortDiag.readBufferIntegers(false);
++                        if(d!=null&&d.length>=56){
++                            long total=Integer.toUnsignedLong(d[0]),safe=Integer.toUnsignedLong(d[1]),shortClipped=Integer.toUnsignedLong(d[2]);
++                            long noBridge=Integer.toUnsignedLong(d[3]),bridgeRejected=Integer.toUnsignedLong(d[4]),radiometryRejected=Integer.toUnsignedLong(d[5]);
++                            long recovered=Integer.toUnsignedLong(d[6]),unrecoverable=Integer.toUnsignedLong(d[7]);
++                            long mgcRejected=Integer.toUnsignedLong(d[13]),topologyRejected=Integer.toUnsignedLong(d[14]),candidate=Integer.toUnsignedLong(d[15]);
++                            float denom=Math.max(total,1L);
++                            Log.i(TAG,"IRIS_26509_SHORT_ARCHITECTURAL_RESULT"+" physicalClipAuthority=immutableReferenceCfa"
++                                    +" totalNormalClipped="+total
++                                    +" shortPhysicallyAvailable="+safe+" shortPhysicallyAvailablePct="+(100.0f*safe/denom)
++                                    +" shortPhysicallyClipped="+shortClipped+" shortPhysicallyClippedPct="+(100.0f*shortClipped/denom)
++                                    +" noBridge="+noBridge+" noBridgePct="+(100.0f*noBridge/denom)
++                                    +" bridgeGeometryRejected="+bridgeRejected+" bridgeGeometryRejectedPct="+(100.0f*bridgeRejected/denom)
++                                    +" mgcRejected="+mgcRejected+" mgcRejectedPct="+(100.0f*mgcRejected/denom)
++                                    +" regionTopologyRejected="+topologyRejected+" regionTopologyRejectedPct="+(100.0f*topologyRejected/denom)
++                                    +" radiometryRejected="+radiometryRejected+" radiometryRejectedPct="+(100.0f*radiometryRejected/denom)
++                                    +" physicalCandidates="+candidate+" candidatePct="+(100.0f*candidate/denom)
++                                    +" recovered="+recovered+" recoveredPct="+(100.0f*recovered/denom)
++                                    +" intentionallyUnrecoverableOrDisoccluded="+unrecoverable+" unrecoverablePct="+(100.0f*unrecoverable/denom)
++                                    +" clippedByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,16,20))
++                                    +" recoveredByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,20,24))
++                                    +" shortClippedByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,24,28))
++                                    +" noBridgeByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,28,32))
++                                    +" bridgeRejectedByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,32,36))
++                                    +" radiometryRejectedByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,36,40))
++                                    +" unrecoverableByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,40,44))
++                                    +" mgcRejectedByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,44,48))
++                                    +" topologyRejectedByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,48,52))
++                                    +" candidateByPhase="+java.util.Arrays.toString(java.util.Arrays.copyOfRange(d,52,56))
++                                    +" oneGpuDrain=true");
++                            if(total!=recovered+unrecoverable)Log.w(TAG,"IRIS_26509_SHORT_ACCOUNTING_MISMATCH total="+total+" recoveredPlusUnrecoverable="+(recovered+unrecoverable));
++                            try{com.particlesdevs.photoncamera.util.MotionTrace.processingState("IRIS_26509_SHORT_ARCHITECTURAL_RESULT","total="+total+" recovered="+recovered+" unrecoverable="+unrecoverable+" noBridge="+noBridge+" bridgeRejected="+bridgeRejected+" mgcRejected="+mgcRejected+" topologyRejected="+topologyRejected);}catch(Throwable ignored){}
+                         }
+-                    } catch (Throwable shortDiagError) {
+-                        Log.w(TAG, "IRIS_26496_SHORT_DIAGNOSTIC_READBACK_SKIPPED", shortDiagError);
+-                    }
++                    }catch(Throwable shortDiagError){Log.w(TAG,"IRIS_26509_SHORT_DIAGNOSTIC_READBACK_SKIPPED",shortDiagError);}
+                 }
+                 if (false && /* IRIS_26504_DISABLE_HEAVY_PROVENANCE_READBACK */ directBayer && iris26492ReadbackProvenance != null) {
+                     try {
+@@ -2368,9 +2320,16 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 if(irisV13ShadowAlignment!=null)irisV13ShadowAlignment.close();if(irisV13ShadowWbCfa!=null)irisV13ShadowWbCfa.close();
+                 if(irisV13ShadowCfa!=null)irisV13ShadowCfa.close();if(irisV13ShadowRaw!=null)irisV13ShadowRaw.close();
+                 if(irisV13ShadowRecovered!=null)irisV13ShadowRecovered.close();if(irisV13ShadowDiag!=null)irisV13ShadowDiag.close();
++                if(iris26509ReferenceToBridgeAlignment!=null)iris26509ReferenceToBridgeAlignment.close();if(iris26509BridgeToShortAlignment!=null)iris26509BridgeToShortAlignment.close();
++                if(iris26509BridgeWbCfa!=null)iris26509BridgeWbCfa.close();if(iris26509BridgeCfa!=null)iris26509BridgeCfa.close();if(iris26509BridgeRaw!=null)iris26509BridgeRaw.close();if(iris26509ComposedFlow!=null)iris26509ComposedFlow.close();
++                if(iris26509ShortCandidateCfa!=null)iris26509ShortCandidateCfa.close();if(iris26509ShortCandidateProvenance!=null)iris26509ShortCandidateProvenance.close();if(iris26509RegionA!=null)iris26509RegionA.close();if(iris26509RegionB!=null)iris26509RegionB.close();
++                if(iris26509AuxFinalWeight!=null)iris26509AuxFinalWeight.close();if(iris26509AuxSmallFiltered!=null)iris26509AuxSmallFiltered.close();if(iris26509AuxSmallRaw!=null)iris26509AuxSmallRaw.close();if(iris26509AuxSmallLuma!=null)iris26509AuxSmallLuma.close();
++                if(iris26509AuxRejectC!=null)iris26509AuxRejectC.close();if(iris26509AuxRejectB!=null)iris26509AuxRejectB.close();if(iris26509AuxRejectA!=null)iris26509AuxRejectA.close();if(iris26509AuxUnblocker!=null)iris26509AuxUnblocker.close();if(iris26509AuxGuide!=null)iris26509AuxGuide.close();
++                if(iris26509GeometryDiag!=null)iris26509GeometryDiag.close();if(iris26509SupportDiag!=null)iris26509SupportDiag.close();
+                 /* IRIS_26498_V13_TAKEN_AUX_CPU_BUFFER_LIFETIME_FIX */
+                 if(shortHighlightFrame!=null)try{shortHighlightFrame.close();}catch(Throwable ignored){}
+                 if(irisV13ShadowAuxFrame!=null)try{irisV13ShadowAuxFrame.close();}catch(Throwable ignored){}
++                if(iris26509GeometryBridgeFrame!=null)try{iris26509GeometryBridgeFrame.close();}catch(Throwable ignored){}
+                 if(iris26496ShortDiag!=null)iris26496ShortDiag.close();
+                 if(iris26492RecoveredProvenance!=null)iris26492RecoveredProvenance.close();
+                 if(iris26492BaseProvenance!=null)iris26492BaseProvenance.close();
+diff --git a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+index 3007b1a..b603834 100644
+--- a/successful26507/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
++++ b/candidate26509/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2WronskiAlignment.java
+@@ -175,7 +175,11 @@ public final class MotionV2WronskiAlignment {
+             Log.d(TAG,"IRIS_26484_BJZHOU_COMPLETE_FLOW_CHAIN elapsedMs="+(System.currentTimeMillis()-start)
+                     +" levels=4 steps=1,2,4,4 tileStrides=32,32,16,8 lkIterations=2,3,3,3 blockSearchPasses=0"
+                     +" referenceProductsPreparedOnce=true sequentialScratchReuse=true denseFlowFrameOwned=true");
+-            return new MotionV2Alignment.Result(keep,0.0f,0.0f,1.0f,0.0f);
++            /* IRIS_26509_NO_FAKE_ALIGNMENT_CONFIDENCE
++             * 1.0/0.0 were placeholders, not measurements. Per-shot GPU geometry
++             * diagnostics now own truthful uncertainty/OOB statistics after the one drain.
++             */
++            return new MotionV2Alignment.Result(keep,0.0f,0.0f,Float.NaN,Float.NaN);
+         }finally{s.end();if(dense!=null)dense.close();}
+     }
+ 
