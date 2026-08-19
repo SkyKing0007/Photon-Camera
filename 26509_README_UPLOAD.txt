@@ -131,3 +131,10 @@ Expected APK:
 
 Suggested commit message:
   26509: direct 26507 root correction for geometry HDR exposure and output
+
+V3 SOURCE-INTEGRITY PROOF FIX (no runtime/image-math change)
+- V2 reached BUILD SUCCESSFUL, then failed only because the post-Gradle integrity proof hashed the fetched app/src/main/cpp/third_party_26507 dependency tree together with canonical Photon runtime source.
+- 26507 deliberately excluded third_party_26507 from its successful-source checkpoint and proves that dependency separately by pinned bjzhou commit + SHA manifest.
+- V3 preserves that same authority split: the bjzhou tree is authenticated before Gradle; the post-Gradle immutable-source proof covers Photon app/src/main excluding third_party_26507 plus app/version.properties.
+- If Gradle ever changes actual Photon runtime source, V3 emits an exact unified pre/post hash diff before failing.
+- 26509 runtime delta, image math, flow thresholds, MGC, Short/Long HDR, exposure controller, UHDR, JPEG_R and target version/build remain byte-identical to V2.

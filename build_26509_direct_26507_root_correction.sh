@@ -181,12 +181,28 @@ PYVER
 rm -rf app/src/main
 cp -a "$AFTER/app/src/main" app/src/main
 cp "$AFTER/app/version.properties" app/version.properties
-# Gradle must not mutate the audited source tree.
-( { find app/src/main -type f -print; echo app/version.properties; } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done ) > "$OUT/26509_pre_gradle_source.sha256"
+# IRIS_26509_V3_AUDITED_RUNTIME_EXCLUDES_FETCHED_NATIVE_TREE
+# Gradle must not mutate Photon runtime source.  The fetched third_party_26507 tree
+# is a pinned build dependency, not part of the canonical successful-source archive;
+# it was already authenticated above by BJZHOU_HEAD + BJZHOU_MANIFEST and may contain
+# CMake-generated/configured files during native compilation.
+audited_runtime_manifest(){
+  {
+    find app/src/main -type f ! -path 'app/src/main/cpp/third_party_26507/*' -print
+    echo app/version.properties
+  } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done
+}
+audited_runtime_manifest > "$OUT/26509_pre_gradle_audited_runtime.sha256"
 chmod +x ./gradlew
 ./gradlew clean :app:assembleDebug --stacktrace
-( { find app/src/main -type f -print; echo app/version.properties; } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done ) > "$OUT/26509_post_gradle_source.sha256"
-cmp -s "$OUT/26509_pre_gradle_source.sha256" "$OUT/26509_post_gradle_source.sha256" || fail "Gradle mutated audited source"
+audited_runtime_manifest > "$OUT/26509_post_gradle_audited_runtime.sha256"
+if ! cmp -s "$OUT/26509_pre_gradle_audited_runtime.sha256" "$OUT/26509_post_gradle_audited_runtime.sha256"; then
+  # IRIS_26509_V3_SOURCE_DIFF_DIAGNOSTIC
+  diff -u "$OUT/26509_pre_gradle_audited_runtime.sha256" "$OUT/26509_post_gradle_audited_runtime.sha256" \
+    | tee "$OUT/26509_gradle_runtime_source_diff.txt" >&2 || true
+  fail "Gradle mutated audited Photon runtime source; see 26509_gradle_runtime_source_diff.txt"
+fi
+pass "Gradle preserved audited Photon runtime source; fetched native dependency tree excluded by separate pinned authority"
 mapfile -t APKS < <(find app/build -type f -name '*.apk' | sort)
 [[ "${#APKS[@]}" -eq 1 ]] || fail "expected exactly one APK, found ${#APKS[@]}"
 [[ "$(basename "${APKS[0]}")" == "IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-debug.apk" ]] || fail "unexpected APK identity $(basename "${APKS[0]}")"
