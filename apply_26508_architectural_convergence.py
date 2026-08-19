@@ -781,7 +781,15 @@ def cfa_host(src: str) -> str:
     src = replace_span(src, short_start, final_norm, SHORT_BLOCK, 'replace old direct Short correspondence authority')
 
     diag_start = '                if (iris26496ShortDiag != null) {\n'
-    provenance_start = '                if (directBayer && iris26492ReadbackProvenance != null) {\n'
+    # IRIS_26508_V2_EXACT_26504_DIAGNOSTIC_ANCHOR
+    # 26504 deliberately disabled the heavy provenance readback. 26508 must anchor
+    # to that exact tested form rather than the pre-26504 executable line.
+    provenance_start = '                if (false && /* IRIS_26504_DISABLE_HEAVY_PROVENANCE_READBACK */ directBayer && iris26492ReadbackProvenance != null) {\n'
+    legacy_provenance_start = '                if (directBayer && iris26492ReadbackProvenance != null) {\n'
+    if src.count(provenance_start) != 1:
+        fail('replace Short diagnostics: exact preserved 26504 provenance anchor count='+str(src.count(provenance_start)))
+    if legacy_provenance_start in src:
+        fail('replace Short diagnostics: pre-26504 executable provenance readback unexpectedly active')
     src = replace_span(src, diag_start, provenance_start, DIAG_BLOCK, 'replace Short diagnostics')
 
     cleanup_anchor = '''                if(irisV13ShadowRecovered!=null)irisV13ShadowRecovered.close();if(irisV13ShadowDiag!=null)irisV13ShadowDiag.close();

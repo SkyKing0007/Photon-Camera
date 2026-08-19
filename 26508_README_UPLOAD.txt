@@ -79,3 +79,14 @@ topology rejection, radiometry rejection, recovered phases, and intentionally un
 or disoccluded phases. There is intentionally no hard-coded target such as 95% recovery:
 physically observable areas should improve dramatically over 26507's ~2.81%, while genuine
 motion/disocclusion may remain censored.
+
+26508 V2 anchor/build-procedure correction (no imaging-math change):
+- Fixes only the failed Gate-3 Short diagnostic end anchor: it now targets the exact preserved 26504 disabled heavy-provenance-readback line present in reconstructed tested 26507 V5.
+- Adds an exact pre-transform anchor count proof so this class of mismatch stops in Gate 2 before candidate modification.
+- Verifies backup-26508-failed-transform-before-anchor-fix-20260818 points to failed handoff commit 14d3322f2344620f817769532ba5e8411903696c, matching the corrective-backup pattern used during 26507.
+- Retains the successful 26506/26507 procedure: canonical byte identity, pre-change patch/archive, exact delta, pinned glslang 16.5.0, exact bjzhou native layout, Java/GLSL preflight, version+Gradle in one guarded block, pre/post-Gradle integrity, one-APK invariant, type-aware APK proof, manifest verification, successful-source checkpoint/report.
+- Explicitly guards the known 26507 V3 native-layout failure, V4 Java-scope/Throwable failures, and V5 source-comment-vs-DEX proof failure.
+- Build remains 0.9726508 / 26508 because no 26508 APK was produced by the failed V1 handoff.
+- Motion/HDR transform intent and all 9 intended runtime-file changes are otherwise unchanged.
+
+Suggested corrective commit message: 26508 V2: fix exact diagnostic anchor and retain proven build gates

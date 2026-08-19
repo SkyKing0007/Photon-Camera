@@ -11,6 +11,8 @@ EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 CANONICAL_26502_HEAD="6118984523296945a0910e55ddaa4d3126184059"
 TESTED_26507_V5_HEAD="c4f99d7f3212ac82b0976b41621c8b5bb917d31b"
 BACKUP_26507_V5_BRANCH="backup-26507-tested-before-26508-20260818"
+FAILED_26508_V1_HEAD="14d3322f2344620f817769532ba5e8411903696c"
+BACKUP_26508_V1_BRANCH="backup-26508-failed-transform-before-anchor-fix-20260818"
 BJZHOU_HEAD="09c76e57e8f01a5a8fc536ab41fc80ba642d4042"
 SEED_26503="$ROOT/26503_v2_seed_safe_highlight_shadow_runtime.patch"
 APPLY_26504="$ROOT/apply_26504_integrated.py"; VALIDATOR_26504="$ROOT/validate_26504_integrated.py"
@@ -28,7 +30,7 @@ APPLY_26506_SHA="c34f71ccbfc436df604be410a8dff373d81963826a3359cfff43f28d9807bcc
 VALIDATOR_26506_SHA="9aca6c1bf3e65360542ec1e158bfcb663bf54df1d5c3b8847c103b542f738a6e"
 APPLY_26507_SHA="3552094867cbc56db3fad891cd86c4b1dee2cdbd3d85d1bedc4c8f7bdb4a2723"
 VALIDATOR_26507_SHA="0b74b72c96a1e51604cb2f934e32b69aa5e692cb7101a231d3cf33127975f1b5"
-APPLY_26508_SHA="dc24617dd324f18127e3cd0b1cb980f1708e17c6a4d18142da5ed0c96f125d29"
+APPLY_26508_SHA="1eb66326426dabdb0e7986ceba84427a3a9a2261cb2b63de5d2b67d12625a1c3"
 VALIDATOR_26508_SHA="8859a5fea5fad747ab80cf3e631694ee55db1fa9d6081b85e32e6decc9570c4c"
 rm -rf "$OUT" "$WORK"; mkdir -p "$OUT" "$CANON" "$V26506" "$BEFORE" "$AFTER"
 exec > >(tee "$OUT/26508_build.log") 2>&1
@@ -37,11 +39,14 @@ echo "=== GATE 1: exact tested 26507 V5 lineage + backup + dependency identity =
 BRANCH="$(git branch --show-current)"; START_HEAD="$(git rev-parse HEAD)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch $BRANCH"
 git merge-base --is-ancestor "$TESTED_26507_V5_HEAD" HEAD || fail "tested 26507 V5 handoff missing from lineage"
+git merge-base --is-ancestor "$FAILED_26508_V1_HEAD" HEAD || fail "failed 26508 V1 handoff missing from correction lineage"
 git merge-base --is-ancestor "$CANONICAL_26502_HEAD" HEAD || fail "canonical 26502 missing from lineage"
 git diff --name-only "$CANONICAL_26502_HEAD"..HEAD -- app/src/main app/version.properties > "$OUT/runtime_diff_from_canonical_26502.txt"
 [[ ! -s "$OUT/runtime_diff_from_canonical_26502.txt" ]] || { cat "$OUT/runtime_diff_from_canonical_26502.txt" >&2; fail "committed runtime drift exists"; }
 REMOTE_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_26507_V5_BRANCH" | awk '{print $1}')"
 [[ "$REMOTE_BACKUP" == "$TESTED_26507_V5_HEAD" ]] || fail "backup missing/wrong: $BACKUP_26507_V5_BRANCH -> ${REMOTE_BACKUP:-MISSING}"
+REMOTE_26508_V1_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_26508_V1_BRANCH" | awk '{print $1}')"
+[[ "$REMOTE_26508_V1_BACKUP" == "$FAILED_26508_V1_HEAD" ]] || fail "failed-handoff backup missing/wrong: $BACKUP_26508_V1_BRANCH -> ${REMOTE_26508_V1_BACKUP:-MISSING}"
 for f in "$SEED_26503" "$APPLY_26504" "$VALIDATOR_26504" "$APPLY_26505" "$VALIDATOR_26505" "$APPLY_26506" "$VALIDATOR_26506" "$APPLY_26507" "$VALIDATOR_26507" "$APPLY_26508" "$VALIDATOR_26508" "$INTEGRITY"; do [[ -f "$f" ]] || fail "missing $(basename "$f")"; done
 [[ "$(sha "$SEED_26503")" == "$SEED_26503_SHA" ]] || fail "26503 seed hash mismatch"
 [[ "$(sha "$APPLY_26504")" == "$APPLY_26504_SHA" && "$(sha "$VALIDATOR_26504")" == "$VALIDATOR_26504_SHA" ]] || fail "26504 dependency hash mismatch"
@@ -49,7 +54,7 @@ for f in "$SEED_26503" "$APPLY_26504" "$VALIDATOR_26504" "$APPLY_26505" "$VALIDA
 [[ "$(sha "$APPLY_26506")" == "$APPLY_26506_SHA" && "$(sha "$VALIDATOR_26506")" == "$VALIDATOR_26506_SHA" ]] || fail "26506 dependency hash mismatch"
 [[ "$(sha "$APPLY_26507")" == "$APPLY_26507_SHA" && "$(sha "$VALIDATOR_26507")" == "$VALIDATOR_26507_SHA" ]] || fail "26507 V5 transform/validator hash mismatch"
 [[ "$(sha "$APPLY_26508")" == "$APPLY_26508_SHA" && "$(sha "$VALIDATOR_26508")" == "$VALIDATOR_26508_SHA" ]] || fail "26508 transform/validator hash mismatch"
-pass "GATE 1 exact branch/lineage + backup-26507-tested-before-26508 + dependency hashes"
+pass "GATE 1 exact branch/lineage + tested-26507 backup + failed-26508-V1 backup + dependency hashes"
 
 echo "=== GATE 2: reconstruct exact tested 26507 and freeze PRE-26508 safety artifacts ==="
 git archive "$CANONICAL_26502_HEAD" app/src/main app/version.properties | tar -x -C "$CANON"
@@ -88,6 +93,16 @@ sha256sum "$OUT/26508_PRECHANGE_TESTED_26507_RUNTIME.patch" > "$OUT/26508_PRECHA
 grep -F 'IRIS_26507_MGC_RAW_HALF_GUIDE_PARITY' "$BEFORE/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" >/dev/null
 grep -F 'IRIS_26507_FROZEN_AUX_BATCH_BOUNDARY' "$BEFORE/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java" >/dev/null
 grep -F 'IRIS_26507_GPU_LOCAL_8_CONNECTED_SHORT_TOPOLOGY' "$BEFORE/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_short_weight_26501.glsl" >/dev/null
+python3 - "$BEFORE/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java" <<'PYANCHOR'
+from pathlib import Path
+import sys
+s=Path(sys.argv[1]).read_text()
+anchor='                if (false && /* IRIS_26504_DISABLE_HEAVY_PROVENANCE_READBACK */ directBayer && iris26492ReadbackProvenance != null) {\n'
+legacy='                if (directBayer && iris26492ReadbackProvenance != null) {\n'
+assert s.count(anchor)==1, 'exact preserved 26504 Short-diagnostic end anchor count='+str(s.count(anchor))
+assert legacy not in s, 'pre-26504 heavy provenance readback unexpectedly active'
+print('PASS: exact reconstructed 26507 contains the one preserved 26504 Short-diagnostic end anchor')
+PYANCHOR
 pass "GATE 2 exact tested 26507/V5 runtime reconstructed; pre-26508 patch/archive frozen"
 
 echo "=== GATE 3: apply 26508 and prove exact architectural delta ==="
@@ -105,7 +120,13 @@ git -C "$BJ" config core.sparseCheckout true; mkdir -p "$BJ/.git/info"; printf '
 git -C "$BJ" fetch --depth=1 origin "$BJZHOU_HEAD"; git -C "$BJ" checkout -q --detach FETCH_HEAD
 [[ "$(git -C "$BJ" rev-parse HEAD)" == "$BJZHOU_HEAD" ]] || fail "bjzhou dependency checkout drift"
 THIRD="$AFTER/app/src/main/cpp/third_party_26507"; mkdir -p "$THIRD"; cp -a "$BJ/app/src/main/cpp/libjpeg-turbo" "$THIRD/libjpeg-turbo"; cp -a "$BJ/app/src/main/cpp/libultrahdr" "$THIRD/libultrahdr"
-[[ -f "$THIRD/libjpeg-turbo/src/turbojpeg.h" && -f "$THIRD/libultrahdr/ultrahdr_api.h" && -f "$THIRD/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "pinned native dependency layout missing"
+# Preserve the exact successful 26507 V3 dependency-layout contract.
+[[ -f "$THIRD/libjpeg-turbo/CMakeLists.txt" ]] || fail "pinned libjpeg-turbo CMakeLists missing after sparse checkout"
+[[ -f "$THIRD/libjpeg-turbo/src/turbojpeg.h" ]] || fail "pinned libjpeg-turbo turbojpeg.h missing"
+[[ -f "$THIRD/libultrahdr/ultrahdr_api.h" ]] || fail "pinned libultrahdr root ultrahdr_api.h missing"
+[[ -f "$THIRD/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "pinned libultrahdr core source missing"
+[[ -d "$THIRD/libultrahdr/lib/include/ultrahdr" ]] || fail "pinned libultrahdr internal include tree missing"
+[[ ! -e "$THIRD/libultrahdr/lib/include/ultrahdr_api.h" ]] || fail "unexpected obsolete lib/include/ultrahdr_api.h layout; audited source contract changed"
 ( cd "$THIRD" && find libjpeg-turbo libultrahdr -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum ) > "$OUT/26508_bjzhou_native_dependencies.sha256"
 echo "$BJZHOU_HEAD" > "$OUT/26508_bjzhou_dependency_commit.txt"
 command -v glslangValidator >/dev/null || fail "glslangValidator missing"
@@ -154,6 +175,13 @@ grep -F 'IRIS_26508_GPU_8_CONNECTED_REGION_PROPAGATION' "$AFTER/app/src/main/ass
 ! grep -F 'IRIS_26507_GPU_LOCAL_8_CONNECTED_SHORT_TOPOLOGY' "$WEIGHT" >/dev/null || fail "one-hop 26507 topology survived"
 grep -F 'IRIS_26507_FULL_HDR_DISPLAY_CAPACITY_PARITY' "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java" >/dev/null
 grep -F 'TJSAMP_444' "$AFTER/app/src/main/cpp/motionv2_jpeg444_jni.cpp" >/dev/null
+CC_AFTER="$AFTER/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java"
+JPEG444_AFTER="$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java"
+grep -F 'iris26507ShortExpected' "$CC_AFTER" >/dev/null || fail "26507 V4 in-scope Short freeze owner missing"
+grep -F 'iris26507LongExpected' "$CC_AFTER" >/dev/null || fail "26507 V4 in-scope Long freeze owner missing"
+! grep -F 'iris26480ShortHighlightRequested, iris26505LongRequested, 80L' "$CC_AFTER" >/dev/null || fail "stale out-of-scope 26507 V3 freeze locals returned"
+grep -F 'Log.e(TAG,"IRIS_26507_JPEG444_FAILED",t);' "$JPEG444_AFTER" >/dev/null || fail "26507 V4 Throwable-safe JPEG444 logging missing"
+! grep -F 'Log.getStackTraceString(t)' "$JPEG444_AFTER" >/dev/null || fail "26507 V3 Exception-only JPEG444 stack helper returned"
 [[ "$(grep '^VERSION_NAME=' "$AFTER/app/version.properties" | cut -d= -f2)" == "0.9726502" ]] || fail "version changed before safety proof"
 [[ "$(grep '^VERSION_BUILD=' "$AFTER/app/version.properties" | cut -d= -f2)" == "26502" ]] || fail "build changed before safety proof"
 echo "PRE-BUILD SAFETY PROOF PASSED"
@@ -186,6 +214,9 @@ mapfile -t APKS < <(find app/build -type f -name '*.apk' | sort)
 FINAL="$ROOT/IrisCamera-0.9726508-26508-architectural-convergence-debug.apk"; cp "${APKS[0]}" "$FINAL"; rm -f "${APKS[0]}"
 mapfile -t ALL_APKS < <(find "$ROOT" -type f -name '*.apk' -not -path '*/.gradle/*' | sort)
 [[ "${#ALL_APKS[@]}" -eq 1 && "${ALL_APKS[0]}" == "$FINAL" ]] || { printf '%s\n' "${ALL_APKS[@]}"; fail "exactly-one APK output invariant failed"; }
+# IRIS_26508_TYPED_POSTBUILD_PROOF
+# Same 26507 V5 rule: runtime Java telemetry in DEX, GLSL ownership in packaged
+# shader assets, native JPEG_R bridge as a shared library. Never demand comments from DEX.
 python3 - "$FINAL" "$AFTER" <<'PYAPK'
 import hashlib,sys,zipfile
 p=sys.argv[1]; root=sys.argv[2]
@@ -233,6 +264,7 @@ cat > "$OUT/26508_build_report.txt" <<EOF
 26508 Architectural Convergence
 Start infrastructure HEAD: $START_HEAD
 Protected tested-26507/V5 backup: $BACKUP_26507_V5_BRANCH -> $TESTED_26507_V5_HEAD
+Protected failed-26508/V1 handoff backup: $BACKUP_26508_V1_BRANCH -> $FAILED_26508_V1_HEAD
 Canonical runtime base: tested 26502 $CANONICAL_26502_HEAD
 Version/build: 0.9726508 / 26508
 APK: $(basename "$FINAL")
