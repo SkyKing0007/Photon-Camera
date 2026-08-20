@@ -14,19 +14,35 @@ def one(old: str, new: str, label: str) -> None:
         raise SystemExit(f'{label}: expected exactly one anchor, found {n}')
     s = s.replace(old, new, 1)
 
-# The existing 26514 outer constructor has already proved and reconstructed the exact 26514 base.
-one('OUT="$ROOT/build_26514_iris_profiles_controls_outputs"',
+# Scope constructor identity edits to the executable top-level header. This deliberately ignores
+# any identical literals embedded later in Python/heredoc proof text.
+first_gate_candidates = [i for i in (s.find('\necho "=== GATE'), s.find('\necho "=== 265')) if i >= 0]
+if not first_gate_candidates:
+    raise SystemExit('inner first gate boundary missing')
+cut = min(first_gate_candidates)
+header, body = s[:cut], s[cut:]
+
+def one_header(old: str, new: str, label: str) -> None:
+    global header
+    n = header.count(old)
+    if n != 1:
+        raise SystemExit(f'{label}: expected exactly one top-level header anchor, found {n}')
+    header = header.replace(old, new, 1)
+
+# The existing 26514 constructor has already proved and reconstructed the exact 26514 base.
+one_header('OUT="$ROOT/build_26514_iris_profiles_controls_outputs"',
     'OUT="$ROOT/build_26515_short_bento_exposure_domain_outputs"', 'inner OUT')
-one('WORK="$ROOT/.build_26514_iris_profiles_controls_work"',
+one_header('WORK="$ROOT/.build_26514_iris_profiles_controls_work"',
     'WORK="$ROOT/.build_26515_short_bento_exposure_domain_work"', 'inner WORK')
-one('AFTER="$WORK/candidate26514"', 'AFTER="$WORK/candidate26515"', 'inner candidate')
-one('VERSION_NAME="0.9726514"', 'VERSION_NAME="0.9726515"', 'inner version name')
-one('VERSION_BUILD="26514"', 'VERSION_BUILD="26515"', 'inner version build')
-one('FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-iris-profiles-controls-debug.apk"',
+one_header('AFTER="$WORK/candidate26514"', 'AFTER="$WORK/candidate26515"', 'inner candidate')
+one_header('VERSION_NAME="0.9726514"', 'VERSION_NAME="0.9726515"', 'inner version name')
+one_header('VERSION_BUILD="26514"', 'VERSION_BUILD="26515"', 'inner version build')
+one_header('FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-iris-profiles-controls-debug.apk"',
     'FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-short-bento-domain-fix-debug.apk"',
     'inner final APK')
-one('exec > >(tee "$OUT/26514_build.log") 2>&1',
+one_header('exec > >(tee "$OUT/26514_build.log") 2>&1',
     'exec > >(tee "$OUT/26515_build.log") 2>&1', 'inner build log')
+s = header + body
 
 # Add the 26515 deterministic transform as an explicit constructor input.
 anchor = 'VALIDATE_26514="'

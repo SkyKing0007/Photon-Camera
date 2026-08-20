@@ -41,3 +41,9 @@ UPLOAD
 Upload this package's files preserving the .github/workflows directory, commit them to
 experimental-clean-photon-rebuild, and let the push-triggered workflow run. Do not upload the ZIP
 itself into the repository.
+
+CI RETRY NOTE
+- This corrected handoff scopes inherited 26514 constructor identity edits to executable top-level
+  headers. Duplicate literals inside PYDERIVE/proof heredocs are intentionally ignored.
+- This is a constructor-only correction after a pre-source/pre-Gradle failure. Runtime fix, version
+  0.9726515 / 26515, and the existing 26514 backup remain unchanged.

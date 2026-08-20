@@ -76,16 +76,33 @@ def one(old,new,label):
     if n!=1: raise SystemExit(f'{label}: expected one anchor, found {n}')
     s=s.replace(old,new,1)
 
-one('OUT="$ROOT/build_26514_iris_profiles_controls_outputs"',
+# The 26514 outer script contains some of these literals again inside its PYDERIVE heredoc.
+# Only the real top-level constructor header is allowed to change here.
+gate0='echo "=== 26514 GATE 0: stable 26513 + one backup + exact handoff identities ==="'
+cut=s.find(gate0)
+if cut < 0:
+    raise SystemExit('outer Gate 0 boundary missing')
+header=s[:cut]
+body=s[cut:]
+
+def one_header(old,new,label):
+    global header
+    n=header.count(old)
+    if n!=1:
+        raise SystemExit(f'{label}: expected one top-level header anchor, found {n}')
+    header=header.replace(old,new,1)
+
+one_header('OUT="$ROOT/build_26514_iris_profiles_controls_outputs"',
     'OUT="$ROOT/build_26515_short_bento_exposure_domain_outputs"','outer OUT')
-one('PREOUT="$ROOT/.build_26514_handoff_preflight"',
+one_header('PREOUT="$ROOT/.build_26514_handoff_preflight"',
     'PREOUT="$ROOT/.build_26515_short_bento_preflight"','outer PREOUT')
-one('DERIVED="$ROOT/.build_26514_derived_from_exact_26512.sh"',
+one_header('DERIVED="$ROOT/.build_26514_derived_from_exact_26512.sh"',
     'DERIVED="$ROOT/.build_26515_derived_from_exact_26512.sh"','outer DERIVED')
-one('VERSION_NAME="0.9726514"','VERSION_NAME="0.9726515"','outer version name')
-one('VERSION_BUILD="26514"','VERSION_BUILD="26515"','outer version build')
-one('FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-iris-profiles-controls-debug.apk"',
+one_header('VERSION_NAME="0.9726514"','VERSION_NAME="0.9726515"','outer version name')
+one_header('VERSION_BUILD="26514"','VERSION_BUILD="26515"','outer version build')
+one_header('FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-iris-profiles-controls-debug.apk"',
     'FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-short-bento-domain-fix-debug.apk"','outer final')
+s=header+body
 # Patch the already-proved inner 26514 constructor only after its built-in lineage proof, then run it once.
 one('\n"$DERIVED"\n',
     '\npython3 "'+str(patcher)+'" "$DERIVED"\nbash -n "$DERIVED"\nsha256sum "$DERIVED" > "$PREOUT/26515_EXECUTED_DERIVED_BUILDER.sha256"\n"$DERIVED"\n',
