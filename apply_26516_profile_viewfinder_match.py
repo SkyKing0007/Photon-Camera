@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, difflib, hashlib
+import argparse, difflib, hashlib, re
 from pathlib import Path
 
 CHANGED = {
@@ -191,10 +191,10 @@ import static android.opengl.GLES20.GL_LINEAR;
  * Manual Iris Exposure remains a later, independent user control.
  */
 public final class MotionV2ViewfinderExposureMatcher extends Node {
-    private static final int PROBE_W = 48;
-    private static final int PROBE_H = 36;
-    private static final float MIN_EV = -2.5f;
-    private static final float MAX_EV = 3.0f;
+    private static final int METER_LONG_EDGE = 256;
+    private static final float MIN_EV = -4.0f;
+    private static final float MAX_EV = 4.0f;
+    private static final int MAX_ITERATIONS = 4;
     private static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
     private static final float LOG2 = (float)Math.log(2.0);
 
@@ -239,7 +239,8 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
             }
 
             ArrayList<Float> previewLuma = collectPreviewMidtones(preview);
-            ArrayList<RgbSample> candidate = collectCandidateSamples(previousNode.WorkingTexture);
+            ArrayList<RgbSample> candidate = collectCandidateSamples(
+                    previousNode.WorkingTexture, preview.getWidth(), preview.getHeight());
             previewCount = previewLuma.size();
             candidateCount = candidate.size();
             if (previewCount < 32 || candidateCount < 32) {
@@ -276,7 +277,9 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
                     + " solvedEv=" + solvedEv
                     + " displayGain=" + gain
                     + " fixedCandidateSampleSet=true"
-                    + " boundedSecant=true probeStepEv=0.5"
+                    + " boundedSecant=true probeStepEv=0.5 maxIterations=4 evBounds=-4..4"
+                    + " meterLongEdge=" + METER_LONG_EDGE
+                    + " displayLinearLuma=true candidateMidtoneBand=P25-P50"
                     + " legacyRawGainAuthority=false"
                     + " manualIrisExposureLater=true"
                     + " camera2Write=false");
@@ -313,22 +316,27 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
         bitmap.getPixels(pixels, 0, w, 0, 0, w, h);
         ArrayList<Float> luma = new ArrayList<>();
         for (int c : pixels) {
-            float r = ((c >> 16) & 0xff) / 255.0f;
-            float g = ((c >> 8) & 0xff) / 255.0f;
-            float b = (c & 0xff) / 255.0f;
+            float r = srgbDecode(((c >> 16) & 0xff) / 255.0f);
+            float g = srgbDecode(((c >> 8) & 0xff) / 255.0f);
+            float b = srgbDecode((c & 0xff) / 255.0f);
             float y = 0.2126f * r + 0.7152f * g + 0.0722f * b;
             if (Float.isFinite(y) && y > 0.025f && y < 0.975f) luma.add(y);
         }
         Collections.sort(luma);
-        return trimMiddle(luma, 0.18f, 0.82f);
+        return trimMiddle(luma, 0.25f, 0.50f);
     }
 
-    private ArrayList<RgbSample> collectCandidateSamples(GLTexture source) {
+    private ArrayList<RgbSample> collectCandidateSamples(GLTexture source, int previewW, int previewH) {
         int[] oldFramebuffer = new int[1];
         GLTexture probe = null;
         try {
             GLES30.glGetIntegerv(GL_FRAMEBUFFER_BINDING, oldFramebuffer, 0);
-            Point size = new Point(PROBE_W, PROBE_H);
+            int longEdge = Math.max(previewW, previewH);
+            if (longEdge <= 0 || longEdge > METER_LONG_EDGE) {
+                throw new IllegalStateException("invalid viewfinder meter dimensions "
+                        + previewW + "x" + previewH);
+            }
+            Point size = new Point(previewW, previewH);
             probe = new GLTexture(size, new GLFormat(GLFormat.DataType.FLOAT_32, 4), null,
                     GL_LINEAR, GL_CLAMP_TO_EDGE);
             glProg.useProgram(
@@ -339,7 +347,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
                     + "void main(){vec2 uv=(gl_FragCoord.xy-vec2(0.5))/OutputSize;"
                     + "Output=texture(InputBuffer,clamp(uv,vec2(0.0),vec2(1.0)));}\n");
             glProg.setTexture("InputBuffer", source);
-            glProg.setVar("OutputSize", (float)PROBE_W, (float)PROBE_H);
+            glProg.setVar("OutputSize", (float)previewW, (float)previewH);
             glProg.drawBlocks(probe);
             glProg.closed = true;
             probe.BufferLoad();
@@ -357,9 +365,9 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
                 if (y > 1.0e-4f && y < 8.0f) all.add(new RgbSample(r, g, b));
             }
             all.sort(Comparator.comparingDouble(s -> presentedLuma(s, 1.0f)));
-            int from = Math.max(0, Math.round((all.size() - 1) * 0.18f));
+            int from = Math.max(0, Math.round((all.size() - 1) * 0.25f));
             int to = Math.min(all.size(), Math.max(from + 1,
-                    Math.round((all.size() - 1) * 0.82f) + 1));
+                    Math.round((all.size() - 1) * 0.50f) + 1));
             return new ArrayList<>(all.subList(from, to));
         } finally {
             if (probe != null) try { probe.close(); } catch (Throwable ignored) {}
@@ -412,7 +420,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
             return bestEv;
         }
 
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < MAX_ITERATIONS; i++) {
             float denom = fhi - flo;
             float x = Math.abs(denom) > 1.0e-5f
                     ? lo - flo * (hi - lo) / denom
@@ -457,7 +465,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
             g = mix(g / outPeak, 1.0f, t);
             b = mix(b / outPeak, 1.0f, t);
         }
-        r = srgbEncode(r); g = srgbEncode(g); b = srgbEncode(b);
         return clamp(luma(r, g, b), 0.0f, 1.0f);
     }
 
@@ -472,11 +479,11 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
         return start + (preScaleDisplayWhite - start) * shaped;
     }
 
-    private static float srgbEncode(float x) {
-        x = Math.max(x, 0.0f);
-        return x <= 0.0031308f
-                ? 12.92f * x
-                : 1.055f * (float)Math.pow(x, 1.0 / 2.4) - 0.055f;
+    private static float srgbDecode(float x) {
+        x = clamp(x, 0.0f, 1.0f);
+        return x <= 0.04045f
+                ? x / 12.92f
+                : (float)Math.pow((x + 0.055f) / 1.055f, 2.4);
     }
 
     private static float luma(float r, float g, float b) {
@@ -511,8 +518,9 @@ import com.particlesdevs.photoncamera.util.Log;
  *
  * Camera-linear RGB is source-restored before this node. Use the DNG/profile-derived
  * sensorToProPhoto + ProPhotoToSRGB matrices already calculated from SENSOR_NEUTRAL_COLOR_POINT,
- * ColorMatrix/ForwardMatrix/CalibrationTransform metadata. Camera white is clipped in camera
- * space before the profile transform, matching the DNG-style domain ordering used by bjzhou.
+ * ColorMatrix/ForwardMatrix/CalibrationTransform metadata. The camera neutral is already consumed
+ * while Parameters constructs sensorToProPhoto, so do NOT hard-clip reconstructed HDR RGB against
+ * cameraWhite a second time here.
  */
 public final class MotionV2ColorTransform extends Node {
     public MotionV2ColorTransform() { super("", "MotionV2ColorTransform"); }
@@ -523,31 +531,20 @@ public final class MotionV2ColorTransform extends Node {
         if (!basePipeline.mParameters.motionV2Active) {
             throw new IllegalStateException("MotionV2ColorTransform outside Motion V2");
         }
-        float[] white = basePipeline.mParameters.whitePoint;
+        float[] cameraNeutral = basePipeline.mParameters.whitePoint;
         float[] sensorToProPhoto = basePipeline.mParameters.sensorToProPhoto;
         float[] proPhotoToSrgb = basePipeline.mParameters.proPhotoToSRGB;
-        if (white == null || white.length < 3
+        if (cameraNeutral == null || cameraNeutral.length < 3
                 || sensorToProPhoto == null || sensorToProPhoto.length != 9
                 || proPhotoToSrgb == null || proPhotoToSrgb.length != 9) {
             throw new IllegalStateException("Invalid Motion V2 DNG/profile color metadata dimensions");
         }
-        requireFinitePositive3(white, "camera neutral");
+        requireFinitePositive3(cameraNeutral, "camera neutral");
         requireFinite9(sensorToProPhoto, "sensorToProPhoto");
         requireFinite9(proPhotoToSrgb, "proPhotoToSRGB");
 
-        float maxWhite = Math.max(white[0], Math.max(white[1], white[2]));
-        if (!Float.isFinite(maxWhite) || maxWhite <= 1.0e-6f) {
-            throw new IllegalStateException("Invalid Motion V2 DNG camera white normalization");
-        }
-        float[] cameraWhite = new float[]{
-                Math.max(0.001f, Math.min(1.0f, white[0] / maxWhite)),
-                Math.max(0.001f, Math.min(1.0f, white[1] / maxWhite)),
-                Math.max(0.001f, Math.min(1.0f, white[2] / maxWhite)),
-        };
-
         glProg.useAssetProgram("motionv2/color_transform");
         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
-        glProg.setVar("cameraWhite", cameraWhite);
         setRows("sensorToProfile", sensorToProPhoto);
         setRows("profileToSrgb", proPhotoToSrgb);
 
@@ -556,12 +553,14 @@ public final class MotionV2ColorTransform extends Node {
         glProg.closed = true;
 
         Log.d(Name, "IRIS_26516_DNG_PROFILE_COLOR"
-                + " cameraWhite=" + java.util.Arrays.toString(cameraWhite)
+                + " cameraNeutral=" + java.util.Arrays.toString(cameraNeutral)
                 + " sensorToProPhoto=" + java.util.Arrays.toString(sensorToProPhoto)
                 + " proPhotoToSrgb=" + java.util.Arrays.toString(proPhotoToSrgb)
                 + " camera2DirectGainsBypassed=true"
                 + " camera2Direct3x3Bypassed=true"
-                + " cameraWhiteClipBeforeProfile=true"
+                + " cameraNeutralConsumedInsideProfileMatrix=true"
+                + " additionalCameraWhiteClip=false"
+                + " reconstructedHdrHeadroomPreserved=true"
                 + " neutralAxisNegativeGamutFit=true"
                 + " extendedLinearOutput=true");
     }
@@ -595,7 +594,6 @@ COLOR_GLSL = r'''precision highp float;
 precision mediump sampler2D;
 
 uniform sampler2D InputBuffer;
-uniform vec3 cameraWhite;
 uniform vec3 sensorToProfileRow0;
 uniform vec3 sensorToProfileRow1;
 uniform vec3 sensorToProfileRow2;
@@ -605,15 +603,14 @@ uniform vec3 profileToSrgbRow2;
 out vec3 Output;
 
 /*
- * IRIS_26516_DNG_PROFILE_CAMERA_WHITE_DOMAIN
- * Restore MGC source exposure first, then clip against the DNG camera white in camera space.
- * Convert through the DNG/profile-derived working transform. Do not use the old direct Camera2
- * gains -> Camera2 3x3 path here.
+ * IRIS_26516_DNG_PROFILE_HDR_PRESERVING_DOMAIN
+ * Parameters.sensorToProPhoto already incorporates the timestamp-owned camera neutral through the
+ * DNG profile construction. Preserve reconstructed values above 1.0 here; highlight headroom is
+ * rendered later by the frozen 26515 MotionV2Render path.
  */
 void main() {
     ivec2 xy = ivec2(gl_FragCoord.xy);
     vec3 cameraRgb = max(texelFetch(InputBuffer, xy, 0).rgb, vec3(0.0));
-    cameraRgb = min(cameraRgb, max(cameraWhite, vec3(0.001)));
 
     vec3 profileRgb = vec3(
             dot(sensorToProfileRow0, cameraRgb),
@@ -624,9 +621,8 @@ void main() {
             dot(profileToSrgbRow1, profileRgb),
             dot(profileToSrgbRow2, profileRgb));
 
-    /* Neutral-axis gamut floor: a small negative component from a wide-gamut matrix must not be
-     * independently clipped to zero and turn a green deficit into a magenta edge. Translate all
-     * channels equally until the minimum reaches zero, preserving channel differences.
+    /* Neutral-axis gamut floor: do not independently clamp a single negative channel and create
+     * a synthetic magenta/cyan edge. Translate all channels equally until the minimum reaches 0.
      */
     float negativeFloor = min(linearSrgb.r, min(linearSrgb.g, linearSrgb.b));
     if (negativeFloor < 0.0) linearSrgb -= vec3(negativeFloor);
@@ -717,6 +713,36 @@ def need(text: str, token: str, label: str) -> None:
         raise AssertionError(f'{label}: missing {token!r}')
 
 
+def add_import(text: str, import_line: str, label: str) -> str:
+    if import_line in text:
+        return text
+    m = re.search(r'(?m)^import\s+', text)
+    if not m:
+        raise AssertionError(f'{label}: no Java import section')
+    return text[:m.start()] + import_line + '\n' + text[m.start():]
+
+
+def replace_marker_range(text: str, start_marker: str, end_marker: str,
+                         replacement: str, label: str) -> str:
+    si = text.find(start_marker)
+    ei = text.find(end_marker, si + 1) if si >= 0 else -1
+    if si < 0 or ei < 0:
+        raise AssertionError(f'{label}: marker range missing')
+    start = text.rfind('            /*', 0, si + 1)
+    if start < 0:
+        raise AssertionError(f'{label}: opening owned comment not found')
+    end_line = text.find('\n', ei)
+    close = text.find('\n            }', end_line)
+    if close < 0 or close - end_line > 256:
+        raise AssertionError(f'{label}: manual-control closing brace not found')
+    after_close = text.find('\n', close + 1)
+    if after_close < 0:
+        after_close = len(text)
+    else:
+        after_close += 1
+    return text[:start] + replacement + text[after_close:]
+
+
 def expected_text(rel: str, base: str) -> str:
     if rel in NEW_FILES:
         if base:
@@ -725,14 +751,55 @@ def expected_text(rel: str, base: str) -> str:
 
     s = base
     if rel.endswith('PhotonMotionMgc1271Bridge.kt'):
-        old = '''            parameters.motionV2MgcSourceExposureGain = baselineScale\n            parameters.motionV2DisplayGain = referenceDisplayGain\n'''
-        new = '''            parameters.motionV2MgcSourceExposureGain = baselineScale\n            /* IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY\n             * Retire the old RAW p50/p90 estimator as an output authority. Keep its already-computed\n             * referenceDisplayGain only as diagnostic evidence; shutter-time viewfinder matching\n             * will set motionV2DisplayGain after DNG/profile color.\n             */\n            parameters.motionV2DisplayGain = 1.0f\n            PLog.i(TAG, "IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY " +\n                "legacyRawDisplayGainDiagnostic=$referenceDisplayGain " +\n                "initialPresentationGain=${parameters.motionV2DisplayGain} " +\n                "sourceDomainGain=${parameters.motionV2MgcSourceExposureGain} " +\n                "solverAfterProfileColor=true camera2Write=false")\n'''
+        need(s, 'IRIS_26515_SHORT_BASELINE_DOMAIN', '26515 Short domain base')
+        need(s, 'parameters.motionV2MgcSourceExposureGain = baselineScale', '26515 source restore authority')
+        old = '            parameters.motionV2DisplayGain = referenceDisplayGain\n'
+        new = '''            /* IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY
+             * Retire the old RAW p50/p90 estimator as an output authority. Keep its already-computed
+             * referenceDisplayGain only as diagnostic evidence; shutter-time viewfinder matching
+             * will set motionV2DisplayGain after DNG/profile color.
+             */
+            parameters.motionV2DisplayGain = 1.0f
+            PLog.i(TAG, "IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY " +
+                "legacyRawDisplayGainDiagnostic=$referenceDisplayGain " +
+                "initialPresentationGain=${parameters.motionV2DisplayGain} " +
+                "sourceDomainGain=${parameters.motionV2MgcSourceExposureGain} " +
+                "solverAfterProfileColor=true camera2Write=false")
+'''
         return one(s, old, new, 'bridge retires RAW histogram display authority')
 
     if rel.endswith('PostPipeline.java'):
-        anchor = '''            /*\n             * IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY\n             * Wronski is complete before scene/display exposure is applied.\n             */\n            add(new MotionV2DisplayExposure());\n            add(new StageTelemetry("V2_POST_DISPLAY_EXPOSURE_AFTER_WRONSKI"));\n            add(new MotionV2ColorTransform());\n            add(new StageTelemetry("V2_POST_CAMERA2_COLOR_TRANSFORM"));\n\n            /* IRIS_26514_OPTIONAL_LINEAR_PRESENTATION_CONTROLS\n             * Neutral settings add no node/pass at all, preserving exact 26513 input to render.\n             * Non-neutral exposure/shadows/contrast operate on the common extended-linear source\n             * before MotionV2Render derives both SDR and UHDR.\n             */\n            IrisMotionSettings.Snapshot irisMotionSettings = IrisMotionSettings.current();\n            if (irisMotionSettings.hasToneAdjustment()) {\n                add(new IrisMotionToneControls(irisMotionSettings));\n                add(new StageTelemetry("IRIS_26514_LINEAR_PRESENTATION_CONTROLS"));\n            }\n'''
-        replacement = '''            /* IRIS_26516_POST_MGC_DOMAIN_ORDER\n             * MGC BaselineExposure restores only the darker source domain. Profile color then\n             * establishes the DNG-aware working domain. Automatic presentation EV is solved\n             * from the shutter-time viewfinder only after color; the user's Iris controls remain\n             * later and additive.\n             */\n            add(new MotionV2MgcSourceExposure());\n            add(new StageTelemetry("V2_POST_MGC_SOURCE_RESTORE"));\n            add(new MotionV2ColorTransform());\n            add(new StageTelemetry("V2_POST_DNG_PROFILE_COLOR_TRANSFORM"));\n            add(new MotionV2ViewfinderExposureMatcher());\n            add(new StageTelemetry("V2_POST_VIEWFINDER_EXPOSURE_SOLVE"));\n            add(new MotionV2DisplayExposure());\n            add(new StageTelemetry("V2_POST_VIEWFINDER_PRESENTATION_EXPOSURE"));\n\n            /* IRIS_26514_OPTIONAL_LINEAR_PRESENTATION_CONTROLS\n             * Manual Iris Exposure/Shadows/Contrast remain independent of the automatic\n             * viewfinder match and operate afterward on the common extended-linear source.\n             */\n            IrisMotionSettings.Snapshot irisMotionSettings = IrisMotionSettings.current();\n            if (irisMotionSettings.hasToneAdjustment()) {\n                add(new IrisMotionToneControls(irisMotionSettings));\n                add(new StageTelemetry("IRIS_26514_LINEAR_PRESENTATION_CONTROLS"));\n            }\n'''
-        s = one(s, anchor, replacement, 'post-MGC profile/viewfinder graph ordering')
+        need(s, 'IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY', '26515 display boundary marker')
+        need(s, 'IRIS_26514_OPTIONAL_LINEAR_PRESENTATION_CONTROLS', '26514 manual controls marker')
+        replacement = '''            /* IRIS_26516_POST_MGC_DOMAIN_ORDER
+             * MGC BaselineExposure restores only the darker source domain. Profile color then
+             * establishes the DNG-aware working domain. Automatic presentation EV is solved
+             * from the shutter-time viewfinder only after color; the user's Iris controls remain
+             * later and additive.
+             */
+            add(new MotionV2MgcSourceExposure());
+            add(new StageTelemetry("V2_POST_MGC_SOURCE_RESTORE"));
+            add(new MotionV2ColorTransform());
+            add(new StageTelemetry("V2_POST_DNG_PROFILE_COLOR_TRANSFORM"));
+            add(new MotionV2ViewfinderExposureMatcher());
+            add(new StageTelemetry("V2_POST_VIEWFINDER_EXPOSURE_SOLVE"));
+            add(new MotionV2DisplayExposure());
+            add(new StageTelemetry("V2_POST_VIEWFINDER_PRESENTATION_EXPOSURE"));
+
+            /* IRIS_26514_OPTIONAL_LINEAR_PRESENTATION_CONTROLS
+             * Manual Iris Exposure/Shadows/Contrast remain independent of the automatic
+             * viewfinder match and operate afterward on the common extended-linear source.
+             */
+            IrisMotionSettings.Snapshot irisMotionSettings = IrisMotionSettings.current();
+            if (irisMotionSettings.hasToneAdjustment()) {
+                add(new IrisMotionToneControls(irisMotionSettings));
+                add(new StageTelemetry("IRIS_26514_LINEAR_PRESENTATION_CONTROLS"));
+            }
+'''
+        s = replace_marker_range(
+            s, 'IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY',
+            'add(new StageTelemetry("IRIS_26514_LINEAR_PRESENTATION_CONTROLS"));',
+            replacement, 'post-MGC profile/viewfinder graph ordering')
         old_nodes = 'nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,MotionV2DisplayExposure,MotionV2ColorTransform,MotionV2Render,RotateWatermark'
         if old_nodes in s:
             s = s.replace(old_nodes,
@@ -744,33 +811,98 @@ def expected_text(rel: str, base: str) -> str:
         return DISPLAY_JAVA
 
     if rel.endswith('MotionV2ColorTransform.java'):
-        need(s, 'IRIS_26482_CAMERA2_COLOR_ONLY_AFTER_CFA_AUTHORITY', 'old direct Camera2 color base')
+        need(s, 'MotionV2ColorTransform', 'pre-26516 color class')
+        need(s, 'motionV2ColorGains', 'pre-26516 direct Camera2 gain owner')
         return COLOR_JAVA
 
     if rel.endswith('GLPreview.java'):
-        s = one(s,
-            'import android.graphics.Matrix;\nimport android.graphics.Point;\n',
-            'import android.graphics.Bitmap;\nimport android.graphics.Matrix;\nimport android.graphics.Point;\nimport android.os.Build;\n',
-            'GLPreview Bitmap/Build imports')
-        s = one(s,
-            'import android.view.SurfaceHolder;\nimport android.view.TextureView;\n',
-            'import android.view.PixelCopy;\nimport android.view.SurfaceHolder;\nimport android.view.TextureView;\n\nimport com.particlesdevs.photoncamera.processing.processor.MotionViewfinderMetering;\nimport com.particlesdevs.photoncamera.util.Log;\n',
-            'GLPreview PixelCopy imports')
-        anchor = '''    public void setMirror(boolean mirror) {\n        mRenderer.setMirror(mirror);\n        requestRender();\n    }\n\n    boolean available = false;\n'''
-        replacement = '''    public void setMirror(boolean mirror) {\n        mRenderer.setMirror(mirror);\n        requestRender();\n    }\n\n    /** IRIS_26516_SHUTTER_VIEWFINDER_PIXELCOPY\n     * Request a small copy of the already-rendered preview surface. The copy is asynchronous: the\n     * still capture proceeds immediately, while Motion postprocessing consumes the result later.\n     */\n    public void requestMotionViewfinderMetering() {\n        final long requestId = MotionViewfinderMetering.beginRequest();\n        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N\n                || getHolder() == null || getHolder().getSurface() == null\n                || !getHolder().getSurface().isValid()\n                || getWidth() <= 0 || getHeight() <= 0) {\n            MotionViewfinderMetering.fail(requestId, PixelCopy.ERROR_SOURCE_INVALID);\n            Log.w("GLPreview", "IRIS_26516_VIEWFINDER_PIXELCOPY unavailable requestId=" + requestId);\n            return;\n        }\n        int srcW = getWidth(), srcH = getHeight();\n        int longEdge = 256;\n        int dstW, dstH;\n        if (srcW >= srcH) {\n            dstW = longEdge;\n            dstH = Math.max(1, Math.round(longEdge * srcH / (float)srcW));\n        } else {\n            dstH = longEdge;\n            dstW = Math.max(1, Math.round(longEdge * srcW / (float)srcH));\n        }\n        final Bitmap bitmap = Bitmap.createBitmap(dstW, dstH, Bitmap.Config.ARGB_8888);\n        try {\n            PixelCopy.request(this, bitmap, result -> {\n                MotionViewfinderMetering.complete(requestId, result, bitmap);\n                Log.d("GLPreview", "IRIS_26516_VIEWFINDER_PIXELCOPY requestId=" + requestId\n                        + " result=" + result + " size=" + dstW + "x" + dstH\n                        + " asynchronous=true captureBlocked=false");\n            }, handler);\n        } catch (Throwable t) {\n            MotionViewfinderMetering.fail(requestId, PixelCopy.ERROR_UNKNOWN);\n            if (!bitmap.isRecycled()) bitmap.recycle();\n            Log.w("GLPreview", "IRIS_26516_VIEWFINDER_PIXELCOPY exception="\n                    + t.getClass().getSimpleName() + " requestId=" + requestId);\n        }\n    }\n\n    boolean available = false;\n'''
-        return one(s, anchor, replacement, 'GLPreview shutter-time PixelCopy method')
+        need(s, 'public class GLPreview extends GLSurfaceView', 'GLPreview class base')
+        need(s, 'boolean available = false;', 'GLPreview lifecycle anchor')
+        for imp in (
+            'import android.graphics.Bitmap;',
+            'import android.os.Build;',
+            'import android.view.PixelCopy;',
+            'import com.particlesdevs.photoncamera.processing.processor.MotionViewfinderMetering;',
+            'import com.particlesdevs.photoncamera.util.Log;',
+        ):
+            s = add_import(s, imp, 'GLPreview 26516 imports')
+        marker = '    boolean available = false;\n'
+        method = '''    /** IRIS_26516_SHUTTER_VIEWFINDER_PIXELCOPY
+     * Request a small copy of the already-rendered preview surface. The copy is asynchronous: the
+     * still capture proceeds immediately, while Motion postprocessing consumes the result later.
+     */
+    public void requestMotionViewfinderMetering() {
+        final long requestId = MotionViewfinderMetering.beginRequest();
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N
+                || getHolder() == null || getHolder().getSurface() == null
+                || !getHolder().getSurface().isValid()
+                || getWidth() <= 0 || getHeight() <= 0) {
+            MotionViewfinderMetering.fail(requestId, PixelCopy.ERROR_SOURCE_INVALID);
+            Log.w("GLPreview", "IRIS_26516_VIEWFINDER_PIXELCOPY unavailable requestId=" + requestId);
+            return;
+        }
+        int srcW = getWidth(), srcH = getHeight();
+        int longEdge = 256;
+        int dstW, dstH;
+        if (srcW >= srcH) {
+            dstW = longEdge;
+            dstH = Math.max(1, Math.round(longEdge * srcH / (float)srcW));
+        } else {
+            dstH = longEdge;
+            dstW = Math.max(1, Math.round(longEdge * srcW / (float)srcH));
+        }
+        final Bitmap bitmap = Bitmap.createBitmap(dstW, dstH, Bitmap.Config.ARGB_8888);
+        try {
+            PixelCopy.request(this, bitmap, result -> {
+                MotionViewfinderMetering.complete(requestId, result, bitmap);
+                Log.d("GLPreview", "IRIS_26516_VIEWFINDER_PIXELCOPY requestId=" + requestId
+                        + " result=" + result + " size=" + dstW + "x" + dstH
+                        + " asynchronous=true captureBlocked=false");
+            }, handler);
+        } catch (Throwable t) {
+            MotionViewfinderMetering.fail(requestId, PixelCopy.ERROR_UNKNOWN);
+            if (!bitmap.isRecycled()) bitmap.recycle();
+            Log.w("GLPreview", "IRIS_26516_VIEWFINDER_PIXELCOPY exception="
+                    + t.getClass().getSimpleName() + " requestId=" + requestId);
+        }
+    }
+
+'''
+        return one(s, marker, method + marker, 'GLPreview shutter-time PixelCopy method')
 
     if rel.endswith('CameraUIController.java'):
-        old = '''    private void onTimerFinished() {\n        this.shutterButton.setHovered(false);\n        this.shutterButton.setActivated(false);\n        this.shutterButton.setClickable(false);\n        cameraFragment.captureController.takePicture();\n    }\n'''
-        new = '''    private void onTimerFinished() {\n        this.shutterButton.setHovered(false);\n        this.shutterButton.setActivated(false);\n        this.shutterButton.setClickable(false);\n        /* IRIS_26516_SHUTTER_VIEWFINDER_SNAPSHOT\n         * Fire the asynchronous preview copy immediately before Motion capture. No wait and no\n         * Camera2 mutation: takePicture() proceeds in the same UI turn.\n         */\n        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {\n            cameraFragment.textureView.requestMotionViewfinderMetering();\n        }\n        cameraFragment.captureController.takePicture();\n    }\n'''
-        return one(s, old, new, 'UI shutter snapshot trigger')
+        method_marker = '    private void onTimerFinished() {'
+        mi = s.find(method_marker)
+        if mi < 0:
+            raise AssertionError('UI shutter snapshot trigger: onTimerFinished missing')
+        me = s.find('\n    }', mi)
+        if me < 0:
+            raise AssertionError('UI shutter snapshot trigger: onTimerFinished closing brace missing')
+        method = s[mi:me]
+        call = '        cameraFragment.captureController.takePicture();'
+        if method.count(call) != 1:
+            raise AssertionError('UI shutter snapshot trigger: takePicture call not unique in onTimerFinished')
+        insert = '''        /* IRIS_26516_SHUTTER_VIEWFINDER_SNAPSHOT
+         * Fire the asynchronous preview copy immediately before Motion capture. No wait and no
+         * Camera2 mutation: takePicture() proceeds in the same UI turn.
+         */
+        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
+            cameraFragment.textureView.requestMotionViewfinderMetering();
+        }
+'''
+        new_method = method.replace(call, insert + call, 1)
+        return s[:mi] + new_method + s[me:]
 
     if rel.endswith('display_exposure.glsl'):
-        need(s, 'Output = c * max(displayGain, 1.0);', '26515 scalar shader base')
+        need(s, 'uniform sampler2D InputBuffer;', '26515 scalar shader interface')
+        need(s, 'uniform float displayGain;', '26515 scalar shader interface')
+        need(s, 'out vec3 Output;', '26515 scalar shader interface')
         return DISPLAY_GLSL
 
     if rel.endswith('color_transform.glsl'):
-        need(s, 'uniform vec3 sensorGains;', 'old Camera2 gains shader base')
+        need(s, 'uniform sampler2D InputBuffer;', 'pre-26516 color shader interface')
+        need(s, 'out vec3 Output;', 'pre-26516 color shader interface')
+        need(s, 'sensorGains', 'pre-26516 direct Camera2 color owner')
         return COLOR_GLSL
 
     raise AssertionError(f'unexpected changed path: {rel}')

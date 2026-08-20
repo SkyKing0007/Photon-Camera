@@ -8,6 +8,7 @@ ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 SUCCESSFUL_26515_HEAD="01a53d2301dc32a246eba52e3d2e965f7a498cfd"
 FAILED_26516_V1_HEAD="b4461c6c969fd56fee8f353bd58bc444cbb59aee"
+FAILED_26516_V2_HEAD="5c527421dc312e998444e4a97683c032faff27ee"
 BACKUP_26515="backup-26515-before-26516-profile-viewfinder-20260820"
 BACKUP_26516_V1="backup-26516-v1-before-handoff-gate-fix-20260820"
 BASE_WORKFLOW="build-26515-short-bento-domain.yml"
@@ -33,11 +34,12 @@ FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-profile-viewfinder-matc
 rm -rf "$OUT" "$WORK"; mkdir -p "$OUT" "$ART" "$BASE" "$AFTER"
 exec > >(tee "$OUT/26516_build.log") 2>&1
 
-echo "=== 26516 V2 GATE 0: exact successful-26515 runtime + failed-v1 handoff backup + direct-source-only handoff ==="
+echo "=== 26516 V3 GATE 0: exact successful-26515 runtime + failed-v1 handoff backup + direct-source-only handoff ==="
 BRANCH="$(git branch --show-current)"; START_HEAD="$(git rev-parse HEAD)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26515_HEAD" HEAD || fail "handoff is not descended from successful 26515 HEAD"
-git merge-base --is-ancestor "$FAILED_26516_V1_HEAD" HEAD || fail "v2 correction is not descended from failed 26516 v1 handoff"
+git merge-base --is-ancestor "$FAILED_26516_V1_HEAD" HEAD || fail "v3 correction is not descended from failed 26516 v1 handoff"
+git merge-base --is-ancestor "$FAILED_26516_V2_HEAD" HEAD || fail "v3 correction is not descended from failed 26516 v2 handoff"
 REMOTE_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_26515" | awk '{print $1}')"
 [[ "$REMOTE_BACKUP" == "$SUCCESSFUL_26515_HEAD" ]] || fail "backup missing/wrong: $BACKUP_26515 -> ${REMOTE_BACKUP:-MISSING}; expected $SUCCESSFUL_26515_HEAD"
 REMOTE_V1_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_26516_V1" | awk '{print $1}')"
@@ -76,9 +78,9 @@ if found:
     raise SystemExit('historical runtime constructor reference(s) found: '+', '.join(found))
 print('PASS: no 26512-26515 runtime constructor invocation in 26516 builder')
 PYNOBACK
-pass "exact 26515 runtime backup + exact failed-v1 handoff backup verified; no committed runtime/build drift; historical constructors prohibited"
+pass "26515 runtime backup + existing v1 handoff backup verified; exact failed-v2 ancestry verified; no new backup required; no committed runtime/build drift"
 
-echo "=== 26516 V2 GATE 1: recover and trust the ACTUAL manifest-verified source snapshot emitted by successful 26515 ==="
+echo "=== 26516 V3 GATE 1: recover and trust the ACTUAL manifest-verified source snapshot emitted by successful 26515 ==="
 command -v gh >/dev/null || fail "GitHub CLI (gh) unavailable"
 [[ -n "${GH_TOKEN:-}" ]] || fail "GH_TOKEN missing; Actions artifact cannot be authenticated"
 RUN_JSON="$WORK/26515_runs.json"
@@ -126,7 +128,7 @@ grep -F 'IRIS_26515_FUSED_LINEAR_SOURCE_RESTORE=true' "$BASE/app/src/main/java/c
 grep -F 'IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java" >/dev/null || fail "26515 render authority split missing"
 grep -F 'IRIS_26514_OPTIONAL_LINEAR_PRESENTATION_CONTROLS' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java" >/dev/null || fail "26514 manual control graph missing"
 
-# IRIS_26516_V2_ARTIFACT_BYTE_AUTHORITY
+# IRIS_26516_V3_ARTIFACT_CONTRACT_AUTHORITY
 # The successful 26515 artifact + its own manifest are the sole byte authority. Do NOT compare
 # artifact files to the repository placeholder app/src/main tree: successful 26515 intentionally
 # built from its predecessor artifact and emitted a new source snapshot without committing runtime.
@@ -148,7 +150,7 @@ for rel in sorted(mod.CHANGED):
     if p.is_file():
         lines.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {rel}")
 out.write_text("\n".join(lines)+"\n")
-print('PASS: deterministic 26516 transform anchors resolve against actual manifest-verified 26515 artifact source')
+print('PASS: semantic 26516 transform contracts resolve against actual manifest-verified 26515 artifact source')
 print('PASS: repository-placeholder byte hashes are not used as 26515 runtime authority')
 PYBASECOMPAT
 
@@ -164,7 +166,7 @@ BASE_VERSION=0.9726515/26515
 EOF
 pass "actual successful-26515 source snapshot recovered; manifest + deterministic-transform compatibility proven without repository-placeholder byte assumptions"
 
-echo "=== 26516 V2 GATE 2: rollback patch FIRST; apply only profile/viewfinder delta; exact validator ==="
+echo "=== 26516 V3 GATE 2: rollback patch FIRST; apply only profile/viewfinder delta; exact validator ==="
 PATCH="$OUT/26516_RUNTIME_DELTA_FROM_TESTED_26515.patch"
 PATCH_SHA="$OUT/26516_RUNTIME_DELTA_FROM_TESTED_26515.patch.sha256"
 python3 "$APPLY_26516" "$AFTER" --patch-out "$PATCH" --patch-sha-out "$PATCH_SHA"
@@ -197,7 +199,7 @@ PYSOURCE
 echo "PRE-BUILD SAFETY PROOF PASSED"
 pass "rollback/audit patch existed before writes; exact 26516 delta validated; capture/MGC/render frozen"
 
-echo "=== 26516 V2 GATE 3: VERSION ${VERSION_NAME}/${VERSION_BUILD} + APK build in the SAME guarded block ==="
+echo "=== 26516 V3 GATE 3: VERSION ${VERSION_NAME}/${VERSION_BUILD} + APK build in the SAME guarded block ==="
 python3 - "$AFTER/app/version.properties" "$VERSION_NAME" "$VERSION_BUILD" <<'PYVER'
 from pathlib import Path
 import sys
@@ -275,7 +277,7 @@ FINAL_APK_SHA256=$(sha "$FINAL")
 FINAL_SOURCE_TAR_SHA256=$(sha "$OUT/26516_candidate_app_source.tar.gz")
 EOF
 
-echo "=== 26516 V2 SUCCESS ==="
+echo "=== 26516 V3 SUCCESS ==="
 echo "APK: $(basename "$FINAL")"
 echo "APK SHA256: $(sha "$FINAL")"
 echo "BASE_26515_RUN_ID=$RUN_ID"

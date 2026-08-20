@@ -178,7 +178,9 @@ def main() -> None:
         'basePipeline.mParameters.sensorToProPhoto',
         'basePipeline.mParameters.proPhotoToSRGB',
         'camera2DirectGainsBypassed=true',
-        'cameraWhiteClipBeforeProfile=true',
+        'cameraNeutralConsumedInsideProfileMatrix=true',
+        'additionalCameraWhiteClip=false',
+        'reconstructedHdrHeadroomPreserved=true',
     ):
         need(color, token, 'DNG/profile color owner')
     forbid(color, 'motionV2ColorGains', 'old direct Camera2 WB gains')
@@ -186,16 +188,16 @@ def main() -> None:
 
     color_shader = cf['app/src/main/assets/shaders/motionv2/color_transform.glsl'].read_text()
     for token in (
-        'uniform vec3 cameraWhite;',
+        'IRIS_26516_DNG_PROFILE_HDR_PRESERVING_DOMAIN',
         'sensorToProfileRow0',
         'profileToSrgbRow0',
-        'cameraRgb = min(cameraRgb, max(cameraWhite, vec3(0.001)))',
         'negativeFloor',
         'linearSrgb -= vec3(negativeFloor)',
     ):
         need(color_shader, token, 'profile shader')
     forbid(color_shader, 'sensorGains', 'old direct Camera2 gain shader')
-    print('PASS: post-MGC color uses DNG/profile matrices and camera-white boundary, not direct Camera2 gains+3x3')
+    forbid(color_shader, 'cameraWhite', 'second camera-white hard clamp')
+    print('PASS: post-MGC DNG/profile color preserves reconstructed HDR headroom; no second camera-white clamp')
 
     meter = cf['app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionViewfinderMetering.java'].read_text()
     glpreview = cf['app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java'].read_text()
@@ -223,8 +225,16 @@ def main() -> None:
 
     for token in (
         'IRIS_26516_BJZHOU_STYLE_VIEWFINDER_PRESENTATION_SOLVER',
+        'private static final int METER_LONG_EDGE = 256;',
+        'private static final float MIN_EV = -4.0f;',
+        'private static final float MAX_EV = 4.0f;',
+        'private static final int MAX_ITERATIONS = 4;',
         'errorMinus = exposureError(candidate, -0.5f, targetLog)',
         'errorPlus = exposureError(candidate, 0.5f, targetLog)',
+        'for (int i = 0; i < MAX_ITERATIONS; i++)',
+        'return trimMiddle(luma, 0.25f, 0.50f);',
+        'srgbDecode(',
+        'displayLinearLuma=true candidateMidtoneBand=P25-P50',
         'solveBounded(',
         'basePipeline.mParameters.motionV2DisplayGain = gain',
         'manualIrisExposureLater=true',
