@@ -1,103 +1,72 @@
-PHOTON / IRIS 26516 V3 — DIRECT TESTED-26515 PROFILE + VIEWFINDER MATCH HANDOFF
+PHOTON / IRIS 26516 V4 — DIRECT TESTED-26515 PROFILE + VIEWFINDER MATCH HANDOFF
 Date: 2026-08-20
 
 BASE / LINEAGE
 - Branch: experimental-clean-photon-rebuild
 - Successful tested 26515 handoff HEAD: 01a53d2301dc32a246eba52e3d2e965f7a498cfd
-- Failed 26516 V1 handoff HEAD: b4461c6c969fd56fee8f353bd58bc444cbb59aee
-- Failed 26516 V2 handoff HEAD: 5c527421dc312e998444e4a97683c032faff27ee
-- Runtime base is NOT the committed app/src/main placeholder tree.
+- Failed handoff-only 26516 heads:
+  V1 b4461c6c969fd56fee8f353bd58bc444cbb59aee
+  V2 5c527421dc312e998444e4a97683c032faff27ee
+  V3 6f4867066f401a7bfe2639d0820076a6a6e5b5ed
 - Runtime base is ONLY 26515_candidate_app_source.tar.gz emitted by the successful
-  build-26515-short-bento-domain.yml run at the exact tested 26515 HEAD above.
-- No 26512/26513/26514/26515 runtime constructor is invoked by the 26516 builder.
+  build-26515-short-bento-domain.yml run at the exact tested 26515 HEAD.
+- No 26512/26513/26514/26515 runtime constructor is invoked.
 
-BACKUP POLICY FOR THIS V3 CORRECTION
-NO NEW BACKUP BRANCH IS REQUIRED.
-The existing backups are sufficient:
-  backup-26515-before-26516-profile-viewfinder-20260820
-    -> 01a53d2301dc32a246eba52e3d2e965f7a498cfd
-  backup-26516-v1-before-handoff-gate-fix-20260820
-    -> b4461c6c969fd56fee8f353bd58bc444cbb59aee
-V3 additionally verifies that the handoff is descended from failed V2 HEAD
-5c527421dc312e998444e4a97683c032faff27ee. Since V1/V2 failed before candidate runtime
-writes and app/src/main was never committed, another backup would add no useful rollback state.
+BACKUP POLICY
+NO NEW BACKUP BRANCH IS REQUIRED FOR V4.
+The tested-26515 backup and the existing V1 handoff backup are already sufficient. V1/V2/V3
+all stopped in pre-write compatibility checks; no 26516 candidate runtime was committed.
 
-FILES TO REPLACE / ADD
-Repository root:
-  apply_26516_profile_viewfinder_match.py
-  validate_26516_profile_viewfinder_match.py
-  patch_26516_derived_builder.py
-  build_26516_profile_viewfinder_match.sh
-  26516_BASE_26515_COMMIT.txt
-  26516_README_UPLOAD.txt
-  26516_HANDOFF_HASHES.sha256
-Workflow path:
-  .github/workflows/build-26516-profile-viewfinder-match.yml
+WHY V3 FAILED
+V3 correctly recovered and manifest-verified the real 26515 source artifact, but its bridge
+transform required the legacy line
+  parameters.motionV2DisplayGain = referenceDisplayGain
+to occur exactly once. The real tested 26515 bridge has TWO control-flow paths assigning that
+legacy display authority. The failure was therefore in the 26516 handoff transform, not in 26515.
 
-WHAT 26516 V3 DOES
-1. Preserves the tested 26515 Short/Bento BaselineExposure domain correction.
-2. Separates MGC source-domain restoration from presentation exposure:
-      MGC/denoise -> source restore -> DNG/profile color -> auto presentation EV.
-3. Uses Iris's existing DNG/profile-derived sensorToProPhoto + proPhotoToSRGB matrices.
-   Parameters already builds sensorToProPhoto using SENSOR_NEUTRAL_COLOR_POINT plus the
-   ColorMatrix/ForwardMatrix/CalibrationTransform metadata.
-4. V3 DOES NOT hard-clip reconstructed camera RGB to cameraWhite before the profile matrix.
-   That would double-consume the camera neutral and could destroy the >1.0 Short/Bento HDR
-   headroom that 26515 deliberately preserved. Extended-linear HDR values remain available to
-   the frozen 26515 MotionV2Render highlight shoulder.
-5. Keeps the neutral-axis negative-gamut floor: if a profile matrix creates a small negative
-   output component, all RGB channels translate together instead of independently clipping one
-   channel and creating synthetic magenta/cyan edges.
-6. Requests a 256-long-edge asynchronous PixelCopy of the displayed Motion viewfinder immediately
-   before takePicture(). Capture is NOT blocked waiting for the copy.
-7. Automatic exposure matching is post-capture only. It compares display-linear midtones, uses a
-   P25-P50 metering band, starts from 0 EV, probes -0.5/+0.5 EV, performs at most four bounded
-   secant iterations, and uses a -4 EV to +4 EV safety range.
-8. The solver writes ONLY motionV2DisplayGain. It never writes shutter, ISO, AE mode,
-   AE compensation, or a Camera2 CaptureRequest.
-9. Existing Iris Exposure/Shadows/Contrast remain AFTER automatic matching, so manual Exposure is
-   an independent additive creative offset.
-10. The existing 26515 MotionV2Render, 0.80 output scale, max(luma,maxRGB) highlight shoulder,
-    UHDR path, MGC/Spatial/Bento/Short/Long/denoise and capture policy remain unchanged.
+V4 BRIDGE CORRECTION
+- Gate 1 now proves the ACTUAL downloaded 26515 bridge shape before transforming it:
+  source-domain assignment count = 1
+  legacy referenceDisplayGain assignment count = 2
+  Short/Bento source+display contextual pair count = 1
+- The transform neutralizes BOTH exact legacy display assignments to 1.0f because the new
+  shutter-time viewfinder matcher must be the sole automatic presentation authority.
+- Diagnostic telemetry is inserted only at the unique 26515 Short/Bento source-domain site.
+- V4 includes a regression fixture that reproduces the V3 two-assignment failure and must pass
+  before the guarded build begins.
+- The validator forbids any surviving referenceDisplayGain assignment and proves the unique
+  Short/Bento source-domain restoration remains ordered after MGC denoise.
 
-V3 ARTIFACT-COMPATIBILITY CORRECTION
-- V1 failed because the builder compared manifest-verified 26515 artifact files with stale
-  repository-placeholder SHA values.
-- V2 correctly removed those SHA comparisons, but apply_26516 still required the historical
-  placeholder shader line:
-      Output = c * max(displayGain, 1.0);
-  The actual tested-26515 artifact did not contain that literal line, so the pure dry-run stopped
-  before any 26516 candidate runtime write.
-- V3 removes that historical-text dependency. Files that 26516 intentionally replaces are checked
-  by their required runtime interface/ownership markers against the manifest-verified artifact,
-  then replaced deterministically. This is the same artifact-authority principle that made 26515
-  reliable.
-- GLPreview, CameraUIController and PostPipeline transforms are likewise marker/semantic based
-  rather than tied to stale placeholder byte layouts.
+INTENDED 26516 PIPELINE (UNCHANGED FROM V3)
+MGC/denoise -> MGC source restore -> DNG/profile color -> automatic viewfinder presentation EV
+-> existing manual Iris Exposure/Shadows/Contrast -> frozen 26515 Motion render/UHDR.
 
-FAIL-CLOSED BEHAVIOR
-If the shutter-time PixelCopy is unavailable, still pending when processing reaches the solver,
-or does not contain enough valid samples, automatic presentation EV is neutral (0 EV / 1.0x).
-It does NOT fall back to the retired RAW p50/p90 display-gain authority.
+The DNG/profile color path preserves reconstructed HDR values above 1.0; there is no additional
+cameraWhite hard clamp. Automatic viewfinder matching remains post-capture only, uses a 256-long-
+edge meter, +/-0.5 EV probes, maximum four bounded solver iterations, and -4..+4 EV safety bounds.
+It writes only motionV2DisplayGain and never writes Camera2 shutter/ISO/AE state.
+
+FROZEN / NO-REGRESSION OWNERS
+CaptureController, MotionBatch, HdrxProcessor, MotionV2Merger, IsoExpoSelector, MGC 1.27.1,
+Spatial/Bento/denoise closure, Iris manual/noise controls, Parameters profile matrices,
+MotionV2Render/render.glsl/gainmap.glsl, JPEG/UHDR owners.
 
 BUILD ID
-- VERSION_NAME=0.9726516
-- VERSION_BUILD=26516
-- Expected final APK:
-  IrisCamera-0.9726516-26516-profile-viewfinder-match-debug.apk
+VERSION_NAME=0.9726516
+VERSION_BUILD=26516
+Expected APK: IrisCamera-0.9726516-26516-profile-viewfinder-match-debug.apk
+Expected artifact: photon-26516-profile-viewfinder-match-v4
 
 PROCEDURE — SAME SUCCESSFUL 26515 STRUCTURE
-Gate 0: exact branch/lineage + existing rollback branches + handoff hashes + no committed runtime
-        or protected Gradle drift + no historical runtime constructor.
-Gate 1: use gh to recover successful 26515 artifact at exact HEAD, verify its own source manifest,
-        version and 26513/26514/26515 ownership markers; then dry-run every V3 semantic transform
-        against THAT artifact and record actual input hashes for provenance.
-Gate 2: create rollback/audit patch BEFORE candidate runtime writes, apply deterministic 26516
-        transform, validate exact changed-file set, byte-freeze capture/MGC/render/UHDR owners,
-        and print PRE-BUILD SAFETY PROOF PASSED.
-Gate 3: increment 0.9726515/26515 -> 0.9726516/26516 and assembleDebug in the SAME guarded block,
-        verify Gradle did not mutate audited runtime source, require exactly one APK, and emit
-        26516_candidate_app_source.tar.gz + manifest for the next direct build.
+Gate 0: exact branch/lineage + existing rollback state + handoff hashes + no committed runtime or
+        protected Gradle drift + no historical runtime constructor.
+Gate 1: recover successful 26515 artifact at exact HEAD, verify its own source manifest/version/
+        ownership markers, prove the actual bridge authority shape, then dry-run every V4
+        deterministic transform in memory against THAT artifact.
+Gate 2: create rollback/audit patch BEFORE candidate runtime writes; apply the deterministic 26516
+        delta; exact changed-file validation; byte-freeze capture/MGC/render/UHDR owners; print
+        PRE-BUILD SAFETY PROOF PASSED.
+Gate 3: increment 0.9726515/26515 -> 0.9726516/26516 and assembleDebug in the SAME guarded block;
+        require exactly one APK; emit 26516_candidate_app_source.tar.gz + source manifest.
 
 DO NOT COMMIT OR PUSH app/src/main produced inside an Actions run.
-Only the handoff files above are intended to be committed for 26516.

@@ -752,21 +752,46 @@ def expected_text(rel: str, base: str) -> str:
     s = base
     if rel.endswith('PhotonMotionMgc1271Bridge.kt'):
         need(s, 'IRIS_26515_SHORT_BASELINE_DOMAIN', '26515 Short domain base')
-        need(s, 'parameters.motionV2MgcSourceExposureGain = baselineScale', '26515 source restore authority')
-        old = '            parameters.motionV2DisplayGain = referenceDisplayGain\n'
-        new = '''            /* IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY
-             * Retire the old RAW p50/p90 estimator as an output authority. Keep its already-computed
+        source_line = '            parameters.motionV2MgcSourceExposureGain = baselineScale\n'
+        old_display = '            parameters.motionV2DisplayGain = referenceDisplayGain\n'
+        neutral_display = '            parameters.motionV2DisplayGain = 1.0f\n'
+        source_count = s.count(source_line)
+        display_count = s.count(old_display)
+        if source_count != 1:
+            raise AssertionError(
+                f'26515 bridge source-domain owner: expected 1 source assignment, found {source_count}')
+        if display_count < 1:
+            raise AssertionError('26515 bridge display authority: no referenceDisplayGain assignment found')
+
+        # IRIS_26516_V4_ALL_BRIDGE_DISPLAY_PATHS_NEUTRALIZED
+        # The tested 26515 artifact has more than one control-flow path assigning the legacy
+        # referenceDisplayGain. The new viewfinder matcher is the sole presentation authority, so
+        # every exact legacy assignment must become neutral. Do not choose one by occurrence index.
+        s = s.replace(old_display, neutral_display)
+        if old_display in s:
+            raise AssertionError('legacy bridge referenceDisplayGain assignment survived neutralization')
+
+        # Add diagnostic telemetry only at the unique 26515 Short/Bento source-domain owner.
+        # This is deliberately context-qualified rather than tied to whichever legacy display
+        # assignment happened to appear first in the file.
+        pair = source_line + neutral_display
+        pair_count = s.count(pair)
+        if pair_count != 1:
+            raise AssertionError(
+                f'26515 Short/Bento source/display pair: expected 1 contextual pair, found {pair_count}')
+        telemetry = f'''            /* IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY
+             * All legacy RAW p50/p90 display assignments are neutralized. Keep the already-computed
              * referenceDisplayGain only as diagnostic evidence; shutter-time viewfinder matching
-             * will set motionV2DisplayGain after DNG/profile color.
+             * sets motionV2DisplayGain after DNG/profile color.
              */
-            parameters.motionV2DisplayGain = 1.0f
             PLog.i(TAG, "IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY " +
                 "legacyRawDisplayGainDiagnostic=$referenceDisplayGain " +
-                "initialPresentationGain=${parameters.motionV2DisplayGain} " +
-                "sourceDomainGain=${parameters.motionV2MgcSourceExposureGain} " +
+                "initialPresentationGain=${{parameters.motionV2DisplayGain}} " +
+                "sourceDomainGain=${{parameters.motionV2MgcSourceExposureGain}} " +
+                "legacyAssignmentsNeutralized={display_count} " +
                 "solverAfterProfileColor=true camera2Write=false")
 '''
-        return one(s, old, new, 'bridge retires RAW histogram display authority')
+        return s.replace(pair, pair + telemetry, 1)
 
     if rel.endswith('PostPipeline.java'):
         need(s, 'IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY', '26515 display boundary marker')

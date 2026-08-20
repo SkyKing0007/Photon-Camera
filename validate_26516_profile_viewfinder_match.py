@@ -133,13 +133,21 @@ def main() -> None:
         'solverAfterProfileColor=true camera2Write=false',
     ):
         need(bridge, token, 'bridge source/presentation authority')
-    forbid(bridge, 'parameters.motionV2DisplayGain = referenceDisplayGain',
-           'legacy RAW p50/p90 display authority')
+    legacy_assign = 'parameters.motionV2DisplayGain = referenceDisplayGain'
+    neutral_assign = 'parameters.motionV2DisplayGain = 1.0f'
+    forbid(bridge, legacy_assign, 'legacy RAW p50/p90 display authority')
+    neutral_count = bridge.count(neutral_assign)
+    assert neutral_count >= 2, (
+        f'expected all tested-26515 bridge display paths neutralized; found {neutral_count}')
     denoise_i = bridge.index('MgcFullResolutionDenoise.denoise(')
-    source_i = bridge.index('parameters.motionV2MgcSourceExposureGain = baselineScale')
-    neutral_i = bridge.index('parameters.motionV2DisplayGain = 1.0f')
-    assert denoise_i < source_i < neutral_i
-    print('PASS: 26515 Short source restoration survives; old RAW histogram gain is diagnostic only')
+    pair = ('parameters.motionV2MgcSourceExposureGain = baselineScale\n'
+            '            parameters.motionV2DisplayGain = 1.0f')
+    pair_i = bridge.index(pair)
+    telemetry_i = bridge.index('IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY', pair_i)
+    assert denoise_i < pair_i < telemetry_i
+    need(bridge, 'legacyAssignmentsNeutralized=', 'bridge neutralized-path telemetry')
+    print('PASS: all legacy RAW histogram display paths are neutral; 26515 Short source restoration survives')
+
 
     post = cf['app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java'].read_text()
     order = [
