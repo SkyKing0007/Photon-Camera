@@ -133,8 +133,13 @@ public final class IrisMotionSettings {
     }
 
     private static float getFloat(SettingsManager sm, String key, float def) {
-        try { return sm.getFloat(SettingsManager.SCOPE_GLOBAL, key, def); }
-        catch (Throwable ignored) { return def; }
+        try {
+            String value = sm.getString(
+                    SettingsManager.SCOPE_GLOBAL, key, Float.toString(def));
+            return Float.parseFloat(value);
+        } catch (Throwable ignored) {
+            return def;
+        }
     }
 
     private static boolean getBoolean(SettingsManager sm, String key, boolean def) {
