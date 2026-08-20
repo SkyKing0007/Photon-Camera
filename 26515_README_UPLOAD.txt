@@ -1,49 +1,67 @@
-PHOTON / IRIS 26515 — SHORT/BENTO EXPOSURE-DOMAIN FIX
+26515 V4 — DIRECT TESTED-26514 SOURCE -> SHORT/BENTO EXPOSURE-DOMAIN FIX
+=======================================================================
 
-Base handoff HEAD:
-  e9855a3af7a79801a762ec3f99b441474926f009
-Branch:
-  experimental-clean-photon-rebuild
-Verified backup required by builder:
-  backup-26514-before-26515-short-bento-fix-20260820
+IMPORTANT
+---------
+This v4 supersedes v1/v2/v3. Do not use the earlier 26515 constructor packages.
+
+Why v4 exists
+-------------
+The earlier 26515 handoffs recreated 26514 through older 26512/26513 constructors. That was
+reproducible, but it violated the agreed working rule: when the previous tested build is good,
+continue directly from that previous build rather than rebuilding from an older checkpoint.
+
+v4 fixes the BUILD LINEAGE, not the 26515 image-math change.
+
+Direct baseline used by v4
+--------------------------
+1. Exact successful 26514 handoff/fix HEAD:
+   e9855a3af7a79801a762ec3f99b441474926f009
+2. Exact existing backup:
+   backup-26514-before-26515-short-bento-fix-20260820
+3. The workflow locates the successful 26514 GitHub Actions run at that exact HEAD.
+4. It downloads artifact: photon-26514-iris-profiles-controls
+5. It extracts and manifest-verifies the ACTUAL 26514_candidate_app_source.tar.gz emitted by
+   that successful build.
+6. That tested source snapshot is the sole Iris/Photon runtime base for 26515.
+7. No 26512 or 26513 runtime constructor is executed or referenced by the v4 builder.
+
+The source snapshot intentionally omitted the large JPEG/UHDR vendor copies. v4 rehydrates ONLY
+those exact vendor trees from pinned bjzhou commit 09c76e57e8f01a5a8fc536ab41fc80ba642d4042
+and verifies them with the existing 26507_BJZHOU_NATIVE_DEPENDENCIES.sha256 manifest. This does not
+reconstruct any older Iris runtime source.
+
+26515 runtime change (unchanged from v3)
+----------------------------------------
+Accepted Short/Bento recovery remains enabled. MGC BaselineExposure is separated into:
+- MGC source-domain restoration gain, consumed after MGC full-resolution denoise in the existing
+  DisplayExposure linear pass; and
+- Photon's normal reference display gain, which alone owns MotionV2Render sceneWhite/highlight
+  shoulder authority.
+
+The linear pixel product remains equivalent; the incorrect Short-dependent sceneWhite authority is
+removed. UHDR retains the prior Short-dependent gain-map capacity.
+
+Frozen in this build
+--------------------
+MGC/Bento threshold and acceptance logic, MGC alignment/rejection, Short capture exposure, Long,
+Spatial RGB math, 26513 1.10/0.40 Spatial detail tuning, MGC noise propagation, luma/chroma denoise
+controls, Iris tone controls, color transform, display shader, render shader, UHDR shader, JPEG 4:4:4,
+and Camera2/AE capture authority are not changed by 26515.
+
+Upload instructions
+-------------------
+Extract this ZIP and upload/replace all 8 files on experimental-clean-photon-rebuild, preserving
+.github/workflows/build-26515-short-bento-domain.yml.
+Do NOT upload the ZIP itself.
+Do NOT create another backup; the existing exact 26514 backup is the correct backup for this source
+modification cycle.
+
+Suggested commit message:
+26515: build directly from tested 26514 source
+
 Expected APK:
-  IrisCamera-0.9726515-26515-short-bento-domain-fix-debug.apk
+IrisCamera-0.9726515-26515-short-bento-domain-fix-debug.apk
 
-PURPOSE
-- Keep the Short/Bento recovery frame. Do NOT disable Short and do NOT loosen/tighten Bento.
-- Keep pinned bjzhou MGC Spatial/Bento/noise/native code byte-identical.
-- Keep 26513 Spatial 1.10 / 0.40 detail tuning unchanged.
-- Keep 26514 luma/chroma/noise-profile/presentation controls unchanged.
-- Correct only Iris's consumer boundary for accepted-Short MGC BaselineExposure.
-
-CORRECTION
-Before 26515:
-  motionV2DisplayGain = referenceDisplayGain * 2^baselineExposureEv
-This mixed MGC source-domain normalization into Photon's scene/display authority. Accepted Short
-therefore changed MotionV2Render sceneWhite while rejected Short did not.
-
-26515:
-  motionV2MgcSourceExposureGain = 2^baselineExposureEv
-  motionV2DisplayGain = referenceDisplayGain
-The existing linear DisplayExposure pass multiplies the two gains together, preserving the prior
-linear pixel product. MotionV2Render sceneWhite uses only reference display gain. UHDR max-gain
-capacity still includes the source-domain gain so accepted Short recovery is not discarded.
-
-SAFETY
-- apply_26515 writes 26515_RUNTIME_DELTA_FROM_GOLDEN_26514.patch and its SHA before runtime writes.
-- validator requires exactly four runtime files to differ from the reconstructed 26514 candidate.
-- display_exposure.glsl, render.glsl, color transform, tone controls, MGC core/assets/native closure,
-  capture scheduling, denoise controls and UHDR shader are frozen.
-- version increment and the only Gradle APK build occur inside the same guarded constructor.
-- dev is never modified or pushed.
-
-UPLOAD
-Upload this package's files preserving the .github/workflows directory, commit them to
-experimental-clean-photon-rebuild, and let the push-triggered workflow run. Do not upload the ZIP
-itself into the repository.
-
-CI RETRY NOTE
-- This corrected handoff scopes inherited 26514 constructor identity edits to executable top-level
-  headers. Duplicate literals inside PYDERIVE/proof heredocs are intentionally ignored.
-- This is a constructor-only correction after a pre-source/pre-Gradle failure. Runtime fix, version
-  0.9726515 / 26515, and the existing 26514 backup remain unchanged.
+The successful proof bundle also emits 26515_candidate_app_source.tar.gz and its manifest so the
+NEXT incremental build can again work directly from the successful previous build.

@@ -21,60 +21,46 @@ def one(text: str, old: str, new: str, label: str) -> str:
 def expected_text(rel: str, base: str) -> str:
     s = base
     if rel.endswith('PhotonMotionMgc1271Bridge.kt'):
-        old = '''            val baselineScale = stacked.baselineExposureEv
-                ?.takeIf { it.isFinite() }
-                ?.let { 2.0.pow(it.toDouble()).toFloat() }
-                ?: 1f
-            requireParity(baselineScale.isFinite() && baselineScale > 0f,
-                "invalid Bento baseline exposure scale=$baselineScale")
-            parameters.motionV2DisplayGain = referenceDisplayGain * baselineScale
-            parameters.motionV2ShortHighlightRecoveryExecuted = stacked.baselineExposureEv != null'''
-        new = '''            val baselineScale = stacked.baselineExposureEv
-                ?.takeIf { it.isFinite() }
-                ?.let { 2.0.pow(it.toDouble()).toFloat() }
-                ?: 1f
-            requireParity(baselineScale.isFinite() && baselineScale > 0f,
-                "invalid Bento baseline exposure scale=$baselineScale")
-
-            /* IRIS_26515_SHORT_BASELINE_DOMAIN
+        # Keep MGC's BaselineExposure calculation itself byte-identical. Only split its consumer
+        # into source-domain restoration versus Photon scene/display authority.
+        old_assign = '            parameters.motionV2DisplayGain = referenceDisplayGain * baselineScale\n'
+        new_assign = '''            /* IRIS_26515_SHORT_BASELINE_DOMAIN
              * MGC deliberately stores an accepted-Short result in a darker source domain and
              * returns BaselineExposure to restore reference brightness after MGC denoise.
-             * Keep that source-domain restoration separate from Photon's scene/display authority.
-             * MotionV2DisplayExposure fuses both *linear* multipliers in its existing GPU pass,
-             * while MotionV2Render sees only referenceDisplayGain for scene-white decisions.
+             * Keep that restoration separate from Photon's scene/display authority.
              */
             parameters.motionV2MgcSourceExposureGain = baselineScale
             parameters.motionV2DisplayGain = referenceDisplayGain
-            parameters.motionV2ShortHighlightRecoveryExecuted = stacked.baselineExposureEv != null
-            PLog.i(TAG, "IRIS_26515_SHORT_BASELINE_DOMAIN " +
+'''
+        s = one(s, old_assign, new_assign, 'bridge display/source authority assignment')
+        short_state = '            parameters.motionV2ShortHighlightRecoveryExecuted = stacked.baselineExposureEv != null\n'
+        short_state_new = short_state + '''            PLog.i(TAG, "IRIS_26515_SHORT_BASELINE_DOMAIN " +
                 "baselineEv=${stacked.baselineExposureEv} sourceDomainGain=$baselineScale " +
                 "displayGain=${parameters.motionV2DisplayGain} " +
                 "shortAccepted=${stacked.baselineExposureEv != null} " +
                 "denoiseBeforeSourceRestore=true restorePass=existingDisplayExposure " +
-                "rendererSceneWhiteAuthority=referenceDisplayOnly")'''
-        return one(s, old, new, 'bridge BaselineExposure ownership')
+                "rendererSceneWhiteAuthority=referenceDisplayOnly")
+'''
+        return one(s, short_state, short_state_new, 'bridge Short source-domain telemetry')
 
     if rel.endswith('Parameters.java'):
-        old = '''    public float motionV2DisplayGain = 1.0f;
-    /* IRIS_26490_SHORT_RECOVERY_EXECUTED_STATE_OWNER'''
-        new = '''    public float motionV2DisplayGain = 1.0f;
-    /* IRIS_26515_MGC_SOURCE_EXPOSURE_GAIN
+        old = '    public float motionV2DisplayGain = 1.0f;\n'
+        new = old + '''    /* IRIS_26515_MGC_SOURCE_EXPOSURE_GAIN
      * MGC BaselineExposure restoration is source-domain metadata, not scene/display exposure.
      * It is consumed once by MotionV2DisplayExposure after MGC full-resolution denoise.
      */
     public float motionV2MgcSourceExposureGain = 1.0f;
-    /* IRIS_26490_SHORT_RECOVERY_EXECUTED_STATE_OWNER'''
+'''
         return one(s, old, new, 'Parameters MGC source exposure carrier')
 
     if rel.endswith('MotionV2DisplayExposure.java'):
-        old = '''        float gain = Math.max(
+        # Reconstructed 26514 inherits IRIS_26504_SINGLE_EXPOSURE_LOCAL_SUPPORT. Do not replace
+        # that method: change only its global gain declaration, one shader uniform, and telemetry.
+        old_gain = '''        float gain = Math.max(
                 1.0f,
                 basePipeline.mParameters.motionV2DisplayGain);
-
-        glProg.useAssetProgram("motionv2/display_exposure");
-        glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
-        glProg.setVar("displayGain", gain);'''
-        new = '''        float displayGain = Math.max(
+'''
+        new_gain = '''        float displayGain = Math.max(
                 1.0f,
                 basePipeline.mParameters.motionV2DisplayGain);
         float sourceDomainGain = basePipeline.mParameters.motionV2MgcSourceExposureGain;
@@ -83,36 +69,35 @@ def expected_text(rel: str, base: str) -> str:
                     "Invalid MGC source-domain exposure gain: " + sourceDomainGain);
         }
         /* IRIS_26515_FUSED_LINEAR_SOURCE_RESTORE
-         * Source restoration and display exposure are both scalar linear gains with no nonlinear
-         * stage between them, so fuse them into the existing pass. This preserves the prior pixel
-         * product while keeping the two authorities separate for downstream tone/headroom logic.
+         * Source restoration and display exposure are scalar linear gains with no nonlinear
+         * stage between them. Fuse them into the existing 26504 DisplayExposure pass so its
+         * local-support/shadow logic sees the exact same pixel product as before.
          */
         float combinedLinearGain = displayGain * sourceDomainGain;
         if (!Float.isFinite(combinedLinearGain) || combinedLinearGain <= 0.0f) {
             throw new IllegalStateException(
                     "Invalid combined Motion linear exposure gain: " + combinedLinearGain);
         }
-
-        glProg.useAssetProgram("motionv2/display_exposure");
-        glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
-        glProg.setVar("displayGain", combinedLinearGain);'''
-        s = one(s, old, new, 'DisplayExposure split/fused gains')
-        old_log = '''        Log.d(Name, "IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY"
-                + " displayGain=" + gain
-                + " insideWronski=false"'''
-        new_log = '''        Log.d(Name, "IRIS_26477_POST_WRONSKI_DISPLAY_BOUNDARY"
-                + " displayGain=" + displayGain
+'''
+        s = one(s, old_gain, new_gain, 'DisplayExposure split/fused gain declaration')
+        s = one(s,
+                '        glProg.setVar("displayGain", gain);\n',
+                '        glProg.setVar("displayGain", combinedLinearGain);\n',
+                'DisplayExposure combined linear shader gain')
+        old_log = '                + " displayGain=" + gain\n'
+        new_log = '''                + " displayGain=" + displayGain
                 + " mgcSourceExposureGain=" + sourceDomainGain
                 + " combinedLinearGain=" + combinedLinearGain
                 + " IRIS_26515_FUSED_LINEAR_SOURCE_RESTORE=true"
-                + " insideWronski=false"'''
-        return one(s, old_log, new_log, 'DisplayExposure telemetry')
+'''
+        return one(s, old_log, new_log, 'DisplayExposure split telemetry')
 
     if rel.endswith('MotionV2Render.java'):
         old = '''        float postDisplaySensorWhite = Math.max(
                 1.0f, basePipeline.mParameters.motionV2DisplayGain);
         float sceneWhite = Math.max(
-                1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));'''
+                1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));
+'''
         new = '''        float postDisplaySensorWhite = Math.max(
                 1.0f, basePipeline.mParameters.motionV2DisplayGain);
         float mgcSourceExposureGain = basePipeline.mParameters.motionV2MgcSourceExposureGain;
@@ -122,28 +107,34 @@ def expected_text(rel: str, base: str) -> str:
         }
         /* IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT
          * sceneWhite follows only the real Photon display exposure. Accepted-Short BaselineExposure
-         * is a source-domain restoration and must not stretch the SDR highlight shoulder.
+         * is source-domain restoration and must not stretch the SDR highlight shoulder.
          */
         float sceneWhite = Math.max(
-                1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));'''
+                1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));
+'''
         s = one(s, old, new, 'Render scene-white authority split')
+        # Reconstructed 26514 includes IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS.
         old_gainmap = '''            float maxGainRatio = Math.max(
                     2.0f,
-                    Math.min(2.5f, OUTPUT_EXPOSURE_SCALE * postDisplaySensorWhite));'''
-        new_gainmap = '''            /* Preserve the pre-26515 UHDR ceiling exactly: Short source headroom still
-             * participates in gain-map capacity even though it no longer contaminates sceneWhite.
+                    Math.min(2.5f, HDR_EXPOSURE_SCALE * postDisplaySensorWhite));
+'''
+        new_gainmap = '''            /* Preserve the pre-26515 UHDR capacity exactly. The Short source-domain
+             * headroom still participates in max gain even though it no longer changes sceneWhite.
              */
             float maxGainRatio = Math.max(
                     2.0f,
-                    Math.min(2.5f, OUTPUT_EXPOSURE_SCALE * postDisplaySensorWhite
-                            * mgcSourceExposureGain));'''
+                    Math.min(2.5f, HDR_EXPOSURE_SCALE * postDisplaySensorWhite
+                            * mgcSourceExposureGain));
+'''
         s = one(s, old_gainmap, new_gainmap, 'UHDR ceiling preservation')
         old_log = '''                + " postDisplaySensorWhite=" + postDisplaySensorWhite
-                + " sceneWhite=" + sceneWhite'''
+                + " sceneWhite=" + sceneWhite
+'''
         new_log = '''                + " postDisplaySensorWhite=" + postDisplaySensorWhite
                 + " mgcSourceExposureGain=" + mgcSourceExposureGain
                 + " sceneWhite=" + sceneWhite
-                + " IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true"'''
+                + " IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true"
+'''
         return one(s, old_log, new_log, 'Render telemetry')
 
     raise AssertionError(f'unexpected changed path: {rel}')

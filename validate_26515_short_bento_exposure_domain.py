@@ -130,26 +130,45 @@ def main() -> None:
         'IRIS_26515_FUSED_LINEAR_SOURCE_RESTORE=true',
     ):
         need(display, token, 'existing-pass source restoration')
-    print('PASS: source restoration is fused into the existing linear DisplayExposure GPU pass; no new pass')
+    for inherited in (
+        'IRIS_26504_SINGLE_EXPOSURE_LOCAL_SUPPORT',
+        'float retainedFrames = Math.max(',
+        'float effectiveSupport = Math.max(',
+        'float shadowRecoveryStrength = Math.max(',
+        'glProg.setVar("shadowRecoveryStrength", shadowRecoveryStrength);',
+        'glProg.setVar("shadowFloorStop", shadowFloorStop);',
+        'glProg.setVar("retainedFrames", retainedFrames);',
+        'pixelLocalSupportFromCarrierAlpha=true',
+    ):
+        need(display, inherited, '26504 local-support DisplayExposure preserved')
+    print('PASS: source restoration is fused into existing 26504 DisplayExposure; local support/shadow logic preserved')
 
     render = cf['app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java'].read_text()
     for token in (
         'float postDisplaySensorWhite = Math.max(',
         'float mgcSourceExposureGain = basePipeline.mParameters.motionV2MgcSourceExposureGain;',
         'Math.min(6.0f, 0.90f * postDisplaySensorWhite)',
-        'OUTPUT_EXPOSURE_SCALE * postDisplaySensorWhite\n                            * mgcSourceExposureGain',
+        'HDR_EXPOSURE_SCALE * postDisplaySensorWhite\n                            * mgcSourceExposureGain',
         'IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true',
     ):
         need(render, token, 'render authority split')
     forbid(render,
            'Math.min(6.0f, 0.90f * postDisplaySensorWhite * mgcSourceExposureGain)',
            'Short source gain must not alter sceneWhite')
-    print('PASS: SDR sceneWhite uses reference display only; UHDR max-gain ceiling preserves prior Short headroom')
+    need(render, 'IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS', '26506 SDR/HDR split retained')
+    need(render, 'private static final float HDR_EXPOSURE_SCALE = 1.00f;', '26506 HDR target retained')
+    print('PASS: SDR sceneWhite uses reference display only; 26506 UHDR target/capacity preserved with Short headroom')
 
     # The existing shader still receives the same combined scalar, so no shader math is changed.
     display_shader = 'app/src/main/assets/shaders/motionv2/display_exposure.glsl'
     assert bf[display_shader].read_bytes() == cf[display_shader].read_bytes()
-    need(cf[display_shader].read_text(), 'Output = c * max(displayGain, 1.0);', 'unchanged display shader')
+    shader_text = cf[display_shader].read_text()
+    for inherited in (
+        'IRIS_26504_PIXEL_LOCAL_EFFECTIVE_STACK_PERMISSION',
+        'vec3 displayed=c*max(displayGain,1.0);',
+        'Output=recoverSupportedShadow(displayed,c,carrier.a);',
+    ):
+        need(shader_text, inherited, 'unchanged 26504 display shader')
 
     # 26514 controls and 26513 Spatial detail change remain present exactly as inherited.
     settings = cf['app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java'].read_text()
