@@ -1,4 +1,4 @@
-PHOTON / IRIS 26516 V1 — DIRECT TESTED-26515 PROFILE + VIEWFINDER MATCH HANDOFF
+PHOTON / IRIS 26516 V2 — DIRECT TESTED-26515 PROFILE + VIEWFINDER MATCH HANDOFF
 Date: 2026-08-20
 
 BASE / LINEAGE
@@ -9,10 +9,16 @@ BASE / LINEAGE
   build-26515-short-bento-domain.yml run at the exact HEAD above.
 - No 26512/26513/26514/26515 runtime constructor is invoked by the 26516 builder.
 
-REQUIRED BACKUP BEFORE COMMITTING/RUNNING 26516
-Create this branch from EXACT commit 01a53d2301dc32a246eba52e3d2e965f7a498cfd:
+REQUIRED BACKUPS BEFORE COMMITTING/RUNNING 26516 V2
+Keep the existing runtime backup at EXACT successful 26515 commit:
   backup-26515-before-26516-profile-viewfinder-20260820
-The guarded builder refuses to run unless that remote backup exists at that exact commit.
+  -> 01a53d2301dc32a246eba52e3d2e965f7a498cfd
+
+Before replacing the failed-v1 handoff files, create this additional handoff backup:
+  backup-26516-v1-before-handoff-gate-fix-20260820
+  -> b4461c6c969fd56fee8f353bd58bc444cbb59aee
+
+The v2 builder refuses to run unless BOTH remote backups point to those exact commits.
 
 FILES TO ADD
 Repository root:
@@ -61,7 +67,9 @@ PROCEDURE — SAME STRUCTURE AS SUCCESSFUL 26515
 Gate 0: exact branch/HEAD ancestry + exact remote backup + handoff hashes + no committed runtime
         or protected Gradle drift + no historical runtime constructor.
 Gate 1: use gh to recover the successful 26515 artifact at exact HEAD, verify source tar manifest,
-        26515 version, 26513/26514/26515 ownership markers, and known unchanged file bytes.
+        26515 version and 26513/26514/26515 ownership markers, then dry-run every deterministic
+        26516 transform anchor against THAT artifact. Record its changed-input hashes for provenance.
+        Do NOT compare the built artifact to stale repository-placeholder app/src/main hashes.
 Gate 2: create rollback/audit patch BEFORE candidate runtime writes, apply deterministic 26516
         transform, validate exact changed-file set, byte-freeze capture/MGC/render/UHDR owners,
         and print PRE-BUILD SAFETY PROOF PASSED.
@@ -71,3 +79,12 @@ Gate 3: increment 0.9726515/26515 -> 0.9726516/26516 and assembleDebug in the SA
 
 DO NOT COMMIT OR PUSH app/src/main produced inside an Actions run.
 The handoff files are the only files intended to be committed for 26516.
+
+
+V2 CORRECTION AFTER FAILED V1 GATE
+- V1 stopped before any 26516 candidate runtime write because it compared the manifest-verified
+  26515 artifact MotionV2ColorTransform against a SHA taken from repository placeholder source.
+- That assumption violates the same direct-artifact architecture used successfully by 26515.
+- V2 removes all five repository-placeholder SHA expectations. The successful 26515 artifact
+  manifest is the byte authority; deterministic transform-anchor resolution is the compatibility
+  proof before writes. Runtime transform/apply/validator logic itself is otherwise unchanged.

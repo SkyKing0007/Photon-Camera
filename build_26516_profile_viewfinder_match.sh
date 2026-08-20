@@ -7,7 +7,9 @@ sha(){ sha256sum "$1" | awk '{print $1}'; }
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 SUCCESSFUL_26515_HEAD="01a53d2301dc32a246eba52e3d2e965f7a498cfd"
+FAILED_26516_V1_HEAD="b4461c6c969fd56fee8f353bd58bc444cbb59aee"
 BACKUP_26515="backup-26515-before-26516-profile-viewfinder-20260820"
+BACKUP_26516_V1="backup-26516-v1-before-handoff-gate-fix-20260820"
 BASE_WORKFLOW="build-26515-short-bento-domain.yml"
 BASE_ARTIFACT="photon-26515-short-bento-domain-v4"
 REPO="${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}"
@@ -31,12 +33,15 @@ FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-profile-viewfinder-matc
 rm -rf "$OUT" "$WORK"; mkdir -p "$OUT" "$ART" "$BASE" "$AFTER"
 exec > >(tee "$OUT/26516_build.log") 2>&1
 
-echo "=== 26516 V1 GATE 0: exact successful-26515 checkpoint + backup + direct-source-only handoff ==="
+echo "=== 26516 V2 GATE 0: exact successful-26515 runtime + failed-v1 handoff backup + direct-source-only handoff ==="
 BRANCH="$(git branch --show-current)"; START_HEAD="$(git rev-parse HEAD)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26515_HEAD" HEAD || fail "handoff is not descended from successful 26515 HEAD"
+git merge-base --is-ancestor "$FAILED_26516_V1_HEAD" HEAD || fail "v2 correction is not descended from failed 26516 v1 handoff"
 REMOTE_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_26515" | awk '{print $1}')"
 [[ "$REMOTE_BACKUP" == "$SUCCESSFUL_26515_HEAD" ]] || fail "backup missing/wrong: $BACKUP_26515 -> ${REMOTE_BACKUP:-MISSING}; expected $SUCCESSFUL_26515_HEAD"
+REMOTE_V1_BACKUP="$(git ls-remote origin "refs/heads/$BACKUP_26516_V1" | awk '{print $1}')"
+[[ "$REMOTE_V1_BACKUP" == "$FAILED_26516_V1_HEAD" ]] || fail "v1 handoff backup missing/wrong: $BACKUP_26516_V1 -> ${REMOTE_V1_BACKUP:-MISSING}; expected $FAILED_26516_V1_HEAD"
 for f in "$APPLY_26516" "$VALIDATE_26516" "$HANDOFF_26516" "$INERT_DERIVED" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do
   [[ -f "$f" ]] || fail "missing $(basename "$f")"
 done
@@ -71,9 +76,9 @@ if found:
     raise SystemExit('historical runtime constructor reference(s) found: '+', '.join(found))
 print('PASS: no 26512-26515 runtime constructor invocation in 26516 builder')
 PYNOBACK
-pass "exact 26515 HEAD/backup verified; no committed runtime/build drift; historical constructors prohibited"
+pass "exact 26515 runtime backup + exact failed-v1 handoff backup verified; no committed runtime/build drift; historical constructors prohibited"
 
-echo "=== 26516 V1 GATE 1: recover the ACTUAL source snapshot emitted by successful 26515 ==="
+echo "=== 26516 V2 GATE 1: recover and trust the ACTUAL manifest-verified source snapshot emitted by successful 26515 ==="
 command -v gh >/dev/null || fail "GitHub CLI (gh) unavailable"
 [[ -n "${GH_TOKEN:-}" ]] || fail "GH_TOKEN missing; Actions artifact cannot be authenticated"
 RUN_JSON="$WORK/26515_runs.json"
@@ -121,12 +126,31 @@ grep -F 'IRIS_26515_FUSED_LINEAR_SOURCE_RESTORE=true' "$BASE/app/src/main/java/c
 grep -F 'IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java" >/dev/null || fail "26515 render authority split missing"
 grep -F 'IRIS_26514_OPTIONAL_LINEAR_PRESENTATION_CONTROLS' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java" >/dev/null || fail "26514 manual control graph missing"
 
-# Files unchanged by 26514/26515 must retain their known exact bytes before 26516 touches them.
-[[ "$(sha "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java")" == "c1feb33087bb7436f0d7fa18489458d3d84594cc" ]] || fail "pre-26516 MotionV2ColorTransform bytes drift"
-[[ "$(sha "$BASE/app/src/main/assets/shaders/motionv2/color_transform.glsl")" == "05a850c5a7df1f338c448c84e59e188ebdcf71a1" ]] || fail "pre-26516 color shader bytes drift"
-[[ "$(sha "$BASE/app/src/main/assets/shaders/motionv2/display_exposure.glsl")" == "748b94327da96fa0b2fc6d8a5750dc07651c4796" ]] || fail "pre-26516 display shader bytes drift"
-[[ "$(sha "$BASE/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java")" == "552576a32166acfd674dacd6d2a7a1958a797317" ]] || fail "pre-26516 GLPreview bytes drift"
-[[ "$(sha "$BASE/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java")" == "3d2b6aa7f2997b8ce9d9f43523967672f17d003c" ]] || fail "pre-26516 CameraUIController bytes drift"
+# IRIS_26516_V2_ARTIFACT_BYTE_AUTHORITY
+# The successful 26515 artifact + its own manifest are the sole byte authority. Do NOT compare
+# artifact files to the repository placeholder app/src/main tree: successful 26515 intentionally
+# built from its predecessor artifact and emitted a new source snapshot without committing runtime.
+# Instead, dry-run the deterministic 26516 transform against the actual artifact source. Every
+# changed-file anchor must resolve before any candidate write occurs. Record the exact artifact
+# input hashes for provenance, but do not impose stale repository-derived hash expectations.
+python3 - "$BASE" "$APPLY_26516" "$OUT/26516_BASE_CHANGED_INPUTS.sha256" <<'PYBASECOMPAT'
+from __future__ import annotations
+import hashlib, importlib.util, sys
+from pathlib import Path
+base=Path(sys.argv[1]).resolve(); script=Path(sys.argv[2]).resolve(); out=Path(sys.argv[3]).resolve()
+spec=importlib.util.spec_from_file_location('iris26516apply_basecompat', script)
+mod=importlib.util.module_from_spec(spec); assert spec.loader is not None; spec.loader.exec_module(mod)
+lines=[]
+for rel in sorted(mod.CHANGED):
+    p=base/rel
+    old=p.read_text() if p.is_file() else ''
+    mod.expected_text(rel, old)  # pure in-memory compatibility proof; performs no write
+    if p.is_file():
+        lines.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {rel}")
+out.write_text("\n".join(lines)+"\n")
+print('PASS: deterministic 26516 transform anchors resolve against actual manifest-verified 26515 artifact source')
+print('PASS: repository-placeholder byte hashes are not used as 26515 runtime authority')
+PYBASECOMPAT
 
 cp -a "$BASE/." "$AFTER/"
 cat > "$OUT/26516_BASE_SOURCE_PROVENANCE.txt" <<EOF
@@ -138,9 +162,9 @@ BASE_SOURCE_TAR_SHA256=$BASE_TAR_SHA
 BASE_SOURCE_MANIFEST_SHA256=$SOURCE_MANIFEST_SHA
 BASE_VERSION=0.9726515/26515
 EOF
-pass "actual successful-26515 source snapshot recovered, manifest-verified, and 26515 ownership markers proven"
+pass "actual successful-26515 source snapshot recovered; manifest + deterministic-transform compatibility proven without repository-placeholder byte assumptions"
 
-echo "=== 26516 V1 GATE 2: rollback patch FIRST; apply only profile/viewfinder delta; exact validator ==="
+echo "=== 26516 V2 GATE 2: rollback patch FIRST; apply only profile/viewfinder delta; exact validator ==="
 PATCH="$OUT/26516_RUNTIME_DELTA_FROM_TESTED_26515.patch"
 PATCH_SHA="$OUT/26516_RUNTIME_DELTA_FROM_TESTED_26515.patch.sha256"
 python3 "$APPLY_26516" "$AFTER" --patch-out "$PATCH" --patch-sha-out "$PATCH_SHA"
@@ -173,7 +197,7 @@ PYSOURCE
 echo "PRE-BUILD SAFETY PROOF PASSED"
 pass "rollback/audit patch existed before writes; exact 26516 delta validated; capture/MGC/render frozen"
 
-echo "=== 26516 V1 GATE 3: VERSION ${VERSION_NAME}/${VERSION_BUILD} + APK build in the SAME guarded block ==="
+echo "=== 26516 V2 GATE 3: VERSION ${VERSION_NAME}/${VERSION_BUILD} + APK build in the SAME guarded block ==="
 python3 - "$AFTER/app/version.properties" "$VERSION_NAME" "$VERSION_BUILD" <<'PYVER'
 from pathlib import Path
 import sys
@@ -251,7 +275,7 @@ FINAL_APK_SHA256=$(sha "$FINAL")
 FINAL_SOURCE_TAR_SHA256=$(sha "$OUT/26516_candidate_app_source.tar.gz")
 EOF
 
-echo "=== 26516 V1 SUCCESS ==="
+echo "=== 26516 V2 SUCCESS ==="
 echo "APK: $(basename "$FINAL")"
 echo "APK SHA256: $(sha "$FINAL")"
 echo "BASE_26515_RUN_ID=$RUN_ID"
