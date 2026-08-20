@@ -22,3 +22,8 @@ Required backup branch before committing this handoff:
 Workflow: `Build 26517 v1 Released-1.27.1 Spatial + Viewfinder`
 Artifact: `photon-26517-released-spatial-viewfinder-v1`
 APK: `IrisCamera-0.9726517-26517-released-spatial-viewfinder-debug.apk`
+
+V3 HANDOFF GATE CORRECTION (2026-08-20)
+- No runtime delta change from 26517 V2.
+- No version/build change: still 0.9726517 / 26517.
+- Gate 1 now validates the ACTUAL built-26516 bridge markers/neutral assignments used by the successful 26516 validator, rather than searching for a transformation-script-only comment that is never emitted into runtime source.

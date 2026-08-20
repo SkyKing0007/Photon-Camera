@@ -88,7 +88,37 @@ tar -xzf "$SOURCE_TAR" -C "$BASE"
 [[ "$(grep '^VERSION_NAME=' "$BASE/app/version.properties"|cut -d= -f2)" == "0.9726516" && "$(grep '^VERSION_BUILD=' "$BASE/app/version.properties"|cut -d= -f2)" == "26516" ]] || fail "artifact source is not 0.9726516/26516"
 grep -F 'IRIS_26516_BJZHOU_STYLE_VIEWFINDER_PRESENTATION_SOLVER' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java" >/dev/null || fail "26516 matcher owner missing"
 grep -F 'IRIS_26516_DNG_PROFILE_HDR_PRESERVING_DOMAIN' "$BASE/app/src/main/assets/shaders/motionv2/color_transform.glsl" >/dev/null || fail "26516 profile owner missing"
-grep -F 'IRIS_26516_V4_ALL_BRIDGE_DISPLAY_PATHS_NEUTRALIZED' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt" >/dev/null || fail "26516 bridge V4 owner missing"
+BRIDGE_26516="$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt"
+python3 - "$BRIDGE_26516" <<'PYBRIDGEARTIFACT'
+from pathlib import Path
+import sys
+s = Path(sys.argv[1]).read_text()
+for token in (
+    'IRIS_26515_SHORT_BASELINE_DOMAIN',
+    'parameters.motionV2MgcSourceExposureGain = baselineScale',
+    'IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY',
+    'parameters.motionV2DisplayGain = 1.0f',
+    'legacyRawDisplayGainDiagnostic=$referenceDisplayGain',
+    'solverAfterProfileColor=true camera2Write=false',
+    'legacyAssignmentsNeutralized=',
+):
+    if token not in s:
+        raise SystemExit('recovered 26516 bridge runtime evidence missing: ' + token)
+legacy = 'parameters.motionV2DisplayGain = referenceDisplayGain'
+neutral = 'parameters.motionV2DisplayGain = 1.0f'
+if legacy in s:
+    raise SystemExit('recovered 26516 bridge still contains legacy referenceDisplayGain authority')
+if s.count(neutral) < 2:
+    raise SystemExit('recovered 26516 bridge did not neutralize every tested-26515 display path')
+denoise_i = s.index('MgcFullResolutionDenoise.denoise(')
+pair = ('parameters.motionV2MgcSourceExposureGain = baselineScale\n'
+        '            parameters.motionV2DisplayGain = 1.0f')
+pair_i = s.index(pair)
+telemetry_i = s.index('IRIS_26516_VIEWFINDER_PRESENTATION_AUTHORITY', pair_i)
+if not (denoise_i < pair_i < telemetry_i):
+    raise SystemExit('recovered 26516 bridge runtime authority ordering drift')
+print('PASS: recovered 26516 bridge V4 runtime authority matches successful 26516 validator')
+PYBRIDGEARTIFACT
 grep -F 'private val guideWidth = ceilDiv(width, 2)' "$BASE/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt" >/dev/null || fail "expected post-Sabre 09c Spatial guide missing"
 
 rm -rf "$REL"; git init -q "$REL"; git -C "$REL" remote add origin https://github.com/bjzhou/PhotonCamera.git
