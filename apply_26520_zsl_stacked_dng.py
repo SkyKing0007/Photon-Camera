@@ -81,12 +81,16 @@ def append_unique_call_argument(
     argument without depending on indentation/line wrapping from the recovered
     successful-build source artifact.
     """
-    pattern = re.compile(
-            r'(?m)^[ \t]*' + re.escape(function_name) + r'\s*\(')
+    # IRIS_26520_V3_EXACT_26519_ARTIFACT_CALL_DISCOVERY
+    # Search the entire source, not just line starts. The successful 26519 artifact is
+    # the byte authority and may place an assignment/cast before this invocation.
+    pattern = re.compile(re.escape(function_name) + r'\s*\(')
     matches = list(pattern.finditer(s))
     if len(matches) != 1:
+        class_hits = [m.start() for m in re.finditer(re.escape(function_name.rsplit('.', 1)[0]), s)]
         raise AssertionError(
-                f'{label} semantic call count={len(matches)} expected=1')
+                f'{label} semantic call count={len(matches)} expected=1 '
+                f'classTokenHits={len(class_hits)}')
 
     match = matches[0]
     open_idx = s.find('(', match.start(), match.end() + 1)

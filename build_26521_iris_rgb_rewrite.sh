@@ -2,6 +2,7 @@
 set -euo pipefail
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 pass(){ echo "PASS: $*"; }
+sha(){ sha256sum "$1" | awk '{print $1}'; }
 
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
@@ -9,6 +10,8 @@ BASE_HEAD="9b59a27235747733bacdde68bf6a888ebffefa18"
 BACKUP="backup-26519-before-26521-iris-rgb-rewrite"
 BASE_WORKFLOW="build-26519-per-lens-viewfinder-response.yml"
 BASE_ARTIFACT="photon-26519-per-lens-viewfinder-response-v2"
+BASE_SOURCE_TAR_NAME="26519_candidate_app_source.tar.gz"
+BASE_SOURCE_MANIFEST_NAME="26519_candidate_source.sha256"
 REPO="${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}"
 APPLY20="$ROOT/apply_26520_zsl_stacked_dng.py"
 APPLY21="$ROOT/apply_26521_iris_rgb_rewrite.py"
@@ -54,14 +57,55 @@ print(r[0]['databaseId'])
 PY
 )"
 gh run download "$RUN_ID" --repo "$REPO" --name "$BASE_ARTIFACT" --dir "$ART"
-SOURCE_TAR="$(find "$ART" -type f -name '26519_candidate_app_source.tar.gz' -print -quit)"
-SOURCE_MANIFEST="$(find "$ART" -type f -name '26519_candidate_source.sha256' -print -quit)"
-[[ -f "$SOURCE_TAR" && -f "$SOURCE_MANIFEST" ]] || fail "26519 source artifact missing"
+mapfile -t SOURCE_TARS < <(find "$ART" -type f -name "$BASE_SOURCE_TAR_NAME" -print)
+mapfile -t SOURCE_MANIFESTS < <(find "$ART" -type f -name "$BASE_SOURCE_MANIFEST_NAME" -print)
+[[ "${#SOURCE_TARS[@]}" -eq 1 && "${#SOURCE_MANIFESTS[@]}" -eq 1 ]] || fail "26519 source artifact cardinality mismatch"
+SOURCE_TAR="${SOURCE_TARS[0]}"; SOURCE_MANIFEST="${SOURCE_MANIFESTS[0]}"
+BASE_TAR_SHA="$(sha "$SOURCE_TAR")"; SOURCE_MANIFEST_SHA="$(sha "$SOURCE_MANIFEST")"
+python3 - "$SOURCE_TAR" <<'PYTAR'
+import sys,tarfile
+with tarfile.open(sys.argv[1],'r:gz') as t:
+    names=[m.name.lstrip('./') for m in t.getmembers() if m.name not in ('.','./')]
+for n in names:
+    if not (n in {'app','app/','app/src','app/src/','app/src/main','app/src/main/','app/version.properties'} or n.startswith('app/src/main/')):
+        raise SystemExit('unexpected path in 26519 source archive: '+n)
+print('PASS: 26519 source archive contains runtime source + version only')
+PYTAR
 tar -xzf "$SOURCE_TAR" -C "$BASE"
 ( cd "$BASE" && sha256sum -c "$SOURCE_MANIFEST" ) > "$OUT/26519_source_manifest_check.txt"
-[[ "$(grep '^VERSION_NAME=' "$BASE/app/version.properties"|cut -d= -f2)" == "0.9726519" ]]
-[[ "$(grep '^VERSION_BUILD=' "$BASE/app/version.properties"|cut -d= -f2)" == "26519" ]]
-pass "successful 26519 source recovered"
+[[ "$(grep '^VERSION_NAME=' "$BASE/app/version.properties"|cut -d= -f2)" == "0.9726519" ]] || fail "base version name mismatch"
+[[ "$(grep '^VERSION_BUILD=' "$BASE/app/version.properties"|cut -d= -f2)" == "26519" ]] || fail "base build mismatch"
+grep -F 'IRIS_26519_PER_LENS_VIEWFINDER_RESPONSE' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java" >/dev/null || fail "26519 matcher missing"
+grep -F 'pref_motion_viewfinder_match_strength' "$BASE/app/src/main/res/xml/preferences.xml" >/dev/null || fail "26519 slider missing"
+grep -F 'IRIS_26518_RELEASED_1271_RESULT_ABI_SNR_BRIDGE' "$BASE/app/src/main/java/com/hinnka/mycamera/processor/GlesMgc1271ReleasedSpatialStacker.kt" >/dev/null || fail "26518 SNR ABI missing"
+grep -F 'IRIS_26517_RELEASED_1271_SPATIAL_RGB_OWNER' "$BASE/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt" >/dev/null || fail "c4ff owner missing"
+pass "successful 26519 source recovered and runtime owners proven"
+
+echo "=== 26521 GATE 1B: prove COMPLETE 26520+26521 transforms against ACTUAL successful 26519 artifact BEFORE writes ==="
+python3 - "$BASE" "$APPLY20" "$APPLY21" "$OUT/26521_BASE_CHANGED_INPUTS.sha256" "$OUT/26521_ACTUAL_26519_HDRX_RECONSTRUCT_CONTEXT.txt" <<'PYCOMPAT'
+from __future__ import annotations
+import hashlib,importlib.util,sys
+from pathlib import Path
+base=Path(sys.argv[1]).resolve(); a20=Path(sys.argv[2]).resolve(); a21=Path(sys.argv[3]).resolve(); hashes=Path(sys.argv[4]); context=Path(sys.argv[5])
+def load(name,p):
+    spec=importlib.util.spec_from_file_location(name,p); m=importlib.util.module_from_spec(spec); assert spec.loader is not None; spec.loader.exec_module(m); return m
+m20=load('iris26520_artifact_compat',a20); m21=load('iris26521_artifact_compat',a21)
+# Both transforms execute only in memory against the exact manifest-verified 26519 artifact.
+e20=m20.expected_map(base); e21=m21.expected_map(base,a20)
+lines=[]
+for rel in sorted(set(m20.CHANGED)|{m21.CFA,m21.SHADER}):
+    p=base/rel
+    if p.is_file(): lines.append(f"{hashlib.sha256(p.read_bytes()).hexdigest()}  {rel}")
+hashes.write_text('\n'.join(lines)+'\n')
+hdr=(base/m20.HDRX).read_text().replace('\r\n','\n').replace('\r','\n'); token='MotionV2CfaReconstruction.reconstruct'; pos=hdr.find(token)
+assert pos>=0 and hdr.find(token,pos+1)<0, 'actual 26519 reconstruct token cardinality is not exactly one'
+a=max(0,hdr.rfind('\n',0,max(0,pos-500))+1); b=hdr.find('\n',min(len(hdr),pos+900)); b=len(hdr) if b<0 else b
+context.write_text(hdr[a:b]+'\n')
+assert m20.HDRX in e20 and m21.CFA in e21 and m21.SHADER in e21
+print('PASS: complete shared 26520 transform resolves against actual successful 26519 artifact')
+print('PASS: complete 26521 RGB transform resolves on that exact same in-memory 26520 candidate')
+print('PASS: repository app/src is not used as 26521 runtime authority')
+PYCOMPAT
 
 echo "=== 26521 GATE 2: combined rollback patch FIRST ==="
 cp -a "$BASE/." "$AFTER/"
@@ -70,6 +114,8 @@ PATCH_SHA="$OUT/26521_COMBINED_RUNTIME_DELTA_FROM_TESTED_26519.patch.sha256"
 python3 "$APPLY21" "$AFTER" --apply26520 "$APPLY20" --patch-out "$PATCH" --patch-sha-out "$PATCH_SHA"
 ( cd "$OUT" && sha256sum -c "$(basename "$PATCH_SHA")" )
 python3 "$VALIDATE" --base "$BASE" --candidate "$AFTER" --apply26520 "$APPLY20" --patch "$PATCH" --patch-sha "$PATCH_SHA" | tee "$OUT/26521_prebuild_validator.txt"
+[[ "$(grep '^VERSION_NAME=' "$AFTER/app/version.properties"|cut -d= -f2)" == "0.9726519" ]] || fail "version changed before build block"
+[[ "$(grep '^VERSION_BUILD=' "$AFTER/app/version.properties"|cut -d= -f2)" == "26519" ]] || fail "build changed before build block"
 echo "PRE-BUILD SAFETY PROOF PASSED"
 
 echo "=== 26521 GATE 3: version increment + APK build same block ==="
@@ -132,6 +178,11 @@ tar --sort=name --mtime='UTC 2026-08-21 00:00:00' --owner=0 --group=0 --numeric-
 cat > "$OUT/26521_FINAL_PROVENANCE.txt" <<EOF
 BUILD=0.9726521/26521
 BASE_HEAD=$BASE_HEAD
+BASE_ARTIFACT=$BASE_ARTIFACT
+BASE_SOURCE_TAR_SHA256=$BASE_TAR_SHA
+BASE_SOURCE_MANIFEST_SHA256=$SOURCE_MANIFEST_SHA
+ARTIFACT_COMPATIBILITY_PROOF=true
+REPOSITORY_RUNTIME_AUTHORITY=false
 BACKUP=$BACKUP
 SIBLING_OF_26520=true
 ONE_FRAME_FIX_IDENTICAL_TO_26520=true

@@ -40,3 +40,10 @@ follow-up source-tree cleanup can physically remove those dormant files/assets.
 
 Artifact: photon-26521-iris-rgb-rewrite-v1
 APK: IrisCamera-0.9726521-26521-iris-rgb-rewrite-debug.apk
+
+V3 exact-26519 procedure correction
+-----------------------------------
+- The successful 26519 V2 Actions artifact is the sole runtime source authority.
+- Both the shared 26520 transform and the 26521 RGB transform are proven in memory against that exact artifact before candidate writes.
+- Repository app/src is never substituted for the tested 26519 artifact.
+- No new runtime architecture change versus the original 26521 sibling experiment.
