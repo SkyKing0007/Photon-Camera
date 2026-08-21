@@ -226,16 +226,41 @@ mkdir -p app/src
 cp -a "$AFTER/app/src/main" app/src/main
 cp "$AFTER/app/version.properties" app/version.properties
 
-runtime_manifest() {
-  local root="$1"; local dest="$2"
-  ( cd "$root" && find app/src/main -type f -print0 | sort -z | xargs -0 sha256sum; sha256sum app/version.properties ) > "$dest"
+# Match the exact successful 26518 Gradle-mutation audit:
+# - third_party_26507 is a temporary rehydrated vendor tree and is audited separately by its pinned manifest.
+# - app/src/main/cpp/deps is populated by the build; only the known generated headers may appear.
+# - every other runtime source file plus version.properties must remain byte-identical.
+assert_cpp_deps_exact() {
+  local phase="$1" expected actual
+  if [[ "$phase" == pre ]]; then
+    expected=$'.gitignore'
+  else
+    expected=$'.gitignore\narchive.h\narchive_entry.h\ntechnicallyflac.h\ntiny_dng_writer.h'
+  fi
+  actual="$(find app/src/main/cpp/deps -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+  [[ "$actual" == "$expected" ]] || fail "unexpected app/src/main/cpp/deps contents ($phase)"
+}
+audited_runtime_manifest() {
+  {
+    find app/src/main -type f \
+      ! -path 'app/src/main/cpp/third_party_26507/*' \
+      ! -path 'app/src/main/cpp/deps/*' -print
+    echo app/src/main/cpp/deps/.gitignore
+    echo app/version.properties
+  } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done
 }
 
-runtime_manifest "$ROOT" "$OUT/26519_pre_gradle_runtime_manifest.sha256"
+assert_cpp_deps_exact pre
+audited_runtime_manifest > "$OUT/26519_pre_gradle_audited_runtime.sha256"
 ./gradlew clean :app:assembleDebug --stacktrace
-runtime_manifest "$ROOT" "$OUT/26519_post_gradle_runtime_manifest.sha256"
-cmp -s "$OUT/26519_pre_gradle_runtime_manifest.sha256" "$OUT/26519_post_gradle_runtime_manifest.sha256" || fail "Gradle changed runtime source/version inputs"
-pass "pre/post Gradle runtime manifests identical"
+assert_cpp_deps_exact post
+audited_runtime_manifest > "$OUT/26519_post_gradle_audited_runtime.sha256"
+cmp -s "$OUT/26519_pre_gradle_audited_runtime.sha256" "$OUT/26519_post_gradle_audited_runtime.sha256" || {
+  diff -u "$OUT/26519_pre_gradle_audited_runtime.sha256" "$OUT/26519_post_gradle_audited_runtime.sha256" \
+    > "$OUT/26519_gradle_runtime_source_diff.txt" || true
+  fail "Gradle mutated audited 26519 runtime source"
+}
+pass "Gradle preserved validated 26519 runtime source; generated deps matched exact 26518 contract"
 
 mapfile -t APKS < <(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print)
 [[ "${#APKS[@]}" -eq 1 ]] || { printf '%s\n' "${APKS[@]}" >&2; fail "expected exactly one debug APK, found ${#APKS[@]}"; }

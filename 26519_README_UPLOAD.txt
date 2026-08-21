@@ -48,3 +48,19 @@ Expected artifact
 -----------------
 photon-26519-per-lens-viewfinder-response-v1
 IrisCamera-0.9726519-26519-per-lens-viewfinder-response-debug.apk
+
+V2 gate correction
+------------------
+The first 26519 Actions run compiled the APK successfully but the post-Gradle gate falsely failed
+because it hashed Gradle-generated app/src/main/cpp/deps headers as immutable source.
+
+V2 restores the exact successful 26518 audit contract:
+- temporary third_party_26507 is validated by the pinned bjzhou vendor manifest and excluded from
+  the immutable runtime-source manifest;
+- app/src/main/cpp/deps must be exactly .gitignore before Gradle and exactly
+  .gitignore, archive.h, archive_entry.h, technicallyflac.h, tiny_dng_writer.h after Gradle;
+- every other app/src/main file and app/version.properties must remain byte-identical.
+
+No runtime source, matcher math, slider behavior, c4ff owner, version, or build number changed.
+Expected V2 artifact:
+photon-26519-per-lens-viewfinder-response-v2
