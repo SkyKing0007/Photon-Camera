@@ -135,12 +135,31 @@ def main():
     ):
         assert tok in stack, 'two-slot RAW lifetime token missing '+tok
     assert 'drawBandHeight=$RGB_ONLINE_DRAW_BAND_HEIGHT rawSlots=2' in stack
-    dng_pos=stack.find('IRIS_26520_V4_NORMAL_ONLY_TEMPORAL_CONTRIBUTION')
-    rgb_pos=stack.find('submitOrRetainRgbFrame(',dng_pos)
-    wait_pos=stack.find('online.passWindow.awaitResources(',dng_pos)
-    upload_pos=stack.find('uploadRaw(images[index], texture, "frame $index")',wait_pos)
-    assert dng_pos>=0 and rgb_pos>dng_pos, 'temporal DNG read must precede tracked RGB contribution in the same GL command stream'
-    assert wait_pos>=0 and upload_pos>wait_pos, 'RAW slot must be awaited before overwrite upload'
+    # Validate the actual temporal-loop execution order. The RAW slot must be made safe before
+    # it is overwritten; DNG and RGB then consume that uploaded RAW in-order on the same GL
+    # command stream. The RGB pass-window fence is submitted after those reads and therefore
+    # protects the slot until the next awaitResources() before reuse.
+    loop_start=stack.find('            for (index in temporalFrameRange) {')
+    loop_end=stack.find('            val readyStrengthCapture',loop_start)
+    assert loop_start>=0 and loop_end>loop_start, 'temporal merge loop missing/ambiguous'
+    temporal=stack[loop_start:loop_end]
+    wait_pos=temporal.find('online.passWindow.awaitResources(')
+    upload_pos=temporal.find('uploadRaw(images[index], texture, "frame $index")')
+    prepare_pos=temporal.find('val prepared = prepareTemporalFrame(')
+    dng_pos=temporal.find('IRIS_26520_V4_NORMAL_ONLY_TEMPORAL_CONTRIBUTION')
+    rgb_pos=temporal.find('submitOrRetainRgbFrame(',dng_pos)
+    assert 0 <= wait_pos < upload_pos < prepare_pos < dng_pos < rgb_pos, (
+        'temporal RAW lifetime order must be wait -> upload -> prepare -> DNG -> RGB; '
+        f'got wait={wait_pos} upload={upload_pos} prepare={prepare_pos} dng={dng_pos} rgb={rgb_pos}'
+    )
+    contribute_start=stack.find('    private fun contributeOnlineRgbFrame(')
+    contribute_end=stack.find('    private fun finishOnlineRgbMerge(',contribute_start)
+    assert contribute_start>=0 and contribute_end>contribute_start, 'online RGB contribution function missing'
+    contribute=stack[contribute_start:contribute_end]
+    begin_pos=contribute.find('accumulator.passWindow.beginPass(')
+    draw_pos=contribute.find('renderRgbFrameContribution(',begin_pos)
+    end_pos=contribute.find('accumulator.passWindow.endPass()',draw_pos)
+    assert 0 <= begin_pos < draw_pos < end_pos, 'RAW resource fence must wrap each online RGB band draw'
     assert 'online != null -> online.rawSlots.size' in stack
     assert 'maxInFlight=$RGB_MAX_IN_FLIGHT_PASSES' in stack
     print('PASS: online Spatial RGB uses two resource-tracked RAW slots and cannot overwrite an in-flight RAW texture')
