@@ -167,33 +167,18 @@ cmp -s "$OUT/26524_pre_gradle_audited_runtime.sha256" "$OUT/26524_post_gradle_au
 }
 pass "Gradle preserved validated 26524 runtime source; generated deps are exact"
 
-echo "=== 26524 GATE 4: post-build protected-owner proof ==="
-python3 - "$BASE" "$ROOT" "$OUT/26524_postbuild_owner_proof.txt" <<'PYPOST'
-from pathlib import Path
-import hashlib,sys
-base=Path(sys.argv[1]); cur=Path(sys.argv[2]); out=Path(sys.argv[3])
-protected=[
-'app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java',
-'app/src/main/java/com/particlesdevs/photoncamera/processing/DngCreator.java',
-'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt',
-'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt',
-'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt',
-]
-def h(p): return hashlib.sha256(p.read_bytes()).hexdigest()
-lines=[]
-for rel in protected:
-    a=h(base/rel); b=h(cur/rel)
-    if a!=b: raise SystemExit('protected owner changed post-build: '+rel)
-    lines.append(rel+' '+a)
-render=(cur/'app/src/main/assets/shaders/motionv2/render.glsl').read_text()
-gain=(cur/'app/src/main/assets/shaders/motionv2/gainmap.glsl').read_text()
-zoom=(cur/'app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java').read_text()
-for t in ('IRIS_26524_FULLSIZE_MOTION_ZOOM_RENDER','IRIS_26501_GENTLE_NEUTRAL_WHITE_ROLLOFF'): assert t in render
-assert 'IRIS_26524_UHDR_ZOOM_GEOMETRY_PARITY' in gain
-assert 'TELE_MAX_GLOBAL_ZOOM = 50.0f' in zoom
-out.write_text('\n'.join(lines)+'\n')
-print('PASS: post-build protected MGC/DNG/support owners byte-identical to successful 26523')
-PYPOST
+echo "=== 26524 GATE 4: post-build exact deterministic runtime proof ==="
+# V1.2: rerun the same deterministic validator after Gradle instead of relying
+# on historical comment-marker names. This proves every allowlisted runtime
+# file still equals the exact 26524 transform of successful 26523 and rechecks
+# the protected MGC/Spatial RGB/DNG/support owners after the build.
+python3 "$VALIDATE" \
+  --base "$BASE" \
+  --candidate "$ROOT" \
+  --patch "$PATCH" \
+  --patch-sha "$PATCH_SHA" \
+  | tee "$OUT/26524_postbuild_owner_proof.txt"
+pass "post-build runtime exactly equals deterministic 26524 transform; protected 26523 owners preserved"
 
 mapfile -t APKS < <(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print)
 [[ "${#APKS[@]}" -eq 1 ]] || fail "expected exactly one debug APK, found ${#APKS[@]}"
