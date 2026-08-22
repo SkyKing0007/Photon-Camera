@@ -168,17 +168,40 @@ cmp -s "$OUT/26524_pre_gradle_audited_runtime.sha256" "$OUT/26524_post_gradle_au
 pass "Gradle preserved validated 26524 runtime source; generated deps are exact"
 
 echo "=== 26524 GATE 4: post-build exact deterministic runtime proof ==="
-# V1.2: rerun the same deterministic validator after Gradle instead of relying
-# on historical comment-marker names. This proves every allowlisted runtime
-# file still equals the exact 26524 transform of successful 26523 and rechecks
-# the protected MGC/Spatial RGB/DNG/support owners after the build.
+# V1.3: Gradle legitimately adds build-only files under app/src/main:
+#   - cpp/third_party_26507 (the pinned vendor source already hash-verified)
+#   - four generated cpp/deps headers (already cardinality-verified above)
+# The deterministic validator is intentionally defined against the clean runtime
+# candidate, so validate a sanitized COPY of the post-Gradle tree rather than
+# misclassifying those known build-only files as imaging-source drift.
+POSTCHECK="$WORK/postbuild_runtime_for_validator"
+rm -rf "$POSTCHECK"
+mkdir -p "$POSTCHECK/app/src"
+cp -a "$ROOT/app/src/main" "$POSTCHECK/app/src/main"
+
+# Prove the post-Gradle vendor tree still matches the pinned dependency manifest
+# before removing it from the sanitized validation copy.
+( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) \
+  > "$OUT/26524_postbuild_vendor_manifest_check.txt"
+
+rm -rf "$POSTCHECK/app/src/main/cpp/third_party_26507"
+rm -f \
+  "$POSTCHECK/app/src/main/cpp/deps/archive.h" \
+  "$POSTCHECK/app/src/main/cpp/deps/archive_entry.h" \
+  "$POSTCHECK/app/src/main/cpp/deps/technicallyflac.h" \
+  "$POSTCHECK/app/src/main/cpp/deps/tiny_dng_writer.h"
+
+# The sanitized tree must now contain exactly the deterministic 26524 runtime
+# transform of the successful 26523 candidate. Any other post-Gradle source drift
+# remains visible and fails this validator.
 python3 "$VALIDATE" \
   --base "$BASE" \
-  --candidate "$ROOT" \
+  --candidate "$POSTCHECK" \
   --patch "$PATCH" \
   --patch-sha "$PATCH_SHA" \
   | tee "$OUT/26524_postbuild_owner_proof.txt"
-pass "post-build runtime exactly equals deterministic 26524 transform; protected 26523 owners preserved"
+
+pass "post-build sanitized runtime exactly equals deterministic 26524 transform; protected 26523 owners preserved"
 
 mapfile -t APKS < <(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' -print)
 [[ "${#APKS[@]}" -eq 1 ]] || fail "expected exactly one debug APK, found ${#APKS[@]}"
