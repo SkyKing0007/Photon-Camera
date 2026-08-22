@@ -127,10 +127,14 @@ cap=(root/"app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureContr
 for token in (
     "IRIS_26524_CAMERA2_ZOOM_REQUEST_OWNER",
     "IRIS_26524_ACTUAL_HAL_ZOOM_RESULT_OWNER",
-    "protected CameraDevice mCameraDevice;",
     "PhotonCamera.getSettings().mCameraID",
 ):
-    if token not in cap: raise SystemExit("successful-26525 CaptureController prechange anchor missing: "+token)
+    if token not in cap:
+        raise SystemExit("successful-26525 CaptureController prechange owner missing: "+token)
+import re
+if re.search(r"\bCameraDevice\s+mCameraDevice\s*;", cap) is None:
+    raise SystemExit("successful-26525 CaptureController CameraDevice mCameraDevice declaration missing")
+print("PASS: successful-26525 camera-device field proven semantically (visibility-independent)")
 saver=(root/"app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java").read_text()
 dng=(root/"app/src/main/cpp/dngCreator.cpp").read_text()
 for token in (

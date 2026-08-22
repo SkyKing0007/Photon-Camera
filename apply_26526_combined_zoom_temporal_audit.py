@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, difflib, hashlib, importlib.util
+import argparse, difflib, hashlib, importlib.util, re
 from pathlib import Path
 
 ZOOM = "app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java"
@@ -9,6 +9,14 @@ ALLOWED = {ZOOM, CAPTURE}
 
 PREDECESSOR_ZOOM_TRANSFORMER = "apply_26524_continuous_zoom.py"
 PREDECESSOR_ZOOM_TRANSFORMER_SHA = "056dbbd4c72bed95054682c22c90de3041f88af4dfcc53dab3f6efb240d96bf3"
+PREDECESSOR_DNG_TRANSFORMER = "apply_26525_dng_zoom_parity.py"
+PREDECESSOR_DNG_TRANSFORMER_SHA = "25522634fbcba20638ccf9637475b5ac200ebe6a17d8242733e7de4e06577bbb"
+EXPECTED_26525_DNG_ONLY = {
+    "app/src/main/java/com/particlesdevs/photoncamera/processing/DngCreator.java",
+    "app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java",
+    "app/src/main/cpp/dngCreator.cpp",
+    "app/src/main/cpp/CMakeLists.txt",
+}
 
 def norm(s: str) -> str:
     return s.replace("\r\n", "\n").replace("\r", "\n")
@@ -40,6 +48,45 @@ def load_26524_transformer(script_dir: Path):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+def load_26525_transformer(script_dir: Path):
+    p = script_dir / PREDECESSOR_DNG_TRANSFORMER
+    if not p.is_file():
+        raise AssertionError("missing exact 26525 V1.1 DNG transformer beside 26526 handoff")
+    if sha(p) != PREDECESSOR_DNG_TRANSFORMER_SHA:
+        raise AssertionError("exact 26525 V1.1 DNG transformer SHA drift")
+    spec = importlib.util.spec_from_file_location("iris26525_exact", p)
+    if spec is None or spec.loader is None:
+        raise AssertionError("unable to import exact 26525 V1.1 DNG transformer")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def has_camera_device_field(src: str) -> bool:
+    # Visibility was public in the predecessor source. Ownership only requires
+    # the declared type/name, so never gate on public/protected/private spelling.
+    return re.search(r"\bCameraDevice\s+mCameraDevice\s*;", src) is not None
+
+def prove_predecessor_chain(script_dir: Path) -> None:
+    prev24 = load_26524_transformer(script_dir)
+    prev25 = load_26525_transformer(script_dir)
+
+    allowed25 = set(getattr(prev25, "ALLOWED", set()))
+    if allowed25 != EXPECTED_26525_DNG_ONLY:
+        raise AssertionError(
+            "exact 26525 V1.1 runtime allowlist drift: " + repr(sorted(allowed25))
+        )
+    if ZOOM in allowed25 or CAPTURE in allowed25:
+        raise AssertionError("26525 V1.1 unexpectedly touches zoom/capture owners")
+
+    prev24_source = norm((script_dir / PREDECESSOR_ZOOM_TRANSFORMER).read_text(encoding="utf-8"))
+    if OLD_CAPTURE_HELPER not in prev24_source:
+        raise AssertionError("26526 request-owner replacement is not exact 26524-generated block")
+    if OLD_CAPTURE_RESULT not in prev24_source:
+        raise AssertionError("26526 result-owner replacement is not exact 26524-generated block")
+
+    if norm(prev24.ZOOM_SOURCE).count("IRIS_26524_CONTINUOUS_CROSSLENS_ZOOM_OWNER") != 1:
+        raise AssertionError("exact 26524 generated zoom owner marker drift")
 
 def zoom_expected(old: str) -> str:
     s = norm(old)
@@ -731,8 +778,8 @@ NEW_CAPTURE_RESULT = """            /* IRIS_26526_SESSION_BOUND_HAL_TELEMETRY
 
 def capture_expected(old: str) -> str:
     s = norm(old)
-    if "protected CameraDevice mCameraDevice;" not in s:
-        raise AssertionError("CaptureController exact camera-device field missing")
+    if not has_camera_device_field(s):
+        raise AssertionError("CaptureController CameraDevice mCameraDevice declaration missing")
     if "IRIS_26524_CAMERA2_ZOOM_REQUEST_OWNER" not in s:
         raise AssertionError("successful-26525 candidate missing 26524 request owner")
     if "IRIS_26524_ACTUAL_HAL_ZOOM_RESULT_OWNER" not in s:
@@ -744,6 +791,7 @@ def capture_expected(old: str) -> str:
 def transformed(root: Path, script_dir: Path | None = None) -> dict[str, str]:
     if script_dir is None:
         script_dir = Path(__file__).resolve().parent
+    prove_predecessor_chain(script_dir)
     prev = load_26524_transformer(script_dir)
     current_zoom = read(root, ZOOM)
     expected_old_zoom = norm(prev.ZOOM_SOURCE)
@@ -775,6 +823,7 @@ def write_patch(root: Path, outputs: dict[str, str], patch: Path):
     patch.write_text("".join(chunks), encoding="utf-8")
 
 def self_test(script_dir: Path):
+    prove_predecessor_chain(script_dir)
     prev = load_26524_transformer(script_dir)
     z = zoom_expected(norm(prev.ZOOM_SOURCE))
     assert z.count("IRIS_26526_SINGLE_PREVIEW_GEOMETRY_AUTHORITY") == 1
@@ -784,11 +833,20 @@ def self_test(script_dir: Path):
     assert "desiredLocal / Math.max(1.0f, actualHardware)" not in z
     assert z.count("sResidualSoftwareZoom = residual;") == 1
     assert z.count("{") == z.count("}")
-    synthetic = "protected CameraDevice mCameraDevice;\n" + OLD_CAPTURE_HELPER + OLD_CAPTURE_RESULT
+    synthetic = "public CameraDevice mCameraDevice;\n" + OLD_CAPTURE_HELPER + OLD_CAPTURE_RESULT
     c = capture_expected(synthetic)
+    for declaration in (
+        "public CameraDevice mCameraDevice;",
+        "protected CameraDevice mCameraDevice;",
+        "private CameraDevice mCameraDevice;",
+    ):
+        assert has_camera_device_field(declaration)
+    assert not has_camera_device_field("CameraDevice otherDevice;")
     assert "session.getDevice().getId()" in c
     assert "iris26524PreviousResidual" not in c
     assert "mTextureView.setSoftwareZoom(iris26524ActualResidual)" not in c
+    print("PASS: exact 26524 zoom blocks + exact 26525 DNG-only provenance chain")
+    print("PASS: semantic CameraDevice field proof is visibility-independent")
     print("PASS: 26526 exact predecessor zoom transform self-test")
     print("PASS: CaptureResult-driven software zoom removal self-test")
     print("PASS: transactional pending/commit + hysteresis source structure self-test")
