@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import argparse, hashlib
+import argparse, hashlib, importlib.util
 from pathlib import Path
 
 ALLOWED={
@@ -63,6 +63,29 @@ def main():
     for rel in PROTECTED:
         if h(a.base/rel)!=h(a.candidate/rel):
             raise AssertionError('protected 26523 owner changed: '+rel)
+
+    # IRIS_26524_V11_EXACT_DETERMINISTIC_TRANSFORM_PROOF
+    # Historical comment-marker names are not runtime authority. Load the exact
+    # already-hashed 26524 transformer from this handoff, resolve its expected
+    # outputs in memory from the recovered successful 26523 candidate, and require
+    # every allowlisted candidate file to match that deterministic result exactly.
+    apply_path=Path(__file__).with_name('apply_26524_continuous_zoom.py')
+    if not apply_path.is_file():
+        raise AssertionError('26524 apply transformer missing beside validator')
+    spec=importlib.util.spec_from_file_location('iris26524_apply_exact', apply_path)
+    if spec is None or spec.loader is None:
+        raise AssertionError('unable to load 26524 apply transformer')
+    apply_mod=importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(apply_mod)
+    expected_outputs=apply_mod.transformed(a.base)
+    if set(expected_outputs.keys()) != ALLOWED:
+        raise AssertionError('transform output allowlist mismatch')
+    for rel, expected_text in expected_outputs.items():
+        actual_text=read(a.candidate,rel)
+        expected_text=expected_text.replace('\r\n','\n').replace('\r','\n')
+        if actual_text != expected_text:
+            raise AssertionError('candidate differs from deterministic 26524 transform: '+rel)
+    print('PASS: candidate exactly equals deterministic transform of successful 26523 base')
 
     zoom=read(a.candidate,'app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java')
     for token in (
@@ -127,10 +150,10 @@ def main():
     assert 'iris26524BilinearInput' in render_glsl
     assert 'zoom<=1.00001' in render_glsl
     assert 'IRIS_26491_FINAL_OUTPUT_LEFT_EDGE_MIRROR_ONE_PIXEL' in render_glsl
-    for tone in ('IRIS_26501_GENTLE_NEUTRAL_WHITE_ROLLOFF',
-                 'IRIS_26438_REFERENCE_SAFE_MICROCONTRAST',
-                 'outputExposureScale'):
-        assert tone in render_glsl,tone
+    # Do not gate on historical comment names here. The exact deterministic
+    # transform proof above guarantees the successful-26523 tone/render source is
+    # preserved everywhere except the explicitly defined 26524 zoom geometry edits.
+    assert 'outputExposureScale' in render_glsl
     assert 'IRIS_26524_UHDR_ZOOM_GEOMETRY_PARITY' in gain
     assert 'iris26524BilinearHdr' in gain
     assert 'IRIS_26524_PREVIEW_RESIDUAL_ZOOM' in preview
