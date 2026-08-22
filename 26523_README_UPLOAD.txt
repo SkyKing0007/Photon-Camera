@@ -21,3 +21,6 @@ or invoke Gradle.
 
 26523 intentionally does NOT loosen Spatial rejection or merge weights. The tested 26522 JPEG/UHDR
 image path is treated as the IQ floor.
+
+V1.1 compile hotfix: TouchFocus reads the actual preview crop with
+CaptureResult.SCALER_CROP_REGION; validator rejects CaptureRequest.Key usage against CaptureResult.

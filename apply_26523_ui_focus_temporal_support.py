@@ -283,6 +283,10 @@ def touch_focus_expected(text:str)->str:
     if 'IRIS_26523_ACTIVE_CROP_FOCUS_MAPPING' in s:
         raise AssertionError('26523 TouchFocus already applied')
     s=one(s,'import android.graphics.Point;\n','import android.graphics.Point;\nimport android.graphics.Rect;\n', 'TouchFocus Rect import')
+    if 'import android.hardware.camera2.CaptureResult;' not in s:
+        s=one(s,'import android.hardware.camera2.CaptureRequest;\n',
+              'import android.hardware.camera2.CaptureRequest;\nimport android.hardware.camera2.CaptureResult;\n',
+              'TouchFocus CaptureResult import')
     old_listener='''    private final OnTouchListener focusListener = (v, event) -> {
         v.performClick();
         resetFocusCircle();
@@ -389,7 +393,7 @@ def touch_focus_expected(text:str)->str:
         }
 
         Rect crop = CaptureController.mPreviewCaptureResult != null
-                ? CaptureController.mPreviewCaptureResult.get(CaptureRequest.SCALER_CROP_REGION)
+                ? CaptureController.mPreviewCaptureResult.get(CaptureResult.SCALER_CROP_REGION)
                 : null;
         if (crop == null && builder != null) crop = builder.get(CaptureRequest.SCALER_CROP_REGION);
         crop = crop == null ? new Rect(coordinateArray) : new Rect(crop);

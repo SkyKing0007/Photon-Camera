@@ -151,7 +151,8 @@ def main():
     tf=read(a.candidate,'app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java')
     for tok in ('IRIS_26523_REAL_AF_LOCK_STATE','IRIS_26523_ACTIVE_CROP_FOCUS_MAPPING',
                 'SENSOR_INFO_ACTIVE_ARRAY_SIZE','SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE',
-                'CaptureRequest.SCALER_CROP_REGION','crop.intersect(coordinateArray)',
+                'CaptureResult.SCALER_CROP_REGION','CaptureRequest.SCALER_CROP_REGION',
+                'crop.intersect(coordinateArray)',
                 'targetSensorAspect','CaptureRequest.CONTROL_AF_TRIGGER_START',
                 'CaptureRequest.CONTROL_AF_TRIGGER_CANCEL','CaptureRequest.CONTROL_AF_TRIGGER_IDLE',
                 'processLongPressToLock','resumeLockedFocusAfterCapture','focusLocked = lockRequested'):
@@ -161,6 +162,8 @@ def main():
     assert tf.find('SENSOR_INFO_ACTIVE_ARRAY_SIZE') < tf.find('SENSOR_INFO_PIXEL_ARRAY_SIZE'), 'pixel array became primary focus domain'
     forbid(tf,'LENS_FOCUS_DISTANCE','manual lens-distance focus')
     forbid(tf,'CONTROL_AE_LOCK','AE lock')
+    forbid(tf,'mPreviewCaptureResult.get(CaptureRequest.SCALER_CROP_REGION)',
+           'CaptureRequest.Key used against CaptureResult')
     forbid(tf,'if (x_to_set - width_to_set > sizee.getWidth())\n            y_to_set','historical x/y clamp bug')
     require(tf,'focusCircleView.setOnTouchListener(null);','focus ring pass-through')
     require(tf,'focusCircleView.setClickable(false);','focus ring pass-through')
