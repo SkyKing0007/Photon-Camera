@@ -88,7 +88,7 @@ def image_saver_expected(text: str) -> str:
     anchor = "                dngCreator.setParameters(parameters, false, false);\n"
     repl = anchor + (
         "                /* IRIS_26525_DNG_DEFAULT_CROP_ZOOM_PARITY */\n"
-        "                dngCreator.setDefaultCropZoom(parameters.iris26524OutputLocalZoom);\n"
+        "                dngCreator.setDefaultCropZoom(parameters.motionV2OutputZoom);\n"
     )
     block = one(block, anchor, repl, "stacked DNG frozen zoom crop handoff")
     s = s[:start] + block + s[end:]

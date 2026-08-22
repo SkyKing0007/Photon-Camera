@@ -18,6 +18,8 @@ VALIDATE="$ROOT/validate_26525_dng_zoom_parity.py"
 HANDOFF="$ROOT/26525_HANDOFF_HASHES.sha256"
 BASE_FILE="$ROOT/26525_BASE_26524_HEAD.txt"
 PROVENANCE="$ROOT/26525_SCOPE_PROVENANCE.txt"
+PREDECESSOR_APPLY="$ROOT/apply_26524_continuous_zoom.py"
+PREDECESSOR_APPLY_SHA="056dbbd4c72bed95054682c22c90de3041f88af4dfcc53dab3f6efb240d96bf3"
 
 BJZHOU_VENDOR_HEAD="09c76e57e8f01a5a8fc536ab41fc80ba642d4042"
 BJZHOU_MANIFEST="$ROOT/26507_BJZHOU_NATIVE_DEPENDENCIES.sha256"
@@ -42,10 +44,13 @@ BRANCH="$(git branch --show-current)"; START_HEAD="$(git rev-parse HEAD)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch: $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26524_HEAD" HEAD || fail "handoff HEAD is not descended from successful 26524"
 [[ "$(tr -d '\r\n' < "$BASE_FILE")" == "$SUCCESSFUL_26524_HEAD" ]] || fail "base-26524 file drift"
-for f in "$APPLY" "$VALIDATE" "$HANDOFF" "$PROVENANCE" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do
+for f in "$APPLY" "$VALIDATE" "$HANDOFF" "$PROVENANCE" "$PREDECESSOR_APPLY" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do
   [[ -f "$f" ]] || fail "missing required file $(basename "$f")"
 done
 sha256sum -c "$HANDOFF"
+[[ "$(sha "$PREDECESSOR_APPLY")" == "$PREDECESSOR_APPLY_SHA" ]] || fail "exact successful-26524 transformer hash drift"
+grep -F 'processingParameters.motionV2OutputZoom = mMotion26524OutputLocalZoom;' "$PREDECESSOR_APPLY" >/dev/null || fail "successful-26524 Parameters zoom handoff provenance missing"
+grep -F 'public float motionV2OutputZoom = 1.0f;' "$PREDECESSOR_APPLY" >/dev/null || fail "successful-26524 Parameters zoom owner provenance missing"
 python3 -m py_compile "$APPLY" "$VALIDATE"
 bash -n "$0"
 [[ "$(tr -d '\r\n' < "$BJZHOU_COMMIT_FILE")" == "$BJZHOU_VENDOR_HEAD" ]] || fail "vendor dependency commit drift"
@@ -107,9 +112,33 @@ for marker in \
   IRIS_26523_DNG_SINGLE_METADATA_OWNERSHIP; do
   grep -R -F "$marker" "$BASE/app/src/main" >/dev/null || fail "successful-26524 marker missing: $marker"
 done
-grep -F 'iris26524OutputLocalZoom' \
-  "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java" >/dev/null \
-  || fail "successful-26524 frozen output-local zoom field missing"
+python3 - "$BASE" <<'PYZOOM'
+from pathlib import Path
+import sys
+root=Path(sys.argv[1])
+def read(rel):
+    p=root/rel
+    if not p.is_file():
+        raise SystemExit('missing successful-26524 zoom owner: '+rel)
+    return p.read_text()
+batch=read('app/src/main/java/com/particlesdevs/photoncamera/processing/MotionBatch.java')
+saver=read('app/src/main/java/com/particlesdevs/photoncamera/processing/DefaultSaver.java')
+hdrx=read('app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java')
+params=read('app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java')
+render=read('app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java')
+required={
+    'MotionBatch': (batch, 'public final float iris26524OutputLocalZoom;'),
+    'DefaultSaver': (saver, 'batch.iris26524OutputLocalZoom'),
+    'Hdrx assignment': (hdrx, 'this.mMotion26524OutputLocalZoom = Math.max(1.0f, outputLocalZoom);'),
+    'Hdrx Parameters handoff': (hdrx, 'processingParameters.motionV2OutputZoom = mMotion26524OutputLocalZoom;'),
+    'Parameters owner': (params, 'public float motionV2OutputZoom = 1.0f;'),
+    'Motion render consumer': (render, 'basePipeline.mParameters.motionV2OutputZoom'),
+}
+for label,(text,token) in required.items():
+    if token not in text:
+        raise SystemExit(f'successful-26524 frozen zoom transport mismatch at {label}: {token}')
+print('PASS: exact successful-26524 frozen zoom transport proven: MotionBatch -> DefaultSaver -> HdrxProcessor -> Parameters.motionV2OutputZoom -> MotionV2Render')
+PYZOOM
 pass "manifest-verified successful 26524 runtime recovered; repository app/src is not runtime authority"
 
 echo "=== 26525 GATE 1A: freeze active IQ / zoom owners before DNG-only transform ==="
@@ -271,7 +300,7 @@ RUNTIME_CHANGED_FILES=4
 TEMPORAL_MERGE_MATH_CHANGED=false
 MULTIFRAME_SR_CHANGED=false
 DNG_PIXEL_PAYLOAD_RESAMPLED=false
-DNG_DEFAULT_CROP_AUTHORITY=parameters.iris26524OutputLocalZoom
+DNG_DEFAULT_CROP_AUTHORITY=parameters.motionV2OutputZoom
 TINYDNG_PINNED_COMMIT=857590b3997818a4ccfbb8a42dd21c76273d6837
 TINYDNG_PINNED_GIT_BLOB=624d614bf3e3bccb394ec54d1bca5bbb350859be
 PROOF

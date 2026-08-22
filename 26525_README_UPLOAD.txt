@@ -13,7 +13,7 @@ IMPORTANT
 WHAT 26525 DOES
 - Keeps the exact successful 26524 Motion JPEG/UHDR zoom architecture.
 - Adds DNG DefaultCropOrigin / DefaultCropSize to the synthetic normalized16 Motion stacked DNG.
-- Uses the shutter-frozen parameters.iris26524OutputLocalZoom.
+- Uses the shutter-frozen parameters.motionV2OutputZoom.
 - Keeps the full stacked Bayer payload; no RAW resampling/cropping/upscaling.
 - Keeps crop origin/size Bayer-even when zoomed.
 - Pins the exact TinyDNG upstream header before adding the two standard tags.

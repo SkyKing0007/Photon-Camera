@@ -115,9 +115,9 @@ def main():
     stacked = saver[marker:boundary]
     assert "IRIS_26523_SINGLE_METADATA=true" in stacked
     assert "dngCreator.setParameters(parameters, false, false);" in stacked
-    assert "dngCreator.setDefaultCropZoom(parameters.iris26524OutputLocalZoom);" in stacked
+    assert "dngCreator.setDefaultCropZoom(parameters.motionV2OutputZoom);" in stacked
     assert "setDefaultCropZoom(" not in saver[boundary:]
-    assert "iris26524OutputLocalZoom" in params
+    assert "public float motionV2OutputZoom = 1.0f;" in params
 
     for token in (
         "double default_crop_zoom = 1.0;",
