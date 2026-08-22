@@ -1,0 +1,2002 @@
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+@@ -526,6 +526,36 @@
+     """.trimIndent()
+ 
+     /**
++     * IRIS_26527_FINAL_MGC_REJECTION_ALIGNMENT_PARITY
++     * Rejection::Downsample2x. MGC applies this to pixel difference immediately after
++     * DilateMask moves the rejection result onto the RAW/4 merge-weight grid.
++     */
++    val rejectionPixelDifferenceDownsample = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uInput;
++        uniform ivec2 uInputSize;
++        out float oPixelDifference;
++        float valueAt(ivec2 p) {
++            return texelFetch(
++                uInput,
++                clamp(p, ivec2(0), uInputSize - ivec2(1)),
++                0
++            ).r;
++        }
++        void main() {
++            ivec2 source = ivec2(gl_FragCoord.xy) * 2;
++            oPixelDifference = 0.25 * (
++                valueAt(source) +
++                valueAt(source + ivec2(1, 0)) +
++                valueAt(source + ivec2(0, 1)) +
++                valueAt(source + ivec2(1, 1))
++            );
++        }
++    """.trimIndent()
++
++    /**
+      * ClippedGaussianBlurHalide (0x387cd28), recovered from the AOT workers and verified against
+      * the original function with constant, impulse, step and asymmetric synthetic inputs.
+      *
+@@ -590,7 +620,8 @@
+ 
+     /**
+      * Read4xDownSample and the input preparation for
+-     * Downsample4xAndFilterRejectionMap from the embedded rejection.cl.
++     * Downsample4xAndFilterRejectionMap from the embedded rejection.cl. These inputs are already
++     * on DilateMask's RAW/4 merge-weight grid; this pass produces the RAW/16 filter grid.
+      */
+     val rejectionFilterDownsample = """
+         #version 300 es
+@@ -598,7 +629,7 @@
+         precision highp int;
+         precision highp usampler2D;
+         uniform highp usampler2D uBaseLuma;
+-        uniform sampler2D uRejection;
++        uniform sampler2D uWeight;
+         uniform ivec2 uInputSize;
+         layout(location = 0) out float oLuma;
+         layout(location = 1) out float oRejection;
+@@ -627,9 +658,9 @@
+             );
+         }
+ 
+-        float rejectionLinearAt(vec2 coordinate) {
++        float weightLinearAt(vec2 coordinate) {
+             return texture(
+-                uRejection,
++                uWeight,
+                 coordinate / vec2(uInputSize)
+             ).r;
+         }
+@@ -642,17 +673,17 @@
+                 vec2(uInputSize) - vec2(2.0)
+             );
+             float luma = 0.0;
+-            float rejection = 0.0;
++            float weight = 0.0;
+             for (int y = -1; y <= 1; y += 2) {
+                 for (int x = -1; x <= 1; x += 2) {
+                     vec2 coordinate = center + vec2(x, y);
+                     luma += lumaLinearAt(coordinate);
+-                    rejection += rejectionLinearAt(coordinate);
++                    weight += weightLinearAt(coordinate);
+                 }
+             }
+             // The source reads CL_SNORM_INT16 and multiplies by 32767 / 16383.
+             oLuma = 0.25 * luma / 16383.0;
+-            oRejection = 0.25 * rejection;
++            oRejection = 0.25 * weight;
+         }
+     """.trimIndent()
+ 
+@@ -702,7 +733,7 @@
+         void main() {
+             ivec2 p = ivec2(gl_FragCoord.xy);
+             float centerLuma = valueAt(uLuma, p);
+-            float centerRejection = valueAt(uRejection, p);
++            float centerWeight = valueAt(uRejection, p);
+             int spatialRadius = min(uRadius, 3 * int(uSigmaSpatial));
+             float weightedRejection = 0.0;
+             float weightSum = 0.0;
+@@ -713,9 +744,9 @@
+                     if (abs(dx) > spatialRadius) continue;
+                     ivec2 q = p + ivec2(dx, dy);
+                     float deltaLuma = valueAt(uLuma, q);
+-                    float deltaRejection = valueAt(uRejection, q);
+-                    float sigma = centerRejection <
+-                            deltaRejection - 1.0 / 255.0
++                    float deltaWeight = valueAt(uRejection, q);
++                    float sigma = centerWeight <
++                            deltaWeight - 1.0 / 255.0
+                         ? uColorSigma
+                         : uColorSigma * (
+                             uClipRejection != 0 ? uColorSigmaBoost : 1.0
+@@ -725,16 +756,18 @@
+                         sigma
+                     );
+                     weight *= spatialWeight(float(dx)) * spatialWeightY;
++                    // DilateMask has inverted rejection into acceptance weight. Filtering may
++                    // restore support, but clip-rejection must never lower the center acceptance.
+                     float value = uClipRejection != 0
+-                        ? min(deltaRejection, centerRejection)
+-                        : deltaRejection;
++                        ? max(deltaWeight, centerWeight)
++                        : deltaWeight;
+                     weightedRejection += weight * value;
+                     weightSum += weight;
+                 }
+             }
+             oFilteredRejection = weightSum > 0.0
+                 ? weightedRejection / weightSum
+-                : centerRejection;
++                : centerWeight;
+         }
+     """.trimIndent()
+ 
+@@ -746,8 +779,8 @@
+         #version 300 es
+         precision highp float;
+         precision highp int;
+-        uniform sampler2D uOriginalRejection;
+-        uniform sampler2D uFilteredRejection;
++        uniform sampler2D uOriginalWeight;
++        uniform sampler2D uFilteredWeight;
+         uniform sampler2D uPixelDifference;
+         uniform ivec2 uSize;
+         uniform float uPixelDifferenceThreshold;
+@@ -755,10 +788,10 @@
+         out float oRejection;
+         void main() {
+             ivec2 p = ivec2(gl_FragCoord.xy);
+-            float original = texelFetch(uOriginalRejection, p, 0).r;
++            float original = texelFetch(uOriginalWeight, p, 0).r;
+             float pixelDifference = texelFetch(uPixelDifference, p, 0).r;
+             vec2 uv = (vec2(p) + vec2(0.5)) / vec2(uSize);
+-            float filtered = texture(uFilteredRejection, uv).r;
++            float filtered = texture(uFilteredWeight, uv).r;
+             float postprocessed = filtered;
+             if (filtered > original) {
+                 float weight = pixelDifference < uPixelDifferenceThreshold
+@@ -1563,7 +1596,7 @@
+     """.trimIndent()
+ 
+     /**
+-     * MergeBayerRaw transport recovered from the Halide AOT contract.
++     * MergeBayerRaw transport recovered from the Halide AOT contract. IRIS_26527 consumes the final AlignAlt merge-grid directly.
+      *
+      * Alignment and the spatial kernel operate on Bayer quads, and every output sample is
+      * reconstructed only from the same CFA phase in neighboring quads.
+@@ -2610,69 +2643,6 @@
+      * actual merge-domain consumer (mergeBayer/mergeRgb), where it cannot quantize motion at the
+      * coarser finest-LK cadence into 64-RAW-pixel constant-flow blocks.
+      */
+-    val convertBayerAlignment = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uAlignment;
+-        uniform ivec2 uGridSize;
+-        uniform float uTileStride;
+-        uniform float uAlignmentScale;
+-        uniform float uGridMin;
+-        uniform float uTargetTileStride;
+-        uniform vec2 uFlowNormalizationSize;
+-        out vec4 oAlignment;
+-
+-        vec2 flowAt(ivec2 p) {
+-            return texelFetch(
+-                uAlignment,
+-                clamp(p, ivec2(0), uGridSize - ivec2(1)),
+-                0
+-            ).xy * uAlignmentScale;
+-        }
+-        vec2 resampledFlow(vec2 sourceGrid) {
+-            ivec2 p00 = ivec2(floor(sourceGrid));
+-            vec2 fraction = fract(sourceGrid);
+-            vec2 flow00 = flowAt(p00);
+-            vec2 flow10 = flowAt(p00 + ivec2(1, 0));
+-            vec2 flow01 = flowAt(p00 + ivec2(0, 1));
+-            vec2 flow11 = flowAt(p00 + ivec2(1, 1));
+-            return mix(
+-                mix(flow00, flow10, fraction.x),
+-                mix(flow01, flow11, fraction.x),
+-                fraction.y
+-            );
+-        }
+-        void main() {
+-            ivec2 outputTile = ivec2(gl_FragCoord.xy);
+-            ivec2 alignmentPixel = ivec2(floor(
+-                (vec2(outputTile) + vec2(0.5)) * uTargetTileStride
+-            ));
+-            // Local texel zero is logical LK tile uGridMin and its sample lives at
+-            // (uGridMin + 0.5) * uTileStride in the Bayer-quad image domain.
+-            vec2 sourceGrid =
+-                vec2(alignmentPixel) / uTileStride -
+-                vec2(uGridMin + 0.5);
+-            vec2 flow = resampledFlow(sourceGrid);
+-            ivec2 tile = ivec2(floor(sourceGrid + vec2(0.5)));
+-
+-            vec2 minimumFlow = vec2(1.0e20);
+-            vec2 maximumFlow = vec2(-1.0e20);
+-            for (int y = -1; y <= 1; ++y) {
+-                for (int x = -1; x <= 1; ++x) {
+-                    vec2 candidate = flowAt(tile + ivec2(x, y));
+-                    minimumFlow = min(minimumFlow, candidate);
+-                    maximumFlow = max(maximumFlow, candidate);
+-                }
+-            }
+-            float localFlowVariation = length(
+-                (maximumFlow - minimumFlow) /
+-                max(uFlowNormalizationSize, vec2(1.0))
+-            );
+-            oAlignment = vec4(flow, localFlowVariation, 0.0);
+-        }
+-    """.trimIndent()
+-
+     val strengthAlignment = """
+         #version 300 es
+         precision highp float;
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+@@ -343,10 +343,11 @@
+     private val bayerAlignmentHeight = ceilDiv(height, MERGE_BAYER_RAW_TILE_SIZE)
+     private val rejectionWidth = ceilDiv(width, 2)
+     private val rejectionHeight = ceilDiv(height, 2)
+-    private val mergeWeightWidth = ceilDiv(rejectionWidth, 2)
+-    private val mergeWeightHeight = ceilDiv(rejectionHeight, 2)
+-    private val rejectionFilterWidth = ceilDiv(rejectionWidth, REJECTION_FILTER_DOWNSAMPLE)
+-    private val rejectionFilterHeight = ceilDiv(rejectionHeight, REJECTION_FILTER_DOWNSAMPLE)
++    // IRIS_26527_FINAL_MGC_REJECTION_ALIGNMENT_PARITY: DilateMask and Downsample2x use floor /2.
++    private val mergeWeightWidth = rejectionWidth / 2
++    private val mergeWeightHeight = rejectionHeight / 2
++    private val rejectionFilterWidth = ceilDiv(mergeWeightWidth, REJECTION_FILTER_DOWNSAMPLE)
++    private val rejectionFilterHeight = ceilDiv(mergeWeightHeight, REJECTION_FILTER_DOWNSAMPLE)
+     private val normalizedOutputScale = MultiFrameConfig.normalizeOutputScale(outputScale)
+     private val outputWidth = if (outputMode == MgcSpatialOutputMode.RGB) {
+         MultiFrameConfig.scaledRawOutputDimension(width, normalizedOutputScale)
+@@ -418,11 +419,11 @@
+     private var upsampleAlignmentProgram = 0
+     private var blockLucasKanadeProgram = 0
+     private var convertAlignmentProgram = 0
+-    private var convertBayerAlignmentProgram = 0
+     private var strengthAlignmentProgram = 0
+     private var strengthRejectionProgram = 0
+     private var unblockerProgram = 0
+     private var rejectionProgram = 0
++    private var rejectionPixelDifferenceDownsampleProgram = 0
+     private var clippedGaussianHorizontalProgram = 0
+     private var clippedGaussianVerticalProgram = 0
+     private var rejectionFilterDownsampleProgram = 0
+@@ -955,21 +956,15 @@
+                     )
+                     bentoAlignSubmitNs = System.nanoTime() - alignmentStartNs
+                     val postAlignStartNs = System.nanoTime()
+-                    val bayerAlignment = createTexture(
+-                        bayerAlignmentWidth,
+-                        bayerAlignmentHeight,
+-                        GLES30.GL_RGBA32F,
+-                        GLES30.GL_NEAREST,
+-                    )
+-                    renderBayerAlignment(alignment, bayerAlignment)
+-                    /* IRIS_26520_V5_MERGE_DOMAIN_REJECTION_FLOW */
++                    /* IRIS_26527_FINAL_ALIGNMENT_FIELD_OWNER */
++                    val bayerAlignment = alignment.texture
+                     val flow = createTexture(
+                         rejectionWidth,
+                         rejectionHeight,
+                         GLES30.GL_RGBA16F,
+                         GLES30.GL_LINEAR,
+                     )
+-                    renderMergeDomainFlow(bayerAlignment, flow)
++                    renderConvertedAlignment(alignment, flow)
+                     val tilingMask = renderFindBlockTiles(
+                         baseRaw = referenceRaw,
+                         ultrashortRaw = bentoRaw,
+@@ -2146,10 +2141,6 @@
+             GlesIris26521SpatialRgbShaders.convertAlignment,
+             "mgc_convert_alignment",
+         )
+-        convertBayerAlignmentProgram = linkProgram(
+-            GlesIris26521SpatialRgbShaders.convertBayerAlignment,
+-            "mgc_convert_bayer_alignment",
+-        )
+         strengthAlignmentProgram = linkProgram(
+             GlesIris26521SpatialRgbShaders.strengthAlignment,
+             "mgc_strength_alignment",
+@@ -2162,6 +2153,10 @@
+         rejectionProgram = linkProgram(
+             GlesIris26521SpatialRgbShaders.rejection,
+             "mgc_spatial_rejection",
++        )
++        rejectionPixelDifferenceDownsampleProgram = linkProgram(
++            GlesIris26521SpatialRgbShaders.rejectionPixelDifferenceDownsample,
++            "mgc_rejection_pixel_difference_downsample",
+         )
+         clippedGaussianHorizontalProgram = linkProgram(
+             GlesIris26521SpatialRgbShaders.clippedGaussianHorizontal,
+@@ -2708,8 +2703,9 @@
+      * AlignL1 search is absent, but UpsampleAlignment still selects among three neighboring
+      * coarse-flow candidates using target-level L1 residuals before every finer LK level.
+      * IRIS_26520_V5_FINAL_FINEST_LK_OWNER: AlignPyramid exits after the finest LK pass; no
+-     * additional content-selected UpsampleAlignment is run to the MergeBayer grid. The finest
+-     * LK field is transported continuously by convertBayerAlignment instead.
++     * additional content-selected UpsampleAlignment is run to the MergeBayer grid. MergeBayer
++     * consumes that final AlignAlt field directly; ConvertAlignment independently expands the
++     * same field into the rejection domain.
+      */
+     private fun alignPyramids(
+         reference: List<TextureLevel>,
+@@ -2777,6 +2773,32 @@
+                 "LK$iterations,normalize=$normalize," +
+                 "levelScale=$scale"
+         }
++        // AlignPyramid::AlignAlt performs one final content-selected UpsampleAlignment from the
++        // 32-quad finest LK grid to MergeBayerRaw16's 8-quad merge grid. Merge and rejection now
++        // derive from this same final field; there is no second bilinear Bayer-alignment owner.
++        alignment = renderUpsampledAlignment(
++            reference = reference.first(),
++            current = current.first(),
++            initial = alignment,
++            targetGridWidth = bayerAlignmentWidth,
++            targetGridHeight = bayerAlignmentHeight,
++            targetGridMin = MERGE_ALIGNMENT_GRID_MIN,
++            targetTileStride = MERGE_BAYER_RAW_TILE_SIZE / 2,
++            targetTileSize = MERGE_BAYER_RAW_TILE_SIZE,
++        )
++        schedule +=
++            "${reference.first().width}x${reference.first().height}:" +
++                "${MERGE_BAYER_RAW_TILE_SIZE / 2}px," +
++                "UpsampleL1(tile=${MERGE_BAYER_RAW_TILE_SIZE})"
++        check(
++            alignment.gridWidth == bayerAlignmentWidth &&
++                alignment.gridHeight == bayerAlignmentHeight &&
++                alignment.tileStride == MERGE_BAYER_RAW_TILE_SIZE / 2 &&
++                alignment.scaleToBayerQuads == 1f &&
++                alignment.gridMin == MERGE_ALIGNMENT_GRID_MIN
++        ) {
++            "Iris Spatial AlignAlt final output does not match MergeBayerRaw16 alignment grid"
++        }
+         PLog.i(
+             TAG,
+                 "MGC AlignPyramid target=$ALIGN_TARGET_FINEST_DIMENSION " +
+@@ -2785,7 +2807,7 @@
+                 "flowGrid=${alignment.gridWidth}x${alignment.gridHeight} " +
+                 "flowScale=${alignment.scaleToBayerQuads} useL1=false " +
+                 "gradientProducts=cached " +
+-                "upsampleL1=level-transitions-only/3-candidate median=false " +
++                "upsampleL1=merge-grid/3-candidate median=false " +
+                 "runtimeOptions=256/8/64/-1/2/3/0/1/0 " +
+                 "schedule=${schedule.joinToString(" -> ")}",
+         )
+@@ -3068,106 +3090,6 @@
+         )
+     }
+ 
+-    /** IRIS_26520_V5_MERGE_DOMAIN_REJECTION_FLOW */
+-    private fun renderMergeDomainFlow(bayerAlignment: Int, output: Int) {
+-        GLES30.glUseProgram(convertAlignmentProgram)
+-        bindTexture(convertAlignmentProgram, "uAlignment", 0, bayerAlignment)
+-        uniform2i(
+-            convertAlignmentProgram,
+-            "uGridSize",
+-            bayerAlignmentWidth,
+-            bayerAlignmentHeight,
+-        )
+-        uniform2i(
+-            convertAlignmentProgram,
+-            "uOutputSize",
+-            rejectionWidth,
+-            rejectionHeight,
+-        )
+-        uniform1f(
+-            convertAlignmentProgram,
+-            "uTileStride",
+-            (MERGE_BAYER_RAW_TILE_SIZE / 2).toFloat(),
+-        )
+-        uniform1f(convertAlignmentProgram, "uAlignmentScale", 1f)
+-        uniform1f(convertAlignmentProgram, "uOutputToAlignmentScale", 1f)
+-        uniform1f(convertAlignmentProgram, "uGridMin", 0f)
+-        uniform1f(
+-            convertAlignmentProgram,
+-            "uInterpolationFlowTolerance",
+-            SPATIAL_INTERPOLATION_FLOW_TOLERANCE,
+-        )
+-        uniform2f(
+-            convertAlignmentProgram,
+-            "uFlowNormalizationSize",
+-            rejectionWidth.toFloat(),
+-            rejectionHeight.toFloat(),
+-        )
+-        draw(
+-            convertAlignmentProgram,
+-            rejectionWidth,
+-            rejectionHeight,
+-            intArrayOf(output),
+-        )
+-    }
+-
+-    private fun renderBayerAlignment(alignment: Alignment, output: Int) {
+-        require(
+-            alignment.gridWidth > 0 &&
+-                alignment.gridHeight > 0 &&
+-                alignment.tileStride > 0 &&
+-                alignment.scaleToBayerQuads.isFinite() &&
+-                alignment.scaleToBayerQuads > 0f
+-        ) {
+-            "MergeBayer requires a valid finest-level LK alignment"
+-        }
+-        GLES30.glUseProgram(convertBayerAlignmentProgram)
+-        bindTexture(
+-            convertBayerAlignmentProgram,
+-            "uAlignment",
+-            0,
+-            alignment.texture,
+-        )
+-        uniform2i(
+-            convertBayerAlignmentProgram,
+-            "uGridSize",
+-            alignment.gridWidth,
+-            alignment.gridHeight,
+-        )
+-        uniform1f(
+-            convertBayerAlignmentProgram,
+-            "uTileStride",
+-            alignment.tileStride * alignment.scaleToBayerQuads,
+-        )
+-        uniform1f(
+-            convertBayerAlignmentProgram,
+-            "uAlignmentScale",
+-            alignment.scaleToBayerQuads,
+-        )
+-        uniform1f(
+-            convertBayerAlignmentProgram,
+-            "uGridMin",
+-            alignment.gridMin.toFloat(),
+-        )
+-        uniform1f(
+-            convertBayerAlignmentProgram,
+-            "uTargetTileStride",
+-            (MERGE_BAYER_RAW_TILE_SIZE / 2).toFloat(),
+-        )
+-        uniform2f(
+-            convertBayerAlignmentProgram,
+-            "uFlowNormalizationSize",
+-            ceilDiv(width, 2).toFloat(),
+-            ceilDiv(height, 2).toFloat(),
+-        )
+-        draw(
+-            convertBayerAlignmentProgram,
+-            bayerAlignmentWidth,
+-            bayerAlignmentHeight,
+-            intArrayOf(output),
+-        )
+-    }
+-
+     private fun renderGuide(
+         rawTexture: Int,
+         noiseTexture: Int,
+@@ -3386,18 +3308,14 @@
+         uniform2i(
+             clippedGaussianHorizontalProgram,
+             "uSize",
+-            rejectionWidth,
+-            rejectionHeight,
+-        )
+-        uniform1fv(
+-            clippedGaussianHorizontalProgram,
+-            "uKernel",
+-            pixelDifferenceKernel,
+-        )
++            mergeWeightWidth,
++            mergeWeightHeight,
++        )
++        uniform1fv(clippedGaussianHorizontalProgram, "uKernel", pixelDifferenceKernel)
+         draw(
+             clippedGaussianHorizontalProgram,
+-            rejectionWidth,
+-            rejectionHeight,
++            mergeWeightWidth,
++            mergeWeightHeight,
+             intArrayOf(horizontal),
+         )
+         GlesGpuScheduler.yieldToUiRenderer()
+@@ -3407,18 +3325,35 @@
+         uniform2i(
+             clippedGaussianVerticalProgram,
+             "uSize",
++            mergeWeightWidth,
++            mergeWeightHeight,
++        )
++        uniform1fv(clippedGaussianVerticalProgram, "uKernel", pixelDifferenceKernel)
++        draw(
++            clippedGaussianVerticalProgram,
++            mergeWeightWidth,
++            mergeWeightHeight,
++            intArrayOf(output),
++        )
++        GlesGpuScheduler.yieldToUiRenderer()
++    }
++
++    private fun renderPixelDifferenceDownsample(
++        input: Int,
++        output: Int,
++    ) {
++        GLES30.glUseProgram(rejectionPixelDifferenceDownsampleProgram)
++        bindTexture(rejectionPixelDifferenceDownsampleProgram, "uInput", 0, input)
++        uniform2i(
++            rejectionPixelDifferenceDownsampleProgram,
++            "uInputSize",
+             rejectionWidth,
+             rejectionHeight,
+         )
+-        uniform1fv(
+-            clippedGaussianVerticalProgram,
+-            "uKernel",
+-            pixelDifferenceKernel,
+-        )
+         draw(
+-            clippedGaussianVerticalProgram,
+-            rejectionWidth,
+-            rejectionHeight,
++            rejectionPixelDifferenceDownsampleProgram,
++            mergeWeightWidth,
++            mergeWeightHeight,
+             intArrayOf(output),
+         )
+         GlesGpuScheduler.yieldToUiRenderer()
+@@ -3426,18 +3361,18 @@
+ 
+     private fun renderRejectionFilterDownsample(
+         baseLuma: Int,
+-        rejection: Int,
++        weight: Int,
+         downsampledLuma: Int,
+         downsampledRejection: Int,
+     ) {
+         GLES30.glUseProgram(rejectionFilterDownsampleProgram)
+         bindTexture(rejectionFilterDownsampleProgram, "uBaseLuma", 0, baseLuma)
+-        bindTexture(rejectionFilterDownsampleProgram, "uRejection", 1, rejection)
++        bindTexture(rejectionFilterDownsampleProgram, "uWeight", 1, weight)
+         uniform2i(
+             rejectionFilterDownsampleProgram,
+             "uInputSize",
+-            rejectionWidth,
+-            rejectionHeight,
++            mergeWeightWidth,
++            mergeWeightHeight,
+         )
+         draw(
+             rejectionFilterDownsampleProgram,
+@@ -3489,35 +3424,20 @@
+     }
+ 
+     private fun renderRejectionPostprocess(
+-        originalRejection: Int,
+-        filteredRejection: Int,
++        originalWeight: Int,
++        filteredWeight: Int,
+         pixelDifference: Int,
+         output: Int,
+     ) {
+         GLES30.glUseProgram(rejectionPostprocessProgram)
+-        bindTexture(
+-            rejectionPostprocessProgram,
+-            "uOriginalRejection",
+-            0,
+-            originalRejection,
+-        )
+-        bindTexture(
+-            rejectionPostprocessProgram,
+-            "uFilteredRejection",
+-            1,
+-            filteredRejection,
+-        )
+-        bindTexture(
+-            rejectionPostprocessProgram,
+-            "uPixelDifference",
+-            2,
+-            pixelDifference,
+-        )
++        bindTexture(rejectionPostprocessProgram, "uOriginalWeight", 0, originalWeight)
++        bindTexture(rejectionPostprocessProgram, "uFilteredWeight", 1, filteredWeight)
++        bindTexture(rejectionPostprocessProgram, "uPixelDifference", 2, pixelDifference)
+         uniform2i(
+             rejectionPostprocessProgram,
+             "uSize",
+-            rejectionWidth,
+-            rejectionHeight,
++            mergeWeightWidth,
++            mergeWeightHeight,
+         )
+         uniform1f(
+             rejectionPostprocessProgram,
+@@ -3531,8 +3451,8 @@
+         )
+         draw(
+             rejectionPostprocessProgram,
+-            rejectionWidth,
+-            rejectionHeight,
++            mergeWeightWidth,
++            mergeWeightHeight,
+             intArrayOf(output),
+         )
+         GlesGpuScheduler.yieldToUiRenderer()
+@@ -3638,21 +3558,15 @@
+         )
+         val alignmentNs = System.nanoTime() - alignmentStartNs
+         val flowStartNs = System.nanoTime()
+-        val bayerAlignment = createTexture(
+-            bayerAlignmentWidth,
+-            bayerAlignmentHeight,
+-            GLES30.GL_RGBA32F,
+-            GLES30.GL_NEAREST,
+-        )
+-        renderBayerAlignment(alignment, bayerAlignment)
+-        /* IRIS_26520_V5_MERGE_DOMAIN_REJECTION_FLOW */
++        /* IRIS_26527_FINAL_ALIGNMENT_FIELD_OWNER */
++        val bayerAlignment = alignment.texture
+         val flow = createTexture(
+             rejectionWidth,
+             rejectionHeight,
+             GLES30.GL_RGBA16F,
+             GLES30.GL_LINEAR,
+         )
+-        renderMergeDomainFlow(bayerAlignment, flow)
++        renderConvertedAlignment(alignment, flow)
+         val flowNs = System.nanoTime() - flowStartNs
+         val rejectionStartNs = System.nanoTime()
+         val unblockerWidth = ceilDiv(width, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+@@ -3670,27 +3584,39 @@
+             outputWidth = unblockerWidth,
+             outputHeight = unblockerHeight,
+         )
+-        val reverseWeight = createTexture(
++        val rawReverseWeight = createTexture(
+             rejectionWidth,
+             rejectionHeight,
+             GLES30.GL_R8,
+             GLES30.GL_LINEAR,
+         )
+-        val pixelDifference = createTexture(
++        val rawPixelDifference = createTexture(
+             rejectionWidth,
+             rejectionHeight,
+             GLES30.GL_R8,
+             GLES30.GL_NEAREST,
+         )
++        val initialWeight = createTexture(
++            mergeWeightWidth,
++            mergeWeightHeight,
++            GLES30.GL_R8,
++            GLES30.GL_LINEAR,
++        )
++        val pixelDifference = createTexture(
++            mergeWeightWidth,
++            mergeWeightHeight,
++            GLES30.GL_R8,
++            GLES30.GL_NEAREST,
++        )
+         val pixelDifferenceHorizontal = createTexture(
+-            rejectionWidth,
+-            rejectionHeight,
++            mergeWeightWidth,
++            mergeWeightHeight,
+             GLES30.GL_R32F,
+             GLES30.GL_NEAREST,
+         )
+         val smoothedPixelDifference = createTexture(
+-            rejectionWidth,
+-            rejectionHeight,
++            mergeWeightWidth,
++            mergeWeightHeight,
+             GLES30.GL_R8,
+             GLES30.GL_NEAREST,
+         )
+@@ -3709,12 +3635,6 @@
+         val filteredRejection = createTexture(
+             rejectionFilterWidth,
+             rejectionFilterHeight,
+-            GLES30.GL_R8,
+-            GLES30.GL_LINEAR,
+-        )
+-        val postprocessedRejection = createTexture(
+-            rejectionWidth,
+-            rejectionHeight,
+             GLES30.GL_R8,
+             GLES30.GL_LINEAR,
+         )
+@@ -3730,17 +3650,26 @@
+             flowTexture = flow,
+             unblockerTexture = unblocker,
+             noiseTexture = currentNoiseLut,
+-            reverseWeightTexture = reverseWeight,
+-            pixelDifferenceTexture = pixelDifference,
+-        )
++            reverseWeightTexture = rawReverseWeight,
++            pixelDifferenceTexture = rawPixelDifference,
++        )
++        // MGC closes the RAW/2 rejection boundary here. DilateMask converts rejection to
++        // RAW/4 acceptance weight and Downsample2x places pixel difference on that same domain.
++        renderDilation(rawReverseWeight, initialWeight)
++        renderPixelDifferenceDownsample(rawPixelDifference, pixelDifference)
+         renderClippedGaussianPixelDifference(
+             input = pixelDifference,
+             horizontal = pixelDifferenceHorizontal,
+             output = smoothedPixelDifference,
+         )
++        check(referenceGrayPyramid.size > 1) {
++            "FilterRejectionMap requires the RAW/4 reference-luma pyramid level"
++        }
+         renderRejectionFilterDownsample(
+-            baseLuma = referenceGrayPyramid.first().texture,
+-            rejection = reverseWeight,
++            // Pyramid level 1 includes one positive-edge support texel; uInputSize clips it to
++            // the floor-sized RAW/4 merge domain.
++            baseLuma = referenceGrayPyramid[1].texture,
++            weight = initialWeight,
+             downsampledLuma = downsampledLuma,
+             downsampledRejection = downsampledRejection,
+         )
+@@ -3750,12 +3679,19 @@
+             output = filteredRejection,
+         )
+         renderRejectionPostprocess(
+-            originalRejection = reverseWeight,
+-            filteredRejection = filteredRejection,
++            originalWeight = initialWeight,
++            filteredWeight = filteredRejection,
+             pixelDifference = smoothedPixelDifference,
+-            output = postprocessedRejection,
+-        )
+-        renderDilation(postprocessedRejection, frameWeight)
++            output = frameWeight,
++        )
++        PLog.d(
++            TAG,
++            "IRIS_26527_TEMPORAL_ACCEPTANCE_STAGES frame=${frame.frameNumber} " +
++                "rawRejection=${rejectionWidth}x${rejectionHeight} " +
++                "initialAcceptance=${mergeWeightWidth}x${mergeWeightHeight} " +
++                "finalAcceptance=${mergeWeightWidth}x${mergeWeightHeight} " +
++                "semantics=acceptance-weight",
++        )
+         val rejectionNs = System.nanoTime() - rejectionStartNs
+         PLog.i(
+             TAG,
+@@ -3770,7 +3706,7 @@
+         return PreparedTemporalFrame(
+             calibration = calibration,
+             flowTexture = flow,
+-            bayerAlignmentTexture = bayerAlignment,
++            bayerAlignmentTexture = alignment.texture,
+             weightTexture = frameWeight,
+         )
+     }
+@@ -7716,6 +7652,7 @@
+         // the GPU command stream instead of synchronously reading every alignment texture.
+         const val MAX_ALIGNMENT_DISPLACEMENT_BAYER_QUADS = 128f
+         const val ALIGN_LK_GRID_MIN = 1
++        const val MERGE_ALIGNMENT_GRID_MIN = 0
+         const val MERGE_BAYER_RAW_TILE_SIZE = 16
+         // MGC defines the tolerance as a fraction of its 8 Bayer-quad tile. Keep
+         // interpolation only where every neighboring flow is within one raw pixel
+--- a/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
+@@ -42,6 +42,11 @@
+     private static final Object STATE_LOCK = new Object();
+ 
+     private static volatile boolean sInitialized = false;
++    /* IRIS_26527_REQUESTED_VS_DISPLAYED_ZOOM
++     * Requested zoom follows the fingers. Global/displayed zoom is the geometry actually safe
++     * to show/capture on the route that has produced a proven result.
++     */
++    private static volatile float sRequestedGlobalZoom = 1.0f;
+     private static volatile float sGlobalZoom = 1.0f;
+     private static volatile float sOpticalAnchor = 1.0f;
+     private static volatile float sHardwareLocalZoom = 1.0f;
+@@ -55,6 +60,8 @@
+     private static volatile String sOwnerCameraId = null;
+     private static volatile String sPendingOwnerCameraId = null;
+     private static volatile float sPendingOpticalAnchor = 1.0f;
++    private static volatile String[] sLensCameraIds = new String[0];
++    private static volatile float[] sLensAnchors = new float[0];
+ 
+     private final CameraFragment fragment;
+     private final ArrayList<CameraLensData> backLenses = new ArrayList<>();
+@@ -85,6 +92,24 @@
+         }
+     }
+ 
++    public static final class CaptureZoomUpdate {
++        public final float residualSoftwareZoom;
++        public final boolean committedPending;
++        public final String chainedPendingOwnerCameraId;
++        public final boolean revealAllowed;
++        public final boolean previewRefreshRequired;
++
++        private CaptureZoomUpdate(float residualSoftwareZoom, boolean committedPending,
++                                  String chainedPendingOwnerCameraId, boolean revealAllowed,
++                                  boolean previewRefreshRequired) {
++            this.residualSoftwareZoom = residualSoftwareZoom;
++            this.committedPending = committedPending;
++            this.chainedPendingOwnerCameraId = chainedPendingOwnerCameraId;
++            this.revealAllowed = revealAllowed;
++            this.previewRefreshRequired = previewRefreshRequired;
++        }
++    }
++
+     public IrisZoomController(CameraFragment fragment) {
+         this.fragment = fragment;
+     }
+@@ -100,6 +125,7 @@
+             if (!sInitialized || findLens(sOwnerCameraId) == null) {
+                 sGlobalZoom = clamp(selected.getZoomFactor(),
+                         sMinimumGlobalZoom, sMaximumGlobalZoom);
++                sRequestedGlobalZoom = sGlobalZoom;
+                 sOwnerCameraId = selected.getCameraId();
+                 sOpticalAnchor = safeAnchor(selected);
+                 sPendingOwnerCameraId = null;
+@@ -112,6 +138,8 @@
+                 // inventory refresh must not commit the pending camera merely because
+                 // PreferenceKeys already points at the restart target.
+                 sGlobalZoom = clamp(sGlobalZoom, sMinimumGlobalZoom, sMaximumGlobalZoom);
++                sRequestedGlobalZoom = clamp(sRequestedGlobalZoom,
++                        sMinimumGlobalZoom, sMaximumGlobalZoom);
+             }
+         }
+         updateButtonUi();
+@@ -125,6 +153,7 @@
+         }
+         synchronized (STATE_LOCK) {
+             sGlobalZoom = clamp(safeAnchor(lens), sMinimumGlobalZoom, sMaximumGlobalZoom);
++            sRequestedGlobalZoom = sGlobalZoom;
+             sOpticalAnchor = safeAnchor(lens);
+             sOwnerCameraId = lens.getCameraId();
+             sPendingOwnerCameraId = null;
+@@ -150,28 +179,28 @@
+         String pendingOwner = null;
+         float pendingAnchor = 1.0f;
+         synchronized (STATE_LOCK) {
+-            sGlobalZoom = clamp(sGlobalZoom * scaleFactor,
++            sRequestedGlobalZoom = clamp(sRequestedGlobalZoom * scaleFactor,
+                     sMinimumGlobalZoom, sMaximumGlobalZoom);
+             sInitialized = true;
+             activeOwner = sOwnerCameraId;
+ 
+-            // Only one physical-camera restart can be outstanding. The requested
+-            // global zoom may continue changing while the old camera remains active.
+             if (sPendingOwnerCameraId == null) {
+-                CameraLensData nextOwner = ownerWithHysteresis(sGlobalZoom);
+-                if (nextOwner != null
+-                        && sOwnerCameraId != null
++                CameraLensData nextOwner = ownerWithHysteresis(sRequestedGlobalZoom);
++                if (nextOwner != null && sOwnerCameraId != null
+                         && !sOwnerCameraId.equals(nextOwner.getCameraId())) {
++                    // Freeze displayed geometry on the proven old route. The curtain closes
++                    // before the new route is opened; requested intent may continue changing.
+                     sPendingOwnerCameraId = nextOwner.getCameraId();
+                     sPendingOpticalAnchor = safeAnchor(nextOwner);
+                     pendingOwner = sPendingOwnerCameraId;
+                     pendingAnchor = sPendingOpticalAnchor;
++                } else {
++                    sGlobalZoom = sRequestedGlobalZoom;
+                 }
+             }
+         }
+ 
+         updateButtonUi();
+-
+         if (pendingOwner != null) {
+             PreferenceKeys.setCameraID(pendingOwner);
+             if (fragment.auxButtonsViewModel != null) {
+@@ -179,18 +208,24 @@
+             }
+             CaptureController controller = fragment.captureController;
+             if (controller != null) {
+-                Log.i(TAG, "IRIS_26526_HANDOFF_PENDING"
++                Log.i(TAG, "IRIS_26527_HANDOFF_PENDING"
+                         + " activeOwner=" + activeOwner
+                         + " pendingOwner=" + pendingOwner
+-                        + " globalZoom=" + getGlobalZoom()
++                        + " requestedZoom=" + getRequestedGlobalZoom()
++                        + " displayedZoom=" + getGlobalZoom()
+                         + " activeAnchor=" + getOpticalAnchor()
+-                        + " pendingAnchor=" + pendingAnchor);
+-                controller.restartCamera();
++                        + " pendingAnchor=" + pendingAnchor
++                        + " sequential=true");
++                controller.restartCameraForIrisHandoff(pendingOwner);
+             }
+             lastPreviewApplyMs = SystemClock.uptimeMillis();
+             return;
+         }
+ 
++        // A route transition is already outstanding: do not push new geometry into the old route.
++        synchronized (STATE_LOCK) {
++            if (sPendingOwnerCameraId != null) return;
++        }
+         long now = SystemClock.uptimeMillis();
+         if (now - lastPreviewApplyMs >= PREVIEW_APPLY_INTERVAL_MS) {
+             applyPreviewNow();
+@@ -201,6 +236,9 @@
+     public void finishScale() {
+         if (!isContinuousZoomEnabledForCurrentMode()) return;
+         updateButtonUi();
++        synchronized (STATE_LOCK) {
++            if (sPendingOwnerCameraId != null) return;
++        }
+         applyPreviewNow();
+         lastPreviewApplyMs = SystemClock.uptimeMillis();
+     }
+@@ -212,7 +250,7 @@
+ 
+     private void updateButtonUi() {
+         if (fragment.activity == null) return;
+-        final float z = getGlobalZoom();
++        final float z = getRequestedGlobalZoom();
+         final String owner = getOwnerCameraId();
+         fragment.activity.runOnUiThread(() -> {
+             AuxButtonsLayout layout = fragment.findViewById(R.id.aux_buttons_container);
+@@ -247,6 +285,14 @@
+             sMinimumGlobalZoom = minimum;
+             sMaximumGlobalZoom = tele ? TELE_MAX_GLOBAL_ZOOM : NO_TELE_MAX_GLOBAL_ZOOM;
+             sGlobalZoom = clamp(sGlobalZoom, sMinimumGlobalZoom, sMaximumGlobalZoom);
++            sRequestedGlobalZoom = clamp(sRequestedGlobalZoom,
++                    sMinimumGlobalZoom, sMaximumGlobalZoom);
++            sLensCameraIds = new String[backLenses.size()];
++            sLensAnchors = new float[backLenses.size()];
++            for (int i = 0; i < backLenses.size(); ++i) {
++                sLensCameraIds[i] = backLenses.get(i).getCameraId();
++                sLensAnchors[i] = safeAnchor(backLenses.get(i));
++            }
+         }
+     }
+ 
+@@ -260,37 +306,57 @@
+     }
+ 
+     /**
+-     * IRIS_26526_DIRECTIONAL_HANDOFF_HYSTERESIS
+-     * Physical cameras switch only after the global zoom clears a small band
+-     * around the relevant optical anchor. The anchors remain dynamically
+-     * discovered from CameraLensData. A fast gesture may directly request the
+-     * highest appropriate lens instead of forcing serial intermediate restarts.
++     * IRIS_26527_SEQUENTIAL_OPTICAL_ANCHORS
++     * One transition may cross only one neighboring optical anchor. A large pinch therefore
++     * chains proven sessions instead of applying a far-lens zoom to the old sensor.
+      */
+-    private CameraLensData ownerWithHysteresis(float globalZoom) {
++    private CameraLensData ownerWithHysteresis(float requestedGlobalZoom) {
+         CameraLensData active = findLens(sOwnerCameraId);
+-        if (active == null) return ownerFor(globalZoom);
++        if (active == null) return ownerFor(requestedGlobalZoom);
+         int activeIndex = backLenses.indexOf(active);
+-        if (activeIndex < 0) return ownerFor(globalZoom);
+-
+-        float activeAnchor = safeAnchor(active);
+-        if (globalZoom >= activeAnchor) {
+-            CameraLensData target = active;
+-            for (int i = activeIndex + 1; i < backLenses.size(); ++i) {
+-                CameraLensData candidate = backLenses.get(i);
+-                float upperSwitch = safeAnchor(candidate)
+-                        * (1.0f + LENS_HANDOFF_HYSTERESIS_FRACTION);
+-                if (globalZoom >= upperSwitch) target = candidate;
+-                else break;
+-            }
+-            return target;
+-        }
+-
+-        if (activeIndex > 0
+-                && globalZoom <= activeAnchor
+-                        * (1.0f - LENS_HANDOFF_HYSTERESIS_FRACTION)) {
+-            return ownerFor(globalZoom);
++        if (activeIndex < 0) return ownerFor(requestedGlobalZoom);
++
++        if (activeIndex + 1 < backLenses.size()) {
++            CameraLensData next = backLenses.get(activeIndex + 1);
++            float upperSwitch = safeAnchor(next)
++                    * (1.0f + LENS_HANDOFF_HYSTERESIS_FRACTION);
++            if (requestedGlobalZoom >= upperSwitch) return next;
++        }
++        if (activeIndex > 0) {
++            float lowerSwitch = safeAnchor(active)
++                    * (1.0f - LENS_HANDOFF_HYSTERESIS_FRACTION);
++            if (requestedGlobalZoom <= lowerSwitch) return backLenses.get(activeIndex - 1);
+         }
+         return active;
++    }
++
++    private static int lensIndexLocked(String cameraId) {
++        if (cameraId == null) return -1;
++        for (int i = 0; i < sLensCameraIds.length; ++i) {
++            if (cameraId.equals(sLensCameraIds[i])) return i;
++        }
++        return -1;
++    }
++
++    private static String adjacentOwnerForRequestedLocked(float requestedGlobalZoom) {
++        int index = lensIndexLocked(sOwnerCameraId);
++        if (index < 0 || sLensCameraIds.length != sLensAnchors.length) return sOwnerCameraId;
++        if (index + 1 < sLensAnchors.length) {
++            float upper = sLensAnchors[index + 1]
++                    * (1.0f + LENS_HANDOFF_HYSTERESIS_FRACTION);
++            if (requestedGlobalZoom >= upper) return sLensCameraIds[index + 1];
++        }
++        if (index > 0) {
++            float lower = sLensAnchors[index]
++                    * (1.0f - LENS_HANDOFF_HYSTERESIS_FRACTION);
++            if (requestedGlobalZoom <= lower) return sLensCameraIds[index - 1];
++        }
++        return sOwnerCameraId;
++    }
++
++    private static float anchorForCameraLocked(String cameraId, float fallback) {
++        int index = lensIndexLocked(cameraId);
++        return index >= 0 ? Math.max(0.05f, sLensAnchors[index]) : Math.max(0.05f, fallback);
+     }
+ 
+     private CameraLensData findLens(String cameraId) {
+@@ -341,6 +407,7 @@
+         synchronized (STATE_LOCK) {
+             if (!motionZoom) {
+                 sGlobalZoom = sOpticalAnchor;
++                sRequestedGlobalZoom = sOpticalAnchor;
+                 sPendingOwnerCameraId = null;
+                 sPendingOpticalAnchor = sOpticalAnchor;
+                 sHardwareLocalZoom = 1.0f;
+@@ -357,8 +424,11 @@
+             ownsRequest = motionZoom && rear && sInitialized
+                     && requestOwner != null && requestOwner.equals(activeCameraId);
+             if (ownsRequest) {
++                float requestGlobal = (sPendingOwnerCameraId != null
++                        && sPendingOwnerCameraId.equals(activeCameraId))
++                        ? requestAnchor : sGlobalZoom;
+                 localZoom = Math.max(1.0f,
+-                        sGlobalZoom / Math.max(0.01f, requestAnchor));
++                        requestGlobal / Math.max(0.01f, requestAnchor));
+             }
+         }
+ 
+@@ -425,7 +495,8 @@
+         if (ownsRequest) {
+             Log.d(TAG, "IRIS_26526_ZOOM_REQUEST_AUTHORITY"
+                     + " activeCameraId=" + activeCameraId
+-                    + " globalZoom=" + getGlobalZoom()
++                    + " requestedZoom=" + getRequestedGlobalZoom()
++                    + " displayedZoom=" + getGlobalZoom()
+                     + " localZoom=" + localZoom
+                     + " hardwareTarget=" + hardwareZoom
+                     + " hardwareMax=" + supportedHardwareMax
+@@ -438,82 +509,104 @@
+      * CaptureResult may update actual-HAL telemetry and commit a pending physical
+      * camera, but it must never drive the live software preview crop.
+      */
+-    public static float updateFromCaptureResult(CaptureResult result,
+-                                                CameraCharacteristics characteristics,
+-                                                String activeCameraId) {
++    public static CaptureZoomUpdate updateFromCaptureResult(
++            CaptureResult result, CameraCharacteristics characteristics, String activeCameraId) {
+         if (result == null || characteristics == null
+-                || !isContinuousZoomEnabledForCurrentMode()
+-                || activeCameraId == null) {
+-            return getResidualSoftwareZoom();
++                || !isContinuousZoomEnabledForCurrentMode() || activeCameraId == null) {
++            return new CaptureZoomUpdate(getResidualSoftwareZoom(), false, null, false, false);
+         }
+         Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+         if (facing == null || facing != CameraCharacteristics.LENS_FACING_BACK) {
+-            return 1.0f;
++            return new CaptureZoomUpdate(1.0f, false, null, false, false);
+         }
+ 
+         boolean committedPending = false;
++        String chainedOwner = null;
++        boolean revealAllowed = false;
++        boolean previewRefreshRequired = false;
+         synchronized (STATE_LOCK) {
+             if (sPendingOwnerCameraId != null
+                     && sPendingOwnerCameraId.equals(activeCameraId)) {
+                 String oldOwner = sOwnerCameraId;
+                 sOwnerCameraId = sPendingOwnerCameraId;
+                 sOpticalAnchor = Math.max(0.05f, sPendingOpticalAnchor);
++                sGlobalZoom = sOpticalAnchor;
+                 sPendingOwnerCameraId = null;
+                 sPendingOpticalAnchor = sOpticalAnchor;
+                 committedPending = true;
+-                Log.i(TAG, "IRIS_26526_HANDOFF_COMMIT"
++
++                String next = adjacentOwnerForRequestedLocked(sRequestedGlobalZoom);
++                if (next != null && !next.equals(sOwnerCameraId)) {
++                    sPendingOwnerCameraId = next;
++                    sPendingOpticalAnchor = anchorForCameraLocked(next, sOpticalAnchor);
++                    chainedOwner = next;
++                } else {
++                    sGlobalZoom = clamp(sRequestedGlobalZoom,
++                            sMinimumGlobalZoom, sMaximumGlobalZoom);
++                    revealAllowed = true;
++                    previewRefreshRequired = true;
++                }
++                Log.i(TAG, "IRIS_26527_HANDOFF_COMMIT"
+                         + " oldOwner=" + oldOwner
+                         + " activeOwner=" + sOwnerCameraId
+-                        + " globalZoom=" + sGlobalZoom
+-                        + " opticalAnchor=" + sOpticalAnchor);
++                        + " requestedZoom=" + sRequestedGlobalZoom
++                        + " displayedZoom=" + sGlobalZoom
++                        + " opticalAnchor=" + sOpticalAnchor
++                        + " chainedOwner=" + chainedOwner);
+             }
+         }
+ 
+         float actualHardware = 1.0f;
+         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+             try {
+-                Float z = result.get(CaptureResult.CONTROL_ZOOM_RATIO);
+-                if (z != null && Float.isFinite(z) && z > 0.0f) {
+-                    actualHardware = Math.max(actualHardware, z);
++                Float zoom = result.get(CaptureResult.CONTROL_ZOOM_RATIO);
++                if (zoom != null && Float.isFinite(zoom) && zoom > 0.0f) {
++                    actualHardware = Math.max(actualHardware, zoom);
+                 }
+             } catch (Throwable ignored) {}
+         }
+-
+-        Rect active = characteristics.get(
+-                CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
++        Rect active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+         Rect crop = null;
+-        try {
+-            crop = result.get(CaptureResult.SCALER_CROP_REGION);
+-        } catch (Throwable ignored) {}
++        try { crop = result.get(CaptureResult.SCALER_CROP_REGION); } catch (Throwable ignored) {}
+         if (active != null && crop != null && crop.width() > 0 && crop.height() > 0) {
+             float cropZoomX = active.width() / (float) crop.width();
+             float cropZoomY = active.height() / (float) crop.height();
+-            actualHardware = Math.max(actualHardware,
+-                    Math.max(1.0f, Math.min(cropZoomX, cropZoomY)));
++            actualHardware = Math.max(actualHardware, Math.max(1.0f, Math.min(cropZoomX, cropZoomY)));
+         }
+ 
+         float residual;
+         boolean resultOwnsCurrent;
+         synchronized (STATE_LOCK) {
+-            resultOwnsCurrent = sOwnerCameraId != null
+-                    && sOwnerCameraId.equals(activeCameraId);
+-            if (resultOwnsCurrent) {
+-                // Actual HAL zoom is metadata only. It cannot modify residual.
+-                sHardwareLocalZoom = Math.max(1.0f, actualHardware);
+-            }
++            resultOwnsCurrent = sOwnerCameraId != null && sOwnerCameraId.equals(activeCameraId);
++            if (resultOwnsCurrent) sHardwareLocalZoom = Math.max(1.0f, actualHardware);
+             residual = sResidualSoftwareZoom;
+         }
+         if (resultOwnsCurrent || committedPending) {
+-            Log.d(TAG, "IRIS_26526_HAL_TELEMETRY_ONLY"
+-                    + " activeCameraId=" + activeCameraId
+-                    + " globalZoom=" + getGlobalZoom()
++            Log.d(TAG, "IRIS_26527_HAL_TELEMETRY_ONLY"
++                    + " routeOwner=" + activeCameraId
++                    + " requestedZoom=" + getRequestedGlobalZoom()
++                    + " displayedZoom=" + getGlobalZoom()
+                     + " opticalAnchor=" + getOpticalAnchor()
+                     + " actualHardwareZoom=" + actualHardware
+                     + " residualSoftwareZoom=" + residual
+                     + " residualDrivenByCaptureResult=false"
+                     + " crop=" + crop);
+         }
+-        return residual;
++        return new CaptureZoomUpdate(residual, committedPending, chainedOwner,
++                revealAllowed, previewRefreshRequired);
++    }
++
++    public static void abortPendingHandoff(String reason) {
++        synchronized (STATE_LOCK) {
++            Log.w(TAG, "IRIS_26527_HANDOFF_ABORT reason=" + reason
++                    + " owner=" + sOwnerCameraId
++                    + " pending=" + sPendingOwnerCameraId
++                    + " requestedZoom=" + sRequestedGlobalZoom
++                    + " displayedZoom=" + sGlobalZoom);
++            sPendingOwnerCameraId = null;
++            sPendingOpticalAnchor = sOpticalAnchor;
++            sRequestedGlobalZoom = sGlobalZoom;
++        }
+     }
+ 
+     public static ZoomSnapshot snapshot() {
+@@ -525,6 +618,7 @@
+     }
+ 
+     public static boolean isInitialized() { return sInitialized; }
++    public static float getRequestedGlobalZoom() { return sRequestedGlobalZoom; }
+     public static float getGlobalZoom() { return sGlobalZoom; }
+     public static float getOpticalAnchor() { return sOpticalAnchor; }
+     public static float getResidualSoftwareZoom() { return sResidualSoftwareZoom; }
+--- a/app/src/main/java/com/particlesdevs/photoncamera/control/Swipe.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/control/Swipe.java
+@@ -111,6 +111,18 @@
+                                 && IrisZoomController.isContinuousZoomEnabledForCurrentMode();
+                         iris26524PinchActive = enabled;
+                         iris26524SuppressNextUp = enabled;
++                        if (enabled && gestureDetector != null) {
++                            long now = android.os.SystemClock.uptimeMillis();
++                            MotionEvent cancel = MotionEvent.obtain(
++                                    now, now, MotionEvent.ACTION_CANCEL,
++                                    detector.getFocusX(), detector.getFocusY(), 0);
++                            try {
++                                gestureDetector.onTouchEvent(cancel);
++                                Log.d(TAG, "IRIS_26527_PINCH_OWNS_GESTURE_STREAM cancelPriorTap=true");
++                            } finally {
++                                cancel.recycle();
++                            }
++                        }
+                         return enabled;
+                     }
+ 
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -726,12 +726,32 @@
+              * ownership from PreferenceKeys or mutable mCameraDevice. CaptureResult
+              * cannot drive the live software preview crop.
+              */
+-            String iris26526ResultCameraId =
+-                    session.getDevice() == null ? null : session.getDevice().getId();
+-            IrisZoomController.updateFromCaptureResult(
+-                    result,
+-                    mCameraCharacteristics,
+-                    iris26526ResultCameraId);
++            IrisCameraRoute iris26527ResultRoute = mIrisSessionRoutes.get(session);
++            String iris26527ResultOwner = iris26527ResultRoute == null
++                    ? (session.getDevice() == null ? null : session.getDevice().getId())
++                    : iris26527ResultRoute.provenOwnerId;
++            CameraCharacteristics iris26527ResultCharacteristics = mCameraCharacteristics;
++            if (iris26527ResultRoute != null) {
++                CameraCharacteristics routeCharacteristics =
++                        mCameraCharacteristicsMap.get(iris26527ResultRoute.characteristicsId);
++                if (routeCharacteristics != null) iris26527ResultCharacteristics = routeCharacteristics;
++            }
++            IrisZoomController.CaptureZoomUpdate iris26527ZoomUpdate =
++                    IrisZoomController.updateFromCaptureResult(
++                            result, iris26527ResultCharacteristics, iris26527ResultOwner);
++            if (iris26527ZoomUpdate.committedPending) {
++                if (iris26527ZoomUpdate.chainedPendingOwnerCameraId != null) {
++                    PreferenceKeys.setCameraID(iris26527ZoomUpdate.chainedPendingOwnerCameraId);
++                    restartCameraForIrisHandoff(iris26527ZoomUpdate.chainedPendingOwnerCameraId);
++                } else {
++                    if (iris26527ZoomUpdate.previewRefreshRequired && mBackgroundHandler != null) {
++                        mBackgroundHandler.post(CaptureController.this::applyIrisZoomNow);
++                    }
++                    if (iris26527ZoomUpdate.revealAllowed) {
++                        iris26527RevealZoomCurtain(iris26527ResultOwner);
++                    }
++                }
++            }
+             Long sensorTimestamp = result.get(CaptureResult.SENSOR_TIMESTAMP);
+             if (sensorTimestamp != null && PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
+                 synchronized (mZslBufferLock) {
+@@ -806,6 +826,40 @@
+     /**
+      * {@link CameraDevice.StateCallback} is called when {@link CameraDevice} changes its state.
+      */
++    /* IRIS_26527_SESSION_BOUND_ROUTE_OWNER */
++    private static final class IrisCameraRoute {
++        final String requestedOwnerId;
++        final String openedDeviceId;
++        final String physicalOutputId;
++        final String characteristicsId;
++        final String provenOwnerId;
++        final String mode;
++
++        IrisCameraRoute(String requestedOwnerId, String openedDeviceId, String physicalOutputId,
++                        String characteristicsId, String provenOwnerId, String mode) {
++            this.requestedOwnerId = requestedOwnerId;
++            this.openedDeviceId = openedDeviceId;
++            this.physicalOutputId = physicalOutputId;
++            this.characteristicsId = characteristicsId;
++            this.provenOwnerId = provenOwnerId;
++            this.mode = mode;
++        }
++
++        @Override public String toString() {
++            return "requested=" + requestedOwnerId + ",opened=" + openedDeviceId
++                    + ",physicalOutput=" + physicalOutputId + ",characteristics="
++                    + characteristicsId + ",provenOwner=" + provenOwnerId + ",mode=" + mode;
++        }
++    }
++
++    private volatile IrisCameraRoute mIrisOpeningRoute = null;
++    private volatile IrisCameraRoute mIrisActiveRoute = null;
++    private final Map<CameraCaptureSession, IrisCameraRoute> mIrisSessionRoutes =
++            Collections.synchronizedMap(new java.util.IdentityHashMap<>());
++    private volatile boolean mIrisZoomCurtainClosed = false;
++    private volatile long mIrisZoomCurtainGeneration = 0L;
++    private static final long IRIS_26527_CURTAIN_FAILSAFE_MS = 1600L;
++
+     private final CameraDevice.StateCallback mStateCallback = new CameraDevice.StateCallback() {
+ 
+         @Override
+@@ -813,6 +867,11 @@
+             // This method is called when the camera is opened.  We start camera preview here.
+             mCameraOpenCloseLock.release();
+             mCameraDevice = cameraDevice;
++            IrisCameraRoute route = mIrisOpeningRoute;
++            if (route != null && !route.openedDeviceId.equals(cameraDevice.getId())) {
++                Log.e(TAG, "IRIS_26527_CAMERA_ROUTE_MISMATCH expected="
++                        + route.openedDeviceId + " actual=" + cameraDevice.getId());
++            }
+             mImageSaver = new ImageSaver(cameraEventsListener);
+             createCameraPreviewSession(false);
+         }
+@@ -843,34 +902,15 @@
+         @Override
+         public void onSurfaceTextureAvailable(@NonNull SurfaceTexture texture, int width, int height) {
+             try {
+-                String curID = PhotonCamera.getSettings().mCameraID;
+-                if(curID.contains("-")){
+-                    logicalID = curID.split("-")[0];
+-                    physicalID = curID.split("-")[1];
+-                } else {
+-                    logicalID = curID;
+-                    physicalID = curID;
+-                }
+-                
+-                Log.d(TAG, "ID:" + mCameraCharacteristicsMap.get(physicalID));
+-                // list available characteristics ids
+-                for (String id : mCameraCharacteristicsMap.keySet()) {
+-                    Log.d(TAG, "Available camera ID: " + id);
+-                }
+-                CameraCharacteristics chars = mCameraCharacteristicsMap.get(physicalID);
++                /* IRIS_26527_SINGLE_ROUTE_AUTHORITY_SURFACE */
++                IrisCameraRoute route = iris26527ResolveRoute(PhotonCamera.getSettings().mCameraID);
++                mIrisOpeningRoute = route;
++                iris26527ApplyRouteToLegacyFields(route);
++                CameraCharacteristics chars = mCameraCharacteristics;
+                 if (chars == null) {
+-                    Log.e(TAG, "No characteristics for physicalID=" + physicalID
+-                            + " (mCameraID=" + PhotonCamera.getSettings().mCameraID + "). Falling back to first available.");
+-                    if (!mCameraCharacteristicsMap.isEmpty()) {
+-                        Map.Entry<String, CameraCharacteristics> first = mCameraCharacteristicsMap.entrySet().iterator().next();
+-                        physicalID = first.getKey();
+-                        logicalID = physicalID;
+-                        PhotonCamera.getSettings().mCameraID = physicalID;
+-                        chars = first.getValue();
+-                    } else {
+-                        showToast("No cameras available");
+-                        return;
+-                    }
++                    Log.e(TAG, "No characteristics for resolved route " + route);
++                    showToast("No camera characteristics for selected lens");
++                    return;
+                 }
+                 Size optimal = getPreviewOutputSize(getSafeDisplay(), chars,
+                         PhotonCamera.getSettings().selectedMode);
+@@ -1130,16 +1170,10 @@
+         try {
+             mPreviewWidth = width;
+             mPreviewHeight = height;
+-            String curID = PhotonCamera.getSettings().mCameraID;
+-            if(curID.contains("-")) {
+-                logicalID = curID.split("-")[0];
+-                physicalID = curID.split("-")[1];
+-            } else {
+-                logicalID = curID;
+-                physicalID = logicalID;
+-            }
+-            
+-            UpdateCameraCharacteristics(physicalID);
++            /* IRIS_26527_SINGLE_ROUTE_AUTHORITY_SETUP */
++            IrisCameraRoute route = iris26527ResolveRoute(PhotonCamera.getSettings().mCameraID);
++            mIrisOpeningRoute = route;
++            iris26527ApplyRouteToLegacyFields(route);
+             //Thread thr = new Thread(mImageSaver);
+             //thr.start();
+         } catch (Exception e) {
+@@ -2258,16 +2292,13 @@
+      */
+     private void iris26524ApplyZoomToPreviewBuilder() {
+         if (mPreviewRequestBuilder == null || mCameraCharacteristics == null) return;
+-        String iris26526ActiveCameraId = null;
+-        if (mCaptureSession != null && mCaptureSession.getDevice() != null) {
+-            iris26526ActiveCameraId = mCaptureSession.getDevice().getId();
+-        } else if (mCameraDevice != null) {
+-            iris26526ActiveCameraId = mCameraDevice.getId();
+-        }
++        IrisCameraRoute irisRoute = mCaptureSession == null
++                ? mIrisOpeningRoute : mIrisSessionRoutes.get(mCaptureSession);
++        String iris26527ActiveOwner = irisRoute != null
++                ? irisRoute.provenOwnerId
++                : (mCameraDevice == null ? null : mCameraDevice.getId());
+         float residual = IrisZoomController.applyToRequest(
+-                mPreviewRequestBuilder,
+-                mCameraCharacteristics,
+-                iris26526ActiveCameraId);
++                mPreviewRequestBuilder, mCameraCharacteristics, iris26527ActiveOwner);
+         if (mTextureView != null) mTextureView.setSoftwareZoom(residual);
+     }
+ 
+@@ -2402,6 +2433,104 @@
+         }
+         return allTargets;
+     }
++    private IrisCameraRoute iris26527ResolveRoute(String selectedId) {
++        String requested = selectedId == null ? "" : selectedId;
++        String logical = requested;
++        String physical = requested;
++        if (requested.contains("-")) {
++            String[] ids = requested.split("-", 2);
++            logical = ids[0];
++            physical = ids[1];
++        }
++        boolean directListed = false;
++        try {
++            directListed = Arrays.asList(mCameraManager.getCameraIdList()).contains(physical);
++        } catch (Throwable ignored) {}
++        if (!requested.equals(physical) && directListed) {
++            return new IrisCameraRoute(requested, physical, null, physical, requested,
++                    "direct-physical");
++        }
++        if (!requested.equals(physical) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            try {
++                CameraCharacteristics logicalChars = mCameraManager.getCameraCharacteristics(logical);
++                if (logicalChars.getPhysicalCameraIds().contains(physical)) {
++                    return new IrisCameraRoute(requested, logical, physical, physical, requested,
++                            "logical+physical-output");
++                }
++            } catch (Throwable ignored) {}
++            /* IRIS_26527_ADAPTIVE_LOGICAL_PHYSICAL_SEARCH
++             * Some vendors expose the requested physical lens under a logical camera other than
++             * the settings hint. Search Camera2's real public IDs before degrading to logical-only.
++             */
++            try {
++                for (String candidateLogical : mCameraManager.getCameraIdList()) {
++                    CameraCharacteristics candidateChars =
++                            mCameraManager.getCameraCharacteristics(candidateLogical);
++                    if (candidateChars.getPhysicalCameraIds().contains(physical)) {
++                        return new IrisCameraRoute(requested, candidateLogical, physical,
++                                physical, requested, "adaptive-logical+physical-output");
++                    }
++                }
++            } catch (Throwable error) {
++                Log.w(TAG, "IRIS_26527_ADAPTIVE_ROUTE_SEARCH_FAILED requested=" + requested
++                        + " error=" + error.getClass().getSimpleName());
++            }
++        }
++        String opened = requested.equals(physical) ? physical : logical;
++        return new IrisCameraRoute(requested, opened, null, opened, opened, "logical-only");
++    }
++
++    private void iris26527ApplyRouteToLegacyFields(IrisCameraRoute route) {
++        if (route == null) return;
++        logicalID = route.openedDeviceId;
++        physicalID = route.characteristicsId;
++        UpdateCameraCharacteristics(route.characteristicsId);
++    }
++
++    public void restartCameraForIrisHandoff(String requestedOwnerId) {
++        PreferenceKeys.setCameraID(requestedOwnerId);
++        final long generation = ++mIrisZoomCurtainGeneration;
++        Runnable restart = () -> {
++            if (generation != mIrisZoomCurtainGeneration) return;
++            processExecutor.execute(this::restartCamera);
++        };
++        if (mTextureView == null) {
++            restart.run();
++            return;
++        }
++        activity.runOnUiThread(() -> {
++            if (mIrisZoomCurtainClosed) {
++                restart.run();
++            } else {
++                mIrisZoomCurtainClosed = true;
++                mTextureView.animate().cancel();
++                mTextureView.animate().alpha(0.0f).setDuration(90L)
++                        .withEndAction(restart).start();
++            }
++            mTextureView.postDelayed(() -> {
++                if (generation != mIrisZoomCurtainGeneration || !mIrisZoomCurtainClosed) return;
++                Log.e(TAG, "IRIS_26527_ZOOM_CURTAIN_FAILSAFE generation=" + generation);
++                IrisZoomController.abortPendingHandoff("curtain-timeout");
++                mIrisZoomCurtainClosed = false;
++                mTextureView.animate().cancel();
++                mTextureView.setAlpha(1.0f);
++                ++mIrisZoomCurtainGeneration;
++            }, IRIS_26527_CURTAIN_FAILSAFE_MS);
++        });
++    }
++
++    private void iris26527RevealZoomCurtain(String provenOwnerId) {
++        if (!mIrisZoomCurtainClosed || mTextureView == null) return;
++        final long generation = ++mIrisZoomCurtainGeneration;
++        activity.runOnUiThread(() -> {
++            if (generation != mIrisZoomCurtainGeneration) return;
++            mIrisZoomCurtainClosed = false;
++            mTextureView.animate().cancel();
++            mTextureView.animate().alpha(1.0f).setDuration(90L).start();
++            Log.i(TAG, "IRIS_26527_ZOOM_CURTAIN_REVEAL provenOwner=" + provenOwnerId);
++        });
++    }
++
+     @SuppressLint("MissingPermission")
+     public void restartCamera() {
+         Log.d(TAG, "restartCamera() called from \"" + Thread.currentThread().getName() + "\" Thread");
+@@ -2453,33 +2582,29 @@
+                 showToast("Failed to release camera");
+             }
+         }
+-        String curID = PhotonCamera.getSettings().mCameraID;
+-        if(curID.contains("-")) {
+-            logicalID = curID.split("-")[0];
+-            physicalID = curID.split("-")[1];
+-        } else {
+-            logicalID = curID;
+-            physicalID = logicalID;
+-        }
+-        
++        IrisCameraRoute irisRoute = iris26527ResolveRoute(PhotonCamera.getSettings().mCameraID);
++        mIrisOpeningRoute = irisRoute;
++        iris26527ApplyRouteToLegacyFields(irisRoute);
++        Log.i(TAG, "IRIS_26527_CAMERA_ROUTE_OPEN " + irisRoute);
++
++        // IRIS_26527_ROUTE_RESTART_ORDER: prepare the complete route/output state before the
++        // asynchronous onOpened callback can create a capture session.
++        startBackgroundThread();
++        Size optimal = getPreviewOutputSize(
++                getSafeDisplay(), mCameraCharacteristics, CameraFragment.mSelectedMode);
++        setUpCameraOutputs(optimal.getWidth(), optimal.getHeight());
++        configureTransform(optimal.getWidth(), optimal.getHeight());
++        irisRoute = mIrisOpeningRoute;
+         try {
+             if (!mCameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                 throw new RuntimeException("Time out waiting to lock camera opening.");
+             }
+-            this.mCameraManager.openCamera(logicalID, mStateCallback, mBackgroundHandler);
++            this.mCameraManager.openCamera(irisRoute.openedDeviceId, mStateCallback, mBackgroundHandler);
+         } catch (CameraAccessException e) {
+             Log.e(TAG, Log.getStackTraceString(e));
+         } catch (InterruptedException e) {
+             throw new RuntimeException("Interrupted while trying to restart camera.", e);
+         }
+-        //stopBackgroundThread();
+-        //UpdateCameraCharacteristics(physicalID);
+-        startBackgroundThread();
+-
+-        Size optimal = getPreviewOutputSize(getSafeDisplay(), mCameraCharacteristics, CameraFragment.mSelectedMode);
+-
+-        setUpCameraOutputs(optimal.getWidth(), optimal.getHeight());
+-        configureTransform(optimal.getWidth(), optimal.getHeight());
+     }
+     private Size getAspect(CameraMode targetMode){
+         Size aspectRatio;
+@@ -2623,17 +2748,13 @@
+                 if (!mCameraOpenCloseLock.tryAcquire(1000, TimeUnit.MILLISECONDS)) {
+                     throw new RuntimeException("Time out waiting to lock camera opening.");
+                 }
+-                physicalID = PhotonCamera.getSettings().mCameraID;
+-                logicalID = PhotonCamera.getSettings().mCameraID;
+-                // Split x-y, x - logical, y - physical
+-                if(PhotonCamera.getSettings().mCameraID.contains("-")){
+-                    String[] ids = PhotonCamera.getSettings().mCameraID.split("-");
+-                    logicalID = ids[0];
+-                    physicalID = ids[1];
+-                    //isDualSession = true;
+-                }
+-                
+-                this.mCameraManager.openCamera(logicalID, mStateCallback, mBackgroundHandler);
++                IrisCameraRoute irisRoute =
++                        iris26527ResolveRoute(PhotonCamera.getSettings().mCameraID);
++                mIrisOpeningRoute = irisRoute;
++                iris26527ApplyRouteToLegacyFields(irisRoute);
++                Log.i(TAG, "IRIS_26527_CAMERA_ROUTE_OPEN " + irisRoute);
++                this.mCameraManager.openCamera(
++                        irisRoute.openedDeviceId, mStateCallback, mBackgroundHandler);
+             } catch (CameraAccessException e) {
+                 Log.e(TAG, Log.getStackTraceString(e));
+             } catch (InterruptedException e) {
+@@ -2819,14 +2940,19 @@
+             // Here, we create a CameraCaptureSession for camera preview.
+             List<Surface> surfaces = configureSurfaces(isBurstSession);
+             Log.d(TAG, "createCameraPreviewSession() surfaces:" + Arrays.toString(surfaces.toArray()));
++            final IrisCameraRoute irisSessionRoute = mIrisOpeningRoute != null
++                    ? mIrisOpeningRoute
++                    : iris26527ResolveRoute(PhotonCamera.getSettings().mCameraID);
+             ArrayList<OutputConfiguration> outputConfigurations = new ArrayList<>();
+             for (Surface surfacei : surfaces) {
+                 var config = new OutputConfiguration(surfacei);
+-                if(!Objects.equals(physicalID, logicalID) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P){
+-                    config.setPhysicalCameraId(physicalID);
++                if (irisSessionRoute.physicalOutputId != null
++                        && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                    config.setPhysicalCameraId(irisSessionRoute.physicalOutputId);
+                 }
+                 outputConfigurations.add(config);
+             }
++            Log.i(TAG, "IRIS_26527_SESSION_ROUTE_CONFIG " + irisSessionRoute);
+ 
+             CameraCaptureSession.StateCallback stateCallback =
+                     new CameraCaptureSession.StateCallback() {
+@@ -2839,6 +2965,9 @@
+                     }
+                     // When the session is ready, we start displaying the preview.
+                     mCaptureSession = cameraCaptureSession;
++                    mIrisSessionRoutes.put(cameraCaptureSession, irisSessionRoute);
++                    mIrisActiveRoute = irisSessionRoute;
++                    Log.i(TAG, "IRIS_26527_SESSION_ROUTE_ACTIVE " + irisSessionRoute);
+                     try {
+                         // Auto focus should be continuous for camera preview.
+                         //mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AF_MODE,CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
+@@ -2889,8 +3018,18 @@
+                 @Override
+                 public void onConfigureFailed(
+                         @NonNull CameraCaptureSession cameraCaptureSession) {
++                    mIrisSessionRoutes.remove(cameraCaptureSession);
++                    if (mIrisActiveRoute == irisSessionRoute) mIrisActiveRoute = null;
+                     showToast(activity.getString(R.string.session_on_configure_failed));
+                     Log.d(TAG, "CameraCaptureSession onConfigureFailed()");
++                }
++
++                @Override
++                public void onClosed(@NonNull CameraCaptureSession cameraCaptureSession) {
++                    mIrisSessionRoutes.remove(cameraCaptureSession);
++                    if (mCaptureSession == cameraCaptureSession) mCaptureSession = null;
++                    if (mIrisActiveRoute == irisSessionRoute) mIrisActiveRoute = null;
++                    super.onClosed(cameraCaptureSession);
+                 }
+             };
+             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+--- a/app/src/main/java/com/particlesdevs/photoncamera/api/CameraManager2.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/api/CameraManager2.java
+@@ -59,6 +59,19 @@
+             try {
+                 Thread.sleep(1);
+             } catch (InterruptedException ignored) {}
++        }
++        /* IRIS_26527_CAMERA_TOPOLOGY_DIAGNOSTICS */
++        try {
++            for (String cameraId : cameraManager.getCameraIdList()) {
++                CameraCharacteristics cc = cameraManager.getCameraCharacteristics(cameraId);
++                Set<String> physicalIds = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
++                        ? cc.getPhysicalCameraIds() : java.util.Collections.emptySet();
++                Log.i(TAG, "IRIS_26527_CAMERA_TOPOLOGY cameraId=" + cameraId
++                        + " physicalIds=" + physicalIds
++                        + " directListed=true");
++            }
++        } catch (Exception e) {
++            Log.w(TAG, "IRIS_26527_CAMERA_TOPOLOGY_FAILED " + e.getClass().getSimpleName());
+         }
+         SpecificSetting sp = PhotonCamera.getSpecific().specificSetting;
+         String[] ids = sp.cameraIDS;
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/DngCreator.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/DngCreator.java
+@@ -60,6 +60,8 @@
+     private native void setBinning(long nativePtr, boolean binning);
+     /* IRIS_26525_DNG_DEFAULT_CROP_ZOOM_PARITY */
+     private native void setDefaultCropZoom(long nativePtr, double zoom);
++    /* IRIS_26527_DNG_EMBEDDED_RGB_SUBIFD_PREVIEW */
++    private native void setEmbeddedPreviewEnabled(long nativePtr, boolean enabled);
+     private native void destroy(long nativePtr);
+     private native void writeFile(long nativePtr, ByteBuffer dngBuffer, ByteBuffer raw, String path, int offset);
+     private native void openArchive(long nativePtr, String path);
+@@ -403,6 +405,15 @@
+             zoom = 1.0;
+         }
+         setDefaultCropZoom(nativePtr, zoom);
++    }
++
++    /**
++     * IRIS_26527_DNG_EMBEDDED_RGB_SUBIFD_PREVIEW
++     * Enables a reduced RGB SubIFD preview while leaving the full Bayer payload and
++     * IRIS_26525 DefaultCrop metadata untouched. This is intended for still stacked DNGs only.
++     */
++    public void setEmbeddedPreviewEnabled(boolean enabled) {
++        setEmbeddedPreviewEnabled(nativePtr, enabled);
+     }
+ 
+     /**
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -264,6 +264,11 @@
+                 dngCreator.setParameters(parameters, false, false);
+                 /* IRIS_26525_DNG_DEFAULT_CROP_ZOOM_PARITY */
+                 dngCreator.setDefaultCropZoom(parameters.motionV2OutputZoom);
++                /* IRIS_26527_DNG_EMBEDDED_RGB_SUBIFD_PREVIEW
++                 * This utility is Motion's stacked still-DNG path only. RawVideo uses its
++                 * separate DngCreator path and therefore retains the default false value.
++                 */
++                dngCreator.setEmbeddedPreviewEnabled(true);
+                 dngCreator.setBitsPerSample(16);
+                 dngCreator.setBlackLevel(new short[]{0, 0, 0, 0});
+                 dngCreator.setWhiteLevel(65535.0);
+--- a/app/src/main/cpp/dngCreator.cpp
++++ b/app/src/main/cpp/dngCreator.cpp
+@@ -556,6 +556,190 @@
+         default_crop_zoom = (std::isfinite(zoom) && zoom >= 1.0) ? zoom : 1.0;
+     }
+ 
++    void setEmbeddedPreviewEnabled(bool enabled) {
++        metadata.embedded_preview_enabled = enabled;
++    }
++
++    struct Iris26527PreviewRgb {
++        unsigned int width = 0;
++        unsigned int height = 0;
++        std::vector<unsigned char> bytes;
++    };
++
++    static double iris26527Clamp01(double v) {
++        return std::max(0.0, std::min(1.0, v));
++    }
++
++    static unsigned char iris26527Srgb8(double linear) {
++        linear = iris26527Clamp01(linear);
++        double encoded = linear <= 0.0031308
++                ? 12.92 * linear
++                : 1.055 * std::pow(linear, 1.0 / 2.4) - 0.055;
++        return static_cast<unsigned char>(std::lround(255.0 * iris26527Clamp01(encoded)));
++    }
++
++    static void iris26527D50ToSrgb(double x, double y, double z,
++                                   double &r, double &g, double &b) {
++        // Bradford D50 -> D65 followed by the standard D65 XYZ -> linear-sRGB matrix.
++        const double xd =  0.9555766 * x + -0.0230393 * y +  0.0631636 * z;
++        const double yd = -0.0282895 * x +  1.0099416 * y +  0.0210077 * z;
++        const double zd =  0.0122982 * x + -0.0204830 * y +  1.3299098 * z;
++        r =  3.2404542 * xd + -1.5371385 * yd + -0.4985314 * zd;
++        g = -0.9692660 * xd +  1.8760108 * yd +  0.0415560 * zd;
++        b =  0.0556434 * xd + -0.2040259 * yd +  1.0572252 * zd;
++    }
++
++    Iris26527PreviewRgb iris26527BuildPreview(
++            const uint16_t *raw, int rawWidth, int rawHeight,
++            const unsigned int cropOrigin[2], const unsigned int cropSize[2]) const {
++        Iris26527PreviewRgb out;
++        if (!raw || rawWidth < 2 || rawHeight < 2 || cropSize[0] < 2 || cropSize[1] < 2) {
++            return out;
++        }
++        const double scale = std::min(1.0, 512.0 / static_cast<double>(
++                std::max(cropSize[0], cropSize[1])));
++        unsigned int previewW = std::max(1u, static_cast<unsigned int>(
++                std::floor(cropSize[0] * scale)));
++        unsigned int previewH = std::max(1u, static_cast<unsigned int>(
++                std::floor(cropSize[1] * scale)));
++        out.width = previewW;
++        out.height = previewH;
++
++        struct LinearRgb { float r, g, b; };
++        std::vector<LinearRgb> linear(static_cast<size_t>(previewW) * previewH);
++        std::vector<float> luma;
++        luma.reserve(linear.size());
++        const double white = std::max(metadata.white_level, 1.0);
++        double wb[3] = {1.0, 1.0, 1.0};
++        if (metadata.has_as_shot_neutral) {
++            for (int c = 0; c < 3; ++c) {
++                const double n = metadata.as_shot_neutral[c];
++                wb[c] = (std::isfinite(n) && n > 1.0e-6)
++                        ? std::max(0.05, std::min(20.0, 1.0 / n)) : 1.0;
++            }
++        }
++        const bool useForward = metadata.has_forward_matrix1;
++        for (unsigned int py = 0; py < previewH; ++py) {
++            for (unsigned int px = 0; px < previewW; ++px) {
++                int sx = static_cast<int>(cropOrigin[0] +
++                        ((static_cast<double>(px) + 0.5) * cropSize[0] / previewW));
++                int sy = static_cast<int>(cropOrigin[1] +
++                        ((static_cast<double>(py) + 0.5) * cropSize[1] / previewH));
++                sx = std::max(0, std::min(rawWidth - 2, sx & ~1));
++                sy = std::max(0, std::min(rawHeight - 2, sy & ~1));
++                double camera[3] = {0.0, 0.0, 0.0};
++                int counts[3] = {0, 0, 0};
++                for (int dy = 0; dy < 2; ++dy) {
++                    for (int dx = 0; dx < 2; ++dx) {
++                        const int phase = dy * 2 + dx;
++                        const int color = metadata.cfa_pattern[phase];
++                        if (color < 0 || color > 2) continue;
++                        const double black = metadata.black_level[phase];
++                        const double denom = std::max(1.0, white - black);
++                        const double sample = raw[(sy + dy) * rawWidth + (sx + dx)];
++                        camera[color] += iris26527Clamp01((sample - black) / denom);
++                        counts[color]++;
++                    }
++                }
++                for (int c = 0; c < 3; ++c) {
++                    if (counts[c] > 0) camera[c] /= counts[c];
++                    camera[c] *= wb[c];
++                }
++                double r = camera[0], g = camera[1], b = camera[2];
++                if (useForward) {
++                    const double *m = metadata.forward_matrix1;
++                    const double x = m[0] * camera[0] + m[1] * camera[1] + m[2] * camera[2];
++                    const double y = m[3] * camera[0] + m[4] * camera[1] + m[5] * camera[2];
++                    const double z = m[6] * camera[0] + m[7] * camera[1] + m[8] * camera[2];
++                    iris26527D50ToSrgb(x, y, z, r, g, b);
++                }
++                r = std::max(0.0, r); g = std::max(0.0, g); b = std::max(0.0, b);
++                linear[static_cast<size_t>(py) * previewW + px] = {
++                        static_cast<float>(r), static_cast<float>(g), static_cast<float>(b)};
++                luma.push_back(static_cast<float>(0.2126 * r + 0.7152 * g + 0.0722 * b));
++            }
++        }
++        double exposureGain = 1.0;
++        if (!luma.empty()) {
++            const size_t p90Index = std::min(luma.size() - 1,
++                    static_cast<size_t>(0.90 * static_cast<double>(luma.size() - 1)));
++            std::nth_element(luma.begin(), luma.begin() + p90Index, luma.end());
++            const double p90 = std::max(1.0e-4, static_cast<double>(luma[p90Index]));
++            exposureGain = std::max(0.25, std::min(8.0, 0.85 / p90));
++        }
++        out.bytes.resize(linear.size() * 3);
++        for (size_t i = 0; i < linear.size(); ++i) {
++            out.bytes[3 * i + 0] = iris26527Srgb8(linear[i].r * exposureGain);
++            out.bytes[3 * i + 1] = iris26527Srgb8(linear[i].g * exposureGain);
++            out.bytes[3 * i + 2] = iris26527Srgb8(linear[i].b * exposureGain);
++        }
++        LOGD("IRIS_26527_DNG_PREVIEW_RENDER crop=%u,%u %ux%u preview=%ux%u gain=%.4f forward=%d",
++             cropOrigin[0], cropOrigin[1], cropSize[0], cropSize[1],
++             out.width, out.height, exposureGain, useForward ? 1 : 0);
++        return out;
++    }
++
++    static uint16_t iris26527Read16(const uint8_t *p, bool bigEndian) {
++        return bigEndian ? static_cast<uint16_t>((p[0] << 8) | p[1])
++                         : static_cast<uint16_t>(p[0] | (p[1] << 8));
++    }
++
++    static uint32_t iris26527Read32(const uint8_t *p, bool bigEndian) {
++        if (bigEndian) {
++            return (static_cast<uint32_t>(p[0]) << 24) |
++                   (static_cast<uint32_t>(p[1]) << 16) |
++                   (static_cast<uint32_t>(p[2]) << 8) | p[3];
++        }
++        return p[0] | (static_cast<uint32_t>(p[1]) << 8) |
++               (static_cast<uint32_t>(p[2]) << 16) |
++               (static_cast<uint32_t>(p[3]) << 24);
++    }
++
++    static void iris26527Write32(uint8_t *p, uint32_t v, bool bigEndian) {
++        if (bigEndian) {
++            p[0] = static_cast<uint8_t>(v >> 24); p[1] = static_cast<uint8_t>(v >> 16);
++            p[2] = static_cast<uint8_t>(v >> 8); p[3] = static_cast<uint8_t>(v);
++        } else {
++            p[0] = static_cast<uint8_t>(v); p[1] = static_cast<uint8_t>(v >> 8);
++            p[2] = static_cast<uint8_t>(v >> 16); p[3] = static_cast<uint8_t>(v >> 24);
++        }
++    }
++
++    static bool iris26527PromoteSecondIfdToSubIfd(void *memory, size_t size) {
++        if (!memory || size < 16) return false;
++        auto *bytes = reinterpret_cast<uint8_t *>(memory);
++        bool bigEndian;
++        if (bytes[0] == 'I' && bytes[1] == 'I') bigEndian = false;
++        else if (bytes[0] == 'M' && bytes[1] == 'M') bigEndian = true;
++        else return false;
++        if (iris26527Read16(bytes + 2, bigEndian) != 42) return false;
++        const uint32_t ifd0 = iris26527Read32(bytes + 4, bigEndian);
++        if (ifd0 > size - 2) return false;
++        const uint16_t count = iris26527Read16(bytes + ifd0, bigEndian);
++        const size_t entriesStart = static_cast<size_t>(ifd0) + 2;
++        const size_t nextOffsetPos = entriesStart + static_cast<size_t>(count) * 12;
++        if (nextOffsetPos > size - 4) return false;
++        const uint32_t previewIfd = iris26527Read32(bytes + nextOffsetPos, bigEndian);
++        if (previewIfd == 0 || previewIfd > size - 2) return false;
++        uint8_t *subIfdValue = nullptr;
++        for (uint16_t i = 0; i < count; ++i) {
++            uint8_t *entry = bytes + entriesStart + static_cast<size_t>(i) * 12;
++            const uint16_t tag = iris26527Read16(entry, bigEndian);
++            if (tag == 330) {
++                if (iris26527Read16(entry + 2, bigEndian) != 4 ||
++                    iris26527Read32(entry + 4, bigEndian) != 1) return false;
++                subIfdValue = entry + 8;
++                break;
++            }
++        }
++        if (!subIfdValue) return false;
++        iris26527Write32(subIfdValue, previewIfd, bigEndian);
++        iris26527Write32(bytes + nextOffsetPos, 0, bigEndian);
++        LOGD("IRIS_26527_DNG_SUBIFD_LINK mainIfd=%u previewIfd=%u tag=330 chainNext=0",
++             ifd0, previewIfd);
++        return true;
++    }
++
+     /**
+      * Bayer 2x2 binning: each output pixel combines 4 same-color input pixels
+      * (from a 4x4 input block → 2x2 output Bayer cell), preserving the CFA pattern.
+@@ -771,12 +955,66 @@
+         }
+         dng_writer.AddImage(dng_image0);
+ 
++        /* IRIS_26527_DNG_EMBEDDED_RGB_SUBIFD_PREVIEW
++         * Still stacked DNG only: reduced RGB preview is a second TinyDNG IFD while the main
++         * Bayer payload and IRIS_26525 DefaultCrop remain byte-for-byte in their original domain.
++         */
++        tinydngwriter::DNGImage *previewImage = nullptr;
++        bool hasEmbeddedPreview = metadata.embedded_preview_enabled &&
++                metadata.bps == 16 && !metadata.binning;
++        if (hasEmbeddedPreview) {
++            Iris26527PreviewRgb preview = iris26527BuildPreview(
++                    reinterpret_cast<const uint16_t *>(dataToProcess), actualWidth, actualHeight,
++                    defaultCropOrigin, defaultCropSize);
++            if (preview.bytes.empty() || preview.width == 0 || preview.height == 0) {
++                LOGE("IRIS_26527_DNG_PREVIEW render failed");
++                if (binnedData) delete[] binnedData;
++                return nullptr;
++            }
++            // Placeholder is patched to the preview IFD offset after TinyDNG lays out both IFDs.
++            if (!dng_image0->SetCustomFieldULong(330, 0u)) {
++                LOGE("IRIS_26527_DNG_PREVIEW failed to add SubIFD tag 330");
++                if (binnedData) delete[] binnedData;
++                return nullptr;
++            }
++            previewImage = new tinydngwriter::DNGImage();
++            previewImage->SetSubfileType(true, false, false);
++            previewImage->SetBigEndian(false);
++            previewImage->SetSamplesPerPixel(3);
++            const unsigned short previewBps[3] = {8, 8, 8};
++            previewImage->SetBitsPerSample(3, previewBps);
++            previewImage->SetPhotometric(tinydngwriter::PHOTOMETRIC_RGB);
++            previewImage->SetPlanarConfig(tinydngwriter::PLANARCONFIG_CONTIG);
++            previewImage->SetCompression(tinydngwriter::COMPRESSION_NONE);
++            previewImage->SetOrientation(metadata.orientation);
++            previewImage->SetImageWidth(preview.width);
++            previewImage->SetImageLength(preview.height);
++            previewImage->SetRowsPerStrip(preview.height);
++            if (!previewImage->SetImageData(preview.bytes.data(), preview.bytes.size())) {
++                LOGE("IRIS_26527_DNG_PREVIEW failed to set RGB payload");
++                delete previewImage;
++                if (binnedData) delete[] binnedData;
++                return nullptr;
++            }
++            dng_writer.AddImage(previewImage);
++        }
++
+         size_t writeSize = 0;
+         std::string err;
+-        auto res = dng_writer.WriteToMemory(&writeSize, &err, &metadata.strip_offset);
++        // TinyDNG's multi-image strip_offset_out is overwritten by the last image. Preserve the
++        // historical MAIN Bayer strip offset explicitly for RawVideo/writeFile compatibility.
++        metadata.strip_offset = dng_image0->GetStripOffset();
++        auto res = dng_writer.WriteToMemory(&writeSize, &err, nullptr);
+         if (!err.empty()) {
+             LOGE("WriteToMemory error: %s", err.c_str());
+         }
++        if (res && hasEmbeddedPreview && !iris26527PromoteSecondIfdToSubIfd(res, writeSize)) {
++            LOGE("IRIS_26527_DNG_SUBIFD_LINK failed; refusing malformed still DNG");
++            free(res);
++            res = nullptr;
++            writeSize = 0;
++        }
++        if (previewImage) delete previewImage;
+         if (binnedData) {
+             delete[] binnedData;
+         }
+@@ -1175,6 +1413,13 @@
+         DngCreator* creator = reinterpret_cast<DngCreator*>(creatorPtr);
+         if (creator) {
+             creator->setDefaultCropZoom(static_cast<double>(zoom));
++        }
++    }
++
++    JNIEXPORT void JNICALL Java_com_particlesdevs_photoncamera_processing_DngCreator_setEmbeddedPreviewEnabled(JNIEnv *env, jobject obj, jlong creatorPtr, jboolean enabled) {
++        DngCreator* creator = reinterpret_cast<DngCreator*>(creatorPtr);
++        if (creator) {
++            creator->setEmbeddedPreviewEnabled(enabled == JNI_TRUE);
+         }
+     }
+ 
+--- a/app/src/main/cpp/dngCreator.h
++++ b/app/src/main/cpp/dngCreator.h
+@@ -58,6 +58,8 @@
+     bool binning_uses_average = false;
+     int original_width = 0;
+     int original_height = 0;
++    /* IRIS_26527_DNG_EMBEDDED_RGB_SUBIFD_PREVIEW */
++    bool embedded_preview_enabled = false;
+ };
+ 
+ #ifdef __cplusplus
+@@ -161,6 +163,9 @@
+ JNIEXPORT void JNICALL Java_com_particlesdevs_photoncamera_processing_DngCreator_setBinning(
+     JNIEnv *env, jobject obj, jlong creatorPtr, jboolean binning);
+ 
++JNIEXPORT void JNICALL Java_com_particlesdevs_photoncamera_processing_DngCreator_setEmbeddedPreviewEnabled(
++    JNIEnv *env, jobject obj, jlong creatorPtr, jboolean enabled);
++
+ JNIEXPORT void JNICALL Java_com_particlesdevs_photoncamera_processing_DngCreator_destroy(
+ JNIEnv *env, jobject obj, jlong creatorPtr);
+ 
