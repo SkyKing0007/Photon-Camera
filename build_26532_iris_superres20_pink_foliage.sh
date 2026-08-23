@@ -17,6 +17,9 @@ EXPECTED_BASE_TAR_SHA="9c22f3d3e090607f9266246930d77961948c6b89f0fe708c81b140cfb
 EXPECTED_BASE_MANIFEST_SHA="87eb558a00ff3b71fd9bad059e502e64b51e94f4bb359f992e34cb39b8201302"
 EXPECTED_BASE_FILES=950
 EXPECTED_CANDIDATE_FILES=951
+BJZHOU_VENDOR_HEAD="09c76e57e8f01a5a8fc536ab41fc80ba642d4042"
+BJZHOU_MANIFEST="$ROOT/26507_BJZHOU_NATIVE_DEPENDENCIES.sha256"
+BJZHOU_COMMIT_FILE="$ROOT/26507_BJZHOU_DEPENDENCY_COMMIT.txt"
 REPO="${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}"
 VERSION_NAME="0.9726532"; VERSION_BUILD="26532"
 
@@ -46,6 +49,7 @@ BASE="$WORK/tested26531"
 AFTER="$WORK/candidate26532"
 ROLL="$WORK/rollbackcheck"
 PATCHREPO="$WORK/patchrepo"
+BJ="$WORK/bjzhou_vendor"
 FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-superres20-pink-foliage-debug.apk"
 
 rm -rf "$OUT" "$WORK" "$FINAL"
@@ -63,7 +67,7 @@ for f in "$APPLY" "$VALIDATE" "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAV
          "$BASE_HEAD_FILE" "$BASE_TAR_SHA_FILE" "$BASE_MANIFEST_SHA_FILE" \
          "$EXPECTED_PATCH" "$EXPECTED_PATCH_SHA" "$EXPECTED_ROLLBACK" "$EXPECTED_ROLLBACK_SHA" \
          "$EMBEDDED_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" \
-         "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST"; do [[ -f "$f" ]] || fail "missing $(basename "$f")"; done
+         "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do [[ -f "$f" ]] || fail "missing $(basename "$f")"; done
 sha256sum -c "$HANDOFF"
 sha256sum -c "$EXPECTED_PATCH_SHA"
 sha256sum -c "$EXPECTED_ROLLBACK_SHA"
@@ -74,6 +78,7 @@ command -v gh >/dev/null || fail "GitHub CLI unavailable"
 [[ -n "${GH_TOKEN:-}" ]] || fail "GH_TOKEN missing"
 command -v glslangValidator >/dev/null || fail "glslangValidator unavailable"
 glslangValidator --version | grep -F '16.5.0' >/dev/null || fail "wrong glslangValidator version"
+[[ "$(tr -d '\r\n' < "$BJZHOU_COMMIT_FILE")" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor dependency commit drift"
 
 git fetch --no-tags origin "refs/heads/$BACKUP_BRANCH:refs/remotes/origin/$BACKUP_BRANCH"
 [[ "$(git rev-parse "refs/remotes/origin/$BACKUP_BRANCH")" == "$SUCCESSFUL_26531_HEAD" ]] || fail "backup branch is not exact 26531"
@@ -82,7 +87,7 @@ git diff --name-only "$SUCCESSFUL_26531_HEAD"..HEAD -- app/src/main app/version.
 [[ ! -s "$OUT/26532_committed_runtime_drift_after_26531.txt" ]] || fail "committed runtime drift after successful 26531"
 git diff --name-only "$SUCCESSFUL_26531_HEAD"..HEAD -- gradlew gradlew.bat gradle build.gradle settings.gradle gradle.properties app/build.gradle app/proguard-rules.pro > "$OUT/26532_protected_build_infrastructure_drift.txt"
 [[ ! -s "$OUT/26532_protected_build_infrastructure_drift.txt" ]] || fail "protected build infrastructure drift after successful 26531"
-for rel in preflight_26529_iris_embedded_shaders_v3.py preflight_26526_inherited_shaders.py preflight_26531_iris_kotlin_api_contracts.py preflight_26527_native_syntax.py test_26527_dng_subifd.py; do
+for rel in preflight_26529_iris_embedded_shaders_v3.py preflight_26526_inherited_shaders.py preflight_26531_iris_kotlin_api_contracts.py preflight_26527_native_syntax.py test_26527_dng_subifd.py 26507_BJZHOU_NATIVE_DEPENDENCIES.sha256 26507_BJZHOU_DEPENDENCY_COMMIT.txt; do
   [[ "$(git hash-object "$rel")" == "$(git rev-parse "$SUCCESSFUL_26531_HEAD:$rel")" ]] || fail "inherited preflight drift: $rel"
 done
 pass "exact 26531 lineage + backup + handoff integrity verified"
@@ -168,11 +173,57 @@ manifest "$AFTER" "$OUT/26532_pre_gradle_audited_runtime.sha256"
 [[ "$(wc -l < "$OUT/26532_pre_gradle_audited_runtime.sha256")" -eq "$EXPECTED_CANDIDATE_FILES" ]] || fail "26532 candidate source count mismatch"
 pass "version increment + pre-Gradle candidate freeze complete"
 
+echo "=== 26532 GATE 4B: restore exact pinned native dependencies inherited from successful 26531 ==="
+rm -rf "$BJ"; git init -q "$BJ"
+git -C "$BJ" remote add origin https://github.com/bjzhou/PhotonCamera.git
+git -C "$BJ" config core.sparseCheckout true
+mkdir -p "$BJ/.git/info"
+cat > "$BJ/.git/info/sparse-checkout" <<'SPARSE'
+/app/src/main/cpp/libjpeg-turbo/
+/app/src/main/cpp/libultrahdr/
+SPARSE
+git -C "$BJ" fetch --depth=1 origin "$BJZHOU_VENDOR_HEAD"
+git -C "$BJ" checkout -q --detach FETCH_HEAD
+[[ "$(git -C "$BJ" rev-parse HEAD)" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor checkout drift"
+THIRD="$AFTER/app/src/main/cpp/third_party_26507"
+rm -rf "$THIRD"; mkdir -p "$THIRD"
+cp -a "$BJ/app/src/main/cpp/libjpeg-turbo" "$THIRD/libjpeg-turbo"
+cp -a "$BJ/app/src/main/cpp/libultrahdr" "$THIRD/libultrahdr"
+[[ -f "$THIRD/libjpeg-turbo/CMakeLists.txt" ]] || fail "26507 pinned libjpeg-turbo source missing before Gradle"
+[[ -f "$THIRD/libultrahdr/CMakeLists.txt" ]] || fail "26507 pinned libultrahdr source missing before Gradle"
+( cd "$THIRD" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26532_vendor_manifest_check_prebuild.txt"
+pass "exact 26507 native vendor dependencies restored + hash-verified before Gradle"
+
 echo "=== 26532 GATE 5: install exact candidate into disposable Actions workspace + compile ==="
 rm -rf "$ROOT/app/src/main"
 mkdir -p "$ROOT/app/src"
 cp -a "$AFTER/app/src/main" "$ROOT/app/src/"
 cp "$AFTER/app/version.properties" "$ROOT/app/version.properties"
+
+assert_cpp_deps_exact(){
+  local root="$1" phase="$2" expected actual
+  if [[ "$phase" == pre ]]; then expected=$'.gitignore'
+  else expected=$'.gitignore\narchive.h\narchive_entry.h\ntechnicallyflac.h\ntiny_dng_writer.h'; fi
+  actual="$(find "$root/app/src/main/cpp/deps" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+  [[ "$actual" == "$expected" ]] || fail "unexpected app/src/main/cpp/deps contents ($phase): [$actual]"
+}
+audited_runtime_manifest(){
+  local root="$1" out="$2"
+  (
+    cd "$root"
+    {
+      find app/src/main -type f ! -path 'app/src/main/cpp/third_party_26507/*' ! -path 'app/src/main/cpp/deps/*' -print
+      echo app/src/main/cpp/deps/.gitignore
+      echo app/version.properties
+    } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done
+  ) > "$out"
+}
+assert_cpp_deps_exact "$ROOT" pre
+audited_runtime_manifest "$ROOT" "$OUT/26532_installed_pre_gradle_audited_runtime.sha256"
+cmp -s "$OUT/26532_pre_gradle_audited_runtime.sha256" "$OUT/26532_installed_pre_gradle_audited_runtime.sha256" || fail "installed runtime differs before Gradle"
+[[ -f "$ROOT/app/src/main/cpp/third_party_26507/libjpeg-turbo/CMakeLists.txt" ]] || fail "pinned libjpeg-turbo missing immediately before Gradle"
+[[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/CMakeLists.txt" ]] || fail "pinned libultrahdr missing immediately before Gradle"
+( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26532_installed_vendor_manifest_check_prebuild.txt"
 
 ./gradlew --no-daemon :app:compileDebugKotlin :app:compileDebugJavaWithJavac
 pass "Kotlin + Java compile gates"
@@ -180,10 +231,13 @@ pass "Kotlin + Java compile gates"
 pass "assembleDebug"
 
 echo "=== 26532 GATE 6: post-build source + semantic revalidation ==="
+assert_cpp_deps_exact "$ROOT" post
+audited_runtime_manifest "$ROOT" "$OUT/26532_installed_runtime_after_gradle.sha256"
+cmp -s "$OUT/26532_pre_gradle_audited_runtime.sha256" "$OUT/26532_installed_runtime_after_gradle.sha256" || fail "installed audited runtime source drifted during Gradle"
+( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26532_vendor_manifest_check_postbuild.txt"
+rm -rf "$AFTER/app/src/main/cpp/third_party_26507"
 manifest "$AFTER" "$OUT/26532_post_gradle_candidate.sha256"
 cmp -s "$OUT/26532_pre_gradle_audited_runtime.sha256" "$OUT/26532_post_gradle_candidate.sha256" || fail "candidate source mutated during Gradle"
-manifest "$ROOT" "$OUT/26532_installed_runtime_after_gradle.sha256"
-cmp -s "$OUT/26532_pre_gradle_audited_runtime.sha256" "$OUT/26532_installed_runtime_after_gradle.sha256" || fail "installed runtime source drifted during Gradle"
 python3 "$VALIDATE" --base "$BASE" --candidate "$AFTER" --patch "$EXPECTED_PATCH" --rollback "$EXPECTED_ROLLBACK" --versioned \
   --json-out "$OUT/26532_postbuild_validation.json" | tee "$OUT/26532_postbuild_validator.txt"
 python3 "$SHADER_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26532_shader_postbuild.txt"
