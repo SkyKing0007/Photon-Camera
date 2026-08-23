@@ -183,28 +183,30 @@ manifest "$AFTER" "$OUT/26532_pre_gradle_audited_runtime.sha256"
 pass "version increment + pre-Gradle candidate freeze complete"
 
 echo "=== 26532 GATE 4B: restore exact pinned native dependencies inherited from successful 26531 ==="
+# V1.4: restore the exact successful-26531 vendor checkout procedure. The prior V1.1/V1.3
+# failures came from an invalid invented libultrahdr/CMakeLists.txt sentinel; upstream
+# libultrahdr intentionally has no top-level CMakeLists.txt. Use the same source files
+# that successful 26531 CMake itself requires, then verify the complete pinned manifest.
 rm -rf "$BJ"; git init -q "$BJ"
 git -C "$BJ" remote add origin https://github.com/bjzhou/PhotonCamera.git
+git -C "$BJ" config core.sparseCheckout true
+mkdir -p "$BJ/.git/info"
+cat > "$BJ/.git/info/sparse-checkout" <<'SPARSE'
+/app/src/main/cpp/libjpeg-turbo/
+/app/src/main/cpp/libultrahdr/
+SPARSE
 git -C "$BJ" fetch --depth=1 origin "$BJZHOU_VENDOR_HEAD"
-FETCHED_VENDOR_HEAD="$(git -C "$BJ" rev-parse FETCH_HEAD)"
-[[ "$FETCHED_VENDOR_HEAD" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor FETCH_HEAD drift"
-# V1.2: avoid sparse-checkout materialization ambiguity. Prove both exact trees exist
-# in the pinned commit, then extract only those two paths directly from that commit tree.
-git -C "$BJ" cat-file -e "$FETCHED_VENDOR_HEAD:app/src/main/cpp/libjpeg-turbo/CMakeLists.txt" \
-  || fail "pinned commit does not contain libjpeg-turbo/CMakeLists.txt"
-git -C "$BJ" cat-file -e "$FETCHED_VENDOR_HEAD:app/src/main/cpp/libultrahdr/CMakeLists.txt" \
-  || fail "pinned commit does not contain libultrahdr/CMakeLists.txt"
-git -C "$BJ" archive "$FETCHED_VENDOR_HEAD" -- \
-  app/src/main/cpp/libjpeg-turbo \
-  app/src/main/cpp/libultrahdr | tar -x -C "$BJ"
+git -C "$BJ" checkout -q --detach FETCH_HEAD
+[[ "$(git -C "$BJ" rev-parse HEAD)" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor checkout drift"
 THIRD="$AFTER/app/src/main/cpp/third_party_26507"
 rm -rf "$THIRD"; mkdir -p "$THIRD"
 cp -a "$BJ/app/src/main/cpp/libjpeg-turbo" "$THIRD/libjpeg-turbo"
 cp -a "$BJ/app/src/main/cpp/libultrahdr" "$THIRD/libultrahdr"
 [[ -f "$THIRD/libjpeg-turbo/CMakeLists.txt" ]] || fail "26507 pinned libjpeg-turbo source missing before Gradle"
-[[ -f "$THIRD/libultrahdr/CMakeLists.txt" ]] || fail "26507 pinned libultrahdr source missing before Gradle"
+[[ -f "$THIRD/libultrahdr/ultrahdr_api.h" ]] || fail "26507 pinned libultrahdr root API missing before Gradle"
+[[ -f "$THIRD/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "26507 pinned libultrahdr core source missing before Gradle"
 ( cd "$THIRD" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26532_vendor_manifest_check_prebuild.txt"
-pass "exact 26507 native vendor dependencies restored + hash-verified before Gradle"
+pass "exact successful-26531 native vendor checkout + full manifest verified before Gradle"
 
 echo "=== 26532 GATE 5: install exact candidate into disposable Actions workspace + compile ==="
 rm -rf "$ROOT/app/src/main"
@@ -234,7 +236,8 @@ assert_cpp_deps_exact "$ROOT" pre
 audited_runtime_manifest "$ROOT" "$OUT/26532_installed_pre_gradle_audited_runtime.sha256"
 cmp -s "$OUT/26532_pre_gradle_audited_runtime.sha256" "$OUT/26532_installed_pre_gradle_audited_runtime.sha256" || fail "installed runtime differs before Gradle"
 [[ -f "$ROOT/app/src/main/cpp/third_party_26507/libjpeg-turbo/CMakeLists.txt" ]] || fail "pinned libjpeg-turbo missing immediately before Gradle"
-[[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/CMakeLists.txt" ]] || fail "pinned libultrahdr missing immediately before Gradle"
+[[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/ultrahdr_api.h" ]] || fail "pinned libultrahdr root API missing immediately before Gradle"
+[[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "pinned libultrahdr core source missing immediately before Gradle"
 ( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26532_installed_vendor_manifest_check_prebuild.txt"
 
 chmod +x ./gradlew
