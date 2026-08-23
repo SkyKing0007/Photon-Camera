@@ -1,0 +1,2388 @@
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+index 750fcdd..0e35b52 100644
+--- a/app/src/main/cpp/CMakeLists.txt
++++ b/app/src/main/cpp/CMakeLists.txt
+@@ -265,7 +265,7 @@ target_include_directories(motionv2jpeg PRIVATE
+     ${IRIS26507_UHDR}
+     ${IRIS26507_UHDR}/lib/include
+     ${CMAKE_CURRENT_SOURCE_DIR})
+-target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static iris26507-ultrahdr log jnigraphics android z)
++target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static jpeg-static iris26507-ultrahdr log jnigraphics android z)
+ 
+ # IRIS_26512_MGC1271_ISOLATED_NATIVE_OWNER
+ add_subdirectory(mgc1271_upstream)
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index ae3304f..c4b9dd7 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -6,6 +6,13 @@
+ #include <cstdio>
+ #include <string>
+ #include <turbojpeg.h>
++#include <jpeglib.h>
++#include <cmath>
++#include <vector>
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ #include "motionv2_jpeg_r_encoder.h"
+ #define TAG "MotionV2Jpeg444"
+ /* IRIS_26513_FAST_HUFFMAN: entropy-table optimization disabled; quantization, 4:4:4 sampling and pixels unchanged. */
+@@ -13,6 +20,66 @@ namespace { struct U{JNIEnv*e;jstring s;const char*c;U(JNIEnv*e,jstring s):e(e),
+ bool write(const char*p,const unsigned char*d,size_t n){FILE*f=fopen(p,"wb");if(!f)return false;size_t w=fwrite(d,1,n,f);int a=fflush(f),b=fclose(f);return w==n&&a==0&&b==0;}
+ bool f3(JNIEnv*e,jfloatArray a,std::array<float,3>*o){if(!a||e->GetArrayLength(a)!=3)return false;e->GetFloatArrayRegion(a,0,3,o->data());return !e->ExceptionCheck();}}
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);if(!h){AndroidBitmap_unlockPixels(e,bitmap);return JNI_FALSE;}int q=std::clamp((int)quality,1,100);bool cfg=tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,TJSAMP_444)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,0)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,TJPF_RGBA,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
++
++namespace {
++constexpr float kIris26532DetailLog2Range = 0.75f;
++inline float clampf(float v,float lo,float hi){return std::max(lo,std::min(hi,v));}
++inline float srgbToLinear(float x){x=clampf(x,0.f,1.f);return x<=0.04045f?x/12.92f:std::pow((x+0.055f)/1.055f,2.4f);}
++inline float linearToSrgb(float x){x=std::max(x,0.f);return x<=0.0031308f?12.92f*x:1.055f*std::pow(x,1.f/2.4f)-0.055f;}
++inline float detailLog2Q8(const uint8_t*detail,int w,int h,float x,float y){
++    x=clampf(x,0.f,(float)std::max(0,w-1));y=clampf(y,0.f,(float)std::max(0,h-1));
++    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);
++    float fx=x-x0,fy=y-y0;
++    auto d=[&](int px,int py){float n=(float)detail[(size_t)py*w+px]/255.f;return (n*2.f-1.f)*kIris26532DetailLog2Range;};
++    float a=d(x0,y0)+(d(x1,y0)-d(x0,y0))*fx,b=d(x0,y1)+(d(x1,y1)-d(x0,y1))*fx;
++    return a+(b-a)*fy;
++}
++inline void bilinearBitmap(const uint8_t*base,int bw,int bh,int stride,float x,float y,float*rgb){
++    x=clampf(x,0.f,(float)std::max(0,bw-1)); y=clampf(y,0.f,(float)std::max(0,bh-1));
++    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,bw-1),y1=std::min(y0+1,bh-1);float fx=x-x0,fy=y-y0;
++    const uint8_t*p00=base+(size_t)y0*stride+x0*4,*p10=base+(size_t)y0*stride+x1*4,*p01=base+(size_t)y1*stride+x0*4,*p11=base+(size_t)y1*stride+x1*4;
++    for(int c=0;c<3;c++){float a=p00[c]+(p10[c]-p00[c])*fx,b=p01[c]+(p11[c]-p01[c])*fx;rgb[c]=(a+(b-a)*fy)/255.f;}
++}
++/* Map a final-oriented native pixel back to the unrotated MotionV2Render output. This mirrors
++ * addwatermark_rotate.glsl's crop/rotation geometry without materializing a 50 MP bitmap. */
++inline void finalToUnrotated(float bx,float by,int rawW,int rawH,int cropW,int cropH,int rotation,bool mirror,float*outX,float*outY){
++    float x=bx,y=by;
++    switch(rotation){
++        case 90: { // shader rotate=3
++            float sx=y; float sy=(float)rawH-x;
++            x=sx; y=sy; break;
++        }
++        case 180: { x=(float)rawW-x; y=(float)rawH-y; break; }
++        case 270: { // shader rotate=1
++            float xx=x+(float)(rawH-cropH); if(mirror) xx=(float)cropH-xx;
++            float sx=(float)rawW-y; float sy=xx; x=sx; y=sy; return;
++        }
++        default: { y+=(float)(rawH-cropH); if(mirror)y=(float)rawH-y; break; }
++    }
++    if(rotation==90){ if(mirror){/* horizontal output mirror maps to vertical source flip */ y=(float)rawH-y;} }
++    else if(rotation==180){ if(mirror)y=(float)rawH-y; }
++    *outX=x;*outY=y;
++}
++}
++extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeSuperResNative(
++        JNIEnv*e,jclass,jobject bitmap,jstring detailPath,jint detailW,jint detailH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,jstring path,jint quality){
++    AndroidBitmapInfo info{};if(!bitmap||!detailPath||!path||detailW<=0||detailH<=0||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;
++    U ud(e,detailPath);if(!ud.c)return JNI_FALSE;int fd=open(ud.c,O_RDONLY);if(fd<0)return JNI_FALSE;struct stat st{};size_t expected=(size_t)detailW*(size_t)detailH;
++    if(fstat(fd,&st)!=0||(size_t)st.st_size!=expected){close(fd);return JNI_FALSE;}void*m=mmap(nullptr,expected,PROT_READ,MAP_PRIVATE,fd,0);close(fd);if(m==MAP_FAILED)return JNI_FALSE;const uint8_t*detail=(const uint8_t*)m;
++    void*pixels=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&pixels)!=ANDROID_BITMAP_RESULT_SUCCESS||!pixels){munmap(m,expected);return JNI_FALSE;}U u(e,path);if(!u.c){AndroidBitmap_unlockPixels(e,bitmap);munmap(m,expected);return JNI_FALSE;}
++    FILE*f=fopen(u.c,"wb");if(!f){AndroidBitmap_unlockPixels(e,bitmap);munmap(m,expected);return JNI_FALSE;}
++    jpeg_compress_struct c{};jpeg_error_mgr jerr{};c.err=jpeg_std_error(&jerr);jpeg_create_compress(&c);jpeg_stdio_dest(&c,f);
++    int outW=(int)info.width*2,outH=(int)info.height*2;c.image_width=outW;c.image_height=outH;c.input_components=3;c.in_color_space=JCS_RGB;jpeg_set_defaults(&c);jpeg_set_quality(&c,std::clamp((int)quality,1,100),TRUE);
++    for(int k=0;k<c.num_components;k++){c.comp_info[k].h_samp_factor=1;c.comp_info[k].v_samp_factor=1;}
++    jpeg_start_compress(&c,TRUE);std::vector<uint8_t>row((size_t)outW*3);const uint8_t*base=(const uint8_t*)pixels;float z=std::max(1.f,(float)residualZoom);
++    while(c.next_scanline<c.image_height){int oy=(int)c.next_scanline;float by=((float)oy+0.5f)*0.5f-0.5f;for(int ox=0;ox<outW;ox++){float bx=((float)ox+0.5f)*0.5f-0.5f;float rgb[3];bilinearBitmap(base,(int)info.width,(int)info.height,(int)info.stride,bx,by,rgb);
++            float ux=0.f,uy=0.f;finalToUnrotated(bx,by,rawW,rawH,cropW,cropH,rotation,mirror==JNI_TRUE,&ux,&uy);float cx=((float)rawW-1.f)*0.5f,cy=((float)rawH-1.f)*0.5f;float sx=cx+(ux-cx)/z,sy=cy+(uy-cy)/z;float dx=2.f*(sx+0.5f)-0.5f,dy=2.f*(sy+0.5f)-0.5f;float ld=detailLog2Q8(detail,detailW,detailH,dx,dy);
++            float lin[3]={srgbToLinear(rgb[0]),srgbToLinear(rgb[1]),srgbToLinear(rgb[2])};float y=0.2126f*lin[0]+0.7152f*lin[1]+0.0722f*lin[2];float shadow=clampf((y-0.015f)/0.085f,0.f,1.f),high=1.f-clampf((y-0.75f)/0.23f,0.f,1.f);float factor=std::exp2(ld*shadow*high);
++            for(int k=0;k<3;k++)row[(size_t)ox*3+k]=(uint8_t)std::lround(clampf(linearToSrgb(lin[k]*factor),0.f,1.f)*255.f);
++        }JSAMPROW rp=row.data();jpeg_write_scanlines(&c,&rp,1);}
++    jpeg_finish_compress(&c);jpeg_destroy_compress(&c);int flush=fflush(f),closeRc=fclose(f);AndroidBitmap_unlockPixels(e,bitmap);munmap(m,expected);return (flush==0&&closeRc==0)?JNI_TRUE:JNI_FALSE;
++}
++
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_encodeGainmapNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||(i.format!=ANDROID_BITMAP_FORMAT_A_8&&i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888))return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);int pf=i.format==ANDROID_BITMAP_FORMAT_A_8?TJPF_GRAY:TJPF_RGBA;int ss=i.format==ANDROID_BITMAP_FORMAT_A_8?TJSAMP_GRAY:TJSAMP_444;int q=std::clamp((int)quality,1,100);bool cfg=h&&tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,ss)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,0)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,pf,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);if(h)tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_packageJpegRNative(JNIEnv*e,jclass,jstring b,jstring g,jstring o,jint gamut,jfloatArray rmin,jfloatArray rmax,jfloatArray gamma,jfloatArray es,jfloatArray eh,jfloat ds,jfloat dh,jboolean use){U ub(e,b),ug(e,g),uo(e,o);if(!ub.c||!ug.c||!uo.c)return JNI_FALSE;iris26507::GainmapMetadata m;if(!f3(e,rmin,&m.ratioMin)||!f3(e,rmax,&m.ratioMax)||!f3(e,gamma,&m.gamma)||!f3(e,es,&m.epsilonSdr)||!f3(e,eh,&m.epsilonHdr))return JNI_FALSE;m.displaySdr=ds;m.displayHdr=dh;m.useBaseColorSpace=use==JNI_TRUE;std::string err;return iris26507::packageJpegR(ub.c,ug.c,uo.c,gamut,m,&err)?JNI_TRUE:JNI_FALSE;}
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_isJpegRNative(JNIEnv*e,jclass,jstring p){U u(e,p);return u.c&&iris26507::isJpegR(u.c)?JNI_TRUE:JNI_FALSE;}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+index bc8ddaa..2984c6a 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+@@ -456,7 +456,18 @@ internal object GlesIris26521SpatialRgbShaders {
+             vec2 uv = gl_FragCoord.xy / vec2(uRejectionSize);
+             vec2 flowUv = uv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec4 flow = texture(uFlow, flowUv);
+-            vec2 warpedUv = mirrorUv(uv + flow.xy);
++            /* IRIS_26532_REJECTION_REAL_SENSOR_SUPPORT
++             * Rejection must validate the same physical auxiliary support that merge can sample.
++             * Do not mirror nonexistent guide pixels back into the sensor.
++             */
++            vec2 warpedUv = uv + flow.xy;
++            vec2 supportMargin = 0.5 / vec2(max(uGuideSize, ivec2(1)));
++            if (any(lessThan(warpedUv, supportMargin)) ||
++                any(greaterThan(warpedUv, vec2(1.0) - supportMargin))) {
++                oReverseWeight = 1.0;
++                oPixelDifference = 0.0;
++                return;
++            }
+             float unblocker = texture(uUnblocker, uv * uUnblockerScale).r;
+             if (flow.z < uUnblockerReductionThreshold) unblocker = 0.0;
+             bool motionPrior = flow.z > uExtraMotionRobustnessMotionThreshold;
+@@ -1145,11 +1156,6 @@ internal object GlesIris26521SpatialRgbShaders {
+         layout(location = 1) out float oInpaintingMask;
+         layout(location = 2) out float oUltrashortClippingMask;
+ 
+-        vec2 mirrorUv(vec2 uv) {
+-            uv = mod(uv, 2.0);
+-            return mix(uv, 2.0 - uv, greaterThan(uv, vec2(1.0)));
+-        }
+-
+         void main() {
+             ivec2 p = clamp(
+                 ivec2(gl_FragCoord.xy),
+@@ -1158,11 +1164,21 @@ internal object GlesIris26521SpatialRgbShaders {
+             );
+             vec2 uv = gl_FragCoord.xy / vec2(uSize);
+             vec2 flow = texture(uFlow, uv).xy;
++            vec2 ultrashortUv = uv + flow;
++            bool physicalUltrashort = all(greaterThanEqual(ultrashortUv, vec2(0.0))) &&
++                all(lessThanEqual(ultrashortUv, vec2(1.0)));
+             vec3 base = round(
+                 65535.0 * clamp(texelFetch(uBaseFrame, p, 0).rgb, 0.0, 1.0)
+             ) / 65535.0;
++            if (!physicalUltrashort) {
++                /* IRIS_26532_BENTO_REAL_SENSOR_SUPPORT: absent Short evidence is zero evidence. */
++                oAdjustedHighlightMask = 0.0;
++                oInpaintingMask = 0.0;
++                oUltrashortClippingMask = 0.0;
++                return;
++            }
+             vec3 ultrashort = clamp(
+-                texture(uUltrashortFrame, mirrorUv(uv + flow)).rgb,
++                texture(uUltrashortFrame, ultrashortUv).rgb,
+                 0.0,
+                 1.0
+             );
+@@ -1300,9 +1316,13 @@ internal object GlesIris26521SpatialRgbShaders {
+             );
+         }
+ 
++        bool rawInside(ivec2 p) {
++            return all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, uRawSize));
++        }
++
+         float gainedRaw(ivec2 globalPixel) {
++            // IRIS_26532_PHYSICAL_SENSOR_SUPPORT: callers must prove this is a real sensor site.
+             int channel = canonicalChannel(globalPixel);
+-            globalPixel = clampRawPixelToPhase(globalPixel);
+             return float(texelFetch(uRaw, globalPixel - uRawTextureOrigin, 0).r) *
+                 uGains[channel] +
+                 uBlackLevelsTimesGains[channel];
+@@ -1322,10 +1342,10 @@ internal object GlesIris26521SpatialRgbShaders {
+             return texelFetch(uAlignment, clamp(tile, ivec2(0), size - ivec2(1)), 0).xy;
+         }
+ 
+-        vec2 interpolatedAlignment(vec2 quadPosition) {
++        vec3 interpolatedAlignmentAndConfidence(vec2 quadPosition) {
+             ivec2 tile = ivec2(floor(quadPosition / 8.0));
+             vec2 baseFlow = alignmentAt(tile);
+-            if (uInterpolationFlowTolerance <= 0.0) return baseFlow;
++            if (uInterpolationFlowTolerance <= 0.0) return vec3(baseFlow, 1.0);
+             vec2 offsetWithinTile = quadPosition - vec2(tile * 8);
+             bool leftHalf = offsetWithinTile.x <= 4.0;
+             bool topHalf = offsetWithinTile.y <= 4.0;
+@@ -1336,21 +1356,22 @@ internal object GlesIris26521SpatialRgbShaders {
+             vec2 flow10 = alignmentAt(tile00 + ivec2(1, 0));
+             vec2 flow01 = alignmentAt(tile00 + ivec2(0, 1));
+             vec2 flow11 = alignmentAt(tile00 + ivec2(1, 1));
+-            float threshold = 8.0 * uInterpolationFlowTolerance;
+-            bool cancelInterpolation =
+-                any(greaterThanEqual(abs(flow00 - baseFlow), vec2(threshold))) ||
+-                any(greaterThanEqual(abs(flow10 - baseFlow), vec2(threshold))) ||
+-                any(greaterThanEqual(abs(flow01 - baseFlow), vec2(threshold))) ||
+-                any(greaterThanEqual(abs(flow11 - baseFlow), vec2(threshold)));
+-            if (cancelInterpolation) return baseFlow;
++            float threshold = max(8.0 * uInterpolationFlowTolerance, 1.0e-6);
++            float disagreement = max(
++                max(max(abs(flow00.x-baseFlow.x), abs(flow00.y-baseFlow.y)),
++                    max(abs(flow10.x-baseFlow.x), abs(flow10.y-baseFlow.y))),
++                max(max(abs(flow01.x-baseFlow.x), abs(flow01.y-baseFlow.y)),
++                    max(abs(flow11.x-baseFlow.x), abs(flow11.y-baseFlow.y)))
++            );
++            /* IRIS_26532_CONTINUOUS_GEOMETRY_CONFIDENCE
++             * No threshold jump to a constant tile vector. Neighbor disagreement smoothly
++             * fades interpolation and, below, the auxiliary contribution itself.
++             */
++            float confidence = 1.0 - smoothstep(0.50 * threshold, threshold, disagreement);
+             float ux = quadPosition.x / 8.0 - (float(tx0) + 0.5);
+             float uy = quadPosition.y / 8.0 - (float(ty0) + 0.5);
+-            return mix(mix(flow00, flow10, ux), mix(flow01, flow11, ux), uy);
+-        }
+-
+-        vec2 mirrorUv(vec2 uv) {
+-            uv = mod(uv, 2.0);
+-            return mix(uv, 2.0 - uv, greaterThan(uv, vec2(1.0)));
++            vec2 interpolated = mix(mix(flow00, flow10, ux), mix(flow01, flow11, ux), uy);
++            return vec3(mix(baseFlow, interpolated, confidence), confidence);
+         }
+ 
+         float kernelWeight(vec2 pixelOffset, vec3 covariance) {
+@@ -1395,9 +1416,17 @@ internal object GlesIris26521SpatialRgbShaders {
+             ivec2 outputPixel = localOutput + uOutputOrigin;
+             vec2 referenceRaw = (vec2(outputPixel) + vec2(0.5)) *
+                 vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);
+-            vec2 sourceRaw = referenceRaw + 2.0 * interpolatedAlignment(referenceRaw * 0.5);
+-            vec2 sourceUv = mirrorUv((sourceRaw + vec2(0.5)) / vec2(uRawSize));
+-            vec3 packedCovariance = texture(uCovariance, sourceUv).xyz;
++            vec3 flowAndConfidence = interpolatedAlignmentAndConfidence(referenceRaw * 0.5);
++            vec2 sourceRaw = referenceRaw + 2.0 * flowAndConfidence.xy;
++            bool sourceCenterInside = all(greaterThanEqual(sourceRaw, vec2(-0.5))) &&
++                all(lessThan(sourceRaw, vec2(uRawSize) - vec2(0.5)));
++            if (!sourceCenterInside) {
++                oColorAndRWeight = vec4(0.0);
++                oGbWeights = vec4(0.0);
++                return;
++            }
++            vec2 sourceUv = (sourceRaw + vec2(0.5)) / vec2(uRawSize);
++            vec3 packedCovariance = texture(uCovariance, clamp(sourceUv, vec2(0.0), vec2(1.0))).xyz;
+             vec3 covariance = vec3(
+                 packedCovariance.xy * uCovRangeRg.yw + uCovRangeRg.xz,
+                 packedCovariance.z * uCovRangeB.y + uCovRangeB.x
+@@ -1410,6 +1439,7 @@ internal object GlesIris26521SpatialRgbShaders {
+             for (int y = -1; y <= 1; ++y) {
+                 for (int x = -1; x <= 1; ++x) {
+                     ivec2 p = anchor + ivec2(x, y);
++                    if (!rawInside(p)) continue;
+                     int channel = canonicalChannel(p);
+                     if (channel != 1 && channel != 2) continue;
+                     float spatialWeight = kernelWeight(
+@@ -1426,6 +1456,7 @@ internal object GlesIris26521SpatialRgbShaders {
+             for (int y = -1; y <= 1; ++y) {
+                 for (int x = -1; x <= 1; ++x) {
+                     ivec2 p = anchor + ivec2(x, y);
++                    if (!rawInside(p)) continue;
+                     int channel = canonicalChannel(p);
+                     if (channel == 1 || channel == 2) continue;
+                     float spatialWeight = kernelWeight(
+@@ -1446,6 +1477,7 @@ internal object GlesIris26521SpatialRgbShaders {
+                 texture(uFrameWeight, clamp(weightUv, vec2(0.0), vec2(1.0))).r : 1.0;
+             frameWeight = clamp(frameWeight, 0.0, 1.0);
+             frameWeight *= uGlobalFrameWeight;
++            frameWeight *= clamp(flowAndConfidence.z, 0.0, 1.0);
+             vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);
+             oColorAndRWeight = vec4(semanticSums * frameWeight, weights.r * frameWeight);
+             oGbWeights = vec4(
+@@ -1469,13 +1501,20 @@ internal object GlesIris26521SpatialRgbShaders {
+             "uniform ivec2 uOutputSize;\nuniform float uReconstructionZoom;\nuniform float uLumaTemporalScale;",
+         )
+         .replace(
+-            "vec2 referenceRaw = (vec2(outputPixel) + vec2(0.5)) *\n                vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);",
+-            "vec2 fullRaw = (vec2(outputPixel) + vec2(0.5)) *\n                vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);\n            vec2 rawCenter = (vec2(uRawSize) - vec2(1.0)) * 0.5;\n            vec2 referenceRaw = rawCenter + (fullRaw - rawCenter) / max(uReconstructionZoom, 1.0);",
++            "    vec2 referenceRaw = (vec2(outputPixel) + vec2(0.5)) *\n        vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);",
++            "    vec2 fullRaw = (vec2(outputPixel) + vec2(0.5)) *\n        vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);\n    vec2 rawCenter = (vec2(uRawSize) - vec2(1.0)) * 0.5;\n    vec2 referenceRaw = rawCenter + (fullRaw - rawCenter) / max(uReconstructionZoom, 1.0);",
+         )
+         .replace(
+-            "frameWeight *= uGlobalFrameWeight;\n            vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n            oColorAndRWeight = vec4(semanticSums * frameWeight, weights.r * frameWeight);\n            oGbWeights = vec4(\n                weights.gb * frameWeight,\n                directionMoment * weights.r * frameWeight\n            );",
+-            "frameWeight *= uGlobalFrameWeight;\n            float lumaFrameWeight = frameWeight * clamp(uLumaTemporalScale, 0.0, 1.0);\n            vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n            oColorAndRWeight = vec4(\n                semanticSums.r * lumaFrameWeight,\n                semanticSums.g * frameWeight,\n                semanticSums.b * frameWeight,\n                weights.r * lumaFrameWeight\n            );\n            oGbWeights = vec4(\n                weights.gb * frameWeight,\n                directionMoment * weights.r * lumaFrameWeight\n            );",
+-        )
++            "    frameWeight *= uGlobalFrameWeight;\n    frameWeight *= clamp(flowAndConfidence.z, 0.0, 1.0);\n    vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n    oColorAndRWeight = vec4(semanticSums * frameWeight, weights.r * frameWeight);\n    oGbWeights = vec4(\n        weights.gb * frameWeight,\n        directionMoment * weights.r * frameWeight\n    );",
++            "    frameWeight *= uGlobalFrameWeight;\n    frameWeight *= clamp(flowAndConfidence.z, 0.0, 1.0);\n    float lumaFrameWeight = frameWeight * clamp(uLumaTemporalScale, 0.0, 1.0);\n    vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n    oColorAndRWeight = vec4(\n        semanticSums.r * lumaFrameWeight,\n        semanticSums.g * frameWeight,\n        semanticSums.b * frameWeight,\n        weights.r * lumaFrameWeight\n    );\n    oGbWeights = vec4(\n        weights.gb * frameWeight,\n        directionMoment * weights.r * lumaFrameWeight\n    );",
++        ).also { shader ->
++            check(shader.contains("uReconstructionZoom"))
++            check(shader.contains("uLumaTemporalScale"))
++            check(shader.contains("lumaFrameWeight"))
++            check(shader.contains("rawCenter"))
++            check(shader.contains("referenceRaw = rawCenter"))
++            check(shader.contains("flowAndConfidence.z"))
++        }
+ 
+     val normalizeRgb16 = """
+         #version 300 es
+@@ -1548,6 +1587,53 @@ internal object GlesIris26521SpatialRgbShaders {
+             "vec2 fullRaw = (vec2(outputPixel) + vec2(0.5)) * vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);\n                vec2 rawCenter = (vec2(uRawSize) - vec2(1.0)) * 0.5;\n                vec2 referenceRaw = rawCenter + (fullRaw - rawCenter) / max(uReconstructionZoom, 1.0);\n                vec2 uv = (referenceRaw + vec2(0.5)) / vec2(uRawSize);",
+         )
+ 
++
++
++    /* IRIS_26532_STREAMED_2X_TO_NATIVE_CHROMA
++     * The high-resolution normalized Spatial band is the SR evidence. Downsample only the
++     * base RGB carrier to the native grid before the existing Iris chroma/tone chain. Direction
++     * moments are decoded, averaged and repacked rather than averaging packed alpha integers.
++     */
++    val downsampleRgb16SuperRes2x = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        precision highp usampler2D;
++        uniform highp usampler2D uHighResBand;
++        uniform ivec2 uTargetOrigin;
++        layout(location = 0) out highp uvec4 oRgb16;
++
++        float decodeSnorm8(uint x) {
++            int v = int(x & 255u);
++            if (v > 127) v -= 256;
++            return clamp(float(v) / 127.0, -1.0, 1.0);
++        }
++        uint encodeSnorm8(float value) {
++            int encoded = int(round(clamp(value, -1.0, 1.0) * 127.0));
++            return uint(encoded & 0xFF);
++        }
++        vec2 decodeMoment(uint packed) {
++            return vec2(decodeSnorm8(packed), decodeSnorm8(packed >> 8u));
++        }
++        uint encodeMoment(vec2 moment) {
++            return encodeSnorm8(moment.x) | (encodeSnorm8(moment.y) << 8u);
++        }
++        void main() {
++            ivec2 nativeLocal = ivec2(gl_FragCoord.xy) - uTargetOrigin;
++            ivec2 q = nativeLocal * 2;
++            uvec4 a = texelFetch(uHighResBand, q, 0);
++            uvec4 b = texelFetch(uHighResBand, q + ivec2(1, 0), 0);
++            uvec4 c = texelFetch(uHighResBand, q + ivec2(0, 1), 0);
++            uvec4 d = texelFetch(uHighResBand, q + ivec2(1, 1), 0);
++            uvec3 rgb = (a.rgb + b.rgb + c.rgb + d.rgb + uvec3(2u)) / 4u;
++            vec2 moment = 0.25 * (
++                decodeMoment(a.a) + decodeMoment(b.a) +
++                decodeMoment(c.a) + decodeMoment(d.a)
++            );
++            oRgb16 = uvec4(rgb, encodeMoment(moment));
++        }
++    """.trimIndent()
++
+     /** Float variant used only for the direct CPU black-box boundary. */
+     val normalizeRgbFloat = """
+         #version 300 es
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+index a0cd3c6..75265cf 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+@@ -15,10 +15,15 @@ import com.hinnka.mycamera.utils.LargeDirectBuffer
+ import com.hinnka.mycamera.utils.PLog
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
++import java.io.BufferedOutputStream
++import java.io.File
++import java.io.FileOutputStream
+ import kotlin.math.ceil
+ import kotlin.math.exp
+ import kotlin.math.max
+ import kotlin.math.sqrt
++import kotlin.math.ln
++import kotlin.math.round
+ 
+ /**
+  * Independent GLES MGC Spatial RAW merge pipeline.
+@@ -57,6 +62,9 @@ internal class GlesIris26521SpatialRgbStacker(
+     private val gpuLinearRgbStorage: GpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16UI,
+     /* IRIS_26520_V4_LIVE_MGC_NORMAL_DNG_REQUEST */
+     private val exportNormalStackedDng: Boolean = false,
++    /* IRIS_26532_STREAMED_SUPERRES_TEMP_OWNER */
++    private val superResTempDir: File? = null,
++    private val superResWriteLinearRaw: Boolean = false,
+ ) {
+     private data class TextureLevel(
+         val texture: Int,
+@@ -128,6 +136,10 @@ internal class GlesIris26521SpatialRgbStacker(
+         val gpuTexture: Int,
+         val diagnosticFixed16: PreparedTextureReadback?,
+         val completionTimeline: GpuStackCompletionTimeline?,
++        val superResDetailPath: String? = null,
++        val superResLinearRawPath: String? = null,
++        val superResWidth: Int = 0,
++        val superResHeight: Int = 0,
+     )
+ 
+     /**
+@@ -363,6 +375,14 @@ internal class GlesIris26521SpatialRgbStacker(
+     } else {
+         height
+     }
++    /* IRIS_26532_MEMORY_SAFE_STREAMED_2X
++     * 2x is reconstructed only in bands. The persistent post-merge RGB carrier stays at native
++     * dimensions, so 50 MP never multiplies the full-frame chroma/tone surface count.
++     */
++    private val iris26532StreamingOutput2x = outputMode == MgcSpatialOutputMode.RGB &&
++        normalizedOutputScale >= 1.999f
++    private val resultOutputWidth = if (iris26532StreamingOutput2x) width else outputWidth
++    private val resultOutputHeight = if (iris26532StreamingOutput2x) height else outputHeight
+     private val sensorWhiteLevel = max(1, whiteLevel).toFloat()
+     // RawMetadata has already converted positional Camera2 black levels to R, Gr, Gb, B.
+     private val canonicalBlackLevel = FloatArray(4) { channel ->
+@@ -448,10 +468,16 @@ internal class GlesIris26521SpatialRgbStacker(
+     /* IRIS_26530_LOW_ZOOM_LEGACY_SHADER_ISOLATION */
+     private var mergeRgbSuperResProgram = 0
+     private var normalizeRgbSuperResProgram = 0
++    private var downsampleRgb16SuperRes2xProgram = 0
+     private var iris26530LumaAuxScale = 1f
+     private var iris26530LumaTargetFrames = 0f
+-    private val iris26530SuperResEnabled = outputMode == MgcSpatialOutputMode.RGB &&
+-        displayedGlobalZoom >= 8f && reconstructionZoom > 1.0001f
++    /* IRIS_26532_20X_CROP_AWARE_SR
++     * Geometry SR may operate below 8x; the proven 26530 GCam luma-stack tuning remains >=8x.
++     */
++    private val iris26532CropAwareSrEnabled = outputMode == MgcSpatialOutputMode.RGB &&
++        reconstructionZoom > 1.0001f
++    private val iris26530GcamLumaTuningEnabled = iris26532CropAwareSrEnabled &&
++        displayedGlobalZoom >= 8f
+     private var normalizeBayerProgram = 0
+     /* IRIS_26522_DNG_EFFECTIVE_SUPPORT_Q8 */
+     private var normalDngSupportProgram = 0
+@@ -556,6 +582,10 @@ internal class GlesIris26521SpatialRgbStacker(
+         var exportedBayerTexture = 0
+         var exportedRgbTexture = 0
+         var exportedRgbCompletionTimeline: GpuStackCompletionTimeline? = null
++        var superResDetailPath: String? = null
++        var superResLinearRawPath: String? = null
++        var superResWidth = 0
++        var superResHeight = 0
+         var strengthAlignmentHostBuffer: ByteBuffer? = null
+         var strengthRejectionHostBuffer: ByteBuffer? = null
+         var rgbDiagnosticHostBuffer: ByteBuffer? = null
+@@ -1227,7 +1257,7 @@ internal class GlesIris26521SpatialRgbStacker(
+             }
+             val spatialNoiseFrameCount =
+                 1 + (if (bentoAccepted) 1 else 0) + temporalMergeCount
+-            if (iris26530SuperResEnabled) {
++            if (iris26530GcamLumaTuningEnabled) {
+                 iris26530LumaTargetFrames = iris26530TargetEffectiveLumaFrames(displayedGlobalZoom)
+                     .coerceAtMost(spatialNoiseFrameCount.toFloat())
+                 iris26530LumaAuxScale = iris26530AuxiliaryLumaScale(
+@@ -1733,6 +1763,10 @@ internal class GlesIris26521SpatialRgbStacker(
+                 cpuOutput = rgbOutput.cpuBuffer
+                 exportedRgbTexture = rgbOutput.gpuTexture
+                 exportedRgbCompletionTimeline = rgbOutput.completionTimeline
++                superResDetailPath = rgbOutput.superResDetailPath
++                superResLinearRawPath = rgbOutput.superResLinearRawPath
++                superResWidth = rgbOutput.superResWidth
++                superResHeight = rgbOutput.superResHeight
+                 rgbDiagnosticHostBuffer = rgbOutput.diagnosticFixed16?.cpuBuffer
+                 readyStrengthCapture?.let { capture ->
+                     val startNs = System.nanoTime()
+@@ -1909,7 +1943,7 @@ internal class GlesIris26521SpatialRgbStacker(
+             PLog.i(
+                 TAG,
+                 "MGC Spatial ${outputMode.name} merge complete frames=$mergedFrames " +
+-                    "output=${outputWidth}x$outputHeight " +
++                    "output=${resultOutputWidth}x$resultOutputHeight srEvidence=${superResWidth}x$superResHeight " +
+                     "referenceSnr=${bayerKernelTuning.referenceSnr} " +
+                     "finishRawDenoiseSnr=$finishRawDenoiseSnr " +
+                     "finishRawDenoiseSnrSource=${if (propagatedOutputSnr != null) {
+@@ -1933,8 +1967,8 @@ internal class GlesIris26521SpatialRgbStacker(
+             val rgbOutput = outputMode == MgcSpatialOutputMode.RGB
+             RawStackResult(
+                 fusedBayerBuffer = cpuOutput,
+-                width = outputWidth,
+-                height = outputHeight,
++                width = resultOutputWidth,
++                height = resultOutputHeight,
+                 isNormalizedSensorData = true,
+                 blackLevel = FloatArray(4),
+                 fusedBayerUsesNativeAllocator = cpuOutput != null,
+@@ -1943,14 +1977,14 @@ internal class GlesIris26521SpatialRgbStacker(
+                 } else {
+                     RawStackBufferLayout.CFA
+                 },
+-                inputRowStepSamples = outputWidth * if (rgbOutput) 3 else 1,
++                inputRowStepSamples = resultOutputWidth * if (rgbOutput) 3 else 1,
+                 inputColStepSamples = if (rgbOutput) 3 else 1,
+                 baselineExposureEv = outputExposure.baselineExposureEv,
+                 gpuLinearRgbSource = exportedRgbTexture.takeIf { it != 0 }?.let { textureId ->
+                     GpuLinearRgbSource(
+                         textureId = textureId,
+-                        width = outputWidth,
+-                        height = outputHeight,
++                        width = resultOutputWidth,
++                        height = resultOutputHeight,
+                         samplesPerPixel = 4,
+                         stackCompletionTimeline = exportedRgbCompletionTimeline,
+                         storage = gpuLinearRgbStorage,
+@@ -1979,6 +2013,10 @@ internal class GlesIris26521SpatialRgbStacker(
+                 mgcDenoiseTuningSnr = finishRawDenoiseSnr,
+                 mgcSharpenTuningSnr = bayerKernelTuning.referenceSnr,
+                 mgcSpatialReferenceOnlyDiagnostic = referenceOnly,
++                superResDetailPath = superResDetailPath,
++                superResLinearRawPath = superResLinearRawPath,
++                superResWidth = superResWidth,
++                superResHeight = superResHeight,
+                 normalStackedDngRaw16 = normalStackedDngRaw16,
+                 normalStackedDngFrameCount = normalStackedDngFrameCount,
+                 normalStackedDngNoiseProfile = normalStackedDngNoiseProfile,
+@@ -1991,6 +2029,8 @@ internal class GlesIris26521SpatialRgbStacker(
+                 normalStackedDngNoiseEquivalentSupport = normalStackedDngSupport.noiseEquivalent,
+             )
+         } catch (error: Exception) {
++            runCatching { superResDetailPath?.let { File(it).delete() } }
++            runCatching { superResLinearRawPath?.let { File(it).delete() } }
+             onlineRgbAccumulator?.passWindow?.drain("MGC Spatial merge failure")
+             PLog.e(TAG, "MGC Spatial ${outputMode.name} merge failed", error)
+             null
+@@ -2319,7 +2359,7 @@ internal class GlesIris26521SpatialRgbStacker(
+                 GlesIris26521SpatialRgbShaders.normalizeRgb16,
+                 "mgc_spatial_rgb16ui",
+             )
+-            if (iris26530SuperResEnabled) {
++            if (iris26532CropAwareSrEnabled) {
+                 mergeRgbSuperResProgram = linkProgram(
+                     GlesIris26521SpatialRgbShaders.mergeRgbSuperRes,
+                     "iris26530_spatial_rgb_superres_merge",
+@@ -2337,7 +2377,17 @@ internal class GlesIris26521SpatialRgbStacker(
+                     "mgc_spatial_rgb_chroma_to_rgba16f",
+                 )
+             }
+-            rgbChromaPostprocessor = createRgbChromaPostprocessor().also {
++            if (iris26532StreamingOutput2x) {
++                downsampleRgb16SuperRes2xProgram = linkProgram(
++                    GlesIris26521SpatialRgbShaders.downsampleRgb16SuperRes2x,
++                    "iris26532_streamed_2x_to_native_chroma",
++                )
++            }
++            rgbChromaPostprocessor = createRgbChromaPostprocessor(
++                imageWidth = resultOutputWidth,
++                imageHeight = resultOutputHeight,
++                iirOutputScale = if (iris26532StreamingOutput2x) 1f else normalizedOutputScale,
++            ).also {
+                 it.initPrograms()
+             }
+             packRgbFixed16FallbackProgram = linkProgram(
+@@ -5256,6 +5306,10 @@ internal class GlesIris26521SpatialRgbStacker(
+         diagnosticCapture: StrengthCapture?,
+     ): OnlineRgbAccumulator? {
+         check(outputMode == MgcSpatialOutputMode.RGB)
++        if (iris26532StreamingOutput2x) {
++            PLog.i(TAG, "IRIS_26532_MEMORY_SAFE_STREAMED_2X onlineFullAccumulator=false")
++            return null
++        }
+         val rawBytes = width.toLong() * height * RAW_BYTES_PER_PIXEL
+         val accumulatorBytes = outputWidth.toLong() * outputHeight * 16L
+         val chromaGuideBytes = width.toLong() * height * 2L
+@@ -5520,7 +5574,7 @@ internal class GlesIris26521SpatialRgbStacker(
+                         label = "MGC Spatial RGB IIR-to-float handoff",
+                         checkGlError = ::checkGlError,
+                     )
+-                    createTexture(outputWidth, outputHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++                    createTexture(resultOutputWidth, resultOutputHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+                         .also { target ->
+                             renderRgb16ToFloat(postprocessedUi, target)
+                             GLES30.glDeleteTextures(1, intArrayOf(postprocessedUi), 0)
+@@ -5595,7 +5649,7 @@ internal class GlesIris26521SpatialRgbStacker(
+                     outputWidth = outputWidth,
+                     outputHeight = outputHeight,
+                     flowBounds = frame.flowBounds,
+-                    reconstructionZoom = if (iris26530SuperResEnabled) reconstructionZoom else 1f,
++                    reconstructionZoom = if (iris26532CropAwareSrEnabled) reconstructionZoom else 1f,
+                 )
+                 RgbTileFrameRegion(
+                     frame = frame,
+@@ -5639,7 +5693,11 @@ internal class GlesIris26521SpatialRgbStacker(
+             RAW_BYTES_PER_PIXEL * RGB_RAW_WINDOW_SLOTS
+         val chromaGuideBytes = maximumSourceWidth.toLong() * maximumSourceHeight * 2L
+         val accumulatorBytes = maximumOutputWidth.toLong() * maximumOutputHeight * 16L
+-        val outputStorageBytes = if (exportGpuLinearRgbSource) {
++        val outputStorageBytes = if (iris26532StreamingOutput2x) {
++            // One high-resolution normalization band plus one persistent native-size chroma base.
++            maximumOutputWidth.toLong() * maximumOutputHeight * 8L +
++                resultOutputWidth.toLong() * resultOutputHeight * 8L
++        } else if (exportGpuLinearRgbSource) {
+             outputWidth.toLong() * outputHeight * 8L
+         } else {
+             maximumOutputWidth.toLong() * maximumOutputHeight * 8L
+@@ -5695,6 +5753,7 @@ internal class GlesIris26521SpatialRgbStacker(
+             }
+         }
+         val bandPlan = rgbBandHeightCandidates().asSequence()
++            .filter { maximumBandHeight -> !iris26532StreamingOutput2x || maximumBandHeight <= 256 }
+             .map { maximumBandHeight ->
+                 createRgbBandPlan(
+                     frames = frames,
+@@ -5743,10 +5802,43 @@ internal class GlesIris26521SpatialRgbStacker(
+             GLES30.GL_RGBA16F,
+             GLES30.GL_NEAREST,
+         )
++        val superResNormalizedBandTexture = if (iris26532StreamingOutput2x) {
++            require(outputWidth == width * 2 && outputHeight == height * 2) {
++                "IRIS 26532 fixed Super Res must be exact 2x: ${outputWidth}x$outputHeight vs ${width}x$height"
++            }
++            require(bands.all { (it.outputCore.top and 1) == 0 && (it.outputCore.bottom and 1) == 0 }) {
++                "IRIS 26532 streamed 2x requires even band boundaries"
++            }
++            createTexture(
++                maximumOutputWidth, maximumOutputHeight,
++                GLES30.GL_RGBA16UI, GLES30.GL_NEAREST,
++            )
++        } else 0
++        val superResNativeBands = if (iris26532StreamingOutput2x) {
++            bands.map { band ->
++                MgcSpatialRgbTile(
++                    index = band.index,
++                    outputCore = MgcSpatialRgbRect(
++                        band.outputCore.left / 2, band.outputCore.top / 2,
++                        band.outputCore.right / 2, band.outputCore.bottom / 2,
++                    ),
++                )
++            }
++        } else bands
++        val srDir = if (iris26532StreamingOutput2x) {
++            requireNotNull(superResTempDir) { "IRIS 26532 Super Res temp directory is missing" }
++                .also { require(it.exists() || it.mkdirs()) { "Unable to create Super Res temp directory $it" } }
++        } else null
++        val superResDetailFile = srDir?.let { File.createTempFile("iris26532-detail-", ".q8", it) }
++        val superResLinearRawFile = if (iris26532StreamingOutput2x && superResWriteLinearRaw) {
++            File.createTempFile("iris26532-linearraw-", ".rgb16", srDir)
++        } else null
++        var superResDetailOut: BufferedOutputStream? = null
++        var superResLinearRawOut: BufferedOutputStream? = null
+         val lensShadingTexture = createLensShadingTexture()
+         var gpuOutput = 0
+         var postprocessedUi = 0
+-        val outputBytes = outputWidth.toLong() * outputHeight.toLong() * 3L * Short.SIZE_BYTES
++        val outputBytes = resultOutputWidth.toLong() * resultOutputHeight.toLong() * 3L * Short.SIZE_BYTES
+         require(outputBytes <= Int.MAX_VALUE) {
+             "MGC Spatial RGB CPU output is too large: $outputBytes bytes"
+         }
+@@ -5867,7 +5959,18 @@ internal class GlesIris26521SpatialRgbStacker(
+             val chromaPostprocessor = checkNotNull(rgbChromaPostprocessor) {
+                 "MGC Spatial RGB chroma postprocessor is not initialized"
+             }
+-            chromaPostprocessor.beginFullFrame(bands)
++            if (iris26532StreamingOutput2x) {
++                superResDetailOut = BufferedOutputStream(
++                    FileOutputStream(checkNotNull(superResDetailFile)), 1024 * 1024,
++                )
++                superResLinearRawOut = superResLinearRawFile?.let {
++                    BufferedOutputStream(FileOutputStream(it), 1024 * 1024)
++                }
++            }
++            chromaPostprocessor.beginFullFrame(superResNativeBands)
++            check(estimatedOwnedTextureBytes() <= RGB_TEXTURE_BUDGET_BYTES) {
++                "IRIS 26532 post-begin GPU bytes=${estimatedOwnedTextureBytes()} budget=$RGB_TEXTURE_BUDGET_BYTES"
++            }
+             for ((band, frameRegions) in work) {
+                 val diagnosticSlotIndex = if (diagnosticStorages.isEmpty()) {
+                     -1
+@@ -5951,16 +6054,42 @@ internal class GlesIris26521SpatialRgbStacker(
+                 )
+                 var pendingDiagnosticBand: PendingRgbDiagnosticBand? = null
+                 try {
+-                    renderRgbNormalizedTile(
+-                        semanticAccumulator = semanticAccumulator,
+-                        opponentWeightAccumulator = opponentWeightAccumulator,
+-                        lensShadingTexture = lensShadingTexture,
+-                        outputCore = band.outputCore,
+-                        target = chromaPostprocessor.normalizationTargetTexture(),
+-                        targetIsFullOutput = true,
+-                        outputExposureScale = outputExposureScale,
+-                    )
+-                    chromaPostprocessor.markBandWritten(band)
++                    if (iris26532StreamingOutput2x) {
++                        renderRgbNormalizedTile(
++                            semanticAccumulator = semanticAccumulator,
++                            opponentWeightAccumulator = opponentWeightAccumulator,
++                            lensShadingTexture = lensShadingTexture,
++                            outputCore = band.outputCore,
++                            target = superResNormalizedBandTexture,
++                            targetIsFullOutput = false,
++                            outputExposureScale = outputExposureScale,
++                        )
++                        streamIris26532SuperResBand(
++                            texture = superResNormalizedBandTexture,
++                            band = band,
++                            detailOut = checkNotNull(superResDetailOut),
++                            linearRawOut = superResLinearRawOut,
++                        )
++                        val nativeBand = superResNativeBands[band.index]
++                        renderIris26532SuperResBandToNative(
++                            sourceBandTexture = superResNormalizedBandTexture,
++                            highResBand = band,
++                            nativeBand = nativeBand,
++                            target = chromaPostprocessor.normalizationTargetTexture(),
++                        )
++                        chromaPostprocessor.markBandWritten(nativeBand)
++                    } else {
++                        renderRgbNormalizedTile(
++                            semanticAccumulator = semanticAccumulator,
++                            opponentWeightAccumulator = opponentWeightAccumulator,
++                            lensShadingTexture = lensShadingTexture,
++                            outputCore = band.outputCore,
++                            target = chromaPostprocessor.normalizationTargetTexture(),
++                            targetIsFullOutput = true,
++                            outputExposureScale = outputExposureScale,
++                        )
++                        chromaPostprocessor.markBandWritten(band)
++                    }
+                     GlesGpuScheduler.yieldToUiRenderer()
+                     diagnosticCapture?.let { capture ->
+                         // The production output for this band has already been submitted. The
+@@ -6007,6 +6136,24 @@ internal class GlesIris26521SpatialRgbStacker(
+                 )
+                 pendingDiagnosticBands[slot] = null
+             }
++            if (iris26532StreamingOutput2x) {
++                superResDetailOut?.close(); superResDetailOut = null
++                superResLinearRawOut?.close(); superResLinearRawOut = null
++                val expectedDetailBytes = outputWidth.toLong() * outputHeight
++                check(checkNotNull(superResDetailFile).length() == expectedDetailBytes) {
++                    "IRIS 26532 detail bytes=${superResDetailFile.length()} expected=$expectedDetailBytes"
++                }
++                superResLinearRawFile?.let { file ->
++                    val expectedRawBytes = outputWidth.toLong() * outputHeight * 3L * 2L
++                    check(file.length() == expectedRawBytes) {
++                        "IRIS 26532 LinearRaw bytes=${file.length()} expected=$expectedRawBytes"
++                    }
++                }
++                PLog.i(TAG, "IRIS_26532_STREAMED_2X_BANDS high=${outputWidth}x$outputHeight " +
++                    "base=${resultOutputWidth}x$resultOutputHeight detailBytes=$expectedDetailBytes " +
++                    "linearRawBytes=${superResLinearRawFile?.length() ?: 0L} " +
++                    "fullHighResPostTexture=false maxBandHeight=${bands.maxOf { it.outputCore.height }}")
++            }
+             diagnosticStorages.forEach { storage ->
+                 releasePixelPackBuffer(storage, "MGC Spatial RGB Fixed16 band slot")
+             }
+@@ -6035,7 +6182,7 @@ internal class GlesIris26521SpatialRgbStacker(
+                         label = "MGC Spatial RGB IIR-to-float handoff",
+                         checkGlError = ::checkGlError,
+                     )
+-                    createTexture(outputWidth, outputHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++                    createTexture(resultOutputWidth, resultOutputHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+                         .also { target ->
+                             renderRgb16ToFloat(postprocessedUi, target)
+                             GLES30.glDeleteTextures(1, intArrayOf(postprocessedUi), 0)
+@@ -6086,8 +6233,16 @@ internal class GlesIris26521SpatialRgbStacker(
+                 gpuTexture = gpuOutput,
+                 diagnosticFixed16 = diagnosticFixed16,
+                 completionTimeline = completionTimeline,
++                superResDetailPath = superResDetailFile?.absolutePath,
++                superResLinearRawPath = superResLinearRawFile?.absolutePath,
++                superResWidth = if (iris26532StreamingOutput2x) outputWidth else 0,
++                superResHeight = if (iris26532StreamingOutput2x) outputHeight else 0,
+             )
+         } catch (throwable: Throwable) {
++            runCatching { superResDetailOut?.close() }; superResDetailOut = null
++            runCatching { superResLinearRawOut?.close() }; superResLinearRawOut = null
++            runCatching { superResDetailFile?.delete() }
++            runCatching { superResLinearRawFile?.delete() }
+             completionRecorder.releasePending()
+             passWindow.drain("MGC RGB reconstruction failure")
+             if (!diagnosticStoragesReleased) {
+@@ -6108,6 +6263,126 @@ internal class GlesIris26521SpatialRgbStacker(
+         }
+     }
+ 
++    /* IRIS_26532_MEMORY_SAFE_STREAMED_2X
++     * Stream one already-normalized 2x RGB16 band while it is resident. No full 2x RGB texture
++     * survives the band. Detail is one signed-log-luma Q8 byte/pixel; optional DNG evidence is
++     * tightly packed little-endian RGB16.
++     */
++    private fun streamIris26532SuperResBand(
++        texture: Int,
++        band: MgcSpatialRgbTile,
++        detailOut: BufferedOutputStream,
++        linearRawOut: BufferedOutputStream?,
++    ) {
++        val w = band.outputCore.width
++        val h = band.outputCore.height
++        require(w == outputWidth && (h and 1) == 0)
++        val bytes = w.toLong() * h * 4L * 2L
++        val buffer = LargeDirectBuffer.allocate(bytes, "IRIS26532 streamed RGB16 band")
++            ?.order(ByteOrder.nativeOrder()) ?: error("Unable to allocate IRIS 26532 RGB16 band")
++        try {
++            bindRenderTargets(intArrayOf(texture), "IRIS 26532 streamed 2x RGB16 readback")
++            GLES30.glReadBuffer(GLES30.GL_COLOR_ATTACHMENT0)
++            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 8)
++            buffer.position(0)
++            GLES30.glReadPixels(
++                0, 0, w, h,
++                GLES30.GL_RGBA_INTEGER, GLES30.GL_UNSIGNED_SHORT, buffer,
++            )
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
++            checkGlError("IRIS 26532 streamed RGB16 band readback")
++            val samples = buffer.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
++            val rawRow = linearRawOut?.let { ByteArray(w * 3 * 2) }
++            val detailRow0 = ByteArray(w)
++            val detailRow1 = ByteArray(w)
++            val detailLum = FloatArray(4)
++            val detailCoords = IntArray(4)
++            val invLn2 = (1.0 / ln(2.0)).toFloat()
++            val logRange = 0.75f
++            var y = 0
++            while (y < h) {
++                if (rawRow != null) {
++                    for (yy in 0..1) {
++                        var o = 0
++                        val row = y + yy
++                        for (x in 0 until w) {
++                            val base = (row * w + x) * 4
++                            for (c in 0..2) {
++                                val q = samples.get(base + c).toInt() and 0xffff
++                                rawRow[o++] = (q and 0xff).toByte()
++                                rawRow[o++] = ((q ushr 8) and 0xff).toByte()
++                            }
++                        }
++                        linearRawOut?.write(rawRow)
++                    }
++                }
++                var x = 0
++                while (x < w) {
++                    detailCoords[0] = (y * w + x) * 4
++                    detailCoords[1] = (y * w + x + 1) * 4
++                    detailCoords[2] = ((y + 1) * w + x) * 4
++                    detailCoords[3] = ((y + 1) * w + x + 1) * 4
++                    for (k in 0..3) {
++                        val base = detailCoords[k]
++                        val r = (samples.get(base).toInt() and 0xffff).toFloat()
++                        val g = (samples.get(base + 1).toInt() and 0xffff).toFloat()
++                        val b = (samples.get(base + 2).toInt() and 0xffff).toFloat()
++                        detailLum[k] = 0.25f * r + 0.50f * g + 0.25f * b
++                    }
++                    val mean = max((detailLum[0] + detailLum[1] + detailLum[2] + detailLum[3]) * 0.25f, 1f)
++                    for (k in 0..3) {
++                        val safe = max(detailLum[k], 1f)
++                        val log2Detail = (ln((safe / mean).toDouble()).toFloat() * invLn2)
++                            .coerceIn(-logRange, logRange)
++                        val code = round(
++                            ((log2Detail / logRange) * 0.5f + 0.5f)
++                                .coerceIn(0f, 1f) * 255f
++                        ).toInt().coerceIn(0, 255).toByte()
++                        when (k) {
++                            0 -> detailRow0[x] = code
++                            1 -> detailRow0[x + 1] = code
++                            2 -> detailRow1[x] = code
++                            else -> detailRow1[x + 1] = code
++                        }
++                    }
++                    x += 2
++                }
++                detailOut.write(detailRow0)
++                detailOut.write(detailRow1)
++                y += 2
++            }
++        } finally {
++            LargeDirectBuffer.free(buffer)
++        }
++    }
++
++    private fun renderIris26532SuperResBandToNative(
++        sourceBandTexture: Int,
++        highResBand: MgcSpatialRgbTile,
++        nativeBand: MgcSpatialRgbTile,
++        target: Int,
++    ) {
++        check(downsampleRgb16SuperRes2xProgram != 0)
++        require(highResBand.outputCore.width == nativeBand.outputCore.width * 2)
++        require(highResBand.outputCore.height == nativeBand.outputCore.height * 2)
++        bindRenderTargets(intArrayOf(target), "IRIS 26532 2x-to-native chroma band")
++        GLES30.glViewport(
++            nativeBand.outputCore.left, nativeBand.outputCore.top,
++            nativeBand.outputCore.width, nativeBand.outputCore.height,
++        )
++        GLES30.glDisable(GLES30.GL_BLEND)
++        GLES30.glUseProgram(downsampleRgb16SuperRes2xProgram)
++        bindTexture(downsampleRgb16SuperRes2xProgram, "uHighResBand", 0, sourceBandTexture)
++        uniform2i(
++            downsampleRgb16SuperRes2xProgram, "uTargetOrigin",
++            nativeBand.outputCore.left, nativeBand.outputCore.top,
++        )
++        GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
++        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++        checkGlError("IRIS 26532 2x-to-native chroma band")
++    }
++
+     /**
+      * Packs the isolated semantic merge accumulator before LSC and output-exposure scaling.
+      * Applying only cameraDomainScale produces the normalized camera-RGB domain expected by
+@@ -6308,7 +6583,7 @@ internal class GlesIris26521SpatialRgbStacker(
+         accumulatorIsFullOutput: Boolean = false,
+     ) {
+         require(outputCores.isNotEmpty())
+-        val activeMergeProgram = if (iris26530SuperResEnabled) mergeRgbSuperResProgram else mergeRgbProgram
++        val activeMergeProgram = if (iris26532CropAwareSrEnabled) mergeRgbSuperResProgram else mergeRgbProgram
+         check(activeMergeProgram != 0)
+         GLES30.glUseProgram(activeMergeProgram)
+         bindTexture(activeMergeProgram, "uRaw", 0, rawTexture)
+@@ -6336,12 +6611,12 @@ internal class GlesIris26521SpatialRgbStacker(
+             sourceRegion.height,
+         )
+         uniform2i(activeMergeProgram, "uOutputSize", outputWidth, outputHeight)
+-        if (iris26530SuperResEnabled) {
++        if (iris26532CropAwareSrEnabled) {
+             uniform1f(activeMergeProgram, "uReconstructionZoom", reconstructionZoom)
+             uniform1f(
+                 activeMergeProgram,
+                 "uLumaTemporalScale",
+-                if (frame.imageIndex == 0) 1f else iris26530LumaAuxScale,
++                if (frame.imageIndex == 0 || !iris26530GcamLumaTuningEnabled) 1f else iris26530LumaAuxScale,
+             )
+         }
+         uniform4f(
+@@ -6491,7 +6766,7 @@ internal class GlesIris26521SpatialRgbStacker(
+         bindRenderTargets(intArrayOf(target), "MGC RGB normalize tile ${outputCore.left},${outputCore.top}")
+         GLES30.glViewport(targetLeft, targetTop, outputCore.width, outputCore.height)
+         GLES30.glDisable(GLES30.GL_BLEND)
+-        val activeNormalizeProgram = if (iris26530SuperResEnabled) normalizeRgbSuperResProgram else normalizeRgbProgram
++        val activeNormalizeProgram = if (iris26532CropAwareSrEnabled) normalizeRgbSuperResProgram else normalizeRgbProgram
+         check(activeNormalizeProgram != 0)
+         GLES30.glUseProgram(activeNormalizeProgram)
+         bindTexture(activeNormalizeProgram, "uColorAndRWeight", 0, semanticAccumulator)
+@@ -6511,7 +6786,7 @@ internal class GlesIris26521SpatialRgbStacker(
+             outputCore.top,
+         )
+         uniform2i(activeNormalizeProgram, "uOutputSize", outputWidth, outputHeight)
+-        if (iris26530SuperResEnabled) {
++        if (iris26532CropAwareSrEnabled) {
+             uniform2i(activeNormalizeProgram, "uRawSize", width, height)
+             uniform1f(activeNormalizeProgram, "uReconstructionZoom", reconstructionZoom)
+         }
+@@ -6714,8 +6989,8 @@ internal class GlesIris26521SpatialRgbStacker(
+     private fun mapSpatialStrengthToOutputCoordinates(
+         source: MgcSpatialStrengthMap,
+     ): MgcSpatialStrengthMap {
+-        val targetWidth = ceilDiv(outputWidth, 4)
+-        val targetHeight = ceilDiv(outputHeight, 4)
++        val targetWidth = ceilDiv(resultOutputWidth, 4)
++        val targetHeight = ceilDiv(resultOutputHeight, 4)
+         if (source.width == targetWidth && source.height == targetHeight) return source
+         val startNs = System.nanoTime()
+         val mapped = MgcSpatialStrengthMapScaler.scaleBilinear(
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 9774039..cfc4f0b 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -568,17 +568,22 @@ internal object Iris26529SpatialRgbChromaShaders {
+             return clamp(vec3(decodeU16(e.r),decodeU16(e.g),decodeU16(e.b))*uCalculationGains,vec3(0.0),vec3(65504.0));
+         }
+         float yAt(ivec2 p){ return dot(calculationRgbAt(p),vec3(0.25,0.5,0.25)); }
+-        /* IRIS_26530_V1_3_RGB_DIRECTION_ONLY
+-         * Bjzhou's post-c317 MGC audit supersedes fused-green direction-moment steering here.
+-         * The fused RGB/Y gradient now owns the post-fusion chroma direction decision.
++        /* IRIS_26532_FOLIAGE_STRUCTURE_GUIDANCE
++         * 26531's RGB-gradient-only direction choice regressed fine green foliage against sky.
++         * Restore the fused-green doubled-angle structure moment as a geometric guide while
++         * retaining RGB luminance gradients as the actual edge magnitude.
+          */
++        float snorm8(uint x){ int v=int(x&255u); if(v>127)v-=256; return clamp(float(v)/127.0,-1.0,1.0); }
++        vec2 directionMomentAt(ivec2 p){ uint a=imageLoad(uInput,safePos(p)).a; return vec2(snorm8(a),snorm8(a>>8u)); }
+         uint directionMaskAt(ivec2 p){
+             const ivec2 d[8]=ivec2[8](ivec2(0,-1),ivec2(1,0),ivec2(0,1),ivec2(-1,0),ivec2(1,-1),ivec2(1,1),ivec2(-1,1),ivec2(-1,-1));
+-            float center=yAt(p); float g[8]; float lo=65504.0; float hi=0.0;
++            const vec2 axis2[8]=vec2[8](vec2(-1,0),vec2(1,0),vec2(-1,0),vec2(1,0),vec2(0,-1),vec2(0,1),vec2(0,-1),vec2(0,1));
++            float center=yAt(p); vec2 moment=directionMomentAt(p); float g[8]; float lo=65504.0; float hi=0.0;
+             for(int i=0;i<8;++i){
+                 float first=yAt(p+d[i]); float second=yAt(p+d[i]*2);
+                 float rgbGradient=abs(center-first)+0.5*abs(first-second);
+-                g[i]=rgbGradient; lo=min(lo,g[i]); hi=max(hi,g[i]);
++                float structureScale=clamp(1.0+0.5*dot(moment,axis2[i]),0.5,1.5);
++                g[i]=rgbGradient*structureScale; lo=min(lo,g[i]); hi=max(hi,g[i]);
+             }
+             float threshold=max(uMinimumDirectionGradient,1.5*lo+0.09375*(hi-lo));
+             int mask=0; int count=0;
+@@ -625,7 +630,22 @@ internal object Iris26529SpatialRgbChromaShaders {
+             ivec2 row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); ivec2 mn=row,mx=row,sum=row; int ysum=a.x+2*b.x+c.x;
+             a=s(p+ivec2(-1,0));b=s(p);c=s(p+ivec2(1,0)); row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); sum+=row; mn=min(mn,row); mx=max(mx,row); ysum+=2*a.x+4*b.x+2*c.x;
+             a=s(p+ivec2(-1,1));b=s(p+ivec2(0,1));c=s(p+ivec2(1,1)); row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); sum+=row-min(mn,row)-max(mx,row); ysum+=a.x+2*b.x+c.x;
+-            uvec4 center=imageLoad(uInput,p); imageStore(uOutput,p,uvec4(uint(max(ysum/16,0)),unsignedChroma(sum.x),unsignedChroma(sum.y),center.a));
++            uvec4 center=imageLoad(uInput,p);
++            /* IRIS_26532_FOLIAGE_LOCAL_MEDIAN_EDGE_GATE
++             * The old median could borrow sky chroma into a leaf (or vice versa). Preserve the
++             * center chroma progressively across real luminance edges, while flat areas retain
++             * the proven 26529 chroma cleanup.
++             */
++            float centerY=decodeU16(center.r); float edge=0.0;
++            for(int yy=-1;yy<=1;++yy)for(int xx=-1;xx<=1;++xx){
++                if(xx==0&&yy==0)continue;
++                float ny=decodeU16(imageLoad(uInput,safePos(p+ivec2(xx,yy))).r);
++                edge=max(edge,abs(centerY-ny)/max(centerY+ny,1.0));
++            }
++            float protect=smoothstep(0.035,0.10,edge);
++            vec2 medianC=vec2(sum); vec2 centerC=vec2(signedChroma(center.g),signedChroma(center.b));
++            ivec2 outC=ivec2(round(mix(medianC,centerC,protect)));
++            imageStore(uOutput,p,uvec4(uint(max(ysum/16,0)),unsignedChroma(outC.x),unsignedChroma(outC.y),center.a));
+         }
+     """.trimIndent()
+ 
+@@ -650,7 +670,25 @@ internal object Iris26529SpatialRgbChromaShaders {
+             if((direction&(1<<6))!=0){selected+=vec3(cr[3],cb[3],scale[3]);count++;} if((direction&(1<<7))!=0){selected+=vec3(cr[3],cb[3],scale[3]);count++;}
+             if(count>0)selected/=float(count); float minScale=min(min(scale.x,scale.y),min(scale.z,scale.w)); float yScale=clamp(1.0-center.x/16384.0*minScale,0.0,1.0); return vec4(center.x,yScale*selected.x,yScale*selected.y,selected.z*65504.0);
+         }
+-        void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;uvec4 e=imageLoad(uOriginal,p);vec4 f=vec4(decodeU16(e.r),float(signedChroma(e.g)),float(signedChroma(e.b)),0.0);if(e.r!=0u&&e.a!=0u)f=filter3(e,p);uvec4 sm=imageLoad(uSmooth,p);ivec2 sc=ivec2(signedChroma(sm.g),signedChroma(sm.b));ivec2 fc=ivec2(f.yz);if(abs(sc.x)+abs(sc.y)<abs(fc.x)+abs(fc.y))fc=sc;imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(fc.x),unsignedChroma(fc.y),uint(clamp(f.w,0.0,65504.0))));}
++        float edgeProtect(ivec2 p,float centerY){
++            const ivec2 d[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
++            float edge=0.0;
++            for(int i=0;i<4;++i){float ny=decodeU16(imageLoad(uOriginal,safePos(p+d[i])).r);edge=max(edge,abs(centerY-ny)/max(centerY+ny,1.0));}
++            return smoothstep(0.035,0.10,edge);
++        }
++        void main(){
++            ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
++            uvec4 e=imageLoad(uOriginal,p);vec4 f=vec4(decodeU16(e.r),float(signedChroma(e.g)),float(signedChroma(e.b)),0.0);
++            if(e.r!=0u&&e.a!=0u)f=filter3(e,p);
++            uvec4 sm=imageLoad(uSmooth,p);ivec2 sc=ivec2(signedChroma(sm.g),signedChroma(sm.b));ivec2 fc=ivec2(f.yz);
++            float protect=edgeProtect(p,decodeU16(e.r));
++            /* IRIS_26532_NO_EDGE_DESATURATION: the lower-saturation candidate may win only away
++             * from a real edge. At a protected edge the fused center chroma remains authority. */
++            if(protect<0.5 && abs(sc.x)+abs(sc.y)<abs(fc.x)+abs(fc.y))fc=sc;
++            vec2 centerC=vec2(signedChroma(e.g),signedChroma(e.b));
++            fc=ivec2(round(mix(vec2(fc),centerC,protect)));
++            imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(fc.x),unsignedChroma(fc.y),uint(clamp(f.w,0.0,65504.0))));
++        }
+     """.trimIndent()
+ 
+     val restoreDirection = """
+@@ -676,7 +714,28 @@ internal object Iris26529SpatialRgbChromaShaders {
+         float apply(inout State s,float v,vec4 a,vec4 b,bool unsignedOut){float r=a[0]*v+a[1]*s.x0+a[2]*s.x1-b[1]*s.y0-b[2]*s.y1;s.x1=s.x0;s.y1=s.y0;s.x0=v;s.y0=unsignedOut?clamp(r,0.0,65504.0):r;return s.y0;}
+         float steadyOutput(float v,vec4 a,vec4 b,bool u){float r=v*(a[0]+a[1]+a[2])/(1.0+b[1]+b[2]);return u?clamp(r,0.0,65504.0):r;}
+         State steady(float x,float y){return State(x,x,y,y);} ivec2 pos(int inner,int outer){return uAxis==0?ivec2(inner,outer):ivec2(outer,inner);}
+-        void main(){int outer=uAxis==0?int(gl_GlobalInvocationID.y):int(gl_GlobalInvocationID.x);int outerLimit=uAxis==0?uImageSize.y:uImageSize.x;int innerSize=uAxis==0?uImageSize.x:uImageSize.y;if(outer>=outerLimit)return;int start=uDirection==0?0:innerSize-1;int step=uDirection==0?1:-1;uvec4 b=imageLoad(uInput,pos(start,outer));float by=decodeU16(b.r),cr=float(signedChroma(b.g)),cb=float(signedChroma(b.b));float sy=steadyOutput(by,uA10,uB10,true),sc1=steadyOutput(cr,uADyn1,uBDyn1,false),sb1=steadyOutput(cb,uADyn1,uBDyn1,false),sc2=steadyOutput(sc1,uADyn2,uBDyn2,false),sb2=steadyOutput(sb1,uADyn2,uBDyn2,false);State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);for(int i=0;i<innerSize;++i){ivec2 p=pos(start+i*step,outer);uvec4 px=imageLoad(uInput,p);float y=uFilterLuma!=0?apply(ys,decodeU16(px.r),uA10,uB10,true):decodeU16(px.r);float r=apply(c1,float(signedChroma(px.g)),uADyn1,uBDyn1,false);float q=apply(b1,float(signedChroma(px.b)),uADyn1,uBDyn1,false);r=apply(c2,r,uADyn2,uBDyn2,false);q=apply(b2,q,uADyn2,uBDyn2,false);imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));}}
++        void main(){
++            int outer=uAxis==0?int(gl_GlobalInvocationID.y):int(gl_GlobalInvocationID.x);int outerLimit=uAxis==0?uImageSize.y:uImageSize.x;int innerSize=uAxis==0?uImageSize.x:uImageSize.y;if(outer>=outerLimit)return;
++            int start=uDirection==0?0:innerSize-1;int step=uDirection==0?1:-1;uvec4 b=imageLoad(uInput,pos(start,outer));float by=decodeU16(b.r),cr=float(signedChroma(b.g)),cb=float(signedChroma(b.b));
++            float sy=steadyOutput(by,uA10,uB10,true),sc1=steadyOutput(cr,uADyn1,uBDyn1,false),sb1=steadyOutput(cb,uADyn1,uBDyn1,false),sc2=steadyOutput(sc1,uADyn2,uBDyn2,false),sb2=steadyOutput(sb1,uADyn2,uBDyn2,false);
++            State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);float previousY=by;
++            for(int i=0;i<innerSize;++i){
++                ivec2 p=pos(start+i*step,outer);uvec4 px=imageLoad(uInput,p);float currentY=decodeU16(px.r);float inCr=float(signedChroma(px.g)),inCb=float(signedChroma(px.b));
++                if(uFilterLuma==0 && i>0){
++                    float edge=abs(currentY-previousY)/max(currentY+previousY,1.0);
++                    if(edge>=0.06){
++                        /* IRIS_26532_IIR_CHROMA_EDGE_RESET: IIR3 may not carry sky chroma through
++                         * a leaf boundary. Reset both recursive chroma sections at the edge. */
++                        float r1=steadyOutput(inCr,uADyn1,uBDyn1,false),q1=steadyOutput(inCb,uADyn1,uBDyn1,false);
++                        float r2=steadyOutput(r1,uADyn2,uBDyn2,false),q2=steadyOutput(q1,uADyn2,uBDyn2,false);
++                        c1=steady(inCr,r1);b1=steady(inCb,q1);c2=steady(r1,r2);b2=steady(q1,q2);
++                    }
++                }
++                float y=uFilterLuma!=0?apply(ys,currentY,uA10,uB10,true):currentY;
++                float r=apply(c1,inCr,uADyn1,uBDyn1,false);float q=apply(b1,inCb,uADyn1,uBDyn1,false);r=apply(c2,r,uADyn2,uBDyn2,false);q=apply(b2,q,uADyn2,uBDyn2,false);
++                imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));previousY=currentY;
++            }
++        }
+     """.trimIndent()
+ 
+     val calculateError = """
+@@ -713,7 +772,20 @@ internal object Iris26529SpatialRgbChromaShaders {
+         layout(rgba16ui,binding=2) writeonly uniform highp uimage2D uOutput;
+         $common
+         float scale(float low,float v,float high){return(clamp(v,low,high)-low)/(high-low);}
+-        void main(){ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;uvec4 o=imageLoad(uOriginal,p),s=imageLoad(uSmooth,p);int cr=signedChroma(o.g),cb=signedChroma(o.b),sr=signedChroma(s.g),sb=signedChroma(s.b);float errorScale=scale(100.0,decodeU16(s.a)*0.25,300.0);float smoothSat=1.0+float(abs(sr))+float(abs(sb));float normalSat=float(abs(cr))+float(abs(cb));float f=errorScale*scale(0.5,normalSat/smoothSat,1.0);o.g=unsignedChroma(int(mix(float(cr),float(sr),f)));o.b=unsignedChroma(int(mix(float(cb),float(sb),f)));o.a=s.a;imageStore(uOutput,p,o);}
++        float edgeProtect(ivec2 p,float centerY){
++            const ivec2 d[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));float edge=0.0;
++            for(int i=0;i<4;++i){float ny=decodeU16(imageLoad(uOriginal,safePos(p+d[i])).r);edge=max(edge,abs(centerY-ny)/max(centerY+ny,1.0));}
++            return smoothstep(0.035,0.10,edge);
++        }
++        void main(){
++            ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;uvec4 o=imageLoad(uOriginal,p),s=imageLoad(uSmooth,p);
++            int cr=signedChroma(o.g),cb=signedChroma(o.b),sr=signedChroma(s.g),sb=signedChroma(s.b);float errorScale=scale(100.0,decodeU16(s.a)*0.25,300.0);float smoothSat=1.0+float(abs(sr))+float(abs(sb));float normalSat=float(abs(cr))+float(abs(cb));
++            float f=errorScale*scale(0.5,normalSat/smoothSat,1.0);
++            /* IRIS_26532_BLEND_EDGE_CHROMA_PROTECT: filtered chroma cannot overwrite a strong
++             * structural edge; flat low-frequency chroma noise remains eligible for cleanup. */
++            f*=1.0-edgeProtect(p,decodeU16(o.r));
++            o.g=unsignedChroma(int(mix(float(cr),float(sr),f)));o.b=unsignedChroma(int(mix(float(cb),float(sb),f)));o.a=s.a;imageStore(uOutput,p,o);
++        }
+     """.trimIndent()
+ 
+     val finalCameraRgb = """
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index 3c84410..43db1fc 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -2,6 +2,7 @@ package com.hinnka.mycamera.processor
+ 
+ import com.hinnka.mycamera.camera.MultiFrameConfig
+ import com.hinnka.mycamera.utils.PLog
++import java.io.File
+ 
+ /**
+  * Entry point for the non-AI MGC Spatial RAW pipeline recovered from
+@@ -34,6 +35,9 @@ internal class GlesMgcRawFusion(
+     private val gpuLinearRgbStorage: GpuLinearRgbStorage,
+     /* IRIS_26520_V4_LIVE_MGC_NORMAL_DNG_REQUEST */
+     private val exportNormalStackedDng: Boolean = false,
++    /* IRIS_26532_STREAMED_SUPERRES_TEMP_OWNER */
++    private val superResTempDir: File? = null,
++    private val superResWriteLinearRaw: Boolean = false,
+ ) {
+     private val outputScale = MultiFrameConfig.normalizeOutputScale(outputScale)
+ 
+@@ -163,6 +167,8 @@ internal class GlesMgcRawFusion(
+                 exportGpuLinearRgbSource = exportGpuLinearRgbSource,
+                 gpuLinearRgbStorage = gpuLinearRgbStorage,
+                 exportNormalStackedDng = exportNormalStackedDng,
++                superResTempDir = superResTempDir,
++                superResWriteLinearRaw = superResWriteLinearRaw,
+             ).processFrames(scheduledFrames)
+         }
+         return GlesMgcRawSpatialStacker(
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+index 266b4fe..8ad0cb2 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+@@ -50,6 +50,15 @@ data class RawStackResult(
+     val mgcSharpenTuningSnr: Float? = null,
+     val mgcSharpenAttenuationScale: Float? = null,
+     val mgcSpatialReferenceOnlyDiagnostic: Boolean = false,
++    /* IRIS_26532_STREAMED_SUPERRES_RESULT
++     * High-resolution SR evidence is streamed while Spatial bands are resident. The normal
++     * GPU source remains native-sized so the proven 26531 chroma/tone path never allocates
++     * full-frame 2x post-processing surfaces.
++     */
++    val superResDetailPath: String? = null,
++    val superResLinearRawPath: String? = null,
++    val superResWidth: Int = 0,
++    val superResHeight: Int = 0,
+     /* IRIS_26520_V4_LIVE_MGC_NORMAL_DNG_SIDECAR */
+     val normalStackedDngRaw16: ByteBuffer? = null,
+     val normalStackedDngFrameCount: Int = 0,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java b/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
+index 8a3e6e1..80d229b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
+@@ -115,13 +115,47 @@ public final class IrisZoomController {
+         this.fragment = fragment;
+     }
+ 
++    /** IRIS_26532_NEW_CAMERA_ACTIVITY_ONE_X
++     * A genuinely new CameraActivity session (savedInstanceState == null) starts at 1x even if
++     * Android kept the process alive after the previous activity was closed. Configuration/state
++     * recreation with a non-null savedInstanceState keeps the live session instead.
++     */
++    public static void resetForNewCameraActivitySession() {
++        synchronized (STATE_LOCK) {
++            sInitialized = false;
++            sRequestedGlobalZoom = 1.0f;
++            sGlobalZoom = 1.0f;
++            sOpticalAnchor = 1.0f;
++            sHardwareLocalZoom = 1.0f;
++            sResidualSoftwareZoom = 1.0f;
++            sMinimumGlobalZoom = 1.0f;
++            sMaximumGlobalZoom = LOCAL_MAX_ZOOM;
++            sOwnerCameraId = null;
++            sPendingOwnerCameraId = null;
++            sPendingOpticalAnchor = 1.0f;
++        }
++    }
++
+     public void onLensInventoryReady() {
+         refreshInventory();
+         if (backLenses.isEmpty()) return;
++        String freshProcessCameraId = null;
+         synchronized (STATE_LOCK) {
+-            CameraLensData selected = findLens(PreferenceKeys.getCameraID());
+-            if (selected == null || selected.getFacing() != CameraCharacteristics.LENS_FACING_BACK) {
++            CameraLensData selected;
++            if (!sInitialized) {
++                /* IRIS_26532_FRESH_PROCESS_ONE_X
++                 * Static zoom ownership dies with the app process. On the first inventory of a
++                 * new process, ignore persisted camera/zoom state and start from the physical
++                 * rear lens whose optical anchor is closest to 1x. Same-process recreation keeps
++                 * the live owner below.
++                 */
+                 selected = findClosestToOne();
++                freshProcessCameraId = selected.getCameraId();
++            } else {
++                selected = findLens(PreferenceKeys.getCameraID());
++                if (selected == null || selected.getFacing() != CameraCharacteristics.LENS_FACING_BACK) {
++                    selected = findClosestToOne();
++                }
+             }
+             CameraLensData owner = findLens(sOwnerCameraId);
+             if (!sInitialized || owner == null) {
+@@ -147,6 +181,12 @@ public final class IrisZoomController {
+                 sPendingOpticalAnchor = sOpticalAnchor;
+             }
+         }
++        if (freshProcessCameraId != null) {
++            PreferenceKeys.setCameraID(freshProcessCameraId);
++            CameraFragment.sActiveBackCamId = freshProcessCameraId;
++            Log.i(TAG, "IRIS_26532_FRESH_PROCESS_ONE_X cameraId=" + freshProcessCameraId
++                    + " globalZoom=" + getGlobalZoom() + " localZoom=1.0");
++        }
+         updateButtonUi();
+     }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+index 067c6ae..3afbb52 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -159,7 +159,12 @@ public class ImageSaver {
+                 Path fileToSave,
+                 Bitmap img,
+                 int jpgQuality,
+-                ParseExif.ExifData exifData) {
++                ParseExif.ExifData exifData,
++                String superResDetailPath,
++                int superResDetailWidth,
++                int superResDetailHeight,
++                com.particlesdevs.photoncamera.processing.render.Parameters parameters,
++                Point cropSize) {
+             exifData.COMPRESSION = String.valueOf(jpgQuality);
+             try {
+                 /* IRIS_26507_MOTION_JPEG444
+@@ -167,7 +172,23 @@ public class ImageSaver {
+                  * gain map is attached, package that already-compressed 4:4:4 base as JPEG_R
+                  * rather than asking Bitmap.compress() to re-encode it as 4:2:0.
+                  */
+-                boolean saved = MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
++                boolean useSuperRes = parameters != null
++                        && parameters.motionV2SuperResOutputEnabled
++                        && superResDetailPath != null
++                        && superResDetailWidth > 0 && superResDetailHeight > 0;
++                boolean saved;
++                if (useSuperRes) {
++                    Point raw = parameters.rawSize;
++                    Point crop = cropSize != null ? cropSize : raw;
++                    saved = MotionV2Jpeg444Encoder.writeSuperRes(
++                            fileToSave, img, jpgQuality, superResDetailPath,
++                            superResDetailWidth, superResDetailHeight,
++                            raw.x, raw.y, crop.x, crop.y,
++                            parameters.cameraRotation, parameters.mirror,
++                            parameters.motionV2RenderResidualZoom);
++                } else {
++                    saved = MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
++                }
+                 if (!saved) return false;
+ 
+                 img.recycle();
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisMotionSuperResDngWriter.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisMotionSuperResDngWriter.java
+new file mode 100644
+index 0000000..038ccde
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisMotionSuperResDngWriter.java
+@@ -0,0 +1,405 @@
++package com.particlesdevs.photoncamera.processing;
++
++import android.os.Build;
++
++import com.particlesdevs.photoncamera.processing.render.Parameters;
++import com.particlesdevs.photoncamera.util.Log;
++
++import java.io.BufferedOutputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.IOException;
++import java.io.OutputStream;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.StandardOpenOption;
++import java.text.SimpleDateFormat;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.Date;
++import java.util.List;
++import java.util.Locale;
++
++/**
++ * IRIS_26532_STREAMING_LINEAR_RAW_DNG
++ *
++ * Iris-owned DNG serializer for the 2x Spatial RGB result. The MGC result already lives on its
++ * final resampled LinearRaw grid, so DefaultScale is 1:1. Only residual FOV crop that remains
++ * after the <=20x Spatial reconstruction is encoded in DefaultCrop. Pixel payload is copied from
++ * a temporary RGB16 stream without materializing a second whole-image buffer.
++ */
++public final class IrisMotionSuperResDngWriter {
++    private static final String TAG = "Iris26532Dng";
++
++    private static final int TYPE_BYTE = 1;
++    private static final int TYPE_ASCII = 2;
++    private static final int TYPE_SHORT = 3;
++    private static final int TYPE_LONG = 4;
++    private static final int TYPE_RATIONAL = 5;
++    private static final int TYPE_SRATIONAL = 10;
++    private static final int TYPE_DOUBLE = 12;
++
++    private static final int TAG_NEW_SUBFILE_TYPE = 254;
++    private static final int TAG_IMAGE_WIDTH = 256;
++    private static final int TAG_IMAGE_LENGTH = 257;
++    private static final int TAG_BITS_PER_SAMPLE = 258;
++    private static final int TAG_COMPRESSION = 259;
++    private static final int TAG_PHOTOMETRIC = 262;
++    private static final int TAG_DESCRIPTION = 270;
++    private static final int TAG_MAKE = 271;
++    private static final int TAG_MODEL = 272;
++    private static final int TAG_STRIP_OFFSETS = 273;
++    private static final int TAG_ORIENTATION = 274;
++    private static final int TAG_SAMPLES_PER_PIXEL = 277;
++    private static final int TAG_ROWS_PER_STRIP = 278;
++    private static final int TAG_STRIP_BYTE_COUNTS = 279;
++    private static final int TAG_PLANAR_CONFIG = 284;
++    private static final int TAG_SOFTWARE = 305;
++    private static final int TAG_DATETIME = 306;
++    private static final int TAG_SAMPLE_FORMAT = 339;
++    private static final int TAG_EXPOSURE_TIME = 33434;
++    private static final int TAG_F_NUMBER = 33437;
++    private static final int TAG_ISO = 34855;
++    private static final int TAG_FOCAL_LENGTH = 37386;
++    private static final int TAG_DNG_VERSION = 50706;
++    private static final int TAG_DNG_BACKWARD_VERSION = 50707;
++    private static final int TAG_UNIQUE_CAMERA_MODEL = 50708;
++    private static final int TAG_BLACK_LEVEL = 50714;
++    private static final int TAG_WHITE_LEVEL = 50717;
++    private static final int TAG_DEFAULT_SCALE = 50718;
++    private static final int TAG_DEFAULT_CROP_ORIGIN = 50719;
++    private static final int TAG_DEFAULT_CROP_SIZE = 50720;
++    private static final int TAG_COLOR_MATRIX_1 = 50721;
++    private static final int TAG_COLOR_MATRIX_2 = 50722;
++    private static final int TAG_CAMERA_CALIBRATION_1 = 50723;
++    private static final int TAG_CAMERA_CALIBRATION_2 = 50724;
++    private static final int TAG_ANALOG_BALANCE = 50727;
++    private static final int TAG_AS_SHOT_NEUTRAL = 50728;
++    private static final int TAG_BASELINE_EXPOSURE = 50730;
++    private static final int TAG_CALIBRATION_ILLUMINANT_1 = 50778;
++    private static final int TAG_CALIBRATION_ILLUMINANT_2 = 50779;
++    private static final int TAG_ACTIVE_AREA = 50829;
++    private static final int TAG_FORWARD_MATRIX_1 = 50964;
++    private static final int TAG_FORWARD_MATRIX_2 = 50965;
++    private static final int TAG_NOISE_PROFILE = 51041;
++    private static final int TAG_DEFAULT_BLACK_RENDER = 51110;
++
++    private static final int PHOTOMETRIC_LINEAR_RAW = 34892;
++    private static final int SAMPLES_PER_PIXEL = 3;
++    private static final long U32_MAX = 0xffff_ffffL;
++
++    private IrisMotionSuperResDngWriter() {}
++
++    private static final class Entry {
++        final int tag;
++        final int type;
++        final long count;
++        final byte[] data;
++        long externalOffset;
++
++        Entry(int tag, int type, long count, byte[] data) {
++            this.tag = tag;
++            this.type = type;
++            this.count = count;
++            this.data = data;
++        }
++    }
++
++    public static boolean write(
++            Path output,
++            Path linearRawRgb16,
++            int width,
++            int height,
++            Parameters p,
++            double[] noiseProfile,
++            int normalFrameCount,
++            float supportMin,
++            float supportP01,
++            float supportP10,
++            float supportMedian,
++            float supportMean,
++            float supportMax,
++            float noiseEquivalentSupport) {
++        if (output == null || linearRawRgb16 == null || p == null || width <= 0 || height <= 0) {
++            return false;
++        }
++        try {
++            long pixelBytes = Math.multiplyExact(Math.multiplyExact((long) width, (long) height), 6L);
++            if (pixelBytes > U32_MAX || Files.size(linearRawRgb16) != pixelBytes) {
++                throw new IOException("LinearRaw payload size mismatch expected=" + pixelBytes
++                        + " actual=" + Files.size(linearRawRgb16));
++            }
++            byte[] header = buildHeader(width, height, pixelBytes, p, noiseProfile,
++                    normalFrameCount, supportMin, supportP01, supportP10, supportMedian,
++                    supportMean, supportMax, noiseEquivalentSupport);
++            if ((long) header.length + pixelBytes > U32_MAX) {
++                throw new IOException("Classic TIFF/DNG 32-bit offset limit exceeded");
++            }
++            Files.deleteIfExists(output);
++            try (OutputStream out = new BufferedOutputStream(
++                    Files.newOutputStream(output, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE),
++                    1024 * 1024)) {
++                out.write(header);
++                Files.copy(linearRawRgb16, out);
++                out.flush();
++            }
++            long expected = (long) header.length + pixelBytes;
++            if (Files.size(output) != expected) {
++                throw new IOException("DNG final size mismatch expected=" + expected
++                        + " actual=" + Files.size(output));
++            }
++            Log.i(TAG, "IRIS_26532_LINEAR_RAW_DNG saved=true size=" + width + "x" + height
++                    + " payloadBytes=" + pixelBytes + " headerBytes=" + header.length
++                    + " residualZoom=" + Math.max(1.0f, p.motionV2RenderResidualZoom)
++                    + " defaultScale=1:1 photometric=LinearRaw");
++            return true;
++        } catch (Throwable t) {
++            Log.e(TAG, "IRIS_26532_LINEAR_RAW_DNG_FAILED", t);
++            try { Files.deleteIfExists(output); } catch (Throwable ignored) {}
++            return false;
++        }
++    }
++
++    private static byte[] buildHeader(
++            int width,
++            int height,
++            long pixelBytes,
++            Parameters p,
++            double[] noiseProfile,
++            int normalFrameCount,
++            float supportMin,
++            float supportP01,
++            float supportP10,
++            float supportMedian,
++            float supportMean,
++            float supportMax,
++            float noiseEquivalentSupport) throws IOException {
++        List<Entry> entries = new ArrayList<>();
++        entries.add(longEntry(TAG_NEW_SUBFILE_TYPE, 0));
++        entries.add(longEntry(TAG_IMAGE_WIDTH, width));
++        entries.add(longEntry(TAG_IMAGE_LENGTH, height));
++        entries.add(shortArray(TAG_BITS_PER_SAMPLE, new int[]{16, 16, 16}));
++        entries.add(shortEntry(TAG_COMPRESSION, 1));
++        entries.add(shortEntry(TAG_PHOTOMETRIC, PHOTOMETRIC_LINEAR_RAW));
++        entries.add(ascii(TAG_DESCRIPTION, "Iris 26532 Motion Spatial Super Res; normalFrames="
++                + Math.max(0, normalFrameCount)
++                + "; support[min,p01,p10,median,mean,max,noiseEq]="
++                + supportMin + "," + supportP01 + "," + supportP10 + "," + supportMedian
++                + "," + supportMean + "," + supportMax + "," + noiseEquivalentSupport
++                + "; displayedZoom=" + p.motionV2GlobalZoom
++                + "; spatialZoom=" + p.motionV2SpatialReconstructionZoom
++                + "; residualZoom=" + p.motionV2RenderResidualZoom));
++        String make = Build.BRAND != null && !Build.BRAND.isEmpty() ? Build.BRAND : Build.MANUFACTURER;
++        String model = Build.MODEL != null ? Build.MODEL : "Android Camera";
++        entries.add(ascii(TAG_MAKE, make));
++        entries.add(ascii(TAG_MODEL, model));
++        Entry stripOffset = longEntry(TAG_STRIP_OFFSETS, 0);
++        entries.add(stripOffset);
++        entries.add(shortEntry(TAG_ORIENTATION, exifOrientation(p.cameraRotation)));
++        entries.add(shortEntry(TAG_SAMPLES_PER_PIXEL, SAMPLES_PER_PIXEL));
++        entries.add(longEntry(TAG_ROWS_PER_STRIP, height));
++        entries.add(longEntry(TAG_STRIP_BYTE_COUNTS, pixelBytes));
++        entries.add(shortEntry(TAG_PLANAR_CONFIG, 1));
++        entries.add(ascii(TAG_SOFTWARE, "Iris Camera 0.9726532 / 26532"));
++        entries.add(ascii(TAG_DATETIME,
++                new SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(new Date())));
++        entries.add(shortArray(TAG_SAMPLE_FORMAT, new int[]{1, 1, 1}));
++
++        if (p.exposureTime > 0.0 && Double.isFinite(p.exposureTime)) {
++            entries.add(rationalArray(TAG_EXPOSURE_TIME, new double[]{p.exposureTime}));
++        }
++        if (p.aperture > 0.0f && Float.isFinite(p.aperture)) {
++            entries.add(rationalArray(TAG_F_NUMBER, new double[]{p.aperture}));
++        }
++        if (p.iso > 0) entries.add(shortEntry(TAG_ISO, Math.min(65535, p.iso)));
++        if (p.focalLength > 0.0f && Float.isFinite(p.focalLength)) {
++            entries.add(rationalArray(TAG_FOCAL_LENGTH, new double[]{p.focalLength}));
++        }
++
++        entries.add(byteArray(TAG_DNG_VERSION, new byte[]{1, 4, 0, 0}));
++        entries.add(byteArray(TAG_DNG_BACKWARD_VERSION, new byte[]{1, 3, 0, 0}));
++        entries.add(ascii(TAG_UNIQUE_CAMERA_MODEL, model + "-" + make + "-Iris"));
++        entries.add(rationalArray(TAG_BLACK_LEVEL, new double[]{0.0, 0.0, 0.0}));
++        entries.add(longArray(TAG_WHITE_LEVEL, new long[]{65535, 65535, 65535}));
++        entries.add(rationalArray(TAG_DEFAULT_SCALE, new double[]{1.0, 1.0}));
++
++        double residualZoom = Float.isFinite(p.motionV2RenderResidualZoom)
++                ? Math.max(1.0, p.motionV2RenderResidualZoom) : 1.0;
++        double cropWidth = width / residualZoom;
++        double cropHeight = height / residualZoom;
++        double cropLeft = (width - cropWidth) * 0.5;
++        double cropTop = (height - cropHeight) * 0.5;
++        entries.add(rationalArray(TAG_DEFAULT_CROP_ORIGIN, new double[]{cropLeft, cropTop}));
++        entries.add(rationalArray(TAG_DEFAULT_CROP_SIZE, new double[]{cropWidth, cropHeight}));
++
++        addMatrix(entries, TAG_COLOR_MATRIX_1, p.ColorMatrix1);
++        addMatrix(entries, TAG_COLOR_MATRIX_2, p.ColorMatrix2);
++        addMatrix(entries, TAG_CAMERA_CALIBRATION_1, p.calibrationTransform1);
++        addMatrix(entries, TAG_CAMERA_CALIBRATION_2, p.calibrationTransform2);
++        entries.add(rationalArray(TAG_ANALOG_BALANCE, new double[]{1.0, 1.0, 1.0}));
++        if (p.whitePoint != null && p.whitePoint.length >= 3
++                && finitePositive(p.whitePoint[0]) && finitePositive(p.whitePoint[1])
++                && finitePositive(p.whitePoint[2])) {
++            entries.add(rationalArray(TAG_AS_SHOT_NEUTRAL, new double[]{
++                    p.whitePoint[0], p.whitePoint[1], p.whitePoint[2]}));
++        }
++        entries.add(sRationalArray(TAG_BASELINE_EXPOSURE, new double[]{0.0}));
++        if (p.calibrationIlluminant1 > 0) {
++            entries.add(shortEntry(TAG_CALIBRATION_ILLUMINANT_1,
++                    Math.min(65535, p.calibrationIlluminant1)));
++        }
++        if (p.calibrationIlluminant2 > 0 && validMatrix(p.ColorMatrix2)) {
++            entries.add(shortEntry(TAG_CALIBRATION_ILLUMINANT_2,
++                    Math.min(65535, p.calibrationIlluminant2)));
++        }
++        entries.add(longArray(TAG_ACTIVE_AREA, new long[]{0, 0, height, width}));
++        addMatrix(entries, TAG_FORWARD_MATRIX_1, p.ForwardTransform1);
++        addMatrix(entries, TAG_FORWARD_MATRIX_2, p.ForwardTransform2);
++        if (noiseProfile != null && noiseProfile.length == 6) {
++            boolean valid = true;
++            for (double v : noiseProfile) valid &= Double.isFinite(v) && v >= 0.0;
++            if (valid) entries.add(doubleArray(TAG_NOISE_PROFILE, noiseProfile));
++        }
++        entries.add(shortEntry(TAG_DEFAULT_BLACK_RENDER, 1));
++
++        entries.sort(Comparator.comparingInt(e -> e.tag));
++        int ifdBytes = 2 + entries.size() * 12 + 4;
++        long extraCursor = 8L + ifdBytes;
++        for (Entry e : entries) {
++            if (e.data.length > 4) {
++                extraCursor = align2(extraCursor);
++                e.externalOffset = extraCursor;
++                extraCursor += e.data.length;
++            }
++        }
++        long imageOffset = align2(extraCursor);
++        if (imageOffset > U32_MAX || imageOffset + pixelBytes > U32_MAX) {
++            throw new IOException("DNG offset range exceeds classic TIFF");
++        }
++        stripOffset.data[0] = (byte) (imageOffset & 0xff);
++        stripOffset.data[1] = (byte) ((imageOffset >>> 8) & 0xff);
++        stripOffset.data[2] = (byte) ((imageOffset >>> 16) & 0xff);
++        stripOffset.data[3] = (byte) ((imageOffset >>> 24) & 0xff);
++
++        ByteBuffer header = ByteBuffer.allocate((int) imageOffset).order(ByteOrder.LITTLE_ENDIAN);
++        header.put((byte) 'I').put((byte) 'I').putShort((short) 42).putInt(8);
++        header.putShort((short) entries.size());
++        for (Entry e : entries) {
++            header.putShort((short) e.tag);
++            header.putShort((short) e.type);
++            header.putInt((int) e.count);
++            if (e.data.length <= 4) {
++                header.put(e.data);
++                for (int i = e.data.length; i < 4; i++) header.put((byte) 0);
++            } else {
++                header.putInt((int) e.externalOffset);
++            }
++        }
++        header.putInt(0);
++        for (Entry e : entries) {
++            if (e.data.length <= 4) continue;
++            while (header.position() < e.externalOffset) header.put((byte) 0);
++            header.put(e.data);
++        }
++        while (header.position() < imageOffset) header.put((byte) 0);
++        return header.array();
++    }
++
++    private static void addMatrix(List<Entry> entries, int tag, float[] matrix) {
++        if (!validMatrix(matrix)) return;
++        double[] values = new double[9];
++        for (int i = 0; i < 9; i++) values[i] = matrix[i];
++        entries.add(sRationalArray(tag, values));
++    }
++
++    private static boolean validMatrix(float[] matrix) {
++        if (matrix == null || matrix.length < 9) return false;
++        boolean nonZero = false;
++        for (int i = 0; i < 9; i++) {
++            if (!Float.isFinite(matrix[i])) return false;
++            nonZero |= Math.abs(matrix[i]) > 1.0e-9f;
++        }
++        return nonZero;
++    }
++
++    private static boolean finitePositive(float value) {
++        return Float.isFinite(value) && value > 0.0f;
++    }
++
++    private static int exifOrientation(int rotationDegrees) {
++        int r = ((rotationDegrees % 360) + 360) % 360;
++        if (r == 90) return 6;
++        if (r == 180) return 3;
++        if (r == 270) return 8;
++        return 1;
++    }
++
++    private static long align2(long value) { return (value + 1L) & ~1L; }
++
++    private static Entry byteArray(int tag, byte[] values) {
++        return new Entry(tag, TYPE_BYTE, values.length, values.clone());
++    }
++
++    private static Entry ascii(int tag, String value) {
++        byte[] body = (value == null ? "" : value).getBytes(java.nio.charset.StandardCharsets.US_ASCII);
++        byte[] data = new byte[body.length + 1];
++        System.arraycopy(body, 0, data, 0, body.length);
++        return new Entry(tag, TYPE_ASCII, data.length, data);
++    }
++
++    private static Entry shortEntry(int tag, int value) {
++        return shortArray(tag, new int[]{value});
++    }
++
++    private static Entry shortArray(int tag, int[] values) {
++        ByteBuffer b = ByteBuffer.allocate(values.length * 2).order(ByteOrder.LITTLE_ENDIAN);
++        for (int v : values) b.putShort((short) (v & 0xffff));
++        return new Entry(tag, TYPE_SHORT, values.length, b.array());
++    }
++
++    private static Entry longEntry(int tag, long value) {
++        return longArray(tag, new long[]{value});
++    }
++
++    private static Entry longArray(int tag, long[] values) {
++        ByteBuffer b = ByteBuffer.allocate(values.length * 4).order(ByteOrder.LITTLE_ENDIAN);
++        for (long v : values) {
++            if (v < 0 || v > U32_MAX) throw new IllegalArgumentException("u32 overflow tag=" + tag);
++            b.putInt((int) v);
++        }
++        return new Entry(tag, TYPE_LONG, values.length, b.array());
++    }
++
++    private static Entry rationalArray(int tag, double[] values) {
++        ByteBuffer b = ByteBuffer.allocate(values.length * 8).order(ByteOrder.LITTLE_ENDIAN);
++        for (double value : values) {
++            long den = 1_000_000L;
++            long num = Math.round(Math.max(0.0, value) * den);
++            while (num > U32_MAX && den > 1) { num /= 10; den /= 10; }
++            b.putInt((int) Math.min(U32_MAX, num));
++            b.putInt((int) Math.max(1L, den));
++        }
++        return new Entry(tag, TYPE_RATIONAL, values.length, b.array());
++    }
++
++    private static Entry sRationalArray(int tag, double[] values) {
++        ByteBuffer b = ByteBuffer.allocate(values.length * 8).order(ByteOrder.LITTLE_ENDIAN);
++        for (double value : values) {
++            long den = 1_000_000L;
++            long num = Math.round(value * den);
++            while ((num > Integer.MAX_VALUE || num < Integer.MIN_VALUE) && den > 1) {
++                num /= 10; den /= 10;
++            }
++            b.putInt((int) Math.max(Integer.MIN_VALUE, Math.min(Integer.MAX_VALUE, num)));
++            b.putInt((int) Math.max(1L, den));
++        }
++        return new Entry(tag, TYPE_SRATIONAL, values.length, b.array());
++    }
++
++    private static Entry doubleArray(int tag, double[] values) {
++        ByteBuffer b = ByteBuffer.allocate(values.length * 8).order(ByteOrder.LITTLE_ENDIAN);
++        for (double value : values) b.putDouble(value);
++        return new Entry(tag, TYPE_DOUBLE, values.length, b.array());
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index e82fbc5..05d7016 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -64,12 +64,17 @@ public final class MotionV2Render extends Node {
+          */
+         float spatialReconstructionZoom = Math.max(1.0f,
+                 basePipeline.mParameters.motionV2SpatialReconstructionZoom);
++        /* IRIS_26532_20X_SR_GEOMETRY_IDENTITY
++         * MGC owns the crop through 20x total. Render owns only any residual request beyond the
++         * reconstruction crop, so reconstruction * residual == selected-lens local zoom exactly.
++         */
+         float irisOutputZoom = Math.max(1.0f,
+-                basePipeline.mParameters.motionV2OutputZoom);
+-        Log.i("MotionV2Render", "IRIS_26530_V1_3_FINAL_FOV_ZOOM requestedLocal="
++                basePipeline.mParameters.motionV2RenderResidualZoom);
++        Log.i("MotionV2Render", "IRIS_26532_FINAL_FOV_IDENTITY requestedLocal="
+                 + basePipeline.mParameters.motionV2OutputZoom
+                 + " srScale=" + spatialReconstructionZoom
+-                + " finalRenderLocal=" + irisOutputZoom);
++                + " renderResidual=" + irisOutputZoom
++                + " product=" + (spatialReconstructionZoom * irisOutputZoom));
+                 glProg.useAssetProgram("motionv2/render");
+         glProg.setTexture("InputBuffer", extendedLinearHdr);
+         glProg.setVar("sceneWhite", sceneWhite);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index d37b843..03bdc3c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -234,6 +234,14 @@ public class HdrxProcessor extends ProcessorBase {
+         Parameters processingParameters = new Parameters();
+         processingParameters.FillConstParameters(characteristics, new Point(width, height));
+         if (cameraMode == CameraMode.MOTION) {
++            /* IRIS_26532_SUPER_RES_CAPTURE_SNAPSHOT
++             * Freeze the public toggle before Motion reconstruction begins. A UI change after
++             * shutter cannot alter the in-flight JPEG/DNG pair.
++             */
++            processingParameters.motionV2SuperResOutputEnabled =
++                    com.particlesdevs.photoncamera.settings.PreferenceKeys.isIrisSuperResOn();
++            processingParameters.motionV2SuperResOutputScale =
++                    processingParameters.motionV2SuperResOutputEnabled ? 2.0f : 1.0f;
+             processingParameters.motionV2GlobalZoom = mMotion26524GlobalZoom;
+             processingParameters.motionV2OpticalZoomAnchor = mMotion26524OpticalZoomAnchor;
+             processingParameters.motionV2OutputZoom = mMotion26524OutputLocalZoom;
+@@ -561,6 +569,13 @@ public class HdrxProcessor extends ProcessorBase {
+ 
+         ByteBuffer output = null;
+         ByteBuffer motionV2HighlightProvenance = null;
++        /* IRIS_26532_STREAMED_2X_OUTPUTS */
++        String iris26532SuperResDetailPath = null;
++        int iris26532SuperResDetailWidth = 0;
++        int iris26532SuperResDetailHeight = 0;
++        String iris26532SuperResLinearRawPath = null;
++        int iris26532SuperResLinearRawWidth = 0;
++        int iris26532SuperResLinearRawHeight = 0;
+ 
+         /*
+          * IRIS_26379_PRODUCTION_DIAGNOSTIC_CLEANUP
+@@ -611,6 +626,12 @@ public class HdrxProcessor extends ProcessorBase {
+             motionV2HighlightProvenance = iris26409V2.highlightProvenance;
+             processingParameters.motionV2EffectiveSupport =
+                     iris26409V2.effectiveSupport;
++            iris26532SuperResDetailPath = iris26409V2.superResDetailPath;
++            iris26532SuperResDetailWidth = iris26409V2.superResDetailWidth;
++            iris26532SuperResDetailHeight = iris26409V2.superResDetailHeight;
++            iris26532SuperResLinearRawPath = iris26409V2.superResLinearRawPath;
++            iris26532SuperResLinearRawWidth = iris26409V2.superResLinearRawWidth;
++            iris26532SuperResLinearRawHeight = iris26409V2.superResLinearRawHeight;
+             /* IRIS_26520_V4_SHARED_NORMAL_BATCH_DNG */
+             iris26480DeferredDng = iris26409V2.stackedDngRaw16;
+             iris26522DeferredDngNoiseProfile = iris26409V2.dngNoiseProfile;
+@@ -647,22 +668,49 @@ public class HdrxProcessor extends ProcessorBase {
+                             + " sameAdmittedNormalPopulation=true shortLongBentoExcludedFromDng=true"
+                             + " secondAlignmentPass=false c4ffRgbOwnerUnchanged=true");
+             if (saveRAW == 2) {
+-                ByteBuffer iris26520RawOnly = iris26480DeferredDng;
+-                iris26480DeferredDng = null;
+-                iris26520RawOnly.position(0);
+-                boolean iris26520RawSaved = ImageSaver.Util.saveNormalized16StackedRaw(
+-                        dngFile, iris26520RawOnly, processingParameters,
+-                        iris26522DeferredDngNoiseProfile, iris26522DeferredDngFrameCount,
+-                        iris26522DngSupportMin, iris26522DngSupportP01, iris26522DngSupportP10,
+-                        iris26522DngSupportMedian, iris26522DngSupportMean, iris26522DngSupportMax,
+-                        iris26522DngNoiseEquivalentSupport);
++                final boolean iris26532SrDng = processingParameters.motionV2SuperResOutputEnabled
++                        && iris26532SuperResLinearRawPath != null
++                        && iris26532SuperResLinearRawWidth > 0
++                        && iris26532SuperResLinearRawHeight > 0;
++                boolean iris26520RawSaved;
++                if (iris26532SrDng) {
++                    iris26520RawSaved = com.particlesdevs.photoncamera.processing.IrisMotionSuperResDngWriter.write(
++                            dngFile, java.nio.file.Paths.get(iris26532SuperResLinearRawPath),
++                            iris26532SuperResLinearRawWidth, iris26532SuperResLinearRawHeight,
++                            processingParameters, iris26522DeferredDngNoiseProfile,
++                            iris26522DeferredDngFrameCount, iris26522DngSupportMin, iris26522DngSupportP01,
++                            iris26522DngSupportP10, iris26522DngSupportMedian, iris26522DngSupportMean,
++                            iris26522DngSupportMax, iris26522DngNoiseEquivalentSupport);
++                    if (iris26480DeferredDng != null) {
++                        try { Allocator.free(iris26480DeferredDng); } catch (Throwable ignored) {}
++                        iris26480DeferredDng = null;
++                    }
++                } else {
++                    ByteBuffer iris26520RawOnly = iris26480DeferredDng;
++                    iris26480DeferredDng = null;
++                    iris26520RawOnly.position(0);
++                    iris26520RawSaved = ImageSaver.Util.saveNormalized16StackedRaw(
++                            dngFile, iris26520RawOnly, processingParameters,
++                            iris26522DeferredDngNoiseProfile, iris26522DeferredDngFrameCount,
++                            iris26522DngSupportMin, iris26522DngSupportP01, iris26522DngSupportP10,
++                            iris26522DngSupportMedian, iris26522DngSupportMean, iris26522DngSupportMax,
++                            iris26522DngNoiseEquivalentSupport);
++                    try { Allocator.free(iris26520RawOnly); } catch (Throwable ignored) {}
++                }
+                 processingEventsListener.notifyImageSavedStatus(iris26520RawSaved, dngFile);
+-                try { Allocator.free(iris26520RawOnly); } catch (Throwable ignored) {}
+                 if (output != null) { try { Allocator.free(output); } catch (Throwable ignored) {} output = null; }
+                 if (motionV2HighlightProvenance != null) {
+                     try { Allocator.free(motionV2HighlightProvenance); } catch (Throwable ignored) {}
+                     motionV2HighlightProvenance = null;
+                 }
++                if (iris26532SuperResDetailPath != null) {
++                    try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(iris26532SuperResDetailPath)); } catch (Throwable ignored) {}
++                    iris26532SuperResDetailPath = null;
++                }
++                if (iris26532SuperResLinearRawPath != null) {
++                    try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(iris26532SuperResLinearRawPath)); } catch (Throwable ignored) {}
++                    iris26532SuperResLinearRawPath = null;
++                }
+                 processingEventsListener.onProcessingFinished("Motion stacked RAW Processing Finished");
+                 callback.onFinished();
+                 return;
+@@ -807,7 +855,15 @@ public class HdrxProcessor extends ProcessorBase {
+                             + " trueV2LinearGainMap=true"
+                             + " bodyGainUnity=true");
+             imageSaved = ImageSaver.Util.saveBitmapAsJPGMotionV2(
+-                    imageFile, img, ImageSaver.JPG_QUALITY, exifData);
++                    imageFile, img, ImageSaver.JPG_QUALITY, exifData,
++                    iris26532SuperResDetailPath,
++                    iris26532SuperResDetailWidth, iris26532SuperResDetailHeight,
++                    processingParameters, pipeline.cropSize);
++            if (iris26532SuperResDetailPath != null) {
++                try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(iris26532SuperResDetailPath)); } catch (Throwable ignored) {}
++                iris26532SuperResDetailPath = null;
++            }
++            // LinearRaw temp file may still be needed by deferred DNG; ownership resolves below.
+         } else {
+             imageSaved = ImageSaver.Util.saveBitmapAsJPG(
+                     imageFile, img, ImageSaver.JPG_QUALITY, exifData);
+@@ -846,18 +902,39 @@ public class HdrxProcessor extends ProcessorBase {
+                     dngSupportP10=iris26522DngSupportP10,dngSupportMedian=iris26522DngSupportMedian,
+                     dngSupportMean=iris26522DngSupportMean,dngSupportMax=iris26522DngSupportMax,
+                     dngNoiseEquivalent=iris26522DngNoiseEquivalentSupport;
++            final String srLinearRawPath=iris26532SuperResLinearRawPath;
++            final int srLinearRawWidth=iris26532SuperResLinearRawWidth;
++            final int srLinearRawHeight=iris26532SuperResLinearRawHeight;
++            final boolean srLinearDng=dngParams.motionV2SuperResOutputEnabled
++                    &&srLinearRawPath!=null&&srLinearRawWidth>0&&srLinearRawHeight>0;
+             MOTION_26480_OUTPUT_EXECUTOR.execute(()->{Integer old=null;try{int tid=android.os.Process.myTid();
+                 old=android.os.Process.getThreadPriority(tid);android.os.Process.setThreadPriority(tid,android.os.Process.THREAD_PRIORITY_BACKGROUND);
+-                dngBytes.position(0);boolean saved=ImageSaver.Util.saveNormalized16StackedRaw(
+-                        dngPath,dngBytes,dngParams,dngNoise,dngFrameCount,
+-                        dngSupportMin,dngSupportP01,dngSupportP10,dngSupportMedian,
+-                        dngSupportMean,dngSupportMax,dngNoiseEquivalent);
+-                processingEventsListener.notifyImageSavedStatus(saved,dngPath);Log.d(TAG,"IRIS_26480_DEFERRED_DNG_FINISHED saved="+saved);
++                final boolean saved;
++                if(srLinearDng){
++                    saved=com.particlesdevs.photoncamera.processing.IrisMotionSuperResDngWriter.write(
++                            dngPath,java.nio.file.Paths.get(srLinearRawPath),srLinearRawWidth,srLinearRawHeight,
++                            dngParams,dngNoise,dngFrameCount,dngSupportMin,dngSupportP01,dngSupportP10,
++                            dngSupportMedian,dngSupportMean,dngSupportMax,dngNoiseEquivalent);
++                }else{
++                    dngBytes.position(0);saved=ImageSaver.Util.saveNormalized16StackedRaw(
++                            dngPath,dngBytes,dngParams,dngNoise,dngFrameCount,
++                            dngSupportMin,dngSupportP01,dngSupportP10,dngSupportMedian,
++                            dngSupportMean,dngSupportMax,dngNoiseEquivalent);
++                }
++                processingEventsListener.notifyImageSavedStatus(saved,dngPath);Log.d(TAG,"IRIS_26480_DEFERRED_DNG_FINISHED saved="+saved+" srLinearRaw="+srLinearDng);
+             }catch(Exception e){Log.e(TAG,"IRIS_26480_DEFERRED_DNG_FAILED "+Log.getStackTraceString(e));}
+-            finally{try{Allocator.free(dngBytes);}catch(Throwable ignored){}if(old!=null)try{android.os.Process.setThreadPriority(android.os.Process.myTid(),old);}catch(Throwable ignored){}}});
++            finally{try{Allocator.free(dngBytes);}catch(Throwable ignored){}
++                if(srLinearRawPath!=null)try{java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(srLinearRawPath));}catch(Throwable ignored){}
++                if(old!=null)try{android.os.Process.setThreadPriority(android.os.Process.myTid(),old);}catch(Throwable ignored){}}});
+             iris26480DeferredDng=null;
++            iris26532SuperResLinearRawPath=null;
++        } else if (cameraMode==CameraMode.MOTION && iris26532SuperResLinearRawPath!=null) {
++            // No DNG was requested: JPEG was the only owner of the temporary LinearRaw stream.
++            try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(iris26532SuperResLinearRawPath)); } catch (Throwable ignored) {}
++            iris26532SuperResLinearRawPath=null;
+         }
+ 
++
+         pipeline.close();
+ 
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java
+index e28126f..dc943eb 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java
+@@ -45,6 +45,17 @@ public final class MotionV2Merger {
+         public final float dngSupportMean;
+         public final float dngSupportMax;
+         public final float dngNoiseEquivalentSupport;
++        /* IRIS_26532_STREAMED_2X_OUTPUTS
++         * JPEG uses a compact unsigned-Q8 log-luma detail stream (~1 byte/output pixel).
++         * A full RGB16 LinearRaw stream is created only when DNG is requested. Neither path
++         * materializes a 50 MP RGB Bitmap/FLOAT32/whole-image direct buffer.
++         */
++        public final String superResDetailPath;
++        public final int superResDetailWidth;
++        public final int superResDetailHeight;
++        public final String superResLinearRawPath;
++        public final int superResLinearRawWidth;
++        public final int superResLinearRawHeight;
+ 
+         Result(ByteBuffer raw, long referenceTimestamp, int inputFrames,
+                 float effectiveSupport, ByteBuffer highlightProvenance) {
+@@ -57,7 +68,8 @@ public final class MotionV2Merger {
+                 ByteBuffer stackedDngRaw16, int dngStackFrames) {
+             this(raw, referenceTimestamp, inputFrames, effectiveSupport, highlightProvenance,
+                     stackedDngRaw16, dngStackFrames, null,
+-                    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f);
++                    1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
++                    null, 0, 0, null, 0, 0);
+         }
+ 
+         Result(ByteBuffer raw, long referenceTimestamp, int inputFrames,
+@@ -67,6 +79,23 @@ public final class MotionV2Merger {
+                 float dngSupportMin, float dngSupportP01, float dngSupportP10,
+                 float dngSupportMedian, float dngSupportMean, float dngSupportMax,
+                 float dngNoiseEquivalentSupport) {
++            this(raw, referenceTimestamp, inputFrames, effectiveSupport, highlightProvenance,
++                    stackedDngRaw16, dngStackFrames, dngNoiseProfile,
++                    dngSupportMin, dngSupportP01, dngSupportP10, dngSupportMedian,
++                    dngSupportMean, dngSupportMax, dngNoiseEquivalentSupport,
++                    null, 0, 0, null, 0, 0);
++        }
++
++        Result(ByteBuffer raw, long referenceTimestamp, int inputFrames,
++                float effectiveSupport, ByteBuffer highlightProvenance,
++                ByteBuffer stackedDngRaw16, int dngStackFrames,
++                double[] dngNoiseProfile,
++                float dngSupportMin, float dngSupportP01, float dngSupportP10,
++                float dngSupportMedian, float dngSupportMean, float dngSupportMax,
++                float dngNoiseEquivalentSupport, String superResDetailPath,
++                int superResDetailWidth, int superResDetailHeight,
++                String superResLinearRawPath, int superResLinearRawWidth,
++                int superResLinearRawHeight) {
+             this.raw = raw;
+             this.referenceTimestamp = referenceTimestamp;
+             this.inputFrames = inputFrames;
+@@ -82,6 +111,12 @@ public final class MotionV2Merger {
+             this.dngSupportMean = dngSupportMean;
+             this.dngSupportMax = dngSupportMax;
+             this.dngNoiseEquivalentSupport = dngNoiseEquivalentSupport;
++            this.superResDetailPath = superResDetailPath;
++            this.superResDetailWidth = Math.max(0, superResDetailWidth);
++            this.superResDetailHeight = Math.max(0, superResDetailHeight);
++            this.superResLinearRawPath = superResLinearRawPath;
++            this.superResLinearRawWidth = Math.max(0, superResLinearRawWidth);
++            this.superResLinearRawHeight = Math.max(0, superResLinearRawHeight);
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index d739329..24ca28c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -13,6 +13,7 @@ import android.os.Build
+ import com.hinnka.mycamera.model.SafeImage
+ import com.hinnka.mycamera.processor.GlesGpuScheduler
+ import com.hinnka.mycamera.processor.GlesMgcRawFusion
++import com.hinnka.mycamera.camera.MultiFrameConfig
+ import com.hinnka.mycamera.processor.GpuLinearRgbStorage
+ import com.hinnka.mycamera.processor.MgcMergeMethod
+ import com.hinnka.mycamera.processor.MgcSpatialOutputMode
+@@ -33,6 +34,7 @@ import com.particlesdevs.photoncamera.processing.render.Parameters
+ import com.particlesdevs.photoncamera.util.Allocator
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
++import java.io.File
+ import kotlin.math.pow
+ 
+ /**
+@@ -66,6 +68,9 @@ object PhotonMotionMgc1271Bridge {
+         var egl: EglOwner? = null
+         var halfBuffer: ByteBuffer? = null
+         var resultTexture = 0
++        var superResDetailPathForCleanup: String? = null
++        var superResLinearRawPathForCleanup: String? = null
++        var superResOutputsHandedOff = false
+         try {
+             requireParity(Build.SUPPORTED_ABIS.any { it == "arm64-v8a" },
+                 "pinned MGC 1.27.1 AOT is arm64-only; device ABIs=${Build.SUPPORTED_ABIS.contentToString()}")
+@@ -195,28 +200,39 @@ object PhotonMotionMgc1271Bridge {
+                 )
+             }
+ 
+-            /* IRIS_26530_SR_RECONSTRUCTION_ZOOM
+-             * Only digitally enlarged high-zoom captures enter crop-aware RAW SR. Native/low zoom
+-             * retains the exact 26529 Spatial mapping. 2x is a conservative subpixel-reconstruction
+-             * cap; any remaining requested crop is left to MotionV2Render.
++            /* IRIS_26532_20X_TOTAL_SR_AUTHORITY
++             * "20x" is displayed/equivalent FOV, not a 20x output-size multiplier. The selected
++             * physical lens owns its optical anchor. Spatial directly reconstructs the requested
++             * crop through 20x total; any request above 20x remains a final residual crop.
+              */
+             val displayedGlobalZoom = parameters.motionV2GlobalZoom
+                 .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+             val localOutputZoom = parameters.motionV2OutputZoom
+                 .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+-            val spatialReconstructionZoom = if (
+-                displayedGlobalZoom >= 8f && localOutputZoom > 1.0001f
+-            ) minOf(2f, localOutputZoom) else 1f
++            val opticalAnchor = parameters.motionV2OpticalZoomAnchor
++                .takeIf { it.isFinite() && it > 0f }
++                ?: (displayedGlobalZoom / localOutputZoom).coerceAtLeast(0.05f)
++            val srTotalZoom = minOf(displayedGlobalZoom, 20.0f)
++            val spatialReconstructionZoom = if (localOutputZoom > 1.0001f) {
++                (srTotalZoom / opticalAnchor).coerceIn(1f, localOutputZoom)
++            } else 1f
++            val renderResidualZoom = (localOutputZoom / spatialReconstructionZoom)
++                .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+             parameters.motionV2SpatialReconstructionZoom = spatialReconstructionZoom
+-            /* IRIS_26530_V1_3_FOV_AUTHORITY
+-             * SR scale controls reconstruction sampling only. The final JPEG/UHDR FOV remains the
+-             * full requested local zoom; do not divide that authority by the SR scale.
+-             */
+-            PLog.i(TAG, "IRIS_26530_MOTION_SAFE_RAW_SUPERRES " +
+-                "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
++            parameters.motionV2RenderResidualZoom = renderResidualZoom
++            requireParity(
++                kotlin.math.abs(spatialReconstructionZoom * renderResidualZoom - localOutputZoom)
++                    <= 1.0e-3f * maxOf(1f, localOutputZoom),
++                "26532 SR geometry identity failed local=$localOutputZoom recon=$spatialReconstructionZoom residual=$renderResidualZoom",
++            )
++            val fixedOutputScale = if (parameters.motionV2SuperResOutputEnabled) 2f else 1f
++            parameters.motionV2SuperResOutputScale = fixedOutputScale
++            PLog.i(TAG, "IRIS_26532_20X_TOTAL_SR " +
++                "displayedGlobalZoom=$displayedGlobalZoom opticalAnchor=$opticalAnchor " +
++                "localOutputZoom=$localOutputZoom srTotalZoom=$srTotalZoom " +
+                 "spatialReconstructionZoom=$spatialReconstructionZoom " +
+-                "finalRenderLocalZoom=$localOutputZoom threshold=8.0 cap=2.0 " +
+-                "motionAuthority=existingSpatialRejection cfaGeometry=sharedGreenOpponent")
++                "renderResidualZoom=$renderResidualZoom outputScale=$fixedOutputScale " +
++                "srTotalCap=20.0 fixedSuperResScale=2.0")
+ 
+             egl = EglOwner.create()
+             val fusion = GlesMgcRawFusion(
+@@ -232,18 +248,36 @@ object PhotonMotionMgc1271Bridge {
+                 lensShadingHeight = lscHeight,
+                 outputMode = MgcSpatialOutputMode.RGB,
+                 mergeMethod = MgcMergeMethod.SPATIAL_RGB,
+-                outputScale = 1f,
++                outputScale = fixedOutputScale,
+                 reconstructionZoom = spatialReconstructionZoom,
+                 displayedGlobalZoom = displayedGlobalZoom,
+                 useCurrentGlContext = true,
+                 exportGpuLinearRgbSource = true,
+                 gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
+                 exportNormalStackedDng = produceNormalStackedDng,
++                superResTempDir = PhotonCamera.getApplicationContextStatic().cacheDir,
++                superResWriteLinearRaw = produceNormalStackedDng,
+             )
+             val stacked = fusion.processFrames(frames)
+                 ?: invalid("pinned Spatial RGB owner returned null")
+-            requireParity(stacked.width == size.x && stacked.height == size.y,
+-                "output geometry ${stacked.width}x${stacked.height} != ${size.x}x${size.y}")
++            val expectedSuperResWidth = MultiFrameConfig.scaledRawOutputDimension(size.x, fixedOutputScale)
++            val expectedSuperResHeight = MultiFrameConfig.scaledRawOutputDimension(size.y, fixedOutputScale)
++            val expectedOutputWidth = if (fixedOutputScale > 1f) size.x else expectedSuperResWidth
++            val expectedOutputHeight = if (fixedOutputScale > 1f) size.y else expectedSuperResHeight
++            requireParity(stacked.width == expectedOutputWidth && stacked.height == expectedOutputHeight,
++                "base output geometry ${stacked.width}x${stacked.height} != ${expectedOutputWidth}x${expectedOutputHeight}")
++            if (fixedOutputScale > 1f) {
++                requireParity(
++                    stacked.superResWidth == expectedSuperResWidth &&
++                        stacked.superResHeight == expectedSuperResHeight,
++                    "SR evidence geometry ${stacked.superResWidth}x${stacked.superResHeight} != " +
++                        "${expectedSuperResWidth}x$expectedSuperResHeight",
++                )
++                requireParity(stacked.superResDetailPath != null, "missing streamed 2x detail evidence")
++                if (produceNormalStackedDng) {
++                    requireParity(stacked.superResLinearRawPath != null, "missing streamed 2x LinearRaw DNG evidence")
++                }
++            }
+             requireParity(stacked.bufferLayout == RawStackBufferLayout.LINEAR_RGB,
+                 "output layout=${stacked.bufferLayout}")
+             requireParity(stacked.isNormalizedSensorData, "output is not normalized sensor data")
+@@ -264,8 +298,8 @@ object PhotonMotionMgc1271Bridge {
+                 "missing/malformed propagated read noise")
+             requireParity(shotNoise?.size == 3 && shotNoise.all { it.isFinite() && it >= 0f },
+                 "missing/malformed propagated shot noise")
+-            requireParity(strength != null && strength.width == (size.x + 3) / 4 &&
+-                    strength.height == (size.y + 3) / 4,
++            requireParity(strength != null && strength.width == (expectedOutputWidth + 3) / 4 &&
++                    strength.height == (expectedOutputHeight + 3) / 4,
+                 "missing/malformed Spatial strength map")
+             requireParity(tuningSnr != null && tuningSnr.isFinite() && tuningSnr >= 0f,
+                 "missing/malformed MGC tuning SNR")
+@@ -275,11 +309,6 @@ object PhotonMotionMgc1271Bridge {
+             GLES30.glFinish()
+             gpu.stackCompletionTimeline?.releasePending()
+             resultTexture = gpu.textureId
+-            val denoiseBuffer = readRgba16f(resultTexture, size.x, size.y)
+-            halfBuffer = denoiseBuffer
+-            GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
+-            resultTexture = 0
+-            checkGl("delete exported MGC RGB")
+ 
+             val denoiseMetadata = RawMetadata(
+                 cfaPattern = cfa,
+@@ -309,6 +338,26 @@ object PhotonMotionMgc1271Bridge {
+                 requireParity(MgcFullResolutionDenoise.ensureInitialized(
+                     PhotonCamera.getApplicationContextStatic()),
+                     "MGC denoise tuning assets failed initialization")
++            }
++
++            var superResDetailPath: String? = stacked.superResDetailPath
++            var superResDetailWidth = stacked.superResWidth
++            var superResDetailHeight = stacked.superResHeight
++            var superResLinearRawPath: String? = stacked.superResLinearRawPath
++            var superResLinearRawWidth = stacked.superResWidth
++            var superResLinearRawHeight = stacked.superResHeight
++            if (fixedOutputScale > 1f) {
++                superResDetailPathForCleanup = superResDetailPath
++                superResLinearRawPathForCleanup = superResLinearRawPath
++            }
++            /* IRIS_26532_MEMORY_SAFE_STREAMED_2X
++             * The stacker has already reconstructed/streamed 2x evidence band-by-band and
++             * downsampled the base carrier before its native-size chroma pass. Downstream Photon
++             * therefore sees the same native-size carrier contract as 26531 in both toggle states.
++             */
++            val denoiseBuffer = readRgba16f(resultTexture, size.x, size.y)
++            halfBuffer = denoiseBuffer
++            if (runFullResolutionDenoise) {
+                 requireParity(MgcFullResolutionDenoise.denoise(
+                     rgba16f = denoiseBuffer,
+                     width = size.x,
+@@ -327,21 +376,26 @@ object PhotonMotionMgc1271Bridge {
+                     pass = MgcFullResolutionDenoise.Pass.SPATIAL_DEFAULT,
+                     lumaStrengthScale = lumaScale,
+                     chromaStrengthScale = chromaScale,
+-                ), "MGC SPATIAL_DEFAULT denoise rejected its propagated state")
++                ), "MGC SPATIAL_DEFAULT native carrier denoise rejected its propagated state")
+             }
+-            PLog.i(TAG, "IRIS_26530_V1_3_DENOISE_ZOOM_AUTHORITY " +
++            forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
++            val output: ByteBuffer = convertHalfRgbaToFloatRgba(
++                denoiseBuffer, size.x, size.y,
++            )
++            GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
++            resultTexture = 0
++            checkGl("delete exported MGC RGB")
++
++            PLog.i(TAG, "IRIS_26532_DENOISE_SR_AUTHORITY " +
+                 "master=${irisSettings.noiseReductionEnabled} " +
+                 "requestedLuma=$requestedLumaScale effectiveMgcLuma=$lumaScale " +
+                 "chroma=$chromaScale executed=$runFullResolutionDenoise " +
+                 "srScale=$spatialReconstructionZoom requestedLocalZoom=$localOutputZoom " +
+-                "finalFovZoom=$displayedGlobalZoom finalRenderLocalZoom=$localOutputZoom " +
++                "finalFovZoom=$displayedGlobalZoom renderResidual=$renderResidualZoom " +
++                "outputScale=$fixedOutputScale banded2x=${fixedOutputScale > 1f} " +
++                "fullHighResPostTexture=false baseCarrier=${size.x}x${size.y} " +
+                 "pass=SPATIAL_DEFAULT legacyPhotonNr=false sabreSelected=false")
+ 
+-            // MGC's RGBA storage does not encode Photon/Wronski local support. Alpha=1 makes
+-            // 26507 display_exposure's localRatio exactly zero while preserving global display gain.
+-            forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+-            val output = convertHalfRgbaToFloatRgba(denoiseBuffer, size.x, size.y)
+-
+             val baselineScale = stacked.baselineExposureEv
+                 ?.takeIf { it.isFinite() }
+                 ?.let { 2.0.pow(it.toDouble()).toFloat() }
+@@ -405,6 +459,7 @@ object PhotonMotionMgc1271Bridge {
+                 "displayGain=${parameters.motionV2DisplayGain} " +
+                 "crossContext=float32_rgba_cpu alphaSupport=disabled")
+ 
++            superResOutputsHandedOff = true
+             return MotionV2Merger.Result(
+                 output,
+                 mgcBase.timestamp,
+@@ -421,6 +476,12 @@ object PhotonMotionMgc1271Bridge {
+                 stacked.normalStackedDngSupportMean,
+                 stacked.normalStackedDngSupportMax,
+                 stacked.normalStackedDngNoiseEquivalentSupport,
++                superResDetailPath,
++                superResDetailWidth,
++                superResDetailHeight,
++                superResLinearRawPath,
++                superResLinearRawWidth,
++                superResLinearRawHeight,
+             )
+         } catch (error: Throwable) {
+             PLog.e(TAG, "MGC PARITY ARCHITECTURE INVALID", error)
+@@ -435,6 +496,10 @@ object PhotonMotionMgc1271Bridge {
+                 GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
+             }
+             LargeDirectBuffer.free(halfBuffer)
++            if (!superResOutputsHandedOff) {
++                superResDetailPathForCleanup?.let { path -> runCatching { File(path).delete() } }
++                superResLinearRawPathForCleanup?.let { path -> runCatching { File(path).delete() } }
++            }
+             egl?.close()
+             inputImages.forEach { frame ->
+                 if (frame.buffer != null) runCatching { frame.close() }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index e240869..1ca5f48 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -78,6 +78,12 @@ public class Parameters {
+      * by motionV2OutputZoom, preserving the 26525 one-crop DNG contract.
+      */
+     public float motionV2SpatialReconstructionZoom = 1.0f;
++    /* IRIS_26532_20X_SR_GEOMETRY_IDENTITY
++     * reconstructionZoom * renderResidualZoom == requested selected-lens local zoom.
++     */
++    public float motionV2RenderResidualZoom = 1.0f;
++    public boolean motionV2SuperResOutputEnabled = false;
++    public float motionV2SuperResOutputScale = 1.0f;
+     public float motionV2HardwareZoom = 1.0f;
+     public float motionV2ResidualSoftwareZoom = 1.0f;
+     public int realWL = -1;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index 3c223d3..5e245be 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -38,7 +38,51 @@ public final class MotionV2Jpeg444Encoder {
+         }catch(Throwable t){Log.e(TAG,"IRIS_26507_JPEG444_FAILED",t);return false;}
+         finally{try{if(base!=null)Files.deleteIfExists(base);}catch(Throwable ignored){}try{if(gain!=null)Files.deleteIfExists(gain);}catch(Throwable ignored){}}
+     }
++
++    /** IRIS_26532_STREAMING_SUPER_RES_JPEG
++     * The proven native-resolution bitmap remains the color/tone/UHDR authority. The Q16 detail
++     * map carries only MGC's 2x high-frequency luma. Native libjpeg consumes output scanlines, so
++     * no 50 MP Android Bitmap or full RGB output buffer is ever allocated.
++     */
++    public static boolean writeSuperRes(
++            Path output, Bitmap bitmap, int quality, String detailPath,
++            int detailWidth, int detailHeight,
++            int rawWidth, int rawHeight, int cropWidth, int cropHeight,
++            int rotation, boolean mirror, float renderResidualZoom) {
++        if(output==null||bitmap==null||bitmap.isRecycled()||detailPath==null||detailPath.isEmpty())return false;
++        Path base=null,gain=null;
++        try{
++            boolean hasGain=Build.VERSION.SDK_INT>=34&&bitmap.hasGainmap();
++            Path target=output;
++            if(hasGain){
++                base=output.resolveSibling("."+output.getFileName()+".26532.sr.base.jpg");
++                gain=output.resolveSibling("."+output.getFileName()+".26532.sr.gain.jpg");
++                Files.deleteIfExists(base);Files.deleteIfExists(gain);Files.deleteIfExists(output);target=base;
++            }
++            boolean baseOk=writeSuperResNative(bitmap,detailPath,detailWidth,detailHeight,
++                    rawWidth,rawHeight,cropWidth,cropHeight,rotation,mirror,
++                    Math.max(1.0f,renderResidualZoom),target.toString(),Math.max(1,Math.min(100,quality)));
++            if(!baseOk)return false;
++            if(!hasGain){
++                Log.i(TAG,"IRIS_26532_STREAMING_SUPER_RES_JPEG encoded=true scale=2 gainmap=false");
++                return true;
++            }
++            Gainmap gm=bitmap.getGainmap(); if(gm==null)return false;
++            Bitmap contents=gm.getGainmapContents();
++            if(contents==null||contents.isRecycled()||!encodeGainmapNative(contents,gain.toString(),GAINMAP_QUALITY))return false;
++            boolean ok=packageJpegRNative(base.toString(),gain.toString(),output.toString(),0,
++                    gm.getRatioMin(),gm.getRatioMax(),gm.getGamma(),gm.getEpsilonSdr(),gm.getEpsilonHdr(),
++                    gm.getMinDisplayRatioForHdrTransition(),gm.getDisplayRatioForFullHdr(),true)
++                    &&isJpegRNative(output.toString());
++            Log.i(TAG,"IRIS_26532_STREAMING_SUPER_RES_JPEG encoded="+ok+" scale=2 gainmap=true jpegR="+ok);
++            return ok;
++        }catch(Throwable t){Log.e(TAG,"IRIS_26532_STREAMING_SUPER_RES_JPEG_FAILED",t);return false;}
++        finally{try{if(base!=null)Files.deleteIfExists(base);}catch(Throwable ignored){}try{if(gain!=null)Files.deleteIfExists(gain);}catch(Throwable ignored){}}
++    }
+     private static native boolean writeNative(Bitmap bitmap,String path,int quality);
++    private static native boolean writeSuperResNative(Bitmap bitmap,String detailPath,
++            int detailWidth,int detailHeight,int rawWidth,int rawHeight,int cropWidth,int cropHeight,
++            int rotation,boolean mirror,float renderResidualZoom,String path,int quality);
+     private static native boolean encodeGainmapNative(Bitmap bitmap,String path,int quality);
+     private static native boolean packageJpegRNative(String base,String gain,String output,int gamut,
+             float[] ratioMin,float[] ratioMax,float[] gamma,float[] epsSdr,float[] epsHdr,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+index 7a709e8..a7ee4a0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+@@ -44,6 +44,8 @@ public class PreferenceKeys {
+         COMMON_KEYS.add(Key.KEY_AE_MODE.mValue);
+         COMMON_KEYS.add(Key.CAMERA_MODE.mValue);
+         COMMON_KEYS.add(Key.KEY_SAVE_RAW.mValue);
++        // IRIS_26532_SUPER_RES_GLOBAL_TOGGLE: one public capture preference, never per-lens JSON.
++        COMMON_KEYS.add(Key.KEY_IRIS_SUPER_RES.mValue);
+     }
+ 
+     private final SettingsManager settingsManager;
+@@ -68,6 +70,7 @@ public class PreferenceKeys {
+         settingsManager.setInitial(SCOPE_GLOBAL, Key.CAMERA_MODE, resources.getString(R.string.pref_camera_mode_default));
+         settingsManager.setInitial(SCOPE_GLOBAL, Key.KEY_COUNTDOWN_TIMER, 0);
+         settingsManager.setInitial(SCOPE_GLOBAL, Key.KEY_BRACKETING_MODE, 0); // Default to disable bracketing
++        settingsManager.setInitial(SCOPE_GLOBAL, Key.KEY_IRIS_SUPER_RES, false);
+         settingsManager.setInitial(SCOPE_GLOBAL, Key.KEY_VIDEO_RESOLUTION, resources.getString(R.string.pref_video_resolution_default));
+         settingsManager.setInitial(SCOPE_GLOBAL, Key.KEY_RAWVIDEO_DOWNSCALE_4X, false);
+         settingsManager.setInitial(SCOPE_GLOBAL, Key.KEY_RAWVIDEO_WRITE_ZIP, true);
+@@ -392,6 +395,15 @@ public class PreferenceKeys {
+         preferenceKeys.settingsManager.set(SCOPE_GLOBAL, Key.KEY_BRACKETING_MODE, value);
+     }
+ 
++    /** IRIS_26532_FIXED_2X_SUPER_RES_TOGGLE */
++    public static boolean isIrisSuperResOn() {
++        return preferenceKeys.settingsManager.getBoolean(SCOPE_GLOBAL, Key.KEY_IRIS_SUPER_RES);
++    }
++
++    public static void setIrisSuperRes(boolean value) {
++        preferenceKeys.settingsManager.set(SCOPE_GLOBAL, Key.KEY_IRIS_SUPER_RES, value);
++    }
++
+     public static void setCameraID(String value) {
+         preferenceKeys.settingsManager.set(Key.CAMERAS_PREFERENCE_FILE_NAME.mValue, Key.CAMERA_ID, value);
+     }
+@@ -496,6 +508,7 @@ public class PreferenceKeys {
+         KEY_AF_MODE(R.string.pref_af_mode_key),
+         KEY_AE_MODE(R.string.pref_ae_mode_key),
+         KEY_BRACKETING_MODE(R.string.pref_bracketing_key),
++        KEY_IRIS_SUPER_RES(R.string.pref_iris_super_res_key),
+         KEY_COUNTDOWN_TIMER(R.string.pref_countdown_timer_key),
+         /**
+          * Enhanced settings keys
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/SettingType.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/SettingType.java
+index 4d7b434..e0842a9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/SettingType.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/SettingType.java
+@@ -10,5 +10,6 @@ public enum SettingType {
+     EIS,
+     RAW,
+     BATTERY_SAVER,
+-    BRACKETING
++    BRACKETING,
++    SUPER_RES
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraActivity.java
+index deff4af..795545e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraActivity.java
+@@ -70,6 +70,11 @@ public class CameraActivity extends BaseActivity {
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
++        if (savedInstanceState == null) {
++            /* IRIS_26532_NEW_CAMERA_ACTIVITY_ONE_X */
++            com.particlesdevs.photoncamera.control.IrisZoomController
++                    .resetForNewCameraActivitySession();
++        }
+         Log.d("CameraActivity", "Called onCreate()");
+         // Hide system UI immediately to prevent flickering (like gallery view)
+         hideSystemUI();
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+index 7081286..9eb60be 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+@@ -349,6 +349,12 @@ case R.id.flash_button:
+                         PreferenceKeys.setBracketingMode((Integer) value);
+                         IsoExpoSelector.HDR = (Integer) value > 0;
+                         break;
++                    case SUPER_RES:
++                        /* IRIS_26532_FIXED_2X_SUPER_RES_TOGGLE
++                         * Capture-time only: changing it never restarts Camera2 or changes pinch FOV.
++                         */
++                        PreferenceKeys.setIrisSuperRes(value.equals(1));
++                        break;
+ 
+ 
+                 }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
+index 5fe14ba..2452a5c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
+@@ -45,6 +45,8 @@ public class SettingsBarEntryProvider extends ViewModel {
+     private final SettingsBarEntryModel saveRawEntry = SettingsBarEntryModel.newEntry(R.id.saveraw_entry_layout, R.string.raw_string, SettingType.RAW);
+     private final SettingsBarEntryModel batterySaverEntry = SettingsBarEntryModel.newEntry(R.id.batterysaver_entry_layout, R.string.energy_saving, SettingType.BATTERY_SAVER);
+     private final SettingsBarEntryModel bracketingEntry = SettingsBarEntryModel.newEntry(R.id.bracketing_entry_layout, R.string.exposure_bracketing, SettingType.BRACKETING);
++    /* IRIS_26532_FIXED_2X_SUPER_RES_UI */
++    private final SettingsBarEntryModel superResEntry = SettingsBarEntryModel.newEntry(R.id.super_res_entry_layout, R.string.super_res, SettingType.SUPER_RES);
+     private final List<SettingsBarEntryModel> allEntries = new ArrayList<>(8);
+ 
+     public SettingsBarEntryProvider() {
+@@ -58,6 +60,7 @@ public class SettingsBarEntryProvider extends ViewModel {
+         allEntries.add(gridEntry);
+         allEntries.add(batterySaverEntry);
+         allEntries.add(bracketingEntry);
++        allEntries.add(superResEntry);
+     }
+ 
+     public void createEntries() {
+@@ -71,6 +74,7 @@ public class SettingsBarEntryProvider extends ViewModel {
+         createGridEntry();
+         createBatterySaverEntry();
+         createBracketingEntry();
++        createSuperResEntry();
+         updateAllEntries();
+     }
+ 
+@@ -85,6 +89,7 @@ public class SettingsBarEntryProvider extends ViewModel {
+         updateEntry(saveRawEntry, PreferenceKeys.isSaveRaw());
+         updateEntry(batterySaverEntry, PreferenceKeys.isBatterySaverOn());
+         updateEntry(bracketingEntry, PreferenceKeys.getBracketingMode());
++        updateEntry(superResEntry, PreferenceKeys.isIrisSuperResOn());
+     }
+ 
+     public void addObserver(Observer<TopBarSettingsData<?, ?>> observer) {
+@@ -144,6 +149,14 @@ public class SettingsBarEntryProvider extends ViewModel {
+         );
+     }
+ 
++    private void createSuperResEntry() {
++        // Reuse the existing themed two-state icon pair so the row matches the gear popup.
++        superResEntry.addSettingsBarButtonModels(
++                SettingsBarButtonModel.newButtonModel(R.id.super_res_off_button, R.drawable.ic_quad_off, R.string.off, 0, superResEntry),
++                SettingsBarButtonModel.newButtonModel(R.id.super_res_on_button, R.drawable.ic_quad_on, R.string.on, 1, superResEntry)
++        );
++    }
++
+     private void createFlashEntry() {
+         flashEntry.addSettingsBarButtonModels(
+                 SettingsBarButtonModel.newButtonModel(R.id.torch_button, R.drawable.ic_torch, R.string.torch, 0, flashEntry),
+diff --git a/app/src/main/res/values/ids.xml b/app/src/main/res/values/ids.xml
+index 010c427..81f2c05 100644
+--- a/app/src/main/res/values/ids.xml
++++ b/app/src/main/res/values/ids.xml
+@@ -44,4 +44,7 @@
+     <item name="bracketing_off_button" type="id"/>
+     <item name="bracketing_normal_button" type="id"/>
+     <item name="bracketing_high_button" type="id"/>
++    <item name="super_res_entry_layout" type="id"/>
++    <item name="super_res_off_button" type="id"/>
++    <item name="super_res_on_button" type="id"/>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index 5a375e0..0f58fc3 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -193,4 +193,6 @@
+     <string name="perm_rationale_audio_message">Microphone access is required for video recording with audio.</string>
+     <string name="perm_rationale_dcim_title">DCIM Folder Access</string>
+     <string name="perm_rationale_dcim_message">Access to the DCIM folder is required for saving RAW video files and reading device custom configs.</string>
++    <string name="super_res">Super Res</string>
++    <string name="pref_iris_super_res_key">pref_iris_super_res</string>
+ </resources>
