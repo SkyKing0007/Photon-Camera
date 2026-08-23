@@ -1,0 +1,416 @@
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+@@ -2730,8 +2730,7 @@
+         #version 300 es
+         precision highp float;
+         precision highp int;
+-        /* IRIS_26530_V1_3_FINAL_BAYER_ALIGNMENT_AUTHORITY */
+-        uniform sampler2D uAlignment;
++        uniform sampler2D uFlow;
+         uniform ivec2 uOutputSize;
+         uniform ivec2 uOutputOrigin;
+         uniform int uComponent;
+@@ -2739,7 +2738,7 @@
+         void main() {
+             vec2 local = gl_FragCoord.xy - vec2(uOutputOrigin);
+             vec2 uv = local / vec2(uOutputSize);
+-            oAlignment = texture(uAlignment, uv)[uComponent];
++            oAlignment = texture(uFlow, uv)[uComponent];
+         }
+     """.trimIndent()
+ 
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+@@ -1328,7 +1328,7 @@
+                         capture = capture,
+                         frameIndex = capturedFrameIndex++,
+                         calibration = referenceCalibration,
+-                        alignmentTexture = zeroFlow,
++                        flowTexture = zeroFlow,
+                         weightTexture = bentoBaseWeight,
+                         identityWeight = false,
+                     )
+@@ -1368,7 +1368,7 @@
+                         capture = capture,
+                         frameIndex = capturedFrameIndex++,
+                         calibration = checkNotNull(bentoCalibration),
+-                        alignmentTexture = bentoBayerAlignmentTexture,
++                        flowTexture = bentoFlowTexture,
+                         weightTexture = bentoShortWeight,
+                         identityWeight = false,
+                     )
+@@ -1406,7 +1406,7 @@
+                         capture = capture,
+                         frameIndex = capturedFrameIndex++,
+                         calibration = referenceCalibration,
+-                        alignmentTexture = zeroFlow,
++                        flowTexture = zeroFlow,
+                         weightTexture = identityWeight,
+                         identityWeight = true,
+                     )
+@@ -1490,7 +1490,7 @@
+                                 val alignedLongClippingMask =
+                                     renderAlignedLongFrameClippingMask(
+                                         rawTexture = temporalRaw,
+-                                        alignmentTexture = prepared.bayerAlignmentTexture,
++                                        flowTexture = prepared.flowTexture,
+                                     )
+                                 PLog.d(
+                                     TAG,
+@@ -1595,7 +1595,7 @@
+                             capture = capture,
+                             frameIndex = capturedFrameIndex++,
+                             calibration = prepared.calibration,
+-                            alignmentTexture = prepared.bayerAlignmentTexture,
++                            flowTexture = prepared.flowTexture,
+                             weightTexture = mergeWeight,
+                             identityWeight = identityTemporalWeights,
+                         )
+@@ -1853,25 +1853,6 @@
+                     values[channel] * outputExposure.readNoiseVarianceScale
+                 }
+             }
+-            /* IRIS_26530_V1_3_PROPAGATED_OUTPUT_SNR
+-             * FinishRaw denoise must use the noise model after real alignment/rejection/output
+-             * exposure transport, not the pre-merge reference SNR or nominal frame count.
+-             */
+-            val propagatedOutputSnr = if (outputReadNoise != null && outputShotNoise != null) {
+-                MgcSpatialMergeTuning.outputNoiseModelSnr(
+-                    signal = bayerKernelTuning.referenceSignal *
+-                        outputExposure.normalizationScale,
+-                    greenReadVariance = outputReadNoise.getOrElse(1) { Float.NaN },
+-                    greenShotNoiseFactor = outputShotNoise.getOrElse(1) { Float.NaN },
+-                )
+-            } else {
+-                null
+-            }
+-            val finishRawDenoiseSnr = propagatedOutputSnr
+-                ?: MgcSpatialMergeTuning.mergedSnr(
+-                    bayerKernelTuning.referenceSnr,
+-                    mergedFrames,
+-                )
+             if (spatialDenoiseEnabled) {
+                 checkNotNull(spatialNoiseModel) {
+                     "MGC Spatial output noise coefficients were not produced"
+@@ -1908,13 +1889,6 @@
+                 TAG,
+                 "MGC Spatial ${outputMode.name} merge complete frames=$mergedFrames " +
+                     "output=${outputWidth}x$outputHeight " +
+-                    "referenceSnr=${bayerKernelTuning.referenceSnr} " +
+-                    "finishRawDenoiseSnr=$finishRawDenoiseSnr " +
+-                    "finishRawDenoiseSnrSource=${if (propagatedOutputSnr != null) {
+-                        "spatial-output-noise-model"
+-                    } else {
+-                        "reference-snr-frame-count-fallback"
+-                    }} " +
+                     "lscApplied=$lensShadingCorrectionApplied result=$resultLabel " +
+                     "programInit=${programInitMs}ms " +
+                     "queueMode=${if (outputMode == MgcSpatialOutputMode.RGB) {
+@@ -1970,11 +1944,13 @@
+                 mgcSpatialStrengthMap = spatialNoiseModel?.strengthMap?.let(
+                     ::mapSpatialStrengthToOutputCoordinates,
+                 ),
+-                /* IRIS_26530_V1_3_PROPAGATED_OUTPUT_SNR
+-                 * Denoise tuning follows Spatial's propagated post-rejection output NoiseModel.
+-                 * Sharpening remains disabled/frozen and retains the reference diagnostic only.
++                /* IRIS_26518_RELEASED_1271_RESULT_ABI_SNR_BRIDGE
++                 * Released c4ff already computes bayerKernelTuning.referenceSnr and uses it for
++                 * its Spatial kernel selection. Its historical RawStackResult predates the later
++                 * process-local tuning-SNR fields. Export that same c4ff value into the newer ABI
++                 * only; do not import post-Sabre Spatial tuning or Sabre TET attenuation math.
+                  */
+-                mgcDenoiseTuningSnr = finishRawDenoiseSnr,
++                mgcDenoiseTuningSnr = bayerKernelTuning.referenceSnr,
+                 mgcSharpenTuningSnr = bayerKernelTuning.referenceSnr,
+                 mgcSpatialReferenceOnlyDiagnostic = referenceOnly,
+                 normalStackedDngRaw16 = normalStackedDngRaw16,
+@@ -2458,21 +2434,19 @@
+             shotNoise = shot,
+             readNoise = read,
+         )
+-        /* IRIS_26530_V1_3_MGC_EXPECTED_MERGE_WEIGHT
+-         * Use the recovered Spatial expected-merge weight at the reference signal. This carries
+-         * both shot and read noise into the exposure-normalized comparison; per-pixel motion
+-         * rejection remains a separate multiplicative authority in the merge shader.
+-         */
+-        val globalFrameWeight = MgcSpatialMergeTuning.expectedMergeWeight(
+-            referenceSignal = kernelTuning.referenceSignal,
+-            baseShotNoiseFactor = kernelTuning.referenceGreenShotNoiseFactor,
+-            baseReadVariance = kernelTuning.referenceGreenReadVariance,
+-            alternateShotNoiseFactor = sourceShot.getOrElse(1) { 0f },
+-            alternateReadVariance = sourceRead.getOrElse(1) { 0f },
+-            exposureScale = exposureScale,
+-        ).takeIf { it.isFinite() && it > 0f }
++        val computedFrameWeight = if (
++            kernelTuning.referenceNoiseVariance > MIN_NOISE_VARIANCE &&
++            frameNoiseVariance > MIN_NOISE_VARIANCE
++        ) {
++            (kernelTuning.referenceNoiseVariance / frameNoiseVariance)
++                .coerceIn(0f, SPATIAL_FRAME_WEIGHT_CAP)
++        } else {
++            1f
++        }
++        val globalFrameWeight = computedFrameWeight
++            .takeIf { it.isFinite() && it > 0f }
+             ?: SPATIAL_IDENTITY_MULTIPLIER
+-        val frameKernelScale = MgcSpatialMergeTuning.frameWeightKernelMultiplier(globalFrameWeight)
++        val frameKernelScale = spatialFrameWeightKernelScale(globalFrameWeight)
+         val computedKernelSigma = 1f / (
+             kernelTuning.baseSpatialScale * frameKernelScale
+             ).coerceAtLeast(MIN_BAYER_KERNEL_SCALE)
+@@ -2489,11 +2463,7 @@
+             shotNoise = shot,
+             readNoise = read,
+             greenClippingPoint = greenClip.takeIf { it.isFinite() && it > 0f } ?: Float.MAX_VALUE,
+-            /* IRIS_26530_V1_3_MGC_ALIGNMENT_S16_SCALE */
+-            alignmentGain = MgcAlignmentInputScale.compute(
+-                frameGain = exposureScale,
+-                whiteLevel = sensorWhiteLevel,
+-            ),
++            alignmentGain = exposureScale,
+             unblockerShotNoise = unblockerShot,
+             unblockerReadNoise = unblockerRead,
+             cameraRgbShotNoise = cameraRgbShot,
+@@ -2613,6 +2583,18 @@
+             .takeIf { it.isFinite() && it >= 0f } ?: 0f
+     }
+ 
++    private fun spatialFrameWeightKernelScale(frameWeight: Float): Float {
++        if (frameWeight <= SPATIAL_FRAME_WEIGHT_CURVE_START) return 1f
++        if (frameWeight >= SPATIAL_FRAME_WEIGHT_CURVE_END) {
++            return SPATIAL_FRAME_WEIGHT_KERNEL_SCALE_END
++        }
++        val position = (
++            (frameWeight - SPATIAL_FRAME_WEIGHT_CURVE_START) /
++                (SPATIAL_FRAME_WEIGHT_CURVE_END - SPATIAL_FRAME_WEIGHT_CURVE_START)
++            ).coerceIn(0f, 1f)
++        return 1f + position * (SPATIAL_FRAME_WEIGHT_KERNEL_SCALE_END - 1f)
++    }
++
+     private fun buildGrayPyramid(
+         rawTexture: Int,
+         calibration: FrameCalibration,
+@@ -4269,7 +4251,7 @@
+         capture: StrengthCapture,
+         frameIndex: Int,
+         calibration: FrameCalibration,
+-        alignmentTexture: Int,
++        flowTexture: Int,
+         weightTexture: Int,
+         identityWeight: Boolean,
+     ) {
+@@ -4280,7 +4262,7 @@
+             val outputOriginX = capture.alignmentLayout.originX(slot)
+             val outputOriginY = capture.alignmentLayout.originY(slot)
+             GLES30.glUseProgram(strengthAlignmentProgram)
+-            bindTexture(strengthAlignmentProgram, "uAlignment", 0, alignmentTexture)
++            bindTexture(strengthAlignmentProgram, "uFlow", 0, flowTexture)
+             uniform2i(
+                 strengthAlignmentProgram,
+                 "uOutputSize",
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -535,7 +535,7 @@
+ }
+ 
+ /**
+- * Iris-owned GLSL translation of the latest post-c317 MGC Spatial-RGB post-fusion behavior.
++ * Iris-owned GLSL translation of the c317/MGC Spatial-RGB post-fusion behavior.
+  * The mathematical invariants are intentionally recognizable; ownership and integration are Iris.
+  */
+ internal object Iris26529SpatialRgbChromaShaders {
+@@ -568,17 +568,17 @@
+             return clamp(vec3(decodeU16(e.r),decodeU16(e.g),decodeU16(e.b))*uCalculationGains,vec3(0.0),vec3(65504.0));
+         }
+         float yAt(ivec2 p){ return dot(calculationRgbAt(p),vec3(0.25,0.5,0.25)); }
+-        /* IRIS_26530_V1_3_RGB_DIRECTION_ONLY
+-         * Bjzhou's post-c317 MGC audit supersedes fused-green direction-moment steering here.
+-         * The fused RGB/Y gradient now owns the post-fusion chroma direction decision.
+-         */
++        float snorm8(uint x){ int v=int(x&255u); if(v>127)v-=256; return clamp(float(v)/127.0,-1.0,1.0); }
++        vec2 directionMomentAt(ivec2 p){ uint a=imageLoad(uInput,safePos(p)).a; return vec2(snorm8(a),snorm8(a>>8u)); }
+         uint directionMaskAt(ivec2 p){
+             const ivec2 d[8]=ivec2[8](ivec2(0,-1),ivec2(1,0),ivec2(0,1),ivec2(-1,0),ivec2(1,-1),ivec2(1,1),ivec2(-1,1),ivec2(-1,-1));
+-            float center=yAt(p); float g[8]; float lo=65504.0; float hi=0.0;
++            const vec2 axis2[8]=vec2[8](vec2(-1,0),vec2(1,0),vec2(-1,0),vec2(1,0),vec2(0,-1),vec2(0,1),vec2(0,-1),vec2(0,1));
++            float center=yAt(p); vec2 moment=directionMomentAt(p); float g[8]; float lo=65504.0; float hi=0.0;
+             for(int i=0;i<8;++i){
+                 float first=yAt(p+d[i]); float second=yAt(p+d[i]*2);
+                 float rgbGradient=abs(center-first)+0.5*abs(first-second);
+-                g[i]=rgbGradient; lo=min(lo,g[i]); hi=max(hi,g[i]);
++                float structureScale=clamp(1.0+0.5*dot(moment,axis2[i]),0.5,1.5);
++                g[i]=rgbGradient*structureScale; lo=min(lo,g[i]); hi=max(hi,g[i]);
+             }
+             float threshold=max(uMinimumDirectionGradient,1.5*lo+0.09375*(hi-lo));
+             int mask=0; int count=0;
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/MgcAlignmentInputScale.kt b/app/src/main/java/com/hinnka/mycamera/processor/MgcAlignmentInputScale.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/MgcAlignmentInputScale.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/MgcAlignmentInputScale.kt
+@@ -1,10 +1,6 @@
+ package com.hinnka.mycamera.processor
+ 
+-/**
+- * IRIS_26530_V1_3_MGC_ALIGNMENT_S16_SCALE
+- * Exact fixed-point input scaling recovered from MGC V25 BuildAlignPyramidForBurst:
+- * frame gain times 16384 divided by StaticMetadata.white_level + 1.
+- */
++/** Fixed-point input scaling used by MGC's RAW alignment pyramid. */
+ internal object MgcAlignmentInputScale {
+     const val S16_DOMAIN_SCALE = 16384f
+ 
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialMergeTuning.kt b/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialMergeTuning.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialMergeTuning.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialMergeTuning.kt
+@@ -23,21 +23,6 @@
+         return snr * sqrt(frameCount.coerceAtLeast(0).toFloat())
+     }
+ 
+-    /* IRIS_26530_V1_3_PROPAGATED_OUTPUT_SNR */
+-    fun outputNoiseModelSnr(
+-        signal: Float,
+-        greenReadVariance: Float,
+-        greenShotNoiseFactor: Float,
+-    ): Float? {
+-        if (!signal.isFinite() || signal < 0f ||
+-            !greenReadVariance.isFinite() || greenReadVariance < 0f ||
+-            !greenShotNoiseFactor.isFinite() || greenShotNoiseFactor < 0f
+-        ) return null
+-        val variance = greenReadVariance + greenShotNoiseFactor * signal
+-        if (!variance.isFinite() || variance <= 0f) return null
+-        return (signal / sqrt(variance)).takeIf { it.isFinite() && it >= 0f }
+-    }
+-
+     /**
+      * Recovered from SpatialMergeParams::BuildForSnr at libgcastartup.so+0x386b3cc.
+      * The curve input is the merged-stack SNR, not the base-frame SNR.
+@@ -97,41 +82,9 @@
+             .coerceAtMost(MAXIMUM_MERGE_WEIGHT_CAP)
+     }
+ 
+-    /* IRIS_26530_V1_3_MGC_EXPECTED_MERGE_WEIGHT
+-     * Recovered Spatial ExpectedMergeWeight: compare shot+read variance at the reference signal
+-     * after transporting the alternate frame into the base exposure domain.
+-     */
+-    fun expectedMergeWeight(
+-        referenceSignal: Float,
+-        baseShotNoiseFactor: Float,
+-        baseReadVariance: Float,
+-        alternateShotNoiseFactor: Float,
+-        alternateReadVariance: Float,
+-        exposureScale: Float,
+-        frameWeightExponent: Float = DEFAULT_FRAME_WEIGHT_EXPONENT,
+-    ): Float {
+-        require(referenceSignal.isFinite() && referenceSignal >= 0f)
+-        require(baseShotNoiseFactor.isFinite() && baseShotNoiseFactor >= 0f)
+-        require(baseReadVariance.isFinite() && baseReadVariance >= 0f)
+-        require(alternateShotNoiseFactor.isFinite() && alternateShotNoiseFactor >= 0f)
+-        require(alternateReadVariance.isFinite() && alternateReadVariance >= 0f)
+-        require(exposureScale.isFinite() && exposureScale > 0f)
+-        require(frameWeightExponent.isFinite() && frameWeightExponent >= 0f)
+-        val baseVariance = baseShotNoiseFactor * referenceSignal + baseReadVariance
+-        val scaledAlternateVariance =
+-            alternateShotNoiseFactor * exposureScale * referenceSignal +
+-                alternateReadVariance * exposureScale * exposureScale
+-        check(scaledAlternateVariance > 0f) {
+-            "MGC Spatial requires positive alternate variance at the reference signal"
+-        }
+-        return (baseVariance / scaledAlternateVariance)
+-            .pow(frameWeightExponent)
+-            .coerceAtMost(MAXIMUM_MERGE_WEIGHT_CAP)
+-    }
+-
+     /** Static MGC map initialized from libgcastartup.so rodata at 0x6b6e40. */
+-    fun frameWeightKernelMultiplier(mergeWeight: Float): Float = interpolate(
+-        mergeWeight.takeIf { it.isFinite() } ?: 0f,
++    fun frameWeightKernelMultiplier(maximumMergeWeight: Float): Float = interpolate(
++        maximumMergeWeight.takeIf { it.isFinite() } ?: 0f,
+         10f to 1f,
+         30f to 1.414000034332275f,
+     )
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -58,18 +58,18 @@
+          */
+         float sceneWhite = Math.max(
+                 1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));
+-        /* IRIS_26530_V1_3_FOV_AUTHORITY
+-         * motionV2OutputZoom is the final FOV authority. SR reconstruction scale must not divide
+-         * the JPEG/UHDR crop request; doing so produced the measured ~2x-wide 123x frame.
++        /* IRIS_26530_RENDER_RESIDUAL_ZOOM
++         * The requested DNG/output zoom remains unchanged in Parameters. JPEG/UHDR only performs
++         * the crop not already reconstructed from multiframe RAW samples.
+          */
+         float spatialReconstructionZoom = Math.max(1.0f,
+                 basePipeline.mParameters.motionV2SpatialReconstructionZoom);
+         float irisOutputZoom = Math.max(1.0f,
+-                basePipeline.mParameters.motionV2OutputZoom);
+-        Log.i("MotionV2Render", "IRIS_26530_V1_3_FINAL_FOV_ZOOM requestedLocal="
++                basePipeline.mParameters.motionV2OutputZoom / spatialReconstructionZoom);
++        Log.i("MotionV2Render", "IRIS_26530_RENDER_RESIDUAL_ZOOM requestedLocal="
+                 + basePipeline.mParameters.motionV2OutputZoom
+-                + " srScale=" + spatialReconstructionZoom
+-                + " finalRenderLocal=" + irisOutputZoom);
++                + " spatial=" + spatialReconstructionZoom
++                + " residual=" + irisOutputZoom);
+                 glProg.useAssetProgram("motionv2/render");
+         glProg.setTexture("InputBuffer", extendedLinearHdr);
+         glProg.setVar("sceneWhite", sceneWhite);
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -208,14 +208,11 @@
+                 displayedGlobalZoom >= 8f && localOutputZoom > 1.0001f
+             ) minOf(2f, localOutputZoom) else 1f
+             parameters.motionV2SpatialReconstructionZoom = spatialReconstructionZoom
+-            /* IRIS_26530_V1_3_FOV_AUTHORITY
+-             * SR scale controls reconstruction sampling only. The final JPEG/UHDR FOV remains the
+-             * full requested local zoom; do not divide that authority by the SR scale.
+-             */
++            val renderResidualZoom = localOutputZoom / spatialReconstructionZoom
+             PLog.i(TAG, "IRIS_26530_MOTION_SAFE_RAW_SUPERRES " +
+                 "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
+                 "spatialReconstructionZoom=$spatialReconstructionZoom " +
+-                "finalRenderLocalZoom=$localOutputZoom threshold=8.0 cap=2.0 " +
++                "renderResidualZoom=$renderResidualZoom threshold=8.0 cap=2.0 " +
+                 "motionAuthority=existingSpatialRejection cfaGeometry=sharedGreenOpponent")
+ 
+             egl = EglOwner.create()
+@@ -296,15 +293,10 @@
+                 channelNoiseProfile = if (irisSettings.customNoiseModelEnabled)
+                     floatArrayOf() else reference.motionV2NoiseProfile.copyOf(),
+             )
+-            /* IRIS_26530_V1_3_ZERO_MGC_LUMA
+-             * The Motion master may still run chroma cleanup, but explicit full-resolution MGC
+-             * luma denoise is zero so temporal/SR reconstruction is not smoothed a second time.
+-             */
+-            val requestedLumaScale = irisSettings.lumaDenoise
+-            val lumaScale = 0f
++            val lumaScale = irisSettings.lumaDenoise
+             val chromaScale = irisSettings.chromaDenoise
+             val runFullResolutionDenoise = irisSettings.noiseReductionEnabled &&
+-                chromaScale > 0f
++                (lumaScale > 0f || chromaScale > 0f)
+             if (runFullResolutionDenoise) {
+                 requireParity(MgcFullResolutionDenoise.ensureInitialized(
+                     PhotonCamera.getApplicationContextStatic()),
+@@ -329,13 +321,9 @@
+                     chromaStrengthScale = chromaScale,
+                 ), "MGC SPATIAL_DEFAULT denoise rejected its propagated state")
+             }
+-            PLog.i(TAG, "IRIS_26530_V1_3_DENOISE_ZOOM_AUTHORITY " +
+-                "master=${irisSettings.noiseReductionEnabled} " +
+-                "requestedLuma=$requestedLumaScale effectiveMgcLuma=$lumaScale " +
+-                "chroma=$chromaScale executed=$runFullResolutionDenoise " +
+-                "srScale=$spatialReconstructionZoom requestedLocalZoom=$localOutputZoom " +
+-                "finalFovZoom=$displayedGlobalZoom finalRenderLocalZoom=$localOutputZoom " +
+-                "pass=SPATIAL_DEFAULT legacyPhotonNr=false sabreSelected=false")
++            PLog.i(TAG, "IRIS_26514_DENOISE master=${irisSettings.noiseReductionEnabled} " +
++                "luma=$lumaScale chroma=$chromaScale executed=$runFullResolutionDenoise " +
++                "legacyPhotonNr=false")
+ 
+             // MGC's RGBA storage does not encode Photon/Wronski local support. Alpha=1 makes
+             // 26507 display_exposure's localRatio exactly zero while preserving global display gain.
