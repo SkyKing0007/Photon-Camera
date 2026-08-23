@@ -1,6 +1,6 @@
-26531 V1.1 latest-MGC Spatial / zero-luma / corrected-FOV handoff
+26531 V1.2 latest-MGC Spatial / zero-luma / corrected-FOV handoff
 
-V1.1 infrastructure correction: removes accidental backup-branch creation from the first 26531 handoff. Runtime forward/rollback patches are byte-identical; build/version remain 0.9726531 / 26531.
+V1.2 infrastructure correction: removes accidental backup-branch creation from the first 26531 handoff. Runtime forward/rollback patches are byte-identical; build/version remain 0.9726531 / 26531.
 
 Upload the CONTENTS of this ZIP to the root of branch:
   experimental-clean-photon-rebuild
@@ -33,3 +33,5 @@ Primary on-device checks after a successful build:
 4. Moving people/cars/leaves/hair/branches at >=8x: no new clumping, zippering, ghosting, or colored blocks.
 5. Harsh highlights/text edges: no pink/magenta/green line/dot/block recurrence.
 6. Keep DNG and logs; telemetry should show requestedLuma, effectiveMgcLuma=0.0, chroma, srScale, requestedLocalZoom, finalFovZoom, finalRenderLocalZoom, pass=SPATIAL_DEFAULT, sabreSelected=false.
+
+V1.2 correction: removed generated Python __pycache__/*.pyc entries from 26531_HANDOFF_HASHES.sha256 and added a permanent cache-entry guard. Runtime forward/rollback patches are byte-identical to V1.1; build/version remains 0.9726531 / 26531.
