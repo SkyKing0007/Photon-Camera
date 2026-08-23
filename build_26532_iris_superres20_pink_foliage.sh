@@ -114,6 +114,15 @@ SOURCE_TAR="${SOURCE_TARS[0]}"; SOURCE_MANIFEST="${SOURCE_MANIFESTS[0]}"
 [[ "$(sha "$SOURCE_TAR")" == "$EXPECTED_BASE_TAR_SHA" ]] || fail "26531 source tar SHA drift"
 [[ "$(sha "$SOURCE_MANIFEST")" == "$EXPECTED_BASE_MANIFEST_SHA" ]] || fail "26531 source manifest SHA drift"
 [[ "$(wc -l < "$SOURCE_MANIFEST")" -eq "$EXPECTED_BASE_FILES" ]] || fail "26531 source manifest count drift"
+python3 - "$SOURCE_TAR" <<'PY'
+import sys,tarfile
+with tarfile.open(sys.argv[1],'r:gz') as t:
+    names=[m.name.lstrip('./') for m in t.getmembers() if m.name not in ('.','./')]
+for n in names:
+    if not (n in {'app','app/','app/src','app/src/','app/src/main','app/src/main/','app/version.properties'} or n.startswith('app/src/main/')):
+        raise SystemExit('unexpected path in 26531 candidate archive: '+n)
+print('PASS: 26531 archive contains runtime source + version only')
+PY
 tar -xzf "$SOURCE_TAR" -C "$BASE"
 ( cd "$BASE" && sha256sum -c "$SOURCE_MANIFEST" ) > "$OUT/26531_source_manifest_check.txt"
 [[ "$(grep '^VERSION_NAME=' "$BASE/app/version.properties" | cut -d= -f2)" == "0.9726531" ]] || fail "base version name mismatch"
@@ -176,15 +185,18 @@ pass "version increment + pre-Gradle candidate freeze complete"
 echo "=== 26532 GATE 4B: restore exact pinned native dependencies inherited from successful 26531 ==="
 rm -rf "$BJ"; git init -q "$BJ"
 git -C "$BJ" remote add origin https://github.com/bjzhou/PhotonCamera.git
-git -C "$BJ" config core.sparseCheckout true
-mkdir -p "$BJ/.git/info"
-cat > "$BJ/.git/info/sparse-checkout" <<'SPARSE'
-/app/src/main/cpp/libjpeg-turbo/
-/app/src/main/cpp/libultrahdr/
-SPARSE
 git -C "$BJ" fetch --depth=1 origin "$BJZHOU_VENDOR_HEAD"
-git -C "$BJ" checkout -q --detach FETCH_HEAD
-[[ "$(git -C "$BJ" rev-parse HEAD)" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor checkout drift"
+FETCHED_VENDOR_HEAD="$(git -C "$BJ" rev-parse FETCH_HEAD)"
+[[ "$FETCHED_VENDOR_HEAD" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor FETCH_HEAD drift"
+# V1.2: avoid sparse-checkout materialization ambiguity. Prove both exact trees exist
+# in the pinned commit, then extract only those two paths directly from that commit tree.
+git -C "$BJ" cat-file -e "$FETCHED_VENDOR_HEAD:app/src/main/cpp/libjpeg-turbo/CMakeLists.txt" \
+  || fail "pinned commit does not contain libjpeg-turbo/CMakeLists.txt"
+git -C "$BJ" cat-file -e "$FETCHED_VENDOR_HEAD:app/src/main/cpp/libultrahdr/CMakeLists.txt" \
+  || fail "pinned commit does not contain libultrahdr/CMakeLists.txt"
+git -C "$BJ" archive "$FETCHED_VENDOR_HEAD" -- \
+  app/src/main/cpp/libjpeg-turbo \
+  app/src/main/cpp/libultrahdr | tar -x -C "$BJ"
 THIRD="$AFTER/app/src/main/cpp/third_party_26507"
 rm -rf "$THIRD"; mkdir -p "$THIRD"
 cp -a "$BJ/app/src/main/cpp/libjpeg-turbo" "$THIRD/libjpeg-turbo"
@@ -225,9 +237,10 @@ cmp -s "$OUT/26532_pre_gradle_audited_runtime.sha256" "$OUT/26532_installed_pre_
 [[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/CMakeLists.txt" ]] || fail "pinned libultrahdr missing immediately before Gradle"
 ( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26532_installed_vendor_manifest_check_prebuild.txt"
 
-./gradlew --no-daemon :app:compileDebugKotlin :app:compileDebugJavaWithJavac
-pass "Kotlin + Java compile gates"
-./gradlew --no-daemon :app:assembleDebug
+chmod +x ./gradlew
+./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace
+pass "real Android Kotlin + Java compile gates passed"
+./gradlew :app:assembleDebug --stacktrace
 pass "assembleDebug"
 
 echo "=== 26532 GATE 6: post-build source + semantic revalidation ==="
@@ -259,7 +272,8 @@ mv "${APKS[0]}" "$FINAL"
 sha256sum "$FINAL" | tee "$OUT/26532_APK.sha256"
 
 cp "$OUT/26532_pre_gradle_audited_runtime.sha256" "$OUT/26532_candidate_source.sha256"
-tar -czf "$OUT/26532_candidate_app_source.tar.gz" -C "$AFTER" app/src/main app/version.properties
+tar --sort=name --mtime='UTC 2026-08-23 00:00:00' --owner=0 --group=0 --numeric-owner \
+  -czf "$OUT/26532_candidate_app_source.tar.gz" -C "$AFTER" app/src/main app/version.properties
 sha256sum "$OUT/26532_candidate_app_source.tar.gz" > "$OUT/26532_candidate_app_source.tar.gz.sha256"
 VERIFY="$WORK/verify_next_candidate"; mkdir -p "$VERIFY"; tar -xzf "$OUT/26532_candidate_app_source.tar.gz" -C "$VERIFY"
 ( cd "$VERIFY" && sha256sum -c "$OUT/26532_candidate_source.sha256" ) > "$OUT/26532_next_candidate_manifest_check.txt"
@@ -288,6 +302,8 @@ EOF
 
 # Do not allow any second APK into the uploaded proof bundle.
 [[ "$(find "$ROOT" -maxdepth 1 -type f -name '*.apk' -print | wc -l)" -eq 1 ]] || fail "root APK cardinality is not exactly one"
-pass "single APK + exact next-candidate source archive"
+pass "26532 exact successful-26531 artifact + certified patch-first safety proof"
+pass "26532 native/bootstrap + shader/API/DNG compile/build gates"
+pass "26532 guarded version/Gradle/postbuild + deterministic next candidate"
 echo "PASS: 26532 STRICT HANDOFF BUILD COMPLETE"
 echo "APK=$FINAL"
