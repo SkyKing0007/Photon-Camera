@@ -1,0 +1,487 @@
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+@@ -1455,6 +1455,28 @@
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26530_MOTION_SAFE_RAW_SUPERRES
++     * High-zoom-only derivative of the proven 26529 joint CFA shader. The legacy mergeRgb
++     * string above is untouched and remains the <8x path. Spatial reconstruction maps the
++     * requested crop directly into the original output grid; one shared green-driven geometry
++     * remains authoritative for G/R-G/B-G so red/blue can never invent independent edge motion.
++     * Luma temporal scaling applies only to green semantic/value support. Chroma opponents keep
++     * the full rejection/global-frame weights for strong color-noise suppression.
++     */
++    val mergeRgbSuperRes = mergeRgb
++        .replace(
++            "uniform ivec2 uOutputSize;",
++            "uniform ivec2 uOutputSize;\nuniform float uReconstructionZoom;\nuniform float uLumaTemporalScale;",
++        )
++        .replace(
++            "vec2 referenceRaw = (vec2(outputPixel) + vec2(0.5)) *\n                vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);",
++            "vec2 fullRaw = (vec2(outputPixel) + vec2(0.5)) *\n                vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);\n            vec2 rawCenter = (vec2(uRawSize) - vec2(1.0)) * 0.5;\n            vec2 referenceRaw = rawCenter + (fullRaw - rawCenter) / max(uReconstructionZoom, 1.0);",
++        )
++        .replace(
++            "frameWeight *= uGlobalFrameWeight;\n            vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n            oColorAndRWeight = vec4(semanticSums * frameWeight, weights.r * frameWeight);\n            oGbWeights = vec4(\n                weights.gb * frameWeight,\n                directionMoment * weights.r * frameWeight\n            );",
++            "frameWeight *= uGlobalFrameWeight;\n            float lumaFrameWeight = frameWeight * clamp(uLumaTemporalScale, 0.0, 1.0);\n            vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n            oColorAndRWeight = vec4(\n                semanticSums.r * lumaFrameWeight,\n                semanticSums.g * frameWeight,\n                semanticSums.b * frameWeight,\n                weights.r * lumaFrameWeight\n            );\n            oGbWeights = vec4(\n                weights.gb * frameWeight,\n                directionMoment * weights.r * lumaFrameWeight\n            );",
++        )
++
+     val normalizeRgb16 = """
+         #version 300 es
+         precision highp float;
+@@ -1512,6 +1534,20 @@
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26530_SUPERRES_LSC_SENSOR_COORDINATE
++     * Crop-aware SR must sample lens shading at the reconstructed sensor coordinate, not at the
++     * post-crop output coordinate. This avoids radial R/G/B gain errors and pink/green edges.
++     */
++    val normalizeRgb16SuperRes = normalizeRgb16
++        .replace(
++            "uniform ivec2 uOutputSize;",
++            "uniform ivec2 uOutputSize;\nuniform ivec2 uRawSize;\nuniform float uReconstructionZoom;",
++        )
++        .replace(
++            "vec2 uv = (vec2(outputPixel) + vec2(0.5)) / vec2(uOutputSize);",
++            "vec2 fullRaw = (vec2(outputPixel) + vec2(0.5)) * vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);\n                vec2 rawCenter = (vec2(uRawSize) - vec2(1.0)) * 0.5;\n                vec2 referenceRaw = rawCenter + (fullRaw - rawCenter) / max(uReconstructionZoom, 1.0);\n                vec2 uv = (referenceRaw + vec2(0.5)) / vec2(uRawSize);",
++        )
++
+     /** Float variant used only for the direct CPU black-box boundary. */
+     val normalizeRgbFloat = """
+         #version 300 es
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+@@ -50,6 +50,8 @@
+     private val lensShadingHeight: Int,
+     private val outputMode: MgcSpatialOutputMode,
+     outputScale: Float,
++    private val reconstructionZoom: Float = 1f,
++    private val displayedGlobalZoom: Float = 1f,
+     private val useCurrentGlContext: Boolean,
+     private val exportGpuLinearRgbSource: Boolean,
+     private val gpuLinearRgbStorage: GpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16UI,
+@@ -441,6 +443,13 @@
+     private var alignedRawClippingMaskProgram = 0
+     private var mergeBayerProgram = 0
+     private var mergeRgbProgram = 0
++    /* IRIS_26530_LOW_ZOOM_LEGACY_SHADER_ISOLATION */
++    private var mergeRgbSuperResProgram = 0
++    private var normalizeRgbSuperResProgram = 0
++    private var iris26530LumaAuxScale = 1f
++    private var iris26530LumaTargetFrames = 0f
++    private val iris26530SuperResEnabled = outputMode == MgcSpatialOutputMode.RGB &&
++        displayedGlobalZoom >= 8f && reconstructionZoom > 1.0001f
+     private var normalizeBayerProgram = 0
+     /* IRIS_26522_DNG_EFFECTIVE_SUPPORT_Q8 */
+     private var normalDngSupportProgram = 0
+@@ -1216,6 +1225,18 @@
+             }
+             val spatialNoiseFrameCount =
+                 1 + (if (bentoAccepted) 1 else 0) + temporalMergeCount
++            if (iris26530SuperResEnabled) {
++                iris26530LumaTargetFrames = iris26530TargetEffectiveLumaFrames(displayedGlobalZoom)
++                    .coerceAtMost(spatialNoiseFrameCount.toFloat())
++                iris26530LumaAuxScale = iris26530AuxiliaryLumaScale(
++                    frameCount = spatialNoiseFrameCount,
++                    targetEffectiveFrames = iris26530LumaTargetFrames,
++                )
++                PLog.i(TAG, "IRIS_26530_GCAM_LUMA_EFFECTIVE_STACK " +
++                    "displayedGlobalZoom=$displayedGlobalZoom frames=$spatialNoiseFrameCount " +
++                    "target=${iris26530LumaTargetFrames} auxiliaryScale=$iris26530LumaAuxScale " +
++                    "referenceScale=1.0 chromaScale=full motionGate=existingSpatialRejection")
++            }
+             if (MultiFrameConfig.ENABLE_MGC_SPATIAL_DEFAULT_DENOISE &&
+                 !referenceOnly &&
+                 spatialNoiseFrameCount > 1
+@@ -1974,6 +1995,38 @@
+      * Bayer normalization weight. This keeps Spatial kernel geometry and temporal rejection in
+      * the variance calculation without the 26522 sum-then-square bias.
+      */
++    /* IRIS_26530_GCAM_LUMA_EFFECTIVE_STACK
++     * Static fully-accepted regions are calibrated to the tuned-GCam 8x reference: seven
++     * effective luma frames through 50x, rising smoothly to nine by 120x. The reference keeps
++     * unit weight; only auxiliary green/luma weights are reduced. Existing per-pixel rejection
++     * remains multiplicative, so motion can only reduce auxiliary contribution further.
++     */
++    private fun iris26530TargetEffectiveLumaFrames(globalZoom: Float): Float {
++        if (!globalZoom.isFinite() || globalZoom < 8f) return 0f
++        if (globalZoom <= 50f) return 7f
++        val t = ((globalZoom - 50f) / 70f).coerceIn(0f, 1f)
++        return 7f + 2f * (t * t * (3f - 2f * t))
++    }
++
++    private fun iris26530AuxiliaryLumaScale(
++        frameCount: Int,
++        targetEffectiveFrames: Float,
++    ): Float {
++        if (frameCount <= 1 || targetEffectiveFrames >= frameCount.toFloat()) return 1f
++        val target = targetEffectiveFrames.coerceIn(1f, frameCount.toFloat())
++        val auxiliaries = (frameCount - 1).toFloat()
++        var lo = 0f
++        var hi = 1f
++        repeat(40) {
++            val beta = 0.5f * (lo + hi)
++            val sum = 1f + auxiliaries * beta
++            val sumSquares = 1f + auxiliaries * beta * beta
++            val neff = sum * sum / sumSquares
++            if (neff < target) lo = beta else hi = beta
++        }
++        return 0.5f * (lo + hi)
++    }
++
+     private data class NormalDngSupportStats(
+         val minimum: Float,
+         val p01: Float,
+@@ -2240,6 +2293,16 @@
+                 GlesIris26521SpatialRgbShaders.normalizeRgb16,
+                 "mgc_spatial_rgb16ui",
+             )
++            if (iris26530SuperResEnabled) {
++                mergeRgbSuperResProgram = linkProgram(
++                    GlesIris26521SpatialRgbShaders.mergeRgbSuperRes,
++                    "iris26530_spatial_rgb_superres_merge",
++                )
++                normalizeRgbSuperResProgram = linkProgram(
++                    GlesIris26521SpatialRgbShaders.normalizeRgb16SuperRes,
++                    "iris26530_spatial_rgb_superres_normalize",
++                )
++            }
+             if (exportGpuLinearRgbSource &&
+                 gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F
+             ) {
+@@ -5510,6 +5573,7 @@
+                     outputWidth = outputWidth,
+                     outputHeight = outputHeight,
+                     flowBounds = frame.flowBounds,
++                    reconstructionZoom = if (iris26530SuperResEnabled) reconstructionZoom else 1f,
+                 )
+                 RgbTileFrameRegion(
+                     frame = frame,
+@@ -6222,34 +6286,44 @@
+         accumulatorIsFullOutput: Boolean = false,
+     ) {
+         require(outputCores.isNotEmpty())
+-        GLES30.glUseProgram(mergeRgbProgram)
+-        bindTexture(mergeRgbProgram, "uRaw", 0, rawTexture)
+-        bindTexture(mergeRgbProgram, "uChromaGuideRegion", 1, chromaGuideRegionTexture)
+-        bindTexture(mergeRgbProgram, "uAlignment", 2, frame.alignmentTexture)
+-        bindTexture(mergeRgbProgram, "uFrameWeight", 3, frame.weightTexture)
+-        bindTexture(mergeRgbProgram, "uCovariance", 4, frame.covarianceTexture)
+-        uniform2i(mergeRgbProgram, "uRawSize", width, height)
++        val activeMergeProgram = if (iris26530SuperResEnabled) mergeRgbSuperResProgram else mergeRgbProgram
++        check(activeMergeProgram != 0)
++        GLES30.glUseProgram(activeMergeProgram)
++        bindTexture(activeMergeProgram, "uRaw", 0, rawTexture)
++        bindTexture(activeMergeProgram, "uChromaGuideRegion", 1, chromaGuideRegionTexture)
++        bindTexture(activeMergeProgram, "uAlignment", 2, frame.alignmentTexture)
++        bindTexture(activeMergeProgram, "uFrameWeight", 3, frame.weightTexture)
++        bindTexture(activeMergeProgram, "uCovariance", 4, frame.covarianceTexture)
++        uniform2i(activeMergeProgram, "uRawSize", width, height)
+         uniform2i(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uRawTextureOrigin",
+             rawTextureOrigin.left,
+             rawTextureOrigin.top,
+         )
+         uniform2i(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uRawRegionOrigin",
+             sourceRegion.left,
+             sourceRegion.top,
+         )
+         uniform2i(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uRawRegionSize",
+             sourceRegion.width,
+             sourceRegion.height,
+         )
+-        uniform2i(mergeRgbProgram, "uOutputSize", outputWidth, outputHeight)
++        uniform2i(activeMergeProgram, "uOutputSize", outputWidth, outputHeight)
++        if (iris26530SuperResEnabled) {
++            uniform1f(activeMergeProgram, "uReconstructionZoom", reconstructionZoom)
++            uniform1f(
++                activeMergeProgram,
++                "uLumaTemporalScale",
++                if (frame.imageIndex == 0) 1f else iris26530LumaAuxScale,
++            )
++        }
+         uniform4f(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uCovRangeRg",
+             COV_MIN_R,
+             COV_MAX_R - COV_MIN_R,
+@@ -6257,46 +6331,46 @@
+             COV_MAX_G - COV_MIN_G,
+         )
+         uniform2f(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uCovRangeB",
+             COV_MIN_B,
+             COV_MAX_B - COV_MIN_B,
+         )
+-        uniform4fv(mergeRgbProgram, "uGains", frame.calibration.gains)
++        uniform4fv(activeMergeProgram, "uGains", frame.calibration.gains)
+         uniform4fv(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uBlackLevelsTimesGains",
+             frame.calibration.blackTerms,
+         )
+         uniform2f(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uGreenNoise",
+             0.5f * (frame.calibration.shotNoise[1] + frame.calibration.shotNoise[2]),
+             0.5f * (frame.calibration.readNoise[1] + frame.calibration.readNoise[2]),
+         )
+         uniform1f(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uChromaEdgeNoiseSigmas",
+             RGB_CHROMA_EDGE_NOISE_SIGMAS,
+         )
+         uniform1f(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uChromaEdgeSigmaFloor",
+             RGB_CHROMA_EDGE_SIGMA_FLOOR,
+         )
+         uniform1f(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uInterpolationFlowTolerance",
+             SPATIAL_INTERPOLATION_FLOW_TOLERANCE,
+         )
+-        uniform1i(mergeRgbProgram, "uCfaPattern", cfaPattern)
++        uniform1i(activeMergeProgram, "uCfaPattern", cfaPattern)
+         uniform1i(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uUseFrameWeight",
+             if (frame.useFrameWeight) 1 else 0,
+         )
+         uniform1f(
+-            mergeRgbProgram,
++            activeMergeProgram,
+             "uGlobalFrameWeight",
+             frame.calibration.globalFrameWeight,
+         )
+@@ -6312,13 +6386,13 @@
+                 val accumulatorLeft = if (accumulatorIsFullOutput) outputCore.left else 0
+                 val accumulatorTop = if (accumulatorIsFullOutput) outputCore.top else 0
+                 uniform2i(
+-                    mergeRgbProgram,
++                    activeMergeProgram,
+                     "uOutputOrigin",
+                     outputCore.left,
+                     outputCore.top,
+                 )
+                 uniform2i(
+-                    mergeRgbProgram,
++                    activeMergeProgram,
+                     "uAccumulatorOrigin",
+                     accumulatorLeft,
+                     accumulatorTop,
+@@ -6395,37 +6469,43 @@
+         bindRenderTargets(intArrayOf(target), "MGC RGB normalize tile ${outputCore.left},${outputCore.top}")
+         GLES30.glViewport(targetLeft, targetTop, outputCore.width, outputCore.height)
+         GLES30.glDisable(GLES30.GL_BLEND)
+-        GLES30.glUseProgram(normalizeRgbProgram)
+-        bindTexture(normalizeRgbProgram, "uColorAndRWeight", 0, semanticAccumulator)
+-        bindTexture(normalizeRgbProgram, "uGbWeights", 1, opponentWeightAccumulator)
+-        bindTexture(normalizeRgbProgram, "uLensShading", 2, lensShadingTexture)
++        val activeNormalizeProgram = if (iris26530SuperResEnabled) normalizeRgbSuperResProgram else normalizeRgbProgram
++        check(activeNormalizeProgram != 0)
++        GLES30.glUseProgram(activeNormalizeProgram)
++        bindTexture(activeNormalizeProgram, "uColorAndRWeight", 0, semanticAccumulator)
++        bindTexture(activeNormalizeProgram, "uGbWeights", 1, opponentWeightAccumulator)
++        bindTexture(activeNormalizeProgram, "uLensShading", 2, lensShadingTexture)
+         uniform2i(
+-            normalizeRgbProgram,
++            activeNormalizeProgram,
+             "uAccumulatorSize",
+             outputCore.width,
+             outputCore.height,
+         )
+-        uniform2i(normalizeRgbProgram, "uTargetOrigin", targetLeft, targetTop)
++        uniform2i(activeNormalizeProgram, "uTargetOrigin", targetLeft, targetTop)
+         uniform2i(
+-            normalizeRgbProgram,
++            activeNormalizeProgram,
+             "uOutputOrigin",
+             outputCore.left,
+             outputCore.top,
+         )
+-        uniform2i(normalizeRgbProgram, "uOutputSize", outputWidth, outputHeight)
++        uniform2i(activeNormalizeProgram, "uOutputSize", outputWidth, outputHeight)
++        if (iris26530SuperResEnabled) {
++            uniform2i(activeNormalizeProgram, "uRawSize", width, height)
++            uniform1f(activeNormalizeProgram, "uReconstructionZoom", reconstructionZoom)
++        }
+         uniform3f(
+-            normalizeRgbProgram,
++            activeNormalizeProgram,
+             "uCameraDomainScale",
+             cameraDomainScale[0],
+             cameraDomainScale[1],
+             cameraDomainScale[2],
+         )
+         uniform1f(
+-            normalizeRgbProgram,
++            activeNormalizeProgram,
+             "uOutputExposureScale",
+             outputExposureScale,
+         )
+-        uniform1i(normalizeRgbProgram, "uUseLensShading", if (hasLensShading()) 1 else 0)
++        uniform1i(activeNormalizeProgram, "uUseLensShading", if (hasLensShading()) 1 else 0)
+         GLES30.glDrawArrays(GLES30.GL_TRIANGLES, 0, 3)
+         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+         checkGlError("MGC Spatial RGB normalize tile $outputCore")
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -27,6 +27,8 @@
+     private val outputMode: MgcSpatialOutputMode,
+     private val mergeMethod: MgcMergeMethod,
+     outputScale: Float,
++    private val reconstructionZoom: Float = 1f,
++    private val displayedGlobalZoom: Float = 1f,
+     private val useCurrentGlContext: Boolean,
+     private val exportGpuLinearRgbSource: Boolean,
+     private val gpuLinearRgbStorage: GpuLinearRgbStorage,
+@@ -155,6 +157,8 @@
+                 lensShadingHeight = lensShadingHeight,
+                 outputMode = outputMode,
+                 outputScale = outputScale,
++                reconstructionZoom = reconstructionZoom,
++                displayedGlobalZoom = displayedGlobalZoom,
+                 useCurrentGlContext = useCurrentGlContext,
+                 exportGpuLinearRgbSource = exportGpuLinearRgbSource,
+                 gpuLinearRgbStorage = gpuLinearRgbStorage,
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialRgbTilePlanner.kt b/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialRgbTilePlanner.kt
+--- a/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialRgbTilePlanner.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialRgbTilePlanner.kt
+@@ -109,16 +109,19 @@
+         outputWidth: Int,
+         outputHeight: Int,
+         flowBounds: MgcSpatialRgbFlowBounds,
++        reconstructionZoom: Float = 1f,
+     ): MgcSpatialRgbRect {
+         require(rawWidth > 0 && rawHeight > 0)
+         require(outputWidth > 0 && outputHeight > 0)
++        require(reconstructionZoom.isFinite() && reconstructionZoom >= 1f)
+         val output = tile.outputCore
+         require(output.right <= outputWidth && output.bottom <= outputHeight)
+ 
+-        val firstRawX = outputToRaw(output.left, rawWidth, outputWidth)
+-        val lastRawX = outputToRaw(output.right - 1, rawWidth, outputWidth)
+-        val firstRawY = outputToRaw(output.top, rawHeight, outputHeight)
+-        val lastRawY = outputToRaw(output.bottom - 1, rawHeight, outputHeight)
++        /* IRIS_26530_SR_TILE_SHADER_GEOMETRY_PARITY */
++        val firstRawX = outputToRaw(output.left, rawWidth, outputWidth, reconstructionZoom)
++        val lastRawX = outputToRaw(output.right - 1, rawWidth, outputWidth, reconstructionZoom)
++        val firstRawY = outputToRaw(output.top, rawHeight, outputHeight, reconstructionZoom)
++        val lastRawY = outputToRaw(output.bottom - 1, rawHeight, outputHeight, reconstructionZoom)
+         val minimumSourceX = minOf(firstRawX, lastRawX) + 2f * flowBounds.minX
+         val maximumSourceX = maxOf(firstRawX, lastRawX) + 2f * flowBounds.maxX
+         val minimumSourceY = minOf(firstRawY, lastRawY) + 2f * flowBounds.minY
+@@ -137,6 +140,11 @@
+         return MgcSpatialRgbRect(left, top, right, bottom)
+     }
+ 
+-    private fun outputToRaw(outputPixel: Int, rawSize: Int, outputSize: Int): Float =
+-        (outputPixel + 0.5f) * rawSize.toFloat() / outputSize.toFloat() - 0.5f
++    private fun outputToRaw(
++        outputPixel: Int, rawSize: Int, outputSize: Int, reconstructionZoom: Float,
++    ): Float {
++        val fullRaw = (outputPixel + 0.5f) * rawSize.toFloat() / outputSize.toFloat() - 0.5f
++        val rawCenter = (rawSize.toFloat() - 1f) * 0.5f
++        return rawCenter + (fullRaw - rawCenter) / reconstructionZoom
++    }
+ }
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -58,9 +58,18 @@
+          */
+         float sceneWhite = Math.max(
+                 1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));
+-        /* IRIS_26524_FULLSIZE_MOTION_ZOOM_RENDER */
++        /* IRIS_26530_RENDER_RESIDUAL_ZOOM
++         * The requested DNG/output zoom remains unchanged in Parameters. JPEG/UHDR only performs
++         * the crop not already reconstructed from multiframe RAW samples.
++         */
++        float spatialReconstructionZoom = Math.max(1.0f,
++                basePipeline.mParameters.motionV2SpatialReconstructionZoom);
+         float irisOutputZoom = Math.max(1.0f,
+-                basePipeline.mParameters.motionV2OutputZoom);
++                basePipeline.mParameters.motionV2OutputZoom / spatialReconstructionZoom);
++        Log.i("MotionV2Render", "IRIS_26530_RENDER_RESIDUAL_ZOOM requestedLocal="
++                + basePipeline.mParameters.motionV2OutputZoom
++                + " spatial=" + spatialReconstructionZoom
++                + " residual=" + irisOutputZoom);
+                 glProg.useAssetProgram("motionv2/render");
+         glProg.setTexture("InputBuffer", extendedLinearHdr);
+         glProg.setVar("sceneWhite", sceneWhite);
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -195,6 +195,26 @@
+                 )
+             }
+ 
++            /* IRIS_26530_SR_RECONSTRUCTION_ZOOM
++             * Only digitally enlarged high-zoom captures enter crop-aware RAW SR. Native/low zoom
++             * retains the exact 26529 Spatial mapping. 2x is a conservative subpixel-reconstruction
++             * cap; any remaining requested crop is left to MotionV2Render.
++             */
++            val displayedGlobalZoom = parameters.motionV2GlobalZoom
++                .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
++            val localOutputZoom = parameters.motionV2OutputZoom
++                .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
++            val spatialReconstructionZoom = if (
++                displayedGlobalZoom >= 8f && localOutputZoom > 1.0001f
++            ) minOf(2f, localOutputZoom) else 1f
++            parameters.motionV2SpatialReconstructionZoom = spatialReconstructionZoom
++            val renderResidualZoom = localOutputZoom / spatialReconstructionZoom
++            PLog.i(TAG, "IRIS_26530_MOTION_SAFE_RAW_SUPERRES " +
++                "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
++                "spatialReconstructionZoom=$spatialReconstructionZoom " +
++                "renderResidualZoom=$renderResidualZoom threshold=8.0 cap=2.0 " +
++                "motionAuthority=existingSpatialRejection cfaGeometry=sharedGreenOpponent")
++
+             egl = EglOwner.create()
+             val fusion = GlesMgcRawFusion(
+                 width = size.x,
+@@ -210,6 +230,8 @@
+                 outputMode = MgcSpatialOutputMode.RGB,
+                 mergeMethod = MgcMergeMethod.SPATIAL_RGB,
+                 outputScale = 1f,
++                reconstructionZoom = spatialReconstructionZoom,
++                displayedGlobalZoom = displayedGlobalZoom,
+                 useCurrentGlContext = true,
+                 exportGpuLinearRgbSource = true,
+                 gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
+diff -ruN '--exclude=version.properties' a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -73,6 +73,11 @@
+     public float motionV2GlobalZoom = 1.0f;
+     public float motionV2OpticalZoomAnchor = 1.0f;
+     public float motionV2OutputZoom = 1.0f;
++    /* IRIS_26530_DNG_ZOOM_UNCHANGED
++     * JPEG/UHDR may consume this crop inside Spatial first. DNG DefaultCrop remains owned solely
++     * by motionV2OutputZoom, preserving the 26525 one-crop DNG contract.
++     */
++    public float motionV2SpatialReconstructionZoom = 1.0f;
+     public float motionV2HardwareZoom = 1.0f;
+     public float motionV2ResidualSoftwareZoom = 1.0f;
+     public int realWL = -1;
