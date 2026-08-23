@@ -81,6 +81,28 @@ def main():
     require('bindTexture(strengthAlignmentProgram, "uAlignment", 0, alignmentTexture)' in stack,'strength host binding not final alignment')
     require('flowTexture = bentoFlowTexture' not in stack,'old Bento flow strength capture survived')
 
+    # 26531 V1.3 Kotlin/API regression proof: final Bayer alignment is strength-only.
+    require('flowTexture = prepared.flowTexture' in stack,
+            'long-frame clipping guard lost dense flow authority')
+    long_branch=stack.find('RawBurstFrameRole.SHADOW_LONG ->')
+    long_call=stack.find('renderAlignedLongFrameClippingMask(', long_branch)
+    require(long_call >= 0, 'long-frame clipping call missing')
+    long_end=stack.find(')', long_call)
+    long_text=stack[long_call:long_end+1]
+    require('flowTexture = prepared.flowTexture' in long_text,
+            'long-frame clipping call does not pass flowTexture')
+    require('alignmentTexture = prepared.bayerAlignmentTexture' not in long_text,
+            'final Bayer grid leaked into long-frame flow shader')
+    require('val referenceGreenShotNoiseFactor: Float' in stack and
+            'val referenceGreenReadVariance: Float' in stack,
+            'Iris Bayer tuning green noise fields missing')
+    require('referenceGreenShotNoiseFactor = shotNoise.getOrElse(1) { 0f }' in stack and
+            'referenceGreenReadVariance = readNoise.getOrElse(1) { 0f }' in stack,
+            'Iris Bayer tuning green noise fields not initialized')
+    require('baseShotNoiseFactor = kernelTuning.referenceGreenShotNoiseFactor' in stack and
+            'baseReadVariance = kernelTuning.referenceGreenReadVariance' in stack,
+            'expected merge weight does not consume initialized Iris green noise fields')
+
     require('IRIS_26530_V1_3_MGC_ALIGNMENT_S16_SCALE' in align and 'S16_DOMAIN_SCALE / (whiteLevel + 1f)' in align,'MGC S16 alignment scaling missing')
     require('MgcAlignmentInputScale.compute(' in stack and 'whiteLevel = sensorWhiteLevel' in stack,'Iris alignment does not consume sensor white scaling')
     require('IRIS_26530_V1_3_MGC_EXPECTED_MERGE_WEIGHT' in tuning and 'fun expectedMergeWeight(' in tuning,'expected merge-weight helper missing')
@@ -121,5 +143,5 @@ def main():
 
     out={'postbuild':a.postbuild,'changed_runtime_files':runtime_changed,'sabre_active':False,'motion_merge':'SPATIAL_RGB','mgc_luma':0.0,'chroma_owner':'irisSettings.chromaDenoise','fov_authority':'motionV2OutputZoom','sr_sampling_scale':'motionV2SpatialReconstructionZoom','latest_mgc_semantics':['final_bayer_alignment_strength','alignment_s16_sensor_white_scale','expected_merge_weight_shot_read','propagated_output_noise_snr','rgb_gradient_postfusion_direction','rejected_multiplier_identity']}
     if a.json_out: Path(a.json_out).write_text(json.dumps(out,indent=2)+"\n")
-    print(json.dumps(out,indent=2)); print('PASS: 26531 latest-MGC Spatial/Iris + zero-luma + FOV validator')
+    print(json.dumps(out,indent=2)); print('PASS: 26531 Iris Spatial + zero-luma + FOV + Kotlin API validator')
 if __name__=='__main__': main()

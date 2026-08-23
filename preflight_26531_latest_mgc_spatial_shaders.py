@@ -28,5 +28,5 @@ def main():
     need('directionMomentAt' not in seed and 'structureScale' not in seed and 'g[i]=rgbGradient' in seed,'seed still uses c317 direction moment')
     compile_shader(a.validator,strength,'frag','v13_strength_alignment')
     compile_shader(a.validator,seed,'comp','v13_rgb_direction_seed')
-    print('PASS: 26530 V1.3 final-Bayer-alignment + RGB-direction shaders compile')
+    print('PASS: 26531 Iris final-Bayer-alignment + RGB-direction shaders compile')
 if __name__=='__main__': main()

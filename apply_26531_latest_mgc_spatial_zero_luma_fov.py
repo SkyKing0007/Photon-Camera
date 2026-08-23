@@ -32,11 +32,68 @@ def transform(root):
     s=p.read_text(encoding='utf-8')
     s=s.replace('''                        flowTexture = zeroFlow,\n''','''                        alignmentTexture = zeroFlow,\n''')
     s=s.replace('''                        flowTexture = bentoFlowTexture,\n''','''                        alignmentTexture = bentoBayerAlignmentTexture,\n''')
-    s=s.replace('''                            flowTexture = prepared.flowTexture,\n''','''                            alignmentTexture = prepared.bayerAlignmentTexture,\n''')
+    # Only strength/noise capture switches to the final Bayer alignment grid. The long-frame
+    # clipping guard still consumes the dense flow field used by its uFlow shader.
+    s=once(s,
+'''                    strengthCapture?.let { capture ->
+                        captureStrengthFrame(
+                            capture = capture,
+                            frameIndex = capturedFrameIndex++,
+                            calibration = prepared.calibration,
+                            flowTexture = prepared.flowTexture,
+                            weightTexture = mergeWeight,
+                            identityWeight = identityTemporalWeights,
+                        )
+                    }''',
+'''                    strengthCapture?.let { capture ->
+                        captureStrengthFrame(
+                            capture = capture,
+                            frameIndex = capturedFrameIndex++,
+                            calibration = prepared.calibration,
+                            alignmentTexture = prepared.bayerAlignmentTexture,
+                            weightTexture = mergeWeight,
+                            identityWeight = identityTemporalWeights,
+                        )
+                    }''','temporal strength final Bayer alignment')
     if s.count('captureStrengthFrame(') != 5:
         raise RuntimeError(f'unexpected captureStrengthFrame count {s.count("captureStrengthFrame(")}')
-    if 'flowTexture = prepared.flowTexture' in s or 'flowTexture = bentoFlowTexture' in s:
-        raise RuntimeError('stale strength flow capture survived')
+    if s.count('flowTexture = prepared.flowTexture') != 1:
+        raise RuntimeError('long-frame dense-flow authority missing or duplicated')
+    if s.count('alignmentTexture = prepared.bayerAlignmentTexture') < 1:
+        raise RuntimeError('temporal strength final-Bayer alignment missing')
+    if 'flowTexture = bentoFlowTexture' in s:
+        raise RuntimeError('stale Bento strength flow capture survived')
+    s=once(s,
+'''    private data class BayerKernelTuning(
+        val referenceSignal: Float,
+        val referenceNoiseVariance: Float,
+        val referenceSnr: Float,
+        val baseSpatialScale: Float,
+    )''',
+'''    private data class BayerKernelTuning(
+        val referenceSignal: Float,
+        val referenceNoiseVariance: Float,
+        val referenceGreenShotNoiseFactor: Float,
+        val referenceGreenReadVariance: Float,
+        val referenceSnr: Float,
+        val baseSpatialScale: Float,
+    )''','Iris Bayer tuning green noise fields')
+    s=once(s,
+'''        return BayerKernelTuning(
+            referenceSignal = referenceSignal,
+            referenceNoiseVariance = referenceNoiseVariance,
+            referenceSnr = referenceSnr,
+            baseSpatialScale = baseSpatialScale,
+        )''',
+'''        return BayerKernelTuning(
+            referenceSignal = referenceSignal,
+            referenceNoiseVariance = referenceNoiseVariance,
+            referenceGreenShotNoiseFactor = shotNoise.getOrElse(1) { 0f },
+            referenceGreenReadVariance = readNoise.getOrElse(1) { 0f },
+            referenceSnr = referenceSnr,
+            baseSpatialScale = baseSpatialScale,
+        )''','Iris Bayer tuning green noise initialization')
+
     s=once(s,
 '''    private fun captureStrengthFrame(\n        capture: StrengthCapture,\n        frameIndex: Int,\n        calibration: FrameCalibration,\n        flowTexture: Int,\n        weightTexture: Int,\n        identityWeight: Boolean,\n    ) {''',
 '''    private fun captureStrengthFrame(\n        capture: StrengthCapture,\n        frameIndex: Int,\n        calibration: FrameCalibration,\n        alignmentTexture: Int,\n        weightTexture: Int,\n        identityWeight: Boolean,\n    ) {''','strength function signature')
@@ -138,6 +195,19 @@ def transform(root):
     post=(root/'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt').read_text()
     if 'directionMomentAt(' in post or 'structureScale=' in post: raise RuntimeError('c317 direction moment steering survived')
     if 'effectiveMgcLuma=$lumaScale' not in active or 'val lumaScale = 0f' not in active: raise RuntimeError('zero luma authority missing')
+    # V1.3 compiler-regression invariants.
+    stack_out=(root/'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt').read_text()
+    if 'flowTexture = prepared.flowTexture' not in stack_out:
+        raise RuntimeError('SHADOW_LONG dense-flow call missing')
+    if 'alignmentTexture = prepared.bayerAlignmentTexture' not in stack_out:
+        raise RuntimeError('final Bayer strength call missing')
+    for token in (
+        'val referenceGreenShotNoiseFactor: Float',
+        'val referenceGreenReadVariance: Float',
+        'referenceGreenShotNoiseFactor = shotNoise.getOrElse(1) { 0f }',
+        'referenceGreenReadVariance = readNoise.getOrElse(1) { 0f }',
+    ):
+        if token not in stack_out: raise RuntimeError('Iris Kotlin API contract missing: '+token)
 
 
 def diff_dirs(base: Path, after: Path, reverse=False):
@@ -152,7 +222,7 @@ def main():
     ap=argparse.ArgumentParser(); ap.add_argument('root',nargs='?'); ap.add_argument('--check-only',action='store_true'); ap.add_argument('--self-test',action='store_true'); ap.add_argument('--patch-out'); ap.add_argument('--patch-sha-out'); ap.add_argument('--rollback-out'); ap.add_argument('--rollback-sha-out'); args=ap.parse_args()
     if args.self_test:
         assert len(BASE_HASHES)==7
-        print('PASS: 26530 V1.3 transformer self-test exact seven-file V1.2 base hash lock'); return
+        print('PASS: 26531 V1.3 transformer self-test exact seven-file 26530 V1.2 base hash lock + Kotlin API fix'); return
     if not args.root: ap.error('root required')
     root=Path(args.root).resolve()
     if args.check_only:
@@ -164,7 +234,7 @@ def main():
                 if path:
                     q=Path(path); q.write_text(data)
                     if side: Path(side).write_text(f'{hashlib.sha256(q.read_bytes()).hexdigest()}  {q.name}\n')
-            print('PASS: 26530 V1.3 in-memory transform resolved; forward+rollback available before candidate writes')
+            print('PASS: 26531 V1.3 in-memory transform resolved; forward+rollback available before candidate writes')
     else:
-        transform(root); print('PASS: applied 26530 V1.3 latest-MGC Spatial parity + zero-luma + FOV authority')
+        transform(root); print('PASS: applied 26531 V1.3 Iris Spatial + zero-luma + FOV + Kotlin API correction')
 if __name__=='__main__': main()

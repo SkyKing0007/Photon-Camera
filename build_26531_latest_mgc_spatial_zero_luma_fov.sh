@@ -20,6 +20,7 @@ VERSION_NAME="0.9726531"; VERSION_BUILD="26531"
 APPLY="$ROOT/apply_26531_latest_mgc_spatial_zero_luma_fov.py"
 VALIDATE="$ROOT/validate_26531_latest_mgc_spatial_zero_luma_fov.py"
 NEW_SHADER_PREFLIGHT="$ROOT/preflight_26531_latest_mgc_spatial_shaders.py"
+KOTLIN_API_PREFLIGHT="$ROOT/preflight_26531_iris_kotlin_api_contracts.py"
 SR_SHADER_PREFLIGHT="$ROOT/preflight_26530_superres_shaders.py"
 EMBEDDED_26529_PREFLIGHT="$ROOT/preflight_26529_iris_embedded_shaders_v3.py"
 INHERITED_SHADER_PREFLIGHT="$ROOT/preflight_26526_inherited_shaders.py"
@@ -50,7 +51,7 @@ AFTER="$WORK/candidate26531"
 POSTCHECK="$WORK/postbuild26531"
 VERIFY_NEXT="$WORK/verify_next_candidate"
 BJ="$WORK/bjzhou_vendor"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-latest-mgc-spatial-zero-luma-fov-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-iris-spatial-zero-luma-fov-debug.apk"
 
 rm -rf "$OUT" "$WORK" "$FINAL"
 mkdir -p "$OUT" "$ART" "$BASE" "$AFTER"
@@ -61,7 +62,7 @@ BRANCH="$(git branch --show-current)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch: $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26530_HEAD" HEAD || fail "handoff HEAD is not descended from successful 26530 V1.2"
 [[ "$(tr -d '\r\n' < "$BASE_HEAD_FILE")" == "$SUCCESSFUL_26530_HEAD" ]] || fail "base 26530 V1.2 HEAD file drift"
-for f in "$APPLY" "$VALIDATE" "$NEW_SHADER_PREFLIGHT" "$SR_SHADER_PREFLIGHT" \
+for f in "$APPLY" "$VALIDATE" "$NEW_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$SR_SHADER_PREFLIGHT" \
          "$EMBEDDED_26529_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$NATIVE_PREFLIGHT" "$DNG_TEST" \
          "$PREV_26529_HANDOFF" "$PREV_26530_HANDOFF" "$HANDOFF" "$BASE_HEAD_FILE" \
          "$EXPECTED_PATCH" "$EXPECTED_PATCH_SHA" "$EXPECTED_ROLLBACK" "$EXPECTED_ROLLBACK_SHA" \
@@ -76,7 +77,7 @@ sha256sum -c "$PREV_26529_HANDOFF"
 [[ "$(sha "$SR_SHADER_PREFLIGHT")" == "$SR_SHADER_PREFLIGHT_SHA" ]] || fail "26530 SR shader preflight drift"
 [[ "$(sha "$EMBEDDED_26529_PREFLIGHT")" == "$EMBEDDED_26529_PREFLIGHT_SHA" ]] || fail "26529 embedded shader preflight drift"
 [[ "$(sha "$INHERITED_SHADER_PREFLIGHT")" == "$INHERITED_SHADER_PREFLIGHT_SHA" ]] || fail "inherited shader preflight drift"
-python3 -m py_compile "$APPLY" "$VALIDATE" "$NEW_SHADER_PREFLIGHT" "$SR_SHADER_PREFLIGHT" \
+python3 -m py_compile "$APPLY" "$VALIDATE" "$NEW_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$SR_SHADER_PREFLIGHT" \
     "$EMBEDDED_26529_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$NATIVE_PREFLIGHT" "$DNG_TEST"
 python3 "$APPLY" --self-test
 bash -n "$0"
@@ -166,6 +167,7 @@ cp -a "$BASE/." "$AFTER/"
 python3 "$APPLY" "$AFTER"
 python3 "$VALIDATE" --base "$BASE" --candidate "$AFTER" --patch "$GEN_PATCH" --rollback "$GEN_ROLLBACK" \
   --json-out "$OUT/26531_prebuild_validation.json" | tee "$OUT/26531_prebuild_validator.txt"
+python3 "$KOTLIN_API_PREFLIGHT" --root "$AFTER" | tee "$OUT/26531_iris_kotlin_api_preflight.txt"
 
 python3 "$NEW_SHADER_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26531_latest_mgc_spatial_shader_preflight.txt"
 python3 "$SR_SHADER_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26531_superres_shader_preflight.txt"
@@ -187,10 +189,10 @@ diff -qr "$ROLLCHECK/app/src/main" "$BASE/app/src/main" > "$OUT/26531_rollback_c
 [[ "$(grep '^VERSION_BUILD=' "$AFTER/app/version.properties" | cut -d= -f2)" == "26530" ]] || fail "build changed before guarded build block"
 
 echo "TEMPORAL_IMAGE_MATH_CHANGED=true"
-echo "LATEST_MGC_SPATIAL_PARITY=FINAL_BAYER_ALIGNMENT_EXPECTED_MERGE_WEIGHT_PROPAGATED_OUTPUT_SNR_RGB_DIRECTION"
+echo "LATEST_IRIS_SPATIAL_PARITY=FINAL_BAYER_ALIGNMENT_EXPECTED_MERGE_WEIGHT_PROPAGATED_OUTPUT_SNR_RGB_DIRECTION"
 echo "ALIGNMENT_SCALE=FRAME_GAIN_X_16384_OVER_SENSOR_WHITE_PLUS_1"
-echo "MGC_LUMA_DENOISE=0"
-echo "MGC_CHROMA_DENOISE=USER_SETTING"
+echo "IRIS_LUMA_DENOISE=0"
+echo "IRIS_CHROMA_DENOISE=USER_SETTING"
 echo "SUPERRES=RAW_DOMAIN_SHARED_GREEN_GEOMETRY_CAP_2X"
 echo "FOV_AUTHORITY=FULL_MOTIONV2_OUTPUT_ZOOM"
 echo "SABRE=SOURCE_ALLOWED_RUNTIME_DORMANT"
@@ -246,7 +248,10 @@ audited_runtime_manifest(){
 assert_cpp_deps_exact pre
 audited_runtime_manifest > "$OUT/26531_pre_gradle_audited_runtime.sha256"
 chmod +x ./gradlew
-./gradlew clean :app:assembleDebug --stacktrace
+# V1.3 strict project compiler gate: resolve Kotlin/Java APIs before the full APK assembly.
+./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace
+pass "real Android Kotlin + Java compile gates passed"
+./gradlew :app:assembleDebug --stacktrace
 assert_cpp_deps_exact post
 audited_runtime_manifest > "$OUT/26531_post_gradle_audited_runtime.sha256"
 cmp -s "$OUT/26531_pre_gradle_audited_runtime.sha256" "$OUT/26531_post_gradle_audited_runtime.sha256" || fail "Gradle mutated audited 26531 runtime source/version"
