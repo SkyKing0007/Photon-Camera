@@ -12,10 +12,10 @@ AFTER_HASHES = {
 'app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java':'cf9cad601bde9354754ba6d9c5f12a75ef7de1c77921c943f2ec926eb1212c8e',
 'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java':'f4de605df17c1e8ca5ec91b4a8aa2c81cea38014c0bfcab4923a4246c6aa12b7',
 'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java':'e9d1bd2258da3d53d75d1a9344b257b6a92cdd7cedff2e11bab8f8499567664b',
-'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightMgc1271Bridge.kt':'9c3dc05ab49c5c230b86f614ba89aba0ab232f3aea0b2e31edd4af9ba204c630',
+'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightMgc1271Bridge.kt':'1842bacaaa8e735110b3778f60cd647930a80c7805edbc29fcaaa286ea26a9a4',
 }
 PATCH_NAME='26534_RUNTIME_DELTA_FROM_V16.patch'
-PATCH_SHA='e8197d231670e6e943f20b55fcdb61c638d5d99c252450220410739bf48a872b'
+PATCH_SHA='82c27d2c962c1a67e89e45dacb65ef4de36e639f2cf577e2490dc8e0e7c203af'
 
 def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
 def fail(m): raise SystemExit('FAIL: '+m)

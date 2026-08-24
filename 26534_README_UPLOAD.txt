@@ -1,3 +1,11 @@
+26534 V2 COMPILE-CONTRACT CORRECTION
+
+V1 failed only at :app:compileDebugKotlin because the Night Bayer conversion removed the mandatory GlesMgcRawFusion gpuLinearRgbStorage constructor argument. V2 restores the pinned V1.6 RGBA16F enum argument while keeping exportGpuLinearRgbSource=false. This parameter is constructor-only/inert for the Bayer path; routing remains Motion=Spatial RGB, Night=Spatial Bayer->RCD->Jin. Version/build remains 0.9726534 / 26534 because V1 never produced an APK.
+
+IMPORTANT V2 UPLOAD:
+Upload/extract ALL files from this V2 handoff over the existing 26534 V1 handoff paths so the same workflow/patch files are replaced. Do not create a parallel second 26534 workflow.
+Suggested commit message: 26534 V2: fix Night MGC Kotlin constructor contract
+
 PHOTON / IRIS 26534 — MOTION SPATIAL-RGB + NIGHT SPATIAL-BAYER ROUTING RESTORATION
 
 Target branch: experimental-clean-photon-rebuild

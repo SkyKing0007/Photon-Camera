@@ -80,7 +80,17 @@ def main():
         require(cp.returncode==0,'Java parser helper compile:\n'+cp.stdout)
         cp=subprocess.run(['java','-cp',str(td),'ParseJava26534',*paths],text=True,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
         require(cp.returncode==0,'changed Java syntax parse:\n'+cp.stdout)
-    kotlin_balance(kp.read_text(encoding='utf-8'))
+    ks=kp.read_text(encoding='utf-8')
+    kotlin_balance(ks)
+    fusion=root/'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt'
+    require(fusion.is_file(),'missing pinned GlesMgcRawFusion.kt')
+    fs=fusion.read_text(encoding='utf-8')
+    require('private val gpuLinearRgbStorage: GpuLinearRgbStorage,' in fs,
+            'pinned GlesMgcRawFusion gpuLinearRgbStorage constructor contract missing')
+    require('import com.hinnka.mycamera.processor.GpuLinearRgbStorage' in ks,
+            'Night bridge missing required GpuLinearRgbStorage import')
+    require('gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F' in ks,
+            'Night bridge missing required gpuLinearRgbStorage constructor argument')
     # Also ask kotlinc to parse/type-analyze the changed bridge when available. Missing Android/project
     # symbols are expected in isolation; grammar diagnostics are not.
     kotlinc=shutil.which('kotlinc')

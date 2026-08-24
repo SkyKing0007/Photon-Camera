@@ -109,8 +109,17 @@ def validate(base,cand):
               'val output = readBayer16(resultTexture, size.x, size.y)'):
         req(n in nb,'Night Spatial-Bayer contract missing '+n)
     for bad in ('RawStackBufferLayout.LINEAR_RGB','readRgba16f(','forceOpaqueHalfAlpha(','convertHalfRgbaToFloatRgba(',
-                'MgcFullResolutionDenoise','GpuLinearRgbStorage'):
+                'MgcFullResolutionDenoise'):
         req(bad not in nb,'stale Night RGB authority survived: '+bad)
+    # GlesMgcRawFusion still requires gpuLinearRgbStorage even when RGB export=false.
+    # Keep the pinned V1.6 storage enum solely to satisfy the constructor; it is inert in Bayer mode.
+    req('import com.hinnka.mycamera.processor.GpuLinearRgbStorage' in nb,
+        'Night MGC required GpuLinearRgbStorage import missing')
+    req('gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F' in nb,
+        'Night MGC required gpuLinearRgbStorage constructor argument missing')
+    fusion_src=txt(cand,'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt')
+    req('private val gpuLinearRgbStorage: GpuLinearRgbStorage,' in fusion_src,
+        'pinned MGC constructor contract changed unexpectedly')
     req('IRIS_26534_NIGHT_SPATIAL_BAYER_PARITY_VALID' in nb,'Night Bayer parity marker missing')
     req('dngSidecarAsProduction=false' in nb,'Night DNG-vs-production isolation marker missing')
     req('closeAction = { if (!preserveInputFrames) frame.close() }' in nb,'Night SR input preservation contract missing')
