@@ -91,7 +91,8 @@ sha256sum -c "$EXPECTED_ROLLBACK_SHA"
 (cd "$ROOT" && sha256sum -c "$OVERLAY_HASHES")
 for f in "$APPLY" "$VALIDATE" "$SYNTAX" "$CHROMA_SHADER" "$V16_PROVENANCE_PREFLIGHT" "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do [[ -f "$f" ]] || fail "required inherited safety file missing: $f"; done
 [[ "$(cat "$BJZHOU_COMMIT_FILE" | tr -d '\r\n')" == "$BJZHOU_VENDOR_HEAD" ]] || fail "bjzhou native dependency pin drift"
-! grep -E 'git push|git switch dev|git checkout dev' "$0" >/dev/null || fail "forbidden push/dev command in build script"
+FORBIDDEN_RE="$(printf '%s' 'git p' 'ush|git sw' 'itch dev|git check' 'out dev')"
+! grep -E "$FORBIDDEN_RE" "$0" >/dev/null || fail "forbidden push/dev command in build script"
 pass "exact experimental-clean-photon-rebuild lineage + strict handoff integrity"
 
 echo "=== 26535 GATE 1: recover exact successful 26534 artifact candidate; repo app/src is NOT authority ==="

@@ -24,3 +24,5 @@ Architecture:
 Strict procedure:
 Gate 0 -> 1 -> 2 -> 3 -> PRE-BUILD SAFETY PROOF -> Gate 4 version+compile+assemble same block -> Gate 5 -> Gate 6.
 Gate 2 uses the exact required git diff and git diff -R commands and fuzz=0 proof in both directions.
+
+26535 V2 packaging-only fix: corrected self-referential forbidden-command guard; runtime delta unchanged.
