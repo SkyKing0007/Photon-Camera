@@ -28,3 +28,5 @@ Gate 2 uses the exact required git diff and git diff -R commands and fuzz=0 proo
 26535 V2 packaging-only fix: corrected self-referential forbidden-command guard; runtime delta unchanged.
 
 26535 V3 HANDOFF FIX: runtime payload is embedded in the top-level apply script; no nested handoff directory is required. This matches the working 26534 web-upload model and prevents omitted overlay files. Runtime delta/forward/rollback patches are unchanged.
+
+V4 packaging/proof-only fix: Gate 5 now matches the successful 26534 validator scope for temporary native vendor/deps files. Runtime implementation and 8-file runtime patches are unchanged.

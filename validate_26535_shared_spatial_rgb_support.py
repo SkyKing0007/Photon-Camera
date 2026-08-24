@@ -25,7 +25,17 @@ def manifest(root):
     for top in ('app/src/main',):
         p=root/top
         for f in p.rglob('*'):
-            if f.is_file(): out[str(f.relative_to(root))]=h(f)
+            if not f.is_file():
+                continue
+            rel=str(f.relative_to(root))
+            # Match the proven 26534 audited-runtime scope exactly: pinned native
+            # vendor sources and Gradle-materialized cpp/deps headers are verified
+            # by their own native manifests, not counted as 26535 runtime delta.
+            if rel.startswith('app/src/main/cpp/third_party_26507/'):
+                continue
+            if rel.startswith('app/src/main/cpp/deps/') and rel != 'app/src/main/cpp/deps/.gitignore':
+                continue
+            out[rel]=h(f)
     return out
 
 def ordered(s,tokens,label):
