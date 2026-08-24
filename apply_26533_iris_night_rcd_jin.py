@@ -214,101 +214,95 @@ def patch_frame_selector(root):
     s=one(s,anchor,anchor+'\n        if (PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT) return IrisNightFrameSelector.getFrames();','Frame selector Night dispatch')
     p.write_text(s,encoding='utf-8')
 
+def clone_current_rcd(root):
+    srcp=root/'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java'
+    src=srcp.read_text(encoding='utf-8')
+    required=('IRIS_26498_PROVENANCE_INSIDE_RCD_AND_TRUE_MIRRORED_BOUNDARY','motionv2/rcd26498_populate','motionv2/rcd26498_write','motionv2/rcd26489_diag_direction')
+    for tok in required:
+        if tok not in src: raise RuntimeError('successful-26532 provenance-aware RCD contract missing: '+tok)
+    for rel in ('rcd26498_populate.glsl','rcd26498_vh_direction.glsl','rcd26498_lpf.glsl','rcd26498_green.glsl','rcd26498_diag_residual.glsl','rcd26489_diag_direction.glsl','rcd26498_opposite.glsl','rcd26498_green_rb.glsl','rcd26498_write.glsl'):
+        if not (root/'app/src/main/assets/shaders/motionv2'/rel).is_file(): raise RuntimeError('successful-26532 RCD shader missing: '+rel)
+    clone=src.replace('public final class MotionV2RcdDemosaic','public final class IrisRcdDemosaic',1)
+    clone=clone.replace('public MotionV2RcdDemosaic()','public IrisRcdDemosaic()',1)
+    clone=clone.replace('super("", "MotionV2RcdDemosaic")','super("", "IrisRcdDemosaic")',1)
+    clone=one(clone,'if (!basePipeline.mParameters.motionV2Active) {','if (!(basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive)) {','shared RCD capability')
+    clone=clone.replace('MotionV2RcdDemosaic used outside Motion V2','IrisRcdDemosaic used outside Iris Motion/Night')
+    write(root,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisRcdDemosaic.java',clone)
+
 def add_night_input(root):
     java=r'''package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
-
 import android.graphics.Point;
 import com.particlesdevs.photoncamera.processing.opengl.GLDrawParams;
 import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
 import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
 import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
 import static android.opengl.GLES20.GL_LINEAR;
 import static android.opengl.GLES20.GL_NEAREST;
-
-/** IRIS_26533_NIGHT_SENSOR_CODE_INPUT
- * Iris-owned input boundary for the MGC fused RAW16 Bayer sidecar. This is not Photon Night's
- * Bayer2Float/ExposureFusion path: it performs only physical black/white normalization.
- */
-public final class IrisNightBayerInput extends Node {
-    public IrisNightBayerInput(){ super("","IrisNightBayerInput"); }
-    @Override public void Compile(){}
-    @Override public void Run(){
-        PostPipeline p=(PostPipeline)basePipeline;
-        Point raw=new Point(basePipeline.mParameters.rawSize);
-        GLTexture in=new GLTexture(raw,new GLFormat(GLFormat.DataType.UNSIGNED_16),p.stackFrame,GL_NEAREST,GL_CLAMP_TO_EDGE);
-        float white=Math.max(1.0f,basePipeline.mParameters.whiteLevel);
-        float[] bl=basePipeline.mParameters.blackLevel.clone();
-        for(int i=0;i<4;i++) bl[i]=Math.max(0.0f,Math.min(0.999f,bl[i]/white));
-        glProg.useAssetProgram("irisnight/raw16_to_linear_bayer");
-        glProg.setTexture("InputBuffer",in);
-        glProg.setVar("blackLevel",bl);
-        glProg.setVar("CfaPattern",basePipeline.mParameters.cfaPattern);
-        glProg.setVarU("whitelevel",basePipeline.mParameters.whiteLevel);
-        basePipeline.main2=new GLTexture(raw,new GLFormat(GLFormat.DataType.FLOAT_16,GLDrawParams.WorkDim),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
-        WorkingTexture=basePipeline.main2;
-        glProg.drawBlocks(WorkingTexture);
-        basePipeline.main1=new GLTexture(raw,new GLFormat(GLFormat.DataType.FLOAT_16,GLDrawParams.WorkDim),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
-        basePipeline.main3=new GLTexture(raw,new GLFormat(GLFormat.DataType.FLOAT_16,GLDrawParams.WorkDim),null,GL_LINEAR,GL_CLAMP_TO_EDGE);
-        glProg.closed=true; in.close();
-    }
+/** IRIS_26533_SHARED_FUSED_BAYER_INPUT */
+public final class IrisRcdBayerInput extends Node {
+ public IrisRcdBayerInput(){super("","IrisRcdBayerInput");}
+ @Override public void Compile(){}
+ @Override public void Run(){
+  PostPipeline p=(PostPipeline)basePipeline; Point raw=new Point(basePipeline.mParameters.rawSize); Point packed=new Point(raw.x/2,raw.y/2);
+  if(p.stackFrame==null||raw.x<=0||raw.y<=0||(raw.x&1)!=0||(raw.y&1)!=0)throw new IllegalStateException("26533 fused RAW16 Bayer bridge invalid");
+  ByteBuffer rv=p.stackFrame.duplicate();rv.position(0); GLTexture in=new GLTexture(raw,new GLFormat(GLFormat.DataType.UNSIGNED_16),rv,GL_NEAREST,GL_CLAMP_TO_EDGE);
+  glProg.useAssetProgram("irisnight/raw16_to_packed_linear_bayer"); glProg.setTexture("InputBuffer",in); glProg.setVar("blackLevel",basePipeline.mParameters.blackLevel); glProg.setVar("whiteLevel",(float)basePipeline.mParameters.whiteLevel);
+  WorkingTexture=new GLTexture(packed,new GLFormat(GLFormat.DataType.FLOAT_32,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE); glProg.drawBlocks(WorkingTexture); in.close();
+  ByteBuffer prov;
+  if(p.motionV2HighlightProvenance!=null){prov=p.motionV2HighlightProvenance.duplicate();prov.position(0);}else{prov=ByteBuffer.allocateDirect(packed.x*packed.y*4).order(ByteOrder.nativeOrder());while(prov.remaining()>=4)prov.putFloat(0f);prov.position(0);}
+  p.motionV2HighlightProvenanceTexture=new GLTexture(packed,new GLFormat(GLFormat.DataType.FLOAT_32,1),prov,GL_NEAREST,GL_CLAMP_TO_EDGE);
+  if(p.irisMotionDirectRgbAuxiliary!=null){ByteBuffer rgb=p.irisMotionDirectRgbAuxiliary.duplicate();rgb.position(0);p.irisMotionDirectRgbTexture=new GLTexture(raw,new GLFormat(GLFormat.DataType.FLOAT_32,4),rgb,GL_NEAREST,GL_CLAMP_TO_EDGE);}
+  GLFormat wf=new GLFormat(GLFormat.DataType.FLOAT_16,GLDrawParams.WorkDim); basePipeline.main1=new GLTexture(raw,wf,null,GL_LINEAR,GL_CLAMP_TO_EDGE);basePipeline.main2=new GLTexture(raw,wf,null,GL_LINEAR,GL_CLAMP_TO_EDGE);basePipeline.main3=new GLTexture(raw,wf,null,GL_LINEAR,GL_CLAMP_TO_EDGE);basePipeline.texnum=0;glProg.closed=true;
+ }
 }
 '''
-    shader=r'''precision highp float;
-precision highp usampler2D;
-uniform usampler2D InputBuffer;
-uniform vec4 blackLevel;
-uniform int CfaPattern;
-uniform uint whitelevel;
-out float Output;
-void main(){
-    ivec2 xy=ivec2(gl_FragCoord.xy);
-    ivec2 phase=(xy+ivec2(CfaPattern%2,CfaPattern/2))%2;
-    int pi=phase.y*2+phase.x;
-    float bl=pi==0?blackLevel.r:(pi==1?blackLevel.g:(pi==2?blackLevel.b:blackLevel.a));
-    float raw=float(texelFetch(InputBuffer,xy,0).x)/max(float(whitelevel),1.0);
-    Output=max((raw-bl)/max(1.0-bl,1.0e-6),0.0);
+    shader=r'''precision highp float; precision highp usampler2D;
+uniform highp usampler2D InputBuffer; uniform vec4 blackLevel; uniform float whiteLevel; out vec4 Output;
+float n(ivec2 p,int q){float v=float(texelFetch(InputBuffer,p,0).r);float b=q==0?blackLevel.r:(q==1?blackLevel.g:(q==2?blackLevel.b:blackLevel.a));return max((v-b)/max(whiteLevel-b,1.0),0.0);}
+void main(){ivec2 p=ivec2(gl_FragCoord.xy)*2;Output=vec4(n(p,0),n(p+ivec2(1,0),1),n(p+ivec2(0,1),2),n(p+ivec2(1,1),3));}
+'''
+    overlay_java=r'''package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+/** IRIS_26533_MOTION_RCD_SHORT_CHROMA_BRIDGE */
+public final class IrisMotionRcdShortChromaOverlay extends Node {
+ public IrisMotionRcdShortChromaOverlay(){super("","IrisMotionRcdShortChromaOverlay");}@Override public void Compile(){}
+ @Override public void Run(){PostPipeline p=(PostPipeline)basePipeline;if(previousNode==null||previousNode.WorkingTexture==null||p.irisMotionDirectRgbTexture==null||p.motionV2HighlightProvenanceTexture==null)throw new IllegalStateException("26533 Motion RCD Short-A bridge missing input");glProg.useAssetProgram("irisnight/motion_rcd_short_chroma_overlay");glProg.setTexture("RcdRgb",previousNode.WorkingTexture);glProg.setTexture("DirectRgb",p.irisMotionDirectRgbTexture);glProg.setTexture("HighlightProvenance",p.motionV2HighlightProvenanceTexture);glProg.setVar("rawSize",basePipeline.mParameters.rawSize);glProg.setVar("packedSize",new android.graphics.Point(basePipeline.mParameters.rawSize.x/2,basePipeline.mParameters.rawSize.y/2));WorkingTexture=basePipeline.getMain();glProg.drawBlocks(WorkingTexture);}
 }
 '''
-    write(root,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightBayerInput.java',java)
-    write(root,'app/src/main/assets/shaders/irisnight/raw16_to_linear_bayer.glsl',shader)
+    overlay_shader=r'''precision highp float;precision highp int;uniform highp sampler2D RcdRgb;uniform highp sampler2D DirectRgb;uniform highp sampler2D HighlightProvenance;uniform ivec2 rawSize;uniform ivec2 packedSize;out vec3 Output;
+float dv(int q){return q==0?1.0:(q==1?3.0:(q==2?9.0:27.0));}float sf(ivec2 p){p=clamp(p,ivec2(0),packedSize-ivec2(1));float c=texelFetch(HighlightProvenance,p,0).r,n=0.0;for(int q=0;q<4;++q){float s=mod(floor(c/dv(q)),3.0);n+=abs(s-2.0)<0.25?1.0:0.0;}return .25*n;}float sm(ivec2 p){vec2 x=.5*vec2(p)-vec2(.5);ivec2 a=ivec2(floor(x)),b=a+ivec2(1);vec2 f=fract(x);return mix(mix(sf(a),sf(ivec2(b.x,a.y)),f.x),mix(sf(ivec2(a.x,b.y)),sf(b),f.x),f.y);}float l(vec3 v){return dot(max(v,vec3(0)),vec3(.2126,.7152,.0722));}void main(){ivec2 p=ivec2(gl_FragCoord.xy);vec3 r=max(texelFetch(RcdRgb,p,0).rgb,vec3(0)),d=max(texelFetch(DirectRgb,p,0).rgb,vec3(0));float rl=l(r),dl=l(d);vec3 hue=dl>1e-6?d*(rl/dl):r;float m=smoothstep(.10,.65,sm(p))*smoothstep(.50,.90,max(max(d.r,d.g),d.b));Output=mix(r,hue,.90*m);}
+'''
+    write(root,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisRcdBayerInput.java',java)
+    write(root,'app/src/main/assets/shaders/irisnight/raw16_to_packed_linear_bayer.glsl',shader)
+    write(root,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionRcdShortChromaOverlay.java',overlay_java)
+    write(root,'app/src/main/assets/shaders/irisnight/motion_rcd_short_chroma_overlay.glsl',overlay_shader)
 
 def patch_post(root):
     p=root/'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java'; s=p.read_text(encoding='utf-8')
+    fa='public ByteBuffer motionV2HighlightProvenance;'
+    s=one(s,fa,fa+'\n    /* IRIS_26533_MOTION_RCD_CARRIER */\n    public boolean irisMotionRcdActive=false;\n    public ByteBuffer irisMotionDirectRgbAuxiliary;\n    public GLTexture irisMotionDirectRgbTexture;','Post Motion RCD fields')
     anchor='public Bitmap Run(ByteBuffer inBuffer, Parameters parameters) {'
-    method='''public Bitmap RunIrisNightBayer(ByteBuffer fusedBayer, Parameters parameters) {
-        if (fusedBayer == null) throw new IllegalArgumentException("26533 Iris Night fused Bayer is null");
-        parameters.irisNightActive = true;
-        parameters.motionV2Active = false;
-        return Run(fusedBayer, parameters);
+    methods='''public Bitmap RunIrisNightBayer(ByteBuffer fusedBayer, Parameters parameters) {
+        if(fusedBayer==null)throw new IllegalArgumentException("26533 Iris Night fused Bayer is null"); parameters.irisNightActive=true;parameters.motionV2Active=false;irisMotionRcdActive=false;irisMotionDirectRgbAuxiliary=null;motionV2HighlightProvenance=null;return Run(fusedBayer,parameters);
+    }
+    public Bitmap RunMotionV2FusedBayerRcd(ByteBuffer fusedBayer,ByteBuffer directRgb,ByteBuffer provenance,Parameters parameters){
+        if(fusedBayer==null||directRgb==null)throw new IllegalArgumentException("26533 Motion RCD carrier missing");parameters.motionV2Active=true;parameters.irisNightActive=false;irisMotionRcdActive=true;irisMotionDirectRgbAuxiliary=directRgb;motionV2HighlightProvenance=provenance;return Run(fusedBayer,parameters);
     }
 
     '''
-    s=one(s,anchor,method+anchor,'Post Night entry')
-    # Never let Night instantiate Photon generic noise state.
+    s=one(s,anchor,methods+anchor,'Post shared RCD entries')
     s=s.replace('if (mParameters.motionV2Active) {','if (mParameters.motionV2Active || mParameters.irisNightActive) {',1)
     build='private void BuildDefaultPipeline() {'
-    night='''private void BuildDefaultPipeline() {
+    graph='''private void BuildDefaultPipeline() {
         /* IRIS_26533_NIGHT_ISOLATED_POST_GRAPH */
-        if (mParameters.irisNightActive) {
-            add(new IrisNightBayerInput());
-            add(new StageTelemetry("IRIS_NIGHT_FUSED_BAYER_INPUT"));
-            add(new MotionV2RcdDemosaic());
-            add(new StageTelemetry("IRIS_NIGHT_RCD"));
-            add(new MotionV2DisplayExposure());
-            add(new MotionV2ColorTransform());
-            add(new MotionV2Render());
-            add(new StageTelemetry("IRIS_NIGHT_RENDER"));
-            add(new RotateWatermark(getRotation()));
-            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
-                    "IRIS_26533_NIGHT_POST_GRAPH",
-                    "nodes=IrisNightBayerInput,RCD,DisplayExposure,ColorTransform,Render,Rotate; " +
-                    "photonPyramid=false exposureFusion=false esd=false legacyDemosaic=false sharpening=false");
-            return;
-        }
+        if(mParameters.irisNightActive){add(new IrisRcdBayerInput());add(new StageTelemetry("IRIS_NIGHT_FUSED_BAYER_INPUT"));add(new IrisRcdDemosaic());add(new StageTelemetry("IRIS_NIGHT_RCD_26498"));add(new MotionV2DisplayExposure());add(new MotionV2ColorTransform());add(new MotionV2Render());add(new RotateWatermark(getRotation()));return;}
+        /* IRIS_26533_MOTION_FUSED_BAYER_RCD_POST_GRAPH */
+        if(mParameters.motionV2Active&&irisMotionRcdActive){add(new IrisRcdBayerInput());add(new StageTelemetry("V2_POST_FUSED_BAYER_CANONICAL_26533"));add(new IrisRcdDemosaic());add(new StageTelemetry("V2_POST_RCD26498_AFTER_MGC_SPATIAL"));add(new IrisMotionRcdShortChromaOverlay());add(new StageTelemetry("V2_POST_SHORT_A_CHROMA_AFTER_RCD"));add(new MotionV2DisplayExposure());add(new MotionV2ColorTransform());add(new MotionV2Render());add(new RotateWatermark(getRotation()));return;}
 '''
-    s=one(s,build,night,'Post Night graph')
-    # Allow Iris render-generated gainmap to attach for Night without marking it Motion.
+    s=one(s,build,graph,'Post shared Motion/Night RCD graphs')
     s=s.replace('if (mParameters.motionV2Active && motionV2GainMapBitmap != null) {','if ((mParameters.motionV2Active || mParameters.irisNightActive) && motionV2GainMapBitmap != null) {',1)
     p.write_text(s,encoding='utf-8')
 
@@ -490,6 +484,24 @@ def patch_hdrx(root):
     # Insert method immediately before entry method to keep class structure simple.
     idx=s.index(entry)
     s=s[:idx]+method+s[idx:]
+    result_decl='ByteBuffer motionV2HighlightProvenance = null;'
+    s=one(s,result_decl,result_decl+'\n        MotionV2Merger.Result iris26533MotionRcdResult = null;','Motion RCD result carrier')
+    prov='motionV2HighlightProvenance = iris26409V2.highlightProvenance;'
+    s=one(s,prov,prov+'\n            iris26533MotionRcdResult = iris26409V2;','Motion RCD sidecar capture')
+    old='''img = pipeline.RunMotionV2FloatCfa(
+                    output,
+                    motionV2HighlightProvenance,
+                    processingParameters);
+            output = null;'''
+    new='''if (processingParameters.cfaPattern >= 0 && processingParameters.cfaPattern <= 3) {
+                if (iris26533MotionRcdResult == null || iris26533MotionRcdResult.stackedDngRaw16 == null) throw new IllegalStateException("26533 Motion fused Bayer sidecar missing");
+                ByteBuffer iris26533Bayer=iris26533MotionRcdResult.stackedDngRaw16; iris26533Bayer.position(0);
+                img=pipeline.RunMotionV2FusedBayerRcd(iris26533Bayer,output,motionV2HighlightProvenance,processingParameters);
+                try{Allocator.free(output);}catch(Throwable ignored){} output=null;
+            } else {
+                img=pipeline.RunMotionV2FloatCfa(output,motionV2HighlightProvenance,processingParameters); output=null;
+            }'''
+    s=one(s,old,new,'Motion standard Bayer RCD handoff')
     p.write_text(s,encoding='utf-8')
 
 def patch_iris_post_nodes(root):
@@ -522,7 +534,7 @@ def main():
         if not p.exists(): raise RuntimeError('required 26532 file missing: '+rel)
         got=sha(p)
         if got!=h: raise RuntimeError(f'26532 base hash mismatch {rel}: {got} != {h}')
-    import_rcd(root,a.historical_rcd_transform)
+    clone_current_rcd(root)
     clone_night_bridge(root); add_parameters(root); add_night_exposure(root); patch_capture(root); patch_frame_selector(root); add_night_input(root); patch_post(root); patch_iris_post_nodes(root); add_neural(root); patch_native(root); patch_gradle(root); patch_hdrx(root)
     print('IRIS_26533_TRANSFORM_APPLIED')
 if __name__=='__main__': main()

@@ -5,13 +5,16 @@ pass(){ echo "PASS: $*"; }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
 manifest_all(){ local r="$1" o="$2"; (cd "$r" && find app/src/main app/version.properties app/build.gradle -type f -print0 | sort -z | xargs -0 sha256sum) > "$o"; }
 manifest_runtime(){ local r="$1" o="$2"; (cd "$r" && find app/src/main app/version.properties -type f -print0 | sort -z | xargs -0 sha256sum) > "$o"; }
-manifest_audited_live(){ local r="$1" o="$2"; (cd "$r" && find app/src/main app/version.properties app/build.gradle \
-  \( -path 'app/src/main/cpp/libjpeg-turbo' -o -path 'app/src/main/cpp/libultrahdr' \) -prune -o -type f -print0 | sort -z | xargs -0 sha256sum) > "$o"; }
+manifest_audited_live(){ local r="$1" o="$2"; (cd "$r" && {
+  find app/src/main -type f ! -path 'app/src/main/cpp/third_party_26507/*' ! -path 'app/src/main/cpp/deps/*' -print;
+  [[ -f app/src/main/cpp/deps/.gitignore ]] && echo app/src/main/cpp/deps/.gitignore;
+  echo app/version.properties; echo app/build.gradle;
+} | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done) > "$o"; }
 
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 SUCCESSFUL_26532_HEAD="22222d162053fefade881a4c37dc388c6f68c581"
-FAILED_26533_V12_HEAD="58392a1aba8f97803ac61f16c3096ac22c5d64f6"
+FAILED_26533_V13_HEAD="55bbaae3d86f031d3bb0951554502ba7ed0152fa"
 BASE_WORKFLOW="build-26532-iris-superres20-pink-foliage.yml"
 BASE_ARTIFACT="photon-26532-iris-superres20-pink-foliage"
 BASE_SOURCE_TAR_NAME="26532_candidate_app_source.tar.gz"
@@ -70,7 +73,7 @@ echo "=== 26533 GATE 0: exact 26532 lineage + handoff integrity ==="
 BRANCH="$(git branch --show-current)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch: $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26532_HEAD" HEAD || fail "handoff HEAD is not descended from exact successful 26532 V1.4"
-git merge-base --is-ancestor "$FAILED_26533_V12_HEAD" HEAD || fail "V1.3 handoff HEAD is not descended from exact failed 26533 V1.2 handoff"
+git merge-base --is-ancestor "$FAILED_26533_V13_HEAD" HEAD || fail "V1.3 handoff HEAD is not descended from exact failed 26533 V1.3 handoff"
 for f in "$APPLY" "$MODEL_PREP" "$VALIDATE" "$HANDOFF" "$OWNER_HASHES" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE" \
          "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" \
          "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST"; do
@@ -109,7 +112,7 @@ git diff --name-only "$SUCCESSFUL_26532_HEAD"..HEAD -- gradlew gradlew.bat gradl
 # Pin the historical RCD payload source to the exact 26532 lineage, not the handoff commit.
 git show "$SUCCESSFUL_26532_HEAD:$HISTORICAL_REL" > "$HISTORICAL_RCD"
 [[ -s "$HISTORICAL_RCD" ]] || fail "historical certified RCD transform unavailable at 26532 lineage"
-pass "exact 26532 V1.4 runtime lineage + exact failed V1.2 correction lineage + handoff integrity verified"
+pass "exact 26532 V1.4 runtime lineage + exact failed V1.3 correction lineage + handoff integrity verified"
 
 echo "=== 26533 GATE 1: recover ACTUAL successful 26532 candidate-source artifact ==="
 RUN_JSON="$WORK/26532_runs.json"
@@ -169,6 +172,10 @@ b0476f9e5a7b130d7c3edc58b7ba4a033edc5fa2c55605fd446feea8e1b3e4ca app/src/main/as
 66831dfd1a39a4b5866631f1058a2883dd237961f33cc4c0bd169a7e02a0873e app/src/main/assets/shaders/motionv2/rcd26489_vh_direction.glsl
 EOF_RCD_INHERITED
 pass "seven certified RCD shaders proven inherited byte-exact from successful 26532"
+# V1.4: the first-RGB owner is the newer provenance-aware 26498 RCD already carried by successful 26532.
+grep -F 'IRIS_26498_PROVENANCE_INSIDE_RCD_AND_TRUE_MIRRORED_BOUNDARY' "$BASE/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java" >/dev/null || fail "26532 provenance-aware RCD26498 owner missing"
+for rel in rcd26498_populate.glsl rcd26498_vh_direction.glsl rcd26498_lpf.glsl rcd26498_green.glsl rcd26498_diag_residual.glsl rcd26489_diag_direction.glsl rcd26498_opposite.glsl rcd26498_green_rb.glsl rcd26498_write.glsl; do [[ -f "$BASE/app/src/main/assets/shaders/motionv2/$rel" ]] || fail "26532 RCD26498 shader missing: $rel"; done
+pass "successful 26532 provenance-aware RCD26498 owner/assets verified before transform"
 cp -a "$BASE/." "$AFTER/"
 pass "exact successful 26532 candidate recovered; repository app/src remains non-authoritative"
 
@@ -202,15 +209,15 @@ EXPECTED_CHANGED="$OUT/26533_expected_changed_files.txt"
 cat > "$EXPECTED_CHANGED" <<'EOF'
 app/build.gradle
 app/src/main/assets/models/iris_night_jin_lol_512.onnx
-app/src/main/assets/shaders/motionv2/rcd26489_populate.glsl
-app/src/main/assets/shaders/irisnight/raw16_to_linear_bayer.glsl
-app/src/main/assets/shaders/motionv2/rcd26489_write.glsl
+app/src/main/assets/shaders/irisnight/motion_rcd_short_chroma_overlay.glsl
+app/src/main/assets/shaders/irisnight/raw16_to_packed_linear_bayer.glsl
 app/src/main/cpp/motionv2_jpeg444_jni.cpp
 app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
-app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightBayerInput.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionRcdShortChromaOverlay.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisRcdBayerInput.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisRcdDemosaic.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
-app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/FrameNumberSelector.java
@@ -303,46 +310,57 @@ echo "=== 26533 GATE 4: version increment + live copy + native restore + compile
   python3 "$VALIDATE" "$AFTER" --model-provenance "$MODEL_PROVENANCE" --base-owner-hashes "$OWNER_HASHES" | tee "$OUT/26533_versioned_owner_validation.txt"
   manifest_audited_live "$AFTER" "$OUT/26533_pre_gradle_audited_runtime.sha256"
 
+  # V1.4: exact successful-26532 V1.4 native restore procedure.
+  rm -rf "$BJ"; git init -q "$BJ"
+  git -C "$BJ" remote add origin https://github.com/bjzhou/PhotonCamera.git
+  git -C "$BJ" config core.sparseCheckout true
+  mkdir -p "$BJ/.git/info"
+  cat > "$BJ/.git/info/sparse-checkout" <<'SPARSE'
+/app/src/main/cpp/libjpeg-turbo/
+/app/src/main/cpp/libultrahdr/
+SPARSE
+  git -C "$BJ" fetch --depth=1 origin "$BJZHOU_VENDOR_HEAD"
+  git -C "$BJ" checkout -q --detach FETCH_HEAD
+  [[ "$(git -C "$BJ" rev-parse HEAD)" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor checkout drift"
+  THIRD="$AFTER/app/src/main/cpp/third_party_26507"
+  rm -rf "$THIRD"; mkdir -p "$THIRD"
+  cp -a "$BJ/app/src/main/cpp/libjpeg-turbo" "$THIRD/libjpeg-turbo"
+  cp -a "$BJ/app/src/main/cpp/libultrahdr" "$THIRD/libultrahdr"
+  [[ -f "$THIRD/libjpeg-turbo/CMakeLists.txt" ]] || fail "26507 pinned libjpeg-turbo source missing before Gradle"
+  [[ -f "$THIRD/libultrahdr/ultrahdr_api.h" ]] || fail "26507 pinned libultrahdr root API missing before Gradle"
+  [[ -f "$THIRD/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "26507 pinned libultrahdr core source missing before Gradle"
+  [[ ! -e "$THIRD/libultrahdr/CMakeLists.txt" ]] || fail "unexpected obsolete libultrahdr CMakeLists sentinel returned"
+  ( cd "$THIRD" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26533_vendor_manifest_check_prebuild.txt"
+  pass "exact successful-26532 V1.4 native vendor checkout + full manifest verified before Gradle"
+
+  # Install the complete candidate only after the exact vendor tree is proven.
   rm -rf "$ROOT/app/src/main"
+  mkdir -p "$ROOT/app/src"
   cp -a "$AFTER/app/src/main" "$ROOT/app/src/"
   cp "$AFTER/app/version.properties" "$ROOT/app/version.properties"
   cp "$AFTER/app/build.gradle" "$ROOT/app/build.gradle"
-
-  # Restore the exact successful-26532 native dependency procedure inherited from V1.4.
-  rm -rf "$BJ"
-  git clone --filter=blob:none --no-checkout https://github.com/bjzhou/PhotonCamera.git "$BJ"
-  git -C "$BJ" config core.sparseCheckout true
-  mkdir -p "$BJ/.git/info"
-  cat > "$BJ/.git/info/sparse-checkout" <<'EOF'
-/app/src/main/cpp/libjpeg-turbo/
-/app/src/main/cpp/libultrahdr/
-EOF
-  git -C "$BJ" fetch --depth=1 origin "$BJZHOU_VENDOR_HEAD"
-  git -C "$BJ" checkout --detach FETCH_HEAD
-  [[ "$(git -C "$BJ" rev-parse HEAD)" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor checkout head mismatch"
-  [[ -f "$BJ/app/src/main/cpp/libjpeg-turbo/CMakeLists.txt" ]] || fail "libjpeg-turbo sentinel missing"
-  [[ -f "$BJ/app/src/main/cpp/libultrahdr/ultrahdr_api.h" ]] || fail "libultrahdr API sentinel missing"
-  [[ -f "$BJ/app/src/main/cpp/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "libultrahdr source sentinel missing"
-  [[ ! -e "$BJ/app/src/main/cpp/libultrahdr/CMakeLists.txt" ]] || fail "unexpected obsolete libultrahdr CMakeLists sentinel returned"
-  rm -rf "$ROOT/app/src/main/cpp/libjpeg-turbo" "$ROOT/app/src/main/cpp/libultrahdr"
-  cp -a "$BJ/app/src/main/cpp/libjpeg-turbo" "$ROOT/app/src/main/cpp/"
-  cp -a "$BJ/app/src/main/cpp/libultrahdr" "$ROOT/app/src/main/cpp/"
-  (cd "$ROOT" && sha256sum -c "$BJZHOU_MANIFEST") | tee "$OUT/26533_native_dependency_manifest_check.txt"
-  pass "exact successful-26532 native vendor checkout + full manifest verified before Gradle"
-
+  assert_cpp_deps_exact(){ local root="$1" phase="$2" expected actual; if [[ "$phase" == pre ]]; then expected=$'.gitignore'; else expected=$'.gitignore\narchive.h\narchive_entry.h\ntechnicallyflac.h\ntiny_dng_writer.h'; fi; actual="$(find "$root/app/src/main/cpp/deps" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"; [[ "$actual" == "$expected" ]] || fail "unexpected app/src/main/cpp/deps contents ($phase): [$actual]"; }
+  assert_cpp_deps_exact "$ROOT" pre
+  manifest_audited_live "$ROOT" "$OUT/26533_installed_pre_gradle_audited_runtime.sha256"
+  cmp -s "$OUT/26533_pre_gradle_audited_runtime.sha256" "$OUT/26533_installed_pre_gradle_audited_runtime.sha256" || fail "installed runtime differs before Gradle"
+  [[ -f "$ROOT/app/src/main/cpp/third_party_26507/libjpeg-turbo/CMakeLists.txt" ]] || fail "pinned libjpeg-turbo missing immediately before Gradle"
+  [[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/ultrahdr_api.h" ]] || fail "pinned libultrahdr root API missing immediately before Gradle"
+  [[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "pinned libultrahdr core source missing immediately before Gradle"
+  ( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26533_installed_vendor_manifest_check_prebuild.txt"
   chmod +x ./gradlew
   ./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace
   ./gradlew :app:assembleDebug --stacktrace
 }
 
 echo "=== 26533 GATE 5: post-build source integrity + owner revalidation ==="
+assert_cpp_deps_exact "$ROOT" post
 manifest_audited_live "$ROOT" "$OUT/26533_post_gradle_audited_runtime.sha256"
 cmp -s "$OUT/26533_pre_gradle_audited_runtime.sha256" "$OUT/26533_post_gradle_audited_runtime.sha256" || fail "Gradle/build mutated audited 26533 source"
 python3 "$VALIDATE" "$ROOT" --model-provenance "$MODEL_PROVENANCE" --base-owner-hashes "$OWNER_HASHES" | tee "$OUT/26533_postbuild_owner_validation.txt"
 python3 "$JAVA_XML_PREFLIGHT" --root "$ROOT" | tee "$OUT/26533_postbuild_java_xml_preflight.txt"
 python3 "$NATIVE_JPEG_PREFLIGHT" --root "$ROOT" | tee "$OUT/26533_postbuild_native_jpeg_preflight.txt"
 # Native vendor dependencies must also remain exact after Gradle.
-(cd "$ROOT" && sha256sum -c "$BJZHOU_MANIFEST") | tee "$OUT/26533_postbuild_native_dependency_manifest_check.txt"
+(cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST") | tee "$OUT/26533_postbuild_native_dependency_manifest_check.txt"
 pass "compile/build completed and audited source remained byte-identical"
 
 echo "=== 26533 GATE 6: exactly one APK + deterministic candidate artifact ==="
@@ -354,7 +372,7 @@ find "$ROOT/app/build" -type f -name '*.apk' -delete
 [[ "$(find "$ROOT" -maxdepth 1 -type f -name '*.apk' | wc -l)" -eq 1 ]] || fail "root APK count is not exactly one"
 sha256sum "$FINAL" > "$OUT/26533_APK.sha256"
 # Strip build-only vendor trees before exporting the authoritative next candidate source.
-rm -rf "$AFTER/app/src/main/cpp/libjpeg-turbo" "$AFTER/app/src/main/cpp/libultrahdr"
+rm -rf "$AFTER/app/src/main/cpp/third_party_26507"
 manifest_all "$AFTER" "$SOURCE_MANIFEST_OUT"
 EXPECTED_AFTER_FILES="$(python3 - "$BASE" "$EXPECTED_CHANGED" <<'PY'
 from pathlib import Path
@@ -401,11 +419,13 @@ NIGHT_FULL_RES_NEURAL=false
 NIGHT_50MP_NEURAL=false
 NIGHT_SUPERRES_OUTPUT=26532_STREAMED_2X
 PHOTON_NIGHT_FALLBACK=false
-MOTION_RUNTIME_BASE=26532_V1.4_PRESERVED
+MOTION_RUNTIME_BASE=26532_V1.4_CAPTURE_MGC_PRESERVED
+MOTION_FIRST_RGB_OWNER=PROVENANCE_AWARE_RCD26498
+MOTION_SHORT_A=CHROMA_ONLY_AFTER_RCD
 EOF
 pass "single APK + deterministic 26533 next-candidate source exported"
 
 echo "=== FINAL 26533 PASS SUMMARY ==="
 pass "26533 exact successful-26532 V1.4 lineage + forward/rollback + anti-hybrid safety proof"
 pass "26533 Kotlin/Java/native build + post-build source/dependency integrity proof"
-pass "26533 single APK + 12MP/50MP Night/RCD/Jin architecture + deterministic next candidate proof"
+pass "26533 single APK + Motion/Night RCD/Jin architecture + deterministic next candidate proof"

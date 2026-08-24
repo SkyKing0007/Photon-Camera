@@ -102,18 +102,11 @@ def self_test():
         rr=Path(td)
         mod.add_night_exposure(rr); mod.add_night_input(rr)
         generated_night=(rr/'app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java').read_text(encoding='utf-8')
-        generated_input=(rr/'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightBayerInput.java').read_text(encoding='utf-8')
+        generated_input=(rr/'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisRcdBayerInput.java').read_text(encoding='utf-8')
         req('GenerateExpoPair' in generated_night,'generator self-test lost explanatory GenerateExpoPair documentation')
         req('GenerateExpoPair' not in java_executable_text(generated_night),'generator self-test sees executable GenerateExpoPair leak')
-        req('Bayer2Float' in generated_input,'generator self-test lost explanatory Bayer2Float documentation')
-        req('Bayer2Float' not in java_executable_text(generated_input),'generator self-test sees executable Bayer2Float leak')
-        hp=rr/'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java'
-        hp.parent.mkdir(parents=True,exist_ok=True); hp.write_text('class H {\nprivate void ApplyHdrX() {\n}\n}\n',encoding='utf-8')
-        mod.patch_hdrx(rr); hh=hp.read_text(encoding='utf-8')
-        hb=hh[hh.index('private void ApplyIrisNight26533()'):hh.index('private void ApplyHdrX()')]
-        hcode=java_executable_text(hb)
-        for bad in ('PyramidMerging','ImageFrameDeblur','IsoExpoSelector.fullpairs','ExposureFusionBayer2','ESD3D2','Sharpen2','CaptureSharpening'):
-            req(bad not in hcode,'generator Hdrx self-test executable legacy leak: '+bad)
+        req('IRIS_26533_SHARED_FUSED_BAYER_INPUT' in generated_input,'generator shared packed Bayer input missing')
+        req('Bayer2Float' not in java_executable_text(generated_input),'generator shared input sees executable Bayer2Float leak')
         ncode=java_executable_text(mod.neural_java())
         req('writeSuperRes' not in ncode,'generator neural self-test executable writeSuperRes leak')
         req('PhotonCamera.getInstance().getAssets()' not in ncode,'generator neural self-test invalid executable asset access')
@@ -150,16 +143,16 @@ def main():
     req('mergeMethod = MgcMergeMethod.SPATIAL_BAYER' in bridge,'Night bridge not SPATIAL_BAYER')
     req('IRIS_26533_NIGHT_ISOLATED_POST_GRAPH' in post,'isolated Night post graph missing')
     nightpost=post[post.index('IRIS_26533_NIGHT_ISOLATED_POST_GRAPH'):post.index('IRIS_26410_MOTION_V2_ISOLATED_POST_GRAPH')]
-    for good in ('IrisNightBayerInput','MotionV2RcdDemosaic','MotionV2DisplayExposure','MotionV2ColorTransform','MotionV2Render'):
+    for good in ('IrisRcdBayerInput','IrisRcdDemosaic','MotionV2DisplayExposure','MotionV2ColorTransform','MotionV2Render'):
         req(good in nightpost,'Night post node missing: '+good)
     nightpost_code=java_executable_text(nightpost)
     for bad in ('ExposureFusionBayer2','Demosaic3','ESD3D2','CaptureSharpening','Sharpen2','Bayer2Float'):
         req(bad not in nightpost_code,'legacy Night post executable node leaked: '+bad)
-    inputj=txt('app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightBayerInput.java')
-    req('IRIS_26533_NIGHT_SENSOR_CODE_INPUT' in inputj,'Iris Night sensor-code input owner missing')
+    inputj=txt('app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisRcdBayerInput.java')
+    req('IRIS_26533_SHARED_FUSED_BAYER_INPUT' in inputj,'shared Motion/Night packed Bayer input owner missing')
     req('Bayer2Float' not in java_executable_text(inputj),'Photon Bayer2Float executable implementation leaked into Iris Night input')
-    shader=txt('app/src/main/assets/shaders/irisnight/raw16_to_linear_bayer.glsl')
-    req('uniform usampler2D InputBuffer;' in shader and 'Output=max((raw-bl)' in shader,'Iris Night RAW16 physical normalization shader missing')
+    shader=txt('app/src/main/assets/shaders/irisnight/raw16_to_packed_linear_bayer.glsl')
+    req('usampler2D InputBuffer' in shader and 'out vec4 Output' in shader,'shared RAW16 -> packed physical Bayer shader missing')
     req("onnxruntime-android:1.29.0" in grad,'pinned ORT 1.29.0 dependency missing')
     model=r/'app/src/main/assets/models/iris_night_jin_lol_512.onnx'; req(model.exists() and model.stat().st_size>1_000_000,'ONNX model missing/suspiciously small')
     neural=txt('app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightNeuralEnhancer.java')
@@ -183,12 +176,23 @@ def main():
         req('motionV2Active || basePipeline.mParameters.irisNightActive' in t,'Iris Night capability guard missing: '+rel)
     req('PhotonCamera.getAssetLoader().getInputStream("models/iris_night_jin_lol_512.onnx")' in neural,'portable asset-loader model access missing')
     req('PhotonCamera.getInstance().getAssets()' not in java_executable_text(neural),'invalid executable PhotonCamera getInstance asset access survived')
-    for rel,expected in RCD_HASHES.items():
-        f=r/rel; req(f.exists(),'RCD payload missing: '+rel); req(hashlib.sha256(f.read_bytes()).hexdigest()==expected,'RCD certified hash mismatch: '+rel)
+    rcd=txt('app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisRcdDemosaic.java')
+    req('IRIS_26498_PROVENANCE_INSIDE_RCD_AND_TRUE_MIRRORED_BOUNDARY' in rcd,'26532 provenance-aware RCD clone missing')
+    req('class IrisRcdDemosaic' in rcd and 'rcd26498_populate' in rcd and 'rcd26498_write' in rcd,'shared 26498 RCD owner incomplete')
+    for rel in ('rcd26498_populate.glsl','rcd26498_vh_direction.glsl','rcd26498_lpf.glsl','rcd26498_green.glsl','rcd26498_diag_residual.glsl','rcd26489_diag_direction.glsl','rcd26498_opposite.glsl','rcd26498_green_rb.glsl','rcd26498_write.glsl'):
+        req((r/'app/src/main/assets/shaders/motionv2'/rel).is_file(),'26532 RCD shader missing: '+rel)
+    motionpost=post[post.index('IRIS_26533_MOTION_FUSED_BAYER_RCD_POST_GRAPH'):post.index('IRIS_26410_MOTION_V2_ISOLATED_POST_GRAPH')]
+    for good in ('IrisRcdBayerInput','IrisRcdDemosaic','IrisMotionRcdShortChromaOverlay','MotionV2DisplayExposure','MotionV2ColorTransform','MotionV2Render'):
+        req(good in motionpost,'Motion RCD post node missing: '+good)
+    req(motionpost.index('IrisRcdDemosaic') < motionpost.index('MotionV2DisplayExposure'),'Motion display exposure must remain after RCD')
+    req('RunMotionV2FusedBayerRcd' in hdr and 'iris26533MotionRcdResult.stackedDngRaw16' in hdr,'Motion fused-Bayer RCD handoff missing')
+    req('motionV2HighlightProvenance' in hdr,'Motion Short-A provenance bridge lost')
+    overlay=txt('app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionRcdShortChromaOverlay.java')
+    req('IRIS_26533_MOTION_RCD_SHORT_CHROMA_BRIDGE' in overlay,'Short-A chroma-only post-RCD bridge missing')
     for rel in PROTECTED_26532_PATHS:
         req(rel in exact,'exact-26532 owner hash contract missing protected path: '+rel)
         f=r/rel; req(f.exists(),'protected 26532 file missing: '+rel); req(hashlib.sha256(f.read_bytes()).hexdigest()==exact[rel],'protected Motion/Spatial 26532 hash changed: '+rel)
     print('26533 NIGHT ANTI-HYBRID PROOF PASSED')
     print('26533 12MP/50MP PERFORMANCE ARCHITECTURE PROOF PASSED')
-    print('26533 RCD/DNG/NEURAL OWNER PROOF PASSED')
+    print('26533 MOTION+NIGHT RCD/DNG/NEURAL OWNER PROOF PASSED')
 if __name__=='__main__': main()
