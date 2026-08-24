@@ -11,6 +11,7 @@ manifest_audited_live(){ local r="$1" o="$2"; (cd "$r" && find app/src/main app/
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 SUCCESSFUL_26532_HEAD="22222d162053fefade881a4c37dc388c6f68c581"
+FAILED_26533_V11_HEAD="a11275d3a4278dd3c6821aef23c20262daddf03e"
 BASE_WORKFLOW="build-26532-iris-superres20-pink-foliage.yml"
 BASE_ARTIFACT="photon-26532-iris-superres20-pink-foliage"
 BASE_SOURCE_TAR_NAME="26532_candidate_app_source.tar.gz"
@@ -69,6 +70,7 @@ echo "=== 26533 GATE 0: exact 26532 lineage + handoff integrity ==="
 BRANCH="$(git branch --show-current)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch: $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26532_HEAD" HEAD || fail "handoff HEAD is not descended from exact successful 26532 V1.4"
+git merge-base --is-ancestor "$FAILED_26533_V11_HEAD" HEAD || fail "V1.2 handoff HEAD is not descended from exact failed 26533 V1.1 handoff"
 for f in "$APPLY" "$MODEL_PREP" "$VALIDATE" "$HANDOFF" "$OWNER_HASHES" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE" \
          "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" \
          "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST"; do
@@ -92,6 +94,7 @@ PYHASH
 python3 -m py_compile "$APPLY" "$MODEL_PREP" "$VALIDATE" "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" \
   "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" \
   "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST"
+python3 "$VALIDATE" --self-test
 bash -n "$0"
 command -v gh >/dev/null || fail "GitHub CLI unavailable"
 [[ -n "${GH_TOKEN:-}" ]] || fail "GH_TOKEN missing"
@@ -106,7 +109,7 @@ git diff --name-only "$SUCCESSFUL_26532_HEAD"..HEAD -- gradlew gradlew.bat gradl
 # Pin the historical RCD payload source to the exact 26532 lineage, not the handoff commit.
 git show "$SUCCESSFUL_26532_HEAD:$HISTORICAL_REL" > "$HISTORICAL_RCD"
 [[ -s "$HISTORICAL_RCD" ]] || fail "historical certified RCD transform unavailable at 26532 lineage"
-pass "exact 26532 V1.4 lineage + handoff integrity verified"
+pass "exact 26532 V1.4 runtime lineage + exact failed V1.1 correction lineage + handoff integrity verified"
 
 echo "=== 26533 GATE 1: recover ACTUAL successful 26532 candidate-source artifact ==="
 RUN_JSON="$WORK/26532_runs.json"
@@ -147,7 +150,7 @@ mkdir -p "$BASE/app"
 git show "$SUCCESSFUL_26532_HEAD:app/build.gradle" > "$BASE/app/build.gradle"
 [[ "$(grep '^VERSION_NAME=' "$BASE/app/version.properties" | cut -d= -f2)" == "0.9726532" ]] || fail "base version name mismatch"
 [[ "$(grep '^VERSION_BUILD=' "$BASE/app/version.properties" | cut -d= -f2)" == "26532" ]] || fail "base build mismatch"
-# V1.1: verify the complete critical-owner contract recovered by the earlier exact-26532 source probe.
+# V1.2: verify the complete critical-owner contract recovered by the earlier exact-26532 source probe.
 # This happens BEFORE model work and BEFORE the 26533 transformer can touch the isolated candidate.
 ( cd "$BASE" && sha256sum -c "$OWNER_HASHES" ) | tee "$OUT/26533_exact_26532_owner_contract_check.txt"
 pass "exact 8-owner 26532 source-probe contract verified against recovered candidate"
