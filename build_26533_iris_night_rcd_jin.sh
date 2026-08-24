@@ -11,7 +11,7 @@ manifest_audited_live(){ local r="$1" o="$2"; (cd "$r" && find app/src/main app/
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 SUCCESSFUL_26532_HEAD="22222d162053fefade881a4c37dc388c6f68c581"
-FAILED_26533_V11_HEAD="a11275d3a4278dd3c6821aef23c20262daddf03e"
+FAILED_26533_V12_HEAD="58392a1aba8f97803ac61f16c3096ac22c5d64f6"
 BASE_WORKFLOW="build-26532-iris-superres20-pink-foliage.yml"
 BASE_ARTIFACT="photon-26532-iris-superres20-pink-foliage"
 BASE_SOURCE_TAR_NAME="26532_candidate_app_source.tar.gz"
@@ -70,7 +70,7 @@ echo "=== 26533 GATE 0: exact 26532 lineage + handoff integrity ==="
 BRANCH="$(git branch --show-current)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch: $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26532_HEAD" HEAD || fail "handoff HEAD is not descended from exact successful 26532 V1.4"
-git merge-base --is-ancestor "$FAILED_26533_V11_HEAD" HEAD || fail "V1.2 handoff HEAD is not descended from exact failed 26533 V1.1 handoff"
+git merge-base --is-ancestor "$FAILED_26533_V12_HEAD" HEAD || fail "V1.3 handoff HEAD is not descended from exact failed 26533 V1.2 handoff"
 for f in "$APPLY" "$MODEL_PREP" "$VALIDATE" "$HANDOFF" "$OWNER_HASHES" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE" \
          "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" \
          "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST"; do
@@ -109,7 +109,7 @@ git diff --name-only "$SUCCESSFUL_26532_HEAD"..HEAD -- gradlew gradlew.bat gradl
 # Pin the historical RCD payload source to the exact 26532 lineage, not the handoff commit.
 git show "$SUCCESSFUL_26532_HEAD:$HISTORICAL_REL" > "$HISTORICAL_RCD"
 [[ -s "$HISTORICAL_RCD" ]] || fail "historical certified RCD transform unavailable at 26532 lineage"
-pass "exact 26532 V1.4 runtime lineage + exact failed V1.1 correction lineage + handoff integrity verified"
+pass "exact 26532 V1.4 runtime lineage + exact failed V1.2 correction lineage + handoff integrity verified"
 
 echo "=== 26533 GATE 1: recover ACTUAL successful 26532 candidate-source artifact ==="
 RUN_JSON="$WORK/26532_runs.json"
@@ -150,10 +150,25 @@ mkdir -p "$BASE/app"
 git show "$SUCCESSFUL_26532_HEAD:app/build.gradle" > "$BASE/app/build.gradle"
 [[ "$(grep '^VERSION_NAME=' "$BASE/app/version.properties" | cut -d= -f2)" == "0.9726532" ]] || fail "base version name mismatch"
 [[ "$(grep '^VERSION_BUILD=' "$BASE/app/version.properties" | cut -d= -f2)" == "26532" ]] || fail "base build mismatch"
-# V1.2: verify the complete critical-owner contract recovered by the earlier exact-26532 source probe.
+# V1.3: verify the complete critical-owner contract recovered by the earlier exact-26532 source probe.
 # This happens BEFORE model work and BEFORE the 26533 transformer can touch the isolated candidate.
 ( cd "$BASE" && sha256sum -c "$OWNER_HASHES" ) | tee "$OUT/26533_exact_26532_owner_contract_check.txt"
 pass "exact 8-owner 26532 source-probe contract verified against recovered candidate"
+# V1.3: the failed exact-candidate V1.2 delta proved these seven RCD shaders
+# are already byte-identical in successful 26532. Re-importing them is a no-op,
+# so prove that inheritance BEFORE transform and exclude them from changed scope.
+while read -r expected rel; do
+  [[ "$(sha "$BASE/$rel")" == "$expected" ]] || fail "26532 inherited RCD shader drift: $rel"
+done <<'EOF_RCD_INHERITED'
+1bd8f80b12e06f5ab8c19bb65d27e60f31998327557df0e6f551c682bdfc2b0e app/src/main/assets/shaders/motionv2/rcd26489_diag_direction.glsl
+47e7041976905fb76a54acb36e19d30d4d29d8e4dd9d25012f0515978170a2e3 app/src/main/assets/shaders/motionv2/rcd26489_diag_residual.glsl
+4f268056ae8d8f1da8ae5b3936768cbb7d3841f9ac4e4b54ac6f113ca6a55040 app/src/main/assets/shaders/motionv2/rcd26489_green.glsl
+b0476f9e5a7b130d7c3edc58b7ba4a033edc5fa2c55605fd446feea8e1b3e4ca app/src/main/assets/shaders/motionv2/rcd26489_green_rb.glsl
+95dff8fa0f3c4420de8e13346b766c7a2a80f76b08634b3b8135f775cac06a0c app/src/main/assets/shaders/motionv2/rcd26489_lpf.glsl
+30e732e00e50aeca0d29d08529230c3d043b81e8df87b0c4504768e89fe80392 app/src/main/assets/shaders/motionv2/rcd26489_opposite.glsl
+66831dfd1a39a4b5866631f1058a2883dd237961f33cc4c0bd169a7e02a0873e app/src/main/assets/shaders/motionv2/rcd26489_vh_direction.glsl
+EOF_RCD_INHERITED
+pass "seven certified RCD shaders proven inherited byte-exact from successful 26532"
 cp -a "$BASE/." "$AFTER/"
 pass "exact successful 26532 candidate recovered; repository app/src remains non-authoritative"
 
@@ -187,14 +202,7 @@ EXPECTED_CHANGED="$OUT/26533_expected_changed_files.txt"
 cat > "$EXPECTED_CHANGED" <<'EOF'
 app/build.gradle
 app/src/main/assets/models/iris_night_jin_lol_512.onnx
-app/src/main/assets/shaders/motionv2/rcd26489_diag_direction.glsl
-app/src/main/assets/shaders/motionv2/rcd26489_diag_residual.glsl
-app/src/main/assets/shaders/motionv2/rcd26489_green.glsl
-app/src/main/assets/shaders/motionv2/rcd26489_green_rb.glsl
-app/src/main/assets/shaders/motionv2/rcd26489_lpf.glsl
-app/src/main/assets/shaders/motionv2/rcd26489_opposite.glsl
 app/src/main/assets/shaders/motionv2/rcd26489_populate.glsl
-app/src/main/assets/shaders/motionv2/rcd26489_vh_direction.glsl
 app/src/main/assets/shaders/irisnight/raw16_to_linear_bayer.glsl
 app/src/main/assets/shaders/motionv2/rcd26489_write.glsl
 app/src/main/cpp/motionv2_jpeg444_jni.cpp

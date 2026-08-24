@@ -1,14 +1,14 @@
-Photon Camera 26533 V1.2 — Iris Night / RCD / Jin Neural Handoff
+Photon Camera 26533 V1.3 — Iris Night / RCD / Jin Neural Handoff
 ==============================================================
 
 TARGET
 - Branch: experimental-clean-photon-rebuild
 - Base runtime: exact successful 26532 V1.4 candidate
 - Base HEAD required by the workflow: 22222d162053fefade881a4c37dc388c6f68c581
-- V1.2 correction parent required: exact failed V1.1 handoff a11275d3a4278dd3c6821aef23c20262daddf03e
+- V1.3 correction parent required: exact failed V1.2 handoff 58392a1aba8f97803ac61f16c3096ac22c5d64f6
 - Target: 0.9726533 / 26533
-- Workflow: Build 26533 V1.2 Iris Night RCD Jin
-- Artifact: photon-26533-v1-2-iris-night-rcd-jin
+- Workflow: Build 26533 V1.3 Iris Night RCD Jin
+- Artifact: photon-26533-v1-3-iris-night-rcd-jin
 
 V1.1 CORRECTION — EXACT 26532 SOURCE CONTRACT
 - V1 failed before runtime modification because three base-owner SHA-256 literals were copied from an earlier non-authoritative source view.
@@ -69,9 +69,16 @@ Forward/rollback patches provide the pre-write safety/recovery proof, and the ex
 WHAT YOU DO
 - Upload the contents of this handoff to the ROOT of experimental-clean-photon-rebuild, preserving the .github/workflows folder.
 - Commit those handoff files only. Do not edit app/src or app/build.gradle yourself.
-- The push path can start the workflow automatically. If it does not, open Actions and run "Build 26533 V1.2 Iris Night RCD Jin" manually.
-- If the build succeeds, download artifact "photon-26533-v1-2-iris-night-rcd-jin".
-- If it fails, send the 26533_build.log / proof output. A pre-success failure stays build 26533 and is corrected as V1.1/V1.2 rather than consuming 26534.
+- The push path can start the workflow automatically. If it does not, open Actions and run "Build 26533 V1.3 Iris Night RCD Jin" manually.
+- If the build succeeds, download artifact "photon-26533-v1-3-iris-night-rcd-jin".
+- If it fails, send the 26533_build.log / proof output. A pre-success failure stays build 26533 and is corrected as V1.1/V1.2/V1.3 rather than consuming 26534.
 
 DO NOT PUSH THE RESULT TO dev.
 No repository push is performed by the workflow itself.
+
+V1.3 CORRECTION — EXACT CANDIDATE DELTA CONTRACT
+- V1.2 reached the exact successful-26532 candidate, passed the corrected owner contract, completed Jin conversion, completed the 26533 transform, and passed semantic validation.
+- It then failed the exact changed-file allowlist because seven certified RCD shaders are already byte-identical in successful 26532. Re-importing identical bytes correctly produces no git diff.
+- V1.3 excludes only those seven no-op inherited shaders from the required delta and proves their exact historical hashes directly against recovered 26532 BEFORE transform.
+- rcd26489_populate.glsl, rcd26489_write.glsl, and MotionV2RcdDemosaic.java remain required changes because the real V1.2 candidate delta showed them as changed.
+- Runtime transformer, semantic validator, Jin model conversion, Night architecture, version/build, and all downstream compile/build gates are otherwise unchanged.
