@@ -27,6 +27,7 @@ APPLY="$ROOT/apply_26533_iris_night_rcd_jin.py"
 MODEL_PREP="$ROOT/prepare_26533_jin_model.py"
 VALIDATE="$ROOT/validate_26533_iris_night_rcd_jin.py"
 HANDOFF="$ROOT/26533_HANDOFF_HASHES.sha256"
+OWNER_HASHES="$ROOT/26533_EXACT_26532_OWNER_HASHES.sha256"
 HISTORICAL_REL="transform_26489_bjzhou_host_bayer_rcd_v2.py"
 BJZHOU_MANIFEST="$ROOT/26507_BJZHOU_NATIVE_DEPENDENCIES.sha256"
 BJZHOU_COMMIT_FILE="$ROOT/26507_BJZHOU_DEPENDENCY_COMMIT.txt"
@@ -68,12 +69,26 @@ echo "=== 26533 GATE 0: exact 26532 lineage + handoff integrity ==="
 BRANCH="$(git branch --show-current)"
 [[ "$BRANCH" == "$EXPECTED_BRANCH" && "$BRANCH" != "dev" ]] || fail "wrong/protected branch: $BRANCH"
 git merge-base --is-ancestor "$SUCCESSFUL_26532_HEAD" HEAD || fail "handoff HEAD is not descended from exact successful 26532 V1.4"
-for f in "$APPLY" "$MODEL_PREP" "$VALIDATE" "$HANDOFF" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE" \
+for f in "$APPLY" "$MODEL_PREP" "$VALIDATE" "$HANDOFF" "$OWNER_HASHES" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE" \
          "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" \
          "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST"; do
   [[ -f "$f" ]] || fail "missing $(basename "$f")"
 done
 sha256sum -c "$HANDOFF"
+python3 - "$OWNER_HASHES" <<'PYHASH'
+import re,sys
+rows=[]
+for raw in open(sys.argv[1],encoding='utf-8'):
+    line=raw.strip()
+    if not line or line.startswith('#'): continue
+    parts=line.split(None,1)
+    if len(parts)!=2 or not re.fullmatch(r'[0-9a-f]{64}',parts[0]):
+        raise SystemExit('invalid exact-26532 owner hash contract line: '+line)
+    rows.append((parts[0],parts[1].strip()))
+if len(rows)!=8 or len({p for _,p in rows})!=8:
+    raise SystemExit('exact-26532 owner hash contract must contain exactly 8 unique entries')
+print('PASS: exact-26532 owner hash contract syntax/cardinality')
+PYHASH
 python3 -m py_compile "$APPLY" "$MODEL_PREP" "$VALIDATE" "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" \
   "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" \
   "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST"
@@ -132,7 +147,10 @@ mkdir -p "$BASE/app"
 git show "$SUCCESSFUL_26532_HEAD:app/build.gradle" > "$BASE/app/build.gradle"
 [[ "$(grep '^VERSION_NAME=' "$BASE/app/version.properties" | cut -d= -f2)" == "0.9726532" ]] || fail "base version name mismatch"
 [[ "$(grep '^VERSION_BUILD=' "$BASE/app/version.properties" | cut -d= -f2)" == "26532" ]] || fail "base build mismatch"
-# The transform itself carries exact hashes for the most important 26532 runtime owners and fails before changing anything if they drift.
+# V1.1: verify the complete critical-owner contract recovered by the earlier exact-26532 source probe.
+# This happens BEFORE model work and BEFORE the 26533 transformer can touch the isolated candidate.
+( cd "$BASE" && sha256sum -c "$OWNER_HASHES" ) | tee "$OUT/26533_exact_26532_owner_contract_check.txt"
+pass "exact 8-owner 26532 source-probe contract verified against recovered candidate"
 cp -a "$BASE/." "$AFTER/"
 pass "exact successful 26532 candidate recovered; repository app/src remains non-authoritative"
 
@@ -154,8 +172,8 @@ mkdir -p "$AFTER/app/src/main/assets/models"
 pass "pinned Jin checkpoint converted + PyTorch/ONNX equivalence verified"
 
 echo "=== 26533 GATE 1B: complete transform in isolated candidate ==="
-python3 "$APPLY" "$AFTER" --historical-rcd-transform "$HISTORICAL_RCD"
-python3 "$VALIDATE" "$AFTER" --model-provenance "$MODEL_PROVENANCE" | tee "$OUT/26533_prebuild_anti_hybrid_validation.txt"
+python3 "$APPLY" "$AFTER" --historical-rcd-transform "$HISTORICAL_RCD" --base-owner-hashes "$OWNER_HASHES"
+python3 "$VALIDATE" "$AFTER" --model-provenance "$MODEL_PROVENANCE" --base-owner-hashes "$OWNER_HASHES" | tee "$OUT/26533_prebuild_anti_hybrid_validation.txt"
 # Version must remain 26532 until every source/patch/preflight gate passes.
 [[ "$(grep '^VERSION_NAME=' "$AFTER/app/version.properties" | cut -d= -f2)" == "0.9726532" ]] || fail "transform changed version too early"
 [[ "$(grep '^VERSION_BUILD=' "$AFTER/app/version.properties" | cut -d= -f2)" == "26532" ]] || fail "transform changed build too early"
@@ -233,7 +251,7 @@ cmp -s "$OUT/26533_base_manifest_for_rollback.sha256" "$OUT/26533_rollback_manif
 pass "changed-file allowlist exact; forward and rollback patches independently proven"
 
 echo "=== 26533 GATE 3: inherited 26532 + Night/RCD/model preflights ==="
-python3 "$VALIDATE" "$AFTER" --model-provenance "$MODEL_PROVENANCE" | tee "$OUT/26533_owner_preflight.txt"
+python3 "$VALIDATE" "$AFTER" --model-provenance "$MODEL_PROVENANCE" --base-owner-hashes "$OWNER_HASHES" | tee "$OUT/26533_owner_preflight.txt"
 python3 "$SHADER_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26533_inherited_26532_shader_preflight.txt"
 python3 "$EMBEDDED_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26533_inherited_embedded_shader_preflight.txt"
 python3 "$INHERITED_SHADER_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26533_inherited_shader_preflight.txt"
@@ -246,8 +264,11 @@ python3 "$DNG_TEST" --root "$AFTER" | tee "$OUT/26533_dng_subifd_preflight.txt"
 ! grep -R --include='*.java' --include='*.kt' -F 'CameraMode.MOTION || CameraMode.NIGHT' "$AFTER/app/src/main" >/dev/null || fail "global Motion/Night hybrid gate detected"
 ! grep -R --include='*.java' --include='*.kt' -F 'CameraMode.NIGHT || CameraMode.MOTION' "$AFTER/app/src/main" >/dev/null || fail "global Night/Motion hybrid gate detected"
 # Original Motion MGC owner and shared Spatial implementation must remain byte-exact 26532.
-[[ "$(sha "$AFTER/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt")" == "8e10e9dfee15bb306aab74bdd8a41c41df05d9d5df753727887750e08f4c8e1c" ]] || fail "26532 MGC fusion owner changed"
-[[ "$(sha "$AFTER/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt")" == "2a4c259a6a47e066fa7605c5aa0b3d40d07d775bad75d1960a0444107eaf7a8a" ]] || fail "26532 Motion bridge changed"
+expected_owner_sha(){ awk -v p="$1" '$2==p {print $1}' "$OWNER_HASHES"; }
+FUSION_REL="app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt"
+BRIDGE_REL="app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt"
+[[ "$(sha "$AFTER/$FUSION_REL")" == "$(expected_owner_sha "$FUSION_REL")" ]] || fail "26532 MGC fusion owner changed"
+[[ "$(sha "$AFTER/$BRIDGE_REL")" == "$(expected_owner_sha "$BRIDGE_REL")" ]] || fail "26532 Motion bridge changed"
 # Model must be the exact file proven by provenance and the Android dependency must be pinned.
 python3 - "$MODEL_PROVENANCE" "$AFTER/app/src/main/assets/models/iris_night_jin_lol_512.onnx" "$JIN_UPSTREAM_HEAD" <<'PY'
 import hashlib,json,sys
@@ -268,7 +289,7 @@ echo "=== 26533 GATE 4: version increment + live copy + native restore + compile
   sed -i "s/^VERSION_NAME=.*/VERSION_NAME=$VERSION_NAME/; s/^VERSION_BUILD=.*/VERSION_BUILD=$VERSION_BUILD/" "$AFTER/app/version.properties"
   [[ "$(grep '^VERSION_NAME=' "$AFTER/app/version.properties" | cut -d= -f2)" == "$VERSION_NAME" ]] || fail "version name increment failed"
   [[ "$(grep '^VERSION_BUILD=' "$AFTER/app/version.properties" | cut -d= -f2)" == "$VERSION_BUILD" ]] || fail "build increment failed"
-  python3 "$VALIDATE" "$AFTER" --model-provenance "$MODEL_PROVENANCE" | tee "$OUT/26533_versioned_owner_validation.txt"
+  python3 "$VALIDATE" "$AFTER" --model-provenance "$MODEL_PROVENANCE" --base-owner-hashes "$OWNER_HASHES" | tee "$OUT/26533_versioned_owner_validation.txt"
   manifest_audited_live "$AFTER" "$OUT/26533_pre_gradle_audited_runtime.sha256"
 
   rm -rf "$ROOT/app/src/main"
@@ -306,7 +327,7 @@ EOF
 echo "=== 26533 GATE 5: post-build source integrity + owner revalidation ==="
 manifest_audited_live "$ROOT" "$OUT/26533_post_gradle_audited_runtime.sha256"
 cmp -s "$OUT/26533_pre_gradle_audited_runtime.sha256" "$OUT/26533_post_gradle_audited_runtime.sha256" || fail "Gradle/build mutated audited 26533 source"
-python3 "$VALIDATE" "$ROOT" --model-provenance "$MODEL_PROVENANCE" | tee "$OUT/26533_postbuild_owner_validation.txt"
+python3 "$VALIDATE" "$ROOT" --model-provenance "$MODEL_PROVENANCE" --base-owner-hashes "$OWNER_HASHES" | tee "$OUT/26533_postbuild_owner_validation.txt"
 python3 "$JAVA_XML_PREFLIGHT" --root "$ROOT" | tee "$OUT/26533_postbuild_java_xml_preflight.txt"
 python3 "$NATIVE_JPEG_PREFLIGHT" --root "$ROOT" | tee "$OUT/26533_postbuild_native_jpeg_preflight.txt"
 # Native vendor dependencies must also remain exact after Gradle.

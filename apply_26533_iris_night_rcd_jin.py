@@ -2,12 +2,27 @@
 from pathlib import Path
 import argparse, ast, base64, gzip, hashlib, re
 
-EXPECTED_26532 = {
-    'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java': '242e05cb32a8c5e090d1ea4963e30f4c3089f0daba5ad8e2d962ea7fc57c4fa5',
-    'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt': '8e10e9dfee15bb306aab74bdd8a41c41df05d9d5df753727887750e08f4c8e1c',
-    'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt': '2a4c259a6a47e066fa7605c5aa0b3d40d07d775bad75d1960a0444107eaf7a8a',
-    'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java': '8dc271032667ffc8b4b4e19ed1166a4948ebe74a0583d88d7672440320f927d3',
-}
+def load_hash_contract(path):
+    rows={}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line=line.strip()
+        if not line or line.startswith("#"): continue
+        parts=line.split(None,1)
+        if len(parts)!=2 or not re.fullmatch(r'[0-9a-f]{64}', parts[0]):
+            raise RuntimeError("invalid exact-26532 owner hash contract line: "+line)
+        h,rel=parts[0],parts[1].strip()
+        if rel in rows:
+            raise RuntimeError("duplicate exact-26532 owner hash contract path: "+rel)
+        rows[rel]=h
+    return rows
+
+REQUIRED_26532_BASE_OWNERS = (
+    'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java',
+    'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt',
+    'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt',
+    'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java',
+)
+
 RCD_HASHES = {
  'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2RcdDemosaic.java':'754beea951bdea2fbde31988011a36ee1c77bf35fc503b383529c00b9031cd40',
  'app/src/main/assets/shaders/motionv2/rcd26489_diag_direction.glsl':'1bd8f80b12e06f5ab8c19bb65d27e60f31998327557df0e6f551c682bdfc2b0e',
@@ -497,8 +512,12 @@ def patch_iris_post_nodes(root):
 def add_neural(root): write(root,'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightNeuralEnhancer.java',neural_java())
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('root'); ap.add_argument('--historical-rcd-transform',required=True); a=ap.parse_args(); root=Path(a.root)
-    for rel,h in EXPECTED_26532.items():
+    ap=argparse.ArgumentParser(); ap.add_argument('root'); ap.add_argument('--historical-rcd-transform',required=True); ap.add_argument('--base-owner-hashes',required=True); a=ap.parse_args(); root=Path(a.root)
+    exact=load_hash_contract(a.base_owner_hashes)
+    missing=[rel for rel in REQUIRED_26532_BASE_OWNERS if rel not in exact]
+    if missing: raise RuntimeError('exact-26532 owner hash contract missing: '+', '.join(missing))
+    for rel in REQUIRED_26532_BASE_OWNERS:
+        h=exact[rel]
         p=root/rel
         if not p.exists(): raise RuntimeError('required 26532 file missing: '+rel)
         got=sha(p)

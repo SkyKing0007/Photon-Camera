@@ -14,15 +14,28 @@ RCD_HASHES = {
  'app/src/main/assets/shaders/motionv2/rcd26489_vh_direction.glsl':'66831dfd1a39a4b5866631f1058a2883dd237961f33cc4c0bd169a7e02a0873e',
  'app/src/main/assets/shaders/motionv2/rcd26489_write.glsl':'0c3b66a45d0bd8288188c9963cf2b1c7abf0341bb08c59136cdbdd3dc458d346',
 }
-PROTECTED_26532 = {
- 'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt':'8e10e9dfee15bb306aab74bdd8a41c41df05d9d5df753727887750e08f4c8e1c',
- 'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt':'2a4c259a6a47e066fa7605c5aa0b3d40d07d775bad75d1960a0444107eaf7a8a',
-}
+PROTECTED_26532_PATHS = (
+ 'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt',
+ 'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt',
+)
+
+def load_hash_contract(path):
+    rows={}
+    for line in Path(path).read_text(encoding='utf-8').splitlines():
+        line=line.strip()
+        if not line or line.startswith('#'): continue
+        parts=line.split(None,1)
+        if len(parts)!=2 or not re.fullmatch(r'[0-9a-f]{64}', parts[0]): raise RuntimeError('invalid exact-26532 owner hash contract line: '+line)
+        h,rel=parts[0],parts[1].strip()
+        if rel in rows: raise RuntimeError('duplicate exact-26532 owner hash contract path: '+rel)
+        rows[rel]=h
+    return rows
+
 
 def req(cond,msg):
     if not cond: raise RuntimeError(msg)
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('root'); ap.add_argument('--model-provenance'); a=ap.parse_args(); r=Path(a.root)
+    ap=argparse.ArgumentParser(); ap.add_argument('root'); ap.add_argument('--model-provenance'); ap.add_argument('--base-owner-hashes',required=True); a=ap.parse_args(); r=Path(a.root); exact=load_hash_contract(a.base_owner_hashes)
     def txt(rel): return (r/rel).read_text(encoding='utf-8')
     cap=txt('app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java')
     iso=txt('app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IsoExpoSelector.java')
@@ -78,8 +91,9 @@ def main():
     req('PhotonCamera.getInstance().getAssets()' not in neural,'invalid PhotonCamera getInstance asset access survived')
     for rel,expected in RCD_HASHES.items():
         f=r/rel; req(f.exists(),'RCD payload missing: '+rel); req(hashlib.sha256(f.read_bytes()).hexdigest()==expected,'RCD certified hash mismatch: '+rel)
-    for rel,expected in PROTECTED_26532.items():
-        f=r/rel; req(f.exists(),'protected 26532 file missing: '+rel); req(hashlib.sha256(f.read_bytes()).hexdigest()==expected,'protected Motion/Spatial 26532 hash changed: '+rel)
+    for rel in PROTECTED_26532_PATHS:
+        req(rel in exact,'exact-26532 owner hash contract missing protected path: '+rel)
+        f=r/rel; req(f.exists(),'protected 26532 file missing: '+rel); req(hashlib.sha256(f.read_bytes()).hexdigest()==exact[rel],'protected Motion/Spatial 26532 hash changed: '+rel)
     print('26533 NIGHT ANTI-HYBRID PROOF PASSED')
     print('26533 12MP/50MP PERFORMANCE ARCHITECTURE PROOF PASSED')
     print('26533 RCD/DNG/NEURAL OWNER PROOF PASSED')
