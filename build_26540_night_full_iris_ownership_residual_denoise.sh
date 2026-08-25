@@ -30,6 +30,7 @@ TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 APPLY="$ROOT/apply_26540_night_full_iris_ownership_residual_denoise.py"
 VALIDATE="$ROOT/validate_26540_night_full_iris_ownership_residual_denoise.py"
 SYNTAX="$ROOT/preflight_26540_changed_syntax.py"
+JAVA_CONTRACT="$ROOT/preflight_26540_v11_java_compile_contracts.py"
 HANDOFF="$ROOT/26540_HANDOFF_HASHES.sha256"
 BASE_MANIFEST_PIN="$ROOT/26540_BASE_26539_CANDIDATE_SOURCE.sha256"
 BASE_MANIFEST_PIN_SHA="$ROOT/26540_BASE_26539_CANDIDATE_SOURCE_FILE.sha256"
@@ -66,7 +67,7 @@ FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-night-full-iris-ownersh
 SOURCE_TAR_OUT="$OUT/26540_candidate_app_source.tar.gz"
 SOURCE_MANIFEST_OUT="$OUT/26540_candidate_source.sha256"
 mapfile -t RUNTIME_FILES < "$RUNTIME_LIST"
-[[ "${#RUNTIME_FILES[@]}" -eq 17 ]] || fail "runtime file inventory is not exactly seventeen"
+[[ "${#RUNTIME_FILES[@]}" -eq 18 ]] || fail "runtime file inventory is not exactly eighteen"
 
 rm -rf "$OUT" "$WORK" "$FINAL"; mkdir -p "$OUT" "$WORK"
 
@@ -79,7 +80,7 @@ sha256sum -c "$BASE_MANIFEST_PIN_SHA"
 sha256sum -c "$PAYLOAD_SHA"
 sha256sum -c "$EXPECTED_PATCH_SHA"
 sha256sum -c "$EXPECTED_ROLLBACK_SHA"
-for f in "$APPLY" "$VALIDATE" "$SYNTAX" "$RUNTIME_META" "$V16_PROVENANCE_PREFLIGHT" "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do [[ -f "$f" ]] || fail "required safety file missing: $f"; done
+for f in "$APPLY" "$VALIDATE" "$SYNTAX" "$JAVA_CONTRACT" "$RUNTIME_META" "$V16_PROVENANCE_PREFLIGHT" "$SHADER_PREFLIGHT" "$NATIVE_JPEG_PREFLIGHT" "$JAVA_XML_PREFLIGHT" "$EMBEDDED_PREFLIGHT" "$INHERITED_SHADER_PREFLIGHT" "$KOTLIN_API_PREFLIGHT" "$NATIVE_DNG_PREFLIGHT" "$DNG_TEST" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do [[ -f "$f" ]] || fail "required safety file missing: $f"; done
 [[ "$(tr -d '\r\n' < "$BJZHOU_COMMIT_FILE")" == "$BJZHOU_VENDOR_HEAD" ]] || fail "bjzhou native dependency pin drift"
 FORBIDDEN_RE="$(printf '%s' 'git p' 'ush|git sw' 'itch dev|git check' 'out dev')"
 ! grep -E "$FORBIDDEN_RE" "$0" >/dev/null || fail "forbidden repository command in build script"
@@ -115,11 +116,12 @@ tar -xzf "$ART/$BASE_TAR_REL" -C "$BASE"
 cp "$WORK/artifact_selection.txt" "$OUT/26540_base_artifact_selection.txt"
 pass "exact successful 26539 V1.1 artifact source recovered and verified 965/965"
 
-echo "=== 26540 GATE 2: exact seventeen-file transform + binary forward/rollback + fuzz=0 both directions ==="
+echo "=== 26540 GATE 2: exact eighteen-file V1.1 transform + binary forward/rollback + fuzz=0 both directions ==="
 rm -rf "$AFTER"; cp -a "$BASE" "$AFTER"
 python3 "$APPLY" "$AFTER"
 python3 "$VALIDATE" --base "$BASE" --candidate "$AFTER" | tee "$OUT/26540_prebuild_validation.txt"
 python3 "$SYNTAX" --root "$AFTER" | tee "$OUT/26540_changed_syntax_preflight.txt"
+python3 "$JAVA_CONTRACT" --root "$AFTER" | tee "$OUT/26540_v11_java_compile_contract_preflight.txt"
 python3 - "$BASE" "$AFTER" "${RUNTIME_FILES[@]}" <<'PY' > "$OUT/26540_actual_changed_files.txt"
 from pathlib import Path
 import hashlib,sys
@@ -150,10 +152,11 @@ rm -rf "$ROLLBACKCHECK"; cp -a "$AFTER" "$ROLLBACKCHECK"
 patch -d "$ROLLBACKCHECK" -p1 --batch --forward --fuzz=0 --no-backup-if-mismatch < "$EXPECTED_ROLLBACK" >/dev/null
 manifest_all "$BASE" "$OUT/26540_base_for_rollback.sha256"; manifest_all "$ROLLBACKCHECK" "$OUT/26540_rollbackcheck.sha256"
 cmp -s "$OUT/26540_base_for_rollback.sha256" "$OUT/26540_rollbackcheck.sha256" || fail "rollback does not restore exact successful 26539"
-pass "exact seventeen-file forward/rollback proof; fuzz=0 both directions; no backup branch"
+pass "exact eighteen-file V1.1 forward/rollback proof; fuzz=0 both directions; no backup branch"
 
 echo "=== 26540 GATE 3: architecture + inherited shader/API/native/DNG safety proof ==="
 python3 "$SYNTAX" --root "$AFTER" | tee "$OUT/26540_changed_syntax_preflight_gate3.txt"
+python3 "$JAVA_CONTRACT" --root "$AFTER" | tee "$OUT/26540_v11_java_compile_contract_preflight_gate3.txt"
 python3 "$V16_PROVENANCE_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26540_v16_provenance_shader_preflight.txt"
 python3 "$SHADER_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26540_shader_preflight.txt"
 python3 "$EMBEDDED_PREFLIGHT" --root "$AFTER" --validator glslangValidator | tee "$OUT/26540_embedded_shader_preflight.txt"
@@ -195,7 +198,8 @@ SPARSE
  manifest_audited_live "$ROOT" "$OUT/26540_installed_pre_gradle_audited_runtime.sha256"
  cmp -s "$OUT/26540_pre_gradle_audited_runtime.sha256" "$OUT/26540_installed_pre_gradle_audited_runtime.sha256" || fail "installed candidate drift before Gradle"
  (cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST") > "$OUT/26540_installed_vendor_manifest_prebuild.txt"
- chmod +x ./gradlew
+ python3 "$JAVA_CONTRACT" --root "$ROOT" | tee "$OUT/26540_v11_java_compile_contract_pre_gradle.txt"
+chmod +x ./gradlew
  ./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace
  pass "real Android Kotlin + Java compile gates passed"
  ./gradlew :app:assembleDebug --stacktrace
@@ -216,6 +220,7 @@ manifest_audited_live "$POSTCHECK" "$OUT/26540_postbuild_sanitized_audited_runti
 cmp -s "$OUT/26540_pre_gradle_audited_runtime.sha256" "$OUT/26540_postbuild_sanitized_audited_runtime.sha256" || fail "sanitized post-build audited runtime drift"
 python3 "$VALIDATE" --base "$BASE" --candidate "$POSTCHECK" | tee "$OUT/26540_postbuild_architecture_validation.txt"
 python3 "$JAVA_XML_PREFLIGHT" --root "$POSTCHECK" | tee "$OUT/26540_postbuild_java_xml_preflight.txt"
+python3 "$JAVA_CONTRACT" --root "$POSTCHECK" | tee "$OUT/26540_v11_java_compile_contract_postbuild.txt"
 python3 "$NATIVE_JPEG_PREFLIGHT" --root "$ROOT" | tee "$OUT/26540_postbuild_native_jpeg_preflight.txt"
 pass "post-build source/native/26540 contracts remained exact"
 
@@ -240,7 +245,10 @@ BASE_ARTIFACT_ID=$BASE_ARTIFACT_ID
 BASE_SOURCE_TAR_SHA=$EXPECTED_BASE_TAR_SHA
 TARGET_VERSION=$VERSION_NAME
 TARGET_BUILD=$VERSION_BUILD
-RUNTIME_DELTA_FILES=17
+HANDOFF_REVISION=V1.1_COMPILE_CORRECTION
+FAILED_V1_RUN=32875794882
+FAILED_V1_JOB=97893251628
+RUNTIME_DELTA_FILES=18
 RUNTIME_NEW_FILES=2
 NIGHT_CAPTURE_OWNER=IRIS_NIGHT_BATCH
 NIGHT_RAW_OWNER=IRIS_CAPTURE_CONTROLLER_COPY

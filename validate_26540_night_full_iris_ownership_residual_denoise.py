@@ -29,7 +29,7 @@ def validate(base:Path,cand:Path):
     mb,mc=manifest(base),manifest(cand)
     changed=sorted(k for k in set(mb)|set(mc) if mb.get(k)!=mc.get(k))
     if changed!=sorted(RUNTIME): raise SystemExit('26540 changed-file allowlist mismatch: '+repr(changed))
-    if len(changed)!=17: raise SystemExit('26540 runtime count is not 17')
+    if len(changed)!=18: raise SystemExit('26540 V1.1 runtime count is not 18')
     if sum(k not in mb for k in changed)!=2: raise SystemExit('26540 expected exactly two new runtime files')
     vp=(cand/'app/version.properties').read_text()
     if 'VERSION_BUILD=26539' not in vp and 'VERSION_BUILD=26540' not in vp: raise SystemExit('candidate build pin unexpected')
@@ -48,6 +48,7 @@ def validate(base:Path,cand:Path):
     settings=read('app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java')
     bridge=read('app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt')
     stacker=read('app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt')
+    legacyFrameSel=read('app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/FrameNumberSelector.java')
     frameSel=read('app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java')
     expoSel=read('app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java')
 
@@ -81,11 +82,17 @@ def validate(base:Path,cand:Path):
 
     need(hdr,'IRIS_26540_NIGHT_HDRX_ENTRY_FORBIDDEN')
     need(pars,'IRIS_26540_NIGHT_CAMERA2_PARAMETER_OWNER','FillIrisNightParameters(',
-         'photonNoiseModeler=false tunableInjector=false','sensorSpecificOverrides=false customCct=false')
-    need(post,'IRIS_26540_NIGHT_POST_CONSTRUCTOR','IRIS_26540_NIGHT_NO_LIVE_TUNABLE_INJECTION')
+         'photonNoiseModeler=false tunableInjector=false','sensorSpecificOverrides=false customCct=false',
+         'Byte ref2Obj = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2);',
+         'int ref2 = ref2Obj == null ? ref1 : (ref2Obj & 0xff);')
+    forbid(pars,'Integer ref2Obj = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2);')
+    need(post,'IRIS_26540_NIGHT_POST_CONSTRUCTOR','IRIS_26540_NIGHT_NO_LIVE_TUNABLE_INJECTION',
+         'Log.i("PostPipeline", "IRIS_26540_NIGHT_NO_LIVE_TUNABLE_INJECTION')
     need(node,'IRIS_26540_NIGHT_NO_NODE_TUNABLE_INJECTION')
     need(glbase,'IRIS_26540_NIGHT_NO_LEGACY_TUNING_FILE')
     need(settings,'IRIS_26540_NIGHT_EXACT_CAMERA2_NOISE_SNAPSHOT','exactCamera2NightSnapshot()')
+    need(legacyFrameSel,'IRIS_26540_V11_NIGHT_FRAME_BUDGET_NOT_OWNED_HERE')
+    forbid(strip_comments(legacyFrameSel),'IrisNightFrameSelector.getFrames()')
     need(frameSel,'IRIS_26540_NIGHT_FRAME_BUDGET_OWNER')
     forbid(strip_comments(frameSel),'iso','ISO','preview')
     need(expoSel,'IRIS_26540_NIGHT_EXPOSURE_SOLE_OWNER')
@@ -105,12 +112,12 @@ def validate(base:Path,cand:Path):
       'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java']:
         if mb.get(rel)!=mc.get(rel): raise SystemExit('protected Motion owner changed: '+rel)
 
-    print('PASS: 26540 exact 17-file scope + Iris Night ownership + residual-only denoise contracts')
+    print('PASS: 26540 V1.1 exact 18-file scope + Iris Night ownership + residual-only denoise + compile-correction contracts')
 
 def self_test():
     assert strip_comments('a/*x*/b//y\nc')=='ab\nc'
-    assert len(RUNTIME)==17
-    print('PASS: 26540 validator self-test')
+    assert len(RUNTIME)==18
+    print('PASS: 26540 V1.1 validator self-test')
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser(); ap.add_argument('--base'); ap.add_argument('--candidate'); ap.add_argument('--self-test',action='store_true'); a=ap.parse_args()

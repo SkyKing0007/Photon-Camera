@@ -15,7 +15,7 @@ def sha(p:Path)->str:
 
 def load():
     rows=json.loads(META.read_text())
-    if len(rows)!=17: raise SystemExit(f'expected 17 runtime entries, got {len(rows)}')
+    if len(rows)!=18: raise SystemExit(f'expected 18 runtime entries, got {len(rows)}')
     paths=[r['path'] for r in rows]
     if paths!=sorted(paths) or len(set(paths))!=len(paths): raise SystemExit('runtime metadata not sorted/unique')
     return rows
@@ -49,12 +49,12 @@ def apply(root:Path):
             src=td/r['path']; dst=root/r['path']; dst.parent.mkdir(parents=True,exist_ok=True)
             shutil.copy2(src,dst)
             if sha(dst)!=r['target_sha256']: raise SystemExit('26540 installed hash mismatch: '+r['path'])
-    print('PASS: exact 17-file 26539 -> 26540 runtime payload applied')
+    print('PASS: exact 18-file 26539 -> 26540 V1.1 runtime payload applied')
 
 def self_test():
     rows=load(); verify_payload(rows)
     assert sum(1 for r in rows if r['new_file'])==2
-    print('PASS: 26540 apply self-test payload=17 files new=2')
+    print('PASS: 26540 apply self-test payload=18 files new=2')
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser(); ap.add_argument('root',nargs='?'); ap.add_argument('--self-test',action='store_true'); a=ap.parse_args()

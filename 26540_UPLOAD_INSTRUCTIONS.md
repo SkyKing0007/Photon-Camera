@@ -1,30 +1,31 @@
-# Photon Camera / Iris 26540 handoff
+# Iris / Photon 26540 V1.1 compile correction
 
 Target branch: `experimental-clean-photon-rebuild`
 
-Target build: `0.9726540 / 26540`
+Target runtime: **0.9726540 / 26540** (same IQ/architecture as 26540 V1; compile correction only).
 
-Base authority: exact successful 26539 V1.1 GitHub Actions artifact `photon-26539-v1-1-night-owned-lifecycle-publication-pecan`, artifact ID `9563581076`, handoff HEAD `21a485d4e7ed11b223d94b34e412635f55e2fd90`.
+## Why V1.1 exists
 
-Upload **all files and folders in this handoff** to the repository root, preserving `.github/workflows/`.
+26540 V1 failed GitHub Actions run `32875794882`, job `97893251628` at the real Java compiler with exactly three errors. V1.1 corrects only those contracts and strengthens preflight so those exact regressions fail before Gradle:
 
-Do not modify `app/src` manually. The workflow recovers the exact successful 26539 V1.1 candidate source, verifies its manifest, applies the exact 26540 payload, proves forward and rollback patches with fuzz=0, runs inherited shader/native/API/DNG preflights, increments the version, compiles Kotlin + Java, builds exactly one APK, then performs post-build source/native/architecture validation.
+1. Camera2 `SENSOR_REFERENCE_ILLUMINANT2` is `Byte`, not `Integer`.
+2. `PostPipeline` must not access private `GLBasePipeline.TAG`.
+3. legacy `FrameNumberSelector` must not call the new argument-taking Iris Night selector; active Night owns its frame budget directly in `CaptureController`.
 
-Expected workflow: `.github/workflows/build-26540-night-full-iris-ownership-residual-denoise.yml`
+No Night IQ/MGC/Pecan/Jin design is changed relative to intended 26540 V1.
 
-Expected artifact: `photon-26540-night-full-iris-ownership-residual-denoise`
+## Upload
 
-26540 architecture contract:
-- Night RAW ownership is Iris-owned and immutable; no Photon static `IMAGE_BUFFER` or `DefaultSaver.runRaw()`.
-- Night exposure is frozen once at shutter by `IrisNightExposureSelector`; no Photon `GenerateExpoPair()` or `setExpo()` executes for Night.
-- Night frame count is the requested stack budget, not an ISO tier.
-- Night exact timestamp-matched Camera2 request/result metadata owns black level, white level, exposure, ISO and per-frame noise profile.
-- Night bypasses `Camera2ApiAutoFix.applyEnergySaving()`, `ApplyBurst()` and processing-time `ApplyRes()`.
-- Night bypasses `Parameters.FillDynamicParameters()` and Photon `NoiseModeler`/custom-noise substitution.
-- Current Iris Spatial-RGB/MGC reconstruction is preserved; Motion remains behaviorally unchanged.
-- Pecan profile SNR uses pre-merge reference/source SNR.
-- Actual denoise magnitude remains driven by propagated post-stack read/shot/correlation/spatial residual evidence.
-- No ISO/darkness denoise-strength authority and no automatic low-light luma floor.
-- Fine natural grain is preferred over structured luma/chroma clumps; no new sharpening is added.
-- Existing 26539 Night post/Jin publication safety remains: completed base JPEG before optional Jin; Jin failure does not discard the base image.
-- No Photon Night fallback, ADRC fallback, or single-frame fallback.
+Upload/replace **all files from this handoff folder**, preserving `.github/workflows/`.
+
+Commit message:
+
+`26540 V1.1: fix Night Java compile contracts and strengthen preflight`
+
+The workflow is still:
+
+`.github/workflows/build-26540-night-full-iris-ownership-residual-denoise.yml`
+
+Its displayed Actions name is now **Build 26540 V1.1 Compile Correction** and its artifact name is `photon-26540-v1-1-night-full-iris-ownership-residual-denoise`.
+
+Do not modify `dev`. No APK should be committed.

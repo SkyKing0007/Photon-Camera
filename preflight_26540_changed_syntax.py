@@ -21,11 +21,11 @@ def run(root:Path):
     compiled=list((root/'app/src/main').rglob('*.class'))
     if compiled: bad.append('compiled .class files under app/src/main: '+repr([str(x) for x in compiled[:5]]))
     if bad: raise SystemExit('\n'.join(bad))
-    print('PASS: 26540 changed-source lexical/scope preflight (17 files, no generated classes)')
+    print('PASS: 26540 changed-source lexical/scope preflight (18 files, no generated classes)')
 
 def self_test():
-    assert len(RUNTIME)==17
-    print('PASS: 26540 syntax preflight self-test')
+    assert len(RUNTIME)==18
+    print('PASS: 26540 V1.1 syntax preflight self-test')
 
 if __name__=='__main__':
     ap=argparse.ArgumentParser(); ap.add_argument('--root'); ap.add_argument('--self-test',action='store_true'); a=ap.parse_args()
