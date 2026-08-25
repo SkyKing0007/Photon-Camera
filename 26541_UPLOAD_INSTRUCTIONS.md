@@ -32,3 +32,8 @@ Expected APK:
 `IrisCamera-0.9726541-26541-motion-highlight-night-12plus3-debug.apk`
 
 No backup branch is created. `dev` is not modified or pushed.
+
+26541 V1.1 correction note (2026-08-25):
+- V1 failed before the guarded build because one workflow grep literal did not match the build-script wording.
+- V1.1 corrects only that workflow assertion plus handoff proof/hash text.
+- Runtime payload, forward/rollback patches, transformer, validator, build script, and all nine intended runtime changes are unchanged from V1.
