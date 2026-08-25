@@ -1,0 +1,219 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
+new file mode 100644
+index 0000000..70ea810
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
+@@ -0,0 +1,61 @@
++package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
++
++import android.graphics.Point;
++
++import com.particlesdevs.photoncamera.processing.opengl.GLDrawParams;
++import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
++import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
++import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
++import com.particlesdevs.photoncamera.util.Log;
++
++import java.nio.ByteBuffer;
++
++import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
++import static android.opengl.GLES20.GL_LINEAR;
++import static android.opengl.GLES20.GL_NEAREST;
++
++/**
++ * IRIS_26538_NIGHT_RGBA16F_TWO_BUFFER_INPUT
++ * Dedicated Night post input. MGC already returns full-resolution camera-linear RGBA16F, so Night
++ * uploads that carrier directly and allocates only the main1/main2 half-float ping-pong pair used
++ * by every active Night node. It intentionally does not allocate Motion's FLOAT32 upload texture
++ * plus main3. No Bayer/RCD/demosaic or legacy Photon Night processing exists in this route.
++ */
++public final class IrisNightRgbInput extends Node {
++    public IrisNightRgbInput() { super("", "IrisNightRgbInput"); }
++    @Override public void Compile() {}
++
++    @Override
++    public void Run() {
++        PostPipeline pipeline = (PostPipeline) basePipeline;
++        if (!basePipeline.mParameters.irisNightActive || basePipeline.mParameters.motionV2Active)
++            throw new IllegalStateException("26538 dedicated Night RGB input used outside Night");
++        ByteBuffer source = pipeline.irisNightRgba16f;
++        if (source == null)
++            throw new IllegalStateException("26538 Night RGBA16F carrier is null");
++
++        Point raw = basePipeline.mParameters.rawSize;
++        long expected = (long) raw.x * (long) raw.y * 4L * 2L;
++        if (raw.x <= 0 || raw.y <= 0 || source.capacity() < expected)
++            throw new IllegalStateException("26538 Night RGBA16F carrier too small bytes="
++                    + source.capacity() + " expectedAtLeast=" + expected);
++
++        ByteBuffer view = source.duplicate();
++        view.position(0);
++        GLFormat rgba16f = new GLFormat(GLFormat.DataType.FLOAT_16, 4);
++        WorkingTexture = new GLTexture(raw, rgba16f, view, GL_NEAREST, GL_CLAMP_TO_EDGE);
++
++        GLFormat work = new GLFormat(GLFormat.DataType.FLOAT_16, GLDrawParams.WorkDim);
++        basePipeline.main1 = new GLTexture(raw, work, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
++        basePipeline.main2 = new GLTexture(raw, work, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
++        basePipeline.main3 = null;
++        basePipeline.texnum = 0;
++        glProg.closed = true;
++
++        Log.i(Name, "IRIS_26538_NIGHT_RGBA16F_TWO_BUFFER_INPUT"
++                + " carrier=fullResCameraLinearRGBA16F"
++                + " main1=true main2=true main3=false"
++                + " float32Expansion=false rcd=false demosaic=false photonNight=false"
++                + " bytes=" + expected);
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 0ec9590..08da92e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -30,6 +30,8 @@ public class PostPipeline extends GLBasePipeline {
+ 
+     /* IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF */
+     public ByteBuffer motionV2FloatCfa;
++    /* IRIS_26538 dedicated Night native half-float carrier; Motion FLOAT32 contract stays separate. */
++    public ByteBuffer irisNightRgba16f;
+     /* IRIS_26501_FULL_RES_CAMERA_RGB_BRIDGE */
+     public boolean motionV2DirectRgbCarrier = false;
+     /* IRIS_26492_EXPLICIT_HIGHLIGHT_PROVENANCE_BRIDGE */
+@@ -125,14 +127,16 @@ public class PostPipeline extends GLBasePipeline {
+ 
+     public Bitmap RunIrisNightRgb(ByteBuffer spatialRgb, Parameters parameters) {
+         if (spatialRgb == null) throw new IllegalArgumentException("26535 Iris Night Spatial RGB is null");
+-        motionV2FloatCfa = spatialRgb;
+-        motionV2DirectRgbCarrier = true;
++        irisNightRgba16f = spatialRgb;
++        motionV2FloatCfa = null;
++        motionV2DirectRgbCarrier = false;
+         motionV2HighlightProvenance = null;
+         parameters.irisNightActive = true;
+         parameters.motionV2Active = false;
+         irisMotionRcdActive = false;
+         irisMotionDirectRgbAuxiliary = null;
+-        Log.i("PostPipeline", "IRIS_26535_NIGHT_SPATIAL_RGB_POST_ENTRY carrier=RGBA32F rcd=false demosaic=false");
++        Log.i("PostPipeline", "IRIS_26538_NIGHT_SPATIAL_RGB_POST_ENTRY carrier=RGBA16F"
++                + " dedicatedNightInput=true twoBuffer=true rcd=false demosaic=false");
+         return Run(null, parameters);
+     }
+     /** Legacy guard: Night production must not return to the 26534 Bayer/RCD route. */
+@@ -295,7 +299,7 @@ public class PostPipeline extends GLBasePipeline {
+          * capture policy, neutral presentation gain and Jin finishing. No Bayer/RCD consumer exists.
+          */
+         if(mParameters.irisNightActive){
+-            add(new MotionV2CfaInput());
++            add(new IrisNightRgbInput());
+             add(new StageTelemetry("IRIS_NIGHT_SPATIAL_RGB_INPUT"));
+             add(new MotionV2MgcSourceExposure());
+             add(new StageTelemetry("IRIS_NIGHT_MGC_SOURCE_RESTORE"));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 070116f..aad24a6 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -243,13 +243,13 @@ public class HdrxProcessor extends ProcessorBase {
+         if(r==null||r.raw==null)throw new IllegalStateException("26535 Night Spatial RGB carrier missing");
+         if(r.inputFrames<images.size())throw new IllegalStateException("26535 Night MGC scheduled frame mismatch scheduled="+r.inputFrames+" expectedAtLeast="+images.size());
+         ByteBuffer rgb=r.raw; rgb.position(0);
+-        final long expectedRgbBytes=(long)width*(long)height*4L*4L;
++        final long expectedRgbBytes=(long)width*(long)height*4L*2L;
+         if(rgb.capacity()<expectedRgbBytes)
+             throw new IllegalStateException("26535 Night RGB carrier too small bytes="+rgb.capacity()+" expectedAtLeast="+expectedRgbBytes);
+         if(r.stackedDngRaw16!=null&&rgb==r.stackedDngRaw16)
+             throw new IllegalStateException("26535 Night production RGB aliases DNG sidecar");
+         p.motionV2EffectiveSupport=r.effectiveSupport;
+-        Log.i(TAG,"IRIS_26537_NIGHT_SPATIAL_RGB_PRODUCTION_AUTHORITY jpegCarrier=MGC_SPATIAL_RGB_RGBA32F"
++        Log.i(TAG,"IRIS_26538_NIGHT_SPATIAL_RGB_PRODUCTION_AUTHORITY jpegCarrier=MGC_SPATIAL_RGB_RGBA16F"
+                 +" dngCarrier=normalized16_sidecar_separate rcd=false demosaic=false jin=optional_cpu_file_backed"
+                 +" preJinUltraHdr=false srIntegratedSinglePass="+p.motionV2SuperResOutputEnabled);
+ 
+@@ -293,13 +293,13 @@ public class HdrxProcessor extends ProcessorBase {
+ 
+         exifData.IMAGE_DESCRIPTION=p.toString()+"\n"+
+                 com.particlesdevs.photoncamera.processing.parameters.IrisNightExposureSelector.diagnostics+
+-                "\nIRIS_26537_NIGHT photonNight=false mgcSpatialRgb=true spatialBayer=false rcd=false neural=jin512_cpu_file_backed_save_mgc_base preJinUltraHdr=false superRes="+p.motionV2SuperResOutputEnabled;
++                "\nIRIS_26538_NIGHT photonNight=false mgcSpatialRgb=true carrier=rgba16f twoBufferPost=true spatialBayer=false rcd=false neural=jin512_cpu_file_backed_save_mgc_base preJinUltraHdr=false superRes="+p.motionV2SuperResOutputEnabled;
+         com.particlesdevs.photoncamera.processing.opengl.postpipeline.PostPipeline pipeline=
+                 new com.particlesdevs.photoncamera.processing.opengl.postpipeline.PostPipeline();
+         final long iris26535PostStartNs=System.nanoTime();
+         Bitmap img=pipeline.RunIrisNightRgb(rgb,p);
+         try{Allocator.free(rgb);}catch(Throwable ignored){}
+-        Log.i(TAG,"IRIS_26537_NIGHT_RGB_CARRIER_RELEASED_BEFORE_JIN bytes="+expectedRgbBytes);
++        Log.i(TAG,"IRIS_26538_NIGHT_RGBA16F_CARRIER_RELEASED_BEFORE_JIN bytes="+expectedRgbBytes);
+         if(android.os.Build.VERSION.SDK_INT>=34 && img!=null && !img.isRecycled() && img.hasGainmap())
+             throw new IllegalStateException("26537 Night bitmap carried pre-Jin UltraHDR gain map");
+         /* IRIS_26537_JIN_OPTIONAL_FINISH_ONLY: failure returns this completed MGC Night bitmap. */
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index ae73d82..a74857d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -355,12 +355,21 @@ object PhotonMotionMgc1271Bridge {
+             val lumaSupportRisk = ((7f - noiseEquivalentSupport) / 5f).coerceIn(0f, 1f)
+             val lumaReliabilityRisk =
+                 ((0.90f - parameters.motionV2SpatialReliabilityMean) / 0.45f).coerceIn(0f, 1f)
+-            val supportWeight = 0.35f + 0.65f * lumaSupportRisk
+-            val adaptiveLowLightFloor =
+-                (0.30f * lumaSnrRisk * supportWeight *
+-                    (1f + 0.10f * lumaReliabilityRisk)).coerceAtMost(0.30f)
+-            val userLumaContribution = (requestedLumaScale * 0.25f).coerceAtMost(0.45f)
+-            val lumaScale = maxOf(adaptiveLowLightFloor, userLumaContribution).coerceAtMost(0.45f)
++            /* IRIS_26538_NATIVE_PECAN_LUMA_SCALE
++             * 26537 correctly detected the bathroom stack (reference SNR ~4.6, noise-equivalent
++             * support ~5) but then multiplied MGC's calibrated Pecan sigma strengths by only
++             * ~0.175. The native kernel squares those strengths into variance, leaving only ~3%
++             * of full calibrated variance and therefore almost no visible change. Keep the same
++             * evidence-based activation, but feed the native SNR-interpolated Pecan tuning at a
++             * meaningful sigma scale. The propagated post-merge tuningSnr still chooses the
++             * calibrated table values; this scale only expresses how strongly that existing
++             * denoiser is admitted for genuinely low-light / low-support stacks.
++             */
++            val lowLightDemand =
++                (lumaSnrRisk * (0.55f + 0.45f * lumaSupportRisk) *
++                    (1f + 0.08f * lumaReliabilityRisk)).coerceIn(0f, 1f)
++            val lumaScale = if (irisSettings.noiseReductionEnabled)
++                (requestedLumaScale * lowLightDemand).coerceIn(0f, 1.5f) else 0f
+             val chromaScale = irisSettings.chromaDenoise
+             val runFullResolutionDenoise = irisSettings.noiseReductionEnabled &&
+                 (lumaScale > 0f || chromaScale > 0f)
+@@ -420,9 +429,20 @@ object PhotonMotionMgc1271Bridge {
+             }
+             iris26535DenoiseMs = (System.nanoTime() - iris26535DenoiseStartNs) / 1_000_000L
+             forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+-            val output: ByteBuffer = convertHalfRgbaToFloatRgba(
+-                denoiseBuffer, size.x, size.y,
+-            )
++            /* IRIS_26538_NIGHT_NATIVE_RGBA16F_HANDOFF
++             * MGC already owns the finished full-resolution camera RGB as RGBA16F. Motion keeps
++             * its established FLOAT32 cross-context contract byte-for-byte, but Night no longer
++             * expands the ~96 MiB half-float carrier into a ~192 MiB FLOAT32 carrier only to
++             * upload it and immediately process through RGBA16F ping-pong textures.
++             */
++            val nightNativeHalfCarrier = parameters.irisNightActive
++            val output: ByteBuffer = if (nightNativeHalfCarrier) {
++                halfBuffer = null // ownership transfers to the returned Night result
++                denoiseBuffer.position(0)
++                denoiseBuffer
++            } else {
++                convertHalfRgbaToFloatRgba(denoiseBuffer, size.x, size.y)
++            }
+             GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
+             resultTexture = 0
+             checkGl("delete exported MGC RGB")
+@@ -430,7 +450,7 @@ object PhotonMotionMgc1271Bridge {
+             PLog.i(TAG, "IRIS_26532_DENOISE_SR_AUTHORITY " +
+                 "master=${irisSettings.noiseReductionEnabled} " +
+                 "requestedLuma=$requestedLumaScale effectiveMgcLuma=$lumaScale " +
+-                "adaptiveLowLightFloor=$adaptiveLowLightFloor lumaSnrRisk=$lumaSnrRisk " +
++                "lowLightDemand=$lowLightDemand nativePecanSigmaScale=true lumaSnrRisk=$lumaSnrRisk " +
+                 "lumaSnrSource=referencePreMerge referenceSnr=$referenceSnr " +
+                 "noiseEquivalentSupport=$noiseEquivalentSupport lumaSupportRisk=$lumaSupportRisk " +
+                 "propagatedDenoiseTuningSnr=$tuningSnr " +
+@@ -509,7 +529,7 @@ object PhotonMotionMgc1271Bridge {
+                 "denoise=SPATIAL_DEFAULT_ADAPTIVE_LUMA_CHROMA " +
+                 "baselineEv=${stacked.baselineExposureEv} " +
+                 "displayGain=${parameters.motionV2DisplayGain} " +
+-                "crossContext=float32_rgba_cpu alphaSupport=disabled")
++                "crossContext=${if (parameters.irisNightActive) "rgba16f_cpu_night" else "float32_rgba_cpu_motion"} alphaSupport=disabled")
+ 
+             superResOutputsHandedOff = true
+             return MotionV2Merger.Result(
