@@ -1,0 +1,2103 @@
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+index e96ab33..db719c1 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+@@ -2006,13 +2006,12 @@ internal class GlesIris26521SpatialRgbStacker(
+                 mgcSpatialStrengthMap = spatialNoiseModel?.strengthMap?.let(
+                     ::mapSpatialStrengthToOutputCoordinates,
+                 ),
+-                /* IRIS_26540_PECAN_PROFILE_SNR_AUTHORITY
+-                 * Source/reference SNR selects Pecan's frequency profile only. Propagated post-stack
+-                 * read/shot/correlation/strength remain the physical residual-noise magnitude authority.
+-                 * ISO, scene brightness and nominal frame count do not independently increase denoise.
++                /* IRIS_26530_V1_3_PROPAGATED_OUTPUT_SNR
++                 * Denoise tuning follows Spatial's propagated post-rejection output NoiseModel.
++                 * Sharpening remains disabled/frozen and retains the reference diagnostic only.
+                  */
+                 mgcReferenceSnr = bayerKernelTuning.referenceSnr,
+-                mgcDenoiseTuningSnr = bayerKernelTuning.referenceSnr,
++                mgcDenoiseTuningSnr = finishRawDenoiseSnr,
+                 mgcSharpenTuningSnr = bayerKernelTuning.referenceSnr,
+                 mgcSpatialReferenceOnlyDiagnostic = referenceOnly,
+                 superResDetailPath = superResDetailPath,
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 585c33f..8bd88a4 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -80,14 +80,10 @@ import com.particlesdevs.photoncamera.control.TouchFocus;
+ import com.particlesdevs.photoncamera.debugclient.DebugSender;
+ import com.particlesdevs.photoncamera.manual.ParamController;
+ import com.particlesdevs.photoncamera.processing.ImageSaver;
+-import com.particlesdevs.photoncamera.processing.IrisNightBatch;
+-import com.particlesdevs.photoncamera.processing.processor.IrisNightProcessor;
+-import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings;
+ import com.particlesdevs.photoncamera.processing.parameters.ExposureIndex;
+ import com.particlesdevs.photoncamera.processing.parameters.FrameNumberSelector;
+ import com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector;
+ import com.particlesdevs.photoncamera.processing.parameters.IrisNightExposureSelector;
+-import com.particlesdevs.photoncamera.processing.parameters.IrisNightFrameSelector;
+ import com.particlesdevs.photoncamera.processing.parameters.ResolutionSolution;
+ import com.particlesdevs.photoncamera.settings.PreferenceKeys;
+ import com.particlesdevs.photoncamera.ui.camera.CameraFragment;
+@@ -464,32 +460,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 }
+                 return;
+             }
+-            if (mIrisNight26540CaptureActive) {
+-                Image nightImage = null;
+-                ImageFrame copied = null;
+-                try {
+-                    nightImage = reader.acquireNextImage();
+-                    if (nightImage == null) return;
+-                    copied = copyIrisNight26540Raw(nightImage);
+-                    synchronized (mIrisNight26540Lock) {
+-                        if (!mIrisNight26540CaptureActive) {
+-                            copied.close();
+-                            copied = null;
+-                        } else {
+-                            mIrisNight26540Frames.add(copied);
+-                        }
+-                    }
+-                } catch (Throwable nightRawFailure) {
+-                    if (copied != null) try { copied.close(); } catch (Throwable ignored) {}
+-                    Log.e(TAG, "IRIS_26540_NIGHT_RAW_COPY_FAILED", nightRawFailure);
+-                    cameraEventsListener.onProcessingError("Night RAW copy: "
+-                            + nightRawFailure.getClass().getSimpleName());
+-                } finally {
+-                    if (nightImage != null) try { nightImage.close(); } catch (Throwable ignored) {}
+-                }
+-                tryDispatchIrisNight26540();
+-                return;
+-            }
+             if (onUnlimited && !unlimitedStarted) {
+                 return;
+             }
+@@ -4249,302 +4219,57 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    /* IRIS_26540_NIGHT_CAPTURE_OWNER
+-     * Night RAW copies and exact Camera2 results are accumulated independently of ImageSaver and
+-     * sealed together into one immutable IrisNightBatch. No static IMAGE_BUFFER and no busy wait.
++    /* IRIS_26533_V16_NIGHT_TIMESTAMP_METADATA_OWNER
++     * Night is a normal Camera2 burst (not Motion ZSL), so retain every exact completed result
++     * by SENSOR_TIMESTAMP until all copied RAWs are present. No neighboring-result borrowing.
+      */
+-    private final Object mIrisNight26540Lock = new Object();
+-    private final ArrayList<ImageFrame> mIrisNight26540Frames = new ArrayList<>();
+     private final java.util.concurrent.ConcurrentHashMap<Long, TotalCaptureResult>
+-            mIrisNight26540Results = new java.util.concurrent.ConcurrentHashMap<>();
++            mIrisNight26533Results = new java.util.concurrent.ConcurrentHashMap<>();
+     private final java.util.concurrent.ConcurrentHashMap<Long, CaptureRequest>
+-            mIrisNight26540Requests = new java.util.concurrent.ConcurrentHashMap<>();
+-    private volatile boolean mIrisNight26540CaptureActive = false;
+-    private boolean mIrisNight26540SequenceComplete = false;
+-    private boolean mIrisNight26540Dispatched = false;
+-    private int mIrisNight26540ExpectedFrames = 0;
+-    private int mIrisNight26540SaveRaw = 0;
+-    private boolean mIrisNight26540SuperRes = false;
+-    private boolean mIrisNight26540Aspect169 = false;
+-    private boolean mIrisNight26540EnergySaving = false;
+-    private boolean mIrisNight26540Watermark = false;
+-    private boolean mIrisNight26540Binning = false;
+-    private String mIrisNight26540CameraId = "0";
+-    private IrisMotionSettings.Snapshot mIrisNight26540IrisSettings = null;
+-    private CameraCharacteristics mIrisNight26540Characteristics = null;
+-    private int mIrisNight26540Rotation = 0;
+-
+-    private void drainIrisNight26540ReaderBeforeCapture() {
+-        if (mImageReaderRaw == null) return;
+-        while (true) {
+-            Image stale = null;
+-            try { stale = mImageReaderRaw.acquireNextImage(); }
+-            catch (Throwable ignored) { break; }
+-            if (stale == null) break;
+-            try { stale.close(); } catch (Throwable ignored) {}
+-        }
+-    }
+-
+-    private void prepareIrisNight26540CaptureState(int expectedFrames, int saveRaw,
+-            boolean superRes, boolean aspect169, boolean energySaving, boolean watermark,
+-            boolean binning, String cameraId, IrisMotionSettings.Snapshot irisSettings,
+-            CameraCharacteristics characteristics, int rotation) {
+-        if (expectedFrames < 2) throw new IllegalArgumentException("26540 Night requires >=2 frames");
+-        drainIrisNight26540ReaderBeforeCapture();
+-        synchronized (mIrisNight26540Lock) {
+-            for (ImageFrame old : mIrisNight26540Frames) {
+-                if (old != null) try { old.close(); } catch (Throwable ignored) {}
+-            }
+-            mIrisNight26540Frames.clear();
+-            mIrisNight26540Results.clear();
+-            mIrisNight26540Requests.clear();
+-            mIrisNight26540ExpectedFrames = expectedFrames;
+-            mIrisNight26540SequenceComplete = false;
+-            mIrisNight26540Dispatched = false;
+-            mIrisNight26540SaveRaw = saveRaw;
+-            mIrisNight26540SuperRes = superRes;
+-            mIrisNight26540Aspect169 = aspect169;
+-            mIrisNight26540EnergySaving = energySaving;
+-            mIrisNight26540Watermark = watermark;
+-            mIrisNight26540Binning = binning;
+-            mIrisNight26540CameraId = cameraId == null ? "0" : cameraId;
+-            mIrisNight26540IrisSettings = irisSettings;
+-            mIrisNight26540Characteristics = characteristics;
+-            mIrisNight26540Rotation = rotation;
+-            if (mIrisNight26540IrisSettings == null || mIrisNight26540IrisSettings.customNoiseModelEnabled
+-                    || mIrisNight26540Characteristics == null) {
+-                throw new IllegalStateException("26540 Night requires frozen exact-Camera2 Iris settings");
+-            }
+-            mIrisNight26540CaptureActive = true;
+-            CaptureController.isProcessing = true;
+-        }
+-        Log.i(TAG, "IRIS_26540_NIGHT_CAPTURE_STATE_FROZEN frames=" + expectedFrames
+-                + " saveRaw=" + mIrisNight26540SaveRaw
+-                + " superRes=" + mIrisNight26540SuperRes
+-                + " aspect169=" + mIrisNight26540Aspect169
+-                + " energySaving=" + mIrisNight26540EnergySaving
+-                + " binning=" + mIrisNight26540Binning
+-                + " cameraId=" + mIrisNight26540CameraId);
+-    }
+-
+-    private ImageFrame copyIrisNight26540Raw(@NonNull Image image) {
+-        if (image.getFormat() != ImageFormat.RAW_SENSOR) {
+-            throw new IllegalArgumentException("26540 Night requires RAW_SENSOR image");
+-        }
+-        Image.Plane plane = image.getPlanes()[0];
+-        int rowStride = plane.getRowStride();
+-        int pixelStride = plane.getPixelStride();
+-        int storageWidth = rowStride / Math.max(1, pixelStride);
+-        int height = image.getHeight();
+-        int capacity = plane.getBuffer().capacity();
+-        ImageFrame frame = new ImageFrame(plane.getBuffer(), image.getFormat(), storageWidth,
+-                rowStride, 0, capacity, mIrisNight26540Binning);
+-        frame.timestamp = image.getTimestamp();
+-        frame.setMotionV2PlaneLayout(image.getFormat(), image.getWidth(), image.getHeight(),
+-                rowStride, pixelStride, mIrisNight26540Binning);
+-        frame.width = mIrisNight26540Binning ? storageWidth / 2 : storageWidth;
+-        frame.height = mIrisNight26540Binning ? height / 2 : height;
+-        return frame;
+-    }
+-
+-    /* IRIS_26540_NIGHT_EXACT_FRAME_METADATA_OWNER */
+-    private static void populateIrisNight26540FrameMetadata(@NonNull ImageFrame frame,
+-            @NonNull TotalCaptureResult result, @NonNull CameraCharacteristics characteristics) {
+-        Long exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+-        Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+-        Long ts = result.get(CaptureResult.SENSOR_TIMESTAMP);
+-        Long skew = result.get(CaptureResult.SENSOR_ROLLING_SHUTTER_SKEW);
+-        Float focus = result.get(CaptureResult.LENS_FOCUS_DISTANCE);
+-        Integer lens = result.get(CaptureResult.LENS_STATE);
+-        if (exp == null || exp <= 0L || iso == null || iso <= 0 || ts == null || ts <= 0L) {
+-            throw new IllegalStateException("26540 Night result missing exposure/ISO/timestamp");
+-        }
+-        frame.motionV2FrameRole = ImageFrame.MotionV2FrameRole.NORMAL;
+-        frame.motionV2ShortHighlightFrame = false;
+-        frame.motionV2ActualExposureNs = exp;
+-        frame.motionV2ActualIso = iso;
+-        frame.motionV2ExposureEnergy = ExposureIndex.time2sec(exp) * iso;
+-        frame.motionV2ResultSensorTimestampNs = ts;
+-        frame.motionV2FrameNumber = result.getFrameNumber();
+-        if (skew != null) frame.motionV2RollingShutterSkewNs = skew;
+-        if (focus != null) frame.motionV2FocusDistanceDiopters = focus;
+-        if (lens != null) frame.motionV2LensState = lens;
+-
+-        float[] dynamicBlack = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL);
+-        if (dynamicBlack != null && dynamicBlack.length >= 4) {
+-            boolean sane = true;
+-            for (int i = 0; i < 4; i++) sane &= Float.isFinite(dynamicBlack[i]) && dynamicBlack[i] >= 0f;
+-            if (sane) {
+-                System.arraycopy(dynamicBlack, 0, frame.motionV2BlackLevel, 0, 4);
+-                frame.motionV2BlackLevelValid = true;
+-            }
+-        }
+-        if (!frame.motionV2BlackLevelValid) {
+-            android.hardware.camera2.params.BlackLevelPattern fixed =
+-                    characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+-            if (fixed != null) {
+-                int[] values = new int[4]; fixed.copyTo(values, 0);
+-                for (int i = 0; i < 4; i++) frame.motionV2BlackLevel[i] = values[i];
+-                frame.motionV2BlackLevelValid = true;
+-            }
+-        }
+-        Integer white = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL);
+-        if (white == null || white <= 0) {
+-            white = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
+-        }
+-        if (white != null && white > 0) {
+-            frame.motionV2WhiteLevel = white;
+-            frame.motionV2WhiteLevelValid = true;
+-        }
+-
+-        android.util.Pair<Double, Double>[] profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE);
+-        boolean valid = profile != null && profile.length >= 4;
+-        boolean anyRead = false;
+-        if (valid) for (int i = 0; i < 4; i++) {
+-            android.util.Pair<Double, Double> q = profile[i];
+-            if (q == null || q.first == null || q.second == null
+-                    || !Double.isFinite(q.first) || !Double.isFinite(q.second)
+-                    || q.first <= 0.0 || q.second < 0.0) { valid = false; break; }
+-            frame.motionV2NoiseProfile[i * 2] = q.first.floatValue();
+-            frame.motionV2NoiseProfile[i * 2 + 1] = q.second.floatValue();
+-            anyRead |= q.second > 0.0;
+-        }
+-        valid &= anyRead;
+-        frame.motionV2NoiseProfileValid = valid;
+-        frame.motionV2NoiseProfileSource = valid ? "CAMERA2_PER_FRAME" : "UNAVAILABLE";
+-        if (valid) {
+-            float[] n = frame.motionV2NoiseProfile;
+-            frame.motionV2NoiseS = (n[0] + 0.5f * (n[2] + n[4]) + n[6]) / 3.0f;
+-            frame.motionV2NoiseO = (n[1] + 0.5f * (n[3] + n[5]) + n[7]) / 3.0f;
+-        }
+-        if (!frame.motionV2BlackLevelValid || !frame.motionV2WhiteLevelValid || !valid) {
+-            throw new IllegalStateException("26540 Night exact sensor metadata incomplete timestamp=" + ts);
+-        }
+-    }
+-
+-    private void finishIrisNight26540AfterDrainTimeout() {
+-        boolean fail = false;
+-        int matchedCount = 0;
+-        int requestedCount = 0;
+-        synchronized (mIrisNight26540Lock) {
+-            if (!mIrisNight26540CaptureActive || mIrisNight26540Dispatched
+-                    || !mIrisNight26540SequenceComplete) return;
+-            requestedCount = mIrisNight26540ExpectedFrames;
+-            java.util.HashSet<Long> seen = new java.util.HashSet<>();
+-            for (ImageFrame frame : mIrisNight26540Frames) {
+-                if (frame == null || !seen.add(frame.timestamp)) continue;
+-                if (mIrisNight26540Results.containsKey(frame.timestamp)
+-                        && mIrisNight26540Requests.containsKey(frame.timestamp)) matchedCount++;
+-            }
+-            if (matchedCount >= 2) {
+-                // IRIS_26540_NIGHT_BOUNDED_DRAIN
+-                // The slider is a maximum stack budget, not a reason to hang forever if the HAL
+-                // drops one RAW. Preserve multiframe processing with every exact matched RAW.
+-                mIrisNight26540ExpectedFrames = matchedCount;
+-            } else {
+-                fail = true;
+-                mIrisNight26540CaptureActive = false;
+-                for (ImageFrame frame : mIrisNight26540Frames) {
+-                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                }
+-                mIrisNight26540Frames.clear();
+-                mIrisNight26540Results.clear();
+-                mIrisNight26540Requests.clear();
+-                CaptureController.isProcessing = false;
+-            }
+-        }
+-        if (fail) {
+-            Log.e(TAG, "IRIS_26540_NIGHT_BOUNDED_DRAIN_FAILED matched=" + matchedCount);
+-            cameraEventsListener.onProcessingError("Iris Night: fewer than two exact RAW/result pairs");
+-            return;
+-        }
+-        Log.w(TAG, "IRIS_26540_NIGHT_BOUNDED_DRAIN matched=" + matchedCount
+-                + " requested=" + requestedCount
+-                + " singleFrameFallback=false");
+-        tryDispatchIrisNight26540();
+-    }
++            mIrisNight26533Requests = new java.util.concurrent.ConcurrentHashMap<>();
+ 
+-    private void tryDispatchIrisNight26540() {
+-        IrisNightBatch sealedBatch = null;
+-        try {
+-            synchronized (mIrisNight26540Lock) {
+-                if (!mIrisNight26540CaptureActive || !mIrisNight26540SequenceComplete
+-                        || mIrisNight26540Dispatched || mIrisNight26540ExpectedFrames < 2) return;
+-                ArrayList<ImageFrame> matched = new ArrayList<>();
+-                java.util.HashSet<Long> seen = new java.util.HashSet<>();
+-                for (ImageFrame frame : mIrisNight26540Frames) {
+-                    if (frame == null || !seen.add(frame.timestamp)) continue;
+-                    TotalCaptureResult result = mIrisNight26540Results.get(frame.timestamp);
+-                    CaptureRequest request = mIrisNight26540Requests.get(frame.timestamp);
+-                    if (result != null && request != null) matched.add(frame);
+-                }
+-                if (matched.size() < mIrisNight26540ExpectedFrames) return;
+-                matched.sort(Comparator.comparingLong(ImageFrame::getTimestamp));
+-                if (matched.size() > mIrisNight26540ExpectedFrames) {
+-                    for (int i = mIrisNight26540ExpectedFrames; i < matched.size(); i++) {
+-                        try { matched.get(i).close(); } catch (Throwable ignored) {}
+-                    }
+-                    matched = new ArrayList<>(matched.subList(0, mIrisNight26540ExpectedFrames));
+-                }
+-                for (ImageFrame frame : matched) {
+-                    TotalCaptureResult exact = mIrisNight26540Results.get(frame.timestamp);
+-                    CaptureRequest exactRequest = mIrisNight26540Requests.get(frame.timestamp);
+-                    populateIrisNight26540FrameMetadata(frame, exact, mIrisNight26540Characteristics);
+-                    frame.irisNightExactCaptureResult = exact;
+-                    frame.irisNightExactCaptureRequest = exactRequest;
+-                }
+-                ArrayList<ImageFrame> unmatched = new ArrayList<>(mIrisNight26540Frames);
+-                unmatched.removeAll(matched);
+-                for (ImageFrame frame : unmatched) {
+-                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                }
+-                sealedBatch = new IrisNightBatch(matched, new ArrayList<>(BurstShakiness),
+-                        java.util.Collections.emptyMap(), mIrisNight26540Results, mIrisNight26540Requests,
+-                        mIrisNight26540Characteristics, RAW_FORMAT, mIrisNight26540Rotation,
+-                        mIrisNight26540ExpectedFrames,
+-                        mIrisNight26540SaveRaw, mIrisNight26540SuperRes,
+-                        mIrisNight26540Aspect169, mIrisNight26540EnergySaving,
+-                        mIrisNight26540Watermark, mIrisNight26540Binning,
+-                        mIrisNight26540CameraId, mIrisNight26540IrisSettings);
+-                mIrisNight26540Dispatched = true;
+-                mIrisNight26540CaptureActive = false;
+-                mIrisNight26540Frames.clear();
+-                mIrisNight26540Results.clear();
+-                mIrisNight26540Requests.clear();
+-            }
+-        } catch (Throwable sealFailure) {
+-            synchronized (mIrisNight26540Lock) {
+-                for (ImageFrame frame : mIrisNight26540Frames) {
+-                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                }
+-                mIrisNight26540Frames.clear();
+-                mIrisNight26540Results.clear();
+-                mIrisNight26540Requests.clear();
+-                mIrisNight26540CaptureActive = false;
+-                mIrisNight26540Dispatched = false;
+-            }
+-            CaptureController.isProcessing = false;
+-            Log.e(TAG, "IRIS_26540_NIGHT_BATCH_SEAL_FAILED", sealFailure);
+-            cameraEventsListener.onProcessingError("Iris Night batch: "
+-                    + sealFailure.getClass().getSimpleName() + ": "
+-                    + String.valueOf(sealFailure.getMessage()));
+-            return;
+-        }
+-        final IrisNightBatch batch = sealedBatch;
+-        if (batch == null) return;
+-        Log.i(TAG, "IRIS_26540_NIGHT_BATCH_SEALED frames=" + batch.frames.size()
+-                + " exactResults=" + batch.results.size()
+-                + " staticImageBuffer=false defaultSaver=false hdrxRun=false");
++    private void prepareIrisNight26533ExactMetadata(int expectedFrames) {
+         try {
+-            processExecutor.execute(() -> IrisNightProcessor.process(batch, cameraEventsListener));
+-        } catch (Throwable dispatchFailure) {
+-            for (ImageFrame frame : batch.frames) {
+-                if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-            }
+-            CaptureController.isProcessing = false;
+-            Log.e(TAG, "IRIS_26540_NIGHT_PROCESS_DISPATCH_FAILED", dispatchFailure);
+-            cameraEventsListener.onProcessingError("Iris Night dispatch: "
+-                    + dispatchFailure.getClass().getSimpleName());
++            if (expectedFrames <= 0)
++                throw new IllegalStateException("26533 Night exact metadata invalid expected frame count=" + expectedFrames);
++            if (SaverImplementation.IMAGE_BUFFER.size() != expectedFrames)
++                throw new IllegalStateException("26533 Night RAW frame count mismatch images="
++                        + SaverImplementation.IMAGE_BUFFER.size() + " expected=" + expectedFrames);
++            if (mIrisNight26533Results.size() != expectedFrames
++                    || mIrisNight26533Requests.size() != expectedFrames)
++                throw new IllegalStateException("26533 Night exact result count mismatch results="
++                        + mIrisNight26533Results.size() + " requests=" + mIrisNight26533Requests.size()
++                        + " expected=" + expectedFrames);
++            java.util.HashSet<Long> matched = new java.util.HashSet<>();
++            for (int i = 0; i < expectedFrames; ++i) {
++                ImageFrame frame = SaverImplementation.IMAGE_BUFFER.get(i);
++                if (frame == null) throw new IllegalStateException("26533 Night null RAW frame index=" + i);
++                if (!frame.motionV2PlaneLayoutValid)
++                    throw new IllegalStateException("26533 Night RAW plane layout missing index=" + i);
++                long imageTs = frame.timestamp;
++                TotalCaptureResult exact = mIrisNight26533Results.get(imageTs);
++                CaptureRequest exactRequest = mIrisNight26533Requests.get(imageTs);
++                if (exact == null || exactRequest == null)
++                    throw new IllegalStateException("26533 Night exact SENSOR_TIMESTAMP result missing imageTs=" + imageTs);
++                Long resultTs = exact.get(CaptureResult.SENSOR_TIMESTAMP);
++                if (resultTs == null || resultTs.longValue() != imageTs)
++                    throw new IllegalStateException("26533 Night timestamp mismatch image=" + imageTs
++                            + " result=" + resultTs);
++                if (!matched.add(imageTs))
++                    throw new IllegalStateException("26533 Night duplicate RAW timestamp=" + imageTs);
++                populateMotion26480FrameMetadata(frame, exact, false);
++                frame.irisNightExactCaptureResult = exact;
++                frame.irisNightExactCaptureRequest = exactRequest;
++            }
++            if (matched.size() != expectedFrames)
++                throw new IllegalStateException("26533 Night exact metadata cardinality mismatch matched="
++                        + matched.size() + " expected=" + expectedFrames);
++            Log.i(TAG, "IRIS_26533_V16_NIGHT_EXACT_METADATA_READY frames=" + expectedFrames
++                    + " exactTimestampMatches=" + matched.size()
++                    + " neighboringBorrow=0 planeLayoutPreserved=true");
++        } finally {
++            mIrisNight26533Results.clear();
++            mIrisNight26533Requests.clear();
+         }
+     }
+ 
+@@ -6274,45 +5999,17 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 triggerZslCapture();
+                 return;
+             }
+-            /* IRIS_26540_NIGHT_SHUTTER_SETTINGS_SNAPSHOT */
+-            final Settings iris26540ShutterSettings = PhotonCamera.getSettings();
+-            final CameraMode iris26533CaptureMode = iris26540ShutterSettings.selectedMode;
+-            final float iris26540ExposureCompensation = (float) iris26540ShutterSettings.exposureCompensation;
+-            final int iris26540RequestedFrames = iris26540ShutterSettings.frameCount;
+-            final int iris26540SaveRaw = iris26540ShutterSettings.rawSaver;
+-            final int iris26540AlignAlgorithm = iris26540ShutterSettings.alignAlgorithm;
+-            final boolean iris26540Aspect169 = iris26540ShutterSettings.aspect169;
+-            final boolean iris26540EnergySaving = iris26540ShutterSettings.energySaving;
+-            final boolean iris26540Binning = iris26540ShutterSettings.binning;
+-            final String iris26540CameraId = iris26540ShutterSettings.mCameraID;
+-            final boolean iris26540SuperRes = iris26533CaptureMode == CameraMode.NIGHT
+-                    && PreferenceKeys.isIrisSuperResOn();
+-            final boolean iris26540Watermark = iris26533CaptureMode == CameraMode.NIGHT
+-                    && PreferenceKeys.isShowWatermarkOn();
+-            final IrisMotionSettings.Snapshot iris26540IrisSettings =
+-                    iris26533CaptureMode == CameraMode.NIGHT
+-                            ? IrisMotionSettings.exactCamera2NightSnapshot() : null;
+-            final IrisNightExposureSelector.Plan iris26540NightPlan =
+-                    iris26533CaptureMode == CameraMode.NIGHT
+-                            ? IrisNightExposureSelector.freezePlan(
+-                                    this, mCameraCharacteristics,
+-                                    iris26540ExposureCompensation,
+-                                    PhotonCamera.getGyro() != null && PhotonCamera.getGyro().getTripod(),
+-                                    PhotonCamera.getGyro() == null ? 0 : PhotonCamera.getGyro().getFilteredShakiness(),
+-                                    mPreviewCaptureResult)
+-                            : null;
++            final CameraMode iris26533CaptureMode = PhotonCamera.getSettings().selectedMode;
+             // This is the CaptureRequest.Builder that we use to take a picture.
+             final CaptureRequest.Builder captureBuilder;
+-            if(iris26533CaptureMode == CameraMode.RAWVIDEO) {
++            if(PhotonCamera.getSettings().selectedMode.equals(CameraMode.RAWVIDEO)) {
+                 captureBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+                 captureBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, getSelectedFpsRange());
+             } else {
+                 captureBuilder = mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+             }
+             float focus = mFocus;
+-            double frametime = iris26540NightPlan != null
+-                    ? ExposureIndex.time2sec(iris26540NightPlan.exposureNs)
+-                    : ExposureIndex.time2sec(IsoExpoSelector.GenerateExpoPair(-1, this).exposure);
++            double frametime = ExposureIndex.time2sec(IsoExpoSelector.GenerateExpoPair(-1, this).exposure);
+             //this.mCaptureSession.stopRepeating();
+             if(isDualSession) {
+                 if (mTargetFormat != mPreviewTargetFormat)
+@@ -6321,14 +6018,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     captureBuilder.addTarget(mImageReaderPreview.getSurface());
+             } else {
+                 captureBuilder.addTarget(mImageReaderRaw.getSurface());
+-                final boolean iris26540AddPreviewTarget = iris26533CaptureMode == CameraMode.NIGHT
+-                        ? frametime > 0.06
+-                        : (frametime > 0.06 || iris26533CaptureMode == CameraMode.RAWVIDEO
+-                        || iris26533CaptureMode == CameraMode.UNLIMITED || !IsoExpoSelector.HDR);
+-                if (iris26540AddPreviewTarget) captureBuilder.addTarget(surface);
+-            }
+-            if (iris26533CaptureMode != CameraMode.NIGHT) Camera2ApiAutoFix.applyEnergySaving();
+-            else Log.i(TAG, "IRIS_26540_NIGHT_BYPASS photonApplyEnergySaving=true");
++                CameraMode selectedMode = PhotonCamera.getSettings().selectedMode;
++                if(frametime > 0.06 && !isDualSession || selectedMode == CameraMode.RAWVIDEO || selectedMode == CameraMode.UNLIMITED || (!IsoExpoSelector.HDR)) {
++                    captureBuilder.addTarget(surface);
++                }
++            }
++            Camera2ApiAutoFix.applyEnergySaving();
+             cameraRotation = PhotonCamera.getGravity().getCameraRotation(mSensorOrientation);
+ 
+             //captureBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,CaptureRequest.CONTROL_AF_TRIGGER_CANCEL);
+@@ -6359,31 +6054,21 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             captures = new ArrayList<>();
+             BurstShakiness = new ArrayList<>();
+             mExposures = new HashMap<>();
+-            if (iris26533CaptureMode != CameraMode.NIGHT) SaverImplementation.IMAGE_BUFFER.clear();
+-
+-            int frameCount = iris26533CaptureMode == CameraMode.NIGHT
+-                    ? IrisNightFrameSelector.getFrames(iris26540RequestedFrames)
+-                    : FrameNumberSelector.getFrames();
++            SaverImplementation.IMAGE_BUFFER.clear();
+             if (iris26533CaptureMode == CameraMode.NIGHT) {
+-                prepareIrisNight26540CaptureState(frameCount, iris26540SaveRaw,
+-                        iris26540SuperRes, iris26540Aspect169, iris26540EnergySaving,
+-                        iris26540Watermark, iris26540Binning, iris26540CameraId,
+-                        iris26540IrisSettings, mCameraCharacteristics, cameraRotation);
++                mIrisNight26533Results.clear();
++                mIrisNight26533Requests.clear();
+             }
++
++            int frameCount = FrameNumberSelector.getFrames();
+             //if (frameCount == 1) frameCount++;
+             cameraEventsListener.onFrameCountSet(frameCount);
+-            Log.d(TAG, "HDRFact1:" + paramController.isManualMode() + " HDRFact2:" + iris26540AlignAlgorithm);
++            Log.d(TAG, "HDRFact1:" + paramController.isManualMode() + " HDRFact2:" + PhotonCamera.getSettings().alignAlgorithm);
+             //IsoExpoSelector.HDR = (!manualParamModel.isManualMode()) && (PhotonCamera.getSettings().alignAlgorithm == 0);
+             //IsoExpoSelector.HDR = (PhotonCamera.getSettings().alignAlgorithm == 1);
+-            if (iris26533CaptureMode != CameraMode.NIGHT) {
+-                Log.d(TAG, "HDR:" + IsoExpoSelector.HDR);
+-            } else {
+-                Log.i(TAG, "IRIS_26540_NIGHT_NO_PHOTON_HDR_STATE_READ=true");
+-            }
++            Log.d(TAG, "HDR:" + IsoExpoSelector.HDR);
+             Object mode = mPreviewRequestBuilder.get(CONTROL_AF_MODE);
+-            if(mode != null && (int) mode != CaptureRequest.CONTROL_AF_MODE_AUTO
+-                    || PreferenceKeys.getAfMode() == CaptureRequest.CONTROL_AF_MODE_AUTO
+-                    && iris26533CaptureMode != CameraMode.RAWVIDEO) {
++            if(mode != null && (int) mode != CaptureRequest.CONTROL_AF_MODE_AUTO || PreferenceKeys.getAfMode() == CaptureRequest.CONTROL_AF_MODE_AUTO && !PhotonCamera.getSettings().selectedMode.equals(CameraMode.RAWVIDEO)) {
+                 captureBuilder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO);
+                 captureBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_CANCEL);
+             }
+@@ -6419,13 +6104,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 mPreviewRequestBuilder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focus);
+             rebuildPreviewBuilder();*/
+ 
+-            if (iris26533CaptureMode != CameraMode.NIGHT)
+-                IsoExpoSelector.useTripod = PhotonCamera.getGyro().getTripod();
++            IsoExpoSelector.useTripod = PhotonCamera.getGyro().getTripod();
+             if (frameCount == -1) {
+                 for (int i = 0; i < 1; i++) {
+-                    if(iris26533CaptureMode != CameraMode.RAWVIDEO) {
+-                        if (iris26533CaptureMode == CameraMode.NIGHT) {
+-                            IrisNightExposureSelector.applyPlan(captureBuilder, iris26540NightPlan);
++                    if(!PhotonCamera.getSettings().selectedMode.equals(CameraMode.RAWVIDEO)) {
++                        if (PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT) {
++                            IrisNightExposureSelector.setExpo(captureBuilder, i, this);
+                         } else {
+                             IsoExpoSelector.setExpo(captureBuilder, i, this);
+                         }
+@@ -6438,13 +6122,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             } else {
+                 long[] times = new long[frameCount];
+                 for (int i = 0; i < frameCount; i++) {
+-                    if (iris26533CaptureMode == CameraMode.NIGHT) {
+-                        IrisNightExposureSelector.applyPlan(captureBuilder, iris26540NightPlan);
++                    if (PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT) {
++                        IrisNightExposureSelector.setExpo(captureBuilder, i, this);
+                     } else {
+                         IsoExpoSelector.setExpo(captureBuilder, i, this);
+                     }
+-                    times[i] = iris26533CaptureMode == CameraMode.NIGHT
+-                            ? iris26540NightPlan.exposureNs
++                    times[i] = PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT
++                            ? IrisNightExposureSelector.lastSelectedExposure
+                             : IsoExpoSelector.lastSelectedExposure;
+                     captures.add(captureBuilder.build());
+                     mCaptureRequest = captureBuilder.build();
+@@ -6454,12 +6138,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+             //img
+             Log.d(TAG, "FrameCount:" + frameCount);
+-            if (iris26533CaptureMode != CameraMode.NIGHT) {
+-                mImageSaver = new ImageSaver(cameraEventsListener);
+-                mImageSaver.setFrameCount(frameCount);
+-            } else {
+-                mImageSaver = null;
+-            }
++            mImageSaver = new ImageSaver(cameraEventsListener);
++            mImageSaver.setFrameCount(frameCount);
+ //            final int[] burstcount = {0, 0, frameCount};
+             /*if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                 mImageReaderRaw.discardFreeBuffers();
+@@ -6514,15 +6194,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     if (iris26533CaptureMode == CameraMode.NIGHT) {
+                         Long irisNightTs = result.get(CaptureResult.SENSOR_TIMESTAMP);
+                         if (irisNightTs == null) {
+-                            Log.e(TAG, "IRIS_26540_NIGHT_RESULT_MISSING_TIMESTAMP frame="
++                            Log.e(TAG, "IRIS_26533_V16_NIGHT_RESULT_MISSING_TIMESTAMP frame="
+                                     + result.getFrameNumber());
+                         } else {
+-                            TotalCaptureResult previousResult = mIrisNight26540Results.putIfAbsent(irisNightTs, result);
+-                            CaptureRequest previousRequest = mIrisNight26540Requests.putIfAbsent(irisNightTs, request);
++                            TotalCaptureResult previousResult = mIrisNight26533Results.putIfAbsent(irisNightTs, result);
++                            CaptureRequest previousRequest = mIrisNight26533Requests.putIfAbsent(irisNightTs, request);
+                             if (previousResult != null || previousRequest != null)
+-                                Log.e(TAG, "IRIS_26540_NIGHT_DUPLICATE_RESULT timestamp=" + irisNightTs);
++                                Log.e(TAG, "IRIS_26533_V16_NIGHT_DUPLICATE_RESULT timestamp=" + irisNightTs);
+                         }
+-                        tryDispatchIrisNight26540();
+                     }
+                     if (time != null) {
+                         // get exposure multiply ISO and exposure time
+@@ -6563,25 +6242,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     //unlockFocus();
+                     //Surface texture related
+                     //activity.runOnUiThread(() -> UpdateCameraCharacteristics(PhotonCamera.getSettings().mCameraID));
+-                    if (iris26533CaptureMode == CameraMode.NIGHT) {
+-                        try { PhotonCamera.getGyro().CompleteSequence(); } catch (Throwable ignored) {}
+-                        synchronized (mIrisNight26540Lock) {
+-                            mIrisNight26540ExpectedFrames = finalFrameCount;
+-                            mIrisNight26540SequenceComplete = true;
+-                        }
+-                        mBackgroundHandler.post(() -> {
+-                            if (!isDualSession) unlockFocus();
+-                            else createCameraPreviewSession(false);
+-                        });
+-                        Log.i(TAG, "IRIS_26540_NIGHT_SEQUENCE_COMPLETE frames=" + finalFrameCount
+-                                + " legacySaverWait=false");
+-                        tryDispatchIrisNight26540();
+-                        if (mBackgroundHandler != null) {
+-                            mBackgroundHandler.postDelayed(
+-                                    CaptureController.this::finishIrisNight26540AfterDrainTimeout, 750L);
+-                        }
+-                        return;
+-                    }
+                     if (PhotonCamera.getSettings().selectedMode != CameraMode.UNLIMITED && PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                         //processExecutor.submit(() -> mImageSaver.runRaw(mCameraCharacteristics, mCaptureResult, new ArrayList<>(BurstShakiness), cameraRotation));
+                         /*taskResults.removeIf(Future::isDone); //remove already completed results
+@@ -6626,6 +6286,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                 return;
+                             }
+                             mImageSaver.updateFrameCount(mImageSaver.bufferSize());
++                            if (iris26533CaptureMode == CameraMode.NIGHT)
++                                prepareIrisNight26533ExactMetadata(finalFrameCount);
+                             if (mImageSaver.bufferSize() != 0)
+                                 mImageSaver.runRaw(mCameraCharacteristics, mCaptureResult, mCaptureRequest, new ArrayList<>(BurstShakiness), cameraRotation, mExposures);
+                             } catch (Exception e){
+@@ -6649,14 +6311,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             };
+             //mCaptureSession.setRepeatingBurst(captures, CaptureCallback, null);
+             burst = true;
+-            if (iris26533CaptureMode != CameraMode.NIGHT) Camera2ApiAutoFix.ApplyBurst();
+-            else Log.i(TAG, "IRIS_26540_NIGHT_BYPASS photonApplyBurst=true");
++            Camera2ApiAutoFix.ApplyBurst();
+             if (isDualSession)
+                 createCameraPreviewSession(true);
+             else {
+             mCaptureSession.stopRepeating();
+             mCaptureSession.abortCaptures();
+-                switch (iris26533CaptureMode) {
++                switch (PhotonCamera.getSettings().selectedMode) {
+                     case UNLIMITED:
+                         mCaptureSession.setRepeatingBurst(captures, CaptureCallback, mBackgroundHandler);
+                         break;
+@@ -6671,18 +6332,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 }
+             }
+         } catch (CameraAccessException e) {
+-            synchronized (mIrisNight26540Lock) {
+-                if (mIrisNight26540CaptureActive && !mIrisNight26540Dispatched) {
+-                    for (ImageFrame frame : mIrisNight26540Frames) {
+-                        if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                    }
+-                    mIrisNight26540Frames.clear();
+-                    mIrisNight26540Results.clear();
+-                    mIrisNight26540Requests.clear();
+-                    mIrisNight26540CaptureActive = false;
+-                    CaptureController.isProcessing = false;
+-                }
+-            }
+             Log.e(TAG, Log.getStackTraceString(e));
+         }
+     }
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+index bef8bdc..c2c4e72 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+@@ -25,23 +25,6 @@ public class ImageFrame {
+     public int number;
+     public IsoExpoSelector.ExpoPair pair;
+ 
+-    /* IRIS_26540_NEUTRAL_RELATIVE_EXPOSURE_OWNER
+-     * Iris Night writes its equal-exposure scale directly. Legacy modes can keep using pair.
+-     * The shared Spatial-RGB engine reads this neutral accessor, so Night never needs to create
+-     * or consult an IsoExpoSelector.ExpoPair.
+-     */
+-    public float irisRelativeExposureMpy = Float.NaN;
+-
+-    public float getRelativeExposureMpy() {
+-        if (Float.isFinite(irisRelativeExposureMpy) && irisRelativeExposureMpy > 0.0f) {
+-            return irisRelativeExposureMpy;
+-        }
+-        if (pair != null && Float.isFinite(pair.layerMpy) && pair.layerMpy > 0.0f) {
+-            return pair.layerMpy;
+-        }
+-        return 1.0f;
+-    }
+-
+     /* IRIS_26533_V16_NIGHT_EXACT_RESULT_OWNER
+      * Night keeps the exact SENSOR_TIMESTAMP-matched result/request beside the copied RAW.
+      * These are processing-time metadata owners only; Motion capture remains unchanged.
+@@ -110,17 +93,8 @@ public class ImageFrame {
+     }
+ 
+     public ImageFrame(ByteBuffer in, int format, int width, int row_stride, int shift, int capacity) {
+-        this(in, format, width, row_stride, shift, capacity, Allocator.binning);
+-    }
+-
+-    /* IRIS_26540_NIGHT_EXPLICIT_RAW_COPY_POLICY
+-     * Night passes its shutter-frozen binning choice explicitly; it never consults the global
+-     * Allocator.binning flag while copying an in-flight RAW.
+-     */
+-    public ImageFrame(ByteBuffer in, int format, int width, int row_stride, int shift, int capacity,
+-                      boolean binning) {
+         ByteBuffer direct;
+-        if (binning) {
++        if (Allocator.binning) {
+             int height = capacity / row_stride;
+             if (format == 0x25) {
+                 direct = Allocator.allocateAndCopyConvertBinning(capacity, in, width, row_stride, shift);
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
+deleted file mode 100644
+index c0a086a..0000000
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
++++ /dev/null
+@@ -1,123 +0,0 @@
+-package com.particlesdevs.photoncamera.processing;
+-
+-import android.hardware.camera2.CameraCharacteristics;
+-import android.hardware.camera2.CaptureRequest;
+-import android.hardware.camera2.TotalCaptureResult;
+-
+-import com.particlesdevs.photoncamera.control.GyroBurst;
+-
+-import java.util.ArrayList;
+-import java.util.Collections;
+-import java.util.HashMap;
+-import java.util.List;
+-import java.util.Map;
+-
+-/**
+- * IRIS_26540_NIGHT_IMMUTABLE_BATCH_OWNER
+- *
+- * One shutter-frozen Night capture. RAW copies, exact timestamp-matched Camera2 metadata,
+- * gyro observations and every processing-affecting Night setting are frozen together before
+- * processing starts. No Photon static IMAGE_BUFFER or live mode/settings read owns this batch.
+- */
+-public final class IrisNightBatch {
+-    public final List<ImageFrame> frames;
+-    public final List<GyroBurst> gyro;
+-    public final Map<Long, Double> exposures;
+-    public final Map<Long, TotalCaptureResult> results;
+-    public final Map<Long, CaptureRequest> requests;
+-    public final TotalCaptureResult referenceResult;
+-    public final CaptureRequest referenceRequest;
+-    public final CameraCharacteristics characteristics;
+-    public final int imageFormat;
+-    public final int rotation;
+-    public final int frameBudget;
+-    public final int saveRaw;
+-    public final boolean superResEnabled;
+-    public final boolean aspect169;
+-    public final boolean energySaving;
+-    public final boolean watermarkEnabled;
+-    public final boolean binning;
+-    public final String cameraId;
+-    public final com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.Snapshot irisSettings;
+-
+-    public IrisNightBatch(
+-            List<ImageFrame> frames,
+-            List<GyroBurst> gyro,
+-            Map<Long, Double> exposures,
+-            Map<Long, TotalCaptureResult> results,
+-            Map<Long, CaptureRequest> requests,
+-            CameraCharacteristics characteristics,
+-            int imageFormat,
+-            int rotation,
+-            int frameBudget,
+-            int saveRaw,
+-            boolean superResEnabled,
+-            boolean aspect169,
+-            boolean energySaving,
+-            boolean watermarkEnabled,
+-            boolean binning,
+-            String cameraId,
+-            com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.Snapshot irisSettings) {
+-        if (frames == null || frames.size() < 2) {
+-            throw new IllegalArgumentException("26540 NightBatch requires at least two RAW frames");
+-        }
+-        if (results == null || requests == null || characteristics == null) {
+-            throw new IllegalArgumentException("26540 NightBatch exact metadata/characteristics are required");
+-        }
+-        ArrayList<ImageFrame> ordered = new ArrayList<>(frames);
+-        ordered.sort(java.util.Comparator.comparingLong(ImageFrame::getTimestamp));
+-        HashMap<Long, Double> expoCopy = new HashMap<>();
+-        HashMap<Long, TotalCaptureResult> resultCopy = new HashMap<>();
+-        HashMap<Long, CaptureRequest> requestCopy = new HashMap<>();
+-        for (ImageFrame frame : ordered) {
+-            if (frame == null || !frame.motionV2PlaneLayoutValid) {
+-                throw new IllegalArgumentException("26540 NightBatch RAW layout missing");
+-            }
+-            TotalCaptureResult result = results.get(frame.timestamp);
+-            CaptureRequest request = requests.get(frame.timestamp);
+-            if (result == null || request == null) {
+-                throw new IllegalArgumentException(
+-                        "26540 NightBatch exact metadata missing timestamp=" + frame.timestamp);
+-            }
+-            Long resultTimestamp = result.get(android.hardware.camera2.CaptureResult.SENSOR_TIMESTAMP);
+-            if (resultTimestamp == null || resultTimestamp.longValue() != frame.timestamp) {
+-                throw new IllegalArgumentException(
+-                        "26540 NightBatch timestamp mismatch image=" + frame.timestamp
+-                                + " result=" + resultTimestamp);
+-            }
+-            if (frame.motionV2ActualExposureNs <= 0L || frame.motionV2ActualIso <= 0
+-                    || !frame.motionV2NoiseProfileValid || !frame.motionV2BlackLevelValid
+-                    || !frame.motionV2WhiteLevelValid) {
+-                throw new IllegalArgumentException(
+-                        "26540 NightBatch exact radiometric metadata missing timestamp=" + frame.timestamp);
+-            }
+-            expoCopy.put(frame.timestamp, frame.motionV2ExposureEnergy);
+-            resultCopy.put(frame.timestamp, result);
+-            requestCopy.put(frame.timestamp, request);
+-        }
+-        this.frames = Collections.unmodifiableList(ordered);
+-        this.gyro = Collections.unmodifiableList(new ArrayList<>(gyro == null
+-                ? Collections.emptyList() : gyro));
+-        this.exposures = Collections.unmodifiableMap(expoCopy);
+-        this.results = Collections.unmodifiableMap(resultCopy);
+-        this.requests = Collections.unmodifiableMap(requestCopy);
+-        ImageFrame reference = ordered.get(0);
+-        this.referenceResult = resultCopy.get(reference.timestamp);
+-        this.referenceRequest = requestCopy.get(reference.timestamp);
+-        this.characteristics = characteristics;
+-        this.imageFormat = imageFormat;
+-        this.rotation = rotation;
+-        this.frameBudget = frameBudget;
+-        this.saveRaw = saveRaw;
+-        this.superResEnabled = superResEnabled;
+-        this.aspect169 = aspect169;
+-        this.energySaving = energySaving;
+-        this.watermarkEnabled = watermarkEnabled;
+-        this.binning = binning;
+-        this.cameraId = cameraId == null ? "0" : cameraId;
+-        if (irisSettings == null || irisSettings.customNoiseModelEnabled) {
+-            throw new IllegalArgumentException("26540 NightBatch requires exact-Camera2 Iris settings");
+-        }
+-        this.irisSettings = irisSettings;
+-    }
+-}
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLBasePipeline.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLBasePipeline.java
+index 37ad7aa..f1d56d0 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLBasePipeline.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLBasePipeline.java
+@@ -41,24 +41,23 @@ public class GLBasePipeline implements AutoCloseable {
+     public int texnum = 0;
+ 
+     public GLBasePipeline(String name){
+-        this(name, false);
+-    }
+-
+-    /* IRIS_26540_NIGHT_NO_LEGACY_TUNING_FILE */
+-    protected GLBasePipeline(String name, boolean skipLegacyTuningFile){
+         Name = name;
+         Properties properties = new Properties();
+-        if (!skipLegacyTuningFile) {
+-            try {
+-                File init = new File(sPHOTON_TUNING_DIR, "PhotonCameraTuning.ini");
+-                if(!init.exists()) init.createNewFile();
+-                properties.load(new FileInputStream(init));
+-            } catch (Exception e) {
+-                Log.e("PostPipeline","Error at loading properties");
+-                e.printStackTrace();
++        try {
++            File init = new File(sPHOTON_TUNING_DIR, "PhotonCameraTuning.ini");
++            if(!init.exists()) {
++                init.createNewFile();
++                /*InputStream inputStream = PhotonCamera.getAssetLoader().getInputStream("tuning/PhotonCameraTuning.ini");
++                byte[] buffer = new byte[inputStream.available()];
++                inputStream.read(buffer);
++                OutputStream outputStream = new FileOutputStream(init);
++                outputStream.write(buffer);
++                outputStream.close();*/
+             }
+-        } else {
+-            Log.i(TAG, "IRIS_26540_NIGHT_NO_LEGACY_TUNING_FILE active=true");
++            properties.load(new FileInputStream(init));
++        } catch (Exception e) {
++            Log.e("PostPipeline","Error at loading properties");
++            e.printStackTrace();
+         }
+         mProp = properties;
+     }
+@@ -221,7 +220,10 @@ public class GLBasePipeline implements AutoCloseable {
+             if (i != Nodes.size() - 1) {
+                 drawProgramTexture(Nodes.get(i));
+             }
+-            if (mParameters != null && mParameters.motionV2Active) {
++            if (mParameters != null
++                    && com.particlesdevs.photoncamera.app.PhotonCamera
++                            .getSettings().selectedMode
++                            == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+                 String iris26387Stage = Nodes.get(i).getClass().getSimpleName();
+                 if ("Bayer2Float".equals(iris26387Stage)
+                         || "ExposureFusionBayer2".equals(iris26387Stage)
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/nodes/Node.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/nodes/Node.java
+index 2ec6722..067fe26 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/nodes/Node.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/nodes/Node.java
+@@ -77,12 +77,9 @@ public class Node {
+         Log.d(Name, name + " elapsed:" + (System.currentTimeMillis() - timeStart) + " ms");
+     }
+     public void BeforeRun(){
+-        // IRIS_26540_NIGHT_NO_NODE_TUNABLE_INJECTION
+-        // Night nodes consume only the immutable Parameters/batch contract.
+-        if (basePipeline == null || basePipeline.mParameters == null
+-                || !basePipeline.mParameters.irisNightActive) {
+-            com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
+-        }
++        // Automatically inject tunable values before each run
++        // This ensures settings changes are always picked up
++        com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
+     }
+     public void Run() {}
+     public void AfterRun(){}
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 5da412c..deffe31 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -63,21 +63,11 @@ public class PostPipeline extends GLBasePipeline {
+         super("PostPipeline");
+     }
+ 
+-    /* IRIS_26540_NIGHT_POST_CONSTRUCTOR */
+-    public PostPipeline(boolean irisNightOwned) {
+-        super("PostPipeline", irisNightOwned);
+-    }
+-
+     public int getRotation() {
+         int rotation = mParameters.cameraRotation;
+         String TAG = "ParseExif";
+-        if (mParameters == null || !mParameters.irisNightActive) {
+-            Log.d(TAG, "Gravity rotation:" + PhotonCamera.getGravity().getRotation());
+-            Log.d(TAG, "Sensor rotation:" + PhotonCamera.getCaptureController().mSensorOrientation);
+-        } else {
+-            Log.d(TAG, "IRIS_26540_NIGHT_FROZEN_ROTATION rotation=" + rotation
+-                    + " livePhotonRotationReads=false");
+-        }
++        Log.d(TAG, "Gravity rotation:" + PhotonCamera.getGravity().getRotation());
++        Log.d(TAG, "Sensor rotation:" + PhotonCamera.getCaptureController().mSensorOrientation);
+         return rotation;
+     }
+ 
+@@ -179,7 +169,7 @@ public class PostPipeline extends GLBasePipeline {
+ 
+     public Bitmap Run(ByteBuffer inBuffer, Parameters parameters) {
+         mParameters = parameters;
+-        mSettings = mParameters.irisNightActive ? null : PhotonCamera.getSettings();
++        mSettings = PhotonCamera.getSettings();
+         workSize = new Point(mParameters.rawSize.x, mParameters.rawSize.y);
+         if (mParameters.motionV2Active || mParameters.irisNightActive) {
+             /*
+@@ -213,9 +203,7 @@ public class PostPipeline extends GLBasePipeline {
+         }
+         Point rawSliced = parameters.rawSize;
+         cropSize = new Point(parameters.rawSize);
+-        final boolean iris26540Aspect169 = mParameters.irisNightActive
+-                ? mParameters.irisNightAspect169 : PhotonCamera.getSettings().aspect169;
+-        if (iris26540Aspect169) {
++        if (PhotonCamera.getSettings().aspect169) {
+             if (rawSliced.x > rawSliced.y) {
+                 rawSliced = new Point(rawSliced.x, rawSliced.x * 9 / 16);
+             } else {
+@@ -224,9 +212,7 @@ public class PostPipeline extends GLBasePipeline {
+             cropSize =  new Point(rawSliced);
+         }
+         Point rotatedSize = getRotatedCoords(rawSliced);
+-        final boolean iris26540EnergySaving = mParameters.irisNightActive
+-                ? mParameters.irisNightEnergySaving : PhotonCamera.getSettings().energySaving;
+-        if (iris26540EnergySaving || mParameters.rawSize.x * mParameters.rawSize.y < ResolutionSolution.smallRes) {
++        if (PhotonCamera.getSettings().energySaving || mParameters.rawSize.x * mParameters.rawSize.y < ResolutionSolution.smallRes) {
+             GLDrawParams.TileSize = 8;
+         } else {
+             GLDrawParams.TileSize = 256;
+@@ -237,20 +223,14 @@ public class PostPipeline extends GLBasePipeline {
+         glint = new GLInterface(glproc);
+         stackFrame = inBuffer;
+         glint.parameters = parameters;
+-        if (mParameters.motionV2Active) {
++        if (com.particlesdevs.photoncamera.app.PhotonCamera
++                .getSettings().selectedMode
++                == com.particlesdevs.photoncamera.api.CameraMode.MOTION) {
+             iris26387LogMergedBayerInput(stackFrame);
+         }
+ 
+-        // IRIS_26540_NIGHT_NO_LIVE_TUNABLE_INJECTION
+-        // Night presentation is shutter-frozen. Legacy/live tunables remain available to other modes.
+-        if (!mParameters.irisNightActive) {
+-            com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
+-        } else {
+-            Log.i(TAG, "IRIS_26540_NIGHT_NO_LIVE_TUNABLE_INJECTION aspect169="
+-                    + mParameters.irisNightAspect169 + " energySaving="
+-                    + mParameters.irisNightEnergySaving + " watermark="
+-                    + mParameters.irisNightWatermarkEnabled);
+-        }
++        // Inject tunable values for PostPipeline (since it doesn't extend Node)
++        com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
+         
+         BuildDefaultPipeline();
+         GLImage resImg = runAll();
+@@ -346,7 +326,7 @@ public class PostPipeline extends GLBasePipeline {
+             add(new StageTelemetry("IRIS_NIGHT_NEUTRAL_PRESENTATION"));
+             add(new MotionV2Render());
+             add(new StageTelemetry("IRIS_NIGHT_RENDER"));
+-            add(new RotateWatermark(getRotation(), mParameters.irisNightWatermarkEnabled));
++            add(new RotateWatermark(getRotation()));
+             return;
+         }
+         /* IRIS_26534_MOTION_RCD_DETOUR_FORBIDDEN */
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/RotateWatermark.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/RotateWatermark.java
+index fdb15e8..81f053e 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/RotateWatermark.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/RotateWatermark.java
+@@ -25,14 +25,9 @@ public class RotateWatermark extends Node {
+     private GLImage watermark;
+     private GLImage noise;
+     public RotateWatermark(int rotation) {
+-        this(rotation, PreferenceKeys.isShowWatermarkOn());
+-    }
+-
+-    /* IRIS_26540_NIGHT_FROZEN_WATERMARK_POLICY */
+-    public RotateWatermark(int rotation, boolean frozenWatermarkNeeded) {
+         super("", "Rotate");
+         rotate = rotation;
+-        watermarkNeeded = frozenWatermarkNeeded;
++        watermarkNeeded = PreferenceKeys.isShowWatermarkOn();
+     }
+ 
+     @Override
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java
+index d539f27..2ddfc56 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/StageTelemetry.java
+@@ -2,6 +2,8 @@ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+ 
+ import android.graphics.Point;
+ 
++import com.particlesdevs.photoncamera.api.CameraMode;
++import com.particlesdevs.photoncamera.app.PhotonCamera;
+ import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+ import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+@@ -141,9 +143,7 @@ public class StageTelemetry extends Node {
+     public void Run() {
+         GLTexture source = previousNode == null ? null : previousNode.WorkingTexture;
+         WorkingTexture = source;
+-        // IRIS_26540_TELEMETRY_MODE_FROM_IMMUTABLE_PARAMETERS
+-        // Preserve historical telemetry as Motion-only without consulting live global mode.
+-        if (!basePipeline.mParameters.motionV2Active || source == null) return;
++        if (PhotonCamera.getSettings().selectedMode != CameraMode.MOTION || source == null) return;
+ 
+         GLHistogram histogram = null;
+         try {
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java
+index 25e942d..e53e6ba 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java
+@@ -1,123 +1,70 @@
+ package com.particlesdevs.photoncamera.processing.parameters;
+ 
+-import android.hardware.camera2.CameraCharacteristics;
+ import android.hardware.camera2.CaptureRequest;
+ import android.hardware.camera2.CaptureResult;
+-import android.util.Range;
+-
++import com.particlesdevs.photoncamera.api.CameraMode;
++import com.particlesdevs.photoncamera.app.PhotonCamera;
+ import com.particlesdevs.photoncamera.capture.CaptureController;
+ import com.particlesdevs.photoncamera.util.Log;
++import java.util.ArrayList;
++import java.util.List;
+ 
+-/** IRIS_26540_NIGHT_EXPOSURE_SOLE_OWNER
+- * One equal-exposure Night plan is frozen once at shutter time from Camera2 sensor bounds,
+- * shutter-time preview metering and gyro state. Photon IsoExpoSelector logic/state is not called.
++/** IRIS_26533_NIGHT_EXPOSURE_SOLE_OWNER
++ * Iris Night uses HAL preview metering only as scene measurement. Photon Night's
++ * GenerateExpoPair/night shutter curve/fullpairs are not used.
+  */
+ public final class IrisNightExposureSelector {
+-    private static final String TAG = "IrisNightExposure";
+-    public static final class Plan {
+-        public final long exposureNs;
+-        public final int iso;
+-        public final long exposureLowNs;
+-        public final long exposureHighNs;
+-        public final int isoLow;
+-        public final int isoHigh;
+-        public final int analogIso;
+-        public final boolean tripod;
+-        public final int shakiness;
+-        public final int antibandingMode;
+-
+-        Plan(long exposureNs, int iso, long exposureLowNs, long exposureHighNs,
+-             int isoLow, int isoHigh, int analogIso, boolean tripod, int shakiness,
+-             int antibandingMode) {
+-            this.exposureNs = exposureNs;
+-            this.iso = iso;
+-            this.exposureLowNs = exposureLowNs;
+-            this.exposureHighNs = exposureHighNs;
+-            this.isoLow = isoLow;
+-            this.isoHigh = isoHigh;
+-            this.analogIso = analogIso;
+-            this.tripod = tripod;
+-            this.shakiness = shakiness;
+-            this.antibandingMode = antibandingMode;
+-        }
++    private static final String TAG="IrisNightExposure";
++    private static final ArrayList<IsoExpoSelector.ExpoPair> PAIRS=new ArrayList<>();
++    public static volatile long lastSelectedExposure=0L;
++    public static volatile String diagnostics="";
++    private IrisNightExposureSelector(){}
++    public static synchronized List<IsoExpoSelector.ExpoPair> snapshotPairs(){
++        ArrayList<IsoExpoSelector.ExpoPair> out=new ArrayList<>();
++        for(IsoExpoSelector.ExpoPair p:PAIRS)out.add(new IsoExpoSelector.ExpoPair(p));
++        return out;
+     }
+-
+-    private IrisNightExposureSelector() {}
+-
+-    private static long clamp(long v, long lo, long hi) {
+-        return Math.max(lo, Math.min(hi, v));
++    private static long clamp(long v,long lo,long hi){return Math.max(lo,Math.min(hi,v));}
++    private static long motionCap(){
++        if(PhotonCamera.getGyro()==null)return ExposureIndex.sec/15;
++        int s=Math.max(0,PhotonCamera.getGyro().getFilteredShakiness());
++        if(s<=30)return ExposureIndex.sec/4;
++        if(s<=70)return ExposureIndex.sec/8;
++        if(s<=150)return ExposureIndex.sec/15;
++        return ExposureIndex.sec/30;
+     }
+-
+-    private static long motionCap(boolean tripod, int shakiness, long sensorHigh) {
+-        if (tripod) return Math.min(sensorHigh, ExposureIndex.sec * 2L);
+-        if (shakiness <= 30) return Math.min(sensorHigh, ExposureIndex.sec / 4L);
+-        if (shakiness <= 70) return Math.min(sensorHigh, ExposureIndex.sec / 8L);
+-        if (shakiness <= 150) return Math.min(sensorHigh, ExposureIndex.sec / 15L);
+-        return Math.min(sensorHigh, ExposureIndex.sec / 30L);
+-    }
+-
+-    private static long antiFlicker(long desired, long cap, int antibandingMode) {
+-        long q = antibandingMode == CaptureResult.CONTROL_AE_ANTIBANDING_MODE_50HZ
+-                ? ExposureIndex.sec / 100L : ExposureIndex.sec / 120L;
+-        desired = Math.min(desired, cap);
+-        if (desired < q) return desired;
+-        long n = Math.max(1L, Math.round((double) desired / q));
+-        while (n * q > cap && n > 1L) n--;
+-        return n * q;
++    private static long antiFlicker(long desired,long cap){
++        CaptureResult r=CaptureController.mPreviewCaptureResult;
++        Integer ab=r==null?null:r.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE);
++        long q=(ab!=null&&ab==CaptureResult.CONTROL_AE_ANTIBANDING_MODE_50HZ)?ExposureIndex.sec/100:ExposureIndex.sec/120;
++        desired=Math.min(desired,cap); if(desired<q)return desired;
++        long n=Math.max(1,Math.round((double)desired/q));
++        while(n*q>cap&&n>1)n--;
++        return n*q;
+     }
+-
+-    public static Plan freezePlan(CaptureController controller,
+-                                  CameraCharacteristics characteristics,
+-                                  float exposureCompensationEv,
+-                                  boolean tripod,
+-                                  int shakiness,
+-                                  CaptureResult previewResult) {
+-        Range<Long> exposureRange = characteristics == null ? null
+-                : characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
+-        Range<Integer> isoRange = characteristics == null ? null
+-                : characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
+-        Integer analogObj = characteristics == null ? null
+-                : characteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY);
+-        long exposureLow = exposureRange == null ? ExposureIndex.sec / 1000L : exposureRange.getLower();
+-        long exposureHigh = exposureRange == null ? ExposureIndex.sec : exposureRange.getUpper();
+-        int isoLow = isoRange == null ? 100 : isoRange.getLower();
+-        int isoHigh = isoRange == null ? 3200 : isoRange.getUpper();
+-        int analogIso = analogObj == null ? 100 : analogObj;
+-        Integer ab = previewResult == null ? null
+-                : previewResult.get(CaptureResult.CONTROL_AE_ANTIBANDING_MODE);
+-        int antibanding = ab == null ? CaptureResult.CONTROL_AE_ANTIBANDING_MODE_AUTO : ab;
+-
+-        double compensation = Math.pow(2.0, exposureCompensationEv);
+-        // Preserve 26533's 0.70 EV highlight-protection target, but own it entirely in Iris.
+-        double meteredEnergy = Math.max(1.0,
+-                controller.mPreviewExposureTime * (double) Math.max(1, controller.mPreviewIso));
+-        double targetEnergy = meteredEnergy * compensation / Math.pow(2.0, 0.70);
+-        long cap = motionCap(tripod, Math.max(0, shakiness), exposureHigh);
+-        long desired = (long) Math.round(targetEnergy / Math.max(100, isoLow));
+-        long exposure = clamp(antiFlicker(clamp(desired, exposureLow, cap), cap, antibanding),
+-                exposureLow, exposureHigh);
+-        int iso = (int) Math.round(targetEnergy / Math.max(1.0, exposure));
+-        iso = Math.max(isoLow, Math.min(isoHigh, iso));
+-
+-        double manualExposure = controller.getParamController().getCurrentExposureValue();
+-        double manualIso = controller.getParamController().getCurrentISOValue();
+-        if (manualExposure != 0.0) exposure = clamp((long) manualExposure, exposureLow, exposureHigh);
+-        if (manualIso != 0.0) iso = Math.max(isoLow, Math.min(isoHigh, (int) manualIso));
+-
+-        Plan plan = new Plan(exposure, iso, exposureLow, exposureHigh, isoLow, isoHigh,
+-                analogIso, tripod, Math.max(0, shakiness), antibanding);
+-        String diagnostics = "IRIS_26540_NIGHT_EXPOSURE requestedNs=" + exposure
+-                + " iso=" + iso + " capNs=" + cap + " tripod=" + tripod
+-                + " shakiness=" + shakiness + " equalExposure=true"
+-                + " photonIsoExpoSelector=false planFrozenAtShutter=true";
+-        Log.i(TAG, diagnostics);
+-        return plan;
+-    }
+-
+-    public static void applyPlan(CaptureRequest.Builder builder, Plan plan) {
+-        if (plan == null) throw new IllegalArgumentException("26540 Night exposure plan is null");
+-        builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+-        builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, plan.exposureNs);
+-        builder.set(CaptureRequest.SENSOR_SENSITIVITY, plan.iso);
++    public static synchronized void setExpo(CaptureRequest.Builder b,int step,CaptureController c){
++        if(step==0)PAIRS.clear();
++        long lo=IsoExpoSelector.getEXPLOW(), hi=IsoExpoSelector.getEXPHIGH();
++        int isoLo=IsoExpoSelector.getISOLOW(), isoHi=IsoExpoSelector.getISOHIGH();
++        int analog=IsoExpoSelector.getISOAnalog();
++        double comp=Math.pow(2.0,PhotonCamera.getSettings().exposureCompensation);
++        // Protect point lights by metering about 0.70 EV below HAL preview energy; multiframe
++        // accumulation + neural illumination recovery restores dark regions without brackets.
++        double energy=Math.max(1.0,c.mPreviewExposureTime*(double)Math.max(1,c.mPreviewIso))*comp/Math.pow(2.0,0.70);
++        boolean tripod=PhotonCamera.getGyro()!=null&&PhotonCamera.getGyro().getTripod();
++        long cap=tripod?Math.min(hi,ExposureIndex.sec*2):Math.min(hi,motionCap());
++        long desired=(long)Math.round(energy/Math.max(100,isoLo));
++        long exposure=clamp(antiFlicker(clamp(desired,lo,cap),cap),lo,hi);
++        int iso=(int)Math.round(energy/Math.max(1.0,exposure)); iso=Math.max(isoLo,Math.min(isoHi,iso));
++        double manE=c.getParamController().getCurrentExposureValue();
++        double manI=c.getParamController().getCurrentISOValue();
++        if(manE!=0)exposure=clamp((long)manE,lo,hi); if(manI!=0)iso=Math.max(isoLo,Math.min(isoHi,(int)manI));
++        IsoExpoSelector.ExpoPair p=new IsoExpoSelector.ExpoPair(exposure,lo,hi,iso,isoLo,isoHi,analog);
++        p.curlayer=IsoExpoSelector.ExpoPair.exposureLayer.Normal; p.layerMpy=1.0f;
++        PAIRS.add(p); lastSelectedExposure=exposure;
++        b.set(CaptureRequest.CONTROL_AE_MODE,CaptureRequest.CONTROL_AE_MODE_OFF);
++        b.set(CaptureRequest.SENSOR_EXPOSURE_TIME,exposure); b.set(CaptureRequest.SENSOR_SENSITIVITY,iso);
++        diagnostics="IRIS_26533_NIGHT_EXPOSURE requestedNs="+exposure+" iso="+iso+" capNs="+cap+" tripod="+tripod+" equalExposure=true photonNightCurve=false";
++        Log.i(TAG,diagnostics);
+     }
+ }
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java
+index 7a12eed..86307ce 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java
+@@ -1,12 +1,14 @@
+ package com.particlesdevs.photoncamera.processing.parameters;
+-
+-/** IRIS_26540_NIGHT_FRAME_BUDGET_OWNER
+- * Night frame count is the user-requested temporal stacking budget. ISO and scene darkness do not
+- * increase/decrease it. Alignment/rejection and spatial confidence decide local effective support.
+- */
++import com.particlesdevs.photoncamera.app.PhotonCamera;
++/** IRIS_26533_NIGHT_FRAMECOUNT_SOLE_OWNER */
+ public final class IrisNightFrameSelector {
+-    private IrisNightFrameSelector() {}
+-    public static int getFrames(int requestedMaximum) {
+-        return Math.max(2, Math.min(35, requestedMaximum));
++    private IrisNightFrameSelector(){}
++    public static int getFrames(){
++        int max=Math.max(2,PhotonCamera.getSettings().frameCount);
++        int iso=Math.max(100,PhotonCamera.getCaptureController().mPreviewIso);
++        int wanted=iso>=3200?15:iso>=1600?13:iso>=800?11:9;
++        int n=Math.max(2,Math.min(max,wanted));
++        FrameNumberSelector.frameCount=n; FrameNumberSelector.throwCount=0;
++        return n;
+     }
+ }
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index f445354..cdf9460 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -138,13 +138,6 @@ public class HdrxProcessor extends ProcessorBase {
+             Log.d(TAG,"IRIS_26480_BACKGROUND_PROCESSING_PRIORITY active="+android.os.Process.getThreadPriority(tid));
+         }catch(Throwable ignored){}}
+         try {
+-            /* IRIS_26540_NIGHT_HDRX_ENTRY_FORBIDDEN
+-             * Night must enter IrisNightProcessor directly. This guard is intentionally before
+-             * Camera2ApiAutoFix.ApplyRes so no legacy metadata mutation can occur if routing regresses.
+-             */
+-            if (cameraMode == CameraMode.NIGHT) {
+-                throw new IllegalStateException("26540 Night must not enter HdrxProcessor.Run");
+-            }
+             Camera2ApiAutoFix.ApplyRes(captureResult);
+             if (imageFormat == CaptureController.RAW_FORMAT) {
+                 ApplyHdrX();
+@@ -183,13 +176,185 @@ public class HdrxProcessor extends ProcessorBase {
+     }
+ 
+     
+-    /* IRIS_26540_NIGHT_LEGACY_BODY_REMOVED
+-     * Night processing moved to IrisNightProcessor. Keeping a second compilable Night body here
+-     * would recreate two authorities and permit future accidental fallback.
++    /* IRIS_26535_NIGHT_SHARED_SPATIAL_RGB_SOLE_OWNER
++     * Night keeps its own capture/exposure policy and exact metadata ownership, but reconstruction
++     * now shares Motion's one proven MGC Spatial-RGB core. There is no Spatial-Bayer/RCD pass and
++     * no second MGC pass for Super Res.
+      */
++    private void ApplyIrisNight26533() {
++        final long iris26535NightStartNs=System.nanoTime();
++        callback.onStarted();
++        processingEventsListener.onProcessingStarted("Iris Night");
++        if (mImageFramesToProcess == null || mImageFramesToProcess.size() < 2)
++            throw new IllegalStateException("26535 Iris Night requires at least two RAW frames");
++        mImageFramesToProcess.sort(Comparator.comparingLong(ImageFrame::getTimestamp));
++        final ImageFrame irisNightBase=mImageFramesToProcess.get(0);
++        if(!irisNightBase.motionV2PlaneLayoutValid)throw new IllegalStateException("26535 Night base RAW plane layout missing");
++        final int width=irisNightBase.motionV2PlaneLogicalWidth, height=irisNightBase.motionV2PlaneLogicalHeight;
++        if(width<=0||height<=0)throw new IllegalStateException("26535 Night logical RAW geometry invalid "+width+"x"+height);
++        for(int i=0;i<mImageFramesToProcess.size();++i){
++            ImageFrame f=mImageFramesToProcess.get(i);
++            if(!f.motionV2PlaneLayoutValid||f.motionV2PlaneLogicalWidth!=width||f.motionV2PlaneLogicalHeight!=height)
++                throw new IllegalStateException("26535 Night RAW layout mismatch index="+i);
++            if(f.irisNightExactCaptureResult==null||f.irisNightExactCaptureRequest==null
++                    ||f.motionV2ResultSensorTimestampNs<=0L||f.motionV2ResultSensorTimestampNs!=f.timestamp)
++                throw new IllegalStateException("26535 Night exact timestamp metadata missing index="+i+" imageTs="+f.timestamp);
++            if(f.motionV2ActualExposureNs<=0L||f.motionV2ActualIso<=0
++                    ||!Double.isFinite(f.motionV2ExposureEnergy)||f.motionV2ExposureEnergy<=0.0
++                    ||!f.motionV2NoiseProfileValid||!"CAMERA2_PER_FRAME".equals(f.motionV2NoiseProfileSource)
++                    ||!f.motionV2BlackLevelValid||!f.motionV2WhiteLevelValid||f.motionV2WhiteLevel<=0)
++                throw new IllegalStateException("26535 Night exact radiometric metadata missing index="+i);
++        }
++        final Parameters p=new Parameters();
++        p.FillConstParameters(characteristics,new Point(width,height));
++        java.util.List<com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair> pairs=
++                com.particlesdevs.photoncamera.processing.parameters.IrisNightExposureSelector.snapshotPairs();
++        if(pairs.size()<mImageFramesToProcess.size())
++            throw new IllegalStateException("26535 Night exposure metadata population mismatch pairs="+pairs.size()+" frames="+mImageFramesToProcess.size());
++        ArrayList<ImageFrame> images=new ArrayList<>(); int isoSum=0;
++        for(int i=0;i<mImageFramesToProcess.size();i++){
++            ImageFrame f=mImageFramesToProcess.get(i); f.number=i;
++            f.pair=new com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair(pairs.get(i));
++            f.pair.curlayer=com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector.ExpoPair.exposureLayer.Normal;
++            f.pair.layerMpy=1.0f;
++            if(BurstShakiness!=null&&!BurstShakiness.isEmpty())f.frameGyro=BurstShakiness.get(i%BurstShakiness.size());
++            images.add(f); isoSum+=f.pair.iso;
++        }
++        p.FillDynamicParameters(irisNightBase.irisNightExactCaptureResult,
++                irisNightBase.irisNightExactCaptureRequest,Math.max(1,isoSum/images.size()));
++        p.cameraRotation=cameraRotation;
++        configureStrictWronskiSensorAuthority(p);
++        p.irisNightActive=true; p.motionV2Active=false;
++        p.motionV2GlobalZoom=1.0f; p.motionV2OpticalZoomAnchor=1.0f; p.motionV2OutputZoom=1.0f;
++        p.motionV2SpatialReconstructionZoom=1.0f; p.motionV2RenderResidualZoom=1.0f;
++        p.motionV2SuperResOutputEnabled=com.particlesdevs.photoncamera.settings.PreferenceKeys.isIrisSuperResOn();
++        p.motionV2SuperResOutputScale=p.motionV2SuperResOutputEnabled?2.0f:1.0f;
++        final long ref=irisNightBase.getTimestamp();
++        Log.i(TAG,"IRIS_26535_NIGHT_SHARED_SPATIAL_RGB_REQUEST timestamp="+ref
++                +" exactResultTimestamp="+irisNightBase.motionV2ResultSensorTimestampNs
++                +" logicalRaw="+width+"x"+height
++                +" frames="+images.size()+" superRes="+p.motionV2SuperResOutputEnabled
++                +" spatialBayer=false rcd=false secondMgcPass=false");
++
++        final long iris26535MergeStartNs=System.nanoTime();
++        final MotionV2Merger.Result r=PhotonMotionMgc1271Bridge.reconstruct(
++                new Point(width,height),images,ref,p,null,saveRAW>=1);
++        final long iris26535MergeMs=(System.nanoTime()-iris26535MergeStartNs)/1_000_000L;
++        if(r==null||r.raw==null)throw new IllegalStateException("26535 Night Spatial RGB carrier missing");
++        if(r.inputFrames<images.size())throw new IllegalStateException("26535 Night MGC scheduled frame mismatch scheduled="+r.inputFrames+" expectedAtLeast="+images.size());
++        ByteBuffer rgb=r.raw; rgb.position(0);
++        final long expectedRgbBytes=(long)width*(long)height*4L*2L;
++        if(rgb.capacity()<expectedRgbBytes)
++            throw new IllegalStateException("26535 Night RGB carrier too small bytes="+rgb.capacity()+" expectedAtLeast="+expectedRgbBytes);
++        if(r.stackedDngRaw16!=null&&rgb==r.stackedDngRaw16)
++            throw new IllegalStateException("26535 Night production RGB aliases DNG sidecar");
++        p.motionV2EffectiveSupport=r.effectiveSupport;
++        Log.i(TAG,"IRIS_26538_NIGHT_SPATIAL_RGB_PRODUCTION_AUTHORITY jpegCarrier=MGC_SPATIAL_RGB_RGBA16F"
++                +" dngCarrier=normalized16_sidecar_separate rcd=false demosaic=false jin=optional_cpu_file_backed"
++                +" preJinUltraHdr=false srIntegratedSinglePass="+p.motionV2SuperResOutputEnabled);
++
++        /* IRIS_26537_NIGHT_RELEASE_DNG_BEFORE_JIN
++         * If RAW saving is enabled, serialize the independent normalized16/SR DNG sidecar now and
++         * release it before the native-resolution RGB bitmap and ORT session coexist. This changes
++         * only resource lifetime/save ordering, never the Night reconstruction carrier.
++         */
++        if(saveRAW>=1){
++            boolean rawSavedEarly=false;
++            try{
++                if(p.motionV2SuperResOutputEnabled&&r.superResLinearRawPath!=null
++                        &&r.superResLinearRawWidth>0&&r.superResLinearRawHeight>0){
++                    rawSavedEarly=com.particlesdevs.photoncamera.processing.IrisMotionSuperResDngWriter.write(
++                            dngFile,java.nio.file.Paths.get(r.superResLinearRawPath),
++                            r.superResLinearRawWidth,r.superResLinearRawHeight,p,
++                            r.dngNoiseProfile,r.dngStackFrames,r.dngSupportMin,r.dngSupportP01,
++                            r.dngSupportP10,r.dngSupportMedian,r.dngSupportMean,r.dngSupportMax,
++                            r.dngNoiseEquivalentSupport);
++                }else{
++                    if(r.stackedDngRaw16==null)throw new IllegalStateException("26537 Night normalized16 DNG sidecar missing");
++                    ByteBuffer dngBayer=r.stackedDngRaw16; dngBayer.position(0);
++                    rawSavedEarly=ImageSaver.Util.saveNormalized16StackedRaw(
++                            dngFile,dngBayer,p,r.dngNoiseProfile,r.dngStackFrames,
++                            r.dngSupportMin,r.dngSupportP01,r.dngSupportP10,r.dngSupportMedian,
++                            r.dngSupportMean,r.dngSupportMax,r.dngNoiseEquivalentSupport);
++                }
++            }catch(Throwable rawFailure){
++                Log.e(TAG,"IRIS_26537_NIGHT_DNG_SAVE_FAILED_CONTINUE_JPEG",rawFailure);
++                rawSavedEarly=false;
++            }finally{
++                if(r.stackedDngRaw16!=null)try{Allocator.free(r.stackedDngRaw16);}catch(Throwable ignored){}
++                if(r.superResLinearRawPath!=null)
++                    try{java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(r.superResLinearRawPath));}catch(Throwable ignored){}
++            }
++            processingEventsListener.notifyImageSavedStatus(rawSavedEarly,dngFile);
++            Log.i(TAG,"IRIS_26537_NIGHT_DNG_RELEASED_BEFORE_JIN saved="+rawSavedEarly
++                    +" dngFailureDoesNotBlockJpeg=true"
++                    +" dngNoiseEquivalentSupport="+r.dngNoiseEquivalentSupport);
++        }
++
++        exifData.IMAGE_DESCRIPTION=p.toString()+"\n"+
++                com.particlesdevs.photoncamera.processing.parameters.IrisNightExposureSelector.diagnostics+
++                "\nIRIS_26538_NIGHT photonNight=false mgcSpatialRgb=true carrier=rgba16f twoBufferPost=true spatialBayer=false rcd=false neural=jin512_cpu_file_backed_save_mgc_base preJinUltraHdr=false superRes="+p.motionV2SuperResOutputEnabled;
++        com.particlesdevs.photoncamera.processing.opengl.postpipeline.PostPipeline pipeline=
++                new com.particlesdevs.photoncamera.processing.opengl.postpipeline.PostPipeline();
++        final long iris26535PostStartNs=System.nanoTime();
++        final Point iris26539NightCrop;
++        Bitmap img;
++        try {
++            img=pipeline.RunIrisNightRgb(rgb,p);
++            iris26539NightCrop=pipeline.cropSize==null?new Point(p.rawSize):new Point(pipeline.cropSize);
++        } finally {
++            try{Allocator.free(rgb);}catch(Throwable ignored){}
++        }
++        Log.i(TAG,"IRIS_26539_NIGHT_RGBA16F_CARRIER_RELEASED_BEFORE_JIN bytes="+expectedRgbBytes
++                +" postOwnerAlreadyClosed=true");
++        if(android.os.Build.VERSION.SDK_INT>=34 && img!=null && !img.isRecycled() && img.hasGainmap())
++            throw new IllegalStateException("26539 Night bitmap carried forbidden pre-Jin UltraHDR gain map");
++
++        final String srDetailPath=r.superResDetailPath;
++        final int srDetailWidth=r.superResDetailWidth;
++        final int srDetailHeight=r.superResDetailHeight;
++        final long iris26535SaveStartNs=System.nanoTime();
++        /* IRIS_26539_NIGHT_COMMIT_BASE_BEFORE_JIN
++         * A valid completed multiframe MGC Night JPEG is committed before entering ONNX Runtime.
++         * If native ORT ever terminates the process, the photograph already exists on disk.
++         */
++        final boolean iris26539BaseSaved=ImageSaver.Util.saveBitmapAsJPGIrisNightCheckpoint(
++                imageFile,img,ImageSaver.JPG_QUALITY,exifData);
++        if(iris26539BaseSaved){
++            processingEventsListener.notifyImageSavedStatus(true,imageFile);
++        } else {
++            Log.w(TAG,"IRIS_26539_NIGHT_BASE_CHECKPOINT_FAILED continueFinalAttempt=true");
++        }
++
++        /* Jin remains optional finishing only and now starts after the Night GL owner is destroyed,
++         * the MGC carrier is released, and the base JPEG is durable. */
++        img=IrisNightNeuralEnhancer.enhanceInPlace(img);
++        final long iris26535PostMs=(System.nanoTime()-iris26535PostStartNs)/1_000_000L;
++
++        final boolean iris26539FinalSaved=ImageSaver.Util.saveBitmapAsJPGIrisNightAtomicFinal(
++                imageFile,img,ImageSaver.JPG_QUALITY,exifData,
++                srDetailPath,srDetailWidth,srDetailHeight,p,iris26539NightCrop);
++        final boolean imageSaved=iris26539FinalSaved||iris26539BaseSaved;
++        if(iris26539FinalSaved || !iris26539BaseSaved){
++            processingEventsListener.notifyImageSavedStatus(imageSaved,imageFile);
++        }
++        Log.i(TAG,"IRIS_26539_NIGHT_PUBLICATION_OWNERSHIP baseSaved="+iris26539BaseSaved
++                +" finalSaved="+iris26539FinalSaved+" imageSaved="+imageSaved
++                +" motionSaver=false ultraHdr=false baseSurvivesJinFailure=true");
++        if(srDetailPath!=null)try{java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(srDetailPath));}catch(Throwable ignored){}
++        final long iris26535SaveMs=(System.nanoTime()-iris26535SaveStartNs)/1_000_000L;
++        Log.i(TAG,"IRIS_26537_NIGHT_TIMING mergeMs="+iris26535MergeMs
++                +" postPlusJinMs="+iris26535PostMs+" saveMs="+iris26535SaveMs
++                +" totalMs="+((System.nanoTime()-iris26535NightStartNs)/1_000_000L)
++                +" secondMgcPass=false");
++        processingEventsListener.onProcessingFinished("Iris Night Processing Finished");
++        callback.onFinished();
++    }
++
+ private void ApplyHdrX() {
+         if (cameraMode == CameraMode.NIGHT) {
+-            throw new IllegalStateException("26540 architecture guard: Night legacy Hdrx path forbidden");
++            ApplyIrisNight26533();
++            return;
+         }
+ 
+         callback.onStarted();
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+index 060e630..f3c4288 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+@@ -78,17 +78,6 @@ public final class IrisMotionSettings {
+         return new Snapshot(nr, custom, id, name, luma, chroma, exposure, shadows, contrast);
+     }
+ 
+-    /* IRIS_26540_NIGHT_EXACT_CAMERA2_NOISE_SNAPSHOT
+-     * Night freezes user denoise controls at shutter but deliberately disables custom/profile
+-     * noise substitution. Exact per-frame Camera2 SENSOR_NOISE_PROFILE remains sensor authority.
+-     */
+-    public static Snapshot exactCamera2NightSnapshot() {
+-        Snapshot source = current();
+-        return new Snapshot(source.noiseReductionEnabled, false, "", "Camera2 exact",
+-                source.lumaDenoise, source.chromaDenoise,
+-                source.exposureEv, source.shadows, source.contrast);
+-    }
+-
+     public static float snap01(float value, float min, float max) {
+         if (!Float.isFinite(value)) value = 0.0f;
+         float clamped = Math.max(min, Math.min(max, value));
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+deleted file mode 100644
+index 2108c9f..0000000
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ /dev/null
+@@ -1,230 +0,0 @@
+-package com.particlesdevs.photoncamera.processing.processor;
+-
+-import android.graphics.Bitmap;
+-import android.graphics.Point;
+-import android.hardware.camera2.CameraCharacteristics;
+-import android.hardware.camera2.CaptureResult;
+-
+-import com.particlesdevs.photoncamera.api.ParseExif;
+-import com.particlesdevs.photoncamera.capture.CaptureController;
+-import com.particlesdevs.photoncamera.control.GyroBurst;
+-import com.particlesdevs.photoncamera.processing.ImageFrame;
+-import com.particlesdevs.photoncamera.processing.ImagePath;
+-import com.particlesdevs.photoncamera.processing.ImageSaver;
+-import com.particlesdevs.photoncamera.processing.IrisNightBatch;
+-import com.particlesdevs.photoncamera.processing.ProcessingEventsListener;
+-import com.particlesdevs.photoncamera.processing.opengl.postpipeline.PostPipeline;
+-import com.particlesdevs.photoncamera.processing.render.Parameters;
+-import com.particlesdevs.photoncamera.util.Allocator;
+-import com.particlesdevs.photoncamera.util.Log;
+-
+-import java.nio.ByteBuffer;
+-import java.nio.file.Path;
+-import java.util.ArrayList;
+-
+-/**
+- * IRIS_26540_NIGHT_PROCESSOR_SOLE_OWNER
+- *
+- * Standalone Night processor. It never enters DefaultSaver, HdrxProcessor.Run(),
+- * Camera2ApiAutoFix.ApplyRes(), Parameters.FillDynamicParameters(), Photon NoiseModeler,
+- * or the legacy Photon Night graph. The immutable IrisNightBatch is the complete authority.
+- */
+-public final class IrisNightProcessor {
+-    private static final String TAG = "IrisNightProcessor";
+-
+-    private IrisNightProcessor() {}
+-
+-    public static void process(IrisNightBatch batch,
+-                               ProcessingEventsListener listener) {
+-        final long startNs = System.nanoTime();
+-        CaptureController.isProcessing = true;
+-        listener.onProcessingStarted("Iris Night");
+-        try {
+-            if (batch == null || batch.characteristics == null || batch.frames.size() < 2) {
+-                throw new IllegalStateException("26540 Iris Night requires immutable Camera2 batch");
+-            }
+-            final CameraCharacteristics characteristics = batch.characteristics;
+-            final ArrayList<ImageFrame> images = new ArrayList<>(batch.frames);
+-            images.sort(java.util.Comparator.comparingLong(ImageFrame::getTimestamp));
+-            final ImageFrame base = images.get(0);
+-            final int width = base.motionV2PlaneLogicalWidth;
+-            final int height = base.motionV2PlaneLogicalHeight;
+-            if (width <= 0 || height <= 0) {
+-                throw new IllegalStateException("26540 Night logical RAW geometry invalid " + width + "x" + height);
+-            }
+-            for (int i = 0; i < images.size(); i++) {
+-                ImageFrame frame = images.get(i);
+-                if (!frame.motionV2PlaneLayoutValid
+-                        || frame.motionV2PlaneLogicalWidth != width
+-                        || frame.motionV2PlaneLogicalHeight != height
+-                        || frame.irisNightExactCaptureResult == null
+-                        || frame.irisNightExactCaptureRequest == null
+-                        || frame.motionV2ResultSensorTimestampNs != frame.timestamp
+-                        || frame.motionV2ActualExposureNs <= 0L
+-                        || frame.motionV2ActualIso <= 0
+-                        || !frame.motionV2NoiseProfileValid
+-                        || !frame.motionV2BlackLevelValid
+-                        || !frame.motionV2WhiteLevelValid) {
+-                    throw new IllegalStateException("26540 Night immutable frame contract failed index=" + i);
+-                }
+-                frame.number = i;
+-                frame.pair = null;
+-                frame.irisRelativeExposureMpy = 1.0f;
+-                if (!batch.gyro.isEmpty()) {
+-                    frame.frameGyro = batch.gyro.get(i % batch.gyro.size());
+-                }
+-            }
+-
+-            final Parameters p = new Parameters();
+-            p.FillIrisNightParameters(characteristics, batch.referenceResult,
+-                    batch.referenceRequest, new Point(width, height), batch);
+-            p.cameraRotation = batch.rotation;
+-            p.motionV2WronskiNoiseS = base.motionV2NoiseS;
+-            p.motionV2WronskiNoiseO = base.motionV2NoiseO;
+-            p.motionV2StrictWronskiSensorValid = true;
+-            p.motionV2GlobalZoom = 1.0f;
+-            p.motionV2OpticalZoomAnchor = 1.0f;
+-            p.motionV2OutputZoom = 1.0f;
+-            p.motionV2SpatialReconstructionZoom = 1.0f;
+-            p.motionV2RenderResidualZoom = 1.0f;
+-            p.motionV2SuperResOutputEnabled = batch.superResEnabled;
+-            p.motionV2SuperResOutputScale = batch.superResEnabled ? 2.0f : 1.0f;
+-
+-            final Path dngFile = ImagePath.newDNGFilePath();
+-            final Path imageFile = ImagePath.newImageFilePath();
+-            final ParseExif.ExifData exif = ParseExif.parse(batch.referenceResult, batch.referenceRequest);
+-            final long ref = base.getTimestamp();
+-            Log.i(TAG, "IRIS_26540_NIGHT_DIRECT_PROCESS_ENTRY frames=" + images.size()
+-                    + " frameBudget=" + batch.frameBudget
+-                    + " exactReferenceTimestamp=" + ref
+-                    + " staticImageBuffer=false defaultSaver=false hdrxRun=false"
+-                    + " applyRes=false fillDynamic=false photonNoiseModeler=false"
+-                    + " superRes=" + batch.superResEnabled);
+-
+-            final long mergeStartNs = System.nanoTime();
+-            final MotionV2Merger.Result r = PhotonMotionMgc1271Bridge.reconstruct(
+-                    new Point(width, height), images, ref, p, null, batch.saveRaw >= 1);
+-            final long mergeMs = (System.nanoTime() - mergeStartNs) / 1_000_000L;
+-            if (r == null || r.raw == null) {
+-                throw new IllegalStateException("26540 Night Spatial RGB carrier missing");
+-            }
+-            if (r.inputFrames < images.size()) {
+-                throw new IllegalStateException("26540 Night MGC scheduled-frame mismatch scheduled="
+-                        + r.inputFrames + " expectedAtLeast=" + images.size());
+-            }
+-            ByteBuffer rgb = r.raw;
+-            rgb.position(0);
+-            final long expectedRgbBytes = (long) width * (long) height * 4L * 2L;
+-            if (rgb.capacity() < expectedRgbBytes) {
+-                throw new IllegalStateException("26540 Night RGB carrier too small bytes="
+-                        + rgb.capacity() + " expectedAtLeast=" + expectedRgbBytes);
+-            }
+-            if (r.stackedDngRaw16 != null && rgb == r.stackedDngRaw16) {
+-                throw new IllegalStateException("26540 Night RGB carrier aliases DNG sidecar");
+-            }
+-            p.motionV2EffectiveSupport = r.effectiveSupport;
+-
+-            if (batch.saveRaw >= 1) {
+-                boolean rawSaved = false;
+-                try {
+-                    if (p.motionV2SuperResOutputEnabled && r.superResLinearRawPath != null
+-                            && r.superResLinearRawWidth > 0 && r.superResLinearRawHeight > 0) {
+-                        rawSaved = com.particlesdevs.photoncamera.processing.IrisMotionSuperResDngWriter.write(
+-                                dngFile, java.nio.file.Paths.get(r.superResLinearRawPath),
+-                                r.superResLinearRawWidth, r.superResLinearRawHeight, p,
+-                                r.dngNoiseProfile, r.dngStackFrames, r.dngSupportMin, r.dngSupportP01,
+-                                r.dngSupportP10, r.dngSupportMedian, r.dngSupportMean, r.dngSupportMax,
+-                                r.dngNoiseEquivalentSupport);
+-                    } else {
+-                        if (r.stackedDngRaw16 == null) {
+-                            throw new IllegalStateException("26540 Night normalized16 DNG sidecar missing");
+-                        }
+-                        ByteBuffer dngBayer = r.stackedDngRaw16;
+-                        dngBayer.position(0);
+-                        rawSaved = ImageSaver.Util.saveNormalized16StackedRaw(
+-                                dngFile, dngBayer, p, r.dngNoiseProfile, r.dngStackFrames,
+-                                r.dngSupportMin, r.dngSupportP01, r.dngSupportP10,
+-                                r.dngSupportMedian, r.dngSupportMean, r.dngSupportMax,
+-                                r.dngNoiseEquivalentSupport);
+-                    }
+-                } catch (Throwable rawFailure) {
+-                    Log.e(TAG, "IRIS_26540_NIGHT_DNG_SAVE_FAILED_CONTINUE_JPEG", rawFailure);
+-                } finally {
+-                    if (r.stackedDngRaw16 != null) {
+-                        try { Allocator.free(r.stackedDngRaw16); } catch (Throwable ignored) {}
+-                    }
+-                    if (r.superResLinearRawPath != null) {
+-                        try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(r.superResLinearRawPath)); }
+-                        catch (Throwable ignored) {}
+-                    }
+-                }
+-                listener.notifyImageSavedStatus(rawSaved, dngFile);
+-            }
+-
+-            exif.IMAGE_DESCRIPTION = p.toString()
+-                    + "\nIRIS_26540_NIGHT irisCaptureOwner=true exactTimestampMetadata=true"
+-                    + " photonNight=false staticImageBuffer=false defaultSaver=false hdrxRun=false"
+-                    + " applyRes=false photonNoiseModeler=false liveTunableInjection=false"
+-                    + " mgcSpatialRgb=true pecanProfileSnr=referencePreMerge"
+-                    + " denoiseMagnitude=propagatedResidual readShotCorrelationStrength=true"
+-                    + " isoDenoiseAuthority=false darknessDenoiseAuthority=false"
+-                    + " autoLowLightLumaFloor=false ultraHdr=false superRes="
+-                    + p.motionV2SuperResOutputEnabled;
+-
+-            final PostPipeline pipeline = new PostPipeline(true);
+-            final long postStartNs = System.nanoTime();
+-            final Point crop;
+-            Bitmap img;
+-            try {
+-                img = pipeline.RunIrisNightRgb(rgb, p);
+-                crop = pipeline.cropSize == null ? new Point(p.rawSize) : new Point(pipeline.cropSize);
+-            } finally {
+-                try { Allocator.free(rgb); } catch (Throwable ignored) {}
+-            }
+-            Log.i(TAG, "IRIS_26540_NIGHT_RGBA16F_RELEASED_BEFORE_JIN bytes=" + expectedRgbBytes);
+-            if (android.os.Build.VERSION.SDK_INT >= 34 && img != null
+-                    && !img.isRecycled() && img.hasGainmap()) {
+-                throw new IllegalStateException("26540 Night pre-Jin UltraHDR is forbidden");
+-            }
+-
+-            final String srDetailPath = r.superResDetailPath;
+-            final int srDetailWidth = r.superResDetailWidth;
+-            final int srDetailHeight = r.superResDetailHeight;
+-            final boolean baseSaved = ImageSaver.Util.saveBitmapAsJPGIrisNightCheckpoint(
+-                    imageFile, img, ImageSaver.JPG_QUALITY, exif);
+-            if (baseSaved) listener.notifyImageSavedStatus(true, imageFile);
+-            else Log.w(TAG, "IRIS_26540_NIGHT_BASE_CHECKPOINT_FAILED continueFinalAttempt=true");
+-
+-            img = IrisNightNeuralEnhancer.enhanceInPlace(img);
+-            final long postPlusJinMs = (System.nanoTime() - postStartNs) / 1_000_000L;
+-            final boolean finalSaved = ImageSaver.Util.saveBitmapAsJPGIrisNightAtomicFinal(
+-                    imageFile, img, ImageSaver.JPG_QUALITY, exif,
+-                    srDetailPath, srDetailWidth, srDetailHeight, p, crop);
+-            final boolean imageSaved = finalSaved || baseSaved;
+-            if (finalSaved || !baseSaved) listener.notifyImageSavedStatus(imageSaved, imageFile);
+-            if (srDetailPath != null) {
+-                try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(srDetailPath)); }
+-                catch (Throwable ignored) {}
+-            }
+-            Log.i(TAG, "IRIS_26540_NIGHT_PUBLICATION_OWNERSHIP baseSaved=" + baseSaved
+-                    + " finalSaved=" + finalSaved + " imageSaved=" + imageSaved
+-                    + " jinOptional=true baseSurvivesJinFailure=true ultraHdr=false"
+-                    + " mergeMs=" + mergeMs + " postPlusJinMs=" + postPlusJinMs
+-                    + " totalMs=" + ((System.nanoTime() - startNs) / 1_000_000L));
+-            listener.onProcessingFinished("Iris Night Processing Finished");
+-        } catch (Throwable failure) {
+-            Log.e(TAG, "IRIS_26540_NIGHT_PROCESS_FAILED", failure);
+-            listener.onProcessingError(failure.getClass().getSimpleName() + ": "
+-                    + String.valueOf(failure.getMessage()));
+-        } finally {
+-            if (batch != null && batch.frames != null) {
+-                for (ImageFrame frame : batch.frames) {
+-                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                }
+-            }
+-            CaptureController.isProcessing = false;
+-        }
+-    }
+-
+-
+-}
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index f5d0aaf..d7002b0 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -704,8 +704,10 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             glProg.useAssetProgram("motionv2/raw_to_cfa", true);
+             glProg.setVar("whiteLevel", (float) parameters.whiteLevel);
+             glProg.setVar("blackLevel", blackLevel);
+-            final float iris26487ReferenceExposureScale = canonicalGain
+-                    * (1.0f / Math.max(images.get(0).getRelativeExposureMpy(), 1.0e-6f));
++            final float iris26487ReferenceExposureScale = canonicalGain * (
++                    images.get(0).pair != null
++                            ? 1.0f / Math.max(images.get(0).pair.layerMpy, 1.0e-6f)
++                            : 1.0f);
+             glProg.setVar("exposure", iris26487ReferenceExposureScale);
+             glProg.setTexture("inTexture", referenceRaw);
+             glProg.setTextureCompute("outTexture", referenceCfa, true);
+@@ -1164,8 +1166,11 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             new GLFormat(GLFormat.DataType.FLOAT_16,4),null,GL_NEAREST,GL_CLAMP_TO_EDGE);
+                     alterCfa=iris26480CfaScratch;
+ 
+-                    float exposure = canonicalGain
+-                            * (1.0f / Math.max(frame.getRelativeExposureMpy(), 1.0e-6f));
++                    float exposure = canonicalGain * (
++                            frame.pair != null
++                                    ? 1.0f / Math.max(
++                                            frame.pair.layerMpy, 1.0e-6f)
++                                    : 1.0f);
+                     Iris26487Noise iris26487SensorNoise=iris26487FrameNoise(frame,noiseS,noiseO);
+                     float[] iris26487WbNoise=iris26487WbNoiseRgb(iris26487SensorNoise,(int)parameters.cfaPattern,exposure,wronskiGlobalWbR,wronskiGlobalWbB);
+                     float[] iris26487GreenPhysicalNoise=iris26487GreenPhysicalNoise(iris26487SensorNoise,(int)parameters.cfaPattern);
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index b65dbd2..3930414 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -107,13 +107,7 @@ object PhotonMotionMgc1271Bridge {
+             }
+ 
+             // IRIS_26514_STRICT_NOISE_AUTHORITY: no Camera2 base-frame, Pixel, or custom->Camera2 fallback.
+-            // IRIS_26540_NIGHT_FROZEN_IRIS_SETTINGS
+-            val irisSettings = if (parameters.irisNightActive) {
+-                parameters.irisNightSettingsSnapshot
+-                    ?: throw IllegalStateException("26540 Night missing frozen Iris settings")
+-            } else {
+-                IrisMotionSettings.current()
+-            }
++            val irisSettings = IrisMotionSettings.current()
+             val noiseSelection: RawNoiseProfileSelection
+             val noiseAuthority: String
+             if (irisSettings.customNoiseModelEnabled) {
+@@ -342,19 +336,51 @@ object PhotonMotionMgc1271Bridge {
+                 channelNoiseProfile = if (irisSettings.customNoiseModelEnabled)
+                     floatArrayOf() else reference.motionV2NoiseProfile.copyOf(),
+             )
+-            /* IRIS_26540_RESIDUAL_ONLY_DENOISE_AUTHORITY
+-             * Temporal Spatial-RGB reconstruction is the first noise reducer. Pecan runs only on
+-             * the residual model exported by the finished stack. Source/reference SNR chooses the
+-             * Pecan frequency profile; it does NOT create a low-light strength floor. ISO, scene
+-             * brightness and preview darkness never independently increase denoise strength.
++            /* IRIS_26537_SOURCE_SNR_EFFECTIVE_SUPPORT_LUMA_AUTHORITY
++             * 26536 accidentally used finishRawDenoiseSnr here. That value is intentionally the
++             * propagated POST-merge output SNR and reached ~55 in the user's ISO-3210 bathroom
++             * stack, so low-light activation clamped to zero even though referenceSnr was ~4.6
++             * and frame-equivalent support was only ~5. Keep the two domains separate:
++             *   - reference/source SNR + real noise-equivalent support decide WHETHER the small
++             *     luma cleanup is needed;
++             *   - tuningSnr below remains the propagated output-noise authority used BY the
++             *     MGC/Pecan denoiser.
++             * There is still no flat-area classifier and no broad post-merge blur.
+              */
+             val requestedLumaScale = irisSettings.lumaDenoise.coerceIn(0f, 2f)
+             val noiseEquivalentSupport = stacked.normalStackedDngNoiseEquivalentSupport
+             requireParity(noiseEquivalentSupport.isFinite() && noiseEquivalentSupport >= 1f,
+                 "missing/malformed noise-equivalent temporal support")
++            val lumaSnrRisk = ((24f - referenceSnr!!) / 20f).coerceIn(0f, 1f)
++            val lumaSupportRisk = ((7f - noiseEquivalentSupport) / 5f).coerceIn(0f, 1f)
++            val lumaReliabilityRisk =
++                ((0.90f - parameters.motionV2SpatialReliabilityMean) / 0.45f).coerceIn(0f, 1f)
++            /* IRIS_26538_NATIVE_PECAN_LUMA_SCALE
++             * 26537 correctly detected the bathroom stack (reference SNR ~4.6, noise-equivalent
++             * support ~5) but then multiplied MGC's calibrated Pecan sigma strengths by only
++             * ~0.175. The native kernel squares those strengths into variance, leaving only ~3%
++             * of full calibrated variance and therefore almost no visible change. Keep the same
++             * evidence-based activation, but feed the native SNR-interpolated Pecan tuning at a
++             * meaningful sigma scale. The propagated post-merge tuningSnr still chooses the
++             * calibrated table values; this scale only expresses how strongly that existing
++             * denoiser is admitted for genuinely low-light / low-support stacks.
++             */
++            val lowLightDemand =
++                (lumaSnrRisk * (0.55f + 0.45f * lumaSupportRisk) *
++                    (1f + 0.08f * lumaReliabilityRisk)).coerceIn(0f, 1f)
++            /* IRIS_26539_AUTOMATIC_PECAN_LUMA_FLOOR
++             * 26538 accidentally multiplied the automatic low-light demand by the user luma
++             * slider. With Denoise enabled but slider=0, that made a source-SNR~4.4 / NE~4.9
++             * stack run with lumaScale=0, so the intended native Pecan test never happened.
++             * lowLightDemand is already a normalized 0..1 admission signal. Scale=1 means the
++             * native SNR-interpolated Pecan tuning exactly, so use that signal directly as the
++             * automatic floor and let the user slider independently request more strength.
++             */
++            val automaticLowLightLuma = if (irisSettings.noiseReductionEnabled)
++                lowLightDemand else 0f
+             val userLumaScale = if (irisSettings.noiseReductionEnabled)
+                 requestedLumaScale else 0f
+-            val lumaScale = userLumaScale.coerceIn(0f, 1.5f)
++            val lumaScale = maxOf(automaticLowLightLuma, userLumaScale).coerceIn(0f, 1.5f)
+             val chromaScale = irisSettings.chromaDenoise
+             val runFullResolutionDenoise = irisSettings.noiseReductionEnabled &&
+                 (lumaScale > 0f || chromaScale > 0f)
+@@ -434,12 +460,13 @@ object PhotonMotionMgc1271Bridge {
+ 
+             PLog.i(TAG, "IRIS_26532_DENOISE_SR_AUTHORITY " +
+                 "master=${irisSettings.noiseReductionEnabled} " +
+-                "requestedLuma=$requestedLumaScale automaticLowLightLuma=0.0 " +
++                "requestedLuma=$requestedLumaScale automaticLowLightLuma=$automaticLowLightLuma " +
+                 "userLuma=$userLumaScale effectiveMgcLuma=$lumaScale " +
+-                "profileSnrSource=referencePreMerge referenceSnr=$referenceSnr " +
+-                "noiseEquivalentSupport=$noiseEquivalentSupport " +
+-                "pecanProfileTuningSnr=$tuningSnr residualMagnitude=propagatedReadShotCorrelationStrength " +
+-                "isoStrengthAuthority=false darknessStrengthAuthority=false textureClassifier=false " +
++                "lowLightDemand=$lowLightDemand nativePecanSigmaScale=true lumaSnrRisk=$lumaSnrRisk " +
++                "lumaSnrSource=referencePreMerge referenceSnr=$referenceSnr " +
++                "noiseEquivalentSupport=$noiseEquivalentSupport lumaSupportRisk=$lumaSupportRisk " +
++                "propagatedDenoiseTuningSnr=$tuningSnr " +
++                "lumaReliabilityRisk=$lumaReliabilityRisk textureClassifier=false " +
+                 "structureAuthority=MGC_PECAN_OUTLIER_REVERT_SPATIAL_STRENGTH " +
+                 "chroma=$chromaScale executed=$runFullResolutionDenoise " +
+                 "srScale=$spatialReconstructionZoom requestedLocalZoom=$localOutputZoom " +
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 6a423e9..13f8e86 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -68,12 +68,6 @@ public class Parameters {
+     public boolean motionV2Active = false;
+     /* IRIS_26533_NIGHT_DOMAIN_OWNER */
+     public boolean irisNightActive = false;
+-    /* IRIS_26540_NIGHT_FROZEN_PRESENTATION_SETTINGS */
+-    public boolean irisNightAspect169 = false;
+-    public boolean irisNightEnergySaving = false;
+-    public boolean irisNightWatermarkEnabled = false;
+-    public com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.Snapshot
+-            irisNightSettingsSnapshot = null;
+     public float motionV2EffectiveSupport = 1.0f;
+     /* IRIS_26535_NATIVE_SPATIAL_RELIABILITY_OWNER
+      * Quarter-resolution reliability transported from MGC's native Spatial strength/rejection
+@@ -178,7 +172,7 @@ public class Parameters {
+     public float[] ForwardTransform2 = new float[9];
+ 
+     public boolean mirror = false;
+-    public String cameraID = "0";
++    public String cameraID = PhotonCamera.getSettings().mCameraID;
+     public int physicalID = 0;
+     public int logicalID = 0;
+ 
+@@ -206,208 +200,6 @@ public class Parameters {
+             description = "Disable front camera mirroring")
+     boolean disableMirror;
+ 
+-    /**
+-     * IRIS_26540_NIGHT_CAMERA2_PARAMETER_OWNER
+-     * Builds Night parameters only from shutter-frozen Iris settings plus standard Camera2
+-     * characteristics/result/request metadata. It does not call TunableInjector, NoiseModeler,
+-     * sensor-specific Photon overrides, custom CCT files, or live Photon settings.
+-     */
+-    public void FillIrisNightParameters(CameraCharacteristics characteristics,
+-                                        CaptureResult result,
+-                                        CaptureRequest request,
+-                                        Point size,
+-                                        com.particlesdevs.photoncamera.processing.IrisNightBatch batch) {
+-        if (characteristics == null || result == null || request == null || size == null || batch == null)
+-            throw new IllegalArgumentException("26540 Night parameters require exact Camera2 metadata");
+-        irisNightActive = true;
+-        motionV2Active = false;
+-        irisNightAspect169 = batch.aspect169;
+-        irisNightEnergySaving = batch.energySaving;
+-        irisNightWatermarkEnabled = batch.watermarkEnabled;
+-        irisNightSettingsSnapshot = batch.irisSettings;
+-        if (irisNightSettingsSnapshot == null || irisNightSettingsSnapshot.customNoiseModelEnabled) {
+-            throw new IllegalStateException("26540 Night requires frozen exact-Camera2 Iris settings");
+-        }
+-        cameraID = batch.cameraId;
+-        try {
+-            if (cameraID.contains("-")) {
+-                String[] ids = cameraID.split("-");
+-                logicalID = Integer.parseInt(ids[0]);
+-                physicalID = Integer.parseInt(ids[1]);
+-            } else {
+-                physicalID = Integer.parseInt(cameraID);
+-                logicalID = physicalID;
+-            }
+-        } catch (Throwable badId) {
+-            logicalID = 0;
+-            physicalID = 0;
+-        }
+-        rawSize = new Point(size);
+-        alignmentSize = new Point((size.x / tile) + 1, (size.y / tile) + 1);
+-        tilesX = (rawSize.x / 800) + 1;
+-        Integer analog = characteristics.get(CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY);
+-        analogIso = analog == null ? 100 : analog;
+-        Integer cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT);
+-        if (cfa == null || cfa < 0 || cfa > 3)
+-            throw new IllegalStateException("26540 Night requires standard Camera2 Bayer CFA: " + cfa);
+-        cfaPattern = (byte)(int)cfa;
+-        sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+-        if (sensorSize == null || sensorSize.getWidth() <= 0f || sensorSize.getHeight() <= 0f)
+-            throw new IllegalStateException("26540 Night missing SENSOR_INFO_PHYSICAL_SIZE");
+-        sensorPix = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+-        if (sensorPix == null) sensorPix = new Rect(0, 0, rawSize.x, rawSize.y);
+-        float[] flens = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+-        Float resultFocal = result.get(CaptureResult.LENS_FOCAL_LENGTH);
+-        focalLength = resultFocal != null ? resultFocal
+-                : (flens != null && flens.length > 0 ? flens[0] : 4.75f);
+-        Float resultAperture = result.get(CaptureResult.LENS_APERTURE);
+-        float[] apertures = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES);
+-        aperture = resultAperture != null ? resultAperture
+-                : (apertures != null && apertures.length > 0 ? apertures[0] : 1.8f);
+-        XPerMm = rawSize.x / sensorSize.getWidth();
+-        YPerMm = rawSize.y / sensorSize.getHeight();
+-        cameraIntrinsic[0] = focalLength; cameraIntrinsic[1] = 0.0; cameraIntrinsic[2] = rawSize.x / 2.0;
+-        cameraIntrinsic[3] = 0.0; cameraIntrinsic[4] = focalLength; cameraIntrinsic[5] = rawSize.y / 2.0;
+-        cameraIntrinsic[6] = 0.0; cameraIntrinsic[7] = 0.0; cameraIntrinsic[8] = 1.0;
+-        cameraIntrinsicRev[0] = 1.0; cameraIntrinsicRev[1] = 0.0; cameraIntrinsicRev[2] = -rawSize.x / 2.0;
+-        cameraIntrinsicRev[3] = 0.0; cameraIntrinsicRev[4] = 1.0; cameraIntrinsicRev[5] = -rawSize.y / 2.0;
+-        cameraIntrinsicRev[6] = 0.0; cameraIntrinsicRev[7] = 0.0; cameraIntrinsicRev[8] = focalLength;
+-        angleX = 2 * Math.atan(sensorSize.getWidth() / ((double)focalLength * 2));
+-        angleY = 2 * Math.atan(sensorSize.getHeight() / ((double)focalLength * 2));
+-        perXAngle = rawSize.x / angleX;
+-        perYAngle = rawSize.y / angleY;
+-        Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+-        mirror = facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT;
+-
+-        Integer sensitivity = result.get(CaptureResult.SENSOR_SENSITIVITY);
+-        if (sensitivity == null) sensitivity = request.get(CaptureRequest.SENSOR_SENSITIVITY);
+-        if (sensitivity == null || sensitivity <= 0)
+-            throw new IllegalStateException("26540 Night missing SENSOR_SENSITIVITY");
+-        iso = sensitivity;
+-        Long exposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+-        if (exposure == null) exposure = request.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+-        if (exposure == null || exposure <= 0L)
+-            throw new IllegalStateException("26540 Night missing SENSOR_EXPOSURE_TIME");
+-        exposureTime = ExposureIndex.time2sec(exposure);
+-
+-        float[] dynamicBlack = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL);
+-        boolean blackOk = dynamicBlack != null && dynamicBlack.length >= 4;
+-        if (blackOk) {
+-            for (int i = 0; i < 4; i++) blackOk &= Float.isFinite(dynamicBlack[i]) && dynamicBlack[i] >= 0f;
+-        }
+-        if (blackOk) {
+-            System.arraycopy(dynamicBlack, 0, blackLevel, 0, 4);
+-            usedDynamic = true;
+-        } else {
+-            BlackLevelPattern fixedBlack = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN);
+-            if (fixedBlack == null) throw new IllegalStateException("26540 Night missing black level");
+-            int[] b = new int[4]; fixedBlack.copyTo(b, 0);
+-            for (int i = 0; i < 4; i++) blackLevel[i] = b[i];
+-        }
+-        Integer dynamicWhite = result.get(CaptureResult.SENSOR_DYNAMIC_WHITE_LEVEL);
+-        Integer fixedWhite = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL);
+-        whiteLevel = dynamicWhite != null && dynamicWhite > 0 ? dynamicWhite
+-                : (fixedWhite == null ? 0 : fixedWhite);
+-        if (whiteLevel <= 0) throw new IllegalStateException("26540 Night missing white level");
+-        if (batch.binning) {
+-            for (int i = 0; i < 4; i++) blackLevel[i] = Math.min(blackLevel[i] * 4f, 65535f);
+-            whiteLevel = Math.min(whiteLevel * 4, 65535);
+-        }
+-
+-        gainMap = new float[]{1f,1f,1f,1f};
+-        mapSize = new Point(1,1);
+-        hasGainMap = false;
+-        LensShadingMap lensMap = result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP);
+-        if (lensMap != null) {
+-            gainMap = new float[lensMap.getGainFactorCount()];
+-            lensMap.copyGainFactors(gainMap, 0);
+-            mapSize = new Point(lensMap.getColumnCount(), lensMap.getRowCount());
+-            hasGainMap = true;
+-        }
+-        hotPixels = result.get(CaptureResult.STATISTICS_HOT_PIXEL_MAP);
+-        fillIrisNightCamera2Color(characteristics, result);
+-        tonemapStrength = 1.0f;
+-        customTonemap = new float[]{0f, 0f, 1f, 0f};
+-        noiseModeler = null;
+-        Log.i(TAG, "IRIS_26540_NIGHT_CAMERA2_PARAMETER_OWNER"
+-                + " cameraId=" + cameraID + " iso=" + iso + " exposureNs=" + exposure
+-                + " cfa=" + cfaPattern + " whiteLevel=" + whiteLevel
+-                + " gainMap=" + hasGainMap + " photonNoiseModeler=false tunableInjector=false"
+-                + " sensorSpecificOverrides=false customCct=false");
+-    }
+-
+-    private void fillIrisNightCamera2Color(CameraCharacteristics characteristics, CaptureResult result) {
+-        Rational[] neutral = result.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT);
+-        if (neutral == null || neutral.length < 3)
+-            throw new IllegalStateException("26540 Night missing SENSOR_NEUTRAL_COLOR_POINT");
+-        for (int i = 0; i < 3; i++) {
+-            whitePoint[i] = neutral[i].floatValue();
+-            if (!Float.isFinite(whitePoint[i]) || whitePoint[i] <= 0f)
+-                throw new IllegalStateException("26540 Night invalid neutral component " + i);
+-        }
+-        Integer ref1Obj = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1);
+-        Integer ref2Obj = characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2);
+-        int ref1 = ref1Obj == null ? 21 : ref1Obj;
+-        int ref2 = ref2Obj == null ? ref1 : ref2Obj;
+-        calibrationIlluminant1 = ref1;
+-        calibrationIlluminant2 = ref2;
+-        ColorSpaceTransform identity = new ColorSpaceTransform(new Rational[]{
+-                new Rational(1,1),new Rational(0,1),new Rational(0,1),
+-                new Rational(0,1),new Rational(1,1),new Rational(0,1),
+-                new Rational(0,1),new Rational(0,1),new Rational(1,1)});
+-        ColorSpaceTransform calibration1 = characteristics.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1);
+-        ColorSpaceTransform calibration2 = characteristics.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2);
+-        ColorSpaceTransform color1 = characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1);
+-        ColorSpaceTransform color2 = characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2);
+-        ColorSpaceTransform forward1 = characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1);
+-        ColorSpaceTransform forward2 = characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2);
+-        if (calibration1 == null) calibration1 = identity;
+-        if (calibration2 == null) calibration2 = calibration1;
+-        if (color1 == null) color1 = identity;
+-        if (color2 == null) color2 = color1;
+-        if (forward1 == null) forward1 = identity;
+-        if (forward2 == null) forward2 = forward1;
+-        Converter.convertColorspaceTransform(calibration1, calibrationTransform1);
+-        Converter.convertColorspaceTransform(calibration2, calibrationTransform2);
+-        Converter.convertColorspaceTransform(forward1, ForwardTransform1);
+-        Converter.convertColorspaceTransform(forward2, ForwardTransform2);
+-        Converter.convertColorspaceTransform(color1, ColorMatrix1);
+-        Converter.convertColorspaceTransform(color2, ColorMatrix2);
+-        float[] nf1 = ForwardTransform1.clone();
+-        float[] nf2 = ForwardTransform2.clone();
+-        float[] nc1 = ColorMatrix1.clone();
+-        float[] nc2 = ColorMatrix2.clone();
+-        Converter.normalizeFM(nf1); Converter.normalizeFM(nf2);
+-        Converter.normalizeFM(nc1); Converter.normalizeFM(nc2);
+-        double factor = Converter.findDngInterpolationFactor(ref1, ref2,
+-                calibrationTransform1, calibrationTransform2, nc1, nc2, whitePoint);
+-        float[] sensorToXYZ = new float[9];
+-        Converter.calculateCameraToXYZD50Transform(nf1, nf2, calibrationTransform1,
+-                calibrationTransform2, whitePoint, factor, sensorToXYZ);
+-        Converter.multiply(Converter.sXYZtoProPhoto, sensorToXYZ, sensorToProPhoto);
+-        Converter.multiply(Converter.sXYZtoSRGB, Converter.sProPhotoToXYZ, proPhotoToSRGB);
+-        android.hardware.camera2.params.RggbChannelVector gains =
+-                result.get(CaptureResult.COLOR_CORRECTION_GAINS);
+-        ColorSpaceTransform direct = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM);
+-        motionV2DirectColorValid = false;
+-        if (gains != null && direct != null) {
+-            motionV2ColorGains[0] = gains.getRed();
+-            motionV2ColorGains[1] = gains.getGreenEven();
+-            motionV2ColorGains[2] = gains.getGreenOdd();
+-            motionV2ColorGains[3] = gains.getBlue();
+-            Rational[] d = new Rational[9]; direct.copyElements(d, 0);
+-            boolean sane = true;
+-            for (int i = 0; i < 9; i++) {
+-                motionV2ColorTransform[i] = d[i].floatValue();
+-                sane &= Float.isFinite(motionV2ColorTransform[i]);
+-            }
+-            for (float g : motionV2ColorGains) sane &= Float.isFinite(g) && g > 0f;
+-            motionV2DirectColorValid = sane;
+-        }
+-        CCT = new ColorCorrectionTransform();
+-        CCT.matrix = proPhotoToSRGB;
+-    }
+-
+     public void FillConstParameters(CameraCharacteristics characteristics, Point size) {
+         com.particlesdevs.photoncamera.settings.TunableInjector.inject(this);
+         cameraID = PhotonCamera.getSettings().mCameraID;
