@@ -1,0 +1,332 @@
+diff --git b/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl a/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl
+index 02b2382..a44a62e 100644
+--- b/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl
++++ a/app/src/main/assets/shaders/motionv2/mfsr_bayer_accumulate.glsl
+@@ -64,12 +64,9 @@ mat2 interpolatePrecision(vec2 guidePosition) {
+         + c * ((1.0-f.x)*f.y) + d * (f.x*f.y);
+ }
+ 
+-/* IRIS_26542_IPOL_FIGURE7_BAYER_GAUSSIAN
+- * Same Algorithm-4 w = exp(-0.5*d) convention as the active Spatial-RGB consumer.
+- */
+ float kernelWeight(vec2 rawOffset, mat2 precisionMatrix) {
+     float distance = max(dot(rawOffset, precisionMatrix * rawOffset), 0.0);
+-    return exp(-0.5 * distance);
++    return exp2(-0.5 * distance) + 0.00005;
+ }
+ 
+ ivec2 phaseOffset(int phase) {
+diff --git b/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl a/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl
+index e0c2bc0..372525a 100644
+--- b/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl
++++ a/app/src/main/assets/shaders/motionv2/mfsr_mgc_covariance.glsl
+@@ -16,12 +16,6 @@ uniform float wbR;
+ uniform float wbB;
+ uniform float noiseS;
+ uniform float noiseO;
+-uniform float kDetail;
+-uniform float kDenoise;
+-uniform float Dth;
+-uniform float Dtr;
+-uniform float kStretch;
+-uniform float kShrink;
+ 
+ int phaseIndex(ivec2 p){return ((p.y&1)<<1)|(p.x&1);}
+ int colorFromPhase(int phase){if(cfaPattern==0){if(phase==0)return 0;if(phase==3)return 2;return 1;}if(cfaPattern==1){if(phase==1)return 0;if(phase==2)return 2;return 1;}if(cfaPattern==2){if(phase==2)return 0;if(phase==1)return 2;return 1;}if(phase==3)return 0;if(phase==0)return 2;return 1;}
+@@ -30,73 +24,60 @@ int clampPhase(int value,int extent){int phase=value&1;if(phase>=extent)return e
+ ivec2 phaseClamp(ivec2 p){return ivec2(clampPhase(p.x,rawSize.x),clampPhase(p.y,rawSize.y));}
+ float nativeCalculationSample(ivec2 p){p=phaseClamp(p);int phase=phaseIndex(p);float rawValue=float(texelFetch(rawTexture,p,0).r);float black=blackLevel[phase];float sensor=max(rawValue-black,0.0)/max(whiteLevel-black,1.0);return sensor*exposureScale*wbForColor(colorFromPhase(phase));}
+ vec4 qAt(ivec2 q){ivec2 p=clamp(q*2,ivec2(0),rawSize-ivec2(2));return vec4(nativeCalculationSample(p),nativeCalculationSample(p+ivec2(1,0)),nativeCalculationSample(p+ivec2(0,1)),nativeCalculationSample(p+ivec2(1,1)));}
+-
+-/* IRIS_26542_IPOL_FIGURE7_ACTIVE_KERNEL
+- * Direct public Wronski/IPOL kernel-selection law, evaluated from the current native RAW owner:
+- * GAT -> 2x2 Bayer-quad grey -> published gradients -> 2x2 structure tensor -> linear A/D law
+- * with k_stretch=4 and k_shrink=2 supplied by the host. The published implementation produces
+- * covariance; current Spatial-RGB consumes precision, so the final 2x2 matrix is explicitly inverted.
+- * This changes only reconstruction-kernel geometry. Alignment, robustness/rejection and semantic
+- * G/R-G/B-G accumulation remain owned by the existing 26541 graph.
+- */
+-float vst(float x){
+-    float a=max(noiseS,1.0e-7);
+-    float b=max(noiseO,0.0);
+-    float q=max(a*x+0.375*a*a+b,0.0);
+-    return 2.0/a*sqrt(q);
++vec4 canon(vec4 v){if(cfaPattern==0)return v;if(cfaPattern==1)return vec4(v.g,v.r,v.a,v.b);if(cfaPattern==2)return vec4(v.b,v.a,v.r,v.g);return vec4(v.a,v.b,v.g,v.r);}
++int mirrorGuideCoordinate(int coordinate,int extent){
++    const int borderPadding=1;
++    int maximum=max(borderPadding,extent-1-borderPadding);
++    coordinate=coordinate<borderPadding?2*borderPadding-coordinate:coordinate;
++    coordinate=coordinate>maximum?2*maximum-coordinate:coordinate;
++    return clamp(coordinate,0,max(extent-1,0));
+ }
+-float greyVst(ivec2 p){
+-    p=clamp(p,ivec2(0),rawHalf-ivec2(1));
+-    vec4 v=qAt(p);
+-    return 0.25*(vst(v.r)+vst(v.g)+vst(v.b)+vst(v.a));
++void grad(float dx,float dy,inout vec4 t){t+=vec4(dx*dx,dy*dy,dx*dy,0.0);}
++vec4 structureTensor(float g0[9],float g1[9]){
++    vec4 t=vec4(0.0);
++    for(int y=0;y<2;y++)for(int x=0;x<2;x++){
++        float g00=g0[y*3+x],g01=g0[y*3+x+1],g10=g1[y*3+x],g11=g1[y*3+x+1];
++        float g20=g0[(y+1)*3+x],g21=g0[(y+1)*3+x+1],g30=g1[(y+1)*3+x],g31=g1[(y+1)*3+x+1];
++        float bdx,bdy,rdx,rdy;
++        if(cfaPattern==1||cfaPattern==2){
++            bdx=.5*((g11-g01)+(g21-g10)); bdy=.5*((g01-g10)+(g11-g21));
++            rdx=.5*((g21-g10)+(g30-g20)); rdy=.5*((g21-g30)+(g10-g20));
++        }else{
++            bdx=.5*((g11-g00)+(g20-g10)); bdy=.5*((g00-g10)+(g11-g20));
++            rdx=.5*((g21-g11)+(g31-g20)); rdy=.5*((g21-g31)+(g11-g20));
++        }
++        grad(bdx,bdy,t);grad(rdx,rdy,t);grad(.5*(g21-g00),.5*(g01-g20),t);grad(.5*(g31-g10),.5*(g11-g30),t);
++    }
++    t/=16.0;t.w=.75;float c0=.5*(t.x+t.y);float c1=.5*(t.y-t.x);return vec4(c0+t.z,c0-t.z,c1,t.w);
+ }
+-vec2 publicGrad(ivec2 p){
+-    float g00=greyVst(p);
+-    float g01=greyVst(p+ivec2(1,0));
+-    float g10=greyVst(p+ivec2(0,1));
+-    float g11=greyVst(p+ivec2(1,1));
+-    return vec2(
+-        0.25*(-g00+g01-g10+g11),
+-        0.25*(-g00-g01+g10+g11));
++mat2 precisionFrom(vec4 t,float greenVar,float greenNoise){
++    float trace=t.x+t.y,difference=t.x-t.y,disc=sqrt(max(difference*difference+4.0*t.z*t.z,0.0));
++    float l1=.5*(trace+disc),l2=.5*(trace-disc);vec2 e1=vec2(1.0,0.0);
++    if(abs(t.z)>.0001)e1=normalize(vec2(t.z,l1-t.x))*-sign(t.z);else if(t.x<t.y)e1=vec2(0.0,1.0);
++    vec2 e2=vec2(-e1.y,e1.x);float s1=sqrt(max(l1,0.0)),s2=sqrt(max(l2,0.0));
++    float correction=t.w*greenNoise;l1*=l1/max(l1+correction,1e-8);float strength=sqrt(max(l1,0.0));
++    float coherence=(s1-s2)/(s1+s2+1e-6);float correctedGreenStd=sqrt(greenVar*greenVar/max(greenVar+greenNoise,1e-8));
++    float dominant=max(strength,correctedGreenStd)-.001;float blur=clamp(1.0-dominant*142.857142857,0.0,1.0);
++    float anisotropic=mix(4.0,6.0,min(coherence,strength*5.0));float p1=mix(anisotropic,1.0,blur);float p2=mix(mix(4.0,1.3333333333,coherence),1.0,blur);
++    mat2 R=mat2(e1,e2);return transpose(R)*mat2(p1*p1,0.0,0.0,p2*p2)*R;
+ }
++/* IRIS_26488_BJZHOU_NATIVE_RAW_COVARIANCE_EXACT_GEOMETRY
++ * IRIS_26507_MGC_RAW_HALF_COVARIANCE_PARITY
++ * Exact recovered structure-tensor equations at one sample per 2x2 Bayer quad (RAW/2).
++ * The resulting precision matrix is stored directly (not inverted) for MergeRgb.
++ */
+ void main(){
+-    ivec2 p=ivec2(gl_GlobalInvocationID.xy);
+-    if(any(greaterThanEqual(p,guideSize)))return;
+-
+-    float jxx=0.0,jxy=0.0,jyy=0.0;
+-    for(int iy=0;iy<2;iy++)for(int ix=0;ix<2;ix++){
+-        ivec2 q=p-ivec2(1)+ivec2(ix,iy);
+-        if(q.x<0||q.y<0||q.x>=rawHalf.x-1||q.y>=rawHalf.y-1)continue;
+-        vec2 g=publicGrad(q);
+-        jxx+=g.x*g.x;
+-        jxy+=g.x*g.y;
+-        jyy+=g.y*g.y;
++    ivec2 center=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(center,guideSize)))return;
++    ivec2 mirroredCenter=ivec2(mirrorGuideCoordinate(center.x,guideSize.x),mirrorGuideCoordinate(center.y,guideSize.y));
++    float g0[9],g1[9];float gs=0.0,gs2=0.0;vec3 avg=vec3(0.0);
++    for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++){
++        vec4 rggb=canon(qAt(mirroredCenter+ivec2(x,y)));int idx=(y+1)*3+x+1;
++        if(cfaPattern==2||cfaPattern==3){g0[idx]=rggb.b;g1[idx]=rggb.g;}else{g0[idx]=rggb.g;g1[idx]=rggb.b;}
++        float wx=x==0?.5:.25,wy=y==0?.5:.25;avg+=vec3(rggb.r,.5*(rggb.g+rggb.b),rggb.a)*wx*wy;
++        gs+=rggb.g+rggb.b;gs2+=rggb.g*rggb.g+rggb.b*rggb.b;
+     }
+-
+-    float tr=jxx+jyy;
+-    float disc=sqrt(max((jxx-jyy)*(jxx-jyy)+4.0*jxy*jxy,0.0));
+-    float l1=max(0.5*(tr+disc),0.0);
+-    float l2=max(0.5*(tr-disc),0.0);
+-    vec2 va=vec2(jxy,l1-jxx);
+-    vec2 vb=vec2(l1-jyy,jxy);
+-    float na=dot(va,va),nb=dot(vb,vb);
+-    vec2 e1;
+-    if(max(na,nb)>1.0e-20)e1=normalize(na>=nb?va:vb);
+-    else e1=jxx>=jyy?vec2(1.0,0.0):vec2(0.0,1.0);
+-    vec2 e2=vec2(-e1.y,e1.x);
+-
+-    float A=1.0+sqrt(max((l1-l2)/max(l1+l2,1.0e-20),0.0));
+-    float D=clamp(1.0-sqrt(max(l1,0.0))/max(Dtr,1.0e-8)+Dth,0.0,1.0);
+-    float sk1=1.0+0.5*A*(1.0/max(kShrink,1.0e-8)-1.0);
+-    float sk2=1.0+0.5*A*(kStretch-1.0);
+-    float k1=max(kDetail*((1.0-D)*sk1+D*kDenoise),1.0e-5);
+-    float k2=max(kDetail*((1.0-D)*sk2+D*kDenoise),1.0e-5);
+-    float k1s=k1*k1,k2s=k2*k2;
+-
+-    float xx=k1s*e1.x*e1.x+k2s*e2.x*e2.x;
+-    float xy=k1s*e1.x*e1.y+k2s*e2.x*e2.y;
+-    float yy=k1s*e1.y*e1.y+k2s*e2.y*e2.y;
+-    float det=max(xx*yy-xy*xy,1.0e-12);
+-    mat2 P=mat2(yy,-xy,-xy,xx)/det;
+-    imageStore(outputCov,p,vec4(P[0][0],P[0][1],P[1][0],P[1][1]));
++    float gm=gs/18.0,gv=max(gs2/18.0-gm*gm,0.0);float averageLuma=clamp(dot(avg,vec3(0.25,0.5,0.25)),0.0,1.0);
++    float greenNoise=2.0*max(noiseS*max(averageLuma,0.0)+noiseO,1e-10);
++    mat2 P=precisionFrom(structureTensor(g0,g1),gv,greenNoise);
++    imageStore(outputCov,center,vec4(P[0][0],P[0][1],P[1][0],P[1][1]));
+ }
+diff --git b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl a/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
+index 4e2ec0c..ba1a37b 100644
+--- b/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
++++ a/app/src/main/assets/shaders/motionv2/mfsr_spatial_rgb_contribute_26501.glsl
+@@ -75,13 +75,9 @@ mat2 precisionAt(vec2 sourceRaw){
+     vec4 v=texture(covarianceTexture,uv);
+     return mat2(v.x,v.y,v.z,v.w);
+ }
+-/* IRIS_26542_IPOL_FIGURE7_GAUSSIAN
+- * Algorithm-4 convention: w = exp(-0.5 * d). The previous exp2 form decayed more slowly
+- * and the fixed floor kept cross-edge samples alive even under a highly directional kernel.
+- */
+ float spatialWeight(vec2 offset,mat2 precisionMatrix){
+     float d=max(dot(offset,precisionMatrix*offset),0.0);
+-    return exp(-0.5*d);
++    return exp2(-0.5*d)+0.00005;
+ }
+ float phaseComponent(vec4 v,int q){return q==0?v.r:(q==1?v.g:(q==2?v.b:v.a));}
+ vec3 semanticAxisPhaseWeight(ivec2 outputPixel){
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+index f876b53..f5d0aaf 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2CfaReconstruction.java
+@@ -206,8 +206,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+             GLProg glProg, Point raw, Point rawHalf, Point guideSize,
+             GLTexture rawTexture, GLTexture covarianceTexture,
+             int cfaPattern, float[] blackLevel, float whiteLevel, float exposureScale,
+-            float wbR, float wbB, float greenNoiseS, float greenNoiseO,
+-            float kDetail, float kDenoise, float dTh, float dTr, float kStretch, float kShrink) {
++            float wbR, float wbB, float greenNoiseS, float greenNoiseO) {
+         glProg.setLayout(8, 8, 1);
+         glProg.useAssetProgram("motionv2/mfsr_mgc_covariance", true);
+         glProg.setVar("rawSize", raw);
+@@ -221,12 +220,6 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+         glProg.setVar("exposureScale", exposureScale);
+         glProg.setVar("wbR", wbR);
+         glProg.setVar("wbB", wbB);
+-        glProg.setVar("kDetail", kDetail);
+-        glProg.setVar("kDenoise", kDenoise);
+-        glProg.setVar("Dth", dTh);
+-        glProg.setVar("Dtr", dTr);
+-        glProg.setVar("kStretch", kStretch);
+-        glProg.setVar("kShrink", kShrink);
+         glProg.setTexture("rawTexture", rawTexture);
+         glProg.setTextureCompute("outputCov", covarianceTexture, true);
+         glProg.computeAutoDeferred(guideSize, 1);
+@@ -559,11 +552,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 + " kDetail=" + mfsrKDetail
+                 + " kDenoise=" + mfsrKDenoise
+                 + " Dth=" + mfsrDth
+-                + " Dtr=" + mfsrDtr
+-                + " kStretch=" + mfsrKStretch
+-                + " kShrink=" + mfsrKShrink
+-                + " kernelLaw=IPOL_FIGURE7_LINEAR"
+-                + " spatialGaussian=EXP_NEG_HALF_D");
++                + " Dtr=" + mfsrDtr);
+ 
+         GLTexture referenceRaw = null;
+         GLTexture referenceCfa = null;
+@@ -776,12 +765,6 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                 glProg.setVar("exposureScale", iris26487ReferenceExposureScale);
+                 glProg.setVar("wbR", wronskiWbR);
+                 glProg.setVar("wbB", wronskiWbB);
+-                glProg.setVar("kDetail", mfsrKDetail);
+-                glProg.setVar("kDenoise", mfsrKDenoise);
+-                glProg.setVar("Dth", mfsrDth);
+-                glProg.setVar("Dtr", mfsrDtr);
+-                glProg.setVar("kStretch", mfsrKStretch);
+-                glProg.setVar("kShrink", mfsrKShrink);
+                 glProg.setTexture("rawTexture", referenceRaw);
+                 glProg.setTextureCompute("outputCov", wronskiReferenceCov, true);
+                 glProg.computeAutoDeferred(iris26487GuideSize, 1);
+@@ -978,8 +961,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         referenceRaw, iris26501RgbCovScratch,
+                         (int) parameters.cfaPattern, iris26501ReferenceBlack, iris26501ReferenceWhite,
+                         iris26487ReferenceExposureScale, wronskiGlobalWbR, wronskiGlobalWbB,
+-                        iris26487ReferenceWbNoise[1], iris26487ReferenceWbNoise[4],
+-                        mfsrKDetail, mfsrKDenoise, mfsrDth, mfsrDtr, mfsrKStretch, mfsrKShrink);
++                        iris26487ReferenceWbNoise[1], iris26487ReferenceWbNoise[4]);
+                 iris26501ContributeRgbFrame(
+                         glProg, iris26501RgbFramebuffer, raw, rawHalf,
+                         referenceRaw, iris26501ChromaGuideScratch, wronskiReferenceGuide,
+@@ -1243,12 +1225,6 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                         glProg.setVar("exposureScale",exposure);
+                         glProg.setVar("wbR",wronskiWbR);
+                         glProg.setVar("wbB",wronskiWbB);
+-                        glProg.setVar("kDetail",mfsrKDetail);
+-                        glProg.setVar("kDenoise",mfsrKDenoise);
+-                        glProg.setVar("Dth",mfsrDth);
+-                        glProg.setVar("Dtr",mfsrDtr);
+-                        glProg.setVar("kStretch",mfsrKStretch);
+-                        glProg.setVar("kShrink",mfsrKShrink);
+                         glProg.setTexture("rawTexture",rawInput);
+                         glProg.setTextureCompute("outputCov", wronskiAlterCov, true);
+                         glProg.computeAutoDeferred(iris26487GuideSize, 1);
+@@ -1267,8 +1243,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 rawInput, iris26501RgbCovScratch,
+                                 (int) parameters.cfaPattern, iris26501FrameBlack, iris26501FrameWhite,
+                                 exposure, wronskiWbR, wronskiWbB,
+-                                iris26487WbNoise[1], iris26487WbNoise[4],
+-                                mfsrKDetail, mfsrKDenoise, mfsrDth, mfsrDtr, mfsrKStretch, mfsrKShrink);
++                                iris26487WbNoise[1], iris26487WbNoise[4]);
+                         /* IRIS_26489_REMOVE_PREMERGE_COLOR_SYNTHESIS_AUX
+                          * Covariance/rejection remain; chroma/highlight synthesis is post-merge only.
+                          */
+@@ -1813,8 +1788,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                                 glProg,raw,rawHalf,iris26487GuideSize,
+                                 irisV13ShadowRaw,iris26501ShadowCov,
+                                 (int)parameters.cfaPattern,shadowBlack,shadowWhite,alignmentScale,rr,bb,
+-                                iris26501ShadowWbNoise[1],iris26501ShadowWbNoise[4],
+-                                mfsrKDetail,mfsrKDenoise,mfsrDth,mfsrDtr,mfsrKStretch,mfsrKShrink);
++                                iris26501ShadowWbNoise[1],iris26501ShadowWbNoise[4]);
+                         iris26501RenderChromaGuide(
+                                 glProg,raw,irisV13ShadowRaw,iris26501ChromaGuideScratch,
+                                 (int)parameters.cfaPattern,shadowBlack,shadowWhite,alignmentScale,rr,bb);
+@@ -1938,8 +1912,7 @@ public final class MotionV2CfaReconstruction extends GLOneScript {
+                             iris26480ShortRaw,iris26501ShortCov,
+                             (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
+                             iris26490ShortAlignmentScale,r,b,
+-                            iris26501ShortWbNoise[1],iris26501ShortWbNoise[4],
+-                            mfsrKDetail,mfsrKDenoise,mfsrDth,mfsrDtr,mfsrKStretch,mfsrKShrink);
++                            iris26501ShortWbNoise[1],iris26501ShortWbNoise[4]);
+                     iris26501RenderChromaGuide(
+                             glProg,raw,iris26480ShortRaw,iris26501ChromaGuideScratch,
+                             (int)parameters.cfaPattern,iris26490ShortBlack,iris26490ShortWhite,
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 9e20a3b..9afa292 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -500,28 +500,18 @@ object PhotonMotionMgc1271Bridge {
+                 "rendererSceneWhiteAuthority=referenceDisplayOnly")
+             parameters.motionV2EffectiveSupport = stacked.mergedFrameCount.toFloat()
+ 
+-            /* IRIS_26542_ROLE_AWARE_NORMAL_DNG_PARITY
+-             * The stacked DNG intentionally contains only same-exposure NORMAL observations.
+-             * Motion still has all-normal inputImages, while dedicated Night carries 12 NORMAL
+-             * shorts plus 3 SHADOW_LONG frames in the same MGC list. The old total-list comparison
+-             * therefore aborted a correct Night 12+3 merge after Spatial-RGB had already finished.
+-             */
+-            val expectedNormalDngFrames = inputImages.count {
+-                it.motionV2FrameRole == ImageFrame.MotionV2FrameRole.NORMAL
+-            }
+-            requireParity(expectedNormalDngFrames >= 1,
+-                "normal stacked DNG has no NORMAL source frames totalInputs=${inputImages.size}")
++            /* IRIS_26520_V4_LIVE_MGC_NORMAL_DNG_BRIDGE */
+             if (produceNormalStackedDng) {
+                 requireParity(stacked.normalStackedDngRaw16 != null, "requested normal stacked DNG buffer is missing")
+-                requireParity(stacked.normalStackedDngFrameCount == expectedNormalDngFrames,
+-                    "normal stacked DNG population=${stacked.normalStackedDngFrameCount} expectedNormals=$expectedNormalDngFrames totalInputs=${inputImages.size}")
++                requireParity(stacked.normalStackedDngFrameCount == inputImages.size,
++                    "normal stacked DNG population=${stacked.normalStackedDngFrameCount} normals=${inputImages.size}")
+                 /* IRIS_26522_NORMALIZED16_DNG_METADATA */
+                 requireParity(stacked.normalStackedDngNoiseProfile?.size == 6,
+                     "normalized16 stacked DNG noise profile is missing/invalid")
+                 requireParity(stacked.normalStackedDngNoiseEquivalentSupport.isFinite() &&
+                     stacked.normalStackedDngNoiseEquivalentSupport >= 1f &&
+-                    stacked.normalStackedDngNoiseEquivalentSupport <= expectedNormalDngFrames.toFloat() + 0.01f,
+-                    "normalized16 stacked DNG effective support is invalid normalLimit=$expectedNormalDngFrames")
++                    stacked.normalStackedDngNoiseEquivalentSupport <= inputImages.size.toFloat() + 0.01f,
++                    "normalized16 stacked DNG effective support is invalid")
+             } else {
+                 requireParity(stacked.normalStackedDngRaw16 == null && stacked.normalStackedDngFrameCount == 0,
+                     "DNG sidecar produced without request")
+@@ -535,7 +525,7 @@ object PhotonMotionMgc1271Bridge {
+                 "totalMs=${(System.nanoTime() - iris26535TotalStartNs) / 1_000_000L} " +
+                 "frames=${frames.size} merged=${stacked.mergedFrameCount}")
+             PLog.i(TAG, "IRIS_26512_MGC1271_PARITY_VALID " +
+-                "normals=$expectedNormalDngFrames totalInputs=${inputImages.size} totalScheduled=${frames.size} " +
++                "normals=${inputImages.size} totalScheduled=${frames.size} " +
+                 "photonReference=$referenceTimestamp mgcBase=${mgcBase.timestamp} " +
+                 "long=${if (longFrame != null) 1 else 0} short=${if (shortFrame != null) 1 else 0} " +
+                 "merged=${stacked.mergedFrameCount} cfa=$cfa " +
