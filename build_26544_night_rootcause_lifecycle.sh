@@ -8,6 +8,15 @@ manifest_all(){
   (cd "$root" && find app/src/main app/version.properties app/build.gradle -type f -print0 \
     | LC_ALL=C sort -z | xargs -0 sha256sum) > "$out"
 }
+manifest_audited_live(){
+  local root="$1" out="$2"
+  (cd "$root" && {
+    find app/src/main -type f ! -path 'app/src/main/cpp/third_party_26507/*' ! -path 'app/src/main/cpp/deps/*' -print
+    [[ -f app/src/main/cpp/deps/.gitignore ]] && echo app/src/main/cpp/deps/.gitignore
+    echo app/version.properties
+    echo app/build.gradle
+  } | LC_ALL=C sort | while read -r f; do sha256sum "$f"; done) > "$out"
+}
 
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
@@ -20,6 +29,7 @@ BASE_TAR_SHA="18e380899a2d1817ccdcc840f30ba69290b3a1c6541d9083796062f22d229c48"
 BASE_MANIFEST_SHA="9ac60d97d8ccad91a4957ac23e1bd728166ededcfde622848ed1d09b2f82a8fb"
 VERSION_NAME="0.9726544"
 VERSION_BUILD="26544"
+BJZHOU_VENDOR_HEAD="09c76e57e8f01a5a8fc536ab41fc80ba642d4042"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 
 BASE_PIN="$ROOT/26544_BASE_26543_CANDIDATE_SOURCE.sha256"
@@ -30,6 +40,8 @@ ROLLBACK="$ROOT/26544_RUNTIME_ROLLBACK_TO_26543.patch"
 VALIDATE="$ROOT/validate_26544_night_rootcause_lifecycle.py"
 HANDOFF_HASHES="$ROOT/26544_HANDOFF_HASHES.sha256"
 OLD_GLSL_PREFLIGHT="$ROOT/preflight_26543_changed_syntax.py"
+BJZHOU_MANIFEST="$ROOT/26507_BJZHOU_NATIVE_DEPENDENCIES.sha256"
+BJZHOU_COMMIT_FILE="$ROOT/26507_BJZHOU_DEPENDENCY_COMMIT.txt"
 OUT="$ROOT/build_26544_night_rootcause_lifecycle_outputs"
 WORK="$ROOT/.build_26544_night_rootcause_lifecycle_work"
 ARTZIP="$WORK/26543_artifact.zip"
@@ -39,6 +51,7 @@ AFTER="$WORK/candidate_26544"
 PATCHREPO="$WORK/patchrepo"
 FORWARDCHECK="$WORK/forwardcheck"
 ROLLBACKCHECK="$WORK/rollbackcheck"
+BJ="$WORK/bjzhou_vendor"
 FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-night-rootcause-lifecycle-debug.apk"
 
 mapfile -t RUNTIME_FILES < "$RUNTIME_LIST"
@@ -59,13 +72,14 @@ echo "=== 26544 GATE 0: exact branch / lineage / handoff integrity ==="
 [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch: $(git branch --show-current)"
 git merge-base --is-ancestor "$BASE_26543_HEAD" HEAD || fail "handoff is not descended from exact tested 26543 V1.4"
 [[ -n "$TOKEN" ]] || fail "GitHub token unavailable for exact successful 26543 artifact"
-for f in "$BASE_PIN" "$BASE_TAR_PIN" "$RUNTIME_LIST" "$FORWARD" "$ROLLBACK" "$VALIDATE" "$HANDOFF_HASHES" "$OLD_GLSL_PREFLIGHT"; do
+for f in "$BASE_PIN" "$BASE_TAR_PIN" "$RUNTIME_LIST" "$FORWARD" "$ROLLBACK" "$VALIDATE" "$HANDOFF_HASHES" "$OLD_GLSL_PREFLIGHT" "$BJZHOU_MANIFEST" "$BJZHOU_COMMIT_FILE"; do
   [[ -f "$f" ]] || fail "required file missing: $f"
 done
 sha256sum -c "$HANDOFF_HASHES"
 [[ "$(sha "$BASE_PIN")" == "$BASE_MANIFEST_SHA" ]] || fail "base manifest pin SHA drift"
 [[ "$(wc -l < "$BASE_PIN")" -eq 967 ]] || fail "base manifest pin is not 967 files"
 grep -Fx "$BASE_TAR_SHA  26543_candidate_app_source.tar.gz" "$BASE_TAR_PIN" >/dev/null || fail "base tar pin drift"
+[[ "$(tr -d '\r\n' < "$BJZHOU_COMMIT_FILE")" == "$BJZHOU_VENDOR_HEAD" ]] || fail "26507 bjzhou native dependency pin drift"
 
 python3 - "$BASE_26543_HEAD" <<'PY'
 import subprocess,sys
@@ -200,8 +214,37 @@ cmp -s "$OUT/26544_installed_pre_gradle.sha256" "$OUT/26544_candidate_source.sha
 grep -Fx "VERSION_NAME=$VERSION_NAME" "$ROOT/app/version.properties" >/dev/null || fail "version name not exact"
 grep -Fx "VERSION_BUILD=$VERSION_BUILD" "$ROOT/app/version.properties" >/dev/null || fail "version build not exact"
 python3 "$VALIDATE" --base "$BASE" --candidate "$ROOT" > "$OUT/26544_installed_pre_gradle_contract.txt"
+
+echo "=== 26544 GATE 5B: restore exact proven 26507 native JPEG/UltraHDR source ==="
+rm -rf "$BJ"
+git init -q "$BJ"
+git -C "$BJ" remote add origin https://github.com/bjzhou/PhotonCamera.git
+git -C "$BJ" config core.sparseCheckout true
+mkdir -p "$BJ/.git/info"
+cat > "$BJ/.git/info/sparse-checkout" <<'SPARSE'
+/app/src/main/cpp/libjpeg-turbo/
+/app/src/main/cpp/libultrahdr/
+SPARSE
+git -C "$BJ" fetch --depth=1 origin "$BJZHOU_VENDOR_HEAD"
+git -C "$BJ" checkout -q --detach FETCH_HEAD
+[[ "$(git -C "$BJ" rev-parse HEAD)" == "$BJZHOU_VENDOR_HEAD" ]] || fail "native vendor checkout drift"
+THIRD="$ROOT/app/src/main/cpp/third_party_26507"
+rm -rf "$THIRD"
+mkdir -p "$THIRD"
+cp -a "$BJ/app/src/main/cpp/libjpeg-turbo" "$THIRD/libjpeg-turbo"
+cp -a "$BJ/app/src/main/cpp/libultrahdr" "$THIRD/libultrahdr"
+[[ -f "$THIRD/libjpeg-turbo/CMakeLists.txt" ]] || fail "26507 pinned libjpeg-turbo source missing before Gradle"
+[[ -f "$THIRD/libultrahdr/ultrahdr_api.h" ]] || fail "26507 pinned libultrahdr header missing before Gradle"
+[[ -f "$THIRD/libultrahdr/lib/src/ultrahdr_api.cpp" ]] || fail "26507 pinned libultrahdr source missing before Gradle"
+[[ ! -e "$THIRD/libultrahdr/CMakeLists.txt" ]] || fail "obsolete libultrahdr CMakeLists returned"
+( cd "$THIRD" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26544_vendor_manifest_prebuild.txt"
+manifest_audited_live "$AFTER" "$OUT/26544_candidate_audited_runtime.sha256"
+manifest_audited_live "$ROOT" "$OUT/26544_installed_with_vendor_audited_runtime.sha256"
+cmp -s "$OUT/26544_candidate_audited_runtime.sha256" "$OUT/26544_installed_with_vendor_audited_runtime.sha256" || fail "native vendor bootstrap altered audited Iris runtime source"
+pass "exact successful-26543 native vendor bootstrap restored and pinned before project compiler/assemble"
+
 echo "PRE-BUILD SAFETY PROOF PASSED"
-pass "version increment + exact runtime installation are in this same authoritative build invocation"
+pass "version increment + exact runtime installation + proven native vendor bootstrap are in this same authoritative build invocation"
 
 echo "=== 26544 GATE 6: REAL PROJECT COMPILERS ==="
 chmod +x "$ROOT/gradlew"
@@ -211,14 +254,20 @@ sed -i 's/^REAL JAVA COMPILE:.*/REAL JAVA COMPILE: PASS (:app:compileDebugJavaWi
 pass "REAL KOTLIN COMPILE"
 pass "REAL JAVA COMPILE"
 
+echo "=== 26544 GATE 6B: PERMANENT NATIVE-SOURCE REGRESSION GATE ==="
+[[ -f "$ROOT/app/src/main/cpp/third_party_26507/libjpeg-turbo/CMakeLists.txt" ]] || fail "REGRESSION: 26507 pinned libjpeg-turbo source missing immediately before assemble"
+[[ -f "$ROOT/app/src/main/cpp/third_party_26507/libultrahdr/ultrahdr_api.h" ]] || fail "REGRESSION: 26507 pinned libultrahdr source missing immediately before assemble"
+( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26544_vendor_manifest_preassemble.txt"
+pass "PERMANENT REGRESSION: pinned libjpeg-turbo/libultrahdr source present + manifest exact before assemble"
+
 echo "=== 26544 GATE 7: FULL ANDROID ASSEMBLE ==="
 ./gradlew :app:assembleDebug --stacktrace
 sed -i 's/^FULL ANDROID ASSEMBLE:.*/FULL ANDROID ASSEMBLE: PASS (:app:assembleDebug)/' "$OUT/26544_COMPILER_STATUS.txt"
 pass "FULL ANDROID ASSEMBLE"
 
 echo "=== 26544 GATE 8: post-compiler source invariance + one APK ==="
-manifest_all "$ROOT" "$OUT/26544_post_gradle_runtime.sha256"
-cmp -s "$OUT/26544_post_gradle_runtime.sha256" "$OUT/26544_candidate_source.sha256" || fail "Gradle changed audited runtime source"
+manifest_audited_live "$ROOT" "$OUT/26544_post_gradle_runtime.sha256"
+cmp -s "$OUT/26544_post_gradle_runtime.sha256" "$OUT/26544_candidate_audited_runtime.sha256" || fail "Gradle changed audited runtime source"
 python3 "$VALIDATE" --base "$BASE" --candidate "$ROOT" > "$OUT/26544_postbuild_contract.txt"
 mapfile -t APKS < <(find "$ROOT/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print | sort)
 [[ "${#APKS[@]}" -eq 1 ]] || fail "expected exactly one Gradle APK, got ${#APKS[@]}"
@@ -238,6 +287,7 @@ Iris Night capture/exposure/MGC/post/Jin ownership preserved.
 26543 async live-Camera2-Image spool removed.
 Cold process start forces Motion before Settings construction.
 Process-death evidence: fsync lifecycle + ApplicationExitInfo + process-state summary.
+Native build dependency bootstrap: exact successful-26543 bjzhou libjpeg-turbo/libultrahdr source at 09c76e57e8f01a5a8fc536ab41fc80ba642d4042, manifest-verified before assemble.
 EOF
 tar -czf "$OUT/26544_candidate_app_source.tar.gz" -C "$ROOT" app/src/main app/version.properties app/build.gradle
 sha256sum "$OUT/26544_candidate_app_source.tar.gz" > "$OUT/26544_candidate_app_source.tar.gz.sha256"

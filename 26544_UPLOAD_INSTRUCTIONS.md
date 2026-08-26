@@ -1,4 +1,9 @@
-# Photon 26544 — Night Root-Cause + Lifecycle Correction
+# 26544 V1.1 upload instructions
+
+**V1.1 is a build-procedure-only correction. The six-file 26544 runtime patch, version `0.9726544 / 26544`, Night logic, and all image-processing code are byte-identical to V1.**
+
+The failed V1 Actions run reached and passed real GLSL, Kotlin, and Java compilation, then failed at native CMake configuration with `26507 pinned libjpeg-turbo source missing`. V1.1 restores the exact successful-26543 bjzhou native bootstrap (`09c76e57e8f01a5a8fc536ab41fc80ba642d4042`) before Gradle assemble and adds a permanent pre-assemble regression gate for both `libjpeg-turbo` and `libultrahdr`.
+
 
 Target: **0.9726544 / 26544**
 
