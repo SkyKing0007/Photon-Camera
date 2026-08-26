@@ -1,8 +1,8 @@
-# 26544 V1.1 upload instructions
+# 26544 V1.2 upload instructions
 
-**V1.1 is a build-procedure-only correction. The six-file 26544 runtime patch, version `0.9726544 / 26544`, Night logic, and all image-processing code are byte-identical to V1.**
+**V1.2 is a build-procedure-only correction. The six-file 26544 runtime patch, version `0.9726544 / 26544`, Night logic, and all image-processing code are byte-identical to V1.**
 
-The failed V1 Actions run reached and passed real GLSL, Kotlin, and Java compilation, then failed at native CMake configuration with `26507 pinned libjpeg-turbo source missing`. V1.1 restores the exact successful-26543 bjzhou native bootstrap (`09c76e57e8f01a5a8fc536ab41fc80ba642d4042`) before Gradle assemble and adds a permanent pre-assemble regression gate for both `libjpeg-turbo` and `libultrahdr`.
+The failed V1 run reached and passed real GLSL, Kotlin, and Java compilation, then failed at native CMake configuration with `26507 pinned libjpeg-turbo source missing`. V1.1 restored the exact successful-26543 bjzhou native bootstrap (`09c76e57e8f01a5a8fc536ab41fc80ba642d4042`) before Gradle assemble and adds a permanent pre-assemble regression gate for both `libjpeg-turbo` and `libultrahdr`.
 
 
 Target: **0.9726544 / 26544**
@@ -137,3 +137,19 @@ Use the exact sequence that has been failing:
 If Night still exits, immediately reopen Photon once before exporting PhotonLog. The export should then contain both the failed process’s final `IRIS_26544_NIGHT_*` breadcrumb and `IRIS_26544_PREVIOUS_PROCESS_EXIT ... processState=...` from the new process.
 
 That result will distinguish capture/HAL failure, MGC/native/GPU failure, PostPipeline failure, memory kill, Java crash, JPEG publication failure, or Jin failure without another speculative build.
+
+
+## V1.2 post-build validation correction
+
+V1.2 changes **handoff/build validation only**. The 0.9726544 / 26544 runtime patch is byte-identical to V1/V1.1.
+
+The V1.1 Actions run proved real glslang, Kotlin, Java, native CMake for both ABIs, and `:app:assembleDebug` all PASS. It then falsely failed because the strict 967-file application candidate validator was run against the live tree after the pinned 26507 native vendor subtree had been restored, producing 1744 files.
+
+V1.2 permanently separates those authorities after Gradle:
+
+- audited Iris/application source is compared with the vendor-excluding manifest and must remain unchanged;
+- the exact pinned `third_party_26507` vendor tree is independently rechecked against `26507_BJZHOU_NATIVE_DEPENDENCIES.sha256`;
+- a clean vendor-stripped post-build copy must contain exactly 967 files and pass the original 26544 runtime validator;
+- exactly one Gradle debug APK must exist.
+
+Permanent regression: never compare the pre-vendor 967-file application manifest against the post-vendor augmented source tree.
