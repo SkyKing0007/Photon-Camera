@@ -1,0 +1,2025 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+deleted file mode 100644
+index ed6eb3819ed651123acc11a913ac55afa50e5e0e..0000000000000000000000000000000000000000
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ /dev/null
+@@ -1,86 +0,0 @@
+-package com.hinnka.mycamera.processor
+-
+-import com.hinnka.mycamera.utils.PLog
+-
+-/**
+- * IRIS_26545_SABRE_OWNER
+- * Iris-owned adapter for the pinned MGC Sabre algorithm.
+- *
+- * Native MGC SabreProcessor entry point.
+- *
+- * Sabre has its own frame admission and full merge/resolve pipeline. It does not use Spatial's
+- * Shasta bracket composition, Bento ultrashort path, Spatial Bayer normalization, or Spatial RGB
+- * reconstruction.
+- */
+-internal class GlesIris26545SabreProcessor(
+-    private val width: Int,
+-    private val height: Int,
+-    private val cfaPattern: Int,
+-    private val blackLevel: FloatArray,
+-    private val whiteLevel: Int,
+-    private val whiteBalanceGains: FloatArray,
+-    private val noiseProfileSelection: RawNoiseProfileSelection,
+-    private val lensShading: FloatArray?,
+-    private val lensShadingWidth: Int,
+-    private val lensShadingHeight: Int,
+-    private val useCurrentGlContext: Boolean,
+-    private val exportGpuLinearRgbSource: Boolean,
+-    private val gpuLinearRgbStorage: GpuLinearRgbStorage,
+-    private val exportNormalStackedDng: Boolean,
+-) {
+-    fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+-        if (frames.isEmpty()) return null
+-        if (cfaPattern !in 0..3) {
+-            PLog.e(TAG, "MGC Sabre supports only the four 2x2 Bayer layouts; cfa=$cfaPattern")
+-            frames.forEach { it.image.close() }
+-            return null
+-        }
+-
+-        val baseIndex = frames.indexOfFirst { it.role == RawBurstFrameRole.NORMAL }
+-        if (baseIndex < 0) {
+-            PLog.e(TAG, "MGC Sabre has no NORMAL base frame")
+-            frames.forEach { it.image.close() }
+-            return null
+-        }
+-        val admittedIndices = buildList {
+-            add(baseIndex)
+-            frames.indices.filterTo(this) { index ->
+-                index != baseIndex && frames[index].role == RawBurstFrameRole.NORMAL
+-            }
+-        }
+-        val admittedSet = admittedIndices.toSet()
+-        val excluded = frames.indices.filterNot(admittedSet::contains)
+-        excluded.forEach { frames[it].image.close() }
+-        val admitted = admittedIndices.map(frames::get)
+-        PLog.i(
+-            TAG,
+-            "IRIS_26545_SABRE_OWNER_ACTIVE base=${frames[baseIndex].frameNumber} " +
+-                "regular=${admitted.size} excludedBracketed=${excluded.size} " +
+-                "spatial=false bento=false output=linear-rgb",
+-        )
+-        return GlesMgcRawSpatialStacker(
+-            width = width,
+-            height = height,
+-            cfaPattern = cfaPattern,
+-            blackLevel = blackLevel,
+-            whiteLevel = whiteLevel,
+-            whiteBalanceGains = whiteBalanceGains,
+-            noiseProfileSelection = noiseProfileSelection,
+-            lensShading = lensShading,
+-            lensShadingWidth = lensShadingWidth,
+-            lensShadingHeight = lensShadingHeight,
+-            outputMode = MgcSpatialOutputMode.RGB,
+-            mergeMethod = MgcMergeMethod.SABRE,
+-            outputScale = 1f,
+-            useCurrentGlContext = useCurrentGlContext,
+-            exportGpuLinearRgbSource = exportGpuLinearRgbSource,
+-            gpuLinearRgbStorage = gpuLinearRgbStorage,
+-            processorPipeline = MgcRawProcessorPipeline.SABRE,
+-            exportNormalStackedDng = exportNormalStackedDng,
+-        ).processFrames(admitted)
+-    }
+-
+-    private companion object {
+-        const val TAG = "Iris26545Sabre"
+-    }
+-}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index 027d910cf5eb5111a89b5ba92dc976e23cd845f8..43db1fcfcbb60f1d71dea492077bee6b5bcc178d 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -53,7 +53,7 @@ internal class GlesMgcRawFusion(
+             return null
+         }
+         if (mergeMethod == MgcMergeMethod.SABRE) {
+-            return GlesIris26545SabreProcessor(
++            return GlesMgcRawSabreProcessor(
+                 width = width,
+                 height = height,
+                 cfaPattern = cfaPattern,
+@@ -67,7 +67,6 @@ internal class GlesMgcRawFusion(
+                 useCurrentGlContext = useCurrentGlContext,
+                 exportGpuLinearRgbSource = exportGpuLinearRgbSource,
+                 gpuLinearRgbStorage = gpuLinearRgbStorage,
+-                exportNormalStackedDng = exportNormalStackedDng,
+             ).processFrames(frames)
+         }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 02f9adf8e008f6de17839661a16bf7ea58188156..59633cd435b694fd7eaea508cf4b78239e1e8fbd 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -52,8 +52,7 @@ internal object GlesMgcRawSabreShaders {
+         uniform vec4 uCovRangeRgFactors;
+         uniform vec2 uCovRangeBFactor;
+         uniform float uGreenClippingPoint;
+-        // IRIS_26545 current Sabre contract: x is a strict 0/1 switch.
+-        uniform vec4 uForceReferenceColorRgb;
++        uniform float uForceReferenceColorRgb;
+         layout(location = 0) out vec4 oGuide;
+         layout(location = 1) out vec4 oCovariance;
+ 
+@@ -238,7 +237,7 @@ internal object GlesMgcRawSabreShaders {
+ 
+             vec3 referenceColor;
+             float referenceVariance;
+-            if (greenVariance > 3.0 * greenNoise && uForceReferenceColorRgb.x == 0.0) {
++            if (greenVariance > 3.0 * greenNoise && uForceReferenceColorRgb == 0.0) {
+                 referenceColor = vec3(averageRgb.x, centerGreen, averageRgb.z);
+                 referenceVariance = -max(rgbVariance.y, greenVariance);
+             } else {
+@@ -399,7 +398,6 @@ internal object GlesMgcRawSabreShaders {
+         uniform sampler2D uFlow;
+         uniform sampler2D uCovariance;
+         uniform sampler2D uRejection;
+-        uniform vec4 uFlowScaleOffset;
+         uniform ivec2 uExtractedSize;
+         uniform ivec2 uOutputSize;
+         uniform vec4 uFrameBorderPadded;
+@@ -560,10 +558,7 @@ internal object GlesMgcRawSabreShaders {
+ 
+         void main() {
+             vec2 referenceUv = gl_FragCoord.xy / vec2(uOutputSize);
+-            vec2 flowUv =
+-                referenceUv * uFlowScaleOffset.xy +
+-                uFlowScaleOffset.zw;
+-            vec4 flow = texture(uFlow, flowUv);
++            vec4 flow = texture(uFlow, referenceUv);
+             vec2 sampleUv = mirrorUvs(referenceUv + flow.xy);
+             vec3 covariance = unpackCovariance(texture(uCovariance, sampleUv).xyz);
+             vec3 accumulatedColor = vec3(0.0);
+@@ -584,192 +579,6 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-    /**
+-     * IRIS_26545_SABRE_SPARSE_FLOW_CONTRACT
+-     * Sabre-only reproduction of MGC ConvertAlignmentHalide. Keep the LK grid sparse; each
+-     * consumer interpolates it with an explicit reference-UV scale/offset instead of first
+-     * materializing a dense flow image.
+-     */
+-    val convertAlignmentSparse = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uAlignment;
+-        uniform ivec2 uGridSize;
+-        uniform float uAlignmentScale;
+-        uniform vec2 uFlowNormalizationSize;
+-        out vec4 oFlow;
+-        vec2 flowAt(ivec2 p) {
+-            return texelFetch(
+-                uAlignment,
+-                clamp(p, ivec2(0), uGridSize - ivec2(1)),
+-                0
+-            ).xy * uAlignmentScale;
+-        }
+-        void main() {
+-            ivec2 tile = ivec2(gl_FragCoord.xy);
+-            vec2 flowPixels = flowAt(tile);
+-            vec2 minimumFlow = vec2(1.0e20);
+-            vec2 maximumFlow = vec2(-1.0e20);
+-            for (int y = -1; y <= 1; ++y) {
+-                for (int x = -1; x <= 1; ++x) {
+-                    vec2 v = flowAt(tile + ivec2(x, y));
+-                    minimumFlow = min(minimumFlow, v);
+-                    maximumFlow = max(maximumFlow, v);
+-                }
+-            }
+-            vec2 uvFlow = flowPixels / uFlowNormalizationSize;
+-            vec2 normalizedRange =
+-                (maximumFlow - minimumFlow) /
+-                max(uFlowNormalizationSize, vec2(1.0));
+-            float localFlowVariation = length(normalizedRange);
+-            oFlow = vec4(uvFlow, localFlowVariation, 0.0);
+-        }
+-    """.trimIndent()
+-
+-    /**
+-     * IRIS_26545_SABRE_NORMALIZED16_DNG
+-     * RAW-only companion to Sabre merge. It consumes the exact Sabre sparse flow, covariance
+-     * and temporal rejection, but accumulates only the reference-CFA color in black-subtracted
+-     * normalized sensor units. No ResolveSabre/demosaic, WB, lens shading, denoise, tone or
+-     * sharpening is present in this sidecar path.
+-     */
+-    val normalDngMerge = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        precision highp usampler2D;
+-        uniform highp usampler2D uRaw;
+-        uniform sampler2D uFlow;
+-        uniform sampler2D uCovariance;
+-        uniform sampler2D uRejection;
+-        uniform vec4 uFlowScaleOffset;
+-        uniform ivec2 uRawSize;
+-        uniform vec4 uFrameBorderPadded;
+-        uniform int uCfaPattern;
+-        uniform int uUseFrameWeight;
+-        uniform vec4 uPhaseGains;
+-        uniform vec4 uPhaseBlackTerms;
+-        uniform vec4 uCovRangeRg;
+-        uniform vec2 uCovRangeB;
+-        layout(location = 0) out vec2 oSignalAndWeight;
+-
+-        vec2 mirrorUvs(vec2 sampleUv) {
+-            if (sampleUv.x <= uFrameBorderPadded.x)
+-                sampleUv.x = 2.0 * uFrameBorderPadded.x - sampleUv.x;
+-            if (sampleUv.y <= uFrameBorderPadded.y)
+-                sampleUv.y = 2.0 * uFrameBorderPadded.y - sampleUv.y;
+-            if (sampleUv.x > uFrameBorderPadded.z)
+-                sampleUv.x = 2.0 * uFrameBorderPadded.z - sampleUv.x;
+-            if (sampleUv.y > uFrameBorderPadded.w)
+-                sampleUv.y = 2.0 * uFrameBorderPadded.w - sampleUv.y;
+-            return sampleUv;
+-        }
+-
+-        int mirrorCoordinate(int coordinate, int extent) {
+-            if (extent <= 1) return 0;
+-            if (coordinate < 0) coordinate = -coordinate - 1;
+-            if (coordinate >= extent) coordinate = 2 * extent - coordinate - 1;
+-            return clamp(coordinate, 0, extent - 1);
+-        }
+-
+-        ivec2 mirrorPixel(ivec2 p) {
+-            return ivec2(
+-                mirrorCoordinate(p.x, uRawSize.x),
+-                mirrorCoordinate(p.y, uRawSize.y)
+-            );
+-        }
+-
+-        int phaseAt(ivec2 p) {
+-            return ((p.y & 1) << 1) + (p.x & 1);
+-        }
+-
+-        int canonicalChannelForPhase(int phase) {
+-            if (uCfaPattern == 1) {
+-                if (phase == 0) return 1;
+-                if (phase == 1) return 0;
+-                if (phase == 2) return 3;
+-                return 2;
+-            }
+-            if (uCfaPattern == 2) {
+-                if (phase == 0) return 2;
+-                if (phase == 1) return 3;
+-                if (phase == 2) return 0;
+-                return 1;
+-            }
+-            if (uCfaPattern == 3) {
+-                if (phase == 0) return 3;
+-                if (phase == 1) return 2;
+-                if (phase == 2) return 1;
+-                return 0;
+-            }
+-            return phase;
+-        }
+-
+-        bool sameCfaColor(int targetCanonical, int sampleCanonical) {
+-            bool targetGreen = targetCanonical == 1 || targetCanonical == 2;
+-            bool sampleGreen = sampleCanonical == 1 || sampleCanonical == 2;
+-            return targetGreen ? sampleGreen : targetCanonical == sampleCanonical;
+-        }
+-
+-        float normalizedRaw(ivec2 p) {
+-            p = mirrorPixel(p);
+-            int phase = phaseAt(p);
+-            return float(texelFetch(uRaw, p, 0).r) * uPhaseGains[phase] +
+-                uPhaseBlackTerms[phase];
+-        }
+-
+-        float kernelWeight(vec2 pixelOffset, vec3 covariance) {
+-            float kernelDistance =
+-                pixelOffset.x * pixelOffset.x * covariance.x +
+-                pixelOffset.y * pixelOffset.y * covariance.y +
+-                pixelOffset.x * pixelOffset.y * covariance.z * 2.0;
+-            return exp2(-0.5 * kernelDistance) + 0.00005;
+-        }
+-
+-        vec3 unpackCovariance(vec3 packed) {
+-            return vec3(
+-                packed.x * uCovRangeRg.y + uCovRangeRg.x,
+-                packed.y * uCovRangeRg.w + uCovRangeRg.z,
+-                packed.z * uCovRangeB.y + uCovRangeB.x
+-            );
+-        }
+-
+-        void main() {
+-            ivec2 outputPixel = ivec2(gl_FragCoord.xy);
+-            vec2 referenceUv = gl_FragCoord.xy / vec2(uRawSize);
+-            vec2 flowUv =
+-                referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+-            vec2 flow = texture(uFlow, flowUv).xy;
+-            vec2 sampleUv = mirrorUvs(referenceUv + flow);
+-            vec3 covariance = unpackCovariance(texture(uCovariance, sampleUv).xyz);
+-            vec2 sourcePixel = sampleUv * vec2(uRawSize);
+-            ivec2 anchor = ivec2(floor(sourcePixel));
+-            vec2 subpixelOffset = vec2(anchor) + vec2(0.5) - sourcePixel;
+-            int targetCanonical = canonicalChannelForPhase(phaseAt(outputPixel));
+-            float intensity = 0.0;
+-            float accumulatedWeight = 0.0;
+-            for (int y = -1; y <= 1; ++y) {
+-                for (int x = -1; x <= 1; ++x) {
+-                    ivec2 samplePixel = anchor + ivec2(x, y);
+-                    ivec2 mirrored = mirrorPixel(samplePixel);
+-                    int sampleCanonical = canonicalChannelForPhase(phaseAt(mirrored));
+-                    if (!sameCfaColor(targetCanonical, sampleCanonical)) continue;
+-                    float w = kernelWeight(subpixelOffset + vec2(x, y), covariance);
+-                    intensity += normalizedRaw(samplePixel) * w;
+-                    accumulatedWeight += w;
+-                }
+-            }
+-            float frameWeight = uUseFrameWeight != 0
+-                ? texture(uRejection, referenceUv).r
+-                : 1.0;
+-            oSignalAndWeight = vec2(
+-                intensity * frameWeight,
+-                accumulatedWeight * frameWeight
+-            );
+-        }
+-    """.trimIndent()
+-
+     val copyMask = """
+         #version 300 es
+         precision highp float;
+@@ -793,38 +602,6 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-    /**
+-     * IRIS_26545_SABRE_MEASURED_SUPPORT
+-     * Current Sabre Q8 average-merge-factor diagnostic. Four-by-four reduction keeps readback
+-     * small while preserving the global mean of 256 / accumulated green weight.
+-     */
+-    val reciprocalGreenWeight4x4 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uAccumulatedWeightsGb;
+-        uniform ivec2 uInputSize;
+-        layout(location = 0) out vec2 oReciprocalSumAndCount;
+-        void main() {
+-            ivec2 base = ivec2(gl_FragCoord.xy) * 4;
+-            float reciprocalSum = 0.0;
+-            float sampleCount = 0.0;
+-            for (int y = 0; y < 4; ++y) {
+-                for (int x = 0; x < 4; ++x) {
+-                    ivec2 p = base + ivec2(x, y);
+-                    if (p.x >= uInputSize.x || p.y >= uInputSize.y) {
+-                        continue;
+-                    }
+-                    float weight = texelFetch(uAccumulatedWeightsGb, p, 0).r;
+-                    float weightQ8 = max(floor(weight * 256.0 + 0.5), 1.0);
+-                    reciprocalSum += 256.0 / weightQ8;
+-                    sampleCount += 1.0;
+-                }
+-            }
+-            oReciprocalSumAndCount = vec2(reciprocalSum, sampleCount);
+-        }
+-    """.trimIndent()
+-
+     val dehomogenize = """
+         #version 300 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 828f39dbf33a3ce5e766d33b1bf817e53966dcb7..f6dbf962afc52803398765e7473d1ef86f5f1628 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -8,7 +8,6 @@ import android.opengl.EGLDisplay
+ import android.opengl.EGLSurface
+ import android.opengl.GLES30
+ import android.opengl.GLES31
+-import android.util.Half
+ import com.hinnka.mycamera.camera.MultiFrameConfig
+ import com.hinnka.mycamera.model.SafeImage
+ import com.hinnka.mycamera.raw.MgcSpatialStrengthMap
+@@ -56,7 +55,6 @@ internal class GlesMgcRawSpatialStacker(
+     private val exportGpuLinearRgbSource: Boolean,
+     private val gpuLinearRgbStorage: GpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16UI,
+     private val processorPipeline: MgcRawProcessorPipeline = MgcRawProcessorPipeline.SPATIAL,
+-    private val exportNormalStackedDng: Boolean = false,
+ ) {
+     private data class TextureLevel(
+         val texture: Int,
+@@ -74,25 +72,6 @@ internal class GlesMgcRawSpatialStacker(
+         val gridMin: Int,
+     )
+ 
+-    /** IRIS_26545 Sabre owns sparse normalized flow plus its sampling transform. */
+-    private data class SabreConvertedAlignment(
+-        val texture: Int,
+-        val scaleX: Float,
+-        val scaleY: Float,
+-        val offsetX: Float,
+-        val offsetY: Float,
+-    ) {
+-        companion object {
+-            fun constant(texture: Int) = SabreConvertedAlignment(
+-                texture = texture,
+-                scaleX = 0f,
+-                scaleY = 0f,
+-                offsetX = 0.5f,
+-                offsetY = 0.5f,
+-            )
+-        }
+-    }
+-
+     /** Reference-only LK products shared by every current frame at one pyramid level. */
+     private data class ReferenceAlignmentProducts(
+         val referenceTexture: Int,
+@@ -467,13 +446,10 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreExtractBayerProgram = 0
+     private var sabreGuideAndCovarianceProgram = 0
+     private var sabreMergeProgram = 0
+-    private var sabreNormalDngMergeProgram = 0
+     private var sabreCopyMaskProgram = 0
+     private var sabreCopyAlphaProgram = 0
+-    private var sabreReciprocalGreenWeightProgram = 0
+     private var sabreDehomogenizeProgram = 0
+     private var sabreOutputTransformProgram = 0
+-    private var sabreConvertAlignmentSparseProgram = 0
+     private var currentMergeCovariance = 0
+     private var mergeRgbProgram = 0
+     private var normalizeBayerProgram = 0
+@@ -1966,9 +1942,6 @@ internal class GlesMgcRawSpatialStacker(
+         var cpuOutput: ByteBuffer? = null
+         var sabreAccumulatedReadback: ByteBuffer? = null
+         var sabreResolvedRgb: ByteBuffer? = null
+-        var normalStackedDngRaw16: ByteBuffer? = null
+-        var normalStackedDngSupport = SabreNormalDngSupportStats.identity()
+-        var normalStackedDngNoiseProfile: DoubleArray? = null
+         var exportedTexture = 0
+         var returned = false
+         val originalThreadPriority = GlesGpuScheduler.lowerCurrentThreadPriority(SABRE_TAG)
+@@ -2040,16 +2013,6 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_R8,
+                 GLES30.GL_LINEAR,
+             )
+-            /* IRIS_26545_SABRE_NORMALIZED16_DNG
+-             * Keep only signal+weight for the RAW sidecar. It uses the exact Sabre flow,
+-             * covariance and temporal rejection but never ResolveSabre, WB/color transform,
+-             * lens shading, denoise, tone, sharpening or JPEG processing.
+-             */
+-            val normalDngAccumulator = if (exportNormalStackedDng) {
+-                createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
+-            } else {
+-                0
+-            }
+             clearSabreAccumulators(
+                 accumulatedColor,
+                 accumulatedWeightsGb,
+@@ -2057,9 +2020,6 @@ internal class GlesMgcRawSpatialStacker(
+                 coverageWidth,
+                 coverageHeight,
+             )
+-            if (normalDngAccumulator != 0) {
+-                clearSabreNormalDngAccumulator(normalDngAccumulator)
+-            }
+ 
+             val referenceExposure = validExposureProduct(frames.first().exposureProduct)
+             val kernelTuning = createBayerKernelTuning(
+@@ -2076,6 +2036,9 @@ internal class GlesMgcRawSpatialStacker(
+                 desiredExposureProduct = frames.first().desiredExposureProduct,
+                 actualExposureProduct = frames.first().exposureProduct,
+             )
++            val sabreNoiseModelScale = classicSabreNoiseModelScale(
++                kernelTuning.referenceSnr,
++            )
+             val referenceCalibration = calibrationForFrame(
+                 frame = frames.first(),
+                 exposureScale = 1f,
+@@ -2094,6 +2057,7 @@ internal class GlesMgcRawSpatialStacker(
+                     "${sabreKernelParameters.gradientTransition}," +
+                     "${sabreKernelParameters.anisotropyScale}," +
+                     "${sabreKernelParameters.coherenceScale} " +
++                    "coefficientScale=$sabreNoiseModelScale " +
+                     "guideColorSpace=sqrt noiseLut=qmc64x10 " +
+                     "alignmentInputGain=${referenceCalibration.alignmentGain} " +
+                     "alignmentDomain=signed-s16",
+@@ -2116,7 +2080,7 @@ internal class GlesMgcRawSpatialStacker(
+             )
+             val referenceGrayPyramid = buildGrayPyramid(referenceRaw, referenceCalibration)
+             val referenceAlignmentProducts = buildReferenceAlignmentProducts(referenceGrayPyramid)
+-            val zeroFlow = SabreConvertedAlignment.constant(createZeroFlowTexture())
++            val zeroFlow = createZeroFlowTexture()
+             val identityWeight = createIdentityWeightTexture()
+             val accumulatedWeightScale = maxSabreAccumulatedWeight(frames.size)
+             renderSabreMerge(
+@@ -2131,17 +2095,6 @@ internal class GlesMgcRawSpatialStacker(
+                 extractedHeight = extractedHeight,
+                 useFrameWeight = false,
+             )
+-            if (normalDngAccumulator != 0) {
+-                renderSabreNormalDngMerge(
+-                    raw = referenceRaw,
+-                    flow = zeroFlow,
+-                    covariance = referenceCovariance,
+-                    weight = identityWeight,
+-                    calibration = referenceCalibration,
+-                    accumulator = normalDngAccumulator,
+-                    useFrameWeight = false,
+-                )
+-            }
+             GlesGpuScheduler.yieldToUiRenderer()
+ 
+             for (index in 1 until frames.size) {
+@@ -2171,7 +2124,13 @@ internal class GlesMgcRawSpatialStacker(
+                     currentGrayPyramid,
+                     referenceAlignmentProducts,
+                 )
+-                val flow = createSabreConvertedAlignment(alignment)
++                val flow = createTexture(
++                    extractedWidth,
++                    extractedHeight,
++                    GLES30.GL_RGBA16F,
++                    GLES30.GL_LINEAR,
++                )
++                renderConvertedAlignment(alignment, flow)
+                 val unblockerWidth = ceilDiv(width, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+                 val unblockerHeight = ceilDiv(height, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+                 val unblocker = createTexture(
+@@ -2236,17 +2195,6 @@ internal class GlesMgcRawSpatialStacker(
+                     extractedHeight = extractedHeight,
+                     useFrameWeight = true,
+                 )
+-                if (normalDngAccumulator != 0) {
+-                    renderSabreNormalDngMerge(
+-                        raw = currentRaw,
+-                        flow = flow,
+-                        covariance = currentCovariance,
+-                        weight = frameWeight,
+-                        calibration = calibration,
+-                        accumulator = normalDngAccumulator,
+-                        useFrameWeight = true,
+-                    )
+-                }
+                 PLog.i(
+                     SABRE_TAG,
+                     "MGC Sabre frame=$index/${frames.lastIndex} number=${frame.frameNumber} " +
+@@ -2256,50 +2204,6 @@ internal class GlesMgcRawSpatialStacker(
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+ 
+-            /* IRIS_26545_SABRE_MEASURED_SUPPORT
+-             * Match current MGC/Sabre behavior: derive the merged noise coefficient from the
+-             * actual accumulated green weights after all temporal rejection/merge decisions.
+-             * This is measured support, not a pre-merge SNR lookup.
+-             */
+-            val sabreAverageMergeFactor = readSabreAverageMergeFactor(
+-                accumulatedWeightsGb = accumulatedWeightsGb,
+-            )
+-            val sabreNoiseModelScale = sabreAverageMergeFactor
+-            PLog.i(
+-                SABRE_TAG,
+-                "MGC Sabre merged NoiseModel averageMergeFactor=$sabreAverageMergeFactor " +
+-                    "coefficientScale=$sabreNoiseModelScale",
+-            )
+-
+-            if (normalDngAccumulator != 0) {
+-                val normalizedDngTexture = renderBayer16(
+-                    accumulator = normalDngAccumulator,
+-                    outputExposureScale = 1f,
+-                )
+-                normalStackedDngRaw16 = readBayer16(normalizedDngTexture)
+-                releaseOwnedTexture(normalizedDngTexture, "Sabre normalized16 DNG readback")
+-                normalStackedDngSupport = resolveSabreNormalDngSupportStats(
+-                    accumulatedCoverage = accumulatedCoverage,
+-                    coverageWidth = coverageWidth,
+-                    coverageHeight = coverageHeight,
+-                    accumulatedWeightScale = accumulatedWeightScale,
+-                    frameCount = frames.size,
+-                    sabreNoiseModelScale = sabreNoiseModelScale,
+-                )
+-                normalStackedDngNoiseProfile = createSabreNormalDngNoiseProfile(
+-                    frames = frames,
+-                    support = normalStackedDngSupport,
+-                )
+-                PLog.i(
+-                    SABRE_TAG,
+-                    "IRIS_26545_SABRE_NORMALIZED16_DNG_READY normalFrames=${frames.size} " +
+-                        "sameSabreFlow=true sameSabreRejection=true sameSabreCovariance=true " +
+-                        "resolveSabre=false demosaic=false wb=false lsc=false denoise=false " +
+-                        "tone=false sharpen=false fullRangeNormalized16=true blackLevel=0 whiteLevel=65535 " +
+-                        "support=${normalStackedDngSupport}",
+-                )
+-            }
+-
+             renderSabreDehomogenize(
+                 accumulatedColor,
+                 accumulatedWeightsGb,
+@@ -2423,20 +2327,9 @@ internal class GlesMgcRawSpatialStacker(
+                 lensShadingCorrectionApplied = hasLensShading(),
+                 mergedFrameCount = frames.size,
+                 mgcSabreNoiseModelScale = sabreNoiseModelScale,
+-                mgcReferenceSnr = kernelTuning.referenceSnr,
+-                mgcDenoiseTuningSnr = kernelTuning.referenceSnr / sqrt(sabreNoiseModelScale),
++                mgcDenoiseTuningSnr = kernelTuning.referenceSnr,
+                 mgcSharpenTuningSnr = kernelTuning.referenceSnr,
+                 mgcSharpenAttenuationScale = sabreResolveParameters.demosaicSharpness,
+-                normalStackedDngRaw16 = normalStackedDngRaw16,
+-                normalStackedDngFrameCount = if (exportNormalStackedDng) frames.size else 0,
+-                normalStackedDngNoiseProfile = normalStackedDngNoiseProfile,
+-                normalStackedDngSupportMin = normalStackedDngSupport.minimum,
+-                normalStackedDngSupportP01 = normalStackedDngSupport.p01,
+-                normalStackedDngSupportP10 = normalStackedDngSupport.p10,
+-                normalStackedDngSupportMedian = normalStackedDngSupport.median,
+-                normalStackedDngSupportMean = normalStackedDngSupport.mean,
+-                normalStackedDngSupportMax = normalStackedDngSupport.maximum,
+-                normalStackedDngNoiseEquivalentSupport = normalStackedDngSupport.noiseEquivalent,
+             )
+         } catch (error: Exception) {
+             PLog.e(SABRE_TAG, "MGC Sabre merge failed", error)
+@@ -2449,7 +2342,6 @@ internal class GlesMgcRawSpatialStacker(
+             LargeDirectBuffer.free(sabreResolvedRgb)
+             if (!returned) {
+                 LargeDirectBuffer.free(cpuOutput)
+-                LargeDirectBuffer.free(normalStackedDngRaw16)
+                 if (exportedTexture != 0) {
+                     GLES30.glDeleteTextures(1, intArrayOf(exportedTexture), 0)
+                 }
+@@ -2457,177 +2349,6 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private data class SabreNormalDngSupportStats(
+-        val minimum: Float,
+-        val p01: Float,
+-        val p10: Float,
+-        val median: Float,
+-        val mean: Float,
+-        val maximum: Float,
+-        val noiseEquivalent: Float,
+-    ) {
+-        companion object {
+-            fun identity() = SabreNormalDngSupportStats(1f, 1f, 1f, 1f, 1f, 1f, 1f)
+-        }
+-    }
+-
+-    private fun clearSabreNormalDngAccumulator(accumulator: Int) {
+-        check(accumulator != 0)
+-        bindRenderTargets(intArrayOf(accumulator), "clear Sabre normalized16 DNG accumulator")
+-        GLES30.glViewport(0, 0, width, height)
+-        GLES30.glClearBufferfv(
+-            GLES30.GL_COLOR,
+-            0,
+-            floatArrayOf(0f, 0f, 0f, 0f),
+-            0,
+-        )
+-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-    }
+-
+-    private fun renderSabreNormalDngMerge(
+-        raw: Int,
+-        flow: SabreConvertedAlignment,
+-        covariance: Int,
+-        weight: Int,
+-        calibration: FrameCalibration,
+-        accumulator: Int,
+-        useFrameWeight: Boolean,
+-    ) {
+-        check(exportNormalStackedDng && sabreNormalDngMergeProgram != 0 && accumulator != 0)
+-        val program = sabreNormalDngMergeProgram
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uRaw", 0, raw)
+-        bindTexture(program, "uFlow", 1, flow.texture)
+-        bindTexture(program, "uCovariance", 2, covariance)
+-        bindTexture(program, "uRejection", 3, weight)
+-        uniformSabreFlowScaleOffset(program, flow)
+-        uniform2i(program, "uRawSize", width, height)
+-        uniform4f(
+-            program,
+-            "uFrameBorderPadded",
+-            SABRE_SAMPLE_BORDER_PIXELS / width,
+-            SABRE_SAMPLE_BORDER_PIXELS / height,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
+-        )
+-        uniform1i(program, "uCfaPattern", cfaPattern)
+-        uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
+-        uniform4fv(program, "uPhaseGains", calibration.bayerPhaseGains)
+-        uniform4fv(program, "uPhaseBlackTerms", calibration.bayerPhaseBlackTerms)
+-        uniform4f(
+-            program,
+-            "uCovRangeRg",
+-            COV_MIN_R,
+-            COV_MAX_R - COV_MIN_R,
+-            COV_MIN_G,
+-            COV_MAX_G - COV_MIN_G,
+-        )
+-        uniform2f(program, "uCovRangeB", COV_MIN_B, COV_MAX_B - COV_MIN_B)
+-        GLES30.glEnable(GLES30.GL_BLEND)
+-        try {
+-            GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
+-            GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
+-            draw(
+-                program,
+-                width,
+-                height,
+-                intArrayOf(accumulator),
+-                preserveBlend = true,
+-            )
+-        } finally {
+-            GLES30.glDisable(GLES30.GL_BLEND)
+-        }
+-    }
+-
+-    private fun resolveSabreNormalDngSupportStats(
+-        accumulatedCoverage: Int,
+-        coverageWidth: Int,
+-        coverageHeight: Int,
+-        accumulatedWeightScale: Float,
+-        frameCount: Int,
+-        sabreNoiseModelScale: Float,
+-    ): SabreNormalDngSupportStats {
+-        require(exportNormalStackedDng && accumulatedCoverage != 0 && frameCount >= 1)
+-        val byteCount = Math.multiplyExact(coverageWidth, coverageHeight)
+-        val readback = ByteBuffer.allocateDirect(byteCount).order(ByteOrder.nativeOrder())
+-        bindRenderTargets(intArrayOf(accumulatedCoverage), "Sabre DNG temporal support readback")
+-        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+-        GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
+-        GLES30.glReadPixels(
+-            0, 0, coverageWidth, coverageHeight,
+-            GLES30.GL_RED, GLES30.GL_UNSIGNED_BYTE, readback,
+-        )
+-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-        checkGlError("Sabre DNG temporal support readback")
+-
+-        val total = coverageWidth * coverageHeight
+-        val stride = max(1, total / SABRE_DNG_SUPPORT_MAX_SAMPLES)
+-        val sampleCount = (total + stride - 1) / stride
+-        val values = FloatArray(sampleCount)
+-        var out = 0
+-        var index = 0
+-        while (index < total) {
+-            val encoded = readback.get(index).toInt() and 0xff
+-            val temporal = encoded / 255f * accumulatedWeightScale
+-            values[out++] = (1f + temporal).coerceIn(1f, frameCount.toFloat())
+-            index += stride
+-        }
+-        val used = if (out == values.size) values else values.copyOf(out)
+-        used.sort()
+-        var sum = 0.0
+-        var reciprocal = 0.0
+-        used.forEach { value ->
+-            sum += value.toDouble()
+-            reciprocal += 1.0 / value.toDouble()
+-        }
+-        fun percentile(fraction: Float): Float {
+-            val i = ((used.size - 1) * fraction).toInt().coerceIn(0, used.lastIndex)
+-            return used[i]
+-        }
+-        val harmonicCoverage = (used.size.toDouble() / reciprocal).toFloat()
+-            .coerceIn(1f, frameCount.toFloat())
+-        val mergeEquivalent = (1f / sabreNoiseModelScale.coerceAtLeast(1.0e-6f))
+-            .coerceIn(1f, frameCount.toFloat())
+-        val noiseEquivalent = minOf(harmonicCoverage, mergeEquivalent)
+-        return SabreNormalDngSupportStats(
+-            minimum = used.first(),
+-            p01 = percentile(0.01f),
+-            p10 = percentile(0.10f),
+-            median = percentile(0.50f),
+-            mean = (sum / used.size.toDouble()).toFloat(),
+-            maximum = used.last(),
+-            noiseEquivalent = noiseEquivalent,
+-        )
+-    }
+-
+-    private fun createSabreNormalDngNoiseProfile(
+-        frames: List<RawStackFrame>,
+-        support: SabreNormalDngSupportStats,
+-    ): DoubleArray {
+-        require(frames.isNotEmpty())
+-        val referenceModel = frames.first().channelNoiseProfile
+-            ?.let(RawNoiseModel::fromCamera2NoiseProfile)
+-            ?.takeIf { it.hasValidCamera2Profile }
+-            ?: noiseModelForFrame(frames.first())
+-        val shot = referenceModel.normalizedShotNoiseForShader(cfaPattern)
+-        val read = referenceModel.normalizedReadNoiseForShader(cfaPattern)
+-        val divisor = support.noiseEquivalent.coerceAtLeast(1f).toDouble()
+-        fun sane(value: Float): Double =
+-            value.takeIf { it.isFinite() && it >= 0f }?.toDouble() ?: 0.0
+-        return doubleArrayOf(
+-            sane(shot[0]) / divisor,
+-            sane(read[0]) / divisor,
+-            0.5 * (sane(shot[1]) + sane(shot[2])) / divisor,
+-            0.5 * (sane(read[1]) + sane(read[2])) / divisor,
+-            sane(shot[3]) / divisor,
+-            sane(read[3]) / divisor,
+-        ).also { profile ->
+-            check(profile.all { it.isFinite() && it >= 0.0 }) {
+-                "26545 Sabre normalized16 DNG noise profile is invalid"
+-            }
+-        }
+-    }
+-
+     private fun renderSabreExtract(
+         raw: Int,
+         output: Int,
+@@ -2658,10 +2379,10 @@ internal class GlesMgcRawSpatialStacker(
+         uniform4f(
+             program,
+             "uFrameBorderPadded",
+-            SABRE_GUIDE_BORDER_PIXELS / width,
+-            SABRE_GUIDE_BORDER_PIXELS / height,
+-            1f - SABRE_GUIDE_BORDER_PIXELS / width,
+-            1f - SABRE_GUIDE_BORDER_PIXELS / height,
++            SABRE_KERNEL_BORDER_PIXELS / width,
++            SABRE_KERNEL_BORDER_PIXELS / height,
++            1f - SABRE_KERNEL_BORDER_PIXELS / width,
++            1f - SABRE_KERNEL_BORDER_PIXELS / height,
+         )
+         uniform1i(program, "uCfaPattern", cfaPattern)
+         uniform4fv(program, "uGains", calibration.gains)
+@@ -2684,19 +2405,14 @@ internal class GlesMgcRawSpatialStacker(
+             covariancePackScale(kernelParameters.covarianceMinB, kernelParameters.covarianceMaxB),
+         )
+         uniform1f(program, "uGreenClippingPoint", calibration.greenClippingPoint)
+-        uniform4f(
+-            program,
+-            "uForceReferenceColorRgb",
+-            if (kernelParameters.forceReferenceColorRgb) 1f else 0f,
+-            0f, 0f, 0f,
+-        )
++        uniform1f(program, "uForceReferenceColorRgb", 0f)
+         draw(program, guideWidth, guideHeight, intArrayOf(guide, covariance))
+     }
+ 
+     private fun renderSabreRejection(
+         referenceGuide: Int,
+         currentGuide: Int,
+-        flow: SabreConvertedAlignment,
++        flow: Int,
+         unblocker: Int,
+         noiseTexture: Int,
+         reverseWeight: Int,
+@@ -2708,7 +2424,7 @@ internal class GlesMgcRawSpatialStacker(
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uBaseGuide", 0, referenceGuide)
+         bindTexture(program, "uAltGuide", 1, currentGuide)
+-        bindTexture(program, "uFlow", 2, flow.texture)
++        bindTexture(program, "uFlow", 2, flow)
+         bindTexture(program, "uUnblocker", 3, unblocker)
+         bindTexture(program, "uNoiseEstimates", 4, noiseTexture)
+         uniform2i(program, "uGuideSize", guideWidth, guideHeight)
+@@ -2716,12 +2432,12 @@ internal class GlesMgcRawSpatialStacker(
+         uniform4f(
+             program,
+             "uFrameBorderPadded",
+-            SABRE_SAMPLE_BORDER_PIXELS / width,
+-            SABRE_SAMPLE_BORDER_PIXELS / height,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
++            SABRE_KERNEL_BORDER_PIXELS / width,
++            SABRE_KERNEL_BORDER_PIXELS / height,
++            1f - SABRE_KERNEL_BORDER_PIXELS / width,
++            1f - SABRE_KERNEL_BORDER_PIXELS / height,
+         )
+-        uniformSabreFlowScaleOffset(program, flow)
++        uniform4f(program, "uFlowScaleOffset", 1f, 1f, 0f, 0f)
+         uniform2f(program, "uUnblockerScale", 1f, 1f)
+         uniform4f(program, "uNoiseTextureScaleBias", 0.9f, 0.5f, 0.05f, 0.25f)
+         uniform2f(
+@@ -2730,13 +2446,9 @@ internal class GlesMgcRawSpatialStacker(
+             MgcSabreRejectionTuning.COLOR_DIFFERENCE_RGB,
+             MgcSabreRejectionTuning.COLOR_DIFFERENCE_GREEN,
+         )
+-        val flowVariationThresholds =
+-            MgcSabreRejectionTuning.flowVariationThresholds(ceilDiv(width, 2))
+-        uniform1f(
+-            program,
+-            "uUnblockerReductionThreshold",
+-            flowVariationThresholds.unblockerReduction,
+-        )
++        val flowVariationThreshold =
++            MgcSabreRejectionTuning.flowVariationThreshold(guideWidth)
++        uniform1f(program, "uUnblockerReductionThreshold", flowVariationThreshold)
+         uniform1f(
+             program,
+             "uExtraMotionRobustnessBoost",
+@@ -2747,11 +2459,7 @@ internal class GlesMgcRawSpatialStacker(
+             "uMotionRobustnessBoostVarianceThreshold",
+             MgcSabreRejectionTuning.MOTION_ROBUSTNESS_VARIANCE_THRESHOLD,
+         )
+-        uniform1f(
+-            program,
+-            "uExtraMotionRobustnessMotionThreshold",
+-            flowVariationThresholds.extraMotionRobustness,
+-        )
++        uniform1f(program, "uExtraMotionRobustnessMotionThreshold", flowVariationThreshold)
+         draw(program, guideWidth, guideHeight, intArrayOf(reverseWeight, pixelDifference))
+     }
+ 
+@@ -2796,7 +2504,7 @@ internal class GlesMgcRawSpatialStacker(
+ 
+     private fun renderSabreMerge(
+         extracted: Int,
+-        flow: SabreConvertedAlignment,
++        flow: Int,
+         covariance: Int,
+         weight: Int,
+         calibration: FrameCalibration,
+@@ -2809,19 +2517,18 @@ internal class GlesMgcRawSpatialStacker(
+         val program = sabreMergeProgram
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uExtractedBayer", 0, extracted)
+-        bindTexture(program, "uFlow", 1, flow.texture)
++        bindTexture(program, "uFlow", 1, flow)
+         bindTexture(program, "uCovariance", 2, covariance)
+         bindTexture(program, "uRejection", 3, weight)
+         uniform2i(program, "uExtractedSize", extractedWidth, extractedHeight)
+         uniform2i(program, "uOutputSize", width, height)
+-        uniformSabreFlowScaleOffset(program, flow)
+         uniform4f(
+             program,
+             "uFrameBorderPadded",
+-            SABRE_SAMPLE_BORDER_PIXELS / width,
+-            SABRE_SAMPLE_BORDER_PIXELS / height,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
++            SABRE_KERNEL_BORDER_PIXELS / width,
++            SABRE_KERNEL_BORDER_PIXELS / height,
++            1f - SABRE_KERNEL_BORDER_PIXELS / width,
++            1f - SABRE_KERNEL_BORDER_PIXELS / height,
+         )
+         uniform1i(program, "uCfaPattern", cfaPattern)
+         uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
+@@ -2907,81 +2614,6 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    /**
+-     * IRIS_26545_SABRE_MEASURED_SUPPORT
+-     * Reproduce the current Sabre global mean of 256 / accumulated-green-weight-Q8.
+-     * The value is transported as the merged-noise coefficient scale and therefore reflects
+-     * the frames Sabre actually trusted, rather than the nominal burst length.
+-     */
+-    private fun readSabreAverageMergeFactor(
+-        accumulatedWeightsGb: Int,
+-    ): Float {
+-        val reducedWidth = ceilDiv(width, 4)
+-        val reducedHeight = ceilDiv(height, 4)
+-        val reduced = createTexture(
+-            reducedWidth,
+-            reducedHeight,
+-            GLES30.GL_RG16F,
+-            GLES30.GL_NEAREST,
+-        )
+-        try {
+-            GLES30.glUseProgram(sabreReciprocalGreenWeightProgram)
+-            bindTexture(
+-                sabreReciprocalGreenWeightProgram,
+-                "uAccumulatedWeightsGb",
+-                0,
+-                accumulatedWeightsGb,
+-            )
+-            uniform2i(sabreReciprocalGreenWeightProgram, "uInputSize", width, height)
+-            draw(
+-                sabreReciprocalGreenWeightProgram,
+-                reducedWidth,
+-                reducedHeight,
+-                intArrayOf(reduced),
+-            )
+-
+-            val valueCount = Math.multiplyExact(
+-                Math.multiplyExact(reducedWidth, reducedHeight),
+-                2,
+-            )
+-            val readback = ByteBuffer.allocateDirect(
+-                Math.multiplyExact(valueCount, Short.SIZE_BYTES),
+-            ).order(ByteOrder.nativeOrder())
+-            bindRenderTargets(intArrayOf(reduced), "Iris Sabre reciprocal green-weight readback")
+-            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+-            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
+-            GLES30.glReadPixels(
+-                0,
+-                0,
+-                reducedWidth,
+-                reducedHeight,
+-                GLES30.GL_RG,
+-                GLES30.GL_HALF_FLOAT,
+-                readback,
+-            )
+-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-            checkGlError("read Iris Sabre reciprocal green weights")
+-
+-            val values = readback.asShortBuffer()
+-            var reciprocalSum = 0.0
+-            var sampleCount = 0.0
+-            for (index in 0 until reducedWidth * reducedHeight) {
+-                reciprocalSum += Half.toFloat(values.get(index * 2)).toDouble()
+-                sampleCount += Half.toFloat(values.get(index * 2 + 1)).toDouble()
+-            }
+-            check(
+-                reciprocalSum.isFinite() && sampleCount.isFinite() &&
+-                    reciprocalSum > 0.0 && sampleCount > 0.0
+-            ) {
+-                "Iris Sabre accumulated green weights produced an invalid merge factor: " +
+-                    "sum=$reciprocalSum count=$sampleCount"
+-            }
+-            return (reciprocalSum / sampleCount).toFloat()
+-        } finally {
+-            releaseOwnedTexture(reduced, "Iris Sabre reciprocal green-weight reduction")
+-        }
+-    }
+-
+     private fun renderSabreOutputTransform(
+         resolvedRgbPlanes: IntArray,
+         lensShadingTexture: Int,
+@@ -3164,10 +2796,6 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun initSabrePrograms() {
+-        sabreConvertAlignmentSparseProgram = linkProgram(
+-            GlesMgcRawSabreShaders.convertAlignmentSparse,
+-            "iris_26545_sabre_convert_alignment_sparse",
+-        )
+         sabreExtractBayerProgram = linkProgram(
+             GlesMgcRawSabreShaders.extractBayer,
+             "mgc_sabre_extract_bayer",
+@@ -3211,16 +2839,6 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
+-        if (exportNormalStackedDng) {
+-            sabreNormalDngMergeProgram = linkProgram(
+-                GlesMgcRawSabreShaders.normalDngMerge,
+-                "iris_26545_sabre_normal_dng_merge",
+-            )
+-            normalizeBayerProgram = linkProgram(
+-                GlesMgcRawSpatialShaders.normalizeBayer,
+-                "iris_26545_sabre_normal_dng_normalize16",
+-            )
+-        }
+         sabreCopyMaskProgram = linkProgram(
+             GlesMgcRawSabreShaders.copyMask,
+             "mgc_sabre_copy_mask",
+@@ -3229,10 +2847,6 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.copyAlpha,
+             "mgc_sabre_copy_alpha",
+         )
+-        sabreReciprocalGreenWeightProgram = linkProgram(
+-            GlesMgcRawSabreShaders.reciprocalGreenWeight4x4,
+-            "iris_26545_sabre_reciprocal_green_weight_4x4",
+-        )
+         sabreDehomogenizeProgram = linkProgram(
+             GlesMgcRawSabreShaders.dehomogenize,
+             "mgc_sabre_dehomogenize",
+@@ -3700,6 +3314,30 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     /** Classic Sabre table at libgcastartup.so+0x00bc67dc, consumed by 0x388396c. */
++    private fun classicSabreNoiseModelScale(referenceSnr: Float): Float {
++        val snr = referenceSnr.takeIf { it.isFinite() } ?: 0f
++        val reduction = when {
++            snr <= SABRE_DENOISE_SNR_LOW -> SABRE_DENOISE_REDUCTION_LOW
++            snr < SABRE_DENOISE_SNR_MID -> {
++                val amount = (snr - SABRE_DENOISE_SNR_LOW) /
++                    (SABRE_DENOISE_SNR_MID - SABRE_DENOISE_SNR_LOW)
++                SABRE_DENOISE_REDUCTION_LOW +
++                    amount * (SABRE_DENOISE_REDUCTION_MID - SABRE_DENOISE_REDUCTION_LOW)
++            }
++            snr < SABRE_DENOISE_SNR_HIGH -> {
++                val amount = (snr - SABRE_DENOISE_SNR_MID) /
++                    (SABRE_DENOISE_SNR_HIGH - SABRE_DENOISE_SNR_MID)
++                SABRE_DENOISE_REDUCTION_MID +
++                    amount * (SABRE_DENOISE_REDUCTION_HIGH - SABRE_DENOISE_REDUCTION_MID)
++            }
++            else -> SABRE_DENOISE_REDUCTION_HIGH
++        }
++        // MergeRaw passes 1 / reduction as the equivalent sample count to
++        // NoiseModel::Average(). Average() takes its reciprocal, so the coefficients that
++        // leave Sabre are multiplied by the table value itself.
++        return reduction
++    }
++
+     private fun resolveNoiseModelForFrame(frame: RawStackFrame): ResolvedRawNoiseModel =
+         RawNoiseModelResolver.resolve(
+             selection = noiseProfileSelection,
+@@ -4199,61 +3837,6 @@ internal class GlesMgcRawSpatialStacker(
+         )
+     }
+ 
+-    private fun createSabreConvertedAlignment(alignment: Alignment): SabreConvertedAlignment {
+-        require(alignment.gridWidth > 0 && alignment.gridHeight > 0)
+-        val strideInBayerQuads = alignment.tileStride.toFloat() * alignment.scaleToBayerQuads
+-        require(strideInBayerQuads.isFinite() && strideInBayerQuads > 0f)
+-        val output = createTexture(
+-            alignment.gridWidth,
+-            alignment.gridHeight,
+-            GLES30.GL_RGBA16F,
+-            GLES30.GL_LINEAR,
+-        )
+-        GLES30.glUseProgram(sabreConvertAlignmentSparseProgram)
+-        bindTexture(sabreConvertAlignmentSparseProgram, "uAlignment", 0, alignment.texture)
+-        uniform2i(
+-            sabreConvertAlignmentSparseProgram,
+-            "uGridSize",
+-            alignment.gridWidth,
+-            alignment.gridHeight,
+-        )
+-        uniform1f(
+-            sabreConvertAlignmentSparseProgram,
+-            "uAlignmentScale",
+-            alignment.scaleToBayerQuads,
+-        )
+-        val bayerQuadWidth = ceilDiv(width, 2)
+-        val bayerQuadHeight = ceilDiv(height, 2)
+-        uniform2f(
+-            sabreConvertAlignmentSparseProgram,
+-            "uFlowNormalizationSize",
+-            bayerQuadWidth.toFloat(),
+-            bayerQuadHeight.toFloat(),
+-        )
+-        draw(
+-            sabreConvertAlignmentSparseProgram,
+-            alignment.gridWidth,
+-            alignment.gridHeight,
+-            intArrayOf(output),
+-        )
+-        val scaleX = bayerQuadWidth.toFloat() /
+-            (strideInBayerQuads * alignment.gridWidth.toFloat())
+-        val scaleY = bayerQuadHeight.toFloat() /
+-            (strideInBayerQuads * alignment.gridHeight.toFloat())
+-        val offsetX = -alignment.gridMin.toFloat() / alignment.gridWidth.toFloat()
+-        val offsetY = -alignment.gridMin.toFloat() / alignment.gridHeight.toFloat()
+-        check(scaleX.isFinite() && scaleY.isFinite() && offsetX.isFinite() && offsetY.isFinite())
+-        return SabreConvertedAlignment(output, scaleX, scaleY, offsetX, offsetY)
+-    }
+-
+-    private fun uniformSabreFlowScaleOffset(program: Int, flow: SabreConvertedAlignment) {
+-        uniform4f(
+-            program,
+-            "uFlowScaleOffset",
+-            flow.scaleX, flow.scaleY, flow.offsetX, flow.offsetY,
+-        )
+-    }
+-
+     private fun renderConvertedAlignment(alignment: Alignment, output: Int) {
+         GLES30.glUseProgram(convertAlignmentProgram)
+         bindTexture(convertAlignmentProgram, "uAlignment", 0, alignment.texture)
+@@ -8919,19 +8502,22 @@ internal class GlesMgcRawSpatialStacker(
+         const val TAG = "GlesMgcRawSpatial"
+         const val SABRE_TAG = "GlesMgcRawSabre"
+         const val SABRE_READBACK_ROWS = 64
+-        const val SABRE_DNG_SUPPORT_MAX_SAMPLES = 262144
+         // MGC 9.6.080 SabreKernelParams defaults. BuildSabreKernelParamsForSnr tunes only the
+         // first six floats; these two Resolve interpolation endpoints remain 3 and 4. The
+         // original wrapper converts them to scale=-range*frameCount and bias=end/range.
+         const val SABRE_DEMOSAIC_BLEND_START = 3f
+         const val SABRE_DEMOSAIC_BLEND_END = 4f
+         const val SABRE_RESOLVE_INPUT_WHITE_LEVEL = 16384f
+-        // Guide/covariance has a wider MGC footprint than rejection/RBF sampling.
+-        const val SABRE_GUIDE_BORDER_PIXELS = 2.5f
+-        const val SABRE_SAMPLE_BORDER_PIXELS = 1.5f
++        const val SABRE_KERNEL_BORDER_PIXELS = 1.5f
+         const val SABRE_SIGNAL_LINEAR_HISTOGRAM_BITS = 10
+         const val SABRE_SIGNAL_LINEAR_HISTOGRAM_BINS = 1 shl SABRE_SIGNAL_LINEAR_HISTOGRAM_BITS
+         const val SABRE_SIGNAL_ROW_STEP = 8
++        const val SABRE_DENOISE_SNR_LOW = 0.5f
++        const val SABRE_DENOISE_REDUCTION_LOW = 0.8f
++        const val SABRE_DENOISE_SNR_MID = 4f
++        const val SABRE_DENOISE_REDUCTION_MID = 1f
++        const val SABRE_DENOISE_SNR_HIGH = 10f
++        const val SABRE_DENOISE_REDUCTION_HIGH = 0.7f
+         const val EGL_OPENGL_ES3_BIT_KHR = 0x00000040
+         const val RAW_BYTES_PER_PIXEL = 2
+         const val RGB_RAW_WINDOW_SLOTS = 2
+@@ -9006,5 +8592,6 @@ internal class GlesMgcRawSpatialStacker(
+         const val BENTO_MAX_ULTRASHORT_CLIPPING_OVERLAP = 0.62f
+         const val LONG_FRAME_RAW_CLIPPING_THRESHOLD = 250f / 255f
+ 
++        // The independent classic-Sabre 0x3882c20 table is represented by SABRE_DENOISE_*.
+     }
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt b/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt
+index 3447dad0b404557932c7374b82ea16a4ab630672..e6ab17e337b7edca01c18833d4beca01150f8585 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt
+@@ -18,7 +18,6 @@ internal object MgcSabreKernelTuning {
+         val gradientTransition: Float,
+         val anisotropyScale: Float,
+         val coherenceScale: Float,
+-        val forceReferenceColorRgb: Boolean,
+         val demosaicBlendStart: Float = 3f,
+         val demosaicBlendEnd: Float = 4f,
+         val covarianceMinR: Float = 0.3671880066f,
+@@ -77,9 +76,6 @@ internal object MgcSabreKernelTuning {
+             ),
+             anisotropyScale = interpolate(effectiveSnr, 16f to 3f),
+             coherenceScale = interpolate(effectiveSnr, 16f to 1.5f),
+-            // Current MGC Sabre GuideImage uses this as a strict switch. Low-SNR captures
+-            // force the filtered RGB guide; higher-SNR captures may use center green.
+-            forceReferenceColorRgb = finiteSnr <= 10f,
+         )
+     }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreRejectionTuning.kt b/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreRejectionTuning.kt
+index 96a51baa0d91aa491c57be56b7affaef58ce4b91..a887b6392980c9e2d7d8ff9e4b701b960d64cce7 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreRejectionTuning.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreRejectionTuning.kt
+@@ -1,32 +1,22 @@
+ package com.hinnka.mycamera.processor
+ 
+-/** IRIS_26545 current MGC Sabre rejection constants without app-level tunable ownership. */
++/** MGC 9.6.080 Sabre/Spatial rejection defaults and runtime resolution scaling. */
+ internal object MgcSabreRejectionTuning {
+-    data class FlowVariationThresholds(
+-        val unblockerReduction: Float,
+-        val extraMotionRobustness: Float,
+-    )
+-
+     const val COLOR_DIFFERENCE_RGB = 0.07f
+     const val COLOR_DIFFERENCE_GREEN = 0.35f
+     const val EXTRA_MOTION_ROBUSTNESS_BOOST = 6f
+     const val MOTION_ROBUSTNESS_VARIANCE_THRESHOLD = 25f
+ 
+-    private const val REFERENCE_FLOW_WIDTH = 2016f
++    private const val REFERENCE_GUIDE_WIDTH = 2016f
+     private const val BASE_FLOW_VARIATION_THRESHOLD = 1e-4f
+ 
+-    /** MGC V25 normalizes both rejection thresholds by the Bayer-quad flow coordinate width. */
+-    fun flowVariationThresholds(flowNormalizationWidth: Int): FlowVariationThresholds {
+-        require(flowNormalizationWidth > 0)
+-        val threshold = REFERENCE_FLOW_WIDTH / flowNormalizationWidth.toFloat() *
++    /**
++     * GenerateRejectionTexture scales both flow-variation thresholds by the guide width.
++     * Recovered from libgcastartup.so 0x3492dd0..0x3492e84.
++     */
++    fun flowVariationThreshold(guideWidth: Int): Float {
++        require(guideWidth > 0)
++        return REFERENCE_GUIDE_WIDTH / guideWidth.toFloat() *
+             BASE_FLOW_VARIATION_THRESHOLD
+-        return FlowVariationThresholds(
+-            unblockerReduction = threshold,
+-            extraMotionRobustness = threshold,
+-        )
+     }
+-
+-    /** Compatibility for the unchanged Iris Spatial control path. */
+-    fun flowVariationThreshold(guideWidth: Int): Float =
+-        flowVariationThresholds(guideWidth).unblockerReduction
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt b/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
+index 454ab6c5fad7a077bcc91c4e80732c2c98ad1ff9..a8f9b75654b3ce96ad6d32c1ae955af2afd5424f 100644
+--- a/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
++++ b/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
+@@ -255,10 +255,10 @@ internal object MgcFullResolutionDenoise {
+             } else {
+                 1f
+             }
+-            // IRIS_26545_MEASURED_SABRE_RESIDUAL_NOISE
+-            // Sabre transports the measured post-merge Q8 average green-weight factor. Apply that
+-            // measured residual coefficient scale uniformly to the physical MGC-base read/shot
+-            // model. Do not apply the retired second reference-SNR lookup-table scale.
++            // MergeRaw passes the reciprocal SNR-table reduction as an equivalent sample count
++            // to NoiseModel::Average() at libgcastartup.so+0x5e97a84. Average() takes the
++            // reciprocal again, so the table reduction itself is applied uniformly to read,
++            // shot and quadratic coefficients. The physical camera model has no quadratic term.
+             rgbShot = FloatArray(3) { channel ->
+                 resolvedNoise.shot[channel] * sabreNoiseModelScale
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 7cec3683f4a54f1c4dbca0949d3933ced12acbc3..f445354ca1535119db34b2da94e95ff19242d3ee 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -592,7 +592,6 @@ private void ApplyHdrX() {
+         String iris26532SuperResLinearRawPath = null;
+         int iris26532SuperResLinearRawWidth = 0;
+         int iris26532SuperResLinearRawHeight = 0;
+-        boolean iris26545SabreSelected = false;
+ 
+         /*
+          * IRIS_26379_PRODUCTION_DIAGNOSTIC_CLEANUP
+@@ -660,15 +659,12 @@ private void ApplyHdrX() {
+             iris26522DngSupportMean = iris26409V2.dngSupportMean;
+             iris26522DngSupportMax = iris26409V2.dngSupportMax;
+             iris26522DngNoiseEquivalentSupport = iris26409V2.dngNoiseEquivalentSupport;
+-            iris26545SabreSelected = iris26409V2.sabreSelected;
+             if (saveRAW >= 1 && iris26480DeferredDng == null) {
+-                throw new IllegalStateException("26545 Motion DNG requested but reconstruction sidecar is missing");
++                throw new IllegalStateException("26520 stacked DNG requested but live MGC sidecar is missing");
+             }
+             if (saveRAW >= 1 && iris26409V2.dngStackFrames != iris26520ExpectedNormalFrames) {
+-                throw new IllegalStateException("26545 JPEG-normal/DNG-normal population mismatch reconstruction="
+-                        + (iris26545SabreSelected ? "SABRE" : "SPATIAL_RGB")
+-                        + " admittedNormal=" + iris26520ExpectedNormalFrames
+-                        + " dng=" + iris26409V2.dngStackFrames);
++                throw new IllegalStateException("26520 JPEG-normal/DNG-normal population mismatch admittedNormal="
++                        + iris26520ExpectedNormalFrames + " dng=" + iris26409V2.dngStackFrames);
+             }
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26520_V4_SHARED_NORMAL_BATCH_DNG",
+@@ -685,10 +681,8 @@ private void ApplyHdrX() {
+                             + " dngSupportMax=" + iris26409V2.dngSupportMax
+                             + " dngNoiseEquivalentSupport=" + iris26409V2.dngNoiseEquivalentSupport
+                             + " dngDomain=normalized16 blackLevel=0 whiteLevel=65535"
+-                            + " sameAdmittedNormalPopulation=true"
+-                            + " shortLongBentoExcludedFromDng=true"
+-                            + " reconstruction=" + (iris26545SabreSelected ? "SABRE" : "SPATIAL_RGB")
+-                            + " secondAlignmentPass=false");
++                            + " sameAdmittedNormalPopulation=true shortLongBentoExcludedFromDng=true"
++                            + " secondAlignmentPass=false c4ffRgbOwnerUnchanged=true");
+             if (saveRAW == 2) {
+                 final boolean iris26532SrDng = processingParameters.motionV2SuperResOutputEnabled
+                         && iris26532SuperResLinearRawPath != null
+@@ -833,9 +827,9 @@ private void ApplyHdrX() {
+ 
+         Bitmap img;
+         if (cameraMode == CameraMode.MOTION) {
+-            /* IRIS_26545_MOTION_LINEAR_RGB_PRODUCTION_AUTHORITY
+-             * PhotonMotionMgc1271Bridge.raw is the selected Iris reconstruction's full-resolution
+-             * linear RGB carrier. DNG evidence is always separate and never aliases RGB.
++            /* IRIS_26534_MOTION_SPATIAL_RGB_PRODUCTION_AUTHORITY
++             * PhotonMotionMgc1271Bridge.raw is the full-resolution MGC Spatial-RGB production
++             * carrier after the pinned chroma denoise. stackedDngRaw16 is export evidence only.
+              * Standard Bayer therefore re-enters the proven direct-RGB post graph and is never
+              * reinterpreted as CFA or demosaiced again.
+              */
+@@ -849,8 +843,8 @@ private void ApplyHdrX() {
+                 if (iris26480DeferredDng != null && output == iris26480DeferredDng)
+                     throw new IllegalStateException("26534 Motion production carrier aliases DNG sidecar");
+                 com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+-                        "IRIS_26545_MOTION_LINEAR_RGB_PRODUCTION_AUTHORITY",
+-                        "jpegCarrier=" + (iris26545SabreSelected ? "MGC_SABRE_RESOLVE_RGBA32F" : "MGC_SPATIAL_RGB_RGBA32F")
++                        "IRIS_26534_MOTION_SPATIAL_RGB_PRODUCTION_AUTHORITY",
++                        "jpegCarrier=MGC_SPATIAL_RGB_RGBA32F"
+                                 + " dngCarrier=normalized16_sidecar_separate"
+                                 + " rcdBypassed=true demosaicBypassed=true"
+                                 + " postEntry=RunMotionV2FloatCfa");
+@@ -958,7 +952,7 @@ private void ApplyHdrX() {
+                             dngSupportMin,dngSupportP01,dngSupportP10,dngSupportMedian,
+                             dngSupportMean,dngSupportMax,dngNoiseEquivalent);
+                 }
+-                processingEventsListener.notifyImageSavedStatus(saved,dngPath);Log.d(TAG,"IRIS_26545_DEFERRED_DNG_FINISHED saved="+saved+" normalizedStacked=true srLinearRaw="+srLinearDng);
++                processingEventsListener.notifyImageSavedStatus(saved,dngPath);Log.d(TAG,"IRIS_26480_DEFERRED_DNG_FINISHED saved="+saved+" srLinearRaw="+srLinearDng);
+             }catch(Exception e){Log.e(TAG,"IRIS_26480_DEFERRED_DNG_FAILED "+Log.getStackTraceString(e));}
+             finally{try{Allocator.free(dngBytes);}catch(Throwable ignored){}
+                 if(srLinearRawPath!=null)try{java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(srLinearRawPath));}catch(Throwable ignored){}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+index 33e7397717f5dbbc27a7a19e3aafe2ef5e75f03c..060e6309d8bb0442708ea0b04dedd418d6551250 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+@@ -8,20 +8,15 @@ import java.util.Locale;
+ 
+ /**
+  * IRIS_26514_MOTION_USER_CONTROLS_OWNER
+- * One Motion settings boundary for the stable Iris/MGC runtime. Values are snapped to exact
+- * tenths before use so UI drag and persisted-value paths cannot diverge.
++ * One per-lens settings boundary for the stable Motion/MGC runtime. Values are snapped to
++ * exact tenths before use so UI drag and manual-entry paths cannot diverge.
+  */
+ public final class IrisMotionSettings {
+-    public static final String KEY_RECONSTRUCTION = "pref_iris_motion_reconstruction";
+     public static final String KEY_CUSTOM_NOISE_MODEL = "pref_iris_custom_noise_model";
+     public static final String KEY_IMPORT_NOISE_MODEL = "pref_iris_import_noise_model";
+     public static final String KEY_PROFILE_ID = "pref_iris_custom_noise_profile_id";
+     public static final String KEY_PROFILE_NAME = "pref_iris_custom_noise_profile_name";
+-    /* IRIS_26545_FUNCTIONAL_LUMA_DENOISE_V2
+-     * The old pref_iris_luma_denoise value was stored while Motion luma was hard-disabled.
+-     * Use a fresh key so upgrading cannot silently turn luma smoothing on at the old 1.0 value.
+-     */
+-    public static final String KEY_LUMA_DENOISE = "pref_iris_luma_denoise_v2";
++    public static final String KEY_LUMA_DENOISE = "pref_iris_luma_denoise";
+     public static final String KEY_CHROMA_DENOISE = "pref_iris_chroma_denoise";
+     public static final String KEY_EXPOSURE_EV = "pref_iris_exposure_ev";
+     public static final String KEY_SHADOWS = "pref_iris_shadows";
+@@ -29,21 +24,7 @@ public final class IrisMotionSettings {
+ 
+     private IrisMotionSettings() {}
+ 
+-    public enum Reconstruction {
+-        SPATIAL_RGB("spatial_rgb"),
+-        SABRE("sabre");
+-
+-        public final String persistedValue;
+-        Reconstruction(String persistedValue) { this.persistedValue = persistedValue; }
+-
+-        static Reconstruction fromPersisted(String value) {
+-            if (SABRE.persistedValue.equalsIgnoreCase(value)) return SABRE;
+-            return SPATIAL_RGB;
+-        }
+-    }
+-
+     public static final class Snapshot {
+-        public final Reconstruction reconstruction;
+         public final boolean noiseReductionEnabled;
+         public final boolean customNoiseModelEnabled;
+         public final String profileId;
+@@ -54,8 +35,7 @@ public final class IrisMotionSettings {
+         public final float shadows;
+         public final float contrast;
+ 
+-        Snapshot(Reconstruction reconstruction,
+-                 boolean noiseReductionEnabled,
++        Snapshot(boolean noiseReductionEnabled,
+                  boolean customNoiseModelEnabled,
+                  String profileId,
+                  String profileDisplayName,
+@@ -64,7 +44,6 @@ public final class IrisMotionSettings {
+                  float exposureEv,
+                  float shadows,
+                  float contrast) {
+-            this.reconstruction = reconstruction == null ? Reconstruction.SPATIAL_RGB : reconstruction;
+             this.noiseReductionEnabled = noiseReductionEnabled;
+             this.customNoiseModelEnabled = customNoiseModelEnabled;
+             this.profileId = profileId == null ? "" : profileId;
+@@ -85,20 +64,18 @@ public final class IrisMotionSettings {
+     public static Snapshot current() {
+         SettingsManager sm = PhotonCamera.getSettingsManagerStatic();
+         if (sm == null) {
+-            return new Snapshot(Reconstruction.SPATIAL_RGB, true, false, "", "", 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
++            return new Snapshot(true, false, "", "", 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
+         }
+-        Reconstruction reconstruction = Reconstruction.fromPersisted(
+-                getString(sm, KEY_RECONSTRUCTION, Reconstruction.SPATIAL_RGB.persistedValue));
+         boolean nr = PreferenceKeys.isHdrxNrOn();
+         boolean custom = getBoolean(sm, KEY_CUSTOM_NOISE_MODEL, false);
+         String id = getString(sm, KEY_PROFILE_ID, "");
+         String name = getString(sm, KEY_PROFILE_NAME, "");
+-        float luma = snap01(getFloat(sm, KEY_LUMA_DENOISE, 0.0f), 0.0f, 2.0f);
++        float luma = snap01(getFloat(sm, KEY_LUMA_DENOISE, 1.0f), 0.0f, 2.0f);
+         float chroma = snap01(getFloat(sm, KEY_CHROMA_DENOISE, 1.0f), 0.0f, 2.0f);
+         float exposure = snap01(getFloat(sm, KEY_EXPOSURE_EV, 0.0f), -1.0f, 1.0f);
+         float shadows = snap01(getFloat(sm, KEY_SHADOWS, 0.0f), -1.0f, 1.0f);
+         float contrast = snap01(getFloat(sm, KEY_CONTRAST, 0.0f), -1.0f, 1.0f);
+-        return new Snapshot(reconstruction, nr, custom, id, name, luma, chroma, exposure, shadows, contrast);
++        return new Snapshot(nr, custom, id, name, luma, chroma, exposure, shadows, contrast);
+     }
+ 
+     /* IRIS_26540_NIGHT_EXACT_CAMERA2_NOISE_SNAPSHOT
+@@ -107,8 +84,8 @@ public final class IrisMotionSettings {
+      */
+     public static Snapshot exactCamera2NightSnapshot() {
+         Snapshot source = current();
+-        return new Snapshot(Reconstruction.SPATIAL_RGB, source.noiseReductionEnabled, false, "", "Camera2 exact",
+-                0.0f, source.chromaDenoise,
++        return new Snapshot(source.noiseReductionEnabled, false, "", "Camera2 exact",
++                source.lumaDenoise, source.chromaDenoise,
+                 source.exposureEv, source.shadows, source.contrast);
+     }
+ 
+@@ -130,8 +107,7 @@ public final class IrisMotionSettings {
+         if (sm == null) return;
+         float min = (KEY_LUMA_DENOISE.equals(key) || KEY_CHROMA_DENOISE.equals(key)) ? 0.0f : -1.0f;
+         float max = (KEY_LUMA_DENOISE.equals(key) || KEY_CHROMA_DENOISE.equals(key)) ? 2.0f : 1.0f;
+-        float def = KEY_LUMA_DENOISE.equals(key) ? 0.0f :
+-                (KEY_CHROMA_DENOISE.equals(key) ? 1.0f : 0.0f);
++        float def = (KEY_LUMA_DENOISE.equals(key) || KEY_CHROMA_DENOISE.equals(key)) ? 1.0f : 0.0f;
+         float snapped = snap01(getFloat(sm, key, def), min, max);
+         String normalized = String.format(Locale.ROOT, "%.1f", snapped);
+         String current = getString(sm, key, String.format(Locale.ROOT, "%.1f", def));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java
+index 2cdf1379b2bcd34197018bfa2a604bd7b7fec778..dc943eb8d81eff0de7e900bdf7495fc6626341fa 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java
+@@ -56,8 +56,6 @@ public final class MotionV2Merger {
+         public final String superResLinearRawPath;
+         public final int superResLinearRawWidth;
+         public final int superResLinearRawHeight;
+-        /* IRIS_26545_RECONSTRUCTION_RESULT_CONTRACT */
+-        public boolean sabreSelected = false;
+ 
+         Result(ByteBuffer raw, long referenceTimestamp, int inputFrames,
+                 float effectiveSupport, ByteBuffer highlightProvenance) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 70739330267bc20294311ac5a3b2bf27f3fd6f91..aaf3f14353dbff486c3b716f843628f4814f72e0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -31,6 +31,7 @@ import com.particlesdevs.photoncamera.app.PhotonCamera
+ import com.particlesdevs.photoncamera.processing.ImageFrame
+ import com.particlesdevs.photoncamera.processing.MotionBatch
+ import com.particlesdevs.photoncamera.processing.render.Parameters
++import com.particlesdevs.photoncamera.util.Allocator
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+ import java.io.File
+@@ -126,17 +127,8 @@ object PhotonMotionMgc1271Bridge {
+             } else {
+                 IrisMotionSettings.current()
+             }
+-            val sabreSelected = !parameters.irisNightActive &&
+-                irisSettings.reconstruction == IrisMotionSettings.Reconstruction.SABRE
+-            PLog.i(TAG, "IRIS_26545_MOTION_RECONSTRUCTION_SELECTED " +
+-                "method=${if (sabreSelected) "SABRE" else "SPATIAL_RGB"} " +
+-                "settings=${irisSettings.reconstruction.persistedValue} " +
+-                "night=${parameters.irisNightActive} dngRequested=$produceNormalStackedDng")
+-
+             val noiseSelection: RawNoiseProfileSelection
+             val noiseAuthority: String
+-            var denoiseNoiseProfileLayout = RawNoiseProfileLayout.NONE
+-            var denoiseChannelNoiseProfile = floatArrayOf()
+             if (irisSettings.customNoiseModelEnabled) {
+                 val profile = IrisNoiseProfileStore.loadSelectedProfile(
+                     PhotonCamera.getApplicationContextStatic())
+@@ -153,18 +145,6 @@ object PhotonMotionMgc1271Bridge {
+                             "IRIS_26514 custom noise model invalid at frame=$index iso=$iso")
+                     }
+                 }
+-                val baseNoiseModel = profile.evaluate(mgcBase.motionV2ActualIso)
+-                    ?: throw IllegalStateException(
+-                        "IRIS_26545 custom noise model cannot evaluate MGC base iso=${mgcBase.motionV2ActualIso}")
+-                denoiseNoiseProfileLayout = RawNoiseProfileLayout.CANONICAL_BAYER
+-                denoiseChannelNoiseProfile = baseNoiseModel.canonicalChannelPairs()
+-                requireParity(
+-                    denoiseChannelNoiseProfile.size == 8 &&
+-                        denoiseChannelNoiseProfile.all { it.isFinite() && it >= 0f } &&
+-                        (0 until 4).all { denoiseChannelNoiseProfile[it * 2] > 0f } &&
+-                        (0 until 4).any { denoiseChannelNoiseProfile[it * 2 + 1] > 0f },
+-                    "invalid custom MGC-base denoise noise pairs",
+-                )
+                 noiseSelection = RawNoiseProfileSelection.Calibrated(profile)
+                 noiseAuthority = "CUSTOM:" +
+                     irisSettings.profileDisplayName.ifBlank { irisSettings.profileId }
+@@ -181,19 +161,11 @@ object PhotonMotionMgc1271Bridge {
+                             "IRIS_26514 invalid Camera2 SENSOR_NOISE_PROFILE frame=$index")
+                     }
+                 }
+-                denoiseNoiseProfileLayout = RawNoiseProfileLayout.CAMERA2_CFA
+-                denoiseChannelNoiseProfile = mgcBase.motionV2NoiseProfile.copyOf()
+-                requireParity(
+-                    RawNoiseModel.fromCamera2NoiseProfile(denoiseChannelNoiseProfile)
+-                        .hasValidCamera2Profile,
+-                    "invalid Camera2 MGC-base denoise noise profile",
+-                )
+                 noiseSelection = RawNoiseProfileSelection.Camera2
+                 noiseAuthority = "CAMERA2_PER_FRAME"
+             }
+             PLog.i(TAG, "IRIS_26514_NOISE_AUTHORITY source=$noiseAuthority " +
+-                "frames=${orderedPhysical.size} mgcBaseIso=${mgcBase.motionV2ActualIso} " +
+-                "residualDenoiseBase=${mgcBase.timestamp} baseFallback=0 pixelFallback=0 " +
++                "frames=${orderedPhysical.size} baseFallback=0 pixelFallback=0 " +
+                 "crossSourceFallback=false")
+ 
+             parameters.motionCanonicalExposureGain = 1.0f
+@@ -265,17 +237,11 @@ object PhotonMotionMgc1271Bridge {
+                 .takeIf { it.isFinite() && it > 0f }
+                 ?: (displayedGlobalZoom / localOutputZoom).coerceAtLeast(0.05f)
+             val srTotalZoom = minOf(displayedGlobalZoom, 20.0f)
+-            val spatialReconstructionZoom = if (sabreSelected) {
+-                1f
+-            } else if (localOutputZoom > 1.0001f) {
++            val spatialReconstructionZoom = if (localOutputZoom > 1.0001f) {
+                 (srTotalZoom / opticalAnchor).coerceIn(1f, localOutputZoom)
+             } else 1f
+-            val renderResidualZoom = if (sabreSelected) {
+-                localOutputZoom
+-            } else {
+-                (localOutputZoom / spatialReconstructionZoom)
+-                    .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+-            }
++            val renderResidualZoom = (localOutputZoom / spatialReconstructionZoom)
++                .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+             parameters.motionV2SpatialReconstructionZoom = spatialReconstructionZoom
+             parameters.motionV2RenderResidualZoom = renderResidualZoom
+             requireParity(
+@@ -283,23 +249,14 @@ object PhotonMotionMgc1271Bridge {
+                     <= 1.0e-3f * maxOf(1f, localOutputZoom),
+                 "26532 SR geometry identity failed local=$localOutputZoom recon=$spatialReconstructionZoom residual=$renderResidualZoom",
+             )
+-            // Sabre Resolve is tested on its native sensor grid in 26545. Spatial RGB retains
+-            // the existing true streamed 2x reconstruction unchanged.
+-            val fixedOutputScale = if (sabreSelected) {
+-                1f
+-            } else if (parameters.motionV2SuperResOutputEnabled) {
+-                2f
+-            } else {
+-                1f
+-            }
++            val fixedOutputScale = if (parameters.motionV2SuperResOutputEnabled) 2f else 1f
+             parameters.motionV2SuperResOutputScale = fixedOutputScale
+             PLog.i(TAG, "IRIS_26532_20X_TOTAL_SR " +
+                 "displayedGlobalZoom=$displayedGlobalZoom opticalAnchor=$opticalAnchor " +
+                 "localOutputZoom=$localOutputZoom srTotalZoom=$srTotalZoom " +
+                 "spatialReconstructionZoom=$spatialReconstructionZoom " +
+                 "renderResidualZoom=$renderResidualZoom outputScale=$fixedOutputScale " +
+-                "srTotalCap=20.0 fixedSuperResScale=${if (sabreSelected) 1.0 else 2.0} " +
+-                "reconstruction=${if (sabreSelected) "SABRE_NATIVE_GRID" else "SPATIAL_RGB"}")
++                "srTotalCap=20.0 fixedSuperResScale=2.0")
+ 
+             egl = EglOwner.create()
+             val fusion = GlesMgcRawFusion(
+@@ -314,7 +271,7 @@ object PhotonMotionMgc1271Bridge {
+                 lensShadingWidth = lscWidth,
+                 lensShadingHeight = lscHeight,
+                 outputMode = MgcSpatialOutputMode.RGB,
+-                mergeMethod = if (sabreSelected) MgcMergeMethod.SABRE else MgcMergeMethod.SPATIAL_RGB,
++                mergeMethod = MgcMergeMethod.SPATIAL_RGB,
+                 outputScale = fixedOutputScale,
+                 reconstructionZoom = spatialReconstructionZoom,
+                 displayedGlobalZoom = displayedGlobalZoom,
+@@ -323,11 +280,11 @@ object PhotonMotionMgc1271Bridge {
+                 gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
+                 exportNormalStackedDng = produceNormalStackedDng,
+                 superResTempDir = PhotonCamera.getApplicationContextStatic().cacheDir,
+-                superResWriteLinearRaw = produceNormalStackedDng && !sabreSelected,
++                superResWriteLinearRaw = produceNormalStackedDng,
+             )
+             val iris26535FusionStartNs = System.nanoTime()
+             val stacked = fusion.processFrames(frames)
+-                ?: invalid(if (sabreSelected) "Iris Sabre owner returned null" else "pinned Spatial RGB owner returned null")
++                ?: invalid("pinned Spatial RGB owner returned null")
+             iris26535FusionMs = (System.nanoTime() - iris26535FusionStartNs) / 1_000_000L
+             val expectedSuperResWidth = MultiFrameConfig.scaledRawOutputDimension(size.x, fixedOutputScale)
+             val expectedSuperResHeight = MultiFrameConfig.scaledRawOutputDimension(size.y, fixedOutputScale)
+@@ -362,35 +319,22 @@ object PhotonMotionMgc1271Bridge {
+             val strength = stacked.mgcSpatialStrengthMap
+             val referenceSnr = stacked.mgcReferenceSnr
+             val tuningSnr = stacked.mgcDenoiseTuningSnr
+-            val sabreNoiseScale = stacked.mgcSabreNoiseModelScale
+-            val iris26535SpatialReliability = if (!sabreSelected) {
+-                requireParity(correlation?.size == 128 && correlation.all { it.isFinite() && it >= 0f },
+-                    "missing/malformed propagated correlation")
+-                requireParity(readNoise?.size == 3 && readNoise.all { it.isFinite() && it >= 0f },
+-                    "missing/malformed propagated read noise")
+-                requireParity(shotNoise?.size == 3 && shotNoise.all { it.isFinite() && it >= 0f },
+-                    "missing/malformed propagated shot noise")
+-                requireParity(strength != null && strength.width == (expectedOutputWidth + 3) / 4 &&
+-                        strength.height == (expectedOutputHeight + 3) / 4,
+-                    "missing/malformed Spatial strength map")
+-                requireParity(referenceSnr != null && referenceSnr.isFinite() && referenceSnr >= 0f,
+-                    "missing/malformed MGC reference SNR")
+-                requireParity(tuningSnr != null && tuningSnr.isFinite() && tuningSnr >= 0f,
+-                    "missing/malformed propagated MGC tuning SNR")
+-                publishSpatialReliability(parameters, checkNotNull(strength))
+-            } else {
+-                requireParity(correlation == null && readNoise == null && shotNoise == null && strength == null,
+-                    "Sabre unexpectedly leaked Spatial-only denoise/reliability state")
+-                requireParity(referenceSnr != null && referenceSnr.isFinite() && referenceSnr >= 0f,
+-                    "Sabre reference SNR missing/malformed")
+-                requireParity(tuningSnr != null && tuningSnr.isFinite() && tuningSnr >= 0f,
+-                    "Sabre output SNR missing/malformed")
+-                requireParity(sabreNoiseScale != null && sabreNoiseScale.isFinite() && sabreNoiseScale > 0f,
+-                    "Sabre propagated noise scale missing/malformed")
+-                null
+-            }
++            requireParity(correlation?.size == 128 && correlation.all { it.isFinite() && it >= 0f },
++                "missing/malformed propagated correlation")
++            requireParity(readNoise?.size == 3 && readNoise.all { it.isFinite() && it >= 0f },
++                "missing/malformed propagated read noise")
++            requireParity(shotNoise?.size == 3 && shotNoise.all { it.isFinite() && it >= 0f },
++                "missing/malformed propagated shot noise")
++            requireParity(strength != null && strength.width == (expectedOutputWidth + 3) / 4 &&
++                    strength.height == (expectedOutputHeight + 3) / 4,
++                "missing/malformed Spatial strength map")
++            requireParity(referenceSnr != null && referenceSnr.isFinite() && referenceSnr >= 0f,
++                "missing/malformed MGC reference SNR")
++            requireParity(tuningSnr != null && tuningSnr.isFinite() && tuningSnr >= 0f,
++                "missing/malformed propagated MGC tuning SNR")
+             requireParity(lsc == null || stacked.lensShadingCorrectionApplied,
+                 "LSC supplied but MGC output did not apply it")
++            val iris26535SpatialReliability = publishSpatialReliability(parameters, checkNotNull(strength))
+ 
+             GLES30.glFinish()
+             gpu.stackCompletionTimeline?.releasePending()
+@@ -406,9 +350,10 @@ object PhotonMotionMgc1271Bridge {
+                 mgcDenoiseReadNoise = readNoise,
+                 mgcDenoiseShotNoise = shotNoise,
+                 mgcSpatialStrengthMap = strength,
+-                mgcSabreNoiseModelScale = if (sabreSelected) sabreNoiseScale else null,
+-                noiseProfileLayout = denoiseNoiseProfileLayout,
+-                channelNoiseProfile = denoiseChannelNoiseProfile,
++                noiseProfileLayout = if (irisSettings.customNoiseModelEnabled)
++                    RawNoiseProfileLayout.CANONICAL_BAYER else RawNoiseProfileLayout.CAMERA2_CFA,
++                channelNoiseProfile = if (irisSettings.customNoiseModelEnabled)
++                    floatArrayOf() else reference.motionV2NoiseProfile.copyOf(),
+             )
+             /* IRIS_26540_RESIDUAL_ONLY_DENOISE_AUTHORITY
+              * Temporal Spatial-RGB reconstruction is the first noise reducer. Pecan runs only on
+@@ -417,27 +362,18 @@ object PhotonMotionMgc1271Bridge {
+              * brightness and preview darkness never independently increase denoise strength.
+              */
+             val requestedLumaScale = irisSettings.lumaDenoise.coerceIn(0f, 2f)
+-            val noiseEquivalentSupport = if (sabreSelected) {
+-                (1f / checkNotNull(sabreNoiseScale)).coerceIn(1f, stacked.mergedFrameCount.toFloat())
+-            } else {
+-                stacked.normalStackedDngNoiseEquivalentSupport
+-            }
++            val noiseEquivalentSupport = stacked.normalStackedDngNoiseEquivalentSupport
+             requireParity(noiseEquivalentSupport.isFinite() && noiseEquivalentSupport >= 1f,
+                 "missing/malformed noise-equivalent temporal support")
+-            /* IRIS_26545_SHARED_RESIDUAL_DENOISE_CONTROLS
+-             * The reconstruction owns temporal noise reduction. These two user controls act only
+-             * on the completed linear-RGB carrier, before PostPipeline/tone/UHDR. They never alter
+-             * capture exposure, frame admission, Spatial merge math, Sabre rejection, or Resolve.
+-             * Luma uses a new preference key and defaults to zero to preserve the proven 26544
+-             * zero-luma behavior until the user deliberately opts in. Chroma keeps its prior value.
++            /* IRIS_26541_RESTORE_26535_ZERO_MGC_LUMA
++             * The 26536+ low-light/mottle luma experiment did not improve the user's Motion
++             * samples. Restore the proven 26531/26535 full-resolution Pecan/MGC luma contract
++             * exactly to zero for Motion and Night. Chroma remains user-owned, and the separate
++             * >=8x SR temporal-luma weighting inside the reconstruction shader is untouched.
+              */
+-            val lumaScale = requestedLumaScale
+-            val chromaScale = irisSettings.chromaDenoise.coerceIn(0f, 2f)
+-            val denoisePass = if (sabreSelected) {
+-                MgcFullResolutionDenoise.Pass.SABRE_DEFAULT
+-            } else {
+-                MgcFullResolutionDenoise.Pass.SPATIAL_DEFAULT
+-            }
++            val userLumaScale = 0f
++            val lumaScale = 0f
++            val chromaScale = irisSettings.chromaDenoise
+             val runFullResolutionDenoise = irisSettings.noiseReductionEnabled &&
+                 (lumaScale > 0f || chromaScale > 0f)
+             if (runFullResolutionDenoise) {
+@@ -461,7 +397,7 @@ object PhotonMotionMgc1271Bridge {
+                     superResDetailWidth,
+                     superResDetailHeight,
+                     checkNotNull(strength),
+-                    checkNotNull(iris26535SpatialReliability),
++                    iris26535SpatialReliability,
+                 )
+                 iris26535SrGateMs = (System.nanoTime() - gateStartNs) / 1_000_000L
+             }
+@@ -489,10 +425,10 @@ object PhotonMotionMgc1271Bridge {
+                     preparedYuvNoiseModel = null,
+                     applyLensShadingToDenoiseStrength = false,
+                     tuningSnr = tuningSnr!!,
+-                    pass = denoisePass,
++                    pass = MgcFullResolutionDenoise.Pass.SPATIAL_DEFAULT,
+                     lumaStrengthScale = lumaScale,
+                     chromaStrengthScale = chromaScale,
+-                ), "MGC $denoisePass pre-PostPipeline linear-RGB denoise rejected its noise state")
++                ), "MGC SPATIAL_DEFAULT native carrier denoise rejected its propagated state")
+             }
+             iris26535DenoiseMs = (System.nanoTime() - iris26535DenoiseStartNs) / 1_000_000L
+             forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+@@ -514,20 +450,22 @@ object PhotonMotionMgc1271Bridge {
+             resultTexture = 0
+             checkGl("delete exported MGC RGB")
+ 
+-            PLog.i(TAG, "IRIS_26545_DENOISE_NOISE_AUTHORITY " +
+-                "stage=PRE_POSTPIPELINE_LINEAR_RGB master=${irisSettings.noiseReductionEnabled} " +
+-                "luma=$lumaScale chroma=$chromaScale executed=$runFullResolutionDenoise " +
+-                "pass=$denoisePass noiseSource=$noiseAuthority mgcBase=${mgcBase.timestamp} " +
+-                "referenceSnr=$referenceSnr outputTuningSnr=$tuningSnr " +
++            PLog.i(TAG, "IRIS_26532_DENOISE_SR_AUTHORITY " +
++                "master=${irisSettings.noiseReductionEnabled} " +
++                "requestedLuma=$requestedLumaScale automaticLowLightLuma=0.0 " +
++                "userLuma=$userLumaScale effectiveMgcLuma=$lumaScale " +
++                "zeroLumaRollback=IRIS_26541_RESTORE_26535_ZERO_MGC_LUMA " +
++                "profileSnrSource=referencePreMerge referenceSnr=$referenceSnr " +
+                 "noiseEquivalentSupport=$noiseEquivalentSupport " +
+-                "residualMagnitude=${if (sabreSelected) "physicalBaseNoiseTimesMeasuredSabreMergeScale" else "propagatedSpatialReadShotCorrelationStrength"} " +
+-                "sliderAffectsMerge=false sliderAffectsExposure=false sliderAffectsTone=false " +
+-                "structureAuthority=${if (sabreSelected) "SABRE_REJECTION_RESOLVE" else "MGC_PECAN_OUTLIER_REVERT_SPATIAL_STRENGTH"} " +
++                "pecanProfileTuningSnr=$tuningSnr residualMagnitude=propagatedReadShotCorrelationStrength " +
++                "isoStrengthAuthority=false darknessStrengthAuthority=false textureClassifier=false " +
++                "structureAuthority=MGC_PECAN_OUTLIER_REVERT_SPATIAL_STRENGTH " +
++                "chroma=$chromaScale executed=$runFullResolutionDenoise " +
+                 "srScale=$spatialReconstructionZoom requestedLocalZoom=$localOutputZoom " +
+                 "finalFovZoom=$displayedGlobalZoom renderResidual=$renderResidualZoom " +
+                 "outputScale=$fixedOutputScale banded2x=${fixedOutputScale > 1f} " +
+                 "fullHighResPostTexture=false baseCarrier=${size.x}x${size.y} " +
+-                "legacyPhotonNr=false sabreSelected=$sabreSelected")
++                "pass=SPATIAL_DEFAULT legacyPhotonNr=false sabreSelected=false")
+ 
+             val baselineScale = stacked.baselineExposureEv
+                 ?.takeIf { it.isFinite() }
+@@ -560,7 +498,7 @@ object PhotonMotionMgc1271Bridge {
+                 "shortAccepted=${stacked.baselineExposureEv != null} " +
+                 "denoiseBeforeSourceRestore=true restorePass=existingDisplayExposure " +
+                 "rendererSceneWhiteAuthority=referenceDisplayOnly")
+-            parameters.motionV2EffectiveSupport = if (sabreSelected) noiseEquivalentSupport else stacked.mergedFrameCount.toFloat()
++            parameters.motionV2EffectiveSupport = stacked.mergedFrameCount.toFloat()
+ 
+             /* IRIS_26542_ROLE_AWARE_NORMAL_DNG_PARITY
+              * The stacked DNG intentionally contains only same-exposure NORMAL observations.
+@@ -573,41 +511,17 @@ object PhotonMotionMgc1271Bridge {
+             }
+             requireParity(expectedNormalDngFrames >= 1,
+                 "normal stacked DNG has no NORMAL source frames totalInputs=${inputImages.size}")
+-            var resultDngRaw16: ByteBuffer? = null
+-            var resultDngFrameCount = 0
+-            var resultDngNoiseProfile: DoubleArray? = null
+-            var resultDngSupportMin = 1f
+-            var resultDngSupportP01 = 1f
+-            var resultDngSupportP10 = 1f
+-            var resultDngSupportMedian = 1f
+-            var resultDngSupportMean = 1f
+-            var resultDngSupportMax = 1f
+-            var resultDngNoiseEquivalentSupport = 1f
+             if (produceNormalStackedDng) {
+-                requireParity(stacked.normalStackedDngRaw16 != null,
+-                    "requested ${if (sabreSelected) "Sabre" else "Spatial"} normal stacked DNG buffer is missing")
++                requireParity(stacked.normalStackedDngRaw16 != null, "requested normal stacked DNG buffer is missing")
+                 requireParity(stacked.normalStackedDngFrameCount == expectedNormalDngFrames,
+                     "normal stacked DNG population=${stacked.normalStackedDngFrameCount} expectedNormals=$expectedNormalDngFrames totalInputs=${inputImages.size}")
++                /* IRIS_26522_NORMALIZED16_DNG_METADATA */
+                 requireParity(stacked.normalStackedDngNoiseProfile?.size == 6,
+                     "normalized16 stacked DNG noise profile is missing/invalid")
+                 requireParity(stacked.normalStackedDngNoiseEquivalentSupport.isFinite() &&
+                     stacked.normalStackedDngNoiseEquivalentSupport >= 1f &&
+                     stacked.normalStackedDngNoiseEquivalentSupport <= expectedNormalDngFrames.toFloat() + 0.01f,
+                     "normalized16 stacked DNG effective support is invalid normalLimit=$expectedNormalDngFrames")
+-                resultDngRaw16 = stacked.normalStackedDngRaw16
+-                resultDngFrameCount = stacked.normalStackedDngFrameCount
+-                resultDngNoiseProfile = stacked.normalStackedDngNoiseProfile
+-                resultDngSupportMin = stacked.normalStackedDngSupportMin
+-                resultDngSupportP01 = stacked.normalStackedDngSupportP01
+-                resultDngSupportP10 = stacked.normalStackedDngSupportP10
+-                resultDngSupportMedian = stacked.normalStackedDngSupportMedian
+-                resultDngSupportMean = stacked.normalStackedDngSupportMean
+-                resultDngSupportMax = stacked.normalStackedDngSupportMax
+-                resultDngNoiseEquivalentSupport = stacked.normalStackedDngNoiseEquivalentSupport
+-                PLog.i(TAG, "IRIS_26545_DNG_RECONSTRUCTION_PARITY " +
+-                    "reconstruction=${if (sabreSelected) "SABRE" else "SPATIAL_RGB"} " +
+-                    "domain=normalized16_bayer normalFrames=$resultDngFrameCount " +
+-                    "blackLevel=0 whiteLevel=65535 postProcessingBaked=false")
+             } else {
+                 requireParity(stacked.normalStackedDngRaw16 == null && stacked.normalStackedDngFrameCount == 0,
+                     "DNG sidecar produced without request")
+@@ -615,8 +529,7 @@ object PhotonMotionMgc1271Bridge {
+                     "DNG metadata produced without request")
+             }
+ 
+-            PLog.i(TAG, "IRIS_26545_RECONSTRUCTION_TIMING " +
+-                "method=${if (sabreSelected) "SABRE" else "SPATIAL_RGB"} " +
++            PLog.i(TAG, "IRIS_26535_SPATIAL_RGB_TIMING " +
+                 "srEnabled=${fixedOutputScale > 1f} fusionMs=$iris26535FusionMs " +
+                 "denoiseMs=$iris26535DenoiseMs srReliabilityGateMs=$iris26535SrGateMs " +
+                 "totalMs=${(System.nanoTime() - iris26535TotalStartNs) / 1_000_000L} " +
+@@ -627,7 +540,7 @@ object PhotonMotionMgc1271Bridge {
+                 "long=${if (longFrame != null) 1 else 0} short=${if (shortFrame != null) 1 else 0} " +
+                 "merged=${stacked.mergedFrameCount} cfa=$cfa " +
+                 "lsc=${stacked.lensShadingCorrectionApplied} " +
+-                "denoise=${if (sabreSelected) "SABRE_RESOLVE_NO_POST_PECAN" else "SPATIAL_DEFAULT_ADAPTIVE_LUMA_CHROMA"} " +
++                "denoise=SPATIAL_DEFAULT_ADAPTIVE_LUMA_CHROMA " +
+                 "baselineEv=${stacked.baselineExposureEv} " +
+                 "displayGain=${parameters.motionV2DisplayGain} " +
+                 "crossContext=${if (parameters.irisNightActive) "rgba16f_cpu_night" else "float32_rgba_cpu_motion"} alphaSupport=disabled")
+@@ -637,27 +550,25 @@ object PhotonMotionMgc1271Bridge {
+                 output,
+                 mgcBase.timestamp,
+                 frames.size,
+-                if (sabreSelected) noiseEquivalentSupport else stacked.mergedFrameCount.toFloat(),
++                stacked.mergedFrameCount.toFloat(),
+                 null,
+-                resultDngRaw16,
+-                resultDngFrameCount,
+-                resultDngNoiseProfile,
+-                resultDngSupportMin,
+-                resultDngSupportP01,
+-                resultDngSupportP10,
+-                resultDngSupportMedian,
+-                resultDngSupportMean,
+-                resultDngSupportMax,
+-                resultDngNoiseEquivalentSupport,
++                stacked.normalStackedDngRaw16,
++                stacked.normalStackedDngFrameCount,
++                stacked.normalStackedDngNoiseProfile,
++                stacked.normalStackedDngSupportMin,
++                stacked.normalStackedDngSupportP01,
++                stacked.normalStackedDngSupportP10,
++                stacked.normalStackedDngSupportMedian,
++                stacked.normalStackedDngSupportMean,
++                stacked.normalStackedDngSupportMax,
++                stacked.normalStackedDngNoiseEquivalentSupport,
+                 superResDetailPath,
+                 superResDetailWidth,
+                 superResDetailHeight,
+                 superResLinearRawPath,
+                 superResLinearRawWidth,
+                 superResLinearRawHeight,
+-            ).also { result ->
+-                result.sabreSelected = sabreSelected
+-            }
++            )
+         } catch (error: Throwable) {
+             PLog.e(TAG, "MGC PARITY ARCHITECTURE INVALID", error)
+             throw if (error is IllegalStateException &&
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+index 13af9bd92b84722e3b3c21cb22c03ecde868f5db..a7ee4a05e716a0b68b50e437935d8d594738275f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+@@ -78,13 +78,10 @@ public class PreferenceKeys {
+ 
+         // IRIS_26514_PER_LENS_DEFAULT_SEED: regular (non-common) keys participate in the
+         // existing settings_for_camera_<id> JSON ownership. Seed them before lens JSONs are made.
+-        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_motion_reconstruction", "spatial_rgb");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_custom_noise_model", "0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_custom_noise_profile_id", "");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_custom_noise_profile_name", "");
+-        // Legacy ignored luma value remains untouched for rollback compatibility.
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_luma_denoise", "1.0");
+-        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_luma_denoise_v2", "0.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_chroma_denoise", "1.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_exposure_ev", "0.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_shadows", "0.0");
+@@ -157,12 +154,10 @@ public class PreferenceKeys {
+         // IRIS_26514_PER_LENS_LEGACY_JSON_DEFAULTS: old lens JSONs predate these keys.
+         // Add missing defaults to the selected lens's in-memory map before applying it. This
+         // prevents values from the previously active lens leaking into an old per-lens JSON.
+-        map.putIfAbsent("pref_iris_motion_reconstruction", "spatial_rgb");
+         map.putIfAbsent("pref_iris_custom_noise_model", "0");
+         map.putIfAbsent("pref_iris_custom_noise_profile_id", "");
+         map.putIfAbsent("pref_iris_custom_noise_profile_name", "");
+         map.putIfAbsent("pref_iris_luma_denoise", "1.0");
+-        map.putIfAbsent("pref_iris_luma_denoise_v2", "0.0");
+         map.putIfAbsent("pref_iris_chroma_denoise", "1.0");
+         map.putIfAbsent("pref_iris_exposure_ev", "0.0");
+         map.putIfAbsent("pref_iris_shadows", "0.0");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index 684eca2e1bcc0796be07f934b09a412d15a8d40d..b62173c0f8a368df6e5b58fa961f71deaf1599d1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -334,7 +334,6 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+                     removePreferenceAnywhere(PreferenceKeys.Key.KEY_SHADOWS_SEEKBAR.mValue);
+                     removePreferenceAnywhere(PreferenceKeys.Key.KEY_COMPRESSOR_SEEKBAR.mValue);
+                 } else {
+-                    removePreferenceAnywhere(IrisMotionSettings.KEY_RECONSTRUCTION);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_CUSTOM_NOISE_MODEL);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_IMPORT_NOISE_MODEL);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_LUMA_DENOISE);
+diff --git a/app/src/main/res/values/arrays.xml b/app/src/main/res/values/arrays.xml
+index bb9449186128c95aa8cb5b6a794754a665b39380..f1551822585af45025e19135f24528167f40df3d 100644
+--- a/app/src/main/res/values/arrays.xml
++++ b/app/src/main/res/values/arrays.xml
+@@ -143,12 +143,4 @@
+         <item>1920x1080</item>
+         <item>1280x720</item>
+     </string-array>
+-    <string-array name="iris_motion_reconstruction_entries">
+-        <item>@string/iris_motion_reconstruction_spatial_rgb</item>
+-        <item>@string/iris_motion_reconstruction_sabre</item>
+-    </string-array>
+-    <string-array name="iris_motion_reconstruction_entryvalues">
+-        <item>spatial_rgb</item>
+-        <item>sabre</item>
+-    </string-array>
+ </resources>
+\ No newline at end of file
+diff --git a/app/src/main/res/values/default_prefs.xml b/app/src/main/res/values/default_prefs.xml
+index 9adf1ba5ddc45a0deea62c5825be52eab14970ee..c5a408dfb142588f146a826424356b457a46c2db 100644
+--- a/app/src/main/res/values/default_prefs.xml
++++ b/app/src/main/res/values/default_prefs.xml
+@@ -13,7 +13,7 @@
+     <bool name="pref_system_nr_default">false</bool>
+     <bool name="pref_disable_align_default">false</bool>
+     <bool name="pref_hdrx_nr_default">true</bool>
+-    <string name="pref_iris_luma_denoise_default" translatable="false">0.0</string>
++    <string name="pref_iris_luma_denoise_default" translatable="false">1.0</string>
+     <string name="pref_iris_chroma_denoise_default" translatable="false">1.0</string>
+     <string name="pref_iris_exposure_default" translatable="false">0.0</string>
+     <string name="pref_iris_shadows_default" translatable="false">0.0</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index dc7efa7bcbd457be1de0116ceeaf5da5d77ebe57..0f58fc391ff3f7bc8764738fb5a785d41c34a9a6 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -35,18 +35,12 @@
+     <string name="general">General</string>
+     <string name="telegram">Telegram Group ↗</string>
+     <string name="hdrxNR">Noise Reduction</string>
+-    <string name="iris_motion_reconstruction">Motion Reconstruction</string>
+-    <string name="iris_motion_reconstruction_summary">Choose the Iris multiframe reconstruction engine for Motion photos</string>
+-    <string name="iris_motion_reconstruction_spatial_rgb">Spatial RGB</string>
+-    <string name="iris_motion_reconstruction_sabre">Sabre</string>
+     <string name="iris_custom_noise_model">Custom Noise Model</string>
+-    <string name="iris_custom_noise_model_summary">Use the imported GCam .c noise model for both Spatial RGB and Sabre instead of Camera2 sensor-noise metadata</string>
++    <string name="iris_custom_noise_model_summary">Use the imported per-lens GCam .c model instead of Camera2 metadata</string>
+     <string name="iris_import_noise_model">Import Noise Model</string>
+     <string name="iris_import_noise_model_summary">Tap to choose a validated .c file</string>
+     <string name="iris_luma_denoise">Luma Denoise</string>
+-    <string name="iris_luma_denoise_summary">Residual luminance denoise after reconstruction and before tone mapping. 0 = off, 1 = calibrated, 2 = strongest.</string>
+     <string name="iris_chroma_denoise">Chroma Denoise</string>
+-    <string name="iris_chroma_denoise_summary">Residual color denoise after reconstruction and before tone mapping. 0 = off, 1 = calibrated, 2 = strongest.</string>
+     <string name="iris_exposure">Exposure (EV)</string>
+     <string name="iris_shadows">Shadows</string>
+     <string name="iris_contrast">Contrast</string>
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index 4bd0dc2b10b1df5cc51c047ef11f4d213b1a5d8a..88f6a2df01c59e40668202debc6cabb006eee96f 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -33,14 +33,12 @@
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_enhanced_processing_key" ns0:defaultValue="@bool/pref_enhanced_processing_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/enhanced_processing" ns0:summary="" ns0:icon="@drawable/ic_tune_black_24dp" />
+     </PreferenceCategory>
+     <PreferenceCategory ns0:layout="@layout/preference_category_layout" ns0:key="@string/pref_category_hdrx_key" ns0:title="@string/hdrx">
+-        <!-- IRIS_26545_MOTION_RECONSTRUCTION_SELECTOR: Motion-only; Night remains independent. -->
+-        <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="pref_iris_motion_reconstruction" ns0:title="@string/iris_motion_reconstruction" ns0:summary="@string/iris_motion_reconstruction_summary" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_burst_mode_black_24dp" ns0:entries="@array/iris_motion_reconstruction_entries" ns0:entryValues="@array/iris_motion_reconstruction_entryvalues" ns0:defaultValue="spatial_rgb" />
+         <ListPreference ns0:layout="@layout/preference_with_margin" ns0:key="@string/pref_save_raw_key" ns0:title="@string/raw" ns1:useSimpleSummaryProvider="true" ns0:icon="@drawable/ic_raw" ns0:summary="" ns0:entries="@array/raw_mode_entries" ns0:entryValues="@array/raw_mode_entryvalues" ns0:defaultValue="@string/pref_raw_mode_default_value" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="@string/pref_hdrx_nr_key" ns0:defaultValue="@bool/pref_hdrx_nr_default" ns0:layout="@layout/preference_with_margin" ns0:title="@string/hdrxNR" ns0:summary="" ns0:icon="@drawable/ic_gradient_black_24dp" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="pref_iris_custom_noise_model" ns0:defaultValue="false" ns0:layout="@layout/preference_with_margin" ns0:title="@string/iris_custom_noise_model" ns0:summary="@string/iris_custom_noise_model_summary" ns0:icon="@drawable/ic_gradient_black_24dp" />
+         <Preference ns0:key="pref_iris_import_noise_model" ns0:layout="@layout/preference_with_margin" ns0:title="@string/iris_import_noise_model" ns0:summary="@string/iris_import_noise_model_summary" ns0:icon="@drawable/ic_save" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_luma_denoise_v2" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_luma_denoise" ns0:summary="@string/iris_luma_denoise_summary" ns0:defaultValue="@string/pref_iris_luma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_grain_black_24dp" />
+-        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_chroma_denoise" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_chroma_denoise" ns0:summary="@string/iris_chroma_denoise_summary" ns0:defaultValue="@string/pref_iris_chroma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_luma_denoise" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_luma_denoise" ns0:summary="" ns0:defaultValue="@string/pref_iris_luma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_grain_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_chroma_denoise" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_chroma_denoise" ns0:summary="" ns0:defaultValue="@string/pref_iris_chroma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_exposure_ev" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_exposure" ns0:summary="" ns0:defaultValue="@string/pref_iris_exposure_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_shadows" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_shadows" ns0:summary="" ns0:defaultValue="@string/pref_iris_shadows_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_compressor" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_contrast" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_contrast" ns0:summary="" ns0:defaultValue="@string/pref_iris_contrast_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+diff --git a/app/version.properties b/app/version.properties
+index 869a14afb7252bc60d40d536b0eab035208d37aa..7eaef32ed11fd6638f7106baf214b829d81110a9 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726545
+-VERSION_BUILD=26545
++VERSION_NAME=0.9726544
++VERSION_BUILD=26544
