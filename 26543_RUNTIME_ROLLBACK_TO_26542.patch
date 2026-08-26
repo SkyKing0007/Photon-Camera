@@ -1,0 +1,1721 @@
+diff --git b/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt a/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt
+index 4d6f16a..3290fb0 100644
+--- b/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt
++++ a/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt
+@@ -1,32 +1,20 @@
+ package com.hinnka.mycamera.model
+ 
+-import com.hinnka.mycamera.utils.LargeDirectBuffer
+-import com.hinnka.mycamera.utils.PLog
+-import java.io.File
+-import java.io.FileInputStream
+ import java.nio.ByteBuffer
+-import java.nio.ByteOrder
+ import java.util.concurrent.atomic.AtomicBoolean
+ 
+ /**
+  * IRIS_26512_MGC1271_IMMUTABLE_SAFE_IMAGE_ADAPTER
+  * Minimal plane contract consumed by pinned bjzhou 1.27.1 MGC Spatial.
+- *
+- * IRIS_26543_NIGHT_BOUNDED_DISK_BACKING
+- * Night may back non-reference RAWs with immutable cache files. The live Spatial owner reads only
+- * the full frame or tile region needed for the current GPU upload into one temporary Photon native
+- * buffer, then frees it immediately. Frame count therefore does not multiply anonymous RAW RAM.
+  */
+-class SafeImage private constructor(
++class SafeImage(
+     val width: Int,
+     val height: Int,
+     val format: Int,
+     val timestamp: Long,
+-    buffer: ByteBuffer?,
+-    val rowStrideBytes: Int,
+-    val pixelStrideBytes: Int,
+-    private val backingFile: File?,
+-    private val backingByteCount: Int,
++    buffer: ByteBuffer,
++    rowStride: Int,
++    pixelStride: Int,
+     private val closeAction: (() -> Unit)? = null,
+ ) : AutoCloseable {
+     class Plane(
+@@ -35,113 +23,16 @@ class SafeImage private constructor(
+         val pixelStride: Int,
+     )
+ 
+-    class FileRegion internal constructor(
+-        val buffer: ByteBuffer,
+-        val rowStride: Int,
+-        val pixelStride: Int,
+-    ) : AutoCloseable {
+-        private val closed = AtomicBoolean(false)
+-        override fun close() {
+-            if (closed.compareAndSet(false, true)) LargeDirectBuffer.free(buffer)
+-        }
+-    }
+-
+     private val closed = AtomicBoolean(false)
+-    private val memoryPlane: Array<Plane> = if (buffer != null) {
+-        arrayOf(Plane(buffer.duplicate().apply { position(0) }, rowStrideBytes, pixelStrideBytes))
+-    } else {
+-        emptyArray()
+-    }
+-
+-    val planes: Array<Plane> get() = memoryPlane
+-    val isFileBacked: Boolean get() = backingFile != null
+-
+-    constructor(
+-        width: Int, height: Int, format: Int, timestamp: Long, buffer: ByteBuffer,
+-        rowStride: Int, pixelStride: Int, closeAction: (() -> Unit)? = null,
+-    ) : this(
+-        width, height, format, timestamp, buffer, rowStride, pixelStride,
+-        null, 0, closeAction,
++    val planes: Array<Plane> = arrayOf(
++        Plane(
++            buffer = buffer.duplicate().apply { position(0) },
++            rowStride = rowStride,
++            pixelStride = pixelStride,
++        )
+     )
+ 
+-    constructor(
+-        width: Int, height: Int, format: Int, timestamp: Long, backingFile: File,
+-        backingByteCount: Int, rowStride: Int, pixelStride: Int,
+-        closeAction: (() -> Unit)? = null,
+-    ) : this(
+-        width, height, format, timestamp, null, rowStride, pixelStride,
+-        backingFile, backingByteCount, closeAction,
+-    ) {
+-        require(backingByteCount > 0) { "Disk-backed RAW byte count must be positive" }
+-        require(backingFile.isFile && backingFile.length() >= backingByteCount.toLong()) {
+-            "Disk-backed RAW is unavailable: ${backingFile.absolutePath}"
+-        }
+-    }
+-
+-    /** Read a packed RAW16 rectangle without retaining the entire disk-backed frame in RAM. */
+-    fun readFileRegion(left: Int, top: Int, regionWidth: Int, regionHeight: Int): FileRegion {
+-        check(!closed.get()) { "SafeImage is closed" }
+-        val file = checkNotNull(backingFile) { "SafeImage is not disk-backed" }
+-        require(pixelStrideBytes == 2) { "Disk-backed RAW pixel stride=$pixelStrideBytes, expected 2" }
+-        require(left >= 0 && top >= 0 && regionWidth > 0 && regionHeight > 0)
+-        require(left + regionWidth <= width && top + regionHeight <= height)
+-        require(rowStrideBytes >= width * pixelStrideBytes)
+-        val packedRowStride = regionWidth * pixelStrideBytes
+-        val byteCountLong = packedRowStride.toLong() * regionHeight
+-        require(byteCountLong in 1..Int.MAX_VALUE.toLong())
+-        val byteCount = byteCountLong.toInt()
+-        val output = LargeDirectBuffer.allocate(byteCountLong, "IRIS26543 Night RAW region")
+-            ?: throw IllegalStateException("Unable to allocate $byteCount byte Night RAW upload region")
+-        output.order(ByteOrder.nativeOrder())
+-        try {
+-            FileInputStream(file).channel.use { channel ->
+-                if (left == 0 && packedRowStride == rowStrideBytes) {
+-                    val sourceOffset = top.toLong() * rowStrideBytes
+-                    val sourceEnd = sourceOffset + byteCountLong
+-                    require(sourceOffset >= 0 && sourceEnd <= backingByteCount.toLong()) {
+-                        "Disk RAW region exceeds backing bytes=$backingByteCount"
+-                    }
+-                    output.position(0)
+-                    output.limit(byteCount)
+-                    var position = sourceOffset
+-                    while (output.hasRemaining()) {
+-                        val read = channel.read(output, position)
+-                        if (read < 0) throw IllegalStateException("Unexpected EOF in Night RAW spool")
+-                        if (read == 0) continue
+-                        position += read
+-                    }
+-                } else {
+-                    for (row in 0 until regionHeight) {
+-                        val sourceOffset =
+-                            (top + row).toLong() * rowStrideBytes + left.toLong() * pixelStrideBytes
+-                        val sourceEnd = sourceOffset + packedRowStride
+-                        require(sourceOffset >= 0 && sourceEnd <= backingByteCount.toLong()) {
+-                            "Disk RAW region exceeds backing bytes=$backingByteCount"
+-                        }
+-                        output.position(row * packedRowStride)
+-                        output.limit((row + 1) * packedRowStride)
+-                        var position = sourceOffset
+-                        while (output.hasRemaining()) {
+-                            val read = channel.read(output, position)
+-                            if (read < 0) throw IllegalStateException("Unexpected EOF in Night RAW spool")
+-                            if (read == 0) continue
+-                            position += read
+-                        }
+-                    }
+-                }
+-            }
+-            output.position(0)
+-            output.limit(byteCount)
+-            return FileRegion(output, packedRowStride, pixelStrideBytes)
+-        } catch (t: Throwable) {
+-            LargeDirectBuffer.free(output)
+-            throw t
+-        }
+-    }
+-
+     override fun close() {
+-        if (closed.compareAndSet(false, true)) {
+-            closeAction?.invoke()
+-        }
++        if (closed.compareAndSet(false, true)) closeAction?.invoke()
+     }
+ }
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+index 0e843d2..2984c6a 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+@@ -230,125 +230,180 @@ internal object GlesIris26521SpatialRgbShaders {
+         precision highp int;
+         precision highp usampler2D;
+         uniform highp usampler2D uRaw;
++        uniform sampler2D uNoiseEstimates;
+         uniform ivec2 uRawSize;
+-        uniform ivec2 uRawTextureOrigin;
+-        uniform ivec2 uRawTextureSize;
+-        uniform ivec2 uCovarianceSize;
+-        uniform ivec2 uCovarianceOrigin;
+-        uniform ivec2 uCovarianceTextureSize;
+-        uniform vec4 uBayerPhaseGains;
+-        uniform vec4 uBayerPhaseBlackTerms;
+-        uniform vec2 uFigure7Noise;
+-        uniform float uKDetail;
+-        uniform float uKDenoise;
+-        uniform float uDth;
+-        uniform float uDtr;
+-        uniform float uKStretch;
+-        uniform float uKShrink;
++        uniform int uCfaPattern;
++        uniform vec4 uGains;
++        uniform vec4 uBlackLevelsTimesGains;
++        uniform vec4 uNoiseTextureScaleBias;
++        uniform vec4 uCovarianceParameters1;
++        uniform vec4 uCovarianceParameters2;
++        uniform vec4 uCovRangeRgFactors;
++        uniform vec2 uCovRangeBFactor;
+         out vec4 oCovariance;
+ 
+-        /* IRIS_26543_ACTIVE_IPOL_FIGURE7_COVARIANCE
+-         * This is the production GlesIris26521SpatialRgbStacker owner, not the dormant MotionV2
+-         * asset path. It follows IPOL Alg. 5: GAT -> Bayer-quad grey (RAW/2) -> public 2x2
+-         * gradients -> 2x2 structure tensor -> linear A/D selection with stretch=4/shrink=2.
+-         * IPOL produces covariance. Spatial-RGB consumes precision, so invert once here and store
+-         * direct Pxx/Pyy/Pxy in RGBA16F without the released MGC RGB10_A2 packing/clipping.
+-         */
+-        int phaseIndex(ivec2 p) { return ((p.y & 1) << 1) | (p.x & 1); }
+-
+-        float sensorSample(ivec2 p) {
+-            p = clamp(p, ivec2(0), uRawSize - ivec2(1));
+-            int phase = phaseIndex(p);
+-            ivec2 local = p - uRawTextureOrigin;
+-            local = clamp(local, ivec2(0), uRawTextureSize - ivec2(1));
+-            return max(
+-                float(texelFetch(uRaw, local, 0).r) * uBayerPhaseGains[phase] +
+-                    uBayerPhaseBlackTerms[phase],
+-                0.0
+-            );
+-        }
+-
+-        float vst(float x) {
+-            float alpha = max(uFigure7Noise.x, 1.0e-8);
+-            float beta = max(uFigure7Noise.y, 0.0);
+-            float stabilized = max(alpha * x + 0.375 * alpha * alpha + beta, 0.0);
+-            return 2.0 / alpha * sqrt(stabilized);
++        vec4 rawQuad(ivec2 quad) {
++            ivec2 p = clamp(quad * 2, ivec2(0), uRawSize - ivec2(2));
++            float p00 = float(texelFetch(uRaw, p, 0).r);
++            float p10 = float(texelFetch(uRaw, p + ivec2(1, 0), 0).r);
++            float p01 = float(texelFetch(uRaw, p + ivec2(0, 1), 0).r);
++            float p11 = float(texelFetch(uRaw, p + ivec2(1, 1), 0).r);
++            vec4 raw;
++            if (uCfaPattern == 0) raw = vec4(p00, p10, p01, p11);
++            else if (uCfaPattern == 1) raw = vec4(p10, p00, p11, p01);
++            else if (uCfaPattern == 2) raw = vec4(p01, p11, p00, p10);
++            else raw = vec4(p11, p01, p10, p00);
++            return raw * uGains + uBlackLevelsTimesGains;
+         }
+ 
+-        float greyVst(ivec2 q) {
+-            q = clamp(q, ivec2(0), uCovarianceSize - ivec2(1));
+-            ivec2 p = q * 2;
+-            return 0.25 * (
+-                vst(sensorSample(p)) +
+-                vst(sensorSample(p + ivec2(1, 0))) +
+-                vst(sensorSample(p + ivec2(0, 1))) +
+-                vst(sensorSample(p + ivec2(1, 1)))
++        void accumulateGradient(float dx, float dy, inout vec4 tensor) {
++            tensor += vec4(dx * dx, dy * dy, dx * dy, 0.0);
++        }
++
++        vec4 structureTensor(float green0[9], float green1[9]) {
++            vec4 tensor = vec4(0.0);
++            for (int y = 0; y < 2; ++y) {
++                for (int x = 0; x < 2; ++x) {
++                    float g00 = green0[y * 3 + x];
++                    float g01 = green0[y * 3 + x + 1];
++                    float g10 = green1[y * 3 + x];
++                    float g11 = green1[y * 3 + x + 1];
++                    float g20 = green0[(y + 1) * 3 + x];
++                    float g21 = green0[(y + 1) * 3 + x + 1];
++                    float g30 = green1[(y + 1) * 3 + x];
++                    float g31 = green1[(y + 1) * 3 + x + 1];
++                    float bdx;
++                    float bdy;
++                    float rdx;
++                    float rdy;
++                    if (uCfaPattern == 1 || uCfaPattern == 2) {
++                        bdx = 0.5 * ((g11 - g01) + (g21 - g10));
++                        bdy = 0.5 * ((g01 - g10) + (g11 - g21));
++                        rdx = 0.5 * ((g21 - g10) + (g30 - g20));
++                        rdy = 0.5 * ((g21 - g30) + (g10 - g20));
++                    } else {
++                        bdx = 0.5 * ((g11 - g00) + (g20 - g10));
++                        bdy = 0.5 * ((g00 - g10) + (g11 - g20));
++                        rdx = 0.5 * ((g21 - g11) + (g31 - g20));
++                        rdy = 0.5 * ((g21 - g31) + (g11 - g20));
++                    }
++                    accumulateGradient(bdx, bdy, tensor);
++                    accumulateGradient(rdx, rdy, tensor);
++                    accumulateGradient(0.5 * (g21 - g00), 0.5 * (g01 - g20), tensor);
++                    accumulateGradient(0.5 * (g31 - g10), 0.5 * (g11 - g30), tensor);
++                }
++            }
++            tensor /= 16.0;
++            tensor.w = 0.75;
++            float c0 = 0.5 * (tensor.x + tensor.y);
++            float c1 = 0.5 * (tensor.y - tensor.x);
++            return vec4(c0 + tensor.z, c0 - tensor.z, c1, tensor.w);
++        }
++
++        vec3 constructCovariance(vec4 tensor, float greenVariance, float greenNoise) {
++            float trace = tensor.x + tensor.y;
++            float difference = tensor.x - tensor.y;
++            float discriminant = sqrt(max(
++                difference * difference + 4.0 * tensor.z * tensor.z,
++                0.0
++            ));
++            float eigenvalue1 = 0.5 * (trace + discriminant);
++            float eigenvalue2 = 0.5 * (trace - discriminant);
++            vec2 eigenvector1 = vec2(1.0, 0.0);
++            if (abs(tensor.z) > 0.0001) {
++                eigenvector1 = normalize(vec2(tensor.z, eigenvalue1 - tensor.x)) *
++                    -sign(tensor.z);
++            } else if (tensor.x < tensor.y) {
++                eigenvector1 = vec2(0.0, 1.0);
++            }
++            vec2 eigenvector2 = vec2(-eigenvector1.y, eigenvector1.x);
++            float singularValue1 = sqrt(max(eigenvalue1, 0.0));
++            float singularValue2 = sqrt(max(eigenvalue2, 0.0));
++            float correction = tensor.w * greenNoise;
++            eigenvalue1 *= eigenvalue1 / max(eigenvalue1 + correction, 1.0e-8);
++            float strength = sqrt(max(eigenvalue1, 0.0));
++            float coherence = (singularValue1 - singularValue2) /
++                (singularValue1 + singularValue2 + 1.0e-6);
++            float correctedGreenStdDev = sqrt(
++                greenVariance * greenVariance / max(greenVariance + greenNoise, 1.0e-8)
+             );
+-        }
+-
+-        vec2 publicGrad(ivec2 q) {
+-            float g00 = greyVst(q);
+-            float g01 = greyVst(q + ivec2(1, 0));
+-            float g10 = greyVst(q + ivec2(0, 1));
+-            float g11 = greyVst(q + ivec2(1, 1));
+-            return vec2(
+-                0.25 * (-g00 + g01 - g10 + g11),
+-                0.25 * (-g00 - g01 + g10 + g11)
++            float dominantFeature = max(strength, correctedGreenStdDev) -
++                uCovarianceParameters1.z;
++            float blur = clamp(
++                1.0 - dominantFeature * uCovarianceParameters2.y,
++                0.0,
++                1.0
++            );
++            float anisotropicShrinking = mix(
++                uCovarianceParameters1.w,
++                uCovarianceParameters1.x,
++                min(coherence, strength * 5.0)
+             );
++            float precision1 = mix(
++                anisotropicShrinking,
++                uCovarianceParameters2.x,
++                blur
++            );
++            float precision2 = mix(
++                mix(uCovarianceParameters1.w, uCovarianceParameters1.y, coherence),
++                uCovarianceParameters2.x,
++                blur
++            );
++            mat2 rotation = mat2(eigenvector1, eigenvector2);
++            mat2 covariance = transpose(rotation) * mat2(
++                precision1 * precision1, 0.0,
++                0.0, precision2 * precision2
++            ) * rotation;
++            return vec3(covariance[0].x, covariance[1].y, covariance[0].y);
+         }
+ 
+         void main() {
+-            ivec2 localP = ivec2(gl_FragCoord.xy);
+-            if (any(greaterThanEqual(localP, uCovarianceTextureSize))) {
+-                oCovariance = vec4(1.0, 1.0, 0.0, 1.0);
+-                return;
+-            }
+-            ivec2 p = localP + uCovarianceOrigin;
+-            if (any(greaterThanEqual(p, uCovarianceSize))) {
+-                oCovariance = vec4(1.0, 1.0, 0.0, 1.0);
+-                return;
+-            }
+-            float jxx = 0.0, jxy = 0.0, jyy = 0.0;
+-            for (int iy = 0; iy < 2; ++iy) {
+-                for (int ix = 0; ix < 2; ++ix) {
+-                    ivec2 q = p - ivec2(1) + ivec2(ix, iy);
+-                    if (q.x < 0 || q.y < 0 ||
+-                        q.x >= uCovarianceSize.x - 1 || q.y >= uCovarianceSize.y - 1) continue;
+-                    vec2 g = publicGrad(q);
+-                    jxx += g.x * g.x;
+-                    jxy += g.x * g.y;
+-                    jyy += g.y * g.y;
++            ivec2 center = ivec2(gl_FragCoord.xy);
++            float green0[9];
++            float green1[9];
++            float greenSum = 0.0;
++            float greenSquareSum = 0.0;
++            vec3 averageRgb = vec3(0.0);
++            for (int y = -1; y <= 1; ++y) {
++                for (int x = -1; x <= 1; ++x) {
++                    vec4 rggb = rawQuad(center * 2 + ivec2(x, y));
++                    int index = (y + 1) * 3 + x + 1;
++                    if (uCfaPattern == 2 || uCfaPattern == 3) {
++                        green0[index] = rggb.z;
++                        green1[index] = rggb.y;
++                    } else {
++                        green0[index] = rggb.y;
++                        green1[index] = rggb.z;
++                    }
++                    float wx = x == 0 ? 0.5 : 0.25;
++                    float wy = y == 0 ? 0.5 : 0.25;
++                    averageRgb += vec3(rggb.x, 0.5 * (rggb.y + rggb.z), rggb.w) * wx * wy;
++                    greenSum += rggb.y + rggb.z;
++                    greenSquareSum += rggb.y * rggb.y + rggb.z * rggb.z;
+                 }
+             }
+-
+-            float trace = jxx + jyy;
+-            float disc = sqrt(max((jxx-jyy)*(jxx-jyy) + 4.0*jxy*jxy, 0.0));
+-            float l1 = max(0.5 * (trace + disc), 0.0);
+-            float l2 = max(0.5 * (trace - disc), 0.0);
+-            vec2 va = vec2(jxy, l1 - jxx);
+-            vec2 vb = vec2(l1 - jyy, jxy);
+-            float na = dot(va, va), nb = dot(vb, vb);
+-            vec2 e1;
+-            if (max(na, nb) > 1.0e-20) e1 = normalize(na >= nb ? va : vb);
+-            else e1 = jxx >= jyy ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+-            vec2 e2 = vec2(-e1.y, e1.x);
+-
+-            float A = 1.0 + sqrt(max((l1-l2) / max(l1+l2, 1.0e-20), 0.0));
+-            float D = clamp(1.0 - sqrt(max(l1, 0.0)) / max(uDtr, 1.0e-8) + uDth, 0.0, 1.0);
+-            float selected1 = 1.0 + 0.5 * A * (1.0 / max(uKShrink, 1.0e-8) - 1.0);
+-            float selected2 = 1.0 + 0.5 * A * (uKStretch - 1.0);
+-            float k1 = max(uKDetail * ((1.0-D) * selected1 + D * uKDenoise), 1.0e-5);
+-            float k2 = max(uKDetail * ((1.0-D) * selected2 + D * uKDenoise), 1.0e-5);
+-            float k1s = k1*k1, k2s = k2*k2;
+-            float xx = k1s*e1.x*e1.x + k2s*e2.x*e2.x;
+-            float xy = k1s*e1.x*e1.y + k2s*e2.x*e2.y;
+-            float yy = k1s*e1.y*e1.y + k2s*e2.y*e2.y;
+-            float det = xx*yy - xy*xy;
+-            if (abs(det) <= 1.0e-12) {
+-                oCovariance = vec4(1.0, 1.0, 0.0, 1.0);
+-            } else {
+-                oCovariance = vec4(yy/det, xx/det, -xy/det, 1.0);
+-            }
++            float greenMean = greenSum / 18.0;
++            float greenVariance = max(0.0, greenSquareSum / 18.0 - greenMean * greenMean);
++            float averageLuma = dot(averageRgb, vec3(0.25, 0.5, 0.25));
++            vec2 noiseUv = vec2(averageLuma, 1.0) * uNoiseTextureScaleBias.xy +
++                uNoiseTextureScaleBias.zw;
++            float greenNoise = 2.0 * texture(uNoiseEstimates, noiseUv).y;
++            vec3 covariance = constructCovariance(
++                structureTensor(green0, green1),
++                greenVariance,
++                greenNoise
++            );
++            vec2 packedRg = clamp(
++                covariance.xy * uCovRangeRgFactors.yw + uCovRangeRgFactors.xz,
++                0.0,
++                1.0
++            );
++            float packedB = clamp(
++                covariance.z * uCovRangeBFactor.y + uCovRangeBFactor.x,
++                0.0,
++                1.0
++            );
++            oCovariance = vec4(packedRg, packedB, 0.0);
+         }
+     """.trimIndent()
+ 
+@@ -1206,14 +1261,14 @@ internal object GlesIris26521SpatialRgbShaders {
+         uniform sampler2D uFrameWeight;
+         uniform sampler2D uCovariance;
+         uniform ivec2 uRawSize;
+-        uniform ivec2 uCovarianceOrigin;
+-        uniform ivec2 uCovarianceTextureSize;
+         uniform ivec2 uRawTextureOrigin;
+         uniform ivec2 uRawRegionOrigin;
+         uniform ivec2 uRawRegionSize;
+         uniform ivec2 uOutputSize;
+         uniform ivec2 uOutputOrigin;
+         uniform ivec2 uAccumulatorOrigin;
++        uniform vec4 uCovRangeRg;
++        uniform vec2 uCovRangeB;
+         uniform vec4 uGains;
+         uniform vec4 uBlackLevelsTimesGains;
+         uniform vec2 uGreenNoise;
+@@ -1319,11 +1374,11 @@ internal object GlesIris26521SpatialRgbShaders {
+             return vec3(mix(baseFlow, interpolated, confidence), confidence);
+         }
+ 
+-        float kernelWeight(vec2 pixelOffset, vec3 precision) {
+-            float distance = pixelOffset.x * pixelOffset.x * precision.x +
+-                pixelOffset.y * pixelOffset.y * precision.y +
+-                2.0 * pixelOffset.x * pixelOffset.y * precision.z;
+-            return exp(-0.5 * max(distance, 0.0));
++        float kernelWeight(vec2 pixelOffset, vec3 covariance) {
++            float distance = pixelOffset.x * pixelOffset.x * covariance.x +
++                pixelOffset.y * pixelOffset.y * covariance.y +
++                2.0 * pixelOffset.x * pixelOffset.y * covariance.z;
++            return exp2(-0.5 * max(distance, 0.0)) + 0.00005;
+         }
+ 
+         float chromaGuideWeight(float sampleGreen, float targetGreen) {
+@@ -1370,18 +1425,12 @@ internal object GlesIris26521SpatialRgbShaders {
+                 oGbWeights = vec4(0.0);
+                 return;
+             }
+-            /* IPOL Bayer covariance coordinate is (sourceCenter/2 - 0.5). Our sourceRaw is
+-             * integer-pixel-center coordinates, so sourceCenter=sourceRaw+0.5. Converting that
+-             * texel-index coordinate to GL normalized coordinates for a possibly band-local
+-             * covariance texture gives ((sourceRaw+0.5)/2-origin)/localSize. Full-frame origin=0
+-             * reduces exactly to the previously audited (sourceRaw+0.5)/rawSize mapping. */
+-            vec2 covarianceUv = (
+-                (sourceRaw + vec2(0.5)) * 0.5 - vec2(uCovarianceOrigin)
+-            ) / vec2(uCovarianceTextureSize);
+-            vec3 covariance = texture(
+-                uCovariance,
+-                clamp(covarianceUv, vec2(0.0), vec2(1.0))
+-            ).xyz;
++            vec2 sourceUv = (sourceRaw + vec2(0.5)) / vec2(uRawSize);
++            vec3 packedCovariance = texture(uCovariance, clamp(sourceUv, vec2(0.0), vec2(1.0))).xyz;
++            vec3 covariance = vec3(
++                packedCovariance.xy * uCovRangeRg.yw + uCovRangeRg.xz,
++                packedCovariance.z * uCovRangeB.y + uCovRangeB.x
++            );
+             vec2 samplePosition = sourceRaw + vec2(0.5);
+             ivec2 anchor = ivec2(floor(samplePosition));
+             vec2 subpixelOffset = vec2(anchor) + vec2(0.5) - samplePosition;
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+index e227b5f..e96ab33 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+@@ -115,7 +115,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         val frame: RgbMergeFrame,
+         val sourceRegion: MgcSpatialRgbRect,
+         val uploadRegion: MgcSpatialRgbRect,
+-        val covarianceRegion: MgcSpatialRgbRect,
+     )
+ 
+     private data class RgbBandPlan(
+@@ -129,8 +128,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         val maximumSourceHeight: Int,
+         val maximumUploadWidth: Int,
+         val maximumUploadHeight: Int,
+-        val maximumCovarianceWidth: Int,
+-        val maximumCovarianceHeight: Int,
+         val projectedGpuBytes: Long,
+     )
+ 
+@@ -237,8 +234,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         val blackTerms: FloatArray,
+         val bayerPhaseGains: FloatArray,
+         val bayerPhaseBlackTerms: FloatArray,
+-        val bayerPhaseShotNoise: FloatArray,
+-        val bayerPhaseReadNoise: FloatArray,
+         val globalFrameWeight: Float,
+         val kernelSigma: Float,
+         val shotNoise: FloatArray,
+@@ -343,12 +338,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         val referenceGreenReadVariance: Float,
+         val referenceSnr: Float,
+         val baseSpatialScale: Float,
+-        val figure7KDetail: Float,
+-        val figure7KDenoise: Float,
+-        val figure7Dth: Float,
+-        val figure7Dtr: Float,
+-        val figure7KStretch: Float,
+-        val figure7KShrink: Float,
+     )
+ 
+     private data class BentoAssessment(
+@@ -360,12 +349,10 @@ internal class GlesIris26521SpatialRgbStacker(
+         val ultrashortClippingOverlap: Float,
+     )
+ 
+-    // GuideImage/rejection keeps released MGC quarter-resolution ownership. Figure-7 covariance
+-    // is separate and follows the paper/IPOL contract: one tensor/covariance per Bayer quad (RAW/2).
++    // GuideImage is quarter-resolution, but GenerateRejectionTexture runs once per Bayer quad.
++    // MergeBayer consumes the half-sized result of DilateMask.
+     private val guideWidth = max(1, width / 4)
+     private val guideHeight = max(1, height / 4)
+-    private val covarianceWidth = max(1, width / 2)
+-    private val covarianceHeight = max(1, height / 2)
+     // MergeBayerRaw16's queried AOT contract requests one alignment sample per 8x8
+     // Bayer-quad tile, i.e. one sample per 16x16 sensor pixels.
+     private val bayerAlignmentWidth = ceilDiv(width, MERGE_BAYER_RAW_TILE_SIZE)
+@@ -670,9 +657,9 @@ internal class GlesIris26521SpatialRgbStacker(
+             )
+             val referenceCovariance = if (outputMode == MgcSpatialOutputMode.RGB) {
+                 createTexture(
+-                    covarianceWidth,
+-                    covarianceHeight,
+-                    GLES30.GL_RGBA16F,
++                    guideWidth,
++                    guideHeight,
++                    GLES30.GL_RGB10_A2,
+                     GLES30.GL_LINEAR,
+                 )
+             } else {
+@@ -680,9 +667,9 @@ internal class GlesIris26521SpatialRgbStacker(
+             }
+             val currentCovariance = if (outputMode == MgcSpatialOutputMode.RGB) {
+                 createTexture(
+-                    covarianceWidth,
+-                    covarianceHeight,
+-                    GLES30.GL_RGBA16F,
++                    guideWidth,
++                    guideHeight,
++                    GLES30.GL_RGB10_A2,
+                     GLES30.GL_LINEAR,
+                 )
+             } else {
+@@ -760,18 +747,6 @@ internal class GlesIris26521SpatialRgbStacker(
+                     "baseSpatialScale=${bayerKernelTuning.baseSpatialScale} " +
+                     "referenceSigma=${referenceCalibration.kernelSigma}",
+             )
+-            PLog.i(
+-                TAG,
+-                "IRIS_26543_ACTIVE_FIGURE7 owner=GlesIris26521SpatialRgbStacker " +
+-                    "shaderOwner=GlesIris26521SpatialRgbShaders.covariance/mergeRgb " +
+-                    "reachableFrom=GlesMgcRawFusion mergeMethod=SPATIAL_RGB grid=RAW2 " +
+-                    "kernelLaw=IPOL_LINEAR kDetail=${bayerKernelTuning.figure7KDetail} " +
+-                    "kDenoise=${bayerKernelTuning.figure7KDenoise} " +
+-                    "Dth=${bayerKernelTuning.figure7Dth} Dtr=${bayerKernelTuning.figure7Dtr} " +
+-                    "kStretch=${bayerKernelTuning.figure7KStretch} " +
+-                    "kShrink=${bayerKernelTuning.figure7KShrink} gaussian=EXP_NEG_HALF_D " +
+-                    "precisionStorage=RGBA16F covarianceUv=RAW_PLUS_HALF_OVER_RAW_SIZE",
+-            )
+             val rawUploadStartNs = System.nanoTime()
+             uploadRaw(images.first(), referenceRaw, "reference")
+             PLog.i(
+@@ -798,8 +773,8 @@ internal class GlesIris26521SpatialRgbStacker(
+             if (outputMode == MgcSpatialOutputMode.RGB) {
+                 renderCovariance(
+                     rawTexture = referenceRaw,
++                    noiseTexture = referenceNoiseLut,
+                     calibration = referenceCalibration,
+-                    kernelTuning = bayerKernelTuning,
+                     outputTexture = referenceCovariance,
+                 )
+             }
+@@ -998,15 +973,15 @@ internal class GlesIris26521SpatialRgbStacker(
+                     if (outputMode == MgcSpatialOutputMode.RGB) {
+                         renderCovariance(
+                             rawTexture = bentoRaw,
++                            noiseTexture = normalizedNoiseLut,
+                             calibration = normalizedCalibration,
+-                            kernelTuning = bayerKernelTuning,
+                             outputTexture = currentCovariance,
+                         )
+                         bentoRgbCovarianceTexture = copyPersistentTexture(
+                             source = currentCovariance,
+-                            textureWidth = covarianceWidth,
+-                            textureHeight = covarianceHeight,
+-                            internalFormat = GLES30.GL_RGBA16F,
++                            textureWidth = guideWidth,
++                            textureHeight = guideHeight,
++                            internalFormat = GLES30.GL_RGB10_A2,
+                             filter = GLES30.GL_LINEAR,
+                             label = "MGC Bento RGB covariance",
+                         )
+@@ -1628,27 +1603,23 @@ internal class GlesIris26521SpatialRgbStacker(
+                                     label = "MGC RGB final weight frame $index",
+                                 )
+                             }
+-                            /* IRIS_26543_BANDED_FIGURE7_BOUNDED_COVARIANCE
+-                             * The low-memory/banded path must not retain one RAW/2 RGBA16F
+-                             * covariance (~24 MiB at 4096x3072) per temporal frame. Alignment and
+-                             * rejection remain compact persistent evidence; Figure-7 covariance is
+-                             * reconstructed from the current streamed RAW band immediately before
+-                             * that frame contributes, using one reusable scratch texture.
+-                             */
++                            val retainedCovariance = copyPersistentTexture(
++                                source = currentCovariance,
++                                textureWidth = guideWidth,
++                                textureHeight = guideHeight,
++                                internalFormat = GLES30.GL_RGB10_A2,
++                                filter = GLES30.GL_LINEAR,
++                                label = "MGC RGB covariance frame $index",
++                            )
+                             rgbMergeFrames += RgbMergeFrame(
+                                 imageIndex = index,
+                                 calibration = prepared.calibration,
+                                 alignmentTexture = retainedAlignment,
+                                 weightTexture = retainedWeight,
+-                                covarianceTexture = 0,
++                                covarianceTexture = retainedCovariance,
+                                 flowBounds = conservativeRgbFlowBounds,
+                                 useFrameWeight = true,
+                             )
+-                            PLog.d(
+-                                TAG,
+-                                "IRIS_26543_BANDED_COVARIANCE_FRAME frame=$index " +
+-                                    "retainedFullCovariance=false",
+-                            )
+                         }
+                     }
+                     strengthCapture?.let { capture ->
+@@ -1751,11 +1722,11 @@ internal class GlesIris26521SpatialRgbStacker(
+                             "but Bayer/noise merge admitted $mergedFrames"
+                     }
+                     rgbMergeFrames.flatMap { frame ->
+-                        buildList {
+-                            add(frame.alignmentTexture)
+-                            add(frame.weightTexture)
+-                            if (frame.covarianceTexture != 0) add(frame.covarianceTexture)
+-                        }
++                        listOf(
++                            frame.alignmentTexture,
++                            frame.weightTexture,
++                            frame.covarianceTexture,
++                        )
+                     }.toIntArray()
+                 }
+                 val temporalGpuBytes = estimatedOwnedTextureBytes()
+@@ -2504,15 +2475,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         val frameNoiseModel = noiseModelForFrame(frame)
+         val sourceShot = frameNoiseModel.normalizedShotNoiseForShader(cfaPattern)
+         val sourceRead = frameNoiseModel.normalizedReadNoiseForShader(cfaPattern)
+-        val bayerPhaseShotNoise = FloatArray(4)
+-        val bayerPhaseReadNoise = FloatArray(4)
+-        val exposureScaleSquaredForBayer = exposureScale * exposureScale
+-        for (phase in 0 until 4) {
+-            val canonicalChannel = canonicalChannelAtPhase(phase)
+-            bayerPhaseShotNoise[phase] = sourceShot[canonicalChannel] * exposureScale
+-            bayerPhaseReadNoise[phase] =
+-                sourceRead[canonicalChannel] * exposureScaleSquaredForBayer
+-        }
+         val shot = FloatArray(4)
+         val read = FloatArray(4)
+         val unblockerShot = FloatArray(4)
+@@ -2576,8 +2538,6 @@ internal class GlesIris26521SpatialRgbStacker(
+             blackTerms = blackTerms,
+             bayerPhaseGains = bayerPhaseGains,
+             bayerPhaseBlackTerms = bayerPhaseBlackTerms,
+-            bayerPhaseShotNoise = bayerPhaseShotNoise,
+-            bayerPhaseReadNoise = bayerPhaseReadNoise,
+             globalFrameWeight = globalFrameWeight,
+             kernelSigma = kernelSigma,
+             shotNoise = shot,
+@@ -2623,9 +2583,6 @@ internal class GlesIris26521SpatialRgbStacker(
+                     SPATIAL_KERNEL_SCALE_HIGH_SNR -
+                         SPATIAL_KERNEL_SCALE_LOW_SNR
+                     )
+-        val figure7KDenoise = 5.0f + snrPosition * (3.0f - 5.0f)
+-        val figure7Dth = 0.81f + snrPosition * (0.71f - 0.81f)
+-        val figure7Dtr = 1.24f + snrPosition * (1.00f - 1.24f)
+         return BayerKernelTuning(
+             referenceSignal = referenceSignal,
+             referenceNoiseVariance = referenceNoiseVariance,
+@@ -2633,12 +2590,6 @@ internal class GlesIris26521SpatialRgbStacker(
+             referenceGreenReadVariance = readNoise.getOrElse(1) { 0f },
+             referenceSnr = referenceSnr,
+             baseSpatialScale = baseSpatialScale,
+-            figure7KDetail = baseSpatialScale,
+-            figure7KDenoise = figure7KDenoise,
+-            figure7Dth = figure7Dth,
+-            figure7Dtr = figure7Dtr,
+-            figure7KStretch = 4.0f,
+-            figure7KShrink = 2.0f,
+         )
+     }
+ 
+@@ -3313,72 +3264,67 @@ internal class GlesIris26521SpatialRgbStacker(
+ 
+     private fun renderCovariance(
+         rawTexture: Int,
++        noiseTexture: Int,
+         calibration: FrameCalibration,
+-        kernelTuning: BayerKernelTuning,
+-        outputTexture: Int,
+-    ) {
+-        renderCovarianceRegion(
+-            rawTexture = rawTexture,
+-            rawTextureOrigin = MgcSpatialRgbRect(0, 0, width, height),
+-            calibration = calibration,
+-            kernelTuning = kernelTuning,
+-            covarianceRegion = MgcSpatialRgbRect(0, 0, covarianceWidth, covarianceHeight),
+-            outputTexture = outputTexture,
+-        )
+-    }
+-
+-    private fun renderCovarianceRegion(
+-        rawTexture: Int,
+-        rawTextureOrigin: MgcSpatialRgbRect,
+-        calibration: FrameCalibration,
+-        kernelTuning: BayerKernelTuning,
+-        covarianceRegion: MgcSpatialRgbRect,
+         outputTexture: Int,
+     ) {
+         check(outputMode == MgcSpatialOutputMode.RGB && covarianceProgram != 0)
+         GLES30.glUseProgram(covarianceProgram)
+         bindTexture(covarianceProgram, "uRaw", 0, rawTexture)
++        bindTexture(covarianceProgram, "uNoiseEstimates", 1, noiseTexture)
+         uniform2i(covarianceProgram, "uRawSize", width, height)
+-        uniform2i(
+-            covarianceProgram, "uRawTextureOrigin",
+-            rawTextureOrigin.left, rawTextureOrigin.top,
++        uniform1i(covarianceProgram, "uCfaPattern", cfaPattern)
++        uniform4fv(covarianceProgram, "uGains", calibration.gains)
++        uniform4fv(
++            covarianceProgram,
++            "uBlackLevelsTimesGains",
++            calibration.blackTerms,
+         )
+-        uniform2i(
+-            covarianceProgram, "uRawTextureSize",
+-            rawTextureOrigin.width, rawTextureOrigin.height,
++        uniform4f(covarianceProgram, "uNoiseTextureScaleBias", 0.9f, 0.5f, 0.05f, 0.25f)
++        uniform4f(
++            covarianceProgram,
++            "uCovarianceParameters1",
++            6f,
++            1.3333333333333333f,
++            0.001f,
++            4f,
+         )
+-        uniform2i(covarianceProgram, "uCovarianceSize", covarianceWidth, covarianceHeight)
+-        uniform2i(
+-            covarianceProgram, "uCovarianceOrigin",
+-            covarianceRegion.left, covarianceRegion.top,
++        uniform4f(
++            covarianceProgram,
++            "uCovarianceParameters2",
++            1f,
++            142.85714285714286f,
++            0f,
++            0f,
+         )
+-        uniform2i(
+-            covarianceProgram, "uCovarianceTextureSize",
+-            covarianceRegion.width, covarianceRegion.height,
++        uniform4f(
++            covarianceProgram,
++            "uCovRangeRgFactors",
++            covariancePackOffset(COV_MIN_R, COV_MAX_R),
++            covariancePackScale(COV_MIN_R, COV_MAX_R),
++            covariancePackOffset(COV_MIN_G, COV_MAX_G),
++            covariancePackScale(COV_MIN_G, COV_MAX_G),
+         )
+-        uniform4fv(covarianceProgram, "uBayerPhaseGains", calibration.bayerPhaseGains)
+-        uniform4fv(
++        uniform2f(
+             covarianceProgram,
+-            "uBayerPhaseBlackTerms",
+-            calibration.bayerPhaseBlackTerms,
++            "uCovRangeBFactor",
++            covariancePackOffset(COV_MIN_B, COV_MAX_B),
++            covariancePackScale(COV_MIN_B, COV_MAX_B),
+         )
+-        val averageShot = calibration.bayerPhaseShotNoise.average().coerceAtLeast(1.0e-8f)
+-        val averageRead = calibration.bayerPhaseReadNoise.average().coerceAtLeast(0.0f)
+-        uniform2f(covarianceProgram, "uFigure7Noise", averageShot, averageRead)
+-        uniform1f(covarianceProgram, "uKDetail", kernelTuning.figure7KDetail)
+-        uniform1f(covarianceProgram, "uKDenoise", kernelTuning.figure7KDenoise)
+-        uniform1f(covarianceProgram, "uDth", kernelTuning.figure7Dth)
+-        uniform1f(covarianceProgram, "uDtr", kernelTuning.figure7Dtr)
+-        uniform1f(covarianceProgram, "uKStretch", kernelTuning.figure7KStretch)
+-        uniform1f(covarianceProgram, "uKShrink", kernelTuning.figure7KShrink)
+         draw(
+             covarianceProgram,
+-            covarianceRegion.width,
+-            covarianceRegion.height,
++            guideWidth,
++            guideHeight,
+             intArrayOf(outputTexture),
+         )
+     }
+ 
++    private fun covariancePackOffset(minimum: Float, maximum: Float): Float =
++        -minimum / (maximum - minimum)
++
++    private fun covariancePackScale(minimum: Float, maximum: Float): Float =
++        1f / (maximum - minimum)
++
+     private fun renderUnblocker(
+         rawTexture: Int,
+         calibration: FrameCalibration,
+@@ -3730,8 +3676,8 @@ internal class GlesIris26521SpatialRgbStacker(
+         if (outputMode == MgcSpatialOutputMode.RGB) {
+             renderCovariance(
+                 rawTexture = currentRaw,
++                noiseTexture = currentNoiseLut,
+                 calibration = calibration,
+-                kernelTuning = kernelTuning,
+                 outputTexture = currentCovariance,
+             )
+         }
+@@ -5686,40 +5632,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         }
+     }
+ 
+-    /* IRIS_26543_BANDED_FIGURE7_REGION_OWNER
+-     * For streamed reconstruction, compute only the RAW/2 covariance cells touched by this
+-     * source band. Figure-7 cell q needs RAW support [2q-2, 2q+3], so the upload rectangle is
+-     * expanded from the covariance cell rectangle rather than assuming the 3x3 merge halo is
+-     * sufficient. This keeps covariance residency bounded independently of frame count.
+-     */
+-    private fun figure7CovarianceRegion(source: MgcSpatialRgbRect): MgcSpatialRgbRect {
+-        val expandedLeft = max(0, source.left - FIGURE7_BANDED_COV_RAW_MARGIN)
+-        val expandedTop = max(0, source.top - FIGURE7_BANDED_COV_RAW_MARGIN)
+-        val expandedRight = minOf(width, source.right + FIGURE7_BANDED_COV_RAW_MARGIN)
+-        val expandedBottom = minOf(height, source.bottom + FIGURE7_BANDED_COV_RAW_MARGIN)
+-        val left = (expandedLeft / 2).coerceIn(0, covarianceWidth - 1)
+-        val top = (expandedTop / 2).coerceIn(0, covarianceHeight - 1)
+-        val right = ceilDiv(expandedRight, 2).coerceIn(left + 1, covarianceWidth)
+-        val bottom = ceilDiv(expandedBottom, 2).coerceIn(top + 1, covarianceHeight)
+-        return MgcSpatialRgbRect(left, top, right, bottom)
+-    }
+-
+-    private fun figure7RawSupportRegion(covariance: MgcSpatialRgbRect): MgcSpatialRgbRect {
+-        val left = max(0, covariance.left * 2 - FIGURE7_COV_RAW_NEGATIVE_SUPPORT)
+-        val top = max(0, covariance.top * 2 - FIGURE7_COV_RAW_NEGATIVE_SUPPORT)
+-        val right = minOf(width, covariance.right * 2 + FIGURE7_COV_RAW_POSITIVE_SUPPORT)
+-        val bottom = minOf(height, covariance.bottom * 2 + FIGURE7_COV_RAW_POSITIVE_SUPPORT)
+-        return MgcSpatialRgbRect(left, top, right, bottom)
+-    }
+-
+-    private fun unionRawRegions(a: MgcSpatialRgbRect, b: MgcSpatialRgbRect): MgcSpatialRgbRect =
+-        MgcSpatialRgbRect(
+-            left = minOf(a.left, b.left),
+-            top = minOf(a.top, b.top),
+-            right = maxOf(a.right, b.right),
+-            bottom = maxOf(a.bottom, b.bottom),
+-        )
+-
+     private fun createRgbBandPlan(
+         frames: List<RgbMergeFrame>,
+         diagnosticCapture: StrengthCapture?,
+@@ -5741,17 +5653,13 @@ internal class GlesIris26521SpatialRgbStacker(
+                     flowBounds = frame.flowBounds,
+                     reconstructionZoom = if (iris26532CropAwareSrEnabled) reconstructionZoom else 1f,
+                 )
+-                val covarianceRegion = figure7CovarianceRegion(sourceRegion)
+-                val chromaUploadRegion = expandRgbRawRegion(
+-                    sourceRegion,
+-                    RGB_CHROMA_GUIDE_RAW_RADIUS,
+-                )
+-                val covarianceRawSupport = figure7RawSupportRegion(covarianceRegion)
+                 RgbTileFrameRegion(
+                     frame = frame,
+                     sourceRegion = sourceRegion,
+-                    uploadRegion = unionRawRegions(chromaUploadRegion, covarianceRawSupport),
+-                    covarianceRegion = covarianceRegion,
++                    uploadRegion = expandRgbRawRegion(
++                        sourceRegion,
++                        RGB_CHROMA_GUIDE_RAW_RADIUS,
++                    ),
+                 )
+             }
+         }
+@@ -5783,15 +5691,8 @@ internal class GlesIris26521SpatialRgbStacker(
+         val maximumUploadHeight = work.maxOf { (_, regions) ->
+             regions.maxOf { it.uploadRegion.height }
+         }
+-        val maximumCovarianceWidth = work.maxOf { (_, regions) ->
+-            regions.maxOf { it.covarianceRegion.width }
+-        }
+-        val maximumCovarianceHeight = work.maxOf { (_, regions) ->
+-            regions.maxOf { it.covarianceRegion.height }
+-        }
+         val rawWindowBytes = maximumUploadWidth.toLong() * maximumUploadHeight *
+             RAW_BYTES_PER_PIXEL * RGB_RAW_WINDOW_SLOTS
+-        val covarianceScratchBytes = maximumCovarianceWidth.toLong() * maximumCovarianceHeight * 8L
+         val chromaGuideBytes = maximumSourceWidth.toLong() * maximumSourceHeight * 2L
+         val accumulatorBytes = maximumOutputWidth.toLong() * maximumOutputHeight * 16L
+         val outputStorageBytes = if (iris26532StreamingOutput2x) {
+@@ -5815,7 +5716,7 @@ internal class GlesIris26521SpatialRgbStacker(
+             0L
+         }
+         val projectedGpuBytes = estimatedOwnedTextureBytes() + rawWindowBytes +
+-            covarianceScratchBytes + chromaGuideBytes + accumulatorBytes + outputStorageBytes +
++            chromaGuideBytes + accumulatorBytes + outputStorageBytes +
+             diagnosticTextureBytes + diagnosticPboBytes + RGB_TEXTURE_BUDGET_RESERVE_BYTES
+         return RgbBandPlan(
+             bands = bands,
+@@ -5828,8 +5729,6 @@ internal class GlesIris26521SpatialRgbStacker(
+             maximumSourceHeight = maximumSourceHeight,
+             maximumUploadWidth = maximumUploadWidth,
+             maximumUploadHeight = maximumUploadHeight,
+-            maximumCovarianceWidth = maximumCovarianceWidth,
+-            maximumCovarianceHeight = maximumCovarianceHeight,
+             projectedGpuBytes = projectedGpuBytes,
+         )
+     }
+@@ -5879,8 +5778,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         val maximumSourceHeight = bandPlan.maximumSourceHeight
+         val maximumUploadWidth = bandPlan.maximumUploadWidth
+         val maximumUploadHeight = bandPlan.maximumUploadHeight
+-        val maximumCovarianceWidth = bandPlan.maximumCovarianceWidth
+-        val maximumCovarianceHeight = bandPlan.maximumCovarianceHeight
+         val rawBandTextures = List(RGB_RAW_WINDOW_SLOTS) {
+             createTexture(
+                 maximumUploadWidth,
+@@ -5889,12 +5786,6 @@ internal class GlesIris26521SpatialRgbStacker(
+                 GLES30.GL_NEAREST,
+             )
+         }
+-        val covarianceBandTexture = createTexture(
+-            maximumCovarianceWidth,
+-            maximumCovarianceHeight,
+-            GLES30.GL_RGBA16F,
+-            GLES30.GL_LINEAR,
+-        )
+         val chromaGuideRegionTexture = createTexture(
+             maximumSourceWidth,
+             maximumSourceHeight,
+@@ -6027,8 +5918,6 @@ internal class GlesIris26521SpatialRgbStacker(
+                 "rawWindow=${maximumUploadWidth}x$maximumUploadHeight " +
+                 "rawWindowBytes=" +
+                 "${maximumUploadWidth.toLong() * maximumUploadHeight * RAW_BYTES_PER_PIXEL * rawBandTextures.size} " +
+-                "covarianceScratch=${maximumCovarianceWidth}x$maximumCovarianceHeight " +
+-                "covarianceScratchBytes=${maximumCovarianceWidth.toLong() * maximumCovarianceHeight * 8L} " +
+                 "maxOutput=${maximumOutputWidth}x$maximumOutputHeight " +
+                 "maxChromaGuide=${maximumSourceWidth}x$maximumSourceHeight " +
+                 "frames=${frames.size} reconstruction=joint-G/R-G/B-G " +
+@@ -6117,21 +6006,10 @@ internal class GlesIris26521SpatialRgbStacker(
+                     }
+                     val rawBandTexture = rawBandTextures[framePosition % rawBandTextures.size]
+                     val rawResource = GlesGpuScheduler.textureResource(rawBandTexture)
+-                    val reconstructCovariance = frameRegion.frame.covarianceTexture == 0
+-                    val covarianceScratchResource =
+-                        GlesGpuScheduler.textureResource(covarianceBandTexture)
+                     passWindow.beginPass(
+                         label = "MGC RGB band ${band.index} frame $framePosition",
+-                        reads = if (reconstructCovariance) {
+-                            longArrayOf(rawResource, covarianceScratchResource)
+-                        } else {
+-                            longArrayOf(rawResource)
+-                        },
+-                        writes = if (reconstructCovariance) {
+-                            longArrayOf(rawResource, covarianceScratchResource)
+-                        } else {
+-                            longArrayOf(rawResource)
+-                        },
++                        reads = longArrayOf(rawResource),
++                        writes = longArrayOf(rawResource),
+                     )
+                     try {
+                         val uploadStartNs = System.nanoTime()
+@@ -6146,25 +6024,6 @@ internal class GlesIris26521SpatialRgbStacker(
+                         rawBandUploadBytes += frameRegion.uploadRegion.width.toLong() *
+                             frameRegion.uploadRegion.height * RAW_BYTES_PER_PIXEL
+                         rawBandUploadCount += 1
+-                        val activeCovarianceTexture: Int
+-                        val activeCovarianceOrigin: MgcSpatialRgbRect
+-                        if (reconstructCovariance) {
+-                            renderCovarianceRegion(
+-                                rawTexture = rawBandTexture,
+-                                rawTextureOrigin = frameRegion.uploadRegion,
+-                                calibration = frameRegion.frame.calibration,
+-                                kernelTuning = bayerKernelTuning,
+-                                covarianceRegion = frameRegion.covarianceRegion,
+-                                outputTexture = covarianceBandTexture,
+-                            )
+-                            activeCovarianceTexture = covarianceBandTexture
+-                            activeCovarianceOrigin = frameRegion.covarianceRegion
+-                        } else {
+-                            activeCovarianceTexture = frameRegion.frame.covarianceTexture
+-                            activeCovarianceOrigin = MgcSpatialRgbRect(
+-                                0, 0, covarianceWidth, covarianceHeight,
+-                            )
+-                        }
+                         renderRgbChromaGuide(
+                             frame = frameRegion.frame,
+                             rawTexture = rawBandTexture,
+@@ -6181,8 +6040,6 @@ internal class GlesIris26521SpatialRgbStacker(
+                             chromaGuideRegionTexture = chromaGuideRegionTexture,
+                             semanticAccumulator = semanticAccumulator,
+                             opponentWeightAccumulator = opponentWeightAccumulator,
+-                            covarianceTexture = activeCovarianceTexture,
+-                            covarianceRegion = activeCovarianceOrigin,
+                         )
+                     } finally {
+                         passWindow.endPass()
+@@ -6726,10 +6583,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         semanticAccumulator: Int,
+         opponentWeightAccumulator: Int,
+         accumulatorIsFullOutput: Boolean = false,
+-        covarianceTexture: Int = frame.covarianceTexture,
+-        covarianceRegion: MgcSpatialRgbRect = MgcSpatialRgbRect(
+-            0, 0, covarianceWidth, covarianceHeight,
+-        ),
+     ) {
+         require(outputCores.isNotEmpty())
+         val activeMergeProgram = if (iris26532CropAwareSrEnabled) mergeRgbSuperResProgram else mergeRgbProgram
+@@ -6739,17 +6592,8 @@ internal class GlesIris26521SpatialRgbStacker(
+         bindTexture(activeMergeProgram, "uChromaGuideRegion", 1, chromaGuideRegionTexture)
+         bindTexture(activeMergeProgram, "uAlignment", 2, frame.alignmentTexture)
+         bindTexture(activeMergeProgram, "uFrameWeight", 3, frame.weightTexture)
+-        check(covarianceTexture != 0) { "RGB contribution has no active Figure-7 covariance" }
+-        bindTexture(activeMergeProgram, "uCovariance", 4, covarianceTexture)
++        bindTexture(activeMergeProgram, "uCovariance", 4, frame.covarianceTexture)
+         uniform2i(activeMergeProgram, "uRawSize", width, height)
+-        uniform2i(
+-            activeMergeProgram, "uCovarianceOrigin",
+-            covarianceRegion.left, covarianceRegion.top,
+-        )
+-        uniform2i(
+-            activeMergeProgram, "uCovarianceTextureSize",
+-            covarianceRegion.width, covarianceRegion.height,
+-        )
+         uniform2i(
+             activeMergeProgram,
+             "uRawTextureOrigin",
+@@ -6777,6 +6621,20 @@ internal class GlesIris26521SpatialRgbStacker(
+                 if (frame.imageIndex == 0 || !iris26530GcamLumaTuningEnabled) 1f else iris26530LumaAuxScale,
+             )
+         }
++        uniform4f(
++            activeMergeProgram,
++            "uCovRangeRg",
++            COV_MIN_R,
++            COV_MAX_R - COV_MIN_R,
++            COV_MIN_G,
++            COV_MAX_G - COV_MIN_G,
++        )
++        uniform2f(
++            activeMergeProgram,
++            "uCovRangeB",
++            COV_MIN_B,
++            COV_MAX_B - COV_MIN_B,
++        )
+         uniform4fv(activeMergeProgram, "uGains", frame.calibration.gains)
+         uniform4fv(
+             activeMergeProgram,
+@@ -7305,25 +7163,6 @@ internal class GlesIris26521SpatialRgbStacker(
+     }
+ 
+     private fun uploadRaw(image: SafeImage, texture: Int, label: String) {
+-        if (image.isFileBacked) {
+-            val region = image.readFileRegion(0, 0, width, height)
+-            try {
+-                GLES30.glBindBuffer(GLES30.GL_PIXEL_UNPACK_BUFFER, 0)
+-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
+-                GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
+-                GLES30.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, region.rowStride / RAW_BYTES_PER_PIXEL)
+-                GLES30.glTexSubImage2D(
+-                    GLES30.GL_TEXTURE_2D, 0, 0, 0, width, height,
+-                    GLES30.GL_RED_INTEGER, GLES30.GL_UNSIGNED_SHORT, region.buffer,
+-                )
+-                GLES30.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, 0)
+-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+-                checkGlError("upload $label disk-backed")
+-            } finally {
+-                region.close()
+-            }
+-            return
+-        }
+         val plane = image.planes.firstOrNull()
+             ?: throw IllegalArgumentException("$label has no RAW plane")
+         require(plane.pixelStride == RAW_BYTES_PER_PIXEL) {
+@@ -7366,28 +7205,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         label: String,
+     ) {
+         require(region.right <= width && region.bottom <= height)
+-        if (image.isFileBacked) {
+-            val fileRegion = image.readFileRegion(region.left, region.top, region.width, region.height)
+-            try {
+-                GLES30.glBindBuffer(GLES30.GL_PIXEL_UNPACK_BUFFER, 0)
+-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
+-                GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
+-                GLES30.glPixelStorei(
+-                    GLES30.GL_UNPACK_ROW_LENGTH,
+-                    fileRegion.rowStride / RAW_BYTES_PER_PIXEL,
+-                )
+-                GLES30.glTexSubImage2D(
+-                    GLES30.GL_TEXTURE_2D, 0, 0, 0, region.width, region.height,
+-                    GLES30.GL_RED_INTEGER, GLES30.GL_UNSIGNED_SHORT, fileRegion.buffer,
+-                )
+-                GLES30.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, 0)
+-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+-                checkGlError("upload $label region=$region disk-backed")
+-            } finally {
+-                fileRegion.close()
+-            }
+-            return
+-        }
+         val plane = image.planes.firstOrNull()
+             ?: throw IllegalArgumentException("$label has no RAW plane")
+         require(plane.pixelStride == RAW_BYTES_PER_PIXEL) {
+@@ -8337,9 +8154,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         const val RGB_TEXTURE_BUDGET_RESERVE_BYTES = 8L * 1024L * 1024L
+         const val RGB_ONLINE_DRAW_BAND_HEIGHT = 1024
+         const val RGB_CHROMA_GUIDE_RAW_RADIUS = 2
+-        const val FIGURE7_BANDED_COV_RAW_MARGIN = 4
+-        const val FIGURE7_COV_RAW_NEGATIVE_SUPPORT = 2
+-        const val FIGURE7_COV_RAW_POSITIVE_SUPPORT = 2
+         const val NOISE_LUT_WIDTH = 10
+         const val ALIGN_TARGET_FINEST_DIMENSION = 256
+         const val ALIGN_MIN_TILE_SIZE = 8
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 857c819..095bbd8 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -100,7 +100,6 @@ import org.jetbrains.annotations.NotNull;
+ import org.jetbrains.annotations.TestOnly;
+ 
+ import java.io.File;
+-import java.io.FileOutputStream;
+ import java.io.IOException;
+ import java.text.DateFormat;
+ import java.text.SimpleDateFormat;
+@@ -117,8 +116,6 @@ import java.util.Objects;
+ import android.media.Image;
+ import java.util.ArrayDeque;
+ import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
+@@ -468,77 +465,29 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 return;
+             }
+             if (mIrisNight26540CaptureActive) {
+-                /* IRIS_26543_NIGHT_BOUNDED_CAPTURE_MEMORY
+-                 * Keep exactly one in-memory SHORT reference. Every later Camera2 RAW is handed
+-                 * directly to the bounded spool workers without creating another native copy.
+-                 * At most ImageReader's three RAWs can be outstanding; capture timing remains
+-                 * producer-driven unless storage itself cannot keep up with the sensor.
+-                 */
+-                if (!mIrisNight26543ReferenceCopied) {
+-                    Image nightImage = null;
+-                    ImageFrame copied = null;
+-                    try {
+-                        nightImage = reader.acquireNextImage();
+-                        if (nightImage == null) return;
+-                        copied = copyIrisNight26540Raw(nightImage);
+-                        synchronized (mIrisNight26540Lock) {
+-                            if (!mIrisNight26540CaptureActive) {
+-                                copied.close();
+-                                copied = null;
+-                            } else {
+-                                mIrisNight26540Frames.add(copied);
+-                                mIrisNight26543ReferenceCopied = true;
+-                                Log.i(TAG, "IRIS_26543_NIGHT_REFERENCE_MEMORY bytes="
+-                                        + (copied.buffer == null ? 0 : copied.buffer.capacity())
+-                                        + " nativeReferenceFrames=1");
+-                            }
+-                        }
+-                    } catch (Throwable nightRawFailure) {
+-                        if (copied != null) try { copied.close(); } catch (Throwable ignored) {}
+-                        Log.e(TAG, "IRIS_26543_NIGHT_REFERENCE_COPY_FAILED", nightRawFailure);
+-                        cameraEventsListener.onProcessingError("Night reference RAW copy: "
+-                                + nightRawFailure.getClass().getSimpleName());
+-                    } finally {
+-                        if (nightImage != null) try { nightImage.close(); } catch (Throwable ignored) {}
+-                    }
+-                    tryDispatchIrisNight26540();
+-                    return;
+-                }
+-                try {
+-                    mIrisNight26543SpoolSlots.acquire();
+-                } catch (InterruptedException interrupted) {
+-                    Thread.currentThread().interrupt();
+-                    cameraEventsListener.onProcessingError("Night RAW spool interrupted");
+-                    return;
+-                }
+                 Image nightImage = null;
++                ImageFrame copied = null;
+                 try {
+                     nightImage = reader.acquireNextImage();
+-                    if (nightImage == null) {
+-                        mIrisNight26543SpoolSlots.release();
+-                        return;
+-                    }
+-                    final Image ownedImage = nightImage;
+-                    nightImage = null;
+-                    final long generation = mIrisNight26543CaptureGeneration;
+-                    mIrisNight26543PendingSpools.incrementAndGet();
+-                    try {
+-                        IRIS_NIGHT_26543_SPOOL_EXECUTOR.execute(() ->
+-                                spoolIrisNight26543Raw(ownedImage, generation));
+-                    } catch (Throwable submitFailure) {
+-                        mIrisNight26543PendingSpools.decrementAndGet();
+-                        mIrisNight26543SpoolFailure = "submit:"
+-                                + submitFailure.getClass().getSimpleName();
+-                        try { ownedImage.close(); } catch (Throwable ignored) {}
+-                        throw submitFailure;
++                    if (nightImage == null) return;
++                    copied = copyIrisNight26540Raw(nightImage);
++                    synchronized (mIrisNight26540Lock) {
++                        if (!mIrisNight26540CaptureActive) {
++                            copied.close();
++                            copied = null;
++                        } else {
++                            mIrisNight26540Frames.add(copied);
++                        }
+                     }
+                 } catch (Throwable nightRawFailure) {
+-                    if (nightImage != null) try { nightImage.close(); } catch (Throwable ignored) {}
+-                    mIrisNight26543SpoolSlots.release();
+-                    Log.e(TAG, "IRIS_26543_NIGHT_SPOOL_SUBMIT_FAILED", nightRawFailure);
+-                    cameraEventsListener.onProcessingError("Night RAW spool submit: "
++                    if (copied != null) try { copied.close(); } catch (Throwable ignored) {}
++                    Log.e(TAG, "IRIS_26540_NIGHT_RAW_COPY_FAILED", nightRawFailure);
++                    cameraEventsListener.onProcessingError("Night RAW copy: "
+                             + nightRawFailure.getClass().getSimpleName());
++                } finally {
++                    if (nightImage != null) try { nightImage.close(); } catch (Throwable ignored) {}
+                 }
++                tryDispatchIrisNight26540();
+                 return;
+             }
+             if (onUnlimited && !unlimitedStarted) {
+@@ -4306,28 +4255,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      */
+     private final Object mIrisNight26540Lock = new Object();
+     private final ArrayList<ImageFrame> mIrisNight26540Frames = new ArrayList<>();
+-    /* IRIS_26543_NIGHT_BOUNDED_CAPTURE_MEMORY_OWNER
+-     * ImageReader itself has maxImages=3 in fresh Night. Three spool permits therefore bound
+-     * outstanding HAL RAWs exactly to the already-provisioned reader capacity; only the first
+-     * SHORT gets a persistent native copy. Two workers overlap sequential UFS writes.
+-     */
+-    private static final int IRIS_NIGHT_26543_SPOOL_SLOTS = 3;
+-    private static final long IRIS_NIGHT_26543_SPOOL_RESERVE_BYTES = 128L * 1024L * 1024L;
+-    private static final long IRIS_NIGHT_26543_SPOOL_DRAIN_TIMEOUT_MS = 10_000L;
+-    private static final ExecutorService IRIS_NIGHT_26543_SPOOL_EXECUTOR =
+-            Executors.newFixedThreadPool(2, runnable -> {
+-                Thread thread = new Thread(runnable, "IrisNightRawSpool");
+-                thread.setDaemon(true);
+-                return thread;
+-            });
+-    private final Semaphore mIrisNight26543SpoolSlots =
+-            new Semaphore(IRIS_NIGHT_26543_SPOOL_SLOTS, true);
+-    private final AtomicInteger mIrisNight26543PendingSpools = new AtomicInteger(0);
+-    private volatile boolean mIrisNight26543ReferenceCopied = false;
+-    private volatile long mIrisNight26543CaptureGeneration = 0L;
+-    private volatile long mIrisNight26543SpoolDrainDeadlineMs = 0L;
+-    private volatile boolean mIrisNight26543SpoolCapacityChecked = false;
+-    private volatile String mIrisNight26543SpoolFailure = null;
+     private final java.util.concurrent.ConcurrentHashMap<Long, TotalCaptureResult>
+             mIrisNight26540Results = new java.util.concurrent.ConcurrentHashMap<>();
+     private final java.util.concurrent.ConcurrentHashMap<Long, CaptureRequest>
+@@ -4366,16 +4293,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             CameraCharacteristics characteristics, int rotation) {
+         if (expectedFrames < 2) throw new IllegalArgumentException("26540 Night requires >=2 frames");
+         drainIrisNight26540ReaderBeforeCapture();
+-        if (mIrisNight26543PendingSpools.get() != 0
+-                || mIrisNight26543SpoolSlots.availablePermits() != IRIS_NIGHT_26543_SPOOL_SLOTS) {
+-            throw new IllegalStateException("26543 Night previous RAW spool is still active");
+-        }
+-        cleanupIrisNight26543SpoolCache();
+-        mIrisNight26543ReferenceCopied = false;
+-        mIrisNight26543CaptureGeneration++;
+-        mIrisNight26543SpoolDrainDeadlineMs = 0L;
+-        mIrisNight26543SpoolCapacityChecked = false;
+-        mIrisNight26543SpoolFailure = null;
+         synchronized (mIrisNight26540Lock) {
+             for (ImageFrame old : mIrisNight26540Frames) {
+                 if (old != null) try { old.close(); } catch (Throwable ignored) {}
+@@ -4432,102 +4349,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return frame;
+     }
+ 
+-    /* IRIS_26543_NIGHT_RAW_SPOOL_OWNER */
+-    private File irisNight26543SpoolDirectory() {
+-        File dir = new File(PhotonCamera.getApplicationContextStatic().getCacheDir(), "iris-night-raw-spool");
+-        if (!dir.exists() && !dir.mkdirs())
+-            throw new IllegalStateException("Cannot create Iris Night RAW spool directory");
+-        return dir;
+-    }
+-
+-    private void cleanupIrisNight26543SpoolCache() {
+-        try {
+-            File dir = new File(PhotonCamera.getApplicationContextStatic().getCacheDir(), "iris-night-raw-spool");
+-            File[] stale = dir.listFiles((d, name) -> name.startsWith("iris26543_") && name.endsWith(".raw"));
+-            if (stale != null) for (File f : stale) { try { f.delete(); } catch (Throwable ignored) {} }
+-        } catch (Throwable cleanupFailure) {
+-            Log.w(TAG, "IRIS_26543_NIGHT_SPOOL_STALE_CLEANUP_FAILED " + cleanupFailure);
+-        }
+-    }
+-
+-    private void spoolIrisNight26543Raw(@NonNull Image image, long generation) {
+-        ImageFrame frame = null;
+-        File file = null;
+-        long bytes = 0L;
+-        long startNs = System.nanoTime();
+-        try {
+-            if (image.getFormat() != ImageFormat.RAW_SENSOR)
+-                throw new IllegalArgumentException("26543 Night spool requires RAW_SENSOR");
+-            if (mIrisNight26540Binning)
+-                throw new IllegalStateException("26543 Night disk spool requires native non-binned RAW layout");
+-            Image.Plane plane = image.getPlanes()[0];
+-            int rowStride = plane.getRowStride();
+-            int pixelStride = plane.getPixelStride();
+-            int storageWidth = rowStride / Math.max(1, pixelStride);
+-            int capacity = plane.getBuffer().capacity();
+-            bytes = capacity;
+-            File dir = irisNight26543SpoolDirectory();
+-            if (!mIrisNight26543SpoolCapacityChecked) {
+-                synchronized (mIrisNight26540Lock) {
+-                    if (!mIrisNight26543SpoolCapacityChecked) {
+-                        long required = Math.max(0L, (long)mIrisNight26540ExpectedFrames - 1L) * capacity
+-                                + IRIS_NIGHT_26543_SPOOL_RESERVE_BYTES;
+-                        if (dir.getUsableSpace() < required)
+-                            throw new IllegalStateException("Insufficient cache space for Night RAW spool: required="
+-                                    + required + " usable=" + dir.getUsableSpace());
+-                        mIrisNight26543SpoolCapacityChecked = true;
+-                        Log.i(TAG, "IRIS_26543_NIGHT_SPOOL_CAPACITY expectedFrames="
+-                                + mIrisNight26540ExpectedFrames + " rawBytes=" + capacity
+-                                + " requiredWithReserve=" + required + " usable=" + dir.getUsableSpace());
+-                    }
+-                }
+-            }
+-            file = new File(dir, "iris26543_" + generation + "_" + image.getTimestamp() + ".raw");
+-            ByteBuffer source = plane.getBuffer().duplicate();
+-            source.position(0);
+-            source.limit(capacity);
+-            try (FileOutputStream fos = new FileOutputStream(file);
+-                 java.nio.channels.FileChannel channel = fos.getChannel()) {
+-                while (source.hasRemaining()) channel.write(source);
+-            }
+-            if (file.length() != capacity)
+-                throw new IllegalStateException("Night RAW spool length=" + file.length() + " expected=" + capacity);
+-            frame = new ImageFrame();
+-            frame.timestamp = image.getTimestamp();
+-            frame.setMotionV2PlaneLayout(image.getFormat(), image.getWidth(), image.getHeight(),
+-                    rowStride, pixelStride, false);
+-            frame.width = storageWidth;
+-            frame.height = image.getHeight();
+-            frame.setIrisNightRawSpool(file, capacity);
+-            file = null; // frame.close() owns deletion from here.
+-            synchronized (mIrisNight26540Lock) {
+-                if (!mIrisNight26540CaptureActive || generation != mIrisNight26543CaptureGeneration) {
+-                    frame.close();
+-                    frame = null;
+-                } else {
+-                    mIrisNight26540Frames.add(frame);
+-                    Log.i(TAG, "IRIS_26543_NIGHT_RAW_SPOOLED timestamp=" + frame.timestamp
+-                            + " bytes=" + frame.irisNightRawSpoolBytes
+-                            + " pending=" + mIrisNight26543PendingSpools.get()
+-                            + " nativeCopiesPersistent=1 tookMs="
+-                            + ((System.nanoTime() - startNs) / 1_000_000L));
+-                    frame = null;
+-                }
+-            }
+-        } catch (Throwable spoolFailure) {
+-            if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-            if (file != null) try { file.delete(); } catch (Throwable ignored) {}
+-            mIrisNight26543SpoolFailure = "write:" + spoolFailure.getClass().getSimpleName()
+-                    + ":" + String.valueOf(spoolFailure.getMessage());
+-            Log.e(TAG, "IRIS_26543_NIGHT_RAW_SPOOL_FAILED bytes=" + bytes, spoolFailure);
+-        } finally {
+-            try { image.close(); } catch (Throwable ignored) {}
+-            mIrisNight26543PendingSpools.decrementAndGet();
+-            mIrisNight26543SpoolSlots.release();
+-            tryDispatchIrisNight26540();
+-        }
+-    }
+-
+     /* IRIS_26540_NIGHT_EXACT_FRAME_METADATA_OWNER */
+     private static void populateIrisNight26540FrameMetadata(@NonNull ImageFrame frame,
+             @NonNull TotalCaptureResult result, @NonNull CaptureRequest request,
+@@ -4613,30 +4434,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+ 
+     private void finishIrisNight26540AfterDrainTimeout() {
+-        int pendingSpools = mIrisNight26543PendingSpools.get();
+-        if (pendingSpools > 0) {
+-            long now = SystemClock.elapsedRealtime();
+-            if (now < mIrisNight26543SpoolDrainDeadlineMs) {
+-                Log.i(TAG, "IRIS_26543_NIGHT_WAITING_FOR_SPOOL pending=" + pendingSpools
+-                        + " permits=" + mIrisNight26543SpoolSlots.availablePermits());
+-                if (mBackgroundHandler != null)
+-                    mBackgroundHandler.postDelayed(
+-                            CaptureController.this::finishIrisNight26540AfterDrainTimeout, 100L);
+-                return;
+-            }
+-            synchronized (mIrisNight26540Lock) {
+-                mIrisNight26540CaptureActive = false;
+-                for (ImageFrame frame : mIrisNight26540Frames)
+-                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                mIrisNight26540Frames.clear();
+-                mIrisNight26540Results.clear();
+-                mIrisNight26540Requests.clear();
+-            }
+-            CaptureController.isProcessing = false;
+-            Log.e(TAG, "IRIS_26543_NIGHT_SPOOL_DRAIN_TIMEOUT pending=" + pendingSpools);
+-            cameraEventsListener.onProcessingError("Iris Night RAW spool timeout");
+-            return;
+-        }
+         boolean fail = false;
+         int matchedCount = 0;
+         int requestedCount = 0;
+@@ -4681,11 +4478,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private void tryDispatchIrisNight26540() {
+         IrisNightBatch sealedBatch = null;
+         try {
+-            if (mIrisNight26543PendingSpools.get() != 0) return;
+-            if (mIrisNight26543SpoolFailure != null) {
+-                throw new IllegalStateException("26543 Night RAW spool failure: "
+-                        + mIrisNight26543SpoolFailure);
+-            }
+             synchronized (mIrisNight26540Lock) {
+                 if (!mIrisNight26540CaptureActive || !mIrisNight26540SequenceComplete
+                         || mIrisNight26540Dispatched || mIrisNight26540ExpectedFrames < 2) return;
+@@ -4713,40 +4505,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     frame.irisNightExactCaptureResult = exact;
+                     frame.irisNightExactCaptureRequest = exactRequest;
+                 }
+-                ImageFrame sortedReference = matched.get(0);
+-                if (sortedReference.buffer == null
+-                        || sortedReference.motionV2FrameRole != ImageFrame.MotionV2FrameRole.NORMAL) {
+-                    throw new IllegalStateException(
+-                            "26543 Night sorted first SHORT/reference is not the sole in-memory RAW");
+-                }
+-                Log.i(TAG, "IRIS_26543_NIGHT_REFERENCE_ORDER_PROOF timestamp="
+-                        + sortedReference.timestamp + " role=SHORT inMemory=true sortedBySensorTimestamp=true");
+                 ArrayList<ImageFrame> unmatched = new ArrayList<>(mIrisNight26540Frames);
+                 unmatched.removeAll(matched);
+                 for (ImageFrame frame : unmatched) {
+                     if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+                 }
+-                int inMemoryRawFrames = 0;
+-                int diskBackedRawFrames = 0;
+-                for (ImageFrame frame : matched) {
+-                    if (frame.buffer != null) inMemoryRawFrames++;
+-                    if (frame.irisNightRawDiskBacked) diskBackedRawFrames++;
+-                    if (!frame.hasMotionV2RawBacking())
+-                        throw new IllegalStateException("26543 Night matched frame lost RAW backing");
+-                }
+-                if (inMemoryRawFrames != 1 || diskBackedRawFrames != matched.size() - 1
+-                        || mIrisNight26543PendingSpools.get() != 0
+-                        || mIrisNight26543SpoolSlots.availablePermits() != IRIS_NIGHT_26543_SPOOL_SLOTS) {
+-                    throw new IllegalStateException("26543 Night bounded-memory proof failed memory="
+-                            + inMemoryRawFrames + " disk=" + diskBackedRawFrames
+-                            + " frames=" + matched.size()
+-                            + " pending=" + mIrisNight26543PendingSpools.get()
+-                            + " permits=" + mIrisNight26543SpoolSlots.availablePermits());
+-                }
+-                Log.i(TAG, "IRIS_26543_NIGHT_BOUNDED_MEMORY_PROOF frames=" + matched.size()
+-                        + " inMemoryRawFrames=" + inMemoryRawFrames
+-                        + " diskBackedRawFrames=" + diskBackedRawFrames
+-                        + " nativePersistentCopies=1 imageReaderSlots=3 pending=0 spoolPermits=3");
+                 sealedBatch = new IrisNightBatch(matched, new ArrayList<>(BurstShakiness),
+                         java.util.Collections.emptyMap(), mIrisNight26540Results, mIrisNight26540Requests,
+                         mIrisNight26540Characteristics, RAW_FORMAT, mIrisNight26540Rotation,
+@@ -6848,8 +6611,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         synchronized (mIrisNight26540Lock) {
+                             mIrisNight26540ExpectedFrames = finalFrameCount;
+                             mIrisNight26540SequenceComplete = true;
+-                            mIrisNight26543SpoolDrainDeadlineMs = SystemClock.elapsedRealtime()
+-                                    + IRIS_NIGHT_26543_SPOOL_DRAIN_TIMEOUT_MS;
+                         }
+                         mBackgroundHandler.post(() -> {
+                             if (!isDualSession) unlockFocus();
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+index 68773da..9cd580a 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+@@ -11,7 +11,6 @@ import com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector;
+ import com.particlesdevs.photoncamera.util.Allocator;
+ 
+ import java.nio.ByteBuffer;
+-import java.io.File;
+ 
+ public class ImageFrame {
+     public ByteBuffer buffer;
+@@ -93,28 +92,6 @@ public class ImageFrame {
+     public boolean motionV2PlaneTransformedByBinning = false;
+     public boolean motionV2PlaneLayoutValid = false;
+ 
+-    /* IRIS_26543_NIGHT_BOUNDED_DISK_BACKING
+-     * Non-reference Night RAWs may be immutable cache files instead of long-lived malloc copies.
+-     * Motion continues to use buffer exactly as before. close() owns both representations.
+-     */
+-    public File irisNightRawSpoolFile = null;
+-    public long irisNightRawSpoolBytes = 0L;
+-    public boolean irisNightRawDiskBacked = false;
+-
+-    public void setIrisNightRawSpool(File file, long bytes) {
+-        if (file == null || bytes <= 0L) throw new IllegalArgumentException("invalid Night RAW spool");
+-        irisNightRawSpoolFile = file;
+-        irisNightRawSpoolBytes = bytes;
+-        irisNightRawDiskBacked = true;
+-    }
+-
+-    public boolean hasMotionV2RawBacking() {
+-        return buffer != null || (irisNightRawDiskBacked && irisNightRawSpoolFile != null
+-                && irisNightRawSpoolFile.isFile() && irisNightRawSpoolBytes > 0L);
+-    }
+-
+-    public ImageFrame() {}
+-
+     public void setMotionV2PlaneLayout(int format, int logicalWidth, int logicalHeight,
+                                        int rowStrideBytes, int pixelStrideBytes,
+                                        boolean transformedByBinning) {
+@@ -168,23 +145,11 @@ public class ImageFrame {
+     }
+ 
+     public void close() {
+-        boolean released = false;
+         if (buffer != null) {
+             Allocator.free(buffer);
+             buffer = null;
+-            released = true;
+-        }
+-        if (irisNightRawSpoolFile != null) {
+-            try {
+-                if (irisNightRawSpoolFile.exists() && !irisNightRawSpoolFile.delete()) {
+-                    Log.w("ImageFrame", "Could not delete Night RAW spool " + irisNightRawSpoolFile);
+-                }
+-            } catch (Throwable ignored) {}
+-            irisNightRawSpoolFile = null;
+-            irisNightRawSpoolBytes = 0L;
+-            irisNightRawDiskBacked = false;
+-            released = true;
++        } else {
++            Log.d("ImageFrame", "Buffer is already null, nothing to close.");
+         }
+-        if (!released) Log.d("ImageFrame", "No RAW backing remains to close.");
+     }
+ }
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index ac9ddf6..4f1f8c6 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -184,14 +184,11 @@ public final class IrisNightProcessor {
+ 
+             final PostPipeline pipeline = new PostPipeline(true);
+             final long postStartNs = System.nanoTime();
+-            Log.i(TAG, "IRIS_26543_NIGHT_POST_RGB_BEGIN dngStageComplete=true");
+             final Point crop;
+             Bitmap img;
+             try {
+                 img = pipeline.RunIrisNightRgb(rgb, p);
+                 crop = pipeline.cropSize == null ? new Point(p.rawSize) : new Point(pipeline.cropSize);
+-                Log.i(TAG, "IRIS_26543_NIGHT_POST_RGB_COMPLETE bitmap="
+-                        + (img == null ? "null" : (img.getWidth() + "x" + img.getHeight())));
+             } finally {
+                 try { Allocator.free(rgb); } catch (Throwable ignored) {}
+             }
+@@ -204,10 +201,8 @@ public final class IrisNightProcessor {
+             final String srDetailPath = r.superResDetailPath;
+             final int srDetailWidth = r.superResDetailWidth;
+             final int srDetailHeight = r.superResDetailHeight;
+-            Log.i(TAG, "IRIS_26543_NIGHT_BASE_JPEG_BEGIN");
+             final boolean baseSaved = ImageSaver.Util.saveBitmapAsJPGIrisNightCheckpoint(
+                     imageFile, img, ImageSaver.JPG_QUALITY, exif);
+-            Log.i(TAG, "IRIS_26543_NIGHT_BASE_JPEG_COMPLETE saved=" + baseSaved);
+             if (baseSaved) listener.notifyImageSavedStatus(true, imageFile);
+             else Log.w(TAG, "IRIS_26540_NIGHT_BASE_CHECKPOINT_FAILED continueFinalAttempt=true");
+ 
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index aaf3f14..9e20a3b 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -87,7 +87,7 @@ object PhotonMotionMgc1271Bridge {
+ 
+             val reference = inputImages.firstOrNull { it.timestamp == referenceTimestamp }
+                 ?: invalid("owned reference is absent timestamp=$referenceTimestamp")
+-            requireParity(reference.buffer != null, "26543 Night/Motion owned reference must remain in-memory")
++            requireParity(reference.buffer != null, "owned reference buffer is null")
+ 
+             shortFrame = shortSlot?.takeAndSeal()
+             longFrame = shortSlot?.shadowAuxSlot?.takeAndSeal()
+@@ -588,12 +588,12 @@ object PhotonMotionMgc1271Bridge {
+             }
+             egl?.close()
+             inputImages.forEach { frame ->
+-                if (frame.hasMotionV2RawBacking()) runCatching { frame.close() }
++                if (frame.buffer != null) runCatching { frame.close() }
+             }
+-            if (shortFrame?.hasMotionV2RawBacking() == true && inputImages.none { it === shortFrame }) {
++            if (shortFrame?.buffer != null && inputImages.none { it === shortFrame }) {
+                 runCatching { shortFrame?.close() }
+             }
+-            if (longFrame?.hasMotionV2RawBacking() == true && inputImages.none { it === longFrame }) {
++            if (longFrame?.buffer != null && inputImages.none { it === longFrame }) {
+                 runCatching { longFrame?.close() }
+             }
+             shortSlot?.sealAndClose()
+@@ -607,7 +607,7 @@ object PhotonMotionMgc1271Bridge {
+         referenceEnergy: Double,
+         index: Int,
+     ) {
+-        requireParity(frame.hasMotionV2RawBacking(), "frame[$index] $role RAW backing is missing")
++        requireParity(frame.buffer != null, "frame[$index] $role buffer is null")
+         requireParity(frame.motionV2PlaneLayoutValid,
+             "frame[$index] $role RAW plane layout missing")
+         requireParity(!frame.motionV2PlaneTransformedByBinning,
+@@ -622,15 +622,8 @@ object PhotonMotionMgc1271Bridge {
+             "frame[$index] $role pixelStride=${frame.motionV2PlanePixelStrideBytes}, expected=2")
+         requireParity(frame.motionV2PlaneRowStrideBytes >= size.x * 2,
+             "frame[$index] $role rowStride=${frame.motionV2PlaneRowStrideBytes}")
+-        val minimumRawBytes = frame.motionV2PlaneRowStrideBytes.toLong() * size.y
+-        if (frame.buffer != null) {
+-            requireParity(frame.buffer.capacity().toLong() >= minimumRawBytes,
+-                "frame[$index] $role copied RAW capacity=${frame.buffer.capacity()} stride=${frame.motionV2PlaneRowStrideBytes}")
+-        } else {
+-            requireParity(frame.irisNightRawDiskBacked && frame.irisNightRawSpoolFile?.isFile == true &&
+-                    frame.irisNightRawSpoolBytes >= minimumRawBytes,
+-                "frame[$index] $role disk RAW backing is incomplete bytes=${frame.irisNightRawSpoolBytes}")
+-        }
++        requireParity(frame.buffer.capacity() >= frame.motionV2PlaneRowStrideBytes * size.y,
++            "frame[$index] $role copied RAW capacity=${frame.buffer.capacity()} stride=${frame.motionV2PlaneRowStrideBytes}")
+         requireParity(frame.motionV2ActualExposureNs > 0L && frame.motionV2ActualIso > 0 &&
+                 frame.motionV2ExposureEnergy.isFinite() && frame.motionV2ExposureEnergy > 0.0,
+             "frame[$index] $role exposure metadata invalid")
+@@ -654,32 +647,13 @@ object PhotonMotionMgc1271Bridge {
+     }
+ 
+     private fun safeImage(frame: ImageFrame, size: Point): SafeImage {
+-        val raw = frame.buffer
+-        if (raw != null) {
+-            return SafeImage(
+-                width = size.x,
+-                height = size.y,
+-                format = frame.motionV2PlaneFormat,
+-                timestamp = frame.timestamp,
+-                buffer = raw,
+-                rowStride = frame.motionV2PlaneRowStrideBytes,
+-                pixelStride = frame.motionV2PlanePixelStrideBytes,
+-                closeAction = { frame.close() },
+-            )
+-        }
+-        val file = frame.irisNightRawSpoolFile
+-            ?: invalid("RAW backing vanished before disk SafeImage adapter")
+-        requireParity(frame.irisNightRawDiskBacked && file.isFile,
+-            "Night disk SafeImage backing is unavailable")
+-        requireParity(frame.irisNightRawSpoolBytes in 1..Int.MAX_VALUE.toLong(),
+-            "Night disk SafeImage byte count=${frame.irisNightRawSpoolBytes}")
++        val raw = frame.buffer ?: invalid("RAW buffer vanished before SafeImage adapter")
+         return SafeImage(
+             width = size.x,
+             height = size.y,
+             format = frame.motionV2PlaneFormat,
+             timestamp = frame.timestamp,
+-            backingFile = file,
+-            backingByteCount = frame.irisNightRawSpoolBytes.toInt(),
++            buffer = raw,
+             rowStride = frame.motionV2PlaneRowStrideBytes,
+             pixelStride = frame.motionV2PlanePixelStrideBytes,
+             closeAction = { frame.close() },
