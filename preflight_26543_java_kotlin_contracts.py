@@ -43,6 +43,14 @@ def run(root):
               'return exp(-0.5 * max(distance, 0.0));'):
         need(shaders,t,'embedded GLSL API')
     forbid(stack,'label = "MGC RGB covariance frame $index"','per-frame covariance retention')
+    # 26543 V1.3: guard the exact Kotlin compiler failures seen in V1.2 Actions.
+    forbid(stack,'bayerPhaseShotNoise.average().coerceAtLeast(1.0e-8f)','FloatArray.average Double/Float mismatch')
+    forbid(stack,'bayerPhaseReadNoise.average().coerceAtLeast(0.0f)','FloatArray.average Double/Float mismatch')
+    need(stack,'bayerPhaseShotNoise.average().coerceAtLeast(1.0e-8).toFloat()','Figure7 shot-noise Float conversion')
+    need(stack,'bayerPhaseReadNoise.average().coerceAtLeast(0.0).toFloat()','Figure7 read-noise Float conversion')
+    need(stack,'diagnosticCapture = readyStrengthCapture,\n                        kernelTuning = bayerKernelTuning,','renderRgbMerge caller tuning scope')
+    need(stack,'diagnosticCapture: StrengthCapture?,\n        kernelTuning: BayerKernelTuning,\n    ): RgbMergeOutput {','renderRgbMerge tuning parameter')
+    need(stack,'calibration = frameRegion.frame.calibration,\n                                kernelTuning = kernelTuning,\n                                covarianceRegion = frameRegion.covarianceRegion,','banded covariance local tuning scope')
     # Production Night must use the same live Spatial-RGB owner, not dormant old bridge.
     need(night,'PhotonMotionMgc1271Bridge.reconstruct(','Night live bridge')
     forbid(night,'IrisNightMgc1271Bridge','stale Night bridge')

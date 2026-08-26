@@ -14,7 +14,7 @@ RUNTIME_FILES = [
 CAND_SHA = {
     'app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt': '11e1f216c9633f4972bd2771fcfff05ca4efe74a665d29e49123b6e45db9a9da',
     'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt': '4db690dc2b3c9c587d881a85ba3613b6c2d61bd6e286d2033d38fa193bb30a2e',
-    'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt': 'afdddd1885e91c02f730fdea19be739f05e7dd643dbf4d3e107595980961af40',
+    'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt': '6b8a192818c9c3787f3adc19a1fe4de4bc9086ee95f4180810b503835fac0c3c',
     'app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java': 'a59c9633be1073e6ef9e900a8484553f5e83ee430eaf1e6de91d7484540f62bd',
     'app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java': '39088bb5cd21789a620b4bcb424aac8bbe607cd1822644cab45965874a5cbd8e',
     'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java': '55a7020e2881cb4a373ea87d7e9e4276bbfc9fc21ff1b19464ecd000fd44b430',
