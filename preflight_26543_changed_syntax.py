@@ -1,6 +1,29 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import argparse, re, subprocess, tempfile
+
+GLSL_RESERVED_IDENTIFIERS = {
+    'attribute','const','uniform','varying','buffer','shared','coherent','volatile','restrict',
+    'readonly','writeonly','atomic_uint','layout','centroid','flat','smooth','noperspective',
+    'patch','sample','break','continue','do','for','while','switch','case','default','if','else',
+    'subroutine','in','out','inout','float','double','int','void','bool','true','false',
+    'invariant','precise','discard','return','mat2','mat3','mat4','dmat2','dmat3','dmat4',
+    'mat2x2','mat2x3','mat2x4','mat3x2','mat3x3','mat3x4','mat4x2','mat4x3','mat4x4',
+    'vec2','vec3','vec4','ivec2','ivec3','ivec4','bvec2','bvec3','bvec4','dvec2','dvec3','dvec4',
+    'uint','uvec2','uvec3','uvec4','lowp','mediump','highp','precision','sampler2D','samplerCube',
+    'sampler3D','sampler2DShadow','samplerCubeShadow','isampler2D','usampler2D','struct',
+}
+
+def reject_reserved_decl_identifiers(source, shader_name):
+    no_block = re.sub(r'/\*.*?\*/', ' ', source, flags=re.S)
+    no_line = re.sub(r'//.*', ' ', no_block)
+    decl = re.compile(
+        r'\b(?:float|double|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|dvec[234]|mat[234])\s+([A-Za-z_]\w*)\b'
+    )
+    for m in decl.finditer(no_line):
+        if m.group(1) in GLSL_RESERVED_IDENTIFIERS:
+            raise SystemExit('ERROR: GLSL reserved identifier '+m.group(1)+' in '+shader_name)
+
 FILES=[
 'app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt',
 'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt',
@@ -69,8 +92,12 @@ def run(root,validator=None):
         balanced(p)
     sh=root/'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt'
     cov=embedded_shader(sh,'covariance'); merge=embedded_shader(sh,'mergeRgb')
+    reject_reserved_decl_identifiers(cov, 'covariance')
+    reject_reserved_decl_identifiers(merge, 'mergeRgb')
     for t in ('#version 300 es','uniform ivec2 uCovarianceOrigin;','uniform float uKStretch;','uniform float uKShrink;','void main()'):
         if t not in cov: raise SystemExit('ERROR: covariance GLSL contract missing '+t)
+    if 'float kernelWeight(vec2 pixelOffset, vec3 precisionCoeffs)' not in merge:
+        raise SystemExit('ERROR: 26543 V1.1 reserved-keyword correction missing')
     if 'return exp(-0.5 * max(distance, 0.0));' not in merge or 'exp2(-0.5' in merge or '0.00005' in merge:
         raise SystemExit('ERROR: active merge Gaussian contract')
     if validator:
@@ -81,7 +108,14 @@ def run(root,validator=None):
 def self_test():
     x='fun x(){ val s=""" { ignored } """; if(true){ println("x") } }'
     assert code_only(x).count('{')==2
-    print('PASS: 26543 changed syntax self-test')
+    try:
+        reject_reserved_decl_identifiers('float f(vec3 precision){ return precision.x; }', 'selftest')
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError('reserved GLSL identifier self-test did not fail')
+    reject_reserved_decl_identifiers('float f(vec3 precisionCoeffs){ return precisionCoeffs.x; }', 'selftest-good')
+    print('PASS: 26543 V1.1 changed syntax + GLSL reserved-identifier self-test')
 if __name__=='__main__':
     ap=argparse.ArgumentParser(); ap.add_argument('--root'); ap.add_argument('--validator'); ap.add_argument('--self-test',action='store_true'); a=ap.parse_args()
     if a.self_test:self_test()

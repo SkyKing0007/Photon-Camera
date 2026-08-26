@@ -13,7 +13,7 @@ RUNTIME_FILES = [
 ]
 CAND_SHA = {
     'app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt': '11e1f216c9633f4972bd2771fcfff05ca4efe74a665d29e49123b6e45db9a9da',
-    'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt': 'ccb5fca12a4e1e983633908fb5a3d74249a64b06197d963094f7a8159fec376b',
+    'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt': '4db690dc2b3c9c587d881a85ba3613b6c2d61bd6e286d2033d38fa193bb30a2e',
     'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt': 'afdddd1885e91c02f730fdea19be739f05e7dd643dbf4d3e107595980961af40',
     'app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java': 'a59c9633be1073e6ef9e900a8484553f5e83ee430eaf1e6de91d7484540f62bd',
     'app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java': '39088bb5cd21789a620b4bcb424aac8bbe607cd1822644cab45965874a5cbd8e',
@@ -93,11 +93,14 @@ def figure7(root):
     for stale in ['anisotropic=mix(4.0,6.0','correctedGreenStd','dominant=max(strength']:
         if stale in cov: fail('stale covariance law survived: '+stale)
     for marker in [
+        'float kernelWeight(vec2 pixelOffset, vec3 precisionCoeffs)',
         'return exp(-0.5 * max(distance, 0.0));',
         '(sourceRaw + vec2(0.5)) * 0.5 - vec2(uCovarianceOrigin)',
         'vec2(uCovarianceTextureSize)',
     ]:
         if marker not in merge: fail('active merge Figure-7 anchor missing: '+marker)
+    if re.search(r'\b(?:float|vec[234]|mat[234]|int|ivec[234]|uint|uvec[234]|bool|bvec[234])\s+precision\b', merge):
+        fail('reserved GLSL keyword precision used as identifier')
     if 'exp2(-0.5' in merge or '+ 0.00005' in merge: fail('old active Spatial-RGB Gaussian/floor survived')
     if 'private val covarianceWidth = max(1, width / 2)' not in stack or 'private val covarianceHeight = max(1, height / 2)' not in stack:
         fail('production covariance is not RAW/2')
