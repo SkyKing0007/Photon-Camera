@@ -1,6 +1,6 @@
-# 26544 V1.2 upload instructions
+# 26544 V1.3 upload instructions
 
-**V1.2 is a build-procedure-only correction. The six-file 26544 runtime patch, version `0.9726544 / 26544`, Night logic, and all image-processing code are byte-identical to V1.**
+**V1.3 is a build-procedure-only correction. The six-file 26544 runtime patch, version `0.9726544 / 26544`, Night logic, and all image-processing code are byte-identical to V1.**
 
 The failed V1 run reached and passed real GLSL, Kotlin, and Java compilation, then failed at native CMake configuration with `26507 pinned libjpeg-turbo source missing`. V1.1 restored the exact successful-26543 bjzhou native bootstrap (`09c76e57e8f01a5a8fc536ab41fc80ba642d4042`) before Gradle assemble and adds a permanent pre-assemble regression gate for both `libjpeg-turbo` and `libultrahdr`.
 
@@ -153,3 +153,22 @@ V1.2 permanently separates those authorities after Gradle:
 - exactly one Gradle debug APK must exist.
 
 Permanent regression: never compare the pre-vendor 967-file application manifest against the post-vendor augmented source tree.
+
+
+## V1.3 canonical post-build proof correction
+
+V1.3 makes **no runtime-source or version change**. It removes the V1.2 attempt to recreate a 967-file authority from the Gradle-mutated build tree.
+
+After `:app:assembleDebug` passes, V1.3 follows the 26543 V1.4 authority model:
+
+- re-hash the untouched frozen 967-file candidate and require byte-identical equality with its pre-build manifest;
+- rerun the 26544 runtime contract directly on that frozen candidate;
+- compare the live vendor-excluding Iris source domain against the frozen candidate;
+- verify `third_party_26507` independently against `26507_BJZHOU_NATIVE_DEPENDENCIES.sha256`;
+- require exactly one Gradle debug APK and hash/copy it.
+
+Permanent regressions:
+
+1. Never compare the pre-vendor 967-file application manifest against a vendor-augmented worktree.
+2. Never reconstruct authoritative source invariance from a Gradle-mutated worktree.
+3. The frozen candidate, pinned vendor manifest, and produced APK are separate authorities and are validated separately.

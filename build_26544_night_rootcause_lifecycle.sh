@@ -51,7 +51,6 @@ AFTER="$WORK/candidate_26544"
 PATCHREPO="$WORK/patchrepo"
 FORWARDCHECK="$WORK/forwardcheck"
 ROLLBACKCHECK="$WORK/rollbackcheck"
-POSTCHECK="$WORK/postbuild_validation_candidate"
 BJ="$WORK/bjzhou_vendor"
 FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-night-rootcause-lifecycle-debug.apk"
 
@@ -266,24 +265,24 @@ echo "=== 26544 GATE 7: FULL ANDROID ASSEMBLE ==="
 sed -i 's/^FULL ANDROID ASSEMBLE:.*/FULL ANDROID ASSEMBLE: PASS (:app:assembleDebug)/' "$OUT/26544_COMPILER_STATUS.txt"
 pass "FULL ANDROID ASSEMBLE"
 
-echo "=== 26544 GATE 8: post-compiler Iris-source invariance + vendor invariance + one APK ==="
-# The canonical 967-file candidate intentionally excludes build-time third_party_26507.
-# Never compare that pre-vendor manifest against the vendor-augmented live tree (1744 files in V1.1).
-manifest_audited_live "$ROOT" "$OUT/26544_post_gradle_runtime.sha256"
-cmp -s "$OUT/26544_post_gradle_runtime.sha256" "$OUT/26544_candidate_audited_runtime.sha256" || fail "Gradle changed audited Iris runtime source"
-( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26544_vendor_manifest_postbuild.txt"
+echo "=== 26544 GATE 8: frozen-candidate invariance + installed Iris invariance + vendor invariance + one APK ==="
+# 26543 V1.4 model: the immutable candidate is the source authority. Never reconstruct authority
+# from a Gradle-mutated worktree and never compare a pre-vendor 967-file manifest to vendor files.
+manifest_all "$AFTER" "$OUT/26544_frozen_candidate_postbuild.sha256"
+cmp -s "$OUT/26544_frozen_candidate_postbuild.sha256" "$OUT/26544_candidate_source.sha256" || fail "REGRESSION: frozen 967-file candidate changed during Gradle"
+[[ "$(wc -l < "$OUT/26544_frozen_candidate_postbuild.sha256")" -eq 967 ]] || fail "REGRESSION: frozen candidate is not exactly 967 files"
+python3 "$VALIDATE" --base "$BASE" --candidate "$AFTER" > "$OUT/26544_frozen_candidate_postbuild_contract.txt"
 
-# Re-run the exact 967-file runtime contract on a clean copy with the intentionally external
-# native vendor subtree removed. This preserves the strict validator without lying about scope.
-rm -rf "$POSTCHECK"; mkdir -p "$POSTCHECK/app"
-cp -a "$ROOT/app/src" "$POSTCHECK/app/"
-cp "$ROOT/app/version.properties" "$POSTCHECK/app/version.properties"
-cp "$ROOT/app/build.gradle" "$POSTCHECK/app/build.gradle"
-rm -rf "$POSTCHECK/app/src/main/cpp/third_party_26507"
-manifest_all "$POSTCHECK" "$OUT/26544_postbuild_967_source.sha256"
-[[ "$(wc -l < "$OUT/26544_postbuild_967_source.sha256")" -eq 967 ]] || fail "REGRESSION: post-build Iris-only validation copy is not exactly 967 files"
-python3 "$VALIDATE" --base "$BASE" --candidate "$POSTCHECK" > "$OUT/26544_postbuild_contract.txt"
-pass "PERMANENT REGRESSION: pre-vendor 967-file candidate is validated separately from post-vendor native tree"
+# The live build tree may contain the intentionally restored native vendor subtree and Gradle outputs.
+# Compare only the authoritative Iris source domain against the frozen candidate.
+manifest_audited_live "$AFTER" "$OUT/26544_frozen_candidate_audited_runtime.sha256"
+manifest_audited_live "$ROOT" "$OUT/26544_post_gradle_audited_runtime.sha256"
+cmp -s "$OUT/26544_post_gradle_audited_runtime.sha256" "$OUT/26544_frozen_candidate_audited_runtime.sha256" || fail "REGRESSION: Gradle changed audited Iris runtime source"
+
+# Native build-time source is a separate pinned authority and must remain byte-exact after assemble.
+( cd "$ROOT/app/src/main/cpp/third_party_26507" && sha256sum -c "$BJZHOU_MANIFEST" ) > "$OUT/26544_vendor_manifest_postbuild.txt"
+pass "PERMANENT REGRESSION: frozen 967-file Iris candidate and post-build native vendor authority validated separately"
+
 mapfile -t APKS < <(find "$ROOT/app/build/outputs/apk/debug" -maxdepth 1 -type f -name '*.apk' -print | sort)
 [[ "${#APKS[@]}" -eq 1 ]] || fail "expected exactly one Gradle APK, got ${#APKS[@]}"
 cp "${APKS[0]}" "$FINAL"
