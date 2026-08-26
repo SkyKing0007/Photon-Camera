@@ -27,7 +27,7 @@ BASE_ARTIFACT_NAME="photon-26544-night-rootcause-lifecycle"
 BASE_ARTIFACT_SHA="3092d61603574a01957e5268f842c5527dc682c69bfcd855144a72f090e5addd"
 BASE_TAR_SHA="411a79c54acbc8e1092ecb306bdea6f3c1ae4c45d4860ee528b1ca153e0eea37"
 BASE_MANIFEST_SHA="90a0651864f17ffe535871a185c5de87821cb6c7aefefb757869001f1b02a746"
-CAND_MANIFEST_SHA="30cc34de484b958a66a5b95b2d2781924213e4fc6c1a0767c2cce55d8567c21c"
+CAND_MANIFEST_SHA="a923dc9730a7402702cfd7feeb9e6d5d28dd95743e76ee08e96bcbbc2da93da1"
 VERSION_NAME="0.9726545"
 VERSION_BUILD="26545"
 BJZHOU_VENDOR_HEAD="09c76e57e8f01a5a8fc536ab41fc80ba642d4042"
@@ -57,10 +57,10 @@ PATCHREPO="$WORK/patchrepo"
 FORWARDCHECK="$WORK/forwardcheck"
 ROLLBACKCHECK="$WORK/rollbackcheck"
 BJ="$WORK/bjzhou_vendor"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-iris-sabre-ab-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-2-sabre-isolation-debug.apk"
 
 mapfile -t RUNTIME_FILES < "$RUNTIME_LIST"
-[[ "${#RUNTIME_FILES[@]}" -eq 18 ]] || fail "runtime file inventory is not exactly 18"
+[[ "${#RUNTIME_FILES[@]}" -eq 25 ]] || fail "runtime file inventory is not exactly 25"
 rm -rf "$OUT" "$WORK"
 rm -f "$FINAL"
 mkdir -p "$OUT" "$WORK" "$ARTDIR" "$BASE_POST" "$BASE"
@@ -183,7 +183,7 @@ cmp -s "$OUT/26545_base_frozen_reconstructed.sha256" "$BASE_PIN" || fail "failed
 set_report "EXACT PRIOR RUNTIME AUTHORITY" "PASS"
 pass "exact successful 26544 artifact -> exact frozen 967-file candidate reconstructed"
 
-echo "=== 26545 GATE 2: candidate-first exact 18-file transform ==="
+echo "=== 26545 V1.2 GATE 2: candidate-first exact 25-file transform ==="
 mkdir -p "$AFTER"
 cp -a "$BASE/." "$AFTER/"
 (cd "$AFTER" && patch --batch --forward --fuzz=0 --no-backup-if-mismatch -p1 < "$FORWARD" >/dev/null)
@@ -206,11 +206,11 @@ def m(r):
 mb,mc=m(b),m(c); ch=sorted(k for k in set(mb)|set(mc) if mb.get(k)!=mc.get(k))
 o.write_text('\n'.join(ch)+'\n')
 PY
-cmp -s "$ACTUAL_CHANGED" "$RUNTIME_LIST" || fail "actual changed scope differs from 18-file allowlist"
+cmp -s "$ACTUAL_CHANGED" "$RUNTIME_LIST" || fail "actual changed scope differs from 25-file allowlist"
 set_report "RUNTIME OWNERSHIP" "PASS"
 set_report "DORMANT-OWNER REJECTION" "PASS"
-set_report "CHANGED RUNTIME SCOPE" "18 files (exact 26545_RUNTIME_FILES.txt)"
-pass "candidate-first transform exact 18-file runtime scope"
+set_report "CHANGED RUNTIME SCOPE" "25 files (exact 26545_RUNTIME_FILES.txt)"
+pass "candidate-first transform exact 25-file runtime scope"
 
 echo "=== 26545 GATE 3: REAL GLSL COMPILE (active Sabre + shared dependencies) ==="
 GLSLANG="$(command -v glslangValidator || true)"
@@ -345,17 +345,19 @@ Exact prior artifact ZIP SHA256: $BASE_ARTIFACT_SHA
 Exact prior final source TAR SHA256: $BASE_TAR_SHA
 Reconstructed frozen prior Iris manifest SHA256: $BASE_MANIFEST_SHA (967 files)
 Exact candidate Iris manifest SHA256: $CAND_MANIFEST_SHA (968 files)
-Runtime changed files: 18
+Runtime changed files: 25
 Motion Reconstruction setting: Spatial RGB (default/control) or Sabre.
-Spatial RGB active owner byte-identical to 26544.
-Capture/exposure/UHDR/PostPipeline/Night control owners byte-identical to 26544.
+Spatial RGB reconstruction owner remains the exact 26544 control; only explicit routing guards around the shared post boundary change.
+Capture/exposure/UHDR/Night and common post-color finishing owners remain byte-identical to 26544.
 Sabre source audit pin: bjzhou main $BJZHOU_SABRE_HEAD.
-Sabre JPEG: normal-frame admission -> Sabre sparse alignment/rejection/merge -> ResolveSabre -> user-controlled residual MGC luma/chroma denoise -> Iris linear RGB; no RCD and no hidden VGN/IIR denoise.
+Sabre JPEG: explicit SABRE owner -> NORMAL-only admission -> Sabre sparse alignment/rejection/merge -> ResolveSabre -> Sabre-default user residual denoise -> common Iris color/viewfinder/tone/UHDR/JPEG.
+Sabre post isolation: no Spatial/Bento source restore; no Spatial highlight-reliability node; no Spatial reliability payload; no RCD/demosaic.
 Sabre RAW: same NORMAL population, Sabre flow/rejection/covariance weighted normalized16 Bayer DNG; black=0 white=65535; no Resolve/demosaic/WB/LSC/denoise/tone/sharpen baked in.
 Sabre support/noise: measured post-merge accumulated-green-weight coefficient; stale classic SNR lookup removed.
 Shared denoise controls: 0..2 luma/chroma act only after reconstruction and before PostPipeline/tone; luma new-key default=0.0, chroma preserves existing value.
 Shared noise model: imported GCam .c or exact Camera2 per-frame selection feeds both Spatial RGB and Sabre; Sabre residual denoise uses MGC-base physical noise scaled by measured merge support.
 Night remains isolated and unchanged.
+V1.2 ownership regression: PostPipeline routing is driven only by durable reconstruction owner, never by optional Spatial payload inference.
 Native build dependency bootstrap: exact successful-26544 JPEG/UltraHDR vendor source at $BJZHOU_VENDOR_HEAD, manifest-verified before and after assemble.
 EOF
 tar -czf "$OUT/26545_candidate_app_source.tar.gz" -C "$ROOT" app/src/main app/version.properties app/build.gradle
@@ -363,6 +365,6 @@ sha256sum "$OUT/26545_candidate_app_source.tar.gz" > "$OUT/26545_candidate_app_s
 cat "$OUT/26545_COMPILER_STATUS.txt"
 cat "$OUT/26545_STRICT_HANDOFF_REPORT.txt"
 echo "PASS: 26545 exact prior artifact authority"
-echo "PASS: 26545 runtime ownership + deterministic rollback"
+echo "PASS: 26545 V1.2 explicit Sabre/Spatial ownership + deterministic rollback"
 echo "PASS: 26545 REAL GLSL/KOTLIN/JAVA + FULL ANDROID ASSEMBLE"
 echo "APK: $FINAL"

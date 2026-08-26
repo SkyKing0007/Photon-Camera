@@ -43,10 +43,17 @@ app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
 app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt
 app/src/main/java/com/hinnka/mycamera/processor/MgcSabreRejectionTuning.kt
 app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2HighlightChromaReliability.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2MgcSourceExposure.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2Merger.java
 app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
 app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
 app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
 app/src/main/res/values/arrays.xml
@@ -62,9 +69,10 @@ PROTECTED=[
 'app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IsoExpoSelector.java',
 'app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java',
 'app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/UltraHdrSaver.java',
-'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java',
-'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java',
 'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightMgc1271Bridge.kt',
+'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java',
+'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java',
+'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java',
 ]
 
 def run(base,cand,base_pin):
@@ -88,6 +96,10 @@ def run(base,cand,base_pin):
     prefs=txt(cand,'app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java')
     settings_activity=txt(cand,'app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java')
     denoise=txt(cand,'app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt')
+    params=txt(cand,'app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java')
+    post=txt(cand,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java')
+    highlight=txt(cand,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2HighlightChromaReliability.java')
+    source_restore=txt(cand,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2MgcSourceExposure.java')
     px=txt(cand,'app/src/main/res/xml/preferences.xml')
     defaults=txt(cand,'app/src/main/res/values/default_prefs.xml')
     strings=txt(cand,'app/src/main/res/values/strings.xml')
@@ -117,6 +129,67 @@ def run(base,cand,base_pin):
     need('excluded.forEach { frames[it].image.close() }' in processor,'excluded bracket frame close missing')
     need('MgcSabreResolver.resolve(' in stack,'ResolveSabre missing')
     need('RunMotionV2FloatCfa' in hdrx and 'rcdBypassed=true demosaicBypassed=true' in hdrx,'direct-RGB post contract missing')
+
+    # V1.2: explicit reconstruction ownership; no optional-payload inference.
+    for m in ['MOTION_V2_RECONSTRUCTION_NONE','MOTION_V2_RECONSTRUCTION_SPATIAL_RGB',
+              'MOTION_V2_RECONSTRUCTION_SABRE','motionV2ReconstructionOwner',
+              'motionV2ReconstructionZoom']:
+        need(m in params,'explicit reconstruction owner contract missing '+m)
+    need('parameters.motionV2ReconstructionOwner = if (sabreSelected)' in bridge,
+         'bridge does not durably publish selected reconstruction owner')
+    for m in ['motionV2SpatialReliability = null','motionV2SpatialReliabilityWidth = 0',
+              'motionV2SpatialReliabilityHeight = 0']:
+        need(m in bridge,'bridge does not clear stale Spatial state: '+m)
+    need('Sabre unexpectedly leaked Spatial-only denoise/reliability state' in bridge,
+         'Sabre lacks negative Spatial payload proof')
+    need('Sabre unexpectedly inherited Spatial/Bento BaselineExposure' in bridge,
+         'Sabre lacks negative Bento/source-domain proof')
+    need('Sabre unexpectedly inherited Spatial SR/reconstruction zoom' in bridge,
+         'Sabre lacks negative Spatial SR proof')
+    need('reconstruction owner mismatch' in hdrx and
+         'Sabre leaked Spatial reliability before PostPipeline' in hdrx,
+         'Hdrx does not verify result/Parameters/Sabre payload agreement')
+
+    # Sabre high-level dispatch must precede all Spatial scheduling.
+    need(fusion.index('if (mergeMethod == MgcMergeMethod.SABRE)') <
+         fusion.index('val baseIndex = frames.indexOfFirst'),
+         'Sabre routing occurs after Spatial frame scheduling')
+    need('IRIS_26545_V1_2_SABRE_LOW_LEVEL_ISOLATION' in processor,
+         'Iris Sabre adapter low-level isolation contract missing')
+    need('if (processorPipeline == MgcRawProcessorPipeline.SABRE) {\n            return processSabreFrames(frames)\n        }' in stack,
+         'Sabre low-level dispatch does not precede Spatial pipeline')
+    need('require(processorPipeline == MgcRawProcessorPipeline.SABRE &&' in stack and
+         'mergeMethod == MgcMergeMethod.SABRE' in stack,
+         'Sabre low-level method lacks method/pipeline ownership assertion')
+    sabre_init=stack[stack.index('private fun initSabrePrograms()'):stack.index('private fun initPrograms(',stack.index('private fun initSabrePrograms()'))]
+    for bad in ['GlesMgcRawSpatialShaders.guide,','GlesMgcRawSpatialShaders.covariance,',
+                'GlesMgcRawSpatialShaders.rgbChromaGuide,',
+                'GlesMgcRawSpatialShaders.strengthAlignment,',
+                'GlesMgcRawSpatialShaders.strengthRejection,',
+                'GlesMgcRawSpatialShaders.rejection,','GlesMgcRawSpatialShaders.rgbMerge']:
+        need(bad not in sabre_init,'Spatial semantic shader leaked into Sabre init: '+bad)
+    for ok in ['GlesMgcRawSabreShaders.extractBayer','GlesMgcRawSabreShaders.guideAndCovariance',
+               'GlesMgcRawSabreShaders.rejection','GlesMgcRawSabreShaders.merge',
+               'GlesMgcRawSabreShaders.dehomogenize']:
+        need(ok in sabre_init,'dedicated Sabre program missing '+ok)
+
+    # Post graph: Spatial-only nodes are present only inside the explicit Spatial owner branch.
+    owner_start=post.index('if (reconstructionOwner == Parameters.MOTION_V2_RECONSTRUCTION_SPATIAL_RGB) {')
+    color_start=post.index('add(new MotionV2ColorTransform());',owner_start)
+    owner_block=post[owner_start:color_start]
+    sabre_start=owner_block.index('} else if (reconstructionOwner == Parameters.MOTION_V2_RECONSTRUCTION_SABRE) {')
+    spatial_block=owner_block[:sabre_start]
+    sabre_block=owner_block[sabre_start:]
+    for node in ['add(new MotionV2MgcSourceExposure())','add(new MotionV2HighlightChromaReliability())']:
+        need(node in spatial_block,'Spatial branch missing '+node)
+        need(node not in sabre_block,'Sabre branch still invokes Spatial-only '+node)
+    for marker in ['spatialSourceRestore=false','spatialHighlightReliability=false',
+                   'spatialReliabilityPayload=false','commonIrisFinishingBegins=MotionV2ColorTransform']:
+        need(marker in sabre_block,'Sabre post ownership marker missing '+marker)
+    need('MOTION_V2_RECONSTRUCTION_SPATIAL_RGB' in highlight,
+         'Spatial highlight node lacks defense-in-depth owner assertion')
+    need('MOTION_V2_RECONSTRUCTION_SPATIAL_RGB' in source_restore,
+         'Spatial source-restore node lacks defense-in-depth owner assertion')
 
     need('mergeMethod = if (sabreSelected) MgcMergeMethod.SABRE else MgcMergeMethod.SPATIAL_RGB' in bridge,'selector merge routing missing')
     need('outputMode = MgcSpatialOutputMode.RGB' in bridge,'common linear RGB output missing')
@@ -202,10 +275,10 @@ def run(base,cand,base_pin):
         ET.parse(cand/rel)
 
     print('PASS: EXACT PRIOR RUNTIME AUTHORITY 26544 frozen 967-file Iris manifest')
-    print('PASS: CHANGED RUNTIME SCOPE exact 18 files')
-    print('PASS: RUNTIME OWNERSHIP Motion selector -> Iris Sabre -> ResolveSabre -> common Iris RGB')
+    print('PASS: CHANGED RUNTIME SCOPE exact 25 files')
+    print('PASS: RUNTIME OWNERSHIP explicit owner -> isolated Sabre/Spatial pre-color graph -> common Iris finishing')
     print('PASS: DORMANT-OWNER REJECTION Spatial control unchanged; Night/legacy owners excluded')
-    print('PASS: capture/exposure/UHDR/PostPipeline/Night/Spatial control hashes unchanged')
+    print('PASS: capture/exposure/UHDR/Night/Spatial reconstruction/shared finishing control hashes unchanged')
     print('PASS: current Sabre sparse-flow/rejection + measured merge-support propagation')
     print('PASS: Sabre normalized16 stacked Bayer DNG same-normal-population/no-baked-processing contract')
     print('PASS: bounded request-only DNG accumulator + per-frame transient release')
@@ -213,8 +286,8 @@ def run(base,cand,base_pin):
     print('PASS: modified Android resource XML parses')
 
 def self_test():
-    assert len(ALLOWED)==18 and len(set(ALLOWED))==18
-    assert len(PROTECTED)==8 and len(set(PROTECTED))==8
+    assert len(ALLOWED)==25 and len(set(ALLOWED))==25
+    assert len(PROTECTED)==9 and len(set(PROTECTED))==9
     print('PASS: 26545 validator self-test')
 
 if __name__=='__main__':

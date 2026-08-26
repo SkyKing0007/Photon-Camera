@@ -1,18 +1,9 @@
-# 26545 Iris Sabre A/B — upload instructions
+# 26545 V1.2 Sabre ownership-isolation handoff
 
 Target branch: `experimental-clean-photon-rebuild`
 
-Exact starting commit: `99b1a4ec0bafd583e09ec686ef396de40403d2fe` (successful 26544 V1.3 handoff)
+This is a corrective revision of 0.9726545 / 26545. It reconstructs the exact successful 26544 runtime authority in Actions, applies the full audited 26545 V1.2 runtime patch, then runs real glslang 16.5.0, the real project Kotlin compiler, the real project Java compiler, and full Android assemble.
 
-Verified backup branch: `backup-26544-v1-3-pre-26545-iris-sabre-20260826`
+V1.2 specifically fixes the tested Sabre crash caused by a Spatial-only highlight reliability node leaking into the Sabre post graph. Routing now uses a durable reconstruction owner (`SPATIAL_RGB` or `SABRE`) with defense-in-depth assertions at the bridge, Hdrx boundary, PostPipeline graph, and Spatial-only nodes.
 
-Upload/extract **all files in this handoff ZIP at repository root**, preserving `.github/workflows/build-26545-iris-sabre-ab.yml`.
-Do not upload or edit `app/src` manually. The Actions build reconstructs the exact successful 26544 runtime candidate and applies the canonical 26545 patch itself.
-
-Suggested commit message:
-
-`26545: add Iris Sabre A/B and shared residual denoise controls`
-
-After committing to `experimental-clean-photon-rebuild`, GitHub Actions workflow **Build 26545 Iris Sabre A-B** should start automatically.
-
-Do not modify or push `dev`.
+No backup branch is required for this contained corrective revision. Do not edit or push `dev`. Replace the prior 26545 handoff files at repository root with this package and commit them to `experimental-clean-photon-rebuild`.
