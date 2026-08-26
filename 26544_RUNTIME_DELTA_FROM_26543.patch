@@ -1,0 +1,877 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java b/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
+index dbf850771befd89ef5d9995a3e841d307e5ea12e..9fda464a3afc18d787741845dd2304959dd1dedc 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
+@@ -20,6 +20,7 @@ import androidx.annotation.StringRes;
+ import androidx.core.content.ContextCompat;
+ import androidx.core.os.HandlerCompat;
+ 
++import com.particlesdevs.photoncamera.api.CameraMode;
+ import com.particlesdevs.photoncamera.api.Settings;
+ import com.particlesdevs.photoncamera.capture.CaptureController;
+ import com.particlesdevs.photoncamera.control.Gravity;
+@@ -215,6 +216,8 @@ public class PhotonCamera extends Application {
+     public void onCreate() {
+         registerActivityLifecycleCallbacks(new ActivityLifecycleMonitor());
+         sPhotonCamera = this;
++        Log.initProcessDiagnostics(this);
++        Log.critical("PhotonCamera", "IRIS_26544_APPLICATION_ONCREATE_BEGIN");
+         Log.d("PhotonCamera", "Initializing PhotonCamera Modules");
+         initModules();
+         super.onCreate();
+@@ -238,7 +241,16 @@ public class PhotonCamera extends Application {
+ 
+         PreferenceKeys.initialise(mSettingsManager);
+ 
++        /* IRIS_26544_COLD_START_MOTION_AUTHORITY
++         * A fresh Android process must never restore a stale Night mode after a Night process death.
++         * Set the persisted mode before Settings and camera UI/session state are constructed. Normal
++         * in-process mode switching still persists and behaves normally until the next process start.
++         */
++        PreferenceKeys.setCameraModeOrdinal(CameraMode.MOTION.ordinal());
++        Log.critical("PhotonCamera", "IRIS_26544_COLD_START_FORCE_MOTION ordinal="
++                + CameraMode.MOTION.ordinal());
+         mSettings = new Settings();
++        Log.critical("PhotonCamera", "IRIS_26544_SETTINGS_CREATED mode=" + mSettings.selectedMode);
+ 
+         //mParameters = new Parameters();
+         mPreviewParameters = new PreviewParameters();
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 099b9cf352a64af297f91b4ce4f3afbccc3d0120..762cde240511db8e159efe79e6df42c8d5066667 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -117,8 +117,6 @@ import java.util.Objects;
+ import android.media.Image;
+ import java.util.ArrayDeque;
+ import java.util.concurrent.ExecutorService;
+-import java.util.concurrent.Executors;
+-import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.Future;
+ import java.util.concurrent.Semaphore;
+ import java.util.concurrent.TimeUnit;
+@@ -468,18 +466,25 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 return;
+             }
+             if (mIrisNight26540CaptureActive) {
+-                /* IRIS_26543_NIGHT_BOUNDED_CAPTURE_MEMORY
+-                 * Keep exactly one in-memory SHORT reference. Every later Camera2 RAW is handed
+-                 * directly to the bounded spool workers without creating another native copy.
+-                 * At most ImageReader's three RAWs can be outstanding; capture timing remains
+-                 * producer-driven unless storage itself cannot keep up with the sensor.
++                /* IRIS_26544_NIGHT_IMMEDIATE_CALLBACK_OWNERSHIP
++                 * Keep exactly one app-owned SHORT reference. Every later Camera2 RAW is consumed
++                 * synchronously into the disk-backed Iris spool and closed before this callback
++                 * returns. No live Camera2 Image is retained by an executor or later processing.
+                  */
+-                if (!mIrisNight26543ReferenceCopied) {
++                if (!mIrisNight26544ReferenceCopied) {
+                     Image nightImage = null;
+                     ImageFrame copied = null;
++                    long nightTimestamp = 0L;
++                    Log.i(TAG, "IRIS_26544_NIGHT_RAW_CALLBACK_BEGIN role=REFERENCE");
+                     try {
+                         nightImage = reader.acquireNextImage();
+-                        if (nightImage == null) return;
++                        if (nightImage == null) {
++                            Log.critical(TAG, "IRIS_26544_NIGHT_RAW_ACQUIRE_NULL role=REFERENCE");
++                            return;
++                        }
++                        nightTimestamp = nightImage.getTimestamp();
++                        Log.i(TAG, "IRIS_26544_NIGHT_RAW_ACQUIRED role=REFERENCE timestamp="
++                                + nightTimestamp);
+                         copied = copyIrisNight26540Raw(nightImage);
+                         synchronized (mIrisNight26540Lock) {
+                             if (!mIrisNight26540CaptureActive) {
+@@ -487,56 +492,52 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                 copied = null;
+                             } else {
+                                 mIrisNight26540Frames.add(copied);
+-                                mIrisNight26543ReferenceCopied = true;
+-                                Log.i(TAG, "IRIS_26543_NIGHT_REFERENCE_MEMORY bytes="
++                                mIrisNight26544ReferenceCopied = true;
++                                Log.i(TAG, "IRIS_26544_NIGHT_REFERENCE_COPIED timestamp="
++                                        + nightTimestamp + " bytes="
+                                         + (copied.buffer == null ? 0 : copied.buffer.capacity())
+-                                        + " nativeReferenceFrames=1");
++                                        + " persistentNativeReferenceFrames=1");
+                             }
+                         }
+                     } catch (Throwable nightRawFailure) {
+                         if (copied != null) try { copied.close(); } catch (Throwable ignored) {}
+-                        Log.e(TAG, "IRIS_26543_NIGHT_REFERENCE_COPY_FAILED", nightRawFailure);
++                        Log.e(TAG, "IRIS_26544_NIGHT_REFERENCE_COPY_FAILED", nightRawFailure);
++                        Log.critical(TAG, "IRIS_26544_NIGHT_REFERENCE_COPY_FAILED type="
++                                + nightRawFailure.getClass().getName() + " message="
++                                + String.valueOf(nightRawFailure.getMessage()));
+                         cameraEventsListener.onProcessingError("Night reference RAW copy: "
+                                 + nightRawFailure.getClass().getSimpleName());
+                     } finally {
+-                        if (nightImage != null) try { nightImage.close(); } catch (Throwable ignored) {}
++                        if (nightImage != null) {
++                            try { nightImage.close(); } catch (Throwable ignored) {}
++                            Log.critical(TAG, "IRIS_26544_NIGHT_CAMERA2_IMAGE_CLOSED role=REFERENCE timestamp="
++                                    + nightTimestamp);
++                        }
+                     }
+                     tryDispatchIrisNight26540();
+                     return;
+                 }
+-                try {
+-                    mIrisNight26543SpoolSlots.acquire();
+-                } catch (InterruptedException interrupted) {
+-                    Thread.currentThread().interrupt();
+-                    cameraEventsListener.onProcessingError("Night RAW spool interrupted");
+-                    return;
+-                }
+                 Image nightImage = null;
+                 try {
++                    Log.i(TAG, "IRIS_26544_NIGHT_RAW_CALLBACK_BEGIN role=AUX");
+                     nightImage = reader.acquireNextImage();
+                     if (nightImage == null) {
+-                        mIrisNight26543SpoolSlots.release();
++                        Log.critical(TAG, "IRIS_26544_NIGHT_RAW_ACQUIRE_NULL role=AUX");
+                         return;
+                     }
+                     final Image ownedImage = nightImage;
+                     nightImage = null;
+-                    final long generation = mIrisNight26543CaptureGeneration;
+-                    mIrisNight26543PendingSpools.incrementAndGet();
+-                    try {
+-                        IRIS_NIGHT_26543_SPOOL_EXECUTOR.execute(() ->
+-                                spoolIrisNight26543Raw(ownedImage, generation));
+-                    } catch (Throwable submitFailure) {
+-                        mIrisNight26543PendingSpools.decrementAndGet();
+-                        mIrisNight26543SpoolFailure = "submit:"
+-                                + submitFailure.getClass().getSimpleName();
+-                        try { ownedImage.close(); } catch (Throwable ignored) {}
+-                        throw submitFailure;
+-                    }
++                    spoolIrisNight26544RawSynchronously(ownedImage, mIrisNight26544CaptureGeneration);
+                 } catch (Throwable nightRawFailure) {
+                     if (nightImage != null) try { nightImage.close(); } catch (Throwable ignored) {}
+-                    mIrisNight26543SpoolSlots.release();
+-                    Log.e(TAG, "IRIS_26543_NIGHT_SPOOL_SUBMIT_FAILED", nightRawFailure);
+-                    cameraEventsListener.onProcessingError("Night RAW spool submit: "
++                    mIrisNight26544SpoolFailure = "callback:"
++                            + nightRawFailure.getClass().getSimpleName() + ":"
++                            + String.valueOf(nightRawFailure.getMessage());
++                    Log.e(TAG, "IRIS_26544_NIGHT_SYNC_SPOOL_CALLBACK_FAILED", nightRawFailure);
++                    Log.critical(TAG, "IRIS_26544_NIGHT_SYNC_SPOOL_CALLBACK_FAILED type="
++                            + nightRawFailure.getClass().getName() + " message="
++                            + String.valueOf(nightRawFailure.getMessage()));
++                    cameraEventsListener.onProcessingError("Night RAW spool: "
+                             + nightRawFailure.getClass().getSimpleName());
+                 }
+                 return;
+@@ -4306,28 +4307,20 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      */
+     private final Object mIrisNight26540Lock = new Object();
+     private final ArrayList<ImageFrame> mIrisNight26540Frames = new ArrayList<>();
+-    /* IRIS_26543_NIGHT_BOUNDED_CAPTURE_MEMORY_OWNER
+-     * ImageReader itself has maxImages=3 in fresh Night. Three spool permits therefore bound
+-     * outstanding HAL RAWs exactly to the already-provisioned reader capacity; only the first
+-     * SHORT gets a persistent native copy. Two workers overlap sequential UFS writes.
++    /* IRIS_26544_NIGHT_IMMEDIATE_IMAGE_RELEASE_OWNER
++     * Original Photon copies/consumes a Camera2 RAW while the Image is valid and closes that
++     * Image before returning from ImageReader.OnImageAvailableListener. 26543 diverged from that
++     * proven ownership by handing live Camera2 Images to asynchronous disk workers. Night died
++     * inside that exact ingestion window on the tested 26543 V1.4 APK. 26544 restores the proven
++     * ownership discipline while retaining Iris Night's one-reference + disk-backed RAW memory:
++     * reference is copied synchronously; every other RAW is synchronously spooled and the Camera2
++     * Image is closed in this callback before the next callback is serviced. No live Image escapes.
+      */
+-    private static final int IRIS_NIGHT_26543_SPOOL_SLOTS = 3;
+-    private static final long IRIS_NIGHT_26543_SPOOL_RESERVE_BYTES = 128L * 1024L * 1024L;
+-    private static final long IRIS_NIGHT_26543_SPOOL_DRAIN_TIMEOUT_MS = 10_000L;
+-    private static final ExecutorService IRIS_NIGHT_26543_SPOOL_EXECUTOR =
+-            Executors.newFixedThreadPool(2, runnable -> {
+-                Thread thread = new Thread(runnable, "IrisNightRawSpool");
+-                thread.setDaemon(true);
+-                return thread;
+-            });
+-    private final Semaphore mIrisNight26543SpoolSlots =
+-            new Semaphore(IRIS_NIGHT_26543_SPOOL_SLOTS, true);
+-    private final AtomicInteger mIrisNight26543PendingSpools = new AtomicInteger(0);
+-    private volatile boolean mIrisNight26543ReferenceCopied = false;
+-    private volatile long mIrisNight26543CaptureGeneration = 0L;
+-    private volatile long mIrisNight26543SpoolDrainDeadlineMs = 0L;
+-    private volatile boolean mIrisNight26543SpoolCapacityChecked = false;
+-    private volatile String mIrisNight26543SpoolFailure = null;
++    private static final long IRIS_NIGHT_26544_SPOOL_RESERVE_BYTES = 128L * 1024L * 1024L;
++    private volatile boolean mIrisNight26544ReferenceCopied = false;
++    private volatile long mIrisNight26544CaptureGeneration = 0L;
++    private volatile boolean mIrisNight26544SpoolCapacityChecked = false;
++    private volatile String mIrisNight26544SpoolFailure = null;
+     private final java.util.concurrent.ConcurrentHashMap<Long, TotalCaptureResult>
+             mIrisNight26540Results = new java.util.concurrent.ConcurrentHashMap<>();
+     private final java.util.concurrent.ConcurrentHashMap<Long, CaptureRequest>
+@@ -4366,16 +4359,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             CameraCharacteristics characteristics, int rotation) {
+         if (expectedFrames < 2) throw new IllegalArgumentException("26540 Night requires >=2 frames");
+         drainIrisNight26540ReaderBeforeCapture();
+-        if (mIrisNight26543PendingSpools.get() != 0
+-                || mIrisNight26543SpoolSlots.availablePermits() != IRIS_NIGHT_26543_SPOOL_SLOTS) {
+-            throw new IllegalStateException("26543 Night previous RAW spool is still active");
+-        }
+-        cleanupIrisNight26543SpoolCache();
+-        mIrisNight26543ReferenceCopied = false;
+-        mIrisNight26543CaptureGeneration++;
+-        mIrisNight26543SpoolDrainDeadlineMs = 0L;
+-        mIrisNight26543SpoolCapacityChecked = false;
+-        mIrisNight26543SpoolFailure = null;
++        cleanupIrisNight26544SpoolCache();
++        mIrisNight26544ReferenceCopied = false;
++        mIrisNight26544CaptureGeneration++;
++        mIrisNight26544SpoolCapacityChecked = false;
++        mIrisNight26544SpoolFailure = null;
+         synchronized (mIrisNight26540Lock) {
+             for (ImageFrame old : mIrisNight26540Frames) {
+                 if (old != null) try { old.close(); } catch (Throwable ignored) {}
+@@ -4403,6 +4391,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mIrisNight26540CaptureActive = true;
+             CaptureController.isProcessing = true;
+         }
++        Log.processState(TAG, "NIGHT_CAPTURE_ARMED_" + expectedFrames + "_FRAMES");
++        Log.critical(TAG, "IRIS_26544_NIGHT_CAPTURE_ARMED frames=" + expectedFrames
++                + " saveRaw=" + mIrisNight26540SaveRaw + " cameraId=" + mIrisNight26540CameraId);
+         Log.i(TAG, "IRIS_26540_NIGHT_CAPTURE_STATE_FROZEN frames=" + expectedFrames
+                 + " saveRaw=" + mIrisNight26540SaveRaw
+                 + " superRes=" + mIrisNight26540SuperRes
+@@ -4440,26 +4431,36 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return dir;
+     }
+ 
+-    private void cleanupIrisNight26543SpoolCache() {
++    private void cleanupIrisNight26544SpoolCache() {
+         try {
+             File dir = new File(PhotonCamera.getApplicationContextStatic().getCacheDir(), "iris-night-raw-spool");
+-            File[] stale = dir.listFiles((d, name) -> name.startsWith("iris26543_") && name.endsWith(".raw"));
++            File[] stale = dir.listFiles((d, name) -> name.endsWith(".raw")
++                    && (name.startsWith("iris26543_") || name.startsWith("iris26544_")));
+             if (stale != null) for (File f : stale) { try { f.delete(); } catch (Throwable ignored) {} }
+         } catch (Throwable cleanupFailure) {
+-            Log.w(TAG, "IRIS_26543_NIGHT_SPOOL_STALE_CLEANUP_FAILED " + cleanupFailure);
++            Log.w(TAG, "IRIS_26544_NIGHT_SPOOL_STALE_CLEANUP_FAILED " + cleanupFailure);
+         }
+     }
+ 
+-    private void spoolIrisNight26543Raw(@NonNull Image image, long generation) {
++    /* IRIS_26544_NIGHT_SYNC_RAW_SPOOL_OWNER
++     * The Camera2 Image never leaves OnImageAvailable ownership. The raw plane is written while
++     * the Image is valid; the Image is closed in this method's finally block before callback return.
++     * This restores original Photon's proven immediate-release discipline without retaining 14
++     * additional full RAW copies in memory.
++     */
++    private void spoolIrisNight26544RawSynchronously(@NonNull Image image, long generation) {
+         ImageFrame frame = null;
+         File file = null;
+         long bytes = 0L;
++        long timestamp = 0L;
+         long startNs = System.nanoTime();
+         try {
++            timestamp = image.getTimestamp();
++            Log.i(TAG, "IRIS_26544_NIGHT_RAW_ACQUIRED role=AUX timestamp=" + timestamp);
+             if (image.getFormat() != ImageFormat.RAW_SENSOR)
+-                throw new IllegalArgumentException("26543 Night spool requires RAW_SENSOR");
++                throw new IllegalArgumentException("26544 Night spool requires RAW_SENSOR");
+             if (mIrisNight26540Binning)
+-                throw new IllegalStateException("26543 Night disk spool requires native non-binned RAW layout");
++                throw new IllegalStateException("26544 Night disk spool requires native non-binned RAW layout");
+             Image.Plane plane = image.getPlanes()[0];
+             int rowStride = plane.getRowStride();
+             int pixelStride = plane.getPixelStride();
+@@ -4467,25 +4468,27 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             int capacity = plane.getBuffer().capacity();
+             bytes = capacity;
+             File dir = irisNight26543SpoolDirectory();
+-            if (!mIrisNight26543SpoolCapacityChecked) {
++            if (!mIrisNight26544SpoolCapacityChecked) {
+                 synchronized (mIrisNight26540Lock) {
+-                    if (!mIrisNight26543SpoolCapacityChecked) {
++                    if (!mIrisNight26544SpoolCapacityChecked) {
+                         long required = Math.max(0L, (long)mIrisNight26540ExpectedFrames - 1L) * capacity
+-                                + IRIS_NIGHT_26543_SPOOL_RESERVE_BYTES;
++                                + IRIS_NIGHT_26544_SPOOL_RESERVE_BYTES;
+                         if (dir.getUsableSpace() < required)
+                             throw new IllegalStateException("Insufficient cache space for Night RAW spool: required="
+                                     + required + " usable=" + dir.getUsableSpace());
+-                        mIrisNight26543SpoolCapacityChecked = true;
+-                        Log.i(TAG, "IRIS_26543_NIGHT_SPOOL_CAPACITY expectedFrames="
++                        mIrisNight26544SpoolCapacityChecked = true;
++                        Log.critical(TAG, "IRIS_26544_NIGHT_SPOOL_CAPACITY expectedFrames="
+                                 + mIrisNight26540ExpectedFrames + " rawBytes=" + capacity
+                                 + " requiredWithReserve=" + required + " usable=" + dir.getUsableSpace());
+                     }
+                 }
+             }
+-            file = new File(dir, "iris26543_" + generation + "_" + image.getTimestamp() + ".raw");
++            file = new File(dir, "iris26544_" + generation + "_" + timestamp + ".raw");
+             java.nio.ByteBuffer source = plane.getBuffer().duplicate();
+             source.position(0);
+             source.limit(capacity);
++            Log.i(TAG, "IRIS_26544_NIGHT_RAW_SYNC_WRITE_BEGIN timestamp=" + timestamp
++                    + " bytes=" + capacity);
+             try (FileOutputStream fos = new FileOutputStream(file);
+                  java.nio.channels.FileChannel channel = fos.getChannel()) {
+                 while (source.hasRemaining()) channel.write(source);
+@@ -4493,7 +4496,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             if (file.length() != capacity)
+                 throw new IllegalStateException("Night RAW spool length=" + file.length() + " expected=" + capacity);
+             frame = new ImageFrame();
+-            frame.timestamp = image.getTimestamp();
++            frame.timestamp = timestamp;
+             frame.setMotionV2PlaneLayout(image.getFormat(), image.getWidth(), image.getHeight(),
+                     rowStride, pixelStride, false);
+             frame.width = storageWidth;
+@@ -4501,15 +4504,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             frame.setIrisNightRawSpool(file, capacity);
+             file = null; // frame.close() owns deletion from here.
+             synchronized (mIrisNight26540Lock) {
+-                if (!mIrisNight26540CaptureActive || generation != mIrisNight26543CaptureGeneration) {
++                if (!mIrisNight26540CaptureActive || generation != mIrisNight26544CaptureGeneration) {
+                     frame.close();
+                     frame = null;
+                 } else {
+                     mIrisNight26540Frames.add(frame);
+-                    Log.i(TAG, "IRIS_26543_NIGHT_RAW_SPOOLED timestamp=" + frame.timestamp
++                    Log.i(TAG, "IRIS_26544_NIGHT_RAW_SYNC_WRITE_END timestamp=" + frame.timestamp
+                             + " bytes=" + frame.irisNightRawSpoolBytes
+-                            + " pending=" + mIrisNight26543PendingSpools.get()
+-                            + " nativeCopiesPersistent=1 tookMs="
++                            + " persistentNativeCopies=1 tookMs="
+                             + ((System.nanoTime() - startNs) / 1_000_000L));
+                     frame = null;
+                 }
+@@ -4517,13 +4519,15 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         } catch (Throwable spoolFailure) {
+             if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+             if (file != null) try { file.delete(); } catch (Throwable ignored) {}
+-            mIrisNight26543SpoolFailure = "write:" + spoolFailure.getClass().getSimpleName()
++            mIrisNight26544SpoolFailure = "write:" + spoolFailure.getClass().getSimpleName()
+                     + ":" + String.valueOf(spoolFailure.getMessage());
+-            Log.e(TAG, "IRIS_26543_NIGHT_RAW_SPOOL_FAILED bytes=" + bytes, spoolFailure);
++            Log.e(TAG, "IRIS_26544_NIGHT_RAW_SYNC_SPOOL_FAILED bytes=" + bytes, spoolFailure);
++            Log.critical(TAG, "IRIS_26544_NIGHT_RAW_SYNC_SPOOL_FAILED timestamp=" + timestamp
++                    + " type=" + spoolFailure.getClass().getName() + " message="
++                    + String.valueOf(spoolFailure.getMessage()));
+         } finally {
+             try { image.close(); } catch (Throwable ignored) {}
+-            mIrisNight26543PendingSpools.decrementAndGet();
+-            mIrisNight26543SpoolSlots.release();
++            Log.critical(TAG, "IRIS_26544_NIGHT_CAMERA2_IMAGE_CLOSED role=AUX timestamp=" + timestamp);
+             tryDispatchIrisNight26540();
+         }
+     }
+@@ -4612,31 +4616,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    private void finishIrisNight26540AfterDrainTimeout() {
+-        int pendingSpools = mIrisNight26543PendingSpools.get();
+-        if (pendingSpools > 0) {
+-            long now = SystemClock.elapsedRealtime();
+-            if (now < mIrisNight26543SpoolDrainDeadlineMs) {
+-                Log.i(TAG, "IRIS_26543_NIGHT_WAITING_FOR_SPOOL pending=" + pendingSpools
+-                        + " permits=" + mIrisNight26543SpoolSlots.availablePermits());
+-                if (mBackgroundHandler != null)
+-                    mBackgroundHandler.postDelayed(
+-                            CaptureController.this::finishIrisNight26540AfterDrainTimeout, 100L);
+-                return;
+-            }
+-            synchronized (mIrisNight26540Lock) {
+-                mIrisNight26540CaptureActive = false;
+-                for (ImageFrame frame : mIrisNight26540Frames)
+-                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                mIrisNight26540Frames.clear();
+-                mIrisNight26540Results.clear();
+-                mIrisNight26540Requests.clear();
+-            }
+-            CaptureController.isProcessing = false;
+-            Log.e(TAG, "IRIS_26543_NIGHT_SPOOL_DRAIN_TIMEOUT pending=" + pendingSpools);
+-            cameraEventsListener.onProcessingError("Iris Night RAW spool timeout");
+-            return;
+-        }
++    private void finishIrisNight26544AfterSequenceGrace() {
+         boolean fail = false;
+         int matchedCount = 0;
+         int requestedCount = 0;
+@@ -4681,10 +4661,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private void tryDispatchIrisNight26540() {
+         IrisNightBatch sealedBatch = null;
+         try {
+-            if (mIrisNight26543PendingSpools.get() != 0) return;
+-            if (mIrisNight26543SpoolFailure != null) {
+-                throw new IllegalStateException("26543 Night RAW spool failure: "
+-                        + mIrisNight26543SpoolFailure);
++            if (mIrisNight26544SpoolFailure != null) {
++                throw new IllegalStateException("26544 Night RAW spool failure: "
++                        + mIrisNight26544SpoolFailure);
+             }
+             synchronized (mIrisNight26540Lock) {
+                 if (!mIrisNight26540CaptureActive || !mIrisNight26540SequenceComplete
+@@ -4734,19 +4713,15 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     if (!frame.hasMotionV2RawBacking())
+                         throw new IllegalStateException("26543 Night matched frame lost RAW backing");
+                 }
+-                if (inMemoryRawFrames != 1 || diskBackedRawFrames != matched.size() - 1
+-                        || mIrisNight26543PendingSpools.get() != 0
+-                        || mIrisNight26543SpoolSlots.availablePermits() != IRIS_NIGHT_26543_SPOOL_SLOTS) {
+-                    throw new IllegalStateException("26543 Night bounded-memory proof failed memory="
++                if (inMemoryRawFrames != 1 || diskBackedRawFrames != matched.size() - 1) {
++                    throw new IllegalStateException("26544 Night bounded-memory proof failed memory="
+                             + inMemoryRawFrames + " disk=" + diskBackedRawFrames
+-                            + " frames=" + matched.size()
+-                            + " pending=" + mIrisNight26543PendingSpools.get()
+-                            + " permits=" + mIrisNight26543SpoolSlots.availablePermits());
++                            + " frames=" + matched.size());
+                 }
+-                Log.i(TAG, "IRIS_26543_NIGHT_BOUNDED_MEMORY_PROOF frames=" + matched.size()
++                Log.critical(TAG, "IRIS_26544_NIGHT_BOUNDED_MEMORY_PROOF frames=" + matched.size()
+                         + " inMemoryRawFrames=" + inMemoryRawFrames
+                         + " diskBackedRawFrames=" + diskBackedRawFrames
+-                        + " nativePersistentCopies=1 imageReaderSlots=3 pending=0 spoolPermits=3");
++                        + " persistentNativeCopies=1 asyncLiveCamera2Images=0");
+                 sealedBatch = new IrisNightBatch(matched, new ArrayList<>(BurstShakiness),
+                         java.util.Collections.emptyMap(), mIrisNight26540Results, mIrisNight26540Requests,
+                         mIrisNight26540Characteristics, RAW_FORMAT, mIrisNight26540Rotation,
+@@ -4781,6 +4756,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+         final IrisNightBatch batch = sealedBatch;
+         if (batch == null) return;
++        Log.processState(TAG, "NIGHT_BATCH_SEALED");
++        Log.critical(TAG, "IRIS_26544_NIGHT_BATCH_SEALED frames=" + batch.frames.size());
+         Log.i(TAG, "IRIS_26541_NIGHT_BATCH_SEALED frames=" + batch.frames.size()
+                 + " shortActual=" + batch.shortFrameCount + " longActual=" + batch.longFrameCount
+                 + " shortRequested=" + batch.requestedShortFrames + " longRequested=" + batch.requestedLongFrames
+@@ -4788,7 +4765,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + " zsl=false motionRing=false preShutterRaw=false"
+                 + " staticImageBuffer=false defaultSaver=false hdrxRun=false");
+         try {
+-            processExecutor.execute(() -> IrisNightProcessor.process(batch, cameraEventsListener));
++            Log.processState(TAG, "NIGHT_PROCESS_DISPATCH");
++            Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_DISPATCH frames=" + batch.frames.size());
++            processExecutor.execute(() -> {
++                Log.processState(TAG, "NIGHT_PROCESSOR_THREAD_ENTER");
++                Log.critical(TAG, "IRIS_26544_NIGHT_PROCESSOR_ENTER frames=" + batch.frames.size());
++                IrisNightProcessor.process(batch, cameraEventsListener);
++            });
+         } catch (Throwable dispatchFailure) {
+             for (ImageFrame frame : batch.frames) {
+                 if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+@@ -6793,6 +6776,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     Log.d(TAG, "Timestamp:" + time);
+                     if (iris26533CaptureMode == CameraMode.NIGHT) {
+                         Long irisNightTs = result.get(CaptureResult.SENSOR_TIMESTAMP);
++                        Log.i(TAG, "IRIS_26544_NIGHT_CAPTURE_RESULT frameNumber="
++                                + result.getFrameNumber() + " timestamp=" + String.valueOf(irisNightTs));
+                         if (irisNightTs == null) {
+                             Log.e(TAG, "IRIS_26540_NIGHT_RESULT_MISSING_TIMESTAMP frame="
+                                     + result.getFrameNumber());
+@@ -6848,9 +6833,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         synchronized (mIrisNight26540Lock) {
+                             mIrisNight26540ExpectedFrames = finalFrameCount;
+                             mIrisNight26540SequenceComplete = true;
+-                            mIrisNight26543SpoolDrainDeadlineMs = SystemClock.elapsedRealtime()
+-                                    + IRIS_NIGHT_26543_SPOOL_DRAIN_TIMEOUT_MS;
+                         }
++                        Log.processState(TAG, "NIGHT_SEQUENCE_COMPLETE_" + finalFrameCount);
++                        Log.critical(TAG, "IRIS_26544_NIGHT_SEQUENCE_COMPLETE frames=" + finalFrameCount);
+                         mBackgroundHandler.post(() -> {
+                             if (!isDualSession) unlockFocus();
+                             else createCameraPreviewSession(false);
+@@ -6860,7 +6845,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         tryDispatchIrisNight26540();
+                         if (mBackgroundHandler != null) {
+                             mBackgroundHandler.postDelayed(
+-                                    CaptureController.this::finishIrisNight26540AfterDrainTimeout, 750L);
++                                    CaptureController.this::finishIrisNight26544AfterSequenceGrace, 750L);
+                         }
+                         return;
+                     }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 006d142f1bf43f6dbd50c80273f59ba886ecffd1..6e84db3ec4798a1546887b410588d00c4919b26d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -145,22 +145,33 @@ public class PostPipeline extends GLBasePipeline {
+         parameters.motionV2Active = false;
+         irisMotionRcdActive = false;
+         irisMotionDirectRgbAuxiliary = null;
+-        Log.i("PostPipeline", "IRIS_26539_NIGHT_SPATIAL_RGB_POST_ENTRY carrier=RGBA16F"
++        Log.processState("PostPipeline", "NIGHT_POST_PIPELINE_ENTER");
++        Log.critical("PostPipeline", "IRIS_26544_NIGHT_SPATIAL_RGB_POST_ENTRY carrier=RGBA16F"
++                + " bytes=" + spatialRgb.capacity()
+                 + " dedicatedNightInput=true twoBuffer=true rcd=false demosaic=false"
+                 + " lifecycleOwner=night_self_closing");
+         try {
+-            return Run(null, parameters);
++            Log.processState("PostPipeline", "NIGHT_POST_RUN_BEGIN");
++            Log.critical("PostPipeline", "IRIS_26544_NIGHT_POST_RUN_BEGIN");
++            Bitmap result = Run(null, parameters);
++            Log.processState("PostPipeline", "NIGHT_POST_RUN_COMPLETE");
++            Log.critical("PostPipeline", "IRIS_26544_NIGHT_POST_RUN_COMPLETE bitmap="
++                    + (result == null ? "null" : (result.getWidth() + "x" + result.getHeight())));
++            return result;
+         } finally {
+             // IRIS_26539_NIGHT_POST_OWNER_CLOSE_BEFORE_JIN
+             // The returned Bitmap owns a copied ARGB_8888 image. Night must destroy the EGL/Post
+             // owner before ORT/Jin begins, even when a post node throws. Motion keeps its existing
+             // caller-owned lifecycle unchanged.
+             irisNightRgba16f = null;
++            Log.processState("PostPipeline", "NIGHT_POST_CLOSE_BEGIN");
++            Log.critical("PostPipeline", "IRIS_26544_NIGHT_POST_CLOSE_BEGIN");
+             try { close(); }
+             catch (Throwable closeFailure) {
+                 Log.e("PostPipeline", "IRIS_26539_NIGHT_POST_CLOSE_FAILED", closeFailure);
+             }
+-            Log.i("PostPipeline", "IRIS_26539_NIGHT_POST_OWNER_CLOSED beforeJin=true"
++            Log.processState("PostPipeline", "NIGHT_POST_CLOSE_COMPLETE");
++            Log.critical("PostPipeline", "IRIS_26544_NIGHT_POST_OWNER_CLOSED beforeJin=true"
+                     + " carrierReferenceCleared=true");
+         }
+     }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index ac9ddf686bb2413b21101fcb7701c741475d313a..8b3a64a8f051dc6de2ea5a7b7c9e861056d2fad5 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -38,6 +38,9 @@ public final class IrisNightProcessor {
+                                ProcessingEventsListener listener) {
+         final long startNs = System.nanoTime();
+         CaptureController.isProcessing = true;
++        Log.processState(TAG, "NIGHT_PROCESS_ENTRY");
++        Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_ENTRY frames="
++                + (batch == null || batch.frames == null ? -1 : batch.frames.size()));
+         listener.onProcessingStarted("Iris Night");
+         try {
+             if (batch == null || batch.characteristics == null || batch.frames.size() < 2) {
+@@ -110,6 +113,9 @@ public final class IrisNightProcessor {
+                     + " superRes=" + batch.superResEnabled);
+ 
+             final long mergeStartNs = System.nanoTime();
++            Log.processState(TAG, "NIGHT_MGC_BEGIN");
++            Log.critical(TAG, "IRIS_26544_NIGHT_MGC_BEGIN frames=" + images.size()
++                    + " raw=" + width + "x" + height + " saveRaw=" + batch.saveRaw);
+             final MotionV2Merger.Result r = PhotonMotionMgc1271Bridge.reconstruct(
+                     new Point(width, height), images, ref, p, null, batch.saveRaw >= 1);
+             final long mergeMs = (System.nanoTime() - mergeStartNs) / 1_000_000L;
+@@ -131,8 +137,14 @@ public final class IrisNightProcessor {
+                 throw new IllegalStateException("26540 Night RGB carrier aliases DNG sidecar");
+             }
+             p.motionV2EffectiveSupport = r.effectiveSupport;
++            Log.processState(TAG, "NIGHT_MGC_COMPLETE");
++            Log.critical(TAG, "IRIS_26544_NIGHT_MGC_COMPLETE inputFrames=" + r.inputFrames
++                    + " effectiveSupport=" + r.effectiveSupport
++                    + " rgba16fBytes=" + rgb.capacity());
+ 
+             if (batch.saveRaw >= 1) {
++                Log.processState(TAG, "NIGHT_DNG_BEGIN");
++                Log.critical(TAG, "IRIS_26544_NIGHT_DNG_BEGIN path=" + dngFile);
+                 boolean rawSaved = false;
+                 try {
+                     if (p.motionV2SuperResOutputEnabled && r.superResLinearRawPath != null
+@@ -157,6 +169,9 @@ public final class IrisNightProcessor {
+                     }
+                 } catch (Throwable rawFailure) {
+                     Log.e(TAG, "IRIS_26540_NIGHT_DNG_SAVE_FAILED_CONTINUE_JPEG", rawFailure);
++                    Log.critical(TAG, "IRIS_26544_NIGHT_DNG_FAILED_CONTINUE_JPEG type="
++                            + rawFailure.getClass().getName() + " message="
++                            + String.valueOf(rawFailure.getMessage()));
+                 } finally {
+                     if (r.stackedDngRaw16 != null) {
+                         try { Allocator.free(r.stackedDngRaw16); } catch (Throwable ignored) {}
+@@ -166,7 +181,13 @@ public final class IrisNightProcessor {
+                         catch (Throwable ignored) {}
+                     }
+                 }
++                Log.processState(TAG, "NIGHT_DNG_COMPLETE");
++                Log.critical(TAG, "IRIS_26544_NIGHT_DNG_COMPLETE saved=" + rawSaved
++                        + " path=" + dngFile);
+                 listener.notifyImageSavedStatus(rawSaved, dngFile);
++                Log.critical(TAG, "IRIS_26544_NIGHT_DNG_NOTIFY_COMPLETE saved=" + rawSaved);
++            } else {
++                Log.critical(TAG, "IRIS_26544_NIGHT_DNG_SKIPPED saveRaw=" + batch.saveRaw);
+             }
+ 
+             exif.IMAGE_DESCRIPTION = p.toString()
+@@ -184,16 +205,19 @@ public final class IrisNightProcessor {
+ 
+             final PostPipeline pipeline = new PostPipeline(true);
+             final long postStartNs = System.nanoTime();
+-            Log.i(TAG, "IRIS_26543_NIGHT_POST_RGB_BEGIN dngStageComplete=true");
++            Log.processState(TAG, "NIGHT_POST_RGB_BEGIN");
++            Log.critical(TAG, "IRIS_26544_NIGHT_POST_RGB_BEGIN dngStageComplete=true");
+             final Point crop;
+             Bitmap img;
+             try {
+                 img = pipeline.RunIrisNightRgb(rgb, p);
+                 crop = pipeline.cropSize == null ? new Point(p.rawSize) : new Point(pipeline.cropSize);
+-                Log.i(TAG, "IRIS_26543_NIGHT_POST_RGB_COMPLETE bitmap="
++                Log.processState(TAG, "NIGHT_POST_RGB_COMPLETE");
++                Log.critical(TAG, "IRIS_26544_NIGHT_POST_RGB_COMPLETE bitmap="
+                         + (img == null ? "null" : (img.getWidth() + "x" + img.getHeight())));
+             } finally {
+                 try { Allocator.free(rgb); } catch (Throwable ignored) {}
++                Log.critical(TAG, "IRIS_26544_NIGHT_RGBA16F_RELEASED bytes=" + expectedRgbBytes);
+             }
+             Log.i(TAG, "IRIS_26540_NIGHT_RGBA16F_RELEASED_BEFORE_JIN bytes=" + expectedRgbBytes);
+             if (android.os.Build.VERSION.SDK_INT >= 34 && img != null
+@@ -204,20 +228,40 @@ public final class IrisNightProcessor {
+             final String srDetailPath = r.superResDetailPath;
+             final int srDetailWidth = r.superResDetailWidth;
+             final int srDetailHeight = r.superResDetailHeight;
+-            Log.i(TAG, "IRIS_26543_NIGHT_BASE_JPEG_BEGIN");
++            Log.processState(TAG, "NIGHT_BASE_JPEG_BEGIN");
++            Log.critical(TAG, "IRIS_26544_NIGHT_BASE_JPEG_BEGIN path=" + imageFile);
+             final boolean baseSaved = ImageSaver.Util.saveBitmapAsJPGIrisNightCheckpoint(
+                     imageFile, img, ImageSaver.JPG_QUALITY, exif);
+-            Log.i(TAG, "IRIS_26543_NIGHT_BASE_JPEG_COMPLETE saved=" + baseSaved);
+-            if (baseSaved) listener.notifyImageSavedStatus(true, imageFile);
++            Log.processState(TAG, "NIGHT_BASE_JPEG_COMPLETE_" + baseSaved);
++            Log.critical(TAG, "IRIS_26544_NIGHT_BASE_JPEG_COMPLETE saved=" + baseSaved);
++            if (baseSaved) {
++                Log.critical(TAG, "IRIS_26544_NIGHT_BASE_JPEG_NOTIFY_BEGIN");
++                listener.notifyImageSavedStatus(true, imageFile);
++                Log.critical(TAG, "IRIS_26544_NIGHT_BASE_JPEG_NOTIFY_END");
++            }
+             else Log.w(TAG, "IRIS_26540_NIGHT_BASE_CHECKPOINT_FAILED continueFinalAttempt=true");
+ 
++            Log.processState(TAG, "NIGHT_JIN_BEGIN");
++            Log.critical(TAG, "IRIS_26544_NIGHT_JIN_BEGIN baseSaved=" + baseSaved);
+             img = IrisNightNeuralEnhancer.enhanceInPlace(img);
++            Log.processState(TAG, "NIGHT_JIN_COMPLETE");
++            Log.critical(TAG, "IRIS_26544_NIGHT_JIN_COMPLETE bitmap="
++                    + (img == null ? "null" : (img.getWidth() + "x" + img.getHeight())));
+             final long postPlusJinMs = (System.nanoTime() - postStartNs) / 1_000_000L;
++            Log.processState(TAG, "NIGHT_FINAL_JPEG_BEGIN");
++            Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_BEGIN path=" + imageFile);
+             final boolean finalSaved = ImageSaver.Util.saveBitmapAsJPGIrisNightAtomicFinal(
+                     imageFile, img, ImageSaver.JPG_QUALITY, exif,
+                     srDetailPath, srDetailWidth, srDetailHeight, p, crop);
+             final boolean imageSaved = finalSaved || baseSaved;
+-            if (finalSaved || !baseSaved) listener.notifyImageSavedStatus(imageSaved, imageFile);
++            Log.processState(TAG, "NIGHT_FINAL_JPEG_COMPLETE_" + finalSaved);
++            Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_COMPLETE finalSaved=" + finalSaved
++                    + " imageSaved=" + imageSaved);
++            if (finalSaved || !baseSaved) {
++                Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_NOTIFY_BEGIN saved=" + imageSaved);
++                listener.notifyImageSavedStatus(imageSaved, imageFile);
++                Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_NOTIFY_END saved=" + imageSaved);
++            }
+             if (srDetailPath != null) {
+                 try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(srDetailPath)); }
+                 catch (Throwable ignored) {}
+@@ -227,18 +271,27 @@ public final class IrisNightProcessor {
+                     + " jinOptional=true baseSurvivesJinFailure=true ultraHdr=false"
+                     + " mergeMs=" + mergeMs + " postPlusJinMs=" + postPlusJinMs
+                     + " totalMs=" + ((System.nanoTime() - startNs) / 1_000_000L));
++            Log.processState(TAG, "NIGHT_PROCESS_FINISHED_NOTIFY_BEGIN");
++            Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_FINISHED_NOTIFY_BEGIN");
+             listener.onProcessingFinished("Iris Night Processing Finished");
++            Log.processState(TAG, "NIGHT_PROCESS_COMPLETE");
++            Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_FINISHED_NOTIFY_END");
+         } catch (Throwable failure) {
++            Log.processState(TAG, "NIGHT_PROCESS_FAILED_" + failure.getClass().getSimpleName());
+             Log.e(TAG, "IRIS_26540_NIGHT_PROCESS_FAILED", failure);
++            Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_FAILED type="
++                    + failure.getClass().getName() + " message=" + String.valueOf(failure.getMessage()));
+             listener.onProcessingError(failure.getClass().getSimpleName() + ": "
+                     + String.valueOf(failure.getMessage()));
+         } finally {
++            Log.critical(TAG, "IRIS_26544_NIGHT_FRAMES_RELEASE_BEGIN");
+             if (batch != null && batch.frames != null) {
+                 for (ImageFrame frame : batch.frames) {
+                     if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+                 }
+             }
+             CaptureController.isProcessing = false;
++            Log.critical(TAG, "IRIS_26544_NIGHT_FRAMES_RELEASE_END processing=false");
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+index d966088dba93e133f88ecd3d13429be1bc9a82dd..5de2ef64b7f32d8e6ce04d897857443c5ec6c0ae 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+@@ -32,6 +32,17 @@ public class Log {
+     private static String currentLogFileName = null;
+     private static boolean logEnabled = true;
+ 
++    /* IRIS_26544_PROCESS_DEATH_DIAGNOSTICS
++     * Normal Photon logs are authorized only after external storage setup. A process can die before
++     * that async writer flushes, which made the 26543 Night crash silent. This tiny private file is
++     * available from Application.onCreate, and critical() fsyncs each lifecycle breadcrumb before
++     * returning. On the next process start, Android's prior ApplicationExitInfo is captured here too.
++     */
++    private static final Object processLogLock = new Object();
++    private static java.io.File processLogDir = null;
++    private static java.io.File processLogFile = null;
++    private static Context processContext = null;
++
+     // Thread-safe date formatters
+     private static final ThreadLocal<SimpleDateFormat> dateFormatter =
+         ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd", Locale.US));
+@@ -77,6 +88,142 @@ public class Log {
+         }, BUFFER_FLUSH_INTERVAL);
+     }
+ 
++    public static void initProcessDiagnostics(Context context) {
++        if (context == null) return;
++        synchronized (processLogLock) {
++            try {
++                Context app = context.getApplicationContext();
++                processContext = app;
++                processLogDir = new java.io.File(app.getFilesDir(), "iris-process-lifecycle");
++                if (!processLogDir.exists() && !processLogDir.mkdirs()) {
++                    android.util.Log.e("IrisProcess", "Cannot create private lifecycle log directory");
++                    return;
++                }
++                String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US)
++                        .format(new java.util.Date());
++                processLogFile = new java.io.File(processLogDir,
++                        "iris-process-lifecycle-" + stamp + "-pid" + android.os.Process.myPid() + ".txt");
++                writeCriticalInternal("I", "IrisProcess", "IRIS_26544_PROCESS_START pid="
++                        + android.os.Process.myPid() + " sdk=" + android.os.Build.VERSION.SDK_INT);
++                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
++                    try {
++                        android.app.ActivityManager am = (android.app.ActivityManager)
++                                app.getSystemService(Context.ACTIVITY_SERVICE);
++                        if (am != null) {
++                            java.util.List<android.app.ApplicationExitInfo> exits =
++                                    am.getHistoricalProcessExitReasons(app.getPackageName(), 0, 5);
++                            int count = 0;
++                            for (android.app.ApplicationExitInfo info : exits) {
++                                if (info == null || count++ >= 3) continue;
++                                byte[] priorState = info.getProcessStateSummary();
++                                String priorStateText = priorState == null ? "null"
++                                        : new String(priorState, java.nio.charset.StandardCharsets.UTF_8);
++                                writeCriticalInternal("I", "IrisProcess",
++                                        "IRIS_26544_PREVIOUS_PROCESS_EXIT reason=" + info.getReason()
++                                                + " status=" + info.getStatus()
++                                                + " importance=" + info.getImportance()
++                                                + " pssKb=" + info.getPss()
++                                                + " rssKb=" + info.getRss()
++                                                + " timestamp=" + info.getTimestamp()
++                                                + " processState=" + priorStateText
++                                                + " description=" + String.valueOf(info.getDescription()));
++                            }
++                        }
++                    } catch (Throwable exitInfoFailure) {
++                        writeCriticalInternal("W", "IrisProcess",
++                                "IRIS_26544_PREVIOUS_PROCESS_EXIT_QUERY_FAILED type="
++                                        + exitInfoFailure.getClass().getName() + " message="
++                                        + String.valueOf(exitInfoFailure.getMessage()));
++                    }
++                }
++            } catch (Throwable initFailure) {
++                android.util.Log.e("IrisProcess", "Process diagnostics init failed", initFailure);
++            }
++        }
++    }
++
++    private static void writeCriticalInternal(String level, String tag, String message) {
++        synchronized (processLogLock) {
++            if (processLogFile == null) return;
++            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(processLogFile, true);
++                 java.io.OutputStreamWriter osw = new java.io.OutputStreamWriter(
++                         fos, java.nio.charset.StandardCharsets.UTF_8);
++                 java.io.BufferedWriter writer = new java.io.BufferedWriter(osw)) {
++                String time = timeFormatter.get().format(new java.util.Date());
++                writer.write(time + " " + level + "/" + tag + ": " + message);
++                writer.newLine();
++                writer.flush();
++                fos.getFD().sync();
++            } catch (Throwable writeFailure) {
++                android.util.Log.e("IrisProcess", "Critical lifecycle write failed", writeFailure);
++            }
++        }
++    }
++
++    public static void critical(String tag, String message) {
++        android.util.Log.i(tag, message);
++        writeCriticalInternal("C", tag, message);
++        if (logEnabled) writeToFile("C", tag, message);
++    }
++
++    /**
++     * IRIS_26544_PROCESS_STATE_SUMMARY
++     * Store only coarse pipeline stage text so Android can return the last known stage with
++     * ApplicationExitInfo even if the process is killed before a normal log writer flushes.
++     * Android allows at most 128 bytes and may throttle excessive calls, so callers use this only
++     * at major capture/processing boundaries rather than per-frame hot paths.
++     */
++    public static void processState(String tag, String message) {
++        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return;
++        Context context = processContext;
++        if (context == null) return;
++        try {
++            String stateText = String.valueOf(tag) + ":" + String.valueOf(message);
++            byte[] state = stateText.getBytes(java.nio.charset.StandardCharsets.UTF_8);
++            if (state.length > 128) state = java.util.Arrays.copyOf(state, 128);
++            android.app.ActivityManager am = (android.app.ActivityManager)
++                    context.getSystemService(Context.ACTIVITY_SERVICE);
++            if (am != null) am.setProcessStateSummary(state);
++            writeCriticalInternal("S", "IrisProcess", "IRIS_26544_PROCESS_STATE " + stateText);
++        } catch (Throwable stateFailure) {
++            writeCriticalInternal("W", "IrisProcess",
++                    "IRIS_26544_PROCESS_STATE_FAILED type=" + stateFailure.getClass().getName()
++                            + " message=" + String.valueOf(stateFailure.getMessage()));
++        }
++    }
++
++    private static void mirrorPrivateProcessLogs() {
++        Context context = logContext;
++        java.io.File dir = processLogDir;
++        if (context == null || dir == null || !SimpleStorageHelper.hasStorageAccess(context)) return;
++        DocumentFile folder = getLogFolderDocumentFile();
++        if (folder == null || !folder.isDirectory()) return;
++        java.io.File[] files = dir.listFiles((d, name) ->
++                name.startsWith("iris-process-lifecycle-") && name.endsWith(".txt"));
++        if (files == null) return;
++        for (java.io.File source : files) {
++            try {
++                DocumentFile target = folder.findFile(source.getName());
++                if (target == null || !target.exists())
++                    target = folder.createFile("text/plain", source.getName());
++                if (target == null) continue;
++                try (java.io.InputStream in = new java.io.FileInputStream(source);
++                     java.io.OutputStream out = DocumentFileUtils.openOutputStream(target, context, false)) {
++                    if (out == null) continue;
++                    byte[] buf = new byte[8192];
++                    int n;
++                    while ((n = in.read(buf)) >= 0) {
++                        if (n > 0) out.write(buf, 0, n);
++                    }
++                    out.flush();
++                }
++            } catch (Throwable mirrorFailure) {
++                android.util.Log.w("IrisProcess", "Private lifecycle mirror failed: "
++                        + source.getName(), mirrorFailure);
++            }
++        }
++    }
++
+     /**
+      * Use SimpleStorage to write logs to DCIM/PhotonCamera/PhotonLog.
+      * Call this when the app has SAF storage access (e.g. from SplashActivity).
+@@ -85,7 +232,10 @@ public class Log {
+         if (context != null) {
+             logContext = context.getApplicationContext();
+             logDir = null;
+-            logHandler.post(() -> cleanupOldLogs());
++            logHandler.post(() -> {
++                cleanupOldLogs();
++                mirrorPrivateProcessLogs();
++            });
+         } else {
+             logContext = null;
+             closeWriter();
+diff --git a/app/version.properties b/app/version.properties
+index 4b0462f7a65198098bcd7262c12d78ec6be97dd1..7eaef32ed11fd6638f7106baf214b829d81110a9 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726543
+-VERSION_BUILD=26543
++VERSION_NAME=0.9726544
++VERSION_BUILD=26544
