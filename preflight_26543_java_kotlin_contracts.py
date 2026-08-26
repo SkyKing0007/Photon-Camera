@@ -6,6 +6,20 @@ def need(s,t,l):
     if t not in s: raise SystemExit('ERROR: '+l+' missing '+t)
 def forbid(s,t,l):
     if t in s: raise SystemExit('ERROR: '+l+' forbidden '+t)
+
+def audit_night_spool_jdk_symbols(cap):
+    import re
+    required_imports = {
+        'FileOutputStream':'java.io.FileOutputStream',
+        'Executors':'java.util.concurrent.Executors',
+        'AtomicInteger':'java.util.concurrent.atomic.AtomicInteger',
+    }
+    for typ, fq in required_imports.items():
+        if re.search(r'(?<![\w.])'+re.escape(typ)+r'\b', cap) and ('import '+fq+';') not in cap:
+            raise SystemExit('ERROR: Night spool Java symbol '+typ+' lacks import '+fq)
+    if re.search(r'(?<![\w.])ByteBuffer\b', cap) and 'import java.nio.ByteBuffer;' not in cap:
+        raise SystemExit('ERROR: bare ByteBuffer lacks java.nio.ByteBuffer import or qualification')
+
 def run(root):
     safe=(root/'app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt').read_text()
     frame=(root/'app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java').read_text()
@@ -31,6 +45,13 @@ def run(root):
               'IRIS_26543_NIGHT_REFERENCE_ORDER_PROOF'):
         need(cap,t,'Night spool contract')
     forbid(cap,'channel.force(','Night speed regression')
+    # 26543 V1.4: permanent javac symbol/import regression guard from failed V1.3 Actions.
+    need(cap,'java.nio.ByteBuffer source = plane.getBuffer().duplicate();','Night spool ByteBuffer javac symbol')
+    forbid(cap,'            ByteBuffer source = plane.getBuffer().duplicate();','bare ByteBuffer javac regression')
+    for imp in ('import java.io.FileOutputStream;','import java.util.concurrent.Executors;','import java.util.concurrent.atomic.AtomicInteger;'):
+        need(cap,imp,'Night spool Java import')
+    # Generic simple-name audit for JDK types introduced by the Night spool owner.
+    audit_night_spool_jdk_symbols(cap)
     # Live Figure-7 owner/API agreement.
     for t in ('return GlesIris26521SpatialRgbStacker(','if (mergeMethod == MgcMergeMethod.SPATIAL_RGB)'):
         need(fusion,t,'fusion owner')
@@ -66,9 +87,26 @@ def run(root):
     forbid(fn,'IrisNightFrameSelector.getFrames()','stale no-arg Night selector')
     for t in ('captureBuilder.setTag(IRIS_26541_NIGHT_SHORT_TAG);','captureBuilder.setTag(IRIS_26541_NIGHT_LONG_TAG);','request.getTag()'):
         need(cap,t,'26541 Night request tag contract')
-    print('PASS: 26543 Java/Kotlin API contracts + live ownership + prior compiler regressions guarded')
+    print('PASS: 26543 Java/Kotlin API contracts + live ownership + Kotlin/javac regression guards')
 def self_test():
-    assert 'x' in 'x'; print('PASS: 26543 Java/Kotlin contract self-test')
+    good = """import java.io.FileOutputStream;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+class X { java.nio.ByteBuffer source; FileOutputStream f; AtomicInteger a; void x(){ Executors.newFixedThreadPool(2); } }
+"""
+    audit_night_spool_jdk_symbols(good)
+    bad = """import java.io.FileOutputStream;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+class X { ByteBuffer source; }
+"""
+    try:
+        audit_night_spool_jdk_symbols(bad)
+    except SystemExit as e:
+        assert 'bare ByteBuffer' in str(e)
+    else:
+        raise AssertionError('ByteBuffer import regression self-test did not fail')
+    print('PASS: 26543 Java/Kotlin contract self-test + V1.4 javac symbol regression')
 if __name__=='__main__':
     ap=argparse.ArgumentParser(); ap.add_argument('--root'); ap.add_argument('--self-test',action='store_true'); a=ap.parse_args()
     if a.self_test:self_test()
