@@ -151,8 +151,14 @@ rm -rf "$PATCHREPO"; cp -a "$BASE" "$PATCHREPO"
  for rel in "${RUNTIME_FILES[@]}"; do mkdir -p "$(dirname "$rel")"; cp "$AFTER/$rel" "$rel"; done
  git add -N -- app/src/main
  git diff --check
- git diff --binary --no-ext-diff -- app/src/main > "$OUT/26543_regenerated_forward.patch"
- git diff --binary --no-ext-diff -R -- app/src/main > "$OUT/26543_regenerated_rollback.patch"
+ git diff --binary --full-index --no-ext-diff -- app/src/main > "$OUT/26543_regenerated_forward.patch"
+ # Deterministic canonical rollback: commit the audited candidate as baseline, then copy exact 26542 files back.
+ # Do not use `git diff -R`: Git versions/configurations may render reversed a/b path prefixes differently.
+ git add app/src/main
+ git commit -qm candidate-26543-for-rollback
+ for rel in "${RUNTIME_FILES[@]}"; do cp "$BASE/$rel" "$rel"; done
+ git diff --check
+ git diff --binary --full-index --no-ext-diff -- app/src/main > "$OUT/26543_regenerated_rollback.patch"
 )
 cmp -s "$OUT/26543_regenerated_forward.patch" "$EXPECTED_PATCH" || fail "regenerated 26543 forward patch differs"
 cmp -s "$OUT/26543_regenerated_rollback.patch" "$EXPECTED_ROLLBACK" || fail "regenerated 26543 rollback patch differs"
