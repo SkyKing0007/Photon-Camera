@@ -1,0 +1,709 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+index bfd4c82607fec90530684b4a72c0ee84f75a225e..c6273daa5a521ede1e8b5fb1e5969d9bdd422835 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+@@ -28,6 +28,7 @@ internal class GlesIris26545SabreProcessor(
+     private val gpuLinearRgbStorage: GpuLinearRgbStorage,
+     private val exportNormalStackedDng: Boolean,
+     private val vgnChromaCorrectionStrength: Float = 1f,
++    private val allowShadowLong: Boolean = false,
+ ) {
+     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+         if (frames.isEmpty()) return null
+@@ -43,21 +44,32 @@ internal class GlesIris26545SabreProcessor(
+             frames.forEach { it.image.close() }
+             return null
+         }
++        val baseExposure = frames[baseIndex].exposureProduct
++            .takeIf { it.isFinite() && it > 0.0 }
+         val admittedIndices = buildList {
+             add(baseIndex)
+             frames.indices.filterTo(this) { index ->
+                 index != baseIndex && frames[index].role == RawBurstFrameRole.NORMAL
+             }
++            if (allowShadowLong && baseExposure != null) {
++                frames.indices.filterTo(this) { index ->
++                    val frame = frames[index]
++                    frame.role == RawBurstFrameRole.SHADOW_LONG &&
++                        frame.exposureProduct.isFinite() && frame.exposureProduct > baseExposure
++                }
++            }
+         }
+         val admittedSet = admittedIndices.toSet()
+         val excluded = frames.indices.filterNot(admittedSet::contains)
+         excluded.forEach { frames[it].image.close() }
+         val admitted = admittedIndices.map(frames::get)
++        val normalCount = admitted.count { it.role == RawBurstFrameRole.NORMAL }
++        val longCount = admitted.count { it.role == RawBurstFrameRole.SHADOW_LONG }
+         PLog.i(
+             TAG,
+-            "IRIS_26545_SABRE_OWNER_ACTIVE base=${frames[baseIndex].frameNumber} " +
+-                "regular=${admitted.size} excludedBracketed=${excluded.size} " +
+-                "spatial=false bento=false output=linear-rgb",
++            "IRIS_26547_SABRE_OWNER_ACTIVE base=${frames[baseIndex].frameNumber} " +
++                "normal=$normalCount shadowLong=$longCount allowShadowLong=$allowShadowLong " +
++                "excluded=${excluded.size} shortReferenceImmutable=true spatial=false bento=false output=linear-rgb",
+         )
+         /* IRIS_26545_V1_2_SABRE_LOW_LEVEL_ISOLATION
+          * Match bjzhou's current Sabre architecture: the shared low-level GL class is used only
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index edd8e9a993c987313803b0e138b04c76cc25d1a9..404ecea530ee974ef68464ff001f3852d8703ec3 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -25,6 +25,10 @@ internal class GlesMgcRawFusion(
+     private val lensShadingHeight: Int,
+     private val outputMode: MgcSpatialOutputMode,
+     private val mergeMethod: MgcMergeMethod,
++    /* IRIS_26547_NIGHT_SABRE_LONG_ADMISSION_GATE
++     * False by default so Motion Sabre remains byte-for-byte role compatible with 26546.
++     */
++    private val allowSabreShadowLong: Boolean = false,
+     outputScale: Float,
+     private val reconstructionZoom: Float = 1f,
+     private val displayedGlobalZoom: Float = 1f,
+@@ -68,6 +72,7 @@ internal class GlesMgcRawFusion(
+                 gpuLinearRgbStorage = gpuLinearRgbStorage,
+                 exportNormalStackedDng = exportNormalStackedDng,
+                 vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
++                allowShadowLong = allowSabreShadowLong,
+             ).processFrames(frames)
+         }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index a4a8d3e124d254213e3b948f8499d8b93dbed605..ba47b9bf649ba5860d9642de6c48e7a7dd7cf27a 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -1958,6 +1958,26 @@ internal class GlesMgcRawSpatialStacker(
+             images.forEach { it.close() }
+             return null
+         }
++        /* IRIS_26547_SABRE_12_PLUS_3_ROLE_CONTRACT */
++        require(frames.first().role == RawBurstFrameRole.NORMAL) {
++            "26547 Sabre first frame must remain the SHORT/NORMAL reference"
++        }
++        val normalFrameCount = frames.count { it.role == RawBurstFrameRole.NORMAL }
++        val shadowLongFrameCount = frames.count { it.role == RawBurstFrameRole.SHADOW_LONG }
++        require(normalFrameCount >= 1 && normalFrameCount + shadowLongFrameCount == frames.size) {
++            "26547 Sabre accepts only NORMAL + SHADOW_LONG roles"
++        }
++        val referenceExposure = validExposureProduct(frames.first().exposureProduct)
++        frames.filter { it.role == RawBurstFrameRole.SHADOW_LONG }.forEach { frame ->
++            require(validExposureProduct(frame.exposureProduct) > referenceExposure) {
++                "26547 Sabre SHADOW_LONG exposure must exceed SHORT reference exposure"
++            }
++        }
++        PLog.i(
++            SABRE_TAG,
++            "IRIS_26547_SABRE_ROLE_CONTRACT normal=$normalFrameCount shadowLong=$shadowLongFrameCount " +
++                "total=${frames.size} referenceRole=SHORT",
++        )
+         baseFrameCamera2Model = frames.firstOrNull()
+             ?.channelNoiseProfile
+             ?.let(RawNoiseModel::fromCamera2NoiseProfile)
+@@ -2060,6 +2080,16 @@ internal class GlesMgcRawSpatialStacker(
+             } else {
+                 0
+             }
++            /* IRIS_26547_V1_1_MOTION_DNG_26546_PRESERVATION
++             * Motion has no SHADOW_LONG frames, so keep its exact 26546 Sabre DNG support owner:
++             * the shared measured RGB coverage + measured average merge factor. Only bracketed Night
++             * allocates a second NORMAL-only coverage map so Long support can never leak into DNG.
++             */
++            val normalDngCoverage = if (exportNormalStackedDng && shadowLongFrameCount > 0) {
++                createTexture(coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_LINEAR)
++            } else {
++                0
++            }
+             clearSabreAccumulators(
+                 accumulatedColor,
+                 accumulatedWeightsGb,
+@@ -2069,17 +2099,25 @@ internal class GlesMgcRawSpatialStacker(
+             )
+             if (normalDngAccumulator != 0) {
+                 clearSabreNormalDngAccumulator(normalDngAccumulator)
++                if (normalDngCoverage != 0) {
++                    clearSabreCoverage(
++                        normalDngCoverage,
++                        coverageWidth,
++                        coverageHeight,
++                        "Sabre NORMAL-only DNG coverage clear",
++                    )
++                }
+             }
+ 
+-            val referenceExposure = validExposureProduct(frames.first().exposureProduct)
+             val kernelTuning = createBayerKernelTuning(
+                 frame = frames.first(),
+                 image = images.first(),
+-                frameCount = frames.size,
++                // Longs are opportunistic evidence, never guaranteed Short temporal support.
++                frameCount = normalFrameCount,
+             )
+             val sabreKernelParameters = MgcSabreKernelTuning.build(
+                 referenceSnr = kernelTuning.referenceSnr,
+-                frameCount = frames.size,
++                frameCount = normalFrameCount,
+                 mergeGradientThreshold = sabreMergeGradientThreshold,
+             )
+             val sabreResolveParameters = MgcSabreResolveTuning.build(
+@@ -2098,7 +2136,8 @@ internal class GlesMgcRawSpatialStacker(
+                 SABRE_TAG,
+                 "MGC Sabre NoiseModel meanSignal=${kernelTuning.referenceSignal} " +
+                     "snr=${kernelTuning.referenceSnr} " +
+-                    "effectiveSnr=${MgcSabreKernelTuning.effectiveSnr(kernelTuning.referenceSnr, frames.size)} " +
++                    "effectiveSnr=${MgcSabreKernelTuning.effectiveSnr(kernelTuning.referenceSnr, normalFrameCount)} " +
++                    "normalSupport=$normalFrameCount shadowLongEvidence=$shadowLongFrameCount " +
+                     "kernelParams=${sabreKernelParameters.directionalScale}," +
+                     "${sabreKernelParameters.isotropicScale}," +
+                     "${sabreKernelParameters.gradientThreshold}," +
+@@ -2212,6 +2251,7 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.GL_R8,
+                     GLES30.GL_NEAREST,
+                 )
++                val durationRobustness = sabreExposureDurationRobustness(frames.first(), frame)
+                 renderSabreRejection(
+                     referenceGuide,
+                     currentGuide,
+@@ -2222,6 +2262,7 @@ internal class GlesMgcRawSpatialStacker(
+                     pixelDifference,
+                     extractedWidth,
+                     extractedHeight,
++                    durationRobustness,
+                 )
+                 val frameWeight = createTexture(
+                     coverageWidth,
+@@ -2249,7 +2290,7 @@ internal class GlesMgcRawSpatialStacker(
+                     extractedHeight = extractedHeight,
+                     useFrameWeight = true,
+                 )
+-                if (normalDngAccumulator != 0) {
++                if (normalDngAccumulator != 0 && frame.role == RawBurstFrameRole.NORMAL) {
+                     renderSabreNormalDngMerge(
+                         raw = currentRaw,
+                         flow = flow,
+@@ -2259,11 +2300,21 @@ internal class GlesMgcRawSpatialStacker(
+                         accumulator = normalDngAccumulator,
+                         useFrameWeight = true,
+                     )
++                    if (normalDngCoverage != 0) {
++                        renderSabreCoverage(
++                            frameWeight,
++                            normalDngCoverage,
++                            coverageWidth,
++                            coverageHeight,
++                            maxSabreAccumulatedWeight(normalFrameCount),
++                        )
++                    }
+                 }
+                 PLog.i(
+                     SABRE_TAG,
+                     "MGC Sabre frame=$index/${frames.lastIndex} number=${frame.frameNumber} " +
+-                        "exposureScale=$exposureScale submit=${elapsedMs(frameStartNs)}ms",
++                        "role=${frame.role} exposureScale=$exposureScale " +
++                        "durationRobustness=$durationRobustness submit=${elapsedMs(frameStartNs)}ms",
+                 )
+                 releaseTexturesFrom(transientTextureStart)
+                 GlesGpuScheduler.yieldToUiRenderer()
+@@ -2291,21 +2342,39 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+                 normalStackedDngRaw16 = readBayer16(normalizedDngTexture)
+                 releaseOwnedTexture(normalizedDngTexture, "Sabre normalized16 DNG readback")
+-                normalStackedDngSupport = resolveSabreNormalDngSupportStats(
+-                    accumulatedCoverage = accumulatedCoverage,
+-                    coverageWidth = coverageWidth,
+-                    coverageHeight = coverageHeight,
+-                    accumulatedWeightScale = accumulatedWeightScale,
+-                    frameCount = frames.size,
+-                    sabreNoiseModelScale = sabreNoiseModelScale,
+-                )
+-                normalStackedDngNoiseProfile = createSabreNormalDngNoiseProfile(
+-                    frames = frames,
+-                    support = normalStackedDngSupport,
+-                )
++                if (normalDngCoverage != 0) {
++                    // Night 12+3: DNG owns only measured NORMAL coverage; Long RGB support is excluded.
++                    normalStackedDngSupport = resolveSabreNormalDngSupportStats(
++                        accumulatedCoverage = normalDngCoverage,
++                        coverageWidth = coverageWidth,
++                        coverageHeight = coverageHeight,
++                        accumulatedWeightScale = maxSabreAccumulatedWeight(normalFrameCount),
++                        frameCount = normalFrameCount,
++                        sabreNoiseModelScale = 1f / normalFrameCount.coerceAtLeast(1).toFloat(),
++                    )
++                    normalStackedDngNoiseProfile = createSabreNormalDngNoiseProfile(
++                        frames = frames.filter { it.role == RawBurstFrameRole.NORMAL },
++                        support = normalStackedDngSupport,
++                    )
++                } else {
++                    // Motion: exact 26546 support/noise ownership. All admitted frames are NORMAL.
++                    normalStackedDngSupport = resolveSabreNormalDngSupportStats(
++                        accumulatedCoverage = accumulatedCoverage,
++                        coverageWidth = coverageWidth,
++                        coverageHeight = coverageHeight,
++                        accumulatedWeightScale = accumulatedWeightScale,
++                        frameCount = frames.size,
++                        sabreNoiseModelScale = sabreNoiseModelScale,
++                    )
++                    normalStackedDngNoiseProfile = createSabreNormalDngNoiseProfile(
++                        frames = frames,
++                        support = normalStackedDngSupport,
++                    )
++                }
+                 PLog.i(
+                     SABRE_TAG,
+-                    "IRIS_26545_SABRE_NORMALIZED16_DNG_READY normalFrames=${frames.size} " +
++                    "IRIS_26547_SABRE_NORMALIZED16_DNG_READY normalFrames=$normalFrameCount " +
++                        "shadowLongExcluded=$shadowLongFrameCount " +
+                         "sameSabreFlow=true sameSabreRejection=true sameSabreCovariance=true " +
+                         "resolveSabre=false demosaic=false wb=false lsc=false denoise=false " +
+                         "tone=false sharpen=false fullRangeNormalized16=true blackLevel=0 whiteLevel=65535 " +
+@@ -2469,7 +2538,7 @@ internal class GlesMgcRawSpatialStacker(
+                 mgcSharpenTuningSnr = kernelTuning.referenceSnr,
+                 mgcSharpenAttenuationScale = sabreResolveParameters.demosaicSharpness,
+                 normalStackedDngRaw16 = normalStackedDngRaw16,
+-                normalStackedDngFrameCount = if (exportNormalStackedDng) frames.size else 0,
++                normalStackedDngFrameCount = if (exportNormalStackedDng) normalFrameCount else 0,
+                 normalStackedDngNoiseProfile = normalStackedDngNoiseProfile,
+                 normalStackedDngSupportMin = normalStackedDngSupport.minimum,
+                 normalStackedDngSupportP01 = normalStackedDngSupport.p01,
+@@ -2724,7 +2793,16 @@ internal class GlesMgcRawSpatialStacker(
+             covariancePackOffset(kernelParameters.covarianceMinB, kernelParameters.covarianceMaxB),
+             covariancePackScale(kernelParameters.covarianceMinB, kernelParameters.covarianceMaxB),
+         )
+-        uniform1f(program, "uGreenClippingPoint", calibration.greenClippingPoint)
++        /* IRIS_26547_SABRE_SQRT_CLIP_DOMAIN
++         * guideAndCovariance applies sqrt() to normalized Bayer values. Transport the clipping
++         * threshold through the same monotonic transform so a 4x Long normalized to 0.25 clips
++         * at sqrt(0.25)=0.5 in guide space, not at linear 0.25 (which rejected valid data early).
++         */
++        uniform1f(
++            program,
++            "uGreenClippingPoint",
++            sqrt(calibration.greenClippingPoint.coerceAtLeast(0f)),
++        )
+         uniform4f(
+             program,
+             "uForceReferenceColorRgb",
+@@ -2734,6 +2812,27 @@ internal class GlesMgcRawSpatialStacker(
+         draw(program, guideWidth, guideHeight, intArrayOf(guide, covariance))
+     }
+ 
++    /* IRIS_26547_SABRE_LONG_DURATION_ROBUSTNESS
++     * Sabre already subtracts heteroscedastic reference+frame noise before forming its squared
++     * residual statistic. For SHADOW_LONG only, scale that statistic by the actual shutter-time
++     * ratio. Static, noise-consistent pixels still have near-zero excess residual and are not
++     * assigned an arbitrary lower merge weight; disagreement is simply held to a tighter
++     * likelihood threshold as intra-frame blur risk rises with integration time. Cap the factor
++     * at 4x so an extreme HAL shutter does not turn the Long path into an all-or-nothing gate.
++     */
++    private fun sabreExposureDurationRobustness(
++        reference: RawStackFrame,
++        frame: RawStackFrame,
++    ): Float {
++        if (frame.role != RawBurstFrameRole.SHADOW_LONG) return 1f
++        val referenceNs = reference.exposureTimeNs.takeIf { it > 0L } ?: return 1f
++        val frameNs = frame.exposureTimeNs.takeIf { it > 0L } ?: return 1f
++        val ratio = frameNs.toDouble() / referenceNs.toDouble()
++        return ratio.takeIf { it.isFinite() }
++            ?.coerceIn(1.0, SABRE_LONG_DURATION_ROBUSTNESS_MAX.toDouble())
++            ?.toFloat() ?: 1f
++    }
++
+     private fun renderSabreRejection(
+         referenceGuide: Int,
+         currentGuide: Int,
+@@ -2744,6 +2843,7 @@ internal class GlesMgcRawSpatialStacker(
+         pixelDifference: Int,
+         guideWidth: Int,
+         guideHeight: Int,
++        durationRobustness: Float = 1f,
+     ) {
+         val program = rejectionProgram
+         GLES30.glUseProgram(program)
+@@ -2768,8 +2868,8 @@ internal class GlesMgcRawSpatialStacker(
+         uniform2f(
+             program,
+             "uColorDifferenceMultiplier",
+-            MgcSabreRejectionTuning.COLOR_DIFFERENCE_RGB,
+-            MgcSabreRejectionTuning.COLOR_DIFFERENCE_GREEN,
++            MgcSabreRejectionTuning.COLOR_DIFFERENCE_RGB * durationRobustness,
++            MgcSabreRejectionTuning.COLOR_DIFFERENCE_GREEN * durationRobustness,
+         )
+         val flowVariationThresholds =
+             MgcSabreRejectionTuning.flowVariationThresholds(ceilDiv(width, 2))
+@@ -2901,7 +3001,22 @@ internal class GlesMgcRawSpatialStacker(
+         coverageHeight: Int,
+     ) {
+         clearRgbAccumulators(accumulatedColor, accumulatedWeightsGb, width, height)
+-        bindRenderTargets(intArrayOf(accumulatedCoverage), "MGC Sabre coverage clear")
++        clearSabreCoverage(
++            accumulatedCoverage,
++            coverageWidth,
++            coverageHeight,
++            "MGC Sabre coverage clear",
++        )
++    }
++
++    private fun clearSabreCoverage(
++        coverage: Int,
++        coverageWidth: Int,
++        coverageHeight: Int,
++        label: String,
++    ) {
++        check(coverage != 0)
++        bindRenderTargets(intArrayOf(coverage), label)
+         GLES30.glViewport(0, 0, coverageWidth, coverageHeight)
+         GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
+         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+@@ -8041,38 +8156,74 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun uploadRaw(image: SafeImage, texture: Int, label: String) {
++        /* IRIS_26547_SABRE_DISK_RAW_STREAM_UPLOAD
++         * Night retains exactly one full RAW in native RAM. Every auxiliary is file-backed and is
++         * materialized only for this single glTexSubImage2D call, then FileRegion.close() frees the
++         * temporary native buffer before the next frame begins. Motion's in-memory path is unchanged.
++         */
++        if (image.isFileBacked) {
++            val region = image.readFileRegion(0, 0, width, height)
++            try {
++                uploadRawBuffer(
++                    buffer = region.buffer,
++                    rowStride = region.rowStride,
++                    pixelStride = region.pixelStride,
++                    texture = texture,
++                    label = "$label disk-backed",
++                )
++            } finally {
++                region.close()
++            }
++            return
++        }
+         val plane = image.planes.firstOrNull()
+             ?: throw IllegalArgumentException("$label has no RAW plane")
+-        require(plane.pixelStride == RAW_BYTES_PER_PIXEL) {
+-            "$label RAW pixel stride=${plane.pixelStride}, expected 2"
++        uploadRawBuffer(
++            buffer = plane.buffer,
++            rowStride = plane.rowStride,
++            pixelStride = plane.pixelStride,
++            texture = texture,
++            label = label,
++        )
++    }
++
++    private fun uploadRawBuffer(
++        buffer: ByteBuffer,
++        rowStride: Int,
++        pixelStride: Int,
++        texture: Int,
++        label: String,
++    ) {
++        require(pixelStride == RAW_BYTES_PER_PIXEL) {
++            "$label RAW pixel stride=$pixelStride, expected 2"
+         }
+-        require(plane.rowStride >= width * RAW_BYTES_PER_PIXEL) {
+-            "$label RAW row stride=${plane.rowStride} is smaller than width=$width"
++        require(rowStride >= width * RAW_BYTES_PER_PIXEL) {
++            "$label RAW row stride=$rowStride is smaller than width=$width"
+         }
+-        require(plane.rowStride % RAW_BYTES_PER_PIXEL == 0) {
++        require(rowStride % RAW_BYTES_PER_PIXEL == 0) {
+             "$label RAW row stride is not 16-bit aligned"
+         }
+-        val buffer = plane.buffer.duplicate().order(ByteOrder.nativeOrder())
++        val upload = buffer.duplicate().order(ByteOrder.nativeOrder())
+         GLES30.glBindBuffer(GLES30.GL_PIXEL_UNPACK_BUFFER, 0)
+         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture)
+         GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
+-        GLES30.glPixelStorei(
+-            GLES30.GL_UNPACK_ROW_LENGTH,
+-            plane.rowStride / RAW_BYTES_PER_PIXEL,
+-        )
+-        GLES30.glTexSubImage2D(
+-            GLES30.GL_TEXTURE_2D,
+-            0,
+-            0,
+-            0,
+-            width,
+-            height,
+-            GLES30.GL_RED_INTEGER,
+-            GLES30.GL_UNSIGNED_SHORT,
+-            buffer,
+-        )
+-        GLES30.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, 0)
+-        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
++        GLES30.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, rowStride / RAW_BYTES_PER_PIXEL)
++        try {
++            GLES30.glTexSubImage2D(
++                GLES30.GL_TEXTURE_2D,
++                0,
++                0,
++                0,
++                width,
++                height,
++                GLES30.GL_RED_INTEGER,
++                GLES30.GL_UNSIGNED_SHORT,
++                upload,
++            )
++        } finally {
++            GLES30.glPixelStorei(GLES30.GL_UNPACK_ROW_LENGTH, 0)
++            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
++        }
+         checkGlError("upload $label")
+     }
+ 
+@@ -9035,6 +9186,7 @@ internal class GlesMgcRawSpatialStacker(
+         // Guide/covariance has a wider MGC footprint than rejection/RBF sampling.
+         const val SABRE_GUIDE_BORDER_PIXELS = 2.5f
+         const val SABRE_SAMPLE_BORDER_PIXELS = 1.5f
++        private const val SABRE_LONG_DURATION_ROBUSTNESS_MAX = 4f
+         const val SABRE_SIGNAL_LINEAR_HISTOGRAM_BITS = 10
+         const val SABRE_SIGNAL_LINEAR_HISTOGRAM_BINS = 1 shl SABRE_SIGNAL_LINEAR_HISTOGRAM_BITS
+         const val SABRE_SIGNAL_ROW_STEP = 8
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index b51fd6a945721d65c54daddf9605ab67f1f79003..da82ddf2c9d848445d746584920fe7bbe2d0bf2e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -3223,6 +3223,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * Initiate a still image capture.
+      */
+     public void takePicture() {
++        /* IRIS_26547_NIGHT_REENTRY_GUARD
++         * UI state is not a sufficient serialization primitive. Reject a second Night shutter at
++         * the controller boundary while the prior Night capture/reconstruction still owns RAW/GL.
++         */
++        if (PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT && isProcessing) {
++            Log.w(TAG, "IRIS_26547_NIGHT_REENTRY_REJECTED processing=true");
++            return;
++        }
+         if (mPreviewRequestBuilder == null || mCaptureSession == null) {
+             Log.w(TAG, "takePicture(): camera not ready, ignoring shutter press");
+             return;
+@@ -4353,6 +4361,37 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
++    /* IRIS_26547_NIGHT_CAPTURE_ABORT_OWNER
++     * Pre-dispatch Night failure must release every app-owned RAW representation and clear the
++     * controller gate. Once dispatched, IrisNightProcessor owns the immutable batch instead.
++     */
++    private boolean abortIrisNight26547CaptureState(String reason) {
++        boolean aborted = false;
++        synchronized (mIrisNight26540Lock) {
++            if (mIrisNight26540CaptureActive && !mIrisNight26540Dispatched) {
++                for (ImageFrame frame : mIrisNight26540Frames) {
++                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
++                }
++                mIrisNight26540Frames.clear();
++                mIrisNight26540Results.clear();
++                mIrisNight26540Requests.clear();
++                mIrisNight26540CaptureActive = false;
++                mIrisNight26540SequenceComplete = false;
++                mIrisNight26540ExpectedFrames = 0;
++                mIrisNight26544ReferenceCopied = false;
++                mIrisNight26544SpoolFailure = null;
++                CaptureController.isProcessing = false;
++                aborted = true;
++            }
++        }
++        if (aborted) {
++            cleanupIrisNight26544SpoolCache();
++            Log.critical(TAG, "IRIS_26547_NIGHT_CAPTURE_ABORT_CLEAN reason=" + reason
++                    + " processing=false");
++        }
++        return aborted;
++    }
++
+     private void prepareIrisNight26540CaptureState(int expectedFrames, int saveRaw,
+             boolean superRes, boolean aspect169, boolean energySaving, boolean watermark,
+             boolean binning, String cameraId, IrisMotionSettings.Snapshot irisSettings,
+@@ -6501,7 +6540,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+ 
+     private void captureStillPicture() {
++        boolean iris26547NightRequested = false;
+         try {
++            iris26547NightRequested = PhotonCamera.getSettings().selectedMode == CameraMode.NIGHT;
+             if (null == mCameraDevice) {
+                 return;
+             }
+@@ -6818,6 +6859,27 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     if (maxFrameCount[0] != -1) PhotonCamera.getGyro().CaptureGyroBurst();
+                 }
+ 
++                @Override
++                public void onCaptureSequenceAborted(@NonNull CameraCaptureSession session,
++                                                     int sequenceId) {
++                    if (iris26533CaptureMode == CameraMode.NIGHT) {
++                        burst = false;
++                        try { PhotonCamera.getGyro().CompleteSequence(); } catch (Throwable ignored) {}
++                        final boolean cleaned = abortIrisNight26547CaptureState(
++                                "camera-sequence-aborted:" + sequenceId);
++                        if (mBackgroundHandler != null) {
++                            mBackgroundHandler.post(() -> {
++                                if (!isDualSession) unlockFocus();
++                                else createCameraPreviewSession(false);
++                            });
++                        }
++                        Log.e(TAG, "IRIS_26547_NIGHT_SEQUENCE_ABORTED id=" + sequenceId
++                                + " cleanup=" + cleaned);
++                        cameraEventsListener.onProcessingError("Iris Night capture sequence aborted");
++                        return;
++                    }
++                }
++
+                 @Override
+                 public void onCaptureSequenceCompleted(@NonNull CameraCaptureSession session,
+                                                        int sequenceId,
+@@ -6944,19 +7006,28 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 }
+             }
+         } catch (CameraAccessException e) {
+-            synchronized (mIrisNight26540Lock) {
+-                if (mIrisNight26540CaptureActive && !mIrisNight26540Dispatched) {
+-                    for (ImageFrame frame : mIrisNight26540Frames) {
+-                        if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                    }
+-                    mIrisNight26540Frames.clear();
+-                    mIrisNight26540Results.clear();
+-                    mIrisNight26540Requests.clear();
+-                    mIrisNight26540CaptureActive = false;
++            abortIrisNight26547CaptureState("CameraAccessException");
++            Log.e(TAG, Log.getStackTraceString(e));
++        } catch (RuntimeException e) {
++            if (iris26547NightRequested) {
++                final boolean cleaned = abortIrisNight26547CaptureState(
++                        "RuntimeException:" + e.getClass().getSimpleName());
++                if (!cleaned) {
+                     CaptureController.isProcessing = false;
++                    cleanupIrisNight26544SpoolCache();
+                 }
++                if (mBackgroundHandler != null) {
++                    mBackgroundHandler.post(() -> {
++                        if (!isDualSession) unlockFocus();
++                        else createCameraPreviewSession(false);
++                    });
++                }
++                Log.e(TAG, "IRIS_26547_NIGHT_CAPTURE_RUNTIME_FAILURE cleanup=" + cleaned, e);
++                cameraEventsListener.onProcessingError("Iris Night capture: "
++                        + e.getClass().getSimpleName());
++                return;
+             }
+-            Log.e(TAG, Log.getStackTraceString(e));
++            throw e;
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index 3870500b66478fe1d6b3760f10ce6486ea0e613d..9b36f5270af569b4bdf1d8c7c6b8d8bb7f8c4971 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -120,7 +120,7 @@ public final class IrisNightProcessor {
+                     new Point(width, height), images, ref, p, null, batch.saveRaw >= 1);
+             final long mergeMs = (System.nanoTime() - mergeStartNs) / 1_000_000L;
+             if (r == null || r.raw == null) {
+-                throw new IllegalStateException("26540 Night Spatial RGB carrier missing");
++                throw new IllegalStateException("26547 Night Sabre linear-RGB carrier missing");
+             }
+             if (r.inputFrames < images.size()) {
+                 throw new IllegalStateException("26540 Night MGC scheduled-frame mismatch scheduled="
+@@ -197,7 +197,9 @@ public final class IrisNightProcessor {
+                     + " referenceRole=SHORT zsl=false motionRing=false preShutterRaw=false"
+                     + " photonNight=false staticImageBuffer=false defaultSaver=false hdrxRun=false"
+                     + " applyRes=false photonNoiseModeler=false liveTunableInjection=false"
+-                    + " mgcSpatialRgb=true pecanProfileSnr=referencePreMerge"
++                    + " mgcSabre=true mgcSpatialRgb=false shortReferenceAuthority=true"
++                    + " longEvidence=shadowOnly normalDngLongExcluded=true"
++                    + " pecanProfileSnr=referencePreMerge"
+                     + " denoiseMagnitude=propagatedResidual readShotCorrelationStrength=true"
+                     + " isoDenoiseAuthority=false darknessDenoiseAuthority=false"
+                     + " autoLowLightLumaFloor=false ultraHdr=false superRes="
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 55e5547dfbda9d02f08bc4713e3456eec10c6abd..527b1e3f291ec7cfcf7454d6fa85aeaa72b072c0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -126,7 +126,12 @@ object PhotonMotionMgc1271Bridge {
+             } else {
+                 IrisMotionSettings.current()
+             }
+-            val sabreSelected = !parameters.irisNightActive &&
++            /* IRIS_26547_NIGHT_SABRE_12_PLUS_3_OWNER
++             * Night always uses the audited Sabre owner. Motion keeps its existing user-selected
++             * reconstruction setting unchanged. Long admission itself remains explicitly gated
++             * inside GlesIris26545SabreProcessor and can never activate for Motion.
++             */
++            val sabreSelected = parameters.irisNightActive ||
+                 irisSettings.reconstruction == IrisMotionSettings.Reconstruction.SABRE
+             // IRIS_26546_NIGHT_VGN_POLICY_ISOLATION: Motion owns the diagnostic slider;
+             // Night remains fixed to exact 26545 current-MGC VGN behavior.
+@@ -135,21 +140,20 @@ object PhotonMotionMgc1271Bridge {
+             } else {
+                 irisSettings.vgnChromaCorrection.coerceIn(0.0f, 1.0f)
+             }
+-            if (!parameters.irisNightActive) {
+-                parameters.motionV2ReconstructionOwner = if (sabreSelected) {
+-                    Parameters.MOTION_V2_RECONSTRUCTION_SABRE
+-                } else {
+-                    Parameters.MOTION_V2_RECONSTRUCTION_SPATIAL_RGB
+-                }
+-                // IRIS_26545_V1_2_EXPLICIT_RECONSTRUCTION_OWNER
+-                // Clear every Spatial-only payload before the selected owner runs. Spatial may
+-                // republish them below; Sabre must reach PostPipeline with these still absent.
+-                parameters.motionV2SpatialReliability = null
+-                parameters.motionV2SpatialReliabilityWidth = 0
+-                parameters.motionV2SpatialReliabilityHeight = 0
+-                parameters.motionV2SpatialReliabilityMean = 1.0f
+-                parameters.motionV2SpatialReliabilityLowFraction = 0.0f
++            /* IRIS_26547_NIGHT_SABRE_DURABLE_OWNER
++             * Publish the selected owner for both pipelines. Night now selects Sabre, so the
++             * existing Sabre postcondition needs the same durable owner and Spatial-state clear.
++             */
++            parameters.motionV2ReconstructionOwner = if (sabreSelected) {
++                Parameters.MOTION_V2_RECONSTRUCTION_SABRE
++            } else {
++                Parameters.MOTION_V2_RECONSTRUCTION_SPATIAL_RGB
+             }
++            parameters.motionV2SpatialReliability = null
++            parameters.motionV2SpatialReliabilityWidth = 0
++            parameters.motionV2SpatialReliabilityHeight = 0
++            parameters.motionV2SpatialReliabilityMean = 1.0f
++            parameters.motionV2SpatialReliabilityLowFraction = 0.0f
+             PLog.i(TAG, "IRIS_26545_MOTION_RECONSTRUCTION_SELECTED " +
+                 "method=${if (sabreSelected) "SABRE" else "SPATIAL_RGB"} " +
+                 "settings=${irisSettings.reconstruction.persistedValue} " +
+@@ -339,6 +343,7 @@ object PhotonMotionMgc1271Bridge {
+                 lensShadingHeight = lscHeight,
+                 outputMode = MgcSpatialOutputMode.RGB,
+                 mergeMethod = if (sabreSelected) MgcMergeMethod.SABRE else MgcMergeMethod.SPATIAL_RGB,
++                allowSabreShadowLong = parameters.irisNightActive,
+                 outputScale = fixedOutputScale,
+                 reconstructionZoom = spatialReconstructionZoom,
+                 displayedGlobalZoom = displayedGlobalZoom,
+@@ -353,6 +358,15 @@ object PhotonMotionMgc1271Bridge {
+             val iris26535FusionStartNs = System.nanoTime()
+             val stacked = fusion.processFrames(frames)
+                 ?: invalid(if (sabreSelected) "Iris Sabre owner returned null" else "pinned Spatial RGB owner returned null")
++            if (parameters.irisNightActive) {
++                /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
++                 * A HAL-shortened batch may contain fewer than 15 physical frames, but every frame
++                 * that reached the immutable Night batch must be admitted by Sabre. Never report a
++                 * successful 12+3 path after quietly discarding one of the Long observations.
++                 */
++                requireParity(stacked.mergedFrameCount == frames.size,
++                    "Night Sabre admitted=${stacked.mergedFrameCount} immutableBatch=${frames.size}")
++            }
+             iris26535FusionMs = (System.nanoTime() - iris26535FusionStartNs) / 1_000_000L
+             val expectedSuperResWidth = MultiFrameConfig.scaledRawOutputDimension(size.x, fixedOutputScale)
+             val expectedSuperResHeight = MultiFrameConfig.scaledRawOutputDimension(size.y, fixedOutputScale)
+diff --git a/app/version.properties b/app/version.properties
+index 8b81ebf694a0d07598fd4c6f39a45523be1eecf8..ae97098c54377e1b0edb204ff21b93c03b771ae7 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726546
+-VERSION_BUILD=26546
++VERSION_NAME=0.9726547
++VERSION_BUILD=26547
