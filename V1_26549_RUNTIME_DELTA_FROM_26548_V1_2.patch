@@ -1,0 +1,169 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index c38db12b585928d62e125150ff725121f7362b92..de11aced812698ab3beabcfe63ff38ed0e14510e 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -660,6 +660,28 @@ internal object Iris26529SpatialRgbChromaShaders {
+         uniform float uChromaStrength;
+         $common
+         vec3 smoothAt(ivec2 p){uvec4 v=imageLoad(uSmooth,safePos(p));return vec3(decodeU16(v.r),float(signedChroma(v.g)),float(signedChroma(v.b)));}
++        vec3 originalAt(ivec2 p){uvec4 v=imageLoad(uOriginal,safePos(p));return vec3(decodeU16(v.r),float(signedChroma(v.g)),float(signedChroma(v.b)));}
++        /* IRIS_26549_VGN_TRUE_COLOR_CONFIDENCE
++         * Full-strength VGN remains the artifact authority, but coherent scene chroma is no
++         * longer treated as disposable merely because a smoother candidate has lower magnitude.
++         * A real-color region must have meaningful chroma and multi-neighbor hue/magnitude
++         * agreement in the pre-median local-clamp image. Isolated fringe/block chroma therefore
++         * receives the old full correction while stable object/light color is conserved.
++         */
++        float realColorConfidence(ivec2 p,vec2 c){
++            float mag=length(c); if(mag<256.0)return 0.0;
++            const ivec2 d[8]=ivec2[8](ivec2(0,-1),ivec2(1,0),ivec2(0,1),ivec2(-1,0),ivec2(1,-1),ivec2(1,1),ivec2(-1,1),ivec2(-1,-1));
++            float support=0.0;
++            for(int i=0;i<8;++i){
++                vec2 n=originalAt(p+d[i]).yz; float nm=length(n);
++                if(nm>128.0){
++                    float hue=dot(c,n)/max(mag*nm,1.0);
++                    float ratio=min(mag,nm)/max(mag,nm);
++                    support+=smoothstep(0.88,0.97,hue)*smoothstep(0.35,0.75,ratio);
++                }
++            }
++            return smoothstep(2.5,5.0,support)*smoothstep(256.0,1536.0,mag);
++        }
+         vec4 filter3(uvec4 encoded,ivec2 p){
+             vec3 neg[4]; vec3 pos[4];
+             neg[0]=smoothAt(p+ivec2(-1,0));pos[0]=smoothAt(p+ivec2(1,0));neg[1]=smoothAt(p+ivec2(0,-1));pos[1]=smoothAt(p+ivec2(0,1));neg[2]=smoothAt(p+ivec2(1,-1));pos[2]=smoothAt(p+ivec2(-1,1));neg[3]=smoothAt(p+ivec2(-1,-1));pos[3]=smoothAt(p+ivec2(1,1));
+@@ -677,10 +699,25 @@ internal object Iris26529SpatialRgbChromaShaders {
+             uvec4 e=imageLoad(uOriginal,p);vec4 f=vec4(decodeU16(e.r),float(signedChroma(e.g)),float(signedChroma(e.b)),0.0);
+             if(e.r!=0u&&e.a!=0u)f=filter3(e,p);
+             uvec4 sm=imageLoad(uSmooth,p);ivec2 sc=ivec2(signedChroma(sm.g),signedChroma(sm.b));ivec2 fc=ivec2(f.yz);
+-            if(abs(sc.x)+abs(sc.y)<abs(fc.x)+abs(fc.y))fc=sc;
+             ivec2 originalChroma=ivec2(signedChroma(e.g),signedChroma(e.b));
++            float preserve=realColorConfidence(p,vec2(originalChroma));
++            /* A coherent false-color patch must not be protected simply because it is spatially
++             * coherent. Require VGN's own directional candidate to agree with the original hue;
++             * disagreement or a near-neutral candidate keeps full artifact correction authority. */
++            float originalMag=length(vec2(originalChroma));
++            float filteredMag=length(vec2(fc));
++            float hueAgreement=filteredMag>96.0?dot(vec2(originalChroma),vec2(fc))/max(originalMag*filteredMag,1.0):-1.0;
++            preserve*=smoothstep(0.84,0.97,hueAgreement)*smoothstep(96.0,384.0,filteredMag);
+             float strength=clamp(uChromaStrength,0.0,1.0);
+-            ivec2 corrected=strength>=0.9999?fc:(strength<=0.0001?originalChroma:ivec2(mix(vec2(originalChroma),vec2(fc),strength)));
++            /* Preserve the old lower-saturation candidate only where the local chroma is not
++             * strongly supported as real scene color. Artifact regions therefore retain VGN 1.0
++             * behavior; coherent colors retain their pre-median chroma vector and magnitude. */
++            if(abs(sc.x)+abs(sc.y)<abs(fc.x)+abs(fc.y)){
++                float lowSatWeight=strength*(1.0-preserve);
++                fc=ivec2(mix(vec2(fc),vec2(sc),lowSatWeight));
++            }
++            float correctionWeight=strength*(1.0-preserve);
++            ivec2 corrected=correctionWeight>=0.9999?fc:(correctionWeight<=0.0001?originalChroma:ivec2(mix(vec2(originalChroma),vec2(fc),correctionWeight)));
+             imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(corrected.x),unsignedChroma(corrected.y),uint(clamp(f.w,0.0,65504.0))));
+         }
+     """.trimIndent()
+@@ -718,7 +755,18 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 float y=uFilterLuma!=0?apply(ys,currentY,uA10,uB10,true):currentY;
+                 float r=apply(c1,inCr,uADyn1,uBDyn1,false);float q=apply(b1,inCb,uADyn1,uBDyn1,false);r=apply(c2,r,uADyn2,uBDyn2,false);q=apply(b2,q,uADyn2,uBDyn2,false);
+                 float strength=clamp(uChromaStrength,0.0,1.0);
+-                if(strength<0.9999){r=strength<=0.0001?inCr:mix(inCr,r,strength);q=strength<=0.0001?inCb:mix(inCb,q,strength);}
++                /* IRIS_26549_VGN_ERROR_GATED_FINAL_IIR
++                 * IIR1 (uFilterLuma!=0) remains exactly full-strength so VGN still generates its
++                 * reference smooth field and error evidence. IIR3 is the final chroma-only pass;
++                 * gate it by that filtered VGN error instead of smoothing legitimate chroma
++                 * globally. The thresholds are the same error domain consumed by blendChroma. */
++                float effectiveStrength=strength;
++                if(uFilterLuma==0){
++                    float errorSignal=decodeU16(px.a)*0.25;
++                    float artifactConfidence=clamp((errorSignal-100.0)/200.0,0.0,1.0);
++                    effectiveStrength*=artifactConfidence;
++                }
++                if(effectiveStrength<0.9999){r=effectiveStrength<=0.0001?inCr:mix(inCr,r,effectiveStrength);q=effectiveStrength<=0.0001?inCb:mix(inCb,q,effectiveStrength);}
+                 imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));
+             }
+         }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+index 0d69dc24ce4931bd811470d5e14ba176e2b4be31..6345af7f7b57dc7fb6b287df21d3ee4f086f2d8d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -192,14 +192,51 @@ public class ImageSaver {
+          */
+         private static boolean encodeIrisNightJpegPortable(
+                 Path fileToSave, Bitmap img, int jpgQuality) {
+-            if (MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality)) return true;
++            if (fileToSave == null || img == null || img.isRecycled()) return false;
++            final Path absolute = fileToSave.toAbsolutePath();
++            final Path parent = absolute.getParent();
++            try {
++                if (parent != null) Files.createDirectories(parent);
++                Files.deleteIfExists(absolute);
++            } catch (Throwable targetFailure) {
++                Log.e(TAG, "IRIS_26549_NIGHT_JPEG_TARGET_PREP_FAILED", targetFailure);
++                Log.critical(TAG, "IRIS_26549_NIGHT_JPEG_TARGET_PREP_FAILED path=" + absolute
++                        + " type=" + targetFailure.getClass().getName()
++                        + " message=" + String.valueOf(targetFailure.getMessage()));
++                return false;
++            }
++            Log.critical(TAG, "IRIS_26549_NIGHT_JPEG_TARGET path=" + absolute
++                    + " extensionJpg=" + absolute.getFileName().toString().toLowerCase(java.util.Locale.US).endsWith(".jpg")
++                    + " parentExists=" + (parent != null && Files.isDirectory(parent))
++                    + " parentWritable=" + (parent != null && Files.isWritable(parent))
++                    + " bitmapConfig=" + String.valueOf(img.getConfig())
++                    + " bitmap=" + img.getWidth() + "x" + img.getHeight()
++                    + " recycled=" + img.isRecycled());
++
++            final boolean turboSaved = MotionV2Jpeg444Encoder.write(absolute, img, jpgQuality);
++            long turboBytes = 0L;
++            try { if (Files.isRegularFile(absolute)) turboBytes = Files.size(absolute); } catch (Throwable ignored) {}
++            Log.critical(TAG, "IRIS_26549_NIGHT_JPEG444_RESULT saved=" + turboSaved
++                    + " exists=" + Files.isRegularFile(absolute) + " bytes=" + turboBytes);
++            if (turboSaved && turboBytes > 0L) return true;
++
+             Log.w(TAG, "IRIS_26539_NIGHT_JPEG444_CODEC_FALLBACK androidBitmapCompress=true");
+-            try (OutputStream outputStream = Files.newOutputStream(fileToSave)) {
+-                boolean saved = img.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
++            try { Files.deleteIfExists(absolute); } catch (Throwable ignored) {}
++            try (OutputStream outputStream = Files.newOutputStream(absolute)) {
++                boolean compressReturned = img.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
+                 outputStream.flush();
+-                return saved && Files.isRegularFile(fileToSave) && Files.size(fileToSave) > 0L;
++                final boolean exists = Files.isRegularFile(absolute);
++                final long bytes = exists ? Files.size(absolute) : 0L;
++                final boolean saved = compressReturned && exists && bytes > 0L;
++                Log.critical(TAG, "IRIS_26549_NIGHT_ANDROID_JPEG_RESULT saved=" + saved
++                        + " compressReturned=" + compressReturned
++                        + " exists=" + exists + " bytes=" + bytes);
++                return saved;
+             } catch (Throwable codecFailure) {
+                 Log.e(TAG, "IRIS_26539_NIGHT_PORTABLE_JPEG_CODEC_FAILED", codecFailure);
++                Log.critical(TAG, "IRIS_26549_NIGHT_ANDROID_JPEG_FAILED path=" + absolute
++                        + " type=" + codecFailure.getClass().getName()
++                        + " message=" + String.valueOf(codecFailure.getMessage()));
+                 return false;
+             }
+         }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index 31341685d9bdef4c61bad5721a04c5b9135ffd00..00b128a454e795bf7eb2d3d1aa96c75b8035f8e6 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -100,7 +100,11 @@ public final class IrisNightProcessor {
+             p.motionV2SuperResOutputScale = batch.superResEnabled ? 2.0f : 1.0f;
+ 
+             final Path dngFile = ImagePath.newDNGFilePath();
+-            final Path imageFile = ImagePath.newImageFilePath();
++            /* IRIS_26549_NIGHT_EXPLICIT_JPEG_TARGET
++             * Dedicated Night owns plain-JPEG publication and must publish to the same explicit
++             * .jpg filename contract used by the proven Hdrx/Motion saver.
++             */
++            final Path imageFile = ImagePath.getNewImageFilePath("jpg");
+             final ParseExif.ExifData exif = ParseExif.parse(batch.referenceResult, batch.referenceRequest);
+             final long ref = base.getTimestamp();
+             Log.i(TAG, "IRIS_26541_NIGHT_12_PLUS_3_DIRECT_PROCESS_ENTRY frames=" + images.size()
+diff --git a/app/version.properties b/app/version.properties
+index 59791efa93feddf520bb8b7ac61267c3176db292..b7943e5d95b7d36c08365b5b6bca8cd884fb45aa 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726548
+-VERSION_BUILD=26548
++VERSION_NAME=0.9726549
++VERSION_BUILD=26549
