@@ -1,0 +1,1206 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+index 5a1dd293f9e7a0eca8809a7a24fa955602047283..708b3eebd2411332dcb2938378ea5159f685fa7c 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbShaders.kt
+@@ -396,23 +396,11 @@ internal object GlesIris26521SpatialRgbShaders {
+         }
+ 
+         void main() {
+-            // GenerateRejectionTexture runs once per Bayer quad (RAW/2). The guide is
+-            // independently decimated to RAW/4 and is sampled in normalized coordinates.
++            // V25 requires GenerateRejectionTexture and GuideImage to share the RAW/4 domain.
+             vec2 uv = gl_FragCoord.xy / vec2(uRejectionSize);
+             vec2 flowUv = uv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec4 flow = texture(uFlow, flowUv);
+-            /* IRIS_26532_REJECTION_REAL_SENSOR_SUPPORT
+-             * Rejection must validate the same physical auxiliary support that merge can sample.
+-             * Do not mirror nonexistent guide pixels back into the sensor.
+-             */
+-            vec2 warpedUv = uv + flow.xy;
+-            vec2 supportMargin = 0.5 / vec2(max(uGuideSize, ivec2(1)));
+-            if (any(lessThan(warpedUv, supportMargin)) ||
+-                any(greaterThan(warpedUv, vec2(1.0) - supportMargin))) {
+-                oReverseWeight = 1.0;
+-                oPixelDifference = 0.0;
+-                return;
+-            }
++            vec2 warpedUv = mirrorUv(uv + flow.xy);
+             float unblocker = texture(uUnblocker, uv * uUnblockerScale).r;
+             if (flow.z < uUnblockerReductionThreshold) unblocker = 0.0;
+             bool motionPrior = flow.z > uExtraMotionRobustnessMotionThreshold;
+@@ -847,6 +835,7 @@ internal object GlesIris26521SpatialRgbShaders {
+         uniform usampler2D uBaseRaw;
+         uniform usampler2D uAltRaw;
+         uniform sampler2D uFlow;
++        uniform vec4 uFlowScaleOffset;
+         uniform ivec2 uRawSize;
+         uniform ivec2 uBayerSize;
+         uniform ivec2 uTileGridSize;
+@@ -921,7 +910,8 @@ internal object GlesIris26521SpatialRgbShaders {
+                         continue;
+                     }
+ 
+-                    vec2 flowUv = (vec2(bayer) + vec2(0.5)) / vec2(uBayerSize);
++                    vec2 referenceUv = (vec2(bayer) + vec2(0.5)) / vec2(uBayerSize);
++                    vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+                     vec2 flow = texture(uFlow, flowUv).xy * vec2(uBayerSize);
+                     float baseGreen = greenAt(uBaseRaw, bayer, uBasePhaseGains, uBasePhaseBlackTerms);
+                     float altGreen = alignedAltGreen(vec2(bayer) + flow);
+@@ -1092,6 +1082,7 @@ internal object GlesIris26521SpatialRgbShaders {
+         uniform sampler2D uUltrashortFrame;
+         uniform sampler2D uHighlightMask;
+         uniform sampler2D uFlow;
++        uniform vec4 uFlowScaleOffset;
+         uniform ivec2 uSize;
+         uniform float uExposureRatio;
+         uniform float uMinNormalizedIntensityError;
+@@ -1108,7 +1099,8 @@ internal object GlesIris26521SpatialRgbShaders {
+                 uSize - ivec2(1)
+             );
+             vec2 uv = gl_FragCoord.xy / vec2(uSize);
+-            vec2 flow = texture(uFlow, uv).xy;
++            vec2 flowUv = uv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
++            vec2 flow = texture(uFlow, flowUv).xy;
+             vec2 ultrashortUv = uv + flow;
+             bool physicalUltrashort = all(greaterThanEqual(ultrashortUv, vec2(0.0))) &&
+                 all(lessThanEqual(ultrashortUv, vec2(1.0)));
+@@ -1261,13 +1253,9 @@ internal object GlesIris26521SpatialRgbShaders {
+             );
+         }
+ 
+-        bool rawInside(ivec2 p) {
+-            return all(greaterThanEqual(p, ivec2(0))) && all(lessThan(p, uRawSize));
+-        }
+-
+         float gainedRaw(ivec2 globalPixel) {
+-            // IRIS_26532_PHYSICAL_SENSOR_SUPPORT: callers must prove this is a real sensor site.
+             int channel = canonicalChannel(globalPixel);
++            globalPixel = clampRawPixelToPhase(globalPixel);
+             return float(texelFetch(uRaw, globalPixel - uRawTextureOrigin, 0).r) *
+                 uGains[channel] +
+                 uBlackLevelsTimesGains[channel];
+@@ -1287,10 +1275,10 @@ internal object GlesIris26521SpatialRgbShaders {
+             return texelFetch(uAlignment, clamp(tile, ivec2(0), size - ivec2(1)), 0).xy;
+         }
+ 
+-        vec3 interpolatedAlignmentAndConfidence(vec2 quadPosition) {
++        vec2 interpolatedAlignment(vec2 quadPosition) {
+             ivec2 tile = ivec2(floor(quadPosition / 8.0));
+             vec2 baseFlow = alignmentAt(tile);
+-            if (uInterpolationFlowTolerance <= 0.0) return vec3(baseFlow, 1.0);
++            if (uInterpolationFlowTolerance <= 0.0) return baseFlow;
+             vec2 offsetWithinTile = quadPosition - vec2(tile * 8);
+             bool leftHalf = offsetWithinTile.x <= 4.0;
+             bool topHalf = offsetWithinTile.y <= 4.0;
+@@ -1301,22 +1289,21 @@ internal object GlesIris26521SpatialRgbShaders {
+             vec2 flow10 = alignmentAt(tile00 + ivec2(1, 0));
+             vec2 flow01 = alignmentAt(tile00 + ivec2(0, 1));
+             vec2 flow11 = alignmentAt(tile00 + ivec2(1, 1));
+-            float threshold = max(8.0 * uInterpolationFlowTolerance, 1.0e-6);
+-            float disagreement = max(
+-                max(max(abs(flow00.x-baseFlow.x), abs(flow00.y-baseFlow.y)),
+-                    max(abs(flow10.x-baseFlow.x), abs(flow10.y-baseFlow.y))),
+-                max(max(abs(flow01.x-baseFlow.x), abs(flow01.y-baseFlow.y)),
+-                    max(abs(flow11.x-baseFlow.x), abs(flow11.y-baseFlow.y)))
+-            );
+-            /* IRIS_26532_CONTINUOUS_GEOMETRY_CONFIDENCE
+-             * No threshold jump to a constant tile vector. Neighbor disagreement smoothly
+-             * fades interpolation and, below, the auxiliary contribution itself.
+-             */
+-            float confidence = 1.0 - smoothstep(0.50 * threshold, threshold, disagreement);
++            float threshold = 8.0 * uInterpolationFlowTolerance;
++            bool cancelInterpolation =
++                any(greaterThanEqual(abs(flow00 - baseFlow), vec2(threshold))) ||
++                any(greaterThanEqual(abs(flow10 - baseFlow), vec2(threshold))) ||
++                any(greaterThanEqual(abs(flow01 - baseFlow), vec2(threshold))) ||
++                any(greaterThanEqual(abs(flow11 - baseFlow), vec2(threshold)));
++            if (cancelInterpolation) return baseFlow;
+             float ux = quadPosition.x / 8.0 - (float(tx0) + 0.5);
+             float uy = quadPosition.y / 8.0 - (float(ty0) + 0.5);
+-            vec2 interpolated = mix(mix(flow00, flow10, ux), mix(flow01, flow11, ux), uy);
+-            return vec3(mix(baseFlow, interpolated, confidence), confidence);
++            return mix(mix(flow00, flow10, ux), mix(flow01, flow11, ux), uy);
++        }
++
++        vec2 mirrorUv(vec2 uv) {
++            uv = mod(uv, 2.0);
++            return mix(uv, 2.0 - uv, greaterThan(uv, vec2(1.0)));
+         }
+ 
+         float kernelWeight(vec2 pixelOffset, vec3 precisionCoeffs) {
+@@ -1361,22 +1348,17 @@ internal object GlesIris26521SpatialRgbShaders {
+             ivec2 outputPixel = localOutput + uOutputOrigin;
+             vec2 referenceRaw = (vec2(outputPixel) + vec2(0.5)) *
+                 vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);
+-            vec3 flowAndConfidence = interpolatedAlignmentAndConfidence(referenceRaw * 0.5);
+-            vec2 sourceRaw = referenceRaw + 2.0 * flowAndConfidence.xy;
+-            bool sourceCenterInside = all(greaterThanEqual(sourceRaw, vec2(-0.5))) &&
+-                all(lessThan(sourceRaw, vec2(uRawSize) - vec2(0.5)));
+-            if (!sourceCenterInside) {
+-                oColorAndRWeight = vec4(0.0);
+-                oGbWeights = vec4(0.0);
+-                return;
+-            }
++            vec2 sourceRaw = referenceRaw + 2.0 * interpolatedAlignment(referenceRaw * 0.5);
+             /* IPOL Bayer covariance coordinate is (sourceCenter/2 - 0.5). Our sourceRaw is
+              * integer-pixel-center coordinates, so sourceCenter=sourceRaw+0.5. Converting that
+              * texel-index coordinate to GL normalized coordinates for a possibly band-local
+              * covariance texture gives ((sourceRaw+0.5)/2-origin)/localSize. Full-frame origin=0
+              * reduces exactly to the previously audited (sourceRaw+0.5)/rawSize mapping. */
++            vec2 mirroredRawCenter = mirrorUv(
++                (sourceRaw + vec2(0.5)) / vec2(uRawSize)
++            ) * vec2(uRawSize);
+             vec2 covarianceUv = (
+-                (sourceRaw + vec2(0.5)) * 0.5 - vec2(uCovarianceOrigin)
++                mirroredRawCenter * 0.5 - vec2(uCovarianceOrigin)
+             ) / vec2(uCovarianceTextureSize);
+             vec3 covariance = texture(
+                 uCovariance,
+@@ -1390,7 +1372,6 @@ internal object GlesIris26521SpatialRgbShaders {
+             for (int y = -1; y <= 1; ++y) {
+                 for (int x = -1; x <= 1; ++x) {
+                     ivec2 p = anchor + ivec2(x, y);
+-                    if (!rawInside(p)) continue;
+                     int channel = canonicalChannel(p);
+                     if (channel != 1 && channel != 2) continue;
+                     float spatialWeight = kernelWeight(
+@@ -1407,7 +1388,6 @@ internal object GlesIris26521SpatialRgbShaders {
+             for (int y = -1; y <= 1; ++y) {
+                 for (int x = -1; x <= 1; ++x) {
+                     ivec2 p = anchor + ivec2(x, y);
+-                    if (!rawInside(p)) continue;
+                     int channel = canonicalChannel(p);
+                     if (channel == 1 || channel == 2) continue;
+                     float spatialWeight = kernelWeight(
+@@ -1428,7 +1408,6 @@ internal object GlesIris26521SpatialRgbShaders {
+                 texture(uFrameWeight, clamp(weightUv, vec2(0.0), vec2(1.0))).r : 1.0;
+             frameWeight = clamp(frameWeight, 0.0, 1.0);
+             frameWeight *= uGlobalFrameWeight;
+-            frameWeight *= clamp(flowAndConfidence.z, 0.0, 1.0);
+             vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);
+             oColorAndRWeight = vec4(semanticSums * frameWeight, weights.r * frameWeight);
+             oGbWeights = vec4(
+@@ -1456,15 +1435,16 @@ internal object GlesIris26521SpatialRgbShaders {
+             "    vec2 fullRaw = (vec2(outputPixel) + vec2(0.5)) *\n        vec2(uRawSize) / vec2(uOutputSize) - vec2(0.5);\n    vec2 rawCenter = (vec2(uRawSize) - vec2(1.0)) * 0.5;\n    vec2 referenceRaw = rawCenter + (fullRaw - rawCenter) / max(uReconstructionZoom, 1.0);",
+         )
+         .replace(
+-            "    frameWeight *= uGlobalFrameWeight;\n    frameWeight *= clamp(flowAndConfidence.z, 0.0, 1.0);\n    vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n    oColorAndRWeight = vec4(semanticSums * frameWeight, weights.r * frameWeight);\n    oGbWeights = vec4(\n        weights.gb * frameWeight,\n        directionMoment * weights.r * frameWeight\n    );",
+-            "    frameWeight *= uGlobalFrameWeight;\n    frameWeight *= clamp(flowAndConfidence.z, 0.0, 1.0);\n    float lumaFrameWeight = frameWeight * clamp(uLumaTemporalScale, 0.0, 1.0);\n    vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n    oColorAndRWeight = vec4(\n        semanticSums.r * lumaFrameWeight,\n        semanticSums.g * frameWeight,\n        semanticSums.b * frameWeight,\n        weights.r * lumaFrameWeight\n    );\n    oGbWeights = vec4(\n        weights.gb * frameWeight,\n        directionMoment * weights.r * lumaFrameWeight\n    );",
++            "    frameWeight *= uGlobalFrameWeight;\n    vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n    oColorAndRWeight = vec4(semanticSums * frameWeight, weights.r * frameWeight);\n    oGbWeights = vec4(\n        weights.gb * frameWeight,\n        directionMoment * weights.r * frameWeight\n    );",
++            "    frameWeight *= uGlobalFrameWeight;\n    float lumaFrameWeight = frameWeight * clamp(uLumaTemporalScale, 0.0, 1.0);\n    vec2 directionMoment = greenDirectionMoment(anchor, targetGreen);\n    oColorAndRWeight = vec4(\n        semanticSums.r * lumaFrameWeight,\n        semanticSums.g * frameWeight,\n        semanticSums.b * frameWeight,\n        weights.r * lumaFrameWeight\n    );\n    oGbWeights = vec4(\n        weights.gb * frameWeight,\n        directionMoment * weights.r * lumaFrameWeight\n    );",
+         ).also { shader ->
+             check(shader.contains("uReconstructionZoom"))
+             check(shader.contains("uLumaTemporalScale"))
+             check(shader.contains("lumaFrameWeight"))
+             check(shader.contains("rawCenter"))
+             check(shader.contains("referenceRaw = rawCenter"))
+-            check(shader.contains("flowAndConfidence.z"))
++            check(!shader.contains("flowAndConfidence"))
++            check(shader.contains("cancelInterpolation"))
+         }
+ 
+     val normalizeRgb16 = """
+@@ -1649,6 +1629,7 @@ internal object GlesIris26521SpatialRgbShaders {
+ 
+         uniform highp usampler2D uRaw;
+         uniform sampler2D uFlow;
++        uniform vec4 uFlowScaleOffset;
+         uniform ivec2 uRawSize;
+         uniform ivec2 uBayerSize;
+         uniform ivec2 uOutputSize;
+@@ -1677,10 +1658,11 @@ internal object GlesIris26521SpatialRgbShaders {
+                 return;
+             }
+ 
+-            // One merge-weight texel covers 2x2 Bayer quads. Use its center in reference
+-            // coordinates, then inspect the 3x3 source neighborhood consumed by MergeBayer.
+-            ivec2 referenceQuad = min(outputPixel * 2 + ivec2(1), uBayerSize - ivec2(1));
+-            vec2 flowUv = (vec2(referenceQuad) + vec2(0.5)) / vec2(uBayerSize);
++            // V25 merge weight is RAW/8: one texel covers 4x4 Bayer quads. Use its center in
++            // reference coordinates, then inspect the 3x3 source neighborhood consumed by merge.
++            ivec2 referenceQuad = min(outputPixel * 4 + ivec2(2), uBayerSize - ivec2(1));
++            vec2 referenceUv = (vec2(referenceQuad) + vec2(0.5)) / vec2(uBayerSize);
++            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec2 sourceFlow = texture(uFlow, flowUv).xy * vec2(uBayerSize);
+             ivec2 sourceAnchor = ivec2(roundEven(vec2(referenceQuad) + sourceFlow));
+ 
+@@ -2649,18 +2631,18 @@ internal object GlesIris26521SpatialRgbShaders {
+      * MergeBayerRaw, convert it to normalized UV displacement, and store the pre-interpolation
+      * local 3x3 range in B.
+      */
++    /**
++     * ConvertAlignmentHalide: preserve the sparse alignment grid while converting Bayer-quad
++     * displacements to normalized UV and storing the local 3x3 flow range in B. Current MGC
++     * performs guarded interpolation only in the merge shader, never in this transport stage.
++     */
+     val convertAlignment = """
+         #version 300 es
+         precision highp float;
+         precision highp int;
+         uniform sampler2D uAlignment;
+         uniform ivec2 uGridSize;
+-        uniform ivec2 uOutputSize;
+-        uniform float uTileStride;
+         uniform float uAlignmentScale;
+-        uniform float uOutputToAlignmentScale;
+-        uniform float uGridMin;
+-        uniform float uInterpolationFlowTolerance;
+         uniform vec2 uFlowNormalizationSize;
+         out vec4 oFlow;
+         vec2 flowAt(ivec2 p) {
+@@ -2670,70 +2652,9 @@ internal object GlesIris26521SpatialRgbShaders {
+                 0
+             ).xy * uAlignmentScale;
+         }
+-        vec2 interpolatedFlow(
+-            ivec2 tile,
+-            ivec2 offsetWithinTile,
+-            vec2 baseFlow
+-        ) {
+-            if (uInterpolationFlowTolerance <= 0.0) {
+-                return baseFlow;
+-            }
+-            bool leftHalf =
+-                offsetWithinTile.x <= int(0.5 * uTileStride);
+-            bool topHalf =
+-                offsetWithinTile.y <= int(0.5 * uTileStride);
+-            int tx0 = leftHalf ? tile.x - 1 : tile.x;
+-            int ty0 = topHalf ? tile.y - 1 : tile.y;
+-            vec2 flow00 = flowAt(ivec2(tx0, ty0));
+-            vec2 flow10 = flowAt(ivec2(tx0 + 1, ty0));
+-            vec2 flow01 = flowAt(ivec2(tx0, ty0 + 1));
+-            vec2 flow11 = flowAt(ivec2(tx0 + 1, ty0 + 1));
+-            float threshold =
+-                uTileStride * uAlignmentScale *
+-                uInterpolationFlowTolerance;
+-            bool cancelInterpolation =
+-                any(greaterThanEqual(abs(flow00 - baseFlow), vec2(threshold))) ||
+-                any(greaterThanEqual(abs(flow10 - baseFlow), vec2(threshold))) ||
+-                any(greaterThanEqual(abs(flow01 - baseFlow), vec2(threshold))) ||
+-                any(greaterThanEqual(abs(flow11 - baseFlow), vec2(threshold)));
+-            if (cancelInterpolation) {
+-                return baseFlow;
+-            }
+-            vec2 logicalTile = vec2(tile) + vec2(uGridMin);
+-            vec2 pixelPosition =
+-                logicalTile * uTileStride + vec2(offsetWithinTile);
+-            float tx0Logical = float(tx0) + uGridMin;
+-            float ty0Logical = float(ty0) + uGridMin;
+-            float ux =
+-                pixelPosition.x / uTileStride -
+-                (tx0Logical + 0.5);
+-            float uy =
+-                pixelPosition.y / uTileStride -
+-                (ty0Logical + 0.5);
+-            return mix(
+-                mix(flow00, flow10, ux),
+-                mix(flow01, flow11, ux),
+-                uy
+-            );
+-        }
+         void main() {
+-            vec2 pixel = gl_FragCoord.xy - vec2(0.5);
+-            vec2 alignmentPixel =
+-                pixel * uOutputToAlignmentScale;
+-            vec2 logicalGrid = alignmentPixel / uTileStride;
+-            vec2 grid = logicalGrid -
+-                vec2(uGridMin);
+-            ivec2 tile = ivec2(floor(grid));
+-            ivec2 offsetWithinTile = ivec2(floor(
+-                alignmentPixel -
+-                floor(logicalGrid) * uTileStride
+-            ));
+-            vec2 baseFlowPixels = flowAt(tile);
+-            vec2 flowPixels = interpolatedFlow(
+-                tile,
+-                offsetWithinTile,
+-                baseFlowPixels
+-            );
++            ivec2 tile = ivec2(gl_FragCoord.xy);
++            vec2 flowPixels = flowAt(tile);
+             vec2 minimumFlow = vec2(1.0e20);
+             vec2 maximumFlow = vec2(-1.0e20);
+             for (int y = -1; y <= 1; ++y) {
+@@ -2747,8 +2668,6 @@ internal object GlesIris26521SpatialRgbShaders {
+             vec2 normalizedRange =
+                 (maximumFlow - minimumFlow) /
+                 max(uFlowNormalizationSize, vec2(1.0));
+-            // ConvertAlignmentHalide stores the Euclidean length of the normalized
+-            // min/max flow extent. X and Y use their own output dimensions.
+             float localFlowVariation = length(normalizedRange);
+             oFlow = vec4(uvFlow, localFlowVariation, 0.0);
+         }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+index 07cb7717c7146fa688e503f7b62eeb79d3f0b3ef..316c331fa8232e6016ec791db69eafc4c64b2276 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26521SpatialRgbStacker.kt
+@@ -82,6 +82,15 @@ internal class GlesIris26521SpatialRgbStacker(
+         val gridMin: Int,
+     )
+ 
++    /** Sparse normalized flow plus the reference-UV to alignment-texture transform. */
++    private data class ConvertedAlignment(
++        val texture: Int,
++        val scaleX: Float,
++        val scaleY: Float,
++        val offsetX: Float,
++        val offsetY: Float,
++    )
++
+     /** Reference-only LK products shared by every current frame at one pyramid level. */
+     private data class ReferenceAlignmentProducts(
+         val referenceTexture: Int,
+@@ -96,7 +105,7 @@ internal class GlesIris26521SpatialRgbStacker(
+ 
+     private data class PreparedTemporalFrame(
+         val calibration: FrameCalibration,
+-        val flowTexture: Int,
++        val convertedAlignment: ConvertedAlignment,
+         val bayerAlignmentTexture: Int,
+         val weightTexture: Int,
+     )
+@@ -360,23 +369,30 @@ internal class GlesIris26521SpatialRgbStacker(
+         val ultrashortClippingOverlap: Float,
+     )
+ 
+-    // GuideImage/rejection keeps released MGC quarter-resolution ownership. Figure-7 covariance
+-    // is separate and follows the paper/IPOL contract: one tensor/covariance per Bayer quad (RAW/2).
+-    private val guideWidth = max(1, width / 4)
+-    private val guideHeight = max(1, height / 4)
+-    private val covarianceWidth = max(1, width / 2)
+-    private val covarianceHeight = max(1, height / 2)
++    private val rejectionGeometry = mgcSpatialRejectionGeometry(
++        imageWidth = width,
++        imageHeight = height,
++        filterDownsample = REJECTION_FILTER_DOWNSAMPLE,
++    )
++    // Current V25: GuideImage and GenerateRejectionTexture share RAW/4. Figure-7 covariance
++    // remains separate at one tensor/covariance per Bayer quad (RAW/2).
++    private val bayerQuadWidth = rejectionGeometry.bayerQuadWidth
++    private val bayerQuadHeight = rejectionGeometry.bayerQuadHeight
++    private val guideWidth = rejectionGeometry.guideWidth
++    private val guideHeight = rejectionGeometry.guideHeight
++    private val covarianceWidth = bayerQuadWidth
++    private val covarianceHeight = bayerQuadHeight
+     // MergeBayerRaw16's queried AOT contract requests one alignment sample per 8x8
+     // Bayer-quad tile, i.e. one sample per 16x16 sensor pixels.
+     private val bayerAlignmentWidth = ceilDiv(width, MERGE_BAYER_RAW_TILE_SIZE)
+     private val bayerAlignmentHeight = ceilDiv(height, MERGE_BAYER_RAW_TILE_SIZE)
+-    private val rejectionWidth = ceilDiv(width, 2)
+-    private val rejectionHeight = ceilDiv(height, 2)
+-    // IRIS_26527_FINAL_MGC_REJECTION_ALIGNMENT_PARITY: DilateMask and Downsample2x use floor /2.
+-    private val mergeWeightWidth = rejectionWidth / 2
+-    private val mergeWeightHeight = rejectionHeight / 2
+-    private val rejectionFilterWidth = ceilDiv(mergeWeightWidth, REJECTION_FILTER_DOWNSAMPLE)
+-    private val rejectionFilterHeight = ceilDiv(mergeWeightHeight, REJECTION_FILTER_DOWNSAMPLE)
++    private val rejectionWidth = rejectionGeometry.rejectionWidth
++    private val rejectionHeight = rejectionGeometry.rejectionHeight
++    // V25 DilateMask/Downsample2x moves RAW/4 rejection to RAW/8 merge acceptance.
++    private val mergeWeightWidth = rejectionGeometry.mergeWeightWidth
++    private val mergeWeightHeight = rejectionGeometry.mergeWeightHeight
++    private val rejectionFilterWidth = rejectionGeometry.filterWidth
++    private val rejectionFilterHeight = rejectionGeometry.filterHeight
+     private val normalizedOutputScale = MultiFrameConfig.normalizeOutputScale(outputScale)
+     private val outputWidth = if (outputMode == MgcSpatialOutputMode.RGB) {
+         MultiFrameConfig.scaledRawOutputDimension(width, normalizedOutputScale)
+@@ -625,7 +641,8 @@ internal class GlesIris26521SpatialRgbStacker(
+             applyRawRenderState()
+             PLog.i(
+                 TAG,
+-                "MGC rejection domain=${rejectionWidth}x$rejectionHeight " +
++                "MGC V25 domains bayerQuad=${bayerQuadWidth}x$bayerQuadHeight " +
++                    "guide=${guideWidth}x$guideHeight rejection=${rejectionWidth}x$rejectionHeight " +
+                     "mergeWeight=${mergeWeightWidth}x$mergeWeightHeight " +
+                     "pixelDiff=ClippedGaussian${PIXEL_DIFFERENCE_KERNEL_SIZE}" +
+                     "(sigma=$PIXEL_DIFFERENCE_SMOOTH_SIGMA) " +
+@@ -1026,17 +1043,11 @@ internal class GlesIris26521SpatialRgbStacker(
+                     val postAlignStartNs = System.nanoTime()
+                     /* IRIS_26527_FINAL_ALIGNMENT_FIELD_OWNER */
+                     val bayerAlignment = alignment.texture
+-                    val flow = createTexture(
+-                        rejectionWidth,
+-                        rejectionHeight,
+-                        GLES30.GL_RGBA16F,
+-                        GLES30.GL_LINEAR,
+-                    )
+-                    renderConvertedAlignment(alignment, flow)
++                    val flow = createConvertedAlignment(alignment)
+                     val tilingMask = renderFindBlockTiles(
+                         baseRaw = referenceRaw,
+                         ultrashortRaw = bentoRaw,
+-                        flowTexture = flow,
++                        flow = flow,
+                         baseCalibration = referenceCalibration,
+                         ultrashortCalibration = normalizedCalibration,
+                     )
+@@ -1080,7 +1091,7 @@ internal class GlesIris26521SpatialRgbStacker(
+                         baseFrame = referenceGuide,
+                         ultrashortFrame = unscaledGuide,
+                         highlightMask = referenceHighlightMask,
+-                        flowTexture = flow,
++                        flow = flow,
+                         exposureRatio = exposureRatio,
+                         adjustedMask = checkNotNull(bentoMask),
+                         inpaintingMask = inpaintingMask,
+@@ -1547,7 +1558,7 @@ internal class GlesIris26521SpatialRgbStacker(
+                                 val alignedLongClippingMask =
+                                     renderAlignedLongFrameClippingMask(
+                                         rawTexture = temporalRaw,
+-                                        flowTexture = prepared.flowTexture,
++                                        flow = prepared.convertedAlignment,
+                                     )
+                                 PLog.d(
+                                     TAG,
+@@ -3232,6 +3243,37 @@ internal class GlesIris26521SpatialRgbStacker(
+         )
+     }
+ 
++    private fun createConvertedAlignment(alignment: Alignment): ConvertedAlignment {
++        require(alignment.gridWidth > 0 && alignment.gridHeight > 0) {
++            "ConvertAlignment requires a non-empty alignment grid"
++        }
++        val strideInBayerQuads =
++            alignment.tileStride.toFloat() * alignment.scaleToBayerQuads
++        require(strideInBayerQuads.isFinite() && strideInBayerQuads > 0f) {
++            "ConvertAlignment requires a positive finite Bayer-quad stride"
++        }
++        val output = createTexture(
++            alignment.gridWidth,
++            alignment.gridHeight,
++            GLES30.GL_RGBA16F,
++            GLES30.GL_LINEAR,
++        )
++        renderConvertedAlignment(alignment, output)
++
++        // Current MGC keeps ConvertAlignment sparse. Consumers map normalized reference UV onto
++        // this grid through flow_scale_offset rather than materializing a dense rejection image.
++        val scaleX = bayerQuadWidth.toFloat() /
++            (strideInBayerQuads * alignment.gridWidth.toFloat())
++        val scaleY = bayerQuadHeight.toFloat() /
++            (strideInBayerQuads * alignment.gridHeight.toFloat())
++        val offsetX = -alignment.gridMin.toFloat() / alignment.gridWidth.toFloat()
++        val offsetY = -alignment.gridMin.toFloat() / alignment.gridHeight.toFloat()
++        check(scaleX.isFinite() && scaleY.isFinite() && offsetX.isFinite() && offsetY.isFinite()) {
++            "ConvertAlignment produced a non-finite flow sampling transform"
++        }
++        return ConvertedAlignment(output, scaleX, scaleY, offsetX, offsetY)
++    }
++
+     private fun renderConvertedAlignment(alignment: Alignment, output: Int) {
+         GLES30.glUseProgram(convertAlignmentProgram)
+         bindTexture(convertAlignmentProgram, "uAlignment", 0, alignment.texture)
+@@ -3241,43 +3283,29 @@ internal class GlesIris26521SpatialRgbStacker(
+             alignment.gridWidth,
+             alignment.gridHeight,
+         )
+-        uniform2i(
+-            convertAlignmentProgram,
+-            "uOutputSize",
+-            rejectionWidth,
+-            rejectionHeight,
+-        )
+-        uniform1f(
+-            convertAlignmentProgram,
+-            "uTileStride",
+-            alignment.tileStride * alignment.scaleToBayerQuads,
+-        )
+         uniform1f(
+             convertAlignmentProgram,
+             "uAlignmentScale",
+             alignment.scaleToBayerQuads,
+         )
+-        uniform1f(convertAlignmentProgram, "uOutputToAlignmentScale", 1f)
+-        uniform1f(convertAlignmentProgram, "uGridMin", alignment.gridMin.toFloat())
+-        uniform1f(
+-            convertAlignmentProgram,
+-            "uInterpolationFlowTolerance",
+-            SPATIAL_INTERPOLATION_FLOW_TOLERANCE,
+-        )
+         uniform2f(
+             convertAlignmentProgram,
+             "uFlowNormalizationSize",
+-            ceilDiv(width, 2).toFloat(),
+-            ceilDiv(height, 2).toFloat(),
++            bayerQuadWidth.toFloat(),
++            bayerQuadHeight.toFloat(),
+         )
+         draw(
+             convertAlignmentProgram,
+-            rejectionWidth,
+-            rejectionHeight,
++            alignment.gridWidth,
++            alignment.gridHeight,
+             intArrayOf(output),
+         )
+     }
+ 
++    private fun uniformFlowScaleOffset(program: Int, flow: ConvertedAlignment) {
++        uniform4f(program, "uFlowScaleOffset", flow.scaleX, flow.scaleY, flow.offsetX, flow.offsetY)
++    }
++
+     private fun renderGuide(
+         rawTexture: Int,
+         noiseTexture: Int,
+@@ -3419,7 +3447,7 @@ internal class GlesIris26521SpatialRgbStacker(
+     private fun renderRejection(
+         referenceGuide: Int,
+         currentGuide: Int,
+-        flowTexture: Int,
++        flow: ConvertedAlignment,
+         unblockerTexture: Int,
+         noiseTexture: Int,
+         reverseWeightTexture: Int,
+@@ -3428,7 +3456,7 @@ internal class GlesIris26521SpatialRgbStacker(
+         GLES30.glUseProgram(rejectionProgram)
+         bindTexture(rejectionProgram, "uBaseGuide", 0, referenceGuide)
+         bindTexture(rejectionProgram, "uAltGuide", 1, currentGuide)
+-        bindTexture(rejectionProgram, "uFlow", 2, flowTexture)
++        bindTexture(rejectionProgram, "uFlow", 2, flow.texture)
+         bindTexture(rejectionProgram, "uUnblocker", 3, unblockerTexture)
+         bindTexture(rejectionProgram, "uNoiseEstimates", 4, noiseTexture)
+         uniform2i(rejectionProgram, "uGuideSize", guideWidth, guideHeight)
+@@ -3438,7 +3466,7 @@ internal class GlesIris26521SpatialRgbStacker(
+             rejectionWidth,
+             rejectionHeight,
+         )
+-        uniform4f(rejectionProgram, "uFlowScaleOffset", 1f, 1f, 0f, 0f)
++        uniformFlowScaleOffset(rejectionProgram, flow)
+         uniform2f(rejectionProgram, "uUnblockerScale", 1f, 1f)
+         uniform4f(
+             rejectionProgram,
+@@ -3448,7 +3476,17 @@ internal class GlesIris26521SpatialRgbStacker(
+             0.05f,
+             0.25f,
+         )
+-        uniform2f(rejectionProgram, "uColorDifferenceMultiplier", 0.07f, 0.35f)
++        uniform2f(
++            rejectionProgram,
++            "uColorDifferenceMultiplier",
++            MgcSabreRejectionTuning.COLOR_DIFFERENCE_RGB,
++            MgcSabreRejectionTuning.COLOR_DIFFERENCE_GREEN,
++        )
++        // V25's captured threshold is normalized in Bayer-quad flow coordinates, not in the
++        // RAW/4 rejection texture domain. Resolve it from the actual Bayer-quad width.
++        val flowVariationThresholds = MgcSabreRejectionTuning.flowVariationThresholds(
++            bayerQuadWidth,
++        )
+         val diagnosticMode = RawStackRuntimeDebug.mgcSpatialDiagnosticMode
+         val unblockerReductionThreshold =
+             if (
+@@ -3457,24 +3495,28 @@ internal class GlesIris26521SpatialRgbStacker(
+             ) {
+                 Float.MAX_VALUE
+             } else {
+-                FLOW_VARIATION_THRESHOLD
++                flowVariationThresholds.unblockerReduction
+             }
+         val motionPriorThreshold =
+             if (diagnosticMode == MgcSpatialDiagnosticMode.MAIN_REJECTION_ONLY) {
+                 Float.MAX_VALUE
+             } else {
+-                FLOW_VARIATION_THRESHOLD
++                flowVariationThresholds.extraMotionRobustness
+             }
+         uniform1f(
+             rejectionProgram,
+             "uUnblockerReductionThreshold",
+             unblockerReductionThreshold,
+         )
+-        uniform1f(rejectionProgram, "uExtraMotionRobustnessBoost", 6f)
++        uniform1f(
++            rejectionProgram,
++            "uExtraMotionRobustnessBoost",
++            MgcSabreRejectionTuning.EXTRA_MOTION_ROBUSTNESS_BOOST,
++        )
+         uniform1f(
+             rejectionProgram,
+             "uMotionRobustnessBoostVarianceThreshold",
+-            25f,
++            MgcSabreRejectionTuning.MOTION_ROBUSTNESS_VARIANCE_THRESHOLD,
+         )
+         uniform1f(
+             rejectionProgram,
+@@ -3753,13 +3795,7 @@ internal class GlesIris26521SpatialRgbStacker(
+         val flowStartNs = System.nanoTime()
+         /* IRIS_26527_FINAL_ALIGNMENT_FIELD_OWNER */
+         val bayerAlignment = alignment.texture
+-        val flow = createTexture(
+-            rejectionWidth,
+-            rejectionHeight,
+-            GLES30.GL_RGBA16F,
+-            GLES30.GL_LINEAR,
+-        )
+-        renderConvertedAlignment(alignment, flow)
++        val flow = createConvertedAlignment(alignment)
+         val flowNs = System.nanoTime() - flowStartNs
+         val rejectionStartNs = System.nanoTime()
+         val unblockerWidth = ceilDiv(width, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+@@ -3840,14 +3876,14 @@ internal class GlesIris26521SpatialRgbStacker(
+         renderRejection(
+             referenceGuide = referenceGuide,
+             currentGuide = currentGuide,
+-            flowTexture = flow,
++            flow = flow,
+             unblockerTexture = unblocker,
+             noiseTexture = currentNoiseLut,
+             reverseWeightTexture = rawReverseWeight,
+             pixelDifferenceTexture = rawPixelDifference,
+         )
+-        // MGC closes the RAW/2 rejection boundary here. DilateMask converts rejection to
+-        // RAW/4 acceptance weight and Downsample2x places pixel difference on that same domain.
++        // V25 closes the RAW/4 rejection boundary here. DilateMask converts rejection to
++        // RAW/8 acceptance weight and Downsample2x places pixel difference on that same domain.
+         renderDilation(rawReverseWeight, initialWeight)
+         renderPixelDifferenceDownsample(rawPixelDifference, pixelDifference)
+         renderClippedGaussianPixelDifference(
+@@ -3898,7 +3934,7 @@ internal class GlesIris26521SpatialRgbStacker(
+         )
+         return PreparedTemporalFrame(
+             calibration = calibration,
+-            flowTexture = flow,
++            convertedAlignment = flow,
+             bayerAlignmentTexture = alignment.texture,
+             weightTexture = frameWeight,
+         )
+@@ -3912,7 +3948,7 @@ internal class GlesIris26521SpatialRgbStacker(
+     private fun renderFindBlockTiles(
+         baseRaw: Int,
+         ultrashortRaw: Int,
+-        flowTexture: Int,
++        flow: ConvertedAlignment,
+         baseCalibration: FrameCalibration,
+         ultrashortCalibration: FrameCalibration,
+     ): Int {
+@@ -3925,13 +3961,14 @@ internal class GlesIris26521SpatialRgbStacker(
+         GLES30.glUseProgram(findBlockTilesGatherEdgesProgram)
+         bindTexture(findBlockTilesGatherEdgesProgram, "uBaseRaw", 0, baseRaw)
+         bindTexture(findBlockTilesGatherEdgesProgram, "uAltRaw", 1, ultrashortRaw)
+-        bindTexture(findBlockTilesGatherEdgesProgram, "uFlow", 2, flowTexture)
++        bindTexture(findBlockTilesGatherEdgesProgram, "uFlow", 2, flow.texture)
++        uniformFlowScaleOffset(findBlockTilesGatherEdgesProgram, flow)
+         uniform2i(findBlockTilesGatherEdgesProgram, "uRawSize", width, height)
+         uniform2i(
+             findBlockTilesGatherEdgesProgram,
+             "uBayerSize",
+-            rejectionWidth,
+-            rejectionHeight,
++            bayerQuadWidth,
++            bayerQuadHeight,
+         )
+         uniform2i(
+             findBlockTilesGatherEdgesProgram,
+@@ -4038,7 +4075,7 @@ internal class GlesIris26521SpatialRgbStacker(
+ 
+     private fun renderAlignedLongFrameClippingMask(
+         rawTexture: Int,
+-        flowTexture: Int,
++        flow: ConvertedAlignment,
+     ): Int {
+         check(alignedRawClippingMaskProgram != 0) {
+             "Aligned RAW clipping-mask program is not initialized"
+@@ -4056,13 +4093,14 @@ internal class GlesIris26521SpatialRgbStacker(
+         }
+         GLES30.glUseProgram(alignedRawClippingMaskProgram)
+         bindTexture(alignedRawClippingMaskProgram, "uRaw", 0, rawTexture)
+-        bindTexture(alignedRawClippingMaskProgram, "uFlow", 1, flowTexture)
++        bindTexture(alignedRawClippingMaskProgram, "uFlow", 1, flow.texture)
++        uniformFlowScaleOffset(alignedRawClippingMaskProgram, flow)
+         uniform2i(alignedRawClippingMaskProgram, "uRawSize", width, height)
+         uniform2i(
+             alignedRawClippingMaskProgram,
+             "uBayerSize",
+-            rejectionWidth,
+-            rejectionHeight,
++            bayerQuadWidth,
++            bayerQuadHeight,
+         )
+         uniform2i(
+             alignedRawClippingMaskProgram,
+@@ -4088,7 +4126,7 @@ internal class GlesIris26521SpatialRgbStacker(
+         baseFrame: Int,
+         ultrashortFrame: Int,
+         highlightMask: Int,
+-        flowTexture: Int,
++        flow: ConvertedAlignment,
+         exposureRatio: Float,
+         adjustedMask: Int,
+         inpaintingMask: Int,
+@@ -4098,7 +4136,8 @@ internal class GlesIris26521SpatialRgbStacker(
+         bindTexture(bentoAdjustProgram, "uBaseFrame", 0, baseFrame)
+         bindTexture(bentoAdjustProgram, "uUltrashortFrame", 1, ultrashortFrame)
+         bindTexture(bentoAdjustProgram, "uHighlightMask", 2, highlightMask)
+-        bindTexture(bentoAdjustProgram, "uFlow", 3, flowTexture)
++        bindTexture(bentoAdjustProgram, "uFlow", 3, flow.texture)
++        uniformFlowScaleOffset(bentoAdjustProgram, flow)
+         uniform2i(bentoAdjustProgram, "uSize", guideWidth, guideHeight)
+         uniform1f(bentoAdjustProgram, "uExposureRatio", exposureRatio)
+         uniform1f(
+@@ -8393,7 +8432,6 @@ internal class GlesIris26521SpatialRgbStacker(
+         const val SPATIAL_IDENTITY_SHOT_NOISE = 1f
+         const val SPATIAL_IDENTITY_STRENGTH_Q8 = 256
+         // Captured from the original MGC rejection program on the same full-resolution path.
+-        const val FLOW_VARIATION_THRESHOLD = 9.88235261e-5f
+ 
+         // FilterRejectionMap runtime values read from the original MGC process. The
+         // ClippedGaussian formula and tap center were independently verified against its AOT.
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index cfc4f0b7ef29b8e0b7601268fcdabf45a59cdd28..8ba1d4439da0735b959856f54dd8bc1518b66a3f 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -13,13 +13,14 @@ import kotlin.math.sin
+ /**
+  * IRIS_26529_SPATIAL_RGB_CHROMA_REWRITE_OWNER
+  *
+- * Iris-owned rewrite of the post-fusion Spatial-RGB chroma stage. bjzhou c317/MGC is used only as
++ * Iris-owned current-MGC VGN/color-noise/IIR stage shared by Spatial and Sabre. bjzhou c317/MGC is used only as
+  * a pinned semantic reference for equations, coefficients, coordinate domains, and stage ordering.
+  * This owner is intentionally integrated around Iris' existing Spatial-RGB accumulator, texture
+  * lifecycle, diagnostics, Motion ownership, and GPU export path rather than vendoring bjzhou code.
+  *
+- * Input is one full contiguous RGBA16UI camera-RGB image. RGB contains normalized camera color;
+- * alpha contains the packed fused-green doubled-angle direction moment produced by the Iris merge.
++ * Input is one full contiguous RGBA16UI camera-RGB image. RGB contains normalized camera color.
++ * Direction selection is rebuilt from RGB gradients exactly at the VGN boundary; the packed fused
++ * green direction carried by Spatial remains a merge diagnostic and is not a VGN seed authority.
+  * All directional and recursive filtering runs in global image coordinates so processing bands can
+  * never become visible tile boundaries.
+  */
+@@ -58,7 +59,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+     private val coefficients = Iris26529SpatialRgbIirCoefficients.forOutputScale(
+         outputScale.takeIf { it.isFinite() && it > 0f } ?: 1f,
+     )
+-    private val passWindow = GlesGpuScheduler.PassWindow("Iris26529SpatialRgbChroma", 2)
++    private val passWindow = GlesGpuScheduler.PassWindow("IrisCurrentMgcVgn", 2)
+ 
+     private var seedProgram = 0
+     private var localClampProgram = 0
+@@ -568,22 +569,13 @@ internal object Iris26529SpatialRgbChromaShaders {
+             return clamp(vec3(decodeU16(e.r),decodeU16(e.g),decodeU16(e.b))*uCalculationGains,vec3(0.0),vec3(65504.0));
+         }
+         float yAt(ivec2 p){ return dot(calculationRgbAt(p),vec3(0.25,0.5,0.25)); }
+-        /* IRIS_26532_FOLIAGE_STRUCTURE_GUIDANCE
+-         * 26531's RGB-gradient-only direction choice regressed fine green foliage against sky.
+-         * Restore the fused-green doubled-angle structure moment as a geometric guide while
+-         * retaining RGB luminance gradients as the actual edge magnitude.
+-         */
+-        float snorm8(uint x){ int v=int(x&255u); if(v>127)v-=256; return clamp(float(v)/127.0,-1.0,1.0); }
+-        vec2 directionMomentAt(ivec2 p){ uint a=imageLoad(uInput,safePos(p)).a; return vec2(snorm8(a),snorm8(a>>8u)); }
+         uint directionMaskAt(ivec2 p){
+             const ivec2 d[8]=ivec2[8](ivec2(0,-1),ivec2(1,0),ivec2(0,1),ivec2(-1,0),ivec2(1,-1),ivec2(1,1),ivec2(-1,1),ivec2(-1,-1));
+-            const vec2 axis2[8]=vec2[8](vec2(-1,0),vec2(1,0),vec2(-1,0),vec2(1,0),vec2(0,-1),vec2(0,1),vec2(0,-1),vec2(0,1));
+-            float center=yAt(p); vec2 moment=directionMomentAt(p); float g[8]; float lo=65504.0; float hi=0.0;
++            float center=yAt(p); float g[8]; float lo=65504.0; float hi=0.0;
+             for(int i=0;i<8;++i){
+                 float first=yAt(p+d[i]); float second=yAt(p+d[i]*2);
+                 float rgbGradient=abs(center-first)+0.5*abs(first-second);
+-                float structureScale=clamp(1.0+0.5*dot(moment,axis2[i]),0.5,1.5);
+-                g[i]=rgbGradient*structureScale; lo=min(lo,g[i]); hi=max(hi,g[i]);
++                g[i]=rgbGradient; lo=min(lo,g[i]); hi=max(hi,g[i]);
+             }
+             float threshold=max(uMinimumDirectionGradient,1.5*lo+0.09375*(hi-lo));
+             int mask=0; int count=0;
+@@ -631,21 +623,12 @@ internal object Iris26529SpatialRgbChromaShaders {
+             a=s(p+ivec2(-1,0));b=s(p);c=s(p+ivec2(1,0)); row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); sum+=row; mn=min(mn,row); mx=max(mx,row); ysum+=2*a.x+4*b.x+2*c.x;
+             a=s(p+ivec2(-1,1));b=s(p+ivec2(0,1));c=s(p+ivec2(1,1)); row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); sum+=row-min(mn,row)-max(mx,row); ysum+=a.x+2*b.x+c.x;
+             uvec4 center=imageLoad(uInput,p);
+-            /* IRIS_26532_FOLIAGE_LOCAL_MEDIAN_EDGE_GATE
+-             * The old median could borrow sky chroma into a leaf (or vice versa). Preserve the
+-             * center chroma progressively across real luminance edges, while flat areas retain
+-             * the proven 26529 chroma cleanup.
+-             */
+-            float centerY=decodeU16(center.r); float edge=0.0;
+-            for(int yy=-1;yy<=1;++yy)for(int xx=-1;xx<=1;++xx){
+-                if(xx==0&&yy==0)continue;
+-                float ny=decodeU16(imageLoad(uInput,safePos(p+ivec2(xx,yy))).r);
+-                edge=max(edge,abs(centerY-ny)/max(centerY+ny,1.0));
+-            }
+-            float protect=smoothstep(0.035,0.10,edge);
+-            vec2 medianC=vec2(sum); vec2 centerC=vec2(signedChroma(center.g),signedChroma(center.b));
+-            ivec2 outC=ivec2(round(mix(medianC,centerC,protect)));
+-            imageStore(uOutput,p,uvec4(uint(max(ysum/16,0)),unsignedChroma(outC.x),unsignedChroma(outC.y),center.a));
++            imageStore(uOutput,p,uvec4(
++                uint(max(ysum/16,0)),
++                unsignedChroma(sum.x),
++                unsignedChroma(sum.y),
++                center.a
++            ));
+         }
+     """.trimIndent()
+ 
+@@ -670,23 +653,12 @@ internal object Iris26529SpatialRgbChromaShaders {
+             if((direction&(1<<6))!=0){selected+=vec3(cr[3],cb[3],scale[3]);count++;} if((direction&(1<<7))!=0){selected+=vec3(cr[3],cb[3],scale[3]);count++;}
+             if(count>0)selected/=float(count); float minScale=min(min(scale.x,scale.y),min(scale.z,scale.w)); float yScale=clamp(1.0-center.x/16384.0*minScale,0.0,1.0); return vec4(center.x,yScale*selected.x,yScale*selected.y,selected.z*65504.0);
+         }
+-        float edgeProtect(ivec2 p,float centerY){
+-            const ivec2 d[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+-            float edge=0.0;
+-            for(int i=0;i<4;++i){float ny=decodeU16(imageLoad(uOriginal,safePos(p+d[i])).r);edge=max(edge,abs(centerY-ny)/max(centerY+ny,1.0));}
+-            return smoothstep(0.035,0.10,edge);
+-        }
+         void main(){
+             ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
+             uvec4 e=imageLoad(uOriginal,p);vec4 f=vec4(decodeU16(e.r),float(signedChroma(e.g)),float(signedChroma(e.b)),0.0);
+             if(e.r!=0u&&e.a!=0u)f=filter3(e,p);
+             uvec4 sm=imageLoad(uSmooth,p);ivec2 sc=ivec2(signedChroma(sm.g),signedChroma(sm.b));ivec2 fc=ivec2(f.yz);
+-            float protect=edgeProtect(p,decodeU16(e.r));
+-            /* IRIS_26532_NO_EDGE_DESATURATION: the lower-saturation candidate may win only away
+-             * from a real edge. At a protected edge the fused center chroma remains authority. */
+-            if(protect<0.5 && abs(sc.x)+abs(sc.y)<abs(fc.x)+abs(fc.y))fc=sc;
+-            vec2 centerC=vec2(signedChroma(e.g),signedChroma(e.b));
+-            fc=ivec2(round(mix(vec2(fc),centerC,protect)));
++            if(abs(sc.x)+abs(sc.y)<abs(fc.x)+abs(fc.y))fc=sc;
+             imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(fc.x),unsignedChroma(fc.y),uint(clamp(f.w,0.0,65504.0))));
+         }
+     """.trimIndent()
+@@ -718,22 +690,12 @@ internal object Iris26529SpatialRgbChromaShaders {
+             int outer=uAxis==0?int(gl_GlobalInvocationID.y):int(gl_GlobalInvocationID.x);int outerLimit=uAxis==0?uImageSize.y:uImageSize.x;int innerSize=uAxis==0?uImageSize.x:uImageSize.y;if(outer>=outerLimit)return;
+             int start=uDirection==0?0:innerSize-1;int step=uDirection==0?1:-1;uvec4 b=imageLoad(uInput,pos(start,outer));float by=decodeU16(b.r),cr=float(signedChroma(b.g)),cb=float(signedChroma(b.b));
+             float sy=steadyOutput(by,uA10,uB10,true),sc1=steadyOutput(cr,uADyn1,uBDyn1,false),sb1=steadyOutput(cb,uADyn1,uBDyn1,false),sc2=steadyOutput(sc1,uADyn2,uBDyn2,false),sb2=steadyOutput(sb1,uADyn2,uBDyn2,false);
+-            State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);float previousY=by;
++            State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);
+             for(int i=0;i<innerSize;++i){
+                 ivec2 p=pos(start+i*step,outer);uvec4 px=imageLoad(uInput,p);float currentY=decodeU16(px.r);float inCr=float(signedChroma(px.g)),inCb=float(signedChroma(px.b));
+-                if(uFilterLuma==0 && i>0){
+-                    float edge=abs(currentY-previousY)/max(currentY+previousY,1.0);
+-                    if(edge>=0.06){
+-                        /* IRIS_26532_IIR_CHROMA_EDGE_RESET: IIR3 may not carry sky chroma through
+-                         * a leaf boundary. Reset both recursive chroma sections at the edge. */
+-                        float r1=steadyOutput(inCr,uADyn1,uBDyn1,false),q1=steadyOutput(inCb,uADyn1,uBDyn1,false);
+-                        float r2=steadyOutput(r1,uADyn2,uBDyn2,false),q2=steadyOutput(q1,uADyn2,uBDyn2,false);
+-                        c1=steady(inCr,r1);b1=steady(inCb,q1);c2=steady(r1,r2);b2=steady(q1,q2);
+-                    }
+-                }
+                 float y=uFilterLuma!=0?apply(ys,currentY,uA10,uB10,true):currentY;
+                 float r=apply(c1,inCr,uADyn1,uBDyn1,false);float q=apply(b1,inCb,uADyn1,uBDyn1,false);r=apply(c2,r,uADyn2,uBDyn2,false);q=apply(b2,q,uADyn2,uBDyn2,false);
+-                imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));previousY=currentY;
++                imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));
+             }
+         }
+     """.trimIndent()
+@@ -772,18 +734,10 @@ internal object Iris26529SpatialRgbChromaShaders {
+         layout(rgba16ui,binding=2) writeonly uniform highp uimage2D uOutput;
+         $common
+         float scale(float low,float v,float high){return(clamp(v,low,high)-low)/(high-low);}
+-        float edgeProtect(ivec2 p,float centerY){
+-            const ivec2 d[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));float edge=0.0;
+-            for(int i=0;i<4;++i){float ny=decodeU16(imageLoad(uOriginal,safePos(p+d[i])).r);edge=max(edge,abs(centerY-ny)/max(centerY+ny,1.0));}
+-            return smoothstep(0.035,0.10,edge);
+-        }
+         void main(){
+             ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;uvec4 o=imageLoad(uOriginal,p),s=imageLoad(uSmooth,p);
+             int cr=signedChroma(o.g),cb=signedChroma(o.b),sr=signedChroma(s.g),sb=signedChroma(s.b);float errorScale=scale(100.0,decodeU16(s.a)*0.25,300.0);float smoothSat=1.0+float(abs(sr))+float(abs(sb));float normalSat=float(abs(cr))+float(abs(cb));
+             float f=errorScale*scale(0.5,normalSat/smoothSat,1.0);
+-            /* IRIS_26532_BLEND_EDGE_CHROMA_PROTECT: filtered chroma cannot overwrite a strong
+-             * structural edge; flat low-frequency chroma noise remains eligible for cleanup. */
+-            f*=1.0-edgeProtect(p,decodeU16(o.r));
+             o.g=unsignedChroma(int(mix(float(cr),float(sr),f)));o.b=unsignedChroma(int(mix(float(cb),float(sb),f)));o.a=s.a;imageStore(uOutput,p,o);
+         }
+     """.trimIndent()
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index d23d9978614784dce03bdebd86e2f4c3586b8eb7..89e3f8f6e81cc2a3b126b973e11c86e6a140f86c 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -473,6 +473,8 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreReciprocalGreenWeightProgram = 0
+     private var sabreDehomogenizeProgram = 0
+     private var sabreOutputTransformProgram = 0
++    private var sabreRgb16ToFloatProgram = 0
++    private var sabreRgbChromaPostprocessor: GlesIris26529SpatialRgbChromaPostprocessor? = null
+     private var sabreConvertAlignmentSparseProgram = 0
+     private var currentMergeCovariance = 0
+     private var mergeRgbProgram = 0
+@@ -2074,6 +2076,7 @@ internal class GlesMgcRawSpatialStacker(
+             val sabreKernelParameters = MgcSabreKernelTuning.build(
+                 referenceSnr = kernelTuning.referenceSnr,
+                 frameCount = frames.size,
++                mergeGradientThreshold = coreImagingTuning.fusion.mergeGradientThreshold,
+             )
+             val sabreResolveParameters = MgcSabreResolveTuning.build(
+                 referenceSnr = kernelTuning.referenceSnr,
+@@ -2098,6 +2101,8 @@ internal class GlesMgcRawSpatialStacker(
+                     "${sabreKernelParameters.gradientTransition}," +
+                     "${sabreKernelParameters.anisotropyScale}," +
+                     "${sabreKernelParameters.coherenceScale} " +
++                    "forceReferenceColorRgb=${sabreKernelParameters.forceReferenceColorRgb} " +
++                    "mergeGradientThreshold=${coreImagingTuning.fusion.mergeGradientThreshold ?: "adaptive"} " +
+                     "guideColorSpace=sqrt noiseLut=qmc64x10 " +
+                     "alignmentInputGain=${referenceCalibration.alignmentGain} " +
+                     "alignmentDomain=signed-s16",
+@@ -2368,41 +2373,69 @@ internal class GlesMgcRawSpatialStacker(
+             LargeDirectBuffer.free(sabreResolvedRgb)
+             sabreResolvedRgb = null
+             val lensShadingTexture = createLensShadingTexture()
+-            val resolved = createTexture(
+-                width,
+-                height,
+-                if (exportGpuLinearRgbSource &&
+-                    gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F
+-                ) {
+-                    GLES30.GL_RGBA16F
+-                } else {
+-                    GLES30.GL_RGBA16UI
+-                },
+-                GLES30.GL_NEAREST,
+-            )
++            val fullOutput = MgcSpatialRgbRect(0, 0, width, height)
++            val fullOutputTile = MgcSpatialRgbTile(index = 0, outputCore = fullOutput)
++            val chromaPostprocessor = checkNotNull(sabreRgbChromaPostprocessor) {
++                "Iris current-MGC Sabre VGN color noise/IIR postprocessor is not initialized"
++            }
++            chromaPostprocessor.beginFullFrame(listOf(fullOutputTile))
+             renderSabreOutputTransform(
+                 resolvedRgbPlanes = nativeResolvedPlanes,
+                 lensShadingTexture = lensShadingTexture,
+                 finalBlackLevel = sabreResolveFinalBlackLevel,
+                 demosaicWhiteLevel = demosaicWhiteLevel.toFloat(),
+-                output = resolved,
++                output = chromaPostprocessor.normalizationTargetTexture(),
++            )
++            chromaPostprocessor.markBandWritten(fullOutputTile)
++            if (!exportGpuLinearRgbSource) {
++                val outputBytes = width.toLong() * height * 3L * Short.SIZE_BYTES
++                cpuOutput = LargeDirectBuffer.allocate(outputBytes, "MGC Sabre VGN RGB16 output")
++                    ?.order(ByteOrder.nativeOrder()) ?: error(
++                    "Unable to allocate MGC Sabre VGN RGB16 output",
++                )
++            }
++            GlesGpuScheduler.memoryBarrier()
++            val chromaResult = chromaPostprocessor.process(
++                obtainCpuOutput = { checkNotNull(cpuOutput) },
++                deferCpuReadback = exportGpuLinearRgbSource,
++                onFinalSubmitted = if (exportGpuLinearRgbSource) {
++                    { GLES30.glFlush() }
++                } else {
++                    null
++                },
+             )
+-            if (useCurrentGlContext && exportGpuLinearRgbSource) {
+-                GLES30.glFlush()
+-                exportedTexture = resolved
+-                check(textures.remove(resolved)) {
+-                    "Exported Sabre RGB texture is not owned by the processor"
++            var postprocessedUi = chromaResult.exportedTextureId
++            if (exportGpuLinearRgbSource) {
++                check(postprocessedUi != 0) {
++                    "MGC Sabre VGN color noise/IIR did not export its filtered texture"
++                }
++                exportedTexture = if (gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16UI) {
++                    postprocessedUi.also { postprocessedUi = 0 }
++                } else {
++                    createTexture(
++                        width,
++                        height,
++                        GLES30.GL_RGBA16F,
++                        GLES30.GL_NEAREST,
++                    ).also { target ->
++                        renderSabreRgb16ToFloat(postprocessedUi, target)
++                        GLES30.glDeleteTextures(1, intArrayOf(postprocessedUi), 0)
++                        postprocessedUi = 0
++                        check(textures.remove(target)) {
++                            "Exported Sabre RGBA16F texture is not owned by the processor"
++                        }
++                        textureSpecs.remove(target)
++                    }
+                 }
+-                textureSpecs.remove(resolved)
+-            } else {
+-                cpuOutput = readSabreRgb16(resolved)
+             }
+-            checkGlError("MGC Sabre resolve")
++            checkGlError("MGC Sabre Resolve/VGN color noise")
+             returned = true
+             PLog.i(
+                 SABRE_TAG,
+                 "MGC Sabre complete frames=${frames.size} output=${width}x$height " +
+                     "result=${if (exportedTexture != 0) gpuLinearRgbStorage.name + "_GPU" else "RGB16_CPU"} " +
++                    "colorNoiseIir=${chromaResult.chromaSubmissionMs}ms " +
++                    "chromaFinal=${chromaResult.finalSubmissionMs}ms " +
+                     "total=${elapsedMs(processStartNs)}ms",
+             )
+             RawStackResult(
+@@ -3112,6 +3145,61 @@ internal class GlesMgcRawSpatialStacker(
+         )
+     }
+ 
++    private fun createSabreRgbChromaPostprocessor(): GlesIris26529SpatialRgbChromaPostprocessor =
++        GlesIris26529SpatialRgbChromaPostprocessor(
++            imageWidth = width,
++            imageHeight = height,
++            calculationWbGains = calculationWhiteBalance,
++            outputScale = 1f,
++            host = object : GlesIris26529SpatialRgbChromaPostprocessor.Host {
++                override fun linkComputeProgram(source: String, name: String): Int =
++                    this@GlesMgcRawSpatialStacker.linkComputeProgram(source, name)
++
++                override fun createRgba16UiTexture(width: Int, height: Int, label: String): Int =
++                    createTexture(width, height, GLES30.GL_RGBA16UI, GLES30.GL_NEAREST)
++
++                override fun releaseTexture(texture: Int, label: String) =
++                    releaseOwnedTexture(texture, label)
++
++                override fun transferTextureOwnership(texture: Int, label: String) {
++                    check(textures.remove(texture)) { "$label texture=$texture is not owned" }
++                    textureSpecs.remove(texture)
++                }
++
++                override fun uniformLocation(program: Int, name: String): Int =
++                    this@GlesMgcRawSpatialStacker.uniformLocation(program, name)
++
++                override fun checkGlError(label: String) =
++                    this@GlesMgcRawSpatialStacker.checkGlError(label)
++
++                override fun yieldToUiRenderer() = GlesGpuScheduler.yieldToUiRenderer()
++            },
++            exportFullSizeTexture = exportGpuLinearRgbSource,
++        )
++
++    private fun renderSabreRgb16ToFloat(source: Int, target: Int) {
++        check(sabreRgb16ToFloatProgram != 0) {
++            "MGC Sabre VGN RGB16-to-float program is not initialized"
++        }
++        GLES31.glUseProgram(sabreRgb16ToFloatProgram)
++        uniform2i(sabreRgb16ToFloatProgram, "uImageSize", width, height)
++        GLES31.glBindImageTexture(
++            0, source, 0, false, 0, GLES31.GL_READ_ONLY, GLES30.GL_RGBA16UI,
++        )
++        GLES31.glBindImageTexture(
++            1, target, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F,
++        )
++        GLES31.glDispatchCompute(
++            GlesComputeWorkGroup.imageGroupCount(width),
++            GlesComputeWorkGroup.imageGroupCount(height),
++            1,
++        )
++        GlesGpuScheduler.memoryBarrier()
++        GLES31.glBindImageTexture(0, 0, 0, false, 0, GLES31.GL_READ_ONLY, GLES30.GL_RGBA16UI)
++        GLES31.glBindImageTexture(1, 0, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
++        checkGlError("MGC Sabre VGN RGBA16F handoff")
++    }
++
+     private fun readSabreRgb16(texture: Int): ByteBuffer {
+         val outputBytes = width.toLong() * height * 3L * Short.SIZE_BYTES
+         val output = checkNotNull(
+@@ -3248,17 +3336,18 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dehomogenize",
+         )
+         sabreOutputTransformProgram = linkProgram(
+-            if (exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
+-                GlesMgcRawSabreShaders.outputTransformFloat
+-            } else {
+-                GlesMgcRawSabreShaders.outputTransformUint16
+-            },
+-            if (exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
+-                "mgc_sabre_output_transform_rgba16f"
+-            } else {
+-                "mgc_sabre_output_transform_rgba16ui"
+-            },
++            GlesMgcRawSabreShaders.outputTransformUint16,
++            "mgc_sabre_output_transform_rgba16ui_pre_vgn",
+         )
++        if (exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
++            sabreRgb16ToFloatProgram = linkComputeProgram(
++                GlesIris26521SpatialRgbShaders.copyRgb16ToFloat,
++                "mgc_sabre_vgn_rgb16_to_rgba16f",
++            )
++        }
++        sabreRgbChromaPostprocessor = createSabreRgbChromaPostprocessor().also {
++            it.initPrograms()
++        }
+     }
+ 
+     private fun initPrograms(
+@@ -8813,6 +8902,8 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun release() {
++        sabreRgbChromaPostprocessor?.release()
++        sabreRgbChromaPostprocessor = null
+         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
+             if (programs.isNotEmpty()) {
+                 for (program in programs) GLES30.glDeleteProgram(program)
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt b/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt
+index 3447dad0b404557932c7374b82ea16a4ab630672..571772b5b47e07d6c759eceddcb6b06a52a1b57d 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/MgcSabreKernelTuning.kt
+@@ -45,9 +45,15 @@ internal object MgcSabreKernelTuning {
+             )
+     }
+ 
+-    fun build(referenceSnr: Float, frameCount: Int): Parameters {
++    fun build(
++        referenceSnr: Float,
++        frameCount: Int,
++        mergeGradientThreshold: Float? = null,
++    ): Parameters {
+         val finiteSnr = referenceSnr.takeIf { it.isFinite() }?.coerceAtLeast(0f) ?: 0f
+         val effectiveSnr = finiteSnr * sqrt(frameCount.coerceAtLeast(0).toFloat() / 12f)
++        val resolvedGradientThreshold = mergeGradientThreshold
++            ?.takeIf { it.isFinite() }
+         return Parameters(
+             directionalScale = interpolate(
+                 effectiveSnr,
+@@ -60,7 +66,7 @@ internal object MgcSabreKernelTuning {
+                 11f to 4f,
+                 27f to 3f,
+             ),
+-            gradientThreshold = interpolate(
++            gradientThreshold = resolvedGradientThreshold ?: interpolate(
+                 effectiveSnr,
+                 0.9f to 0.01f,
+                 1f to 0.0012f,
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialRejectionGeometry.kt b/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialRejectionGeometry.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bcf71459272d8d2dcfb04913e33e3a70cf3ef2b
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/MgcSpatialRejectionGeometry.kt
+@@ -0,0 +1,50 @@
++package com.hinnka.mycamera.processor
++
++/** Texture domains used by MGC Spatial's rejection pipeline. */
++internal data class MgcSpatialRejectionGeometry(
++    val bayerQuadWidth: Int,
++    val bayerQuadHeight: Int,
++    val guideWidth: Int,
++    val guideHeight: Int,
++    val rejectionWidth: Int,
++    val rejectionHeight: Int,
++    val mergeWeightWidth: Int,
++    val mergeWeightHeight: Int,
++    val filterWidth: Int,
++    val filterHeight: Int,
++)
++
++/**
++ * Current V25 contract:
++ * - GuideImage and GenerateRejectionTexture share RAW/4 extents.
++ * - DilateMask/Downsample2x produce the RAW/8 merge-weight domain.
++ * - The rejection filter works on its further fixed decimation.
++ */
++internal fun mgcSpatialRejectionGeometry(
++    imageWidth: Int,
++    imageHeight: Int,
++    filterDownsample: Int,
++): MgcSpatialRejectionGeometry {
++    require(imageWidth > 0 && imageHeight > 0)
++    require(filterDownsample > 0)
++    val guideWidth = ceilDivMgcV25(imageWidth, 4)
++    val guideHeight = ceilDivMgcV25(imageHeight, 4)
++    val mergeWeightWidth = guideWidth / 2
++    val mergeWeightHeight = guideHeight / 2
++    require(mergeWeightWidth > 0 && mergeWeightHeight > 0)
++    return MgcSpatialRejectionGeometry(
++        bayerQuadWidth = ceilDivMgcV25(imageWidth, 2),
++        bayerQuadHeight = ceilDivMgcV25(imageHeight, 2),
++        guideWidth = guideWidth,
++        guideHeight = guideHeight,
++        rejectionWidth = guideWidth,
++        rejectionHeight = guideHeight,
++        mergeWeightWidth = mergeWeightWidth,
++        mergeWeightHeight = mergeWeightHeight,
++        filterWidth = ceilDivMgcV25(mergeWeightWidth, filterDownsample),
++        filterHeight = ceilDivMgcV25(mergeWeightHeight, filterDownsample),
++    )
++}
++
++private fun ceilDivMgcV25(value: Int, divisor: Int): Int =
++    (value + divisor - 1) / divisor
