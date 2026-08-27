@@ -1,0 +1,762 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawNoiseModel.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawNoiseModel.kt
+index c6da7abc008694e7aef946b7b3c59d1ac27ffa00..53c132aa332e21f1c7fffd79c54f8adb987baead 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawNoiseModel.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawNoiseModel.kt
+@@ -81,18 +81,25 @@ class RawNoiseModel private constructor(
+         fun fromCamera2NoiseProfile(channelPairs: FloatArray): RawNoiseModel {
+             if (channelPairs.size < CHANNEL_COUNT * 2) return EMPTY
+ 
+-            fun coefficient(pair: Int, component: Int): Float =
+-                sanitizeCoefficient(channelPairs.getOrElse(pair * 2 + component) { 0f })
+-            val shotNoise = FloatArray(CHANNEL_COUNT) { coefficient(it, 0) }
+-            val readNoise = FloatArray(CHANNEL_COUNT) { coefficient(it, 1) }
++            /* IRIS_26548_CAMERA2_ZERO_READ_NOISE_VALID
++             * Camera2's variance model is S*x + O. A vendor may legitimately quantize the
++             * low-ISO read-noise offset O to exactly zero; that remains mathematically valid.
++             * Validate the raw coefficients before sanitizeCoefficient() so negative/NaN/Inf
++             * values cannot be silently clamped into a valid-looking profile.
++             */
++            val rawValid = (0 until CHANNEL_COUNT).all { pair ->
++                val s = channelPairs[pair * 2]
++                val o = channelPairs[pair * 2 + 1]
++                s.isFinite() && s > 0f && o.isFinite() && o >= 0f
++            }
++            if (!rawValid) return EMPTY
++
++            val shotNoise = FloatArray(CHANNEL_COUNT) { channelPairs[it * 2] }
++            val readNoise = FloatArray(CHANNEL_COUNT) { channelPairs[it * 2 + 1] }
+             return RawNoiseModel(
+                 shotNoise = shotNoise,
+                 readNoise = readNoise,
+-                // DNG requires S > 0 and O >= 0. Some O channels may legitimately be zero, but
+-                // an all-zero O vector is the Camera2 default seen on devices without a usable
+-                // read-noise profile and cannot drive Spatial's read-only propagation pass.
+-                hasValidCamera2Profile =
+-                    shotNoise.all { it > 0f } && readNoise.any { it > 0f },
++                hasValidCamera2Profile = true,
+                 cfaPhaseOrdered = true,
+             )
+         }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index da82ddf2c9d848445d746584920fe7bbe2d0bf2e..bb548e48680e14d4cfc7bfde40cb0af0be8ecf97 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -447,6 +447,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 // Buffer first; validate timestamp/exposure when shutter is pressed.
+                 synchronized (mZslBufferLock) {
+                     mZslRingBuffer.addLast(img);
++                    if (!mIris26548FirstZslRaw) {
++                        mIris26548FirstZslRaw = true;
++                        Log.i(TAG, "IRIS_26548_FIRST_ZSL_RAW generation="
++                                + mIris26548CameraHealthGeneration + " timestamp=" + img.getTimestamp());
++                    }
+                     /* IRIS_26480_SHORT_RING_HEADROOM_V1
+                      * ImageReader already owns frameCount+3 buffers in Motion.
+                      * Keep up to two extra acquired Images only while the short
+@@ -804,6 +809,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mFlashed = state != null && state == CaptureResult.FLASH_STATE_PARTIAL || state == CaptureResult.FLASH_STATE_FIRED;
+             mPreviewCaptureResult = result;
+             mPreviewCaptureRequest = request;
++            if (!mIris26548FirstCaptureResult) {
++                mIris26548FirstCaptureResult = true;
++                Long iris26548Timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP);
++                Log.i(TAG, "IRIS_26548_FIRST_CAPTURE_RESULT generation="
++                        + mIris26548CameraHealthGeneration + " timestamp=" + iris26548Timestamp);
++            }
+             /* IRIS_26526_SESSION_BOUND_HAL_TELEMETRY
+              * The callback session is immutable for this result. Never infer result
+              * ownership from PreferenceKeys or mutable mCameraDevice. CaptureResult
+@@ -937,6 +948,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+     private volatile IrisCameraRoute mIrisOpeningRoute = null;
+     private volatile IrisCameraRoute mIrisActiveRoute = null;
++    /* IRIS_26548_CAMERA_SESSION_HEALTH_CONTRACT
++     * A configured Camera2 object is not sufficient evidence of a usable camera. Track actual
++     * session/result/preview/RAW flow so startup stalls become recoverable instead of a permanent
++     * black viewfinder followed by an empty frozen Motion batch.
++     */
++    private volatile long mIris26548CameraHealthGeneration = 0L;
++    private volatile boolean mIris26548SessionConfigured = false;
++    private volatile boolean mIris26548RepeatingSubmitted = false;
++    private volatile boolean mIris26548FirstCaptureResult = false;
++    private volatile boolean mIris26548FirstZslRaw = false;
++    private volatile int mIris26548ConsecutiveHealthRecoveries = 0;
++    private static final long IRIS_26548_POST_OPEN_HEALTH_TIMEOUT_MS = 3500L;
+     private final Map<CameraCaptureSession, IrisCameraRoute> mIrisSessionRoutes =
+             Collections.synchronizedMap(new java.util.IdentityHashMap<>());
+     private volatile boolean mIrisZoomCurtainClosed = false;
+@@ -950,6 +973,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             // This method is called when the camera is opened.  We start camera preview here.
+             mCameraOpenCloseLock.release();
+             mCameraDevice = cameraDevice;
++            Log.i(TAG, "IRIS_26548_CAMERA_ON_OPENED generation=" + mIris26548CameraHealthGeneration
++                    + " camera=" + cameraDevice.getId());
++            iris26548SchedulePostOpenHealthCheck(cameraDevice);
+             IrisCameraRoute route = mIrisOpeningRoute;
+             if (route != null && !route.openedDeviceId.equals(cameraDevice.getId())) {
+                 Log.e(TAG, "IRIS_26527_CAMERA_ROUTE_MISMATCH expected="
+@@ -961,6 +987,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+         @Override
+         public void onDisconnected(@NonNull CameraDevice cameraDevice) {
++            Log.e(TAG, "IRIS_26548_CAMERA_ON_DISCONNECTED generation="
++                    + mIris26548CameraHealthGeneration + " camera=" + cameraDevice.getId());
+             mCameraOpenCloseLock.release();
+             cameraDevice.close();
+             mCameraDevice = null;
+@@ -968,6 +996,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+         @Override
+         public void onError(@NonNull CameraDevice cameraDevice, int error) {
++            Log.e(TAG, "IRIS_26548_CAMERA_ON_ERROR generation="
++                    + mIris26548CameraHealthGeneration + " camera=" + cameraDevice.getId()
++                    + " error=" + error);
+             mCameraOpenCloseLock.release();
+             cameraDevice.close();
+             mCameraDevice = null;
+@@ -985,6 +1016,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         @Override
+         public void onSurfaceTextureAvailable(@NonNull SurfaceTexture texture, int width, int height) {
+             try {
++                mIris26548ConsecutiveHealthRecoveries = 0;
++                iris26548BeginCameraHealthGeneration("surface_available");
++                Log.i(TAG, "IRIS_26548_PREVIEW_SURFACE_AVAILABLE width=" + width + " height=" + height);
+                 /* IRIS_26527_SINGLE_ROUTE_AUTHORITY_SURFACE */
+                 IrisCameraRoute route = iris26527ResolveRoute(PhotonCamera.getSettings().mCameraID);
+                 mIrisOpeningRoute = route;
+@@ -2622,6 +2656,71 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         });
+     }
+ 
++    private void iris26548BeginCameraHealthGeneration(String reason) {
++        mIris26548CameraHealthGeneration++;
++        mIris26548SessionConfigured = false;
++        mIris26548RepeatingSubmitted = false;
++        mIris26548FirstCaptureResult = false;
++        mIris26548FirstZslRaw = false;
++        Log.i(TAG, "IRIS_26548_CAMERA_START_REQUESTED generation="
++                + mIris26548CameraHealthGeneration + " reason=" + reason);
++    }
++
++    private boolean iris26548MotionZslHasFrames() {
++        synchronized (mZslBufferLock) {
++            return !mZslRingBuffer.isEmpty();
++        }
++    }
++
++    private boolean iris26548CameraFlowHealthy() {
++        if (!mIris26548SessionConfigured || !mIris26548RepeatingSubmitted
++                || !mIris26548FirstCaptureResult || mTextureView == null
++                || !mTextureView.hasReceivedPreviewFrame()) {
++            return false;
++        }
++        return PhotonCamera.getSettings().selectedMode != CameraMode.MOTION
++                || (mIris26548FirstZslRaw && iris26548MotionZslHasFrames());
++    }
++
++    private void iris26548SchedulePostOpenHealthCheck(@NonNull CameraDevice cameraDevice) {
++        if (mBackgroundHandler == null) return;
++        final long generation = mIris26548CameraHealthGeneration;
++        mBackgroundHandler.postDelayed(() -> {
++            if (generation != mIris26548CameraHealthGeneration
++                    || mCameraDevice != cameraDevice) return;
++            final boolean healthy = iris26548CameraFlowHealthy();
++            Log.i(TAG, "IRIS_26548_CAMERA_HEALTH_CHECK generation=" + generation
++                    + " healthy=" + healthy
++                    + " sessionConfigured=" + mIris26548SessionConfigured
++                    + " repeatingSubmitted=" + mIris26548RepeatingSubmitted
++                    + " firstCaptureResult=" + mIris26548FirstCaptureResult
++                    + " firstPreviewFrame=" + (mTextureView != null && mTextureView.hasReceivedPreviewFrame())
++                    + " firstZslRaw=" + mIris26548FirstZslRaw
++                    + " zslBuffered=" + iris26548MotionZslHasFrames()
++                    + " recoveryCount=" + mIris26548ConsecutiveHealthRecoveries);
++            if (healthy) {
++                mIris26548ConsecutiveHealthRecoveries = 0;
++                return;
++            }
++            // Exactly one automatic restart per unresolved startup episode. The known Motorola-A
++            // missed-surface race is fixed in GLPreview before openCamera(); this watchdog covers
++            // later onOpened/session/repeating stalls without creating a restart loop.
++            if (mIris26548ConsecutiveHealthRecoveries >= 1) {
++                Log.e(TAG, "IRIS_26548_CAMERA_SESSION_STALLED recoverySuppressed=true generation="
++                        + generation);
++                return;
++            }
++            mIris26548ConsecutiveHealthRecoveries++;
++            Log.e(TAG, "IRIS_26548_CAMERA_SESSION_STALLED recovery=single_restart generation="
++                    + generation);
++            activity.runOnUiThread(() -> {
++                if (generation != mIris26548CameraHealthGeneration
++                        || mCameraDevice != cameraDevice) return;
++                restartCamera();
++            });
++        }, IRIS_26548_POST_OPEN_HEALTH_TIMEOUT_MS);
++    }
++
+     @SuppressLint("MissingPermission")
+     public void restartCamera() {
+         Log.d(TAG, "restartCamera() called from \"" + Thread.currentThread().getName() + "\" Thread");
+@@ -2677,6 +2776,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mIrisOpeningRoute = irisRoute;
+         iris26527ApplyRouteToLegacyFields(irisRoute);
+         Log.i(TAG, "IRIS_26527_CAMERA_ROUTE_OPEN " + irisRoute);
++        iris26548BeginCameraHealthGeneration("restart_camera");
+ 
+         // IRIS_26527_ROUTE_RESTART_ORDER: prepare the complete route/output state before the
+         // asynchronous onOpened callback can create a capture session.
+@@ -2690,6 +2790,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             if (!mCameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                 throw new RuntimeException("Time out waiting to lock camera opening.");
+             }
++            Log.i(TAG, "IRIS_26548_CAMERA_OPEN_REQUESTED generation="
++                    + mIris26548CameraHealthGeneration + " camera=" + irisRoute.openedDeviceId
++                    + " restart=true");
+             this.mCameraManager.openCamera(irisRoute.openedDeviceId, mStateCallback, mBackgroundHandler);
+         } catch (CameraAccessException e) {
+             Log.e(TAG, Log.getStackTraceString(e));
+@@ -2844,6 +2947,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 mIrisOpeningRoute = irisRoute;
+                 iris26527ApplyRouteToLegacyFields(irisRoute);
+                 Log.i(TAG, "IRIS_26527_CAMERA_ROUTE_OPEN " + irisRoute);
++                Log.i(TAG, "IRIS_26548_CAMERA_OPEN_REQUESTED generation="
++                        + mIris26548CameraHealthGeneration + " camera=" + irisRoute.openedDeviceId);
+                 this.mCameraManager.openCamera(
+                         irisRoute.openedDeviceId, mStateCallback, mBackgroundHandler);
+             } catch (CameraAccessException e) {
+@@ -3006,6 +3111,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     Surface surface;
+     public void createCameraPreviewSession(boolean isBurstSession) {
+         try {
++            Log.i(TAG, "IRIS_26548_PREVIEW_SESSION_CREATE_BEGIN generation="
++                    + mIris26548CameraHealthGeneration + " burstSession=" + isBurstSession);
+             SurfaceTexture texture = mTextureView.getSurfaceTexture();
+             if (texture == null) {
+                 Log.w(TAG, "createCameraPreviewSession(): SurfaceTexture not ready, waiting for surface");
+@@ -3062,7 +3169,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                      * leaving Motion capture functional while the shutter/UI state remains stale.
+                      */
+                     mState = STATE_PREVIEW;
++                    mIris26548SessionConfigured = true;
+                     Log.i(TAG, "IRIS_26534_SESSION_STATE_RECOVERY state=STATE_PREVIEW sessionConfigured=true");
++                    Log.i(TAG, "IRIS_26548_PREVIEW_SESSION_ON_CONFIGURED generation="
++                            + mIris26548CameraHealthGeneration);
+                     mIrisSessionRoutes.put(cameraCaptureSession, irisSessionRoute);
+                     mIrisActiveRoute = irisSessionRoute;
+                     Log.i(TAG, "IRIS_26527_SESSION_ROUTE_ACTIVE " + irisSessionRoute);
+@@ -3101,6 +3211,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                             //if(mSelectedMode != CameraMode.VIDEO)
+                             mCaptureSession.setRepeatingRequest(mPreviewInputRequest,
+                                     mCaptureCallback, mBackgroundHandler);
++                            mIris26548RepeatingSubmitted = true;
++                            Log.i(TAG, "IRIS_26548_REPEATING_REQUEST_SUBMITTED generation="
++                                    + mIris26548CameraHealthGeneration);
+                             unlockFocus();
+                         }
+                     } catch (Exception e) {
+@@ -4632,7 +4745,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+         android.util.Pair<Double, Double>[] profile = result.get(CaptureResult.SENSOR_NOISE_PROFILE);
+         boolean valid = profile != null && profile.length >= 4;
+-        boolean anyRead = false;
++        boolean allReadZero = valid;
+         if (valid) for (int i = 0; i < 4; i++) {
+             android.util.Pair<Double, Double> q = profile[i];
+             if (q == null || q.first == null || q.second == null
+@@ -4640,10 +4753,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     || q.first <= 0.0 || q.second < 0.0) { valid = false; break; }
+             frame.motionV2NoiseProfile[i * 2] = q.first.floatValue();
+             frame.motionV2NoiseProfile[i * 2 + 1] = q.second.floatValue();
+-            anyRead |= q.second > 0.0;
++            allReadZero &= q.second == 0.0;
+         }
+-        valid &= anyRead;
+         frame.motionV2NoiseProfileValid = valid;
++        if (valid && allReadZero) {
++            Log.i(TAG, "IRIS_26548_CAMERA2_ZERO_READ_NOISE_ACCEPTED timestamp=" + ts
++                    + " source=night_exact_metadata");
++        }
+         frame.motionV2NoiseProfileSource = valid ? "CAMERA2_PER_FRAME" : "UNAVAILABLE";
+         if (valid) {
+             float[] n = frame.motionV2NoiseProfile;
+@@ -4881,15 +4997,17 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             }
+         }
+         android.util.Pair<Double,Double>[] np=result.get(CaptureResult.SENSOR_NOISE_PROFILE);
+-        boolean valid=np!=null&&np.length>=4,anyRead=false;
++        boolean valid=np!=null&&np.length>=4,allReadZero=valid;
+         if(valid)for(int i=0;i<4;i++){
+             android.util.Pair<Double,Double> q=np[i];
+             if(q==null||q.first==null||q.second==null||!Double.isFinite(q.first)||!Double.isFinite(q.second)
+                     ||q.first<=0.0||q.second<0.0){valid=false;break;}
+             frame.motionV2NoiseProfile[i*2]=q.first.floatValue();frame.motionV2NoiseProfile[i*2+1]=q.second.floatValue();
+-            anyRead|=q.second>0.0;
++            allReadZero&=q.second==0.0;
+         }
+-        valid&=anyRead;frame.motionV2NoiseProfileValid=valid;
++        frame.motionV2NoiseProfileValid=valid;
++        if(valid&&allReadZero)Log.i(TAG,"IRIS_26548_CAMERA2_ZERO_READ_NOISE_ACCEPTED timestamp="
++                +frame.timestamp+" source=motion_timestamp_metadata");
+         frame.motionV2NoiseProfileSource=valid?"CAMERA2_PER_FRAME":"UNAVAILABLE";
+         if(valid){float[] p=frame.motionV2NoiseProfile;
+             frame.motionV2NoiseS=(p[0]+0.5f*(p[2]+p[4])+p[6])/3.0f;
+@@ -5179,6 +5297,38 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+ 
++        /* IRIS_26548_MOTION_INPUT_READINESS_GATE
++         * Never transition a Motion shot into the frozen generation when Camera2/session/result
++         * ownership is not live or the shutter-time RAW ring cannot satisfy the existing minimum.
++         * This does not change the healthy Xiaomi path and deliberately does not use
++         * countValidMotionFrames(): exact timestamp metadata keeps its existing 180 ms frozen
++         * metadata grace once RAW frames are physically present.
++         */
++        final int iris26548RequestedMaximum = Math.max(
++                1, Math.min(PhotonCamera.getSettings().frameCount, 37));
++        final int iris26548MinimumRawFrames = Math.min(iris26548RequestedMaximum, 2);
++        final int iris26548BufferedRawFrames;
++        synchronized (mZslBufferLock) {
++            iris26548BufferedRawFrames = mZslRingBuffer.size();
++        }
++        final boolean iris26548SessionReady = mCameraDevice != null
++                && mCaptureSession != null && mPreviewCaptureResult != null;
++        if (!iris26548SessionReady || iris26548BufferedRawFrames < iris26548MinimumRawFrames) {
++            Log.w(TAG, "IRIS_26548_MOTION_NOT_READY_SESSION_OR_ZSL sessionReady="
++                    + iris26548SessionReady + " bufferedRawFrames=" + iris26548BufferedRawFrames
++                    + " minimumRawFrames=" + iris26548MinimumRawFrames
++                    + " cameraDevice=" + (mCameraDevice != null)
++                    + " captureSession=" + (mCaptureSession != null)
++                    + " previewResult=" + (mPreviewCaptureResult != null));
++            com.particlesdevs.photoncamera.util.MotionTrace.processingState(
++                    "IRIS_26548_MOTION_NOT_READY_SESSION_OR_ZSL",
++                    "bufferedRawFrames=" + iris26548BufferedRawFrames
++                            + " minimumRawFrames=" + iris26548MinimumRawFrames
++                            + " sessionReady=" + iris26548SessionReady
++                            + " ringFrozen=false auxRequested=false");
++            return;
++        }
++
+         mZslCapturing = true;
+         burst = false;
+         mMotionTopUpActive = true;
+@@ -5211,11 +5361,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+         mMotionTopUpStartMs = android.os.SystemClock.elapsedRealtime();
+-        mMotionTopUpTargetFrames = Math.max(
+-                1,
+-                Math.min(PhotonCamera.getSettings().frameCount, 37));
++        mMotionTopUpTargetFrames = iris26548RequestedMaximum;
+         /* IRIS_26486_NO_SINGLE_FRAME_FALLBACK */
+-        mMotionTopUpMinimumFrames = Math.min(mMotionTopUpTargetFrames, 2);
++        mMotionTopUpMinimumFrames = iris26548MinimumRawFrames;
+ 
+         int buffered;
+         synchronized (mZslBufferLock) {
+@@ -7244,6 +7392,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             if (mTextureView == null)
+                 mTextureView = new GLPreview(activity);
+             if (mTextureView.isAvailable()) {
++                mIris26548ConsecutiveHealthRecoveries = 0;
++                iris26548BeginCameraHealthGeneration("resume_surface_already_available");
+                 Log.d(TAG,"ID:"+mCameraCharacteristicsMap.get(physicalID));
+                 Size optimal = getPreviewOutputSize(getSafeDisplay(),
+                         mCameraCharacteristicsMap.get(physicalID),
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
+index 8105ff2ff830831b7a4ef83da8104ff4e755f41e..61d1fc81346045b111b14091e11599f550ca2d58 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
+@@ -13,14 +13,14 @@ import java.nio.ByteBuffer;
+ 
+ import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+ import static android.opengl.GLES20.GL_LINEAR;
++import static android.opengl.GLES20.GL_NEAREST;
+ 
+ /**
+- * IRIS_26538_NIGHT_RGBA16F_TWO_BUFFER_INPUT
+- * Dedicated Night post input. MGC already returns full-resolution camera-linear RGBA16F, so Night
+- * uploads that carrier directly into main1, releases the CPU carrier, then allocates only main2.
+- * Thus Night owns exactly two full-resolution half-float GPU textures at post entry. It intentionally
+- * does not allocate Motion's FLOAT32 upload texture
+- * plus main3. No Bayer/RCD/demosaic or legacy Photon Night processing exists in this route.
++ * IRIS_26548_NIGHT_RGBA32F_MOTION_PARITY_INPUT
++ * Dedicated Night RGB input with Motion's proven cross-context representation and GL lifecycle.
++ * MGC/Sabre still owns Night reconstruction and returns completed camera-linear RGB. Only the
++ * transport boundary changes: Night now enters this EGL context as RGBA32F, exactly like healthy
++ * Motion on the Xiaomi 15 Ultra, then uses the established three RGBA16F working textures.
+  */
+ public final class IrisNightRgbInput extends Node {
+     public IrisNightRgbInput() { super("", "IrisNightRgbInput"); }
+@@ -30,45 +30,47 @@ public final class IrisNightRgbInput extends Node {
+     public void Run() {
+         PostPipeline pipeline = (PostPipeline) basePipeline;
+         if (!basePipeline.mParameters.irisNightActive || basePipeline.mParameters.motionV2Active)
+-            throw new IllegalStateException("26538 dedicated Night RGB input used outside Night");
+-        ByteBuffer source = pipeline.irisNightRgba16f;
++            throw new IllegalStateException("26548 dedicated Night RGB input used outside Night");
++        ByteBuffer source = pipeline.irisNightRgba32f;
+         if (source == null)
+-            throw new IllegalStateException("26538 Night RGBA16F carrier is null");
++            throw new IllegalStateException("26548 Night RGBA32F carrier is null");
+ 
+         Point raw = basePipeline.mParameters.rawSize;
+-        long expected = (long) raw.x * (long) raw.y * 4L * 2L;
++        long expected = (long) raw.x * (long) raw.y * 4L * 4L;
+         if (raw.x <= 0 || raw.y <= 0 || source.capacity() < expected)
+-            throw new IllegalStateException("26538 Night RGBA16F carrier too small bytes="
++            throw new IllegalStateException("26548 Night RGBA32F carrier too small bytes="
+                     + source.capacity() + " expectedAtLeast=" + expected);
+ 
+         ByteBuffer view = source.duplicate();
+         view.position(0);
+-        GLFormat rgba16f = new GLFormat(GLFormat.DataType.FLOAT_16, 4);
+-        // IRIS_26546_NIGHT_TRUE_TWO_GPU_BUFFER_INPUT
+-        // main1 is the upload texture itself. There is no third full-resolution upload texture.
+-        basePipeline.main1 = new GLTexture(raw, rgba16f, view, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-        WorkingTexture = basePipeline.main1;
++        WorkingTexture = new GLTexture(
++                raw,
++                new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                view,
++                GL_NEAREST,
++                GL_CLAMP_TO_EDGE);
+ 
+         // glTexSubImage2D has consumed the client bytes before GLTexture construction returns.
+-        // Transfer/free the ~96 MiB CPU carrier before allocating main2 to bound peak residency.
+-        pipeline.irisNightRgba16f = null;
++        // Release the ~192 MiB CPU transfer carrier before allocating the working ping-pong set.
++        pipeline.irisNightRgba32f = null;
+         Allocator.free(source);
+         source = null;
+         view = null;
+-        Log.critical(Name, "IRIS_26546_NIGHT_CPU_RGBA16F_RELEASED_AFTER_UPLOAD bytes=" + expected);
++        Log.critical(Name, "IRIS_26548_NIGHT_CPU_RGBA32F_RELEASED_AFTER_UPLOAD bytes=" + expected);
+ 
+         GLFormat work = new GLFormat(GLFormat.DataType.FLOAT_16, GLDrawParams.WorkDim);
++        basePipeline.main1 = new GLTexture(raw, work, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+         basePipeline.main2 = new GLTexture(raw, work, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-        basePipeline.main3 = null;
+-        // main1 is current input; first downstream getMain() must return main2, preventing aliasing.
+-        basePipeline.texnum = 1;
++        basePipeline.main3 = new GLTexture(raw, work, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
++        basePipeline.texnum = 0;
+         glProg.closed = true;
+ 
+-        Log.i(Name, "IRIS_26546_NIGHT_RGBA16F_TRUE_TWO_BUFFER_INPUT"
+-                + " carrier=fullResCameraLinearRGBA16F"
+-                + " uploadIsMain1=true main1=true main2=true main3=false texnum=1"
+-                + " cpuCarrierReleasedBeforeMain2=true"
+-                + " float32Expansion=false rcd=false demosaic=false photonNight=false"
++        Log.i(Name, "IRIS_26548_NIGHT_RGBA32F_MOTION_PARITY_INPUT"
++                + " carrier=fullResCameraLinearRGBA32F"
++                + " uploadSeparate=true main1=true main2=true main3=true texnum=0"
++                + " cpuCarrierReleasedBeforePingPong=true"
++                + " rcd=false demosaic=false photonNight=false"
++                + " transportOnly=true reconstructionMathUnchanged=true"
+                 + " bytes=" + expected);
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index be0e7a6ab3384b3ee995b39aecd14b650a21ed4c..c122d9d02df75a2c95947c57cdeb5ece844db7e3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -30,8 +30,9 @@ public class PostPipeline extends GLBasePipeline {
+ 
+     /* IRIS_26414_MOTION_V2_FLOAT_CFA_HANDOFF */
+     public ByteBuffer motionV2FloatCfa;
+-    /* IRIS_26538 dedicated Night native half-float carrier; Motion FLOAT32 contract stays separate. */
+-    public ByteBuffer irisNightRgba16f;
++    /* IRIS_26548 Night uses Motion's proven RGBA32F cross-context CPU carrier;
++     * Night capture/reconstruction/post ownership remains separate. */
++    public ByteBuffer irisNightRgba32f;
+     /* IRIS_26501_FULL_RES_CAMERA_RGB_BRIDGE */
+     public boolean motionV2DirectRgbCarrier = false;
+     /* IRIS_26492_EXPLICIT_HIGHLIGHT_PROVENANCE_BRIDGE */
+@@ -181,7 +182,7 @@ public class PostPipeline extends GLBasePipeline {
+ 
+     public Bitmap RunIrisNightRgb(ByteBuffer spatialRgb, Parameters parameters) {
+         if (spatialRgb == null) throw new IllegalArgumentException("26535 Iris Night Spatial RGB is null");
+-        irisNightRgba16f = spatialRgb;
++        irisNightRgba32f = spatialRgb;
+         motionV2FloatCfa = null;
+         motionV2DirectRgbCarrier = false;
+         motionV2HighlightProvenance = null;
+@@ -190,9 +191,9 @@ public class PostPipeline extends GLBasePipeline {
+         irisMotionRcdActive = false;
+         irisMotionDirectRgbAuxiliary = null;
+         Log.processState("PostPipeline", "NIGHT_POST_PIPELINE_ENTER");
+-        Log.critical("PostPipeline", "IRIS_26544_NIGHT_SPATIAL_RGB_POST_ENTRY carrier=RGBA16F"
++        Log.critical("PostPipeline", "IRIS_26548_NIGHT_SPATIAL_RGB_POST_ENTRY carrier=RGBA32F"
+                 + " bytes=" + spatialRgb.capacity()
+-                + " dedicatedNightInput=true twoBuffer=true rcd=false demosaic=false"
++                + " dedicatedNightInput=true motionParityLifecycle=true rcd=false demosaic=false"
+                 + " lifecycleOwner=night_self_closing");
+         try {
+             Log.processState("PostPipeline", "NIGHT_POST_RUN_BEGIN");
+@@ -203,18 +204,18 @@ public class PostPipeline extends GLBasePipeline {
+                     + (result == null ? "null" : (result.getWidth() + "x" + result.getHeight())));
+             return result;
+         } finally {
+-            // IRIS_26546_NIGHT_RGBA16F_POST_OWNERSHIP
++            // IRIS_26548_NIGHT_RGBA32F_POST_OWNERSHIP
+             // RunIrisNightRgb owns the carrier once entered. IrisNightRgbInput frees it immediately
+             // after successful upload; if setup fails earlier, this fallback is the sole release.
+-            ByteBuffer unreleasedNightCarrier = irisNightRgba16f;
+-            irisNightRgba16f = null;
++            ByteBuffer unreleasedNightCarrier = irisNightRgba32f;
++            irisNightRgba32f = null;
+             if (unreleasedNightCarrier != null) {
+                 try {
+                     Allocator.free(unreleasedNightCarrier);
+-                    Log.critical("PostPipeline", "IRIS_26546_NIGHT_CPU_RGBA16F_FALLBACK_RELEASE bytes="
++                    Log.critical("PostPipeline", "IRIS_26548_NIGHT_CPU_RGBA32F_FALLBACK_RELEASE bytes="
+                             + unreleasedNightCarrier.capacity());
+                 } catch (Throwable releaseFailure) {
+-                    Log.e("PostPipeline", "IRIS_26546_NIGHT_CPU_RGBA16F_FALLBACK_RELEASE_FAILED", releaseFailure);
++                    Log.e("PostPipeline", "IRIS_26548_NIGHT_CPU_RGBA32F_FALLBACK_RELEASE_FAILED", releaseFailure);
+                 }
+             }
+             // IRIS_26539_NIGHT_POST_OWNER_CLOSE_BEFORE_JIN
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index 9b36f5270af569b4bdf1d8c7c6b8d8bb7f8c4971..0109819918d20f73aad41db12b82cf61005e29a0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -128,7 +128,7 @@ public final class IrisNightProcessor {
+             }
+             ByteBuffer rgb = r.raw;
+             rgb.position(0);
+-            final long expectedRgbBytes = (long) width * (long) height * 4L * 2L;
++            final long expectedRgbBytes = (long) width * (long) height * 4L * 4L;
+             if (rgb.capacity() < expectedRgbBytes) {
+                 throw new IllegalStateException("26540 Night RGB carrier too small bytes="
+                         + rgb.capacity() + " expectedAtLeast=" + expectedRgbBytes);
+@@ -140,7 +140,7 @@ public final class IrisNightProcessor {
+             Log.processState(TAG, "NIGHT_MGC_COMPLETE");
+             Log.critical(TAG, "IRIS_26544_NIGHT_MGC_COMPLETE inputFrames=" + r.inputFrames
+                     + " effectiveSupport=" + r.effectiveSupport
+-                    + " rgba16fBytes=" + rgb.capacity());
++                    + " rgba32fBytes=" + rgb.capacity());
+ 
+             if (batch.saveRaw >= 1) {
+                 Log.processState(TAG, "NIGHT_DNG_BEGIN");
+@@ -222,7 +222,7 @@ public final class IrisNightProcessor {
+             Log.critical(TAG, "IRIS_26546_NIGHT_POST_RGB_COMPLETE bitmap="
+                     + (img == null ? "null" : (img.getWidth() + "x" + img.getHeight()))
+                     + " cpuCarrierOwnership=postPipeline");
+-            Log.i(TAG, "IRIS_26540_NIGHT_RGBA16F_RELEASED_BEFORE_JIN bytes=" + expectedRgbBytes);
++            Log.i(TAG, "IRIS_26548_NIGHT_RGBA32F_RELEASED_BEFORE_JIN bytes=" + expectedRgbBytes);
+             if (android.os.Build.VERSION.SDK_INT >= 34 && img != null
+                     && !img.isRecycled() && img.hasGainmap()) {
+                 throw new IllegalStateException("26540 Night pre-Jin UltraHDR is forbidden");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 527b1e3f291ec7cfcf7454d6fa85aeaa72b072c0..a85c04a7bda37252be7d88e23fe4f880f518d879 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -554,20 +554,16 @@ object PhotonMotionMgc1271Bridge {
+             }
+             iris26535DenoiseMs = (System.nanoTime() - iris26535DenoiseStartNs) / 1_000_000L
+             forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+-            /* IRIS_26538_NIGHT_NATIVE_RGBA16F_HANDOFF
+-             * MGC already owns the finished full-resolution camera RGB as RGBA16F. Motion keeps
+-             * its established FLOAT32 cross-context contract byte-for-byte, but Night no longer
+-             * expands the ~96 MiB half-float carrier into a ~192 MiB FLOAT32 carrier only to
+-             * upload it and immediately process through RGBA16F ping-pong textures.
++            /* IRIS_26548_NIGHT_RGBA32F_MOTION_PARITY_HANDOFF
++             * 26547 proved that the Night-only native-half CPU handoff can reach a native status-11
++             * crash at the first PostPipeline input. GLTexture's FLOAT_16 internal format uses a
++             * GL_FLOAT client upload contract, while that Night ByteBuffer physically contains
++             * 16-bit half values. Reuse Motion's already-proven cross-context contract instead:
++             * convert the finished MGC RGBA16F texture to an RGBA32F CPU carrier inside the MGC
++             * context, then let the PostPipeline upload the exact same representation Motion uses.
++             * Reconstruction/Sabre/VGN math is unchanged.
+              */
+-            val nightNativeHalfCarrier = parameters.irisNightActive
+-            val output: ByteBuffer = if (nightNativeHalfCarrier) {
+-                halfBuffer = null // ownership transfers to the returned Night result
+-                denoiseBuffer.position(0)
+-                denoiseBuffer
+-            } else {
+-                convertHalfRgbaToFloatRgba(denoiseBuffer, size.x, size.y)
+-            }
++            val output: ByteBuffer = convertHalfRgbaToFloatRgba(denoiseBuffer, size.x, size.y)
+             GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
+             resultTexture = 0
+             checkGl("delete exported MGC RGB")
+@@ -697,7 +693,7 @@ object PhotonMotionMgc1271Bridge {
+                 "denoise=${if (sabreSelected) "SABRE_RESOLVE_PLUS_SABRE_DEFAULT_RESIDUAL" else "SPATIAL_DEFAULT_ADAPTIVE_LUMA_CHROMA"} " +
+                 "baselineEv=${stacked.baselineExposureEv} " +
+                 "displayGain=${parameters.motionV2DisplayGain} " +
+-                "crossContext=${if (parameters.irisNightActive) "rgba16f_cpu_night" else "float32_rgba_cpu_motion"} alphaSupport=disabled")
++                "crossContext=${if (parameters.irisNightActive) "float32_rgba_cpu_night_motion_parity" else "float32_rgba_cpu_motion"} alphaSupport=disabled")
+ 
+             superResOutputsHandedOff = true
+             return MotionV2Merger.Result(
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java
+index b10cdbe247e47ae0de5b9031db2df4277fa8e588..a234e09dd9da5d3eb9692563502fa21321188dff 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/GLPreview.java
+@@ -24,6 +24,18 @@ public class GLPreview extends GLSurfaceView {
+     public Point cameraSize;
+     private TextureView.SurfaceTextureListener surfaceTextureListener;
+     private Handler handler;
++    /* IRIS_26548_PREVIEW_SURFACE_HANDSHAKE
++     * GLSurfaceView can create MainRenderer's camera SurfaceTexture before CaptureController
++     * installs the TextureView-style listener. Keep the real surface generation as durable state
++     * and replay it exactly once instead of dropping the event and leaving Camera2 unopened.
++     */
++    private final Object surfaceTextureStateLock = new Object();
++    private SurfaceTexture currentSurfaceTexture;
++    private int currentSurfaceWidth;
++    private int currentSurfaceHeight;
++    private long surfaceTextureGeneration = 0L;
++    private long deliveredSurfaceTextureGeneration = -1L;
++    private volatile boolean previewFrameReceived = false;
+ 
+     public GLPreview(Context context) {
+         super(context);
+@@ -47,16 +59,62 @@ public class GLPreview extends GLSurfaceView {
+     }
+ 
+     public void fireOnSurfaceTextureAvailable(SurfaceTexture surfaceTexture, int w, int h) {
++        if (surfaceTexture == null) return;
+         handler.post(() -> {
+-            if (surfaceTextureListener != null)
+-                surfaceTextureListener.onSurfaceTextureAvailable(surfaceTexture, w, h);
++            TextureView.SurfaceTextureListener listenerToNotify = null;
++            long generation;
++            synchronized (surfaceTextureStateLock) {
++                if (currentSurfaceTexture != surfaceTexture) {
++                    currentSurfaceTexture = surfaceTexture;
++                    currentSurfaceWidth = w;
++                    currentSurfaceHeight = h;
++                    surfaceTextureGeneration++;
++                    deliveredSurfaceTextureGeneration = -1L;
++                    previewFrameReceived = false;
++                } else {
++                    currentSurfaceWidth = w;
++                    currentSurfaceHeight = h;
++                }
++                available = true;
++                generation = surfaceTextureGeneration;
++                if (surfaceTextureListener != null
++                        && deliveredSurfaceTextureGeneration != generation) {
++                    deliveredSurfaceTextureGeneration = generation;
++                    listenerToNotify = surfaceTextureListener;
++                }
++            }
++            Log.i("GLPreview", "IRIS_26548_PREVIEW_SURFACE_CREATED generation=" + generation
++                    + " listenerPresent=" + (listenerToNotify != null));
++            if (listenerToNotify != null) {
++                listenerToNotify.onSurfaceTextureAvailable(surfaceTexture, w, h);
++                Log.i("GLPreview", "IRIS_26548_PREVIEW_SURFACE_DELIVERED generation=" + generation
++                        + " replay=false");
++            }
+         });
+     }
+ 
+     public void fireOnSurfaceTextureDestroyed(SurfaceTexture surfaceTexture) {
+         handler.post(() -> {
+-            if (surfaceTextureListener != null)
+-                surfaceTextureListener.onSurfaceTextureDestroyed(surfaceTexture);
++            TextureView.SurfaceTextureListener listenerToNotify;
++            long generation;
++            synchronized (surfaceTextureStateLock) {
++                if (surfaceTexture != null && currentSurfaceTexture != null
++                        && currentSurfaceTexture != surfaceTexture) {
++                    return;
++                }
++                listenerToNotify = surfaceTextureListener;
++                currentSurfaceTexture = null;
++                currentSurfaceWidth = 0;
++                currentSurfaceHeight = 0;
++                available = false;
++                surfaceTextureGeneration++;
++                generation = surfaceTextureGeneration;
++                deliveredSurfaceTextureGeneration = -1L;
++                previewFrameReceived = false;
++            }
++            Log.i("GLPreview", "IRIS_26548_PREVIEW_SURFACE_DESTROYED generation=" + generation);
++            if (listenerToNotify != null && surfaceTexture != null)
++                listenerToNotify.onSurfaceTextureDestroyed(surfaceTexture);
+         });
+     }
+ 
+@@ -196,15 +254,52 @@ public class GLPreview extends GLSurfaceView {
+         }
+     }
+ 
+-    boolean available = false;
++    volatile boolean available = false;
+ 
+     public boolean isAvailable() {
+-        return available;
++        return available && currentSurfaceTexture != null;
+     }
+ 
+     public void setSurfaceTextureListener(TextureView.SurfaceTextureListener l) {
+-        this.surfaceTextureListener = l;
+-        available = true;
++        SurfaceTexture replaySurface;
++        int replayWidth;
++        int replayHeight;
++        long replayGeneration;
++        synchronized (surfaceTextureStateLock) {
++            this.surfaceTextureListener = l;
++            available = currentSurfaceTexture != null;
++            replaySurface = currentSurfaceTexture;
++            replayWidth = currentSurfaceWidth;
++            replayHeight = currentSurfaceHeight;
++            replayGeneration = surfaceTextureGeneration;
++        }
++        if (l == null || replaySurface == null) return;
++        handler.post(() -> {
++            synchronized (surfaceTextureStateLock) {
++                if (surfaceTextureListener != l
++                        || currentSurfaceTexture != replaySurface
++                        || surfaceTextureGeneration != replayGeneration
++                        || deliveredSurfaceTextureGeneration == replayGeneration) {
++                    return;
++                }
++                deliveredSurfaceTextureGeneration = replayGeneration;
++            }
++            Log.i("GLPreview", "IRIS_26548_PREVIEW_SURFACE_REPLAY generation="
++                    + replayGeneration);
++            l.onSurfaceTextureAvailable(replaySurface, replayWidth, replayHeight);
++            Log.i("GLPreview", "IRIS_26548_PREVIEW_SURFACE_DELIVERED generation="
++                    + replayGeneration + " replay=true");
++        });
++    }
++
++    public boolean hasReceivedPreviewFrame() {
++        return previewFrameReceived;
++    }
++
++    public void fireOnPreviewFrameAvailable() {
++        if (previewFrameReceived) return;
++        previewFrameReceived = true;
++        Log.i("GLPreview", "IRIS_26548_FIRST_PREVIEW_FRAME");
+     }
+ 
+     public void scale(int in_width, int in_height, int out_width, int out_height, int or) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index dab2015a5d55d247d323031c2c33130ed6e3683c..7dcbc64e69ca8b659a18384522221df437049397 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -126,6 +126,7 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+ 
+     public synchronized void onFrameAvailable(SurfaceTexture st) {
+         mUpdateST = true;
++        mView.fireOnPreviewFrameAvailable();
+         mView.requestRender();
+     }
+ 
+diff --git a/app/version.properties b/app/version.properties
+index ae97098c54377e1b0edb204ff21b93c03b771ae7..59791efa93feddf520bb8b7ac61267c3176db292 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726547
+-VERSION_BUILD=26547
++VERSION_NAME=0.9726548
++VERSION_BUILD=26548
