@@ -178,27 +178,55 @@ PY
 pass "sealed 15-file V1.2 handoff; no backup branch; repository app source untouched"
 
 echo "=== 26548 V1.2 GATE 1: recover exact successful compiled 26548 V1 authority ==="
-URL="https://api.github.com/repos/${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}/actions/artifacts/${BASE_ARTIFACT_ID}/zip"
+REPO_API="https://api.github.com/repos/${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}"
+RUN_META="$WORK/26548_v1_base_run.json"
+RUN_URL="$REPO_API/actions/runs/${BASE_RUN_ID}"
+ART_URL="$REPO_API/actions/artifacts/${BASE_ARTIFACT_ID}/zip"
+# Permanent V1.2 regression: prove success from GitHub run metadata and persisted artifact files.
+# Never require a console-only echo such as `26548 V1 BUILD SUCCESS` to exist inside the artifact.
 curl --fail --location --silent --show-error --retry 5 \
   -H "Authorization: Bearer $TOKEN" \
   -H "Accept: application/vnd.github+json" \
   -H "X-GitHub-Api-Version: 2022-11-28" \
-  "$URL" -o "$ARTZIP"
+  "$RUN_URL" -o "$RUN_META"
+python3 - "$RUN_META" "$BASE_RUN_ID" "$BASE_SUCCESS_COMMIT" "$EXPECTED_BRANCH" <<'PYRUN'
+import json, sys
+p, run_id, commit, branch = sys.argv[1:]
+d = json.load(open(p, 'r', encoding='utf-8'))
+assert str(d.get('id')) == run_id, f"run id mismatch: {d.get('id')}"
+assert d.get('conclusion') == 'success', f"base run conclusion is {d.get('conclusion')}"
+assert d.get('head_sha') == commit, f"base run head_sha mismatch: {d.get('head_sha')}"
+assert d.get('head_branch') == branch, f"base run branch mismatch: {d.get('head_branch')}"
+print('PASS: exact prior Actions run metadata proves success/commit/branch')
+PYRUN
+curl --fail --location --silent --show-error --retry 5 \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Accept: application/vnd.github+json" \
+  -H "X-GitHub-Api-Version: 2022-11-28" \
+  "$ART_URL" -o "$ARTZIP"
 [[ "$(sha "$ARTZIP")" == "$BASE_ARTIFACT_SHA" ]] || fail "26548 V1 artifact ZIP SHA mismatch"
 unzip -q "$ARTZIP" -d "$ARTDIR"
 BASE_OUT="$ARTDIR/build_26548_v1_integrated_night_moto_compat_outputs"
 BASE_TAR="$BASE_OUT/26548_V1_candidate_app_source.tar.gz"
 BASE_AUDITED="$BASE_OUT/26548_V1_candidate_source.sha256"
 BASE_APK_HASH="$BASE_OUT/26548_V1_APK.sha256"
+BASE_COMPILER="$BASE_OUT/26548_V1_COMPILER_STATUS.txt"
 BASE_REPORT="$BASE_OUT/26548_V1_STRICT_HANDOFF_REPORT.txt"
-[[ -f "$BASE_TAR" && -f "$BASE_AUDITED" && -f "$BASE_APK_HASH" && -f "$BASE_REPORT" ]] || fail "26548 V1 artifact lacks exact compiled candidate authority"
+[[ -f "$BASE_TAR" && -f "$BASE_AUDITED" && -f "$BASE_APK_HASH" && -f "$BASE_COMPILER" && -f "$BASE_REPORT" ]] || fail "26548 V1 artifact lacks exact compiled candidate/proof authority"
 [[ "$(sha "$BASE_TAR")" == "$BASE_TAR_SHA" ]] || fail "26548 V1 candidate TAR SHA mismatch"
 [[ "$(sha "$BASE_AUDITED")" == "$BASE_MANIFEST_SHA" ]] || fail "26548 V1 audited manifest SHA mismatch"
 cmp -s "$BASE_AUDITED" "$BASE_PIN" || fail "artifact audited manifest is not exact packaged base pin"
 grep -F "$BASE_APK_SHA" "$BASE_APK_HASH" >/dev/null || fail "26548 V1 tested APK hash mismatch"
-for proof in 'REAL KOTLIN COMPILE: PASS' 'REAL JAVA COMPILE: PASS' 'FULL ANDROID ASSEMBLE: PASS' \
-             'POST-BUILD INVARIANCE: PASS' '26548 V1 BUILD SUCCESS'; do
-  grep -F "$proof" "$BASE_REPORT" >/dev/null || fail "base artifact missing proof: $proof"
+for proof in 'REAL GLSL COMPILE: PASS' 'REAL KOTLIN COMPILE: PASS' 'REAL JAVA COMPILE: PASS' \
+             'FULL ANDROID ASSEMBLE: PASS' 'POST-BUILD INVARIANCE: PASS'; do
+  grep -F "$proof" "$BASE_COMPILER" >/dev/null || fail "base compiler-status file missing persisted proof: $proof"
+done
+for proof in 'RUNTIME OWNERSHIP: PASS' 'DORMANT-OWNER REJECTION: PASS' 'EXACT PRIOR RUNTIME AUTHORITY: PASS' \
+             'NIGHT RGBA32F TRANSPORT CORRECTION: PASS' 'XIAOMI MOTION IQ INVARIANCE: PASS' \
+             'FORWARD PATCH FUZZ=0: PASS' 'ROLLBACK PATCH FUZZ=0: PASS' \
+             'POST-BUILD INVARIANCE: PASS' 'CLEAN ARTIFACT SOURCE EXPORT: PASS' \
+             'TARGET VERSION/BUILD: 0.9726548 / 26548 V1'; do
+  grep -F "$proof" "$BASE_REPORT" >/dev/null || fail "base strict report missing persisted proof: $proof"
 done
 tar -xzf "$BASE_TAR" -C "$BASE"
 manifest_audited "$BASE" "$OUT/26548_V1_2_base_reconstructed.sha256"
