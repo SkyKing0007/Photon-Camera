@@ -19,6 +19,9 @@ PY
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="8e4904530e767ac8bdd3fbf3ec8d81e98cd6e8ec"
+FAILED_V1_HANDOFF_COMMIT="426190836e6ff702c7f22021a4f5b1afbfe2d97f"
+FAILED_V1_RUN_ID="33175316346"
+FAILED_V1_JOB_ID="98862299994"
 BASE_RUN_ID="33143648461"
 BASE_ARTIFACT_ID="9674993907"
 BASE_ARTIFACT_NAME="photon-26552-v1-1-dynamic-night-vgn-shutter-ring"
@@ -48,7 +51,7 @@ VENDOR_PIN="$ROOT/V1_26553_NATIVE_VENDOR_DEPENDENCIES.sha256"
 OUT="$ROOT/build_26553_v1_shutter_night_vgn_moto_diagnostic_outputs"
 WORK="$ROOT/.build_26553_v1_shutter_night_vgn_moto_diagnostic_work"
 ARTZIP="$WORK/26552_v1_1_artifact.zip"; ARTDIR="$WORK/26552_v1_1_artifact"; BASE="$WORK/exact_26552_v1_1_compiled_candidate"; AFTER="$WORK/candidate_26553"; PATCHREPO="$WORK/patchrepo"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-shutter-night-vgn-moto-diagnostic-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-1-shutter-night-vgn-moto-diagnostic-debug.apk"
 mapfile -t RUNTIME_FILES < "$RUNTIME_LIST"; [[ "${#RUNTIME_FILES[@]}" -eq 5 ]] || fail "runtime inventory is not 5 files"
 rm -rf "$OUT" "$WORK"; rm -f "$FINAL"; mkdir -p "$OUT" "$WORK" "$ARTDIR" "$BASE" "$AFTER"
 cat > "$OUT/26553_V1_COMPILER_STATUS.txt" <<'EOF'
@@ -79,7 +82,7 @@ ROLLBACK PATCH FUZZ=0: NOT RUN
 POST-BUILD INVARIANCE: NOT RUN
 CLEAN ARTIFACT SOURCE EXPORT: NOT RUN
 BACKUP: NOT REQUIRED (localized correction/diagnostics)
-TARGET VERSION/BUILD: 0.9726553 / 26553 V1
+TARGET VERSION/BUILD: 0.9726553 / 26553 V1.1
 EOF
 set_report(){ python3 - "$OUT/26553_V1_STRICT_HANDOFF_REPORT.txt" "$1" "$2" <<'PY'
 from pathlib import Path
@@ -94,7 +97,8 @@ PY
 
 echo "=== 26553 GATE 0: sealed handoff / branch / exact package ==="
 [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-[[ "$(git rev-parse HEAD^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "26553 handoff parent is not exact successful 26552 V1.1 commit"
+[[ "$(git rev-parse HEAD^)" == "$FAILED_V1_HANDOFF_COMMIT" ]] || fail "26553 V1.1 handoff parent is not exact failed V1 handoff commit"
+[[ "$(git rev-parse "${FAILED_V1_HANDOFF_COMMIT}^")" == "$BASE_SUCCESS_COMMIT" ]] || fail "failed 26553 V1 handoff does not descend directly from successful 26552 V1.1 runtime commit"
 [[ -n "$TOKEN" ]] || fail "GitHub token unavailable"
 sha256sum -c "$HANDOFF_HASHES"
 python3 -m py_compile "$VALIDATE" "$EXTRACT_GLSL" "$SCAN_GLSL"
@@ -110,6 +114,42 @@ bash -n "$0"
 [[ "$(wc -l < "$VENDOR_PIN")" -eq 778 ]] || fail "vendor manifest count"
 [[ "$(wc -l < "$RUNTIME_GLSL_PIN")" -eq 2 ]] || fail "expanded GLSL pin count"
 grep -F "$BASE_TAR_SHA" "$BASE_TAR_PIN" >/dev/null || fail "base TAR pin drift"
+python3 - "$RUNTIME_LIST" "$BASE_PIN" "$BASE_TAR_PIN" "$CAND_PIN" "$PREWRITE" "$RUNTIME_GLSL_PIN" "$VENDOR_PIN" "$HANDOFF_HASHES" <<'PYMANIFEST'
+from pathlib import Path, PurePosixPath
+import re, sys
+runtime = [x.strip() for x in Path(sys.argv[1]).read_text().splitlines() if x.strip()]
+manifest_paths = sys.argv[2:]
+def nonportable(entry):
+    return (entry.startswith('/') or entry.startswith('\\\\') or
+            re.match(r'^[A-Za-z]:[\\/]',entry) is not None or '\\' in entry or
+            '..' in PurePosixPath(entry).parts)
+# Permanent regression for run 33175316346/job 98862299994: the exact failed path
+# must be rejected by the very same predicate used for packaged manifests.
+synthetic='/mnt/data/26553_base/app/version.properties'
+if not nonportable(synthetic):
+    raise SystemExit('absolute-path regression self-test failed to reject exact Actions path')
+for name in manifest_paths:
+    p = Path(name)
+    entries=[]
+    for lineno,line in enumerate(p.read_text().splitlines(),1):
+        if not line.strip():
+            continue
+        parts=line.split(maxsplit=1)
+        if len(parts)!=2 or not re.fullmatch(r'[0-9a-fA-F]{64}',parts[0]):
+            raise SystemExit(f'{p.name}:{lineno}: malformed SHA-256 manifest line')
+        entry=parts[1].lstrip('*')
+        if nonportable(entry):
+            raise SystemExit(f'{p.name}:{lineno}: non-portable/absolute path rejected: {entry!r}')
+        entries.append(entry)
+    if not entries:
+        raise SystemExit(f'{p.name}: empty SHA manifest')
+prewrite = []
+for line in Path(sys.argv[5]).read_text().splitlines():
+    if line.strip(): prewrite.append(line.split(maxsplit=1)[1].lstrip('*'))
+if prewrite != runtime:
+    raise SystemExit(f'prewrite manifest paths differ from exact runtime inventory: {prewrite!r} != {runtime!r}')
+print('PASS: relative-path SHA manifests; exact 26553 V1 /mnt/data regression rejected')
+PYMANIFEST
 python3 - "$BASE_SUCCESS_COMMIT" <<'PY'
 import subprocess,sys
 base=sys.argv[1]
@@ -276,4 +316,4 @@ VENDOR MANIFEST SHA-256: ${VENDOR_MANIFEST_SHA}
 EOF
 cat "$OUT/26553_V1_COMPILER_STATUS.txt"; cat "$OUT/26553_V1_STRICT_HANDOFF_REPORT.txt"
 echo "PRE-BUILD SAFETY PROOF PASSED"
-echo "26553 V1 BUILD SUCCESS"
+echo "26553 V1.1 BUILD SUCCESS"
