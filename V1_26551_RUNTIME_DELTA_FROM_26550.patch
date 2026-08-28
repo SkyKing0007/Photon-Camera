@@ -1,0 +1,273 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 189de4933b2f395cb39af3693aab80146d55a868..af255474d3d8cc697a8f2e7b0ec3373eb1e36386 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -689,7 +689,23 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     //*****************************************************************************************************************
+ 
+     private class CameraEventsListenerImpl extends CameraEventsListener {
+-        private boolean iris26550NightUiRearmPending = false;
++        /* IRIS_26551_CAPTURE_UI_OWNER
++         * Capture-progress/countdown callbacks belong to the mode that started the burst.
++         * A late callback from a completed/retired mode must never repaint the destination mode.
++         */
++        private CameraMode iris26551CaptureUiMode = null;
++
++        private boolean iris26551CaptureUiIsCurrent(String event) {
++            final CameraMode currentMode = PhotonCamera.getSettings().selectedMode;
++            final boolean current = iris26551CaptureUiMode == null
++                    || iris26551CaptureUiMode == currentMode;
++            if (!current) {
++                Log.i(TAG, "IRIS_26551_STALE_UI_REJECT event=" + event
++                        + " sourceMode=" + iris26551CaptureUiMode
++                        + " currentMode=" + currentMode);
++            }
++            return current;
++        }
+         /**
+          * Implementation of {@link ProcessingEventsListener}
+          */
+@@ -721,11 +737,6 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         @Override
+         public void onProcessingFinished(Object obj) {
+             logD("onProcessingFinished: " + obj);
+-            final boolean iris26550NightFinished = obj instanceof String
+-                    && ((String) obj).startsWith("Iris Night Processing Finished");
+-            if (iris26550NightFinished) {
+-                iris26550NightUiRearmPending = true;
+-            }
+             mCameraUIView.setProcessingProgressBarIndeterminate(false);
+             mCameraUIView.activateShutterButton(true);
+             mCameraUIView.lockUIForBurst(false);
+@@ -766,28 +777,20 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+          */
+         @Override
+         public void onFrameCountSet(int frameCount) {
++            iris26551CaptureUiMode = PhotonCamera.getSettings().selectedMode;
+             mCameraUIView.setCaptureProgressMax(frameCount);
++            Log.i(TAG, "IRIS_26551_CAPTURE_UI_OWNER mode=" + iris26551CaptureUiMode
++                    + " frameCount=" + frameCount);
+         }
+ 
+         @Override
+         public void onCaptureStillPictureStarted(Object o) {
+             if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+-                if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION
+-                        && iris26550NightUiRearmPending) {
+-                    /* IRIS_26550_NIGHT_TO_MOTION_UI_REARM
+-                     * Night completion now clears CaptureController.isProcessing before its UI
+-                     * callback. Queue reset then show on the same View to defeat any stale Night
+-                     * reset runnable; the next Motion capture owns a fresh progress-ring cycle.
+-                     */
+-                    mCameraUIView.resetCaptureProgressBar();
+-                    mCameraUIView.setProcessingProgressBarIndeterminate(false);
+-                    mCameraUIView.activateShutterButton(true);
+-                    mCameraUIView.lockUIForBurst(false);
+-                    iris26550NightUiRearmPending = false;
+-                    Log.i(TAG, "IRIS_26550_NIGHT_TO_MOTION_UI_REARM"
+-                            + " processing=" + CaptureController.isProcessing
+-                            + " captureRingReady=true processingRingReady=true shutterReady=true");
+-                }
++                /* IRIS_26551_MODE_GENERIC_PROGRESS_REARM
++                 * setCaptureProgressMax() already opened a fresh UI generation for this burst.
++                 * Never post a processing-ring hide from capture start: onProcessingStarted() is
++                 * the sole SHOW authority and onProcessingFinished()/error is the HIDE authority.
++                 */
+                 mCameraUIView.setCaptureProgressBarOpacity(1.0f);
+                 mCameraUIView.lockUIForBurst(true);
+             }
+@@ -813,6 +816,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+ 
+         @Override
+         public void onFrameCaptureCompleted(Object o) {
++            if (!iris26551CaptureUiIsCurrent("frame-complete")) return;
+             if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                 mCameraUIView.incrementCaptureProgressBar(1);
+                 if (PreferenceKeys.isCameraSoundsOn()) {
+@@ -826,6 +830,9 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+ 
+         @Override
+         public void onCaptureSequenceCompleted(Object o) {
++            final boolean currentUiOwner = iris26551CaptureUiIsCurrent("capture-sequence-complete");
++            iris26551CaptureUiMode = null;
++            if (!currentUiOwner) return;
+             if (PreferenceKeys.isCameraSoundsOn()) {
+                 endPlayer.start();
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 6249e397d1b599bbd07a1f1716a54c232a3b2e45..a68f77ba65e750ad028a99e9534aa123b780836b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -81,7 +81,32 @@ public class CameraUIViewImpl implements CameraUIView {
+     private CameraUIEventsListener uiEventsListener;
+     private CameraModeState currentState;
+ 
++    /* IRIS_26551_PROGRESS_UI_GENERATION_OWNER
++     * Every posted capture/processing-ring mutation is tied to the mode/generation that issued it.
++     * Mode changes and new captures advance the generation, making older queued operations inert.
++     */
++    private long iris26551ProgressUiGeneration = 0L;
+     private CameraMode displayedMode = null;
++
++    private long iris26551AdvanceProgressUiGeneration(String reason) {
++        iris26551ProgressUiGeneration++;
++        Log.i(TAG, "IRIS_26551_UI_GENERATION generation=" + iris26551ProgressUiGeneration
++                + " mode=" + displayedMode + " reason=" + reason);
++        return iris26551ProgressUiGeneration;
++    }
++
++    private boolean iris26551ProgressUiIsCurrent(long generation, CameraMode ownerMode, String operation) {
++        final boolean current = generation == iris26551ProgressUiGeneration
++                && ownerMode == displayedMode;
++        if (!current) {
++            Log.i(TAG, "IRIS_26551_STALE_UI_REJECT operation=" + operation
++                    + " sourceGeneration=" + generation
++                    + " currentGeneration=" + iris26551ProgressUiGeneration
++                    + " sourceMode=" + ownerMode
++                    + " currentMode=" + displayedMode);
++        }
++        return current;
++    }
+     CameraUIViewImpl(CameraFragment cameraFragment) {
+         this.cameraFragment = cameraFragment;
+         this.topbar = cameraFragment.cameraFragmentBinding.layoutTopbar;
+@@ -443,6 +468,11 @@ public class CameraUIViewImpl implements CameraUIView {
+         Log.d(TAG, "Current Mode:" + cameraMode.name());
+         CameraMode previousMode = displayedMode;
+         displayedMode = cameraMode;
++        iris26551AdvanceProgressUiGeneration("mode-transition:" + previousMode + "->" + cameraMode);
++        if (previousMode != cameraMode) {
++            /* Clear the retired mode's frame counter for every destination mode, not Motion-only. */
++            cameraFragment.clearTimerFrameCountForModeTransition();
++        }
+ 
+         switch (cameraMode) {
+             case VIDEO:
+@@ -599,7 +629,11 @@ public class CameraUIViewImpl implements CameraUIView {
+ 
+     @Override
+     public void setProcessingProgressBarIndeterminate(boolean indeterminate) {
++        final long generation = iris26551ProgressUiGeneration;
++        final CameraMode ownerMode = displayedMode;
+         this.mProcessingProgressBar.post(() -> {
++            if (!iris26551ProgressUiIsCurrent(generation, ownerMode,
++                    indeterminate ? "process-ring-show" : "process-ring-hide")) return;
+             boolean show =
+                     indeterminate
+                             && CaptureController.isProcessing
+@@ -608,24 +642,33 @@ public class CameraUIViewImpl implements CameraUIView {
+             this.mProcessingProgressBar.setIndeterminate(show);
+             this.mProcessingProgressBar.setClickable(false);
+             this.mProcessingProgressBar.setFocusable(false);
+-            this.mProcessingProgressBar.setVisibility(
+-                    show ? View.VISIBLE : View.GONE
+-            );
++            this.mProcessingProgressBar.setVisibility(show ? View.VISIBLE : View.GONE);
+             if (!show) {
+                 this.mProcessingProgressBar.setProgress(0);
+                 this.mProcessingProgressBar.clearAnimation();
+             }
++            Log.i(TAG, "IRIS_26551_PROCESS_RING_" + (show ? "SHOW" : "HIDE")
++                    + " generation=" + generation + " mode=" + ownerMode
++                    + " processing=" + CaptureController.isProcessing);
+         });
+     }
+ 
+     @Override
+     public void incrementCaptureProgressBar(int step) {
+-        this.mCaptureProgressBar.post(() -> this.mCaptureProgressBar.incrementProgressBy(step));
++        final long generation = iris26551ProgressUiGeneration;
++        final CameraMode ownerMode = displayedMode;
++        this.mCaptureProgressBar.post(() -> {
++            if (!iris26551ProgressUiIsCurrent(generation, ownerMode, "capture-ring-increment")) return;
++            this.mCaptureProgressBar.incrementProgressBy(step);
++        });
+     }
+ 
+     @Override
+     public void resetCaptureProgressBar() {
++        final long generation = iris26551ProgressUiGeneration;
++        final CameraMode ownerMode = displayedMode;
+         this.mCaptureProgressBar.post(() -> {
++            if (!iris26551ProgressUiIsCurrent(generation, ownerMode, "capture-ring-reset")) return;
+             this.mCaptureProgressBar.animate().cancel();
+             this.mCaptureProgressBar.setProgress(0);
+             this.mCaptureProgressBar.setAlpha(0.0f);
+@@ -643,12 +686,13 @@ public class CameraUIViewImpl implements CameraUIView {
+ 
+     @Override
+     public void setCaptureProgressBarOpacity(float alpha) {
++        final long generation = iris26551ProgressUiGeneration;
++        final CameraMode ownerMode = displayedMode;
+         this.mCaptureProgressBar.post(() -> {
++            if (!iris26551ProgressUiIsCurrent(generation, ownerMode, "capture-ring-opacity")) return;
+             boolean visible = alpha > 0.0f;
+             this.mCaptureProgressBar.setAlpha(alpha);
+-            this.mCaptureProgressBar.setVisibility(
+-                    visible ? View.VISIBLE : View.INVISIBLE
+-            );
++            this.mCaptureProgressBar.setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+ 
+             if (cameraFragment.cameraFragmentBinding != null
+                     && cameraFragment.cameraFragmentBinding.layoutViewfinder != null
+@@ -656,12 +700,22 @@ public class CameraUIViewImpl implements CameraUIView {
+                 cameraFragment.cameraFragmentBinding.layoutViewfinder.frameTimer
+                         .setVisibility(visible ? View.VISIBLE : View.INVISIBLE);
+             }
++            Log.i(TAG, "IRIS_26551_CAPTURE_RING_" + (visible ? "SHOW" : "HIDE")
++                    + " generation=" + generation + " mode=" + ownerMode);
+         });
+     }
+ 
+     @Override
+     public void setCaptureProgressMax(int max) {
+-        this.mCaptureProgressBar.post(() -> this.mCaptureProgressBar.setMax(max));
++        /* onFrameCountSet() is the first capture-progress callback for a new burst.
++         * Advancing here invalidates any reset/hide runnable queued by the previous mode.
++         */
++        final long generation = iris26551AdvanceProgressUiGeneration("capture-start:max=" + max);
++        final CameraMode ownerMode = displayedMode;
++        this.mCaptureProgressBar.post(() -> {
++            if (!iris26551ProgressUiIsCurrent(generation, ownerMode, "capture-ring-max")) return;
++            this.mCaptureProgressBar.setMax(max);
++        });
+     }
+ 
+     @Override
+diff --git a/app/src/main/res/drawable/circular_progress_bar.xml b/app/src/main/res/drawable/circular_progress_bar.xml
+index e773e81249e4d6ed12a32b41169c54e5e6b815b7..4344e23ea41287243aa304ca226006d1be83cc90 100644
+--- a/app/src/main/res/drawable/circular_progress_bar.xml
++++ b/app/src/main/res/drawable/circular_progress_bar.xml
+@@ -27,7 +27,7 @@
+                 android:angle="0"
+                 android:type="sweep"
+                 android:thicknessRatio="40.0">
+-                <solid android:color="#DDDDDD"/>
++                <solid android:color="?attr/processingProgressColor"/>
+             </shape>
+         </rotate>
+     </item>
+diff --git a/app/src/main/res/layout/layout_bottombuttons.xml b/app/src/main/res/layout/layout_bottombuttons.xml
+index aa6f956c5259b3409ba37dde0f3df516ac09b823..3cb2704b791cca037d0eddafecfe6f0deda79fbe 100644
+--- a/app/src/main/res/layout/layout_bottombuttons.xml
++++ b/app/src/main/res/layout/layout_bottombuttons.xml
+@@ -67,7 +67,7 @@
+                     android:gravity="center"
+                     android:includeFontPadding="false"
+                     android:text="@{timermodel.frameCount}"
+-                    android:textColor="@android:color/white"
++                    android:textColor="?attr/processingProgressColor"
+                     android:textSize="25sp"
+                     android:textStyle="bold"
+                     android:textAlignment="center"
+diff --git a/app/version.properties b/app/version.properties
+index 644938cf95f0a8450c1bef250527e3b641a33743..4d44878234b0342249fc2fbef033b44f50d32c5a 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726550
+-VERSION_BUILD=26550
++VERSION_NAME=0.9726551
++VERSION_BUILD=26551
