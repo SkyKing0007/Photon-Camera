@@ -151,8 +151,43 @@ mkdir -p "$WORK/forwardcheck" "$WORK/rollbackcheck"; cp -a "$BASE/." "$WORK/forw
 echo "=== 26550 GATE 4: install exact candidate into ephemeral checkout ==="
 rsync -a --delete "$AFTER/app/" "$ROOT/app/"; manifest_audited "$ROOT" "$OUT/26550_installed_precompiler.sha256"; cmp -s "$OUT/26550_installed_precompiler.sha256" "$CAND_PIN" || fail "installed candidate mismatch"; vendor_manifest "$ROOT" "$OUT/26550_vendor_precompiler.txt"; cmp -s "$OUT/26550_vendor_precompiler.txt" "$VENDOR_PIN" || fail "vendor drift"; grep -Fx 'VERSION_NAME=0.9726550' app/version.properties >/dev/null; grep -Fx 'VERSION_BUILD=26550' app/version.properties >/dev/null; pass "version increment + candidate install same invocation"
 
-echo "=== 26550 GATE 5: REAL pinned glslang for modified active shader ==="
-sudo apt-get update -qq; apt-cache madison glslang-tools | grep -F "$GLSLANG_PKG_VERSION" >/dev/null || fail "pinned glslang unavailable"; sudo apt-get install -y --no-install-recommends "glslang-tools=${GLSLANG_PKG_VERSION}"; [[ "$(dpkg-query -W -f='${Version}' glslang-tools)" == "$GLSLANG_PKG_VERSION" ]] || fail "glslang version mismatch"; glslangValidator --version | tee "$OUT/26550_glslang_version.txt"; glslangValidator -S frag app/src/main/assets/shaders/motionv2/gainmap.glsl | tee "$OUT/26550_glslang_compile.txt"; sed -i 's/REAL GLSL COMPILE: NOT RUN YET/REAL GLSL COMPILE: PASS (pinned glslangValidator 15.1.0-2~ubuntu0.24.04.2; gainmap.glsl)/' "$OUT/26550_V1_COMPILER_STATUS.txt"; set_report "REAL GLSL COMPILE" "PASS (pinned 15.1.0-2~ubuntu0.24.04.2; gainmap.glsl)"; pass "real GLSL compiler"
+echo "=== 26550 GATE 5: REAL pinned glslang for exact runtime-expanded modified shader ==="
+sudo apt-get update -qq; apt-cache madison glslang-tools | grep -F "$GLSLANG_PKG_VERSION" >/dev/null || fail "pinned glslang unavailable"; sudo apt-get install -y --no-install-recommends "glslang-tools=${GLSLANG_PKG_VERSION}"; [[ "$(dpkg-query -W -f='${Version}' glslang-tools)" == "$GLSLANG_PKG_VERSION" ]] || fail "glslang version mismatch"
+# Permanent 26550 V1.1 regression: Photon asset shaders are runtime-expanded by GLInterface.readProgram().
+# IRIS_26550_GLSLANG_RUNTIME_PREPROCESS_PARITY
+# Never compile this raw body directly; reproduce the exact #version/#line prefix the runtime supplies.
+RUNTIME_GAINMAP_SHADER="$WORK/26550_gainmap_runtime_expanded.frag"
+python3 - app/src/main/assets/shaders/motionv2/gainmap.glsl app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLProg.java app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLInterface.java "$RUNTIME_GAINMAP_SHADER" <<'PYGLSL'
+from pathlib import Path
+import sys
+asset, glprog, glinterface, out = map(Path, sys.argv[1:])
+src = asset.read_text()
+gp = glprog.read_text()
+gi = glinterface.read_text()
+if 'public final static String glVersion = "#version 310 es\\n";' not in gp:
+    raise SystemExit('FAIL: GLProg runtime GLSL version contract drifted')
+if 'String addVersion = glVersion+"\\n"+"#line 1\\n";' not in gi:
+    raise SystemExit('FAIL: GLInterface runtime shader-prefix contract drifted')
+if '#version' in src:
+    raise SystemExit('FAIL: gainmap.glsl unexpectedly became self-versioned; update compile parity gate')
+if '#import' in src:
+    raise SystemExit('FAIL: gainmap.glsl gained #import; exact runtime import expansion must be added to gate')
+out.write_text('#version 310 es\n#line 1\n' + src)
+print('PASS: exact Photon runtime #version/#line expansion generated for gainmap.glsl')
+PYGLSL
+head -n 2 "$RUNTIME_GAINMAP_SHADER" | diff -u <(printf '#version 310 es\n#line 1\n') - >/dev/null || fail "runtime-expanded gainmap prefix mismatch"
+python3 - "$0" <<'PYRAW'
+from pathlib import Path
+import sys
+text = Path(sys.argv[1]).read_text()
+bad = 'glslangValidator -S frag ' + 'app/src/main/assets/shaders/motionv2/gainmap.glsl'
+if any(line.strip().startswith(bad) for line in text.splitlines()):
+    raise SystemExit('FAIL: permanent raw-asset glslang regression gate failed')
+print('PASS: raw asset direct-compile regression excluded')
+PYRAW
+glslangValidator --version | tee "$OUT/26550_glslang_version.txt"
+glslangValidator -S frag "$RUNTIME_GAINMAP_SHADER" | tee "$OUT/26550_glslang_compile.txt"
+sed -i 's/REAL GLSL COMPILE: NOT RUN YET/REAL GLSL COMPILE: PASS (pinned glslangValidator 15.1.0-2~ubuntu0.24.04.2; exact Photon runtime-expanded gainmap.glsl)/' "$OUT/26550_V1_COMPILER_STATUS.txt"; set_report "REAL GLSL COMPILE" "PASS (pinned 15.1.0-2~ubuntu0.24.04.2; exact runtime-expanded gainmap.glsl)"; pass "real GLSL compiler on exact runtime-expanded source"
 
 echo "=== 26550 GATE 6: REAL Kotlin + Java project compilers ==="
 ./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace; sed -i 's/REAL KOTLIN COMPILE: NOT RUN YET/REAL KOTLIN COMPILE: PASS/' "$OUT/26550_V1_COMPILER_STATUS.txt"; sed -i 's/REAL JAVA COMPILE: NOT RUN YET/REAL JAVA COMPILE: PASS/' "$OUT/26550_V1_COMPILER_STATUS.txt"; set_report "REAL KOTLIN COMPILE" "PASS"; set_report "REAL JAVA COMPILE" "PASS"; grep -F 'java.nio.ByteBuffer source = plane.getBuffer().duplicate();' app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java >/dev/null || fail "permanent ByteBuffer javac regression"; python3 "$VALIDATE" "$BASE" "$AFTER" > "$OUT/26550_postcompiler_contract.txt"; pass "real language compilers"
