@@ -1,0 +1,416 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 946969f796f7ee75a60e1a8ca5bb74b9ce75fedf..4b7f0fb3c899de180bb498f5448017c342f9e060 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -471,12 +471,80 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 return;
+             }
+             if (mIrisNight26540CaptureActive) {
+-                // IRIS_26554_NIGHT_HAL_QUEUE_DRAIN_OWNER
+-                // A callback is only a notification that one OR MORE RAWs may be queued. Drain
+-                // every currently available Camera2 Image synchronously so HALs that coalesce
+-                // notifications cannot strand tail frames. Exactly one copied SHORT reference is
+-                // retained in memory; every later RAW is spooled and its Camera2 Image closed.
+-                drainIrisNight26554AvailableRawImages(reader, "image-callback");
++                /* IRIS_26544_NIGHT_IMMEDIATE_CALLBACK_OWNERSHIP
++                 * Keep exactly one app-owned SHORT reference. Every later Camera2 RAW is consumed
++                 * synchronously into the disk-backed Iris spool and closed before this callback
++                 * returns. No live Camera2 Image is retained by an executor or later processing.
++                 */
++                if (!mIrisNight26544ReferenceCopied) {
++                    Image nightImage = null;
++                    ImageFrame copied = null;
++                    long nightTimestamp = 0L;
++                    Log.i(TAG, "IRIS_26544_NIGHT_RAW_CALLBACK_BEGIN role=REFERENCE");
++                    try {
++                        nightImage = reader.acquireNextImage();
++                        if (nightImage == null) {
++                            Log.critical(TAG, "IRIS_26544_NIGHT_RAW_ACQUIRE_NULL role=REFERENCE");
++                            return;
++                        }
++                        nightTimestamp = nightImage.getTimestamp();
++                        Log.i(TAG, "IRIS_26544_NIGHT_RAW_ACQUIRED role=REFERENCE timestamp="
++                                + nightTimestamp);
++                        copied = copyIrisNight26540Raw(nightImage);
++                        synchronized (mIrisNight26540Lock) {
++                            if (!mIrisNight26540CaptureActive) {
++                                copied.close();
++                                copied = null;
++                            } else {
++                                mIrisNight26540Frames.add(copied);
++                                mIrisNight26544ReferenceCopied = true;
++                                Log.i(TAG, "IRIS_26544_NIGHT_REFERENCE_COPIED timestamp="
++                                        + nightTimestamp + " bytes="
++                                        + (copied.buffer == null ? 0 : copied.buffer.capacity())
++                                        + " persistentNativeReferenceFrames=1");
++                            }
++                        }
++                    } catch (Throwable nightRawFailure) {
++                        if (copied != null) try { copied.close(); } catch (Throwable ignored) {}
++                        Log.e(TAG, "IRIS_26544_NIGHT_REFERENCE_COPY_FAILED", nightRawFailure);
++                        Log.critical(TAG, "IRIS_26544_NIGHT_REFERENCE_COPY_FAILED type="
++                                + nightRawFailure.getClass().getName() + " message="
++                                + String.valueOf(nightRawFailure.getMessage()));
++                        cameraEventsListener.onProcessingError("Night reference RAW copy: "
++                                + nightRawFailure.getClass().getSimpleName());
++                    } finally {
++                        if (nightImage != null) {
++                            try { nightImage.close(); } catch (Throwable ignored) {}
++                            Log.critical(TAG, "IRIS_26544_NIGHT_CAMERA2_IMAGE_CLOSED role=REFERENCE timestamp="
++                                    + nightTimestamp);
++                        }
++                    }
++                    tryDispatchIrisNight26540();
++                    return;
++                }
++                Image nightImage = null;
++                try {
++                    Log.i(TAG, "IRIS_26544_NIGHT_RAW_CALLBACK_BEGIN role=AUX");
++                    nightImage = reader.acquireNextImage();
++                    if (nightImage == null) {
++                        Log.critical(TAG, "IRIS_26544_NIGHT_RAW_ACQUIRE_NULL role=AUX");
++                        return;
++                    }
++                    final Image ownedImage = nightImage;
++                    nightImage = null;
++                    spoolIrisNight26544RawSynchronously(ownedImage, mIrisNight26544CaptureGeneration);
++                } catch (Throwable nightRawFailure) {
++                    if (nightImage != null) try { nightImage.close(); } catch (Throwable ignored) {}
++                    mIrisNight26544SpoolFailure = "callback:"
++                            + nightRawFailure.getClass().getSimpleName() + ":"
++                            + String.valueOf(nightRawFailure.getMessage());
++                    Log.e(TAG, "IRIS_26544_NIGHT_SYNC_SPOOL_CALLBACK_FAILED", nightRawFailure);
++                    Log.critical(TAG, "IRIS_26544_NIGHT_SYNC_SPOOL_CALLBACK_FAILED type="
++                            + nightRawFailure.getClass().getName() + " message="
++                            + String.valueOf(nightRawFailure.getMessage()));
++                    cameraEventsListener.onProcessingError("Night RAW spool: "
++                            + nightRawFailure.getClass().getSimpleName());
++                }
+                 return;
+             }
+             if (onUnlimited && !unlimitedStarted) {
+@@ -4554,91 +4622,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + " cameraId=" + mIrisNight26540CameraId);
+     }
+ 
+-    /* IRIS_26554_NIGHT_HAL_QUEUE_DRAIN_OWNER
+-     * ImageReader callbacks are availability notifications, not a one-callback/one-image contract.
+-     * Drain all currently queued RAWs without retaining live Camera2 Images asynchronously.
+-     */
+-    private int drainIrisNight26554AvailableRawImages(@NonNull ImageReader reader, String reason) {
+-        int drained = 0;
+-        final long generation = mIrisNight26544CaptureGeneration;
+-        while (mIrisNight26540CaptureActive && generation == mIrisNight26544CaptureGeneration) {
+-            Image nightImage = null;
+-            ImageFrame copied = null;
+-            long timestamp = 0L;
+-            try {
+-                nightImage = reader.acquireNextImage();
+-                if (nightImage == null) break;
+-                drained++;
+-                timestamp = nightImage.getTimestamp();
+-                if (!mIrisNight26544ReferenceCopied) {
+-                    Log.i(TAG, "IRIS_26554_NIGHT_RAW_DRAIN role=REFERENCE reason=" + reason
+-                            + " timestamp=" + timestamp + " drained=" + drained);
+-                    copied = copyIrisNight26540Raw(nightImage);
+-                    synchronized (mIrisNight26540Lock) {
+-                        if (!mIrisNight26540CaptureActive
+-                                || generation != mIrisNight26544CaptureGeneration) {
+-                            copied.close();
+-                            copied = null;
+-                        } else if (!mIrisNight26544ReferenceCopied) {
+-                            mIrisNight26540Frames.add(copied);
+-                            mIrisNight26544ReferenceCopied = true;
+-                            Log.i(TAG, "IRIS_26544_NIGHT_REFERENCE_COPIED timestamp="
+-                                    + timestamp + " bytes="
+-                                    + (copied.buffer == null ? 0 : copied.buffer.capacity())
+-                                    + " persistentNativeReferenceFrames=1");
+-                            copied = null; // Controller frame list owns the copied RAW.
+-                        } else {
+-                            copied.close();
+-                            copied = null;
+-                        }
+-                    }
+-                } else {
+-                    Log.i(TAG, "IRIS_26554_NIGHT_RAW_DRAIN role=AUX reason=" + reason
+-                            + " timestamp=" + timestamp + " drained=" + drained);
+-                    final Image ownedImage = nightImage;
+-                    nightImage = null;
+-                    spoolIrisNight26544RawSynchronously(ownedImage, generation);
+-                }
+-            } catch (Throwable nightRawFailure) {
+-                if (copied != null) try { copied.close(); } catch (Throwable ignored) {}
+-                mIrisNight26544SpoolFailure = "drain:"
+-                        + nightRawFailure.getClass().getSimpleName() + ":"
+-                        + String.valueOf(nightRawFailure.getMessage());
+-                Log.e(TAG, "IRIS_26554_NIGHT_RAW_DRAIN_FAILED reason=" + reason, nightRawFailure);
+-                Log.critical(TAG, "IRIS_26554_NIGHT_RAW_DRAIN_FAILED reason=" + reason
+-                        + " type=" + nightRawFailure.getClass().getName()
+-                        + " message=" + String.valueOf(nightRawFailure.getMessage()));
+-                break;
+-            } finally {
+-                if (nightImage != null) {
+-                    try { nightImage.close(); } catch (Throwable ignored) {}
+-                    Log.critical(TAG, "IRIS_26544_NIGHT_CAMERA2_IMAGE_CLOSED role="
+-                            + (mIrisNight26544ReferenceCopied ? "REFERENCE_OR_AUX" : "REFERENCE")
+-                            + " timestamp=" + timestamp);
+-                }
+-            }
+-        }
+-        if (drained > 0) {
+-            Log.i(TAG, "IRIS_26554_NIGHT_RAW_DRAIN_COMPLETE reason=" + reason
+-                    + " drained=" + drained + " generation=" + generation);
+-        }
+-        tryDispatchIrisNight26540();
+-        return drained;
+-    }
+-
+-    private long irisNight26554SequenceDrainGraceMs() {
+-        long maxExposureNs = 0L;
+-        synchronized (mIrisNight26540Lock) {
+-            for (CaptureRequest request : mIrisNight26540Requests.values()) {
+-                if (request == null) continue;
+-                Long ns = request.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+-                if (ns != null) maxExposureNs = Math.max(maxExposureNs, ns);
+-            }
+-        }
+-        long exposureMs = Math.max(0L, maxExposureNs / 1_000_000L);
+-        return Math.max(750L, Math.min(5000L, 750L + exposureMs));
+-    }
+-
+     private ImageFrame copyIrisNight26540Raw(@NonNull Image image) {
+         if (image.getFormat() != ImageFormat.RAW_SENSOR) {
+             throw new IllegalArgumentException("26540 Night requires RAW_SENSOR image");
+@@ -4856,9 +4839,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+ 
+     private void finishIrisNight26544AfterSequenceGrace() {
+-        if (mImageReaderRaw != null && mIrisNight26540CaptureActive) {
+-            drainIrisNight26554AvailableRawImages(mImageReaderRaw, "sequence-grace");
+-        }
+         boolean fail = false;
+         int matchedCount = 0;
+         int requestedCount = 0;
+@@ -4873,11 +4853,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         && mIrisNight26540Requests.containsKey(frame.timestamp)) matchedCount++;
+             }
+             if (matchedCount >= 2) {
+-                // IRIS_26554_NIGHT_ACTUAL_DELIVERED_ROLE_RECOVERY
+-                // The slider is the immutable requested maximum. If the HAL truly delivers fewer
+-                // exact RAW/result/request pairs after the bounded drain, process that exact
+-                // delivered set. IrisNightBatch keeps requested roles as provenance and validates
+-                // actual SHORT/LONG roles independently; no missing role is fabricated.
++                // IRIS_26540_NIGHT_BOUNDED_DRAIN
++                // The slider is a maximum stack budget, not a reason to hang forever if the HAL
++                // drops one RAW. Preserve multiframe processing with every exact matched RAW.
+                 mIrisNight26540ExpectedFrames = matchedCount;
+             } else {
+                 fail = true;
+@@ -4896,10 +4874,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             cameraEventsListener.onProcessingError("Iris Night: fewer than two exact RAW/result pairs");
+             return;
+         }
+-        Log.w(TAG, "IRIS_26554_NIGHT_ACTUAL_DELIVERED_SET matched=" + matchedCount
++        Log.w(TAG, "IRIS_26540_NIGHT_BOUNDED_DRAIN matched=" + matchedCount
+                 + " requested=" + requestedCount
+-                + " degraded=" + (matchedCount != requestedCount)
+-                + " singleFrameFallback=false fabricatedFrames=false");
++                + " singleFrameFallback=false");
+         tryDispatchIrisNight26540();
+     }
+ 
+@@ -5008,11 +4985,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         if (batch == null) return;
+         Log.processState(TAG, "NIGHT_BATCH_SEALED");
+         Log.critical(TAG, "IRIS_26544_NIGHT_BATCH_SEALED frames=" + batch.frames.size());
+-        Log.i(TAG, "IRIS_26554_NIGHT_BATCH_SEALED frames=" + batch.frames.size()
++        Log.i(TAG, "IRIS_26541_NIGHT_BATCH_SEALED frames=" + batch.frames.size()
+                 + " shortActual=" + batch.shortFrameCount + " longActual=" + batch.longFrameCount
+                 + " shortRequested=" + batch.requestedShortFrames + " longRequested=" + batch.requestedLongFrames
+-                + " degradedBracket=" + batch.degradedBracket
+-                + " fabricatedFrames=false"
+                 + " exactResults=" + batch.results.size()
+                 + " zsl=false motionRing=false preShutterRaw=false"
+                 + " staticImageBuffer=false defaultSaver=false hdrxRun=false");
+@@ -7174,12 +7149,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                 + " legacySaverWait=false");
+                         tryDispatchIrisNight26540();
+                         if (mBackgroundHandler != null) {
+-                            final long iris26554DrainGraceMs = irisNight26554SequenceDrainGraceMs();
+-                            Log.i(TAG, "IRIS_26554_NIGHT_SEQUENCE_DRAIN_GRACE ms="
+-                                    + iris26554DrainGraceMs + " exposureAware=true maxMs=5000");
+                             mBackgroundHandler.postDelayed(
+-                                    CaptureController.this::finishIrisNight26544AfterSequenceGrace,
+-                                    iris26554DrainGraceMs);
++                                    CaptureController.this::finishIrisNight26544AfterSequenceGrace, 750L);
+                         }
+                         return;
+                     }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
+index 1826a2027adcedd4b1128f652a549a47380892ee..57322eb08b73641765beaf0d84e95a894da51d4c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
+@@ -17,10 +17,8 @@ import java.util.Map;
+  * IRIS_26552_NIGHT_IMMUTABLE_DYNAMIC_BATCH_OWNER
+  *
+  * One shutter-frozen, fresh-capture Night batch. Frozen requested SHORT/LONG counts remain
+- * immutable provenance, while the exact RAW/result/request pairs actually delivered by Camera2
+- * own processing. Missing HAL deliveries are never fabricated and never force a single-frame
+- * fallback. No Motion ZSL/ring/pre-shutter RAW, Photon static IMAGE_BUFFER, or live settings own
+- * this batch.
++ * authoritative through processing; actual roles must exactly match that shutter-time plan.
++ * No Motion ZSL/ring/pre-shutter RAW, Photon static IMAGE_BUFFER, or live settings own this batch.
+  */
+ public final class IrisNightBatch {
+     public final List<ImageFrame> frames;
+@@ -38,7 +36,6 @@ public final class IrisNightBatch {
+     public final int requestedLongFrames;
+     public final int shortFrameCount;
+     public final int longFrameCount;
+-    public final boolean degradedBracket;
+     public final int saveRaw;
+     public final boolean superResEnabled;
+     public final boolean aspect169;
+@@ -121,12 +118,9 @@ public final class IrisNightBatch {
+             requestCopy.put(frame.timestamp, request);
+         }
+         if (shortCount < 2 || reference == null)
+-            throw new IllegalArgumentException("26554 Night requires at least two exact delivered SHORT/reference frames; got=" + shortCount);
+-        if (shortCount + longCount != frameBudget)
+-            throw new IllegalArgumentException("26554 Night delivered role total mismatch short="
+-                    + shortCount + " long=" + longCount + " budget=" + frameBudget);
+-        if (shortCount > requestedShortFrames || longCount > requestedLongFrames)
+-            throw new IllegalArgumentException("26554 Night delivered roles exceed frozen request: short="
++            throw new IllegalArgumentException("26552 Night requires at least two exact SHORT/reference frames; got=" + shortCount);
++        if (shortCount != requestedShortFrames || longCount != requestedLongFrames)
++            throw new IllegalArgumentException("26552 Night actual roles do not match frozen request: short="
+                     + shortCount + "/" + requestedShortFrames + " long=" + longCount + "/" + requestedLongFrames);
+         final double referenceEnergy = reference.motionV2ExposureEnergy;
+         for (ImageFrame frame : ordered) {
+@@ -150,7 +144,6 @@ public final class IrisNightBatch {
+         this.requestedLongFrames = requestedLongFrames;
+         this.shortFrameCount = shortCount;
+         this.longFrameCount = longCount;
+-        this.degradedBracket = shortCount != requestedShortFrames || longCount != requestedLongFrames;
+         this.saveRaw = saveRaw;
+         this.superResEnabled = superResEnabled;
+         this.aspect169 = aspect169;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index 01542e98867374f249bdeac4e166d30eab994ce0..e266e93d4e679a2aa53d5dbaa7402b142ce53c18 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -230,8 +230,7 @@ public final class IrisNightProcessor {
+                     + " pecanProfileSnr=referencePreMerge"
+                     + " denoiseMagnitude=propagatedResidual readShotCorrelationStrength=true"
+                     + " isoDenoiseAuthority=false darknessDenoiseAuthority=false"
+-                    + " autoLowLightLumaFloor=false ultraHdrPostPipeline=true"
+-                    + " jinRgbGridApplied=false degradedBracket=" + batch.degradedBracket
++                    + " autoLowLightLumaFloor=false ultraHdrPostJin=true"
+                     + " superResRequested=" + iris26548NightSuperResRequested
+                     + " superResEffective=" + p.motionV2SuperResOutputEnabled;
+ 
+@@ -277,29 +276,26 @@ public final class IrisNightProcessor {
+             Log.processState(TAG, "NIGHT_BASE_JPEG_COMPLETE_" + baseSaved);
+             Log.critical(TAG, "IRIS_26544_NIGHT_BASE_JPEG_COMPLETE saved=" + baseSaved);
+             if (baseSaved) {
+-                // IRIS_26554_NIGHT_CHECKPOINT_NOT_COMPLETION
+-                // Keep the crash-safe file, but do not scan it or update the gallery thumbnail.
+-                Log.critical(TAG, "IRIS_26554_NIGHT_BASE_JPEG_CHECKPOINT_ONLY saved=true"
+-                        + " galleryPublished=false processingComplete=false");
+-            } else {
+-                Log.w(TAG, "IRIS_26540_NIGHT_BASE_CHECKPOINT_FAILED continueFinalAttempt=true");
++                Log.critical(TAG, "IRIS_26544_NIGHT_BASE_JPEG_NOTIFY_BEGIN");
++                listener.notifyImageSavedStatus(true, imageFile);
++                Log.critical(TAG, "IRIS_26544_NIGHT_BASE_JPEG_NOTIFY_END");
+             }
++            else Log.w(TAG, "IRIS_26540_NIGHT_BASE_CHECKPOINT_FAILED continueFinalAttempt=true");
+ 
+-            // IRIS_26554_NIGHT_JIN_RGB_GRID_UNIVERSAL_BYPASS
+-            // The 512->32x32 independent RGB gain field can create scene-position-dependent
+-            // rectangular luminance/chroma halos. Preserve the completed Sabre/VGN/PostPipeline
+-            // bitmap unchanged. UHDR remains Sabre-owned and is attached below.
+-            Log.processState(TAG, "NIGHT_JIN_RGB_GRID_BYPASS");
+-            Log.critical(TAG, "IRIS_26554_NIGHT_JIN_RGB_GRID_BYPASS applied=false"
+-                    + " reason=universalSquareChromaSafety sabreVgnPostPreserved=true");
++            Log.processState(TAG, "NIGHT_JIN_BEGIN");
++            Log.critical(TAG, "IRIS_26544_NIGHT_JIN_BEGIN baseSaved=" + baseSaved);
++            img = IrisNightNeuralEnhancer.enhanceInPlace(img);
++            Log.processState(TAG, "NIGHT_JIN_COMPLETE");
++            Log.critical(TAG, "IRIS_26544_NIGHT_JIN_COMPLETE bitmap="
++                    + (img == null ? "null" : (img.getWidth() + "x" + img.getHeight())));
+             final boolean iris26550UltraHdrAttached = IrisNightUltraHdr.attachPostJin(
+                     img, iris26550UltraHdr);
+             iris26550UltraHdr = null;
+             Log.processState(TAG, "NIGHT_POST_JIN_ULTRAHDR_" + iris26550UltraHdrAttached);
+             Log.critical(TAG, "IRIS_26550_NIGHT_POST_JIN_ULTRAHDR attached="
+                     + iris26550UltraHdrAttached
+-                    + " finalSdrAuthority=postPipelineJinBypassed sabreHdrAuthority=true");
+-            final long postNoJinMs = (System.nanoTime() - postStartNs) / 1_000_000L;
++                    + " finalSdrAuthority=postJin sabreHdrAuthority=true");
++            final long postPlusJinMs = (System.nanoTime() - postStartNs) / 1_000_000L;
+             Log.processState(TAG, "NIGHT_FINAL_JPEG_BEGIN");
+             Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_BEGIN path=" + imageFile);
+             final boolean finalSaved = ImageSaver.Util.saveBitmapAsJPGIrisNightAtomicFinal(
+@@ -309,21 +305,19 @@ public final class IrisNightProcessor {
+             Log.processState(TAG, "NIGHT_FINAL_JPEG_COMPLETE_" + finalSaved);
+             Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_COMPLETE finalSaved=" + finalSaved
+                     + " imageSaved=" + imageSaved);
+-            // IRIS_26554_NIGHT_SINGLE_PUBLICATION_OWNER
+-            // Publish exactly once, after the final attempt. If final UHDR/JPEG-R replacement
+-            // fails, the crash-safe base may be published only now as an explicit degraded result.
+-            Log.critical(TAG, "IRIS_26554_NIGHT_FINAL_PUBLICATION_BEGIN finalSaved=" + finalSaved
+-                    + " baseFallback=" + (!finalSaved && baseSaved) + " saved=" + imageSaved);
+-            listener.notifyImageSavedStatus(imageSaved, imageFile);
+-            Log.critical(TAG, "IRIS_26554_NIGHT_FINAL_PUBLICATION_END saved=" + imageSaved);
++            if (finalSaved || !baseSaved) {
++                Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_NOTIFY_BEGIN saved=" + imageSaved);
++                listener.notifyImageSavedStatus(imageSaved, imageFile);
++                Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_NOTIFY_END saved=" + imageSaved);
++            }
+             if (srDetailPath != null) {
+                 try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(srDetailPath)); }
+                 catch (Throwable ignored) {}
+             }
+             Log.i(TAG, "IRIS_26540_NIGHT_PUBLICATION_OWNERSHIP baseSaved=" + baseSaved
+                     + " finalSaved=" + finalSaved + " imageSaved=" + imageSaved
+-                    + " jinApplied=false baseCheckpointOnly=true ultraHdr=" + iris26550UltraHdrAttached
+-                    + " mergeMs=" + mergeMs + " postNoJinMs=" + postNoJinMs
++                    + " jinOptional=true baseSurvivesJinFailure=true ultraHdr=" + iris26550UltraHdrAttached
++                    + " mergeMs=" + mergeMs + " postPlusJinMs=" + postPlusJinMs
+                     + " totalMs=" + ((System.nanoTime() - startNs) / 1_000_000L));
+             Log.processState(TAG, "NIGHT_PROCESS_FINISHED_NOTIFY_BEGIN");
+             releaseNightFrames(batch);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 65bbb736e2a7d2900b3ec8cca05cc6de90bebcfb..1b07e99356ad18233526a4009c07c4377a5a8ca8 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -490,18 +490,6 @@ public class CameraUIViewImpl implements CameraUIView {
+     private void switchToMode(CameraMode cameraMode) {
+         Log.d(TAG, "Current Mode:" + cameraMode.name());
+         CameraMode previousMode = displayedMode;
+-        if (previousMode != cameraMode && CaptureController.isProcessing
+-                && previousMode != CameraMode.RAWVIDEO) {
+-            // IRIS_26554_PROCESSING_MODE_TRANSITION_GUARD
+-            // Keep the current owner mode/UI alive until its processor releases global ownership.
+-            // The picker already committed its visual selection before this callback, so snap it
+-            // back without firing another selection callback.
+-            mModePicker.collapseToIndex(indexOfMode(previousMode));
+-            cameraFragment.showToast("Please wait until processing is completed.");
+-            Log.w(TAG, "IRIS_26554_PROCESSING_MODE_CHANGE_REJECT from=" + previousMode
+-                    + " requested=" + cameraMode + " processing=true");
+-            return;
+-        }
+         displayedMode = cameraMode;
+         iris26551AdvanceProgressUiGeneration("mode-transition:" + previousMode + "->" + cameraMode);
+         if (previousMode != cameraMode) {
+diff --git a/app/version.properties b/app/version.properties
+index 5b07437616d2385c7f154c270c06d8982bcc91d7..9be055b2dd87105965015afa568be0571705e903 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726554
+-VERSION_BUILD=26554
++VERSION_NAME=0.9726553
++VERSION_BUILD=26553
