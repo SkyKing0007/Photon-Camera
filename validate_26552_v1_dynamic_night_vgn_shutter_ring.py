@@ -61,6 +61,62 @@ def check_delimiters(src,label):
             st.pop()
     need(not st,f'{label}: unclosed delimiter {st[-1] if st else "?"}')
 
+# Complete-enough GLSL ES keyword/reserved set for identifier declarations.  This is a
+# supplemental precompiler regression gate; pinned glslangValidator remains authoritative.
+GLSL_RESERVED = set("""
+attribute const uniform varying buffer shared coherent volatile restrict readonly writeonly
+atomic_uint layout centroid flat smooth noperspective patch sample break continue do for while
+switch case default if else subroutine in out inout float double int void bool true false
+invariant precise discard return mat2 mat3 mat4 dmat2 dmat3 dmat4 mat2x2 mat2x3 mat2x4
+mat3x2 mat3x3 mat3x4 mat4x2 mat4x3 mat4x4 dmat2x2 dmat2x3 dmat2x4 dmat3x2 dmat3x3
+dmat3x4 dmat4x2 dmat4x3 dmat4x4 vec2 vec3 vec4 ivec2 ivec3 ivec4 bvec2 bvec3 bvec4
+uvec2 uvec3 uvec4 dvec2 dvec3 dvec4 lowp mediump highp precision sampler1D sampler2D
+sampler3D samplerCube sampler1DShadow sampler2DShadow samplerCubeShadow sampler1DArray
+sampler2DArray sampler1DArrayShadow sampler2DArrayShadow isampler1D isampler2D isampler3D
+isamplerCube isampler1DArray isampler2DArray usampler1D usampler2D usampler3D usamplerCube
+usampler1DArray usampler2DArray sampler2DRect sampler2DRectShadow isampler2DRect usampler2DRect
+samplerBuffer isamplerBuffer usamplerBuffer sampler2DMS isampler2DMS usampler2DMS
+sampler2DMSArray isampler2DMSArray usampler2DMSArray image1D iimage1D uimage1D image2D
+iimage2D uimage2D image3D iimage3D uimage3D image2DRect iimage2DRect uimage2DRect
+imageCube iimageCube uimageCube imageBuffer iimageBuffer uimageBuffer image1DArray iimage1DArray
+uimage1DArray image2DArray iimage2DArray uimage2DArray image2DMS iimage2DMS uimage2DMS
+image2DMSArray iimage2DMSArray uimage2DMSArray struct common partition active asm class union
+enum typedef template this resource goto inline noinline public static extern external interface long
+short half fixed unsigned superp input output hvec2 hvec3 hvec4 fvec2 fvec3 fvec4 sampler3DRect
+filter sizeof cast namespace using row_major
+""".split())
+GLSL_TYPES = set(x for x in GLSL_RESERVED if re.match(r'^(?:[diub]?vec[234]|[d]?mat[234](?:x[234])?|[iu]?sampler|[iu]?image|atomic_uint|float|double|int|uint|bool|void)', x))
+GLSL_TYPES |= {'float','double','int','uint','bool','void'}
+
+def glsl_declared_reserved(src,label):
+    # Strip comments and preprocessor payloads only after separately checking macro identifiers.
+    for m in re.finditer(r'(?m)^\s*#\s*define\s+([A-Za-z_]\w*)',src):
+        if m.group(1) in GLSL_RESERVED:
+            die(f'{label}: reserved GLSL identifier used as macro name: {m.group(1)}')
+    clean=re.sub(r'/\*.*?\*/',' ',src,flags=re.S)
+    clean=re.sub(r'//[^\n]*',' ',clean)
+    # Include user-defined struct names as types, then catch declarations/functions/parameters/fields.
+    types=set(GLSL_TYPES)
+    types.update(re.findall(r'\bstruct\s+([A-Za-z_]\w*)',clean))
+    tpat='|'.join(sorted(map(re.escape,types),key=len,reverse=True))
+    # Qualifiers may precede a type; declaration identity is the token immediately following the type.
+    pat=re.compile(r'\b(?:'+tpat+r')\s+([A-Za-z_]\w*)\b')
+    bad=[]
+    for m in pat.finditer(clean):
+        ident=m.group(1)
+        if ident in GLSL_RESERVED:
+            line=clean.count('\n',0,m.start(1))+1
+            bad.append((line,ident))
+    if bad:
+        die(f'{label}: reserved GLSL identifier declaration(s): {bad}')
+    # Permanent regression from Actions run 33143071632 / job 98758015139.
+    need(not re.search(r'\bfloat\s+coherent\b',clean),f'{label}: 26552 V1 Actions regression float coherent reintroduced')
+
+def check_glsl_dir(root):
+    root=Path(root); files=sorted(root.glob('*.comp')); need(files,'no expanded .comp shaders for reserved scan')
+    for p in files: glsl_declared_reserved(p.read_text(),p.name)
+    print('PASS: complete declared-identifier GLSL reserved-keyword scan; 26552 V1 coherent regression blocked')
+
 def selftest():
     for req in range(-1000,1001):
         total=max(2,min(50,req)); lng=0 if total==2 else max(1,(total+2)//5); short=total-lng
@@ -68,6 +124,13 @@ def selftest():
     need((12,3)==(15-max(1,(15+2)//5),max(1,(15+2)//5)),'15 formula')
     need((16,4)==(20-max(1,(20+2)//5),max(1,(20+2)//5)),'20 formula')
     need((40,10)==(50-max(1,(50+2)//5),max(1,(50+2)//5)),'50 formula')
+    glsl_declared_reserved('#version 310 es\nvoid main(){ float coherentSupport=1.0; }\n','reserved-selftest-good')
+    try:
+        glsl_declared_reserved('#version 310 es\nvoid main(){ float coherent=1.0; }\n','reserved-selftest-bad')
+    except SystemExit:
+        pass
+    else:
+        die('reserved keyword selftest failed to reject float coherent')
     print('PASS: validator self-test')
 
 def main(base,cand):
@@ -177,7 +240,7 @@ def main(base,cand):
     modified=[n for n in sorted(rsb) if rsb[n]!=rsc[n]]
     need(modified==['directionalSmooth','iirRgb'],'unexpected embedded GLSL delta '+repr(modified))
     need(mask_raw(vb,modified)==mask_raw(vc,modified),'VGN host/non-modified source drifted')
-    for x in ['IRIS_26552_VGN_REAL_COLOR_GEOMETRY_SUPPORT','IRIS_26552_VGN_LOW_CHROMA_CROSS_EDGE_CONTAINMENT','float vectorAgreement=','return support*(1.0-highlightBoundary(p));','expansionGuard=lowOriginal*localLumaEdge(p)*expansion*(1.0-highlight)']:
+    for x in ['IRIS_26552_VGN_REAL_COLOR_GEOMETRY_SUPPORT','IRIS_26552_VGN_LOW_CHROMA_CROSS_EDGE_CONTAINMENT','float vectorAgreement=','float coherentSupport=','return support*(1.0-highlightBoundary(p));','expansionGuard=lowOriginal*localLumaEdge(p)*expansion*(1.0-highlight)']:
         need(x in vc,'directional VGN guard missing '+x)
     for x in ['iirRealColorSupport','iirHighlightBoundary','iirLumaEdge','effectiveStrength*=artifactConfidence*(1.0-0.85*preserve)','expansionGuard=lowOriginal*iirLumaEdge(p)*expansion*(1.0-highlight)']:
         need(x in vc,'IIR3 VGN guard missing '+x)
@@ -203,5 +266,6 @@ def main(base,cand):
 
 if __name__=='__main__':
     if len(sys.argv)==2 and sys.argv[1]=='--self-test': selftest()
+    elif len(sys.argv)==3 and sys.argv[1]=='--check-glsl': check_glsl_dir(sys.argv[2])
     elif len(sys.argv)==3: main(sys.argv[1],sys.argv[2])
-    else: raise SystemExit('usage: validate...py --self-test | <base> <candidate>')
+    else: raise SystemExit('usage: validate...py --self-test | --check-glsl <expanded-dir> | <base> <candidate>')
