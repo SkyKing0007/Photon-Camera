@@ -1,0 +1,649 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index c7c4587a021cba460c0a6ad9d39bb4cfd2d7c38e..a0548535f6b2e17427d60f22e9cfc40268cbabc0 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -34,21 +34,41 @@ vec3 iris26524BilinearHdr(vec2 sourcePixel){
+                texelFetch(HdrBuffer,ivec2(p1.x,p1.y),0).rgb,f.x);
+     return mix(a,b,f.y);
+ }
++/* IRIS_26550_GAINMAP_GENERAL_GEOMETRY
++ * Motion remains 1:1 so sourcePixel==p exactly. Night may request a smaller detached gain map;
++ * sample the full rendered SDR/HDR at the corresponding pixel center instead of accidentally
++ * reading only the top-left quarter of the image.
++ */
++vec3 iris26550BilinearSdr(vec2 sourcePixel){
++    ivec2 sz=textureSize(SdrBuffer,0);
++    vec2 hi=max(vec2(sz)-vec2(1.0),vec2(0.0));
++    vec2 q=clamp(sourcePixel,vec2(0.0),hi);
++    ivec2 p0=ivec2(floor(q));
++    ivec2 p1=min(p0+ivec2(1),sz-ivec2(1));
++    vec2 f=fract(q);
++    vec3 a=mix(texelFetch(SdrBuffer,ivec2(p0.x,p0.y),0).rgb,
++               texelFetch(SdrBuffer,ivec2(p1.x,p0.y),0).rgb,f.x);
++    vec3 b=mix(texelFetch(SdrBuffer,ivec2(p0.x,p1.y),0).rgb,
++               texelFetch(SdrBuffer,ivec2(p1.x,p1.y),0).rgb,f.x);
++    return mix(a,b,f.y);
++}
+ void main(){
+     ivec2 p=ivec2(gl_FragCoord.xy);
+     if(any(greaterThanEqual(p,gainMapSize))){Output=0.0;return;}
+     float zoom=max(irisOutputZoom,1.0);
++    ivec2 sdrSize=textureSize(SdrBuffer,0);
++    vec2 sourcePixel=(vec2(p)+vec2(0.5))*vec2(sdrSize)/vec2(gainMapSize)-vec2(0.5);
+     vec3 hdrRgb;
+     if(zoom<=1.00001){
+-        hdrRgb=texelFetch(HdrBuffer,p,0).rgb;
++        hdrRgb=iris26524BilinearHdr(sourcePixel);
+     }else{
+         ivec2 hdrSize=textureSize(HdrBuffer,0);
+         vec2 center=(vec2(hdrSize)-vec2(1.0))*0.5;
+-        vec2 sourcePixel=center+(vec2(p)-center)/zoom;
+-        hdrRgb=iris26524BilinearHdr(sourcePixel);
++        vec2 zoomedSource=center+(sourcePixel-center)/zoom;
++        hdrRgb=iris26524BilinearHdr(zoomedSource);
+     }
+     float hdr=max(luminance(max(hdrRgb,vec3(0.0))*hdrExposureScale),0.0);
+-    float sdr=max(luminance(srgbDecode(texelFetch(SdrBuffer,p,0).rgb)),0.0);
++    float sdr=max(luminance(srgbDecode(iris26550BilinearSdr(sourcePixel))),0.0);
+     float safeMax=max(maxGainRatio,1.001);
+     float ratio=clamp((hdr+UHDR_OFFSET)/(sdr+UHDR_OFFSET),1.0,safeMax);
+     Output=clamp(log2(ratio)/max(log2(safeMax),1.0e-6),0.0,1.0);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+index 6345af7f7b57dc7fb6b287df21d3ee4f086f2d8d..8ccf5a860b2f3cecb484bb9980e115033974e257 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -205,8 +205,10 @@ public class ImageSaver {
+                         + " message=" + String.valueOf(targetFailure.getMessage()));
+                 return false;
+             }
++            final boolean iris26550HasGainmap = android.os.Build.VERSION.SDK_INT >= 34 && img.hasGainmap();
+             Log.critical(TAG, "IRIS_26549_NIGHT_JPEG_TARGET path=" + absolute
+                     + " extensionJpg=" + absolute.getFileName().toString().toLowerCase(java.util.Locale.US).endsWith(".jpg")
++                    + " ultraHdrRequested=" + iris26550HasGainmap
+                     + " parentExists=" + (parent != null && Files.isDirectory(parent))
+                     + " parentWritable=" + (parent != null && Files.isWritable(parent))
+                     + " bitmapConfig=" + String.valueOf(img.getConfig())
+@@ -217,7 +219,9 @@ public class ImageSaver {
+             long turboBytes = 0L;
+             try { if (Files.isRegularFile(absolute)) turboBytes = Files.size(absolute); } catch (Throwable ignored) {}
+             Log.critical(TAG, "IRIS_26549_NIGHT_JPEG444_RESULT saved=" + turboSaved
+-                    + " exists=" + Files.isRegularFile(absolute) + " bytes=" + turboBytes);
++                    + " exists=" + Files.isRegularFile(absolute) + " bytes=" + turboBytes
++                    + " ultraHdrRequested=" + iris26550HasGainmap
++                    + " jpegRExpected=" + iris26550HasGainmap);
+             if (turboSaved && turboBytes > 0L) return true;
+ 
+             Log.w(TAG, "IRIS_26539_NIGHT_JPEG444_CODEC_FALLBACK androidBitmapCompress=true");
+@@ -311,8 +315,10 @@ public class ImageSaver {
+                 } catch (java.nio.file.AtomicMoveNotSupportedException atomicUnsupported) {
+                     Files.move(tmp, fileToSave, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                 }
+-                Log.i(TAG, "IRIS_26539_NIGHT_FINAL_JPEG444 saved=true atomicReplace=true"
+-                        + " superRes=" + useSuperRes + " ultraHdr=false");
++                final boolean ultraHdr = android.os.Build.VERSION.SDK_INT >= 34 && img.hasGainmap();
++                Log.i(TAG, "IRIS_26550_NIGHT_FINAL_PUBLICATION saved=true atomicReplace=true"
++                        + " superRes=" + useSuperRes + " ultraHdr=" + ultraHdr
++                        + " jpegR=" + ultraHdr + " baseCheckpointPreservedOnFailure=true");
+                 return true;
+             } catch (Throwable t) {
+                 Log.e(TAG, "IRIS_26539_NIGHT_FINAL_JPEG444_FAILED", t);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index c916ac03adc3ecaef77fec83838f7f4fe8e719a2..5a63ff3d4bcc3b907cd7e4675991034ffedac118 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -89,21 +89,20 @@ public final class MotionV2Render extends Node {
+         pipeline.motionV2GainMapBitmap = null;
+         pipeline.motionV2GainMapMaxRatio = 1.0f;
+ 
+-        /* IRIS_26537_NIGHT_DEFER_ULTRAHDR_UNTIL_AFTER_JIN
+-         * Night must not allocate a full-resolution gain map before the 512x512 neural finish.
+-         * Motion retains the proven UHDR path byte-for-byte. A later Night build may construct a
+-         * Night-owned gain map from the FINAL Jin SDR image; 26537 deliberately publishes Night
+-         * as normal JPEG first to prove the corrected lifecycle.
++        /* IRIS_26550_NIGHT_POST_JIN_ULTRAHDR_AUTHORITY
++         * Motion keeps its exact full-resolution gain-map geometry. Night now retains only a 1/4
++         * resolution pre-Jin HDR/SDR relationship from this GL owner. IrisNightUltraHdr later
++         * rebases that relationship against the final post-Jin SDR before attaching JPEG_R.
+          */
+-        if (basePipeline.mParameters.irisNightActive) {
+-            Log.i("MotionV2Render", "IRIS_26537_NIGHT_ULTRAHDR_DEFERRED"
+-                    + " preJinGainMap=false motionUltraHdrUntouched=true");
+-        }
+-        if (basePipeline.mParameters.motionV2Active
++        final boolean iris26550Night = basePipeline.mParameters.irisNightActive;
++        if ((basePipeline.mParameters.motionV2Active || iris26550Night)
+                 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+             /* IRIS_26470_UHDR_RENDER_GEOMETRY_AUTHORITY */
+             Point renderedSdrSize = new Point(WorkingTexture.mSize);
+-            Point gainSize = new Point(renderedSdrSize);
++            final int gainDownsample = iris26550Night ? 4 : GAINMAP_DOWNSAMPLE;
++            Point gainSize = new Point(
++                    Math.max(1, (renderedSdrSize.x + gainDownsample - 1) / gainDownsample),
++                    Math.max(1, (renderedSdrSize.y + gainDownsample - 1) / gainDownsample));
+ 
+             /* Preserve the pre-26515 UHDR capacity exactly. The Short source-domain
+              * headroom still participates in max gain even though it no longer changes sceneWhite.
+@@ -205,8 +204,9 @@ public final class MotionV2Render extends Node {
+                 Log.d(Name, "IRIS_26470_UHDR_GAINMAP_GEOMETRY"
+                         + " renderedSdr=" + renderedSdrSize.x + "x" + renderedSdrSize.y
+                         + " gainMap=" + gainSize.x + "x" + gainSize.y
+-                        + " downsample=" + GAINMAP_DOWNSAMPLE
+-                        + " authority=actualRenderedSdrTexture");
++                        + " downsample=" + gainDownsample
++                        + " authority=actualRenderedSdrTexture"
++                        + " pipeline=" + (iris26550Night ? "NIGHT_PRE_JIN_DETACHED" : "MOTION"));
+                 Log.d(Name, "IRIS_26436_V2_GAINMAP"
+                         + " size=" + gainSize.x + "x" + gainSize.y
+                         + " maxRatio=" + maxGainRatio
+@@ -219,10 +219,11 @@ public final class MotionV2Render extends Node {
+                         + " provenance=actualGainMapBeforeJpegAttach"
+                         + " grid12x8=" + grid
+                         + " source=extendedLinearPreTone"
+-                        + " fullResolutionGainMap=true"
+-                        + " downsample=" + GAINMAP_DOWNSAMPLE
+-                        + " widthFraction=1.0"
+-                        + " heightFraction=1.0"
++                        + " fullResolutionGainMap=" + (!iris26550Night)
++                        + " downsample=" + gainDownsample
++                        + " widthFraction=" + (1.0f / gainDownsample)
++                        + " heightFraction=" + (1.0f / gainDownsample)
++                        + " nightPostJinRebaseRequired=" + iris26550Night
+                         + " quotientOffset=0.015625"
+                         + " standardLogGainEncoding=true"
+                         + " gainMapResamplingRequired=false"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 36ff6b341e7341190d6ffaedb8ad05c5da2fd333..59e660a87fb50dee8bf042bdee86df34b8c88959 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -49,6 +49,16 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+ 
+     private static final String MATCH_STRENGTH_KEY = "pref_motion_viewfinder_match_strength";
+     private static final float DEFAULT_MATCH_STRENGTH_PERCENT = 65.0f;
++    /* IRIS_26550_NIGHT_PRESENTATION_POLICY
++     * Night capture intentionally keeps its Short reference highlight-safe. Presentation restores
++     * shutter-time brightness after reconstruction, but true dark scenes retain some darkness and
++     * a P99 extended-linear guide caps positive lift before the existing render shoulder.
++     */
++    private static final float NIGHT_DARK_STRENGTH = 0.72f;
++    private static final float NIGHT_FULL_MATCH_LUMA = 0.22f;
++    private static final float NIGHT_DARK_LUMA = 0.06f;
++    private static final float NIGHT_HEADROOM_GUIDE_LIMIT = 5.0f;
++    private float iris26550CandidateP99Guide = Float.NaN;
+ 
+     private static final class RgbSample {
+         final float r, g, b;
+@@ -63,8 +73,9 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+ 
+     @Override
+     public void Run() {
+-        if (!basePipeline.mParameters.motionV2Active) {
+-            throw new IllegalStateException("MotionV2ViewfinderExposureMatcher outside Motion V2");
++        final boolean iris26550Night = basePipeline.mParameters.irisNightActive;
++        if (!(basePipeline.mParameters.motionV2Active || iris26550Night)) {
++            throw new IllegalStateException("MotionV2ViewfinderExposureMatcher outside Iris Motion/Night");
+         }
+         WorkingTexture = previousNode.WorkingTexture;
+         MotionViewfinderMetering.Snapshot snapshot = MotionViewfinderMetering.consumeLatest();
+@@ -110,9 +121,33 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             errorMinus = exposureError(candidate, -0.5f, targetLog);
+             errorPlus = exposureError(candidate, 0.5f, targetLog);
+             rawSolvedEv = solveBounded(candidate, targetLog, error0, errorMinus, errorPlus);
+-            matchStrengthPercent = readMatchStrengthPercent();
+-            float matchStrength = matchStrengthPercent / 100.0f;
+-            solvedEv = clamp(rawSolvedEv * matchStrength, MIN_EV, MAX_EV);
++            if (iris26550Night) {
++                float targetLinearLuma = (float)Math.pow(2.0, targetLog);
++                float daylightness = smoothstep(NIGHT_DARK_LUMA, NIGHT_FULL_MATCH_LUMA, targetLinearLuma);
++                float nightStrength = mix(NIGHT_DARK_STRENGTH, 1.0f, daylightness);
++                matchStrengthPercent = nightStrength * 100.0f;
++                float desiredEv = clamp(rawSolvedEv * nightStrength, MIN_EV, MAX_EV);
++                float headroomCapEv = MAX_EV;
++                if (Float.isFinite(iris26550CandidateP99Guide) && iris26550CandidateP99Guide > 0.0f) {
++                    headroomCapEv = clamp(log2(NIGHT_HEADROOM_GUIDE_LIMIT
++                            / Math.max(0.05f, iris26550CandidateP99Guide)), 0.0f, MAX_EV);
++                }
++                solvedEv = desiredEv > 0.0f ? Math.min(desiredEv, headroomCapEv) : desiredEv;
++                Log.i(Name, "IRIS_26550_NIGHT_PRESENTATION_SOLVE"
++                        + " targetLinearLuma=" + targetLinearLuma
++                        + " rawSolvedEv=" + rawSolvedEv
++                        + " nightStrength=" + nightStrength
++                        + " candidateP99Guide=" + iris26550CandidateP99Guide
++                        + " headroomCapEv=" + headroomCapEv
++                        + " solvedEv=" + solvedEv
++                        + " captureExposureWrite=false shortReferenceUnchanged=true"
++                        + " preserveNightFeel=true viewfinderTarget=true");
++            } else {
++                /* Exact Motion behavior retained from 26549. */
++                matchStrengthPercent = readMatchStrengthPercent();
++                float matchStrength = matchStrengthPercent / 100.0f;
++                solvedEv = clamp(rawSolvedEv * matchStrength, MIN_EV, MAX_EV);
++            }
+             float gain = (float)Math.pow(2.0, solvedEv);
+             if (!Float.isFinite(gain) || gain <= 0.0f) {
+                 throw new IllegalStateException("non-finite solved viewfinder gain");
+@@ -136,6 +171,8 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " solvedEv=" + solvedEv
+                     + " cameraId=" + cameraIdForLog()
+                     + " displayGain=" + gain
++                    + " irisNight=" + iris26550Night
++                    + " candidateP99Guide=" + iris26550CandidateP99Guide
+                     + " fixedCandidateSampleSet=true"
+                     + " boundedSecant=true probeStepEv=0.5 maxIterations=4 evBounds=-4..4"
+                     + " meterLongEdge=" + METER_LONG_EDGE
+@@ -252,6 +289,14 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 float y = luma(r, g, b);
+                 if (y > 1.0e-4f && y < 8.0f) all.add(new RgbSample(r, g, b));
+             }
++            if (basePipeline.mParameters.irisNightActive && !all.isEmpty()) {
++                ArrayList<Float> guides = new ArrayList<>(all.size());
++                for (RgbSample s : all) guides.add(Math.max(s.r, Math.max(s.g, s.b)));
++                Collections.sort(guides);
++                int p99 = Math.max(0, Math.min(guides.size() - 1,
++                        Math.round((guides.size() - 1) * 0.99f)));
++                iris26550CandidateP99Guide = guides.get(p99);
++            }
+             all.sort(Comparator.comparingDouble(s -> presentedLuma(s, 1.0f)));
+             int from = Math.max(0, Math.round((all.size() - 1) * 0.25f));
+             int to = Math.min(all.size(), Math.max(from + 1,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 68db8350b770f663a8176970b09f64346012da06..a6c741a2bb1f376f20f009c4a31a175f7d475862 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -348,8 +348,11 @@ public class PostPipeline extends GLBasePipeline {
+          * Gain map came from pre-tone extended-linear Motion V2 signal.
+          */
+         if (mParameters.irisNightActive && motionV2GainMapBitmap != null) {
+-            throw new IllegalStateException(
+-                    "26537 Night pre-Jin UltraHDR gain map is forbidden");
++            Log.i("PostPipeline", "IRIS_26550_NIGHT_HDR_AUTHORITY_DETACHED"
++                    + " gainMap=" + motionV2GainMapBitmap.getWidth() + "x"
++                    + motionV2GainMapBitmap.getHeight()
++                    + " maxRatio=" + motionV2GainMapMaxRatio
++                    + " attachedPreJin=false postJinRebaseRequired=true");
+         }
+         if (mParameters.motionV2Active && motionV2GainMapBitmap != null) {
+             boolean attached = MotionV2UltraHdr.attach(
+@@ -445,8 +448,10 @@ public class PostPipeline extends GLBasePipeline {
+             }
+             add(new MotionV2ColorTransform());
+             add(new StageTelemetry("IRIS_NIGHT_PROFILE_COLOR"));
++            add(new MotionV2ViewfinderExposureMatcher());
++            add(new StageTelemetry("IRIS_26550_NIGHT_PRESENTATION_SOLVE"));
+             add(new MotionV2DisplayExposure());
+-            add(new StageTelemetry("IRIS_NIGHT_NEUTRAL_PRESENTATION"));
++            add(new StageTelemetry("IRIS_26550_NIGHT_PRESENTATION_EXPOSURE"));
+             add(new MotionV2Render());
+             add(new StageTelemetry("IRIS_NIGHT_RENDER"));
+             add(new RotateWatermark(getRotation(), mParameters.irisNightWatermarkEnabled));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index 00b128a454e795bf7eb2d3d1aa96c75b8035f8e6..e266e93d4e679a2aa53d5dbaa7402b142ce53c18 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -15,6 +15,7 @@ import com.particlesdevs.photoncamera.processing.IrisNightBatch;
+ import com.particlesdevs.photoncamera.processing.ProcessingEventsListener;
+ import com.particlesdevs.photoncamera.processing.opengl.postpipeline.PostPipeline;
+ import com.particlesdevs.photoncamera.processing.render.Parameters;
++import com.particlesdevs.photoncamera.processing.ultrahdr.IrisNightUltraHdr;
+ import com.particlesdevs.photoncamera.util.Allocator;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+@@ -38,6 +39,8 @@ public final class IrisNightProcessor {
+                                ProcessingEventsListener listener) {
+         final long startNs = System.nanoTime();
+         CaptureController.isProcessing = true;
++        IrisNightUltraHdr.Prepared iris26550UltraHdr = null;
++        boolean iris26550FramesReleased = false;
+         Log.processState(TAG, "NIGHT_PROCESS_ENTRY");
+         Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_ENTRY frames="
+                 + (batch == null || batch.frames == null ? -1 : batch.frames.size()));
+@@ -227,7 +230,7 @@ public final class IrisNightProcessor {
+                     + " pecanProfileSnr=referencePreMerge"
+                     + " denoiseMagnitude=propagatedResidual readShotCorrelationStrength=true"
+                     + " isoDenoiseAuthority=false darknessDenoiseAuthority=false"
+-                    + " autoLowLightLumaFloor=false ultraHdr=false"
++                    + " autoLowLightLumaFloor=false ultraHdrPostJin=true"
+                     + " superResRequested=" + iris26548NightSuperResRequested
+                     + " superResEffective=" + p.motionV2SuperResOutputEnabled;
+ 
+@@ -251,7 +254,16 @@ public final class IrisNightProcessor {
+             Log.i(TAG, "IRIS_26548_NIGHT_RGBA32F_RELEASED_BEFORE_JIN bytes=" + expectedRgbBytes);
+             if (android.os.Build.VERSION.SDK_INT >= 34 && img != null
+                     && !img.isRecycled() && img.hasGainmap()) {
+-                throw new IllegalStateException("26540 Night pre-Jin UltraHDR is forbidden");
++                throw new IllegalStateException("26550 Night gain map must remain detached before Jin");
++            }
++            if (android.os.Build.VERSION.SDK_INT >= 34 && pipeline.motionV2GainMapBitmap != null) {
++                iris26550UltraHdr = IrisNightUltraHdr.prepare(
++                        img, pipeline.motionV2GainMapBitmap,
++                        pipeline.motionV2GainMapMaxRatio, p.cameraRotation);
++                pipeline.motionV2GainMapBitmap = null;
++                Log.critical(TAG, "IRIS_26550_NIGHT_UHDR_PREPARED prepared="
++                        + (iris26550UltraHdr != null)
++                        + " postJinAttach=true preJinAttach=false");
+             }
+ 
+             final String srDetailPath = r.superResDetailPath;
+@@ -276,6 +288,13 @@ public final class IrisNightProcessor {
+             Log.processState(TAG, "NIGHT_JIN_COMPLETE");
+             Log.critical(TAG, "IRIS_26544_NIGHT_JIN_COMPLETE bitmap="
+                     + (img == null ? "null" : (img.getWidth() + "x" + img.getHeight())));
++            final boolean iris26550UltraHdrAttached = IrisNightUltraHdr.attachPostJin(
++                    img, iris26550UltraHdr);
++            iris26550UltraHdr = null;
++            Log.processState(TAG, "NIGHT_POST_JIN_ULTRAHDR_" + iris26550UltraHdrAttached);
++            Log.critical(TAG, "IRIS_26550_NIGHT_POST_JIN_ULTRAHDR attached="
++                    + iris26550UltraHdrAttached
++                    + " finalSdrAuthority=postJin sabreHdrAuthority=true");
+             final long postPlusJinMs = (System.nanoTime() - postStartNs) / 1_000_000L;
+             Log.processState(TAG, "NIGHT_FINAL_JPEG_BEGIN");
+             Log.critical(TAG, "IRIS_26544_NIGHT_FINAL_JPEG_BEGIN path=" + imageFile);
+@@ -297,10 +316,15 @@ public final class IrisNightProcessor {
+             }
+             Log.i(TAG, "IRIS_26540_NIGHT_PUBLICATION_OWNERSHIP baseSaved=" + baseSaved
+                     + " finalSaved=" + finalSaved + " imageSaved=" + imageSaved
+-                    + " jinOptional=true baseSurvivesJinFailure=true ultraHdr=false"
++                    + " jinOptional=true baseSurvivesJinFailure=true ultraHdr=" + iris26550UltraHdrAttached
+                     + " mergeMs=" + mergeMs + " postPlusJinMs=" + postPlusJinMs
+                     + " totalMs=" + ((System.nanoTime() - startNs) / 1_000_000L));
+             Log.processState(TAG, "NIGHT_PROCESS_FINISHED_NOTIFY_BEGIN");
++            releaseNightFrames(batch);
++            iris26550FramesReleased = true;
++            CaptureController.isProcessing = false;
++            Log.critical(TAG, "IRIS_26550_NIGHT_UI_COMPLETION processing=false"
++                    + " framesReleased=true beforeOnProcessingFinished=true imageSaved=" + imageSaved);
+             Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_FINISHED_NOTIFY_BEGIN");
+             listener.onProcessingFinished("Iris Night Processing Finished");
+             Log.processState(TAG, "NIGHT_PROCESS_COMPLETE");
+@@ -310,19 +334,31 @@ public final class IrisNightProcessor {
+             Log.e(TAG, "IRIS_26540_NIGHT_PROCESS_FAILED", failure);
+             Log.critical(TAG, "IRIS_26544_NIGHT_PROCESS_FAILED type="
+                     + failure.getClass().getName() + " message=" + String.valueOf(failure.getMessage()));
++            releaseNightFrames(batch);
++            iris26550FramesReleased = true;
++            CaptureController.isProcessing = false;
++            Log.critical(TAG, "IRIS_26550_NIGHT_UI_COMPLETION processing=false"
++                    + " framesReleased=true beforeOnProcessingError=true");
+             listener.onProcessingError(failure.getClass().getSimpleName() + ": "
+                     + String.valueOf(failure.getMessage()));
+         } finally {
+-            Log.critical(TAG, "IRIS_26544_NIGHT_FRAMES_RELEASE_BEGIN");
+-            if (batch != null && batch.frames != null) {
+-                for (ImageFrame frame : batch.frames) {
+-                    if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
+-                }
++            IrisNightUltraHdr.release(iris26550UltraHdr);
++            if (!iris26550FramesReleased) {
++                releaseNightFrames(batch);
+             }
+             CaptureController.isProcessing = false;
+             Log.critical(TAG, "IRIS_26544_NIGHT_FRAMES_RELEASE_END processing=false");
+         }
+     }
+ 
++    private static void releaseNightFrames(IrisNightBatch batch) {
++        Log.critical(TAG, "IRIS_26544_NIGHT_FRAMES_RELEASE_BEGIN");
++        if (batch != null && batch.frames != null) {
++            for (ImageFrame frame : batch.frames) {
++                if (frame != null) try { frame.close(); } catch (Throwable ignored) {}
++            }
++        }
++        Log.critical(TAG, "IRIS_26550_NIGHT_FRAMES_RELEASE_COMPLETE");
++    }
+ 
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisNightUltraHdr.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisNightUltraHdr.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ceec0e92540967f334d7d5c2fab549b81830ac7
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisNightUltraHdr.java
+@@ -0,0 +1,169 @@
++package com.particlesdevs.photoncamera.processing.ultrahdr;
++
++import android.graphics.Bitmap;
++import android.graphics.Matrix;
++import android.os.Build;
++
++import com.particlesdevs.photoncamera.util.Log;
++
++import java.nio.ByteBuffer;
++
++/**
++ * IRIS_26550_NIGHT_POST_JIN_ULTRAHDR_OWNER
++ *
++ * Night's GL render owns the true pre-Jin relationship between Sabre extended-linear HDR and its
++ * SDR rendition. Jin then modifies only the SDR bitmap. Keep that HDR authority detached, sample
++ * the matching pre-Jin SDR luma on the gain-map grid, and after Jin rebase each logarithmic gain
++ * against the FINAL SDR luma. This preserves the same HDR target without retaining a second
++ * full-resolution SDR bitmap and without letting Jin become HDR/exposure authority.
++ */
++public final class IrisNightUltraHdr {
++    private static final String TAG = "IrisNightUltraHdr";
++    private static final float UHDR_OFFSET = 0.015625f;
++
++    public static final class Prepared {
++        Bitmap orientedGainMap;
++        final float[] preJinLinearLuma;
++        final float maxRatio;
++        Prepared(Bitmap gainMap, float[] luma, float ratio) {
++            orientedGainMap = gainMap;
++            preJinLinearLuma = luma;
++            maxRatio = ratio;
++        }
++    }
++
++    private IrisNightUltraHdr() {}
++
++    public static Prepared prepare(Bitmap preJinSdr, Bitmap unrotatedGainMap,
++                                   float maxRatio, int rotationDegrees) {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE
++                || preJinSdr == null || preJinSdr.isRecycled()
++                || unrotatedGainMap == null || unrotatedGainMap.isRecycled()) {
++            recycle(unrotatedGainMap);
++            return null;
++        }
++        Bitmap oriented = unrotatedGainMap;
++        try {
++            int rotation = ((rotationDegrees % 360) + 360) % 360;
++            if (rotation != 0) {
++                Matrix matrix = new Matrix();
++                matrix.postRotate(rotation);
++                oriented = Bitmap.createBitmap(unrotatedGainMap, 0, 0,
++                        unrotatedGainMap.getWidth(), unrotatedGainMap.getHeight(), matrix, false);
++                if (oriented != unrotatedGainMap) recycle(unrotatedGainMap);
++            }
++            float baseAspect = preJinSdr.getWidth() / (float)Math.max(1, preJinSdr.getHeight());
++            float gainAspect = oriented.getWidth() / (float)Math.max(1, oriented.getHeight());
++            if (Math.abs(baseAspect - gainAspect) > 0.02f) {
++                throw new IllegalStateException("26550 Night UHDR aspect mismatch base="
++                        + preJinSdr.getWidth() + "x" + preJinSdr.getHeight()
++                        + " gain=" + oriented.getWidth() + "x" + oriented.getHeight());
++            }
++            float[] pre = sampleLinearLuma(preJinSdr, oriented.getWidth(), oriented.getHeight());
++            float safeMax = Math.max(1.50f, Math.min(2.5f, maxRatio));
++            Log.i(TAG, "IRIS_26550_NIGHT_UHDR_PREPARE gain=" + oriented.getWidth() + "x"
++                    + oriented.getHeight() + " base=" + preJinSdr.getWidth() + "x"
++                    + preJinSdr.getHeight() + " maxRatio=" + safeMax
++                    + " rotation=" + rotation + " preJinAttached=false memoryBounded=true");
++            return new Prepared(oriented, pre, safeMax);
++        } catch (Throwable t) {
++            Log.e(TAG, "IRIS_26550_NIGHT_UHDR_PREPARE_FAILED", t);
++            recycle(oriented);
++            return null;
++        }
++    }
++
++    public static boolean attachPostJin(Bitmap finalSdr, Prepared prepared) {
++        if (prepared == null) return false;
++        Bitmap oldMap = prepared.orientedGainMap;
++        prepared.orientedGainMap = null;
++        Bitmap rebased = null;
++        try {
++            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE
++                    || finalSdr == null || finalSdr.isRecycled() || oldMap == null
++                    || oldMap.isRecycled()) return false;
++            final int w = oldMap.getWidth(), h = oldMap.getHeight();
++            float[] finalLuma = sampleLinearLuma(finalSdr, w, h);
++            if (prepared.preJinLinearLuma.length != w * h || finalLuma.length != w * h) {
++                throw new IllegalStateException("26550 Night UHDR luma grid mismatch");
++            }
++            ByteBuffer codes = ByteBuffer.allocateDirect(w * h);
++            oldMap.copyPixelsToBuffer(codes);
++            codes.position(0);
++            ByteBuffer out = ByteBuffer.allocateDirect(w * h);
++            final double logMax = Math.log(prepared.maxRatio);
++            int nonUnity = 0, peak = 0;
++            double ratioSum = 0.0;
++            for (int i = 0; i < w * h; i++) {
++                int code = codes.get() & 0xff;
++                double oldRatio = Math.exp((code / 255.0) * logMax);
++                double pre = Math.max(0.0, prepared.preJinLinearLuma[i]);
++                double fin = Math.max(0.0, finalLuma[i]);
++                double ratio = oldRatio * (pre + UHDR_OFFSET) / (fin + UHDR_OFFSET);
++                ratio = Math.max(1.0, Math.min(prepared.maxRatio, ratio));
++                int newCode = logMax > 1.0e-9
++                        ? (int)Math.round(Math.log(ratio) / logMax * 255.0) : 0;
++                newCode = Math.max(0, Math.min(255, newCode));
++                if (newCode > 0) nonUnity++;
++                peak = Math.max(peak, newCode);
++                ratioSum += ratio;
++                out.put((byte)newCode);
++            }
++            out.position(0);
++            rebased = Bitmap.createBitmap(w, h, Bitmap.Config.ALPHA_8);
++            rebased.copyPixelsFromBuffer(out);
++            boolean attached = MotionV2UltraHdr.attach(finalSdr, rebased, 0, prepared.maxRatio);
++            if (!attached) recycle(rebased);
++            else rebased = null; // Gainmap attached to finalSdr owns contents.
++            Log.i(TAG, "IRIS_26550_NIGHT_UHDR_POST_JIN_REBASE attached=" + attached
++                    + " gain=" + w + "x" + h
++                    + " nonUnityFraction=" + (nonUnity / (float)Math.max(1, w * h))
++                    + " peakCode=" + peak
++                    + " meanRatio=" + (ratioSum / Math.max(1, w * h))
++                    + " hdrAuthority=SabreExtendedLinear"
++                    + " finalSdrAuthority=PostJin"
++                    + " jinExposureAuthority=false");
++            return attached;
++        } catch (Throwable t) {
++            Log.e(TAG, "IRIS_26550_NIGHT_UHDR_POST_JIN_REBASE_FAILED", t);
++            recycle(rebased);
++            return false;
++        } finally {
++            recycle(oldMap);
++        }
++    }
++
++    public static void release(Prepared prepared) {
++        if (prepared == null) return;
++        recycle(prepared.orientedGainMap);
++        prepared.orientedGainMap = null;
++    }
++
++    private static float[] sampleLinearLuma(Bitmap source, int w, int h) {
++        Bitmap scaled = Bitmap.createScaledBitmap(source, w, h, true);
++        int[] pixels = new int[w * h];
++        scaled.getPixels(pixels, 0, w, 0, 0, w, h);
++        if (scaled != source) recycle(scaled);
++        float[] out = new float[pixels.length];
++        for (int i = 0; i < pixels.length; i++) {
++            int c = pixels[i];
++            float r = srgbDecode(((c >> 16) & 255) / 255.0f);
++            float g = srgbDecode(((c >> 8) & 255) / 255.0f);
++            float b = srgbDecode((c & 255) / 255.0f);
++            out[i] = 0.2126f * r + 0.7152f * g + 0.0722f * b;
++        }
++        return out;
++    }
++
++    private static float srgbDecode(float x) {
++        x = Math.max(0.0f, Math.min(1.0f, x));
++        return x <= 0.04045f ? x / 12.92f
++                : (float)Math.pow((x + 0.055f) / 1.055f, 2.4);
++    }
++
++    private static void recycle(Bitmap bitmap) {
++        if (bitmap != null && !bitmap.isRecycled()) {
++            try { bitmap.recycle(); } catch (Throwable ignored) {}
++        }
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 2dac32a0f5883de4fe4a0a877b0998e62473223a..189de4933b2f395cb39af3693aab80146d55a868 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -689,6 +689,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     //*****************************************************************************************************************
+ 
+     private class CameraEventsListenerImpl extends CameraEventsListener {
++        private boolean iris26550NightUiRearmPending = false;
+         /**
+          * Implementation of {@link ProcessingEventsListener}
+          */
+@@ -720,6 +721,11 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         @Override
+         public void onProcessingFinished(Object obj) {
+             logD("onProcessingFinished: " + obj);
++            final boolean iris26550NightFinished = obj instanceof String
++                    && ((String) obj).startsWith("Iris Night Processing Finished");
++            if (iris26550NightFinished) {
++                iris26550NightUiRearmPending = true;
++            }
+             mCameraUIView.setProcessingProgressBarIndeterminate(false);
+             mCameraUIView.activateShutterButton(true);
+             mCameraUIView.lockUIForBurst(false);
+@@ -766,6 +772,22 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         @Override
+         public void onCaptureStillPictureStarted(Object o) {
+             if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
++                if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION
++                        && iris26550NightUiRearmPending) {
++                    /* IRIS_26550_NIGHT_TO_MOTION_UI_REARM
++                     * Night completion now clears CaptureController.isProcessing before its UI
++                     * callback. Queue reset then show on the same View to defeat any stale Night
++                     * reset runnable; the next Motion capture owns a fresh progress-ring cycle.
++                     */
++                    mCameraUIView.resetCaptureProgressBar();
++                    mCameraUIView.setProcessingProgressBarIndeterminate(false);
++                    mCameraUIView.activateShutterButton(true);
++                    mCameraUIView.lockUIForBurst(false);
++                    iris26550NightUiRearmPending = false;
++                    Log.i(TAG, "IRIS_26550_NIGHT_TO_MOTION_UI_REARM"
++                            + " processing=" + CaptureController.isProcessing
++                            + " captureRingReady=true processingRingReady=true shutterReady=true");
++                }
+                 mCameraUIView.setCaptureProgressBarOpacity(1.0f);
+                 mCameraUIView.lockUIForBurst(true);
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+index 9eb60be32a03b1f98c06fd7de09e747a9075d28b..2b717d6899c65384f02fbc5d029c17b3327af7e2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+@@ -285,11 +285,14 @@ case R.id.flash_button:
+         this.shutterButton.setHovered(false);
+         this.shutterButton.setActivated(false);
+         this.shutterButton.setClickable(false);
+-        /* IRIS_26516_SHUTTER_VIEWFINDER_SNAPSHOT
+-         * Fire the asynchronous preview copy immediately before Motion capture. No wait and no
+-         * Camera2 mutation: takePicture() proceeds in the same UI turn.
++        /* IRIS_26550_SHUTTER_VIEWFINDER_SNAPSHOT
++         * Motion keeps the exact 26516 shutter-time snapshot behavior. Night now requests the same
++         * display-only PixelCopy so its post-capture presentation can restore the highlight-safe
++         * Short-reference capture to the brightness actually shown at shutter time. No wait and no
++         * Camera2 mutation: takePicture() proceeds in the same UI turn for both modes.
+          */
+-        if (PhotonCamera.getSettings().selectedMode == CameraMode.MOTION) {
++        CameraMode shutterMode = PhotonCamera.getSettings().selectedMode;
++        if (shutterMode == CameraMode.MOTION || shutterMode == CameraMode.NIGHT) {
+             cameraFragment.textureView.requestMotionViewfinderMetering();
+         }
+         cameraFragment.captureController.takePicture();
+diff --git a/app/version.properties b/app/version.properties
+index b7943e5d95b7d36c08365b5b6bca8cd884fb45aa..644938cf95f0a8450c1bef250527e3b641a33743 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726549
+-VERSION_BUILD=26549
++VERSION_NAME=0.9726550
++VERSION_BUILD=26550
