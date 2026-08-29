@@ -1,0 +1,270 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 04802631b2af2160aaf580f1facbf66fb9744e11..f858e1f93c861516ee4048abc9179c6e378e2662 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -86,17 +86,20 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_processor_IrisNightNeuralEnhancer_applyReferenceResidualNative(
+         JNIEnv*e,jclass,jobject bitmap,jfloatArray residual,jintArray referenceRgb,jint rw,jint rh){
+-    /* IRIS_26556_JIN_NATIVE_SABRE_GUIDED_RESIDUAL
+-     * Jin itself is unchanged: Java supplies the complete dense 512x512 RGB residual
+-     * denorm(output)-denorm(input), plus the exact 512 RGB reference pixels fed to Jin.
++    /* IRIS_26557_JIN_CHROMA_SAFE_EDGE_ATTENUATION
++     * Jin inference and the dense 512x512 RGB residual are unchanged from 26555/26556.
++     * The 26555 bilinear RGB residual remains the color authority at native resolution.
+      *
+-     * Smooth native regions retain the exact 26555 bilinear residual. Near a real edge, native
+-     * Sabre RGB and Jin's exact 512 input identify same-side residual support. A local compatible
+-     * Jin-residual baseline may only REDUCE a high-frequency residual peak; it is never allowed to
+-     * increase any residual component beyond the 26555 bilinear magnitude. This prevents the
+-     * coarse 512 transfer from inventing bright/dark segmented structures beside a native edge
+-     * without globally disabling Jin there. No gain ratio, 32x32 grid, luma-only reinterpretation,
+-     * tiled inference, or neural-model change is introduced here.
++     * 26556's per-channel compatible-residual suppression could rotate the residual vector and
++     * reintroduce magenta borders around bright edges even though no component was amplified.
++     * 26557 removes that failure mode: edge guidance computes ONE scalar in [0.35,1.0] and applies
++     * it equally to R/G/B. Smooth regions are exactly the 26555 bilinear result; strong edges may
++     * only reduce sufficiently large Jin residuals, never change their RGB direction/sign ratio.
++     *
++     * Performance: 512-domain structural gates are precomputed once per guide cell. The previous
++     * implementation recomputed six RGB pair distances (including sqrt) for every native pixel and
++     * could also run a 3x3 compatible-residual search. No gain grid, ratio gain, luma-only Jin,
++     * tiled inference, neural-model change, or Sabre/Night ownership change is introduced here.
+      */
+     if(!bitmap||!residual||!referenceRgb||rw<2||rh<2||
+        e->GetArrayLength(residual)!=(jsize)(rw*rh*3)||
+@@ -112,37 +115,54 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+     if(e->ExceptionCheck())return JNI_FALSE;
+     for(float v:r)if(!std::isfinite(v))return JNI_FALSE;
+ 
+-    auto guideRgb=[&](int x,int y,int c)->float{
++    // Decode Jin's exact 512 input RGB once. 26556 repeatedly bit-unpacked these values in the
++    // native-resolution loop; keeping them here also makes the precomputed structural gate cheap.
++    std::vector<float> guideRgb((size_t)rw*rh*3);
++    for(int y=0;y<rh;y++)for(int x=0;x<rw;x++){
+         jint argb=guide[(size_t)y*rw+x];
+-        int shift=c==0?16:(c==1?8:0);
+-        return (float)((argb>>shift)&255)/255.f;
+-    };
+-    auto guideDistance2ToNative=[&](int x,int y,const float nativeRgb[3])->float{
+-        float d0=nativeRgb[0]-guideRgb(x,y,0);
+-        float d1=nativeRgb[1]-guideRgb(x,y,1);
+-        float d2=nativeRgb[2]-guideRgb(x,y,2);
++        size_t b=((size_t)y*rw+x)*3;
++        guideRgb[b+0]=(float)((argb>>16)&255)/255.f;
++        guideRgb[b+1]=(float)((argb>>8)&255)/255.f;
++        guideRgb[b+2]=(float)(argb&255)/255.f;
++    }
++    auto guideDistance2=[&](int ax,int ay,int bx,int by)->float{
++        size_t a=((size_t)ay*rw+ax)*3,b=((size_t)by*rw+bx)*3;
++        float d0=guideRgb[a+0]-guideRgb[b+0];
++        float d1=guideRgb[a+1]-guideRgb[b+1];
++        float d2=guideRgb[a+2]-guideRgb[b+2];
+         return (d0*d0+d1*d1+d2*d2)/3.f;
+     };
+-    auto guidePairDistance=[&](int ax,int ay,int bx,int by)->float{
+-        float d0=guideRgb(ax,ay,0)-guideRgb(bx,by,0);
+-        float d1=guideRgb(ax,ay,1)-guideRgb(bx,by,1);
+-        float d2=guideRgb(ax,ay,2)-guideRgb(bx,by,2);
+-        return std::sqrt((d0*d0+d1*d1+d2*d2)/3.f);
++    auto smooth01=[](float t)->float{
++        t=clampf(t,0.f,1.f);
++        return t*t*(3.f-2.f*t);
+     };
+ 
++    // One guide gate per 512 interpolation cell. This preserves 26556's guide-span thresholds but
++    // reduces ~75.5M native-pixel sqrt calls at 4096x3072 to at most ~261k cell-level sqrt calls.
++    std::vector<float> guideGate((size_t)rw*rh,0.f);
++    for(int y=0;y<rh-1;y++)for(int x=0;x<rw-1;x++){
++        const int gx[4]={x,x+1,x,x+1};
++        const int gy[4]={y,y,y+1,y+1};
++        float maxD2=0.f;
++        for(int a=0;a<4;a++)for(int b=a+1;b<4;b++)
++            maxD2=std::max(maxD2,guideDistance2(gx[a],gy[a],gx[b],gy[b]));
++        float span=std::sqrt(maxD2);
++        guideGate[(size_t)y*rw+x]=smooth01((span-0.060f)/(0.200f-0.060f));
++    }
++    // Border pixels map to the nearest real interpolation cell.
++    for(int y=0;y<rh-1;y++)guideGate[(size_t)y*rw+(rw-1)]=guideGate[(size_t)y*rw+(rw-2)];
++    for(int x=0;x<rw;x++)guideGate[(size_t)(rh-1)*rw+x]=guideGate[(size_t)(rh-2)*rw+x];
++
+     void*p=nullptr;
+     if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;
+     const auto*base=(const uint8_t*)p;
+-    uint64_t guidedPixels=0;
+-    uint64_t suppressedComponents=0;
++    uint64_t edgePixels=0;
++    uint64_t attenuatedPixels=0;
++    float minScale=1.f;
+     const uint64_t totalPixels=(uint64_t)info.width*(uint64_t)info.height;
+     auto luma=[](const uint8_t*q)->float{
+         return (0.2126f*(float)q[0]+0.7152f*(float)q[1]+0.0722f*(float)q[2])/255.f;
+     };
+-    auto smooth01=[](float t)->float{
+-        t=clampf(t,0.f,1.f);
+-        return t*t*(3.f-2.f*t);
+-    };
+ 
+     for(uint32_t y=0;y<info.height;y++){
+         auto*row=(uint8_t*)p+(size_t)y*info.stride;
+@@ -168,8 +188,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+                 for(int c=0;c<3;c++)bilinear[c]+=r[b+c]*sw[k];
+             }
+ 
+-            // High-resolution native edge evidence. Right/down samples are unmodified in scan
+-            // order, so this does not use residual-altered pixels as the structural guide.
++            // High-resolution native edge evidence. Right/down are still unmodified in scan order,
++            // so the structural gate never reads a Jin-altered future pixel.
+             float centerL=luma(q),nativeEdge=0.f;
+             if(x+1<info.width){
+                 const uint8_t*qr=row+(size_t)(x+1)*4;
+@@ -179,58 +199,25 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+                 const uint8_t*qd=base+(size_t)(y+1)*info.stride+(size_t)x*4;
+                 nativeEdge=std::max(nativeEdge,std::fabs(centerL-luma(qd)));
+             }
+-
+-            // The 512 guide footprint extends edge awareness across the whole interpolation cell,
+-            // not just the single native boundary pixel. Smooth 512 neighborhoods keep this zero.
+-            float guideSpan=0.f;
+-            for(int a=0;a<4;a++)for(int b=a+1;b<4;b++)
+-                guideSpan=std::max(guideSpan,guidePairDistance(gx[a],gy[a],gx[b],gy[b]));
+             float nativeGate=smooth01((nativeEdge-0.025f)/(0.120f-0.025f));
+-            float guideGate=smooth01((guideSpan-0.060f)/(0.200f-0.060f));
+-            float edgeGate=std::max(nativeGate,guideGate);
++            float cellGate=guideGate[(size_t)y0*rw+x0];
++            float edgeGate=std::max(nativeGate,cellGate);
++            if(edgeGate>=0.5f)edgePixels++;
+ 
+-            float reduced[3]={bilinear[0],bilinear[1],bilinear[2]};
+-            if(edgeGate>0.0001f){
+-                // Local compatible Jin-residual baseline. Native RGB selects samples from the same
+-                // structural side of the edge while the spatial term keeps the baseline local.
+-                int cx=std::max(0,std::min(rw-1,(int)lroundf(fx)));
+-                int cy=std::max(0,std::min(rh-1,(int)lroundf(fy)));
+-                float sum[3]={0.f,0.f,0.f};
+-                float wsum=0.f;
+-                for(int yy=std::max(0,cy-1);yy<=std::min(rh-1,cy+1);yy++){
+-                    for(int xx=std::max(0,cx-1);xx<=std::min(rw-1,cx+1);xx++){
+-                        float dx=(float)xx-fx,dy=(float)yy-fy;
+-                        float spatial=1.f/(1.f+dx*dx+dy*dy);
+-                        float compat=1.f/(1.f+80.f*guideDistance2ToNative(xx,yy,nativeRgb));
+-                        float w=spatial*compat;
+-                        size_t b=((size_t)yy*rw+xx)*3;
+-                        for(int c=0;c<3;c++)sum[c]+=r[b+c]*w;
+-                        wsum+=w;
+-                    }
+-                }
+-                if(wsum>1.0e-8f){
+-                    for(int c=0;c<3;c++){
+-                        float mean=sum[c]/wsum;
+-                        float before=bilinear[c];
+-                        float after=before;
+-                        // Permanent edge-artifact invariant: guidance may suppress a local residual
+-                        // peak but may never create a larger correction than 26555 bilinear.
+-                        if(before!=0.f){
+-                            if(before*mean<=0.f && std::fabs(mean)<std::fabs(before))after=0.f;
+-                            else if(before*mean>0.f && std::fabs(mean)<std::fabs(before))after=mean;
+-                        }
+-                        reduced[c]=after;
+-                        if(std::fabs(after)+1.0e-8f<std::fabs(before))suppressedComponents++;
+-                    }
+-                }
+-                if(edgeGate>=0.5f)guidedPixels++;
+-            }
++            // Small Jin corrections are preserved even at strong edges. Larger residuals are where
++            // coarse 512 transfer can create glow, so only that risk class receives attenuation.
++            float residualPeak=std::max(std::fabs(bilinear[0]),
++                    std::max(std::fabs(bilinear[1]),std::fabs(bilinear[2])));
++            float residualGate=smooth01((residualPeak-0.015f)/(0.080f-0.015f));
++            float scale=1.f-0.65f*edgeGate*residualGate;
++            scale=clampf(scale,0.35f,1.f);
++            if(scale<0.999999f){attenuatedPixels++;minScale=std::min(minScale,scale);}
+ 
++            // Chroma-safety invariant: ONE scalar multiplies the complete 26555 bilinear RGB
++            // residual vector. Guidance cannot rotate hue, change component signs independently,
++            // or increase any component magnitude over the 26555 result.
+             for(int c=0;c<3;c++){
+-                float rr=bilinear[c]+(reduced[c]-bilinear[c])*edgeGate;
+-                // The inequality is intentional and regression-tested: edge guidance cannot
+-                // increase the absolute Jin correction versus the original 26555 bilinear value.
+-                if(std::fabs(rr)>std::fabs(bilinear[c])+1.0e-6f)rr=bilinear[c];
++                float rr=bilinear[c]*scale;
+                 float v=nativeRgb[c]+rr;
+                 q[c]=(uint8_t)lrintf(clampf(v,0.f,1.f)*255.f);
+             }
+@@ -238,10 +225,10 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+     }
+     AndroidBitmap_unlockPixels(e,bitmap);
+     __android_log_print(ANDROID_LOG_INFO,TAG,
+-            "IRIS_26556_JIN_NATIVE_GUIDED_TRANSFER native=%ux%u guide=%dx%d guidedPixels=%llu totalPixels=%llu suppressedComponents=%llu",
++            "IRIS_26557_JIN_CHROMA_SAFE_EDGE_ATTENUATION native=%ux%u guide=%dx%d edgePixels=%llu totalPixels=%llu attenuatedPixels=%llu minScale=%.4f",
+             info.width,info.height,(int)rw,(int)rh,
+-            (unsigned long long)guidedPixels,(unsigned long long)totalPixels,
+-            (unsigned long long)suppressedComponents);
++            (unsigned long long)edgePixels,(unsigned long long)totalPixels,
++            (unsigned long long)attenuatedPixels,(double)minScale);
+     return JNI_TRUE;
+ }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightNeuralEnhancer.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightNeuralEnhancer.java
+index 4c0e812c8a3f80130a938ba3b252ec9e9e18b159..63a99eebf0e5271a28bf870c0d17f76c86086461 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightNeuralEnhancer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightNeuralEnhancer.java
+@@ -31,9 +31,10 @@ import ai.onnxruntime.OrtSession;
+  *
+  * Minimal Iris native-resolution adapter:
+  *  - retain the complete dense 512x512x3 learned RGB residual (output - input);
+- *  - transfer that residual to native resolution with the exact 512 input RGB plus the native
+- *    Sabre/VGN/Post RGB as a structure guide: smooth regions retain the 26555 bilinear result,
+- *    while strong native edges use an edge-aware transfer that cannot freely bleed across them;
++ *  - retain 26555 bilinear RGB residual as the native color authority;
++ *  - use the exact 512 input RGB plus native Sabre/VGN/Post RGB only to compute a shared edge
++ *    attenuation scalar: smooth regions remain exact 26555, while risky strong-edge residuals
++ *    shrink as one RGB vector so guidance cannot rotate hue or reintroduce magenta borders;
+  *  - never form the rejected 32x32 gain grid, never divide output/input, never tile Jin, and
+  *    never reinterpret Jin's RGB prediction as a luminance-only correction.
+  *
+@@ -148,6 +149,7 @@ public final class IrisNightNeuralEnhancer {
+             }
+ 
+             final float[] residual = new float[N * N * 3];
++            long inferenceStartNs = System.nanoTime();
+             try {
+                 fillReferenceResidual(cpuSession, cpuInputName, input, residual);
+             } catch (Throwable inferenceFailure) {
+@@ -155,14 +157,22 @@ public final class IrisNightNeuralEnhancer {
+                         + describe(inferenceFailure), inferenceFailure);
+                 return false;
+             }
++            long inferenceMs = (System.nanoTime() - inferenceStartNs) / 1_000_000L;
++            Log.i(TAG, "IRIS_26557_JIN_TIMING stage=inference ms=" + inferenceMs);
+ 
+-            if (!applyReferenceResidualNative(base, residual, px, N, N)) {
++            long transferStartNs = System.nanoTime();
++            boolean transferred = applyReferenceResidualNative(base, residual, px, N, N);
++            long transferMs = (System.nanoTime() - transferStartNs) / 1_000_000L;
++            Log.i(TAG, "IRIS_26557_JIN_TIMING stage=nativeTransfer ms=" + transferMs
++                    + " applied=" + transferred);
++            if (!transferred) {
+                 Log.e(TAG, "IRIS_26555_JIN_REFERENCE residualApply=false");
+                 return false;
+             }
+-            Log.i(TAG, "IRIS_26556_JIN_NATIVE_GUIDED_TRANSFER applied=true input=mergedRgb"
++            Log.i(TAG, "IRIS_26557_JIN_CHROMA_SAFE_TRANSFER applied=true input=mergedRgb"
+                     + " inference=512x512 completeRgb=true denseResidual=true"
+                     + " nativeSabreGuide=true smoothRegionExactBilinear=true"
++                    + " sharedRgbScalar=true hueRotation=false"
+                     + " coarseGrid=false ratioGain=false lumaOnly=false tiled=false");
+             return true;
+         } catch (Throwable setupFailure) {
+diff --git a/app/version.properties b/app/version.properties
+index 0217c13eca80cf056ada420a6ee7de47b8134c8a..eccb25a1b049aaa760469e27a1be68f5f8e370da 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726556
+-VERSION_BUILD=26556
++VERSION_NAME=0.9726557
++VERSION_BUILD=26557
