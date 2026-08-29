@@ -1,0 +1,995 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index b74833d37043f60fa1defcaddc00d64096c77761..2635afb430058b66a9c122b160135c5fdb0c8abb 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -73,6 +73,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+     private var iirErrorProgram = 0
+     private var blendProgram = 0
+     private var finalProgram = 0
++    private var universalAdaptiveColorProgram = 0
+ 
+     private var assembledRgb = 0
+     private var workA = 0
+@@ -98,6 +99,10 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         iirErrorProgram = host.linkComputeProgram(Iris26529SpatialRgbChromaShaders.iirError, "iris26529_chroma_iir_error")
+         blendProgram = host.linkComputeProgram(Iris26529SpatialRgbChromaShaders.blendChroma, "iris26529_chroma_blend")
+         finalProgram = host.linkComputeProgram(Iris26529SpatialRgbChromaShaders.finalCameraRgb, "iris26529_chroma_final")
++        universalAdaptiveColorProgram = host.linkComputeProgram(
++            Iris26529SpatialRgbChromaShaders.universalAdaptiveColor26561,
++            "iris26561_universal_adaptive_color",
++        )
+     }
+ 
+     fun beginFullFrame(newBands: List<MgcSpatialRgbTile>) {
+@@ -177,6 +182,15 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+ 
+         val finalStart = System.nanoTime()
+         dispatchFinal(filteredYccd, originalYccd)
++        /* IRIS_26561_UNIVERSAL_ADAPTIVE_COLOR
++         * Current-MGC VGN completes first, unchanged. One shared Iris post-VGN pass then removes
++         * only locally unsupported shadow chroma while protecting coherent color and luminance
++         * edges. Motion and Night therefore use the same color decision layer.
++         */
++        dispatchUniversalAdaptiveColor(assembledRgb, workA)
++        val completedVgn = assembledRgb
++        assembledRgb = workA
++        workA = completedVgn
+         val finalMs = (System.nanoTime() - finalStart) / 1_000_000L
+         onFinalSubmitted?.invoke()
+ 
+@@ -342,6 +356,20 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         return input to output
+     }
+ 
++    private fun dispatchUniversalAdaptiveColor(source: Int, destination: Int) {
++        check(universalAdaptiveColorProgram != 0)
++        GLES31.glUseProgram(universalAdaptiveColorProgram)
++        setImageSize(universalAdaptiveColorProgram)
++        bindImage(0, source, GLES31.GL_READ_ONLY)
++        bindImage(1, destination, GLES31.GL_WRITE_ONLY)
++        trackedDispatch(
++            "IRIS 26561 universal adaptive color",
++            intArrayOf(source),
++            intArrayOf(destination),
++        )
++        clearImages()
++    }
++
+     private fun runIirError(source: Int, destination: Int, a10: FloatArray, b10: FloatArray): Pair<Int, Int> {
+         var input = source
+         var output = destination
+@@ -565,6 +593,64 @@ internal object Iris26529SpatialRgbChromaShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26561_UNIVERSAL_ADAPTIVE_COLOR
++     * Runs only after current-MGC VGN has produced completed camera RGB. It is intentionally
++     * hue-agnostic and never boosts saturation: coherent color and luminance edges pass through;
++     * only unsupported local shadow chroma is pulled toward the local chroma consensus.
++     */
++    val universalAdaptiveColor26561 = """
++        #version 310 es
++        layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++        precision highp float;
++        precision highp int;
++        layout(rgba16ui, binding = 0) readonly uniform highp uimage2D uSource;
++        layout(rgba16ui, binding = 1) writeonly uniform highp uimage2D uDestination;
++        uniform ivec2 uImageSize;
++
++        vec3 loadRgb(ivec2 p) {
++            uvec4 packedValue = imageLoad(uSource, clamp(p, ivec2(0), uImageSize - ivec2(1)));
++            return vec3(packedValue.rgb) / 65535.0;
++        }
++
++        float luminanceOf(vec3 rgb) {
++            return dot(rgb, vec3(0.25, 0.50, 0.25));
++        }
++
++        void main() {
++            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++            if (any(greaterThanEqual(p, uImageSize))) return;
++            vec3 center = loadRgb(p);
++            float centerLuma = luminanceOf(center);
++            vec3 localRgb = vec3(0.0);
++            float maximumLumaDelta = 0.0;
++            for (int y = -1; y <= 1; ++y) {
++                for (int x = -1; x <= 1; ++x) {
++                    vec3 neighborRgb = loadRgb(p + ivec2(x, y));
++                    localRgb += neighborRgb;
++                    maximumLumaDelta = max(
++                        maximumLumaDelta,
++                        abs(luminanceOf(neighborRgb) - centerLuma)
++                    );
++                }
++            }
++            localRgb /= 9.0;
++            float localLuma = luminanceOf(localRgb);
++            vec3 centerChroma = center - vec3(centerLuma);
++            vec3 localChroma = localRgb - vec3(localLuma);
++            float chromaDisagreement = length(centerChroma - localChroma);
++            float localChromaMagnitude = length(localChroma);
++            float unsupportedColor = smoothstep(0.010, 0.055, chromaDisagreement) *
++                (1.0 - smoothstep(0.020, 0.120, localChromaMagnitude));
++            float shadowNeed = 1.0 - smoothstep(0.040, 0.220, centerLuma);
++            float edgeProtection = smoothstep(0.018, 0.090, maximumLumaDelta);
++            float correction = 0.65 * unsupportedColor * shadowNeed * (1.0 - edgeProtection);
++            vec3 correctedChroma = mix(centerChroma, localChroma, correction);
++            vec3 correctedRgb = clamp(vec3(centerLuma) + correctedChroma, 0.0, 1.0);
++            uvec3 encodedRgb = uvec3(round(correctedRgb * 65535.0));
++            imageStore(uDestination, p, uvec4(encodedRgb, 65535u));
++        }
++    """.trimIndent()
++
+     val seed = """
+         #version 310 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+index c6273daa5a521ede1e8b5fb1e5969d9bdd422835..453e721de71dfafac25e1e1d8e43e4b3d449f9eb 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+@@ -1,6 +1,7 @@
+ package com.hinnka.mycamera.processor
+ 
+ import com.hinnka.mycamera.utils.PLog
++import java.io.File
+ 
+ /**
+  * IRIS_26545_SABRE_OWNER
+@@ -29,6 +30,8 @@ internal class GlesIris26545SabreProcessor(
+     private val exportNormalStackedDng: Boolean,
+     private val vgnChromaCorrectionStrength: Float = 1f,
+     private val allowShadowLong: Boolean = false,
++    private val enableSuperRes: Boolean = false,
++    private val superResTempDir: File? = null,
+ ) {
+     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+         if (frames.isEmpty()) return null
+@@ -69,7 +72,8 @@ internal class GlesIris26545SabreProcessor(
+             TAG,
+             "IRIS_26547_SABRE_OWNER_ACTIVE base=${frames[baseIndex].frameNumber} " +
+                 "normal=$normalCount shadowLong=$longCount allowShadowLong=$allowShadowLong " +
+-                "excluded=${excluded.size} shortReferenceImmutable=true spatial=false bento=false output=linear-rgb",
++                "excluded=${excluded.size} shortReferenceImmutable=true spatial=false bento=false output=linear-rgb " +
++                    "superRes=$enableSuperRes srEvidence=NORMAL_ONLY",
+         )
+         /* IRIS_26545_V1_2_SABRE_LOW_LEVEL_ISOLATION
+          * Match bjzhou's current Sabre architecture: the shared low-level GL class is used only
+@@ -97,6 +101,8 @@ internal class GlesIris26545SabreProcessor(
+             processorPipeline = MgcRawProcessorPipeline.SABRE,
+             exportNormalStackedDng = exportNormalStackedDng,
+             vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
++            enableSabreSuperRes = enableSuperRes,
++            sabreSuperResTempDir = superResTempDir,
+         ).processFrames(admitted)
+     }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index d59a99fb9e8c04ba008e6fae2d0f309e733636fc..925aad1f7171a71cd0c09016af4e964de1d9aaaa 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -1,6 +1,7 @@
+ package com.hinnka.mycamera.processor
+ 
+ import com.hinnka.mycamera.utils.PLog
++import java.io.File
+ 
+ /**
+  * IRIS_26560_SABRE_ONLY_RAW_FUSION_OWNER
+@@ -26,6 +27,8 @@ internal class GlesMgcRawFusion(
+     private val gpuLinearRgbStorage: GpuLinearRgbStorage,
+     private val exportNormalStackedDng: Boolean = false,
+     private val vgnChromaCorrectionStrength: Float = 1f,
++    private val enableSabreSuperRes: Boolean = false,
++    private val sabreSuperResTempDir: File? = null,
+ ) {
+     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+         if (frames.isEmpty()) return null
+@@ -51,6 +54,8 @@ internal class GlesMgcRawFusion(
+             exportNormalStackedDng = exportNormalStackedDng,
+             vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
+             allowShadowLong = allowSabreShadowLong,
++            enableSuperRes = enableSabreSuperRes,
++            superResTempDir = sabreSuperResTempDir,
+         ).processFrames(frames)
+     }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 261ec87f5e7c34be5f21bd2957b2c79c68f7f5fa..52cb2609919ed83f1fb98b954101b896571eaf38 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -800,6 +800,211 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26561_SABRE_NATIVE_2X_DETAIL
++     * Iris Super Res extension after the current-MGC Sabre alignment/rejection contract.
++     * The 1x Sabre merge/Resolve/VGN sources above remain unchanged. This shader reuses the
++     * same sparse flow, covariance RBF and rejection decision at a 2x sample grid, but stores
++     * only weighted luma + accepted-frame support. It is therefore not a second color owner.
++     */
++    val superResDetailMerge26561 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uExtractedBayer;
++        uniform sampler2D uFlow;
++        uniform sampler2D uCovariance;
++        uniform sampler2D uRejection;
++        uniform vec4 uFlowScaleOffset;
++        uniform ivec2 uExtractedSize;
++        uniform ivec2 uOutputSize;
++        uniform vec4 uFrameBorderPadded;
++        uniform int uCfaPattern;
++        uniform int uUseFrameWeight;
++        uniform vec4 uGains;
++        uniform vec4 uBlackLevelsTimesGains;
++        uniform vec4 uCovRangeRg;
++        uniform vec2 uCovRangeB;
++        layout(location = 0) out vec2 oLumaAndSupport;
++
++        vec2 mirrorUvs(vec2 sampleUv) {
++            if (sampleUv.x <= uFrameBorderPadded.x)
++                sampleUv.x = 2.0 * uFrameBorderPadded.x - sampleUv.x;
++            if (sampleUv.y <= uFrameBorderPadded.y)
++                sampleUv.y = 2.0 * uFrameBorderPadded.y - sampleUv.y;
++            if (sampleUv.x > uFrameBorderPadded.z)
++                sampleUv.x = 2.0 * uFrameBorderPadded.z - sampleUv.x;
++            if (sampleUv.y > uFrameBorderPadded.w)
++                sampleUv.y = 2.0 * uFrameBorderPadded.w - sampleUv.y;
++            return sampleUv;
++        }
++
++        float kernelWeight(vec2 pixelOffset, vec3 covariance) {
++            float kernelDistance =
++                pixelOffset.x * pixelOffset.x * covariance.x +
++                pixelOffset.y * pixelOffset.y * covariance.y +
++                pixelOffset.x * pixelOffset.y * covariance.z * 2.0;
++            return exp2(-0.5 * kernelDistance) + 0.00005;
++        }
++
++        vec3 unpackCovariance(vec3 packed) {
++            return vec3(
++                packed.x * uCovRangeRg.y + uCovRangeRg.x,
++                packed.y * uCovRangeRg.w + uCovRangeRg.z,
++                packed.z * uCovRangeB.y + uCovRangeB.x
++            );
++        }
++
++        mat3 get3x3FromExtractedBayer(ivec2 bayerPosition) {
++            mat3 values = mat3(0.0);
++            int type = (bayerPosition.y % 2) * 2 + (bayerPosition.x % 2);
++            vec2 texturePosition = vec2(bayerPosition / 2);
++            if (type == 0) texturePosition += vec2(-1.0, -1.0);
++            else if (type == 1) texturePosition += vec2(0.0, -1.0);
++            else if (type == 2) texturePosition += vec2(-1.0, 0.0);
++            texturePosition += vec2(0.5);
++            vec2 reciprocalSize = 1.0 / vec2(uExtractedSize);
++            vec4 bayer0 = texture(uExtractedBayer, texturePosition * reciprocalSize);
++            vec4 bayer1 = texture(uExtractedBayer, (texturePosition + vec2(1.0, 0.0)) * reciprocalSize);
++            vec4 bayer2 = texture(uExtractedBayer, (texturePosition + vec2(0.0, 1.0)) * reciprocalSize);
++            vec4 bayer3 = texture(uExtractedBayer, (texturePosition + vec2(1.0, 1.0)) * reciprocalSize);
++            if (type == 0) {
++                values[0][0] = bayer0.w; values[1][0] = bayer1.z; values[2][0] = bayer1.w;
++                values[0][1] = bayer2.y; values[1][1] = bayer3.x; values[2][1] = bayer3.y;
++                values[0][2] = bayer2.w; values[1][2] = bayer3.z; values[2][2] = bayer3.w;
++            } else if (type == 1) {
++                values[0][0] = bayer0.z; values[1][0] = bayer0.w; values[2][0] = bayer1.z;
++                values[0][1] = bayer2.x; values[1][1] = bayer2.y; values[2][1] = bayer3.x;
++                values[0][2] = bayer2.z; values[1][2] = bayer2.w; values[2][2] = bayer3.z;
++            } else if (type == 2) {
++                values[0][0] = bayer0.y; values[1][0] = bayer1.x; values[2][0] = bayer1.y;
++                values[0][1] = bayer0.w; values[1][1] = bayer1.z; values[2][1] = bayer1.w;
++                values[0][2] = bayer2.y; values[1][2] = bayer3.x; values[2][2] = bayer3.y;
++            } else {
++                values[0][0] = bayer0.x; values[1][0] = bayer0.y; values[2][0] = bayer1.x;
++                values[0][1] = bayer0.z; values[1][1] = bayer0.w; values[2][1] = bayer1.z;
++                values[0][2] = bayer2.x; values[1][2] = bayer2.y; values[2][2] = bayer3.x;
++            }
++            return values;
++        }
++
++        vec4 swizzleForType(vec4 value, int type) {
++            if (type == 0) return value.rgba;
++            if (type == 1) return value.grab;
++            if (type == 2) return value.barg;
++            return value.abgr;
++        }
++
++        void sampleNeighborhoodRbf(
++            vec2 sampleUv,
++            vec3 covariance,
++            out vec3 accumulatedIntensities,
++            out vec3 accumulatedWeights
++        ) {
++            accumulatedIntensities = vec3(0.0);
++            accumulatedWeights = vec3(0.0);
++            vec2 coordinateScaled = sampleUv * (vec2(uExtractedSize) * 2.0);
++            ivec2 position = ivec2(coordinateScaled);
++            mat3 bayerValue = get3x3FromExtractedBayer(position);
++            mat3 weights = mat3(0.0);
++            vec2 subpixelOffset = floor(coordinateScaled) + 0.5 - coordinateScaled;
++            for (int i = -1; i <= 1; ++i) {
++                for (int j = -1; j <= 1; ++j) {
++                    weights[i + 1][j + 1] = kernelWeight(subpixelOffset + vec2(ivec2(i, j)), covariance);
++                }
++            }
++            ivec2 bayerOffset = ivec2(0);
++            if (uCfaPattern == 0) bayerOffset = ivec2(1, 1);
++            else if (uCfaPattern == 1) bayerOffset = ivec2(0, 1);
++            else if (uCfaPattern == 2) bayerOffset = ivec2(1, 0);
++            int type = (((position.y + bayerOffset.y) & 1) << 1) + ((position.x + bayerOffset.x) & 1);
++            vec4 cornerWeights = vec4(weights[0][0], weights[0][2], weights[2][0], weights[2][2]);
++            vec2 upDownWeights = vec2(weights[1][0], weights[1][2]);
++            vec2 leftRightWeights = vec2(weights[0][1], weights[2][1]);
++            vec4 value1 = vec4(bayerValue[0][0], bayerValue[0][2], bayerValue[2][0], bayerValue[2][2]);
++            vec2 value2 = vec2(bayerValue[1][0], bayerValue[1][2]);
++            vec2 value3 = vec2(bayerValue[0][1], bayerValue[2][1]);
++            vec4 reorderedGains = swizzleForType(uGains, type);
++            vec4 reorderedBlack = swizzleForType(uBlackLevelsTimesGains, type);
++            vec4 intensities = vec4(
++                dot(value1 * reorderedGains.r + reorderedBlack.r, cornerWeights),
++                dot(value2 * reorderedGains.g + reorderedBlack.g, upDownWeights),
++                dot(value3 * reorderedGains.b + reorderedBlack.b, leftRightWeights),
++                (bayerValue[1][1] * reorderedGains.a + reorderedBlack.a) * weights[1][1]
++            );
++            vec4 reorderedWeights = vec4(
++                dot(cornerWeights, vec4(1.0)),
++                dot(upDownWeights, vec2(1.0)),
++                dot(leftRightWeights, vec2(1.0)),
++                weights[1][1]
++            );
++            intensities = swizzleForType(intensities, type);
++            reorderedWeights = swizzleForType(reorderedWeights, type);
++            accumulatedIntensities = vec3(intensities.r, intensities.g + intensities.b, intensities.a);
++            accumulatedWeights = vec3(reorderedWeights.r, reorderedWeights.g + reorderedWeights.b, reorderedWeights.a);
++        }
++
++        void main() {
++            vec2 referenceUv = gl_FragCoord.xy / vec2(uOutputSize);
++            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
++            vec2 flow = texture(uFlow, flowUv).xy;
++            vec2 sampleUv = mirrorUvs(referenceUv + flow);
++            vec3 covariance = unpackCovariance(texture(uCovariance, sampleUv).xyz);
++            vec3 accumulatedColor = vec3(0.0);
++            vec3 accumulatedWeight = vec3(0.0);
++            sampleNeighborhoodRbf(sampleUv, covariance, accumulatedColor, accumulatedWeight);
++            vec3 frameRgb = accumulatedColor / max(accumulatedWeight, vec3(1.0e-6));
++            float frameLuma = dot(frameRgb, vec3(0.25, 0.50, 0.25));
++            float frameWeight = uUseFrameWeight != 0 ? texture(uRejection, referenceUv).r : 1.0;
++            oLumaAndSupport = vec2(frameLuma * frameWeight, frameWeight);
++        }
++    """.trimIndent()
++
++    /* Convert the 2x luma/support carrier to the existing 26532 Q8 signed-log-detail contract.
++     * A reference-only pixel has support 1 and intentionally resolves to neutral detail. Multiple
++     * accepted NORMAL observations progressively unlock real subpixel detail. Deep-black signal is
++     * also neutral, preventing SR from magnifying unsupported shadow noise.
++     */
++    val superResDetailResolve26561 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uAccumulatedDetail;
++        uniform ivec2 uOutputSize;
++        uniform int uBandTop;
++        uniform float uExpectedNormalFrames;
++        layout(location = 0) out float oDetailCode;
++
++        vec2 lumaAndSupportAt(ivec2 p) {
++            return texelFetch(uAccumulatedDetail, clamp(p, ivec2(0), uOutputSize - ivec2(1)), 0).rg;
++        }
++
++        float resolvedLuma(vec2 packedValue) {
++            return packedValue.x / max(packedValue.y, 1.0e-6);
++        }
++
++        void main() {
++            ivec2 p = ivec2(gl_FragCoord.xy) + ivec2(0, uBandTop);
++            ivec2 blockOrigin = (p / 2) * 2;
++            vec2 packed0 = lumaAndSupportAt(blockOrigin);
++            vec2 packed1 = lumaAndSupportAt(blockOrigin + ivec2(1, 0));
++            vec2 packed2 = lumaAndSupportAt(blockOrigin + ivec2(0, 1));
++            vec2 packed3 = lumaAndSupportAt(blockOrigin + ivec2(1, 1));
++            float luma0 = resolvedLuma(packed0);
++            float luma1 = resolvedLuma(packed1);
++            float luma2 = resolvedLuma(packed2);
++            float luma3 = resolvedLuma(packed3);
++            float blockMean = max((luma0 + luma1 + luma2 + luma3) * 0.25, 1.0e-6);
++            float currentLuma = resolvedLuma(lumaAndSupportAt(p));
++            float minimumSupport = min(min(packed0.y, packed1.y), min(packed2.y, packed3.y));
++            float supportEnd = min(max(uExpectedNormalFrames, 2.0), 3.0);
++            float supportGate = smoothstep(1.0, supportEnd, minimumSupport);
++            float signalGate = smoothstep(0.002, 0.020, blockMean);
++            float logDetail = clamp(log2(max(currentLuma, 1.0e-6) / blockMean), -0.75, 0.75);
++            float trustedLogDetail = logDetail * supportGate * signalGate;
++            oDetailCode = clamp((trustedLogDetail / 0.75) * 0.5 + 0.5, 0.0, 1.0);
++        }
++    """.trimIndent()
++
+     /**
+      * IRIS_26545_SABRE_SPARSE_FLOW_CONTRACT
+      * Sabre-only reproduction of MGC ConvertAlignmentHalide. Keep the LK grid sparse; each
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index d264aa2e6bd1d507d62791b45f09c8dec78dddd4..09d451fe60f846cd66e947738d26fb0e886bfff0 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -14,6 +14,9 @@ import com.hinnka.mycamera.model.SafeImage
+ import com.hinnka.mycamera.raw.MgcSpatialStrengthMap
+ import com.hinnka.mycamera.utils.LargeDirectBuffer
+ import com.hinnka.mycamera.utils.PLog
++import java.io.BufferedOutputStream
++import java.io.File
++import java.io.FileOutputStream
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+ import kotlin.math.ceil
+@@ -61,6 +64,8 @@ internal class GlesMgcRawSpatialStacker(
+     // at this low-level boundary while defaulting to the exact adaptive SNR interpolation.
+     private val sabreMergeGradientThreshold: Float? = null,
+     private val vgnChromaCorrectionStrength: Float = 1f,
++    private val enableSabreSuperRes: Boolean = false,
++    private val sabreSuperResTempDir: File? = null,
+ ) {
+     private data class TextureLevel(
+         val texture: Int,
+@@ -471,6 +476,8 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreExtractBayerProgram = 0
+     private var sabreGuideAndCovarianceProgram = 0
+     private var sabreMergeProgram = 0
++    private var sabreSuperResDetailMergeProgram = 0
++    private var sabreSuperResDetailResolveProgram = 0
+     private var sabreShadowLongMergeProgram = 0
+     private var sabreShadowLongCopyMaskProgram = 0
+     private var sabreNormalDngMergeProgram = 0
+@@ -2010,6 +2017,7 @@ internal class GlesMgcRawSpatialStacker(
+         var normalStackedDngRaw16: ByteBuffer? = null
+         var normalStackedDngSupport = SabreNormalDngSupportStats.identity()
+         var normalStackedDngNoiseProfile: DoubleArray? = null
++        var superResDetailPath: String? = null
+         var exportedTexture = 0
+         var returned = false
+         val originalThreadPriority = GlesGpuScheduler.lowerCurrentThreadPriority(SABRE_TAG)
+@@ -2023,6 +2031,18 @@ internal class GlesMgcRawSpatialStacker(
+ 
+             val extractedWidth = ceilDiv(width, 2)
+             val extractedHeight = ceilDiv(height, 2)
++            val superResWidth = if (enableSabreSuperRes) width * 2 else 0
++            val superResHeight = if (enableSabreSuperRes) height * 2 else 0
++            if (enableSabreSuperRes) {
++                requireNotNull(sabreSuperResTempDir) {
++                    "26561 Sabre Super Res requires a temp directory"
++                }
++                val maximumTexture = IntArray(1)
++                GLES30.glGetIntegerv(GLES30.GL_MAX_TEXTURE_SIZE, maximumTexture, 0)
++                require(superResWidth <= maximumTexture[0] && superResHeight <= maximumTexture[0]) {
++                    "26561 Sabre Super Res ${superResWidth}x$superResHeight exceeds GL_MAX_TEXTURE_SIZE=${maximumTexture[0]}"
++                }
++            }
+             val coverageWidth = ceilDiv(extractedWidth, 2)
+             val coverageHeight = ceilDiv(extractedHeight, 2)
+             val referenceRaw = createTexture(width, height, GLES30.GL_R16UI, GLES30.GL_NEAREST)
+@@ -2075,6 +2095,21 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_RG16F,
+                 GLES30.GL_NEAREST,
+             )
++            /* IRIS_26561_SABRE_NATIVE_2X_DETAIL
++             * The proven 1x Sabre RGB accumulator remains authoritative. Super Res adds only a
++             * two-channel 2x luma/support carrier (RG16F), never a full 2x RGB image. This keeps
++             * VGN/color ownership native and bounds the additional GPU surface to 4 bytes/pixel.
++             */
++            val superResDetailAccumulator = if (enableSabreSuperRes) {
++                createTexture(
++                    superResWidth,
++                    superResHeight,
++                    GLES30.GL_RG16F,
++                    GLES30.GL_NEAREST,
++                )
++            } else {
++                0
++            }
+             val accumulatedCoverage = createTexture(
+                 coverageWidth,
+                 coverageHeight,
+@@ -2108,6 +2143,13 @@ internal class GlesMgcRawSpatialStacker(
+                 coverageWidth,
+                 coverageHeight,
+             )
++            if (superResDetailAccumulator != 0) {
++                clearSabreSuperResAccumulator(
++                    superResDetailAccumulator,
++                    superResWidth,
++                    superResHeight,
++                )
++            }
+             if (normalDngAccumulator != 0) {
+                 clearSabreNormalDngAccumulator(normalDngAccumulator)
+                 if (normalDngCoverage != 0) {
+@@ -2195,6 +2237,21 @@ internal class GlesMgcRawSpatialStacker(
+                 useFrameWeight = false,
+                 shadowLongSourceClipGuard = false,
+             )
++            if (superResDetailAccumulator != 0) {
++                renderSabreSuperResDetailMerge(
++                    extracted = referenceExtracted,
++                    flow = zeroFlow,
++                    covariance = referenceCovariance,
++                    weight = identityWeight,
++                    calibration = referenceCalibration,
++                    accumulator = superResDetailAccumulator,
++                    extractedWidth = extractedWidth,
++                    extractedHeight = extractedHeight,
++                    superResWidth = superResWidth,
++                    superResHeight = superResHeight,
++                    useFrameWeight = false,
++                )
++            }
+             if (normalDngAccumulator != 0) {
+                 renderSabreNormalDngMerge(
+                     raw = referenceRaw,
+@@ -2317,6 +2374,26 @@ internal class GlesMgcRawSpatialStacker(
+                     useFrameWeight = true,
+                     shadowLongSourceClipGuard = frame.role == RawBurstFrameRole.SHADOW_LONG,
+                 )
++                /* IRIS_26561_NIGHT_LONG_EXCLUDED_FROM_SR_DETAIL
++                 * Native Sabre still admits validated SHADOW_LONG evidence. The fine-detail path
++                 * accepts NORMAL/Short exposure frames only, so longer exposure blur cannot become
++                 * high-frequency Super Res evidence.
++                 */
++                if (superResDetailAccumulator != 0 && frame.role == RawBurstFrameRole.NORMAL) {
++                    renderSabreSuperResDetailMerge(
++                        extracted = currentExtracted,
++                        flow = flow,
++                        covariance = currentCovariance,
++                        weight = frameWeight,
++                        calibration = calibration,
++                        accumulator = superResDetailAccumulator,
++                        extractedWidth = extractedWidth,
++                        extractedHeight = extractedHeight,
++                        superResWidth = superResWidth,
++                        superResHeight = superResHeight,
++                        useFrameWeight = true,
++                    )
++                }
+                 if (normalDngAccumulator != 0 && frame.role == RawBurstFrameRole.NORMAL) {
+                     renderSabreNormalDngMerge(
+                         raw = currentRaw,
+@@ -2409,6 +2486,21 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+             }
+ 
++            if (superResDetailAccumulator != 0) {
++                superResDetailPath = streamSabreSuperResDetail(
++                    accumulator = superResDetailAccumulator,
++                    superResWidth = superResWidth,
++                    superResHeight = superResHeight,
++                    normalFrameCount = normalFrameCount,
++                )
++                PLog.i(
++                    SABRE_TAG,
++                    "IRIS_26561_SABRE_NATIVE_2X_DETAIL_READY normalFrames=$normalFrameCount " +
++                        "shadowLongExcluded=$shadowLongFrameCount size=${superResWidth}x$superResHeight " +
++                        "detailPath=${superResDetailPath != null} fullHighResRgb=false",
++                )
++            }
++
+             renderSabreDehomogenize(
+                 accumulatedColor,
+                 accumulatedWeightsGb,
+@@ -2574,6 +2666,10 @@ internal class GlesMgcRawSpatialStacker(
+                 normalStackedDngSupportMean = normalStackedDngSupport.mean,
+                 normalStackedDngSupportMax = normalStackedDngSupport.maximum,
+                 normalStackedDngNoiseEquivalentSupport = normalStackedDngSupport.noiseEquivalent,
++                superResDetailPath = superResDetailPath,
++                superResLinearRawPath = null,
++                superResWidth = if (superResDetailPath != null) superResWidth else 0,
++                superResHeight = if (superResDetailPath != null) superResHeight else 0,
+             )
+         } catch (error: Exception) {
+             PLog.e(SABRE_TAG, "MGC Sabre merge failed", error)
+@@ -2585,6 +2681,7 @@ internal class GlesMgcRawSpatialStacker(
+             LargeDirectBuffer.free(sabreAccumulatedReadback)
+             LargeDirectBuffer.free(sabreResolvedRgb)
+             if (!returned) {
++                runCatching { superResDetailPath?.let { File(it).delete() } }
+                 LargeDirectBuffer.free(cpuOutput)
+                 LargeDirectBuffer.free(normalStackedDngRaw16)
+                 if (exportedTexture != 0) {
+@@ -3092,6 +3189,146 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    private fun clearSabreSuperResAccumulator(
++        accumulator: Int,
++        superResWidth: Int,
++        superResHeight: Int,
++    ) {
++        check(accumulator != 0)
++        bindRenderTargets(intArrayOf(accumulator), "IRIS 26561 Sabre SR luma/support clear")
++        GLES30.glViewport(0, 0, superResWidth, superResHeight)
++        GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
++        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++        checkGlError("IRIS 26561 Sabre SR luma/support clear")
++    }
++
++    private fun renderSabreSuperResDetailMerge(
++        extracted: Int,
++        flow: SabreConvertedAlignment,
++        covariance: Int,
++        weight: Int,
++        calibration: FrameCalibration,
++        accumulator: Int,
++        extractedWidth: Int,
++        extractedHeight: Int,
++        superResWidth: Int,
++        superResHeight: Int,
++        useFrameWeight: Boolean,
++    ) {
++        check(enableSabreSuperRes && sabreSuperResDetailMergeProgram != 0 && accumulator != 0)
++        val program = sabreSuperResDetailMergeProgram
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uExtractedBayer", 0, extracted)
++        bindTexture(program, "uFlow", 1, flow.texture)
++        bindTexture(program, "uCovariance", 2, covariance)
++        bindTexture(program, "uRejection", 3, weight)
++        uniform2i(program, "uExtractedSize", extractedWidth, extractedHeight)
++        uniform2i(program, "uOutputSize", superResWidth, superResHeight)
++        uniformSabreFlowScaleOffset(program, flow)
++        uniform4f(
++            program,
++            "uFrameBorderPadded",
++            SABRE_SAMPLE_BORDER_PIXELS / width,
++            SABRE_SAMPLE_BORDER_PIXELS / height,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
++        )
++        uniform1i(program, "uCfaPattern", cfaPattern)
++        uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
++        uniform4fv(program, "uGains", calibration.gains)
++        uniform4fv(program, "uBlackLevelsTimesGains", calibration.blackTerms)
++        uniform4f(
++            program,
++            "uCovRangeRg",
++            COV_MIN_R,
++            COV_MAX_R - COV_MIN_R,
++            COV_MIN_G,
++            COV_MAX_G - COV_MIN_G,
++        )
++        uniform2f(program, "uCovRangeB", COV_MIN_B, COV_MAX_B - COV_MIN_B)
++        GLES30.glEnable(GLES30.GL_BLEND)
++        try {
++            GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
++            GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
++            draw(
++                program,
++                superResWidth,
++                superResHeight,
++                intArrayOf(accumulator),
++                preserveBlend = true,
++            )
++        } finally {
++            GLES30.glDisable(GLES30.GL_BLEND)
++        }
++    }
++
++    private fun streamSabreSuperResDetail(
++        accumulator: Int,
++        superResWidth: Int,
++        superResHeight: Int,
++        normalFrameCount: Int,
++    ): String {
++        check(enableSabreSuperRes && sabreSuperResDetailResolveProgram != 0)
++        require((superResWidth and 1) == 0 && (superResHeight and 1) == 0)
++        val directory = requireNotNull(sabreSuperResTempDir)
++        if (!directory.exists()) check(directory.mkdirs()) {
++            "Unable to create 26561 Sabre Super Res temp directory: $directory"
++        }
++        val detailFile = File.createTempFile("iris26561-sabre-detail-", ".q8", directory)
++        val maximumBandHeight = minOf(SABRE_SUPER_RES_DETAIL_BAND_HEIGHT, superResHeight)
++        val bandTexture = createTexture(
++            superResWidth,
++            maximumBandHeight,
++            GLES30.GL_R8,
++            GLES30.GL_NEAREST,
++        )
++        try {
++            BufferedOutputStream(FileOutputStream(detailFile), 1024 * 1024).use { output ->
++                var bandTop = 0
++                while (bandTop < superResHeight) {
++                    val bandHeight = minOf(maximumBandHeight, superResHeight - bandTop)
++                    GLES30.glUseProgram(sabreSuperResDetailResolveProgram)
++                    bindTexture(sabreSuperResDetailResolveProgram, "uAccumulatedDetail", 0, accumulator)
++                    uniform2i(
++                        sabreSuperResDetailResolveProgram,
++                        "uOutputSize",
++                        superResWidth,
++                        superResHeight,
++                    )
++                    uniform1i(sabreSuperResDetailResolveProgram, "uBandTop", bandTop)
++                    uniform1f(
++                        sabreSuperResDetailResolveProgram,
++                        "uExpectedNormalFrames",
++                        normalFrameCount.coerceAtLeast(1).toFloat(),
++                    )
++                    draw(
++                        sabreSuperResDetailResolveProgram,
++                        superResWidth,
++                        bandHeight,
++                        intArrayOf(bandTexture),
++                    )
++                    val bytes = readR8Mask(
++                        texture = bandTexture,
++                        label = "IRIS 26561 Sabre SR detail band $bandTop",
++                        maskWidth = superResWidth,
++                        maskHeight = bandHeight,
++                    )
++                    output.write(bytes)
++                    bandTop += bandHeight
++                    GlesGpuScheduler.yieldToUiRenderer()
++                }
++            }
++            val expectedBytes = superResWidth.toLong() * superResHeight.toLong()
++            check(detailFile.length() == expectedBytes) {
++                "26561 Sabre SR detail bytes=${detailFile.length()} expected=$expectedBytes"
++            }
++            return detailFile.absolutePath
++        } catch (error: Throwable) {
++            runCatching { detailFile.delete() }
++            throw error
++        }
++    }
++
+     private fun clearSabreAccumulators(
+         accumulatedColor: Int,
+         accumulatedWeightsGb: Int,
+@@ -3528,6 +3765,16 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
++        if (enableSabreSuperRes) {
++            sabreSuperResDetailMergeProgram = linkProgram(
++                GlesMgcRawSabreShaders.superResDetailMerge26561,
++                "iris_26561_sabre_super_res_detail_merge",
++            )
++            sabreSuperResDetailResolveProgram = linkProgram(
++                GlesMgcRawSabreShaders.superResDetailResolve26561,
++                "iris_26561_sabre_super_res_detail_resolve",
++            )
++        }
+         // IRIS_26558: keep Motion/NORMAL on the exact proven merge program. The Long program
+         // is linked lazily only when a SHADOW_LONG frame is actually processed.
+         if (exportNormalStackedDng) {
+@@ -9287,6 +9534,7 @@ internal class GlesMgcRawSpatialStacker(
+         // Guide/covariance has a wider MGC footprint than rejection/RBF sampling.
+         const val SABRE_GUIDE_BORDER_PIXELS = 2.5f
+         const val SABRE_SAMPLE_BORDER_PIXELS = 1.5f
++        private const val SABRE_SUPER_RES_DETAIL_BAND_HEIGHT = 256
+         private const val SABRE_LONG_DURATION_ROBUSTNESS_MAX = 4f
+         const val SABRE_SIGNAL_LINEAR_HISTOGRAM_BITS = 10
+         const val SABRE_SIGNAL_LINEAR_HISTOGRAM_BINS = 1 shl SABRE_SIGNAL_LINEAR_HISTOGRAM_BITS
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 4ef267a601bf25dd6d87a8d45943f4ca839f1551..fa63ab98b6594fbd64a1a05475ab6967e13b310d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -28,6 +28,7 @@ import com.particlesdevs.photoncamera.app.PhotonCamera
+ import com.particlesdevs.photoncamera.processing.ImageFrame
+ import com.particlesdevs.photoncamera.processing.MotionBatch
+ import com.particlesdevs.photoncamera.processing.render.Parameters
++import java.io.File
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+ 
+@@ -63,6 +64,8 @@ object PhotonMotionMgc1271Bridge {
+         var egl: EglOwner? = null
+         var halfBuffer: ByteBuffer? = null
+         var resultTexture = 0
++        var superResDetailPathForCleanup: String? = null
++        var superResOutputsHandedOff = false
+         val iris26535TotalStartNs = System.nanoTime()
+         var iris26535FusionMs = -1L
+         var iris26535DenoiseMs = -1L
+@@ -251,9 +254,11 @@ object PhotonMotionMgc1271Bridge {
+                 )
+             }
+ 
+-            /* IRIS_26560_SABRE_NATIVE_GRID_SR_PLACEHOLDER
+-             * Keep the existing public Super Res switch/state, but do not reuse Spatial-RGB 2x
+-             * evidence. This cleanup build preserves exact proven Sabre native-grid geometry.
++            /* IRIS_26561_SABRE_NATIVE_2X_SR_AUTHORITY
++             * Sabre remains native-grid for structural RGB/Resolve/VGN. When the existing Super
++             * Res switch is on, the same Sabre flow/covariance/rejection decisions also feed a
++             * compact 2x luma-detail carrier. No deleted Spatial/Wronski reconstruction owner is
++             * restored and DNG remains the proven 1x NORMAL Sabre sidecar.
+              */
+             val displayedGlobalZoom = parameters.motionV2GlobalZoom
+                 .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+@@ -264,12 +269,15 @@ object PhotonMotionMgc1271Bridge {
+             parameters.motionV2SpatialReconstructionZoom = 1f // compatibility field until Sabre-SR rebase
+             parameters.motionV2ReconstructionZoom = reconstructionZoom
+             parameters.motionV2RenderResidualZoom = renderResidualZoom
+-            parameters.motionV2SuperResOutputScale = 1f
+-            PLog.i(TAG, "IRIS_26560_SABRE_NATIVE_GRID_SR_PLACEHOLDER " +
++            val sabreSuperResEnabled = parameters.motionV2SuperResOutputEnabled
++            val sabreSuperResOutputScale = if (sabreSuperResEnabled) 2f else 1f
++            parameters.motionV2SuperResOutputScale = sabreSuperResOutputScale
++            PLog.i(TAG, "IRIS_26561_SABRE_NATIVE_2X_SR_AUTHORITY " +
+                 "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
+                 "reconstructionZoom=$reconstructionZoom renderResidualZoom=$renderResidualZoom " +
+-                "superResRequested=${parameters.motionV2SuperResOutputEnabled} outputScale=1.0 " +
+-                "futureBackend=SABRE_SR")
++                "superResRequested=$sabreSuperResEnabled outputScale=$sabreSuperResOutputScale " +
++                "baseRgbScale=1.0 detailScale=${if (sabreSuperResEnabled) 2.0 else 1.0} " +
++                "colorOwner=NATIVE_SABRE_VGN dngScale=1.0")
+ 
+             egl = EglOwner.create()
+             val fusion = GlesMgcRawFusion(
+@@ -289,10 +297,13 @@ object PhotonMotionMgc1271Bridge {
+                 gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
+                 exportNormalStackedDng = produceNormalStackedDng,
+                 vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
++                enableSabreSuperRes = sabreSuperResEnabled,
++                sabreSuperResTempDir = PhotonCamera.getApplicationContextStatic().cacheDir,
+             )
+             val iris26535FusionStartNs = System.nanoTime()
+             val stacked = fusion.processFrames(frames)
+                 ?: invalid("Iris Sabre owner returned null")
++            superResDetailPathForCleanup = stacked.superResDetailPath
+             if (parameters.irisNightActive) {
+                 /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
+                  * A HAL-shortened batch may contain fewer than 15 physical frames, but every frame
+@@ -305,9 +316,23 @@ object PhotonMotionMgc1271Bridge {
+             iris26535FusionMs = (System.nanoTime() - iris26535FusionStartNs) / 1_000_000L
+             requireParity(stacked.width == size.x && stacked.height == size.y,
+                 "Sabre native-grid output geometry ${stacked.width}x${stacked.height} != ${size.x}x${size.y}")
+-            requireParity(stacked.superResDetailPath == null && stacked.superResLinearRawPath == null &&
+-                    stacked.superResWidth == 0 && stacked.superResHeight == 0,
+-                "26560 Sabre cleanup unexpectedly produced legacy Spatial-RGB SR evidence")
++            val expectedSuperResWidth = if (sabreSuperResEnabled) size.x * 2 else 0
++            val expectedSuperResHeight = if (sabreSuperResEnabled) size.y * 2 else 0
++            if (sabreSuperResEnabled) {
++                requireParity(
++                    stacked.superResDetailPath != null &&
++                        stacked.superResWidth == expectedSuperResWidth &&
++                        stacked.superResHeight == expectedSuperResHeight,
++                    "26561 Sabre SR evidence ${stacked.superResWidth}x${stacked.superResHeight} " +
++                        "path=${stacked.superResDetailPath != null} expected=${expectedSuperResWidth}x$expectedSuperResHeight",
++                )
++                requireParity(stacked.superResLinearRawPath == null,
++                    "26561 Sabre SR must preserve native 1x normalized16 DNG ownership")
++            } else {
++                requireParity(stacked.superResDetailPath == null && stacked.superResLinearRawPath == null &&
++                        stacked.superResWidth == 0 && stacked.superResHeight == 0,
++                    "26561 Sabre SR disabled but evidence was produced")
++            }
+             requireParity(stacked.bufferLayout == RawStackBufferLayout.LINEAR_RGB,
+                 "output layout=${stacked.bufferLayout}")
+             requireParity(stacked.isNormalizedSensorData, "output is not normalized sensor data")
+@@ -337,8 +362,8 @@ object PhotonMotionMgc1271Bridge {
+             requireParity(stacked.baselineExposureEv == null,
+                 "Sabre unexpectedly inherited Spatial/Bento BaselineExposure")
+             requireParity(parameters.motionV2ReconstructionZoom == 1f &&
+-                    parameters.motionV2SuperResOutputScale == 1f,
+-                "Sabre native-grid contract changed during Spatial-RGB cleanup")
++                    parameters.motionV2SuperResOutputScale == sabreSuperResOutputScale,
++                "26561 Sabre base-grid/SR output-scale contract drifted")
+             requireParity(lsc == null || stacked.lensShadingCorrectionApplied,
+                 "LSC supplied but MGC output did not apply it")
+ 
+@@ -389,9 +414,10 @@ object PhotonMotionMgc1271Bridge {
+                     "MGC denoise tuning assets failed initialization")
+             }
+ 
+-            /* IRIS_26560_SPATIAL_SR_BACKEND_REMOVED
+-             * The Super Res request is intentionally preserved in Parameters, but no Spatial-RGB
+-             * 2x detail/LinearRaw evidence is created or consumed in this cleanup build.
++            /* IRIS_26561_SABRE_SR_DETAIL_ONLY_BACKEND
++             * Full-resolution residual denoise remains native 1x Sabre RGB. The optional 2x
++             * detail sidecar is already frozen from Sabre NORMAL-frame evidence and is consumed
++             * only by the streamed Super Res JPEG encoder after this native color path completes.
+              */
+             val denoiseBuffer = readRgba16f(resultTexture, size.x, size.y)
+             halfBuffer = denoiseBuffer
+@@ -519,9 +545,11 @@ object PhotonMotionMgc1271Bridge {
+                 "pipeline=${if (parameters.irisNightActive) "NIGHT" else "MOTION"} " +
+                 "owner=SABRE spatialSourceRestoreAllowed=false spatialHighlightNodeAllowed=false " +
+                 "residualDenoise=$denoisePass carrier=RESOLVE_SABRE_LINEAR_RGB " +
+-                "superResRequested=${parameters.motionV2SuperResOutputEnabled}")
++                "superResRequested=${parameters.motionV2SuperResOutputEnabled} " +
++                "superResDetail=${stacked.superResDetailPath != null} " +
++                "adaptiveColor=POST_VGN_SHARED")
+             PLog.i(TAG, "IRIS_26545_RECONSTRUCTION_TIMING " +
+-                "method=SABRE srEnabled=false fusionMs=$iris26535FusionMs " +
++                "method=SABRE srEnabled=$sabreSuperResEnabled fusionMs=$iris26535FusionMs " +
+                 "denoiseMs=$iris26535DenoiseMs srReliabilityGateMs=0 " +
+                 "totalMs=${(System.nanoTime() - iris26535TotalStartNs) / 1_000_000L} " +
+                 "frames=${frames.size} merged=${stacked.mergedFrameCount}")
+@@ -552,14 +580,15 @@ object PhotonMotionMgc1271Bridge {
+                 resultDngSupportMean,
+                 resultDngSupportMax,
+                 resultDngNoiseEquivalentSupport,
+-                null,
+-                0,
+-                0,
++                stacked.superResDetailPath,
++                stacked.superResWidth,
++                stacked.superResHeight,
+                 null,
+                 0,
+                 0,
+             ).also { result ->
+                 result.sabreSelected = true
++                superResOutputsHandedOff = true
+             }
+         } catch (error: Throwable) {
+             PLog.e(TAG, "MGC PARITY ARCHITECTURE INVALID", error)
+@@ -574,6 +603,9 @@ object PhotonMotionMgc1271Bridge {
+                 GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
+             }
+             LargeDirectBuffer.free(halfBuffer)
++            if (!superResOutputsHandedOff) {
++                superResDetailPathForCleanup?.let { path -> runCatching { File(path).delete() } }
++            }
+             egl?.close()
+             inputImages.forEach { frame ->
+                 if (frame.hasMotionV2RawBacking()) runCatching { frame.close() }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
+index 2452a5c3cb08414eeafb5aa92e25143bbf173a45..d3d876219dfc59f36033c8c5064b9eacc0f4aaac 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
+@@ -150,10 +150,11 @@ public class SettingsBarEntryProvider extends ViewModel {
+     }
+ 
+     private void createSuperResEntry() {
+-        // Reuse the existing themed two-state icon pair so the row matches the gear popup.
++        /* IRIS_26561_DEDICATED_SUPER_RES_ICONS: keep setting ownership unchanged while making
++         * Super Res visually distinct from the Quad Bayer setting. */
+         superResEntry.addSettingsBarButtonModels(
+-                SettingsBarButtonModel.newButtonModel(R.id.super_res_off_button, R.drawable.ic_quad_off, R.string.off, 0, superResEntry),
+-                SettingsBarButtonModel.newButtonModel(R.id.super_res_on_button, R.drawable.ic_quad_on, R.string.on, 1, superResEntry)
++                SettingsBarButtonModel.newButtonModel(R.id.super_res_off_button, R.drawable.ic_super_res_off, R.string.off, 0, superResEntry),
++                SettingsBarButtonModel.newButtonModel(R.id.super_res_on_button, R.drawable.ic_super_res_on, R.string.on, 1, superResEntry)
+         );
+     }
+ 
+diff --git a/app/src/main/res/drawable/ic_super_res_off.xml b/app/src/main/res/drawable/ic_super_res_off.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..702711594ba8dab41a0a3b343f7984bfecbc0c06
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_super_res_off.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp" android:height="24dp"
++    android:viewportWidth="52" android:viewportHeight="52">
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="4"
++        android:strokeLineCap="round" android:strokeLineJoin="round"
++        android:pathData="M17,5 L7,5 Q5,5 5,7 L5,17 M35,5 L45,5 Q47,5 47,7 L47,17 M5,35 L5,45 Q5,47 7,47 L17,47 M47,35 L47,45 Q47,47 45,47 L35,47"/>
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="3.5"
++        android:strokeLineCap="round" android:strokeLineJoin="round"
++        android:pathData="M18,26 L34,26 M26,18 L26,34"/>
++</vector>
+diff --git a/app/src/main/res/drawable/ic_super_res_on.xml b/app/src/main/res/drawable/ic_super_res_on.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f4a37e7ac97c88d2e66a1dc6dc47345569ba241
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_super_res_on.xml
+@@ -0,0 +1,9 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="24dp" android:height="24dp"
++    android:viewportWidth="52" android:viewportHeight="52">
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M17,3 L7,3 Q3,3 3,7 L3,17 L7,17 L7,7 L17,7 Z M35,3 L45,3 Q49,3 49,7 L49,17 L45,17 L45,7 L35,7 Z M3,35 L7,35 L7,45 L17,45 L17,49 L7,49 Q3,49 3,45 Z M45,35 L49,35 L49,45 Q49,49 45,49 L35,49 L35,45 L45,45 Z"/>
++    <path android:fillColor="#FFFFFFFF"
++        android:pathData="M24,15 L28,15 L28,24 L37,24 L37,28 L28,28 L28,37 L24,37 L24,28 L15,28 L15,24 L24,24 Z"/>
++</vector>
+diff --git a/app/version.properties b/app/version.properties
+index 597d415557eb31937778a087d547c6a8952a6ad1..a960a296a8cd954a58feab673bedc3dbceb39edb 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726560
+-VERSION_BUILD=26560
++VERSION_NAME=0.9726561
++VERSION_BUILD=26561
