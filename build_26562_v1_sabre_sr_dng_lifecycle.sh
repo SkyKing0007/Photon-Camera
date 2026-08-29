@@ -61,6 +61,7 @@ PY
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="6e0618b13d4fd3f98c292cf275ba0a487068b66f"
+HANDOFF_PARENT_COMMIT="007f694a67d67f136e281867a3c15f163396606e"
 BASE_RUN_ID="33268952022"
 BASE_ARTIFACT_ID="9719538010"
 BASE_ARTIFACT_NAME="photon-26561-v1-1-sabre-native-super-res-adaptive-color"
@@ -107,7 +108,7 @@ ARTDIR="$WORK/artifact"
 BASE="$WORK/exact_26561_v1_1_compiled_candidate"
 AFTER="$WORK/candidate_26562"
 GLSLOUT="$WORK/runtime_glsl"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-sabre-sr-dng-lifecycle-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-1-sabre-sr-dng-lifecycle-debug.apk"
 LOCAL_REPLAY_ARTIFACT=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then [[ -n "${2:-}" ]] || fail "--local-prebuild requires exact 26561 V1.1 artifact ZIP"; LOCAL_REPLAY_ARTIFACT="$2"; fi
 mapfile -t RUNTIME_FILES < "$RUNTIME_LIST"
@@ -302,35 +303,64 @@ run_preinstall_vendor_authority_regression(){
  vendor_manifest "$f" "$WORK/stale_vendor.sha256"; ! cmp -s "$WORK/stale_vendor.sha256" "$VENDOR_PIN" || fail "stale fixture invalid"; install_frozen_candidate_into_live_root "$f" regression
  set_report "PREINSTALL VENDOR AUTHORITY ORDERING" "PASS (V1 failure regression retained; equality only after frozen candidate install)"; pass "permanent V1 vendor-authority regression"
 }
+run_live_repository_extras_scope_regression(){
+ local f="$WORK/live_repository_extras_scope_regression"
+ rm -rf "$f"; mkdir -p "$f"; cp -a "$AFTER/app" "$f/app"
+ local extras=(
+  '.gitignore' 'SupportedList.txt' 'proguard-rules.pro'
+  'src/androidTest/java/com/particlesdevs/photoncamera/gallery/adapters/DepthPageTransformerTest.java'
+  'src/test/java/android/util/Log.java'
+  'src/test/java/com/particlesdevs/photoncamera/capture/CaptureControllerTest.java'
+  'src/test/java/com/particlesdevs/photoncamera/debugclient/DebugClientTest.java'
+  'src/test/java/com/particlesdevs/photoncamera/processing/render/ColorCorrectionTransformTest.java'
+  'src/test/java/com/particlesdevs/photoncamera/ui/camera/CustomOrientationEventListenerTest.java'
+  'src/test/java/com/particlesdevs/photoncamera/ui/camera/TestSwitchToMode.java'
+  'src/test/java/com/particlesdevs/photoncamera/ui/camera/TestSwitchToModeTest.java'
+  'src/test/java/com/particlesdevs/photoncamera/util/RANSACTest.java'
+  'src/test/java/com/particlesdevs/photoncamera/util/UtilitiesTest.java'
+ )
+ for rel in "${extras[@]}"; do mkdir -p "$(dirname "$f/app/$rel")"; printf '26562 V1 exact Actions extras-scope regression\n' > "$f/app/$rel"; done
+ python3 "$VALIDATE" "$BASE" "$f" > "$OUT/live_repository_extras_scope_regression.txt"
+ grep -F 'PASS exact 18-file runtime allowlist' "$OUT/live_repository_extras_scope_regression.txt" >/dev/null || fail "live repository extras-scope regression did not reach allowlist PASS"
+ pass "permanent 26562 V1 live-repository app-extras scope regression (exact 13 unexpected paths)"
+}
 
 if [[ -n "$LOCAL_REPLAY_ARTIFACT" ]]; then
  echo "=== 26562 LOCAL PREBUILD: package/pins ==="; verify_package_and_pins
  echo "=== 26562 LOCAL PREBUILD: exact 26561 V1.1 artifact ==="; verify_base_artifact_and_reconstruct "$LOCAL_REPLAY_ARTIFACT"
  echo "=== 26562 LOCAL PREBUILD: transform/audit/DNG/GLSL/patches ==="; build_candidate_and_precompile_proof
  echo "=== 26562 LOCAL PREBUILD: V1 vendor regression ==="; run_preinstall_vendor_authority_regression
+ echo "=== 26562 LOCAL PREBUILD: V1 live-repository extras-scope regression ==="; run_live_repository_extras_scope_regression
  if command -v glslangValidator >/dev/null 2>&1 && command -v dpkg-query >/dev/null 2>&1 && [[ "$(dpkg-query -W -f='${Version}' glslang-tools 2>/dev/null || true)" == "$GLSLANG_PKG_VERSION" ]]; then run_real_glsl; else echo 'LOCAL REAL GLSL COMPILE: NOT RUN (pinned package unavailable locally)' | tee "$OUT/26562_V1_LOCAL_COMPILER_LIMIT.txt"; fi
  echo 'LOCAL REAL KOTLIN/JAVA/ASSEMBLE: NOT RUN (authoritative Actions gate)' | tee -a "$OUT/26562_V1_LOCAL_COMPILER_LIMIT.txt"; pass "26562 local prebuild replay complete"; exit 0
 fi
 
 # Actions authoritative sequence.
-echo "=== 26562 GATE 0: sealed handoff / branch / direct lineage / architectural backup ==="
+echo "=== 26562 V1.1 GATE 0: sealed handoff / failed-V1 parent / exact runtime-infrastructure lineage / architectural backup ==="
 [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-[[ "$(git rev-parse HEAD^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "26562 handoff must be direct child of successful 26561 V1.1"
-git diff --quiet "$BASE_SUCCESS_COMMIT..HEAD" -- app || fail "handoff directly changed repository app source"
+[[ "$(git rev-parse HEAD^)" == "$HANDOFF_PARENT_COMMIT" ]] || fail "26562 V1.1 must be direct child of failed 26562 V1 handoff"
+[[ "$(git rev-parse "${HANDOFF_PARENT_COMMIT}^")" == "$BASE_SUCCESS_COMMIT" ]] || fail "failed 26562 V1 parent is not direct child of successful 26561 V1.1"
+git diff --quiet "$BASE_SUCCESS_COMMIT..$HANDOFF_PARENT_COMMIT" -- app || fail "failed 26562 V1 handoff directly changed repository app source"
 [[ -n "$TOKEN" ]] || fail "GITHUB_TOKEN missing"; verify_package_and_pins
 BACKUP_SHA="$(git ls-remote origin "refs/heads/${BACKUP_BRANCH}" | awk '{print $1}')"; [[ "$BACKUP_SHA" == "$BACKUP_SHA_EXPECTED" ]] || fail "backup missing/wrong"
-set_report "BACKUP STATUS" "PASS (${BACKUP_BRANCH} @ ${BACKUP_SHA_EXPECTED})"
-python3 - "$BASE_SUCCESS_COMMIT" <<'PY'
+set_report "BACKUP STATUS" "PASS (${BACKUP_BRANCH} @ ${BACKUP_SHA_EXPECTED}; existing architectural backup retained; no new backup for V1.1 validation-infrastructure correction)"
+python3 - "$HANDOFF_PARENT_COMMIT" <<'PY'
 import subprocess,sys
 base=sys.argv[1]
 allowed={
-'.github/workflows/build-26562-v1-sabre-sr-dng-lifecycle.yml','V1_26562_BASE_26561_V1_1_AUDITED_RUNTIME.sha256','V1_26562_BASE_26561_V1_1_CANDIDATE_TAR.sha256','V1_26562_BASE_PROVENANCE.txt','V1_26562_CANDIDATE_CHANGED_HASHES.sha256','V1_26562_EXPECTED_CANDIDATE_AUDITED_RUNTIME.sha256','V1_26562_HANDOFF_HASHES.sha256','V1_26562_LOCAL_VALIDATION.txt','V1_26562_NATIVE_VENDOR_DEPENDENCIES.sha256','V1_26562_PREWRITE_SOURCE_HASHES.sha256','V1_26562_PROTECTED_UNCHANGED_CORE.sha256','V1_26562_RUNTIME_DELTA_FROM_26561_V1_1.patch','V1_26562_RUNTIME_EXPANDED_GLSL.sha256','V1_26562_RUNTIME_CHANGED_PATHS.txt','V1_26562_RUNTIME_ROLLBACK_TO_26561_V1_1.patch','V1_26562_UPLOAD_INSTRUCTIONS.md','build_26562_v1_sabre_sr_dng_lifecycle.sh','extract_26562_runtime_glsl.py','scan_glsl_reserved_identifiers_26562.py','selftest_26562_sabre_linearraw_dng.py','transform_26562_v1_sabre_sr_dng_lifecycle.py','validate_26562_v1_sabre_sr_dng_lifecycle.py'}
+'.github/workflows/build-26562-v1-sabre-sr-dng-lifecycle.yml',
+'V1_26562_HANDOFF_HASHES.sha256',
+'V1_26562_LOCAL_VALIDATION.txt',
+'V1_26562_UPLOAD_INSTRUCTIONS.md',
+'build_26562_v1_sabre_sr_dng_lifecycle.sh',
+'validate_26562_v1_sabre_sr_dng_lifecycle.py',
+}
 actual=set(subprocess.check_output(['git','diff','--name-only',base+'..HEAD'],text=True).splitlines())
-if actual!=allowed: raise SystemExit('handoff scope mismatch extra=%r missing=%r'%(sorted(actual-allowed),sorted(allowed-actual)))
-if any(x.startswith('app/') for x in actual): raise SystemExit('handoff modified repository app source')
-print('PASS exact 22-file 26562 handoff scope')
+if actual!=allowed: raise SystemExit('V1.1 infrastructure scope mismatch extra=%r missing=%r'%(sorted(actual-allowed),sorted(allowed-actual)))
+if any(x.startswith('app/') for x in actual): raise SystemExit('V1.1 modified repository app source')
+print('PASS exact 6-file 26562 V1.1 infrastructure-only handoff scope; V1 runtime payload unchanged')
 PY
-pass "sealed 26562 package / lineage / backup"
+pass "sealed 26562 V1.1 package / failed-V1 lineage / backup"
 
 echo "=== 26562 GATE 1: exact successful compiled 26561 V1.1 authority ==="
 REPO_API="https://api.github.com/repos/${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}"
@@ -349,8 +379,10 @@ verify_base_artifact_and_reconstruct "$ARTZIP"
 
 echo "=== 26562 GATE 2: candidate-first transform / audit / DNG / exact GLSL / patches ==="; build_candidate_and_precompile_proof
 echo "=== 26562 GATE 3: pinned real glslangValidator ==="; run_real_glsl
-echo "=== 26562 GATE 4: controlled live install / real Kotlin+Java / full assemble ==="
-run_preinstall_vendor_authority_regression; install_frozen_candidate_into_live_root "$ROOT" repository
+echo "=== 26562 V1.1 GATE 4: controlled live install / exact V1 regressions / real Kotlin+Java / full assemble ==="
+run_preinstall_vendor_authority_regression
+run_live_repository_extras_scope_regression
+install_frozen_candidate_into_live_root "$ROOT" repository
 rm -rf "$ROOT/app/build/outputs/apk/debug"
 ./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace
 python3 - "$OUT/26562_V1_COMPILER_STATUS.txt" <<'PY'

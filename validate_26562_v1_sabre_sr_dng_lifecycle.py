@@ -34,8 +34,28 @@ expected={
 'version.properties',
 }
 def files(root):
+    # 26562 V1.1 permanent Actions regression: compare the exact audited runtime
+    # authority scope used by the successful 26561 procedure, not unrelated app/
+    # checkout files (tests, proguard rules, SupportedList, app .gitignore).
+    # Native/vendor trees are verified independently by the pinned vendor manifest.
     r=root/A
-    paths=sorted(p for p in r.rglob('*') if p.is_file())
+    paths=[]
+    main=r/'src/main'
+    for p in main.rglob('*'):
+        if not p.is_file():
+            continue
+        rel=p.relative_to(r).as_posix()
+        if rel.startswith('src/main/cpp/third_party_26507/') or rel.startswith('src/main/cpp/deps/'):
+            continue
+        paths.append(p)
+    deps_gitignore=r/'src/main/cpp/deps/.gitignore'
+    if deps_gitignore.is_file():
+        paths.append(deps_gitignore)
+    for rel in ('version.properties','build.gradle'):
+        q=r/rel
+        if q.is_file():
+            paths.append(q)
+    paths=sorted(set(paths))
     def one(p): return p.relative_to(r).as_posix(),sha(p.read_bytes())
     with ThreadPoolExecutor(max_workers=32) as pool:
         return dict(pool.map(one,paths))
