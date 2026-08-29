@@ -1,0 +1,1003 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 52cb2609919ed83f1fb98b954101b896571eaf38..a53b752c9bf5b4d9ae4f0bb553314414c45279be 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -1005,6 +1005,72 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26562_SABRE_SUPER_RES_LINEAR_RAW
++     * Build a truthful 3-channel 2x LinearRaw stream from the current native Sabre camera-RGB
++     * base plus the exact 26561 NORMAL-only signed-log detail carrier. The base already includes
++     * Sabre Resolve black removal and lens shading. Night SHADOW_LONG may influence that native
++     * base, but it never enters uAccumulatedDetail. No Spatial/Wronski reconstruction is used.
++     */
++    val superResLinearRaw26562 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        precision highp usampler2D;
++        uniform highp usampler2D uNativeRgb;
++        uniform sampler2D uAccumulatedDetail;
++        uniform ivec2 uNativeSize;
++        uniform ivec2 uOutputSize;
++        uniform int uBandTop;
++        uniform float uExpectedNormalFrames;
++        layout(location = 0) out highp uvec4 oLinearRaw;
++
++        vec2 lumaAndSupportAt(ivec2 p) {
++            return texelFetch(uAccumulatedDetail, clamp(p, ivec2(0), uOutputSize - ivec2(1)), 0).rg;
++        }
++
++        float resolvedLuma(vec2 packedValue) {
++            return packedValue.x / max(packedValue.y, 1.0e-6);
++        }
++
++        vec3 nativeRgbTexel(ivec2 p) {
++            uvec3 encoded = texelFetch(uNativeRgb, clamp(p, ivec2(0), uNativeSize - ivec2(1)), 0).rgb;
++            return vec3(encoded) / 65535.0;
++        }
++
++        vec3 nativeRgbAt(vec2 sourceCoordinate) {
++            ivec2 p0 = ivec2(floor(sourceCoordinate));
++            vec2 fraction = fract(sourceCoordinate);
++            vec3 row0 = mix(nativeRgbTexel(p0), nativeRgbTexel(p0 + ivec2(1, 0)), fraction.x);
++            vec3 row1 = mix(nativeRgbTexel(p0 + ivec2(0, 1)), nativeRgbTexel(p0 + ivec2(1, 1)), fraction.x);
++            return mix(row0, row1, fraction.y);
++        }
++
++        void main() {
++            ivec2 p = ivec2(gl_FragCoord.xy) + ivec2(0, uBandTop);
++            ivec2 blockOrigin = (p / 2) * 2;
++            vec2 packed0 = lumaAndSupportAt(blockOrigin);
++            vec2 packed1 = lumaAndSupportAt(blockOrigin + ivec2(1, 0));
++            vec2 packed2 = lumaAndSupportAt(blockOrigin + ivec2(0, 1));
++            vec2 packed3 = lumaAndSupportAt(blockOrigin + ivec2(1, 1));
++            float luma0 = resolvedLuma(packed0);
++            float luma1 = resolvedLuma(packed1);
++            float luma2 = resolvedLuma(packed2);
++            float luma3 = resolvedLuma(packed3);
++            float blockMean = max((luma0 + luma1 + luma2 + luma3) * 0.25, 1.0e-6);
++            float currentLuma = resolvedLuma(lumaAndSupportAt(p));
++            float minimumSupport = min(min(packed0.y, packed1.y), min(packed2.y, packed3.y));
++            float supportEnd = min(max(uExpectedNormalFrames, 2.0), 3.0);
++            float supportGate = smoothstep(1.0, supportEnd, minimumSupport);
++            float signalGate = smoothstep(0.002, 0.020, blockMean);
++            float logDetail = clamp(log2(max(currentLuma, 1.0e-6) / blockMean), -0.75, 0.75);
++            float trustedLogDetail = logDetail * supportGate * signalGate;
++            float detailFactor = exp2(trustedLogDetail);
++            vec2 sourceCoordinate = (vec2(p) + vec2(0.5)) * 0.5 - vec2(0.5);
++            vec3 linearRgb = clamp(nativeRgbAt(sourceCoordinate) * detailFactor, 0.0, 1.0);
++            oLinearRaw = uvec4(uvec3(round(linearRgb * 65535.0)), 65535u);
++        }
++    """.trimIndent()
++
+     /**
+      * IRIS_26545_SABRE_SPARSE_FLOW_CONTRACT
+      * Sabre-only reproduction of MGC ConvertAlignmentHalide. Keep the LK grid sparse; each
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 09d451fe60f846cd66e947738d26fb0e886bfff0..a98832eb948bd15e0bf16863e756946704b08b51 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -478,6 +478,7 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreMergeProgram = 0
+     private var sabreSuperResDetailMergeProgram = 0
+     private var sabreSuperResDetailResolveProgram = 0
++    private var sabreSuperResLinearRawProgram = 0
+     private var sabreShadowLongMergeProgram = 0
+     private var sabreShadowLongCopyMaskProgram = 0
+     private var sabreNormalDngMergeProgram = 0
+@@ -2018,6 +2019,7 @@ internal class GlesMgcRawSpatialStacker(
+         var normalStackedDngSupport = SabreNormalDngSupportStats.identity()
+         var normalStackedDngNoiseProfile: DoubleArray? = null
+         var superResDetailPath: String? = null
++        var superResLinearRawPath: String? = null
+         var exportedTexture = 0
+         var returned = false
+         val originalThreadPriority = GlesGpuScheduler.lowerCurrentThreadPriority(SABRE_TAG)
+@@ -2578,6 +2580,25 @@ internal class GlesMgcRawSpatialStacker(
+                 demosaicWhiteLevel = demosaicWhiteLevel.toFloat(),
+                 output = chromaPostprocessor.normalizationTargetTexture(),
+             )
++            if (superResDetailAccumulator != 0 && exportNormalStackedDng) {
++                superResLinearRawPath = runCatching {
++                    streamSabreSuperResLinearRaw(
++                        nativeRgb = chromaPostprocessor.normalizationTargetTexture(),
++                        accumulator = superResDetailAccumulator,
++                        superResWidth = superResWidth,
++                        superResHeight = superResHeight,
++                        normalFrameCount = normalFrameCount,
++                    )
++                }.onFailure { error ->
++                    PLog.e(SABRE_TAG, "IRIS_26562_SABRE_SR_DNG_EXPORT_FAILED_CONTINUE_JPEG", error)
++                }.getOrNull()
++                PLog.i(
++                    SABRE_TAG,
++                    "IRIS_26562_SABRE_SR_LINEAR_RAW_STATUS requested=true ready=${superResLinearRawPath != null} " +
++                        "size=${superResWidth}x$superResHeight normalFrames=$normalFrameCount " +
++                        "shadowLongFineDetail=false preVgnCameraRgb=true",
++                )
++            }
+             chromaPostprocessor.markBandWritten(fullOutputTile)
+             if (!exportGpuLinearRgbSource) {
+                 val outputBytes = width.toLong() * height * 3L * Short.SIZE_BYTES
+@@ -2667,7 +2688,7 @@ internal class GlesMgcRawSpatialStacker(
+                 normalStackedDngSupportMax = normalStackedDngSupport.maximum,
+                 normalStackedDngNoiseEquivalentSupport = normalStackedDngSupport.noiseEquivalent,
+                 superResDetailPath = superResDetailPath,
+-                superResLinearRawPath = null,
++                superResLinearRawPath = superResLinearRawPath,
+                 superResWidth = if (superResDetailPath != null) superResWidth else 0,
+                 superResHeight = if (superResDetailPath != null) superResHeight else 0,
+             )
+@@ -2682,6 +2703,7 @@ internal class GlesMgcRawSpatialStacker(
+             LargeDirectBuffer.free(sabreResolvedRgb)
+             if (!returned) {
+                 runCatching { superResDetailPath?.let { File(it).delete() } }
++                runCatching { superResLinearRawPath?.let { File(it).delete() } }
+                 LargeDirectBuffer.free(cpuOutput)
+                 LargeDirectBuffer.free(normalStackedDngRaw16)
+                 if (exportedTexture != 0) {
+@@ -3329,6 +3351,106 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    private fun streamSabreSuperResLinearRaw(
++        nativeRgb: Int,
++        accumulator: Int,
++        superResWidth: Int,
++        superResHeight: Int,
++        normalFrameCount: Int,
++    ): String {
++        check(enableSabreSuperRes && exportNormalStackedDng && sabreSuperResLinearRawProgram != 0)
++        require(superResWidth == width * 2 && superResHeight == height * 2)
++        val directory = requireNotNull(sabreSuperResTempDir)
++        if (!directory.exists()) check(directory.mkdirs()) {
++            "Unable to create 26562 Sabre Super Res DNG temp directory: $directory"
++        }
++        val linearRawFile = File.createTempFile("iris26562-sabre-linear-raw-", ".rgb16", directory)
++        val maximumBandHeight = minOf(SABRE_SUPER_RES_LINEAR_RAW_BAND_HEIGHT, superResHeight)
++        val bandTexture = createTexture(
++            superResWidth,
++            maximumBandHeight,
++            GLES30.GL_RGBA16UI,
++            GLES30.GL_NEAREST,
++        )
++        val readback = checkNotNull(
++            LargeDirectBuffer.allocate(
++                superResWidth.toLong() * maximumBandHeight * 4L * Short.SIZE_BYTES,
++                "IRIS 26562 Sabre SR LinearRaw readback",
++            ),
++        ) { "Unable to allocate 26562 Sabre SR LinearRaw readback band" }
++        val rgbBand = ByteArray(superResWidth * maximumBandHeight * 3 * Short.SIZE_BYTES)
++        try {
++            BufferedOutputStream(FileOutputStream(linearRawFile), 1024 * 1024).use { output ->
++                var bandTop = 0
++                while (bandTop < superResHeight) {
++                    val bandHeight = minOf(maximumBandHeight, superResHeight - bandTop)
++                    GLES30.glUseProgram(sabreSuperResLinearRawProgram)
++                    bindTexture(sabreSuperResLinearRawProgram, "uNativeRgb", 0, nativeRgb)
++                    bindTexture(sabreSuperResLinearRawProgram, "uAccumulatedDetail", 1, accumulator)
++                    uniform2i(sabreSuperResLinearRawProgram, "uNativeSize", width, height)
++                    uniform2i(
++                        sabreSuperResLinearRawProgram,
++                        "uOutputSize",
++                        superResWidth,
++                        superResHeight,
++                    )
++                    uniform1i(sabreSuperResLinearRawProgram, "uBandTop", bandTop)
++                    uniform1f(
++                        sabreSuperResLinearRawProgram,
++                        "uExpectedNormalFrames",
++                        normalFrameCount.coerceAtLeast(1).toFloat(),
++                    )
++                    draw(
++                        sabreSuperResLinearRawProgram,
++                        superResWidth,
++                        bandHeight,
++                        intArrayOf(bandTexture),
++                    )
++                    readback.clear()
++                    readback.limit(superResWidth * bandHeight * 4 * Short.SIZE_BYTES)
++                    bindRenderTargets(intArrayOf(bandTexture), "IRIS 26562 Sabre SR LinearRaw readback")
++                    GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
++                    GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
++                    GLES30.glReadPixels(
++                        0,
++                        0,
++                        superResWidth,
++                        bandHeight,
++                        GLES30.GL_RGBA_INTEGER,
++                        GLES30.GL_UNSIGNED_SHORT,
++                        readback,
++                    )
++                    GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++                    checkGlError("IRIS 26562 Sabre SR LinearRaw band $bandTop")
++                    val source = readback.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
++                    var destination = 0
++                    val pixelCount = superResWidth * bandHeight
++                    for (pixel in 0 until pixelCount) {
++                        val sourceIndex = pixel * 4
++                        for (channel in 0 until 3) {
++                            val value = source.get(sourceIndex + channel).toInt() and 0xffff
++                            rgbBand[destination++] = (value and 0xff).toByte()
++                            rgbBand[destination++] = ((value ushr 8) and 0xff).toByte()
++                        }
++                    }
++                    output.write(rgbBand, 0, destination)
++                    bandTop += bandHeight
++                    GlesGpuScheduler.yieldToUiRenderer()
++                }
++            }
++            val expectedBytes = superResWidth.toLong() * superResHeight.toLong() * 3L * Short.SIZE_BYTES
++            check(linearRawFile.length() == expectedBytes) {
++                "26562 Sabre SR LinearRaw bytes=${linearRawFile.length()} expected=$expectedBytes"
++            }
++            return linearRawFile.absolutePath
++        } catch (error: Throwable) {
++            runCatching { linearRawFile.delete() }
++            throw error
++        } finally {
++            LargeDirectBuffer.free(readback)
++        }
++    }
++
+     private fun clearSabreAccumulators(
+         accumulatedColor: Int,
+         accumulatedWeightsGb: Int,
+@@ -3774,6 +3896,12 @@ internal class GlesMgcRawSpatialStacker(
+                 GlesMgcRawSabreShaders.superResDetailResolve26561,
+                 "iris_26561_sabre_super_res_detail_resolve",
+             )
++            if (exportNormalStackedDng) {
++                sabreSuperResLinearRawProgram = linkProgram(
++                    GlesMgcRawSabreShaders.superResLinearRaw26562,
++                    "iris_26562_sabre_super_res_linear_raw",
++                )
++            }
+         }
+         // IRIS_26558: keep Motion/NORMAL on the exact proven merge program. The Long program
+         // is linked lazily only when a SHADOW_LONG frame is actually processed.
+@@ -9534,6 +9662,7 @@ internal class GlesMgcRawSpatialStacker(
+         // Guide/covariance has a wider MGC footprint than rejection/RBF sampling.
+         const val SABRE_GUIDE_BORDER_PIXELS = 2.5f
+         const val SABRE_SAMPLE_BORDER_PIXELS = 1.5f
++        private const val SABRE_SUPER_RES_LINEAR_RAW_BAND_HEIGHT = 64
+         private const val SABRE_SUPER_RES_DETAIL_BAND_HEIGHT = 256
+         private const val SABRE_LONG_DURATION_ROBUSTNESS_MAX = 4f
+         const val SABRE_SIGNAL_LINEAR_HISTOGRAM_BITS = 10
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java b/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
+index 9fda464a3afc18d787741845dd2304959dd1dedc..33508f3b14d6af51b8cd16868548415314e5b05f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
+@@ -247,7 +247,8 @@ public class PhotonCamera extends Application {
+          * in-process mode switching still persists and behaves normally until the next process start.
+          */
+         PreferenceKeys.setCameraModeOrdinal(CameraMode.MOTION.ordinal());
+-        Log.critical("PhotonCamera", "IRIS_26544_COLD_START_FORCE_MOTION ordinal="
++        PreferenceKeys.setIrisSuperRes(false);
++        Log.critical("PhotonCamera", "IRIS_26562_COLD_START_RESET mode=MOTION zoom=1x superRes=false ordinal="
+                 + CameraMode.MOTION.ordinal());
+         mSettings = new Settings();
+         Log.critical("PhotonCamera", "IRIS_26544_SETTINGS_CREATED mode=" + mSettings.selectedMode);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java b/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
+index 1e535656543adccb75281704725f637dace6d9c8..e5c67eae659d2ae856300d5c094ba15a9073803a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/control/IrisZoomController.java
+@@ -136,6 +136,15 @@ public final class IrisZoomController {
+         }
+     }
+ 
++    /** IRIS_26562_FOREGROUND_ONE_X_OWNER
++     * A true application background/foreground boundary gets the same strict physical 1x reset as
++     * a new CameraActivity. The subsequent inventory pass persists the rear lens closest to 1x
++     * before CaptureController resolves its route.
++     */
++    public static void resetForForegroundSession() {
++        resetForNewCameraActivitySession();
++    }
++
+     public void onLensInventoryReady() {
+         refreshInventory();
+         if (backLenses.isEmpty()) return;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+index 8ccf5a860b2f3cecb484bb9980e115033974e257..2c8144e56481e825ddbee4c4ad7575ffb2d164c5 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -361,6 +361,12 @@ public class ImageSaver {
+                             raw.x, raw.y, crop.x, crop.y,
+                             parameters.cameraRotation, parameters.mirror,
+                             parameters.motionV2RenderResidualZoom);
++                    if (!saved) {
++                        Log.critical("ImageSaver",
++                                "IRIS_26562_MOTION_SR_JPEG_DEGRADED_TO_NATIVE reason=sr_encoder_failed multiframeSabre=true");
++                        try { java.nio.file.Files.deleteIfExists(fileToSave); } catch (Throwable ignored) {}
++                        saved = MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
++                    }
+                 } else {
+                     saved = MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
+                 }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisMotionSuperResDngWriter.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisSabreSuperResDngWriter.java
+similarity index 90%
+rename from app/src/main/java/com/particlesdevs/photoncamera/processing/IrisMotionSuperResDngWriter.java
+rename to app/src/main/java/com/particlesdevs/photoncamera/processing/IrisSabreSuperResDngWriter.java
+index 038ccde6bccb4d81ca8520595b7c934452035c63..ab552c6ad0ad77355d47c2935dae5c24c01ab8b0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisMotionSuperResDngWriter.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisSabreSuperResDngWriter.java
+@@ -22,15 +22,16 @@ import java.util.List;
+ import java.util.Locale;
+ 
+ /**
+- * IRIS_26532_STREAMING_LINEAR_RAW_DNG
++ * IRIS_26562_SABRE_STREAMING_LINEAR_RAW_DNG
+  *
+- * Iris-owned DNG serializer for the 2x Spatial RGB result. The MGC result already lives on its
+- * final resampled LinearRaw grid, so DefaultScale is 1:1. Only residual FOV crop that remains
+- * after the <=20x Spatial reconstruction is encoded in DefaultCrop. Pixel payload is copied from
+- * a temporary RGB16 stream without materializing a second whole-image buffer.
++ * Iris-owned DNG serializer for the current Sabre-native 2x LinearRaw RGB result. Reconstruction
++ * remains on Sabre's native grid; the 2x stream combines that black-free, lens-shading-corrected
++ * camera-RGB base with the 26561 NORMAL-frame-only signed-log SR detail carrier. Night Long may
++ * influence the native low-frequency base but never the fine-detail carrier. DefaultScale is 1:1.
++ * Pixel payload is streamed from RGB16 without materializing a second whole-image buffer.
+  */
+-public final class IrisMotionSuperResDngWriter {
+-    private static final String TAG = "Iris26532Dng";
++public final class IrisSabreSuperResDngWriter {
++    private static final String TAG = "Iris26562SabreSrDng";
+ 
+     private static final int TYPE_BYTE = 1;
+     private static final int TYPE_ASCII = 2;
+@@ -38,7 +39,6 @@ public final class IrisMotionSuperResDngWriter {
+     private static final int TYPE_LONG = 4;
+     private static final int TYPE_RATIONAL = 5;
+     private static final int TYPE_SRATIONAL = 10;
+-    private static final int TYPE_DOUBLE = 12;
+ 
+     private static final int TAG_NEW_SUBFILE_TYPE = 254;
+     private static final int TAG_IMAGE_WIDTH = 256;
+@@ -82,14 +82,13 @@ public final class IrisMotionSuperResDngWriter {
+     private static final int TAG_ACTIVE_AREA = 50829;
+     private static final int TAG_FORWARD_MATRIX_1 = 50964;
+     private static final int TAG_FORWARD_MATRIX_2 = 50965;
+-    private static final int TAG_NOISE_PROFILE = 51041;
+     private static final int TAG_DEFAULT_BLACK_RENDER = 51110;
+ 
+     private static final int PHOTOMETRIC_LINEAR_RAW = 34892;
+     private static final int SAMPLES_PER_PIXEL = 3;
+     private static final long U32_MAX = 0xffff_ffffL;
+ 
+-    private IrisMotionSuperResDngWriter() {}
++    private IrisSabreSuperResDngWriter() {}
+ 
+     private static final class Entry {
+         final int tag;
+@@ -112,7 +111,6 @@ public final class IrisMotionSuperResDngWriter {
+             int width,
+             int height,
+             Parameters p,
+-            double[] noiseProfile,
+             int normalFrameCount,
+             float supportMin,
+             float supportP01,
+@@ -130,7 +128,7 @@ public final class IrisMotionSuperResDngWriter {
+                 throw new IOException("LinearRaw payload size mismatch expected=" + pixelBytes
+                         + " actual=" + Files.size(linearRawRgb16));
+             }
+-            byte[] header = buildHeader(width, height, pixelBytes, p, noiseProfile,
++            byte[] header = buildHeader(width, height, pixelBytes, p,
+                     normalFrameCount, supportMin, supportP01, supportP10, supportMedian,
+                     supportMean, supportMax, noiseEquivalentSupport);
+             if ((long) header.length + pixelBytes > U32_MAX) {
+@@ -149,13 +147,13 @@ public final class IrisMotionSuperResDngWriter {
+                 throw new IOException("DNG final size mismatch expected=" + expected
+                         + " actual=" + Files.size(output));
+             }
+-            Log.i(TAG, "IRIS_26532_LINEAR_RAW_DNG saved=true size=" + width + "x" + height
++            Log.i(TAG, "IRIS_26562_SABRE_LINEAR_RAW_DNG saved=true size=" + width + "x" + height
+                     + " payloadBytes=" + pixelBytes + " headerBytes=" + header.length
+                     + " residualZoom=" + Math.max(1.0f, p.motionV2RenderResidualZoom)
+                     + " defaultScale=1:1 photometric=LinearRaw");
+             return true;
+         } catch (Throwable t) {
+-            Log.e(TAG, "IRIS_26532_LINEAR_RAW_DNG_FAILED", t);
++            Log.e(TAG, "IRIS_26562_SABRE_LINEAR_RAW_DNG_FAILED", t);
+             try { Files.deleteIfExists(output); } catch (Throwable ignored) {}
+             return false;
+         }
+@@ -166,7 +164,6 @@ public final class IrisMotionSuperResDngWriter {
+             int height,
+             long pixelBytes,
+             Parameters p,
+-            double[] noiseProfile,
+             int normalFrameCount,
+             float supportMin,
+             float supportP01,
+@@ -182,13 +179,14 @@ public final class IrisMotionSuperResDngWriter {
+         entries.add(shortArray(TAG_BITS_PER_SAMPLE, new int[]{16, 16, 16}));
+         entries.add(shortEntry(TAG_COMPRESSION, 1));
+         entries.add(shortEntry(TAG_PHOTOMETRIC, PHOTOMETRIC_LINEAR_RAW));
+-        entries.add(ascii(TAG_DESCRIPTION, "Iris 26532 Motion Spatial Super Res; normalFrames="
+-                + Math.max(0, normalFrameCount)
++        entries.add(ascii(TAG_DESCRIPTION, "Iris 26562 "
++                + (p.irisNightActive ? "Night" : "Motion")
++                + " Sabre Super Res LinearRaw; normalFrames=" + Math.max(0, normalFrameCount)
+                 + "; support[min,p01,p10,median,mean,max,noiseEq]="
+                 + supportMin + "," + supportP01 + "," + supportP10 + "," + supportMedian
+                 + "," + supportMean + "," + supportMax + "," + noiseEquivalentSupport
++                + "; nativeSabreBase=true; normalFineDetail=true; nightLongFineDetail=false"
+                 + "; displayedZoom=" + p.motionV2GlobalZoom
+-                + "; spatialZoom=" + p.motionV2SpatialReconstructionZoom
+                 + "; residualZoom=" + p.motionV2RenderResidualZoom));
+         String make = Build.BRAND != null && !Build.BRAND.isEmpty() ? Build.BRAND : Build.MANUFACTURER;
+         String model = Build.MODEL != null ? Build.MODEL : "Android Camera";
+@@ -201,7 +199,7 @@ public final class IrisMotionSuperResDngWriter {
+         entries.add(longEntry(TAG_ROWS_PER_STRIP, height));
+         entries.add(longEntry(TAG_STRIP_BYTE_COUNTS, pixelBytes));
+         entries.add(shortEntry(TAG_PLANAR_CONFIG, 1));
+-        entries.add(ascii(TAG_SOFTWARE, "Iris Camera 0.9726532 / 26532"));
++        entries.add(ascii(TAG_SOFTWARE, "Iris Camera 0.9726562 / 26562"));
+         entries.add(ascii(TAG_DATETIME,
+                 new SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(new Date())));
+         entries.add(shortArray(TAG_SAMPLE_FORMAT, new int[]{1, 1, 1}));
+@@ -256,11 +254,6 @@ public final class IrisMotionSuperResDngWriter {
+         entries.add(longArray(TAG_ACTIVE_AREA, new long[]{0, 0, height, width}));
+         addMatrix(entries, TAG_FORWARD_MATRIX_1, p.ForwardTransform1);
+         addMatrix(entries, TAG_FORWARD_MATRIX_2, p.ForwardTransform2);
+-        if (noiseProfile != null && noiseProfile.length == 6) {
+-            boolean valid = true;
+-            for (double v : noiseProfile) valid &= Double.isFinite(v) && v >= 0.0;
+-            if (valid) entries.add(doubleArray(TAG_NOISE_PROFILE, noiseProfile));
+-        }
+         entries.add(shortEntry(TAG_DEFAULT_BLACK_RENDER, 1));
+ 
+         entries.sort(Comparator.comparingInt(e -> e.tag));
+@@ -397,9 +390,4 @@ public final class IrisMotionSuperResDngWriter {
+         return new Entry(tag, TYPE_SRATIONAL, values.length, b.array());
+     }
+ 
+-    private static Entry doubleArray(int tag, double[] values) {
+-        ByteBuffer b = ByteBuffer.allocate(values.length * 8).order(ByteOrder.LITTLE_ENDIAN);
+-        for (double value : values) b.putDouble(value);
+-        return new Entry(tag, TYPE_DOUBLE, values.length, b.array());
+-    }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 96deccf772aedf325f1295c8c284c0ab839a03de..c465acb990bd20c75fc9a2f174fbf97e31c9954e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -75,7 +75,7 @@ public class PostPipeline extends GLBasePipeline {
+         return "NONE_OR_INVALID(" + owner + ")";
+     }
+ 
+-    /* IRIS_26560_SABRE_ONLY_POST_OWNER_CONTRACT
++    /* IRIS_26562_SABRE_SR_POST_OWNER_CONTRACT
+      * Motion and Night have one legal reconstruction owner. Spatial-RGB reliability/source-restore
+      * payloads no longer exist at this boundary.
+      */
+@@ -87,16 +87,23 @@ public class PostPipeline extends GLBasePipeline {
+             throw new IllegalStateException("26560 missing/invalid " + pipeline
+                     + " Sabre reconstruction owner=" + owner);
+         }
++        final float expectedOutputScale = mParameters.motionV2SuperResOutputEnabled ? 2.0f : 1.0f;
+         if (Math.abs(mParameters.motionV2ReconstructionZoom - 1.0f) > 1.0e-5f
+-                || Math.abs(mParameters.motionV2SuperResOutputScale - 1.0f) > 1.0e-5f) {
+-            throw new IllegalStateException("26560 " + pipeline
+-                    + " changed proven Sabre native-grid geometry");
++                || Math.abs(mParameters.motionV2SpatialReconstructionZoom - 1.0f) > 1.0e-5f
++                || Math.abs(mParameters.motionV2SuperResOutputScale - expectedOutputScale) > 1.0e-5f) {
++            throw new IllegalStateException("26562 " + pipeline
++                    + " invalid Sabre SR geometry reconstructionZoom="
++                    + mParameters.motionV2ReconstructionZoom
++                    + " spatialZoom=" + mParameters.motionV2SpatialReconstructionZoom
++                    + " srEnabled=" + mParameters.motionV2SuperResOutputEnabled
++                    + " outputScale=" + mParameters.motionV2SuperResOutputScale
++                    + " expectedOutputScale=" + expectedOutputScale);
+         }
+         if (Math.abs(mParameters.motionV2MgcSourceExposureGain - 1.0f) > 1.0e-5f) {
+             throw new IllegalStateException("26560 " + pipeline
+                     + " inherited obsolete Spatial/Bento source exposure");
+         }
+-        Log.i("PostPipeline", "IRIS_26560_SABRE_ONLY_RECONSTRUCTION_OWNER_VALID"
++        Log.i("PostPipeline", "IRIS_26562_SABRE_SR_RECONSTRUCTION_OWNER_VALID"
+                 + " pipeline=" + pipeline
+                 + " owner=" + motionReconstructionOwnerName(owner)
+                 + " sourceGain=" + mParameters.motionV2MgcSourceExposureGain
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 23f2e9708f1b18536cee3bcb1ec8278355fa0824..c5d21c38a696ce1e6a4a3c79d68c2108b3484990 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -704,11 +704,10 @@ private void ApplyHdrX() {
+                         && iris26532SuperResLinearRawHeight > 0;
+                 boolean iris26520RawSaved;
+                 if (iris26532SrDng) {
+-                    iris26520RawSaved = com.particlesdevs.photoncamera.processing.IrisMotionSuperResDngWriter.write(
++                    iris26520RawSaved = com.particlesdevs.photoncamera.processing.IrisSabreSuperResDngWriter.write(
+                             dngFile, java.nio.file.Paths.get(iris26532SuperResLinearRawPath),
+                             iris26532SuperResLinearRawWidth, iris26532SuperResLinearRawHeight,
+-                            processingParameters, iris26522DeferredDngNoiseProfile,
+-                            iris26522DeferredDngFrameCount, iris26522DngSupportMin, iris26522DngSupportP01,
++                            processingParameters, iris26522DeferredDngFrameCount, iris26522DngSupportMin, iris26522DngSupportP01,
+                             iris26522DngSupportP10, iris26522DngSupportMedian, iris26522DngSupportMean,
+                             iris26522DngSupportMax, iris26522DngNoiseEquivalentSupport);
+                     if (iris26480DeferredDng != null) {
+@@ -716,6 +715,9 @@ private void ApplyHdrX() {
+                         iris26480DeferredDng = null;
+                     }
+                 } else {
++                    if (processingParameters.motionV2SuperResOutputEnabled) {
++                        Log.critical(TAG, "IRIS_26562_MOTION_SR_DNG_DEGRADED_TO_NATIVE reason=missing_2x_linear_raw rawOnly=true");
++                    }
+                     ByteBuffer iris26520RawOnly = iris26480DeferredDng;
+                     iris26480DeferredDng = null;
+                     iris26520RawOnly.position(0);
+@@ -956,11 +958,12 @@ private void ApplyHdrX() {
+                 old=android.os.Process.getThreadPriority(tid);android.os.Process.setThreadPriority(tid,android.os.Process.THREAD_PRIORITY_BACKGROUND);
+                 final boolean saved;
+                 if(srLinearDng){
+-                    saved=com.particlesdevs.photoncamera.processing.IrisMotionSuperResDngWriter.write(
++                    saved=com.particlesdevs.photoncamera.processing.IrisSabreSuperResDngWriter.write(
+                             dngPath,java.nio.file.Paths.get(srLinearRawPath),srLinearRawWidth,srLinearRawHeight,
+-                            dngParams,dngNoise,dngFrameCount,dngSupportMin,dngSupportP01,dngSupportP10,
++                            dngParams,dngFrameCount,dngSupportMin,dngSupportP01,dngSupportP10,
+                             dngSupportMedian,dngSupportMean,dngSupportMax,dngNoiseEquivalent);
+                 }else{
++                    if(dngParams.motionV2SuperResOutputEnabled)Log.critical(TAG,"IRIS_26562_MOTION_SR_DNG_DEGRADED_TO_NATIVE reason=missing_2x_linear_raw deferred=true");
+                     dngBytes.position(0);saved=ImageSaver.Util.saveNormalized16StackedRaw(
+                             dngPath,dngBytes,dngParams,dngNoise,dngFrameCount,
+                             dngSupportMin,dngSupportP01,dngSupportP10,dngSupportMedian,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index ca5fb055b67e9bb5cd33eae61b28f0c5618bff9f..c455f9129c5049559f47c83a6b9a6b584adf5300 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -133,23 +133,24 @@ public final class IrisNightProcessor {
+                 throw new IllegalStateException("26548 V1.2 Night reconstruction owner is not Sabre owner="
+                         + p.motionV2ReconstructionOwner);
+             }
++            final boolean iris26562NightSuperResRequested = batch.superResEnabled;
++            final float iris26562ExpectedOutputScale = iris26562NightSuperResRequested ? 2.0f : 1.0f;
+             if (Math.abs(p.motionV2ReconstructionZoom - 1.0f) > 1.0e-5f
+                     || Math.abs(p.motionV2SpatialReconstructionZoom - 1.0f) > 1.0e-5f
+-                    || Math.abs(p.motionV2SuperResOutputScale - 1.0f) > 1.0e-5f) {
+-                throw new IllegalStateException("26548 V1.2 Night Sabre must remain native-grid"
++                    || p.motionV2SuperResOutputEnabled != iris26562NightSuperResRequested
++                    || Math.abs(p.motionV2SuperResOutputScale - iris26562ExpectedOutputScale) > 1.0e-5f) {
++                throw new IllegalStateException("26562 Night invalid Sabre SR geometry"
+                         + " reconstructionZoom=" + p.motionV2ReconstructionZoom
+                         + " spatialZoom=" + p.motionV2SpatialReconstructionZoom
+-                        + " outputScale=" + p.motionV2SuperResOutputScale);
+-            }
+-            final boolean iris26548NightSuperResRequested = batch.superResEnabled;
+-            if (p.motionV2SuperResOutputEnabled) {
+-                // Sabre is intentionally native-grid in this build. Publish effective state rather
+-                // than allowing EXIF/DNG routing to claim a 2x Spatial output that Sabre did not make.
+-                p.motionV2SuperResOutputEnabled = false;
+-                Log.i(TAG, "IRIS_26548_V1_2_NIGHT_SABRE_SR_EFFECTIVE"
+-                        + " requested=" + iris26548NightSuperResRequested
+-                        + " effective=false owner=SABRE nativeGrid=true");
++                        + " srEnabled=" + p.motionV2SuperResOutputEnabled
++                        + " requested=" + iris26562NightSuperResRequested
++                        + " outputScale=" + p.motionV2SuperResOutputScale
++                        + " expectedOutputScale=" + iris26562ExpectedOutputScale);
+             }
++            Log.i(TAG, "IRIS_26562_NIGHT_SABRE_SR_EFFECTIVE"
++                    + " requested=" + iris26562NightSuperResRequested
++                    + " effective=" + p.motionV2SuperResOutputEnabled
++                    + " owner=SABRE nativeGrid=true outputScale=" + p.motionV2SuperResOutputScale);
+             if (r.inputFrames < images.size()) {
+                 throw new IllegalStateException("26540 Night MGC scheduled-frame mismatch scheduled="
+                         + r.inputFrames + " expectedAtLeast=" + images.size());
+@@ -177,13 +178,16 @@ public final class IrisNightProcessor {
+                 try {
+                     if (p.motionV2SuperResOutputEnabled && r.superResLinearRawPath != null
+                             && r.superResLinearRawWidth > 0 && r.superResLinearRawHeight > 0) {
+-                        rawSaved = com.particlesdevs.photoncamera.processing.IrisMotionSuperResDngWriter.write(
++                        rawSaved = com.particlesdevs.photoncamera.processing.IrisSabreSuperResDngWriter.write(
+                                 dngFile, java.nio.file.Paths.get(r.superResLinearRawPath),
+                                 r.superResLinearRawWidth, r.superResLinearRawHeight, p,
+-                                r.dngNoiseProfile, r.dngStackFrames, r.dngSupportMin, r.dngSupportP01,
++                                r.dngStackFrames, r.dngSupportMin, r.dngSupportP01,
+                                 r.dngSupportP10, r.dngSupportMedian, r.dngSupportMean, r.dngSupportMax,
+                                 r.dngNoiseEquivalentSupport);
+                     } else {
++                        if (p.motionV2SuperResOutputEnabled) {
++                            Log.critical(TAG, "IRIS_26562_NIGHT_SR_DNG_DEGRADED_TO_NATIVE reason=missing_2x_linear_raw");
++                        }
+                         if (r.stackedDngRaw16 == null) {
+                             throw new IllegalStateException("26540 Night normalized16 DNG sidecar missing");
+                         }
+@@ -232,7 +236,7 @@ public final class IrisNightProcessor {
+                     + " isoDenoiseAuthority=false darknessDenoiseAuthority=false"
+                     + " autoLowLightLumaFloor=false ultraHdrPostPipeline=true"
+                     + " jinRgbGridApplied=false degradedBracket=" + batch.degradedBracket
+-                    + " superResRequested=" + iris26548NightSuperResRequested
++                    + " superResRequested=" + iris26562NightSuperResRequested
+                     + " superResEffective=" + p.motionV2SuperResOutputEnabled;
+ 
+             final PostPipeline pipeline = new PostPipeline(true);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index fa63ab98b6594fbd64a1a05475ab6967e13b310d..01d59edf813721038356008664878e4bd46266b4 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -65,6 +65,7 @@ object PhotonMotionMgc1271Bridge {
+         var halfBuffer: ByteBuffer? = null
+         var resultTexture = 0
+         var superResDetailPathForCleanup: String? = null
++        var superResLinearRawPathForCleanup: String? = null
+         var superResOutputsHandedOff = false
+         val iris26535TotalStartNs = System.nanoTime()
+         var iris26535FusionMs = -1L
+@@ -254,11 +255,12 @@ object PhotonMotionMgc1271Bridge {
+                 )
+             }
+ 
+-            /* IRIS_26561_SABRE_NATIVE_2X_SR_AUTHORITY
+-             * Sabre remains native-grid for structural RGB/Resolve/VGN. When the existing Super
+-             * Res switch is on, the same Sabre flow/covariance/rejection decisions also feed a
+-             * compact 2x luma-detail carrier. No deleted Spatial/Wronski reconstruction owner is
+-             * restored and DNG remains the proven 1x NORMAL Sabre sidecar.
++            /* IRIS_26562_SABRE_NATIVE_2X_SR_DNG_AUTHORITY
++             * Sabre remains native-grid for structural RGB/Resolve/VGN. When Super Res is on,
++             * the same Sabre flow/covariance/rejection decisions feed the compact 2x luma-detail
++             * carrier. RAW requests additionally export a 2x Sabre LinearRaw RGB DNG carrier; the
++             * normalized16 NORMAL Bayer sidecar remains only the native-resolution fallback. No
++             * deleted Spatial/Wronski reconstruction owner is restored.
+              */
+             val displayedGlobalZoom = parameters.motionV2GlobalZoom
+                 .takeIf { it.isFinite() }?.coerceAtLeast(1f) ?: 1f
+@@ -272,12 +274,13 @@ object PhotonMotionMgc1271Bridge {
+             val sabreSuperResEnabled = parameters.motionV2SuperResOutputEnabled
+             val sabreSuperResOutputScale = if (sabreSuperResEnabled) 2f else 1f
+             parameters.motionV2SuperResOutputScale = sabreSuperResOutputScale
+-            PLog.i(TAG, "IRIS_26561_SABRE_NATIVE_2X_SR_AUTHORITY " +
++            PLog.i(TAG, "IRIS_26562_SABRE_NATIVE_2X_SR_DNG_AUTHORITY " +
+                 "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
+                 "reconstructionZoom=$reconstructionZoom renderResidualZoom=$renderResidualZoom " +
+                 "superResRequested=$sabreSuperResEnabled outputScale=$sabreSuperResOutputScale " +
+                 "baseRgbScale=1.0 detailScale=${if (sabreSuperResEnabled) 2.0 else 1.0} " +
+-                "colorOwner=NATIVE_SABRE_VGN dngScale=1.0")
++                "colorOwner=NATIVE_SABRE_VGN dngScale=${if (sabreSuperResEnabled && produceNormalStackedDng) 2.0 else 1.0} " +
++                "dngOwner=${if (sabreSuperResEnabled && produceNormalStackedDng) "SABRE_LINEAR_RAW_2X" else "NORMALIZED16_NATIVE"}")
+ 
+             egl = EglOwner.create()
+             val fusion = GlesMgcRawFusion(
+@@ -304,6 +307,7 @@ object PhotonMotionMgc1271Bridge {
+             val stacked = fusion.processFrames(frames)
+                 ?: invalid("Iris Sabre owner returned null")
+             superResDetailPathForCleanup = stacked.superResDetailPath
++            superResLinearRawPathForCleanup = stacked.superResLinearRawPath
+             if (parameters.irisNightActive) {
+                 /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
+                  * A HAL-shortened batch may contain fewer than 15 physical frames, but every frame
+@@ -326,8 +330,19 @@ object PhotonMotionMgc1271Bridge {
+                     "26561 Sabre SR evidence ${stacked.superResWidth}x${stacked.superResHeight} " +
+                         "path=${stacked.superResDetailPath != null} expected=${expectedSuperResWidth}x$expectedSuperResHeight",
+                 )
+-                requireParity(stacked.superResLinearRawPath == null,
+-                    "26561 Sabre SR must preserve native 1x normalized16 DNG ownership")
++                if (produceNormalStackedDng) {
++                    if (stacked.superResLinearRawPath != null) {
++                        val srLinearRaw = File(stacked.superResLinearRawPath)
++                        val expectedSrBytes = stacked.superResWidth.toLong() * stacked.superResHeight * 3L * Short.SIZE_BYTES
++                        requireParity(srLinearRaw.isFile && srLinearRaw.length() == expectedSrBytes,
++                            "26562 Sabre SR LinearRaw payload invalid expectedBytes=$expectedSrBytes")
++                    } else {
++                        PLog.w(TAG, "IRIS_26562_SABRE_SR_DNG_DEGRADED_TO_NATIVE producerMissing=true")
++                    }
++                } else {
++                    requireParity(stacked.superResLinearRawPath == null,
++                        "26562 Sabre SR LinearRaw produced without RAW request")
++                }
+             } else {
+                 requireParity(stacked.superResDetailPath == null && stacked.superResLinearRawPath == null &&
+                         stacked.superResWidth == 0 && stacked.superResHeight == 0,
+@@ -583,9 +598,9 @@ object PhotonMotionMgc1271Bridge {
+                 stacked.superResDetailPath,
+                 stacked.superResWidth,
+                 stacked.superResHeight,
+-                null,
+-                0,
+-                0,
++                stacked.superResLinearRawPath,
++                if (stacked.superResLinearRawPath != null) stacked.superResWidth else 0,
++                if (stacked.superResLinearRawPath != null) stacked.superResHeight else 0,
+             ).also { result ->
+                 result.sabreSelected = true
+                 superResOutputsHandedOff = true
+@@ -605,6 +620,7 @@ object PhotonMotionMgc1271Bridge {
+             LargeDirectBuffer.free(halfBuffer)
+             if (!superResOutputsHandedOff) {
+                 superResDetailPathForCleanup?.let { path -> runCatching { File(path).delete() } }
++                superResLinearRawPathForCleanup?.let { path -> runCatching { File(path).delete() } }
+             }
+             egl?.close()
+             inputImages.forEach { frame ->
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index af255474d3d8cc697a8f2e7b0ec3373eb1e36386..837d05c01362f587d08c99ba44102282c7dec4cf 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -41,6 +41,7 @@ import android.os.Bundle;
+ import android.util.DisplayMetrics;
+ 
+ import com.particlesdevs.photoncamera.ui.camera.views.viewfinder.HorizonIndicatorView;
++import com.particlesdevs.photoncamera.util.log.ActivityLifecycleMonitor;
+ import com.particlesdevs.photoncamera.util.Log;
+ import android.util.Size;
+ import android.view.LayoutInflater;
+@@ -151,6 +152,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     private SettingsBarEntryProvider settingsBarEntryProvider;
+     private ManualModeConsole manualModeConsole;
+     public float displayAspectRatio;
++    private boolean iris26562DeferredForegroundReset = false;
+     private HorizonIndicatorView mHorizonIndicatorView;
+ 
+     public CameraFragment() {
+@@ -293,6 +295,25 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+             super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+         }
+     }
++    private boolean iris26562ApplyForegroundResetIfReady() {
++        if (!ActivityLifecycleMonitor.isCameraResetPending()) return true;
++        if (CaptureController.isProcessing) {
++            iris26562DeferredForegroundReset = true;
++            Log.critical(TAG, "IRIS_26562_FOREGROUND_RESET_DEFERRED processing=true cameraResume=false");
++            return false;
++        }
++        if (!ActivityLifecycleMonitor.consumeCameraResetPending()) return true;
++        PreferenceKeys.setCameraModeOrdinal(CameraMode.MOTION.ordinal());
++        PreferenceKeys.setIrisSuperRes(false);
++        IrisZoomController.resetForForegroundSession();
++        PhotonCamera.getSettings().loadCache();
++        if (mCameraUIView != null) mCameraUIView.forceForegroundMotionReset();
++        updateSettingsBar();
++        iris26562DeferredForegroundReset = false;
++        Log.critical(TAG, "IRIS_26562_FOREGROUND_RESET_APPLIED mode=MOTION physicalZoomReset=1x superRes=false");
++        return true;
++    }
++
+     @Override
+     public void onResume() {
+         super.onResume();
+@@ -313,7 +334,9 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         }
+         captureController.startBackgroundThread();
+         textureView.onResume();
+-        captureController.resumeCamera();
++        if (iris26562ApplyForegroundResetIfReady()) {
++            captureController.resumeCamera();
++        }
+         initTouchFocus();
+         manualModeConsole.onResume();
+     }
+@@ -743,6 +766,17 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+             if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                 stopNotification();
+             }
++            if (iris26562DeferredForegroundReset && isResumed()) {
++                final Activity foregroundActivity = activity;
++                if (foregroundActivity != null) {
++                    foregroundActivity.runOnUiThread(() -> {
++                        if (isResumed() && iris26562ApplyForegroundResetIfReady()) {
++                            captureController.resumeCamera();
++                            Log.critical(TAG, "IRIS_26562_DEFERRED_FOREGROUND_CAMERA_RESUMED");
++                        }
++                    });
++                }
++            }
+ 
+         }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIView.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIView.java
+index b40e29b05a6d30db86326884b133c44385c8fa8d..631610c4b7e20ab9a4c4a70bf2879d2cc67eb38c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIView.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIView.java
+@@ -62,6 +62,9 @@ public interface CameraUIView {
+ 
+     void setVideoRecordingInfoVisible(boolean visible);
+ 
++    /** IRIS_26562 retained-process reset without firing a second camera restart callback. */
++    void forceForegroundMotionReset();
++
+     void destroy();
+ 
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 65bbb736e2a7d2900b3ec8cca05cc6de90bebcfb..96611fde3bae1825a7459d17842cc706fdfb0126 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -647,6 +647,39 @@ public class CameraUIViewImpl implements CameraUIView {
+         }
+     }
+ 
++    @Override
++    public void forceForegroundMotionReset() {
++        final CameraMode previousMode = displayedMode;
++        displayedMode = CameraMode.MOTION;
++        iris26551AdvanceProgressUiGeneration("foreground-reset:" + previousMode + "->MOTION");
++        if (previousMode != CameraMode.MOTION) {
++            cameraFragment.clearTimerFrameCountForModeTransition();
++        }
++        currentState = new PhotoMotionModeState();
++        mModePicker.collapseToIndex(indexOfMode(CameraMode.MOTION));
++        currentState.reConfigureModeViews(CameraMode.MOTION);
++        resetCaptureProgressBar();
++        if (mProcessingProgressBar != null) {
++            mProcessingProgressBar.animate().cancel();
++            mProcessingProgressBar.setIndeterminate(false);
++            mProcessingProgressBar.setProgress(0);
++            mProcessingProgressBar.clearAnimation();
++            mProcessingProgressBar.setClickable(false);
++            mProcessingProgressBar.setFocusable(false);
++            mProcessingProgressBar.setVisibility(View.GONE);
++        }
++        if (mVideoRecordingInfo != null) {
++            mVideoRecordingInfo.setText("");
++            mVideoRecordingInfo.setVisibility(View.GONE);
++            mVideoRecordingInfo.setAlpha(0.0f);
++        }
++        setVideoRecordingInfoVisible(false);
++        activateShutterButton(true);
++        lockUIForBurst(false);
++        Log.critical(TAG, "IRIS_26562_FOREGROUND_UI_RESET previous=" + previousMode
++                + " current=MOTION callbackRestart=false staleVideoUiCleared=true");
++    }
++
+     @Override
+     public void refresh(boolean processing) {
+         TunableInjector.inject(this);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/util/log/ActivityLifecycleMonitor.java b/app/src/main/java/com/particlesdevs/photoncamera/util/log/ActivityLifecycleMonitor.java
+index 9da4ee19ad95fd7560a6043bb039d4e34fa06d91..119c9402873648c6ce6248bf3c7ea85f338005e2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/util/log/ActivityLifecycleMonitor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/util/log/ActivityLifecycleMonitor.java
+@@ -3,6 +3,8 @@ package com.particlesdevs.photoncamera.util.log;
+ import android.app.Activity;
+ import android.app.Application;
+ import android.os.Bundle;
++import android.os.Handler;
++import android.os.Looper;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+ import androidx.annotation.NonNull;
+@@ -16,6 +18,27 @@ import com.particlesdevs.photoncamera.app.PhotonCamera;
+ public class ActivityLifecycleMonitor implements Application.ActivityLifecycleCallbacks {
+     private static final String TAG = "ActivityMonitor";
+ 
++    private static final Object IRIS_26562_LOCK = new Object();
++    private static final Handler IRIS_26562_MAIN = new Handler(Looper.getMainLooper());
++    private static int iris26562StartedActivities = 0;
++    private static boolean iris26562BackgroundConfirmed = false;
++    private static boolean iris26562CameraResetPending = false;
++    private static int iris26562StopGeneration = 0;
++
++    public static boolean isCameraResetPending() {
++        synchronized (IRIS_26562_LOCK) {
++            return iris26562CameraResetPending;
++        }
++    }
++
++    public static boolean consumeCameraResetPending() {
++        synchronized (IRIS_26562_LOCK) {
++            if (!iris26562CameraResetPending) return false;
++            iris26562CameraResetPending = false;
++            return true;
++        }
++    }
++
+     void log(String msg) {
+         if (PhotonCamera.DEBUG)
+             Log.d(TAG, msg);
+@@ -29,7 +52,20 @@ public class ActivityLifecycleMonitor implements Application.ActivityLifecycleCa
+     @Override
+     public void onActivityStarted(@NonNull Activity activity) {
+         log(activity.getLocalClassName() + " : onStarted()");
+-
++        boolean armReset = false;
++        synchronized (IRIS_26562_LOCK) {
++            iris26562StartedActivities++;
++            iris26562StopGeneration++;
++            if (iris26562BackgroundConfirmed) {
++                iris26562BackgroundConfirmed = false;
++                iris26562CameraResetPending = true;
++                armReset = true;
++            }
++        }
++        if (armReset) {
++            Log.critical(TAG, "IRIS_26562_FOREGROUND_RESET_ARMED activity="
++                    + activity.getLocalClassName());
++        }
+     }
+ 
+     @Override
+@@ -47,7 +83,24 @@ public class ActivityLifecycleMonitor implements Application.ActivityLifecycleCa
+     @Override
+     public void onActivityStopped(@NonNull Activity activity) {
+         log(activity.getLocalClassName() + " : onStopped()");
+-
++        final int generation;
++        synchronized (IRIS_26562_LOCK) {
++            iris26562StartedActivities = Math.max(0, iris26562StartedActivities - 1);
++            generation = ++iris26562StopGeneration;
++            if (iris26562StartedActivities != 0) return;
++        }
++        IRIS_26562_MAIN.post(() -> {
++            boolean confirmed = false;
++            synchronized (IRIS_26562_LOCK) {
++                if (iris26562StartedActivities == 0 && iris26562StopGeneration == generation) {
++                    iris26562BackgroundConfirmed = true;
++                    confirmed = true;
++                }
++            }
++            if (confirmed) {
++                Log.critical(TAG, "IRIS_26562_APP_BACKGROUND_CONFIRMED resetOnNextForeground=true");
++            }
++        });
+     }
+ 
+     @Override
+diff --git a/app/src/main/res/drawable/ic_super_res_off.xml b/app/src/main/res/drawable/ic_super_res_off.xml
+index 702711594ba8dab41a0a3b343f7984bfecbc0c06..89b4d75ad08270fc28844eedb979a3263937ce3a 100644
+--- a/app/src/main/res/drawable/ic_super_res_off.xml
++++ b/app/src/main/res/drawable/ic_super_res_off.xml
+@@ -1,11 +1,13 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <vector xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:width="24dp" android:height="24dp"
+-    android:viewportWidth="52" android:viewportHeight="52">
+-    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="4"
+-        android:strokeLineCap="round" android:strokeLineJoin="round"
+-        android:pathData="M17,5 L7,5 Q5,5 5,7 L5,17 M35,5 L45,5 Q47,5 47,7 L47,17 M5,35 L5,45 Q5,47 7,47 L17,47 M47,35 L47,45 Q47,47 45,47 L35,47"/>
+-    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="3.5"
+-        android:strokeLineCap="round" android:strokeLineJoin="round"
+-        android:pathData="M18,26 L34,26 M26,18 L26,34"/>
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="0.9" android:strokeAlpha="0.35" android:pathData="M17.3,6.8 A1.7,1.7 0,1 1,13.9 6.8 A1.7,1.7 0,1 1,17.3 6.8"/>
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="0.9" android:strokeAlpha="0.35" android:pathData="M17,6.6 A1.7,1.7 0,1 1,13.6 6.6 A1.7,1.7 0,1 1,17 6.6"/>
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="0.9" android:strokeAlpha="0.5" android:pathData="M17.6,7 A1.7,1.7 0,1 1,14.2 7 A1.7,1.7 0,1 1,17.6 7"/>
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="0.9" android:strokeAlpha="0.4" android:pathData="M2.5,18.5 L8.5,9.5 L11.5,13.5 L14.5,9 L21.5,18.5 Z"/>
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="0.9" android:strokeAlpha="0.3" android:pathData="M2.2,18.8 L8.2,9.8 L11.2,13.8 L14.2,9.3 L21.2,18.8 Z"/>
++    <path android:fillColor="#00000000" android:strokeColor="#FFFFFFFF" android:strokeWidth="0.9" android:strokeAlpha="0.55" android:pathData="M2.8,18.2 L8.8,9.2 L11.8,13.2 L14.8,8.7 L21.8,18.2 Z"/>
+ </vector>
+diff --git a/app/src/main/res/drawable/ic_super_res_on.xml b/app/src/main/res/drawable/ic_super_res_on.xml
+index 8f4a37e7ac97c88d2e66a1dc6dc47345569ba241..cbd9f513743cdaeac900e1c1acbdbc6a7ee35a8f 100644
+--- a/app/src/main/res/drawable/ic_super_res_on.xml
++++ b/app/src/main/res/drawable/ic_super_res_on.xml
+@@ -1,9 +1,19 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <vector xmlns:android="http://schemas.android.com/apk/res/android"
+-    android:width="24dp" android:height="24dp"
+-    android:viewportWidth="52" android:viewportHeight="52">
+-    <path android:fillColor="#FFFFFFFF"
+-        android:pathData="M17,3 L7,3 Q3,3 3,7 L3,17 L7,17 L7,7 L17,7 Z M35,3 L45,3 Q49,3 49,7 L49,17 L45,17 L45,7 L35,7 Z M3,35 L7,35 L7,45 L17,45 L17,49 L7,49 Q3,49 3,45 Z M45,35 L49,35 L49,45 Q49,49 45,49 L35,49 L35,45 L45,45 Z"/>
+-    <path android:fillColor="#FFFFFFFF"
+-        android:pathData="M24,15 L28,15 L28,24 L37,24 L37,28 L28,28 L28,37 L24,37 L24,28 L15,28 L15,24 L24,24 Z"/>
++    android:width="24dp"
++    android:height="24dp"
++    android:viewportWidth="24"
++    android:viewportHeight="24">
++    <path
++        android:fillColor="#00000000"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="1.6"
++        android:pathData="M17.3,6.8 A1.7,1.7 0,1 1,13.9 6.8 A1.7,1.7 0,1 1,17.3 6.8"/>
++    <path
++        android:fillColor="#00000000"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="1.6"
++        android:strokeLineJoin="round"
++        android:strokeLineCap="round"
++        android:pathData="M2.5,18.5 L8.5,9.5 L11.5,13.5 L14.5,9 L21.5,18.5 Z"/>
+ </vector>
+diff --git a/app/version.properties b/app/version.properties
+index a960a296a8cd954a58feab673bedc3dbceb39edb..ea9a0db7daf8f0373a625b9588a1fc59aeb52059 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726561
+-VERSION_BUILD=26561
++VERSION_NAME=0.9726562
++VERSION_BUILD=26562
