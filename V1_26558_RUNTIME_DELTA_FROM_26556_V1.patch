@@ -1,0 +1,600 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 02f9adf8e008f6de17839661a16bf7ea58188156..261ec87f5e7c34be5f21bd2957b2c79c68f7f5fa 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -584,6 +584,222 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26558_SABRE_SHADOW_LONG_SOURCE_CLIP_GUARD
++     * Night-only Sabre merge. The proven Motion/NORMAL merge shader above remains byte-for-byte
++     * unchanged. For SHADOW_LONG only, reject the whole Long observation at an output pixel if
++     * any of the exact 3x3 unnormalized source-CFA samples consumed by Sabre has reached sensor
++     * saturation. This prevents exposure normalization from making lost/clipped channel evidence
++     * look valid and preserves SHORT as highlight authority.
++     */
++    val mergeShadowLong26558 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uExtractedBayer;
++        uniform sampler2D uFlow;
++        uniform sampler2D uCovariance;
++        uniform sampler2D uRejection;
++        uniform vec4 uFlowScaleOffset;
++        uniform ivec2 uExtractedSize;
++        uniform ivec2 uOutputSize;
++        uniform vec4 uFrameBorderPadded;
++        uniform int uCfaPattern;
++        uniform int uUseFrameWeight;
++        uniform float uSourceClippingPoint;
++        uniform vec4 uGains;
++        uniform vec4 uBlackLevelsTimesGains;
++        uniform vec4 uCovRangeRg;
++        uniform vec2 uCovRangeB;
++        layout(location = 0) out vec4 oColorAndRWeight;
++        layout(location = 1) out vec2 oWeightsGb;
++
++        vec2 mirrorUvs(vec2 sampleUv) {
++            if (sampleUv.x <= uFrameBorderPadded.x) {
++                sampleUv.x = 2.0 * uFrameBorderPadded.x - sampleUv.x;
++            }
++            if (sampleUv.y <= uFrameBorderPadded.y) {
++                sampleUv.y = 2.0 * uFrameBorderPadded.y - sampleUv.y;
++            }
++            if (sampleUv.x > uFrameBorderPadded.z) {
++                sampleUv.x = 2.0 * uFrameBorderPadded.z - sampleUv.x;
++            }
++            if (sampleUv.y > uFrameBorderPadded.w) {
++                sampleUv.y = 2.0 * uFrameBorderPadded.w - sampleUv.y;
++            }
++            return sampleUv;
++        }
++
++        float kernelWeight(vec2 pixelOffset, vec3 covariance) {
++            float kernelDistance =
++                pixelOffset.x * pixelOffset.x * covariance.x +
++                pixelOffset.y * pixelOffset.y * covariance.y +
++                pixelOffset.x * pixelOffset.y * covariance.z * 2.0;
++            return exp2(-0.5 * kernelDistance) + 0.00005;
++        }
++
++        vec3 unpackCovariance(vec3 packed) {
++            return vec3(
++                packed.x * uCovRangeRg.y + uCovRangeRg.x,
++                packed.y * uCovRangeRg.w + uCovRangeRg.z,
++                packed.z * uCovRangeB.y + uCovRangeB.x
++            );
++        }
++
++        mat3 get3x3FromExtractedBayer(ivec2 bayerPosition) {
++            mat3 values = mat3(0.0);
++            int type = (bayerPosition.y % 2) * 2 + (bayerPosition.x % 2);
++            vec2 texturePosition = vec2(bayerPosition / 2);
++            if (type == 0) texturePosition += vec2(-1.0, -1.0);
++            else if (type == 1) texturePosition += vec2(0.0, -1.0);
++            else if (type == 2) texturePosition += vec2(-1.0, 0.0);
++            texturePosition += vec2(0.5);
++            vec2 reciprocalSize = 1.0 / vec2(uExtractedSize);
++            vec4 bayer0 = texture(uExtractedBayer, texturePosition * reciprocalSize);
++            vec4 bayer1 = texture(
++                uExtractedBayer,
++                (texturePosition + vec2(1.0, 0.0)) * reciprocalSize
++            );
++            vec4 bayer2 = texture(
++                uExtractedBayer,
++                (texturePosition + vec2(0.0, 1.0)) * reciprocalSize
++            );
++            vec4 bayer3 = texture(
++                uExtractedBayer,
++                (texturePosition + vec2(1.0, 1.0)) * reciprocalSize
++            );
++            if (type == 0) {
++                values[0][0] = bayer0.w; values[1][0] = bayer1.z; values[2][0] = bayer1.w;
++                values[0][1] = bayer2.y; values[1][1] = bayer3.x; values[2][1] = bayer3.y;
++                values[0][2] = bayer2.w; values[1][2] = bayer3.z; values[2][2] = bayer3.w;
++            } else if (type == 1) {
++                values[0][0] = bayer0.z; values[1][0] = bayer0.w; values[2][0] = bayer1.z;
++                values[0][1] = bayer2.x; values[1][1] = bayer2.y; values[2][1] = bayer3.x;
++                values[0][2] = bayer2.z; values[1][2] = bayer2.w; values[2][2] = bayer3.z;
++            } else if (type == 2) {
++                values[0][0] = bayer0.y; values[1][0] = bayer1.x; values[2][0] = bayer1.y;
++                values[0][1] = bayer0.w; values[1][1] = bayer1.z; values[2][1] = bayer1.w;
++                values[0][2] = bayer2.y; values[1][2] = bayer3.x; values[2][2] = bayer3.y;
++            } else {
++                values[0][0] = bayer0.x; values[1][0] = bayer0.y; values[2][0] = bayer1.x;
++                values[0][1] = bayer0.z; values[1][1] = bayer0.w; values[2][1] = bayer1.z;
++                values[0][2] = bayer2.x; values[1][2] = bayer2.y; values[2][2] = bayer3.x;
++            }
++            return values;
++        }
++
++        vec4 swizzleForType(vec4 value, int type) {
++            if (type == 0) return value.rgba;
++            if (type == 1) return value.grab;
++            if (type == 2) return value.barg;
++            return value.abgr;
++        }
++
++        void sampleNeighborhoodRbf(
++            vec2 sampleUv,
++            vec3 covariance,
++            out vec3 accumulatedIntensities,
++            out vec3 accumulatedWeights,
++            out float sourceNeighborhoodClipped
++        ) {
++            accumulatedIntensities = vec3(0.0);
++            accumulatedWeights = vec3(0.0);
++            sourceNeighborhoodClipped = 0.0;
++            vec2 coordinateScaled = sampleUv * (vec2(uExtractedSize) * 2.0);
++            ivec2 position = ivec2(coordinateScaled);
++            mat3 bayerValue = get3x3FromExtractedBayer(position);
++            for (int sx = 0; sx < 3; ++sx) {
++                for (int sy = 0; sy < 3; ++sy) {
++                    sourceNeighborhoodClipped = max(
++                        sourceNeighborhoodClipped,
++                        step(uSourceClippingPoint, bayerValue[sx][sy])
++                    );
++                }
++            }
++            mat3 weights = mat3(0.0);
++            vec2 subpixelOffset = floor(coordinateScaled) + 0.5 - coordinateScaled;
++            for (int i = -1; i <= 1; ++i) {
++                for (int j = -1; j <= 1; ++j) {
++                    weights[i + 1][j + 1] = kernelWeight(
++                        subpixelOffset + vec2(ivec2(i, j)),
++                        covariance
++                    );
++                }
++            }
++            ivec2 bayerOffset = ivec2(0);
++            if (uCfaPattern == 0) bayerOffset = ivec2(1, 1);
++            else if (uCfaPattern == 1) bayerOffset = ivec2(0, 1);
++            else if (uCfaPattern == 2) bayerOffset = ivec2(1, 0);
++            int type = (((position.y + bayerOffset.y) & 1) << 1) +
++                ((position.x + bayerOffset.x) & 1);
++            vec4 cornerWeights = vec4(
++                weights[0][0], weights[0][2], weights[2][0], weights[2][2]
++            );
++            vec2 upDownWeights = vec2(weights[1][0], weights[1][2]);
++            vec2 leftRightWeights = vec2(weights[0][1], weights[2][1]);
++            vec4 value1 = vec4(
++                bayerValue[0][0], bayerValue[0][2], bayerValue[2][0], bayerValue[2][2]
++            );
++            vec2 value2 = vec2(bayerValue[1][0], bayerValue[1][2]);
++            vec2 value3 = vec2(bayerValue[0][1], bayerValue[2][1]);
++            vec4 reorderedGains = swizzleForType(uGains, type);
++            vec4 reorderedBlack = swizzleForType(uBlackLevelsTimesGains, type);
++            vec4 intensities = vec4(
++                dot(value1 * reorderedGains.r + reorderedBlack.r, cornerWeights),
++                dot(value2 * reorderedGains.g + reorderedBlack.g, upDownWeights),
++                dot(value3 * reorderedGains.b + reorderedBlack.b, leftRightWeights),
++                (bayerValue[1][1] * reorderedGains.a + reorderedBlack.a) * weights[1][1]
++            );
++            vec4 reorderedWeights = vec4(
++                dot(cornerWeights, vec4(1.0)),
++                dot(upDownWeights, vec2(1.0)),
++                dot(leftRightWeights, vec2(1.0)),
++                weights[1][1]
++            );
++            intensities = swizzleForType(intensities, type);
++            reorderedWeights = swizzleForType(reorderedWeights, type);
++            accumulatedIntensities = vec3(
++                intensities.r,
++                intensities.g + intensities.b,
++                intensities.a
++            );
++            accumulatedWeights = vec3(
++                reorderedWeights.r,
++                reorderedWeights.g + reorderedWeights.b,
++                reorderedWeights.a
++            );
++        }
++
++        void main() {
++            vec2 referenceUv = gl_FragCoord.xy / vec2(uOutputSize);
++            vec2 flowUv =
++                referenceUv * uFlowScaleOffset.xy +
++                uFlowScaleOffset.zw;
++            vec4 flow = texture(uFlow, flowUv);
++            vec2 sampleUv = mirrorUvs(referenceUv + flow.xy);
++            vec3 covariance = unpackCovariance(texture(uCovariance, sampleUv).xyz);
++            vec3 accumulatedColor = vec3(0.0);
++            vec3 accumulatedWeight = vec3(0.0);
++            float sourceNeighborhoodClipped = 0.0;
++            sampleNeighborhoodRbf(
++                sampleUv,
++                covariance,
++                accumulatedColor,
++                accumulatedWeight,
++                sourceNeighborhoodClipped
++            );
++            float frameWeight = uUseFrameWeight != 0
++                ? texture(uRejection, referenceUv).r
++                : 1.0;
++            if (sourceNeighborhoodClipped > 0.5) {
++                frameWeight = 0.0;
++            }
++            accumulatedColor *= frameWeight;
++            accumulatedWeight *= frameWeight;
++            oColorAndRWeight = vec4(accumulatedColor, accumulatedWeight.r);
++            oWeightsGb = accumulatedWeight.gb;
++        }
++    """.trimIndent()
++
+     /**
+      * IRIS_26545_SABRE_SPARSE_FLOW_CONTRACT
+      * Sabre-only reproduction of MGC ConvertAlignmentHalide. Keep the LK grid sparse; each
+@@ -770,6 +986,106 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++
++    /* IRIS_26558_SABRE_SHADOW_LONG_SOURCE_CLIP_COVERAGE
++     * Night-only companion for Sabre accumulated alpha/support. Motion/NORMAL keeps the proven
++     * copyMask shader. On the quarter-resolution coverage grid, do not count a SHADOW_LONG
++     * observation when its aligned exact Sabre 3x3 source-CFA footprint reaches sensor saturation.
++     */
++    val copyMaskShadowLong26558 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uRejection;
++        uniform sampler2D uExtractedBayer;
++        uniform sampler2D uFlow;
++        uniform vec4 uFlowScaleOffset;
++        uniform ivec2 uExtractedSize;
++        uniform vec4 uFrameBorderPadded;
++        uniform float uAccumulatedWeightScale;
++        uniform float uSourceClippingPoint;
++        layout(location = 0) out float oAccumulatedWeight;
++
++        vec2 mirrorUvs(vec2 sampleUv) {
++            if (sampleUv.x <= uFrameBorderPadded.x) {
++                sampleUv.x = 2.0 * uFrameBorderPadded.x - sampleUv.x;
++            }
++            if (sampleUv.y <= uFrameBorderPadded.y) {
++                sampleUv.y = 2.0 * uFrameBorderPadded.y - sampleUv.y;
++            }
++            if (sampleUv.x > uFrameBorderPadded.z) {
++                sampleUv.x = 2.0 * uFrameBorderPadded.z - sampleUv.x;
++            }
++            if (sampleUv.y > uFrameBorderPadded.w) {
++                sampleUv.y = 2.0 * uFrameBorderPadded.w - sampleUv.y;
++            }
++            return sampleUv;
++        }
++
++        mat3 get3x3FromExtractedBayer(ivec2 bayerPosition) {
++            mat3 values = mat3(0.0);
++            int type = (bayerPosition.y % 2) * 2 + (bayerPosition.x % 2);
++            vec2 texturePosition = vec2(bayerPosition / 2);
++            if (type == 0) texturePosition += vec2(-1.0, -1.0);
++            else if (type == 1) texturePosition += vec2(0.0, -1.0);
++            else if (type == 2) texturePosition += vec2(-1.0, 0.0);
++            texturePosition += vec2(0.5);
++            vec2 reciprocalSize = 1.0 / vec2(uExtractedSize);
++            vec4 bayer0 = texture(uExtractedBayer, texturePosition * reciprocalSize);
++            vec4 bayer1 = texture(
++                uExtractedBayer,
++                (texturePosition + vec2(1.0, 0.0)) * reciprocalSize
++            );
++            vec4 bayer2 = texture(
++                uExtractedBayer,
++                (texturePosition + vec2(0.0, 1.0)) * reciprocalSize
++            );
++            vec4 bayer3 = texture(
++                uExtractedBayer,
++                (texturePosition + vec2(1.0, 1.0)) * reciprocalSize
++            );
++            if (type == 0) {
++                values[0][0] = bayer0.w; values[1][0] = bayer1.z; values[2][0] = bayer1.w;
++                values[0][1] = bayer2.y; values[1][1] = bayer3.x; values[2][1] = bayer3.y;
++                values[0][2] = bayer2.w; values[1][2] = bayer3.z; values[2][2] = bayer3.w;
++            } else if (type == 1) {
++                values[0][0] = bayer0.z; values[1][0] = bayer0.w; values[2][0] = bayer1.z;
++                values[0][1] = bayer2.x; values[1][1] = bayer2.y; values[2][1] = bayer3.x;
++                values[0][2] = bayer2.z; values[1][2] = bayer2.w; values[2][2] = bayer3.z;
++            } else if (type == 2) {
++                values[0][0] = bayer0.y; values[1][0] = bayer1.x; values[2][0] = bayer1.y;
++                values[0][1] = bayer0.w; values[1][1] = bayer1.z; values[2][1] = bayer1.w;
++                values[0][2] = bayer2.y; values[1][2] = bayer3.x; values[2][2] = bayer3.y;
++            } else {
++                values[0][0] = bayer0.x; values[1][0] = bayer0.y; values[2][0] = bayer1.x;
++                values[0][1] = bayer0.z; values[1][1] = bayer0.w; values[2][1] = bayer1.z;
++                values[0][2] = bayer2.x; values[1][2] = bayer2.y; values[2][2] = bayer3.x;
++            }
++            return values;
++        }
++
++        void main() {
++            vec2 referenceUv = gl_FragCoord.xy / vec2(textureSize(uRejection, 0));
++            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
++            vec4 flow = texture(uFlow, flowUv);
++            vec2 sampleUv = mirrorUvs(referenceUv + flow.xy);
++            vec2 coordinateScaled = sampleUv * (vec2(uExtractedSize) * 2.0);
++            mat3 bayerValue = get3x3FromExtractedBayer(ivec2(coordinateScaled));
++            float sourceNeighborhoodClipped = 0.0;
++            for (int sx = 0; sx < 3; ++sx) {
++                for (int sy = 0; sy < 3; ++sy) {
++                    sourceNeighborhoodClipped = max(
++                        sourceNeighborhoodClipped,
++                        step(uSourceClippingPoint, bayerValue[sx][sy])
++                    );
++                }
++            }
++            float validLong = 1.0 - step(0.5, sourceNeighborhoodClipped);
++            oAccumulatedWeight =
++                texture(uRejection, referenceUv).r * validLong / uAccumulatedWeightScale;
++        }
++    """.trimIndent()
++
+     val copyMask = """
+         #version 300 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index ba47b9bf649ba5860d9642de6c48e7a7dd7cf27a..d264aa2e6bd1d507d62791b45f09c8dec78dddd4 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -471,6 +471,8 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreExtractBayerProgram = 0
+     private var sabreGuideAndCovarianceProgram = 0
+     private var sabreMergeProgram = 0
++    private var sabreShadowLongMergeProgram = 0
++    private var sabreShadowLongCopyMaskProgram = 0
+     private var sabreNormalDngMergeProgram = 0
+     private var sabreCopyMaskProgram = 0
+     private var sabreCopyAlphaProgram = 0
+@@ -1978,6 +1980,15 @@ internal class GlesMgcRawSpatialStacker(
+             "IRIS_26547_SABRE_ROLE_CONTRACT normal=$normalFrameCount shadowLong=$shadowLongFrameCount " +
+                 "total=${frames.size} referenceRole=SHORT",
+         )
++        if (shadowLongFrameCount > 0) {
++            PLog.i(
++                SABRE_TAG,
++                "IRIS_26558_SABRE_LONG_SOURCE_CLIP_GUARD enabled=true role=SHADOW_LONG " +
++                    "domain=unnormalized_sensor_raw footprint=exact_sabre_3x3 allCfa=true " +
++                    "wholeLongObservationReject=true coverageSupportGuard=true shortHighlightAuthority=true " +
++                    "sourceClippingPoint=${sabreShadowLongSourceClippingPoint()}",
++            )
++        }
+         baseFrameCamera2Model = frames.firstOrNull()
+             ?.channelNoiseProfile
+             ?.let(RawNoiseModel::fromCamera2NoiseProfile)
+@@ -2182,6 +2193,7 @@ internal class GlesMgcRawSpatialStacker(
+                 extractedWidth = extractedWidth,
+                 extractedHeight = extractedHeight,
+                 useFrameWeight = false,
++                shadowLongSourceClipGuard = false,
+             )
+             if (normalDngAccumulator != 0) {
+                 renderSabreNormalDngMerge(
+@@ -2271,13 +2283,27 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.GL_LINEAR,
+                 )
+                 renderDilation(reverseWeight, frameWeight)
+-                renderSabreCoverage(
+-                    frameWeight,
+-                    accumulatedCoverage,
+-                    coverageWidth,
+-                    coverageHeight,
+-                    accumulatedWeightScale,
+-                )
++                if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
++                    renderSabreShadowLongCoverage(
++                        weight = frameWeight,
++                        extracted = currentExtracted,
++                        flow = flow,
++                        accumulatedCoverage = accumulatedCoverage,
++                        coverageWidth = coverageWidth,
++                        coverageHeight = coverageHeight,
++                        extractedWidth = extractedWidth,
++                        extractedHeight = extractedHeight,
++                        accumulatedWeightScale = accumulatedWeightScale,
++                    )
++                } else {
++                    renderSabreCoverage(
++                        frameWeight,
++                        accumulatedCoverage,
++                        coverageWidth,
++                        coverageHeight,
++                        accumulatedWeightScale,
++                    )
++                }
+                 renderSabreMerge(
+                     extracted = currentExtracted,
+                     flow = flow,
+@@ -2289,6 +2315,7 @@ internal class GlesMgcRawSpatialStacker(
+                     extractedWidth = extractedWidth,
+                     extractedHeight = extractedHeight,
+                     useFrameWeight = true,
++                    shadowLongSourceClipGuard = frame.role == RawBurstFrameRole.SHADOW_LONG,
+                 )
+                 if (normalDngAccumulator != 0 && frame.role == RawBurstFrameRole.NORMAL) {
+                     renderSabreNormalDngMerge(
+@@ -2923,6 +2950,56 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    private fun renderSabreShadowLongCoverage(
++        weight: Int,
++        extracted: Int,
++        flow: SabreConvertedAlignment,
++        accumulatedCoverage: Int,
++        coverageWidth: Int,
++        coverageHeight: Int,
++        extractedWidth: Int,
++        extractedHeight: Int,
++        accumulatedWeightScale: Float,
++    ) {
++        if (sabreShadowLongCopyMaskProgram == 0) {
++            sabreShadowLongCopyMaskProgram = linkProgram(
++                GlesMgcRawSabreShaders.copyMaskShadowLong26558,
++                "iris_26558_sabre_shadow_long_coverage",
++            )
++        }
++        val program = sabreShadowLongCopyMaskProgram
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uRejection", 0, weight)
++        bindTexture(program, "uExtractedBayer", 1, extracted)
++        bindTexture(program, "uFlow", 2, flow.texture)
++        uniformSabreFlowScaleOffset(program, flow)
++        uniform2i(program, "uExtractedSize", extractedWidth, extractedHeight)
++        uniform4f(
++            program,
++            "uFrameBorderPadded",
++            SABRE_SAMPLE_BORDER_PIXELS / width,
++            SABRE_SAMPLE_BORDER_PIXELS / height,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
++        )
++        uniform1f(program, "uAccumulatedWeightScale", accumulatedWeightScale)
++        uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
++        GLES30.glEnable(GLES30.GL_BLEND)
++        try {
++            GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
++            GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
++            draw(
++                program,
++                coverageWidth,
++                coverageHeight,
++                intArrayOf(accumulatedCoverage),
++                preserveBlend = true,
++            )
++        } finally {
++            GLES30.glDisable(GLES30.GL_BLEND)
++        }
++    }
++
+     /** Exact bucket mapping used by MGC's Sabre accumulated R8 mask uniform. */
+     private fun maxSabreAccumulatedWeight(frameCount: Int): Float = when {
+         frameCount < 2 -> 1f
+@@ -2935,6 +3012,14 @@ internal class GlesMgcRawSpatialStacker(
+         else -> 255f
+     }
+ 
++    /* IRIS_26558_SABRE_SHADOW_LONG_SOURCE_CLIP_GUARD
++     * uExtractedBayer stores unnormalized integer sensor RAW (+1e-4 transport epsilon). Keep the
++     * threshold at the actual sensor saturation code rather than a tuned highlight threshold: this
++     * build rejects only genuinely lost Long evidence, not merely bright but recoverable samples.
++     */
++    private fun sabreShadowLongSourceClippingPoint(): Float =
++        sensorWhiteLevel.coerceAtLeast(1f) - 0.5f
++
+     private fun renderSabreMerge(
+         extracted: Int,
+         flow: SabreConvertedAlignment,
+@@ -2946,8 +3031,19 @@ internal class GlesMgcRawSpatialStacker(
+         extractedWidth: Int,
+         extractedHeight: Int,
+         useFrameWeight: Boolean,
++        shadowLongSourceClipGuard: Boolean,
+     ) {
+-        val program = sabreMergeProgram
++        val program = if (shadowLongSourceClipGuard) {
++            if (sabreShadowLongMergeProgram == 0) {
++                sabreShadowLongMergeProgram = linkProgram(
++                    GlesMgcRawSabreShaders.mergeShadowLong26558,
++                    "iris_26558_sabre_shadow_long_merge",
++                )
++            }
++            sabreShadowLongMergeProgram
++        } else {
++            sabreMergeProgram
++        }
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uExtractedBayer", 0, extracted)
+         bindTexture(program, "uFlow", 1, flow.texture)
+@@ -2966,6 +3062,9 @@ internal class GlesMgcRawSpatialStacker(
+         )
+         uniform1i(program, "uCfaPattern", cfaPattern)
+         uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
++        if (shadowLongSourceClipGuard) {
++            uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
++        }
+         uniform4fv(program, "uGains", calibration.gains)
+         uniform4fv(program, "uBlackLevelsTimesGains", calibration.blackTerms)
+         uniform4f(
+@@ -3429,6 +3528,8 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
++        // IRIS_26558: keep Motion/NORMAL on the exact proven merge program. The Long program
++        // is linked lazily only when a SHADOW_LONG frame is actually processed.
+         if (exportNormalStackedDng) {
+             sabreNormalDngMergeProgram = linkProgram(
+                 GlesMgcRawSabreShaders.normalDngMerge,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 59e660a87fb50dee8bf042bdee86df34b8c88959..93d1b3f68829623c67e2e3522a5c9931dba0fc47 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -49,12 +49,15 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+ 
+     private static final String MATCH_STRENGTH_KEY = "pref_motion_viewfinder_match_strength";
+     private static final float DEFAULT_MATCH_STRENGTH_PERCENT = 65.0f;
+-    /* IRIS_26550_NIGHT_PRESENTATION_POLICY
+-     * Night capture intentionally keeps its Short reference highlight-safe. Presentation restores
+-     * shutter-time brightness after reconstruction, but true dark scenes retain some darkness and
+-     * a P99 extended-linear guide caps positive lift before the existing render shoulder.
++    /* IRIS_26558_NIGHT_PRESENTATION_POLICY
++     * Keep Motion's proven current match-strength solve as the comparison authority, then give Night a bounded
++     * scene-adaptive visibility advantage: about +0.40 EV (~32%) in very dark scenes and +0.30 EV
++     * (~23%) in bright scenes. This prevents the old bright-scene ramp to 100% of rawSolvedEv from
++     * washing midtones while retaining a meaningful Night advantage in a dark closet. The existing
++     * P99 extended-linear headroom cap remains the highlight-safety authority.
+      */
+-    private static final float NIGHT_DARK_STRENGTH = 0.72f;
++    private static final float NIGHT_DARK_ADVANTAGE_EV = 0.40f;
++    private static final float NIGHT_BRIGHT_ADVANTAGE_EV = 0.30f;
+     private static final float NIGHT_FULL_MATCH_LUMA = 0.22f;
+     private static final float NIGHT_DARK_LUMA = 0.06f;
+     private static final float NIGHT_HEADROOM_GUIDE_LIMIT = 5.0f;
+@@ -124,24 +127,31 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             if (iris26550Night) {
+                 float targetLinearLuma = (float)Math.pow(2.0, targetLog);
+                 float daylightness = smoothstep(NIGHT_DARK_LUMA, NIGHT_FULL_MATCH_LUMA, targetLinearLuma);
+-                float nightStrength = mix(NIGHT_DARK_STRENGTH, 1.0f, daylightness);
+-                matchStrengthPercent = nightStrength * 100.0f;
+-                float desiredEv = clamp(rawSolvedEv * nightStrength, MIN_EV, MAX_EV);
++                matchStrengthPercent = readMatchStrengthPercent();
++                float motionStrength = matchStrengthPercent / 100.0f;
++                float motionEquivalentEv = clamp(rawSolvedEv * motionStrength, MIN_EV, MAX_EV);
++                float nightAdvantageEv = mix(
++                        NIGHT_DARK_ADVANTAGE_EV, NIGHT_BRIGHT_ADVANTAGE_EV, daylightness);
++                float desiredEv = clamp(motionEquivalentEv + nightAdvantageEv, MIN_EV, MAX_EV);
+                 float headroomCapEv = MAX_EV;
+                 if (Float.isFinite(iris26550CandidateP99Guide) && iris26550CandidateP99Guide > 0.0f) {
+                     headroomCapEv = clamp(log2(NIGHT_HEADROOM_GUIDE_LIMIT
+                             / Math.max(0.05f, iris26550CandidateP99Guide)), 0.0f, MAX_EV);
+                 }
+                 solvedEv = desiredEv > 0.0f ? Math.min(desiredEv, headroomCapEv) : desiredEv;
+-                Log.i(Name, "IRIS_26550_NIGHT_PRESENTATION_SOLVE"
++                Log.i(Name, "IRIS_26558_NIGHT_PRESENTATION_SOLVE"
+                         + " targetLinearLuma=" + targetLinearLuma
+                         + " rawSolvedEv=" + rawSolvedEv
+-                        + " nightStrength=" + nightStrength
++                        + " motionEquivalentEv=" + motionEquivalentEv
++                        + " nightAdvantageEv=" + nightAdvantageEv
++                        + " targetBrightnessRatio=" + Math.pow(2.0, nightAdvantageEv)
+                         + " candidateP99Guide=" + iris26550CandidateP99Guide
+                         + " headroomCapEv=" + headroomCapEv
+                         + " solvedEv=" + solvedEv
++                        + " realizedAdvantageEv=" + (solvedEv - motionEquivalentEv)
++                        + " realizedBrightnessRatio=" + Math.pow(2.0, solvedEv - motionEquivalentEv)
+                         + " captureExposureWrite=false shortReferenceUnchanged=true"
+-                        + " preserveNightFeel=true viewfinderTarget=true");
++                        + " motionPresentationUnchanged=true preserveNightFeel=true viewfinderTarget=true");
+             } else {
+                 /* Exact Motion behavior retained from 26549. */
+                 matchStrengthPercent = readMatchStrengthPercent();
+diff --git a/app/version.properties b/app/version.properties
+index 0217c13eca80cf056ada420a6ee7de47b8134c8a..08f95de1d4f2fa65763bde86239585404dfa6d3d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726556
+-VERSION_BUILD=26556
++VERSION_NAME=0.9726558
++VERSION_BUILD=26558
