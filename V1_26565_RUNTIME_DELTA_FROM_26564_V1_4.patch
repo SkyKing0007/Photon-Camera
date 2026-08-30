@@ -1,0 +1,394 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index f42d6b0596008410f93c5365c5ed034e2b37ee95..bb1cb4d22e5e7c9d7882a150eff8ea09691b4531 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -17,13 +17,67 @@
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#include <limits>
++#include <ultrahdr/icc.h>
++#include <ultrahdr_api.h>
+ #include "motionv2_jpeg_r_encoder.h"
+ #define TAG "MotionV2Jpeg444"
+ /* IRIS_26513_FAST_HUFFMAN: entropy-table optimization disabled; quantization, 4:4:4 sampling and pixels unchanged. */
+ namespace { struct U{JNIEnv*e;jstring s;const char*c;U(JNIEnv*e,jstring s):e(e),s(s),c(s?e->GetStringUTFChars(s,nullptr):nullptr){}~U(){if(c)e->ReleaseStringUTFChars(s,c);}};
+ bool write(const char*p,const unsigned char*d,size_t n){FILE*f=fopen(p,"wb");if(!f)return false;size_t w=fwrite(d,1,n,f);int a=fflush(f),b=fclose(f);return w==n&&a==0&&b==0;}
+ bool f3(JNIEnv*e,jfloatArray a,std::array<float,3>*o){if(!a||e->GetArrayLength(a)!=3)return false;e->GetFloatArrayRegion(a,0,3,o->data());return !e->ExceptionCheck();}}
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);if(!h){AndroidBitmap_unlockPixels(e,bitmap);return JNI_FALSE;}int q=std::clamp((int)quality,1,100);bool cfg=tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,TJSAMP_444)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,0)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,TJPF_RGBA,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
++
++namespace {
++/* IRIS_26565_JPEG_BOUNDARY_DISPLAY_P3
++ * Internal Photon/Iris image processing, Night Jin, UHDR ratio construction and all existing
++ * appearance math remain in their proven sRGB-referred domains. Only final publication converts
++ * encoded sRGB samples through linear light to Display-P3, then emits the standards-defined P3 ICC.
++ */
++struct DisplayP3Lut {
++    std::array<float,256> decode{};
++    std::array<float,16385> encode{};
++    DisplayP3Lut(){
++        for(size_t i=0;i<decode.size();i++){float x=(float)i/255.f;decode[i]=x<=0.04045f?x/12.92f:std::pow((x+0.055f)/1.055f,2.4f);}
++        for(size_t i=0;i<encode.size();i++){float x=(float)i/(float)(encode.size()-1);encode[i]=x<=0.0031308f?12.92f*x:1.055f*std::pow(x,1.f/2.4f)-0.055f;}
++    }
++    float enc(float x)const{
++        x=std::max(0.f,std::min(1.f,x));float q=x*(float)(encode.size()-1);int a=(int)q,b=std::min(a+1,(int)encode.size()-1);return encode[(size_t)a]+(encode[(size_t)b]-encode[(size_t)a])*(q-a);
++    }
++    void convert(uint8_t r8,uint8_t g8,uint8_t b8,uint8_t*out)const{
++        float r=decode[r8],g=decode[g8],b=decode[b8];
++        // IEC sRGB D65 -> Display-P3 D65, derived from the published primary chromaticities.
++        float pr=0.8224619687f*r+0.1775380313f*g;
++        float pg=0.0331941989f*r+0.9668058011f*g;
++        float pb=0.0170826307f*r+0.0723974407f*g+0.9105199286f*b;
++        out[0]=(uint8_t)std::lround(enc(pr)*255.f);out[1]=(uint8_t)std::lround(enc(pg)*255.f);out[2]=(uint8_t)std::lround(enc(pb)*255.f);
++    }
++    void convertInPlace(uint8_t*rgb)const{uint8_t o[3];convert(rgb[0],rgb[1],rgb[2],o);rgb[0]=o[0];rgb[1]=o[1];rgb[2]=o[2];}
++};
++const DisplayP3Lut& displayP3Lut(){static const DisplayP3Lut lut;return lut;}
++
++bool writeDisplayP3Icc(j_compress_ptr c){
++    auto icc=ultrahdr::IccHelper::writeIccProfile(UHDR_CT_SRGB,UHDR_CG_DISPLAY_P3);
++    if(!icc||icc->getLength()<=ultrahdr::kICCIdentifierSize)return false;
++    const size_t n=icc->getLength()-ultrahdr::kICCIdentifierSize;
++    if(n>(size_t)std::numeric_limits<unsigned int>::max())return false;
++    const auto*d=(const JOCTET*)icc->getData()+ultrahdr::kICCIdentifierSize;
++    jpeg_write_icc_profile(c,d,(unsigned int)n);return true;
++}
++
++bool encodeRgbaBitmapP3(const char*path,const AndroidBitmapInfo&i,const uint8_t*p,int quality){
++    if(!path||!p||i.width==0||i.height==0)return false;FILE*f=fopen(path,"wb");if(!f)return false;
++    jpeg_compress_struct c{};jpeg_error_mgr jerr{};c.err=jpeg_std_error(&jerr);jpeg_create_compress(&c);jpeg_stdio_dest(&c,f);
++    c.image_width=i.width;c.image_height=i.height;c.input_components=3;c.in_color_space=JCS_RGB;jpeg_set_defaults(&c);jpeg_set_quality(&c,std::clamp(quality,1,100),TRUE);
++    for(int k=0;k<c.num_components;k++){c.comp_info[k].h_samp_factor=1;c.comp_info[k].v_samp_factor=1;}
++    jpeg_start_compress(&c,TRUE);bool ok=writeDisplayP3Icc(&c);std::vector<uint8_t>row((size_t)i.width*3);const auto&lut=displayP3Lut();
++    while(ok&&c.next_scanline<c.image_height){const uint8_t*src=p+(size_t)c.next_scanline*i.stride;for(size_t x=0;x<i.width;x++)lut.convert(src[x*4],src[x*4+1],src[x*4+2],&row[x*3]);JSAMPROW rp=row.data();ok=jpeg_write_scanlines(&c,&rp,1)==1;}
++    if(ok)jpeg_finish_compress(&c);else jpeg_abort_compress(&c);jpeg_destroy_compress(&c);int a=fflush(f),b=fclose(f);return ok&&a==0&&b==0;
++}
++}
++
++extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;U u(e,path);bool ok=u.c&&encodeRgbaBitmapP3(u.c,i,(const uint8_t*)p,(int)quality);AndroidBitmap_unlockPixels(e,bitmap);return ok?JNI_TRUE:JNI_FALSE;}
++
++extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_convertSrgbToDisplayP3Native(JNIEnv*e,jclass,jobject bitmap){AndroidBitmapInfo i{};if(!bitmap||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;const auto&lut=displayP3Lut();auto*base=(uint8_t*)p;unsigned hc=std::thread::hardware_concurrency();int workers=std::max(1,std::min(4,(int)(hc?hc:2)));std::atomic<uint32_t>next{0};auto work=[&](){for(;;){uint32_t y=next.fetch_add(1);if(y>=i.height)break;uint8_t*row=base+(size_t)y*i.stride;for(uint32_t x=0;x<i.width;x++)lut.convertInPlace(row+x*4);}};std::vector<std::thread>threads;for(int n=0;n<workers;n++)threads.emplace_back(work);for(auto&t:threads)t.join();AndroidBitmap_unlockPixels(e,bitmap);return JNI_TRUE;}
+ 
+ namespace {
+ constexpr float kIris26532DetailLog2Range = 0.75f;
+@@ -522,12 +576,12 @@ inline void applyJinPixel(const Jin&j,const uint8_t*center,const uint8_t*right,c
+ }
+ inline bool pwriteExact(int fd,const void*src,size_t bytes,off_t off){const uint8_t*p=(const uint8_t*)src;size_t done=0;while(done<bytes){ssize_t n=pwrite(fd,p+done,bytes-done,off+(off_t)done);if(n<=0)return false;done+=(size_t)n;}return true;}
+ inline bool renderTile(int sourceFd,int outFd,int gainFd,float gainMax,const Params&p,const Watermark&w,const Jin&j,const SrgbLut&lut,int outW,int outH,int left,int top,int coreW,int coreH){
+-    int extW=coreW+(left+coreW<outW?1:0),extH=coreH+(top+coreH<outH?1:0);SourceRegion src;if(!readRegion(sourceFd,p,left,top,left+extW-1,top+extH-1,&src))return false;std::vector<uint8_t>base((size_t)extW*extH*3),row((size_t)coreW*3),gainBase,gainRow;if(gainFd>=0){gainBase.resize((size_t)extW*extH);gainRow.resize((size_t)coreW);}
++    int extW=coreW+(left+coreW<outW?1:0),extH=coreH+(top+coreH<outH?1:0);SourceRegion src;if(!readRegion(sourceFd,p,left,top,left+extW-1,top+extH-1,&src))return false;std::vector<uint8_t>base((size_t)extW*extH*3),row((size_t)coreW*3),gainBase,gainRow;const auto&p3=displayP3Lut();if(gainFd>=0){gainBase.resize((size_t)extW*extH);gainRow.resize((size_t)coreW);}
+     for(int y=0;y<extH;y++)for(int x=0;x<extW;x++){uint8_t*g=gainFd>=0?&gainBase[(size_t)y*extW+x]:nullptr;if(!renderBase(src,p,w,lut,left+x,top+y,gainMax,&base[((size_t)y*extW+x)*3],g))return false;}
+-    for(int y=0;y<coreH;y++){for(int x=0;x<coreW;x++){const uint8_t*c=&base[((size_t)y*extW+x)*3];const uint8_t*r=(left+x+1<outW)?&base[((size_t)y*extW+x+1)*3]:nullptr;const uint8_t*d=(top+y+1<outH)?&base[((size_t)(y+1)*extW+x)*3]:nullptr;applyJinPixel(j,c,r,d,left+x,top+y,outW,outH,&row[(size_t)x*3]);if(gainFd>=0)gainRow[(size_t)x]=gainBase[(size_t)y*extW+x];}off_t off=((off_t)(top+y)*(off_t)outW+(off_t)left)*3;if(!pwriteExact(outFd,row.data(),row.size(),off))return false;if(gainFd>=0){off_t goff=(off_t)(top+y)*(off_t)outW+(off_t)left;if(!pwriteExact(gainFd,gainRow.data(),gainRow.size(),goff))return false;}}
++    for(int y=0;y<coreH;y++){for(int x=0;x<coreW;x++){const uint8_t*c=&base[((size_t)y*extW+x)*3];const uint8_t*r=(left+x+1<outW)?&base[((size_t)y*extW+x+1)*3]:nullptr;const uint8_t*d=(top+y+1<outH)?&base[((size_t)(y+1)*extW+x)*3]:nullptr;applyJinPixel(j,c,r,d,left+x,top+y,outW,outH,&row[(size_t)x*3]);p3.convertInPlace(&row[(size_t)x*3]);if(gainFd>=0)gainRow[(size_t)x]=gainBase[(size_t)y*extW+x];}off_t off=((off_t)(top+y)*(off_t)outW+(off_t)left)*3;if(!pwriteExact(outFd,row.data(),row.size(),off))return false;if(gainFd>=0){off_t goff=(off_t)(top+y)*(off_t)outW+(off_t)left;if(!pwriteExact(gainFd,gainRow.data(),gainRow.size(),goff))return false;}}
+     return true;
+ }
+-inline bool encodeRgbFile(const char*rgbPath,const char*jpgPath,int w,int h,int quality){FILE*in=fopen(rgbPath,"rb");if(!in)return false;FILE*out=fopen(jpgPath,"wb");if(!out){fclose(in);return false;}jpeg_compress_struct c{};jpeg_error_mgr jerr{};c.err=jpeg_std_error(&jerr);jpeg_create_compress(&c);jpeg_stdio_dest(&c,out);c.image_width=w;c.image_height=h;c.input_components=3;c.in_color_space=JCS_RGB;jpeg_set_defaults(&c);jpeg_set_quality(&c,std::clamp(quality,1,100),TRUE);for(int k=0;k<c.num_components;k++){c.comp_info[k].h_samp_factor=1;c.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&c,TRUE);std::vector<uint8_t>row((size_t)w*3);bool ok=true;while(ok&&c.next_scanline<c.image_height){if(fread(row.data(),1,row.size(),in)!=row.size()){ok=false;break;}JSAMPROW rp=row.data();if(jpeg_write_scanlines(&c,&rp,1)!=1){ok=false;break;}}if(ok)jpeg_finish_compress(&c);jpeg_destroy_compress(&c);int a=fclose(in),b=fflush(out),d=fclose(out);return ok&&a==0&&b==0&&d==0;}
++inline bool encodeRgbFile(const char*rgbPath,const char*jpgPath,int w,int h,int quality){FILE*in=fopen(rgbPath,"rb");if(!in)return false;FILE*out=fopen(jpgPath,"wb");if(!out){fclose(in);return false;}jpeg_compress_struct c{};jpeg_error_mgr jerr{};c.err=jpeg_std_error(&jerr);jpeg_create_compress(&c);jpeg_stdio_dest(&c,out);c.image_width=w;c.image_height=h;c.input_components=3;c.in_color_space=JCS_RGB;jpeg_set_defaults(&c);jpeg_set_quality(&c,std::clamp(quality,1,100),TRUE);for(int k=0;k<c.num_components;k++){c.comp_info[k].h_samp_factor=1;c.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&c,TRUE);bool ok=writeDisplayP3Icc(&c);std::vector<uint8_t>row((size_t)w*3);while(ok&&c.next_scanline<c.image_height){if(fread(row.data(),1,row.size(),in)!=row.size()){ok=false;break;}JSAMPROW rp=row.data();if(jpeg_write_scanlines(&c,&rp,1)!=1){ok=false;break;}}if(ok)jpeg_finish_compress(&c);jpeg_destroy_compress(&c);int a=fclose(in),b=fflush(out),d=fclose(out);return ok&&a==0&&b==0&&d==0;}
+ inline bool encodeGrayFile(const char*grayPath,const char*jpgPath,int w,int h,int quality){FILE*in=fopen(grayPath,"rb");if(!in)return false;FILE*out=fopen(jpgPath,"wb");if(!out){fclose(in);return false;}jpeg_compress_struct c{};jpeg_error_mgr jerr{};c.err=jpeg_std_error(&jerr);jpeg_create_compress(&c);jpeg_stdio_dest(&c,out);c.image_width=w;c.image_height=h;c.input_components=1;c.in_color_space=JCS_GRAYSCALE;jpeg_set_defaults(&c);jpeg_set_quality(&c,std::clamp(quality,1,100),TRUE);jpeg_start_compress(&c,TRUE);std::vector<uint8_t>row((size_t)w);bool ok=true;while(ok&&c.next_scanline<c.image_height){if(fread(row.data(),1,row.size(),in)!=row.size()){ok=false;break;}JSAMPROW rp=row.data();if(jpeg_write_scanlines(&c,&rp,1)!=1){ok=false;break;}}if(ok)jpeg_finish_compress(&c);jpeg_destroy_compress(&c);int a=fclose(in),b=fflush(out),d=fclose(out);return ok&&a==0&&b==0&&d==0;}
+ }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+index 67d92cf94cdc2bac225d887911af40e722c423f6..c3952d7cfa304630f66fc8509b3881b71af1083b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -141,10 +141,12 @@ public class ImageSaver {
+                 outputStream.close();
+ 
+                 if (!savedAsUltraHdr) {
+-                    outputStream = Files.newOutputStream(fileToSave);
+-                    img.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
+-                    outputStream.flush();
+-                    outputStream.close();
++                    try { Files.deleteIfExists(fileToSave); } catch (Throwable ignored) {}
++                    boolean displayP3Saved = MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
++                    if (!displayP3Saved) {
++                        displayP3Saved = compressDisplayP3AndroidFallback(fileToSave, img, jpgQuality);
++                    }
++                    if (!displayP3Saved) return false;
+                 }
+ 
+                 img.recycle();
+@@ -156,6 +158,25 @@ public class ImageSaver {
+                 return false;
+             }
+         }
++        /** IRIS_26565_ANDROID_P3_ENCODER_FALLBACK
++         * Used only after the native P3 JPEG writer fails. The original sRGB bitmap is never
++         * retagged or mutated; a separately converted Display-P3 copy is compressed instead.
++         */
++        private static boolean compressDisplayP3AndroidFallback(Path fileToSave, Bitmap img, int jpgQuality) {
++            Bitmap p3 = MotionV2Jpeg444Encoder.toDisplayP3BitmapCopy(img);
++            if (p3 == null) return false;
++            try (OutputStream outputStream = Files.newOutputStream(fileToSave)) {
++                boolean saved = p3.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
++                outputStream.flush();
++                return saved && Files.isRegularFile(fileToSave) && Files.size(fileToSave) > 0L;
++            } catch (Throwable t) {
++                Log.e(TAG, "IRIS_26565_ANDROID_P3_ENCODER_FALLBACK_FAILED", t);
++                return false;
++            } finally {
++                if (!p3.isRecycled()) p3.recycle();
++            }
++        }
++
+         /** IRIS_26537_NIGHT_PLAIN_JPEG_PUBLICATION_FALLBACK
+          * Encoding-only fallback for an already-completed Iris Night bitmap. It deliberately does
+          * NOT call UltraHdrSaver and therefore cannot revive Photon's synthetic gain-map path.
+@@ -165,12 +186,10 @@ public class ImageSaver {
+                 Path fileToSave, Bitmap img, int jpgQuality, ParseExif.ExifData exifData) {
+             if (fileToSave == null || img == null || img.isRecycled()) return false;
+             exifData.COMPRESSION = String.valueOf(jpgQuality);
+-            try (OutputStream outputStream = Files.newOutputStream(fileToSave)) {
+-                boolean saved = img.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
+-                outputStream.flush();
+-                if (!saved) return false;
+-            } catch (Throwable t) {
+-                Log.e(TAG, "IRIS_26537_NIGHT_PLAIN_JPEG_FAILED", t);
++            boolean saved = MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
++            if (!saved) saved = compressDisplayP3AndroidFallback(fileToSave, img, jpgQuality);
++            if (!saved) {
++                Log.e(TAG, "IRIS_26565_NIGHT_PLAIN_DISPLAY_P3_JPEG_FAILED");
+                 return false;
+             }
+             try {
+@@ -226,25 +245,14 @@ public class ImageSaver {
+                     + " jpegRExpected=" + iris26550HasGainmap);
+             if (turboSaved && turboBytes > 0L) return true;
+ 
+-            Log.w(TAG, "IRIS_26539_NIGHT_JPEG444_CODEC_FALLBACK androidBitmapCompress=true");
++            Log.w(TAG, "IRIS_26565_NIGHT_JPEG444_CODEC_FALLBACK androidDisplayP3Copy=true");
+             try { Files.deleteIfExists(absolute); } catch (Throwable ignored) {}
+-            try (OutputStream outputStream = Files.newOutputStream(absolute)) {
+-                boolean compressReturned = img.compress(Bitmap.CompressFormat.JPEG, jpgQuality, outputStream);
+-                outputStream.flush();
+-                final boolean exists = Files.isRegularFile(absolute);
+-                final long bytes = exists ? Files.size(absolute) : 0L;
+-                final boolean saved = compressReturned && exists && bytes > 0L;
+-                Log.critical(TAG, "IRIS_26549_NIGHT_ANDROID_JPEG_RESULT saved=" + saved
+-                        + " compressReturned=" + compressReturned
+-                        + " exists=" + exists + " bytes=" + bytes);
+-                return saved;
+-            } catch (Throwable codecFailure) {
+-                Log.e(TAG, "IRIS_26539_NIGHT_PORTABLE_JPEG_CODEC_FAILED", codecFailure);
+-                Log.critical(TAG, "IRIS_26549_NIGHT_ANDROID_JPEG_FAILED path=" + absolute
+-                        + " type=" + codecFailure.getClass().getName()
+-                        + " message=" + String.valueOf(codecFailure.getMessage()));
+-                return false;
+-            }
++            final boolean saved = compressDisplayP3AndroidFallback(absolute, img, jpgQuality);
++            long fallbackBytes = 0L;
++            try { if (Files.isRegularFile(absolute)) fallbackBytes = Files.size(absolute); } catch (Throwable ignored) {}
++            Log.critical(TAG, "IRIS_26565_NIGHT_ANDROID_P3_JPEG_RESULT saved=" + saved
++                    + " exists=" + Files.isRegularFile(absolute) + " bytes=" + fallbackBytes);
++            return saved;
+         }
+ 
+         public static boolean saveBitmapAsJPGIrisNightCheckpoint(
+@@ -294,8 +302,8 @@ public class ImageSaver {
+                             true2xWidth, true2xHeight, parameters, cropSize, toneSettings,
+                             watermarkEnabled, jinResidual);
+                     if (!encoded) {
+-                        Log.w(TAG, "IRIS_26564_NIGHT_TRUE2X_CODEC_FALLBACK baseResolution=true");
+-                        encoded = encodeIrisNightJpegPortable(tmp, img, jpgQuality);
++                        Log.e(TAG, "IRIS_26565_NIGHT_TRUE2X_FINAL_FAILED checkpointPreserved=true nativeReplacement=false");
++                        return false;
+                     }
+                 } else {
+                     encoded = encodeIrisNightJpegPortable(tmp, img, jpgQuality);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 1d3e3c6c5788729a7439ed77ed1977ba0becea36..3cc6909735f9f898a4e20c3de46272c6390dd7fa 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -499,6 +499,7 @@ object PhotonMotionMgc1271Bridge {
+                     stacked.true2xWidth == size.x * 2 && stacked.true2xHeight == size.y * 2,
+                     "26564 true2x render inputs missing/malformed")
+                 val prepStartNs = System.nanoTime()
++                val runTrue2xFullResolutionMgc = runFullResolutionDenoise && lumaScale > 0f
+                 resultTrue2xRenderRgbPath = buildTrue2xRenderCarrier(
+                     rawPath = checkNotNull(rawPath),
+                     guidePath = checkNotNull(guidePath),
+@@ -507,7 +508,7 @@ object PhotonMotionMgc1271Bridge {
+                     metadata = denoiseMetadata,
+                     tuningSnr = checkNotNull(tuningSnr),
+                     pass = denoisePass,
+-                    runDenoise = runFullResolutionDenoise,
++                    runDenoise = runTrue2xFullResolutionMgc,
+                     lumaScale = lumaScale,
+                     chromaScale = chromaScale,
+                 )
+@@ -526,8 +527,10 @@ object PhotonMotionMgc1271Bridge {
+                 PLog.i(TAG, "IRIS_26564_TRUE2X_RENDER_DERIVATIVE " +
+                     "size=${stacked.true2xWidth}x${stacked.true2xHeight} " +
+                     "dngRawPreserved=${resultTrue2xLinearRawPath != null} " +
+-                    "vgnGuideConsumed=true residualDenoise=$runFullResolutionDenoise " +
+-                    "luma=$lumaScale chroma=$chromaScale lumaZeroNoPecan=${lumaScale <= 0f} " +
++                    "vgnGuideConsumed=true residualDenoise=$runTrue2xFullResolutionMgc " +
++                    "nativeResidualDenoise=$runFullResolutionDenoise " +
++                    "luma=$lumaScale chroma=$chromaScale " +
++                    "lumaZeroFastPublication=${lumaScale <= 0f && !runTrue2xFullResolutionMgc} " +
+                     "prepMs=$iris26564True2xRenderPrepMs")
+             }
+             forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index da3aac8899689442f0af4c1da27a28f7dc46350f..def7e80dee7d7a96640ac9b097b68dfa8286893b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -1,6 +1,8 @@
+ package com.particlesdevs.photoncamera.processing.ultrahdr;
+ 
+ import android.graphics.Bitmap;
++import android.graphics.Canvas;
++import android.graphics.ColorSpace;
+ import android.graphics.Gainmap;
+ import android.graphics.BitmapFactory;
+ import android.graphics.Point;
+@@ -22,6 +24,33 @@ public final class MotionV2Jpeg444Encoder {
+     private static final int GAINMAP_QUALITY=95;
+     static { System.loadLibrary("motionv2jpeg"); }
+     private MotionV2Jpeg444Encoder(){}
++
++    /** IRIS_26565_ANDROID_DISPLAY_P3_COPY_FALLBACK
++     * Source pixels are never mutated: Night Jin and every upstream consumer keep the proven sRGB
++     * bitmap. Native math is preferred; Android color-managed Canvas is a guarded API26+ fallback.
++     */
++    public static Bitmap toDisplayP3BitmapCopy(Bitmap source) {
++        if (source == null || source.isRecycled() || Build.VERSION.SDK_INT < 26) return null;
++        Bitmap out = null;
++        try {
++            out = source.copy(Bitmap.Config.ARGB_8888, true);
++            if (out != null && convertSrgbToDisplayP3Native(out)) {
++                out.setColorSpace(ColorSpace.get(ColorSpace.Named.DISPLAY_P3));
++                return out;
++            }
++            if (out != null && !out.isRecycled()) out.recycle();
++            out = Bitmap.createBitmap(source.getWidth(), source.getHeight(),
++                    Bitmap.Config.ARGB_8888, true, ColorSpace.get(ColorSpace.Named.DISPLAY_P3));
++            new Canvas(out).drawBitmap(source, 0.0f, 0.0f, null);
++            Log.w(TAG, "IRIS_26565_DISPLAY_P3_ANDROID_CANVAS_FALLBACK nativeConvert=false");
++            return out;
++        } catch (Throwable t) {
++            if (out != null && !out.isRecycled()) out.recycle();
++            Log.e(TAG, "IRIS_26565_DISPLAY_P3_COPY_FAILED", t);
++            return null;
++        }
++    }
++
+     public static boolean write(Path output, Bitmap bitmap, int quality){
+         if(output==null||bitmap==null||bitmap.isRecycled())return false;
+         Path base=null,gain=null;
+@@ -29,7 +58,7 @@ public final class MotionV2Jpeg444Encoder {
+             boolean hasGain=Build.VERSION.SDK_INT>=34&&bitmap.hasGainmap();
+             if(!hasGain){
+                 boolean ok=writeNative(bitmap,output.toString(),Math.max(1,Math.min(100,quality)));
+-                Log.i(TAG,"IRIS_26507_JPEG444 encoded="+ok+" gainmap=false subsampling=444");return ok;
++                Log.i(TAG,"IRIS_26565_DISPLAY_P3_JPEG444 encoded="+ok+" gainmap=false subsampling=444 icc=true");return ok;
+             }
+             Gainmap gm=bitmap.getGainmap(); if(gm==null)return false;
+             base=output.resolveSibling("."+output.getFileName()+".26507.base.jpg");
+@@ -38,11 +67,11 @@ public final class MotionV2Jpeg444Encoder {
+             if(!writeNative(bitmap,base.toString(),Math.max(1,Math.min(100,quality))))return false;
+             Bitmap contents=gm.getGainmapContents();
+             if(contents==null||contents.isRecycled()||!encodeGainmapNative(contents,gain.toString(),GAINMAP_QUALITY))return false;
+-            boolean ok=packageJpegRNative(base.toString(),gain.toString(),output.toString(),0,
++            boolean ok=packageJpegRNative(base.toString(),gain.toString(),output.toString(),1,
+                     gm.getRatioMin(),gm.getRatioMax(),gm.getGamma(),gm.getEpsilonSdr(),gm.getEpsilonHdr(),
+                     gm.getMinDisplayRatioForHdrTransition(),gm.getDisplayRatioForFullHdr(),true)
+                     && isJpegRNative(output.toString());
+-            Log.i(TAG,"IRIS_26507_JPEG444 encoded="+ok+" gainmap=true subsampling=444 jpegR="+ok);
++            Log.i(TAG,"IRIS_26565_DISPLAY_P3_JPEG444 encoded="+ok+" gainmap=true subsampling=444 jpegR="+ok+" gamut=DISPLAY_P3");
+             return ok;
+         }catch(Throwable t){Log.e(TAG,"IRIS_26507_JPEG444_FAILED",t);return false;}
+         finally{try{if(base!=null)Files.deleteIfExists(base);}catch(Throwable ignored){}try{if(gain!=null)Files.deleteIfExists(gain);}catch(Throwable ignored){}}
+@@ -124,23 +153,39 @@ public final class MotionV2Jpeg444Encoder {
+                 return true;
+             }
+             Gainmap gm = attachedGainmap; if (gm == null) return false;
++            boolean gainReady;
+             if (!generateMotionTrue2xGain) {
+                 Bitmap contents = gm.getGainmapContents();
+-                if (contents == null || contents.isRecycled()
+-                        || !encodeGainmapNative(contents, gain.toString(), GAINMAP_QUALITY)) return false;
+-            } else if (!Files.isRegularFile(gain) || Files.size(gain) <= 0L) {
+-                Log.e(TAG, "IRIS_26564_TRUE2X_MOTION_GAINMAP_MISSING");
+-                return false;
++                gainReady = contents != null && !contents.isRecycled()
++                        && encodeGainmapNative(contents, gain.toString(), GAINMAP_QUALITY);
++            } else {
++                gainReady = Files.isRegularFile(gain) && Files.size(gain) > 0L;
+             }
+-            boolean ok = packageJpegRNative(base.toString(), gain.toString(), output.toString(), 0,
+-                    gm.getRatioMin(), gm.getRatioMax(), gm.getGamma(), gm.getEpsilonSdr(), gm.getEpsilonHdr(),
+-                    gm.getMinDisplayRatioForHdrTransition(), gm.getDisplayRatioForFullHdr(), true)
++            boolean jpegR = gainReady
++                    && packageJpegRNative(base.toString(), gain.toString(), output.toString(), 1,
++                            gm.getRatioMin(), gm.getRatioMax(), gm.getGamma(), gm.getEpsilonSdr(), gm.getEpsilonHdr(),
++                            gm.getMinDisplayRatioForHdrTransition(), gm.getDisplayRatioForFullHdr(), true)
+                     && isJpegRNative(output.toString());
+-            Log.i(TAG, "IRIS_26564_TRUE2X_STREAMING_JPEG encoded=" + ok
+-                    + " gainmap=true jpegR=" + ok
+-                    + " gainmapOwner=" + (generateMotionTrue2xGain ? "TRUE2X_1TO1" : "NIGHT_POST_JIN_REBASE")
+-                    + " totalMs=" + ((System.nanoTime() - startNs) / 1_000_000L));
+-            return ok;
++            if (jpegR) {
++                Log.i(TAG, "IRIS_26565_TRUE2X_DISPLAY_P3_JPEG encoded=true gainmap=true jpegR=true"
++                        + " gamut=DISPLAY_P3 gainmapOwner="
++                        + (generateMotionTrue2xGain ? "TRUE2X_1TO1" : "NIGHT_POST_JIN_REBASE")
++                        + " totalMs=" + ((System.nanoTime() - startNs) / 1_000_000L));
++                return true;
++            }
++            // UHDR packaging/auxiliary failure must not throw away a successfully rendered 50MP P3 base.
++            try {
++                Files.deleteIfExists(output);
++                Files.move(base, output, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
++                base = null;
++                boolean sdr50 = Files.isRegularFile(output) && Files.size(output) > 0L;
++                Log.w(TAG, "IRIS_26565_TRUE2X_UHDR_FALLBACK_50MP_SDR saved=" + sdr50
++                        + " gainReady=" + gainReady + " jpegR=false native12mpFallback=false");
++                return sdr50;
++            } catch (Throwable promoteFailure) {
++                Log.e(TAG, "IRIS_26565_TRUE2X_SDR_PROMOTE_FAILED", promoteFailure);
++                return false;
++            }
+         } catch (Throwable t) {
+             Log.e(TAG, "IRIS_26564_TRUE2X_STREAMING_JPEG_FAILED", t);
+             return false;
+@@ -171,6 +216,7 @@ public final class MotionV2Jpeg444Encoder {
+     }
+ 
+     private static native boolean writeNative(Bitmap bitmap,String path,int quality);
++    private static native boolean convertSrgbToDisplayP3Native(Bitmap bitmap);
+     private static native boolean writeTrue2xNative(
+             Bitmap bitmap, String renderRgb16fPath, int trueWidth, int trueHeight,
+             int rawWidth, int rawHeight, int cropWidth, int cropHeight,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/UltraHdrSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/UltraHdrSaver.java
+index bc64ed1003e6ad684c6f32cd75ce7e3a9fa5e747..6218be2768ad1486f2a9411ed3c4bed7f0920db3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/UltraHdrSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/UltraHdrSaver.java
+@@ -50,14 +50,14 @@ public final class UltraHdrSaver {
+             gainmap.setMinDisplayRatioForHdrTransition(MIN_FULL_HDR_RATIO);
+             gainmap.setDisplayRatioForFullHdr(DEFAULT_FULL_HDR_RATIO);
+ 
+-            outputBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false);
++            outputBitmap = MotionV2Jpeg444Encoder.toDisplayP3BitmapCopy(bitmap);
+             if (outputBitmap == null) return false;
+             outputBitmap.setGainmap(gainmap);
+ 
+             boolean saved = outputBitmap.compress(
+                     Bitmap.CompressFormat.JPEG, quality, outputStream);
+             outputStream.flush();
+-            if (saved) Log.d(TAG, "UltraHDR JPEG saved successfully");
++            if (saved) Log.d(TAG, "IRIS_26565_ULTRAHDR_DISPLAY_P3 saved=true baseColor=DISPLAY_P3 gainmapMath=sRGB_preserved");
+             return saved;
+         } catch (Exception e) {
+             Log.e(TAG, "save failed", e);
+diff --git a/app/version.properties b/app/version.properties
+index 789db43e1ee4c2b3e5a05cc67bd00d95f8f958cc..308fb3db2bc7dcb7037003a967d38de4a78ce6a6 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726564
+-VERSION_BUILD=26564
++VERSION_NAME=0.9726565
++VERSION_BUILD=26565
