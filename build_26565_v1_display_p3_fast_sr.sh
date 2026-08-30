@@ -10,6 +10,9 @@ BASE_SUCCESS_COMMIT="d0e9f1660140eaa8cb695f3e76805ba6f80cf79f"
 FAILED_V1_HANDOFF_COMMIT="c775e067b5e73e3297dcd00f5cd0423da8cfa93f"
 FAILED_V1_RUN_ID="33322029512"
 FAILED_V1_JOB_ID="99285563475"
+FAILED_V1_1_HANDOFF_COMMIT="0d4c3f6e644af77f5b52d88c96e29f01fe30700a"
+FAILED_V1_1_RUN_ID="33322926514"
+FAILED_V1_1_JOB_ID="99288343214"
 BASE_RUN_ID="33286029778"
 BASE_ARTIFACT_ID="9724492359"
 BASE_ARTIFACT_NAME="photon-26564-v1-4-true-2x-sr"
@@ -34,10 +37,9 @@ TRANSFORM="$ROOT/transform_26565_v1_display_p3_fast_sr.py"
 VALIDATE="$ROOT/validate_26565_v1_display_p3_fast_sr.py"
 AUTHORITY="$ROOT/verify_26565_authority.py"
 PATCHVERIFY="$ROOT/verify_26565_patches.py"
-CPPCONTRACT="$ROOT/compile_26565_cpp_contract.py"
 WORKFLOW="$ROOT/.github/workflows/build-26565-v1-display-p3-fast-sr.yml"
 BUILD_SCRIPT="$ROOT/build_26565_v1_display_p3_fast_sr.sh"
-SEALED_PY=("$TRANSFORM" "$VALIDATE" "$AUTHORITY" "$PATCHVERIFY" "$CPPCONTRACT")
+SEALED_PY=("$TRANSFORM" "$VALIDATE" "$AUTHORITY" "$PATCHVERIFY")
 SEALED_DEP_FILES=("${SEALED_PY[@]}" "$BUILD_SCRIPT" "$WORKFLOW")
 OUT="$ROOT/build_26565_v1_display_p3_fast_sr_outputs"
 WORK="$ROOT/.build_26565_v1_display_p3_fast_sr_work"
@@ -47,14 +49,13 @@ BASE="$WORK/exact_26564_v1_4_compiled_candidate"
 AFTER="$WORK/candidate_26565"
 AFTER2="$WORK/candidate_26565_replay"
 POST="$WORK/postbuild_source_snapshot"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-1-display-p3-fast-sr-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-2-display-p3-fast-sr-debug.apk"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 LOCAL_ART=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then [[ -n "${2:-}" ]] || fail "--local-prebuild requires exact 26564 V1.4 artifact ZIP"; LOCAL_ART="$2"; fi
 rm -rf "$OUT" "$WORK"; rm -f "$FINAL"; mkdir -p "$OUT" "$WORK" "$ARTDIR" "$BASE" "$AFTER" "$AFTER2"
 cat > "$OUT/26565_V1_COMPILER_STATUS.txt" <<'EOF'
 REAL GLSL COMPILE: PASS (inherited exact successful 26564 shader bytes; no GLSL modified)
-SUPPLEMENTAL C++17 HOST CONTRACT: NOT RUN YET
 REAL KOTLIN COMPILE: NOT RUN YET
 REAL JAVA COMPILE: NOT RUN YET
 NATIVE/NDK COMPILE: NOT RUN YET (covered by full assemble)
@@ -75,7 +76,6 @@ DNG INVARIANCE: NOT RUN
 TRUE2X LUMA-ZERO FAST PUBLICATION: NOT RUN
 TRUE2X 50MP FALLBACK RETENTION: NOT RUN
 PROTECTED COLOR/NIGHT/GLSL CORE: NOT RUN
-SUPPLEMENTAL C++17 HOST CONTRACT: NOT RUN
 FORWARD PATCH FUZZ=0: NOT RUN
 ROLLBACK PATCH FUZZ=0: NOT RUN
 REAL GLSL COMPILE: PASS (inherited exact successful 26564 shader bytes; no GLSL modified)
@@ -140,6 +140,17 @@ PY
  grep -F 'run 33284552163, job 99185364515' "$ROOT/REGRESSION_26565_CARRIED_FAILURES.txt" >/dev/null || fail "NumPy regression record"
  grep -F 'run 33285297620, job 99187338833' "$ROOT/REGRESSION_26565_CARRIED_FAILURES.txt" >/dev/null || fail "Kotlin Throwable regression record"
  grep -F 'run 33322029512, job 99285563475' "$ROOT/REGRESSION_26565_V1_REPO_WIDE_DEPENDENCY_SCOPE.txt" >/dev/null || fail "26565 V1 repository-wide dependency regression record"
+ grep -F 'run 33322926514, rerun job 99288343214' "$ROOT/REGRESSION_26565_V1_1_HOST_CPP_JCONFIG_SCOPE.txt" >/dev/null || fail "26565 V1.1 host C++ jconfig regression record"
+ local host_contract_name="compile_26565_cpp_"'contract.py'
+ local host_syntax_flag="-fsyntax"'-only'
+ local host_tombstone="$ROOT/$host_contract_name"
+ [[ -f "$host_tombstone" ]] || fail "host C++ tombstone missing"
+ grep -F 'OBSOLETE V1.1 host C++ surrogate disabled' "$host_tombstone" >/dev/null || fail "host C++ tombstone marker missing"
+ ! grep -F -- "$host_syntax_flag" "$host_tombstone" >/dev/null || fail "host C++ tombstone still contains host syntax gate"
+ ! grep -F 'clang++' "$host_tombstone" >/dev/null || fail "host C++ tombstone still contains clang invocation"
+ grep -F './gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace' "$BUILD_SCRIPT" >/dev/null || fail "real Kotlin/Java compiler sequence missing"
+ grep -F './gradlew :app:assembleDebug --stacktrace' "$BUILD_SCRIPT" >/dev/null || fail "real Android NDK/full assemble sequence missing"
+ pass "REGRESSION_26565_V1_1_HOST_CPP_JCONFIG_SCOPE: PASS"
  # Exact historical newline fixture.
  python3 - "$HANDOFF" <<'PY'
 from pathlib import Path
@@ -151,7 +162,7 @@ fixture='a'*64+'  alpha.txt\n'+'b'*64+'  dir/beta.txt\n'
 assert [x.split('  ',1)[1] for x in fixture.splitlines()] == ['alpha.txt','dir/beta.txt']
 print('PASS REGRESSION_26564_V1_HANDOFF_SCOPE_NEWLINE')
 PY
- set_report "26564 FAILURE REGRESSIONS" "PASS (26564 four failures + 26565 V1 repository-context dependency-scope regression)"
+ set_report "26564 FAILURE REGRESSIONS" "PASS (26564 four failures + 26565 V1 dependency-scope + V1.1 host-C++-jconfig regressions)"
 }
 
 verify_scope(){
@@ -216,9 +227,8 @@ build_candidate(){
  python3 -S "$VALIDATE" "$AFTER" --base "$BASE" --package "$ROOT" | tee "$OUT/26565_semantic_validation.txt"
  python3 -S "$VALIDATE" "$AFTER2" --base "$BASE" --package "$ROOT" > "$OUT/26565_semantic_validation_replay.txt"
  python3 -S "$PATCHVERIFY" "$BASE" "$AFTER" "$ROOT" | tee "$OUT/26565_patch_validation.txt"
- python3 -S "$CPPCONTRACT" "$AFTER" | tee "$OUT/26565_cpp_contract.txt"
- set_compiler "SUPPLEMENTAL C++17 HOST CONTRACT" "PASS"
- set_report "SUPPLEMENTAL C++17 HOST CONTRACT" "PASS (actual pinned libjpeg/UltraHDR headers)"
+ # V1.2 permanent regression: do not block on an ad-hoc host clang++ surrogate.
+ # The modified native runtime file is compiled authoritatively by the real Android NDK in :app:assembleDebug below.
  set_report "CANDIDATE-FIRST TRANSFORM" "PASS (two deterministic replays under nested checkout context)"
  set_report "RUNTIME OWNERSHIP" "PASS (existing sRGB processing/Jin -> final JPEG boundary P3 publication)"
  set_report "DORMANT-OWNER REJECTION" "PASS (protected internal color/Jin owners unchanged; encoder publication paths validated)"
