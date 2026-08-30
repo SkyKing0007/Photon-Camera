@@ -84,6 +84,7 @@ EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="d048338a8e303c11b2208d4c1b78c8c129ebc57b"
 FAILED_V1_HANDOFF_COMMIT="82eafc66df2bd17885f3d8b44e22047abfda440e"
 FAILED_V1_1_HANDOFF_COMMIT="115aa825ec5759a6ef714a7d8ab057669fe238dc"
+FAILED_V1_2_HANDOFF_COMMIT="40ee502839caf866c1de9a4fd94025bf3cb5fbc0"
 BASE_RUN_ID="33277777042"
 BASE_ARTIFACT_ID="9722074240"
 BASE_ARTIFACT_NAME="photon-26563-v1-universal-adaptive-color-appearance"
@@ -130,7 +131,7 @@ ARTDIR="$WORK/artifact"
 BASE="$WORK/exact_26563_v1_compiled_candidate"
 AFTER="$WORK/candidate_26564"
 GLSLOUT="$WORK/runtime_glsl"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-2-true-2x-sr-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-3-true-2x-sr-debug.apk"
 LOCAL_REPLAY_ARTIFACT=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then [[ -n "${2:-}" ]] || fail "--local-prebuild requires exact 26563 V1 artifact ZIP"; LOCAL_REPLAY_ARTIFACT="$2"; fi
 mapfile -t RUNTIME_FILES < "$RUNTIME_LIST"
@@ -171,17 +172,38 @@ FORWARD PATCH FUZZ=0: NOT RUN
 ROLLBACK PATCH FUZZ=0: NOT RUN
 POST-BUILD INVARIANCE: NOT RUN
 CLEAN ARTIFACT SOURCE EXPORT: NOT RUN
-TARGET VERSION/BUILD: 0.9726564 / 26564 V1.2
+TARGET VERSION/BUILD: 0.9726564 / 26564 V1.3
 EOF
 set_report(){ local key="$1" val="$2" tmp="$OUT/.report.tmp"; awk -v key="$key:" -v val="$val" 'BEGIN{f=0} index($0,key)==1{print key" "val;f=1;next}{print} END{if(!f)exit 42}' "$OUT/26564_V1_STRICT_HANDOFF_REPORT.txt" > "$tmp" || { rm -f "$tmp"; fail "report key missing $key"; }; mv "$tmp" "$OUT/26564_V1_STRICT_HANDOFF_REPORT.txt"; }
 
 verify_package_and_pins(){
  sha256sum -c "$HANDOFF_HASHES"
  python3 -m py_compile "$TRANSFORM" "$VALIDATE" "$MEMORY" "$PARITY" "$EXTRACT" "$RESERVED"
+ # REGRESSION_26564_V1_2_NUMPY_DEPENDENCY: prove the package does not rely on site-packages.
+ python3 -S -m py_compile "$TRANSFORM" "$VALIDATE" "$MEMORY" "$PARITY" "$EXTRACT" "$RESERVED"
+ python3 -S - "$TRANSFORM" "$VALIDATE" "$MEMORY" "$PARITY" "$EXTRACT" "$RESERVED" <<'PY_STDLIB_IMPORTS'
+import ast,sys
+from pathlib import Path
+allowed=set(sys.stdlib_module_names)
+for raw in sys.argv[1:]:
+    p=Path(raw)
+    tree=ast.parse(p.read_text(),filename=str(p))
+    bad=[]
+    for node in ast.walk(tree):
+        if isinstance(node,ast.Import): names=[a.name.split('.',1)[0] for a in node.names]
+        elif isinstance(node,ast.ImportFrom) and node.module: names=[node.module.split('.',1)[0]]
+        else: continue
+        bad.extend(n for n in names if n not in allowed)
+    if bad: raise SystemExit(f'non-stdlib Python dependency in {p.name}: {sorted(set(bad))}')
+print('PASS packaged Python imports are Python 3.12 standard-library only')
+PY_STDLIB_IMPORTS
+ python3 -S "$PARITY" | tee "$OUT/26564_true2x_stdlib_only_parity_regression.txt"
+ grep -F 'PASS stdlib-only parity fixture' "$OUT/26564_true2x_stdlib_only_parity_regression.txt" >/dev/null || fail "stdlib-only parity regression missing"
  python3 "$EXTRACT" --self-test
  python3 "$RESERVED" --self-test
  grep -F "env['GIT_DIR']=os.devnull" "$TRANSFORM" >/dev/null || fail "nested-Git isolation marker missing"
  grep -F 'GitHub Actions failure: run 33284071958, job 99184083108.' "$ROOT/REGRESSION_26564_V1_1_NESTED_GIT_APPLY_SKIPPED.txt" >/dev/null || fail "nested-Git regression record missing"
+ grep -F 'GitHub Actions failure: run 33284552163, job 99185364515.' "$ROOT/REGRESSION_26564_V1_2_NUMPY_DEPENDENCY.txt" >/dev/null || fail "NumPy dependency regression record missing"
  bash -n "$0"
  python3 - "$HANDOFF_HASHES" <<'PY_SCOPE_SELFTEST'
 from pathlib import Path
@@ -189,8 +211,8 @@ import sys
 hf=Path(sys.argv[1])
 raw=hf.read_text().splitlines()
 allowed={line.split('  ',1)[1] for line in raw if line.strip()}
-if len(allowed) != 29:
-    raise SystemExit(f'handoff manifest payload count mismatch: {len(allowed)} != 29')
+if len(allowed) != 30:
+    raise SystemExit(f'handoff manifest payload count mismatch: {len(allowed)} != 30')
 if any(('\n' in x or '\r' in x) for x in allowed):
     raise SystemExit('REGRESSION_26564_V1_HANDOFF_SCOPE_NEWLINE: parsed filename retained line ending')
 # Exact historical failure fixture: old open(file) parsing retained '\n'; splitlines parsing must not.
@@ -259,7 +281,7 @@ build_candidate_and_precompile_proof(){
  grep -Fx 'VERSION_NAME=0.9726564' "$AFTER/app/version.properties" >/dev/null; grep -Fx 'VERSION_BUILD=26564' "$AFTER/app/version.properties" >/dev/null
  python3 "$VALIDATE" "$AFTER" "$BASE" | tee "$OUT/26564_true2x_semantic_validation.txt"; grep -F 'PASS TOTAL 45 / 45' "$OUT/26564_true2x_semantic_validation.txt" >/dev/null
  python3 "$MEMORY" "$AFTER" "$BASE" | tee "$OUT/26564_true2x_memory_validation.txt"; grep -F 'PASS TOTAL 12 / 12' "$OUT/26564_true2x_memory_validation.txt" >/dev/null
- python3 "$PARITY" | tee "$OUT/26564_true2x_cpu_gpu_numeric_parity.txt"; grep -F 'PASS synthetic CPU/GPU true2x parity' "$OUT/26564_true2x_cpu_gpu_numeric_parity.txt" >/dev/null
+ python3 -S "$PARITY" | tee "$OUT/26564_true2x_cpu_gpu_numeric_parity.txt"; grep -F 'PASS synthetic CPU/GPU true2x parity' "$OUT/26564_true2x_cpu_gpu_numeric_parity.txt" >/dev/null
  set_report "CHANGED RUNTIME SCOPE" "PASS (exact 15 paths including one new JNI Java bridge + version)"
  set_report "TRUE 2X DIRECT CFA OWNERSHIP" "PASS (registered multiframe RAW/CFA -> direct 2x RGB; no native-RGB upscale/detail owner)"
  set_report "CPU/GPU EQUIVALENT SEMANTICS" "PASS (paired RBF equations + deterministic numeric parity fixture)"
@@ -336,10 +358,11 @@ fi
 
 echo "=== 26564 GATE 0: sealed handoff / direct lineage / architectural backup ==="
 [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-[[ "$(git rev-parse HEAD^)" == "$FAILED_V1_1_HANDOFF_COMMIT" ]] || fail "26564 V1.2 must be direct child of exact failed V1.1 handoff"
-[[ "$(git rev-parse HEAD^^)" == "$FAILED_V1_HANDOFF_COMMIT" ]] || fail "failed V1.1 handoff must be direct child of failed V1 handoff"
-[[ "$(git rev-parse HEAD^^^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "failed V1 handoff must itself be direct child of successful 26563 V1"
-git diff --quiet "$BASE_SUCCESS_COMMIT..HEAD" -- app || fail "V1/V1.1/V1.2 handoffs directly changed repository app source"
+[[ "$(git rev-parse HEAD^)" == "$FAILED_V1_2_HANDOFF_COMMIT" ]] || fail "26564 V1.3 must be direct child of exact failed V1.2 handoff"
+[[ "$(git rev-parse HEAD^^)" == "$FAILED_V1_1_HANDOFF_COMMIT" ]] || fail "failed V1.2 handoff must be direct child of failed V1.1 handoff"
+[[ "$(git rev-parse HEAD^^^)" == "$FAILED_V1_HANDOFF_COMMIT" ]] || fail "failed V1.1 handoff must be direct child of failed V1 handoff"
+[[ "$(git rev-parse HEAD^^^^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "failed V1 handoff must itself be direct child of successful 26563 V1"
+git diff --quiet "$BASE_SUCCESS_COMMIT..HEAD" -- app || fail "V1/V1.1/V1.2/V1.3 handoffs directly changed repository app source"
 [[ -n "$TOKEN" ]] || fail "GITHUB_TOKEN missing"; verify_package_and_pins
 BACKUP_SHA="$(git ls-remote origin "refs/heads/${BACKUP_BRANCH}" | awk '{print $1}')"; [[ "$BACKUP_SHA" == "$BACKUP_SHA_EXPECTED" ]] || fail "backup missing/wrong"; set_report "BACKUP STATUS" "PASS (${BACKUP_BRANCH} @ ${BACKUP_SHA_EXPECTED})"
 python3 - "$BASE_SUCCESS_COMMIT" "$HANDOFF_HASHES" <<'PY'
@@ -352,10 +375,10 @@ actual=set(subprocess.check_output(['git','diff','--name-only',base+'..HEAD'],te
 if actual!=allowed: raise SystemExit('handoff scope mismatch extra=%r missing=%r'%(sorted(actual-allowed),sorted(allowed-actual)))
 if any(x.startswith('app/') for x in actual): raise SystemExit('handoff modified repository app source')
 if any(('\n' in x or '\r' in x) for x in allowed): raise SystemExit('REGRESSION_26564_V1_HANDOFF_SCOPE_NEWLINE')
-print('PASS exact sealed 26564 V1.2 handoff scope',len(actual),'files')
+print('PASS exact sealed 26564 V1.3 handoff scope',len(actual),'files')
 PY
 ! grep -R -F 'V1_26564_' .github/workflows --exclude='build-26564-v1-true-2x-sr.yml' | grep -q . || fail "overlapping 26564 workflow trigger"
-pass "sealed 26564 V1.2 package / failed-V1/V1.1 lineage / backup"
+pass "sealed 26564 V1.3 package / failed-V1/V1.1/V1.2 lineage / backup"
 
 echo "=== 26564 GATE 1: exact successful compiled 26563 authority ==="
 REPO_API="https://api.github.com/repos/${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}"
@@ -409,4 +432,4 @@ set_report "POST-BUILD INVARIANCE" PASS; pass "post-build invariance"
 echo "=== 26564 GATE 6: deterministic clean candidate source export ==="
 tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner -czf "$OUT/26564_V1_candidate_app_source.tar.gz" -C "$AFTER" app
 sha256sum "$OUT/26564_V1_candidate_app_source.tar.gz" > "$OUT/26564_V1_candidate_app_source.tar.gz.sha256"; cp "$CAND_PIN" "$OUT/26564_V1_candidate_source.sha256"; set_report "CLEAN ARTIFACT SOURCE EXPORT" PASS
-pass "26564 V1.2 BUILD-PROVEN Actions output"
+pass "26564 V1.3 BUILD-PROVEN Actions output"
