@@ -167,4 +167,13 @@ check('Night keeps post-Jin UHDR owner', 'IrisNightUltraHdr.attachPostJin(' in n
 # Geometry edge regression: no forced source column shift.
 check('true2x first source column preserved', 'if(ix==0&&p.trueW>1)ix=1' not in native)
 
+# REGRESSION_26564_V1_3_KOTLIN_NULLABLE_THROWABLE: the real Kotlin compiler requires
+# a non-null Throwable at PLog.e.  Capture the failed Result exception once and reuse it.
+check('Kotlin GPU fallback throwable is non-null',
+      'val gpuFailure = gpuAttempt.exceptionOrNull()' in stack and
+      '?: IllegalStateException("IRIS_26564_TRUE2X_GPU_FALLBACK_CPU unknown GPU failure")' in stack and
+      '"IRIS_26564_TRUE2X_GPU_FALLBACK_CPU reason=${gpuFailure.message}"' in stack and
+      '            gpuFailure,\n' in stack and
+      '            gpuAttempt.exceptionOrNull(),\n' not in stack)
+
 print(f'PASS TOTAL {len(PASS)} / {len(PASS)}')
