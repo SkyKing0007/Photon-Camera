@@ -82,6 +82,7 @@ apply_state_to_scope(){ local source="$1" dest="$2"; while IFS= read -r rel; do 
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="d048338a8e303c11b2208d4c1b78c8c129ebc57b"
+FAILED_V1_HANDOFF_COMMIT="82eafc66df2bd17885f3d8b44e22047abfda440e"
 BASE_RUN_ID="33277777042"
 BASE_ARTIFACT_ID="9722074240"
 BASE_ARTIFACT_NAME="photon-26563-v1-universal-adaptive-color-appearance"
@@ -128,7 +129,7 @@ ARTDIR="$WORK/artifact"
 BASE="$WORK/exact_26563_v1_compiled_candidate"
 AFTER="$WORK/candidate_26564"
 GLSLOUT="$WORK/runtime_glsl"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-true-2x-sr-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-1-true-2x-sr-debug.apk"
 LOCAL_REPLAY_ARTIFACT=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then [[ -n "${2:-}" ]] || fail "--local-prebuild requires exact 26563 V1 artifact ZIP"; LOCAL_REPLAY_ARTIFACT="$2"; fi
 mapfile -t RUNTIME_FILES < "$RUNTIME_LIST"
@@ -169,7 +170,7 @@ FORWARD PATCH FUZZ=0: NOT RUN
 ROLLBACK PATCH FUZZ=0: NOT RUN
 POST-BUILD INVARIANCE: NOT RUN
 CLEAN ARTIFACT SOURCE EXPORT: NOT RUN
-TARGET VERSION/BUILD: 0.9726564 / 26564 V1
+TARGET VERSION/BUILD: 0.9726564 / 26564 V1.1
 EOF
 set_report(){ local key="$1" val="$2" tmp="$OUT/.report.tmp"; awk -v key="$key:" -v val="$val" 'BEGIN{f=0} index($0,key)==1{print key" "val;f=1;next}{print} END{if(!f)exit 42}' "$OUT/26564_V1_STRICT_HANDOFF_REPORT.txt" > "$tmp" || { rm -f "$tmp"; fail "report key missing $key"; }; mv "$tmp" "$OUT/26564_V1_STRICT_HANDOFF_REPORT.txt"; }
 
@@ -179,6 +180,23 @@ verify_package_and_pins(){
  python3 "$EXTRACT" --self-test
  python3 "$RESERVED" --self-test
  bash -n "$0"
+ python3 - "$HANDOFF_HASHES" <<'PY_SCOPE_SELFTEST'
+from pathlib import Path
+import sys
+hf=Path(sys.argv[1])
+raw=hf.read_text().splitlines()
+allowed={line.split('  ',1)[1] for line in raw if line.strip()}
+if len(allowed) != 28:
+    raise SystemExit(f'handoff manifest payload count mismatch: {len(allowed)} != 28')
+if any(('\n' in x or '\r' in x) for x in allowed):
+    raise SystemExit('REGRESSION_26564_V1_HANDOFF_SCOPE_NEWLINE: parsed filename retained line ending')
+# Exact historical failure fixture: old open(file) parsing retained '\n'; splitlines parsing must not.
+fixture='a'*64+'  alpha.txt\n'+'b'*64+'  dir/beta.txt\n'
+parsed={line.split('  ',1)[1] for line in fixture.splitlines() if line.strip()}
+if parsed != {'alpha.txt','dir/beta.txt'}:
+    raise SystemExit('REGRESSION_26564_V1_HANDOFF_SCOPE_NEWLINE fixture failed')
+print('PASS permanent 26564 V1 handoff-scope newline regression')
+PY_SCOPE_SELFTEST
  [[ "$(wc -l < "$BASE_PIN")" -eq 929 && "$(sha "$BASE_PIN")" == "$BASE_MANIFEST_SHA" ]] || fail "base runtime manifest pin"
  [[ "$(wc -l < "$CAND_PIN")" -eq 930 && "$(sha "$CAND_PIN")" == "$CAND_MANIFEST_SHA" ]] || fail "candidate runtime manifest pin"
  [[ "$(wc -l < "$VENDOR_PIN")" -eq 778 && "$(sha "$VENDOR_PIN")" == "$VENDOR_MANIFEST_SHA" ]] || fail "vendor manifest pin"
@@ -300,21 +318,25 @@ fi
 
 echo "=== 26564 GATE 0: sealed handoff / direct lineage / architectural backup ==="
 [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-[[ "$(git rev-parse HEAD^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "26564 handoff must be direct child of successful 26563 V1"
-git diff --quiet "$BASE_SUCCESS_COMMIT..HEAD" -- app || fail "handoff directly changed repository app source"
+[[ "$(git rev-parse HEAD^)" == "$FAILED_V1_HANDOFF_COMMIT" ]] || fail "26564 V1.1 must be direct child of exact failed V1 handoff"
+[[ "$(git rev-parse HEAD^^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "failed V1 handoff must itself be direct child of successful 26563 V1"
+git diff --quiet "$BASE_SUCCESS_COMMIT..HEAD" -- app || fail "V1/V1.1 handoffs directly changed repository app source"
 [[ -n "$TOKEN" ]] || fail "GITHUB_TOKEN missing"; verify_package_and_pins
 BACKUP_SHA="$(git ls-remote origin "refs/heads/${BACKUP_BRANCH}" | awk '{print $1}')"; [[ "$BACKUP_SHA" == "$BACKUP_SHA_EXPECTED" ]] || fail "backup missing/wrong"; set_report "BACKUP STATUS" "PASS (${BACKUP_BRANCH} @ ${BACKUP_SHA_EXPECTED})"
 python3 - "$BASE_SUCCESS_COMMIT" "$HANDOFF_HASHES" <<'PY'
+from pathlib import Path
 import subprocess,sys
-base=sys.argv[1]; hf=sys.argv[2]
-allowed={line.split('  ',1)[1] for line in open(hf) if line.strip()}; allowed.add('V1_26564_HANDOFF_HASHES.sha256')
+base=sys.argv[1]; hf=Path(sys.argv[2])
+allowed={line.split('  ',1)[1] for line in hf.read_text().splitlines() if line.strip()}
+allowed.add('V1_26564_HANDOFF_HASHES.sha256')
 actual=set(subprocess.check_output(['git','diff','--name-only',base+'..HEAD'],text=True).splitlines())
 if actual!=allowed: raise SystemExit('handoff scope mismatch extra=%r missing=%r'%(sorted(actual-allowed),sorted(allowed-actual)))
 if any(x.startswith('app/') for x in actual): raise SystemExit('handoff modified repository app source')
-print('PASS exact sealed 26564 handoff scope',len(actual),'files')
+if any(('\n' in x or '\r' in x) for x in allowed): raise SystemExit('REGRESSION_26564_V1_HANDOFF_SCOPE_NEWLINE')
+print('PASS exact sealed 26564 V1.1 handoff scope',len(actual),'files')
 PY
 ! grep -R -F 'V1_26564_' .github/workflows --exclude='build-26564-v1-true-2x-sr.yml' | grep -q . || fail "overlapping 26564 workflow trigger"
-pass "sealed 26564 package / lineage / backup"
+pass "sealed 26564 V1.1 package / failed-V1 lineage / backup"
 
 echo "=== 26564 GATE 1: exact successful compiled 26563 authority ==="
 REPO_API="https://api.github.com/repos/${GITHUB_REPOSITORY:-SkyKing0007/Photon-Camera}"
