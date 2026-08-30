@@ -4,6 +4,16 @@ export PYTHONDONTWRITEBYTECODE=1
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 pass(){ echo "PASS: $*"; }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
+resolve_glslang_compiler(){
+  local root="$1" compiler="" compat=""
+  compiler="$(find "$root" -type f -name glslang -print -quit)"
+  if [[ -z "$compiler" ]]; then
+    compat="$(find "$root" \( -type f -o -type l \) -name glslangValidator -print -quit)"
+    if [[ -n "$compat" ]]; then compiler="$(readlink -f "$compat" 2>/dev/null || true)"; fi
+  fi
+  [[ -n "$compiler" && -f "$compiler" ]] || return 1
+  printf '%s\n' "$compiler"
+}
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="f591411c3b696c1b88938e159332f36ac652775d"
@@ -54,7 +64,7 @@ AFTER2="$WORK/candidate_26567_replay"
 SHADER_OUT="$WORK/runtime_expanded_shaders"
 GLSLANG_DIR="$WORK/glslang-16.5.0"
 POST="$WORK/postbuild_source_snapshot"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-sabre-guided-true2x-p3-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-1-sabre-guided-true2x-p3-debug.apk"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 LOCAL_ART=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then
@@ -141,7 +151,17 @@ PY
   grep -F '26567 local true2x shader anchor leakage:' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "shader-scope regression missing"
   grep -F '26567 local Java declaration-order failure:' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Java-order regression missing"
   grep -F '26567 local workflow py_compile self-contamination:' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "workflow py_compile regression missing"
+  grep -F 'run 33339787968, job 99333216734' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions glslang bootstrap regression missing"
   ! grep -F 'py_compile' "$WORKFLOW" >/dev/null || fail "sealed workflow reintroduced py_compile transient contamination"
+  local glslfix="$WORK/glslang_symlink_fixture" blind="" resolved=""
+  rm -rf "$glslfix"; mkdir -p "$glslfix/bin"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$glslfix/bin/glslang"; chmod +x "$glslfix/bin/glslang"
+  ln -s glslang "$glslfix/bin/glslangValidator"
+  blind="$(find "$glslfix" -type f -name glslangValidator -print -quit)"
+  [[ -z "$blind" ]] || fail "glslang symlink regression fixture did not reproduce V1 failure"
+  resolved="$(resolve_glslang_compiler "$glslfix")" || fail "V1.1 glslang resolver failed symlink fixture"
+  [[ "$resolved" == "$glslfix/bin/glslang" ]] || fail "V1.1 glslang resolver chose wrong fixture executable"
+  pass "REGRESSION_26567_V1_GLSLANG_SYMLINK_BOOTSTRAP: PASS"
   grep -F 'DNG HARD INVARIANT' "$ROOT/REGRESSION_26567_SR_COLOR_DNG_CONTRACT.txt" >/dev/null || fail "DNG contract missing"
   grep -F 'SR-on publication keeps exact physical 2x dimensions' "$ROOT/REGRESSION_26567_SR_COLOR_DNG_CONTRACT.txt" >/dev/null || fail "2x publication regression missing"
   pass "sealed package syntax/hash/regression contract"
@@ -243,10 +263,10 @@ verify_shaders(){
   local archive="$WORK/glslang-${GLSLANG_VERSION}.tar.gz"
   curl -L --fail --retry 3 "$GLSLANG_URL" -o "$archive"
   [[ "$(sha "$archive")" == "$GLSLANG_ARCHIVE_SHA" ]] || fail "pinned glslang archive SHA mismatch"
+  tar -tzf "$archive" > "$OUT/26567_glslang_archive_contents.txt"
   tar -xzf "$archive" -C "$GLSLANG_DIR"
   local compiler
-  compiler="$(find "$GLSLANG_DIR" -type f -name glslangValidator -print -quit)"
-  [[ -n "$compiler" && -f "$compiler" ]] || fail "glslangValidator missing after pinned extraction"
+  compiler="$(resolve_glslang_compiler "$GLSLANG_DIR")" || fail "glslang executable missing after pinned extraction"
   chmod +x "$compiler"
   "$compiler" --version | tee "$OUT/26567_glslang_version.txt"
   python3 -S "$SHADERVERIFY" "$AFTER" --out "$SHADER_OUT" --glslang "$compiler" | tee "$OUT/26567_shader_validation.txt"
