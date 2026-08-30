@@ -7,6 +7,9 @@ sha(){ sha256sum "$1" | awk '{print $1}'; }
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="d0e9f1660140eaa8cb695f3e76805ba6f80cf79f"
+FAILED_V1_HANDOFF_COMMIT="c775e067b5e73e3297dcd00f5cd0423da8cfa93f"
+FAILED_V1_RUN_ID="33322029512"
+FAILED_V1_JOB_ID="99285563475"
 BASE_RUN_ID="33286029778"
 BASE_ARTIFACT_ID="9724492359"
 BASE_ARTIFACT_NAME="photon-26564-v1-4-true-2x-sr"
@@ -32,6 +35,10 @@ VALIDATE="$ROOT/validate_26565_v1_display_p3_fast_sr.py"
 AUTHORITY="$ROOT/verify_26565_authority.py"
 PATCHVERIFY="$ROOT/verify_26565_patches.py"
 CPPCONTRACT="$ROOT/compile_26565_cpp_contract.py"
+WORKFLOW="$ROOT/.github/workflows/build-26565-v1-display-p3-fast-sr.yml"
+BUILD_SCRIPT="$ROOT/build_26565_v1_display_p3_fast_sr.sh"
+SEALED_PY=("$TRANSFORM" "$VALIDATE" "$AUTHORITY" "$PATCHVERIFY" "$CPPCONTRACT")
+SEALED_DEP_FILES=("${SEALED_PY[@]}" "$BUILD_SCRIPT" "$WORKFLOW")
 OUT="$ROOT/build_26565_v1_display_p3_fast_sr_outputs"
 WORK="$ROOT/.build_26565_v1_display_p3_fast_sr_work"
 ARTZIP="$WORK/26564_v1_4_artifact.zip"
@@ -40,7 +47,7 @@ BASE="$WORK/exact_26564_v1_4_compiled_candidate"
 AFTER="$WORK/candidate_26565"
 AFTER2="$WORK/candidate_26565_replay"
 POST="$WORK/postbuild_source_snapshot"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-display-p3-fast-sr-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-1-display-p3-fast-sr-debug.apk"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 LOCAL_ART=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then [[ -n "${2:-}" ]] || fail "--local-prebuild requires exact 26564 V1.4 artifact ZIP"; LOCAL_ART="$2"; fi
@@ -94,8 +101,8 @@ verify_package(){
  [[ "$(sha "$ROOT/V1_26565_RUNTIME_ROLLBACK_TO_26564_V1_4.patch")" == "$ROLLBACK_SHA" ]] || fail "rollback patch SHA"
  [[ "$(wc -l < "$BASE_PIN")" -eq 930 && "$(wc -l < "$CAND_PIN")" -eq 930 && "$(wc -l < "$VENDOR_PIN")" -eq 778 ]] || fail "manifest expected line counts"
  [[ "$(wc -l < "$ROOT/V1_26565_RUNTIME_CHANGED_PATHS.txt")" -eq 6 ]] || fail "changed path count"
- # Parse/compile all packaged Python without site packages and without writing pyc.
- python3 -S - "$TRANSFORM" "$VALIDATE" "$AUTHORITY" "$PATCHVERIFY" "$CPPCONTRACT" <<'PY'
+ # Parse/compile the exact sealed Python inventory without site packages and without writing pyc.
+ python3 -S - "${SEALED_PY[@]}" <<'PY'
 import ast,sys
 from pathlib import Path
 allowed=set(sys.stdlib_module_names)
@@ -110,13 +117,29 @@ for raw in sys.argv[1:]:
  compile(p.read_text(),str(p),'exec')
 print('PASS packaged Python standard-library-only syntax/import gate')
 PY
- ! grep -Eq '(^|[[:space:]])(import|from)[[:space:]]+numpy' "$ROOT"/*.py || fail "NumPy import regression"
- ! grep -Eq 'pip(3)?[[:space:]]+install' "$ROOT"/*.py "$ROOT"/*.sh "$ROOT/.github/workflows/build-26565-v1-display-p3-fast-sr.yml" || fail "undeclared package-manager dependency regression"
+ # Dependency regressions own only the sealed 26565 inventory, never unrelated historical repository files.
+ ! grep -Eq '(^|[[:space:]])(import|from)[[:space:]]+numpy' "${SEALED_PY[@]}" || fail "NumPy import regression in sealed 26565 Python inventory"
+ ! grep -Eq 'pip(3)?[[:space:]]+install' "${SEALED_DEP_FILES[@]}" || fail "undeclared package-manager dependency in sealed 26565 inventory"
+ # REGRESSION_26565_V1_REPO_WIDE_DEPENDENCY_SCOPE: reproduce a polluted checkout and prove exact inventory semantics.
+ local depfix="$WORK/dependency_scope_fixture"
+ mkdir -p "$depfix"
+ printf 'import numpy\n' > "$depfix/unrelated_history.py"
+ printf 'pip%sinstall numpy\n' ' ' > "$depfix/unrelated_history.sh"
+ grep -Eq '(^|[[:space:]])(import|from)[[:space:]]+numpy' "$depfix/unrelated_history.py" || fail "dependency-scope NumPy decoy fixture invalid"
+ grep -Eq 'pip(3)?[[:space:]]+install' "$depfix/unrelated_history.sh" || fail "dependency-scope pip decoy fixture invalid"
+ ! grep -Eq '(^|[[:space:]])(import|from)[[:space:]]+numpy' "${SEALED_PY[@]}" || fail "unrelated NumPy decoy contaminated sealed scan"
+ ! grep -Eq 'pip(3)?[[:space:]]+install' "${SEALED_DEP_FILES[@]}" || fail "unrelated pip decoy contaminated sealed scan"
+ printf 'import numpy\n' > "$depfix/sealed_bad_numpy.py"
+ printf 'pip%sinstall numpy\n' ' ' > "$depfix/sealed_bad_pip.sh"
+ grep -Eq '(^|[[:space:]])(import|from)[[:space:]]+numpy' "$depfix/sealed_bad_numpy.py" || fail "sealed NumPy detector fixture failed"
+ grep -Eq 'pip(3)?[[:space:]]+install' "$depfix/sealed_bad_pip.sh" || fail "sealed pip detector fixture failed"
+ pass "REGRESSION_26565_V1_REPO_WIDE_DEPENDENCY_SCOPE: PASS"
  bash -n "$0"
  grep -F 'run 33283538711, job 99182648927' "$ROOT/REGRESSION_26565_CARRIED_FAILURES.txt" >/dev/null || fail "newline regression record"
  grep -F 'run 33284071958, job 99184083108' "$ROOT/REGRESSION_26565_CARRIED_FAILURES.txt" >/dev/null || fail "nested Git regression record"
  grep -F 'run 33284552163, job 99185364515' "$ROOT/REGRESSION_26565_CARRIED_FAILURES.txt" >/dev/null || fail "NumPy regression record"
  grep -F 'run 33285297620, job 99187338833' "$ROOT/REGRESSION_26565_CARRIED_FAILURES.txt" >/dev/null || fail "Kotlin Throwable regression record"
+ grep -F 'run 33322029512, job 99285563475' "$ROOT/REGRESSION_26565_V1_REPO_WIDE_DEPENDENCY_SCOPE.txt" >/dev/null || fail "26565 V1 repository-wide dependency regression record"
  # Exact historical newline fixture.
  python3 - "$HANDOFF" <<'PY'
 from pathlib import Path
@@ -128,7 +151,7 @@ fixture='a'*64+'  alpha.txt\n'+'b'*64+'  dir/beta.txt\n'
 assert [x.split('  ',1)[1] for x in fixture.splitlines()] == ['alpha.txt','dir/beta.txt']
 print('PASS REGRESSION_26564_V1_HANDOFF_SCOPE_NEWLINE')
 PY
- set_report "26564 FAILURE REGRESSIONS" "PASS (newline parser + nested Git + stdlib-only + nullable Throwable carried)"
+ set_report "26564 FAILURE REGRESSIONS" "PASS (26564 four failures + 26565 V1 repository-context dependency-scope regression)"
 }
 
 verify_scope(){
