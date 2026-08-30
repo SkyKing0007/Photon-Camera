@@ -92,7 +92,18 @@ def main():
         'CPU source clipping threshold is missing from true2x accumulation call')
     req('IRIS_26567_TRUE2X_EVIDENCE_POLICY' in stack and 'jpegPhaseCap=${true2xFastPhaseSlots != null}' in stack,
         'speed-policy telemetry missing')
-    print('PASS JPEG <=4 phase-diverse evidence / full DNG evidence / true zero phase support')
+    for helper in ('runTrue2xCpu', 'runTrue2xGpu'):
+        m=re.search(r'private fun '+helper+r'\(.*?\n\s*\):\s*([^\{]+)\{', stack, re.S)
+        req(m is not None, f'{helper} declaration missing')
+        req(m.group(1).strip()=='True2xPhaseStats',
+            f'regression 33340190659/99334293921: {helper} must return True2xPhaseStats, got {m.group(1).strip()}')
+    req('private fun runTrue2xCpu' not in stack or
+        not re.search(r'private fun runTrue2xCpu\(.*?\):\s*Pair<Float, Float>', stack, re.S),
+        'regression: stale runTrue2xCpu Pair<Float, Float> return survived')
+    req('private fun runTrue2xGpu' not in stack or
+        not re.search(r'private fun runTrue2xGpu\(.*?\):\s*Pair<Float, Float>', stack, re.S),
+        'regression: stale runTrue2xGpu Pair<Float, Float> return survived')
+    print('PASS JPEG <=4 phase-diverse evidence / full DNG evidence / true zero phase support + phase-stat Kotlin type contract')
 
     # The clipping rule is allowed to affect support only. It must not be multiplied into RGB accumulation.
     kshader=txt(cand,'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt')

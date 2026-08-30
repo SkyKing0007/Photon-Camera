@@ -991,6 +991,19 @@ s=s.replace('''                                        ev.useFrameWeight,
                                     )
 ''',1)
 # rawResult.copy now keeps phase path automatically. Ensure constructor raw positions fixed above.
+# 26567 V1.2: real Kotlin compile contract. The richer phase-stat object must flow through
+# both CPU and GPU helpers; stale Pair<Float, Float> declarations caused Actions run
+# 33340190659 / job 99334293921 to fail before Java/assemble.
+for helper in ('runTrue2xCpu', 'runTrue2xGpu'):
+    old_return = f'): Pair<Float, Float> {{'
+    start = s.index(f'    private fun {helper}(')
+    end = s.index('{', start)
+    declaration = s[start:end + 1]
+    if declaration.count(old_return) != 1:
+        raise SystemExit(f'{helper} stale Pair return-type anchor count {declaration.count(old_return)}')
+    replacement = declaration.replace(old_return, '): True2xPhaseStats {', 1)
+    s = s[:start] + replacement + s[end + 1:]
+
 write(rel,s)
 
 rel='app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt'
@@ -1331,6 +1344,7 @@ s=s.replace('''    auto luma=[](const uint8_t*q)->float{
         return (0.2126f*(float)q[0]+0.7152f*(float)q[1]+0.0722f*(float)q[2])/255.f;
     };
 ''',1)
+
 write(rel,s)
 
 print('PASS transform_26567_v1')
