@@ -1,0 +1,802 @@
+#include <algorithm>
+#include <android/bitmap.h>
+#include <android/log.h>
+#include <array>
+#include <atomic>
+#include <thread>
+#include <jni.h>
+#include <cstdio>
+#include <cerrno>
+#include <string>
+#include <turbojpeg.h>
+#include <jpeglib.h>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <limits>
+#include <ultrahdr/icc.h>
+#include <ultrahdr_api.h>
+#include "motionv2_jpeg_r_encoder.h"
+#define TAG "MotionV2Jpeg444"
+/* IRIS_26513_FAST_HUFFMAN: entropy-table optimization disabled; quantization, 4:4:4 sampling and pixels unchanged. */
+namespace { struct U{JNIEnv*e;jstring s;const char*c;U(JNIEnv*e,jstring s):e(e),s(s),c(s?e->GetStringUTFChars(s,nullptr):nullptr){}~U(){if(c)e->ReleaseStringUTFChars(s,c);}};
+bool write(const char*p,const unsigned char*d,size_t n){FILE*f=fopen(p,"wb");if(!f)return false;size_t w=fwrite(d,1,n,f);int a=fflush(f),b=fclose(f);return w==n&&a==0&&b==0;}
+bool f3(JNIEnv*e,jfloatArray a,std::array<float,3>*o){if(!a||e->GetArrayLength(a)!=3)return false;e->GetFloatArrayRegion(a,0,3,o->data());return !e->ExceptionCheck();}}
+
+namespace {
+/* IRIS_26565_JPEG_BOUNDARY_DISPLAY_P3
+ * Internal Photon/Iris image processing, Night Jin, UHDR ratio construction and all existing
+ * appearance math remain in their proven sRGB-referred domains. Only final publication converts
+ * encoded sRGB samples through linear light to Display-P3, then emits the standards-defined P3 ICC.
+ */
+struct DisplayP3Lut {
+    std::array<float,256> decode{};
+    std::array<float,16385> encode{};
+    DisplayP3Lut(){
+        for(size_t i=0;i<decode.size();i++){float x=(float)i/255.f;decode[i]=x<=0.04045f?x/12.92f:std::pow((x+0.055f)/1.055f,2.4f);}
+        for(size_t i=0;i<encode.size();i++){float x=(float)i/(float)(encode.size()-1);encode[i]=x<=0.0031308f?12.92f*x:1.055f*std::pow(x,1.f/2.4f)-0.055f;}
+    }
+    float enc(float x)const{
+        x=std::max(0.f,std::min(1.f,x));float q=x*(float)(encode.size()-1);int a=(int)q,b=std::min(a+1,(int)encode.size()-1);return encode[(size_t)a]+(encode[(size_t)b]-encode[(size_t)a])*(q-a);
+    }
+    void convert(uint8_t r8,uint8_t g8,uint8_t b8,uint8_t*out)const{
+        float r=decode[r8],g=decode[g8],b=decode[b8];
+        // IEC sRGB D65 -> Display-P3 D65, derived from the published primary chromaticities.
+        float pr=0.8224619687f*r+0.1775380313f*g;
+        float pg=0.0331941989f*r+0.9668058011f*g;
+        float pb=0.0170826307f*r+0.0723974407f*g+0.9105199286f*b;
+        out[0]=(uint8_t)std::lround(enc(pr)*255.f);out[1]=(uint8_t)std::lround(enc(pg)*255.f);out[2]=(uint8_t)std::lround(enc(pb)*255.f);
+    }
+    void convertInPlace(uint8_t*rgb)const{uint8_t o[3];convert(rgb[0],rgb[1],rgb[2],o);rgb[0]=o[0];rgb[1]=o[1];rgb[2]=o[2];}
+    std::array<float,3> convertEncoded(float r,float g,float b)const{
+        auto dec=[](float x){x=std::max(0.f,std::min(1.f,x));return x<=0.04045f?x/12.92f:std::pow((x+0.055f)/1.055f,2.4f);};
+        float lr=dec(r),lg=dec(g),lb=dec(b);return {enc(0.8224619687f*lr+0.1775380313f*lg),enc(0.0331941989f*lr+0.9668058011f*lg),enc(0.0170826307f*lr+0.0723974407f*lg+0.9105199286f*lb)};
+    }
+};
+const DisplayP3Lut& displayP3Lut(){static const DisplayP3Lut lut;return lut;}
+
+bool writeDisplayP3Icc(j_compress_ptr c){
+    auto icc=ultrahdr::IccHelper::writeIccProfile(UHDR_CT_SRGB,UHDR_CG_DISPLAY_P3);
+    if(!icc||icc->getLength()<=ultrahdr::kICCIdentifierSize)return false;
+    const size_t n=icc->getLength()-ultrahdr::kICCIdentifierSize;
+    if(n>(size_t)std::numeric_limits<unsigned int>::max())return false;
+    const auto*d=(const JOCTET*)icc->getData()+ultrahdr::kICCIdentifierSize;
+    jpeg_write_icc_profile(c,d,(unsigned int)n);return true;
+}
+
+bool encodeRgbaBitmapP3(const char*path,const AndroidBitmapInfo&i,const uint8_t*p,int quality,bool sourceDisplayP3){
+    if(!path||!p||i.width==0||i.height==0)return false;FILE*f=fopen(path,"wb");if(!f)return false;
+    jpeg_compress_struct c{};jpeg_error_mgr jerr{};c.err=jpeg_std_error(&jerr);jpeg_create_compress(&c);jpeg_stdio_dest(&c,f);
+    c.image_width=i.width;c.image_height=i.height;c.input_components=3;c.in_color_space=JCS_RGB;jpeg_set_defaults(&c);jpeg_set_quality(&c,std::clamp(quality,1,100),TRUE);
+    for(int k=0;k<c.num_components;k++){c.comp_info[k].h_samp_factor=1;c.comp_info[k].v_samp_factor=1;}
+    jpeg_start_compress(&c,TRUE);bool ok=writeDisplayP3Icc(&c);std::vector<uint8_t>row((size_t)i.width*3);const auto&lut=displayP3Lut();
+    while(ok&&c.next_scanline<c.image_height){const uint8_t*src=p+(size_t)c.next_scanline*i.stride;for(size_t x=0;x<i.width;x++){if(sourceDisplayP3){row[x*3]=src[x*4];row[x*3+1]=src[x*4+1];row[x*3+2]=src[x*4+2];}else lut.convert(src[x*4],src[x*4+1],src[x*4+2],&row[x*3]);}JSAMPROW rp=row.data();ok=jpeg_write_scanlines(&c,&rp,1)==1;}
+    if(ok)jpeg_finish_compress(&c);else jpeg_abort_compress(&c);jpeg_destroy_compress(&c);int a=fflush(f),b=fclose(f);return ok&&a==0&&b==0;
+}
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality,jboolean sourceDisplayP3){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;U u(e,path);bool ok=u.c&&encodeRgbaBitmapP3(u.c,i,(const uint8_t*)p,(int)quality,sourceDisplayP3==JNI_TRUE);AndroidBitmap_unlockPixels(e,bitmap);return ok?JNI_TRUE:JNI_FALSE;}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_convertSrgbToDisplayP3Native(JNIEnv*e,jclass,jobject bitmap){AndroidBitmapInfo i{};if(!bitmap||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;const auto&lut=displayP3Lut();auto*base=(uint8_t*)p;unsigned hc=std::thread::hardware_concurrency();int workers=std::max(1,std::min(4,(int)(hc?hc:2)));std::atomic<uint32_t>next{0};auto work=[&](){for(;;){uint32_t y=next.fetch_add(1);if(y>=i.height)break;uint8_t*row=base+(size_t)y*i.stride;for(uint32_t x=0;x<i.width;x++)lut.convertInPlace(row+x*4);}};std::vector<std::thread>threads;for(int n=0;n<workers;n++)threads.emplace_back(work);for(auto&t:threads)t.join();AndroidBitmap_unlockPixels(e,bitmap);return JNI_TRUE;}
+
+namespace {
+constexpr float kIris26532DetailLog2Range = 0.75f;
+inline float clampf(float v,float lo,float hi){return std::max(lo,std::min(hi,v));}
+inline float srgbToLinear(float x){x=clampf(x,0.f,1.f);return x<=0.04045f?x/12.92f:std::pow((x+0.055f)/1.055f,2.4f);}
+inline float linearToSrgb(float x){x=std::max(x,0.f);return x<=0.0031308f?12.92f*x:1.055f*std::pow(x,1.f/2.4f)-0.055f;}
+inline float detailLog2Q8(const uint8_t*detail,int w,int h,float x,float y){
+    x=clampf(x,0.f,(float)std::max(0,w-1));y=clampf(y,0.f,(float)std::max(0,h-1));
+    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);
+    float fx=x-x0,fy=y-y0;
+    auto d=[&](int px,int py){float n=(float)detail[(size_t)py*w+px]/255.f;return (n*2.f-1.f)*kIris26532DetailLog2Range;};
+    float a=d(x0,y0)+(d(x1,y0)-d(x0,y0))*fx,b=d(x0,y1)+(d(x1,y1)-d(x0,y1))*fx;
+    return a+(b-a)*fy;
+}
+inline void bilinearBitmap(const uint8_t*base,int bw,int bh,int stride,float x,float y,float*rgb){
+    x=clampf(x,0.f,(float)std::max(0,bw-1)); y=clampf(y,0.f,(float)std::max(0,bh-1));
+    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,bw-1),y1=std::min(y0+1,bh-1);float fx=x-x0,fy=y-y0;
+    const uint8_t*p00=base+(size_t)y0*stride+x0*4,*p10=base+(size_t)y0*stride+x1*4,*p01=base+(size_t)y1*stride+x0*4,*p11=base+(size_t)y1*stride+x1*4;
+    for(int c=0;c<3;c++){float a=p00[c]+(p10[c]-p00[c])*fx,b=p01[c]+(p11[c]-p01[c])*fx;rgb[c]=(a+(b-a)*fy)/255.f;}
+}
+/* Map a final-oriented native pixel back to the unrotated MotionV2Render output. This mirrors
+ * addwatermark_rotate.glsl's crop/rotation geometry without materializing a 50 MP bitmap. */
+inline void finalToUnrotated(float bx,float by,int rawW,int rawH,int cropW,int cropH,int rotation,bool mirror,float*outX,float*outY){
+    float x=bx,y=by;
+    switch(rotation){
+        case 90: { // shader rotate=3
+            float sx=y; float sy=(float)rawH-x;
+            x=sx; y=sy; break;
+        }
+        case 180: { x=(float)rawW-x; y=(float)rawH-y; break; }
+        case 270: { // shader rotate=1
+            float xx=x+(float)(rawH-cropH); if(mirror) xx=(float)cropH-xx;
+            float sx=(float)rawW-y; float sy=xx; x=sx; y=sy; return;
+        }
+        default: { y+=(float)(rawH-cropH); if(mirror)y=(float)rawH-y; break; }
+    }
+    if(rotation==90){ if(mirror){/* horizontal output mirror maps to vertical source flip */ y=(float)rawH-y;} }
+    else if(rotation==180){ if(mirror)y=(float)rawH-y; }
+    *outX=x;*outY=y;
+}
+}
+
+/* IRIS_26564_TRUE_2X_CPU_REFERENCE_BACKEND
+ * Canonical CPU implementation of the same direct-CFA Sabre RBF estimator used by the GLES
+ * accelerator. The input evidence is already frozen by the proven Sabre owner: sparse flow,
+ * packed covariance and rejection. No alignment, sharpening, native-RGB interpolation or device
+ * model policy exists here. Accumulation is tile-local and therefore memory bounded.
+ */
+namespace iris26564 {
+inline float halfToFloat(uint16_t h){
+    uint32_t sign=(uint32_t)(h&0x8000u)<<16,exp=(h>>10)&0x1fu,mant=h&0x03ffu,bits;
+    if(exp==0){
+        if(mant==0)bits=sign;
+        else{
+            int e=-14;while((mant&0x0400u)==0){mant<<=1;--e;}mant&=0x03ffu;
+            bits=sign|(uint32_t)(e+127)<<23|(mant<<13);
+        }
+    }else if(exp==31)bits=sign|0x7f800000u|(mant<<13);
+    else bits=sign|((exp+112u)<<23)|(mant<<13);
+    float f;std::memcpy(&f,&bits,sizeof(f));return f;
+}
+inline uint16_t floatToHalf(float f){
+    uint32_t x;std::memcpy(&x,&f,sizeof(x));uint32_t sign=(x>>16)&0x8000u;
+    int exp=(int)((x>>23)&0xffu)-127+15;uint32_t mant=x&0x7fffffu;
+    if(((x>>23)&0xffu)==0xffu)return (uint16_t)(sign|(mant?0x7e00u:0x7c00u));
+    if(exp<=0){
+        if(exp<-10)return (uint16_t)sign;
+        mant=(mant|0x800000u)>>(1-exp);if(mant&0x1000u)mant+=0x2000u;
+        return (uint16_t)(sign|(mant>>13));
+    }
+    if(exp>=31)return (uint16_t)(sign|0x7c00u);
+    if(mant&0x1000u){mant+=0x2000u;if(mant&0x800000u){mant=0;++exp;if(exp>=31)return (uint16_t)(sign|0x7c00u);}}
+    return (uint16_t)(sign|((uint32_t)exp<<10)|(mant>>13));
+}
+inline float smooth01(float t){t=clampf(t,0.f,1.f);return t*t*(3.f-2.f*t);}
+inline int clampi(int v,int lo,int hi){return std::max(lo,std::min(hi,v));}
+inline float mirrorCoord(float u,float border){
+    if(u<=border)u=2.f*border-u;
+    if(u>1.f-border)u=2.f*(1.f-border)-u;
+    return clampf(u,0.f,1.f);
+}
+struct Flow4{float x,y,z,w;};
+inline Flow4 flowFetch(const uint16_t*data,int w,int h,int x,int y){
+    x=clampi(x,0,w-1);y=clampi(y,0,h-1);const uint16_t*p=data+((size_t)y*w+x)*4;
+    return {halfToFloat(p[0]),halfToFloat(p[1]),halfToFloat(p[2]),halfToFloat(p[3])};
+}
+inline Flow4 flowSample(const uint16_t*data,int w,int h,float u,float v){
+    float x=clampf(u*(float)w-0.5f,0.f,(float)(w-1)),y=clampf(v*(float)h-0.5f,0.f,(float)(h-1));
+    int x0=(int)floorf(x),y0=(int)floorf(y),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);float fx=x-x0,fy=y-y0;
+    Flow4 a=flowFetch(data,w,h,x0,y0),b=flowFetch(data,w,h,x1,y0),c=flowFetch(data,w,h,x0,y1),d=flowFetch(data,w,h,x1,y1),o{};
+    const float av[4]={a.x,a.y,a.z,a.w},bv[4]={b.x,b.y,b.z,b.w},cv[4]={c.x,c.y,c.z,c.w},dv[4]={d.x,d.y,d.z,d.w};float*ov=&o.x;
+    for(int k=0;k<4;k++){float r0=av[k]+(bv[k]-av[k])*fx,r1=cv[k]+(dv[k]-cv[k])*fx;ov[k]=r0+(r1-r0)*fy;}return o;
+}
+inline void unpackRgb10a2(uint32_t word,float out[3]){out[0]=(float)(word&1023u)/1023.f;out[1]=(float)((word>>10)&1023u)/1023.f;out[2]=(float)((word>>20)&1023u)/1023.f;}
+inline void covFetch(const uint32_t*data,int w,int h,int x,int y,float out[3]){x=clampi(x,0,w-1);y=clampi(y,0,h-1);unpackRgb10a2(data[(size_t)y*w+x],out);}
+inline void covSample(const uint32_t*data,int regionW,int regionH,int originX,int originY,int fullW,int fullH,float u,float v,float out[3]){
+    float gx=clampf(u*(float)fullW-0.5f,0.f,(float)(fullW-1))-(float)originX;
+    float gy=clampf(v*(float)fullH-0.5f,0.f,(float)(fullH-1))-(float)originY;
+    gx=clampf(gx,0.f,(float)(regionW-1));gy=clampf(gy,0.f,(float)(regionH-1));int x0=(int)floorf(gx),y0=(int)floorf(gy),x1=std::min(x0+1,regionW-1),y1=std::min(y0+1,regionH-1);float fx=gx-x0,fy=gy-y0;
+    float a[3],b[3],c[3],d[3];covFetch(data,regionW,regionH,x0,y0,a);covFetch(data,regionW,regionH,x1,y0,b);covFetch(data,regionW,regionH,x0,y1,c);covFetch(data,regionW,regionH,x1,y1,d);
+    for(int k=0;k<3;k++){float r0=a[k]+(b[k]-a[k])*fx,r1=c[k]+(d[k]-c[k])*fx;out[k]=r0+(r1-r0)*fy;}
+}
+inline float rejectionSample(const uint8_t*data,int regionW,int regionH,int originX,int originY,int fullW,int fullH,float u,float v){
+    if(!data)return 1.f;float gx=clampf(u*(float)fullW-0.5f,0.f,(float)(fullW-1))-(float)originX,gy=clampf(v*(float)fullH-0.5f,0.f,(float)(fullH-1))-(float)originY;
+    gx=clampf(gx,0.f,(float)(regionW-1));gy=clampf(gy,0.f,(float)(regionH-1));int x0=(int)floorf(gx),y0=(int)floorf(gy),x1=std::min(x0+1,regionW-1),y1=std::min(y0+1,regionH-1);float fx=gx-x0,fy=gy-y0;
+    auto at=[&](int x,int y){return (float)data[(size_t)y*regionW+x]/255.f;};float r0=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,r1=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;return r0+(r1-r0)*fy;
+}
+inline uint16_t rawFetch(const uint16_t*data,int regionW,int regionH,int rowStrideSamples,int originX,int originY,int fullW,int fullH,int x,int y){
+    x=clampi(x,0,fullW-1)-originX;y=clampi(y,0,fullH-1)-originY;x=clampi(x,0,regionW-1);y=clampi(y,0,regionH-1);return data[(size_t)y*rowStrideSamples+x];
+}
+inline void swizzle4(const float in[4],int type,float out[4]){static const int map[4][4]={{0,1,2,3},{1,0,3,2},{2,3,0,1},{3,2,1,0}};for(int i=0;i<4;i++)out[i]=in[map[type&3][i]];}
+inline float kernelWeight(float dx,float dy,const float c[3]){float d=dx*dx*c[0]+dy*dy*c[1]+dx*dy*c[2]*2.f;return std::exp2(-0.5f*d)+0.00005f;}
+inline void sampleRbf(const uint16_t*raw,int regionW,int regionH,int rowStrideSamples,int originX,int originY,int fullW,int fullH,float sx,float sy,int cfa,const float gains[4],const float black[4],const float cov[3],float color[3],float weightOut[3]){
+    int px=(int)floorf(sx),py=(int)floorf(sy);float bayer[3][3],weights[3][3];
+    for(int ix=0;ix<3;ix++)for(int iy=0;iy<3;iy++)bayer[ix][iy]=(float)rawFetch(raw,regionW,regionH,rowStrideSamples,originX,originY,fullW,fullH,px+ix-1,py+iy-1);
+    float subx=floorf(sx)+0.5f-sx,suby=floorf(sy)+0.5f-sy;for(int i=-1;i<=1;i++)for(int j=-1;j<=1;j++)weights[i+1][j+1]=kernelWeight(subx+(float)i,suby+(float)j,cov);
+    int offx=0,offy=0;if(cfa==0){offx=1;offy=1;}else if(cfa==1){offx=0;offy=1;}else if(cfa==2){offx=1;offy=0;}
+    int type=(((py+offy)&1)<<1)+((px+offx)&1);float rg[4],rb[4];swizzle4(gains,type,rg);swizzle4(black,type,rb);
+    float cornerW[4]={weights[0][0],weights[0][2],weights[2][0],weights[2][2]},cornerV[4]={bayer[0][0],bayer[0][2],bayer[2][0],bayer[2][2]};
+    float udW[2]={weights[1][0],weights[1][2]},udV[2]={bayer[1][0],bayer[1][2]},lrW[2]={weights[0][1],weights[2][1]},lrV[2]={bayer[0][1],bayer[2][1]};
+    float tmpI[4]={0,0,0,0},tmpW[4]={0,0,0,0};
+    for(int i=0;i<4;i++){tmpI[0]+=(cornerV[i]*rg[0]+rb[0])*cornerW[i];tmpW[0]+=cornerW[i];}
+    for(int i=0;i<2;i++){tmpI[1]+=(udV[i]*rg[1]+rb[1])*udW[i];tmpW[1]+=udW[i];tmpI[2]+=(lrV[i]*rg[2]+rb[2])*lrW[i];tmpW[2]+=lrW[i];}
+    tmpI[3]=(bayer[1][1]*rg[3]+rb[3])*weights[1][1];tmpW[3]=weights[1][1];float I[4],W[4];swizzle4(tmpI,type,I);swizzle4(tmpW,type,W);
+    color[0]=I[0];color[1]=I[1]+I[2];color[2]=I[3];weightOut[0]=W[0];weightOut[1]=W[1]+W[2];weightOut[2]=W[3];
+}
+inline void lensSample(const float*map,int w,int h,float u,float v,float out[4]){
+    if(!map||w<=0||h<=0){for(int k=0;k<4;k++)out[k]=1.f;return;}float x=clampf(u*(float)w-0.5f,0.f,(float)(w-1)),y=clampf(v*(float)h-0.5f,0.f,(float)(h-1));int x0=(int)floorf(x),y0=(int)floorf(y),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);float fx=x-x0,fy=y-y0;
+    for(int k=0;k<4;k++){auto at=[&](int xx,int yy){float z=map[((size_t)yy*w+xx)*4+k];return std::isfinite(z)&&z>0.f?z:1.f;};float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;out[k]=a+(b-a)*fy;}
+}
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_accumulateCpuTileFrame(
+        JNIEnv*e,jclass,jobject accumBuffer,jobject phaseBuffer,jint tileW,jint tileH,jint outX,jint outY,jint fullOutW,jint fullOutH,
+        jobject rawBuffer,jint rawX,jint rawY,jint rawW,jint rawH,jint rawRowStrideSamples,jobject flowBuffer,jint flowW,jint flowH,jfloat flowScaleX,jfloat flowScaleY,jfloat flowOffsetX,jfloat flowOffsetY,
+        jobject covBuffer,jint covX,jint covY,jint covW,jint covH,jint covFullW,jint covFullH,jobject rejectionBuffer,jint rejX,jint rejY,jint rejW,jint rejH,jint rejFullW,jint rejFullH,
+        jint fullRawW,jint fullRawH,jint cfa,jfloatArray gainsArray,jfloatArray blackArray,jfloatArray covRgArray,jfloatArray covBArray,jboolean useWeight,jfloat rawClipThreshold){
+    if(!accumBuffer||!phaseBuffer||!rawBuffer||!flowBuffer||!covBuffer||
+       tileW<=0||tileH<=0||fullOutW<=0||fullOutH<=0||fullRawW<=0||fullRawH<=0||
+       outX<0||outY<0||outX>fullOutW-tileW||outY>fullOutH-tileH||
+       rawX<0||rawY<0||rawW<=0||rawH<=0||rawX>fullRawW-rawW||rawY>fullRawH-rawH||
+       rawRowStrideSamples<rawW||flowW<=0||flowH<=0||covW<=0||covH<=0||
+       covFullW<=0||covFullH<=0||covX<0||covY<0||covX>covFullW-covW||covY>covFullH-covH||
+       cfa<0||cfa>3)return JNI_FALSE;
+    if(useWeight==JNI_TRUE&&(!rejectionBuffer||rejW<=0||rejH<=0||rejFullW<=0||rejFullH<=0||
+       rejX<0||rejY<0||rejX>rejFullW-rejW||rejY>rejFullH-rejH))return JNI_FALSE;
+    auto*acc=(float*)e->GetDirectBufferAddress(accumBuffer);auto*phase=(uint8_t*)e->GetDirectBufferAddress(phaseBuffer);auto*raw=(const uint16_t*)e->GetDirectBufferAddress(rawBuffer);auto*flow=(const uint16_t*)e->GetDirectBufferAddress(flowBuffer);auto*cov=(const uint32_t*)e->GetDirectBufferAddress(covBuffer);auto*rej=rejectionBuffer?(const uint8_t*)e->GetDirectBufferAddress(rejectionBuffer):nullptr;
+    if(!acc||!phase||!raw||!flow||!cov||(useWeight==JNI_TRUE&&!rej))return JNI_FALSE;
+    const jlong accumulatorBytes=(jlong)tileW*tileH*6*(jlong)sizeof(float);
+    const jlong rawBytes=((jlong)(rawH-1)*rawRowStrideSamples+rawW)*(jlong)sizeof(uint16_t);
+    const jlong flowBytes=(jlong)flowW*flowH*4*(jlong)sizeof(uint16_t);
+    const jlong covarianceBytes=(jlong)covW*covH*(jlong)sizeof(uint32_t);
+    if(e->GetDirectBufferCapacity(accumBuffer)<accumulatorBytes||
+       e->GetDirectBufferCapacity(phaseBuffer)<(jlong)tileW*tileH||
+       e->GetDirectBufferCapacity(rawBuffer)<rawBytes||
+       e->GetDirectBufferCapacity(flowBuffer)<flowBytes||
+       e->GetDirectBufferCapacity(covBuffer)<covarianceBytes||
+       (useWeight==JNI_TRUE&&e->GetDirectBufferCapacity(rejectionBuffer)<(jlong)rejW*rejH))return JNI_FALSE;
+    float gains[4],black[4],crg[4],cb[2];if(!gainsArray||!blackArray||!covRgArray||!covBArray||e->GetArrayLength(gainsArray)!=4||e->GetArrayLength(blackArray)!=4||e->GetArrayLength(covRgArray)!=4||e->GetArrayLength(covBArray)!=2)return JNI_FALSE;
+    e->GetFloatArrayRegion(gainsArray,0,4,gains);e->GetFloatArrayRegion(blackArray,0,4,black);e->GetFloatArrayRegion(covRgArray,0,4,crg);e->GetFloatArrayRegion(covBArray,0,2,cb);if(e->ExceptionCheck())return JNI_FALSE;
+    const float borderX=1.5f/(float)fullRawW,borderY=1.5f/(float)fullRawH;
+    for(int ly=0;ly<tileH;ly++)for(int lx=0;lx<tileW;lx++){
+        int gx=outX+lx,gy=outY+ly;float refU=((float)gx+0.5f)/(float)fullOutW,refV=((float)gy+0.5f)/(float)fullOutH;
+        iris26564::Flow4 fv=iris26564::flowSample(flow,flowW,flowH,refU*flowScaleX+flowOffsetX,refV*flowScaleY+flowOffsetY);
+        float su=iris26564::mirrorCoord(refU+fv.x,borderX),sv=iris26564::mirrorCoord(refV+fv.y,borderY);float packed[3],c[3];iris26564::covSample(cov,covW,covH,covX,covY,covFullW,covFullH,su,sv,packed);c[0]=packed[0]*crg[1]+crg[0];c[1]=packed[1]*crg[3]+crg[2];c[2]=packed[2]*cb[1]+cb[0];
+        float color[3],weights[3];iris26564::sampleRbf(raw,rawW,rawH,rawRowStrideSamples,rawX,rawY,fullRawW,fullRawH,su*(float)fullRawW,sv*(float)fullRawH,cfa,gains,black,c,color,weights);float fw=useWeight==JNI_TRUE?iris26564::rejectionSample(rej,rejW,rejH,rejX,rejY,rejFullW,rejFullH,refU,refV):1.f;
+        int centerX=iris26564::clampi((int)floorf(su*(float)fullRawW),0,fullRawW-1),centerY=iris26564::clampi((int)floorf(sv*(float)fullRawH),0,fullRawH-1);float sourceRawPeak=0.f;for(int ry=-1;ry<=1;ry++)for(int rx=-1;rx<=1;rx++){int xx=iris26564::clampi(centerX+rx,0,fullRawW-1),yy=iris26564::clampi(centerY+ry,0,fullRawH-1);int localX=iris26564::clampi(xx-rawX,0,rawW-1),localY=iris26564::clampi(yy-rawY,0,rawH-1);sourceRawPeak=std::max(sourceRawPeak,(float)raw[(size_t)localY*rawRowStrideSamples+localX]);}
+        size_t q=((size_t)ly*tileW+lx)*6;for(int k=0;k<3;k++){acc[q+k]+=color[k]*fw;acc[q+3+k]+=weights[k]*fw;}
+        if(fw>0.08f&&std::isfinite(rawClipThreshold)&&sourceRawPeak<rawClipThreshold){float fx=fv.x*(float)fullRawW,fy=fv.y*(float)fullRawH;float px=fx-floorf(fx),py=fy-floorf(fy);int bin=(px>=0.5f?1:0)+(py>=0.5f?2:0);phase[(size_t)ly*tileW+lx]|=(uint8_t)(1u<<bin);}
+    }
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_resolveCpuTile(
+        JNIEnv*e,jclass,jobject accumBuffer,jobject outputBuffer,jint tileW,jint tileH,jint outX,jint outY,jint fullOutW,jint fullOutH,jfloatArray cameraScaleArray,jfloatArray lensArray,jint lensW,jint lensH){
+    auto*acc=(const float*)e->GetDirectBufferAddress(accumBuffer);auto*out=(uint16_t*)e->GetDirectBufferAddress(outputBuffer);
+    if(!acc||!out||tileW<=0||tileH<=0||fullOutW<=0||fullOutH<=0||
+       outX<0||outY<0||outX>fullOutW-tileW||outY>fullOutH-tileH)return JNI_FALSE;
+    if(e->GetDirectBufferCapacity(accumBuffer)<(jlong)tileW*tileH*6*(jlong)sizeof(float)||
+       e->GetDirectBufferCapacity(outputBuffer)<(jlong)tileW*tileH*3*(jlong)sizeof(uint16_t))return JNI_FALSE;float scale[3];if(!cameraScaleArray||e->GetArrayLength(cameraScaleArray)!=3)return JNI_FALSE;e->GetFloatArrayRegion(cameraScaleArray,0,3,scale);if(e->ExceptionCheck())return JNI_FALSE;
+    std::vector<float> lens;if(lensArray&&lensW>0&&lensH>0){jsize n=e->GetArrayLength(lensArray);if(n<lensW*lensH*4)return JNI_FALSE;lens.resize((size_t)lensW*lensH*4);e->GetFloatArrayRegion(lensArray,0,(jsize)lens.size(),lens.data());if(e->ExceptionCheck())return JNI_FALSE;}
+    for(int ly=0;ly<tileH;ly++)for(int lx=0;lx<tileW;lx++){size_t i=(size_t)ly*tileW+lx,q=i*6,o=i*3;float rgb[3];for(int k=0;k<3;k++)rgb[k]=std::max(0.f,acc[q+k]/std::max(acc[q+3+k],1.0e-7f))*scale[k];float u=((float)(outX+lx)+0.5f)/(float)fullOutW,v=((float)(outY+ly)+0.5f)/(float)fullOutH,ls[4];iris26564::lensSample(lens.empty()?nullptr:lens.data(),lensW,lensH,u,v,ls);rgb[0]*=ls[0];rgb[1]*=0.5f*(ls[1]+ls[2]);rgb[2]*=ls[3];for(int k=0;k<3;k++)out[o+k]=iris26564::floatToHalf(std::max(rgb[k],0.f));}
+    return JNI_TRUE;
+}
+
+
+/* IRIS_26564_TRUE2X_NATIVE_VGN_CHROMA_TRANSFER
+ * Preserve the proven native Sabre/VGN + 26561 camera-chroma decision without allocating a
+ * 50 MP recursive VGN surface. The native guide and true-2x carrier are both RGB16F camera RGB.
+ * A bounded two-row native correction field is derived from the guide minus the 2x2 average of
+ * the direct reconstruction, after removing 0.25/0.50/0.25 camera luma from both. Bilinear
+ * interpolation of that zero-luma correction retains true-2x luma and high-frequency residuals.
+ */
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_applyNativeVgnChromaGuide(
+        JNIEnv*e,jclass,jstring truePath,jint trueW,jint trueH,jstring guidePath,jint guideW,jint guideH){
+    if(!truePath||!guidePath||trueW<=0||trueH<=0||guideW<=0||guideH<=0||
+       trueW!=guideW*2||trueH!=guideH*2)return JNI_FALSE;
+    U tp(e,truePath),gp(e,guidePath);if(!tp.c||!gp.c)return JNI_FALSE;
+    int tfd=open(tp.c,O_RDWR),gfd=open(gp.c,O_RDONLY);if(tfd<0||gfd<0){if(tfd>=0)close(tfd);if(gfd>=0)close(gfd);return JNI_FALSE;}
+    struct stat ts{},gs{};const uint64_t tBytes=(uint64_t)trueW*(uint64_t)trueH*6ull;
+    const uint64_t gBytes=(uint64_t)guideW*(uint64_t)guideH*6ull;
+    if(fstat(tfd,&ts)!=0||fstat(gfd,&gs)!=0||(uint64_t)ts.st_size!=tBytes||(uint64_t)gs.st_size!=gBytes){close(tfd);close(gfd);return JNI_FALSE;}
+    auto readExact=[](int fd,void*dst,size_t bytes,off_t offset)->bool{
+        auto*p=(uint8_t*)dst;size_t done=0;while(done<bytes){ssize_t n=pread(fd,p+done,bytes-done,offset+(off_t)done);if(n<=0)return false;done+=(size_t)n;}return true;
+    };
+    auto writeExact=[](int fd,const void*src,size_t bytes,off_t offset)->bool{
+        const auto*p=(const uint8_t*)src;size_t done=0;while(done<bytes){ssize_t n=pwrite(fd,p+done,bytes-done,offset+(off_t)done);if(n<=0)return false;done+=(size_t)n;}return true;
+    };
+    using Corr=std::array<float,3>;
+    std::vector<uint16_t> guideRow((size_t)guideW*3),srcA((size_t)trueW*3),srcB((size_t)trueW*3),outRow((size_t)trueW*3);
+    auto loadCorrectionRow=[&](int gy,std::vector<Corr>&corr)->bool{
+        gy=iris26564::clampi(gy,0,guideH-1);corr.resize((size_t)guideW);
+        const size_t gb=(size_t)guideW*3*sizeof(uint16_t),tb=(size_t)trueW*3*sizeof(uint16_t);
+        if(!readExact(gfd,guideRow.data(),gb,(off_t)gy*(off_t)gb))return false;
+        int y0=std::min(gy*2,trueH-1),y1=std::min(y0+1,trueH-1);
+        if(!readExact(tfd,srcA.data(),tb,(off_t)y0*(off_t)tb)||!readExact(tfd,srcB.data(),tb,(off_t)y1*(off_t)tb))return false;
+        for(int gx=0;gx<guideW;gx++){
+            float g[3],a[3]={0.f,0.f,0.f};
+            for(int k=0;k<3;k++){
+                g[k]=iris26564::halfToFloat(guideRow[(size_t)gx*3+k]);
+                int x0=std::min(gx*2,trueW-1),x1=std::min(x0+1,trueW-1);
+                a[k]=0.25f*(iris26564::halfToFloat(srcA[(size_t)x0*3+k])+
+                            iris26564::halfToFloat(srcA[(size_t)x1*3+k])+
+                            iris26564::halfToFloat(srcB[(size_t)x0*3+k])+
+                            iris26564::halfToFloat(srcB[(size_t)x1*3+k]));
+                if(!std::isfinite(g[k])||!std::isfinite(a[k]))return false;
+            }
+            float gyv=0.25f*g[0]+0.50f*g[1]+0.25f*g[2],ay=0.25f*a[0]+0.50f*a[1]+0.25f*a[2];
+            for(int k=0;k<3;k++)corr[(size_t)gx][k]=(g[k]-gyv)-(a[k]-ay);
+        }
+        return true;
+    };
+    auto applyOutputRow=[&](int oy,const std::vector<Corr>&cy0,const std::vector<Corr>&cy1,float fy)->bool{
+        const size_t rowBytes=(size_t)trueW*3*sizeof(uint16_t);if(!readExact(tfd,outRow.data(),rowBytes,(off_t)oy*(off_t)rowBytes))return false;
+        for(int ox=0;ox<trueW;ox++){
+            float sx=((float)ox+0.5f)*0.5f-0.5f;sx=clampf(sx,0.f,(float)(guideW-1));int x0=(int)floorf(sx),x1=std::min(x0+1,guideW-1);float fx=sx-(float)x0;
+            for(int k=0;k<3;k++){
+                float c0=cy0[(size_t)x0][k]+(cy0[(size_t)x1][k]-cy0[(size_t)x0][k])*fx;
+                float c1=cy1[(size_t)x0][k]+(cy1[(size_t)x1][k]-cy1[(size_t)x0][k])*fx;
+                float delta=c0+(c1-c0)*fy;size_t q=(size_t)ox*3+k;float v=iris26564::halfToFloat(outRow[q]);if(!std::isfinite(v)||!std::isfinite(delta))return false;
+                outRow[q]=iris26564::floatToHalf(std::max(v+delta,0.f));
+            }
+        }
+        return writeExact(tfd,outRow.data(),rowBytes,(off_t)oy*(off_t)rowBytes);
+    };
+    std::vector<Corr> prev,curr,next;
+    bool ok=loadCorrectionRow(0,curr);if(ok)prev=curr;
+    if(ok)ok=loadCorrectionRow(std::min(1,guideH-1),next);
+    for(int gy=0;ok&&gy<guideH;gy++){
+        const int even=gy*2,odd=even+1;
+        ok=applyOutputRow(even,prev,curr,gy==0?0.f:0.75f);
+        if(ok)ok=applyOutputRow(odd,curr,next,gy+1<guideH?0.25f:0.f);
+        if(gy+1<guideH){prev=std::move(curr);curr=std::move(next);if(gy+2<guideH)ok=loadCorrectionRow(gy+2,next);else next=curr;}
+    }
+    int syncRc=ok?fsync(tfd):-1;close(tfd);close(gfd);return (ok&&syncRc==0)?JNI_TRUE:JNI_FALSE;
+}
+
+
+/* IRIS_26567_SABRE_GUIDED_CHROMA_NEUTRAL_TRUE2X
+ * Native Sabre Resolve + VGN is the sole RGB/chroma/highlight owner. The direct-CFA true2x file is
+ * read only to estimate a bounded high-frequency luminance ratio. Per-pixel accepted phase support,
+ * shadows, highlights, low-frequency guide agreement and chroma disagreement gate that scalar.
+ * Unsafe support produces factor 1.0 exactly, so no SR stage can invent an RGB ratio.
+ */
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_prepareVgnGuidedRenderTile(
+        JNIEnv*e,jclass,jstring truePath,jint trueW,jint trueH,jstring guidePath,jint guideW,jint guideH,
+        jstring phasePath,jint regionX,jint regionY,jint regionW,jint regionH,jobject outputBuffer,jlongArray detailStats){
+    if(!truePath||!guidePath||!phasePath||!outputBuffer||!detailStats||e->GetArrayLength(detailStats)<4||
+       trueW<=1||trueH<=1||guideW<=0||guideH<=0||trueW!=guideW*2||trueH!=guideH*2||
+       regionX<0||regionY<0||regionW<=0||regionH<=0||regionX>trueW-regionW||regionY>trueH-regionH)return JNI_FALSE;
+    auto*out=(uint16_t*)e->GetDirectBufferAddress(outputBuffer);jlong cap=e->GetDirectBufferCapacity(outputBuffer);
+    const jlong required=(jlong)regionW*regionH*4*(jlong)sizeof(uint16_t);if(!out||cap<required)return JNI_FALSE;
+    U tp(e,truePath),gp(e,guidePath),pp(e,phasePath);if(!tp.c||!gp.c||!pp.c)return JNI_FALSE;
+    int tfd=open(tp.c,O_RDONLY),gfd=open(gp.c,O_RDONLY),pfd=open(pp.c,O_RDONLY);
+    if(tfd<0||gfd<0||pfd<0){if(tfd>=0)close(tfd);if(gfd>=0)close(gfd);if(pfd>=0)close(pfd);return JNI_FALSE;}
+    struct stat ts{},gs{},ps{};const uint64_t tBytes=(uint64_t)trueW*(uint64_t)trueH*6ull,
+        gBytes=(uint64_t)guideW*(uint64_t)guideH*6ull,pBytes=(uint64_t)trueW*(uint64_t)trueH;
+    if(fstat(tfd,&ts)!=0||fstat(gfd,&gs)!=0||fstat(pfd,&ps)!=0||(uint64_t)ts.st_size!=tBytes||
+       (uint64_t)gs.st_size!=gBytes||(uint64_t)ps.st_size!=pBytes){close(tfd);close(gfd);close(pfd);return JNI_FALSE;}
+    auto readExact=[](int fd,void*dst,size_t bytes,off_t offset)->bool{auto*p=(uint8_t*)dst;size_t done=0;while(done<bytes){ssize_t n=pread(fd,p+done,bytes-done,offset+(off_t)done);if(n<=0)return false;done+=(size_t)n;}return true;};
+    const int ex0=std::max(0,regionX-2),ey0=std::max(0,regionY-2),ex1=std::min((int)trueW,regionX+regionW+2),ey1=std::min((int)trueH,regionY+regionH+2);
+    const int ew=ex1-ex0,eh=ey1-ey0;std::vector<uint16_t>direct((size_t)ew*eh*3);std::vector<uint8_t>support((size_t)regionW*regionH);
+    for(int y=0;y<eh;y++)if(!readExact(tfd,direct.data()+(size_t)y*ew*3,(size_t)ew*6,((off_t)(ey0+y)*trueW+ex0)*6)){close(tfd);close(gfd);close(pfd);return JNI_FALSE;}
+    for(int y=0;y<regionH;y++)if(!readExact(pfd,support.data()+(size_t)y*regionW,(size_t)regionW,(off_t)(regionY+y)*trueW+regionX)){close(tfd);close(gfd);close(pfd);return JNI_FALSE;}
+    const int gx0=std::max(0,(regionX/2)-2),gy0=std::max(0,(regionY/2)-2),gx1=std::min((int)guideW,(regionX+regionW+1)/2+2),gy1=std::min((int)guideH,(regionY+regionH+1)/2+2);
+    const int gw=gx1-gx0,gh=gy1-gy0;std::vector<uint16_t>guide((size_t)gw*gh*3);
+    for(int y=0;y<gh;y++)if(!readExact(gfd,guide.data()+(size_t)y*gw*3,(size_t)gw*6,((off_t)(gy0+y)*guideW+gx0)*6)){close(tfd);close(gfd);close(pfd);return JNI_FALSE;}
+    auto dAt=[&](int x,int y)->std::array<float,3>{x=iris26564::clampi(x,0,trueW-1);y=iris26564::clampi(y,0,trueH-1);size_t q=((size_t)(y-ey0)*ew+(x-ex0))*3;return {iris26564::halfToFloat(direct[q]),iris26564::halfToFloat(direct[q+1]),iris26564::halfToFloat(direct[q+2])};};
+    auto gAt=[&](int x,int y)->std::array<float,3>{x=iris26564::clampi(x,0,guideW-1);y=iris26564::clampi(y,0,guideH-1);size_t q=((size_t)(y-gy0)*gw+(x-gx0))*3;return {iris26564::halfToFloat(guide[q]),iris26564::halfToFloat(guide[q+1]),iris26564::halfToFloat(guide[q+2])};};
+    auto lum=[](const std::array<float,3>&v){return 0.25f*v[0]+0.50f*v[1]+0.25f*v[2];};
+    auto peak3=[](const std::array<float,3>&v){return std::max(v[0],std::max(v[1],v[2]));};
+    auto chroma=[&](const std::array<float,3>&v){float sum=std::max(v[0]+v[1]+v[2],1.0e-5f);return std::array<float,3>{v[0]/sum,v[1]/sum,v[2]/sum};};
+    auto bilGuide=[&](int ox,int oy){float sx=clampf(((float)ox+0.5f)*0.5f-0.5f,0.f,(float)(guideW-1)),sy=clampf(((float)oy+0.5f)*0.5f-0.5f,0.f,(float)(guideH-1));int x0=(int)floorf(sx),y0=(int)floorf(sy),x1=std::min(x0+1,guideW-1),y1=std::min(y0+1,guideH-1);float fx=sx-x0,fy=sy-y0;auto a=gAt(x0,y0),b=gAt(x1,y0),c=gAt(x0,y1),d=gAt(x1,y1);std::array<float,3>o{};for(int k=0;k<3;k++)o[k]=(a[k]+(b[k]-a[k])*fx)*(1.f-fy)+(c[k]+(d[k]-c[k])*fx)*fy;return o;};
+    jlong stats[4]={0,0,0,0};bool ok=true;
+    for(int ly=0;ok&&ly<regionH;ly++)for(int lx=0;lx<regionW;lx++){
+        int ox=regionX+lx,oy=regionY+ly;auto directRgb=dAt(ox,oy),guideRgb=bilGuide(ox,oy);for(int k=0;k<3;k++)if(!std::isfinite(directRgb[k])||!std::isfinite(guideRgb[k])){ok=false;break;}if(!ok)break;
+        int bx=(ox/2)*2,by=(oy/2)*2;auto b00=dAt(bx,by),b10=dAt(std::min(bx+1,(int)trueW-1),by),b01=dAt(bx,std::min(by+1,(int)trueH-1)),b11=dAt(std::min(bx+1,(int)trueW-1),std::min(by+1,(int)trueH-1));
+        float directY=std::max(lum(directRgb),0.f),lowY=std::max(0.25f*(lum(b00)+lum(b10)+lum(b01)+lum(b11)),0.f),guideY=std::max(lum(guideRgb),0.f);
+        int phaseCount=std::min(4,(int)support[(size_t)ly*regionW+lx]);float phaseGate=phaseCount>=4?1.f:(phaseCount==3?0.68f:(phaseCount==2?0.32f:0.f));
+        float signalGate=iris26564::smooth01((guideY-0.020f)/0.080f);float directPeak=peak3(directRgb),guidePeak=peak3(guideRgb);float highlightGate=1.f-iris26564::smooth01((std::max(directPeak,guidePeak)-0.72f)/0.20f);
+        auto dc=chroma(directRgb),gc=chroma(guideRgb);float cd=std::sqrt((dc[0]-gc[0])*(dc[0]-gc[0])+(dc[1]-gc[1])*(dc[1]-gc[1])+(dc[2]-gc[2])*(dc[2]-gc[2]));float chromaGate=1.f-iris26564::smooth01((cd-0.015f)/0.055f);
+        float agreement=std::fabs(std::log2((lowY+0.01f)/(guideY+0.01f)));float agreementGate=1.f-iris26564::smooth01((agreement-0.08f)/0.27f);
+        float confidence=clampf(phaseGate*signalGate*highlightGate*chromaGate*agreementGate,0.f,1.f);float rawLog=std::log2((directY+0.004f)/(lowY+0.004f));rawLog=clampf(rawLog,-0.25f,0.25f);float factor=std::exp2(rawLog*confidence);
+        size_t dst=((size_t)ly*regionW+lx)*4;for(int k=0;k<3;k++)out[dst+k]=iris26564::floatToHalf(std::max(guideRgb[k]*factor,0.f));out[dst+3]=iris26564::floatToHalf(1.f);
+        stats[0]++;if(confidence>0.02f)stats[1]++;if(highlightGate<=0.001f)stats[2]++;if(chromaGate<=0.001f||agreementGate<=0.001f)stats[3]++;
+    }
+    close(tfd);close(gfd);close(pfd);if(ok){jlong previous[4];e->GetLongArrayRegion(detailStats,0,4,previous);if(e->ExceptionCheck())return JNI_FALSE;for(int k=0;k<4;k++)previous[k]+=stats[k];e->SetLongArrayRegion(detailStats,0,4,previous);if(e->ExceptionCheck())return JNI_FALSE;}return ok?JNI_TRUE:JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_writeRenderTileInterior(
+        JNIEnv*e,jclass,jstring outputPath,jint fullW,jint fullH,jobject regionBuffer,jint regionX,jint regionY,jint regionW,jint regionH,
+        jint interiorX,jint interiorY,jint interiorW,jint interiorH){
+    if(!outputPath||!regionBuffer||fullW<=0||fullH<=0||regionX<0||regionY<0||regionW<=0||regionH<=0||
+       regionX>fullW-regionW||regionY>fullH-regionH||interiorX<regionX||interiorY<regionY||interiorW<=0||interiorH<=0||
+       interiorX>regionX+regionW-interiorW||interiorY>regionY+regionH-interiorH||interiorX>fullW-interiorW||interiorY>fullH-interiorH)return JNI_FALSE;
+    auto*rgba=(const uint16_t*)e->GetDirectBufferAddress(regionBuffer);jlong cap=e->GetDirectBufferCapacity(regionBuffer);
+    if(!rgba||cap<(jlong)regionW*regionH*4*(jlong)sizeof(uint16_t))return JNI_FALSE;U op(e,outputPath);if(!op.c)return JNI_FALSE;
+    int fd=open(op.c,O_RDWR);if(fd<0)return JNI_FALSE;struct stat st{};const uint64_t expected=(uint64_t)fullW*(uint64_t)fullH*6ull;
+    if(fstat(fd,&st)!=0||(uint64_t)st.st_size!=expected){close(fd);return JNI_FALSE;}std::vector<uint16_t>row((size_t)interiorW*3);bool ok=true;
+    const int localX=interiorX-regionX,localY=interiorY-regionY;
+    for(int y=0;ok&&y<interiorH;y++){
+        const uint16_t*src=rgba+((size_t)(localY+y)*regionW+localX)*4;for(int x=0;x<interiorW;x++)for(int k=0;k<3;k++)row[(size_t)x*3+k]=src[(size_t)x*4+k];
+        const off_t off=((off_t)(interiorY+y)*(off_t)fullW+(off_t)interiorX)*6;const uint8_t*p=(const uint8_t*)row.data();size_t bytes=row.size()*sizeof(uint16_t),done=0;
+        while(done<bytes){ssize_t n=pwrite(fd,p+done,bytes-done,off+(off_t)done);if(n<=0){ok=false;break;}done+=(size_t)n;}
+    }
+    close(fd);return ok?JNI_TRUE:JNI_FALSE;
+}
+
+
+/* IRIS_26564_TRUE2X_FINAL_RENDER_OWNER
+ * Bounded true-2x final renderer. Scene pixels come only from the direct-CFA RGB16F render
+ * derivative. A small source region is read per output tile, then the exact proven 26563 profile
+ * color -> adaptive appearance -> display exposure -> optional Iris tone -> 26559 render math is
+ * evaluated at 2x. Final crop/rotation/mirror follows the already-proven streaming-SR geometry.
+ *
+ * The 1x Android bitmap is never sampled for scene color. It provides only the exact final native
+ * output dimensions; Java separately retains it as UHDR/JPEG-R metadata authority. Optional Jin
+ * receives the exact retained 512 residual/reference arrays from the one already-proven inference.
+ */
+namespace iris26564render {
+struct Vec3 { float r,g,b; };
+inline Vec3 add(Vec3 a,Vec3 b){return {a.r+b.r,a.g+b.g,a.b+b.b};}
+inline Vec3 sub(Vec3 a,Vec3 b){return {a.r-b.r,a.g-b.g,a.b-b.b};}
+inline Vec3 mul(Vec3 a,float s){return {a.r*s,a.g*s,a.b*s};}
+inline Vec3 mix3(Vec3 a,Vec3 b,float t){return add(a,mul(sub(b,a),t));}
+inline float luma(Vec3 c){return 0.22897456f*c.r+0.69173852f*c.g+0.07928691f*c.b;}
+inline float peak(Vec3 c){return std::max(c.r,std::max(c.g,c.b));}
+inline float length3(Vec3 c){return std::sqrt(c.r*c.r+c.g*c.g+c.b*c.b);}
+inline float smoothstep(float a,float b,float x){float t=clampf((x-a)/std::max(b-a,1.0e-12f),0.f,1.f);return t*t*(3.f-2.f*t);}
+inline Vec3 clampNonnegative(Vec3 c){return {std::max(c.r,0.f),std::max(c.g,0.f),std::max(c.b,0.f)};}
+inline float componentGainLimit(float y,float c){
+    if(c>1.0e-7f)return std::max(1.f,(1.f-y)/c);
+    if(c<-1.0e-7f)return std::max(1.f,(0.f-y)/c);
+    return 4.f;
+}
+struct SourceRegion {
+    int x0=0,y0=0,w=0,h=0,fullW=0,fullH=0;
+    std::vector<uint16_t> rgb;
+    bool contains(int x,int y)const{return x>=x0&&x<x0+w&&y>=y0&&y<y0+h;}
+    bool cameraAt(int x,int y,Vec3*out)const{
+        x=std::max(0,std::min(fullW-1,x));y=std::max(0,std::min(fullH-1,y));
+        if(!contains(x,y)||!out)return false;
+        size_t q=((size_t)(y-y0)*w+(x-x0))*3;
+        float r=iris26564::halfToFloat(rgb[q]),g=iris26564::halfToFloat(rgb[q+1]),b=iris26564::halfToFloat(rgb[q+2]);
+        if(!std::isfinite(r)||!std::isfinite(g)||!std::isfinite(b))return false;
+        *out={std::max(r,0.f),std::max(g,0.f),std::max(b,0.f)};return true;
+    }
+};
+struct Watermark {
+    int w=0,h=0;
+    std::vector<uint8_t> rgba;
+    bool enabled()const{return w>0&&h>0&&rgba.size()==(size_t)w*h*4;}
+};
+struct Jin {
+    int w=0,h=0;
+    std::vector<float> residual;
+    std::vector<jint> guide;
+    std::vector<float> guideP3;
+    bool enabled()const{return w>1&&h>1&&residual.size()==(size_t)w*h*3&&guide.size()==(size_t)w*h&&guideP3.size()==(size_t)w*h*3;}
+};
+struct Params {
+    int trueW=0,trueH=0,rawW=0,rawH=0,cropW=0,cropH=0,rotation=0;
+    bool mirror=false;
+    float residualZoom=1.f,displayGain=1.f,exposureEv=0.f,shadows=0.f,contrast=0.f,sceneWhite=1.f;
+    float sensorToProfile[9]{};
+    float profileToDisplay[9]{};
+};
+inline Vec3 mat(const float*m,Vec3 v){
+    return {m[0]*v.r+m[1]*v.g+m[2]*v.b,
+            m[3]*v.r+m[4]*v.g+m[5]*v.b,
+            m[6]*v.r+m[7]*v.g+m[8]*v.b};
+}
+inline bool profileColor(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){
+    Vec3 camera;if(!s.cameraAt(x,y,&camera))return false;
+    Vec3 profile=mat(p.sensorToProfile,camera);Vec3 linear=mat(p.profileToDisplay,profile);
+    float floor=std::min(linear.r,std::min(linear.g,linear.b));if(floor<0.f){linear.r-=floor;linear.g-=floor;linear.b-=floor;}
+    *out=clampNonnegative(linear);return std::isfinite(out->r)&&std::isfinite(out->g)&&std::isfinite(out->b);
+}
+inline bool adaptiveAppearance(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){
+    Vec3 center;if(!profileColor(s,p,x,y,&center))return false;
+    float cy=luma(center);Vec3 cc={center.r-cy,center.g-cy,center.b-cy};float cm=length3(cc);float relative=cm/std::max(cy,0.08f);
+    const int dx[4]={-1,1,0,0},dy[4]={0,0,-1,1};Vec3 sum=cc;float magSum=cm,maxYDelta=0.f;
+    for(int i=0;i<4;i++){Vec3 n;if(!profileColor(s,p,x+dx[i],y+dy[i],&n))return false;float ny=luma(n);Vec3 nc={n.r-ny,n.g-ny,n.b-ny};sum=add(sum,nc);magSum+=length3(nc);maxYDelta=std::max(maxYDelta,std::fabs(ny-cy));}
+    Vec3 mean=mul(sum,0.2f);float meanMag=magSum*0.2f;float coherence=length3(mean)/std::max(meanMag,1.0e-6f);float disagreement=length3(sub(cc,mean));
+    float neutral=smoothstep(0.0035f,0.018f,cm);float rolloff=1.f-smoothstep(0.08f,0.45f,relative);float dg=std::max(p.displayGain,1.0e-6f);
+    float projectedY=cy*dg,projectedPeak=peak(center)*dg;float shadow=smoothstep(0.015f,0.075f,projectedY);float high=1.f-smoothstep(0.72f,0.98f,projectedPeak);
+    float coh=smoothstep(0.45f,0.82f,coherence);float agree=1.f-smoothstep(0.018f,0.085f,disagreement);float edge=1.f-smoothstep(0.025f,0.11f,maxYDelta*dg);
+    float requested=1.f+0.22f*neutral*rolloff*shadow*high*coh*agree*edge;float limit=4.f;float inPeak=peak(center);
+    if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+    float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+}
+inline Vec3 tone(Vec3 rgb,const Params&p){
+    rgb=mul(clampNonnegative(rgb),std::exp2(p.exposureEv));
+    if(std::fabs(p.shadows)>=0.0001f){float y=luma(rgb),mask=1.f-smoothstep(0.08f,0.55f,y),target=y;if(p.shadows<0.f)target=y+(-p.shadows)*0.08f*mask*(1.f-clampf(y,0.f,1.f));else target=y*(1.f-0.75f*p.shadows*mask);rgb=y<=1.0e-7f?Vec3{std::max(target,0.f),std::max(target,0.f),std::max(target,0.f)}:mul(clampNonnegative(rgb),std::max(target,0.f)/y);}
+    if(std::fabs(p.contrast)>=0.0001f){float y=luma(rgb);if(y>1.0e-7f){const float pivot=0.18f;float slope=1.f+0.25f*p.contrast;float target=pivot*std::exp2(std::log2(std::max(y/pivot,1.0e-6f))*slope);rgb=mul(clampNonnegative(rgb),std::max(target,0.f)/y);}}
+    return clampNonnegative(rgb);
+}
+inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
+inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,Vec3*out){
+    x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+    if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAt(s,p,ix,iy,out);}
+    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,p.trueW-1),y1=std::min(y0+1,p.trueH-1);float fx=x-x0,fy=y-y0;Vec3 a,b,c,d;
+    if(!preRenderAt(s,p,x0,y0,&a)||!preRenderAt(s,p,x1,y0,&b)||!preRenderAt(s,p,x0,y1,&c)||!preRenderAt(s,p,x1,y1,&d))return false;
+    *out=mix3(mix3(a,b,fx),mix3(c,d,fx),fy);return true;
+}
+inline Vec3 renderHeadroom(Vec3 rgb,const Params&p){
+    rgb=clampNonnegative(rgb);float y=std::max(luma(rgb),0.f),pk=peak(rgb),guide=std::max(y,pk);if(guide>1.0e-7f&&guide>0.50f){float white=std::max(p.sceneWhite,0.55f);float x=clampf((guide-0.50f)/std::max(white-0.50f,1.0e-6f),0.f,1.f);float shaped=std::log(1.f+6.f*x)/std::log(7.f);float mapped=0.50f+(1.25f-0.50f)*shaped;rgb=mul(rgb,mapped/guide);}rgb=mul(rgb,0.80f);float pk2=peak(rgb);if(pk2>1.f)rgb=mul(rgb,1.f/std::max(pk2,1.0e-6f));return clampNonnegative(rgb);
+}
+struct SrgbLut {std::array<float,16385>v{};SrgbLut(){for(size_t i=0;i<v.size();i++){float x=(float)i/(float)(v.size()-1);v[i]=x<=0.0031308f?12.92f*x:1.055f*std::pow(x,1.f/2.4f)-0.055f;}}float at(float x)const{x=clampf(x,0.f,1.f);float q=x*(float)(v.size()-1);int i=(int)q;int j=std::min(i+1,(int)v.size()-1);return v[(size_t)i]+(v[(size_t)j]-v[(size_t)i])*(q-i);}};
+inline void true2xFinalToUnrotated(float x,float y,const Params&p,float*outX,float*outY){
+    switch(p.rotation){
+        case 90: {
+            float xx=x;if(p.mirror)xx=(float)p.cropH-xx;
+            *outX=y;*outY=(float)p.rawH-xx;return;
+        }
+        case 180: {
+            float yy=y;if(p.mirror)yy=(float)p.rawH-yy;
+            *outX=(float)p.rawW-x;*outY=(float)p.rawH-yy;return;
+        }
+        case 270: {
+            float xx=x+(float)(p.rawH-p.cropH);if(p.mirror)xx=(float)p.cropH-xx;
+            *outX=(float)p.rawW-y;*outY=xx;return;
+        }
+        default: {
+            float yy=y+(float)(p.rawH-p.cropH);if(p.mirror)yy=(float)p.rawH-yy;
+            *outX=x;*outY=yy;return;
+        }
+    }
+}
+inline void outputToSource(const Params&p,int ox,int oy,float*outX,float*outY){
+    float bx=((float)ox+0.5f)*0.5f-0.5f,by=((float)oy+0.5f)*0.5f-0.5f,ux=0.f,uy=0.f;
+    true2xFinalToUnrotated(bx,by,p,&ux,&uy);
+    float cx=((float)p.rawW-1.f)*0.5f,cy=((float)p.rawH-1.f)*0.5f;
+    float sx=cx+(ux-cx)/p.residualZoom,sy=cy+(uy-cy)/p.residualZoom;
+    *outX=clampf(2.f*(sx+0.5f)-0.5f,0.f,(float)(p.trueW-1));
+    *outY=clampf(2.f*(sy+0.5f)-0.5f,0.f,(float)(p.trueH-1));
+}
+inline bool readRegion(int fd,const Params&p,int ox0,int oy0,int ox1,int oy1,SourceRegion*out){
+    float minx=1.0e30f,miny=1.0e30f,maxx=-1.0e30f,maxy=-1.0e30f;const int xs[2]={ox0,ox1},ys[2]={oy0,oy1};for(int yy:ys)for(int xx:xs){float x,y;outputToSource(p,xx,yy,&x,&y);minx=std::min(minx,x);maxx=std::max(maxx,x);miny=std::min(miny,y);maxy=std::max(maxy,y);}
+    int x0=std::max(0,(int)std::floor(minx)-3),x1=std::min(p.trueW-1,(int)std::ceil(maxx)+3),y0=std::max(0,(int)std::floor(miny)-3),y1=std::min(p.trueH-1,(int)std::ceil(maxy)+3);if(x1<x0||y1<y0)return false;
+    out->x0=x0;out->y0=y0;out->w=x1-x0+1;out->h=y1-y0+1;out->fullW=p.trueW;out->fullH=p.trueH;out->rgb.resize((size_t)out->w*out->h*3);size_t rowBytes=(size_t)out->w*6;
+    for(int y=0;y<out->h;y++){off_t off=((off_t)(out->y0+y)*(off_t)p.trueW+(off_t)out->x0)*6;uint8_t*dst=(uint8_t*)out->rgb.data()+(size_t)y*rowBytes;size_t done=0;while(done<rowBytes){ssize_t n=pread(fd,dst+done,rowBytes-done,off+(off_t)done);if(n<=0)return false;done+=(size_t)n;}}
+    return true;
+}
+inline Vec3 sampleWatermark(const Watermark&w,float u,float v){
+    if(!w.enabled())return {0.f,0.f,0.f};u=clampf(u,0.f,1.f);v=clampf(v,0.f,1.f);float x=u*(float)w.w-0.5f,y=v*(float)w.h-0.5f;x=clampf(x,0.f,(float)(w.w-1));y=clampf(y,0.f,(float)(w.h-1));int x0=(int)floorf(x),y0=(int)floorf(y),x1=std::min(x0+1,w.w-1),y1=std::min(y0+1,w.h-1);float fx=x-x0,fy=y-y0;auto p=[&](int xx,int yy,int c){return (float)w.rgba[((size_t)yy*w.w+xx)*4+c]/255.f;};Vec3 a{},b{};for(int c=0;c<3;c++){float r0=p(x0,y0,c)+(p(x1,y0,c)-p(x0,y0,c))*fx,r1=p(x0,y1,c)+(p(x1,y1,c)-p(x0,y1,c))*fx;float z=r0+(r1-r0)*fy;if(c==0)a.r=z;else if(c==1)a.g=z;else a.b=z;}auto p3=displayP3Lut().convertEncoded(a.r,a.g,a.b);return {p3[0],p3[1],p3[2]};
+}
+inline float sampleWatermarkAlpha(const Watermark&w,float u,float v){
+    if(!w.enabled())return 0.f;u=clampf(u,0.f,1.f);v=clampf(v,0.f,1.f);float x=clampf(u*(float)w.w-0.5f,0.f,(float)(w.w-1)),y=clampf(v*(float)w.h-0.5f,0.f,(float)(w.h-1));int x0=(int)floorf(x),y0=(int)floorf(y),x1=std::min(x0+1,w.w-1),y1=std::min(y0+1,w.h-1);float fx=x-x0,fy=y-y0;auto a=[&](int xx,int yy){return (float)w.rgba[((size_t)yy*w.w+xx)*4+3]/255.f;};float r0=a(x0,y0)+(a(x1,y0)-a(x0,y0))*fx,r1=a(x0,y1)+(a(x1,y1)-a(x0,y1))*fx;return r0+(r1-r0)*fy;
+}
+inline bool watermarkUv(const Params&p,const Watermark&w,int ox,int oy,float*u,float*v){
+    if(!w.enabled())return false;float x=(float)ox,y=(float)oy,tw=(float)p.trueW,th=(float)p.trueH,cw=(float)p.cropW*2.f,ch=(float)p.cropH*2.f,crx=0.f,cry=0.f;
+    switch(p.rotation){case 270:x+=(th-ch);crx=(x-(th-ch))/tw;cry=(y-cw)/th;break;case 180:crx=x/tw;cry=(y-ch)/th;break;case 90:crx=x/tw;cry=(y-tw)/th;break;default:y+=(th-ch);crx=x/tw;cry=(y-th)/th;break;}
+    crx*=tw/th;crx/=((float)w.w/(float)w.h);crx*=1.025f;crx*=15.f;cry=(cry+1.f/15.f)*15.f;if(crx<0.f||cry<0.f)return false;*u=crx;*v=cry;return true;
+}
+inline bool renderBase(const SourceRegion&s,const Params&p,const Watermark&w,const SrgbLut&lut,int ox,int oy,float gainMax,uint8_t*out,uint8_t*gainOut){
+    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);Vec3 hdr;if(!samplePreRender(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr,p);
+    if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f);float hdrY=std::max(luma(clampNonnegative(hdr)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);float ratio=clampf((hdrY+off)/(sdrY+off),1.f,safeMax);float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
+    float rr=lut.at(sdr.r),gg=lut.at(sdr.g),bb=lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
+    out[0]=(uint8_t)std::lround(clampf(rr,0.f,1.f)*255.f);out[1]=(uint8_t)std::lround(clampf(gg,0.f,1.f)*255.f);out[2]=(uint8_t)std::lround(clampf(bb,0.f,1.f)*255.f);return true;
+}
+inline float guideRgb(const Jin&j,int x,int y,int c){return j.guideP3[((size_t)y*j.w+x)*3+c];}
+inline float guideDistance2ToNative(const Jin&j,int x,int y,const float native[3]){float d0=native[0]-guideRgb(j,x,y,0),d1=native[1]-guideRgb(j,x,y,1),d2=native[2]-guideRgb(j,x,y,2);return (d0*d0+d1*d1+d2*d2)/3.f;}
+inline float guidePairDistance(const Jin&j,int ax,int ay,int bx,int by){float d0=guideRgb(j,ax,ay,0)-guideRgb(j,bx,by,0),d1=guideRgb(j,ax,ay,1)-guideRgb(j,bx,by,1),d2=guideRgb(j,ax,ay,2)-guideRgb(j,bx,by,2);return std::sqrt((d0*d0+d1*d1+d2*d2)/3.f);}
+inline void applyJinPixel(const Jin&j,const uint8_t*center,const uint8_t*right,const uint8_t*down,int ox,int oy,int outW,int outH,uint8_t*out){
+    if(!j.enabled()){out[0]=center[0];out[1]=center[1];out[2]=center[2];return;}float fy=((float)oy+0.5f)*(float)j.h/(float)outH-0.5f;int y0=std::max(0,std::min(j.h-1,(int)floorf(fy))),y1=std::min(y0+1,j.h-1);float ty=clampf(fy-y0,0.f,1.f);float fx=((float)ox+0.5f)*(float)j.w/(float)outW-0.5f;int x0=std::max(0,std::min(j.w-1,(int)floorf(fx))),x1=std::min(x0+1,j.w-1);float tx=clampf(fx-x0,0.f,1.f);float native[3]={center[0]/255.f,center[1]/255.f,center[2]/255.f};const float sw[4]={(1.f-tx)*(1.f-ty),tx*(1.f-ty),(1.f-tx)*ty,tx*ty};const int gx[4]={x0,x1,x0,x1},gy[4]={y0,y0,y1,y1};float bil[3]={0,0,0};for(int k=0;k<4;k++){size_t b=((size_t)gy[k]*j.w+gx[k])*3;for(int c=0;c<3;c++)bil[c]+=j.residual[b+c]*sw[k];}
+    auto yl=[](const uint8_t*q){return (0.22897456f*q[0]+0.69173852f*q[1]+0.07928691f*q[2])/255.f;};float centerL=yl(center),nativeEdge=0.f;if(right)nativeEdge=std::max(nativeEdge,std::fabs(centerL-yl(right)));if(down)nativeEdge=std::max(nativeEdge,std::fabs(centerL-yl(down)));float guideSpan=0.f;for(int a=0;a<4;a++)for(int b=a+1;b<4;b++)guideSpan=std::max(guideSpan,guidePairDistance(j,gx[a],gy[a],gx[b],gy[b]));float nativeGate=smoothstep(0.025f,0.120f,nativeEdge),guideGate=smoothstep(0.060f,0.200f,guideSpan),edgeGate=std::max(nativeGate,guideGate);float reduced[3]={bil[0],bil[1],bil[2]};if(edgeGate>0.0001f){int cx=std::max(0,std::min(j.w-1,(int)lroundf(fx))),cy=std::max(0,std::min(j.h-1,(int)lroundf(fy)));float sum[3]={0,0,0},ws=0.f;for(int yy=std::max(0,cy-1);yy<=std::min(j.h-1,cy+1);yy++)for(int xx=std::max(0,cx-1);xx<=std::min(j.w-1,cx+1);xx++){float dx=(float)xx-fx,dy=(float)yy-fy,sp=1.f/(1.f+dx*dx+dy*dy),compat=1.f/(1.f+80.f*guideDistance2ToNative(j,xx,yy,native)),ww=sp*compat;size_t b=((size_t)yy*j.w+xx)*3;for(int c=0;c<3;c++)sum[c]+=j.residual[b+c]*ww;ws+=ww;}if(ws>1.0e-8f)for(int c=0;c<3;c++){float mean=sum[c]/ws,before=bil[c],after=before;if(before!=0.f){if(before*mean<=0.f&&std::fabs(mean)<std::fabs(before))after=0.f;else if(before*mean>0.f&&std::fabs(mean)<std::fabs(before))after=mean;}reduced[c]=after;}}
+    for(int c=0;c<3;c++){float rr=bil[c]+(reduced[c]-bil[c])*edgeGate;if(std::fabs(rr)>std::fabs(bil[c])+1.0e-6f)rr=bil[c];out[c]=(uint8_t)lroundf(clampf(native[c]+rr,0.f,1.f)*255.f);}
+}
+/* IRIS_26568_TRUE2X_STREAMING_JPEG
+ * 26567 rendered independent 256x256 tiles to full-frame RGB8/gain scratch files, fsynced
+ * them, then reread every byte into libjpeg. Pixel math has no cross-pixel accumulation; Jin
+ * only needs the already-rendered right/down neighbors. Keep exact renderBase/applyJinPixel math
+ * and replace only storage order with full-width bands plus one down-row halo.
+ */
+inline bool renderStreamingBand(int sourceFd,float gainMax,const Params&p,const Watermark&w,const Jin&j,const SrgbLut&lut,int outW,int outH,int top,int coreH,int workers,bool generateGain,std::vector<uint8_t>*rgbRows,std::vector<uint8_t>*gainRows){
+    if(!rgbRows||coreH<=0||outW<=0)return false;const int extH=coreH+(top+coreH<outH?1:0);SourceRegion src;if(!readRegion(sourceFd,p,0,top,outW-1,top+extH-1,&src))return false;std::vector<uint8_t>base((size_t)outW*extH*3),gainBase;if(generateGain)gainBase.resize((size_t)outW*extH);std::atomic<int>nextBaseRow{0};std::atomic<bool>ok{true};
+    auto baseWork=[&](){while(ok.load(std::memory_order_relaxed)){int y=nextBaseRow.fetch_add(1);if(y>=extH)break;for(int x=0;x<outW;x++){uint8_t*g=generateGain?&gainBase[(size_t)y*outW+x]:nullptr;if(!renderBase(src,p,w,lut,x,top+y,gainMax,&base[((size_t)y*outW+x)*3],g)){ok.store(false,std::memory_order_relaxed);break;}}}};std::vector<std::thread>threads;threads.reserve((size_t)workers);for(int i=0;i<workers;i++)threads.emplace_back(baseWork);for(auto&t:threads)t.join();if(!ok.load(std::memory_order_relaxed))return false;
+    rgbRows->resize((size_t)outW*coreH*3);if(generateGain){if(!gainRows)return false;gainRows->resize((size_t)outW*coreH);}std::atomic<int>nextOutputRow{0};threads.clear();auto outputWork=[&](){while(ok.load(std::memory_order_relaxed)){int y=nextOutputRow.fetch_add(1);if(y>=coreH)break;for(int x=0;x<outW;x++){const uint8_t*c=&base[((size_t)y*outW+x)*3];const uint8_t*r=(x+1<outW)?&base[((size_t)y*outW+x+1)*3]:nullptr;const uint8_t*d=(top+y+1<outH)?&base[((size_t)(y+1)*outW+x)*3]:nullptr;applyJinPixel(j,c,r,d,x,top+y,outW,outH,&(*rgbRows)[((size_t)y*outW+x)*3]);if(generateGain)(*gainRows)[(size_t)y*outW+x]=gainBase[(size_t)y*outW+x];}}};for(int i=0;i<workers;i++)threads.emplace_back(outputWork);for(auto&t:threads)t.join();return ok.load(std::memory_order_relaxed);
+}
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative(
+        JNIEnv*e,jclass,jobject bitmap,jstring renderPath,jint trueW,jint trueH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,
+        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloat exposureEv,jfloat shadows,jfloat contrast,jobject watermarkBitmap,
+        jfloatArray jinResidual,jintArray jinReference,jint jinW,jint jinH,jstring gainPath,jfloat gainMaxRatio,jstring path,jint quality){
+    using namespace iris26564render;AndroidBitmapInfo info{};if(!bitmap||!renderPath||!path||trueW<=0||trueH<=0||rawW<=0||rawH<=0||cropW<=0||cropH<=0||trueW!=rawW*2||trueH!=rawH*2||cropW>rawW||cropH>rawH||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;
+    int expectedNativeW=(rotation==90||rotation==270)?cropH:rawW,expectedNativeH=(rotation==90||rotation==270)?rawW:cropH;if((int)info.width!=expectedNativeW||(int)info.height!=expectedNativeH)return JNI_FALSE;
+    Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.sceneWhite=std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
+    if(!sensorToProfile||!profileToDisplay||e->GetArrayLength(sensorToProfile)!=9||e->GetArrayLength(profileToDisplay)!=9)return JNI_FALSE;e->GetFloatArrayRegion(sensorToProfile,0,9,p.sensorToProfile);e->GetFloatArrayRegion(profileToDisplay,0,9,p.profileToDisplay);if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.sensorToProfile)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.profileToDisplay)if(!std::isfinite(v))return JNI_FALSE;if(!std::isfinite(p.displayGain)||p.displayGain<=0.f||!std::isfinite(p.exposureEv)||!std::isfinite(p.shadows)||!std::isfinite(p.contrast)||!std::isfinite(p.residualZoom))return JNI_FALSE;
+    U rp(e,renderPath),gp(e,gainPath),op(e,path);if(!rp.c||!op.c)return JNI_FALSE;const bool generateGain=gp.c!=nullptr;if(generateGain&&(!std::isfinite((float)gainMaxRatio)||gainMaxRatio<=1.f))return JNI_FALSE;int sourceFd=open(rp.c,O_RDONLY);if(sourceFd<0)return JNI_FALSE;struct stat st{};uint64_t expected=(uint64_t)trueW*(uint64_t)trueH*6ull;if(fstat(sourceFd,&st)!=0||(uint64_t)st.st_size!=expected){close(sourceFd);return JNI_FALSE;}
+    Watermark water{};if(watermarkBitmap){AndroidBitmapInfo wi{};if(AndroidBitmap_getInfo(e,watermarkBitmap,&wi)!=ANDROID_BITMAP_RESULT_SUCCESS||wi.format!=ANDROID_BITMAP_FORMAT_RGBA_8888||wi.width==0||wi.height==0){close(sourceFd);return JNI_FALSE;}void*wp=nullptr;if(AndroidBitmap_lockPixels(e,watermarkBitmap,&wp)!=ANDROID_BITMAP_RESULT_SUCCESS||!wp){close(sourceFd);return JNI_FALSE;}water.w=(int)wi.width;water.h=(int)wi.height;water.rgba.resize((size_t)water.w*water.h*4);for(int y=0;y<water.h;y++)std::memcpy(water.rgba.data()+(size_t)y*water.w*4,(const uint8_t*)wp+(size_t)y*wi.stride,(size_t)water.w*4);AndroidBitmap_unlockPixels(e,watermarkBitmap);}
+    Jin jin{};if(jinResidual||jinReference||jinW||jinH){if(!jinResidual||!jinReference||jinW<=1||jinH<=1||e->GetArrayLength(jinResidual)!=(jsize)((jlong)jinW*jinH*3)||e->GetArrayLength(jinReference)!=(jsize)((jlong)jinW*jinH)){close(sourceFd);return JNI_FALSE;}jin.w=jinW;jin.h=jinH;jin.residual.resize((size_t)jinW*jinH*3);jin.guide.resize((size_t)jinW*jinH);e->GetFloatArrayRegion(jinResidual,0,(jsize)jin.residual.size(),jin.residual.data());e->GetIntArrayRegion(jinReference,0,(jsize)jin.guide.size(),jin.guide.data());if(e->ExceptionCheck()){close(sourceFd);return JNI_FALSE;}for(float v:jin.residual)if(!std::isfinite(v)){close(sourceFd);return JNI_FALSE;}const auto&p3=displayP3Lut();jin.guideP3.resize((size_t)jinW*jinH*3);for(int i=0;i<jinW*jinH;i++){jint argb=jin.guide[(size_t)i];float sr=(float)((argb>>16)&255)/255.f,sg=(float)((argb>>8)&255)/255.f,sb=(float)(argb&255)/255.f;auto baseP3=p3.convertEncoded(sr,sg,sb);auto outP3=p3.convertEncoded(clampf(sr+jin.residual[(size_t)i*3],0.f,1.f),clampf(sg+jin.residual[(size_t)i*3+1],0.f,1.f),clampf(sb+jin.residual[(size_t)i*3+2],0.f,1.f));for(int c=0;c<3;c++){jin.guideP3[(size_t)i*3+c]=baseP3[(size_t)c];jin.residual[(size_t)i*3+c]=outP3[(size_t)c]-baseP3[(size_t)c];}}}
+    int outW=(int)info.width*2,outH=(int)info.height*2;
+    /* IRIS_26568_TRUE2X_DIRECT_JPEG_SCANLINES
+     * Preserve exact 26567 final-render math, 4:4:4 JPEG parameters, Display-P3 ICC and 1:1
+     * gain samples, but stream full-width bands directly. Ephemeral RGB8/gain scratch disappears.
+     */
+    unlink(op.c);if(generateGain)unlink(gp.c);FILE*baseOut=fopen(op.c,"wb");if(!baseOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_base_jpeg errno=%d",errno);close(sourceFd);return JNI_FALSE;}FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gp.c,"wb");if(!gainOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_gain_jpeg errno=%d",errno);fclose(baseOut);unlink(op.c);close(sourceFd);return JNI_FALSE;}}
+    jpeg_compress_struct baseC{};jpeg_error_mgr baseErr{};baseC.err=jpeg_std_error(&baseErr);jpeg_create_compress(&baseC);jpeg_stdio_dest(&baseC,baseOut);baseC.image_width=outW;baseC.image_height=outH;baseC.input_components=3;baseC.in_color_space=JCS_RGB;jpeg_set_defaults(&baseC);jpeg_set_quality(&baseC,std::clamp((int)quality,1,100),TRUE);for(int k=0;k<baseC.num_components;k++){baseC.comp_info[k].h_samp_factor=1;baseC.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&baseC,TRUE);bool streamed=writeDisplayP3Icc(&baseC);
+    jpeg_compress_struct gainC{};jpeg_error_mgr gainErr{};bool gainCreated=false;if(generateGain){gainC.err=jpeg_std_error(&gainErr);jpeg_create_compress(&gainC);gainCreated=true;jpeg_stdio_dest(&gainC,gainOut);gainC.image_width=outW;gainC.image_height=outH;gainC.input_components=1;gainC.in_color_space=JCS_GRAYSCALE;jpeg_set_defaults(&gainC);jpeg_set_quality(&gainC,95,TRUE);jpeg_start_compress(&gainC,TRUE);}
+    SrgbLut lut;constexpr int bandRows=128;unsigned hc=std::thread::hardware_concurrency();int workers=std::max(1,std::min(4,(int)(hc?hc:2)));std::vector<uint8_t>rgbRows,gainRows;int bands=0;for(int top=0;streamed&&top<outH;top+=bandRows){int h=std::min(bandRows,outH-top);if(!renderStreamingBand(sourceFd,(float)gainMaxRatio,p,water,jin,lut,outW,outH,top,h,workers,generateGain,&rgbRows,&gainRows)){streamed=false;break;}for(int y=0;streamed&&y<h;y++){JSAMPROW rpRow=&rgbRows[(size_t)y*outW*3];if(jpeg_write_scanlines(&baseC,&rpRow,1)!=1){streamed=false;break;}if(generateGain){JSAMPROW gpRow=&gainRows[(size_t)y*outW];if(jpeg_write_scanlines(&gainC,&gpRow,1)!=1){streamed=false;break;}}}bands++;}
+    if(streamed&&baseC.next_scanline==baseC.image_height&&(!generateGain||gainC.next_scanline==gainC.image_height)){jpeg_finish_compress(&baseC);if(generateGain)jpeg_finish_compress(&gainC);}else{streamed=false;jpeg_abort_compress(&baseC);if(gainCreated)jpeg_abort_compress(&gainC);}jpeg_destroy_compress(&baseC);if(gainCreated)jpeg_destroy_compress(&gainC);int baseFlush=fflush(baseOut),baseClose=fclose(baseOut),gainFlush=0,gainClose=0;if(gainOut){gainFlush=fflush(gainOut);gainClose=fclose(gainOut);}close(sourceFd);
+    bool baseEncoded=streamed&&baseFlush==0&&baseClose==0;bool gainEncoded=!generateGain||(streamed&&gainFlush==0&&gainClose==0);if(!baseEncoded)unlink(op.c);if(generateGain&&!gainEncoded)unlink(gp.c);__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26568_TRUE2X_FINAL_STREAM rendered=%d baseEncoded=%d gainEncoded=%d gain1to1=%d source=%dx%d output=%dx%d workers=%d bands=%d jin=%d watermark=%d scratch=NONE",streamed?1:0,baseEncoded?1:0,gainEncoded?1:0,generateGain?1:0,(int)trueW,(int)trueH,outW,outH,workers,bands,jin.enabled()?1:0,water.enabled()?1:0);
+    /* A valid 50MP base is authoritative. Gain/JPEG-R auxiliary failure is handled by Java by
+     * promoting that exact P3 base to SDR; it must never report base failure and trigger 12MP. */
+    return baseEncoded?JNI_TRUE:JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeSuperResNative(
+        JNIEnv*e,jclass,jobject bitmap,jstring detailPath,jint detailW,jint detailH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,jstring path,jint quality){
+    AndroidBitmapInfo info{};if(!bitmap||!detailPath||!path||detailW<=0||detailH<=0||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;
+    U ud(e,detailPath);if(!ud.c)return JNI_FALSE;int fd=open(ud.c,O_RDONLY);if(fd<0)return JNI_FALSE;struct stat st{};size_t expected=(size_t)detailW*(size_t)detailH;
+    if(fstat(fd,&st)!=0||(size_t)st.st_size!=expected){close(fd);return JNI_FALSE;}void*m=mmap(nullptr,expected,PROT_READ,MAP_PRIVATE,fd,0);close(fd);if(m==MAP_FAILED)return JNI_FALSE;const uint8_t*detail=(const uint8_t*)m;
+    void*pixels=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&pixels)!=ANDROID_BITMAP_RESULT_SUCCESS||!pixels){munmap(m,expected);return JNI_FALSE;}U u(e,path);if(!u.c){AndroidBitmap_unlockPixels(e,bitmap);munmap(m,expected);return JNI_FALSE;}
+    FILE*f=fopen(u.c,"wb");if(!f){AndroidBitmap_unlockPixels(e,bitmap);munmap(m,expected);return JNI_FALSE;}
+    jpeg_compress_struct c{};jpeg_error_mgr jerr{};c.err=jpeg_std_error(&jerr);jpeg_create_compress(&c);jpeg_stdio_dest(&c,f);
+    int outW=(int)info.width*2,outH=(int)info.height*2;c.image_width=outW;c.image_height=outH;c.input_components=3;c.in_color_space=JCS_RGB;jpeg_set_defaults(&c);jpeg_set_quality(&c,std::clamp((int)quality,1,100),TRUE);
+    for(int k=0;k<c.num_components;k++){c.comp_info[k].h_samp_factor=1;c.comp_info[k].v_samp_factor=1;}
+    jpeg_start_compress(&c,TRUE);std::vector<uint8_t>row((size_t)outW*3);const uint8_t*base=(const uint8_t*)pixels;float z=std::max(1.f,(float)residualZoom);
+    while(c.next_scanline<c.image_height){int oy=(int)c.next_scanline;float by=((float)oy+0.5f)*0.5f-0.5f;for(int ox=0;ox<outW;ox++){float bx=((float)ox+0.5f)*0.5f-0.5f;float rgb[3];bilinearBitmap(base,(int)info.width,(int)info.height,(int)info.stride,bx,by,rgb);
+            float ux=0.f,uy=0.f;finalToUnrotated(bx,by,rawW,rawH,cropW,cropH,rotation,mirror==JNI_TRUE,&ux,&uy);float cx=((float)rawW-1.f)*0.5f,cy=((float)rawH-1.f)*0.5f;float sx=cx+(ux-cx)/z,sy=cy+(uy-cy)/z;float dx=2.f*(sx+0.5f)-0.5f,dy=2.f*(sy+0.5f)-0.5f;float ld=detailLog2Q8(detail,detailW,detailH,dx,dy);
+            float lin[3]={srgbToLinear(rgb[0]),srgbToLinear(rgb[1]),srgbToLinear(rgb[2])};float y=0.2126f*lin[0]+0.7152f*lin[1]+0.0722f*lin[2];float shadow=clampf((y-0.015f)/0.085f,0.f,1.f),high=1.f-clampf((y-0.75f)/0.23f,0.f,1.f);float factor=std::exp2(ld*shadow*high);
+            for(int k=0;k<3;k++)row[(size_t)ox*3+k]=(uint8_t)std::lround(clampf(linearToSrgb(lin[k]*factor),0.f,1.f)*255.f);
+        }JSAMPROW rp=row.data();jpeg_write_scanlines(&c,&rp,1);}
+    jpeg_finish_compress(&c);jpeg_destroy_compress(&c);int flush=fflush(f),closeRc=fclose(f);AndroidBitmap_unlockPixels(e,bitmap);munmap(m,expected);return (flush==0&&closeRc==0)?JNI_TRUE:JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_encodeGainmapNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||(i.format!=ANDROID_BITMAP_FORMAT_A_8&&i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888))return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;tjhandle h=tj3Init(TJINIT_COMPRESS);int pf=i.format==ANDROID_BITMAP_FORMAT_A_8?TJPF_GRAY:TJPF_RGBA;int ss=i.format==ANDROID_BITMAP_FORMAT_A_8?TJSAMP_GRAY:TJSAMP_444;int q=std::clamp((int)quality,1,100);bool cfg=h&&tj3Set(h,TJPARAM_QUALITY,q)>=0&&tj3Set(h,TJPARAM_SUBSAMP,ss)>=0&&tj3Set(h,TJPARAM_OPTIMIZE,0)>=0;unsigned char*out=nullptr;size_t n=0;int rc=cfg?tj3Compress8(h,(const unsigned char*)p,(int)i.width,(int)i.stride,(int)i.height,pf,&out,&n):-1;AndroidBitmap_unlockPixels(e,bitmap);U u(e,path);bool ok=rc>=0&&out&&n&&u.c&&write(u.c,out,n);if(out)tj3Free(out);if(h)tj3Destroy(h);return ok?JNI_TRUE:JNI_FALSE;}
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_packageJpegRNative(JNIEnv*e,jclass,jstring b,jstring g,jstring o,jint gamut,jfloatArray rmin,jfloatArray rmax,jfloatArray gamma,jfloatArray es,jfloatArray eh,jfloat ds,jfloat dh,jboolean use){U ub(e,b),ug(e,g),uo(e,o);if(!ub.c||!ug.c||!uo.c)return JNI_FALSE;iris26507::GainmapMetadata m;if(!f3(e,rmin,&m.ratioMin)||!f3(e,rmax,&m.ratioMax)||!f3(e,gamma,&m.gamma)||!f3(e,es,&m.epsilonSdr)||!f3(e,eh,&m.epsilonHdr))return JNI_FALSE;m.displaySdr=ds;m.displayHdr=dh;m.useBaseColorSpace=use==JNI_TRUE;std::string err;return iris26507::packageJpegR(ub.c,ug.c,uo.c,gamut,m,&err)?JNI_TRUE:JNI_FALSE;}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_processor_IrisNightNeuralEnhancer_applyReferenceResidualNative(
+        JNIEnv*e,jclass,jobject bitmap,jfloatArray residual,jintArray referenceRgb,jint rw,jint rh,jboolean baseDisplayP3){
+    /* IRIS_26556_JIN_NATIVE_SABRE_GUIDED_RESIDUAL
+     * Jin itself is unchanged: Java supplies the complete dense 512x512 RGB residual
+     * denorm(output)-denorm(input), plus the exact 512 RGB reference pixels fed to Jin.
+     *
+     * Smooth native regions retain the exact 26555 bilinear residual. Near a real edge, native
+     * Sabre RGB and Jin's exact 512 input identify same-side residual support. A local compatible
+     * Jin-residual baseline may only REDUCE a high-frequency residual peak; it is never allowed to
+     * increase any residual component beyond the 26555 bilinear magnitude. This prevents the
+     * coarse 512 transfer from inventing bright/dark segmented structures beside a native edge
+     * without globally disabling Jin there. No gain ratio, 32x32 grid, luma-only reinterpretation,
+     * tiled inference, or neural-model change is introduced here.
+     */
+    if(!bitmap||!residual||!referenceRgb||rw<2||rh<2||
+       e->GetArrayLength(residual)!=(jsize)(rw*rh*3)||
+       e->GetArrayLength(referenceRgb)!=(jsize)(rw*rh))return JNI_FALSE;
+    AndroidBitmapInfo info{};
+    if(AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||
+       info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;
+
+    std::vector<float> r((size_t)rw*rh*3);
+    std::vector<jint> guide((size_t)rw*rh);
+    e->GetFloatArrayRegion(residual,0,(jsize)r.size(),r.data());
+    e->GetIntArrayRegion(referenceRgb,0,(jsize)guide.size(),guide.data());
+    if(e->ExceptionCheck())return JNI_FALSE;
+    for(float v:r)if(!std::isfinite(v))return JNI_FALSE;
+    std::vector<float> guideP3;
+    if(baseDisplayP3==JNI_TRUE){const auto&p3=displayP3Lut();guideP3.resize((size_t)rw*rh*3);for(int i=0;i<rw*rh;i++){jint argb=guide[(size_t)i];float sr=(float)((argb>>16)&255)/255.f,sg=(float)((argb>>8)&255)/255.f,sb=(float)(argb&255)/255.f;auto bp=p3.convertEncoded(sr,sg,sb);auto op=p3.convertEncoded(clampf(sr+r[(size_t)i*3],0.f,1.f),clampf(sg+r[(size_t)i*3+1],0.f,1.f),clampf(sb+r[(size_t)i*3+2],0.f,1.f));for(int c=0;c<3;c++){guideP3[(size_t)i*3+c]=bp[(size_t)c];r[(size_t)i*3+c]=op[(size_t)c]-bp[(size_t)c];}}}
+
+    auto guideRgb=[&](int x,int y,int c)->float{
+        if(baseDisplayP3==JNI_TRUE)return guideP3[((size_t)y*rw+x)*3+c];
+        jint argb=guide[(size_t)y*rw+x];
+        int shift=c==0?16:(c==1?8:0);
+        return (float)((argb>>shift)&255)/255.f;
+    };
+    auto guideDistance2ToNative=[&](int x,int y,const float nativeRgb[3])->float{
+        float d0=nativeRgb[0]-guideRgb(x,y,0);
+        float d1=nativeRgb[1]-guideRgb(x,y,1);
+        float d2=nativeRgb[2]-guideRgb(x,y,2);
+        return (d0*d0+d1*d1+d2*d2)/3.f;
+    };
+    auto guidePairDistance=[&](int ax,int ay,int bx,int by)->float{
+        float d0=guideRgb(ax,ay,0)-guideRgb(bx,by,0);
+        float d1=guideRgb(ax,ay,1)-guideRgb(bx,by,1);
+        float d2=guideRgb(ax,ay,2)-guideRgb(bx,by,2);
+        return std::sqrt((d0*d0+d1*d1+d2*d2)/3.f);
+    };
+
+    void*p=nullptr;
+    if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;
+    const auto*base=(const uint8_t*)p;
+    uint64_t guidedPixels=0;
+    uint64_t suppressedComponents=0;
+    const uint64_t totalPixels=(uint64_t)info.width*(uint64_t)info.height;
+    auto luma=[&](const uint8_t*q)->float{
+        if(baseDisplayP3==JNI_TRUE)return (0.22897456f*(float)q[0]+0.69173852f*(float)q[1]+0.07928691f*(float)q[2])/255.f;
+        return (0.2126f*(float)q[0]+0.7152f*(float)q[1]+0.0722f*(float)q[2])/255.f;
+    };
+    auto smooth01=[](float t)->float{
+        t=clampf(t,0.f,1.f);
+        return t*t*(3.f-2.f*t);
+    };
+
+    for(uint32_t y=0;y<info.height;y++){
+        auto*row=(uint8_t*)p+(size_t)y*info.stride;
+        float fy=((float)y+0.5f)*(float)rh/(float)info.height-0.5f;
+        int y0=std::max(0,std::min(rh-1,(int)floorf(fy)));
+        int y1=std::min(y0+1,rh-1);
+        float ty=clampf(fy-(float)y0,0.f,1.f);
+        for(uint32_t x=0;x<info.width;x++){
+            float fx=((float)x+0.5f)*(float)rw/(float)info.width-0.5f;
+            int x0=std::max(0,std::min(rw-1,(int)floorf(fx)));
+            int x1=std::min(x0+1,rw-1);
+            float tx=clampf(fx-(float)x0,0.f,1.f);
+            uint8_t*q=row+x*4;
+            float nativeRgb[3]={q[0]/255.f,q[1]/255.f,q[2]/255.f};
+
+            const float sw[4]={
+                    (1.f-tx)*(1.f-ty), tx*(1.f-ty), (1.f-tx)*ty, tx*ty};
+            const int gx[4]={x0,x1,x0,x1};
+            const int gy[4]={y0,y0,y1,y1};
+            float bilinear[3]={0.f,0.f,0.f};
+            for(int k=0;k<4;k++){
+                size_t b=((size_t)gy[k]*rw+gx[k])*3;
+                for(int c=0;c<3;c++)bilinear[c]+=r[b+c]*sw[k];
+            }
+
+            // High-resolution native edge evidence. Right/down samples are unmodified in scan
+            // order, so this does not use residual-altered pixels as the structural guide.
+            float centerL=luma(q),nativeEdge=0.f;
+            if(x+1<info.width){
+                const uint8_t*qr=row+(size_t)(x+1)*4;
+                nativeEdge=std::max(nativeEdge,std::fabs(centerL-luma(qr)));
+            }
+            if(y+1<info.height){
+                const uint8_t*qd=base+(size_t)(y+1)*info.stride+(size_t)x*4;
+                nativeEdge=std::max(nativeEdge,std::fabs(centerL-luma(qd)));
+            }
+
+            // The 512 guide footprint extends edge awareness across the whole interpolation cell,
+            // not just the single native boundary pixel. Smooth 512 neighborhoods keep this zero.
+            float guideSpan=0.f;
+            for(int a=0;a<4;a++)for(int b=a+1;b<4;b++)
+                guideSpan=std::max(guideSpan,guidePairDistance(gx[a],gy[a],gx[b],gy[b]));
+            float nativeGate=smooth01((nativeEdge-0.025f)/(0.120f-0.025f));
+            float guideGate=smooth01((guideSpan-0.060f)/(0.200f-0.060f));
+            float edgeGate=std::max(nativeGate,guideGate);
+
+            float reduced[3]={bilinear[0],bilinear[1],bilinear[2]};
+            if(edgeGate>0.0001f){
+                // Local compatible Jin-residual baseline. Native RGB selects samples from the same
+                // structural side of the edge while the spatial term keeps the baseline local.
+                int cx=std::max(0,std::min(rw-1,(int)lroundf(fx)));
+                int cy=std::max(0,std::min(rh-1,(int)lroundf(fy)));
+                float sum[3]={0.f,0.f,0.f};
+                float wsum=0.f;
+                for(int yy=std::max(0,cy-1);yy<=std::min(rh-1,cy+1);yy++){
+                    for(int xx=std::max(0,cx-1);xx<=std::min(rw-1,cx+1);xx++){
+                        float dx=(float)xx-fx,dy=(float)yy-fy;
+                        float spatial=1.f/(1.f+dx*dx+dy*dy);
+                        float compat=1.f/(1.f+80.f*guideDistance2ToNative(xx,yy,nativeRgb));
+                        float w=spatial*compat;
+                        size_t b=((size_t)yy*rw+xx)*3;
+                        for(int c=0;c<3;c++)sum[c]+=r[b+c]*w;
+                        wsum+=w;
+                    }
+                }
+                if(wsum>1.0e-8f){
+                    for(int c=0;c<3;c++){
+                        float mean=sum[c]/wsum;
+                        float before=bilinear[c];
+                        float after=before;
+                        // Permanent edge-artifact invariant: guidance may suppress a local residual
+                        // peak but may never create a larger correction than 26555 bilinear.
+                        if(before!=0.f){
+                            if(before*mean<=0.f && std::fabs(mean)<std::fabs(before))after=0.f;
+                            else if(before*mean>0.f && std::fabs(mean)<std::fabs(before))after=mean;
+                        }
+                        reduced[c]=after;
+                        if(std::fabs(after)+1.0e-8f<std::fabs(before))suppressedComponents++;
+                    }
+                }
+                if(edgeGate>=0.5f)guidedPixels++;
+            }
+
+            for(int c=0;c<3;c++){
+                float rr=bilinear[c]+(reduced[c]-bilinear[c])*edgeGate;
+                // The inequality is intentional and regression-tested: edge guidance cannot
+                // increase the absolute Jin correction versus the original 26555 bilinear value.
+                if(std::fabs(rr)>std::fabs(bilinear[c])+1.0e-6f)rr=bilinear[c];
+                float v=nativeRgb[c]+rr;
+                q[c]=(uint8_t)lrintf(clampf(v,0.f,1.f)*255.f);
+            }
+        }
+    }
+    AndroidBitmap_unlockPixels(e,bitmap);
+    __android_log_print(ANDROID_LOG_INFO,TAG,
+            "IRIS_26556_JIN_NATIVE_GUIDED_TRANSFER native=%ux%u guide=%dx%d guidedPixels=%llu totalPixels=%llu suppressedComponents=%llu",
+            info.width,info.height,(int)rw,(int)rh,
+            (unsigned long long)guidedPixels,(unsigned long long)totalPixels,
+            (unsigned long long)suppressedComponents);
+    return JNI_TRUE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_isJpegRNative(JNIEnv*e,jclass,jstring p){U u(e,p);return u.c&&iris26507::isJpegR(u.c)?JNI_TRUE:JNI_FALSE;}
