@@ -64,7 +64,7 @@ AFTER2="$WORK/candidate_26567_replay"
 SHADER_OUT="$WORK/runtime_expanded_shaders"
 GLSLANG_DIR="$WORK/glslang-16.5.0"
 POST="$WORK/postbuild_source_snapshot"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-2-sabre-guided-true2x-p3-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-3-sabre-guided-true2x-p3-debug.apk"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 LOCAL_ART=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then
@@ -107,6 +107,15 @@ TARGET VERSION/BUILD: 0.9726567 / 26567
 EOF
 set_report(){ local key="$1" val="$2" tmp="$OUT/.report.tmp"; awk -v key="$key:" -v val="$val" 'BEGIN{f=0} index($0,key)==1{print key" "val;f=1;next}{print} END{if(!f)exit 42}' "$OUT/26567_V1_STRICT_HANDOFF_REPORT.txt" > "$tmp" || fail "report key missing $key"; mv "$tmp" "$OUT/26567_V1_STRICT_HANDOFF_REPORT.txt"; }
 set_compiler(){ local key="$1" val="$2" tmp="$OUT/.compiler.tmp"; awk -v key="$key:" -v val="$val" 'BEGIN{f=0} index($0,key)==1{print key" "val;f=1;next}{print} END{if(!f)exit 42}' "$OUT/26567_V1_COMPILER_STATUS.txt" > "$tmp" || fail "compiler key missing $key"; mv "$tmp" "$OUT/26567_V1_COMPILER_STATUS.txt"; }
+
+snapshot_app_source(){
+  local src_root="$1" dest_root="$2"
+  rm -rf "$dest_root"
+  mkdir -p "$dest_root/app"
+  cp -a "$src_root/app/src" "$dest_root/app/"
+  cp -a "$src_root/app/build.gradle" "$dest_root/app/build.gradle"
+  cp -a "$src_root/app/version.properties" "$dest_root/app/version.properties"
+}
 
 verify_package(){
   [[ -f "$HANDOFF" ]] || fail "handoff hash manifest missing"
@@ -153,6 +162,22 @@ PY
   grep -F '26567 local workflow py_compile self-contamination:' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "workflow py_compile regression missing"
   grep -F 'run 33339787968, job 99333216734' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions glslang bootstrap regression missing"
   grep -F 'run 33340190659, job 99334293921' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions Kotlin phase-stat regression missing"
+  grep -F 'run 33340661287, job 99335599790' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions post-build generated-scope regression missing"
+  grep -F "actual=['app/'+p for p in changed_paths(base/'app',cand/'app')]" "$VALIDATE" >/dev/null || fail "strict changed-runtime validator was weakened"
+  grep -F "req(actual==EXPECTED_CHANGED" "$VALIDATE" >/dev/null || fail "exact changed-runtime allowlist equality gate missing"
+  local scopefix="$WORK/postbuild_scope_fixture"
+  rm -rf "$scopefix"
+  mkdir -p "$scopefix/live/app/src/main/java/fixture" "$scopefix/live/app/build/generated" "$scopefix/live/app/.cxx/generated"
+  printf '// fixture\n' > "$scopefix/live/app/src/main/java/fixture/UnexpectedSource.java"
+  printf 'android {}\n' > "$scopefix/live/app/build.gradle"
+  printf 'VERSION_NAME=fixture\nVERSION_BUILD=0\n' > "$scopefix/live/app/version.properties"
+  printf 'generated\n' > "$scopefix/live/app/build/generated/output.txt"
+  printf 'generated\n' > "$scopefix/live/app/.cxx/generated/output.txt"
+  snapshot_app_source "$scopefix/live" "$scopefix/snapshot"
+  [[ -f "$scopefix/snapshot/app/src/main/java/fixture/UnexpectedSource.java" ]] || fail "post-build snapshot hid unexpected runtime source"
+  [[ ! -e "$scopefix/snapshot/app/build/generated/output.txt" ]] || fail "post-build snapshot admitted Gradle generated output"
+  [[ ! -e "$scopefix/snapshot/app/.cxx" ]] || fail "post-build snapshot admitted CMake generated output"
+  pass "REGRESSION_26567_V1_2_POSTBUILD_GENERATED_SCOPE: PASS"
   ! grep -F 'py_compile' "$WORKFLOW" >/dev/null || fail "sealed workflow reintroduced py_compile transient contamination"
   local glslfix="$WORK/glslang_symlink_fixture" blind="" resolved=""
   rm -rf "$glslfix"; mkdir -p "$glslfix/bin"
@@ -237,7 +262,6 @@ print(f'PASS deterministic candidate transform files={len(a)}')
 PY
   python3 -S "$VALIDATE" "$BASE" "$AFTER" | tee "$OUT/26567_semantic_validation.txt"
   python3 -S "$AUTHORITY" "$ROOT" "$BASE" "$AFTER" | tee "$OUT/26567_authority_candidate.txt"
-  python3 -S "$PATCHVERIFY" "$BASE" "$AFTER" "$FORWARD" "$ROLLBACK" | tee "$OUT/26567_patch_validation.txt"
   set_report "BASE/CANDIDATE MANIFEST COMPLETENESS" "PASS (931 audited / 1708 full / 778 vendor / 7 DNG / 1686 protected)"
   set_report "DNG INVARIANCE" "PASS (dedicated DNG/ImageSaver bytes + full-evidence DNG SR contract)"
   set_report "JPEG TRUE2X SABRE COLOR OWNERSHIP" "PASS (Sabre/VGN RGB owner; scalar detail only)"
@@ -246,6 +270,10 @@ PY
   set_report "JIN MODEL-DOMAIN ADAPTER" "PASS (sRGB inference contract + P3 boundary residual)"
   set_report "RUNTIME OWNERSHIP" "PASS"
   set_report "DORMANT-OWNER REJECTION" "PASS"
+}
+
+verify_candidate_patches(){
+  python3 -S "$PATCHVERIFY" "$BASE" "$AFTER" "$FORWARD" "$ROLLBACK" | tee "$OUT/26567_patch_validation.txt"
   set_report "FORWARD PATCH FUZZ=0" "PASS"
   set_report "ROLLBACK PATCH FUZZ=0" "PASS"
 }
@@ -281,8 +309,10 @@ verify_shaders(){
 install_and_build(){
   [[ -z "$LOCAL_ART" ]] || return 0
   # Runtime write occurs only after authority, backup, candidate, semantics, patches and real GLSL pass.
-  rm -rf "$ROOT/app"
-  cp -a "$AFTER/app" "$ROOT/app"
+  rm -rf "$ROOT/app/src"
+  cp -a "$AFTER/app/src" "$ROOT/app/"
+  cp -a "$AFTER/app/build.gradle" "$ROOT/app/build.gradle"
+  cp -a "$AFTER/app/version.properties" "$ROOT/app/version.properties"
   python3 -S "$VALIDATE" "$BASE" "$ROOT" | tee "$OUT/26567_live_semantic_validation.txt"
   python3 -S "$AUTHORITY" "$ROOT" "$BASE" "$ROOT" | tee "$OUT/26567_live_authority.txt"
   ./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace 2>&1 | tee "$OUT/26567_gradle_language_compilers.log"
@@ -290,6 +320,8 @@ install_and_build(){
   set_report "REAL JAVA COMPILE" "PASS"
   set_compiler "REAL KOTLIN COMPILE" "PASS"
   set_compiler "REAL JAVA COMPILE" "PASS"
+  # Expensive deterministic patch proof runs only after the exact candidate passes real language compilers.
+  verify_candidate_patches
   ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee "$OUT/26567_gradle_assemble.log"
   set_report "FULL ANDROID ASSEMBLE" "PASS (includes Android NDK native compile/link)"
   set_compiler "NATIVE/NDK COMPILE" "PASS (real Android NDK via assembleDebug)"
@@ -301,17 +333,19 @@ install_and_build(){
   [[ "${#all_apks[@]}" -eq 1 && "${all_apks[0]}" == "$FINAL" ]] || fail "final workspace must contain exactly one intended APK"
   sha256sum "$FINAL" > "$OUT/26567_V1_APK.sha256"
 
-  # Build must not mutate frozen runtime source/protected/native/vendor bytes.
-  python3 -S "$AUTHORITY" "$ROOT" "$BASE" "$ROOT" | tee "$OUT/26567_postbuild_authority.txt"
-  python3 -S "$VALIDATE" "$BASE" "$ROOT" | tee "$OUT/26567_postbuild_semantic_validation.txt"
-  (cd "$ROOT" && sha256sum -c "$CAND_VENDOR" >/dev/null)
-  (cd "$ROOT" && sha256sum -c "$CAND_DNG" >/dev/null)
-  (cd "$ROOT" && sha256sum -c "$CAND_PROTECTED" >/dev/null)
-  set_report "POST-BUILD INVARIANCE" "PASS (candidate/protected/DNG/native/vendor exact)"
+  # Regression #20 / successful-26566 mechanics: validate a clean frozen source snapshot,
+  # never the Gradle/CMake generated live workspace.
+  snapshot_app_source "$ROOT" "$POST"
+  python3 -S "$AUTHORITY" "$ROOT" "$BASE" "$POST" | tee "$OUT/26567_postbuild_authority.txt"
+  python3 -S "$VALIDATE" "$BASE" "$POST" | tee "$OUT/26567_postbuild_semantic_validation.txt"
+  (cd "$POST" && sha256sum -c "$CAND_VENDOR" >/dev/null)
+  (cd "$POST" && sha256sum -c "$CAND_DNG" >/dev/null)
+  (cd "$POST" && sha256sum -c "$CAND_PROTECTED" >/dev/null)
+  set_report "POST-BUILD INVARIANCE" "PASS (clean frozen source snapshot; candidate/protected/DNG/native/vendor exact)"
   set_compiler "POST-BUILD INVARIANCE" "PASS"
 
   tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner -czf \
-    "$OUT/26567_V1_candidate_app_source.tar.gz" -C "$ROOT" app
+    "$OUT/26567_V1_candidate_app_source.tar.gz" -C "$POST" app
   sha256sum "$OUT/26567_V1_candidate_app_source.tar.gz" > "$OUT/26567_V1_candidate_app_source.tar.gz.sha256"
   cp "$CAND_PIN" "$OUT/26567_V1_candidate_source.sha256"
   cp "$CAND_FULL" "$OUT/26567_V1_candidate_full_app.sha256"
@@ -325,6 +359,7 @@ obtain_authority
 make_candidate
 verify_shaders
 if [[ -n "$LOCAL_ART" ]]; then
+  verify_candidate_patches
   set_report "CLEAN ARTIFACT SOURCE EXPORT" "NOT RUN (local prebuild intentionally stops before Android build)"
   cp "$OUT/26567_V1_STRICT_HANDOFF_REPORT.txt" "$OUT/26567_local_prebuild_report.txt"
   pass "26567 LOCAL PREBUILD PREPARED: compiler/build gates remain explicitly unproven"
