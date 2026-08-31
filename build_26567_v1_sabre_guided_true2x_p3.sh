@@ -63,8 +63,9 @@ AFTER="$WORK/candidate_26567"
 AFTER2="$WORK/candidate_26567_replay"
 SHADER_OUT="$WORK/runtime_expanded_shaders"
 GLSLANG_DIR="$WORK/glslang-16.5.0"
+LIVE_CANON="$WORK/live_compiler_candidate_snapshot"
 POST="$WORK/postbuild_source_snapshot"
-FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-3-sabre-guided-true2x-p3-debug.apk"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-v1-4-sabre-guided-true2x-p3-debug.apk"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 LOCAL_ART=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then
@@ -108,13 +109,17 @@ EOF
 set_report(){ local key="$1" val="$2" tmp="$OUT/.report.tmp"; awk -v key="$key:" -v val="$val" 'BEGIN{f=0} index($0,key)==1{print key" "val;f=1;next}{print} END{if(!f)exit 42}' "$OUT/26567_V1_STRICT_HANDOFF_REPORT.txt" > "$tmp" || fail "report key missing $key"; mv "$tmp" "$OUT/26567_V1_STRICT_HANDOFF_REPORT.txt"; }
 set_compiler(){ local key="$1" val="$2" tmp="$OUT/.compiler.tmp"; awk -v key="$key:" -v val="$val" 'BEGIN{f=0} index($0,key)==1{print key" "val;f=1;next}{print} END{if(!f)exit 42}' "$OUT/26567_V1_COMPILER_STATUS.txt" > "$tmp" || fail "compiler key missing $key"; mv "$tmp" "$OUT/26567_V1_COMPILER_STATUS.txt"; }
 
-snapshot_app_source(){
-  local src_root="$1" dest_root="$2"
+snapshot_candidate_from_authority(){
+  local authority_root="$1" live_root="$2" dest_root="$3"
   rm -rf "$dest_root"
-  mkdir -p "$dest_root/app"
-  cp -a "$src_root/app/src" "$dest_root/app/"
-  cp -a "$src_root/app/build.gradle" "$dest_root/app/build.gradle"
-  cp -a "$src_root/app/version.properties" "$dest_root/app/version.properties"
+  mkdir -p "$dest_root"
+  # Preserve the exact successful compiled-candidate file universe. Repository-only
+  # module scaffolding and generated build outputs must never enter candidate scope.
+  cp -a "$authority_root/." "$dest_root/"
+  rm -rf "$dest_root/app/src"
+  cp -a "$live_root/app/src" "$dest_root/app/"
+  cp -a "$live_root/app/build.gradle" "$dest_root/app/build.gradle"
+  cp -a "$live_root/app/version.properties" "$dest_root/app/version.properties"
 }
 
 verify_package(){
@@ -163,21 +168,35 @@ PY
   grep -F 'run 33339787968, job 99333216734' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions glslang bootstrap regression missing"
   grep -F 'run 33340190659, job 99334293921' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions Kotlin phase-stat regression missing"
   grep -F 'run 33340661287, job 99335599790' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions post-build generated-scope regression missing"
+  grep -F 'run 33350507622, job 99362814146' "$ROOT/REGRESSION_26567_CARRIED_FAILURES.txt" >/dev/null || fail "Actions repository-scaffolding scope regression missing"
   grep -F "actual=['app/'+p for p in changed_paths(base/'app',cand/'app')]" "$VALIDATE" >/dev/null || fail "strict changed-runtime validator was weakened"
   grep -F "req(actual==EXPECTED_CHANGED" "$VALIDATE" >/dev/null || fail "exact changed-runtime allowlist equality gate missing"
-  local scopefix="$WORK/postbuild_scope_fixture"
+  local scopefix="$WORK/canonical_scope_fixture"
   rm -rf "$scopefix"
-  mkdir -p "$scopefix/live/app/src/main/java/fixture" "$scopefix/live/app/build/generated" "$scopefix/live/app/.cxx/generated"
-  printf '// fixture\n' > "$scopefix/live/app/src/main/java/fixture/UnexpectedSource.java"
+  mkdir -p "$scopefix/authority/app/src/main/java/fixture" "$scopefix/live/app/src/main/java/fixture" \
+    "$scopefix/live/app/build/generated" "$scopefix/live/app/.cxx/generated"
+  printf '// authority fixture\n' > "$scopefix/authority/app/src/main/java/fixture/Authority.java"
+  printf 'authority-only\n' > "$scopefix/authority/app/authority-only.txt"
+  printf 'android {}\n' > "$scopefix/authority/app/build.gradle"
+  printf 'VERSION_NAME=authority\nVERSION_BUILD=1\n' > "$scopefix/authority/app/version.properties"
+  printf '// unexpected runtime source fixture\n' > "$scopefix/live/app/src/main/java/fixture/UnexpectedSource.java"
   printf 'android {}\n' > "$scopefix/live/app/build.gradle"
-  printf 'VERSION_NAME=fixture\nVERSION_BUILD=0\n' > "$scopefix/live/app/version.properties"
+  printf 'VERSION_NAME=fixture\nVERSION_BUILD=2\n' > "$scopefix/live/app/version.properties"
+  printf 'repo scaffold\n' > "$scopefix/live/app/.gitignore"
+  printf 'repo scaffold\n' > "$scopefix/live/app/SupportedList.txt"
+  printf 'repo scaffold\n' > "$scopefix/live/app/proguard-rules.pro"
   printf 'generated\n' > "$scopefix/live/app/build/generated/output.txt"
   printf 'generated\n' > "$scopefix/live/app/.cxx/generated/output.txt"
-  snapshot_app_source "$scopefix/live" "$scopefix/snapshot"
-  [[ -f "$scopefix/snapshot/app/src/main/java/fixture/UnexpectedSource.java" ]] || fail "post-build snapshot hid unexpected runtime source"
-  [[ ! -e "$scopefix/snapshot/app/build/generated/output.txt" ]] || fail "post-build snapshot admitted Gradle generated output"
-  [[ ! -e "$scopefix/snapshot/app/.cxx" ]] || fail "post-build snapshot admitted CMake generated output"
+  snapshot_candidate_from_authority "$scopefix/authority" "$scopefix/live" "$scopefix/snapshot"
+  [[ -f "$scopefix/snapshot/app/authority-only.txt" ]] || fail "canonical snapshot lost authority file universe"
+  [[ -f "$scopefix/snapshot/app/src/main/java/fixture/UnexpectedSource.java" ]] || fail "canonical snapshot hid unexpected runtime source"
+  [[ ! -e "$scopefix/snapshot/app/.gitignore" ]] || fail "canonical snapshot admitted repository-only app/.gitignore"
+  [[ ! -e "$scopefix/snapshot/app/SupportedList.txt" ]] || fail "canonical snapshot admitted repository-only SupportedList.txt"
+  [[ ! -e "$scopefix/snapshot/app/proguard-rules.pro" ]] || fail "canonical snapshot admitted repository-only proguard-rules.pro"
+  [[ ! -e "$scopefix/snapshot/app/build/generated/output.txt" ]] || fail "canonical snapshot admitted Gradle generated output"
+  [[ ! -e "$scopefix/snapshot/app/.cxx" ]] || fail "canonical snapshot admitted CMake generated output"
   pass "REGRESSION_26567_V1_2_POSTBUILD_GENERATED_SCOPE: PASS"
+  pass "REGRESSION_26567_V1_3_REPOSITORY_SCAFFOLD_SCOPE: PASS"
   ! grep -F 'py_compile' "$WORKFLOW" >/dev/null || fail "sealed workflow reintroduced py_compile transient contamination"
   local glslfix="$WORK/glslang_symlink_fixture" blind="" resolved=""
   rm -rf "$glslfix"; mkdir -p "$glslfix/bin"
@@ -313,8 +332,21 @@ install_and_build(){
   cp -a "$AFTER/app/src" "$ROOT/app/"
   cp -a "$AFTER/app/build.gradle" "$ROOT/app/build.gradle"
   cp -a "$AFTER/app/version.properties" "$ROOT/app/version.properties"
-  python3 -S "$VALIDATE" "$BASE" "$ROOT" | tee "$OUT/26567_live_semantic_validation.txt"
-  python3 -S "$AUTHORITY" "$ROOT" "$BASE" "$ROOT" | tee "$OUT/26567_live_authority.txt"
+  # Canonicalize the compiler target against the exact 26566 compiled-candidate file universe.
+  # This excludes repository-only module scaffolding while retaining every live app/src byte.
+  snapshot_candidate_from_authority "$BASE" "$ROOT" "$LIVE_CANON"
+  python3 -S "$VALIDATE" "$BASE" "$LIVE_CANON" | tee "$OUT/26567_live_semantic_validation.txt"
+  python3 -S "$AUTHORITY" "$ROOT" "$BASE" "$LIVE_CANON" | tee "$OUT/26567_live_authority.txt"
+  python3 - "$AFTER" "$LIVE_CANON" <<'PYTREE'
+from pathlib import Path
+import hashlib,sys
+def H(r): return {str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path(r).rglob('*')) if p.is_file()}
+a,b=H(Path(sys.argv[1])),H(Path(sys.argv[2]))
+if a != b:
+    only_a=sorted(set(a)-set(b)); only_b=sorted(set(b)-set(a)); changed=sorted(k for k in set(a)&set(b) if a[k]!=b[k])
+    raise SystemExit(f'live compiler candidate differs from frozen AFTER: only_after={only_a} only_live={only_b} changed={changed}')
+print(f'PASS live compiler candidate byte-identical to frozen AFTER files={len(a)}')
+PYTREE
   ./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace 2>&1 | tee "$OUT/26567_gradle_language_compilers.log"
   set_report "REAL KOTLIN COMPILE" "PASS"
   set_report "REAL JAVA COMPILE" "PASS"
@@ -322,6 +354,7 @@ install_and_build(){
   set_compiler "REAL JAVA COMPILE" "PASS"
   # Expensive deterministic patch proof runs only after the exact candidate passes real language compilers.
   verify_candidate_patches
+  pass "26567 PRE-BUILD SAFETY PROOF PASSED"
   ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee "$OUT/26567_gradle_assemble.log"
   set_report "FULL ANDROID ASSEMBLE" "PASS (includes Android NDK native compile/link)"
   set_compiler "NATIVE/NDK COMPILE" "PASS (real Android NDK via assembleDebug)"
@@ -335,7 +368,7 @@ install_and_build(){
 
   # Regression #20 / successful-26566 mechanics: validate a clean frozen source snapshot,
   # never the Gradle/CMake generated live workspace.
-  snapshot_app_source "$ROOT" "$POST"
+  snapshot_candidate_from_authority "$BASE" "$ROOT" "$POST"
   python3 -S "$AUTHORITY" "$ROOT" "$BASE" "$POST" | tee "$OUT/26567_postbuild_authority.txt"
   python3 -S "$VALIDATE" "$BASE" "$POST" | tee "$OUT/26567_postbuild_semantic_validation.txt"
   (cd "$POST" && sha256sum -c "$CAND_VENDOR" >/dev/null)
@@ -366,6 +399,5 @@ if [[ -n "$LOCAL_ART" ]]; then
   exit 0
 fi
 install_and_build
-pass "26567 PRE-BUILD SAFETY PROOF PASSED"
 pass "26567 REAL COMPILERS + FULL ASSEMBLE PASSED"
 pass "26567 POST-BUILD INVARIANCE PASSED"
