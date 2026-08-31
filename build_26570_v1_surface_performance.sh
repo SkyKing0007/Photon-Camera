@@ -17,6 +17,7 @@ resolve_glslang_compiler(){
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="cd57770a427f63a3000a6b7d594fcda425fcd351"
+HANDOFF_PARENT_COMMIT="ddf60af1823d356ea418718804fc61ab9a34be80"
 BASE_RUN_ID="33410892866"
 BASE_ARTIFACT_ID="9765167937"
 BASE_ARTIFACT_NAME="photon-26569-v1-1-encoder-ui"
@@ -169,6 +170,7 @@ print('PASS sealed Python stdlib-only syntax/import gate')
 PY
   bash -n "$BUILD_SCRIPT"
   grep -F 'run 33401928594 / job 99520075790' "$ROOT/REGRESSION_V1_26570_CARRIED_FAILURES.txt" >/dev/null || fail "26569 native failure regression absent"
+  grep -F 'run 33427734790 / job 99605325755' "$ROOT/REGRESSION_V1_26570_CARRIED_FAILURES.txt" >/dev/null || fail "26570 V1 impossible workflow-order assertion regression absent"
   grep -F 'IRIS_26570_ONE_SIDED_EDGE_LUMA_AUTHORITY' "$ROOT/REGRESSION_V1_26570_SURFACE_PERFORMANCE_CONTRACT.txt" >/dev/null || fail "surface regression contract missing"
   grep -F 'No verification order is weakened' "$ROOT/V1_26570_INFRASTRUCTURE_DIFF_AUDIT.txt" >/dev/null || fail "infrastructure diff audit missing"
   ! grep -Eq 'pip(3)?[[:space:]]+install' "$TRANSFORM" "$VALIDATE" "$AUTHORITY" "$PATCHVERIFY" "$SHADERVERIFY" "$BUILD_SCRIPT" "$WORKFLOW" || fail "package-manager dependency introduced"
@@ -184,7 +186,8 @@ verify_scope(){
     return
   fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-  [[ "$(git rev-parse HEAD^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "26570 handoff must be one clean commit directly on successful 26569 V1.1"
+  git merge-base --is-ancestor "$BASE_SUCCESS_COMMIT" HEAD || fail "successful 26569 V1.1 runtime authority is not an ancestor"
+  [[ "$(git rev-parse HEAD^)" == "$HANDOFF_PARENT_COMMIT" ]] || fail "26570 V1.1 retry must be one clean commit directly on failed V1 handoff"
   python3 -S - "$HANDOFF" > "$WORK/expected_scope.txt" <<'PY'
 from pathlib import Path
 import sys
