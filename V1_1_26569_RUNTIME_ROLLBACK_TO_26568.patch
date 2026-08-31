@@ -1,0 +1,242 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 839d5ba1829c16fc6d30320a765a6220d62a228b..3c2ffd12aa5e47317162306b037c84e537702976 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -3,7 +3,6 @@
+ #include <android/log.h>
+ #include <array>
+ #include <atomic>
+-#include <chrono>
+ #include <thread>
+ #include <jni.h>
+ #include <cstdio>
+@@ -509,52 +508,6 @@ inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,
+     if(!preRenderAt(s,p,x0,y0,&a)||!preRenderAt(s,p,x1,y0,&b)||!preRenderAt(s,p,x0,y1,&c)||!preRenderAt(s,p,x1,y1,&d))return false;
+     *out=mix3(mix3(a,b,fx),mix3(c,d,fx),fy);return true;
+ }
+-/* IRIS_26569_TRUE2X_PROFILE_CACHE
+- * Motion true2x repeatedly queried center + four neighbors through identical sensor->profile->P3
+- * matrices. Cache that deterministic profile-color result once per bounded source band. The
+- * original profileColor/adaptiveAppearance/samplePreRender functions above remain untouched and
+- * authoritative for Jin-enabled fallback; this cache changes evaluation count, not equations.
+- */
+-struct ProfileRegion {
+-    int x0=0,y0=0,w=0,h=0,fullW=0,fullH=0;
+-    std::vector<Vec3> rgb;
+-    bool contains(int x,int y)const{return x>=x0&&x<x0+w&&y>=y0&&y<y0+h;}
+-    bool at(int x,int y,Vec3*out)const{
+-        x=std::max(0,std::min(fullW-1,x));y=std::max(0,std::min(fullH-1,y));
+-        if(!contains(x,y)||!out)return false;
+-        *out=rgb[(size_t)(y-y0)*w+(x-x0)];
+-        return std::isfinite(out->r)&&std::isfinite(out->g)&&std::isfinite(out->b);
+-    }
+-};
+-inline bool buildProfileRegion(const SourceRegion&s,const Params&p,int workers,ProfileRegion*out){
+-    if(!out||s.w<=0||s.h<=0)return false;
+-    out->x0=s.x0;out->y0=s.y0;out->w=s.w;out->h=s.h;out->fullW=s.fullW;out->fullH=s.fullH;out->rgb.resize((size_t)s.w*s.h);
+-    std::atomic<int> nextRow{0};std::atomic<bool> ok{true};
+-    auto work=[&](){while(ok.load(std::memory_order_relaxed)){int ly=nextRow.fetch_add(1);if(ly>=s.h)break;for(int lx=0;lx<s.w;lx++){Vec3 v;if(!profileColor(s,p,s.x0+lx,s.y0+ly,&v)){ok.store(false,std::memory_order_relaxed);break;}out->rgb[(size_t)ly*s.w+lx]=v;}}};
+-    std::vector<std::thread> threads;threads.reserve((size_t)workers);for(int i=0;i<workers;i++)threads.emplace_back(work);for(auto&t:threads)t.join();return ok.load(std::memory_order_relaxed);
+-}
+-inline bool adaptiveAppearanceCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){
+-    Vec3 center;if(!s.at(x,y,&center))return false;
+-    float cy=luma(center);Vec3 cc={center.r-cy,center.g-cy,center.b-cy};float cm=length3(cc);float relative=cm/std::max(cy,0.08f);
+-    const int dx[4]={-1,1,0,0},dy[4]={0,0,-1,1};Vec3 sum=cc;float magSum=cm,maxYDelta=0.f;
+-    for(int i=0;i<4;i++){Vec3 n;if(!s.at(x+dx[i],y+dy[i],&n))return false;float ny=luma(n);Vec3 nc={n.r-ny,n.g-ny,n.b-ny};sum=add(sum,nc);magSum+=length3(nc);maxYDelta=std::max(maxYDelta,std::fabs(ny-cy));}
+-    Vec3 mean=mul(sum,0.2f);float meanMag=magSum*0.2f;float coherence=length3(mean)/std::max(meanMag,1.0e-6f);float disagreement=length3(sub(cc,mean));
+-    float neutral=smoothstep(0.0035f,0.018f,cm);float rolloff=1.f-smoothstep(0.08f,0.45f,relative);float dg=std::max(p.displayGain,1.0e-6f);
+-    float projectedY=cy*dg,projectedPeak=peak(center)*dg;float shadow=smoothstep(0.015f,0.075f,projectedY);float high=1.f-smoothstep(0.72f,0.98f,projectedPeak);
+-    float coh=smoothstep(0.45f,0.82f,coherence);float agree=1.f-smoothstep(0.018f,0.085f,disagreement);float edge=1.f-smoothstep(0.025f,0.11f,maxYDelta*dg);
+-    float requested=1.f+0.22f*neutral*rolloff*shadow*high*coh*agree*edge;float limit=4.f;float inPeak=peak(center);
+-    if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+-    float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+-}
+-inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
+-inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,float y,Vec3*out){
+-    x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+-    if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAtCached(s,p,ix,iy,out);}
+-    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,p.trueW-1),y1=std::min(y0+1,p.trueH-1);float fx=x-x0,fy=y-y0;Vec3 a,b,c,d;
+-    if(!preRenderAtCached(s,p,x0,y0,&a)||!preRenderAtCached(s,p,x1,y0,&b)||!preRenderAtCached(s,p,x0,y1,&c)||!preRenderAtCached(s,p,x1,y1,&d))return false;
+-    *out=mix3(mix3(a,b,fx),mix3(c,d,fx),fy);return true;
+-}
+-
+ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p){
+     rgb=clampNonnegative(rgb);float y=std::max(luma(rgb),0.f),pk=peak(rgb),guide=std::max(y,pk);if(guide>1.0e-7f&&guide>0.50f){float white=std::max(p.sceneWhite,0.55f);float x=clampf((guide-0.50f)/std::max(white-0.50f,1.0e-6f),0.f,1.f);float shaped=std::log(1.f+6.f*x)/std::log(7.f);float mapped=0.50f+(1.25f-0.50f)*shaped;rgb=mul(rgb,mapped/guide);}rgb=mul(rgb,0.80f);float pk2=peak(rgb);if(pk2>1.f)rgb=mul(rgb,1.f/std::max(pk2,1.0e-6f));return clampNonnegative(rgb);
+ }
+@@ -611,12 +564,6 @@ inline bool renderBase(const SourceRegion&s,const Params&p,const Watermark&w,con
+     float rr=lut.at(sdr.r),gg=lut.at(sdr.g),bb=lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
+     out[0]=(uint8_t)std::lround(clampf(rr,0.f,1.f)*255.f);out[1]=(uint8_t)std::lround(clampf(gg,0.f,1.f)*255.f);out[2]=(uint8_t)std::lround(clampf(bb,0.f,1.f)*255.f);return true;
+ }
+-inline bool renderBaseCached(const ProfileRegion&s,const Params&p,const Watermark&w,const SrgbLut&lut,int ox,int oy,float gainMax,uint8_t*out,uint8_t*gainOut){
+-    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);Vec3 hdr;if(!samplePreRenderCached(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr,p);
+-    if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f);float hdrY=std::max(luma(clampNonnegative(hdr)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);float ratio=clampf((hdrY+off)/(sdrY+off),1.f,safeMax);float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
+-    float rr=lut.at(sdr.r),gg=lut.at(sdr.g),bb=lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
+-    out[0]=(uint8_t)std::lround(clampf(rr,0.f,1.f)*255.f);out[1]=(uint8_t)std::lround(clampf(gg,0.f,1.f)*255.f);out[2]=(uint8_t)std::lround(clampf(bb,0.f,1.f)*255.f);return true;
+-}
+ inline float guideRgb(const Jin&j,int x,int y,int c){return j.guideP3[((size_t)y*j.w+x)*3+c];}
+ inline float guideDistance2ToNative(const Jin&j,int x,int y,const float native[3]){float d0=native[0]-guideRgb(j,x,y,0),d1=native[1]-guideRgb(j,x,y,1),d2=native[2]-guideRgb(j,x,y,2);return (d0*d0+d1*d1+d2*d2)/3.f;}
+ inline float guidePairDistance(const Jin&j,int ax,int ay,int bx,int by){float d0=guideRgb(j,ax,ay,0)-guideRgb(j,bx,by,0),d1=guideRgb(j,ax,ay,1)-guideRgb(j,bx,by,1),d2=guideRgb(j,ax,ay,2)-guideRgb(j,bx,by,2);return std::sqrt((d0*d0+d1*d1+d2*d2)/3.f);}
+@@ -631,25 +578,11 @@ inline void applyJinPixel(const Jin&j,const uint8_t*center,const uint8_t*right,c
+  * only needs the already-rendered right/down neighbors. Keep exact renderBase/applyJinPixel math
+  * and replace only storage order with full-width bands plus one down-row halo.
+  */
+-struct StreamingBandTiming { uint64_t profileNs=0,renderNs=0,jinNs=0; };
+-inline uint64_t iris26569Ns(std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count();}
+-inline bool renderStreamingBand(int sourceFd,float gainMax,const Params&p,const Watermark&w,const Jin&j,const SrgbLut&lut,int outW,int outH,int top,int coreH,int workers,bool generateGain,std::vector<uint8_t>*rgbRows,std::vector<uint8_t>*gainRows,StreamingBandTiming*timing){
+-    if(!rgbRows||coreH<=0||outW<=0)return false;
+-    const bool useJin=j.enabled();
+-    const int extH=coreH+(useJin&&top+coreH<outH?1:0);
+-    SourceRegion src;if(!readRegion(sourceFd,p,0,top,outW-1,top+extH-1,&src))return false;
+-    if(!useJin){
+-        ProfileRegion profile;auto profileStart=std::chrono::steady_clock::now();if(!buildProfileRegion(src,p,workers,&profile))return false;auto profileEnd=std::chrono::steady_clock::now();if(timing)timing->profileNs+=iris26569Ns(profileStart,profileEnd);
+-        rgbRows->resize((size_t)outW*coreH*3);if(generateGain){if(!gainRows)return false;gainRows->resize((size_t)outW*coreH);}
+-        std::atomic<int> nextRow{0};std::atomic<bool> ok{true};auto renderStart=std::chrono::steady_clock::now();
+-        auto work=[&](){while(ok.load(std::memory_order_relaxed)){int y=nextRow.fetch_add(1);if(y>=coreH)break;for(int x=0;x<outW;x++){uint8_t*g=generateGain?&(*gainRows)[(size_t)y*outW+x]:nullptr;if(!renderBaseCached(profile,p,w,lut,x,top+y,gainMax,&(*rgbRows)[((size_t)y*outW+x)*3],g)){ok.store(false,std::memory_order_relaxed);break;}}}};
+-        std::vector<std::thread> threads;threads.reserve((size_t)workers);for(int i=0;i<workers;i++)threads.emplace_back(work);for(auto&t:threads)t.join();auto renderEnd=std::chrono::steady_clock::now();if(timing)timing->renderNs+=iris26569Ns(renderStart,renderEnd);return ok.load(std::memory_order_relaxed);
+-    }
+-    std::vector<uint8_t>base((size_t)outW*extH*3),gainBase;if(generateGain)gainBase.resize((size_t)outW*extH);std::atomic<int>nextBaseRow{0};std::atomic<bool>ok{true};auto renderStart=std::chrono::steady_clock::now();
+-    auto baseWork=[&](){while(ok.load(std::memory_order_relaxed)){int y=nextBaseRow.fetch_add(1);if(y>=extH)break;for(int x=0;x<outW;x++){uint8_t*g=generateGain?&gainBase[(size_t)y*outW+x]:nullptr;if(!renderBase(src,p,w,lut,x,top+y,gainMax,&base[((size_t)y*outW+x)*3],g)){ok.store(false,std::memory_order_relaxed);break;}}}};std::vector<std::thread>threads;threads.reserve((size_t)workers);for(int i=0;i<workers;i++)threads.emplace_back(baseWork);for(auto&t:threads)t.join();auto renderEnd=std::chrono::steady_clock::now();if(timing)timing->renderNs+=iris26569Ns(renderStart,renderEnd);if(!ok.load(std::memory_order_relaxed))return false;
+-    rgbRows->resize((size_t)outW*coreH*3);if(generateGain){if(!gainRows)return false;gainRows->resize((size_t)outW*coreH);}std::atomic<int>nextOutputRow{0};threads.clear();auto jinStart=std::chrono::steady_clock::now();auto outputWork=[&](){while(ok.load(std::memory_order_relaxed)){int y=nextOutputRow.fetch_add(1);if(y>=coreH)break;for(int x=0;x<outW;x++){const uint8_t*c=&base[((size_t)y*outW+x)*3];const uint8_t*r=(x+1<outW)?&base[((size_t)y*outW+x+1)*3]:nullptr;const uint8_t*d=(top+y+1<outH)?&base[((size_t)(y+1)*outW+x)*3]:nullptr;applyJinPixel(j,c,r,d,x,top+y,outW,outH,&(*rgbRows)[((size_t)y*outW+x)*3]);if(generateGain)(*gainRows)[(size_t)y*outW+x]=gainBase[(size_t)y*outW+x];}}};for(int i=0;i<workers;i++)threads.emplace_back(outputWork);for(auto&t:threads)t.join();auto jinEnd=std::chrono::steady_clock::now();if(timing)timing->jinNs+=iris26569Ns(jinStart,jinEnd);return ok.load(std::memory_order_relaxed);
++inline bool renderStreamingBand(int sourceFd,float gainMax,const Params&p,const Watermark&w,const Jin&j,const SrgbLut&lut,int outW,int outH,int top,int coreH,int workers,bool generateGain,std::vector<uint8_t>*rgbRows,std::vector<uint8_t>*gainRows){
++    if(!rgbRows||coreH<=0||outW<=0)return false;const int extH=coreH+(top+coreH<outH?1:0);SourceRegion src;if(!readRegion(sourceFd,p,0,top,outW-1,top+extH-1,&src))return false;std::vector<uint8_t>base((size_t)outW*extH*3),gainBase;if(generateGain)gainBase.resize((size_t)outW*extH);std::atomic<int>nextBaseRow{0};std::atomic<bool>ok{true};
++    auto baseWork=[&](){while(ok.load(std::memory_order_relaxed)){int y=nextBaseRow.fetch_add(1);if(y>=extH)break;for(int x=0;x<outW;x++){uint8_t*g=generateGain?&gainBase[(size_t)y*outW+x]:nullptr;if(!renderBase(src,p,w,lut,x,top+y,gainMax,&base[((size_t)y*outW+x)*3],g)){ok.store(false,std::memory_order_relaxed);break;}}}};std::vector<std::thread>threads;threads.reserve((size_t)workers);for(int i=0;i<workers;i++)threads.emplace_back(baseWork);for(auto&t:threads)t.join();if(!ok.load(std::memory_order_relaxed))return false;
++    rgbRows->resize((size_t)outW*coreH*3);if(generateGain){if(!gainRows)return false;gainRows->resize((size_t)outW*coreH);}std::atomic<int>nextOutputRow{0};threads.clear();auto outputWork=[&](){while(ok.load(std::memory_order_relaxed)){int y=nextOutputRow.fetch_add(1);if(y>=coreH)break;for(int x=0;x<outW;x++){const uint8_t*c=&base[((size_t)y*outW+x)*3];const uint8_t*r=(x+1<outW)?&base[((size_t)y*outW+x+1)*3]:nullptr;const uint8_t*d=(top+y+1<outH)?&base[((size_t)(y+1)*outW+x)*3]:nullptr;applyJinPixel(j,c,r,d,x,top+y,outW,outH,&(*rgbRows)[((size_t)y*outW+x)*3]);if(generateGain)(*gainRows)[(size_t)y*outW+x]=gainBase[(size_t)y*outW+x];}}};for(int i=0;i<workers;i++)threads.emplace_back(outputWork);for(auto&t:threads)t.join();return ok.load(std::memory_order_relaxed);
+ }
+-
+ }
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative(
+@@ -671,9 +604,9 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+     unlink(op.c);if(generateGain)unlink(gp.c);FILE*baseOut=fopen(op.c,"wb");if(!baseOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_base_jpeg errno=%d",errno);close(sourceFd);return JNI_FALSE;}FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gp.c,"wb");if(!gainOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_gain_jpeg errno=%d",errno);fclose(baseOut);unlink(op.c);close(sourceFd);return JNI_FALSE;}}
+     jpeg_compress_struct baseC{};jpeg_error_mgr baseErr{};baseC.err=jpeg_std_error(&baseErr);jpeg_create_compress(&baseC);jpeg_stdio_dest(&baseC,baseOut);baseC.image_width=outW;baseC.image_height=outH;baseC.input_components=3;baseC.in_color_space=JCS_RGB;jpeg_set_defaults(&baseC);jpeg_set_quality(&baseC,std::clamp((int)quality,1,100),TRUE);for(int k=0;k<baseC.num_components;k++){baseC.comp_info[k].h_samp_factor=1;baseC.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&baseC,TRUE);bool streamed=writeDisplayP3Icc(&baseC);
+     jpeg_compress_struct gainC{};jpeg_error_mgr gainErr{};bool gainCreated=false;if(generateGain){gainC.err=jpeg_std_error(&gainErr);jpeg_create_compress(&gainC);gainCreated=true;jpeg_stdio_dest(&gainC,gainOut);gainC.image_width=outW;gainC.image_height=outH;gainC.input_components=1;gainC.in_color_space=JCS_GRAYSCALE;jpeg_set_defaults(&gainC);jpeg_set_quality(&gainC,95,TRUE);jpeg_start_compress(&gainC,TRUE);}
+-    SrgbLut lut;const bool motionFast=!jin.enabled();const int bandRows=motionFast?256:128;unsigned hc=std::thread::hardware_concurrency();int workers=std::max(1,std::min(motionFast?6:4,(int)(hc?hc:2)));std::vector<uint8_t>rgbRows,gainRows;StreamingBandTiming timing{};uint64_t baseJpegNs=0,gainJpegNs=0;int bands=0;auto streamStart=std::chrono::steady_clock::now();for(int top=0;streamed&&top<outH;top+=bandRows){int h=std::min(bandRows,outH-top);if(!renderStreamingBand(sourceFd,(float)gainMaxRatio,p,water,jin,lut,outW,outH,top,h,workers,generateGain,&rgbRows,&gainRows,&timing)){streamed=false;break;}for(int y=0;streamed&&y<h;y++){JSAMPROW rpRow=&rgbRows[(size_t)y*outW*3];auto baseStart=std::chrono::steady_clock::now();int baseWritten=jpeg_write_scanlines(&baseC,&rpRow,1);auto baseEnd=std::chrono::steady_clock::now();baseJpegNs+=iris26569Ns(baseStart,baseEnd);if(baseWritten!=1){streamed=false;break;}if(generateGain){JSAMPROW gpRow=&gainRows[(size_t)y*outW];auto gainStart=std::chrono::steady_clock::now();int gainWritten=jpeg_write_scanlines(&gainC,&gpRow,1);auto gainEnd=std::chrono::steady_clock::now();gainJpegNs+=iris26569Ns(gainStart,gainEnd);if(gainWritten!=1){streamed=false;break;}}}bands++;}auto streamEnd=std::chrono::steady_clock::now();
++    SrgbLut lut;constexpr int bandRows=128;unsigned hc=std::thread::hardware_concurrency();int workers=std::max(1,std::min(4,(int)(hc?hc:2)));std::vector<uint8_t>rgbRows,gainRows;int bands=0;for(int top=0;streamed&&top<outH;top+=bandRows){int h=std::min(bandRows,outH-top);if(!renderStreamingBand(sourceFd,(float)gainMaxRatio,p,water,jin,lut,outW,outH,top,h,workers,generateGain,&rgbRows,&gainRows)){streamed=false;break;}for(int y=0;streamed&&y<h;y++){JSAMPROW rpRow=&rgbRows[(size_t)y*outW*3];if(jpeg_write_scanlines(&baseC,&rpRow,1)!=1){streamed=false;break;}if(generateGain){JSAMPROW gpRow=&gainRows[(size_t)y*outW];if(jpeg_write_scanlines(&gainC,&gpRow,1)!=1){streamed=false;break;}}}bands++;}
+     if(streamed&&baseC.next_scanline==baseC.image_height&&(!generateGain||gainC.next_scanline==gainC.image_height)){jpeg_finish_compress(&baseC);if(generateGain)jpeg_finish_compress(&gainC);}else{streamed=false;jpeg_abort_compress(&baseC);if(gainCreated)jpeg_abort_compress(&gainC);}jpeg_destroy_compress(&baseC);if(gainCreated)jpeg_destroy_compress(&gainC);int baseFlush=fflush(baseOut),baseClose=fclose(baseOut),gainFlush=0,gainClose=0;if(gainOut){gainFlush=fflush(gainOut);gainClose=fclose(gainOut);}close(sourceFd);
+-    bool baseEncoded=streamed&&baseFlush==0&&baseClose==0;bool gainEncoded=!generateGain||(streamed&&gainFlush==0&&gainClose==0);if(!baseEncoded)unlink(op.c);if(generateGain&&!gainEncoded)unlink(gp.c);__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26569_TRUE2X_ENCODER_TIMING profileMs=%.3f renderMs=%.3f jinMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f streamMs=%.3f workers=%d bandRows=%d profileCache=%d",timing.profileNs/1000000.0,timing.renderNs/1000000.0,timing.jinNs/1000000.0,baseJpegNs/1000000.0,gainJpegNs/1000000.0,iris26569Ns(streamStart,streamEnd)/1000000.0,workers,bandRows,motionFast?1:0);__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26568_TRUE2X_FINAL_STREAM rendered=%d baseEncoded=%d gainEncoded=%d gain1to1=%d source=%dx%d output=%dx%d workers=%d bands=%d jin=%d watermark=%d scratch=NONE",streamed?1:0,baseEncoded?1:0,gainEncoded?1:0,generateGain?1:0,(int)trueW,(int)trueH,outW,outH,workers,bands,jin.enabled()?1:0,water.enabled()?1:0);
++    bool baseEncoded=streamed&&baseFlush==0&&baseClose==0;bool gainEncoded=!generateGain||(streamed&&gainFlush==0&&gainClose==0);if(!baseEncoded)unlink(op.c);if(generateGain&&!gainEncoded)unlink(gp.c);__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26568_TRUE2X_FINAL_STREAM rendered=%d baseEncoded=%d gainEncoded=%d gain1to1=%d source=%dx%d output=%dx%d workers=%d bands=%d jin=%d watermark=%d scratch=NONE",streamed?1:0,baseEncoded?1:0,gainEncoded?1:0,generateGain?1:0,(int)trueW,(int)trueH,outW,outH,workers,bands,jin.enabled()?1:0,water.enabled()?1:0);
+     /* A valid 50MP base is authoritative. Gain/JPEG-R auxiliary failure is handled by Java by
+      * promoting that exact P3 base to SDR; it must never report base failure and trigger 12MP. */
+     return baseEncoded?JNI_TRUE:JNI_FALSE;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index 165e7582eb8f3849bdadf0e7c4336042ba9f54b1..3ce6d93bb630c6a2c297f87b69b03ab06a81d24a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -189,15 +189,11 @@ public final class MotionV2Jpeg444Encoder {
+             } else {
+                 gainReady = Files.isRegularFile(gain) && Files.size(gain) > 0L;
+             }
+-            final long packageStartNs = System.nanoTime();
+             boolean jpegR = gainReady
+                     && packageJpegRNative(base.toString(), gain.toString(), output.toString(), 1,
+                             gm.getRatioMin(), gm.getRatioMax(), gm.getGamma(), gm.getEpsilonSdr(), gm.getEpsilonHdr(),
+                             gm.getMinDisplayRatioForHdrTransition(), gm.getDisplayRatioForFullHdr(), true)
+                     && isJpegRNative(output.toString());
+-            final long packageMs = (System.nanoTime() - packageStartNs) / 1_000_000L;
+-            Log.i(TAG, "IRIS_26569_TRUE2X_PACKAGE_TIMING jpegRPackageMs=" + packageMs
+-                    + " gainReady=" + gainReady + " jpegR=" + jpegR);
+             if (jpegR && hasExpectedJpegDimensions(output, expectedJpegWidth, expectedJpegHeight)) {
+                 Log.i(TAG, "IRIS_26566_TRUE2X_DIMENSION_ACCEPT width=" + expectedJpegWidth
+                         + " height=" + expectedJpegHeight + " jpegR=true native12mpFallback=false");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 0acd38fad898c2f5852ac3c1e5dea0b0c2c7e9d7..96611fde3bae1825a7459d17842cc706fdfb0126 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -76,7 +76,6 @@ public class CameraUIViewImpl implements CameraUIView {
+     private TextView formatActiveLabel;
+     private TextView quadStatusLabel;
+     private boolean formatPanelOpen;
+-    private float iris26569LastLensCollisionCorrectionPx = Float.NaN;
+     private LayoutMainTopbarBinding topbar;
+     private LayoutBottombuttonsBinding bottombuttons;
+     private CameraUIEventsListener uiEventsListener;
+@@ -131,7 +130,6 @@ public class CameraUIViewImpl implements CameraUIView {
+         this.initListeners();
+         this.initModeSwitcher();
+         this.initLiquidUi();
+-        this.installAdaptiveBottomCollisionGuard();
+         this.currentState = new PhotoMotionModeState(); //init mode
+         initModeState(CameraMode.valueOf(PreferenceKeys.getCameraModeOrdinal()));
+     }
+@@ -439,53 +437,6 @@ public class CameraUIViewImpl implements CameraUIView {
+             }
+         });
+     }
+-    /* IRIS_26569_ADAPTIVE_BOTTOM_COLLISION_GUARD
+-     * Preview/dummy geometry and bottom-bar geometry are resolved independently on different
+-     * aspect ratios. Preserve the existing preferred lens-row position whenever it is safe, but
+-     * enforce a measured 12dp clearance from the actual shutter bounds after layout. This is
+-     * device-independent: no model, resolution, density, or aspect-ratio allowlist is used.
+-     */
+-    private void installAdaptiveBottomCollisionGuard() {
+-        final View root = cameraFragment.cameraFragmentBinding.getRoot();
+-        if (root == null) return;
+-        root.addOnLayoutChangeListener((v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) ->
+-                applyAdaptiveLensShutterCollisionGuard(isVideoStyleMode()));
+-    }
+-
+-    private void applyAdaptiveLensShutterCollisionGuard(boolean videoStyle) {
+-        if (bottombuttons == null || bottombuttons.shutterButtonContainer == null) return;
+-        final View root = cameraFragment.cameraFragmentBinding.getRoot();
+-        final View lensSelector = root.findViewById(R.id.aux_buttons_container);
+-        final View shutter = bottombuttons.shutterButtonContainer;
+-        if (lensSelector == null) return;
+-        final float density = cameraFragment.getResources().getDisplayMetrics().density;
+-        final float preferredTranslationY = videoStyle ? -48.0f * density : 0.0f;
+-        lensSelector.animate().cancel();
+-        lensSelector.setTranslationY(preferredTranslationY);
+-        root.post(() -> {
+-            if (lensSelector.getWidth() <= 0 || lensSelector.getHeight() <= 0
+-                    || shutter.getWidth() <= 0 || shutter.getHeight() <= 0) return;
+-            int[] lensLocation = new int[2];
+-            int[] shutterLocation = new int[2];
+-            lensSelector.getLocationInWindow(lensLocation);
+-            shutter.getLocationInWindow(shutterLocation);
+-            final float minimumGapPx = 12.0f * density;
+-            final float lensBottom = lensLocation[1] + lensSelector.getHeight();
+-            final float shutterTop = shutterLocation[1];
+-            final float correctionPx = Math.max(0.0f, lensBottom + minimumGapPx - shutterTop);
+-            lensSelector.setTranslationY(preferredTranslationY - correctionPx);
+-            if (!Float.isFinite(iris26569LastLensCollisionCorrectionPx)
+-                    || Math.abs(iris26569LastLensCollisionCorrectionPx - correctionPx) > 0.5f) {
+-                Log.i(TAG, "IRIS_26569_UI_COLLISION_GUARD correctionPx=" + correctionPx
+-                        + " gapPx=" + minimumGapPx
+-                        + " lensBottom=" + lensBottom
+-                        + " shutterTop=" + shutterTop
+-                        + " videoStyle=" + videoStyle);
+-                iris26569LastLensCollisionCorrectionPx = correctionPx;
+-            }
+-        });
+-    }
+-
+     private void applyBottomGeometry(boolean videoStyle) {
+         float density =
+                 cameraFragment.getResources()
+@@ -526,7 +477,15 @@ public class CameraUIViewImpl implements CameraUIView {
+                     .start();
+         }
+ 
+-        applyAdaptiveLensShutterCollisionGuard(videoStyle);
++        View lensSelector =
++                cameraFragment.cameraFragmentBinding.getRoot()
++                        .findViewById(R.id.aux_buttons_container);
++        if (lensSelector != null) {
++            lensSelector.animate()
++                    .translationY(videoStyle ? -48.0f * density : 0.0f)
++                    .setDuration(180L)
++                    .start();
++        }
+     }
+     private void switchToMode(CameraMode cameraMode) {
+         Log.d(TAG, "Current Mode:" + cameraMode.name());
+diff --git a/app/version.properties b/app/version.properties
+index ea48e916c9beaff7dc5b469b235b0980fe55902a..e72afcd40dbe0b890c064576b44f276b4102e4eb 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726569
+-VERSION_BUILD=26569
++VERSION_NAME=0.9726568
++VERSION_BUILD=26568
