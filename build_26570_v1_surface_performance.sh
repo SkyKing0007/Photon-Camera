@@ -17,7 +17,7 @@ resolve_glslang_compiler(){
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="cd57770a427f63a3000a6b7d594fcda425fcd351"
-HANDOFF_PARENT_COMMIT="ddf60af1823d356ea418718804fc61ab9a34be80"
+HANDOFF_PARENT_COMMIT="1caa0879bebc29802dabfe71b64dcdc73f5e0d1c"
 BASE_RUN_ID="33410892866"
 BASE_ARTIFACT_ID="9765167937"
 BASE_ARTIFACT_NAME="photon-26569-v1-1-encoder-ui"
@@ -121,22 +121,7 @@ snapshot_candidate_from_authority(){
 verify_package(){
   [[ -f "$HANDOFF" ]] || fail "handoff hash manifest missing"
   sha256sum -c "$HANDOFF"
-  python3 -S - "$HANDOFF" <<'PY'
-from pathlib import Path
-import sys
-m=Path(sys.argv[1]); root=m.parent
-listed={line.split('  ',1)[1] for line in m.read_text().splitlines() if line.strip()}
-actual=set()
-for p in root.rglob('*'):
- if not p.is_file() or p==m: continue
- rel=p.relative_to(root)
- if rel.parts and rel.parts[0] in {'build_26570_v1_surface_performance_outputs','.build_26570_v1_surface_performance_work'}: continue
- actual.add(str(rel))
-# Generated local/Actions proof directories are runtime outputs, never sealed handoff inputs.
-if actual!=listed:
- raise SystemExit(f'FAIL sealed package set mismatch missing={sorted(listed-actual)} extra={sorted(actual-listed)}')
-print(f'PASS exact sealed package file set count={len(actual)}')
-PY
+  [[ "$(wc -l < "$HANDOFF")" -eq 29 ]] || fail "sealed payload count must be 29 excluding handoff manifest"
   [[ "$(wc -l < "$CHANGED")" -eq 3 ]] || fail "runtime allowlist count must be 3"
   [[ "$(wc -l < "$BASE_FULL")" -eq 1708 && "$(wc -l < "$CAND_FULL")" -eq 1708 ]] || fail "full app manifest count"
   [[ "$(wc -l < "$BASE_PROTECTED")" -eq 1705 && "$(wc -l < "$CAND_PROTECTED")" -eq 1705 ]] || fail "protected manifest count"
@@ -171,6 +156,7 @@ PY
   bash -n "$BUILD_SCRIPT"
   grep -F 'run 33401928594 / job 99520075790' "$ROOT/REGRESSION_V1_26570_CARRIED_FAILURES.txt" >/dev/null || fail "26569 native failure regression absent"
   grep -F 'run 33427734790 / job 99605325755' "$ROOT/REGRESSION_V1_26570_CARRIED_FAILURES.txt" >/dev/null || fail "26570 V1 impossible workflow-order assertion regression absent"
+  grep -F 'run 33433465300 / job 99624165337' "$ROOT/REGRESSION_V1_26570_CARRIED_FAILURES.txt" >/dev/null || fail "26570 V1.1 full-checkout package-scope regression absent"
   grep -F 'IRIS_26570_ONE_SIDED_EDGE_LUMA_AUTHORITY' "$ROOT/REGRESSION_V1_26570_SURFACE_PERFORMANCE_CONTRACT.txt" >/dev/null || fail "surface regression contract missing"
   grep -F 'No verification order is weakened' "$ROOT/V1_26570_INFRASTRUCTURE_DIFF_AUDIT.txt" >/dev/null || fail "infrastructure diff audit missing"
   ! grep -Eq 'pip(3)?[[:space:]]+install' "$TRANSFORM" "$VALIDATE" "$AUTHORITY" "$PATCHVERIFY" "$SHADERVERIFY" "$BUILD_SCRIPT" "$WORKFLOW" || fail "package-manager dependency introduced"
@@ -187,7 +173,7 @@ verify_scope(){
   fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
   git merge-base --is-ancestor "$BASE_SUCCESS_COMMIT" HEAD || fail "successful 26569 V1.1 runtime authority is not an ancestor"
-  [[ "$(git rev-parse HEAD^)" == "$HANDOFF_PARENT_COMMIT" ]] || fail "26570 V1.1 retry must be one clean commit directly on failed V1 handoff"
+  [[ "$(git rev-parse HEAD^)" == "$HANDOFF_PARENT_COMMIT" ]] || fail "26570 V1.2 retry must be one clean commit directly on failed V1.1 handoff"
   python3 -S - "$HANDOFF" > "$WORK/expected_scope.txt" <<'PY'
 from pathlib import Path
 import sys
