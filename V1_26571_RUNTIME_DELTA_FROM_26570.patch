@@ -1,0 +1,676 @@
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+index 0e35b52191bbc0505bdd9f13bc80fa7dbf2fb6f4..d4ae6b442529a412486d1616493ab5a73fec356d 100644
+--- a/app/src/main/cpp/CMakeLists.txt
++++ b/app/src/main/cpp/CMakeLists.txt
+@@ -265,7 +265,7 @@ target_include_directories(motionv2jpeg PRIVATE
+     ${IRIS26507_UHDR}
+     ${IRIS26507_UHDR}/lib/include
+     ${CMAKE_CURRENT_SOURCE_DIR})
+-target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static jpeg-static iris26507-ultrahdr log jnigraphics android z)
++target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static jpeg-static iris26507-ultrahdr log jnigraphics android z EGL GLESv3)
+ 
+ # IRIS_26512_MGC1271_ISOLATED_NATIVE_OWNER
+ add_subdirectory(mgc1271_upstream)
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 317dc96854b39f7bfbd9c760b3e45eb373ca1ddf..190ac6cdae7f283d4d023b2981a2994f3088fb6f 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -4,8 +4,13 @@
+ #include <array>
+ #include <atomic>
+ #include <chrono>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
+ #include <thread>
+ #include <jni.h>
++#include <EGL/egl.h>
++#include <GLES3/gl31.h>
+ #include <cstdio>
+ #include <cerrno>
+ #include <string>
+@@ -631,6 +636,340 @@ inline void applyJinPixel(const Jin&j,const uint8_t*center,const uint8_t*right,c
+  * only needs the already-rendered right/down neighbors. Keep exact renderBase/applyJinPixel math
+  * and replace only storage order with full-width bands plus one down-row halo.
+  */
++
++inline uint64_t iris26569Ns(std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b);
++inline bool writeJpegBand(jpeg_compress_struct*c,std::vector<uint8_t>&bytes,int width,int components,int rows,uint64_t*timingNs);
++
++/* IRIS_26571_TRUE2X_GPU_PUBLICATION
++ * Accelerate only the late 50 MP publication renderer. Sabre/VGN reconstruction, the true2x
++ * carrier, capture/frame policy, DNG, JPEG quality, 4:4:4 sampling, 1:1 gain-map geometry and
++ * JPEG-R ownership are unchanged. The exact 26570 CPU renderer remains the authoritative fallback.
++ *
++ * The GPU producer owns its EGL context on one thread, renders bounded full-width bands into an
++ * RGBA8UI publication surface (RGB=SDR base, A=1:1 gain code), and uses two PBOs/fences for
++ * asynchronous readback. CPU libjpeg consumes prior bands concurrently. No full-frame GPU output
++ * allocation is introduced.
++ */
++#ifndef EGL_OPENGL_ES3_BIT_KHR
++#define EGL_OPENGL_ES3_BIT_KHR 0x0040
++#endif
++
++struct Iris26571GpuTiming {
++    uint64_t sourceReadNs=0, uploadDispatchNs=0, readbackWaitNs=0, deinterleaveNs=0, producerNs=0;
++};
++
++struct Iris26571ReadyBand {
++    int top=0,h=0;
++    std::vector<uint8_t> rgb;
++    std::vector<uint8_t> gain;
++};
++
++struct Iris26571BandQueue {
++    std::mutex mutex;
++    std::condition_variable notEmpty,notFull;
++    std::deque<Iris26571ReadyBand> bands;
++    bool done=false;
++    bool ok=true;
++    std::string reason;
++    static constexpr size_t kCapacity=2;
++    bool push(Iris26571ReadyBand&&b){
++        std::unique_lock<std::mutex>lock(mutex);
++        notFull.wait(lock,[&](){return bands.size()<kCapacity||!ok;});
++        if(!ok)return false;
++        bands.emplace_back(std::move(b));
++        notEmpty.notify_one();return true;
++    }
++    bool pop(Iris26571ReadyBand*out){
++        std::unique_lock<std::mutex>lock(mutex);
++        notEmpty.wait(lock,[&](){return !bands.empty()||done||!ok;});
++        if(bands.empty())return false;
++        *out=std::move(bands.front());bands.pop_front();notFull.notify_one();return true;
++    }
++    void finish(bool success,const char*why){
++        std::lock_guard<std::mutex>lock(mutex);if(!success)ok=false;done=true;if(why&&!success)reason=why;
++        notEmpty.notify_all();notFull.notify_all();
++    }
++};
++
++static const char*kIris26571PublicationCompute=R"GLSL(
++#version 310 es
++precision highp float;
++precision highp int;
++precision highp usampler2D;
++/* IRIS_26571_TRUE2X_PUBLICATION_COMPUTE */
++layout(local_size_x=16,local_size_y=8,local_size_z=1) in;
++layout(binding=0) uniform highp sampler2D uSource;
++layout(rgba8ui,binding=0) writeonly uniform highp uimage2D uOutput;
++layout(std430,binding=1) readonly buffer IrisGammaLut { float gammaLut[]; };
++
++uniform ivec2 uSrcOrigin;
++uniform ivec2 uSrcSize;
++uniform ivec2 uTrueSize;
++uniform ivec2 uOutputSize;
++uniform ivec2 uRawSize;
++uniform ivec2 uCropSize;
++uniform int uRotation;
++uniform int uMirror;
++uniform int uBandTop;
++uniform int uBandH;
++uniform int uGenerateGain;
++uniform float uResidualZoom;
++uniform float uDisplayGain;
++uniform float uExposureEv;
++uniform float uShadows;
++uniform float uContrast;
++uniform float uSceneWhite;
++uniform float uGainMax;
++uniform vec3 uSensorRow0;
++uniform vec3 uSensorRow1;
++uniform vec3 uSensorRow2;
++uniform vec3 uDisplayRow0;
++uniform vec3 uDisplayRow1;
++uniform vec3 uDisplayRow2;
++
++float irisLuma(vec3 c){return dot(c,vec3(0.22897456,0.69173852,0.07928691));}
++float irisPeak(vec3 c){return max(c.r,max(c.g,c.b));}
++vec3 irisClampNonnegative(vec3 c){return max(c,vec3(0.0));}
++float irisComponentGainLimit(float y,float c){
++    if(c>1.0e-7)return max(1.0,(1.0-y)/c);
++    if(c<(-1.0e-7))return max(1.0,(0.0-y)/c);
++    return 4.0;
++}
++vec3 irisMatRows(vec3 r0,vec3 r1,vec3 r2,vec3 v){return vec3(dot(r0,v),dot(r1,v),dot(r2,v));}
++vec3 irisCameraAt(ivec2 fullP){
++    fullP=clamp(fullP,ivec2(0),uTrueSize-ivec2(1));
++    ivec2 local=fullP-uSrcOrigin;
++    local=clamp(local,ivec2(0),uSrcSize-ivec2(1));
++    return max(texelFetch(uSource,local,0).rgb,vec3(0.0));
++}
++vec3 irisProfileColor(ivec2 p){
++    vec3 camera=irisCameraAt(p);
++    vec3 profile=irisMatRows(uSensorRow0,uSensorRow1,uSensorRow2,camera);
++    vec3 linear=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,profile);
++    float floorV=min(linear.r,min(linear.g,linear.b));
++    if(floorV<0.0)linear-=vec3(floorV);
++    return irisClampNonnegative(linear);
++}
++vec3 irisAdaptive(ivec2 p){
++    vec3 center=irisProfileColor(p);
++    float cy=irisLuma(center);
++    vec3 cc=center-vec3(cy);
++    float cm=length(cc);
++    float relative=cm/max(cy,0.08);
++    const ivec2 d0=ivec2(-1,0),d1=ivec2(1,0),d2=ivec2(0,-1),d3=ivec2(0,1);
++    vec3 n0=irisProfileColor(p+d0),n1=irisProfileColor(p+d1),n2=irisProfileColor(p+d2),n3=irisProfileColor(p+d3);
++    float y0=irisLuma(n0),y1=irisLuma(n1),y2=irisLuma(n2),y3=irisLuma(n3);
++    vec3 c0=n0-vec3(y0),c1=n1-vec3(y1),c2=n2-vec3(y2),c3=n3-vec3(y3);
++    vec3 mean=(cc+c0+c1+c2+c3)*0.2;
++    float meanMag=(cm+length(c0)+length(c1)+length(c2)+length(c3))*0.2;
++    float maxYDelta=max(max(abs(y0-cy),abs(y1-cy)),max(abs(y2-cy),abs(y3-cy)));
++    float coherence=length(mean)/max(meanMag,1.0e-6);
++    float disagreement=length(cc-mean);
++    float neutral=smoothstep(0.0035,0.018,cm);
++    float rolloff=1.0-smoothstep(0.08,0.45,relative);
++    float dg=max(uDisplayGain,1.0e-6);
++    float projectedY=cy*dg,projectedPeak=irisPeak(center)*dg;
++    float shadow=smoothstep(0.015,0.075,projectedY);
++    float high=1.0-smoothstep(0.72,0.98,projectedPeak);
++    float coh=smoothstep(0.45,0.82,coherence);
++    float agree=1.0-smoothstep(0.018,0.085,disagreement);
++    float edge=1.0-smoothstep(0.025,0.11,maxYDelta*dg);
++    float requested=1.0+0.22*neutral*rolloff*shadow*high*coh*agree*edge;
++    float limitV=4.0;
++    if(irisPeak(center)>=1.0||projectedPeak>=1.0)limitV=1.0;
++    else{
++        limitV=min(limitV,irisComponentGainLimit(cy,cc.r));
++        limitV=min(limitV,irisComponentGainLimit(cy,cc.g));
++        limitV=min(limitV,irisComponentGainLimit(cy,cc.b));
++    }
++    float g=clamp(min(requested,limitV),1.0,1.22);
++    return g<=1.000001?center:vec3(cy)+cc*g;
++}
++vec3 irisTone(vec3 rgb){
++    rgb=irisClampNonnegative(rgb)*exp2(uExposureEv);
++    if(abs(uShadows)>=0.0001){
++        float y=irisLuma(rgb),mask=1.0-smoothstep(0.08,0.55,y),target=y;
++        if(uShadows<0.0)target=y+(-uShadows)*0.08*mask*(1.0-clamp(y,0.0,1.0));
++        else target=y*(1.0-0.75*uShadows*mask);
++        rgb=y<=1.0e-7?vec3(max(target,0.0)):irisClampNonnegative(rgb)*(max(target,0.0)/y);
++    }
++    if(abs(uContrast)>=0.0001){
++        float y=irisLuma(rgb);
++        if(y>1.0e-7){
++            const float pivot=0.18;
++            float slope=1.0+0.25*uContrast;
++            float target=pivot*exp2(log2(max(y/pivot,1.0e-6))*slope);
++            rgb=irisClampNonnegative(rgb)*(max(target,0.0)/y);
++        }
++    }
++    return irisClampNonnegative(rgb);
++}
++vec3 irisPreRenderAt(ivec2 p){return irisTone(irisAdaptive(p)*max(uDisplayGain,1.0e-6));}
++vec3 irisSamplePreRender(vec2 p){
++    p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
++    if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
++    ivec2 p0=ivec2(floor(p)),p1=min(p0+ivec2(1),uTrueSize-ivec2(1));
++    vec2 f=p-vec2(p0);
++    vec3 a=irisPreRenderAt(p0),b=irisPreRenderAt(ivec2(p1.x,p0.y));
++    vec3 c=irisPreRenderAt(ivec2(p0.x,p1.y)),d=irisPreRenderAt(p1);
++    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
++}
++vec2 irisOutputToSource(ivec2 op){
++    float bx=(float(op.x)+0.5)*0.5-0.5,by=(float(op.y)+0.5)*0.5-0.5;
++    float ux=0.0,uy=0.0;
++    if(uRotation==90){
++        float xx=bx;if(uMirror!=0)xx=float(uCropSize.y)-xx;ux=by;uy=float(uRawSize.y)-xx;
++    }else if(uRotation==180){
++        float yy=by;if(uMirror!=0)yy=float(uRawSize.y)-yy;ux=float(uRawSize.x)-bx;uy=float(uRawSize.y)-yy;
++    }else if(uRotation==270){
++        float xx=bx+float(uRawSize.y-uCropSize.y);if(uMirror!=0)xx=float(uCropSize.y)-xx;ux=float(uRawSize.x)-by;uy=xx;
++    }else{
++        float yy=by+float(uRawSize.y-uCropSize.y);if(uMirror!=0)yy=float(uRawSize.y)-yy;ux=bx;uy=yy;
++    }
++    float cx=(float(uRawSize.x)-1.0)*0.5,cy=(float(uRawSize.y)-1.0)*0.5;
++    float sx=cx+(ux-cx)/uResidualZoom,sy=cy+(uy-cy)/uResidualZoom;
++    return clamp(2.0*(vec2(sx,sy)+vec2(0.5))-vec2(0.5),vec2(0.0),vec2(uTrueSize-ivec2(1)));
++}
++vec3 irisHeadroom(vec3 rgb){
++    rgb=irisClampNonnegative(rgb);
++    float y=max(irisLuma(rgb),0.0),pk=irisPeak(rgb),guide=max(y,pk);
++    if(guide>1.0e-7&&guide>0.50){
++        float white=max(uSceneWhite,0.55);
++        float x=clamp((guide-0.50)/max(white-0.50,1.0e-6),0.0,1.0);
++        float shaped=log(1.0+6.0*x)/log(7.0);
++        float mapped=0.50+(1.25-0.50)*shaped;
++        rgb*=mapped/guide;
++    }
++    rgb*=0.80;
++    float pk2=irisPeak(rgb);if(pk2>1.0)rgb*=1.0/max(pk2,1.0e-6);
++    return irisClampNonnegative(rgb);
++}
++float irisGamma(float x){
++    x=clamp(x,0.0,1.0);float q=x*16384.0;int a=int(q),b=min(a+1,16384);
++    return mix(gammaLut[a],gammaLut[b],q-float(a));
++}
++uint irisByte(float x){return uint(clamp(floor(clamp(x,0.0,1.0)*255.0+0.5),0.0,255.0));}
++void main(){
++    ivec2 local=ivec2(gl_GlobalInvocationID.xy);
++    if(local.x>=uOutputSize.x||local.y>=uBandH)return;
++    ivec2 op=ivec2(local.x,uBandTop+local.y);
++    vec3 hdr=irisSamplePreRender(irisOutputToSource(op));
++    vec3 sdr=irisHeadroom(hdr);
++    uint gainCode=0u;
++    if(uGenerateGain!=0){
++        const float off=0.015625;float safeMax=max(uGainMax,1.001);
++        float hdrY=max(irisLuma(irisClampNonnegative(hdr)),0.0);
++        float sdrY=max(irisLuma(irisClampNonnegative(sdr)),0.0);
++        float ratio=clamp((hdrY+off)/(sdrY+off),1.0,safeMax);
++        float code=clamp(log2(ratio)/max(log2(safeMax),1.0e-6),0.0,1.0);
++        gainCode=irisByte(code);
++    }
++    uvec4 outv=uvec4(irisByte(irisGamma(sdr.r)),irisByte(irisGamma(sdr.g)),irisByte(irisGamma(sdr.b)),gainCode);
++    imageStore(uOutput,local,outv);
++}
++)GLSL";
++
++inline GLuint iris26571Compile(GLenum type,const char*src,std::string*error){
++    GLuint s=glCreateShader(type);if(!s)return 0;glShaderSource(s,1,&src,nullptr);glCompileShader(s);GLint ok=0;glGetShaderiv(s,GL_COMPILE_STATUS,&ok);
++    if(!ok){GLint n=0;glGetShaderiv(s,GL_INFO_LOG_LENGTH,&n);std::vector<char>log((size_t)std::max(n,1));glGetShaderInfoLog(s,n,nullptr,log.data());if(error)*error=log.data();glDeleteShader(s);return 0;}return s;
++}
++inline GLuint iris26571Program(std::string*error){
++    GLuint sh=iris26571Compile(GL_COMPUTE_SHADER,kIris26571PublicationCompute,error);if(!sh)return 0;GLuint p=glCreateProgram();if(!p){glDeleteShader(sh);return 0;}glAttachShader(p,sh);glLinkProgram(p);glDeleteShader(sh);GLint ok=0;glGetProgramiv(p,GL_LINK_STATUS,&ok);
++    if(!ok){GLint n=0;glGetProgramiv(p,GL_INFO_LOG_LENGTH,&n);std::vector<char>log((size_t)std::max(n,1));glGetProgramInfoLog(p,n,nullptr,log.data());if(error)*error=log.data();glDeleteProgram(p);return 0;}return p;
++}
++
++class Iris26571GpuPublisher {
++public:
++    ~Iris26571GpuPublisher(){destroy();}
++    bool init(const Params&p,const SrgbLut&lut,int outW,int outH,int bandRows,std::string*reason){
++        params=&p;outWidth=outW;outHeight=outH;maxBandRows=bandRows;
++        display=eglGetDisplay(EGL_DEFAULT_DISPLAY);if(display==EGL_NO_DISPLAY){set(reason,"eglGetDisplay");return false;}
++        EGLint maj=0,min=0;if(!eglInitialize(display,&maj,&min)){set(reason,"eglInitialize");return false;}
++        if(!eglBindAPI(EGL_OPENGL_ES_API)){set(reason,"eglBindAPI");return false;}
++        const EGLint cfgAttr[]={EGL_SURFACE_TYPE,EGL_PBUFFER_BIT,EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT_KHR,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_NONE};
++        EGLint count=0;if(!eglChooseConfig(display,cfgAttr,&config,1,&count)||count<1){set(reason,"eglChooseConfig");return false;}
++        const EGLint pbAttr[]={EGL_WIDTH,1,EGL_HEIGHT,1,EGL_NONE};surface=eglCreatePbufferSurface(display,config,pbAttr);if(surface==EGL_NO_SURFACE){set(reason,"eglCreatePbufferSurface");return false;}
++        const EGLint ctxAttr[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};context=eglCreateContext(display,config,EGL_NO_CONTEXT,ctxAttr);if(context==EGL_NO_CONTEXT){set(reason,"eglCreateContext");return false;}
++        if(!eglMakeCurrent(display,surface,surface,context)){set(reason,"eglMakeCurrent");return false;}
++        GLint major=0,minor=0,maxTex=0;glGetIntegerv(GL_MAJOR_VERSION,&major);glGetIntegerv(GL_MINOR_VERSION,&minor);glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maxTex);
++        if(major<3||(major==3&&minor<1)){set(reason,"OpenGL ES < 3.1");return false;}
++        if(maxTex<std::max(outWidth,std::max(p.trueW,p.trueH))){set(reason,"GL_MAX_TEXTURE_SIZE");return false;}
++        std::string compileError;program=iris26571Program(&compileError);if(!program){set(reason,("compute:"+compileError).c_str());return false;}
++        glGenTextures(1,&sourceTex);glBindTexture(GL_TEXTURE_2D,sourceTex);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
++        glGenTextures(1,&outputTex);glBindTexture(GL_TEXTURE_2D,outputTex);glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8UI,outWidth,maxBandRows);
++        glGenFramebuffers(1,&fbo);glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,outputTex,0);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){set(reason,"RGBA8UI framebuffer");return false;}
++        glGenBuffers(1,&lutSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,lutSsbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(lut.v.size()*sizeof(float)),lut.v.data(),GL_STATIC_DRAW);
++        const size_t maxBytes=(size_t)outWidth*maxBandRows*4;glGenBuffers(2,pbo);for(int i=0;i<2;i++){glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[i]);glBufferData(GL_PIXEL_PACK_BUFFER,(GLsizeiptr)maxBytes,nullptr,GL_STREAM_READ);}
++        glBindBuffer(GL_PIXEL_PACK_BUFFER,0);GLenum err=glGetError();if(err!=GL_NO_ERROR){set(reason,"GL allocation");return false;}
++        glUseProgram(program);glUniform1i(loc("uSource"),0);setParams();return true;
++    }
++    bool renderReadback(int fd,float gainMax,bool generateGain,int top,int h,int slot,Iris26571ReadyBand*out,Iris26571GpuTiming*timing,std::string*reason){
++        if(!params||slot<0||slot>1)return false;
++        SourceRegion src;auto rs=std::chrono::steady_clock::now();if(!readRegion(fd,*params,0,top,outWidth-1,top+h-1,&src)){set(reason,"readRegion");return false;}auto re=std::chrono::steady_clock::now();if(timing)timing->sourceReadNs+=iris26569Ns(rs,re);
++        auto us=std::chrono::steady_clock::now();glPixelStorei(GL_UNPACK_ALIGNMENT,1);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,sourceTex);
++        if(src.w>sourceAllocW||src.h>sourceAllocH){sourceAllocW=std::max(sourceAllocW,src.w);sourceAllocH=std::max(sourceAllocH,src.h);glTexImage2D(GL_TEXTURE_2D,0,GL_RGB16F,sourceAllocW,sourceAllocH,0,GL_RGB,GL_HALF_FLOAT,nullptr);}
++        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,src.w,src.h,GL_RGB,GL_HALF_FLOAT,src.rgb.data());
++        glUseProgram(program);glUniform2i(loc("uSrcOrigin"),src.x0,src.y0);glUniform2i(loc("uSrcSize"),src.w,src.h);glUniform1i(loc("uBandTop"),top);glUniform1i(loc("uBandH"),h);glUniform1i(loc("uGenerateGain"),generateGain?1:0);glUniform1f(loc("uGainMax"),gainMax);
++        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,lutSsbo);glBindImageTexture(0,outputTex,0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8UI);
++        glDispatchCompute((GLuint)((outWidth+15)/16),(GLuint)((h+7)/8),1);glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT|GL_FRAMEBUFFER_BARRIER_BIT);
++        glBindFramebuffer(GL_FRAMEBUFFER,fbo);glReadBuffer(GL_COLOR_ATTACHMENT0);glPixelStorei(GL_PACK_ALIGNMENT,1);glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[slot]);glReadPixels(0,0,outWidth,h,GL_RGBA_INTEGER,GL_UNSIGNED_BYTE,(void*)0);
++        if(fence[slot]){glDeleteSync(fence[slot]);fence[slot]=0;}fence[slot]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);glFlush();auto ue=std::chrono::steady_clock::now();if(timing)timing->uploadDispatchNs+=iris26569Ns(us,ue);
++        if(glGetError()!=GL_NO_ERROR||!fence[slot]){set(reason,"dispatch/readback");return false;}
++        pendingTop[slot]=top;pendingH[slot]=h;return true;
++    }
++    bool resolve(int slot,bool generateGain,Iris26571ReadyBand*out,Iris26571GpuTiming*timing,std::string*reason){
++        if(!out||slot<0||slot>1||!fence[slot]||pendingH[slot]<=0)return false;auto ws=std::chrono::steady_clock::now();GLenum wait=GL_TIMEOUT_EXPIRED;while(wait==GL_TIMEOUT_EXPIRED)wait=glClientWaitSync(fence[slot],GL_SYNC_FLUSH_COMMANDS_BIT,1000000000ull);auto we=std::chrono::steady_clock::now();if(timing)timing->readbackWaitNs+=iris26569Ns(ws,we);if(wait==GL_WAIT_FAILED){set(reason,"glClientWaitSync");return false;}
++        glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[slot]);size_t px=(size_t)outWidth*pendingH[slot],bytes=px*4;const uint8_t*mapped=(const uint8_t*)glMapBufferRange(GL_PIXEL_PACK_BUFFER,0,(GLsizeiptr)bytes,GL_MAP_READ_BIT);if(!mapped){set(reason,"glMapBufferRange");return false;}
++        auto ds=std::chrono::steady_clock::now();out->top=pendingTop[slot];out->h=pendingH[slot];out->rgb.resize(px*3);if(generateGain)out->gain.resize(px);else out->gain.clear();
++        for(size_t i=0;i<px;i++){out->rgb[i*3]=mapped[i*4];out->rgb[i*3+1]=mapped[i*4+1];out->rgb[i*3+2]=mapped[i*4+2];if(generateGain)out->gain[i]=mapped[i*4+3];}
++        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);glBindBuffer(GL_PIXEL_PACK_BUFFER,0);auto de=std::chrono::steady_clock::now();if(timing)timing->deinterleaveNs+=iris26569Ns(ds,de);glDeleteSync(fence[slot]);fence[slot]=0;pendingH[slot]=0;return glGetError()==GL_NO_ERROR;
++    }
++private:
++    EGLDisplay display=EGL_NO_DISPLAY;EGLConfig config=nullptr;EGLSurface surface=EGL_NO_SURFACE;EGLContext context=EGL_NO_CONTEXT;
++    GLuint program=0,sourceTex=0,outputTex=0,fbo=0,lutSsbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;const Params*params=nullptr;
++    GLint loc(const char*n){return glGetUniformLocation(program,n);}
++    static void set(std::string*r,const char*m){if(r)*r=m?m:"unknown";}
++    void setParams(){
++        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);
++        glUniform3f(loc("uSensorRow0"),params->sensorToProfile[0],params->sensorToProfile[1],params->sensorToProfile[2]);glUniform3f(loc("uSensorRow1"),params->sensorToProfile[3],params->sensorToProfile[4],params->sensorToProfile[5]);glUniform3f(loc("uSensorRow2"),params->sensorToProfile[6],params->sensorToProfile[7],params->sensorToProfile[8]);
++        glUniform3f(loc("uDisplayRow0"),params->profileToDisplay[0],params->profileToDisplay[1],params->profileToDisplay[2]);glUniform3f(loc("uDisplayRow1"),params->profileToDisplay[3],params->profileToDisplay[4],params->profileToDisplay[5]);glUniform3f(loc("uDisplayRow2"),params->profileToDisplay[6],params->profileToDisplay[7],params->profileToDisplay[8]);
++    }
++    void destroy(){
++        if(display!=EGL_NO_DISPLAY&&context!=EGL_NO_CONTEXT&&surface!=EGL_NO_SURFACE)eglMakeCurrent(display,surface,surface,context);
++        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
++        if(display!=EGL_NO_DISPLAY){eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(context!=EGL_NO_CONTEXT)eglDestroyContext(display,context);if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);eglTerminate(display);}
++        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=outputTex=fbo=lutSsbo=0;pbo[0]=pbo[1]=0;
++    }
++};
++
++inline bool iris26571EncodeGpuPublication(int sourceFd,float gainMax,const Params&p,const SrgbLut&lut,int outW,int outH,int bandRows,bool generateGain,const char*basePath,const char*gainPath,int quality,Iris26571GpuTiming*gpuTiming,uint64_t*baseJpegNs,uint64_t*gainJpegNs,std::string*reason){
++    if(!basePath||outW<=0||outH<=0||bandRows<=0)return false;
++    Iris26571BandQueue queue;auto producerStart=std::chrono::steady_clock::now();
++    std::thread producer([&](){
++        Iris26571GpuPublisher gpu;std::string why;if(!gpu.init(p,lut,outW,outH,bandRows,&why)){queue.finish(false,why.c_str());return;}
++        int bandIndex=0;bool ok=true;for(int top=0;top<outH&&ok;top+=bandRows,bandIndex++){
++            int h=std::min(bandRows,outH-top),slot=bandIndex&1;if(bandIndex>=2){Iris26571ReadyBand ready;if(!gpu.resolve(slot,generateGain,&ready,gpuTiming,&why)){ok=false;break;}if(!queue.push(std::move(ready))){ok=false;why="queue_cancelled";break;}}
++            if(!gpu.renderReadback(sourceFd,gainMax,generateGain,top,h,slot,nullptr,gpuTiming,&why)){ok=false;break;}
++        }
++        if(ok){int totalBands=(outH+bandRows-1)/bandRows;for(int k=std::max(0,totalBands-2);k<totalBands;k++){int slot=k&1;Iris26571ReadyBand ready;if(!gpu.resolve(slot,generateGain,&ready,gpuTiming,&why)){ok=false;break;}if(!queue.push(std::move(ready))){ok=false;why="queue_cancelled";break;}}}
++        queue.finish(ok,ok?nullptr:why.c_str());
++    });
++
++    FILE*baseOut=fopen(basePath,"wb");if(!baseOut){queue.finish(false,"open base");producer.join();return false;}FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gainPath,"wb");if(!gainOut){fclose(baseOut);queue.finish(false,"open gain");producer.join();return false;}}
++    jpeg_compress_struct baseC{};jpeg_error_mgr baseErr{};baseC.err=jpeg_std_error(&baseErr);jpeg_create_compress(&baseC);jpeg_stdio_dest(&baseC,baseOut);baseC.image_width=outW;baseC.image_height=outH;baseC.input_components=3;baseC.in_color_space=JCS_RGB;jpeg_set_defaults(&baseC);jpeg_set_quality(&baseC,std::clamp(quality,1,100),TRUE);for(int k=0;k<baseC.num_components;k++){baseC.comp_info[k].h_samp_factor=1;baseC.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&baseC,TRUE);bool streamed=writeDisplayP3Icc(&baseC);
++    jpeg_compress_struct gainC{};jpeg_error_mgr gainErr{};bool gainCreated=false;if(generateGain){gainC.err=jpeg_std_error(&gainErr);jpeg_create_compress(&gainC);gainCreated=true;jpeg_stdio_dest(&gainC,gainOut);gainC.image_width=outW;gainC.image_height=outH;gainC.input_components=1;gainC.in_color_space=JCS_GRAYSCALE;jpeg_set_defaults(&gainC);jpeg_set_quality(&gainC,95,TRUE);jpeg_start_compress(&gainC,TRUE);}
++    int expectedTop=0,bands=0;while(streamed&&expectedTop<outH){Iris26571ReadyBand band;if(!queue.pop(&band)){streamed=false;break;}if(band.top!=expectedTop||band.h<=0){streamed=false;break;}
++        std::atomic<bool>gainOk{true};std::thread gainThread;if(generateGain)gainThread=std::thread([&](){gainOk.store(writeJpegBand(&gainC,band.gain,outW,1,band.h,gainJpegNs),std::memory_order_relaxed);});
++        bool baseOk=writeJpegBand(&baseC,band.rgb,outW,3,band.h,baseJpegNs);if(generateGain)gainThread.join();if(!baseOk||(generateGain&&!gainOk.load(std::memory_order_relaxed))){streamed=false;break;}expectedTop+=band.h;bands++;
++    }
++    if(!streamed)queue.finish(false,"jpeg_band_encode");
++    producer.join();{std::lock_guard<std::mutex>lock(queue.mutex);if(!queue.ok){streamed=false;if(reason)*reason=queue.reason;}}
++    auto producerEnd=std::chrono::steady_clock::now();if(gpuTiming)gpuTiming->producerNs=iris26569Ns(producerStart,producerEnd);
++    if(streamed&&baseC.next_scanline==baseC.image_height&&(!generateGain||gainC.next_scanline==gainC.image_height)){jpeg_finish_compress(&baseC);if(generateGain)jpeg_finish_compress(&gainC);}else{jpeg_abort_compress(&baseC);if(gainCreated)jpeg_abort_compress(&gainC);}
++    jpeg_destroy_compress(&baseC);if(gainCreated)jpeg_destroy_compress(&gainC);int bf=fflush(baseOut),bc=fclose(baseOut),gf=0,gc=0;if(gainOut){gf=fflush(gainOut);gc=fclose(gainOut);}
++    bool ok=streamed&&bf==0&&bc==0&&(!generateGain||(gf==0&&gc==0));if(!ok){unlink(basePath);if(generateGain)unlink(gainPath);}return ok;
++}
++
+ struct StreamingBandTiming { uint64_t profileNs=0,renderNs=0,jinNs=0; };
+ inline uint64_t iris26569Ns(std::chrono::steady_clock::time_point a,std::chrono::steady_clock::time_point b){return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count();}
+ inline void addBandTiming(StreamingBandTiming*total,const StreamingBandTiming&band){if(!total)return;total->profileNs+=band.profileNs;total->renderNs+=band.renderNs;total->jinNs+=band.jinNs;}
+@@ -676,10 +1015,37 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+      * Preserve exact 26567 final-render math, 4:4:4 JPEG parameters, Display-P3 ICC and 1:1
+      * gain samples, but stream full-width bands directly. Ephemeral RGB8/gain scratch disappears.
+      */
++    SrgbLut lut;const bool motionFast=!jin.enabled();const int bandRows=motionFast?256:128;unsigned hc=std::thread::hardware_concurrency();int workers=std::max(1,std::min(motionFast?6:4,(int)(hc?hc:2)));
++    /* IRIS_26571_TRUE2X_GPU_PUBLICATION_ROUTE
++     * Only the Jin-free / watermark-free true2x publication fast path is GPU-eligible. Any EGL,
++     * GLES 3.1, allocation, shader, dispatch, readback or encode failure deletes the GPU temp
++     * outputs and replays the exact 26570 CPU publication path from the unchanged true2x carrier.
++     */
++    bool gpuEligible=motionFast&&!water.enabled();bool gpuEncoded=false;Iris26571GpuTiming gpuTiming{};uint64_t gpuBaseJpegNs=0,gpuGainJpegNs=0;std::string gpuReason;
++    std::string gpuBasePath=std::string(op.c)+".iris26571_gpu",gpuGainPath=generateGain?std::string(gp.c)+".iris26571_gpu":std::string();
++    unlink(gpuBasePath.c_str());if(generateGain)unlink(gpuGainPath.c_str());auto gpuStart=std::chrono::steady_clock::now();
++    if(gpuEligible)gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,p,lut,outW,outH,bandRows,generateGain,gpuBasePath.c_str(),generateGain?gpuGainPath.c_str():nullptr,(int)quality,&gpuTiming,&gpuBaseJpegNs,&gpuGainJpegNs,&gpuReason);
++    auto gpuEnd=std::chrono::steady_clock::now();uint64_t gpuTotalNs=iris26569Ns(gpuStart,gpuEnd);
++    if(gpuEncoded){
++        unlink(op.c);if(rename(gpuBasePath.c_str(),op.c)!=0)gpuEncoded=false;
++        if(gpuEncoded&&generateGain){unlink(gp.c);if(rename(gpuGainPath.c_str(),gp.c)!=0)gpuEncoded=false;}
++        if(!gpuEncoded){unlink(op.c);if(generateGain)unlink(gp.c);}
++    }
++    if(gpuEncoded){
++        close(sourceFd);
++        __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26571_TRUE2X_GPU_PUBLICATION gpuEligible=1 gpuUsed=1 sourceReadMs=%.3f uploadDispatchMs=%.3f readbackWaitMs=%.3f deinterleaveMs=%.3f producerMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f totalMs=%.3f bandRows=%d pboSlots=2 gain1to1=%d",(double)gpuTiming.sourceReadNs/1000000.0,(double)gpuTiming.uploadDispatchNs/1000000.0,(double)gpuTiming.readbackWaitNs/1000000.0,(double)gpuTiming.deinterleaveNs/1000000.0,(double)gpuTiming.producerNs/1000000.0,(double)gpuBaseJpegNs/1000000.0,(double)gpuGainJpegNs/1000000.0,(double)gpuTotalNs/1000000.0,bandRows,generateGain?1:0);
++        __android_log_print(ANDROID_LOG_INFO,"MotionTrace","PIPELINE_STATE stage=IRIS_26571_TRUE2X_GPU_PUBLICATION details=gpuEligible=1 gpuUsed=1 sourceReadMs=%.3f uploadDispatchMs=%.3f readbackWaitMs=%.3f deinterleaveMs=%.3f producerMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f totalMs=%.3f bandRows=%d pboSlots=2 gain1to1=%d",(double)gpuTiming.sourceReadNs/1000000.0,(double)gpuTiming.uploadDispatchNs/1000000.0,(double)gpuTiming.readbackWaitNs/1000000.0,(double)gpuTiming.deinterleaveNs/1000000.0,(double)gpuTiming.producerNs/1000000.0,(double)gpuBaseJpegNs/1000000.0,(double)gpuGainJpegNs/1000000.0,(double)gpuTotalNs/1000000.0,bandRows,generateGain?1:0);
++        return JNI_TRUE;
++    }
++    unlink(gpuBasePath.c_str());if(generateGain)unlink(gpuGainPath.c_str());
++    __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26571_TRUE2X_GPU_FALLBACK eligible=%d reason=%s elapsedMs=%.3f",(int)gpuEligible,gpuReason.empty()?(gpuEligible?"gpu_failed":"jin_or_watermark"):gpuReason.c_str(),(double)gpuTotalNs/1000000.0);
++    __android_log_print(ANDROID_LOG_INFO,"MotionTrace","PIPELINE_STATE stage=IRIS_26571_TRUE2X_GPU_FALLBACK details=eligible=%d reason=%s elapsedMs=%.3f",(int)gpuEligible,gpuReason.empty()?(gpuEligible?"gpu_failed":"jin_or_watermark"):gpuReason.c_str(),(double)gpuTotalNs/1000000.0);
++
++    /* Exact successful 26570 CPU fallback begins here. */
+     unlink(op.c);if(generateGain)unlink(gp.c);FILE*baseOut=fopen(op.c,"wb");if(!baseOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_base_jpeg errno=%d",errno);close(sourceFd);return JNI_FALSE;}FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gp.c,"wb");if(!gainOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_gain_jpeg errno=%d",errno);fclose(baseOut);unlink(op.c);close(sourceFd);return JNI_FALSE;}}
+     jpeg_compress_struct baseC{};jpeg_error_mgr baseErr{};baseC.err=jpeg_std_error(&baseErr);jpeg_create_compress(&baseC);jpeg_stdio_dest(&baseC,baseOut);baseC.image_width=outW;baseC.image_height=outH;baseC.input_components=3;baseC.in_color_space=JCS_RGB;jpeg_set_defaults(&baseC);jpeg_set_quality(&baseC,std::clamp((int)quality,1,100),TRUE);for(int k=0;k<baseC.num_components;k++){baseC.comp_info[k].h_samp_factor=1;baseC.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&baseC,TRUE);bool streamed=writeDisplayP3Icc(&baseC);
+     jpeg_compress_struct gainC{};jpeg_error_mgr gainErr{};bool gainCreated=false;if(generateGain){gainC.err=jpeg_std_error(&gainErr);jpeg_create_compress(&gainC);gainCreated=true;jpeg_stdio_dest(&gainC,gainOut);gainC.image_width=outW;gainC.image_height=outH;gainC.input_components=1;gainC.in_color_space=JCS_GRAYSCALE;jpeg_set_defaults(&gainC);jpeg_set_quality(&gainC,95,TRUE);jpeg_start_compress(&gainC,TRUE);}
+-    SrgbLut lut;const bool motionFast=!jin.enabled();const int bandRows=motionFast?256:128;unsigned hc=std::thread::hardware_concurrency();int workers=std::max(1,std::min(motionFast?6:4,(int)(hc?hc:2)));StreamingBandTiming timing{};uint64_t baseJpegNs=0,gainJpegNs=0,overlapNs=0;int bands=0;auto streamStart=std::chrono::steady_clock::now();
++    StreamingBandTiming timing{};uint64_t baseJpegNs=0,gainJpegNs=0,overlapNs=0;int bands=0;auto streamStart=std::chrono::steady_clock::now();
+     /* IRIS_26570_TRUE2X_RENDER_ENCODE_PIPELINE
+      * Keep the exact 26569 pixel equations, 4:4:4 base JPEG, 1:1 gain map and 256-row memory
+      * bound. While libjpeg consumes band N, render band N+1; base and gain compressors run on
+@@ -696,6 +1062,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+     auto streamEnd=std::chrono::steady_clock::now();
+     if(streamed&&baseC.next_scanline==baseC.image_height&&(!generateGain||gainC.next_scanline==gainC.image_height)){jpeg_finish_compress(&baseC);if(generateGain)jpeg_finish_compress(&gainC);}else{streamed=false;jpeg_abort_compress(&baseC);if(gainCreated)jpeg_abort_compress(&gainC);}jpeg_destroy_compress(&baseC);if(gainCreated)jpeg_destroy_compress(&gainC);int baseFlush=fflush(baseOut),baseClose=fclose(baseOut),gainFlush=0,gainClose=0;if(gainOut){gainFlush=fflush(gainOut);gainClose=fclose(gainOut);}close(sourceFd);
+     bool baseEncoded=streamed&&baseFlush==0&&baseClose==0;bool gainEncoded=!generateGain||(streamed&&gainFlush==0&&gainClose==0);if(!baseEncoded)unlink(op.c);if(generateGain&&!gainEncoded)unlink(gp.c);__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26570_TRUE2X_ENCODER_TIMING profileMs=%.3f renderMs=%.3f jinMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f overlapPipelineMs=%.3f streamMs=%.3f workers=%d bandRows=%d profileCache=%d jpegBatchRows=%d doubleBuffered=%d concurrentGain=%d",timing.profileNs/1000000.0,timing.renderNs/1000000.0,timing.jinNs/1000000.0,baseJpegNs/1000000.0,gainJpegNs/1000000.0,overlapNs/1000000.0,iris26569Ns(streamStart,streamEnd)/1000000.0,workers,bandRows,motionFast?1:0,32,1,generateGain?1:0);__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26568_TRUE2X_FINAL_STREAM rendered=%d baseEncoded=%d gainEncoded=%d gain1to1=%d source=%dx%d output=%dx%d workers=%d bands=%d jin=%d watermark=%d scratch=BOUNDED_DOUBLE_BAND",streamed?1:0,baseEncoded?1:0,gainEncoded?1:0,generateGain?1:0,(int)trueW,(int)trueH,outW,outH,workers,bands,jin.enabled()?1:0,water.enabled()?1:0);
++    __android_log_print(ANDROID_LOG_INFO,"MotionTrace","PIPELINE_STATE stage=IRIS_26571_TRUE2X_CPU_FALLBACK details=profileMs=%.3f renderMs=%.3f jinMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f streamMs=%.3f workers=%d bandRows=%d",(double)timing.profileNs/1000000.0,(double)timing.renderNs/1000000.0,(double)timing.jinNs/1000000.0,(double)baseJpegNs/1000000.0,(double)gainJpegNs/1000000.0,(double)iris26569Ns(streamStart,streamEnd)/1000000.0,workers,bandRows);
+     /* A valid 50MP base is authoritative. Gain/JPEG-R auxiliary failure is handled by Java by
+      * promoting that exact P3 base to SDR; it must never report base failure and trigger 12MP. */
+     return baseEncoded?JNI_TRUE:JNI_FALSE;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 98512a1c26d986c2af4e673d231f870748d0225f..01faf3300d612a27de3a9f931d3f82843af8073c 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -182,10 +182,11 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+ 
+         val finalStart = System.nanoTime()
+         dispatchFinal(filteredYccd, originalYccd)
+-        /* IRIS_26561_UNIVERSAL_ADAPTIVE_COLOR
+-         * Current-MGC VGN completes first, unchanged. One shared Iris post-VGN pass then removes
+-         * only locally unsupported shadow chroma while protecting coherent color and luminance
+-         * edges. Motion and Night therefore use the same color decision layer.
++        /* IRIS_26571_COHERENT_EDGE_COLOR_OWNER
++         * Current-MGC VGN still completes first. The shared post-VGN pass keeps the successful
++         * 26570 illumination-independent surface cleanup, but coherent real subject chroma is no
++         * longer pulled toward a weaker opposite-side consensus. Clean sky remains pass-through;
++         * highlight false-color suppression remains authoritative.
+          */
+         dispatchUniversalAdaptiveColor(assembledRgb, workA)
+         val completedVgn = assembledRgb
+@@ -593,12 +594,13 @@ internal object Iris26529SpatialRgbChromaShaders {
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26570_SURFACE_CONTINUITY_ILLUMINATION_INDEPENDENT
+-     * Runs only after current-MGC VGN has produced completed camera RGB. Surface cleanup is now
+-     * driven by illumination-normalized chroma disagreement and same-side local support, not by
+-     * absolute shadow brightness. It never boosts saturation and strong luma boundaries remain
+-     * authoritative, so the ceiling-light false-color protection is retained while chair/car
+-     * surfaces cannot flip cleanup regimes merely because illumination or reflection changes.
++    /* IRIS_26571_COHERENT_CHROMA_PRESERVATION
++     * Inherits the successful 26570 illumination-independent surface cleanup. Real chroma that
++     * agrees in hue with same-surface support is protected from one-way magnitude loss, while
++     * isolated unsupported chroma is still pulled toward consensus. A one-sided luma boundary
++     * with chroma disagreement becomes a material edge, so sky/subject colors cannot average
++     * across it. No target may exceed the center chroma magnitude, and highlight preservation is
++     * disabled so prior pink/magenta false-color suppression remains authoritative.
+      */
+     val universalAdaptiveColor26561 = """
+         #version 310 es
+@@ -631,14 +633,19 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float weightSum = 1.0;
+             float neighborSupport = 0.0;
+             float maximumRelativeLumaDelta = 0.0;
++            int brighterSide = 0;
++            int darkerSide = 0;
+             for (int y = -1; y <= 1; ++y) {
+                 for (int x = -1; x <= 1; ++x) {
+                     if (x == 0 && y == 0) continue;
+                     vec3 neighborRgb = loadRgb(p + ivec2(x, y));
+                     float neighborLuma = luminanceOf(neighborRgb);
+                     float lumaScale = max(max(centerLuma, neighborLuma), 0.060);
+-                    float relativeLumaDelta = abs(neighborLuma - centerLuma) / lumaScale;
++                    float signedRelativeLumaDelta = (neighborLuma - centerLuma) / lumaScale;
++                    float relativeLumaDelta = abs(signedRelativeLumaDelta);
+                     maximumRelativeLumaDelta = max(maximumRelativeLumaDelta, relativeLumaDelta);
++                    if (signedRelativeLumaDelta > 0.16) brighterSide++;
++                    if (signedRelativeLumaDelta < -0.16) darkerSide++;
+                     float sameSurfaceWeight = 1.0 - smoothstep(0.16, 0.55, relativeLumaDelta);
+                     vec3 neighborChroma = neighborRgb - vec3(neighborLuma);
+                     vec3 neighborNormalizedChroma = neighborChroma / max(neighborLuma, 0.060);
+@@ -651,11 +658,42 @@ internal object Iris26529SpatialRgbChromaShaders {
+             vec3 consensusNormalizedChroma = normalizedChromaSum / max(weightSum, 1.0e-6);
+             float chromaDisagreement = length(centerNormalizedChroma - consensusNormalizedChroma);
+             float consensusMagnitude = length(consensusNormalizedChroma);
++            float centerNormalizedMagnitude = length(centerNormalizedChroma);
++            float chromaAgreement = dot(centerNormalizedChroma, consensusNormalizedChroma) /
++                max(centerNormalizedMagnitude * consensusMagnitude, 1.0e-6);
++            chromaAgreement = clamp(chromaAgreement, -1.0, 1.0);
++
+             float unsupportedColor = smoothstep(0.045, 0.260, chromaDisagreement) *
+                 (1.0 - smoothstep(0.18, 0.65, consensusMagnitude));
+             float surfaceSupport = smoothstep(1.5, 5.5, neighborSupport);
+-            float edgeProtection = smoothstep(0.45, 0.90, maximumRelativeLumaDelta);
+-            float correction = 0.65 * unsupportedColor * surfaceSupport * (1.0 - edgeProtection);
++            float legacyEdgeProtection = smoothstep(0.45, 0.90, maximumRelativeLumaDelta);
++
++            /* IRIS_26571_SAME_SIDE_MATERIAL_BOUNDARY
++             * A moderate one-sided luma transition is a protected object/material boundary only
++             * when chroma also disagrees. Smooth illumination on one material therefore keeps the
++             * 26570 continuity behavior, while foliage/sky and other subject/background colors do
++             * not become one shared chroma population.
++             */
++            float oneSidedLuma = ((brighterSide >= 4 && darkerSide <= 1) ||
++                (darkerSide >= 4 && brighterSide <= 1)) ? 1.0 : 0.0;
++            float highlightPreservePermission = 1.0 - smoothstep(0.72, 0.92, centerLuma);
++            float materialBoundary = oneSidedLuma *
++                (1.0 - smoothstep(0.72, 0.92, chromaAgreement)) * highlightPreservePermission;
++            float edgeProtection = max(legacyEdgeProtection, materialBoundary);
++
++            /* Coherent real color may be stronger than a local average without being noise. This
++             * only reduces cleanup when hue is strongly supported and the center is not an extreme
++             * chroma outlier. It never adds chroma beyond the original center sample.
++             */
++            float coherentHue = smoothstep(0.72, 0.94, chromaAgreement) *
++                smoothstep(0.050, 0.180, consensusMagnitude);
++            float centerToConsensusMagnitude = centerNormalizedMagnitude /
++                max(consensusMagnitude, 0.025);
++            float plausibleCenterMagnitude = 1.0 - smoothstep(2.0, 3.5, centerToConsensusMagnitude);
++            float coherentCenterProtection = coherentHue * plausibleCenterMagnitude *
++                highlightPreservePermission;
++            float correction = 0.65 * unsupportedColor * surfaceSupport *
++                (1.0 - edgeProtection) * (1.0 - 0.85 * coherentCenterProtection);
+ 
+             vec3 targetChroma = consensusNormalizedChroma * centerScale;
+             float centerMagnitude = length(centerChroma);
+@@ -735,6 +773,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+         uniform float uChromaStrength;
+         $common
+         ivec3 s(ivec2 p){ uvec4 v=imageLoad(uInput,safePos(p)); return ivec3(int(v.r),signedChroma(v.g),signedChroma(v.b)); }
++        float chromaAgreement(vec2 a, vec2 b){return dot(a,b)/max(length(a)*length(b),1.0);}
+         void main(){
+             ivec2 p=ivec2(gl_GlobalInvocationID.xy); if(any(greaterThanEqual(p,uImageSize)))return;
+             ivec3 a=s(p+ivec2(-1,-1)),b=s(p+ivec2(0,-1)),c=s(p+ivec2(1,-1));
+@@ -747,22 +786,35 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float maximumRelativeLumaDelta=0.0;
+             int brighterSide=0;
+             int darkerSide=0;
++            vec2 brighterChromaSum=vec2(0.0);
++            vec2 darkerChromaSum=vec2(0.0);
+             for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x){
+                 if(x==0&&y==0)continue;
+-                float neighborY=float(imageLoad(uInput,safePos(p+ivec2(x,y))).r)/65504.0;
++                uvec4 neighbor=imageLoad(uInput,safePos(p+ivec2(x,y)));
++                float neighborY=float(neighbor.r)/65504.0;
+                 float scale=max(max(centerY,neighborY),0.060);
+                 float signedDelta=(neighborY-centerY)/scale;
+                 maximumRelativeLumaDelta=max(maximumRelativeLumaDelta,abs(signedDelta));
+-                if(signedDelta>0.18)brighterSide++;
+-                if(signedDelta<-0.18)darkerSide++;
++                vec2 neighborChroma=vec2(float(signedChroma(neighbor.g)),float(signedChroma(neighbor.b)));
++                if(signedDelta>0.16){brighterSide++;brighterChromaSum+=neighborChroma;}
++                if(signedDelta<-0.16){darkerSide++;darkerChromaSum+=neighborChroma;}
+             }
+             float oneSidedProtection=((brighterSide>=6&&darkerSide<=1)||(darkerSide>=6&&brighterSide<=1))?1.0:0.0;
+-            float edgeProtection=max(oneSidedProtection,smoothstep(0.45,0.90,maximumRelativeLumaDelta));
++            float sideCount=0.0;
++            vec2 sideChroma=vec2(0.0);
++            if(brighterSide>=4&&darkerSide<=1){sideCount=float(brighterSide);sideChroma=brighterChromaSum/max(sideCount,1.0);}
++            if(darkerSide>=4&&brighterSide<=1){sideCount=float(darkerSide);sideChroma=darkerChromaSum/max(sideCount,1.0);}
++            float sideAgreement=sideCount>0.0?clamp(chromaAgreement(vec2(centerChroma),sideChroma),-1.0,1.0):1.0;
++            float highlightPreservePermission=1.0-smoothstep(0.72,0.92,centerY);
++            float materialBoundary=(sideCount>0.0?1.0:0.0)*
++                (1.0-smoothstep(0.72,0.92,sideAgreement))*highlightPreservePermission;
++            float edgeProtection=max(max(oneSidedProtection,materialBoundary),smoothstep(0.45,0.90,maximumRelativeLumaDelta));
+             float strength=clamp(uChromaStrength,0.0,1.0)*(1.0-edgeProtection);
+             ivec2 corrected=strength<=0.0001?centerChroma:ivec2(mix(vec2(centerChroma),vec2(sum),strength));
+-            /* IRIS_26570_CROSS_EDGE_CHROMA_EXCLUSION
+-             * Median cleanup cannot import opposite-side sky/edge chroma, and luma remains the
+-             * pre-cleanup center sample so no brighter edge envelope can be manufactured here.
++            /* IRIS_26571_CROSS_EDGE_CHROMA_OWNERSHIP
++             * 26570 luma pass-through is preserved. Median chroma cleanup is additionally blocked
++             * at moderate one-sided material/color boundaries, preventing sky color from entering
++             * foliage or any other subject edge without weakening interior surface cleanup.
+              */
+             imageStore(uOutput,p,uvec4(
+                 center.r,
+@@ -782,6 +834,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+         layout(rgba16ui,binding=2) writeonly uniform highp uimage2D uOutput;
+         $common
+         vec3 smoothAt(ivec2 p){uvec4 v=imageLoad(uSmooth,safePos(p));return vec3(decodeU16(v.r),float(signedChroma(v.g)),float(signedChroma(v.b)));}
++        float chromaAgreement(vec2 a,vec2 b){return dot(a,b)/max(length(a)*length(b),1.0);}
+         vec4 filter3(uvec4 encoded,ivec2 p){
+             vec3 neg[4]; vec3 pos[4];
+             neg[0]=smoothAt(p+ivec2(-1,0));pos[0]=smoothAt(p+ivec2(1,0));neg[1]=smoothAt(p+ivec2(0,-1));pos[1]=smoothAt(p+ivec2(0,1));neg[2]=smoothAt(p+ivec2(1,-1));pos[2]=smoothAt(p+ivec2(-1,1));neg[3]=smoothAt(p+ivec2(-1,-1));pos[3]=smoothAt(p+ivec2(1,1));
+@@ -798,9 +851,36 @@ internal object Iris26529SpatialRgbChromaShaders {
+             ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
+             uvec4 e=imageLoad(uOriginal,p);vec4 f=vec4(decodeU16(e.r),float(signedChroma(e.g)),float(signedChroma(e.b)),0.0);
+             if(e.r!=0u&&e.a!=0u)f=filter3(e,p);
+-            uvec4 sm=imageLoad(uSmooth,p);ivec2 sc=ivec2(signedChroma(sm.g),signedChroma(sm.b));ivec2 fc=ivec2(f.yz);
+-            if(abs(sc.x)+abs(sc.y)<abs(fc.x)+abs(fc.y))fc=sc;
+-            imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(fc.x),unsignedChroma(fc.y),uint(clamp(f.w,0.0,65504.0))));
++            uvec4 sm=imageLoad(uSmooth,p);
++            vec2 originalChroma=vec2(float(signedChroma(e.g)),float(signedChroma(e.b)));
++            vec2 smoothChroma=vec2(float(signedChroma(sm.g)),float(signedChroma(sm.b)));
++            vec2 directionalChroma=f.yz;
++            vec2 legacyChroma=length(smoothChroma)<length(directionalChroma)?smoothChroma:directionalChroma;
++
++            /* IRIS_26571_DIRECTIONAL_EDGE_CHROMA_FLOOR
++             * Preserve the exact 26570 lower-chroma choice in interiors. At a real non-highlight
++             * directional edge, prefer the candidate whose hue agrees with the original subject
++             * and prevent that candidate from collapsing below 80% of coherent center chroma.
++             * The cap is the original center magnitude, so this cannot globally boost saturation.
++             */
++            float edgeEvidence=clamp(f.w/65504.0,0.0,1.0);
++            float centerY=clamp(f.x/65504.0,0.0,1.0);
++            float highlightPreservePermission=1.0-smoothstep(0.72,0.92,centerY);
++            float edgePreserve=smoothstep(0.08,0.30,edgeEvidence)*highlightPreservePermission;
++            float smoothAgreement=clamp(chromaAgreement(originalChroma,smoothChroma),-1.0,1.0);
++            float directionalAgreement=clamp(chromaAgreement(originalChroma,directionalChroma),-1.0,1.0);
++            vec2 edgeCandidate=directionalAgreement>=smoothAgreement?directionalChroma:smoothChroma;
++            float edgeAgreement=max(smoothAgreement,directionalAgreement);
++            float originalMagnitude=length(originalChroma);
++            float edgeMagnitude=length(edgeCandidate);
++            if(originalMagnitude>192.0&&edgeMagnitude>1.0&&edgeAgreement>0.82){
++                float protectedMagnitude=clamp(edgeMagnitude,0.80*originalMagnitude,originalMagnitude);
++                edgeCandidate*=protectedMagnitude/edgeMagnitude;
++            }
++            float coherentEdge=smoothstep(0.72,0.92,edgeAgreement);
++            vec2 selectedChroma=mix(legacyChroma,edgeCandidate,edgePreserve*coherentEdge);
++            ivec2 encodedChroma=ivec2(round(selectedChroma));
++            imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(encodedChroma.x),unsignedChroma(encodedChroma.y),uint(clamp(f.w,0.0,65504.0))));
+         }
+     """.trimIndent()
+ 
+@@ -831,16 +911,24 @@ internal object Iris26529SpatialRgbChromaShaders {
+             int outer=uAxis==0?int(gl_GlobalInvocationID.y):int(gl_GlobalInvocationID.x);int outerLimit=uAxis==0?uImageSize.y:uImageSize.x;int innerSize=uAxis==0?uImageSize.x:uImageSize.y;if(outer>=outerLimit)return;
+             int start=uDirection==0?0:innerSize-1;int step=uDirection==0?1:-1;uvec4 boundary=imageLoad(uInput,pos(start,outer));float by=decodeU16(boundary.r),cr=float(signedChroma(boundary.g)),cb=float(signedChroma(boundary.b));
+             float sy=steadyOutput(by,uA10,uB10,true),sc1=steadyOutput(cr,uADyn1,uBDyn1,false),sb1=steadyOutput(cb,uADyn1,uBDyn1,false),sc2=steadyOutput(sc1,uADyn2,uBDyn2,false),sb2=steadyOutput(sb1,uADyn2,uBDyn2,false);
+-            State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);float previousY=by;
++            State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);float previousY=by;float previousCr=cr;float previousCb=cb;
+             for(int i=0;i<innerSize;++i){
+                 ivec2 p=pos(start+i*step,outer);uvec4 px=imageLoad(uInput,p);float currentY=decodeU16(px.r);float inCr=float(signedChroma(px.g)),inCb=float(signedChroma(px.b));
+-                /* IRIS_26570_IIR_STRONG_EDGE_STATE_RESET
+-                 * Recursive color state may not cross a high-contrast physical boundary. Reset
+-                 * both directions independently at that boundary; smooth illumination changes
+-                 * remain recursive and therefore spatially continuous.
+-                 */
+                 float edgeRatio=abs(currentY-previousY)/max(max(currentY,previousY),3930.0);
+-                if(i>0&&edgeRatio>0.55){
++                float previousChromaMagnitude=length(vec2(previousCr,previousCb));
++                float currentChromaMagnitude=length(vec2(inCr,inCb));
++                float chromaScale=max(max(previousChromaMagnitude,currentChromaMagnitude),512.0);
++                float chromaJump=length(vec2(inCr-previousCr,inCb-previousCb))/chromaScale;
++                float highlightPreservePermission=1.0-smoothstep(47162.88,60263.68,max(currentY,previousY));
++                bool strongLumaBoundary=edgeRatio>0.55;
++                bool materialColorBoundary=edgeRatio>0.24&&chromaJump>0.45&&highlightPreservePermission>0.5;
++                /* IRIS_26571_IIR_MATERIAL_EDGE_STATE_RESET
++                 * Keep the 26570 strong-edge reset and additionally stop recursive chroma state at
++                 * moderate luma transitions when the input chroma itself proves a material/color
++                 * change. Smooth illumination with stable chroma stays recursive. Highlight pairs
++                 * retain 26570 behavior so false pink/magenta suppression is not relaxed.
++                 */
++                if(i>0&&(strongLumaBoundary||materialColorBoundary)){
+                     if(uFilterLuma!=0){float resetY=steadyOutput(currentY,uA10,uB10,true);ys=steady(currentY,resetY);}
+                     float resetCr1=steadyOutput(inCr,uADyn1,uBDyn1,false),resetCb1=steadyOutput(inCb,uADyn1,uBDyn1,false);
+                     float resetCr2=steadyOutput(resetCr1,uADyn2,uBDyn2,false),resetCb2=steadyOutput(resetCb1,uADyn2,uBDyn2,false);
+@@ -848,7 +936,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 }
+                 float y=uFilterLuma!=0?apply(ys,currentY,uA10,uB10,true):currentY;
+                 float r=apply(c1,inCr,uADyn1,uBDyn1,false);float q=apply(b1,inCb,uADyn1,uBDyn1,false);r=apply(c2,r,uADyn2,uBDyn2,false);q=apply(b2,q,uADyn2,uBDyn2,false);
+-                imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));previousY=currentY;
++                imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));previousY=currentY;previousCr=inCr;previousCb=inCb;
+             }
+         }
+     """.trimIndent()
+diff --git a/app/version.properties b/app/version.properties
+index e446fb7aa6330f46490f9e115a98540b47c6fd8d..dbd5d2c0e0f6658b7dd98d6cf8d76a7a7d488c2b 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726570
+-VERSION_BUILD=26570
++VERSION_NAME=0.9726571
++VERSION_BUILD=26571
