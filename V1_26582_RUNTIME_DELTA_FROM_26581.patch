@@ -1,0 +1,352 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 5a63ff3d4bcc3b907cd7e4675991034ffedac118..c47852209d7b47f9dfc7d1b3d031f4932ec8d8f9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -23,7 +23,13 @@ import static android.opengl.GLES20.GL_LINEAR;
+  * quarter-resolution interpolation that measurably softened the UHDR rendition.
+  */
+ public final class MotionV2Render extends Node {
+-    private static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
++    static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
++    static final float IRIS_26582_TONE_START = 0.50f;
++    static final float IRIS_26582_HIGHLIGHT_TARGET = 0.97f;
++    static final float IRIS_26582_CLIP_FRACTION_START = 0.002f;
++    static final float IRIS_26582_CLIP_FRACTION_FULL = 0.025f;
++    static final float IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE = 12.0f;
++    private static final float IRIS_26582_LOG_SHAPE = 6.0f;
+     /* IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS
+      * Preserve the tested 26505 SDR primary exactly. Ultra HDR is a reversible
+      * rendition relationship: the gain map should recover the wanted HDR signal
+@@ -37,6 +43,60 @@ public final class MotionV2Render extends Node {
+     public MotionV2Render() { super("", "MotionV2Render"); }
+     @Override public void Compile() {}
+ 
++    /* IRIS_26582_SHARED_GLOBAL_TONE_MODEL
++     * Single Java authority used by both the viewfinder solver and render setup. The GLSL render
++     * uses the same start/log shape/output scale; only sceneWhite is scene-adaptive.
++     */
++    static float iris26582BaseSceneWhite(float displayGain) {
++        return Math.max(1.0f, Math.min(6.0f, 0.90f * Math.max(1.0f, displayGain)));
++    }
++
++    static float iris26582MapHeadroom(float guide, float sceneWhite) {
++        if (guide <= IRIS_26582_TONE_START) return guide;
++        float whitePoint = Math.max(sceneWhite, IRIS_26582_TONE_START + 0.05f);
++        float x = iris26582Clamp((guide - IRIS_26582_TONE_START)
++                / Math.max(whitePoint - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
++        float shaped = (float)(Math.log(1.0 + IRIS_26582_LOG_SHAPE * x)
++                / Math.log(1.0 + IRIS_26582_LOG_SHAPE));
++        float preScaleDisplayWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
++        return IRIS_26582_TONE_START
++                + (preScaleDisplayWhite - IRIS_26582_TONE_START) * shaped;
++    }
++
++    static float iris26582AdaptiveStrength(float clippedFraction) {
++        float t = iris26582Clamp((clippedFraction - IRIS_26582_CLIP_FRACTION_START)
++                / Math.max(IRIS_26582_CLIP_FRACTION_FULL
++                        - IRIS_26582_CLIP_FRACTION_START, 1.0e-6f), 0.0f, 1.0f);
++        return t * t * (3.0f - 2.0f * t);
++    }
++
++    static float iris26582AdaptiveSceneWhite(float displayGain, float p99Guide,
++                                              float clippedFraction) {
++        float baseWhite = iris26582BaseSceneWhite(displayGain);
++        if (!Float.isFinite(p99Guide) || p99Guide <= 0.0f) return baseWhite;
++        float postP99 = p99Guide * Math.max(displayGain, 1.0e-6f);
++        if (postP99 <= baseWhite) return baseWhite;
++
++        /* Put robust P99 near 0.97 SDR, leaving the final 0.03 for rarer peaks.
++         * This is the inverse of the existing 26581 global log shoulder, not a new local operator.
++         */
++        float targetPreScale = IRIS_26582_HIGHLIGHT_TARGET / OUTPUT_EXPOSURE_SCALE;
++        float preScaleWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
++        float targetShape = iris26582Clamp((targetPreScale - IRIS_26582_TONE_START)
++                / Math.max(preScaleWhite - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
++        float targetX = (float)((Math.exp(targetShape * Math.log(1.0 + IRIS_26582_LOG_SHAPE)) - 1.0)
++                / IRIS_26582_LOG_SHAPE);
++        float requiredWhite = IRIS_26582_TONE_START
++                + (postP99 - IRIS_26582_TONE_START) / Math.max(targetX, 1.0e-4f);
++        requiredWhite = Math.max(baseWhite, Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, requiredWhite));
++        float strength = iris26582AdaptiveStrength(clippedFraction);
++        return baseWhite + (requiredWhite - baseWhite) * strength;
++    }
++
++    private static float iris26582Clamp(float x, float lo, float hi) {
++        return Math.max(lo, Math.min(hi, x));
++    }
++
+     @Override
+     public void Run() {
+         if (!(basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive)) {
+@@ -56,8 +116,12 @@ public final class MotionV2Render extends Node {
+          * sceneWhite follows only the real Photon display exposure. Accepted-Short BaselineExposure
+          * is source-domain restoration and must not stretch the SDR highlight shoulder.
+          */
+-        float sceneWhite = Math.max(
+-                1.0f, Math.min(6.0f, 0.90f * postDisplaySensorWhite));
++        float baseSceneWhite = iris26582BaseSceneWhite(postDisplaySensorWhite);
++        float sceneWhite = basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite;
++        if (!Float.isFinite(sceneWhite) || sceneWhite < baseSceneWhite) {
++            sceneWhite = baseSceneWhite;
++        }
++        sceneWhite = Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, sceneWhite);
+         /* IRIS_26530_V1_3_FOV_AUTHORITY
+          * motionV2OutputZoom is the final FOV authority. SR reconstruction scale must not divide
+          * the JPEG/UHDR crop request; doing so produced the measured ~2x-wide 123x frame.
+@@ -251,6 +315,13 @@ public final class MotionV2Render extends Node {
+                 + " postDisplaySensorWhite=" + postDisplaySensorWhite
+                 + " mgcSourceExposureGain=" + mgcSourceExposureGain
+                 + " sceneWhite=" + sceneWhite
++                + " baseSceneWhite=" + baseSceneWhite
++                + " toneP95Guide=" + basePipeline.mParameters.motionV2ToneP95Guide
++                + " toneP99Guide=" + basePipeline.mParameters.motionV2ToneP99Guide
++                + " predictedClipFraction=" + basePipeline.mParameters.motionV2TonePredictedClipFraction
++                + " adaptiveStrength=" + basePipeline.mParameters.motionV2ToneAdaptiveStrength
++                + " adaptiveHighlightTarget=" + IRIS_26582_HIGHLIGHT_TARGET
++                + " IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE=true"
+                 + " IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true"
+                                 + " toneCurve26430ExactBase=true"
+                 + " outputExposureScale=" + OUTPUT_EXPOSURE_SCALE
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index b988307f7745ab38bc92a21fbdcc086f87ff0302..63263818ec7fd2af8aca558ba313e2cf22942fee 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -44,7 +44,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+     private static final float MIN_EV = -4.0f;
+     private static final float MAX_EV = 4.0f;
+     private static final int MAX_ITERATIONS = 4;
+-    private static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
++    private static final float OUTPUT_EXPOSURE_SCALE = MotionV2Render.OUTPUT_EXPOSURE_SCALE;
+     private static final float LOG2 = (float)Math.log(2.0);
+ 
+     private static final String MATCH_STRENGTH_KEY = "pref_motion_viewfinder_match_strength";
+@@ -62,6 +62,8 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+     private static final float NIGHT_DARK_LUMA = 0.06f;
+     private static final float NIGHT_HEADROOM_GUIDE_LIMIT = 5.0f;
+     private float iris26550CandidateP99Guide = Float.NaN;
++    private float iris26582CandidateP95Guide = Float.NaN;
++    private final ArrayList<Float> iris26582CandidateGuides = new ArrayList<>();
+ 
+     private static final class RgbSample {
+         final float r, g, b;
+@@ -81,6 +83,15 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             throw new IllegalStateException("MotionV2ViewfinderExposureMatcher outside Iris Motion/Night");
+         }
+         WorkingTexture = previousNode.WorkingTexture;
++        iris26582CandidateGuides.clear();
++        iris26582CandidateP95Guide = Float.NaN;
++        iris26550CandidateP99Guide = Float.NaN;
++        basePipeline.mParameters.motionV2ToneP95Guide = Float.NaN;
++        basePipeline.mParameters.motionV2ToneP99Guide = Float.NaN;
++        basePipeline.mParameters.motionV2TonePredictedClipFraction = 0.0f;
++        basePipeline.mParameters.motionV2ToneBaseSceneWhite = 1.0f;
++        basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite = 1.0f;
++        basePipeline.mParameters.motionV2ToneAdaptiveStrength = 0.0f;
+         MotionViewfinderMetering.Snapshot snapshot = MotionViewfinderMetering.consumeLatest();
+         Bitmap preview = snapshot == null ? null : snapshot.bitmap;
+         float solvedEv = 0.0f;
+@@ -163,8 +174,26 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 throw new IllegalStateException("non-finite solved viewfinder gain");
+             }
+             basePipeline.mParameters.motionV2DisplayGain = gain;
++            ToneDecision iris26582Tone = iris26582ToneDecision(gain);
++            basePipeline.mParameters.motionV2ToneP95Guide = iris26582CandidateP95Guide;
++            basePipeline.mParameters.motionV2ToneP99Guide = iris26550CandidateP99Guide;
++            basePipeline.mParameters.motionV2TonePredictedClipFraction = iris26582Tone.clippedFraction;
++            basePipeline.mParameters.motionV2ToneBaseSceneWhite = iris26582Tone.baseSceneWhite;
++            basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite = iris26582Tone.adaptiveSceneWhite;
++            basePipeline.mParameters.motionV2ToneAdaptiveStrength = iris26582Tone.adaptiveStrength;
+             valid = true;
+ 
++            Log.i(Name, "IRIS_26582_SCENE_ADAPTIVE_TONE_DECISION"
++                    + " p95Guide=" + iris26582CandidateP95Guide
++                    + " p99Guide=" + iris26550CandidateP99Guide
++                    + " displayGain=" + gain
++                    + " predictedClipFraction=" + iris26582Tone.clippedFraction
++                    + " baseSceneWhite=" + iris26582Tone.baseSceneWhite
++                    + " adaptiveSceneWhite=" + iris26582Tone.adaptiveSceneWhite
++                    + " adaptiveStrength=" + iris26582Tone.adaptiveStrength
++                    + " highlightTarget=" + MotionV2Render.IRIS_26582_HIGHLIGHT_TARGET
++                    + " localTone=false uniformRgbScalar=true chromaOwnerUnchanged=true");
++
+             Log.i(Name, "IRIS_26519_VIEWFINDER_MATCH"
+                     + " requestId=" + snapshot.requestId
+                     + " requestToCopyMs=" + Math.max(0L,
+@@ -299,13 +328,18 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 float y = luma(r, g, b);
+                 if (y > 1.0e-4f && y < 8.0f) all.add(new RgbSample(r, g, b));
+             }
+-            if (basePipeline.mParameters.irisNightActive && !all.isEmpty()) {
+-                ArrayList<Float> guides = new ArrayList<>(all.size());
+-                for (RgbSample s : all) guides.add(Math.max(s.r, Math.max(s.g, s.b)));
+-                Collections.sort(guides);
+-                int p99 = Math.max(0, Math.min(guides.size() - 1,
+-                        Math.round((guides.size() - 1) * 0.99f)));
+-                iris26550CandidateP99Guide = guides.get(p99);
++            if (!all.isEmpty()) {
++                iris26582CandidateGuides.clear();
++                for (RgbSample s : all) {
++                    iris26582CandidateGuides.add(Math.max(s.r, Math.max(s.g, s.b)));
++                }
++                Collections.sort(iris26582CandidateGuides);
++                int p95 = Math.max(0, Math.min(iris26582CandidateGuides.size() - 1,
++                        Math.round((iris26582CandidateGuides.size() - 1) * 0.95f)));
++                int p99 = Math.max(0, Math.min(iris26582CandidateGuides.size() - 1,
++                        Math.round((iris26582CandidateGuides.size() - 1) * 0.99f)));
++                iris26582CandidateP95Guide = iris26582CandidateGuides.get(p95);
++                iris26550CandidateP99Guide = iris26582CandidateGuides.get(p99);
+             }
+             all.sort(Comparator.comparingDouble(s -> presentedLuma(s, 1.0f)));
+             int from = Math.max(0, Math.round((all.size() - 1) * 0.25f));
+@@ -335,17 +369,18 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         return medianSorted(logs);
+     }
+ 
+-    private static float exposureError(ArrayList<RgbSample> samples, float ev, float targetLog) {
++    private float exposureError(ArrayList<RgbSample> samples, float ev, float targetLog) {
+         float gain = (float)Math.pow(2.0, ev);
++        ToneDecision tone = iris26582ToneDecision(gain);
+         ArrayList<Float> logs = new ArrayList<>(samples.size());
+         for (RgbSample sample : samples) {
+-            logs.add(log2(Math.max(presentedLuma(sample, gain), 1.0e-5f)));
++            logs.add(log2(Math.max(presentedLuma(sample, gain, tone.adaptiveSceneWhite), 1.0e-5f)));
+         }
+         Collections.sort(logs);
+         return medianSorted(logs) - targetLog;
+     }
+ 
+-    private static float solveBounded(ArrayList<RgbSample> samples, float targetLog,
++    private float solveBounded(ArrayList<RgbSample> samples, float targetLog,
+                                       float e0, float eMinus, float ePlus) {
+         float slope = ePlus - eMinus;
+         float guess = Math.abs(slope) > 1.0e-4f
+@@ -379,7 +414,47 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         return clamp(bestEv, MIN_EV, MAX_EV);
+     }
+ 
+-    private static float presentedLuma(RgbSample sample, float gain) {
++    private static final class ToneDecision {
++        final float baseSceneWhite;
++        final float adaptiveSceneWhite;
++        final float clippedFraction;
++        final float adaptiveStrength;
++        ToneDecision(float baseSceneWhite, float adaptiveSceneWhite,
++                     float clippedFraction, float adaptiveStrength) {
++            this.baseSceneWhite = baseSceneWhite;
++            this.adaptiveSceneWhite = adaptiveSceneWhite;
++            this.clippedFraction = clippedFraction;
++            this.adaptiveStrength = adaptiveStrength;
++        }
++    }
++
++    private ToneDecision iris26582ToneDecision(float gain) {
++        float baseWhite = MotionV2Render.iris26582BaseSceneWhite(gain);
++        float clippedFraction = 0.0f;
++        if (!iris26582CandidateGuides.isEmpty()) {
++            float sourceThreshold = baseWhite / Math.max(gain, 1.0e-6f);
++            int lo = 0, hi = iris26582CandidateGuides.size();
++            while (lo < hi) {
++                int mid = (lo + hi) >>> 1;
++                if (iris26582CandidateGuides.get(mid) < sourceThreshold) lo = mid + 1;
++                else hi = mid;
++            }
++            clippedFraction = (iris26582CandidateGuides.size() - lo)
++                    / (float)iris26582CandidateGuides.size();
++        }
++        float adaptiveWhite = MotionV2Render.iris26582AdaptiveSceneWhite(
++                gain, iris26550CandidateP99Guide, clippedFraction);
++        float strength = MotionV2Render.iris26582AdaptiveStrength(clippedFraction);
++        if (adaptiveWhite <= baseWhite + 1.0e-6f) strength = 0.0f;
++        return new ToneDecision(baseWhite, adaptiveWhite, clippedFraction, strength);
++    }
++
++    /* IRIS_26582_SOLVER_RENDER_TONE_PARITY
++     * Exact scalar tone/gamut model used by motionv2/render.glsl. The removed 26581
++     * neutral-to-white and overflow-to-white solver approximations were stale and were not
++     * present in the final renderer.
++     */
++    private static float presentedLuma(RgbSample sample, float gain, float sceneWhite) {
+         float r = Math.max(0.0f, sample.r * gain);
+         float g = Math.max(0.0f, sample.g * gain);
+         float b = Math.max(0.0f, sample.b * gain);
+@@ -387,41 +462,24 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         float peak = Math.max(r, Math.max(g, b));
+         float guide = Math.max(y, peak);
+         if (guide > 1.0e-7f) {
+-            float mappedGuide = mapHeadroom(guide, gain);
++            float mappedGuide = MotionV2Render.iris26582MapHeadroom(guide, sceneWhite);
+             float scale = mappedGuide / guide;
+-            float mr = r * scale, mg = g * scale, mb = b * scale;
+-            float whitePoint = Math.max(1.0f, Math.min(6.0f, 0.90f * Math.max(1.0f, gain)));
+-            float pos = clamp((guide - 0.50f) / Math.max(whitePoint - 0.50f, 1.0e-6f), 0f, 1f);
+-            float neutralMix = smoothstep(0.82f, 1.0f, pos);
+-            r = mix(mr, mappedGuide, neutralMix);
+-            g = mix(mg, mappedGuide, neutralMix);
+-            b = mix(mb, mappedGuide, neutralMix);
++            r *= scale;
++            g *= scale;
++            b *= scale;
+         }
+         r *= OUTPUT_EXPOSURE_SCALE;
+         g *= OUTPUT_EXPOSURE_SCALE;
+         b *= OUTPUT_EXPOSURE_SCALE;
+         float outPeak = Math.max(r, Math.max(g, b));
+         if (outPeak > 1.0f) {
+-            float overflow = clamp((outPeak - 1.0f) / 0.25f, 0f, 1f);
+-            float t = smoothstep(0.0f, 1.0f, overflow);
+-            r = mix(r / outPeak, 1.0f, t);
+-            g = mix(g / outPeak, 1.0f, t);
+-            b = mix(b / outPeak, 1.0f, t);
++            r /= outPeak;
++            g /= outPeak;
++            b /= outPeak;
+         }
+         return clamp(luma(r, g, b), 0.0f, 1.0f);
+     }
+ 
+-    private static float mapHeadroom(float guide, float gain) {
+-        final float start = 0.50f;
+-        if (guide <= start) return guide;
+-        float whitePoint = Math.max(1.0f, Math.min(6.0f, 0.90f * Math.max(1.0f, gain)));
+-        float x = clamp((guide - start) / Math.max(whitePoint - start, 1.0e-6f), 0f, 1f);
+-        final float logShape = 6.0f;
+-        float shaped = (float)(Math.log(1.0 + logShape * x) / Math.log(1.0 + logShape));
+-        float preScaleDisplayWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
+-        return start + (preScaleDisplayWhite - start) * shaped;
+-    }
+-
+     private static float srgbDecode(float x) {
+         x = clamp(x, 0.0f, 1.0f);
+         return x <= 0.04045f
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 8372549469367e99d108436387e3d0770995f8fa..be497c092555d140dc3d73db5c91d694a058360a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -55,6 +55,16 @@ public class Parameters {
+      * Scene brightness normalization applied only after temporal Bayer fusion + RCD.
+      */
+     public float motionV2DisplayGain = 1.0f;
++    /* IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE_STATE
++     * Decision-only presentation state produced by MotionV2ViewfinderExposureMatcher from its
++     * existing low-resolution candidate probe. No RAW/capture/DNG owner consumes these fields.
++     */
++    public float motionV2ToneP95Guide = Float.NaN;
++    public float motionV2ToneP99Guide = Float.NaN;
++    public float motionV2TonePredictedClipFraction = 0.0f;
++    public float motionV2ToneBaseSceneWhite = 1.0f;
++    public float motionV2ToneAdaptiveSceneWhite = 1.0f;
++    public float motionV2ToneAdaptiveStrength = 0.0f;
+     /* IRIS_26515_MGC_SOURCE_EXPOSURE_GAIN
+      * MGC BaselineExposure restoration is source-domain metadata, not scene/display exposure.
+      * It is consumed once by MotionV2DisplayExposure after MGC full-resolution denoise.
+diff --git a/app/version.properties b/app/version.properties
+index 0b9ce3cfb31ac90a7cb34e59d7221f50f57e490b..8fb01469128559e5cb8ad345f988054653576fd5 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726581
+-VERSION_BUILD=26581
++VERSION_NAME=0.9726582
++VERSION_BUILD=26582
