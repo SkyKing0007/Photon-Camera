@@ -1,0 +1,161 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 15fd1ffbe8de4befb9da45529dd70dc9c2caf3fd..9cddfb79cc7b1522836365dd95c710ee4cfd2050 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -704,6 +704,15 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float microMomentXX = 0.0;
+             float microMomentYY = 0.0;
+             float microMomentXY = 0.0;
++            /* IRIS_26580_MICRO_OBJECT_AREA_VS_RIBBON
++             * Track independent near-field horizontal/vertical occupancy. A genuine tiny printed
++             * object may change hue inside only a few pixels, but it still occupies area in both
++             * image axes. A one-pixel CFA/text fringe remains line-like even when it is diagonal.
++             */
++            float microNearLeft = 0.0;
++            float microNearRight = 0.0;
++            float microNearUp = 0.0;
++            float microNearDown = 0.0;
+             const ivec2 topologyDirections[8] = ivec2[8](
+                 ivec2(1,0), ivec2(-1,0), ivec2(0,1), ivec2(0,-1),
+                 ivec2(1,1), ivec2(-1,-1), ivec2(1,-1), ivec2(-1,1));
+@@ -724,7 +733,13 @@ internal object Iris26529SpatialRgbChromaShaders {
+                         float objectCompatibility = 1.0 - smoothstep(0.72, 1.20, relativeObjectLuma);
+                         float w = chromatic * objectCompatibility;
+                         microChromaWeight += w;
+-                        if (abs(xx) <= 1 && abs(yy) <= 1) microNearWeight += w;
++                        if (abs(xx) <= 1 && abs(yy) <= 1) {
++                            microNearWeight += w;
++                            if (xx < 0) microNearLeft = max(microNearLeft, w);
++                            if (xx > 0) microNearRight = max(microNearRight, w);
++                            if (yy < 0) microNearUp = max(microNearUp, w);
++                            if (yy > 0) microNearDown = max(microNearDown, w);
++                        }
+                         microMomentXX += w * float(xx * xx);
+                         microMomentYY += w * float(yy * yy);
+                         microMomentXY += w * float(xx * yy);
+@@ -770,13 +785,23 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float microMinorMoment = microTrace > 1.0e-6 ?
+                 0.5 * (microTrace - sqrt(max(microTrace * microTrace -
+                     4.0 * microDeterminant, 0.0))) / max(microChromaWeight, 1.0e-6) : 0.0;
+-            float microAreaEvidence = smoothstep(2.15, 4.25, microChromaWeight) *
+-                smoothstep(2.20, 4.60, microNearWeight) *
+-                smoothstep(0.16, 0.46, microMinorMoment) * centerChromaPresent;
+-            /* Strong Bayer-phase evidence can nearly extinguish this new veto because repeated
+-             * near-opposite/far-matching phase structure is the strongest false-color proof. Real
+-             * micro-objects still win through occupancy when that phase proof is not overwhelming. */
+-            float microObjectProtection = microAreaEvidence * (1.0 - 0.95 * phaseLikeEvidence);
++            float microAreaEvidence = smoothstep(1.35, 3.25, microChromaWeight) *
++                smoothstep(1.15, 2.75, microNearWeight) *
++                smoothstep(0.10, 0.32, microMinorMoment) * centerChromaPresent;
++            float microHorizontalPresence = max(microNearLeft, microNearRight);
++            float microVerticalPresence = max(microNearUp, microNearDown);
++            float microTwoAxisEvidence = smoothstep(0.18, 0.60, microHorizontalPresence) *
++                smoothstep(0.18, 0.60, microVerticalPresence);
++            float microCompactAreaEvidence = microAreaEvidence * microTwoAxisEvidence;
++            /* IRIS_26580_FAIL_CLOSED_MULTICOLOR_OBJECT_VETO
++             * Compact 2-D chroma wins over weak/moderate phase resemblance, which is common inside
++             * tiny multicolor prints. Only an overwhelming repeated near-opposite/far-matching phase
++             * signature can extinguish this veto; that preserves the proven 26578 neutral CFA-fringe
++             * regression. Uncertain cases remain biased toward keeping scene color. */
++            float phaseOverride = smoothstep(0.78, 0.96, phaseLikeEvidence);
++            float microObjectProtection = max(
++                microAreaEvidence * (1.0 - 0.98 * phaseOverride),
++                microCompactAreaEvidence * (1.0 - phaseOverride));
+             float supportedMaterialBoundary = materialBoundary * nearTopologyProtection;
+ 
+             /* Coherent center color remains protected. This is intentionally asymmetric: evidence
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index ba19738a1fe321b9029ea972e195143febd38fe4..3d240a86698068f7cf31b24c71c5b3ecb89beed7 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -1845,34 +1845,71 @@ internal object GlesMgcRawSabreShaders {
+             int nearestIndex = 0;
+             for (int i = 1; i < 4; ++i) if (spatial[i] > spatial[nearestIndex]) nearestIndex = i;
+             float sampleY[4];
++            vec3 sampleChroma[4];
++            float sampleChromaMagnitude[4];
+             float maxYDelta = 0.0;
+             float maxChromaMagnitude = 0.0;
+             for (int i = 0; i < 4; ++i) {
+                 sampleY[i] = irisLuma(samples[i]);
+-                maxChromaMagnitude = max(maxChromaMagnitude,
+-                    length(samples[i] - vec3(sampleY[i])));
++                sampleChroma[i] = samples[i] - vec3(sampleY[i]);
++                sampleChromaMagnitude[i] = length(sampleChroma[i]);
++                maxChromaMagnitude = max(maxChromaMagnitude, sampleChromaMagnitude[i]);
+             }
+             for (int i = 0; i < 4; ++i) for (int j = i + 1; j < 4; ++j)
+                 maxYDelta = max(maxYDelta, abs(sampleY[i] - sampleY[j]));
+             float bilinearY = max(irisLuma(bilinearGuide), 0.0);
+-            float selectorY = mix(sampleY[nearestIndex], directY, 0.40 * confidence);
++            /* IRIS_26580_TRUE2X_SAME_MATERIAL_CHROMA_OWNERSHIP
++             * Direct-CFA remains luma-only. Its temporally proven 2x luma is used only to choose
++             * which native VGN material side owns this output pixel. Cross-edge samples receive no
++             * meaningful floor weight, preventing a colored native edge pixel from painting the
++             * neighboring neutral glyph/background side. */
++            float selectorY = mix(sampleY[nearestIndex], directY, 0.60 * confidence);
+             vec3 topologyChroma = vec3(0.0);
+             float weight = 0.0;
++            float crossSideSpatial = 0.0;
++            float localChromaOccupancy = 0.0;
++            float neutralVotes = 0.0;
++            int anchorIndex = nearestIndex;
++            float anchorScore = -1.0;
+             for (int i = 0; i < 4; ++i) {
+                 float relativeY = abs(sampleY[i] - selectorY) /
+                     max(max(abs(sampleY[i]), abs(selectorY)), 0.035);
+-                float sameMaterial = 1.0 / (1.0 + 18.0 * relativeY * relativeY);
+-                float w = spatial[i] * max(sameMaterial, 0.015);
+-                topologyChroma += (samples[i] - vec3(sampleY[i])) * w;
++                float sameMaterial = 1.0 - irisSmooth01((relativeY - 0.08) / 0.32);
++                float materialWeight = sameMaterial * sameMaterial;
++                float w = spatial[i] * (0.002 + 0.998 * materialWeight);
++                topologyChroma += sampleChroma[i] * w;
+                 weight += w;
++                crossSideSpatial += spatial[i] * (1.0 - sameMaterial);
++                localChromaOccupancy += spatial[i] *
++                    irisSmooth01((sampleChromaMagnitude[i] - 0.020) / 0.055);
++                neutralVotes += 1.0 - irisSmooth01((sampleChromaMagnitude[i] - 0.010) / 0.050);
++                float score = spatial[i] * (0.15 + 0.85 * sameMaterial);
++                if (score > anchorScore) { anchorScore = score; anchorIndex = i; }
+             }
+             topologyChroma /= max(weight, 1.0e-6);
+             float topologyMagnitude = length(topologyChroma);
+             if (topologyMagnitude > maxChromaMagnitude && topologyMagnitude > 1.0e-7)
+                 topologyChroma *= maxChromaMagnitude / topologyMagnitude;
+             vec3 bilinearChroma = bilinearGuide - vec3(bilinearY);
+-            float edgeGate = irisSmooth01((maxYDelta - 0.025) / 0.130);
+-            vec3 selectedChroma = mix(bilinearChroma, topologyChroma, edgeGate);
++            float edgeGate = irisSmooth01((maxYDelta - 0.018) / 0.095);
++            float crossEdgeEvidence = irisSmooth01((crossSideSpatial - 0.06) / 0.30);
++            float topologyGate = edgeGate * mix(0.70, 1.0, crossEdgeEvidence);
++            vec3 selectedChroma = mix(bilinearChroma, topologyChroma, topologyGate);
++
++            /* IRIS_26580_NEUTRAL_GLYPH_OUTSIDE_EDGE_EXCLUSION
++             * Do not identify text semantically. When at least three of the four native guide
++             * samples are neutral and the high-resolution luma-selected owner is also neutral, any
++             * chroma arriving mainly from the opposite material side is unsupported. Pull only
++             * toward that already-existing neutral owner chroma. A nearby tiny colored print is
++             * protected whenever its spatially owned chroma occupancy is strong. */
++            vec3 anchorChroma = sampleChroma[anchorIndex];
++            float anchorNeutral = 1.0 -
++                irisSmooth01((sampleChromaMagnitude[anchorIndex] - 0.012) / 0.050);
++            float neutralNeighborhood = irisSmooth01((neutralVotes - 2.55) / 0.90);
++            float localColorProtection = irisSmooth01((localChromaOccupancy - 0.20) / 0.40);
++            float neutralSideOwnership = edgeGate * crossEdgeEvidence * anchorNeutral *
++                neutralNeighborhood * (1.0 - localColorProtection);
++            selectedChroma = mix(selectedChroma, anchorChroma, 0.92 * neutralSideOwnership);
+             /* Preserve exact bilinear guide luminance without clipping a negative RGB component:
+              * if a supported chroma vector would cross zero at this luminance, reduce only chroma. */
+             float nonNegativeScale = 1.0;
+diff --git a/app/version.properties b/app/version.properties
+index 791c879d7eca2bbae5806bf04efd4566007be3ad..ec761f747322f688fd506bb7a75bb963f56bebfe 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726579
+-VERSION_BUILD=26579
++VERSION_NAME=0.9726580
++VERSION_BUILD=26580
