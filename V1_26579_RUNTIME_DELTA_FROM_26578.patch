@@ -1,0 +1,295 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index b61a2cbf8598381d634a7a1c9f350a7ae51f251e..1cdb1905bd6d9b86c7240143568efe01f2e2afca 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -716,7 +716,7 @@ struct Iris26571BandQueue {
+         *out=std::move(bands.front());bands.pop_front();notFull.notify_one();return true;
+     }
+     void finish(bool success,const char*why){
+-        std::lock_guard<std::mutex>lock(mutex);if(!success)ok=false;done=true;if(why&&!success)reason=why;
++        std::lock_guard<std::mutex>lock(mutex);if(!success)ok=false;done=true;if(why&&!success&&reason.empty())reason=why;
+         notEmpty.notify_all();notFull.notify_all();
+     }
+ };
+@@ -934,7 +934,7 @@ public:
+         glUseProgram(program);glUniform1i(loc("uSource"),0);setParams();return true;
+     }
+     bool renderReadback(int fd,float gainMax,bool generateGain,int top,int h,int slot,Iris26571ReadyBand*out,Iris26571GpuTiming*timing,std::string*reason){
+-        if(!params||slot<0||slot>1)return false;
++        if(!params||slot<0||slot>1){set(reason,"render_invalid_state");return false;}
+         SourceRegion src;auto rs=std::chrono::steady_clock::now();if(!readRegion(fd,*params,0,top,outWidth-1,top+h-1,&src)){set(reason,"readRegion");return false;}auto re=std::chrono::steady_clock::now();if(timing)timing->sourceReadNs+=iris26569Ns(rs,re);
+         auto us=std::chrono::steady_clock::now();glPixelStorei(GL_UNPACK_ALIGNMENT,1);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,sourceTex);
+         if(src.w>sourceAllocW||src.h>sourceAllocH){sourceAllocW=std::max(sourceAllocW,src.w);sourceAllocH=std::max(sourceAllocH,src.h);glTexImage2D(GL_TEXTURE_2D,0,GL_RGB16F,sourceAllocW,sourceAllocH,0,GL_RGB,GL_HALF_FLOAT,nullptr);}
+@@ -975,7 +975,20 @@ private:
+ };
+ 
+ inline bool iris26571EncodeGpuPublication(int sourceFd,float gainMax,const Params&p,const SrgbLut&lut,int outW,int outH,int bandRows,bool generateGain,const char*basePath,const char*gainPath,int quality,bool useExplicitFenceSync,Iris26571GpuTiming*gpuTiming,uint64_t*baseJpegNs,uint64_t*gainJpegNs,std::string*reason){
+-    if(!basePath||outW<=0||outH<=0||bandRows<=0)return false;
++    /* IRIS_26579_GPU_DIRECT_INTERMEDIATE_PUBLICATION
++     * basePath is the Java-authorized JPEG target (hidden base intermediate when JPEG_R is active,
++     * final SDR target otherwise); gainPath is the Java-owned gain intermediate. Open them before
++     * starting the GPU producer. This removes the extra extension-changing GPU sibling layer
++     * that failed before any 50MP JPEG work on-device, and guarantees every early return has
++     * an exact reason. A failed attempt deletes these partial intermediates; the next GPU tier or
++     * exact CPU fallback recreates them from the immutable true2x carrier.
++     */
++    auto setReason=[&](const char*m){if(reason)*reason=m?m:"unknown";};
++    auto setErrnoReason=[&](const char*stage){if(!reason)return;char b[128];std::snprintf(b,sizeof(b),"%s_errno_%d",stage?stage:"file",errno);*reason=b;};
++    if(!basePath||outW<=0||outH<=0||bandRows<=0){setReason("invalid_gpu_publication_args");return false;}
++    if(generateGain&&!gainPath){setReason("missing_gain_path");return false;}
++    FILE*baseOut=fopen(basePath,"wb");if(!baseOut){setErrnoReason("open_base");return false;}
++    FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gainPath,"wb");if(!gainOut){setErrnoReason("open_gain");fclose(baseOut);unlink(basePath);return false;}}
+     Iris26571BandQueue queue;auto producerStart=std::chrono::steady_clock::now();
+     std::thread producer([&](){
+         Iris26571GpuPublisher gpu;std::string why;if(!gpu.init(p,lut,outW,outH,bandRows,useExplicitFenceSync,&why)){queue.finish(false,why.c_str());return;}
+@@ -987,19 +1000,19 @@ inline bool iris26571EncodeGpuPublication(int sourceFd,float gainMax,const Param
+         queue.finish(ok,ok?nullptr:why.c_str());
+     });
+ 
+-    FILE*baseOut=fopen(basePath,"wb");if(!baseOut){queue.finish(false,"open base");producer.join();return false;}FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gainPath,"wb");if(!gainOut){fclose(baseOut);queue.finish(false,"open gain");producer.join();return false;}}
+-    jpeg_compress_struct baseC{};jpeg_error_mgr baseErr{};baseC.err=jpeg_std_error(&baseErr);jpeg_create_compress(&baseC);jpeg_stdio_dest(&baseC,baseOut);baseC.image_width=outW;baseC.image_height=outH;baseC.input_components=3;baseC.in_color_space=JCS_RGB;jpeg_set_defaults(&baseC);jpeg_set_quality(&baseC,std::clamp(quality,1,100),TRUE);for(int k=0;k<baseC.num_components;k++){baseC.comp_info[k].h_samp_factor=1;baseC.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&baseC,TRUE);bool streamed=writeDisplayP3Icc(&baseC);
++    jpeg_compress_struct baseC{};jpeg_error_mgr baseErr{};baseC.err=jpeg_std_error(&baseErr);jpeg_create_compress(&baseC);jpeg_stdio_dest(&baseC,baseOut);baseC.image_width=outW;baseC.image_height=outH;baseC.input_components=3;baseC.in_color_space=JCS_RGB;jpeg_set_defaults(&baseC);jpeg_set_quality(&baseC,std::clamp(quality,1,100),TRUE);for(int k=0;k<baseC.num_components;k++){baseC.comp_info[k].h_samp_factor=1;baseC.comp_info[k].v_samp_factor=1;}jpeg_start_compress(&baseC,TRUE);bool streamed=writeDisplayP3Icc(&baseC);std::string consumerReason;if(!streamed){consumerReason="display_p3_icc";queue.finish(false,consumerReason.c_str());}
+     jpeg_compress_struct gainC{};jpeg_error_mgr gainErr{};bool gainCreated=false;if(generateGain){gainC.err=jpeg_std_error(&gainErr);jpeg_create_compress(&gainC);gainCreated=true;jpeg_stdio_dest(&gainC,gainOut);gainC.image_width=outW;gainC.image_height=outH;gainC.input_components=1;gainC.in_color_space=JCS_GRAYSCALE;jpeg_set_defaults(&gainC);jpeg_set_quality(&gainC,95,TRUE);jpeg_start_compress(&gainC,TRUE);}
+-    int expectedTop=0,bands=0;while(streamed&&expectedTop<outH){Iris26571ReadyBand band;if(!queue.pop(&band)){streamed=false;break;}if(band.top!=expectedTop||band.h<=0){streamed=false;break;}
++    int expectedTop=0,bands=0;while(streamed&&expectedTop<outH){Iris26571ReadyBand band;if(!queue.pop(&band)){streamed=false;break;}if(band.top!=expectedTop||band.h<=0){streamed=false;consumerReason="gpu_band_order";queue.finish(false,consumerReason.c_str());break;}
+         std::atomic<bool>gainOk{true};std::thread gainThread;if(generateGain)gainThread=std::thread([&](){gainOk.store(writeJpegBand(&gainC,band.gain,outW,1,band.h,gainJpegNs),std::memory_order_relaxed);});
+-        bool baseOk=writeJpegBand(&baseC,band.rgb,outW,3,band.h,baseJpegNs);if(generateGain)gainThread.join();if(!baseOk||(generateGain&&!gainOk.load(std::memory_order_relaxed))){streamed=false;break;}expectedTop+=band.h;bands++;
++        bool baseOk=writeJpegBand(&baseC,band.rgb,outW,3,band.h,baseJpegNs);if(generateGain)gainThread.join();if(!baseOk||(generateGain&&!gainOk.load(std::memory_order_relaxed))){streamed=false;consumerReason=!baseOk?"base_jpeg_band_encode":"gain_jpeg_band_encode";queue.finish(false,consumerReason.c_str());break;}expectedTop+=band.h;bands++;
+     }
+-    if(!streamed)queue.finish(false,"jpeg_band_encode");
+-    producer.join();{std::lock_guard<std::mutex>lock(queue.mutex);if(!queue.ok){streamed=false;if(reason)*reason=queue.reason;}}
++    producer.join();{std::lock_guard<std::mutex>lock(queue.mutex);if(!queue.ok){streamed=false;if(reason&&reason->empty())*reason=queue.reason;}}
++    if(!streamed&&reason&&reason->empty())*reason=consumerReason.empty()?"gpu_band_queue_empty":consumerReason;
+     auto producerEnd=std::chrono::steady_clock::now();if(gpuTiming)gpuTiming->producerNs=iris26569Ns(producerStart,producerEnd);
+     if(streamed&&baseC.next_scanline==baseC.image_height&&(!generateGain||gainC.next_scanline==gainC.image_height)){jpeg_finish_compress(&baseC);if(generateGain)jpeg_finish_compress(&gainC);}else{jpeg_abort_compress(&baseC);if(gainCreated)jpeg_abort_compress(&gainC);}
+-    jpeg_destroy_compress(&baseC);if(gainCreated)jpeg_destroy_compress(&gainC);int bf=fflush(baseOut),bc=fclose(baseOut),gf=0,gc=0;if(gainOut){gf=fflush(gainOut);gc=fclose(gainOut);}
+-    bool ok=streamed&&bf==0&&bc==0&&(!generateGain||(gf==0&&gc==0));if(!ok){unlink(basePath);if(generateGain)unlink(gainPath);}return ok;
++    jpeg_destroy_compress(&baseC);if(gainCreated)jpeg_destroy_compress(&gainC);int bf=fflush(baseOut),bfErr=bf!=0?errno:0;int bc=fclose(baseOut),bcErr=bc!=0?errno:0;int gf=0,gc=0,gfErr=0,gcErr=0;if(gainOut){gf=fflush(gainOut);gfErr=gf!=0?errno:0;gc=fclose(gainOut);gcErr=gc!=0?errno:0;}
++    auto setSavedErrnoReason=[&](const char*stage,int savedErrno){if(!reason)return;char b[128];std::snprintf(b,sizeof(b),"%s_errno_%d",stage?stage:"file",savedErrno);*reason=b;};
++    bool ok=streamed&&bf==0&&bc==0&&(!generateGain||(gf==0&&gc==0));if(!ok){if(reason&&reason->empty()){if(bf!=0)setSavedErrnoReason("flush_base",bfErr);else if(bc!=0)setSavedErrnoReason("close_base",bcErr);else if(generateGain&&gf!=0)setSavedErrnoReason("flush_gain",gfErr);else if(generateGain&&gc!=0)setSavedErrnoReason("close_gain",gcErr);else setReason("gpu_publication_incomplete");}unlink(basePath);if(generateGain)unlink(gainPath);}return ok;
+ }
+ 
+ struct StreamingBandTiming { uint64_t profileNs=0,renderNs=0,jinNs=0; };
+@@ -1064,24 +1077,18 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+      * PBO behavior on-device. CPU remains the final exact 26570 fallback.
+      */
+     bool gpuEligible=motionFast&&!water.enabled();bool gpuEncoded=false;bool gpuCompatUsed=false;Iris26571GpuTiming gpuTiming{},gpuCompatTiming{};uint64_t gpuBaseJpegNs=0,gpuGainJpegNs=0,gpuCompatBaseJpegNs=0,gpuCompatGainJpegNs=0,gpuCompatTotalNs=0;std::string gpuReason,gpuCompatReason;
+-    std::string gpuBasePath=std::string(op.c)+".iris26571_gpu",gpuGainPath=generateGain?std::string(gp.c)+".iris26571_gpu":std::string();
+-    unlink(gpuBasePath.c_str());if(generateGain)unlink(gpuGainPath.c_str());auto gpuStart=std::chrono::steady_clock::now();
+-    if(gpuEligible)gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,p,lut,outW,outH,bandRows,generateGain,gpuBasePath.c_str(),generateGain?gpuGainPath.c_str():nullptr,(int)quality,true,&gpuTiming,&gpuBaseJpegNs,&gpuGainJpegNs,&gpuReason);
++    unlink(op.c);if(generateGain)unlink(gp.c);auto gpuStart=std::chrono::steady_clock::now();
++    if(gpuEligible)gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,p,lut,outW,outH,bandRows,generateGain,op.c,generateGain?gp.c:nullptr,(int)quality,true,&gpuTiming,&gpuBaseJpegNs,&gpuGainJpegNs,&gpuReason);
+     auto gpuEnd=std::chrono::steady_clock::now();uint64_t gpuTotalNs=iris26569Ns(gpuStart,gpuEnd);
+-    if(gpuEligible&&!gpuEncoded){unlink(gpuBasePath.c_str());if(generateGain)unlink(gpuGainPath.c_str());auto compatStart=std::chrono::steady_clock::now();gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,p,lut,outW,outH,bandRows,generateGain,gpuBasePath.c_str(),generateGain?gpuGainPath.c_str():nullptr,(int)quality,false,&gpuCompatTiming,&gpuCompatBaseJpegNs,&gpuCompatGainJpegNs,&gpuCompatReason);auto compatEnd=std::chrono::steady_clock::now();gpuCompatTotalNs=iris26569Ns(compatStart,compatEnd);gpuCompatUsed=gpuEncoded;__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26577_TRUE2X_GPU_COMPAT_RESULT asyncReason=%s asyncMs=%.3f compatUsed=%d compatReason=%s compatMs=%.3f",gpuReason.empty()?"missing_reason":gpuReason.c_str(),(double)gpuTotalNs/1000000.0,gpuCompatUsed?1:0,gpuCompatReason.empty()?(gpuCompatUsed?"none":"missing_reason"):gpuCompatReason.c_str(),(double)gpuCompatTotalNs/1000000.0);}
+-    if(gpuEncoded){
+-        unlink(op.c);if(rename(gpuBasePath.c_str(),op.c)!=0){gpuEncoded=false;if(gpuCompatUsed)gpuCompatReason="rename_base";else gpuReason="rename_base";}
+-        if(gpuEncoded&&generateGain){unlink(gp.c);if(rename(gpuGainPath.c_str(),gp.c)!=0){gpuEncoded=false;if(gpuCompatUsed)gpuCompatReason="rename_gain";else gpuReason="rename_gain";}}
+-        if(!gpuEncoded){unlink(op.c);if(generateGain)unlink(gp.c);}
+-    }
++    if(gpuEligible&&!gpuEncoded){unlink(op.c);if(generateGain)unlink(gp.c);auto compatStart=std::chrono::steady_clock::now();gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,p,lut,outW,outH,bandRows,generateGain,op.c,generateGain?gp.c:nullptr,(int)quality,false,&gpuCompatTiming,&gpuCompatBaseJpegNs,&gpuCompatGainJpegNs,&gpuCompatReason);auto compatEnd=std::chrono::steady_clock::now();gpuCompatTotalNs=iris26569Ns(compatStart,compatEnd);gpuCompatUsed=gpuEncoded;__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26579_TRUE2X_GPU_COMPAT_RESULT asyncReason=%s asyncMs=%.3f compatUsed=%d compatReason=%s compatMs=%.3f",gpuReason.empty()?"missing_reason":gpuReason.c_str(),(double)gpuTotalNs/1000000.0,gpuCompatUsed?1:0,gpuCompatReason.empty()?(gpuCompatUsed?"none":"missing_reason"):gpuCompatReason.c_str(),(double)gpuCompatTotalNs/1000000.0);}
+     if(gpuEncoded){
+         close(sourceFd);const Iris26571GpuTiming&usedTiming=gpuCompatUsed?gpuCompatTiming:gpuTiming;uint64_t usedBaseJpegNs=gpuCompatUsed?gpuCompatBaseJpegNs:gpuBaseJpegNs,usedGainJpegNs=gpuCompatUsed?gpuCompatGainJpegNs:gpuGainJpegNs,usedTotalNs=gpuCompatUsed?gpuCompatTotalNs:gpuTotalNs;
+         iris26576SetPublicationTelemetry("backend=GPU gpuEligible=1 gpuUsed=1 gpuMode=%s asyncAttemptMs=%.3f asyncFailureReason=%s sourceReadMs=%.3f uploadDispatchMs=%.3f readbackWaitMs=%.3f deinterleaveMs=%.3f producerMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f totalMs=%.3f bandRows=%d pboSlots=2 gain1to1=%d",gpuCompatUsed?"MAP_SYNC_COMPAT":"ASYNC_FENCE",(double)gpuTotalNs/1000000.0,gpuCompatUsed?(gpuReason.empty()?"missing_reason":gpuReason.c_str()):"none",(double)usedTiming.sourceReadNs/1000000.0,(double)usedTiming.uploadDispatchNs/1000000.0,(double)usedTiming.readbackWaitNs/1000000.0,(double)usedTiming.deinterleaveNs/1000000.0,(double)usedTiming.producerNs/1000000.0,(double)usedBaseJpegNs/1000000.0,(double)usedGainJpegNs/1000000.0,(double)usedTotalNs/1000000.0,bandRows,generateGain?1:0);
+-        __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26577_TRUE2X_GPU_PUBLICATION gpuMode=%s asyncAttemptMs=%.3f asyncFailureReason=%s sourceReadMs=%.3f uploadDispatchMs=%.3f readbackWaitMs=%.3f deinterleaveMs=%.3f producerMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f totalMs=%.3f bandRows=%d pboSlots=2 gain1to1=%d",gpuCompatUsed?"MAP_SYNC_COMPAT":"ASYNC_FENCE",(double)gpuTotalNs/1000000.0,gpuCompatUsed?(gpuReason.empty()?"missing_reason":gpuReason.c_str()):"none",(double)usedTiming.sourceReadNs/1000000.0,(double)usedTiming.uploadDispatchNs/1000000.0,(double)usedTiming.readbackWaitNs/1000000.0,(double)usedTiming.deinterleaveNs/1000000.0,(double)usedTiming.producerNs/1000000.0,(double)usedBaseJpegNs/1000000.0,(double)usedGainJpegNs/1000000.0,(double)usedTotalNs/1000000.0,bandRows,generateGain?1:0);
++        __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26579_TRUE2X_GPU_PUBLICATION gpuMode=%s asyncAttemptMs=%.3f asyncFailureReason=%s sourceReadMs=%.3f uploadDispatchMs=%.3f readbackWaitMs=%.3f deinterleaveMs=%.3f producerMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f totalMs=%.3f bandRows=%d pboSlots=2 gain1to1=%d",gpuCompatUsed?"MAP_SYNC_COMPAT":"ASYNC_FENCE",(double)gpuTotalNs/1000000.0,gpuCompatUsed?(gpuReason.empty()?"missing_reason":gpuReason.c_str()):"none",(double)usedTiming.sourceReadNs/1000000.0,(double)usedTiming.uploadDispatchNs/1000000.0,(double)usedTiming.readbackWaitNs/1000000.0,(double)usedTiming.deinterleaveNs/1000000.0,(double)usedTiming.producerNs/1000000.0,(double)usedBaseJpegNs/1000000.0,(double)usedGainJpegNs/1000000.0,(double)usedTotalNs/1000000.0,bandRows,generateGain?1:0);
+         return JNI_TRUE;
+     }
+-    unlink(gpuBasePath.c_str());if(generateGain)unlink(gpuGainPath.c_str());const char*primaryReason=gpuReason.empty()?(gpuEligible?"missing_async_reason":"jin_or_watermark"):gpuReason.c_str();const char*compatReason=gpuCompatReason.empty()?(gpuEligible?"missing_compat_reason":"not_attempted"):gpuCompatReason.c_str();
+-    __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26577_TRUE2X_GPU_TO_CPU_FALLBACK eligible=%d asyncReason=%s asyncMs=%.3f compatReason=%s compatMs=%.3f",(int)gpuEligible,primaryReason,(double)gpuTotalNs/1000000.0,compatReason,(double)gpuCompatTotalNs/1000000.0);
++    unlink(op.c);if(generateGain)unlink(gp.c);const char*primaryReason=gpuReason.empty()?(gpuEligible?"missing_async_reason":"jin_or_watermark"):gpuReason.c_str();const char*compatReason=gpuCompatReason.empty()?(gpuEligible?"missing_compat_reason":"not_attempted"):gpuCompatReason.c_str();
++    __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26579_TRUE2X_GPU_TO_CPU_FALLBACK eligible=%d asyncReason=%s asyncMs=%.3f compatReason=%s compatMs=%.3f",(int)gpuEligible,primaryReason,(double)gpuTotalNs/1000000.0,compatReason,(double)gpuCompatTotalNs/1000000.0);
+ 
+     /* Exact successful 26570 CPU fallback begins here. */
+     unlink(op.c);if(generateGain)unlink(gp.c);FILE*baseOut=fopen(op.c,"wb");if(!baseOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_base_jpeg errno=%d",errno);close(sourceFd);return JNI_FALSE;}FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gp.c,"wb");if(!gainOut){__android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26568_TRUE2X_FAIL stage=open_gain_jpeg errno=%d",errno);fclose(baseOut);unlink(op.c);close(sourceFd);return JNI_FALSE;}}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 6915adba9278264a1474ee8af9b629e324214419..15fd1ffbe8de4befb9da45529dd70dc9c2caf3fd 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -692,12 +692,44 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float nearTopologySupport = 0.0;
+             float contourChainSupport = 0.0;
+             float phasePatternSupport = 0.0;
++            /* IRIS_26579_MICRO_OBJECT_COLOR_TOPOLOGY
++             * A real tiny print/icon may contain several different hues inside only a few native
++             * pixels, so same-hue continuation is not a sufficient real-color definition. Measure
++             * non-neutral chroma occupancy over radius two as a 2-D shape instead. The minor second
++             * moment is near zero for a thin edge-following CFA fringe (including diagonal fringes)
++             * but positive for a compact colored area. Hue agreement is deliberately not required.
++             */
++            float microChromaWeight = 0.0;
++            float microNearWeight = 0.0;
++            float microMomentXX = 0.0;
++            float microMomentYY = 0.0;
++            float microMomentXY = 0.0;
+             const ivec2 topologyDirections[8] = ivec2[8](
+                 ivec2(1,0), ivec2(-1,0), ivec2(0,1), ivec2(0,-1),
+                 ivec2(1,1), ivec2(-1,-1), ivec2(1,-1), ivec2(-1,1));
+             float centerChromaPresent = smoothstep(0.035, 0.090, centerNormalizedMagnitude);
+             if (centerLuma > 0.58 || oneSidedLuma > 0.5 || legacyEdgeProtection > 0.25 ||
+                 centerChromaPresent > 0.0) {
++                for (int yy = -2; yy <= 2; ++yy) {
++                    for (int xx = -2; xx <= 2; ++xx) {
++                        if (xx == 0 && yy == 0) continue;
++                        vec3 objectRgb = loadRgb(p + ivec2(xx, yy));
++                        float objectLuma = luminanceOf(objectRgb);
++                        float relativeObjectLuma = abs(objectLuma - centerLuma) /
++                            max(max(objectLuma, centerLuma), 0.060);
++                        vec3 objectChroma = (objectRgb - vec3(objectLuma)) / max(objectLuma, 0.060);
++                        float chromatic = smoothstep(0.050, 0.115, length(objectChroma));
++                        /* Broad luma compatibility rejects unrelated remote surfaces without
++                         * demanding one brightness inside a multicolor micro-print. */
++                        float objectCompatibility = 1.0 - smoothstep(0.72, 1.20, relativeObjectLuma);
++                        float w = chromatic * objectCompatibility;
++                        microChromaWeight += w;
++                        if (abs(xx) <= 1 && abs(yy) <= 1) microNearWeight += w;
++                        microMomentXX += w * float(xx * xx);
++                        microMomentYY += w * float(yy * yy);
++                        microMomentXY += w * float(xx * yy);
++                    }
++                }
+                 for (int i = 0; i < 8; ++i) {
+                     vec3 nearRgb = loadRgb(p + topologyDirections[i]);
+                     vec3 farRgb = loadRgb(p + topologyDirections[i] * 2);
+@@ -732,6 +764,19 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float phaseLikeEvidence = smoothstep(1.10, 2.80, phasePatternSupport);
+             float topologyProtection = max(max(nearTopologyProtection, contourTopologyProtection),
+                 radiusTwoTopologyProtection * (1.0 - 0.90 * phaseLikeEvidence));
++            float microTrace = microMomentXX + microMomentYY;
++            float microDeterminant = max(microMomentXX * microMomentYY -
++                microMomentXY * microMomentXY, 0.0);
++            float microMinorMoment = microTrace > 1.0e-6 ?
++                0.5 * (microTrace - sqrt(max(microTrace * microTrace -
++                    4.0 * microDeterminant, 0.0))) / max(microChromaWeight, 1.0e-6) : 0.0;
++            float microAreaEvidence = smoothstep(2.15, 4.25, microChromaWeight) *
++                smoothstep(2.20, 4.60, microNearWeight) *
++                smoothstep(0.16, 0.46, microMinorMoment) * centerChromaPresent;
++            /* Strong Bayer-phase evidence can nearly extinguish this new veto because repeated
++             * near-opposite/far-matching phase structure is the strongest false-color proof. Real
++             * micro-objects still win through occupancy when that phase proof is not overwhelming. */
++            float microObjectProtection = microAreaEvidence * (1.0 - 0.95 * phaseLikeEvidence);
+             float supportedMaterialBoundary = materialBoundary * nearTopologyProtection;
+ 
+             /* Coherent center color remains protected. This is intentionally asymmetric: evidence
+@@ -747,8 +792,8 @@ internal object Iris26529SpatialRgbChromaShaders {
+             /* A luma edge by itself is no longer a chroma veto. This is the core 26578 change:
+              * geometry stays untouched, but chroma protection must be earned by color topology.
+              */
+-            float realColorConfidence = clamp(max(max(supportedMaterialBoundary, coherentCenterProtection),
+-                topologyProtection), 0.0, 1.0);
++            float realColorConfidence = clamp(max(max(max(supportedMaterialBoundary,
++                coherentCenterProtection), topologyProtection), microObjectProtection), 0.0, 1.0);
+ 
+             /* Fail-closed false-color proof.
+              * 1) The center must disagree materially with same-surface consensus.
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 17d7b92bd8e18c6d6a94962876c3355e145abdb1..ba19738a1fe321b9029ea972e195143febd38fe4 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -1820,6 +1820,70 @@ internal object GlesMgcRawSabreShaders {
+             vec3 d = texelFetch(uNativeVgnGuide, p1, 0).rgb;
+             return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+         }
++        /* IRIS_26579_TRUE2X_TOPOLOGY_CHROMA_UPSAMPLE
++         * Native Sabre/VGN remains the only chroma authority. Replace cross-edge bilinear chroma
++         * mixing with a positive-weight same-material reconstruction while preserving the exact
++         * bilinear guide luminance. The nearest native sample supplies a stable material side;
++         * temporally-proven direct-CFA luma may refine that side only in proportion to SR confidence.
++         * No direct-CFA chroma enters, no hue is invented, and the reconstructed chroma magnitude is
++         * capped by the strongest of the four actually-supported native VGN samples.
++         */
++        vec3 irisTopologyGuide(ivec2 globalP, vec3 bilinearGuide, float directY, float confidence) {
++            vec2 s = clamp((vec2(globalP) + vec2(0.5)) * 0.5 - vec2(0.5),
++                           vec2(0.0), vec2(uGuideSize - ivec2(1)));
++            ivec2 p0 = ivec2(floor(s));
++            ivec2 p1 = min(p0 + ivec2(1), uGuideSize - ivec2(1));
++            vec2 f = s - vec2(p0);
++            vec3 samples[4] = vec3[4](
++                texelFetch(uNativeVgnGuide, p0, 0).rgb,
++                texelFetch(uNativeVgnGuide, ivec2(p1.x, p0.y), 0).rgb,
++                texelFetch(uNativeVgnGuide, ivec2(p0.x, p1.y), 0).rgb,
++                texelFetch(uNativeVgnGuide, p1, 0).rgb);
++            float spatial[4] = float[4](
++                (1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
++                (1.0 - f.x) * f.y, f.x * f.y);
++            int nearestIndex = 0;
++            for (int i = 1; i < 4; ++i) if (spatial[i] > spatial[nearestIndex]) nearestIndex = i;
++            float sampleY[4];
++            float maxYDelta = 0.0;
++            float maxChromaMagnitude = 0.0;
++            for (int i = 0; i < 4; ++i) {
++                sampleY[i] = irisLuma(samples[i]);
++                maxChromaMagnitude = max(maxChromaMagnitude,
++                    length(samples[i] - vec3(sampleY[i])));
++            }
++            for (int i = 0; i < 4; ++i) for (int j = i + 1; j < 4; ++j)
++                maxYDelta = max(maxYDelta, abs(sampleY[i] - sampleY[j]));
++            float bilinearY = max(irisLuma(bilinearGuide), 0.0);
++            float selectorY = mix(sampleY[nearestIndex], directY, 0.40 * confidence);
++            vec3 topologyChroma = vec3(0.0);
++            float weight = 0.0;
++            for (int i = 0; i < 4; ++i) {
++                float relativeY = abs(sampleY[i] - selectorY) /
++                    max(max(abs(sampleY[i]), abs(selectorY)), 0.035);
++                float sameMaterial = 1.0 / (1.0 + 18.0 * relativeY * relativeY);
++                float w = spatial[i] * max(sameMaterial, 0.015);
++                topologyChroma += (samples[i] - vec3(sampleY[i])) * w;
++                weight += w;
++            }
++            topologyChroma /= max(weight, 1.0e-6);
++            float topologyMagnitude = length(topologyChroma);
++            if (topologyMagnitude > maxChromaMagnitude && topologyMagnitude > 1.0e-7)
++                topologyChroma *= maxChromaMagnitude / topologyMagnitude;
++            vec3 bilinearChroma = bilinearGuide - vec3(bilinearY);
++            float edgeGate = irisSmooth01((maxYDelta - 0.025) / 0.130);
++            vec3 selectedChroma = mix(bilinearChroma, topologyChroma, edgeGate);
++            /* Preserve exact bilinear guide luminance without clipping a negative RGB component:
++             * if a supported chroma vector would cross zero at this luminance, reduce only chroma. */
++            float nonNegativeScale = 1.0;
++            if (selectedChroma.r < 0.0) nonNegativeScale = min(nonNegativeScale,
++                bilinearY / max(-selectedChroma.r, 1.0e-7));
++            if (selectedChroma.g < 0.0) nonNegativeScale = min(nonNegativeScale,
++                bilinearY / max(-selectedChroma.g, 1.0e-7));
++            if (selectedChroma.b < 0.0) nonNegativeScale = min(nonNegativeScale,
++                bilinearY / max(-selectedChroma.b, 1.0e-7));
++            return vec3(bilinearY) + selectedChroma * clamp(nonNegativeScale, 0.0, 1.0);
++        }
+         int irisPhaseCount(ivec2 localP) {
+             vec4 phases = texelFetch(uPhaseOccupancy, localP, 0);
+             return (phases.r > 0.0 ? 1 : 0) + (phases.g > 0.0 ? 1 : 0) +
+@@ -1854,7 +1918,7 @@ internal object GlesMgcRawSabreShaders {
+             vec3 b11 = texelFetch(uDirectRgb, q11, 0).rgb;
+             ivec2 cell = globalP - globalBlock;
+             vec3 directRgb = cell.y == 0 ? (cell.x == 0 ? b00 : b10) : (cell.x == 0 ? b01 : b11);
+-            vec3 guideRgb = irisGuide(globalP);
++            vec3 bilinearGuideRgb = irisGuide(globalP);
+             ivec2 nativeBlock = clamp(globalBlock / 2, ivec2(0), uGuideSize - ivec2(1));
+             vec3 guideBlockRgb = texelFetch(uNativeVgnGuide, nativeBlock, 0).rgb;
+ 
+@@ -1864,7 +1928,7 @@ internal object GlesMgcRawSabreShaders {
+             float y11 = max(irisLuma(b11), 0.0);
+             float directY = max(irisLuma(directRgb), 0.0);
+             float lowY = max(0.25 * (y00 + y10 + y01 + y11), 0.0);
+-            float guideY = max(irisLuma(guideRgb), 0.0);
++            float guideY = max(irisLuma(bilinearGuideRgb), 0.0);
+             float guideBlockY = max(irisLuma(guideBlockRgb), 0.0);
+ 
+             int p00 = irisPhaseCount(q00);
+@@ -1908,6 +1972,7 @@ internal object GlesMgcRawSabreShaders {
+             float directDetail = ((directY - lowY) / denom) * shapeScale;
+             float targetY = max(guideY + guideBlockY * directDetail * confidence, 0.0);
+             float factor = guideY > 1.0e-5 ? clamp(targetY / guideY, 0.68, 1.47) : 1.0;
++            vec3 guideRgb = irisTopologyGuide(globalP, bilinearGuideRgb, directY, confidence);
+ 
+             /* IRIS_26573_REQUIRED_SR_PROOF_DIAGNOSTIC
+              * Alpha is diagnostic-only and never published. Encode phaseCount*8 + reasonClass as
+diff --git a/app/version.properties b/app/version.properties
+index a078c034728f264be26f96e80b074d480299f132..791c879d7eca2bbae5806bf04efd4566007be3ad 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726578
+-VERSION_BUILD=26578
++VERSION_NAME=0.9726579
++VERSION_BUILD=26579
