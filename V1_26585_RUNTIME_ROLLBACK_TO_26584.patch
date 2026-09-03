@@ -1,0 +1,200 @@
+diff --git a/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl b/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl
+index fabe7b66c0a1cf863d69e70c8dc3ffbfa477b348..0e27e9a21a95a1a987d6296d52adbf6c63215370 100644
+--- a/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl
++++ b/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl
+@@ -3,7 +3,6 @@ precision mediump sampler2D;
+ 
+ uniform sampler2D InputBuffer;
+ uniform float displayGain;
+-uniform float sceneWhite;
+ out vec3 Output;
+ #ifndef CALIBRATED_PROFILE
+ #define CALIBRATED_PROFILE 0
+@@ -49,48 +48,6 @@ float componentGainLimit(float luminanceValue, float chromaValue) {
+     return 4.0;
+ }
+ 
+-/* IRIS_26585_TONE_AWARE_HIGHLIGHT_CHROMA_PRESERVATION
+- * 26584 creates real highlight headroom later in MotionV2Render. The previous appearance
+- * safety test treated any pre-tone projected channel >=1 as out of gamut, which could suppress
+- * legitimate warm chroma before the global scalar tone map had a chance to compress it safely.
+- * Reproduce the exact 26584/26582 scalar shoulder here only as a safety predictor; this stage
+- * still changes colorfulness solely along the center pixel's own chroma axis.
+- */
+-float iris26585MapHeadroomGuide(float guide) {
+-    const float toneStart = 0.50;
+-    const float logShape = 6.0;
+-    const float outputExposureScale = 0.80;
+-    if (guide <= toneStart) return guide;
+-    float whitePoint = max(sceneWhite, toneStart + 0.05);
+-    float x = clamp((guide - toneStart) / max(whitePoint - toneStart, 1.0e-6), 0.0, 1.0);
+-    float shaped = log(1.0 + logShape * x) / log(1.0 + logShape);
+-    float preScaleDisplayWhite = 1.0 / outputExposureScale;
+-    return toneStart + (preScaleDisplayWhite - toneStart) * shaped;
+-}
+-
+-float iris26585PostTonePreGamutPeak(vec3 preDisplayRgb) {
+-    const float outputExposureScale = 0.80;
+-    vec3 postRgb = max(preDisplayRgb, vec3(0.0)) * max(displayGain, 1.0e-6);
+-    float postLuma = max(luminanceOf(postRgb), 0.0);
+-    float postPeak = maximumComponent(postRgb);
+-    float guide = max(postLuma, postPeak);
+-    if (guide <= 1.0e-7) return 0.0;
+-    float mappedGuide = iris26585MapHeadroomGuide(guide);
+-    return postPeak * (mappedGuide / guide) * outputExposureScale;
+-}
+-
+-float iris26585ToneSafeHighlightGain(float centerLuma, vec3 centerChroma, float requestedGain) {
+-    float lo = 1.0;
+-    float hi = max(1.0, requestedGain);
+-    for (int iteration = 0; iteration < 7; ++iteration) {
+-        float mid = 0.5 * (lo + hi);
+-        vec3 candidate = vec3(centerLuma) + centerChroma * mid;
+-        if (iris26585PostTonePreGamutPeak(candidate) <= 0.995) lo = mid;
+-        else hi = mid;
+-    }
+-    return lo;
+-}
+-
+ void main() {
+     ivec2 position = ivec2(gl_FragCoord.xy);
+     ivec2 imageSize = textureSize(InputBuffer, 0);
+@@ -156,7 +113,10 @@ void main() {
+         * highlightGate
+         * reliability;
+ 
+-    /* Preserve the exact <=26584 path as a floor. */
++    /* Hard gamut/highlight safety. A pixel already at/above linear display gamut, or predicted to
++     * cross it after the already-solved display exposure, gets exactly 1x colorfulness gain.
++     * Otherwise cap the chroma-axis scalar before any RGB component could cross 0 or 1.
++     */
+     float inputPeak = maximumComponent(centerRgb);
+     float gamutGainLimit = 4.0;
+     if (inputPeak >= 1.0 || projectedPeak >= 1.0) {
+@@ -166,35 +126,8 @@ void main() {
+         gamutGainLimit = min(gamutGainLimit, componentGainLimit(centerLuma, centerChroma.g));
+         gamutGainLimit = min(gamutGainLimit, componentGainLimit(centerLuma, centerChroma.b));
+     }
+-    float legacyChromaGain = clamp(min(requestedGain, gamutGainLimit), 1.0, 1.32);
+ 
+-    /* The added path exists only where the legacy highlight gate was suppressing an otherwise
+-     * reliable weak chroma vector. Exact neutrals remain neutral because neutralActivation is 0,
+-     * and no neighboring hue is ever copied. The gain is capped at 1.12x and then binary-limited
+-     * against the actual post-tone/pre-gamut peak, so the later renderer need not clip or whiten it.
+-     */
+-    float legacyHighlightSuppression = 1.0 - highlightGate;
+-    float basePostTonePeak = iris26585PostTonePreGamutPeak(centerRgb);
+-    float toneHeadroomGate = 1.0 - smoothstep(0.94, 0.995, basePostTonePeak);
+-    float highlightRequestedGain = 1.0 + 0.12
+-        * neutralActivation
+-        * chromaRolloff
+-        * shadowGate
+-        * legacyHighlightSuppression
+-        * reliability
+-        * toneHeadroomGate;
+-    float highlightFloorGainLimit = 4.0;
+-    if (centerChroma.r < -1.0e-7) highlightFloorGainLimit = min(
+-        highlightFloorGainLimit, (0.0 - centerLuma) / centerChroma.r);
+-    if (centerChroma.g < -1.0e-7) highlightFloorGainLimit = min(
+-        highlightFloorGainLimit, (0.0 - centerLuma) / centerChroma.g);
+-    if (centerChroma.b < -1.0e-7) highlightFloorGainLimit = min(
+-        highlightFloorGainLimit, (0.0 - centerLuma) / centerChroma.b);
+-    highlightRequestedGain = min(highlightRequestedGain, min(1.12, highlightFloorGainLimit));
+-    float toneSafeHighlightGain = iris26585ToneSafeHighlightGain(
+-        centerLuma, centerChroma, highlightRequestedGain);
+-
+-    float adaptiveChromaGain = max(legacyChromaGain, toneSafeHighlightGain);
++    float adaptiveChromaGain = clamp(min(requestedGain, gamutGainLimit), 1.0, 1.32);
+     if (adaptiveChromaGain <= 1.000001) {
+         Output = centerRgb;
+         return;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
+index d0b8020b7b7e21d05e424d95768eb7b5960d749f..233f7934349f60dcfb8f2f054ea1b5c7db34222e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
+@@ -17,7 +17,6 @@ import com.particlesdevs.photoncamera.util.Log;
+  */
+ public final class MotionV2AdaptiveColorAppearance extends Node {
+     private static final float MAX_WEAK_CHROMA_GAIN = 1.32f;
+-    private static final float MAX_HIGHLIGHT_CHROMA_GAIN = 1.12f;
+ 
+     public MotionV2AdaptiveColorAppearance() {
+         super("", "MotionV2AdaptiveColorAppearance");
+@@ -49,11 +48,6 @@ public final class MotionV2AdaptiveColorAppearance extends Node {
+         glProg.useAssetProgram("motionv2/adaptive_color_appearance_26563");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+         glProg.setVar("displayGain", displayGain);
+-        float baseSceneWhite = MotionV2Render.iris26582BaseSceneWhite(displayGain);
+-        float sceneWhite = basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite;
+-        if (!Float.isFinite(sceneWhite) || sceneWhite < baseSceneWhite) sceneWhite = baseSceneWhite;
+-        sceneWhite = Math.min(MotionV2Render.IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, sceneWhite);
+-        glProg.setVar("sceneWhite", sceneWhite);
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
+@@ -67,9 +61,6 @@ public final class MotionV2AdaptiveColorAppearance extends Node {
+                 + " beforeToneHighlightGamut=true"
+                 + " dngAffected=false"
+                 + " maxWeakChromaGain=" + MAX_WEAK_CHROMA_GAIN
+-                + " maxHighlightChromaGain=" + MAX_HIGHLIGHT_CHROMA_GAIN
+-                + " sceneWhite=" + sceneWhite
+-                + " toneAwareHighlightChroma=true"
+                 + " displayGain=" + displayGain
+                 + " irisNight=" + basePipeline.mParameters.irisNightActive
+                 + " superRes=" + basePipeline.mParameters.motionV2SuperResOutputEnabled
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 4fb325509a605eb477e213ce4f0197dd6c4ab441..bfa52d0f96c0fbed7ef2f41cb95638e247aed929 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -239,8 +239,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " structuredPixels=" + iris26583Tone.structuredPixels
+                     + " structuredCells=" + iris26583Tone.structuredCells
+                     + " structuredGuide=" + iris26583Tone.structuredGuide
+-                    + " structuredGuidePercentile=0.98"
+-                    + " structuredHighlightTarget=0.945"
+                     + " structuredStrength=" + iris26583Tone.structuredStrength
+                     + " floor26583SceneWhite=" + iris26583Tone.floor26583SceneWhite
+                     + " adaptiveSceneWhite=" + iris26583Tone.adaptiveSceneWhite
+@@ -692,12 +690,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             final int cellsX = (gw + cellSize - 1) / cellSize;
+             final int cellsY = (gh + cellSize - 1) / cellSize;
+             final int[] cellCounts = new int[cellsX * cellsY];
+-            /* IRIS_26585_STRUCTURED_HIGHLIGHT_SHAPE_TAIL
+-             * 26584 proved the coherent region exists, but P90/0.965 still allowed the
+-             * brightest shape-bearing part of neutral pots/practical lights to crowd at white.
+-             * Resolve the supported structured tail more finely and protect P98 instead.
+-             */
+-            final int[] hist = new int[256];
++            final int[] hist = new int[64];
+             int histTotal = 0;
+             float histMaxGuide = 0.0f;
+             for (int y = 1; y < gh - 1; y++) {
+@@ -730,7 +723,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             }
+             for (int count : cellCounts) if (count >= 2) structuredCells++;
+             if (histTotal > 0) {
+-                int target = Math.max(1, (int)Math.ceil(histTotal * 0.98));
++                int target = Math.max(1, (int)Math.ceil(histTotal * 0.90));
+                 int accum = 0, chosen = 0;
+                 for (int b = 0; b < hist.length; b++) {
+                     accum += hist[b];
+@@ -745,7 +738,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         float structuredWhite = baseWhite;
+         if (structuredStrength > 0.0f && Float.isFinite(structuredGuide)) {
+             float structuredRequiredWhite = MotionV2Render.iris26583RequiredSceneWhite(
+-                    gain, structuredGuide, 0.945f);
++                    gain, structuredGuide, 0.965f);
+             structuredWhite = baseWhite
+                     + (structuredRequiredWhite - baseWhite) * structuredStrength;
+         }
+diff --git a/app/version.properties b/app/version.properties
+index 9c2c324fc9ffa89d91954e0348242bff636dd2fd..c7e990235eedf475d37fd29653196e3b31364a0e 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726585
+-VERSION_BUILD=26585
++VERSION_NAME=0.9726584
++VERSION_BUILD=26584
