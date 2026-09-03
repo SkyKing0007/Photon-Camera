@@ -1,0 +1,332 @@
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 11f0cb27e6346f32c269089b660a7a8f3e62ea1e..4ff35d7edea924d8bc80160257757be49e5e3a28 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -108,7 +108,11 @@ float mapHeadroomLuminance(float y) {
+             0.0,
+             1.0);
+ 
+-    const float logShape=6.0;
++    /* IRIS_26591_PHOTON_LIKE_UPPER_TAIL_SEPARATION
++     * Less-concave global shoulder preserves differential spacing near the recovered endpoint.
++     * No local tone map, per-channel substitution, sharpening, or post-tone SHORT composite.
++     */
++    const float logShape=3.0;
+     float shaped=
+             log(1.0+logShape*x)
+             /log(1.0+logShape);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 995068fec8944a6cfea95bd259fa8601a91c2ae5..7e51616ebc1597f6f3079a643ac947bcf7fa98f4 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2468,15 +2468,22 @@ internal class GlesMgcRawSpatialStacker(
+                         output = highlightShortMask26587,
+                     )
+                     val shortMaskProbe26590 = probeSabreShortRestoreMask26590(highlightShortMask26587)
+-                    PLog.i(
+-                        SABRE_TAG,
+-                        "IRIS_26590_SHORT_MASK_EFFECT probe=${shortMaskProbe26590.width}x${shortMaskProbe26590.height} " +
++                    val shortMaskEffectDetails26591 =
++                        "probe=${shortMaskProbe26590.width}x${shortMaskProbe26590.height} " +
+                             "active=${shortMaskProbe26590.activePixels}/${shortMaskProbe26590.totalPixels} " +
+                             "strong=${shortMaskProbe26590.strongPixels}/${shortMaskProbe26590.totalPixels} " +
+                             "maxConfidence=${shortMaskProbe26590.maxConfidence} " +
+                             "meanConfidence=${shortMaskProbe26590.meanConfidence} " +
+                             "referenceNearClipThreshold=0.98 shortHeadroomThreshold=0.90 " +
+-                            "sameSabreFlow=true wholeRgb=true maskFilter=NEAREST",
++                            "sameSabreFlow=true wholeRgb=true maskFilter=NEAREST"
++                    PLog.i(SABRE_TAG, "IRIS_26590_SHORT_MASK_EFFECT $shortMaskEffectDetails26591")
++                    /* IRIS_26591_SHORT_MASK_EFFECT_MOTIONTRACE
++                     * Telemetry only: expose the already-computed 26590 read-only mask probe in the
++                     * capture's durable MotionTrace. No mask, flow, weight, or RGB math changes.
++                     */
++                    MotionTrace.processingState(
++                        "IRIS_26591_SHORT_MASK_EFFECT",
++                        shortMaskEffectDetails26591,
+                     )
+                     highlightShortAdmitted26587 = true
+                     highlightShortMaskGenerated26587 = true
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 7c33cf1d86bcc04df79d8c9208ccf7b45c050222..9d18e257592782dc50c59b0ecdcf600f3192959d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -46,6 +46,18 @@ public final class MotionV2Render extends Node {
+     static final float IRIS_26583_COMPACT_FRACTION_START = 0.004f;
+     static final float IRIS_26583_COMPACT_FRACTION_FULL = 0.015f;
+     private static final float IRIS_26582_LOG_SHAPE = 6.0f;
++    /* IRIS_26591_PHOTON_LIKE_UPPER_TAIL_SEPARATION
++     * Keep the exact 26590 viewfinder/body meter curve above as a frozen control-loop model.
++     * Final SDR rendering uses a less-concave monotonic shoulder so reconstructed NORMAL and
++     * aligned SHORT highlight differences remain separated instead of crowding below white.
++     * Tone start and the proven 0.80 output exposure remain unchanged.
++     */
++    static final float IRIS_26591_HIGHLIGHT_TARGET = 0.980f;
++    static final float IRIS_26591_BROAD_HIGHLIGHT_TARGET = 0.975f;
++    static final float IRIS_26591_COMPACT_HIGHLIGHT_TARGET = 0.985f;
++    static final float IRIS_26591_CONTINUOUS_HIGHLIGHT_TARGET = 0.980f;
++    static final float IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET = 0.985f;
++    private static final float IRIS_26591_LOG_SHAPE = 3.0f;
+     /* IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS
+      * Preserve the tested 26505 SDR primary exactly. Ultra HDR is a reversible
+      * rendition relationship: the gain map should recover the wanted HDR signal
+@@ -79,6 +91,18 @@ public final class MotionV2Render extends Node {
+                 + (preScaleDisplayWhite - IRIS_26582_TONE_START) * shaped;
+     }
+ 
++    static float iris26591MapHeadroom(float guide, float sceneWhite) {
++        if (guide <= IRIS_26582_TONE_START) return guide;
++        float whitePoint = Math.max(sceneWhite, IRIS_26582_TONE_START + 0.05f);
++        float x = iris26582Clamp((guide - IRIS_26582_TONE_START)
++                / Math.max(whitePoint - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
++        float shaped = (float)(Math.log(1.0 + IRIS_26591_LOG_SHAPE * x)
++                / Math.log(1.0 + IRIS_26591_LOG_SHAPE));
++        float preScaleDisplayWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
++        return IRIS_26582_TONE_START
++                + (preScaleDisplayWhite - IRIS_26582_TONE_START) * shaped;
++    }
++
+     static float iris26582AdaptiveStrength(float clippedFraction) {
+         float t = iris26582Clamp((clippedFraction - IRIS_26582_CLIP_FRACTION_START)
+                 / Math.max(IRIS_26582_CLIP_FRACTION_FULL
+@@ -103,6 +127,35 @@ public final class MotionV2Render extends Node {
+         return Math.max(baseWhite, Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, requiredWhite));
+     }
+ 
++    static float iris26591RequiredSceneWhite(float displayGain, float sourceGuide,
++                                              float outputTarget) {
++        float baseWhite = iris26582BaseSceneWhite(displayGain);
++        if (!Float.isFinite(sourceGuide) || sourceGuide <= 0.0f) return baseWhite;
++        float postGuide = sourceGuide * Math.max(displayGain, 1.0e-6f);
++        if (postGuide <= IRIS_26582_TONE_START) return baseWhite;
++        float targetPreScale = iris26582Clamp(outputTarget, 0.80f, 0.995f) / OUTPUT_EXPOSURE_SCALE;
++        float preScaleWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
++        float targetShape = iris26582Clamp((targetPreScale - IRIS_26582_TONE_START)
++                / Math.max(preScaleWhite - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
++        float targetX = (float)((Math.exp(targetShape * Math.log(1.0 + IRIS_26591_LOG_SHAPE)) - 1.0)
++                / IRIS_26591_LOG_SHAPE);
++        float requiredWhite = IRIS_26582_TONE_START
++                + (postGuide - IRIS_26582_TONE_START) / Math.max(targetX, 1.0e-4f);
++        return Math.max(baseWhite, Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, requiredWhite));
++    }
++
++    static float iris26591AdaptiveSceneWhite(float displayGain, float p99Guide,
++                                              float clippedFraction) {
++        float baseWhite = iris26582BaseSceneWhite(displayGain);
++        if (!Float.isFinite(p99Guide) || p99Guide <= 0.0f) return baseWhite;
++        float postP99 = p99Guide * Math.max(displayGain, 1.0e-6f);
++        if (postP99 <= baseWhite) return baseWhite;
++        float requiredWhite = iris26591RequiredSceneWhite(
++                displayGain, p99Guide, IRIS_26591_HIGHLIGHT_TARGET);
++        float strength = iris26582AdaptiveStrength(clippedFraction);
++        return baseWhite + (requiredWhite - baseWhite) * strength;
++    }
++
+     static float iris26582AdaptiveSceneWhite(float displayGain, float p99Guide,
+                                               float clippedFraction) {
+         float baseWhite = iris26582BaseSceneWhite(displayGain);
+@@ -354,6 +407,12 @@ public final class MotionV2Render extends Node {
+                 + " legacyHighlightTarget=" + IRIS_26582_HIGHLIGHT_TARGET
+                 + " broadHighlightTarget=" + IRIS_26583_BROAD_HIGHLIGHT_TARGET
+                 + " compactHighlightTarget=" + IRIS_26583_COMPACT_HIGHLIGHT_TARGET
++                + " iris26591FinalLogShape=" + IRIS_26591_LOG_SHAPE
++                + " iris26591FinalTargets=" + IRIS_26591_HIGHLIGHT_TARGET + ","
++                    + IRIS_26591_BROAD_HIGHLIGHT_TARGET + ","
++                    + IRIS_26591_COMPACT_HIGHLIGHT_TARGET + ","
++                    + IRIS_26591_CONTINUOUS_HIGHLIGHT_TARGET + ","
++                    + IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET
+                 + " IRIS_26583_PROJECTED_BROAD_AND_COMPACT_HIGHLIGHT_TAIL=true"
+                 + " IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE=true"
+                 + " IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 560d7bab256884ab63a91c3b337ae842801367cc..816f1220841d0d595ba80551cc01d64d66b8ece5 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -240,12 +240,13 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " structuredCells=" + iris26583Tone.structuredCells
+                     + " structuredGuide=" + iris26583Tone.structuredGuide
+                     + " structuredGuidePercentile=0.98"
+-                    + " structuredHighlightTarget=0.945"
++                    + " structuredHighlightTarget=" + MotionV2Render.IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET
+                     + " structuredStrength=" + iris26583Tone.structuredStrength
+                     + " floor26583SceneWhite=" + iris26583Tone.floor26583SceneWhite
+                     + " adaptiveSceneWhite=" + iris26583Tone.adaptiveSceneWhite
+                     + " spatialPopulationIndependent=true continuousTail=true"
+-                    + " toneStartUnchanged=true uniformRgbScalar=true localToneMap=false");
++                    + " toneStartUnchanged=true uniformRgbScalar=true localToneMap=false"
++                    + " IRIS_26591_FINAL_UPPER_TAIL=true meterCurveFrozen26590=true");
+ 
+             Log.i(Name, "IRIS_26519_VIEWFINDER_MATCH"
+                     + " requestId=" + snapshot.requestId
+@@ -531,17 +532,25 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         }
+     }
+ 
+-    private static float iris26583ProjectedOutputPeak(float sourceGuide, float gain, float sceneWhite) {
++    private static float iris26583ProjectedOutputPeak(float sourceGuide, float gain, float sceneWhite,
++                                                        boolean finalHighlightAuthority) {
+         float postGuide = Math.max(0.0f, sourceGuide) * Math.max(gain, 1.0e-6f);
+-        return clamp(MotionV2Render.iris26582MapHeadroom(postGuide, sceneWhite)
+-                * OUTPUT_EXPOSURE_SCALE, 0.0f, 1.0f);
++        float mapped = finalHighlightAuthority
++                ? MotionV2Render.iris26591MapHeadroom(postGuide, sceneWhite)
++                : MotionV2Render.iris26582MapHeadroom(postGuide, sceneWhite);
++        return clamp(mapped * OUTPUT_EXPOSURE_SCALE, 0.0f, 1.0f);
+     }
+ 
+     private ToneDecision iris26583ToneDecision(float gain) {
+         return iris26586ToneDecision(gain, true);
+     }
+ 
+-    /* IRIS_26586_VIEWFINDER_TONE_AUTHORITY_SPLIT
++    /* IRIS_26591_VIEWFINDER_BODY_FREEZE_FINAL_TAIL_SPLIT
++     * Preserve the exact 26590 meter map (logShape 6 and successful meter targets) so the
++     * new final highlight shoulder cannot feed back into body/viewfinder brightness. Final
++     * highlight decisions and motionv2/render.glsl alone use the 26591 logShape-3 transfer.
++     *
++     * IRIS_26586_VIEWFINDER_TONE_AUTHORITY_SPLIT
+      * Viewfinder/body exposure is solved against the exact successful 26584 structured-tone
+      * baseline (64-bin P90, 0.965 target). Only after displayGain is final may the 26585
+      * P98/0.945 structured-highlight owner allocate extra upper-tail headroom. This prevents
+@@ -567,8 +576,11 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             legacyBroadClippedFraction = (iris26582CandidateGuides.size() - lo)
+                     / (float)iris26582CandidateGuides.size();
+         }
+-        float legacyBroadWhite = MotionV2Render.iris26582AdaptiveSceneWhite(
+-                gain, iris26550CandidateP99Guide, legacyBroadClippedFraction);
++        float legacyBroadWhite = finalHighlightAuthority
++                ? MotionV2Render.iris26591AdaptiveSceneWhite(
++                        gain, iris26550CandidateP99Guide, legacyBroadClippedFraction)
++                : MotionV2Render.iris26582AdaptiveSceneWhite(
++                        gain, iris26550CandidateP99Guide, legacyBroadClippedFraction);
+         float legacyBroadStrength = MotionV2Render.iris26582AdaptiveStrength(legacyBroadClippedFraction);
+         if (legacyBroadWhite <= baseWhite + 1.0e-6f) legacyBroadStrength = 0.0f;
+ 
+@@ -584,7 +596,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         if (!iris26582CandidateGuides.isEmpty()) {
+             int broadNear = 0, near = 0, hard = 0;
+             for (float guide : iris26582CandidateGuides) {
+-                float projected = iris26583ProjectedOutputPeak(guide, gain, baseWhite);
++                float projected = iris26583ProjectedOutputPeak(guide, gain, baseWhite, finalHighlightAuthority);
+                 if (projected >= MotionV2Render.IRIS_26583_PROJECTED_BROAD_NEAR_CEILING) broadNear++;
+                 if (projected >= MotionV2Render.IRIS_26583_PROJECTED_NEAR_CEILING) near++;
+                 if (projected >= MotionV2Render.IRIS_26583_PROJECTED_HARD_CEILING) hard++;
+@@ -595,7 +607,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             projectedHardFraction = hard / n;
+         }
+ 
+-        float p99Projected = iris26583ProjectedOutputPeak(iris26550CandidateP99Guide, gain, baseWhite);
++        float p99Projected = iris26583ProjectedOutputPeak(iris26550CandidateP99Guide, gain, baseWhite, finalHighlightAuthority);
+         float broadPopulation = smoothstep(MotionV2Render.IRIS_26583_BROAD_FRACTION_START,
+                 MotionV2Render.IRIS_26583_BROAD_FRACTION_FULL, projectedBroadNearFraction);
+         float broadPressure = smoothstep(MotionV2Render.IRIS_26583_PROJECTED_BROAD_NEAR_CEILING,
+@@ -611,15 +623,18 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     Math.max(projectedBroadGuide, iris26583CandidateP995Guide),
+                     0.45f * p995BroadAssist);
+         }
+-        float projectedBroadRequiredWhite = MotionV2Render.iris26583RequiredSceneWhite(
+-                gain, projectedBroadGuide, MotionV2Render.IRIS_26583_BROAD_HIGHLIGHT_TARGET);
++        float projectedBroadRequiredWhite = finalHighlightAuthority
++                ? MotionV2Render.iris26591RequiredSceneWhite(
++                        gain, projectedBroadGuide, MotionV2Render.IRIS_26591_BROAD_HIGHLIGHT_TARGET)
++                : MotionV2Render.iris26583RequiredSceneWhite(
++                        gain, projectedBroadGuide, MotionV2Render.IRIS_26583_BROAD_HIGHLIGHT_TARGET);
+         float projectedBroadWhite = baseWhite
+                 + (projectedBroadRequiredWhite - baseWhite) * projectedBroadStrength;
+ 
+         float broadWhite = Math.max(legacyBroadWhite, projectedBroadWhite);
+         float broadStrength = Math.max(legacyBroadStrength, projectedBroadStrength);
+ 
+-        float p995Projected = iris26583ProjectedOutputPeak(iris26583CandidateP995Guide, gain, baseWhite);
++        float p995Projected = iris26583ProjectedOutputPeak(iris26583CandidateP995Guide, gain, baseWhite, finalHighlightAuthority);
+         float compactSupport = smoothstep(MotionV2Render.IRIS_26583_COMPACT_FRACTION_START,
+                 MotionV2Render.IRIS_26583_COMPACT_FRACTION_FULL, projectedNearFraction);
+         float compactPressure = smoothstep(0.965f, 0.995f, p995Projected);
+@@ -634,8 +649,11 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             compactGuide = mix(compactGuide, Math.max(compactGuide, iris26583CandidateP998Guide),
+                     0.35f * p998Assist);
+         }
+-        float compactRequiredWhite = MotionV2Render.iris26583RequiredSceneWhite(
+-                gain, compactGuide, MotionV2Render.IRIS_26583_COMPACT_HIGHLIGHT_TARGET);
++        float compactRequiredWhite = finalHighlightAuthority
++                ? MotionV2Render.iris26591RequiredSceneWhite(
++                        gain, compactGuide, MotionV2Render.IRIS_26591_COMPACT_HIGHLIGHT_TARGET)
++                : MotionV2Render.iris26583RequiredSceneWhite(
++                        gain, compactGuide, MotionV2Render.IRIS_26583_COMPACT_HIGHLIGHT_TARGET);
+         float compactWhite = baseWhite
+                 + (compactRequiredWhite - baseWhite) * compactStrength;
+ 
+@@ -660,7 +678,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             for (int i = 0; i < iris26584CandidateGuideGrid.length; i++) {
+                 float guide = iris26584CandidateGuideGrid[i];
+                 if (!Float.isFinite(guide)) continue;
+-                float projected = iris26583ProjectedOutputPeak(guide, gain, baseWhite);
++                float projected = iris26583ProjectedOutputPeak(guide, gain, baseWhite, finalHighlightAuthority);
+                 iris26584ProjectedGridScratch[i] = projected;
+                 float q = smoothstep(0.885f, 0.995f, projected);
+                 pressureSum += q * q;
+@@ -668,7 +686,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             }
+         } else {
+             for (float guide : iris26582CandidateGuides) {
+-                float projected = iris26583ProjectedOutputPeak(guide, gain, baseWhite);
++                float projected = iris26583ProjectedOutputPeak(guide, gain, baseWhite, finalHighlightAuthority);
+                 float q = smoothstep(0.885f, 0.995f, projected);
+                 pressureSum += q * q;
+                 pressureCount++;
+@@ -688,8 +706,10 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             continuousGuide = mix(continuousGuide,
+                     Math.max(continuousGuide, iris26583CandidateP998Guide), 0.45f * tailAssist998);
+         }
+-        float continuousRequiredWhite = MotionV2Render.iris26583RequiredSceneWhite(
+-                gain, continuousGuide, 0.958f);
++        float continuousRequiredWhite = finalHighlightAuthority
++                ? MotionV2Render.iris26591RequiredSceneWhite(
++                        gain, continuousGuide, MotionV2Render.IRIS_26591_CONTINUOUS_HIGHLIGHT_TARGET)
++                : MotionV2Render.iris26583RequiredSceneWhite(gain, continuousGuide, 0.958f);
+         float continuousWhite = baseWhite
+                 + (continuousRequiredWhite - baseWhite) * continuousTailStrength;
+ 
+@@ -699,7 +719,8 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         float structuredStrength = 0.0f;
+         final int structuredHistogramBins = finalHighlightAuthority ? 256 : 64;
+         final float structuredPercentile = finalHighlightAuthority ? 0.98f : 0.90f;
+-        final float structuredHighlightTarget = finalHighlightAuthority ? 0.945f : 0.965f;
++        final float structuredHighlightTarget = finalHighlightAuthority
++                ? MotionV2Render.IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET : 0.965f;
+         if (iris26584CandidateGuideGrid != null
+                 && iris26584CandidateGridWidth > 2 && iris26584CandidateGridHeight > 2
+                 && iris26584CandidateGuideGrid.length
+@@ -725,7 +746,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     if (!Float.isFinite(guide)) continue;
+                     float projected = iris26584ProjectedGridScratch != null
+                             ? iris26584ProjectedGridScratch[idx]
+-                            : iris26583ProjectedOutputPeak(guide, gain, baseWhite);
++                            : iris26583ProjectedOutputPeak(guide, gain, baseWhite, finalHighlightAuthority);
+                     if (!Float.isFinite(projected) || projected < 0.945f) continue;
+                     int neighborCount = 0;
+                     float np = iris26584ProjectedGridScratch != null ? iris26584ProjectedGridScratch[idx - 1] : Float.NaN;
+@@ -762,8 +783,11 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         }
+         float structuredWhite = baseWhite;
+         if (structuredStrength > 0.0f && Float.isFinite(structuredGuide)) {
+-            float structuredRequiredWhite = MotionV2Render.iris26583RequiredSceneWhite(
+-                    gain, structuredGuide, structuredHighlightTarget);
++            float structuredRequiredWhite = finalHighlightAuthority
++                    ? MotionV2Render.iris26591RequiredSceneWhite(
++                            gain, structuredGuide, structuredHighlightTarget)
++                    : MotionV2Render.iris26583RequiredSceneWhite(
++                            gain, structuredGuide, structuredHighlightTarget);
+             structuredWhite = baseWhite
+                     + (structuredRequiredWhite - baseWhite) * structuredStrength;
+         }
+diff --git a/app/version.properties b/app/version.properties
+index 80468789134914ce47a6c726df956b37f239508f..ffcf4b41a6c382d75aede3a1a4d897ce4b1f25bc 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726590
+-VERSION_BUILD=26590
++VERSION_NAME=0.9726591
++VERSION_BUILD=26591
