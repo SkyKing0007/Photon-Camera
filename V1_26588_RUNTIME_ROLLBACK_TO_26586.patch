@@ -1,0 +1,804 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+index 867debbe3586b21b5f2b09eb1c3c622238464455..453e721de71dfafac25e1e1d8e43e4b3d449f9eb 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+@@ -49,18 +49,6 @@ internal class GlesIris26545SabreProcessor(
+         }
+         val baseExposure = frames[baseIndex].exposureProduct
+             .takeIf { it.isFinite() && it > 0.0 }
+-        val highlightShortIndices = frames.indices.filter { index ->
+-            frames[index].role == RawBurstFrameRole.HIGHLIGHT_SHORT
+-        }
+-        require(highlightShortIndices.size <= 1) {
+-            "26587 Sabre accepts at most one HIGHLIGHT_SHORT, got ${highlightShortIndices.size}"
+-        }
+-        highlightShortIndices.forEach { index ->
+-            val exposure = frames[index].exposureProduct
+-            require(baseExposure != null && exposure.isFinite() && exposure > 0.0 && exposure < baseExposure) {
+-                "26587 HIGHLIGHT_SHORT must be lower exposure than NORMAL base"
+-            }
+-        }
+         val admittedIndices = buildList {
+             add(baseIndex)
+             frames.indices.filterTo(this) { index ->
+@@ -73,8 +61,6 @@ internal class GlesIris26545SabreProcessor(
+                         frame.exposureProduct.isFinite() && frame.exposureProduct > baseExposure
+                 }
+             }
+-            // IRIS_26587: keep SHORT last so NORMAL Sabre support is frozen before auxiliary tests.
+-            addAll(highlightShortIndices)
+         }
+         val admittedSet = admittedIndices.toSet()
+         val excluded = frames.indices.filterNot(admittedSet::contains)
+@@ -82,14 +68,12 @@ internal class GlesIris26545SabreProcessor(
+         val admitted = admittedIndices.map(frames::get)
+         val normalCount = admitted.count { it.role == RawBurstFrameRole.NORMAL }
+         val longCount = admitted.count { it.role == RawBurstFrameRole.SHADOW_LONG }
+-        val highlightShortCount = admitted.count { it.role == RawBurstFrameRole.HIGHLIGHT_SHORT }
+         PLog.i(
+             TAG,
+-            "IRIS_26587_SABRE_OWNER_ACTIVE base=${frames[baseIndex].frameNumber} " +
+-                "normal=$normalCount shadowLong=$longCount highlightShort=$highlightShortCount " +
+-                "allowShadowLong=$allowShadowLong excluded=${excluded.size} " +
+-                "normalMergeOwner=true shortReferenceImmutable=true spatial=false bento=false output=linear-rgb " +
+-                "superRes=$enableSuperRes srEvidence=NORMAL_ONLY shortContribution=NORMAL_ACCUMULATOR_EXCLUDED",
++            "IRIS_26547_SABRE_OWNER_ACTIVE base=${frames[baseIndex].frameNumber} " +
++                "normal=$normalCount shadowLong=$longCount allowShadowLong=$allowShadowLong " +
++                "excluded=${excluded.size} shortReferenceImmutable=true spatial=false bento=false output=linear-rgb " +
++                    "superRes=$enableSuperRes srEvidence=NORMAL_ONLY",
+         )
+         /* IRIS_26545_V1_2_SABRE_LOW_LEVEL_ISOLATION
+          * Match bjzhou's current Sabre architecture: the shared low-level GL class is used only
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 7882b0708973b1fbc950f5bee2511c4d375ae440..9ac818dadafee823ba02e17eb2ea5ca5499c70f6 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -391,139 +391,6 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-
+-    /* IRIS_26587_FAIL_CLOSED_SHORT_RESTORE_MASK
+-     * One scalar confidence controls the whole RGB replacement. NORMAL clipping is proven in
+-     * unnormalized sensor codes across at least two CFA sites in the center 2x2 quad. SHORT must
+-     * remain unclipped in its aligned 3x3 neighborhood. Alignment/rejection/coverage come from
+-     * the existing Sabre reference-domain owner. Radiometric agreement is checked only on nearby
+-     * unclipped RAW quads after black subtraction and the exact exposure ratio.
+-     */
+-    val shortRestoreMask26587 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        precision highp usampler2D;
+-        uniform highp usampler2D uReferenceRaw;
+-        uniform highp usampler2D uShortRaw;
+-        uniform sampler2D uFlow;
+-        uniform sampler2D uShortWeight;
+-        uniform sampler2D uNormalCoverage;
+-        uniform sampler2D uUnblocker;
+-        uniform ivec2 uRawSize;
+-        uniform vec4 uFlowScaleOffset;
+-        uniform vec4 uReferenceBlackByPhase;
+-        uniform vec4 uShortBlackByPhase;
+-        uniform float uWhiteLevel;
+-        uniform float uExposureRatio;
+-        uniform float uNormalCoverageThreshold;
+-        uniform float uFlowVariationThreshold;
+-        uniform float uShortWeightThreshold;
+-        uniform float uUnblockerThreshold;
+-        uniform float uConsistencyThreshold;
+-        layout(location = 0) out float oMask;
+-
+-        ivec2 clampRaw(ivec2 p) { return clamp(p, ivec2(0), uRawSize - ivec2(1)); }
+-        float rawAt(highp usampler2D t, ivec2 p) { return float(texelFetch(t, clampRaw(p), 0).r); }
+-        int phaseAt(ivec2 p) { return ((p.y & 1) << 1) | (p.x & 1); }
+-        float blackAt(vec4 b, int phase) { return b[phase]; }
+-        float normalizedRaw(float raw, float black) {
+-            return max(raw - black, 0.0) / max(uWhiteLevel - black, 1.0);
+-        }
+-        int clippedQuad(highp usampler2D t, ivec2 p) {
+-            ivec2 q = (clampRaw(p) / 2) * 2;
+-            float clipCode = uWhiteLevel - 0.5;
+-            int count = 0;
+-            for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x)
+-                count += rawAt(t, q + ivec2(x, y)) >= clipCode ? 1 : 0;
+-            return count;
+-        }
+-        bool shortNeighborhoodUnclipped(ivec2 p) {
+-            float clipCode = uWhiteLevel - 0.5;
+-            for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x)
+-                if (rawAt(uShortRaw, p + ivec2(x, y)) >= clipCode) return false;
+-            return true;
+-        }
+-        float quadMean(highp usampler2D t, ivec2 p, vec4 blackByPhase) {
+-            ivec2 q = (clampRaw(p) / 2) * 2;
+-            float sum = 0.0;
+-            for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+-                ivec2 s = q + ivec2(x, y);
+-                sum += normalizedRaw(rawAt(t, s), blackAt(blackByPhase, phaseAt(s)));
+-            }
+-            return 0.25 * sum;
+-        }
+-
+-        void main() {
+-            vec2 referenceUv = gl_FragCoord.xy / vec2(uRawSize);
+-            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+-            vec4 flow = texture(uFlow, flowUv);
+-            vec2 shortUv = clamp(referenceUv + flow.xy, vec2(0.0), vec2(1.0));
+-            ivec2 referenceP = ivec2(gl_FragCoord.xy);
+-            ivec2 shortP = clampRaw(ivec2(floor(shortUv * vec2(uRawSize))));
+-
+-            if (clippedQuad(uReferenceRaw, referenceP) < 2 || !shortNeighborhoodUnclipped(shortP)) {
+-                oMask = 0.0; return;
+-            }
+-            float shortWeight = texture(uShortWeight, referenceUv).r;
+-            float coverage = texture(uNormalCoverage, referenceUv).r;
+-            float unblocker = texture(uUnblocker, referenceUv).r;
+-            if (shortWeight < uShortWeightThreshold || coverage < uNormalCoverageThreshold ||
+-                flow.z > uFlowVariationThreshold || unblocker > uUnblockerThreshold) {
+-                oMask = 0.0; return;
+-            }
+-
+-            float errorSum = 0.0;
+-            int evidence = 0;
+-            ivec2 referenceQuad = (referenceP / 2) * 2;
+-            ivec2 shortQuad = (shortP / 2) * 2;
+-            for (int qy = -1; qy <= 1; ++qy) {
+-                for (int qx = -1; qx <= 1; ++qx) {
+-                    ivec2 rp = referenceQuad + ivec2(qx * 2, qy * 2);
+-                    ivec2 sp = shortQuad + ivec2(qx * 2, qy * 2);
+-                    if (clippedQuad(uReferenceRaw, rp) != 0 || clippedQuad(uShortRaw, sp) != 0) continue;
+-                    float nr = quadMean(uReferenceRaw, rp, uReferenceBlackByPhase);
+-                    float ns = quadMean(uShortRaw, sp, uShortBlackByPhase) * uExposureRatio;
+-                    if (nr < 0.025 || ns < 0.025) continue;
+-                    errorSum += abs(ns - nr) / max(max(nr, ns), 0.05);
+-                    evidence += 1;
+-                }
+-            }
+-            if (evidence < 3) { oMask = 0.0; return; }
+-            float meanError = errorSum / float(evidence);
+-            if (meanError >= uConsistencyThreshold) { oMask = 0.0; return; }
+-
+-            float weightConfidence = smoothstep(uShortWeightThreshold, 0.95, shortWeight);
+-            float supportConfidence = smoothstep(uNormalCoverageThreshold, min(1.0, uNormalCoverageThreshold + 0.20), coverage);
+-            float flowConfidence = 1.0 - smoothstep(0.5 * uFlowVariationThreshold, uFlowVariationThreshold, flow.z);
+-            float unblockerConfidence = 1.0 - smoothstep(0.25 * uUnblockerThreshold, uUnblockerThreshold, unblocker);
+-            float consistencyConfidence = 1.0 - smoothstep(0.5 * uConsistencyThreshold, uConsistencyThreshold, meanError);
+-            oMask = clamp(min(weightConfidence, min(supportConfidence, min(flowConfidence,
+-                min(unblockerConfidence, consistencyConfidence)))), 0.0, 1.0);
+-        }
+-    """.trimIndent()
+-
+-    /* IRIS_26587_RGBA16F_WHOLE_RGB_SHORT_RESTORE
+-     * SHORT remains native-exposure through reconstruction/VGN. The exposure ratio is applied only
+-     * here, in RGBA16F, and one scalar mask replaces RGB together. Alpha stays NORMAL-owned.
+-     */
+-    val shortRestoreRgba16f26587 = """
+-        #version 300 es
+-        precision highp float;
+-        uniform sampler2D uNormalRgb;
+-        uniform sampler2D uShortRgb;
+-        uniform sampler2D uMask;
+-        uniform float uExposureRatio;
+-        layout(location = 0) out vec4 oColor;
+-        void main() {
+-            vec2 uv = gl_FragCoord.xy / vec2(textureSize(uNormalRgb, 0));
+-            vec4 normalRgb = texture(uNormalRgb, uv);
+-            vec3 restoredShort = texture(uShortRgb, uv).rgb * uExposureRatio;
+-            float confidence = clamp(texture(uMask, uv).r, 0.0, 1.0);
+-            oColor = vec4(mix(normalRgb.rgb, restoredShort, confidence), normalRgb.a);
+-        }
+-    """.trimIndent()
+-
+     val merge = """
+         #version 300 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 7a30deed2b4a9f3571e391c3cb69acd44bae8571..6d543b14eed9c361fd68a8779ad834c5a6427a75 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -552,8 +552,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreDehomogenizeProgram = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreRgb16ToFloatProgram = 0
+-    private var sabreShortRestoreMaskProgram26587 = 0
+-    private var sabreShortRestoreRgba16fProgram26587 = 0
+     private var sabreRgbChromaPostprocessor: GlesIris26529SpatialRgbChromaPostprocessor? = null
+     private var sabreConvertAlignmentSparseProgram = 0
+     private var currentMergeCovariance = 0
+@@ -2040,10 +2038,8 @@ internal class GlesMgcRawSpatialStacker(
+         }
+         val normalFrameCount = frames.count { it.role == RawBurstFrameRole.NORMAL }
+         val shadowLongFrameCount = frames.count { it.role == RawBurstFrameRole.SHADOW_LONG }
+-        val highlightShortFrameCount = frames.count { it.role == RawBurstFrameRole.HIGHLIGHT_SHORT }
+-        require(normalFrameCount >= 1 && highlightShortFrameCount <= 1 &&
+-            normalFrameCount + shadowLongFrameCount + highlightShortFrameCount == frames.size) {
+-            "26587 Sabre accepts NORMAL + SHADOW_LONG + at most one HIGHLIGHT_SHORT"
++        require(normalFrameCount >= 1 && normalFrameCount + shadowLongFrameCount == frames.size) {
++            "26547 Sabre accepts only NORMAL + SHADOW_LONG roles"
+         }
+         val referenceExposure = validExposureProduct(frames.first().exposureProduct)
+         frames.filter { it.role == RawBurstFrameRole.SHADOW_LONG }.forEach { frame ->
+@@ -2051,17 +2047,10 @@ internal class GlesMgcRawSpatialStacker(
+                 "26547 Sabre SHADOW_LONG exposure must exceed SHORT reference exposure"
+             }
+         }
+-        frames.filter { it.role == RawBurstFrameRole.HIGHLIGHT_SHORT }.forEach { frame ->
+-            require(validExposureProduct(frame.exposureProduct) < referenceExposure) {
+-                "26587 HIGHLIGHT_SHORT exposure must be below NORMAL reference exposure"
+-            }
+-        }
+-        val mergedFrameCount = normalFrameCount + shadowLongFrameCount
+         PLog.i(
+             SABRE_TAG,
+-            "IRIS_26587_SABRE_ROLE_CONTRACT normal=$normalFrameCount shadowLong=$shadowLongFrameCount " +
+-                "highlightShort=$highlightShortFrameCount scheduled=${frames.size} merged=$mergedFrameCount " +
+-                "referenceRole=NORMAL shortNormalAccumulator=false shortDng=false shortSr=false",
++            "IRIS_26547_SABRE_ROLE_CONTRACT normal=$normalFrameCount shadowLong=$shadowLongFrameCount " +
++                "total=${frames.size} referenceRole=SHORT",
+         )
+         if (shadowLongFrameCount > 0) {
+             PLog.i(
+@@ -2105,12 +2094,6 @@ internal class GlesMgcRawSpatialStacker(
+         val true2xFastPhaseSlots: Array<True2xFrameEvidence?>? =
+             if (enableSabreSuperRes && !exportNormalStackedDng) arrayOfNulls(TRUE2X_JPEG_MAX_EVIDENCE) else null
+         var exportedTexture = 0
+-        var highlightShortTexture26587 = 0
+-        var highlightShortMask26587 = 0
+-        var highlightShortExposureRatio26587 = 1f
+-        var highlightShortAdmitted26587 = false
+-        var highlightShortMaskGenerated26587 = false
+-        var highlightShortAppliedToTrue2x26587 = false
+         var returned = false
+         val originalThreadPriority = GlesGpuScheduler.lowerCurrentThreadPriority(SABRE_TAG)
+         val processStartNs = System.nanoTime()
+@@ -2303,7 +2286,7 @@ internal class GlesMgcRawSpatialStacker(
+             val referenceAlignmentProducts = buildReferenceAlignmentProducts(referenceGrayPyramid)
+             val zeroFlow = SabreConvertedAlignment.constant(createZeroFlowTexture())
+             val identityWeight = createIdentityWeightTexture()
+-            val accumulatedWeightScale = maxSabreAccumulatedWeight(mergedFrameCount)
++            val accumulatedWeightScale = maxSabreAccumulatedWeight(frames.size)
+             renderSabreMerge(
+                 extracted = referenceExtracted,
+                 flow = zeroFlow,
+@@ -2424,93 +2407,40 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.GL_LINEAR,
+                 )
+                 renderDilation(reverseWeight, frameWeight)
+-                if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT) {
+-                    /* IRIS_26587_SHORT_REFERENCE_DOMAIN_ALIGNMENT_NATIVE_RECONSTRUCTION
+-                     * Alignment/rejection above used exposure-normalized calibration. SHORT is never
+-                     * added to NORMAL coverage/color/weight accumulators. Reconstruct it separately
+-                     * at native exposure with the same flow/covariance geometry, then create one
+-                     * fail-closed whole-RGB mask while the exact RAW/alignment evidence is resident.
+-                     */
+-                    require(index == frames.lastIndex) {
+-                        "26587 HIGHLIGHT_SHORT must be scheduled after all NORMAL/LONG evidence"
+-                    }
+-                    val nativeShortCalibration = calibrationForFrame(frame, 1f, kernelTuning)
+-                    highlightShortExposureRatio26587 = exposureScale
+-                    highlightShortTexture26587 = resolveSabreShortNativeExposure26587(
+-                        extracted = currentExtracted,
+-                        flow = flow,
+-                        covariance = currentCovariance,
+-                        calibration = nativeShortCalibration,
+-                        identityWeight = identityWeight,
+-                        resolveParameters = sabreResolveParameters,
+-                    )
+-                    highlightShortMask26587 = createTexture(
+-                        width, height, GLES30.GL_R8, GLES30.GL_LINEAR,
+-                    )
+-                    val requiredNormalAux = minOf(6, normalFrameCount - 1)
+-                    val coverageThreshold = if (requiredNormalAux >= 2) {
+-                        requiredNormalAux.toFloat() / accumulatedWeightScale
+-                    } else {
+-                        2f // impossible in UNORM; fail closed without real temporal NORMAL support
+-                    }
+-                    renderSabreShortRestoreMask26587(
+-                        referenceRaw = referenceRaw,
+-                        shortRaw = currentRaw,
+-                        flow = flow,
+-                        shortWeight = frameWeight,
+-                        normalCoverage = accumulatedCoverage,
+-                        unblocker = unblocker,
+-                        referenceCalibration = referenceCalibration,
+-                        shortCalibration = nativeShortCalibration,
+-                        exposureRatio = exposureScale,
+-                        normalCoverageThreshold = coverageThreshold,
+-                        output = highlightShortMask26587,
+-                    )
+-                    highlightShortAdmitted26587 = true
+-                    highlightShortMaskGenerated26587 = true
+-                    PLog.i(
+-                        SABRE_TAG,
+-                        "IRIS_26587_SHORT_AUXILIARY_READY exposureRatio=$exposureScale " +
+-                            "normalFrames=$normalFrameCount requiredNormalAux=$requiredNormalAux " +
+-                            "coverageThreshold=$coverageThreshold normalAccumulator=false dng=false sr=false " +
+-                            "nativeExposureReconstruction=true wholeRgbMask=true",
+-                    )
+-                } else {
+-                    if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
+-                        renderSabreShadowLongCoverage(
+-                            weight = frameWeight,
+-                            extracted = currentExtracted,
+-                            flow = flow,
+-                            accumulatedCoverage = accumulatedCoverage,
+-                            coverageWidth = coverageWidth,
+-                            coverageHeight = coverageHeight,
+-                            extractedWidth = extractedWidth,
+-                            extractedHeight = extractedHeight,
+-                            accumulatedWeightScale = accumulatedWeightScale,
+-                        )
+-                    } else {
+-                        renderSabreCoverage(
+-                            frameWeight,
+-                            accumulatedCoverage,
+-                            coverageWidth,
+-                            coverageHeight,
+-                            accumulatedWeightScale,
+-                        )
+-                    }
+-                    renderSabreMerge(
++                if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
++                    renderSabreShadowLongCoverage(
++                        weight = frameWeight,
+                         extracted = currentExtracted,
+                         flow = flow,
+-                        covariance = currentCovariance,
+-                        weight = frameWeight,
+-                        calibration = calibration,
+-                        accumulatedColor = accumulatedColor,
+-                        accumulatedWeightsGb = accumulatedWeightsGb,
++                        accumulatedCoverage = accumulatedCoverage,
++                        coverageWidth = coverageWidth,
++                        coverageHeight = coverageHeight,
+                         extractedWidth = extractedWidth,
+                         extractedHeight = extractedHeight,
+-                        useFrameWeight = true,
+-                        shadowLongSourceClipGuard = frame.role == RawBurstFrameRole.SHADOW_LONG,
++                        accumulatedWeightScale = accumulatedWeightScale,
++                    )
++                } else {
++                    renderSabreCoverage(
++                        frameWeight,
++                        accumulatedCoverage,
++                        coverageWidth,
++                        coverageHeight,
++                        accumulatedWeightScale,
+                     )
+                 }
++                renderSabreMerge(
++                    extracted = currentExtracted,
++                    flow = flow,
++                    covariance = currentCovariance,
++                    weight = frameWeight,
++                    calibration = calibration,
++                    accumulatedColor = accumulatedColor,
++                    accumulatedWeightsGb = accumulatedWeightsGb,
++                    extractedWidth = extractedWidth,
++                    extractedHeight = extractedHeight,
++                    useFrameWeight = true,
++                    shadowLongSourceClipGuard = frame.role == RawBurstFrameRole.SHADOW_LONG,
++                )
+                 /* IRIS_26564_NIGHT_LONG_EXCLUDED_FROM_TRUE_2X
+                  * Native Sabre still admits validated SHADOW_LONG evidence for Night SNR. True 2x
+                  * spatial reconstruction accepts NORMAL/Short frames only, preserving the proven
+@@ -2561,19 +2491,7 @@ internal class GlesMgcRawSpatialStacker(
+                         "role=${frame.role} exposureScale=$exposureScale " +
+                         "durationRobustness=$durationRobustness submit=${elapsedMs(frameStartNs)}ms",
+                 )
+-                if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT && highlightShortAdmitted26587) {
+-                    /* IRIS_26587_SHORT_TRANSIENT_LIFETIME
+-                     * Preserve only the native SHORT RGBA16F carrier and scalar restore mask beyond
+-                     * this frame. All alignment/rejection/raw temporaries still follow the exact
+-                     * 26586 per-frame cleanup boundary.
+-                     */
+-                    releaseTexturesFromExcept(
+-                        transientTextureStart,
+-                        intArrayOf(highlightShortTexture26587, highlightShortMask26587),
+-                    )
+-                } else {
+-                    releaseTexturesFrom(transientTextureStart)
+-                }
++                releaseTexturesFrom(transientTextureStart)
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+ 
+@@ -2614,21 +2532,17 @@ internal class GlesMgcRawSpatialStacker(
+                         support = normalStackedDngSupport,
+                     )
+                 } else {
+-                    /* IRIS_26587_MOTION_DNG_NORMAL_ONLY_SUPPORT
+-                     * Motion may schedule one HIGHLIGHT_SHORT auxiliary, but stacked DNG support and
+-                     * noise ownership remain the exact NORMAL set. SHORT never changes DNG frame
+-                     * count, support statistics, or per-frame noise aggregation.
+-                     */
++                    // Motion: exact 26546 support/noise ownership. All admitted frames are NORMAL.
+                     normalStackedDngSupport = resolveSabreNormalDngSupportStats(
+                         accumulatedCoverage = accumulatedCoverage,
+                         coverageWidth = coverageWidth,
+                         coverageHeight = coverageHeight,
+                         accumulatedWeightScale = accumulatedWeightScale,
+-                        frameCount = normalFrameCount,
++                        frameCount = frames.size,
+                         sabreNoiseModelScale = sabreNoiseModelScale,
+                     )
+                     normalStackedDngNoiseProfile = createSabreNormalDngNoiseProfile(
+-                        frames = frames.filter { it.role == RawBurstFrameRole.NORMAL },
++                        frames = frames,
+                         support = normalStackedDngSupport,
+                     )
+                 }
+@@ -2647,8 +2561,8 @@ internal class GlesMgcRawSpatialStacker(
+                 accumulatedColor,
+                 accumulatedWeightsGb,
+                 accumulatedCoverage,
+-                alphaScale = accumulatedWeightScale / mergedFrameCount.toFloat(),
+-                alphaBias = 1f / mergedFrameCount.toFloat(),
++                alphaScale = accumulatedWeightScale / frames.size.toFloat(),
++                alphaBias = 1f / frames.size.toFloat(),
+             )
+             // The original merge shaders write normalized, white-balanced half floats. The
+             // Resolve AOT accepts those RGBA16F bit patterns directly; rawScale applies only to
+@@ -2686,7 +2600,7 @@ internal class GlesMgcRawSpatialStacker(
+                 finalGains = sabreResolveFinalGains,
+                 demosaicWhiteLevel = demosaicWhiteLevel,
+                 outputWhiteLevel = sabreResolveParameters.outputWhiteLevel,
+-                demosaicBlendScale = -demosaicBlendRange * mergedFrameCount,
++                demosaicBlendScale = -demosaicBlendRange * frames.size,
+                 demosaicBlendBias = SABRE_DEMOSAIC_BLEND_END / demosaicBlendRange,
+                 demosaicSharpnessScale =
+                     demosaicWhiteLevel * sabreResolveParameters.demosaicSharpness,
+@@ -2766,38 +2680,15 @@ internal class GlesMgcRawSpatialStacker(
+                     }
+                 }
+             }
+-            /* IRIS_26587_SHARED_NATIVE_HIGHLIGHT_AUTHORITY
+-             * Build one restored native Sabre/VGN RGB authority after NORMAL fusion/VGN. True-2x
+-             * still reconstructs geometry/detail from NORMAL CFA evidence only; this restored native
+-             * RGB is consumed only at the existing post-reconstruction color/detail-guide boundary.
+-             * The exact same texture becomes the native 1x output after SR has finished.
+-             */
+-            val nativeHighlightAuthority26587 = if (highlightShortAdmitted26587) {
+-                require(highlightShortTexture26587 != 0 && highlightShortMask26587 != 0)
+-                createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST).also { restored ->
+-                    renderSabreShortRestoreRgba16f26587(
+-                        normalRgb = exportedTexture,
+-                        shortRgb = highlightShortTexture26587,
+-                        mask = highlightShortMask26587,
+-                        exposureRatio = highlightShortExposureRatio26587,
+-                        output = restored,
+-                    )
+-                }
+-            } else {
+-                exportedTexture
+-            }
+             if (enableSabreSuperRes) {
+                 val reconstructionStartNs=System.nanoTime()
+                 val reconstructionEvidence=true2xFastPhaseSlots?.filterNotNull()?:true2xEvidence
+                 val evidencePolicy = "dngRequested=$exportNormalStackedDng normalFrames=$normalFrameCount " +
+                     "retained=${reconstructionEvidence.size} jpegTop2PerPhase=${true2xFastPhaseSlots!=null} " +
+-                    "maxEvidence=${if (true2xFastPhaseSlots!=null) TRUE2X_JPEG_MAX_EVIDENCE else reconstructionEvidence.size} " +
+-                    "shortEvidence=false shortNativeGuide=${highlightShortAdmitted26587}"
++                    "maxEvidence=${if (true2xFastPhaseSlots!=null) TRUE2X_JPEG_MAX_EVIDENCE else reconstructionEvidence.size}"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_EVIDENCE_POLICY $evidencePolicy")
+                 MotionTrace.processingState("IRIS_26576_SR_EVIDENCE", evidencePolicy)
+-                val rawResult=reconstructTrue2x(
+-                    frames, images, reconstructionEvidence, nativeHighlightAuthority26587, exportNormalStackedDng,
+-                )
++                val rawResult=reconstructTrue2x(frames,images,reconstructionEvidence,exportedTexture,exportNormalStackedDng)
+                 require(rawResult.width==superResWidth&&rawResult.height==superResHeight)
+                 val expectedTrueBytes=rawResult.width.toLong()*rawResult.height*TRUE2X_RGB16F_BYTES_PER_PIXEL
+                 if(rawResult.backend=="GPU") {
+@@ -2816,7 +2707,6 @@ internal class GlesMgcRawSpatialStacker(
+                  * before the new scalar-detail render. CPU fallback retains 26567's same boundary.
+                  */
+                 true2xResult=rawResult.copy(reconstructionMs=elapsedMs(reconstructionStartNs))
+-                if (highlightShortAdmitted26587) highlightShortAppliedToTrue2x26587 = true
+                 val result=checkNotNull(true2xResult)
+                 val readyDetails = "normalFrames=$normalFrameCount shadowLongExcluded=$shadowLongFrameCount " +
+                     "size=${result.width}x${result.height} backend=${result.backend} phaseMean=${result.phaseSupportMean} phaseP10=${result.phaseSupportP10} " +
+@@ -2827,32 +2717,11 @@ internal class GlesMgcRawSpatialStacker(
+                 MotionTrace.processingState("IRIS_26576_SR_RECONSTRUCTION_SUMMARY", readyDetails)
+                 cleanupTrue2xEvidence(true2xFastPhaseSlots?.filterNotNull()?:true2xEvidence); true2xEvidence.clear(); true2xFastPhaseSlots?.fill(null)
+             }
+-            /* IRIS_26587_POST_SR_RGBA16F_SHORT_PUBLICATION
+-             * SR has now completed all NORMAL-only CFA/detail decisions using the restored native
+-             * color/highlight guide only at its existing guide boundary. Publish that exact same
+-             * restored RGB as the native 1x carrier, then retire the private SHORT evidence.
+-             */
+-            if (highlightShortAdmitted26587) {
+-                require(nativeHighlightAuthority26587 != exportedTexture)
+-                GLES30.glDeleteTextures(1, intArrayOf(exportedTexture), 0)
+-                exportedTexture = nativeHighlightAuthority26587
+-                check(textures.remove(exportedTexture)) { "26587 restored RGBA16F texture is not owned" }
+-                textureSpecs.remove(exportedTexture)
+-                releaseOwnedTexture(highlightShortTexture26587, "26587 native SHORT RGBA16F")
+-                releaseOwnedTexture(highlightShortMask26587, "26587 whole-RGB SHORT mask")
+-                highlightShortTexture26587 = 0
+-                highlightShortMask26587 = 0
+-                PLog.i(
+-                    SABRE_TAG,
+-                    "IRIS_26587_SHORT_RESTORE_APPLIED exposureRatio=$highlightShortExposureRatio26587 " +
+-                        "domain=RGBA16F wholeRgb=true afterTrue2x=true true2xGuide=${enableSabreSuperRes}",
+-                )
+-            }
+             checkGlError("MGC Sabre Resolve/VGN color noise")
+             returned = true
+             PLog.i(
+                 SABRE_TAG,
+-                "MGC Sabre complete scheduled=${frames.size} merged=$mergedFrameCount output=${width}x$height " +
++                "MGC Sabre complete frames=${frames.size} output=${width}x$height " +
+                     "result=${if (exportedTexture != 0) gpuLinearRgbStorage.name + "_GPU" else "RGB16_CPU"} " +
+                     "colorNoiseIir=${chromaResult.chromaSubmissionMs}ms " +
+                     "chromaFinal=${chromaResult.finalSubmissionMs}ms " +
+@@ -2878,16 +2747,12 @@ internal class GlesMgcRawSpatialStacker(
+                     )
+                 },
+                 lensShadingCorrectionApplied = hasLensShading(),
+-                mergedFrameCount = mergedFrameCount,
++                mergedFrameCount = frames.size,
+                 mgcSabreNoiseModelScale = sabreNoiseModelScale,
+                 mgcReferenceSnr = kernelTuning.referenceSnr,
+                 mgcDenoiseTuningSnr = kernelTuning.referenceSnr / sqrt(sabreNoiseModelScale),
+                 mgcSharpenTuningSnr = kernelTuning.referenceSnr,
+                 mgcSharpenAttenuationScale = sabreResolveParameters.demosaicSharpness,
+-                highlightShortAdmitted = highlightShortAdmitted26587,
+-                highlightShortRestoreMaskGenerated = highlightShortMaskGenerated26587,
+-                highlightShortAppliedToTrue2x = highlightShortAppliedToTrue2x26587,
+-                highlightShortExposureRatio = highlightShortExposureRatio26587,
+                 normalStackedDngRaw16 = normalStackedDngRaw16,
+                 normalStackedDngFrameCount = if (exportNormalStackedDng) normalFrameCount else 0,
+                 normalStackedDngNoiseProfile = normalStackedDngNoiseProfile,
+@@ -2918,14 +2783,6 @@ internal class GlesMgcRawSpatialStacker(
+             null
+         } finally {
+             images.forEach { it.close() }
+-            if (highlightShortTexture26587 != 0) {
+-                releaseOwnedTexture(highlightShortTexture26587, "26587 failed SHORT RGBA16F")
+-                highlightShortTexture26587 = 0
+-            }
+-            if (highlightShortMask26587 != 0) {
+-                releaseOwnedTexture(highlightShortMask26587, "26587 failed SHORT mask")
+-                highlightShortMask26587 = 0
+-            }
+             release()
+             GlesGpuScheduler.restoreCurrentThreadPriority(originalThreadPriority, SABRE_TAG)
+             LargeDirectBuffer.free(sabreAccumulatedReadback)
+@@ -3859,156 +3716,6 @@ internal class GlesMgcRawSpatialStacker(
+         draw(program, width, height, intArrayOf(output))
+     }
+ 
+-    private fun positionalBlackLevels26587(calibration: FrameCalibration): FloatArray =
+-        FloatArray(4) { phase -> calibration.blackLevels[canonicalChannelAtPhase(phase)] }
+-
+-    private fun resolveSabreShortNativeExposure26587(
+-        extracted: Int,
+-        flow: SabreConvertedAlignment,
+-        covariance: Int,
+-        calibration: FrameCalibration,
+-        identityWeight: Int,
+-        resolveParameters: MgcSabreResolveTuning.Parameters,
+-    ): Int {
+-        require(exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F)
+-        val color = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-        val weightsGb = createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
+-        val coverage = createTexture(1, 1, GLES30.GL_R8, GLES30.GL_NEAREST)
+-        clearSabreAccumulators(color, weightsGb, coverage, 1, 1)
+-        renderSabreMerge(
+-            extracted = extracted,
+-            flow = flow,
+-            covariance = covariance,
+-            weight = identityWeight,
+-            calibration = calibration,
+-            accumulatedColor = color,
+-            accumulatedWeightsGb = weightsGb,
+-            extractedWidth = ceilDiv(width, 2),
+-            extractedHeight = ceilDiv(height, 2),
+-            useFrameWeight = false,
+-            shadowLongSourceClipGuard = false,
+-        )
+-        renderSabreDehomogenize(
+-            accumulatedColor = color,
+-            accumulatedWeightsGb = weightsGb,
+-            accumulatedCoverage = coverage,
+-            alphaScale = 0f,
+-            alphaBias = 1f,
+-        )
+-        val accumulated = readSabreAccumulatedRgba16f(color)
+-        val resolved = checkNotNull(
+-            LargeDirectBuffer.allocate(width.toLong() * height * 3L * Short.SIZE_BYTES,
+-                "26587 native SHORT Resolve RGB16"),
+-        )
+-        try {
+-            val finalBlack = sabreResolveBlackLevel(calibration.blackLevels)
+-            val demosaicWhite = minOf(
+-                (sensorWhiteLevel * sabreResolveRawScale).toInt(),
+-                Short.MAX_VALUE.toInt(),
+-            ).coerceAtLeast(1)
+-            val blendRange = SABRE_DEMOSAIC_BLEND_END - SABRE_DEMOSAIC_BLEND_START
+-            MgcSabreResolver.resolve(
+-                accumulatedColorRgba16f = accumulated,
+-                outputRgb16Planar = resolved,
+-                width = width,
+-                height = height,
+-                cfaPattern = cfaPattern,
+-                finalBlackLevel = finalBlack,
+-                finalGains = sabreResolveFinalGains,
+-                demosaicWhiteLevel = demosaicWhite,
+-                outputWhiteLevel = resolveParameters.outputWhiteLevel,
+-                demosaicBlendScale = -blendRange,
+-                demosaicBlendBias = SABRE_DEMOSAIC_BLEND_END / blendRange,
+-                demosaicSharpnessScale = demosaicWhite * resolveParameters.demosaicSharpness,
+-            )
+-            val planes = IntArray(3) { createTexture(width, height, GLES30.GL_R16UI, GLES30.GL_NEAREST) }
+-            uploadSabreResolvedRgb16Planar(resolved, planes)
+-            val lensShadingTexture = createLensShadingTexture()
+-            val fullOutput = MgcSpatialRgbRect(0, 0, width, height)
+-            val tile = MgcSpatialRgbTile(index = 0, outputCore = fullOutput)
+-            val chroma = checkNotNull(sabreRgbChromaPostprocessor)
+-            chroma.beginFullFrame(listOf(tile))
+-            renderSabreOutputTransform(
+-                resolvedRgbPlanes = planes,
+-                lensShadingTexture = lensShadingTexture,
+-                finalBlackLevel = finalBlack,
+-                demosaicWhiteLevel = demosaicWhite.toFloat(),
+-                output = chroma.normalizationTargetTexture(),
+-            )
+-            chroma.markBandWritten(tile)
+-            GlesGpuScheduler.memoryBarrier()
+-            val chromaResult = chroma.process(
+-                obtainCpuOutput = { error("26587 SHORT VGN unexpectedly requested CPU output") },
+-                deferCpuReadback = true,
+-                onFinalSubmitted = { GLES30.glFlush() },
+-            )
+-            var ui = chromaResult.exportedTextureId
+-            check(ui != 0) { "26587 SHORT VGN did not export RGBA16UI" }
+-            val output = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-            renderSabreRgb16ToFloat(ui, output)
+-            GLES30.glDeleteTextures(1, intArrayOf(ui), 0)
+-            ui = 0
+-            return output
+-        } finally {
+-            LargeDirectBuffer.free(accumulated)
+-            LargeDirectBuffer.free(resolved)
+-        }
+-    }
+-
+-    private fun renderSabreShortRestoreMask26587(
+-        referenceRaw: Int,
+-        shortRaw: Int,
+-        flow: SabreConvertedAlignment,
+-        shortWeight: Int,
+-        normalCoverage: Int,
+-        unblocker: Int,
+-        referenceCalibration: FrameCalibration,
+-        shortCalibration: FrameCalibration,
+-        exposureRatio: Float,
+-        normalCoverageThreshold: Float,
+-        output: Int,
+-    ) {
+-        val program = sabreShortRestoreMaskProgram26587
+-        check(program != 0)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uReferenceRaw", 0, referenceRaw)
+-        bindTexture(program, "uShortRaw", 1, shortRaw)
+-        bindTexture(program, "uFlow", 2, flow.texture)
+-        bindTexture(program, "uShortWeight", 3, shortWeight)
+-        bindTexture(program, "uNormalCoverage", 4, normalCoverage)
+-        bindTexture(program, "uUnblocker", 5, unblocker)
+-        uniform2i(program, "uRawSize", width, height)
+-        uniformSabreFlowScaleOffset(program, flow)
+-        uniform4fv(program, "uReferenceBlackByPhase", positionalBlackLevels26587(referenceCalibration))
+-        uniform4fv(program, "uShortBlackByPhase", positionalBlackLevels26587(shortCalibration))
+-        uniform1f(program, "uWhiteLevel", sensorWhiteLevel)
+-        uniform1f(program, "uExposureRatio", exposureRatio)
+-        uniform1f(program, "uNormalCoverageThreshold", normalCoverageThreshold)
+-        val flowThreshold = MgcSabreRejectionTuning.flowVariationThresholds(ceilDiv(width, 2)).unblockerReduction
+-        uniform1f(program, "uFlowVariationThreshold", flowThreshold)
+-        uniform1f(program, "uShortWeightThreshold", 0.75f)
+-        uniform1f(program, "uUnblockerThreshold", 0.10f)
+-        uniform1f(program, "uConsistencyThreshold", 0.05f)
+-        draw(program, width, height, intArrayOf(output))
+-    }
+-
+-    private fun renderSabreShortRestoreRgba16f26587(
+-        normalRgb: Int,
+-        shortRgb: Int,
+-        mask: Int,
+-        exposureRatio: Float,
+-        output: Int,
+-    ) {
+-        val program = sabreShortRestoreRgba16fProgram26587
+-        check(program != 0)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uNormalRgb", 0, normalRgb)
+-        bindTexture(program, "uShortRgb", 1, shortRgb)
+-        bindTexture(program, "uMask", 2, mask)
+-        uniform1f(program, "uExposureRatio", exposureRatio)
+-        draw(program, width, height, intArrayOf(output))
+-    }
+-
+     private fun readSabreAccumulatedRgba16f(texture: Int): ByteBuffer {
+         val output = checkNotNull(
+             LargeDirectBuffer.allocate(
+@@ -4271,14 +3978,6 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
+-        sabreShortRestoreMaskProgram26587 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRestoreMask26587,
+-            "iris_26587_sabre_short_restore_mask",
+-        )
+-        sabreShortRestoreRgba16fProgram26587 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRestoreRgba16f26587,
+-            "iris_26587_sabre_short_restore_rgba16f",
+-        )
+         /* IRIS_26564_TRUE_2X_NO_FAKE_SR_OWNER
+          * Do not eagerly link the 26561/26562 native-RGB-upscale/detail shaders. The true-2x GPU
+          * shaders are linked lazily inside the accelerator attempt so shader/driver failure can
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+index 62dffa65b085948841e9ade7ec26c317a4f46ff8..34f03576b4582b987d034f8d4bb71c0f7a465281 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+@@ -56,14 +56,6 @@ data class RawStackResult(
+     val mgcSharpenTuningSnr: Float? = null,
+     val mgcSharpenAttenuationScale: Float? = null,
+     val mgcSpatialReferenceOnlyDiagnostic: Boolean = false,
+-    /* IRIS_26587_SABRE_SHORT_RESTORE_TELEMETRY
+-     * HIGHLIGHT_SHORT is alignment/recovery evidence only. These fields prove admission into the
+-     * Sabre reference-domain auxiliary path without changing NORMAL mergedFrameCount/DNG/SR.
+-     */
+-    val highlightShortAdmitted: Boolean = false,
+-    val highlightShortRestoreMaskGenerated: Boolean = false,
+-    val highlightShortAppliedToTrue2x: Boolean = false,
+-    val highlightShortExposureRatio: Float = 1f,
+     /* IRIS_26532_STREAMED_SUPERRES_RESULT
+      * High-resolution SR evidence is streamed while Spatial bands are resident. The normal
+      * GPU source remains native-sized so the proven 26531 chroma/tone path never allocates
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 987f9d84d9174a12d2fff12bcee6b73f6349f007..ac019dd7153b49b8c4b99a236847698383f14138 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -372,30 +372,6 @@ object PhotonMotionMgc1271Bridge {
+                 "unexpected GPU RGB storage=${gpu.storage} samples=${gpu.samplesPerPixel}")
+             requireParity(gpu.textureId != 0, "zero GPU RGB texture")
+             requireParity(stacked.mergedFrameCount >= 1, "mergedFrameCount=${stacked.mergedFrameCount}")
+-            val expectedMergedFrames26587 = frames.count { it.role != RawBurstFrameRole.HIGHLIGHT_SHORT }
+-            requireParity(stacked.mergedFrameCount == expectedMergedFrames26587,
+-                "26587 SHORT leaked into mergedFrameCount merged=${stacked.mergedFrameCount} expected=$expectedMergedFrames26587")
+-            if (!parameters.irisNightActive && shortFrame != null) {
+-                requireParity(stacked.highlightShortAdmitted,
+-                    "26587 captured Motion SHORT was not admitted by Sabre auxiliary path")
+-                requireParity(stacked.highlightShortRestoreMaskGenerated,
+-                    "26587 admitted Motion SHORT has no whole-RGB restore mask")
+-                requireParity(stacked.highlightShortExposureRatio.isFinite() &&
+-                        stacked.highlightShortExposureRatio > 1f,
+-                    "26587 invalid SHORT exposure ratio=${stacked.highlightShortExposureRatio}")
+-                requireParity(
+-                    stacked.highlightShortAppliedToTrue2x == sabreSuperResEnabled,
+-                    "26587 true2x SHORT guide mismatch applied=${stacked.highlightShortAppliedToTrue2x} " +
+-                        "srEnabled=$sabreSuperResEnabled",
+-                )
+-                PLog.i(TAG, "IRIS_26587_SHORT_BRIDGE_PROOF captured=true admitted=true " +
+-                    "exposureRatio=${stacked.highlightShortExposureRatio} " +
+-                    "mergedFrameCount=${stacked.mergedFrameCount} normalOnlyMerged=true dngShortExcluded=true " +
+-                    "srShortEvidenceExcluded=true srNativeHighlightGuide=${stacked.highlightShortAppliedToTrue2x}")
+-            } else {
+-                requireParity(!stacked.highlightShortAdmitted,
+-                    "26587 SHORT auxiliary unexpectedly active without Motion SHORT capture")
+-            }
+             val correlation = stacked.mgcDenoiseCorrelation
+             val readNoise = stacked.mgcDenoiseReadNoise
+             val shotNoise = stacked.mgcDenoiseShotNoise
+diff --git a/app/version.properties b/app/version.properties
+index d51b27da2c3093e9629101fed4094d4d716b2189..2a6f4da5d0722492de1d87a0586a57f4d1282e86 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726588
+-VERSION_BUILD=26588
++VERSION_NAME=0.9726586
++VERSION_BUILD=26586
