@@ -1,0 +1,528 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 542fef6c0440a6edaffc12d73cb6c57bb30661b1..1f08cdb27900de6b106e2364b44f0a17c8dda9cd 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -392,25 +392,16 @@ internal object GlesMgcRawSabreShaders {
+     """.trimIndent()
+ 
+ 
+-    /* IRIS_26594_REGION_ANCHORED_SHORT_HANDOFF
+-     * 26593 device proof established that the SHORT frame reaches Sabre but the 26592 mask can
+-     * still be empty because every clipped output pixel was required to find three fully-unclipped
+-     * NORMAL quads in its own 3x3 neighborhood and to pass a second, unrelated NORMAL-stack
+-     * coverage confidence gate. That is circular: the SHORT exists precisely where NORMAL lost
+-     * radiometric information.
+-     *
+-     * 26594 separates the proof into two domains:
+-     *  - boundary radiometry is established only in a bright, still-unclipped overlap band where
+-     *    both NORMAL and exposure-normalized SHORT are physically measurable;
+-     *  - that trust is propagated only through an 8-connected bright-highlight region whose every
+-     *    cell still passes the exact SHORT Sabre rejection/flow/unblocker/headroom gates.
+-     *
+-     * The final native-resolution mask still requires local SHORT geometry/headroom and still uses
+-     * one whole-RGB scalar. NORMAL sensor saturation alone controls the 0.90 -> 0.98 handoff.
+-     * There is no second correspondence search, no per-channel substitution, no NORMAL coverage
+-     * requirement, and no unanchored propagation into motion/disocclusion.
++    /* IRIS_26592_TRUST_GATED_RADIOMETRIC_SHORT_HANDOFF
++     * Separate two concepts that 26590/26591 incorrectly conflated: Sabre evidence decides only
++     * whether aligned SHORT is trustworthy, while NORMAL sensor saturation decides how much SHORT
++     * should replace NORMAL. Below 0.90 second-highest CFA signal the output is exact NORMAL; from
++     * 0.90 to 0.98 it transitions monotonically; at >=0.98 a trusted SHORT is 100% authoritative.
++     * This prevents clipped NORMAL from contaminating a valid SHORT merely because alignment trust
++     * was fractional. Existing flow/covariance/rejection/coverage/unblocker/radiometric gates stay
++     * fail-closed and there is still no second correspondence search or per-channel substitution.
+      */
+-    val shortRegionSeed26594 = """
++    val shortRestoreMask26587 = """
+         #version 300 es
+         precision highp float;
+         precision highp int;
+@@ -419,23 +410,22 @@ internal object GlesMgcRawSabreShaders {
+         uniform highp usampler2D uShortRaw;
+         uniform sampler2D uFlow;
+         uniform sampler2D uShortWeight;
++        uniform sampler2D uNormalCoverage;
+         uniform sampler2D uUnblocker;
+         uniform ivec2 uRawSize;
+-        uniform ivec2 uRegionSize;
+         uniform vec4 uFlowScaleOffset;
+         uniform vec4 uReferenceBlackByPhase;
+         uniform vec4 uShortBlackByPhase;
+         uniform float uWhiteLevel;
+         uniform float uExposureRatio;
+-        uniform float uRegionFloor;
+-        uniform float uBoundaryCeiling;
++        uniform float uReferenceNearClipThreshold;
+         uniform float uShortHeadroomThreshold;
++        uniform float uNormalCoverageThreshold;
+         uniform float uFlowVariationThreshold;
+         uniform float uShortWeightThreshold;
+         uniform float uUnblockerThreshold;
+         uniform float uConsistencyThreshold;
+-        layout(location = 0) out float oSeed;
+-        layout(location = 1) out float oRegion;
++        layout(location = 0) out float oMask;
+ 
+         ivec2 clampRaw(ivec2 p) { return clamp(p, ivec2(0), uRawSize - ivec2(1)); }
+         float rawAt(highp usampler2D t, ivec2 p) { return float(texelFetch(t, clampRaw(p), 0).r); }
+@@ -452,13 +442,16 @@ internal object GlesMgcRawSabreShaders {
+                 count += rawAt(t, q + ivec2(x, y)) >= clipCode ? 1 : 0;
+             return count;
+         }
+-        float secondHighestSignal(highp usampler2D t, ivec2 p, vec4 blackByPhase) {
++        float referenceSecondHighestSignal(ivec2 p) {
+             ivec2 q = (clampRaw(p) / 2) * 2;
+             float first = 0.0;
+             float second = 0.0;
+             for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+                 ivec2 s = q + ivec2(x, y);
+-                float signal = normalizedRaw(rawAt(t, s), blackAt(blackByPhase, phaseAt(s)));
++                float signal = normalizedRaw(
++                    rawAt(uReferenceRaw, s),
++                    blackAt(uReferenceBlackByPhase, phaseAt(s))
++                );
+                 if (signal >= first) { second = first; first = signal; }
+                 else if (signal > second) { second = signal; }
+             }
+@@ -486,30 +479,27 @@ internal object GlesMgcRawSabreShaders {
+         }
+ 
+         void main() {
+-            vec2 referenceUv = gl_FragCoord.xy / vec2(uRegionSize);
++            vec2 referenceUv = gl_FragCoord.xy / vec2(uRawSize);
+             vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec4 flow = texture(uFlow, flowUv);
+             vec2 shortUv = clamp(referenceUv + flow.xy, vec2(0.0), vec2(1.0));
+-            ivec2 referenceP = clampRaw(ivec2(floor(referenceUv * vec2(uRawSize))));
++            ivec2 referenceP = ivec2(gl_FragCoord.xy);
+             ivec2 shortP = clampRaw(ivec2(floor(shortUv * vec2(uRawSize))));
+ 
++            const float handoffStart = 0.90;
++            const float trustGate = 0.60;
++            float referenceSecond = referenceSecondHighestSignal(referenceP);
++            if (referenceSecond < handoffStart || !shortNeighborhoodHasHeadroom(shortP)) {
++                oMask = 0.0; return;
++            }
+             float shortWeight = texture(uShortWeight, referenceUv).r;
++            float coverage = texture(uNormalCoverage, referenceUv).r;
+             float unblocker = texture(uUnblocker, referenceUv).r;
+-            bool geometryTrusted = shortWeight >= uShortWeightThreshold &&
+-                flow.z <= uFlowVariationThreshold &&
+-                unblocker <= uUnblockerThreshold &&
+-                shortNeighborhoodHasHeadroom(shortP);
+-            float referenceSecond = secondHighestSignal(
+-                uReferenceRaw, referenceP, uReferenceBlackByPhase
+-            );
+-            bool regionCandidate = geometryTrusted && referenceSecond >= uRegionFloor;
+-            oRegion = regionCandidate ? 1.0 : 0.0;
+-            if (!regionCandidate || referenceSecond >= uBoundaryCeiling) {
+-                oSeed = 0.0;
+-                return;
++            if (shortWeight < uShortWeightThreshold || coverage < uNormalCoverageThreshold ||
++                flow.z > uFlowVariationThreshold || unblocker > uUnblockerThreshold) {
++                oMask = 0.0; return;
+             }
+ 
+-            /* Radiometry is proved in the measurable boundary, never demanded from clipped core. */
+             float errorSum = 0.0;
+             int evidence = 0;
+             ivec2 referenceQuad = (referenceP / 2) * 2;
+@@ -518,8 +508,7 @@ internal object GlesMgcRawSabreShaders {
+                 for (int qx = -1; qx <= 1; ++qx) {
+                     ivec2 rp = referenceQuad + ivec2(qx * 2, qy * 2);
+                     ivec2 sp = shortQuad + ivec2(qx * 2, qy * 2);
+-                    if (sensorClippedQuad(uReferenceRaw, rp) != 0 ||
+-                        sensorClippedQuad(uShortRaw, sp) != 0) continue;
++                    if (sensorClippedQuad(uReferenceRaw, rp) != 0 || sensorClippedQuad(uShortRaw, sp) != 0) continue;
+                     float nr = quadMean(uReferenceRaw, rp, uReferenceBlackByPhase);
+                     float ns = quadMean(uShortRaw, sp, uShortBlackByPhase) * uExposureRatio;
+                     if (nr < 0.025 || ns < 0.025) continue;
+@@ -527,115 +516,20 @@ internal object GlesMgcRawSabreShaders {
+                     evidence += 1;
+                 }
+             }
+-            float meanError = evidence > 0 ? errorSum / float(evidence) : 1.0;
+-            oSeed = evidence >= 3 && meanError < uConsistencyThreshold ? 1.0 : 0.0;
+-        }
+-    """.trimIndent()
+-
+-    val shortRegionPropagate26594 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uSeed;
+-        uniform sampler2D uRegion;
+-        uniform sampler2D uCurrent;
+-        uniform ivec2 uSize;
+-        layout(location = 0) out float oTrust;
+-
+-        float at(sampler2D t, ivec2 p) {
+-            return texelFetch(t, clamp(p, ivec2(0), uSize - ivec2(1)), 0).r;
+-        }
+-        void main() {
+-            ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - ivec2(1));
+-            float seed = at(uSeed, p);
+-            if (seed >= 0.5) { oTrust = 1.0; return; }
+-            if (at(uRegion, p) < 0.5) { oTrust = 0.0; return; }
+-            float trust = 0.0;
+-            for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x)
+-                trust = max(trust, at(uCurrent, p + ivec2(x, y)));
+-            oTrust = trust >= 0.5 ? 1.0 : 0.0;
+-        }
+-    """.trimIndent()
+-
+-    val shortRestoreMask26587 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        precision highp usampler2D;
+-        uniform highp usampler2D uReferenceRaw;
+-        uniform highp usampler2D uShortRaw;
+-        uniform sampler2D uFlow;
+-        uniform sampler2D uShortWeight;
+-        uniform sampler2D uUnblocker;
+-        uniform sampler2D uRegionTrust;
+-        uniform ivec2 uRawSize;
+-        uniform vec4 uFlowScaleOffset;
+-        uniform vec4 uReferenceBlackByPhase;
+-        uniform vec4 uShortBlackByPhase;
+-        uniform float uWhiteLevel;
+-        uniform float uReferenceNearClipThreshold;
+-        uniform float uShortHeadroomThreshold;
+-        uniform float uFlowVariationThreshold;
+-        uniform float uShortWeightThreshold;
+-        uniform float uUnblockerThreshold;
+-        layout(location = 0) out float oMask;
+-
+-        ivec2 clampRaw(ivec2 p) { return clamp(p, ivec2(0), uRawSize - ivec2(1)); }
+-        float rawAt(highp usampler2D t, ivec2 p) { return float(texelFetch(t, clampRaw(p), 0).r); }
+-        int phaseAt(ivec2 p) { return ((p.y & 1) << 1) | (p.x & 1); }
+-        float blackAt(vec4 b, int phase) { return b[phase]; }
+-        float normalizedRaw(float raw, float black) {
+-            return max(raw - black, 0.0) / max(uWhiteLevel - black, 1.0);
+-        }
+-        float referenceSecondHighestSignal(ivec2 p) {
+-            ivec2 q = (clampRaw(p) / 2) * 2;
+-            float first = 0.0;
+-            float second = 0.0;
+-            for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+-                ivec2 s = q + ivec2(x, y);
+-                float signal = normalizedRaw(
+-                    rawAt(uReferenceRaw, s),
+-                    blackAt(uReferenceBlackByPhase, phaseAt(s))
+-                );
+-                if (signal >= first) { second = first; first = signal; }
+-                else if (signal > second) { second = signal; }
+-            }
+-            return second;
+-        }
+-        bool shortNeighborhoodHasHeadroom(ivec2 p) {
+-            for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
+-                ivec2 s = clampRaw(p + ivec2(x, y));
+-                float signal = normalizedRaw(
+-                    rawAt(uShortRaw, s),
+-                    blackAt(uShortBlackByPhase, phaseAt(s))
+-                );
+-                if (signal >= uShortHeadroomThreshold) return false;
+-            }
+-            return true;
+-        }
+-
+-        void main() {
+-            vec2 referenceUv = gl_FragCoord.xy / vec2(uRawSize);
+-            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+-            vec4 flow = texture(uFlow, flowUv);
+-            vec2 shortUv = clamp(referenceUv + flow.xy, vec2(0.0), vec2(1.0));
+-            ivec2 referenceP = ivec2(gl_FragCoord.xy);
+-            ivec2 shortP = clampRaw(ivec2(floor(shortUv * vec2(uRawSize))));
+-
+-            const float handoffStart = 0.90;
+-            float referenceSecond = referenceSecondHighestSignal(referenceP);
+-            if (referenceSecond < handoffStart || !shortNeighborhoodHasHeadroom(shortP)) {
+-                oMask = 0.0; return;
+-            }
+-            float shortWeight = texture(uShortWeight, referenceUv).r;
+-            float unblocker = texture(uUnblocker, referenceUv).r;
+-            float regionTrust = texture(uRegionTrust, referenceUv).r;
+-            if (shortWeight < uShortWeightThreshold || flow.z > uFlowVariationThreshold ||
+-                unblocker > uUnblockerThreshold || regionTrust < 0.5) {
+-                oMask = 0.0; return;
+-            }
+-
+-            /* Region trust is a gate, never blend opacity. Sensor reliability owns the handoff. */
++            if (evidence < 3) { oMask = 0.0; return; }
++            float meanError = errorSum / float(evidence);
++            if (meanError >= uConsistencyThreshold) { oMask = 0.0; return; }
++
++            float weightConfidence = smoothstep(uShortWeightThreshold, 0.95, shortWeight);
++            float supportConfidence = smoothstep(uNormalCoverageThreshold, min(1.0, uNormalCoverageThreshold + 0.20), coverage);
++            float flowConfidence = 1.0 - smoothstep(0.5 * uFlowVariationThreshold, uFlowVariationThreshold, flow.z);
++            float unblockerConfidence = 1.0 - smoothstep(0.25 * uUnblockerThreshold, uUnblockerThreshold, unblocker);
++            float consistencyConfidence = 1.0 - smoothstep(0.5 * uConsistencyThreshold, uConsistencyThreshold, meanError);
++            float trustConfidence = clamp(min(weightConfidence, min(supportConfidence, min(flowConfidence,
++                min(unblockerConfidence, consistencyConfidence)))), 0.0, 1.0);
++            if (trustConfidence < trustGate) { oMask = 0.0; return; }
++
++            /* Trust is a gate, never blend opacity. Sensor reliability alone owns the handoff. */
+             oMask = smoothstep(handoffStart, uReferenceNearClipThreshold, referenceSecond);
+         }
+     """.trimIndent()
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 0b16de03cc1df1e6ddc2333a5f4ed062a7199022..05f25bbaa80567022fd008f0ba3963e551ed5f71 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -552,8 +552,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreDehomogenizeProgram = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreRgb16ToFloatProgram = 0
+-    private var sabreShortRegionSeedProgram26594 = 0
+-    private var sabreShortRegionPropagateProgram26594 = 0
+     private var sabreShortRestoreMaskProgram26587 = 0
+     private var sabreShortRestoreMaskProbeProgram26590 = 0
+     private var sabreShortRestoreRgba16fProgram26587 = 0
+@@ -2447,64 +2445,26 @@ internal class GlesMgcRawSpatialStacker(
+                         identityWeight = identityWeight,
+                         resolveParameters = sabreResolveParameters,
+                     )
+-                    /* IRIS_26594_GPU_REGION_ANCHORED_SHORT_HANDOFF
+-                     * Build radiometric seeds only in the bright but still-measurable NORMAL/SHORT
+-                     * overlap band, then propagate them through an 8-connected highlight region.
+-                     * Every propagated cell and every final native pixel still passes the SHORT's
+-                     * own Sabre weight/flow/unblocker/headroom gates. NORMAL temporal coverage is
+-                     * intentionally not a SHORT-geometry authority.
+-                     */
+-                    val shortRegionSeed26594 = createTexture(
+-                        coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
+-                    )
+-                    val shortRegion26594 = createTexture(
+-                        coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
+-                    )
+-                    renderSabreShortRegionSeed26594(
+-                        referenceRaw = referenceRaw,
+-                        shortRaw = currentRaw,
+-                        flow = flow,
+-                        shortWeight = frameWeight,
+-                        unblocker = unblocker,
+-                        referenceCalibration = referenceCalibration,
+-                        shortCalibration = nativeShortCalibration,
+-                        exposureRatio = exposureScale,
+-                        outputSeed = shortRegionSeed26594,
+-                        outputRegion = shortRegion26594,
+-                    )
+-                    val shortRegionTrustA26594 = createTexture(
+-                        coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
+-                    )
+-                    val shortRegionTrustB26594 = createTexture(
+-                        coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
+-                    )
+-                    var shortRegionTrust26594 = shortRegionSeed26594
+-                    repeat(SHORT_REGION_PROPAGATION_PASSES_26594) { pass ->
+-                        val outputTrust = if ((pass and 1) == 0) {
+-                            shortRegionTrustA26594
+-                        } else {
+-                            shortRegionTrustB26594
+-                        }
+-                        renderSabreShortRegionPropagate26594(
+-                            seed = shortRegionSeed26594,
+-                            region = shortRegion26594,
+-                            current = shortRegionTrust26594,
+-                            output = outputTrust,
+-                        )
+-                        shortRegionTrust26594 = outputTrust
+-                    }
+                     highlightShortMask26587 = createTexture(
+                         width, height, GLES30.GL_R8, GLES30.GL_NEAREST,
+                     )
++                    val requiredNormalAux = minOf(6, normalFrameCount - 1)
++                    val coverageThreshold = if (requiredNormalAux >= 2) {
++                        requiredNormalAux.toFloat() / accumulatedWeightScale
++                    } else {
++                        2f // impossible in UNORM; fail closed without real temporal NORMAL support
++                    }
+                     renderSabreShortRestoreMask26587(
+                         referenceRaw = referenceRaw,
+                         shortRaw = currentRaw,
+                         flow = flow,
+                         shortWeight = frameWeight,
++                        normalCoverage = accumulatedCoverage,
+                         unblocker = unblocker,
+-                        regionTrust = shortRegionTrust26594,
+                         referenceCalibration = referenceCalibration,
+                         shortCalibration = nativeShortCalibration,
++                        exposureRatio = exposureScale,
++                        normalCoverageThreshold = coverageThreshold,
+                         output = highlightShortMask26587,
+                     )
+                     val shortMaskProbe26590 = probeSabreShortRestoreMask26590(highlightShortMask26587)
+@@ -2514,10 +2474,8 @@ internal class GlesMgcRawSpatialStacker(
+                             "strong=${shortMaskProbe26590.strongPixels}/${shortMaskProbe26590.totalPixels} " +
+                             "maxHandoffWeight=${shortMaskProbe26590.maxConfidence} " +
+                             "meanHandoffWeight=${shortMaskProbe26590.meanConfidence} " +
+-                            "handoffStart=0.90 fullShortAt=0.98 shortHeadroomThreshold=0.90 " +
+-                            "boundaryRadiometry=true regionFloor=0.70 boundaryCeiling=0.90 " +
+-                            "regionPropagation=8connected passes=$SHORT_REGION_PROPAGATION_PASSES_26594 " +
+-                            "normalCoverageGate=false sameSabreFlow=true wholeRgb=true maskFilter=NEAREST"
++                            "handoffStart=0.90 fullShortAt=0.98 trustGate=0.60 shortHeadroomThreshold=0.90 " +
++                            "trustSeparatedFromBlend=true sameSabreFlow=true wholeRgb=true maskFilter=NEAREST"
+                     PLog.i(SABRE_TAG, "IRIS_26590_SHORT_MASK_EFFECT $shortMaskEffectDetails26591")
+                     /* IRIS_26591_SHORT_MASK_EFFECT_MOTIONTRACE
+                      * Telemetry only: expose the already-computed 26590 read-only mask probe in the
+@@ -2531,11 +2489,10 @@ internal class GlesMgcRawSpatialStacker(
+                     highlightShortMaskGenerated26587 = true
+                     PLog.i(
+                         SABRE_TAG,
+-                        "IRIS_26594_SHORT_REGION_AUXILIARY_READY exposureRatio=$exposureScale " +
+-                            "normalFrames=$normalFrameCount boundaryRadiometry=true " +
+-                            "regionPropagationPasses=$SHORT_REGION_PROPAGATION_PASSES_26594 " +
+-                            "normalCoverageAuthority=false normalAccumulator=false dng=false sr=false " +
+-                            "nativeExposureReconstruction=true wholeRgbMask=true",
++                        "IRIS_26587_SHORT_AUXILIARY_READY exposureRatio=$exposureScale " +
++                            "normalFrames=$normalFrameCount requiredNormalAux=$requiredNormalAux " +
++                            "coverageThreshold=$coverageThreshold normalAccumulator=false dng=false sr=false " +
++                            "nativeExposureReconstruction=true wholeRgbMask=true trustSeparatedFromBlend=true",
+                     )
+                 } else {
+                     if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
+@@ -4017,76 +3974,17 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun renderSabreShortRegionSeed26594(
+-        referenceRaw: Int,
+-        shortRaw: Int,
+-        flow: SabreConvertedAlignment,
+-        shortWeight: Int,
+-        unblocker: Int,
+-        referenceCalibration: FrameCalibration,
+-        shortCalibration: FrameCalibration,
+-        exposureRatio: Float,
+-        outputSeed: Int,
+-        outputRegion: Int,
+-    ) {
+-        val program = sabreShortRegionSeedProgram26594
+-        check(program != 0)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uReferenceRaw", 0, referenceRaw)
+-        bindTexture(program, "uShortRaw", 1, shortRaw)
+-        bindTexture(program, "uFlow", 2, flow.texture)
+-        bindTexture(program, "uShortWeight", 3, shortWeight)
+-        bindTexture(program, "uUnblocker", 4, unblocker)
+-        uniform2i(program, "uRawSize", width, height)
+-        uniform2i(program, "uRegionSize", ceilDiv(ceilDiv(width, 2), 2), ceilDiv(ceilDiv(height, 2), 2))
+-        uniformSabreFlowScaleOffset(program, flow)
+-        uniform4fv(program, "uReferenceBlackByPhase", positionalBlackLevels26587(referenceCalibration))
+-        uniform4fv(program, "uShortBlackByPhase", positionalBlackLevels26587(shortCalibration))
+-        uniform1f(program, "uWhiteLevel", sensorWhiteLevel)
+-        uniform1f(program, "uExposureRatio", exposureRatio)
+-        uniform1f(program, "uRegionFloor", 0.70f)
+-        uniform1f(program, "uBoundaryCeiling", 0.90f)
+-        uniform1f(program, "uShortHeadroomThreshold", 0.90f)
+-        val flowThreshold = MgcSabreRejectionTuning.flowVariationThresholds(ceilDiv(width, 2)).unblockerReduction
+-        uniform1f(program, "uFlowVariationThreshold", flowThreshold)
+-        uniform1f(program, "uShortWeightThreshold", 0.75f)
+-        uniform1f(program, "uUnblockerThreshold", 0.10f)
+-        uniform1f(program, "uConsistencyThreshold", 0.05f)
+-        draw(
+-            program,
+-            ceilDiv(ceilDiv(width, 2), 2),
+-            ceilDiv(ceilDiv(height, 2), 2),
+-            intArrayOf(outputSeed, outputRegion),
+-        )
+-    }
+-
+-    private fun renderSabreShortRegionPropagate26594(
+-        seed: Int,
+-        region: Int,
+-        current: Int,
+-        output: Int,
+-    ) {
+-        val program = sabreShortRegionPropagateProgram26594
+-        check(program != 0)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uSeed", 0, seed)
+-        bindTexture(program, "uRegion", 1, region)
+-        bindTexture(program, "uCurrent", 2, current)
+-        val regionWidth = ceilDiv(ceilDiv(width, 2), 2)
+-        val regionHeight = ceilDiv(ceilDiv(height, 2), 2)
+-        uniform2i(program, "uSize", regionWidth, regionHeight)
+-        draw(program, regionWidth, regionHeight, intArrayOf(output))
+-    }
+-
+     private fun renderSabreShortRestoreMask26587(
+         referenceRaw: Int,
+         shortRaw: Int,
+         flow: SabreConvertedAlignment,
+         shortWeight: Int,
++        normalCoverage: Int,
+         unblocker: Int,
+-        regionTrust: Int,
+         referenceCalibration: FrameCalibration,
+         shortCalibration: FrameCalibration,
++        exposureRatio: Float,
++        normalCoverageThreshold: Float,
+         output: Int,
+     ) {
+         val program = sabreShortRestoreMaskProgram26587
+@@ -4096,19 +3994,22 @@ internal class GlesMgcRawSpatialStacker(
+         bindTexture(program, "uShortRaw", 1, shortRaw)
+         bindTexture(program, "uFlow", 2, flow.texture)
+         bindTexture(program, "uShortWeight", 3, shortWeight)
+-        bindTexture(program, "uUnblocker", 4, unblocker)
+-        bindTexture(program, "uRegionTrust", 5, regionTrust)
++        bindTexture(program, "uNormalCoverage", 4, normalCoverage)
++        bindTexture(program, "uUnblocker", 5, unblocker)
+         uniform2i(program, "uRawSize", width, height)
+         uniformSabreFlowScaleOffset(program, flow)
+         uniform4fv(program, "uReferenceBlackByPhase", positionalBlackLevels26587(referenceCalibration))
+         uniform4fv(program, "uShortBlackByPhase", positionalBlackLevels26587(shortCalibration))
+         uniform1f(program, "uWhiteLevel", sensorWhiteLevel)
++        uniform1f(program, "uExposureRatio", exposureRatio)
+         uniform1f(program, "uReferenceNearClipThreshold", 0.98f)
+         uniform1f(program, "uShortHeadroomThreshold", 0.90f)
++        uniform1f(program, "uNormalCoverageThreshold", normalCoverageThreshold)
+         val flowThreshold = MgcSabreRejectionTuning.flowVariationThresholds(ceilDiv(width, 2)).unblockerReduction
+         uniform1f(program, "uFlowVariationThreshold", flowThreshold)
+         uniform1f(program, "uShortWeightThreshold", 0.75f)
+         uniform1f(program, "uUnblockerThreshold", 0.10f)
++        uniform1f(program, "uConsistencyThreshold", 0.05f)
+         draw(program, width, height, intArrayOf(output))
+     }
+ 
+@@ -4444,17 +4345,9 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
+-        sabreShortRegionSeedProgram26594 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRegionSeed26594,
+-            "iris_26594_sabre_short_region_seed",
+-        )
+-        sabreShortRegionPropagateProgram26594 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRegionPropagate26594,
+-            "iris_26594_sabre_short_region_propagate",
+-        )
+         sabreShortRestoreMaskProgram26587 = linkProgram(
+             GlesMgcRawSabreShaders.shortRestoreMask26587,
+-            "iris_26594_sabre_short_restore_mask",
++            "iris_26587_sabre_short_restore_mask",
+         )
+         sabreShortRestoreMaskProbeProgram26590 = linkProgram(
+             GlesMgcRawSabreShaders.shortRestoreMaskProbe26590,
+@@ -11323,7 +11216,6 @@ internal class GlesMgcRawSpatialStacker(
+         // Guide/covariance has a wider MGC footprint than rejection/RBF sampling.
+         const val SABRE_GUIDE_BORDER_PIXELS = 2.5f
+         const val SABRE_SAMPLE_BORDER_PIXELS = 1.5f
+-        private const val SHORT_REGION_PROPAGATION_PASSES_26594 = 32
+         private const val SABRE_SUPER_RES_LINEAR_RAW_BAND_HEIGHT = 64
+         private const val SABRE_SUPER_RES_DETAIL_BAND_HEIGHT = 256
+         private const val TRUE2X_CPU_TILE_WIDTH = 512
+diff --git a/app/version.properties b/app/version.properties
+index 60dfaf6415429c7637efdaa8c7c7b5d0fc6e5342..bb15747ed3d1aa81c67791f96b89803ce1381eb5 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726594
+-VERSION_BUILD=26594
++VERSION_NAME=0.9726593
++VERSION_BUILD=26593
