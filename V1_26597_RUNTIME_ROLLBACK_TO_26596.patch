@@ -1,0 +1,141 @@
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index fe418f847b0168d3fd0734a26b83bc66b19a07b6..fc038ea886aff77ae7711bb12f6b6cbad0b28546 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -114,27 +114,9 @@ float mapHeadroomLuminance(float y) {
+     const float logShape=3.0;
+     float shaped;
+     if(iris26592MotionHdrHandoff!=0) {
+-        /* IRIS_26597_BODY_ANCHORED_UNIVERSAL_HIGHLIGHT_RESERVE
+-         * Preserve the exact 26596 body exposure and tone start. 26596 used a concave
+-         * log+tanh allocation inside the recoverable highlight interval, spending too much
+-         * display range on its lower half and making bright roads/ground/foliage wash toward
+-         * white even when the source still contained structure. Allocate 0..sceneWhite
+-         * headroom linearly instead. At u=1 retain the exact 26596 scene-white output anchor
+-         * (tanh(1.2020679)), then continue with a C1-matched rational tail so values beyond
+-         * scene white remain strictly ordered and true speculars may still approach white.
+-         * Nothing at or below start changes. No scene/category threshold is introduced.
+-         */
+-        /* IRIS_26597_V1_1_ESSL_CONSTANT_INITIALIZER_FIX
+-         * ESSL 3.20 const initializers cannot call tanh()/max(). These literals are the IEEE-754
+-         * float results of the unchanged V1 equations, so the highlight mapping is unchanged.
+-         */
+-        const float sceneAnchor=0.834284246;
+-        const float tailSlope=5.03442907;
+-        if(u<=1.0) {
+-            shaped=sceneAnchor*max(u,0.0);
+-        } else {
+-            shaped=1.0-(1.0-sceneAnchor)/(1.0+tailSlope*(u-1.0));
+-        }
++        const float tanhScale=1.2020679;
++        float logCoordinate=log(1.0+logShape*u)/log(1.0+logShape);
++        shaped=tanh(tanhScale*logCoordinate);
+     } else {
+         float x=clamp(u,0.0,1.0);
+         shaped=log(1.0+logShape*x)/log(1.0+logShape);
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index a6e753a803ce2e848d52ce6f5404b69d062c5b34..c7fb9d16990dc6d43b5c7be0a86489721bb8a07f 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -595,7 +595,7 @@ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p){
+     rgb=clampNonnegative(rgb);float y=std::max(luma(rgb),0.f),pk=peak(rgb),guide=std::max(y,pk);
+     if(guide>1.0e-7f&&guide>0.50f){
+         float white=std::max(p.sceneWhite,0.55f);float u=std::max((guide-0.50f)/std::max(white-0.50f,1.0e-6f),0.f);float shaped;
+-        if(p.motionHdrHandoff){/* IRIS_26597_BODY_ANCHORED_UNIVERSAL_HIGHLIGHT_RESERVE */const float a=std::tanh(1.2020679f);const float k=a/std::max(1.f-a,1.0e-6f);shaped=u<=1.f?a*std::max(u,0.f):1.f-(1.f-a)/(1.f+k*(u-1.f));}
++        if(p.motionHdrHandoff){float logCoordinate=std::log(1.f+3.f*u)/std::log(4.f);shaped=std::tanh(1.2020679f*logCoordinate);}
+         else {float x=clampf(u,0.f,1.f);shaped=std::log(1.f+6.f*x)/std::log(7.f);}
+         float mapped=0.50f+(1.25f-0.50f)*shaped;rgb=mul(rgb,mapped/guide);
+     }
+@@ -877,7 +877,7 @@ vec3 irisHeadroom(vec3 rgb){
+         float white=max(uSceneWhite,0.55);
+         float u=max((guide-0.50)/max(white-0.50,1.0e-6),0.0);
+         float shaped;
+-        if(uMotionHdrHandoff!=0){/* IRIS_26597_BODY_ANCHORED_UNIVERSAL_HIGHLIGHT_RESERVE */float a=tanh(1.2020679);float k=a/max(1.0-a,1.0e-6);shaped=u<=1.0?a*max(u,0.0):1.0-(1.0-a)/(1.0+k*(u-1.0));}
++        if(uMotionHdrHandoff!=0){float logCoordinate=log(1.0+3.0*u)/log(4.0);shaped=tanh(1.2020679*logCoordinate);}
+         else {float x=clamp(u,0.0,1.0);shaped=log(1.0+6.0*x)/log(7.0);}
+         float mapped=0.50+(1.25-0.50)*shaped;
+         rgb*=mapped/guide;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 87837f4e03db4995e8559fa66dbff6f0c94ff40d..270ab4241197be433b1609328a0cc8b9d3988654 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -663,44 +663,28 @@ internal object GlesMgcRawSabreShaders {
+             }
+             return second;
+         }
+-        bool shortQuadEvidence(ivec2 referenceQuad, vec2 flowRawPixels,
+-                out vec4 shortNormalized, out vec4 shortSupportPeak) {
++        bool shortQuadEvidence(ivec2 referenceQuad, vec2 flowRawPixels, out vec4 shortNormalized) {
+             shortNormalized = vec4(0.0);
+-            shortSupportPeak = vec4(0.0);
+             for (int phase = 0; phase < 4; ++phase) {
+                 ivec2 rp = referenceQuad + phaseOffset(phase);
+                 vec2 shortCenter = vec2(rp) + vec2(0.5) + flowRawPixels;
+                 vec4 support = samePhaseSupport(uShortRaw, shortCenter, phase, uShortBlackByPhase);
+-                float supportPeak = samePhasePeak(support);
+-                shortSupportPeak[phase] = supportPeak;
+-                /* IRIS_26597_PHASE_SCOPED_SHORT_HEADROOM
+-                 * Whole-RGB SHORT still requires every phase to remain physically measurable,
+-                 * but do not demand a full 10% reserve from an unrelated phase. The strict 0.90
+-                 * reserve is checked below only for phases whose NORMAL sensor code is actually
+-                 * clipped. A SHORT phase at/near physical sensor white still fails closed.
+-                 */
+-                if (supportPeak >= 0.995) return false;
++                if (samePhasePeak(support) >= uShortHeadroomThreshold) return false;
+                 shortNormalized[phase] = bilinearSamePhase(support, shortCenter, phase) * uExposureRatio;
+             }
+             return true;
+         }
+-        bool everyClippedReferencePhaseExplained(ivec2 referenceQuad, vec4 shortNormalized,
+-                vec4 shortSupportPeak) {
++        bool everyClippedReferencePhaseExplained(ivec2 referenceQuad, vec4 shortNormalized) {
+             float clipCode = uWhiteLevel - 0.5;
+             int clipped = 0;
+             for (int phase = 0; phase < 4; ++phase) {
+                 if (rawAt(uReferenceRaw, referenceQuad + phaseOffset(phase)) >= clipCode) {
+                     clipped += 1;
+-                    if (shortSupportPeak[phase] >= uShortHeadroomThreshold) return false;
+                     if (shortNormalized[phase] < 0.90) return false;
+                 }
+             }
+             return clipped >= 1;
+         }
+-        bool allShortPhasesHaveStrongHeadroom(vec4 shortSupportPeak) {
+-            return max(max(shortSupportPeak.x, shortSupportPeak.y),
+-                       max(shortSupportPeak.z, shortSupportPeak.w)) < uShortHeadroomThreshold;
+-        }
+         void main() {
+             vec2 referenceUv = gl_FragCoord.xy / vec2(uRawSize);
+             vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+@@ -710,18 +694,13 @@ internal object GlesMgcRawSabreShaders {
+             ivec2 referenceP = ivec2(gl_FragCoord.xy);
+             ivec2 referenceQuad = (clampRaw(referenceP) / 2) * 2;
+             vec4 shortNormalized = vec4(0.0);
+-            vec4 shortSupportPeak = vec4(0.0);
+-            if (!shortQuadEvidence(referenceQuad, flowRawPixels, shortNormalized, shortSupportPeak)) { oMask = 0.0; return; }
++            if (!shortQuadEvidence(referenceQuad, flowRawPixels, shortNormalized)) { oMask = 0.0; return; }
+             const float handoffStart = 0.90;
+             bool actualSensorLoss = sensorClippedPhaseCount(referenceP) >= 1;
+             if (actualSensorLoss) {
+-                oMask = everyClippedReferencePhaseExplained(
+-                    referenceQuad, shortNormalized, shortSupportPeak) ? 1.0 : 0.0;
++                oMask = everyClippedReferencePhaseExplained(referenceQuad, shortNormalized) ? 1.0 : 0.0;
+                 return;
+             }
+-            /* Preserve the exact 26596 fail-closed near-clip path: without an actual clipped
+-             * NORMAL phase, every SHORT phase must still carry the full 0.90 reserve. */
+-            if (!allShortPhasesHaveStrongHeadroom(shortSupportPeak)) { oMask = 0.0; return; }
+             float referenceSecond = referenceSecondHighest(referenceP);
+             float shortSecondNormalized = secondHighestVec4(shortNormalized);
+             if (referenceSecond < handoffStart || shortSecondNormalized < handoffStart) { oMask = 0.0; return; }
+diff --git a/app/version.properties b/app/version.properties
+index a053340830038935c8847d0526a64c668cf7111d..af7184627cd7afdcef72811359106c1be7fb87da 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726597
+-VERSION_BUILD=26597
++VERSION_NAME=0.9726596
++VERSION_BUILD=26596
