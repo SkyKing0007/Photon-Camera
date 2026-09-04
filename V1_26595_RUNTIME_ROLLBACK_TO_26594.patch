@@ -1,0 +1,748 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 791e88826b038b5e326bbd1d67f16c1a4c9c8629..542fef6c0440a6edaffc12d73cb6c57bb30661b1 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -392,18 +392,25 @@ internal object GlesMgcRawSabreShaders {
+     """.trimIndent()
+ 
+ 
+-    /* IRIS_26595_SUBPIXEL_PHASE_SHORT_HANDOFF
+-     * 26594 device proof exposed three independent false-closed conditions:
+-     *  - Sabre photometric rejection deliberately collapses when clipped NORMAL guide=10000;
+-     *  - integer RAW snapping discarded subpixel flow before the 5% radiometric proof;
+-     *  - a fixed flood radius could not be a universal owner for large clipped cores.
++    /* IRIS_26594_REGION_ANCHORED_SHORT_HANDOFF
++     * 26593 device proof established that the SHORT frame reaches Sabre but the 26592 mask can
++     * still be empty because every clipped output pixel was required to find three fully-unclipped
++     * NORMAL quads in its own 3x3 neighborhood and to pass a second, unrelated NORMAL-stack
++     * coverage confidence gate. That is circular: the SHORT exists precisely where NORMAL lost
++     * radiometric information.
+      *
+-     * 26595 keeps boundary radiometry only where NORMAL is still measurable, but samples SHORT at
+-     * the exact Sabre subpixel displacement on the SAME CFA phase lattice. Geometry is flow-only
+-     * (flow.w raw-pixel variation). SHORT headroom is checked only on the phase support actually
+-     * used by interpolation. No Sabre frameWeight/unblocker value is an HDR eligibility input.
++     * 26594 separates the proof into two domains:
++     *  - boundary radiometry is established only in a bright, still-unclipped overlap band where
++     *    both NORMAL and exposure-normalized SHORT are physically measurable;
++     *  - that trust is propagated only through an 8-connected bright-highlight region whose every
++     *    cell still passes the exact SHORT Sabre rejection/flow/unblocker/headroom gates.
++     *
++     * The final native-resolution mask still requires local SHORT geometry/headroom and still uses
++     * one whole-RGB scalar. NORMAL sensor saturation alone controls the 0.90 -> 0.98 handoff.
++     * There is no second correspondence search, no per-channel substitution, no NORMAL coverage
++     * requirement, and no unanchored propagation into motion/disocclusion.
+      */
+-    val shortRegionSeed26595 = """
++    val shortRegionSeed26594 = """
+         #version 300 es
+         precision highp float;
+         precision highp int;
+@@ -411,6 +418,8 @@ internal object GlesMgcRawSabreShaders {
+         uniform highp usampler2D uReferenceRaw;
+         uniform highp usampler2D uShortRaw;
+         uniform sampler2D uFlow;
++        uniform sampler2D uShortWeight;
++        uniform sampler2D uUnblocker;
+         uniform ivec2 uRawSize;
+         uniform ivec2 uRegionSize;
+         uniform vec4 uFlowScaleOffset;
+@@ -421,7 +430,9 @@ internal object GlesMgcRawSabreShaders {
+         uniform float uRegionFloor;
+         uniform float uBoundaryCeiling;
+         uniform float uShortHeadroomThreshold;
+-        uniform float uFlowVariationPixelsThreshold;
++        uniform float uFlowVariationThreshold;
++        uniform float uShortWeightThreshold;
++        uniform float uUnblockerThreshold;
+         uniform float uConsistencyThreshold;
+         layout(location = 0) out float oSeed;
+         layout(location = 1) out float oRegion;
+@@ -429,77 +440,68 @@ internal object GlesMgcRawSabreShaders {
+         ivec2 clampRaw(ivec2 p) { return clamp(p, ivec2(0), uRawSize - ivec2(1)); }
+         float rawAt(highp usampler2D t, ivec2 p) { return float(texelFetch(t, clampRaw(p), 0).r); }
+         int phaseAt(ivec2 p) { return ((p.y & 1) << 1) | (p.x & 1); }
+-        ivec2 phaseOffset(int phase) { return ivec2(phase & 1, (phase >> 1) & 1); }
+         float blackAt(vec4 b, int phase) { return b[phase]; }
+         float normalizedRaw(float raw, float black) {
+             return max(raw - black, 0.0) / max(uWhiteLevel - black, 1.0);
+         }
+-        float normalizedAt(highp usampler2D t, ivec2 p, vec4 blackByPhase) {
+-            ivec2 q = clampRaw(p);
+-            return normalizedRaw(rawAt(t, q), blackAt(blackByPhase, phaseAt(q)));
+-        }
+-        ivec2 phaseGridSize(int phase) {
+-            ivec2 off = phaseOffset(phase);
+-            return max((uRawSize - off + ivec2(1)) / 2, ivec2(1));
+-        }
+-        ivec2 phaseSamplePixel(int phase, ivec2 gridP) {
+-            ivec2 off = phaseOffset(phase);
+-            ivec2 size = phaseGridSize(phase);
+-            return 2 * clamp(gridP, ivec2(0), size - ivec2(1)) + off;
+-        }
+-        vec4 samePhaseSupport(highp usampler2D t, vec2 rawCenter, int phase, vec4 blackByPhase) {
+-            vec2 origin = vec2(phaseOffset(phase)) + vec2(0.5);
+-            vec2 g = (rawCenter - origin) * 0.5;
+-            ivec2 g0 = ivec2(floor(g));
+-            vec2 f = fract(g);
+-            ivec2 p00 = phaseSamplePixel(phase, g0);
+-            ivec2 p10 = phaseSamplePixel(phase, g0 + ivec2(1, 0));
+-            ivec2 p01 = phaseSamplePixel(phase, g0 + ivec2(0, 1));
+-            ivec2 p11 = phaseSamplePixel(phase, g0 + ivec2(1, 1));
+-            float a = normalizedRaw(rawAt(t, p00), blackAt(blackByPhase, phase));
+-            float b = normalizedRaw(rawAt(t, p10), blackAt(blackByPhase, phase));
+-            float c = normalizedRaw(rawAt(t, p01), blackAt(blackByPhase, phase));
+-            float d = normalizedRaw(rawAt(t, p11), blackAt(blackByPhase, phase));
+-            return vec4(a, b, c, d);
+-        }
+-        float bilinearSamePhase(vec4 v, vec2 rawCenter, int phase) {
+-            vec2 origin = vec2(phaseOffset(phase)) + vec2(0.5);
+-            vec2 f = fract((rawCenter - origin) * 0.5);
+-            return mix(mix(v.x, v.y, f.x), mix(v.z, v.w, f.x), f.y);
+-        }
+-        float samePhasePeak(vec4 v) { return max(max(v.x, v.y), max(v.z, v.w)); }
+-        float secondHighestReference(ivec2 p) {
++        int sensorClippedQuad(highp usampler2D t, ivec2 p) {
++            ivec2 q = (clampRaw(p) / 2) * 2;
++            float clipCode = uWhiteLevel - 0.5;
++            int count = 0;
++            for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x)
++                count += rawAt(t, q + ivec2(x, y)) >= clipCode ? 1 : 0;
++            return count;
++        }
++        float secondHighestSignal(highp usampler2D t, ivec2 p, vec4 blackByPhase) {
+             ivec2 q = (clampRaw(p) / 2) * 2;
+-            float first = 0.0; float second = 0.0;
++            float first = 0.0;
++            float second = 0.0;
+             for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
+-                float signal = normalizedAt(uReferenceRaw, q + ivec2(x, y), uReferenceBlackByPhase);
++                ivec2 s = q + ivec2(x, y);
++                float signal = normalizedRaw(rawAt(t, s), blackAt(blackByPhase, phaseAt(s)));
+                 if (signal >= first) { second = first; first = signal; }
+-                else if (signal > second) second = signal;
++                else if (signal > second) { second = signal; }
+             }
+             return second;
+         }
+-        bool shortQuadHasHeadroom(ivec2 referenceQuad, vec2 flowRawPixels) {
+-            for (int phase = 0; phase < 4; ++phase) {
+-                ivec2 rp = referenceQuad + phaseOffset(phase);
+-                vec2 shortCenter = vec2(rp) + vec2(0.5) + flowRawPixels;
+-                if (samePhasePeak(samePhaseSupport(
+-                        uShortRaw, shortCenter, phase, uShortBlackByPhase)) >=
+-                        uShortHeadroomThreshold) return false;
++        bool shortNeighborhoodHasHeadroom(ivec2 p) {
++            for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
++                ivec2 s = clampRaw(p + ivec2(x, y));
++                float signal = normalizedRaw(
++                    rawAt(uShortRaw, s),
++                    blackAt(uShortBlackByPhase, phaseAt(s))
++                );
++                if (signal >= uShortHeadroomThreshold) return false;
+             }
+             return true;
+         }
++        float quadMean(highp usampler2D t, ivec2 p, vec4 blackByPhase) {
++            ivec2 q = (clampRaw(p) / 2) * 2;
++            float sum = 0.0;
++            for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
++                ivec2 s = q + ivec2(x, y);
++                sum += normalizedRaw(rawAt(t, s), blackAt(blackByPhase, phaseAt(s)));
++            }
++            return 0.25 * sum;
++        }
+ 
+         void main() {
+             vec2 referenceUv = gl_FragCoord.xy / vec2(uRegionSize);
+             vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec4 flow = texture(uFlow, flowUv);
+-            vec2 flowRawPixels = flow.xy * vec2(uRawSize);
++            vec2 shortUv = clamp(referenceUv + flow.xy, vec2(0.0), vec2(1.0));
+             ivec2 referenceP = clampRaw(ivec2(floor(referenceUv * vec2(uRawSize))));
+-            ivec2 referenceQuad = (referenceP / 2) * 2;
+-
+-            bool geometryTrusted = flow.w <= uFlowVariationPixelsThreshold &&
+-                shortQuadHasHeadroom(referenceQuad, flowRawPixels);
+-            float referenceSecond = secondHighestReference(referenceP);
++            ivec2 shortP = clampRaw(ivec2(floor(shortUv * vec2(uRawSize))));
++
++            float shortWeight = texture(uShortWeight, referenceUv).r;
++            float unblocker = texture(uUnblocker, referenceUv).r;
++            bool geometryTrusted = shortWeight >= uShortWeightThreshold &&
++                flow.z <= uFlowVariationThreshold &&
++                unblocker <= uUnblockerThreshold &&
++                shortNeighborhoodHasHeadroom(shortP);
++            float referenceSecond = secondHighestSignal(
++                uReferenceRaw, referenceP, uReferenceBlackByPhase
++            );
+             bool regionCandidate = geometryTrusted && referenceSecond >= uRegionFloor;
+             oRegion = regionCandidate ? 1.0 : 0.0;
+             if (!regionCandidate || referenceSecond >= uBoundaryCeiling) {
+@@ -507,33 +509,26 @@ internal object GlesMgcRawSabreShaders {
+                 return;
+             }
+ 
++            /* Radiometry is proved in the measurable boundary, never demanded from clipped core. */
+             float errorSum = 0.0;
+-            int phaseEvidence = 0;
+-            int quadEvidence = 0;
++            int evidence = 0;
++            ivec2 referenceQuad = (referenceP / 2) * 2;
++            ivec2 shortQuad = (shortP / 2) * 2;
+             for (int qy = -1; qy <= 1; ++qy) {
+                 for (int qx = -1; qx <= 1; ++qx) {
+-                    ivec2 rq = referenceQuad + ivec2(qx * 2, qy * 2);
+-                    int phasesThisQuad = 0;
+-                    for (int phase = 0; phase < 4; ++phase) {
+-                        ivec2 rp = clampRaw(rq + phaseOffset(phase));
+-                        float nr = normalizedAt(uReferenceRaw, rp, uReferenceBlackByPhase);
+-                        if (nr < 0.025 || nr >= uBoundaryCeiling) continue;
+-                        vec2 shortCenter = vec2(rp) + vec2(0.5) + flowRawPixels;
+-                        vec4 support = samePhaseSupport(
+-                            uShortRaw, shortCenter, phase, uShortBlackByPhase);
+-                        if (samePhasePeak(support) >= uShortHeadroomThreshold) continue;
+-                        float ns = bilinearSamePhase(support, shortCenter, phase) * uExposureRatio;
+-                        if (ns < 0.025) continue;
+-                        errorSum += abs(ns - nr) / max(max(nr, ns), 0.05);
+-                        phaseEvidence += 1;
+-                        phasesThisQuad += 1;
+-                    }
+-                    if (phasesThisQuad >= 2) quadEvidence += 1;
++                    ivec2 rp = referenceQuad + ivec2(qx * 2, qy * 2);
++                    ivec2 sp = shortQuad + ivec2(qx * 2, qy * 2);
++                    if (sensorClippedQuad(uReferenceRaw, rp) != 0 ||
++                        sensorClippedQuad(uShortRaw, sp) != 0) continue;
++                    float nr = quadMean(uReferenceRaw, rp, uReferenceBlackByPhase);
++                    float ns = quadMean(uShortRaw, sp, uShortBlackByPhase) * uExposureRatio;
++                    if (nr < 0.025 || ns < 0.025) continue;
++                    errorSum += abs(ns - nr) / max(max(nr, ns), 0.05);
++                    evidence += 1;
+                 }
+             }
+-            float meanError = phaseEvidence > 0 ? errorSum / float(phaseEvidence) : 1.0;
+-            oSeed = quadEvidence >= 3 && phaseEvidence >= 6 &&
+-                meanError < uConsistencyThreshold ? 1.0 : 0.0;
++            float meanError = evidence > 0 ? errorSum / float(evidence) : 1.0;
++            oSeed = evidence >= 3 && meanError < uConsistencyThreshold ? 1.0 : 0.0;
+         }
+     """.trimIndent()
+ 
+@@ -562,14 +557,7 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26595_SENSOR_LOSS_SHORT_MASK
+-     * Actual multi-phase sensor clipping is an information-loss state, not a photometric mismatch.
+-     * For those pixels SHORT may bypass boundary flood reach, but only with pure flow coherence,
+-     * same-phase SHORT headroom, and an exposure-normalized SHORT signal that is itself bright
+-     * enough to explain the clipped NORMAL. Near-clip but not sensor-clipped pixels still require
+-     * connected boundary radiometry. This makes clipped-core ownership independent of region size.
+-     */
+-    val shortRestoreMask26595 = """
++    val shortRestoreMask26587 = """
+         #version 300 es
+         precision highp float;
+         precision highp int;
+@@ -577,91 +565,52 @@ internal object GlesMgcRawSabreShaders {
+         uniform highp usampler2D uReferenceRaw;
+         uniform highp usampler2D uShortRaw;
+         uniform sampler2D uFlow;
++        uniform sampler2D uShortWeight;
++        uniform sampler2D uUnblocker;
+         uniform sampler2D uRegionTrust;
+         uniform ivec2 uRawSize;
+         uniform vec4 uFlowScaleOffset;
+         uniform vec4 uReferenceBlackByPhase;
+         uniform vec4 uShortBlackByPhase;
+         uniform float uWhiteLevel;
+-        uniform float uExposureRatio;
+         uniform float uReferenceNearClipThreshold;
+         uniform float uShortHeadroomThreshold;
+-        uniform float uFlowVariationPixelsThreshold;
++        uniform float uFlowVariationThreshold;
++        uniform float uShortWeightThreshold;
++        uniform float uUnblockerThreshold;
+         layout(location = 0) out float oMask;
+ 
+         ivec2 clampRaw(ivec2 p) { return clamp(p, ivec2(0), uRawSize - ivec2(1)); }
+         float rawAt(highp usampler2D t, ivec2 p) { return float(texelFetch(t, clampRaw(p), 0).r); }
+         int phaseAt(ivec2 p) { return ((p.y & 1) << 1) | (p.x & 1); }
+-        ivec2 phaseOffset(int phase) { return ivec2(phase & 1, (phase >> 1) & 1); }
+         float blackAt(vec4 b, int phase) { return b[phase]; }
+         float normalizedRaw(float raw, float black) {
+             return max(raw - black, 0.0) / max(uWhiteLevel - black, 1.0);
+         }
+-        float normalizedAt(highp usampler2D t, ivec2 p, vec4 blackByPhase) {
+-            ivec2 q = clampRaw(p);
+-            return normalizedRaw(rawAt(t, q), blackAt(blackByPhase, phaseAt(q)));
+-        }
+-        ivec2 phaseGridSize(int phase) {
+-            ivec2 off = phaseOffset(phase);
+-            return max((uRawSize - off + ivec2(1)) / 2, ivec2(1));
+-        }
+-        ivec2 phaseSamplePixel(int phase, ivec2 gridP) {
+-            ivec2 off = phaseOffset(phase);
+-            ivec2 size = phaseGridSize(phase);
+-            return 2 * clamp(gridP, ivec2(0), size - ivec2(1)) + off;
+-        }
+-        vec4 samePhaseSupport(highp usampler2D t, vec2 rawCenter, int phase, vec4 blackByPhase) {
+-            vec2 origin = vec2(phaseOffset(phase)) + vec2(0.5);
+-            vec2 g = (rawCenter - origin) * 0.5;
+-            ivec2 g0 = ivec2(floor(g));
+-            ivec2 p00 = phaseSamplePixel(phase, g0);
+-            ivec2 p10 = phaseSamplePixel(phase, g0 + ivec2(1, 0));
+-            ivec2 p01 = phaseSamplePixel(phase, g0 + ivec2(0, 1));
+-            ivec2 p11 = phaseSamplePixel(phase, g0 + ivec2(1, 1));
+-            float a = normalizedRaw(rawAt(t, p00), blackAt(blackByPhase, phase));
+-            float b = normalizedRaw(rawAt(t, p10), blackAt(blackByPhase, phase));
+-            float c = normalizedRaw(rawAt(t, p01), blackAt(blackByPhase, phase));
+-            float d = normalizedRaw(rawAt(t, p11), blackAt(blackByPhase, phase));
+-            return vec4(a, b, c, d);
+-        }
+-        float bilinearSamePhase(vec4 v, vec2 rawCenter, int phase) {
+-            vec2 origin = vec2(phaseOffset(phase)) + vec2(0.5);
+-            vec2 f = fract((rawCenter - origin) * 0.5);
+-            return mix(mix(v.x, v.y, f.x), mix(v.z, v.w, f.x), f.y);
+-        }
+-        float samePhasePeak(vec4 v) { return max(max(v.x, v.y), max(v.z, v.w)); }
+-        int sensorClippedPhaseCount(ivec2 p) {
++        float referenceSecondHighestSignal(ivec2 p) {
+             ivec2 q = (clampRaw(p) / 2) * 2;
+-            float clipCode = uWhiteLevel - 0.5;
+-            int count = 0;
+-            for (int phase = 0; phase < 4; ++phase)
+-                count += rawAt(uReferenceRaw, q + phaseOffset(phase)) >= clipCode ? 1 : 0;
+-            return count;
+-        }
+-        float referenceSecondHighest(ivec2 p) {
+-            ivec2 q = (clampRaw(p) / 2) * 2;
+-            float first = 0.0; float second = 0.0;
+-            for (int phase = 0; phase < 4; ++phase) {
+-                float signal = normalizedAt(
+-                    uReferenceRaw, q + phaseOffset(phase), uReferenceBlackByPhase);
++            float first = 0.0;
++            float second = 0.0;
++            for (int y = 0; y < 2; ++y) for (int x = 0; x < 2; ++x) {
++                ivec2 s = q + ivec2(x, y);
++                float signal = normalizedRaw(
++                    rawAt(uReferenceRaw, s),
++                    blackAt(uReferenceBlackByPhase, phaseAt(s))
++                );
+                 if (signal >= first) { second = first; first = signal; }
+-                else if (signal > second) second = signal;
++                else if (signal > second) { second = signal; }
+             }
+             return second;
+         }
+-        bool shortQuadEvidence(ivec2 referenceQuad, vec2 flowRawPixels, out float shortSecondNormalized) {
+-            float first = 0.0; float second = 0.0;
+-            for (int phase = 0; phase < 4; ++phase) {
+-                ivec2 rp = referenceQuad + phaseOffset(phase);
+-                vec2 shortCenter = vec2(rp) + vec2(0.5) + flowRawPixels;
+-                vec4 support = samePhaseSupport(
+-                    uShortRaw, shortCenter, phase, uShortBlackByPhase);
+-                if (samePhasePeak(support) >= uShortHeadroomThreshold) return false;
+-                float signal = bilinearSamePhase(support, shortCenter, phase) * uExposureRatio;
+-                if (signal >= first) { second = first; first = signal; }
+-                else if (signal > second) second = signal;
++        bool shortNeighborhoodHasHeadroom(ivec2 p) {
++            for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) {
++                ivec2 s = clampRaw(p + ivec2(x, y));
++                float signal = normalizedRaw(
++                    rawAt(uShortRaw, s),
++                    blackAt(uShortBlackByPhase, phaseAt(s))
++                );
++                if (signal >= uShortHeadroomThreshold) return false;
+             }
+-            shortSecondNormalized = second;
+             return true;
+         }
+ 
+@@ -669,27 +618,24 @@ internal object GlesMgcRawSabreShaders {
+             vec2 referenceUv = gl_FragCoord.xy / vec2(uRawSize);
+             vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec4 flow = texture(uFlow, flowUv);
+-            vec2 flowRawPixels = flow.xy * vec2(uRawSize);
++            vec2 shortUv = clamp(referenceUv + flow.xy, vec2(0.0), vec2(1.0));
+             ivec2 referenceP = ivec2(gl_FragCoord.xy);
+-            ivec2 referenceQuad = (clampRaw(referenceP) / 2) * 2;
++            ivec2 shortP = clampRaw(ivec2(floor(shortUv * vec2(uRawSize))));
+ 
+             const float handoffStart = 0.90;
+-            float referenceSecond = referenceSecondHighest(referenceP);
+-            if (referenceSecond < handoffStart || flow.w > uFlowVariationPixelsThreshold) {
++            float referenceSecond = referenceSecondHighestSignal(referenceP);
++            if (referenceSecond < handoffStart || !shortNeighborhoodHasHeadroom(shortP)) {
+                 oMask = 0.0; return;
+             }
+-            float shortSecondNormalized = 0.0;
+-            if (!shortQuadEvidence(referenceQuad, flowRawPixels, shortSecondNormalized) ||
+-                shortSecondNormalized < handoffStart) {
+-                oMask = 0.0; return;
+-            }
+-
+-            bool actualSensorLoss = sensorClippedPhaseCount(referenceP) >= 2;
++            float shortWeight = texture(uShortWeight, referenceUv).r;
++            float unblocker = texture(uUnblocker, referenceUv).r;
+             float regionTrust = texture(uRegionTrust, referenceUv).r;
+-            if (!actualSensorLoss && regionTrust < 0.5) {
++            if (shortWeight < uShortWeightThreshold || flow.z > uFlowVariationThreshold ||
++                unblocker > uUnblockerThreshold || regionTrust < 0.5) {
+                 oMask = 0.0; return;
+             }
+ 
++            /* Region trust is a gate, never blend opacity. Sensor reliability owns the handoff. */
+             oMask = smoothstep(handoffStart, uReferenceNearClipThreshold, referenceSecond);
+         }
+     """.trimIndent()
+@@ -1449,19 +1395,11 @@ internal object GlesMgcRawSabreShaders {
+                 }
+             }
+             vec2 uvFlow = flowPixels / uFlowNormalizationSize;
+-            vec2 flowRangeBayerQuads = maximumFlow - minimumFlow;
+             vec2 normalizedRange =
+-                flowRangeBayerQuads /
++                (maximumFlow - minimumFlow) /
+                 max(uFlowNormalizationSize, vec2(1.0));
+             float localFlowVariation = length(normalizedRange);
+-            /* IRIS_26595_PURE_FLOW_GEOMETRY_METRIC
+-             * flowAt() is measured in Bayer-quad units. Preserve Sabre's normalized variation in z
+-             * unchanged for native rejection, and publish the same 3x3 range in RAW-pixel units
+-             * in previously-unused w. SHORT HDR uses w only as geometry; no photometric rejection
+-             * or unblocker state can poison it when NORMAL is clipped.
+-             */
+-            float localFlowVariationRawPixels = 2.0 * length(flowRangeBayerQuads);
+-            oFlow = vec4(uvFlow, localFlowVariation, localFlowVariationRawPixels);
++            oFlow = vec4(uvFlow, localFlowVariation, 0.0);
+         }
+     """.trimIndent()
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index a3d044ce90a03a4fddcae271f0f58feea104f6fd..0b16de03cc1df1e6ddc2333a5f4ed062a7199022 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -552,11 +552,10 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreDehomogenizeProgram = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreRgb16ToFloatProgram = 0
+-    private var sabreShortRegionSeedProgram26595 = 0
++    private var sabreShortRegionSeedProgram26594 = 0
+     private var sabreShortRegionPropagateProgram26594 = 0
+-    private var sabreShortRestoreMaskProgram26595 = 0
++    private var sabreShortRestoreMaskProgram26587 = 0
+     private var sabreShortRestoreMaskProbeProgram26590 = 0
+-    private var sabreShortMaskCountProgram26595 = 0
+     private var sabreShortRestoreRgba16fProgram26587 = 0
+     private var sabreRgbChromaPostprocessor: GlesIris26529SpatialRgbChromaPostprocessor? = null
+     private var sabreConvertAlignmentSparseProgram = 0
+@@ -2115,7 +2114,6 @@ internal class GlesMgcRawSpatialStacker(
+         var highlightShortAdmitted26587 = false
+         var highlightShortMaskGenerated26587 = false
+         var highlightShortAppliedToTrue2x26587 = false
+-        var highlightShortFullActivePixels26595: Int? = null
+         var returned = false
+         val originalThreadPriority = GlesGpuScheduler.lowerCurrentThreadPriority(SABRE_TAG)
+         val processStartNs = System.nanoTime()
+@@ -2462,10 +2460,12 @@ internal class GlesMgcRawSpatialStacker(
+                     val shortRegion26594 = createTexture(
+                         coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
+                     )
+-                    renderSabreShortRegionSeed26595(
++                    renderSabreShortRegionSeed26594(
+                         referenceRaw = referenceRaw,
+                         shortRaw = currentRaw,
+                         flow = flow,
++                        shortWeight = frameWeight,
++                        unblocker = unblocker,
+                         referenceCalibration = referenceCalibration,
+                         shortCalibration = nativeShortCalibration,
+                         exposureRatio = exposureScale,
+@@ -2496,32 +2496,27 @@ internal class GlesMgcRawSpatialStacker(
+                     highlightShortMask26587 = createTexture(
+                         width, height, GLES30.GL_R8, GLES30.GL_NEAREST,
+                     )
+-                    renderSabreShortRestoreMask26595(
++                    renderSabreShortRestoreMask26587(
+                         referenceRaw = referenceRaw,
+                         shortRaw = currentRaw,
+                         flow = flow,
++                        shortWeight = frameWeight,
++                        unblocker = unblocker,
+                         regionTrust = shortRegionTrust26594,
+                         referenceCalibration = referenceCalibration,
+                         shortCalibration = nativeShortCalibration,
+-                        exposureRatio = exposureScale,
+                         output = highlightShortMask26587,
+                     )
+                     val shortMaskProbe26590 = probeSabreShortRestoreMask26590(highlightShortMask26587)
+-                    highlightShortFullActivePixels26595 =
+-                        countSabreShortRestoreMaskFull26595(highlightShortMask26587)
+-                    val fullActiveText26595 = highlightShortFullActivePixels26595?.toString() ?: "UNAVAILABLE"
+                     val shortMaskEffectDetails26591 =
+                         "probe=${shortMaskProbe26590.width}x${shortMaskProbe26590.height} " +
+                             "active=${shortMaskProbe26590.activePixels}/${shortMaskProbe26590.totalPixels} " +
+                             "strong=${shortMaskProbe26590.strongPixels}/${shortMaskProbe26590.totalPixels} " +
+-                            "fullActive=$fullActiveText26595/${Math.multiplyExact(width, height)} " +
+                             "maxHandoffWeight=${shortMaskProbe26590.maxConfidence} " +
+                             "meanHandoffWeight=${shortMaskProbe26590.meanConfidence} " +
+                             "handoffStart=0.90 fullShortAt=0.98 shortHeadroomThreshold=0.90 " +
+-                            "boundaryRadiometry=subpixelSameCfaPhase regionFloor=0.70 boundaryCeiling=0.90 " +
++                            "boundaryRadiometry=true regionFloor=0.70 boundaryCeiling=0.90 " +
+                             "regionPropagation=8connected passes=$SHORT_REGION_PROPAGATION_PASSES_26594 " +
+-                            "actualSensorClipBypass=true clipPhasesMin=2 pureFlowGeometry=true " +
+-                            "flowVariationRawPxMax=2.0 sabrePhotometricGate=false unblockerGate=false " +
+                             "normalCoverageGate=false sameSabreFlow=true wholeRgb=true maskFilter=NEAREST"
+                     PLog.i(SABRE_TAG, "IRIS_26590_SHORT_MASK_EFFECT $shortMaskEffectDetails26591")
+                     /* IRIS_26591_SHORT_MASK_EFFECT_MOTIONTRACE
+@@ -2536,12 +2531,10 @@ internal class GlesMgcRawSpatialStacker(
+                     highlightShortMaskGenerated26587 = true
+                     PLog.i(
+                         SABRE_TAG,
+-                        "IRIS_26595_SHORT_REGION_AUXILIARY_READY exposureRatio=$exposureScale " +
+-                            "normalFrames=$normalFrameCount boundaryRadiometry=subpixelSameCfaPhase " +
++                        "IRIS_26594_SHORT_REGION_AUXILIARY_READY exposureRatio=$exposureScale " +
++                            "normalFrames=$normalFrameCount boundaryRadiometry=true " +
+                             "regionPropagationPasses=$SHORT_REGION_PROPAGATION_PASSES_26594 " +
+-                            "actualSensorClipBypass=true fullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                            "photometricWeightAuthority=false unblockerAuthority=false pureFlowGeometry=true " +
+-                            "normalCoverageAuthority=false normalAccumulator=false dng=false srEvidence=false " +
++                            "normalCoverageAuthority=false normalAccumulator=false dng=false sr=false " +
+                             "nativeExposureReconstruction=true wholeRgbMask=true",
+                     )
+                 } else {
+@@ -2861,9 +2854,7 @@ internal class GlesMgcRawSpatialStacker(
+                 val evidencePolicy = "dngRequested=$exportNormalStackedDng normalFrames=$normalFrameCount " +
+                     "retained=${reconstructionEvidence.size} jpegTop2PerPhase=${true2xFastPhaseSlots!=null} " +
+                     "maxEvidence=${if (true2xFastPhaseSlots!=null) TRUE2X_JPEG_MAX_EVIDENCE else reconstructionEvidence.size} " +
+-                    "shortEvidence=false shortNativeGuide=${highlightShortAdmitted26587} " +
+-                    "shortGuideFullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                    "shortGuideOwner=EXACT_NATIVE_RGBA16F_RESTORE"
++                    "shortEvidence=false shortNativeGuide=${highlightShortAdmitted26587}"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_EVIDENCE_POLICY $evidencePolicy")
+                 MotionTrace.processingState("IRIS_26576_SR_EVIDENCE", evidencePolicy)
+                 val rawResult=reconstructTrue2x(
+@@ -2915,11 +2906,8 @@ internal class GlesMgcRawSpatialStacker(
+                 highlightShortMask26587 = 0
+                 PLog.i(
+                     SABRE_TAG,
+-                    "IRIS_26595_SHORT_RESTORE_RESULT exposureRatio=$highlightShortExposureRatio26587 " +
+-                        "fullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                        "actualContribution=${(highlightShortFullActivePixels26595 ?: 0) > 0} " +
+-                        "domain=RGBA16F wholeRgb=true afterTrue2x=true " +
+-                        "true2xGuide=${enableSabreSuperRes} true2xDetailEvidenceShort=false",
++                    "IRIS_26587_SHORT_RESTORE_APPLIED exposureRatio=$highlightShortExposureRatio26587 " +
++                        "domain=RGBA16F wholeRgb=true afterTrue2x=true true2xGuide=${enableSabreSuperRes}",
+                 )
+             }
+             checkGlError("MGC Sabre Resolve/VGN color noise")
+@@ -4029,22 +4017,26 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun renderSabreShortRegionSeed26595(
++    private fun renderSabreShortRegionSeed26594(
+         referenceRaw: Int,
+         shortRaw: Int,
+         flow: SabreConvertedAlignment,
++        shortWeight: Int,
++        unblocker: Int,
+         referenceCalibration: FrameCalibration,
+         shortCalibration: FrameCalibration,
+         exposureRatio: Float,
+         outputSeed: Int,
+         outputRegion: Int,
+     ) {
+-        val program = sabreShortRegionSeedProgram26595
++        val program = sabreShortRegionSeedProgram26594
+         check(program != 0)
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uReferenceRaw", 0, referenceRaw)
+         bindTexture(program, "uShortRaw", 1, shortRaw)
+         bindTexture(program, "uFlow", 2, flow.texture)
++        bindTexture(program, "uShortWeight", 3, shortWeight)
++        bindTexture(program, "uUnblocker", 4, unblocker)
+         uniform2i(program, "uRawSize", width, height)
+         uniform2i(program, "uRegionSize", ceilDiv(ceilDiv(width, 2), 2), ceilDiv(ceilDiv(height, 2), 2))
+         uniformSabreFlowScaleOffset(program, flow)
+@@ -4055,8 +4047,10 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1f(program, "uRegionFloor", 0.70f)
+         uniform1f(program, "uBoundaryCeiling", 0.90f)
+         uniform1f(program, "uShortHeadroomThreshold", 0.90f)
+-        // One Bayer period in RAW-pixel space: pure geometry, not Sabre photometric rejection.
+-        uniform1f(program, "uFlowVariationPixelsThreshold", 2.0f)
++        val flowThreshold = MgcSabreRejectionTuning.flowVariationThresholds(ceilDiv(width, 2)).unblockerReduction
++        uniform1f(program, "uFlowVariationThreshold", flowThreshold)
++        uniform1f(program, "uShortWeightThreshold", 0.75f)
++        uniform1f(program, "uUnblockerThreshold", 0.10f)
+         uniform1f(program, "uConsistencyThreshold", 0.05f)
+         draw(
+             program,
+@@ -4084,32 +4078,37 @@ internal class GlesMgcRawSpatialStacker(
+         draw(program, regionWidth, regionHeight, intArrayOf(output))
+     }
+ 
+-    private fun renderSabreShortRestoreMask26595(
++    private fun renderSabreShortRestoreMask26587(
+         referenceRaw: Int,
+         shortRaw: Int,
+         flow: SabreConvertedAlignment,
++        shortWeight: Int,
++        unblocker: Int,
+         regionTrust: Int,
+         referenceCalibration: FrameCalibration,
+         shortCalibration: FrameCalibration,
+-        exposureRatio: Float,
+         output: Int,
+     ) {
+-        val program = sabreShortRestoreMaskProgram26595
++        val program = sabreShortRestoreMaskProgram26587
+         check(program != 0)
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uReferenceRaw", 0, referenceRaw)
+         bindTexture(program, "uShortRaw", 1, shortRaw)
+         bindTexture(program, "uFlow", 2, flow.texture)
+-        bindTexture(program, "uRegionTrust", 3, regionTrust)
++        bindTexture(program, "uShortWeight", 3, shortWeight)
++        bindTexture(program, "uUnblocker", 4, unblocker)
++        bindTexture(program, "uRegionTrust", 5, regionTrust)
+         uniform2i(program, "uRawSize", width, height)
+         uniformSabreFlowScaleOffset(program, flow)
+         uniform4fv(program, "uReferenceBlackByPhase", positionalBlackLevels26587(referenceCalibration))
+         uniform4fv(program, "uShortBlackByPhase", positionalBlackLevels26587(shortCalibration))
+         uniform1f(program, "uWhiteLevel", sensorWhiteLevel)
+-        uniform1f(program, "uExposureRatio", exposureRatio)
+         uniform1f(program, "uReferenceNearClipThreshold", 0.98f)
+         uniform1f(program, "uShortHeadroomThreshold", 0.90f)
+-        uniform1f(program, "uFlowVariationPixelsThreshold", 2.0f)
++        val flowThreshold = MgcSabreRejectionTuning.flowVariationThresholds(ceilDiv(width, 2)).unblockerReduction
++        uniform1f(program, "uFlowVariationThreshold", flowThreshold)
++        uniform1f(program, "uShortWeightThreshold", 0.75f)
++        uniform1f(program, "uUnblockerThreshold", 0.10f)
+         draw(program, width, height, intArrayOf(output))
+     }
+ 
+@@ -4123,72 +4122,6 @@ internal class GlesMgcRawSpatialStacker(
+         val meanConfidence: Float,
+     )
+ 
+-    /* IRIS_26595_FULL_MASK_CONTRIBUTION_PROOF
+-     * Permanent correctness telemetry: count the exact finalized full-resolution SHORT mask on GPU
+-     * and read back one uint only. This is the same mask consumed by RGBA16F restore and true-2x
+-     * native highlight guide; unlike the 64x48 probe it cannot miss thin or sparse active regions.
+-     */
+-    private fun countSabreShortRestoreMaskFull26595(mask: Int): Int? {
+-        val program = sabreShortMaskCountProgram26595
+-        if (program == 0) return null
+-        val ids = IntArray(1)
+-        GLES31.glGenBuffers(1, ids, 0)
+-        val buffer = ids[0]
+-        check(buffer != 0) { "26595 SHORT full-mask count glGenBuffers returned 0" }
+-        buffers += buffer
+-        var mapped = false
+-        try {
+-            val zero = ByteBuffer.allocateDirect(Int.SIZE_BYTES).order(ByteOrder.nativeOrder())
+-                .apply { putInt(0); rewind() }
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, buffer)
+-            GLES31.glBufferData(
+-                GLES31.GL_SHADER_STORAGE_BUFFER, Int.SIZE_BYTES, zero, GLES31.GL_STREAM_READ,
+-            )
+-            GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, buffer)
+-            GLES31.glUseProgram(program)
+-            GLES31.glActiveTexture(GLES31.GL_TEXTURE0)
+-            GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, mask)
+-            GLES31.glUniform1i(uniformLocation(program, "uMask"), 0)
+-            GLES31.glUniform2i(uniformLocation(program, "uSize"), width, height)
+-            GLES31.glDispatchCompute(
+-                GlesComputeWorkGroup.imageGroupCount(width),
+-                GlesComputeWorkGroup.imageGroupCount(height),
+-                1,
+-            )
+-            GLES31.glMemoryBarrier(
+-                GLES31.GL_SHADER_STORAGE_BARRIER_BIT or GLES31.GL_BUFFER_UPDATE_BARRIER_BIT,
+-            )
+-            GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 0)
+-            GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, 0)
+-            GLES31.glUseProgram(0)
+-            checkGlError("26595 SHORT full-mask count submit")
+-            GlesGpuCompletion.awaitSubmittedWork(
+-                label = "26595 SHORT full-mask count", checkGlError = ::checkGlError,
+-            )
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, buffer)
+-            val bb = GLES31.glMapBufferRange(
+-                GLES31.GL_SHADER_STORAGE_BUFFER, 0, Int.SIZE_BYTES, GLES31.GL_MAP_READ_BIT,
+-            ) as? ByteBuffer ?: error("Unable to map 26595 SHORT full-mask count")
+-            mapped = true
+-            val active = bb.order(ByteOrder.nativeOrder()).getInt(0)
+-            check(GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)) {
+-                "26595 SHORT full-mask count buffer invalid"
+-            }
+-            mapped = false
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+-            check(active in 0..Math.multiplyExact(width, height))
+-            return active
+-        } finally {
+-            if (mapped) {
+-                GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, buffer)
+-                GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)
+-            }
+-            GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 0)
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+-            if (buffers.remove(buffer)) GLES31.glDeleteBuffers(1, intArrayOf(buffer), 0)
+-        }
+-    }
+-
+     private fun probeSabreShortRestoreMask26590(mask: Int): ShortMaskProbe26590 {
+         val probeWidth = 64
+         val probeHeight = 48
+@@ -4511,33 +4444,22 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
+-        sabreShortRegionSeedProgram26595 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRegionSeed26595,
+-            "iris_26595_sabre_short_region_seed",
++        sabreShortRegionSeedProgram26594 = linkProgram(
++            GlesMgcRawSabreShaders.shortRegionSeed26594,
++            "iris_26594_sabre_short_region_seed",
+         )
+         sabreShortRegionPropagateProgram26594 = linkProgram(
+             GlesMgcRawSabreShaders.shortRegionPropagate26594,
+             "iris_26594_sabre_short_region_propagate",
+         )
+-        sabreShortRestoreMaskProgram26595 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRestoreMask26595,
+-            "iris_26595_sabre_short_restore_mask",
++        sabreShortRestoreMaskProgram26587 = linkProgram(
++            GlesMgcRawSabreShaders.shortRestoreMask26587,
++            "iris_26594_sabre_short_restore_mask",
+         )
+         sabreShortRestoreMaskProbeProgram26590 = linkProgram(
+             GlesMgcRawSabreShaders.shortRestoreMaskProbe26590,
+             "iris_26590_sabre_short_restore_mask_probe",
+         )
+-        if (supportsComputeReadback) {
+-            runCatching {
+-                sabreShortMaskCountProgram26595 = linkComputeProgram(
+-                    GlesMgcRawSpatialShaders.bentoCountHighlightMask,
+-                    "iris_26595_sabre_short_full_mask_count",
+-                )
+-            }.onFailure { error ->
+-                sabreShortMaskCountProgram26595 = 0
+-                PLog.w(SABRE_TAG, "26595 SHORT full-mask GPU count unavailable", error)
+-            }
+-        }
+         sabreShortRestoreRgba16fProgram26587 = linkProgram(
+             GlesMgcRawSabreShaders.shortRestoreRgba16f26587,
+             "iris_26587_sabre_short_restore_rgba16f",
+diff --git a/app/version.properties b/app/version.properties
+index c308722e7bbd5ab41de98e37e0c01816aa630807..60dfaf6415429c7637efdaa8c7c7b5d0fc6e5342 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726595
+-VERSION_BUILD=26595
++VERSION_NAME=0.9726594
++VERSION_BUILD=26594
