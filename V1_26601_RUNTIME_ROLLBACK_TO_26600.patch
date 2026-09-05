@@ -1,0 +1,754 @@
+diff --git a/app/src/main/assets/shaders/motionv2/display_exposure.glsl b/app/src/main/assets/shaders/motionv2/display_exposure.glsl
+index 93682532666518310376797465ae2b0b8ace4198..1a6a870eaf8ecae82a51e6d17cfd330c79bafeb5 100644
+--- a/app/src/main/assets/shaders/motionv2/display_exposure.glsl
++++ b/app/src/main/assets/shaders/motionv2/display_exposure.glsl
+@@ -3,14 +3,39 @@ precision mediump sampler2D;
+ 
+ uniform sampler2D InputBuffer;
+ uniform float displayGain;
++uniform float presentationLinearAnchor;
++uniform float presentationKnee;
++uniform int motionToneNormalization;
+ out vec3 Output;
+ 
+-/* IRIS_26516_SIGNED_PRESENTATION_EV_SCALAR
+- * This shader is a pure positive linear scalar. Source restoration normally uses >=1x, while
+- * viewfinder-matched presentation may legitimately be below 1x. No Camera2 authority lives here.
++/* IRIS_26599_SHARED_HDR_PRESENTATION_NORMALIZATION
++ * Motion keeps the solved display gain exactly through the linear body anchor, then smoothly
++ * reduces only the additional positive gain. A single scalar derived from max(luma, peak) scales
++ * whole RGB, so hue and neutrals are invariant. Night and non-positive Motion gains retain the
++ * exact successful-26598 scalar behavior. This node remains presentation-only: no Camera2 write.
+  */
++float irisGuide(vec3 c) {
++    float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
++    return max(y, max(c.r, max(c.g, c.b)));
++}
++float irisMappedGuide(float guide, float gain) {
++    float g = max(guide, 0.0);
++    float dg = max(gain, 1.0e-6);
++    if (motionToneNormalization == 0 || dg <= 1.0 || g <= presentationLinearAnchor)
++        return g * dg;
++    float x = g - presentationLinearAnchor;
++    float knee = max(presentationKnee, 1.0e-6);
++    return presentationLinearAnchor * dg + x
++        + (dg - 1.0) * knee * log(1.0 + x / knee);
++}
+ void main() {
+     ivec2 p = ivec2(gl_FragCoord.xy);
+     vec3 c = max(texelFetch(InputBuffer, p, 0).rgb, vec3(0.0));
+-    Output = c * max(displayGain, 1.0e-6);
++    float guide = irisGuide(c);
++    if (guide <= 1.0e-7) {
++        Output = c * max(displayGain, 1.0e-6);
++        return;
++    }
++    float mapped = irisMappedGuide(guide, displayGain);
++    Output = c * (mapped / guide);
+ }
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index a6e753a803ce2e848d52ce6f5404b69d062c5b34..9cc4fad1431ccd152acda770989beda28b1b2a8b 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -504,6 +504,7 @@ struct Params {
+     bool mirror=false;
+     bool motionHdrHandoff=false;
+     float residualZoom=1.f,displayGain=1.f,exposureEv=0.f,shadows=0.f,contrast=0.f,sceneWhite=1.f;
++    float presentationLinearAnchor=0.18f,presentationKnee=0.18f;
+     float sensorToProfile[9]{};
+     float profileToDisplay[9]{};
+ };
+@@ -531,13 +532,22 @@ inline bool adaptiveAppearance(const SourceRegion&s,const Params&p,int x,int y,V
+     if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+     float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+ }
++inline Vec3 iris26599PresentationNormalize(Vec3 c,const Params&p){
++    const float dg=std::max(p.displayGain,1.0e-6f);
++    if(!p.motionHdrHandoff||dg<=1.f)return mul(c,dg);
++    const float y=luma(c),g=std::max(y,peak(c));
++    if(g<=1.0e-7f||g<=p.presentationLinearAnchor)return mul(c,dg);
++    const float x=g-p.presentationLinearAnchor,k=std::max(p.presentationKnee,1.0e-6f);
++    const float mapped=p.presentationLinearAnchor*dg+x+(dg-1.f)*k*std::log(1.f+x/k);
++    return mul(c,mapped/g);
++}
+ inline Vec3 tone(Vec3 rgb,const Params&p){
+     rgb=mul(clampNonnegative(rgb),std::exp2(p.exposureEv));
+     if(std::fabs(p.shadows)>=0.0001f){float y=luma(rgb),mask=1.f-smoothstep(0.08f,0.55f,y),target=y;if(p.shadows<0.f)target=y+(-p.shadows)*0.08f*mask*(1.f-clampf(y,0.f,1.f));else target=y*(1.f-0.75f*p.shadows*mask);rgb=y<=1.0e-7f?Vec3{std::max(target,0.f),std::max(target,0.f),std::max(target,0.f)}:mul(clampNonnegative(rgb),std::max(target,0.f)/y);}
+     if(std::fabs(p.contrast)>=0.0001f){float y=luma(rgb);if(y>1.0e-7f){const float pivot=0.18f;float slope=1.f+0.25f*p.contrast;float target=pivot*std::exp2(std::log2(std::max(y/pivot,1.0e-6f))*slope);rgb=mul(clampNonnegative(rgb),std::max(target,0.f)/y);}}
+     return clampNonnegative(rgb);
+ }
+-inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;c=iris26599PresentationNormalize(c,p);*out=tone(c,p);return true;}
+ inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,Vec3*out){
+     x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAt(s,p,ix,iy,out);}
+@@ -582,7 +592,7 @@ inline bool adaptiveAppearanceCached(const ProfileRegion&s,const Params&p,int x,
+     if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+     float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+ }
+-inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;c=iris26599PresentationNormalize(c,p);*out=tone(c,p);return true;}
+ inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,float y,Vec3*out){
+     x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAtCached(s,p,ix,iy,out);}
+@@ -753,6 +763,8 @@ uniform int uBandH;
+ uniform int uGenerateGain;
+ uniform float uResidualZoom;
+ uniform float uDisplayGain;
++uniform float uPresentationLinearAnchor;
++uniform float uPresentationKnee;
+ uniform float uExposureEv;
+ uniform float uShadows;
+ uniform float uContrast;
+@@ -825,6 +837,15 @@ vec3 irisAdaptive(ivec2 p){
+     float g=clamp(min(requested,limitV),1.0,1.22);
+     return g<=1.000001?center:vec3(cy)+cc*g;
+ }
++vec3 irisPresentationNormalize(vec3 c){
++    float dg=max(uDisplayGain,1.0e-6);
++    if(uMotionHdrHandoff==0||dg<=1.0)return c*dg;
++    float y=irisLuma(c),g=max(y,irisPeak(c));
++    if(g<=1.0e-7||g<=uPresentationLinearAnchor)return c*dg;
++    float x=g-uPresentationLinearAnchor,k=max(uPresentationKnee,1.0e-6);
++    float mapped=uPresentationLinearAnchor*dg+x+(dg-1.0)*k*log(1.0+x/k);
++    return c*(mapped/g);
++}
+ vec3 irisTone(vec3 rgb){
+     rgb=irisClampNonnegative(rgb)*exp2(uExposureEv);
+     if(abs(uShadows)>=0.0001){
+@@ -844,7 +865,7 @@ vec3 irisTone(vec3 rgb){
+     }
+     return irisClampNonnegative(rgb);
+ }
+-vec3 irisPreRenderAt(ivec2 p){return irisTone(irisAdaptive(p)*max(uDisplayGain,1.0e-6));}
++vec3 irisPreRenderAt(ivec2 p){return irisTone(irisPresentationNormalize(irisAdaptive(p)));}
+ vec3 irisSamplePreRender(vec2 p){
+     p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
+     if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
+@@ -975,7 +996,7 @@ private:
+     static void set(std::string*r,const char*m){if(r)*r=m?m:"unknown";}
+     static void setGl(std::string*r,const char*stage,GLenum err){if(!r)return;char b[96];std::snprintf(b,sizeof(b),"%s_gl_error_0x%04x",stage?stage:"gl",(unsigned int)err);*r=b;}
+     void setParams(){
+-        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);
++        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uPresentationLinearAnchor"),params->presentationLinearAnchor);glUniform1f(loc("uPresentationKnee"),params->presentationKnee);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);
+         glUniform3f(loc("uSensorRow0"),params->sensorToProfile[0],params->sensorToProfile[1],params->sensorToProfile[2]);glUniform3f(loc("uSensorRow1"),params->sensorToProfile[3],params->sensorToProfile[4],params->sensorToProfile[5]);glUniform3f(loc("uSensorRow2"),params->sensorToProfile[6],params->sensorToProfile[7],params->sensorToProfile[8]);
+         glUniform3f(loc("uDisplayRow0"),params->profileToDisplay[0],params->profileToDisplay[1],params->profileToDisplay[2]);glUniform3f(loc("uDisplayRow1"),params->profileToDisplay[3],params->profileToDisplay[4],params->profileToDisplay[5]);glUniform3f(loc("uDisplayRow2"),params->profileToDisplay[6],params->profileToDisplay[7],params->profileToDisplay[8]);
+     }
+@@ -1063,12 +1084,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_particlesdevs_photoncamera_process
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative(
+         JNIEnv*e,jclass,jobject bitmap,jstring renderPath,jint trueW,jint trueH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,
+-        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat sceneWhite,jboolean motionHdrHandoff,jobject watermarkBitmap,
++        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat sceneWhite,jboolean motionHdrHandoff,jfloat presentationLinearAnchor,jfloat presentationKnee,jobject watermarkBitmap,
+         jfloatArray jinResidual,jintArray jinReference,jint jinW,jint jinH,jstring gainPath,jfloat gainMaxRatio,jfloat gainContentMaxRatio,jstring path,jint quality){
+     using namespace iris26564render;gIris26576PublicationTelemetry="backend=UNSET callStarted=true";AndroidBitmapInfo info{};if(!bitmap||!renderPath||!path||trueW<=0||trueH<=0||rawW<=0||rawH<=0||cropW<=0||cropH<=0||trueW!=rawW*2||trueH!=rawH*2||cropW>rawW||cropH>rawH||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888){iris26576SetPublicationTelemetry("backend=NONE validationFailed=true");return JNI_FALSE;}
+     int expectedNativeW=(rotation==90||rotation==270)?cropH:rawW,expectedNativeH=(rotation==90||rotation==270)?rawW:cropH;if((int)info.width!=expectedNativeW||(int)info.height!=expectedNativeH)return JNI_FALSE;
+-    Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
+-    if(!sensorToProfile||!profileToDisplay||e->GetArrayLength(sensorToProfile)!=9||e->GetArrayLength(profileToDisplay)!=9)return JNI_FALSE;e->GetFloatArrayRegion(sensorToProfile,0,9,p.sensorToProfile);e->GetFloatArrayRegion(profileToDisplay,0,9,p.profileToDisplay);if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.sensorToProfile)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.profileToDisplay)if(!std::isfinite(v))return JNI_FALSE;if(!std::isfinite(p.displayGain)||p.displayGain<=0.f||!std::isfinite(p.exposureEv)||!std::isfinite(p.shadows)||!std::isfinite(p.contrast)||!std::isfinite(p.residualZoom)||!std::isfinite(p.sceneWhite)||p.sceneWhite<=0.f)return JNI_FALSE;
++    Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.presentationLinearAnchor=presentationLinearAnchor;p.presentationKnee=presentationKnee;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
++    if(!sensorToProfile||!profileToDisplay||e->GetArrayLength(sensorToProfile)!=9||e->GetArrayLength(profileToDisplay)!=9)return JNI_FALSE;e->GetFloatArrayRegion(sensorToProfile,0,9,p.sensorToProfile);e->GetFloatArrayRegion(profileToDisplay,0,9,p.profileToDisplay);if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.sensorToProfile)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.profileToDisplay)if(!std::isfinite(v))return JNI_FALSE;if(!std::isfinite(p.displayGain)||p.displayGain<=0.f||!std::isfinite(p.exposureEv)||!std::isfinite(p.shadows)||!std::isfinite(p.contrast)||!std::isfinite(p.residualZoom)||!std::isfinite(p.sceneWhite)||p.sceneWhite<=0.f||!std::isfinite(p.presentationLinearAnchor)||p.presentationLinearAnchor<=0.f||!std::isfinite(p.presentationKnee)||p.presentationKnee<=0.f)return JNI_FALSE;
+     U rp(e,renderPath),gp(e,gainPath),op(e,path);if(!rp.c||!op.c)return JNI_FALSE;const bool generateGain=gp.c!=nullptr;if(generateGain&&(!std::isfinite((float)gainMaxRatio)||gainMaxRatio<=1.f||!std::isfinite((float)gainContentMaxRatio)||gainContentMaxRatio<1.f))return JNI_FALSE;const float gainContentMax=generateGain?clampf((float)gainContentMaxRatio,1.f,(float)gainMaxRatio):1.f;int sourceFd=open(rp.c,O_RDONLY);if(sourceFd<0)return JNI_FALSE;struct stat st{};uint64_t expected=(uint64_t)trueW*(uint64_t)trueH*6ull;if(fstat(sourceFd,&st)!=0||(uint64_t)st.st_size!=expected){close(sourceFd);return JNI_FALSE;}
+     Watermark water{};if(watermarkBitmap){AndroidBitmapInfo wi{};if(AndroidBitmap_getInfo(e,watermarkBitmap,&wi)!=ANDROID_BITMAP_RESULT_SUCCESS||wi.format!=ANDROID_BITMAP_FORMAT_RGBA_8888||wi.width==0||wi.height==0){close(sourceFd);return JNI_FALSE;}void*wp=nullptr;if(AndroidBitmap_lockPixels(e,watermarkBitmap,&wp)!=ANDROID_BITMAP_RESULT_SUCCESS||!wp){close(sourceFd);return JNI_FALSE;}water.w=(int)wi.width;water.h=(int)wi.height;water.rgba.resize((size_t)water.w*water.h*4);for(int y=0;y<water.h;y++)std::memcpy(water.rgba.data()+(size_t)y*water.w*4,(const uint8_t*)wp+(size_t)y*wi.stride,(size_t)water.w*4);AndroidBitmap_unlockPixels(e,watermarkBitmap);}
+     Jin jin{};if(jinResidual||jinReference||jinW||jinH){if(!jinResidual||!jinReference||jinW<=1||jinH<=1||e->GetArrayLength(jinResidual)!=(jsize)((jlong)jinW*jinH*3)||e->GetArrayLength(jinReference)!=(jsize)((jlong)jinW*jinH)){close(sourceFd);return JNI_FALSE;}jin.w=jinW;jin.h=jinH;jin.residual.resize((size_t)jinW*jinH*3);jin.guide.resize((size_t)jinW*jinH);e->GetFloatArrayRegion(jinResidual,0,(jsize)jin.residual.size(),jin.residual.data());e->GetIntArrayRegion(jinReference,0,(jsize)jin.guide.size(),jin.guide.data());if(e->ExceptionCheck()){close(sourceFd);return JNI_FALSE;}for(float v:jin.residual)if(!std::isfinite(v)){close(sourceFd);return JNI_FALSE;}const auto&p3=displayP3Lut();jin.guideP3.resize((size_t)jinW*jinH*3);for(int i=0;i<jinW*jinH;i++){jint argb=jin.guide[(size_t)i];float sr=(float)((argb>>16)&255)/255.f,sg=(float)((argb>>8)&255)/255.f,sb=(float)(argb&255)/255.f;auto baseP3=p3.convertEncoded(sr,sg,sb);auto outP3=p3.convertEncoded(clampf(sr+jin.residual[(size_t)i*3],0.f,1.f),clampf(sg+jin.residual[(size_t)i*3+1],0.f,1.f),clampf(sb+jin.residual[(size_t)i*3+2],0.f,1.f));for(int c=0;c<3;c++){jin.guideP3[(size_t)i*3+c]=baseP3[(size_t)c];jin.residual[(size_t)i*3+c]=outP3[(size_t)c]-baseP3[(size_t)c];}}}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index e3b72fd8bf809c912a9c6bc8a7409405908294c2..881b4b3d6c236160a18676ead9f3a04cc3edffc9 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -1144,38 +1144,6 @@ internal object GlesMgcRawSabreShaders {
+      * Sabre trust gates pass: exact NORMAL below the handoff, exact SHORT at >=0.98, one RGB scalar
+      * throughout the transition. Alpha stays NORMAL-owned.
+      */
+-    /* IRIS_26601_SHORT_COMMON_SABRE_VGN_OWNERSHIP
+-     * The 26600 device fix proved SHORT geometry, but late post-VGN RGB compositing exposed
+-     * independently reconstructed CFA/color edges at bright material boundaries. SHORT now enters
+-     * the same homogeneous Sabre accumulator domain as NORMAL/LONG before dehomogenize/Resolve/VGN.
+-     * uShortMask remains the exact 26600 fail-closed evidence authority. This is a binary evidence
+-     * ownership switch, never an RGB alpha blend: all three homogeneous color/weight channels move
+-     * together, while temporal coverage/noise and DNG remain NORMAL/LONG-owned elsewhere.
+-     */
+-    val shortAccumulatorOwnership26601 = """
+-        #version 300 es
+-        precision highp float;
+-        uniform sampler2D uNormalColorAndRWeight;
+-        uniform sampler2D uNormalWeightsGb;
+-        uniform sampler2D uShortColorAndRWeight;
+-        uniform sampler2D uShortWeightsGb;
+-        uniform sampler2D uShortMask;
+-        layout(location = 0) out vec4 oColorAndRWeight;
+-        layout(location = 1) out vec2 oWeightsGb;
+-        void main() {
+-            ivec2 p = ivec2(gl_FragCoord.xy);
+-            vec4 normalColor = texelFetch(uNormalColorAndRWeight, p, 0);
+-            vec2 normalGb = texelFetch(uNormalWeightsGb, p, 0).rg;
+-            vec4 shortColor = texelFetch(uShortColorAndRWeight, p, 0);
+-            vec2 shortGb = texelFetch(uShortWeightsGb, p, 0).rg;
+-            float evidence = texelFetch(uShortMask, p, 0).r;
+-            float minimumShortWeight = min(shortColor.a, min(shortGb.r, shortGb.g));
+-            float shortOwner = (evidence > 0.0 && minimumShortWeight > 1.0e-7) ? 1.0 : 0.0;
+-            oColorAndRWeight = mix(normalColor, shortColor, shortOwner);
+-            oWeightsGb = mix(normalGb, shortGb, shortOwner);
+-        }
+-    """.trimIndent()
+-
+     val shortRestoreRgba16f26587 = """
+         #version 300 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index cda77f96b4262eb81c573b2a167733d451f6f935..55267fc631dc842aa5caff4a0d05347e34b9daaf 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -558,8 +558,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreShortRestoreMaskProgram26595 = 0
+     private var sabreShortRestoreMaskProbeProgram26590 = 0
+     private var sabreShortMaskCountProgram26595 = 0
+-    private var sabreShortAccumulatorOwnershipProgram26601 = 0
+-    /* 26587 late post-VGN RGB restore program intentionally retired from the active 26601 path. */
+     private var sabreShortRestoreRgba16fProgram26587 = 0
+     private var sabreRgbChromaPostprocessor: GlesIris26529SpatialRgbChromaPostprocessor? = null
+     private var sabreConvertAlignmentSparseProgram = 0
+@@ -2068,8 +2066,7 @@ internal class GlesMgcRawSpatialStacker(
+             SABRE_TAG,
+             "IRIS_26587_SABRE_ROLE_CONTRACT normal=$normalFrameCount shadowLong=$shadowLongFrameCount " +
+                 "highlightShort=$highlightShortFrameCount scheduled=${frames.size} merged=$mergedFrameCount " +
+-                "referenceRole=NORMAL shortCommonSabrePreResolve=true shortTemporalSupport=false " +
+-                "shortDng=false shortSrDetail=false",
++                "referenceRole=NORMAL shortNormalAccumulator=false shortDng=false shortSr=false",
+         )
+         if (shadowLongFrameCount > 0) {
+             PLog.i(
+@@ -2113,8 +2110,7 @@ internal class GlesMgcRawSpatialStacker(
+         val true2xFastPhaseSlots: Array<True2xFrameEvidence?>? =
+             if (enableSabreSuperRes && !exportNormalStackedDng) arrayOfNulls(TRUE2X_JPEG_MAX_EVIDENCE) else null
+         var exportedTexture = 0
+-        var highlightShortAccumulatedColor26601 = 0
+-        var highlightShortAccumulatedWeightsGb26601 = 0
++        var highlightShortTexture26587 = 0
+         var highlightShortMask26587 = 0
+         var highlightShortExposureRatio26587 = 1f
+         var highlightShortAdmitted26587 = false
+@@ -2435,44 +2431,24 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+                 renderDilation(reverseWeight, frameWeight)
+                 if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT) {
+-                    /* IRIS_26601_SHORT_COMMON_SABRE_PRE_RESOLVE
+-                     * Alignment/rejection remains the exact exposure-normalized 26600 geometry.
+-                     * Build one private SHORT homogeneous Sabre observation in NORMAL reference
+-                     * exposure using the same flow/covariance/RBF estimator. It does not alter
+-                     * NORMAL/LONG temporal support, noise, DNG, or SR-detail evidence. The exact
+-                     * 26600 mask below is the only spatial ownership authority; accepted SHORT
+-                     * evidence is switched into the common accumulator only after those accounting
+-                     * owners are finalized and before the single Resolve/VGN reconstruction.
++                    /* IRIS_26587_SHORT_REFERENCE_DOMAIN_ALIGNMENT_NATIVE_RECONSTRUCTION
++                     * Alignment/rejection above used exposure-normalized calibration. SHORT is never
++                     * added to NORMAL coverage/color/weight accumulators. Reconstruct it separately
++                     * at native exposure with the same flow/covariance geometry, then create one
++                     * fail-closed whole-RGB mask while the exact RAW/alignment evidence is resident.
+                      */
+                     require(index == frames.lastIndex) {
+-                        "26601 HIGHLIGHT_SHORT must be scheduled after all NORMAL/LONG evidence"
++                        "26587 HIGHLIGHT_SHORT must be scheduled after all NORMAL/LONG evidence"
+                     }
+                     val nativeShortCalibration = calibrationForFrame(frame, 1f, kernelTuning)
+                     highlightShortExposureRatio26587 = exposureScale
+-                    highlightShortAccumulatedColor26601 = createTexture(
+-                        width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+-                    )
+-                    highlightShortAccumulatedWeightsGb26601 = createTexture(
+-                        width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST,
+-                    )
+-                    clearRgbAccumulators(
+-                        highlightShortAccumulatedColor26601,
+-                        highlightShortAccumulatedWeightsGb26601,
+-                        width,
+-                        height,
+-                    )
+-                    renderSabreMerge(
++                    highlightShortTexture26587 = resolveSabreShortNativeExposure26587(
+                         extracted = currentExtracted,
+                         flow = flow,
+                         covariance = currentCovariance,
+-                        weight = identityWeight,
+-                        calibration = calibration,
+-                        accumulatedColor = highlightShortAccumulatedColor26601,
+-                        accumulatedWeightsGb = highlightShortAccumulatedWeightsGb26601,
+-                        extractedWidth = extractedWidth,
+-                        extractedHeight = extractedHeight,
+-                        useFrameWeight = false,
+-                        shadowLongSourceClipGuard = false,
++                        calibration = nativeShortCalibration,
++                        identityWeight = identityWeight,
++                        resolveParameters = sabreResolveParameters,
+                     )
+                     /* IRIS_26600_BOUNDARY_CONSENSUS_SHORT_HANDOFF
+                      * 26599 device telemetry proved the old max-range flow gate rejected every
+@@ -2568,8 +2544,8 @@ internal class GlesMgcRawSpatialStacker(
+                             "boundaryGeometryPasses=${shortBoundaryGeometry26600.passes} " +
+                             "actualSensorClipBypass=true fullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+                             "photometricWeightAuthority=false unblockerAuthority=false robustBoundaryGeometry=true " +
+-                            "normalCoverageAuthority=false commonSabrePreResolve=true temporalSupport=false " +
+-                            "dng=false srDetailEvidence=false referenceExposureReconstruction=true wholeRgbMask=true",
++                            "normalCoverageAuthority=false normalAccumulator=false dng=false srEvidence=false " +
++                            "nativeExposureReconstruction=true wholeRgbMask=true",
+                     )
+                 } else {
+                     if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
+@@ -2658,18 +2634,14 @@ internal class GlesMgcRawSpatialStacker(
+                         "durationRobustness=$durationRobustness submit=${elapsedMs(frameStartNs)}ms",
+                 )
+                 if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT && highlightShortAdmitted26587) {
+-                    /* IRIS_26601_SHORT_TRANSIENT_LIFETIME
+-                     * Preserve only the private homogeneous SHORT observation and exact 26600
+-                     * evidence mask beyond this frame. All RAW/alignment/rejection temporaries keep
+-                     * the proven per-frame cleanup boundary.
++                    /* IRIS_26587_SHORT_TRANSIENT_LIFETIME
++                     * Preserve only the native SHORT RGBA16F carrier and scalar restore mask beyond
++                     * this frame. All alignment/rejection/raw temporaries still follow the exact
++                     * 26586 per-frame cleanup boundary.
+                      */
+                     releaseTexturesFromExcept(
+                         transientTextureStart,
+-                        intArrayOf(
+-                            highlightShortAccumulatedColor26601,
+-                            highlightShortAccumulatedWeightsGb26601,
+-                            highlightShortMask26587,
+-                        ),
++                        intArrayOf(highlightShortTexture26587, highlightShortMask26587),
+                     )
+                 } else {
+                     releaseTexturesFrom(transientTextureStart)
+@@ -2743,59 +2715,9 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+             }
+ 
+-            /* IRIS_26601_SHORT_SINGLE_RECONSTRUCTION_AUTHORITY
+-             * NORMAL/LONG support/noise/DNG accounting above is now frozen. If SHORT has proven
+-             * evidence, switch its exposure-normalized homogeneous Sabre observation into a new
+-             * resolve accumulator at those exact 26600 mask pixels. This is the last evidence
+-             * boundary: there is no post-VGN NORMAL/SHORT RGB compositing in 26601.
+-             */
+-            var resolveAccumulatedColor26601 = accumulatedColor
+-            var resolveAccumulatedWeightsGb26601 = accumulatedWeightsGb
+-            if (highlightShortAdmitted26587) {
+-                require(
+-                    highlightShortAccumulatedColor26601 != 0 &&
+-                        highlightShortAccumulatedWeightsGb26601 != 0 &&
+-                        highlightShortMask26587 != 0
+-                ) { "26601 SHORT common Sabre evidence is incomplete" }
+-                resolveAccumulatedColor26601 = createTexture(
+-                    width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+-                )
+-                resolveAccumulatedWeightsGb26601 = createTexture(
+-                    width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST,
+-                )
+-                renderSabreShortAccumulatorOwnership26601(
+-                    normalColorAndRWeight = accumulatedColor,
+-                    normalWeightsGb = accumulatedWeightsGb,
+-                    shortColorAndRWeight = highlightShortAccumulatedColor26601,
+-                    shortWeightsGb = highlightShortAccumulatedWeightsGb26601,
+-                    shortMask = highlightShortMask26587,
+-                    outputColorAndRWeight = resolveAccumulatedColor26601,
+-                    outputWeightsGb = resolveAccumulatedWeightsGb26601,
+-                )
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedColor26601,
+-                    "26601 SHORT homogeneous color/weight evidence",
+-                )
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedWeightsGb26601,
+-                    "26601 SHORT homogeneous Gb weight evidence",
+-                )
+-                releaseOwnedTexture(highlightShortMask26587, "26601 SHORT evidence mask")
+-                highlightShortAccumulatedColor26601 = 0
+-                highlightShortAccumulatedWeightsGb26601 = 0
+-                highlightShortMask26587 = 0
+-                PLog.i(
+-                    SABRE_TAG,
+-                    "IRIS_26601_SHORT_COMMON_SABRE_OWNERSHIP " +
+-                        "fullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                        "domain=homogeneousReferenceExposure hardEvidenceSwitch=true " +
+-                        "sharedResolve=true sharedVgn=true lateRgbBlend=false " +
+-                        "temporalSupportOwner=NORMAL_LONG dngOwner=NORMAL srDetailOwner=NORMAL",
+-                )
+-            }
+             renderSabreDehomogenize(
+-                resolveAccumulatedColor26601,
+-                resolveAccumulatedWeightsGb26601,
++                accumulatedColor,
++                accumulatedWeightsGb,
+                 accumulatedCoverage,
+                 alphaScale = accumulatedWeightScale / mergedFrameCount.toFloat(),
+                 alphaBias = 1f / mergedFrameCount.toFloat(),
+@@ -2803,7 +2725,7 @@ internal class GlesMgcRawSpatialStacker(
+             // The original merge shaders write normalized, white-balanced half floats. The
+             // Resolve AOT accepts those RGBA16F bit patterns directly; rawScale applies only to
+             // the black/white scalar parameters below.
+-            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveAccumulatedColor26601)
++            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(accumulatedColor)
+             sabreResolvedRgb = checkNotNull(
+                 LargeDirectBuffer.allocate(
+                     width.toLong() * height * 3L * Short.SIZE_BYTES,
+@@ -2916,25 +2838,39 @@ internal class GlesMgcRawSpatialStacker(
+                     }
+                 }
+             }
+-            /* IRIS_26601_SHARED_NATIVE_HDR_AUTHORITY
+-             * Resolve/VGN above already consumed the accepted SHORT evidence in the common Sabre
+-             * domain. Native 1x and true-2x therefore share this one reconstructed RGB guide; there
+-             * is no independently reconstructed SHORT RGB texture and no post-VGN exposure blend.
++            /* IRIS_26587_SHARED_NATIVE_HIGHLIGHT_AUTHORITY
++             * Build one restored native Sabre/VGN RGB authority after NORMAL fusion/VGN. True-2x
++             * still reconstructs geometry/detail from NORMAL CFA evidence only; this restored native
++             * RGB is consumed only at the existing post-reconstruction color/detail-guide boundary.
++             * The exact same texture becomes the native 1x output after SR has finished.
+              */
+-            val nativeHdrAuthority26601 = exportedTexture
++            val nativeHighlightAuthority26587 = if (highlightShortAdmitted26587) {
++                require(highlightShortTexture26587 != 0 && highlightShortMask26587 != 0)
++                createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST).also { restored ->
++                    renderSabreShortRestoreRgba16f26587(
++                        normalRgb = exportedTexture,
++                        shortRgb = highlightShortTexture26587,
++                        mask = highlightShortMask26587,
++                        exposureRatio = highlightShortExposureRatio26587,
++                        output = restored,
++                    )
++                }
++            } else {
++                exportedTexture
++            }
+             if (enableSabreSuperRes) {
+                 val reconstructionStartNs=System.nanoTime()
+                 val reconstructionEvidence=true2xFastPhaseSlots?.filterNotNull()?:true2xEvidence
+                 val evidencePolicy = "dngRequested=$exportNormalStackedDng normalFrames=$normalFrameCount " +
+                     "retained=${reconstructionEvidence.size} jpegTop2PerPhase=${true2xFastPhaseSlots!=null} " +
+                     "maxEvidence=${if (true2xFastPhaseSlots!=null) TRUE2X_JPEG_MAX_EVIDENCE else reconstructionEvidence.size} " +
+-                    "shortEvidence=false shortUnifiedGuide=${highlightShortAdmitted26587} " +
++                    "shortEvidence=false shortNativeGuide=${highlightShortAdmitted26587} " +
+                     "shortGuideFullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                    "shortGuideOwner=COMMON_SABRE_PRE_RESOLVE_VGN srDetailOwner=NORMAL_ONLY"
++                    "shortGuideOwner=EXACT_NATIVE_RGBA16F_RESTORE"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_EVIDENCE_POLICY $evidencePolicy")
+                 MotionTrace.processingState("IRIS_26576_SR_EVIDENCE", evidencePolicy)
+                 val rawResult=reconstructTrue2x(
+-                    frames, images, reconstructionEvidence, nativeHdrAuthority26601, exportNormalStackedDng,
++                    frames, images, reconstructionEvidence, nativeHighlightAuthority26587, exportNormalStackedDng,
+                 )
+                 require(rawResult.width==superResWidth&&rawResult.height==superResHeight)
+                 val expectedTrueBytes=rawResult.width.toLong()*rawResult.height*TRUE2X_RGB16F_BYTES_PER_PIXEL
+@@ -2965,18 +2901,27 @@ internal class GlesMgcRawSpatialStacker(
+                 MotionTrace.processingState("IRIS_26576_SR_RECONSTRUCTION_SUMMARY", readyDetails)
+                 cleanupTrue2xEvidence(true2xFastPhaseSlots?.filterNotNull()?:true2xEvidence); true2xEvidence.clear(); true2xFastPhaseSlots?.fill(null)
+             }
+-            /* IRIS_26601_POST_SR_SHARED_HDR_PUBLICATION
+-             * 1x is already the single common Sabre/Resolve/VGN reconstruction. True-2x consumed
+-             * that same RGB only as its low-frequency HDR/color guide while direct high-frequency
+-             * evidence remained NORMAL-only. Nothing is composited or republished after SR.
++            /* IRIS_26587_POST_SR_RGBA16F_SHORT_PUBLICATION
++             * SR has now completed all NORMAL-only CFA/detail decisions using the restored native
++             * color/highlight guide only at its existing guide boundary. Publish that exact same
++             * restored RGB as the native 1x carrier, then retire the private SHORT evidence.
+              */
+             if (highlightShortAdmitted26587) {
++                require(nativeHighlightAuthority26587 != exportedTexture)
++                GLES30.glDeleteTextures(1, intArrayOf(exportedTexture), 0)
++                exportedTexture = nativeHighlightAuthority26587
++                check(textures.remove(exportedTexture)) { "26587 restored RGBA16F texture is not owned" }
++                textureSpecs.remove(exportedTexture)
++                releaseOwnedTexture(highlightShortTexture26587, "26587 native SHORT RGBA16F")
++                releaseOwnedTexture(highlightShortMask26587, "26587 whole-RGB SHORT mask")
++                highlightShortTexture26587 = 0
++                highlightShortMask26587 = 0
+                 PLog.i(
+                     SABRE_TAG,
+-                    "IRIS_26601_SHORT_RESTORE_RESULT exposureRatio=$highlightShortExposureRatio26587 " +
++                    "IRIS_26596_SHORT_RESTORE_RESULT exposureRatio=$highlightShortExposureRatio26587 " +
+                         "fullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+                         "actualContribution=${(highlightShortFullActivePixels26595 ?: 0) > 0} " +
+-                        "domain=COMMON_SABRE_PRE_RESOLVE_VGN wholeRgbEvidence=true lateRgbBlend=false " +
++                        "domain=RGBA16F wholeRgb=true afterTrue2x=true " +
+                         "true2xGuide=${enableSabreSuperRes} true2xDetailEvidenceShort=false",
+                 )
+             }
+@@ -3050,22 +2995,12 @@ internal class GlesMgcRawSpatialStacker(
+             null
+         } finally {
+             images.forEach { it.close() }
+-            if (highlightShortAccumulatedColor26601 != 0) {
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedColor26601,
+-                    "26601 failed SHORT homogeneous color/weight evidence",
+-                )
+-                highlightShortAccumulatedColor26601 = 0
+-            }
+-            if (highlightShortAccumulatedWeightsGb26601 != 0) {
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedWeightsGb26601,
+-                    "26601 failed SHORT homogeneous Gb weight evidence",
+-                )
+-                highlightShortAccumulatedWeightsGb26601 = 0
++            if (highlightShortTexture26587 != 0) {
++                releaseOwnedTexture(highlightShortTexture26587, "26587 failed SHORT RGBA16F")
++                highlightShortTexture26587 = 0
+             }
+             if (highlightShortMask26587 != 0) {
+-                releaseOwnedTexture(highlightShortMask26587, "26601 failed SHORT evidence mask")
++                releaseOwnedTexture(highlightShortMask26587, "26587 failed SHORT mask")
+                 highlightShortMask26587 = 0
+             }
+             release()
+@@ -4422,31 +4357,6 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun renderSabreShortAccumulatorOwnership26601(
+-        normalColorAndRWeight: Int,
+-        normalWeightsGb: Int,
+-        shortColorAndRWeight: Int,
+-        shortWeightsGb: Int,
+-        shortMask: Int,
+-        outputColorAndRWeight: Int,
+-        outputWeightsGb: Int,
+-    ) {
+-        val program = sabreShortAccumulatorOwnershipProgram26601
+-        check(program != 0) { "26601 SHORT common Sabre owner program is unavailable" }
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uNormalColorAndRWeight", 0, normalColorAndRWeight)
+-        bindTexture(program, "uNormalWeightsGb", 1, normalWeightsGb)
+-        bindTexture(program, "uShortColorAndRWeight", 2, shortColorAndRWeight)
+-        bindTexture(program, "uShortWeightsGb", 3, shortWeightsGb)
+-        bindTexture(program, "uShortMask", 4, shortMask)
+-        draw(
+-            program,
+-            width,
+-            height,
+-            intArrayOf(outputColorAndRWeight, outputWeightsGb),
+-        )
+-    }
+-
+     private fun renderSabreShortRestoreRgba16f26587(
+         normalRgb: Int,
+         shortRgb: Int,
+@@ -4761,16 +4671,10 @@ internal class GlesMgcRawSpatialStacker(
+                 PLog.w(SABRE_TAG, "26595 SHORT full-mask GPU count unavailable", error)
+             }
+         }
+-        sabreShortAccumulatorOwnershipProgram26601 = linkProgram(
+-            GlesMgcRawSabreShaders.shortAccumulatorOwnership26601,
+-            "iris_26601_sabre_short_accumulator_ownership",
++        sabreShortRestoreRgba16fProgram26587 = linkProgram(
++            GlesMgcRawSabreShaders.shortRestoreRgba16f26587,
++            "iris_26587_sabre_short_restore_rgba16f",
+         )
+-        /* IRIS_26601_LATE_RGB_SHORT_OWNER_RETIRED
+-         * Keep the old helper source for rollback provenance, but do not link it. Any accidental
+-         * call to renderSabreShortRestoreRgba16f26587 therefore fails rather than silently reviving
+-         * the post-VGN two-RGB authority.
+-         */
+-        sabreShortRestoreRgba16fProgram26587 = 0
+         /* IRIS_26564_TRUE_2X_NO_FAKE_SR_OWNER
+          * Do not eagerly link the 26561/26562 native-RGB-upscale/detail shaders. The true-2x GPU
+          * shaders are linked lazily inside the accelerator attempt so shader/driver failure can
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+index 10c49b1a32fec0d2f5ac59453ed1a01a0926c093..08f0bb44574fb657b523f0b1b4ca65b310f8eb91 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+@@ -10,6 +10,22 @@ import com.particlesdevs.photoncamera.util.Log;
+  * MotionV2MgcSourceExposure instead. Sabre has no such source-domain pass.
+  */
+ public final class MotionV2DisplayExposure extends Node {
++    public static final float PRESENTATION_LINEAR_ANCHOR_26599 = 0.18f;
++    public static final float PRESENTATION_KNEE_26599 = 0.18f;
++
++    /** Shared scalar guide map mirrored by 1x GLSL and true-2x CPU/GPU publication. */
++    public static float iris26599MapPresentationGuide(float guide, float displayGain,
++                                                       boolean motionToneNormalization) {
++        final float g = Math.max(guide, 0.0f);
++        final float gain = Math.max(displayGain, 1.0e-6f);
++        if (!motionToneNormalization || gain <= 1.0f || g <= PRESENTATION_LINEAR_ANCHOR_26599) {
++            return g * gain;
++        }
++        final float x = g - PRESENTATION_LINEAR_ANCHOR_26599;
++        return PRESENTATION_LINEAR_ANCHOR_26599 * gain + x
++                + (gain - 1.0f) * PRESENTATION_KNEE_26599
++                * (float)Math.log(1.0f + x / PRESENTATION_KNEE_26599);
++    }
+     public MotionV2DisplayExposure() {
+         super("", "MotionV2DisplayExposure");
+     }
+@@ -22,6 +38,8 @@ public final class MotionV2DisplayExposure extends Node {
+             throw new IllegalStateException("MotionV2DisplayExposure used outside Motion V2");
+         }
+         float displayGain = basePipeline.mParameters.motionV2DisplayGain;
++        final boolean motionToneNormalization = basePipeline.mParameters.motionV2Active
++                && !basePipeline.mParameters.irisNightActive;
+         if (!Float.isFinite(displayGain) || displayGain <= 0.0f) {
+             throw new IllegalStateException("Invalid viewfinder presentation gain: " + displayGain);
+         }
+@@ -37,6 +55,9 @@ public final class MotionV2DisplayExposure extends Node {
+         glProg.useAssetProgram("motionv2/display_exposure");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+         glProg.setVar("displayGain", displayGain);
++        glProg.setVar("presentationLinearAnchor", PRESENTATION_LINEAR_ANCHOR_26599);
++        glProg.setVar("presentationKnee", PRESENTATION_KNEE_26599);
++        glProg.setVar("motionToneNormalization", motionToneNormalization ? 1 : 0);
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
+@@ -49,6 +70,10 @@ public final class MotionV2DisplayExposure extends Node {
+                 + " extremeLift=" + (displayGain >= 4.0f)
+                 + " headroomOwner=MotionV2RenderCommonRgbScalar"
+                 + " duplicateHeadroomLimiter=false"
++                + " motionToneNormalization=" + motionToneNormalization
++                + " presentationAnchor=" + PRESENTATION_LINEAR_ANCHOR_26599
++                + " presentationKnee=" + PRESENTATION_KNEE_26599
++                + " wholeRgbScalar=true perChannelTone=false"
+                 + " camera2Write=false");
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 816f1220841d0d595ba80551cc01d64d66b8ece5..77a64d0f9d578746e369cdf27309db21c242cbeb 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -154,10 +154,13 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             }
+ 
+             targetLog = medianLogLuma(previewLuma);
+-            error0 = exposureError(candidate, 0.0f, targetLog);
+-            errorMinus = exposureError(candidate, -0.5f, targetLog);
+-            errorPlus = exposureError(candidate, 0.5f, targetLog);
+-            rawSolvedEv = solveBounded(candidate, targetLog, error0, errorMinus, errorPlus);
++            final boolean motionToneNormalization26599 = !iris26550Night;
++            error0 = exposureError(candidate, 0.0f, targetLog, motionToneNormalization26599);
++            errorMinus = exposureError(candidate, -0.5f, targetLog, motionToneNormalization26599);
++            errorPlus = exposureError(candidate, 0.5f, targetLog, motionToneNormalization26599);
++            rawSolvedEv = solveBounded(
++                    candidate, targetLog, error0, errorMinus, errorPlus,
++                    motionToneNormalization26599);
+             if (iris26550Night) {
+                 float targetLinearLuma = (float)Math.pow(2.0, targetLog);
+                 float daylightness = smoothstep(NIGHT_DARK_LUMA, NIGHT_FULL_MATCH_LUMA, targetLinearLuma);
+@@ -416,7 +419,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             }
+             ToneDecision iris26586MeterTone = iris26586ViewfinderMeterToneDecision(1.0f);
+             all.sort(Comparator.comparingDouble(s ->
+-                    presentedLuma(s, 1.0f, iris26586MeterTone.adaptiveSceneWhite)));
++                    presentedLuma(s, 1.0f, iris26586MeterTone.adaptiveSceneWhite, false)));
+             int from = Math.max(0, Math.round((all.size() - 1) * 0.25f));
+             int to = Math.min(all.size(), Math.max(from + 1,
+                     Math.round((all.size() - 1) * 0.50f) + 1));
+@@ -444,29 +447,33 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         return medianSorted(logs);
+     }
+ 
+-    private float exposureError(ArrayList<RgbSample> samples, float ev, float targetLog) {
++    private float exposureError(ArrayList<RgbSample> samples, float ev, float targetLog,
++                                boolean motionToneNormalization26599) {
+         float gain = (float)Math.pow(2.0, ev);
+         ToneDecision tone = iris26586ViewfinderMeterToneDecision(gain);
+         ArrayList<Float> logs = new ArrayList<>(samples.size());
+         for (RgbSample sample : samples) {
+-            logs.add(log2(Math.max(presentedLuma(sample, gain, tone.adaptiveSceneWhite), 1.0e-5f)));
++            logs.add(log2(Math.max(presentedLuma(
++                    sample, gain, tone.adaptiveSceneWhite, motionToneNormalization26599), 1.0e-5f)));
+         }
+         Collections.sort(logs);
+         return medianSorted(logs) - targetLog;
+     }
+ 
+     private float solveBounded(ArrayList<RgbSample> samples, float targetLog,
+-                                      float e0, float eMinus, float ePlus) {
++                                      float e0, float eMinus, float ePlus,
++                                      boolean motionToneNormalization26599) {
+         float slope = ePlus - eMinus;
+         float guess = Math.abs(slope) > 1.0e-4f
+                 ? clamp(-e0 / slope, MIN_EV, MAX_EV)
+                 : 0.0f;
+         float bestEv = guess;
+-        float bestErr = Math.abs(exposureError(samples, guess, targetLog));
++        float bestErr = Math.abs(exposureError(
++                samples, guess, targetLog, motionToneNormalization26599));
+ 
+         float lo = MIN_EV, hi = MAX_EV;
+-        float flo = exposureError(samples, lo, targetLog);
+-        float fhi = exposureError(samples, hi, targetLog);
++        float flo = exposureError(samples, lo, targetLog, motionToneNormalization26599);
++        float fhi = exposureError(samples, hi, targetLog, motionToneNormalization26599);
+         if (Math.signum(flo) == Math.signum(fhi)) {
+             if (Math.abs(flo) < bestErr) { bestErr = Math.abs(flo); bestEv = lo; }
+             if (Math.abs(fhi) < bestErr) bestEv = hi;
+@@ -480,7 +487,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     : 0.5f * (lo + hi);
+             float guard = 0.12f * (hi - lo);
+             x = clamp(x, lo + guard, hi - guard);
+-            float fx = exposureError(samples, x, targetLog);
++            float fx = exposureError(samples, x, targetLog, motionToneNormalization26599);
+             if (Math.abs(fx) < bestErr) { bestErr = Math.abs(fx); bestEv = x; }
+             if (Math.abs(fx) < 0.01f) break;
+             if (Math.signum(fx) == Math.signum(flo)) { lo = x; flo = fx; }
+@@ -809,10 +816,22 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+      * neutral-to-white and overflow-to-white solver approximations were stale and were not
+      * present in the final renderer.
+      */
+-    private static float presentedLuma(RgbSample sample, float gain, float sceneWhite) {
+-        float r = Math.max(0.0f, sample.r * gain);
+-        float g = Math.max(0.0f, sample.g * gain);
+-        float b = Math.max(0.0f, sample.b * gain);
++    private static float presentedLuma(RgbSample sample, float gain, float sceneWhite,
++                                       boolean motionToneNormalization26599) {
++        float r = Math.max(0.0f, sample.r);
++        float g = Math.max(0.0f, sample.g);
++        float b = Math.max(0.0f, sample.b);
++        float sourceY = luma(r, g, b);
++        float sourcePeak = Math.max(r, Math.max(g, b));
++        float sourceGuide = Math.max(sourceY, sourcePeak);
++        float presentationScale = gain;
++        if (sourceGuide > 1.0e-7f) {
++            presentationScale = MotionV2DisplayExposure.iris26599MapPresentationGuide(
++                    sourceGuide, gain, motionToneNormalization26599) / sourceGuide;
++        }
++        r *= presentationScale;
++        g *= presentationScale;
++        b *= presentationScale;
+         float y = luma(r, g, b);
+         float peak = Math.max(r, Math.max(g, b));
+         float guide = Math.max(y, peak);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index 4d388227d631ebc25da6e79ef3c6070d8f5ad586..e28cee1e466b68a1f67108f20c09a37686dc9758 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -1,5 +1,7 @@
+ package com.particlesdevs.photoncamera.processing.ultrahdr;
+ 
++import com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionV2DisplayExposure;
++
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
+ import android.graphics.ColorSpace;
+@@ -163,6 +165,8 @@ public final class MotionV2Jpeg444Encoder {
+                     sensorToProPhoto, profileToDisplay,
+                     parameters.motionV2DisplayGain, exposureEv, shadows, contrast,
+                     publicationSceneWhite, parameters.motionV2Active,
++                    MotionV2DisplayExposure.PRESENTATION_LINEAR_ANCHOR_26599,
++                    MotionV2DisplayExposure.PRESENTATION_KNEE_26599,
+                     watermark,
+                     useJin ? jinResidual.residual : null,
+                     useJin ? jinResidual.referenceRgb : null,
+@@ -312,6 +316,7 @@ public final class MotionV2Jpeg444Encoder {
+             int rotation, boolean mirror, float renderResidualZoom,
+             float[] sensorToProPhoto, float[] proPhotoToSrgb, float displayGain,
+             float exposureEv, float shadows, float contrast, float sceneWhite, boolean motionHdrHandoff,
++            float presentationLinearAnchor, float presentationKnee,
+             Bitmap watermark,
+             float[] jinResidual, int[] jinReferenceRgb, int jinWidth, int jinHeight,
+             String true2xGainmapPath, float true2xGainmapMaxRatio,
+diff --git a/app/version.properties b/app/version.properties
+index d73232e51bc570a0d0ae7ea4688f78e3d75d49b8..391e7c7fa8527d17d5335088cae543a365ea1546 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726601
+-VERSION_BUILD=26601
++VERSION_NAME=0.9726600
++VERSION_BUILD=26600
