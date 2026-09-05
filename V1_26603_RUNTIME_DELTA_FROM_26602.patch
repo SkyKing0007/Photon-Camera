@@ -1,0 +1,1072 @@
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 5c14bd972a27fa42dcf8a05336dff9c1e7b4cd89..a6dd5f0d024d558310b5f66427a8d8d10358fa4f 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -6,7 +6,7 @@ uniform float sceneWhite;
+ uniform float outputExposureScale;
+ uniform float irisOutputZoom;
+ uniform int iris26592MotionHdrHandoff;
+-uniform float iris26602MotionMasterToneStart;
++uniform float iris26603MotionSdrKnee;
+ /* IRIS_26524_FULLSIZE_MOTION_ZOOM_RENDER */
+ out vec3 Output;
+ 
+@@ -95,63 +95,31 @@ vec3 iris26524BilinearInput(vec2 sourcePixel) {
+ }
+ 
+ float mapHeadroomLuminance(float y) {
+-    /* IRIS_26602_UHDR_MASTER_SDR_PARITY
+-     * Motion's UHDR target is the extended-linear pre-tone rendition at the same 0.80
+-     * presentation scale. Preserve that master rendition exactly through guide=1.0, so
+-     * SDR and UHDR have identical blacks/body/midtones/color/contrast. Only luminance that
+-     * actually needs HDR headroom enters the shoulder. Night retains its exact 0.50 start.
++    /* IRIS_26603_MASTER_FAITHFUL_SDR_PROJECTION
++     * Motion works in the final SDR display domain for the knee decision. 26602 began the shoulder
++     * at guide=1.0 before the preserved 0.80 output scale, i.e. at only 0.80 SDR output. 26603 keeps
++     * the UHDR/master signal byte-for-byte linear through 0.98 final SDR output, then uses a C1
++     * rational soft knee. The derivative at the knee is exactly 1, the mapping is strictly
++     * monotonic for every finite input, and it asymptotically approaches SDR white without a hard
++     * endpoint clamp. Hue/channel ratios remain one scalar. Night keeps its exact 26602 mapping.
+      */
+-    float start=iris26592MotionHdrHandoff!=0 ? iris26602MotionMasterToneStart : 0.50;
+-    if(y<=start) return y;
+-
+-    float whitePoint=max(sceneWhite,start+0.05);
+-
+-    /*
+-     * If there is little physical headroom, sensor white maps close to display
+-     * white. If Motion preserved several times display-white energy, spread it
+-     * across the remaining SDR range instead of crushing it into 0.93-1.00.
+-     */
+-    float u=max((y-start)/max(whitePoint-start,1.0e-6),0.0);
+-
+-    /* IRIS_26592_UNBOUNDED_MONOTONIC_HIGHLIGHT_TAIL
+-     * Motion: sceneWhite is a scale, not an endpoint. No finite valid recovered value is clamped
+-     * into the same tone coordinate as a brighter value. The nested log+tanh function is strictly
+-     * monotonic and asymptotically approaches display white. Night keeps exact successful-26591.
+-     */
+-    const float logShape=3.0;
+-    float shaped;
+     if(iris26592MotionHdrHandoff!=0) {
+-        /* IRIS_26597_BODY_ANCHORED_UNIVERSAL_HIGHLIGHT_RESERVE
+-         * Preserve the exact 26596 body exposure and tone start. 26596 used a concave
+-         * log+tanh allocation inside the recoverable highlight interval, spending too much
+-         * display range on its lower half and making bright roads/ground/foliage wash toward
+-         * white even when the source still contained structure. Allocate 0..sceneWhite
+-         * headroom linearly instead. At u=1 retain the exact 26596 scene-white output anchor
+-         * (tanh(1.2020679)), then continue with a C1-matched rational tail so values beyond
+-         * scene white remain strictly ordered and true speculars may still approach white.
+-         * Nothing at or below start changes. No scene/category threshold is introduced.
+-         */
+-        /* IRIS_26597_V1_1_ESSL_CONSTANT_INITIALIZER_FIX
+-         * ESSL 3.20 const initializers cannot call tanh()/max(). These literals are the IEEE-754
+-         * float results of the unchanged V1 equations, so the highlight mapping is unchanged.
+-         */
+-        const float sceneAnchor=0.834284246;
+-        const float tailSlope=5.03442907;
+-        if(u<=1.0) {
+-            shaped=sceneAnchor*max(u,0.0);
+-        } else {
+-            shaped=1.0-(1.0-sceneAnchor)/(1.0+tailSlope*(u-1.0));
+-        }
+-    } else {
+-        float x=clamp(u,0.0,1.0);
+-        shaped=log(1.0+logShape*x)/log(1.0+logShape);
++        float scale=max(outputExposureScale,1.0e-6);
++        float displayGuide=y*scale;
++        float knee=clamp(iris26603MotionSdrKnee,0.50,0.98);
++        if(displayGuide<=knee) return y;
++        float reserve=max(1.0-knee,1.0e-6);
++        float excess=max(displayGuide-knee,0.0);
++        float mappedDisplay=knee+reserve*excess/(excess+reserve);
++        return mappedDisplay/scale;
+     }
+ 
+-    /* IRIS_26501_WHITE_TARGET_AFTER_EXISTING_OUTPUT_EXPOSURE
+-     * The previous 1.0 pre-scale ceiling became only 0.80 after the proven output
+-     * exposure, structurally preventing clean white clipping. Map to the inverse
+-     * of that existing scale so the final SDR endpoint can actually reach 1.0.
+-     */
++    float start=0.50;
++    if(y<=start) return y;
++    float whitePoint=max(sceneWhite,start+0.05);
++    float u=max((y-start)/max(whitePoint-start,1.0e-6),0.0);
++    float x=clamp(u,0.0,1.0);
++    float shaped=log(1.0+6.0*x)/log(7.0);
+     float preScaleDisplayWhite=1.0/max(outputExposureScale,1.0e-6);
+     return start+(preScaleDisplayWhite-start)*shaped;
+ }
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index bbde744627a553c84ec5aa02bec85fb82bedc77a..8c30fec2d3d746a189fa5ada629e32cd01dd59b9 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -593,14 +593,18 @@ inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,f
+ 
+ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p){
+     rgb=clampNonnegative(rgb);float y=std::max(luma(rgb),0.f),pk=peak(rgb),guide=std::max(y,pk);
+-    /* IRIS_26602_UHDR_MASTER_SDR_PARITY_TRUE2X_CPU: Motion preserves the exact UHDR master
+-     * rendition through guide=1.0; Night retains the successful 0.50 shoulder start. */
+-    const float start=p.motionHdrHandoff?1.0f:0.50f;
+-    if(guide>1.0e-7f&&guide>start){
+-        float white=std::max(p.sceneWhite,start+0.05f);float u=std::max((guide-start)/std::max(white-start,1.0e-6f),0.f);float shaped;
+-        if(p.motionHdrHandoff){/* IRIS_26597_BODY_ANCHORED_UNIVERSAL_HIGHLIGHT_RESERVE */const float a=std::tanh(1.2020679f);const float k=a/std::max(1.f-a,1.0e-6f);shaped=u<=1.f?a*std::max(u,0.f):1.f-(1.f-a)/(1.f+k*(u-1.f));}
+-        else {float x=clampf(u,0.f,1.f);shaped=std::log(1.f+6.f*x)/std::log(7.f);}
+-        float mapped=start+(1.25f-start)*shaped;rgb=mul(rgb,mapped/guide);
++    /* IRIS_26603_MASTER_FAITHFUL_SDR_TRUE2X_CPU */
++    if(p.motionHdrHandoff){
++        constexpr float scale=0.80f,knee=0.98f,reserve=0.02f;
++        float displayGuide=guide*scale;
++        if(guide>1.0e-7f&&displayGuide>knee){
++            float excess=displayGuide-knee;
++            float mappedDisplay=knee+reserve*excess/(excess+reserve);
++            rgb=mul(rgb,(mappedDisplay/scale)/guide);
++        }
++    }else{
++        const float start=0.50f;
++        if(guide>1.0e-7f&&guide>start){float white=std::max(p.sceneWhite,start+0.05f);float u=std::max((guide-start)/std::max(white-start,1.0e-6f),0.f);float x=clampf(u,0.f,1.f);float shaped=std::log(1.f+6.f*x)/std::log(7.f);float mapped=start+(1.25f-start)*shaped;rgb=mul(rgb,mapped/guide);}
+     }
+     rgb=mul(rgb,0.80f);float pk2=peak(rgb);if(pk2>1.f)rgb=mul(rgb,1.f/std::max(pk2,1.0e-6f));return clampNonnegative(rgb);
+ }
+@@ -876,16 +880,18 @@ vec2 irisOutputToSource(ivec2 op){
+ vec3 irisHeadroom(vec3 rgb){
+     rgb=irisClampNonnegative(rgb);
+     float y=max(irisLuma(rgb),0.0),pk=irisPeak(rgb),guide=max(y,pk);
+-    /* IRIS_26602_UHDR_MASTER_SDR_PARITY_TRUE2X_GPU */
+-    float start=uMotionHdrHandoff!=0?1.0:0.50;
+-    if(guide>1.0e-7&&guide>start){
+-        float white=max(uSceneWhite,start+0.05);
+-        float u=max((guide-start)/max(white-start,1.0e-6),0.0);
+-        float shaped;
+-        if(uMotionHdrHandoff!=0){/* IRIS_26597_BODY_ANCHORED_UNIVERSAL_HIGHLIGHT_RESERVE */float a=tanh(1.2020679);float k=a/max(1.0-a,1.0e-6);shaped=u<=1.0?a*max(u,0.0):1.0-(1.0-a)/(1.0+k*(u-1.0));}
+-        else {float x=clamp(u,0.0,1.0);shaped=log(1.0+6.0*x)/log(7.0);}
+-        float mapped=start+(1.25-start)*shaped;
+-        rgb*=mapped/guide;
++    /* IRIS_26603_MASTER_FAITHFUL_SDR_TRUE2X_GPU */
++    if(uMotionHdrHandoff!=0){
++        const float scale=0.80,knee=0.98,reserve=0.02;
++        float displayGuide=guide*scale;
++        if(guide>1.0e-7&&displayGuide>knee){
++            float excess=displayGuide-knee;
++            float mappedDisplay=knee+reserve*excess/(excess+reserve);
++            rgb*=(mappedDisplay/scale)/guide;
++        }
++    }else{
++        float start=0.50;
++        if(guide>1.0e-7&&guide>start){float white=max(uSceneWhite,start+0.05);float u=max((guide-start)/max(white-start,1.0e-6),0.0);float x=clamp(u,0.0,1.0);float shaped=log(1.0+6.0*x)/log(7.0);float mapped=start+(1.25-start)*shaped;rgb*=mapped/guide;}
+     }
+     rgb*=0.80;
+     float pk2=irisPeak(rgb);if(pk2>1.0)rgb*=1.0/max(pk2,1.0e-6);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 80596f807f276a5bbc53bc52447233ae426ee133..0794e531034aaaaed690f6b301e502f27aad0ed1 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -276,7 +276,17 @@ internal object GlesMgcRawSabreShaders {
+         uniform sampler2D uFlow;
+         uniform sampler2D uUnblocker;
+         uniform sampler2D uNoiseEstimates;
++        /* IRIS_26603_ONE_TUNNEL_BRACKET_REJECTION
++         * The same Sabre rejection shader remains authoritative. When a real SHORT is present,
++         * source-domain clipping can invalidate the reference photometric comparison without
++         * creating a second SHORT mask/owner. These raw-quad inputs only override the photometric
++         * term where NORMAL is genuinely clipped, SHORT/alternate evidence is not clipped, and
++         * the already-computed Sabre flow field is locally coherent (<=2 RAW px variation).
++         */
++        uniform sampler2D uBaseExtractedBayer;
++        uniform sampler2D uAltExtractedBayer;
+         uniform ivec2 uGuideSize;
++        uniform ivec2 uExtractedSize;
+         uniform ivec2 uRejectionSize;
+         uniform vec4 uFrameBorderPadded;
+         uniform vec4 uFlowScaleOffset;
+@@ -287,6 +297,8 @@ internal object GlesMgcRawSabreShaders {
+         uniform float uExtraMotionRobustnessBoost;
+         uniform float uMotionRobustnessBoostVarianceThreshold;
+         uniform float uExtraMotionRobustnessMotionThreshold;
++        uniform float uSourceClippingPoint;
++        uniform int uBracketAwareClipping;
+         layout(location = 0) out float oReverseWeight;
+         layout(location = 1) out float oPixelDifference;
+ 
+@@ -306,6 +318,13 @@ internal object GlesMgcRawSabreShaders {
+             return sampleUv;
+         }
+ 
++        float max4(vec4 v) { return max(max(v.r,v.g),max(v.b,v.a)); }
++
++        bool sourceQuadClipped(sampler2D image, vec2 uv) {
++            ivec2 p=clamp(ivec2(floor(uv*vec2(uExtractedSize))),ivec2(0),uExtractedSize-ivec2(1));
++            return max4(texelFetch(image,p,0)) >= uSourceClippingPoint;
++        }
++
+         vec4 sampleBiquadraticAbsolute(sampler2D image, vec2 uv) {
+             vec2 fractionalOffset = fract(uv * vec2(uGuideSize));
+             vec2 c = fractionalOffset * fractionalOffset - fractionalOffset + 0.5;
+@@ -385,6 +404,17 @@ internal object GlesMgcRawSabreShaders {
+             float pixelDifference = exp2(min(-pixelDistance, 0.0));
+             distance *= robustnessBoost;
+             float frameWeight = exp2(min(-distance, 0.0));
++            if (uBracketAwareClipping != 0) {
++                bool referenceClipped=sourceQuadClipped(uBaseExtractedBayer,referenceUv);
++                bool currentClipped=sourceQuadClipped(uAltExtractedBayer,warpedUv);
++                if (currentClipped) {
++                    frameWeight=0.0;
++                } else if (referenceClipped) {
++                    /* Whole-quad bracket bypass: only the photometric comparison is unavailable.
++                     * Unblocker/motion rejection remains downstream via min(1-unblocker,...). */
++                    frameWeight=flow.z <= 2.0 ? 1.0 : 0.0;
++                }
++            }
+             float weight = min(1.0 - unblocker, frameWeight);
+             oReverseWeight = 1.0 - weight;
+             oPixelDifference = pixelDifference;
+@@ -1344,6 +1374,15 @@ internal object GlesMgcRawSabreShaders {
+         uniform vec4 uFrameBorderPadded;
+         uniform int uCfaPattern;
+         uniform int uUseFrameWeight;
++        /* IRIS_26603_ONE_TUNNEL_SOURCE_CLIPPING
++         * Every bracket observation, including the reference, reaches this same RBF accumulator.
++         * Source clipping is one scalar for the complete consumed 3x3 CFA footprint, so no Bayer
++         * phase or RGB channel can become an independent bracket owner. The reference may retain a
++         * tiny deterministic fallback weight only when all useful bracket evidence is exhausted.
++         */
++        uniform int uSourceClipGuard;
++        uniform float uSourceClippingPoint;
++        uniform float uSourceClippedWeight;
+         uniform vec4 uGains;
+         uniform vec4 uBlackLevelsTimesGains;
+         uniform vec4 uCovRangeRg;
+@@ -1375,11 +1414,11 @@ internal object GlesMgcRawSabreShaders {
+             return exp2(-0.5 * kernelDistance) + 0.00005;
+         }
+ 
+-        vec3 unpackCovariance(vec3 packed) {
++        vec3 unpackCovariance(vec3 packedCovariance) {
+             return vec3(
+-                packed.x * uCovRangeRg.y + uCovRangeRg.x,
+-                packed.y * uCovRangeRg.w + uCovRangeRg.z,
+-                packed.z * uCovRangeB.y + uCovRangeB.x
++                packedCovariance.x * uCovRangeRg.y + uCovRangeRg.x,
++                packedCovariance.y * uCovRangeRg.w + uCovRangeRg.z,
++                packedCovariance.z * uCovRangeB.y + uCovRangeB.x
+             );
+         }
+ 
+@@ -1436,13 +1475,23 @@ internal object GlesMgcRawSabreShaders {
+             vec2 sampleUv,
+             vec3 covariance,
+             out vec3 accumulatedIntensities,
+-            out vec3 accumulatedWeights
++            out vec3 accumulatedWeights,
++            out float sourceNeighborhoodClipped
+         ) {
+             accumulatedIntensities = vec3(0.0);
+             accumulatedWeights = vec3(0.0);
++            sourceNeighborhoodClipped = 0.0;
+             vec2 coordinateScaled = sampleUv * (vec2(uExtractedSize) * 2.0);
+             ivec2 position = ivec2(coordinateScaled);
+             mat3 bayerValue = get3x3FromExtractedBayer(position);
++            for (int sx=0;sx<3;++sx) {
++                for (int sy=0;sy<3;++sy) {
++                    sourceNeighborhoodClipped=max(
++                        sourceNeighborhoodClipped,
++                        step(uSourceClippingPoint,bayerValue[sx][sy])
++                    );
++                }
++            }
+             mat3 weights = mat3(0.0);
+             vec2 subpixelOffset = floor(coordinateScaled) + 0.5 - coordinateScaled;
+             for (int i = -1; i <= 1; ++i) {
+@@ -1507,15 +1556,20 @@ internal object GlesMgcRawSabreShaders {
+             vec3 covariance = unpackCovariance(texture(uCovariance, sampleUv).xyz);
+             vec3 accumulatedColor = vec3(0.0);
+             vec3 accumulatedWeight = vec3(0.0);
++            float sourceNeighborhoodClipped = 0.0;
+             sampleNeighborhoodRbf(
+                 sampleUv,
+                 covariance,
+                 accumulatedColor,
+-                accumulatedWeight
++                accumulatedWeight,
++                sourceNeighborhoodClipped
+             );
+             float frameWeight = uUseFrameWeight != 0
+                 ? texture(uRejection, referenceUv).r
+                 : 1.0;
++            if (uSourceClipGuard != 0 && sourceNeighborhoodClipped > 0.5) {
++                frameWeight *= uSourceClippedWeight;
++            }
+             accumulatedColor *= frameWeight;
+             accumulatedWeight *= frameWeight;
+             oColorAndRWeight = vec4(accumulatedColor, accumulatedWeight.r);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index e96c9558cf38b17774002676ad01f17184276556..35fa7c2499f8fec6ac004deeb291b39e45b29e21 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2072,8 +2072,9 @@ internal class GlesMgcRawSpatialStacker(
+             SABRE_TAG,
+             "IRIS_26587_SABRE_ROLE_CONTRACT normal=$normalFrameCount shadowLong=$shadowLongFrameCount " +
+                 "highlightShort=$highlightShortFrameCount scheduled=${frames.size} merged=$mergedFrameCount " +
+-                "referenceRole=NORMAL shortCommonSabrePreResolve=true shortTemporalAccumulation=false " +
+-                "shortProtection=NORMAL_SABRE_BOUNDARY_PROPAGATED shortDng=false shortSrDetail=false",
++                "referenceRole=NORMAL oneTunnelRbf=true shortTemporalAccumulation=true " +
++                "shortProtection=COMMON_SABRE_REJECTION_SOURCE_CLIP shortPrivateMean=false " +
++                "shortDng=false shortSrDetail=false",
+         )
+         if (shadowLongFrameCount > 0) {
+             PLog.i(
+@@ -2124,17 +2125,16 @@ internal class GlesMgcRawSpatialStacker(
+         val true2xFastPhaseSlots: Array<True2xFrameEvidence?>? =
+             if (enableSabreSuperRes && !exportNormalStackedDng) arrayOfNulls(TRUE2X_JPEG_MAX_EVIDENCE) else null
+         var exportedTexture = 0
+-        var highlightShortAccumulatedColor26601 = 0
+-        var highlightShortAccumulatedWeightsGb26601 = 0
+-        var highlightShortMask26587 = 0
++        /* IRIS_26603_ONE_TUNNEL_SHORT_TELEMETRY
++         * No private SHORT texture, mask, mean or accumulator survives. These legacy-named booleans
++         * remain only for the existing bridge contract: "maskGenerated" now means the common Sabre
++         * scalar rejection/source-clipping validity field was generated for the admitted SHORT.
++         */
+         var highlightShortExposureRatio26587 = 1f
+         var highlightShortAdmitted26587 = false
+         var highlightShortMaskGenerated26587 = false
+         var highlightShortAppliedToTrue2x26587 = false
+         var highlightShortFullActivePixels26595: Int? = null
+-        var highlightShortCandidatePixels26602: Int? = null
+-        var highlightShortProtectionSeedCells26602 = 0
+-        var highlightShortProtectionFinalCells26602 = 0
+         var returned = false
+         val originalThreadPriority = GlesGpuScheduler.lowerCurrentThreadPriority(SABRE_TAG)
+         val processStartNs = System.nanoTime()
+@@ -2227,16 +2227,6 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_R8,
+                 GLES30.GL_LINEAR,
+             )
+-            /* IRIS_26602_SHORT_NORMAL_ONLY_PROTECTION_COVERAGE
+-             * SHORT must be validated by NORMAL temporal support only. LONG is protected HDR
+-             * evidence but cannot bootstrap the SHORT highlight owner. This map uses the exact
+-             * NORMAL Sabre dilated frame weights and never feeds DNG/SR accounting.
+-             */
+-            val shortNormalProtectionCoverage26602 = if (highlightShortFrameCount > 0) {
+-                createTexture(coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_LINEAR)
+-            } else {
+-                0
+-            }
+             /* IRIS_26545_SABRE_NORMALIZED16_DNG
+              * Keep only signal+weight for the RAW sidecar. It uses the exact Sabre flow,
+              * covariance and temporal rejection but never ResolveSabre, WB/color transform,
+@@ -2252,7 +2242,9 @@ internal class GlesMgcRawSpatialStacker(
+              * the shared measured RGB coverage + measured average merge factor. Only bracketed Night
+              * allocates a second NORMAL-only coverage map so Long support can never leak into DNG.
+              */
+-            val normalDngCoverage = if (exportNormalStackedDng && shadowLongFrameCount > 0) {
++            val normalDngCoverage = if (
++                exportNormalStackedDng && (shadowLongFrameCount > 0 || highlightShortFrameCount > 0)
++            ) {
+                 createTexture(coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_LINEAR)
+             } else {
+                 0
+@@ -2264,14 +2256,6 @@ internal class GlesMgcRawSpatialStacker(
+                 coverageWidth,
+                 coverageHeight,
+             )
+-            if (shortNormalProtectionCoverage26602 != 0) {
+-                clearSabreCoverage(
+-                    shortNormalProtectionCoverage26602,
+-                    coverageWidth,
+-                    coverageHeight,
+-                    "26602 SHORT NORMAL-only protection coverage clear",
+-                )
+-            }
+             if (normalDngAccumulator != 0) {
+                 clearSabreNormalDngAccumulator(normalDngAccumulator)
+                 if (normalDngCoverage != 0) {
+@@ -2345,7 +2329,14 @@ internal class GlesMgcRawSpatialStacker(
+             val referenceAlignmentProducts = buildReferenceAlignmentProducts(referenceGrayPyramid)
+             val zeroFlow = SabreConvertedAlignment.constant(createZeroFlowTexture())
+             val identityWeight = createIdentityWeightTexture()
+-            val accumulatedWeightScale = maxSabreAccumulatedWeight(mergedFrameCount)
++            /* IRIS_26603_ONE_TUNNEL_EVIDENCE_COUNT
++             * mergedFrameCount remains the external NORMAL(+Night LONG) contract. Internally, an
++             * admitted SHORT is real radiometric evidence in the one common accumulator and must
++             * participate in support/noise normalization exactly once.
++             */
++            val highlightShortOneTunnel26603 = highlightShortFrameCount > 0
++            val unifiedEvidenceCount26603 = mergedFrameCount + highlightShortFrameCount
++            val accumulatedWeightScale = maxSabreAccumulatedWeight(unifiedEvidenceCount26603)
+             renderSabreMerge(
+                 extracted = referenceExtracted,
+                 flow = zeroFlow,
+@@ -2357,7 +2348,8 @@ internal class GlesMgcRawSpatialStacker(
+                 extractedWidth = extractedWidth,
+                 extractedHeight = extractedHeight,
+                 useFrameWeight = false,
+-                shadowLongSourceClipGuard = false,
++                sourceClipGuard = highlightShortOneTunnel26603,
++                sourceClippedWeight = if (highlightShortOneTunnel26603) 0.001f else 1f,
+             )
+             if (enableSabreSuperRes) {
+                 val referenceEvidence = persistTrue2xEvidence(
+@@ -2458,6 +2450,9 @@ internal class GlesMgcRawSpatialStacker(
+                     extractedWidth,
+                     extractedHeight,
+                     durationRobustness,
++                    baseExtracted = referenceExtracted,
++                    altExtracted = currentExtracted,
++                    bracketAwareClipping = highlightShortFrameCount > 0,
+                 )
+                 val frameWeight = createTexture(
+                     coverageWidth,
+@@ -2466,222 +2461,64 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.GL_LINEAR,
+                 )
+                 renderDilation(reverseWeight, frameWeight)
+-                if (
+-                    shortNormalProtectionCoverage26602 != 0 &&
+-                    frame.role == RawBurstFrameRole.NORMAL
+-                ) {
++                /* IRIS_26603_ONE_TUNNEL_NORMAL_SHORT_LONG
++                 * No role owns a private reconstruction. NORMAL, HIGHLIGHT_SHORT and SHADOW_LONG
++                 * use the same Sabre frameWeight, same source-clipped support, same homogeneous RBF
++                 * accumulator, same Resolve and same VGN. Source clipping is evaluated on the exact
++                 * 3x3 CFA footprint consumed by the RBF and is one scalar for the complete RGB
++                 * observation. SHORT has no propagated mask, private mean or post-merge fuse.
++                 */
++                if (highlightShortOneTunnel26603 || frame.role == RawBurstFrameRole.SHADOW_LONG) {
++                    renderSabreUnifiedBracketCoverage26603(
++                        weight = frameWeight,
++                        extracted = currentExtracted,
++                        flow = flow,
++                        accumulatedCoverage = accumulatedCoverage,
++                        coverageWidth = coverageWidth,
++                        coverageHeight = coverageHeight,
++                        extractedWidth = extractedWidth,
++                        extractedHeight = extractedHeight,
++                        accumulatedWeightScale = accumulatedWeightScale,
++                    )
++                } else {
+                     renderSabreCoverage(
+                         frameWeight,
+-                        shortNormalProtectionCoverage26602,
++                        accumulatedCoverage,
+                         coverageWidth,
+                         coverageHeight,
+-                        maxSabreAccumulatedWeight(normalFrameCount),
++                        accumulatedWeightScale,
+                     )
+                 }
++                renderSabreMerge(
++                    extracted = currentExtracted,
++                    flow = flow,
++                    covariance = currentCovariance,
++                    weight = frameWeight,
++                    calibration = calibration,
++                    accumulatedColor = accumulatedColor,
++                    accumulatedWeightsGb = accumulatedWeightsGb,
++                    extractedWidth = extractedWidth,
++                    extractedHeight = extractedHeight,
++                    useFrameWeight = true,
++                    sourceClipGuard = highlightShortOneTunnel26603 || frame.role == RawBurstFrameRole.SHADOW_LONG,
++                    sourceClippedWeight = 0f,
++                )
+                 if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT) {
+-                    /* IRIS_26602_SHORT_FULL_NORMAL_SABRE_PROTECTION
+-                     * 26601 proved that arriving before Resolve/VGN was insufficient because SHORT
+-                     * discarded the already-computed NORMAL-equivalent Sabre rejection/unblocker/
+-                     * dilation weight. Keep the exact 26600 boundary geometry and highlight-loss
+-                     * candidate, but seed trust only where the exact SHORT frameWeight and NORMAL-
+-                     * only temporal coverage both agree. Carry that measured trust into a clipped
+-                     * core only through the already-proven coherent-flow boundary geometry.
+-                     */
+                     require(index == frames.lastIndex) {
+-                        "26602 HIGHLIGHT_SHORT must be scheduled after all NORMAL/LONG evidence"
++                        "26603 HIGHLIGHT_SHORT must remain the final scheduled auxiliary frame"
+                     }
+-                    require(shortNormalProtectionCoverage26602 != 0) {
+-                        "26602 HIGHLIGHT_SHORT requires NORMAL-only temporal protection coverage"
+-                    }
+-                    val nativeShortCalibration = calibrationForFrame(frame, 1f, kernelTuning)
+                     highlightShortExposureRatio26587 = exposureScale
+-                    val shortBoundaryGeometry26600 = createSabreShortBoundaryGeometry26600(
+-                        referenceRaw = referenceRaw,
+-                        shortRaw = currentRaw,
+-                        flow = flow,
+-                        referenceCalibration = referenceCalibration,
+-                        shortCalibration = nativeShortCalibration,
+-                        exposureRatio = exposureScale,
+-                    )
+-                    PLog.i(
+-                        SABRE_TAG,
+-                        "IRIS_26600_SHORT_BOUNDARY_GEOMETRY " +
+-                            "grid=${shortBoundaryGeometry26600.gridWidth}x${shortBoundaryGeometry26600.gridHeight} " +
+-                            "passes=${shortBoundaryGeometry26600.passes} " +
+-                            "seedGeometry=${shortBoundaryGeometry26600.seedGeometryCells} " +
+-                            "seedBoundary=${shortBoundaryGeometry26600.seedBoundaryCells} " +
+-                            "finalGeometry=${shortBoundaryGeometry26600.finalGeometryCells} " +
+-                            "finalBoundary=${shortBoundaryGeometry26600.finalBoundaryCells} " +
+-                            "consensusRawPx=2.0 majority=5of9 ambiguityMargin=2 " +
+-                            "boundaryRadiometry=subpixelSameCfaPhase meanErrorMax=0.05 " +
+-                            "propagation=highlightConnectedMotionConsensus",
+-                    )
+-
+-                    val highlightShortCandidateMask26602 = createTexture(
+-                        width, height, GLES30.GL_R8, GLES30.GL_NEAREST,
+-                    )
+-                    renderSabreShortRestoreMask26595(
+-                        referenceRaw = referenceRaw,
+-                        shortRaw = currentRaw,
+-                        flow = flow,
+-                        boundaryGeometry = shortBoundaryGeometry26600.texture,
+-                        referenceCalibration = referenceCalibration,
+-                        shortCalibration = nativeShortCalibration,
+-                        exposureRatio = exposureScale,
+-                        output = highlightShortCandidateMask26602,
+-                        outputGateStage26599 = 0,
+-                        outputWidth26599 = width,
+-                        outputHeight26599 = height,
+-                    )
+-                    val shortGateProbe26599 = probeSabreShortGateStages26599(
+-                        referenceRaw = referenceRaw,
+-                        shortRaw = currentRaw,
+-                        flow = flow,
+-                        boundaryGeometry = shortBoundaryGeometry26600.texture,
+-                        referenceCalibration = referenceCalibration,
+-                        shortCalibration = nativeShortCalibration,
+-                        exposureRatio = exposureScale,
+-                    )
+-                    highlightShortCandidatePixels26602 =
+-                        countSabreShortRestoreMaskFull26595(highlightShortCandidateMask26602)
+-
+-                    val shortProtection26602 = createSabreShortProtection26602(
+-                        boundaryGeometry = shortBoundaryGeometry26600,
+-                        frameWeight = frameWeight,
+-                        normalCoverage = shortNormalProtectionCoverage26602,
+-                    )
+-                    highlightShortProtectionSeedCells26602 = shortProtection26602.seedCells
+-                    highlightShortProtectionFinalCells26602 = shortProtection26602.finalCells
+-                    highlightShortMask26587 = createTexture(
+-                        width, height, GLES30.GL_R8, GLES30.GL_NEAREST,
+-                    )
+-                    renderSabreShortProtectedMask26602(
+-                        candidateMask = highlightShortCandidateMask26602,
+-                        protection = shortProtection26602.texture,
+-                        output = highlightShortMask26587,
+-                    )
+-                    releaseOwnedTexture(
+-                        highlightShortCandidateMask26602,
+-                        "26602 SHORT unprotected candidate mask",
+-                    )
+-                    releaseOwnedTexture(
+-                        shortProtection26602.texture,
+-                        "26602 SHORT propagated Sabre protection",
+-                    )
+-
+-                    val shortMaskProbe26590 = probeSabreShortRestoreMask26590(highlightShortMask26587)
+-                    highlightShortFullActivePixels26595 =
+-                        countSabreShortRestoreMaskFull26595(highlightShortMask26587)
+-                    val candidateText26602 = highlightShortCandidatePixels26602?.toString() ?: "UNAVAILABLE"
+-                    val fullActiveText26595 = highlightShortFullActivePixels26595?.toString() ?: "UNAVAILABLE"
+-                    val shortMaskEffectDetails26591 =
+-                        "probe=${shortMaskProbe26590.width}x${shortMaskProbe26590.height} " +
+-                            "active=${shortMaskProbe26590.activePixels}/${shortMaskProbe26590.totalPixels} " +
+-                            "strong=${shortMaskProbe26590.strongPixels}/${shortMaskProbe26590.totalPixels} " +
+-                            "candidate=$candidateText26602/${Math.multiplyExact(width, height)} " +
+-                            "protectedFullActive=$fullActiveText26595/${Math.multiplyExact(width, height)} " +
+-                            "protectionSeedCells=${shortProtection26602.seedCells} " +
+-                            "protectionFinalCells=${shortProtection26602.finalCells} " +
+-                            "protectionPasses=${shortProtection26602.passes} " +
+-                            "gateProbe=$shortGateProbe26599 " +
+-                            "maxHandoffWeight=${shortMaskProbe26590.maxConfidence} " +
+-                            "meanHandoffWeight=${shortMaskProbe26590.meanConfidence} " +
+-                            "effectiveSignalFloor=0.72 effectiveLoss=0.05..0.12 " +
+-                            "severeSingleReference=0.94 severeSingleLoss=0.12..0.22 " +
+-                            "shortHeadroomThreshold=0.90 boundaryRadiometry=subpixelSameCfaPhase " +
+-                            "regionFloor=0.70 boundaryCeiling=0.90 " +
+-                            "boundaryGeometry=26600SparseConsensus grid=${shortBoundaryGeometry26600.gridWidth}x${shortBoundaryGeometry26600.gridHeight} " +
+-                            "geometryPasses=${shortBoundaryGeometry26600.passes} geometrySeed=${shortBoundaryGeometry26600.seedGeometryCells} " +
+-                            "boundarySeed=${shortBoundaryGeometry26600.seedBoundaryCells} geometryFinal=${shortBoundaryGeometry26600.finalGeometryCells} " +
+-                            "boundaryFinal=${shortBoundaryGeometry26600.finalBoundaryCells} " +
+-                            "actualSensorClipBypass=true clipPhasesMin=1 clippedPhaseShortProof=true robustFlowGeometry=true " +
+-                            "flowConsensusRawPx=2.0 sabrePhotometricGate=true unblockerGate=true " +
+-                            "normalCoverageGate=true bayerQuadCoherent=true sameSabreFlow=true wholeRgb=true maskFilter=NEAREST"
+-                    PLog.i(SABRE_TAG, "IRIS_26602_SHORT_PROTECTED_MASK $shortMaskEffectDetails26591")
+-                    MotionTrace.processingState(
+-                        "IRIS_26602_SHORT_PROTECTED_HANDOFF",
+-                        shortMaskEffectDetails26591,
+-                    )
+-
+-                    /* Build the private SHORT observation only after the protected final mask exists.
+-                     * uUseFrameWeight=true is now mandatory. The mask is a propagated version of the
+-                     * exact NORMAL Sabre frameWeight, intersected with 26600 radiometric validity and
+-                     * made one scalar per Bayer quad. Identity-weight SHORT is permanently retired.
+-                     */
+-                    highlightShortAccumulatedColor26601 = createTexture(
+-                        width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+-                    )
+-                    highlightShortAccumulatedWeightsGb26601 = createTexture(
+-                        width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST,
+-                    )
+-                    clearRgbAccumulators(
+-                        highlightShortAccumulatedColor26601,
+-                        highlightShortAccumulatedWeightsGb26601,
+-                        width,
+-                        height,
+-                    )
+-                    renderSabreMerge(
+-                        extracted = currentExtracted,
+-                        flow = flow,
+-                        covariance = currentCovariance,
+-                        weight = highlightShortMask26587,
+-                        calibration = calibration,
+-                        accumulatedColor = highlightShortAccumulatedColor26601,
+-                        accumulatedWeightsGb = highlightShortAccumulatedWeightsGb26601,
+-                        extractedWidth = extractedWidth,
+-                        extractedHeight = extractedHeight,
+-                        useFrameWeight = true,
+-                        shadowLongSourceClipGuard = false,
+-                    )
+                     highlightShortAdmitted26587 = true
+                     highlightShortMaskGenerated26587 = true
+-                    PLog.i(
+-                        SABRE_TAG,
+-                        "IRIS_26602_SHORT_FULL_NORMAL_PROTECTION_READY exposureRatio=$exposureScale " +
+-                            "normalFrames=$normalFrameCount candidate=${highlightShortCandidatePixels26602 ?: -1} " +
+-                            "protectedFullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                            "protectionSeedCells=$highlightShortProtectionSeedCells26602 " +
+-                            "protectionFinalCells=$highlightShortProtectionFinalCells26602 " +
+-                            "sameSabreFlow=true sameSabreCovariance=true sabrePhotometricGate=true " +
+-                            "unblockerGate=true dilationFrameWeight=true normalCoverageGate=true " +
+-                            "bayerQuadCoherent=true boundaryGeometry26600=true hardEvidenceSwitch=false " +
+-                            "dng=false srDetailEvidence=false referenceExposureReconstruction=true wholeRgb=true",
+-                    )
+-                } else {
+-                    if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
+-                        renderSabreShadowLongCoverage(
+-                            weight = frameWeight,
+-                            extracted = currentExtracted,
+-                            flow = flow,
+-                            accumulatedCoverage = accumulatedCoverage,
+-                            coverageWidth = coverageWidth,
+-                            coverageHeight = coverageHeight,
+-                            extractedWidth = extractedWidth,
+-                            extractedHeight = extractedHeight,
+-                            accumulatedWeightScale = accumulatedWeightScale,
+-                        )
+-                    } else {
+-                        renderSabreCoverage(
+-                            frameWeight,
+-                            accumulatedCoverage,
+-                            coverageWidth,
+-                            coverageHeight,
+-                            accumulatedWeightScale,
+-                        )
+-                    }
+-                    renderSabreMerge(
+-                        extracted = currentExtracted,
+-                        flow = flow,
+-                        covariance = currentCovariance,
+-                        weight = frameWeight,
+-                        calibration = calibration,
+-                        accumulatedColor = accumulatedColor,
+-                        accumulatedWeightsGb = accumulatedWeightsGb,
+-                        extractedWidth = extractedWidth,
+-                        extractedHeight = extractedHeight,
+-                        useFrameWeight = true,
+-                        shadowLongSourceClipGuard = frame.role == RawBurstFrameRole.SHADOW_LONG,
+-                    )
++                    highlightShortFullActivePixels26595 = null
++                    val details26603 =
++                        "exposureRatio=$exposureScale commonAccumulator=true privateShortAccumulator=false " +
++                            "propagatedShortMask=false sameSabreFlow=true sameSabreCovariance=true " +
++                            "sabrePhotometricGate=true clippedReferenceBypass=true unblockerGate=true " +
++                            "dilationFrameWeight=true sourceClip3x3=true bayerQuadWholeRgb=true " +
++                            "flowCoherenceRawPx=2.0 dng=false srDetailEvidence=false"
++                    PLog.i(SABRE_TAG, "IRIS_26603_SHORT_ONE_TUNNEL_ADMITTED $details26603")
++                    MotionTrace.processingState("IRIS_26603_SHORT_ONE_TUNNEL_ADMITTED", details26603)
+                 }
+                 /* IRIS_26564_NIGHT_LONG_EXCLUDED_FROM_TRUE_2X
+                  * Native Sabre still admits validated SHADOW_LONG evidence for Night SNR. True 2x
+@@ -2733,23 +2570,7 @@ internal class GlesMgcRawSpatialStacker(
+                         "role=${frame.role} exposureScale=$exposureScale " +
+                         "durationRobustness=$durationRobustness submit=${elapsedMs(frameStartNs)}ms",
+                 )
+-                if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT && highlightShortAdmitted26587) {
+-                    /* IRIS_26601_SHORT_TRANSIENT_LIFETIME
+-                     * Preserve only the private homogeneous SHORT observation and exact 26600
+-                     * evidence mask beyond this frame. All RAW/alignment/rejection temporaries keep
+-                     * the proven per-frame cleanup boundary.
+-                     */
+-                    releaseTexturesFromExcept(
+-                        transientTextureStart,
+-                        intArrayOf(
+-                            highlightShortAccumulatedColor26601,
+-                            highlightShortAccumulatedWeightsGb26601,
+-                            highlightShortMask26587,
+-                        ),
+-                    )
+-                } else {
+-                    releaseTexturesFrom(transientTextureStart)
+-                }
++                releaseTexturesFrom(transientTextureStart)
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+ 
+@@ -2819,73 +2640,33 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+             }
+ 
+-            /* IRIS_26602_SHORT_PROTECTED_SINGLE_RECONSTRUCTION_AUTHORITY
+-             * NORMAL/LONG support/noise/DNG accounting above is frozen. SHORT has already consumed
+-             * the exact NORMAL Sabre rejection/unblocker/dilation protection at its measurable
+-             * boundary and may carry that trust inward only through 26600 coherent geometry. Fuse
+-             * dehomogenized means with one Bayer-coherent RGB scalar while retaining NORMAL/LONG
+-             * accumulated weights. There is no hard accumulator switch and no post-VGN compositor.
++            /* IRIS_26603_ONE_TUNNEL_RESOLVE_AUTHORITY
++             * The compiler-tested common accumulatedColor/accumulatedWeightsGb are the only RGB
++             * authority entering Resolve/VGN. There is no SHORT mean, handoff mask, accumulator
++             * switch, protected fuse, or post-VGN compositor on the active path.
+              */
+-            var resolveAccumulatedColor26602 = accumulatedColor
+-            var resolveAccumulatedWeightsGb26602 = accumulatedWeightsGb
++            val resolveAccumulatedColor26603 = accumulatedColor
++            val resolveAccumulatedWeightsGb26603 = accumulatedWeightsGb
+             if (highlightShortAdmitted26587) {
+-                require(
+-                    highlightShortAccumulatedColor26601 != 0 &&
+-                        highlightShortAccumulatedWeightsGb26601 != 0 &&
+-                        highlightShortMask26587 != 0
+-                ) { "26602 protected SHORT common Sabre evidence is incomplete" }
+-                resolveAccumulatedColor26602 = createTexture(
+-                    width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+-                )
+-                resolveAccumulatedWeightsGb26602 = createTexture(
+-                    width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST,
+-                )
+-                renderSabreShortProtectedAccumulatorFuse26602(
+-                    normalColorAndRWeight = accumulatedColor,
+-                    normalWeightsGb = accumulatedWeightsGb,
+-                    shortColorAndRWeight = highlightShortAccumulatedColor26601,
+-                    shortWeightsGb = highlightShortAccumulatedWeightsGb26601,
+-                    protectedMask = highlightShortMask26587,
+-                    outputColorAndRWeight = resolveAccumulatedColor26602,
+-                    outputWeightsGb = resolveAccumulatedWeightsGb26602,
+-                )
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedColor26601,
+-                    "26602 SHORT protected homogeneous color/weight evidence",
+-                )
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedWeightsGb26601,
+-                    "26602 SHORT protected homogeneous Gb weight evidence",
+-                )
+-                releaseOwnedTexture(highlightShortMask26587, "26602 SHORT protected evidence mask")
+-                highlightShortAccumulatedColor26601 = 0
+-                highlightShortAccumulatedWeightsGb26601 = 0
+-                highlightShortMask26587 = 0
+                 PLog.i(
+                     SABRE_TAG,
+-                    "IRIS_26602_SHORT_FULL_PROTECTED_COMMON_SABRE_OWNERSHIP " +
+-                        "candidate=${highlightShortCandidatePixels26602 ?: -1} " +
+-                        "protectedFullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                        "protectionSeedCells=$highlightShortProtectionSeedCells26602 " +
+-                        "protectionFinalCells=$highlightShortProtectionFinalCells26602 " +
+-                        "domain=homogeneousReferenceExposure hardEvidenceSwitch=false " +
+-                        "sabrePhotometricGate=true unblockerGate=true dilationFrameWeight=true " +
+-                        "normalCoverageGate=true bayerQuadCoherent=true " +
+-                        "sharedResolve=true sharedVgn=true lateRgbBlend=false " +
+-                        "temporalSupportOwner=NORMAL_LONG dngOwner=NORMAL srDetailOwner=NORMAL",
++                    "IRIS_26603_SINGLE_COMMON_ACCUMULATOR_OWNERSHIP " +
++                        "domain=homogeneousReferenceExposure sharedRbf=true sharedResolve=true sharedVgn=true " +
++                        "privateShortMean=false propagatedShortMask=false lateRgbBlend=false " +
++                        "temporalSupportOwner=NORMAL_SHORT_LONG dngOwner=NORMAL srDetailOwner=NORMAL",
+                 )
+             }
+             renderSabreDehomogenize(
+-                resolveAccumulatedColor26602,
+-                resolveAccumulatedWeightsGb26602,
++                resolveAccumulatedColor26603,
++                resolveAccumulatedWeightsGb26603,
+                 accumulatedCoverage,
+-                alphaScale = accumulatedWeightScale / mergedFrameCount.toFloat(),
+-                alphaBias = 1f / mergedFrameCount.toFloat(),
++                alphaScale = accumulatedWeightScale / unifiedEvidenceCount26603.toFloat(),
++                alphaBias = 1f / unifiedEvidenceCount26603.toFloat(),
+             )
+             // The original merge shaders write normalized, white-balanced half floats. The
+             // Resolve AOT accepts those RGBA16F bit patterns directly; rawScale applies only to
+             // the black/white scalar parameters below.
+-            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveAccumulatedColor26602)
++            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveAccumulatedColor26603)
+             sabreResolvedRgb = checkNotNull(
+                 LargeDirectBuffer.allocate(
+                     width.toLong() * height * 3L * Short.SIZE_BYTES,
+@@ -3010,9 +2791,9 @@ internal class GlesMgcRawSpatialStacker(
+                 val evidencePolicy = "dngRequested=$exportNormalStackedDng normalFrames=$normalFrameCount " +
+                     "retained=${reconstructionEvidence.size} jpegTop2PerPhase=${true2xFastPhaseSlots!=null} " +
+                     "maxEvidence=${if (true2xFastPhaseSlots!=null) TRUE2X_JPEG_MAX_EVIDENCE else reconstructionEvidence.size} " +
+-                    "shortEvidence=false shortUnifiedGuide=${highlightShortAdmitted26587} " +
+-                    "shortGuideFullActive=${highlightShortFullActivePixels26595 ?: -1} " +
+-                    "shortGuideOwner=COMMON_SABRE_PRE_RESOLVE_VGN srDetailOwner=NORMAL_ONLY"
++                    "shortDetailEvidence=false shortUnifiedGuide=${highlightShortAdmitted26587} " +
++                    "shortAcceptedCoverageCells=${highlightShortFullActivePixels26595 ?: -1} " +
++                    "shortGuideOwner=SINGLE_COMMON_RBF_RESOLVE_VGN srDetailOwner=NORMAL_ONLY"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_EVIDENCE_POLICY $evidencePolicy")
+                 MotionTrace.processingState("IRIS_26576_SR_EVIDENCE", evidencePolicy)
+                 val rawResult=reconstructTrue2x(
+@@ -3132,24 +2913,6 @@ internal class GlesMgcRawSpatialStacker(
+             null
+         } finally {
+             images.forEach { it.close() }
+-            if (highlightShortAccumulatedColor26601 != 0) {
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedColor26601,
+-                    "26601 failed SHORT homogeneous color/weight evidence",
+-                )
+-                highlightShortAccumulatedColor26601 = 0
+-            }
+-            if (highlightShortAccumulatedWeightsGb26601 != 0) {
+-                releaseOwnedTexture(
+-                    highlightShortAccumulatedWeightsGb26601,
+-                    "26601 failed SHORT homogeneous Gb weight evidence",
+-                )
+-                highlightShortAccumulatedWeightsGb26601 = 0
+-            }
+-            if (highlightShortMask26587 != 0) {
+-                releaseOwnedTexture(highlightShortMask26587, "26601 failed SHORT evidence mask")
+-                highlightShortMask26587 = 0
+-            }
+             release()
+             GlesGpuScheduler.restoreCurrentThreadPriority(originalThreadPriority, SABRE_TAG)
+             LargeDirectBuffer.free(sabreAccumulatedReadback)
+@@ -3448,6 +3211,9 @@ internal class GlesMgcRawSpatialStacker(
+         guideWidth: Int,
+         guideHeight: Int,
+         durationRobustness: Float = 1f,
++        baseExtracted: Int,
++        altExtracted: Int,
++        bracketAwareClipping: Boolean,
+     ) {
+         val program = rejectionProgram
+         GLES30.glUseProgram(program)
+@@ -3456,7 +3222,10 @@ internal class GlesMgcRawSpatialStacker(
+         bindTexture(program, "uFlow", 2, flow.texture)
+         bindTexture(program, "uUnblocker", 3, unblocker)
+         bindTexture(program, "uNoiseEstimates", 4, noiseTexture)
++        bindTexture(program, "uBaseExtractedBayer", 5, baseExtracted)
++        bindTexture(program, "uAltExtractedBayer", 6, altExtracted)
+         uniform2i(program, "uGuideSize", guideWidth, guideHeight)
++        uniform2i(program, "uExtractedSize", guideWidth, guideHeight)
+         uniform2i(program, "uRejectionSize", guideWidth, guideHeight)
+         uniform4f(
+             program,
+@@ -3497,6 +3266,8 @@ internal class GlesMgcRawSpatialStacker(
+             "uExtraMotionRobustnessMotionThreshold",
+             flowVariationThresholds.extraMotionRobustness,
+         )
++        uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
++        uniform1i(program, "uBracketAwareClipping", if (bracketAwareClipping) 1 else 0)
+         draw(program, guideWidth, guideHeight, intArrayOf(reverseWeight, pixelDifference))
+     }
+ 
+@@ -3527,7 +3298,7 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun renderSabreShadowLongCoverage(
++    private fun renderSabreUnifiedBracketCoverage26603(
+         weight: Int,
+         extracted: Int,
+         flow: SabreConvertedAlignment,
+@@ -3541,7 +3312,7 @@ internal class GlesMgcRawSpatialStacker(
+         if (sabreShadowLongCopyMaskProgram == 0) {
+             sabreShadowLongCopyMaskProgram = linkProgram(
+                 GlesMgcRawSabreShaders.copyMaskShadowLong26558,
+-                "iris_26558_sabre_shadow_long_coverage",
++                "iris_26603_sabre_unified_bracket_coverage",
+             )
+         }
+         val program = sabreShadowLongCopyMaskProgram
+@@ -3608,19 +3379,10 @@ internal class GlesMgcRawSpatialStacker(
+         extractedWidth: Int,
+         extractedHeight: Int,
+         useFrameWeight: Boolean,
+-        shadowLongSourceClipGuard: Boolean,
++        sourceClipGuard: Boolean,
++        sourceClippedWeight: Float,
+     ) {
+-        val program = if (shadowLongSourceClipGuard) {
+-            if (sabreShadowLongMergeProgram == 0) {
+-                sabreShadowLongMergeProgram = linkProgram(
+-                    GlesMgcRawSabreShaders.mergeShadowLong26558,
+-                    "iris_26558_sabre_shadow_long_merge",
+-                )
+-            }
+-            sabreShadowLongMergeProgram
+-        } else {
+-            sabreMergeProgram
+-        }
++        val program = sabreMergeProgram
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uExtractedBayer", 0, extracted)
+         bindTexture(program, "uFlow", 1, flow.texture)
+@@ -3639,9 +3401,9 @@ internal class GlesMgcRawSpatialStacker(
+         )
+         uniform1i(program, "uCfaPattern", cfaPattern)
+         uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
+-        if (shadowLongSourceClipGuard) {
+-            uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
+-        }
++        uniform1i(program, "uSourceClipGuard", if (sourceClipGuard) 1 else 0)
++        uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
++        uniform1f(program, "uSourceClippedWeight", sourceClippedWeight.coerceIn(0f, 1f))
+         uniform4fv(program, "uGains", calibration.gains)
+         uniform4fv(program, "uBlackLevelsTimesGains", calibration.blackTerms)
+         uniform4f(
+@@ -4110,7 +3872,8 @@ internal class GlesMgcRawSpatialStacker(
+             extractedWidth = ceilDiv(width, 2),
+             extractedHeight = ceilDiv(height, 2),
+             useFrameWeight = false,
+-            shadowLongSourceClipGuard = false,
++            sourceClipGuard = false,
++            sourceClippedWeight = 1f,
+         )
+         renderSabreDehomogenize(
+             accumulatedColor = color,
+@@ -4923,62 +4686,22 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
+-        /* IRIS_26600_BOUNDARY_GEOMETRY_OWNER
+-         * Retire the fixed-radius scalar region owner from the active SHORT path. Geometry and
+-         * non-literal boundary provenance now share one sparse consensus field.
+-         */
+-        sabreShortBoundaryGeometrySeedProgram26600 = linkProgram(
+-            GlesMgcRawSabreShaders.shortBoundaryGeometrySeed26600,
+-            "iris_26600_sabre_short_boundary_geometry_seed",
+-        )
+-        sabreShortBoundaryGeometryPropagateProgram26600 = linkProgram(
+-            GlesMgcRawSabreShaders.shortBoundaryGeometryPropagate26600,
+-            "iris_26600_sabre_short_boundary_geometry_propagate",
+-        )
+-        sabreShortBoundaryGeometryProbeProgram26600 = linkProgram(
+-            GlesMgcRawSabreShaders.shortBoundaryGeometryProbe26600,
+-            "iris_26600_sabre_short_boundary_geometry_probe",
+-        )
+-        sabreShortRestoreMaskProgram26595 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRestoreMask26596,
+-            "iris_26596_sabre_short_restore_mask",
+-        )
+-        sabreShortRestoreMaskProbeProgram26590 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRestoreMaskProbe26590,
+-            "iris_26590_sabre_short_restore_mask_probe",
+-        )
+-        if (supportsComputeReadback) {
+-            runCatching {
+-                sabreShortMaskCountProgram26595 = linkComputeProgram(
+-                    GlesMgcRawSpatialShaders.bentoCountHighlightMask,
+-                    "iris_26595_sabre_short_full_mask_count",
+-                )
+-            }.onFailure { error ->
+-                sabreShortMaskCountProgram26595 = 0
+-                PLog.w(SABRE_TAG, "26595 SHORT full-mask GPU count unavailable", error)
+-            }
+-        }
+-        /* IRIS_26602_SHORT_HARD_OWNER_RETIRED
+-         * 26601's binary accumulator switch is intentionally unlinked. SHORT now consumes the
+-         * NORMAL-equivalent Sabre protection and fuses one protected RGB mean before Resolve/VGN.
++        /* IRIS_26603_RETIRED_SEPARATE_SHORT_AUTHORITIES
++         * One-tunnel reconstruction makes every 26595/26600/26602 SHORT boundary/mask/protection/
++         * private-fuse program a duplicate owner. Keep their source/helpers only as rollback
++         * provenance; do not link them on the active runtime path.
+          */
++        sabreShortBoundaryGeometrySeedProgram26600 = 0
++        sabreShortBoundaryGeometryPropagateProgram26600 = 0
++        sabreShortBoundaryGeometryProbeProgram26600 = 0
++        sabreShortRestoreMaskProgram26595 = 0
++        sabreShortRestoreMaskProbeProgram26590 = 0
++        sabreShortMaskCountProgram26595 = 0
+         sabreShortAccumulatorOwnershipProgram26601 = 0
+-        sabreShortProtectionSeedProgram26602 = linkProgram(
+-            GlesMgcRawSabreShaders.shortProtectionSeed26602,
+-            "iris_26602_sabre_short_protection_seed",
+-        )
+-        sabreShortProtectionPropagateProgram26602 = linkProgram(
+-            GlesMgcRawSabreShaders.shortProtectionPropagate26602,
+-            "iris_26602_sabre_short_protection_propagate",
+-        )
+-        sabreShortProtectedMaskProgram26602 = linkProgram(
+-            GlesMgcRawSabreShaders.shortProtectedMask26602,
+-            "iris_26602_sabre_short_protected_mask",
+-        )
+-        sabreShortProtectedAccumulatorFuseProgram26602 = linkProgram(
+-            GlesMgcRawSabreShaders.shortProtectedAccumulatorFuse26602,
+-            "iris_26602_sabre_short_protected_accumulator_fuse",
+-        )
++        sabreShortProtectionSeedProgram26602 = 0
++        sabreShortProtectionPropagateProgram26602 = 0
++        sabreShortProtectedMaskProgram26602 = 0
++        sabreShortProtectedAccumulatorFuseProgram26602 = 0
+         /* IRIS_26601_LATE_RGB_SHORT_OWNER_RETIRED
+          * Keep the old helper source for rollback provenance, but do not link it. Any accidental
+          * call to renderSabreShortRestoreRgba16f26587 therefore fails rather than silently reviving
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 3d13ef7486d877026dda7795f296db3a8dd36d45..2fc177aaded82b7450732da1f7ca0a936b379052 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -25,11 +25,12 @@ import static android.opengl.GLES20.GL_LINEAR;
+  */
+ public final class MotionV2Render extends Node {
+     static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
+-    /* IRIS_26602_UHDR_MASTER_SDR_PARITY
+-     * UHDR's pre-tone extended-linear rendition is the Motion master. Keep that exact grade
+-     * through guide=1.0 in SDR; only true HDR headroom above it enters the shoulder.
++    /* IRIS_26603_MASTER_FAITHFUL_SDR_PROJECTION
++     * 26602's guide=1.0 start became only 0.80 after OUTPUT_EXPOSURE_SCALE. Preserve the master
++     * exactly through 0.98 final SDR output and reserve only the top 2% for a C1 monotonic HDR
++     * excess knee. This is a display-domain threshold, not a scene/category heuristic.
+      */
+-    static final float IRIS_26602_MOTION_MASTER_SDR_TONE_START = 1.00f;
++    static final float IRIS_26603_MOTION_SDR_KNEE = 0.98f;
+     static final float IRIS_26582_TONE_START = 0.50f;
+     static final float IRIS_26582_HIGHLIGHT_TARGET = 0.97f;
+     static final float IRIS_26582_CLIP_FRACTION_START = 0.002f;
+@@ -277,7 +278,7 @@ public final class MotionV2Render extends Node {
+         glProg.setTexture("InputBuffer", extendedLinearHdr);
+         glProg.setVar("sceneWhite", sceneWhite);
+         glProg.setVar("iris26592MotionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+-        glProg.setVar("iris26602MotionMasterToneStart", IRIS_26602_MOTION_MASTER_SDR_TONE_START);
++        glProg.setVar("iris26603MotionSdrKnee", IRIS_26603_MOTION_SDR_KNEE);
+                 glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+         glProg.setVar("irisOutputZoom", irisOutputZoom);
+ 
+@@ -462,14 +463,13 @@ public final class MotionV2Render extends Node {
+         glProg.closed = true;
+ 
+         if (basePipeline.mParameters.motionV2Active) {
+-            Log.i(Name, "IRIS_26602_SDR_UHDR_MASTER_PARITY"
++            Log.i(Name, "IRIS_26603_MASTER_FAITHFUL_SDR"
+                     + " master=extendedLinearPreTone"
+-                    + " motionToneStart=" + IRIS_26602_MOTION_MASTER_SDR_TONE_START
+-                    + " bodyGuideMax=1.0"
+-                    + " bodyOutputMax=" + OUTPUT_EXPOSURE_SCALE
+-                    + " bodyGainUnity=true"
+-                    + " sameColor=true sameBlack=true sameMidtones=true sameContrast=true"
+-                    + " differenceOnlyAboveBody=HDR_HEADROOM"
++                     + " motionSdrKneeFinal=" + IRIS_26603_MOTION_SDR_KNEE
++                    + " exactMasterThroughFinalSdr=" + IRIS_26603_MOTION_SDR_KNEE
++                    + " c1SoftKnee=true monotonic=true hardEndpointClamp=false"
++                    + " sameColor=true sameBlack=true sameShadows=true sameMidtones=true"
++                    + " differenceOnlyInTopSdrReserveAndHdrExcess=true"
+                     + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                     + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+                     + " oneMasterRendition=true");
+diff --git a/app/version.properties b/app/version.properties
+index 9194e4970cd9416c4fe4e2124a5c25f062ad0944..d9e5acc942e6ddd0b440463d6fd221e394065d60 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726602
+-VERSION_BUILD=26602
++VERSION_NAME=0.9726603
++VERSION_BUILD=26603
