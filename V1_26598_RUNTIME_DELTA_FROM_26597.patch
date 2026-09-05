@@ -1,0 +1,1223 @@
+diff --git a/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl b/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl
+index fabe7b66c0a1cf863d69e70c8dc3ffbfa477b348..d2429287319fe8018332e40df8dee39b4ef426cd 100644
+--- a/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl
++++ b/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26563.glsl
+@@ -4,6 +4,7 @@ precision mediump sampler2D;
+ uniform sampler2D InputBuffer;
+ uniform float displayGain;
+ uniform float sceneWhite;
++uniform int iris26598MotionPublication;
+ out vec3 Output;
+ #ifndef CALIBRATED_PROFILE
+ #define CALIBRATED_PROFILE 0
+@@ -62,8 +63,27 @@ float iris26585MapHeadroomGuide(float guide) {
+     const float outputExposureScale = 0.80;
+     if (guide <= toneStart) return guide;
+     float whitePoint = max(sceneWhite, toneStart + 0.05);
+-    float x = clamp((guide - toneStart) / max(whitePoint - toneStart, 1.0e-6), 0.0, 1.0);
+-    float shaped = log(1.0 + logShape * x) / log(1.0 + logShape);
++    float u = max((guide - toneStart) / max(whitePoint - toneStart, 1.0e-6), 0.0);
++    float shaped;
++    if (iris26598MotionPublication != 0) {
++        /* IRIS_26598_TONE_AWARE_PREDICTOR_PARITY
++         * Predict the exact successful-26597 Motion publication curve. The old 26585 log endpoint
++         * predictor otherwise treats sceneWhite as display white and can suppress legitimate
++         * highlight chroma that 26597 would safely retain. Literals are the exact V1.1 ESSL-safe
++         * anchors used by motionv2/render.glsl.
++         */
++        const float sceneAnchor = 0.834284246;
++        const float tailSlope = 5.03442907;
++        if (u <= 1.0) {
++            shaped = sceneAnchor * u;
++        } else {
++            shaped = 1.0 - (1.0 - sceneAnchor) / (1.0 + tailSlope * (u - 1.0));
++        }
++    } else {
++        /* Night keeps the exact successful pre-26598 appearance predictor. */
++        float x = clamp(u, 0.0, 1.0);
++        shaped = log(1.0 + logShape * x) / log(1.0 + logShape);
++    }
+     float preScaleDisplayWhite = 1.0 / outputExposureScale;
+     return toneStart + (preScaleDisplayWhite - toneStart) * shaped;
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 3ced01d2fe286c2fd50cd5fa84c5e379f2ffd3ac..b4f76c10548733a0ce7a3c263e969d924d4d361b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -389,100 +389,153 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ //            msg.obj = reader;
+ //            mImageSaver.processingHandler.sendMessage(msg);
+             if (isZslMode()) {
+-                Image img = reader.acquireNextImage();
+-                if (img == null) return;
+-                /* IRIS_26489_SHORT_RAW_CALLBACK_BEFORE_RING_DRAIN
+-                 * Stage a copied candidate before the historical capture-state early-close can
+-                 * discard the one short RAW whose TotalCaptureResult has not arrived yet.
++                /* IRIS_26598_MOTION_HAL_QUEUE_DRAIN_OWNER
++                 * ImageReader callbacks are notifications that one OR MORE RAWs may be queued.
++                 * Drain every currently available Motion RAW synchronously. This is the Motion
++                 * equivalent of the already-proven Night drain-all rule and prevents coalesced
++                 * Camera2 notifications from stranding exact NORMAL top-up tail frames.
+                  */
++                int iris26598Drained = 0;
++                while (true) {
++                    Image img;
++                    try {
++                        img = reader.acquireNextImage();
++                    } catch (IllegalStateException acquireError) {
++                        Log.w(TAG, "IRIS_26598_MOTION_RAW_DRAIN_ACQUIRE_FAILED drained="
++                                + iris26598Drained + " reason="
++                                + acquireError.getClass().getSimpleName());
++                        break;
++                    }
++                    if (img == null) break;
++                    iris26598Drained++;
+ 
+-                /* IRIS_26505_LONG_RAW_EXACT_CALLBACK_OWNERSHIP
+-                 * The intentional Long-A request is physically outside the normal ZSL
+-                 * exposure group. CaptureStarted/Image timestamp equality owns the role.
+-                 * Copy/stage before the historical capture-state close just like Short-A.
+-                 */
+-                Motion26505LongTicket iris26505LongTicket = mMotion26505CaptureLongTicket;
+-                final long iris26505RawTimestamp = img.getTimestamp();
+-                final long iris26505ExpectedLongTimestamp = iris26505LongTicket == null
+-                        ? 0L : iris26505LongTicket.expectedTimestampNs();
+-                final boolean iris26505ExactLongRawOwned = iris26505LongTicket != null
+-                        && iris26505ExpectedLongTimestamp > 0L
+-                        && iris26505RawTimestamp == iris26505ExpectedLongTimestamp;
+-                boolean iris26505LongCandidateCopied =
+-                        stageMotion26505LongRawCandidate(iris26505LongTicket, img);
+-                if (iris26505ExactLongRawOwned) {
+-                    Log.i(TAG, "IRIS_26505_LONG_RAW_EXACT_CALLBACK_OWNERSHIP"
+-                            + " rawTimestamp=" + iris26505RawTimestamp
+-                            + " expectedTimestamp=" + iris26505ExpectedLongTimestamp
+-                            + " stagedOrDelivered=" + iris26505LongCandidateCopied
+-                            + " slotSealed=" + iris26505LongTicket.slot.isSealed()
+-                            + " normalRingAdmission=false");
+-                    img.close();
+-                    return;
+-                }
+-                Motion26486ShortTicket iris26489ShortTicket = mMotion26486CaptureShortTicket;
+-                final long iris26490RawTimestamp = img.getTimestamp();
+-                final long iris26490ExpectedShortTimestamp = iris26489ShortTicket == null
+-                        ? 0L : iris26489ShortTicket.expectedTimestampNs();
+-                final boolean iris26490ExactShortRawOwned = iris26489ShortTicket != null
+-                        && iris26490ExpectedShortTimestamp > 0L
+-                        && iris26490RawTimestamp == iris26490ExpectedShortTimestamp;
+-                boolean iris26489ShortCandidateCopied =
+-                        stageMotion26489ShortRawCandidate(iris26489ShortTicket, img);
+-                /* IRIS_26490_EXACT_SHORT_RAW_NEVER_ENTERS_NORMAL_RING
+-                 * Camera2 guarantees onCaptureStarted/result/Image timestamps identify the same
+-                 * physical capture. Once this Image is the exact HIGHLIGHT_SHORT observation,
+-                 * the short ticket owns it exclusively even if reconstruction already sealed the
+-                 * optional slot. Never let a bracketed short exposure contaminate the normal ZSL ring.
+-                 */
+-                if (iris26490ExactShortRawOwned) {
+-                    Log.i(TAG, "IRIS_26490_SHORT_RAW_EXACT_CALLBACK_OWNERSHIP"
+-                            + " rawTimestamp=" + iris26490RawTimestamp
+-                            + " expectedTimestamp=" + iris26490ExpectedShortTimestamp
+-                            + " stagedOrDelivered=" + iris26489ShortCandidateCopied
+-                            + " slotSealed=" + iris26489ShortTicket.slot.isSealed()
+-                            + " normalRingAdmission=false");
+-                    img.close();
+-                    return;
+-                }
+-                if (mZslCapturing && !mMotionTopUpActive) {
+-                    if (iris26489ShortCandidateCopied) {
+-                        Log.d(TAG, "IRIS_26489_SHORT_RAW_SURVIVED_EARLY_CLOSE timestamp="
+-                                + img.getTimestamp());
++                    /* IRIS_26489_SHORT_RAW_CALLBACK_BEFORE_RING_DRAIN
++                     * Stage a copied candidate before the historical capture-state early-close can
++                     * discard the one short RAW whose TotalCaptureResult has not arrived yet.
++                     */
++
++                    /* IRIS_26505_LONG_RAW_EXACT_CALLBACK_OWNERSHIP
++                     * The intentional Long-A request is physically outside the normal ZSL
++                     * exposure group. CaptureStarted/Image timestamp equality owns the role.
++                     * Copy/stage before any capture-state close just like Short-A.
++                     */
++                    Motion26505LongTicket iris26505LongTicket = mMotion26505CaptureLongTicket;
++                    final long iris26505RawTimestamp = img.getTimestamp();
++                    final long iris26505ExpectedLongTimestamp = iris26505LongTicket == null
++                            ? 0L : iris26505LongTicket.expectedTimestampNs();
++                    final boolean iris26505ExactLongRawOwned = iris26505LongTicket != null
++                            && iris26505ExpectedLongTimestamp > 0L
++                            && iris26505RawTimestamp == iris26505ExpectedLongTimestamp;
++                    boolean iris26505LongCandidateCopied =
++                            stageMotion26505LongRawCandidate(iris26505LongTicket, img);
++                    if (iris26505ExactLongRawOwned) {
++                        Log.i(TAG, "IRIS_26505_LONG_RAW_EXACT_CALLBACK_OWNERSHIP"
++                                + " rawTimestamp=" + iris26505RawTimestamp
++                                + " expectedTimestamp=" + iris26505ExpectedLongTimestamp
++                                + " stagedOrDelivered=" + iris26505LongCandidateCopied
++                                + " slotSealed=" + iris26505LongTicket.slot.isSealed()
++                                + " normalRingAdmission=false");
++                        img.close();
++                        continue;
+                     }
+-                    img.close();
+-                    return;
+-                }
+-                // Keep buffering during AE probe. Eligibility is decided from
+-                // actual exposure/ISO groups at shutter time.
+-                // Metadata can arrive after the Image callback.
+-                // Measure only a sparse RAW sample; the frame is not changed.
+-                sampleMotion26380RawCaptureQuality(img);
+ 
+-                // Buffer first; validate timestamp/exposure when shutter is pressed.
+-                synchronized (mZslBufferLock) {
+-                    mZslRingBuffer.addLast(img);
+-                    if (!mIris26548FirstZslRaw) {
+-                        mIris26548FirstZslRaw = true;
+-                        Log.i(TAG, "IRIS_26548_FIRST_ZSL_RAW generation="
+-                                + mIris26548CameraHealthGeneration + " timestamp=" + img.getTimestamp());
++                    Motion26486ShortTicket iris26489ShortTicket = mMotion26486CaptureShortTicket;
++                    final long iris26490RawTimestamp = img.getTimestamp();
++                    final long iris26490ExpectedShortTimestamp = iris26489ShortTicket == null
++                            ? 0L : iris26489ShortTicket.expectedTimestampNs();
++                    final boolean iris26490ExactShortRawOwned = iris26489ShortTicket != null
++                            && iris26490ExpectedShortTimestamp > 0L
++                            && iris26490RawTimestamp == iris26490ExpectedShortTimestamp;
++                    boolean iris26489ShortCandidateCopied =
++                            stageMotion26489ShortRawCandidate(iris26489ShortTicket, img);
++                    /* IRIS_26490_EXACT_SHORT_RAW_NEVER_ENTERS_NORMAL_RING */
++                    if (iris26490ExactShortRawOwned) {
++                        Log.i(TAG, "IRIS_26490_SHORT_RAW_EXACT_CALLBACK_OWNERSHIP"
++                                + " rawTimestamp=" + iris26490RawTimestamp
++                                + " expectedTimestamp=" + iris26490ExpectedShortTimestamp
++                                + " stagedOrDelivered=" + iris26489ShortCandidateCopied
++                                + " slotSealed=" + iris26489ShortTicket.slot.isSealed()
++                                + " normalRingAdmission=false");
++                        img.close();
++                        continue;
+                     }
+-                    /* IRIS_26480_SHORT_RING_HEADROOM_V1
+-                     * ImageReader already owns frameCount+3 buffers in Motion.
+-                     * Keep up to two extra acquired Images only while the short
+-                     * highlight observation is pending, so normal ZSL frames
+-                     * are not evicted by the short probe.
++
++                    /* IRIS_26598_GENERATION_OWNED_NORMAL_RAW_INGRESS
++                     * While an exact-total Motion generation is open, ordinary repeating-preview
++                     * RAWs never enter or mutate that capture. Only an explicit NORMAL top-up
++                     * ticket may own a post-shutter RAW, by exact Camera2 sensor timestamp.
+                      */
+-                    int maxFrames = Math.min(
+-                            iris26556RequestedMotionFrames()
+-                                    + ((mMotion26480ShortRequested
+-                                            || mMotion26486ShortAcquisitions.get() > 0) ? 2 : 0),
+-                            MOTION_26593_MAX_TOTAL_FRAMES + 2);
+-                    while (mZslRingBuffer.size() > maxFrames) {
+-                        Image old = mZslRingBuffer.pollFirst();
+-                        if (old != null) old.close();
++                    if (mZslCapturing) {
++                        Motion26593CapturePlan iris26598Plan = mMotion26593CapturePlan;
++                        boolean iris26598SameGeneration = iris26598Plan != null
++                                && iris26598Plan.cameraHealthGeneration == mIris26548CameraHealthGeneration
++                                && Objects.equals(iris26598Plan.physicalCameraId,
++                                        physicalID == null ? "" : physicalID);
++                        if (iris26598SameGeneration && iris26598Plan.tryOwnTopUpRaw(img)) {
++                            Log.i(TAG, "IRIS_26598_NORMAL_TOPUP_RAW_OWNED timestamp="
++                                    + img.getTimestamp()
++                                    + " readyNormals=" + iris26598Plan.normalReadyCount()
++                                    + " normalTarget=" + iris26598Plan.normalTargetFrames
++                                    + " repeatingRingAdmission=false");
++                            continue;
++                        }
++                        if (iris26489ShortCandidateCopied) {
++                            Log.d(TAG, "IRIS_26489_SHORT_RAW_SURVIVED_EARLY_CLOSE timestamp="
++                                    + img.getTimestamp());
++                        }
++                        Log.d(TAG, "IRIS_26598_UNOWNED_CAPTURE_RAW_CLOSED timestamp="
++                                + img.getTimestamp()
++                                + " planPresent=" + (iris26598Plan != null)
++                                + " repeatingRingAdmission=false");
++                        img.close();
++                        continue;
++                    }
++
++                    if (isMotion26598RetiredNormalTopUpTimestamp(img.getTimestamp())) {
++                        Log.w(TAG, "IRIS_26598_LATE_NORMAL_TOPUP_RAW_REJECTED timestamp="
++                                + img.getTimestamp() + " staleGeneration=true");
++                        img.close();
++                        continue;
++                    }
++                    TotalCaptureResult iris26598ExactIngressResult;
++                    synchronized (mZslBufferLock) {
++                        iris26598ExactIngressResult = mZslResultMap.get(img.getTimestamp());
++                    }
++                    Object iris26598IngressTag = iris26598ExactIngressResult == null
++                            || iris26598ExactIngressResult.getRequest() == null ? null
++                            : iris26598ExactIngressResult.getRequest().getTag();
++                    if (iris26598IngressTag instanceof Motion26598NormalTopUpTag) {
++                        Log.w(TAG, "IRIS_26598_LATE_NORMAL_TOPUP_RESULT_TAG_REJECTED timestamp="
++                                + img.getTimestamp() + " staleGeneration=true");
++                        img.close();
++                        continue;
++                    }
++
++                    // Keep buffering during AE probe. Eligibility is decided from
++                    // actual exposure/ISO groups at shutter time.
++                    sampleMotion26380RawCaptureQuality(img);
++
++                    synchronized (mZslBufferLock) {
++                        mZslRingBuffer.addLast(img);
++                        if (!mIris26548FirstZslRaw) {
++                            mIris26548FirstZslRaw = true;
++                            Log.i(TAG, "IRIS_26548_FIRST_ZSL_RAW generation="
++                                    + mIris26548CameraHealthGeneration + " timestamp=" + img.getTimestamp());
++                        }
++                        int maxFrames = Math.min(
++                                iris26556RequestedMotionFrames()
++                                        + ((mMotion26480ShortRequested
++                                                || mMotion26486ShortAcquisitions.get() > 0) ? 2 : 0),
++                                MOTION_26593_MAX_TOTAL_FRAMES + 2);
++                        while (mZslRingBuffer.size() > maxFrames) {
++                            Image old = mZslRingBuffer.pollFirst();
++                            if (old != null) old.close();
++                        }
+                     }
+                 }
++                if (iris26598Drained > 1) {
++                    Log.i(TAG, "IRIS_26598_MOTION_RAW_CALLBACK_DRAINED count=" + iris26598Drained);
++                }
+                 return;
+             }
+             if (mIrisNight26540CaptureActive) {
+@@ -5575,10 +5628,86 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private volatile Motion26505LongTicket mMotion26505CaptureLongTicket = null;
+     private volatile boolean mMotion26505LongRequested = false;
+ 
+-    /* IRIS_26593_GENERATION_OWNED_TOTAL_CAPTURE_PLAN
+-     * Async callback ingress pointers may clear after exact delivery, but this immutable shutter
+-     * plan keeps the exact SHORT/LONG ticket references alive until the batch is frozen.
++    /* IRIS_26598_GENERATION_OWNED_NORMAL_TOTAL_CAPTURE
++     * 26593 correctly made slider N the exact NORMAL+SHORT+LONG budget, but NORMALs counted at
++     * shutter remained in the rolling ring and could be evicted before finalization. 26598 makes
++     * every accepted NORMAL a generation-owned slot just like SHORT/LONG: pre-shutter Images are
++     * transferred out of the rolling ring, and post-shutter NORMALs require exact timestamp-owned
++     * tickets. Super Res consumes the same immutable NORMAL set downstream and never owns capture.
+      */
++    private static final class Motion26598PreShutterNormals {
++        final ArrayList<Image> images = new ArrayList<>();
++        final HashMap<Long, TotalCaptureResult> results = new HashMap<>();
++        final int ringCountAtPress;
++        Motion26598PreShutterNormals(int ringCountAtPress) {
++            this.ringCountAtPress = ringCountAtPress;
++        }
++        void trimToLatest(int target) {
++            while (images.size() > target) {
++                Image old = images.remove(0);
++                if (old != null) {
++                    results.remove(old.getTimestamp());
++                    try { old.close(); } catch (Throwable ignored) {}
++                }
++            }
++        }
++        void closeAll() {
++            for (Image image : images) if (image != null) {
++                try { image.close(); } catch (Throwable ignored) {}
++            }
++            images.clear();
++            results.clear();
++        }
++    }
++
++    private static final class Motion26598NormalTopUpTicket {
++        final int ordinal;
++        volatile long captureStartedTimestampNs = 0L;
++        volatile long resultTimestampNs = 0L;
++        volatile boolean completed = false;
++        volatile boolean failed = false;
++        volatile boolean exposureAccepted = false;
++        volatile TotalCaptureResult result = null;
++        private Image rawImage = null;
++        Motion26598NormalTopUpTicket(int ordinal) { this.ordinal = ordinal; }
++        long expectedTimestampNs() {
++            return resultTimestampNs > 0L ? resultTimestampNs : captureStartedTimestampNs;
++        }
++        synchronized boolean offerRaw(Image image) {
++            if (image == null || rawImage != null) return false;
++            long expected = expectedTimestampNs();
++            if (expected <= 0L || image.getTimestamp() != expected) return false;
++            rawImage = image;
++            return true;
++        }
++        synchronized boolean isReady() {
++            return !failed && completed && exposureAccepted && result != null && rawImage != null
++                    && resultTimestampNs > 0L && rawImage.getTimestamp() == resultTimestampNs;
++        }
++        synchronized Image takeRaw() {
++            if (!isReady()) return null;
++            Image image = rawImage;
++            rawImage = null;
++            return image;
++        }
++        synchronized void closeRaw() {
++            if (rawImage != null) {
++                try { rawImage.close(); } catch (Throwable ignored) {}
++                rawImage = null;
++            }
++        }
++    }
++
++    private static final class Motion26598NormalTopUpTag {
++        final Motion26598NormalTopUpTicket ticket;
++        Motion26598NormalTopUpTag(Motion26598NormalTopUpTicket ticket) {
++            this.ticket = ticket;
++        }
++        @Override public String toString() {
++            return MOTION_26593_NORMAL_TOPUP_TAG + "#" + ticket.ordinal;
++        }
++    }
++
+     private static final class Motion26593CapturePlan {
+         final int totalTargetFrames;
+         final int normalTargetFrames;
+@@ -5591,12 +5720,20 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final long startElapsedMs;
+         final long completionTimeoutMs;
+         final int normalFramesAtPress;
++        final int ringCountAtPress;
++        final long cameraHealthGeneration;
++        final String physicalCameraId;
++        final ArrayList<Image> preShutterNormalImages = new ArrayList<>();
++        final HashMap<Long, TotalCaptureResult> ownedNormalResults = new HashMap<>();
++        final ArrayList<Motion26598NormalTopUpTicket> normalTopUpTickets = new ArrayList<>();
+ 
+         Motion26593CapturePlan(int totalTargetFrames, int normalTargetFrames,
+                 boolean shortExpected, boolean longExpected,
+                 Motion26486ShortTicket shortTicket, Motion26505LongTicket longTicket,
+                 TotalCaptureResult normalReferenceResult, long normalReferenceTimestampNs,
+-                long startElapsedMs, long completionTimeoutMs, int normalFramesAtPress) {
++                long startElapsedMs, long completionTimeoutMs,
++                Motion26598PreShutterNormals preShutter,
++                long cameraHealthGeneration, String physicalCameraId) {
+             this.totalTargetFrames = totalTargetFrames;
+             this.normalTargetFrames = normalTargetFrames;
+             this.shortExpected = shortExpected;
+@@ -5607,11 +5744,93 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             this.normalReferenceTimestampNs = normalReferenceTimestampNs;
+             this.startElapsedMs = startElapsedMs;
+             this.completionTimeoutMs = completionTimeoutMs;
+-            this.normalFramesAtPress = normalFramesAtPress;
++            this.normalFramesAtPress = preShutter == null ? 0 : preShutter.images.size();
++            this.ringCountAtPress = preShutter == null ? 0 : preShutter.ringCountAtPress;
++            this.cameraHealthGeneration = cameraHealthGeneration;
++            this.physicalCameraId = physicalCameraId == null ? "" : physicalCameraId;
++            if (preShutter != null) {
++                this.preShutterNormalImages.addAll(preShutter.images);
++                this.ownedNormalResults.putAll(preShutter.results);
++                preShutter.images.clear();
++                preShutter.results.clear();
++            }
++        }
++
++        synchronized void addTopUpTicket(Motion26598NormalTopUpTicket ticket) {
++            if (ticket != null) normalTopUpTickets.add(ticket);
++        }
++        synchronized boolean containsTopUpTicket(Motion26598NormalTopUpTicket ticket) {
++            return ticket != null && normalTopUpTickets.contains(ticket);
++        }
++        synchronized boolean tryOwnTopUpRaw(Image image) {
++            if (image == null) return false;
++            for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
++                if (ticket != null && ticket.offerRaw(image)) return true;
++            }
++            return false;
++        }
++        synchronized void recordTopUpResult(Motion26598NormalTopUpTicket ticket,
++                TotalCaptureResult result) {
++            if (ticket == null || result == null || !normalTopUpTickets.contains(ticket)) return;
++            Long ts = result.get(CaptureResult.SENSOR_TIMESTAMP);
++            if (ts != null && ts > 0L) ownedNormalResults.put(ts, result);
++        }
++        synchronized int normalReadyCount() {
++            int count = preShutterNormalImages.size();
++            for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
++                if (ticket != null && ticket.isReady()) count++;
++            }
++            return count;
++        }
++        synchronized boolean hasTopUpFailure() {
++            for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
++                if (ticket != null && ticket.failed) return true;
++            }
++            return false;
++        }
++        synchronized TotalCaptureResult normalResult(long timestampNs) {
++            return ownedNormalResults.get(timestampNs);
++        }
++        synchronized List<Image> takeOwnedNormalImages() {
++            ArrayList<Image> out = new ArrayList<>(normalTargetFrames);
++            out.addAll(preShutterNormalImages);
++            preShutterNormalImages.clear();
++            for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
++                if (ticket == null) continue;
++                Image image = ticket.takeRaw();
++                if (image != null) out.add(image);
++            }
++            out.sort(Comparator.comparingLong(Image::getTimestamp));
++            return out;
++        }
++        synchronized void closeOwnedNormals() {
++            for (Image image : preShutterNormalImages) if (image != null) {
++                try { image.close(); } catch (Throwable ignored) {}
++            }
++            preShutterNormalImages.clear();
++            for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
++                if (ticket != null) ticket.closeRaw();
++            }
++            ownedNormalResults.clear();
+         }
+     }
+     private volatile Motion26593CapturePlan mMotion26593CapturePlan = null;
+ 
++    /* IRIS_26598_ONE_DEEP_DEFERRED_MOTION_SHUTTER
++     * Preserve the proven single-active reconstruction rule, but never discard a user shutter
++     * intent merely because acquisition/processing is busy. At most one future shutter is latched;
++     * additional taps collapse into that one intent and are replayed only on the same live camera
++     * generation after the current immutable batch terminates.
++     */
++    private final java.util.concurrent.atomic.AtomicBoolean mMotion26598DeferredShutter =
++            new java.util.concurrent.atomic.AtomicBoolean(false);
++    private volatile long mMotion26598DeferredGeneration = -1L;
++    private volatile String mMotion26598DeferredPhysicalId = "";
++    private volatile long mMotion26598DeferredRequestedMs = 0L;
++    private final ArrayDeque<Long> mMotion26598RetiredNormalTopUpTimestamps = new ArrayDeque<>();
++    private static final int MOTION_26598_RETIRED_TOPUP_TIMESTAMP_LIMIT = 64;
++    private static final long MOTION_26598_DEFERRED_RING_READY_WAIT_MS = 2000L;
++
+     private void clearMotion26505LongTicket(
+             Motion26505LongTicket ticket, String reason) {
+         if (ticket == null) return;
+@@ -5666,41 +5885,165 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    /* IRIS_26593_EXACT_FROZEN_NORMAL_GROUP_COUNT
+-     * Count only exact-metadata RAWs matching the shutter-frozen NORMAL exposure. This count may
+-     * include post-shutter repeating RAWs while the immutable total-frame plan is still open.
++    /* IRIS_26598_PRE_SHUTTER_NORMAL_OWNERSHIP_TRANSFER
++     * Snapshot the newest exact shutter-exposure NORMALs before any post-shutter role can mutate
++     * the rolling ring. Selected Images are removed from the ring without closing; every other
++     * acquired ring Image is closed immediately so ImageReader headroom is available for the exact
++     * missing NORMAL/SHORT/LONG requests.
+      */
+-    private int countMotion26593NormalFrames(Motion26593CapturePlan plan) {
+-        if (plan == null || plan.normalReferenceResult == null) return 0;
+-        int valid = 0;
++    private Motion26598PreShutterNormals freezeMotion26598PreShutterNormals(
++            @NonNull TotalCaptureResult normalReferenceResult, int maxNormals) {
+         synchronized (mZslBufferLock) {
++            final int ringCount = mZslRingBuffer.size();
++            Motion26598PreShutterNormals snapshot = new Motion26598PreShutterNormals(ringCount);
++            ArrayList<Image> eligible = new ArrayList<>();
++            HashMap<Long, TotalCaptureResult> eligibleResults = new HashMap<>();
+             for (Image image : mZslRingBuffer) {
+                 if (image == null) continue;
+                 TotalCaptureResult result = mZslResultMap.get(image.getTimestamp());
+-                if (result == null) continue;
+-                CaptureRequest request = result.getRequest();
+-                Object tag = request == null ? null : request.getTag();
+-                if (MOTION_26480_SHORT_TAG.equals(tag) || MOTION_26505_LONG_TAG.equals(tag)) continue;
+-                if (motionExposurePairMatches(result, plan.normalReferenceResult)) valid++;
++                if (result == null || result.getRequest() == null) continue;
++                Object tag = result.getRequest().getTag();
++                if (MOTION_26480_SHORT_TAG.equals(tag) || MOTION_26505_LONG_TAG.equals(tag)
++                        || tag instanceof Motion26598NormalTopUpTag) continue;
++                if (!motionExposurePairMatches(result, normalReferenceResult)) continue;
++                eligible.add(image);
++                eligibleResults.put(image.getTimestamp(), result);
++            }
++            int keepFrom = Math.max(0, eligible.size() - Math.max(0, maxNormals));
++            java.util.HashSet<Image> keep = new java.util.HashSet<>();
++            for (int i = keepFrom; i < eligible.size(); i++) keep.add(eligible.get(i));
++            java.util.Iterator<Image> it = mZslRingBuffer.iterator();
++            while (it.hasNext()) {
++                Image image = it.next();
++                it.remove();
++                if (image != null && keep.contains(image)) {
++                    snapshot.images.add(image);
++                    TotalCaptureResult result = eligibleResults.get(image.getTimestamp());
++                    if (result != null) snapshot.results.put(image.getTimestamp(), result);
++                } else if (image != null) {
++                    try { image.close(); } catch (Throwable ignored) {}
++                }
+             }
++            Log.i(TAG, "IRIS_26598_PRE_SHUTTER_NORMALS_OWNED ringAtPress=" + ringCount
++                    + " eligibleAtPress=" + eligible.size()
++                    + " ownedAtPress=" + snapshot.images.size()
++                    + " maxProvisional=" + maxNormals
++                    + " rollingRingRemaining=" + mZslRingBuffer.size());
++            return snapshot;
+         }
+-        return valid;
++    }
++
++    private int countMotion26593NormalFrames(Motion26593CapturePlan plan) {
++        return plan == null ? 0 : plan.normalReadyCount();
+     }
+ 
+     private long motion26593CompletionTimeoutMs(int missingNormals, long normalExposureNs,
+             boolean auxiliaryExpected) {
+-        long cadenceNs = Math.max(33_333_333L, Math.max(1L, normalExposureNs));
+-        long estimatedNormalMs = 500L + (long)Math.ceil(
+-                Math.max(0, missingNormals) * (cadenceNs / 1_000_000.0) * 1.35);
+-        long estimate = auxiliaryExpected
+-                ? Math.max(estimatedNormalMs, MOTION_26593_AUX_COMPLETION_MS)
+-                : estimatedNormalMs;
+-        return Math.max(MOTION_26593_MIN_CAPTURE_COMPLETION_MS,
+-                Math.min(MOTION_26593_MAX_CAPTURE_COMPLETION_MS, estimate));
++        /* IRIS_26598_COMPLETION_WATCHDOG_NOT_CADENCE_OWNER
++         * The watchdog is only a terminal failure bound; successful capture completes immediately
++         * when all exact owned slots arrive. Any post-shutter role gets the already-established
++         * 3.5 s maximum rather than assuming preview cadence can deliver a RAW burst in 1.4 s.
++         */
++        if (missingNormals > 0 || auxiliaryExpected) return MOTION_26593_MAX_CAPTURE_COMPLETION_MS;
++        return MOTION_26593_MIN_CAPTURE_COMPLETION_MS;
++    }
++
++    private void rememberMotion26598RetiredNormalTopUpTimestamp(long timestampNs) {
++        if (timestampNs <= 0L) return;
++        synchronized (mZslBufferLock) {
++            if (!mMotion26598RetiredNormalTopUpTimestamps.contains(timestampNs)) {
++                mMotion26598RetiredNormalTopUpTimestamps.addLast(timestampNs);
++            }
++            while (mMotion26598RetiredNormalTopUpTimestamps.size()
++                    > MOTION_26598_RETIRED_TOPUP_TIMESTAMP_LIMIT) {
++                mMotion26598RetiredNormalTopUpTimestamps.pollFirst();
++            }
++        }
++    }
++
++    private boolean isMotion26598RetiredNormalTopUpTimestamp(long timestampNs) {
++        synchronized (mZslBufferLock) {
++            return mMotion26598RetiredNormalTopUpTimestamps.contains(timestampNs);
++        }
++    }
++
++    private void rememberMotion26598PlanTopUpTimestamps(Motion26593CapturePlan plan) {
++        if (plan == null) return;
++        synchronized (plan) {
++            for (Motion26598NormalTopUpTicket ticket : plan.normalTopUpTickets) {
++                if (ticket == null) continue;
++                rememberMotion26598RetiredNormalTopUpTimestamp(ticket.captureStartedTimestampNs);
++                rememberMotion26598RetiredNormalTopUpTimestamp(ticket.resultTimestampNs);
++            }
++        }
++    }
++
++    private void latchMotion26598DeferredShutter(String busyReason) {
++        boolean first = mMotion26598DeferredShutter.compareAndSet(false, true);
++        if (first) {
++            mMotion26598DeferredGeneration = mIris26548CameraHealthGeneration;
++            mMotion26598DeferredPhysicalId = physicalID == null ? "" : physicalID;
++            mMotion26598DeferredRequestedMs = android.os.SystemClock.elapsedRealtime();
++        }
++        Log.i(TAG, "IRIS_26598_DEFERRED_SHUTTER_LATCHED first=" + first
++                + " collapsed=" + (!first)
++                + " busyReason=" + busyReason
++                + " generation=" + mMotion26598DeferredGeneration
++                + " physicalId=" + mMotion26598DeferredPhysicalId
++                + " inFlight=" + mMotion26486InFlightBatches.get()
++                + " acquiring=" + mZslCapturing);
++    }
++
++    private void scheduleMotion26598DeferredShutterReplay(String source) {
++        if (!mMotion26598DeferredShutter.get() || mBackgroundHandler == null) return;
++        final long replayStartMs = android.os.SystemClock.elapsedRealtime();
++        mBackgroundHandler.post(() -> replayMotion26598DeferredShutter(source, replayStartMs));
++    }
++
++    private void replayMotion26598DeferredShutter(String source, long replayStartMs) {
++        if (!mMotion26598DeferredShutter.get()) return;
++        if (mZslCapturing || mMotion26486InFlightBatches.get() > 0) return;
++        boolean sameGeneration = mMotion26598DeferredGeneration == mIris26548CameraHealthGeneration;
++        boolean samePhysical = Objects.equals(mMotion26598DeferredPhysicalId,
++                physicalID == null ? "" : physicalID);
++        boolean sameMode = PhotonCamera.getSettings().selectedMode == CameraMode.MOTION;
++        if (!sameGeneration || !samePhysical || !sameMode || mCameraDevice == null
++                || mCaptureSession == null || !mIris26555RawStreamAvailable) {
++            if (mMotion26598DeferredShutter.compareAndSet(true, false)) {
++                Log.w(TAG, "IRIS_26598_DEFERRED_SHUTTER_CANCELED source=" + source
++                        + " sameGeneration=" + sameGeneration
++                        + " samePhysical=" + samePhysical
++                        + " sameMode=" + sameMode
++                        + " cameraDevice=" + (mCameraDevice != null)
++                        + " captureSession=" + (mCaptureSession != null));
++                showToast("Queued Motion capture canceled after camera change");
++            }
++            return;
++        }
++        if (iris26555PreviewOnlyRecoveryActive() || !iris26555MotionZslReady()) {
++            long waited = android.os.SystemClock.elapsedRealtime() - replayStartMs;
++            if (waited < MOTION_26598_DEFERRED_RING_READY_WAIT_MS && mBackgroundHandler != null) {
++                mBackgroundHandler.postDelayed(
++                        () -> replayMotion26598DeferredShutter(source, replayStartMs), 50L);
++            } else if (mMotion26598DeferredShutter.compareAndSet(true, false)) {
++                Log.w(TAG, "IRIS_26598_DEFERRED_SHUTTER_BUFFER_TIMEOUT source=" + source
++                        + " waitedMs=" + waited);
++                showToast("Motion RAW buffer is still preparing");
++            }
++            return;
++        }
++        if (!mMotion26598DeferredShutter.compareAndSet(true, false)) return;
++        Log.i(TAG, "IRIS_26598_DEFERRED_SHUTTER_REPLAY source=" + source
++                + " waitedSincePressMs="
++                + (android.os.SystemClock.elapsedRealtime() - mMotion26598DeferredRequestedMs)
++                + " generation=" + mIris26548CameraHealthGeneration
++                + " exactNormalShortLongBudget=true");
++        captureStillPicture();
+     }
+ 
+     private void clearMotion26593CapturePlan(Motion26593CapturePlan plan, String reason) {
+         if (plan == null) return;
++        rememberMotion26598PlanTopUpTimestamps(plan);
+         boolean cleared = false;
+         synchronized (mZslBufferLock) {
+             if (mMotion26593CapturePlan == plan) {
+@@ -5712,6 +6055,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + " cleared=" + cleared
+                 + " totalTarget=" + plan.totalTargetFrames
+                 + " normalTarget=" + plan.normalTargetFrames
++                + " normalAtPress=" + plan.normalFramesAtPress
+                 + " shortExpected=" + plan.shortExpected
+                 + " longExpected=" + plan.longExpected);
+     }
+@@ -5724,6 +6068,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         plan.shortTicket.slot.sealAndClose();
+         plan.shortTicket.closeStaged();
+         if (plan.longTicket != null) plan.longTicket.closeStaged();
++        plan.closeOwnedNormals();
+         clearMotion26490CaptureShortTicket(plan.shortTicket, "26593_" + reason);
+         if (plan.longTicket != null) clearMotion26505LongTicket(plan.longTicket, "26593_" + reason);
+         clearMotion26593CapturePlan(plan, reason);
+@@ -5738,12 +6083,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         recoverMotionCaptureAfterEarlyExit("IRIS_26593_" + reason, userMessage);
+     }
+ 
+-    /* IRIS_26593_EXPLICIT_FROZEN_NORMAL_TOPUP
+-     * If the rolling ZSL ring is not full at shutter, queue only the missing NORMAL RAWs as
+-     * raw-only still requests using the shutter-frozen exposure/ISO. The preview repeating request
+-     * is never mutated, so viewfinder metering/brightness ownership is unchanged. On devices where
+-     * manual sensor control is unavailable, a capture-local AE lock is attempted; admission still
+-     * requires actual metadata to match the frozen NORMAL exposure group.
++    /* IRIS_26598_EXPLICIT_GENERATION_OWNED_NORMAL_TOPUP
++     * Each missing NORMAL is its own immutable ticket. Camera2 onCaptureStarted/result/Image
++     * sensor timestamp equality is the identity authority, exactly like SHORT/LONG. The preview
++     * repeating request is never mutated and unrelated post-shutter RAWs never satisfy the plan.
+      */
+     private boolean submitMotion26593MissingNormals(
+             @NonNull Motion26593CapturePlan plan, int missingNormals) {
+@@ -5772,10 +6115,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         ArrayList<CaptureRequest> requests = new ArrayList<>(missingNormals);
+         try {
+             for (int i = 0; i < missingNormals; i++) {
++                Motion26598NormalTopUpTicket ticket = new Motion26598NormalTopUpTicket(i);
++                plan.addTopUpTicket(ticket);
+                 CaptureRequest.Builder b = mCameraDevice.createCaptureRequest(
+                         CameraDevice.TEMPLATE_STILL_CAPTURE);
+                 b.addTarget(mImageReaderRaw.getSurface());
+-                b.setTag(MOTION_26593_NORMAL_TOPUP_TAG);
++                b.setTag(new Motion26598NormalTopUpTag(ticket));
+                 if (mPreviewAFMode >= 0) b.set(CaptureRequest.CONTROL_AF_MODE, mPreviewAFMode);
+                 if (Float.isFinite(mFocus) && mFocus >= 0.0f) {
+                     try { b.set(CaptureRequest.LENS_FOCUS_DISTANCE, mFocus); }
+@@ -5798,37 +6143,108 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 requests.add(b.build());
+             }
+             mCaptureSession.captureBurst(requests, new CameraCaptureSession.CaptureCallback() {
++                private Motion26598NormalTopUpTicket ticketFor(CaptureRequest request) {
++                    Object tag = request == null ? null : request.getTag();
++                    return tag instanceof Motion26598NormalTopUpTag
++                            ? ((Motion26598NormalTopUpTag) tag).ticket : null;
++                }
++                @Override public void onCaptureStarted(@NonNull CameraCaptureSession session,
++                        @NonNull CaptureRequest request, long timestamp, long frameNumber) {
++                    Motion26598NormalTopUpTicket ticket = ticketFor(request);
++                    if (ticket == null || !plan.containsTopUpTicket(ticket)) return;
++                    if (mMotion26593CapturePlan != plan) {
++                        rememberMotion26598RetiredNormalTopUpTimestamp(timestamp);
++                        return;
++                    }
++                    ticket.captureStartedTimestampNs = timestamp;
++                    Log.i(TAG, "IRIS_26598_NORMAL_TOPUP_CAPTURE_STARTED ordinal=" + ticket.ordinal
++                            + " sensorTimestamp=" + timestamp
++                            + " frameNumber=" + frameNumber
++                            + " exactImageTimestampContract=true");
++                }
+                 @Override public void onCaptureCompleted(@NonNull CameraCaptureSession session,
+                         @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
++                    Motion26598NormalTopUpTicket ticket = ticketFor(request);
++                    if (ticket == null || !plan.containsTopUpTicket(ticket)) return;
+                     Long ts = result.get(CaptureResult.SENSOR_TIMESTAMP);
+-                    if (ts != null) {
+-                        synchronized (mZslBufferLock) {
+-                            mZslResultMap.put(ts, result);
+-                            while (mZslResultMap.size() > MAX_ZSL_RESULT_METADATA) {
+-                                Long oldest = Collections.min(mZslResultMap.keySet());
+-                                mZslResultMap.remove(oldest);
+-                            }
++                    if (mMotion26593CapturePlan != plan) {
++                        if (ts != null) rememberMotion26598RetiredNormalTopUpTimestamp(ts);
++                        ticket.completed = true;
++                        ticket.failed = true;
++                        ticket.closeRaw();
++                        return;
++                    }
++                    ticket.completed = true;
++                    ticket.result = result;
++                    if (ts == null || ts <= 0L) {
++                        ticket.failed = true;
++                        ticket.closeRaw();
++                        return;
++                    }
++                    ticket.resultTimestampNs = ts;
++                    if (ticket.captureStartedTimestampNs > 0L
++                            && ticket.captureStartedTimestampNs != ts) {
++                        ticket.failed = true;
++                        ticket.closeRaw();
++                        rememberMotion26598RetiredNormalTopUpTimestamp(ts);
++                        Log.e(TAG, "IRIS_26598_NORMAL_TOPUP_TIMESTAMP_MISMATCH ordinal="
++                                + ticket.ordinal + " started=" + ticket.captureStartedTimestampNs
++                                + " result=" + ts);
++                        return;
++                    }
++                    ticket.exposureAccepted = motionExposurePairMatches(
++                            result, plan.normalReferenceResult);
++                    if (!ticket.exposureAccepted) {
++                        ticket.failed = true;
++                        ticket.closeRaw();
++                        Log.w(TAG, "IRIS_26598_NORMAL_TOPUP_EXPOSURE_REJECTED ordinal="
++                                + ticket.ordinal + " sensorTimestamp=" + ts
++                                + " frozenExposureRequired=true");
++                    } else {
++                        plan.recordTopUpResult(ticket, result);
++                        Log.i(TAG, "IRIS_26598_NORMAL_TOPUP_RESULT_ACCEPTED ordinal="
++                                + ticket.ordinal + " sensorTimestamp=" + ts
++                                + " exposureNs=" + result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
++                                + " iso=" + result.get(CaptureResult.SENSOR_SENSITIVITY)
++                                + " exactFrozenNormal=true");
++                    }
++                    synchronized (mZslBufferLock) {
++                        mZslResultMap.put(ts, result);
++                        while (mZslResultMap.size() > MAX_ZSL_RESULT_METADATA) {
++                            Long oldest = Collections.min(mZslResultMap.keySet());
++                            mZslResultMap.remove(oldest);
+                         }
+                     }
+                 }
+                 @Override public void onCaptureFailed(@NonNull CameraCaptureSession session,
+                         @NonNull CaptureRequest request,
+                         @NonNull android.hardware.camera2.CaptureFailure failure) {
+-                    Log.w(TAG, "IRIS_26593_NORMAL_TOPUP_FRAME_FAILED reason=" + failure.getReason());
++                    Motion26598NormalTopUpTicket ticket = ticketFor(request);
++                    if (ticket != null) {
++                        rememberMotion26598RetiredNormalTopUpTimestamp(ticket.captureStartedTimestampNs);
++                        rememberMotion26598RetiredNormalTopUpTimestamp(ticket.resultTimestampNs);
++                        ticket.completed = true;
++                        ticket.failed = true;
++                        ticket.closeRaw();
++                    }
++                    Log.w(TAG, "IRIS_26598_NORMAL_TOPUP_FRAME_FAILED ordinal="
++                            + (ticket == null ? -1 : ticket.ordinal)
++                            + " reason=" + failure.getReason());
+                 }
+                 @Override public void onCaptureSequenceCompleted(@NonNull CameraCaptureSession session,
+                         int sequenceId, long frameNumber) {
+-                    Log.i(TAG, "IRIS_26593_NORMAL_TOPUP_SEQUENCE_COMPLETE sequenceId=" + sequenceId
++                    Log.i(TAG, "IRIS_26598_NORMAL_TOPUP_SEQUENCE_COMPLETE sequenceId=" + sequenceId
+                             + " requested=" + missingNormals + " lastFrame=" + frameNumber);
+                 }
+             }, mBackgroundHandler);
+-            Log.i(TAG, "IRIS_26593_NORMAL_TOPUP_SUBMITTED count=" + missingNormals
++            Log.i(TAG, "IRIS_26598_NORMAL_TOPUP_SUBMITTED count=" + missingNormals
+                     + " mode=" + (manual ? "MANUAL_FROZEN_EXPOSURE" : "CAPTURE_LOCAL_AE_LOCK")
+                     + " exposureNs=" + expObj + " iso=" + isoObj
+-                    + " previewRepeatingRequestMutated=false rawOnlyTarget=true");
++                    + " previewRepeatingRequestMutated=false rawOnlyTarget=true"
++                    + " generationOwnedTickets=true");
+             return true;
+         } catch (CameraAccessException | IllegalArgumentException | IllegalStateException e) {
+-            Log.w(TAG, "IRIS_26593_NORMAL_TOPUP_SUBMIT_FAILED count=" + missingNormals
++            Log.w(TAG, "IRIS_26598_NORMAL_TOPUP_SUBMIT_FAILED count=" + missingNormals
+                     + " reason=" + e.getClass().getSimpleName());
+             return false;
+         }
+@@ -5837,6 +6253,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     /* IRIS_26593_TOTAL_BATCH_COMPLETION_GATE */
+     private void pollMotion26593CapturePlan(Motion26593CapturePlan plan) {
+         if (plan == null || !mZslCapturing || mMotion26593CapturePlan != plan) return;
++        if (plan.cameraHealthGeneration != mIris26548CameraHealthGeneration
++                || !Objects.equals(plan.physicalCameraId, physicalID == null ? "" : physicalID)
++                || PhotonCamera.getSettings().selectedMode != CameraMode.MOTION) {
++            failMotion26593CapturePlan(plan, "CAPTURE_GENERATION_CHANGED",
++                    "Motion capture canceled after camera change");
++            return;
++        }
+         int normalReadyCount = countMotion26593NormalFrames(plan);
+         boolean shortPresent = !plan.shortExpected || plan.shortTicket.slot.hasFrame();
+         boolean longPresent = !plan.longExpected
+@@ -5860,6 +6283,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             failMotion26593CapturePlan(plan, "LONG_CAPTURE_FAILURE", "HDR shadow frame failed");
+             return;
+         }
++        if (plan.hasTopUpFailure()) {
++            failMotion26593CapturePlan(plan, "NORMAL_TOPUP_FRAME_FAILURE",
++                    "Motion NORMAL frame failed");
++            return;
++        }
+ 
+         if (normalReadyCount >= plan.normalTargetFrames && shortPresent && longPresent) {
+             mMotionTopUpActive = false;
+@@ -5903,7 +6331,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         /* IRIS_26593_TOTAL_FRAME_CAPTURE_ENTRY */
+         if (mZslCapturing
+                 || mMotion26486InFlightBatches.get() >= MOTION_26486_MAX_INFLIGHT_BATCHES) {
+-            Log.w(TAG, "ZSL: Motion processing active; shutter waits for current immutable batch");
++            latchMotion26598DeferredShutter(mZslCapturing ? "ACQUISITION_ACTIVE" : "PROCESSING_ACTIVE");
++            Log.w(TAG, "ZSL: Motion busy; one shutter intent deferred until current immutable batch completes");
+             return;
+         }
+ 
+@@ -5932,6 +6361,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     "IRIS_26593_MOTION_NOT_READY",
+                     "totalTarget=" + iris26593TotalTarget
+                             + " sessionReady=false ringRequirement=0");
++            showToast("Motion capture is not ready");
+             return;
+         }
+ 
+@@ -5946,6 +6376,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         try { cameraEventsListener.onCaptureStillPictureStarted("ZSLCaptureStarted!"); }
+         catch (Exception uiError) { Log.e(TAG,"26484 immediate shutter ack failed",uiError); }
+ 
++        final Motion26598PreShutterNormals iris26598PreShutterNormals =
++                freezeMotion26598PreShutterNormals(iris26593NormalReference, iris26593TotalTarget);
++
+         mMotion26505LongRequested = false;
+         Motion26505LongTicket iris26505PreviousLongTicket = mMotion26505CaptureLongTicket;
+         if (iris26505PreviousLongTicket != null) {
+@@ -5989,6 +6422,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + (iris26505LongRequested ? 1 : 0);
+         final int iris26593NormalTarget = iris26593TotalTarget - iris26593AuxCount;
+         if (iris26593NormalTarget < 1) {
++            iris26598PreShutterNormals.closeAll();
+             iris26486ShortTicket.slot.sealAndClose();
+             clearMotion26490CaptureShortTicket(iris26486ShortTicket, "invalid_total_budget");
+             clearMotion26505LongTicket(iris26505LongTicket, "invalid_total_budget");
+@@ -5996,13 +6430,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+ 
+-        Motion26593CapturePlan probePlan = new Motion26593CapturePlan(
+-                iris26593TotalTarget, iris26593NormalTarget,
+-                iris26480ShortHighlightRequested, iris26505LongRequested,
+-                iris26486ShortTicket, iris26505LongTicket, iris26593NormalReference,
+-                iris26593ReferenceTs, android.os.SystemClock.elapsedRealtime(),
+-                MOTION_26593_MIN_CAPTURE_COMPLETION_MS, 0);
+-        final int iris26593NormalAtPress = countMotion26593NormalFrames(probePlan);
++        iris26598PreShutterNormals.trimToLatest(iris26593NormalTarget);
++        final int iris26593NormalAtPress = iris26598PreShutterNormals.images.size();
+         final int iris26593MissingNormals = Math.max(0,
+                 iris26593NormalTarget - iris26593NormalAtPress);
+         final long iris26593TimeoutMs = motion26593CompletionTimeoutMs(
+@@ -6014,7 +6443,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 iris26480ShortHighlightRequested, iris26505LongRequested,
+                 iris26486ShortTicket, iris26505LongTicket, iris26593NormalReference,
+                 iris26593ReferenceTs, iris26593StartMs, iris26593TimeoutMs,
+-                iris26593NormalAtPress);
++                iris26598PreShutterNormals, mIris26548CameraHealthGeneration, physicalID);
+         mMotion26593CapturePlan = iris26593Plan;
+ 
+         mMotionTopUpStartMs = iris26593StartMs;
+@@ -6022,8 +6451,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotionTopUpMinimumFrames = iris26593NormalTarget;
+         mMotion26485PrebufferFullAtPress = iris26593NormalAtPress >= iris26593NormalTarget;
+ 
+-        int iris26593BufferedRawFrames;
+-        synchronized (mZslBufferLock) { iris26593BufferedRawFrames = mZslRingBuffer.size(); }
++        final int iris26593BufferedRawFrames = iris26593Plan.ringCountAtPress;
+         mMotionDiagnosticShotId = com.particlesdevs.photoncamera.util.MotionTrace.beginShot(
+                 physicalID, iris26593TotalTarget, iris26593BufferedRawFrames,
+                 mMotionManualLadderActive, mMotionUnifiedGeneration);
+@@ -6046,6 +6474,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + " postShutterNormalAdmission=" + (iris26593MissingNormals > 0)
+                         + " normalReferenceExposureNs=" + iris26593ReferenceExp
+                         + " normalReferenceIso=" + iris26593ReferenceIso
++                        + " preShutterNormalsGenerationOwned=true"
++                        + " postShutterNormalsTicketOwned=true"
++                        + " superResCaptureBudgetOwner=false"
+                         + " exactTotalRequired=true");
+         if (iris26593MissingNormals > 0
+                 && !submitMotion26593MissingNormals(iris26593Plan, iris26593MissingNormals)) {
+@@ -6312,6 +6743,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + " generation=" + mMotionUnifiedGeneration
+                 + " settled=" + mMotionUnifiedSettledFrames
+                 + " aeProbe=" + mMotionAeProbeActive);
++        showToast(userMessage);
++        scheduleMotion26598DeferredShutterReplay("early_recovery_" + traceResult);
+     }
+ 
+ 
+@@ -6327,18 +6760,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         BurstShakiness = new ArrayList<>();
+         mExposures = new HashMap<>();
+ 
+-        // Drain raw Image objects from the ring buffer (no copy yet)
+-        List<Image> rawImages;
+-        int validAtDrain;
+-        synchronized (mZslBufferLock) {
+-            validAtDrain = countMotion26593NormalFrames(iris26593Plan);
+-            if (validAtDrain >= mMotionTopUpMinimumFrames) {
+-                rawImages = new ArrayList<>(mZslRingBuffer);
+-                mZslRingBuffer.clear();
+-            } else {
+-                rawImages = null;
+-            }
+-        }
++        /* IRIS_26598_IMMUTABLE_NORMAL_SET_DRAIN
++         * Finalization consumes only the exact generation-owned NORMAL Images. The rolling ZSL
++         * ring is not a capture source after shutter and therefore cannot replace pre-shutter
++         * evidence with unrelated repeating-preview RAWs.
++         */
++        int validAtDrain = countMotion26593NormalFrames(iris26593Plan);
++        List<Image> rawImages = validAtDrain >= mMotionTopUpMinimumFrames
++                ? iris26593Plan.takeOwnedNormalImages() : null;
+ 
+         if (rawImages == null) {
+             Log.w(TAG, "MOTION_DRAIN_DEFERRED"
+@@ -6370,8 +6799,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         TotalCaptureResult irisV13ShadowAuxResult = null;
+         int irisV13ShadowAuxIndex = -1;
+         final long irisV13ShadowSelectStartNs = System.nanoTime();
+-        /* rawImages is the immediately frozen rolling-ZSL ring from the shutter path;
+-         * only tagged Short-A is non-normal and excluded separately. */
++        /* rawImages is the exact generation-owned NORMAL set: accepted pre-shutter ZSL
++         * evidence plus only timestamp-owned missing NORMAL top-ups. */
+         final long irisV13PreShutterCeilingNs = iris26593Plan.normalReferenceTimestampNs;
+         final double irisV13NormalEnergy = motion26486ExposureEnergy(bestExposureGroup);
+         Long irisV13NormalExpObj = bestExposureGroup == null ? null
+@@ -6390,7 +6819,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             Image im = rawImages.get(i);
+             if (im == null) continue;
+             long rawTs = im.getTimestamp();
+-            TotalCaptureResult rr = findNearestZslResult(rawTs);
++            TotalCaptureResult rr = iris26593Plan.normalResult(rawTs);
+             Long rrTs = rr == null ? null : rr.get(CaptureResult.SENSOR_TIMESTAMP);
+             Long e = rr == null ? null : rr.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+             Integer iso = rr == null ? null : rr.get(CaptureResult.SENSOR_SENSITIVITY);
+@@ -6537,7 +6966,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+         for (int i = skip; i < rawImages.size(); i++) {
+             Image img = rawImages.get(i);
+-            TotalCaptureResult frameResult = findNearestZslResult(img.getTimestamp());
++            TotalCaptureResult frameResult = iris26593Plan.normalResult(img.getTimestamp());
+             if (irisV13ShadowAuxFrame != null
+                     && img.getTimestamp() == irisV13ShadowAuxTimestamp) {
+                 img.close();
+@@ -6995,6 +7424,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotion26505LongRequested = false;
+         clearMotion26490CaptureShortTicket(iris26486ShortTicket, "26593_batch_frozen");
+         clearMotion26505LongTicket(iris26505LongTicket, "26593_batch_frozen");
++        Log.i(TAG, "IRIS_26598_EXACT_TOTAL_OWNERSHIP_PROOF"
++                + " sliderTotal=" + iris26593Plan.totalTargetFrames
++                + " normalTarget=" + iris26593Plan.normalTargetFrames
++                + " normalAtPress=" + iris26593Plan.normalFramesAtPress
++                + " normalFinal=" + actualCount
++                + " shortExpected=" + iris26593Plan.shortExpected
++                + " shortPresent=" + iris26486ShortSlot.hasFrame()
++                + " longExpected=" + iris26593Plan.longExpected
++                + " longPresent=" + iris26486ShortSlot.shadowAuxSlot.hasFrame()
++                + " superResFrozen=" + mMotion26575SuperResAtShutter
++                + " exactPhysicalBudget=" + iris26593Plan.totalTargetFrames
++                + " noRepeatingRawSubstitution=true");
+         clearMotion26593CapturePlan(iris26593Plan, "immutable_batch_handoff");
+         final long iris26486ShotId = mMotionDiagnosticShotId;
+         final CameraCharacteristics iris26486Characteristics = mCameraCharacteristics;
+@@ -7056,6 +7497,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         Log.e(TAG, "Motion shutter cleanup callback failed: "
+                                 + Log.getStackTraceString(cleanupError));
+                     }
++                    scheduleMotion26598DeferredShutterReplay("batch_finished");
+                 }
+             }
+         });
+@@ -7070,6 +7512,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             showToast("RAW capture is not supported by this camera");
+             return;
+         }
++        if (iris26555Mode == CameraMode.MOTION
++                && (mZslCapturing
++                        || mMotion26486InFlightBatches.get() >= MOTION_26486_MAX_INFLIGHT_BATCHES)) {
++            latchMotion26598DeferredShutter(mZslCapturing ? "ACQUISITION_ACTIVE_UI" : "PROCESSING_ACTIVE_UI");
++            return;
++        }
+         if (iris26555Mode == CameraMode.MOTION && mIris26555RawStreamAvailable
+                 && (iris26555PreviewOnlyRecoveryActive() || !iris26555MotionZslReady())) {
+             Log.w(TAG, "IRIS_26555_MOTION_CAPTURE_NOT_READY_INTERNAL recoveryStage="
+@@ -7092,6 +7540,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 iris26553NightDispatchReserved = true;
+             }
+             if (null == mCameraDevice) {
++                if (iris26555Mode == CameraMode.MOTION) showToast("Motion camera is not ready");
+                 return;
+             }
+             if (isZslMode()) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
+index d0b8020b7b7e21d05e424d95768eb7b5960d749f..75de7740418d92b03d9639bd539543b6fa8483f6 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
+@@ -49,11 +49,10 @@ public final class MotionV2AdaptiveColorAppearance extends Node {
+         glProg.useAssetProgram("motionv2/adaptive_color_appearance_26563");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+         glProg.setVar("displayGain", displayGain);
+-        float baseSceneWhite = MotionV2Render.iris26582BaseSceneWhite(displayGain);
+-        float sceneWhite = basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite;
+-        if (!Float.isFinite(sceneWhite) || sceneWhite < baseSceneWhite) sceneWhite = baseSceneWhite;
+-        sceneWhite = Math.min(MotionV2Render.IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, sceneWhite);
++        float sceneWhite = MotionV2Render.iris26598PublicationSceneWhite(basePipeline.mParameters);
+         glProg.setVar("sceneWhite", sceneWhite);
++        glProg.setVar("iris26598MotionPublication",
++                basePipeline.mParameters.motionV2Active ? 1 : 0);
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
+@@ -69,6 +68,12 @@ public final class MotionV2AdaptiveColorAppearance extends Node {
+                 + " maxWeakChromaGain=" + MAX_WEAK_CHROMA_GAIN
+                 + " maxHighlightChromaGain=" + MAX_HIGHLIGHT_CHROMA_GAIN
+                 + " sceneWhite=" + sceneWhite
++                + " adaptiveSceneWhite=" + basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite
++                + " publicationSceneWhiteSource="
++                    + (basePipeline.mParameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
++                + " publicationCurvePredictor="
++                    + (basePipeline.mParameters.motionV2Active ? "EXACT_26597_MOTION" : "PRESERVED_26585_NIGHT")
++                + " IRIS_26598_SEMANTIC_AUTHORITY=true"
+                 + " toneAwareHighlightChroma=true"
+                 + " displayGain=" + displayGain
+                 + " irisNight=" + basePipeline.mParameters.irisNightActive
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index f156878b7002ce0b635dd75a66aac83e44eff010..07b1e190f7e5f0be774372f41e85f832b10a505e 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -7,6 +7,7 @@ import android.os.Build;
+ import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+ import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
++import com.particlesdevs.photoncamera.processing.render.Parameters;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+ import java.nio.ByteBuffer;
+@@ -93,6 +94,30 @@ public final class MotionV2Render extends Node {
+         return Math.max(1.0f, Math.min(6.0f, 0.90f * Math.max(1.0f, displayGain)));
+     }
+ 
++    /* IRIS_26598_MOTION_PUBLICATION_SCENE_WHITE_AUTHORITY
++     * 26597 made Motion publication itself preserve an unbounded monotonic highlight tail. The
++     * older adaptiveSceneWhite expansion was designed for the pre-26597 endpoint-compression
++     * renderer and therefore double-reserved highlight range when reused by Motion. Motion now
++     * publishes against the body/physical baseSceneWhite. Night intentionally retains its proven
++     * adaptive scene-white owner because it still uses the successful 26591 publication curve.
++     * Keep this as the single Java selector consumed by normal Motion render, tone-aware highlight
++     * chroma prediction, and true-2x publication so those paths cannot silently diverge again.
++     */
++    public static float iris26598PublicationSceneWhite(Parameters parameters) {
++        if (parameters == null) {
++            throw new IllegalArgumentException("parameters == null");
++        }
++        float computedBase = iris26582BaseSceneWhite(parameters.motionV2DisplayGain);
++        float baseWhite = parameters.motionV2ToneBaseSceneWhite;
++        if (!Float.isFinite(baseWhite) || baseWhite < 1.0f) baseWhite = computedBase;
++        baseWhite = Math.max(1.0f, Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, baseWhite));
++        if (parameters.motionV2Active) return baseWhite;
++
++        float adaptiveWhite = parameters.motionV2ToneAdaptiveSceneWhite;
++        if (!Float.isFinite(adaptiveWhite) || adaptiveWhite < baseWhite) adaptiveWhite = baseWhite;
++        return Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, adaptiveWhite);
++    }
++
+     static float iris26582MapHeadroom(float guide, float sceneWhite) {
+         if (guide <= IRIS_26582_TONE_START) return guide;
+         float whitePoint = Math.max(sceneWhite, IRIS_26582_TONE_START + 0.05f);
+@@ -220,12 +245,11 @@ public final class MotionV2Render extends Node {
+          * sceneWhite follows only the real Photon display exposure. Accepted-Short BaselineExposure
+          * is source-domain restoration and must not stretch the SDR highlight shoulder.
+          */
+-        float baseSceneWhite = iris26582BaseSceneWhite(postDisplaySensorWhite);
+-        float sceneWhite = basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite;
+-        if (!Float.isFinite(sceneWhite) || sceneWhite < baseSceneWhite) {
+-            sceneWhite = baseSceneWhite;
++        float baseSceneWhite = basePipeline.mParameters.motionV2ToneBaseSceneWhite;
++        if (!Float.isFinite(baseSceneWhite) || baseSceneWhite < 1.0f) {
++            baseSceneWhite = iris26582BaseSceneWhite(postDisplaySensorWhite);
+         }
+-        sceneWhite = Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, sceneWhite);
++        float sceneWhite = iris26598PublicationSceneWhite(basePipeline.mParameters);
+         /* IRIS_26530_V1_3_FOV_AUTHORITY
+          * motionV2OutputZoom is the final FOV authority. SR reconstruction scale must not divide
+          * the JPEG/UHDR crop request; doing so produced the measured ~2x-wide 123x frame.
+@@ -437,6 +461,10 @@ public final class MotionV2Render extends Node {
+                 + " mgcSourceExposureGain=" + mgcSourceExposureGain
+                 + " sceneWhite=" + sceneWhite
+                 + " baseSceneWhite=" + baseSceneWhite
++                + " adaptiveSceneWhite=" + basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite
++                + " publicationSceneWhiteSource="
++                    + (basePipeline.mParameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
++                + " IRIS_26598_SEMANTIC_AUTHORITY=true"
+                 + " toneP95Guide=" + basePipeline.mParameters.motionV2ToneP95Guide
+                 + " toneP99Guide=" + basePipeline.mParameters.motionV2ToneP99Guide
+                 + " toneP995Guide=" + basePipeline.mParameters.motionV2ToneP995Guide
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index 43dfd83fa3258356befa8635784bd2ae4f623860..4d388227d631ebc25da6e79ef3c6070d8f5ad586 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -14,6 +14,7 @@ import com.particlesdevs.photoncamera.util.FileManager;
+ import com.particlesdevs.photoncamera.processing.render.Parameters;
+ import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings;
+ import com.particlesdevs.photoncamera.processing.processor.IrisNightNeuralEnhancer;
++import com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionV2Render;
+ import java.nio.file.Path;
+ import java.nio.file.Files;
+ import java.io.File;
+@@ -152,6 +153,8 @@ public final class MotionV2Jpeg444Encoder {
+                     ? attachedGainmap.getRatioMax()[0] : 1.0f;
+             final float true2xGainContentMax = generateMotionTrue2xGain
+                     ? attachedGainmap.getDisplayRatioForFullHdr() : 1.0f;
++            final float publicationSceneWhite =
++                    MotionV2Render.iris26598PublicationSceneWhite(parameters);
+             final long renderStartNs = System.nanoTime();
+             final boolean baseOk = writeTrue2xNative(
+                     bitmap, renderRgb16fPath, trueWidth, trueHeight,
+@@ -159,7 +162,7 @@ public final class MotionV2Jpeg444Encoder {
+                     Math.max(1.0f, parameters.motionV2RenderResidualZoom),
+                     sensorToProPhoto, profileToDisplay,
+                     parameters.motionV2DisplayGain, exposureEv, shadows, contrast,
+-                    parameters.motionV2ToneAdaptiveSceneWhite, parameters.motionV2Active,
++                    publicationSceneWhite, parameters.motionV2Active,
+                     watermark,
+                     useJin ? jinResidual.residual : null,
+                     useJin ? jinResidual.referenceRgb : null,
+@@ -175,6 +178,11 @@ public final class MotionV2Jpeg444Encoder {
+                     + " gainmap=" + hasGain
+                     + " gainEncodingMax=" + true2xGainEncodingMax
+                     + " gainContentMax=" + true2xGainContentMax
++                    + " publicationSceneWhite=" + publicationSceneWhite
++                    + " adaptiveSceneWhite=" + parameters.motionV2ToneAdaptiveSceneWhite
++                    + " publicationSceneWhiteSource="
++                        + (parameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
++                    + " IRIS_26598_TRUE2X_TONE_PARITY=true"
+                     + " IRIS_26596_TRUE2X_CONTENT_CAP=true");
+             /* IRIS_26576_NATIVE_PUBLICATION_BACKEND_PERSISTENT_PROOF
+              * Native 26571 remains GPU-first with the exact 26570 CPU fallback. Retrieve only the
+diff --git a/app/version.properties b/app/version.properties
+index a053340830038935c8847d0526a64c668cf7111d..81e76c2021cc3a514072d84f553099bf8def3226 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726597
+-VERSION_BUILD=26597
++VERSION_NAME=0.9726598
++VERSION_BUILD=26598
