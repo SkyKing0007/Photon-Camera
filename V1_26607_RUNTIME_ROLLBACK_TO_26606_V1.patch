@@ -1,0 +1,1002 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 58049d01ed05a10a75ce227240b085d2bbc73713..b09cce052afebe197ca25da89f2b2e03baae0d75 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -652,447 +652,6 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-
+-    /* IRIS_26607_UNIVERSAL_HIGHLIGHT_COMPONENT_ANCHOR
+-     * The 26606 device bulb proof showed the boundary test was spatially undersampled: one
+-     * ~66x67 RAW-pixel flow cell searched only ~6x6 RAW pixels around its center. 26607 samples
+-     * the actual flow-cell footprint and treats highlight loss as a physical RAW condition, not a
+-     * semantic scene class. The same rule therefore applies to bulbs, clouds, white fabric,
+-     * reflective metal, signage, windows, skin highlights, and any other recoverable highlight.
+-     *
+-     * flow.xy remains the exact production warp consumed by Sabre. flow.w remains diagnostic local
+-     * affine residual; it is used only as one geometry/coherence input and never as an absolute
+-     * registration-error proxy. Boundary radiometry validates the SAME production flow that the
+-     * common accumulator later consumes. Output z is connected highlight-component eligibility;
+-     * w is measurable-boundary anchor confidence. No private image/reconstruction is produced.
+-     */
+-    val shortComponentAnchor26607 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        precision highp usampler2D;
+-        uniform sampler2D uFlow;
+-        uniform highp usampler2D uReferenceRaw;
+-        uniform highp usampler2D uShortRaw;
+-        uniform ivec2 uGridSize;
+-        uniform ivec2 uRawSize;
+-        uniform vec4 uFlowScaleOffset;
+-        uniform vec4 uReferenceBlackByPhase;
+-        uniform vec4 uShortBlackByPhase;
+-        uniform float uWhiteLevel;
+-        uniform float uExposureRatio;
+-        uniform float uSourceClippingPoint;
+-        uniform float uComponentFloor;
+-        uniform float uComponentFull;
+-        uniform float uBoundaryCeiling;
+-        uniform float uConsistencyLow;
+-        uniform float uConsistencyHigh;
+-        layout(location = 0) out vec4 oAnchor;
+-
+-        ivec2 clampRaw(ivec2 p) { return clamp(p, ivec2(0), uRawSize - ivec2(1)); }
+-        ivec2 clampGrid(ivec2 p) { return clamp(p, ivec2(0), uGridSize - ivec2(1)); }
+-        int phaseAt(ivec2 p) { return ((p.y & 1) << 1) | (p.x & 1); }
+-        ivec2 phaseOffset(int phase) { return ivec2(phase & 1, (phase >> 1) & 1); }
+-        float blackAt(vec4 b, int phase) { return b[phase]; }
+-        float rawAt(highp usampler2D t, ivec2 p) {
+-            return float(texelFetch(t, clampRaw(p), 0).r);
+-        }
+-        float normalizedRaw(float rawCode, float black) {
+-            return max(rawCode - black, 0.0) / max(uWhiteLevel - black, 1.0);
+-        }
+-        float normalizedAt(highp usampler2D t, ivec2 p, vec4 blackByPhase) {
+-            ivec2 q = clampRaw(p);
+-            return normalizedRaw(rawAt(t, q), blackAt(blackByPhase, phaseAt(q)));
+-        }
+-        ivec2 phaseGridSize(int phase) {
+-            ivec2 off = phaseOffset(phase);
+-            return max((uRawSize - off + ivec2(1)) / 2, ivec2(1));
+-        }
+-        ivec2 phaseSamplePixel(int phase, ivec2 gridP) {
+-            ivec2 off = phaseOffset(phase);
+-            ivec2 size = phaseGridSize(phase);
+-            return 2 * clamp(gridP, ivec2(0), size - ivec2(1)) + off;
+-        }
+-        vec4 samePhaseRawSupport(highp usampler2D t, vec2 rawCenter, int phase) {
+-            vec2 origin = vec2(phaseOffset(phase)) + vec2(0.5);
+-            vec2 g = (rawCenter - origin) * 0.5;
+-            ivec2 g0 = ivec2(floor(g));
+-            return vec4(
+-                rawAt(t, phaseSamplePixel(phase, g0)),
+-                rawAt(t, phaseSamplePixel(phase, g0 + ivec2(1, 0))),
+-                rawAt(t, phaseSamplePixel(phase, g0 + ivec2(0, 1))),
+-                rawAt(t, phaseSamplePixel(phase, g0 + ivec2(1, 1)))
+-            );
+-        }
+-        float bilinearRaw(vec4 values, vec2 rawCenter, int phase) {
+-            vec2 origin = vec2(phaseOffset(phase)) + vec2(0.5);
+-            vec2 f = fract((rawCenter - origin) * 0.5);
+-            return mix(mix(values.x, values.y, f.x), mix(values.z, values.w, f.x), f.y);
+-        }
+-        float peak4(vec4 v) { return max(max(v.x, v.y), max(v.z, v.w)); }
+-        float secondHighest4(vec4 v) {
+-            float first = -1.0;
+-            float second = -1.0;
+-            for (int i = 0; i < 4; ++i) {
+-                float x = v[i];
+-                if (x >= first) { second = first; first = x; }
+-                else if (x > second) second = x;
+-            }
+-            return max(second, 0.0);
+-        }
+-        vec2 rawFlowAt(ivec2 p) {
+-            return texelFetch(uFlow, clampGrid(p), 0).xy * vec2(uRawSize);
+-        }
+-        float predictorConsensus(ivec2 tile) {
+-            if (tile.x <= 0 || tile.y <= 0 || tile.x + 1 >= uGridSize.x || tile.y + 1 >= uGridSize.y)
+-                return 0.0;
+-            vec2 p0 = 0.5 * (rawFlowAt(tile + ivec2(-1, 0)) + rawFlowAt(tile + ivec2(1, 0)));
+-            vec2 p1 = 0.5 * (rawFlowAt(tile + ivec2(0, -1)) + rawFlowAt(tile + ivec2(0, 1)));
+-            vec2 p2 = 0.5 * (rawFlowAt(tile + ivec2(-1, -1)) + rawFlowAt(tile + ivec2(1, 1)));
+-            vec2 p3 = 0.5 * (rawFlowAt(tile + ivec2(-1, 1)) + rawFlowAt(tile + ivec2(1, -1)));
+-            float s0 = length(p0-p1) + length(p0-p2) + length(p0-p3);
+-            float s1 = length(p1-p0) + length(p1-p2) + length(p1-p3);
+-            float s2 = length(p2-p0) + length(p2-p1) + length(p2-p3);
+-            float s3 = length(p3-p0) + length(p3-p1) + length(p3-p2);
+-            float spread = min(min(s0, s1), min(s2, s3)) / 3.0;
+-            return 1.0 - smoothstep(2.0, 8.0, spread);
+-        }
+-        float sourcePhaseConfidence(float peakRawCode) {
+-            float headroomStart = max(1.0, uSourceClippingPoint * 0.9925);
+-            return 1.0 - smoothstep(
+-                headroomStart,
+-                max(headroomStart + 1.0e-4, uSourceClippingPoint),
+-                peakRawCode);
+-        }
+-        vec4 referenceQuadNormalized(ivec2 referenceQuad) {
+-            vec4 v = vec4(0.0);
+-            for (int phase = 0; phase < 4; ++phase)
+-                v[phase] = normalizedAt(
+-                    uReferenceRaw, referenceQuad + phaseOffset(phase), uReferenceBlackByPhase);
+-            return v;
+-        }
+-        bool shortQuadEvidence(
+-            ivec2 referenceQuad,
+-            vec2 flowRawPixels,
+-            out vec4 scaledShort,
+-            out vec4 phaseSourceConfidence
+-        ) {
+-            scaledShort = vec4(0.0);
+-            phaseSourceConfidence = vec4(0.0);
+-            for (int phase = 0; phase < 4; ++phase) {
+-                ivec2 rp = referenceQuad + phaseOffset(phase);
+-                vec2 shortCenter = vec2(rp) + vec2(0.5) + flowRawPixels;
+-                vec4 supportRaw = samePhaseRawSupport(uShortRaw, shortCenter, phase);
+-                phaseSourceConfidence[phase] = sourcePhaseConfidence(peak4(supportRaw));
+-                float shortRawCode = bilinearRaw(supportRaw, shortCenter, phase);
+-                scaledShort[phase] = normalizedRaw(
+-                    shortRawCode, blackAt(uShortBlackByPhase, phase)) * uExposureRatio;
+-            }
+-            return min(min(phaseSourceConfidence.x, phaseSourceConfidence.y),
+-                min(phaseSourceConfidence.z, phaseSourceConfidence.w)) > 0.0;
+-        }
+-        float effectiveLossWeight(vec4 referenceNormalized, vec4 scaledShort) {
+-            vec4 phaseLoss = vec4(0.0);
+-            float severeSingle = 0.0;
+-            for (int phase = 0; phase < 4; ++phase) {
+-                float predicted = max(scaledShort[phase], 0.0);
+-                float reference = max(referenceNormalized[phase], 0.0);
+-                float relativeLoss = max(predicted - reference, 0.0) / max(predicted, 0.05);
+-                float signalGate = smoothstep(0.72, 0.92, predicted);
+-                phaseLoss[phase] = signalGate * smoothstep(0.05, 0.12, relativeLoss);
+-                severeSingle = max(severeSingle,
+-                    smoothstep(0.94, 0.98, reference) *
+-                    signalGate * smoothstep(0.12, 0.22, relativeLoss));
+-            }
+-            return max(secondHighest4(phaseLoss), severeSingle);
+-        }
+-
+-        void main() {
+-            ivec2 tile = clampGrid(ivec2(gl_FragCoord.xy));
+-            vec2 flowTextureUv = (vec2(tile) + vec2(0.5)) / vec2(uGridSize);
+-            vec2 safeScale = max(abs(uFlowScaleOffset.xy), vec2(1.0e-7));
+-            vec2 referenceUv = (flowTextureUv - uFlowScaleOffset.zw) / safeScale;
+-            referenceUv = clamp(referenceUv, vec2(0.0), vec2(1.0));
+-            vec4 flow = texelFetch(uFlow, tile, 0);
+-            vec2 flowRawPixels = flow.xy * vec2(uRawSize);
+-
+-            float localResidualConfidence =
+-                1.0 - smoothstep(2.0, 8.0, max(flow.w, 0.0));
+-            float neighborhoodPredictorConfidence = predictorConsensus(tile);
+-            float flowProof = max(localResidualConfidence, neighborhoodPredictorConfidence);
+-
+-            vec2 cellSpanRaw = vec2(uRawSize) / (vec2(uGridSize) * safeScale);
+-            vec2 cellCenterRaw = referenceUv * vec2(uRawSize);
+-            float componentBrightness = 0.0;
+-            float componentSourceConfidence = 0.0;
+-            float literalLossSeen = 0.0;
+-            float effectiveLossSeen = 0.0;
+-            float anchorConfidenceSum = 0.0;
+-            int anchorPhaseEvidence = 0;
+-            int anchorQuadEvidence = 0;
+-
+-            /* Five-by-five probes span the full sparse-flow cell footprint at -50/-25/0/+25/+50%. */
+-            for (int py = -2; py <= 2; ++py) {
+-                for (int px = -2; px <= 2; ++px) {
+-                    vec2 probeRaw = cellCenterRaw +
+-                        vec2(float(px), float(py)) * (0.25 * cellSpanRaw);
+-                    ivec2 referenceP = clampRaw(ivec2(floor(probeRaw)));
+-                    ivec2 referenceQuad = (referenceP / 2) * 2;
+-                    vec4 referenceNormalized = referenceQuadNormalized(referenceQuad);
+-                    vec4 scaledShort = vec4(0.0);
+-                    vec4 phaseSourceConfidence = vec4(0.0);
+-                    bool hasShort = shortQuadEvidence(
+-                        referenceQuad, flowRawPixels, scaledShort, phaseSourceConfidence);
+-                    float probeSourceConfidence = min(
+-                        min(phaseSourceConfidence.x, phaseSourceConfidence.y),
+-                        min(phaseSourceConfidence.z, phaseSourceConfidence.w));
+-                    float referenceSecond = secondHighest4(referenceNormalized);
+-                    float shortSecond = secondHighest4(scaledShort);
+-                    float brightness = smoothstep(
+-                        uComponentFloor, uComponentFull, max(referenceSecond, shortSecond));
+-                    if (hasShort && brightness > 0.0) {
+-                        componentBrightness = max(componentBrightness, brightness);
+-                        componentSourceConfidence = max(
+-                            componentSourceConfidence, probeSourceConfidence);
+-                    }
+-
+-                    bool literalHere = false;
+-                    for (int phase = 0; phase < 4; ++phase) {
+-                        if (rawAt(uReferenceRaw, referenceQuad + phaseOffset(phase)) >=
+-                                uSourceClippingPoint) literalHere = true;
+-                    }
+-                    if (literalHere) literalLossSeen = 1.0;
+-                    if (hasShort) effectiveLossSeen = max(
+-                        effectiveLossSeen,
+-                        effectiveLossWeight(referenceNormalized, scaledShort));
+-
+-                    int phasesThisQuad = 0;
+-                    if (hasShort) {
+-                        for (int phase = 0; phase < 4; ++phase) {
+-                            float nr = referenceNormalized[phase];
+-                            float ns = scaledShort[phase];
+-                            if (nr < 0.05 || nr >= uBoundaryCeiling || ns < 0.05) continue;
+-                            if (phaseSourceConfidence[phase] <= 0.0) continue;
+-                            float relativeError = abs(ns - nr) / max(max(nr, ns), 0.05);
+-                            anchorConfidenceSum += 1.0 - smoothstep(
+-                                uConsistencyLow, uConsistencyHigh, relativeError);
+-                            anchorPhaseEvidence += 1;
+-                            phasesThisQuad += 1;
+-                        }
+-                    }
+-                    if (phasesThisQuad >= 2) anchorQuadEvidence += 1;
+-                }
+-            }
+-
+-            float lossConnectivity = max(literalLossSeen, effectiveLossSeen);
+-            float geometryForComponent = max(flowProof, 0.85 * literalLossSeen);
+-            float componentConfidence = min(
+-                componentSourceConfidence,
+-                min(max(componentBrightness, lossConnectivity), geometryForComponent));
+-            float anchorConfidence = 0.0;
+-            if (anchorQuadEvidence >= 4 && anchorPhaseEvidence >= 8 && flowProof > 0.0) {
+-                float radiometricConfidence =
+-                    anchorConfidenceSum / float(anchorPhaseEvidence);
+-                anchorConfidence = min(
+-                    componentSourceConfidence,
+-                    min(flowProof, radiometricConfidence));
+-            }
+-            oAnchor = vec4(flow.xy, clamp(componentConfidence, 0.0, 1.0),
+-                clamp(anchorConfidence, 0.0, 1.0));
+-        }
+-    """.trimIndent()
+-
+-    /* IRIS_26607_CONNECTED_HIGHLIGHT_COMPONENT_PROPAGATION
+-     * Boundary trust is propagated across the physically bright/lost component with a bottleneck
+-     * min/max rule. Adjacent production-flow disagreement is a discontinuity barrier, not an
+-     * absolute registration metric. This prevents a validated bulb/cloud component from dying at
+-     * each interior cell while still failing closed across a strong local motion boundary.
+-     */
+-    val shortComponentPropagate26607 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uAnchor;
+-        uniform sampler2D uCurrent;
+-        uniform ivec2 uGridSize;
+-        uniform ivec2 uRawSize;
+-        layout(location = 0) out float oTrust;
+-
+-        ivec2 clampGrid(ivec2 p) { return clamp(p, ivec2(0), uGridSize - ivec2(1)); }
+-        float trustAt(ivec2 p) { return texelFetch(uCurrent, clampGrid(p), 0).r; }
+-        vec2 rawFlowAtAnchor(ivec2 p) {
+-            return texelFetch(uAnchor, clampGrid(p), 0).xy * vec2(uRawSize);
+-        }
+-        float compatibleFlow(ivec2 a, ivec2 b) {
+-            float delta = length(rawFlowAtAnchor(a) - rawFlowAtAnchor(b));
+-            return 1.0 - smoothstep(4.0, 16.0, delta);
+-        }
+-        void main() {
+-            ivec2 p = clampGrid(ivec2(gl_FragCoord.xy));
+-            vec4 anchor = texelFetch(uAnchor, p, 0);
+-            float componentConfidence = clamp(anchor.z, 0.0, 1.0);
+-            float trust = clamp(anchor.w, 0.0, 1.0);
+-            if (componentConfidence > 0.0) {
+-                ivec2 n0 = p + ivec2(-1, 0);
+-                ivec2 n1 = p + ivec2( 1, 0);
+-                ivec2 n2 = p + ivec2( 0,-1);
+-                ivec2 n3 = p + ivec2( 0, 1);
+-                trust = max(trust, min(componentConfidence,
+-                    min(trustAt(n0), compatibleFlow(p, n0))));
+-                trust = max(trust, min(componentConfidence,
+-                    min(trustAt(n1), compatibleFlow(p, n1))));
+-                trust = max(trust, min(componentConfidence,
+-                    min(trustAt(n2), compatibleFlow(p, n2))));
+-                trust = max(trust, min(componentConfidence,
+-                    min(trustAt(n3), compatibleFlow(p, n3))));
+-            }
+-            oTrust = trust;
+-        }
+-    """.trimIndent()
+-
+-    /* IRIS_26607_UNIVERSAL_EFFECTIVE_HIGHLIGHT_LOSS_WEIGHT
+-     * Rescue is triggered by physical NORMAL information loss, not by semantic scene type and not
+-     * only by literal sensor code saturation. For each spatial CFA phase, exposure-normalized
+-     * SHORT is compared with NORMAL in the same RAW domain. A two-phase 5..12% deficit, or one
+-     * severe near-saturation phase, proves effective NORMAL censorship before literal white.
+-     *
+-     * Component trust owns geometry once boundary correspondence has been validated. No second
+-     * flow.w penalty is applied here. The exact common-RBF 3x3 source-clipping guard still runs
+-     * afterward and is the final physical veto before accumulator contribution.
+-     *
+-     * MRT outputs: final common-Sabre SHORT weight, target-domain rescue-only weight, and NORMAL
+-     * physical-loss candidate weight for semantic funnel telemetry.
+-     */
+-    val shortRescueWeight26607 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uOrdinaryWeight;
+-        uniform sampler2D uReferenceExtractedBayer;
+-        uniform sampler2D uShortExtractedBayer;
+-        uniform sampler2D uFlow;
+-        uniform sampler2D uComponentTrust;
+-        uniform ivec2 uExtractedSize;
+-        uniform vec4 uFlowScaleOffset;
+-        uniform vec4 uFrameBorderPadded;
+-        uniform vec4 uReferenceBlackByPhase;
+-        uniform vec4 uShortBlackByPhase;
+-        uniform float uWhiteLevel;
+-        uniform float uExposureRatio;
+-        uniform float uSourceClippingPoint;
+-        layout(location = 0) out float oWeight;
+-        layout(location = 1) out float oRescueOnlyWeight;
+-        layout(location = 2) out float oLossCandidate;
+-
+-        vec2 mirrorUvs(vec2 sampleUv) {
+-            if (sampleUv.x <= uFrameBorderPadded.x) sampleUv.x =
+-                2.0 * uFrameBorderPadded.x - sampleUv.x;
+-            if (sampleUv.y <= uFrameBorderPadded.y) sampleUv.y =
+-                2.0 * uFrameBorderPadded.y - sampleUv.y;
+-            if (sampleUv.x > uFrameBorderPadded.z) sampleUv.x =
+-                2.0 * uFrameBorderPadded.z - sampleUv.x;
+-            if (sampleUv.y > uFrameBorderPadded.w) sampleUv.y =
+-                2.0 * uFrameBorderPadded.w - sampleUv.y;
+-            return sampleUv;
+-        }
+-        float secondHighest4(vec4 v) {
+-            float first = -1.0;
+-            float second = -1.0;
+-            for (int i = 0; i < 4; ++i) {
+-                float x = v[i];
+-                if (x >= first) { second = first; first = x; }
+-                else if (x > second) second = x;
+-            }
+-            return max(second, 0.0);
+-        }
+-        vec4 normalizedQuad(vec4 rawQuad, vec4 blackByPhase) {
+-            vec4 denominator = max(vec4(uWhiteLevel) - blackByPhase, vec4(1.0));
+-            return max(rawQuad - blackByPhase, vec4(0.0)) / denominator;
+-        }
+-        ivec2 clampExtracted(ivec2 p) {
+-            return clamp(p, ivec2(0), uExtractedSize - ivec2(1));
+-        }
+-        void shortPhaseSupport(vec2 uv, out vec4 interpolatedRaw, out vec4 peakRaw) {
+-            vec2 position = uv * vec2(uExtractedSize) - vec2(0.5);
+-            ivec2 p0 = ivec2(floor(position));
+-            vec2 f = fract(position);
+-            vec4 q00 = texelFetch(uShortExtractedBayer, clampExtracted(p0), 0);
+-            vec4 q10 = texelFetch(uShortExtractedBayer, clampExtracted(p0 + ivec2(1, 0)), 0);
+-            vec4 q01 = texelFetch(uShortExtractedBayer, clampExtracted(p0 + ivec2(0, 1)), 0);
+-            vec4 q11 = texelFetch(uShortExtractedBayer, clampExtracted(p0 + ivec2(1, 1)), 0);
+-            interpolatedRaw = mix(mix(q00, q10, f.x), mix(q01, q11, f.x), f.y);
+-            peakRaw = max(max(q00, q10), max(q01, q11));
+-        }
+-        float wholeShortHeadroom(vec4 peakRaw) {
+-            float peak = max(max(peakRaw.x, peakRaw.y), max(peakRaw.z, peakRaw.w));
+-            float headroomStart = max(1.0, uSourceClippingPoint * 0.9925);
+-            return 1.0 - smoothstep(
+-                headroomStart,
+-                max(headroomStart + 1.0e-4, uSourceClippingPoint),
+-                peak);
+-        }
+-        float effectiveLossWeight(vec4 referenceNormalized, vec4 scaledShort) {
+-            vec4 phaseLoss = vec4(0.0);
+-            float severeSingle = 0.0;
+-            for (int phase = 0; phase < 4; ++phase) {
+-                float predicted = max(scaledShort[phase], 0.0);
+-                float reference = max(referenceNormalized[phase], 0.0);
+-                float relativeLoss = max(predicted - reference, 0.0) / max(predicted, 0.05);
+-                float signalGate = smoothstep(0.72, 0.92, predicted);
+-                phaseLoss[phase] = signalGate * smoothstep(0.05, 0.12, relativeLoss);
+-                severeSingle = max(severeSingle,
+-                    smoothstep(0.94, 0.98, reference) * signalGate *
+-                    smoothstep(0.12, 0.22, relativeLoss));
+-            }
+-            return max(secondHighest4(phaseLoss), severeSingle);
+-        }
+-        float literalLossWeight(
+-            vec4 referenceRaw,
+-            vec4 scaledShort,
+-            vec4 peakShortRaw
+-        ) {
+-            float literal = 0.0;
+-            float explained = 1.0;
+-            for (int phase = 0; phase < 4; ++phase) {
+-                if (referenceRaw[phase] >= uSourceClippingPoint) {
+-                    literal = 1.0;
+-                    float phaseHeadroom = peakShortRaw[phase] < uSourceClippingPoint ? 1.0 : 0.0;
+-                    float signalProof = smoothstep(0.85, 0.95, scaledShort[phase]);
+-                    explained = min(explained, phaseHeadroom * signalProof);
+-                }
+-            }
+-            return literal * explained;
+-        }
+-
+-        void main() {
+-            vec2 referenceUv = gl_FragCoord.xy / vec2(textureSize(uOrdinaryWeight, 0));
+-            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+-            vec4 flow = texture(uFlow, flowUv);
+-            vec2 warpedUv = mirrorUvs(referenceUv + flow.xy);
+-            float ordinaryWeight = texture(uOrdinaryWeight, referenceUv).r;
+-
+-            ivec2 referenceP = clampExtracted(
+-                ivec2(floor(referenceUv * vec2(uExtractedSize))));
+-            vec4 referenceRaw = texelFetch(uReferenceExtractedBayer, referenceP, 0);
+-            vec4 shortRaw = vec4(0.0);
+-            vec4 shortPeakRaw = vec4(0.0);
+-            shortPhaseSupport(warpedUv, shortRaw, shortPeakRaw);
+-            vec4 referenceNormalized = normalizedQuad(referenceRaw, uReferenceBlackByPhase);
+-            vec4 scaledShort = normalizedQuad(shortRaw, uShortBlackByPhase) * uExposureRatio;
+-
+-            float literalLoss = literalLossWeight(referenceRaw, scaledShort, shortPeakRaw);
+-            float effectiveLoss = effectiveLossWeight(referenceNormalized, scaledShort);
+-            float targetLoss = clamp(max(literalLoss, effectiveLoss), 0.0, 1.0);
+-            float shortHeadroom = wholeShortHeadroom(shortPeakRaw);
+-            float componentTrust = clamp(texture(uComponentTrust, flowUv).r, 0.0, 1.0);
+-            float rescueConfidence = min(shortHeadroom, componentTrust);
+-
+-            oWeight = clamp(mix(ordinaryWeight, rescueConfidence, targetLoss), 0.0, 1.0);
+-            oRescueOnlyWeight = clamp(rescueConfidence * targetLoss, 0.0, 1.0);
+-            oLossCandidate = targetLoss;
+-        }
+-    """.trimIndent()
+-
+     /* IRIS_26595_SUBPIXEL_PHASE_SHORT_HANDOFF
+      * 26594 device proof exposed three independent false-closed conditions:
+      *  - Sabre photometric rejection deliberately collapses when clipped NORMAL guide=10000;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 480a31b954396654502f51fcfa162669f3915fc1..5a7e545bace7b5a37186264b245f449665992e22 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -572,9 +572,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreShortBoundaryAnchorProgram26606 = 0
+     private var sabreShortBoundaryPropagateProgram26606 = 0
+     private var sabreShortRescueWeightProgram26606 = 0
+-    private var sabreShortComponentAnchorProgram26607 = 0
+-    private var sabreShortComponentPropagateProgram26607 = 0
+-    private var sabreShortRescueWeightProgram26607 = 0
+     private var sabreRgbChromaPostprocessor: GlesIris26529SpatialRgbChromaPostprocessor? = null
+     private var sabreConvertAlignmentSparseProgram = 0
+     private var currentMergeCovariance = 0
+@@ -2145,17 +2142,15 @@ internal class GlesMgcRawSpatialStacker(
+          * one-tunnel scalar confidence/source-clipping validity field was generated for the scheduled SHORT.
+          */
+         var highlightShortExposureRatio26587 = 1f
+-        var highlightShortScheduled26607 = false
+-        var highlightShortConfidenceFieldGenerated26607 = false
+-        var highlightShortCommonGuideAppliedToTrue2x26607 = false
+-        var highlightShortTargetEligibleCellsAbi26607: Int? = null
+-        var highlightShortBoundarySeedCells26607 = 0
+-        var highlightShortBoundaryFinalCells26607 = 0
+-        var highlightShortLossCandidateCells26607 = 0
+-        var highlightShortComponentWeightedCells26607 = 0
+-        var highlightShortTotalAccumulatorEligibleCells26607 = 0
+-        var highlightShortTargetAccumulatorEligibleCells26607 = 0
+-        var highlightShortAnyAccumulatorEligibleEvidence26607 = 0
++        var highlightShortAdmitted26587 = false
++        var highlightShortMaskGenerated26587 = false
++        var highlightShortAppliedToTrue2x26587 = false
++        var highlightShortFullActivePixels26595: Int? = null
++        var highlightShortBoundarySeedCells26606 = 0
++        var highlightShortBoundaryFinalCells26606 = 0
++        var highlightShortEffectiveCoverageCells26606 = 0
++        var highlightShortRescueCoverageCells26606 = 0
++        var highlightShortEffectiveEvidence26606 = 0
+         var returned = false
+         val originalThreadPriority = GlesGpuScheduler.lowerCurrentThreadPriority(SABRE_TAG)
+         val processStartNs = System.nanoTime()
+@@ -2491,11 +2486,10 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.GL_R8,
+                     GLES30.GL_LINEAR,
+                 )
+-                var shortRescueOnlyWeight26607 = 0
+-                var shortLossCandidateWeight26607 = 0
++                var shortRescueOnlyWeight26606 = 0
+                 renderDilation(reverseWeight, frameWeight)
+                 if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT) {
+-                    val component = createSabreShortComponentTrust26607(
++                    val boundary = createSabreShortBoundaryTrust26606(
+                         referenceRaw = referenceRaw,
+                         shortRaw = currentRaw,
+                         flow = flow,
+@@ -2503,50 +2497,29 @@ internal class GlesMgcRawSpatialStacker(
+                         shortCalibration = calibration,
+                         exposureRatio = exposureScale,
+                     )
+-                    highlightShortBoundarySeedCells26607 = component.seedCells
+-                    highlightShortBoundaryFinalCells26607 = component.finalCells
++                    highlightShortBoundarySeedCells26606 = boundary.seedCells
++                    highlightShortBoundaryFinalCells26606 = boundary.finalCells
+                     val rescuedWeight = createTexture(
+                         coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_LINEAR,
+                     )
+-                    shortRescueOnlyWeight26607 = createTexture(
++                    shortRescueOnlyWeight26606 = createTexture(
+                         coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_LINEAR,
+                     )
+-                    shortLossCandidateWeight26607 = createTexture(
+-                        coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
+-                    )
+-                    renderSabreShortRescueWeight26607(
++                    renderSabreShortRescueWeight26606(
+                         ordinaryWeight = frameWeight,
+                         referenceExtracted = referenceExtracted,
+                         shortExtracted = currentExtracted,
+                         flow = flow,
+-                        componentTrust = component.texture,
+-                        referenceCalibration = referenceCalibration,
+-                        shortCalibration = calibration,
+-                        exposureRatio = exposureScale,
++                        boundaryTrust = boundary.texture,
+                         output = rescuedWeight,
+-                        rescueOnlyOutput = shortRescueOnlyWeight26607,
+-                        lossCandidateOutput = shortLossCandidateWeight26607,
++                        rescueOnlyOutput = shortRescueOnlyWeight26606,
+                         coverageWidth = coverageWidth,
+                         coverageHeight = coverageHeight,
+                         extractedWidth = extractedWidth,
+                         extractedHeight = extractedHeight,
+                     )
+-                    val lossStats = readSabreShortEffectiveCoverage26606(
+-                        shortLossCandidateWeight26607, coverageWidth, coverageHeight,
+-                        "IRIS_26607_SHORT_NORMAL_LOSS_CANDIDATES",
+-                    )
+-                    highlightShortLossCandidateCells26607 = lossStats.nonzeroCells
+-                    val componentWeightStats = readSabreShortEffectiveCoverage26606(
+-                        shortRescueOnlyWeight26607, coverageWidth, coverageHeight,
+-                        "IRIS_26607_SHORT_COMPONENT_WEIGHT",
+-                    )
+-                    highlightShortComponentWeightedCells26607 = componentWeightStats.nonzeroCells
+-                    releaseOwnedTexture(
+-                        shortLossCandidateWeight26607, "26607 SHORT loss-candidate proof",
+-                    )
+-                    shortLossCandidateWeight26607 = 0
+-                    releaseOwnedTexture(frameWeight, "26607 ordinary SHORT post-dilation weight")
+-                    releaseOwnedTexture(component.texture, "26607 SHORT component trust")
++                    releaseOwnedTexture(frameWeight, "26606 ordinary SHORT post-dilation weight")
++                    releaseOwnedTexture(boundary.texture, "26606 SHORT boundary trust")
+                     frameWeight = rescuedWeight
+                 }
+                 /* IRIS_26606_CONTINUOUS_ONE_TUNNEL_NORMAL_SHORT_LONG
+@@ -2577,14 +2550,14 @@ internal class GlesMgcRawSpatialStacker(
+                     )
+                     val effectiveStats = readSabreShortEffectiveCoverage26606(
+                         effectiveCoverage, coverageWidth, coverageHeight,
+-                        "IRIS_26607_SHORT_TOTAL_ACCUMULATOR_ELIGIBLE_COVERAGE",
++                        "IRIS_26606_SHORT_EFFECTIVE_COVERAGE",
+                     )
+-                    highlightShortTotalAccumulatorEligibleCells26607 = effectiveStats.nonzeroCells
+-                    highlightShortAnyAccumulatorEligibleEvidence26607 =
++                    highlightShortEffectiveCoverageCells26606 = effectiveStats.nonzeroCells
++                    highlightShortEffectiveEvidence26606 =
+                         if (effectiveStats.nonzeroCells > 0) 1 else 0
+ 
+-                    check(shortRescueOnlyWeight26607 != 0) {
+-                        "26607 SHORT target-rescue weight missing at exact post-source-clip eligibility proof"
++                    check(shortRescueOnlyWeight26606 != 0) {
++                        "26606 SHORT rescue-only weight missing at exact contribution proof"
+                     }
+                     val rescueEffectiveCoverage = createTexture(
+                         coverageWidth, coverageHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
+@@ -2594,7 +2567,7 @@ internal class GlesMgcRawSpatialStacker(
+                         "26606 SHORT clipped-rescue effective coverage clear",
+                     )
+                     renderSabreUnifiedBracketCoverage26604(
+-                        weight = shortRescueOnlyWeight26607,
++                        weight = shortRescueOnlyWeight26606,
+                         extracted = currentExtracted,
+                         flow = flow,
+                         accumulatedCoverage = rescueEffectiveCoverage,
+@@ -2606,10 +2579,10 @@ internal class GlesMgcRawSpatialStacker(
+                     )
+                     val rescueStats = readSabreShortEffectiveCoverage26606(
+                         rescueEffectiveCoverage, coverageWidth, coverageHeight,
+-                        "IRIS_26607_SHORT_TARGET_ACCUMULATOR_ELIGIBLE_COVERAGE",
++                        "IRIS_26606_SHORT_CLIPPED_RESCUE_COVERAGE",
+                     )
+-                    highlightShortTargetAccumulatorEligibleCells26607 = rescueStats.nonzeroCells
+-                    highlightShortTargetEligibleCellsAbi26607 = rescueStats.nonzeroCells
++                    highlightShortRescueCoverageCells26606 = rescueStats.nonzeroCells
++                    highlightShortFullActivePixels26595 = rescueStats.nonzeroCells
+                     renderSabreCoverage(
+                         effectiveCoverage, accumulatedCoverage, coverageWidth, coverageHeight,
+                         accumulatedWeightScale,
+@@ -2619,9 +2592,9 @@ internal class GlesMgcRawSpatialStacker(
+                         rescueEffectiveCoverage, "26606 SHORT clipped-rescue effective coverage",
+                     )
+                     releaseOwnedTexture(
+-                        shortRescueOnlyWeight26607, "26607 SHORT target-rescue weight",
++                        shortRescueOnlyWeight26606, "26606 SHORT rescue-only weight",
+                     )
+-                    shortRescueOnlyWeight26607 = 0
++                    shortRescueOnlyWeight26606 = 0
+                 } else if (highlightShortOneTunnel26604 ||
+                     frame.role == RawBurstFrameRole.SHADOW_LONG) {
+                     renderSabreUnifiedBracketCoverage26604(
+@@ -2660,30 +2633,25 @@ internal class GlesMgcRawSpatialStacker(
+                         "26604 HIGHLIGHT_SHORT must remain the final scheduled auxiliary frame"
+                     }
+                     highlightShortExposureRatio26587 = exposureScale
+-                    highlightShortScheduled26607 = true
+-                    highlightShortConfidenceFieldGenerated26607 = true
+-                    val details26607 =
++                    highlightShortAdmitted26587 = true
++                    highlightShortMaskGenerated26587 = true
++                    val details26606 =
+                         "exposureRatio=$exposureScale exposureTimeNs=${frame.exposureTimeNs} " +
+                             "iso=${frame.sensitivityIso} sensorWhite=$sensorWhiteLevel " +
+                             "black=${calibration.blackLevels.joinToString(prefix="[",postfix="]")} " +
+-                            "captured=true scheduled=true commonAccumulatorPath=true " +
++                            "scheduled=true confidenceGenerated=true commonAccumulator=true " +
+                             "privateShortAccumulator=false lateRgbBlend=false normalRejectionMeasurableOnly=true " +
+-                            "targetOwner=UNIVERSAL_SENSOR_LOSS literalPlusEffective=true " +
+-                            "effectiveLoss=twoPhase5to12pct_or_severeNearSaturation " +
+-                            "absoluteOwner=FLOW_CELL_FOOTPRINT_BOUNDARY_RADIOMETRY probes=5x5 " +
+-                            "boundaryError=0.03..0.08 componentFlowBarrierRawPx=4..16 " +
+-                            "shortHeadroomOwner=SAME_AS_COMMON_RBF_FINAL_0P75_PERCENT " +
+-                            "boundarySeedCells=$highlightShortBoundarySeedCells26607 " +
+-                            "componentTrustedCells=$highlightShortBoundaryFinalCells26607 " +
+-                            "normalLossCandidateCells=$highlightShortLossCandidateCells26607 " +
+-                            "componentWeightedTargetCells=$highlightShortComponentWeightedCells26607 " +
+-                            "targetAccumulatorEligibleCells=$highlightShortTargetAccumulatorEligibleCells26607 " +
+-                            "totalShortAccumulatorEligibleCells=$highlightShortTotalAccumulatorEligibleCells26607 " +
+-                            "resolveEffective=NOT_DIRECTLY_MEASURED outputPreserved=DEVICE_IMAGE_REQUIRED " +
+-                            "sourceClip3x3Continuous=true bayerQuadWholeRgb=true " +
+-                            "dng=false srDetailEvidence=false"
+-                    PLog.i(SABRE_TAG, "IRIS_26607_SHORT_SEMANTIC_FUNNEL $details26607")
+-                    MotionTrace.processingState("IRIS_26607_SHORT_SEMANTIC_FUNNEL", details26607)
++                            "geometryOwner=LOCAL_AFFINE_RESIDUAL_RAW_PIXELS residualConfidence=0.50..2.00 " +
++                            "absoluteOwner=MEASURABLE_BOUNDARY_RADIOMETRY boundaryError=0.03..0.08 " +
++                            "bottleneckPropagation=true boundarySeedCells=$highlightShortBoundarySeedCells26606 " +
++                            "boundaryFinalCells=$highlightShortBoundaryFinalCells26606 " +
++                            "sourceClippedEffectiveCoverageCells=$highlightShortEffectiveCoverageCells26606 " +
++                            "sourceClippedRescueCoverageCells=$highlightShortRescueCoverageCells26606 " +
++                            "actualHighlightRescue=${highlightShortRescueCoverageCells26606 > 0} " +
++                            "sourceClip3x3Continuous=true " +
++                            "bayerQuadWholeRgb=true dng=false srDetailEvidence=false"
++                    PLog.i(SABRE_TAG, "IRIS_26606_SHORT_EFFECTIVE_PROOF $details26606")
++                    MotionTrace.processingState("IRIS_26606_SHORT_EFFECTIVE_PROOF", details26606)
+                 }
+                 /* IRIS_26564_NIGHT_LONG_EXCLUDED_FROM_TRUE_2X
+                  * Native Sabre still admits validated SHADOW_LONG evidence for Night SNR. True 2x
+@@ -2812,7 +2780,7 @@ internal class GlesMgcRawSpatialStacker(
+              */
+             val resolveAccumulatedColor26604 = accumulatedColor
+             val resolveAccumulatedWeightsGb26604 = accumulatedWeightsGb
+-            if (highlightShortScheduled26607) {
++            if (highlightShortAdmitted26587) {
+                 PLog.i(
+                     SABRE_TAG,
+                     "IRIS_26604_SINGLE_COMMON_ACCUMULATOR_OWNERSHIP " +
+@@ -2823,15 +2791,15 @@ internal class GlesMgcRawSpatialStacker(
+                             "dngOwner=NORMAL srDetailOwner=NORMAL",
+                 )
+             }
+-            val effectiveEvidenceCount26607 =
+-                mergedFrameCount + highlightShortAnyAccumulatorEligibleEvidence26607
+-            require(effectiveEvidenceCount26607 >= 1)
++            val effectiveEvidenceCount26606 =
++                mergedFrameCount + highlightShortEffectiveEvidence26606
++            require(effectiveEvidenceCount26606 >= 1)
+             renderSabreDehomogenize(
+                 resolveAccumulatedColor26604,
+                 resolveAccumulatedWeightsGb26604,
+                 accumulatedCoverage,
+-                alphaScale = accumulatedWeightScale / effectiveEvidenceCount26607.toFloat(),
+-                alphaBias = 1f / effectiveEvidenceCount26607.toFloat(),
++                alphaScale = accumulatedWeightScale / effectiveEvidenceCount26606.toFloat(),
++                alphaBias = 1f / effectiveEvidenceCount26606.toFloat(),
+             )
+             // The original merge shaders write normalized, white-balanced half floats. The
+             // Resolve AOT accepts those RGBA16F bit patterns directly; rawScale applies only to
+@@ -2996,8 +2964,8 @@ internal class GlesMgcRawSpatialStacker(
+                 val evidencePolicy = "dngRequested=$exportNormalStackedDng normalFrames=$normalFrameCount " +
+                     "retained=${reconstructionEvidence.size} jpegTop2PerPhase=${true2xFastPhaseSlots!=null} " +
+                     "maxEvidence=${if (true2xFastPhaseSlots!=null) TRUE2X_JPEG_MAX_EVIDENCE else reconstructionEvidence.size} " +
+-                    "shortDetailEvidence=false shortUnifiedGuide=${highlightShortScheduled26607} " +
+-                    "shortTargetAccumulatorEligibleCells=${highlightShortTargetEligibleCellsAbi26607 ?: 0} " +
++                    "shortDetailEvidence=false shortUnifiedGuide=${highlightShortAdmitted26587} " +
++                    "shortClippedRescueCoverageCells=${highlightShortFullActivePixels26595 ?: 0} " +
+                     "shortGuideOwner=SINGLE_COMMON_RBF_RESOLVE_VGN srDetailOwner=NORMAL_ONLY"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_EVIDENCE_POLICY $evidencePolicy")
+                 MotionTrace.processingState("IRIS_26576_SR_EVIDENCE", evidencePolicy)
+@@ -3022,7 +2990,7 @@ internal class GlesMgcRawSpatialStacker(
+                  * before the new scalar-detail render. CPU fallback retains 26567's same boundary.
+                  */
+                 true2xResult=rawResult.copy(reconstructionMs=elapsedMs(reconstructionStartNs))
+-                if (highlightShortScheduled26607) highlightShortCommonGuideAppliedToTrue2x26607 = true
++                if (highlightShortAdmitted26587) highlightShortAppliedToTrue2x26587 = true
+                 val result=checkNotNull(true2xResult)
+                 val readyDetails = "normalFrames=$normalFrameCount shadowLongExcluded=$shadowLongFrameCount " +
+                     "size=${result.width}x${result.height} backend=${result.backend} phaseMean=${result.phaseSupportMean} phaseP10=${result.phaseSupportP10} " +
+@@ -3038,17 +3006,15 @@ internal class GlesMgcRawSpatialStacker(
+              * that same RGB only as its low-frequency HDR/color guide while direct high-frequency
+              * evidence remained NORMAL-only. Nothing is composited or republished after SR.
+              */
+-            if (highlightShortScheduled26607) {
++            if (highlightShortAdmitted26587) {
+                 PLog.i(
+                     SABRE_TAG,
+-                    "IRIS_26607_SHORT_SEMANTIC_RESULT exposureRatio=$highlightShortExposureRatio26587 " +
+-                        "normalLossCandidateCells=$highlightShortLossCandidateCells26607 " +
+-                        "componentWeightedTargetCells=$highlightShortComponentWeightedCells26607 " +
+-                        "targetAccumulatorEligibleCells=$highlightShortTargetAccumulatorEligibleCells26607 " +
+-                        "totalShortAccumulatorEligibleCells=$highlightShortTotalAccumulatorEligibleCells26607 " +
+-                        "boundarySeedCells=$highlightShortBoundarySeedCells26607 " +
+-                        "componentTrustedCells=$highlightShortBoundaryFinalCells26607 " +
+-                        "resolveEffective=NOT_DIRECTLY_MEASURED outputPreserved=DEVICE_IMAGE_REQUIRED " +
++                    "IRIS_26606_SHORT_CONTRIBUTION_RESULT exposureRatio=$highlightShortExposureRatio26587 " +
++                        "sourceClippedEffectiveCoverageCells=$highlightShortEffectiveCoverageCells26606 " +
++                        "sourceClippedRescueCoverageCells=$highlightShortRescueCoverageCells26606 " +
++                        "actualHighlightRescue=${highlightShortRescueCoverageCells26606 > 0} " +
++                        "boundarySeedCells=$highlightShortBoundarySeedCells26606 " +
++                        "boundaryFinalCells=$highlightShortBoundaryFinalCells26606 " +
+                         "domain=COMMON_SABRE_PRE_RESOLVE_VGN wholeRgbEvidence=true lateRgbBlend=false " +
+                         "true2xGuide=${enableSabreSuperRes} true2xDetailEvidenceShort=false",
+                 )
+@@ -3089,9 +3055,9 @@ internal class GlesMgcRawSpatialStacker(
+                 mgcDenoiseTuningSnr = kernelTuning.referenceSnr / sqrt(sabreNoiseModelScale),
+                 mgcSharpenTuningSnr = kernelTuning.referenceSnr,
+                 mgcSharpenAttenuationScale = sabreResolveParameters.demosaicSharpness,
+-                highlightShortAdmitted = highlightShortScheduled26607,
+-                highlightShortRestoreMaskGenerated = highlightShortConfidenceFieldGenerated26607,
+-                highlightShortAppliedToTrue2x = highlightShortCommonGuideAppliedToTrue2x26607,
++                highlightShortAdmitted = highlightShortAdmitted26587,
++                highlightShortRestoreMaskGenerated = highlightShortMaskGenerated26587,
++                highlightShortAppliedToTrue2x = highlightShortAppliedToTrue2x26587,
+                 highlightShortExposureRatio = highlightShortExposureRatio26587,
+                 normalStackedDngRaw16 = normalStackedDngRaw16,
+                 normalStackedDngFrameCount = if (exportNormalStackedDng) normalFrameCount else 0,
+@@ -3410,155 +3376,6 @@ internal class GlesMgcRawSpatialStacker(
+             ?.toFloat() ?: 1f
+     }
+ 
+-    private data class ShortComponentTrust26607(
+-        val texture: Int,
+-        val seedCells: Int,
+-        val finalCells: Int,
+-        val passes: Int,
+-    )
+-
+-    private fun createSabreShortComponentTrust26607(
+-        referenceRaw: Int,
+-        shortRaw: Int,
+-        flow: SabreConvertedAlignment,
+-        referenceCalibration: FrameCalibration,
+-        shortCalibration: FrameCalibration,
+-        exposureRatio: Float,
+-    ): ShortComponentTrust26607 {
+-        val flowSpec = checkNotNull(textureSpecs[flow.texture]) {
+-            "26607 SHORT component trust requires owned Sabre flow"
+-        }
+-        val gridWidth = flowSpec.width
+-        val gridHeight = flowSpec.height
+-        val anchorTexture = createTexture(
+-            gridWidth, gridHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+-        )
+-        val trustA = createTexture(gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_LINEAR)
+-        val trustB = createTexture(gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_LINEAR)
+-        val anchorProgram = sabreShortComponentAnchorProgram26607
+-        check(anchorProgram != 0)
+-        GLES30.glUseProgram(anchorProgram)
+-        bindTexture(anchorProgram, "uFlow", 0, flow.texture)
+-        bindTexture(anchorProgram, "uReferenceRaw", 1, referenceRaw)
+-        bindTexture(anchorProgram, "uShortRaw", 2, shortRaw)
+-        uniform2i(anchorProgram, "uGridSize", gridWidth, gridHeight)
+-        uniform2i(anchorProgram, "uRawSize", width, height)
+-        uniformSabreFlowScaleOffset(anchorProgram, flow)
+-        uniform4fv(
+-            anchorProgram, "uReferenceBlackByPhase",
+-            positionalBlackLevels26587(referenceCalibration),
+-        )
+-        uniform4fv(
+-            anchorProgram, "uShortBlackByPhase",
+-            positionalBlackLevels26587(shortCalibration),
+-        )
+-        uniform1f(anchorProgram, "uWhiteLevel", sensorWhiteLevel)
+-        uniform1f(anchorProgram, "uExposureRatio", exposureRatio)
+-        uniform1f(anchorProgram, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
+-        uniform1f(anchorProgram, "uComponentFloor", 0.55f)
+-        uniform1f(anchorProgram, "uComponentFull", 0.75f)
+-        uniform1f(anchorProgram, "uBoundaryCeiling", 0.90f)
+-        uniform1f(anchorProgram, "uConsistencyLow", 0.03f)
+-        uniform1f(anchorProgram, "uConsistencyHigh", 0.08f)
+-        draw(anchorProgram, gridWidth, gridHeight, intArrayOf(anchorTexture))
+-
+-        clearSabreSingleChannelTexture26606(
+-            trustA, gridWidth, gridHeight, "26607 SHORT component trust A clear",
+-        )
+-        clearSabreSingleChannelTexture26606(
+-            trustB, gridWidth, gridHeight, "26607 SHORT component trust B clear",
+-        )
+-        val propagationProgram = sabreShortComponentPropagateProgram26607
+-        check(propagationProgram != 0)
+-        val seedProbe = createTexture(gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_NEAREST)
+-        try {
+-            /* Zero-current pass extracts exact anchor.w without permitting propagation. */
+-            GLES30.glUseProgram(propagationProgram)
+-            bindTexture(propagationProgram, "uAnchor", 0, anchorTexture)
+-            bindTexture(propagationProgram, "uCurrent", 1, trustA)
+-            uniform2i(propagationProgram, "uGridSize", gridWidth, gridHeight)
+-            uniform2i(propagationProgram, "uRawSize", width, height)
+-            draw(propagationProgram, gridWidth, gridHeight, intArrayOf(seedProbe))
+-            val seedCells = countSabreTrustCells26606(
+-                seedProbe, gridWidth, gridHeight, "26607 SHORT boundary anchor probe",
+-            )
+-
+-            val passes = Math.addExact(gridWidth, gridHeight)
+-            var current = trustA
+-            repeat(passes) { pass ->
+-                val output = if ((pass and 1) == 0) trustB else trustA
+-                GLES30.glUseProgram(propagationProgram)
+-                bindTexture(propagationProgram, "uAnchor", 0, anchorTexture)
+-                bindTexture(propagationProgram, "uCurrent", 1, current)
+-                uniform2i(propagationProgram, "uGridSize", gridWidth, gridHeight)
+-                uniform2i(propagationProgram, "uRawSize", width, height)
+-                draw(propagationProgram, gridWidth, gridHeight, intArrayOf(output))
+-                current = output
+-            }
+-            val finalCells = countSabreTrustCells26606(
+-                current, gridWidth, gridHeight, "26607 SHORT component final probe",
+-            )
+-            releaseOwnedTexture(anchorTexture, "26607 SHORT component anchor metadata")
+-            val spare = if (current == trustA) trustB else trustA
+-            releaseOwnedTexture(spare, "26607 SHORT component spare trust")
+-            return ShortComponentTrust26607(current, seedCells, finalCells, passes)
+-        } finally {
+-            releaseOwnedTexture(seedProbe, "26607 SHORT component seed probe")
+-        }
+-    }
+-
+-    private fun renderSabreShortRescueWeight26607(
+-        ordinaryWeight: Int,
+-        referenceExtracted: Int,
+-        shortExtracted: Int,
+-        flow: SabreConvertedAlignment,
+-        componentTrust: Int,
+-        referenceCalibration: FrameCalibration,
+-        shortCalibration: FrameCalibration,
+-        exposureRatio: Float,
+-        output: Int,
+-        rescueOnlyOutput: Int,
+-        lossCandidateOutput: Int,
+-        coverageWidth: Int,
+-        coverageHeight: Int,
+-        extractedWidth: Int,
+-        extractedHeight: Int,
+-    ) {
+-        val program = sabreShortRescueWeightProgram26607
+-        check(program != 0)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uOrdinaryWeight", 0, ordinaryWeight)
+-        bindTexture(program, "uReferenceExtractedBayer", 1, referenceExtracted)
+-        bindTexture(program, "uShortExtractedBayer", 2, shortExtracted)
+-        bindTexture(program, "uFlow", 3, flow.texture)
+-        bindTexture(program, "uComponentTrust", 4, componentTrust)
+-        uniform2i(program, "uExtractedSize", extractedWidth, extractedHeight)
+-        uniformSabreFlowScaleOffset(program, flow)
+-        uniform4f(
+-            program,
+-            "uFrameBorderPadded",
+-            SABRE_SAMPLE_BORDER_PIXELS / width,
+-            SABRE_SAMPLE_BORDER_PIXELS / height,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
+-            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
+-        )
+-        uniform4fv(
+-            program, "uReferenceBlackByPhase",
+-            positionalBlackLevels26587(referenceCalibration),
+-        )
+-        uniform4fv(
+-            program, "uShortBlackByPhase",
+-            positionalBlackLevels26587(shortCalibration),
+-        )
+-        uniform1f(program, "uWhiteLevel", sensorWhiteLevel)
+-        uniform1f(program, "uExposureRatio", exposureRatio)
+-        uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
+-        draw(
+-            program, coverageWidth, coverageHeight,
+-            intArrayOf(output, rescueOnlyOutput, lossCandidateOutput),
+-        )
+-    }
+-
+     private data class ShortBoundaryTrust26606(
+         val texture: Int,
+         val seedCells: Int,
+@@ -5361,25 +5178,21 @@ internal class GlesMgcRawSpatialStacker(
+          * the post-VGN two-RGB authority.
+          */
+         sabreShortRestoreRgba16fProgram26587 = 0
+-        /* IRIS_26607_UNIVERSAL_HIGHLIGHT_COMPONENT_PROGRAMS
+-         * 26606's center-only boundary search and 90%-SHORT headroom pre-veto are retired from the
+-         * active path. 26607 still produces only scalar confidence/weight for the same common
+-         * Sabre accumulator: no private SHORT reconstruction, RGB compositor, tone, or publisher.
++        /* IRIS_26606_ONE_TUNNEL_SHORT_CONFIDENCE_PROGRAMS
++         * These programs produce only scalar confidence/weight for the existing common Sabre
++         * accumulator. They do not reconstruct, fuse, tone, or publish a private SHORT image.
+          */
+-        sabreShortBoundaryAnchorProgram26606 = 0
+-        sabreShortBoundaryPropagateProgram26606 = 0
+-        sabreShortRescueWeightProgram26606 = 0
+-        sabreShortComponentAnchorProgram26607 = linkProgram(
+-            GlesMgcRawSabreShaders.shortComponentAnchor26607,
+-            "iris_26607_short_component_anchor",
+-        )
+-        sabreShortComponentPropagateProgram26607 = linkProgram(
+-            GlesMgcRawSabreShaders.shortComponentPropagate26607,
+-            "iris_26607_short_component_propagate",
+-        )
+-        sabreShortRescueWeightProgram26607 = linkProgram(
+-            GlesMgcRawSabreShaders.shortRescueWeight26607,
+-            "iris_26607_short_rescue_weight",
++        sabreShortBoundaryAnchorProgram26606 = linkProgram(
++            GlesMgcRawSabreShaders.shortBoundaryAnchor26606,
++            "iris_26606_short_boundary_anchor",
++        )
++        sabreShortBoundaryPropagateProgram26606 = linkProgram(
++            GlesMgcRawSabreShaders.shortBoundaryPropagate26606,
++            "iris_26606_short_boundary_propagate",
++        )
++        sabreShortRescueWeightProgram26606 = linkProgram(
++            GlesMgcRawSabreShaders.shortRescueWeight26606,
++            "iris_26606_short_rescue_weight",
+         )
+         /* IRIS_26564_TRUE_2X_NO_FAKE_SR_OWNER
+          * Do not eagerly link the 26561/26562 native-RGB-upscale/detail shaders. The true-2x GPU
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 80d91129ab3b7cb107918437fb8f309864596961..e00994ba21435978ff051f0e2edc60e97e14f047 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -424,16 +424,10 @@ object PhotonMotionMgc1271Bridge {
+                 "26589 auxiliary role leaked into mergedFrameCount merged=${stacked.mergedFrameCount} " +
+                     "expected=$expectedMergedFrames26589 night=${parameters.irisNightActive}")
+             if (!parameters.irisNightActive && shortFrame != null) {
+-                /* IRIS_26607_SEMANTIC_STATE_CONTRACT
+-                 * RawStackResult keeps the historical field names for ABI stability only:
+-                 * highlightShortAdmitted means SCHEDULED, and highlightShortRestoreMaskGenerated
+-                 * means the scalar confidence field was GENERATED. Neither field proves nonzero
+-                 * final weight, accumulator contribution, Resolve effect, or output preservation.
+-                 */
+                 requireParity(stacked.highlightShortAdmitted,
+-                    "26607 captured Motion SHORT was not scheduled into the common Sabre path")
++                    "26606 captured Motion SHORT was not scheduled into the common Sabre path")
+                 requireParity(stacked.highlightShortRestoreMaskGenerated,
+-                    "26607 scheduled Motion SHORT did not generate one-tunnel confidence")
++                    "26606 scheduled Motion SHORT did not generate one-tunnel confidence")
+                 requireParity(stacked.highlightShortExposureRatio.isFinite() &&
+                         stacked.highlightShortExposureRatio > 1f,
+                     "26587 invalid SHORT exposure ratio=${stacked.highlightShortExposureRatio}")
+@@ -442,13 +436,11 @@ object PhotonMotionMgc1271Bridge {
+                     "26587 true2x SHORT guide mismatch applied=${stacked.highlightShortAppliedToTrue2x} " +
+                         "srEnabled=$sabreSuperResEnabled",
+                 )
+-                PLog.i(TAG, "IRIS_26607_SHORT_BRIDGE_SCHEDULE_STATE captured=true scheduled=true " +
+-                    "confidenceFieldGenerated=true contributionNotClaimedHere=true " +
+-                    "exposureRatio=${stacked.highlightShortExposureRatio} " +
++                PLog.i(TAG, "IRIS_26606_SHORT_BRIDGE_SCHEDULE_PROOF captured=true scheduled=true " +
++                    "confidenceGenerated=true exposureRatio=${stacked.highlightShortExposureRatio} " +
+                     "mergedFrameCount=${stacked.mergedFrameCount} normalOnlyMerged=true dngShortExcluded=true " +
+                     "srShortEvidenceExcluded=true srNativeCommonGuide=${stacked.highlightShortAppliedToTrue2x} " +
+-                    "targetAccumulatorEligibilityOwnedBy=IRIS_26607_SHORT_SEMANTIC_FUNNEL " +
+-                    "accumulatorContribution=NOT_DIRECTLY_MEASURED resolveEffective=NOT_DIRECTLY_MEASURED outputPreserved=DEVICE_IMAGE_REQUIRED")
++                    "actualContributionOwnedBy=IRIS_26606_SHORT_EFFECTIVE_PROOF")
+             } else {
+                 requireParity(!stacked.highlightShortAdmitted,
+                     "26587 SHORT auxiliary unexpectedly active without Motion SHORT capture")
+diff --git a/app/version.properties b/app/version.properties
+index 1eab60984f143842ce840c607ffa7d5e658323c6..6b1075518afc16ad4aa7aa509d8bad90b004e385 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726607
+-VERSION_BUILD=26607
++VERSION_NAME=0.9726606
++VERSION_BUILD=26606
