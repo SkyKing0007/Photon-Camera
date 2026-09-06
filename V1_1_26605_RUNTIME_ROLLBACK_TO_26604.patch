@@ -1,0 +1,563 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+index dd10e6fa576c299b50c3cf3fcd557c84e3d6ffc2..867debbe3586b21b5f2b09eb1c3c622238464455 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+@@ -117,8 +117,6 @@ internal class GlesIris26545SabreProcessor(
+             processorPipeline = MgcRawProcessorPipeline.SABRE,
+             exportNormalStackedDng = exportNormalStackedDng,
+             vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
+-            preserveExtendedHdrThroughVgn = !allowShadowLong &&
+-                exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F,
+             enableSabreSuperRes = enableSuperRes,
+             sabreSuperResTempDir = superResTempDir,
+         ).processFrames(admitted)
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 4d7b3895a139c7ad228d54c3fe9a83bddab598d8..86e53c695e0552db13108628ea532ce2b23b7a56 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -464,7 +464,7 @@ internal object GlesMgcRawSabreShaders {
+                 frameWeight*=currentHeadroom;
+                 float referenceLoss=1.0-referenceHeadroom;
+                 if(referenceLoss>1.0e-5){
+-                    float flowConfidence=1.0-smoothstep(0.50,2.00,max(flow.w,0.0));
++                    float flowConfidence=1.0-smoothstep(0.50,2.00,localFlowVariation);
+                     float boundaryRisk=clippedBoundaryRisk(uBaseGuide,referenceUv);
+                     float boundaryRadiometry=boundaryRadiometricConfidence(referenceUv,warpedUv);
+                     float boundaryConfidence=mix(
+@@ -3211,44 +3211,4 @@ internal object GlesMgcRawSabreShaders {
+             oResolved = vec4(transformOutput(p), 1.0);
+         }
+     """.trimIndent()
+-
+-
+-    /* IRIS_26605_EXTENDED_HDR_POST_VGN_RESTORE
+-     * VGN remains the validated normalized color/noise processor. Physical highlight radiance
+-     * stays in the unclipped float Resolve carrier. Apply VGN only as a normalized-domain delta:
+-     * below white this is exactly VGN; above white the original per-channel excess survives.
+-     */
+-    val restoreExtendedHdrAfterVgn = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        precision highp usampler2D;
+-        uniform sampler2D uPhysicalHdr;
+-        uniform highp usampler2D uVgnNormalized;
+-        uniform ivec2 uImageSize;
+-        layout(location = 0) out vec4 oHdr;
+-        void main() {
+-            ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uImageSize - ivec2(1));
+-            vec3 physical = max(texelFetch(uPhysicalHdr, p, 0).rgb, vec3(0.0));
+-            vec3 normalizedProxy = clamp(physical, 0.0, 1.0);
+-            vec3 vgn = vec3(texelFetch(uVgnNormalized, p, 0).rgb) / 65535.0;
+-            vec3 restored = physical + (vgn - normalizedProxy);
+-            oHdr = vec4(max(restored, vec3(0.0)), 1.0);
+-        }
+-    """.trimIndent()
+-
+-    /* IRIS_26605_EXTENDED_HDR_TELEMETRY_PROBE
+-     * Sparse fixed-size readback only; never participates in reconstruction.
+-     */
+-    val extendedHdrTelemetryProbe = """
+-        #version 300 es
+-        precision highp float;
+-        uniform sampler2D uHdr;
+-        uniform ivec2 uProbeSize;
+-        layout(location = 0) out vec4 oSample;
+-        void main() {
+-            vec2 uv = gl_FragCoord.xy / vec2(uProbeSize);
+-            oSample = vec4(texture(uHdr, clamp(uv, vec2(0.0), vec2(1.0))).rgb, 1.0);
+-        }
+-    """.trimIndent()
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index a6d343285fc913a2fe134b3dbb55f4735fcb3091..ca03c2f225decb80cf3ee6d6b3c3df22a24127a1 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -67,7 +67,6 @@ internal class GlesMgcRawSpatialStacker(
+     // at this low-level boundary while defaulting to the exact adaptive SNR interpolation.
+     private val sabreMergeGradientThreshold: Float? = null,
+     private val vgnChromaCorrectionStrength: Float = 1f,
+-    private val preserveExtendedHdrThroughVgn: Boolean = false,
+     private val enableSabreSuperRes: Boolean = false,
+     private val sabreSuperResTempDir: File? = null,
+ ) {
+@@ -552,9 +551,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreReciprocalGreenWeightProgram = 0
+     private var sabreDehomogenizeProgram = 0
+     private var sabreOutputTransformProgram = 0
+-    private var sabreOutputTransformFloatProgram = 0
+-    private var sabreExtendedHdrRestoreProgram = 0
+-    private var sabreExtendedHdrTelemetryProbeProgram = 0
+     private var sabreRgb16ToFloatProgram = 0
+     private var sabreShortBoundaryGeometrySeedProgram26600 = 0
+     private var sabreShortBoundaryGeometryPropagateProgram26600 = 0
+@@ -2030,10 +2026,6 @@ internal class GlesMgcRawSpatialStacker(
+         require(!exportGpuLinearRgbSource || useCurrentGlContext) {
+             "MGC Sabre GPU RGB export requires the caller-owned current EGL context"
+         }
+-        require(!preserveExtendedHdrThroughVgn ||
+-            (exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F)) {
+-            "26605 extended HDR preservation requires caller-owned RGBA16F GPU export"
+-        }
+         if (images.isEmpty() || width <= 1 || height <= 1) {
+             images.forEach { it.close() }
+             return null
+@@ -2429,9 +2421,6 @@ internal class GlesMgcRawSpatialStacker(
+                     referenceAlignmentProducts,
+                 )
+                 val flow = createSabreConvertedAlignment(alignment)
+-                if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT) {
+-                    logSabreRawPixelFlowVariation26605(flow, index)
+-                }
+                 val unblockerWidth = ceilDiv(width, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+                 val unblockerHeight = ceilDiv(height, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+                 val unblocker = createTexture(
+@@ -2679,9 +2668,7 @@ internal class GlesMgcRawSpatialStacker(
+                     "IRIS_26604_SINGLE_COMMON_ACCUMULATOR_OWNERSHIP " +
+                         "domain=homogeneousReferenceExposure sharedRbf=true sharedResolve=true sharedVgn=true " +
+                         "privateShortMean=false propagatedShortMask=false lateRgbBlend=false " +
+-                        "temporalSupportOwner=${if (shadowLongFrameCount > 0) "NORMAL_SHORT_LONG" else "NORMAL_SHORT"} " +
+-                            "longOwner=${if (shadowLongFrameCount > 0) "NIGHT_COMMON_SABRE" else "EXCLUDED"} " +
+-                            "dngOwner=NORMAL srDetailOwner=NORMAL",
++                        "temporalSupportOwner=NORMAL_SHORT_LONG dngOwner=NORMAL srDetailOwner=NORMAL",
+                 )
+             }
+             renderSabreDehomogenize(
+@@ -2732,11 +2719,7 @@ internal class GlesMgcRawSpatialStacker(
+                 demosaicSharpnessScale =
+                     demosaicWhiteLevel * sabreResolveParameters.demosaicSharpness,
+             )
+-            logSabreResolvedRgbStats(
+-                sabreResolvedRgb,
+-                finalBlackLevel = sabreResolveFinalBlackLevel,
+-                demosaicWhiteLevel = demosaicWhiteLevel.toFloat(),
+-            )
++            logSabreResolvedRgbStats(sabreResolvedRgb)
+             LargeDirectBuffer.free(sabreAccumulatedReadback)
+             sabreAccumulatedReadback = null
+ 
+@@ -2758,21 +2741,6 @@ internal class GlesMgcRawSpatialStacker(
+                 "Iris current-MGC Sabre VGN color noise/IIR postprocessor is not initialized"
+             }
+             chromaPostprocessor.beginFullFrame(listOf(fullOutputTile))
+-            var physicalHdr26605 = 0
+-            if (preserveExtendedHdrThroughVgn) {
+-                physicalHdr26605 = createTexture(
+-                    width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+-                )
+-                renderSabreOutputTransform(
+-                    resolvedRgbPlanes = nativeResolvedPlanes,
+-                    lensShadingTexture = lensShadingTexture,
+-                    finalBlackLevel = sabreResolveFinalBlackLevel,
+-                    demosaicWhiteLevel = demosaicWhiteLevel.toFloat(),
+-                    output = physicalHdr26605,
+-                    program = sabreOutputTransformFloatProgram,
+-                )
+-                logSabreExtendedHdrProbe26605("FLOAT_HDR_HANDOFF_PRE_VGN", physicalHdr26605)
+-            }
+             renderSabreOutputTransform(
+                 resolvedRgbPlanes = nativeResolvedPlanes,
+                 lensShadingTexture = lensShadingTexture,
+@@ -2816,31 +2784,15 @@ internal class GlesMgcRawSpatialStacker(
+                         GLES30.GL_RGBA16F,
+                         GLES30.GL_NEAREST,
+                     ).also { target ->
+-                        if (preserveExtendedHdrThroughVgn) {
+-                            check(physicalHdr26605 != 0) {
+-                                "26605 physical HDR carrier disappeared before post-VGN restoration"
+-                            }
+-                            renderSabreRestoreExtendedHdr26605(
+-                                physicalHdr26605, postprocessedUi, target,
+-                            )
+-                        } else {
+-                            renderSabreRgb16ToFloat(postprocessedUi, target)
+-                        }
++                        renderSabreRgb16ToFloat(postprocessedUi, target)
+                         GLES30.glDeleteTextures(1, intArrayOf(postprocessedUi), 0)
+                         postprocessedUi = 0
+-                        if (physicalHdr26605 != 0) {
+-                            releaseOwnedTexture(physicalHdr26605, "26605 pre-VGN physical HDR carrier")
+-                            physicalHdr26605 = 0
+-                        }
+                         check(textures.remove(target)) {
+                             "Exported Sabre RGBA16F texture is not owned by the processor"
+                         }
+                         textureSpecs.remove(target)
+                     }
+                 }
+-                if (preserveExtendedHdrThroughVgn) {
+-                    logSabreExtendedHdrProbe26605("POST_VGN_HDR_MASTER", exportedTexture)
+-                }
+             }
+             /* IRIS_26601_SHARED_NATIVE_HDR_AUTHORITY
+              * Resolve/VGN above already consumed the accepted SHORT evidence in the common Sabre
+@@ -3885,11 +3837,10 @@ internal class GlesMgcRawSpatialStacker(
+         finalBlackLevel: FloatArray,
+         demosaicWhiteLevel: Float,
+         output: Int,
+-        program: Int = sabreOutputTransformProgram,
+     ) {
+         require(resolvedRgbPlanes.size == 3)
+         require(finalBlackLevel.size == 3)
+-        check(program != 0) { "Sabre output-transform program is not initialized" }
++        val program = sabreOutputTransformProgram
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uResolvedR", 0, resolvedRgbPlanes[0])
+         bindTexture(program, "uResolvedG", 1, resolvedRgbPlanes[1])
+@@ -4549,12 +4500,7 @@ internal class GlesMgcRawSpatialStacker(
+         checkGlError("upload MGC Sabre Resolve planar RGB16")
+     }
+ 
+-    private fun logSabreResolvedRgbStats(
+-        buffer: ByteBuffer,
+-        finalBlackLevel: FloatArray,
+-        demosaicWhiteLevel: Float,
+-    ) {
+-        require(finalBlackLevel.size == 3)
++    private fun logSabreResolvedRgbStats(buffer: ByteBuffer) {
+         val pixelCount = Math.multiplyExact(width, height)
+         val samplesPerPlane = 4096
+         val sampleStep = max(1, pixelCount / samplesPerPlane)
+@@ -4563,52 +4509,31 @@ internal class GlesMgcRawSpatialStacker(
+         val maximum = IntArray(3)
+         val sum = LongArray(3)
+         val count = IntArray(3)
+-        val normalizedMax = ArrayList<Float>(samplesPerPlane + 1)
+-        var aboveNominalWhite = 0
+-        var pixel = 0
+-        while (pixel < pixelCount) {
+-            var maxNormalized = 0f
+-            for (channel in 0 until 3) {
+-                val planeOffset = channel * pixelCount
++        for (channel in 0 until 3) {
++            val planeOffset = channel * pixelCount
++            var pixel = 0
++            while (pixel < pixelCount) {
+                 val value = values.get(planeOffset + pixel).toInt() and 0xffff
+                 minimum[channel] = minOf(minimum[channel], value)
+                 maximum[channel] = maxOf(maximum[channel], value)
+                 sum[channel] += value.toLong()
+                 count[channel]++
+-                val normalized = max(
+-                    0f,
+-                    (value.toFloat() - finalBlackLevel[channel]) /
+-                        max(1f, demosaicWhiteLevel - finalBlackLevel[channel]),
+-                )
+-                maxNormalized = max(maxNormalized, normalized)
++                pixel += sampleStep
+             }
+-            normalizedMax += maxNormalized
+-            if (maxNormalized > 1f) aboveNominalWhite++
+-            pixel += sampleStep
+         }
+         val mean = FloatArray(3) { channel ->
+-            if (count[channel] > 0) sum[channel].toFloat() / count[channel].toFloat() else 0f
++            if (count[channel] > 0) {
++                sum[channel].toFloat() / count[channel].toFloat()
++            } else {
++                0f
++            }
+         }
+-        normalizedMax.sort()
+-        fun percentile(fraction: Float): Float {
+-            if (normalizedMax.isEmpty()) return Float.NaN
+-            val index = ((normalizedMax.size - 1) * fraction).toInt()
+-                .coerceIn(0, normalizedMax.size - 1)
+-            return normalizedMax[index]
+-        }
+-        val sampledMax = normalizedMax.lastOrNull() ?: Float.NaN
+-        val aboveFraction = if (normalizedMax.isNotEmpty()) {
+-            aboveNominalWhite.toFloat() / normalizedMax.size.toFloat()
+-        } else Float.NaN
+-        val details =
+-            "stage=RESOLVE_PRE_NORMALIZED_OUTPUT samples=${normalizedMax.size} step=$sampleStep " +
+-                "codeMin=${minimum.contentToString()} codeMax=${maximum.contentToString()} " +
+-                "codeMean=${mean.contentToString()} normalizedP95=${percentile(0.95f)} " +
+-                "normalizedP99=${percentile(0.99f)} normalizedMax=$sampledMax " +
+-                "aboveNominalWhite=$aboveNominalWhite aboveNominalWhiteFraction=$aboveFraction " +
+-                "demosaicWhite=$demosaicWhiteLevel"
+-        PLog.i(SABRE_TAG, "IRIS_26605_HDR_DOMAIN_STATS $details")
+-        MotionTrace.processingState("IRIS_26605_HDR_DOMAIN_STATS", details)
++        PLog.i(
++            SABRE_TAG,
++            "MGC Sabre Resolve output samples min=${minimum.contentToString()} " +
++                "max=${maximum.contentToString()} mean=${mean.contentToString()} " +
++                "step=$sampleStep",
++        )
+     }
+ 
+     private fun createSabreRgbChromaPostprocessor(): GlesIris26529SpatialRgbChromaPostprocessor =
+@@ -4667,83 +4592,6 @@ internal class GlesMgcRawSpatialStacker(
+         checkGlError("MGC Sabre VGN RGBA16F handoff")
+     }
+ 
+-    private fun renderSabreRestoreExtendedHdr26605(
+-        physicalHdr: Int,
+-        vgnNormalized: Int,
+-        output: Int,
+-    ) {
+-        val program = sabreExtendedHdrRestoreProgram
+-        check(program != 0) { "26605 extended HDR restore program is not initialized" }
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uPhysicalHdr", 0, physicalHdr)
+-        bindTexture(program, "uVgnNormalized", 1, vgnNormalized)
+-        uniform2i(program, "uImageSize", width, height)
+-        draw(program, width, height, intArrayOf(output))
+-        GlesGpuScheduler.memoryBarrier()
+-        checkGlError("26605 post-VGN extended HDR restoration")
+-    }
+-
+-    private fun logSabreExtendedHdrProbe26605(stage: String, source: Int) {
+-        val program = sabreExtendedHdrTelemetryProbeProgram
+-        if (program == 0 || source == 0) return
+-        val probeWidth = 64
+-        val probeHeight = 48
+-        val probe = createTexture(
+-            probeWidth, probeHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+-        )
+-        val readback = ByteBuffer.allocateDirect(
+-            Math.multiplyExact(Math.multiplyExact(probeWidth, probeHeight), 4 * Short.SIZE_BYTES),
+-        ).order(ByteOrder.nativeOrder())
+-        try {
+-            GLES30.glUseProgram(program)
+-            bindTexture(program, "uHdr", 0, source)
+-            uniform2i(program, "uProbeSize", probeWidth, probeHeight)
+-            draw(program, probeWidth, probeHeight, intArrayOf(probe))
+-            GlesGpuScheduler.memoryBarrier()
+-            bindRenderTargets(intArrayOf(probe), "26605 extended HDR telemetry probe")
+-            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+-            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
+-            GLES30.glReadPixels(
+-                0, 0, probeWidth, probeHeight,
+-                GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, readback,
+-            )
+-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-            checkGlError("26605 extended HDR telemetry readback")
+-            val half = readback.asShortBuffer()
+-            val samples = ArrayList<Float>(probeWidth * probeHeight)
+-            var aboveOne = 0
+-            var plateauNearOne = 0
+-            for (index in 0 until probeWidth * probeHeight) {
+-                val r = Half.toFloat(half.get(index * 4))
+-                val g = Half.toFloat(half.get(index * 4 + 1))
+-                val b = Half.toFloat(half.get(index * 4 + 2))
+-                val value = max(r, max(g, b))
+-                if (!value.isFinite()) continue
+-                samples += value
+-                if (value > 1f) aboveOne++
+-                if (value in 0.995f..1.005f) plateauNearOne++
+-            }
+-            samples.sort()
+-            fun percentile(fraction: Float): Float {
+-                if (samples.isEmpty()) return Float.NaN
+-                val index = ((samples.size - 1) * fraction).toInt()
+-                    .coerceIn(0, samples.size - 1)
+-                return samples[index]
+-            }
+-            val count = samples.size
+-            val details =
+-                "stage=$stage samples=$count probe=${probeWidth}x$probeHeight sparse=true " +
+-                    "p95=${percentile(0.95f)} p99=${percentile(0.99f)} " +
+-                    "max=${samples.lastOrNull() ?: Float.NaN} countAbove1=$aboveOne " +
+-                    "fractionAbove1=${if (count > 0) aboveOne.toFloat() / count else Float.NaN} " +
+-                    "plateauNear1Fraction=${if (count > 0) plateauNearOne.toFloat() / count else Float.NaN}"
+-            PLog.i(SABRE_TAG, "IRIS_26605_HDR_DOMAIN_STATS $details")
+-            MotionTrace.processingState("IRIS_26605_HDR_DOMAIN_STATS", details)
+-        } finally {
+-            releaseOwnedTexture(probe, "26605 extended HDR telemetry probe")
+-        }
+-    }
+-
+     private fun readSabreRgb16(texture: Int): ByteBuffer {
+         val outputBytes = width.toLong() * height * 3L * Short.SIZE_BYTES
+         val output = checkNotNull(
+@@ -4912,20 +4760,6 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.outputTransformUint16,
+             "mgc_sabre_output_transform_rgba16ui_pre_vgn",
+         )
+-        if (preserveExtendedHdrThroughVgn) {
+-            sabreOutputTransformFloatProgram = linkProgram(
+-                GlesMgcRawSabreShaders.outputTransformFloat,
+-                "iris_26605_sabre_output_transform_rgba16f_physical_hdr",
+-            )
+-            sabreExtendedHdrRestoreProgram = linkProgram(
+-                GlesMgcRawSabreShaders.restoreExtendedHdrAfterVgn,
+-                "iris_26605_sabre_post_vgn_extended_hdr_restore",
+-            )
+-            sabreExtendedHdrTelemetryProbeProgram = linkProgram(
+-                GlesMgcRawSabreShaders.extendedHdrTelemetryProbe,
+-                "iris_26605_sabre_extended_hdr_telemetry_probe",
+-            )
+-        }
+         if (exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
+             sabreRgb16ToFloatProgram = linkComputeProgram(
+                 GlesIris26521SpatialRgbShaders.copyRgb16ToFloat,
+@@ -10660,53 +10494,6 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun logSabreRawPixelFlowVariation26605(
+-        flow: SabreConvertedAlignment,
+-        frameIndex: Int,
+-    ) {
+-        val spec = checkNotNull(textureSpecs[flow.texture]) {
+-            "26605 SHORT flow texture is not owned"
+-        }
+-        val bytes = Math.multiplyExact(Math.multiplyExact(spec.width, spec.height), 8)
+-        val readback = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())
+-        bindRenderTargets(intArrayOf(flow.texture), "26605 SHORT raw-pixel flow telemetry")
+-        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+-        GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
+-        GLES30.glReadPixels(
+-            0, 0, spec.width, spec.height,
+-            GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, readback,
+-        )
+-        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-        checkGlError("26605 SHORT raw-pixel flow telemetry")
+-        val half = readback.asShortBuffer()
+-        val values = ArrayList<Float>(spec.width * spec.height)
+-        var ge050 = 0
+-        var ge100 = 0
+-        var ge200 = 0
+-        for (index in 0 until spec.width * spec.height) {
+-            val rawPixels = max(0f, Half.toFloat(half.get(index * 4 + 3)))
+-            if (!rawPixels.isFinite()) continue
+-            values += rawPixels
+-            if (rawPixels >= 0.50f) ge050++
+-            if (rawPixels >= 1.00f) ge100++
+-            if (rawPixels >= 2.00f) ge200++
+-        }
+-        values.sort()
+-        fun percentile(fraction: Float): Float {
+-            if (values.isEmpty()) return Float.NaN
+-            val i = ((values.size - 1) * fraction).toInt().coerceIn(0, values.size - 1)
+-            return values[i]
+-        }
+-        val count = values.size
+-        val details =
+-            "frame=$frameIndex component=flow.w domain=RAW_PIXELS samples=$count grid=${spec.width}x${spec.height} " +
+-                "p50=${percentile(0.50f)} p95=${percentile(0.95f)} p99=${percentile(0.99f)} " +
+-                "max=${values.lastOrNull() ?: Float.NaN} ge0p50=$ge050 ge1p00=$ge100 ge2p00=$ge200 " +
+-                "thresholdsRawPixels=0.50,1.00,2.00 activeConfidenceConsumer=true"
+-        PLog.i(SABRE_TAG, "IRIS_26605_SHORT_FLOW_W_STATS $details")
+-        MotionTrace.processingState("IRIS_26605_SHORT_FLOW_W_STATS", details)
+-    }
+-
+     private fun readTrue2xFlow(flow: SabreConvertedAlignment): Triple<ByteBuffer, Float, Float> {
+         val spec = checkNotNull(textureSpecs[flow.texture]) { "True2x flow texture is not owned" }
+         val bytes = Math.multiplyExact(Math.multiplyExact(spec.width, spec.height), 8)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 3edf6fd18314a47128d9863fbb1aa92afa9331a2..1add79ee3d7da9fbe359a5b6747c811e998b3a4c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -431,8 +431,8 @@ public final class MotionV2Render extends Node {
+                                     + " peakCode=" + peakCode
+                                     + " actualPeakContentRatio=" + actualPeakContentRatio
+                                     + " fullHdrDisplayRatio=" + fullHdrDisplayRatio
+-                                    + " separateBodyGainOwner=false"
+-                                    + " hdrGainSource=HEALTHY_HDR_MASTER_VS_SDR"
++                                    + " bodyGainUnity=" + (!basePipeline.mParameters.motionV2Active)
++                                    + " bodyGainUnityRequired=false"
+                                     + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                                     + " hdrExposureScale=" + HDR_EXPOSURE_SCALE);
+                 } catch (Throwable ignored) {}
+@@ -495,7 +495,7 @@ public final class MotionV2Render extends Node {
+                     + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                     + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+                     + " oneMasterRendition=true"
+-                    + " separateBodyGainOwnerRequired=false"
++                    + " bodyGainUnityRequired=false"
+                     + " superResToneParity=true");
+         }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 5491a55d783029f8538058713fe6d4aa605fab06..a6b14654a1cab6d5fdf6210bc1fe4b99b929a5e5 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -376,7 +376,7 @@ public class PostPipeline extends GLBasePipeline {
+                         "attached=" + attached
+                                 + " source=extendedLinearPreTone"
+                                 + " sdrBasePreserved=true"
+-                                + " hdrMasterOwner=POST_VGN_EXTENDED_LINEAR"
++                                + " bodyGainUnity=true"
+                                 + " maxRatio=" + motionV2GainMapMaxRatio
+                                 + " fullHdrDisplayRatio=" + motionV2GainMapFullHdrDisplayRatio
+                                 + " capacityMatchesActualGainPeak=true");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 9822fa01f2a6e0a8c36765758d26968e481432ca..425c4222ca42fa57b43f788e79661cfba9410cae 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -939,7 +939,7 @@ private void ApplyHdrX() {
+                     "syntheticBitmapGainMap=false"
+                             + " sdrBase=true"
+                             + " trueV2LinearGainMap=true"
+-                            + " hdrMasterOwner=POST_VGN_EXTENDED_LINEAR");
++                            + " bodyGainUnity=true");
+             imageSaved = ImageSaver.Util.saveBitmapAsJPGMotionV2(
+                     imageFile, img, ImageSaver.JPG_QUALITY, exifData,
+                     iris26564True2xRenderRgbPath, iris26564True2xWidth, iris26564True2xHeight,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 494a6d79136fe7a57987e0d88b80836538ad657e..6ed46995066a386263eb483d8d9bc3119fad9276 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -130,27 +130,6 @@ object PhotonMotionMgc1271Bridge {
+ 
+             orderedPhysical.forEachIndexed { index, (frame, role) ->
+                 validateFrame(frame, size, role, reference.motionV2ExposureEnergy, index)
+-                if (role != RawBurstFrameRole.NORMAL) {
+-                    val ratioToNormal = frame.motionV2ExposureEnergy /
+-                        reference.motionV2ExposureEnergy
+-                    val admission = when (role) {
+-                        RawBurstFrameRole.HIGHLIGHT_SHORT -> "COMMON_SABRE_HIGHLIGHT_EVIDENCE"
+-                        RawBurstFrameRole.SHADOW_LONG -> if (parameters.irisNightActive) {
+-                            "COMMON_SABRE_NIGHT_SHADOW_EVIDENCE"
+-                        } else {
+-                            "CAPTURED_BUT_EXCLUDED_FROM_NORMAL_MOTION_SABRE"
+-                        }
+-                        else -> "NORMAL"
+-                    }
+-                    val details =
+-                        "role=$role exposureTimeNs=${frame.motionV2ActualExposureNs} " +
+-                            "iso=${frame.motionV2ActualIso} " +
+-                            "black=${frame.motionV2BlackLevel.contentToString()} " +
+-                            "white=${frame.motionV2WhiteLevel} exposureRatioToNormal=$ratioToNormal " +
+-                            "admission=$admission night=${parameters.irisNightActive}"
+-                    PLog.i(TAG, "IRIS_26605_AUX_PHYSICAL_METADATA $details")
+-                    PLog.i("MotionTrace", "PIPELINE_STATE stage=IRIS_26605_AUX_PHYSICAL_METADATA details=$details")
+-                }
+             }
+ 
+             // IRIS_26514_STRICT_NOISE_AUTHORITY: no Camera2 base-frame, Pixel, or custom->Camera2 fallback.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
+index 945fc865f796e1ba3927aa48cdd435f22a37e033..5bdc669c5a5cfcb583476d9ff877a5a350f08d12 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
+@@ -126,7 +126,7 @@ public final class MotionV2UltraHdr {
+                                     + " minHdrTransition=" + MIN_HDR_TRANSITION
+                                     + " fullHdrDisplayRatio=" + fullHdrDisplayRatio
+                                     + " capacityMatchesActualGainPeak=true"
+-                                    + " gainOwner=HEALTHY_HDR_MASTER_VS_SDR");
++                                    + " bodyGainUnity=true");
+                 } catch (Throwable ignored) {}
+             }
+ 
+@@ -147,7 +147,7 @@ public final class MotionV2UltraHdr {
+                     + " metadataProfile=AndroidUltraHdr_v1_1_AdobeHdrgm"
+                     + " standardCapacityRange=true"
+                     + " source=V2ExtendedLinearBroadRendition"
+-                    + " gainOwner=HEALTHY_HDR_MASTER_VS_SDR");
++                    + " bodyGainUnity=true");
+             return attached;
+         } catch (Exception t) {
+             Log.e(TAG, "IRIS_26436_TRUE_ULTRAHDR_ATTACH_FAILED "
+diff --git a/app/version.properties b/app/version.properties
+index be423d19dc4e45cd9a4c7fabc5108b710e35b5b3..2242654551f8b630e3b903300bacd20c2412a542 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726605
+-VERSION_BUILD=26605
++VERSION_NAME=0.9726604
++VERSION_BUILD=26604
