@@ -1,0 +1,295 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index d4d11f12c5a5af513f29294f109aa099ce9a4261..3fc13bb2d6de8008cec558aad18db34e31ecb367 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -890,27 +890,18 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 targetChroma *= centerMagnitude / targetMagnitude;
+             }
+ 
+-            /* IRIS_26611_DECISIVE_NEUTRAL_CFA_FALSE_COLOR_OWNER
+-             * Ambiguous and genuinely colored pixels retain the proven fail-closed 26578 cap. But
+-             * when every independent gate already says "neutral same-surface Bayer-phase outlier"
+-             * with overwhelming confidence, the old min(0.05,40%) cap is itself a known failure:
+-             * device 26610 can carry a strong 1-2 px opponent fringe through VGN. In that narrow
+-             * decisive case the observed neutral consensus is allowed to become authoritative in a
+-             * single pass. Real-color topology remains a multiplicative veto through falseColorScore. */
++            /* Correction cannot invent a new hue or repaint a pixel. A non-neutral target with a
++             * substantially different hue is ambiguous and therefore untouched. The actual chroma
++             * displacement is then capped to 40% of the original chroma magnitude and 0.05 in the
++             * normalized camera-RGB domain, whichever is smaller.
++             */
+             float targetAgreement = hueAgreement(centerChroma, targetChroma);
+             float targetNeutral = 1.0 - smoothstep(0.010, 0.045, targetMagnitude);
+             float supportedTarget = max(targetNeutral, smoothstep(0.82, 0.94, targetAgreement));
+             float correction = falseColorGate * supportedTarget;
+             vec3 desiredDelta = targetChroma - centerChroma;
+             float desiredLength = length(desiredDelta);
+-            float decisiveNeutralCfaProof =
+-                smoothstep(0.92, 0.985, falseColorScore) *
+-                smoothstep(0.88, 0.985, phaseLikeEvidence) *
+-                smoothstep(0.90, 0.995, neutralSurfaceSupport) *
+-                smoothstep(0.90, 0.995, targetNeutral) *
+-                (1.0 - smoothstep(0.02, 0.12, realColorConfidence));
+-            float legacyMaximumMove = min(0.050, 0.40 * centerMagnitude);
+-            float maximumMove = mix(legacyMaximumMove, desiredLength, decisiveNeutralCfaProof);
++            float maximumMove = min(0.050, 0.40 * centerMagnitude);
+             float boundedScale = desiredLength > 1.0e-7 ? min(1.0, maximumMove / desiredLength) : 0.0;
+             vec3 correctedChroma = centerChroma + desiredDelta * boundedScale * correction;
+             if (length(correctedChroma) > centerMagnitude && length(correctedChroma) > 1.0e-7) {
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 504961829a43f265c1c6d883943414982e393696..3a4479578b727307af0f8004e49b2e4b0fe1c76a 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -823,17 +823,16 @@ internal object GlesMgcRawSabreShaders {
+             vec4 flow = texelFetch(uFlow, tile, 0);
+             vec2 flowRawPixels = flow.xy * vec2(uRawSize);
+ 
+-            /* IRIS_26611_SAME_CFA_MEASURABLE_BOUNDARY_SEED
+-             * Device 26610 proved that 2..8 RAW-pixel residual confidence is unsafe at Bayer
+-             * highlight edges: p50=2.46 RAW px still received ~98% trust. A one-RAW-pixel
+-             * displacement can cross CFA phase, so only a sub-pixel local residual may seed a
+-             * clipped component. Same-phase radiometry below supplies the independent measurement
+-             * proof. Predictor coherence may strengthen a valid seed but can never manufacture it. */
+-            float strictBoundaryResidualConfidence =
+-                1.0 - smoothstep(0.35, 0.95, max(flow.w, 0.0));
++            float localResidualConfidence =
++                1.0 - smoothstep(2.0, 8.0, max(flow.w, 0.0));
+             float neighborhoodPredictorConfidence = predictorConsensus(tile);
+-            float boundaryLocalFlowProof = strictBoundaryResidualConfidence * mix(
+-                0.85, 1.0, neighborhoodPredictorConfidence);
++            /* IRIS_26608_PROTECTED_ONE_TUNNEL_SHORT_BOUNDARIES
++             * Predictor coherence may preserve connectivity through a featureless clipped core,
++             * but it may never overrule poor local residual evidence at a measurable boundary. */
++            float connectivityFlowProof = max(
++                localResidualConfidence, neighborhoodPredictorConfidence);
++            float boundaryLocalFlowProof = localResidualConfidence * mix(
++                0.75, 1.0, neighborhoodPredictorConfidence);
+ 
+             vec2 cellSpanRaw = vec2(uRawSize) / (vec2(uGridSize) * safeScale);
+             vec2 cellCenterRaw = referenceUv * vec2(uRawSize);
+@@ -870,12 +869,12 @@ internal object GlesMgcRawSabreShaders {
+                             componentSourceConfidence, probeSourceConfidence);
+                     }
+ 
+-                    int literalPhasesHere = 0;
++                    bool literalHere = false;
+                     for (int phase = 0; phase < 4; ++phase) {
+                         if (rawAt(uReferenceRaw, referenceQuad + phaseOffset(phase)) >=
+-                                uSourceClippingPoint) literalPhasesHere += 1;
++                                uSourceClippingPoint) literalHere = true;
+                     }
+-                    if (literalPhasesHere >= 2) literalLossSeen = 1.0;
++                    if (literalHere) literalLossSeen = 1.0;
+                     if (hasShort) effectiveLossSeen = max(
+                         effectiveLossSeen,
+                         effectiveLossWeight(referenceNormalized, scaledShort));
+@@ -898,15 +897,12 @@ internal object GlesMgcRawSabreShaders {
+                 }
+             }
+ 
+-            /* IRIS_26611_CLIPPED_INTERIOR_CANNOT_SELF_SEED
+-             * z is region membership only: a two-phase physically censored NORMAL component with
+-             * valid SHORT source headroom. It intentionally contains no geometry confidence.
+-             * Geometry enters exclusively through w (same-CFA measurable-boundary anchor) and is
+-             * then propagated through z by the bottleneck pass. Literal clipping itself can never
+-             * create trust. Effective/sub-clipping loss remains telemetry and retains ordinary
+-             * exposure-normalized NORMAL rejection. */
++            float lossConnectivity = max(literalLossSeen, effectiveLossSeen);
++            float geometryForComponent = max(
++                connectivityFlowProof, 0.85 * literalLossSeen);
+             float componentConfidence = min(
+-                componentSourceConfidence, literalLossSeen);
++                componentSourceConfidence,
++                min(max(componentBrightness, lossConnectivity), geometryForComponent));
+             float anchorConfidence = 0.0;
+             if (anchorQuadEvidence >= 4 && anchorPhaseEvidence >= 8
+                     && boundaryLocalFlowProof > 0.0) {
+@@ -943,12 +939,8 @@ internal object GlesMgcRawSabreShaders {
+             return texelFetch(uAnchor, clampGrid(p), 0).xy * vec2(uRawSize);
+         }
+         float compatibleFlow(ivec2 a, ivec2 b) {
+-            /* IRIS_26611_CFA_PHASE_SAFE_COMPONENT_PROPAGATION
+-             * Trust may cross only a smoothly registered physically clipped interior. A neighbor
+-             * flow jump approaching one RAW pixel can change CFA phase ownership and therefore
+-             * terminates propagation instead of painting SHORT chroma across a material edge. */
+             float delta = length(rawFlowAtAnchor(a) - rawFlowAtAnchor(b));
+-            return 1.0 - smoothstep(0.50, 1.25, delta);
++            return 1.0 - smoothstep(4.0, 16.0, delta);
+         }
+         void main() {
+             ivec2 p = clampGrid(ivec2(gl_FragCoord.xy));
+@@ -1115,26 +1107,33 @@ internal object GlesMgcRawSabreShaders {
+             float targetLoss = clamp(max(literalLoss, effectiveLoss), 0.0, 1.0);
+             float shortHeadroom = wholeShortHeadroom(shortPeakRaw);
+             float componentTrust = clamp(texture(uComponentTrust, flowUv).r, 0.0, 1.0);
+-            /* IRIS_26611_BOUNDARY_PROVEN_SHORT_RESCUE_ONLY
+-             * componentTrust can exist only if a sub-pixel, same-CFA, exposure-normalized
+-             * measurable boundary seed was proven and then propagated through the two-phase clipped
+-             * interior without a CFA-meaningful flow discontinuity. The old 2..8 RAW-pixel local
+-             * residual curve is deliberately absent here: it was the 26610 device-proven path that
+-             * treated a 2.46-pixel residual as ~98% trustworthy. */
+-            float rescueConfidence = min(shortHeadroom, componentTrust);
+-
+-            /* IRIS_26611_SHORT_COMPLETE_COMMON_PHYSICAL_CAP
+-             * Only NORMAL-reference photometry is relaxable in a proven censored core. The exact
+-             * ordinary-rejection physical/unblocker weight after the same dilation remains a hard
+-             * cap, and the common RBF 3x3 source-clipping guard still runs afterward. */
+-            float censoredCoreWeight = min(physicalWeight, rescueConfidence);
++            /* IRIS_26610_NO_LITERAL_CORE_GEOMETRY_BYPASS
++             * A clipped NORMAL core makes NORMAL-reference photometry invalid, but it does not make
++             * SHORT geometry automatically valid. The same local affine residual proof remains a
++             * hard requirement everywhere, including two-phase literal clipping. This permanently
++             * removes the 26608/26609 literalCore -> geometry=1 escape that device samples showed
++             * could admit pink/magenta/blue boundary disagreement under large residuals. */
++            float localResidualConfidence =
++                1.0 - smoothstep(2.0, 8.0, max(flow.w, 0.0));
++            float localGeometry = localResidualConfidence;
++            float rescueConfidence = min(
++                shortHeadroom, min(componentTrust, localGeometry));
++
++            /* IRIS_26610_SHORT_COMPLETE_PHYSICAL_CAP
++             * ordinaryWeight remains bit-for-bit the measurable NORMAL-style weight whenever
++             * physicalCensoring=0. In a proven censored core only the invalid NORMAL-reference
++             * photometric term may relax; the inherited ordinary-rejection unblocker protection,
++             * exact common dilation, SHORT headroom, component trust, and local residual remain
++             * mandatory. No clipping state may erase the local residual cap. */
++            float sharedPhysicalProtection = min(physicalWeight, localResidualConfidence);
++            float censoredCoreWeight = min(sharedPhysicalProtection, rescueConfidence);
+             /* IRIS_26610_ONLY_PHYSICAL_CENSORSHIP_RELAXES_PHOTOMETRY
+              * effectiveLoss remains useful telemetry/evidence, but cannot replace ordinaryWeight.
+              * Only proven two-phase literal RAW censorship invalidates NORMAL-reference photometry. */
+             float physicalCensoring = clamp(literalLoss, 0.0, 1.0);
+             float finalWeight = mix(ordinaryWeight, censoredCoreWeight, physicalCensoring);
+             oWeight = clamp(finalWeight, 0.0, 1.0);
+-            oRescueOnlyWeight = clamp(max(finalWeight - ordinaryWeight, 0.0), 0.0, 1.0);
++            oRescueOnlyWeight = clamp(censoredCoreWeight * physicalCensoring, 0.0, 1.0);
+             oLossCandidate = targetLoss;
+         }
+     """.trimIndent()
+@@ -3895,32 +3894,12 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26611_HDR_INDEPENDENT_VGN_COLOR_DIRECTION
+-     * Below white this is exactly the existing normalized camera RGB. Above white the physical
+-     * RGB vector is divided by one scalar max-RGB magnitude before RGBA16UI quantization. VGN thus
+-     * sees the true color direction without per-channel clipping, while the unclipped physical
+-     * magnitude remains in the separate RGBA16F carrier for scalar restoration after cleanup. */
+-    val outputTransformHdrDirectionUint16 = """
+-        #version 300 es
+-        $outputTransformBody
+-        layout(location = 0) out highp uvec4 oResolved;
+-        float max3(vec3 v) { return max(v.r, max(v.g, v.b)); }
+-        void main() {
+-            ivec2 p = ivec2(gl_FragCoord.xy);
+-            vec3 physical = max(transformOutput(p), vec3(0.0));
+-            float magnitude = max(max3(physical), 1.0);
+-            vec3 directionDomain = clamp(physical / magnitude, 0.0, 1.0);
+-            oResolved = uvec4(uvec3(round(directionDomain * 65535.0)), 65535u);
+-        }
+-    """.trimIndent()
+-
+ 
+-    /* IRIS_26611_CLEAN_DIRECTION_SCALAR_HDR_RESTORE
+-     * VGN-cleaned RGB is the sole post-clean hue/chroma authority. The old physical RGB vector may
+-     * contribute exactly one scalar: its max-RGB HDR magnitude, which is also the source-domain
+-     * guide consumed by the validated 26610 rendition. Below white the output remains exactly VGN.
+-     * Above white, one scalar magnitude multiplies the cleaned direction; no pre-clean R/G/B excess
+-     * can cross the cleanup boundary independently, so dirty magenta/cyan cannot be resurrected. */
++    /* IRIS_26605_EXTENDED_HDR_POST_VGN_RESTORE
++     * VGN remains the validated normalized color/noise processor. Physical highlight radiance
++     * stays in the unclipped float Resolve carrier. Apply VGN only as a normalized-domain delta:
++     * below white this is exactly VGN; above white the original per-channel excess survives.
++     */
+     val restoreExtendedHdrAfterVgn = """
+         #version 300 es
+         precision highp float;
+@@ -3930,19 +3909,12 @@ internal object GlesMgcRawSabreShaders {
+         uniform highp usampler2D uVgnNormalized;
+         uniform ivec2 uImageSize;
+         layout(location = 0) out vec4 oHdr;
+-        float max3(vec3 v) { return max(v.r, max(v.g, v.b)); }
+         void main() {
+             ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uImageSize - ivec2(1));
+             vec3 physical = max(texelFetch(uPhysicalHdr, p, 0).rgb, vec3(0.0));
+-            float physicalMagnitude = max3(physical);
+-            vec3 cleaned = max(vec3(texelFetch(uVgnNormalized, p, 0).rgb) / 65535.0, vec3(0.0));
+-            vec3 restored = cleaned;
+-            if (physicalMagnitude > 1.0) {
+-                float cleanedMagnitude = max3(cleaned);
+-                vec3 cleanedDirection = cleanedMagnitude > 1.0e-6 ?
+-                    cleaned / cleanedMagnitude : vec3(1.0);
+-                restored = cleanedDirection * physicalMagnitude;
+-            }
++            vec3 normalizedProxy = clamp(physical, 0.0, 1.0);
++            vec3 vgn = vec3(texelFetch(uVgnNormalized, p, 0).rgb) / 65535.0;
++            vec3 restored = physical + (vgn - normalizedProxy);
+             oHdr = vec4(max(restored, vec3(0.0)), 1.0);
+         }
+     """.trimIndent()
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 1e4c2c918be335a1c1e11cc0f73c4a41cebf3872..41b6fc0d42ef8d43610cb360b54656d4164f43fa 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2701,11 +2701,10 @@ internal class GlesMgcRawSpatialStacker(
+                             "privateShortAccumulator=false lateRgbBlend=false normalRejectionMeasurableOnly=true " +
+                             "targetOwner=UNIVERSAL_SENSOR_LOSS literalPlusEffective=true " +
+                             "effectiveLoss=twoPhase5to12pct_or_severeNearSaturation " +
+-                            "absoluteOwner=SAME_CFA_MEASURABLE_BOUNDARY_RADIOMETRY probes=5x5 " +
+-                            "boundaryError=0.03..0.08 boundaryResidualRawPx=0.35..0.95 " +
+-                            "componentFlowBarrierRawPx=0.50..1.25 " +
++                            "absoluteOwner=FLOW_CELL_FOOTPRINT_BOUNDARY_RADIOMETRY probes=5x5 " +
++                            "boundaryError=0.03..0.08 componentFlowBarrierRawPx=4..16 " +
+                             "boundaryLocalResidualRequired=true predictorCannotOverrideLocalBoundary=true " +
+-                            "literalCoreSelfSeed=false effectiveLossPhotometricBypass=false " +
++                            "literalCoreTwoPhaseClipBypass=true " +
+                             "shortHeadroomOwner=SAME_AS_COMMON_RBF_FINAL_0P75_PERCENT " +
+                             "boundarySeedCells=$highlightShortBoundarySeedCells26607 " +
+                             "componentTrustedCells=$highlightShortBoundaryFinalCells26607 " +
+@@ -5201,14 +5200,14 @@ internal class GlesMgcRawSpatialStacker(
+         output: Int,
+     ) {
+         val program = sabreExtendedHdrRestoreProgram
+-        check(program != 0) { "26611 clean-direction scalar HDR restore program is not initialized" }
++        check(program != 0) { "26605 extended HDR restore program is not initialized" }
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uPhysicalHdr", 0, physicalHdr)
+         bindTexture(program, "uVgnNormalized", 1, vgnNormalized)
+         uniform2i(program, "uImageSize", width, height)
+         draw(program, width, height, intArrayOf(output))
+         GlesGpuScheduler.memoryBarrier()
+-        checkGlError("26611 clean-direction scalar HDR restoration")
++        checkGlError("26605 post-VGN extended HDR restoration")
+     }
+ 
+     private fun logSabreExtendedHdrProbe26605(stage: String, source: Int) {
+@@ -5457,16 +5456,8 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dehomogenize",
+         )
+         sabreOutputTransformProgram = linkProgram(
+-            if (preserveExtendedHdrThroughVgn) {
+-                GlesMgcRawSabreShaders.outputTransformHdrDirectionUint16
+-            } else {
+-                GlesMgcRawSabreShaders.outputTransformUint16
+-            },
+-            if (preserveExtendedHdrThroughVgn) {
+-                "iris_26611_sabre_output_transform_clean_direction_pre_vgn"
+-            } else {
+-                "mgc_sabre_output_transform_rgba16ui_pre_vgn"
+-            },
++            GlesMgcRawSabreShaders.outputTransformUint16,
++            "mgc_sabre_output_transform_rgba16ui_pre_vgn",
+         )
+         if (preserveExtendedHdrThroughVgn) {
+             sabreOutputTransformFloatProgram = linkProgram(
+diff --git a/app/version.properties b/app/version.properties
+index bb524d27548e000ab8fc38f0701a93de1835ac96..d2ed3f0a0822fa2c8e338c56a06451a319e178ba 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726611
+-VERSION_BUILD=26611
++VERSION_NAME=0.9726610
++VERSION_BUILD=26610
