@@ -1,0 +1,2183 @@
+diff --git a/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26616_wronski.glsl b/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26616_wronski.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..214ad0ab5236a26f43c918eba1ab8acbe1eee175
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/adaptive_color_appearance_26616_wronski.glsl
+@@ -0,0 +1,42 @@
++precision highp float;
++precision mediump sampler2D;
++uniform sampler2D InputBuffer;
++out vec4 Output;
++#ifndef CALIBRATED_PROFILE
++#define CALIBRATED_PROFILE 0
++#endif
++
++/* IRIS_26616_PRE_LTM_COLOR_ONLY
++ * Motion colorfulness correction before Wronski LTM. This shader is strictly luminance-preserving
++ * and contains no displayGain, shoulder, white anchor, output scale, histogram, or tone predictor.
++ * It may alter only the center pixel's chroma vector around its own linear Display-P3 luminance.
++ */
++const vec3 LUMA_WEIGHTS=vec3(0.22897456,0.69173852,0.07928691);
++float lum(vec3 c){return dot(c,LUMA_WEIGHTS);}
++float pk(vec3 c){return max(c.r,max(c.g,c.b));}
++ivec2 safeP(ivec2 p,ivec2 sz){return clamp(p,ivec2(0),sz-ivec2(1));}
++vec3 at(ivec2 p,ivec2 sz){return max(texelFetch(InputBuffer,safeP(p,sz),0).rgb,vec3(0.0));}
++float floorGainLimit(float y,float c){return c<-1.0e-7?max(1.0,(0.0-y)/c):4.0;}
++void main(){
++    ivec2 p=ivec2(gl_FragCoord.xy);ivec2 sz=textureSize(InputBuffer,0);vec3 center=at(p,sz);
++    /* IRIS_26616_PRE_APPEARANCE_PHYSICAL_GUIDE_ALPHA
++     * Alpha is derived before any adaptive colorfulness change.  It is physical provenance only,
++     * never an LTM/tone signal, and must survive unchanged through Wronski for UHDR. */
++    float y=lum(center);float physicalGuide=max(y,pk(center));
++#if CALIBRATED_PROFILE == 1
++    Output=vec4(center,max(physicalGuide,0.0));return;
++#endif
++    vec3 chroma=center-vec3(y);float cm=length(chroma);float relative=cm/max(y,0.08);
++    const ivec2 off[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
++    vec3 sum=chroma;float magSum=cm,maxYDelta=0.0;
++    for(int i=0;i<4;i++){vec3 n=at(p+off[i],sz);float ny=lum(n);vec3 nc=n-vec3(ny);sum+=nc;magSum+=length(nc);maxYDelta=max(maxYDelta,abs(ny-y));}
++    vec3 mean=sum/5.0;float meanMag=magSum/5.0;float coherence=length(mean)/max(meanMag,1.0e-6);float disagreement=length(chroma-mean);
++    float neutral=smoothstep(0.0035,0.018,cm);float rolloff=1.0-smoothstep(0.08,0.45,relative);
++    float shadow=smoothstep(0.015,0.075,y);float highlight=1.0-smoothstep(0.72,0.98,pk(center));
++    float coh=smoothstep(0.45,0.82,coherence);float agree=1.0-smoothstep(0.018,0.085,disagreement);float edge=1.0-smoothstep(0.025,0.11,maxYDelta);
++    float requested=1.0+0.32*neutral*rolloff*shadow*highlight*coh*agree*edge;
++    float floorLimit=min(4.0,min(floorGainLimit(y,chroma.r),min(floorGainLimit(y,chroma.g),floorGainLimit(y,chroma.b))));
++    float gain=clamp(min(requested,floorLimit),1.0,1.32);
++    vec3 appearanceRgb=gain<=1.000001?center:vec3(y)+chroma*gain;
++    Output=vec4(appearanceRgb,max(physicalGuide,0.0));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 4c0f2fab30a098f13d25ffb013cbc642b8bbb7e2..8672c11e17ea1905339dae43cf7b7cb358fe3ba6 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -77,8 +77,8 @@ void main(){
+     float ratio;
+     if(motionHdrHandoff!=0){
+         /* IRIS_26615_PHYSICAL_HEADROOM_SEPARATE_FROM_APPEARANCE
+-         * RGB already contains the canonical spatial appearance. Alpha is the immutable pre-spatial
+-         * physical max-RGB/luminance guide written by MotionV2DisplayExposure. UHDR can therefore
++         * RGB already contains the Wronski exposure-fusion appearance. Alpha is the immutable pre-LTM
++         * physical max-RGB/luminance guide written by MotionV2WronskiLtm. UHDR can therefore
+          * add only genuine >1 source headroom and can never reinterpret body gamma/detail. */
+         float physicalSourceGuide=max(hdrSample.a,0.0);
+         ratio=clamp(max(physicalSourceGuide,1.0),1.0,safeMax);
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index c4018c580e0b6cb5a25f90f354c6d14698173fb6..55830ab0d705a7b60d68f19c85b5a80a0b5d9e79 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -93,25 +93,8 @@ vec3 iris26524BilinearInput(vec2 sourcePixel) {
+     return mix(a,b,f.y);
+ }
+ 
+-/* IRIS_26615_CANONICAL_SPATIAL_APPEARANCE_PROJECTION
+- * Automatic exposure allocation is complete upstream. This is a fixed monotonic SDR projection:
+- * nominal canonical white maps to 0.95 and values above one use only the reserved final 5%.
+- * No brightness target, histogram knot or spatial decision is allowed in the final renderer.
+- */
+-float iris26615ProjectCanonicalSdrGuide(float canonicalGuide) {
+-    float x=max(canonicalGuide,0.0);
+-    const float whiteAnchor=0.95;
+-    if(x<=1.0) return whiteAnchor*x;
+-    float reserve=1.0-whiteAnchor;
+-    float tailScale=reserve/max(whiteAnchor,1.0e-6);
+-    float excess=x-1.0;
+-    return whiteAnchor+reserve*excess/(excess+tailScale);
+-}
+-
+ float mapFinalSdrGuide(float sourceGuide) {
+-    if(iris26592MotionHdrHandoff!=0) {
+-        return iris26615ProjectCanonicalSdrGuide(sourceGuide);
+-    }
++    if(iris26592MotionHdrHandoff!=0) return sourceGuide;
+ 
+     float start=0.50;
+     float mappedPre=sourceGuide;
+@@ -200,10 +183,16 @@ void main() {
+                             vec2(0.0),vec2(sourceSize-ivec2(1))));
+     }
+ 
+-    /* IRIS_26559_REMOVE_SHARED_MICROCONTRAST_HALO
+-     * Do not apply the legacy 5x5 local-luma contrast multiplier here. Sabre remains
+-     * the detail authority; headroom mapping, exposure, gamut fit and zoom are unchanged.
+-     */
++    /* IRIS_26616_WRONSKI_SOLE_MOTION_PRESENTATION_OWNER
++     * Motion input is already the complete standard-encoded Display-P3 SDR appearance produced by
++     * MotionV2WronskiLtm. No old shoulder, white anchor, output scale, gamut fit or OETF may run.
++     * Night alone continues into the inherited legacy render below. */
++    if(iris26592MotionHdrHandoff!=0){
++        Output=clamp(linearSrgb,vec3(0.0),vec3(1.0));
++        return;
++    }
++
++    /* IRIS_26559_REMOVE_SHARED_MICROCONTRAST_HALO */
+     linearSrgb=mapExtendedLinearHeadroom(linearSrgb);
+ 
+     /* IRIS_26615_FINAL_PROJECTION_ONLY
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_coarse.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_coarse.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b8ae358d6c1f15170fce0200057d4942cd43251
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_coarse.glsl
+@@ -0,0 +1,12 @@
++precision highp float;
++precision highp sampler2D;
++uniform sampler2D Exposures;
++uniform sampler2D Weights;
++out float Output;
++void main(){
++    ivec2 p=ivec2(gl_FragCoord.xy);
++    vec3 weights=texelFetch(Weights,p,0).rgb;
++    vec3 exposures=texelFetch(Exposures,p,0).rgb;
++    weights/=dot(weights,vec3(1.0))+0.0001;
++    Output=dot(exposures*weights,vec3(1.0));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_laplacian.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_laplacian.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..75565944b31ef7abce2ed5fd01dd444f5a8251e5
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_laplacian.glsl
+@@ -0,0 +1,17 @@
++precision highp float;
++precision highp sampler2D;
++uniform sampler2D ExposuresFine;
++uniform sampler2D WeightsFine;
++uniform sampler2D ExposuresCoarse;
++uniform sampler2D AccumCoarse;
++uniform vec2 FineSize;
++out float Output;
++void main(){
++    vec2 uv=gl_FragCoord.xy/FineSize;
++    float accumSoFar=texture(AccumCoarse,uv).r;
++    vec3 laplacians=texelFetch(ExposuresFine,ivec2(gl_FragCoord.xy),0).rgb-texture(ExposuresCoarse,uv).rgb;
++    vec3 weights=texelFetch(WeightsFine,ivec2(gl_FragCoord.xy),0).rgb;
++    /* Exact linked-demo default: boostLocalContrast=false, so no abs(laplacian) reweighting. */
++    weights/=dot(weights,vec3(1.0))+0.00001;
++    Output=accumSoFar+dot(laplacians*weights,vec3(1.0));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_downsample.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_downsample.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce8b6a8aa2ce9e6c83089a514abd412fb46676db
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_downsample.glsl
+@@ -0,0 +1,12 @@
++precision highp float;
++precision highp sampler2D;
++uniform sampler2D InputBuffer;
++out vec4 Output;
++void main(){
++    ivec2 outP=ivec2(gl_FragCoord.xy);ivec2 sz=textureSize(InputBuffer,0);ivec2 p=outP*2;
++    vec4 a=texelFetch(InputBuffer,clamp(p,ivec2(0),sz-ivec2(1)),0);
++    vec4 b=texelFetch(InputBuffer,clamp(p+ivec2(1,0),ivec2(0),sz-ivec2(1)),0);
++    vec4 c=texelFetch(InputBuffer,clamp(p+ivec2(0,1),ivec2(0),sz-ivec2(1)),0);
++    vec4 d=texelFetch(InputBuffer,clamp(p+ivec2(1,1),ivec2(0),sz-ivec2(1)),0);
++    Output=(a+b+c+d)*0.25;
++}
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_final.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_final.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8ab22315dfa76801af18ad79118ad43d5de12a0
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_final.glsl
+@@ -0,0 +1,43 @@
++precision highp float;
++precision highp sampler2D;
++uniform sampler2D InputBuffer;
++uniform sampler2D ExposureMip;
++uniform sampler2D FusedMip;
++uniform float exposure;
++out vec4 Output;
++
++vec3 RRTAndODTFit(vec3 v){vec3 a=v*(v+0.0245786)-0.000090537;vec3 b=v*(0.983729*v+0.4329510)+0.238081;return a/b;}
++vec3 ACESFilmicToneMapping(vec3 color){
++    const mat3 ACESInputMat=mat3(vec3(0.59719,0.07600,0.02840),vec3(0.35458,0.90834,0.13383),vec3(0.04823,0.01566,0.83777));
++    const mat3 ACESOutputMat=mat3(vec3(1.60475,-0.10208,-0.00327),vec3(-0.53108,1.10813,-0.07276),vec3(-0.07367,-0.00605,1.07602));
++    color*=1.0/0.6;color=ACESInputMat*color;color=RRTAndODTFit(color);color=ACESOutputMat*color;return clamp(color,vec3(0.0),vec3(1.0));
++}
++vec3 p3ToSrgbLinear(vec3 c){return vec3(1.22494018*c.r-0.22494018*c.g,-0.04205695*c.r+1.04205695*c.g,-0.01963755*c.r-0.07863605*c.g+1.09827360*c.b);}
++vec3 srgbToP3Linear(vec3 c){return vec3(0.8224619687*c.r+0.1775380313*c.g,0.0331941989*c.r+0.9668058011*c.g,0.0170826307*c.r+0.0723974407*c.g+0.9105199286*c.b);}
++float srgbDecode(float x){x=clamp(x,0.0,1.0);return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);}
++vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));}
++float srgbEncode(float x){x=max(x,0.0);return x<=0.0031308?12.92*x:1.055*pow(x,1.0/2.4)-0.055;}
++vec3 srgbEncode(vec3 c){return vec3(srgbEncode(c.r),srgbEncode(c.g),srgbEncode(c.b));}
++float physicalLuma(vec3 c){return dot(max(c,vec3(0.0)),vec3(0.22897456,0.69173852,0.07928691));}
++float peak3(vec3 c){return max(c.r,max(c.g,c.b));}
++void main(){
++    ivec2 p=ivec2(gl_FragCoord.xy);ivec2 sourceSize=textureSize(InputBuffer,0);vec2 uv=gl_FragCoord.xy/vec2(sourceSize);
++    ivec2 mipSize=textureSize(ExposureMip,0);vec2 px=1.0/vec2(mipSize);
++    float momentX=0.0,momentY=0.0,momentX2=0.0,momentXY=0.0,ws=0.0;
++    for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++){
++        vec2 q=uv+vec2(float(dx),float(dy))*px;float x=texture(ExposureMip,q).y;float y=texture(FusedMip,q).x;
++        float w=exp(-0.5*float(dx*dx+dy*dy)/(0.7*0.7));momentX+=x*w;momentY+=y*w;momentX2+=x*x*w;momentXY+=x*y*w;ws+=w;
++    }
++    momentX/=ws;momentY/=ws;momentX2/=ws;momentXY/=ws;float A=(momentXY-momentX*momentY)/(max(momentX2-momentX*momentX,0.0)+0.00001);float B=momentY-A*momentX;
++    vec4 src=texelFetch(InputBuffer,p,0);vec3 sourceP3=max(src.rgb,vec3(0.0));vec3 sourceSrgb=p3ToSrgbLinear(sourceP3);
++    vec3 texelOriginal=sqrt(max(ACESFilmicToneMapping(sourceSrgb*exposure),vec3(0.0)));float luminance=dot(texelOriginal,vec3(0.1,0.7,0.2))+0.00001;
++    float finalMultiplier=max(A*luminance+B,0.0)/luminance;const float threshold=0.007;
++    if(luminance<=threshold){float t=luminance/threshold;finalMultiplier=mix(1.0,finalMultiplier,t*t);}
++    /* Exact linked-demo output code value. Convert its colorimetrically interpreted sRGB display
++     * result to standard encoded Display-P3; this is a gamut/encoding adapter only. */
++    vec3 demoCode=sqrt(max(ACESFilmicToneMapping(sourceSrgb*exposure*finalMultiplier),vec3(0.0)));
++    vec3 displayLinearSrgb=srgbDecode(demoCode);vec3 displayLinearP3=max(srgbToP3Linear(displayLinearSrgb),vec3(0.0));vec3 encodedP3=clamp(srgbEncode(displayLinearP3),vec3(0.0),vec3(1.0));
++    /* Physical guide was frozen before adaptive color appearance.  Wronski owns SDR appearance
++     * only; it must not manufacture UHDR headroom from post-appearance RGB. */
++    float physicalGuide=max(src.a,0.0);Output=vec4(encodedP3,physicalGuide);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_exposures.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_exposures.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..2d00cc87b0f11a5827d6bd39aa1e51fc3463871e
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_exposures.glsl
+@@ -0,0 +1,62 @@
++precision highp float;
++precision highp sampler2D;
++uniform sampler2D InputBuffer;
++uniform float exposure;
++out vec4 Output;
++
++/* IRIS_26616_WRONSKI_EXACT_EXPOSURE_FUSION
++ * Bart Wronski 2022 WebGL demo math, main.js SHA 07417fe..., Three.js r138 ACES.
++ * Branch packing is exactly: highlights(-2 EV), midtones(0 EV), shadows(+1.5 EV).
++ * This shader computes the demo's first actually consumed fusion level (mip 2) directly from
++ * 4x4 source blocks. For ordinary dimensions divisible by four this is mathematically identical
++ * to two successive 2:1 linear-filter copies, while avoiding unused full/half-resolution LTM RTs.
++ */
++vec3 RRTAndODTFit(vec3 v){
++    vec3 a=v*(v+0.0245786)-0.000090537;
++    vec3 b=v*(0.983729*v+0.4329510)+0.238081;
++    return a/b;
++}
++vec3 ACESFilmicToneMapping(vec3 color){
++    const mat3 ACESInputMat=mat3(
++        vec3(0.59719,0.07600,0.02840),
++        vec3(0.35458,0.90834,0.13383),
++        vec3(0.04823,0.01566,0.83777));
++    const mat3 ACESOutputMat=mat3(
++        vec3(1.60475,-0.10208,-0.00327),
++        vec3(-0.53108,1.10813,-0.07276),
++        vec3(-0.07367,-0.00605,1.07602));
++    color*=1.0/0.6;
++    color=ACESInputMat*color;
++    color=RRTAndODTFit(color);
++    color=ACESOutputMat*color;
++    return clamp(color,vec3(0.0),vec3(1.0));
++}
++vec3 irisP3ToLinearSrgb(vec3 c){
++    return vec3(1.22494018*c.r-0.22494018*c.g,
++                -0.04205695*c.r+1.04205695*c.g,
++                -0.01963755*c.r-0.07863605*c.g+1.09827360*c.b);
++}
++float wronskiLightness(vec3 rgb){
++    return sqrt(dot(clamp(ACESFilmicToneMapping(rgb),vec3(0.0),vec3(1.0)),vec3(0.1,0.7,0.2)));
++}
++float qHalf(float v){return unpackHalf2x16(packHalf2x16(vec2(v,0.0))).x;}
++vec3 qHalf3(vec3 v){return vec3(qHalf(v.r),qHalf(v.g),qHalf(v.b));}
++vec3 level0At(ivec2 p,ivec2 sz){
++    p=clamp(p,ivec2(0),sz-ivec2(1));
++    vec3 src=irisP3ToLinearSrgb(texelFetch(InputBuffer,p,0).rgb)*exposure;
++    return qHalf3(vec3(wronskiLightness(src*0.25),wronskiLightness(src),wronskiLightness(src*2.8284271247461903)));
++}
++vec3 level1At(ivec2 p,ivec2 sz){
++    ivec2 q=p*2;
++    vec3 v=level0At(q,sz)+level0At(q+ivec2(1,0),sz)+level0At(q+ivec2(0,1),sz)+level0At(q+ivec2(1,1),sz);
++    return qHalf3(v*0.25);
++}
++void main(){
++    /* Exact linked-demo numeric path without materializing its unused full/half-size RTs:
++     * level0 exposure values are quantized to HalfFloat, level1 GL_LINEAR averages are quantized
++     * to HalfFloat, then level2 averages those stored level1 values. The RGBA16F attachment performs
++     * the demo's level2 HalfFloat storage conversion. */
++    ivec2 outP=ivec2(gl_FragCoord.xy);ivec2 sz=textureSize(InputBuffer,0);ivec2 q=outP*2;
++    vec3 v=level1At(q,sz)+level1At(q+ivec2(1,0),sz)+level1At(q+ivec2(0,1),sz)+level1At(q+ivec2(1,1),sz);
++    Output=vec4(v*0.25,1.0);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_weights.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_weights.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..f09b89f66fa9cbe7deef77846c039620045481c6
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_weights.glsl
+@@ -0,0 +1,48 @@
++precision highp float;
++precision highp sampler2D;
++uniform sampler2D InputBuffer;
++uniform float exposure;
++out vec4 Output;
++
++/* Exact Wronski exposure weights: sigma=5 => sigmaSq=25, normalized per source pixel before mips. */
++vec3 RRTAndODTFit(vec3 v){
++    vec3 a=v*(v+0.0245786)-0.000090537;
++    vec3 b=v*(0.983729*v+0.4329510)+0.238081;
++    return a/b;
++}
++vec3 ACESFilmicToneMapping(vec3 color){
++    const mat3 ACESInputMat=mat3(
++        vec3(0.59719,0.07600,0.02840),vec3(0.35458,0.90834,0.13383),vec3(0.04823,0.01566,0.83777));
++    const mat3 ACESOutputMat=mat3(
++        vec3(1.60475,-0.10208,-0.00327),vec3(-0.53108,1.10813,-0.07276),vec3(-0.07367,-0.00605,1.07602));
++    color*=1.0/0.6;color=ACESInputMat*color;color=RRTAndODTFit(color);color=ACESOutputMat*color;
++    return clamp(color,vec3(0.0),vec3(1.0));
++}
++vec3 irisP3ToLinearSrgb(vec3 c){
++    return vec3(1.22494018*c.r-0.22494018*c.g,
++                -0.04205695*c.r+1.04205695*c.g,
++                -0.01963755*c.r-0.07863605*c.g+1.09827360*c.b);
++}
++float wronskiLightness(vec3 rgb){return sqrt(dot(clamp(ACESFilmicToneMapping(rgb),vec3(0.0),vec3(1.0)),vec3(0.1,0.7,0.2)));}
++float qHalf(float v){return unpackHalf2x16(packHalf2x16(vec2(v,0.0))).x;}
++vec3 qHalf3(vec3 v){return vec3(qHalf(v.r),qHalf(v.g),qHalf(v.b));}
++vec3 level0At(ivec2 p,ivec2 sz){
++    p=clamp(p,ivec2(0),sz-ivec2(1));
++    vec3 src=irisP3ToLinearSrgb(texelFetch(InputBuffer,p,0).rgb)*exposure;
++    vec3 cols=vec3(wronskiLightness(src*0.25),wronskiLightness(src),wronskiLightness(src*2.8284271247461903));
++    vec3 diff=cols-vec3(0.5);vec3 weights=exp(-0.5*diff*diff*25.0);
++    weights/=dot(weights,vec3(1.0))+0.00001;
++    return qHalf3(weights);
++}
++vec3 level1At(ivec2 p,ivec2 sz){
++    ivec2 q=p*2;
++    vec3 v=level0At(q,sz)+level0At(q+ivec2(1,0),sz)+level0At(q+ivec2(0,1),sz)+level0At(q+ivec2(1,1),sz);
++    return qHalf3(v*0.25);
++}
++void main(){
++    /* Exact demo storage order: normalized level0 weights -> HalfFloat, linear level1 average ->
++     * HalfFloat, linear level2 average -> HalfFloat output. */
++    ivec2 outP=ivec2(gl_FragCoord.xy);ivec2 sz=textureSize(InputBuffer,0);ivec2 q=outP*2;
++    vec3 v=level1At(q,sz)+level1At(q+ivec2(1,0),sz)+level1At(q+ivec2(0,1),sz)+level1At(q+ivec2(1,1),sz);
++    Output=vec4(v*0.25,1.0);
++}
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index fbb52bcf71cc2540697161abb172c724cf6a056a..7adf6dd75b379968fe28324ca526255d7d56d11d 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -504,8 +504,9 @@ struct Params {
+     bool mirror=false;
+     bool motionHdrHandoff=false;
+     float residualZoom=1.f,displayGain=1.f,exposureEv=0.f,shadows=0.f,contrast=0.f,sceneWhite=1.f;
+-    int spatialBaseW=0,spatialBaseH=0;
+-    std::vector<float> spatialBase;
++    int wronskiW=0,wronskiH=0;
++    std::vector<float> wronskiMidtone;
++    std::vector<float> wronskiFused;
+     float sensorToProfile[9]{};
+     float profileToDisplay[9]{};
+ };
+@@ -520,35 +521,50 @@ inline bool profileColor(const SourceRegion&s,const Params&p,int x,int y,Vec3*ou
+     float floor=std::min(linear.r,std::min(linear.g,linear.b));if(floor<0.f){linear.r-=floor;linear.g-=floor;linear.b-=floor;}
+     *out=clampNonnegative(linear);return std::isfinite(out->r)&&std::isfinite(out->g)&&std::isfinite(out->b);
+ }
++inline float iris26616FloorGainLimit(float y,float c){return c<(-1.0e-7f)?std::max(1.f,(0.f-y)/c):4.f;}
+ inline bool adaptiveAppearance(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){
+     Vec3 center;if(!profileColor(s,p,x,y,&center))return false;
+-    float cy=luma(center);Vec3 cc={center.r-cy,center.g-cy,center.b-cy};float cm=length3(cc);float relative=cm/std::max(cy,0.08f);
++    if(!p.motionHdrHandoff){ /* exact inherited Night color path is evaluated by the cached/legacy branch below */
++        float cy=luma(center);Vec3 cc={center.r-cy,center.g-cy,center.b-cy};float cm=length3(cc);float relative=cm/std::max(cy,0.08f);
++        const int dx[4]={-1,1,0,0},dy[4]={0,0,-1,1};Vec3 sum=cc;float magSum=cm,maxYDelta=0.f;
++        for(int i=0;i<4;i++){Vec3 n;if(!profileColor(s,p,x+dx[i],y+dy[i],&n))return false;float ny=luma(n);Vec3 nc={n.r-ny,n.g-ny,n.b-ny};sum=add(sum,nc);magSum+=length3(nc);maxYDelta=std::max(maxYDelta,std::fabs(ny-cy));}
++        Vec3 mean=mul(sum,0.2f);float meanMag=magSum*0.2f;float coherence=length3(mean)/std::max(meanMag,1.0e-6f);float disagreement=length3(sub(cc,mean));
++        float neutral=smoothstep(0.0035f,0.018f,cm),rolloff=1.f-smoothstep(0.08f,0.45f,relative),dg=std::max(p.displayGain,1.0e-6f);
++        float projectedY=cy*dg,projectedPeak=peak(center)*dg;float shadow=smoothstep(0.015f,0.075f,projectedY),high=1.f-smoothstep(0.72f,0.98f,projectedPeak);
++        float coh=smoothstep(0.45f,0.82f,coherence),agree=1.f-smoothstep(0.018f,0.085f,disagreement),edge=1.f-smoothstep(0.025f,0.11f,maxYDelta*dg);
++        float requested=1.f+0.22f*neutral*rolloff*shadow*high*coh*agree*edge,limit=4.f;
++        if(peak(center)>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
++        float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
++    }
++    /* IRIS_26616_PRE_LTM_COLOR_ONLY: exact parity with adaptive_color_appearance_26616_wronski. */
++    float cy=luma(center);Vec3 cc={center.r-cy,center.g-cy,center.b-cy};float cm=length3(cc),relative=cm/std::max(cy,0.08f);
+     const int dx[4]={-1,1,0,0},dy[4]={0,0,-1,1};Vec3 sum=cc;float magSum=cm,maxYDelta=0.f;
+     for(int i=0;i<4;i++){Vec3 n;if(!profileColor(s,p,x+dx[i],y+dy[i],&n))return false;float ny=luma(n);Vec3 nc={n.r-ny,n.g-ny,n.b-ny};sum=add(sum,nc);magSum+=length3(nc);maxYDelta=std::max(maxYDelta,std::fabs(ny-cy));}
+-    Vec3 mean=mul(sum,0.2f);float meanMag=magSum*0.2f;float coherence=length3(mean)/std::max(meanMag,1.0e-6f);float disagreement=length3(sub(cc,mean));
+-    float neutral=smoothstep(0.0035f,0.018f,cm);float rolloff=1.f-smoothstep(0.08f,0.45f,relative);float dg=std::max(p.displayGain,1.0e-6f);
+-    float projectedScale=p.motionHdrHandoff?dg*0.80f:dg;float projectedY=cy*projectedScale,projectedPeak=peak(center)*projectedScale;float shadow=smoothstep(0.015f,0.075f,projectedY);float high=1.f-smoothstep(0.72f,0.98f,projectedPeak);
+-    float coh=smoothstep(0.45f,0.82f,coherence);float agree=1.f-smoothstep(0.018f,0.085f,disagreement);float edge=1.f-smoothstep(0.025f,0.11f,maxYDelta*projectedScale);
+-    float requested=1.f+0.22f*neutral*rolloff*shadow*high*coh*agree*edge;float limit=4.f;float inPeak=peak(center);
+-    if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+-    float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+-}
+-inline float iris26615SpatialBaseAt(const Params&p,float x,float y){
+-    if(!p.motionHdrHandoff||p.spatialBaseW<=0||p.spatialBaseH<=0||
+-       p.spatialBase.size()!=(size_t)p.spatialBaseW*p.spatialBaseH)return 0.f;
+-    float gx=clampf(((x+0.5f)/(float)std::max(p.trueW,1))*(float)p.spatialBaseW-0.5f,
+-                    0.f,(float)(p.spatialBaseW-1));
+-    float gy=clampf(((y+0.5f)/(float)std::max(p.trueH,1))*(float)p.spatialBaseH-0.5f,
+-                    0.f,(float)(p.spatialBaseH-1));
+-    int x0=(int)floorf(gx),y0=(int)floorf(gy),x1=std::min(x0+1,p.spatialBaseW-1),y1=std::min(y0+1,p.spatialBaseH-1);
+-    float fx=gx-x0,fy=gy-y0;
+-    auto at=[&](int xx,int yy){float v=p.spatialBase[(size_t)yy*p.spatialBaseW+xx];return std::isfinite(v)?std::max(v,0.f):0.f;};
+-    float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;
+-    return std::max(a+(b-a)*fy,0.f);
+-}
+-inline float iris26615SpatialGain(float base,float target){
+-    target=std::max(target,1.0e-6f);if(target<=1.f)return target;
+-    float b=clampf(std::max(base,0.f),0.f,1.f);return target/(1.f+(target-1.f)*b);
++    Vec3 mean=mul(sum,0.2f);float meanMag=magSum*0.2f,coherence=length3(mean)/std::max(meanMag,1.0e-6f),disagreement=length3(sub(cc,mean));
++    float neutral=smoothstep(0.0035f,0.018f,cm),rolloff=1.f-smoothstep(0.08f,0.45f,relative),shadow=smoothstep(0.015f,0.075f,cy),high=1.f-smoothstep(0.72f,0.98f,peak(center));
++    float coh=smoothstep(0.45f,0.82f,coherence),agree=1.f-smoothstep(0.018f,0.085f,disagreement),edge=1.f-smoothstep(0.025f,0.11f,maxYDelta);
++    float requested=1.f+0.32f*neutral*rolloff*shadow*high*coh*agree*edge;
++    float limit=std::min(4.f,std::min(iris26616FloorGainLimit(cy,cc.r),std::min(iris26616FloorGainLimit(cy,cc.g),iris26616FloorGainLimit(cy,cc.b))));
++    float g=clampf(std::min(requested,limit),1.f,1.32f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
++}
++inline float iris26616GridAt(const std::vector<float>&grid,int w,int h,float gx,float gy){
++    if(w<=0||h<=0||grid.size()!=(size_t)w*h)return 0.f;
++    gx=clampf(gx,0.f,(float)(w-1));gy=clampf(gy,0.f,(float)(h-1));int x0=(int)floorf(gx),y0=(int)floorf(gy),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);float fx=gx-x0,fy=gy-y0;
++    auto at=[&](int x,int y){float v=grid[(size_t)y*w+x];return std::isfinite(v)?v:0.f;};float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;return a+(b-a)*fy;
++}
++inline Vec3 iris26616P3ToSrgb(Vec3 c){return {1.22494018f*c.r-0.22494018f*c.g,-0.04205695f*c.r+1.04205695f*c.g,-0.01963755f*c.r-0.07863605f*c.g+1.09827360f*c.b};}
++inline Vec3 iris26616SrgbToP3(Vec3 c){return {0.8224619687f*c.r+0.1775380313f*c.g,0.0331941989f*c.r+0.9668058011f*c.g,0.0170826307f*c.r+0.0723974407f*c.g+0.9105199286f*c.b};}
++inline float iris26616Rrt(float v){float a=v*(v+0.0245786f)-0.000090537f,b=v*(0.983729f*v+0.4329510f)+0.238081f;return a/b;}
++inline Vec3 iris26616Aces(Vec3 c){
++    c=mul(c,1.f/0.6f);Vec3 a={0.59719f*c.r+0.35458f*c.g+0.04823f*c.b,0.07600f*c.r+0.90834f*c.g+0.01566f*c.b,0.02840f*c.r+0.13383f*c.g+0.83777f*c.b};
++    a={iris26616Rrt(a.r),iris26616Rrt(a.g),iris26616Rrt(a.b)};Vec3 o={1.60475f*a.r-0.53108f*a.g-0.07367f*a.b,-0.10208f*a.r+1.10813f*a.g-0.00605f*a.b,-0.00327f*a.r-0.07276f*a.g+1.07602f*a.b};return {clampf(o.r,0.f,1.f),clampf(o.g,0.f,1.f),clampf(o.b,0.f,1.f)};
++}
++inline Vec3 iris26616DemoCodeToP3(Vec3 q){Vec3 ls={srgbToLinear(q.r),srgbToLinear(q.g),srgbToLinear(q.b)};Vec3 lp3=clampNonnegative(iris26616SrgbToP3(ls));return {clampf(linearToSrgb(lp3.r),0.f,1.f),clampf(linearToSrgb(lp3.g),0.f,1.f),clampf(linearToSrgb(lp3.b),0.f,1.f)};}
++inline bool iris26616WronskiFinal(Vec3 sourceP3,const Params&p,float sourceX,float sourceY,Vec3*out){
++    if(!out||p.wronskiW<=0||p.wronskiH<=0||p.wronskiMidtone.size()!=(size_t)p.wronskiW*p.wronskiH||p.wronskiFused.size()!=p.wronskiMidtone.size())return false;
++    float gx=((sourceX+0.5f)/(float)std::max(p.trueW,1))*(float)p.wronskiW-0.5f,gy=((sourceY+0.5f)/(float)std::max(p.trueH,1))*(float)p.wronskiH-0.5f;
++    float mx=0.f,my=0.f,mx2=0.f,mxy=0.f,ws=0.f;for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++){float x=iris26616GridAt(p.wronskiMidtone,p.wronskiW,p.wronskiH,gx+dx,gy+dy),y=iris26616GridAt(p.wronskiFused,p.wronskiW,p.wronskiH,gx+dx,gy+dy);float w=std::exp(-0.5f*(float)(dx*dx+dy*dy)/(0.7f*0.7f));mx+=x*w;my+=y*w;mx2+=x*x*w;mxy+=x*y*w;ws+=w;}mx/=ws;my/=ws;mx2/=ws;mxy/=ws;float A=(mxy-mx*my)/(std::max(mx2-mx*mx,0.f)+0.00001f),B=my-A*mx;
++    Vec3 srgb=iris26616P3ToSrgb(sourceP3);Vec3 orig=iris26616Aces(mul(srgb,std::max(p.displayGain,1.0e-6f)));orig={std::sqrt(std::max(orig.r,0.f)),std::sqrt(std::max(orig.g,0.f)),std::sqrt(std::max(orig.b,0.f))};float lum=0.1f*orig.r+0.7f*orig.g+0.2f*orig.b+0.00001f;float mult=std::max(A*lum+B,0.f)/lum;if(lum<=0.007f){float t=lum/0.007f;mult=1.f+(mult-1.f)*t*t;}Vec3 q=iris26616Aces(mul(srgb,std::max(p.displayGain,1.0e-6f)*mult));q={std::sqrt(std::max(q.r,0.f)),std::sqrt(std::max(q.g,0.f)),std::sqrt(std::max(q.b,0.f))};*out=iris26616DemoCodeToP3(q);return true;
+ }
+ struct PresentedSample { Vec3 rgb; float physicalGuide=0.f; };
+ 
+@@ -562,11 +578,13 @@ inline Vec3 tone(Vec3 rgb,const Params&p){
+     return clampNonnegative(rgb);
+ }
+ inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,PresentedSample*out){
+-    Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c)||!out)return false;
+-    float physicalGuide=std::max(peak(c),luma(c));
+-    if(p.motionHdrHandoff)c=mul(c,iris26615SpatialGain(iris26615SpatialBaseAt(p,(float)x,(float)y),p.displayGain));
+-    else c=mul(c,std::max(p.displayGain,1.0e-6f));
+-    out->rgb=tone(c,p);out->physicalGuide=std::max(physicalGuide,0.f);return true;
++    if(!out)return false;
++    Vec3 physical;if(!profileColor(s,p,x,y,&physical))return false;
++    Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;
++    /* IRIS_26616_PRE_APPEARANCE_PHYSICAL_GUIDE: mirror the 1x alpha contract exactly. */
++    float physicalGuide=std::max(peak(physical),luma(physical));
++    if(p.motionHdrHandoff){out->rgb=c;out->physicalGuide=std::max(physicalGuide,0.f);return true;}
++    c=mul(c,std::max(p.displayGain,1.0e-6f));out->rgb=tone(c,p);out->physicalGuide=std::max(physicalGuide,0.f);return true;
+ }
+ inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,PresentedSample*out){
+     if(!out)return false;x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+@@ -602,19 +620,13 @@ inline bool buildProfileRegion(const SourceRegion&s,const Params&p,int workers,P
+     std::vector<std::thread> threads;threads.reserve((size_t)workers);for(int i=0;i<workers;i++)threads.emplace_back(work);for(auto&t:threads)t.join();return ok.load(std::memory_order_relaxed);
+ }
+ inline bool adaptiveAppearanceCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){
+-    Vec3 center;if(!s.at(x,y,&center))return false;
+-    float cy=luma(center);Vec3 cc={center.r-cy,center.g-cy,center.b-cy};float cm=length3(cc);float relative=cm/std::max(cy,0.08f);
+-    const int dx[4]={-1,1,0,0},dy[4]={0,0,-1,1};Vec3 sum=cc;float magSum=cm,maxYDelta=0.f;
+-    for(int i=0;i<4;i++){Vec3 n;if(!s.at(x+dx[i],y+dy[i],&n))return false;float ny=luma(n);Vec3 nc={n.r-ny,n.g-ny,n.b-ny};sum=add(sum,nc);magSum+=length3(nc);maxYDelta=std::max(maxYDelta,std::fabs(ny-cy));}
+-    Vec3 mean=mul(sum,0.2f);float meanMag=magSum*0.2f;float coherence=length3(mean)/std::max(meanMag,1.0e-6f);float disagreement=length3(sub(cc,mean));
+-    float neutral=smoothstep(0.0035f,0.018f,cm);float rolloff=1.f-smoothstep(0.08f,0.45f,relative);float dg=std::max(p.displayGain,1.0e-6f);
+-    float projectedScale=p.motionHdrHandoff?dg*0.80f:dg;float projectedY=cy*projectedScale,projectedPeak=peak(center)*projectedScale;float shadow=smoothstep(0.015f,0.075f,projectedY);float high=1.f-smoothstep(0.72f,0.98f,projectedPeak);
+-    float coh=smoothstep(0.45f,0.82f,coherence);float agree=1.f-smoothstep(0.018f,0.085f,disagreement);float edge=1.f-smoothstep(0.025f,0.11f,maxYDelta*projectedScale);
+-    float requested=1.f+0.22f*neutral*rolloff*shadow*high*coh*agree*edge;float limit=4.f;float inPeak=peak(center);
+-    if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+-    float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+-}
+-inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,PresentedSample*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c)||!out)return false;float physicalGuide=std::max(peak(c),luma(c));if(p.motionHdrHandoff)c=mul(c,iris26615SpatialGain(iris26615SpatialBaseAt(p,(float)x,(float)y),p.displayGain));else c=mul(c,std::max(p.displayGain,1.0e-6f));out->rgb=tone(c,p);out->physicalGuide=std::max(physicalGuide,0.f);return true;}
++    Vec3 center;if(!s.at(x,y,&center))return false;float cy=luma(center);Vec3 cc={center.r-cy,center.g-cy,center.b-cy};float cm=length3(cc),relative=cm/std::max(cy,0.08f);
++    const int dx[4]={-1,1,0,0},dy[4]={0,0,-1,1};Vec3 sum=cc;float magSum=cm,maxYDelta=0.f;for(int i=0;i<4;i++){Vec3 n;if(!s.at(x+dx[i],y+dy[i],&n))return false;float ny=luma(n);Vec3 nc={n.r-ny,n.g-ny,n.b-ny};sum=add(sum,nc);magSum+=length3(nc);maxYDelta=std::max(maxYDelta,std::fabs(ny-cy));}
++    Vec3 mean=mul(sum,0.2f);float meanMag=magSum*0.2f,coherence=length3(mean)/std::max(meanMag,1.0e-6f),disagreement=length3(sub(cc,mean));
++    if(!p.motionHdrHandoff){float dg=std::max(p.displayGain,1.0e-6f),projectedY=cy*dg,projectedPeak=peak(center)*dg;float neutral=smoothstep(0.0035f,0.018f,cm),rolloff=1.f-smoothstep(0.08f,0.45f,relative),shadow=smoothstep(0.015f,0.075f,projectedY),high=1.f-smoothstep(0.72f,0.98f,projectedPeak);float coh=smoothstep(0.45f,0.82f,coherence),agree=1.f-smoothstep(0.018f,0.085f,disagreement),edge=1.f-smoothstep(0.025f,0.11f,maxYDelta*dg);float requested=1.f+0.22f*neutral*rolloff*shadow*high*coh*agree*edge,limit=4.f;if(peak(center)>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;}
++    float neutral=smoothstep(0.0035f,0.018f,cm),rolloff=1.f-smoothstep(0.08f,0.45f,relative),shadow=smoothstep(0.015f,0.075f,cy),high=1.f-smoothstep(0.72f,0.98f,peak(center));float coh=smoothstep(0.45f,0.82f,coherence),agree=1.f-smoothstep(0.018f,0.085f,disagreement),edge=1.f-smoothstep(0.025f,0.11f,maxYDelta);float requested=1.f+0.32f*neutral*rolloff*shadow*high*coh*agree*edge;float limit=std::min(4.f,std::min(iris26616FloorGainLimit(cy,cc.r),std::min(iris26616FloorGainLimit(cy,cc.g),iris26616FloorGainLimit(cy,cc.b))));float g=clampf(std::min(requested,limit),1.f,1.32f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
++}
++inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,PresentedSample*out){if(!out)return false;Vec3 physical;if(!s.at(x,y,&physical))return false;Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;float physicalGuide=std::max(peak(physical),luma(physical));if(p.motionHdrHandoff){out->rgb=c;out->physicalGuide=std::max(physicalGuide,0.f);return true;}c=mul(c,std::max(p.displayGain,1.0e-6f));out->rgb=tone(c,p);out->physicalGuide=std::max(physicalGuide,0.f);return true;}
+ inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,float y,PresentedSample*out){
+     if(!out)return false;x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAtCached(s,p,ix,iy,out);}
+@@ -624,19 +636,10 @@ inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,f
+     out->physicalGuide=(a.physicalGuide+(b.physicalGuide-a.physicalGuide)*fx)*(1.f-fy)+(c.physicalGuide+(d.physicalGuide-c.physicalGuide)*fx)*fy;return true;
+ }
+ 
+-inline float iris26615ProjectCanonicalSdrGuide(float canonicalGuide){
+-    float x=std::max(canonicalGuide,0.f);constexpr float whiteAnchor=0.95f;
+-    if(x<=1.f)return whiteAnchor*x;float reserve=1.f-whiteAnchor;
+-    float tailScale=reserve/std::max(whiteAnchor,1.0e-6f),excess=x-1.f;
+-    return whiteAnchor+reserve*excess/(excess+tailScale);
+-}
+ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p){
+     rgb=clampNonnegative(rgb);float y=std::max(luma(rgb),0.f),pk=peak(rgb),guide=std::max(y,pk);
+-    /* IRIS_26615_TRUE2X_CPU_FIXED_SDR_PROJECTION */
+-    if(p.motionHdrHandoff){
+-        float mappedFinal=iris26615ProjectCanonicalSdrGuide(guide);
+-        if(guide>1.0e-7f)rgb=mul(rgb,mappedFinal/guide);
+-    }else{
++    if(p.motionHdrHandoff)return rgb; /* Wronski Motion never enters this Night helper. */
++    else{
+         const float start=0.50f;
+         if(guide>1.0e-7f&&guide>start){float white=std::max(p.sceneWhite,start+0.05f);float u=std::max((guide-start)/std::max(white-start,1.0e-6f),0.f);float x=clampf(u,0.f,1.f);float shaped=std::log(1.f+6.f*x)/std::log(7.f);float mapped=start+(1.25f-start)*shaped;rgb=mul(rgb,mapped/guide);}
+         rgb=mul(rgb,0.80f);
+@@ -691,15 +694,15 @@ inline bool watermarkUv(const Params&p,const Watermark&w,int ox,int oy,float*u,f
+     crx*=tw/th;crx/=((float)w.w/(float)w.h);crx*=1.025f;crx*=15.f;cry=(cry+1.f/15.f)*15.f;if(crx<0.f||cry<0.f)return false;*u=crx;*v=cry;return true;
+ }
+ inline bool renderBase(const SourceRegion&s,const Params&p,const Watermark&w,const SrgbLut&lut,int ox,int oy,float gainMax,float gainContentMax,uint8_t*out,uint8_t*gainOut){
+-    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);PresentedSample hdr;if(!samplePreRender(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr.rgb,p);
++    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);PresentedSample hdr;if(!samplePreRender(s,p,sx,sy,&hdr))return false;Vec3 sdr;if(p.motionHdrHandoff){if(!iris26616WronskiFinal(hdr.rgb,p,sx,sy,&sdr))return false;}else sdr=renderHeadroom(hdr.rgb,p);
+     if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f),contentMax=clampf(gainContentMax,1.f,safeMax);float ratio;if(p.motionHdrHandoff){ratio=clampf(std::max(hdr.physicalGuide,1.f),1.f,contentMax);}else{float hdrY=std::max(luma(clampNonnegative(hdr.rgb)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);ratio=clampf((hdrY+off)/(sdrY+off),1.f,contentMax);}float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
+-    float rr=lut.at(sdr.r),gg=lut.at(sdr.g),bb=lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
++    float rr=p.motionHdrHandoff?clampf(sdr.r,0.f,1.f):lut.at(sdr.r),gg=p.motionHdrHandoff?clampf(sdr.g,0.f,1.f):lut.at(sdr.g),bb=p.motionHdrHandoff?clampf(sdr.b,0.f,1.f):lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
+     out[0]=(uint8_t)std::lround(clampf(rr,0.f,1.f)*255.f);out[1]=(uint8_t)std::lround(clampf(gg,0.f,1.f)*255.f);out[2]=(uint8_t)std::lround(clampf(bb,0.f,1.f)*255.f);return true;
+ }
+ inline bool renderBaseCached(const ProfileRegion&s,const Params&p,const Watermark&w,const SrgbLut&lut,int ox,int oy,float gainMax,float gainContentMax,uint8_t*out,uint8_t*gainOut){
+-    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);PresentedSample hdr;if(!samplePreRenderCached(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr.rgb,p);
++    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);PresentedSample hdr;if(!samplePreRenderCached(s,p,sx,sy,&hdr))return false;Vec3 sdr;if(p.motionHdrHandoff){if(!iris26616WronskiFinal(hdr.rgb,p,sx,sy,&sdr))return false;}else sdr=renderHeadroom(hdr.rgb,p);
+     if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f),contentMax=clampf(gainContentMax,1.f,safeMax);float ratio;if(p.motionHdrHandoff){ratio=clampf(std::max(hdr.physicalGuide,1.f),1.f,contentMax);}else{float hdrY=std::max(luma(clampNonnegative(hdr.rgb)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);ratio=clampf((hdrY+off)/(sdrY+off),1.f,contentMax);}float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
+-    float rr=lut.at(sdr.r),gg=lut.at(sdr.g),bb=lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
++    float rr=p.motionHdrHandoff?clampf(sdr.r,0.f,1.f):lut.at(sdr.r),gg=p.motionHdrHandoff?clampf(sdr.g,0.f,1.f):lut.at(sdr.g),bb=p.motionHdrHandoff?clampf(sdr.b,0.f,1.f):lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
+     out[0]=(uint8_t)std::lround(clampf(rr,0.f,1.f)*255.f);out[1]=(uint8_t)std::lround(clampf(gg,0.f,1.f)*255.f);out[2]=(uint8_t)std::lround(clampf(bb,0.f,1.f)*255.f);return true;
+ }
+ inline float guideRgb(const Jin&j,int x,int y,int c){return j.guideP3[((size_t)y*j.w+x)*3+c];}
+@@ -779,13 +782,13 @@ precision highp usampler2D;
+ /* IRIS_26571_TRUE2X_PUBLICATION_COMPUTE */
+ layout(local_size_x=16,local_size_y=8,local_size_z=1) in;
+ layout(binding=0) uniform highp sampler2D uSource;
+-layout(binding=1) uniform highp sampler2D uSpatialBase;
++layout(binding=1) uniform highp sampler2D uWronskiField;
+ layout(rgba8ui,binding=0) writeonly uniform highp uimage2D uOutput;
+ layout(std430,binding=1) readonly buffer IrisGammaLut { float gammaLut[]; };
+ 
+ uniform ivec2 uSrcOrigin;
+ uniform ivec2 uSrcSize;
+-uniform ivec2 uSpatialBaseSize;
++uniform ivec2 uWronskiSize;
+ uniform ivec2 uTrueSize;
+ uniform ivec2 uOutputSize;
+ uniform ivec2 uRawSize;
+@@ -835,87 +838,23 @@ vec3 irisProfileColor(ivec2 p){
+     return irisClampNonnegative(linear);
+ }
+ vec3 irisAdaptive(ivec2 p){
+-    vec3 center=irisProfileColor(p);
+-    float cy=irisLuma(center);
+-    vec3 cc=center-vec3(cy);
+-    float cm=length(cc);
+-    float relative=cm/max(cy,0.08);
+-    const ivec2 d0=ivec2(-1,0),d1=ivec2(1,0),d2=ivec2(0,-1),d3=ivec2(0,1);
+-    vec3 n0=irisProfileColor(p+d0),n1=irisProfileColor(p+d1),n2=irisProfileColor(p+d2),n3=irisProfileColor(p+d3);
+-    float y0=irisLuma(n0),y1=irisLuma(n1),y2=irisLuma(n2),y3=irisLuma(n3);
+-    vec3 c0=n0-vec3(y0),c1=n1-vec3(y1),c2=n2-vec3(y2),c3=n3-vec3(y3);
+-    vec3 mean=(cc+c0+c1+c2+c3)*0.2;
+-    float meanMag=(cm+length(c0)+length(c1)+length(c2)+length(c3))*0.2;
+-    float maxYDelta=max(max(abs(y0-cy),abs(y1-cy)),max(abs(y2-cy),abs(y3-cy)));
+-    float coherence=length(mean)/max(meanMag,1.0e-6);
+-    float disagreement=length(cc-mean);
+-    float neutral=smoothstep(0.0035,0.018,cm);
+-    float rolloff=1.0-smoothstep(0.08,0.45,relative);
+-    float dg=max(uDisplayGain,1.0e-6);
+-    float projectedScale=uMotionHdrHandoff!=0?dg*0.80:dg;
+-    float projectedY=cy*projectedScale,projectedPeak=irisPeak(center)*projectedScale;
+-    float shadow=smoothstep(0.015,0.075,projectedY);
+-    float high=1.0-smoothstep(0.72,0.98,projectedPeak);
+-    float coh=smoothstep(0.45,0.82,coherence);
+-    float agree=1.0-smoothstep(0.018,0.085,disagreement);
+-    float edge=1.0-smoothstep(0.025,0.11,maxYDelta*projectedScale);
+-    float requested=1.0+0.22*neutral*rolloff*shadow*high*coh*agree*edge;
+-    float limitV=4.0;
+-    if(irisPeak(center)>=1.0||projectedPeak>=1.0)limitV=1.0;
+-    else{
+-        limitV=min(limitV,irisComponentGainLimit(cy,cc.r));
+-        limitV=min(limitV,irisComponentGainLimit(cy,cc.g));
+-        limitV=min(limitV,irisComponentGainLimit(cy,cc.b));
+-    }
+-    float g=clamp(min(requested,limitV),1.0,1.22);
+-    return g<=1.000001?center:vec3(cy)+cc*g;
+-}
+-float iris26615SpatialBaseAt(vec2 p){
+-    vec2 fullSize=max(vec2(uTrueSize),vec2(1.0));
+-    vec2 baseSize=max(vec2(uSpatialBaseSize),vec2(1.0));
+-    vec2 g=clamp(((p+vec2(0.5))/fullSize)*baseSize-vec2(0.5),vec2(0.0),baseSize-vec2(1.0));
+-    ivec2 p0=ivec2(floor(g));
+-    ivec2 p1=min(p0+ivec2(1),uSpatialBaseSize-ivec2(1));
+-    vec2 f=g-vec2(p0);
+-    float a=max(texelFetch(uSpatialBase,p0,0).r,0.0);
+-    float b=max(texelFetch(uSpatialBase,ivec2(p1.x,p0.y),0).r,0.0);
+-    float c=max(texelFetch(uSpatialBase,ivec2(p0.x,p1.y),0).r,0.0);
+-    float d=max(texelFetch(uSpatialBase,p1,0).r,0.0);
+-    return max(mix(mix(a,b,f.x),mix(c,d,f.x),f.y),0.0);
+-}
+-float iris26615SpatialGain(float base,float target){
+-    target=max(target,1.0e-6);
+-    if(target<=1.0)return target;
+-    float b=clamp(max(base,0.0),0.0,1.0);
+-    return target/(1.0+(target-1.0)*b);
+-}
+-vec3 irisTone(vec3 rgb){
+-    /* IRIS_26615_TRUE2X_GPU_MANUAL_POST_SPATIAL_PRESENTATION */
+-    rgb=irisClampNonnegative(rgb)*exp2(uExposureEv);
+-    if(abs(uShadows)>=0.0001){
+-        float y=irisLuma(rgb),mask=1.0-smoothstep(0.08,0.55,y),target=y;
+-        if(uShadows<0.0)target=y+(-uShadows)*0.08*mask*(1.0-clamp(y,0.0,1.0));
+-        else target=y*(1.0-0.75*uShadows*mask);
+-        rgb=y<=1.0e-7?vec3(max(target,0.0)):irisClampNonnegative(rgb)*(max(target,0.0)/y);
+-    }
+-    if(abs(uContrast)>=0.0001){
+-        float y=irisLuma(rgb);
+-        if(y>1.0e-7){
+-            const float pivot=0.18;
+-            float slope=1.0+0.25*uContrast;
+-            float target=pivot*exp2(log2(max(y/pivot,1.0e-6))*slope);
+-            rgb=irisClampNonnegative(rgb)*(max(target,0.0)/y);
+-        }
+-    }
+-    return irisClampNonnegative(rgb);
+-}
+-vec4 irisPreRenderAt(ivec2 p){
+-    vec3 c=irisAdaptive(p);
+-    float physicalGuide=max(irisPeak(c),irisLuma(c));
+-    if(uMotionHdrHandoff!=0)c*=iris26615SpatialGain(iris26615SpatialBaseAt(vec2(p)),uDisplayGain);
+-    else c*=max(uDisplayGain,1.0e-6);
+-    return vec4(irisTone(c),max(physicalGuide,0.0));
+-}
++    vec3 center=irisProfileColor(p);float cy=irisLuma(center);vec3 cc=center-vec3(cy);float cm=length(cc),relative=cm/max(cy,0.08);
++    const ivec2 d0=ivec2(-1,0),d1=ivec2(1,0),d2=ivec2(0,-1),d3=ivec2(0,1);vec3 n0=irisProfileColor(p+d0),n1=irisProfileColor(p+d1),n2=irisProfileColor(p+d2),n3=irisProfileColor(p+d3);
++    float y0=irisLuma(n0),y1=irisLuma(n1),y2=irisLuma(n2),y3=irisLuma(n3);vec3 c0=n0-vec3(y0),c1=n1-vec3(y1),c2=n2-vec3(y2),c3=n3-vec3(y3);vec3 mean=(cc+c0+c1+c2+c3)*0.2;float meanMag=(cm+length(c0)+length(c1)+length(c2)+length(c3))*0.2;float maxYDelta=max(max(abs(y0-cy),abs(y1-cy)),max(abs(y2-cy),abs(y3-cy)));float coherence=length(mean)/max(meanMag,1.0e-6),disagreement=length(cc-mean);
++    if(uMotionHdrHandoff==0){float dg=max(uDisplayGain,1.0e-6),projectedY=cy*dg,projectedPeak=irisPeak(center)*dg;float neutral=smoothstep(0.0035,0.018,cm),rolloff=1.0-smoothstep(0.08,0.45,relative),shadow=smoothstep(0.015,0.075,projectedY),high=1.0-smoothstep(0.72,0.98,projectedPeak),coh=smoothstep(0.45,0.82,coherence),agree=1.0-smoothstep(0.018,0.085,disagreement),edge=1.0-smoothstep(0.025,0.11,maxYDelta*dg);float requested=1.0+0.22*neutral*rolloff*shadow*high*coh*agree*edge,limitV=4.0;if(irisPeak(center)>=1.0||projectedPeak>=1.0)limitV=1.0;else{limitV=min(limitV,irisComponentGainLimit(cy,cc.r));limitV=min(limitV,irisComponentGainLimit(cy,cc.g));limitV=min(limitV,irisComponentGainLimit(cy,cc.b));}float g=clamp(min(requested,limitV),1.0,1.22);return g<=1.000001?center:vec3(cy)+cc*g;}
++    float neutral=smoothstep(0.0035,0.018,cm),rolloff=1.0-smoothstep(0.08,0.45,relative),shadow=smoothstep(0.015,0.075,cy),high=1.0-smoothstep(0.72,0.98,irisPeak(center)),coh=smoothstep(0.45,0.82,coherence),agree=1.0-smoothstep(0.018,0.085,disagreement),edge=1.0-smoothstep(0.025,0.11,maxYDelta);float requested=1.0+0.32*neutral*rolloff*shadow*high*coh*agree*edge;float floorLimit=4.0;if(cc.r<(-1.0e-7))floorLimit=min(floorLimit,max(1.0,(0.0-cy)/cc.r));if(cc.g<(-1.0e-7))floorLimit=min(floorLimit,max(1.0,(0.0-cy)/cc.g));if(cc.b<(-1.0e-7))floorLimit=min(floorLimit,max(1.0,(0.0-cy)/cc.b));float g=clamp(min(requested,floorLimit),1.0,1.32);return g<=1.000001?center:vec3(cy)+cc*g;
++}
++float irisGridAt(int channel,vec2 g){vec2 hi=max(vec2(uWronskiSize)-vec2(1.0),vec2(0.0));g=clamp(g,vec2(0.0),hi);ivec2 p0=ivec2(floor(g)),p1=min(p0+ivec2(1),uWronskiSize-ivec2(1));vec2 f=g-vec2(p0);vec2 a=texelFetch(uWronskiField,p0,0).rg,b=texelFetch(uWronskiField,ivec2(p1.x,p0.y),0).rg,c=texelFetch(uWronskiField,ivec2(p0.x,p1.y),0).rg,d=texelFetch(uWronskiField,p1,0).rg;vec2 q=mix(mix(a,b,f.x),mix(c,d,f.x),f.y);return channel==0?q.r:q.g;}
++vec3 irisP3ToSrgb(vec3 c){return vec3(1.22494018*c.r-0.22494018*c.g,-0.04205695*c.r+1.04205695*c.g,-0.01963755*c.r-0.07863605*c.g+1.09827360*c.b);}
++vec3 irisSrgbToP3(vec3 c){return vec3(0.8224619687*c.r+0.1775380313*c.g,0.0331941989*c.r+0.9668058011*c.g,0.0170826307*c.r+0.0723974407*c.g+0.9105199286*c.b);}
++vec3 irisRrt(vec3 v){vec3 a=v*(v+0.0245786)-0.000090537,b=v*(0.983729*v+0.4329510)+0.238081;return a/b;}
++vec3 irisAces(vec3 c){const mat3 ai=mat3(vec3(0.59719,0.07600,0.02840),vec3(0.35458,0.90834,0.13383),vec3(0.04823,0.01566,0.83777));const mat3 ao=mat3(vec3(1.60475,-0.10208,-0.00327),vec3(-0.53108,1.10813,-0.07276),vec3(-0.07367,-0.00605,1.07602));c*=1.0/0.6;c=ai*c;c=irisRrt(c);c=ao*c;return clamp(c,vec3(0.0),vec3(1.0));}
++float irisSrgbDecode(float x){x=clamp(x,0.0,1.0);return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);}
++float irisSrgbEncode(float x){x=max(x,0.0);return x<=0.0031308?12.92*x:1.055*pow(x,1.0/2.4)-0.055;}
++vec3 irisDemoCodeToP3(vec3 q){vec3 ls=vec3(irisSrgbDecode(q.r),irisSrgbDecode(q.g),irisSrgbDecode(q.b));vec3 lp3=max(irisSrgbToP3(ls),vec3(0.0));return clamp(vec3(irisSrgbEncode(lp3.r),irisSrgbEncode(lp3.g),irisSrgbEncode(lp3.b)),vec3(0.0),vec3(1.0));}
++vec3 irisWronskiFinal(vec3 sourceP3,vec2 sourceP){vec2 g=((sourceP+vec2(0.5))/vec2(max(uTrueSize,ivec2(1))))*vec2(uWronskiSize)-vec2(0.5);float mx=0.0,my=0.0,mx2=0.0,mxy=0.0,ws=0.0;for(int dy=-1;dy<=1;dy++)for(int dx=-1;dx<=1;dx++){float x=irisGridAt(0,g+vec2(float(dx),float(dy))),y=irisGridAt(1,g+vec2(float(dx),float(dy)));float w=exp(-0.5*float(dx*dx+dy*dy)/(0.7*0.7));mx+=x*w;my+=y*w;mx2+=x*x*w;mxy+=x*y*w;ws+=w;}mx/=ws;my/=ws;mx2/=ws;mxy/=ws;float A=(mxy-mx*my)/(max(mx2-mx*mx,0.0)+0.00001),B=my-A*mx;vec3 srgb=irisP3ToSrgb(sourceP3),orig=sqrt(max(irisAces(srgb*max(uDisplayGain,1.0e-6)),vec3(0.0)));float lum=dot(orig,vec3(0.1,0.7,0.2))+0.00001;float mult=max(A*lum+B,0.0)/lum;if(lum<=0.007){float t=lum/0.007;mult=mix(1.0,mult,t*t);}vec3 q=sqrt(max(irisAces(srgb*max(uDisplayGain,1.0e-6)*mult),vec3(0.0)));return irisDemoCodeToP3(q);}
++vec3 irisTone(vec3 rgb){rgb=irisClampNonnegative(rgb)*exp2(uExposureEv);if(abs(uShadows)>=0.0001){float y=irisLuma(rgb),mask=1.0-smoothstep(0.08,0.55,y),target=y;if(uShadows<0.0)target=y+(-uShadows)*0.08*mask*(1.0-clamp(y,0.0,1.0));else target=y*(1.0-0.75*uShadows*mask);rgb=y<=1.0e-7?vec3(max(target,0.0)):irisClampNonnegative(rgb)*(max(target,0.0)/y);}if(abs(uContrast)>=0.0001){float y=irisLuma(rgb);if(y>1.0e-7){const float pivot=0.18;float slope=1.0+0.25*uContrast;float target=pivot*exp2(log2(max(y/pivot,1.0e-6))*slope);rgb=irisClampNonnegative(rgb)*(max(target,0.0)/y);}}return irisClampNonnegative(rgb);}
++vec4 irisPreRenderAt(ivec2 p){vec3 physical=irisProfileColor(p);vec3 c=irisAdaptive(p);float physicalGuide=max(irisPeak(physical),irisLuma(physical));if(uMotionHdrHandoff==0)c=irisTone(c*max(uDisplayGain,1.0e-6));return vec4(c,max(physicalGuide,0.0));}
+ vec4 irisSamplePreRender(vec2 p){
+     p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
+     if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
+@@ -941,22 +880,11 @@ vec2 irisOutputToSource(ivec2 op){
+     float sx=cx+(ux-cx)/uResidualZoom,sy=cy+(uy-cy)/uResidualZoom;
+     return clamp(2.0*(vec2(sx,sy)+vec2(0.5))-vec2(0.5),vec2(0.0),vec2(uTrueSize-ivec2(1)));
+ }
+-float iris26615ProjectCanonicalSdrGuide(float canonicalGuide){
+-    const float whiteAnchor=0.95;
+-    float x=max(canonicalGuide,0.0);
+-    if(x<=1.0)return whiteAnchor*x;
+-    float reserve=1.0-whiteAnchor;
+-    float tailScale=reserve/max(whiteAnchor,1.0e-6),excess=x-1.0;
+-    return whiteAnchor+reserve*excess/(excess+tailScale);
+-}
+ vec3 irisHeadroom(vec3 rgb){
+     rgb=irisClampNonnegative(rgb);
+     float y=max(irisLuma(rgb),0.0),pk=irisPeak(rgb),guide=max(y,pk);
+-    /* IRIS_26615_TRUE2X_GPU_PROJECTION_ONLY */
+-    if(uMotionHdrHandoff!=0){
+-        float mappedFinal=iris26615ProjectCanonicalSdrGuide(guide);
+-        if(guide>1.0e-7)rgb*=mappedFinal/guide;
+-    }else{
++    if(uMotionHdrHandoff!=0)return rgb; /* Wronski Motion never enters this Night helper. */
++    else{
+         float start=0.50;
+         if(guide>1.0e-7&&guide>start){float white=max(uSceneWhite,start+0.05);float u=max((guide-start)/max(white-start,1.0e-6),0.0);float x=clamp(u,0.0,1.0);float shaped=log(1.0+6.0*x)/log(7.0);float mapped=start+(1.25-start)*shaped;rgb*=mapped/guide;}
+         rgb*=0.80;
+@@ -973,9 +901,7 @@ void main(){
+     ivec2 local=ivec2(gl_GlobalInvocationID.xy);
+     if(local.x>=uOutputSize.x||local.y>=uBandH)return;
+     ivec2 op=ivec2(local.x,uBandTop+local.y);
+-    vec4 hdrSample=irisSamplePreRender(irisOutputToSource(op));
+-    vec3 hdr=hdrSample.rgb;
+-    vec3 sdr=irisHeadroom(hdr);
++    vec2 sourceP=irisOutputToSource(op);vec4 hdrSample=irisSamplePreRender(sourceP);vec3 hdr=hdrSample.rgb;vec3 sdr=uMotionHdrHandoff!=0?irisWronskiFinal(hdr,sourceP):irisHeadroom(hdr);
+     uint gainCode=0u;
+     if(uGenerateGain!=0){
+         const float off=0.015625;float safeMax=max(uGainMax,1.001);
+@@ -991,7 +917,7 @@ void main(){
+         float code=clamp(log2(ratio)/max(log2(safeMax),1.0e-6),0.0,1.0);
+         gainCode=irisByte(code);
+     }
+-    uvec4 outv=uvec4(irisByte(irisGamma(sdr.r)),irisByte(irisGamma(sdr.g)),irisByte(irisGamma(sdr.b)),gainCode);
++    uvec4 outv=uMotionHdrHandoff!=0?uvec4(irisByte(sdr.r),irisByte(sdr.g),irisByte(sdr.b),gainCode):uvec4(irisByte(irisGamma(sdr.r)),irisByte(irisGamma(sdr.g)),irisByte(irisGamma(sdr.b)),gainCode);
+     imageStore(uOutput,local,outv);
+ }
+ )GLSL";
+@@ -1023,20 +949,18 @@ public:
+         if(maxTex<std::max(outWidth,std::max(p.trueW,p.trueH))){set(reason,"GL_MAX_TEXTURE_SIZE");return false;}
+         std::string compileError;program=iris26571Program(&compileError);if(!program){set(reason,("compute:"+compileError).c_str());return false;}
+         glGenTextures(1,&sourceTex);glBindTexture(GL_TEXTURE_2D,sourceTex);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+-        /* IRIS_26615_TRUE2X_SHARED_SPATIAL_BASE_GPU
+-         * Small presentation metadata only. RGBA32F is a proven sampled carrier here; manual
+-         * bilinear texelFetch avoids requiring float linear-filter extensions. */
+-        std::vector<float> spatialUpload;int spatialW=1,spatialH=1;
+-        if(p.motionHdrHandoff){spatialW=p.spatialBaseW;spatialH=p.spatialBaseH;spatialUpload.resize((size_t)spatialW*spatialH*4);for(size_t i=0;i<p.spatialBase.size();i++){float v=std::max(p.spatialBase[i],0.f);spatialUpload[i*4]=v;spatialUpload[i*4+1]=v;spatialUpload[i*4+2]=v;spatialUpload[i*4+3]=1.f;}}
+-        else spatialUpload={0.f,0.f,0.f,1.f};
+-        glActiveTexture(GL_TEXTURE1);glGenTextures(1,&spatialBaseTex);glBindTexture(GL_TEXTURE_2D,spatialBaseTex);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,spatialW,spatialH,0,GL_RGBA,GL_FLOAT,spatialUpload.data());
++        /* IRIS_26616_TRUE2X_SHARED_WRONSKI_GPU: R=midtone mip2, G=fused mip2. */
++        std::vector<float> wronskiUpload;int wronskiW=1,wronskiH=1;
++        if(p.motionHdrHandoff){wronskiW=p.wronskiW;wronskiH=p.wronskiH;wronskiUpload.resize((size_t)wronskiW*wronskiH*4);for(size_t i=0;i<p.wronskiMidtone.size();i++){wronskiUpload[i*4]=p.wronskiMidtone[i];wronskiUpload[i*4+1]=p.wronskiFused[i];wronskiUpload[i*4+2]=0.f;wronskiUpload[i*4+3]=1.f;}}
++        else wronskiUpload={0.f,0.f,0.f,1.f};
++        glActiveTexture(GL_TEXTURE1);glGenTextures(1,&spatialBaseTex);glBindTexture(GL_TEXTURE_2D,spatialBaseTex);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,wronskiW,wronskiH,0,GL_RGBA,GL_FLOAT,wronskiUpload.data());
+         glActiveTexture(GL_TEXTURE0);
+         glGenTextures(1,&outputTex);glBindTexture(GL_TEXTURE_2D,outputTex);glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8UI,outWidth,maxBandRows);
+         glGenFramebuffers(1,&fbo);glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,outputTex,0);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){set(reason,"RGBA8UI framebuffer");return false;}
+         glGenBuffers(1,&lutSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,lutSsbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(lut.v.size()*sizeof(float)),lut.v.data(),GL_STATIC_DRAW);
+         const size_t maxBytes=(size_t)outWidth*maxBandRows*4;glGenBuffers(2,pbo);for(int i=0;i<2;i++){glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[i]);glBufferData(GL_PIXEL_PACK_BUFFER,(GLsizeiptr)maxBytes,nullptr,GL_STREAM_READ);}
+         glBindBuffer(GL_PIXEL_PACK_BUFFER,0);GLenum err=glGetError();if(err!=GL_NO_ERROR){set(reason,"GL allocation");return false;}
+-        glUseProgram(program);glUniform1i(loc("uSource"),0);glUniform1i(loc("uSpatialBase"),1);setParams();return true;
++        glUseProgram(program);glUniform1i(loc("uSource"),0);glUniform1i(loc("uWronskiField"),1);setParams();return true;
+     }
+     bool renderReadback(int fd,float gainMax,float gainContentMax,bool generateGain,int top,int h,int slot,Iris26571ReadyBand*out,Iris26571GpuTiming*timing,std::string*reason){
+         if(!params||slot<0||slot>1){set(reason,"render_invalid_state");return false;}
+@@ -1067,7 +991,7 @@ private:
+     static void set(std::string*r,const char*m){if(r)*r=m?m:"unknown";}
+     static void setGl(std::string*r,const char*stage,GLenum err){if(!r)return;char b[96];std::snprintf(b,sizeof(b),"%s_gl_error_0x%04x",stage?stage:"gl",(unsigned int)err);*r=b;}
+     void setParams(){
+-        glUseProgram(program);glUniform2i(loc("uSpatialBaseSize"),params->motionHdrHandoff?params->spatialBaseW:1,params->motionHdrHandoff?params->spatialBaseH:1);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);
++        glUseProgram(program);glUniform2i(loc("uWronskiSize"),params->motionHdrHandoff?params->wronskiW:1,params->motionHdrHandoff?params->wronskiH:1);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);
+         glUniform3f(loc("uSensorRow0"),params->sensorToProfile[0],params->sensorToProfile[1],params->sensorToProfile[2]);glUniform3f(loc("uSensorRow1"),params->sensorToProfile[3],params->sensorToProfile[4],params->sensorToProfile[5]);glUniform3f(loc("uSensorRow2"),params->sensorToProfile[6],params->sensorToProfile[7],params->sensorToProfile[8]);
+         glUniform3f(loc("uDisplayRow0"),params->profileToDisplay[0],params->profileToDisplay[1],params->profileToDisplay[2]);glUniform3f(loc("uDisplayRow1"),params->profileToDisplay[3],params->profileToDisplay[4],params->profileToDisplay[5]);glUniform3f(loc("uDisplayRow2"),params->profileToDisplay[6],params->profileToDisplay[7],params->profileToDisplay[8]);
+     }
+@@ -1155,19 +1079,19 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_particlesdevs_photoncamera_process
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative(
+         JNIEnv*e,jclass,jobject bitmap,jstring renderPath,jint trueW,jint trueH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,
+-        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloatArray spatialAppearanceBase,jint spatialBaseWidth,jint spatialBaseHeight,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat sceneWhite,jboolean motionHdrHandoff,
++        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloatArray wronskiMidtone,jfloatArray wronskiFused,jint wronskiWidth,jint wronskiHeight,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat sceneWhite,jboolean motionHdrHandoff,
+         jobject watermarkBitmap,
+         jfloatArray jinResidual,jintArray jinReference,jint jinW,jint jinH,jstring gainPath,jfloat gainMaxRatio,jfloat gainContentMaxRatio,jstring path,jint quality){
+     using namespace iris26564render;gIris26576PublicationTelemetry="backend=UNSET callStarted=true";AndroidBitmapInfo info{};if(!bitmap||!renderPath||!path||trueW<=0||trueH<=0||rawW<=0||rawH<=0||cropW<=0||cropH<=0||trueW!=rawW*2||trueH!=rawH*2||cropW>rawW||cropH>rawH||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888){iris26576SetPublicationTelemetry("backend=NONE validationFailed=true");return JNI_FALSE;}
+     int expectedNativeW=(rotation==90||rotation==270)?cropH:rawW,expectedNativeH=(rotation==90||rotation==270)?rawW:cropH;if((int)info.width!=expectedNativeW||(int)info.height!=expectedNativeH)return JNI_FALSE;
+     Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
+     if(p.motionHdrHandoff){
+-        if(!spatialAppearanceBase||spatialBaseWidth<=0||spatialBaseHeight<=0||
+-           (jlong)spatialBaseWidth*(jlong)spatialBaseHeight!=(jlong)e->GetArrayLength(spatialAppearanceBase))return JNI_FALSE;
+-        p.spatialBaseW=spatialBaseWidth;p.spatialBaseH=spatialBaseHeight;p.spatialBase.resize((size_t)spatialBaseWidth*spatialBaseHeight);
+-        e->GetFloatArrayRegion(spatialAppearanceBase,0,(jsize)p.spatialBase.size(),p.spatialBase.data());if(e->ExceptionCheck())return JNI_FALSE;
+-        for(float v:p.spatialBase)if(!std::isfinite(v)||v<0.f)return JNI_FALSE;
+-    }else if(spatialAppearanceBase||spatialBaseWidth!=0||spatialBaseHeight!=0)return JNI_FALSE;
++        if(!wronskiMidtone||!wronskiFused||wronskiWidth<=0||wronskiHeight<=0)return JNI_FALSE;const jlong expectedGrid=(jlong)wronskiWidth*(jlong)wronskiHeight;
++        if(expectedGrid!=(jlong)e->GetArrayLength(wronskiMidtone)||expectedGrid!=(jlong)e->GetArrayLength(wronskiFused))return JNI_FALSE;
++        p.wronskiW=wronskiWidth;p.wronskiH=wronskiHeight;p.wronskiMidtone.resize((size_t)expectedGrid);p.wronskiFused.resize((size_t)expectedGrid);
++        e->GetFloatArrayRegion(wronskiMidtone,0,(jsize)expectedGrid,p.wronskiMidtone.data());e->GetFloatArrayRegion(wronskiFused,0,(jsize)expectedGrid,p.wronskiFused.data());if(e->ExceptionCheck())return JNI_FALSE;
++        for(float v:p.wronskiMidtone)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.wronskiFused)if(!std::isfinite(v))return JNI_FALSE;
++    }else if(wronskiMidtone||wronskiFused||wronskiWidth!=0||wronskiHeight!=0)return JNI_FALSE;
+     if(!sensorToProfile||!profileToDisplay||e->GetArrayLength(sensorToProfile)!=9||e->GetArrayLength(profileToDisplay)!=9)return JNI_FALSE;e->GetFloatArrayRegion(sensorToProfile,0,9,p.sensorToProfile);e->GetFloatArrayRegion(profileToDisplay,0,9,p.profileToDisplay);if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.sensorToProfile)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.profileToDisplay)if(!std::isfinite(v))return JNI_FALSE;if(!std::isfinite(p.displayGain)||p.displayGain<=0.f||!std::isfinite(p.exposureEv)||!std::isfinite(p.shadows)||!std::isfinite(p.contrast)||!std::isfinite(p.residualZoom)||!std::isfinite(p.sceneWhite)||p.sceneWhite<=0.f)return JNI_FALSE;
+     U rp(e,renderPath),gp(e,gainPath),op(e,path);if(!rp.c||!op.c)return JNI_FALSE;const bool generateGain=gp.c!=nullptr;if(generateGain&&(!std::isfinite((float)gainMaxRatio)||gainMaxRatio<=1.f||!std::isfinite((float)gainContentMaxRatio)||gainContentMaxRatio<1.f))return JNI_FALSE;const float gainContentMax=generateGain?clampf((float)gainContentMaxRatio,1.f,(float)gainMaxRatio):1.f;int sourceFd=open(rp.c,O_RDONLY);if(sourceFd<0)return JNI_FALSE;struct stat st{};uint64_t expected=(uint64_t)trueW*(uint64_t)trueH*6ull;if(fstat(sourceFd,&st)!=0||(uint64_t)st.st_size!=expected){close(sourceFd);return JNI_FALSE;}
+     Watermark water{};if(watermarkBitmap){AndroidBitmapInfo wi{};if(AndroidBitmap_getInfo(e,watermarkBitmap,&wi)!=ANDROID_BITMAP_RESULT_SUCCESS||wi.format!=ANDROID_BITMAP_FORMAT_RGBA_8888||wi.width==0||wi.height==0){close(sourceFd);return JNI_FALSE;}void*wp=nullptr;if(AndroidBitmap_lockPixels(e,watermarkBitmap,&wp)!=ANDROID_BITMAP_RESULT_SUCCESS||!wp){close(sourceFd);return JNI_FALSE;}water.w=(int)wi.width;water.h=(int)wi.height;water.rgba.resize((size_t)water.w*water.h*4);for(int y=0;y<water.h;y++)std::memcpy(water.rgba.data()+(size_t)y*water.w*4,(const uint8_t*)wp+(size_t)y*wi.stride,(size_t)water.w*4);AndroidBitmap_unlockPixels(e,watermarkBitmap);}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
+index 48ad83b873eb489eb2f28372677e684fe678ed30..0ae5964082c3594e567a681b2cd33592dadf9370 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2AdaptiveColorAppearance.java
+@@ -46,13 +46,18 @@ public final class MotionV2AdaptiveColorAppearance extends Node {
+                         basePipeline.mParameters.HSVMapSize[0]
+                                 * basePipeline.mParameters.HSVMapSize[1] * 3;
+         if (calibratedProfile) glProg.setDefine("CALIBRATED_PROFILE", 1);
+-        glProg.useAssetProgram("motionv2/adaptive_color_appearance_26563");
++        final boolean motionWronski = basePipeline.mParameters.motionV2Active;
++        glProg.useAssetProgram(motionWronski
++                ? "motionv2/adaptive_color_appearance_26616_wronski"
++                : "motionv2/adaptive_color_appearance_26563");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+-        glProg.setVar("displayGain", displayGain);
+-        float sceneWhite = MotionV2Render.iris26598PublicationSceneWhite(basePipeline.mParameters);
+-        glProg.setVar("sceneWhite", sceneWhite);
+-        glProg.setVar("iris26598MotionPublication",
+-                basePipeline.mParameters.motionV2Active ? 1 : 0);
++        float sceneWhite = Float.NaN;
++        if (!motionWronski) {
++            sceneWhite = MotionV2Render.iris26598PublicationSceneWhite(basePipeline.mParameters);
++            glProg.setVar("displayGain", displayGain);
++            glProg.setVar("sceneWhite", sceneWhite);
++            glProg.setVar("iris26598MotionPublication", 0);
++        }
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
+@@ -62,23 +67,25 @@ public final class MotionV2AdaptiveColorAppearance extends Node {
+                 + " profileSource=" + (calibratedProfile ? "CALIBRATED_HUESAT" : "UNIVERSAL")
+                 + " afterDeviceProfileColor=true"
+                 + " afterViewfinderExposureSolve=true"
+-                + " beforeDisplayExposure=true"
+-                + " beforeToneHighlightGamut=true"
++                + " beforeWronskiLtm=true"
++                + " beforeSoleMotionLtm=true"
+                 + " dngAffected=false"
+                 + " maxWeakChromaGain=" + MAX_WEAK_CHROMA_GAIN
+                 + " maxHighlightChromaGain=" + MAX_HIGHLIGHT_CHROMA_GAIN
+                 + " sceneWhite=" + sceneWhite
+-                + " adaptiveSceneWhite=" + basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite
++                + " legacySceneWhiteConsumedByMotion=false"
+                 + " publicationSceneWhiteSource="
+-                    + (basePipeline.mParameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
++                    + (basePipeline.mParameters.motionV2Active ? "NONE_WRONSKI_OWNS_PRESENTATION" : "ADAPTIVE_26591_NIGHT")
+                 + " publicationCurvePredictor="
+-                    + (basePipeline.mParameters.motionV2Active ? "EXACT_26597_MOTION" : "PRESERVED_26585_NIGHT")
+-                + " IRIS_26598_SEMANTIC_AUTHORITY=true"
+-                + " toneAwareHighlightChroma=true"
++                    + (basePipeline.mParameters.motionV2Active ? "NONE_WRONSKI_EXACT_LTM" : "PRESERVED_26585_NIGHT")
++                + " IRIS_26616_NO_LEGACY_MOTION_TONE_PREDICTOR=true"
++                + " toneAwareHighlightChroma=" + (!motionWronski)
++                + " motionColorOwner=" + (motionWronski ? "SOURCE_DOMAIN_LUMA_PRESERVING_ONLY" : "PRESERVED_NIGHT")
++                + " displayGainConsumedByMotionColor=false"
+                 + " displayGain=" + displayGain
+-                + " iris26614SdrWhiteAnchor=" + MotionV2Render.IRIS_26614_SDR_WHITE_ANCHOR
+-                + " iris26614DisplayDomainKneeAuthority=false"
+-                + " IRIS_26614_SOURCE_DOMAIN_TONE_PREDICTOR_PARITY=true"
++                + " motionProjectionPredictor="
++                    + (basePipeline.mParameters.motionV2Active ? "WRONSKI_R138_ACES_MIDDLE_EXPOSURE" : "PRESERVED_NIGHT")
++                + " old26614MotionTonePredictor=false"
+                 + " irisNight=" + basePipeline.mParameters.irisNightActive
+                 + " superRes=" + basePipeline.mParameters.motionV2SuperResOutputEnabled
+                 + " superResScale=" + basePipeline.mParameters.motionV2SuperResOutputScale
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+index 2298310314bc7b78c8443475853e6e7a0c9b6202..9bc54ac2281d92a858541a607c5229fca21e93d7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+@@ -1,256 +1,49 @@
+ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+ 
+-import android.graphics.Point;
+-import android.opengl.GLES30;
+-
+-import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+-import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+-import java.nio.ByteBuffer;
+-import java.nio.ByteOrder;
+-import java.nio.FloatBuffer;
+-import java.util.Arrays;
+-
+-import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+-import static android.opengl.GLES20.GL_LINEAR;
+-
+ /**
+- * IRIS_26615_IRIS_OWNED_SPATIAL_APPEARANCE_OWNER
++ * IRIS_26616_RETIRED_MOTION_SPATIAL_OWNER
+  *
+- * Motion's viewfinder solve remains a desired global brightness target, but it is no longer an
+- * unconstrained whole-frame multiplier. A tiny normalized luminance field allocates that target
+- * spatially and a single scalar is applied to RGB at each pixel. This preserves the local
+- * structural luminance residual already present in the healthy post-VGN master while preventing
+- * broad bright illumination from receiving the same lift as darker broad regions.
+- *
+- * Night intentionally retains the exact proven 26516 scalar implementation below.
++ * 26615 Motion spatial exposure is intentionally gone. This class is now only the exact successful
++ * Night scalar presentation node. Any attempt to route Motion through it is a hard failure, which
++ * prevents a future hybrid from silently reactivating the retired 96-grid owner.
+  */
+ public final class MotionV2DisplayExposure extends Node {
+-    public static final int IRIS_26615_SPATIAL_BASE_SHORT_EDGE = 96;
+-
+-    private static final String IRIS_26615_SPATIAL_BASE_SHADER =
+-            "precision highp float;\n" +
+-            "precision mediump sampler2D;\n" +
+-            "uniform sampler2D InputBuffer;\n" +
+-            "uniform vec2 sourceSize;\n" +
+-            "uniform vec2 baseSize;\n" +
+-            "out vec4 Output;\n" +
+-            "\n" +
+-            "/* IRIS_26615_IRIS_OWNED_SPATIAL_ILLUMINATION_BASE\n" +
+-            " * Low-frequency luminance only. The 9x9 normalized lattice is independent of output resolution,\n" +
+-            " * contains no semantic object labels, and cannot alter reconstruction/color evidence. The tiny\n" +
+-            " * base texture is the sole automatic brightness-allocation guide for 1x and true-2x publication.\n" +
+-            " */\n" +
+-            "float irisLuma(vec3 c){return dot(max(c,vec3(0.0)),vec3(0.22897456,0.69173852,0.07928691));}\n" +
+-            "void main(){\n" +
+-            "    vec2 centerPx=gl_FragCoord.xy*sourceSize/baseSize-vec2(0.5);\n" +
+-            "    vec2 cellPx=sourceSize/baseSize;\n" +
+-            "    float sum=0.0;\n" +
+-            "    float weightSum=0.0;\n" +
+-            "    for(int j=-4;j<=4;j++){\n" +
+-            "        float wy=5.0-abs(float(j));\n" +
+-            "        for(int i=-4;i<=4;i++){\n" +
+-            "            float wx=5.0-abs(float(i));\n" +
+-            "            float w=wx*wy;\n" +
+-            "            vec2 px=centerPx+vec2(float(i),float(j))*cellPx;\n" +
+-            "            vec2 uv=clamp((px+vec2(0.5))/sourceSize,vec2(0.0),vec2(1.0));\n" +
+-            "            sum+=irisLuma(texture(InputBuffer,uv).rgb)*w;\n" +
+-            "            weightSum+=w;\n" +
+-            "        }\n" +
+-            "    }\n" +
+-            "    float base=max(sum/max(weightSum,1.0e-6),0.0);\n" +
+-            "    Output=vec4(base,base,base,1.0);\n" +
+-            "}\n";
+-
+-    private static final String IRIS_26615_SPATIAL_APPLY_SHADER =
+-            "precision highp float;\n" +
+-            "precision mediump sampler2D;\n" +
+-            "uniform sampler2D InputBuffer;\n" +
+-            "uniform sampler2D IlluminationBase;\n" +
+-            "uniform vec2 sourceSize;\n" +
+-            "uniform float brightnessTargetGain;\n" +
+-            "out vec4 Output;\n" +
+-            "\n" +
+-            "/* IRIS_26615_SHARED_CANONICAL_SPATIAL_APPEARANCE\n" +
+-            " * The solver's global target is a constraint, not a pixel multiplier. Lift is allocated only by\n" +
+-            " * the low-frequency luminance field. A single scalar is applied to RGB, preserving hue and the\n" +
+-            " * local structural residual already present in the healthy post-VGN master. Alpha carries the\n" +
+-            " * immutable pre-spatial physical max-RGB/luminance guide for UHDR headroom provenance.\n" +
+-            " */\n" +
+-            "float irisLuma(vec3 c){return dot(max(c,vec3(0.0)),vec3(0.22897456,0.69173852,0.07928691));}\n" +
+-            "float irisPeak(vec3 c){return max(c.r,max(c.g,c.b));}\n" +
+-            "float irisSpatialGain(float base,float target){\n" +
+-            "    target=max(target,1.0e-6);\n" +
+-            "    if(target<=1.0)return target;\n" +
+-            "    float b=clamp(max(base,0.0),0.0,1.0);\n" +
+-            "    return target/(1.0+(target-1.0)*b);\n" +
+-            "}\n" +
+-            "void main(){\n" +
+-            "    ivec2 p=ivec2(gl_FragCoord.xy);\n" +
+-            "    vec4 src=texelFetch(InputBuffer,p,0);\n" +
+-            "    vec3 rgb=max(src.rgb,vec3(0.0));\n" +
+-            "    vec2 uv=gl_FragCoord.xy/sourceSize;\n" +
+-            "    float base=max(texture(IlluminationBase,clamp(uv,vec2(0.0),vec2(1.0))).r,0.0);\n" +
+-            "    float gain=irisSpatialGain(base,brightnessTargetGain);\n" +
+-            "    float physicalGuide=max(irisLuma(rgb),irisPeak(rgb));\n" +
+-            "    Output=vec4(rgb*gain,physicalGuide);\n" +
+-            "}\n";
+-
+-    public MotionV2DisplayExposure() {
+-        super("", "MotionV2DisplayExposure");
+-    }
+-
++    public MotionV2DisplayExposure() { super("", "MotionV2DisplayExposure"); }
+     @Override public void Compile() {}
+ 
+-    private static Point iris26615BaseSize(Point source) {
+-        int shortEdge = Math.max(1, Math.min(source.x, source.y));
+-        float scale = Math.min(1.0f, IRIS_26615_SPATIAL_BASE_SHORT_EDGE / (float) shortEdge);
+-        return new Point(
+-                Math.max(1, Math.round(source.x * scale)),
+-                Math.max(1, Math.round(source.y * scale)));
+-    }
+-
+     @Override
+     public void Run() {
+-        if (!(basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive)) {
+-            throw new IllegalStateException("MotionV2DisplayExposure used outside Motion V2");
++        if (basePipeline.mParameters.motionV2Active) {
++            throw new IllegalStateException(
++                    "26616 Motion must use MotionV2WronskiLtm; legacy DisplayExposure retired");
++        }
++        if (!basePipeline.mParameters.irisNightActive) {
++            throw new IllegalStateException("MotionV2DisplayExposure used outside Iris Night");
+         }
+         float displayGain = basePipeline.mParameters.motionV2DisplayGain;
+         if (!Float.isFinite(displayGain) || displayGain <= 0.0f) {
+-            throw new IllegalStateException("Invalid viewfinder presentation gain: " + displayGain);
+-        }
+-
+-        if (basePipeline.mParameters.motionV2Active) {
+-            final GLTexture source = previousNode.WorkingTexture;
+-            if (source == null || source.mSize == null || source.mSize.x <= 0 || source.mSize.y <= 0) {
+-                throw new IllegalStateException("26615 spatial appearance missing source texture");
+-            }
+-            basePipeline.mParameters.motionV2SpatialAppearanceBaseGrid = null;
+-            basePipeline.mParameters.motionV2SpatialAppearanceBaseWidth = 0;
+-            basePipeline.mParameters.motionV2SpatialAppearanceBaseHeight = 0;
+-
+-            Point baseSize = iris26615BaseSize(source.mSize);
+-            GLTexture illuminationBase = null;
+-            try {
+-                illuminationBase = new GLTexture(
+-                        baseSize,
+-                        new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                        null,
+-                        GL_LINEAR,
+-                        GL_CLAMP_TO_EDGE);
+-
+-                glProg.useProgram(IRIS_26615_SPATIAL_BASE_SHADER);
+-                glProg.setTexture("InputBuffer", source);
+-                glProg.setVar("sourceSize", (float) source.mSize.x, (float) source.mSize.y);
+-                glProg.setVar("baseSize", (float) baseSize.x, (float) baseSize.y);
+-                glProg.drawBlocks(illuminationBase);
+-                glProg.closed = true;
+-
+-                /* Tiny readback only: this exact normalized illumination authority is reused by
+-                 * true-2x publication so SR ON/OFF cannot estimate a different tone field. */
+-                int[] oldFramebuffer = new int[1];
+-                GLES30.glGetIntegerv(GLES30.GL_FRAMEBUFFER_BINDING, oldFramebuffer, 0);
+-                illuminationBase.BufferLoad();
+-                ByteBuffer bytes;
+-                try {
+-                    bytes = illuminationBase.textureBuffer(
+-                            new GLFormat(GLFormat.DataType.FLOAT_32, 4), true);
+-                } finally {
+-                    GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, oldFramebuffer[0]);
+-                    /* GLTexture.close() historically frees buffered IDs as GL buffers rather than
+-                     * FBOs. 26615 does not inherit that leak: this new tiny readback FBO is released
+-                     * explicitly and marked unbuffered before texture close. */
+-                    if (illuminationBase.isBuffered && illuminationBase.mBuffer != 0) {
+-                        GLES30.glDeleteFramebuffers(1, new int[]{illuminationBase.mBuffer}, 0);
+-                        illuminationBase.mBuffer = 0;
+-                        illuminationBase.isBuffered = false;
+-                    }
+-                }
+-                bytes.order(ByteOrder.nativeOrder());
+-                FloatBuffer fb = bytes.asFloatBuffer();
+-                int count = baseSize.x * baseSize.y;
+-                float[] grid = new float[count];
+-                float min = Float.POSITIVE_INFINITY;
+-                float max = 0.0f;
+-                double sum = 0.0;
+-                for (int i = 0; i < count; i++) {
+-                    float v = fb.get(i * 4);
+-                    if (!Float.isFinite(v) || v < 0.0f) {
+-                        throw new IllegalStateException(
+-                                "26615 non-finite spatial base at " + i + ": " + v);
+-                    }
+-                    grid[i] = v;
+-                    min = Math.min(min, v);
+-                    max = Math.max(max, v);
+-                    sum += v;
+-                }
+-                float[] sorted = grid.clone();
+-                Arrays.sort(sorted);
+-                float p50 = sorted[sorted.length / 2];
+-                float p95 = sorted[Math.min(sorted.length - 1,
+-                        Math.round((sorted.length - 1) * 0.95f))];
+-                basePipeline.mParameters.motionV2SpatialAppearanceBaseGrid = grid;
+-                basePipeline.mParameters.motionV2SpatialAppearanceBaseWidth = baseSize.x;
+-                basePipeline.mParameters.motionV2SpatialAppearanceBaseHeight = baseSize.y;
+-
+-                glProg.useProgram(IRIS_26615_SPATIAL_APPLY_SHADER);
+-                glProg.setTexture("InputBuffer", source);
+-                glProg.setTexture("IlluminationBase", illuminationBase);
+-                glProg.setVar("sourceSize", (float) source.mSize.x, (float) source.mSize.y);
+-                glProg.setVar("brightnessTargetGain", displayGain);
+-                WorkingTexture = basePipeline.getMain();
+-                glProg.drawBlocks(WorkingTexture);
+-                glProg.closed = true;
+-
+-                Log.i(Name, "IRIS_26615_SPATIAL_APPEARANCE"
+-                        + " brightnessTargetGain=" + displayGain
+-                        + " globalImageMultiplier=false"
+-                        + " owner=LOW_FREQUENCY_LUMINANCE_ALLOCATION_PLUS_LOCAL_RESIDUAL"
+-                        + " base=" + baseSize.x + "x" + baseSize.y
+-                        + " baseShortEdge=" + IRIS_26615_SPATIAL_BASE_SHORT_EDGE
+-                        + " baseBytesApprox=" + (count * 8L)
+-                        + " baseMean=" + (count > 0 ? (float)(sum / count) : 0.0f)
+-                        + " baseMin=" + min + " baseP50=" + p50 + " baseP95=" + p95
+-                        + " baseMax=" + max
+-                        + " fullResolutionScratchAdded=false"
+-                        + " localResidualPreservedByScalar=true"
+-                        + " physicalHdrGuideCarrier=alphaPreSpatialMaxRgbLuma"
+-                        + " true2xBaseGridShared=true"
+-                        + " camera2Write=false");
+-                return;
+-            } finally {
+-                if (illuminationBase != null) {
+-                    try { illuminationBase.close(); } catch (Throwable ignored) {}
+-                }
+-            }
++            throw new IllegalStateException("Invalid Night presentation gain: " + displayGain);
+         }
+-
+-        /* Exact successful Night behavior is intentionally inherited unchanged. */
+         if (Math.abs(displayGain - 1.0f) < 1.0e-5f) {
+             WorkingTexture = previousNode.WorkingTexture;
+             glProg.closed = true;
+             Log.d(Name, "IRIS_26516_VIEWFINDER_PRESENTATION_GAIN displayGain=1.0 passSkipped=true"
+-                    + " sourceRestoreHere=false camera2Write=false");
++                    + " sourceRestoreHere=false camera2Write=false irisNight=true");
+             return;
+         }
+-
+         glProg.useAssetProgram("motionv2/display_exposure");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+         glProg.setVar("displayGain", displayGain);
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
+-
+         Log.d(Name, "IRIS_26516_VIEWFINDER_PRESENTATION_GAIN"
+                 + " displayGain=" + displayGain
+-                + " sourceRestoreHere=false"
+-                + " afterProfileColor=true"
+-                + " beforeManualIrisControls=true"
+-                + " extremeLift=" + (displayGain >= 4.0f)
+-                + " headroomOwner=MotionV2RenderCommonRgbScalar"
+-                + " duplicateHeadroomLimiter=false"
++                + " sourceRestoreHere=false afterProfileColor=true"
++                + " beforeManualIrisControls=true irisNight=true"
+                 + " camera2Write=false");
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index d0e59d25e6668944b677804b6fe98eab55770cbb..acf8f290c701b86217340f65436a4531bb52b375 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -104,35 +104,6 @@ public final class MotionV2Render extends Node {
+      * reserves the final 5% of SDR code space for genuine >1 extended HDR. The function is one
+      * fixed C1 monotonic source-domain map: no scene percentile, object class or moving knot. */
+     public static final float IRIS_26614_SDR_WHITE_ANCHOR = 0.95f;
+-    public static final float IRIS_26615_SDR_WHITE_ANCHOR = IRIS_26614_SDR_WHITE_ANCHOR;
+-
+-    /* IRIS_26615_SHARED_SPATIAL_APPEARANCE_MATH
+-     * One automatic brightness allocator for Motion 1x, solver prediction and true-2x publication.
+-     * Dark broad illumination approaches the requested target; already-bright broad illumination
+-     * approaches unity gain. Local structure rides on the same scalar and is therefore preserved.
+-     */
+-    static float iris26615SpatialAppearanceGain(float baseGuide, float brightnessTargetGain) {
+-        float target = Math.max(brightnessTargetGain, 1.0e-6f);
+-        if (target <= 1.0f) return target;
+-        float base = iris26582Clamp(Math.max(baseGuide, 0.0f), 0.0f, 1.0f);
+-        return target / (1.0f + (target - 1.0f) * base);
+-    }
+-
+-    /* Fixed SDR projection only. Automatic appearance has already been created upstream. Source
+-     * white receives the same 0.95 anchor as successful 26614; only genuine/appearance values >1
+-     * occupy the final 5% monotonically. No brightness target, histogram or spatial decision lives
+-     * in this projection.
+-     */
+-    static float iris26615ProjectCanonicalSdrGuide(float canonicalGuide) {
+-        float x = Math.max(canonicalGuide, 0.0f);
+-        float whiteAnchor = IRIS_26615_SDR_WHITE_ANCHOR;
+-        if (x <= 1.0f) return whiteAnchor * x;
+-        float reserve = 1.0f - whiteAnchor;
+-        float tailScale = reserve / Math.max(whiteAnchor, 1.0e-6f);
+-        float excess = x - 1.0f;
+-        return whiteAnchor + reserve * excess / (excess + tailScale);
+-    }
+-
+     static float iris26614MapMotionSdrFinalGuide(float sourceGuide, float brightnessTargetGain) {
+         float x = Math.max(sourceGuide, 0.0f);
+         float requestedFinalGain = Math.max(brightnessTargetGain, 1.0e-6f)
+@@ -330,11 +301,15 @@ public final class MotionV2Render extends Node {
+          * sceneWhite follows only the real Photon display exposure. Accepted-Short BaselineExposure
+          * is source-domain restoration and must not stretch the SDR highlight shoulder.
+          */
+-        float baseSceneWhite = basePipeline.mParameters.motionV2ToneBaseSceneWhite;
+-        if (!Float.isFinite(baseSceneWhite) || baseSceneWhite < 1.0f) {
+-            baseSceneWhite = iris26582BaseSceneWhite(postDisplaySensorWhite);
++        float baseSceneWhite = 1.0f;
++        float sceneWhite = 1.0f;
++        if (!basePipeline.mParameters.motionV2Active) {
++            baseSceneWhite = basePipeline.mParameters.motionV2ToneBaseSceneWhite;
++            if (!Float.isFinite(baseSceneWhite) || baseSceneWhite < 1.0f) {
++                baseSceneWhite = iris26582BaseSceneWhite(postDisplaySensorWhite);
++            }
++            sceneWhite = iris26598PublicationSceneWhite(basePipeline.mParameters);
+         }
+-        float sceneWhite = iris26598PublicationSceneWhite(basePipeline.mParameters);
+         /* IRIS_26530_V1_3_FOV_AUTHORITY
+          * motionV2OutputZoom is the final FOV authority. SR reconstruction scale must not divide
+          * the JPEG/UHDR crop request; doing so produced the measured ~2x-wide 123x frame.
+@@ -355,9 +330,11 @@ public final class MotionV2Render extends Node {
+                 + " product=" + (reconstructionZoom * irisOutputZoom));
+                 glProg.useAssetProgram("motionv2/render");
+         glProg.setTexture("InputBuffer", extendedLinearHdr);
+-        glProg.setVar("sceneWhite", sceneWhite);
+         glProg.setVar("iris26592MotionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+-        glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
++        if (!basePipeline.mParameters.motionV2Active) {
++            glProg.setVar("sceneWhite", sceneWhite);
++            glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
++        }
+         glProg.setVar("irisOutputZoom", irisOutputZoom);
+ 
+         WorkingTexture = basePipeline.getMain();
+@@ -493,9 +470,9 @@ public final class MotionV2Render extends Node {
+                                     + " actualPeakContentRatio=" + actualPeakContentRatio
+                                     + " fullHdrDisplayRatio=" + fullHdrDisplayRatio
+                                     + " separateBodyGainOwner=false"
+-                                    + " hdrGainSource=PRE_SPATIAL_PHYSICAL_GUIDE_ALPHA_ONLY"
+-                                    + " canonicalAppearanceOwner=MotionV2DisplayExposure"
+-                                    + " sdrProjectionWhiteAnchor=" + IRIS_26615_SDR_WHITE_ANCHOR
++                                    + " hdrGainSource=PRE_LTM_PHYSICAL_GUIDE_ALPHA_ONLY"
++                                    + " canonicalAppearanceOwner=MotionV2WronskiLtm"
++                                    + " wronskiSdrAppearanceComplete=true"
+                                     + " hdrExposureScale=" + HDR_EXPOSURE_SCALE);
+                 } catch (Throwable ignored) {}
+ 
+@@ -516,7 +493,7 @@ public final class MotionV2Render extends Node {
+                         + " fullImageRoughnessScan=false"
+                         + " provenance=actualGainMapBeforeJpegAttach"
+                         + " grid12x8=" + grid
+-                        + " source=canonicalSpatialAppearanceRgbPlusPhysicalGuideAlpha"
++                        + " source=wronskiSdrAppearanceRgbPlusPhysicalGuideAlpha"
+                         + " fullResolutionGainMap=" + (!iris26550Night)
+                         + " downsample=" + gainDownsample
+                         + " widthFraction=" + (1.0f / gainDownsample)
+@@ -530,11 +507,12 @@ public final class MotionV2Render extends Node {
+                         + " pointDecimation=false"
+                         + " postAliasSpikeRepair=false"
+                         + " midtoneGainUnity=true sourceAtOrBelowWhiteGainUnity=true"
+-                        + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
++                        + " sdrExposureScale="
++                            + (basePipeline.mParameters.motionV2Active ? "WRONSKI_COMPLETE_APPEARANCE" : OUTPUT_EXPOSURE_SCALE)
+                         + " motionHdrBodyGainRatio=1.0"
+                         + " motionHdrGainStartsAbovePhysicalSourceWhite=true"
+-                        + " physicalGuideFromPreSpatialAlpha=true"
+-                        + " IRIS_26615_SDR_UHDR_SPATIAL_APPEARANCE_PARITY=true");
++                        + " physicalGuideFromPreLtmAlpha=true"
++                        + " IRIS_26616_SDR_UHDR_WRONSKI_APPEARANCE_PARITY=true");
+             } finally {
+                 if (gainTexture != null) {
+                     try { gainTexture.close(); } catch (Throwable ignored) {}
+@@ -545,70 +523,70 @@ public final class MotionV2Render extends Node {
+         glProg.closed = true;
+ 
+         if (basePipeline.mParameters.motionV2Active) {
+-            Log.i(Name, "IRIS_26615_SINGLE_SPATIAL_APPEARANCE_OWNER"
+-                    + " master=canonicalSpatialAppearance"
++            Log.i(Name, "IRIS_26616_SINGLE_WRONSKI_LTM_OWNER"
++                    + " master=wronskiExposureFusionAppearance"
+                     + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+                     + " globalDisplayGainImageMultiplier=false"
+-                    + " spatialOwner=MotionV2DisplayExposure"
+-                    + " renderRole=FIXED_PROJECTION_GAMUT_ENCODING"
+-                    + " sdrWhiteAnchor=" + IRIS_26615_SDR_WHITE_ANCHOR
+-                    + " monotonicProjection=true hardEndpointClamp=false"
+-                    + " physicalHdrGuideCarrier=alphaPreSpatial"
++                    + " ltmOwner=MotionV2WronskiLtm"
++                    + " renderRole=MOTION_PASSTHROUGH_ZOOM_PUBLICATION"
++                                       + " oldMotionProjection=false oldMotionShoulder=false"
++                    + " physicalHdrGuideCarrier=alphaPreLtm"
+                     + " separateBodyGainOwnerRequired=false"
+-                    + " superResSameSpatialBaseGrid=true");
++                    + " superResSameWronskiMip2=true");
+         }
+ 
+-        Log.d(Name, "IRIS_26436_V2_RENDER"
+-                + " canonicalSignalAlreadyApplied=true"
+-                + " postDisplaySensorWhite=" + postDisplaySensorWhite
+-                + " mgcSourceExposureGain=" + mgcSourceExposureGain
+-                + " sceneWhite=" + sceneWhite
+-                + " baseSceneWhite=" + baseSceneWhite
+-                + " adaptiveSceneWhite=" + basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite
+-                + " publicationSceneWhiteSource="
+-                    + (basePipeline.mParameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
+-                + " IRIS_26598_SEMANTIC_AUTHORITY=true"
+-                + " toneP95Guide=" + basePipeline.mParameters.motionV2ToneP95Guide
+-                + " toneP99Guide=" + basePipeline.mParameters.motionV2ToneP99Guide
+-                + " toneP995Guide=" + basePipeline.mParameters.motionV2ToneP995Guide
+-                + " toneP998Guide=" + basePipeline.mParameters.motionV2ToneP998Guide
+-                + " legacyPredictedClipFraction=" + basePipeline.mParameters.motionV2TonePredictedClipFraction
+-                + " projectedBroadNearCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction
+-                + " projectedNearCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedNearCeilingFraction
+-                + " projectedHardCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction
+-                + " projectedBroadTailStrength=" + basePipeline.mParameters.motionV2ToneProjectedBroadTailStrength
+-                + " compactTailStrength=" + basePipeline.mParameters.motionV2ToneCompactTailStrength
+-                + " adaptiveStrength=" + basePipeline.mParameters.motionV2ToneAdaptiveStrength
+-                + " legacyHighlightTarget=" + IRIS_26582_HIGHLIGHT_TARGET
+-                + " broadHighlightTarget=" + IRIS_26583_BROAD_HIGHLIGHT_TARGET
+-                + " compactHighlightTarget=" + IRIS_26583_COMPACT_HIGHLIGHT_TARGET
+-                + " iris26591FinalLogShape=" + IRIS_26591_LOG_SHAPE
+-                + " iris26592MotionUnboundedTail=" + basePipeline.mParameters.motionV2Active
+-                + " iris26592TanhScale=" + IRIS_26592_TANH_SCALE
+-                + " iris26591FinalTargets=" + IRIS_26591_HIGHLIGHT_TARGET + ","
+-                    + IRIS_26591_BROAD_HIGHLIGHT_TARGET + ","
+-                    + IRIS_26591_COMPACT_HIGHLIGHT_TARGET + ","
+-                    + IRIS_26591_CONTINUOUS_HIGHLIGHT_TARGET + ","
+-                    + IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET
+-                + " IRIS_26583_PROJECTED_BROAD_AND_COMPACT_HIGHLIGHT_TAIL=true"
+-                + " IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE=true"
+-                + " IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true"
+-                                + " toneCurve26430ExactBase=true"
+-                + " outputExposureScale=" + OUTPUT_EXPOSURE_SCALE
+-                + " outputExposureEv=-0.321928"
+-                + " hdrTargetUsesSameScale=true"
+-                + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+-                + " nominalHdrBodyRecoveryRatio="
+-                    + (HDR_EXPOSURE_SCALE / OUTPUT_EXPOSURE_SCALE)
+-                + " IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS=true"
+-                + " syntheticBitmapGainMap=false"
+-                + " irisOutputZoom=" + irisOutputZoom
+-                + " nativeOutputDimensionsPreserved=true"
+-                + " iris26615SdrWhiteAnchor=" + IRIS_26615_SDR_WHITE_ANCHOR
+-                + " iris26615SpatialAppearanceOwner=MotionV2DisplayExposure"
+-                + " iris26615RenderBrightnessAuthority=false"
+-                + " IRIS_26615_CANONICAL_SPATIAL_SDR_UHDR_SR_PARITY=true"
+-                + " localTone=true"
+-                + " sharpening=false");
++        if (!basePipeline.mParameters.motionV2Active) {
++            Log.d(Name, "IRIS_26436_V2_RENDER"
++                    + " canonicalSignalAlreadyApplied=true"
++                    + " postDisplaySensorWhite=" + postDisplaySensorWhite
++                    + " mgcSourceExposureGain=" + mgcSourceExposureGain
++                    + " sceneWhite=" + sceneWhite
++                    + " baseSceneWhite=" + baseSceneWhite
++                    + " adaptiveSceneWhite=" + basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite
++                    + " publicationSceneWhiteSource="
++                        + (basePipeline.mParameters.motionV2Active ? "WRONSKI_SDR_APPEARANCE_COMPLETE" : "ADAPTIVE_26591_NIGHT")
++                    + " IRIS_26598_SEMANTIC_AUTHORITY=true"
++                    + " toneP95Guide=" + basePipeline.mParameters.motionV2ToneP95Guide
++                    + " toneP99Guide=" + basePipeline.mParameters.motionV2ToneP99Guide
++                    + " toneP995Guide=" + basePipeline.mParameters.motionV2ToneP995Guide
++                    + " toneP998Guide=" + basePipeline.mParameters.motionV2ToneP998Guide
++                    + " legacyPredictedClipFraction=" + basePipeline.mParameters.motionV2TonePredictedClipFraction
++                    + " projectedBroadNearCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction
++                    + " projectedNearCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedNearCeilingFraction
++                    + " projectedHardCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction
++                    + " projectedBroadTailStrength=" + basePipeline.mParameters.motionV2ToneProjectedBroadTailStrength
++                    + " compactTailStrength=" + basePipeline.mParameters.motionV2ToneCompactTailStrength
++                    + " adaptiveStrength=" + basePipeline.mParameters.motionV2ToneAdaptiveStrength
++                    + " legacyHighlightTarget=" + IRIS_26582_HIGHLIGHT_TARGET
++                    + " broadHighlightTarget=" + IRIS_26583_BROAD_HIGHLIGHT_TARGET
++                    + " compactHighlightTarget=" + IRIS_26583_COMPACT_HIGHLIGHT_TARGET
++                    + " iris26591FinalLogShape=" + IRIS_26591_LOG_SHAPE
++                    + " iris26592MotionUnboundedTail=" + basePipeline.mParameters.motionV2Active
++                    + " iris26592TanhScale=" + IRIS_26592_TANH_SCALE
++                    + " iris26591FinalTargets=" + IRIS_26591_HIGHLIGHT_TARGET + ","
++                        + IRIS_26591_BROAD_HIGHLIGHT_TARGET + ","
++                        + IRIS_26591_COMPACT_HIGHLIGHT_TARGET + ","
++                        + IRIS_26591_CONTINUOUS_HIGHLIGHT_TARGET + ","
++                        + IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET
++                    + " IRIS_26583_PROJECTED_BROAD_AND_COMPACT_HIGHLIGHT_TAIL=true"
++                    + " IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE=true"
++                    + " IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true"
++                                    + " toneCurve26430ExactBase=true"
++                    + " outputExposureScale=" + OUTPUT_EXPOSURE_SCALE
++                    + " outputExposureEv=-0.321928"
++                    + " hdrTargetUsesSameScale=true"
++                    + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
++                    + " nominalHdrBodyRecoveryRatio="
++                        + (HDR_EXPOSURE_SCALE / OUTPUT_EXPOSURE_SCALE)
++                    + " IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS=true"
++                    + " syntheticBitmapGainMap=false"
++                    + " irisOutputZoom=" + irisOutputZoom
++                    + " nativeOutputDimensionsPreserved=true"
++                                   + " iris26615SpatialAppearanceOwner=RETIRED"
++                    + " iris26616RenderToneAuthority=false"
++                    + " IRIS_26615_CANONICAL_SPATIAL_SDR_UHDR_SR_PARITY=true"
++                    + " localTone=true"
++                    + " sharpening=false");
++        }
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 035b1a6f1264e5a0bcebbcff6acb510b816e9c6e..320b028ded0af2334e047be108aec39ecf8d972a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -75,15 +75,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+     private int iris26584CandidateGridWidth = 0;
+     private int iris26584CandidateGridHeight = 0;
+     private float[] iris26584ProjectedGridScratch = null;
+-    /* IRIS_26615_VIEWFINDER_SPATIAL_APPEARANCE_MODEL
+-     * Meter-only luminance field using the same normalized 96-short-edge / 9x9 triangular base
+-     * definition as MotionV2DisplayExposure. It predicts the production spatial allocation while
+-     * keeping the solver a target/constraint owner only.
+-     */
+-    private float[] iris26615CandidateLumaGrid = null;
+-    private float[] iris26615CandidateSpatialBaseGrid = null;
+-    private int iris26615CandidateSpatialBaseWidth = 0;
+-    private int iris26615CandidateSpatialBaseHeight = 0;
+ 
+     private static final class RgbSample {
+         final float r, g, b;
+@@ -114,10 +105,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         iris26584CandidateGuideGrid = null;
+         iris26584CandidateGridWidth = 0;
+         iris26584CandidateGridHeight = 0;
+-        iris26615CandidateLumaGrid = null;
+-        iris26615CandidateSpatialBaseGrid = null;
+-        iris26615CandidateSpatialBaseWidth = 0;
+-        iris26615CandidateSpatialBaseHeight = 0;
+         basePipeline.mParameters.motionV2ToneP95Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ToneP99Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ToneP995Guide = Float.NaN;
+@@ -213,56 +200,83 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 throw new IllegalStateException("non-finite solved viewfinder gain");
+             }
+             basePipeline.mParameters.motionV2DisplayGain = gain;
+-            ToneDecision iris26583Tone = iris26583ToneDecision(gain);
+-            basePipeline.mParameters.motionV2ToneP95Guide = iris26582CandidateP95Guide;
+-            basePipeline.mParameters.motionV2ToneP99Guide = iris26550CandidateP99Guide;
+-            basePipeline.mParameters.motionV2ToneP995Guide = iris26583CandidateP995Guide;
+-            basePipeline.mParameters.motionV2ToneP998Guide = iris26583CandidateP998Guide;
+-            basePipeline.mParameters.motionV2TonePredictedClipFraction = iris26583Tone.clippedFraction;
+-            basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction = iris26583Tone.projectedBroadNearFraction;
+-            basePipeline.mParameters.motionV2ToneProjectedNearCeilingFraction = iris26583Tone.projectedNearFraction;
+-            basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction = iris26583Tone.projectedHardFraction;
+-            basePipeline.mParameters.motionV2ToneProjectedBroadTailStrength = iris26583Tone.projectedBroadTailStrength;
+-            basePipeline.mParameters.motionV2ToneCompactTailStrength = iris26583Tone.compactTailStrength;
+-            basePipeline.mParameters.motionV2ToneBaseSceneWhite = iris26583Tone.baseSceneWhite;
+-            basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite = iris26583Tone.adaptiveSceneWhite;
+-            basePipeline.mParameters.motionV2ToneAdaptiveStrength = iris26583Tone.adaptiveStrength;
+             valid = true;
++            if (iris26550Night) {
++                ToneDecision iris26583Tone = iris26583ToneDecision(gain);
++                basePipeline.mParameters.motionV2ToneP95Guide = iris26582CandidateP95Guide;
++                basePipeline.mParameters.motionV2ToneP99Guide = iris26550CandidateP99Guide;
++                basePipeline.mParameters.motionV2ToneP995Guide = iris26583CandidateP995Guide;
++                basePipeline.mParameters.motionV2ToneP998Guide = iris26583CandidateP998Guide;
++                basePipeline.mParameters.motionV2TonePredictedClipFraction = iris26583Tone.clippedFraction;
++                basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction = iris26583Tone.projectedBroadNearFraction;
++                basePipeline.mParameters.motionV2ToneProjectedNearCeilingFraction = iris26583Tone.projectedNearFraction;
++                basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction = iris26583Tone.projectedHardFraction;
++                basePipeline.mParameters.motionV2ToneProjectedBroadTailStrength = iris26583Tone.projectedBroadTailStrength;
++                basePipeline.mParameters.motionV2ToneCompactTailStrength = iris26583Tone.compactTailStrength;
++                basePipeline.mParameters.motionV2ToneBaseSceneWhite = iris26583Tone.baseSceneWhite;
++                basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite = iris26583Tone.adaptiveSceneWhite;
++                basePipeline.mParameters.motionV2ToneAdaptiveStrength = iris26583Tone.adaptiveStrength;
++
++                Log.i(Name, "IRIS_26583_PROJECTED_HIGHLIGHT_TAIL_DECISION"
++                        + " p95Guide=" + iris26582CandidateP95Guide
++                        + " p99Guide=" + iris26550CandidateP99Guide
++                        + " p995Guide=" + iris26583CandidateP995Guide
++                        + " p998Guide=" + iris26583CandidateP998Guide
++                        + " brightnessTargetGain=" + gain
++                        + " legacyBroadClipFraction=" + iris26583Tone.clippedFraction
++                        + " projectedBroadNearCeilingFraction=" + iris26583Tone.projectedBroadNearFraction
++                        + " projectedNearCeilingFraction=" + iris26583Tone.projectedNearFraction
++                        + " projectedHardCeilingFraction=" + iris26583Tone.projectedHardFraction
++                        + " projectedBroadTailStrength=" + iris26583Tone.projectedBroadTailStrength
++                        + " compactTailStrength=" + iris26583Tone.compactTailStrength
++                        + " baseSceneWhite=" + iris26583Tone.baseSceneWhite
++                        + " adaptiveSceneWhite=" + iris26583Tone.adaptiveSceneWhite
++                        + " adaptiveStrength=" + iris26583Tone.adaptiveStrength
++                        + " legacyHighlightTarget=" + MotionV2Render.IRIS_26582_HIGHLIGHT_TARGET
++                        + " broadHighlightTarget=" + MotionV2Render.IRIS_26583_BROAD_HIGHLIGHT_TARGET
++                        + " compactHighlightTarget=" + MotionV2Render.IRIS_26583_COMPACT_HIGHLIGHT_TARGET
++                        + " projectedBaselineTone=true maxChannelDetection=true"
++                        + " localTone=false uniformRgbScalar=true chromaOwnerUnchanged=true");
++                Log.i(Name, "IRIS_26584_ALL_SCENE_HIGHLIGHT_DECISION"
++                        + " continuousTailPressure=" + iris26583Tone.continuousTailPressure
++                        + " continuousTailStrength=" + iris26583Tone.continuousTailStrength
++                        + " structuredPixels=" + iris26583Tone.structuredPixels
++                        + " structuredCells=" + iris26583Tone.structuredCells
++                        + " structuredGuide=" + iris26583Tone.structuredGuide
++                        + " structuredGuidePercentile=0.98"
++                        + " structuredHighlightTarget=" + MotionV2Render.IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET
++                        + " structuredStrength=" + iris26583Tone.structuredStrength
++                        + " floor26583SceneWhite=" + iris26583Tone.floor26583SceneWhite
++                        + " adaptiveSceneWhite=" + iris26583Tone.adaptiveSceneWhite
++                        + " spatialPopulationIndependent=true continuousTail=true"
++                        + " toneStartUnchanged=true uniformRgbScalar=true localToneMap=false"
++                        + " IRIS_26591_FINAL_UPPER_TAIL=true meterCurveFrozen26590=true");
+ 
+-            Log.i(Name, "IRIS_26583_PROJECTED_HIGHLIGHT_TAIL_DECISION"
+-                    + " p95Guide=" + iris26582CandidateP95Guide
+-                    + " p99Guide=" + iris26550CandidateP99Guide
+-                    + " p995Guide=" + iris26583CandidateP995Guide
+-                    + " p998Guide=" + iris26583CandidateP998Guide
+-                    + " brightnessTargetGain=" + gain
+-                    + " legacyBroadClipFraction=" + iris26583Tone.clippedFraction
+-                    + " projectedBroadNearCeilingFraction=" + iris26583Tone.projectedBroadNearFraction
+-                    + " projectedNearCeilingFraction=" + iris26583Tone.projectedNearFraction
+-                    + " projectedHardCeilingFraction=" + iris26583Tone.projectedHardFraction
+-                    + " projectedBroadTailStrength=" + iris26583Tone.projectedBroadTailStrength
+-                    + " compactTailStrength=" + iris26583Tone.compactTailStrength
+-                    + " baseSceneWhite=" + iris26583Tone.baseSceneWhite
+-                    + " adaptiveSceneWhite=" + iris26583Tone.adaptiveSceneWhite
+-                    + " adaptiveStrength=" + iris26583Tone.adaptiveStrength
+-                    + " legacyHighlightTarget=" + MotionV2Render.IRIS_26582_HIGHLIGHT_TARGET
+-                    + " broadHighlightTarget=" + MotionV2Render.IRIS_26583_BROAD_HIGHLIGHT_TARGET
+-                    + " compactHighlightTarget=" + MotionV2Render.IRIS_26583_COMPACT_HIGHLIGHT_TARGET
+-                    + " projectedBaselineTone=true maxChannelDetection=true"
+-                    + " localTone=false uniformRgbScalar=true chromaOwnerUnchanged=true");
+-            Log.i(Name, "IRIS_26584_ALL_SCENE_HIGHLIGHT_DECISION"
+-                    + " continuousTailPressure=" + iris26583Tone.continuousTailPressure
+-                    + " continuousTailStrength=" + iris26583Tone.continuousTailStrength
+-                    + " structuredPixels=" + iris26583Tone.structuredPixels
+-                    + " structuredCells=" + iris26583Tone.structuredCells
+-                    + " structuredGuide=" + iris26583Tone.structuredGuide
+-                    + " structuredGuidePercentile=0.98"
+-                    + " structuredHighlightTarget=" + MotionV2Render.IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET
+-                    + " structuredStrength=" + iris26583Tone.structuredStrength
+-                    + " floor26583SceneWhite=" + iris26583Tone.floor26583SceneWhite
+-                    + " adaptiveSceneWhite=" + iris26583Tone.adaptiveSceneWhite
+-                    + " spatialPopulationIndependent=true continuousTail=true"
+-                    + " toneStartUnchanged=true uniformRgbScalar=true localToneMap=false"
+-                    + " IRIS_26591_FINAL_UPPER_TAIL=true meterCurveFrozen26590=true");
++            } else {
++                /* IRIS_26616_NO_HYBRID_TONE_DECISION
++                 * Motion's solver provides only Wronski's free global exposure parameter.
++                 * All retired 26582..26591 shoulder/scene-white decisions remain neutral and are
++                 * never evaluated on Motion. */
++                basePipeline.mParameters.motionV2ToneP95Guide = iris26582CandidateP95Guide;
++                basePipeline.mParameters.motionV2ToneP99Guide = iris26550CandidateP99Guide;
++                basePipeline.mParameters.motionV2ToneP995Guide = iris26583CandidateP995Guide;
++                basePipeline.mParameters.motionV2ToneP998Guide = iris26583CandidateP998Guide;
++                basePipeline.mParameters.motionV2TonePredictedClipFraction = 0.0f;
++                basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction = 0.0f;
++                basePipeline.mParameters.motionV2ToneProjectedNearCeilingFraction = 0.0f;
++                basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction = 0.0f;
++                basePipeline.mParameters.motionV2ToneProjectedBroadTailStrength = 0.0f;
++                basePipeline.mParameters.motionV2ToneCompactTailStrength = 0.0f;
++                basePipeline.mParameters.motionV2ToneBaseSceneWhite = 1.0f;
++                basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite = 1.0f;
++                basePipeline.mParameters.motionV2ToneAdaptiveStrength = 0.0f;
++                Log.i(Name, "IRIS_26616_WRONSKI_SOLVER_ONLY"
++                        + " brightnessTargetGain=" + gain
++                        + " predictor=EXACT_WRONSKI_MIDTONE_SQRT_ACES"
++                        + " oldSceneWhiteDecision=false oldShoulderDecision=false"
++                        + " oldProjectedHighlightDecision=false"
++                        + " perPixelToneOwner=MotionV2WronskiLtm");
++            }
+ 
+             Log.i(Name, "IRIS_26519_VIEWFINDER_MATCH"
+                     + " requestId=" + snapshot.requestId
+@@ -280,15 +294,17 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " solvedEv=" + solvedEv
+                     + " cameraId=" + cameraIdForLog()
+                     + " brightnessTargetGain=" + gain
+-                    + " meterToneAuthority=IRIS_26615_SPATIAL_APPEARANCE_PREDICTOR finalAppearanceAuthority=IRIS_26615_SPATIAL_APPEARANCE"
++                    + " meterToneAuthority=IRIS_26616_WRONSKI_GLOBAL_EXPOSURE_PREDICTOR finalAppearanceAuthority=IRIS_26616_WRONSKI_EXPOSURE_FUSION"
+                     + " irisNight=" + iris26550Night
+                     + " candidateP99Guide=" + iris26550CandidateP99Guide
+                     + " fixedCandidateSampleSet=true"
+                     + " boundedSecant=true probeStepEv=0.5 maxIterations=4 evBounds=-4..4"
+                     + " meterLongEdge=" + METER_LONG_EDGE
+                     + " displayLinearLuma=true candidateMidtoneBand=P25-P50"
++                    + " motionCandidatePredictor=" + (iris26550Night
++                            ? "PRESERVED_NIGHT" : "EXACT_WRONSKI_MIDTONE_SQRT_ACES")
+                     + " legacyRawGainAuthority=false"
+-                    + " manualIrisExposureLater=true"
++                    + " manualIrisExposureLater=" + iris26550Night
+                     + " camera2Write=false");
+         } catch (Throwable t) {
+             basePipeline.mParameters.motionV2DisplayGain = 1.0f;
+@@ -314,7 +330,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                                 + " cameraId=" + cameraIdForLog()
+                                 + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+                                 + " legacyRawGainAuthority=false"
+-                                + " manualExposureAdditiveLater=true"
++                                + " manualExposureAdditiveLater=" + iris26550Night
+                                 + " captureAeUntouched=true");
+             } catch (Throwable ignored) {}
+         }
+@@ -393,8 +409,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             ArrayList<RgbSample> all = new ArrayList<>();
+             iris26584CandidateGuideGrid = new float[previewW * previewH];
+             java.util.Arrays.fill(iris26584CandidateGuideGrid, Float.NaN);
+-            iris26615CandidateLumaGrid = new float[previewW * previewH];
+-            java.util.Arrays.fill(iris26615CandidateLumaGrid, Float.NaN);
+             iris26584CandidateGridWidth = previewW;
+             iris26584CandidateGridHeight = previewH;
+             int pixelIndex = 0;
+@@ -410,14 +424,12 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                         all.add(new RgbSample(r, g, b, sx, sy));
+                         if (pixelIndex < iris26584CandidateGuideGrid.length) {
+                             iris26584CandidateGuideGrid[pixelIndex] = Math.max(r, Math.max(g, b));
+-                            iris26615CandidateLumaGrid[pixelIndex] = y;
+                         }
+                     }
+                 }
+                 pixelIndex++;
+             }
+             if (!all.isEmpty()) {
+-                iris26615BuildCandidateSpatialBase();
+                 iris26582CandidateGuides.clear();
+                 for (RgbSample s : all) {
+                     iris26582CandidateGuides.add(Math.max(s.r, Math.max(s.g, s.b)));
+@@ -436,9 +448,14 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 iris26583CandidateP995Guide = iris26582CandidateGuides.get(p995);
+                 iris26583CandidateP998Guide = iris26582CandidateGuides.get(p998);
+             }
+-            ToneDecision iris26586MeterTone = iris26586ViewfinderMeterToneDecision(1.0f);
+-            all.sort(Comparator.comparingDouble(s ->
+-                    presentedLuma(s, 1.0f, iris26586MeterTone.adaptiveSceneWhite)));
++            if (basePipeline.mParameters.motionV2Active) {
++                all.sort(Comparator.comparingDouble(s ->
++                        MotionV2WronskiLtm.demoMidtoneLightness(s.r, s.g, s.b, 1.0f)));
++            } else {
++                ToneDecision iris26586MeterTone = iris26586ViewfinderMeterToneDecision(1.0f);
++                all.sort(Comparator.comparingDouble(s ->
++                        presentedLuma(s, 1.0f, iris26586MeterTone.adaptiveSceneWhite)));
++            }
+             int from = Math.max(0, Math.round((all.size() - 1) * 0.25f));
+             int to = Math.min(all.size(), Math.max(from + 1,
+                     Math.round((all.size() - 1) * 0.50f) + 1));
+@@ -449,85 +466,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         }
+     }
+ 
+-    private float iris26615SampleCandidateLuma(float x, float y) {
+-        if (iris26615CandidateLumaGrid == null
+-                || iris26584CandidateGridWidth <= 0 || iris26584CandidateGridHeight <= 0) {
+-            return 0.0f;
+-        }
+-        int w = iris26584CandidateGridWidth, h = iris26584CandidateGridHeight;
+-        x = clamp(x, 0.0f, w - 1.0f);
+-        y = clamp(y, 0.0f, h - 1.0f);
+-        int x0 = (int)Math.floor(x), y0 = (int)Math.floor(y);
+-        int x1 = Math.min(w - 1, x0 + 1), y1 = Math.min(h - 1, y0 + 1);
+-        float fx = x - x0, fy = y - y0;
+-        float a = iris26615CandidateLumaGrid[y0 * w + x0];
+-        float b = iris26615CandidateLumaGrid[y0 * w + x1];
+-        float c = iris26615CandidateLumaGrid[y1 * w + x0];
+-        float d = iris26615CandidateLumaGrid[y1 * w + x1];
+-        if (!Float.isFinite(a)) a = 0.0f;
+-        if (!Float.isFinite(b)) b = a;
+-        if (!Float.isFinite(c)) c = a;
+-        if (!Float.isFinite(d)) d = c;
+-        return mix(mix(a, b, fx), mix(c, d, fx), fy);
+-    }
+-
+-    private void iris26615BuildCandidateSpatialBase() {
+-        int w = iris26584CandidateGridWidth, h = iris26584CandidateGridHeight;
+-        if (iris26615CandidateLumaGrid == null || w <= 0 || h <= 0) return;
+-        int shortEdge = Math.max(1, Math.min(w, h));
+-        float scale = Math.min(1.0f,
+-                MotionV2DisplayExposure.IRIS_26615_SPATIAL_BASE_SHORT_EDGE / (float) shortEdge);
+-        int bw = Math.max(1, Math.round(w * scale));
+-        int bh = Math.max(1, Math.round(h * scale));
+-        float[] base = new float[bw * bh];
+-        float cellX = w / (float) bw;
+-        float cellY = h / (float) bh;
+-        for (int by = 0; by < bh; by++) {
+-            float centerY = (by + 0.5f) * cellY - 0.5f;
+-            for (int bx = 0; bx < bw; bx++) {
+-                float centerX = (bx + 0.5f) * cellX - 0.5f;
+-                float sum = 0.0f, weightSum = 0.0f;
+-                for (int j = -4; j <= 4; j++) {
+-                    float wy = 5.0f - Math.abs(j);
+-                    for (int i = -4; i <= 4; i++) {
+-                        float wx = 5.0f - Math.abs(i);
+-                        float weight = wx * wy;
+-                        sum += iris26615SampleCandidateLuma(
+-                                centerX + i * cellX, centerY + j * cellY) * weight;
+-                        weightSum += weight;
+-                    }
+-                }
+-                base[by * bw + bx] = Math.max(sum / Math.max(weightSum, 1.0e-6f), 0.0f);
+-            }
+-        }
+-        iris26615CandidateSpatialBaseGrid = base;
+-        iris26615CandidateSpatialBaseWidth = bw;
+-        iris26615CandidateSpatialBaseHeight = bh;
+-    }
+-
+-    private float iris26615SpatialBaseForSample(RgbSample sample) {
+-        if (iris26615CandidateSpatialBaseGrid == null
+-                || iris26615CandidateSpatialBaseWidth <= 0
+-                || iris26615CandidateSpatialBaseHeight <= 0
+-                || iris26584CandidateGridWidth <= 0 || iris26584CandidateGridHeight <= 0) {
+-            return Math.max(luma(sample.r, sample.g, sample.b), 0.0f);
+-        }
+-        int bw = iris26615CandidateSpatialBaseWidth;
+-        int bh = iris26615CandidateSpatialBaseHeight;
+-        float x = (sample.x + 0.5f) * bw / (float) iris26584CandidateGridWidth - 0.5f;
+-        float y = (sample.y + 0.5f) * bh / (float) iris26584CandidateGridHeight - 0.5f;
+-        x = clamp(x, 0.0f, bw - 1.0f);
+-        y = clamp(y, 0.0f, bh - 1.0f);
+-        int x0 = (int)Math.floor(x), y0 = (int)Math.floor(y);
+-        int x1 = Math.min(bw - 1, x0 + 1), y1 = Math.min(bh - 1, y0 + 1);
+-        float fx = x - x0, fy = y - y0;
+-        float a = iris26615CandidateSpatialBaseGrid[y0 * bw + x0];
+-        float b = iris26615CandidateSpatialBaseGrid[y0 * bw + x1];
+-        float c = iris26615CandidateSpatialBaseGrid[y1 * bw + x0];
+-        float d = iris26615CandidateSpatialBaseGrid[y1 * bw + x1];
+-        return Math.max(mix(mix(a, b, fx), mix(c, d, fx), fy), 0.0f);
+-    }
+-
+     private static ArrayList<Float> trimMiddle(ArrayList<Float> sorted, float lo, float hi) {
+         if (sorted.isEmpty()) return sorted;
+         int from = Math.max(0, Math.round((sorted.size() - 1) * lo));
+@@ -547,10 +485,19 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+ 
+     private float exposureError(ArrayList<RgbSample> samples, float ev, float targetLog) {
+         float gain = (float)Math.pow(2.0, ev);
+-        ToneDecision tone = iris26586ViewfinderMeterToneDecision(gain);
+         ArrayList<Float> logs = new ArrayList<>(samples.size());
+-        for (RgbSample sample : samples) {
+-            logs.add(log2(Math.max(presentedLuma(sample, gain, tone.adaptiveSceneWhite), 1.0e-5f)));
++        if (basePipeline.mParameters.motionV2Active) {
++            for (RgbSample sample : samples) {
++                float y = MotionV2WronskiLtm.demoMidtoneLightness(
++                        sample.r, sample.g, sample.b, gain);
++                logs.add(log2(Math.max(y, 1.0e-5f)));
++            }
++        } else {
++            ToneDecision tone = iris26586ViewfinderMeterToneDecision(gain);
++            for (RgbSample sample : samples) {
++                logs.add(log2(Math.max(
++                        presentedLuma(sample, gain, tone.adaptiveSceneWhite), 1.0e-5f)));
++            }
+         }
+         Collections.sort(logs);
+         return medianSorted(logs) - targetLog;
+@@ -920,16 +867,12 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         if (guide <= 1.0e-7f) return 0.0f;
+         float mappedFinal;
+         if (basePipeline.mParameters.motionV2Active) {
+-            float spatialBase = iris26615SpatialBaseForSample(sample);
+-            float spatialGain = MotionV2Render.iris26615SpatialAppearanceGain(spatialBase, gain);
+-            r *= spatialGain;
+-            g *= spatialGain;
+-            b *= spatialGain;
+-            y = luma(r, g, b);
+-            peak = Math.max(r, Math.max(g, b));
+-            guide = Math.max(y, peak);
+-            if (guide <= 1.0e-7f) return 0.0f;
+-            mappedFinal = MotionV2Render.iris26615ProjectCanonicalSdrGuide(guide);
++            /* IRIS_26616_WRONSKI_METER_TARGET_ONLY
++             * The solver predicts only the linked demo's free global exposure parameter. It does
++             * not predict/own the later spatial fusion. ACES is the exact Three.js r138 function.
++             */
++            float exposure = Math.max(gain, 1.0e-6f);
++            return clamp(MotionV2WronskiLtm.demoMidtoneLightness(r, g, b, exposure), 0.0f, 1.0f);
+         } else {
+             float preGuide = guide * Math.max(gain, 1.0e-6f);
+             mappedFinal = MotionV2Render.iris26582MapHeadroom(preGuide, sceneWhite)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2WronskiLtm.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2WronskiLtm.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e91ad76881f42596fc2876892ff8e1e6e4f4e607
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2WronskiLtm.java
+@@ -0,0 +1,262 @@
++package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
++
++import android.graphics.Point;
++import android.opengl.GLES30;
++
++import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
++import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
++import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
++import com.particlesdevs.photoncamera.util.Log;
++import com.particlesdevs.photoncamera.util.MotionTrace;
++
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.FloatBuffer;
++
++import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
++import static android.opengl.GLES20.GL_LINEAR;
++
++/**
++ * IRIS_26616_WRONSKI_EXACT_EXPOSURE_FUSION_LTM_OWNER
++ *
++ * Motion's sole automatic local-tone/presentation owner. This is a direct Android/GLSL port of
++ * Bart Wronski's 2022 WebGL exposure-fusion LTM demo (main.js SHA
++ * 07417fe2132975a193b49cbe9d16a6a02ab9dcc2), including the exact three synthetic exposures,
++ * exposure-only Gaussian weights, mip-6 Gaussian blend, mip 5..2 Laplacian reconstruction,
++ * boostLocalContrast=false, and 3x3 guided final combine. The ACES function is pinned to the
++ * demo's Three.js r138 implementation (ShaderChunk SHA 5087a8313493aa5eb230b82dc53dd636465d2751).
++ *
++ * The only camera-specific input is exposure: Parameters.motionV2DisplayGain is used as the demo's
++ * free global exposure parameter. It is not applied anywhere else as a pixel multiplier.
++ * Alpha carries the immutable pre-LTM physical guide so Ultra HDR can add only real >1 headroom.
++ */
++public final class MotionV2WronskiLtm extends Node {
++    public static final int DISPLAY_MIP = 2;
++    public static final int COARSE_MIP = 6;
++    public static final float HIGHLIGHTS_EV = 2.0f;
++    public static final float SHADOWS_EV = 1.5f;
++    public static final float EXPOSURE_PREFERENCE_SIGMA = 5.0f;
++    public static final boolean BOOST_LOCAL_CONTRAST = false;
++    public static final float GUIDED_SPATIAL_SIGMA = 0.7f;
++    public static final float LOW_LUMA_UNITY_THRESHOLD = 0.007f;
++
++    public MotionV2WronskiLtm() { super("", "MotionV2WronskiLtm"); }
++    @Override public void Compile() {}
++
++    private static Point divRoundUp(Point p, int d) {
++        return new Point(Math.max(1, (p.x + d - 1) / d), Math.max(1, (p.y + d - 1) / d));
++    }
++
++    private static GLTexture rgba16(Point size) {
++        return new GLTexture(size, new GLFormat(GLFormat.DataType.FLOAT_16, 4), null,
++                GL_LINEAR, GL_CLAMP_TO_EDGE);
++    }
++
++    private static GLTexture r16(Point size) {
++        return new GLTexture(size, new GLFormat(GLFormat.DataType.FLOAT_16, 1), null,
++                GL_LINEAR, GL_CLAMP_TO_EDGE);
++    }
++
++    private float[] readChannel(GLTexture texture, int channels, int channel) {
++        int[] oldFramebuffer = new int[1];
++        GLES30.glGetIntegerv(GLES30.GL_FRAMEBUFFER_BINDING, oldFramebuffer, 0);
++        texture.BufferLoad();
++        ByteBuffer bytes;
++        try {
++            bytes = texture.textureBuffer(
++                    new GLFormat(GLFormat.DataType.FLOAT_32, channels), true);
++        } finally {
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, oldFramebuffer[0]);
++            if (texture.isBuffered && texture.mBuffer != 0) {
++                GLES30.glDeleteFramebuffers(1, new int[]{texture.mBuffer}, 0);
++                texture.mBuffer = 0;
++                texture.isBuffered = false;
++            }
++        }
++        bytes.order(ByteOrder.nativeOrder());
++        FloatBuffer fb = bytes.asFloatBuffer();
++        int count = texture.mSize.x * texture.mSize.y;
++        float[] out = new float[count];
++        for (int i = 0; i < count; i++) {
++            float v = fb.get(i * channels + channel);
++            if (!Float.isFinite(v)) {
++                throw new IllegalStateException("26616 non-finite Wronski grid at " + i + ": " + v);
++            }
++            out[i] = v;
++        }
++        return out;
++    }
++
++    private void downsample(GLTexture source, GLTexture output) {
++        glProg.useAssetProgram("motionv2/wronski_ltm_downsample");
++        glProg.setTexture("InputBuffer", source);
++        glProg.drawBlocks(output);
++        glProg.closed = true;
++    }
++
++    @Override
++    public void Run() {
++        if (!basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive) {
++            throw new IllegalStateException("MotionV2WronskiLtm is Motion-only");
++        }
++        final GLTexture source = previousNode.WorkingTexture;
++        if (source == null || source.mSize == null || source.mSize.x < 4 || source.mSize.y < 4) {
++            throw new IllegalStateException("26616 Wronski LTM missing/invalid source");
++        }
++        /* The linked demo renders level 0 then performs two GL_LINEAR half-resolution copies
++         * before display mip 2. For dimensions divisible by four, those two aligned linear
++         * reductions are exactly the uniform 4x4 average evaluated by our level-2 shaders.
++         * Refuse any geometry where that equivalence is not exact; never round into a hybrid. */
++        if ((source.mSize.x & 3) != 0 || (source.mSize.y & 3) != 0) {
++            throw new IllegalStateException("26616 exact Wronski mip2 equivalence requires /4 dimensions: "
++                    + source.mSize.x + "x" + source.mSize.y);
++        }
++        final float exposure = basePipeline.mParameters.motionV2DisplayGain;
++        if (!Float.isFinite(exposure) || exposure <= 0.0f) {
++            throw new IllegalStateException("26616 invalid Wronski exposure target: " + exposure);
++        }
++
++        basePipeline.mParameters.motionV2WronskiMidtoneMipGrid = null;
++        basePipeline.mParameters.motionV2WronskiFusedLumaGrid = null;
++        basePipeline.mParameters.motionV2WronskiLtmWidth = 0;
++        basePipeline.mParameters.motionV2WronskiLtmHeight = 0;
++
++        GLTexture[] exposures = new GLTexture[COARSE_MIP + 1];
++        GLTexture[] weights = new GLTexture[COARSE_MIP + 1];
++        GLTexture[] assembled = new GLTexture[COARSE_MIP + 1];
++        try {
++            Point level2 = new Point(source.mSize.x >> DISPLAY_MIP,
++                    source.mSize.y >> DISPLAY_MIP);
++            exposures[DISPLAY_MIP] = rgba16(level2);
++            weights[DISPLAY_MIP] = rgba16(level2);
++
++            glProg.useAssetProgram("motionv2/wronski_ltm_level2_exposures");
++            glProg.setTexture("InputBuffer", source);
++            glProg.setVar("exposure", exposure);
++            glProg.drawBlocks(exposures[DISPLAY_MIP]);
++            glProg.closed = true;
++
++            glProg.useAssetProgram("motionv2/wronski_ltm_level2_weights");
++            glProg.setTexture("InputBuffer", source);
++            glProg.setVar("exposure", exposure);
++            glProg.drawBlocks(weights[DISPLAY_MIP]);
++            glProg.closed = true;
++
++            for (int level = DISPLAY_MIP + 1; level <= COARSE_MIP; level++) {
++                Point size = divRoundUp(exposures[level - 1].mSize, 2);
++                exposures[level] = rgba16(size);
++                weights[level] = rgba16(size);
++                downsample(exposures[level - 1], exposures[level]);
++                downsample(weights[level - 1], weights[level]);
++            }
++
++            assembled[COARSE_MIP] = r16(exposures[COARSE_MIP].mSize);
++            glProg.useAssetProgram("motionv2/wronski_ltm_blend_coarse");
++            glProg.setTexture("Exposures", exposures[COARSE_MIP]);
++            glProg.setTexture("Weights", weights[COARSE_MIP]);
++            glProg.drawBlocks(assembled[COARSE_MIP]);
++            glProg.closed = true;
++
++            for (int level = COARSE_MIP; level > DISPLAY_MIP; level--) {
++                int fine = level - 1;
++                assembled[fine] = r16(exposures[fine].mSize);
++                glProg.useAssetProgram("motionv2/wronski_ltm_blend_laplacian");
++                glProg.setTexture("ExposuresFine", exposures[fine]);
++                glProg.setTexture("WeightsFine", weights[fine]);
++                glProg.setTexture("ExposuresCoarse", exposures[level]);
++                glProg.setTexture("AccumCoarse", assembled[level]);
++                glProg.setVar("FineSize", (float) exposures[fine].mSize.x,
++                        (float) exposures[fine].mSize.y);
++                glProg.drawBlocks(assembled[fine]);
++                glProg.closed = true;
++            }
++
++            /* Freeze the exact mip-2 authorities before the full-resolution final combine. The
++             * true-2x publisher reuses these values and therefore cannot solve a second LTM. */
++            float[] midtone = readChannel(exposures[DISPLAY_MIP], 4, 1);
++            float[] fused = readChannel(assembled[DISPLAY_MIP], 1, 0);
++            if (midtone.length != fused.length || midtone.length != level2.x * level2.y) {
++                throw new IllegalStateException("26616 Wronski shared-grid size mismatch");
++            }
++            basePipeline.mParameters.motionV2WronskiMidtoneMipGrid = midtone;
++            basePipeline.mParameters.motionV2WronskiFusedLumaGrid = fused;
++            basePipeline.mParameters.motionV2WronskiLtmWidth = level2.x;
++            basePipeline.mParameters.motionV2WronskiLtmHeight = level2.y;
++
++            glProg.useAssetProgram("motionv2/wronski_ltm_final");
++            glProg.setTexture("InputBuffer", source);
++            glProg.setTexture("ExposureMip", exposures[DISPLAY_MIP]);
++            glProg.setTexture("FusedMip", assembled[DISPLAY_MIP]);
++            glProg.setVar("exposure", exposure);
++            WorkingTexture = basePipeline.getMain();
++            glProg.drawBlocks(WorkingTexture);
++            glProg.closed = true;
++
++            long lowResSamples = (long) level2.x * level2.y;
++            Log.i(Name, "IRIS_26616_WRONSKI_EXACT_LTM"
++                    + " exposure=" + exposure
++                    + " branches=3"
++                    + " highlightEv=-" + HIGHLIGHTS_EV
++                    + " midtoneEv=0.0"
++                    + " shadowEv=+" + SHADOWS_EV
++                    + " sigma=" + EXPOSURE_PREFERENCE_SIGMA
++                    + " coarseMip=" + COARSE_MIP
++                    + " displayMip=" + DISPLAY_MIP
++                    + " boostLocalContrast=" + BOOST_LOCAL_CONTRAST
++                    + " guidedSigma=" + GUIDED_SPATIAL_SIGMA
++                    + " lowLumaThreshold=" + LOW_LUMA_UNITY_THRESHOLD
++                    + " mip2=" + level2.x + "x" + level2.y
++                    + " sharedGridSamples=" + lowResSamples
++                    + " normalAndTrue2xSharedSolve=true"
++                    + " oldSpatialBaseOwner=false"
++                    + " oldMotionRenderShoulder=false"
++                    + " globalImageMultiplierOutsideLtm=false"
++                    + " physicalHdrGuide=alphaPreLtm"
++                    + " source=bartwronski_2022_demo_sha_07417fe_three_r138");
++            MotionTrace.processingState("IRIS_26616_WRONSKI_LTM_AUTHORITY",
++                    "owner=WRONSKI_EXPOSURE_FUSION_EXACT"
++                            + " exposure=" + exposure
++                            + " branches=3 ev=-2,0,+1.5 sigma=5 mip=6 displayMip=2"
++                            + " boostLocalContrast=false sharedTrue2x=true"
++                            + " physicalHdrAlphaSeparate=true");
++        } finally {
++            for (int i = 0; i < exposures.length; i++) {
++                if (exposures[i] != null) try { exposures[i].close(); } catch (Throwable ignored) {}
++                if (weights[i] != null) try { weights[i].close(); } catch (Throwable ignored) {}
++                if (assembled[i] != null) try { assembled[i].close(); } catch (Throwable ignored) {}
++            }
++        }
++    }
++
++    /** Exact Three.js r138 ACES fit in the linked demo's linear-sRGB domain. Iris supplies
++     * linear Display-P3, so the fixed primary conversion happens before ACES and is not a tone
++     * operation. */
++    static float[] aces(float p3r, float p3g, float p3b) {
++        float r = 1.22494018f * p3r - 0.22494018f * p3g;
++        float g = -0.04205695f * p3r + 1.04205695f * p3g;
++        float b = -0.01963755f * p3r - 0.07863605f * p3g + 1.09827360f * p3b;
++        r /= 0.6f; g /= 0.6f; b /= 0.6f;
++        float ar = 0.59719f*r + 0.35458f*g + 0.04823f*b;
++        float ag = 0.07600f*r + 0.90834f*g + 0.01566f*b;
++        float ab = 0.02840f*r + 0.13383f*g + 0.83777f*b;
++        ar = rrt(ar); ag = rrt(ag); ab = rrt(ab);
++        float or = 1.60475f*ar - 0.53108f*ag - 0.07367f*ab;
++        float og = -0.10208f*ar + 1.10813f*ag - 0.00605f*ab;
++        float ob = -0.00327f*ar - 0.07276f*ag + 1.07602f*ab;
++        return new float[]{clamp01(or), clamp01(og), clamp01(ob)};
++    }
++
++    static float demoMidtoneLightness(float p3r, float p3g, float p3b, float exposure) {
++        float e = Math.max(exposure, 1.0e-6f);
++        float[] a = aces(p3r * e, p3g * e, p3b * e);
++        return (float)Math.sqrt(Math.max(0.1f * a[0] + 0.7f * a[1] + 0.2f * a[2], 0.0f));
++    }
++
++    private static float rrt(float v) {
++        float a = v * (v + 0.0245786f) - 0.000090537f;
++        float b = v * (0.983729f * v + 0.4329510f) + 0.238081f;
++        return a / b;
++    }
++
++    private static float clamp01(float x) { return Math.max(0.0f, Math.min(1.0f, x)); }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 5491a55d783029f8538058713fe6d4aa605fab06..1cd354c3537a1d0565b751ca821e2f378ae70856 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -551,19 +551,18 @@ public class PostPipeline extends GLBasePipeline {
+              */
+             add(new MotionV2AdaptiveColorAppearance());
+             add(new StageTelemetry("IRIS_26563_MOTION_ADAPTIVE_COLOR_APPEARANCE"));
+-            add(new MotionV2DisplayExposure());
+-            add(new StageTelemetry("V2_POST_VIEWFINDER_PRESENTATION_EXPOSURE"));
+-
+-            /* IRIS_26514_OPTIONAL_LINEAR_PRESENTATION_CONTROLS
+-             * Manual Iris Exposure/Shadows/Contrast remain independent of the automatic
+-             * viewfinder match and operate afterward on the common extended-linear source.
++            /* IRIS_26616_ONE_LTM_OWNER
++             * Exact Wronski exposure fusion replaces 26615's spatial gain and every automatic
++             * Motion highlight/presentation operator. The viewfinder solver supplies only the
++             * demo's free global exposure parameter; Wronski owns all per-pixel tone decisions.
+              */
+-            IrisMotionSettings.Snapshot irisMotionSettings = IrisMotionSettings.current();
+-            motionV2ToneSettingsSnapshot = irisMotionSettings;
+-            if (irisMotionSettings.hasToneAdjustment()) {
+-                add(new IrisMotionToneControls(irisMotionSettings));
+-                add(new StageTelemetry("IRIS_26514_LINEAR_PRESENTATION_CONTROLS"));
+-            }
++            add(new MotionV2WronskiLtm());
++            add(new StageTelemetry("IRIS_26616_WRONSKI_EXPOSURE_FUSION_LTM"));
++
++            /* Strict no-hybrid build: legacy post-presentation Exposure/Shadows/Contrast are not
++             * inserted after Wronski. Snapshot remains available to publication plumbing, where
++             * Motion is forced neutral; Night keeps its separate proven path. */
++            motionV2ToneSettingsSnapshot = IrisMotionSettings.current();
+ 
+             /* IRIS_26560_SABRE_PRIMARY_RECONSTRUCTION_DENOISE
+              * No legacy Photon residual spatial-denoise stage is reintroduced after Sabre.
+@@ -574,14 +573,14 @@ public class PostPipeline extends GLBasePipeline {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+                     "owner=" + motionReconstructionOwnerName(mParameters.motionV2ReconstructionOwner)
+-                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,OwnerSpecificPreColor,MotionV2ColorTransform,MotionV2ViewfinderExposureMatcher,MotionV2AdaptiveColorAppearance,MotionV2DisplayExposure,IrisManualOptional,MotionV2Render,RotateWatermark"
++                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,OwnerSpecificPreColor,MotionV2ColorTransform,MotionV2ViewfinderExposureMatcher,MotionV2AdaptiveColorAppearance,MotionV2WronskiLtm,MotionV2Render,RotateWatermark"
+                             + " spatialHighlightNode=false"
+                             + " directMultiframeRgb=" + directRgbCarrier
+                             + " strictSabreAuthority26560=true"
+-                            + " displayExposureAfterSabre=true"
++                            + " viewfinderSolverRole=GLOBAL_EXPOSURE_PARAMETER_ONLY"
+                             + " residualSpatialDenoise=false"
+                             + " photonNoiseState=false"
+-                            + " exposureFusion=false esd=false ablc=false"
++                            + " wronskiExposureFusionLtm=true legacyPhotonExposureFusion=false esd=false ablc=false"
+                             + " initial=false autoExposure=false"
+                             + " captureSharpening=false correctingFlow=false sharpen2=false");
+             return;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 9822fa01f2a6e0a8c36765758d26968e481432ca..82e41dda63b6577ef0abee6d998344f57de866d8 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -848,7 +848,7 @@ private void ApplyHdrX() {
+                     "sensorDomainScale=" + processingParameters.motionCanonicalExposureGain
+                             + " displayGain=" + processingParameters.motionV2DisplayGain
+                             + " sensorDomainOwner=SabreNormalizedRaw"
+-                            + " displayGainOwner=MotionV2DisplayExposure"
++                            + " displayGainOwner=MotionV2WronskiLtmGlobalExposureParameter"
+                             + " displayGainBeforeSabreResolve=false"
+                             + " floatCarrierNotReparsed=true");
+         } else {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 1f9eaec5befdd0b0859ee216d99de9f4a564508c..1c9065748c94343487b4f2e0465a9dc0f05f9a87 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -55,15 +55,15 @@ public class Parameters {
+      * Scene brightness normalization applied only after temporal Bayer fusion + RCD.
+      */
+     public float motionV2DisplayGain = 1.0f;
+-    /* IRIS_26615_SHARED_SPATIAL_APPEARANCE_BASE_STATE
+-     * Tiny normalized low-frequency luminance grid produced once by MotionV2DisplayExposure.
+-     * It is read-only after production and is reused by the true-2x publisher so SR cannot own a
+-     * separate illumination/tone field. This is presentation metadata only; RAW/DNG/Sabre never
+-     * consume it.
++    /* IRIS_26616_WRONSKI_SHARED_MIP2_AUTHORITY
++     * Exact linked-demo display-mip=2 fields produced once by the 1x Wronski exposure-fusion solve.
++     * G/midtone lightness from the exposure pyramid and the fused scalar are immutable after
++     * production and are reused by true-2x guided application. SR may not solve another LTM.
+      */
+-    public float[] motionV2SpatialAppearanceBaseGrid = null;
+-    public int motionV2SpatialAppearanceBaseWidth = 0;
+-    public int motionV2SpatialAppearanceBaseHeight = 0;
++    public float[] motionV2WronskiMidtoneMipGrid = null;
++    public float[] motionV2WronskiFusedLumaGrid = null;
++    public int motionV2WronskiLtmWidth = 0;
++    public int motionV2WronskiLtmHeight = 0;
+     /* IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE_STATE
+      * Decision-only presentation state produced by MotionV2ViewfinderExposureMatcher from its
+      * existing low-resolution candidate probe. No RAW/capture/DNG owner consumes these fields.
+@@ -87,7 +87,8 @@ public class Parameters {
+     public float motionV2ToneAdaptiveStrength = 0.0f;
+     /* IRIS_26515_MGC_SOURCE_EXPOSURE_GAIN
+      * MGC BaselineExposure restoration is source-domain metadata, not scene/display exposure.
+-     * It is consumed once by MotionV2DisplayExposure after MGC full-resolution denoise.
++     * Current Sabre Motion/Night authority requires this to remain exactly 1.0; it is not a
++     * Wronski/display-tone input and validateIrisReconstructionOwnership rejects stale values.
+      */
+     public float motionV2MgcSourceExposureGain = 1.0f;
+     /* IRIS_26490_SHORT_RECOVERY_EXECUTED_STATE_OWNER
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index be00017962811d1c0da0dcd1d720a4aaa78bd21e..25c9cb93666061e6bcbd0818ff372c965288c6e8 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -134,9 +134,12 @@ public final class MotionV2Jpeg444Encoder {
+             }
+             final Point raw = parameters.rawSize;
+             final Point crop = cropSize != null ? cropSize : raw;
+-            final float exposureEv = toneSettings != null ? toneSettings.exposureEv : 0.0f;
+-            final float shadows = toneSettings != null ? toneSettings.shadows : 0.0f;
+-            final float contrast = toneSettings != null ? toneSettings.contrast : 0.0f;
++            final float exposureEv = parameters.motionV2Active ? 0.0f
++                    : (toneSettings != null ? toneSettings.exposureEv : 0.0f);
++            final float shadows = parameters.motionV2Active ? 0.0f
++                    : (toneSettings != null ? toneSettings.shadows : 0.0f);
++            final float contrast = parameters.motionV2Active ? 0.0f
++                    : (toneSettings != null ? toneSettings.contrast : 0.0f);
+             final boolean useJin = jinResidual != null && jinResidual.applied
+                     && jinResidual.residual != null && jinResidual.referenceRgb != null
+                     && jinResidual.width > 1 && jinResidual.height > 1;
+@@ -153,19 +156,21 @@ public final class MotionV2Jpeg444Encoder {
+                     ? attachedGainmap.getRatioMax()[0] : 1.0f;
+             final float true2xGainContentMax = generateMotionTrue2xGain
+                     ? attachedGainmap.getDisplayRatioForFullHdr() : 1.0f;
+-            final float publicationSceneWhite =
+-                    MotionV2Render.iris26598PublicationSceneWhite(parameters);
+-            final float[] spatialBase = parameters.motionV2SpatialAppearanceBaseGrid;
+-            final int spatialBaseWidth = parameters.motionV2SpatialAppearanceBaseWidth;
+-            final int spatialBaseHeight = parameters.motionV2SpatialAppearanceBaseHeight;
++            final float publicationSceneWhite = parameters.motionV2Active
++                    ? 1.0f : MotionV2Render.iris26598PublicationSceneWhite(parameters);
++            final float[] wronskiMidtone = parameters.motionV2WronskiMidtoneMipGrid;
++            final float[] wronskiFused = parameters.motionV2WronskiFusedLumaGrid;
++            final int wronskiWidth = parameters.motionV2WronskiLtmWidth;
++            final int wronskiHeight = parameters.motionV2WronskiLtmHeight;
+             if (parameters.motionV2Active) {
+-                long expectedSpatial = (long) spatialBaseWidth * spatialBaseHeight;
+-                if (spatialBase == null || spatialBaseWidth <= 0 || spatialBaseHeight <= 0
+-                        || expectedSpatial != spatialBase.length) {
+-                    throw new IllegalStateException(
+-                            "26615 true2x missing shared spatial base grid width="
+-                                    + spatialBaseWidth + " height=" + spatialBaseHeight
+-                                    + " length=" + (spatialBase == null ? -1 : spatialBase.length));
++                long expected = (long) wronskiWidth * wronskiHeight;
++                if (wronskiMidtone == null || wronskiFused == null
++                        || wronskiWidth <= 0 || wronskiHeight <= 0
++                        || expected != wronskiMidtone.length || expected != wronskiFused.length) {
++                    throw new IllegalStateException("26616 true2x missing shared Wronski mip2 fields width="
++                            + wronskiWidth + " height=" + wronskiHeight
++                            + " mid=" + (wronskiMidtone == null ? -1 : wronskiMidtone.length)
++                            + " fused=" + (wronskiFused == null ? -1 : wronskiFused.length));
+                 }
+             }
+             final long renderStartNs = System.nanoTime();
+@@ -175,9 +180,10 @@ public final class MotionV2Jpeg444Encoder {
+                     Math.max(1.0f, parameters.motionV2RenderResidualZoom),
+                     sensorToProPhoto, profileToDisplay,
+                     parameters.motionV2DisplayGain,
+-                    parameters.motionV2Active ? spatialBase : null,
+-                    parameters.motionV2Active ? spatialBaseWidth : 0,
+-                    parameters.motionV2Active ? spatialBaseHeight : 0,
++                    parameters.motionV2Active ? wronskiMidtone : null,
++                    parameters.motionV2Active ? wronskiFused : null,
++                    parameters.motionV2Active ? wronskiWidth : 0,
++                    parameters.motionV2Active ? wronskiHeight : 0,
+                     exposureEv, shadows, contrast, publicationSceneWhite, parameters.motionV2Active,
+                     watermark,
+                     useJin ? jinResidual.residual : null,
+@@ -195,14 +201,13 @@ public final class MotionV2Jpeg444Encoder {
+                     + " gainEncodingMax=" + true2xGainEncodingMax
+                     + " gainContentMax=" + true2xGainContentMax
+                     + " publicationSceneWhite=" + publicationSceneWhite
+-                    + " iris26615SdrWhiteAnchor=" + MotionV2Render.IRIS_26615_SDR_WHITE_ANCHOR
+-                    + " spatialBase=" + spatialBaseWidth + "x" + spatialBaseHeight
+-                    + " spatialBaseSharedFrom1x=true"
++                    + " wronskiMip2=" + wronskiWidth + "x" + wronskiHeight
++                    + " wronskiSharedSolveFrom1x=true"
+                     + " duplicateTrue2xToneField=false"
+-                    + " IRIS_26615_TRUE2X_SHARED_SPATIAL_APPEARANCE=true"
++                    + " IRIS_26616_TRUE2X_SHARED_WRONSKI_LTM=true"
+                     + " adaptiveSceneWhite=" + parameters.motionV2ToneAdaptiveSceneWhite
+                     + " publicationSceneWhiteSource="
+-                        + (parameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
++                        + (parameters.motionV2Active ? "WRONSKI_SDR_APPEARANCE_COMPLETE" : "ADAPTIVE_26591_NIGHT")
+                     + " IRIS_26598_TRUE2X_TONE_PARITY=true"
+                     + " IRIS_26596_TRUE2X_CONTENT_CAP=true");
+             /* IRIS_26576_NATIVE_PUBLICATION_BACKEND_PERSISTENT_PROOF
+@@ -332,7 +337,7 @@ public final class MotionV2Jpeg444Encoder {
+             int rawWidth, int rawHeight, int cropWidth, int cropHeight,
+             int rotation, boolean mirror, float renderResidualZoom,
+             float[] sensorToProPhoto, float[] proPhotoToSrgb, float displayGain,
+-            float[] spatialAppearanceBase, int spatialBaseWidth, int spatialBaseHeight,
++            float[] wronskiMidtoneMip2, float[] wronskiFusedMip2, int wronskiWidth, int wronskiHeight,
+             float exposureEv, float shadows, float contrast, float sceneWhite, boolean motionHdrHandoff,
+             Bitmap watermark,
+             float[] jinResidual, int[] jinReferenceRgb, int jinWidth, int jinHeight,
+diff --git a/app/version.properties b/app/version.properties
+index 3d7161c36d9370540df7c87a47eb0b289fc71714..1548c90efb9b12cbdae26b2bb02be83dacf5607a 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726615
+-VERSION_BUILD=26615
++VERSION_NAME=0.9726616
++VERSION_BUILD=26616
