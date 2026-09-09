@@ -28,12 +28,42 @@ for const,name in [('IRIS_26615_SPATIAL_BASE_SHADER','motionv2_spatial_base_2661
     if '#version' in s or '#import' in s: raise SystemExit(name+' unexpected version/import')
     spec.append((name,prefix+s,'frag'))
 
+def extract_java_call_string(src, call_token, after_token):
+    # 26615 R1.1 regression: never locate a Java call terminator with raw `index(');')`.
+    # GLSL string contents can legally contain `);` (the failed R1 probe contains vec2(1.0)));),
+    # which truncated the compiler input even though the production Java shader was complete.
+    search_from=src.index(after_token)
+    call=src.index(call_token,search_from)
+    open_paren=src.index('(',call)+1
+    depth=1; in_string=False; escape=False; i=open_paren
+    while i < len(src):
+        ch=src[i]
+        if in_string:
+            if escape:
+                escape=False
+            elif ch=='\\':
+                escape=True
+            elif ch=='"':
+                in_string=False
+        else:
+            if ch=='"':
+                in_string=True
+            elif ch=='(':
+                depth += 1
+            elif ch==')':
+                depth -= 1
+                if depth==0:
+                    expr=src[open_paren:i]
+                    parts=re.findall(r'"((?:\\.|[^"\\])*)"',expr)
+                    if not parts: raise SystemExit('empty Java call shader '+call_token)
+                    return ''.join(bytes(x,'utf-8').decode('unicode_escape') for x in parts)
+        i += 1
+    raise SystemExit('unterminated Java call '+call_token)
+
 j=(C/'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java').read_text()
-anchor=j.index('glProg.useProgram(',j.index('private ArrayList<RgbSample> collectCandidateSamples'))
-end=j.index(');',anchor); block=j[anchor:end]
-parts=re.findall(r'"((?:\\.|[^"\\])*)"',block)
-if not parts: raise SystemExit('viewfinder embedded shader extraction failed')
-java_src=''.join(bytes(x,'utf-8').decode('unicode_escape') for x in parts)
+java_src=extract_java_call_string(j,'glProg.useProgram','private ArrayList<RgbSample> collectCandidateSamples')
+if java_src.count('void main')!=1 or not java_src.rstrip().endswith(');}'):
+    raise SystemExit('viewfinder embedded shader extraction incomplete')
 spec.append(('viewfinder_meter_probe_26615',prefix+java_src,'frag'))
 
 cpp=(C/'app/src/main/cpp/motionv2_jpeg444_jni.cpp').read_text(); m=re.search(r'kIris26571PublicationCompute=R"GLSL\((.*?)\)GLSL";',cpp,re.S)

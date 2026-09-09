@@ -33,4 +33,15 @@ for x in ['IRIS_26615_SPATIAL_BASE_SHORT_EDGE = 96','fullResolutionScratchAdded=
 cpp=(C/'app/src/main/cpp/motionv2_jpeg444_jni.cpp').read_text()
 for x in ['spatialBaseTex','glDeleteTextures(1,&spatialBaseTex)','GL_NEAREST','uSpatialBaseSize']:
     if x not in cpp: raise SystemExit('true2x shared-base lifecycle regression '+x)
+
+# R1.1 permanent infrastructure regression: the failed R1 verifier truncated the embedded
+# viewfinder GLSL by searching for raw `);` inside Java source. The GLSL itself contains `);`,
+# so extraction must be parenthesis/string aware and the old raw terminator search must stay gone.
+shader_verifier=(Path(__file__).resolve().parent/'verify_26615_shaders.py').read_text()
+if "def extract_java_call_string" not in shader_verifier:
+    raise SystemExit('R1.1 string-aware Java shader extraction missing')
+if "viewfinder embedded shader extraction incomplete" not in shader_verifier:
+    raise SystemExit('R1.1 complete-viewfinder regression missing')
+if "end=j.index(');',anchor)" in shader_verifier:
+    raise SystemExit('failed R1 raw Java shader terminator extraction revived')
 print('PASS 26615 permanent regressions: 26614 Sabre/SHORT/CFA/color/DNG intact; no duplicate tone owner; bounded GPU lifetime; universal spatial behavior')

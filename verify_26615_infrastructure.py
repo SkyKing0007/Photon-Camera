@@ -28,4 +28,4 @@ if '--successful-r1-script' in sys.argv:
     p=Path(sys.argv[sys.argv.index('--successful-r1-script')+1]).read_text()
     for tok in ['snapshot_candidate_from_authority','./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac',"':app:buildCMakeDebug[arm64-v8a]'",'verify_candidate_patches','PRE-BUILD SAFETY PROOF','./gradlew :app:assembleDebug','postbuild candidate byte-identical','tar --sort=name']:
         if tok not in p or tok not in b: raise SystemExit('R1 mechanics inheritance missing '+tok)
-print('PASS 26615 infrastructure: exact successful-26614-R1 ordering/isolation/compiler/NDK/patch/assemble/invariance mechanics preserved; algorithm-only validator deltas')
+print('PASS 26615 R1.1 infrastructure repair: exact successful-26614-R1 ordering/isolation/compiler/NDK/patch/assemble/invariance mechanics preserved; verifier extraction repaired only; runtime candidate unchanged')

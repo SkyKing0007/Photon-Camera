@@ -17,6 +17,7 @@ resolve_glslang_compiler(){
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 BASE_SUCCESS_COMMIT="11d7f8ee4b240f0299b27a674130ddaafbfb0be6"
+HANDOFF_PARENT_COMMIT="4d2185ae33b4bad013fd8e531fadf151b02832ef"
 BASE_RUN_ID="34297133575"
 BASE_ARTIFACT_ID="10083632654"
 BASE_ARTIFACT_NAME="photon-26614-r1-canonical-appearance-cfa-validity"
@@ -104,19 +105,23 @@ for raw in sys.argv[1:]:
 print('PASS sealed Python stdlib-only syntax/import gate')
 PY
   python3 -S "$INFRA" "$BUILD_SCRIPT" "$WORKFLOW" | tee "$OUT/26615_infrastructure_local.txt"
-  set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful 26614 R1 ordering/isolation/compiler/build mechanics preserved; 26615 algorithm validators only; no backup)"
+  set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful 26614 R1 ordering/isolation/compiler/build mechanics preserved; R1.1 verifier-extraction repair only; runtime candidate unchanged; no backup)"
 }
 verify_scope(){
   if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed handoff; exact 11-file allowlist)"; return; fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-  [[ "$(git rev-parse HEAD^)" == "$BASE_SUCCESS_COMMIT" ]] || fail "26615 handoff commit must be directly on successful 26614 R1 authority"
-  python3 -S - "$HANDOFF" > "$WORK/expected_scope.txt" <<'PY'
-from pathlib import Path
-import sys
-names=[line.split('  ',1)[1] for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]; names.append('R1_26615_HANDOFF_HASHES.sha256'); print('\n'.join(sorted(names)))
-PY
-  git diff --name-only "$BASE_SUCCESS_COMMIT"..HEAD | sort > "$WORK/actual_scope.txt"; diff -u "$WORK/expected_scope.txt" "$WORK/actual_scope.txt" || fail "handoff commit scope mismatch"; ! grep -Eq '^app/' "$WORK/actual_scope.txt" || fail "handoff commit contains live app source"
-  set_report "CHANGED RUNTIME SCOPE" "PASS (sealed infrastructure/payload only; runtime written only in Actions)"
+  [[ "$(git rev-parse HEAD^)" == "$HANDOFF_PARENT_COMMIT" ]] || fail "26615 R1.1 repair must be directly on failed 26615 R1 handoff"
+  [[ "$(git rev-parse "$HANDOFF_PARENT_COMMIT^")" == "$BASE_SUCCESS_COMMIT" ]] || fail "failed 26615 R1 parent must be exact successful 26614 R1 authority"
+  cat > "$WORK/expected_scope.txt" <<'EOF'
+R1_26615_HANDOFF_HASHES.sha256
+R1_26615_RUNTIME_EXPANDED_SHADERS.sha256
+build_26615_r1_iris_spatial_appearance.sh
+verify_26615_infrastructure.py
+verify_26615_regressions.py
+verify_26615_shaders.py
+EOF
+  git diff --name-only "$HANDOFF_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_scope.txt"; diff -u "$WORK/expected_scope.txt" "$WORK/actual_scope.txt" || fail "R1.1 infrastructure-repair commit scope mismatch"; ! grep -Eq '^app/' "$WORK/actual_scope.txt" || fail "R1.1 repair commit contains live app source"
+  set_report "CHANGED RUNTIME SCOPE" "PASS (R1.1 verifier-only repair commit; runtime remains exact 11-file candidate reconstructed from successful 26614 R1)"
 }
 obtain_authority(){
   if [[ -n "$LOCAL_ART" ]]; then cp "$LOCAL_ART" "$ARTZIP"; else [[ -n "$TOKEN" ]] || fail "GITHUB_TOKEN missing"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts/${BASE_ARTIFACT_ID}/zip" -o "$ARTZIP"; fi
