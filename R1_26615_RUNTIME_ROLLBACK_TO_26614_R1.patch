@@ -1,0 +1,1203 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 4c0f2fab30a098f13d25ffb013cbc642b8bbb7e2..13cf70e51e0f8ee15fedef0471e12f3c32018e72 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -5,6 +5,7 @@ uniform sampler2D HdrBuffer;
+ uniform sampler2D SdrBuffer;
+ uniform ivec2 gainMapSize;
+ uniform float hdrExposureScale;
++uniform float displayGain;
+ uniform int motionHdrHandoff;
+ uniform float maxGainRatio;
+ uniform float irisOutputZoom;
+@@ -25,17 +26,17 @@ vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c
+ 
+ float max3(vec3 v){return max(v.r,max(v.g,v.b));}
+ 
+-vec4 iris26524BilinearHdr(vec2 sourcePixel){
++vec3 iris26524BilinearHdr(vec2 sourcePixel){
+     ivec2 sz=textureSize(HdrBuffer,0);
+     vec2 hi=max(vec2(sz)-vec2(1.0),vec2(0.0));
+     vec2 q=clamp(sourcePixel,vec2(0.0),hi);
+     ivec2 p0=ivec2(floor(q));
+     ivec2 p1=min(p0+ivec2(1),sz-ivec2(1));
+     vec2 f=fract(q);
+-    vec4 a=mix(texelFetch(HdrBuffer,ivec2(p0.x,p0.y),0),
+-               texelFetch(HdrBuffer,ivec2(p1.x,p0.y),0),f.x);
+-    vec4 b=mix(texelFetch(HdrBuffer,ivec2(p0.x,p1.y),0),
+-               texelFetch(HdrBuffer,ivec2(p1.x,p1.y),0),f.x);
++    vec3 a=mix(texelFetch(HdrBuffer,ivec2(p0.x,p0.y),0).rgb,
++               texelFetch(HdrBuffer,ivec2(p1.x,p0.y),0).rgb,f.x);
++    vec3 b=mix(texelFetch(HdrBuffer,ivec2(p0.x,p1.y),0).rgb,
++               texelFetch(HdrBuffer,ivec2(p1.x,p1.y),0).rgb,f.x);
+     return mix(a,b,f.y);
+ }
+ /* IRIS_26550_GAINMAP_GENERAL_GEOMETRY
+@@ -62,26 +63,28 @@ void main(){
+     float zoom=max(irisOutputZoom,1.0);
+     ivec2 sdrSize=textureSize(SdrBuffer,0);
+     vec2 sourcePixel=(vec2(p)+vec2(0.5))*vec2(sdrSize)/vec2(gainMapSize)-vec2(0.5);
+-    vec4 hdrSample;
++    vec3 hdrRgb;
+     if(zoom<=1.00001){
+-        hdrSample=iris26524BilinearHdr(sourcePixel);
++        hdrRgb=iris26524BilinearHdr(sourcePixel);
+     }else{
+         ivec2 hdrSize=textureSize(HdrBuffer,0);
+         vec2 center=(vec2(hdrSize)-vec2(1.0))*0.5;
+         vec2 zoomedSource=center+(sourcePixel-center)/zoom;
+-        hdrSample=iris26524BilinearHdr(zoomedSource);
++        hdrRgb=iris26524BilinearHdr(zoomedSource);
+     }
+-    vec3 hdrPositive=max(hdrSample.rgb,vec3(0.0));
++    vec3 hdrPositive=max(hdrRgb,vec3(0.0));
+     float sdr=max(luminance(srgbDecode(iris26550BilinearSdr(sourcePixel))),0.0);
+     float safeMax=max(maxGainRatio,1.001);
+     float ratio;
+     if(motionHdrHandoff!=0){
+-        /* IRIS_26615_PHYSICAL_HEADROOM_SEPARATE_FROM_APPEARANCE
+-         * RGB already contains the canonical spatial appearance. Alpha is the immutable pre-spatial
+-         * physical max-RGB/luminance guide written by MotionV2DisplayExposure. UHDR can therefore
+-         * add only genuine >1 source headroom and can never reinterpret body gamma/detail. */
+-        float physicalSourceGuide=max(hdrSample.a,0.0);
+-        ratio=clamp(max(physicalSourceGuide,1.0),1.0,safeMax);
++        /* IRIS_26614_CANONICAL_APPEARANCE_UHDR_EXTENSION
++         * The SDR base is the appearance authority. Ultra HDR is forbidden from dividing the clean
++         * RAW/HDR master by the tone-mapped SDR because that mathematically undoes SDR appearance
++         * and lets the gain map restore house/tree/curtain/ceiling structure absent from the base.
++         * Motion gain is therefore exactly unity through nominal source white. Only genuine >1
++         * source headroom adds scalar display luminance, preserving the SDR color/gamma structure. */
++        float sourceGuide=max(max3(hdrPositive),luminance(hdrPositive));
++        ratio=clamp(max(sourceGuide,1.0),1.0,safeMax);
+     }else{
+         float hdrTargetScale=hdrExposureScale;
+         float hdr=max(luminance(hdrPositive*hdrTargetScale),0.0);
+diff --git a/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl b/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl
+index b08e4492ffa3498a5fe4b907e0b0afca415d5a78..f5334739afc99db22d7bbffddb64247d097d2f67 100644
+--- a/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl
++++ b/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl
+@@ -4,7 +4,8 @@ uniform sampler2D InputBuffer;
+ uniform float exposureEv;
+ uniform float shadowsControl;
+ uniform float contrastControl;
+-out vec4 Output;
++uniform float brightnessTargetGain;
++out vec3 Output;
+ 
+ float irisLuma(vec3 c) {
+     return dot(max(c, vec3(0.0)), vec3(0.22897456, 0.69173852, 0.07928691));
+@@ -42,15 +43,16 @@ vec3 applyContrast(vec3 rgb, float amount) {
+ 
+ void main() {
+     ivec2 xy = ivec2(gl_FragCoord.xy);
+-    vec4 source = texelFetch(InputBuffer, xy, 0);
+-    vec3 rgb = max(source.rgb, vec3(0.0));
+-    /* IRIS_26615_MANUAL_POST_SPATIAL_PRESENTATION
+-     * Automatic viewfinder brightness has already been allocated by the single spatial appearance
+-     * owner. Manual controls operate directly on that canonical appearance and never recreate the
+-     * old global target multiplier. Alpha is immutable physical HDR provenance for UHDR.
++    vec3 rgb = max(texelFetch(InputBuffer, xy, 0).rgb, vec3(0.0));
++    /* IRIS_26604_MANUAL_VIRTUAL_PRESENTATION_DOMAIN
++     * Preserve 26603 manual Exposure/Shadows/Contrast semantics even though automatic displayGain
++     * is no longer a texture multiplier. Evaluate manual masks in the same virtually presented
++     * domain, then return to source domain for the one final tone owner.
+      */
+-    rgb *= exp2(exposureEv);
+-    rgb = applyShadows(rgb, shadowsControl);
+-    rgb = applyContrast(rgb, contrastControl);
+-    Output = vec4(max(rgb, vec3(0.0)), source.a);
++    float targetGain=max(brightnessTargetGain,1.0e-6);
++    vec3 virtualRgb=rgb*targetGain;
++    virtualRgb *= exp2(exposureEv);
++    virtualRgb = applyShadows(virtualRgb, shadowsControl);
++    virtualRgb = applyContrast(virtualRgb, contrastControl);
++    Output = max(virtualRgb/targetGain, vec3(0.0));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index c4018c580e0b6cb5a25f90f354c6d14698173fb6..b9578215a51538ebcfcbdf5ca01f8631135b1053 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -6,6 +6,8 @@ uniform float sceneWhite;
+ uniform float outputExposureScale;
+ uniform float irisOutputZoom;
+ uniform int iris26592MotionHdrHandoff;
++uniform float displayGain;
++uniform float iris26604MotionSdrKneeFinal;
+ /* IRIS_26524_FULLSIZE_MOTION_ZOOM_RENDER */
+ out vec3 Output;
+ 
+@@ -93,16 +95,25 @@ vec3 iris26524BilinearInput(vec2 sourcePixel) {
+     return mix(a,b,f.y);
+ }
+ 
+-/* IRIS_26615_CANONICAL_SPATIAL_APPEARANCE_PROJECTION
+- * Automatic exposure allocation is complete upstream. This is a fixed monotonic SDR projection:
+- * nominal canonical white maps to 0.95 and values above one use only the reserved final 5%.
+- * No brightness target, histogram knot or spatial decision is allowed in the final renderer.
+- */
+-float iris26615ProjectCanonicalSdrGuide(float canonicalGuide) {
+-    float x=max(canonicalGuide,0.0);
+-    const float whiteAnchor=0.95;
+-    if(x<=1.0) return whiteAnchor*x;
++/* IRIS_26614_CANONICAL_SOURCE_DOMAIN_SDR_APPEARANCE
++ * One C1 monotonic source-domain appearance map. Low source values retain the solved viewfinder
++ * body slope. Extra display gain fades continuously toward nominal source white instead of moving
++ * the highlight boundary downward as displayGain rises. Source white maps to 0.95 and >1 clean
++ * HDR occupies the final 5% asymptotically. No histogram percentile or scene-dependent knot. */
++float iris26614MapMotionSdrFinalGuide(float sourceGuide) {
++    float x=max(sourceGuide,0.0);
++    float requestedFinalGain=max(displayGain,1.0e-6)*max(outputExposureScale,1.0e-6);
++    float whiteAnchor=min(0.95,requestedFinalGain);
++    float bodyGain=requestedFinalGain;
++    if(requestedFinalGain>whiteAnchor){
++        bodyGain=min(requestedFinalGain,4.0*whiteAnchor-1.0e-4);
++    }
++    if(x<=1.0){
++        float oneMinus=1.0-x;
++        return whiteAnchor*x+(bodyGain-whiteAnchor)*x*oneMinus*oneMinus;
++    }
+     float reserve=1.0-whiteAnchor;
++    if(reserve<=1.0e-6)return whiteAnchor;
+     float tailScale=reserve/max(whiteAnchor,1.0e-6);
+     float excess=x-1.0;
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+@@ -110,7 +121,7 @@ float iris26615ProjectCanonicalSdrGuide(float canonicalGuide) {
+ 
+ float mapFinalSdrGuide(float sourceGuide) {
+     if(iris26592MotionHdrHandoff!=0) {
+-        return iris26615ProjectCanonicalSdrGuide(sourceGuide);
++        return iris26614MapMotionSdrFinalGuide(sourceGuide);
+     }
+ 
+     float start=0.50;
+@@ -206,9 +217,9 @@ void main() {
+      */
+     linearSrgb=mapExtendedLinearHeadroom(linearSrgb);
+ 
+-    /* IRIS_26615_FINAL_PROJECTION_ONLY
+-     * Motion automatic brightness is already spatially allocated upstream. This node owns only
+-     * fixed SDR projection, gamut fit and transfer encoding.
++    /* IRIS_26604_FINAL_DOMAIN_TONE
++     * outputExposureScale and Motion brightness target are already consumed by mapFinalSdrGuide;
++     * there is no second image multiplier after the canonical tone owner.
+      */
+     linearSrgb=fitDisplayGamut(linearSrgb);
+ 
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index fbb52bcf71cc2540697161abb172c724cf6a056a..1c4812c0f6f278177a1dc88c5b780747737e1dce 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -504,8 +504,6 @@ struct Params {
+     bool mirror=false;
+     bool motionHdrHandoff=false;
+     float residualZoom=1.f,displayGain=1.f,exposureEv=0.f,shadows=0.f,contrast=0.f,sceneWhite=1.f;
+-    int spatialBaseW=0,spatialBaseH=0;
+-    std::vector<float> spatialBase;
+     float sensorToProfile[9]{};
+     float profileToDisplay[9]{};
+ };
+@@ -533,49 +531,22 @@ inline bool adaptiveAppearance(const SourceRegion&s,const Params&p,int x,int y,V
+     if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+     float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+ }
+-inline float iris26615SpatialBaseAt(const Params&p,float x,float y){
+-    if(!p.motionHdrHandoff||p.spatialBaseW<=0||p.spatialBaseH<=0||
+-       p.spatialBase.size()!=(size_t)p.spatialBaseW*p.spatialBaseH)return 0.f;
+-    float gx=clampf(((x+0.5f)/(float)std::max(p.trueW,1))*(float)p.spatialBaseW-0.5f,
+-                    0.f,(float)(p.spatialBaseW-1));
+-    float gy=clampf(((y+0.5f)/(float)std::max(p.trueH,1))*(float)p.spatialBaseH-0.5f,
+-                    0.f,(float)(p.spatialBaseH-1));
+-    int x0=(int)floorf(gx),y0=(int)floorf(gy),x1=std::min(x0+1,p.spatialBaseW-1),y1=std::min(y0+1,p.spatialBaseH-1);
+-    float fx=gx-x0,fy=gy-y0;
+-    auto at=[&](int xx,int yy){float v=p.spatialBase[(size_t)yy*p.spatialBaseW+xx];return std::isfinite(v)?std::max(v,0.f):0.f;};
+-    float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;
+-    return std::max(a+(b-a)*fy,0.f);
+-}
+-inline float iris26615SpatialGain(float base,float target){
+-    target=std::max(target,1.0e-6f);if(target<=1.f)return target;
+-    float b=clampf(std::max(base,0.f),0.f,1.f);return target/(1.f+(target-1.f)*b);
+-}
+-struct PresentedSample { Vec3 rgb; float physicalGuide=0.f; };
+-
+ inline Vec3 tone(Vec3 rgb,const Params&p){
+-    /* IRIS_26615_TRUE2X_MANUAL_POST_SPATIAL_PRESENTATION
+-     * Motion automatic brightness is already spatially allocated. Night never used the old Motion
+-     * virtualGain branch because motionHdrHandoff is false, so its behavior remains unchanged. */
+-    rgb=mul(clampNonnegative(rgb),std::exp2(p.exposureEv));
++    const bool manualActive=std::fabs(p.exposureEv)>=0.0001f||std::fabs(p.shadows)>=0.0001f||std::fabs(p.contrast)>=0.0001f;
++    const float virtualGain=p.motionHdrHandoff&&manualActive?std::max(p.displayGain,1.0e-6f):1.f;
++    rgb=mul(clampNonnegative(rgb),virtualGain*std::exp2(p.exposureEv));
+     if(std::fabs(p.shadows)>=0.0001f){float y=luma(rgb),mask=1.f-smoothstep(0.08f,0.55f,y),target=y;if(p.shadows<0.f)target=y+(-p.shadows)*0.08f*mask*(1.f-clampf(y,0.f,1.f));else target=y*(1.f-0.75f*p.shadows*mask);rgb=y<=1.0e-7f?Vec3{std::max(target,0.f),std::max(target,0.f),std::max(target,0.f)}:mul(clampNonnegative(rgb),std::max(target,0.f)/y);}
+     if(std::fabs(p.contrast)>=0.0001f){float y=luma(rgb);if(y>1.0e-7f){const float pivot=0.18f;float slope=1.f+0.25f*p.contrast;float target=pivot*std::exp2(std::log2(std::max(y/pivot,1.0e-6f))*slope);rgb=mul(clampNonnegative(rgb),std::max(target,0.f)/y);}}
++    if(virtualGain!=1.f)rgb=mul(rgb,1.f/virtualGain);
+     return clampNonnegative(rgb);
+ }
+-inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,PresentedSample*out){
+-    Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c)||!out)return false;
+-    float physicalGuide=std::max(peak(c),luma(c));
+-    if(p.motionHdrHandoff)c=mul(c,iris26615SpatialGain(iris26615SpatialBaseAt(p,(float)x,(float)y),p.displayGain));
+-    else c=mul(c,std::max(p.displayGain,1.0e-6f));
+-    out->rgb=tone(c,p);out->physicalGuide=std::max(physicalGuide,0.f);return true;
+-}
+-inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,PresentedSample*out){
+-    if(!out)return false;x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
++inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,Vec3*out){
++    x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAt(s,p,ix,iy,out);}
+-    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,p.trueW-1),y1=std::min(y0+1,p.trueH-1);float fx=x-x0,fy=y-y0;PresentedSample a,b,c,d;
++    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,p.trueW-1),y1=std::min(y0+1,p.trueH-1);float fx=x-x0,fy=y-y0;Vec3 a,b,c,d;
+     if(!preRenderAt(s,p,x0,y0,&a)||!preRenderAt(s,p,x1,y0,&b)||!preRenderAt(s,p,x0,y1,&c)||!preRenderAt(s,p,x1,y1,&d))return false;
+-    out->rgb=mix3(mix3(a.rgb,b.rgb,fx),mix3(c.rgb,d.rgb,fx),fy);
+-    out->physicalGuide=(a.physicalGuide+(b.physicalGuide-a.physicalGuide)*fx)*(1.f-fy)+(c.physicalGuide+(d.physicalGuide-c.physicalGuide)*fx)*fy;
+-    return true;
++    *out=mix3(mix3(a,b,fx),mix3(c,d,fx),fy);return true;
+ }
+ /* IRIS_26569_TRUE2X_PROFILE_CACHE
+  * Motion true2x repeatedly queried center + four neighbors through identical sensor->profile->P3
+@@ -614,27 +585,32 @@ inline bool adaptiveAppearanceCached(const ProfileRegion&s,const Params&p,int x,
+     if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+     float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+ }
+-inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,PresentedSample*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c)||!out)return false;float physicalGuide=std::max(peak(c),luma(c));if(p.motionHdrHandoff)c=mul(c,iris26615SpatialGain(iris26615SpatialBaseAt(p,(float)x,(float)y),p.displayGain));else c=mul(c,std::max(p.displayGain,1.0e-6f));out->rgb=tone(c,p);out->physicalGuide=std::max(physicalGuide,0.f);return true;}
+-inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,float y,PresentedSample*out){
+-    if(!out)return false;x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
++inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,float y,Vec3*out){
++    x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAtCached(s,p,ix,iy,out);}
+-    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,p.trueW-1),y1=std::min(y0+1,p.trueH-1);float fx=x-x0,fy=y-y0;PresentedSample a,b,c,d;
++    int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,p.trueW-1),y1=std::min(y0+1,p.trueH-1);float fx=x-x0,fy=y-y0;Vec3 a,b,c,d;
+     if(!preRenderAtCached(s,p,x0,y0,&a)||!preRenderAtCached(s,p,x1,y0,&b)||!preRenderAtCached(s,p,x0,y1,&c)||!preRenderAtCached(s,p,x1,y1,&d))return false;
+-    out->rgb=mix3(mix3(a.rgb,b.rgb,fx),mix3(c.rgb,d.rgb,fx),fy);
+-    out->physicalGuide=(a.physicalGuide+(b.physicalGuide-a.physicalGuide)*fx)*(1.f-fy)+(c.physicalGuide+(d.physicalGuide-c.physicalGuide)*fx)*fy;return true;
++    *out=mix3(mix3(a,b,fx),mix3(c,d,fx),fy);return true;
+ }
+ 
+-inline float iris26615ProjectCanonicalSdrGuide(float canonicalGuide){
+-    float x=std::max(canonicalGuide,0.f);constexpr float whiteAnchor=0.95f;
+-    if(x<=1.f)return whiteAnchor*x;float reserve=1.f-whiteAnchor;
++inline float iris26614MapMotionSdrFinalGuide(float sourceGuide,float displayGain){
++    constexpr float scale=0.80f;
++    float x=std::max(sourceGuide,0.f);
++    float requestedFinalGain=std::max(displayGain,1.0e-6f)*scale;
++    float whiteAnchor=std::min(0.95f,requestedFinalGain);
++    float bodyGain=requestedFinalGain;
++    if(requestedFinalGain>whiteAnchor)bodyGain=std::min(requestedFinalGain,4.f*whiteAnchor-1.0e-4f);
++    if(x<=1.f){float oneMinus=1.f-x;return whiteAnchor*x+(bodyGain-whiteAnchor)*x*oneMinus*oneMinus;}
++    float reserve=1.f-whiteAnchor;if(reserve<=1.0e-6f)return whiteAnchor;
+     float tailScale=reserve/std::max(whiteAnchor,1.0e-6f),excess=x-1.f;
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+ }
+ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p){
+     rgb=clampNonnegative(rgb);float y=std::max(luma(rgb),0.f),pk=peak(rgb),guide=std::max(y,pk);
+-    /* IRIS_26615_TRUE2X_CPU_FIXED_SDR_PROJECTION */
++    /* IRIS_26604_SINGLE_TONE_OWNER_TRUE2X_CPU */
+     if(p.motionHdrHandoff){
+-        float mappedFinal=iris26615ProjectCanonicalSdrGuide(guide);
++        float mappedFinal=iris26614MapMotionSdrFinalGuide(guide,p.displayGain);
+         if(guide>1.0e-7f)rgb=mul(rgb,mappedFinal/guide);
+     }else{
+         const float start=0.50f;
+@@ -691,14 +667,14 @@ inline bool watermarkUv(const Params&p,const Watermark&w,int ox,int oy,float*u,f
+     crx*=tw/th;crx/=((float)w.w/(float)w.h);crx*=1.025f;crx*=15.f;cry=(cry+1.f/15.f)*15.f;if(crx<0.f||cry<0.f)return false;*u=crx;*v=cry;return true;
+ }
+ inline bool renderBase(const SourceRegion&s,const Params&p,const Watermark&w,const SrgbLut&lut,int ox,int oy,float gainMax,float gainContentMax,uint8_t*out,uint8_t*gainOut){
+-    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);PresentedSample hdr;if(!samplePreRender(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr.rgb,p);
+-    if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f),contentMax=clampf(gainContentMax,1.f,safeMax);float ratio;if(p.motionHdrHandoff){ratio=clampf(std::max(hdr.physicalGuide,1.f),1.f,contentMax);}else{float hdrY=std::max(luma(clampNonnegative(hdr.rgb)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);ratio=clampf((hdrY+off)/(sdrY+off),1.f,contentMax);}float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
++    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);Vec3 hdr;if(!samplePreRender(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr,p);
++    if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f),contentMax=clampf(gainContentMax,1.f,safeMax);float ratio;if(p.motionHdrHandoff){Vec3 hp=clampNonnegative(hdr);float sourceGuide=std::max(peak(hp),luma(hp));ratio=clampf(std::max(sourceGuide,1.f),1.f,contentMax);}else{float hdrY=std::max(luma(clampNonnegative(hdr)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);ratio=clampf((hdrY+off)/(sdrY+off),1.f,contentMax);}float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
+     float rr=lut.at(sdr.r),gg=lut.at(sdr.g),bb=lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
+     out[0]=(uint8_t)std::lround(clampf(rr,0.f,1.f)*255.f);out[1]=(uint8_t)std::lround(clampf(gg,0.f,1.f)*255.f);out[2]=(uint8_t)std::lround(clampf(bb,0.f,1.f)*255.f);return true;
+ }
+ inline bool renderBaseCached(const ProfileRegion&s,const Params&p,const Watermark&w,const SrgbLut&lut,int ox,int oy,float gainMax,float gainContentMax,uint8_t*out,uint8_t*gainOut){
+-    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);PresentedSample hdr;if(!samplePreRenderCached(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr.rgb,p);
+-    if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f),contentMax=clampf(gainContentMax,1.f,safeMax);float ratio;if(p.motionHdrHandoff){ratio=clampf(std::max(hdr.physicalGuide,1.f),1.f,contentMax);}else{float hdrY=std::max(luma(clampNonnegative(hdr.rgb)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);ratio=clampf((hdrY+off)/(sdrY+off),1.f,contentMax);}float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
++    float sx,sy;outputToSource(p,ox,oy,&sx,&sy);Vec3 hdr;if(!samplePreRenderCached(s,p,sx,sy,&hdr))return false;Vec3 sdr=renderHeadroom(hdr,p);
++    if(gainOut){const float off=0.015625f,safeMax=std::max(gainMax,1.001f),contentMax=clampf(gainContentMax,1.f,safeMax);float ratio;if(p.motionHdrHandoff){Vec3 hp=clampNonnegative(hdr);float sourceGuide=std::max(peak(hp),luma(hp));ratio=clampf(std::max(sourceGuide,1.f),1.f,contentMax);}else{float hdrY=std::max(luma(clampNonnegative(hdr)),0.f),sdrY=std::max(luma(clampNonnegative(sdr)),0.f);ratio=clampf((hdrY+off)/(sdrY+off),1.f,contentMax);}float code=clampf(std::log2(ratio)/std::max(std::log2(safeMax),1.0e-6f),0.f,1.f);*gainOut=(uint8_t)std::lround(code*255.f);}
+     float rr=lut.at(sdr.r),gg=lut.at(sdr.g),bb=lut.at(sdr.b);float wu,wv;if(watermarkUv(p,w,ox,oy,&wu,&wv)){float a=sampleWatermarkAlpha(w,wu,wv);if(a>0.f){Vec3 wc=sampleWatermark(w,wu,wv);rr=rr+(wc.r-rr)*a;gg=gg+(wc.g-gg)*a;bb=bb+(wc.b-bb)*a;}}
+     out[0]=(uint8_t)std::lround(clampf(rr,0.f,1.f)*255.f);out[1]=(uint8_t)std::lround(clampf(gg,0.f,1.f)*255.f);out[2]=(uint8_t)std::lround(clampf(bb,0.f,1.f)*255.f);return true;
+ }
+@@ -779,13 +755,11 @@ precision highp usampler2D;
+ /* IRIS_26571_TRUE2X_PUBLICATION_COMPUTE */
+ layout(local_size_x=16,local_size_y=8,local_size_z=1) in;
+ layout(binding=0) uniform highp sampler2D uSource;
+-layout(binding=1) uniform highp sampler2D uSpatialBase;
+ layout(rgba8ui,binding=0) writeonly uniform highp uimage2D uOutput;
+ layout(std430,binding=1) readonly buffer IrisGammaLut { float gammaLut[]; };
+ 
+ uniform ivec2 uSrcOrigin;
+ uniform ivec2 uSrcSize;
+-uniform ivec2 uSpatialBaseSize;
+ uniform ivec2 uTrueSize;
+ uniform ivec2 uOutputSize;
+ uniform ivec2 uRawSize;
+@@ -870,28 +844,10 @@ vec3 irisAdaptive(ivec2 p){
+     float g=clamp(min(requested,limitV),1.0,1.22);
+     return g<=1.000001?center:vec3(cy)+cc*g;
+ }
+-float iris26615SpatialBaseAt(vec2 p){
+-    vec2 fullSize=max(vec2(uTrueSize),vec2(1.0));
+-    vec2 baseSize=max(vec2(uSpatialBaseSize),vec2(1.0));
+-    vec2 g=clamp(((p+vec2(0.5))/fullSize)*baseSize-vec2(0.5),vec2(0.0),baseSize-vec2(1.0));
+-    ivec2 p0=ivec2(floor(g));
+-    ivec2 p1=min(p0+ivec2(1),uSpatialBaseSize-ivec2(1));
+-    vec2 f=g-vec2(p0);
+-    float a=max(texelFetch(uSpatialBase,p0,0).r,0.0);
+-    float b=max(texelFetch(uSpatialBase,ivec2(p1.x,p0.y),0).r,0.0);
+-    float c=max(texelFetch(uSpatialBase,ivec2(p0.x,p1.y),0).r,0.0);
+-    float d=max(texelFetch(uSpatialBase,p1,0).r,0.0);
+-    return max(mix(mix(a,b,f.x),mix(c,d,f.x),f.y),0.0);
+-}
+-float iris26615SpatialGain(float base,float target){
+-    target=max(target,1.0e-6);
+-    if(target<=1.0)return target;
+-    float b=clamp(max(base,0.0),0.0,1.0);
+-    return target/(1.0+(target-1.0)*b);
+-}
+ vec3 irisTone(vec3 rgb){
+-    /* IRIS_26615_TRUE2X_GPU_MANUAL_POST_SPATIAL_PRESENTATION */
+-    rgb=irisClampNonnegative(rgb)*exp2(uExposureEv);
++    bool manualActive=abs(uExposureEv)>=0.0001||abs(uShadows)>=0.0001||abs(uContrast)>=0.0001;
++    float virtualGain=uMotionHdrHandoff!=0&&manualActive?max(uDisplayGain,1.0e-6):1.0;
++    rgb=irisClampNonnegative(rgb)*virtualGain*exp2(uExposureEv);
+     if(abs(uShadows)>=0.0001){
+         float y=irisLuma(rgb),mask=1.0-smoothstep(0.08,0.55,y),target=y;
+         if(uShadows<0.0)target=y+(-uShadows)*0.08*mask*(1.0-clamp(y,0.0,1.0));
+@@ -907,22 +863,17 @@ vec3 irisTone(vec3 rgb){
+             rgb=irisClampNonnegative(rgb)*(max(target,0.0)/y);
+         }
+     }
++    if(virtualGain!=1.0)rgb/=virtualGain;
+     return irisClampNonnegative(rgb);
+ }
+-vec4 irisPreRenderAt(ivec2 p){
+-    vec3 c=irisAdaptive(p);
+-    float physicalGuide=max(irisPeak(c),irisLuma(c));
+-    if(uMotionHdrHandoff!=0)c*=iris26615SpatialGain(iris26615SpatialBaseAt(vec2(p)),uDisplayGain);
+-    else c*=max(uDisplayGain,1.0e-6);
+-    return vec4(irisTone(c),max(physicalGuide,0.0));
+-}
+-vec4 irisSamplePreRender(vec2 p){
++vec3 irisPreRenderAt(ivec2 p){vec3 c=irisAdaptive(p);if(uMotionHdrHandoff==0)c*=max(uDisplayGain,1.0e-6);return irisTone(c);}
++vec3 irisSamplePreRender(vec2 p){
+     p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
+     if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
+     ivec2 p0=ivec2(floor(p)),p1=min(p0+ivec2(1),uTrueSize-ivec2(1));
+     vec2 f=p-vec2(p0);
+-    vec4 a=irisPreRenderAt(p0),b=irisPreRenderAt(ivec2(p1.x,p0.y));
+-    vec4 c=irisPreRenderAt(ivec2(p0.x,p1.y)),d=irisPreRenderAt(p1);
++    vec3 a=irisPreRenderAt(p0),b=irisPreRenderAt(ivec2(p1.x,p0.y));
++    vec3 c=irisPreRenderAt(ivec2(p0.x,p1.y)),d=irisPreRenderAt(p1);
+     return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
+ }
+ vec2 irisOutputToSource(ivec2 op){
+@@ -941,20 +892,24 @@ vec2 irisOutputToSource(ivec2 op){
+     float sx=cx+(ux-cx)/uResidualZoom,sy=cy+(uy-cy)/uResidualZoom;
+     return clamp(2.0*(vec2(sx,sy)+vec2(0.5))-vec2(0.5),vec2(0.0),vec2(uTrueSize-ivec2(1)));
+ }
+-float iris26615ProjectCanonicalSdrGuide(float canonicalGuide){
+-    const float whiteAnchor=0.95;
+-    float x=max(canonicalGuide,0.0);
+-    if(x<=1.0)return whiteAnchor*x;
+-    float reserve=1.0-whiteAnchor;
++float iris26614MapMotionSdrFinalGuide(float sourceGuide){
++    const float scale=0.80;
++    float x=max(sourceGuide,0.0);
++    float requestedFinalGain=max(uDisplayGain,1.0e-6)*scale;
++    float whiteAnchor=min(0.95,requestedFinalGain);
++    float bodyGain=requestedFinalGain;
++    if(requestedFinalGain>whiteAnchor)bodyGain=min(requestedFinalGain,4.0*whiteAnchor-1.0e-4);
++    if(x<=1.0){float oneMinus=1.0-x;return whiteAnchor*x+(bodyGain-whiteAnchor)*x*oneMinus*oneMinus;}
++    float reserve=1.0-whiteAnchor;if(reserve<=1.0e-6)return whiteAnchor;
+     float tailScale=reserve/max(whiteAnchor,1.0e-6),excess=x-1.0;
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+ }
+ vec3 irisHeadroom(vec3 rgb){
+     rgb=irisClampNonnegative(rgb);
+     float y=max(irisLuma(rgb),0.0),pk=irisPeak(rgb),guide=max(y,pk);
+-    /* IRIS_26615_TRUE2X_GPU_PROJECTION_ONLY */
++    /* IRIS_26604_SINGLE_TONE_OWNER_TRUE2X_GPU */
+     if(uMotionHdrHandoff!=0){
+-        float mappedFinal=iris26615ProjectCanonicalSdrGuide(guide);
++        float mappedFinal=iris26614MapMotionSdrFinalGuide(guide);
+         if(guide>1.0e-7)rgb*=mappedFinal/guide;
+     }else{
+         float start=0.50;
+@@ -973,8 +928,7 @@ void main(){
+     ivec2 local=ivec2(gl_GlobalInvocationID.xy);
+     if(local.x>=uOutputSize.x||local.y>=uBandH)return;
+     ivec2 op=ivec2(local.x,uBandTop+local.y);
+-    vec4 hdrSample=irisSamplePreRender(irisOutputToSource(op));
+-    vec3 hdr=hdrSample.rgb;
++    vec3 hdr=irisSamplePreRender(irisOutputToSource(op));
+     vec3 sdr=irisHeadroom(hdr);
+     uint gainCode=0u;
+     if(uGenerateGain!=0){
+@@ -982,7 +936,9 @@ void main(){
+         float contentMax=clamp(uGainContentMax,1.0,safeMax);
+         float ratio;
+         if(uMotionHdrHandoff!=0){
+-            ratio=clamp(max(hdrSample.a,1.0),1.0,contentMax);
++            vec3 hp=irisClampNonnegative(hdr);
++            float sourceGuide=max(irisPeak(hp),irisLuma(hp));
++            ratio=clamp(max(sourceGuide,1.0),1.0,contentMax);
+         }else{
+             float hdrY=max(irisLuma(irisClampNonnegative(hdr)),0.0);
+             float sdrY=max(irisLuma(irisClampNonnegative(sdr)),0.0);
+@@ -1023,25 +979,17 @@ public:
+         if(maxTex<std::max(outWidth,std::max(p.trueW,p.trueH))){set(reason,"GL_MAX_TEXTURE_SIZE");return false;}
+         std::string compileError;program=iris26571Program(&compileError);if(!program){set(reason,("compute:"+compileError).c_str());return false;}
+         glGenTextures(1,&sourceTex);glBindTexture(GL_TEXTURE_2D,sourceTex);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+-        /* IRIS_26615_TRUE2X_SHARED_SPATIAL_BASE_GPU
+-         * Small presentation metadata only. RGBA32F is a proven sampled carrier here; manual
+-         * bilinear texelFetch avoids requiring float linear-filter extensions. */
+-        std::vector<float> spatialUpload;int spatialW=1,spatialH=1;
+-        if(p.motionHdrHandoff){spatialW=p.spatialBaseW;spatialH=p.spatialBaseH;spatialUpload.resize((size_t)spatialW*spatialH*4);for(size_t i=0;i<p.spatialBase.size();i++){float v=std::max(p.spatialBase[i],0.f);spatialUpload[i*4]=v;spatialUpload[i*4+1]=v;spatialUpload[i*4+2]=v;spatialUpload[i*4+3]=1.f;}}
+-        else spatialUpload={0.f,0.f,0.f,1.f};
+-        glActiveTexture(GL_TEXTURE1);glGenTextures(1,&spatialBaseTex);glBindTexture(GL_TEXTURE_2D,spatialBaseTex);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA32F,spatialW,spatialH,0,GL_RGBA,GL_FLOAT,spatialUpload.data());
+-        glActiveTexture(GL_TEXTURE0);
+         glGenTextures(1,&outputTex);glBindTexture(GL_TEXTURE_2D,outputTex);glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8UI,outWidth,maxBandRows);
+         glGenFramebuffers(1,&fbo);glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,outputTex,0);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){set(reason,"RGBA8UI framebuffer");return false;}
+         glGenBuffers(1,&lutSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,lutSsbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(lut.v.size()*sizeof(float)),lut.v.data(),GL_STATIC_DRAW);
+         const size_t maxBytes=(size_t)outWidth*maxBandRows*4;glGenBuffers(2,pbo);for(int i=0;i<2;i++){glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[i]);glBufferData(GL_PIXEL_PACK_BUFFER,(GLsizeiptr)maxBytes,nullptr,GL_STREAM_READ);}
+         glBindBuffer(GL_PIXEL_PACK_BUFFER,0);GLenum err=glGetError();if(err!=GL_NO_ERROR){set(reason,"GL allocation");return false;}
+-        glUseProgram(program);glUniform1i(loc("uSource"),0);glUniform1i(loc("uSpatialBase"),1);setParams();return true;
++        glUseProgram(program);glUniform1i(loc("uSource"),0);setParams();return true;
+     }
+     bool renderReadback(int fd,float gainMax,float gainContentMax,bool generateGain,int top,int h,int slot,Iris26571ReadyBand*out,Iris26571GpuTiming*timing,std::string*reason){
+         if(!params||slot<0||slot>1){set(reason,"render_invalid_state");return false;}
+         SourceRegion src;auto rs=std::chrono::steady_clock::now();if(!readRegion(fd,*params,0,top,outWidth-1,top+h-1,&src)){set(reason,"readRegion");return false;}auto re=std::chrono::steady_clock::now();if(timing)timing->sourceReadNs+=iris26569Ns(rs,re);
+-        auto us=std::chrono::steady_clock::now();glPixelStorei(GL_UNPACK_ALIGNMENT,1);glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,spatialBaseTex);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,sourceTex);
++        auto us=std::chrono::steady_clock::now();glPixelStorei(GL_UNPACK_ALIGNMENT,1);glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,sourceTex);
+         if(src.w>sourceAllocW||src.h>sourceAllocH){sourceAllocW=std::max(sourceAllocW,src.w);sourceAllocH=std::max(sourceAllocH,src.h);glTexImage2D(GL_TEXTURE_2D,0,GL_RGB16F,sourceAllocW,sourceAllocH,0,GL_RGB,GL_HALF_FLOAT,nullptr);}
+         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,src.w,src.h,GL_RGB,GL_HALF_FLOAT,src.rgb.data());
+         glUseProgram(program);glUniform2i(loc("uSrcOrigin"),src.x0,src.y0);glUniform2i(loc("uSrcSize"),src.w,src.h);glUniform1i(loc("uBandTop"),top);glUniform1i(loc("uBandH"),h);glUniform1i(loc("uGenerateGain"),generateGain?1:0);glUniform1f(loc("uGainMax"),gainMax);glUniform1f(loc("uGainContentMax"),gainContentMax);
+@@ -1062,20 +1010,20 @@ public:
+     }
+ private:
+     EGLDisplay display=EGL_NO_DISPLAY;EGLConfig config=nullptr;EGLSurface surface=EGL_NO_SURFACE;EGLContext context=EGL_NO_CONTEXT;
+-    GLuint program=0,sourceTex=0,spatialBaseTex=0,outputTex=0,fbo=0,lutSsbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
++    GLuint program=0,sourceTex=0,outputTex=0,fbo=0,lutSsbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
+     GLint loc(const char*n){return glGetUniformLocation(program,n);}
+     static void set(std::string*r,const char*m){if(r)*r=m?m:"unknown";}
+     static void setGl(std::string*r,const char*stage,GLenum err){if(!r)return;char b[96];std::snprintf(b,sizeof(b),"%s_gl_error_0x%04x",stage?stage:"gl",(unsigned int)err);*r=b;}
+     void setParams(){
+-        glUseProgram(program);glUniform2i(loc("uSpatialBaseSize"),params->motionHdrHandoff?params->spatialBaseW:1,params->motionHdrHandoff?params->spatialBaseH:1);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);
++        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);
+         glUniform3f(loc("uSensorRow0"),params->sensorToProfile[0],params->sensorToProfile[1],params->sensorToProfile[2]);glUniform3f(loc("uSensorRow1"),params->sensorToProfile[3],params->sensorToProfile[4],params->sensorToProfile[5]);glUniform3f(loc("uSensorRow2"),params->sensorToProfile[6],params->sensorToProfile[7],params->sensorToProfile[8]);
+         glUniform3f(loc("uDisplayRow0"),params->profileToDisplay[0],params->profileToDisplay[1],params->profileToDisplay[2]);glUniform3f(loc("uDisplayRow1"),params->profileToDisplay[3],params->profileToDisplay[4],params->profileToDisplay[5]);glUniform3f(loc("uDisplayRow2"),params->profileToDisplay[6],params->profileToDisplay[7],params->profileToDisplay[8]);
+     }
+     void destroy(){
+         if(display!=EGL_NO_DISPLAY&&context!=EGL_NO_CONTEXT&&surface!=EGL_NO_SURFACE)eglMakeCurrent(display,surface,surface,context);
+-        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(spatialBaseTex)glDeleteTextures(1,&spatialBaseTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
++        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
+         if(display!=EGL_NO_DISPLAY){eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(context!=EGL_NO_CONTEXT)eglDestroyContext(display,context);if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);eglTerminate(display);}
+-        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=spatialBaseTex=outputTex=fbo=lutSsbo=0;pbo[0]=pbo[1]=0;
++        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=outputTex=fbo=lutSsbo=0;pbo[0]=pbo[1]=0;
+     }
+ };
+ 
+@@ -1155,19 +1103,12 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_particlesdevs_photoncamera_process
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative(
+         JNIEnv*e,jclass,jobject bitmap,jstring renderPath,jint trueW,jint trueH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,
+-        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloatArray spatialAppearanceBase,jint spatialBaseWidth,jint spatialBaseHeight,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat sceneWhite,jboolean motionHdrHandoff,
++        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat sceneWhite,jboolean motionHdrHandoff,
+         jobject watermarkBitmap,
+         jfloatArray jinResidual,jintArray jinReference,jint jinW,jint jinH,jstring gainPath,jfloat gainMaxRatio,jfloat gainContentMaxRatio,jstring path,jint quality){
+     using namespace iris26564render;gIris26576PublicationTelemetry="backend=UNSET callStarted=true";AndroidBitmapInfo info{};if(!bitmap||!renderPath||!path||trueW<=0||trueH<=0||rawW<=0||rawH<=0||cropW<=0||cropH<=0||trueW!=rawW*2||trueH!=rawH*2||cropW>rawW||cropH>rawH||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888){iris26576SetPublicationTelemetry("backend=NONE validationFailed=true");return JNI_FALSE;}
+     int expectedNativeW=(rotation==90||rotation==270)?cropH:rawW,expectedNativeH=(rotation==90||rotation==270)?rawW:cropH;if((int)info.width!=expectedNativeW||(int)info.height!=expectedNativeH)return JNI_FALSE;
+     Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
+-    if(p.motionHdrHandoff){
+-        if(!spatialAppearanceBase||spatialBaseWidth<=0||spatialBaseHeight<=0||
+-           (jlong)spatialBaseWidth*(jlong)spatialBaseHeight!=(jlong)e->GetArrayLength(spatialAppearanceBase))return JNI_FALSE;
+-        p.spatialBaseW=spatialBaseWidth;p.spatialBaseH=spatialBaseHeight;p.spatialBase.resize((size_t)spatialBaseWidth*spatialBaseHeight);
+-        e->GetFloatArrayRegion(spatialAppearanceBase,0,(jsize)p.spatialBase.size(),p.spatialBase.data());if(e->ExceptionCheck())return JNI_FALSE;
+-        for(float v:p.spatialBase)if(!std::isfinite(v)||v<0.f)return JNI_FALSE;
+-    }else if(spatialAppearanceBase||spatialBaseWidth!=0||spatialBaseHeight!=0)return JNI_FALSE;
+     if(!sensorToProfile||!profileToDisplay||e->GetArrayLength(sensorToProfile)!=9||e->GetArrayLength(profileToDisplay)!=9)return JNI_FALSE;e->GetFloatArrayRegion(sensorToProfile,0,9,p.sensorToProfile);e->GetFloatArrayRegion(profileToDisplay,0,9,p.profileToDisplay);if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.sensorToProfile)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.profileToDisplay)if(!std::isfinite(v))return JNI_FALSE;if(!std::isfinite(p.displayGain)||p.displayGain<=0.f||!std::isfinite(p.exposureEv)||!std::isfinite(p.shadows)||!std::isfinite(p.contrast)||!std::isfinite(p.residualZoom)||!std::isfinite(p.sceneWhite)||p.sceneWhite<=0.f)return JNI_FALSE;
+     U rp(e,renderPath),gp(e,gainPath),op(e,path);if(!rp.c||!op.c)return JNI_FALSE;const bool generateGain=gp.c!=nullptr;if(generateGain&&(!std::isfinite((float)gainMaxRatio)||gainMaxRatio<=1.f||!std::isfinite((float)gainContentMaxRatio)||gainContentMaxRatio<1.f))return JNI_FALSE;const float gainContentMax=generateGain?clampf((float)gainContentMaxRatio,1.f,(float)gainMaxRatio):1.f;int sourceFd=open(rp.c,O_RDONLY);if(sourceFd<0)return JNI_FALSE;struct stat st{};uint64_t expected=(uint64_t)trueW*(uint64_t)trueH*6ull;if(fstat(sourceFd,&st)!=0||(uint64_t)st.st_size!=expected){close(sourceFd);return JNI_FALSE;}
+     Watermark water{};if(watermarkBitmap){AndroidBitmapInfo wi{};if(AndroidBitmap_getInfo(e,watermarkBitmap,&wi)!=ANDROID_BITMAP_RESULT_SUCCESS||wi.format!=ANDROID_BITMAP_FORMAT_RGBA_8888||wi.width==0||wi.height==0){close(sourceFd);return JNI_FALSE;}void*wp=nullptr;if(AndroidBitmap_lockPixels(e,watermarkBitmap,&wp)!=ANDROID_BITMAP_RESULT_SUCCESS||!wp){close(sourceFd);return JNI_FALSE;}water.w=(int)wi.width;water.h=(int)wi.height;water.rgba.resize((size_t)water.w*water.h*4);for(int y=0;y<water.h;y++)std::memcpy(water.rgba.data()+(size_t)y*water.w*4,(const uint8_t*)wp+(size_t)y*wi.stride,(size_t)water.w*4);AndroidBitmap_unlockPixels(e,watermarkBitmap);}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java
+index c76fbbd6c522edf4eda5c94588dee38a8f9cdd59..f1220a8eb54e513bc891271485e3ab34cda73856 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java
+@@ -33,14 +33,14 @@ public final class IrisMotionToneControls extends Node {
+         glProg.setVar("exposureEv", exposureEv);
+         glProg.setVar("shadowsControl", shadows);
+         glProg.setVar("contrastControl", contrast);
++        glProg.setVar("brightnessTargetGain", basePipeline.mParameters.motionV2DisplayGain);
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
+         Log.d(Name, "IRIS_26514_PRESENTATION exposureEv=" + exposureEv
+                 + " shadows=" + shadows + " contrast=" + contrast
+-                + " automaticSpatialAppearanceAlreadyApplied=true"
+-                + " duplicateBrightnessTargetGain=false"
+-                + " physicalHdrGuideAlphaPreserved=true"
++                + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
++                + " virtualPresentedDomain=true imageMultiplier=false"
+                 + " beforeMotionRender=true sdrUhDrCommonSource=true");
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+index 2298310314bc7b78c8443475853e6e7a0c9b6202..cf609e0b2b09ba1fe9c89e37a2093b4f1e9604e0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2DisplayExposure.java
+@@ -1,117 +1,22 @@
+ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+ 
+-import android.graphics.Point;
+-import android.opengl.GLES30;
+-
+-import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+-import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+-import java.nio.ByteBuffer;
+-import java.nio.ByteOrder;
+-import java.nio.FloatBuffer;
+-import java.util.Arrays;
+-
+-import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+-import static android.opengl.GLES20.GL_LINEAR;
+-
+ /**
+- * IRIS_26615_IRIS_OWNED_SPATIAL_APPEARANCE_OWNER
+- *
+- * Motion's viewfinder solve remains a desired global brightness target, but it is no longer an
+- * unconstrained whole-frame multiplier. A tiny normalized luminance field allocates that target
+- * spatially and a single scalar is applied to RGB at each pixel. This preserves the local
+- * structural luminance residual already present in the healthy post-VGN master while preventing
+- * broad bright illumination from receiving the same lift as darker broad regions.
+- *
+- * Night intentionally retains the exact proven 26516 scalar implementation below.
++ * IRIS_26604_TONE_TARGET_ONLY_PRESENTATION_OWNER
++ * Motion keeps the solved viewfinder response only as a target consumed by the single final
++ * tone owner. It must never multiply the common HDR source texture. Night intentionally retains
++ * its proven 26516 scalar path. This removes the 26603 RGB*displayGain -> late-shoulder split that
++ * flattened clouds/curtains while preserving the same requested body brightness target.
+  */
+ public final class MotionV2DisplayExposure extends Node {
+-    public static final int IRIS_26615_SPATIAL_BASE_SHORT_EDGE = 96;
+-
+-    private static final String IRIS_26615_SPATIAL_BASE_SHADER =
+-            "precision highp float;\n" +
+-            "precision mediump sampler2D;\n" +
+-            "uniform sampler2D InputBuffer;\n" +
+-            "uniform vec2 sourceSize;\n" +
+-            "uniform vec2 baseSize;\n" +
+-            "out vec4 Output;\n" +
+-            "\n" +
+-            "/* IRIS_26615_IRIS_OWNED_SPATIAL_ILLUMINATION_BASE\n" +
+-            " * Low-frequency luminance only. The 9x9 normalized lattice is independent of output resolution,\n" +
+-            " * contains no semantic object labels, and cannot alter reconstruction/color evidence. The tiny\n" +
+-            " * base texture is the sole automatic brightness-allocation guide for 1x and true-2x publication.\n" +
+-            " */\n" +
+-            "float irisLuma(vec3 c){return dot(max(c,vec3(0.0)),vec3(0.22897456,0.69173852,0.07928691));}\n" +
+-            "void main(){\n" +
+-            "    vec2 centerPx=gl_FragCoord.xy*sourceSize/baseSize-vec2(0.5);\n" +
+-            "    vec2 cellPx=sourceSize/baseSize;\n" +
+-            "    float sum=0.0;\n" +
+-            "    float weightSum=0.0;\n" +
+-            "    for(int j=-4;j<=4;j++){\n" +
+-            "        float wy=5.0-abs(float(j));\n" +
+-            "        for(int i=-4;i<=4;i++){\n" +
+-            "            float wx=5.0-abs(float(i));\n" +
+-            "            float w=wx*wy;\n" +
+-            "            vec2 px=centerPx+vec2(float(i),float(j))*cellPx;\n" +
+-            "            vec2 uv=clamp((px+vec2(0.5))/sourceSize,vec2(0.0),vec2(1.0));\n" +
+-            "            sum+=irisLuma(texture(InputBuffer,uv).rgb)*w;\n" +
+-            "            weightSum+=w;\n" +
+-            "        }\n" +
+-            "    }\n" +
+-            "    float base=max(sum/max(weightSum,1.0e-6),0.0);\n" +
+-            "    Output=vec4(base,base,base,1.0);\n" +
+-            "}\n";
+-
+-    private static final String IRIS_26615_SPATIAL_APPLY_SHADER =
+-            "precision highp float;\n" +
+-            "precision mediump sampler2D;\n" +
+-            "uniform sampler2D InputBuffer;\n" +
+-            "uniform sampler2D IlluminationBase;\n" +
+-            "uniform vec2 sourceSize;\n" +
+-            "uniform float brightnessTargetGain;\n" +
+-            "out vec4 Output;\n" +
+-            "\n" +
+-            "/* IRIS_26615_SHARED_CANONICAL_SPATIAL_APPEARANCE\n" +
+-            " * The solver's global target is a constraint, not a pixel multiplier. Lift is allocated only by\n" +
+-            " * the low-frequency luminance field. A single scalar is applied to RGB, preserving hue and the\n" +
+-            " * local structural residual already present in the healthy post-VGN master. Alpha carries the\n" +
+-            " * immutable pre-spatial physical max-RGB/luminance guide for UHDR headroom provenance.\n" +
+-            " */\n" +
+-            "float irisLuma(vec3 c){return dot(max(c,vec3(0.0)),vec3(0.22897456,0.69173852,0.07928691));}\n" +
+-            "float irisPeak(vec3 c){return max(c.r,max(c.g,c.b));}\n" +
+-            "float irisSpatialGain(float base,float target){\n" +
+-            "    target=max(target,1.0e-6);\n" +
+-            "    if(target<=1.0)return target;\n" +
+-            "    float b=clamp(max(base,0.0),0.0,1.0);\n" +
+-            "    return target/(1.0+(target-1.0)*b);\n" +
+-            "}\n" +
+-            "void main(){\n" +
+-            "    ivec2 p=ivec2(gl_FragCoord.xy);\n" +
+-            "    vec4 src=texelFetch(InputBuffer,p,0);\n" +
+-            "    vec3 rgb=max(src.rgb,vec3(0.0));\n" +
+-            "    vec2 uv=gl_FragCoord.xy/sourceSize;\n" +
+-            "    float base=max(texture(IlluminationBase,clamp(uv,vec2(0.0),vec2(1.0))).r,0.0);\n" +
+-            "    float gain=irisSpatialGain(base,brightnessTargetGain);\n" +
+-            "    float physicalGuide=max(irisLuma(rgb),irisPeak(rgb));\n" +
+-            "    Output=vec4(rgb*gain,physicalGuide);\n" +
+-            "}\n";
+-
+     public MotionV2DisplayExposure() {
+         super("", "MotionV2DisplayExposure");
+     }
+ 
+     @Override public void Compile() {}
+ 
+-    private static Point iris26615BaseSize(Point source) {
+-        int shortEdge = Math.max(1, Math.min(source.x, source.y));
+-        float scale = Math.min(1.0f, IRIS_26615_SPATIAL_BASE_SHORT_EDGE / (float) shortEdge);
+-        return new Point(
+-                Math.max(1, Math.round(source.x * scale)),
+-                Math.max(1, Math.round(source.y * scale)));
+-    }
+-
+     @Override
+     public void Run() {
+         if (!(basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive)) {
+@@ -123,111 +28,16 @@ public final class MotionV2DisplayExposure extends Node {
+         }
+ 
+         if (basePipeline.mParameters.motionV2Active) {
+-            final GLTexture source = previousNode.WorkingTexture;
+-            if (source == null || source.mSize == null || source.mSize.x <= 0 || source.mSize.y <= 0) {
+-                throw new IllegalStateException("26615 spatial appearance missing source texture");
+-            }
+-            basePipeline.mParameters.motionV2SpatialAppearanceBaseGrid = null;
+-            basePipeline.mParameters.motionV2SpatialAppearanceBaseWidth = 0;
+-            basePipeline.mParameters.motionV2SpatialAppearanceBaseHeight = 0;
+-
+-            Point baseSize = iris26615BaseSize(source.mSize);
+-            GLTexture illuminationBase = null;
+-            try {
+-                illuminationBase = new GLTexture(
+-                        baseSize,
+-                        new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                        null,
+-                        GL_LINEAR,
+-                        GL_CLAMP_TO_EDGE);
+-
+-                glProg.useProgram(IRIS_26615_SPATIAL_BASE_SHADER);
+-                glProg.setTexture("InputBuffer", source);
+-                glProg.setVar("sourceSize", (float) source.mSize.x, (float) source.mSize.y);
+-                glProg.setVar("baseSize", (float) baseSize.x, (float) baseSize.y);
+-                glProg.drawBlocks(illuminationBase);
+-                glProg.closed = true;
+-
+-                /* Tiny readback only: this exact normalized illumination authority is reused by
+-                 * true-2x publication so SR ON/OFF cannot estimate a different tone field. */
+-                int[] oldFramebuffer = new int[1];
+-                GLES30.glGetIntegerv(GLES30.GL_FRAMEBUFFER_BINDING, oldFramebuffer, 0);
+-                illuminationBase.BufferLoad();
+-                ByteBuffer bytes;
+-                try {
+-                    bytes = illuminationBase.textureBuffer(
+-                            new GLFormat(GLFormat.DataType.FLOAT_32, 4), true);
+-                } finally {
+-                    GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, oldFramebuffer[0]);
+-                    /* GLTexture.close() historically frees buffered IDs as GL buffers rather than
+-                     * FBOs. 26615 does not inherit that leak: this new tiny readback FBO is released
+-                     * explicitly and marked unbuffered before texture close. */
+-                    if (illuminationBase.isBuffered && illuminationBase.mBuffer != 0) {
+-                        GLES30.glDeleteFramebuffers(1, new int[]{illuminationBase.mBuffer}, 0);
+-                        illuminationBase.mBuffer = 0;
+-                        illuminationBase.isBuffered = false;
+-                    }
+-                }
+-                bytes.order(ByteOrder.nativeOrder());
+-                FloatBuffer fb = bytes.asFloatBuffer();
+-                int count = baseSize.x * baseSize.y;
+-                float[] grid = new float[count];
+-                float min = Float.POSITIVE_INFINITY;
+-                float max = 0.0f;
+-                double sum = 0.0;
+-                for (int i = 0; i < count; i++) {
+-                    float v = fb.get(i * 4);
+-                    if (!Float.isFinite(v) || v < 0.0f) {
+-                        throw new IllegalStateException(
+-                                "26615 non-finite spatial base at " + i + ": " + v);
+-                    }
+-                    grid[i] = v;
+-                    min = Math.min(min, v);
+-                    max = Math.max(max, v);
+-                    sum += v;
+-                }
+-                float[] sorted = grid.clone();
+-                Arrays.sort(sorted);
+-                float p50 = sorted[sorted.length / 2];
+-                float p95 = sorted[Math.min(sorted.length - 1,
+-                        Math.round((sorted.length - 1) * 0.95f))];
+-                basePipeline.mParameters.motionV2SpatialAppearanceBaseGrid = grid;
+-                basePipeline.mParameters.motionV2SpatialAppearanceBaseWidth = baseSize.x;
+-                basePipeline.mParameters.motionV2SpatialAppearanceBaseHeight = baseSize.y;
+-
+-                glProg.useProgram(IRIS_26615_SPATIAL_APPLY_SHADER);
+-                glProg.setTexture("InputBuffer", source);
+-                glProg.setTexture("IlluminationBase", illuminationBase);
+-                glProg.setVar("sourceSize", (float) source.mSize.x, (float) source.mSize.y);
+-                glProg.setVar("brightnessTargetGain", displayGain);
+-                WorkingTexture = basePipeline.getMain();
+-                glProg.drawBlocks(WorkingTexture);
+-                glProg.closed = true;
+-
+-                Log.i(Name, "IRIS_26615_SPATIAL_APPEARANCE"
+-                        + " brightnessTargetGain=" + displayGain
+-                        + " globalImageMultiplier=false"
+-                        + " owner=LOW_FREQUENCY_LUMINANCE_ALLOCATION_PLUS_LOCAL_RESIDUAL"
+-                        + " base=" + baseSize.x + "x" + baseSize.y
+-                        + " baseShortEdge=" + IRIS_26615_SPATIAL_BASE_SHORT_EDGE
+-                        + " baseBytesApprox=" + (count * 8L)
+-                        + " baseMean=" + (count > 0 ? (float)(sum / count) : 0.0f)
+-                        + " baseMin=" + min + " baseP50=" + p50 + " baseP95=" + p95
+-                        + " baseMax=" + max
+-                        + " fullResolutionScratchAdded=false"
+-                        + " localResidualPreservedByScalar=true"
+-                        + " physicalHdrGuideCarrier=alphaPreSpatialMaxRgbLuma"
+-                        + " true2xBaseGridShared=true"
+-                        + " camera2Write=false");
+-                return;
+-            } finally {
+-                if (illuminationBase != null) {
+-                    try { illuminationBase.close(); } catch (Throwable ignored) {}
+-                }
+-            }
++            WorkingTexture = previousNode.WorkingTexture;
++            glProg.closed = true;
++            Log.d(Name, "IRIS_26604_VIEWFINDER_TONE_TARGET"
++                    + " brightnessTargetGain=" + displayGain
++                    + " imageMultiplier=false passThrough=true"
++                    + " canonicalToneOwner=MotionV2Render"
++                    + " superResSameTone=true camera2Write=false");
++            return;
+         }
+ 
+-        /* Exact successful Night behavior is intentionally inherited unchanged. */
+         if (Math.abs(displayGain - 1.0f) < 1.0e-5f) {
+             WorkingTexture = previousNode.WorkingTexture;
+             glProg.closed = true;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index d0e59d25e6668944b677804b6fe98eab55770cbb..28611650a88ad5dc878cdad4988bf65e25264700 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -104,34 +104,6 @@ public final class MotionV2Render extends Node {
+      * reserves the final 5% of SDR code space for genuine >1 extended HDR. The function is one
+      * fixed C1 monotonic source-domain map: no scene percentile, object class or moving knot. */
+     public static final float IRIS_26614_SDR_WHITE_ANCHOR = 0.95f;
+-    public static final float IRIS_26615_SDR_WHITE_ANCHOR = IRIS_26614_SDR_WHITE_ANCHOR;
+-
+-    /* IRIS_26615_SHARED_SPATIAL_APPEARANCE_MATH
+-     * One automatic brightness allocator for Motion 1x, solver prediction and true-2x publication.
+-     * Dark broad illumination approaches the requested target; already-bright broad illumination
+-     * approaches unity gain. Local structure rides on the same scalar and is therefore preserved.
+-     */
+-    static float iris26615SpatialAppearanceGain(float baseGuide, float brightnessTargetGain) {
+-        float target = Math.max(brightnessTargetGain, 1.0e-6f);
+-        if (target <= 1.0f) return target;
+-        float base = iris26582Clamp(Math.max(baseGuide, 0.0f), 0.0f, 1.0f);
+-        return target / (1.0f + (target - 1.0f) * base);
+-    }
+-
+-    /* Fixed SDR projection only. Automatic appearance has already been created upstream. Source
+-     * white receives the same 0.95 anchor as successful 26614; only genuine/appearance values >1
+-     * occupy the final 5% monotonically. No brightness target, histogram or spatial decision lives
+-     * in this projection.
+-     */
+-    static float iris26615ProjectCanonicalSdrGuide(float canonicalGuide) {
+-        float x = Math.max(canonicalGuide, 0.0f);
+-        float whiteAnchor = IRIS_26615_SDR_WHITE_ANCHOR;
+-        if (x <= 1.0f) return whiteAnchor * x;
+-        float reserve = 1.0f - whiteAnchor;
+-        float tailScale = reserve / Math.max(whiteAnchor, 1.0e-6f);
+-        float excess = x - 1.0f;
+-        return whiteAnchor + reserve * excess / (excess + tailScale);
+-    }
+ 
+     static float iris26614MapMotionSdrFinalGuide(float sourceGuide, float brightnessTargetGain) {
+         float x = Math.max(sourceGuide, 0.0f);
+@@ -357,7 +329,10 @@ public final class MotionV2Render extends Node {
+         glProg.setTexture("InputBuffer", extendedLinearHdr);
+         glProg.setVar("sceneWhite", sceneWhite);
+         glProg.setVar("iris26592MotionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+-        glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
++        glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
++        glProg.setVar("iris26604MotionSdrKneeFinal", IRIS_26604_MOTION_SDR_KNEE_FINAL);
++        
++                glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+         glProg.setVar("irisOutputZoom", irisOutputZoom);
+ 
+         WorkingTexture = basePipeline.getMain();
+@@ -405,6 +380,7 @@ public final class MotionV2Render extends Node {
+                 glProg.setTexture("SdrBuffer", WorkingTexture);
+                 glProg.setVar("gainMapSize", gainSize);
+                 glProg.setVar("hdrExposureScale", HDR_EXPOSURE_SCALE);
++                glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+                 glProg.setVar("motionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+                 glProg.setVar("maxGainRatio", maxGainRatio);
+ 
+@@ -493,9 +469,8 @@ public final class MotionV2Render extends Node {
+                                     + " actualPeakContentRatio=" + actualPeakContentRatio
+                                     + " fullHdrDisplayRatio=" + fullHdrDisplayRatio
+                                     + " separateBodyGainOwner=false"
+-                                    + " hdrGainSource=PRE_SPATIAL_PHYSICAL_GUIDE_ALPHA_ONLY"
+-                                    + " canonicalAppearanceOwner=MotionV2DisplayExposure"
+-                                    + " sdrProjectionWhiteAnchor=" + IRIS_26615_SDR_WHITE_ANCHOR
++                                    + " hdrGainSource=CANONICAL_SDR_PLUS_SOURCE_HEADROOM_ONLY"
++                                    + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                                     + " hdrExposureScale=" + HDR_EXPOSURE_SCALE);
+                 } catch (Throwable ignored) {}
+ 
+@@ -516,7 +491,7 @@ public final class MotionV2Render extends Node {
+                         + " fullImageRoughnessScan=false"
+                         + " provenance=actualGainMapBeforeJpegAttach"
+                         + " grid12x8=" + grid
+-                        + " source=canonicalSpatialAppearanceRgbPlusPhysicalGuideAlpha"
++                        + " source=extendedLinearPreTone"
+                         + " fullResolutionGainMap=" + (!iris26550Night)
+                         + " downsample=" + gainDownsample
+                         + " widthFraction=" + (1.0f / gainDownsample)
+@@ -532,9 +507,8 @@ public final class MotionV2Render extends Node {
+                         + " midtoneGainUnity=true sourceAtOrBelowWhiteGainUnity=true"
+                         + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                         + " motionHdrBodyGainRatio=1.0"
+-                        + " motionHdrGainStartsAbovePhysicalSourceWhite=true"
+-                        + " physicalGuideFromPreSpatialAlpha=true"
+-                        + " IRIS_26615_SDR_UHDR_SPATIAL_APPEARANCE_PARITY=true");
++                        + " motionHdrGainStartsAboveSourceWhite=true"
++                        + " IRIS_26614_UHDR_BODY_APPEARANCE_PARITY=true");
+             } finally {
+                 if (gainTexture != null) {
+                     try { gainTexture.close(); } catch (Throwable ignored) {}
+@@ -545,17 +519,20 @@ public final class MotionV2Render extends Node {
+         glProg.closed = true;
+ 
+         if (basePipeline.mParameters.motionV2Active) {
+-            Log.i(Name, "IRIS_26615_SINGLE_SPATIAL_APPEARANCE_OWNER"
+-                    + " master=canonicalSpatialAppearance"
++            Log.i(Name, "IRIS_26604_SINGLE_TONE_OWNER"
++                    + " master=extendedLinearPreTone"
+                     + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+-                    + " globalDisplayGainImageMultiplier=false"
+-                    + " spatialOwner=MotionV2DisplayExposure"
+-                    + " renderRole=FIXED_PROJECTION_GAMUT_ENCODING"
+-                    + " sdrWhiteAnchor=" + IRIS_26615_SDR_WHITE_ANCHOR
+-                    + " monotonicProjection=true hardEndpointClamp=false"
+-                    + " physicalHdrGuideCarrier=alphaPreSpatial"
++                    + " displayGainImageMultiplier=false"
++                    + " motionSdrKneeFinal=" + IRIS_26604_MOTION_SDR_KNEE_FINAL
++                    + " exactBodyBrightnessThroughFinalSdr=" + IRIS_26604_MOTION_SDR_KNEE_FINAL
++                    + " c1SoftKnee=true monotonic=true hardEndpointClamp=false"
++                    + " sameColor=true sameBlack=true sameShadows=true sameMidtones=true"
++                    + " differenceOnlyInTopSdrReserveAndHdrExcess=true"
++                    + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
++                    + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
++                    + " oneMasterRendition=true"
+                     + " separateBodyGainOwnerRequired=false"
+-                    + " superResSameSpatialBaseGrid=true");
++                    + " superResToneParity=true");
+         }
+ 
+         Log.d(Name, "IRIS_26436_V2_RENDER"
+@@ -604,11 +581,11 @@ public final class MotionV2Render extends Node {
+                 + " syntheticBitmapGainMap=false"
+                 + " irisOutputZoom=" + irisOutputZoom
+                 + " nativeOutputDimensionsPreserved=true"
+-                + " iris26615SdrWhiteAnchor=" + IRIS_26615_SDR_WHITE_ANCHOR
+-                + " iris26615SpatialAppearanceOwner=MotionV2DisplayExposure"
+-                + " iris26615RenderBrightnessAuthority=false"
+-                + " IRIS_26615_CANONICAL_SPATIAL_SDR_UHDR_SR_PARITY=true"
+-                + " localTone=true"
++                + " iris26614SdrWhiteAnchor=" + IRIS_26614_SDR_WHITE_ANCHOR
++                + " iris26614DisplayDomainKneeAuthority=false"
++                + " iris26614CanonicalAppearanceGainAuthority=true"
++                + " IRIS_26614_CANONICAL_SOURCE_DOMAIN_SDR_UHDR_SR_PARITY=true"
++                + " localTone=false"
+                 + " sharpening=false");
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 035b1a6f1264e5a0bcebbcff6acb510b816e9c6e..6c4469dc1436c4862a9628994aff2a19f96c1e63 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -75,22 +75,10 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+     private int iris26584CandidateGridWidth = 0;
+     private int iris26584CandidateGridHeight = 0;
+     private float[] iris26584ProjectedGridScratch = null;
+-    /* IRIS_26615_VIEWFINDER_SPATIAL_APPEARANCE_MODEL
+-     * Meter-only luminance field using the same normalized 96-short-edge / 9x9 triangular base
+-     * definition as MotionV2DisplayExposure. It predicts the production spatial allocation while
+-     * keeping the solver a target/constraint owner only.
+-     */
+-    private float[] iris26615CandidateLumaGrid = null;
+-    private float[] iris26615CandidateSpatialBaseGrid = null;
+-    private int iris26615CandidateSpatialBaseWidth = 0;
+-    private int iris26615CandidateSpatialBaseHeight = 0;
+ 
+     private static final class RgbSample {
+         final float r, g, b;
+-        final int x, y;
+-        RgbSample(float r, float g, float b, int x, int y) {
+-            this.r = r; this.g = g; this.b = b; this.x = x; this.y = y;
+-        }
++        RgbSample(float r, float g, float b) { this.r = r; this.g = g; this.b = b; }
+     }
+ 
+     public MotionV2ViewfinderExposureMatcher() {
+@@ -114,10 +102,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         iris26584CandidateGuideGrid = null;
+         iris26584CandidateGridWidth = 0;
+         iris26584CandidateGridHeight = 0;
+-        iris26615CandidateLumaGrid = null;
+-        iris26615CandidateSpatialBaseGrid = null;
+-        iris26615CandidateSpatialBaseWidth = 0;
+-        iris26615CandidateSpatialBaseHeight = 0;
+         basePipeline.mParameters.motionV2ToneP95Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ToneP99Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ToneP995Guide = Float.NaN;
+@@ -280,7 +264,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " solvedEv=" + solvedEv
+                     + " cameraId=" + cameraIdForLog()
+                     + " brightnessTargetGain=" + gain
+-                    + " meterToneAuthority=IRIS_26615_SPATIAL_APPEARANCE_PREDICTOR finalAppearanceAuthority=IRIS_26615_SPATIAL_APPEARANCE"
++                    + " meterToneAuthority=IRIS_26614_CANONICAL_SOURCE_DOMAIN finalHighlightAuthority=IRIS_26614_CANONICAL_SOURCE_DOMAIN"
+                     + " irisNight=" + iris26550Night
+                     + " candidateP99Guide=" + iris26550CandidateP99Guide
+                     + " fixedCandidateSampleSet=true"
+@@ -393,8 +377,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             ArrayList<RgbSample> all = new ArrayList<>();
+             iris26584CandidateGuideGrid = new float[previewW * previewH];
+             java.util.Arrays.fill(iris26584CandidateGuideGrid, Float.NaN);
+-            iris26615CandidateLumaGrid = new float[previewW * previewH];
+-            java.util.Arrays.fill(iris26615CandidateLumaGrid, Float.NaN);
+             iris26584CandidateGridWidth = previewW;
+             iris26584CandidateGridHeight = previewH;
+             int pixelIndex = 0;
+@@ -405,19 +387,15 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     r = Math.max(0.0f, r); g = Math.max(0.0f, g); b = Math.max(0.0f, b);
+                     float y = luma(r, g, b);
+                     if (y > 1.0e-4f && y < 8.0f) {
+-                        int sx = pixelIndex % previewW;
+-                        int sy = pixelIndex / previewW;
+-                        all.add(new RgbSample(r, g, b, sx, sy));
++                        all.add(new RgbSample(r, g, b));
+                         if (pixelIndex < iris26584CandidateGuideGrid.length) {
+                             iris26584CandidateGuideGrid[pixelIndex] = Math.max(r, Math.max(g, b));
+-                            iris26615CandidateLumaGrid[pixelIndex] = y;
+                         }
+                     }
+                 }
+                 pixelIndex++;
+             }
+             if (!all.isEmpty()) {
+-                iris26615BuildCandidateSpatialBase();
+                 iris26582CandidateGuides.clear();
+                 for (RgbSample s : all) {
+                     iris26582CandidateGuides.add(Math.max(s.r, Math.max(s.g, s.b)));
+@@ -449,85 +427,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         }
+     }
+ 
+-    private float iris26615SampleCandidateLuma(float x, float y) {
+-        if (iris26615CandidateLumaGrid == null
+-                || iris26584CandidateGridWidth <= 0 || iris26584CandidateGridHeight <= 0) {
+-            return 0.0f;
+-        }
+-        int w = iris26584CandidateGridWidth, h = iris26584CandidateGridHeight;
+-        x = clamp(x, 0.0f, w - 1.0f);
+-        y = clamp(y, 0.0f, h - 1.0f);
+-        int x0 = (int)Math.floor(x), y0 = (int)Math.floor(y);
+-        int x1 = Math.min(w - 1, x0 + 1), y1 = Math.min(h - 1, y0 + 1);
+-        float fx = x - x0, fy = y - y0;
+-        float a = iris26615CandidateLumaGrid[y0 * w + x0];
+-        float b = iris26615CandidateLumaGrid[y0 * w + x1];
+-        float c = iris26615CandidateLumaGrid[y1 * w + x0];
+-        float d = iris26615CandidateLumaGrid[y1 * w + x1];
+-        if (!Float.isFinite(a)) a = 0.0f;
+-        if (!Float.isFinite(b)) b = a;
+-        if (!Float.isFinite(c)) c = a;
+-        if (!Float.isFinite(d)) d = c;
+-        return mix(mix(a, b, fx), mix(c, d, fx), fy);
+-    }
+-
+-    private void iris26615BuildCandidateSpatialBase() {
+-        int w = iris26584CandidateGridWidth, h = iris26584CandidateGridHeight;
+-        if (iris26615CandidateLumaGrid == null || w <= 0 || h <= 0) return;
+-        int shortEdge = Math.max(1, Math.min(w, h));
+-        float scale = Math.min(1.0f,
+-                MotionV2DisplayExposure.IRIS_26615_SPATIAL_BASE_SHORT_EDGE / (float) shortEdge);
+-        int bw = Math.max(1, Math.round(w * scale));
+-        int bh = Math.max(1, Math.round(h * scale));
+-        float[] base = new float[bw * bh];
+-        float cellX = w / (float) bw;
+-        float cellY = h / (float) bh;
+-        for (int by = 0; by < bh; by++) {
+-            float centerY = (by + 0.5f) * cellY - 0.5f;
+-            for (int bx = 0; bx < bw; bx++) {
+-                float centerX = (bx + 0.5f) * cellX - 0.5f;
+-                float sum = 0.0f, weightSum = 0.0f;
+-                for (int j = -4; j <= 4; j++) {
+-                    float wy = 5.0f - Math.abs(j);
+-                    for (int i = -4; i <= 4; i++) {
+-                        float wx = 5.0f - Math.abs(i);
+-                        float weight = wx * wy;
+-                        sum += iris26615SampleCandidateLuma(
+-                                centerX + i * cellX, centerY + j * cellY) * weight;
+-                        weightSum += weight;
+-                    }
+-                }
+-                base[by * bw + bx] = Math.max(sum / Math.max(weightSum, 1.0e-6f), 0.0f);
+-            }
+-        }
+-        iris26615CandidateSpatialBaseGrid = base;
+-        iris26615CandidateSpatialBaseWidth = bw;
+-        iris26615CandidateSpatialBaseHeight = bh;
+-    }
+-
+-    private float iris26615SpatialBaseForSample(RgbSample sample) {
+-        if (iris26615CandidateSpatialBaseGrid == null
+-                || iris26615CandidateSpatialBaseWidth <= 0
+-                || iris26615CandidateSpatialBaseHeight <= 0
+-                || iris26584CandidateGridWidth <= 0 || iris26584CandidateGridHeight <= 0) {
+-            return Math.max(luma(sample.r, sample.g, sample.b), 0.0f);
+-        }
+-        int bw = iris26615CandidateSpatialBaseWidth;
+-        int bh = iris26615CandidateSpatialBaseHeight;
+-        float x = (sample.x + 0.5f) * bw / (float) iris26584CandidateGridWidth - 0.5f;
+-        float y = (sample.y + 0.5f) * bh / (float) iris26584CandidateGridHeight - 0.5f;
+-        x = clamp(x, 0.0f, bw - 1.0f);
+-        y = clamp(y, 0.0f, bh - 1.0f);
+-        int x0 = (int)Math.floor(x), y0 = (int)Math.floor(y);
+-        int x1 = Math.min(bw - 1, x0 + 1), y1 = Math.min(bh - 1, y0 + 1);
+-        float fx = x - x0, fy = y - y0;
+-        float a = iris26615CandidateSpatialBaseGrid[y0 * bw + x0];
+-        float b = iris26615CandidateSpatialBaseGrid[y0 * bw + x1];
+-        float c = iris26615CandidateSpatialBaseGrid[y1 * bw + x0];
+-        float d = iris26615CandidateSpatialBaseGrid[y1 * bw + x1];
+-        return Math.max(mix(mix(a, b, fx), mix(c, d, fx), fy), 0.0f);
+-    }
+-
+     private static ArrayList<Float> trimMiddle(ArrayList<Float> sorted, float lo, float hi) {
+         if (sorted.isEmpty()) return sorted;
+         int from = Math.max(0, Math.round((sorted.size() - 1) * lo));
+@@ -920,16 +819,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         if (guide <= 1.0e-7f) return 0.0f;
+         float mappedFinal;
+         if (basePipeline.mParameters.motionV2Active) {
+-            float spatialBase = iris26615SpatialBaseForSample(sample);
+-            float spatialGain = MotionV2Render.iris26615SpatialAppearanceGain(spatialBase, gain);
+-            r *= spatialGain;
+-            g *= spatialGain;
+-            b *= spatialGain;
+-            y = luma(r, g, b);
+-            peak = Math.max(r, Math.max(g, b));
+-            guide = Math.max(y, peak);
+-            if (guide <= 1.0e-7f) return 0.0f;
+-            mappedFinal = MotionV2Render.iris26615ProjectCanonicalSdrGuide(guide);
++            mappedFinal = MotionV2Render.iris26614MapMotionSdrFinalGuide(guide, gain);
+         } else {
+             float preGuide = guide * Math.max(gain, 1.0e-6f);
+             mappedFinal = MotionV2Render.iris26582MapHeadroom(preGuide, sceneWhite)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 1f9eaec5befdd0b0859ee216d99de9f4a564508c..fb10528bc1d9526c29bfe1a9c1d38d60108a39ec 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -55,15 +55,6 @@ public class Parameters {
+      * Scene brightness normalization applied only after temporal Bayer fusion + RCD.
+      */
+     public float motionV2DisplayGain = 1.0f;
+-    /* IRIS_26615_SHARED_SPATIAL_APPEARANCE_BASE_STATE
+-     * Tiny normalized low-frequency luminance grid produced once by MotionV2DisplayExposure.
+-     * It is read-only after production and is reused by the true-2x publisher so SR cannot own a
+-     * separate illumination/tone field. This is presentation metadata only; RAW/DNG/Sabre never
+-     * consume it.
+-     */
+-    public float[] motionV2SpatialAppearanceBaseGrid = null;
+-    public int motionV2SpatialAppearanceBaseWidth = 0;
+-    public int motionV2SpatialAppearanceBaseHeight = 0;
+     /* IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE_STATE
+      * Decision-only presentation state produced by MotionV2ViewfinderExposureMatcher from its
+      * existing low-resolution candidate probe. No RAW/capture/DNG owner consumes these fields.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index be00017962811d1c0da0dcd1d720a4aaa78bd21e..e4c71385582dbae3b14a46cad3f8010f2e1b475a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -155,30 +155,14 @@ public final class MotionV2Jpeg444Encoder {
+                     ? attachedGainmap.getDisplayRatioForFullHdr() : 1.0f;
+             final float publicationSceneWhite =
+                     MotionV2Render.iris26598PublicationSceneWhite(parameters);
+-            final float[] spatialBase = parameters.motionV2SpatialAppearanceBaseGrid;
+-            final int spatialBaseWidth = parameters.motionV2SpatialAppearanceBaseWidth;
+-            final int spatialBaseHeight = parameters.motionV2SpatialAppearanceBaseHeight;
+-            if (parameters.motionV2Active) {
+-                long expectedSpatial = (long) spatialBaseWidth * spatialBaseHeight;
+-                if (spatialBase == null || spatialBaseWidth <= 0 || spatialBaseHeight <= 0
+-                        || expectedSpatial != spatialBase.length) {
+-                    throw new IllegalStateException(
+-                            "26615 true2x missing shared spatial base grid width="
+-                                    + spatialBaseWidth + " height=" + spatialBaseHeight
+-                                    + " length=" + (spatialBase == null ? -1 : spatialBase.length));
+-                }
+-            }
+             final long renderStartNs = System.nanoTime();
+             final boolean baseOk = writeTrue2xNative(
+                     bitmap, renderRgb16fPath, trueWidth, trueHeight,
+                     raw.x, raw.y, crop.x, crop.y, parameters.cameraRotation, parameters.mirror,
+                     Math.max(1.0f, parameters.motionV2RenderResidualZoom),
+                     sensorToProPhoto, profileToDisplay,
+-                    parameters.motionV2DisplayGain,
+-                    parameters.motionV2Active ? spatialBase : null,
+-                    parameters.motionV2Active ? spatialBaseWidth : 0,
+-                    parameters.motionV2Active ? spatialBaseHeight : 0,
+-                    exposureEv, shadows, contrast, publicationSceneWhite, parameters.motionV2Active,
++                    parameters.motionV2DisplayGain, exposureEv, shadows, contrast,
++                    publicationSceneWhite, parameters.motionV2Active,
+                     watermark,
+                     useJin ? jinResidual.residual : null,
+                     useJin ? jinResidual.referenceRgb : null,
+@@ -195,11 +179,10 @@ public final class MotionV2Jpeg444Encoder {
+                     + " gainEncodingMax=" + true2xGainEncodingMax
+                     + " gainContentMax=" + true2xGainContentMax
+                     + " publicationSceneWhite=" + publicationSceneWhite
+-                    + " iris26615SdrWhiteAnchor=" + MotionV2Render.IRIS_26615_SDR_WHITE_ANCHOR
+-                    + " spatialBase=" + spatialBaseWidth + "x" + spatialBaseHeight
+-                    + " spatialBaseSharedFrom1x=true"
+-                    + " duplicateTrue2xToneField=false"
+-                    + " IRIS_26615_TRUE2X_SHARED_SPATIAL_APPEARANCE=true"
++                    + " iris26614SdrWhiteAnchor=" + MotionV2Render.IRIS_26614_SDR_WHITE_ANCHOR
++                    + " iris26614DisplayDomainKneeAuthority=false"
++                    + " iris26614CanonicalAppearanceGainAuthority=true"
++                    + " IRIS_26614_TRUE2X_SOURCE_DOMAIN_PRESENTATION=true"
+                     + " adaptiveSceneWhite=" + parameters.motionV2ToneAdaptiveSceneWhite
+                     + " publicationSceneWhiteSource="
+                         + (parameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
+@@ -332,7 +315,6 @@ public final class MotionV2Jpeg444Encoder {
+             int rawWidth, int rawHeight, int cropWidth, int cropHeight,
+             int rotation, boolean mirror, float renderResidualZoom,
+             float[] sensorToProPhoto, float[] proPhotoToSrgb, float displayGain,
+-            float[] spatialAppearanceBase, int spatialBaseWidth, int spatialBaseHeight,
+             float exposureEv, float shadows, float contrast, float sceneWhite, boolean motionHdrHandoff,
+             Bitmap watermark,
+             float[] jinResidual, int[] jinReferenceRgb, int jinWidth, int jinHeight,
+diff --git a/app/version.properties b/app/version.properties
+index 3d7161c36d9370540df7c87a47eb0b289fc71714..1529e77152446c36d7bbc901c2ec2c0602fc9fdf 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726615
+-VERSION_BUILD=26615
++VERSION_NAME=0.9726614
++VERSION_BUILD=26614
