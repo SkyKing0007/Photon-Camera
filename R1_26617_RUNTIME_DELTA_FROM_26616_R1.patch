@@ -1,0 +1,429 @@
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_laplacian.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_laplacian.glsl
+index 75565944b31ef7abce2ed5fd01dd444f5a8251e5..e028b14f2467d27713fddf2c8f8d5f32d3ec5f8b 100644
+--- a/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_laplacian.glsl
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_blend_laplacian.glsl
+@@ -4,14 +4,22 @@ uniform sampler2D ExposuresFine;
+ uniform sampler2D WeightsFine;
+ uniform sampler2D ExposuresCoarse;
+ uniform sampler2D AccumCoarse;
++uniform sampler2D BroadWeights;
+ uniform vec2 FineSize;
++uniform float useBroadWeightAuthority;
+ out float Output;
+ void main(){
+     vec2 uv=gl_FragCoord.xy/FineSize;
+     float accumSoFar=texture(AccumCoarse,uv).r;
+     vec3 laplacians=texelFetch(ExposuresFine,ivec2(gl_FragCoord.xy),0).rgb-texture(ExposuresCoarse,uv).rgb;
+-    vec3 weights=texelFetch(WeightsFine,ivec2(gl_FragCoord.xy),0).rgb;
+-    /* Exact linked-demo default: boostLocalContrast=false, so no abs(laplacian) reweighting. */
+-    weights/=dot(weights,vec3(1.0))+0.00001;
++    vec3 fineWeights=texelFetch(WeightsFine,ivec2(gl_FragCoord.xy),0).rgb;
++    vec3 broadWeights=texture(BroadWeights,uv).rgb;
++    /* IRIS_26617_STRUCTURE_STABLE_EXPOSURE_AUTHORITY
++     * boostLocalContrast remains false. Wronski's mip-5 exposure decision owns broad local
++     * illumination; mips 4..2 reuse that decision so fine structure cannot choose a different
++     * synthetic exposure on opposite sides of an edge. Branch-specific fine detail is retained. */
++    fineWeights/=dot(fineWeights,vec3(1.0))+0.00001;
++    broadWeights/=dot(broadWeights,vec3(1.0))+0.00001;
++    vec3 weights=mix(fineWeights,broadWeights,clamp(useBroadWeightAuthority,0.0,1.0));
+     Output=accumSoFar+dot(laplacians*weights,vec3(1.0));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_exposures.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_exposures.glsl
+index 2d00cc87b0f11a5827d6bd39aa1e51fc3463871e..422c0eabd9eba44d7dff2a8430bf1c5e6b8417b2 100644
+--- a/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_exposures.glsl
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_exposures.glsl
+@@ -2,11 +2,13 @@ precision highp float;
+ precision highp sampler2D;
+ uniform sampler2D InputBuffer;
+ uniform float exposure;
++uniform float highlightExposureScale;
++uniform float shadowExposureScale;
+ out vec4 Output;
+ 
+-/* IRIS_26616_WRONSKI_EXACT_EXPOSURE_FUSION
++/* IRIS_26617_WRONSKI_ADAPTIVE_EXPOSURE_FUSION
+  * Bart Wronski 2022 WebGL demo math, main.js SHA 07417fe..., Three.js r138 ACES.
+- * Branch packing is exactly: highlights(-2 EV), midtones(0 EV), shadows(+1.5 EV).
++ * Branch packing remains highlights, midtones, shadows; 26617 supplies capture-adaptive EV scales.
+  * This shader computes the demo's first actually consumed fusion level (mip 2) directly from
+  * 4x4 source blocks. For ordinary dimensions divisible by four this is mathematically identical
+  * to two successive 2:1 linear-filter copies, while avoiding unused full/half-resolution LTM RTs.
+@@ -44,7 +46,7 @@ vec3 qHalf3(vec3 v){return vec3(qHalf(v.r),qHalf(v.g),qHalf(v.b));}
+ vec3 level0At(ivec2 p,ivec2 sz){
+     p=clamp(p,ivec2(0),sz-ivec2(1));
+     vec3 src=irisP3ToLinearSrgb(texelFetch(InputBuffer,p,0).rgb)*exposure;
+-    return qHalf3(vec3(wronskiLightness(src*0.25),wronskiLightness(src),wronskiLightness(src*2.8284271247461903)));
++    return qHalf3(vec3(wronskiLightness(src*highlightExposureScale),wronskiLightness(src),wronskiLightness(src*shadowExposureScale)));
+ }
+ vec3 level1At(ivec2 p,ivec2 sz){
+     ivec2 q=p*2;
+diff --git a/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_weights.glsl b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_weights.glsl
+index f09b89f66fa9cbe7deef77846c039620045481c6..70cc61e6d2b01cd0963e47ea638d890441bd1cac 100644
+--- a/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_weights.glsl
++++ b/app/src/main/assets/shaders/motionv2/wronski_ltm_level2_weights.glsl
+@@ -2,6 +2,8 @@ precision highp float;
+ precision highp sampler2D;
+ uniform sampler2D InputBuffer;
+ uniform float exposure;
++uniform float highlightExposureScale;
++uniform float shadowExposureScale;
+ out vec4 Output;
+ 
+ /* Exact Wronski exposure weights: sigma=5 => sigmaSq=25, normalized per source pixel before mips. */
+@@ -29,7 +31,7 @@ vec3 qHalf3(vec3 v){return vec3(qHalf(v.r),qHalf(v.g),qHalf(v.b));}
+ vec3 level0At(ivec2 p,ivec2 sz){
+     p=clamp(p,ivec2(0),sz-ivec2(1));
+     vec3 src=irisP3ToLinearSrgb(texelFetch(InputBuffer,p,0).rgb)*exposure;
+-    vec3 cols=vec3(wronskiLightness(src*0.25),wronskiLightness(src),wronskiLightness(src*2.8284271247461903));
++    vec3 cols=vec3(wronskiLightness(src*highlightExposureScale),wronskiLightness(src),wronskiLightness(src*shadowExposureScale));
+     vec3 diff=cols-vec3(0.5);vec3 weights=exp(-0.5*diff*diff*25.0);
+     weights/=dot(weights,vec3(1.0))+0.00001;
+     return qHalf3(weights);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 320b028ded0af2334e047be108aec39ecf8d972a..3be8808d0d2613d01a583ffca990015476410ae5 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -35,7 +35,8 @@ import static android.opengl.GLES20.GL_LINEAR;
+  * Post-capture presentation exposure only. A small shutter-time bitmap of the displayed preview
+  * supplies the target midtone distribution. A fixed sample set from the profile-colored RAW
+  * candidate is then probed at +/-0.5 EV and solved with a bounded monotonic secant iteration.
+- * The result writes only Parameters.motionV2DisplayGain; shutter/ISO/AE are untouched.
++ * For Motion, the result writes Parameters.motionV2DisplayGain plus the presentation-only adaptive
++ * Wronski synthetic exposure offsets; shutter/ISO/AE and source-domain pixels are untouched.
+  *
+  * Manual Iris Exposure remains a later, independent user control.
+  */
+@@ -47,6 +48,22 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+     private static final float OUTPUT_EXPOSURE_SCALE = MotionV2Render.OUTPUT_EXPOSURE_SCALE;
+     private static final float LOG2 = (float)Math.log(2.0);
+ 
++    /* IRIS_26617_CAPTURE_ADAPTIVE_WRONSKI_RANGE
++     * Keep Wronski's preference peak at 0.5, but solve the synthetic exposure span from this
++     * capture instead of hard-coding one phone/scene range. P37.5 is the center of the same
++     * P25-P50 body band used by the viewfinder solver. P99 supplies recoverable upper-tail
++     * evidence. Compact highlights keep the proven 26616 -2 EV branch; only a broad physical
++     * >1.0 population may expand the dark branch. 6 EV is a safety envelope, not a target.
++     */
++    private static final float WRONSKI_DEFAULT_SHADOW_EV = 1.5f;
++    private static final float WRONSKI_DEFAULT_HIGHLIGHT_EV = 2.0f;
++    private static final float WRONSKI_MAX_BRANCH_EV = 6.0f;
++    private static final float WRONSKI_SHADOW_PERCENTILE = 0.375f;
++    private static final float WRONSKI_HIGHLIGHT_PERCENTILE = 0.99f;
++    private static final float WRONSKI_PREFERRED_LIGHTNESS = 0.5f;
++    private static final float WRONSKI_BROAD_HIGHLIGHT_START = 0.015f;
++    private static final float WRONSKI_BROAD_HIGHLIGHT_FULL = 0.050f;
++
+     private static final String MATCH_STRENGTH_KEY = "pref_motion_viewfinder_match_strength";
+     private static final float DEFAULT_MATCH_STRENGTH_PERCENT = 65.0f;
+     /* IRIS_26558_NIGHT_PRESENTATION_POLICY
+@@ -75,6 +92,8 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+     private int iris26584CandidateGridWidth = 0;
+     private int iris26584CandidateGridHeight = 0;
+     private float[] iris26584ProjectedGridScratch = null;
++    private final ArrayList<RgbSample> iris26617AllCandidateSamples = new ArrayList<>();
++    private float iris26617BroadHighlightFraction = 0.0f;
+ 
+     private static final class RgbSample {
+         final float r, g, b;
+@@ -105,6 +124,11 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         iris26584CandidateGuideGrid = null;
+         iris26584CandidateGridWidth = 0;
+         iris26584CandidateGridHeight = 0;
++        iris26617AllCandidateSamples.clear();
++        iris26617BroadHighlightFraction = 0.0f;
++        basePipeline.mParameters.motionV2WronskiShadowEv = WRONSKI_DEFAULT_SHADOW_EV;
++        basePipeline.mParameters.motionV2WronskiHighlightEv = WRONSKI_DEFAULT_HIGHLIGHT_EV;
++        basePipeline.mParameters.motionV2WronskiBroadHighlightFraction = 0.0f;
+         basePipeline.mParameters.motionV2ToneP95Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ToneP99Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ToneP995Guide = Float.NaN;
+@@ -201,6 +225,24 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             }
+             basePipeline.mParameters.motionV2DisplayGain = gain;
+             valid = true;
++            if (!iris26550Night) {
++                WronskiBranchDecision branch = solveAdaptiveWronskiBranches(gain);
++                basePipeline.mParameters.motionV2WronskiShadowEv = branch.shadowEv;
++                basePipeline.mParameters.motionV2WronskiHighlightEv = branch.highlightEv;
++                basePipeline.mParameters.motionV2WronskiBroadHighlightFraction = branch.broadHighlightFraction;
++                Log.i(Name, "IRIS_26617_ADAPTIVE_WRONSKI_BRANCH_RANGE"
++                        + " shadowPercentile=" + WRONSKI_SHADOW_PERCENTILE
++                        + " shadowRequiredEv=" + branch.shadowRequiredEv
++                        + " shadowEv=" + branch.shadowEv
++                        + " highlightPercentile=" + WRONSKI_HIGHLIGHT_PERCENTILE
++                        + " highlightRequiredEv=" + branch.highlightRequiredEv
++                        + " broadHighlightFraction=" + branch.broadHighlightFraction
++                        + " broadHighlightStrength=" + branch.broadHighlightStrength
++                        + " highlightEv=" + branch.highlightEv
++                        + " preferredLightness=" + WRONSKI_PREFERRED_LIGHTNESS
++                        + " maxSafetyEv=" + WRONSKI_MAX_BRANCH_EV
++                        + " compactHighlightKeeps26616=true boostLocalContrast=false");
++            }
+             if (iris26550Night) {
+                 ToneDecision iris26583Tone = iris26583ToneDecision(gain);
+                 basePipeline.mParameters.motionV2ToneP95Guide = iris26582CandidateP95Guide;
+@@ -270,7 +312,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 basePipeline.mParameters.motionV2ToneBaseSceneWhite = 1.0f;
+                 basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite = 1.0f;
+                 basePipeline.mParameters.motionV2ToneAdaptiveStrength = 0.0f;
+-                Log.i(Name, "IRIS_26616_WRONSKI_SOLVER_ONLY"
++                Log.i(Name, "IRIS_26617_WRONSKI_SOLVER_PLUS_ADAPTIVE_RANGE"
+                         + " brightnessTargetGain=" + gain
+                         + " predictor=EXACT_WRONSKI_MIDTONE_SQRT_ACES"
+                         + " oldSceneWhiteDecision=false oldShoulderDecision=false"
+@@ -294,7 +336,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " solvedEv=" + solvedEv
+                     + " cameraId=" + cameraIdForLog()
+                     + " brightnessTargetGain=" + gain
+-                    + " meterToneAuthority=IRIS_26616_WRONSKI_GLOBAL_EXPOSURE_PREDICTOR finalAppearanceAuthority=IRIS_26616_WRONSKI_EXPOSURE_FUSION"
++                    + " meterToneAuthority=IRIS_26617_WRONSKI_GLOBAL_EXPOSURE_PREDICTOR finalAppearanceAuthority=IRIS_26617_WRONSKI_ADAPTIVE_EXPOSURE_FUSION"
+                     + " irisNight=" + iris26550Night
+                     + " candidateP99Guide=" + iris26550CandidateP99Guide
+                     + " fixedCandidateSampleSet=true"
+@@ -430,6 +472,13 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 pixelIndex++;
+             }
+             if (!all.isEmpty()) {
++                iris26617AllCandidateSamples.clear();
++                iris26617AllCandidateSamples.addAll(all);
++                int broadAboveOne = 0;
++                for (RgbSample s : all) {
++                    if (Math.max(s.r, Math.max(s.g, s.b)) > 1.0f) broadAboveOne++;
++                }
++                iris26617BroadHighlightFraction = (float)broadAboveOne / (float)all.size();
+                 iris26582CandidateGuides.clear();
+                 for (RgbSample s : all) {
+                     iris26582CandidateGuides.add(Math.max(s.r, Math.max(s.g, s.b)));
+@@ -466,6 +515,70 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         }
+     }
+ 
++    private static final class WronskiBranchDecision {
++        final float shadowRequiredEv, shadowEv;
++        final float highlightRequiredEv, highlightEv;
++        final float broadHighlightFraction, broadHighlightStrength;
++        WronskiBranchDecision(float shadowRequiredEv, float shadowEv,
++                              float highlightRequiredEv, float highlightEv,
++                              float broadHighlightFraction, float broadHighlightStrength) {
++            this.shadowRequiredEv = shadowRequiredEv;
++            this.shadowEv = shadowEv;
++            this.highlightRequiredEv = highlightRequiredEv;
++            this.highlightEv = highlightEv;
++            this.broadHighlightFraction = broadHighlightFraction;
++            this.broadHighlightStrength = broadHighlightStrength;
++        }
++    }
++
++    private WronskiBranchDecision solveAdaptiveWronskiBranches(float gain) {
++        if (iris26617AllCandidateSamples.size() < 32 || !Float.isFinite(gain) || gain <= 0.0f) {
++            return new WronskiBranchDecision(WRONSKI_DEFAULT_SHADOW_EV,
++                    WRONSKI_DEFAULT_SHADOW_EV, WRONSKI_DEFAULT_HIGHLIGHT_EV,
++                    WRONSKI_DEFAULT_HIGHLIGHT_EV, 0.0f, 0.0f);
++        }
++        ArrayList<RgbSample> ranked = new ArrayList<>(iris26617AllCandidateSamples);
++        ranked.sort(Comparator.comparingDouble(s ->
++                MotionV2WronskiLtm.demoMidtoneLightness(s.r, s.g, s.b, gain)));
++        RgbSample shadowSample = ranked.get(percentileIndex(ranked.size(), WRONSKI_SHADOW_PERCENTILE));
++        RgbSample highlightSample = ranked.get(percentileIndex(ranked.size(), WRONSKI_HIGHLIGHT_PERCENTILE));
++        float shadowRequired = solvePreferredBranchMagnitude(shadowSample, gain, true);
++        float highlightRequired = solvePreferredBranchMagnitude(highlightSample, gain, false);
++        float shadowEv = clamp(Math.max(WRONSKI_DEFAULT_SHADOW_EV, shadowRequired),
++                WRONSKI_DEFAULT_SHADOW_EV, WRONSKI_MAX_BRANCH_EV);
++        float broadFraction = clamp(iris26617BroadHighlightFraction, 0.0f, 1.0f);
++        float broadStrength = smoothstep(WRONSKI_BROAD_HIGHLIGHT_START,
++                WRONSKI_BROAD_HIGHLIGHT_FULL, broadFraction);
++        float requestedHighlight = clamp(Math.max(WRONSKI_DEFAULT_HIGHLIGHT_EV, highlightRequired),
++                WRONSKI_DEFAULT_HIGHLIGHT_EV, WRONSKI_MAX_BRANCH_EV);
++        float highlightEv = mix(WRONSKI_DEFAULT_HIGHLIGHT_EV, requestedHighlight, broadStrength);
++        return new WronskiBranchDecision(shadowRequired, shadowEv, highlightRequired, highlightEv,
++                broadFraction, broadStrength);
++    }
++
++    private static int percentileIndex(int size, float percentile) {
++        if (size <= 1) return 0;
++        return Math.max(0, Math.min(size - 1, Math.round((size - 1) * percentile)));
++    }
++
++    private static float solvePreferredBranchMagnitude(RgbSample sample, float gain, boolean brighten) {
++        float atBase = MotionV2WronskiLtm.demoMidtoneLightness(sample.r, sample.g, sample.b, gain);
++        if (brighten && atBase >= WRONSKI_PREFERRED_LIGHTNESS) return 0.0f;
++        if (!brighten && atBase <= WRONSKI_PREFERRED_LIGHTNESS) return 0.0f;
++        float lo = 0.0f, hi = WRONSKI_MAX_BRANCH_EV;
++        for (int i = 0; i < 18; i++) {
++            float mid = 0.5f * (lo + hi);
++            float branchGain = gain * (float)Math.pow(2.0, brighten ? mid : -mid);
++            float y = MotionV2WronskiLtm.demoMidtoneLightness(sample.r, sample.g, sample.b, branchGain);
++            if (brighten) {
++                if (y < WRONSKI_PREFERRED_LIGHTNESS) lo = mid; else hi = mid;
++            } else {
++                if (y > WRONSKI_PREFERRED_LIGHTNESS) lo = mid; else hi = mid;
++            }
++        }
++        return clamp(0.5f * (lo + hi), 0.0f, WRONSKI_MAX_BRANCH_EV);
++    }
++
+     private static ArrayList<Float> trimMiddle(ArrayList<Float> sorted, float lo, float hi) {
+         if (sorted.isEmpty()) return sorted;
+         int from = Math.max(0, Math.round((sorted.size() - 1) * lo));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2WronskiLtm.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2WronskiLtm.java
+index e91ad76881f42596fc2876892ff8e1e6e4f4e607..52fb005fc0fcec03dc4b16263f669ca7a47b8132 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2WronskiLtm.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2WronskiLtm.java
+@@ -17,24 +17,27 @@ import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+ import static android.opengl.GLES20.GL_LINEAR;
+ 
+ /**
+- * IRIS_26616_WRONSKI_EXACT_EXPOSURE_FUSION_LTM_OWNER
++ * IRIS_26617_WRONSKI_ADAPTIVE_EXPOSURE_FUSION_LTM_OWNER
+  *
+- * Motion's sole automatic local-tone/presentation owner. This is a direct Android/GLSL port of
++ * Motion's sole automatic local-tone/presentation owner. This is an Iris camera adaptation of
+  * Bart Wronski's 2022 WebGL exposure-fusion LTM demo (main.js SHA
+- * 07417fe2132975a193b49cbe9d16a6a02ab9dcc2), including the exact three synthetic exposures,
+- * exposure-only Gaussian weights, mip-6 Gaussian blend, mip 5..2 Laplacian reconstruction,
+- * boostLocalContrast=false, and 3x3 guided final combine. The ACES function is pinned to the
++ * 07417fe2132975a193b49cbe9d16a6a02ab9dcc2), using the same three-exposure Gaussian/Laplacian structure, exposure-only Gaussian weights,
++ * mip-6 Gaussian blend, boostLocalContrast=false, and 3x3 guided final combine. 26617 makes only
++ * the synthetic exposure offsets capture-adaptive and freezes fine-band exposure authority to
++ * mip-5 so object edges cannot select a different exposure than their surrounding illumination. The ACES function is pinned to the
+  * demo's Three.js r138 implementation (ShaderChunk SHA 5087a8313493aa5eb230b82dc53dd636465d2751).
+  *
+- * The only camera-specific input is exposure: Parameters.motionV2DisplayGain is used as the demo's
+- * free global exposure parameter. It is not applied anywhere else as a pixel multiplier.
++ * Parameters.motionV2DisplayGain remains the demo-style global exposure parameter. 26617 also
++ * receives capture-adaptive synthetic branch EV offsets from the same fixed candidate probe. None
++ * of these presentation parameters are applied elsewhere as an independent pixel multiplier.
+  * Alpha carries the immutable pre-LTM physical guide so Ultra HDR can add only real >1 headroom.
+  */
+ public final class MotionV2WronskiLtm extends Node {
+     public static final int DISPLAY_MIP = 2;
+     public static final int COARSE_MIP = 6;
+-    public static final float HIGHLIGHTS_EV = 2.0f;
+-    public static final float SHADOWS_EV = 1.5f;
++    public static final float DEFAULT_HIGHLIGHTS_EV = 2.0f;
++    public static final float DEFAULT_SHADOWS_EV = 1.5f;
++    public static final float MAX_BRANCH_EV = 6.0f;
+     public static final float EXPOSURE_PREFERENCE_SIGMA = 5.0f;
+     public static final boolean BOOST_LOCAL_CONTRAST = false;
+     public static final float GUIDED_SPATIAL_SIGMA = 0.7f;
+@@ -112,9 +115,19 @@ public final class MotionV2WronskiLtm extends Node {
+                     + source.mSize.x + "x" + source.mSize.y);
+         }
+         final float exposure = basePipeline.mParameters.motionV2DisplayGain;
++        final float shadowEv = basePipeline.mParameters.motionV2WronskiShadowEv;
++        final float highlightEv = basePipeline.mParameters.motionV2WronskiHighlightEv;
+         if (!Float.isFinite(exposure) || exposure <= 0.0f) {
+-            throw new IllegalStateException("26616 invalid Wronski exposure target: " + exposure);
++            throw new IllegalStateException("26617 invalid Wronski exposure target: " + exposure);
+         }
++        if (!Float.isFinite(shadowEv) || !Float.isFinite(highlightEv)
++                || shadowEv < DEFAULT_SHADOWS_EV || shadowEv > MAX_BRANCH_EV
++                || highlightEv < DEFAULT_HIGHLIGHTS_EV || highlightEv > MAX_BRANCH_EV) {
++            throw new IllegalStateException("26617 invalid adaptive Wronski branch range shadowEv="
++                    + shadowEv + " highlightEv=" + highlightEv);
++        }
++        final float shadowExposureScale = (float)Math.pow(2.0, shadowEv);
++        final float highlightExposureScale = (float)Math.pow(2.0, -highlightEv);
+ 
+         basePipeline.mParameters.motionV2WronskiMidtoneMipGrid = null;
+         basePipeline.mParameters.motionV2WronskiFusedLumaGrid = null;
+@@ -133,12 +146,16 @@ public final class MotionV2WronskiLtm extends Node {
+             glProg.useAssetProgram("motionv2/wronski_ltm_level2_exposures");
+             glProg.setTexture("InputBuffer", source);
+             glProg.setVar("exposure", exposure);
++            glProg.setVar("highlightExposureScale", highlightExposureScale);
++            glProg.setVar("shadowExposureScale", shadowExposureScale);
+             glProg.drawBlocks(exposures[DISPLAY_MIP]);
+             glProg.closed = true;
+ 
+             glProg.useAssetProgram("motionv2/wronski_ltm_level2_weights");
+             glProg.setTexture("InputBuffer", source);
+             glProg.setVar("exposure", exposure);
++            glProg.setVar("highlightExposureScale", highlightExposureScale);
++            glProg.setVar("shadowExposureScale", shadowExposureScale);
+             glProg.drawBlocks(weights[DISPLAY_MIP]);
+             glProg.closed = true;
+ 
+@@ -165,8 +182,13 @@ public final class MotionV2WronskiLtm extends Node {
+                 glProg.setTexture("WeightsFine", weights[fine]);
+                 glProg.setTexture("ExposuresCoarse", exposures[level]);
+                 glProg.setTexture("AccumCoarse", assembled[level]);
++                glProg.setTexture("BroadWeights", weights[COARSE_MIP - 1]);
+                 glProg.setVar("FineSize", (float) exposures[fine].mSize.x,
+                         (float) exposures[fine].mSize.y);
++                /* Keep exact Wronski weighting at mip 5 where broad ceiling/illumination shape
++                 * lives. Mips 4..2 reuse that mip-5 exposure authority so fine object edges,
++                 * curtain folds, text and microstructure cannot independently switch branches. */
++                glProg.setVar("useBroadWeightAuthority", fine <= COARSE_MIP - 2 ? 1.0f : 0.0f);
+                 glProg.drawBlocks(assembled[fine]);
+                 glProg.closed = true;
+             }
+@@ -193,16 +215,17 @@ public final class MotionV2WronskiLtm extends Node {
+             glProg.closed = true;
+ 
+             long lowResSamples = (long) level2.x * level2.y;
+-            Log.i(Name, "IRIS_26616_WRONSKI_EXACT_LTM"
++            Log.i(Name, "IRIS_26617_WRONSKI_ADAPTIVE_LTM"
+                     + " exposure=" + exposure
+                     + " branches=3"
+-                    + " highlightEv=-" + HIGHLIGHTS_EV
++                    + " highlightEv=-" + highlightEv
+                     + " midtoneEv=0.0"
+-                    + " shadowEv=+" + SHADOWS_EV
++                    + " shadowEv=+" + shadowEv
+                     + " sigma=" + EXPOSURE_PREFERENCE_SIGMA
+                     + " coarseMip=" + COARSE_MIP
+                     + " displayMip=" + DISPLAY_MIP
+                     + " boostLocalContrast=" + BOOST_LOCAL_CONTRAST
++                    + " fineWeightAuthority=mip5_for_mips4to2"
+                     + " guidedSigma=" + GUIDED_SPATIAL_SIGMA
+                     + " lowLumaThreshold=" + LOW_LUMA_UNITY_THRESHOLD
+                     + " mip2=" + level2.x + "x" + level2.y
+@@ -213,10 +236,10 @@ public final class MotionV2WronskiLtm extends Node {
+                     + " globalImageMultiplierOutsideLtm=false"
+                     + " physicalHdrGuide=alphaPreLtm"
+                     + " source=bartwronski_2022_demo_sha_07417fe_three_r138");
+-            MotionTrace.processingState("IRIS_26616_WRONSKI_LTM_AUTHORITY",
+-                    "owner=WRONSKI_EXPOSURE_FUSION_EXACT"
++            MotionTrace.processingState("IRIS_26617_WRONSKI_LTM_AUTHORITY",
++                    "owner=WRONSKI_ADAPTIVE_RANGE_STRUCTURE_STABLE"
+                             + " exposure=" + exposure
+-                            + " branches=3 ev=-2,0,+1.5 sigma=5 mip=6 displayMip=2"
++                            + " branches=3 ev=-" + highlightEv + ",0,+" + shadowEv + " sigma=5 mip=6 displayMip=2"
+                             + " boostLocalContrast=false sharedTrue2x=true"
+                             + " physicalHdrAlphaSeparate=true");
+         } finally {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 1c9065748c94343487b4f2e0465a9dc0f05f9a87..2d8a397368adf7620de43fa402064605e3534851 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -55,8 +55,17 @@ public class Parameters {
+      * Scene brightness normalization applied only after temporal Bayer fusion + RCD.
+      */
+     public float motionV2DisplayGain = 1.0f;
++    /* IRIS_26617_ADAPTIVE_WRONSKI_BRANCH_RANGE
++     * Capture-adaptive synthetic exposure offsets solved from the same fixed candidate sample set
++     * used by the viewfinder matcher. These are presentation-only Wronski parameters: they never
++     * alter RAW/CFA/Sabre/DNG/physical-HDR ownership. Highlight EV is stored as a positive
++     * magnitude and consumed as 2^-EV; shadow EV is consumed as 2^+EV.
++     */
++    public float motionV2WronskiShadowEv = 1.5f;
++    public float motionV2WronskiHighlightEv = 2.0f;
++    public float motionV2WronskiBroadHighlightFraction = 0.0f;
+     /* IRIS_26616_WRONSKI_SHARED_MIP2_AUTHORITY
+-     * Exact linked-demo display-mip=2 fields produced once by the 1x Wronski exposure-fusion solve.
++     * Display-mip=2 fields produced once by the 1x adaptive Wronski exposure-fusion solve.
+      * G/midtone lightness from the exposure pyramid and the fused scalar are immutable after
+      * production and are reused by true-2x guided application. SR may not solve another LTM.
+      */
+diff --git a/app/version.properties b/app/version.properties
+index 1548c90efb9b12cbdae26b2bb02be83dacf5607a..6052f7aac021023c299d33f7bb8c5edeeddf9707 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726616
+-VERSION_BUILD=26616
++VERSION_NAME=0.9726617
++VERSION_BUILD=26617
