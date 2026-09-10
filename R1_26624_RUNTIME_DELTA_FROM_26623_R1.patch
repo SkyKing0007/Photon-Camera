@@ -1,0 +1,143 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 0fd7533d02b6d51fde58e484b8891bbe45d43273..0f734408d308c805c7c3dce0181ce45ef210e431 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -841,6 +841,7 @@ internal object GlesMgcRawSabreShaders {
+             float componentSourceConfidence = 0.0;
+             float literalLossSeen = 0.0;
+             float effectiveLossSeen = 0.0;
++            float effectiveLossComponentConfidence = 0.0;
+             float anchorConfidenceSum = 0.0;
+             int anchorPhaseEvidence = 0;
+             int anchorQuadEvidence = 0;
+@@ -876,9 +877,20 @@ internal object GlesMgcRawSabreShaders {
+                                 uSourceClippingPoint) literalPhasesHere += 1;
+                     }
+                     if (literalPhasesHere >= 2) literalLossSeen = 1.0;
+-                    if (hasShort) effectiveLossSeen = max(
+-                        effectiveLossSeen,
+-                        effectiveLossWeight(referenceNormalized, scaledShort));
++                    if (hasShort) {
++                        float probeEffectiveLoss = effectiveLossWeight(
++                            referenceNormalized, scaledShort);
++                        effectiveLossSeen = max(effectiveLossSeen, probeEffectiveLoss);
++                        /* IRIS_26624_COMPONENT_OWNED_EFFECTIVE_LOSS_MEMBERSHIP
++                         * Near-saturated NORMAL may already have lost radiometry before literal
++                         * two-phase sensor clipping. Bind that loss to SHORT headroom from the SAME
++                         * probe so an unrelated good SHORT sample elsewhere in the flow cell cannot
++                         * manufacture component membership. This is region membership only; geometry
++                         * trust still requires the unchanged sub-pixel measurable boundary seed. */
++                        effectiveLossComponentConfidence = max(
++                            effectiveLossComponentConfidence,
++                            min(probeSourceConfidence, probeEffectiveLoss));
++                    }
+ 
+                     int phasesThisQuad = 0;
+                     if (hasShort) {
+@@ -898,15 +910,17 @@ internal object GlesMgcRawSabreShaders {
+                 }
+             }
+ 
+-            /* IRIS_26611_CLIPPED_INTERIOR_CANNOT_SELF_SEED
+-             * z is region membership only: a two-phase physically censored NORMAL component with
+-             * valid SHORT source headroom. It intentionally contains no geometry confidence.
+-             * Geometry enters exclusively through w (same-CFA measurable-boundary anchor) and is
+-             * then propagated through z by the bottleneck pass. Literal clipping itself can never
+-             * create trust. Effective/sub-clipping loss remains telemetry and retains ordinary
+-             * exposure-normalized NORMAL rejection. */
+-            float componentConfidence = min(
++            /* IRIS_26624_BOUNDARY_PROVEN_LITERAL_PLUS_EFFECTIVE_COMPONENT
++             * z remains region membership only and still contains no geometry authority. Preserve
++             * 26611 literal two-phase clipping exactly, but also admit exposure-normalized effective
++             * loss when the SAME probe has valid SHORT headroom. This allows a proven boundary to
++             * carry trust through broad clouds/ground/foliage whose NORMAL signal flattened before
++             * literal clipping. Neither literal nor effective loss can self-seed: geometry enters
++             * exclusively through unchanged w and the CFA-safe bottleneck propagation below. */
++            float literalComponentConfidence = min(
+                 componentSourceConfidence, literalLossSeen);
++            float componentConfidence = max(
++                literalComponentConfidence, effectiveLossComponentConfidence);
+             float anchorConfidence = 0.0;
+             if (anchorQuadEvidence >= 4 && anchorPhaseEvidence >= 8
+                     && boundaryLocalFlowProof > 0.0) {
+@@ -1128,11 +1142,18 @@ internal object GlesMgcRawSabreShaders {
+              * ordinary-rejection physical/unblocker weight after the same dilation remains a hard
+              * cap, and the common RBF 3x3 source-clipping guard still runs afterward. */
+             float censoredCoreWeight = min(physicalWeight, rescueConfidence);
+-            /* IRIS_26610_ONLY_PHYSICAL_CENSORSHIP_RELAXES_PHOTOMETRY
+-             * effectiveLoss remains useful telemetry/evidence, but cannot replace ordinaryWeight.
+-             * Only proven two-phase literal RAW censorship invalidates NORMAL-reference photometry. */
++            /* IRIS_26624_COMPONENT_OWNED_EFFECTIVE_LOSS_RESCUE
++             * Preserve the complete 26611 literal-censoring path byte-for-byte in literalFinalWeight.
++             * For pre-clipping/effective NORMAL loss, componentTrust is the geometry authority: only
++             * boundary-proven trust may expose the already-validated SHORT sample, still capped by
++             * SHORT headroom + ordinary physical rejection and followed by the common 3x3 source-clip
++             * veto. effectiveRescueWeight is additive-only (max), so near-saturation recovery can
++             * never reduce an ordinary valid SHORT weight or alter non-highlight behavior. */
+             float physicalCensoring = clamp(literalLoss, 0.0, 1.0);
+-            float finalWeight = mix(ordinaryWeight, censoredCoreWeight, physicalCensoring);
++            float literalFinalWeight = mix(
++                ordinaryWeight, censoredCoreWeight, physicalCensoring);
++            float effectiveRescueWeight = censoredCoreWeight * clamp(effectiveLoss, 0.0, 1.0);
++            float finalWeight = max(literalFinalWeight, effectiveRescueWeight);
+             oWeight = clamp(finalWeight, 0.0, 1.0);
+             oRescueOnlyWeight = clamp(max(finalWeight - ordinaryWeight, 0.0), 0.0, 1.0);
+             oLossCandidate = targetLoss;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 7533e7940254404fdf6c7f54ac5d614c9aa1b0c3..fbc7974a89120ccf3b3d35c50c202ccbaf107265 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2733,7 +2733,10 @@ internal class GlesMgcRawSpatialStacker(
+                             "boundaryError=0.03..0.08 boundaryResidualRawPx=0.35..0.95 " +
+                             "componentFlowBarrierRawPx=0.50..1.25 " +
+                             "boundaryLocalResidualRequired=true predictorCannotOverrideLocalBoundary=true " +
+-                            "literalCoreSelfSeed=false effectiveLossPhotometricBypass=false " +
++                            "literalCoreSelfSeed=false effectiveCoreSelfSeed=false " +
++                            "componentMembership=LITERAL_PLUS_BOUNDARY_PROVEN_EFFECTIVE_LOSS " +
++                            "effectiveLossPhotometricBypass=BOUNDARY_PROVEN_COMPONENT_ONLY_ADDITIVE " +
++                            "shortInteriorSamples=ACTUAL_ALIGNED_SAME_CFA_SHORT noSpatialFill=true " +
+                             "shortHeadroomOwner=SAME_AS_COMMON_RBF_FINAL_0P75_PERCENT " +
+                             "boundarySeedCells=$highlightShortBoundarySeedCells26607 " +
+                             "componentTrustedCells=$highlightShortBoundaryFinalCells26607 " +
+@@ -3838,11 +3841,11 @@ internal class GlesMgcRawSpatialStacker(
+         )
+     }
+ 
+-    /* IRIS_26623_SHORT_BROAD_LOSS_SUPPORT_TELEMETRY
+-     * Read-only proxy for broad highlight-loss interiors, using data already read for 26607. A
+-     * candidate is "broad interior" only when its center and all four cardinal neighbors are
+-     * normal-loss candidates. Support is measured from the exact post-source-clip target
+-     * accumulator eligibility bytes. No weight, mask, merge, CFA, flow or resolve decision changes. */
++    /* IRIS_26624_SHORT_COMPONENT_RECOVERY_TELEMETRY
++     * Preserve 26623's device-proven broad-loss proxy while reporting the result after component-owned
++     * effective-loss rescue. A candidate is broad interior only when center + four cardinal neighbors
++     * are NORMAL-loss candidates. Support remains the exact post-source-clip target-accumulator bytes;
++     * this logger never changes weight, mask, CFA, flow, merge, resolve, or GPU lifetime. */
+     private fun logSabreShortBroadLossSupport26623(
+         loss: ByteArray?,
+         support: ByteArray?,
+@@ -3871,9 +3874,10 @@ internal class GlesMgcRawSpatialStacker(
+         val details = "broadInteriorCells=$broadInterior broadSupportedCells=$supported " +
+             "broadUnsupportedCells=$unsupported broadSupportFraction=$fraction " +
+             "definition=centerPlus4CardinalNormalLoss support=postSourceClipTargetAccumulator " +
+-            "readOnly=true outputUnchanged=true"
+-        PLog.i(SABRE_TAG, "IRIS_26623_SHORT_BROAD_LOSS_SUPPORT $details")
+-        MotionTrace.processingState("IRIS_26623_SHORT_BROAD_LOSS_SUPPORT", details)
++            "componentMembership=literalPlusEffective boundaryProofRequired=true " +
++            "actualAlignedSameCfaShort=true noSpatialFill=true readOnly=true"
++        PLog.i(SABRE_TAG, "IRIS_26624_SHORT_COMPONENT_RECOVERY $details")
++        MotionTrace.processingState("IRIS_26624_SHORT_COMPONENT_RECOVERY", details)
+     }
+ 
+     private fun renderSabreRejection(
+diff --git a/app/version.properties b/app/version.properties
+index 17a310a6c53fd5d05a42b4ba3d22e0a6c46a7314..c6b036a8bff33b9670c66762c90f8330d86f00dc 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726623
+-VERSION_BUILD=26623
++VERSION_NAME=0.9726624
++VERSION_BUILD=26624
