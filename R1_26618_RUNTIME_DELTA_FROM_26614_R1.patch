@@ -1,0 +1,566 @@
+diff --git a/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_apply_26618.glsl b/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_apply_26618.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..472fa531eb302ca1434727a452bac19b7e01c771
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_apply_26618.glsl
+@@ -0,0 +1,22 @@
++precision highp float;
++precision mediump sampler2D;
++
++uniform sampler2D InputBuffer;
++uniform sampler2D LtmGainBuffer;
++out vec3 Output;
++
++/* IRIS_26618_GUIDED_BASE_DETAIL_LTM_APPLY
++ * One common scalar preserves RGB chromaticity.  Genuine extended-HDR samples are
++ * faded back to unity so the local operator cannot erase physically reconstructed
++ * >1 headroom that 26614 UHDR publication is responsible for carrying.
++ */
++void main() {
++    ivec2 imageSize = textureSize(InputBuffer, 0);
++    vec2 uv = gl_FragCoord.xy / vec2(max(imageSize, ivec2(1)));
++    vec3 rgb = max(texture(InputBuffer, uv).rgb, vec3(0.0));
++    float localGain = clamp(texture(LtmGainBuffer, uv).r, 0.50, 1.0);
++    float sourcePeak = max(rgb.r, max(rgb.g, rgb.b));
++    float preserveHdr = smoothstep(0.95, 1.05, sourcePeak);
++    float appliedGain = mix(localGain, 1.0, preserveHdr);
++    Output = rgb * appliedGain;
++}
+diff --git a/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_coeff_26618.glsl b/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_coeff_26618.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..5b3f66484db7b117d83205a58393b62e6f7b4129
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_coeff_26618.glsl
+@@ -0,0 +1,46 @@
++precision highp float;
++precision mediump sampler2D;
++
++uniform sampler2D InputBuffer;
++uniform ivec2 ltmGridSize;
++out vec4 Output;
++
++/*
++ * IRIS_26618_GUIDED_BASE_DETAIL_LTM_COEFFICIENTS
++ *
++ * Self-guided filter coefficients in log2 luminance.  This is a luminance-only
++ * appearance decomposition: no RGB component is mixed with a neighbour and no
++ * chroma quantity is modified.  A 7x7 support on the deliberately low-resolution
++ * coefficient grid captures broad illumination while the guided variance term
++ * keeps material/geometry edges out of that broad base.
++ */
++const vec3 IRIS_LUMA = vec3(0.22897456, 0.69173852, 0.07928691);
++const float IRIS_GUIDED_EPSILON_STOPS2 = 0.0625; // (0.25 stop)^2
++
++float irisLogLuma(vec2 uv) {
++    vec3 rgb = max(texture(InputBuffer, clamp(uv, vec2(0.0), vec2(1.0))).rgb, vec3(0.0));
++    float y = max(dot(rgb, IRIS_LUMA), 0.000244140625); // 2^-12
++    return log2(y);
++}
++
++void main() {
++    vec2 gridSize = vec2(max(ltmGridSize, ivec2(1)));
++    vec2 uv = gl_FragCoord.xy / gridSize;
++    vec2 stepUv = 1.0 / gridSize;
++
++    float sum = 0.0;
++    float sum2 = 0.0;
++    for (int j = -3; j <= 3; ++j) {
++        for (int i = -3; i <= 3; ++i) {
++            float v = irisLogLuma(uv + vec2(float(i), float(j)) * stepUv);
++            sum += v;
++            sum2 += v * v;
++        }
++    }
++    const float invN = 1.0 / 49.0;
++    float mean = sum * invN;
++    float variance = max(sum2 * invN - mean * mean, 0.0);
++    float a = variance / (variance + IRIS_GUIDED_EPSILON_STOPS2);
++    float b = mean * (1.0 - a);
++    Output = vec4(a, b, 0.0, 1.0);
++}
+diff --git a/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_gain_26618.glsl b/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_gain_26618.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..623e69b2b1bf649645e36b2cfae4df1a4cb50d17
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/guided_base_detail_ltm_gain_26618.glsl
+@@ -0,0 +1,64 @@
++precision highp float;
++precision mediump sampler2D;
++
++uniform sampler2D InputBuffer;
++uniform sampler2D CoeffBuffer;
++uniform float displayGain;
++uniform ivec2 ltmGridSize;
++out vec4 Output;
++
++/*
++ * IRIS_26618_GUIDED_BASE_DETAIL_LTM_GAIN
++ *
++ * Reconstruct the low-frequency guided log-luminance base from smoothed (a,b)
++ * coefficients, then allocate only the already-requested 26614 presentation lift.
++ * Dark broad regions retain the full global target; broad regions that would be
++ * driven near display white receive a bounded pre-tone attenuation.  Because the
++ * scalar depends on the guided base rather than the local detail residual, the
++ * original log-luminance detail is recombined unchanged.
++ */
++const vec3 IRIS_LUMA = vec3(0.22897456, 0.69173852, 0.07928691);
++const float IRIS_OUTPUT_EXPOSURE_SCALE = 0.80;
++
++float irisLogLuma(vec2 uv) {
++    vec3 rgb = max(texture(InputBuffer, clamp(uv, vec2(0.0), vec2(1.0))).rgb, vec3(0.0));
++    return log2(max(dot(rgb, IRIS_LUMA), 0.000244140625));
++}
++
++void main() {
++    vec2 gridSize = vec2(max(ltmGridSize, ivec2(1)));
++    vec2 uv = gl_FragCoord.xy / gridSize;
++    ivec2 coeffSize = textureSize(CoeffBuffer, 0);
++    vec2 coeffStep = 1.0 / vec2(max(coeffSize, ivec2(1)));
++
++    vec2 meanAb = vec2(0.0);
++    for (int j = -1; j <= 1; ++j) {
++        for (int i = -1; i <= 1; ++i) {
++            meanAb += texture(CoeffBuffer,
++                    clamp(uv + vec2(float(i), float(j)) * coeffStep,
++                          vec2(0.0), vec2(1.0))).rg;
++        }
++    }
++    meanAb *= 1.0 / 9.0;
++
++    float logY = irisLogLuma(uv);
++    float guidedBaseLog = meanAb.x * logY + meanAb.y;
++    float guidedBase = exp2(guidedBaseLog);
++
++    float requestedFinalGain = max(displayGain * IRIS_OUTPUT_EXPOSURE_SCALE, 1.0e-6);
++    float requestedEv = max(log2(requestedFinalGain), 0.0);
++    float projectedBase = guidedBase * requestedFinalGain;
++
++    /* Universal, non-semantic allocation.  The operator is deliberately inactive
++     * for small/no presentation lifts, then smoothly reserves up to half of the
++     * requested EV in broad regions whose projected base approaches nominal white. */
++    float requestPressure = smoothstep(0.35, 1.50, requestedEv);
++    float brightBasePressure = smoothstep(0.42, 0.95, projectedBase);
++    float protectEv = min(1.0, 0.50 * requestedEv)
++            * requestPressure * brightBasePressure;
++    float gain = exp2(-protectEv);
++
++    /* Bound the scalar so this stage cannot become a replacement global tone curve. */
++    gain = clamp(gain, 0.50, 1.0);
++    Output = vec4(gain, guidedBaseLog, requestedEv, 1.0);
++}
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 1c4812c0f6f278177a1dc88c5b780747737e1dce..1217543185e633a194f485b3f8c4b9297984797c 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -506,7 +506,23 @@ struct Params {
+     float residualZoom=1.f,displayGain=1.f,exposureEv=0.f,shadows=0.f,contrast=0.f,sceneWhite=1.f;
+     float sensorToProfile[9]{};
+     float profileToDisplay[9]{};
++    int guidedLtmW=0,guidedLtmH=0;
++    std::vector<float> guidedLtmGain;
++    bool guidedLtmEnabled()const{return guidedLtmW>1&&guidedLtmH>1&&guidedLtmGain.size()==(size_t)guidedLtmW*guidedLtmH;}
+ };
++inline float iris26618GuidedLtmGainAt(const Params&p,float trueX,float trueY){
++    if(!p.motionHdrHandoff||!p.guidedLtmEnabled())return 1.f;
++    float nx=p.trueW>1?clampf(trueX/(float)(p.trueW-1),0.f,1.f):0.f;
++    float ny=p.trueH>1?clampf(trueY/(float)(p.trueH-1),0.f,1.f):0.f;
++    float mx=nx*(float)(p.guidedLtmW-1),my=ny*(float)(p.guidedLtmH-1);
++    int x0=(int)std::floor(mx),y0=(int)std::floor(my);
++    int x1=std::min(x0+1,p.guidedLtmW-1),y1=std::min(y0+1,p.guidedLtmH-1);
++    float fx=mx-x0,fy=my-y0;
++    auto at=[&](int x,int y){return p.guidedLtmGain[(size_t)y*p.guidedLtmW+x];};
++    float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx;
++    float b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;
++    return clampf(a+(b-a)*fy,0.50f,1.f);
++}
+ inline Vec3 mat(const float*m,Vec3 v){
+     return {m[0]*v.r+m[1]*v.g+m[2]*v.b,
+             m[3]*v.r+m[4]*v.g+m[5]*v.b,
+@@ -540,7 +556,7 @@ inline Vec3 tone(Vec3 rgb,const Params&p){
+     if(virtualGain!=1.f)rgb=mul(rgb,1.f/virtualGain);
+     return clampNonnegative(rgb);
+ }
+-inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;if(p.motionHdrHandoff){float g=iris26618GuidedLtmGainAt(p,(float)x,(float)y);float preserve=smoothstep(0.95f,1.05f,peak(c));g=g+(1.f-g)*preserve;c=mul(c,g);}else c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
+ inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,Vec3*out){
+     x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAt(s,p,ix,iy,out);}
+@@ -585,7 +601,7 @@ inline bool adaptiveAppearanceCached(const ProfileRegion&s,const Params&p,int x,
+     if(inPeak>=1.f||projectedPeak>=1.f)limit=1.f;else{limit=std::min(limit,componentGainLimit(cy,cc.r));limit=std::min(limit,componentGainLimit(cy,cc.g));limit=std::min(limit,componentGainLimit(cy,cc.b));}
+     float g=clampf(std::min(requested,limit),1.f,1.22f);*out=g<=1.000001f?center:add(Vec3{cy,cy,cy},mul(cc,g));return true;
+ }
+-inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;if(p.motionHdrHandoff){float g=iris26618GuidedLtmGainAt(p,(float)x,(float)y);float preserve=smoothstep(0.95f,1.05f,peak(c));g=g+(1.f-g)*preserve;c=mul(c,g);}else c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
+ inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,float y,Vec3*out){
+     x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAtCached(s,p,ix,iy,out);}
+@@ -757,6 +773,8 @@ layout(local_size_x=16,local_size_y=8,local_size_z=1) in;
+ layout(binding=0) uniform highp sampler2D uSource;
+ layout(rgba8ui,binding=0) writeonly uniform highp uimage2D uOutput;
+ layout(std430,binding=1) readonly buffer IrisGammaLut { float gammaLut[]; };
++/* IRIS_26618_TRUE2X_SHARED_GUIDED_LTM_GPU */
++layout(std430,binding=2) readonly buffer IrisGuidedLtmGain { float guidedLtmGain[]; };
+ 
+ uniform ivec2 uSrcOrigin;
+ uniform ivec2 uSrcSize;
+@@ -776,6 +794,8 @@ uniform float uShadows;
+ uniform float uContrast;
+ uniform float uSceneWhite;
+ uniform int uMotionHdrHandoff;
++uniform int uGuidedLtmEnabled;
++uniform ivec2 uGuidedLtmSize;
+ uniform float uGainMax;
+ uniform float uGainContentMax;
+ uniform vec3 uSensorRow0;
+@@ -844,6 +864,22 @@ vec3 irisAdaptive(ivec2 p){
+     float g=clamp(min(requested,limitV),1.0,1.22);
+     return g<=1.000001?center:vec3(cy)+cc*g;
+ }
++float iris26618GuidedLtmGainAt(vec2 truePos){
++    if(uGuidedLtmEnabled==0||uGuidedLtmSize.x<=1||uGuidedLtmSize.y<=1)return 1.0;
++    vec2 denom=max(vec2(uTrueSize-ivec2(1)),vec2(1.0));
++    vec2 n=clamp(truePos/denom,vec2(0.0),vec2(1.0));
++    vec2 mp=n*vec2(uGuidedLtmSize-ivec2(1));
++    ivec2 p0=ivec2(floor(mp));
++    ivec2 p1=min(p0+ivec2(1),uGuidedLtmSize-ivec2(1));
++    vec2 f=mp-vec2(p0);
++    int i00=p0.y*uGuidedLtmSize.x+p0.x;
++    int i10=p0.y*uGuidedLtmSize.x+p1.x;
++    int i01=p1.y*uGuidedLtmSize.x+p0.x;
++    int i11=p1.y*uGuidedLtmSize.x+p1.x;
++    float a=mix(guidedLtmGain[i00],guidedLtmGain[i10],f.x);
++    float b=mix(guidedLtmGain[i01],guidedLtmGain[i11],f.x);
++    return clamp(mix(a,b,f.y),0.50,1.0);
++}
+ vec3 irisTone(vec3 rgb){
+     bool manualActive=abs(uExposureEv)>=0.0001||abs(uShadows)>=0.0001||abs(uContrast)>=0.0001;
+     float virtualGain=uMotionHdrHandoff!=0&&manualActive?max(uDisplayGain,1.0e-6):1.0;
+@@ -866,7 +902,7 @@ vec3 irisTone(vec3 rgb){
+     if(virtualGain!=1.0)rgb/=virtualGain;
+     return irisClampNonnegative(rgb);
+ }
+-vec3 irisPreRenderAt(ivec2 p){vec3 c=irisAdaptive(p);if(uMotionHdrHandoff==0)c*=max(uDisplayGain,1.0e-6);return irisTone(c);}
++vec3 irisPreRenderAt(ivec2 p){vec3 c=irisAdaptive(p);if(uMotionHdrHandoff!=0){float g=iris26618GuidedLtmGainAt(vec2(p));float preserve=smoothstep(0.95,1.05,irisPeak(c));g=mix(g,1.0,preserve);c*=g;}else c*=max(uDisplayGain,1.0e-6);return irisTone(c);}
+ vec3 irisSamplePreRender(vec2 p){
+     p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
+     if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
+@@ -982,6 +1018,10 @@ public:
+         glGenTextures(1,&outputTex);glBindTexture(GL_TEXTURE_2D,outputTex);glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8UI,outWidth,maxBandRows);
+         glGenFramebuffers(1,&fbo);glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,outputTex,0);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){set(reason,"RGBA8UI framebuffer");return false;}
+         glGenBuffers(1,&lutSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,lutSsbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(lut.v.size()*sizeof(float)),lut.v.data(),GL_STATIC_DRAW);
++        glGenBuffers(1,&guidedLtmSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,guidedLtmSsbo);
++        const float unityLtm=1.f;const float*ltmData=p.guidedLtmEnabled()?p.guidedLtmGain.data():&unityLtm;
++        size_t ltmCount=p.guidedLtmEnabled()?p.guidedLtmGain.size():1u;
++        glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(ltmCount*sizeof(float)),ltmData,GL_STATIC_DRAW);
+         const size_t maxBytes=(size_t)outWidth*maxBandRows*4;glGenBuffers(2,pbo);for(int i=0;i<2;i++){glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[i]);glBufferData(GL_PIXEL_PACK_BUFFER,(GLsizeiptr)maxBytes,nullptr,GL_STREAM_READ);}
+         glBindBuffer(GL_PIXEL_PACK_BUFFER,0);GLenum err=glGetError();if(err!=GL_NO_ERROR){set(reason,"GL allocation");return false;}
+         glUseProgram(program);glUniform1i(loc("uSource"),0);setParams();return true;
+@@ -993,7 +1033,7 @@ public:
+         if(src.w>sourceAllocW||src.h>sourceAllocH){sourceAllocW=std::max(sourceAllocW,src.w);sourceAllocH=std::max(sourceAllocH,src.h);glTexImage2D(GL_TEXTURE_2D,0,GL_RGB16F,sourceAllocW,sourceAllocH,0,GL_RGB,GL_HALF_FLOAT,nullptr);}
+         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,src.w,src.h,GL_RGB,GL_HALF_FLOAT,src.rgb.data());
+         glUseProgram(program);glUniform2i(loc("uSrcOrigin"),src.x0,src.y0);glUniform2i(loc("uSrcSize"),src.w,src.h);glUniform1i(loc("uBandTop"),top);glUniform1i(loc("uBandH"),h);glUniform1i(loc("uGenerateGain"),generateGain?1:0);glUniform1f(loc("uGainMax"),gainMax);glUniform1f(loc("uGainContentMax"),gainContentMax);
+-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,lutSsbo);glBindImageTexture(0,outputTex,0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8UI);
++        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,lutSsbo);glBindBufferBase(GL_SHADER_STORAGE_BUFFER,2,guidedLtmSsbo);glBindImageTexture(0,outputTex,0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8UI);
+         glDispatchCompute((GLuint)((outWidth+15)/16),(GLuint)((h+7)/8),1);glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT|GL_FRAMEBUFFER_BARRIER_BIT);
+         glBindFramebuffer(GL_FRAMEBUFFER,fbo);glReadBuffer(GL_COLOR_ATTACHMENT0);glPixelStorei(GL_PACK_ALIGNMENT,1);glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[slot]);glReadPixels(0,0,outWidth,h,GL_RGBA_INTEGER,GL_UNSIGNED_BYTE,(void*)0);
+         if(fence[slot]){glDeleteSync(fence[slot]);fence[slot]=0;}if(explicitFenceSync)fence[slot]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);glFlush();auto ue=std::chrono::steady_clock::now();if(timing)timing->uploadDispatchNs+=iris26569Ns(us,ue);
+@@ -1010,20 +1050,20 @@ public:
+     }
+ private:
+     EGLDisplay display=EGL_NO_DISPLAY;EGLConfig config=nullptr;EGLSurface surface=EGL_NO_SURFACE;EGLContext context=EGL_NO_CONTEXT;
+-    GLuint program=0,sourceTex=0,outputTex=0,fbo=0,lutSsbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
++    GLuint program=0,sourceTex=0,outputTex=0,fbo=0,lutSsbo=0,guidedLtmSsbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
+     GLint loc(const char*n){return glGetUniformLocation(program,n);}
+     static void set(std::string*r,const char*m){if(r)*r=m?m:"unknown";}
+     static void setGl(std::string*r,const char*stage,GLenum err){if(!r)return;char b[96];std::snprintf(b,sizeof(b),"%s_gl_error_0x%04x",stage?stage:"gl",(unsigned int)err);*r=b;}
+     void setParams(){
+-        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);
++        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);glUniform1i(loc("uGuidedLtmEnabled"),params->guidedLtmEnabled()?1:0);glUniform2i(loc("uGuidedLtmSize"),params->guidedLtmEnabled()?params->guidedLtmW:1,params->guidedLtmEnabled()?params->guidedLtmH:1);
+         glUniform3f(loc("uSensorRow0"),params->sensorToProfile[0],params->sensorToProfile[1],params->sensorToProfile[2]);glUniform3f(loc("uSensorRow1"),params->sensorToProfile[3],params->sensorToProfile[4],params->sensorToProfile[5]);glUniform3f(loc("uSensorRow2"),params->sensorToProfile[6],params->sensorToProfile[7],params->sensorToProfile[8]);
+         glUniform3f(loc("uDisplayRow0"),params->profileToDisplay[0],params->profileToDisplay[1],params->profileToDisplay[2]);glUniform3f(loc("uDisplayRow1"),params->profileToDisplay[3],params->profileToDisplay[4],params->profileToDisplay[5]);glUniform3f(loc("uDisplayRow2"),params->profileToDisplay[6],params->profileToDisplay[7],params->profileToDisplay[8]);
+     }
+     void destroy(){
+         if(display!=EGL_NO_DISPLAY&&context!=EGL_NO_CONTEXT&&surface!=EGL_NO_SURFACE)eglMakeCurrent(display,surface,surface,context);
+-        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
++        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(guidedLtmSsbo)glDeleteBuffers(1,&guidedLtmSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
+         if(display!=EGL_NO_DISPLAY){eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(context!=EGL_NO_CONTEXT)eglDestroyContext(display,context);if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);eglTerminate(display);}
+-        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=outputTex=fbo=lutSsbo=0;pbo[0]=pbo[1]=0;
++        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=outputTex=fbo=lutSsbo=guidedLtmSsbo=0;pbo[0]=pbo[1]=0;
+     }
+ };
+ 
+@@ -1104,12 +1144,14 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_particlesdevs_photoncamera_process
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative(
+         JNIEnv*e,jclass,jobject bitmap,jstring renderPath,jint trueW,jint trueH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,
+         jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloat displayGain,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat sceneWhite,jboolean motionHdrHandoff,
++        jfloatArray guidedLtmGain,jint guidedLtmW,jint guidedLtmH,
+         jobject watermarkBitmap,
+         jfloatArray jinResidual,jintArray jinReference,jint jinW,jint jinH,jstring gainPath,jfloat gainMaxRatio,jfloat gainContentMaxRatio,jstring path,jint quality){
+     using namespace iris26564render;gIris26576PublicationTelemetry="backend=UNSET callStarted=true";AndroidBitmapInfo info{};if(!bitmap||!renderPath||!path||trueW<=0||trueH<=0||rawW<=0||rawH<=0||cropW<=0||cropH<=0||trueW!=rawW*2||trueH!=rawH*2||cropW>rawW||cropH>rawH||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888){iris26576SetPublicationTelemetry("backend=NONE validationFailed=true");return JNI_FALSE;}
+     int expectedNativeW=(rotation==90||rotation==270)?cropH:rawW,expectedNativeH=(rotation==90||rotation==270)?rawW:cropH;if((int)info.width!=expectedNativeW||(int)info.height!=expectedNativeH)return JNI_FALSE;
+     Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
+     if(!sensorToProfile||!profileToDisplay||e->GetArrayLength(sensorToProfile)!=9||e->GetArrayLength(profileToDisplay)!=9)return JNI_FALSE;e->GetFloatArrayRegion(sensorToProfile,0,9,p.sensorToProfile);e->GetFloatArrayRegion(profileToDisplay,0,9,p.profileToDisplay);if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.sensorToProfile)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.profileToDisplay)if(!std::isfinite(v))return JNI_FALSE;if(!std::isfinite(p.displayGain)||p.displayGain<=0.f||!std::isfinite(p.exposureEv)||!std::isfinite(p.shadows)||!std::isfinite(p.contrast)||!std::isfinite(p.residualZoom)||!std::isfinite(p.sceneWhite)||p.sceneWhite<=0.f)return JNI_FALSE;
++    if(guidedLtmGain||guidedLtmW||guidedLtmH){if(!guidedLtmGain||guidedLtmW<=1||guidedLtmH<=1||e->GetArrayLength(guidedLtmGain)!=(jsize)((jlong)guidedLtmW*guidedLtmH))return JNI_FALSE;p.guidedLtmW=guidedLtmW;p.guidedLtmH=guidedLtmH;p.guidedLtmGain.resize((size_t)guidedLtmW*guidedLtmH);e->GetFloatArrayRegion(guidedLtmGain,0,(jsize)p.guidedLtmGain.size(),p.guidedLtmGain.data());if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.guidedLtmGain)if(!std::isfinite(v)||v<0.499f||v>1.001f)return JNI_FALSE;}
+     U rp(e,renderPath),gp(e,gainPath),op(e,path);if(!rp.c||!op.c)return JNI_FALSE;const bool generateGain=gp.c!=nullptr;if(generateGain&&(!std::isfinite((float)gainMaxRatio)||gainMaxRatio<=1.f||!std::isfinite((float)gainContentMaxRatio)||gainContentMaxRatio<1.f))return JNI_FALSE;const float gainContentMax=generateGain?clampf((float)gainContentMaxRatio,1.f,(float)gainMaxRatio):1.f;int sourceFd=open(rp.c,O_RDONLY);if(sourceFd<0)return JNI_FALSE;struct stat st{};uint64_t expected=(uint64_t)trueW*(uint64_t)trueH*6ull;if(fstat(sourceFd,&st)!=0||(uint64_t)st.st_size!=expected){close(sourceFd);return JNI_FALSE;}
+     Watermark water{};if(watermarkBitmap){AndroidBitmapInfo wi{};if(AndroidBitmap_getInfo(e,watermarkBitmap,&wi)!=ANDROID_BITMAP_RESULT_SUCCESS||wi.format!=ANDROID_BITMAP_FORMAT_RGBA_8888||wi.width==0||wi.height==0){close(sourceFd);return JNI_FALSE;}void*wp=nullptr;if(AndroidBitmap_lockPixels(e,watermarkBitmap,&wp)!=ANDROID_BITMAP_RESULT_SUCCESS||!wp){close(sourceFd);return JNI_FALSE;}water.w=(int)wi.width;water.h=(int)wi.height;water.rgba.resize((size_t)water.w*water.h*4);for(int y=0;y<water.h;y++)std::memcpy(water.rgba.data()+(size_t)y*water.w*4,(const uint8_t*)wp+(size_t)y*wi.stride,(size_t)water.w*4);AndroidBitmap_unlockPixels(e,watermarkBitmap);}
+     Jin jin{};if(jinResidual||jinReference||jinW||jinH){if(!jinResidual||!jinReference||jinW<=1||jinH<=1||e->GetArrayLength(jinResidual)!=(jsize)((jlong)jinW*jinH*3)||e->GetArrayLength(jinReference)!=(jsize)((jlong)jinW*jinH)){close(sourceFd);return JNI_FALSE;}jin.w=jinW;jin.h=jinH;jin.residual.resize((size_t)jinW*jinH*3);jin.guide.resize((size_t)jinW*jinH);e->GetFloatArrayRegion(jinResidual,0,(jsize)jin.residual.size(),jin.residual.data());e->GetIntArrayRegion(jinReference,0,(jsize)jin.guide.size(),jin.guide.data());if(e->ExceptionCheck()){close(sourceFd);return JNI_FALSE;}for(float v:jin.residual)if(!std::isfinite(v)){close(sourceFd);return JNI_FALSE;}const auto&p3=displayP3Lut();jin.guideP3.resize((size_t)jinW*jinH*3);for(int i=0;i<jinW*jinH;i++){jint argb=jin.guide[(size_t)i];float sr=(float)((argb>>16)&255)/255.f,sg=(float)((argb>>8)&255)/255.f,sb=(float)(argb&255)/255.f;auto baseP3=p3.convertEncoded(sr,sg,sb);auto outP3=p3.convertEncoded(clampf(sr+jin.residual[(size_t)i*3],0.f,1.f),clampf(sg+jin.residual[(size_t)i*3+1],0.f,1.f),clampf(sb+jin.residual[(size_t)i*3+2],0.f,1.f));for(int c=0;c<3;c++){jin.guideP3[(size_t)i*3+c]=baseP3[(size_t)c];jin.residual[(size_t)i*3+c]=outP3[(size_t)c]-baseP3[(size_t)c];}}}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2GuidedBaseDetailLtm.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2GuidedBaseDetailLtm.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..e2610db3de473a883c1b36f813e5abb9613cdff8
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2GuidedBaseDetailLtm.java
+@@ -0,0 +1,148 @@
++package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
++
++import android.graphics.Point;
++
++import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
++import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
++import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
++import com.particlesdevs.photoncamera.util.Log;
++
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.FloatBuffer;
++
++/**
++ * IRIS_26618_GUIDED_BASE_DETAIL_LTM_OWNER
++ *
++ * Motion-only spatial exposure-allocation augmentation.  26614's viewfinder matcher still owns
++ * the desired global brightness target and MotionV2Render remains the only final tone/output
++ * curve.  This node only decomposes common extended-linear Display-P3 luminance into a guided
++ * broad base plus untouched local detail, then emits a bounded common-RGB scalar that prevents a
++ * large global brightness target from flattening already-bright broad illumination.
++ *
++ * The low-resolution scalar field is also copied into Parameters so the direct true-2x renderer
++ * consumes the identical field.  It is read-only presentation state: Sabre, SHORT, CFA validity,
++ * DNG, capture, denoise, alignment and temporal weights never consume it.
++ */
++public final class MotionV2GuidedBaseDetailLtm extends Node {
++    private static final int MAP_LONG_EDGE = 256;
++    private static final int MAP_MIN_EDGE = 48;
++    private static final float ACTIVE_FINAL_GAIN = 1.05f;
++
++    public MotionV2GuidedBaseDetailLtm() {
++        super("", "MotionV2GuidedBaseDetailLtm");
++    }
++
++    @Override public void Compile() {}
++
++    private static Point mapSize(Point source) {
++        if (source == null || source.x <= 0 || source.y <= 0) {
++            throw new IllegalArgumentException("Invalid 26618 LTM source size");
++        }
++        final float scale = (float) MAP_LONG_EDGE / (float) Math.max(source.x, source.y);
++        final int w = Math.max(MAP_MIN_EDGE, Math.round(source.x * scale));
++        final int h = Math.max(MAP_MIN_EDGE, Math.round(source.y * scale));
++        return new Point(w, h);
++    }
++
++    private void clearState() {
++        basePipeline.mParameters.motionV2GuidedLtmApplied = false;
++        basePipeline.mParameters.motionV2GuidedLtmWidth = 0;
++        basePipeline.mParameters.motionV2GuidedLtmHeight = 0;
++        basePipeline.mParameters.motionV2GuidedLtmGainMap = null;
++    }
++
++    @Override
++    public void Run() {
++        if (!basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive) {
++            throw new IllegalStateException("26618 guided LTM is Motion-only");
++        }
++        clearState();
++        final float displayGain = basePipeline.mParameters.motionV2DisplayGain;
++        if (!Float.isFinite(displayGain) || displayGain <= 0.0f) {
++            throw new IllegalStateException("Invalid 26618 LTM displayGain=" + displayGain);
++        }
++        final float requestedFinalGain = displayGain * 0.80f;
++        if (requestedFinalGain <= ACTIVE_FINAL_GAIN) {
++            WorkingTexture = previousNode.WorkingTexture;
++            glProg.closed = true;
++            Log.i(Name, "IRIS_26618_GUIDED_BASE_DETAIL_LTM"
++                    + " active=false requestedFinalGain=" + requestedFinalGain
++                    + " reason=SMALL_OR_NO_GLOBAL_LIFT"
++                    + " finalToneOwner=MotionV2Render true2xSharedField=false");
++            return;
++        }
++
++        final Point sourceSize = previousNode.WorkingTexture.mSize;
++        final Point low = mapSize(sourceSize);
++        final GLFormat rgba16f = new GLFormat(GLFormat.DataType.FLOAT_16, 4);
++        GLTexture coefficients = null;
++        GLTexture gainMap = null;
++        try {
++            coefficients = new GLTexture(low, rgba16f);
++            gainMap = new GLTexture(low, rgba16f);
++
++            glProg.useAssetProgram("motionv2/guided_base_detail_ltm_coeff_26618");
++            glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
++            glProg.setVar("ltmGridSize", low);
++            glProg.drawBlocks(coefficients);
++
++            glProg.useAssetProgram("motionv2/guided_base_detail_ltm_gain_26618");
++            glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
++            glProg.setTexture("CoeffBuffer", coefficients);
++            glProg.setVar("displayGain", displayGain);
++            glProg.setVar("ltmGridSize", low);
++            glProg.drawBlocks(gainMap);
++
++            gainMap.BufferLoad();
++            ByteBuffer bytes = gainMap.textureBuffer(
++                    new GLFormat(GLFormat.DataType.FLOAT_32, 4), true);
++            bytes.order(ByteOrder.nativeOrder());
++            FloatBuffer floats = bytes.asFloatBuffer();
++            final int count = low.x * low.y;
++            final float[] sharedGain = new float[count];
++            float min = Float.POSITIVE_INFINITY;
++            float max = Float.NEGATIVE_INFINITY;
++            double sum = 0.0;
++            for (int i = 0; i < count; ++i) {
++                final float g = floats.get(i * 4);
++                if (!Float.isFinite(g) || g < 0.499f || g > 1.001f) {
++                    throw new IllegalStateException(
++                            "Invalid 26618 shared LTM gain at " + i + ": " + g);
++                }
++                sharedGain[i] = g;
++                min = Math.min(min, g);
++                max = Math.max(max, g);
++                sum += g;
++            }
++
++            glProg.useAssetProgram("motionv2/guided_base_detail_ltm_apply_26618");
++            glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
++            glProg.setTexture("LtmGainBuffer", gainMap);
++            WorkingTexture = basePipeline.getMain();
++            glProg.drawBlocks(WorkingTexture);
++            glProg.closed = true;
++
++            basePipeline.mParameters.motionV2GuidedLtmGainMap = sharedGain;
++            basePipeline.mParameters.motionV2GuidedLtmWidth = low.x;
++            basePipeline.mParameters.motionV2GuidedLtmHeight = low.y;
++            basePipeline.mParameters.motionV2GuidedLtmApplied = true;
++
++            Log.i(Name, "IRIS_26618_GUIDED_BASE_DETAIL_LTM"
++                    + " active=true owner=GUIDED_LOG_LUMINANCE_BASE"
++                    + " detailResidual=UNCHANGED"
++                    + " rgbGain=COMMON_SCALAR"
++                    + " map=" + low.x + "x" + low.y
++                    + " gainMin=" + min + " gainMean=" + (sum / count) + " gainMax=" + max
++                    + " displayGain=" + displayGain
++                    + " requestedFinalGain=" + requestedFinalGain
++                    + " hdrAboveOnePreserved=true"
++                    + " finalToneOwner=MotionV2Render"
++                    + " true2xSharedField=true"
++                    + " sabreShortCfaDngUnchanged=true");
++        } finally {
++            if (coefficients != null) coefficients.close();
++            if (gainMap != null) gainMap.close();
++        }
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 5491a55d783029f8538058713fe6d4aa605fab06..367f7e4992f8bb53381acac4cacda2a2f4a034e9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -551,6 +551,13 @@ public class PostPipeline extends GLBasePipeline {
+              */
+             add(new MotionV2AdaptiveColorAppearance());
+             add(new StageTelemetry("IRIS_26563_MOTION_ADAPTIVE_COLOR_APPEARANCE"));
++            /* IRIS_26618_GUIDED_BASE_DETAIL_LTM_OWNER
++             * Spatially allocate the already-solved presentation target on luminance base only.
++             * MotionV2DisplayExposure remains pass-through and MotionV2Render remains the single
++             * final tone/output curve; Night is intentionally unchanged.
++             */
++            add(new MotionV2GuidedBaseDetailLtm());
++            add(new StageTelemetry("IRIS_26618_GUIDED_BASE_DETAIL_LTM"));
+             add(new MotionV2DisplayExposure());
+             add(new StageTelemetry("V2_POST_VIEWFINDER_PRESENTATION_EXPOSURE"));
+ 
+@@ -574,7 +581,7 @@ public class PostPipeline extends GLBasePipeline {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+                     "owner=" + motionReconstructionOwnerName(mParameters.motionV2ReconstructionOwner)
+-                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,OwnerSpecificPreColor,MotionV2ColorTransform,MotionV2ViewfinderExposureMatcher,MotionV2AdaptiveColorAppearance,MotionV2DisplayExposure,IrisManualOptional,MotionV2Render,RotateWatermark"
++                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,OwnerSpecificPreColor,MotionV2ColorTransform,MotionV2ViewfinderExposureMatcher,MotionV2AdaptiveColorAppearance,MotionV2GuidedBaseDetailLtm,MotionV2DisplayExposure,IrisManualOptional,MotionV2Render,RotateWatermark"
+                             + " spatialHighlightNode=false"
+                             + " directMultiframeRgb=" + directRgbCarrier
+                             + " strictSabreAuthority26560=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index fb10528bc1d9526c29bfe1a9c1d38d60108a39ec..49d38dde098aa49ec058a974e2a8e7c275b8aec0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -76,6 +76,14 @@ public class Parameters {
+     public float motionV2ToneBaseSceneWhite = 1.0f;
+     public float motionV2ToneAdaptiveSceneWhite = 1.0f;
+     public float motionV2ToneAdaptiveStrength = 0.0f;
++    /* IRIS_26618_GUIDED_BASE_DETAIL_LTM_STATE
++     * Read-only presentation state produced after adaptive color and consumed only by the
++     * matching true-2x publication path. The 1x path has already applied the same field on GPU.
++     */
++    public boolean motionV2GuidedLtmApplied = false;
++    public int motionV2GuidedLtmWidth = 0;
++    public int motionV2GuidedLtmHeight = 0;
++    public float[] motionV2GuidedLtmGainMap = null;
+     /* IRIS_26515_MGC_SOURCE_EXPOSURE_GAIN
+      * MGC BaselineExposure restoration is source-domain metadata, not scene/display exposure.
+      * It is consumed once by MotionV2DisplayExposure after MGC full-resolution denoise.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index e4c71385582dbae3b14a46cad3f8010f2e1b475a..ad70e025a63fb597a58cc2a33bb65c53bacf7ea0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -155,6 +155,17 @@ public final class MotionV2Jpeg444Encoder {
+                     ? attachedGainmap.getDisplayRatioForFullHdr() : 1.0f;
+             final float publicationSceneWhite =
+                     MotionV2Render.iris26598PublicationSceneWhite(parameters);
++            final boolean guidedLtm = parameters.motionV2GuidedLtmApplied;
++            final float[] guidedLtmGain = guidedLtm ? parameters.motionV2GuidedLtmGainMap : null;
++            final int guidedLtmWidth = guidedLtm ? parameters.motionV2GuidedLtmWidth : 0;
++            final int guidedLtmHeight = guidedLtm ? parameters.motionV2GuidedLtmHeight : 0;
++            if (guidedLtm && (guidedLtmGain == null || guidedLtmWidth <= 1 || guidedLtmHeight <= 1
++                    || guidedLtmGain.length != guidedLtmWidth * guidedLtmHeight)) {
++                Log.e(TAG, "IRIS_26618_TRUE2X_LTM_STATE_INVALID applied=true"
++                        + " map=" + guidedLtmWidth + "x" + guidedLtmHeight
++                        + " values=" + (guidedLtmGain == null ? -1 : guidedLtmGain.length));
++                return false;
++            }
+             final long renderStartNs = System.nanoTime();
+             final boolean baseOk = writeTrue2xNative(
+                     bitmap, renderRgb16fPath, trueWidth, trueHeight,
+@@ -163,6 +174,7 @@ public final class MotionV2Jpeg444Encoder {
+                     sensorToProPhoto, profileToDisplay,
+                     parameters.motionV2DisplayGain, exposureEv, shadows, contrast,
+                     publicationSceneWhite, parameters.motionV2Active,
++                    guidedLtmGain, guidedLtmWidth, guidedLtmHeight,
+                     watermark,
+                     useJin ? jinResidual.residual : null,
+                     useJin ? jinResidual.referenceRgb : null,
+@@ -187,7 +199,9 @@ public final class MotionV2Jpeg444Encoder {
+                     + " publicationSceneWhiteSource="
+                         + (parameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
+                     + " IRIS_26598_TRUE2X_TONE_PARITY=true"
+-                    + " IRIS_26596_TRUE2X_CONTENT_CAP=true");
++                    + " IRIS_26596_TRUE2X_CONTENT_CAP=true"
++                    + " IRIS_26618_TRUE2X_SHARED_GUIDED_LTM=" + guidedLtm
++                    + " guidedLtmMap=" + guidedLtmWidth + "x" + guidedLtmHeight);
+             /* IRIS_26576_NATIVE_PUBLICATION_BACKEND_PERSISTENT_PROOF
+              * Native 26571 remains GPU-first with the exact 26570 CPU fallback. Retrieve only the
+              * timing/backend record produced by that call; no publication math or routing changes.
+@@ -316,6 +330,7 @@ public final class MotionV2Jpeg444Encoder {
+             int rotation, boolean mirror, float renderResidualZoom,
+             float[] sensorToProPhoto, float[] proPhotoToSrgb, float displayGain,
+             float exposureEv, float shadows, float contrast, float sceneWhite, boolean motionHdrHandoff,
++            float[] guidedLtmGain, int guidedLtmWidth, int guidedLtmHeight,
+             Bitmap watermark,
+             float[] jinResidual, int[] jinReferenceRgb, int jinWidth, int jinHeight,
+             String true2xGainmapPath, float true2xGainmapMaxRatio,
+diff --git a/app/version.properties b/app/version.properties
+index 1529e77152446c36d7bbc901c2ec2c0602fc9fdf..491cadd63c987362438982f924c83fca7432726e 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726614
+-VERSION_BUILD=26614
++VERSION_NAME=0.9726618
++VERSION_BUILD=26618
