@@ -1,0 +1,584 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 0f734408d308c805c7c3dce0181ce45ef210e431..e587919ad3aa6d92ec763fe3b885e129f2ee1611 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -694,6 +694,9 @@ internal object GlesMgcRawSabreShaders {
+         uniform float uBoundaryCeiling;
+         uniform float uConsistencyLow;
+         uniform float uConsistencyHigh;
++        uniform float uFallbackAffineValid;
++        uniform vec3 uFallbackFlowX;
++        uniform vec3 uFallbackFlowY;
+         layout(location = 0) out vec4 oAnchor;
+ 
+         ivec2 clampRaw(ivec2 p) { return clamp(p, ivec2(0), uRawSize - ivec2(1)); }
+@@ -821,7 +824,7 @@ internal object GlesMgcRawSabreShaders {
+             vec2 referenceUv = (flowTextureUv - uFlowScaleOffset.zw) / safeScale;
+             referenceUv = clamp(referenceUv, vec2(0.0), vec2(1.0));
+             vec4 flow = texelFetch(uFlow, tile, 0);
+-            vec2 flowRawPixels = flow.xy * vec2(uRawSize);
++            vec2 nativeFlowRawPixels = flow.xy * vec2(uRawSize);
+ 
+             /* IRIS_26611_SAME_CFA_MEASURABLE_BOUNDARY_SEED
+              * Device 26610 proved that 2..8 RAW-pixel residual confidence is unsafe at Bayer
+@@ -835,6 +838,22 @@ internal object GlesMgcRawSabreShaders {
+             float boundaryLocalFlowProof = strictBoundaryResidualConfidence * mix(
+                 0.85, 1.0, neighborhoodPredictorConfidence);
+ 
++            /* IRIS_26625_ROBUST_AFFINE_FALLBACK_GEOMETRY
++             * Never relax the successful 26611 local residual threshold. If the production center
++             * is outside that threshold, a deterministic frame-global affine may only PROPOSE the
++             * sampling geometry. The model came exclusively from <=0.95-RAW-pixel production-flow
++             * inliers; the unchanged same-CFA 5x5 boundary radiometry below must still independently
++             * authorize any seed. Thus geometry cannot manufacture SHORT ownership. */
++            vec3 affineBasis = vec3(1.0, referenceUv.x, referenceUv.y);
++            vec2 fallbackFlowRawPixels = vec2(
++                dot(uFallbackFlowX, affineBasis), dot(uFallbackFlowY, affineBasis));
++            bool useFallbackGeometry = strictBoundaryResidualConfidence <= 0.0 &&
++                uFallbackAffineValid >= 0.5;
++            vec2 flowRawPixels = useFallbackGeometry
++                ? fallbackFlowRawPixels : nativeFlowRawPixels;
++            float selectedGeometryProof = useFallbackGeometry
++                ? 1.0 : boundaryLocalFlowProof;
++
+             vec2 cellSpanRaw = vec2(uRawSize) / (vec2(uGridSize) * safeScale);
+             vec2 cellCenterRaw = referenceUv * vec2(uRawSize);
+             float componentBrightness = 0.0;
+@@ -923,14 +942,15 @@ internal object GlesMgcRawSabreShaders {
+                 literalComponentConfidence, effectiveLossComponentConfidence);
+             float anchorConfidence = 0.0;
+             if (anchorQuadEvidence >= 4 && anchorPhaseEvidence >= 8
+-                    && boundaryLocalFlowProof > 0.0) {
++                    && selectedGeometryProof > 0.0) {
+                 float radiometricConfidence =
+                     anchorConfidenceSum / float(anchorPhaseEvidence);
+                 anchorConfidence = min(
+                     componentSourceConfidence,
+-                    min(boundaryLocalFlowProof, radiometricConfidence));
++                    min(selectedGeometryProof, radiometricConfidence));
+             }
+-            oAnchor = vec4(flow.xy, clamp(componentConfidence, 0.0, 1.0),
++            oAnchor = vec4(flowRawPixels / vec2(uRawSize),
++                clamp(componentConfidence, 0.0, 1.0),
+                 clamp(anchorConfidence, 0.0, 1.0));
+         }
+     """.trimIndent()
+@@ -987,6 +1007,36 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26625_COMPONENT_EFFECTIVE_FLOW
++     * The common Sabre merge must sample the exact geometry that boundary radiometry validated.
++     * Outside boundary-proven component trust, preserve production flow byte-for-byte. Inside it,
++     * use oAnchor.xy (native when 26611 was valid, robust affine only when native was invalid).
++     * z/w remain production-flow metadata; no second merge or RGB path is created.
++     */
++    val shortComponentEffectiveFlow26625 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uFlow;
++        uniform sampler2D uAnchor;
++        uniform sampler2D uTrust;
++        uniform ivec2 uGridSize;
++        layout(location = 0) out vec4 oFlow;
++        layout(location = 1) out float oFallbackUsed;
++        void main() {
++            ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uGridSize - ivec2(1));
++            vec4 production = texelFetch(uFlow, p, 0);
++            vec4 geometry = texelFetch(uAnchor, p, 0);
++            float trust = clamp(texelFetch(uTrust, p, 0).r, 0.0, 1.0);
++            bool componentOwned = trust > 0.0;
++            bool fallbackUsed = componentOwned && production.w >= 0.95 &&
++                length(geometry.xy - production.xy) > 1.0e-7;
++            vec2 selected = componentOwned ? geometry.xy : production.xy;
++            oFlow = vec4(selected, production.zw);
++            oFallbackUsed = fallbackUsed ? 1.0 : 0.0;
++        }
++    """.trimIndent()
++
+     /* IRIS_26607_UNIVERSAL_EFFECTIVE_HIGHLIGHT_LOSS_WEIGHT
+      * Rescue is triggered by physical NORMAL information loss, not by semantic scene type and not
+      * only by literal sensor code saturation. For each spatial CFA phase, exposure-normalized
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index fbc7974a89120ccf3b3d35c50c202ccbaf107265..4b0274de9a2899b902ea3459c59e7bb81a3e4ea8 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -574,6 +574,7 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreShortRescueWeightProgram26606 = 0
+     private var sabreShortComponentAnchorProgram26607 = 0
+     private var sabreShortComponentPropagateProgram26607 = 0
++    private var sabreShortComponentEffectiveFlowProgram26625 = 0
+     private var sabreShortRescueWeightProgram26607 = 0
+     private var sabreRgbChromaPostprocessor: GlesIris26529SpatialRgbChromaPostprocessor? = null
+     private var sabreConvertAlignmentSparseProgram = 0
+@@ -2459,9 +2460,14 @@ internal class GlesMgcRawSpatialStacker(
+                     referenceAlignmentProducts,
+                 )
+                 val flow = createSabreConvertedAlignment(alignment)
+-                if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT) {
+-                    logSabreAffineResidual26606(flow, index)
++                val shortFallbackAffine26625 = if (
++                    frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT
++                ) {
++                    analyzeSabreShortFallbackAffine26625(flow, index)
++                } else {
++                    null
+                 }
++                var mergeFlow = flow
+                 val unblockerWidth = ceilDiv(width, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+                 val unblockerHeight = ceilDiv(height, UNBLOCKER_FULLRES_TILE_SIZE * 2)
+                 val unblocker = createTexture(
+@@ -2545,7 +2551,9 @@ internal class GlesMgcRawSpatialStacker(
+                         referenceCalibration = referenceCalibration,
+                         shortCalibration = calibration,
+                         exposureRatio = exposureScale,
++                        fallbackAffine = checkNotNull(shortFallbackAffine26625),
+                     )
++                    mergeFlow = component.effectiveFlow
+                     highlightShortBoundarySeedCells26607 = component.seedCells
+                     highlightShortBoundaryFinalCells26607 = component.finalCells
+                     val rescuedWeight = createTexture(
+@@ -2562,7 +2570,7 @@ internal class GlesMgcRawSpatialStacker(
+                         physicalWeight = shortPhysicalWeight26610,
+                         referenceExtracted = referenceExtracted,
+                         shortExtracted = currentExtracted,
+-                        flow = flow,
++                        flow = mergeFlow,
+                         componentTrust = component.texture,
+                         referenceCalibration = referenceCalibration,
+                         shortCalibration = calibration,
+@@ -2618,7 +2626,7 @@ internal class GlesMgcRawSpatialStacker(
+                     renderSabreUnifiedBracketCoverage26604(
+                         weight = frameWeight,
+                         extracted = currentExtracted,
+-                        flow = flow,
++                        flow = mergeFlow,
+                         accumulatedCoverage = effectiveCoverage,
+                         coverageWidth = coverageWidth,
+                         coverageHeight = coverageHeight,
+@@ -2647,7 +2655,7 @@ internal class GlesMgcRawSpatialStacker(
+                     renderSabreUnifiedBracketCoverage26604(
+                         weight = shortRescueOnlyWeight26607,
+                         extracted = currentExtracted,
+-                        flow = flow,
++                        flow = mergeFlow,
+                         accumulatedCoverage = rescueEffectiveCoverage,
+                         coverageWidth = coverageWidth,
+                         coverageHeight = coverageHeight,
+@@ -2700,7 +2708,7 @@ internal class GlesMgcRawSpatialStacker(
+                 }
+                 renderSabreMerge(
+                     extracted = currentExtracted,
+-                    flow = flow,
++                    flow = mergeFlow,
+                     covariance = currentCovariance,
+                     weight = frameWeight,
+                     calibration = calibration,
+@@ -2732,7 +2740,11 @@ internal class GlesMgcRawSpatialStacker(
+                             "absoluteOwner=SAME_CFA_MEASURABLE_BOUNDARY_RADIOMETRY probes=5x5 " +
+                             "boundaryError=0.03..0.08 boundaryResidualRawPx=0.35..0.95 " +
+                             "componentFlowBarrierRawPx=0.50..1.25 " +
+-                            "boundaryLocalResidualRequired=true predictorCannotOverrideLocalBoundary=true " +
++                            "boundaryLocalResidualRequired=true " +
++                            "fallbackGeometry=ROBUST_GLOBAL_AFFINE_FROM_STRICT_FLOW_INLIERS " +
++                            "fallbackGeometryCannotAuthorizeAlone=true " +
++                            "fallbackActualSampling=true " +
++                            "fallbackTrustedCells=${component.fallbackTrustedCells} " +
+                             "literalCoreSelfSeed=false effectiveCoreSelfSeed=false " +
+                             "componentMembership=LITERAL_PLUS_BOUNDARY_PROVEN_EFFECTIVE_LOSS " +
+                             "effectiveLossPhotometricBypass=BOUNDARY_PROVEN_COMPONENT_ONLY_ADDITIVE " +
+@@ -3491,11 +3503,48 @@ internal class GlesMgcRawSpatialStacker(
+ 
+     private data class ShortComponentTrust26607(
+         val texture: Int,
++        val effectiveFlow: SabreConvertedAlignment,
+         val seedCells: Int,
+         val finalCells: Int,
++        val fallbackTrustedCells: Int,
+         val passes: Int,
+     )
+ 
++    /* IRIS_26625_RADIOMETRICALLY_VALIDATED_FALLBACK_GEOMETRY
++     * The direct-sun 26624 device trace proved a distinct false-closed case: SHORT was captured
++     * with 2.5 EV headroom, but only ~1% of sparse cells retained sub-pixel local-affine residuals,
++     * leaving zero boundary seeds. Build one deterministic frame-global affine hypothesis only from
++     * production-flow cells already inside the existing <=0.95 RAW-pixel strict residual envelope.
++     * RANSAC chooses the dominant sub-pixel model; spatial coverage and inlier residuals must pass.
++     * This model is geometry only. It cannot create component trust without the unchanged 5x5
++     * same-CFA NORMAL/SHORT boundary radiometry, and it is used for actual SHORT sampling only where
++     * that boundary-proven component trust exists.
++     */
++    private data class ShortFlowSample26625(
++        val x: Double, val y: Double, val flowX: Double, val flowY: Double, val residual: Double,
++    )
++
++    private data class ShortFallbackAffine26625(
++        val valid: Boolean,
++        val flowX: FloatArray,
++        val flowY: FloatArray,
++        val strictCells: Int,
++        val coreCells: Int,
++        val inlierCells: Int,
++        val inlierFraction: Float,
++        val coverageX: Float,
++        val coverageY: Float,
++        val p50Residual: Float,
++        val p90Residual: Float,
++    ) {
++        companion object {
++            fun invalid(strictCells: Int = 0, coreCells: Int = 0) = ShortFallbackAffine26625(
++                false, FloatArray(3), FloatArray(3), strictCells, coreCells, 0, 0f, 0f, 0f,
++                Float.NaN, Float.NaN,
++            )
++        }
++    }
++
+     private fun createSabreShortComponentTrust26607(
+         referenceRaw: Int,
+         shortRaw: Int,
+@@ -3503,6 +3552,7 @@ internal class GlesMgcRawSpatialStacker(
+         referenceCalibration: FrameCalibration,
+         shortCalibration: FrameCalibration,
+         exposureRatio: Float,
++        fallbackAffine: ShortFallbackAffine26625,
+     ): ShortComponentTrust26607 {
+         val flowSpec = checkNotNull(textureSpecs[flow.texture]) {
+             "26607 SHORT component trust requires owned Sabre flow"
+@@ -3539,6 +3589,15 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1f(anchorProgram, "uBoundaryCeiling", 0.90f)
+         uniform1f(anchorProgram, "uConsistencyLow", 0.03f)
+         uniform1f(anchorProgram, "uConsistencyHigh", 0.08f)
++        uniform1f(anchorProgram, "uFallbackAffineValid", if (fallbackAffine.valid) 1f else 0f)
++        uniform3f(
++            anchorProgram, "uFallbackFlowX",
++            fallbackAffine.flowX[0], fallbackAffine.flowX[1], fallbackAffine.flowX[2],
++        )
++        uniform3f(
++            anchorProgram, "uFallbackFlowY",
++            fallbackAffine.flowY[0], fallbackAffine.flowY[1], fallbackAffine.flowY[2],
++        )
+         draw(anchorProgram, gridWidth, gridHeight, intArrayOf(anchorTexture))
+ 
+         clearSabreSingleChannelTexture26606(
+@@ -3577,10 +3636,36 @@ internal class GlesMgcRawSpatialStacker(
+             val finalCells = countSabreTrustCells26606(
+                 current, gridWidth, gridHeight, "26607 SHORT component final probe",
+             )
+-            releaseOwnedTexture(anchorTexture, "26607 SHORT component anchor metadata")
++            val effectiveFlowTexture = createTexture(
++                gridWidth, gridHeight, GLES30.GL_RGBA16F, GLES30.GL_LINEAR,
++            )
++            val fallbackUsage = createTexture(
++                gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_NEAREST,
++            )
++            val effectiveFlowProgram = sabreShortComponentEffectiveFlowProgram26625
++            check(effectiveFlowProgram != 0)
++            GLES30.glUseProgram(effectiveFlowProgram)
++            bindTexture(effectiveFlowProgram, "uFlow", 0, flow.texture)
++            bindTexture(effectiveFlowProgram, "uAnchor", 1, anchorTexture)
++            bindTexture(effectiveFlowProgram, "uTrust", 2, current)
++            uniform2i(effectiveFlowProgram, "uGridSize", gridWidth, gridHeight)
++            draw(
++                effectiveFlowProgram, gridWidth, gridHeight,
++                intArrayOf(effectiveFlowTexture, fallbackUsage),
++            )
++            val fallbackTrustedCells = countSabreTrustCells26606(
++                fallbackUsage, gridWidth, gridHeight, "26625 SHORT fallback geometry usage",
++            )
++            releaseOwnedTexture(fallbackUsage, "26625 SHORT fallback geometry usage")
++            releaseOwnedTexture(anchorTexture, "26625 SHORT component geometry metadata")
+             val spare = if (current == trustA) trustB else trustA
+             releaseOwnedTexture(spare, "26607 SHORT component spare trust")
+-            return ShortComponentTrust26607(current, seedCells, finalCells, passes)
++            val effectiveFlow = SabreConvertedAlignment(
++                effectiveFlowTexture, flow.scaleX, flow.scaleY, flow.offsetX, flow.offsetY,
++            )
++            return ShortComponentTrust26607(
++                current, effectiveFlow, seedCells, finalCells, fallbackTrustedCells, passes,
++            )
+         } finally {
+             releaseOwnedTexture(seedProbe, "26607 SHORT component seed probe")
+         }
+@@ -5523,6 +5608,10 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.shortComponentPropagate26607,
+             "iris_26607_short_component_propagate",
+         )
++        sabreShortComponentEffectiveFlowProgram26625 = linkProgram(
++            GlesMgcRawSabreShaders.shortComponentEffectiveFlow26625,
++            "iris_26625_short_component_effective_flow",
++        )
+         sabreShortRescueWeightProgram26607 = linkProgram(
+             GlesMgcRawSabreShaders.shortRescueWeight26607,
+             "iris_26607_short_rescue_weight",
+@@ -11320,16 +11409,165 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun logSabreAffineResidual26606(
++    private fun solveShortAffine3x326625(matrixIn: Array<DoubleArray>): DoubleArray? {
++        val matrix = Array(3) { row -> matrixIn[row].copyOf() }
++        for (column in 0 until 3) {
++            var pivot = column
++            var pivotAbs = kotlin.math.abs(matrix[column][column])
++            for (row in column + 1 until 3) {
++                val candidate = kotlin.math.abs(matrix[row][column])
++                if (candidate > pivotAbs) { pivot = row; pivotAbs = candidate }
++            }
++            if (!pivotAbs.isFinite() || pivotAbs < 1.0e-9) return null
++            if (pivot != column) {
++                val tmp = matrix[pivot]; matrix[pivot] = matrix[column]; matrix[column] = tmp
++            }
++            val scale = matrix[column][column]
++            for (k in column until 4) matrix[column][k] /= scale
++            for (row in 0 until 3) {
++                if (row == column) continue
++                val factor = matrix[row][column]
++                for (k in column until 4) matrix[row][k] -= factor * matrix[column][k]
++            }
++        }
++        return doubleArrayOf(matrix[0][3], matrix[1][3], matrix[2][3])
++    }
++
++    private fun fitShortAffine26625(
++        samples: List<ShortFlowSample26625>,
++        selectX: Boolean,
++    ): DoubleArray? {
++        if (samples.size < 3) return null
++        var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0; var syy = 0.0
++        var sb = 0.0; var sxb = 0.0; var syb = 0.0
++        for (sample in samples) {
++            val b = if (selectX) sample.flowX else sample.flowY
++            sx += sample.x; sy += sample.y
++            sxx += sample.x * sample.x; sxy += sample.x * sample.y; syy += sample.y * sample.y
++            sb += b; sxb += sample.x * b; syb += sample.y * b
++        }
++        return solveShortAffine3x326625(arrayOf(
++            doubleArrayOf(samples.size.toDouble(), sx, sy, sb),
++            doubleArrayOf(sx, sxx, sxy, sxb),
++            doubleArrayOf(sy, sxy, syy, syb),
++        ))
++    }
++
++    private fun fitShortAffineTriplet26625(
++        a: ShortFlowSample26625,
++        b: ShortFlowSample26625,
++        c: ShortFlowSample26625,
++    ): Pair<DoubleArray, DoubleArray>? {
++        val basis = arrayOf(
++            doubleArrayOf(1.0, a.x, a.y),
++            doubleArrayOf(1.0, b.x, b.y),
++            doubleArrayOf(1.0, c.x, c.y),
++        )
++        fun solve(values: DoubleArray): DoubleArray? = solveShortAffine3x326625(arrayOf(
++            doubleArrayOf(basis[0][0], basis[0][1], basis[0][2], values[0]),
++            doubleArrayOf(basis[1][0], basis[1][1], basis[1][2], values[1]),
++            doubleArrayOf(basis[2][0], basis[2][1], basis[2][2], values[2]),
++        ))
++        val x = solve(doubleArrayOf(a.flowX, b.flowX, c.flowX)) ?: return null
++        val y = solve(doubleArrayOf(a.flowY, b.flowY, c.flowY)) ?: return null
++        return x to y
++    }
++
++    private fun shortAffineResidual26625(
++        sample: ShortFlowSample26625,
++        x: DoubleArray,
++        y: DoubleArray,
++    ): Double {
++        val dx = (x[0] + x[1] * sample.x + x[2] * sample.y) - sample.flowX
++        val dy = (y[0] + y[1] * sample.x + y[2] * sample.y) - sample.flowY
++        return kotlin.math.sqrt(dx * dx + dy * dy)
++    }
++
++    private fun buildShortFallbackAffine26625(
++        candidates: List<ShortFlowSample26625>,
++        core: List<ShortFlowSample26625>,
++    ): ShortFallbackAffine26625 {
++        if (core.size < 12 || candidates.size < 12) {
++            return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        }
++        val ransac = if (core.size <= 24) core else List(24) { i ->
++            core[(i.toLong() * (core.size - 1).toLong() / 23L).toInt()]
++        }
++        var bestX: DoubleArray? = null
++        var bestY: DoubleArray? = null
++        var bestCount = -1
++        var bestError = Double.POSITIVE_INFINITY
++        val inlierLimit = 0.75
++        for (i in 0 until ransac.size - 2) {
++            for (j in i + 1 until ransac.size - 1) {
++                for (k in j + 1 until ransac.size) {
++                    val model = fitShortAffineTriplet26625(ransac[i], ransac[j], ransac[k]) ?: continue
++                    var count = 0
++                    var error = 0.0
++                    for (sample in candidates) {
++                        val residual = shortAffineResidual26625(sample, model.first, model.second)
++                        if (residual <= inlierLimit) { count++; error += residual }
++                    }
++                    if (count > bestCount || (count == bestCount && error < bestError)) {
++                        bestCount = count; bestError = error; bestX = model.first; bestY = model.second
++                    }
++                }
++            }
++        }
++        val initialX = bestX ?: return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        val initialY = bestY ?: return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        var inliers = candidates.filter { shortAffineResidual26625(it, initialX, initialY) <= inlierLimit }
++        val minimumInliers = max(12, kotlin.math.ceil(candidates.size * 0.30).toInt())
++        if (inliers.size < minimumInliers) {
++            return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        }
++        val refinedX = fitShortAffine26625(inliers, true)
++            ?: return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        val refinedY = fitShortAffine26625(inliers, false)
++            ?: return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        inliers = candidates.filter { shortAffineResidual26625(it, refinedX, refinedY) <= inlierLimit }
++        if (inliers.size < minimumInliers) {
++            return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        }
++        val finalX = fitShortAffine26625(inliers, true)
++            ?: return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        val finalY = fitShortAffine26625(inliers, false)
++            ?: return ShortFallbackAffine26625.invalid(candidates.size, core.size)
++        val residuals = inliers.map { shortAffineResidual26625(it, finalX, finalY) }.sorted()
++        fun percentile(fraction: Double): Float {
++            val index = ((residuals.size - 1) * fraction).toInt().coerceIn(0, residuals.size - 1)
++            return residuals[index].toFloat()
++        }
++        val minX = inliers.minOf { it.x }; val maxX = inliers.maxOf { it.x }
++        val minY = inliers.minOf { it.y }; val maxY = inliers.maxOf { it.y }
++        val coverageX = (maxX - minX).toFloat()
++        val coverageY = (maxY - minY).toFloat()
++        val fraction = inliers.size.toFloat() / candidates.size.toFloat()
++        val p50 = percentile(0.50); val p90 = percentile(0.90)
++        val valid = coverageX >= 0.30f && coverageY >= 0.30f && fraction >= 0.30f && p90 <= 0.75f &&
++            finalX.all { it.isFinite() } && finalY.all { it.isFinite() }
++        if (!valid) return ShortFallbackAffine26625(
++            false, FloatArray(3), FloatArray(3), candidates.size, core.size, inliers.size, fraction,
++            coverageX, coverageY, p50, p90,
++        )
++        return ShortFallbackAffine26625(
++            true,
++            floatArrayOf(finalX[0].toFloat(), finalX[1].toFloat(), finalX[2].toFloat()),
++            floatArrayOf(finalY[0].toFloat(), finalY[1].toFloat(), finalY[2].toFloat()),
++            candidates.size, core.size, inliers.size, fraction, coverageX, coverageY, p50, p90,
++        )
++    }
++
++    private fun analyzeSabreShortFallbackAffine26625(
+         flow: SabreConvertedAlignment,
+         frameIndex: Int,
+-    ) {
++    ): ShortFallbackAffine26625 {
+         val spec = checkNotNull(textureSpecs[flow.texture]) {
+-            "26606 SHORT flow texture is not owned"
++            "26625 SHORT flow texture is not owned"
+         }
+         val bytes = Math.multiplyExact(Math.multiplyExact(spec.width, spec.height), 8)
+         val readback = ByteBuffer.allocateDirect(bytes).order(ByteOrder.nativeOrder())
+-        bindRenderTargets(intArrayOf(flow.texture), "26606 SHORT affine-residual telemetry")
++        bindRenderTargets(intArrayOf(flow.texture), "26625 SHORT affine/fallback telemetry")
+         GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+         GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
+         GLES30.glReadPixels(
+@@ -11337,35 +11575,65 @@ internal class GlesMgcRawSpatialStacker(
+             GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, readback,
+         )
+         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-        checkGlError("26606 SHORT affine-residual telemetry")
++        checkGlError("26625 SHORT affine/fallback telemetry")
+         val half = readback.asShortBuffer()
+-        val values = ArrayList<Float>(spec.width * spec.height)
+-        var ge050 = 0
+-        var ge100 = 0
+-        var ge200 = 0
++        val residualValues = ArrayList<Float>(spec.width * spec.height)
++        val candidates = ArrayList<ShortFlowSample26625>()
++        val core = ArrayList<ShortFlowSample26625>()
++        var ge050 = 0; var ge100 = 0; var ge200 = 0
+         for (index in 0 until spec.width * spec.height) {
+-            val rawPixels = max(0f, Half.toFloat(half.get(index * 4 + 3)))
+-            if (!rawPixels.isFinite()) continue
+-            values += rawPixels
+-            if (rawPixels >= 0.50f) ge050++
+-            if (rawPixels >= 1.00f) ge100++
+-            if (rawPixels >= 2.00f) ge200++
+-        }
+-        values.sort()
+-        fun percentile(fraction: Float): Float {
+-            if (values.isEmpty()) return Float.NaN
+-            val i = ((values.size - 1) * fraction).toInt().coerceIn(0, values.size - 1)
+-            return values[i]
++            val flowX = Half.toFloat(half.get(index * 4)) * width
++            val flowY = Half.toFloat(half.get(index * 4 + 1)) * height
++            val residual = max(0f, Half.toFloat(half.get(index * 4 + 3)))
++            if (!flowX.isFinite() || !flowY.isFinite() || !residual.isFinite()) continue
++            residualValues += residual
++            if (residual >= 0.50f) ge050++
++            if (residual >= 1.00f) ge100++
++            if (residual >= 2.00f) ge200++
++            if (residual <= 0.95f) {
++                val gx = index % spec.width
++                val gy = index / spec.width
++                val flowUvX = (gx + 0.5) / spec.width.toDouble()
++                val flowUvY = (gy + 0.5) / spec.height.toDouble()
++                val scaleX = kotlin.math.abs(flow.scaleX.toDouble()).coerceAtLeast(1.0e-7)
++                val scaleY = kotlin.math.abs(flow.scaleY.toDouble()).coerceAtLeast(1.0e-7)
++                val referenceX = ((flowUvX - flow.offsetX.toDouble()) / scaleX).coerceIn(0.0, 1.0)
++                val referenceY = ((flowUvY - flow.offsetY.toDouble()) / scaleY).coerceIn(0.0, 1.0)
++                val sample = ShortFlowSample26625(
++                    referenceX, referenceY,
++                    flowX.toDouble(), flowY.toDouble(), residual.toDouble(),
++                )
++                candidates += sample
++                if (residual <= 0.50f) core += sample
++            }
+         }
+-        val count = values.size
+-        val details =
++        residualValues.sort()
++        fun residualPercentile(fraction: Float): Float {
++            if (residualValues.isEmpty()) return Float.NaN
++            val i = ((residualValues.size - 1) * fraction).toInt().coerceIn(0, residualValues.size - 1)
++            return residualValues[i]
++        }
++        val affine = buildShortFallbackAffine26625(candidates, core)
++        val residualDetails =
+             "frame=$frameIndex component=flow.w semantic=LOCAL_AFFINE_RESIDUAL domain=RAW_PIXELS " +
+-                "samples=$count grid=${spec.width}x${spec.height} " +
+-                "p50=${percentile(0.50f)} p95=${percentile(0.95f)} p99=${percentile(0.99f)} " +
+-                "max=${values.lastOrNull() ?: Float.NaN} ge0p50=$ge050 ge1p00=$ge100 ge2p00=$ge200 " +
++                "samples=${residualValues.size} grid=${spec.width}x${spec.height} " +
++                "p50=${residualPercentile(0.50f)} p95=${residualPercentile(0.95f)} " +
++                "p99=${residualPercentile(0.99f)} max=${residualValues.lastOrNull() ?: Float.NaN} " +
++                "ge0p50=$ge050 ge1p00=$ge100 ge2p00=$ge200 " +
+                 "thresholdsRawPixels=0.50,1.00,2.00 activeConfidenceConsumer=SHORT_RESCUE_ONLY"
+-        PLog.i(SABRE_TAG, "IRIS_26606_SHORT_AFFINE_RESIDUAL_STATS $details")
+-        MotionTrace.processingState("IRIS_26606_SHORT_AFFINE_RESIDUAL_STATS", details)
++        PLog.i(SABRE_TAG, "IRIS_26606_SHORT_AFFINE_RESIDUAL_STATS $residualDetails")
++        MotionTrace.processingState("IRIS_26606_SHORT_AFFINE_RESIDUAL_STATS", residualDetails)
++        val fallbackDetails =
++            "frame=$frameIndex valid=${affine.valid} strictCells=${affine.strictCells} " +
++                "coreCells=${affine.coreCells} inlierCells=${affine.inlierCells} " +
++                "inlierFraction=${affine.inlierFraction} coverageX=${affine.coverageX} " +
++                "coverageY=${affine.coverageY} modelP50RawPx=${affine.p50Residual} " +
++                "modelP90RawPx=${affine.p90Residual} inlierLimitRawPx=0.75 " +
++                "sourceResidualLimitRawPx=0.95 boundaryRadiometryStillRequired=true " +
++                "geometryAloneCannotAuthorize=true"
++        PLog.i(SABRE_TAG, "IRIS_26625_SHORT_FALLBACK_AFFINE $fallbackDetails")
++        MotionTrace.processingState("IRIS_26625_SHORT_FALLBACK_AFFINE", fallbackDetails)
++        return affine
+     }
+ 
+     private fun readTrue2xFlow(flow: SabreConvertedAlignment): Triple<ByteBuffer, Float, Float> {
+diff --git a/app/version.properties b/app/version.properties
+index c6b036a8bff33b9670c66762c90f8330d86f00dc..c267c7a0b688eb85106f7d5ed00ec27f841fa52a 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726624
+-VERSION_BUILD=26624
++VERSION_NAME=0.9726625
++VERSION_BUILD=26625
