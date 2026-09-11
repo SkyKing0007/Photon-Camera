@@ -24,6 +24,12 @@ assert emb(bs,'shortComponentPropagate26607')==emb(cs,'shortComponentPropagate26
 # Selected fallback geometry must actually reach common Sabre merge, not merely telemetry.
 assert 'mergeFlow = component.effectiveFlow' in ck
 assert re.search(r'renderSabreMerge\(\s*extracted = currentExtracted,\s*flow = mergeFlow,',ck,re.S)
+# Permanent regression for Actions run 34549354529 compileDebugKotlin failure:
+# component is block-local, so frame telemetry must carry its value through a frame-local scalar.
+assert 'var shortFallbackTrustedCells26625 = 0' in ck
+assert 'shortFallbackTrustedCells26625 = component.fallbackTrustedCells' in ck
+assert '"fallbackTrustedCells=$shortFallbackTrustedCells26625 " +' in ck
+assert '"fallbackTrustedCells=${component.fallbackTrustedCells} " +' not in ck
 # SHORT only: true2x NORMAL and NORMAL DNG stay on production flow.
 segment=ck[ck.index('if (enableSabreSuperRes && frame.role == RawBurstFrameRole.NORMAL)'):ck.index('PLog.i(\n                    SABRE_TAG,\n                    "MGC Sabre frame=',ck.index('if (enableSabreSuperRes && frame.role == RawBurstFrameRole.NORMAL)'))]
 assert segment.count('flow = flow')>=2
@@ -32,4 +38,4 @@ for bad in ['spatialFill=true','inpainting=true','privateShortAccumulator=true',
     assert bad not in ck+cs
 # Version correct.
 v=(C/'app/version.properties').read_text(); assert 'VERSION_NAME=0.9726625' in v and 'VERSION_BUILD=26625' in v
-print('PASS 26625 regressions: reproduces 26624 zero-seed geometry failure without threshold relaxation; fallback geometry requires robust strict-flow consensus + independent same-CFA boundary radiometry; validated geometry reaches actual SHORT merge; CFA barrier/component/headroom/physical/source-clip protections and 26624 presentation remain')
+print('PASS 26625 regressions: robust SHORT fallback remains radiometry-authorized and reaches actual merge; Actions 34549354529 block-local telemetry scope failure is permanently rejected; CFA barrier/component/headroom/physical/source-clip protections and 26624 presentation remain')

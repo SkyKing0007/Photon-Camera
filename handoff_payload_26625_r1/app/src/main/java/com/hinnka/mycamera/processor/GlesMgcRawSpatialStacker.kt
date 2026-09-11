@@ -2468,6 +2468,7 @@ internal class GlesMgcRawSpatialStacker(
                     null
                 }
                 var mergeFlow = flow
+                var shortFallbackTrustedCells26625 = 0
                 val unblockerWidth = ceilDiv(width, UNBLOCKER_FULLRES_TILE_SIZE * 2)
                 val unblockerHeight = ceilDiv(height, UNBLOCKER_FULLRES_TILE_SIZE * 2)
                 val unblocker = createTexture(
@@ -2554,6 +2555,7 @@ internal class GlesMgcRawSpatialStacker(
                         fallbackAffine = checkNotNull(shortFallbackAffine26625),
                     )
                     mergeFlow = component.effectiveFlow
+                    shortFallbackTrustedCells26625 = component.fallbackTrustedCells
                     highlightShortBoundarySeedCells26607 = component.seedCells
                     highlightShortBoundaryFinalCells26607 = component.finalCells
                     val rescuedWeight = createTexture(
@@ -2744,7 +2746,7 @@ internal class GlesMgcRawSpatialStacker(
                             "fallbackGeometry=ROBUST_GLOBAL_AFFINE_FROM_STRICT_FLOW_INLIERS " +
                             "fallbackGeometryCannotAuthorizeAlone=true " +
                             "fallbackActualSampling=true " +
-                            "fallbackTrustedCells=${component.fallbackTrustedCells} " +
+                            "fallbackTrustedCells=$shortFallbackTrustedCells26625 " +
                             "literalCoreSelfSeed=false effectiveCoreSelfSeed=false " +
                             "componentMembership=LITERAL_PLUS_BOUNDARY_PROVEN_EFFECTIVE_LOSS " +
                             "effectiveLossPhotometricBypass=BOUNDARY_PROVEN_COMPONENT_ONLY_ADDITIVE " +
