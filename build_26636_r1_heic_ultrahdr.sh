@@ -18,14 +18,16 @@ ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 RUNTIME_AUTHORITY_COMMIT="e6790ebd2f2a8403191a276d659de4a708181efa"
 HANDOFF_PARENT_COMMIT="$RUNTIME_AUTHORITY_COMMIT"
+FAILED_R1_COMMIT="a33e00935e00d7153cb72619333f658b0a5a566c"
+REPAIR_PARENT_COMMIT="$FAILED_R1_COMMIT"
 BASE_RUN_ID="34777964131"
 BASE_ARTIFACT_ID="10324098412"
 BASE_ARTIFACT_NAME="photon-26635-r1-spatial-highlight-rolloff"
 BASE_ARTIFACT_SHA="fa1f51b03969edf1ce59934d33f46e4a688336d4c5270de18ba2237425a64b1b"
 BASE_TAR_SHA="fb5f2a3f48c737639e879aa2c7ee44c9c4a05d997aa9abc7424c3f69de7ad397"
-SUCCESS_26635_BUILD_BLOB="0052d3e10ee8e7a9b56f5b7082ee68c37e50dd80"
-SUCCESS_26635_WORKFLOW_BLOB="200aa05294d55794668f96aad24b5d7a965b96a1"
-SUCCESS_26635_TRANSFORM_BLOB="2ccc9d42f3ac72d0b2a6d830abc6b9d3049b0007"
+SUCCESS_26635_BUILD_BLOB="779990cef8c143011e411ca87109e36d75875fa1"
+SUCCESS_26635_WORKFLOW_BLOB="bb43c017494365bdccede14f2e388d156b22211e"
+SUCCESS_26635_TRANSFORM_BLOB="fd466230a174cec21093c1eaba7da7585f418550"
 VERSION_NAME="0.9726636"; VERSION_BUILD="26636"
 GLSLANG_VERSION="16.5.0"
 GLSLANG_ARCHIVE_SHA="b9b1f96acb898a62251b171f7695efcecfc206a530299054071919b06820f657"
@@ -118,20 +120,29 @@ PY
   set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful-26635 ordering/isolation/Kotlin-Java/NDK/patch/PRE-BUILD/assemble/postbuild mechanics preserved; authority/scope/HEIC validators only; GLSL stage retained and N/A for zero modified shaders)"
 }
 verify_scope(){
-  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed handoff; exact 18-path runtime allowlist: 15 modified + 3 added)"; return; fi
+  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed R1.1 repair; runtime candidate unchanged at exact 18-path allowlist: 15 modified + 3 added)"; return; fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-  [[ "$(git rev-parse HEAD^)" == "$HANDOFF_PARENT_COMMIT" ]] || fail "26636 sealed handoff must be one direct packaging commit on successful 26635 R1 authority"
-  python3 -S - "$HANDOFF" > "$WORK/expected_scope.txt" <<'PY'
+  [[ "$(git rev-parse HEAD^)" == "$REPAIR_PARENT_COMMIT" ]] || fail "26636 R1.1 repair must be one direct commit on exact failed 26636 R1 handoff"
+  [[ "$(git rev-parse "$REPAIR_PARENT_COMMIT^")" == "$HANDOFF_PARENT_COMMIT" ]] || fail "failed 26636 R1 parent is not exact successful 26635 authority"
+  python3 -S - "$HANDOFF" > "$WORK/expected_r1_scope.txt" <<'PY'
 from pathlib import Path
 import sys
 names=[line.split('  ',1)[1] for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
 names.append('R1_26636_HANDOFF_HASHES.sha256')
 print('\n'.join(sorted(names)))
 PY
-  git diff --name-only "$HANDOFF_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_scope.txt"
-  diff -u "$WORK/expected_scope.txt" "$WORK/actual_scope.txt" || fail "handoff commit scope mismatch"
-  ! grep -Eq '^app/' "$WORK/actual_scope.txt" || fail "handoff commit contains live app source"
-  set_report "CHANGED RUNTIME SCOPE" "PASS (sealed infrastructure/payload only; exact 18-path candidate runtime delta (15 modified + 3 added); no live app source committed)"
+  git diff --name-only "$HANDOFF_PARENT_COMMIT" "$REPAIR_PARENT_COMMIT" | sort > "$WORK/actual_r1_scope.txt"
+  diff -u "$WORK/expected_r1_scope.txt" "$WORK/actual_r1_scope.txt" || fail "failed 26636 R1 sealed handoff scope mismatch"
+  cat > "$WORK/expected_repair_scope.txt" <<'EOF'
+R1_26636_HANDOFF_HASHES.sha256
+build_26636_r1_heic_ultrahdr.sh
+verify_26636_r1_infrastructure.py
+EOF
+  git diff --name-only "$REPAIR_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_repair_scope.txt"
+  diff -u "$WORK/expected_repair_scope.txt" "$WORK/actual_repair_scope.txt" || fail "26636 R1.1 repair commit scope mismatch"
+  ! grep -Eq '^app/' "$WORK/actual_r1_scope.txt" || fail "failed R1 handoff contains live app source"
+  ! grep -Eq '^app/' "$WORK/actual_repair_scope.txt" || fail "R1.1 repair contains live app source"
+  set_report "CHANGED RUNTIME SCOPE" "PASS (R1 runtime payload unchanged; R1.1 changes exactly build script + infrastructure validator + handoff hash manifest; exact 18-path candidate runtime delta retained)"
 }
 obtain_authority(){
   if [[ -n "$LOCAL_ART" ]]; then cp "$LOCAL_ART" "$ARTZIP"; else
