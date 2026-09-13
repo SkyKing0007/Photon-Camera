@@ -1,0 +1,215 @@
+package com.particlesdevs.photoncamera.api;
+
+import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
+import android.os.Build;
+import com.particlesdevs.photoncamera.util.Log;
+import androidx.exifinterface.media.ExifInterface;
+import com.particlesdevs.photoncamera.app.PhotonCamera;
+import com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector;
+
+import java.io.File;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+import java.util.Locale;
+import java.util.TimeZone;
+
+import static android.hardware.camera2.CaptureResult.*;
+import static androidx.exifinterface.media.ExifInterface.*;
+
+public class ParseExif {
+    public static final SimpleDateFormat sFormatter;
+    private static final String TAG = "ParseExif";
+
+    static {
+        sFormatter = new SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US);
+        sFormatter.setTimeZone(TimeZone.getDefault());
+    }
+
+    public static String getTime(long exposureTime) {
+        String out;
+        long sec = 1000000000;
+        double time = (double) (exposureTime) / sec;
+        out = String.valueOf((time));
+        return out;
+    }
+
+    public static String resultget(CaptureResult res, Key<?> key) {
+        Object out = res.get(key);
+        if (out != null) return out.toString();
+        else return "";
+    }
+    public static String requestget(CaptureRequest res, CaptureRequest.Key<?> key) {
+        Object out = res.get(key);
+        if (out != null) return out.toString();
+        else return "";
+    }
+
+    private static String firstNonEmpty(String primary, String fallback) {
+        if (primary != null && !primary.trim().isEmpty()) {
+            return primary.trim();
+        }
+        if (fallback != null && !fallback.trim().isEmpty()) {
+            return fallback.trim();
+        }
+        return "";
+    }
+
+    private static Long safeParseLong(String value, String fieldName) {
+        if (value == null || value.trim().isEmpty()) {
+            Log.w(TAG, "Missing numeric EXIF field: " + fieldName);
+            return null;
+        }
+
+        try {
+            return Long.parseLong(value.trim());
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "Invalid numeric EXIF field " + fieldName
+                    + " value=" + value);
+            return null;
+        }
+    }
+
+    private static Double safeParseDouble(String value, String fieldName) {
+        if (value == null || value.trim().isEmpty()) {
+            Log.w(TAG, "Missing decimal EXIF field: " + fieldName);
+            return null;
+        }
+
+        try {
+            return Double.parseDouble(value.trim());
+        } catch (NumberFormatException e) {
+            Log.w(TAG, "Invalid decimal EXIF field " + fieldName
+                    + " value=" + value);
+            return null;
+        }
+    }
+
+    public static ExifData parse(CaptureResult result, CaptureRequest request) {
+        ExifData data = new ExifData();
+
+        int rotation = PhotonCamera.getCaptureController().cameraRotation;
+        String TAG = "ParseExif";
+        Log.d(TAG, "Gravity rotation:" + PhotonCamera.getGravity().getRotation());
+        Log.d(TAG, "Sensor rotation:" + PhotonCamera.getCaptureController().mSensorOrientation);
+        int orientation = ORIENTATION_NORMAL;
+        switch (rotation) {
+            case 90:
+                orientation = ExifInterface.ORIENTATION_ROTATE_90;
+                break;
+            case 180:
+                orientation = ExifInterface.ORIENTATION_ROTATE_180;
+                break;
+            case 270:
+                orientation = ExifInterface.ORIENTATION_ROTATE_270;
+                break;
+        }
+        Log.d(TAG, "rotation:" + rotation);
+        Log.d(TAG, "orientation:" + orientation);
+
+        Integer iso = result.get(SENSOR_SENSITIVITY);
+        int isonum = 100;
+        if (iso != null) isonum = (int) (iso * IsoExpoSelector.getMPY());
+        Log.d(TAG, "sensivity:" + isonum);
+        isonum = Math.min(65535,isonum);
+
+        data.PHOTOGRAPHIC_SENSITIVITY = String.valueOf(isonum);
+        data.F_NUMBER = resultget(result, LENS_APERTURE);
+        String focal = firstNonEmpty(
+                resultget(result, LENS_FOCAL_LENGTH),
+                requestget(request, CaptureRequest.LENS_FOCAL_LENGTH));
+        Double focalValue = safeParseDouble(focal, "LENS_FOCAL_LENGTH");
+        if (focalValue != null) {
+            data.FOCAL_LENGTH =
+                    ((int) Math.round(100.0 * focalValue)) + "/100";
+        }
+        String exposure = firstNonEmpty(
+                resultget(result, SENSOR_EXPOSURE_TIME),
+                requestget(request, CaptureRequest.SENSOR_EXPOSURE_TIME));
+        Long exposureNs = safeParseLong(
+                exposure,
+                "SENSOR_EXPOSURE_TIME");
+        if (exposureNs != null && exposureNs > 0L) {
+            data.EXPOSURE_TIME = getTime(exposureNs);
+        } else {
+            Log.w(TAG, "Skipping EXIF exposure time because metadata is unavailable");
+        }
+        data.DATETIME = sFormatter.format(new Date(System.currentTimeMillis()));
+        /*
+        //saving for later use
+        float sensorWidth = CameraFragment.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE).getWidth();
+        String mm35 = String.valueOf((short) (36 * (result.get(LENS_FOCAL_LENGTH) / sensorWidth)));
+        inter.setAttribute(TAG_FOCAL_LENGTH_IN_35MM_FILM, mm35);
+        Log.d(TAG, "Saving 35mm FocalLength = " + mm35);
+        */
+        return data;
+    }
+
+    public static ExifInterface setAllAttributes(File file, ExifData data) {
+        ExifInterface inter = null;
+        try {
+            inter = new ExifInterface(file);
+        } catch (IOException e) {
+            e.printStackTrace();
+            return inter;
+        }
+        /* IRIS_26634_PHOTOGRAPHIC_EXIF_ONLY
+         * Preserve user-useful capture metadata. Do not write Iris diagnostics or auxiliary
+         * administrative tags that viewers group under "Other Parameters". UHDR XMP/MPF/gain-map
+         * metadata is owned by the UHDR container path and is intentionally untouched here.
+         */
+        inter.setAttribute(TAG_PHOTOGRAPHIC_SENSITIVITY, data.PHOTOGRAPHIC_SENSITIVITY);
+        inter.setAttribute(TAG_F_NUMBER, data.F_NUMBER);
+        inter.setAttribute(TAG_FOCAL_LENGTH, data.FOCAL_LENGTH);
+        inter.setAttribute(TAG_EXPOSURE_TIME, data.EXPOSURE_TIME);
+        inter.setAttribute(ExifInterface.TAG_DATETIME, data.DATETIME);
+        inter.setAttribute(TAG_MODEL, data.MODEL);
+        inter.setAttribute(TAG_MAKE, data.MAKE);
+        inter.setAttribute(TAG_SENSITIVITY_TYPE, null);
+        inter.setAttribute(TAG_COPYRIGHT, null);
+        inter.setAttribute(TAG_APERTURE_VALUE, null);
+        inter.setAttribute(TAG_IMAGE_DESCRIPTION, null);
+        inter.setAttribute(TAG_COMPRESSION, null);
+        inter.setAttribute(TAG_COLOR_SPACE, null);
+        inter.setAttribute(TAG_EXIF_VERSION, null);
+        return inter;
+    }
+
+    public static int getOrientation(int cameraRotation) {
+        Log.d(TAG, "Gravity rotation:" + PhotonCamera.getGravity().getRotation());
+        Log.d(TAG, "Sensor rotation:" + PhotonCamera.getCaptureController().mSensorOrientation);
+        int orientation = ORIENTATION_NORMAL;
+        switch (cameraRotation) {
+            case 90:
+                orientation = ExifInterface.ORIENTATION_ROTATE_90;
+                break;
+            case 180:
+                orientation = ExifInterface.ORIENTATION_ROTATE_180;
+                break;
+            case 270:
+                orientation = ExifInterface.ORIENTATION_ROTATE_270;
+                break;
+        }
+        return orientation;
+    }
+
+    public static class ExifData {
+        public final String MODEL = Build.MODEL;
+        public final String MAKE = Build.BRAND;
+        /* Retained as source-compatible fields for existing encoders; 26634 no longer writes
+         * these auxiliary values into JPEG EXIF. */
+        public final String COPYRIGHT = "PhotonCamera";
+        public String SENSITIVITY_TYPE;
+        public String PHOTOGRAPHIC_SENSITIVITY;
+        public String APERTURE_VALUE;
+        public String COMPRESSION;
+        public String COLOR_SPACE;
+        public String EXIF_VERSION;
+        public String IMAGE_DESCRIPTION;
+        public String DATETIME;
+        public String EXPOSURE_TIME;
+        public String F_NUMBER;
+        public String FOCAL_LENGTH;
+    }
+}

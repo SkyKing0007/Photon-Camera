@@ -1,0 +1,508 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 82c3070e4731d31e27f0797850e1a81ff3401158..ce3a27eba4a8c41b39f06444ff6315c7474821df 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -78,6 +78,16 @@ internal class GlesMgcRawSpatialStacker(
+         val scaleToBayerQuads: Float,
+     )
+ 
++    /* IRIS_26634_LOCAL_RESIDUAL_NOISE_SUPPORT
++     * Global and local post-Sabre variance are derived from the same accumulated green weights.
++     * The local Q8 map is deliberately reduction-only (<= identity), so it can preserve detail
++     * in better-supported regions but can never increase denoise beyond the successful 26633 owner.
++     */
++    private data class SabreResidualNoiseSupport(
++        val globalScale: Float,
++        val strengthMap: MgcSpatialStrengthMap,
++    )
++
+     private data class Alignment(
+         val texture: Int,
+         val gridWidth: Int,
+@@ -2878,14 +2888,17 @@ internal class GlesMgcRawSpatialStacker(
+              * actual accumulated green weights after all temporal rejection/merge decisions.
+              * This is measured support, not a pre-merge SNR lookup.
+              */
+-            val sabreAverageMergeFactor = readSabreAverageMergeFactor(
++            val sabreResidualNoiseSupport = readSabreResidualNoiseSupport(
+                 accumulatedWeightsGb = accumulatedWeightsGb,
+             )
+-            val sabreNoiseModelScale = sabreAverageMergeFactor
++            val sabreNoiseModelScale = sabreResidualNoiseSupport.globalScale
++            val sabreResidualStrengthMap26634 = sabreResidualNoiseSupport.strengthMap
+             PLog.i(
+                 SABRE_TAG,
+-                "MGC Sabre merged NoiseModel averageMergeFactor=$sabreAverageMergeFactor " +
+-                    "coefficientScale=$sabreNoiseModelScale",
++                "MGC Sabre merged NoiseModel averageMergeFactor=$sabreNoiseModelScale " +
++                    "coefficientScale=$sabreNoiseModelScale " +
++                    "localResidualStrength=${sabreResidualStrengthMap26634.width}x${sabreResidualStrengthMap26634.height} " +
++                    "localResidualRangeQ8=192..256 maxDenoiseIncrease=false",
+             )
+ 
+             if (normalDngAccumulator != 0) {
+@@ -3232,6 +3245,7 @@ internal class GlesMgcRawSpatialStacker(
+                 },
+                 lensShadingCorrectionApplied = hasLensShading(),
+                 mergedFrameCount = mergedFrameCount,
++                mgcSpatialStrengthMap = sabreResidualStrengthMap26634,
+                 mgcSabreNoiseModelScale = sabreNoiseModelScale,
+                 mgcReferenceSnr = kernelTuning.referenceSnr,
+                 mgcDenoiseTuningSnr = kernelTuning.referenceSnr / sqrt(sabreNoiseModelScale),
+@@ -4783,9 +4797,9 @@ internal class GlesMgcRawSpatialStacker(
+      * The value is transported as the merged-noise coefficient scale and therefore reflects
+      * the frames Sabre actually trusted, rather than the nominal burst length.
+      */
+-    private fun readSabreAverageMergeFactor(
++    private fun readSabreResidualNoiseSupport(
+         accumulatedWeightsGb: Int,
+-    ): Float {
++    ): SabreResidualNoiseSupport {
+         val reducedWidth = ceilDiv(width, 4)
+         val reducedHeight = ceilDiv(height, 4)
+         val reduced = createTexture(
+@@ -4810,10 +4824,8 @@ internal class GlesMgcRawSpatialStacker(
+                 intArrayOf(reduced),
+             )
+ 
+-            val valueCount = Math.multiplyExact(
+-                Math.multiplyExact(reducedWidth, reducedHeight),
+-                2,
+-            )
++            val blockCount = Math.multiplyExact(reducedWidth, reducedHeight)
++            val valueCount = Math.multiplyExact(blockCount, 2)
+             val readback = ByteBuffer.allocateDirect(
+                 Math.multiplyExact(valueCount, Short.SIZE_BYTES),
+             ).order(ByteOrder.nativeOrder())
+@@ -4833,11 +4845,20 @@ internal class GlesMgcRawSpatialStacker(
+             checkGlError("read Iris Sabre reciprocal green weights")
+ 
+             val values = readback.asShortBuffer()
++            val blockReciprocalSum = DoubleArray(blockCount)
++            val blockSampleCount = DoubleArray(blockCount)
+             var reciprocalSum = 0.0
+             var sampleCount = 0.0
+-            for (index in 0 until reducedWidth * reducedHeight) {
+-                reciprocalSum += Half.toFloat(values.get(index * 2)).toDouble()
+-                sampleCount += Half.toFloat(values.get(index * 2 + 1)).toDouble()
++            for (index in 0 until blockCount) {
++                val localSum = Half.toFloat(values.get(index * 2)).toDouble()
++                val localCount = Half.toFloat(values.get(index * 2 + 1)).toDouble()
++                check(localSum.isFinite() && localCount.isFinite() && localSum > 0.0 && localCount > 0.0) {
++                    "Iris Sabre local support invalid at block=$index sum=$localSum count=$localCount"
++                }
++                blockReciprocalSum[index] = localSum
++                blockSampleCount[index] = localCount
++                reciprocalSum += localSum
++                sampleCount += localCount
+             }
+             check(
+                 reciprocalSum.isFinite() && sampleCount.isFinite() &&
+@@ -4846,7 +4867,28 @@ internal class GlesMgcRawSpatialStacker(
+                 "Iris Sabre accumulated green weights produced an invalid merge factor: " +
+                     "sum=$reciprocalSum count=$sampleCount"
+             }
+-            return (reciprocalSum / sampleCount).toFloat()
++            val globalScale = (reciprocalSum / sampleCount).toFloat()
++            check(globalScale.isFinite() && globalScale > 0f)
++
++            /* IRIS_26634_LOCAL_RESIDUAL_NOISE_SUPPORT
++             * Convert each exact 4x4 reciprocal-weight average into a multiplier relative to the
++             * already-proven global 26545 variance scale. Clamp to 0.75..1.0 so local evidence may
++             * only reduce residual denoise by at most 25%; low-support blocks retain exact 26633
++             * strength. This cannot create a stronger denoise decision than 26633.
++             */
++            val localStrengthQ8 = ShortArray(blockCount) { index ->
++                val localScale = (blockReciprocalSum[index] / blockSampleCount[index]).toFloat()
++                val boundedRelative = (localScale / globalScale).coerceIn(0.75f, 1.0f)
++                (boundedRelative * 256f + 0.5f).toInt().coerceIn(192, 256).toShort()
++            }
++            return SabreResidualNoiseSupport(
++                globalScale = globalScale,
++                strengthMap = MgcSpatialStrengthMap(
++                    width = reducedWidth,
++                    height = reducedHeight,
++                    q8 = localStrengthQ8,
++                ),
++            )
+         } finally {
+             releaseOwnedTexture(reduced, "Iris Sabre reciprocal green-weight reduction")
+         }
+diff --git a/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt b/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
+index 454ab6c5fad7a077bcc91c4e80732c2c98ad1ff9..80bfa66c4afec659d911a557900ee7ebe151ead5 100644
+--- a/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
++++ b/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
+@@ -195,10 +195,15 @@ internal object MgcFullResolutionDenoise {
+             )
+             return false
+         }
++        /* IRIS_26634_LOCAL_RESIDUAL_NOISE_SUPPORT
++         * Spatial and Sabre now share the existing Q8 variance-multiplier transport. Sabre's map
++         * is derived from the same accumulated green weights as its global 26545 noise scale and
++         * is clamped <= identity, so this path can never increase denoise beyond 26633.
++         */
+         val spatialStrengthMap = metadata.mgcSpatialStrengthMap.takeIf {
+-            useSpatialModel
++            useSpatialModel || useSabreModel
+         }
+-        if (useSpatialModel && spatialStrengthMap?.let {
++        if ((useSpatialModel || useSabreModel) && spatialStrengthMap?.let {
+                 it.width == (fullWidth + 3) / 4 &&
+                     it.height == (fullHeight + 3) / 4 &&
+                     it.q8.size == it.width * it.height
+@@ -206,7 +211,7 @@ internal object MgcFullResolutionDenoise {
+         ) {
+             PLog.e(
+                 TAG,
+-                "MGC denoise rejected Spatial strength map: " +
++                "MGC denoise rejected ${if (useSabreModel) "Sabre" else "Spatial"} strength map: " +
+                     "full=${fullWidth}x$fullHeight map=${spatialStrengthMap?.let {
+                         "${it.width}x${it.height}/${it.q8.size}"
+                     } ?: "none"}",
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java b/app/src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java
+index b4550e9f6b0864ab7d622412e6f2a5f6651dc0e3..e2bbf215b5ac833d7b1c4bebfc49d9ff4ee30b56 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/api/ParseExif.java
+@@ -114,7 +114,6 @@ public class ParseExif {
+         Log.d(TAG, "sensivity:" + isonum);
+         isonum = Math.min(65535,isonum);
+ 
+-        data.SENSITIVITY_TYPE = String.valueOf(ExifInterface.SENSITIVITY_TYPE_ISO_SPEED);
+         data.PHOTOGRAPHIC_SENSITIVITY = String.valueOf(isonum);
+         data.F_NUMBER = resultget(result, LENS_APERTURE);
+         String focal = firstNonEmpty(
+@@ -125,9 +124,6 @@ public class ParseExif {
+             data.FOCAL_LENGTH =
+                     ((int) Math.round(100.0 * focalValue)) + "/100";
+         }
+-        data.APERTURE_VALUE = firstNonEmpty(
+-                resultget(result, LENS_APERTURE),
+-                requestget(request, CaptureRequest.LENS_APERTURE));
+         String exposure = firstNonEmpty(
+                 resultget(result, SENSOR_EXPOSURE_TIME),
+                 requestget(request, CaptureRequest.SENSOR_EXPOSURE_TIME));
+@@ -140,9 +136,6 @@ public class ParseExif {
+             Log.w(TAG, "Skipping EXIF exposure time because metadata is unavailable");
+         }
+         data.DATETIME = sFormatter.format(new Date(System.currentTimeMillis()));
+-        data.COMPRESSION = "97";
+-        data.COLOR_SPACE = "sRGB";
+-        data.EXIF_VERSION = "0231";
+         /*
+         //saving for later use
+         float sensorWidth = CameraFragment.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE).getWidth();
+@@ -161,20 +154,25 @@ public class ParseExif {
+             e.printStackTrace();
+             return inter;
+         }
+-        inter.setAttribute(TAG_SENSITIVITY_TYPE, data.SENSITIVITY_TYPE);
++        /* IRIS_26634_PHOTOGRAPHIC_EXIF_ONLY
++         * Preserve user-useful capture metadata. Do not write Iris diagnostics or auxiliary
++         * administrative tags that viewers group under "Other Parameters". UHDR XMP/MPF/gain-map
++         * metadata is owned by the UHDR container path and is intentionally untouched here.
++         */
+         inter.setAttribute(TAG_PHOTOGRAPHIC_SENSITIVITY, data.PHOTOGRAPHIC_SENSITIVITY);
+         inter.setAttribute(TAG_F_NUMBER, data.F_NUMBER);
+         inter.setAttribute(TAG_FOCAL_LENGTH, data.FOCAL_LENGTH);
+-        inter.setAttribute(TAG_COPYRIGHT, data.COPYRIGHT);
+-        inter.setAttribute(TAG_APERTURE_VALUE, data.APERTURE_VALUE);
+         inter.setAttribute(TAG_EXPOSURE_TIME, data.EXPOSURE_TIME);
+         inter.setAttribute(ExifInterface.TAG_DATETIME, data.DATETIME);
+         inter.setAttribute(TAG_MODEL, data.MODEL);
+         inter.setAttribute(TAG_MAKE, data.MAKE);
+-        inter.setAttribute(TAG_COMPRESSION, data.COMPRESSION);
+-        inter.setAttribute(TAG_COLOR_SPACE, data.COLOR_SPACE);
+-        inter.setAttribute(TAG_EXIF_VERSION, data.EXIF_VERSION);
+-        inter.setAttribute(TAG_IMAGE_DESCRIPTION, data.IMAGE_DESCRIPTION);
++        inter.setAttribute(TAG_SENSITIVITY_TYPE, null);
++        inter.setAttribute(TAG_COPYRIGHT, null);
++        inter.setAttribute(TAG_APERTURE_VALUE, null);
++        inter.setAttribute(TAG_IMAGE_DESCRIPTION, null);
++        inter.setAttribute(TAG_COMPRESSION, null);
++        inter.setAttribute(TAG_COLOR_SPACE, null);
++        inter.setAttribute(TAG_EXIF_VERSION, null);
+         return inter;
+     }
+ 
+@@ -199,6 +197,8 @@ public class ParseExif {
+     public static class ExifData {
+         public final String MODEL = Build.MODEL;
+         public final String MAKE = Build.BRAND;
++        /* Retained as source-compatible fields for existing encoders; 26634 no longer writes
++         * these auxiliary values into JPEG EXIF. */
+         public final String COPYRIGHT = "PhotonCamera";
+         public String SENSITIVITY_TYPE;
+         public String PHOTOGRAPHIC_SENSITIVITY;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 9822fa01f2a6e0a8c36765758d26968e481432ca..647eb906c66119478b5ba8880b5803efb9c3f215 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -448,9 +448,9 @@ private void ApplyHdrX() {
+         }
+         processingParameters.cameraRotation = cameraRotation;
+ 
+-        exifData.IMAGE_DESCRIPTION = processingParameters.toString()
+-                + "\n" + com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector
+-                .lastMotionExposureDiagnostics;
++        /* IRIS_26634_PHOTOGRAPHIC_EXIF_ONLY: diagnostics remain in PhotonLog/MotionTrace,
++         * never in JPEG ImageDescription. */
++        exifData.IMAGE_DESCRIPTION = null;
+         ImageFrameDeblur imageFrameDeblur = new ImageFrameDeblur(processingParameters);
+         imageFrameDeblur.firstFrameGyro = images.get(0).frameGyro.clone();
+         for (int i = 0; i < images.size(); i++)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+index 90c840a6a22ac913083109e9e0395a2172b88aa3..964a214205a8b0a8446d2d5ff91fa642e8c5fbf2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+@@ -224,22 +224,9 @@ public final class IrisNightProcessor {
+                 Log.critical(TAG, "IRIS_26544_NIGHT_DNG_SKIPPED saveRaw=" + batch.saveRaw);
+             }
+ 
+-            exif.IMAGE_DESCRIPTION = p.toString()
+-                    + "\nIRIS_26541_NIGHT_12_PLUS_3 irisCaptureOwner=true exactTimestampMetadata=true"
+-                    + " shortFrames=" + batch.shortFrameCount + "/" + batch.requestedShortFrames
+-                    + " longFrames=" + batch.longFrameCount + "/" + batch.requestedLongFrames
+-                    + " referenceRole=SHORT zsl=false motionRing=false preShutterRaw=false"
+-                    + " photonNight=false staticImageBuffer=false defaultSaver=false hdrxRun=false"
+-                    + " applyRes=false photonNoiseModeler=false liveTunableInjection=false"
+-                    + " mgcSabre=true mgcSpatialRgb=false shortReferenceAuthority=true"
+-                    + " longEvidence=shadowOnly normalDngLongExcluded=true"
+-                    + " pecanProfileSnr=referencePreMerge"
+-                    + " denoiseMagnitude=propagatedResidual readShotCorrelationStrength=true"
+-                    + " isoDenoiseAuthority=false darknessDenoiseAuthority=false"
+-                    + " autoLowLightLumaFloor=false ultraHdrPostPipeline=true"
+-                    + " jinRgbGridApplied=false degradedBracket=" + batch.degradedBracket
+-                    + " superResRequested=" + iris26562NightSuperResRequested
+-                    + " superResEffective=" + p.motionV2SuperResOutputEnabled;
++            /* IRIS_26634_PHOTOGRAPHIC_EXIF_ONLY: Night diagnostics stay in retained logs,
++             * never in JPEG ImageDescription. */
++            exif.IMAGE_DESCRIPTION = null;
+ 
+             final PostPipeline pipeline = new PostPipeline(true);
+             Log.processState(TAG, "NIGHT_POST_RGB_BEGIN");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 4316ff88360111d0c46fb32dde84f5d95b3c4dc6..08079ca6d4178dba38c75ed2fc7b8673cdac5523 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -459,8 +459,16 @@ object PhotonMotionMgc1271Bridge {
+             val referenceSnr = stacked.mgcReferenceSnr
+             val tuningSnr = stacked.mgcDenoiseTuningSnr
+             val sabreNoiseScale = stacked.mgcSabreNoiseModelScale
+-            requireParity(correlation == null && readNoise == null && shotNoise == null && strength == null,
+-                "Sabre unexpectedly leaked Spatial-only denoise/reliability state")
++            requireParity(correlation == null && readNoise == null && shotNoise == null,
++                "Sabre unexpectedly leaked Spatial-only correlation/noise coefficients")
++            requireParity(
++                strength != null &&
++                    strength.width == (size.x + 3) / 4 &&
++                    strength.height == (size.y + 3) / 4 &&
++                    strength.q8.size == strength.width * strength.height &&
++                    strength.q8.all { (it.toInt() and 0xffff) in 192..256 },
++                "26634 Sabre local residual-noise support missing/malformed",
++            )
+             requireParity(referenceSnr != null && referenceSnr.isFinite() && referenceSnr >= 0f,
+                 "Sabre reference SNR missing/malformed")
+             requireParity(tuningSnr != null && tuningSnr.isFinite() && tuningSnr >= 0f,
+@@ -511,7 +519,9 @@ object PhotonMotionMgc1271Bridge {
+              * remains low even after a large nominal frame count. Keep the existing MGC/Pecan
+              * residual denoise owner and measured noise model; add only a bounded support-derived
+              * luma floor. Pecan's frequency/outlier/revert tuning remains the structure authority.
+-             * No ISO/scene-brightness heuristic and no post-render blur is introduced. */
++             * No ISO/scene-brightness heuristic and no post-render blur is introduced.
++             * IRIS_26634_LOCAL_RESIDUAL_NOISE_SUPPORT then only reduces this existing owner in
++             * better-supported 4x4 regions; it never raises the 26633 luma/chroma ceiling. */
+             val supportDeficit26633 =
+                 ((3.0f - noiseEquivalentSupport) / 2.0f).coerceIn(0f, 1f)
+             val supportGate26633 = supportDeficit26633 * supportDeficit26633 *
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+index 5de2ef64b7f32d8e6ce04d897857443c5ec6c0ae..62261d26e811bb10b3960d87279157ae191b9e6b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+@@ -32,16 +32,12 @@ public class Log {
+     private static String currentLogFileName = null;
+     private static boolean logEnabled = true;
+ 
+-    /* IRIS_26544_PROCESS_DEATH_DIAGNOSTICS
+-     * Normal Photon logs are authorized only after external storage setup. A process can die before
+-     * that async writer flushes, which made the 26543 Night crash silent. This tiny private file is
+-     * available from Application.onCreate, and critical() fsyncs each lifecycle breadcrumb before
+-     * returning. On the next process start, Android's prior ApplicationExitInfo is captured here too.
++    /* IRIS_26634_RETIRE_PROCESS_LIFECYCLE_FILES
++     * Keep PhotonLog/log-YYYY-MM-DD.txt and motion-trace-YYYY-MM-DD.txt. The private
++     * iris-process-lifecycle files, synchronous fsync breadcrumbs and process-state persistence
++     * are retired to remove capture/processing-boundary filesystem stalls. Public call sites stay
++     * source-compatible: critical() routes to the normal async logger and processState() is a no-op.
+      */
+-    private static final Object processLogLock = new Object();
+-    private static java.io.File processLogDir = null;
+-    private static java.io.File processLogFile = null;
+-    private static Context processContext = null;
+ 
+     // Thread-safe date formatters
+     private static final ThreadLocal<SimpleDateFormat> dateFormatter =
+@@ -89,139 +85,15 @@ public class Log {
+     }
+ 
+     public static void initProcessDiagnostics(Context context) {
+-        if (context == null) return;
+-        synchronized (processLogLock) {
+-            try {
+-                Context app = context.getApplicationContext();
+-                processContext = app;
+-                processLogDir = new java.io.File(app.getFilesDir(), "iris-process-lifecycle");
+-                if (!processLogDir.exists() && !processLogDir.mkdirs()) {
+-                    android.util.Log.e("IrisProcess", "Cannot create private lifecycle log directory");
+-                    return;
+-                }
+-                String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US)
+-                        .format(new java.util.Date());
+-                processLogFile = new java.io.File(processLogDir,
+-                        "iris-process-lifecycle-" + stamp + "-pid" + android.os.Process.myPid() + ".txt");
+-                writeCriticalInternal("I", "IrisProcess", "IRIS_26544_PROCESS_START pid="
+-                        + android.os.Process.myPid() + " sdk=" + android.os.Build.VERSION.SDK_INT);
+-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+-                    try {
+-                        android.app.ActivityManager am = (android.app.ActivityManager)
+-                                app.getSystemService(Context.ACTIVITY_SERVICE);
+-                        if (am != null) {
+-                            java.util.List<android.app.ApplicationExitInfo> exits =
+-                                    am.getHistoricalProcessExitReasons(app.getPackageName(), 0, 5);
+-                            int count = 0;
+-                            for (android.app.ApplicationExitInfo info : exits) {
+-                                if (info == null || count++ >= 3) continue;
+-                                byte[] priorState = info.getProcessStateSummary();
+-                                String priorStateText = priorState == null ? "null"
+-                                        : new String(priorState, java.nio.charset.StandardCharsets.UTF_8);
+-                                writeCriticalInternal("I", "IrisProcess",
+-                                        "IRIS_26544_PREVIOUS_PROCESS_EXIT reason=" + info.getReason()
+-                                                + " status=" + info.getStatus()
+-                                                + " importance=" + info.getImportance()
+-                                                + " pssKb=" + info.getPss()
+-                                                + " rssKb=" + info.getRss()
+-                                                + " timestamp=" + info.getTimestamp()
+-                                                + " processState=" + priorStateText
+-                                                + " description=" + String.valueOf(info.getDescription()));
+-                            }
+-                        }
+-                    } catch (Throwable exitInfoFailure) {
+-                        writeCriticalInternal("W", "IrisProcess",
+-                                "IRIS_26544_PREVIOUS_PROCESS_EXIT_QUERY_FAILED type="
+-                                        + exitInfoFailure.getClass().getName() + " message="
+-                                        + String.valueOf(exitInfoFailure.getMessage()));
+-                    }
+-                }
+-            } catch (Throwable initFailure) {
+-                android.util.Log.e("IrisProcess", "Process diagnostics init failed", initFailure);
+-            }
+-        }
+-    }
+-
+-    private static void writeCriticalInternal(String level, String tag, String message) {
+-        synchronized (processLogLock) {
+-            if (processLogFile == null) return;
+-            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(processLogFile, true);
+-                 java.io.OutputStreamWriter osw = new java.io.OutputStreamWriter(
+-                         fos, java.nio.charset.StandardCharsets.UTF_8);
+-                 java.io.BufferedWriter writer = new java.io.BufferedWriter(osw)) {
+-                String time = timeFormatter.get().format(new java.util.Date());
+-                writer.write(time + " " + level + "/" + tag + ": " + message);
+-                writer.newLine();
+-                writer.flush();
+-                fos.getFD().sync();
+-            } catch (Throwable writeFailure) {
+-                android.util.Log.e("IrisProcess", "Critical lifecycle write failed", writeFailure);
+-            }
+-        }
++        // IRIS_26634: dedicated lifecycle persistence intentionally retired.
+     }
+ 
+     public static void critical(String tag, String message) {
+-        android.util.Log.i(tag, message);
+-        writeCriticalInternal("C", tag, message);
+-        if (logEnabled) writeToFile("C", tag, message);
++        i(tag, message);
+     }
+ 
+-    /**
+-     * IRIS_26544_PROCESS_STATE_SUMMARY
+-     * Store only coarse pipeline stage text so Android can return the last known stage with
+-     * ApplicationExitInfo even if the process is killed before a normal log writer flushes.
+-     * Android allows at most 128 bytes and may throttle excessive calls, so callers use this only
+-     * at major capture/processing boundaries rather than per-frame hot paths.
+-     */
+     public static void processState(String tag, String message) {
+-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return;
+-        Context context = processContext;
+-        if (context == null) return;
+-        try {
+-            String stateText = String.valueOf(tag) + ":" + String.valueOf(message);
+-            byte[] state = stateText.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+-            if (state.length > 128) state = java.util.Arrays.copyOf(state, 128);
+-            android.app.ActivityManager am = (android.app.ActivityManager)
+-                    context.getSystemService(Context.ACTIVITY_SERVICE);
+-            if (am != null) am.setProcessStateSummary(state);
+-            writeCriticalInternal("S", "IrisProcess", "IRIS_26544_PROCESS_STATE " + stateText);
+-        } catch (Throwable stateFailure) {
+-            writeCriticalInternal("W", "IrisProcess",
+-                    "IRIS_26544_PROCESS_STATE_FAILED type=" + stateFailure.getClass().getName()
+-                            + " message=" + String.valueOf(stateFailure.getMessage()));
+-        }
+-    }
+-
+-    private static void mirrorPrivateProcessLogs() {
+-        Context context = logContext;
+-        java.io.File dir = processLogDir;
+-        if (context == null || dir == null || !SimpleStorageHelper.hasStorageAccess(context)) return;
+-        DocumentFile folder = getLogFolderDocumentFile();
+-        if (folder == null || !folder.isDirectory()) return;
+-        java.io.File[] files = dir.listFiles((d, name) ->
+-                name.startsWith("iris-process-lifecycle-") && name.endsWith(".txt"));
+-        if (files == null) return;
+-        for (java.io.File source : files) {
+-            try {
+-                DocumentFile target = folder.findFile(source.getName());
+-                if (target == null || !target.exists())
+-                    target = folder.createFile("text/plain", source.getName());
+-                if (target == null) continue;
+-                try (java.io.InputStream in = new java.io.FileInputStream(source);
+-                     java.io.OutputStream out = DocumentFileUtils.openOutputStream(target, context, false)) {
+-                    if (out == null) continue;
+-                    byte[] buf = new byte[8192];
+-                    int n;
+-                    while ((n = in.read(buf)) >= 0) {
+-                        if (n > 0) out.write(buf, 0, n);
+-                    }
+-                    out.flush();
+-                }
+-            } catch (Throwable mirrorFailure) {
+-                android.util.Log.w("IrisProcess", "Private lifecycle mirror failed: "
+-                        + source.getName(), mirrorFailure);
+-            }
+-        }
++        // IRIS_26634: no private lifecycle file and no ActivityManager process-state summary.
+     }
+ 
+     /**
+@@ -232,10 +104,7 @@ public class Log {
+         if (context != null) {
+             logContext = context.getApplicationContext();
+             logDir = null;
+-            logHandler.post(() -> {
+-                cleanupOldLogs();
+-                mirrorPrivateProcessLogs();
+-            });
++            logHandler.post(Log::cleanupOldLogs);
+         } else {
+             logContext = null;
+             closeWriter();
+diff --git a/app/version.properties b/app/version.properties
+index 3878572f60adaa65eccbe5de52cf40d33ecf4478..0d8328884c9d874fb8fa43c4f7af7ad579f0945d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726633
+-VERSION_BUILD=26633
++VERSION_NAME=0.9726634
++VERSION_BUILD=26634
