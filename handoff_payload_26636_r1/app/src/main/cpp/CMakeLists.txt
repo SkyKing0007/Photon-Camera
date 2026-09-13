@@ -352,6 +352,9 @@ message(STATUS "IRIS_26636 exact gain-map HEIF authority verified: ${IRIS26636_L
 add_library(irisheic SHARED iris_heic_jni.cpp)
 set_target_properties(irisheic PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 target_include_directories(irisheic PRIVATE
+    # IRIS_26636_LIBHEIF_GENERATED_HEADER_INCLUDE
+    # Pinned libheif generates libheif/heif_version.h under libheif_BINARY_DIR.
+    "${libheif_BINARY_DIR}"
     "${iris26636_libheif_SOURCE_DIR}/libheif/api"
     "${iris26636_libheif_SOURCE_DIR}/libheif/api/libheif"
     ${IRIS26507_UHDR}

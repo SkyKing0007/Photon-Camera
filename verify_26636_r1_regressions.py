@@ -25,6 +25,13 @@ assert 'info.isHardwareAccelerated()' in hw and 'MIMETYPE_VIDEO_HEVC' in hw
 assert 'MIMETYPE_IMAGE_ANDROID_HEIC' not in hw
 for t in ['set(WITH_X265 OFF','set(WITH_KVAZAAR OFF','set(WITH_AOM_ENCODER OFF']:
  assert t in cmake,t
+# Real NDK failure 2026-09-13: libheif/api/libheif/heif.h includes <libheif/heif_version.h>,
+# which pinned libheif generates under libheif_BINARY_DIR. The irisheic consumer must explicitly
+# inherit that build-tree include root; source-tree API includes alone reproduce the exact fatal error.
+iris_inc=cmake.split('target_include_directories(irisheic PRIVATE',1)[1].split(')',1)[0]
+assert 'IRIS_26636_LIBHEIF_GENERATED_HEADER_INCLUDE' in iris_inc
+assert '"${libheif_BINARY_DIR}"' in iris_inc
+assert iris_inc.index('"${libheif_BINARY_DIR}"') < iris_inc.index('"${iris26636_libheif_SOURCE_DIR}/libheif/api"')
 # Patch identity is verified as a Git blob object, not incorrectly as raw SHA1.
 assert 'hash-object "${IRIS26636_LIBHEIF_PATCH}"' in cmake and 'IRIS26636_LIBHEIF_PATCH_BLOB "da5494f223f369781bbabcdaf6dbe192e0d74ca1"' in cmake
 assert 'EXPECTED_HASH SHA1=da5494f223f369781bbabcdaf6dbe192e0d74ca1' not in cmake
@@ -34,4 +41,4 @@ assert 'alternateNclx, heif_matrix_coefficients_chromaticity_derived_non_constan
 # Permanent generated/runtime-scope regressions are handled by authority-seeded manifests; prove changed paths are only intended actual app source/build config.
 changed=[x for x in (Path(__file__).resolve().parent/'R1_26636_RUNTIME_CHANGED_PATHS.txt').read_text().splitlines() if x]
 assert not any('/build/' in p or '/.cxx/' in p for p in changed)
-print('PASS 26636 regressions: no RAW-state collision, no HEIC+SR, no silent SDR fallback, hardware-only HEVC, exact patch provenance, correct P3/tmap color signaling')
+print('PASS 26636 regressions: no RAW-state collision, no HEIC+SR, no silent SDR fallback, hardware-only HEVC, generated libheif header include, exact patch provenance, correct P3/tmap color signaling')

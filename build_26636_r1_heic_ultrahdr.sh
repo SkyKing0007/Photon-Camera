@@ -20,6 +20,7 @@ RUNTIME_AUTHORITY_COMMIT="e6790ebd2f2a8403191a276d659de4a708181efa"
 HANDOFF_PARENT_COMMIT="$RUNTIME_AUTHORITY_COMMIT"
 FAILED_R1_COMMIT="a33e00935e00d7153cb72619333f658b0a5a566c"
 REPAIR_PARENT_COMMIT="$FAILED_R1_COMMIT"
+R1_1_COMMIT="1f414a3d47d6de8baa507c8c293dabfc2d526d04"
 BASE_RUN_ID="34777964131"
 BASE_ARTIFACT_ID="10324098412"
 BASE_ARTIFACT_NAME="photon-26635-r1-spatial-highlight-rolloff"
@@ -120,9 +121,10 @@ PY
   set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful-26635 ordering/isolation/Kotlin-Java/NDK/patch/PRE-BUILD/assemble/postbuild mechanics preserved; authority/scope/HEIC validators only; GLSL stage retained and N/A for zero modified shaders)"
 }
 verify_scope(){
-  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed R1.1 repair; runtime candidate unchanged at exact 18-path allowlist: 15 modified + 3 added)"; return; fi
+  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed R1.2 native-include repair; exact 18-path runtime allowlist retained: 15 modified + 3 added)"; return; fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-  [[ "$(git rev-parse HEAD^)" == "$REPAIR_PARENT_COMMIT" ]] || fail "26636 R1.1 repair must be one direct commit on exact failed 26636 R1 handoff"
+  [[ "$(git rev-parse HEAD^)" == "$R1_1_COMMIT" ]] || fail "26636 R1.2 repair must be one direct commit on exact failed 26636 R1.1 handoff"
+  [[ "$(git rev-parse "$R1_1_COMMIT^")" == "$REPAIR_PARENT_COMMIT" ]] || fail "26636 R1.1 parent is not exact failed 26636 R1"
   [[ "$(git rev-parse "$REPAIR_PARENT_COMMIT^")" == "$HANDOFF_PARENT_COMMIT" ]] || fail "failed 26636 R1 parent is not exact successful 26635 authority"
   python3 -S - "$HANDOFF" > "$WORK/expected_r1_scope.txt" <<'PY'
 from pathlib import Path
@@ -133,17 +135,32 @@ print('\n'.join(sorted(names)))
 PY
   git diff --name-only "$HANDOFF_PARENT_COMMIT" "$REPAIR_PARENT_COMMIT" | sort > "$WORK/actual_r1_scope.txt"
   diff -u "$WORK/expected_r1_scope.txt" "$WORK/actual_r1_scope.txt" || fail "failed 26636 R1 sealed handoff scope mismatch"
-  cat > "$WORK/expected_repair_scope.txt" <<'EOF'
+  cat > "$WORK/expected_r11_scope.txt" <<'EOF'
 R1_26636_HANDOFF_HASHES.sha256
 build_26636_r1_heic_ultrahdr.sh
 verify_26636_r1_infrastructure.py
 EOF
-  git diff --name-only "$REPAIR_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_repair_scope.txt"
-  diff -u "$WORK/expected_repair_scope.txt" "$WORK/actual_repair_scope.txt" || fail "26636 R1.1 repair commit scope mismatch"
+  git diff --name-only "$REPAIR_PARENT_COMMIT" "$R1_1_COMMIT" | sort > "$WORK/actual_r11_scope.txt"
+  diff -u "$WORK/expected_r11_scope.txt" "$WORK/actual_r11_scope.txt" || fail "26636 R1.1 repair commit scope mismatch"
+  cat > "$WORK/expected_r12_scope.txt" <<'EOF'
+R1_26636_EXPECTED_CANDIDATE_FULL_APP.sha256
+R1_26636_EXPECTED_CHANGED_SOURCE_HASHES.sha256
+R1_26636_HANDOFF_HASHES.sha256
+R1_26636_RUNTIME_DELTA_FROM_26635_R1.patch
+R1_26636_RUNTIME_ROLLBACK_TO_26635_R1.patch
+build_26636_r1_heic_ultrahdr.sh
+handoff_payload_26636_r1/app/src/main/cpp/CMakeLists.txt
+verify_26636_r1_infrastructure.py
+verify_26636_r1_regressions.py
+EOF
+  git diff --name-only "$R1_1_COMMIT"..HEAD | sort > "$WORK/actual_r12_scope.txt"
+  diff -u "$WORK/expected_r12_scope.txt" "$WORK/actual_r12_scope.txt" || fail "26636 R1.2 repair commit scope mismatch"
   ! grep -Eq '^app/' "$WORK/actual_r1_scope.txt" || fail "failed R1 handoff contains live app source"
-  ! grep -Eq '^app/' "$WORK/actual_repair_scope.txt" || fail "R1.1 repair contains live app source"
-  set_report "CHANGED RUNTIME SCOPE" "PASS (R1 runtime payload unchanged; R1.1 changes exactly build script + infrastructure validator + handoff hash manifest; exact 18-path candidate runtime delta retained)"
+  ! grep -Eq '^app/' "$WORK/actual_r11_scope.txt" || fail "R1.1 repair contains live app source"
+  ! grep -Eq '^app/' "$WORK/actual_r12_scope.txt" || fail "R1.2 repair contains live app source"
+  set_report "CHANGED RUNTIME SCOPE" "PASS (R1.2 changes one already-allowed runtime file: HEIC CMake generated-header include; exact 18-path candidate runtime allowlist retained; no live app source committed)"
 }
+
 obtain_authority(){
   if [[ -n "$LOCAL_ART" ]]; then cp "$LOCAL_ART" "$ARTZIP"; else
     [[ -n "$TOKEN" ]] || fail "GITHUB_TOKEN missing"
