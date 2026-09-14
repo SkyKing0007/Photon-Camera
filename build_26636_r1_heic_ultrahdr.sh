@@ -21,6 +21,7 @@ HANDOFF_PARENT_COMMIT="$RUNTIME_AUTHORITY_COMMIT"
 FAILED_R1_COMMIT="a33e00935e00d7153cb72619333f658b0a5a566c"
 REPAIR_PARENT_COMMIT="$FAILED_R1_COMMIT"
 R1_1_COMMIT="1f414a3d47d6de8baa507c8c293dabfc2d526d04"
+R1_2_BROKEN_COMMIT="9dc0efd79253f7d2caa016b763796bdd37621ec7"
 BASE_RUN_ID="34777964131"
 BASE_ARTIFACT_ID="10324098412"
 BASE_ARTIFACT_NAME="photon-26635-r1-spatial-highlight-rolloff"
@@ -93,7 +94,11 @@ set_report(){ local key="$1" val="$2" tmp="$OUT/.report.tmp"; awk -v key="$key:"
 set_compiler(){ local key="$1" val="$2" tmp="$OUT/.compiler.tmp"; awk -v key="$key:" -v val="$val" 'BEGIN{f=0} index($0,key)==1{print key" "val;f=1;next}{print} END{if(!f)exit 42}' "$OUT/26636_R1_COMPILER_STATUS.txt" > "$tmp" || fail "compiler key missing $key"; mv "$tmp" "$OUT/26636_R1_COMPILER_STATUS.txt"; }
 snapshot_candidate_from_authority(){ local authority_root="$1" live_root="$2" dest_root="$3"; rm -rf "$dest_root"; mkdir -p "$dest_root"; cp -a "$authority_root/." "$dest_root/"; rm -rf "$dest_root/app/src"; cp -a "$live_root/app/src" "$dest_root/app/"; cp -a "$live_root/app/build.gradle" "$dest_root/app/build.gradle"; cp -a "$live_root/app/version.properties" "$dest_root/app/version.properties"; }
 verify_package(){
-  [[ -f "$HANDOFF" ]] || fail "handoff hash manifest missing"; sha256sum -c "$HANDOFF" >/dev/null
+  [[ -f "$HANDOFF" ]] || fail "handoff hash manifest missing"
+  [[ -d "$ROOT/handoff_payload_26636_r1" ]] || fail "sealed runtime payload directory missing"
+  [[ "$(find "$ROOT/handoff_payload_26636_r1" -type f | wc -l)" -eq 18 ]] || fail "sealed runtime payload must contain exactly 18 files"
+  [[ "$(awk '{print $2}' "$HANDOFF" | grep -c '^handoff_payload_26636_r1/')" -eq 18 ]] || fail "handoff manifest must seal exactly 18 runtime payload files"
+  sha256sum -c "$HANDOFF" >/dev/null
   [[ "$(wc -l < "$CHANGED")" -eq 18 ]] || fail "runtime allowlist must be 18"
   [[ "$(wc -l < "$PREWRITE")" -eq 15 && "$(wc -l < "$ADDED")" -eq 3 ]] || fail "existing/add count"
   [[ "$(wc -l < "$BASE_FULL")" -eq 1713 && "$(wc -l < "$CAND_FULL")" -eq 1716 ]] || fail "full app count"
@@ -121,44 +126,49 @@ PY
   set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful-26635 ordering/isolation/Kotlin-Java/NDK/patch/PRE-BUILD/assemble/postbuild mechanics preserved; authority/scope/HEIC validators only; GLSL stage retained and N/A for zero modified shaders)"
 }
 verify_scope(){
-  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed R1.2 native-include repair; exact 18-path runtime allowlist retained: 15 modified + 3 added)"; return; fi
+  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed R1.3 payload-recovery package; exact 18-path runtime allowlist retained: 15 modified + 3 added)"; return; fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-  [[ "$(git rev-parse HEAD^)" == "$R1_1_COMMIT" ]] || fail "26636 R1.2 repair must be one direct commit on exact failed 26636 R1.1 handoff"
-  [[ "$(git rev-parse "$R1_1_COMMIT^")" == "$REPAIR_PARENT_COMMIT" ]] || fail "26636 R1.1 parent is not exact failed 26636 R1"
-  [[ "$(git rev-parse "$REPAIR_PARENT_COMMIT^")" == "$HANDOFF_PARENT_COMMIT" ]] || fail "failed 26636 R1 parent is not exact successful 26635 authority"
-  python3 -S - "$HANDOFF" > "$WORK/expected_r1_scope.txt" <<'PY'
+  [[ "$(git rev-parse HEAD^)" == "$R1_2_BROKEN_COMMIT" ]] || fail "26636 R1.3 recovery must be one direct commit on exact accidental R1.2 commit"
+  [[ "$(git rev-parse "$R1_2_BROKEN_COMMIT^")" == "$R1_1_COMMIT" ]] || fail "accidental R1.2 parent is not exact R1.1 provenance repair"
+  [[ "$(git rev-parse "$R1_1_COMMIT^")" == "$REPAIR_PARENT_COMMIT" ]] || fail "R1.1 parent is not exact failed R1"
+  [[ "$(git rev-parse "$REPAIR_PARENT_COMMIT^")" == "$HANDOFF_PARENT_COMMIT" ]] || fail "failed R1 parent is not exact successful 26635 authority"
+  python3 -S - "$HANDOFF" > "$WORK/expected_cumulative_scope.txt" <<'PY'
 from pathlib import Path
 import sys
 names=[line.split('  ',1)[1] for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
 names.append('R1_26636_HANDOFF_HASHES.sha256')
 print('\n'.join(sorted(names)))
 PY
-  git diff --name-only "$HANDOFF_PARENT_COMMIT" "$REPAIR_PARENT_COMMIT" | sort > "$WORK/actual_r1_scope.txt"
-  diff -u "$WORK/expected_r1_scope.txt" "$WORK/actual_r1_scope.txt" || fail "failed 26636 R1 sealed handoff scope mismatch"
-  cat > "$WORK/expected_r11_scope.txt" <<'EOF'
+  git diff --name-only "$HANDOFF_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_cumulative_scope.txt"
+  diff -u "$WORK/expected_cumulative_scope.txt" "$WORK/actual_cumulative_scope.txt" || fail "cumulative 26636 sealed handoff scope mismatch"
+  cat > "$WORK/expected_r13_scope.txt" <<'EOF'
 R1_26636_HANDOFF_HASHES.sha256
 build_26636_r1_heic_ultrahdr.sh
+handoff_payload_26636_r1/app/src/main/cpp/iris_heic_jni.cpp
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/DefaultSaver.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/MotionBatch.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/util/FileManager.java
+handoff_payload_26636_r1/app/src/main/res/layout/camera_fragment.xml
+handoff_payload_26636_r1/app/src/main/res/values/strings.xml
+handoff_payload_26636_r1/app/version.properties
 verify_26636_r1_infrastructure.py
 EOF
-  git diff --name-only "$REPAIR_PARENT_COMMIT" "$R1_1_COMMIT" | sort > "$WORK/actual_r11_scope.txt"
-  diff -u "$WORK/expected_r11_scope.txt" "$WORK/actual_r11_scope.txt" || fail "26636 R1.1 repair commit scope mismatch"
-  cat > "$WORK/expected_r12_scope.txt" <<'EOF'
-R1_26636_EXPECTED_CANDIDATE_FULL_APP.sha256
-R1_26636_EXPECTED_CHANGED_SOURCE_HASHES.sha256
-R1_26636_HANDOFF_HASHES.sha256
-R1_26636_RUNTIME_DELTA_FROM_26635_R1.patch
-R1_26636_RUNTIME_ROLLBACK_TO_26635_R1.patch
-build_26636_r1_heic_ultrahdr.sh
-handoff_payload_26636_r1/app/src/main/cpp/CMakeLists.txt
-verify_26636_r1_infrastructure.py
-verify_26636_r1_regressions.py
-EOF
-  git diff --name-only "$R1_1_COMMIT"..HEAD | sort > "$WORK/actual_r12_scope.txt"
-  diff -u "$WORK/expected_r12_scope.txt" "$WORK/actual_r12_scope.txt" || fail "26636 R1.2 repair commit scope mismatch"
-  ! grep -Eq '^app/' "$WORK/actual_r1_scope.txt" || fail "failed R1 handoff contains live app source"
-  ! grep -Eq '^app/' "$WORK/actual_r11_scope.txt" || fail "R1.1 repair contains live app source"
-  ! grep -Eq '^app/' "$WORK/actual_r12_scope.txt" || fail "R1.2 repair contains live app source"
-  set_report "CHANGED RUNTIME SCOPE" "PASS (R1.2 changes one already-allowed runtime file: HEIC CMake generated-header include; exact 18-path candidate runtime allowlist retained; no live app source committed)"
+  git diff --name-only "$R1_2_BROKEN_COMMIT"..HEAD | sort > "$WORK/actual_r13_scope.txt"
+  diff -u "$WORK/expected_r13_scope.txt" "$WORK/actual_r13_scope.txt" || fail "26636 R1.3 recovery commit scope mismatch"
+  [[ "$(wc -l < "$WORK/actual_r13_scope.txt")" -eq 20 ]] || fail "R1.3 recovery must change exactly 20 paths"
+  ! grep -Eq '^app/' "$WORK/actual_cumulative_scope.txt" || fail "cumulative handoff contains live app source"
+  ! grep -Eq '^app/' "$WORK/actual_r13_scope.txt" || fail "R1.3 recovery contains live app source"
+  set_report "CHANGED RUNTIME SCOPE" "PASS (R1.3 restores exactly 17 accidentally deleted sealed payload files and changes only build script + infrastructure validator + handoff hash manifest; runtime candidate remains exact R1.2 18-path candidate)"
 }
 
 obtain_authority(){
