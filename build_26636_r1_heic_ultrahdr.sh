@@ -22,6 +22,7 @@ FAILED_R1_COMMIT="a33e00935e00d7153cb72619333f658b0a5a566c"
 REPAIR_PARENT_COMMIT="$FAILED_R1_COMMIT"
 R1_1_COMMIT="1f414a3d47d6de8baa507c8c293dabfc2d526d04"
 R1_2_BROKEN_COMMIT="9dc0efd79253f7d2caa016b763796bdd37621ec7"
+R1_3_COMMIT="e6982a7eff421c2f7f8eda5bb142241465420f83"
 BASE_RUN_ID="34777964131"
 BASE_ARTIFACT_ID="10324098412"
 BASE_ARTIFACT_NAME="photon-26635-r1-spatial-highlight-rolloff"
@@ -126,9 +127,10 @@ PY
   set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful-26635 ordering/isolation/Kotlin-Java/NDK/patch/PRE-BUILD/assemble/postbuild mechanics preserved; authority/scope/HEIC validators only; GLSL stage retained and N/A for zero modified shaders)"
 }
 verify_scope(){
-  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed R1.3 payload-recovery package; exact 18-path runtime allowlist retained: 15 modified + 3 added)"; return; fi
+  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed R1.4 native dependency/ABI correction; exact 18-path runtime allowlist retained: 15 modified + 3 added)"; return; fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-  [[ "$(git rev-parse HEAD^)" == "$R1_2_BROKEN_COMMIT" ]] || fail "26636 R1.3 recovery must be one direct commit on exact accidental R1.2 commit"
+  [[ "$(git rev-parse HEAD^)" == "$R1_3_COMMIT" ]] || fail "26636 R1.4 must be one direct commit on exact R1.3 recovery"
+  [[ "$(git rev-parse "$R1_3_COMMIT^")" == "$R1_2_BROKEN_COMMIT" ]] || fail "R1.3 parent is not exact accidental R1.2 commit"
   [[ "$(git rev-parse "$R1_2_BROKEN_COMMIT^")" == "$R1_1_COMMIT" ]] || fail "accidental R1.2 parent is not exact R1.1 provenance repair"
   [[ "$(git rev-parse "$R1_1_COMMIT^")" == "$REPAIR_PARENT_COMMIT" ]] || fail "R1.1 parent is not exact failed R1"
   [[ "$(git rev-parse "$REPAIR_PARENT_COMMIT^")" == "$HANDOFF_PARENT_COMMIT" ]] || fail "failed R1 parent is not exact successful 26635 authority"
@@ -141,34 +143,25 @@ print('\n'.join(sorted(names)))
 PY
   git diff --name-only "$HANDOFF_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_cumulative_scope.txt"
   diff -u "$WORK/expected_cumulative_scope.txt" "$WORK/actual_cumulative_scope.txt" || fail "cumulative 26636 sealed handoff scope mismatch"
-  cat > "$WORK/expected_r13_scope.txt" <<'EOF'
+  cat > "$WORK/expected_r14_scope.txt" <<'EOF'
+R1_26636_EXPECTED_CANDIDATE_FULL_APP.sha256
+R1_26636_EXPECTED_CHANGED_SOURCE_HASHES.sha256
 R1_26636_HANDOFF_HASHES.sha256
+R1_26636_RUNTIME_DELTA_FROM_26635_R1.patch
+R1_26636_RUNTIME_ROLLBACK_TO_26635_R1.patch
 build_26636_r1_heic_ultrahdr.sh
+handoff_payload_26636_r1/app/src/main/cpp/CMakeLists.txt
 handoff_payload_26636_r1/app/src/main/cpp/iris_heic_jni.cpp
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/DefaultSaver.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/MotionBatch.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightProcessor.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
-handoff_payload_26636_r1/app/src/main/java/com/particlesdevs/photoncamera/util/FileManager.java
-handoff_payload_26636_r1/app/src/main/res/layout/camera_fragment.xml
-handoff_payload_26636_r1/app/src/main/res/values/strings.xml
-handoff_payload_26636_r1/app/version.properties
+validate_26636_r1.py
 verify_26636_r1_infrastructure.py
+verify_26636_r1_regressions.py
 EOF
-  git diff --name-only "$R1_2_BROKEN_COMMIT"..HEAD | sort > "$WORK/actual_r13_scope.txt"
-  diff -u "$WORK/expected_r13_scope.txt" "$WORK/actual_r13_scope.txt" || fail "26636 R1.3 recovery commit scope mismatch"
-  [[ "$(wc -l < "$WORK/actual_r13_scope.txt")" -eq 20 ]] || fail "R1.3 recovery must change exactly 20 paths"
+  git diff --name-only "$R1_3_COMMIT"..HEAD | sort > "$WORK/actual_r14_scope.txt"
+  diff -u "$WORK/expected_r14_scope.txt" "$WORK/actual_r14_scope.txt" || fail "26636 R1.4 commit scope mismatch"
+  [[ "$(wc -l < "$WORK/actual_r14_scope.txt")" -eq 11 ]] || fail "R1.4 must change exactly 11 paths"
   ! grep -Eq '^app/' "$WORK/actual_cumulative_scope.txt" || fail "cumulative handoff contains live app source"
-  ! grep -Eq '^app/' "$WORK/actual_r13_scope.txt" || fail "R1.3 recovery contains live app source"
-  set_report "CHANGED RUNTIME SCOPE" "PASS (R1.3 restores exactly 17 accidentally deleted sealed payload files and changes only build script + infrastructure validator + handoff hash manifest; runtime candidate remains exact R1.2 18-path candidate)"
+  ! grep -Eq '^app/' "$WORK/actual_r14_scope.txt" || fail "R1.4 contains live app source"
+  set_report "CHANGED RUNTIME SCOPE" "PASS (R1.4 changes only two already-allowlisted native payload files plus resealed candidate hashes/patches and the minimum validator/build-topology files; exact 18-path runtime candidate scope retained)"
 }
 
 obtain_authority(){

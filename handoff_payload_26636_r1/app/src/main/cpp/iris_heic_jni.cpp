@@ -20,6 +20,7 @@
 
 #include <libheif/heif.h>
 #include <libheif/heif_plugin.h>
+#include "plugin_registry.h"
 #include <ultrahdr/icc.h>
 #include <ultrahdr/gainmapmetadata.h>
 #include <ultrahdr/jpegr.h>
@@ -265,12 +266,15 @@ static const heif_encoder_plugin kIris26636MediaCodecHevcPlugin = {
 };
 
 static bool iris26636RegisterEncoder() {
+    // IRIS_26636_PINNED_LIBHEIF_STATIC_ENCODER_REGISTRY
+    // Pinned libheif 4a3f74bc... has no public static encoder-registration API in this
+    // static/no-plugin-loading configuration. Use its compiled-in registry and prove selection.
     static std::once_flag once;
     static bool ok = false;
     std::call_once(once, [] {
-        heif_error err = heif_register_encoder_plugin(&kIris26636MediaCodecHevcPlugin);
-        ok = err.code == heif_error_Ok;
-        if (!ok) IRIS26636_LOGE("encoder plugin registration failed: %s", err.message ? err.message : "unknown");
+        register_encoder(&kIris26636MediaCodecHevcPlugin);
+        ok = get_encoder(heif_compression_HEVC) == &kIris26636MediaCodecHevcPlugin;
+        if (!ok) IRIS26636_LOGE("pinned libheif did not select Iris hardware HEVC encoder");
     });
     return ok;
 }
@@ -329,11 +333,25 @@ static void iris26636PutLe32(std::vector<uint8_t>& v, size_t pos, uint32_t x) {
 }
 
 static bool iris26636ParseDouble(const std::string& s, double& out) {
+    // IRIS_26636_EXIF_RATIONAL_PARSE
+    // Photon focal length is intentionally stored as e.g. "234/100". Parse both that rational
+    // form and ordinary decimal EXIF strings without accepting trailing junk or zero denominators.
     if (s.empty()) return false;
     char* end = nullptr;
     errno = 0;
     double v = std::strtod(s.c_str(), &end);
     if (errno || end == s.c_str() || !std::isfinite(v) || v < 0.0) return false;
+    if (*end == '/') {
+        char* denEnd = nullptr;
+        errno = 0;
+        const double den = std::strtod(end + 1, &denEnd);
+        if (errno || denEnd == end + 1 || *denEnd != '\0' || !std::isfinite(den) || den <= 0.0)
+            return false;
+        v /= den;
+    } else if (*end != '\0') {
+        return false;
+    }
+    if (!std::isfinite(v)) return false;
     out = v;
     return true;
 }
@@ -391,7 +409,6 @@ static std::vector<uint8_t> iris26636BuildExif(const std::string& iso,
     std::vector<uint8_t> tiff;
     tiff.push_back('I'); tiff.push_back('I'); iris26636AppendLe16(tiff, 42); iris26636AppendLe32(tiff, 8);
 
-    const size_t ifd0Start = tiff.size();
     iris26636AppendLe16(tiff, static_cast<uint16_t>(ifd0.size()));
     const size_t ifd0EntriesStart = tiff.size();
     tiff.resize(tiff.size() + ifd0.size() * 12 + 4, 0);

@@ -1,8 +1,8 @@
 diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
-index 4e80a60161c8e6b05c6232bcdb3c6a69cb30cd6f..d4ae6b442529a412486d1616493ab5a73fec356d 100644
+index 0a18920fc98bf601da8e9c0b3024c14da7589c1c..d4ae6b442529a412486d1616493ab5a73fec356d 100644
 --- a/app/src/main/cpp/CMakeLists.txt
 +++ b/app/src/main/cpp/CMakeLists.txt
-@@ -270,98 +270,3 @@ target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static jpeg-static iris2650
+@@ -270,106 +270,3 @@ target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static jpeg-static iris2650
  # IRIS_26512_MGC1271_ISOLATED_NATIVE_OWNER
  add_subdirectory(mgc1271_upstream)
  
@@ -91,8 +91,16 @@ index 4e80a60161c8e6b05c6232bcdb3c6a69cb30cd6f..d4ae6b442529a412486d1616493ab5a7
 -    # IRIS_26636_LIBHEIF_GENERATED_HEADER_INCLUDE
 -    # Pinned libheif generates libheif/heif_version.h under libheif_BINARY_DIR.
 -    "${libheif_BINARY_DIR}"
+-    # IRIS_26636_LIBHEIF_PINNED_REGISTRY_INCLUDE
+-    # Pinned libheif 4a3f74bc... exposes static encoder registration in plugin_registry.h.
+-    "${iris26636_libheif_SOURCE_DIR}/libheif"
 -    "${iris26636_libheif_SOURCE_DIR}/libheif/api"
 -    "${iris26636_libheif_SOURCE_DIR}/libheif/api/libheif"
+-    # IRIS_26636_LIBULTRAHDR_JPEG_HEADER_CLOSURE
+-    # ultrahdr/icc.h -> jpegr.h -> jpeg{decoder,encoder}helper.h requires libjpeg-turbo
+-    # source headers (jerror.h/jpeglib.h) plus its generated build headers (jconfig.h).
+-    ${IRIS26507_JPEG}/src
+-    ${CMAKE_CURRENT_BINARY_DIR}/iris26507-libjpeg-turbo
 -    ${IRIS26507_UHDR}
 -    ${IRIS26507_UHDR}/lib/include
 -    ${CMAKE_CURRENT_SOURCE_DIR})
@@ -103,10 +111,10 @@ index 4e80a60161c8e6b05c6232bcdb3c6a69cb30cd6f..d4ae6b442529a412486d1616493ab5a7
 -
 diff --git a/app/src/main/cpp/iris_heic_jni.cpp b/app/src/main/cpp/iris_heic_jni.cpp
 deleted file mode 100644
-index e6d1c30e98bb9c932c637747093821183e4242cc..0000000000000000000000000000000000000000
+index 61a391af896dbc6fea464dce6806e0c37178ed1b..0000000000000000000000000000000000000000
 --- a/app/src/main/cpp/iris_heic_jni.cpp
 +++ /dev/null
-@@ -1,643 +0,0 @@
+@@ -1,660 +0,0 @@
 -#include <jni.h>
 -#include <android/bitmap.h>
 -#include <android/log.h>
@@ -129,6 +137,7 @@ index e6d1c30e98bb9c932c637747093821183e4242cc..00000000000000000000000000000000
 -
 -#include <libheif/heif.h>
 -#include <libheif/heif_plugin.h>
+-#include "plugin_registry.h"
 -#include <ultrahdr/icc.h>
 -#include <ultrahdr/gainmapmetadata.h>
 -#include <ultrahdr/jpegr.h>
@@ -374,12 +383,15 @@ index e6d1c30e98bb9c932c637747093821183e4242cc..00000000000000000000000000000000
 -};
 -
 -static bool iris26636RegisterEncoder() {
+-    // IRIS_26636_PINNED_LIBHEIF_STATIC_ENCODER_REGISTRY
+-    // Pinned libheif 4a3f74bc... has no public static encoder-registration API in this
+-    // static/no-plugin-loading configuration. Use its compiled-in registry and prove selection.
 -    static std::once_flag once;
 -    static bool ok = false;
 -    std::call_once(once, [] {
--        heif_error err = heif_register_encoder_plugin(&kIris26636MediaCodecHevcPlugin);
--        ok = err.code == heif_error_Ok;
--        if (!ok) IRIS26636_LOGE("encoder plugin registration failed: %s", err.message ? err.message : "unknown");
+-        register_encoder(&kIris26636MediaCodecHevcPlugin);
+-        ok = get_encoder(heif_compression_HEVC) == &kIris26636MediaCodecHevcPlugin;
+-        if (!ok) IRIS26636_LOGE("pinned libheif did not select Iris hardware HEVC encoder");
 -    });
 -    return ok;
 -}
@@ -438,11 +450,25 @@ index e6d1c30e98bb9c932c637747093821183e4242cc..00000000000000000000000000000000
 -}
 -
 -static bool iris26636ParseDouble(const std::string& s, double& out) {
+-    // IRIS_26636_EXIF_RATIONAL_PARSE
+-    // Photon focal length is intentionally stored as e.g. "234/100". Parse both that rational
+-    // form and ordinary decimal EXIF strings without accepting trailing junk or zero denominators.
 -    if (s.empty()) return false;
 -    char* end = nullptr;
 -    errno = 0;
 -    double v = std::strtod(s.c_str(), &end);
 -    if (errno || end == s.c_str() || !std::isfinite(v) || v < 0.0) return false;
+-    if (*end == '/') {
+-        char* denEnd = nullptr;
+-        errno = 0;
+-        const double den = std::strtod(end + 1, &denEnd);
+-        if (errno || denEnd == end + 1 || *denEnd != '\0' || !std::isfinite(den) || den <= 0.0)
+-            return false;
+-        v /= den;
+-    } else if (*end != '\0') {
+-        return false;
+-    }
+-    if (!std::isfinite(v)) return false;
 -    out = v;
 -    return true;
 -}
@@ -500,7 +526,6 @@ index e6d1c30e98bb9c932c637747093821183e4242cc..00000000000000000000000000000000
 -    std::vector<uint8_t> tiff;
 -    tiff.push_back('I'); tiff.push_back('I'); iris26636AppendLe16(tiff, 42); iris26636AppendLe32(tiff, 8);
 -
--    const size_t ifd0Start = tiff.size();
 -    iris26636AppendLe16(tiff, static_cast<uint16_t>(ifd0.size()));
 -    const size_t ifd0EntriesStart = tiff.size();
 -    tiff.resize(tiff.size() + ifd0.size() * 12 + 4, 0);

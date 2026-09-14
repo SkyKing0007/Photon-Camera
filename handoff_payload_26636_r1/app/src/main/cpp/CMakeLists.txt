@@ -355,8 +355,16 @@ target_include_directories(irisheic PRIVATE
     # IRIS_26636_LIBHEIF_GENERATED_HEADER_INCLUDE
     # Pinned libheif generates libheif/heif_version.h under libheif_BINARY_DIR.
     "${libheif_BINARY_DIR}"
+    # IRIS_26636_LIBHEIF_PINNED_REGISTRY_INCLUDE
+    # Pinned libheif 4a3f74bc... exposes static encoder registration in plugin_registry.h.
+    "${iris26636_libheif_SOURCE_DIR}/libheif"
     "${iris26636_libheif_SOURCE_DIR}/libheif/api"
     "${iris26636_libheif_SOURCE_DIR}/libheif/api/libheif"
+    # IRIS_26636_LIBULTRAHDR_JPEG_HEADER_CLOSURE
+    # ultrahdr/icc.h -> jpegr.h -> jpeg{decoder,encoder}helper.h requires libjpeg-turbo
+    # source headers (jerror.h/jpeglib.h) plus its generated build headers (jconfig.h).
+    ${IRIS26507_JPEG}/src
+    ${CMAKE_CURRENT_BINARY_DIR}/iris26507-libjpeg-turbo
     ${IRIS26507_UHDR}
     ${IRIS26507_UHDR}/lib/include
     ${CMAKE_CURRENT_SOURCE_DIR})

@@ -47,7 +47,8 @@ for t in ['Build.VERSION.SDK_INT < 36','MediaFormat.MIMETYPE_VIDEO_HEVC','info.i
 for forbidden in ['MIMETYPE_IMAGE_ANDROID_HEIC','SOFTWARE_ENCODER','x265','kvazaar']:
  assert forbidden not in hw,forbidden
 # ISO 21496-1 container authority / color signaling.
-for t in ['heif_context_encode_gain_map_image','gainmapMetadataFloatToFraction','encodeGainmapMetadata','UHDR_CG_DISPLAY_P3','heif_color_primaries_SMPTE_EG_432_1','heif_transfer_characteristic_linear','heif_matrix_coefficients_chromaticity_derived_non_constant_luminance','metadata.use_base_cg = 1','heif_register_encoder_plugin']: assert t in native,t
+for t in ['heif_context_encode_gain_map_image','gainmapMetadataFloatToFraction','encodeGainmapMetadata','UHDR_CG_DISPLAY_P3','heif_color_primaries_SMPTE_EG_432_1','heif_transfer_characteristic_linear','heif_matrix_coefficients_chromaticity_derived_non_constant_luminance','metadata.use_base_cg = 1','IRIS_26636_PINNED_LIBHEIF_STATIC_ENCODER_REGISTRY','register_encoder(&kIris26636MediaCodecHevcPlugin)','get_encoder(heif_compression_HEVC) == &kIris26636MediaCodecHevcPlugin']: assert t in native,t
+assert 'heif_register_encoder_plugin' not in native
 assert 'heif_matrix_coefficients_ITU_R_BT_601_6' in native
 # Exact dependency authority, patch-object verification, and all software HEVC disabled. CMake block is after proven native owners.
 for t in ['4a3f74bc593ebfc29becc1ed5dd0a61cc66d40e1','da5494f223f369781bbabcdaf6dbe192e0d74ca1','hash-object','WITH_EXPERIMENTAL_GAIN_MAP ON','WITH_X265 OFF','WITH_KVAZAAR OFF','add_library(irisheic SHARED iris_heic_jni.cpp)']: assert t in cmake,t
