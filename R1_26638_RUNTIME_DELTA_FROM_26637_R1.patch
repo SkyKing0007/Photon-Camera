@@ -1,0 +1,1148 @@
+diff --git a/app/src/main/assets/shaders/motionv2/color_transform.glsl b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+index a4d19fd8d0d6c1b8fb22f74cc5ab21c14cef9597..062444d296a8a621cc3852a0fe9d20a8ddaf1379 100644
+--- a/app/src/main/assets/shaders/motionv2/color_transform.glsl
++++ b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+@@ -4,6 +4,9 @@ precision mediump sampler2D;
+ uniform sampler2D InputBuffer;
+ uniform sampler2D ProfileHueSatMap;
+ uniform sampler2D ProfileLookMap;
++uniform sampler2D Acr3Curve;
++uniform int acr3CurveSize;
++uniform int acr3Enabled;
+ uniform int profileHueDivisions;
+ uniform int profileSatDivisions;
+ uniform int profileValueDivisions;
+@@ -96,6 +99,53 @@ vec3 iris26628ApplyMap(vec3 color,sampler2D tableTex,int hDiv,int sDiv,int vDiv)
+     return iris26628HsvToRgb(hsv);
+ }
+ 
++
++/* IRIS_26638_DEFAULT_ACR3_COLOR_RENDER_OWNER
++ * Faithful max/mid/min RGB relationship from bjzhou default AdobeCurve. The sampled curve is
++ * exact and linearly interpolated; values above 1 use the same end-slope continuation concept.
++ * ACR3 owns photographic channel separation only: after profile->Display-P3 conversion the
++ * original calibrated Display-P3 luminance is restored uniformly, so exposure/26635 tone remain
++ * separate authorities. Negative profile/display excursions bypass this nonlinear color owner. */
++float iris26638SampleAcr3(float value){
++    if(acr3CurveSize<=1)return value;
++    if(value>1.0){
++        float y1=texelFetch(Acr3Curve,ivec2(acr3CurveSize-1,0),0).r;
++        const float dx=0.001;
++        float p=(1.0-dx)*float(acr3CurveSize-1);
++        int i0=int(floor(p));
++        int i1=min(i0+1,acr3CurveSize-1);
++        float y0=mix(texelFetch(Acr3Curve,ivec2(i0,0),0).r,
++                     texelFetch(Acr3Curve,ivec2(i1,0),0).r,p-float(i0));
++        return y1+((y1-y0)/dx)*(value-1.0);
++    }
++    float p=clamp(value,0.0,1.0)*float(acr3CurveSize-1);
++    int i0=int(floor(p));
++    int i1=min(i0+1,acr3CurveSize-1);
++    return mix(texelFetch(Acr3Curve,ivec2(i0,0),0).r,
++               texelFetch(Acr3Curve,ivec2(i1,0),0).r,p-float(i0));
++}
++void iris26638AdobeRgbTone(inout float mx,inout float md,inout float mn){
++    float oldMx=mx,oldMd=md,oldMn=mn;
++    mx=iris26638SampleAcr3(oldMx);
++    mn=iris26638SampleAcr3(oldMn);
++    if(abs(oldMx-oldMn)<1.0e-6)md=mn;
++    else md=mn+(mx-mn)*(oldMd-oldMn)/(oldMx-oldMn);
++}
++vec3 iris26638ApplyAcr3(vec3 color){
++    float r=color.r,g=color.g,b=color.b;
++    if(r>=g){
++        if(g>b)iris26638AdobeRgbTone(r,g,b);
++        else if(b>r)iris26638AdobeRgbTone(b,r,g);
++        else if(b>g)iris26638AdobeRgbTone(r,b,g);
++        else { r=iris26638SampleAcr3(r); g=iris26638SampleAcr3(g); b=g; }
++    }else{
++        if(r>=b)iris26638AdobeRgbTone(g,r,b);
++        else if(b>g)iris26638AdobeRgbTone(b,g,r);
++        else iris26638AdobeRgbTone(g,b,r);
++    }
++    return vec3(r,g,b);
++}
++
+ void main(){
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+     vec3 cameraRgb=max(texelFetch(InputBuffer,xy,0).rgb,vec3(0.0));
+@@ -106,7 +156,20 @@ void main(){
+ #if USE_PROFILE_LOOK == 1
+     profileRgb=iris26628ApplyMap(profileRgb,ProfileLookMap,lookHueDivisions,lookSatDivisions,lookValueDivisions);
+ #endif
+-    vec3 linearDisplay=vec3(dot(profileToSrgbRow0,profileRgb),dot(profileToSrgbRow1,profileRgb),dot(profileToSrgbRow2,profileRgb));
++    vec3 linearDisplayOriginal=vec3(dot(profileToSrgbRow0,profileRgb),dot(profileToSrgbRow1,profileRgb),dot(profileToSrgbRow2,profileRgb));
++    vec3 linearDisplay=linearDisplayOriginal;
++    if(acr3Enabled!=0
++            && min(profileRgb.r,min(profileRgb.g,profileRgb.b))>=0.0
++            && min(linearDisplayOriginal.r,min(linearDisplayOriginal.g,linearDisplayOriginal.b))>=0.0){
++        vec3 renderedProfile=iris26638ApplyAcr3(profileRgb);
++        vec3 renderedDisplay=vec3(dot(profileToSrgbRow0,renderedProfile),dot(profileToSrgbRow1,renderedProfile),dot(profileToSrgbRow2,renderedProfile));
++        const vec3 displayP3Luma=vec3(0.22897456,0.69173852,0.07928691);
++        float targetY=dot(linearDisplayOriginal,displayP3Luma);
++        float renderedY=dot(renderedDisplay,displayP3Luma);
++        if(targetY>=0.0 && renderedY>1.0e-8){
++            linearDisplay=renderedDisplay*(targetY/renderedY);
++        }
++    }
+     /* Frozen pink/cyan-edge invariant: translate all channels together, never clip one channel. */
+     float negativeFloor=min(linearDisplay.r,min(linearDisplay.g,linearDisplay.b));
+     if(negativeFloor<0.0)linearDisplay-=vec3(negativeFloor);
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index c0cf4181361f0cdb1b47ad3f27c4307d1e251c6b..0a41823ba90c022ec19d840318d8173d2d9d438c 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -282,69 +282,52 @@ vec3 fitDisplayGamut(vec3 rgb) {
+     return rgb/max(peak,1.0e-6);
+ }
+ 
+-/* IRIS_26630_ADAPTIVE_COLOR_V5
+- * One final Display-P3 luminance/chroma authority for Motion presentation.  Luminance stays fixed;
+- * only the pixel's own neutral-axis chroma vector is scaled.  Default per-lens saturation 1.0
+- * enables at most +22% automatic recovery in reliable weak/moderate chroma. Deep black, near-neutral,
+- * strong color and highlights taper to unity.  User saturation is also gated away from black/highlight
+- * instability and is gamut-limited with one shared RGB chroma scale; no channel-wise clipping or
+- * neighbor hue borrowing is introduced. Night receives saturation=1.0 from Java and therefore never
+- * inherits the Motion per-lens saturation setting.
+- */
+-float iris26630ChromaGainLimit(float y,float c){
+-    if(c>1.0e-8) return max(1.0,(1.0-y)/c);
+-    if(c<(-1.0e-8)) return max(1.0,y/(-c));
+-    return 1.0e6;
+-}
+-
+-/* IRIS_26633_MONOTONIC_DEEP_SHADOW_TOE
+- * Universal output-referred shadow presentation only. The toe has positive slope at black,
+- * becomes C1 identity by 0.18 linear guide, and scales RGB uniformly so hue is unchanged.
+- * It is Motion-only; Night and the 26632 UHDR gain-map equation are untouched. */
+-float iris26633ShadowToeGuide(float guide){
+-    const float toeEnd=0.18;
++/* IRIS_26638_TRUE_SHADOW_FLOOR_GUARD
++ * Replace the broad 0..0.18 post-match darkener with a narrow true-shadow/noise-floor guard.
++ * Exact black remains exact black and the original 0.72 deepest-floor protection is retained,
++ * but signal-bearing body/shadow values are identity by 0.05 linear guide. Motion only. */
++float iris26638ShadowFloorGuide(float guide){
++    const float floorEnd=0.050;
+     const float deepScale=0.72;
+     float x=max(guide,0.0);
+-    if(x>=toeEnd) return x;
+-    float t=clamp(x/toeEnd,0.0,1.0);
++    if(x>=floorEnd) return x;
++    float t=clamp(x/floorEnd,0.0,1.0);
+     float smoothFactor=t*t*(3.0-2.0*t);
+     return x*mix(deepScale,1.0,smoothFactor);
+ }
+-vec3 iris26633ApplyShadowToe(vec3 rgb){
++vec3 iris26638ApplyShadowFloorGuard(vec3 rgb){
+     if(iris26592MotionHdrHandoff==0) return rgb;
+     rgb=max(rgb,vec3(0.0));
+     float guide=max(luminance(rgb),max3(rgb));
+     if(guide<=1.0e-7) return rgb;
+-    float mapped=iris26633ShadowToeGuide(guide);
++    float mapped=iris26638ShadowFloorGuide(guide);
+     return rgb*(mapped/guide);
+ }
+ 
+-vec3 iris26630AdaptiveColorV5(vec3 rgb,float userSaturation){
++/* IRIS_26638_USER_SATURATION_ONLY
++ * ACR3 is the automatic photographic color owner. Saturation 1.0 is exact identity here.
++ * Only an explicit user deviation changes neutral-axis chroma, with the proven black/highlight
++ * safety gates and shared gamut limit retained. No automatic +22% recovery or strong-color taper. */
++float iris26638ChromaGainLimit(float y,float c){
++    if(c>1.0e-8) return max(1.0,(1.0-y)/c);
++    if(c<(-1.0e-8)) return max(1.0,y/(-c));
++    return 1.0e6;
++}
++vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
+     rgb=clamp(rgb,vec3(0.0),vec3(1.0));
++    float sat=clamp(userSaturation,0.0,2.0);
++    if(abs(sat-1.0)<=1.0e-7) return rgb;
+     const vec3 displayP3Luma=vec3(0.22897456,0.69173852,0.07928691);
+     float y=clamp(dot(rgb,displayP3Luma),0.0,1.0);
+     vec3 chroma=rgb-vec3(y);
+-    float relativeChroma=length(chroma)/(y+0.05);
+-
+     float blackGate=smoothstep(0.018,0.050,y);
+-    float userHighlightGate=1.0-smoothstep(0.78,0.95,y);
+-    float autoHighlightGate=1.0-smoothstep(0.42,0.72,y);
+-    float neutralGate=smoothstep(0.030,0.090,relativeChroma);
+-    float strongColorTaper=1.0-smoothstep(0.30,0.70,relativeChroma);
+-    float autoGate=blackGate*autoHighlightGate*neutralGate*strongColorTaper;
+-    float userGate=blackGate*userHighlightGate;
+-
+-    float sat=clamp(userSaturation,0.0,2.0);
+-    float requestedGain=1.0 + userGate*(sat-1.0)
+-            + 0.22*autoGate*min(sat,1.0);
+-    requestedGain=max(requestedGain,0.0);
+-
++    float highlightGate=1.0-smoothstep(0.78,0.95,y);
++    float requestedGain=max(1.0+blackGate*highlightGate*(sat-1.0),0.0);
+     float limit=1.0e6;
+-    limit=min(limit,iris26630ChromaGainLimit(y,chroma.r));
+-    limit=min(limit,iris26630ChromaGainLimit(y,chroma.g));
+-    limit=min(limit,iris26630ChromaGainLimit(y,chroma.b));
+-    float appliedGain=min(requestedGain,limit);
+-    return clamp(vec3(y)+chroma*appliedGain,vec3(0.0),vec3(1.0));
++    limit=min(limit,iris26638ChromaGainLimit(y,chroma.r));
++    limit=min(limit,iris26638ChromaGainLimit(y,chroma.g));
++    limit=min(limit,iris26638ChromaGainLimit(y,chroma.b));
++    return clamp(vec3(y)+chroma*min(requestedGain,limit),vec3(0.0),vec3(1.0));
+ }
+ 
+ void main() {
+@@ -402,9 +385,9 @@ void main() {
+      * motionV2DisplayGain/outputExposureScale are consumed only by the shared global tone seed.
+      * Local Laplacian supplies an absolute mapped luminance target, never a second exposure gain.
+      */
+-    linearSrgb=iris26633ApplyShadowToe(linearSrgb);
++    linearSrgb=iris26638ApplyShadowFloorGuard(linearSrgb);
+     linearSrgb=fitDisplayGamut(linearSrgb);
+-    linearSrgb=iris26630AdaptiveColorV5(linearSrgb,iris26630MotionSaturation);
++    linearSrgb=iris26638UserSaturation(linearSrgb,iris26630MotionSaturation);
+ 
+     Output=clamp(
+             srgbEncode(linearSrgb),
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index ee792f43f0b771fe011bdea9e2f45829d63b039a..9962628ae08c747e1201235f4dbf2586c577b396 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -451,7 +451,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+ /* IRIS_26564_TRUE2X_FINAL_RENDER_OWNER
+  * Bounded true-2x final renderer. Scene pixels come only from the direct-CFA RGB16F render
+  * derivative. A small source region is read per output tile, then the exact proven 26563 profile
+- * color -> adaptive appearance -> display exposure -> optional Iris tone -> 26559 render math is
++ * color + exact ACR3 relationship -> display exposure -> optional Iris tone -> 26559 render math is
+  * evaluated at 2x. Final crop/rotation/mirror follows the already-proven streaming-SR geometry.
+  *
+  * The 1x Android bitmap is never sampled for scene color. It provides only the exact final native
+@@ -474,22 +474,20 @@ inline float componentGainLimit(float y,float c){
+     if(c<-1.0e-7f)return std::max(1.f,(0.f-y)/c);
+     return 4.f;
+ }
+-/* IRIS_26630_ADAPTIVE_COLOR_V5_TRUE2X_CPU */
+-inline float iris26630ChromaGainLimit(float y,float c){
++/* IRIS_26638_USER_SATURATION_ONLY_TRUE2X_CPU
++ * ACR3 is the automatic photographic color owner. Saturation 1.0 is exact identity. */
++inline float iris26638ChromaGainLimit(float y,float c){
+     if(c>1.0e-8f)return std::max(1.f,(1.f-y)/c);
+     if(c<(-1.0e-8f))return std::max(1.f,y/(-c));
+     return 1.0e6f;
+ }
+-inline Vec3 iris26630AdaptiveColorV5(Vec3 rgb,float userSaturation){
++inline Vec3 iris26638UserSaturation(Vec3 rgb,float userSaturation){
+     rgb={clampf(rgb.r,0.f,1.f),clampf(rgb.g,0.f,1.f),clampf(rgb.b,0.f,1.f)};
++    float sat=clampf(userSaturation,0.f,2.f);if(std::fabs(sat-1.f)<=1.0e-7f)return rgb;
+     float y=clampf(luma(rgb),0.f,1.f);Vec3 c={rgb.r-y,rgb.g-y,rgb.b-y};
+-    float relative=length3(c)/(y+0.05f);
+-    float black=smoothstep(0.018f,0.050f,y),userHighlight=1.f-smoothstep(0.78f,0.95f,y);
+-    float autoHighlight=1.f-smoothstep(0.42f,0.72f,y),neutral=smoothstep(0.030f,0.090f,relative);
+-    float strong=1.f-smoothstep(0.30f,0.70f,relative),autoGate=black*autoHighlight*neutral*strong;
+-    float userGate=black*userHighlight,sat=clampf(userSaturation,0.f,2.f);
+-    float requested=std::max(0.f,1.f+userGate*(sat-1.f)+0.22f*autoGate*std::min(sat,1.f));
+-    float limit=1.0e6f;limit=std::min(limit,iris26630ChromaGainLimit(y,c.r));limit=std::min(limit,iris26630ChromaGainLimit(y,c.g));limit=std::min(limit,iris26630ChromaGainLimit(y,c.b));
++    float black=smoothstep(0.018f,0.050f,y),highlight=1.f-smoothstep(0.78f,0.95f,y);
++    float requested=std::max(1.f+black*highlight*(sat-1.f),0.f);
++    float limit=1.0e6f;limit=std::min(limit,iris26638ChromaGainLimit(y,c.r));limit=std::min(limit,iris26638ChromaGainLimit(y,c.g));limit=std::min(limit,iris26638ChromaGainLimit(y,c.b));
+     float applied=std::min(requested,limit);Vec3 out={y+c.r*applied,y+c.g*applied,y+c.b*applied};
+     return {clampf(out.r,0.f,1.f),clampf(out.g,0.f,1.f),clampf(out.b,0.f,1.f)};
+ }
+@@ -523,11 +521,13 @@ struct Params {
+     int trueW=0,trueH=0,rawW=0,rawH=0,cropW=0,cropH=0,rotation=0;
+     bool mirror=false;
+     bool motionHdrHandoff=false;
++    bool acr3Enabled=false;
+     float residualZoom=1.f,displayGain=1.f,exposureEv=0.f,shadows=0.f,contrast=0.f,saturation=1.f,sceneWhite=1.f;
+     const uint16_t* localToneLogMap=nullptr;
+     int localToneLogW=0,localToneLogH=0,localToneLogSourceW=0,localToneLogSourceH=0;
+     float sensorToProfile[9]{};
+     float profileToDisplay[9]{};
++    std::vector<float> acr3Curve;
+     std::vector<float> dcpHueSatMap;
+     int dcpHueDivisions=0,dcpSatDivisions=0,dcpValueDivisions=0;
+     std::vector<float> dcpLookMap;
+@@ -586,14 +586,47 @@ inline Vec3 iris26628SampleDcp(const std::vector<float>&t,int hDiv,int sDiv,int
+ inline Vec3 iris26628ApplyDcp(Vec3 color,const std::vector<float>&t,int hDiv,int sDiv,int vDiv){
+     if(t.empty()||std::min(color.r,std::min(color.g,color.b))<0.f)return color;Vec3 hsv=iris26628RgbToHsv(color),m=iris26628SampleDcp(t,hDiv,sDiv,vDiv,hsv);hsv.r=std::fmod(hsv.r+m.r*6.f/360.f,6.f);if(hsv.r<0.f)hsv.r+=6.f;hsv.g=clampf(hsv.g*m.g,0.f,1.f);hsv.b=std::max(hsv.b*m.b,0.f);return iris26628HsvToRgb(hsv);
+ }
++inline float iris26638SampleAcr3(const Params&p,float value){
++    if(p.acr3Curve.size()!=1025u)return value;
++    if(value>1.f){
++        constexpr float dx=0.001f;float y1=p.acr3Curve.back();
++        float pos=(1.f-dx)*(float)(p.acr3Curve.size()-1u);size_t i0=(size_t)std::floor(pos),i1=std::min(i0+1u,p.acr3Curve.size()-1u);
++        float y0=p.acr3Curve[i0]+(p.acr3Curve[i1]-p.acr3Curve[i0])*(pos-(float)i0);
++        return y1+((y1-y0)/dx)*(value-1.f);
++    }
++    float pos=clampf(value,0.f,1.f)*(float)(p.acr3Curve.size()-1u);size_t i0=(size_t)std::floor(pos),i1=std::min(i0+1u,p.acr3Curve.size()-1u);
++    return p.acr3Curve[i0]+(p.acr3Curve[i1]-p.acr3Curve[i0])*(pos-(float)i0);
++}
++inline void iris26638AdobeRgbTone(const Params&p,float&mx,float&md,float&mn){
++    float oldMx=mx,oldMd=md,oldMn=mn;mx=iris26638SampleAcr3(p,oldMx);mn=iris26638SampleAcr3(p,oldMn);
++    md=std::fabs(oldMx-oldMn)<1.0e-6f?mn:mn+(mx-mn)*(oldMd-oldMn)/(oldMx-oldMn);
++}
++inline Vec3 iris26638ApplyAcr3(const Params&p,Vec3 color){
++    float r=color.r,g=color.g,b=color.b;
++    if(r>=g){
++        if(g>b)iris26638AdobeRgbTone(p,r,g,b);
++        else if(b>r)iris26638AdobeRgbTone(p,b,r,g);
++        else if(b>g)iris26638AdobeRgbTone(p,r,b,g);
++        else {r=iris26638SampleAcr3(p,r);g=iris26638SampleAcr3(p,g);b=g;}
++    }else{
++        if(r>=b)iris26638AdobeRgbTone(p,g,r,b);
++        else if(b>g)iris26638AdobeRgbTone(p,b,g,r);
++        else iris26638AdobeRgbTone(p,g,b,r);
++    }
++    return {r,g,b};
++}
+ inline bool profileColor(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){
+     Vec3 camera;if(!s.cameraAt(x,y,&camera))return false;Vec3 profile=mat(p.sensorToProfile,camera);
+     profile=iris26628ApplyDcp(profile,p.dcpHueSatMap,p.dcpHueDivisions,p.dcpSatDivisions,p.dcpValueDivisions);
+     profile=iris26628ApplyDcp(profile,p.dcpLookMap,p.lookHueDivisions,p.lookSatDivisions,p.lookValueDivisions);
+-    Vec3 linear=mat(p.profileToDisplay,profile);float floor=std::min(linear.r,std::min(linear.g,linear.b));if(floor<0.f){linear.r-=floor;linear.g-=floor;linear.b-=floor;}*out=linear;return std::isfinite(out->r)&&std::isfinite(out->g)&&std::isfinite(out->b);
+-}
+-inline bool adaptiveAppearance(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){
+-    Vec3 center;if(!profileColor(s,p,x,y,&center))return false;float lum=luma(center);Vec3 c={center.r-lum,center.g-lum,center.b-lum};*out=add(Vec3{lum,lum,lum},mul(c,0.95f));return true;
++    Vec3 original=mat(p.profileToDisplay,profile),linear=original;
++    float profileFloor=std::min(profile.r,std::min(profile.g,profile.b));float originalFloor=std::min(original.r,std::min(original.g,original.b));
++    if(p.acr3Enabled&&profileFloor>=0.f&&originalFloor>=0.f){
++        Vec3 rendered=mat(p.profileToDisplay,iris26638ApplyAcr3(p,profile));float targetY=luma(original),renderedY=luma(rendered);
++        if(targetY>=0.f&&renderedY>1.0e-8f)linear=mul(rendered,targetY/renderedY);
++    }
++    float floor=std::min(linear.r,std::min(linear.g,linear.b));if(floor<0.f){linear.r-=floor;linear.g-=floor;linear.b-=floor;}*out=linear;
++    return std::isfinite(out->r)&&std::isfinite(out->g)&&std::isfinite(out->b);
+ }
+ inline Vec3 tone(Vec3 rgb,const Params&p){
+     const bool manualActive=std::fabs(p.exposureEv)>=0.0001f||std::fabs(p.shadows)>=0.0001f||std::fabs(p.contrast)>=0.0001f;
+@@ -604,7 +637,7 @@ inline Vec3 tone(Vec3 rgb,const Params&p){
+     if(virtualGain!=1.f)rgb=mul(rgb,1.f/virtualGain);
+     return clampNonnegative(rgb);
+ }
+-inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearance(s,p,x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool preRenderAt(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!profileColor(s,p,x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
+ inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,Vec3*out){
+     x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAt(s,p,ix,iy,out);}
+@@ -615,8 +648,8 @@ inline bool samplePreRender(const SourceRegion&s,const Params&p,float x,float y,
+ /* IRIS_26569_TRUE2X_PROFILE_CACHE
+  * Motion true2x repeatedly queried center + four neighbors through identical sensor->profile->P3
+  * matrices. Cache that deterministic profile-color result once per bounded source band. The
+- * original profileColor/adaptiveAppearance/samplePreRender functions above remain untouched and
+- * authoritative for Jin-enabled fallback; this cache changes evaluation count, not equations.
++ * profileColor/samplePreRender remain authoritative for Jin-enabled fallback; this cache changes
++ * evaluation count, not equations. ACR3 is already included in cached profileColor output.
+  */
+ struct ProfileRegion {
+     int x0=0,y0=0,w=0,h=0,fullW=0,fullH=0;
+@@ -636,10 +669,7 @@ inline bool buildProfileRegion(const SourceRegion&s,const Params&p,int workers,P
+     auto work=[&](){while(ok.load(std::memory_order_relaxed)){int ly=nextRow.fetch_add(1);if(ly>=s.h)break;for(int lx=0;lx<s.w;lx++){Vec3 v;if(!profileColor(s,p,s.x0+lx,s.y0+ly,&v)){ok.store(false,std::memory_order_relaxed);break;}out->rgb[(size_t)ly*s.w+lx]=v;}}};
+     std::vector<std::thread> threads;threads.reserve((size_t)workers);for(int i=0;i<workers;i++)threads.emplace_back(work);for(auto&t:threads)t.join();return ok.load(std::memory_order_relaxed);
+ }
+-inline bool adaptiveAppearanceCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){
+-    Vec3 center;if(!s.at(x,y,&center))return false;float lum=luma(center);Vec3 c={center.r-lum,center.g-lum,center.b-lum};*out=add(Vec3{lum,lum,lum},mul(c,0.95f));return true;
+-}
+-inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!adaptiveAppearanceCached(s,p,x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
++inline bool preRenderAtCached(const ProfileRegion&s,const Params&p,int x,int y,Vec3*out){Vec3 c;if(!s.at(x,y,&c))return false;if(!p.motionHdrHandoff)c=mul(c,std::max(p.displayGain,1.0e-6f));*out=tone(c,p);return true;}
+ inline bool samplePreRenderCached(const ProfileRegion&s,const Params&p,float x,float y,Vec3*out){
+     x=clampf(x,0.f,(float)(p.trueW-1));y=clampf(y,0.f,(float)(p.trueH-1));
+     if(p.residualZoom<=1.00001f){int ix=(int)std::lround(x),iy=(int)std::lround(y);return preRenderAtCached(s,p,ix,iy,out);}
+@@ -669,16 +699,13 @@ inline float iris26621MapMotionSdrFinalGuide(float sourceGuide,float displayGain
+     float tailScale=reserve/std::max(bodySlopeAtWhite,1.0e-6f),excess=x-1.f;
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+ }
+-inline float iris26633ShadowToeGuide(float guide){
+-    constexpr float toeEnd=0.18f,deepScale=0.72f;
+-    float x=std::max(guide,0.f);if(x>=toeEnd)return x;
+-    float t=clampf(x/toeEnd,0.f,1.f),smoothFactor=t*t*(3.f-2.f*t);
+-    return x*(deepScale+(1.f-deepScale)*smoothFactor);
++inline float iris26638ShadowFloorGuide(float guide){
++    constexpr float floorEnd=0.050f,deepScale=0.72f;float x=std::max(guide,0.f);if(x>=floorEnd)return x;
++    float t=clampf(x/floorEnd,0.f,1.f),smoothFactor=t*t*(3.f-2.f*t);return x*(deepScale+(1.f-deepScale)*smoothFactor);
+ }
+-inline Vec3 iris26633ApplyShadowToe(Vec3 rgb,const Params&p){
+-    if(!p.motionHdrHandoff)return rgb;rgb=clampNonnegative(rgb);
+-    float guide=std::max(luma(rgb),peak(rgb));if(guide<=1.0e-7f)return rgb;
+-    return mul(rgb,iris26633ShadowToeGuide(guide)/guide);
++inline Vec3 iris26638ApplyShadowFloorGuard(Vec3 rgb,const Params&p){
++    if(!p.motionHdrHandoff)return rgb;rgb=clampNonnegative(rgb);float guide=std::max(luma(rgb),peak(rgb));if(guide<=1.0e-7f)return rgb;
++    return mul(rgb,iris26638ShadowFloorGuide(guide)/guide);
+ }
+ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p,float localMappedGuide){
+     rgb=clampNonnegative(rgb);float y=std::max(luma(rgb),0.f),pk=peak(rgb),guide=std::max(y,pk);
+@@ -696,9 +723,9 @@ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p,float localMappedGuide){
+         if(guide>1.0e-7f&&guide>start){float white=std::max(p.sceneWhite,start+0.05f);float u=std::max((guide-start)/std::max(white-start,1.0e-6f),0.f);float x=clampf(u,0.f,1.f);float shaped=std::log(1.f+6.f*x)/std::log(7.f);float mapped=start+(1.25f-start)*shaped;rgb=mul(rgb,mapped/guide);}
+         rgb=mul(rgb,0.80f);
+     }
+-    rgb=iris26633ApplyShadowToe(rgb,p);
++    rgb=iris26638ApplyShadowFloorGuard(rgb,p);
+     float pk2=peak(rgb);if(pk2>1.f)rgb=mul(rgb,1.f/std::max(pk2,1.0e-6f));
+-    return iris26630AdaptiveColorV5(clampNonnegative(rgb),p.saturation);
++    return iris26638UserSaturation(clampNonnegative(rgb),p.saturation);
+ }
+ struct SrgbLut {std::array<float,16385>v{};SrgbLut(){for(size_t i=0;i<v.size();i++){float x=(float)i/(float)(v.size()-1);v[i]=x<=0.0031308f?12.92f*x:1.055f*std::pow(x,1.f/2.4f)-0.055f;}}float at(float x)const{x=clampf(x,0.f,1.f);float q=x*(float)(v.size()-1);int i=(int)q;int j=std::min(i+1,(int)v.size()-1);return v[(size_t)i]+(v[(size_t)j]-v[(size_t)i])*(q-i);}};
+ inline void true2xFinalToUnrotated(float x,float y,const Params&p,float*outX,float*outY){
+@@ -839,6 +866,7 @@ layout(binding=0) uniform highp sampler2D uSource;
+ uniform highp sampler2D uLocalToneLogMap;
+ layout(rgba8ui,binding=0) writeonly uniform highp uimage2D uOutput;
+ layout(std430,binding=1) readonly buffer IrisGammaLut { float gammaLut[]; };
++layout(std430,binding=2) readonly buffer IrisAcr3Curve { float acr3Curve[]; };
+ 
+ uniform ivec2 uSrcOrigin;
+ uniform ivec2 uSrcSize;
+@@ -859,6 +887,7 @@ uniform float uContrast;
+ uniform float uSaturation;
+ uniform float uSceneWhite;
+ uniform int uMotionHdrHandoff;
++uniform int uAcr3Enabled;
+ uniform int uLocalToneLogEnabled;
+ uniform ivec2 uLocalToneLogSize;
+ uniform ivec2 uLocalToneLogSourceSize;
+@@ -879,24 +908,19 @@ float irisComponentGainLimit(float y,float c){
+     if(c<(-1.0e-7))return max(1.0,(0.0-y)/c);
+     return 4.0;
+ }
+-/* IRIS_26630_ADAPTIVE_COLOR_V5_TRUE2X_GPU */
+-float iris26630ChromaGainLimit(float y,float c){
++/* IRIS_26638_USER_SATURATION_ONLY_TRUE2X_GPU */
++float iris26638ChromaGainLimit(float y,float c){
+     if(c>1.0e-8)return max(1.0,(1.0-y)/c);
+     if(c<(-1.0e-8))return max(1.0,y/(-c));
+     return 1.0e6;
+ }
+-vec3 iris26630AdaptiveColorV5(vec3 rgb,float userSaturation){
+-    rgb=clamp(rgb,vec3(0.0),vec3(1.0));float y=clamp(irisLuma(rgb),0.0,1.0);vec3 c=rgb-vec3(y);
+-    float relative=length(c)/(y+0.05);
+-    float black=smoothstep(0.018,0.050,y),userHighlight=1.0-smoothstep(0.78,0.95,y);
+-    float autoHighlight=1.0-smoothstep(0.42,0.72,y),neutral=smoothstep(0.030,0.090,relative);
+-    float strong=1.0-smoothstep(0.30,0.70,relative),autoGate=black*autoHighlight*neutral*strong;
+-    float userGate=black*userHighlight,sat=clamp(userSaturation,0.0,2.0);
+-    float requested=max(0.0,1.0+userGate*(sat-1.0)+0.22*autoGate*min(sat,1.0));
+-    float limit=1.0e6;limit=min(limit,iris26630ChromaGainLimit(y,c.r));limit=min(limit,iris26630ChromaGainLimit(y,c.g));limit=min(limit,iris26630ChromaGainLimit(y,c.b));
++vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
++    rgb=clamp(rgb,vec3(0.0),vec3(1.0));float sat=clamp(userSaturation,0.0,2.0);if(abs(sat-1.0)<=1.0e-7)return rgb;
++    float y=clamp(irisLuma(rgb),0.0,1.0);vec3 c=rgb-vec3(y);float black=smoothstep(0.018,0.050,y),highlight=1.0-smoothstep(0.78,0.95,y);
++    float requested=max(1.0+black*highlight*(sat-1.0),0.0);float limit=1.0e6;
++    limit=min(limit,iris26638ChromaGainLimit(y,c.r));limit=min(limit,iris26638ChromaGainLimit(y,c.g));limit=min(limit,iris26638ChromaGainLimit(y,c.b));
+     return clamp(vec3(y)+c*min(requested,limit),vec3(0.0),vec3(1.0));
+ }
+-
+ vec3 irisMatRows(vec3 r0,vec3 r1,vec3 r2,vec3 v){return vec3(dot(r0,v),dot(r1,v),dot(r2,v));}
+ vec3 irisCameraAt(ivec2 fullP){
+     fullP=clamp(fullP,ivec2(0),uTrueSize-ivec2(1));
+@@ -904,16 +928,19 @@ vec3 irisCameraAt(ivec2 fullP){
+     local=clamp(local,ivec2(0),uSrcSize-ivec2(1));
+     return max(texelFetch(uSource,local,0).rgb,vec3(0.0));
+ }
+-vec3 irisProfileColor(ivec2 p){
+-    vec3 camera=irisCameraAt(p);
+-    vec3 profile=irisMatRows(uSensorRow0,uSensorRow1,uSensorRow2,camera);
+-    vec3 linear=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,profile);
+-    float floorV=min(linear.r,min(linear.g,linear.b));
+-    if(floorV<0.0)linear-=vec3(floorV);
+-    return irisClampNonnegative(linear);
++float iris26638SampleAcr3(float value){
++    const int n=1025;if(value>1.0){const float dx=0.001;float y1=acr3Curve[n-1];float pos=(1.0-dx)*float(n-1);int i0=int(floor(pos)),i1=min(i0+1,n-1);float y0=mix(acr3Curve[i0],acr3Curve[i1],pos-float(i0));return y1+((y1-y0)/dx)*(value-1.0);}
++    float pos=clamp(value,0.0,1.0)*float(n-1);int i0=int(floor(pos)),i1=min(i0+1,n-1);return mix(acr3Curve[i0],acr3Curve[i1],pos-float(i0));
+ }
+-vec3 irisAdaptive(ivec2 p){
+-    vec3 center=irisProfileColor(p);float y=irisLuma(center);vec3 c=center-vec3(y);return irisClampNonnegative(vec3(y)+c*0.95);
++void iris26638AdobeRgbTone(inout float mx,inout float md,inout float mn){float oldMx=mx,oldMd=md,oldMn=mn;mx=iris26638SampleAcr3(oldMx);mn=iris26638SampleAcr3(oldMn);md=abs(oldMx-oldMn)<1.0e-6?mn:mn+(mx-mn)*(oldMd-oldMn)/(oldMx-oldMn);}
++vec3 iris26638ApplyAcr3(vec3 color){
++    float r=color.r,g=color.g,b=color.b;if(r>=g){if(g>b)iris26638AdobeRgbTone(r,g,b);else if(b>r)iris26638AdobeRgbTone(b,r,g);else if(b>g)iris26638AdobeRgbTone(r,b,g);else{r=iris26638SampleAcr3(r);g=iris26638SampleAcr3(g);b=g;}}
++    else{if(r>=b)iris26638AdobeRgbTone(g,r,b);else if(b>g)iris26638AdobeRgbTone(b,g,r);else iris26638AdobeRgbTone(g,b,r);}return vec3(r,g,b);
++}
++vec3 irisProfileColor(ivec2 p){
++    vec3 camera=irisCameraAt(p),profile=irisMatRows(uSensorRow0,uSensorRow1,uSensorRow2,camera);vec3 original=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,profile),linear=original;
++    if(uAcr3Enabled!=0&&min(profile.r,min(profile.g,profile.b))>=0.0&&min(original.r,min(original.g,original.b))>=0.0){vec3 rendered=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,iris26638ApplyAcr3(profile));float targetY=irisLuma(original),renderedY=irisLuma(rendered);if(targetY>=0.0&&renderedY>1.0e-8)linear=rendered*(targetY/renderedY);}
++    float floorV=min(linear.r,min(linear.g,linear.b));if(floorV<0.0)linear-=vec3(floorV);return irisClampNonnegative(linear);
+ }
+ vec3 irisTone(vec3 rgb){
+     bool manualActive=abs(uExposureEv)>=0.0001||abs(uShadows)>=0.0001||abs(uContrast)>=0.0001;
+@@ -937,7 +964,7 @@ vec3 irisTone(vec3 rgb){
+     if(virtualGain!=1.0)rgb/=virtualGain;
+     return irisClampNonnegative(rgb);
+ }
+-vec3 irisPreRenderAt(ivec2 p){vec3 c=irisAdaptive(p);if(uMotionHdrHandoff==0)c*=max(uDisplayGain,1.0e-6);return irisTone(c);}
++vec3 irisPreRenderAt(ivec2 p){vec3 c=irisProfileColor(p);if(uMotionHdrHandoff==0)c*=max(uDisplayGain,1.0e-6);return irisTone(c);}
+ vec3 irisSamplePreRender(vec2 p){
+     p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
+     if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
+@@ -996,16 +1023,11 @@ float iris26621MapMotionSdrFinalGuide(float sourceGuide){
+     float excess=x-1.0;
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+ }
+-float iris26633ShadowToeGuide(float guide){
+-    const float toeEnd=0.18,deepScale=0.72;
+-    float x=max(guide,0.0);if(x>=toeEnd)return x;
+-    float t=clamp(x/toeEnd,0.0,1.0),smoothFactor=t*t*(3.0-2.0*t);
+-    return x*mix(deepScale,1.0,smoothFactor);
++float iris26638ShadowFloorGuide(float guide){
++    const float floorEnd=0.050,deepScale=0.72;float x=max(guide,0.0);if(x>=floorEnd)return x;float t=clamp(x/floorEnd,0.0,1.0),smoothFactor=t*t*(3.0-2.0*t);return x*mix(deepScale,1.0,smoothFactor);
+ }
+-vec3 iris26633ApplyShadowToe(vec3 rgb){
+-    if(uMotionHdrHandoff==0)return rgb;rgb=irisClampNonnegative(rgb);
+-    float guide=max(irisLuma(rgb),irisPeak(rgb));if(guide<=1.0e-7)return rgb;
+-    return rgb*(iris26633ShadowToeGuide(guide)/guide);
++vec3 iris26638ApplyShadowFloorGuard(vec3 rgb){
++    if(uMotionHdrHandoff==0)return rgb;rgb=irisClampNonnegative(rgb);float guide=max(irisLuma(rgb),irisPeak(rgb));if(guide<=1.0e-7)return rgb;return rgb*(iris26638ShadowFloorGuide(guide)/guide);
+ }
+ vec3 irisHeadroom(vec3 rgb,float localMappedGuide){
+     rgb=irisClampNonnegative(rgb);
+@@ -1024,9 +1046,9 @@ vec3 irisHeadroom(vec3 rgb,float localMappedGuide){
+         if(guide>1.0e-7&&guide>start){float white=max(uSceneWhite,start+0.05);float u=max((guide-start)/max(white-start,1.0e-6),0.0);float x=clamp(u,0.0,1.0);float shaped=log(1.0+6.0*x)/log(7.0);float mapped=start+(1.25-start)*shaped;rgb*=mapped/guide;}
+         rgb*=0.80;
+     }
+-    rgb=iris26633ApplyShadowToe(rgb);
++    rgb=iris26638ApplyShadowFloorGuard(rgb);
+     float pk2=irisPeak(rgb);if(pk2>1.0)rgb*=1.0/max(pk2,1.0e-6);
+-    return iris26630AdaptiveColorV5(irisClampNonnegative(rgb),uSaturation);
++    return iris26638UserSaturation(irisClampNonnegative(rgb),uSaturation);
+ }
+ float irisGamma(float x){
+     x=clamp(x,0.0,1.0);float q=x*16384.0;int a=int(q),b=min(a+1,16384);
+@@ -1104,6 +1126,7 @@ public:
+         glGenTextures(1,&outputTex);glBindTexture(GL_TEXTURE_2D,outputTex);glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8UI,outWidth,maxBandRows);
+         glGenFramebuffers(1,&fbo);glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,outputTex,0);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){set(reason,"RGBA8UI framebuffer");return false;}
+         glGenBuffers(1,&lutSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,lutSsbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(lut.v.size()*sizeof(float)),lut.v.data(),GL_STATIC_DRAW);
++        if(p.acr3Curve.size()!=1025u){set(reason,"ACR3 size");return false;}glGenBuffers(1,&acr3Ssbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,acr3Ssbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(p.acr3Curve.size()*sizeof(float)),p.acr3Curve.data(),GL_STATIC_DRAW);
+         const size_t maxBytes=(size_t)outWidth*maxBandRows*4;glGenBuffers(2,pbo);for(int i=0;i<2;i++){glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[i]);glBufferData(GL_PIXEL_PACK_BUFFER,(GLsizeiptr)maxBytes,nullptr,GL_STREAM_READ);}
+         glBindBuffer(GL_PIXEL_PACK_BUFFER,0);GLenum err=glGetError();if(err!=GL_NO_ERROR){set(reason,"GL allocation");return false;}
+         glUseProgram(program);glUniform1i(loc("uSource"),0);glUniform1i(loc("uLocalToneLogMap"),1);setParams();return true;
+@@ -1115,7 +1138,7 @@ public:
+         if(src.w>sourceAllocW||src.h>sourceAllocH){sourceAllocW=std::max(sourceAllocW,src.w);sourceAllocH=std::max(sourceAllocH,src.h);glTexImage2D(GL_TEXTURE_2D,0,GL_RGB16F,sourceAllocW,sourceAllocH,0,GL_RGB,GL_HALF_FLOAT,nullptr);}
+         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,src.w,src.h,GL_RGB,GL_HALF_FLOAT,src.rgb.data());
+         glUseProgram(program);glUniform2i(loc("uSrcOrigin"),src.x0,src.y0);glUniform2i(loc("uSrcSize"),src.w,src.h);glUniform1i(loc("uBandTop"),top);glUniform1i(loc("uBandH"),h);glUniform1i(loc("uGenerateGain"),generateGain?1:0);glUniform1f(loc("uGainMax"),gainMax);glUniform1f(loc("uGainContentMax"),gainContentMax);
+-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,lutSsbo);glBindImageTexture(0,outputTex,0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8UI);
++        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,lutSsbo);glBindBufferBase(GL_SHADER_STORAGE_BUFFER,2,acr3Ssbo);glBindImageTexture(0,outputTex,0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8UI);
+         glDispatchCompute((GLuint)((outWidth+15)/16),(GLuint)((h+7)/8),1);glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT|GL_FRAMEBUFFER_BARRIER_BIT);
+         glBindFramebuffer(GL_FRAMEBUFFER,fbo);glReadBuffer(GL_COLOR_ATTACHMENT0);glPixelStorei(GL_PACK_ALIGNMENT,1);glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[slot]);glReadPixels(0,0,outWidth,h,GL_RGBA_INTEGER,GL_UNSIGNED_BYTE,(void*)0);
+         if(fence[slot]){glDeleteSync(fence[slot]);fence[slot]=0;}if(explicitFenceSync)fence[slot]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);glFlush();auto ue=std::chrono::steady_clock::now();if(timing)timing->uploadDispatchNs+=iris26569Ns(us,ue);
+@@ -1132,20 +1155,20 @@ public:
+     }
+ private:
+     EGLDisplay display=EGL_NO_DISPLAY;EGLConfig config=nullptr;EGLSurface surface=EGL_NO_SURFACE;EGLContext context=EGL_NO_CONTEXT;
+-    GLuint program=0,sourceTex=0,localToneLogTex=0,outputTex=0,fbo=0,lutSsbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
++    GLuint program=0,sourceTex=0,localToneLogTex=0,outputTex=0,fbo=0,lutSsbo=0,acr3Ssbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
+     GLint loc(const char*n){return glGetUniformLocation(program,n);}
+     static void set(std::string*r,const char*m){if(r)*r=m?m:"unknown";}
+     static void setGl(std::string*r,const char*stage,GLenum err){if(!r)return;char b[96];std::snprintf(b,sizeof(b),"%s_gl_error_0x%04x",stage?stage:"gl",(unsigned int)err);*r=b;}
+     void setParams(){
+-        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSaturation"),params->saturation);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);glUniform1i(loc("uLocalToneLogEnabled"),(params->motionHdrHandoff&&params->localToneLogMap&&params->localToneLogW>0&&params->localToneLogH>0&&params->localToneLogSourceW>0&&params->localToneLogSourceH>0)?1:0);glUniform2i(loc("uLocalToneLogSize"),params->localToneLogW,params->localToneLogH);glUniform2i(loc("uLocalToneLogSourceSize"),params->localToneLogSourceW,params->localToneLogSourceH);
++        glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSaturation"),params->saturation);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);glUniform1i(loc("uAcr3Enabled"),params->acr3Enabled?1:0);glUniform1i(loc("uLocalToneLogEnabled"),(params->motionHdrHandoff&&params->localToneLogMap&&params->localToneLogW>0&&params->localToneLogH>0&&params->localToneLogSourceW>0&&params->localToneLogSourceH>0)?1:0);glUniform2i(loc("uLocalToneLogSize"),params->localToneLogW,params->localToneLogH);glUniform2i(loc("uLocalToneLogSourceSize"),params->localToneLogSourceW,params->localToneLogSourceH);
+         glUniform3f(loc("uSensorRow0"),params->sensorToProfile[0],params->sensorToProfile[1],params->sensorToProfile[2]);glUniform3f(loc("uSensorRow1"),params->sensorToProfile[3],params->sensorToProfile[4],params->sensorToProfile[5]);glUniform3f(loc("uSensorRow2"),params->sensorToProfile[6],params->sensorToProfile[7],params->sensorToProfile[8]);
+         glUniform3f(loc("uDisplayRow0"),params->profileToDisplay[0],params->profileToDisplay[1],params->profileToDisplay[2]);glUniform3f(loc("uDisplayRow1"),params->profileToDisplay[3],params->profileToDisplay[4],params->profileToDisplay[5]);glUniform3f(loc("uDisplayRow2"),params->profileToDisplay[6],params->profileToDisplay[7],params->profileToDisplay[8]);
+     }
+     void destroy(){
+         if(display!=EGL_NO_DISPLAY&&context!=EGL_NO_CONTEXT&&surface!=EGL_NO_SURFACE)eglMakeCurrent(display,surface,surface,context);
+-        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(localToneLogTex)glDeleteTextures(1,&localToneLogTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
++        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(acr3Ssbo)glDeleteBuffers(1,&acr3Ssbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(localToneLogTex)glDeleteTextures(1,&localToneLogTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
+         if(display!=EGL_NO_DISPLAY){eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(context!=EGL_NO_CONTEXT)eglDestroyContext(display,context);if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);eglTerminate(display);}
+-        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=localToneLogTex=outputTex=fbo=lutSsbo=0;pbo[0]=pbo[1]=0;
++        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=localToneLogTex=outputTex=fbo=lutSsbo=acr3Ssbo=0;pbo[0]=pbo[1]=0;
+     }
+ };
+ 
+@@ -1225,7 +1248,7 @@ extern "C" JNIEXPORT jstring JNICALL Java_com_particlesdevs_photoncamera_process
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative(
+         JNIEnv*e,jclass,jobject bitmap,jstring renderPath,jint trueW,jint trueH,jint rawW,jint rawH,jint cropW,jint cropH,jint rotation,jboolean mirror,jfloat residualZoom,
+-        jfloatArray sensorToProfile,jfloatArray profileToDisplay,
++        jfloatArray sensorToProfile,jfloatArray profileToDisplay,jfloatArray acr3Curve,jboolean acr3Enabled,
+         jfloatArray dcpHueSatMap,jint dcpHueDivisions,jint dcpSatDivisions,jint dcpValueDivisions,
+         jfloatArray dcpLookMap,jint lookHueDivisions,jint lookSatDivisions,jint lookValueDivisions,
+         jfloat displayGain,jfloat exposureEv,jfloat shadows,jfloat contrast,jfloat saturation,jfloat sceneWhite,jboolean motionHdrHandoff,
+@@ -1234,7 +1257,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+         jfloatArray jinResidual,jintArray jinReference,jint jinW,jint jinH,jstring gainPath,jfloat gainMaxRatio,jfloat gainContentMaxRatio,jstring path,jint quality){
+     using namespace iris26564render;gIris26576PublicationTelemetry="backend=UNSET callStarted=true";AndroidBitmapInfo info{};if(!bitmap||!renderPath||!path||trueW<=0||trueH<=0||rawW<=0||rawH<=0||cropW<=0||cropH<=0||trueW!=rawW*2||trueH!=rawH*2||cropW>rawW||cropH>rawH||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888){iris26576SetPublicationTelemetry("backend=NONE validationFailed=true");return JNI_FALSE;}
+     int expectedNativeW=(rotation==90||rotation==270)?cropH:rawW,expectedNativeH=(rotation==90||rotation==270)?rawW:cropH;if((int)info.width!=expectedNativeW||(int)info.height!=expectedNativeH)return JNI_FALSE;
+-    Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.saturation=clampf((float)saturation,0.f,2.f);p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
++    Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.saturation=clampf((float)saturation,0.f,2.f);p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.acr3Enabled=acr3Enabled==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
+     if(p.motionHdrHandoff){
+         if(!localToneLogBuffer||localToneLogW<=0||localToneLogH<=0||localToneLogSourceW<=0||localToneLogSourceH<=0)return JNI_FALSE;
+         void*mapAddress=e->GetDirectBufferAddress(localToneLogBuffer);jlong mapCapacity=e->GetDirectBufferCapacity(localToneLogBuffer);
+@@ -1243,6 +1266,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+         p.localToneLogMap=(const uint16_t*)mapAddress;p.localToneLogW=localToneLogW;p.localToneLogH=localToneLogH;p.localToneLogSourceW=localToneLogSourceW;p.localToneLogSourceH=localToneLogSourceH;
+     }
+     if(!sensorToProfile||!profileToDisplay||e->GetArrayLength(sensorToProfile)!=9||e->GetArrayLength(profileToDisplay)!=9)return JNI_FALSE;e->GetFloatArrayRegion(sensorToProfile,0,9,p.sensorToProfile);e->GetFloatArrayRegion(profileToDisplay,0,9,p.profileToDisplay);if(e->ExceptionCheck())return JNI_FALSE;for(float v:p.sensorToProfile)if(!std::isfinite(v))return JNI_FALSE;for(float v:p.profileToDisplay)if(!std::isfinite(v))return JNI_FALSE;
++    if(!acr3Curve||e->GetArrayLength(acr3Curve)!=1025)return JNI_FALSE;p.acr3Curve.resize(1025);e->GetFloatArrayRegion(acr3Curve,0,1025,p.acr3Curve.data());if(e->ExceptionCheck())return JNI_FALSE;if(p.acr3Curve.front()!=0.f||p.acr3Curve.back()!=1.f)return JNI_FALSE;for(size_t i=0;i<p.acr3Curve.size();i++){if(!std::isfinite(p.acr3Curve[i])||(i>0&&p.acr3Curve[i]<p.acr3Curve[i-1]))return JNI_FALSE;}
+     auto readDcp=[&](jfloatArray array,jint hd,jint sd,jint vd,std::vector<float>*dst,int*oh,int*os,int*ov)->bool{if(!array){*oh=*os=*ov=0;dst->clear();return hd==0&&sd==0&&vd==0;}if(hd<=0||sd<=0||vd<=0)return false;jlong count=(jlong)hd*(jlong)sd*(jlong)vd*3ll;if(count<=0||count>std::numeric_limits<jsize>::max()||e->GetArrayLength(array)<count)return false;dst->resize((size_t)count);e->GetFloatArrayRegion(array,0,(jsize)count,dst->data());if(e->ExceptionCheck())return false;for(float v:*dst)if(!std::isfinite(v))return false;*oh=hd;*os=sd;*ov=vd;return true;};
+     if(!readDcp(dcpHueSatMap,dcpHueDivisions,dcpSatDivisions,dcpValueDivisions,&p.dcpHueSatMap,&p.dcpHueDivisions,&p.dcpSatDivisions,&p.dcpValueDivisions))return JNI_FALSE;if(!readDcp(dcpLookMap,lookHueDivisions,lookSatDivisions,lookValueDivisions,&p.dcpLookMap,&p.lookHueDivisions,&p.lookSatDivisions,&p.lookValueDivisions))return JNI_FALSE;
+     if(!std::isfinite(p.displayGain)||p.displayGain<=0.f||!std::isfinite(p.exposureEv)||!std::isfinite(p.shadows)||!std::isfinite(p.contrast)||!std::isfinite((float)saturation)||!std::isfinite(p.saturation)||!std::isfinite(p.residualZoom)||!std::isfinite(p.sceneWhite)||p.sceneWhite<=0.f)return JNI_FALSE;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 0831631050e16cdc3daaeb30c5be715e9df22970..e0e95e70b5838339c46a49e6a68580efd48a771f 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -864,6 +864,15 @@ internal object GlesMgcRawSabreShaders {
+             float anchorConfidenceSum = 0.0;
+             int anchorPhaseEvidence = 0;
+             int anchorQuadEvidence = 0;
++            /* IRIS_26638_COMPONENT_OWNED_WHOLE_OBSERVATION_COHERENCE
++             * 26633's contradiction evidence now belongs to the measurable component boundary,
++             * never to each censored interior cell. Preserve its Bayer-wide semantics by reducing
++             * repeated spatial probes to one maximum contradiction per CFA phase before taking the
++             * second-highest phase conflict; repeated samples from one phase cannot veto a whole
++             * observation by themselves. */
++            vec4 phaseContradiction = vec4(0.0);
++            float severeContradiction = 0.0;
++            vec4 measurablePhase = vec4(0.0);
+ 
+             /* Five-by-five probes span the full sparse-flow cell footprint at -50/-25/0/+25/+50%. */
+             for (int py = -2; py <= 2; ++py) {
+@@ -923,6 +932,18 @@ internal object GlesMgcRawSabreShaders {
+                                 uConsistencyLow, uConsistencyHigh, relativeError);
+                             anchorPhaseEvidence += 1;
+                             phasesThisQuad += 1;
++
++                            float measurableNormal = 1.0 - smoothstep(0.82, 0.90, nr);
++                            float signal = smoothstep(0.10, 0.25, min(nr, ns));
++                            float relevance = measurableNormal * signal;
++                            if (relevance > 0.15) {
++                                measurablePhase[phase] = 1.0;
++                                phaseContradiction[phase] = max(
++                                    phaseContradiction[phase],
++                                    relevance * smoothstep(0.06, 0.16, relativeError));
++                                severeContradiction = max(severeContradiction, relevance *
++                                    smoothstep(0.16, 0.30, relativeError));
++                            }
+                         }
+                     }
+                     if (phasesThisQuad >= 2) anchorQuadEvidence += 1;
+@@ -940,14 +961,20 @@ internal object GlesMgcRawSabreShaders {
+                 componentSourceConfidence, literalLossSeen);
+             float componentConfidence = max(
+                 literalComponentConfidence, effectiveLossComponentConfidence);
++            int coherenceMeasurablePhases = int(measurablePhase.x + measurablePhase.y +
++                measurablePhase.z + measurablePhase.w + 0.5);
+             float anchorConfidence = 0.0;
+             if (anchorQuadEvidence >= 4 && anchorPhaseEvidence >= 8
++                    && coherenceMeasurablePhases >= 2
+                     && selectedGeometryProof > 0.0) {
+                 float radiometricConfidence =
+                     anchorConfidenceSum / float(anchorPhaseEvidence);
++                float componentObservationCoherence = clamp(
++                    1.0 - max(secondHighest4(phaseContradiction), severeContradiction), 0.0, 1.0);
+                 anchorConfidence = min(
+                     componentSourceConfidence,
+-                    min(selectedGeometryProof, radiometricConfidence));
++                    min(selectedGeometryProof,
++                        min(radiometricConfidence, componentObservationCoherence)));
+             }
+             oAnchor = vec4(flowRawPixels / vec2(uRawSize),
+                 clamp(componentConfidence, 0.0, 1.0),
+@@ -1244,38 +1271,10 @@ internal object GlesMgcRawSabreShaders {
+             }
+             return max(secondHighest4(phaseLoss), severeSingle);
+         }
+-        /* IRIS_26633_SHORT_WHOLE_OBSERVATION_COHERENCE
+-         * Preserve the successful 26604/26605 invariant: SHORT receives ONE scalar observation
+-         * weight for the complete Bayer/RGB observation. Phase-local measurements are evidence
+-         * only; they never become independent bracket owners. At a measurable clipped boundary,
+-         * compare exposure-normalized SHORT against NORMAL on the same CFA phases. Two moderate
+-         * contradictions or one severe high-signal contradiction attenuate the WHOLE rescue.
+-         * Fully censored cores have insufficient measurable NORMAL evidence to disprove SHORT and
+-         * therefore retain 26632 rescue unchanged. This targets misregistered chroma rails without
+-         * reducing coherent chandelier/cloud/sign highlight recovery.
+-         */
+-        float wholeObservationCoherence(vec4 referenceNormalized, vec4 scaledShort) {
+-            vec4 contradiction = vec4(0.0);
+-            float severeSingle = 0.0;
+-            int measurablePhases = 0;
+-            for (int phase = 0; phase < 4; ++phase) {
+-                float reference = max(referenceNormalized[phase], 0.0);
+-                float predicted = max(scaledShort[phase], 0.0);
+-                float measurableNormal = 1.0 - smoothstep(0.82, 0.90, reference);
+-                float signal = smoothstep(0.10, 0.25, min(reference, predicted));
+-                float relevance = measurableNormal * signal;
+-                if (relevance > 0.15) measurablePhases += 1;
+-                float relativeError = abs(predicted - reference) /
+-                    max(max(reference, predicted), 0.05);
+-                contradiction[phase] = relevance * smoothstep(0.06, 0.16, relativeError);
+-                severeSingle = max(severeSingle,
+-                    relevance * smoothstep(0.16, 0.30, relativeError));
+-            }
+-            if (measurablePhases < 2) return 1.0;
+-            float repeatedContradiction = secondHighest4(contradiction);
+-            float penalty = max(repeatedContradiction, severeSingle);
+-            return clamp(1.0 - penalty, 0.0, 1.0);
+-        }
++        /* IRIS_26638_COMPONENT_COHERENCE_ALREADY_PROPAGATED
++         * Whole-observation contradiction is now measured only at validated same-CFA component
++         * boundaries and propagated through componentTrust. Censored interiors never fail-open
++         * merely because NORMAL has fewer than two measurable phases. */
+         float literalLossWeight(
+             vec4 referenceRaw,
+             vec4 scaledShort,
+@@ -1321,21 +1320,18 @@ internal object GlesMgcRawSabreShaders {
+             float targetLoss = clamp(max(literalLoss, effectiveLoss), 0.0, 1.0);
+             float shortHeadroom = wholeShortHeadroom(shortPeakRaw);
+             float componentTrust = clamp(texture(uComponentTrust, flowUv).r, 0.0, 1.0);
+-            float observationCoherence = wholeObservationCoherence(
+-                referenceNormalized, scaledShort);
+             /* IRIS_26611_BOUNDARY_PROVEN_SHORT_RESCUE_ONLY
+              * componentTrust can exist only if a sub-pixel, same-CFA, exposure-normalized
+              * measurable boundary seed was proven and then propagated through the two-phase clipped
+              * interior without a CFA-meaningful flow discontinuity. The old 2..8 RAW-pixel local
+              * residual curve is deliberately absent here: it was the 26610 device-proven path that
+              * treated a 2.46-pixel residual as ~98% trustworthy. */
+-            float rescueConfidence = min(
+-                shortHeadroom, min(componentTrust, observationCoherence));
++            float rescueConfidence = min(shortHeadroom, componentTrust);
+ 
+-            /* IRIS_26633_SHORT_SCALAR_COHERENCE_CAP
+-             * This cap modifies only the relaxed highlight rescue. ordinaryWeight remains intact,
+-             * so coherent/non-highlight SHORT behavior is byte-for-byte semantically preserved.
+-             * No per-phase weight reaches the common accumulator. */
++            /* IRIS_26638_COMPONENT_OWNED_SHORT_COHERENCE
++             * componentTrust already includes the validated boundary's whole-observation
++             * radiometric coherence. No pixel-local contradiction cap remains, and no per-phase
++             * weight reaches the common accumulator. ordinaryWeight remains untouched. */
+ 
+             /* IRIS_26611_SHORT_COMPLETE_COMMON_PHYSICAL_CAP
+              * Only NORMAL-reference photometry is relaxable in a proven censored core. The exact
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index ce3a27eba4a8c41b39f06444ff6315c7474821df..4b9058974196957358421ecf21bf4228e83fe2ab 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2698,6 +2698,10 @@ internal class GlesMgcRawSpatialStacker(
+                         shortLossStats26623?.retainedBytes, rescueStats.retainedBytes,
+                         coverageWidth, coverageHeight,
+                     )
++                    logSabreShortLossComponents26638(
++                        shortLossStats26623?.retainedBytes, rescueStats.retainedBytes,
++                        coverageWidth, coverageHeight,
++                    )
+                     highlightShortTargetAccumulatorEligibleCells26607 = rescueStats.nonzeroCells
+                     highlightShortTargetEligibleCellsAbi26607 = rescueStats.nonzeroCells
+                     /* IRIS_26626_SHORT_ACCUMULATOR_PROOF_SNAPSHOT
+@@ -4235,6 +4239,108 @@ internal class GlesMgcRawSpatialStacker(
+         MotionTrace.processingState("IRIS_26624_SHORT_COMPONENT_RECOVERY", details)
+     }
+ 
++    /* IRIS_26638_SHORT_COMPONENT_SPATIAL_PROOF
++     * Read-only connected-component telemetry over the already-retained NORMAL-loss and final
++     * post-source-clip SHORT target-accumulator masks. No new GPU readback, no mask mutation,
++     * no lifetime extension beyond the existing retained ByteArrays. */
++    private fun logSabreShortLossComponents26638(
++        loss: ByteArray?,
++        support: ByteArray?,
++        textureWidth: Int,
++        textureHeight: Int,
++    ) {
++        if (loss == null || support == null || textureWidth <= 0 || textureHeight <= 0
++            || loss.size != support.size || loss.size != textureWidth * textureHeight) return
++        data class Component(
++            val cells: Int,
++            val minX: Int,
++            val minY: Int,
++            val maxX: Int,
++            val maxY: Int,
++            val strong: Int,
++            val weak: Int,
++            val zero: Int,
++            val sum: Long,
++        )
++        val visited = BooleanArray(loss.size)
++        val queue = IntArray(loss.size)
++        val components = ArrayList<Component>()
++        for (seed in loss.indices) {
++            if (visited[seed] || (loss[seed].toInt() and 0xff) == 0) continue
++            var head = 0
++            var tail = 0
++            queue[tail++] = seed
++            visited[seed] = true
++            var cells = 0
++            var minX = textureWidth
++            var minY = textureHeight
++            var maxX = -1
++            var maxY = -1
++            var strong = 0
++            var weak = 0
++            var zero = 0
++            var sum = 0L
++            while (head < tail) {
++                val i = queue[head++]
++                val x = i % textureWidth
++                val y = i / textureWidth
++                cells++
++                minX = minOf(minX, x); maxX = maxOf(maxX, x)
++                minY = minOf(minY, y); maxY = maxOf(maxY, y)
++                val value = support[i].toInt() and 0xff
++                sum += value.toLong()
++                when {
++                    value >= 128 -> strong++
++                    value > 0 -> weak++
++                    else -> zero++
++                }
++                if (x > 0) {
++                    val n = i - 1
++                    if (!visited[n] && (loss[n].toInt() and 0xff) > 0) {
++                        visited[n] = true; queue[tail++] = n
++                    }
++                }
++                if (x + 1 < textureWidth) {
++                    val n = i + 1
++                    if (!visited[n] && (loss[n].toInt() and 0xff) > 0) {
++                        visited[n] = true; queue[tail++] = n
++                    }
++                }
++                if (y > 0) {
++                    val n = i - textureWidth
++                    if (!visited[n] && (loss[n].toInt() and 0xff) > 0) {
++                        visited[n] = true; queue[tail++] = n
++                    }
++                }
++                if (y + 1 < textureHeight) {
++                    val n = i + textureWidth
++                    if (!visited[n] && (loss[n].toInt() and 0xff) > 0) {
++                        visited[n] = true; queue[tail++] = n
++                    }
++                }
++            }
++            components.add(Component(cells, minX, minY, maxX, maxY, strong, weak, zero, sum))
++        }
++        components.sortByDescending { it.cells }
++        val reportCount = minOf(8, components.size)
++        for (rank in 0 until reportCount) {
++            val c = components[rank]
++            val supported = c.strong + c.weak
++            val mean = if (c.cells > 0) c.sum.toFloat() / (255f * c.cells.toFloat()) else 0f
++            val details = "rank=${rank + 1} bbox=[${c.minX},${c.minY}]-[${c.maxX},${c.maxY}] " +
++                "targetCells=${c.cells} strong=${c.strong} weak=${c.weak} zero=${c.zero} " +
++                "postSourceClipSupported=$supported postSourceClipUnsupported=${c.zero} " +
++                "meanFinalRescue=$mean connectivity=4 literalOrEffectiveLossComponent=true readOnly=true"
++            PLog.i(SABRE_TAG, "IRIS_26638_SHORT_COMPONENT_SPATIAL_PROOF $details")
++            MotionTrace.processingState("IRIS_26638_SHORT_COMPONENT_SPATIAL_PROOF", details)
++        }
++        val summary = "components=${components.size} reported=$reportCount " +
++            "support=postSourceClipTargetAccumulator bboxDomain=runtimeLossMask " +
++            "newGpuReadback=false"
++        PLog.i(SABRE_TAG, "IRIS_26638_SHORT_COMPONENT_SPATIAL_SUMMARY $summary")
++        MotionTrace.processingState("IRIS_26638_SHORT_COMPONENT_SPATIAL_SUMMARY", summary)
++    }
++
+     private fun renderSabreRejection(
+         referenceGuide: Int,
+         currentGuide: Int,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Acr3Curve.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Acr3Curve.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..def38f50ca0dbbefb717af7352c33857f6267526
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Acr3Curve.java
+@@ -0,0 +1,158 @@
++package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
++
++/**
++ * IRIS_26638_ACR3_SINGLE_TABLE_OWNER
++ * Exact 1025-sample default ACR3 curve copied from bjzhou/PhotonCamera ACR3Curve.kt
++ * blob bf5933660fc2edda1cc1e4b79238eb176c0ed7aa (Apache-2.0).
++ * This immutable table is the single 1x/true-2x CPU/GPU color-rendering curve authority.
++ */
++public final class MotionV2Acr3Curve {
++    private MotionV2Acr3Curve() {}
++
++    private static final float[] SAMPLES = new float[]{
++            0.00000f, 0.00078f, 0.00160f, 0.00242f, 0.00314f, 0.00385f, 0.00460f, 0.00539f,
++            0.00623f, 0.00712f, 0.00806f, 0.00906f, 0.01012f, 0.01122f, 0.01238f, 0.01359f,
++            0.01485f, 0.01616f, 0.01751f, 0.01890f, 0.02033f, 0.02180f, 0.02331f, 0.02485f,
++            0.02643f, 0.02804f, 0.02967f, 0.03134f, 0.03303f, 0.03475f, 0.03648f, 0.03824f,
++            0.04002f, 0.04181f, 0.04362f, 0.04545f, 0.04730f, 0.04916f, 0.05103f, 0.05292f,
++            0.05483f, 0.05675f, 0.05868f, 0.06063f, 0.06259f, 0.06457f, 0.06655f, 0.06856f,
++            0.07057f, 0.07259f, 0.07463f, 0.07668f, 0.07874f, 0.08081f, 0.08290f, 0.08499f,
++            0.08710f, 0.08921f, 0.09134f, 0.09348f, 0.09563f, 0.09779f, 0.09996f, 0.10214f,
++            0.10433f, 0.10652f, 0.10873f, 0.11095f, 0.11318f, 0.11541f, 0.11766f, 0.11991f,
++            0.12218f, 0.12445f, 0.12673f, 0.12902f, 0.13132f, 0.13363f, 0.13595f, 0.13827f,
++            0.14061f, 0.14295f, 0.14530f, 0.14765f, 0.15002f, 0.15239f, 0.15477f, 0.15716f,
++            0.15956f, 0.16197f, 0.16438f, 0.16680f, 0.16923f, 0.17166f, 0.17410f, 0.17655f,
++            0.17901f, 0.18148f, 0.18395f, 0.18643f, 0.18891f, 0.19141f, 0.19391f, 0.19641f,
++            0.19893f, 0.20145f, 0.20398f, 0.20651f, 0.20905f, 0.21160f, 0.21416f, 0.21672f,
++            0.21929f, 0.22185f, 0.22440f, 0.22696f, 0.22950f, 0.23204f, 0.23458f, 0.23711f,
++            0.23963f, 0.24215f, 0.24466f, 0.24717f, 0.24967f, 0.25216f, 0.25465f, 0.25713f,
++            0.25961f, 0.26208f, 0.26454f, 0.26700f, 0.26945f, 0.27189f, 0.27433f, 0.27676f,
++            0.27918f, 0.28160f, 0.28401f, 0.28641f, 0.28881f, 0.29120f, 0.29358f, 0.29596f,
++            0.29833f, 0.30069f, 0.30305f, 0.30540f, 0.30774f, 0.31008f, 0.31241f, 0.31473f,
++            0.31704f, 0.31935f, 0.32165f, 0.32395f, 0.32623f, 0.32851f, 0.33079f, 0.33305f,
++            0.33531f, 0.33756f, 0.33981f, 0.34205f, 0.34428f, 0.34650f, 0.34872f, 0.35093f,
++            0.35313f, 0.35532f, 0.35751f, 0.35969f, 0.36187f, 0.36404f, 0.36620f, 0.36835f,
++            0.37050f, 0.37264f, 0.37477f, 0.37689f, 0.37901f, 0.38112f, 0.38323f, 0.38533f,
++            0.38742f, 0.38950f, 0.39158f, 0.39365f, 0.39571f, 0.39777f, 0.39982f, 0.40186f,
++            0.40389f, 0.40592f, 0.40794f, 0.40996f, 0.41197f, 0.41397f, 0.41596f, 0.41795f,
++            0.41993f, 0.42191f, 0.42388f, 0.42584f, 0.42779f, 0.42974f, 0.43168f, 0.43362f,
++            0.43554f, 0.43747f, 0.43938f, 0.44129f, 0.44319f, 0.44509f, 0.44698f, 0.44886f,
++            0.45073f, 0.45260f, 0.45447f, 0.45632f, 0.45817f, 0.46002f, 0.46186f, 0.46369f,
++            0.46551f, 0.46733f, 0.46914f, 0.47095f, 0.47275f, 0.47454f, 0.47633f, 0.47811f,
++            0.47989f, 0.48166f, 0.48342f, 0.48518f, 0.48693f, 0.48867f, 0.49041f, 0.49214f,
++            0.49387f, 0.49559f, 0.49730f, 0.49901f, 0.50072f, 0.50241f, 0.50410f, 0.50579f,
++            0.50747f, 0.50914f, 0.51081f, 0.51247f, 0.51413f, 0.51578f, 0.51742f, 0.51906f,
++            0.52069f, 0.52232f, 0.52394f, 0.52556f, 0.52717f, 0.52878f, 0.53038f, 0.53197f,
++            0.53356f, 0.53514f, 0.53672f, 0.53829f, 0.53986f, 0.54142f, 0.54297f, 0.54452f,
++            0.54607f, 0.54761f, 0.54914f, 0.55067f, 0.55220f, 0.55371f, 0.55523f, 0.55673f,
++            0.55824f, 0.55973f, 0.56123f, 0.56271f, 0.56420f, 0.56567f, 0.56715f, 0.56861f,
++            0.57007f, 0.57153f, 0.57298f, 0.57443f, 0.57587f, 0.57731f, 0.57874f, 0.58017f,
++            0.58159f, 0.58301f, 0.58443f, 0.58583f, 0.58724f, 0.58864f, 0.59003f, 0.59142f,
++            0.59281f, 0.59419f, 0.59556f, 0.59694f, 0.59830f, 0.59966f, 0.60102f, 0.60238f,
++            0.60373f, 0.60507f, 0.60641f, 0.60775f, 0.60908f, 0.61040f, 0.61173f, 0.61305f,
++            0.61436f, 0.61567f, 0.61698f, 0.61828f, 0.61957f, 0.62087f, 0.62216f, 0.62344f,
++            0.62472f, 0.62600f, 0.62727f, 0.62854f, 0.62980f, 0.63106f, 0.63232f, 0.63357f,
++            0.63482f, 0.63606f, 0.63730f, 0.63854f, 0.63977f, 0.64100f, 0.64222f, 0.64344f,
++            0.64466f, 0.64587f, 0.64708f, 0.64829f, 0.64949f, 0.65069f, 0.65188f, 0.65307f,
++            0.65426f, 0.65544f, 0.65662f, 0.65779f, 0.65897f, 0.66013f, 0.66130f, 0.66246f,
++            0.66362f, 0.66477f, 0.66592f, 0.66707f, 0.66821f, 0.66935f, 0.67048f, 0.67162f,
++            0.67275f, 0.67387f, 0.67499f, 0.67611f, 0.67723f, 0.67834f, 0.67945f, 0.68055f,
++            0.68165f, 0.68275f, 0.68385f, 0.68494f, 0.68603f, 0.68711f, 0.68819f, 0.68927f,
++            0.69035f, 0.69142f, 0.69249f, 0.69355f, 0.69461f, 0.69567f, 0.69673f, 0.69778f,
++            0.69883f, 0.69988f, 0.70092f, 0.70196f, 0.70300f, 0.70403f, 0.70506f, 0.70609f,
++            0.70711f, 0.70813f, 0.70915f, 0.71017f, 0.71118f, 0.71219f, 0.71319f, 0.71420f,
++            0.71520f, 0.71620f, 0.71719f, 0.71818f, 0.71917f, 0.72016f, 0.72114f, 0.72212f,
++            0.72309f, 0.72407f, 0.72504f, 0.72601f, 0.72697f, 0.72794f, 0.72890f, 0.72985f,
++            0.73081f, 0.73176f, 0.73271f, 0.73365f, 0.73460f, 0.73554f, 0.73647f, 0.73741f,
++            0.73834f, 0.73927f, 0.74020f, 0.74112f, 0.74204f, 0.74296f, 0.74388f, 0.74479f,
++            0.74570f, 0.74661f, 0.74751f, 0.74842f, 0.74932f, 0.75021f, 0.75111f, 0.75200f,
++            0.75289f, 0.75378f, 0.75466f, 0.75555f, 0.75643f, 0.75730f, 0.75818f, 0.75905f,
++            0.75992f, 0.76079f, 0.76165f, 0.76251f, 0.76337f, 0.76423f, 0.76508f, 0.76594f,
++            0.76679f, 0.76763f, 0.76848f, 0.76932f, 0.77016f, 0.77100f, 0.77183f, 0.77267f,
++            0.77350f, 0.77432f, 0.77515f, 0.77597f, 0.77680f, 0.77761f, 0.77843f, 0.77924f,
++            0.78006f, 0.78087f, 0.78167f, 0.78248f, 0.78328f, 0.78408f, 0.78488f, 0.78568f,
++            0.78647f, 0.78726f, 0.78805f, 0.78884f, 0.78962f, 0.79040f, 0.79118f, 0.79196f,
++            0.79274f, 0.79351f, 0.79428f, 0.79505f, 0.79582f, 0.79658f, 0.79735f, 0.79811f,
++            0.79887f, 0.79962f, 0.80038f, 0.80113f, 0.80188f, 0.80263f, 0.80337f, 0.80412f,
++            0.80486f, 0.80560f, 0.80634f, 0.80707f, 0.80780f, 0.80854f, 0.80926f, 0.80999f,
++            0.81072f, 0.81144f, 0.81216f, 0.81288f, 0.81360f, 0.81431f, 0.81503f, 0.81574f,
++            0.81645f, 0.81715f, 0.81786f, 0.81856f, 0.81926f, 0.81996f, 0.82066f, 0.82135f,
++            0.82205f, 0.82274f, 0.82343f, 0.82412f, 0.82480f, 0.82549f, 0.82617f, 0.82685f,
++            0.82753f, 0.82820f, 0.82888f, 0.82955f, 0.83022f, 0.83089f, 0.83155f, 0.83222f,
++            0.83288f, 0.83354f, 0.83420f, 0.83486f, 0.83552f, 0.83617f, 0.83682f, 0.83747f,
++            0.83812f, 0.83877f, 0.83941f, 0.84005f, 0.84069f, 0.84133f, 0.84197f, 0.84261f,
++            0.84324f, 0.84387f, 0.84450f, 0.84513f, 0.84576f, 0.84639f, 0.84701f, 0.84763f,
++            0.84825f, 0.84887f, 0.84949f, 0.85010f, 0.85071f, 0.85132f, 0.85193f, 0.85254f,
++            0.85315f, 0.85375f, 0.85436f, 0.85496f, 0.85556f, 0.85615f, 0.85675f, 0.85735f,
++            0.85794f, 0.85853f, 0.85912f, 0.85971f, 0.86029f, 0.86088f, 0.86146f, 0.86204f,
++            0.86262f, 0.86320f, 0.86378f, 0.86435f, 0.86493f, 0.86550f, 0.86607f, 0.86664f,
++            0.86720f, 0.86777f, 0.86833f, 0.86889f, 0.86945f, 0.87001f, 0.87057f, 0.87113f,
++            0.87168f, 0.87223f, 0.87278f, 0.87333f, 0.87388f, 0.87443f, 0.87497f, 0.87552f,
++            0.87606f, 0.87660f, 0.87714f, 0.87768f, 0.87821f, 0.87875f, 0.87928f, 0.87981f,
++            0.88034f, 0.88087f, 0.88140f, 0.88192f, 0.88244f, 0.88297f, 0.88349f, 0.88401f,
++            0.88453f, 0.88504f, 0.88556f, 0.88607f, 0.88658f, 0.88709f, 0.88760f, 0.88811f,
++            0.88862f, 0.88912f, 0.88963f, 0.89013f, 0.89063f, 0.89113f, 0.89163f, 0.89212f,
++            0.89262f, 0.89311f, 0.89360f, 0.89409f, 0.89458f, 0.89507f, 0.89556f, 0.89604f,
++            0.89653f, 0.89701f, 0.89749f, 0.89797f, 0.89845f, 0.89892f, 0.89940f, 0.89987f,
++            0.90035f, 0.90082f, 0.90129f, 0.90176f, 0.90222f, 0.90269f, 0.90316f, 0.90362f,
++            0.90408f, 0.90454f, 0.90500f, 0.90546f, 0.90592f, 0.90637f, 0.90683f, 0.90728f,
++            0.90773f, 0.90818f, 0.90863f, 0.90908f, 0.90952f, 0.90997f, 0.91041f, 0.91085f,
++            0.91130f, 0.91173f, 0.91217f, 0.91261f, 0.91305f, 0.91348f, 0.91392f, 0.91435f,
++            0.91478f, 0.91521f, 0.91564f, 0.91606f, 0.91649f, 0.91691f, 0.91734f, 0.91776f,
++            0.91818f, 0.91860f, 0.91902f, 0.91944f, 0.91985f, 0.92027f, 0.92068f, 0.92109f,
++            0.92150f, 0.92191f, 0.92232f, 0.92273f, 0.92314f, 0.92354f, 0.92395f, 0.92435f,
++            0.92475f, 0.92515f, 0.92555f, 0.92595f, 0.92634f, 0.92674f, 0.92713f, 0.92753f,
++            0.92792f, 0.92831f, 0.92870f, 0.92909f, 0.92947f, 0.92986f, 0.93025f, 0.93063f,
++            0.93101f, 0.93139f, 0.93177f, 0.93215f, 0.93253f, 0.93291f, 0.93328f, 0.93366f,
++            0.93403f, 0.93440f, 0.93478f, 0.93515f, 0.93551f, 0.93588f, 0.93625f, 0.93661f,
++            0.93698f, 0.93734f, 0.93770f, 0.93807f, 0.93843f, 0.93878f, 0.93914f, 0.93950f,
++            0.93986f, 0.94021f, 0.94056f, 0.94092f, 0.94127f, 0.94162f, 0.94197f, 0.94231f,
++            0.94266f, 0.94301f, 0.94335f, 0.94369f, 0.94404f, 0.94438f, 0.94472f, 0.94506f,
++            0.94540f, 0.94573f, 0.94607f, 0.94641f, 0.94674f, 0.94707f, 0.94740f, 0.94774f,
++            0.94807f, 0.94839f, 0.94872f, 0.94905f, 0.94937f, 0.94970f, 0.95002f, 0.95035f,
++            0.95067f, 0.95099f, 0.95131f, 0.95163f, 0.95194f, 0.95226f, 0.95257f, 0.95289f,
++            0.95320f, 0.95351f, 0.95383f, 0.95414f, 0.95445f, 0.95475f, 0.95506f, 0.95537f,
++            0.95567f, 0.95598f, 0.95628f, 0.95658f, 0.95688f, 0.95718f, 0.95748f, 0.95778f,
++            0.95808f, 0.95838f, 0.95867f, 0.95897f, 0.95926f, 0.95955f, 0.95984f, 0.96013f,
++            0.96042f, 0.96071f, 0.96100f, 0.96129f, 0.96157f, 0.96186f, 0.96214f, 0.96242f,
++            0.96271f, 0.96299f, 0.96327f, 0.96355f, 0.96382f, 0.96410f, 0.96438f, 0.96465f,
++            0.96493f, 0.96520f, 0.96547f, 0.96574f, 0.96602f, 0.96629f, 0.96655f, 0.96682f,
++            0.96709f, 0.96735f, 0.96762f, 0.96788f, 0.96815f, 0.96841f, 0.96867f, 0.96893f,
++            0.96919f, 0.96945f, 0.96971f, 0.96996f, 0.97022f, 0.97047f, 0.97073f, 0.97098f,
++            0.97123f, 0.97149f, 0.97174f, 0.97199f, 0.97223f, 0.97248f, 0.97273f, 0.97297f,
++            0.97322f, 0.97346f, 0.97371f, 0.97395f, 0.97419f, 0.97443f, 0.97467f, 0.97491f,
++            0.97515f, 0.97539f, 0.97562f, 0.97586f, 0.97609f, 0.97633f, 0.97656f, 0.97679f,
++            0.97702f, 0.97725f, 0.97748f, 0.97771f, 0.97794f, 0.97817f, 0.97839f, 0.97862f,
++            0.97884f, 0.97907f, 0.97929f, 0.97951f, 0.97973f, 0.97995f, 0.98017f, 0.98039f,
++            0.98061f, 0.98082f, 0.98104f, 0.98125f, 0.98147f, 0.98168f, 0.98189f, 0.98211f,
++            0.98232f, 0.98253f, 0.98274f, 0.98295f, 0.98315f, 0.98336f, 0.98357f, 0.98377f,
++            0.98398f, 0.98418f, 0.98438f, 0.98458f, 0.98478f, 0.98498f, 0.98518f, 0.98538f,
++            0.98558f, 0.98578f, 0.98597f, 0.98617f, 0.98636f, 0.98656f, 0.98675f, 0.98694f,
++            0.98714f, 0.98733f, 0.98752f, 0.98771f, 0.98789f, 0.98808f, 0.98827f, 0.98845f,
++            0.98864f, 0.98882f, 0.98901f, 0.98919f, 0.98937f, 0.98955f, 0.98973f, 0.98991f,
++            0.99009f, 0.99027f, 0.99045f, 0.99063f, 0.99080f, 0.99098f, 0.99115f, 0.99133f,
++            0.99150f, 0.99167f, 0.99184f, 0.99201f, 0.99218f, 0.99235f, 0.99252f, 0.99269f,
++            0.99285f, 0.99302f, 0.99319f, 0.99335f, 0.99351f, 0.99368f, 0.99384f, 0.99400f,
++            0.99416f, 0.99432f, 0.99448f, 0.99464f, 0.99480f, 0.99495f, 0.99511f, 0.99527f,
++            0.99542f, 0.99558f, 0.99573f, 0.99588f, 0.99603f, 0.99619f, 0.99634f, 0.99649f,
++            0.99664f, 0.99678f, 0.99693f, 0.99708f, 0.99722f, 0.99737f, 0.99751f, 0.99766f,
++            0.99780f, 0.99794f, 0.99809f, 0.99823f, 0.99837f, 0.99851f, 0.99865f, 0.99879f,
++            0.99892f, 0.99906f, 0.99920f, 0.99933f, 0.99947f, 0.99960f, 0.99974f, 0.99987f,
++            1.00000f
++    };
++
++    public static int size() { return SAMPLES.length; }
++
++    public static float[] copySamples() { return SAMPLES.clone(); }
++
++    static {
++        if (SAMPLES.length != 1025 || SAMPLES[0] != 0f || SAMPLES[SAMPLES.length - 1] != 1f) {
++            throw new IllegalStateException("IRIS_26638 invalid ACR3 table");
++        }
++        for (int i = 1; i < SAMPLES.length; ++i) {
++            if (!(SAMPLES[i] >= SAMPLES[i - 1]) || !Float.isFinite(SAMPLES[i])) {
++                throw new IllegalStateException("IRIS_26638 non-monotonic ACR3 table at " + i);
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+index 5c9b8766d33db9728425b9a41067a12a85220466..13a6f6ecbdda80c46aae26d70bb6c7b880841fe9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+@@ -14,13 +14,15 @@ import static android.opengl.GLES20.GL_NEAREST;
+ /**
+  * IRIS_26628_MOTION_NIGHT_DNG_PROFILE_COLOR_OWNER
+  *
+- * Motion/Night only.  Applies the JPEG-only DNG color-spec matrix followed by the complete
+- * Iris-only DCP HueSat/Look tables when available, then converts ProPhoto(D50) to linear Display-P3.
++ * Motion/Night only. Applies the JPEG-only DNG color-spec matrix and complete Iris-only DCP
++ * HueSat/Look tables, then the exact default ACR3 photographic RGB relationship in ProPhoto(D50),
++ * and finally converts to linear Display-P3 while preserving the pre-ACR3 Display-P3 luminance.
+  * Legacy Photon modes do not traverse this node and their HSVMap/LookMap contract is untouched.
+  */
+ public final class MotionV2ColorTransform extends Node {
+     private GLTexture profileHueSatTexture;
+     private GLTexture profileLookTexture;
++    private GLTexture acr3Texture;
+ 
+     public MotionV2ColorTransform() { super("", "MotionV2ColorTransform"); }
+     @Override public void Compile() {}
+@@ -28,8 +30,10 @@ public final class MotionV2ColorTransform extends Node {
+     @Override public void AfterRun() {
+         if (profileHueSatTexture != null) profileHueSatTexture.close();
+         if (profileLookTexture != null) profileLookTexture.close();
++        if (acr3Texture != null) acr3Texture.close();
+         profileHueSatTexture = null;
+         profileLookTexture = null;
++        acr3Texture = null;
+     }
+ 
+     @Override
+@@ -64,6 +68,18 @@ public final class MotionV2ColorTransform extends Node {
+         glProg.useAssetProgram("motionv2/color_transform");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+ 
++        /* IRIS_26638_ACR3_SINGLE_TABLE_OWNER
++         * The exact bjzhou default ACR3 samples are the sole photographic RGB-rendering curve
++         * for Motion/Night and are shared with true-2x native publication. */
++        final float[] acr3 = MotionV2Acr3Curve.copySamples();
++        acr3Texture = new GLTexture(
++                new Point(acr3.length, 1),
++                new GLFormat(GLFormat.DataType.FLOAT_32, 1),
++                BufferUtils.getFrom(acr3), GL_NEAREST, GL_CLAMP_TO_EDGE);
++        glProg.setTexture("Acr3Curve", acr3Texture);
++        glProg.setVar("acr3CurveSize", acr3.length);
++        glProg.setVar("acr3Enabled", irisJpegColor ? 1 : 0);
++
+         if (hasHueSat) {
+             int[] d = basePipeline.mParameters.irisJpegHueSatMapSize;
+             profileHueSatTexture = makeFlattenedDcpTexture(basePipeline.mParameters.irisJpegHueSatMap, d);
+@@ -96,6 +112,10 @@ public final class MotionV2ColorTransform extends Node {
+                 + " lookDims=" + java.util.Arrays.toString(basePipeline.mParameters.irisJpegLookMapSize)
+                 + " dcpHsv=true"
+                 + " dcpLinearEncoding=true"
++                + " acr3Owner=IRIS_26638_EXACT_1025_SAMPLE"
++                + " acr3Size=" + acr3.length
++                + " acr3DisplayLuminancePreserved=true"
++                + " acr3Enabled=" + irisJpegColor
+                 + " hdrOverrangePreserved=true"
+                 + " negativeProfileExcursionMapBypass=true"
+                 + " neutralAxisNegativeGamutFit=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 885b83f6eda625f006b14a00c5eb3d615ea49b41..3c5d57bee199b58faa980f732058d052841c7d10 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -449,13 +449,11 @@ public class PostPipeline extends GLBasePipeline {
+             add(new StageTelemetry("IRIS_NIGHT_PROFILE_COLOR"));
+             add(new MotionV2ViewfinderExposureMatcher());
+             add(new StageTelemetry("IRIS_26550_NIGHT_PRESENTATION_SOLVE"));
+-            /* IRIS_26563_UNIVERSAL_ADAPTIVE_COLOR_APPEARANCE
+-             * Device-specific profile color is already complete and the exposure solver has read
+-             * the untouched calibrated image. Restore only reliable weak colorfulness in common
+-             * extended linear-sRGB before display exposure/tone/highlight/gamut rendering.
++            /* IRIS_26638_ACR3_SINGLE_COLOR_APPEARANCE_OWNER
++             * MotionV2ColorTransform now owns the default photographic RGB relationship. The old
++             * 0.95 contraction/recovery stage must remain unreachable so color is rendered once.
+              */
+-            add(new MotionV2AdaptiveColorAppearance());
+-            add(new StageTelemetry("IRIS_26563_NIGHT_ADAPTIVE_COLOR_APPEARANCE"));
++            add(new StageTelemetry("IRIS_26638_NIGHT_ACR3_COLOR_APPEARANCE"));
+             add(new MotionV2DisplayExposure());
+             add(new StageTelemetry("IRIS_26550_NIGHT_PRESENTATION_EXPOSURE"));
+             add(new MotionV2Render());
+@@ -545,12 +543,11 @@ public class PostPipeline extends GLBasePipeline {
+             add(new StageTelemetry("V2_POST_DNG_PROFILE_COLOR_TRANSFORM"));
+             add(new MotionV2ViewfinderExposureMatcher());
+             add(new StageTelemetry("V2_POST_VIEWFINDER_EXPOSURE_SOLVE"));
+-            /* IRIS_26563_UNIVERSAL_ADAPTIVE_COLOR_APPEARANCE
+-             * Shared Motion/SR appearance stage in common extended linear-sRGB. It runs exactly
+-             * once after device profile conversion/exposure solve and before presentation gain.
++            /* IRIS_26638_ACR3_SINGLE_COLOR_APPEARANCE_OWNER
++             * The exact ACR3 relationship already ran in profile space inside MotionV2ColorTransform.
++             * Do not stack the old 0.95 neutral-axis contraction or automatic color recovery here.
+              */
+-            add(new MotionV2AdaptiveColorAppearance());
+-            add(new StageTelemetry("IRIS_26563_MOTION_ADAPTIVE_COLOR_APPEARANCE"));
++            add(new StageTelemetry("IRIS_26638_MOTION_ACR3_COLOR_APPEARANCE"));
+             add(new MotionV2DisplayExposure());
+             add(new StageTelemetry("V2_POST_VIEWFINDER_PRESENTATION_EXPOSURE"));
+ 
+@@ -574,7 +571,7 @@ public class PostPipeline extends GLBasePipeline {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+                     "owner=" + motionReconstructionOwnerName(mParameters.motionV2ReconstructionOwner)
+-                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,OwnerSpecificPreColor,MotionV2ColorTransform,MotionV2ViewfinderExposureMatcher,MotionV2AdaptiveColorAppearance,MotionV2DisplayExposure,IrisManualOptional,MotionV2Render,RotateWatermark"
++                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,OwnerSpecificPreColor,MotionV2ColorTransform[ACR3],MotionV2ViewfinderExposureMatcher,MotionV2DisplayExposure,IrisManualOptional,MotionV2Render,RotateWatermark"
+                             + " spatialHighlightNode=false"
+                             + " directMultiframeRgb=" + directRgbCarrier
+                             + " strictSabreAuthority26560=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index c5153cb4e03cf269838de985dd36e3507d114b4f..0d41d86160acbbb130a97b7bee29e4f338aed356 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -15,6 +15,7 @@ import com.particlesdevs.photoncamera.processing.render.Parameters;
+ import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings;
+ import com.particlesdevs.photoncamera.processing.processor.IrisNightNeuralEnhancer;
+ import com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionV2Render;
++import com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionV2Acr3Curve;
+ import java.nio.ByteBuffer;
+ import java.nio.file.Path;
+ import java.nio.file.Files;
+@@ -188,6 +189,7 @@ public final class MotionV2Jpeg444Encoder {
+                     raw.x, raw.y, crop.x, crop.y, parameters.cameraRotation, parameters.mirror,
+                     Math.max(1.0f, parameters.motionV2RenderResidualZoom),
+                     sensorToProPhoto, profileToDisplay,
++                    MotionV2Acr3Curve.copySamples(), parameters.irisJpegColorValid,
+                     parameters.irisJpegHueSatMap,
+                     parameters.irisJpegHueSatMapSize[0], parameters.irisJpegHueSatMapSize[1],
+                     parameters.irisJpegHueSatMapSize[2],
+@@ -214,7 +216,9 @@ public final class MotionV2Jpeg444Encoder {
+                     + " gainEncodingMax=" + true2xGainEncodingMax
+                     + " gainContentMax=" + true2xGainContentMax
+                     + " publicationSceneWhite=" + publicationSceneWhite
+-                    + " iris26630Saturation=" + saturation
++                    + " iris26638Acr3Size=" + MotionV2Acr3Curve.size()
++                    + " iris26638Acr3Owner=EXACT_1025_SAMPLE_SINGLE_TABLE"
++                    + " iris26638Saturation=" + saturation
+                     + " iris26630SaturationOwner=" + (parameters.motionV2Active ? "MOTION_PER_LENS" : "NIGHT_NEUTRAL_1_0")
+                     + " iris26621SdrWhiteAnchor=" + MotionV2Render.IRIS_26621_SDR_WHITE_ANCHOR
+                     + " iris26614DisplayDomainKneeAuthority=false"
+@@ -362,6 +366,7 @@ public final class MotionV2Jpeg444Encoder {
+             int rawWidth, int rawHeight, int cropWidth, int cropHeight,
+             int rotation, boolean mirror, float renderResidualZoom,
+             float[] sensorToProPhoto, float[] proPhotoToSrgb,
++            float[] acr3Curve, boolean acr3Enabled,
+             float[] dcpHueSatMap, int dcpHueDivisions, int dcpSatDivisions, int dcpValueDivisions,
+             float[] dcpLookMap, int lookHueDivisions, int lookSatDivisions, int lookValueDivisions,
+             float displayGain, float exposureEv, float shadows, float contrast, float saturation, float sceneWhite,
+diff --git a/app/version.properties b/app/version.properties
+index e97cff03c061031941ab2b2374e0f1c49a7d4368..771b54600b6359cf1a439f514a03d87d1a963dad 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726637
+-VERSION_BUILD=26637
++VERSION_NAME=0.9726638
++VERSION_BUILD=26638
