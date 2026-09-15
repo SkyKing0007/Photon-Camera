@@ -284,7 +284,7 @@ set(IRIS26636_LIBHEIF_PATCH "${CMAKE_CURRENT_BINARY_DIR}/iris26636_libheif_pr150
 # is the sole publication authority: 8-bit tmap PIXI, visible gain item, essential IPMA,
 # and HEIC brands mif1/heic/tmap (no standalone-libheif miaf hybrid).
 set(IRIS26643_LIBHEIF_AOSP_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/iris26643_libheif_aosp_contract.patch")
-set(IRIS26643_LIBHEIF_AOSP_PATCH_SHA256 "869d0462d6a6ebc4ffbb42c64a36a26a99a6be43c4fb9daa14d13a910263fffe")
+set(IRIS26643_LIBHEIF_AOSP_PATCH_SHA256 "e1fbbfcb926fe1879e1416b11f4f35bd586e480659d1ca6daa45798b666d856a")
 file(SHA256 "${IRIS26643_LIBHEIF_AOSP_PATCH}" IRIS26643_LIBHEIF_AOSP_PATCH_ACTUAL_SHA256)
 if(NOT IRIS26643_LIBHEIF_AOSP_PATCH_ACTUAL_SHA256 STREQUAL IRIS26643_LIBHEIF_AOSP_PATCH_SHA256)
     message(FATAL_ERROR
@@ -346,6 +346,9 @@ FetchContent_Declare(iris26636_libheif
     GIT_SHALLOW FALSE
     GIT_PROGRESS FALSE
     PATCH_COMMAND ${GIT_EXECUTABLE} apply --ignore-space-change --whitespace=nowarn "${IRIS26636_LIBHEIF_PATCH}"
+    # IRIS_26643_PINNED_V2_LIBHEIF_PATCH_REPLAY: permanent regression for Actions run 34987275178.
+    # Check the 26643 correction against the exact post-v2.0.0-PR1503 tree before mutating it.
+    COMMAND ${GIT_EXECUTABLE} apply --check --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}"
     COMMAND ${GIT_EXECUTABLE} apply --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}")
 FetchContent_MakeAvailable(iris26636_libheif)
 execute_process(

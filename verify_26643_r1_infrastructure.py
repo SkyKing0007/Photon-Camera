@@ -6,6 +6,12 @@ b=Path(sys.argv[1]).read_text(); w=Path(sys.argv[2]).read_text()
 # Immediate verification-mechanics authority is the exact successful 26642 implementation.
 assert 'AUTH26642_BUILD_SCRIPT_AUTHORITY_BLOB="2b7a9f4caeb6fba66dbf3880b7d399acb01af256"' in b
 assert 'AUTH26642_WORKFLOW_AUTHORITY_BLOB="e9df8c2f964fb4bd839885f63241187d83baf6d1"' in b
+# Exact failed 26643 R1 lineage is the only additional repair-parent allowance; successful 26642 remains runtime authority.
+for token in ['FAILED_26643_R1_COMMIT="8138cfe871acec20d4a7c02dd63e83b1616ef64c"','FAILED_26643_R1_RUN_ID="34987275178"',
+              'lineage="direct successful-26642 handoff"','one repair commit on exact failed 26643 R1',
+              'git diff --name-only "$RUNTIME_AUTHORITY_COMMIT"..HEAD']:
+ assert token in b,token
+assert '26643 lineage must be direct on successful 26642 or one repair commit on exact failed 26643 R1' in b
 # Inherited successful 26641 and root 26639 authorities remain explicit.
 assert 'AUTH26641_BUILD_SCRIPT_AUTHORITY_BLOB="53bf57126a97d684a35c3d2a04e33bcdaa4f31ee"' in b
 assert 'AUTH26641_WORKFLOW_AUTHORITY_BLOB="1577eeb875644495578e08196514fd7c0bc99c47"' in b
@@ -44,4 +50,4 @@ for token in ['runs-on: ubuntu-24.04','actions/checkout@v5','fetch-depth: 0','ac
 assert w.count('- name:')==3
 # Unique 26643 trigger namespace, no overlapping historical handoff triggers.
 assert "'R1_26643_*'" in w and "'R1_26642_*'" not in w and "'R1_26641_*'" not in w and "'R1_26640_*'" not in w and "'R1_26639_*'" not in w
-print('PASS 26643 infrastructure audit: exact successful-26642 compiler/build/NDK/patch/PRE-BUILD/assemble/postbuild order preserved; delta limited to 26643 authority/scope/HEIC+UI regressions and 0-GLSL applicability')
+print('PASS 26643 infrastructure audit: exact successful-26642 compiler/build/NDK/patch/PRE-BUILD/assemble/postbuild order preserved; repair-only lineage allowance is pinned to failed 8138cfe/run 34987275178; workflow unchanged')

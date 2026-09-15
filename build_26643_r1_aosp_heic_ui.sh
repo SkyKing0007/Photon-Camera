@@ -17,6 +17,8 @@ resolve_glslang_compiler(){
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 RUNTIME_AUTHORITY_COMMIT="23ef05f61020cfd0ce412ef7ecb0bdc1064f99ba"
+FAILED_26643_R1_COMMIT="8138cfe871acec20d4a7c02dd63e83b1616ef64c"
+FAILED_26643_R1_RUN_ID="34987275178"
 BASE_RUN_ID="34930671416"
 BASE_ARTIFACT_ID="10381088303"
 BASE_ARTIFACT_NAME="photon-26642-r1-heic-ui-prefix"
@@ -133,12 +135,20 @@ PY
 verify_scope(){
   if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed exact 10-path/1-added 26643 candidate; no live app source packaged)"; return; fi
   [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
-  [[ "$(git rev-parse HEAD^)" == "$RUNTIME_AUTHORITY_COMMIT" ]] || fail "26643 must be one direct handoff commit on exact successful 26642 authority"
+  local parent lineage
+  parent="$(git rev-parse HEAD^)"
+  if [[ "$parent" == "$RUNTIME_AUTHORITY_COMMIT" ]]; then
+    lineage="direct successful-26642 handoff"
+  elif [[ "$parent" == "$FAILED_26643_R1_COMMIT" && "$(git rev-parse "${FAILED_26643_R1_COMMIT}^")" == "$RUNTIME_AUTHORITY_COMMIT" ]]; then
+    lineage="one repair commit on exact failed 26643 R1 ${FAILED_26643_R1_COMMIT}/run ${FAILED_26643_R1_RUN_ID}"
+  else
+    fail "26643 lineage must be direct on successful 26642 or one repair commit on exact failed 26643 R1"
+  fi
   git diff --name-only "$RUNTIME_AUTHORITY_COMMIT"..HEAD | sort > "$WORK/actual_upload_scope.txt"
   sort "$UPLOADS" > "$WORK/expected_upload_scope.txt"
   diff -u "$WORK/expected_upload_scope.txt" "$WORK/actual_upload_scope.txt" || fail "26643 upload scope mismatch"
   ! grep -Eq '^app/' "$WORK/actual_upload_scope.txt" || fail "handoff commit contains live app source"
-  set_report "CHANGED RUNTIME SCOPE" "PASS (exact 10-path/1-added runtime candidate allowlist; handoff-only repository commit)"
+  set_report "CHANGED RUNTIME SCOPE" "PASS (exact 10-path/1-added runtime candidate allowlist; handoff-only cumulative scope; ${lineage})"
 }
 obtain_authority(){
   if [[ -n "$LOCAL_ART" ]]; then cp "$LOCAL_ART" "$ARTZIP"; else
@@ -184,7 +194,7 @@ verify_shaders(){
 }
 verify_successful_26639_mechanics(){
   python3 -S "$INFRA" "$BUILD_SCRIPT" "$WORKFLOW" | tee "$OUT/26643_infrastructure.txt"
-  set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful-26642 ordering/isolation/Kotlin-Java/NDK/patch/PRE-BUILD/assemble/postbuild mechanics preserved; delta limited to 26643 identity/authority/scope/HEIC+UI regressions and 0-GLSL applicability)"
+  set_report "INFRASTRUCTURE DELTA AUDIT" "PASS (successful-26642 compiler/build ordering preserved; repair-only delta permits exact failed-26643 lineage and permanently guards pinned-v2 PR1503 patch target/layout; workflow unchanged)"
   set_report "VERIFICATION MECHANICS AUTHORITY" "PASS (exact successful 26642 implementation build-script blob ${AUTH26642_BUILD_SCRIPT_AUTHORITY_BLOB} + workflow blob ${AUTH26642_WORKFLOW_AUTHORITY_BLOB}, inheriting successful 26641 blobs ${AUTH26641_BUILD_SCRIPT_AUTHORITY_BLOB}/${AUTH26641_WORKFLOW_AUTHORITY_BLOB} and preserving successful-26639 root ordering blobs ${AUTH26639_BUILD_SCRIPT_AUTHORITY_BLOB}/${AUTH26639_WORKFLOW_AUTHORITY_BLOB})"
 }
 verify_candidate_patches(){

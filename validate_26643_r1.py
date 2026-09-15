@@ -52,13 +52,19 @@ for stale in ['IccHelper::writeIccProfile','heif_image_set_raw_color_profile(']:
 # Dependency patch is the sole post-Google AOSP container correction; old 26642 local patch is neutralized/unreferenced.
 patch=text('app/src/main/cpp/iris26643_libheif_aosp_contract.patch')
 assert patch.count('+  pixi->add_channel_bits(8);')==3 and patch.count('-  pixi->add_channel_bits(10);')==3
+assert 'diff --git a/libheif/image-items/image_item.cc b/libheif/image-items/image_item.cc' in patch
+assert 'diff --git a/libheif/context.cc b/libheif/context.cc' not in patch
 assert '+    infe_box->set_hidden_item(false);' in patch and '-    infe_box->set_hidden_item(true);' in patch
 assert '+  assoc.essential = true;' in patch
 assert 'format != heif_compression_HEVC' in patch and 'if (miaf_compatible && format != heif_compression_HEVC)' in patch
 cm=text('app/src/main/cpp/CMakeLists.txt')
 for x in ['IRIS_26643_AOSP_ANDROID16_HEIC_CONTAINER_OWNER','IRIS26643_LIBHEIF_AOSP_PATCH_SHA256','IRIS26643_LIBHEIF_AOSP_PATCH_ACTUAL_SHA256',
+          'IRIS_26643_PINNED_V2_LIBHEIF_PATCH_REPLAY','google/libultrahdr/v2.0.0/cmake/patches/libheif_pr1503.patch',
+          'IRIS26636_LIBHEIF_PATCH_BLOB "da5494f223f369781bbabcdaf6dbe192e0d74ca1"',
+          'COMMAND ${GIT_EXECUTABLE} apply --check --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}"',
           'COMMAND ${GIT_EXECUTABLE} apply --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}"']:
  assert x in cm,x
+assert cm.index('apply --check --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}"') < cm.index('apply --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}"', cm.index('apply --check'))
 assert 'iris26642_libheif_android16_tmap.patch' not in cm
 assert same('app/src/main/cpp/iris26642_libheif_android16_tmap.patch')
 # MediaCodec no longer publishes a conflicting requested VUI color contract; output-format values remain diagnostic only.

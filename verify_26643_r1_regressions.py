@@ -32,14 +32,26 @@ assert 'alternateNclx, heif_transfer_characteristic_IEC_61966_2_1' in cpp and 'a
 # ISO 21496 metadata generation and gain-map handoff remain present.
 for x in ['uhdr_gainmap_metadata_frac::gainmapMetadataFloatToFraction','uhdr_gainmap_metadata_frac::encodeGainmapMetadata','heif_context_encode_gain_map_image']:
  assert x in cpp,x
-# New dependency patch must parse as a real git patch: malformed-hunk failure is permanent.
+# New dependency patch must parse and target the exact pinned libultrahdr v2.0.0 PR1503 layout.
+# Permanent regression from failed Actions run 34987275178: context.cc:1507 was a newer-layout target.
 p=cand/'app/src/main/cpp/iris26643_libheif_aosp_contract.patch'
 subprocess.run(['git','apply','--numstat',str(p)],check=True,stdout=subprocess.DEVNULL)
 patch=p.read_text()
+assert 'diff --git a/libheif/image-items/image_item.cc b/libheif/image-items/image_item.cc' in patch
+assert 'diff --git a/libheif/context.cc b/libheif/context.cc' not in patch
+assert 'void Box_ipma::add_property_for_item_ID' in patch and 'heif_property_id Box_ipma::add_property_for_item_ID' not in patch
 assert '+    infe_box->set_hidden_item(false);' in patch
 assert '+  assoc.essential = true;' in patch
 assert 'if (miaf_compatible && format != heif_compression_HEVC)' in patch
 assert patch.count('+  pixi->add_channel_bits(8);')==3
+cm=T('app/src/main/cpp/CMakeLists.txt')
+assert 'IRIS26636_LIBHEIF_COMMIT "4a3f74bc593ebfc29becc1ed5dd0a61cc66d40e1"' in cm
+assert 'IRIS26636_LIBHEIF_PATCH_BLOB "da5494f223f369781bbabcdaf6dbe192e0d74ca1"' in cm
+assert 'google/libultrahdr/v2.0.0/cmake/patches/libheif_pr1503.patch' in cm
+assert 'IRIS_26643_PINNED_V2_LIBHEIF_PATCH_REPLAY' in cm
+check='apply --check --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}"'
+apply='apply --ignore-space-change --whitespace=nowarn "${IRIS26643_LIBHEIF_AOSP_PATCH}"'
+assert check in cm and apply in cm and cm.index(check) < cm.index(apply, cm.index(check)+len(check))
 # Old 26642 patch may remain as protected history, but it must be neutralized and unreferenced.
 assert H(base,'app/src/main/cpp/iris26642_libheif_android16_tmap.patch')==H(cand,'app/src/main/cpp/iris26642_libheif_android16_tmap.patch')
 assert 'iris26642_libheif_android16_tmap.patch' not in T('app/src/main/cpp/CMakeLists.txt')
@@ -53,4 +65,4 @@ assert 'iris26642ScheduleUltraHdrDecodeProof(fileToSave, "HEIC")' in saver and '
 # Successful 26642 HDR/IQ/performance/SHORT and filename/mode owners remain exact bytes.
 for r in ['app/src/main/assets/shaders/motionv2/gainmap.glsl','app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java','app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java','app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt','app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java','app/src/main/java/com/particlesdevs/photoncamera/processing/ImagePath.java','app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java']:
  assert H(base,r)==H(cand,r),r
-print('PASS 26643 permanent regressions: no RAW/Battery/bracketing quick rows; glyph-only selection; no manual pill; no hybrid HEIC signaling; dependency patch parses; ISO21496 and 26642 image owners retained')
+print('PASS 26643 permanent regressions: no RAW/Battery/bracketing quick rows; glyph-only selection; no manual pill; no hybrid HEIC signaling; exact pinned-v2 PR1503 patch target/layout guarded; ISO21496 and 26642 image owners retained')

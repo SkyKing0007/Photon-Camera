@@ -1,4 +1,4 @@
-PHOTON/IRIS 26643 R1 — ANDROID-16 AOSP HEIC ULTRA-HDR CONFORMANCE + QUICK/LENS/MANUAL UI CLEANUP
+PHOTON/IRIS 26643 R1 REPAIR — ANDROID-16 AOSP HEIC ULTRA-HDR CONFORMANCE + QUICK/LENS/MANUAL UI CLEANUP
 
 Runtime authority:
   successful 26642 R1 commit 23ef05f61020cfd0ce412ef7ecb0bdc1064f99ba
@@ -11,10 +11,11 @@ Verification-mechanics authority:
   exact successful 26642 implementation (build-script blob 2b7a9f4caeb6fba66dbf3880b7d399acb01af256; workflow blob e9df8c2f964fb4bd839885f63241187d83baf6d1), inheriting successful 26641 and preserving the successful 26639 compiler/build/patch/PRE-BUILD/assemble/postbuild ordering.
 
 Target: 0.9726643 / 26643
+Repair authority: failed 26643 R1 commit 8138cfe871acec20d4a7c02dd63e83b1616ef64c / Actions run 34987275178. The failure was deterministic: the local AOSP-contract patch targeted newer libheif layouts (context.cc and newer Box_ipma signature) instead of the pinned libheif 4a3f74bc + Google/libultrahdr v2.0.0 PR1503 layout.
 Backup: none created/requested. 26643 is a localized HEIC-publication conformance + UI cleanup change.
 
 Runtime changes: exactly 10 paths: 9 modified + 1 added. See R1_26643_RUNTIME_CHANGED_PATHS.txt and R1_26643_ADDED_PATHS_MUST_BE_ABSENT.txt.
-Infrastructure changes: 26643 identity/authority/scope/regressions and 0-GLSL applicability only, retaining the successful 26642 added-path cleanup proof. Compiler/build order is unchanged from successful 26642.
+Infrastructure changes: compiler/build ordering remains exact successful 26642. Repair-only proof delta: accept exactly one repair commit on failed 8138cfe/run 34987275178, and permanently guard the pinned-v2 PR1503 patch target/layout before native configure. Workflow is unchanged.
 
 Implementation owners:
   A) HEIC Android-16 AOSP conformance: retain the successful 26642 matched SDR/HDR gain map, half-linear-resolution Motion gain map, and ISO 21496-1 metadata bytes. Make the HEIF publication layer internally consistent with Android 16 HeicCompositeStream/MPEG4Writer: base/tmap Display-P3+sRGB+unspecified matrix+full range, gain unspecified/full, no parallel base ICC, visible gain item, essential IPMA properties, HEIC mif1/heic/tmap brands, and no explicit requested MediaCodec color-aspect keys.
@@ -26,9 +27,9 @@ Frozen successful 26642 behavior:
 
 Upload workflow:
   Extract this ZIP locally.
-  In vscode.dev on branch experimental-clean-photon-rebuild, upload/replace every path listed in R1_26643_UPLOAD_PATHS.txt exactly.
-  Confirm Source Control shows exactly that upload scope and no live app/ path.
-  Commit once and push. Do not manually edit runtime source.
+  In vscode.dev on branch experimental-clean-photon-rebuild at failed 26643 commit 8138cfe..., upload/replace every path in this repair ZIP.
+  Because the original 41-file handoff is already committed, Source Control will show only the repair files whose bytes changed; the workflow verifies the cumulative diff from successful 26642 is still exactly the sealed 41-path upload scope and contains no live app/ path.
+  Commit the repair once and push. Do not manually edit runtime source.
   The 26643 workflow reconstructs from the successful 26642 Actions artifact and runs the exact inherited guarded compiler/build sequence.
 
 Before Actions, this handoff is PREPARED / UPLOAD-READY only. Real Kotlin/Java, both NDK ABIs, full assemble, one-APK proof and post-build invariance become authoritative only after the 26643 Actions run succeeds. Real GLSL is not applicable because all 257 asset shaders are byte-identical to successful 26642.
