@@ -1,0 +1,486 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index cd3e20bc92f2c2acb71f56fb99a7ab7547183208..34016f4d3060a2c0703fbbd7b88227a66aece337 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -18,11 +18,12 @@ uniform float iris26623ToneAdaptiveSceneWhite;
+ /* IRIS_26524_UHDR_ZOOM_GEOMETRY_PARITY */
+ out float Output;
+ 
+-/* IRIS_26498_FULL_RESOLUTION_ULTRAHDR_GAIN_AUTHORITY_SUPERSEDED_26641
+- * 26641 intentionally replaces the former one-gain-sample-per-primary-pixel geometry with a
+- * half-linear-resolution Motion gain map. HDR and SDR intents are filtered in linear light at the
+- * same source center before their quotient is formed; the completed gain field is never blurred
+- * or dilated. The SDR image remains the exact spatial/color primary.
++/* IRIS_26498_FULL_RESOLUTION_ULTRAHDR_GAIN_AUTHORITY
++ * Android Ultra HDR permits a gain map at the same resolution as the primary.
++ * Generate the standard logarithmic gain per primary pixel, so the decoder never
++ * has to spatially resample a lower-resolution brightness edge over the sharp SDR
++ * base. The SDR image remains the exact spatial/color primary; UHDR changes only
++ * the per-pixel display gain.
+  */
+ const float UHDR_OFFSET = 0.015625;
+ float luminance(vec3 c){return dot(c,vec3(0.22897456,0.69173852,0.07928691));}
+@@ -140,9 +141,9 @@ vec3 iris26524BilinearHdr(vec2 sourcePixel){
+     return mix(a,b,f.y);
+ }
+ /* IRIS_26550_GAINMAP_GENERAL_GEOMETRY
+- * Motion and Night may request detached lower-resolution gain maps. Map every gain pixel back to
+- * the corresponding full-resolution SDR/HDR pixel center instead of accidentally reading only a
+- * top-left fraction of the image. Motion adds 26641 linear-light matched pre-divide filtering.
++ * Motion remains 1:1 so sourcePixel==p exactly. Night may request a smaller detached gain map;
++ * sample the full rendered SDR/HDR at the corresponding pixel center instead of accidentally
++ * reading only the top-left quarter of the image.
+  */
+ vec3 iris26550BilinearSdr(vec2 sourcePixel){
+     ivec2 sz=textureSize(SdrBuffer,0);
+@@ -157,23 +158,6 @@ vec3 iris26550BilinearSdr(vec2 sourcePixel){
+                texelFetch(SdrBuffer,ivec2(p1.x,p1.y),0).rgb,f.x);
+     return mix(a,b,f.y);
+ }
+-/* IRIS_26641_LINEAR_LIGHT_SDR_PREDIVIDE_DOWNSAMPLE
+- * Motion's half-resolution gain map averages decoded SDR radiance before dividing by the matched
+- * HDR intent. At an exact 2x reduction the bilinear center sample is a 2x2 linear-light box.
+- * Night deliberately keeps the pre-26641 encoded-bilinear/decode behavior. */
+-vec3 iris26641BilinearSdrLinear(vec2 sourcePixel){
+-    ivec2 sz=textureSize(SdrBuffer,0);
+-    vec2 hi=max(vec2(sz)-vec2(1.0),vec2(0.0));
+-    vec2 q=clamp(sourcePixel,vec2(0.0),hi);
+-    ivec2 p0=ivec2(floor(q));
+-    ivec2 p1=min(p0+ivec2(1),sz-ivec2(1));
+-    vec2 f=fract(q);
+-    vec3 a=mix(srgbDecode(texelFetch(SdrBuffer,ivec2(p0.x,p0.y),0).rgb),
+-               srgbDecode(texelFetch(SdrBuffer,ivec2(p1.x,p0.y),0).rgb),f.x);
+-    vec3 b=mix(srgbDecode(texelFetch(SdrBuffer,ivec2(p0.x,p1.y),0).rgb),
+-               srgbDecode(texelFetch(SdrBuffer,ivec2(p1.x,p1.y),0).rgb),f.x);
+-    return mix(a,b,f.y);
+-}
+ void main(){
+     ivec2 p=ivec2(gl_FragCoord.xy);
+     if(any(greaterThanEqual(p,gainMapSize))){Output=0.0;return;}
+@@ -191,13 +175,11 @@ void main(){
+         hdrRgb=iris26524BilinearHdr(masterSourcePixel);
+     }
+     vec3 hdrPositive=max(hdrRgb,vec3(0.0));
+-    float sdr=motionHdrHandoff!=0
+-        ? max(luminance(iris26641BilinearSdrLinear(sourcePixel)),0.0)
+-        : max(luminance(srgbDecode(iris26550BilinearSdr(sourcePixel))),0.0);
++    float sdr=max(luminance(srgbDecode(iris26550BilinearSdr(sourcePixel))),0.0);
+     float safeMax=max(maxGainRatio,1.001);
+     float ratio;
+     if(motionHdrHandoff!=0){
+-        /* IRIS_26641_TRUE_MATCHED_SDR_HDR_INTENT_QUOTIENT
++        /* IRIS_26640_MATCHED_SDR_HDR_INTENT_QUOTIENT
+          * Both intents come from the same canonical extended-linear Motion master, same source
+          * sample, same 26623 global tone prerequisites, and the same Local-Laplacian structure.
+          * There is no luma eligibility threshold and no spatial gain dilation. The HDR intent
+@@ -216,14 +198,10 @@ void main(){
+             float requested=max(displayGain,1.0e-6)*hdrExposureScale;
+             float sdrModelY=sourceY*(sharedSdrGuide/sourceGuide);
+             float linearTargetY=sourceY*requested*max(localStructureScale,0.0);
+-            /* IRIS_26641_TRUE_MATCHED_INTENT_DELTA
+-             * The HDR rendition differs from the completed SDR rendition by the full luminance
+-             * that the matched SDR model compressed away. 26640 multiplied this delta by the
+-             * compression fraction a second time, effectively squaring moderate compression and
+-             * under-restoring scenes such as the plant shelf. Keep the actual completed SDR as
+-             * the spatial/color base and restore the full matched-intent delta exactly once. */
+-            float matchedIntentDelta=max(linearTargetY-sdrModelY,0.0);
+-            float hdrIntentY=sdr+matchedIntentDelta;
++            float compressedDelta=max(linearTargetY-sdrModelY,0.0);
++            float compressionFraction=linearTargetY>1.0e-7
++                ? clamp(compressedDelta/linearTargetY,0.0,1.0) : 0.0;
++            float hdrIntentY=sdr+compressedDelta*compressionFraction;
+             ratio=clamp((hdrIntentY+UHDR_OFFSET)/(sdr+UHDR_OFFSET),1.0,safeMax);
+         }
+     }else{
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java
+index 6ef2eccaa67310152c9df0ab9f0a68dc247a1859..a83f46d259edafab43582d9890cc2d7a962ca8aa 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java
+@@ -9,8 +9,6 @@ import androidx.annotation.NonNull;
+ 
+ import java.nio.Buffer;
+ import java.nio.ByteBuffer;
+-import java.util.LinkedHashMap;
+-import java.util.Map;
+ 
+ import static android.opengl.GLES31.*;
+ import static com.particlesdevs.photoncamera.processing.opengl.GLCoreBlockProcessing.checkEglError;
+@@ -24,33 +22,10 @@ public class GLTexture implements AutoCloseable {
+     public final int mTextureID;
+     public int mBuffer;
+     public boolean isBuffered = false;
++    private static int count = 0;
+     public final GLFormat mFormat;
+-    private static final Map<Integer, Long> liveTextureTokens = new LinkedHashMap<>();
+-    private static long nextTrackingToken = 1L;
+-    private final long mTrackingToken;
+-    private boolean mClosed = false;
+-
+-    /* IRIS_26641_SHARED_GL_TEXTURE_OWNERSHIP
+-     * OpenGL texture object names and texture-unit indices are different namespaces. Track live
+-     * object names with a generation token; never reinterpret them as texture units or fixed array
+-     * slots. The generation token prevents an old wrapper from deleting a reused GL object name
+-     * after closeAll(), and dynamic tracking introduces no new live-texture cap. */
+-    private static synchronized long registerTexture(int textureId) {
+-        if (liveTextureTokens.containsKey(textureId)) {
+-            throw new IllegalStateException("Duplicate live GL texture object " + textureId);
+-        }
+-        long token = nextTrackingToken++;
+-        if (nextTrackingToken == 0L) nextTrackingToken = 1L;
+-        liveTextureTokens.put(textureId, token);
+-        return token;
+-    }
+-
+-    private static synchronized boolean unregisterTexture(int textureId, long trackingToken) {
+-        Long current = liveTextureTokens.get(textureId);
+-        if (current == null || current.longValue() != trackingToken) return false;
+-        liveTextureTokens.remove(textureId);
+-        return true;
+-    }
++    private static boolean[] ids = new boolean[256];
++    private static int[] textures = new int[256];
+     public GLTexture(GLTexture in,GLFormat format) {
+         this(in.mSize,new GLFormat(format),null,in.mFormat.filter,in.mFormat.wrap,0);
+     }
+@@ -103,12 +78,23 @@ public class GLTexture implements AutoCloseable {
+         int[] TexID = new int[1];
+         glGenTextures(1,TexID,0);
+         Log.d("GLTexture","TexID:"+TexID[0] + " Size:"+mSize.x+"x"+mSize.y + " Format:"+mFormat.getGLFormatInternal() + " Filter:"+textureFilter + " Wrapper:"+textureWrapper);
++        for(int i = 1; i<ids.length;i++){
++            if(!ids[i]){
++                Log.d("GLTexture","get:"+i);
++                if(count < i){
++                    count = i;
++                    //glGenTextures(1,TexID,0);
++                }
++                //TexID[0] = i;
++                textures[i] = TexID[0];
++                ids[i] = true;
++                break;
++            }
++        }
++
+         mTextureID = TexID[0];
+-        mTrackingToken = registerTexture(mTextureID);
+-        Log.d("GLTexture","getTexture:"+mTextureID);
+-        // Preserve the caller's current texture-unit binding while configuring this new object.
+-        int[] previousBinding = new int[1];
+-        glGetIntegerv(GL_TEXTURE_BINDING_2D, previousBinding, 0);
++        //Log.d("GLTexture","Size:"+size+" ID:"+mTextureID);
++        glActiveTexture(GL_TEXTURE1+mTextureID);
+         glBindTexture(GL_TEXTURE_2D, mTextureID);
+         //if(bmp.byteBuffer != null) {
+             glTexStorage2D(GL_TEXTURE_2D, 1, mFormat.getGLFormatInternal(),  mSize.x, mSize.y);
+@@ -121,8 +107,6 @@ public class GLTexture implements AutoCloseable {
+         checkEglError("glTexSubImage2D");
+         reSetParameters();
+         checkEglError("Tex glTexParameter");
+-        glBindTexture(GL_TEXTURE_2D, previousBinding[0]);
+-        checkEglError("Tex restore binding");
+     }
+     public GLTexture(Point size, GLFormat glFormat, Buffer pixels, int textureFilter, int textureWrapper,int level) {
+         mFormat = glFormat;
+@@ -133,11 +117,22 @@ public class GLTexture implements AutoCloseable {
+         int[] TexID = new int[1];
+         glGenTextures(1,TexID,0);
+         Log.d("GLTexture","TexID:"+TexID[0]);
++        for(int i = 1; i<ids.length;i++){
++            if(!ids[i]){
++                Log.d("GLTexture","get:"+i);
++                if(count < i){
++                    count = i;
++                    //glGenTextures(1,TexID,0);
++                }
++                //TexID[0] = i;
++                textures[i] = TexID[0];
++                ids[i] = true;
++                break;
++            }
++        }
+         mTextureID = TexID[0];
+-        mTrackingToken = registerTexture(mTextureID);
+-        Log.d("GLTexture","getTexture:"+mTextureID);
+-        int[] previousBinding = new int[1];
+-        glGetIntegerv(GL_TEXTURE_BINDING_2D, previousBinding, 0);
++        //Log.d("GLTexture","Size:"+size+" ID:"+mTextureID);
++        glActiveTexture(GL_TEXTURE1+mTextureID);
+         glBindTexture(GL_TEXTURE_2D, mTextureID);
+         //if(pixels != null) {
+             glTexStorage2D(GL_TEXTURE_2D, 1, glFormat.getGLFormatInternal(),  size.x, size.y);
+@@ -150,8 +145,6 @@ public class GLTexture implements AutoCloseable {
+         checkEglError("glTexSubImage2D");
+         reSetParameters();
+         checkEglError("Tex glTexParameter");
+-        glBindTexture(GL_TEXTURE_2D, previousBinding[0]);
+-        checkEglError("Tex restore binding");
+     }
+ 
+     public void loadData(Buffer pixels){
+@@ -228,32 +221,32 @@ public class GLTexture implements AutoCloseable {
+                 ", mFormat=" + mFormat +
+                 '}';
+     }
+-    public static synchronized void notClosed(){
++    public static void notClosed(){
+         StringBuilder str = new StringBuilder();
+-        for (int textureId : liveTextureTokens.keySet()) {
+-            str.append(textureId).append(" ");
++        for(int i =0; i<ids.length;i++){
++            if(ids[i]) {
++                str.append(i);
++                str.append(" ");
++            }
+         }
+         Log.d("GLTexture","notClosed:"+str.toString());
+     }
+ 
+-    public static synchronized void closeAll(){
+-        if (liveTextureTokens.isEmpty()) return;
+-        int[] textureIds = new int[liveTextureTokens.size()];
+-        int i = 0;
+-        for (int textureId : liveTextureTokens.keySet()) textureIds[i++] = textureId;
+-        glDeleteTextures(textureIds.length, textureIds, 0);
+-        liveTextureTokens.clear();
++    public static void closeAll(){
++        for(int i =0; i<ids.length;i++){
++            if(ids[i]) {
++                glDeleteTextures(1,new int[]{textures[i]},0);
++                ids[i] = false;
++            }
++        }
++        count = 0;
+     }
+ 
+     @Override
+-    public synchronized void close() {
+-        if (mClosed) return;
+-        mClosed = true;
+-        // Generation matching prevents an old wrapper from deleting a reused GL object name.
+-        if (unregisterTexture(mTextureID, mTrackingToken)) {
+-            glDeleteTextures(1,new int[]{mTextureID},0);
+-        }
+-        // mBuffer is a framebuffer object, not a generic buffer object.
+-        if(isBuffered) glDeleteFramebuffers(1,new int[]{mBuffer},0);
++    public void close() {
++        glDeleteTextures(1,new int[]{mTextureID},0);
++        ids[mTextureID] = false;
++        //Log.d("GLTexture","close ID:"+mTextureID);
++        if(isBuffered) glDeleteBuffers(1,new int[]{mBuffer},0);
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index ef0fb4ae0320a848721a2524804165d1119cfbf9..7136a972e3c3decf9bea87f2946aaba10d642449 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -19,10 +19,10 @@ import static android.opengl.GLES20.GL_LINEAR;
+ /**
+  * IRIS_26435_EXACT_26430_BASE_LOW_FREQUENCY_TRUE_GAINMAP
+  *
+- * IRIS_26498_FULL_RESOLUTION_UHDR_PRIMARY_DETAIL_AUTHORITY_SUPERSEDED_26641
+- * The completed SDR color/highlight/tone path remains unchanged. 26641 moves Motion UHDR to
+- * half-linear-resolution matched-intent sampling: HDR and SDR are filtered before division,
+- * while the completed gain field is never spatially blurred or dilated.
++ * IRIS_26498_FULL_RESOLUTION_UHDR_PRIMARY_DETAIL_AUTHORITY
++ * The complete 26430 SDR color/highlight/tone path remains unchanged. Ultra HDR
++ * now carries a one-to-one gain sample for every primary pixel, eliminating the
++ * quarter-resolution interpolation that measurably softened the UHDR rendition.
+  */
+ public final class MotionV2Render extends Node {
+     static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
+@@ -96,10 +96,7 @@ public final class MotionV2Render extends Node {
+      * broad non-unity gain map where SDR compression preserves highlight structure.
+      */
+     private static final float HDR_EXPOSURE_SCALE = OUTPUT_EXPOSURE_SCALE;
+-    /* IRIS_26641_HALF_LINEAR_MATCHED_INTENT_GAINMAP
+-     * Motion uses half linear resolution. HDR and SDR are sampled in linear light before the
+-     * quotient; the completed gain map is never blurred/dilated after division. Night remains 1/4. */
+-    private static final int GAINMAP_DOWNSAMPLE = 2;
++    private static final int GAINMAP_DOWNSAMPLE = 1;
+ 
+     /* IRIS_26621_NEW_SIMPLIFIED_PRESENTATION_OWNER
+      * Motion keeps one global exposure request: motionV2DisplayGain * OUTPUT_EXPOSURE_SCALE.
+@@ -917,9 +914,9 @@ public final class MotionV2Render extends Node {
+         pipeline.motionV2GainMapFullHdrDisplayRatio = 1.0f;
+ 
+         /* IRIS_26550_NIGHT_POST_JIN_ULTRAHDR_AUTHORITY
+-         * Motion uses 26641 half-linear-resolution matched-intent gain geometry. Night retains its
+-         * existing 1/4-resolution pre-Jin HDR/SDR relationship from this GL owner; IrisNightUltraHdr
+-         * later rebases that relationship against the final post-Jin SDR before attaching JPEG_R.
++         * Motion keeps its exact full-resolution gain-map geometry. Night now retains only a 1/4
++         * resolution pre-Jin HDR/SDR relationship from this GL owner. IrisNightUltraHdr later
++         * rebases that relationship against the final post-Jin SDR before attaching JPEG_R.
+          */
+         final boolean iris26550Night = basePipeline.mParameters.irisNightActive;
+         try {
+@@ -942,10 +939,6 @@ public final class MotionV2Render extends Node {
+             final float encodingMaxGainRatio = maxGainRatio;
+ 
+             GLTexture gainTexture = null;
+-            final long iris26641GainStartNs = System.nanoTime();
+-            long iris26641AfterDrawNs = iris26641GainStartNs;
+-            long iris26641AfterReadbackNs = iris26641GainStartNs;
+-            long iris26641AfterScanNs = iris26641GainStartNs;
+             try {
+                 gainTexture = new GLTexture(
+                         gainSize,
+@@ -971,14 +964,12 @@ public final class MotionV2Render extends Node {
+ 
+                 glProg.setVar("irisOutputZoom", irisOutputZoom);
+                 glProg.drawBlocks(gainTexture);
+-                iris26641AfterDrawNs = System.nanoTime();
+ 
+                 gainTexture.BufferLoad();
+                 GLFormat readFormat =
+                         new GLFormat(GLFormat.DataType.SIMPLE_8, 1);
+                 ByteBuffer rgba =
+                         gainTexture.textureBuffer(readFormat, true);
+-                iris26641AfterReadbackNs = System.nanoTime();
+                 rgba.position(0);
+ 
+                 int pixels = gainSize.x * gainSize.y;
+@@ -1013,7 +1004,6 @@ public final class MotionV2Render extends Node {
+                     alpha.put((byte)outputCode);
+                 }
+                 alpha.position(0);
+-                iris26641AfterScanNs = System.nanoTime();
+ 
+                 /*
+                  * Per-pixel gain-map provenance, not just a global percentage.
+@@ -1022,9 +1012,9 @@ public final class MotionV2Render extends Node {
+                  * or ceiling-light region cannot hide behind one global mean.
+                  */
+                 /* IRIS_26513_GAINMAP_DIAGNOSTIC_DECIMATION
+-                 * Diagnostic roughness remains a 12x8 local-neighbor sample of the actual stored
+-                 * gain map; it never modifies the gain bytes. 26641 reduces Motion's stored map
+-                 * itself to half linear resolution before this diagnostic stage.
++                 * Keep the actual full-resolution gain map byte-for-byte unchanged.
++                 * Only the diagnostic roughness measurement is reduced from a second
++                 * 12.6 MP full-image walk to 12x8 sampled local pixel neighborhoods.
+                  */
+                 StringBuilder grid = new StringBuilder();
+                 final int gridW = 12;
+@@ -1071,14 +1061,6 @@ public final class MotionV2Render extends Node {
+                 pipeline.motionV2GainMapBitmap = gainMap;
+                 pipeline.motionV2GainMapMaxRatio = maxGainRatio;
+                 pipeline.motionV2GainMapFullHdrDisplayRatio = fullHdrDisplayRatio;
+-                final long iris26641AfterBitmapNs = System.nanoTime();
+-                Log.d(Name, "IRIS_26641_GAINMAP_TIMING"
+-                        + " drawMs=" + ((iris26641AfterDrawNs - iris26641GainStartNs) / 1_000_000.0)
+-                        + " readbackMs=" + ((iris26641AfterReadbackNs - iris26641AfterDrawNs) / 1_000_000.0)
+-                        + " scanMs=" + ((iris26641AfterScanNs - iris26641AfterReadbackNs) / 1_000_000.0)
+-                        + " bitmapMs=" + ((iris26641AfterBitmapNs - iris26641AfterScanNs) / 1_000_000.0)
+-                        + " totalMs=" + ((iris26641AfterBitmapNs - iris26641GainStartNs) / 1_000_000.0)
+-                        + " gainPixels=" + pixels);
+                 try {
+                     com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                             "IRIS_26596_UHDR_GAINMAP_CONTENT",
+@@ -1087,7 +1069,7 @@ public final class MotionV2Render extends Node {
+                                     + " actualPeakContentRatio=" + actualPeakContentRatio
+                                     + " fullHdrDisplayRatio=" + fullHdrDisplayRatio
+                                     + " capacityMatchesGainMapMax=true actualPeakContentRatio=" + actualPeakContentRatio
+-                                    + " bodyGainOwner=IRIS_26641_TRUE_MATCHED_SDR_HDR_INTENT_QUOTIENT"
++                                    + " bodyGainOwner=IRIS_26640_MATCHED_SDR_HDR_INTENT_QUOTIENT"
+                                     + " hdrGainSource=MATCHED_EXTENDED_LINEAR_SDR_HDR_INTENTS"
+                                     + " hdrEligibilityThreshold=false"
+                                     + " singleMatchAnchor=false fixedBodyGain=false nominalWhiteDiscontinuity=false"
+@@ -1113,15 +1095,14 @@ public final class MotionV2Render extends Node {
+                         + " provenance=actualGainMapBeforeJpegAttach"
+                         + " grid12x8=" + grid
+                         + " source=extendedLinearPreTone"
+-                        + " fullResolutionGainMap=false"
+-                        + " matchedIntentPreDivideDownsample=" + (!iris26550Night)
++                        + " fullResolutionGainMap=" + (!iris26550Night)
+                         + " downsample=" + gainDownsample
+                         + " widthFraction=" + (1.0f / gainDownsample)
+                         + " heightFraction=" + (1.0f / gainDownsample)
+                         + " nightPostJinRebaseRequired=" + iris26550Night
+                         + " quotientOffset=0.015625"
+                         + " standardLogGainEncoding=true"
+-                        + " gainMapResamplingRequired=true"
++                        + " gainMapResamplingRequired=false"
+                         + " reconstructionDetailAuthorityOwner="
+                         + basePipeline.mParameters.motionV2ReconstructionOwner
+                         + " pointDecimation=false"
+@@ -1130,10 +1111,10 @@ public final class MotionV2Render extends Node {
+                         + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                         + " motionHdrEligibilityThreshold=false"
+                         + " motionHdrGainIsScalarLuminanceOnly=true"
+-                        + " motionHdrGainEquation=IRIS_26641_TRUE_MATCHED_LINEAR_LUMINANCE_QUOTIENT"
++                        + " motionHdrGainEquation=IRIS_26640_MATCHED_LINEAR_LUMINANCE_QUOTIENT"
+                         + " motionHdrEligibilityDilation=false motionHdrPointwiseThreshold=false"
+                         + " motionHdrSingleMatchAnchor=false motionHdrFixedBodyGain=false"
+-                        + " IRIS_26641_MATCHED_INTENT_UHDR=true");
++                        + " IRIS_26640_MATCHED_INTENT_UHDR=true");
+             } finally {
+                 if (gainTexture != null) {
+                     try { gainTexture.close(); } catch (Throwable ignored) {}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
+index 8eec6d1d74df1674558e196342baa6bc2c3af461..fa9f17447a4ab92732c4fcf1d0370859dbd05655 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
+@@ -29,16 +29,6 @@ public final class IrisHardwareHevcEncoder {
+     private static final long IO_TIMEOUT_US = 5_000_000L;
+     private static final double MAX_COMPRESS_RATIO = 0.25;
+ 
+-    /* IRIS_26641_ANDROID16_HEIC_UHDR_HEVC_COLOR_ASPECTS
+-     * Android media's stable internal values: Display-P3 standard=10, sRGB transfer=2.
+-     * AOSP HEIC Ultra HDR publishes the base as EG432/sRGB/full-range and the gain map as
+-     * unspecified primaries/transfer/full-range. The HEIF item NCLX/ICC remains authoritative;
+-     * these values prevent the hardware HEVC SPS/VUI from contradicting that container contract. */
+-    private static final int IRIS_26641_COLOR_STANDARD_UNSPECIFIED = 0;
+-    private static final int IRIS_26641_COLOR_STANDARD_DISPLAY_P3 = 10;
+-    private static final int IRIS_26641_COLOR_TRANSFER_UNSPECIFIED = 0;
+-    private static final int IRIS_26641_COLOR_TRANSFER_SRGB = 2;
+-
+     private IrisHardwareHevcEncoder() {}
+ 
+     private static final class EncoderChoice {
+@@ -196,16 +186,11 @@ public final class IrisHardwareHevcEncoder {
+                     MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible);
+             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 0);
+             format.setInteger(MediaFormat.KEY_FRAME_RATE, 1);
+-            /* IRIS_26641_ANDROID16_HEIC_UHDR_HEVC_COLOR_ASPECTS
+-             * The public SDK omits the stable Display-P3 media-standard constant, but Android's
+-             * media ColorUtils has used value 10 for Display-P3 since Android 8. Match Android 16
+-             * HEIC Ultra HDR's base/gain-map signaling while preserving the libheif item metadata. */
+-            format.setInteger(MediaFormat.KEY_COLOR_STANDARD, gainMap
+-                    ? IRIS_26641_COLOR_STANDARD_UNSPECIFIED
+-                    : IRIS_26641_COLOR_STANDARD_DISPLAY_P3);
+-            format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, gainMap
+-                    ? IRIS_26641_COLOR_TRANSFER_UNSPECIFIED
+-                    : IRIS_26641_COLOR_TRANSFER_SRGB);
++            /* AOSP Ultra-HDR HEIC owns exact P3/gain-map color aspects at the HEIF item layer.
++             * Public MediaFormat has no Display-P3/EG432 constant, so do not inject a false BT.601
++             * or BT.709 primaries signal into the HEVC bitstream. Preserve full-range samples; the
++             * pinned libheif NCLX/ICC metadata is the color/transfer authority.
++             */
+             format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL);
+ 
+             MediaCodecInfo.EncoderCapabilities enc = caps.getEncoderCapabilities();
+@@ -262,15 +247,6 @@ public final class IrisHardwareHevcEncoder {
+                 int out = codec.dequeueOutputBuffer(bi, IO_TIMEOUT_US);
+                 if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                     MediaFormat of = codec.getOutputFormat();
+-                    int outStandard = of.containsKey(MediaFormat.KEY_COLOR_STANDARD)
+-                            ? of.getInteger(MediaFormat.KEY_COLOR_STANDARD) : -1;
+-                    int outTransfer = of.containsKey(MediaFormat.KEY_COLOR_TRANSFER)
+-                            ? of.getInteger(MediaFormat.KEY_COLOR_TRANSFER) : -1;
+-                    int outRange = of.containsKey(MediaFormat.KEY_COLOR_RANGE)
+-                            ? of.getInteger(MediaFormat.KEY_COLOR_RANGE) : -1;
+-                    Log.i(TAG, "IRIS_26641_HW_HEVC_COLOR_ASPECTS gainMap=" + gainMap
+-                            + " standard=" + outStandard + " transfer=" + outTransfer
+-                            + " range=" + outRange);
+                     for (int i = 0; i < 4; i++) {
+                         ByteBuffer csd = of.getByteBuffer("csd-" + i);
+                         if (csd == null) continue;
+diff --git a/app/version.properties b/app/version.properties
+index fa9ef82b7449e3e767f52190317e7bddf43ccd84..290d5c51f0253852317d5ea5a64e4ecad6b59927 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726641
+-VERSION_BUILD=26641
++VERSION_NAME=0.9726640
++VERSION_BUILD=26640
