@@ -1,0 +1,540 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 091c5af68a4971dd91580c5c3d8c1e87754a2f7f..34016f4d3060a2c0703fbbd7b88227a66aece337 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -9,6 +9,12 @@ uniform float displayGain;
+ uniform int motionHdrHandoff;
+ uniform float maxGainRatio;
+ uniform float irisOutputZoom;
++uniform sampler2D iris26621LocalToneLog;
++uniform int iris26621LocalToneEnabled;
++uniform float iris26623ToneBroadNearFraction;
++uniform float iris26623ToneHardFraction;
++uniform float iris26623ToneBaseSceneWhite;
++uniform float iris26623ToneAdaptiveSceneWhite;
+ /* IRIS_26524_UHDR_ZOOM_GEOMETRY_PARITY */
+ out float Output;
+ 
+@@ -22,20 +28,45 @@ out float Output;
+ const float UHDR_OFFSET = 0.015625;
+ float luminance(vec3 c){return dot(c,vec3(0.22897456,0.69173852,0.07928691));}
+ float max3(vec3 c){return max(c.r,max(c.g,c.b));}
+-float iris26639BaseGlobalSdrGuide(float sourceGuide){
+-    const float outputScale=0.80;
++float iris26640Smoothstep(float a,float b,float x){
++    float t=clamp((x-a)/max(b-a,1.0e-6),0.0,1.0);
++    return t*t*(3.0-2.0*t);
++}
++float iris26640HighlightPressure(){
++    float broad=iris26640Smoothstep(0.015,0.060,clamp(iris26623ToneBroadNearFraction,0.0,1.0));
++    float hard=iris26640Smoothstep(0.010,0.050,clamp(iris26623ToneHardFraction,0.0,1.0));
++    float baseWhite=max(iris26623ToneBaseSceneWhite,1.0);
++    float adaptiveWhite=max(iris26623ToneAdaptiveSceneWhite,baseWhite);
++    float span=max(adaptiveWhite/baseWhite-1.0,0.0);
++    float spanPressure=iris26640Smoothstep(0.08,0.35,span);
++    return clamp(max(0.70*broad+0.30*spanPressure,0.75*hard),0.0,1.0);
++}
++void iris26640LegacyBody(float x,float requested,out float value,out float derivative){
++    float whiteAnchor=min(0.95,requested);
++    float bodyGain=requested;
++    if(requested>whiteAnchor)bodyGain=min(requested,4.0*whiteAnchor-1.0e-4);
++    float safeWhite=max(whiteAnchor,1.0e-6);
++    float shoulderRatio=max(bodyGain/safeWhite-1.0,0.0);
++    float oneMinus=1.0-x;
++    float cubic=whiteAnchor*x+(bodyGain-whiteAnchor)*x*oneMinus*oneMinus;
++    float rational=bodyGain*x/(1.0+shoulderRatio*x);
++    float cubicDerivative=whiteAnchor+(bodyGain-whiteAnchor)*oneMinus*(1.0-3.0*x);
++    float rationalDerivative=bodyGain/((1.0+shoulderRatio*x)*(1.0+shoulderRatio*x));
++    value=0.5*(cubic+rational);
++    derivative=0.5*(cubicDerivative+rationalDerivative);
++}
++float iris26640LegacyMap(float sourceGuide){
+     float x=max(sourceGuide,0.0);
+-    float requested=max(displayGain,1.0e-6)*outputScale;
++    float requested=max(displayGain,1.0e-6)*hdrExposureScale;
+     float whiteAnchor=min(0.95,requested);
+     float bodyGain=requested;
+     if(requested>whiteAnchor)bodyGain=min(requested,4.0*whiteAnchor-1.0e-4);
+     float safeWhite=max(whiteAnchor,1.0e-6);
+     float shoulderRatio=max(bodyGain/safeWhite-1.0,0.0);
+     if(x<=1.0){
+-        float oneMinus=1.0-x;
+-        float cubic=whiteAnchor*x+(bodyGain-whiteAnchor)*x*oneMinus*oneMinus;
+-        float rational=bodyGain*x/(1.0+shoulderRatio*x);
+-        return 0.5*(cubic+rational);
++        float value=0.0; float derivative=0.0;
++        iris26640LegacyBody(x,requested,value,derivative);
++        return value;
+     }
+     float rationalSlope=bodyGain/((1.0+shoulderRatio)*(1.0+shoulderRatio));
+     float bodySlope=0.5*(whiteAnchor+rationalSlope);
+@@ -45,6 +76,53 @@ float iris26639BaseGlobalSdrGuide(float sourceGuide){
+     float excess=x-1.0;
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+ }
++float iris26640MapMotionSdrGuide(float sourceGuide){
++    float x=max(sourceGuide,0.0);
++    float requested=max(displayGain,1.0e-6)*hdrExposureScale;
++    float legacy=iris26640LegacyMap(x);
++    float adaptiveEnable=iris26640Smoothstep(1.05,1.25,requested);
++    const float upperStart=0.65;
++    if(adaptiveEnable<=1.0e-7 || x<=upperStart)return legacy;
++    float pressure=iris26640HighlightPressure();
++    float targetWhite=mix(0.945,0.925,pressure);
++    float targetSlope=mix(0.360,0.300,pressure);
++    float startValue=0.0; float startSlope=0.0;
++    iris26640LegacyBody(upperStart,requested,startValue,startSlope);
++    float width=1.0-upperStart;
++    float secant=(targetWhite-startValue)/width;
++    if(secant<=1.0e-6)return legacy;
++    float m0=max(startSlope,0.0);
++    float m1=max(targetSlope,0.0);
++    float a=m0/secant; float b=m1/secant;
++    float norm2=a*a+b*b;
++    if(norm2>9.0){float limiter=3.0/sqrt(norm2);m0*=limiter;m1*=limiter;}
++    float candidate;
++    if(x<=1.0){
++        float t=clamp((x-upperStart)/width,0.0,1.0);
++        float t2=t*t; float t3=t2*t;
++        candidate=(2.0*t3-3.0*t2+1.0)*startValue
++            +(t3-2.0*t2+t)*width*m0
++            +(-2.0*t3+3.0*t2)*targetWhite
++            +(t3-t2)*width*m1;
++    }else{
++        float reserve=max(1.0-targetWhite,0.0);
++        float tailScale=reserve/max(m1,1.0e-6);
++        float excess=x-1.0;
++        candidate=targetWhite+reserve*excess/(excess+tailScale);
++    }
++    return mix(legacy,candidate,adaptiveEnable);
++}
++float iris26640SharedSdrGuide(float sourceGuide,vec2 masterSourcePixel){
++    float globalMapped=iris26640MapMotionSdrGuide(sourceGuide);
++    if(iris26621LocalToneEnabled==0)return globalMapped;
++    vec2 toneSize=vec2(textureSize(iris26621LocalToneLog,0));
++    vec2 uv=(masterSourcePixel+vec2(0.5))/max(toneSize,vec2(1.0));
++    vec2 halfTexel=vec2(0.5)/max(toneSize,vec2(1.0));
++    float localLog=texture(iris26621LocalToneLog,clamp(uv,halfTexel,vec2(1.0)-halfTexel)).r;
++    float localMapped=exp2(clamp(localLog,-12.0,0.0));
++    float localStrength=smoothstep(0.030,0.100,globalMapped);
++    return mix(globalMapped,localMapped,localStrength);
++}
+ float srgbDecode(float x){x=clamp(x,0.0,1.0);return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);}
+ vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));}
+ 
+@@ -86,41 +164,45 @@ void main(){
+     float zoom=max(irisOutputZoom,1.0);
+     ivec2 sdrSize=textureSize(SdrBuffer,0);
+     vec2 sourcePixel=(vec2(p)+vec2(0.5))*vec2(sdrSize)/vec2(gainMapSize)-vec2(0.5);
++    vec2 masterSourcePixel=sourcePixel;
+     vec3 hdrRgb;
+     if(zoom<=1.00001){
+-        hdrRgb=iris26524BilinearHdr(sourcePixel);
++        hdrRgb=iris26524BilinearHdr(masterSourcePixel);
+     }else{
+         ivec2 hdrSize=textureSize(HdrBuffer,0);
+         vec2 center=(vec2(hdrSize)-vec2(1.0))*0.5;
+-        vec2 zoomedSource=center+(sourcePixel-center)/zoom;
+-        hdrRgb=iris26524BilinearHdr(zoomedSource);
++        masterSourcePixel=center+(sourcePixel-center)/zoom;
++        hdrRgb=iris26524BilinearHdr(masterSourcePixel);
+     }
+     vec3 hdrPositive=max(hdrRgb,vec3(0.0));
+     float sdr=max(luminance(srgbDecode(iris26550BilinearSdr(sourcePixel))),0.0);
+     float safeMax=max(maxGainRatio,1.001);
+     float ratio;
+     if(motionHdrHandoff!=0){
+-        /* IRIS_26639_SELECTIVE_RECOVERABLE_HEADROOM_UHDR
+-         * Ordinary SDR body is exact unity. Eligibility is pointwise/source-aligned and is never
+-         * spatially dilated, so a chandelier cannot lend gain to a darker neighbor. Desired gain is
+-         * derived from the same pre-tone max-channel/luma guide and the frozen 0.80 brightness target.
+-         * The actual SDR sample is used only as a one-sided ceiling: local tone/detail can REDUCE gain
+-         * to prevent an overshoot rim, but can never create extra gain or an HDR island. */
+-        const float hdrEntry=0.65;
+-        const float hdrFullEntry=0.85;
++        /* IRIS_26640_MATCHED_SDR_HDR_INTENT_QUOTIENT
++         * Both intents come from the same canonical extended-linear Motion master, same source
++         * sample, same 26623 global tone prerequisites, and the same Local-Laplacian structure.
++         * There is no luma eligibility threshold and no spatial gain dilation. The HDR intent
++         * departs from SDR only by the amount that the SDR rendition is actually compressing the
++         * shared linear-light target; weak body compression therefore collapses naturally to unity
++         * while broad real highlight compression participates coherently. */
+         float sourceY=max(luminance(hdrPositive),0.0);
+         float sourceGuide=max(sourceY,max3(hdrPositive));
+-        float eligibility=smoothstep(hdrEntry,hdrFullEntry,sourceGuide);
+-        if(sourceGuide<=hdrEntry || eligibility<=1.0e-7){
++        if(sourceGuide<=1.0e-7 || sourceY<=1.0e-9){
+             ratio=1.0;
+         }else{
+-            float globalSdr=max(iris26639BaseGlobalSdrGuide(sourceGuide),0.0);
++            float globalSdrGuide=max(iris26640MapMotionSdrGuide(sourceGuide),0.0);
++            float sharedSdrGuide=max(iris26640SharedSdrGuide(sourceGuide,masterSourcePixel),0.0);
++            float localStructureScale=globalSdrGuide>1.0e-7
++                ? sharedSdrGuide/globalSdrGuide : 1.0;
+             float requested=max(displayGain,1.0e-6)*hdrExposureScale;
+-            float recoverable=max(globalSdr,sourceY*requested);
+-            float desired=clamp((recoverable+UHDR_OFFSET)/(globalSdr+UHDR_OFFSET),1.0,safeMax);
+-            float pixelCeiling=clamp((recoverable+UHDR_OFFSET)/(sdr+UHDR_OFFSET),1.0,safeMax);
+-            float eligibleRatio=min(desired,pixelCeiling);
+-            ratio=clamp(exp2(log2(max(eligibleRatio,1.0))*eligibility),1.0,safeMax);
++            float sdrModelY=sourceY*(sharedSdrGuide/sourceGuide);
++            float linearTargetY=sourceY*requested*max(localStructureScale,0.0);
++            float compressedDelta=max(linearTargetY-sdrModelY,0.0);
++            float compressionFraction=linearTargetY>1.0e-7
++                ? clamp(compressedDelta/linearTargetY,0.0,1.0) : 0.0;
++            float hdrIntentY=sdr+compressedDelta*compressionFraction;
++            ratio=clamp((hdrIntentY+UHDR_OFFSET)/(sdr+UHDR_OFFSET),1.0,safeMax);
+         }
+     }else{
+         float hdrTargetScale=hdrExposureScale;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index e0e95e70b5838339c46a49e6a68580efd48a771f..12b59d47b6f04364f83eda344236401d3fcdbfc4 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -963,30 +963,48 @@ internal object GlesMgcRawSabreShaders {
+                 literalComponentConfidence, effectiveLossComponentConfidence);
+             int coherenceMeasurablePhases = int(measurablePhase.x + measurablePhase.y +
+                 measurablePhase.z + measurablePhase.w + 0.5);
++
++            /* IRIS_26640_LOCAL_SHORT_PROPAGATION_SUPPORT
++             * Component membership alone is never merge authority. Every non-seed cell that can
++             * carry boundary trust must independently prove local post-source-clip radiometry in
++             * at least two CFA phases across at least two local quads. This deliberately prevents
++             * a globally valid camera affine or a neighboring highlight boundary from painting
++             * SHORT into a moving/unsupported object interior. Fully unsupported clipped cores
++             * fail closed; valid stationary partial-clipping boundaries remain recoverable. */
++            float radiometricConfidence = anchorPhaseEvidence > 0
++                ? anchorConfidenceSum / float(anchorPhaseEvidence) : 0.0;
++            float componentObservationCoherence = clamp(
++                1.0 - max(secondHighest4(phaseContradiction), severeContradiction), 0.0, 1.0);
++            float localPropagationSupport = 0.0;
++            if (anchorQuadEvidence >= 2 && anchorPhaseEvidence >= 4
++                    && coherenceMeasurablePhases >= 2) {
++                localPropagationSupport = min(
++                    componentSourceConfidence,
++                    min(radiometricConfidence, componentObservationCoherence));
++            }
++            float propagationCeiling = min(componentConfidence, localPropagationSupport);
++
+             float anchorConfidence = 0.0;
+             if (anchorQuadEvidence >= 4 && anchorPhaseEvidence >= 8
+                     && coherenceMeasurablePhases >= 2
+                     && selectedGeometryProof > 0.0) {
+-                float radiometricConfidence =
+-                    anchorConfidenceSum / float(anchorPhaseEvidence);
+-                float componentObservationCoherence = clamp(
+-                    1.0 - max(secondHighest4(phaseContradiction), severeContradiction), 0.0, 1.0);
+                 anchorConfidence = min(
+                     componentSourceConfidence,
+                     min(selectedGeometryProof,
+                         min(radiometricConfidence, componentObservationCoherence)));
+             }
+             oAnchor = vec4(flowRawPixels / vec2(uRawSize),
+-                clamp(componentConfidence, 0.0, 1.0),
++                clamp(propagationCeiling, 0.0, 1.0),
+                 clamp(anchorConfidence, 0.0, 1.0));
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26607_CONNECTED_HIGHLIGHT_COMPONENT_PROPAGATION
+-     * Boundary trust is propagated across the physically bright/lost component with a bottleneck
+-     * min/max rule. Adjacent production-flow disagreement is a discontinuity barrier, not an
+-     * absolute registration metric. This prevents a validated bulb/cloud component from dying at
+-     * each interior cell while still failing closed across a strong local motion boundary.
++    /* IRIS_26640_LOCAL_GEOMETRY_SAFE_COMPONENT_PROPAGATION
++     * Boundary trust is propagated only across cells whose anchor.z is now a LOCAL propagation
++     * ceiling, not mere connected-component membership. The ceiling requires each destination
++     * cell's own post-source-clip radiometric support; adjacent flow compatibility remains an
++     * additional CFA/geometry barrier. Unsupported interiors and moving-object cells cannot inherit
++     * SHORT merely because they are connected to a valid stationary highlight boundary.
+      */
+     val shortComponentPropagate26607 = """
+         #version 300 es
+@@ -1014,20 +1032,20 @@ internal object GlesMgcRawSabreShaders {
+         void main() {
+             ivec2 p = clampGrid(ivec2(gl_FragCoord.xy));
+             vec4 anchor = texelFetch(uAnchor, p, 0);
+-            float componentConfidence = clamp(anchor.z, 0.0, 1.0);
++            float localPropagationCeiling = clamp(anchor.z, 0.0, 1.0);
+             float trust = clamp(anchor.w, 0.0, 1.0);
+-            if (componentConfidence > 0.0) {
++            if (localPropagationCeiling > 0.0) {
+                 ivec2 n0 = p + ivec2(-1, 0);
+                 ivec2 n1 = p + ivec2( 1, 0);
+                 ivec2 n2 = p + ivec2( 0,-1);
+                 ivec2 n3 = p + ivec2( 0, 1);
+-                trust = max(trust, min(componentConfidence,
++                trust = max(trust, min(localPropagationCeiling,
+                     min(trustAt(n0), compatibleFlow(p, n0))));
+-                trust = max(trust, min(componentConfidence,
++                trust = max(trust, min(localPropagationCeiling,
+                     min(trustAt(n1), compatibleFlow(p, n1))));
+-                trust = max(trust, min(componentConfidence,
++                trust = max(trust, min(localPropagationCeiling,
+                     min(trustAt(n2), compatibleFlow(p, n2))));
+-                trust = max(trust, min(componentConfidence,
++                trust = max(trust, min(localPropagationCeiling,
+                     min(trustAt(n3), compatibleFlow(p, n3))));
+             }
+             oTrust = trust;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 1a05185c1fd20df15b3678e73e0df01e630214af..7136a972e3c3decf9bea87f2946aaba10d642449 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -238,19 +238,12 @@ public final class MotionV2Render extends Node {
+         return hdrBase;
+     }
+ 
+-    /* IRIS_26639_SCENE_ADAPTIVE_UHDR_CAPACITY
+-     * Capacity follows useful recoverable upper-tail headroom from the already-sampled P99.8 guide.
+-     * It is never a denoise/exposure/capture authority. The per-pixel shader remains the stricter
+-     * owner and may encode exact unity everywhere even when metadata advertises this bounded range. */
+-    private static float iris26639MotionGainCapacity(Parameters p) {
+-        float guide = p.motionV2ToneP998Guide;
+-        if (!Float.isFinite(guide) || guide <= 0.0f) guide = p.motionV2ToneP99Guide;
+-        if (!Float.isFinite(guide) || guide <= 0.0f) return 2.0f;
+-        float globalSdr = iris26621MapMotionSdrFinalGuide(guide, p.motionV2DisplayGain);
+-        float requested = Math.max(p.motionV2DisplayGain, 1.0e-6f) * OUTPUT_EXPOSURE_SCALE;
+-        float recoverable = Math.max(globalSdr, guide * requested);
+-        float ratio = (recoverable + 0.015625f) / Math.max(globalSdr + 0.015625f, 1.0e-6f);
+-        return iris26582Clamp(ratio, 1.25f, IRIS_26592_MOTION_UHDR_MAX_RATIO);
++    /* IRIS_26640_MEASURED_GAINMAP_CAPACITY
++     * Motion first encodes against the already-supported 8x ceiling only to avoid clipping the
++     * quotient. The final ALPHA_8 map is then re-normalized to the actual measured peak ratio, and
++     * Android metadata advertises that same measured range. No P99/P99.8 proxy owns GainMapMax. */
++    private static float iris26640MotionGainEncodingCeiling() {
++        return IRIS_26592_MOTION_UHDR_MAX_RATIO;
+     }
+ 
+     public MotionV2Render() { super("", "MotionV2Render"); }
+@@ -883,6 +876,8 @@ public final class MotionV2Render extends Node {
+                 + " renderResidual=" + irisOutputZoom
+                 + " product=" + (reconstructionZoom * irisOutputZoom));
+         GLTexture iris26621LocalTone = iris26621BuildLocalLaplacianTone(extendedLinearHdr);
++        final boolean iris26640KeepLocalToneForGainMap = basePipeline.mParameters.motionV2Active
++                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+         /* IRIS_26630_PER_LENS_SATURATION_ROUTE
+          * Only the Motion graph owns the per-lens Iris Saturation snapshot. Night deliberately
+          * receives neutral 1.0; SR uses the same frozen Motion snapshot through the native encoder. */
+@@ -909,7 +904,7 @@ public final class MotionV2Render extends Node {
+             WorkingTexture = basePipeline.getMain();
+             glProg.drawBlocks(WorkingTexture);
+         } finally {
+-            if (iris26621LocalTone != null) {
++            if (iris26621LocalTone != null && !iris26640KeepLocalToneForGainMap) {
+                 try { iris26621LocalTone.close(); } catch (Throwable ignored) {}
+             }
+         }
+@@ -924,6 +919,7 @@ public final class MotionV2Render extends Node {
+          * rebases that relationship against the final post-Jin SDR before attaching JPEG_R.
+          */
+         final boolean iris26550Night = basePipeline.mParameters.irisNightActive;
++        try {
+         if ((basePipeline.mParameters.motionV2Active || iris26550Night)
+                 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+             /* IRIS_26470_UHDR_RENDER_GEOMETRY_AUTHORITY */
+@@ -939,7 +935,8 @@ public final class MotionV2Render extends Node {
+             float maxGainRatio = iris26550Night
+                     ? Math.max(2.0f, Math.min(2.5f, HDR_EXPOSURE_SCALE * postDisplaySensorWhite
+                             * mgcSourceExposureGain))
+-                    : iris26639MotionGainCapacity(basePipeline.mParameters);
++                    : iris26640MotionGainEncodingCeiling();
++            final float encodingMaxGainRatio = maxGainRatio;
+ 
+             GLTexture gainTexture = null;
+             try {
+@@ -957,7 +954,13 @@ public final class MotionV2Render extends Node {
+                 glProg.setVar("hdrExposureScale", HDR_EXPOSURE_SCALE);
+                 glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+                 glProg.setVar("motionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+-                glProg.setVar("maxGainRatio", maxGainRatio);
++                glProg.setVar("maxGainRatio", encodingMaxGainRatio);
++                glProg.setVar("iris26621LocalToneEnabled",
++                        basePipeline.mParameters.motionV2Active && iris26621LocalTone != null ? 1 : 0);
++                if (basePipeline.mParameters.motionV2Active && iris26621LocalTone != null) {
++                    glProg.setTexture("iris26621LocalToneLog", iris26621LocalTone);
++                }
++                iris26623SetAdaptiveUpperToneUniforms();
+ 
+                 glProg.setVar("irisOutputZoom", irisOutputZoom);
+                 glProg.drawBlocks(gainTexture);
+@@ -972,12 +975,33 @@ public final class MotionV2Render extends Node {
+                 int pixels = gainSize.x * gainSize.y;
+                 ByteBuffer alpha = ByteBuffer.allocateDirect(pixels);
+                 int nonUnity = 0;
+-                int peakCode = 0;
++                int encodedPeakCode = 0;
+                 for (int i = 0; i < pixels; i++) {
+                     int code = rgba.get(i) & 0xff;
+                     if (code > 0) nonUnity++;
+-                    peakCode = Math.max(peakCode, code);
+-                    alpha.put((byte)code);
++                    encodedPeakCode = Math.max(encodedPeakCode, code);
++                }
++                float actualPeakContentRatio = (float)Math.pow(
++                        Math.max(encodingMaxGainRatio, 1.001f), encodedPeakCode / 255.0f);
++                if (basePipeline.mParameters.motionV2Active) {
++                    maxGainRatio = encodedPeakCode > 0
++                            ? Math.max(1.001f, Math.min(IRIS_26592_MOTION_UHDR_MAX_RATIO,
++                                    actualPeakContentRatio))
++                            : 1.001f;
++                }
++                int peakCode = 0;
++                final double logEncodingMax = Math.log(Math.max(encodingMaxGainRatio, 1.001f));
++                final double logDeclaredMax = Math.log(Math.max(maxGainRatio, 1.001f));
++                for (int i = 0; i < pixels; i++) {
++                    int encodedCode = rgba.get(i) & 0xff;
++                    int outputCode = encodedCode;
++                    if (basePipeline.mParameters.motionV2Active && encodedCode > 0) {
++                        double ratioAtPixel = Math.exp(logEncodingMax * encodedCode / 255.0);
++                        outputCode = (int)Math.round(255.0 * Math.log(ratioAtPixel) / logDeclaredMax);
++                        outputCode = Math.max(0, Math.min(255, outputCode));
++                    }
++                    peakCode = Math.max(peakCode, outputCode);
++                    alpha.put((byte)outputCode);
+                 }
+                 alpha.position(0);
+ 
+@@ -1005,16 +1029,16 @@ public final class MotionV2Render extends Node {
+                         int sx = Math.min(gainSize.x - 1,
+                                 (int)(((gx + 0.5f) * gainSize.x) / gridW));
+                         int idx = sy * gainSize.x + sx;
+-                        int code = rgba.get(idx) & 0xff;
++                        int code = alpha.get(idx) & 0xff;
+                         if (code < 16) grid.append('0');
+                         grid.append(Integer.toHexString(code));
+                         if (sx + 1 < gainSize.x) {
+-                            int right = rgba.get(idx + 1) & 0xff;
++                            int right = alpha.get(idx + 1) & 0xff;
+                             roughSum += Math.abs(code - right);
+                             roughCount++;
+                         }
+                         if (sy + 1 < gainSize.y) {
+-                            int down = rgba.get(idx + gainSize.x) & 0xff;
++                            int down = alpha.get(idx + gainSize.x) & 0xff;
+                             roughSum += Math.abs(code - down);
+                             roughCount++;
+                         }
+@@ -1030,9 +1054,7 @@ public final class MotionV2Render extends Node {
+                         Bitmap.Config.ALPHA_8);
+                 gainMap.copyPixelsFromBuffer(alpha);
+ 
+-                float actualPeakContentRatio = (float)Math.pow(
+-                        Math.max(maxGainRatio, 1.001f), peakCode / 255.0f);
+-                /* IRIS_26632_UHDR_CAPACITY_EQUALS_ENCODING_RANGE
++                /* IRIS_26640_UHDR_CAPACITY_EQUALS_MEASURED_STORED_RANGE
+                  * Capacity describes the display range over which the encoded gain map is
+                  * progressively applied; it is not the current scene's measured peak code. */
+                 float fullHdrDisplayRatio = maxGainRatio;
+@@ -1047,10 +1069,9 @@ public final class MotionV2Render extends Node {
+                                     + " actualPeakContentRatio=" + actualPeakContentRatio
+                                     + " fullHdrDisplayRatio=" + fullHdrDisplayRatio
+                                     + " capacityMatchesGainMapMax=true actualPeakContentRatio=" + actualPeakContentRatio
+-                                    + " bodyGainOwner=IRIS_26639_SELECTIVE_RECOVERABLE_HEADROOM"
+-                                    + " hdrGainSource=POST_VGN_MAX_GUIDE_UPPER_TONE_RECOVERY"
+-                                    + " hdrGainEntry=" + IRIS_26623_UPPER_TONE_START
+-                                    + " hdrGainFullEntry=0.85"
++                                    + " bodyGainOwner=IRIS_26640_MATCHED_SDR_HDR_INTENT_QUOTIENT"
++                                    + " hdrGainSource=MATCHED_EXTENDED_LINEAR_SDR_HDR_INTENTS"
++                                    + " hdrEligibilityThreshold=false"
+                                     + " singleMatchAnchor=false fixedBodyGain=false nominalWhiteDiscontinuity=false"
+                                     + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                                     + " hdrExposureScale=" + HDR_EXPOSURE_SCALE);
+@@ -1088,19 +1109,23 @@ public final class MotionV2Render extends Node {
+                         + " postAliasSpikeRepair=false"
+                         + " sdrBaseDetailAuthority=true colorAuthority=SDR_BASE_ONLY"
+                         + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+-                        + " motionHdrGainEntry=" + IRIS_26623_UPPER_TONE_START
+-                        + " motionHdrGainFullEntry=0.85"
++                        + " motionHdrEligibilityThreshold=false"
+                         + " motionHdrGainIsScalarLuminanceOnly=true"
+-                        + " motionHdrGainEquation=IRIS_26639_SELECTIVE_PER_PIXEL_RECOVERABLE_HEADROOM"
+-                        + " motionHdrEligibilityDilation=false motionHdrPerPixelCeiling=true"
++                        + " motionHdrGainEquation=IRIS_26640_MATCHED_LINEAR_LUMINANCE_QUOTIENT"
++                        + " motionHdrEligibilityDilation=false motionHdrPointwiseThreshold=false"
+                         + " motionHdrSingleMatchAnchor=false motionHdrFixedBodyGain=false"
+-                        + " IRIS_26639_SELECTIVE_UHDR=true");
++                        + " IRIS_26640_MATCHED_INTENT_UHDR=true");
+             } finally {
+                 if (gainTexture != null) {
+                     try { gainTexture.close(); } catch (Throwable ignored) {}
+                 }
+             }
+         }
++        } finally {
++            if (iris26640KeepLocalToneForGainMap && iris26621LocalTone != null) {
++                try { iris26621LocalTone.close(); } catch (Throwable ignored) {}
++            }
++        }
+ 
+         glProg.closed = true;
+ 
+@@ -1134,9 +1159,9 @@ public final class MotionV2Render extends Node {
+                     + " localToneDetailAlpha=1.0"
+                     + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                     + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+-                    + " oneMasterRendition=true"
+-                    + " uhdrBodyGainOwner=CONTINUOUS_OUTPUT_REFERRED_SCALAR_EXPANSION"
+-                    + " uhdrGainOwner=POST_VGN_LUMINANCE_GUIDED_DISPLAY_EXPANSION"
++                    + " matchedSdrHdrRenditions=true"
++                    + " uhdrBodyGainOwner=MATCHED_LINEAR_INTENTS"
++                    + " uhdrGainOwner=LINEAR_LUMINANCE_QUOTIENT_1_OVER_64"
+                     + " superResToneParity=true");
+         }
+ 
+@@ -1180,9 +1205,8 @@ public final class MotionV2Render extends Node {
+                 + " outputExposureEv=-0.321928"
+                 + " hdrTargetUsesSameScale=true"
+                 + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+-                + " hdrGainEntry=" + IRIS_26623_UPPER_TONE_START
+-                + " hdrGainFullEntry=0.85"
+-                + " uhdrLuminanceOnly=true uhdrSelectiveRecoverableHeadroom=true"
++                + " hdrEligibilityThreshold=false"
++                + " uhdrLuminanceOnly=true uhdrMatchedIntentQuotient=true"
+                 + " IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS=true"
+                 + " syntheticBitmapGainMap=false"
+                 + " irisOutputZoom=" + irisOutputZoom
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
+index 334a6ab392e865b7201fab98870bd267d033012c..0608ded6b1cf71a7ceb5cdc2ed91e6e65a98bd86 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2UltraHdr.java
+@@ -97,8 +97,10 @@ public final class MotionV2UltraHdr {
+              * metadata capacity does not brighten the body; it only prevents the previous 2.5x
+              * ceiling from truncating valid -2.5EV SHORT recovery (5.657x physical headroom).
+              */
+-            float safeMax = Math.max(1.50f, Math.min(8.0f, maxRatio));
+-            /* IRIS_26632_UHDR_CAPACITY_EQUALS_ENCODING_RANGE
++            float safeMax = motionCapacityAuthority
++                    ? Math.max(1.001f, Math.min(8.0f, maxRatio))
++                    : Math.max(1.50f, Math.min(8.0f, maxRatio));
++            /* IRIS_26640_UHDR_CAPACITY_EQUALS_MEASURED_STORED_RANGE
+              * Motion advertises the same full-HDR display capacity as the gain-map encoding range.
+              * The scene's current peak gain remains content, not metadata capacity. Night retains
+              * its frozen requested-capacity policy. */
+@@ -145,13 +147,13 @@ public final class MotionV2UltraHdr {
+                     + " ratioMaxIndependentFromFullDisplayRatio=" + safeMax
+                     + " motionCapacityAuthority=" + motionCapacityAuthority
+                     + " capacityMatchesGainMapMax=" + motionCapacityAuthority
+-                    + " IRIS_26632_UHDR_ENCODING_CAPACITY_AUTHORITY=" + motionCapacityAuthority
++                    + " IRIS_26640_UHDR_MEASURED_CAPACITY_AUTHORITY=" + motionCapacityAuthority
+                     + " epsilonSdr=0.015625"
+                     + " epsilonHdr=0.015625"
+                     + " gamma=1.0"
+                     + " metadataProfile=AndroidUltraHdr_v1_1_AdobeHdrgm"
+                     + " standardCapacityRange=true"
+-                    + " source=V2ExtendedLinearBroadRendition"
++                    + " source=V2MatchedSdrHdrLinearIntentQuotient"
+                     + " gainOwner=HEALTHY_HDR_MASTER_VS_SDR");
+             return attached;
+         } catch (Exception t) {
+diff --git a/app/version.properties b/app/version.properties
+index 7576a6cf3065e1881f04f88d541bd391949572f4..290d5c51f0253852317d5ea5a64e4ecad6b59927 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726639
+-VERSION_BUILD=26639
++VERSION_NAME=0.9726640
++VERSION_BUILD=26640
