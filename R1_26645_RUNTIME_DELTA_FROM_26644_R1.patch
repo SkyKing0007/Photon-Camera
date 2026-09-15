@@ -1,0 +1,414 @@
+diff --git a/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl b/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
+index cecffc7cb37591d375a8bc1969c3560d75576f1b..b9d0cfe1e6687f0a298846388e167ea9e121376f 100644
+--- a/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
++++ b/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
+@@ -94,6 +94,32 @@ float iris26644SourceStructure(ivec2 p){
+     }
+     return smoothstep(0.0035,0.020,evidence);
+ }
++/* IRIS_26645_VISUAL_TEXTURE_ENERGY_OWNER
++ * 26644's balanced-curvature proof is intentionally conservative and misses stochastic but coherent
++ * grass/pine-straw/foliage texture. Require at least two directional neighbors at two local scales;
++ * a single material boundary cannot qualify. All support fails closed at image borders. */
++float iris26645SourceTexture(ivec2 p){
++    ivec2 sz=textureSize(SourceLinear,0);
++    float center=log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p,0).rgb),IRIS_26626_LOG_FLOOR));
++    float evidence=0.0;
++    for(int k=0;k<2;k++){
++        int r=k==0?2:6;
++        if(p.x-r<0||p.x+r>=sz.x||p.y-r<0||p.y+r>=sz.y) continue;
++        float dl=abs(center-log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p-ivec2(r,0),0).rgb),IRIS_26626_LOG_FLOOR)));
++        float dr=abs(center-log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p+ivec2(r,0),0).rgb),IRIS_26626_LOG_FLOOR)));
++        float du=abs(center-log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p-ivec2(0,r),0).rgb),IRIS_26626_LOG_FLOOR)));
++        float dd=abs(center-log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p+ivec2(0,r),0).rgb),IRIS_26626_LOG_FLOOR)));
++        float first=0.0,second=0.0;
++        float ds[4]=float[4](dl,dr,du,dd);
++        for(int i=0;i<4;i++){
++            float v=ds[i];
++            if(v>=first){second=first;first=v;}
++            else if(v>second){second=v;}
++        }
++        evidence=max(evidence,second);
++    }
++    return smoothstep(0.010,0.055,evidence);
++}
+ 
+ void main(){
+     ivec2 p=ivec2(gl_FragCoord.xy);
+@@ -136,8 +162,14 @@ void main(){
+          * bright fields; strong slats/folds/specular geometry retain unit weight. */
+         float upperGate=smoothstep(0.65,0.985,baseLinear);
+         float shoulderGate=smoothstep(0.70,0.985,baseLinear);
++        float sourceStructureGate=max(iris26644SourceStructure(p),iris26645SourceTexture(p));
+         float smoothShoulder=1.0-pow(max(1.0-baseLinear,0.0),1.12);
+-        float baseOut=mix(baseLinear,smoothShoulder,0.55*shoulderGate);
++        /* IRIS_26645_STRUCTURE_AWARE_HIGHLIGHT_BASE
++         * Smooth bright illumination keeps the successful 26635 shoulder. Real source texture
++         * retains more base headroom so grass/pavement/fabric is not lifted into one pale plateau. */
++        float structureShoulderScale=1.0-0.72*sourceStructureGate;
++        float baseOut=mix(baseLinear,smoothShoulder,
++            0.55*shoulderGate*structureShoulderScale);
+ 
+         /* IRIS_26639_SIGNAL_DRIVEN_SHADOW_BASE
+          * Correct only the low-frequency base B. The 0.05 true-floor endpoint and the scene-derived
+@@ -152,14 +184,22 @@ void main(){
+         float bodyScale=exp2(-0.25*bodyStrength*bodyBump);
+         float shadowBase=baseOut*bodyScale;
+         float structureGate=smoothstep(0.012,0.045,abs(residual));
+-        float sourceStructureGate=iris26644SourceStructure(p);
+         float smallResidualWeight=mix(1.0,0.78,upperGate);
+         /* IRIS_26644_VISUAL_HIGHLIGHT_STRUCTURE_PRESERVATION
+          * Keep 26635 suppression only for genuinely smooth bright-field residuals. If the
+          * pre-tone source independently proves real local structure, preserve that residual. */
+         float residualWeight=mix(
+                 smallResidualWeight,1.0,max(structureGate,sourceStructureGate));
+-        float outLinear=clamp(shadowBase+residualWeight*residual,IRIS_26626_LOG_FLOOR,1.0);
++        float weightedResidual=residualWeight*residual;
++        float candidateLinear=shadowBase+weightedResidual;
++        /* IRIS_26645_STRUCTURAL_HEADROOM_RESERVATION
++         * When real pre-tone structure would otherwise hit the display ceiling, lower only B by
++         * exactly the proven positive overshoot. R remains unchanged, so the saved SDR retains its
++         * local separation instead of becoming a clipped-looking sub-white plateau. */
++        float positiveOvershoot=max(candidateLinear-0.997,0.0);
++        float protectedBase=max(shadowBase-sourceStructureGate*positiveOvershoot,
++            IRIS_26626_LOG_FLOOR);
++        float outLinear=clamp(protectedBase+weightedResidual,IRIS_26626_LOG_FLOOR,1.0);
+         Output=log2(outLinear);
+         return;
+     }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 2d77de72a9879ce1180a3dbf2d739c47995a6621..554637efc790b12fee47238fb3971233d6e8723c 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -875,6 +875,19 @@ internal object GlesMgcRawSabreShaders {
+             float anchorConfidenceSum = 0.0;
+             int anchorPhaseEvidence = 0;
+             int anchorQuadEvidence = 0;
++            /* IRIS_26645_VISUAL_HIGH_RADIANCE_COMPONENT_EVIDENCE
++             * A visually flattened bright region is not defined by sensor clipping. Measure the
++             * SAME spatial probes in NORMAL and exposure-normalized SHORT, in the same RAW/CFA
++             * radiometric domain. SHORT may request authority only when it carries materially more
++             * spatial separation while remaining correlated with NORMAL, or when NORMAL is locally
++             * flat but SHORT has strong structure under independently validated geometry. */
++            float visualRefLogSum = 0.0;
++            float visualShortLogSum = 0.0;
++            float visualRefLogSqSum = 0.0;
++            float visualShortLogSqSum = 0.0;
++            float visualCrossSum = 0.0;
++            float visualHighSignalSum = 0.0;
++            int visualSampleCount = 0;
+             /* IRIS_26638_COMPONENT_OWNED_WHOLE_OBSERVATION_COHERENCE
+              * 26633's contradiction evidence now belongs to the measurable component boundary,
+              * never to each censored interior cell. Preserve its Bayer-wide semantics by reducing
+@@ -909,6 +922,22 @@ internal object GlesMgcRawSabreShaders {
+                         componentSourceConfidence = max(
+                             componentSourceConfidence, probeSourceConfidence);
+                     }
++                    if (hasShort && probeSourceConfidence > 0.0) {
++                        float visualRef = max(referenceSecond, 0.03);
++                        float visualShort = max(shortSecond, 0.03);
++                        float visualHigh = max(visualRef, visualShort);
++                        if (visualHigh >= 0.30) {
++                            float lr = log2(visualRef);
++                            float ls = log2(visualShort);
++                            visualRefLogSum += lr;
++                            visualShortLogSum += ls;
++                            visualRefLogSqSum += lr * lr;
++                            visualShortLogSqSum += ls * ls;
++                            visualCrossSum += lr * ls;
++                            visualHighSignalSum += visualHigh;
++                            visualSampleCount += 1;
++                        }
++                    }
+ 
+                     int literalPhasesHere = 0;
+                     for (int phase = 0; phase < 4; ++phase) {
+@@ -970,8 +999,36 @@ internal object GlesMgcRawSabreShaders {
+              * exclusively through unchanged w and the CFA-safe bottleneck propagation below. */
+             float literalComponentConfidence = min(
+                 componentSourceConfidence, literalLossSeen);
++
++            /* IRIS_26645_VISUAL_HIGH_RADIANCE_COMPONENT_OWNER
++             * Use spatial statistics rather than a brightness/clipping code. At least twelve
++             * independently source-valid probes must cover the cell. Correlation proves the same
++             * scene structure; SHORT must retain materially more log-radiance separation. A second
++             * path handles a genuinely flattened NORMAL cell only when SHORT structure is strong,
++             * source-valid, and the already-selected geometry is independently trustworthy. */
++            float visualStructureComponentConfidence = 0.0;
++            if (visualSampleCount >= 12) {
++                float n = float(visualSampleCount);
++                float meanR = visualRefLogSum / n;
++                float meanS = visualShortLogSum / n;
++                float varR = max(visualRefLogSqSum / n - meanR * meanR, 0.0);
++                float varS = max(visualShortLogSqSum / n - meanS * meanS, 0.0);
++                float cov = visualCrossSum / n - meanR * meanS;
++                float stdR = sqrt(varR);
++                float stdS = sqrt(varS);
++                float corr = cov / max(sqrt(max(varR * varS, 0.0)), 1.0e-5);
++                float meanHigh = visualHighSignalSum / n;
++                float highGate = smoothstep(0.38, 0.62, meanHigh);
++                float shortStructure = smoothstep(0.035, 0.11, stdS);
++                float shortAdvantage = smoothstep(0.012, 0.070, stdS - 1.03 * stdR);
++                float patternProof = smoothstep(0.70, 0.92, corr);
++                visualStructureComponentConfidence = min(
++                    componentSourceConfidence,
++                    highGate * shortStructure * shortAdvantage * patternProof);
++            }
+             float componentConfidence = max(
+-                literalComponentConfidence, effectiveLossComponentConfidence);
++                max(literalComponentConfidence, effectiveLossComponentConfidence),
++                visualStructureComponentConfidence);
+             int coherenceMeasurablePhases = int(measurablePhase.x + measurablePhase.y +
+                 measurablePhase.z + measurablePhase.w + 0.5);
+ 
+@@ -1004,6 +1061,14 @@ internal object GlesMgcRawSabreShaders {
+                     min(selectedGeometryProof,
+                         min(radiometricConfidence, componentObservationCoherence)));
+             }
++            /* IRIS_26645_VISUAL_STRUCTURE_GEOMETRY_SEED
++             * Unlike the old loss gate, this owner validates the SAME high-radiance spatial pattern
++             * across the 5x5 cell. That pattern proof plus the existing local/robust-affine geometry
++             * is sufficient to seed only this cell; no unrelated boundary or spatial fill is used. */
++            float visualGeometryTrust = min(
++                visualStructureComponentConfidence, selectedGeometryProof);
++            propagationCeiling = max(propagationCeiling, visualGeometryTrust);
++            anchorConfidence = max(anchorConfidence, visualGeometryTrust);
+             oAnchor = vec4(flowRawPixels / vec2(uRawSize),
+                 clamp(propagationCeiling, 0.0, 1.0),
+                 clamp(anchorConfidence, 0.0, 1.0));
+@@ -1306,6 +1371,71 @@ internal object GlesMgcRawSabreShaders {
+             }
+             return max(secondHighest4(phaseLoss), severeSingle);
+         }
++        /* IRIS_26645_PER_PIXEL_VISUAL_RADIANCE_PROOF
++         * Component trust is necessary but not sufficient. Re-prove locally that exposure-normalized
++         * SHORT carries the same spatial direction with materially more high-radiance separation.
++         * All four +/- supports must physically exist; borders fail closed. */
++        bool referenceNormalizedAtUv(vec2 uv, out vec4 normalized) {
++            vec2 position = uv * vec2(uExtractedSize) - vec2(0.5);
++            ivec2 p = ivec2(floor(position + vec2(0.5)));
++            if (p.x < 0 || p.y < 0 || p.x >= uExtractedSize.x || p.y >= uExtractedSize.y) {
++                normalized = vec4(0.0);
++                return false;
++            }
++            normalized = normalizedQuad(
++                texelFetch(uReferenceExtractedBayer, p, 0), uReferenceBlackByPhase);
++            return true;
++        }
++        bool shortNormalizedAtUv(vec2 uv, out vec4 normalized) {
++            vec4 raw = vec4(0.0);
++            vec4 peak = vec4(0.0);
++            if (!shortWarpUvValid(uv) || !shortPhaseSupport(uv, raw, peak)) {
++                normalized = vec4(0.0);
++                return false;
++            }
++            if (wholeShortHeadroom(peak) <= 0.0) {
++                normalized = vec4(0.0);
++                return false;
++            }
++            normalized = normalizedQuad(raw, uShortBlackByPhase) * uExposureRatio;
++            return true;
++        }
++        float guideLog(vec4 normalized) {
++            return log2(max(secondHighest4(normalized), 0.03));
++        }
++        float visualRadianceEvidence(vec2 referenceUv, vec2 warpedUv) {
++            vec2 texel = vec2(1.0) / vec2(uExtractedSize);
++            vec4 rc = vec4(0.0), sc = vec4(0.0);
++            if (!referenceNormalizedAtUv(referenceUv, rc) || !shortNormalizedAtUv(warpedUv, sc))
++                return 0.0;
++            float highGate = smoothstep(0.38, 0.62,
++                max(secondHighest4(rc), secondHighest4(sc)));
++            if (highGate <= 0.0) return 0.0;
++            float best = 0.0;
++            for (int radius = 1; radius <= 2; ++radius) {
++                vec2 dx = vec2(float(radius), 0.0) * texel;
++                vec2 dy = vec2(0.0, float(radius)) * texel;
++                vec4 rl, rr, ru, rd, sl, sr, su, sd;
++                if (!referenceNormalizedAtUv(referenceUv - dx, rl)
++                        || !referenceNormalizedAtUv(referenceUv + dx, rr)
++                        || !referenceNormalizedAtUv(referenceUv - dy, ru)
++                        || !referenceNormalizedAtUv(referenceUv + dy, rd)
++                        || !shortNormalizedAtUv(warpedUv - dx, sl)
++                        || !shortNormalizedAtUv(warpedUv + dx, sr)
++                        || !shortNormalizedAtUv(warpedUv - dy, su)
++                        || !shortNormalizedAtUv(warpedUv + dy, sd)) continue;
++                vec2 gradR = vec2(guideLog(rr) - guideLog(rl), guideLog(rd) - guideLog(ru));
++                vec2 gradS = vec2(guideLog(sr) - guideLog(sl), guideLog(sd) - guideLog(su));
++                float magR = length(gradR);
++                float magS = length(gradS);
++                float sameDirection = dot(gradR, gradS) / max(magR * magS, 1.0e-5);
++                float correlation = smoothstep(0.55, 0.90, sameDirection);
++                float shortStructure = smoothstep(0.040, 0.16, magS);
++                float advantage = smoothstep(0.015, 0.10, magS - 1.03 * magR);
++                best = max(best, highGate * shortStructure * advantage * correlation);
++            }
++            return clamp(best, 0.0, 1.0);
++        }
+         /* IRIS_26638_COMPONENT_COHERENCE_ALREADY_PROPAGATED
+          * Whole-observation contradiction is now measured only at validated same-CFA component
+          * boundaries and propagated through componentTrust. Censored interiors never fail-open
+@@ -1359,7 +1489,8 @@ internal object GlesMgcRawSabreShaders {
+ 
+             float literalLoss = literalLossWeight(referenceRaw, scaledShort, shortPeakRaw);
+             float effectiveLoss = effectiveLossWeight(referenceNormalized, scaledShort);
+-            float targetLoss = clamp(max(literalLoss, effectiveLoss), 0.0, 1.0);
++            float visualHighRadiance = visualRadianceEvidence(referenceUv, warpedUv);
++            float targetLoss = clamp(max(max(literalLoss, effectiveLoss), visualHighRadiance), 0.0, 1.0);
+             float shortHeadroom = wholeShortHeadroom(shortPeakRaw);
+             float componentTrust = clamp(texture(uComponentTrust, flowUv).r, 0.0, 1.0);
+             /* IRIS_26611_BOUNDARY_PROVEN_SHORT_RESCUE_ONLY
+@@ -1391,7 +1522,13 @@ internal object GlesMgcRawSabreShaders {
+             float literalFinalWeight = mix(
+                 ordinaryWeight, censoredCoreWeight, physicalCensoring);
+             float effectiveRescueWeight = censoredCoreWeight * clamp(effectiveLoss, 0.0, 1.0);
+-            float finalWeight = max(literalFinalWeight, effectiveRescueWeight);
++            /* IRIS_26645_VISUAL_HIGH_RADIANCE_WEIGHT_OWNER
++             * Do not multiply trusted visual structure by the old 5..12% loss gate. A pixel that
++             * independently proves better SHORT separation may receive consequential common-Sabre
++             * weight, still bounded by physical rejection, SHORT headroom, component geometry and
++             * the unchanged downstream common source-clipping veto. */
++            float visualRescueWeight = censoredCoreWeight * clamp(visualHighRadiance, 0.0, 1.0);
++            float finalWeight = max(max(literalFinalWeight, effectiveRescueWeight), visualRescueWeight);
+             oWeight = clamp(finalWeight, 0.0, 1.0);
+             oRescueOnlyWeight = clamp(max(finalWeight - ordinaryWeight, 0.0), 0.0, 1.0);
+             oLossCandidate = targetLoss;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
+index c617a5cf3545e72c04654503d3898516962cbaa6..1a5faf925215fc059c63c0f926d01d165d017672 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
+@@ -1,6 +1,7 @@
+ package com.particlesdevs.photoncamera.processing.ultrahdr;
+ 
+ import android.graphics.Bitmap;
++import android.graphics.BitmapFactory;
+ import android.graphics.ColorSpace;
+ import android.graphics.Gainmap;
+ import android.os.Build;
+@@ -24,6 +25,73 @@ public final class IrisHeicUltraHdrEncoder {
+ 
+     private IrisHeicUltraHdrEncoder() {}
+ 
++    /* IRIS_26645_ANDROID_HEIC_ULTRAHDR_READBACK_CONTRACT
++     * Publication is successful only if Android decodes the exact saved HEIC as Ultra HDR and
++     * reconstructs the same gain-map metadata/content geometry. This converts 26642's asynchronous
++     * diagnostic into a fail-closed file contract without recomputing or retuning the gain map. */
++    private static boolean iris26645NearlyEqual(float a, float b) {
++        if (!Float.isFinite(a) || !Float.isFinite(b)) return false;
++        float scale = Math.max(1.0f, Math.max(Math.abs(a), Math.abs(b)));
++        return Math.abs(a - b) <= 0.025f * scale;
++    }
++
++    private static boolean iris26645ArrayEquivalent(float[] expected, float[] actual) {
++        if (expected == null || actual == null || expected.length < 3 || actual.length < 3) return false;
++        for (int i = 0; i < 3; ++i) {
++            if (!iris26645NearlyEqual(expected[i], actual[i])) return false;
++        }
++        return true;
++    }
++
++    private static boolean iris26645VerifyPlatformReadback(Path output, Gainmap expected) {
++        Bitmap decoded = null;
++        try {
++            decoded = BitmapFactory.decodeFile(output.toAbsolutePath().toString());
++            if (decoded == null || decoded.isRecycled() || !decoded.hasGainmap()) {
++                Log.e(TAG, "IRIS_26645_HEIC_READBACK missing Android Gainmap");
++                return false;
++            }
++            ColorSpace cs = decoded.getColorSpace();
++            if (cs == null || !cs.equals(ColorSpace.get(ColorSpace.Named.DISPLAY_P3))) {
++                Log.e(TAG, "IRIS_26645_HEIC_READBACK base colorSpace="
++                        + (cs == null ? "null" : cs.getName()));
++                return false;
++            }
++            Gainmap actual = decoded.getGainmap();
++            Bitmap expectedContents = expected.getGainmapContents();
++            Bitmap actualContents = actual == null ? null : actual.getGainmapContents();
++            boolean geometry = expectedContents != null && actualContents != null
++                    && expectedContents.getWidth() == actualContents.getWidth()
++                    && expectedContents.getHeight() == actualContents.getHeight();
++            boolean metadata = actual != null
++                    && iris26645ArrayEquivalent(expected.getRatioMin(), actual.getRatioMin())
++                    && iris26645ArrayEquivalent(expected.getRatioMax(), actual.getRatioMax())
++                    && iris26645ArrayEquivalent(expected.getGamma(), actual.getGamma())
++                    && iris26645ArrayEquivalent(expected.getEpsilonSdr(), actual.getEpsilonSdr())
++                    && iris26645ArrayEquivalent(expected.getEpsilonHdr(), actual.getEpsilonHdr())
++                    && iris26645NearlyEqual(expected.getMinDisplayRatioForHdrTransition(),
++                            actual.getMinDisplayRatioForHdrTransition())
++                    && iris26645NearlyEqual(expected.getDisplayRatioForFullHdr(),
++                            actual.getDisplayRatioForFullHdr());
++            boolean ok = geometry && metadata;
++            Log.critical(TAG, "IRIS_26645_HEIC_READBACK decoded=true hasGainmap=true"
++                    + " p3=true geometry=" + geometry + " metadata=" + metadata
++                    + " expectedRatioMax=" + java.util.Arrays.toString(expected.getRatioMax())
++                    + " actualRatioMax=" + java.util.Arrays.toString(actual.getRatioMax())
++                    + " expectedFull=" + expected.getDisplayRatioForFullHdr()
++                    + " actualFull=" + actual.getDisplayRatioForFullHdr()
++                    + " gainmap=" + (actualContents == null ? "null"
++                    : actualContents.getWidth() + "x" + actualContents.getHeight())
++                    + " saved=" + ok);
++            return ok;
++        } catch (Throwable t) {
++            Log.e(TAG, "IRIS_26645_HEIC_READBACK_FAILED", t);
++            return false;
++        } finally {
++            if (decoded != null && !decoded.isRecycled()) decoded.recycle();
++        }
++    }
++
+     public static boolean write(Path output, Bitmap completedSdr, int quality, ParseExif.ExifData exif) {
+         if (Build.VERSION.SDK_INT < 36 || output == null || completedSdr == null
+                 || completedSdr.isRecycled() || !completedSdr.hasGainmap()) return false;
+@@ -61,6 +129,8 @@ public final class IrisHeicUltraHdrEncoder {
+                     exif == null ? null : exif.MAKE,
+                     exif == null ? null : exif.MODEL);
+             ok &= Files.isRegularFile(output) && Files.size(output) > 0L;
++            if (ok) ok = iris26645VerifyPlatformReadback(output, gm);
++            if (!ok) Files.deleteIfExists(output);
+             Log.i(TAG, "IRIS_26636_HEIC_ULTRAHDR_RESULT saved=" + ok
+                     + " p3=true existingGainmap=true recomputedGainmap=false path=" + output);
+             return ok;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 66c642d383b7efbae2dcc62d5ff3466a753e2875..5d6e44f79c5c4505789b9e96cf3d1af2e4420ce1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -292,6 +292,28 @@ public class CameraUIViewImpl implements CameraUIView {
+         }
+         View manualMode = root.findViewById(R.id.manual_mode);
+         if (manualMode != null) manualMode.setBackgroundResource(android.R.color.transparent);
++        /* IRIS_26645_MANUAL_KNOB_HALF_CIRCLE_REMOVED
++         * circularbarlib is repository-only scaffolding outside compiled app authority. Keep its
++         * ticks/text/touch behavior byte-untouched and neutralize only KnobView's private background
++         * Paint after inflation. Reflection targets our own bundled class, not a platform hidden API. */
++        final int knobId = root.getResources().getIdentifier("knobView", "id", packageName);
++        if (knobId != 0) {
++            View knob = root.findViewById(knobId);
++            if (knob != null) {
++                try {
++                    java.lang.reflect.Field backgroundPaint = knob.getClass()
++                            .getDeclaredField("m_BackgroundPaint");
++                    backgroundPaint.setAccessible(true);
++                    Object paintObject = backgroundPaint.get(knob);
++                    if (paintObject instanceof android.graphics.Paint) {
++                        ((android.graphics.Paint) paintObject).setColor(android.graphics.Color.TRANSPARENT);
++                        knob.invalidate();
++                    }
++                } catch (ReflectiveOperationException reflectionFailure) {
++                    Log.e(TAG, "IRIS_26645_MANUAL_KNOB_BACKGROUND_FAILED", reflectionFailure);
++                }
++            }
++        }
+         final String[] labelIds = {
+                 "focus_option_tv", "exposure_option_tv", "iso_option_tv", "ev_option_tv"
+         };
+diff --git a/app/version.properties b/app/version.properties
+index e33707b45efa5b6084993f50cbda944e7c8a9923..98df5634685f4c693e58a68ed8e278d47e071aeb 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726644
+-VERSION_BUILD=26644
++VERSION_NAME=0.9726645
++VERSION_BUILD=26645
