@@ -1,0 +1,532 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index abfa8664cbfe8b6c98e6e1c1e5cfe84874a8cb9e..a6fd478ec0f10bf0f9b42b3b3fe2c5a7127255ef 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2739,13 +2739,15 @@ internal object GlesMgcRawSabreShaders {
+     """.trimIndent()
+ 
+ 
+-    /* IRIS_26648_UNIVERSAL_NORMAL_SHORT_RADIOMETRIC_FUSION_OWNER
+-     * NORMAL temporal reconstruction is dehomogenized first. HIGHLIGHT_SHORT never enters the
+-     * temporal accumulator. This owner reconstructs the aligned/exposure-normalized SHORT with the
+-     * exact Sabre RBF, evaluates physical alignment/source-headroom/SNR plus measured NORMAL CFA
+-     * validity, and selects one scalar RGB radiometric authority. No scene semantics, gradients,
+-     * spatial fill, mask dilation, border extrapolation, or per-channel exposure switching. */
+-    val universalNormalShortFusion26648 = """
++    /* IRIS_26651_NORMAL_MASTER_SHORT_FUSION_OWNER
++     * NORMAL temporal reconstruction remains the immutable geometry/chroma master. HIGHLIGHT_SHORT
++     * never enters the temporal accumulator. SHORT may raise radiance only after physical support,
++     * source-headroom/SNR and measurable edge correspondence agree; partial NORMAL loss preserves
++     * NORMAL chromaticity and changes only luminance. SHORT chromaticity becomes authoritative only
++     * when all three measured NORMAL CFA color supports are physically lost. A separate R8 carrier
++     * publishes that color-validity decision so scalar radiance rescue cannot masquerade as RGB
++     * provenance. No scene semantics, spatial fill, mask dilation or per-channel exposure switching. */
++    val universalNormalMasterShortFusion26651 = """
+         #version 300 es
+         precision highp float;
+         precision highp int;
+@@ -2775,6 +2777,7 @@ internal object GlesMgcRawSabreShaders {
+         uniform float uNormalFrameCount;
+         layout(location = 0) out vec4 oFusedExtendedLinear;
+         layout(location = 1) out float oDecision;
++        layout(location = 2) out float oShortColorValidity;
+ 
+         bool shortWarpUvValid(vec2 sampleUv) {
+             return sampleUv.x > uFrameBorderPadded.x && sampleUv.y > uFrameBorderPadded.y &&
+@@ -2785,6 +2788,38 @@ internal object GlesMgcRawSabreShaders {
+             return max(min(v.r, v.g), max(min(v.r, v.b), min(v.g, v.b)));
+         }
+         float luma(vec3 v) { return dot(v, vec3(0.25, 0.50, 0.25)); }
++        float shortGuide(vec2 uv) {
++            vec4 q = texture(uShortExtractedBayer, clamp(uv, vec2(0.0), vec2(1.0)));
++            return dot(max(q, vec4(0.0)), vec4(0.25));
++        }
++        float edgeCorrespondence(vec2 referenceUv, vec2 sampleUv) {
++            /* IRIS_26651_MEASURABLE_EDGE_CORRESPONDENCE
++             * Compare edge direction at the exact production warp on the 2x2-CFA-quad scale.
++             * SHORT exposure magnitude is irrelevant because each gradient is normalized locally.
++             * This is an absolute image correspondence check; flow.w remains only a local-affine
++             * coherence input and is never interpreted as absolute registration error. */
++            vec2 stepUv = 1.0 / vec2(uExtractedSize);
++            float nL = luma(max(texture(uNormalMean, clamp(referenceUv - vec2(stepUv.x, 0.0), vec2(0.0), vec2(1.0))).rgb, vec3(0.0)));
++            float nR = luma(max(texture(uNormalMean, clamp(referenceUv + vec2(stepUv.x, 0.0), vec2(0.0), vec2(1.0))).rgb, vec3(0.0)));
++            float nD = luma(max(texture(uNormalMean, clamp(referenceUv - vec2(0.0, stepUv.y), vec2(0.0), vec2(1.0))).rgb, vec3(0.0)));
++            float nU = luma(max(texture(uNormalMean, clamp(referenceUv + vec2(0.0, stepUv.y), vec2(0.0), vec2(1.0))).rgb, vec3(0.0)));
++            float sL = shortGuide(sampleUv - vec2(stepUv.x, 0.0));
++            float sR = shortGuide(sampleUv + vec2(stepUv.x, 0.0));
++            float sD = shortGuide(sampleUv - vec2(0.0, stepUv.y));
++            float sU = shortGuide(sampleUv + vec2(0.0, stepUv.y));
++            vec2 ng = vec2(nR - nL, nU - nD);
++            vec2 sg = vec2(sR - sL, sU - sD);
++            float nScale = max(0.25 * (nL + nR + nD + nU), 0.03);
++            float sScale = max(0.25 * (sL + sR + sD + sU), 1.0);
++            float nStrength = length(ng) / nScale;
++            float sStrength = length(sg) / sScale;
++            float structure = smoothstep(0.05, 0.16, nStrength);
++            float direction = dot(ng, sg) / max(length(ng) * length(sg), 1.0e-8);
++            float directionTrust = smoothstep(0.15, 0.80, direction);
++            float strengthRatio = min(nStrength, sStrength) / max(max(nStrength, sStrength), 1.0e-5);
++            float edgeTrust = directionTrust * smoothstep(0.12, 0.55, strengthRatio);
++            return mix(1.0, edgeTrust, structure);
++        }
+         float kernelWeight(vec2 pixelOffset, vec3 covariance) {
+             float kernelDistance =
+                 pixelOffset.x * pixelOffset.x * covariance.x +
+@@ -2988,15 +3023,16 @@ internal object GlesMgcRawSabreShaders {
+                 ivec2(0), uExtractedSize - ivec2(1));
+             float physicalWeight = 1.0 - clamp(
+                 texelFetch(uShortPhysicalReverseWeight, physicalCell, 0).r, 0.0, 1.0);
+-            /* IRIS_26648_SHORT_ALIGNMENT_RESIDUAL_AUTHORITY
+-             * flow.w is the existing local affine residual in RAW pixels. It reduces SHORT
+-             * authority continuously; coherent local alignment remains untouched, while poor
+-             * geometry cannot create color/brightness authority across an edge. */
++            /* IRIS_26651_SHORT_LOCAL_AFFINE_COHERENCE_INPUT
++             * flow.w is a local affine residual, not absolute registration error. It is retained
++             * only as one coherence input; measurable image-edge correspondence below proves that
++             * the exact production warp is spatially compatible before SHORT can alter radiance. */
+             float alignmentConfidence = 1.0 - smoothstep(0.50, 2.00, max(flow.w, 0.0));
+             if (physicalWeight <= 0.001 || alignmentConfidence <= 0.001 ||
+                 !shortWarpUvValid(sampleUv)) {
+                 oFusedExtendedLinear = normalMean;
+-                oDecision = 204.0 / 255.0; // physical geometry/support rejection
++                oDecision = 204.0 / 255.0;
++                oShortColorValidity = 0.0; // physical geometry/support rejection
+                 return;
+             }
+             vec3 covariance = unpackCovariance(texture(uShortCovariance, sampleUv).xyz);
+@@ -3008,7 +3044,8 @@ internal object GlesMgcRawSabreShaders {
+                 shortSourceConfidence, shortValidWeights);
+             if (shortSourceConfidence <= 0.001 || minimum3(shortWeights) <= 1.0e-6) {
+                 oFusedExtendedLinear = normalMean;
+-                oDecision = 224.0 / 255.0; // SHORT source clipped/incomplete
++                oDecision = 224.0 / 255.0;
++                oShortColorValidity = 0.0; // SHORT source clipped/incomplete
+                 return;
+             }
+             vec3 shortRgb = shortColorSum / max(shortWeights, vec3(1.0e-6));
+@@ -3020,37 +3057,58 @@ internal object GlesMgcRawSabreShaders {
+             float shortSnrConfidence = smoothstep(3.0, 8.0, shortSnr);
+             if (shortSnrConfidence <= 0.001) {
+                 oFusedExtendedLinear = normalMean;
+-                oDecision = 240.0 / 255.0; // SHORT signal/SNR rejection
++                oDecision = 240.0 / 255.0;
++                oShortColorValidity = 0.0; // SHORT signal/SNR rejection
+                 return;
+             }
+ 
+-            /* Radiometric loss is measured in the common exposure-normalized extended-linear
+-             * domain. Two coherent RGB channels establish effective censorship before literal
+-             * saturation; source CFA validity independently catches one-channel physical loss. */
++            /* IRIS_26651_PHYSICAL_LOSS_SPLIT
++             * Radiometric loss may prove that NORMAL lost luminance before literal clipping, but
++             * it does not prove NORMAL lost chromaticity. Therefore partial loss is scalar-only.
++             * The separate color gate below is derived strictly from measured NORMAL CFA validity
++             * and requires physical loss in all three color supports. */
+             vec3 relativeLoss = max(shortRgb - normalMean.rgb, vec3(0.0)) /
+                 max(shortRgb, vec3(0.05));
+             vec3 radiometricLossByChannel = smoothstep(vec3(0.05), vec3(0.12), relativeLoss) *
+                 smoothstep(vec3(0.55), vec3(0.90), max(shortRgb, vec3(0.0)));
+             float effectiveRadiometricLoss = secondHighest3(radiometricLossByChannel);
+             float measuredNormalLoss = max(1.0 - normalSourceConfidence, effectiveRadiometricLoss);
+-            float shortConfidence = physicalWeight * alignmentConfidence *
++            float edgeTrust = edgeCorrespondence(referenceUv, sampleUv);
++            float shortConfidence = physicalWeight * alignmentConfidence * edgeTrust *
+                 shortSourceConfidence * shortSnrConfidence;
+             /* Low NORMAL temporal/SNR confidence may only soften a proven radiometric-loss
+              * transition; it can never create SHORT authority by itself. */
+             float transitionSupport = mix(0.82, 1.0,
+                 min(normalTemporalConfidence, normalSnrConfidence));
+-            float authority = clamp(shortConfidence * measuredNormalLoss / max(transitionSupport, 1.0e-3),
++            float radianceAuthority = clamp(
++                shortConfidence * measuredNormalLoss / max(transitionSupport, 1.0e-3),
+                 0.0, 1.0);
+-            vec3 fused = mix(normalMean.rgb, shortRgb, authority);
++
++            float normalY = luma(max(normalMean.rgb, vec3(0.0)));
++            float shortY = luma(max(shortRgb, vec3(0.0)));
++            float targetY = mix(normalY, shortY, radianceAuthority);
++            vec3 normalChromaCarrier = max(normalMean.rgb, vec3(0.0)) *
++                (targetY / max(normalY, 1.0e-5));
++            vec3 shortChromaCarrier = max(shortRgb, vec3(0.0)) *
++                (targetY / max(shortY, 1.0e-5));
++
++            vec3 measuredNormalPhysicalLoss = clamp(vec3(1.0) - normalValidity, 0.0, 1.0);
++            float allColorSupportLost = smoothstep(
++                0.55, 0.90, minimum3(measuredNormalPhysicalLoss));
++            float colorAuthority = clamp(
++                radianceAuthority * allColorSupportLost, 0.0, 1.0);
++            vec3 fused = mix(normalChromaCarrier, shortChromaCarrier, colorAuthority);
+             oFusedExtendedLinear = vec4(fused, normalMean.a); // SHORT never inflates temporal support
+-            oDecision = authority * (191.0 / 255.0); // 0..191 are valid authority; >191 are rejections
++            oDecision = radianceAuthority * (191.0 / 255.0); // scalar radiance authority only
++            oShortColorValidity = colorAuthority;
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26648_FUSION_RADIANCE_WEIGHT_TELEMETRY
+-     * Tiny diagnostic only: recover SHORT radiance algebraically from the actual NORMAL/fused
+-     * production values and final scalar authority. It never feeds production reconstruction. */
+-    val universalFusionTelemetry26648 = """
++    /* IRIS_26651_FUSION_RADIANCE_WEIGHT_TELEMETRY
++     * Tiny diagnostic only: recover SHORT luminance algebraically from the actual NORMAL/fused
++     * production values and final scalar radiance authority. Chromaticity authority is carried
++     * separately and never changes this luminance equation. It never feeds production reconstruction. */
++    val universalFusionTelemetry26651 = """
+         #version 300 es
+         precision highp float;
+         uniform sampler2D uNormalMean;
+@@ -3073,28 +3131,26 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26648_SHORT_COLOR_VALIDITY_NOT_TEMPORAL_SUPPORT
+-     * The same whole-RGB radiometric authority may restore color-validity provenance so the
+-     * downstream chroma owner cannot reject real SHORT evidence. It adds no temporal weight and
+-     * changes neither NORMAL support nor denoise effective-frame accounting. */
+-    val universalShortValidityAugment26648 = """
++    /* IRIS_26651_SHORT_COLOR_VALIDITY_NOT_RADIANCE_AUTHORITY
++     * Only the dedicated all-three-color-loss carrier may restore RGB validity provenance.
++     * Scalar-only SHORT radiance rescue contributes zero color validity. This adds no temporal
++     * weight and changes neither NORMAL support nor denoise effective-frame accounting. */
++    val universalShortValidityAugment26651 = """
+         #version 300 es
+         precision highp float;
+-        uniform sampler2D uDecision;
++        uniform sampler2D uShortColorValidity;
+         uniform sampler2D uNormalWeightR;
+         uniform sampler2D uNormalWeightsGb;
+         uniform float uValidityWeightScale;
+         layout(location = 0) out vec4 oValidityAdd;
+         void main() {
+             vec2 uv = gl_FragCoord.xy / vec2(textureSize(uNormalWeightR, 0));
+-            float encoded = texture(uDecision, uv).r;
+-            float authority = encoded <= (191.5 / 255.0)
+-                ? clamp(encoded / (191.0 / 255.0), 0.0, 1.0) : 0.0;
++            float colorAuthority = clamp(texture(uShortColorValidity, uv).r, 0.0, 1.0);
+             vec3 totalWeight = vec3(
+                 max(texture(uNormalWeightR, uv).r, 0.0),
+                 max(texture(uNormalWeightsGb, uv).r, 0.0),
+                 max(texture(uNormalWeightsGb, uv).g, 0.0));
+-            oValidityAdd = vec4(totalWeight * authority /
++            oValidityAdd = vec4(totalWeight * colorAuthority /
+                 max(uValidityWeightScale, 1.0e-6), 0.0);
+         }
+     """.trimIndent()
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 548cd4874a8fa33b6062a144de16d1bd63d58280..a86a342ad145e7ac3c8954d5604f75a924a18603 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -589,9 +589,9 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreShortAccumulatorProxyProgram26626 = 0
+     private var sabreShortAccumulatorDeltaProgram26626 = 0
+     private var sabreShortRescueWeightProgram26607 = 0
+-    private var sabreUniversalRadiometricFusionProgram26648 = 0
+-    private var sabreUniversalShortValidityAugmentProgram26648 = 0
+-    private var sabreUniversalFusionTelemetryProgram26648 = 0
++    private var sabreNormalMasterShortFusionProgram26651 = 0
++    private var sabreShortColorValidityAugmentProgram26651 = 0
++    private var sabreUniversalFusionTelemetryProgram26651 = 0
+     private var sabreRgbChromaPostprocessor: GlesIris26529SpatialRgbChromaPostprocessor? = null
+     private var sabreConvertAlignmentSparseProgram = 0
+     private var currentMergeCovariance = 0
+@@ -2606,10 +2606,11 @@ internal class GlesMgcRawSpatialStacker(
+                         "exposureRatio=$exposureScale exposureTimeNs=${frame.exposureTimeNs} " +
+                             "iso=${frame.sensitivityIso} captured=true scheduled=true " +
+                             "temporalAccumulator=false temporalSupport=false dng=false srDetail=false " +
+-                            "owner=UNIVERSAL_RADIOMETRIC_FUSION sceneSemantic=false gradientGate=false " +
+-                            "componentPropagation=false borderExtrapolation=false wholeRgbAuthority=true"
+-                    PLog.i(SABRE_TAG, "IRIS_26648_SHORT_CAPTURE_TO_FUSION $details26648")
+-                    MotionTrace.processingState("IRIS_26648_SHORT_CAPTURE_TO_FUSION", details26648)
++                            "owner=NORMAL_MASTER_SHORT_FUSION sceneSemantic=false edgeCorrespondence=true " +
++                            "componentPropagation=false borderExtrapolation=false scalarRadianceAuthority=true " +
++                            "shortChromaRequiresAllNormalColorSupportLost=true"
++                    PLog.i(SABRE_TAG, "IRIS_26651_SHORT_CAPTURE_TO_FUSION $details26648")
++                    MotionTrace.processingState("IRIS_26651_SHORT_CAPTURE_TO_FUSION", details26648)
+                 }
+                 /* IRIS_26564_NIGHT_LONG_EXCLUDED_FROM_TRUE_2X
+                  * Native Sabre still admits validated SHADOW_LONG evidence for Night SNR. True 2x
+@@ -2742,10 +2743,9 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+             }
+ 
+-            /* IRIS_26648_ONE_EXTENDED_LINEAR_HDR_MASTER
++            /* IRIS_26651_ONE_EXTENDED_LINEAR_HDR_MASTER
+              * Dehomogenize the NORMAL temporal result first. A physically validated, aligned and
+-             * exposure-normalized SHORT is then fused once in extended-linear space with one RGB
+-             * authority. This is the sole HDR exposure owner consumed by Resolve/VGN and true-2x. */
++             * exposure-normalized SHORT is then fused once in extended-linear space with NORMAL-owned chroma plus independently proven SHORT radiance/color authority. This is the sole HDR exposure owner consumed by Resolve/VGN and true-2x. */
+             val resolveAccumulatedColor26604 = accumulatedColor
+             val resolveAccumulatedWeightsGb26604 = accumulatedWeightsGb
+             val sabreRSupport26613 = renderSabreDehomogenize(
+@@ -2757,8 +2757,9 @@ internal class GlesMgcRawSpatialStacker(
+             )
+             check(sabreRSupport26613 != 0) { "26648 Sabre R support provenance missing" }
+ 
+-            var fusionDecision26648 = 0
+-            var resolveExtendedLinear26648 = resolveAccumulatedColor26604
++            var fusionDecision26651 = 0
++            var shortColorValidity26651 = 0
++            var resolveExtendedLinear26651 = resolveAccumulatedColor26604
+             if (highlightShortScheduled26607) {
+                 val shortFlow = checkNotNull(retainedShortFlow26648) {
+                     "26648 scheduled SHORT lost alignment owner"
+@@ -2770,8 +2771,9 @@ internal class GlesMgcRawSpatialStacker(
+                     "26648 scheduled SHORT lost physical support"
+                 }
+                 val fused = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-                fusionDecision26648 = createTexture(width, height, GLES30.GL_R8, GLES30.GL_NEAREST)
+-                renderSabreUniversalRadiometricFusion26648(
++                fusionDecision26651 = createTexture(width, height, GLES30.GL_R8, GLES30.GL_NEAREST)
++                shortColorValidity26651 = createTexture(width, height, GLES30.GL_R8, GLES30.GL_NEAREST)
++                renderSabreNormalMasterShortFusion26651(
+                     normalMean = resolveAccumulatedColor26604,
+                     normalWeightR = sabreRSupport26613,
+                     normalWeightsGb = resolveAccumulatedWeightsGb26604,
+@@ -2784,36 +2786,41 @@ internal class GlesMgcRawSpatialStacker(
+                     normalCalibration = referenceCalibration,
+                     normalFrameCount = mergedFrameCount,
+                     fusedOutput = fused,
+-                    decisionOutput = fusionDecision26648,
++                    decisionOutput = fusionDecision26651,
++                    shortColorValidityOutput = shortColorValidity26651,
+                     extractedWidth = extractedWidth,
+                     extractedHeight = extractedHeight,
+                     validityWeightScale = validityWeightScale26614,
+                 )
+-                logSabreUniversalFusionDecision26648(fusionDecision26648)
+-                logSabreUniversalFusionRadiance26648(
+-                    resolveAccumulatedColor26604, fused, fusionDecision26648,
++                logSabreUniversalFusionDecision26651(fusionDecision26651)
++                logSabreUniversalFusionRadiance26651(
++                    resolveAccumulatedColor26604, fused, fusionDecision26651,
+                 )
+-                renderSabreUniversalShortValidityAugment26648(
+-                    decision = fusionDecision26648,
++                renderSabreShortColorValidityAugment26651(
++                    shortColorValidity = shortColorValidity26651,
+                     normalWeightR = sabreRSupport26613,
+                     normalWeightsGb = resolveAccumulatedWeightsGb26604,
+                     accumulatedValidity = accumulatedValidity26614,
+                     validityWeightScale = validityWeightScale26614,
+                 )
+-                resolveExtendedLinear26648 = fused
++                resolveExtendedLinear26651 = fused
+                 releaseOwnedTexture(retainedShortPhysicalReverseWeight26648, "26648 retained SHORT physical reverse blocker")
+                 releaseOwnedTexture(shortFlow.texture, "26648 retained SHORT alignment")
+                 retainedShortPhysicalReverseWeight26648 = 0
+                 retainedShortFlow26648 = null
+             }
+             // Resolve consumes exactly the single fused extended-linear master.
+-            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveExtendedLinear26648)
+-            if (resolveExtendedLinear26648 != resolveAccumulatedColor26604) {
+-                releaseOwnedTexture(resolveExtendedLinear26648, "26648 fusedExtendedLinear HDR master after Resolve input readback")
++            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveExtendedLinear26651)
++            if (resolveExtendedLinear26651 != resolveAccumulatedColor26604) {
++                releaseOwnedTexture(resolveExtendedLinear26651, "26651 fusedExtendedLinear HDR master after Resolve input readback")
+             }
+-            if (fusionDecision26648 != 0) {
+-                releaseOwnedTexture(fusionDecision26648, "26648 universal fusion decision telemetry")
+-                fusionDecision26648 = 0
++            if (fusionDecision26651 != 0) {
++                releaseOwnedTexture(fusionDecision26651, "26651 scalar radiance fusion decision telemetry")
++                fusionDecision26651 = 0
++            }
++            if (shortColorValidity26651 != 0) {
++                releaseOwnedTexture(shortColorValidity26651, "26651 SHORT all-color-loss validity carrier")
++                shortColorValidity26651 = 0
+             }
+             sabreResolvedRgb = checkNotNull(
+                 LargeDirectBuffer.allocate(
+@@ -2987,8 +2994,8 @@ internal class GlesMgcRawSpatialStacker(
+                         "postVgnProbe=IRIS_26605_HDR_DOMAIN_STATS postVgnMaster=true " +
+                         "true2xUnifiedGuide=${enableSabreSuperRes} srSpecificHdrOwner=false " +
+                         "jpegHeicCommonHdrSource=true"
+-                PLog.i(SABRE_TAG, "IRIS_26648_FUSION_OUTPUT_PRESERVED $details26648")
+-                MotionTrace.processingState("IRIS_26648_FUSION_OUTPUT_PRESERVED", details26648)
++                PLog.i(SABRE_TAG, "IRIS_26651_FUSION_OUTPUT_PRESERVED $details26648")
++                MotionTrace.processingState("IRIS_26651_FUSION_OUTPUT_PRESERVED", details26648)
+             }
+             if (enableSabreSuperRes) {
+                 val reconstructionStartNs=System.nanoTime()
+@@ -3039,18 +3046,19 @@ internal class GlesMgcRawSpatialStacker(
+              * evidence remained NORMAL-only. Nothing is composited or republished after SR.
+              */
+             if (highlightShortScheduled26607) {
+-                val fusionSummary26648 =
++                val fusionSummary26651 =
+                     "exposureRatio=$highlightShortExposureRatio26587 " +
+-                        "owner=UNIVERSAL_NORMAL_SHORT_RADIOMETRIC_FUSION " +
+-                        "shortInTemporalAccumulator=false wholeRgbAuthority=true gradientGate=false " +
+-                        "spatialFill=false dilation=false borderExtrapolation=false " +
+-                        "fusionDecisionMeasured=IRIS_26648_UNIVERSAL_RADIOMETRIC_FUSION " +
+-                        "radianceWeightsMeasured=IRIS_26648_FUSION_RADIANCE_WEIGHTS " +
++                        "owner=NORMAL_MASTER_SHORT_FUSION " +
++                        "shortInTemporalAccumulator=false scalarRadianceAuthority=true " +
++                        "normalChromaMaster=true shortChromaRequiresAllNormalColorSupportLost=true " +
++                        "edgeCorrespondence=true spatialFill=false dilation=false borderExtrapolation=false " +
++                        "fusionDecisionMeasured=IRIS_26651_NORMAL_MASTER_SHORT_FUSION " +
++                        "radianceWeightsMeasured=IRIS_26651_FUSION_RADIANCE_WEIGHTS " +
+                         "postVgnMeasured=IRIS_26605_HDR_DOMAIN_STATS " +
+                         "true2xGuide=${enableSabreSuperRes} true2xDetailEvidenceShort=false " +
+                         "uhdrSource=COMMON_POST_VGN_HDR_MASTER"
+-                PLog.i(SABRE_TAG, "IRIS_26648_FUSION_SEMANTIC_RESULT $fusionSummary26648")
+-                MotionTrace.processingState("IRIS_26648_FUSION_SEMANTIC_RESULT", fusionSummary26648)
++                PLog.i(SABRE_TAG, "IRIS_26651_FUSION_SEMANTIC_RESULT $fusionSummary26651")
++                MotionTrace.processingState("IRIS_26651_FUSION_SEMANTIC_RESULT", fusionSummary26651)
+             }
+             checkGlError("MGC Sabre Resolve/VGN color noise")
+             returned = true
+@@ -4341,7 +4349,7 @@ internal class GlesMgcRawSpatialStacker(
+     private fun sabreShadowLongSourceClippingPoint(): Float =
+         sensorWhiteLevel.coerceAtLeast(1f) - 0.5f
+ 
+-    private fun renderSabreUniversalRadiometricFusion26648(
++    private fun renderSabreNormalMasterShortFusion26651(
+         normalMean: Int,
+         normalWeightR: Int,
+         normalWeightsGb: Int,
+@@ -4355,11 +4363,12 @@ internal class GlesMgcRawSpatialStacker(
+         normalFrameCount: Int,
+         fusedOutput: Int,
+         decisionOutput: Int,
++        shortColorValidityOutput: Int,
+         extractedWidth: Int,
+         extractedHeight: Int,
+         validityWeightScale: Float,
+     ) {
+-        val program = sabreUniversalRadiometricFusionProgram26648
++        val program = sabreNormalMasterShortFusionProgram26651
+         check(program != 0)
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uNormalMean", 0, normalMean)
+@@ -4396,15 +4405,15 @@ internal class GlesMgcRawSpatialStacker(
+         uniform3f(program, "uNormalReadNoiseRgb",
+             normalCalibration.cameraRgbReadNoise[0], normalCalibration.cameraRgbReadNoise[1], normalCalibration.cameraRgbReadNoise[2])
+         uniform1f(program, "uNormalFrameCount", normalFrameCount.toFloat().coerceAtLeast(1f))
+-        draw(program, width, height, intArrayOf(fusedOutput, decisionOutput))
++        draw(program, width, height, intArrayOf(fusedOutput, decisionOutput, shortColorValidityOutput))
+     }
+ 
+-    private fun logSabreUniversalFusionRadiance26648(
++    private fun logSabreUniversalFusionRadiance26651(
+         normalMean: Int,
+         fusedMean: Int,
+         decision: Int,
+     ) {
+-        val program = sabreUniversalFusionTelemetryProgram26648
++        val program = sabreUniversalFusionTelemetryProgram26651
+         check(program != 0)
+         val probeWidth = 64
+         val probeHeight = 48
+@@ -4419,7 +4428,7 @@ internal class GlesMgcRawSpatialStacker(
+             uniform2i(program, "uProbeSize", probeWidth, probeHeight)
+             draw(program, probeWidth, probeHeight, intArrayOf(probe))
+             GlesGpuScheduler.memoryBarrier()
+-            bindRenderTargets(intArrayOf(probe), "26648 fusion radiance/weight telemetry")
++            bindRenderTargets(intArrayOf(probe), "26651 fusion radiance/weight telemetry")
+             GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+             GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
+             GLES30.glReadPixels(
+@@ -4427,7 +4436,7 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, readback,
+             )
+             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-            checkGlError("26648 fusion radiance/weight telemetry readback")
++            checkGlError("26651 fusion radiance/weight telemetry readback")
+             val half = readback.asShortBuffer()
+             var normalSum = 0.0
+             var shortSum = 0.0
+@@ -4459,24 +4468,24 @@ internal class GlesMgcRawSpatialStacker(
+                     "normalFinalWeightMean=${if (meanShortWeight.isFinite()) 1.0 - meanShortWeight else Double.NaN} " +
+                     "shortFinalWeightMean=$meanShortWeight " +
+                     "confidenceSemantics=FINAL_PHYSICAL_RADIOMETRIC_WEIGHT"
+-            PLog.i(SABRE_TAG, "IRIS_26648_FUSION_RADIANCE_WEIGHTS $details")
+-            MotionTrace.processingState("IRIS_26648_FUSION_RADIANCE_WEIGHTS", details)
++            PLog.i(SABRE_TAG, "IRIS_26651_FUSION_RADIANCE_WEIGHTS $details")
++            MotionTrace.processingState("IRIS_26651_FUSION_RADIANCE_WEIGHTS", details)
+         } finally {
+-            releaseOwnedTexture(probe, "26648 fusion radiance/weight telemetry")
++            releaseOwnedTexture(probe, "26651 fusion radiance/weight telemetry")
+         }
+     }
+ 
+-    private fun renderSabreUniversalShortValidityAugment26648(
+-        decision: Int,
++    private fun renderSabreShortColorValidityAugment26651(
++        shortColorValidity: Int,
+         normalWeightR: Int,
+         normalWeightsGb: Int,
+         accumulatedValidity: Int,
+         validityWeightScale: Float,
+     ) {
+-        val program = sabreUniversalShortValidityAugmentProgram26648
++        val program = sabreShortColorValidityAugmentProgram26651
+         check(program != 0)
+         GLES30.glUseProgram(program)
+-        bindTexture(program, "uDecision", 0, decision)
++        bindTexture(program, "uShortColorValidity", 0, shortColorValidity)
+         bindTexture(program, "uNormalWeightR", 1, normalWeightR)
+         bindTexture(program, "uNormalWeightsGb", 2, normalWeightsGb)
+         uniform1f(program, "uValidityWeightScale", validityWeightScale.coerceAtLeast(1f))
+@@ -4490,8 +4499,8 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun logSabreUniversalFusionDecision26648(decision: Int) {
+-        val bytes = readR8Mask(decision, "26648 universal fusion decision", width, height)
++    private fun logSabreUniversalFusionDecision26651(decision: Int) {
++        val bytes = readR8Mask(decision, "26651 scalar radiance fusion decision", width, height)
+         var normalOwned = 0L
+         var blended = 0L
+         var shortOwned = 0L
+@@ -4522,9 +4531,9 @@ internal class GlesMgcRawSpatialStacker(
+             "normalOwned=$normalOwned blended=$blended shortOwned=$shortOwned " +
+                 "geometryRejected=$geometryRejected sourceRejected=$sourceRejected snrRejected=$snrRejected " +
+                 "meanShortAuthority=${if (authoritySamples > 0) authoritySum / authoritySamples else 0.0} " +
+-                "wholeRgb=true sceneSemantic=false gradientGate=false spatialFill=false"
+-        PLog.i(SABRE_TAG, "IRIS_26648_UNIVERSAL_RADIOMETRIC_FUSION $details")
+-        MotionTrace.processingState("IRIS_26648_UNIVERSAL_RADIOMETRIC_FUSION", details)
++                "radianceAuthority=scalar normalChromaMaster=true shortChromaRequiresAllNormalColorSupportLost=true edgeCorrespondence=true sceneSemantic=false spatialFill=false"
++        PLog.i(SABRE_TAG, "IRIS_26651_NORMAL_MASTER_SHORT_FUSION $details")
++        MotionTrace.processingState("IRIS_26651_NORMAL_MASTER_SHORT_FUSION", details)
+     }
+ 
+     private fun renderSabreMerge(
+@@ -6035,17 +6044,17 @@ internal class GlesMgcRawSpatialStacker(
+         sabreShortAccumulatorProxyProgram26626 = 0
+         sabreShortAccumulatorDeltaProgram26626 = 0
+         sabreShortRescueWeightProgram26607 = 0
+-        sabreUniversalRadiometricFusionProgram26648 = linkProgram(
+-            GlesMgcRawSabreShaders.universalNormalShortFusion26648,
+-            "iris_26648_universal_normal_short_radiometric_fusion",
++        sabreNormalMasterShortFusionProgram26651 = linkProgram(
++            GlesMgcRawSabreShaders.universalNormalMasterShortFusion26651,
++            "iris_26651_normal_master_short_fusion",
+         )
+-        sabreUniversalShortValidityAugmentProgram26648 = linkProgram(
+-            GlesMgcRawSabreShaders.universalShortValidityAugment26648,
+-            "iris_26648_short_color_validity_augment",
++        sabreShortColorValidityAugmentProgram26651 = linkProgram(
++            GlesMgcRawSabreShaders.universalShortValidityAugment26651,
++            "iris_26651_short_color_validity_augment",
+         )
+-        sabreUniversalFusionTelemetryProgram26648 = linkProgram(
+-            GlesMgcRawSabreShaders.universalFusionTelemetry26648,
+-            "iris_26648_fusion_radiance_weight_telemetry",
++        sabreUniversalFusionTelemetryProgram26651 = linkProgram(
++            GlesMgcRawSabreShaders.universalFusionTelemetry26651,
++            "iris_26651_fusion_radiance_weight_telemetry",
+         )
+         /* IRIS_26564_TRUE_2X_NO_FAKE_SR_OWNER
+          * Do not eagerly link the 26561/26562 native-RGB-upscale/detail shaders. The true-2x GPU
+diff --git a/app/version.properties b/app/version.properties
+index 3b68343f2fb1223a717d70778b34fe27b2d85aee..ee86f08db964526473635a6919300c72661a9c83 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726650
+-VERSION_BUILD=26650
++VERSION_NAME=0.9726651
++VERSION_BUILD=26651
