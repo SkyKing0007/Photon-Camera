@@ -1,0 +1,757 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 6eebcc76127b120f2e934d448ad46e07a710cbf7..fff049e94405559b5fec7235262e6ca28b84ab37 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2492,6 +2492,12 @@ internal object GlesMgcRawSabreShaders {
+         uniform vec4 uFrameBorderPadded;
+         uniform int uCfaPattern;
+         uniform int uUseFrameWeight;
++        /* IRIS_26647_DIRECT_FINAL_SHORT_FUSION_MODE
++         * Ordinary Sabre merge remains additive. Rescue-only SHORT reuses this exact RBF/source
++         * footprint after dehomogenization and emits a normalized camera-RGB observation plus one
++         * whole-RGB alpha. Fixed-function blending applies that final physical rescue weight once
++         * without a private SHORT accumulator or temporal-support inflation. */
++        uniform int uFinalShortFusion;
+         /* IRIS_26603_ONE_TUNNEL_SOURCE_CLIPPING
+          * Every bracket observation, including the reference, reaches this same RBF accumulator.
+          * Source headroom is one continuous scalar for the complete consumed 3x3 CFA footprint,
+@@ -2728,6 +2734,24 @@ internal object GlesMgcRawSabreShaders {
+                     uSourceClippedWeight,1.0,
+                     clamp(sourceNeighborhoodConfidence,0.0,1.0));
+             }
++            if (uFinalShortFusion != 0) {
++                /* IRIS_26647_DIRECT_FINAL_SHORT_FUSION_OUTPUT
++                 * Mode 1 emits the exact SHORT RBF observation plus the final post-rejection,
++                 * source-clipped whole-RGB rescue alpha. Mode 2 emits that same final alpha as a
++                 * scalar provenance mask. Neither mode changes temporal support. */
++                float finalRescueAlpha = clamp(frameWeight, 0.0, 1.0);
++                if (uFinalShortFusion == 2) {
++                    oColorAndRWeight = vec4(finalRescueAlpha, 0.0, 0.0, 1.0);
++                    oWeightsGb = vec2(0.0);
++                    oValidWeights = vec4(0.0);
++                    return;
++                }
++                vec3 shortMean = accumulatedColor / max(accumulatedWeight, vec3(1.0e-7));
++                oColorAndRWeight = vec4(shortMean, finalRescueAlpha);
++                oWeightsGb = vec2(0.0);
++                oValidWeights = vec4(0.0);
++                return;
++            }
+             accumulatedColor *= frameWeight;
+             accumulatedWeight *= frameWeight;
+             validAccumulatedWeight *= frameWeight;
+@@ -2738,6 +2762,38 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26647_DIRECT_FINAL_SHORT_VALIDITY_FUSION
++     * The direct rescue changes final camera RGB after ordinary Sabre temporal accumulation. Keep
++     * the 26614 physical-CFA validity owner semantically aligned with that final RGB without
++     * changing R/G/B temporal support: validity is blended toward fully measured source color by
++     * exactly the final source-clipped rescue alpha. */
++    val finalShortValidityFusion26647 = """
++        #version 300 es
++        /* IRIS_26647_DIRECT_FINAL_SHORT_VALIDITY_FUSION */
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uSupportR;
++        uniform sampler2D uSupportGb;
++        uniform sampler2D uValidWeights;
++        uniform sampler2D uAppliedRescue;
++        uniform float uValidityWeightScale;
++        uniform ivec2 uImageSize;
++        layout(location = 0) out vec4 oValidWeights;
++        void main() {
++            ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uImageSize - ivec2(1));
++            vec3 totalWeight = vec3(
++                max(texelFetch(uSupportR, p, 0).r, 0.0),
++                max(texelFetch(uSupportGb, p, 0).r, 0.0),
++                max(texelFetch(uSupportGb, p, 0).g, 0.0));
++            float scale = max(uValidityWeightScale, 1.0);
++            vec3 validWeight = max(texelFetch(uValidWeights, p, 0).rgb, vec3(0.0)) * scale;
++            vec3 priorValidity = clamp(validWeight / max(totalWeight, vec3(1.0e-6)), 0.0, 1.0);
++            float rescue = clamp(texelFetch(uAppliedRescue, p, 0).r, 0.0, 1.0);
++            vec3 fusedValidity = mix(priorValidity, vec3(1.0), rescue);
++            oValidWeights = vec4((fusedValidity * totalWeight) / scale, 0.0);
++        }
++    """.trimIndent()
++
+     /* IRIS_26558_SABRE_SHADOW_LONG_SOURCE_CLIP_GUARD
+      * Night-only Sabre merge. The proven Motion/NORMAL merge shader above remains byte-for-byte
+      * unchanged. For SHADOW_LONG only, reject the whole Long observation at an output pixel if
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 4b9058974196957358421ecf21bf4228e83fe2ab..134b9912cdb1d447e8a923464f1169a5ac5faae9 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -116,6 +116,16 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /* IRIS_26647_DIRECT_FINAL_SHORT_FUSION_CARRIER
++     * Retains only the already-final SHORT flow + rescue-only R8 confidence until the one
++     * post-dehomogenize/pre-Resolve blend. currentExtracted/currentCovariance are persistent Sabre
++     * work textures and, because HIGHLIGHT_SHORT is required to be last, already contain SHORT. */
++    private data class FinalShortFusion26647(
++        val flow: SabreConvertedAlignment,
++        val rescueWeight: Int,
++        val calibration: FrameCalibration,
++    )
++
+     /* IRIS_26564_TRUE_2X_PERSISTED_SABRE_EVIDENCE
+      * Sabre's flow/covariance/rejection products are transient GPU resources. True 2x keeps only
+      * compact immutable evidence required to reproduce the exact RBF estimator after the temporal
+@@ -547,6 +557,7 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreExtractBayerProgram = 0
+     private var sabreGuideAndCovarianceProgram = 0
+     private var sabreMergeProgram = 0
++    private var sabreFinalShortValidityProgram26647 = 0
+     private var sabreSuperResDetailMergeProgram = 0
+     private var sabreSuperResDetailResolveProgram = 0
+     private var sabreSuperResLinearRawProgram = 0
+@@ -2254,7 +2265,7 @@ internal class GlesMgcRawSpatialStacker(
+             /* IRIS_26614_RAW_CFA_CHANNEL_VALIDITY_OWNER
+              * Additive per-channel valid-measurement weight. Existing color and total-weight
+              * accumulators are byte-for-byte equation owners and this sidecar never feeds them. */
+-            val accumulatedValidity26614 = createTexture(
++            var accumulatedValidity26614 = createTexture(
+                 width,
+                 height,
+                 GLES30.GL_RGB10_A2,
+@@ -2435,6 +2446,8 @@ internal class GlesMgcRawSpatialStacker(
+             }
+             GlesGpuScheduler.yieldToUiRenderer()
+ 
++            var finalShortFusion26647: FinalShortFusion26647? = null
++
+             for (index in 1 until frames.size) {
+                 val transientTextureStart = textures.size
+                 val frameStartNs = System.nanoTime()
+@@ -2548,6 +2561,7 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.GL_LINEAR,
+                 )
+                 var shortRescueOnlyWeight26607 = 0
++                var shortCombinedWeight26647 = 0
+                 var shortLossCandidateWeight26607 = 0
+                 var shortLossStats26623: ShortEffectiveCoverageStats26606? = null
+                 var shortPhysicalWeight26610 = 0
+@@ -2625,14 +2639,17 @@ internal class GlesMgcRawSpatialStacker(
+                         shortLossCandidateWeight26607, "26607 SHORT loss-candidate proof",
+                     )
+                     shortLossCandidateWeight26607 = 0
+-                    releaseOwnedTexture(frameWeight, "26607 ordinary SHORT post-dilation weight")
++                    /* IRIS_26647_RESCUE_SPLIT_FROM_TEMPORAL_SUPPORT
++                     * Keep the exact ordinary SHORT Sabre weight as the only additive/temporal
++                     * contribution. The combined rescued weight is diagnostic eligibility only;
++                     * rescueOnly is retained for the direct final whole-RGB fusion below. */
++                    shortCombinedWeight26647 = rescuedWeight
+                     releaseOwnedTexture(
+                         shortPhysicalWeight26610,
+                         "26610 SHORT shared physical post-dilation weight",
+                     )
+                     shortPhysicalWeight26610 = 0
+                     releaseOwnedTexture(component.texture, "26607 SHORT component trust")
+-                    frameWeight = rescuedWeight
+                 }
+                 /* IRIS_26606_CONTINUOUS_ONE_TUNNEL_NORMAL_SHORT_LONG
+                  * No role owns a private reconstruction. NORMAL, HIGHLIGHT_SHORT and SHADOW_LONG
+@@ -2649,6 +2666,11 @@ internal class GlesMgcRawSpatialStacker(
+                         effectiveCoverage, coverageWidth, coverageHeight,
+                         "26606 SHORT effective source-clipped coverage clear",
+                     )
++                    check(shortCombinedWeight26647 != 0) {
++                        "26647 SHORT combined rescue weight missing for diagnostic proof"
++                    }
++                    /* 26647 semantic precision: total accumulator eligibility measures only the
++                     * ordinary SHORT weight that actually enters temporal Sabre accumulation. */
+                     renderSabreUnifiedBracketCoverage26604(
+                         weight = frameWeight,
+                         extracted = currentExtracted,
+@@ -2662,7 +2684,7 @@ internal class GlesMgcRawSpatialStacker(
+                     )
+                     val effectiveStats = readSabreShortEffectiveCoverage26606(
+                         effectiveCoverage, coverageWidth, coverageHeight,
+-                        "IRIS_26607_SHORT_TOTAL_ACCUMULATOR_ELIGIBLE_COVERAGE",
++                        "IRIS_26647_SHORT_ORDINARY_ACCUMULATOR_ELIGIBLE_COVERAGE",
+                     )
+                     highlightShortTotalAccumulatorEligibleCells26607 = effectiveStats.nonzeroCells
+                     highlightShortAnyAccumulatorEligibleEvidence26607 =
+@@ -2721,19 +2743,30 @@ internal class GlesMgcRawSpatialStacker(
+                         accumulatedColor, accumulatedWeightsGb, shortAccumulatorBefore26626,
+                         coverageWidth, coverageHeight,
+                     )
+-                    renderSabreCoverage(
+-                        effectiveCoverage, accumulatedCoverage, coverageWidth, coverageHeight,
+-                        accumulatedWeightScale,
++                    /* IRIS_26647_RESCUE_DOES_NOT_OWN_TEMPORAL_SUPPORT
++                     * Combined rescue eligibility is diagnostic only. Accumulated temporal support
++                     * receives only the exact ordinary SHORT weight; rescue will be applied once
++                     * after dehomogenization and therefore cannot reduce the residual-noise model. */
++                    renderSabreUnifiedBracketCoverage26604(
++                        weight = frameWeight,
++                        extracted = currentExtracted,
++                        flow = mergeFlow,
++                        accumulatedCoverage = accumulatedCoverage,
++                        coverageWidth = coverageWidth,
++                        coverageHeight = coverageHeight,
++                        extractedWidth = extractedWidth,
++                        extractedHeight = extractedHeight,
++                        accumulatedWeightScale = accumulatedWeightScale,
+                     )
+-                    releaseOwnedTexture(effectiveCoverage, "26606 SHORT effective coverage")
++                    releaseOwnedTexture(effectiveCoverage, "26647 SHORT combined eligibility coverage")
+                     shortLossStats26623 = null
+                     releaseOwnedTexture(
+                         rescueEffectiveCoverage, "26606 SHORT clipped-rescue effective coverage",
+                     )
+                     releaseOwnedTexture(
+-                        shortRescueOnlyWeight26607, "26607 SHORT target-rescue weight",
++                        shortCombinedWeight26647, "26647 SHORT combined rescue eligibility weight",
+                     )
+-                    shortRescueOnlyWeight26607 = 0
++                    shortCombinedWeight26647 = 0
+                 } else if (highlightShortOneTunnel26604 ||
+                     frame.role == RawBurstFrameRole.SHADOW_LONG) {
+                     renderSabreUnifiedBracketCoverage26604(
+@@ -2790,6 +2823,15 @@ internal class GlesMgcRawSpatialStacker(
+                     require(index == frames.lastIndex) {
+                         "26604 HIGHLIGHT_SHORT must remain the final scheduled auxiliary frame"
+                     }
++                    check(shortRescueOnlyWeight26607 != 0) {
++                        "26647 rescue-only SHORT confidence missing before final fusion retention"
++                    }
++                    finalShortFusion26647 = FinalShortFusion26647(
++                        flow = mergeFlow,
++                        rescueWeight = shortRescueOnlyWeight26607,
++                        calibration = calibration,
++                    )
++                    shortRescueOnlyWeight26607 = 0
+                     highlightShortExposureRatio26587 = exposureScale
+                     highlightShortScheduled26607 = true
+                     highlightShortConfidenceFieldGenerated26607 = true
+@@ -2797,8 +2839,9 @@ internal class GlesMgcRawSpatialStacker(
+                         "exposureRatio=$exposureScale exposureTimeNs=${frame.exposureTimeNs} " +
+                             "iso=${frame.sensitivityIso} sensorWhite=$sensorWhiteLevel " +
+                             "black=${calibration.blackLevels.joinToString(prefix="[",postfix="]")} " +
+-                            "captured=true scheduled=true commonAccumulatorPath=true " +
+-                            "privateShortAccumulator=false lateRgbBlend=false normalRejectionMeasurableOnly=true " +
++                            "captured=true scheduled=true ordinaryShortCommonAccumulator=true " +
++                            "rescueOwner=DIRECT_FINAL_PRE_RESOLVE_WHOLE_RGB privateShortAccumulator=false " +
++                            "rescueAffectsTemporalSupport=false latePostVgnBlend=false normalRejectionMeasurableOnly=true " +
+                             "targetOwner=UNIVERSAL_SENSOR_LOSS literalPlusEffective=true " +
+                             "effectiveLoss=twoPhase5to12pct_or_severeNearSaturation " +
+                             "absoluteOwner=SAME_CFA_MEASURABLE_BOUNDARY_RADIOMETRY probes=5x5 " +
+@@ -2826,8 +2869,9 @@ internal class GlesMgcRawSpatialStacker(
+                             "totalShortAccumulatorEligibleCells=$highlightShortTotalAccumulatorEligibleCells26607 " +
+                             "commonAccumulatorTargetProbeCells=${shortAccumulatorContribution26626?.targetCells ?: 0} " +
+                             "commonAccumulatorChangedProbeCells=${shortAccumulatorContribution26626?.changedCells ?: 0} " +
+-                            "commonAccumulatorInputChanged=${(shortAccumulatorContribution26626?.changedCells ?: 0) > 0} " +
+-                            "resolveEffective=NOT_DIRECTLY_MEASURED outputPreserved=DEVICE_IMAGE_REQUIRED " +
++                            "ordinaryAccumulatorInputChanged=${(shortAccumulatorContribution26626?.changedCells ?: 0) > 0} " +
++                            "rescueFinalFusionScheduled=true resolveEffective=PRE_RESOLVE_DIRECT_FUSION " +
++                            "outputPreserved=DEVICE_IMAGE_REQUIRED " +
+                             "sourceClip3x3Continuous=true bayerQuadWholeRgb=true " +
+                             "dng=false srDetailEvidence=false"
+                     PLog.i(SABRE_TAG, "IRIS_26607_SHORT_SEMANTIC_FUNNEL $details26607")
+@@ -2883,7 +2927,18 @@ internal class GlesMgcRawSpatialStacker(
+                         "role=${frame.role} exposureScale=$exposureScale " +
+                         "durationRobustness=$durationRobustness submit=${elapsedMs(frameStartNs)}ms",
+                 )
+-                releaseTexturesFrom(transientTextureStart)
++                val retainedFinalShort26647 = finalShortFusion26647
++                if (frame.role == RawBurstFrameRole.HIGHLIGHT_SHORT && retainedFinalShort26647 != null) {
++                    releaseTexturesFromExcept(
++                        startIndex = transientTextureStart,
++                        retainedTextures = intArrayOf(
++                            retainedFinalShort26647.flow.texture,
++                            retainedFinalShort26647.rescueWeight,
++                        ),
++                    )
++                } else {
++                    releaseTexturesFrom(transientTextureStart)
++                }
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+ 
+@@ -2956,19 +3011,21 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+             }
+ 
+-            /* IRIS_26604_ONE_TUNNEL_RESOLVE_AUTHORITY
+-             * The compiler-tested common accumulatedColor/accumulatedWeightsGb are the only RGB
+-             * authority entering Resolve/VGN. There is no SHORT mean, handoff mask, accumulator
+-             * switch, protected fuse, or post-VGN compositor on the active path.
++            /* IRIS_26647_PRE_RESOLVE_RGB_AUTHORITY
++             * Ordinary NORMAL/LONG/SHORT temporal evidence remains the one common Sabre
++             * accumulator. Rescue-only SHORT is allowed one final whole-RGB, source-clipped blend
++             * after dehomogenization and before Resolve/VGN. There is no private SHORT accumulator,
++             * no temporal-support inflation and no post-VGN compositor.
+              */
+             val resolveAccumulatedColor26604 = accumulatedColor
+             val resolveAccumulatedWeightsGb26604 = accumulatedWeightsGb
+             if (highlightShortScheduled26607) {
+                 PLog.i(
+                     SABRE_TAG,
+-                    "IRIS_26604_SINGLE_COMMON_ACCUMULATOR_OWNERSHIP " +
+-                        "domain=homogeneousReferenceExposure sharedRbf=true sharedResolve=true sharedVgn=true " +
+-                        "privateShortMean=false propagatedShortMask=false lateRgbBlend=false " +
++                    "IRIS_26647_PRE_RESOLVE_RGB_OWNERSHIP " +
++                        "domain=referenceExposureCameraRgb ordinaryCommonAccumulator=true " +
++                        "rescueOwner=DIRECT_FINAL_PRE_RESOLVE_WHOLE_RGB sharedRbf=true sharedResolve=true sharedVgn=true " +
++                        "privateShortAccumulator=false temporalSupportInflation=false postVgnBlend=false " +
+                         "temporalSupportOwner=${if (shadowLongFrameCount > 0) "NORMAL_SHORT_LONG" else "NORMAL_SHORT"} " +
+                             "longOwner=${if (shadowLongFrameCount > 0) "NIGHT_COMMON_SABRE" else "EXCLUDED"} " +
+                             "dngOwner=NORMAL srDetailOwner=NORMAL",
+@@ -2985,6 +3042,42 @@ internal class GlesMgcRawSpatialStacker(
+                 alphaBias = 1f / effectiveEvidenceCount26607.toFloat(),
+             )
+             check(sabreRSupport26613 != 0) { "26613 Sabre R support provenance missing" }
++            finalShortFusion26647?.let { finalShort ->
++                val appliedRescue26647 = renderSabreFinalShortFusion26647(
++                    extracted = currentExtracted,
++                    flow = finalShort.flow,
++                    covariance = currentCovariance,
++                    rescueWeight = finalShort.rescueWeight,
++                    calibration = finalShort.calibration,
++                    accumulatedColor = resolveAccumulatedColor26604,
++                    extractedWidth = extractedWidth,
++                    extractedHeight = extractedHeight,
++                )
++                val updatedValidity26647 = renderSabreFinalShortValidity26647(
++                    supportR = sabreRSupport26613,
++                    supportGb = resolveAccumulatedWeightsGb26604,
++                    priorValidity = accumulatedValidity26614,
++                    appliedRescue = appliedRescue26647,
++                    validityWeightScale = validityWeightScale26614,
++                )
++                releaseOwnedTexture(accumulatedValidity26614, "26614 pre-26647 channel validity provenance")
++                accumulatedValidity26614 = updatedValidity26647
++                releaseOwnedTexture(appliedRescue26647, "26647 applied SHORT rescue provenance")
++                PLog.i(
++                    SABRE_TAG,
++                    "IRIS_26647_DIRECT_FINAL_SHORT_FUSION " +
++                        "domain=DEHOMOGENIZED_REFERENCE_EXPOSURE_CAMERA_RGB " +
++                        "position=PRE_RESOLVE_PRE_VGN wholeRgb=true rescueOnly=true " +
++                        "sourceClip3x3=true temporalSupportUnchanged=true privateShortAccumulator=false " +
++                        "physicalCfaValidityUpdated=true",
++                )
++                releaseOwnedTexture(
++                    finalShort.rescueWeight,
++                    "26647 final SHORT rescue-only confidence",
++                )
++                releaseOwnedTexture(finalShort.flow.texture, "26647 final SHORT flow")
++                finalShortFusion26647 = null
++            }
+             // The original merge shaders write normalized, white-balanced half floats. The
+             // Resolve AOT accepts those RGBA16F bit patterns directly; rawScale applies only to
+             // the black/white scalar parameters below.
+@@ -3105,7 +3198,7 @@ internal class GlesMgcRawSpatialStacker(
+             PLog.i(
+                 SABRE_TAG,
+                 "IRIS_26614_RAW_CFA_CHANNEL_VALIDITY_PROVENANCE " +
+-                    "source=EXACT_CONSUMED_CFA_HEADROOM_WEIGHT_OVER_TOTAL_WEIGHT readOnly=true " +
++                    "source=EXACT_CONSUMED_CFA_HEADROOM_WEIGHT_PLUS_DIRECT_RESCUE_FINAL_RGB readOnly=true " +
+                     "changesTemporalWeights=false changesColorAccumulator=false " +
+                     "changesResolve=false changesVgn=false trueColorMeasuredValidityOwner=true",
+             )
+@@ -3214,7 +3307,7 @@ internal class GlesMgcRawSpatialStacker(
+                         "boundarySeedCells=$highlightShortBoundarySeedCells26607 " +
+                         "componentTrustedCells=$highlightShortBoundaryFinalCells26607 " +
+                         "resolveEffective=NOT_DIRECTLY_MEASURED outputPreserved=DEVICE_IMAGE_REQUIRED " +
+-                        "domain=COMMON_SABRE_PRE_RESOLVE_VGN wholeRgbEvidence=true lateRgbBlend=false " +
++                        "domain=COMMON_SABRE_PLUS_DIRECT_RESCUE_PRE_RESOLVE_VGN wholeRgbEvidence=true postVgnBlend=false " +
+                         "true2xGuide=${enableSabreSuperRes} true2xDetailEvidenceShort=false",
+                 )
+             }
+@@ -4542,6 +4635,7 @@ internal class GlesMgcRawSpatialStacker(
+         )
+         uniform1i(program, "uCfaPattern", cfaPattern)
+         uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
++        uniform1i(program, "uFinalShortFusion", 0)
+         uniform1i(program, "uSourceClipGuard", if (sourceClipGuard) 1 else 0)
+         uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
+         uniform1f(program, "uSourceClippedWeight", sourceClippedWeight.coerceIn(0f, 1f))
+@@ -4577,6 +4671,108 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /* IRIS_26647_DIRECT_FINAL_SHORT_FUSION_OWNER
++     * Reuse the exact Sabre merge RBF and source-footprint clipping logic, but after the NORMAL +
++     * ordinary-SHORT accumulator has been dehomogenized. The fragment shader emits the normalized
++     * SHORT observation and final rescue-only confidence in alpha. A single-channel provenance
++     * mask records the exact applied alpha so 26614 physical color validity can follow the final
++     * RGB without changing temporal support. No private SHORT RGB/weight accumulator is allocated. */
++    private fun renderSabreFinalShortFusion26647(
++        extracted: Int,
++        flow: SabreConvertedAlignment,
++        covariance: Int,
++        rescueWeight: Int,
++        calibration: FrameCalibration,
++        accumulatedColor: Int,
++        extractedWidth: Int,
++        extractedHeight: Int,
++    ): Int {
++        val program = sabreMergeProgram
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uExtractedBayer", 0, extracted)
++        bindTexture(program, "uFlow", 1, flow.texture)
++        bindTexture(program, "uCovariance", 2, covariance)
++        bindTexture(program, "uRejection", 3, rescueWeight)
++        uniform2i(program, "uExtractedSize", extractedWidth, extractedHeight)
++        uniform2i(program, "uOutputSize", width, height)
++        uniformSabreFlowScaleOffset(program, flow)
++        uniform4f(
++            program,
++            "uFrameBorderPadded",
++            SABRE_SAMPLE_BORDER_PIXELS / width,
++            SABRE_SAMPLE_BORDER_PIXELS / height,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
++        )
++        uniform1i(program, "uCfaPattern", cfaPattern)
++        uniform1i(program, "uUseFrameWeight", 1)
++        uniform1i(program, "uSourceClipGuard", 1)
++        uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
++        uniform1f(program, "uSourceClippedWeight", 0f)
++        uniform1f(program, "uValidityWeightScale", 1f)
++        uniform4fv(program, "uGains", calibration.gains)
++        uniform4fv(program, "uBlackLevelsTimesGains", calibration.blackTerms)
++        uniform4f(
++            program,
++            "uCovRangeRg",
++            COV_MIN_R,
++            COV_MAX_R - COV_MIN_R,
++            COV_MIN_G,
++            COV_MAX_G - COV_MIN_G,
++        )
++        uniform2f(program, "uCovRangeB", COV_MIN_B, COV_MAX_B - COV_MIN_B)
++
++        val appliedRescue = createTexture(width, height, GLES30.GL_R16F, GLES30.GL_NEAREST)
++        uniform1i(program, "uFinalShortFusion", 2)
++        draw(program, width, height, intArrayOf(appliedRescue))
++
++        uniform1i(program, "uFinalShortFusion", 1)
++        GLES30.glEnable(GLES30.GL_BLEND)
++        try {
++            GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
++            GLES30.glBlendFuncSeparate(
++                GLES30.GL_SRC_ALPHA,
++                GLES30.GL_ONE_MINUS_SRC_ALPHA,
++                GLES30.GL_ZERO,
++                GLES30.GL_ONE,
++            )
++            draw(
++                program,
++                width,
++                height,
++                intArrayOf(accumulatedColor),
++                preserveBlend = true,
++            )
++        } finally {
++            GLES30.glUseProgram(program)
++            uniform1i(program, "uFinalShortFusion", 0)
++            GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
++            GLES30.glDisable(GLES30.GL_BLEND)
++        }
++        return appliedRescue
++    }
++
++    private fun renderSabreFinalShortValidity26647(
++        supportR: Int,
++        supportGb: Int,
++        priorValidity: Int,
++        appliedRescue: Int,
++        validityWeightScale: Float,
++    ): Int {
++        check(sabreFinalShortValidityProgram26647 != 0)
++        val output = createTexture(width, height, GLES30.GL_RGB10_A2, GLES30.GL_NEAREST)
++        val program = sabreFinalShortValidityProgram26647
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uSupportR", 0, supportR)
++        bindTexture(program, "uSupportGb", 1, supportGb)
++        bindTexture(program, "uValidWeights", 2, priorValidity)
++        bindTexture(program, "uAppliedRescue", 3, appliedRescue)
++        uniform1f(program, "uValidityWeightScale", validityWeightScale.coerceAtLeast(1f))
++        uniform2i(program, "uImageSize", width, height)
++        draw(program, width, height, intArrayOf(output))
++        return output
++    }
++
+     private fun clearSabreSuperResAccumulator(
+         accumulator: Int,
+         superResWidth: Int,
+@@ -5974,6 +6170,10 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
++        sabreFinalShortValidityProgram26647 = linkProgram(
++            GlesMgcRawSabreShaders.finalShortValidityFusion26647,
++            "iris_26647_final_short_validity_fusion",
++        )
+         /* IRIS_26604_RETIRED_SEPARATE_SHORT_AUTHORITIES
+          * One-tunnel reconstruction makes every 26595/26600/26602 SHORT boundary/mask/protection/
+          * private-fuse program a duplicate owner. Keep their source/helpers only as rollback
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
+index d0d5778cb6db54a7ae58683dc15f31d7908f8526..a7e1459549930e459cc66884da20701997075dbe 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHardwareHevcEncoder.java
+@@ -28,6 +28,13 @@ public final class IrisHardwareHevcEncoder {
+     private static final String MIME_HEVC = MediaFormat.MIMETYPE_VIDEO_HEVC;
+     private static final long IO_TIMEOUT_US = 5_000_000L;
+     private static final double MAX_COMPRESS_RATIO = 0.25;
++    /* IRIS_26647_AOSP_DISPLAY_P3_HEVC_COLOR_ASPECTS
++     * MediaFormat does not publish SDK constants for Android media's Display-P3/sRGB pair, but
++     * AOSP ColorUtils has used these stable platform values since Android 8: standard 10 is
++     * Display-P3 (legacy internal name DCI_P3) and transfer 2 is IEC 61966-2-1/sRGB. The HEIF
++     * container already publishes the same Display-P3/sRGB/full-range NCLX contract. */
++    private static final int AOSP_COLOR_STANDARD_DISPLAY_P3 = 10;
++    private static final int AOSP_COLOR_TRANSFER_SRGB = 2;
+ 
+     private IrisHardwareHevcEncoder() {}
+ 
+@@ -191,9 +198,17 @@ public final class IrisHardwareHevcEncoder {
+              * or MPEG4Writer's per-sample range metadata. libheif supplies full-range YUV bytes
+              * and the HEIF NCLX items are full-range, so explicitly request FULL from MediaCodec. */
+             format.setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL);
+-            /* IRIS_26643_AOSP_ANDROID16_CODEC_CONFIGURATION_OWNER
+-             * Primaries/transfer remain HEIF-NCLX publication authority; only the missing range
+-             * transport adaptation is explicit for this CPU-I420 direct-NAL path. */
++            /* IRIS_26647_HARDWARE_HEVC_BASE_COLOR_CONTRACT
++             * The base I420 bytes were generated from the Display-P3 SDR bitmap. If primaries and
++             * transfer are left unspecified, AOSP may default a >=4K HEVC stream to BT.2020 plus
++             * video transfer, which contradicts the HEIF Display-P3/sRGB NCLX and can visibly lose
++             * color after Android decodes the saved file. Request the same AOSP Display-P3/sRGB
++             * aspects on the hardware base stream. Gain-map HEVC remains scalar/unspecified; only
++             * its full-range sample contract is authoritative. */
++            if (!gainMap) {
++                format.setInteger(MediaFormat.KEY_COLOR_STANDARD, AOSP_COLOR_STANDARD_DISPLAY_P3);
++                format.setInteger(MediaFormat.KEY_COLOR_TRANSFER, AOSP_COLOR_TRANSFER_SRGB);
++            }
+             MediaCodecInfo.EncoderCapabilities enc = caps.getEncoderCapabilities();
+             int q = Math.max(1, Math.min(100, quality));
+             if (enc.isBitrateModeSupported(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ)) {
+@@ -257,16 +272,25 @@ public final class IrisHardwareHevcEncoder {
+                     Log.i(TAG, "IRIS_26641_HW_HEVC_COLOR_ASPECTS gainMap=" + gainMap
+                             + " standard=" + outStandard + " transfer=" + outTransfer
+                             + " range=" + outRange);
+-                    /* IRIS_26644_HEVC_RANGE_RUNTIME_PROOF
+-                     * Never publish full-range NCLX around a hardware stream that explicitly
+-                     * reports anything except FULL. Fail the HEIC save instead of silently
+-                     * producing the 26643 limited/full contradiction. */
++                    /* IRIS_26647_HEVC_COLOR_ASPECT_RUNTIME_PROOF
++                     * Fail closed when the base stream contradicts the exact Display-P3/sRGB/full
++                     * contract. The gain map is scalar and keeps unspecified primaries/transfer,
++                     * but it must still remain full-range. */
+                     if (outRange != MediaFormat.COLOR_RANGE_FULL) {
+                         throw new IllegalStateException("Hardware HEVC did not honor full-range I420 contract: range="
+                                 + outRange + " gainMap=" + gainMap);
+                     }
+-                    Log.i(TAG, "IRIS_26644_HEVC_RANGE_PROOF gainMap=" + gainMap
+-                            + " requested=FULL output=FULL");
++                    if (!gainMap && (outStandard != AOSP_COLOR_STANDARD_DISPLAY_P3
++                            || outTransfer != AOSP_COLOR_TRANSFER_SRGB)) {
++                        throw new IllegalStateException("Hardware HEVC did not honor Display-P3/sRGB contract: standard="
++                                + outStandard + " transfer=" + outTransfer);
++                    }
++                    Log.i(TAG, "IRIS_26647_HEVC_COLOR_ASPECT_PROOF gainMap=" + gainMap
++                            + " requestedRange=FULL outputRange=" + outRange
++                            + " requestedStandard=" + (gainMap ? "UNSPECIFIED" : "DISPLAY_P3(10)")
++                            + " outputStandard=" + outStandard
++                            + " requestedTransfer=" + (gainMap ? "UNSPECIFIED" : "SRGB(2)")
++                            + " outputTransfer=" + outTransfer);
+                     for (int i = 0; i < 4; i++) {
+                         ByteBuffer csd = of.getByteBuffer("csd-" + i);
+                         if (csd == null) continue;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
+index fa2be2b9ea8e13c559f65a38c398cf2e15c23fa5..131674172a5dbd9c4294b1e53d2207bfe17c1cc7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/IrisHeicUltraHdrEncoder.java
+@@ -41,9 +41,106 @@ public final class IrisHeicUltraHdrEncoder {
+         return true;
+     }
+ 
++    private static Bitmap iris26647DecodeP3Preview(Path source, int maxDimension) {
++        if (source == null || maxDimension <= 0) return null;
++        String path = source.toAbsolutePath().toString();
++        BitmapFactory.Options bounds = new BitmapFactory.Options();
++        bounds.inJustDecodeBounds = true;
++        BitmapFactory.decodeFile(path, bounds);
++        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null;
++        int sample = 1;
++        int longest = Math.max(bounds.outWidth, bounds.outHeight);
++        while (sample <= (Integer.MAX_VALUE / 2)
++                && longest / (sample * 2) >= maxDimension) sample *= 2;
++        BitmapFactory.Options options = new BitmapFactory.Options();
++        options.inSampleSize = sample;
++        options.inPreferredConfig = Bitmap.Config.ARGB_8888;
++        options.inPreferredColorSpace = ColorSpace.get(ColorSpace.Named.DISPLAY_P3);
++        return BitmapFactory.decodeFile(path, options);
++    }
++
++    /* IRIS_26647_HEIC_SAVED_BASE_RECONSTRUCTION_PROOF
++     * Verify the saved file's actual decoded SDR base, not only its metadata. Both bitmaps are
++     * compared in Display-P3 at a bounded diagnostic resolution so true-2x publication does not
++     * create another full-resolution memory owner. This proof is diagnostic/non-destructive. */
++    private static boolean iris26647VerifySavedBaseReconstruction(
++            Bitmap expectedP3, Bitmap decodedP3, int expectedFullWidth, int expectedFullHeight,
++            String publication) {
++        Bitmap expectedSmall = null;
++        Bitmap decodedSmall = null;
++        try {
++            if (expectedP3 == null || decodedP3 == null
++                    || expectedP3.isRecycled() || decodedP3.isRecycled()) return false;
++            ColorSpace p3 = ColorSpace.get(ColorSpace.Named.DISPLAY_P3);
++            boolean expectedP3Tagged = expectedP3.getColorSpace() != null
++                    && expectedP3.getColorSpace().equals(p3);
++            boolean decodedP3Tagged = decodedP3.getColorSpace() != null
++                    && decodedP3.getColorSpace().equals(p3);
++            int sampleW = Math.max(1, Math.min(384, Math.min(expectedP3.getWidth(), decodedP3.getWidth())));
++            int sampleH = Math.max(1, Math.min(384, Math.min(expectedP3.getHeight(), decodedP3.getHeight())));
++            double aspect = Math.min(
++                    expectedP3.getWidth() / (double) Math.max(1, expectedP3.getHeight()),
++                    decodedP3.getWidth() / (double) Math.max(1, decodedP3.getHeight()));
++            if (aspect >= 1.0) sampleH = Math.max(1, (int) Math.round(sampleW / aspect));
++            else sampleW = Math.max(1, (int) Math.round(sampleH * aspect));
++            expectedSmall = Bitmap.createScaledBitmap(expectedP3, sampleW, sampleH, true);
++            decodedSmall = Bitmap.createScaledBitmap(decodedP3, sampleW, sampleH, true);
++            int count = Math.multiplyExact(sampleW, sampleH);
++            int[] expected = new int[count];
++            int[] actual = new int[count];
++            expectedSmall.getPixels(expected, 0, sampleW, 0, 0, sampleW, sampleH);
++            decodedSmall.getPixels(actual, 0, sampleW, 0, 0, sampleW, sampleH);
++            double abs = 0.0;
++            double expectedChroma = 0.0;
++            double actualChroma = 0.0;
++            int minAlpha = 255;
++            for (int i = 0; i < count; ++i) {
++                int e = expected[i];
++                int a = actual[i];
++                int er = (e >>> 16) & 255, eg = (e >>> 8) & 255, eb = e & 255;
++                int ar = (a >>> 16) & 255, ag = (a >>> 8) & 255, ab = a & 255;
++                abs += Math.abs(er - ar) + Math.abs(eg - ag) + Math.abs(eb - ab);
++                expectedChroma += Math.max(er, Math.max(eg, eb)) - Math.min(er, Math.min(eg, eb));
++                actualChroma += Math.max(ar, Math.max(ag, ab)) - Math.min(ar, Math.min(ag, ab));
++                minAlpha = Math.min(minAlpha, (a >>> 24) & 255);
++            }
++            double meanAbs = abs / Math.max(1.0, count * 3.0 * 255.0);
++            double expectedChromaMean = expectedChroma / Math.max(1.0, count * 255.0);
++            double actualChromaMean = actualChroma / Math.max(1.0, count * 255.0);
++            double chromaRatio = expectedChromaMean > 0.02
++                    ? actualChromaMean / expectedChromaMean : 1.0;
++            boolean geometry = expectedFullWidth == decodedP3.getWidth()
++                    && expectedFullHeight == decodedP3.getHeight();
++            boolean opaque = minAlpha == 255;
++            boolean colorPreserved = meanAbs <= 0.10
++                    && chromaRatio >= 0.70 && chromaRatio <= 1.30;
++            boolean pass = geometry && expectedP3Tagged && decodedP3Tagged && opaque && colorPreserved;
++            Log.critical(TAG, "IRIS_26647_HEIC_SAVED_BASE_RECONSTRUCTION publication=" + publication
++                    + " geometry=" + geometry
++                    + " expectedP3=" + expectedP3Tagged + " decodedP3=" + decodedP3Tagged
++                    + " opaque=" + opaque + " minAlpha=" + minAlpha
++                    + " sample=" + sampleW + "x" + sampleH
++                    + " meanAbsRgb=" + meanAbs
++                    + " expectedChroma=" + expectedChromaMean
++                    + " decodedChroma=" + actualChromaMean
++                    + " chromaRatio=" + chromaRatio
++                    + " reconstructed=" + pass + " destructiveFailure=false");
++            return pass;
++        } catch (Throwable t) {
++            Log.e(TAG, "IRIS_26647_HEIC_SAVED_BASE_RECONSTRUCTION_FAILED publication="
++                    + publication + " destructiveFailure=false", t);
++            return false;
++        } finally {
++            if (expectedSmall != null && expectedSmall != expectedP3 && !expectedSmall.isRecycled())
++                expectedSmall.recycle();
++            if (decodedSmall != null && decodedSmall != decodedP3 && !decodedSmall.isRecycled())
++                decodedSmall.recycle();
++        }
++    }
++
+     private static boolean iris26646VerifyPlatformReadback(
+             Path output, Gainmap expected, int expectedGainWidth, int expectedGainHeight,
+-            String publication) {
++            String publication, Bitmap expectedBaseP3, int expectedBaseWidth, int expectedBaseHeight) {
+         Bitmap decoded = null;
+         try {
+             decoded = BitmapFactory.decodeFile(output.toAbsolutePath().toString());
+@@ -66,8 +163,11 @@ public final class IrisHeicUltraHdrEncoder {
+             boolean full = actual != null && iris26646NearlyEqual(
+                     expected.getDisplayRatioForFullHdr(), actual.getDisplayRatioForFullHdr());
+             boolean metadata = ratioMin && ratioMax && gamma && epsilonSdr && epsilonHdr && transition && full;
+-            boolean recognized = decodedOk && hasGainmap && p3 && geometry && metadata;
+-            Log.critical(TAG, "IRIS_26646_HEIC_ANDROID_READBACK publication=" + publication
++            boolean baseReconstructed = decodedOk && expectedBaseP3 != null
++                    && iris26647VerifySavedBaseReconstruction(
++                            expectedBaseP3, decoded, expectedBaseWidth, expectedBaseHeight, publication);
++            boolean recognized = decodedOk && hasGainmap && p3 && geometry && metadata && baseReconstructed;
++            Log.critical(TAG, "IRIS_26647_HEIC_ANDROID_READBACK publication=" + publication
+                     + " decoded=" + decodedOk + " hasGainmap=" + hasGainmap + " p3=" + p3
+                     + " colorSpace=" + (cs == null ? "null" : cs.getName())
+                     + " geometry=" + geometry + " expectedGain=" + expectedGainWidth + "x" + expectedGainHeight
+@@ -80,10 +180,11 @@ public final class IrisHeicUltraHdrEncoder {
+                     + " actualRatioMax=" + (actual == null ? "null" : java.util.Arrays.toString(actual.getRatioMax()))
+                     + " expectedFull=" + expected.getDisplayRatioForFullHdr()
+                     + " actualFull=" + (actual == null ? Float.NaN : actual.getDisplayRatioForFullHdr())
++                    + " baseReconstructed=" + baseReconstructed
+                     + " recognizedUltraHdr=" + recognized + " destructiveFailure=false");
+             return recognized;
+         } catch (Throwable t) {
+-            Log.e(TAG, "IRIS_26646_HEIC_ANDROID_READBACK_FAILED publication=" + publication
++            Log.e(TAG, "IRIS_26647_HEIC_ANDROID_READBACK_FAILED publication=" + publication
+                     + " destructiveFailure=false", t);
+             return false;
+         } finally {
+@@ -132,9 +233,10 @@ public final class IrisHeicUltraHdrEncoder {
+             if (ok) {
+                 Bitmap gainContents = gm.getGainmapContents();
+                 recognized = iris26646VerifyPlatformReadback(output, gm,
+-                        gainContents.getWidth(), gainContents.getHeight(), "MOTION_1X");
++                        gainContents.getWidth(), gainContents.getHeight(), "MOTION_1X", p3,
++                        p3.getWidth(), p3.getHeight());
+             }
+-            Log.i(TAG, "IRIS_26646_HEIC_ULTRAHDR_RESULT saved=" + ok
++            Log.i(TAG, "IRIS_26647_HEIC_ULTRAHDR_RESULT saved=" + ok
+                     + " androidRecognizedUltraHdr=" + recognized
+                     + " readbackFailureNonDestructive=true p3=true existingGainmap=true"
+                     + " recomputedGainmap=false path=" + output);
+@@ -186,12 +288,27 @@ public final class IrisHeicUltraHdrEncoder {
+                     exif == null ? null : exif.MAKE,
+                     exif == null ? null : exif.MODEL);
+             saved &= Files.isRegularFile(output) && Files.size(output) > 0L;
+-            boolean recognized = saved && iris26646VerifyPlatformReadback(
+-                    output, metadataOwner, width / 2, height / 2, "MOTION_TRUE2X_GRID");
+-            Log.critical(TAG, "IRIS_26646_TRUE2X_HEIC_RESULT saved=" + saved
++            Bitmap expectedBaseP3 = null;
++            boolean recognized = false;
++            try {
++                /* IRIS_26647_BOUNDED_TRUE2X_BASE_PROOF
++                 * Do not decode a second full true-2x base only for diagnostics. The saved HEIC
++                 * decode is already the 26646 Android recognition owner; the source comparison
++                 * uses a bounded Display-P3 preview while full geometry is checked separately. */
++                expectedBaseP3 = iris26647DecodeP3Preview(displayP3BaseJpeg, 384);
++                recognized = saved && expectedBaseP3 != null
++                        && iris26646VerifyPlatformReadback(
++                                output, metadataOwner, width / 2, height / 2,
++                                "MOTION_TRUE2X_GRID", expectedBaseP3, width, height);
++            } finally {
++                if (expectedBaseP3 != null && !expectedBaseP3.isRecycled()) expectedBaseP3.recycle();
++            }
++            Log.critical(TAG, "IRIS_26647_TRUE2X_HEIC_RESULT saved=" + saved
+                     + " grid=2x2 base=" + width + "x" + height
+                     + " gain=" + (width / 2) + "x" + (height / 2)
+                     + " androidRecognizedUltraHdr=" + recognized
++                    + " baseContract=DISPLAY_P3_SRGB_FULL_RANGE"
++                    + " savedBaseReconstructionProofChecked=true"
+                     + " readbackFailureNonDestructive=true hardwareHevc=true");
+             return saved;
+         } catch (Throwable t) {
+diff --git a/app/version.properties b/app/version.properties
+index 079ee13b1d0604266761376798aeb56f71dbf704..232be2d373ad629aaf03de9e93a998b698b2584f 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726646
+-VERSION_BUILD=26646
++VERSION_NAME=0.9726647
++VERSION_BUILD=26647
