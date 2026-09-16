@@ -1,0 +1,395 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index a6fd478ec0f10bf0f9b42b3b3fe2c5a7127255ef..788214bcd6d3f7eab220eed7e89dbfa050894828 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2820,6 +2820,62 @@ internal object GlesMgcRawSabreShaders {
+             float edgeTrust = directionTrust * smoothstep(0.12, 0.55, strengthRatio);
+             return mix(1.0, edgeTrust, structure);
+         }
++
++        /* IRIS_26652_LOCAL_CHROMA_CONSENSUS
++         * Color recovery is a neighborhood-consensus problem, never a per-pixel SHORT repaint.
++         * Reliable NORMAL neighbors on the same luminance surface define chromaticity. This is
++         * semantic-independent: leaves, hair, wires, fabric, text and lamps use identical proof. */
++        vec3 normalValidityAt(ivec2 p) {
++            ivec2 q = clamp(p, ivec2(0), uOutputSize - ivec2(1));
++            vec3 total = vec3(
++                max(texelFetch(uNormalWeightR, q, 0).r, 0.0),
++                max(texelFetch(uNormalWeightsGb, q, 0).r, 0.0),
++                max(texelFetch(uNormalWeightsGb, q, 0).g, 0.0));
++            vec3 valid = max(texelFetch(uNormalValidWeights, q, 0).rgb, vec3(0.0)) *
++                max(uValidityWeightScale, 1.0);
++            return clamp(valid / max(total, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
++        }
++        vec3 chromaticityAtLuma(vec3 rgb) {
++            vec3 safe = max(rgb, vec3(0.0));
++            return safe / max(luma(safe), 1.0e-5);
++        }
++        void localNormalChromaConsensus(
++            ivec2 centerPixel, float targetY,
++            out vec3 consensusChromaticity, out float consensusConfidence,
++            out float consensusSupport, out float consensusSpread
++        ) {
++            vec3 sumC = vec3(0.0);
++            vec3 sumC2 = vec3(0.0);
++            float sumW = 0.0;
++            for (int y = -1; y <= 1; ++y) {
++                for (int x = -1; x <= 1; ++x) {
++                    if (abs(x) + abs(y) != 1) continue; // four-neighbor cross: bounded mobile-GPU cost
++                    ivec2 q = clamp(centerPixel + ivec2(x, y), ivec2(0), uOutputSize - ivec2(1));
++                    vec3 rgb = max(texelFetch(uNormalMean, q, 0).rgb, vec3(0.0));
++                    float yq = luma(rgb);
++                    float relativeLumaDelta = abs(yq - targetY) /
++                        max(max(yq, targetY), 0.04);
++                    float sameSurface = 1.0 - smoothstep(0.20, 0.58, relativeLumaDelta);
++                    float valid = minimum3(normalValidityAt(q));
++                    float measured = smoothstep(0.82, 0.98, valid);
++                    float w = sameSurface * measured;
++                    vec3 c = chromaticityAtLuma(rgb);
++                    sumC += c * w;
++                    sumC2 += c * c * w;
++                    sumW += w;
++                }
++            }
++            consensusSupport = sumW;
++            consensusChromaticity = sumW > 1.0e-5 ? sumC / sumW : vec3(1.0);
++            vec3 variance = sumW > 1.0e-5
++                ? max(sumC2 / sumW - consensusChromaticity * consensusChromaticity, vec3(0.0))
++                : vec3(1.0);
++            consensusSpread = sqrt(max(dot(variance, vec3(1.0 / 3.0)), 0.0));
++            float supportConfidence = smoothstep(0.75, 1.80, sumW);
++            float uniformityConfidence = 1.0 - smoothstep(0.025, 0.10, consensusSpread);
++            consensusConfidence = supportConfidence * uniformityConfidence;
++        }
++
+         float kernelWeight(vec2 pixelOffset, vec3 covariance) {
+             float kernelDistance =
+                 pixelOffset.x * pixelOffset.x * covariance.x +
+@@ -3095,12 +3151,69 @@ internal object GlesMgcRawSabreShaders {
+             vec3 measuredNormalPhysicalLoss = clamp(vec3(1.0) - normalValidity, 0.0, 1.0);
+             float allColorSupportLost = smoothstep(
+                 0.55, 0.90, minimum3(measuredNormalPhysicalLoss));
+-            float colorAuthority = clamp(
+-                radianceAuthority * allColorSupportLost, 0.0, 1.0);
+-            vec3 fused = mix(normalChromaCarrier, shortChromaCarrier, colorAuthority);
++
++            /* IRIS_26652_TRUSTED_SHORT_CHROMA_CONSENSUS
++             * All-three NORMAL loss makes color recovery eligible, not automatically trustworthy.
++             * The recovered luminance remains the already-proven scalar targetY. Color comes from
++             * uniform, same-surface, measured NORMAL neighbors. SHORT chromaticity may reinforce
++             * that consensus only when it agrees; an isolated pink/cyan/blue SHORT outlier cannot
++             * repaint a tiny object. If no trustworthy color survives, fail closed to NORMAL
++             * chromaticity at the recovered luminance rather than inventing hue. */
++            ivec2 centerPixel = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uOutputSize - ivec2(1));
++            vec3 consensusChromaticity;
++            float consensusConfidence;
++            float consensusSupport;
++            float consensusSpread;
++            localNormalChromaConsensus(
++                centerPixel, targetY, consensusChromaticity, consensusConfidence,
++                consensusSupport, consensusSpread);
++            vec3 shortChromaticity = chromaticityAtLuma(shortRgb);
++            float shortConsensusDistance = length(shortChromaticity - consensusChromaticity);
++            float shortConsensusAgreement = 1.0 - smoothstep(0.08, 0.22, shortConsensusDistance);
++            vec3 consensusCarrier = consensusChromaticity * targetY;
++            vec3 consensusWithShort = mix(
++                consensusCarrier, shortChromaCarrier, 0.35 * shortConsensusAgreement);
++
++            /* Visual wash-out is an image-domain condition, not merely a sensor-code condition.
++             * When trustworthy same-surface neighbors carry coherent color but the center has
++             * collapsed toward low chroma, let that measured consensus make recovery eligible.
++             * This also covers tiny colored structure without object labels or scene semantics. */
++            vec3 normalChromaticity = chromaticityAtLuma(normalMean.rgb);
++            float consensusColorMagnitude = length(consensusChromaticity - vec3(1.0));
++            float normalColorMagnitude = length(normalChromaticity - vec3(1.0));
++            float visualColorDeficit = smoothstep(0.06, 0.20,
++                consensusColorMagnitude - normalColorMagnitude) * consensusConfidence;
++            float colorRecoveryNeed = max(allColorSupportLost, visualColorDeficit);
++            float colorEligibility = clamp(radianceAuthority * colorRecoveryNeed, 0.0, 1.0);
++
++            /* No trustworthy local color means no invented camera-domain neutral. Preserve the
++             * NORMAL chromaticity at the recovered targetY. When consensus is trustworthy it
++             * dominates, with agreeing SHORT color allowed only as bounded supporting evidence. */
++            vec3 trustedRecoveredColor = mix(
++                normalChromaCarrier, consensusWithShort, consensusConfidence);
++            vec3 fused = mix(normalChromaCarrier, trustedRecoveredColor, colorEligibility);
+             oFusedExtendedLinear = vec4(fused, normalMean.a); // SHORT never inflates temporal support
+-            oDecision = radianceAuthority * (191.0 / 255.0); // scalar radiance authority only
+-            oShortColorValidity = colorAuthority;
++
++            /* Pack color-provenance state into the existing R8 decision telemetry without adding a
++             * fourth attachment/readback. 48 quantized radiance levels preserve scalar telemetry.
++             * 0=not color-eligible, 1=eligible/no trustworthy consensus (NORMAL-chroma fallback),
++             * 2=consensus trusted but center SHORT chroma rejected as outlier, 3=SHORT agrees. */
++            float colorState = 0.0;
++            if (colorEligibility > 0.005) {
++                if (consensusConfidence <= 0.20) colorState = 1.0;
++                else if (shortConsensusAgreement < 0.50) colorState = 2.0;
++                else colorState = 3.0;
++            }
++            float radianceCode = floor(clamp(radianceAuthority, 0.0, 1.0) * 47.0 + 0.5);
++            oDecision = (colorState * 48.0 + radianceCode) / 255.0;
++
++            /* IRIS_26652_CONTINUOUS_COLOR_VALIDITY
++             * Publish only confidence that can raise the weakest measured validity toward 0.970.
++             * This intentionally stays below the downstream 0.985 measured-color-protection knee,
++             * preventing a hard validity seam from disabling false-color cleanup on one side. */
++            float trustedColorConfidence = colorEligibility * consensusConfidence;
++            float validityRoom = max(0.970 - normalSourceConfidence, 0.0);
++            oShortColorValidity = validityRoom * trustedColorConfidence;
+         }
+     """.trimIndent()
+ 
+@@ -3120,8 +3233,10 @@ internal object GlesMgcRawSabreShaders {
+         void main() {
+             vec2 uv = gl_FragCoord.xy / vec2(uProbeSize);
+             float encoded = texture(uDecision, uv).r;
+-            float authority = encoded <= (191.5 / 255.0)
+-                ? clamp(encoded / (191.0 / 255.0), 0.0, 1.0) : 0.0;
++            int packed = int(floor(encoded * 255.0 + 0.5));
++            int radianceCode = packed <= 191 ? (packed % 48) : 0;
++            float authority = packed <= 191
++                ? clamp(float(radianceCode) / 47.0, 0.0, 1.0) : 0.0;
+             float normalRadiance = luma(max(texture(uNormalMean, uv).rgb, vec3(0.0)));
+             float fusedRadiance = luma(max(texture(uFusedMean, uv).rgb, vec3(0.0)));
+             float shortRadiance = authority > 0.005
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index a86a342ad145e7ac3c8954d5604f75a924a18603..47a2a37f28d2b060b4fa560ee3ab920fcafe053e 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -4509,18 +4509,30 @@ internal class GlesMgcRawSpatialStacker(
+         var snrRejected = 0L
+         var authoritySum = 0.0
+         var authoritySamples = 0L
++        var colorNotEligible = 0L
++        var colorNormalChromaFallback = 0L
++        var colorConsensusShortOutlier = 0L
++        var colorConsensusShortAgrees = 0L
+         for (raw in bytes) {
+             val v = raw.toInt() and 0xff
+             when {
+                 v <= 191 -> {
+-                    val authority = v / 191.0
++                    val colorState = v / 48
++                    val radianceCode = v % 48
++                    val authority = radianceCode / 47.0
+                     authoritySum += authority
+                     authoritySamples++
+                     when {
+-                        v <= 2 -> normalOwned++
+-                        v >= 189 -> shortOwned++
++                        radianceCode <= 1 -> normalOwned++
++                        radianceCode >= 46 -> shortOwned++
+                         else -> blended++
+                     }
++                    when (colorState) {
++                        0 -> colorNotEligible++
++                        1 -> colorNormalChromaFallback++
++                        2 -> colorConsensusShortOutlier++
++                        else -> colorConsensusShortAgrees++
++                    }
+                 }
+                 v < 216 -> geometryRejected++
+                 v < 233 -> sourceRejected++
+@@ -4531,7 +4543,10 @@ internal class GlesMgcRawSpatialStacker(
+             "normalOwned=$normalOwned blended=$blended shortOwned=$shortOwned " +
+                 "geometryRejected=$geometryRejected sourceRejected=$sourceRejected snrRejected=$snrRejected " +
+                 "meanShortAuthority=${if (authoritySamples > 0) authoritySum / authoritySamples else 0.0} " +
+-                "radianceAuthority=scalar normalChromaMaster=true shortChromaRequiresAllNormalColorSupportLost=true edgeCorrespondence=true sceneSemantic=false spatialFill=false"
++                "colorNotEligible=$colorNotEligible colorNormalChromaFallback=$colorNormalChromaFallback " +
++                "colorConsensusShortOutlier=$colorConsensusShortOutlier " +
++                "colorConsensusShortAgrees=$colorConsensusShortAgrees " +
++                "radianceAuthority=scalar normalChromaMaster=true shortChromaRequiresLocalConsensus=true continuousColorValidity=true edgeCorrespondence=true sceneSemantic=false spatialFill=false"
+         PLog.i(SABRE_TAG, "IRIS_26651_NORMAL_MASTER_SHORT_FUSION $details")
+         MotionTrace.processingState("IRIS_26651_NORMAL_MASTER_SHORT_FUSION", details)
+     }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java
+index 4776da1d7b135ea7f423901931511c93776ed3e5..bc57491210cc94a580ecd17bf97e00220b7c2f1a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java
+@@ -44,6 +44,12 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+     private static final float KNEE_MIN = 0.55f;
+     private static final float KNEE_REF = 0.10f;
+     private static final float CLIP_TOLERANCE = 0.03f;
++    private static final float WHITE_CHANNEL_SUPPORT = 0.005f;
++    private static final int WHITE_MIN_VALID_CHANNELS = 2;
++    private static final float UPPER_TAIL_START = 0.78f;
++    private static final float UPPER_TAIL_MIN_FRACTION = 0.03f;
++    private static final float UPPER_TAIL_REF_FRACTION = 0.18f;
++    private static final float UPPER_TAIL_MAX_KNEE_SHIFT = 0.035f;
+ 
+     private final boolean enabled;
+ 
+@@ -112,20 +118,26 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+         float avgPass1 = estimateAvg(hist, mapped, normR, normG, normB);
+         GainClamp gain1 = clampGain(TARGET / Math.max(avgPass1, 1.0e-4f), noiseS, noiseO);
+         float mpyPass1 = gain1.value;
+-        float sceneWhitePass1 = searchWhite(hist, mapped, normR, normG, normB, mpyPass1);
+-
++        WhiteEstimate whitePass1 = searchWhiteRobust(hist, mapped, normR, normG, normB, mpyPass1);
++        float sceneWhitePass1 = whitePass1.value;
++
++        /* IRIS_26652_ROBUST_ADAPTIVE_WHITE_POINT
++         * A missing/sparse channel is not a measured white and cannot pin the estimate to 255/256.
++         * Require broad upper-tail evidence in at least two RGB channels, then use a robust common
++         * estimate. The pass-1 scene key/gain is immutable: adaptive white may only redistribute
++         * the upper range, never darken the office/lab/midtones merely because a sun/lamp exists. */
+         float adaptiveWhitePoint = 1.0f;
+         float avgFinal = avgPass1;
+         float mpyPreNorm = mpyPass1;
+         float sceneWhiteFinal = sceneWhitePass1;
+         GainClamp gain2 = gain1;
+-        if (sceneWhitePass1 > 1.0f) {
++        WhiteEstimate whiteFinal = whitePass1;
++        if (whitePass1.validChannels >= WHITE_MIN_VALID_CHANNELS && sceneWhitePass1 > 1.0f) {
+             adaptiveWhitePoint = srgbDecodeExtended(sceneWhitePass1);
+             remapHistogram(mapped, extent, adaptiveWhitePoint);
+-            avgFinal = estimateAvg(hist, mapped, normR, normG, normB);
+-            gain2 = clampGain(TARGET / Math.max(avgFinal, 1.0e-4f), noiseS, noiseO);
+-            mpyPreNorm = gain2.value;
+-            sceneWhiteFinal = searchWhite(hist, mapped, normR, normG, normB, mpyPreNorm);
++            // Scene brightness authority remains pass 1 by design.
++            whiteFinal = searchWhiteRobust(hist, mapped, normR, normG, normB, mpyPreNorm);
++            sceneWhiteFinal = whiteFinal.value;
+         }
+ 
+         float normL = 0.0f;
+@@ -140,6 +152,7 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+         float whiteEff = mix(mpy, whiteMax, WHITE_APPLY);
+ 
+         long clipped = 0L;
++        long recoverableUpperTail = 0L;
+         long total = (long)normR + normG + normB;
+         for (int i = 0; i < HIST_SIZE; ++i) {
+             for (int c = 0; c < 3; ++c) {
+@@ -148,12 +161,23 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+                 float v = g * mpy;
+                 float r = v * (1.0f + v / (whiteEff * whiteEff)) / (1.0f + v);
+                 if (r > 1.0f + CLIP_TOLERANCE) clipped += (long)hist[c][i];
++                else if (r >= UPPER_TAIL_START) recoverableUpperTail += (long)hist[c][i];
+             }
+         }
+         float clippedFraction = total > 0L ? clipped / (float)total : 0.0f;
++        float recoverableUpperTailFraction = total > 0L ? recoverableUpperTail / (float)total : 0.0f;
++        float clipPressure = Math.min(clippedFraction / Math.max(KNEE_REF, 1.0e-4f), 1.0f);
++        float upperTailPressure = clamp01(
++                (recoverableUpperTailFraction - UPPER_TAIL_MIN_FRACTION) /
++                        Math.max(UPPER_TAIL_REF_FRACTION - UPPER_TAIL_MIN_FRACTION, 1.0e-4f));
+         float kneeLo = Math.min(KNEE_MIN, KNEE_MAX);
+-        float knee = mix(KNEE_MAX, kneeLo,
+-                Math.min(clippedFraction / Math.max(KNEE_REF, 1.0e-4f), 1.0f));
++        float clipKnee = mix(KNEE_MAX, kneeLo, clipPressure);
++        /* IRIS_26652_BOUNDED_UPPER_TAIL_HIGHLIGHT_SHAPING
++         * Broad recoverable near-white population may add only a small extra shoulder. Tiny sun,
++         * bulb or specular populations stay below the population threshold. The supplement fades
++         * as true clip pressure rises and never changes values below the final knee. */
++        float upperTailKneeShift = UPPER_TAIL_MAX_KNEE_SHIFT * upperTailPressure * (1.0f - clipPressure);
++        float knee = Math.max(kneeLo, clipKnee - upperTailKneeShift);
+ 
+         float[] curveOff = new float[CURVE_SIZE];
+         float[] curveOn = new float[CURVE_SIZE];
+@@ -201,16 +225,25 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+                 + " avgPass1=" + avgPass1
+                 + " mpyPass1=" + mpyPass1
+                 + " sceneWhitePass1=" + sceneWhitePass1
++                + " whitePass1ValidChannels=" + whitePass1.validChannels
++                + " whitePass1Support=" + whitePass1.supportFraction
+                 + " adaptiveWhitePoint=" + adaptiveWhitePoint
++                + " adaptiveWhiteSceneKeyLocked=true"
+                 + " avgFinal=" + avgFinal
+                 + " mpyPreNorm=" + mpyPreNorm
+                 + " reinhardNormL=" + normL
+                 + " reinhardNormR=" + normRr
+                 + " mpyFinal=" + mpy
+                 + " sceneWhiteFinal=" + sceneWhiteFinal
++                + " whiteFinalValidChannels=" + whiteFinal.validChannels
++                + " whiteFinalSupport=" + whiteFinal.supportFraction
+                 + " whiteMax=" + whiteMax
+                 + " whiteEff=" + whiteEff
+                 + " clippedFraction=" + clippedFraction
++                + " recoverableUpperTailFraction=" + recoverableUpperTailFraction
++                + " upperTailPressure=" + upperTailPressure
++                + " clipKnee=" + clipKnee
++                + " upperTailKneeShift=" + upperTailKneeShift
+                 + " appliedKnee=" + (enabled ? knee : 1.0f)
+                 + " potentialKnee=" + knee
+                 + " clipTolerance=" + CLIP_TOLERANCE
+@@ -297,26 +330,39 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+         return cnt > 0 ? sum / cnt : TARGET;
+     }
+ 
+-    private static float searchWhite(int[][] result, float[][] mapped,
+-                                     int histNormR, int histNormG, int histNormB, float mpy) {
+-        float white = Float.MAX_VALUE;
++    private static WhiteEstimate searchWhiteRobust(int[][] result, float[][] mapped,
++                                                   int histNormR, int histNormG, int histNormB,
++                                                   float mpy) {
++        float[] candidates = new float[3];
++        float[] supports = new float[3];
++        int valid = 0;
+         for (int c = 0; c < 3; ++c) {
+             int histNorm = c == 0 ? histNormR : (c == 1 ? histNormG : histNormB);
+             float sum = 0.0f;
+             int cnt = 0;
+             double lower = Math.max(HIST_SIZE * 2.0 / 3.0, HIST_SIZE / (mpy + 0.001));
++            int required = Math.max(1, (int)Math.ceil(histNorm * WHITE_CHANNEL_SUPPORT));
+             for (int i = HIST_SIZE - 1; i > lower; --i) {
+                 sum += result[c][i] * mapped[c][i];
+                 cnt += result[c][i];
+-                if (cnt > histNorm * 0.005f) break;
+-            }
+-            if (cnt == 0) {
+-                sum = HIST_SIZE - 1.0f;
+-                cnt = 1;
++                if (cnt >= required) break;
+             }
+-            white = Math.min(white, (sum / cnt) / HIST_SIZE);
++            if (cnt < required) continue;
++            candidates[valid] = (sum / cnt) / HIST_SIZE;
++            supports[valid] = cnt / (float)Math.max(histNorm, 1);
++            valid++;
+         }
+-        return white;
++        if (valid < WHITE_MIN_VALID_CHANNELS) return new WhiteEstimate(1.0f, valid, 0.0f);
++        float white;
++        if (valid == 2) {
++            white = Math.min(candidates[0], candidates[1]);
++        } else {
++            float a = candidates[0], b = candidates[1], c = candidates[2];
++            white = a + b + c - Math.min(a, Math.min(b, c)) - Math.max(a, Math.max(b, c));
++        }
++        float minSupport = supports[0];
++        for (int i = 1; i < valid; ++i) minSupport = Math.min(minSupport, supports[i]);
++        return new WhiteEstimate(white, valid, minSupport);
+     }
+ 
+     private static GainClamp clampGain(float requested, float noiseS, float noiseO) {
+@@ -352,6 +398,17 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+     private static float clamp01(float v) { return Math.min(Math.max(v, 0.0f), 1.0f); }
+     private static float mix(float a, float b, float t) { return a + (b - a) * t; }
+ 
++    private static final class WhiteEstimate {
++        final float value;
++        final int validChannels;
++        final float supportFraction;
++        WhiteEstimate(float value, int validChannels, float supportFraction) {
++            this.value = value;
++            this.validChannels = validChannels;
++            this.supportFraction = supportFraction;
++        }
++    }
++
+     private static final class GainClamp {
+         final float value;
+         final float noiseLimit;
+diff --git a/app/version.properties b/app/version.properties
+index ee86f08db964526473635a6919300c72661a9c83..23ab95e9563e5274dab95786d2232802ff90022b 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726651
+-VERSION_BUILD=26651
++VERSION_NAME=0.9726652
++VERSION_BUILD=26652
