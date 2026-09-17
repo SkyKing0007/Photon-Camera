@@ -1,0 +1,685 @@
+diff --git b/app/src/main/assets/shaders/motionv2/gainmap.glsl a/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 9d481611d89b4ab08e182abda18375ea85d9520f..dec1f293ba1150f685254843edab9922b957dd23 100644
+--- b/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ a/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -157,23 +157,52 @@ float iris26654MapMotionSdrGuide(float sourceGuide){
+     }
+     return mix(off,candidate,enable);
+ }
+-float iris26655GainFinalSpatialToneAt(vec2 p){
++float iris26654HdrGuideAt(vec2 p){
++    vec3 rgb=max(iris26524BilinearHdr(p),vec3(0.0));
++    return max(luminance(rgb),max3(rgb));
++}
++float iris26654GainLocalToneAt(vec2 p){
+     vec2 toneSize=vec2(textureSize(iris26621LocalToneLog,0));
+     vec2 uv=(p+vec2(0.5))/max(toneSize,vec2(1.0));
+     vec2 halfTexel=vec2(0.5)/max(toneSize,vec2(1.0));
+-    float finalLog=texture(iris26621LocalToneLog,clamp(uv,halfTexel,vec2(1.0)-halfTexel)).r;
+-    return exp2(clamp(finalLog,-12.0,0.0));
++    float localLog=texture(iris26621LocalToneLog,clamp(uv,halfTexel,vec2(1.0)-halfTexel)).r;
++    return exp2(clamp(localLog,-12.0,0.0));
++}
++float iris26654GainLocalDeltaAt(vec2 p){
++    return iris26654GainLocalToneAt(p)-iris26654MapMotionSdrGuide(iris26654HdrGuideAt(p));
++}
++float iris26654GainStructureConfidence(vec2 p){
++    float c=iris26654HdrGuideAt(p);
++    float l=iris26654HdrGuideAt(p+vec2(-1.0,0.0));
++    float r=iris26654HdrGuideAt(p+vec2( 1.0,0.0));
++    float u=iris26654HdrGuideAt(p+vec2(0.0,-1.0));
++    float d=iris26654HdrGuideAt(p+vec2(0.0, 1.0));
++    float norm=max(c,0.02);
++    float curvature=abs(4.0*c-l-r-u-d)/norm;
++    float gradient=max(abs(r-l),abs(d-u))/(2.0*norm);
++    return iris26640Smoothstep(0.010,0.050,max(curvature,0.35*gradient));
+ }
+ float iris26640SharedSdrGuide(float sourceGuide,vec2 masterSourcePixel){
+     float globalMapped=iris26654MapMotionSdrGuide(sourceGuide);
+     if(iris26621LocalToneEnabled==0)return globalMapped;
+-    float localMapped=iris26655GainFinalSpatialToneAt(masterSourcePixel);
+-    /* IRIS_26655_UHDR_CONSUMES_EXACT_FINAL_SPATIAL_TONE
+-     * HC-ON uses the very same completed scalar texture as SDR rendering. There is no second UHDR
+-     * tone equation, no zero-DC reconstruction and no independent local highlight owner. */
+-    if(iris26654HighlightCompressionEnabled!=0)return localMapped;
++    float localMapped=iris26654GainLocalToneAt(masterSourcePixel);
+     float localStrength=iris26640Smoothstep(0.030,0.100,globalMapped);
+-    return mix(globalMapped,localMapped,localStrength);
++    float legacyMapped=mix(globalMapped,localMapped,localStrength);
++    if(iris26654HighlightCompressionEnabled==0 || sourceGuide<=0.65)return legacyMapped;
++    const float radius=8.0;
++    float dc=0.25*(
++        iris26654GainLocalDeltaAt(masterSourcePixel+vec2(-radius,0.0))+
++        iris26654GainLocalDeltaAt(masterSourcePixel+vec2( radius,0.0))+
++        iris26654GainLocalDeltaAt(masterSourcePixel+vec2(0.0,-radius))+
++        iris26654GainLocalDeltaAt(masterSourcePixel+vec2(0.0, radius)));
++    float zeroDc=(localMapped-globalMapped)-dc;
++    float structure=iris26654GainStructureConfidence(masterSourcePixel);
++    float upper=iris26640Smoothstep(0.65,1.0,sourceGuide);
++    float maxAbs=mix(0.018,0.045,upper);
++    float detail=clamp(zeroDc,-maxAbs,maxAbs)*structure;
++    float ownedMapped=clamp(globalMapped+detail,0.0,1.0);
++    float finalOwner=iris26640Smoothstep(0.65,0.72,sourceGuide);
++    return mix(legacyMapped,ownedMapped,finalOwner);
+ }
+ float srgbDecode(float x){x=clamp(x,0.0,1.0);return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);}
+ vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));}
+diff --git b/app/src/main/assets/shaders/motionv2/local_laplacian_downsample_26621.glsl a/app/src/main/assets/shaders/motionv2/local_laplacian_downsample_26621.glsl
+index 6656a7772a45b43146664b195600cc3a3d501585..e20f4cda0f7ebe55b4f4257d7a0e63e685c1eca0 100644
+--- b/app/src/main/assets/shaders/motionv2/local_laplacian_downsample_26621.glsl
++++ a/app/src/main/assets/shaders/motionv2/local_laplacian_downsample_26621.glsl
+@@ -3,7 +3,6 @@ precision highp int;
+ precision mediump sampler2D;
+ 
+ uniform sampler2D InputBuffer;
+-uniform int iris26655EdgeAware;
+ out float Output;
+ 
+ float irisAt(ivec2 p){
+@@ -19,38 +18,13 @@ float irisKernel5(int o){
+ void main(){
+     ivec2 q=ivec2(gl_FragCoord.xy);
+     ivec2 center=q*2;
+-    if(iris26655EdgeAware==0){
+-        /* Exact inherited 26654 Local-Laplacian downsample path. */
+-        float legacySum=0.0;
+-        for(int oy=-2;oy<=2;oy++){
+-            float wy=irisKernel5(oy);
+-            for(int ox=-2;ox<=2;ox++){
+-                float wx=irisKernel5(ox);
+-                legacySum+=irisAt(center+ivec2(ox,oy))*(wx*wy);
+-            }
+-        }
+-        Output=legacySum*(1.0/256.0);
+-        return;
+-    }
+-
+-    float centerValue=irisAt(center);
+     float sum=0.0;
+-    float weightSum=0.0;
+     for(int oy=-2;oy<=2;oy++){
+         float wy=irisKernel5(oy);
+         for(int ox=-2;ox<=2;ox++){
+             float wx=irisKernel5(ox);
+-            float sampleValue=irisAt(center+ivec2(ox,oy));
+-            /* IRIS_26655_SOURCE_DOMAIN_EDGE_AWARE_DOWNSAMPLE
+-             * Values are log2 radiance, so the difference is directly in EV. A 0.65 EV
+-             * bilateral scale smooths ordinary illumination gradients while preventing a
+-             * bright source/material from bleeding through a strong radiometric boundary. */
+-            float d=(sampleValue-centerValue)/0.65;
+-            float rangeWeight=exp(-0.5*d*d);
+-            float w=wx*wy*rangeWeight;
+-            sum+=sampleValue*w;
+-            weightSum+=w;
++            sum+=irisAt(center+ivec2(ox,oy))*(wx*wy);
+         }
+     }
+-    Output=sum/max(weightSum,1.0e-8);
++    Output=sum*(1.0/256.0);
+ }
+diff --git b/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl a/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
+index a53d147c5dbdbe2bc45887e430bb9997fb9d5e9d..02d291d25f20505dd7b164fe7caff2125245f1ba 100644
+--- b/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
++++ a/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
+@@ -18,7 +18,6 @@ uniform float iris26626PreservationStrength;
+ uniform float iris26639ShadowBodyStrength;
+ uniform float iris26639ShadowBodyEnd;
+ uniform int iris26626Mode;
+-uniform int iris26655BodyReferenceOnly;
+ out float Output;
+ 
+ /* IRIS_26621_TRUE_LOCAL_LAPLACIAN_REMAP
+@@ -170,59 +169,6 @@ vec3 iris26646SourceRadianceSurvival(ivec2 p){
+     return best;
+ }
+ 
+-/* IRIS_26655_UNIVERSAL_SOURCE_FINE_STRUCTURE_EVIDENCE
+- * Semantic-independent high-frequency evidence in source log-radiance. Small-radius curvature
+- * responds to text/ribs/foliage/fabric/hair/mesh/edges but rejects smooth illumination gradients.
+- * 26644/26645 remain supporting evidence only; no detector directly changes absolute brightness. */
+-float iris26655SourceFineStructure(ivec2 p){
+-    ivec2 sz=textureSize(SourceLinear,0);
+-    if(p.x<2||p.y<2||p.x+2>=sz.x||p.y+2>=sz.y) return 0.0;
+-    float c=log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p,0).rgb),IRIS_26626_LOG_FLOOR));
+-    float evidence=0.0;
+-    for(int k=0;k<2;k++){
+-        int r=k==0?1:2;
+-        float l=log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p-ivec2(r,0),0).rgb),IRIS_26626_LOG_FLOOR));
+-        float rr=log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p+ivec2(r,0),0).rgb),IRIS_26626_LOG_FLOOR));
+-        float u=log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p-ivec2(0,r),0).rgb),IRIS_26626_LOG_FLOOR));
+-        float d=log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p+ivec2(0,r),0).rgb),IRIS_26626_LOG_FLOOR));
+-        float curvature=abs(c-0.25*(l+rr+u+d));
+-        evidence=max(evidence,k==0?curvature:0.70*curvature);
+-    }
+-    return smoothstep(0.004,0.028,evidence);
+-}
+-
+-/* IRIS_26655_EDGE_AWARE_ILLUMINATION_BASE
+- * Joint-bilateral reconstruction of the coarse source-domain log-radiance field. The pyramid
+- * itself is range-aware, and this final reconstruction uses the full-resolution source only as
+- * a radiometric guide. Smooth illumination gradients may differ substantially from their local
+- * source pixel and remain smooth; strong material/exposure discontinuities reject coarse samples
+- * from the opposite side. No semantic/object classification is used. */
+-float iris26655EdgeAwareBaseLog(ivec2 p){
+-    ivec2 fineSize=textureSize(SourceLinear,0);
+-    ivec2 baseSize=textureSize(SourceGuideLog,0);
+-    float sourceLog=log2(max(iris26626SourceGuide(texelFetch(SourceLinear,p,0).rgb),IRIS_26626_LOG_FLOOR));
+-    vec2 coarsePos=(vec2(p)+vec2(0.5))*vec2(baseSize)/vec2(fineSize)-vec2(0.5);
+-    ivec2 c0=ivec2(floor(coarsePos));
+-    float sum=0.0;
+-    float weightSum=0.0;
+-    for(int oy=-1;oy<=2;oy++){
+-        for(int ox=-1;ox<=2;ox++){
+-            ivec2 q=clamp(c0+ivec2(ox,oy),ivec2(0),baseSize-ivec2(1));
+-            float v=texelFetch(SourceGuideLog,q,0).r;
+-            vec2 d=coarsePos-vec2(q);
+-            float sx=max(1.5-abs(d.x),0.0);
+-            float sy=max(1.5-abs(d.y),0.0);
+-            float spatial=sx*sy;
+-            float ev=(v-sourceLog)/0.75;
+-            float rangeWeight=exp(-0.5*ev*ev);
+-            float w=spatial*rangeWeight;
+-            sum+=v*w;
+-            weightSum+=w;
+-        }
+-    }
+-    return weightSum>1.0e-8?sum/weightSum:sourceLog;
+-}
+-
+ void main(){
+     ivec2 p=ivec2(gl_FragCoord.xy);
+ 
+@@ -257,28 +203,19 @@ void main(){
+         float baseLinear=exp2(clamp(baseLog,-12.0,0.0));
+         float residual=currentLinear-baseLinear;
+ 
+-        /* IRIS_26655_LEGACY_HC_OFF_LOCAL_PRESENTATION_ONLY
+-         * Mode 6 is retained exclusively for the proven HC-OFF/lower-body reference. The HC-ON
+-         * upper-range owner is mode 8 and never consumes the 26635/26645/26646 direct tone math.
+-         *
+-         * IRIS_26654_LOCAL_LAPLACIAN_NO_HIGHLIGHT_TOGGLE_AUTHORITY
++        /* IRIS_26654_LOCAL_LAPLACIAN_NO_HIGHLIGHT_TOGGLE_AUTHORITY
+          * Local Laplacian deliberately does not know whether Highlight Compression is enabled.
+          * It always reconstructs the inherited legacy local candidate. When HC is ON the final
+          * render/gainmap may consume only its bounded zero-DC source-structure residual; absolute
+          * upper-range brightness is owned by the post-brightness global 26654 tone. */
+         float upperGate=smoothstep(0.65,0.985,baseLinear);
+         float shoulderGate=smoothstep(0.70,0.985,baseLinear);
+-        /* IRIS_26655_HC_ON_BODY_REFERENCE_NEUTRALIZES_OLD_HIGHLIGHT_OWNERS
+-         * When HC is ON this legacy reconstruction is needed only for the validated body below
+-         * the 0.65 entry. Fade all old 26635/26645/26646 highlight brightness operations out over
+-         * the same 0.65..0.72 ownership handoff used by mode 8; HC-OFF remains byte-semantic legacy. */
+-        float bodyReferenceFade=iris26655BodyReferenceOnly!=0?smoothstep(0.65,0.72,baseLinear):0.0;
+-        vec3 iris26646Radiance=iris26655BodyReferenceOnly!=0?vec3(0.0):iris26646SourceRadianceSurvival(p);
++        vec3 iris26646Radiance=iris26646SourceRadianceSurvival(p);
+         float sourceStructureGate=max(max(iris26644SourceStructure(p),iris26645SourceTexture(p)),iris26646Radiance.z);
+         float smoothShoulder=1.0-pow(max(1.0-baseLinear,0.0),1.12);
+         float structureShoulderScale=1.0-0.72*sourceStructureGate;
+         float legacyBaseOut=mix(baseLinear,smoothShoulder,
+-            0.55*shoulderGate*structureShoulderScale*(1.0-bodyReferenceFade));
++            0.55*shoulderGate*structureShoulderScale);
+         float baseOut=legacyBaseOut;
+ 
+         /* IRIS_26639_SIGNAL_DRIVEN_SHADOW_BASE
+@@ -310,7 +247,7 @@ void main(){
+          * exactly the proven positive overshoot. R remains unchanged, so the saved SDR retains its
+          * local separation instead of becoming a clipped-looking sub-white plateau. */
+         float positiveOvershoot=max(candidateLinear-0.997,0.0);
+-        float protectedBase=max(shadowBase-sourceStructureGate*positiveOvershoot*(1.0-bodyReferenceFade),
++        float protectedBase=max(shadowBase-sourceStructureGate*positiveOvershoot,
+             IRIS_26626_LOG_FLOOR);
+         float outLinear=clamp(protectedBase+weightedResidual,IRIS_26626_LOG_FLOOR,1.0);
+         /* IRIS_26646_LEGACY_LOCAL_CANDIDATE_RADIANCE
+@@ -318,50 +255,12 @@ void main(){
+          * residual itself into the scalar tone result, while reserving bounded headroom in the
+          * same structured region.  This is luminance-only presentation: final RGB continues to use
+          * one common scalar, so CFA/chroma/hue ownership is untouched. */
+-        float reserveEv=0.40*iris26646Radiance.y*iris26646Radiance.z*upperGate*(1.0-bodyReferenceFade);
++        float reserveEv=0.40*iris26646Radiance.y*iris26646Radiance.z*upperGate;
+         float outLog=log2(max(outLinear,IRIS_26626_LOG_FLOOR))-reserveEv
+-                +iris26646Radiance.x*iris26646Radiance.z*(1.0-bodyReferenceFade);
++                +iris26646Radiance.x*iris26646Radiance.z;
+         Output=clamp(outLog,-12.0,0.0);
+         return;
+     }
+-    if(iris26626Mode==7){
+-        /* IRIS_26655_SOURCE_DOMAIN_ILLUMINATION_BASE_EXPAND
+-         * SourceGuideLog is the resolution-relative coarse B pyramid in source log-radiance.
+-         * Bilinear interpolation stays in log space; exp2 produces a positive extended-linear base. */
+-        float baseLog=iris26655EdgeAwareBaseLog(p);
+-        Output=exp2(max(baseLog,-12.0));
+-        return;
+-    }
+-    if(iris26626Mode==8){
+-        /* IRIS_26655_SOURCE_DOMAIN_B_PLUS_R_FINAL_COMPOSITE
+-         * CurrentToneLog = exact inherited legacy presentation used below 0.65.
+-         * DeltaLog       = T(B), the final pointwise tone applied to broad source-domain base B.
+-         * GlobalMappedLog= T(S), the same tone applied to original source S.
+-         * Only high-frequency source evidence may admit bounded R = T(S)-T(B). Broad gradients,
+-         * smooth ceilings, screens and walls therefore follow B instead of forming a bright island.
+-         * Ownership is driven by max(S,B): ordinary body pixels remain legacy-exact unless the broad
+-         * illumination field itself proves they belong to the highlight transition. */
+-        float sourceGuide=iris26626SourceGuide(texelFetch(SourceLinear,p,0).rgb);
+-        float baseLog=iris26655EdgeAwareBaseLog(p);
+-        float baseSource=exp2(max(baseLog,-12.0));
+-        float highlightGuide=max(sourceGuide,baseSource);
+-        float legacy=exp2(clamp(texelFetch(CurrentToneLog,p,0).r,-12.0,0.0));
+-        float pointMapped=exp2(clamp(texelFetch(GlobalMappedLog,p,0).r,-12.0,0.0));
+-        float baseMapped=exp2(clamp(texelFetch(DeltaLog,p,0).r,-12.0,0.0));
+-        float fine=iris26655SourceFineStructure(p);
+-        float texture=iris26645SourceTexture(p);
+-        float balanced=iris26644SourceStructure(p);
+-        float localEvidence=max(fine,0.85*texture);
+-        float structure=clamp(max(localEvidence,0.60*balanced*localEvidence),0.0,1.0);
+-        float upper=smoothstep(0.65,1.15,highlightGuide);
+-        float maxAbs=mix(0.035,0.100,upper);
+-        float detail=clamp(pointMapped-baseMapped,-maxAbs,maxAbs)*structure;
+-        float spatial=clamp(baseMapped+detail,IRIS_26626_LOG_FLOOR,1.0);
+-        float owner=smoothstep(0.65,0.72,highlightGuide);
+-        float finalLinear=mix(legacy,spatial,owner);
+-        Output=log2(max(finalLinear,IRIS_26626_LOG_FLOOR));
+-        return;
+-    }
+     if(iris26626Mode==5){
+         float sourceGuide=iris26626SourceGuide(texelFetch(SourceLinear,p,0).rgb);
+         float sourceLog=log2(max(sourceGuide,IRIS_26626_LOG_FLOOR));
+diff --git b/app/src/main/assets/shaders/motionv2/render.glsl a/app/src/main/assets/shaders/motionv2/render.glsl
+index ce50fd8f538c8fd776714acf7cddb0fc739134ff..fdf0486330325d808121cdc18213e610c92a754f 100644
+--- b/app/src/main/assets/shaders/motionv2/render.glsl
++++ a/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -380,10 +380,52 @@ vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
+ }
+ 
+ 
+-/* IRIS_26655_EXACT_FINAL_SPATIAL_TONE_TEXTURE
+- * When Highlight Compression is ON, MotionV2Render.java has already completed the source-domain
+- * B+R decomposition and stored the final scalar SDR luminance in iris26621LocalToneLog. No shader
+- * after that texture may recompute, offset, or locally re-own upper-range brightness. */
++/* IRIS_26654_BOUNDED_ZERO_DC_LOCAL_DETAIL
++ * The 26653 global map is the only absolute highlight brightness owner after brightness solve.
++ * Local Laplacian may contribute only a high-pass residual whose local DC component is removed,
++ * whose amplitude is bounded, and whose source pixel proves real full-resolution structure.
++ * Smooth ceilings/screens therefore cannot form a local bright island, while text/ribs/foliage
++ * may retain bounded detail. HC-OFF preserves the inherited local presentation path. */
++float iris26654SourceGuideAt(vec2 p){
++    vec3 rgb=max(iris26524BilinearInput(p),vec3(0.0));
++    return max(luminance(rgb),max3(rgb));
++}
++float iris26654LocalToneAt(vec2 p){
++    vec2 toneSize=vec2(textureSize(iris26621LocalToneLog,0));
++    vec2 uv=(p+vec2(0.5))/max(toneSize,vec2(1.0));
++    vec2 halfTexel=vec2(0.5)/max(toneSize,vec2(1.0));
++    float localLog=texture(iris26621LocalToneLog,clamp(uv,halfTexel,vec2(1.0)-halfTexel)).r;
++    return exp2(clamp(localLog,-12.0,0.0));
++}
++float iris26654LocalDeltaAt(vec2 p){
++    float sourceGuide=iris26654SourceGuideAt(p);
++    return iris26654LocalToneAt(p)-iris26654MapMotionSdrFinalGuide(sourceGuide);
++}
++float iris26654SourceStructureConfidence(vec2 p){
++    float c=iris26654SourceGuideAt(p);
++    float l=iris26654SourceGuideAt(p+vec2(-1.0,0.0));
++    float r=iris26654SourceGuideAt(p+vec2( 1.0,0.0));
++    float u=iris26654SourceGuideAt(p+vec2(0.0,-1.0));
++    float d=iris26654SourceGuideAt(p+vec2(0.0, 1.0));
++    float norm=max(c,0.02);
++    float curvature=abs(4.0*c-l-r-u-d)/norm;
++    float gradient=max(abs(r-l),abs(d-u))/(2.0*norm);
++    float evidence=max(curvature,0.35*gradient);
++    return smoothstep(0.010,0.050,evidence);
++}
++float iris26654BoundedLocalDetail(vec2 p,float sourceGuide,float globalMapped,float localMapped){
++    const float radius=8.0;
++    float dc=0.25*(
++        iris26654LocalDeltaAt(p+vec2(-radius,0.0))+
++        iris26654LocalDeltaAt(p+vec2( radius,0.0))+
++        iris26654LocalDeltaAt(p+vec2(0.0,-radius))+
++        iris26654LocalDeltaAt(p+vec2(0.0, radius)));
++    float zeroDc=(localMapped-globalMapped)-dc;
++    float structure=iris26654SourceStructureConfidence(p);
++    float upper=smoothstep(0.65,1.0,sourceGuide);
++    float maxAbs=mix(0.018,0.045,upper);
++    return clamp(zeroDc,-maxAbs,maxAbs)*structure;
++}
+ 
+ void main() {
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+@@ -423,12 +465,19 @@ void main() {
+             vec2 halfTexel=vec2(0.5)/max(toneSize,vec2(1.0));
+             float localLog=texture(iris26621LocalToneLog,clamp(uv,halfTexel,vec2(1.0)-halfTexel)).r;
+             float localMapped=exp2(clamp(localLog,-12.0,0.0));
++            /* IRIS_26654_SINGLE_ABSOLUTE_HIGHLIGHT_BASE
++             * HC OFF preserves the inherited presentation. HC ON fades stale local absolute-tone
++             * ownership out across the 0.65..0.72 entry band, then uses only bounded zero-DC
++             * source-structure detail around the global 26654 highlight base. */
+             float localStrength=smoothstep(0.030,0.100,globalMapped);
+             float legacyMapped=mix(globalMapped,localMapped,localStrength);
+-            /* IRIS_26655_RENDER_CONSUMES_EXACT_FINAL_SPATIAL_TONE
+-             * HC-ON localMapped is already the completed source-domain B+R presentation texture.
+-             * Do not recompute a pointwise owner or add any later Local-Laplacian correction. */
+-            float mappedGuide=iris26654HighlightCompressionEnabled!=0?localMapped:legacyMapped;
++            float mappedGuide=legacyMapped;
++            if(iris26654HighlightCompressionEnabled!=0 && sourceGuide>0.65){
++                float detail=iris26654BoundedLocalDetail(sourcePixel,sourceGuide,globalMapped,localMapped);
++                float ownedMapped=clamp(globalMapped+detail,0.0,1.0);
++                float finalOwner=smoothstep(0.65,0.72,sourceGuide);
++                mappedGuide=mix(legacyMapped,ownedMapped,finalOwner);
++            }
+             linearSrgb=sourceRgb*(mappedGuide/sourceGuide);
+         }else{
+             linearSrgb=sourceRgb;
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index dfa0e0d9d348628a6a55292ebfdc447360a1a489..ddd27667906b219f209fbd843d47421ca0192628 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -132,12 +132,6 @@ public final class MotionV2Render extends Node {
+      * plus its full-resolution residual. Broad highlight illumination therefore approaches white
+      * coherently, while real slat/fold/reflection structure remains in the residual. */
+     private static final int IRIS_26635_HIGHLIGHT_BASE_LEVEL = 5;
+-    /* IRIS_26655_SOURCE_DOMAIN_SPATIAL_HIGHLIGHT_BASE
+-     * HC-ON derives illumination B from the extended-linear HDR master before any display tone.
+-     * The pyramid is resolution-relative: reduce until the longest axis is <=32 samples, then map
+-     * that broad source-domain base once and admit only source-proven high-frequency residual R. */
+-    private static final int IRIS_26655_BASE_TARGET_MAX_DIM = 32;
+-    private static final int IRIS_26655_BASE_MAX_LEVELS = 12;
+ 
+     static float iris26621MapMotionSdrFinalGuide(float sourceGuide, float brightnessTargetGain) {
+         float x = Math.max(sourceGuide, 0.0f);
+@@ -577,7 +571,6 @@ public final class MotionV2Render extends Node {
+                         nextSize, scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                 glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                 glProg.setTexture("InputBuffer", sourceGuide[level - 1]);
+-                glProg.setVar("iris26655EdgeAware", 0);
+                 glProg.drawBlocks(sourceGuide[level]);
+             }
+ 
+@@ -607,7 +600,6 @@ public final class MotionV2Render extends Node {
+                                 GL_LINEAR, GL_CLAMP_TO_EDGE);
+                         glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                         glProg.setTexture("InputBuffer", remap[level - 1]);
+-                        glProg.setVar("iris26655EdgeAware", 0);
+                         glProg.drawBlocks(remap[level]);
+                     }
+ 
+@@ -731,8 +723,7 @@ public final class MotionV2Render extends Node {
+         }
+     }
+ 
+-    private GLTexture iris26621BuildLocalLaplacianTone(
+-            GLTexture source, boolean publishTrue2xMap, boolean iris26655BodyReferenceOnly) {
++    private GLTexture iris26621BuildLocalLaplacianTone(GLTexture source) {
+         iris26621ClearLocalToneState();
+         if (!basePipeline.mParameters.motionV2Active) return null;
+         if (source == null || source.mSize == null || source.mSize.x <= 0 || source.mSize.y <= 0) {
+@@ -761,7 +752,6 @@ public final class MotionV2Render extends Node {
+                 guide[level] = new GLTexture(nextSize, scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                 glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                 glProg.setTexture("InputBuffer", guide[level - 1]);
+-                glProg.setVar("iris26655EdgeAware", 0);
+                 glProg.drawBlocks(guide[level]);
+             }
+ 
+@@ -784,7 +774,6 @@ public final class MotionV2Render extends Node {
+                         remap[level] = new GLTexture(new Point(guide[level].mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                         glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                         glProg.setTexture("InputBuffer", remap[level - 1]);
+-                        glProg.setVar("iris26655EdgeAware", 0);
+                         glProg.drawBlocks(remap[level]);
+                     }
+ 
+@@ -854,7 +843,6 @@ public final class MotionV2Render extends Node {
+                     basePipeline.mParameters.motionV2ShadowBodyStrength);
+             glProg.setVar("iris26639ShadowBodyEnd",
+                     basePipeline.mParameters.motionV2ShadowBodyEnd);
+-            glProg.setVar("iris26655BodyReferenceOnly", iris26655BodyReferenceOnly ? 1 : 0);
+             glProg.setVar("iris26626Mode", 6);
+             glProg.drawBlocks(coherentHighlightTone);
+             try { finalTone.close(); } catch (Throwable ignored) {}
+@@ -895,7 +883,7 @@ public final class MotionV2Render extends Node {
+                 }
+             }
+ 
+-            if (publishTrue2xMap && basePipeline.mParameters.motionV2SuperResOutputEnabled) {
++            if (basePipeline.mParameters.motionV2SuperResOutputEnabled) {
+                 finalTone.BufferLoad();
+                 ByteBuffer map = finalTone.textureBuffer(scalar, true);
+                 map.position(0);
+@@ -955,141 +943,6 @@ public final class MotionV2Render extends Node {
+         }
+     }
+ 
+-    /* IRIS_26655_SOURCE_DOMAIN_B_PLUS_R_FINAL_TONE
+-     * HC-ON no longer asks the post-tone Local-Laplacian result to define highlight illumination.
+-     * Build B directly from the extended-linear HDR master in log-radiance space at an image-relative
+-     * low-frequency scale. Map B and the original source with the same frozen post-brightness tone,
+-     * then add only bounded source-proven high-frequency R. The returned texture is the completed SDR
+-     * luminance authority consumed verbatim by both render.glsl and gainmap.glsl.
+-     */
+-    private GLTexture iris26655BuildSourceDomainSpatialHighlightTone(
+-            GLTexture source, GLTexture legacyTone) {
+-        if (source == null || legacyTone == null || source.mSize == null
+-                || source.mSize.x <= 0 || source.mSize.y <= 0) {
+-            throw new IllegalStateException("IRIS_26655 invalid source-domain highlight inputs");
+-        }
+-        final GLFormat scalar = new GLFormat(GLFormat.DataType.FLOAT_16, 1);
+-        final GLTexture[] sourceGuide = new GLTexture[IRIS_26655_BASE_MAX_LEVELS];
+-        int sourceLevels = 0;
+-        GLTexture baseLinear = null;
+-        GLTexture pointMappedLog = null;
+-        GLTexture baseMappedLog = null;
+-        GLTexture finalTone = null;
+-        boolean keepFinal = false;
+-        try {
+-            sourceGuide[0] = new GLTexture(
+-                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+-            glProg.setTexture("SourceLinear", source);
+-            glProg.setVar("iris26626Mode", 1);
+-            glProg.drawBlocks(sourceGuide[0]);
+-            sourceLevels = 1;
+-
+-            while (Math.max(sourceGuide[sourceLevels - 1].mSize.x,
+-                    sourceGuide[sourceLevels - 1].mSize.y) > IRIS_26655_BASE_TARGET_MAX_DIM) {
+-                if (sourceLevels >= IRIS_26655_BASE_MAX_LEVELS) {
+-                    throw new IllegalStateException("IRIS_26655 source-base pyramid limit");
+-                }
+-                Point previous = sourceGuide[sourceLevels - 1].mSize;
+-                Point nextSize = new Point(
+-                        Math.max(1, (previous.x + 1) / 2),
+-                        Math.max(1, (previous.y + 1) / 2));
+-                sourceGuide[sourceLevels] = new GLTexture(
+-                        nextSize, scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+-                glProg.setTexture("InputBuffer", sourceGuide[sourceLevels - 1]);
+-                glProg.setVar("iris26655EdgeAware", 1);
+-                glProg.drawBlocks(sourceGuide[sourceLevels]);
+-                sourceLevels++;
+-            }
+-            final GLTexture sourceBaseLog = sourceGuide[sourceLevels - 1];
+-
+-            baseLinear = new GLTexture(
+-                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+-            glProg.setTexture("SourceLinear", source);
+-            glProg.setTexture("SourceGuideLog", sourceBaseLog);
+-            glProg.setVar("iris26626Mode", 7);
+-            glProg.drawBlocks(baseLinear);
+-
+-            pointMappedLog = new GLTexture(
+-                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-            glProg.useAssetProgram("motionv2/local_laplacian_global_log_26621");
+-            glProg.setTexture("InputBuffer", source);
+-            glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+-            glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+-            iris26654SetFinalToneUniforms();
+-            glProg.drawBlocks(pointMappedLog);
+-
+-            baseMappedLog = new GLTexture(
+-                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-            glProg.useAssetProgram("motionv2/local_laplacian_global_log_26621");
+-            glProg.setTexture("InputBuffer", baseLinear);
+-            glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+-            glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+-            iris26654SetFinalToneUniforms();
+-            glProg.drawBlocks(baseMappedLog);
+-
+-            finalTone = new GLTexture(
+-                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+-            glProg.setTexture("SourceLinear", source);
+-            glProg.setTexture("SourceGuideLog", sourceBaseLog);
+-            glProg.setTexture("GlobalMappedLog", pointMappedLog);
+-            glProg.setTexture("DeltaLog", baseMappedLog);
+-            glProg.setTexture("CurrentToneLog", legacyTone);
+-            glProg.setVar("iris26626Mode", 8);
+-            glProg.drawBlocks(finalTone);
+-
+-            if (basePipeline.mParameters.motionV2SuperResOutputEnabled) {
+-                finalTone.BufferLoad();
+-                ByteBuffer map = finalTone.textureBuffer(scalar, true);
+-                map.position(0);
+-                basePipeline.mParameters.motionV2LocalToneLogMap = map;
+-                basePipeline.mParameters.motionV2LocalToneLogWidth = finalTone.mSize.x;
+-                basePipeline.mParameters.motionV2LocalToneLogHeight = finalTone.mSize.y;
+-                basePipeline.mParameters.motionV2LocalToneLogSourceWidth = source.mSize.x;
+-                basePipeline.mParameters.motionV2LocalToneLogSourceHeight = source.mSize.y;
+-            }
+-
+-            Log.i(Name, "IRIS_26655_SOURCE_DOMAIN_B_PLUS_R_FINAL_TONE"
+-                    + " active=true"
+-                    + " source=" + source.mSize.x + "x" + source.mSize.y
+-                    + " baseLevels=" + sourceLevels
+-                    + " baseGrid=" + sourceBaseLog.mSize.x + "x" + sourceBaseLog.mSize.y
+-                    + " targetBaseMaxDim=" + IRIS_26655_BASE_TARGET_MAX_DIM
+-                    + " baseDomain=EXTENDED_LINEAR_LOG_RADIANCE"
+-                    + " absoluteOwner=SOURCE_DOMAIN_B"
+-                    + " residualOwner=SOURCE_PROVEN_HIGH_FREQUENCY_R_ONLY"
+-                    + " legacyBelow065=true transition065To072=true"
+-                    + " staleLocalAbsoluteHighlightOwner=false"
+-                    + " old26645DirectHeadroomOnHcPath=false"
+-                    + " old26646DirectRadianceOnHcPath=false"
+-                    + " sdrUhHdrExactSharedTexture=true"
+-                    + " sceneRecognition=false semanticClassifiers=false");
+-            keepFinal = true;
+-            return finalTone;
+-        } finally {
+-            for (GLTexture texture : sourceGuide) {
+-                if (texture != null) {
+-                    try { texture.close(); } catch (Throwable ignored) {}
+-                }
+-            }
+-            if (baseLinear != null) {
+-                try { baseLinear.close(); } catch (Throwable ignored) {}
+-            }
+-            if (pointMappedLog != null) {
+-                try { pointMappedLog.close(); } catch (Throwable ignored) {}
+-            }
+-            if (baseMappedLog != null) {
+-                try { baseMappedLog.close(); } catch (Throwable ignored) {}
+-            }
+-            if (!keepFinal && finalTone != null) {
+-                try { finalTone.close(); } catch (Throwable ignored) {}
+-            }
+-        }
+-    }
+-
+     @Override
+     public void Run() {
+         if (!(basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive)) {
+@@ -1132,25 +985,13 @@ public final class MotionV2Render extends Node {
+                 + " reconstructionZoom=" + reconstructionZoom
+                 + " renderResidual=" + irisOutputZoom
+                 + " product=" + (reconstructionZoom * irisOutputZoom));
+-        PostPipeline pipeline = (PostPipeline) basePipeline;
+-        final boolean iris26655SpatialHighlight = basePipeline.mParameters.motionV2Active
+-                && pipeline.motionV2PhotonHighlightCompressionEnabled;
+-        GLTexture iris26621LegacyLocalTone = iris26621BuildLocalLaplacianTone(
+-                extendedLinearHdr, !iris26655SpatialHighlight, iris26655SpatialHighlight);
+-        GLTexture iris26621LocalTone = iris26621LegacyLocalTone;
+-        if (iris26655SpatialHighlight) {
+-            GLTexture iris26655Tone = iris26655BuildSourceDomainSpatialHighlightTone(
+-                    extendedLinearHdr, iris26621LegacyLocalTone);
+-            if (iris26655Tone != iris26621LegacyLocalTone) {
+-                try { iris26621LegacyLocalTone.close(); } catch (Throwable ignored) {}
+-            }
+-            iris26621LocalTone = iris26655Tone;
+-        }
++        GLTexture iris26621LocalTone = iris26621BuildLocalLaplacianTone(extendedLinearHdr);
+         final boolean iris26640KeepLocalToneForGainMap = basePipeline.mParameters.motionV2Active
+                 && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+         /* IRIS_26630_PER_LENS_SATURATION_ROUTE
+          * Only the Motion graph owns the per-lens Iris Saturation snapshot. Night deliberately
+          * receives neutral 1.0; SR uses the same frozen Motion snapshot through the native encoder. */
++        PostPipeline pipeline = (PostPipeline) basePipeline;
+         IrisMotionSettings.Snapshot iris26630Tone = pipeline.motionV2ToneSettingsSnapshot;
+         float iris26630MotionSaturation = basePipeline.mParameters.motionV2Active
+                 && iris26630Tone != null ? iris26630Tone.saturation : 1.0f;
+@@ -1449,9 +1290,9 @@ public final class MotionV2Render extends Node {
+                     basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                     basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                     iris26654Enabled, iris26654Knee);
+-            Log.i(Name, "IRIS_26655_SOURCE_DOMAIN_SPATIAL_HIGHLIGHT_AUTHORITY"
++            Log.i(Name, "IRIS_26654_SINGLE_FINAL_HIGHLIGHT_TONE"
+                     + " enabled=" + iris26654Enabled
+-                    + " owner=SourceDomainBPlusRTextureAfterBrightnessSolve"
++                    + " owner=MotionV2RenderAfterBrightnessSolve"
+                     + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+                     + " matcherUses26652OffMap=true"
+                     + " lowerToneExactThrough=" + IRIS_26623_UPPER_TONE_START
+@@ -1460,9 +1301,8 @@ public final class MotionV2Render extends Node {
+                     + " map1=" + iris26654At1
+                     + " map1p25=" + iris26654At125
+                     + " map2=" + iris26654At2
+-                    + " localLaplacianAbsoluteToneOwner=false pointwiseGlobalAbsoluteOwner=false"
+-                    + " sourceDomainBroadIlluminationBase=true sourceProvenResidualOnly=true"
+-                    + " gainMapConsumesExactFinalSpatialToneTexture=true"
++                    + " localLaplacianAbsoluteToneOwner=false localLaplacianBoundedZeroDcDetailOnly=true"
++                    + " gainMapSharedFinalToneAndResidualContract=true"
+                     + " preColorDifferential=false irisSceneWhiteTailAuthority=true");
+ 
+             Log.i(Name, "IRIS_26623_SCENE_ADAPTIVE_UPPER_TONE"
+@@ -1480,9 +1320,9 @@ public final class MotionV2Render extends Node {
+                     + " oldFixedWhiteAnchor=" + IRIS_26621_SDR_WHITE_ANCHOR
+                     + " sceneRecognition=false"
+                     + " c1UpperBody=true c1SourceWhite=true monotonic=true hardEndpointClamp=false"
+-                    + " localToneOwner=HC_OFF_LEGACY_OR_26655_SOURCE_DOMAIN_B_PLUS_R"
++                    + " localToneOwner=fastLocalLaplacian"
+                     + " localToneGlobalExposureMultiplier=false"
+-                    + " localToneDetailAlpha=SOURCE_PROVEN_ONLY_WHEN_HC_ON"
++                    + " localToneDetailAlpha=1.0"
+                     + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                     + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+                     + " matchedSdrHdrRenditions=true"
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 6f79f4e6acec42666ed9282de4b02dfa7a8876d3..ec01bc82db067b53076d5628f54e8c3a61527e26 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -545,7 +545,7 @@ public class PostPipeline extends GLBasePipeline {
+             final boolean iris26650HighlightCompression =
+                     com.particlesdevs.photoncamera.settings.PreferenceKeys.isHighlightCompressionOn();
+             add(new MotionV2PhotonHighlightCompression(iris26650HighlightCompression));
+-            add(new StageTelemetry("IRIS_26655_PHOTON_HIGHLIGHT_ANALYSIS_KNEE_ONLY"));
++            add(new StageTelemetry("IRIS_26654_PHOTON_HIGHLIGHT_ANALYSIS_KNEE_ONLY"));
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26560_MOTION_SABRE_POST_OWNERSHIP",
+                     "owner=SABRE carrier=RESOLVE_SABRE_LINEAR_RGB"
+@@ -583,7 +583,7 @@ public class PostPipeline extends GLBasePipeline {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+                     "owner=" + motionReconstructionOwnerName(mParameters.motionV2ReconstructionOwner)
+-                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,PhotonHighlightAnalysisOnly,OwnerSpecificPreColor,MotionV2ColorTransform[ACR3-no-highlight-tone],MotionV2ViewfinderExposureMatcher[26652-OFF-brightness-authority],MotionV2DisplayExposure,IrisManualOptional,MotionV2Render[26655-source-domain-B-plus-R-final-spatial-tone],RotateWatermark"
++                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,PhotonHighlightAnalysisOnly,OwnerSpecificPreColor,MotionV2ColorTransform[ACR3-no-highlight-tone],MotionV2ViewfinderExposureMatcher[26652-OFF-brightness-authority],MotionV2DisplayExposure,IrisManualOptional,MotionV2Render[26654-global-tone-plus-bounded-zero-dc-detail],RotateWatermark"
+                             + " spatialHighlightNode=false"
+                             + " directMultiframeRgb=" + directRgbCarrier
+                             + " strictSabreAuthority26560=true"
+diff --git b/app/version.properties a/app/version.properties
+index 3279b5c04d0cd4d2da965371d06568f12179984c..1bf13fbb2ce9635f76161f6993509e571fb9ce64 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726655
+-VERSION_BUILD=26655
++VERSION_NAME=0.9726654
++VERSION_BUILD=26654
