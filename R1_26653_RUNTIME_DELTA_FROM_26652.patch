@@ -1,0 +1,722 @@
+diff --git a/app/src/main/assets/shaders/motionv2/color_transform.glsl b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+index 678170ce0c4842de590aa08c8d57875c31472b29..45911b226763bfd1396d38132410e3886459f4a1 100644
+--- a/app/src/main/assets/shaders/motionv2/color_transform.glsl
++++ b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+@@ -5,10 +5,6 @@ uniform sampler2D InputBuffer;
+ uniform sampler2D ProfileHueSatMap;
+ uniform sampler2D ProfileLookMap;
+ uniform sampler2D Acr3Curve;
+-uniform sampler2D PhotonCurveOff;
+-uniform sampler2D PhotonCurveOn;
+-uniform float photonAdaptiveWhitePoint;
+-uniform vec3 photonCameraNeutral;
+ uniform int acr3CurveSize;
+ uniform int acr3Enabled;
+ uniform int profileHueDivisions;
+@@ -31,9 +27,6 @@ out vec3 Output;
+ #ifndef USE_PROFILE_LOOK
+ #define USE_PROFILE_LOOK 0
+ #endif
+-#ifndef USE_PHOTON_HIGHLIGHT_COMPRESSION
+-#define USE_PHOTON_HIGHLIGHT_COMPRESSION 0
+-#endif
+ 
+ /* IRIS_26628_DNG_HSV_PROFILE_MAP
+  * Independently written equivalent of the DNG HSV table mechanics used by bjzhou.  SensorSpecifics
+@@ -156,20 +149,7 @@ vec3 iris26638ApplyAcr3(vec3 color){
+ void main(){
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+     vec3 cameraRgb=max(texelFetch(InputBuffer,xy,0).rgb,vec3(0.0));
+-#if USE_PHOTON_HIGHLIGHT_COMPRESSION == 1
+-    /* IRIS_26650_EXACT_PHOTON_TOGGLE_DIFFERENTIAL
+-     * Photon applies the same common adaptive-white-point/exposure/Reinhard curve in both OFF and
+-     * ON states; the toggle changes only the final shoulder. Sample both exact curves at the same
+-     * pre-color, white-balanced luminance and apply ON/OFF as one scalar to Iris camera RGB.
+-     * This preserves Iris chromaticity and makes OFF the successful 26648 pixel path. */
+-    vec3 photonRgb=(cameraRgb/max(photonCameraNeutral,vec3(1.0e-6)))
+-            /max(photonAdaptiveWhitePoint,1.0e-6);
+-    float photonLuma=max(dot(photonRgb,vec3(0.299,0.587,0.114)),0.0);
+-    float photonOff=texture(PhotonCurveOff,vec2(photonLuma,0.5)).r;
+-    float photonOn=texture(PhotonCurveOn,vec2(photonLuma,0.5)).r;
+-    float photonToggleRatio=photonOff>1.0e-7?photonOn/photonOff:1.0;
+-    cameraRgb*=clamp(photonToggleRatio,0.0,1.0);
+-#endif
++    /* IRIS_26653_HIGHLIGHT_TONE_DEFERRED_TO_FINAL_RENDER: cameraRgb unchanged here. */
+     vec3 profileRgb=vec3(dot(sensorToProfileRow0,cameraRgb),dot(sensorToProfileRow1,cameraRgb),dot(sensorToProfileRow2,cameraRgb));
+ #if USE_PROFILE_HUESAT == 1
+     profileRgb=iris26628ApplyMap(profileRgb,ProfileHueSatMap,profileHueDivisions,profileSatDivisions,profileValueDivisions);
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index cd3e20bc92f2c2acb71f56fb99a7ab7547183208..a62c028bd3c77289effe00b52b6e575d1e077738 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -15,6 +15,9 @@ uniform float iris26623ToneBroadNearFraction;
+ uniform float iris26623ToneHardFraction;
+ uniform float iris26623ToneBaseSceneWhite;
+ uniform float iris26623ToneAdaptiveSceneWhite;
++uniform int iris26653HighlightCompressionEnabled;
++uniform float iris26653HighlightKnee;
++uniform float iris26653AdaptiveWhitePoint;
+ /* IRIS_26524_UHDR_ZOOM_GEOMETRY_PARITY */
+ out float Output;
+ 
+@@ -111,8 +114,48 @@ float iris26640MapMotionSdrGuide(float sourceGuide){
+     }
+     return mix(legacy,candidate,adaptiveEnable);
+ }
++
++/* IRIS_26653_UHDR_SHARED_FINAL_SDR_TONE
++ * Gain-map intent must model the exact same completed SDR global tone as MotionV2Render. */
++float iris26653MapMotionSdrGuide(float sourceGuide){
++    float x=max(sourceGuide,0.0);
++    float off=iris26640MapMotionSdrGuide(x);
++    if(iris26653HighlightCompressionEnabled==0 || x<=0.65)return off;
++    float requested=max(displayGain,1.0e-6)*hdrExposureScale;
++    float enable=iris26640Smoothstep(1.05,1.25,requested);
++    if(enable<=1.0e-7)return off;
++    float scenePressure=iris26640HighlightPressure();
++    float kneePressure=clamp((0.90-iris26653HighlightKnee)/(0.90-0.55),0.0,1.0);
++    float pressure=max(scenePressure,kneePressure);
++    float targetWhite=mix(0.915,0.890,pressure);
++    float targetSlope=mix(0.090,0.055,pressure);
++    const float startX=0.65;
++    float startValue=0.0; float startSlope=0.0;
++    iris26640LegacyBody(startX,requested,startValue,startSlope);
++    float width=1.0-startX;
++    float secant=(targetWhite-startValue)/width;
++    if(secant<=1.0e-6)return off;
++    float m0=max(startSlope,0.0); float m1=max(targetSlope,0.0);
++    float a=m0/secant; float b=m1/secant; float norm2=a*a+b*b;
++    if(norm2>9.0){float limiter=3.0/sqrt(norm2);m0*=limiter;m1*=limiter;}
++    float candidate;
++    if(x<=1.0){
++        float t=clamp((x-startX)/width,0.0,1.0); float t2=t*t; float t3=t2*t;
++        candidate=(2.0*t3-3.0*t2+1.0)*startValue
++            +(t3-2.0*t2+t)*width*m0
++            +(-2.0*t3+3.0*t2)*targetWhite
++            +(t3-t2)*width*m1;
++    }else{
++        float reserve=max(1.0-targetWhite,0.0);
++        float whiteSpan=max(1.0,sqrt(max(iris26653AdaptiveWhitePoint,1.0)));
++        float tailScale=reserve/max(m1,1.0e-6)*whiteSpan;
++        float excess=x-1.0;
++        candidate=targetWhite+reserve*excess/(excess+tailScale);
++    }
++    return mix(off,candidate,enable);
++}
+ float iris26640SharedSdrGuide(float sourceGuide,vec2 masterSourcePixel){
+-    float globalMapped=iris26640MapMotionSdrGuide(sourceGuide);
++    float globalMapped=iris26653MapMotionSdrGuide(sourceGuide);
+     if(iris26621LocalToneEnabled==0)return globalMapped;
+     vec2 toneSize=vec2(textureSize(iris26621LocalToneLog,0));
+     vec2 uv=(masterSourcePixel+vec2(0.5))/max(toneSize,vec2(1.0));
+@@ -209,7 +252,7 @@ void main(){
+         if(sourceGuide<=1.0e-7 || sourceY<=1.0e-9){
+             ratio=1.0;
+         }else{
+-            float globalSdrGuide=max(iris26640MapMotionSdrGuide(sourceGuide),0.0);
++            float globalSdrGuide=max(iris26653MapMotionSdrGuide(sourceGuide),0.0);
+             float sharedSdrGuide=max(iris26640SharedSdrGuide(sourceGuide,masterSourcePixel),0.0);
+             float localStructureScale=globalSdrGuide>1.0e-7
+                 ? sharedSdrGuide/globalSdrGuide : 1.0;
+diff --git a/app/src/main/assets/shaders/motionv2/local_laplacian_global_log_26621.glsl b/app/src/main/assets/shaders/motionv2/local_laplacian_global_log_26621.glsl
+index b0c4bb5b7c60c095a89d7329b6db755090463ed9..f0ce120b5c543dd2912e0b3cf085476100e4cf29 100644
+--- a/app/src/main/assets/shaders/motionv2/local_laplacian_global_log_26621.glsl
++++ b/app/src/main/assets/shaders/motionv2/local_laplacian_global_log_26621.glsl
+@@ -9,6 +9,9 @@ uniform float iris26623ToneBroadNearFraction;
+ uniform float iris26623ToneHardFraction;
+ uniform float iris26623ToneBaseSceneWhite;
+ uniform float iris26623ToneAdaptiveSceneWhite;
++uniform int iris26653HighlightCompressionEnabled;
++uniform float iris26653HighlightKnee;
++uniform float iris26653AdaptiveWhitePoint;
+ out float Output;
+ 
+ const vec3 IRIS_LUMA = vec3(0.22897456,0.69173852,0.07928691);
+@@ -128,9 +131,53 @@ float iris26623MapMotionSdrFinalGuide(float sourceGuide){
+     return mix(legacy,candidate,adaptiveEnable);
+ }
+ 
++/* IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE
++ * OFF is exact 26652. ON is applied only after brightnessTargetGain/displayGain is frozen.
++ * Below source guide 0.65 the map is exactly OFF; above it one C1 monotone curve preserves
++ * visible spacing of the real extended-linear >1.0 HDR master. */
++float iris26653MapMotionSdrFinalGuide(float sourceGuide){
++    float x=max(sourceGuide,0.0);
++    float off=iris26623MapMotionSdrFinalGuide(x);
++    if(iris26653HighlightCompressionEnabled==0 || x<=0.65)return off;
++    float requested=max(displayGain,1.0e-6)*max(outputExposureScale,1.0e-6);
++    float enable=smoothstep(1.05,1.25,requested);
++    if(enable<=1.0e-7)return off;
++    float scenePressure=iris26623HighlightPressure();
++    float kneePressure=clamp((0.90-iris26653HighlightKnee)/(0.90-0.55),0.0,1.0);
++    float pressure=max(scenePressure,kneePressure);
++    float targetWhite=mix(0.915,0.890,pressure);
++    float targetSlope=mix(0.090,0.055,pressure);
++    const float startX=0.65;
++    float startValue=0.0; float startSlope=0.0;
++    iris26623LegacyBody(startX,requested,startValue,startSlope);
++    float width=1.0-startX;
++    float secant=(targetWhite-startValue)/width;
++    if(secant<=1.0e-6)return off;
++    float m0=max(startSlope,0.0);
++    float m1=max(targetSlope,0.0);
++    float a=m0/secant; float b=m1/secant;
++    float norm2=a*a+b*b;
++    if(norm2>9.0){float limiter=3.0/sqrt(norm2);m0*=limiter;m1*=limiter;}
++    float candidate;
++    if(x<=1.0){
++        float t=clamp((x-startX)/width,0.0,1.0);
++        float t2=t*t; float t3=t2*t;
++        candidate=(2.0*t3-3.0*t2+1.0)*startValue
++            +(t3-2.0*t2+t)*width*m0
++            +(-2.0*t3+3.0*t2)*targetWhite
++            +(t3-t2)*width*m1;
++    }else{
++        float reserve=max(1.0-targetWhite,0.0);
++        float whiteSpan=max(1.0,sqrt(max(iris26653AdaptiveWhitePoint,1.0)));
++        float tailScale=reserve/max(m1,1.0e-6)*whiteSpan;
++        float excess=x-1.0;
++        candidate=targetWhite+reserve*excess/(excess+tailScale);
++    }
++    return mix(off,candidate,enable);
++}
+ 
+ void main(){
+     ivec2 p=ivec2(gl_FragCoord.xy);
+-    float mapped=iris26623MapMotionSdrFinalGuide(irisGuide(texelFetch(InputBuffer,p,0).rgb));
++    float mapped=iris26653MapMotionSdrFinalGuide(irisGuide(texelFetch(InputBuffer,p,0).rgb));
+     Output=log2(max(mapped,IRIS_LOG_FLOOR));
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 0a41823ba90c022ec19d840318d8173d2d9d438c..f220974fac6c8d00c5f917cf13bdeeca99039da8 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -13,6 +13,9 @@ uniform float iris26623ToneBroadNearFraction;
+ uniform float iris26623ToneHardFraction;
+ uniform float iris26623ToneBaseSceneWhite;
+ uniform float iris26623ToneAdaptiveSceneWhite;
++uniform int iris26653HighlightCompressionEnabled;
++uniform float iris26653HighlightKnee;
++uniform float iris26653AdaptiveWhitePoint;
+ uniform float iris26630MotionSaturation;
+ /* IRIS_26524_FULLSIZE_MOTION_ZOOM_RENDER */
+ out vec3 Output;
+@@ -210,9 +213,54 @@ float iris26623MapMotionSdrFinalGuide(float sourceGuide){
+ }
+ 
+ 
++/* IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE
++ * OFF is exact 26652. ON is applied only after brightnessTargetGain/displayGain is frozen.
++ * Below source guide 0.65 the map is exactly OFF; above it one C1 monotone curve preserves
++ * visible spacing of the real extended-linear >1.0 HDR master. */
++float iris26653MapMotionSdrFinalGuide(float sourceGuide){
++    float x=max(sourceGuide,0.0);
++    float off=iris26623MapMotionSdrFinalGuide(x);
++    if(iris26653HighlightCompressionEnabled==0 || x<=0.65)return off;
++    float requested=max(displayGain,1.0e-6)*max(outputExposureScale,1.0e-6);
++    float enable=smoothstep(1.05,1.25,requested);
++    if(enable<=1.0e-7)return off;
++    float scenePressure=iris26623HighlightPressure();
++    float kneePressure=clamp((0.90-iris26653HighlightKnee)/(0.90-0.55),0.0,1.0);
++    float pressure=max(scenePressure,kneePressure);
++    float targetWhite=mix(0.915,0.890,pressure);
++    float targetSlope=mix(0.090,0.055,pressure);
++    const float startX=0.65;
++    float startValue=0.0; float startSlope=0.0;
++    iris26623LegacyBody(startX,requested,startValue,startSlope);
++    float width=1.0-startX;
++    float secant=(targetWhite-startValue)/width;
++    if(secant<=1.0e-6)return off;
++    float m0=max(startSlope,0.0);
++    float m1=max(targetSlope,0.0);
++    float a=m0/secant; float b=m1/secant;
++    float norm2=a*a+b*b;
++    if(norm2>9.0){float limiter=3.0/sqrt(norm2);m0*=limiter;m1*=limiter;}
++    float candidate;
++    if(x<=1.0){
++        float t=clamp((x-startX)/width,0.0,1.0);
++        float t2=t*t; float t3=t2*t;
++        candidate=(2.0*t3-3.0*t2+1.0)*startValue
++            +(t3-2.0*t2+t)*width*m0
++            +(-2.0*t3+3.0*t2)*targetWhite
++            +(t3-t2)*width*m1;
++    }else{
++        float reserve=max(1.0-targetWhite,0.0);
++        float whiteSpan=max(1.0,sqrt(max(iris26653AdaptiveWhitePoint,1.0)));
++        float tailScale=reserve/max(m1,1.0e-6)*whiteSpan;
++        float excess=x-1.0;
++        candidate=targetWhite+reserve*excess/(excess+tailScale);
++    }
++    return mix(off,candidate,enable);
++}
++
+ float mapFinalSdrGuide(float sourceGuide) {
+     if(iris26592MotionHdrHandoff!=0) {
+-        return iris26623MapMotionSdrFinalGuide(sourceGuide);
++        return iris26653MapMotionSdrFinalGuide(sourceGuide);
+     }
+ 
+     float start=0.50;
+@@ -362,7 +410,7 @@ void main() {
+         float sourcePeak=max3(sourceRgb);
+         float sourceGuide=max(sourceY,sourcePeak);
+         if(sourceGuide>1.0e-7){
+-            float globalMapped=iris26623MapMotionSdrFinalGuide(sourceGuide);
++            float globalMapped=iris26653MapMotionSdrFinalGuide(sourceGuide);
+             vec2 toneSize=vec2(textureSize(iris26621LocalToneLog,0));
+             vec2 uv=(sourcePixel+vec2(0.5))/max(toneSize,vec2(1.0));
+             vec2 halfTexel=vec2(0.5)/max(toneSize,vec2(1.0));
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 788214bcd6d3f7eab220eed7e89dbfa050894828..533614cebaf19dcb22b7bded3f51aa6577e02cbf 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2792,6 +2792,31 @@ internal object GlesMgcRawSabreShaders {
+             vec4 q = texture(uShortExtractedBayer, clamp(uv, vec2(0.0), vec2(1.0)));
+             return dot(max(q, vec4(0.0)), vec4(0.25));
+         }
++        float normalFineStructureProtection() {
++            /* IRIS_26653_FULL_RES_FINE_STRUCTURE_SHORT_RADIANCE_GUARD
++             * The packed SHORT guide cannot prove one-pixel/two-pixel ridge phase. Detect such
++             * structure directly in the full-resolution NORMAL master. On coherent fine detail,
++             * an interpolated SHORT> NORMAL brightness difference is not sufficient evidence of
++             * radiometric loss; measured NORMAL source-validity loss is still allowed to recover.
++             * This is semantic-independent: lamp ribs, hair, fabric, needles, text and wires use
++             * the same second-derivative proof. */
++            ivec2 c = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uOutputSize - ivec2(1));
++            ivec2 lP = clamp(c + ivec2(-1, 0), ivec2(0), uOutputSize - ivec2(1));
++            ivec2 rP = clamp(c + ivec2( 1, 0), ivec2(0), uOutputSize - ivec2(1));
++            ivec2 dP = clamp(c + ivec2( 0,-1), ivec2(0), uOutputSize - ivec2(1));
++            ivec2 uP = clamp(c + ivec2( 0, 1), ivec2(0), uOutputSize - ivec2(1));
++            float cc = luma(max(texelFetch(uNormalMean, c, 0).rgb, vec3(0.0)));
++            float ll = luma(max(texelFetch(uNormalMean, lP, 0).rgb, vec3(0.0)));
++            float rr = luma(max(texelFetch(uNormalMean, rP, 0).rgb, vec3(0.0)));
++            float dd = luma(max(texelFetch(uNormalMean, dP, 0).rgb, vec3(0.0)));
++            float uu = luma(max(texelFetch(uNormalMean, uP, 0).rgb, vec3(0.0)));
++            float scale = max(max(cc, 0.25 * (ll + rr + dd + uu)), 0.035);
++            float lap = abs((ll + rr + dd + uu) - 4.0 * cc) / (4.0 * scale);
++            float ridgeX = abs(ll - 2.0 * cc + rr) / (2.0 * scale);
++            float ridgeY = abs(dd - 2.0 * cc + uu) / (2.0 * scale);
++            return smoothstep(0.035, 0.120, max(lap, max(ridgeX, ridgeY)));
++        }
++
+         float edgeCorrespondence(vec2 referenceUv, vec2 sampleUv) {
+             /* IRIS_26651_MEASURABLE_EDGE_CORRESPONDENCE
+              * Compare edge direction at the exact production warp on the 2x2-CFA-quad scale.
+@@ -3128,7 +3153,12 @@ internal object GlesMgcRawSabreShaders {
+             vec3 radiometricLossByChannel = smoothstep(vec3(0.05), vec3(0.12), relativeLoss) *
+                 smoothstep(vec3(0.55), vec3(0.90), max(shortRgb, vec3(0.0)));
+             float effectiveRadiometricLoss = secondHighest3(radiometricLossByChannel);
+-            float measuredNormalLoss = max(1.0 - normalSourceConfidence, effectiveRadiometricLoss);
++            float physicalNormalLoss = clamp(1.0 - normalSourceConfidence, 0.0, 1.0);
++            float fineStructure = normalFineStructureProtection();
++            float fineStructurePhysicalSupport = smoothstep(0.20, 0.70, physicalNormalLoss);
++            float inferredRadiometricLoss = effectiveRadiometricLoss *
++                mix(1.0, fineStructurePhysicalSupport, fineStructure);
++            float measuredNormalLoss = max(physicalNormalLoss, inferredRadiometricLoss);
+             float edgeTrust = edgeCorrespondence(referenceUv, sampleUv);
+             float shortConfidence = physicalWeight * alignmentConfidence * edgeTrust *
+                 shortSourceConfidence * shortSnrConfidence;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+index 6995c2208c33c69c75a247492735e5609698d12d..85226d3575515bff95e12f32e508b7eaa170f279 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+@@ -34,17 +34,6 @@ public final class MotionV2ColorTransform extends Node {
+         profileHueSatTexture = null;
+         profileLookTexture = null;
+         acr3Texture = null;
+-        if (basePipeline instanceof PostPipeline) {
+-            PostPipeline pipeline = (PostPipeline) basePipeline;
+-            if (pipeline.motionV2PhotonCurveOff != null) {
+-                try { pipeline.motionV2PhotonCurveOff.close(); } catch (Throwable ignored) {}
+-                pipeline.motionV2PhotonCurveOff = null;
+-            }
+-            if (pipeline.motionV2PhotonCurveOn != null) {
+-                try { pipeline.motionV2PhotonCurveOn.close(); } catch (Throwable ignored) {}
+-                pipeline.motionV2PhotonCurveOn = null;
+-            }
+-        }
+     }
+ 
+     @Override
+@@ -77,21 +66,15 @@ public final class MotionV2ColorTransform extends Node {
+         if (hasHueSat) glProg.setDefine("USE_PROFILE_HUESAT", 1);
+         if (hasLook) glProg.setDefine("USE_PROFILE_LOOK", 1);
+         final PostPipeline pipeline = (PostPipeline) basePipeline;
+-        final boolean iris26650HighlightCompression =
++        final boolean iris26653HighlightCompression =
+                 basePipeline.mParameters.motionV2Active
+                         && pipeline.motionV2PhotonHighlightCompressionEnabled;
+-        if (iris26650HighlightCompression) glProg.setDefine("USE_PHOTON_HIGHLIGHT_COMPRESSION", 1);
+         glProg.useAssetProgram("motionv2/color_transform");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+-        if (iris26650HighlightCompression) {
+-            if (pipeline.motionV2PhotonCurveOff == null || pipeline.motionV2PhotonCurveOn == null) {
+-                throw new IllegalStateException("26650 enabled Highlight Compression missing Photon curves");
+-            }
+-            glProg.setTexture("PhotonCurveOff", pipeline.motionV2PhotonCurveOff);
+-            glProg.setTexture("PhotonCurveOn", pipeline.motionV2PhotonCurveOn);
+-            glProg.setVar("photonAdaptiveWhitePoint", pipeline.motionV2PhotonAdaptiveWhitePoint);
+-            glProg.setVar("photonCameraNeutral", cameraNeutral);
+-        }
++        /* IRIS_26653_NO_PRECOLOR_HIGHLIGHT_TONE
++         * Highlight Compression is analysis-only here. Color formation receives the exact fused
++         * extended-linear carrier; the final common-RGB scalar tone is applied only after the
++         * viewfinder brightness target is frozen. */
+ 
+         /* IRIS_26638_ACR3_SINGLE_TABLE_OWNER
+          * The exact bjzhou default ACR3 samples are the sole photographic RGB-rendering curve
+@@ -145,11 +128,12 @@ public final class MotionV2ColorTransform extends Node {
+                 + " negativeProfileExcursionMapBypass=true"
+                 + " neutralAxisNegativeGamutFit=true"
+                 + " legacyPhotonColorAffected=false"
+-                + " photonHighlightCompression=" + iris26650HighlightCompression
++                + " photonHighlightCompression=" + iris26653HighlightCompression
+                 + " photonHighlightKnee=" + pipeline.motionV2PhotonHighlightKnee
+                 + " photonClippedFraction=" + pipeline.motionV2PhotonHighlightClippedFraction
+                 + " photonAdaptiveWhitePoint=" + pipeline.motionV2PhotonAdaptiveWhitePoint
+-                + " photonToggleDifferentialPreColor=true"
++                + " photonToggleDifferentialPreColor=false"
++                + " photonHighlightFinalToneOwner=MotionV2Render26653"
+                 + " dngAffected=false");
+     }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java
+index bc57491210cc94a580ecd17bf97e00220b7c2f1a..7d44501ccb0dc59d0f894a8ef02c155cb543e49d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PhotonHighlightCompression.java
+@@ -1,17 +1,10 @@
+ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+ 
+-import android.graphics.Point;
+-
+-import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+-import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+ import com.particlesdevs.photoncamera.processing.opengl.scripts.GLHistogram;
+-import com.particlesdevs.photoncamera.util.BufferUtils;
+ import com.particlesdevs.photoncamera.util.Log;
+ import com.particlesdevs.photoncamera.util.MotionTrace;
+ 
+-import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+-import static android.opengl.GLES20.GL_LINEAR;
+ 
+ /**
+  * IRIS_26650_PHOTON_HIGHLIGHT_COMPRESSION_ANALYSIS_OWNER
+@@ -204,19 +197,15 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+         pipeline.motionV2PhotonHighlightKnee = enabled ? knee : 1.0f;
+         pipeline.motionV2PhotonHighlightClippedFraction = clippedFraction;
+ 
+-        if (enabled) {
+-            pipeline.motionV2PhotonCurveOff = new GLTexture(
+-                    new Point(CURVE_SIZE, 1), new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+-                    BufferUtils.getFrom(curveOff), GL_LINEAR, GL_CLAMP_TO_EDGE);
+-            pipeline.motionV2PhotonCurveOn = new GLTexture(
+-                    new Point(CURVE_SIZE, 1), new GLFormat(GLFormat.DataType.FLOAT_32, 1),
+-                    BufferUtils.getFrom(curveOn), GL_LINEAR, GL_CLAMP_TO_EDGE);
+-        }
++        /* IRIS_26653_ANALYSIS_ONLY_NO_PRECOLOR_PIXEL_OWNER
++         * Keep Photon's histogram/white/knee analysis exactly as measurement evidence, but never
++         * publish a pre-color pixel curve. The user toggle is consumed only by MotionV2Render's
++         * final extended-linear SDR tone authority after brightnessTargetGain is frozen. */
+ 
+-        final String line = "IRIS_26650_PHOTON_HIGHLIGHT_COMPRESSION"
++        final String line = "IRIS_26653_PHOTON_HIGHLIGHT_ANALYSIS"
+                 + " enabled=" + enabled
+-                + " owner=preColorSabreCameraRgb"
+-                + " toggleApplication=exactOnOverOffCurveRatio"
++                + " owner=analysisOnlyFinalToneConsumer"
++                + " toggleApplication=finalExtendedLinearToneOnly"
+                 + " photonCommonAnalysis=true"
+                 + " histSize=" + HIST_SIZE
+                 + " histogramResize=3"
+@@ -266,11 +255,13 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+                 + " curveOnEnd=" + curveOn[CURVE_SIZE - 1]
+                 + " curveActiveSamples=" + activeSamples
+                 + " curveMaxDelta=" + maxDelta
++                + " preColorPixelModification=false"
++                + " brightnessMatcherCompensation=false"
+                 + " shortFusionUnchanged=true"
+                 + " irisColorUnchanged=true"
+                 + " heicUhHdrUnchanged=true";
+         Log.i(Name, line);
+-        try { MotionTrace.processingState("IRIS_26650_PHOTON_HIGHLIGHT_COMPRESSION", line); }
++        try { MotionTrace.processingState("IRIS_26653_PHOTON_HIGHLIGHT_ANALYSIS", line); }
+         catch (Throwable ignored) {}
+ 
+         WorkingTexture = previousNode.WorkingTexture;
+@@ -278,10 +269,7 @@ public final class MotionV2PhotonHighlightCompression extends Node {
+     }
+ 
+     private static void clearPublishedCurves(PostPipeline p) {
+-        if (p.motionV2PhotonCurveOff != null) try { p.motionV2PhotonCurveOff.close(); } catch (Throwable ignored) {}
+-        if (p.motionV2PhotonCurveOn != null) try { p.motionV2PhotonCurveOn.close(); } catch (Throwable ignored) {}
+-        p.motionV2PhotonCurveOff = null;
+-        p.motionV2PhotonCurveOn = null;
++        /* IRIS_26653: no pre-color curve textures exist; reset analysis parameters only. */
+         p.motionV2PhotonHighlightCompressionEnabled = false;
+         p.motionV2PhotonAdaptiveWhitePoint = 1.0f;
+         p.motionV2PhotonHighlightKnee = 1.0f;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 1e8758eaede516798591bc48ba01cc48414a8e4d..b84936cc78035e93439f23a87010e88f40e92393 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -119,6 +119,13 @@ public final class MotionV2Render extends Node {
+     public static final float IRIS_26623_BROAD_WHITE_ANCHOR = 0.925f;
+     public static final float IRIS_26623_SPARSE_WHITE_SLOPE = 0.360f;
+     public static final float IRIS_26623_BROAD_WHITE_SLOPE = 0.300f;
++    /* IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE constants. OFF remains exact 26652. */
++    private static final float IRIS_26653_HC_WEAK_WHITE_ANCHOR = 0.915f;
++    private static final float IRIS_26653_HC_STRONG_WHITE_ANCHOR = 0.890f;
++    private static final float IRIS_26653_HC_WEAK_WHITE_SLOPE = 0.090f;
++    private static final float IRIS_26653_HC_STRONG_WHITE_SLOPE = 0.055f;
++    private static final float IRIS_26653_PHOTON_KNEE_MAX = 0.90f;
++    private static final float IRIS_26653_PHOTON_KNEE_MIN = 0.55f;
+     private static final float IRIS_26626_SOURCE_PRESERVATION_MAX = 0.30f;
+     /* IRIS_26635_SPATIALLY_COHERENT_HIGHLIGHT_ROLLOFF
+      * Recombine the completed Local-Laplacian tone from a 1/32-scale mapped illumination base
+@@ -237,6 +244,84 @@ public final class MotionV2Render extends Node {
+         return legacy + (candidate - legacy) * adaptiveEnable;
+     }
+ 
++    /* IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE_REFERENCE
++     * OFF is bit-for-math identical to 26652. ON is applied only after brightnessTargetGain is
++     * frozen. Below 0.65 it is exact identity to OFF; above that point one C1 monotone curve
++     * reserves visible SDR spacing for the true extended-linear >1.0 master. */
++    static float iris26653MapMotionSdrFinalGuide(float sourceGuide, float brightnessTargetGain,
++                                                  float broadNearFraction, float hardFraction,
++                                                  float baseSceneWhite, float adaptiveSceneWhite,
++                                                  boolean highlightCompressionEnabled,
++                                                  float photonHighlightKnee,
++                                                  float photonAdaptiveWhitePoint) {
++        final float x = Math.max(sourceGuide, 0.0f);
++        final float off = iris26623MapMotionSdrFinalGuide(x, brightnessTargetGain,
++                broadNearFraction, hardFraction, baseSceneWhite, adaptiveSceneWhite);
++        if (!highlightCompressionEnabled || x <= IRIS_26623_UPPER_TONE_START) return off;
++        final float requested = Math.max(brightnessTargetGain, 1.0e-6f) * OUTPUT_EXPOSURE_SCALE;
++        final float enable = iris26623Smoothstep(1.05f, 1.25f, requested);
++        if (enable <= 1.0e-7f) return off;
++
++        final float scenePressure = iris26623HighlightPressure(
++                broadNearFraction, hardFraction, baseSceneWhite, adaptiveSceneWhite);
++        final float kneePressure = iris26582Clamp(
++                (IRIS_26653_PHOTON_KNEE_MAX - photonHighlightKnee)
++                        / (IRIS_26653_PHOTON_KNEE_MAX - IRIS_26653_PHOTON_KNEE_MIN),
++                0.0f, 1.0f);
++        final float pressure = Math.max(scenePressure, kneePressure);
++        final float targetWhite = IRIS_26653_HC_WEAK_WHITE_ANCHOR
++                + (IRIS_26653_HC_STRONG_WHITE_ANCHOR - IRIS_26653_HC_WEAK_WHITE_ANCHOR) * pressure;
++        final float targetSlope = IRIS_26653_HC_WEAK_WHITE_SLOPE
++                + (IRIS_26653_HC_STRONG_WHITE_SLOPE - IRIS_26653_HC_WEAK_WHITE_SLOPE) * pressure;
++
++        final float oldWhiteAnchor = Math.min(IRIS_26621_SDR_WHITE_ANCHOR, requested);
++        float bodyGain = requested;
++        if (requested > oldWhiteAnchor) bodyGain = Math.min(requested, 4.0f * oldWhiteAnchor - 1.0e-4f);
++        final float safeWhite = Math.max(oldWhiteAnchor, 1.0e-6f);
++        final float ratio = Math.max(bodyGain / safeWhite - 1.0f, 0.0f);
++        final float startX = IRIS_26623_UPPER_TONE_START;
++        final float oneMinus = 1.0f - startX;
++        final float cubic = oldWhiteAnchor * startX
++                + (bodyGain - oldWhiteAnchor) * startX * oneMinus * oneMinus;
++        final float rational = bodyGain * startX / (1.0f + ratio * startX);
++        final float startValue = 0.5f * (cubic + rational);
++        final float cubicDerivative = oldWhiteAnchor
++                + (bodyGain - oldWhiteAnchor) * oneMinus * (1.0f - 3.0f * startX);
++        final float rationalDerivative = bodyGain
++                / ((1.0f + ratio * startX) * (1.0f + ratio * startX));
++        final float startSlope = 0.5f * (cubicDerivative + rationalDerivative);
++        final float width = 1.0f - startX;
++        final float secant = (targetWhite - startValue) / width;
++        if (secant <= 1.0e-6f) return off;
++        float m0 = Math.max(startSlope, 0.0f);
++        float m1 = Math.max(targetSlope, 0.0f);
++        final float norm2 = (m0 / secant) * (m0 / secant) + (m1 / secant) * (m1 / secant);
++        if (norm2 > 9.0f) {
++            final float limiter = 3.0f / (float)Math.sqrt(norm2);
++            m0 *= limiter;
++            m1 *= limiter;
++        }
++
++        final float candidate;
++        if (x <= 1.0f) {
++            final float t = iris26582Clamp((x - startX) / width, 0.0f, 1.0f);
++            final float t2 = t * t;
++            final float t3 = t2 * t;
++            candidate = (2.0f * t3 - 3.0f * t2 + 1.0f) * startValue
++                    + (t3 - 2.0f * t2 + t) * width * m0
++                    + (-2.0f * t3 + 3.0f * t2) * targetWhite
++                    + (t3 - t2) * width * m1;
++        } else {
++            final float reserve = Math.max(1.0f - targetWhite, 0.0f);
++            final float whiteSpan = Math.max(1.0f,
++                    (float)Math.sqrt(Math.max(photonAdaptiveWhitePoint, 1.0f)));
++            final float tailScale = reserve / Math.max(m1, 1.0e-6f) * whiteSpan;
++            final float excess = x - 1.0f;
++            candidate = targetWhite + reserve * excess / (excess + tailScale);
++        }
++        return off + (candidate - off) * enable;
++    }
++
+     static float iris26614MapHdrTargetLuma(float hdrBase) {
+         return hdrBase;
+     }
+@@ -403,6 +488,15 @@ public final class MotionV2Render extends Node {
+                 basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite);
+     }
+ 
++    private void iris26653SetFinalToneUniforms() {
++        iris26623SetAdaptiveUpperToneUniforms();
++        PostPipeline p = (PostPipeline) basePipeline;
++        glProg.setVar("iris26653HighlightCompressionEnabled",
++                p.motionV2PhotonHighlightCompressionEnabled ? 1 : 0);
++        glProg.setVar("iris26653HighlightKnee", p.motionV2PhotonHighlightKnee);
++        glProg.setVar("iris26653AdaptiveWhitePoint", p.motionV2PhotonAdaptiveWhitePoint);
++    }
++
+     /* IRIS_26626_BOUNDED_SOURCE_DOMAIN_LOCAL_LAPLACIAN_REFERENCE
+      * 26625 remains the canonical baseline. A second transient Local-Laplacian pass uses the
+      * original source-domain guide and source references, but maps every reference center through
+@@ -424,13 +518,17 @@ public final class MotionV2Render extends Node {
+ 
+     private float iris26626MappedReferenceLog(float sourceReferenceLog) {
+         final float sourceGuide = (float)Math.pow(2.0, sourceReferenceLog);
+-        final float mappedGuide = iris26623MapMotionSdrFinalGuide(
++        final PostPipeline p = (PostPipeline) basePipeline;
++        final float mappedGuide = iris26653MapMotionSdrFinalGuide(
+                 sourceGuide,
+                 basePipeline.mParameters.motionV2DisplayGain,
+                 basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                 basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                 basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+-                basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite);
++                basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
++                p.motionV2PhotonHighlightCompressionEnabled,
++                p.motionV2PhotonHighlightKnee,
++                p.motionV2PhotonAdaptiveWhitePoint);
+         return (float)(Math.log(Math.max(mappedGuide, 0.000244140625f)) / Math.log(2.0));
+     }
+ 
+@@ -546,7 +644,7 @@ public final class MotionV2Render extends Node {
+             glProg.setTexture("InputBuffer", coarsestLinear);
+             glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+             glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+-            iris26623SetAdaptiveUpperToneUniforms();
++            iris26653SetFinalToneUniforms();
+             glProg.drawBlocks(reconstruction);
+             try { coarsestLinear.close(); } catch (Throwable ignored) {}
+             coarsestLinear = null;
+@@ -640,7 +738,7 @@ public final class MotionV2Render extends Node {
+             glProg.setTexture("InputBuffer", source);
+             glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+             glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+-            iris26623SetAdaptiveUpperToneUniforms();
++            iris26653SetFinalToneUniforms();
+             glProg.drawBlocks(guide[0]);
+ 
+             for (int level = 1; level < IRIS_26621_LAPLACIAN_LEVELS; level++) {
+@@ -904,7 +1002,7 @@ public final class MotionV2Render extends Node {
+             glProg.setVar("iris26592MotionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+             glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+             glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+-            iris26623SetAdaptiveUpperToneUniforms();
++            iris26653SetFinalToneUniforms();
+             glProg.setVar("irisOutputZoom", irisOutputZoom);
+             glProg.setVar("iris26630MotionSaturation", iris26630MotionSaturation);
+             glProg.setVar("iris26621LocalToneEnabled", iris26621LocalTone != null ? 1 : 0);
+@@ -975,7 +1073,7 @@ public final class MotionV2Render extends Node {
+                 if (basePipeline.mParameters.motionV2Active && iris26621LocalTone != null) {
+                     glProg.setTexture("iris26621LocalToneLog", iris26621LocalTone);
+                 }
+-                iris26623SetAdaptiveUpperToneUniforms();
++                iris26653SetFinalToneUniforms();
+ 
+                 glProg.setVar("irisOutputZoom", irisOutputZoom);
+                 glProg.drawBlocks(gainTexture);
+@@ -1166,6 +1264,46 @@ public final class MotionV2Render extends Node {
+                     + (IRIS_26623_BROAD_WHITE_ANCHOR - IRIS_26623_SPARSE_WHITE_ANCHOR) * iris26623Pressure;
+             final float iris26623WhiteSlope = IRIS_26623_SPARSE_WHITE_SLOPE
+                     + (IRIS_26623_BROAD_WHITE_SLOPE - IRIS_26623_SPARSE_WHITE_SLOPE) * iris26623Pressure;
++            final PostPipeline iris26653Pipeline = (PostPipeline) basePipeline;
++            final boolean iris26653Enabled = iris26653Pipeline.motionV2PhotonHighlightCompressionEnabled;
++            final float iris26653Knee = iris26653Pipeline.motionV2PhotonHighlightKnee;
++            final float iris26653White = iris26653Pipeline.motionV2PhotonAdaptiveWhitePoint;
++            final float iris26653At1 = iris26653MapMotionSdrFinalGuide(1.0f,
++                    basePipeline.mParameters.motionV2DisplayGain,
++                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
++                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
++                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
++                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
++                    iris26653Enabled, iris26653Knee, iris26653White);
++            final float iris26653At125 = iris26653MapMotionSdrFinalGuide(1.25f,
++                    basePipeline.mParameters.motionV2DisplayGain,
++                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
++                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
++                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
++                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
++                    iris26653Enabled, iris26653Knee, iris26653White);
++            final float iris26653At2 = iris26653MapMotionSdrFinalGuide(2.0f,
++                    basePipeline.mParameters.motionV2DisplayGain,
++                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
++                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
++                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
++                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
++                    iris26653Enabled, iris26653Knee, iris26653White);
++            Log.i(Name, "IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE"
++                    + " enabled=" + iris26653Enabled
++                    + " owner=MotionV2RenderAfterBrightnessSolve"
++                    + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
++                    + " matcherUses26652OffMap=true"
++                    + " lowerToneExactThrough=" + IRIS_26623_UPPER_TONE_START
++                    + " photonKnee=" + iris26653Knee
++                    + " photonAdaptiveWhitePoint=" + iris26653White
++                    + " map1=" + iris26653At1
++                    + " map1p25=" + iris26653At125
++                    + " map2=" + iris26653At2
++                    + " localLaplacianSharedMap=true"
++                    + " gainMapSharedMap=true"
++                    + " preColorDifferential=false");
++
+             Log.i(Name, "IRIS_26623_SCENE_ADAPTIVE_UPPER_TONE"
+                     + " master=extendedLinearPreTone"
+                     + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index c062589d66b09003bd3199a04401bacc9021ac10..28bd5807cdb0e7914ffbb39e0607c91956f35cea 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -48,8 +48,6 @@ public class PostPipeline extends GLBasePipeline {
+     /* IRIS_26650_PHOTON_HIGHLIGHT_COMPRESSION_HANDOFF
+      * Analysis curves are created from the pre-color Sabre camera RGB and consumed exactly once
+      * by MotionV2ColorTransform. OFF publishes no textures and is the 26648 pixel path. */
+-    public GLTexture motionV2PhotonCurveOff;
+-    public GLTexture motionV2PhotonCurveOn;
+     public boolean motionV2PhotonHighlightCompressionEnabled = false;
+     public float motionV2PhotonAdaptiveWhitePoint = 1.0f;
+     public float motionV2PhotonHighlightKnee = 1.0f;
+@@ -547,7 +545,7 @@ public class PostPipeline extends GLBasePipeline {
+             final boolean iris26650HighlightCompression =
+                     com.particlesdevs.photoncamera.settings.PreferenceKeys.isHighlightCompressionOn();
+             add(new MotionV2PhotonHighlightCompression(iris26650HighlightCompression));
+-            add(new StageTelemetry("IRIS_26650_PHOTON_HIGHLIGHT_COMPRESSION_ANALYSIS"));
++            add(new StageTelemetry("IRIS_26653_PHOTON_HIGHLIGHT_ANALYSIS_FINAL_TONE_OWNER"));
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26560_MOTION_SABRE_POST_OWNERSHIP",
+                     "owner=SABRE carrier=RESOLVE_SABRE_LINEAR_RGB"
+@@ -585,7 +583,7 @@ public class PostPipeline extends GLBasePipeline {
+             com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                     "IRIS_26410_MOTION_V2_POST_GRAPH",
+                     "owner=" + motionReconstructionOwnerName(mParameters.motionV2ReconstructionOwner)
+-                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,PhotonHighlightCompressionAnalysis,OwnerSpecificPreColor,MotionV2ColorTransform[ACR3+PhotonToggleDifferential],MotionV2ViewfinderExposureMatcher,MotionV2DisplayExposure,IrisManualOptional,MotionV2Render,RotateWatermark"
++                            + " nodes=MotionV2CfaInput,DirectRGB-or-CFAFallback,PhotonHighlightAnalysisOnly,OwnerSpecificPreColor,MotionV2ColorTransform[ACR3-no-highlight-tone],MotionV2ViewfinderExposureMatcher[26652-OFF-brightness-authority],MotionV2DisplayExposure,IrisManualOptional,MotionV2Render[26653-single-final-highlight-tone],RotateWatermark"
+                             + " spatialHighlightNode=false"
+                             + " directMultiframeRgb=" + directRgbCarrier
+                             + " strictSabreAuthority26560=true"
+diff --git a/app/version.properties b/app/version.properties
+index 23ab95e9563e5274dab95786d2232802ff90022b..0813a9b5204b5477da933a144524c8d17126a88f 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726652
+-VERSION_BUILD=26652
++VERSION_NAME=0.9726653
++VERSION_BUILD=26653
