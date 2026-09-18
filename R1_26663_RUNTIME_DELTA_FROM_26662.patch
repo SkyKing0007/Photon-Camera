@@ -1,0 +1,222 @@
+diff --git a/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl b/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
+index ca6c52c963e45000a2731a9335ee0564b448fbc0..d2002afb2bd9a550f24796c2aaaad36d19a65471 100644
+--- a/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
++++ b/app/src/main/assets/shaders/motionv2/local_laplacian_remap_26621.glsl
+@@ -17,6 +17,7 @@ uniform float edgeSlope;
+ uniform float iris26626PreservationStrength;
+ uniform float iris26639ShadowBodyStrength;
+ uniform float iris26639ShadowBodyEnd;
++uniform float iris26663CanonicalBodyLiftEv;
+ uniform int iris26650HighlightCompressionEnabled;
+ uniform int iris26626Mode;
+ out float Output;
+@@ -232,6 +233,16 @@ void main(){
+         float bodyBump=16.0*bodyT*bodyT*(1.0-bodyT)*(1.0-bodyT);
+         float bodyScale=exp2(-0.25*bodyStrength*bodyBump);
+         float shadowBase=baseOut*bodyScale;
++        /* IRIS_26663_CANONICAL_BODY_LOCAL_RECOVERY
++         * Reclaim only the low-frequency body brightness that remains below the stable 26660 65%
++         * global viewfinder match after a highlight-protected capture. The C1 gates are exact zero
++         * near true black and from the upper-mid/highlight range upward. Structural residual R is
++         * never multiplied, so chandelier X/plant-light detail remains owned by the HDR merge. */
++        float iris26663LiftEv=clamp(iris26663CanonicalBodyLiftEv,0.0,0.65);
++        float iris26663Enter=smoothstep(0.035,0.12,shadowBase);
++        float iris26663Exit=1.0-smoothstep(0.42,0.68,shadowBase);
++        float iris26663LiftGate=iris26663Enter*iris26663Exit;
++        float iris26663BodyBase=shadowBase*exp2(iris26663LiftEv*iris26663LiftGate);
+         /* IRIS_26650_UNIVERSAL_HIGHLIGHT_RESIDUAL_PRESERVATION
+          * OFF keeps the exact 26648 smooth-bright residual policy. ON preserves the completed
+          * residual at unit weight so the newly created highlight headroom is not immediately
+@@ -242,13 +253,13 @@ void main(){
+                 smallResidualWeight,1.0,max(structureGate,sourceStructureGate));
+         float residualWeight=mix(legacyResidualWeight,1.0,iris26650Hc);
+         float weightedResidual=residualWeight*residual;
+-        float candidateLinear=shadowBase+weightedResidual;
++        float candidateLinear=iris26663BodyBase+weightedResidual;
+         /* IRIS_26645_STRUCTURAL_HEADROOM_RESERVATION
+          * When real pre-tone structure would otherwise hit the display ceiling, lower only B by
+          * exactly the proven positive overshoot. R remains unchanged, so the saved SDR retains its
+          * local separation instead of becoming a clipped-looking sub-white plateau. */
+         float positiveOvershoot=max(candidateLinear-0.997,0.0);
+-        float protectedBase=max(shadowBase-sourceStructureGate*positiveOvershoot,
++        float protectedBase=max(iris26663BodyBase-sourceStructureGate*positiveOvershoot,
+             IRIS_26626_LOG_FLOOR);
+         float outLinear=clamp(protectedBase+weightedResidual,IRIS_26626_LOG_FLOOR,1.0);
+         /* IRIS_26646_EXTENDED_LINEAR_RADIANCE_SURVIVAL_OWNER
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index cf85106206c21f23477f6c1891fb7d539c794ef9..40426dc529fe87bd0a4272852849887943749f9d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1634,8 +1634,15 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    public float getMotion26662ReferencePreviewProtectionEv(long sensorTimestampNs) {
+-        if (!isZslMode() || sensorTimestampNs <= 0L) return 0.0f;
++    /* IRIS_26663_STABLE_PREVIEW_METADATA_HANDOFF
++     * A SurfaceTexture frame can arrive before its TotalCaptureResult callback. 26662 returned
++     * 0 EV on that transient miss, so protection-active preview frames rapidly alternated between
++     * compensated and uncompensated presentation around bright light sources. Missing metadata is
++     * not evidence for zero protection: return NaN so the renderer holds the last confirmed actual
++     * result until an exact timestamp is available. Capture exposure ownership is unchanged. */
++    public float getMotion26663ReferencePreviewProtectionEv(long sensorTimestampNs) {
++        if (!isZslMode()) return 0.0f;
++        if (sensorTimestampNs <= 0L) return Float.NaN;
+         synchronized (mMotion26662PreviewResultLock) {
+             for (int i = 0; i < MOTION_26662_PREVIEW_RESULT_HISTORY; i++) {
+                 if (mMotion26662PreviewResultTimestampNs[i] == sensorTimestampNs) {
+@@ -1643,7 +1650,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 }
+             }
+         }
+-        return 0.0f;
++        return Float.NaN;
+     }
+ 
+     /* IRIS_26496_SPATIALLY_PERSISTENT_HIGHLIGHT_TRIGGER
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index c7eea6faa6d9769fe8c26fb9ccb09f22b021542f..891f44ac20e555afaed28a7109f3c27ac0b42dec 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -863,6 +863,8 @@ public final class MotionV2Render extends Node {
+                     basePipeline.mParameters.motionV2ShadowBodyStrength);
+             glProg.setVar("iris26639ShadowBodyEnd",
+                     basePipeline.mParameters.motionV2ShadowBodyEnd);
++            glProg.setVar("iris26663CanonicalBodyLiftEv",
++                    basePipeline.mParameters.motionV2CanonicalBodyLiftEv);
+             glProg.setVar("iris26650HighlightCompressionEnabled",
+                     ((PostPipeline) basePipeline).motionV2PhotonHighlightCompressionEnabled ? 1 : 0);
+             glProg.setVar("iris26626Mode", 6);
+@@ -938,6 +940,7 @@ public final class MotionV2Render extends Node {
+                     + " iris26644SmoothBrightResidualSuppressionRetained=true"
+                     + " iris26639ShadowBodyStrength=" + basePipeline.mParameters.motionV2ShadowBodyStrength
+                     + " iris26639ShadowBodyEnd=" + basePipeline.mParameters.motionV2ShadowBodyEnd
++                    + " iris26663CanonicalBodyLiftEv=" + basePipeline.mParameters.motionV2CanonicalBodyLiftEv
+                     + " iris26639ShadowMaxCorrectionEv=0.25"
+                     + " iris26639ShadowStructureResidualPreserved=true"
+                     + " globalExposureOwner=motionV2DisplayGain"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 41e6ad75a1a924e4656a5dd0fe424c8f3c731c92..d8479a3db99b806ded02b9926e9ed5db15bae9fe 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -114,6 +114,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         basePipeline.mParameters.motionV2ToneP99Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ShadowBodyStrength = 0.0f;
+         basePipeline.mParameters.motionV2ShadowBodyEnd = 0.30f;
++        basePipeline.mParameters.motionV2CanonicalBodyLiftEv = 0.0f;
+         basePipeline.mParameters.motionV2ToneP995Guide = Float.NaN;
+         basePipeline.mParameters.motionV2ToneP998Guide = Float.NaN;
+         basePipeline.mParameters.motionV2TonePredictedClipFraction = 0.0f;
+@@ -217,6 +218,28 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                         + " longGlobalBrightnessAuthority=false");
+             }
+             float gain = (float)Math.pow(2.0, solvedEv);
++            if (!iris26550Night && referenceProtectionEv > 0.0f) {
++                /* IRIS_26663_CANONICAL_BODY_PRESENTATION_RECOVERY
++                 * Keep the proven 26660 65% global matcher. Highlight-safe capture increases the
++                 * scene range, so reclaim only 35% of the *remaining* post-solve body mismatch in
++                 * the Local-Laplacian low-frequency base. This is scene-driven, not Photon-fitted:
++                 * darker body distributions receive more lift, already-close scenes receive less,
++                 * and the renderer fades the lift to exact identity before the highlight range. */
++                float postSolveErrorEv = exposureError(candidate, solvedEv, targetLog);
++                float remainingDarkEv = clamp(-postSolveErrorEv, 0.0f, 2.0f);
++                float protectionGate = smoothstep(0.15f, 0.50f, referenceProtectionEv);
++                float bodyLiftEv = clamp(0.35f * remainingDarkEv * protectionGate,
++                        0.0f, 0.65f);
++                basePipeline.mParameters.motionV2CanonicalBodyLiftEv = bodyLiftEv;
++                Log.i(Name, "IRIS_26663_CANONICAL_BODY_PRESENTATION_RECOVERY"
++                        + " referenceProtectionEv=" + referenceProtectionEv
++                        + " postSolveErrorEv=" + postSolveErrorEv
++                        + " remainingDarkEv=" + remainingDarkEv
++                        + " protectionGate=" + protectionGate
++                        + " bodyLiftEv=" + bodyLiftEv
++                        + " globalMatchPercent=" + matchStrengthPercent
++                        + " highlightIdentity=true localBaseOnly=true");
++            }
+             if (!Float.isFinite(gain) || gain <= 0.0f) {
+                 throw new IllegalStateException("non-finite solved viewfinder gain");
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index c71202436e3c9e6d684ff445253e8a837edb39b5..abce285642816617c12c8437e547de823ea0819f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -74,6 +74,10 @@ public class Parameters {
+     public float motionV2ToneP99Guide = Float.NaN;
+     public float motionV2ShadowBodyStrength = 0.0f;
+     public float motionV2ShadowBodyEnd = 0.30f;
++    /* IRIS_26663_CANONICAL_BODY_LIFT
++     * Residual viewfinder/body mismatch reclaimed only in the Local-Laplacian low-frequency base;
++     * highlights and structural residual remain authoritative. */
++    public float motionV2CanonicalBodyLiftEv = 0.0f;
+     /* IRIS_26583_PROJECTED_COMPACT_HIGHLIGHT_TAIL_STATE
+      * P99.5/P99.8 max-channel evidence plus projected baseline-tone ceiling occupancy.
+      * Decision-only presentation metadata; reconstruction/chroma/DNG/capture remain untouched.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index 1b13e6b524d717d954376f375295b9632f9198af..e0b9d433eb5465ab6f6bec7b627bd7db13a2ce81 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -39,6 +39,9 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     private volatile boolean mMirrorPreview;
+     /* IRIS_26524_PREVIEW_RESIDUAL_ZOOM */
+     private volatile float mSoftwareZoom = 1.0f;
++    /* IRIS_26663_STABLE_PREVIEW_PRESENTATION_STATE */
++    private float mIris26663LastConfirmedProtectionEv = 0.0f;
++    private float mIris26663PresentedProtectionEv = 0.0f;
+ 
+     private final GLPreview mView;
+ 
+@@ -72,20 +75,30 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         GLES20.glUniform1i(enablePeak, PhotonCamera.getSettings().focusPeak);
+         GLES20.glUniform1i(mirror, mMirrorPreview ? 1 : 0);
+         GLES20.glUniform1f(irisSoftwareZoom, mSoftwareZoom);
+-        /* IRIS_26662_FRAME_MATCHED_PREVIEW_PRESENTATION
+-         * 26661 brightened the preview from the newly requested protection EV before Camera2 had
+-         * actually delivered a frame at that exposure, producing the measured startup flash and
+-         * oscillation. Bind compensation to the exact SurfaceTexture sensor timestamp instead.
+-         */
+-        float iris26662ProtectionEv = 0.0f;
+-        CaptureController iris26662Controller = PhotonCamera.getCaptureController();
+-        if (iris26662Controller != null && iris26553FrameTimestamp > 0L) {
+-            iris26662ProtectionEv =
+-                    iris26662Controller.getMotion26662ReferencePreviewProtectionEv(
+-                            iris26553FrameTimestamp);
++        /* IRIS_26663_STABLE_PREVIEW_METADATA_HOLD
++         * Keep the 26662 white-anchored display compensation, but never interpret callback-order
++         * latency as 0 EV. Exact Camera2 metadata updates the confirmed target; an unmatched frame
++         * holds that target. A bounded 0.10 EV/frame presentation slew removes visible single-frame
++         * steps without feeding anything back into Camera2 AE or RAW capture. */
++        CaptureController iris26663Controller = PhotonCamera.getCaptureController();
++        if (iris26663Controller != null && iris26553FrameTimestamp > 0L) {
++            float exactEv = iris26663Controller.getMotion26663ReferencePreviewProtectionEv(
++                    iris26553FrameTimestamp);
++            if (Float.isFinite(exactEv)) {
++                mIris26663LastConfirmedProtectionEv = Math.max(0.0f, exactEv);
++            }
++        }
++        float iris26663DeltaEv = mIris26663LastConfirmedProtectionEv
++                - mIris26663PresentedProtectionEv;
++        if (Math.abs(iris26663DeltaEv) <= 0.01f) {
++            mIris26663PresentedProtectionEv = mIris26663LastConfirmedProtectionEv;
++        } else {
++            mIris26663PresentedProtectionEv += Math.max(-0.10f,
++                    Math.min(0.10f, iris26663DeltaEv));
+         }
+-        float iris26662PreviewGain = (float) Math.pow(2.0, iris26662ProtectionEv);
+-        GLES20.glUniform1f(iris26662ReferencePreviewGain, iris26662PreviewGain);
++        float iris26663PreviewGain = (float) Math.pow(2.0,
++                Math.max(0.0f, mIris26663PresentedProtectionEv));
++        GLES20.glUniform1f(iris26662ReferencePreviewGain, iris26663PreviewGain);
+ 
+         GLES20.glVertexAttribPointer(vPosition, 2, GLES20.GL_FLOAT, false, 4 * 2, pVertex);
+         GLES20.glVertexAttribPointer(vTexCoord, 2, GLES20.GL_FLOAT, false, 4 * 2, pTexCoord);
+diff --git a/app/version.properties b/app/version.properties
+index bc5e6b8ae24c1fbb8053d9ba4b3e8e301526ff53..0b8e5028ce6bd2fa3ed3c36f5b26d94ae7461b2d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726662
+-VERSION_BUILD=26662
++VERSION_NAME=0.9726663
++VERSION_BUILD=26663
