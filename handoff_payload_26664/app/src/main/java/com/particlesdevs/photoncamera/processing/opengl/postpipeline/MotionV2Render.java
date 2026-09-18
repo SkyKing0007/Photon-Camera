@@ -1,0 +1,1504 @@
+package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+
+import android.graphics.Bitmap;
+import android.graphics.Point;
+import android.os.Build;
+
+import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+import com.particlesdevs.photoncamera.processing.render.Parameters;
+import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings;
+import com.particlesdevs.photoncamera.util.Log;
+
+import java.nio.ByteBuffer;
+
+import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+import static android.opengl.GLES20.GL_LINEAR;
+
+/**
+ * IRIS_26435_EXACT_26430_BASE_LOW_FREQUENCY_TRUE_GAINMAP
+ *
+ * IRIS_26498_FULL_RESOLUTION_UHDR_PRIMARY_DETAIL_AUTHORITY_SUPERSEDED_26641
+ * The completed SDR color/highlight/tone path remains unchanged. 26641 moves Motion UHDR to
+ * half-linear-resolution matched-intent sampling: HDR and SDR are filtered before division,
+ * while the completed gain field is never spatially blurred or dilated.
+ */
+public final class MotionV2Render extends Node {
+    static final float OUTPUT_EXPOSURE_SCALE = 0.80f;
+    /* IRIS_26604_SINGLE_TONE_OWNER
+     * displayGain is a brightness target, never a separate texture multiplier. Preserve 26603's
+     * body brightness exactly through the proven 26582 final-domain tone start (0.50*0.80=0.40),
+     * then use one C1 monotonic rational shoulder. The 26603 outdoor sample therefore keeps its
+     * P50 (~144/255) while P95 is moved away from the near-white plateau so real cloud/curtain
+     * structure remains visible. The same equation is mirrored by 1x GLSL, solver prediction,
+     * adaptive-color safety prediction and true-2x CPU/GPU publication.
+     */
+    static final float IRIS_26582_TONE_START = 0.50f;
+    static final float IRIS_26582_HIGHLIGHT_TARGET = 0.97f;
+    static final float IRIS_26582_CLIP_FRACTION_START = 0.002f;
+    static final float IRIS_26582_CLIP_FRACTION_FULL = 0.025f;
+    static final float IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE = 12.0f;
+    /* IRIS_26583_PROJECTED_BROAD_AND_COMPACT_HIGHLIGHT_TAIL
+     * Both broad window/cloud regions and compact sunset/specular-like highlight structures are
+     * detected after the requested display gain and exact baseline 26582 tone curve. Detection is
+     * max-channel aware, but rendering remains the exact same uniform-RGB scalar curve.
+     */
+    static final float IRIS_26583_BROAD_HIGHLIGHT_TARGET = 0.955f;
+    static final float IRIS_26583_PROJECTED_BROAD_NEAR_CEILING = 0.930f;
+    static final float IRIS_26583_BROAD_FRACTION_START = 0.012f;
+    static final float IRIS_26583_BROAD_FRACTION_FULL = 0.060f;
+    static final float IRIS_26583_BROAD_HARD_FRACTION_START = 0.0025f;
+    static final float IRIS_26583_BROAD_HARD_FRACTION_FULL = 0.020f;
+    static final float IRIS_26583_COMPACT_HIGHLIGHT_TARGET = 0.965f;
+    static final float IRIS_26583_PROJECTED_NEAR_CEILING = 0.965f;
+    static final float IRIS_26583_PROJECTED_HARD_CEILING = 0.985f;
+    static final float IRIS_26583_COMPACT_FRACTION_START = 0.004f;
+    static final float IRIS_26583_COMPACT_FRACTION_FULL = 0.015f;
+    private static final float IRIS_26582_LOG_SHAPE = 6.0f;
+    /* IRIS_26591_PHOTON_LIKE_UPPER_TAIL_SEPARATION
+     * Keep the exact 26590 viewfinder/body meter curve above as a frozen control-loop model.
+     * Final SDR rendering uses a less-concave monotonic shoulder so reconstructed NORMAL and
+     * aligned SHORT highlight differences remain separated instead of crowding below white.
+     * Tone start and the proven 0.80 output exposure remain unchanged.
+     */
+    static final float IRIS_26591_HIGHLIGHT_TARGET = 0.980f;
+    static final float IRIS_26591_BROAD_HIGHLIGHT_TARGET = 0.975f;
+    static final float IRIS_26591_COMPACT_HIGHLIGHT_TARGET = 0.985f;
+    static final float IRIS_26591_CONTINUOUS_HIGHLIGHT_TARGET = 0.980f;
+    static final float IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET = 0.985f;
+    private static final float IRIS_26591_LOG_SHAPE = 3.0f;
+    /* IRIS_26592_UNBOUNDED_MONOTONIC_HIGHLIGHT_TAIL
+     * sceneWhite is a scale, never a finite clipping endpoint. The nested log+tanh tail is strictly
+     * increasing for every finite positive guide and asymptotically approaches display white.
+     * Tanh scale 1.2020679 is chosen so the new curve exactly meets the 26591 log-shape-3 curve at
+     * half of sceneWhite headroom (u=0.5), preserving the proven upper-midtone anchor while retiring
+     * the x<=1 clamp that collapsed all brighter recovered values together.
+     */
+    private static final float IRIS_26592_TAIL_LOG_SHAPE = 3.0f;
+    private static final float IRIS_26592_TANH_SCALE = 1.2020679f;
+    private static final float IRIS_26592_MOTION_UHDR_MAX_RATIO = 8.0f;
+    /* IRIS_26632_OUTPUT_REFERRED_HDR_PRESENTATION
+     * Motion UHDR keeps the completed SDR as exact appearance authority. The post-VGN master
+     * supplies only the spatial luminance guide for a continuous output-referred HDR expansion.
+     * No scene-linear/SDR quotient, no single match anchor, no hard threshold, and no RGB gain. */
+    /* IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS
+     * Preserve the tested 26505 SDR primary exactly. Ultra HDR is a reversible
+     * rendition relationship: the gain map should recover the wanted HDR signal
+     * from that SDR primary rather than inheriting the SDR headroom reduction.
+     * 1.00 / 0.80 = 1.25 (+0.322 EV) nominal body recovery at full HDR where
+     * tone mapping is otherwise identity. Highlight gain remains content-derived.
+     */
+    /* IRIS_26604_UHDR_MASTER_FROM_SCENE_SOURCE
+     * The scene-referred master is never destructively display-multiplied. Gain derivation applies
+     * the same brightness target and 0.80 presentation scale only when evaluating HDR display
+     * luminance, while SDR uses the canonical compressed rendition. This intentionally permits a
+     * broad non-unity gain map where SDR compression preserves highlight structure.
+     */
+    private static final float HDR_EXPOSURE_SCALE = OUTPUT_EXPOSURE_SCALE;
+    /* IRIS_26641_HALF_LINEAR_MATCHED_INTENT_GAINMAP
+     * Motion uses half linear resolution. HDR and SDR are sampled in linear light before the
+     * quotient; the completed gain map is never blurred/dilated after division. Night remains 1/4. */
+    private static final int GAINMAP_DOWNSAMPLE = 2;
+
+    /* IRIS_26621_NEW_SIMPLIFIED_PRESENTATION_OWNER
+     * Motion keeps one global exposure request: motionV2DisplayGain * OUTPUT_EXPOSURE_SCALE.
+     * The global tone map preserves the successful 26614 black/body slope and 0.95 source-white
+     * anchor, but blends that cubic 50/50 with a rational shoulder so the complete source-body
+     * derivative cannot collapse toward zero. A true fast Local-Laplacian then operates on the
+     * globally mapped scalar log-luminance with alpha=1 (no detail amplification). */
+    private static final int IRIS_26621_LAPLACIAN_LEVELS = 7;
+    private static final int IRIS_26621_REFERENCE_COUNT = 12;
+    private static final float IRIS_26621_REFERENCE_MIN_LOG = -6.0f;
+    private static final float IRIS_26621_REFERENCE_MAX_LOG = 0.0f;
+    private static final float IRIS_26621_DETAIL_SIGMA_EV = 0.35f;
+    private static final float IRIS_26621_EDGE_SLOPE = 0.94f;
+    public static final float IRIS_26621_SDR_WHITE_ANCHOR = 0.95f;
+    public static final float IRIS_26623_UPPER_TONE_START = 0.65f;
+    public static final float IRIS_26623_SPARSE_WHITE_ANCHOR = 0.945f;
+    public static final float IRIS_26623_BROAD_WHITE_ANCHOR = 0.925f;
+    public static final float IRIS_26623_SPARSE_WHITE_SLOPE = 0.360f;
+    public static final float IRIS_26623_BROAD_WHITE_SLOPE = 0.300f;
+    /* IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE constants. OFF remains exact 26652. */
+    private static final float IRIS_26653_HC_WEAK_WHITE_ANCHOR = 0.915f;
+    private static final float IRIS_26653_HC_STRONG_WHITE_ANCHOR = 0.890f;
+    private static final float IRIS_26653_HC_WEAK_WHITE_SLOPE = 0.090f;
+    private static final float IRIS_26653_HC_STRONG_WHITE_SLOPE = 0.055f;
+    private static final float IRIS_26653_PHOTON_KNEE_MAX = 0.90f;
+    private static final float IRIS_26653_PHOTON_KNEE_MIN = 0.55f;
+    /* IRIS_26660_OBJECT_COLOR_GAMMA_REFERENCE */
+    private static final float IRIS_26660_GAMMA_VALUE = 2.50f;
+    private static final float IRIS_26660_GAMMA_INFLUENCE_POWER = 6.0f;
+    private static final float IRIS_26660_GAMMA_WHITE_SCALE = 0.90f;
+    private static final float IRIS_26626_SOURCE_PRESERVATION_MAX = 0.30f;
+    /* IRIS_26635_SPATIALLY_COHERENT_HIGHLIGHT_ROLLOFF
+     * Recombine the completed Local-Laplacian tone from a 1/32-scale mapped illumination base
+     * plus its full-resolution residual. Broad highlight illumination therefore approaches white
+     * coherently, while real slat/fold/reflection structure remains in the residual. */
+    private static final int IRIS_26635_HIGHLIGHT_BASE_LEVEL = 5;
+
+    static float iris26621MapMotionSdrFinalGuide(float sourceGuide, float brightnessTargetGain) {
+        float x = Math.max(sourceGuide, 0.0f);
+        float requestedFinalGain = Math.max(brightnessTargetGain, 1.0e-6f)
+                * OUTPUT_EXPOSURE_SCALE;
+        float whiteAnchor = Math.min(IRIS_26621_SDR_WHITE_ANCHOR, requestedFinalGain);
+        float bodyGain = requestedFinalGain;
+        if (requestedFinalGain > whiteAnchor) {
+            bodyGain = Math.min(requestedFinalGain, 4.0f * whiteAnchor - 1.0e-4f);
+        }
+        float safeWhite = Math.max(whiteAnchor, 1.0e-6f);
+        float ratio = Math.max(bodyGain / safeWhite - 1.0f, 0.0f);
+        if (x <= 1.0f) {
+            float oneMinus = 1.0f - x;
+            float cubic = whiteAnchor * x
+                    + (bodyGain - whiteAnchor) * x * oneMinus * oneMinus;
+            float rational = bodyGain * x / (1.0f + ratio * x);
+            return 0.5f * (cubic + rational);
+        }
+        float rationalSlopeAtWhite = bodyGain
+                / ((1.0f + ratio) * (1.0f + ratio));
+        float bodySlopeAtWhite = 0.5f * (whiteAnchor + rationalSlopeAtWhite);
+        float reserve = Math.max(1.0f - whiteAnchor, 0.0f);
+        if (reserve <= 1.0e-6f) return whiteAnchor;
+        float tailScale = reserve / Math.max(bodySlopeAtWhite, 1.0e-6f);
+        float excess = x - 1.0f;
+        return whiteAnchor + reserve * excess / (excess + tailScale);
+    }
+
+    static float iris26623HighlightPressure(float broadNearFraction, float hardFraction,
+                                                float baseSceneWhite, float adaptiveSceneWhite) {
+        float broad = iris26623Smoothstep(0.015f, 0.060f, iris26582Clamp(broadNearFraction, 0.0f, 1.0f));
+        float hard = iris26623Smoothstep(0.010f, 0.050f, iris26582Clamp(hardFraction, 0.0f, 1.0f));
+        float baseWhite = Math.max(baseSceneWhite, 1.0f);
+        float adaptiveWhite = Math.max(adaptiveSceneWhite, baseWhite);
+        float span = Math.max(adaptiveWhite / baseWhite - 1.0f, 0.0f);
+        float spanPressure = iris26623Smoothstep(0.08f, 0.35f, span);
+        return iris26582Clamp(Math.max(0.70f * broad + 0.30f * spanPressure, 0.75f * hard), 0.0f, 1.0f);
+    }
+
+    private static float iris26623Smoothstep(float edge0, float edge1, float x) {
+        float t = iris26582Clamp((x - edge0) / Math.max(edge1 - edge0, 1.0e-6f), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    /* IRIS_26623_SCENE_ADAPTIVE_UPPER_TONE_REFERENCE
+     * Java reference for validation/telemetry. The viewfinder meter deliberately keeps the exact
+     * 26621 body solver; final Motion presentation uses this adaptive upper-tone equation only
+     * after displayGain and highlight-population statistics are frozen. */
+    static float iris26623MapMotionSdrFinalGuide(float sourceGuide, float brightnessTargetGain,
+                                                  float broadNearFraction, float hardFraction,
+                                                  float baseSceneWhite, float adaptiveSceneWhite) {
+        float x = Math.max(sourceGuide, 0.0f);
+        float legacy = iris26621MapMotionSdrFinalGuide(x, brightnessTargetGain);
+        float requested = Math.max(brightnessTargetGain, 1.0e-6f) * OUTPUT_EXPOSURE_SCALE;
+        float adaptiveEnable = iris26623Smoothstep(1.05f, 1.25f, requested);
+        if (adaptiveEnable <= 1.0e-7f || x <= IRIS_26623_UPPER_TONE_START) return legacy;
+
+        float pressure = iris26623HighlightPressure(broadNearFraction, hardFraction,
+                baseSceneWhite, adaptiveSceneWhite);
+        float targetWhite = IRIS_26623_SPARSE_WHITE_ANCHOR
+                + (IRIS_26623_BROAD_WHITE_ANCHOR - IRIS_26623_SPARSE_WHITE_ANCHOR) * pressure;
+        float targetSlope = IRIS_26623_SPARSE_WHITE_SLOPE
+                + (IRIS_26623_BROAD_WHITE_SLOPE - IRIS_26623_SPARSE_WHITE_SLOPE) * pressure;
+
+        float oldWhiteAnchor = Math.min(IRIS_26621_SDR_WHITE_ANCHOR, requested);
+        float bodyGain = requested;
+        if (requested > oldWhiteAnchor) bodyGain = Math.min(requested, 4.0f * oldWhiteAnchor - 1.0e-4f);
+        float safeWhite = Math.max(oldWhiteAnchor, 1.0e-6f);
+        float ratio = Math.max(bodyGain / safeWhite - 1.0f, 0.0f);
+        float startX = IRIS_26623_UPPER_TONE_START;
+        float oneMinus = 1.0f - startX;
+        float cubic = oldWhiteAnchor * startX
+                + (bodyGain - oldWhiteAnchor) * startX * oneMinus * oneMinus;
+        float rational = bodyGain * startX / (1.0f + ratio * startX);
+        float startValue = 0.5f * (cubic + rational);
+        float cubicDerivative = oldWhiteAnchor
+                + (bodyGain - oldWhiteAnchor) * oneMinus * (1.0f - 3.0f * startX);
+        float rationalDerivative = bodyGain / ((1.0f + ratio * startX) * (1.0f + ratio * startX));
+        float startSlope = 0.5f * (cubicDerivative + rationalDerivative);
+        float width = 1.0f - startX;
+        float secant = (targetWhite - startValue) / width;
+        if (secant <= 1.0e-6f) return legacy;
+        float m0 = Math.max(startSlope, 0.0f);
+        float m1 = Math.max(targetSlope, 0.0f);
+        float a = m0 / secant;
+        float b = m1 / secant;
+        float norm2 = a * a + b * b;
+        if (norm2 > 9.0f) {
+            float limiter = 3.0f / (float)Math.sqrt(norm2);
+            m0 *= limiter;
+            m1 *= limiter;
+        }
+
+        float candidate;
+        if (x <= 1.0f) {
+            float t = iris26582Clamp((x - startX) / width, 0.0f, 1.0f);
+            float t2 = t * t;
+            float t3 = t2 * t;
+            candidate = (2.0f * t3 - 3.0f * t2 + 1.0f) * startValue
+                    + (t3 - 2.0f * t2 + t) * width * m0
+                    + (-2.0f * t3 + 3.0f * t2) * targetWhite
+                    + (t3 - t2) * width * m1;
+        } else {
+            float reserve = Math.max(1.0f - targetWhite, 0.0f);
+            float tailScale = reserve / Math.max(m1, 1.0e-6f);
+            float excess = x - 1.0f;
+            candidate = targetWhite + reserve * excess / (excess + tailScale);
+        }
+        return legacy + (candidate - legacy) * adaptiveEnable;
+    }
+
+    /* IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE_REFERENCE
+     * OFF is bit-for-math identical to 26652. ON is applied only after brightnessTargetGain is
+     * frozen. Below 0.65 it is exact identity to OFF; above that point one C1 monotone curve
+     * reserves visible SDR spacing for the true extended-linear >1.0 master. */
+    static float iris26653MapMotionSdrFinalGuide(float sourceGuide, float brightnessTargetGain,
+                                                  float broadNearFraction, float hardFraction,
+                                                  float baseSceneWhite, float adaptiveSceneWhite,
+                                                  boolean highlightCompressionEnabled,
+                                                  float photonHighlightKnee,
+                                                  float photonAdaptiveWhitePoint) {
+        final float x = Math.max(sourceGuide, 0.0f);
+        final float off = iris26623MapMotionSdrFinalGuide(x, brightnessTargetGain,
+                broadNearFraction, hardFraction, baseSceneWhite, adaptiveSceneWhite);
+        if (!highlightCompressionEnabled || x <= IRIS_26623_UPPER_TONE_START) return off;
+        final float requested = Math.max(brightnessTargetGain, 1.0e-6f) * OUTPUT_EXPOSURE_SCALE;
+        final float enable = iris26623Smoothstep(1.05f, 1.25f, requested);
+        if (enable <= 1.0e-7f) return off;
+
+        final float scenePressure = iris26623HighlightPressure(
+                broadNearFraction, hardFraction, baseSceneWhite, adaptiveSceneWhite);
+        final float kneePressure = iris26582Clamp(
+                (IRIS_26653_PHOTON_KNEE_MAX - photonHighlightKnee)
+                        / (IRIS_26653_PHOTON_KNEE_MAX - IRIS_26653_PHOTON_KNEE_MIN),
+                0.0f, 1.0f);
+        final float pressure = Math.max(scenePressure, kneePressure);
+        final float targetWhite = IRIS_26653_HC_WEAK_WHITE_ANCHOR
+                + (IRIS_26653_HC_STRONG_WHITE_ANCHOR - IRIS_26653_HC_WEAK_WHITE_ANCHOR) * pressure;
+        final float targetSlope = IRIS_26653_HC_WEAK_WHITE_SLOPE
+                + (IRIS_26653_HC_STRONG_WHITE_SLOPE - IRIS_26653_HC_WEAK_WHITE_SLOPE) * pressure;
+
+        final float oldWhiteAnchor = Math.min(IRIS_26621_SDR_WHITE_ANCHOR, requested);
+        float bodyGain = requested;
+        if (requested > oldWhiteAnchor) bodyGain = Math.min(requested, 4.0f * oldWhiteAnchor - 1.0e-4f);
+        final float safeWhite = Math.max(oldWhiteAnchor, 1.0e-6f);
+        final float ratio = Math.max(bodyGain / safeWhite - 1.0f, 0.0f);
+        final float startX = IRIS_26623_UPPER_TONE_START;
+        final float oneMinus = 1.0f - startX;
+        final float cubic = oldWhiteAnchor * startX
+                + (bodyGain - oldWhiteAnchor) * startX * oneMinus * oneMinus;
+        final float rational = bodyGain * startX / (1.0f + ratio * startX);
+        final float startValue = 0.5f * (cubic + rational);
+        final float cubicDerivative = oldWhiteAnchor
+                + (bodyGain - oldWhiteAnchor) * oneMinus * (1.0f - 3.0f * startX);
+        final float rationalDerivative = bodyGain
+                / ((1.0f + ratio * startX) * (1.0f + ratio * startX));
+        final float startSlope = 0.5f * (cubicDerivative + rationalDerivative);
+        final float width = 1.0f - startX;
+        final float secant = (targetWhite - startValue) / width;
+        if (secant <= 1.0e-6f) return off;
+        float m0 = Math.max(startSlope, 0.0f);
+        float m1 = Math.max(targetSlope, 0.0f);
+        final float norm2 = (m0 / secant) * (m0 / secant) + (m1 / secant) * (m1 / secant);
+        if (norm2 > 9.0f) {
+            final float limiter = 3.0f / (float)Math.sqrt(norm2);
+            m0 *= limiter;
+            m1 *= limiter;
+        }
+
+        final float candidate;
+        if (x <= 1.0f) {
+            final float t = iris26582Clamp((x - startX) / width, 0.0f, 1.0f);
+            final float t2 = t * t;
+            final float t3 = t2 * t;
+            candidate = (2.0f * t3 - 3.0f * t2 + 1.0f) * startValue
+                    + (t3 - 2.0f * t2 + t) * width * m0
+                    + (-2.0f * t3 + 3.0f * t2) * targetWhite
+                    + (t3 - t2) * width * m1;
+        } else {
+            final float reserve = Math.max(1.0f - targetWhite, 0.0f);
+            final float whiteSpan = Math.max(1.0f,
+                    (float)Math.sqrt(Math.max(photonAdaptiveWhitePoint, 1.0f)));
+            final float tailScale = reserve / Math.max(m1, 1.0e-6f) * whiteSpan;
+            final float excess = x - 1.0f;
+            candidate = targetWhite + reserve * excess / (excess + tailScale);
+        }
+        return off + (candidate - off) * enable;
+    }
+
+    /* IRIS_26660_OBJECT_COLOR_GAMMA_REFERENCE
+     * CPU mirror for proof only. The production shader rescales RGB uniformly by corrected/original
+     * guide, so chromaticity is invariant while bright material luminance receives a smooth gamma. */
+    static float iris26660ObjectColorGamma(float mappedGuide, boolean highlightCompressionEnabled) {
+        final float y = Math.max(mappedGuide, 0.0f);
+        if (!highlightCompressionEnabled) return y;
+        if (y <= 1.0f) {
+            final float w = (float)Math.pow(iris26582Clamp(y, 0.0f, 1.0f),
+                    IRIS_26660_GAMMA_INFLUENCE_POWER);
+            final float gammaMapped = IRIS_26660_GAMMA_WHITE_SCALE
+                    * (float)Math.pow(Math.max(y, 1.0e-8f), IRIS_26660_GAMMA_VALUE);
+            return y + (gammaMapped - y) * w;
+        }
+        final float endSlope = IRIS_26660_GAMMA_INFLUENCE_POWER
+                * (IRIS_26660_GAMMA_WHITE_SCALE - 1.0f)
+                + IRIS_26660_GAMMA_WHITE_SCALE * IRIS_26660_GAMMA_VALUE;
+        return IRIS_26660_GAMMA_WHITE_SCALE + (y - 1.0f) * endSlope;
+    }
+
+    static float iris26614MapHdrTargetLuma(float hdrBase) {
+        return hdrBase;
+    }
+
+    /* IRIS_26640_MEASURED_GAINMAP_CAPACITY
+     * Motion first encodes against the already-supported 8x ceiling only to avoid clipping the
+     * quotient. The final ALPHA_8 map is then re-normalized to the actual measured peak ratio, and
+     * Android metadata advertises that same measured range. No P99/P99.8 proxy owns GainMapMax. */
+    private static float iris26640MotionGainEncodingCeiling() {
+        return IRIS_26592_MOTION_UHDR_MAX_RATIO;
+    }
+
+    public MotionV2Render() { super("", "MotionV2Render"); }
+    @Override public void Compile() {}
+
+    /* IRIS_26582_SHARED_GLOBAL_TONE_MODEL
+     * Single Java authority used by both the viewfinder solver and render setup. The GLSL render
+     * uses the same start/log shape/output scale; only sceneWhite is scene-adaptive.
+     */
+    static float iris26582BaseSceneWhite(float displayGain) {
+        return Math.max(1.0f, Math.min(6.0f, 0.90f * Math.max(1.0f, displayGain)));
+    }
+
+    /* IRIS_26598_MOTION_PUBLICATION_SCENE_WHITE_AUTHORITY
+     * 26597 made Motion publication itself preserve an unbounded monotonic highlight tail. The
+     * older adaptiveSceneWhite expansion was designed for the pre-26597 endpoint-compression
+     * renderer and therefore double-reserved highlight range when reused by Motion. Motion now
+     * publishes against the body/physical baseSceneWhite. Night intentionally retains its proven
+     * adaptive scene-white owner because it still uses the successful 26591 publication curve.
+     * Keep this as the single Java selector consumed by normal Motion render, tone-aware highlight
+     * chroma prediction, and true-2x publication so those paths cannot silently diverge again.
+     */
+    public static float iris26598PublicationSceneWhite(Parameters parameters) {
+        if (parameters == null) {
+            throw new IllegalArgumentException("parameters == null");
+        }
+        float computedBase = iris26582BaseSceneWhite(parameters.motionV2DisplayGain);
+        float baseWhite = parameters.motionV2ToneBaseSceneWhite;
+        if (!Float.isFinite(baseWhite) || baseWhite < 1.0f) baseWhite = computedBase;
+        baseWhite = Math.max(1.0f, Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, baseWhite));
+        if (parameters.motionV2Active) return baseWhite;
+
+        float adaptiveWhite = parameters.motionV2ToneAdaptiveSceneWhite;
+        if (!Float.isFinite(adaptiveWhite) || adaptiveWhite < baseWhite) adaptiveWhite = baseWhite;
+        return Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, adaptiveWhite);
+    }
+
+    static float iris26582MapHeadroom(float guide, float sceneWhite) {
+        if (guide <= IRIS_26582_TONE_START) return guide;
+        float whitePoint = Math.max(sceneWhite, IRIS_26582_TONE_START + 0.05f);
+        float x = iris26582Clamp((guide - IRIS_26582_TONE_START)
+                / Math.max(whitePoint - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
+        float shaped = (float)(Math.log(1.0 + IRIS_26582_LOG_SHAPE * x)
+                / Math.log(1.0 + IRIS_26582_LOG_SHAPE));
+        float preScaleDisplayWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
+        return IRIS_26582_TONE_START
+                + (preScaleDisplayWhite - IRIS_26582_TONE_START) * shaped;
+    }
+
+    static float iris26591MapHeadroom(float guide, float sceneWhite) {
+        if (guide <= IRIS_26582_TONE_START) return guide;
+        float whitePoint = Math.max(sceneWhite, IRIS_26582_TONE_START + 0.05f);
+        float x = iris26582Clamp((guide - IRIS_26582_TONE_START)
+                / Math.max(whitePoint - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
+        float shaped = (float)(Math.log(1.0 + IRIS_26591_LOG_SHAPE * x)
+                / Math.log(1.0 + IRIS_26591_LOG_SHAPE));
+        float preScaleDisplayWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
+        return IRIS_26582_TONE_START
+                + (preScaleDisplayWhite - IRIS_26582_TONE_START) * shaped;
+    }
+
+    static float iris26592MapHeadroom(float guide, float sceneWhite) {
+        if (guide <= IRIS_26582_TONE_START) return guide;
+        float whitePoint = Math.max(sceneWhite, IRIS_26582_TONE_START + 0.05f);
+        float u = Math.max((guide - IRIS_26582_TONE_START)
+                / Math.max(whitePoint - IRIS_26582_TONE_START, 1.0e-6f), 0.0f);
+        float logCoordinate = (float)(Math.log(1.0 + IRIS_26592_TAIL_LOG_SHAPE * u)
+                / Math.log(1.0 + IRIS_26592_TAIL_LOG_SHAPE));
+        float shaped = (float)Math.tanh(IRIS_26592_TANH_SCALE * logCoordinate);
+        float preScaleDisplayWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
+        return IRIS_26582_TONE_START
+                + (preScaleDisplayWhite - IRIS_26582_TONE_START) * shaped;
+    }
+
+    static float iris26582AdaptiveStrength(float clippedFraction) {
+        float t = iris26582Clamp((clippedFraction - IRIS_26582_CLIP_FRACTION_START)
+                / Math.max(IRIS_26582_CLIP_FRACTION_FULL
+                        - IRIS_26582_CLIP_FRACTION_START, 1.0e-6f), 0.0f, 1.0f);
+        return t * t * (3.0f - 2.0f * t);
+    }
+
+    static float iris26583RequiredSceneWhite(float displayGain, float sourceGuide,
+                                              float outputTarget) {
+        float baseWhite = iris26582BaseSceneWhite(displayGain);
+        if (!Float.isFinite(sourceGuide) || sourceGuide <= 0.0f) return baseWhite;
+        float postGuide = sourceGuide * Math.max(displayGain, 1.0e-6f);
+        if (postGuide <= IRIS_26582_TONE_START) return baseWhite;
+        float targetPreScale = iris26582Clamp(outputTarget, 0.80f, 0.995f) / OUTPUT_EXPOSURE_SCALE;
+        float preScaleWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
+        float targetShape = iris26582Clamp((targetPreScale - IRIS_26582_TONE_START)
+                / Math.max(preScaleWhite - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
+        float targetX = (float)((Math.exp(targetShape * Math.log(1.0 + IRIS_26582_LOG_SHAPE)) - 1.0)
+                / IRIS_26582_LOG_SHAPE);
+        float requiredWhite = IRIS_26582_TONE_START
+                + (postGuide - IRIS_26582_TONE_START) / Math.max(targetX, 1.0e-4f);
+        return Math.max(baseWhite, Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, requiredWhite));
+    }
+
+    static float iris26591RequiredSceneWhite(float displayGain, float sourceGuide,
+                                              float outputTarget) {
+        float baseWhite = iris26582BaseSceneWhite(displayGain);
+        if (!Float.isFinite(sourceGuide) || sourceGuide <= 0.0f) return baseWhite;
+        float postGuide = sourceGuide * Math.max(displayGain, 1.0e-6f);
+        if (postGuide <= IRIS_26582_TONE_START) return baseWhite;
+        float targetPreScale = iris26582Clamp(outputTarget, 0.80f, 0.995f) / OUTPUT_EXPOSURE_SCALE;
+        float preScaleWhite = 1.0f / OUTPUT_EXPOSURE_SCALE;
+        float targetShape = iris26582Clamp((targetPreScale - IRIS_26582_TONE_START)
+                / Math.max(preScaleWhite - IRIS_26582_TONE_START, 1.0e-6f), 0.0f, 1.0f);
+        float targetX = (float)((Math.exp(targetShape * Math.log(1.0 + IRIS_26591_LOG_SHAPE)) - 1.0)
+                / IRIS_26591_LOG_SHAPE);
+        float requiredWhite = IRIS_26582_TONE_START
+                + (postGuide - IRIS_26582_TONE_START) / Math.max(targetX, 1.0e-4f);
+        return Math.max(baseWhite, Math.min(IRIS_26582_MAX_ADAPTIVE_SCENE_WHITE, requiredWhite));
+    }
+
+    static float iris26591AdaptiveSceneWhite(float displayGain, float p99Guide,
+                                              float clippedFraction) {
+        float baseWhite = iris26582BaseSceneWhite(displayGain);
+        if (!Float.isFinite(p99Guide) || p99Guide <= 0.0f) return baseWhite;
+        float postP99 = p99Guide * Math.max(displayGain, 1.0e-6f);
+        if (postP99 <= baseWhite) return baseWhite;
+        float requiredWhite = iris26591RequiredSceneWhite(
+                displayGain, p99Guide, IRIS_26591_HIGHLIGHT_TARGET);
+        float strength = iris26582AdaptiveStrength(clippedFraction);
+        return baseWhite + (requiredWhite - baseWhite) * strength;
+    }
+
+    static float iris26582AdaptiveSceneWhite(float displayGain, float p99Guide,
+                                              float clippedFraction) {
+        float baseWhite = iris26582BaseSceneWhite(displayGain);
+        if (!Float.isFinite(p99Guide) || p99Guide <= 0.0f) return baseWhite;
+        float postP99 = p99Guide * Math.max(displayGain, 1.0e-6f);
+        if (postP99 <= baseWhite) return baseWhite;
+
+        /* Exact 26582 broad-tail behavior retained. */
+        float requiredWhite = iris26583RequiredSceneWhite(
+                displayGain, p99Guide, IRIS_26582_HIGHLIGHT_TARGET);
+        float strength = iris26582AdaptiveStrength(clippedFraction);
+        return baseWhite + (requiredWhite - baseWhite) * strength;
+    }
+
+    private static float iris26582Clamp(float x, float lo, float hi) {
+        return Math.max(lo, Math.min(hi, x));
+    }
+
+    private void iris26623SetAdaptiveUpperToneUniforms() {
+        glProg.setVar("iris26623ToneBroadNearFraction",
+                basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction);
+        glProg.setVar("iris26623ToneHardFraction",
+                basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction);
+        glProg.setVar("iris26623ToneBaseSceneWhite",
+                basePipeline.mParameters.motionV2ToneBaseSceneWhite);
+        glProg.setVar("iris26623ToneAdaptiveSceneWhite",
+                basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite);
+    }
+
+    private void iris26653SetFinalToneUniforms() {
+        iris26623SetAdaptiveUpperToneUniforms();
+        PostPipeline p = (PostPipeline) basePipeline;
+        glProg.setVar("iris26653HighlightCompressionEnabled",
+                p.motionV2PhotonHighlightCompressionEnabled ? 1 : 0);
+        glProg.setVar("iris26653HighlightKnee", p.motionV2PhotonHighlightKnee);
+        glProg.setVar("iris26653AdaptiveWhitePoint", p.motionV2PhotonAdaptiveWhitePoint);
+    }
+
+    /* IRIS_26626_BOUNDED_SOURCE_DOMAIN_LOCAL_LAPLACIAN_REFERENCE
+     * 26625 remains the canonical baseline. A second transient Local-Laplacian pass uses the
+     * original source-domain guide and source references, but maps every reference center through
+     * the unchanged 26623 tone owner. The final per-pixel blend is capped by the exact pre-code
+     * monotonicity/halo sweep; no scene semantic detector or alternate RGB owner is introduced. */
+    private float iris26626SourcePreservationStrength() {
+        final float requested = Math.max(basePipeline.mParameters.motionV2DisplayGain, 1.0e-6f)
+                * OUTPUT_EXPOSURE_SCALE;
+        final float adaptiveEnable = iris26623Smoothstep(1.05f, 1.25f, requested);
+        final float pressure = iris26623HighlightPressure(
+                basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite);
+        return iris26582Clamp(
+                IRIS_26626_SOURCE_PRESERVATION_MAX * adaptiveEnable * pressure,
+                0.0f, IRIS_26626_SOURCE_PRESERVATION_MAX);
+    }
+
+    private float iris26626MappedReferenceLog(float sourceReferenceLog) {
+        final float sourceGuide = (float)Math.pow(2.0, sourceReferenceLog);
+        final PostPipeline p = (PostPipeline) basePipeline;
+        final float mappedGuide = iris26653MapMotionSdrFinalGuide(
+                sourceGuide,
+                basePipeline.mParameters.motionV2DisplayGain,
+                basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                p.motionV2PhotonHighlightCompressionEnabled,
+                p.motionV2PhotonHighlightKnee,
+                p.motionV2PhotonAdaptiveWhitePoint);
+        return (float)(Math.log(Math.max(mappedGuide, 0.000244140625f)) / Math.log(2.0));
+    }
+
+    private void iris26621ClearLocalToneState() {
+        basePipeline.mParameters.motionV2LocalToneLogMap = null;
+        basePipeline.mParameters.motionV2LocalToneLogWidth = 0;
+        basePipeline.mParameters.motionV2LocalToneLogHeight = 0;
+        basePipeline.mParameters.motionV2LocalToneLogSourceWidth = 0;
+        basePipeline.mParameters.motionV2LocalToneLogSourceHeight = 0;
+    }
+
+    private GLTexture iris26626ApplyBoundedSourceDomainPreservation(
+            GLTexture source, GLTexture currentTone, GLFormat scalar, float preservationStrength) {
+        if (preservationStrength <= 1.0e-7f) return currentTone;
+
+        final GLTexture[] sourceGuide = new GLTexture[IRIS_26621_LAPLACIAN_LEVELS];
+        final GLTexture[] sourceBands = new GLTexture[IRIS_26621_LAPLACIAN_LEVELS - 1];
+        GLTexture coarsestLinear = null;
+        GLTexture reconstruction = null;
+        GLTexture delta = null;
+        GLTexture blended = null;
+        boolean keepBlended = false;
+        try {
+            sourceGuide[0] = new GLTexture(
+                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+            glProg.setTexture("SourceLinear", source);
+            glProg.setVar("iris26626Mode", 1);
+            glProg.drawBlocks(sourceGuide[0]);
+
+            for (int level = 1; level < IRIS_26621_LAPLACIAN_LEVELS; level++) {
+                Point previous = sourceGuide[level - 1].mSize;
+                Point nextSize = new Point(
+                        Math.max(1, (previous.x + 1) / 2),
+                        Math.max(1, (previous.y + 1) / 2));
+                sourceGuide[level] = new GLTexture(
+                        nextSize, scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                glProg.setTexture("InputBuffer", sourceGuide[level - 1]);
+                glProg.drawBlocks(sourceGuide[level]);
+            }
+
+            final float referenceStep =
+                    (IRIS_26621_REFERENCE_MAX_LOG - IRIS_26621_REFERENCE_MIN_LOG)
+                            / (IRIS_26621_REFERENCE_COUNT - 1.0f);
+            for (int reference = 0; reference < IRIS_26621_REFERENCE_COUNT; reference++) {
+                final float sourceReferenceLog =
+                        IRIS_26621_REFERENCE_MIN_LOG + reference * referenceStep;
+                final float mappedReferenceLog = iris26626MappedReferenceLog(sourceReferenceLog);
+                final GLTexture[] remap = new GLTexture[IRIS_26621_LAPLACIAN_LEVELS];
+                try {
+                    remap[0] = new GLTexture(
+                            new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                    glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+                    glProg.setTexture("SourceLinear", source);
+                    glProg.setVar("sourceReferenceLog", sourceReferenceLog);
+                    glProg.setVar("mappedReferenceLog", mappedReferenceLog);
+                    glProg.setVar("sigmaEv", IRIS_26621_DETAIL_SIGMA_EV);
+                    glProg.setVar("edgeSlope", IRIS_26621_EDGE_SLOPE);
+                    glProg.setVar("iris26626Mode", 2);
+                    glProg.drawBlocks(remap[0]);
+
+                    for (int level = 1; level < IRIS_26621_LAPLACIAN_LEVELS; level++) {
+                        remap[level] = new GLTexture(
+                                new Point(sourceGuide[level].mSize), scalar, null,
+                                GL_LINEAR, GL_CLAMP_TO_EDGE);
+                        glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                        glProg.setTexture("InputBuffer", remap[level - 1]);
+                        glProg.drawBlocks(remap[level]);
+                    }
+
+                    for (int level = 0; level < IRIS_26621_LAPLACIAN_LEVELS - 1; level++) {
+                        GLTexture next = new GLTexture(
+                                new Point(sourceGuide[level].mSize), scalar, null,
+                                GL_LINEAR, GL_CLAMP_TO_EDGE);
+                        glProg.useAssetProgram("motionv2/local_laplacian_accumulate_26621");
+                        glProg.setTexture("Accumulator",
+                                sourceBands[level] != null ? sourceBands[level] : remap[level]);
+                        glProg.setTexture("RemapFine", remap[level]);
+                        glProg.setTexture("RemapCoarse", remap[level + 1]);
+                        glProg.setTexture("GuideLevel", sourceGuide[level]);
+                        glProg.setVar("referenceLog", sourceReferenceLog);
+                        glProg.setVar("referenceStep", referenceStep);
+                        glProg.setVar("referenceMin", IRIS_26621_REFERENCE_MIN_LOG);
+                        glProg.setVar("referenceMax", IRIS_26621_REFERENCE_MAX_LOG);
+                        glProg.setVar("firstReference", reference == 0 ? 1 : 0);
+                        glProg.drawBlocks(next);
+                        if (sourceBands[level] != null) {
+                            try { sourceBands[level].close(); } catch (Throwable ignored) {}
+                        }
+                        sourceBands[level] = next;
+                    }
+                } finally {
+                    for (GLTexture texture : remap) {
+                        if (texture != null) {
+                            try { texture.close(); } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            }
+
+            coarsestLinear = new GLTexture(
+                    new Point(sourceGuide[IRIS_26621_LAPLACIAN_LEVELS - 1].mSize),
+                    scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+            glProg.setTexture("SourceGuideLog", sourceGuide[IRIS_26621_LAPLACIAN_LEVELS - 1]);
+            glProg.setVar("iris26626Mode", 3);
+            glProg.drawBlocks(coarsestLinear);
+
+            reconstruction = new GLTexture(
+                    new Point(coarsestLinear.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/local_laplacian_global_log_26621");
+            glProg.setTexture("InputBuffer", coarsestLinear);
+            glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+            glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+            iris26653SetFinalToneUniforms();
+            glProg.drawBlocks(reconstruction);
+            try { coarsestLinear.close(); } catch (Throwable ignored) {}
+            coarsestLinear = null;
+
+            for (int level = IRIS_26621_LAPLACIAN_LEVELS - 2; level >= 1; level--) {
+                GLTexture next = new GLTexture(
+                        new Point(sourceGuide[level].mSize), scalar, null,
+                        GL_LINEAR, GL_CLAMP_TO_EDGE);
+                glProg.useAssetProgram("motionv2/local_laplacian_reconstruct_26621");
+                glProg.setTexture("LocalBand", sourceBands[level]);
+                glProg.setTexture("CoarseReconstruction", reconstruction);
+                glProg.drawBlocks(next);
+                try { reconstruction.close(); } catch (Throwable ignored) {}
+                reconstruction = next;
+            }
+
+            delta = new GLTexture(
+                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+            glProg.setTexture("LocalBand", sourceBands[0]);
+            glProg.setTexture("CoarseReconstruction", reconstruction);
+            glProg.setTexture("CurrentToneLog", currentTone);
+            glProg.setVar("iris26626Mode", 4);
+            glProg.drawBlocks(delta);
+            try { reconstruction.close(); } catch (Throwable ignored) {}
+            reconstruction = null;
+
+            blended = new GLTexture(
+                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+            glProg.setTexture("SourceLinear", source);
+            glProg.setTexture("CurrentToneLog", currentTone);
+            glProg.setTexture("DeltaLog", delta);
+            glProg.setVar("iris26626PreservationStrength", preservationStrength);
+            glProg.setVar("iris26626Mode", 5);
+            glProg.drawBlocks(blended);
+
+            Log.i(Name, "IRIS_26626_BOUNDED_SOURCE_DOMAIN_LOCAL_LAPLACIAN"
+                    + " active=true"
+                    + " preservationStrength=" + preservationStrength
+                    + " preservationMax=" + IRIS_26626_SOURCE_PRESERVATION_MAX
+                    + " lowerBodyGate=" + IRIS_26623_UPPER_TONE_START + "..0.72"
+                    + " baseline=EXACT_26625_RECONSTRUCTION"
+                    + " sourceReferences=" + IRIS_26621_REFERENCE_COUNT
+                    + " sourceLevels=" + IRIS_26621_LAPLACIAN_LEVELS
+                    + " true2xSharedFinalMap="
+                    + basePipeline.mParameters.motionV2SuperResOutputEnabled);
+            keepBlended = true;
+            return blended;
+        } finally {
+            if (coarsestLinear != null) {
+                try { coarsestLinear.close(); } catch (Throwable ignored) {}
+            }
+            if (reconstruction != null) {
+                try { reconstruction.close(); } catch (Throwable ignored) {}
+            }
+            if (delta != null) {
+                try { delta.close(); } catch (Throwable ignored) {}
+            }
+            for (GLTexture texture : sourceBands) {
+                if (texture != null) {
+                    try { texture.close(); } catch (Throwable ignored) {}
+                }
+            }
+            for (GLTexture texture : sourceGuide) {
+                if (texture != null) {
+                    try { texture.close(); } catch (Throwable ignored) {}
+                }
+            }
+            if (!keepBlended && blended != null) {
+                try { blended.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private GLTexture iris26621BuildLocalLaplacianTone(GLTexture source) {
+        iris26621ClearLocalToneState();
+        if (!basePipeline.mParameters.motionV2Active) return null;
+        if (source == null || source.mSize == null || source.mSize.x <= 0 || source.mSize.y <= 0) {
+            throw new IllegalStateException("IRIS_26621 invalid Local Laplacian source");
+        }
+
+        final GLFormat scalar = new GLFormat(GLFormat.DataType.FLOAT_16, 1);
+        final GLTexture[] guide = new GLTexture[IRIS_26621_LAPLACIAN_LEVELS];
+        final GLTexture[] bands = new GLTexture[IRIS_26621_LAPLACIAN_LEVELS - 1];
+        GLTexture finalTone = null;
+        boolean keepFinal = false;
+        try {
+            guide[0] = new GLTexture(new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/local_laplacian_global_log_26621");
+            glProg.setTexture("InputBuffer", source);
+            glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+            glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+            iris26653SetFinalToneUniforms();
+            glProg.drawBlocks(guide[0]);
+
+            for (int level = 1; level < IRIS_26621_LAPLACIAN_LEVELS; level++) {
+                Point previous = guide[level - 1].mSize;
+                Point nextSize = new Point(
+                        Math.max(1, (previous.x + 1) / 2),
+                        Math.max(1, (previous.y + 1) / 2));
+                guide[level] = new GLTexture(nextSize, scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                glProg.setTexture("InputBuffer", guide[level - 1]);
+                glProg.drawBlocks(guide[level]);
+            }
+
+            final float referenceStep = (IRIS_26621_REFERENCE_MAX_LOG - IRIS_26621_REFERENCE_MIN_LOG)
+                    / (IRIS_26621_REFERENCE_COUNT - 1.0f);
+            for (int reference = 0; reference < IRIS_26621_REFERENCE_COUNT; reference++) {
+                final float referenceLog = IRIS_26621_REFERENCE_MIN_LOG + reference * referenceStep;
+                final GLTexture[] remap = new GLTexture[IRIS_26621_LAPLACIAN_LEVELS];
+                try {
+                    remap[0] = new GLTexture(new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                    glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+                    glProg.setTexture("GlobalMappedLog", guide[0]);
+                    glProg.setVar("referenceLog", referenceLog);
+                    glProg.setVar("sigmaEv", IRIS_26621_DETAIL_SIGMA_EV);
+                    glProg.setVar("edgeSlope", IRIS_26621_EDGE_SLOPE);
+                    glProg.setVar("iris26626Mode", 0);
+                    glProg.drawBlocks(remap[0]);
+
+                    for (int level = 1; level < IRIS_26621_LAPLACIAN_LEVELS; level++) {
+                        remap[level] = new GLTexture(new Point(guide[level].mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                        glProg.useAssetProgram("motionv2/local_laplacian_downsample_26621");
+                        glProg.setTexture("InputBuffer", remap[level - 1]);
+                        glProg.drawBlocks(remap[level]);
+                    }
+
+                    for (int level = 0; level < IRIS_26621_LAPLACIAN_LEVELS - 1; level++) {
+                        GLTexture next = new GLTexture(new Point(guide[level].mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                        glProg.useAssetProgram("motionv2/local_laplacian_accumulate_26621");
+                        glProg.setTexture("Accumulator", bands[level] != null ? bands[level] : remap[level]);
+                        glProg.setTexture("RemapFine", remap[level]);
+                        glProg.setTexture("RemapCoarse", remap[level + 1]);
+                        glProg.setTexture("GuideLevel", guide[level]);
+                        glProg.setVar("referenceLog", referenceLog);
+                        glProg.setVar("referenceStep", referenceStep);
+                        glProg.setVar("referenceMin", IRIS_26621_REFERENCE_MIN_LOG);
+                        glProg.setVar("referenceMax", IRIS_26621_REFERENCE_MAX_LOG);
+                        glProg.setVar("firstReference", reference == 0 ? 1 : 0);
+                        glProg.drawBlocks(next);
+                        if (bands[level] != null) {
+                            try { bands[level].close(); } catch (Throwable ignored) {}
+                        }
+                        bands[level] = next;
+                    }
+                } finally {
+                    for (GLTexture texture : remap) {
+                        if (texture != null) {
+                            try { texture.close(); } catch (Throwable ignored) {}
+                        }
+                    }
+                }
+            }
+
+            GLTexture reconstruction = guide[IRIS_26621_LAPLACIAN_LEVELS - 1];
+            boolean reconstructionOwned = false;
+            for (int level = IRIS_26621_LAPLACIAN_LEVELS - 2; level >= 0; level--) {
+                GLTexture next = new GLTexture(new Point(guide[level].mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+                glProg.useAssetProgram("motionv2/local_laplacian_reconstruct_26621");
+                glProg.setTexture("LocalBand", bands[level]);
+                glProg.setTexture("CoarseReconstruction", reconstruction);
+                glProg.drawBlocks(next);
+                if (reconstructionOwned) {
+                    try { reconstruction.close(); } catch (Throwable ignored) {}
+                }
+                reconstruction = next;
+                reconstructionOwned = true;
+            }
+            finalTone = reconstruction;
+
+            /* IRIS_26635_SPATIALLY_COHERENT_HIGHLIGHT_ROLLOFF
+             * The successful 26632 global upper-tone map remains the brightness authority.  Use
+             * its already-mapped Gaussian level as low-frequency illumination B, then recombine
+             * the completed Local-Laplacian result as B + k(B,R)R.  Only small upper-range
+             * residual variation is attenuated; strong structure remains effectively unchanged. */
+            if (IRIS_26635_HIGHLIGHT_BASE_LEVEL <= 0
+                    || IRIS_26635_HIGHLIGHT_BASE_LEVEL >= guide.length
+                    || guide[IRIS_26635_HIGHLIGHT_BASE_LEVEL] == null) {
+                throw new IllegalStateException("IRIS_26635 invalid highlight base level");
+            }
+            GLTexture coherentHighlightTone = new GLTexture(
+                    new Point(source.mSize), scalar, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/local_laplacian_remap_26621");
+            glProg.setTexture("CurrentToneLog", finalTone);
+            glProg.setTexture("SourceGuideLog", guide[IRIS_26635_HIGHLIGHT_BASE_LEVEL]);
+            /* IRIS_26644_VISUAL_HIGHLIGHT_SOURCE_STRUCTURE_BINDING
+             * Preserve a small bright residual only when the original pre-tone linear source
+             * independently proves balanced local structure. */
+            glProg.setTexture("SourceLinear", source);
+            glProg.setVar("iris26639ShadowBodyStrength",
+                    basePipeline.mParameters.motionV2ShadowBodyStrength);
+            glProg.setVar("iris26639ShadowBodyEnd",
+                    basePipeline.mParameters.motionV2ShadowBodyEnd);
+            glProg.setVar("iris26650HighlightCompressionEnabled",
+                    ((PostPipeline) basePipeline).motionV2PhotonHighlightCompressionEnabled ? 1 : 0);
+            glProg.setVar("iris26626Mode", 6);
+            glProg.drawBlocks(coherentHighlightTone);
+            try { finalTone.close(); } catch (Throwable ignored) {}
+            finalTone = coherentHighlightTone;
+
+            /* IRIS_26622_LOCAL_LAPLACIAN_TELEMETRY_LIFETIME
+             * Device regression from 26621: telemetry dereferenced guide[last].mSize after the
+             * guide pyramid had been released and nulled, aborting every Motion capture after the
+             * Local-Laplacian reconstruction had already completed. Snapshot diagnostic dimensions
+             * before release; telemetry must never retain or dereference a freed GLTexture. */
+            final int coarsestWidth = guide[IRIS_26621_LAPLACIAN_LEVELS - 1].mSize.x;
+            final int coarsestHeight = guide[IRIS_26621_LAPLACIAN_LEVELS - 1].mSize.y;
+
+            /* IRIS_26621_LOCAL_LAPLACIAN_PEAK_LIFETIME
+             * The remap pyramid is already gone. Once reconstruction is complete, guide/band
+             * pyramids are no longer needed; release them before the optional full-resolution
+             * true-2x readback so the direct R16F map does not overlap those transient allocations. */
+            for (int level = 0; level < bands.length; level++) {
+                if (bands[level] != null) {
+                    try { bands[level].close(); } catch (Throwable ignored) {}
+                    bands[level] = null;
+                }
+            }
+            for (int level = 0; level < guide.length; level++) {
+                if (guide[level] != null && guide[level] != finalTone) {
+                    try { guide[level].close(); } catch (Throwable ignored) {}
+                    guide[level] = null;
+                }
+            }
+
+            final float iris26626PreservationStrength = iris26626SourcePreservationStrength();
+            if (iris26626PreservationStrength > 1.0e-7f) {
+                GLTexture preservedTone = iris26626ApplyBoundedSourceDomainPreservation(
+                        source, finalTone, scalar, iris26626PreservationStrength);
+                if (preservedTone != finalTone) {
+                    try { finalTone.close(); } catch (Throwable ignored) {}
+                    finalTone = preservedTone;
+                }
+            }
+
+            if (basePipeline.mParameters.motionV2SuperResOutputEnabled) {
+                finalTone.BufferLoad();
+                ByteBuffer map = finalTone.textureBuffer(scalar, true);
+                map.position(0);
+                basePipeline.mParameters.motionV2LocalToneLogMap = map;
+                basePipeline.mParameters.motionV2LocalToneLogWidth = finalTone.mSize.x;
+                basePipeline.mParameters.motionV2LocalToneLogHeight = finalTone.mSize.y;
+                basePipeline.mParameters.motionV2LocalToneLogSourceWidth = source.mSize.x;
+                basePipeline.mParameters.motionV2LocalToneLogSourceHeight = source.mSize.y;
+            }
+
+            Log.i(Name, "IRIS_26621_NEW_SIMPLIFIED_LOCAL_LAPLACIAN"
+                    + " active=true"
+                    + " levels=" + IRIS_26621_LAPLACIAN_LEVELS
+                    + " references=" + IRIS_26621_REFERENCE_COUNT
+                    + " source=" + source.mSize.x + "x" + source.mSize.y
+                    + " target=" + finalTone.mSize.x + "x" + finalTone.mSize.y
+                    + " coarsest=" + coarsestWidth
+                        + "x" + coarsestHeight
+                    + " referenceLogRange=" + IRIS_26621_REFERENCE_MIN_LOG
+                        + ".." + IRIS_26621_REFERENCE_MAX_LOG
+                    + " sigmaEv=" + IRIS_26621_DETAIL_SIGMA_EV
+                    + " edgeSlope=" + IRIS_26621_EDGE_SLOPE
+                    + " detailAlpha=1.0"
+                    + " iris26626BoundedSourceDomain=true"
+                    + " iris26626PreservationStrength=" + iris26626PreservationStrength
+                    + " iris26626PreservationMax=" + IRIS_26626_SOURCE_PRESERVATION_MAX
+                    + " iris26626LowerBodyGate=" + IRIS_26623_UPPER_TONE_START + "..0.72"
+                    + " iris26626Baseline=EXACT_26625_RECONSTRUCTION"
+                    + " iris26644VisualHighlightSourceStructure=true"
+                    + " iris26644SmoothBrightResidualSuppressionRetained=true"
+                    + " iris26639ShadowBodyStrength=" + basePipeline.mParameters.motionV2ShadowBodyStrength
+                    + " iris26639ShadowBodyEnd=" + basePipeline.mParameters.motionV2ShadowBodyEnd
+                    + " iris26639ShadowMaxCorrectionEv=0.25"
+                    + " iris26639ShadowStructureResidualPreserved=true"
+                    + " globalExposureOwner=motionV2DisplayGain"
+                    + " outputExposureScaleConsumedOnce=" + OUTPUT_EXPOSURE_SCALE
+                    + " absoluteFullResolutionToneMap=true"
+                    + " correctionMap=false"
+                    + " rgbScalarOnly=true"
+                    + " true2xSharedMap=" + basePipeline.mParameters.motionV2SuperResOutputEnabled);
+            keepFinal = true;
+            return finalTone;
+        } finally {
+            for (GLTexture texture : bands) {
+                if (texture != null) {
+                    try { texture.close(); } catch (Throwable ignored) {}
+                }
+            }
+            for (GLTexture texture : guide) {
+                if (texture != null && texture != finalTone) {
+                    try { texture.close(); } catch (Throwable ignored) {}
+                }
+            }
+            if (!keepFinal && finalTone != null) {
+                try { finalTone.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    @Override
+    public void Run() {
+        if (!(basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive)) {
+            throw new IllegalStateException("MotionV2Render used outside Motion V2");
+        }
+
+        final GLTexture acquiredExtendedLinearHdr = previousNode.WorkingTexture;
+        GLTexture iris26662CanonicalHdrOwned = null;
+        GLTexture extendedLinearHdr = acquiredExtendedLinearHdr;
+        final float iris26662ReferenceProtectionEv = basePipeline.mParameters.motionV2Active
+                ? Math.max(0.0f, Math.min(1.50f,
+                        basePipeline.mParameters.motionV2ReferenceProtectionEv))
+                : 0.0f;
+        final float iris26662ReferenceRestoreGain =
+                (float)Math.pow(2.0, iris26662ReferenceProtectionEv);
+        if (basePipeline.mParameters.motionV2Active
+                && iris26662ReferenceRestoreGain > 1.0001f) {
+            /* IRIS_26662_CANONICAL_HDR_REFERENCE_NORMALIZATION
+             * 26661 correctly protected RAW highlights but left the merged float master in the
+             * deliberately underexposed reference domain, making the plant/chandelier bodies dark.
+             * Undo exactly that known acquisition EV here, before Local-Laplacian/tone/UHDR, in the
+             * unclipped floating HDR carrier. Values above 1 remain above 1; LONG contributes only
+             * through Sabre and never supplies this global scalar. */
+            iris26662CanonicalHdrOwned = new GLTexture(
+                    new Point(acquiredExtendedLinearHdr.mSize),
+                    acquiredExtendedLinearHdr.mFormat, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+            glProg.useAssetProgram("motionv2/display_exposure");
+            glProg.setTexture("InputBuffer", acquiredExtendedLinearHdr);
+            glProg.setVar("displayGain", iris26662ReferenceRestoreGain);
+            glProg.drawBlocks(iris26662CanonicalHdrOwned);
+            extendedLinearHdr = iris26662CanonicalHdrOwned;
+            Log.i(Name, "IRIS_26662_CANONICAL_HDR_REFERENCE_NORMALIZATION"
+                    + " referenceProtectionEv=" + iris26662ReferenceProtectionEv
+                    + " restoreGain=" + iris26662ReferenceRestoreGain
+                    + " beforeLocalTone=true beforeSdrTone=true beforeUhdrGainMap=true"
+                    + " unclippedFloatCarrier=true longGlobalBrightnessAuthority=false");
+        }
+
+        float postDisplaySensorWhite = Math.max(
+                1.0f, basePipeline.mParameters.motionV2DisplayGain);
+        float mgcSourceExposureGain = basePipeline.mParameters.motionV2MgcSourceExposureGain;
+        if (!Float.isFinite(mgcSourceExposureGain) || mgcSourceExposureGain <= 0.0f) {
+            throw new IllegalStateException(
+                    "Invalid MGC source-domain exposure gain at render: " + mgcSourceExposureGain);
+        }
+        /* IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT
+         * sceneWhite follows only the real Photon display exposure. Accepted-Short BaselineExposure
+         * is source-domain restoration and must not stretch the SDR highlight shoulder.
+         */
+        float baseSceneWhite = basePipeline.mParameters.motionV2ToneBaseSceneWhite;
+        if (!Float.isFinite(baseSceneWhite) || baseSceneWhite < 1.0f) {
+            baseSceneWhite = iris26582BaseSceneWhite(postDisplaySensorWhite);
+        }
+        float sceneWhite = iris26598PublicationSceneWhite(basePipeline.mParameters);
+        /* IRIS_26530_V1_3_FOV_AUTHORITY
+         * motionV2OutputZoom is the final FOV authority. SR reconstruction scale must not divide
+         * the JPEG/UHDR crop request; doing so produced the measured ~2x-wide 123x frame.
+         */
+        float reconstructionZoom = Math.max(1.0f,
+                basePipeline.mParameters.motionV2ReconstructionZoom);
+        /* IRIS_26532_20X_SR_GEOMETRY_IDENTITY
+         * MGC owns the crop through 20x total. Render owns only any residual request beyond the
+         * reconstruction crop, so reconstruction * residual == selected-lens local zoom exactly.
+         */
+        float irisOutputZoom = Math.max(1.0f,
+                basePipeline.mParameters.motionV2RenderResidualZoom);
+        Log.i("MotionV2Render", "IRIS_26532_FINAL_FOV_IDENTITY requestedLocal="
+                + basePipeline.mParameters.motionV2OutputZoom
+                + " reconstructionOwner=" + basePipeline.mParameters.motionV2ReconstructionOwner
+                + " reconstructionZoom=" + reconstructionZoom
+                + " renderResidual=" + irisOutputZoom
+                + " product=" + (reconstructionZoom * irisOutputZoom));
+        GLTexture iris26621LocalTone = iris26621BuildLocalLaplacianTone(extendedLinearHdr);
+        final boolean iris26640KeepLocalToneForGainMap = basePipeline.mParameters.motionV2Active
+                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE;
+        /* IRIS_26630_PER_LENS_SATURATION_ROUTE
+         * Only the Motion graph owns the per-lens Iris Saturation snapshot. Night deliberately
+         * receives neutral 1.0; SR uses the same frozen Motion snapshot through the native encoder. */
+        PostPipeline pipeline = (PostPipeline) basePipeline;
+        IrisMotionSettings.Snapshot iris26630Tone = pipeline.motionV2ToneSettingsSnapshot;
+        float iris26630MotionSaturation = basePipeline.mParameters.motionV2Active
+                && iris26630Tone != null ? iris26630Tone.saturation : 1.0f;
+        iris26630MotionSaturation = Math.max(0.0f, Math.min(2.0f, iris26630MotionSaturation));
+        try {
+            glProg.useAssetProgram("motionv2/render");
+            glProg.setTexture("InputBuffer", extendedLinearHdr);
+            glProg.setVar("sceneWhite", sceneWhite);
+            glProg.setVar("iris26592MotionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+            glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+            glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+            iris26653SetFinalToneUniforms();
+            glProg.setVar("irisOutputZoom", irisOutputZoom);
+            glProg.setVar("iris26630MotionSaturation", iris26630MotionSaturation);
+            glProg.setVar("iris26664GlobalBodyLiftEv",
+                    basePipeline.mParameters.motionV2GlobalBodyLiftEv);
+            glProg.setVar("iris26621LocalToneEnabled", iris26621LocalTone != null ? 1 : 0);
+            if (iris26621LocalTone != null) {
+                glProg.setTexture("iris26621LocalToneLog", iris26621LocalTone);
+            }
+
+            WorkingTexture = basePipeline.getMain();
+            glProg.drawBlocks(WorkingTexture);
+            Log.i(Name, "IRIS_26664_GLOBAL_LOG_BODY_TONE"
+                    + " bodyLiftEv=" + basePipeline.mParameters.motionV2GlobalBodyLiftEv
+                    + " fullLiftBelowGuide=0.08 fadeToIdentityGuide=0.65"
+                    + " residualResponsePercent=65.0 spatialMask=false"
+                    + " c1=true monotone=true highlightOwner26660Frozen=true");
+        } finally {
+            if (iris26621LocalTone != null && !iris26640KeepLocalToneForGainMap) {
+                try { iris26621LocalTone.close(); } catch (Throwable ignored) {}
+            }
+        }
+
+        pipeline.motionV2GainMapBitmap = null;
+        pipeline.motionV2GainMapMaxRatio = 1.0f;
+        pipeline.motionV2GainMapFullHdrDisplayRatio = 1.0f;
+
+        /* IRIS_26550_NIGHT_POST_JIN_ULTRAHDR_AUTHORITY
+         * Motion uses 26641 half-linear-resolution matched-intent gain geometry. Night retains its
+         * existing 1/4-resolution pre-Jin HDR/SDR relationship from this GL owner; IrisNightUltraHdr
+         * later rebases that relationship against the final post-Jin SDR before attaching JPEG_R.
+         */
+        final boolean iris26550Night = basePipeline.mParameters.irisNightActive;
+        try {
+        if ((basePipeline.mParameters.motionV2Active || iris26550Night)
+                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            /* IRIS_26470_UHDR_RENDER_GEOMETRY_AUTHORITY */
+            Point renderedSdrSize = new Point(WorkingTexture.mSize);
+            final int gainDownsample = iris26550Night ? 4 : GAINMAP_DOWNSAMPLE;
+            Point gainSize = new Point(
+                    Math.max(1, (renderedSdrSize.x + gainDownsample - 1) / gainDownsample),
+                    Math.max(1, (renderedSdrSize.y + gainDownsample - 1) / gainDownsample));
+
+            /* Preserve the pre-26515 UHDR capacity exactly. The Short source-domain
+             * headroom still participates in max gain even though it no longer changes sceneWhite.
+             */
+            float maxGainRatio = iris26550Night
+                    ? Math.max(2.0f, Math.min(2.5f, HDR_EXPOSURE_SCALE * postDisplaySensorWhite
+                            * mgcSourceExposureGain))
+                    : iris26640MotionGainEncodingCeiling();
+            final float encodingMaxGainRatio = maxGainRatio;
+
+            GLTexture gainTexture = null;
+            final long iris26641GainStartNs = System.nanoTime();
+            long iris26641AfterDrawNs = iris26641GainStartNs;
+            long iris26641AfterReadbackNs = iris26641GainStartNs;
+            long iris26641AfterScanNs = iris26641GainStartNs;
+            try {
+                gainTexture = new GLTexture(
+                        gainSize,
+                        new GLFormat(GLFormat.DataType.SIMPLE_8, 1),
+                        null,
+                        GL_LINEAR,
+                        GL_CLAMP_TO_EDGE);
+
+                glProg.useAssetProgram("motionv2/gainmap");
+                glProg.setTexture("HdrBuffer", extendedLinearHdr);
+                glProg.setTexture("SdrBuffer", WorkingTexture);
+                glProg.setVar("gainMapSize", gainSize);
+                glProg.setVar("hdrExposureScale", HDR_EXPOSURE_SCALE);
+                glProg.setVar("displayGain", basePipeline.mParameters.motionV2DisplayGain);
+                glProg.setVar("motionHdrHandoff", basePipeline.mParameters.motionV2Active ? 1 : 0);
+                glProg.setVar("maxGainRatio", encodingMaxGainRatio);
+                glProg.setVar("iris26621LocalToneEnabled",
+                        basePipeline.mParameters.motionV2Active && iris26621LocalTone != null ? 1 : 0);
+                if (basePipeline.mParameters.motionV2Active && iris26621LocalTone != null) {
+                    glProg.setTexture("iris26621LocalToneLog", iris26621LocalTone);
+                }
+                iris26653SetFinalToneUniforms();
+
+                glProg.setVar("irisOutputZoom", irisOutputZoom);
+                glProg.drawBlocks(gainTexture);
+                iris26641AfterDrawNs = System.nanoTime();
+
+                gainTexture.BufferLoad();
+                GLFormat readFormat =
+                        new GLFormat(GLFormat.DataType.SIMPLE_8, 1);
+                ByteBuffer rgba =
+                        gainTexture.textureBuffer(readFormat, true);
+                iris26641AfterReadbackNs = System.nanoTime();
+                rgba.position(0);
+
+                int pixels = gainSize.x * gainSize.y;
+                ByteBuffer alpha = ByteBuffer.allocateDirect(pixels);
+                int nonUnity = 0;
+                int encodedPeakCode = 0;
+                for (int i = 0; i < pixels; i++) {
+                    int code = rgba.get(i) & 0xff;
+                    if (code > 0) nonUnity++;
+                    encodedPeakCode = Math.max(encodedPeakCode, code);
+                }
+                float actualPeakContentRatio = (float)Math.pow(
+                        Math.max(encodingMaxGainRatio, 1.001f), encodedPeakCode / 255.0f);
+                if (basePipeline.mParameters.motionV2Active) {
+                    maxGainRatio = encodedPeakCode > 0
+                            ? Math.max(1.001f, Math.min(IRIS_26592_MOTION_UHDR_MAX_RATIO,
+                                    actualPeakContentRatio))
+                            : 1.001f;
+                }
+                int peakCode = 0;
+                final double logEncodingMax = Math.log(Math.max(encodingMaxGainRatio, 1.001f));
+                final double logDeclaredMax = Math.log(Math.max(maxGainRatio, 1.001f));
+                for (int i = 0; i < pixels; i++) {
+                    int encodedCode = rgba.get(i) & 0xff;
+                    int outputCode = encodedCode;
+                    if (basePipeline.mParameters.motionV2Active && encodedCode > 0) {
+                        double ratioAtPixel = Math.exp(logEncodingMax * encodedCode / 255.0);
+                        outputCode = (int)Math.round(255.0 * Math.log(ratioAtPixel) / logDeclaredMax);
+                        outputCode = Math.max(0, Math.min(255, outputCode));
+                    }
+                    peakCode = Math.max(peakCode, outputCode);
+                    alpha.put((byte)outputCode);
+                }
+                alpha.position(0);
+                iris26641AfterScanNs = System.nanoTime();
+
+                /*
+                 * Per-pixel gain-map provenance, not just a global percentage.
+                 * 12x8 nearest samples are written as hexadecimal gain codes.
+                 * Also report horizontal/vertical roughness so a smooth floor
+                 * or ceiling-light region cannot hide behind one global mean.
+                 */
+                /* IRIS_26513_GAINMAP_DIAGNOSTIC_DECIMATION
+                 * Diagnostic roughness remains a 12x8 local-neighbor sample of the actual stored
+                 * gain map; it never modifies the gain bytes. 26641 reduces Motion's stored map
+                 * itself to half linear resolution before this diagnostic stage.
+                 */
+                StringBuilder grid = new StringBuilder();
+                final int gridW = 12;
+                final int gridH = 8;
+                long roughSum = 0L;
+                long roughCount = 0L;
+                for (int gy = 0; gy < gridH; gy++) {
+                    if (gy > 0) grid.append('/');
+                    int sy = Math.min(gainSize.y - 1,
+                            (int)(((gy + 0.5f) * gainSize.y) / gridH));
+                    for (int gx = 0; gx < gridW; gx++) {
+                        int sx = Math.min(gainSize.x - 1,
+                                (int)(((gx + 0.5f) * gainSize.x) / gridW));
+                        int idx = sy * gainSize.x + sx;
+                        int code = alpha.get(idx) & 0xff;
+                        if (code < 16) grid.append('0');
+                        grid.append(Integer.toHexString(code));
+                        if (sx + 1 < gainSize.x) {
+                            int right = alpha.get(idx + 1) & 0xff;
+                            roughSum += Math.abs(code - right);
+                            roughCount++;
+                        }
+                        if (sy + 1 < gainSize.y) {
+                            int down = alpha.get(idx + gainSize.x) & 0xff;
+                            roughSum += Math.abs(code - down);
+                            roughCount++;
+                        }
+                    }
+                }
+                float meanNeighborDelta = roughCount > 0
+                        ? roughSum / (float)roughCount
+                        : 0.0f;
+
+                Bitmap gainMap = Bitmap.createBitmap(
+                        gainSize.x,
+                        gainSize.y,
+                        Bitmap.Config.ALPHA_8);
+                gainMap.copyPixelsFromBuffer(alpha);
+
+                /* IRIS_26640_UHDR_CAPACITY_EQUALS_MEASURED_STORED_RANGE
+                 * Capacity describes the display range over which the encoded gain map is
+                 * progressively applied; it is not the current scene's measured peak code. */
+                float fullHdrDisplayRatio = maxGainRatio;
+                pipeline.motionV2GainMapBitmap = gainMap;
+                pipeline.motionV2GainMapMaxRatio = maxGainRatio;
+                pipeline.motionV2GainMapFullHdrDisplayRatio = fullHdrDisplayRatio;
+                final long iris26641AfterBitmapNs = System.nanoTime();
+                Log.d(Name, "IRIS_26641_GAINMAP_TIMING"
+                        + " drawMs=" + ((iris26641AfterDrawNs - iris26641GainStartNs) / 1_000_000.0)
+                        + " readbackMs=" + ((iris26641AfterReadbackNs - iris26641AfterDrawNs) / 1_000_000.0)
+                        + " scanMs=" + ((iris26641AfterScanNs - iris26641AfterReadbackNs) / 1_000_000.0)
+                        + " bitmapMs=" + ((iris26641AfterBitmapNs - iris26641AfterScanNs) / 1_000_000.0)
+                        + " totalMs=" + ((iris26641AfterBitmapNs - iris26641GainStartNs) / 1_000_000.0)
+                        + " gainPixels=" + pixels);
+                try {
+                    com.particlesdevs.photoncamera.util.MotionTrace.processingState(
+                            "IRIS_26596_UHDR_GAINMAP_CONTENT",
+                            "ratioEncodingMax=" + maxGainRatio
+                                    + " peakCode=" + peakCode
+                                    + " actualPeakContentRatio=" + actualPeakContentRatio
+                                    + " fullHdrDisplayRatio=" + fullHdrDisplayRatio
+                                    + " capacityMatchesGainMapMax=true actualPeakContentRatio=" + actualPeakContentRatio
+                                    + " bodyGainOwner=IRIS_26641_TRUE_MATCHED_SDR_HDR_INTENT_QUOTIENT"
+                                    + " hdrGainSource=MATCHED_EXTENDED_LINEAR_SDR_HDR_INTENTS"
+                                    + " hdrEligibilityThreshold=false"
+                                    + " singleMatchAnchor=false fixedBodyGain=false nominalWhiteDiscontinuity=false"
+                                    + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                                    + " hdrExposureScale=" + HDR_EXPOSURE_SCALE);
+                } catch (Throwable ignored) {}
+
+                Log.d(Name, "IRIS_26470_UHDR_GAINMAP_GEOMETRY"
+                        + " renderedSdr=" + renderedSdrSize.x + "x" + renderedSdrSize.y
+                        + " gainMap=" + gainSize.x + "x" + gainSize.y
+                        + " downsample=" + gainDownsample
+                        + " authority=actualRenderedSdrTexture"
+                        + " pipeline=" + (iris26550Night ? "NIGHT_PRE_JIN_DETACHED" : "MOTION"));
+                Log.d(Name, "IRIS_26436_V2_GAINMAP"
+                        + " size=" + gainSize.x + "x" + gainSize.y
+                        + " maxRatio=" + maxGainRatio
+                        + " nonUnityFraction="
+                        + (pixels > 0 ? nonUnity / (float)pixels : 0.0f)
+                        + " peakCode=" + peakCode
+                        + " meanNeighborDeltaCode=" + meanNeighborDelta
+                        + " roughnessSampling=12x8_local_neighbors"
+                        + " fullImageRoughnessScan=false"
+                        + " provenance=actualGainMapBeforeJpegAttach"
+                        + " grid12x8=" + grid
+                        + " source=extendedLinearPreTone"
+                        + " fullResolutionGainMap=false"
+                        + " matchedIntentPreDivideDownsample=" + (!iris26550Night)
+                        + " downsample=" + gainDownsample
+                        + " widthFraction=" + (1.0f / gainDownsample)
+                        + " heightFraction=" + (1.0f / gainDownsample)
+                        + " nightPostJinRebaseRequired=" + iris26550Night
+                        + " quotientOffset=0.015625"
+                        + " standardLogGainEncoding=true"
+                        + " gainMapResamplingRequired=true"
+                        + " reconstructionDetailAuthorityOwner="
+                        + basePipeline.mParameters.motionV2ReconstructionOwner
+                        + " pointDecimation=false"
+                        + " postAliasSpikeRepair=false"
+                        + " sdrBaseDetailAuthority=true colorAuthority=SDR_BASE_ONLY"
+                        + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                        + " motionHdrEligibilityThreshold=false"
+                        + " motionHdrGainIsScalarLuminanceOnly=true"
+                        + " motionHdrGainEquation=IRIS_26641_TRUE_MATCHED_LINEAR_LUMINANCE_QUOTIENT"
+                        + " motionHdrEligibilityDilation=false motionHdrPointwiseThreshold=false"
+                        + " motionHdrSingleMatchAnchor=false motionHdrFixedBodyGain=false"
+                        + " IRIS_26641_MATCHED_INTENT_UHDR=true");
+            } finally {
+                if (gainTexture != null) {
+                    try { gainTexture.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+        } finally {
+            if (iris26640KeepLocalToneForGainMap && iris26621LocalTone != null) {
+                try { iris26621LocalTone.close(); } catch (Throwable ignored) {}
+            }
+        }
+        if (iris26662CanonicalHdrOwned != null) {
+            try { iris26662CanonicalHdrOwned.close(); } catch (Throwable ignored) {}
+            iris26662CanonicalHdrOwned = null;
+        }
+
+        glProg.closed = true;
+
+        if (basePipeline.mParameters.motionV2Active) {
+            final float iris26623Pressure = iris26623HighlightPressure(
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite);
+            final float iris26623WhiteAnchor = IRIS_26623_SPARSE_WHITE_ANCHOR
+                    + (IRIS_26623_BROAD_WHITE_ANCHOR - IRIS_26623_SPARSE_WHITE_ANCHOR) * iris26623Pressure;
+            final float iris26623WhiteSlope = IRIS_26623_SPARSE_WHITE_SLOPE
+                    + (IRIS_26623_BROAD_WHITE_SLOPE - IRIS_26623_SPARSE_WHITE_SLOPE) * iris26623Pressure;
+            final PostPipeline iris26653Pipeline = (PostPipeline) basePipeline;
+            final boolean iris26653Enabled = iris26653Pipeline.motionV2PhotonHighlightCompressionEnabled;
+            final float iris26653Knee = iris26653Pipeline.motionV2PhotonHighlightKnee;
+            final float iris26653White = iris26653Pipeline.motionV2PhotonAdaptiveWhitePoint;
+            final float iris26653At1 = iris26653MapMotionSdrFinalGuide(1.0f,
+                    basePipeline.mParameters.motionV2DisplayGain,
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                    iris26653Enabled, iris26653Knee, iris26653White);
+            final float iris26653At125 = iris26653MapMotionSdrFinalGuide(1.25f,
+                    basePipeline.mParameters.motionV2DisplayGain,
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                    iris26653Enabled, iris26653Knee, iris26653White);
+            final float iris26653At2 = iris26653MapMotionSdrFinalGuide(2.0f,
+                    basePipeline.mParameters.motionV2DisplayGain,
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                    iris26653Enabled, iris26653Knee, iris26653White);
+            final float iris26660Old065 = iris26653MapMotionSdrFinalGuide(0.65f,
+                    basePipeline.mParameters.motionV2DisplayGain,
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                    iris26653Enabled, iris26653Knee, iris26653White);
+            final float iris26660Old085 = iris26653MapMotionSdrFinalGuide(0.85f,
+                    basePipeline.mParameters.motionV2DisplayGain,
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                    iris26653Enabled, iris26653Knee, iris26653White);
+            final float iris26660Old090 = iris26653MapMotionSdrFinalGuide(0.90f,
+                    basePipeline.mParameters.motionV2DisplayGain,
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                    iris26653Enabled, iris26653Knee, iris26653White);
+            final float iris26660Old095 = iris26653MapMotionSdrFinalGuide(0.95f,
+                    basePipeline.mParameters.motionV2DisplayGain,
+                    basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction,
+                    basePipeline.mParameters.motionV2ToneBaseSceneWhite,
+                    basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite,
+                    iris26653Enabled, iris26653Knee, iris26653White);
+            Log.i(Name, "IRIS_26660_OBJECT_COLOR_GAMMA"
+                    + " owner=MotionV2RenderPostLocalTone"
+                    + " visualAuthority=26658Window+Cement+26659OutdoorSeamVsPhoton"
+                    + " spatialSampling=false"
+                    + " sourceThreshold=false"
+                    + " scalarRgbChromaticityPreserved=true"
+                    + " gamma=" + IRIS_26660_GAMMA_VALUE
+                    + " influencePower=" + IRIS_26660_GAMMA_INFLUENCE_POWER
+                    + " whiteScale=" + IRIS_26660_GAMMA_WHITE_SCALE
+                    + " old065=" + iris26660Old065
+                    + " new065=" + iris26660ObjectColorGamma(iris26660Old065,iris26653Enabled)
+                    + " old085=" + iris26660Old085
+                    + " new085=" + iris26660ObjectColorGamma(iris26660Old085,iris26653Enabled)
+                    + " old090=" + iris26660Old090
+                    + " new090=" + iris26660ObjectColorGamma(iris26660Old090,iris26653Enabled)
+                    + " old095=" + iris26660Old095
+                    + " new095=" + iris26660ObjectColorGamma(iris26660Old095,iris26653Enabled)
+                    + " uhdrHdrTarget26658Frozen=true"
+                    + " bracketMerge26658Frozen=true"
+                    + " old26659BandRemoved=true");
+
+            Log.i(Name, "IRIS_26653_SINGLE_FINAL_HIGHLIGHT_TONE"
+                    + " enabled=" + iris26653Enabled
+                    + " owner=MotionV2RenderAfterBrightnessSolve"
+                    + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+                    + " matcherUses26652OffMap=true"
+                    + " lowerToneExactThrough=" + IRIS_26623_UPPER_TONE_START
+                    + " photonKnee=" + iris26653Knee
+                    + " photonAdaptiveWhitePoint=" + iris26653White
+                    + " map1=" + iris26653At1
+                    + " map1p25=" + iris26653At125
+                    + " map2=" + iris26653At2
+                    + " localLaplacianSharedMap=true"
+                    + " gainMapSharedMap=true"
+                    + " preColorDifferential=false");
+
+            Log.i(Name, "IRIS_26623_SCENE_ADAPTIVE_UPPER_TONE"
+                    + " master=extendedLinearPreTone"
+                    + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+                    + " displayGainImageMultiplier=false"
+                    + " lowerTonePreservedThrough=" + IRIS_26623_UPPER_TONE_START
+                    + " highlightPressure=" + iris26623Pressure
+                    + " adaptiveWhiteAnchor=" + iris26623WhiteAnchor
+                    + " adaptiveWhiteSlope=" + iris26623WhiteSlope
+                    + " broadNearFraction=" + basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction
+                    + " hardFraction=" + basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction
+                    + " baseSceneWhite=" + basePipeline.mParameters.motionV2ToneBaseSceneWhite
+                    + " adaptiveSceneWhite=" + basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite
+                    + " oldFixedWhiteAnchor=" + IRIS_26621_SDR_WHITE_ANCHOR
+                    + " sceneRecognition=false"
+                    + " c1UpperBody=true c1SourceWhite=true monotonic=true hardEndpointClamp=false"
+                    + " localToneOwner=fastLocalLaplacian"
+                    + " localToneGlobalExposureMultiplier=false"
+                    + " localToneDetailAlpha=1.0"
+                    + " sdrExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                    + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+                    + " matchedSdrHdrRenditions=true"
+                    + " uhdrBodyGainOwner=MATCHED_LINEAR_INTENTS"
+                    + " uhdrGainOwner=LINEAR_LUMINANCE_QUOTIENT_1_OVER_64"
+                    + " superResToneParity=true");
+        }
+
+        Log.d(Name, "IRIS_26436_V2_RENDER"
+                + " canonicalSignalAlreadyApplied=true"
+                + " postDisplaySensorWhite=" + postDisplaySensorWhite
+                + " mgcSourceExposureGain=" + mgcSourceExposureGain
+                + " sceneWhite=" + sceneWhite
+                + " baseSceneWhite=" + baseSceneWhite
+                + " adaptiveSceneWhite=" + basePipeline.mParameters.motionV2ToneAdaptiveSceneWhite
+                + " publicationSceneWhiteSource="
+                    + (basePipeline.mParameters.motionV2Active ? "BASE_26598_MOTION" : "ADAPTIVE_26591_NIGHT")
+                + " IRIS_26598_SEMANTIC_AUTHORITY=true"
+                + " toneP95Guide=" + basePipeline.mParameters.motionV2ToneP95Guide
+                + " toneP99Guide=" + basePipeline.mParameters.motionV2ToneP99Guide
+                + " toneP995Guide=" + basePipeline.mParameters.motionV2ToneP995Guide
+                + " toneP998Guide=" + basePipeline.mParameters.motionV2ToneP998Guide
+                + " legacyPredictedClipFraction=" + basePipeline.mParameters.motionV2TonePredictedClipFraction
+                + " projectedBroadNearCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedBroadNearCeilingFraction
+                + " projectedNearCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedNearCeilingFraction
+                + " projectedHardCeilingFraction=" + basePipeline.mParameters.motionV2ToneProjectedHardCeilingFraction
+                + " projectedBroadTailStrength=" + basePipeline.mParameters.motionV2ToneProjectedBroadTailStrength
+                + " compactTailStrength=" + basePipeline.mParameters.motionV2ToneCompactTailStrength
+                + " adaptiveStrength=" + basePipeline.mParameters.motionV2ToneAdaptiveStrength
+                + " legacyHighlightTarget=" + IRIS_26582_HIGHLIGHT_TARGET
+                + " broadHighlightTarget=" + IRIS_26583_BROAD_HIGHLIGHT_TARGET
+                + " compactHighlightTarget=" + IRIS_26583_COMPACT_HIGHLIGHT_TARGET
+                + " iris26591FinalLogShape=" + IRIS_26591_LOG_SHAPE
+                + " iris26592MotionUnboundedTail=" + basePipeline.mParameters.motionV2Active
+                + " iris26592TanhScale=" + IRIS_26592_TANH_SCALE
+                + " iris26591FinalTargets=" + IRIS_26591_HIGHLIGHT_TARGET + ","
+                    + IRIS_26591_BROAD_HIGHLIGHT_TARGET + ","
+                    + IRIS_26591_COMPACT_HIGHLIGHT_TARGET + ","
+                    + IRIS_26591_CONTINUOUS_HIGHLIGHT_TARGET + ","
+                    + IRIS_26591_STRUCTURED_HIGHLIGHT_TARGET
+                + " IRIS_26583_PROJECTED_BROAD_AND_COMPACT_HIGHLIGHT_TAIL=true"
+                + " IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE=true"
+                + " IRIS_26515_RENDER_EXPOSURE_AUTHORITY_SPLIT=true"
+                                + " toneCurve26430ExactBase=true"
+                + " outputExposureScale=" + OUTPUT_EXPOSURE_SCALE
+                + " outputExposureEv=-0.321928"
+                + " hdrTargetUsesSameScale=true"
+                + " hdrTargetExposureScale=" + HDR_EXPOSURE_SCALE
+                + " hdrEligibilityThreshold=false"
+                + " uhdrLuminanceOnly=true uhdrMatchedIntentQuotient=true"
+                + " IRIS_26506_SEPARATE_SDR_HDR_EXPOSURE_TARGETS=true"
+                + " syntheticBitmapGainMap=false"
+                + " irisOutputZoom=" + irisOutputZoom
+                + " nativeOutputDimensionsPreserved=true"
+                + " iris26621SdrWhiteAnchorLegacy=" + IRIS_26621_SDR_WHITE_ANCHOR
+                + " iris26623AdaptiveUpperTone=true"
+                + " iris26614DisplayDomainKneeAuthority=false"
+                + " iris26614CanonicalAppearanceGainAuthority=false"
+                + " IRIS_26623_ADAPTIVE_UPPER_TONE_SDR_UHDR_SR_PARITY=true"
+                + " iris26630AdaptiveColorV5=false iris26639Acr3CalibratedChromaFloor=true iris26630Saturation=" + iris26630MotionSaturation
+                + " iris26630SaturationOwner=" + (basePipeline.mParameters.motionV2Active ? "MOTION_PER_LENS" : "NIGHT_NEUTRAL_1_0")
+                + " localTone=" + basePipeline.mParameters.motionV2Active
+                + " localToneOwner=IRIS_26621_FAST_LOCAL_LAPLACIAN"
+                + " globalToneOwner=IRIS_26623_SCENE_ADAPTIVE_UPPER_TONE"
+                + " sharpening=false");
+    }
+}
