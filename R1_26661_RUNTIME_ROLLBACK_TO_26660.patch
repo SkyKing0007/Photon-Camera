@@ -1,0 +1,535 @@
+diff --git a/app/src/main/assets/shaders/preview/main_fs.glsl b/app/src/main/assets/shaders/preview/main_fs.glsl
+index c36435deb82547e0051fd1a36f04128a40d47025..1e7f4b999b41a67f9d03cd44d7f153521e9a824b 100644
+--- a/app/src/main/assets/shaders/preview/main_fs.glsl
++++ b/app/src/main/assets/shaders/preview/main_fs.glsl
+@@ -5,7 +5,6 @@ uniform vec2 resolution;
+ uniform bool enablePeak;
+ uniform bool mirror;
+ uniform float irisSoftwareZoom;
+-uniform float iris26661ReferencePreviewGain;
+ /* IRIS_26524_PREVIEW_RESIDUAL_ZOOM */
+ out vec4 Output;
+ in vec2 texCoord;
+@@ -32,20 +31,5 @@ void main() {
+     vec4 dc = vec4(1.0,0.0,1.0,0.0);
+     if(enablePeak)
+         color = color + dc*32.0*diff*w;
+-
+-    /* IRIS_26661_GOOGLE_REFERENCE_LIVE_PREVIEW_COMPENSATION
+-     * Camera2 AE compensation deliberately protects the RAW reference exposure. Approximate the
+-     * inverse only for the displayed preview in linear-light sRGB so the user does not see a dark
+-     * viewfinder. The same protection magnitude is accounted for exactly once by final rendering.
+-     */
+-    vec3 encoded = clamp(color.rgb, vec3(0.0), vec3(1.0));
+-    vec3 lowLinear = encoded / 12.92;
+-    vec3 highLinear = pow((encoded + 0.055) / 1.055, vec3(2.4));
+-    vec3 linearRgb = mix(lowLinear, highLinear, step(vec3(0.04045), encoded));
+-    linearRgb *= max(iris26661ReferencePreviewGain, 1.0);
+-    vec3 lowEncoded = 12.92 * linearRgb;
+-    vec3 highEncoded = 1.055 * pow(max(linearRgb, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+-    color.rgb = clamp(mix(lowEncoded, highEncoded, step(vec3(0.0031308), linearRgb)),
+-                      vec3(0.0), vec3(1.0));
+     Output = color;
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index b42a7a61dd137ec80d9e746335317c575a5bfeb4..83cf899570cce3c6df387f928488cee73cc583de 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -797,17 +797,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                  * metadata for capture processing and JPEG normalization.
+                  */
+                 /* updateMotionV2ExposureAuthority(result); intentionally dormant */
+-                /* updateMotion26368AdaptiveAeBias(result); intentionally dormant */
+-                /*
+-                 * IRIS_26661_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+-                 *
+-                 * Keep HAL AE as the live controller, but give the Motion ZSL RAW group one
+-                 * slowly-changing NEGATIVE-only AE-compensation offset when fresh RAW evidence
+-                 * proves HDR/highlight pressure. This is the only active Motion AE writer.
+-                 * The controller debiases its own RAW guide before solving the next target, so
+-                 * its protection cannot oscillate merely because the previous offset worked.
+-                 */
+-                updateMotion26661GoogleReferenceExposureAuthority(result);
++                /* IRIS_26386_STABLE_HAL_AE_AUTHORITY */
++                // Asynchronous RAW evidence is diagnostic only; HAL AE owns live preview.
++                // updateMotion26368AdaptiveAeBias(result);
+             }
+             if (mTemp != null) mPreviewTemp = mTemp;
+             if (mPreviewTemp == null) {
+@@ -1575,50 +1567,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private static final long MOTION_26608_HDR_CONFLICT_HOLD_NS = 500_000_000L;
+     private static final int MOTION_26608_HISTOGRAM_BINS = 128;
+ 
+-    /*
+-     * IRIS_26661_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+-     *
+-     * Google HDR+ deliberately keeps its short/reference burst highlight-safe. 26658 already
+-     * changed the merge roles (ZSL reference + one longer shadow/SNR exposure), but deliberately
+-     * left ZSL exposure policy untouched. 26661 completes that acquisition contract without
+-     * reviving the old post-shutter HIGHLIGHT_SHORT frame:
+-     *
+-     *   - HAL AE stays ON.
+-     *   - only a negative AE-compensation offset is allowed;
+-     *   - the target is driven by fresh sensor-normalized RAW evidence, never scene semantics;
+-     *   - the already-applied offset is mathematically removed from the next RAW guide before
+-     *     solving, preventing a successful protection step from making the controller undo itself;
+-     *   - increases settle faster than releases and updates are cadence-limited to avoid the
+-     *     26412 preview-oscillation regression.
+-     */
+-    private static final float MOTION_26661_REFERENCE_HEADROOM_TARGET = 0.72f;
+-    private static final float MOTION_26661_HDR_MIN_PROTECTION_EV = 0.35f;
+-    private static final float MOTION_26661_CLIP_MIN_PROTECTION_EV = 0.70f;
+-    private static final float MOTION_26661_MAX_PROTECTION_EV = 1.50f;
+-    private static final int MOTION_26661_INCREASE_CONFIRM_FRAMES = 4;
+-    private static final int MOTION_26661_RELEASE_CONFIRM_FRAMES = 10;
+-    private static final long MOTION_26661_MIN_UPDATE_MS = 650L;
+-    private boolean mMotion26661ReferenceBaseReady = false;
+-    private int mMotion26661ReferenceBaseSteps = 0;
+-    private int mMotion26661ReferenceAppliedProtectionSteps = 0;
+-    private int mMotion26661ReferenceCandidateProtectionSteps = 0;
+-    private int mMotion26661ReferenceCandidateFrames = 0;
+-    private long mMotion26661ReferenceLastUpdateMs = 0L;
+-    private volatile float mMotion26661ReferenceAppliedProtectionEv = 0.0f;
+-
+-    /**
+-     * IRIS_26661_GOOGLE_REFERENCE_LIVE_PREVIEW_COMPENSATION
+-     * Sensor underexposure protects the RAW ZSL group, but the live SurfaceTexture is a display
+-     * product. Expose the positive magnitude to the preview renderer so it can undo only that
+-     * deliberate capture bias in display space. The RAW stream itself remains untouched.
+-     */
+-    public float getMotion26661ReferencePreviewProtectionEv() {
+-        return isZslMode()
+-                ? Math.max(0.0f, Math.min(MOTION_26661_MAX_PROTECTION_EV,
+-                        mMotion26661ReferenceAppliedProtectionEv))
+-                : 0.0f;
+-    }
+-
+     /* IRIS_26496_SPATIALLY_PERSISTENT_HIGHLIGHT_TRIGGER
+      * A global clipped-pixel percentage misses tiny but visually dominant LEDs,
+      * chandelier rims, flowers and window glints. Keep the per-frame sampler cheap,
+@@ -1956,201 +1904,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    /*
+-     * IRIS_26661_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+-     *
+-     * This is intentionally not the retired 26412/26368 positive-EV loop. It can only move the
+-     * Motion reference darker than the user's/HAL baseline and it never disables AE or writes
+-     * shutter/ISO directly. The long bracket remains the sole extra-photon shadow observation.
+-     */
+-    private void updateMotion26661GoogleReferenceExposureAuthority(
+-            @NonNull TotalCaptureResult result) {
+-        if (!isZslMode() || mZslCapturing || burst || isProcessing
+-                || mPreviewRequestBuilder == null || mCaptureSession == null
+-                || mCameraCharacteristics == null) {
+-            return;
+-        }
+-
+-        Integer aeMode = result.get(CaptureResult.CONTROL_AE_MODE);
+-        Long actualExposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+-        Integer actualIso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+-        Long sensorTs = result.get(CaptureResult.SENSOR_TIMESTAMP);
+-        if (aeMode == null || aeMode == CaptureResult.CONTROL_AE_MODE_OFF
+-                || actualExposure == null || actualExposure <= 0L
+-                || actualIso == null || actualIso <= 0 || sensorTs == null) {
+-            return;
+-        }
+-
+-        android.util.Range<Integer> aeRange = mCameraCharacteristics.get(
+-                CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+-        android.util.Rational aeStep = mCameraCharacteristics.get(
+-                CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+-        if (aeRange == null || aeStep == null || aeStep.floatValue() <= 0.0f) return;
+-        final float stepEv = aeStep.floatValue();
+-
+-        Integer builderSteps = mPreviewRequestBuilder.get(
+-                CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
+-        int currentBuilderSteps = builderSteps != null ? builderSteps : 0;
+-
+-        if (!mMotion26661ReferenceBaseReady) {
+-            mMotion26661ReferenceBaseSteps = Math.max(
+-                    aeRange.getLower(), Math.min(aeRange.getUpper(), currentBuilderSteps));
+-            mMotion26661ReferenceAppliedProtectionSteps = 0;
+-            mMotion26661ReferenceCandidateProtectionSteps = 0;
+-            mMotion26661ReferenceCandidateFrames = 0;
+-            mMotion26661ReferenceAppliedProtectionEv = 0.0f;
+-            mMotion26661ReferenceBaseReady = true;
+-        } else {
+-            int expectedBuilderSteps = mMotion26661ReferenceBaseSteps
+-                    - mMotion26661ReferenceAppliedProtectionSteps;
+-            if (currentBuilderSteps != expectedBuilderSteps) {
+-                /*
+-                 * A newly-created preview request or an external/user compensation owner wins.
+-                 * Rebase instead of dragging a stale Motion offset into the new request.
+-                 */
+-                mMotion26661ReferenceBaseSteps = Math.max(
+-                        aeRange.getLower(), Math.min(aeRange.getUpper(), currentBuilderSteps));
+-                mMotion26661ReferenceAppliedProtectionSteps = 0;
+-                mMotion26661ReferenceCandidateProtectionSteps = 0;
+-                mMotion26661ReferenceCandidateFrames = 0;
+-                mMotion26661ReferenceAppliedProtectionEv = 0.0f;
+-            }
+-        }
+-
+-        long rawAgeNs = mMotion26380RawSignalTimestampNs <= 0L
+-                ? Long.MAX_VALUE : Math.abs(sensorTs - mMotion26380RawSignalTimestampNs);
+-        boolean rawFresh = rawAgeNs <= 180_000_000L
+-                && mMotion26380RawSampleCount >= 64
+-                && Float.isFinite(mMotion26380RawHighlightFraction)
+-                && Float.isFinite(mMotion26608RawP995)
+-                && Float.isFinite(mMotion26608StructuredPeakSecond);
+-        if (!rawFresh) return;
+-
+-        Integer resultCompSteps = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
+-        int observedSteps = resultCompSteps != null ? resultCompSteps : currentBuilderSteps;
+-        int observedProtectionSteps = Math.max(
+-                0, mMotion26661ReferenceBaseSteps - observedSteps);
+-        float observedProtectionEv = observedProtectionSteps * stepEv;
+-
+-        float measuredGuide = Math.max(
+-                Math.max(0.0f, mMotion26608RawP995),
+-                Math.max(0.0f, mMotion26608StructuredPeakSecond));
+-        float unbiasedGuide = measuredGuide
+-                * (float) Math.pow(2.0, observedProtectionEv);
+-
+-        long hdrAgeNs = mMotion26608RecentHdrConflictTimestampNs <= 0L
+-                ? Long.MAX_VALUE
+-                : Math.abs(sensorTs - mMotion26608RecentHdrConflictTimestampNs);
+-        boolean hdrConflict = mMotion26608CurrentHdrConflict
+-                || hdrAgeNs <= MOTION_26608_HDR_CONFLICT_HOLD_NS;
+-
+-        long highlightAgeNs = mMotion26496RecentHighlightEvidenceTimestampNs <= 0L
+-                ? Long.MAX_VALUE
+-                : Math.abs(sensorTs - mMotion26496RecentHighlightEvidenceTimestampNs);
+-        boolean coherentClip = mMotion26496RawCoherentHighlightCells > 0
+-                || highlightAgeNs <= MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS;
+-        boolean broadClip = mMotion26380RawHighlightFraction
+-                >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER;
+-        boolean meaningfulClip = broadClip || (coherentClip && hdrConflict);
+-
+-        float requestedProtectionEv = 0.0f;
+-        if (hdrConflict || meaningfulClip) {
+-            if (unbiasedGuide > MOTION_26661_REFERENCE_HEADROOM_TARGET) {
+-                requestedProtectionEv = (float) (
+-                        Math.log(unbiasedGuide / MOTION_26661_REFERENCE_HEADROOM_TARGET)
+-                                / Math.log(2.0));
+-            }
+-            if (hdrConflict && unbiasedGuide >= 0.45f) {
+-                requestedProtectionEv = Math.max(
+-                        requestedProtectionEv, MOTION_26661_HDR_MIN_PROTECTION_EV);
+-            }
+-            if (meaningfulClip) {
+-                float clipPressure = motion26368Clamp01(
+-                        (mMotion26380RawHighlightFraction
+-                                - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER)
+-                                / (0.030f - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER));
+-                float clipFloor = MOTION_26661_CLIP_MIN_PROTECTION_EV
+-                        + 0.45f * clipPressure;
+-                requestedProtectionEv = Math.max(requestedProtectionEv, clipFloor);
+-            }
+-        }
+-        requestedProtectionEv = Math.max(
+-                0.0f, Math.min(MOTION_26661_MAX_PROTECTION_EV, requestedProtectionEv));
+-
+-        int maximumProtectionSteps = Math.max(
+-                0, mMotion26661ReferenceBaseSteps - aeRange.getLower());
+-        int desiredProtectionSteps = Math.max(
+-                0, Math.min(
+-                        maximumProtectionSteps,
+-                        Math.round(requestedProtectionEv / stepEv)));
+-
+-        if (desiredProtectionSteps != mMotion26661ReferenceCandidateProtectionSteps) {
+-            mMotion26661ReferenceCandidateProtectionSteps = desiredProtectionSteps;
+-            mMotion26661ReferenceCandidateFrames = 1;
+-        } else {
+-            mMotion26661ReferenceCandidateFrames++;
+-        }
+-
+-        int requiredConfirmFrames = desiredProtectionSteps
+-                > mMotion26661ReferenceAppliedProtectionSteps
+-                ? MOTION_26661_INCREASE_CONFIRM_FRAMES
+-                : MOTION_26661_RELEASE_CONFIRM_FRAMES;
+-        if (mMotion26661ReferenceCandidateFrames < requiredConfirmFrames) return;
+-
+-        long nowMs = android.os.SystemClock.elapsedRealtime();
+-        if (nowMs - mMotion26661ReferenceLastUpdateMs < MOTION_26661_MIN_UPDATE_MS) return;
+-        if (desiredProtectionSteps == mMotion26661ReferenceAppliedProtectionSteps) {
+-            mMotion26661ReferenceAppliedProtectionEv =
+-                    mMotion26661ReferenceAppliedProtectionSteps * stepEv;
+-            return;
+-        }
+-
+-        /*
+-         * Bound each visible preview change to at most two Camera2 AE steps. The target may be
+-         * stronger, but it is approached monotonically across subsequent stable result groups.
+-         */
+-        int delta = desiredProtectionSteps - mMotion26661ReferenceAppliedProtectionSteps;
+-        int boundedDelta = Math.max(-2, Math.min(2, delta));
+-        int nextProtectionSteps = mMotion26661ReferenceAppliedProtectionSteps + boundedDelta;
+-        int targetSteps = mMotion26661ReferenceBaseSteps - nextProtectionSteps;
+-        targetSteps = Math.max(aeRange.getLower(), Math.min(aeRange.getUpper(), targetSteps));
+-
+-        try {
+-            mPreviewRequestBuilder.set(
+-                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, targetSteps);
+-            mMotion26661ReferenceAppliedProtectionSteps =
+-                    Math.max(0, mMotion26661ReferenceBaseSteps - targetSteps);
+-            mMotion26661ReferenceAppliedProtectionEv =
+-                    mMotion26661ReferenceAppliedProtectionSteps * stepEv;
+-            mMotion26661ReferenceLastUpdateMs = nowMs;
+-            mMotion26661ReferenceCandidateFrames = 0;
+-            rebuildPreviewBuilder();
+-
+-            Log.i(TAG, "IRIS_26661_GOOGLE_REFERENCE_AE"
+-                    + " actualExposureNs=" + actualExposure
+-                    + " actualIso=" + actualIso
+-                    + " rawAgeMs=" + rawAgeNs / 1_000_000L
+-                    + " rawP995=" + mMotion26608RawP995
+-                    + " structuredPeakSecond=" + mMotion26608StructuredPeakSecond
+-                    + " measuredGuide=" + measuredGuide
+-                    + " observedProtectionEv=" + observedProtectionEv
+-                    + " unbiasedGuide=" + unbiasedGuide
+-                    + " rawHighlightFraction=" + mMotion26380RawHighlightFraction
+-                    + " coherentClip=" + coherentClip
+-                    + " hdrConflict=" + hdrConflict
+-                    + " requestedProtectionEv=" + requestedProtectionEv
+-                    + " appliedProtectionEv=" + mMotion26661ReferenceAppliedProtectionEv
+-                    + " baseSteps=" + mMotion26661ReferenceBaseSteps
+-                    + " targetSteps=" + targetSteps
+-                    + " halAeRemainsOn=true negativeOnly=true"
+-                    + " oldPositiveAeLoopsDormant=true"
+-                    + " postShutterHighlightShort=false");
+-        } catch (IllegalArgumentException | IllegalStateException e) {
+-            Log.w(TAG, "IRIS_26661 reference AE protection skipped: "
+-                    + e.getClass().getSimpleName());
+-        }
+-    }
+-
+     /*
+      * IRIS_26381_DYNAMIC_MOTION_SHUTTER_OPPORTUNITY
+      * Public Camera2 only. Advisory to system AE; no direct shutter/ISO set.
+@@ -5811,20 +5564,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         if(exp!=null&&exp>0L)frame.motionV2ActualExposureNs=exp;if(iso!=null&&iso>0)frame.motionV2ActualIso=iso;
+         if(frame.motionV2ActualExposureNs>0L&&frame.motionV2ActualIso>0)
+             frame.motionV2ExposureEnergy=ExposureIndex.time2sec(frame.motionV2ActualExposureNs)*frame.motionV2ActualIso;
+-        frame.motionV2ReferenceProtectionEv = 0.0f;
+-        if (!shortRole && PhotonCamera.getSettings().selectedMode == CameraMode.MOTION
+-                && mMotion26661ReferenceBaseReady) {
+-            Integer resultAeSteps = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
+-            android.util.Rational resultAeStep = mCameraCharacteristics == null ? null
+-                    : mCameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+-            if (resultAeSteps != null && resultAeStep != null
+-                    && resultAeStep.floatValue() > 0.0f) {
+-                frame.motionV2ReferenceProtectionEv = Math.max(
+-                        0.0f,
+-                        (mMotion26661ReferenceBaseSteps - resultAeSteps)
+-                                * resultAeStep.floatValue());
+-            }
+-        }
+         if(ts!=null)frame.motionV2ResultSensorTimestampNs=ts;frame.motionV2FrameNumber=result.getFrameNumber();
+         if(skew!=null)frame.motionV2RollingShutterSkewNs=skew;if(focus!=null)frame.motionV2FocusDistanceDiopters=focus;
+         if(lens!=null)frame.motionV2LensState=lens;
+@@ -6819,12 +6558,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             clearMotion26505LongTicket(iris26505PreviousLongTicket, "new_generation");
+         }
+ 
+-        /* IRIS_26661_GOOGLE_HDR_BRACKETING_CAPTURE_OWNER
+-         * Motion still captures no post-NORMAL HIGHLIGHT_SHORT repair exposure. The equal-exposure
+-         * ZSL group is now continuously made highlight-safe by the 26661 negative-only HAL-AE
+-         * compensation owner before shutter press; the existing +EV SHADOW_LONG remains auxiliary
+-         * shadow/SNR evidence. ShortHighlightSlot stays only as the immutable generation-owned
+-         * container for SHADOW_LONG so MotionBatch/DNG/Night ownership remains unchanged.
++        /* IRIS_26658_GOOGLE_HDR_BRACKETING_CAPTURE_OWNER
++         * Motion no longer captures a second post-NORMAL HIGHLIGHT_SHORT repair exposure.
++         * The existing equal-exposure ZSL group is the highlight-safe/reference group relative
++         * to the existing +EV SHADOW_LONG capture. Keep ShortHighlightSlot only as the immutable
++         * generation-owned container for SHADOW_LONG so MotionBatch/DNG/Night ownership remains
++         * unchanged. Capture AE/shutter/ISO policy for the ZSL group is deliberately untouched.
+          */
+         final Motion26486ShortTicket iris26486ShortTicket = new Motion26486ShortTicket();
+         mMotion26486CaptureShortTicket = iris26486ShortTicket;
+@@ -6847,11 +6586,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+         final int iris26593AuxCount = (iris26505LongRequested ? 1 : 0);
+-        Log.i(TAG, "IRIS_26661_GOOGLE_HDR_BRACKETING_CAPTURE_PLAN"
++        Log.i(TAG, "IRIS_26658_GOOGLE_HDR_BRACKETING_CAPTURE_PLAN"
+                 + " zslReferenceGroup=true"
+-                + " adaptiveHighlightSafeZslReference=true"
+-                + " referenceProtectionEv=" + mMotion26661ReferenceAppliedProtectionEv
+-                + " halAeRemainsOn=true"
++                + " preserveExistingZslExposurePolicy=true"
+                 + " postNormalHighlightShortRepair=false"
+                 + " shadowLongRequested=" + iris26505LongRequested
+                 + " totalTarget=" + iris26593TotalTarget
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+index 3534245489a112ee366179d80bd13684c3269ffa..68773da893479b4adb7935ac5d0acdd0b16f8991 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+@@ -59,11 +59,6 @@ public class ImageFrame {
+     public long motionV2ActualExposureNs = 0L;
+     public int motionV2ActualIso = 0;
+     public double motionV2ExposureEnergy = 0.0;
+-    /* IRIS_26661_GOOGLE_REFERENCE_PRESENTATION_HANDOFF
+-     * Acquisition-only underexposure applied to the equal-exposure Motion ZSL reference group.
+-     * This never changes RAW normalization or bracket ratios; presentation may compensate it once.
+-     */
+-    public float motionV2ReferenceProtectionEv = 0.0f;
+     public float motionV2NoiseS = Float.NaN;
+     public float motionV2NoiseO = Float.NaN;
+     /* IRIS_26490_PER_FRAME_RADIOMETRIC_CALIBRATION
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 0c13f0adadcc49a31b366816dbdc0e383027ef5b..32ea365fcb943659dce1b6b3c753dd2d0914632b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -197,26 +197,10 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                         + " captureExposureWrite=false shortReferenceUnchanged=true"
+                         + " motionPresentationUnchanged=true preserveNightFeel=true viewfinderTarget=true");
+             } else {
+-                /*
+-                 * IRIS_26661_GOOGLE_REFERENCE_PRESENTATION_COMPENSATION
+-                 *
+-                 * Keep the 26660 viewfinder-response solve, then undo only the deliberate
+-                 * acquisition underexposure stamped on the selected ZSL reference. LONG never
+-                 * supplies this scalar: its job remains extra shadow photons/SNR inside Sabre.
+-                 */
++                /* Exact Motion behavior retained from 26549. */
+                 matchStrengthPercent = MOTION_FIXED_MATCH_STRENGTH_PERCENT;
+                 float matchStrength = matchStrengthPercent / 100.0f;
+-                float referenceProtectionEv = clamp(
+-                        basePipeline.mParameters.motionV2ReferenceProtectionEv,
+-                        0.0f, 1.50f);
+-                /* The displayed preview already undoes the full capture protection. Because the
+-                 * raw viewfinder solver applies only matchStrength of the preview/candidate delta,
+-                 * it automatically restores matchStrength * protectionEv. Add only the residual
+-                 * so capture underexposure is compensated exactly once end-to-end. */
+-                float referenceResidualEv = referenceProtectionEv * (1.0f - matchStrength);
+-                solvedEv = clamp(
+-                        rawSolvedEv * matchStrength + referenceResidualEv,
+-                        MIN_EV, MAX_EV);
++                solvedEv = clamp(rawSolvedEv * matchStrength, MIN_EV, MAX_EV);
+             }
+             float gain = (float)Math.pow(2.0, solvedEv);
+             if (!Float.isFinite(gain) || gain <= 0.0f) {
+@@ -329,10 +313,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " rawSolvedEv=" + rawSolvedEv
+                     + " matchStrengthPercent=" + matchStrengthPercent
+                     + " solvedEv=" + solvedEv
+-                    + " referenceProtectionEv="
+-                    + (iris26550Night ? 0.0f : basePipeline.mParameters.motionV2ReferenceProtectionEv)
+-                    + " referenceProtectionCompensatedInPresentation=" + (!iris26550Night)
+-                    + " longGlobalBrightnessAuthority=false"
+                     + " cameraId=" + cameraIdForLog()
+                     + " brightnessTargetGain=" + gain
+                     + " meterToneAuthority=IRIS_26614_CANONICAL_SOURCE_DOMAIN finalHighlightAuthority=IRIS_26614_CANONICAL_SOURCE_DOMAIN"
+@@ -366,10 +346,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                                 + " rawSolvedEv=" + rawSolvedEv
+                                 + " matchStrengthPercent=" + matchStrengthPercent
+                                 + " solvedEv=" + solvedEv
+-                                + " referenceProtectionEv="
+-                                + (iris26550Night ? 0.0f : basePipeline.mParameters.motionV2ReferenceProtectionEv)
+-                                + " referenceProtectionCompensatedInPresentation=" + (!iris26550Night)
+-                                + " longGlobalBrightnessAuthority=false"
+                                 + " cameraId=" + cameraIdForLog()
+                                 + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+                                 + " legacyRawGainAuthority=false"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index c3374b2cb11f8cab6e950b9330328c0423ef54e0..b3ce8d243b0f81bd36d7013549b007ffb212b839 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -150,17 +150,10 @@ object PhotonMotionMgc1271Bridge {
+             if (parameters.irisNightActive) {
+                 shortFrame?.let { orderedPhysical += it to RawBurstFrameRole.HIGHLIGHT_SHORT }
+             }
+-            parameters.motionV2ReferenceProtectionEv = if (parameters.irisNightActive) {
+-                0.0f
+-            } else {
+-                reference.motionV2ReferenceProtectionEv.coerceIn(0.0f, 1.50f)
+-            }
+-            PLog.i(TAG, "IRIS_26661_GOOGLE_HDR_BRACKETING_REFERENCE_OWNER " +
++            PLog.i(TAG, "IRIS_26658_GOOGLE_HDR_BRACKETING_REFERENCE_OWNER " +
+                 "night=${parameters.irisNightActive} referenceTimestamp=${mgcBase.timestamp} " +
+                 "referenceFromOwnedZsl=${!parameters.irisNightActive} shadowLong=${longFrame != null} " +
+-                "highlightShortRepair=${shortFrame != null} " +
+-                "referenceProtectionEv=${parameters.motionV2ReferenceProtectionEv} " +
+-                "referenceProtectionPresentationOnly=true longGlobalBrightnessAuthority=false")
++                "highlightShortRepair=${shortFrame != null}")
+ 
+             orderedPhysical.forEachIndexed { index, (frame, role) ->
+                 validateFrame(frame, size, role, reference.motionV2ExposureEnergy, index)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index c71202436e3c9e6d684ff445253e8a837edb39b5..b5c0064e0e13c4b9bd504a08d54ecae6cf5d4a78 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -56,11 +56,6 @@ public class Parameters {
+      * Scene brightness normalization applied only after temporal Bayer fusion + RCD.
+      */
+     public float motionV2DisplayGain = 1.0f;
+-    /* IRIS_26661_GOOGLE_REFERENCE_PRESENTATION_HANDOFF
+-     * Positive magnitude of deliberate capture underexposure on the selected Motion reference.
+-     * It is presentation metadata only: RAW/Sabre/DNG/long-frame exposure ratios never consume it.
+-     */
+-    public float motionV2ReferenceProtectionEv = 0.0f;
+     /* IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE_STATE
+      * Decision-only presentation state produced by MotionV2ViewfinderExposureMatcher from its
+      * existing low-resolution candidate probe. No RAW/capture/DNG owner consumes these fields.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index 7c22523835b052b989525169b3358e3980035d13..dac85805944b94bc7a2080291f1d4ed8d9104f40 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -11,7 +11,6 @@ import com.particlesdevs.photoncamera.util.Log;
+ import androidx.annotation.NonNull;
+ 
+ import com.particlesdevs.photoncamera.app.PhotonCamera;
+-import com.particlesdevs.photoncamera.capture.CaptureController;
+ 
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+@@ -72,18 +71,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         GLES20.glUniform1i(enablePeak, PhotonCamera.getSettings().focusPeak);
+         GLES20.glUniform1i(mirror, mMirrorPreview ? 1 : 0);
+         GLES20.glUniform1f(irisSoftwareZoom, mSoftwareZoom);
+-        /* IRIS_26661_GOOGLE_REFERENCE_LIVE_PREVIEW_COMPENSATION
+-         * The repeating request is deliberately underexposed for RAW highlight safety. Restore
+-         * only that known capture bias in the displayed preview; this does not touch RAW/YUV
+-         * acquisition and therefore cannot become another exposure authority.
+-         */
+-        float iris26661ProtectionEv = 0.0f;
+-        CaptureController iris26661Controller = PhotonCamera.getCaptureController();
+-        if (iris26661Controller != null) {
+-            iris26661ProtectionEv = iris26661Controller.getMotion26661ReferencePreviewProtectionEv();
+-        }
+-        float iris26661PreviewGain = (float) Math.pow(2.0, iris26661ProtectionEv);
+-        GLES20.glUniform1f(iris26661ReferencePreviewGain, iris26661PreviewGain);
+ 
+         GLES20.glVertexAttribPointer(vPosition, 2, GLES20.GL_FLOAT, false, 4 * 2, pVertex);
+         GLES20.glVertexAttribPointer(vTexCoord, 2, GLES20.GL_FLOAT, false, 4 * 2, pTexCoord);
+@@ -106,7 +93,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     private int enablePeak;
+     private int mirror;
+     private int irisSoftwareZoom;
+-    private int iris26661ReferencePreviewGain;
+     @Override
+     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+         initTex();
+@@ -132,7 +118,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         enablePeak = GLES20.glGetUniformLocation(hProgram, "enablePeak");
+         mirror = GLES20.glGetUniformLocation(hProgram, "mirror");
+         irisSoftwareZoom = GLES20.glGetUniformLocation(hProgram, "irisSoftwareZoom");
+-        iris26661ReferencePreviewGain = GLES20.glGetUniformLocation(hProgram, "iris26661ReferencePreviewGain");
+         GLES20.glVertexAttribPointer(vPosition, 2, GLES20.GL_FLOAT, false, 4 * 2, pVertex);
+         GLES20.glVertexAttribPointer(vTexCoord, 2, GLES20.GL_FLOAT, false, 4 * 2, pTexCoord);
+         GLES20.glEnableVertexAttribArray(vPosition);
+diff --git a/app/version.properties b/app/version.properties
+index 9bc36b7523ed9e67c5ef77b9d7bab1dacaecd940..ae04d1b4d8edfee4bb75db98b372f31a678b7de5 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726661
+-VERSION_BUILD=26661
++VERSION_NAME=0.9726660
++VERSION_BUILD=26660
