@@ -66,6 +66,19 @@ for r in [
 'app/src/main/assets/shaders/motionv2/gainmap.glsl']:
     assert 'effectiveSupport' not in rd(cand,r),r
 
+
+# 26668 R1 Actions Kotlin-compiler regression: runtime validation helpers do not smart-cast
+# nullable maps. After validation, both maps must be explicitly bound non-null, and logging must
+# use the established PLog MotionTrace path rather than an unavailable MotionTrace symbol.
+bridge=rd(cand,'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt')
+assert 'val strength26668 = checkNotNull(strength)' in bridge
+assert 'val reconstructionSupportMap26668 = checkNotNull(reconstructionSupport26668)' in bridge
+assert 'reconstructionSupport26668.width' not in bridge
+assert 'reconstructionSupport26668.height' not in bridge
+assert 'reconstructionSupport26668.q8.size' not in bridge
+assert 'MotionTrace.processingState(' not in bridge
+assert 'PLog.i(\n                "MotionTrace",\n                "PIPELINE_STATE stage=IRIS_26668_RECONSTRUCTION_SUPPORT_MAP details=" +' in bridge
+
 # UI regressions: every non-AUTO model item is one tick; exact item text/value drives selection;
 # drag ownership survives leaving the panel; AUTO is yellow while pressed and hidden when restored.
 slider=rd(cand,'app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/IrisManualSliderView.java')
@@ -90,4 +103,4 @@ for path in [
 'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java',
 'app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java']:
     assert sh(base,path)==sh(cand,path),path
-print('PASS 26668 regressions: true-26660 preview/no delayed AE; capture-time hardened SHORT; deforming-subject veto; hard LONG+NORMAL chroma; spatial support-gated SDR/UHDR body recovery; effectiveSupport non-authority; exact-value UI/live histogram; 4-added-file rollback completeness')
+print('PASS 26668 regressions: true-26660 preview/no delayed AE; capture-time hardened SHORT; deforming-subject veto; hard LONG+NORMAL chroma; spatial support-gated SDR/UHDR body recovery; exact Kotlin nullable-map/MotionTrace compiler regression; effectiveSupport non-authority; exact-value UI/live histogram; 4-added-file rollback completeness')

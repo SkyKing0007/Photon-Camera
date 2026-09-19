@@ -7,7 +7,7 @@ sha(){ sha256sum "$1" | awk '{print $1}'; }
 resolve_glslang_compiler(){ local root="$1" compiler="" compat=""; compiler="$(find "$root" -type f -name glslang -print -quit)"; if [[ -z "$compiler" ]]; then compat="$(find "$root" \( -type f -o -type l \) -name glslangValidator -print -quit)"; if [[ -n "$compat" ]]; then compiler="$(readlink -f "$compat" 2>/dev/null || true)"; fi; fi; [[ -n "$compiler" && -f "$compiler" ]] || return 1; printf '%s\n' "$compiler"; }
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
-UPLOAD_PARENT_COMMIT="c4e3f1f78d985d0fb041fb662f3e1b0557205d79"
+UPLOAD_PARENT_COMMIT="ac16f7cce71912b5284b4b2a37628d632dcf47d5"
 RUNTIME_AUTHORITY_COMMIT="c4e3f1f78d985d0fb041fb662f3e1b0557205d79"
 BASE_RUN_ID="35386817929"
 BASE_ARTIFACT_ID="10564197796"
@@ -117,10 +117,10 @@ PY
 verify_scope(){
  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed 26668 candidate; exact 18 changed / 4 added from successful 26667 compiled authority)"; return; fi
  [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
- [[ "$(git rev-parse HEAD^)" == "$UPLOAD_PARENT_COMMIT" ]] || fail "26668 handoff parent must be exact successful 26667 commit ${UPLOAD_PARENT_COMMIT}"
- [[ "$(git rev-parse "${UPLOAD_PARENT_COMMIT}:build_26667_r1_preview_long_confidence.sh")" == "$AUTH_26667_BUILD_SCRIPT_BLOB" ]] || fail "successful 26667 build-script blob changed"
- [[ "$(git rev-parse "${UPLOAD_PARENT_COMMIT}:.github/workflows/build-26667-r1-preview-long-confidence.yml")" == "$AUTH_26667_WORKFLOW_BLOB" ]] || fail "successful 26667 workflow blob changed"
- git diff --name-only "$UPLOAD_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_upload_scope.txt"; sort "$UPLOADS" > "$WORK/expected_upload_scope.txt"; diff -u "$WORK/expected_upload_scope.txt" "$WORK/actual_upload_scope.txt" || fail "26668 upload scope mismatch"
+ [[ "$(git rev-parse HEAD^)" == "$UPLOAD_PARENT_COMMIT" ]] || fail "26668 R1.1 repair parent must be exact failed 26668 commit ${UPLOAD_PARENT_COMMIT}"
+ [[ "$(git rev-parse "${RUNTIME_AUTHORITY_COMMIT}:build_26667_r1_preview_long_confidence.sh")" == "$AUTH_26667_BUILD_SCRIPT_BLOB" ]] || fail "successful 26667 build-script blob changed"
+ [[ "$(git rev-parse "${RUNTIME_AUTHORITY_COMMIT}:.github/workflows/build-26667-r1-preview-long-confidence.yml")" == "$AUTH_26667_WORKFLOW_BLOB" ]] || fail "successful 26667 workflow blob changed"
+ git diff --name-only "$RUNTIME_AUTHORITY_COMMIT"..HEAD | sort > "$WORK/actual_upload_scope.txt"; sort "$UPLOADS" > "$WORK/expected_upload_scope.txt"; diff -u "$WORK/expected_upload_scope.txt" "$WORK/actual_upload_scope.txt" || fail "26668 upload scope mismatch"
  ! grep -Eq '^app/' "$WORK/actual_upload_scope.txt" || fail "handoff commit contains live app source"
  set_report "CHANGED RUNTIME SCOPE" "PASS (18 runtime paths / 4 additions carried only inside sealed handoff payload; live app source not committed)"
 }

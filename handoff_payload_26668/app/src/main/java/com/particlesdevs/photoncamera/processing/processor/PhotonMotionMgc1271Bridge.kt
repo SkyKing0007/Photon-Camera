@@ -501,23 +501,28 @@ object PhotonMotionMgc1271Bridge {
                     strength.q8.all { (it.toInt() and 0xffff) in 192..256 },
                 "26634 Sabre local residual-noise support missing/malformed",
             )
+            val strength26668 = checkNotNull(strength) {
+                "26634 Sabre local residual-noise support missing after validation"
+            }
+            val reconstructionSupportMap26668 = checkNotNull(reconstructionSupport26668) {
+                "26668 Sabre reconstruction-support map missing after validation"
+            }
             requireParity(
-                reconstructionSupport26668 != null &&
-                    reconstructionSupport26668.width == strength.width &&
-                    reconstructionSupport26668.height == strength.height &&
-                    reconstructionSupport26668.q8.size == strength.q8.size &&
-                    reconstructionSupport26668.q8.all { (it.toInt() and 0xffff) in 64..256 },
+                reconstructionSupportMap26668.width == strength26668.width &&
+                    reconstructionSupportMap26668.height == strength26668.height &&
+                    reconstructionSupportMap26668.q8.size == strength26668.q8.size &&
+                    reconstructionSupportMap26668.q8.all { (it.toInt() and 0xffff) in 64..256 },
                 "26668 Sabre reconstruction-support map missing/malformed",
             )
-            parameters.motionV2ReconstructionSupportQ8 =
-                checkNotNull(reconstructionSupport26668).q8.copyOf()
-            parameters.motionV2ReconstructionSupportWidth = reconstructionSupport26668.width
-            parameters.motionV2ReconstructionSupportHeight = reconstructionSupport26668.height
-            MotionTrace.processingState(
-                "IRIS_26668_RECONSTRUCTION_SUPPORT_MAP",
-                "width=${reconstructionSupport26668.width} height=${reconstructionSupport26668.height} " +
-                    "minQ8=${reconstructionSupport26668.q8.minOf { it.toInt() and 0xffff }} " +
-                    "maxQ8=${reconstructionSupport26668.q8.maxOf { it.toInt() and 0xffff }} " +
+            parameters.motionV2ReconstructionSupportQ8 = reconstructionSupportMap26668.q8.copyOf()
+            parameters.motionV2ReconstructionSupportWidth = reconstructionSupportMap26668.width
+            parameters.motionV2ReconstructionSupportHeight = reconstructionSupportMap26668.height
+            PLog.i(
+                "MotionTrace",
+                "PIPELINE_STATE stage=IRIS_26668_RECONSTRUCTION_SUPPORT_MAP details=" +
+                    "width=${reconstructionSupportMap26668.width} height=${reconstructionSupportMap26668.height} " +
+                    "minQ8=${reconstructionSupportMap26668.q8.minOf { it.toInt() and 0xffff }} " +
+                    "maxQ8=${reconstructionSupportMap26668.q8.maxOf { it.toInt() and 0xffff }} " +
                     "bodyRecoveryConsumer=true denoiseConsumer=false dngConsumer=false",
             )
             requireParity(referenceSnr != null && referenceSnr.isFinite() && referenceSnr >= 0f,

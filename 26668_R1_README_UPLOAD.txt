@@ -1,10 +1,10 @@
-PHOTON / IRIS 26668 R1 — MOTION EVIDENCE + UI CORRECTION
+PHOTON / IRIS 26668 R1.1 — KOTLIN COMPILER REPAIR + MOTION EVIDENCE + UI CORRECTION
 
 UPLOAD METHOD
-1. In vscode.dev on branch experimental-clean-photon-rebuild at successful 26667 commit c4e3f1f78d985d0fb041fb662f3e1b0557205d79, extract/upload this ZIP at repository root.
-2. Source Control must show exactly the paths listed in R1_26668_UPLOAD_PATHS.txt. Do not add/replace live app/src files manually; runtime files are sealed under handoff_payload_26668 and Actions reconstructs the candidate from the successful 26667 compiled artifact.
+1. In vscode.dev on branch experimental-clean-photon-rebuild at failed 26668 R1 commit ac16f7cce71912b5284b4b2a37628d632dcf47d5, extract/upload this ZIP at repository root. The build still reconstructs runtime exclusively from successful 26667 compiled authority.
+2. Upload/replace the full ZIP at repository root. Because failed 26668 R1 already introduced the sealed 52-path handoff, Source Control for this R1.1 repair must show exactly 10 changed paths: 26668_R1_README_UPLOAD.txt; R1_26668_EXPECTED_CANDIDATE_FULL_APP.sha256; R1_26668_EXPECTED_CHANGED_SOURCE_HASHES.sha256; R1_26668_HANDOFF_HASHES.sha256; R1_26668_INFRASTRUCTURE_DELTA_AUDIT.txt; R1_26668_RUNTIME_DELTA_FROM_26667.patch; R1_26668_RUNTIME_ROLLBACK_TO_26667.patch; build_26668_r1_motion_evidence_ui.sh; handoff_payload_26668/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt; verify_26668_regressions.py. The build gate separately proves the cumulative successful-26667 -> R1.1 handoff scope is still exactly the sealed 52 paths. Do not add/replace live app/src files manually; runtime files remain sealed under handoff_payload_26668.
 3. Commit and push once. The 26668 workflow is path-isolated from historical workflows.
-4. Suggested commit message: 26668 R1: motion evidence and UI correction
+4. Suggested commit message: 26668 R1.1: Kotlin compiler repair
 
 NO BACKUP was created, by explicit request.
 
@@ -60,6 +60,9 @@ Sabre exports a dedicated low-resolution reconstruction-support map separate fro
 PROTECTED BEHAVIOR
 Current 65% viewfinder-match solve, 26664/26665 body/shadow intent, Local-Laplacian, highlight/X-reflection roll-off, sun/window/cloud rendering, UHDR numerator ownership, Night, DNG, SR, color and denoise owners remain protected unless explicitly listed above. No broad denoise increase is introduced.
 
+R1.1 COMPILER REPAIR
+The failed 26668 R1 Actions run 35419666757 stopped at :app:compileDebugKotlin. PhotonMotionMgc1271Bridge.kt now binds the validated nullable strength/support maps through explicit checkNotNull locals before dereference and uses the established PLog MotionTrace logger instead of the unavailable MotionTrace.processingState symbol. No IQ/UI architecture was changed.
+
 PERMANENT REGRESSIONS
 * delayed post-26660 preview HDR AE writer may have no active caller;
 * successful-26660 preview renderer/shader hashes are exact;
@@ -70,7 +73,8 @@ PERMANENT REGRESSIONS
 * extra high-DR body recovery must be spatially reconstruction-support gated in SDR and UHDR and fail closed without support;
 * no 26668 logic treats effectiveSupport as a frame count;
 * manual slider tick count/value source must be the existing ManualModel list exactly;
-* added-file rollback must delete all four added runtime files.
+* added-file rollback must delete all four added runtime files;
+* the exact R1 Kotlin compiler failures may not recur: no direct nullable reconstructionSupport26668 dereference after validation and no MotionTrace.processingState symbol.
 
 COMPILER STATUS BEFORE PUSH
 Packaged/local gates are replayed from the exact successful 26667 artifact. Real pinned GLSL 16.5.0, Kotlin, Java, both NDK ABIs and full :app:assembleDebug remain GitHub Actions authority and are not to be claimed before the run succeeds.
