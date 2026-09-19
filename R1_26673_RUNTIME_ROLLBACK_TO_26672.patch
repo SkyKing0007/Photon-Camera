@@ -1,0 +1,322 @@
+diff --git a/app/src/main/cpp/iris_heic_jni.cpp b/app/src/main/cpp/iris_heic_jni.cpp
+index 214192696f84f1935d9c1bb6f05d036e34f8dba6..6862d4736822453fb500ceb8ebfda51d014e9572 100644
+--- a/app/src/main/cpp/iris_heic_jni.cpp
++++ b/app/src/main/cpp/iris_heic_jni.cpp
+@@ -23,6 +23,7 @@
+ #include <libheif/heif_plugin.h>
+ #include "plugin_registry.h"
+ #include "codecs/hevc_boxes.h"
++#include <ultrahdr/icc.h>
+ #include <ultrahdr/gainmapmetadata.h>
+ #include <ultrahdr/jpegr.h>
+ #include <ultrahdr/jpegrutils.h>
+@@ -483,71 +484,33 @@ static std::vector<uint8_t> iris26636BuildExif(const std::string& iso,
+     return heifExif;
+ }
+ 
+-/* IRIS_26673_ANDROID16_HEIC_EXPLICIT_P3_YUV420_OWNER
+- * Android 16 HeicCompositeStream feeds the HEVC still encoder explicit full-range YUV420 for
+- * Ultra HDR rather than an RGB image that is later converted inside the HEIF writer. Reproduce
+- * that ownership here from the already-completed Display-P3 SDR Bitmap. The equations are the
+- * same Display-P3/BT.601 luma-difference equations used by current Google libultrahdr; 2x2 chroma
+- * averaging supplies the hardware encoder's required 4:2:0 carrier. This stage is publication-only:
+- * it cannot alter Iris HDR intent, gain-map pixels, gain metadata, or upstream SDR rendering.
+- */
+-static bool iris26673FillBaseP3Yuv420Image(JNIEnv* env, jobject bitmap, heif_image** out) {
++static bool iris26636FillBaseImage(JNIEnv* env, jobject bitmap, heif_image** out) {
+     AndroidBitmapInfo info{};
+     if (!bitmap || !out || AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS ||
+-        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width == 0 || info.height == 0 ||
+-        (info.width & 1u) != 0u || (info.height & 1u) != 0u) return false;
++        info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width == 0 || info.height == 0) return false;
+     void* pixels = nullptr;
+     if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS || !pixels) return false;
+-
+     heif_image* image = nullptr;
+-    heif_error err = heif_image_create(info.width, info.height, heif_colorspace_YCbCr,
+-                                       heif_chroma_420, &image);
+-    if (err.code == heif_error_Ok)
+-        err = heif_image_add_plane(image, heif_channel_Y, info.width, info.height, 8);
++    // IRIS_26637_OPAQUE_RGB_HEIC_BASE_OWNER
++    // Android Bitmap remains RGBA_8888 at the JNI boundary, but HEIC camera stills are opaque.
++    // Publish only RGB so libheif cannot synthesize an auxiliary alpha image/item.
++    heif_error err = heif_image_create(info.width, info.height, heif_colorspace_RGB,
++                                       heif_chroma_interleaved_RGB, &image);
+     if (err.code == heif_error_Ok)
+-        err = heif_image_add_plane(image, heif_channel_Cb, info.width / 2u, info.height / 2u, 8);
+-    if (err.code == heif_error_Ok)
+-        err = heif_image_add_plane(image, heif_channel_Cr, info.width / 2u, info.height / 2u, 8);
+-
++        err = heif_image_add_plane(image, heif_channel_interleaved, info.width, info.height, 8);
+     if (err.code == heif_error_Ok) {
+-        int yStride = 0, uStride = 0, vStride = 0;
+-        uint8_t* yPlane = heif_image_get_plane(image, heif_channel_Y, &yStride);
+-        uint8_t* uPlane = heif_image_get_plane(image, heif_channel_Cb, &uStride);
+-        uint8_t* vPlane = heif_image_get_plane(image, heif_channel_Cr, &vStride);
+-        if (!yPlane || !uPlane || !vPlane || yStride < static_cast<int>(info.width) ||
+-            uStride < static_cast<int>(info.width / 2u) || vStride < static_cast<int>(info.width / 2u)) {
+-            err = heif_error_unsupported_parameter;
+-        } else {
++        int stride = 0;
++        uint8_t* dst = heif_image_get_plane(image, heif_channel_interleaved, &stride);
++        if (!dst || stride < static_cast<int>(info.width * 3u)) err = heif_error_unsupported_parameter;
++        else {
+             const auto* src = static_cast<const uint8_t*>(pixels);
+-            constexpr float kYr = 0.299f;
+-            constexpr float kYg = 0.587f;
+-            constexpr float kYb = 0.114f;
+-            constexpr float kCb = 1.772f;
+-            constexpr float kCr = 1.402f;
+-            for (uint32_t by = 0; by < info.height; by += 2u) {
+-                for (uint32_t bx = 0; bx < info.width; bx += 2u) {
+-                    float uSum = 0.0f, vSum = 0.0f;
+-                    for (uint32_t oy = 0; oy < 2u; ++oy) {
+-                        const uint8_t* inRow = src + static_cast<size_t>(by + oy) * info.stride;
+-                        uint8_t* outY = yPlane + static_cast<size_t>(by + oy) * yStride;
+-                        for (uint32_t ox = 0; ox < 2u; ++ox) {
+-                            const uint8_t* p = inRow + static_cast<size_t>(bx + ox) * 4u;
+-                            const float r = p[0] / 255.0f;
+-                            const float g = p[1] / 255.0f;
+-                            const float b = p[2] / 255.0f;
+-                            const float y = kYr * r + kYg * g + kYb * b;
+-                            const float u = (b - y) / kCb;
+-                            const float v = (r - y) / kCr;
+-                            const float yCode = std::clamp(y * 255.0f + 0.5f, 0.0f, 255.0f);
+-                            outY[bx + ox] = static_cast<uint8_t>(yCode);
+-                            uSum += u;
+-                            vSum += v;
+-                        }
+-                    }
+-                    const float uCode = std::clamp((uSum * 0.25f) * 255.0f + 128.5f, 0.0f, 255.0f);
+-                    const float vCode = std::clamp((vSum * 0.25f) * 255.0f + 128.5f, 0.0f, 255.0f);
+-                    uPlane[static_cast<size_t>(by / 2u) * uStride + bx / 2u] = static_cast<uint8_t>(uCode);
+-                    vPlane[static_cast<size_t>(by / 2u) * vStride + bx / 2u] = static_cast<uint8_t>(vCode);
++            for (uint32_t y = 0; y < info.height; ++y) {
++                uint8_t* outRow = dst + static_cast<size_t>(y) * stride;
++                const uint8_t* inRow = src + static_cast<size_t>(y) * info.stride;
++                for (uint32_t x = 0; x < info.width; ++x) {
++                    outRow[x * 3u + 0u] = inRow[x * 4u + 0u];
++                    outRow[x * 3u + 1u] = inRow[x * 4u + 1u];
++                    outRow[x * 3u + 2u] = inRow[x * 4u + 2u];
+                 }
+             }
+         }
+@@ -753,22 +716,29 @@ Java_com_particlesdevs_photoncamera_processing_ultrahdr_IrisHeicUltraHdrEncoder_
+         if (err.code != heif_error_Ok || !encoder) break;
+         if (heif_encoder_set_lossy_quality(encoder, std::clamp(static_cast<int>(quality), 1, 100)).code != heif_error_Ok) break;
+ 
+-        if (!iris26673FillBaseP3Yuv420Image(env, baseBitmap, &baseImage)) break;
++        if (!iris26636FillBaseImage(env, baseBitmap, &baseImage)) break;
+         options = heif_encoding_options_alloc();
+         if (!options) break;
+         baseNclx = heif_nclx_color_profile_alloc();
+         if (!baseNclx) break;
+-        // IRIS_26673_ANDROID16_HEIC_ULTRAHDR_BASE_PUBLICATION
+-        // Match Android 16 HeicCompositeStream rather than the cross-platform HEIF writer:
+-        // Display-P3 primaries, sRGB transfer, unspecified matrix, full range, and no competing ICC
+-        // descriptor. The hardware HEVC owner already publishes the same P3/sRGB/full contract and
+-        // leaves matrix coefficients unspecified, so item metadata and elementary-stream VUI agree.
++        // IRIS_26672_GOOGLE_LIBULTRAHDR_V2_HEIF_BASE_PUBLICATION
++        // Keep Iris' completed Display-P3 SDR pixels byte-owned upstream, but publish their color
++        // description the same way Google's libultrahdr v2.0.0 HEIF writer does: a Display-P3 ICC
++        // profile in parallel with NCLX, BT.709 transfer signalling for UHDR_CT_SRGB, BT.601 matrix,
++        // and full range. This is publication-only; no SDR pixels or gain values are recomputed.
++        std::shared_ptr<ultrahdr::DataStruct> baseIcc =
++                ultrahdr::IccHelper::writeIccProfile(UHDR_CT_SRGB, UHDR_CG_DISPLAY_P3);
++        if (!baseIcc || baseIcc->getLength() <= ultrahdr::kICCIdentifierSize) break;
++        uint8_t* baseIccBytes = static_cast<uint8_t*>(baseIcc->getData());
++        if (!baseIccBytes || heif_image_set_raw_color_profile(
++                baseImage, "prof", baseIccBytes + ultrahdr::kICCIdentifierSize,
++                baseIcc->getLength() - ultrahdr::kICCIdentifierSize).code != heif_error_Ok) break;
+         if (heif_nclx_color_profile_set_color_primaries(baseNclx, heif_color_primaries_SMPTE_EG_432_1).code != heif_error_Ok ||
+-            heif_nclx_color_profile_set_transfer_characteristics(baseNclx, heif_transfer_characteristic_IEC_61966_2_1).code != heif_error_Ok ||
+-            heif_nclx_color_profile_set_matrix_coefficients(baseNclx, heif_matrix_coefficients_unspecified).code != heif_error_Ok) break;
++            heif_nclx_color_profile_set_transfer_characteristics(baseNclx, heif_transfer_characteristic_ITU_R_BT_709_5).code != heif_error_Ok ||
++            heif_nclx_color_profile_set_matrix_coefficients(baseNclx, heif_matrix_coefficients_ITU_R_BT_601_6).code != heif_error_Ok) break;
+         baseNclx->full_range_flag = true;
+         if (heif_image_set_nclx_color_profile(baseImage, baseNclx).code != heif_error_Ok) break;
+-        options->save_two_colr_boxes_when_ICC_and_nclx_available = 0;
++        options->save_two_colr_boxes_when_ICC_and_nclx_available = 1;
+         options->output_nclx_profile = baseNclx;
+         if (heif_context_encode_image(ctx, baseImage, encoder, options, &baseHandle).code != heif_error_Ok || !baseHandle) break;
+ 
+@@ -786,9 +756,10 @@ Java_com_particlesdevs_photoncamera_processing_ultrahdr_IrisHeicUltraHdrEncoder_
+         }
+ 
+         if (!iris26636FillGainmapImage(env, gainmapBitmap, &gainImage)) break;
+-        // IRIS_26673_ANDROID16_HEIC_ULTRAHDR_GAINMAP_PUBLICATION
+-        // ISO HEIC gain-map image color aspects are all unspecified in Android 16 camera output.
+-        // Preserve the existing Iris gain codes exactly; only their HEIF publication descriptor changes.
++        // IRIS_26672_GOOGLE_LIBULTRAHDR_V2_HEIF_GAINMAP_PUBLICATION
++        // Google's v2 HEIF writer keeps monochrome gain-map primaries/transfer unspecified while
++        // carrying the item through BT.601 matrix signalling. The stored Iris gain bytes and ISO
++        // 21496 metadata remain exactly the upstream values.
+         gainmapNclx = heif_nclx_color_profile_alloc();
+         if (!gainmapNclx) break;
+         if (heif_nclx_color_profile_set_color_primaries(
+@@ -796,7 +767,7 @@ Java_com_particlesdevs_photoncamera_processing_ultrahdr_IrisHeicUltraHdrEncoder_
+             heif_nclx_color_profile_set_transfer_characteristics(
+                     gainmapNclx, heif_transfer_characteristic_unspecified).code != heif_error_Ok ||
+             heif_nclx_color_profile_set_matrix_coefficients(
+-                    gainmapNclx, heif_matrix_coefficients_unspecified).code != heif_error_Ok) break;
++                    gainmapNclx, heif_matrix_coefficients_ITU_R_BT_601_6).code != heif_error_Ok) break;
+         gainmapNclx->full_range_flag = true;
+         if (heif_image_set_nclx_color_profile(gainImage, gainmapNclx).code != heif_error_Ok) break;
+         options->output_nclx_profile = gainmapNclx;
+@@ -821,12 +792,14 @@ Java_com_particlesdevs_photoncamera_processing_ultrahdr_IrisHeicUltraHdrEncoder_
+ 
+         alternateNclx = heif_nclx_color_profile_alloc();
+         if (!alternateNclx) break;
+-        // IRIS_26673_ANDROID16_HEIC_ULTRAHDR_TMAP_PUBLICATION
+-        // AOSP MPEG4Writer assigns the tmap metadata item the same base-image color aspects carried
+-        // by HeicCompositeStream: Display-P3 + sRGB + unspecified matrix + full range.
++        // IRIS_26672_GOOGLE_LIBULTRAHDR_V2_TMAP_HDR_INTENT_AUTHORITY
++        // libultrahdr v2 publishes tmap color properties from the HDR intent, not by re-labelling
++        // the alternate rendition as SDR. Iris' matched HDR intent is extended-linear Display-P3,
++        // so advertise P3 + linear transfer + the P3 chromaticity-derived matrix. This changes only
++        // HEIF interpretation; gain-map math, capacity and pixels remain untouched.
+         if (heif_nclx_color_profile_set_color_primaries(alternateNclx, heif_color_primaries_SMPTE_EG_432_1).code != heif_error_Ok ||
+-            heif_nclx_color_profile_set_transfer_characteristics(alternateNclx, heif_transfer_characteristic_IEC_61966_2_1).code != heif_error_Ok ||
+-            heif_nclx_color_profile_set_matrix_coefficients(alternateNclx, heif_matrix_coefficients_unspecified).code != heif_error_Ok) break;
++            heif_nclx_color_profile_set_transfer_characteristics(alternateNclx, heif_transfer_characteristic_linear).code != heif_error_Ok ||
++            heif_nclx_color_profile_set_matrix_coefficients(alternateNclx, heif_matrix_coefficients_chromaticity_derived_non_constant_luminance).code != heif_error_Ok) break;
+         alternateNclx->full_range_flag = true;
+ 
+         // Keep the established Iris gain-map publication quality authority.
+@@ -839,7 +812,7 @@ Java_com_particlesdevs_photoncamera_processing_ultrahdr_IrisHeicUltraHdrEncoder_
+         heif_writer writer{1, iris26636WriteCallback};
+         if (heif_context_write(ctx, &writer, &memory).code != heif_error_Ok || memory.bytes.empty()) break;
+         ok = iris26636WriteFile(path, memory.bytes);
+-        if (ok) IRIS26636_LOGI("IRIS_26673_ANDROID16_HEIC_ULTRAHDR_PUBLICATION hardwareHevc=true explicitP3Yuv420=true baseP3SrgbMatrixUnspecified=true baseIcc=false tmapP3SrgbMatrixUnspecified=true gainmapAllColorAspectsUnspecified=true gainmapVisible=true gainmapReused=true recomputedGainmap=false bytes=%zu", memory.bytes.size());
++        if (ok) IRIS26636_LOGI("IRIS_26672_HEIC_GOOGLE_V2_PUBLICATION hardwareHevc=true opaqueRgb=true baseP3Icc=true baseNclxP3Bt709TransferBt601Matrix=true tmapP3Linear=true gainmapUnspecifiedPrimariesTransferBt601Matrix=true gainmapVisible=true gainmapReused=true recomputedGainmap=false bytes=%zu", memory.bytes.size());
+     } while (false);
+ 
+     gIris26636Env = nullptr;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index e5c06dd08323f04cd496fa9183a74b81ab390ecf..9f41f89afc03c62e708dfb77a312da1d443ec3b1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -165,11 +165,6 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     private ManualModeConsoleImpl iris26670ManualConsoleOwner;
+     private Observer iris26670ManualModeObserver;
+     private IrisManualSliderView iris26670ManualSlider;
+-    /* IRIS_26673_MANUAL_FIXED_MIDPOINT_STATE
+-     * Establish once from the exact successful-26672 final visible geometry for this Fragment
+-     * instance. Chevron show/hide never recalculates or changes the row's vertical position. */
+-    private boolean iris26673ManualMidpointEstablished = false;
+-    private float iris26673ManualFixedRowTranslationY = Float.NaN;
+     public float displayAspectRatio;
+     private boolean iris26562DeferredForegroundReset = false;
+     private HorizonIndicatorView mHorizonIndicatorView;
+@@ -448,59 +443,6 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                 + " legacyResumeSkipped=true sliderReasserted=true");
+     }
+ 
+-    /* IRIS_26673_MANUAL_FIXED_MIDPOINT_FROM_26672_VISIBLE_GEOMETRY
+-     * Successful 26672 is the baseline. Its final visible state has manual_mode translationY=0
+-     * after the older 26670 visibility animation, while the 26672 buttons_container top-margin
+-     * correction remains applied. Recreate that exact final coded state first, then move ONLY the
+-     * button row from that current 26672 center to the measured midpoint between the slider's
+-     * visible outer bottom border and the activated chevron's visible upper tip. The slider and
+-     * chevron never move. Show/hide changes alpha/visibility only; this row translation persists.
+-     */
+-    private void iris26673FixManualRowAtMeasuredMidpoint(View panel) {
+-        if (activity == null || panel == null) return;
+-        final View slider = activity.findViewById(R.id.irisManualSliderContainer);
+-        final View buttons = activity.findViewById(R.id.buttons_container);
+-        final View chevron = activity.findViewById(R.id.approved_manual_chevron);
+-        if (slider == null || buttons == null || chevron == null || slider.getHeight() <= 0
+-                || buttons.getHeight() <= 0 || chevron.getHeight() <= 0) return;
+-        if (iris26673ManualMidpointEstablished) {
+-            // Position was established from successful-26672 geometry already; toggling visibility
+-            // must never recalculate or shift the row.
+-            return;
+-        }
+-
+-        // This is the exact successful-26672 FINAL VISIBLE parent position after its stale owner ran.
+-        panel.setTranslationY(0.0f);
+-        final int[] panelWindow = new int[2];
+-        final int[] sliderWindow = new int[2];
+-        final int[] chevronWindow = new int[2];
+-        panel.getLocationInWindow(panelWindow);
+-        slider.getLocationInWindow(sliderWindow);
+-        chevron.getLocationInWindow(chevronWindow);
+-
+-        final float current26672RowCenterY = panelWindow[1] + buttons.getTop()
+-                + 0.5f * buttons.getHeight();
+-        final float sliderOuterBottomY = sliderWindow[1] + slider.getHeight();
+-        final float density = getResources().getDisplayMetrics().density;
+-        // 26672 chevron path: closed V tip is 0.66h; after 180-degree activation it is 0.34h.
+-        // Include half of the existing 3.75dp dark outline so this is the visible upper tip.
+-        final float activatedChevronVisibleTopY = chevronWindow[1] + 0.34f * chevron.getHeight()
+-                - 1.875f * density;
+-        final float targetCenterY = 0.5f * (sliderOuterBottomY + activatedChevronVisibleTopY);
+-        final float fixedTranslationY = targetCenterY - current26672RowCenterY;
+-        buttons.setTranslationY(fixedTranslationY);
+-        iris26673ManualFixedRowTranslationY = fixedTranslationY;
+-        iris26673ManualMidpointEstablished = true;
+-        Log.i(TAG, "IRIS_26673_MANUAL_FIXED_MIDPOINT baseline=current26672FinalVisible"
+-                + " current26672RowCenterY=" + current26672RowCenterY
+-                + " sliderOuterBottomY=" + sliderOuterBottomY
+-                + " activatedChevronVisibleTopY=" + activatedChevronVisibleTopY
+-                + " targetCenterY=" + targetCenterY
+-                + " fixedRowTranslationY=" + fixedTranslationY
+-                + " panelTranslationY=" + panel.getTranslationY()
+-                + " sliderMoved=false chevronMoved=false rowPositionPersistent=true");
+-    }
+-
+     private void iris26670ApplyManualPresentationState(
+             ManualModeModel model, @Nullable ManualModeModel.ManualModelFields field) {
+         if (activity == null || model == null) return;
+@@ -533,36 +475,13 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                 && panel != null) {
+             final boolean visible = model.isManualPanelVisible();
+             panel.animate().cancel();
+-            // IRIS_26673_MANUAL_VISIBILITY_ONLY_OWNER: never move the panel or the centered row.
+-            // Successful 26672's visible parent position is translationY=0; retain it in both states.
+-            panel.setTranslationY(0.0f);
+             if (visible) {
+-                panel.setAlpha(0.0f);
+                 panel.setVisibility(View.VISIBLE);
+-                panel.post(() -> {
+-                    if (!model.isManualPanelVisible() || panel.getVisibility() != View.VISIBLE) return;
+-                    if (!iris26673ManualMidpointEstablished) {
+-                        iris26673FixManualRowAtMeasuredMidpoint(panel);
+-                    }
+-                    Log.i(TAG, "IRIS_26673_MANUAL_VISIBLE_STATIONARY established="
+-                            + iris26673ManualMidpointEstablished + " fixedRowTranslationY="
+-                            + iris26673ManualFixedRowTranslationY);
+-                    panel.animate().alpha(1.0f).setDuration(100).start();
+-                });
++                panel.animate().translationY(0f).alpha(1f).setDuration(100).start();
+             } else {
+-                final View buttons = activity.findViewById(R.id.buttons_container);
+-                final float rowTranslationBeforeHide = buttons == null ? Float.NaN : buttons.getTranslationY();
+-                panel.animate().alpha(0.0f).setDuration(100)
+-                        .withEndAction(() -> {
+-                            panel.setTranslationY(0.0f);
+-                            panel.setVisibility(View.GONE);
+-                            final float rowTranslationAfterHide = buttons == null
+-                                    ? Float.NaN : buttons.getTranslationY();
+-                            Log.i(TAG, "IRIS_26673_MANUAL_HIDDEN_STATIONARY panelTranslationY="
+-                                    + panel.getTranslationY() + " rowTranslationBeforeHide="
+-                                    + rowTranslationBeforeHide + " rowTranslationAfterHide="
+-                                    + rowTranslationAfterHide);
+-                        }).start();
++                final float dy = getResources().getDimension(R.dimen.standard_20);
++                panel.animate().translationY(dy).alpha(0f).setDuration(100)
++                        .withEndAction(() -> panel.setVisibility(View.GONE)).start();
+             }
+         }
+     }
+diff --git a/app/version.properties b/app/version.properties
+index ae61bb7f4dc35ddd0541edaf0fade0f5ef18c365..7d05b8083dd6d1955a4f6c9c1726f33295aa9a95 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726673
+-VERSION_BUILD=26673
++VERSION_NAME=0.9726672
++VERSION_BUILD=26672
