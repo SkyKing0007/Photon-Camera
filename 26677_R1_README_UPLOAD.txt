@@ -1,0 +1,1 @@
+Upload the complete handoff at repository root on experimental-clean-photon-rebuild, replace matching files, commit once, and push. GitHub Actions is authoritative. Runtime change is watermark-only over successful 26676.
