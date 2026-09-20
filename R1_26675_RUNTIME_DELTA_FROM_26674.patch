@@ -1,0 +1,436 @@
+diff --git a/app/src/main/assets/shaders/preview/main_fs.glsl b/app/src/main/assets/shaders/preview/main_fs.glsl
+index a95114ca6957c8f216a593aedddf1cb47db56ca7..26ae604d87ccd6324d81c3f91f4b165952a333e3 100644
+--- a/app/src/main/assets/shaders/preview/main_fs.glsl
++++ b/app/src/main/assets/shaders/preview/main_fs.glsl
+@@ -33,25 +33,21 @@ void main() {
+     if(enablePeak)
+         color = color + dc*32.0*diff*w;
+ 
+-    /* IRIS_26662_FRAME_MATCHED_PREVIEW_PRESENTATION
+-     * Preserve exact 26660 preview bytes when no RAW protection is active. When protection is
+-     * active, restore body brightness with a white-anchored rational exposure map instead of the
+-     * 26661 full linear multiplier. The map is monotone, maps display white to display white, and
+-     * rescales RGB uniformly, so it cannot create the blown preview highlights seen in 26661.
++    /* IRIS_26675_CAPTURE_DECOUPLED_PREVIEW_CLIP_OWNER
++     * Capture remains exactly 26674: the sensor/ZSL NORMAL may become highlight-protected and the
++     * final HDR image may recover information that is not visible in preview. Display only uses the
++     * exact frame-matched 2^protection gain to reconstruct the virtual unprotected HAL presentation.
++     * Unlike 26674's white-anchored rational map, the virtual unprotected signal is allowed to clip
++     * at display white. Therefore an initially blown window stays blown-looking while protected RAW
++     * frames improve invisibly underneath; preview presentation never feeds capture authority.
+      */
+-    float iris26662Gain = max(iris26662ReferencePreviewGain, 1.0);
+-    if (iris26662Gain > 1.0001) {
++    float iris26675VirtualUnprotectedGain = max(iris26662ReferencePreviewGain, 1.0);
++    if (iris26675VirtualUnprotectedGain > 1.0001) {
+         vec3 encoded = clamp(color.rgb, vec3(0.0), vec3(1.0));
+         vec3 lowLinear = encoded / 12.92;
+         vec3 highLinear = pow((encoded + 0.055) / 1.055, vec3(2.4));
+         vec3 linearRgb = mix(lowLinear, highLinear, step(vec3(0.04045), encoded));
+-        float y = dot(linearRgb, vec3(0.2126, 0.7152, 0.0722));
+-        float guide = max(y, max(linearRgb.r, max(linearRgb.g, linearRgb.b)));
+-        if (guide > 1.0e-6) {
+-            float mappedGuide = iris26662Gain * guide
+-                    / (1.0 + (iris26662Gain - 1.0) * guide);
+-            linearRgb *= mappedGuide / guide;
+-        }
++        linearRgb *= iris26675VirtualUnprotectedGain;
+         vec3 lowEncoded = 12.92 * linearRgb;
+         vec3 highEncoded = 1.055 * pow(max(linearRgb, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+         color.rgb = clamp(mix(lowEncoded, highEncoded, step(vec3(0.0031308), linearRgb)),
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+index 0abd6b96d0fae49ac61b18f2134dcc88fea2b91a..62ed626b46a8914a41451b34f6856736a3138e44 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+@@ -33,6 +33,8 @@ internal class GlesIris26545SabreProcessor(
+     private val preserveExtendedHdrThroughVgn: Boolean = false,
+     private val enableSuperRes: Boolean = false,
+     private val superResTempDir: File? = null,
++    /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT: no acquisition authority. */
++    private val referenceProtectionEv: Float = 0f,
+ ) {
+     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+         if (frames.isEmpty()) return null
+@@ -123,6 +125,7 @@ internal class GlesIris26545SabreProcessor(
+                 exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F,
+             enableSabreSuperRes = enableSuperRes,
+             sabreSuperResTempDir = superResTempDir,
++            referenceProtectionEv = referenceProtectionEv,
+         ).processFrames(admitted)
+     }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index 9d809af04b37634e346036220b6749819f3abfd7..1b2de3eb0f0b912d5bc606a282d1a58c22b74619 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -30,6 +30,8 @@ internal class GlesMgcRawFusion(
+     private val vgnChromaCorrectionStrength: Float = 1f,
+     private val enableSabreSuperRes: Boolean = false,
+     private val sabreSuperResTempDir: File? = null,
++    /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT: downstream fusion context only. */
++    private val referenceProtectionEv: Float = 0f,
+ ) {
+     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+         if (frames.isEmpty()) return null
+@@ -58,6 +60,7 @@ internal class GlesMgcRawFusion(
+             preserveExtendedHdrThroughVgn = preserveExtendedHdrThroughVgn,
+             enableSuperRes = enableSabreSuperRes,
+             superResTempDir = sabreSuperResTempDir,
++            referenceProtectionEv = referenceProtectionEv,
+         ).processFrames(frames)
+     }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 533614cebaf19dcb22b7bded3f51aa6577e02cbf..5984ebde8dd4d831ca7313bd9cf230af56be7c94 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2775,6 +2775,7 @@ internal object GlesMgcRawSabreShaders {
+         uniform vec3 uNormalShotNoiseRgb;
+         uniform vec3 uNormalReadNoiseRgb;
+         uniform float uNormalFrameCount;
++        uniform float uReferenceProtectionEv;
+         layout(location = 0) out vec4 oFusedExtendedLinear;
+         layout(location = 1) out float oDecision;
+         layout(location = 2) out float oShortColorValidity;
+@@ -3158,6 +3159,15 @@ internal object GlesMgcRawSabreShaders {
+             float fineStructurePhysicalSupport = smoothstep(0.20, 0.70, physicalNormalLoss);
+             float inferredRadiometricLoss = effectiveRadiometricLoss *
+                 mix(1.0, fineStructurePhysicalSupport, fineStructure);
++            /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION
++             * Once 26674 has deliberately protected the NORMAL reference, a brighter normalized
++             * SHORT sample is no longer sufficient evidence of NORMAL radiometric loss: amplifying
++             * the ~2.5 EV SHORT can otherwise inject neutral/chroma speckle into valid smooth bright
++             * surfaces. In that protected state SHORT may alter radiance only where the existing
++             * per-CFA NORMAL validity proves actual source loss. Unprotected NORMAL retains the
++             * exact 26674 inferred-loss path, preserving prior highlight behavior. */
++            float protectedNormalActive = step(0.25, uReferenceProtectionEv);
++            inferredRadiometricLoss *= (1.0 - protectedNormalActive);
+             float measuredNormalLoss = max(physicalNormalLoss, inferredRadiometricLoss);
+             float edgeTrust = edgeCorrespondence(referenceUv, sampleUv);
+             float shortConfidence = physicalWeight * alignmentConfidence * edgeTrust *
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 8ef6ec0367808912638203b2081bba15e74d18e4..cccdc61bef59bb268b6fb1de21c779e4bad2f9ea 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -70,6 +70,9 @@ internal class GlesMgcRawSpatialStacker(
+     private val preserveExtendedHdrThroughVgn: Boolean = false,
+     private val enableSabreSuperRes: Boolean = false,
+     private val sabreSuperResTempDir: File? = null,
++    /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT
++     * Read-only selected-reference protection metadata; never writes capture state. */
++    private val referenceProtectionEv: Float = 0f,
+ ) {
+     private data class TextureLevel(
+         val texture: Int,
+@@ -2841,6 +2844,14 @@ internal class GlesMgcRawSpatialStacker(
+                     extractedWidth = extractedWidth,
+                     extractedHeight = extractedHeight,
+                     validityWeightScale = validityWeightScale26614,
++                    referenceProtectionEv = referenceProtectionEv,
++                )
++                PLog.i(
++                    SABRE_TAG,
++                    "IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION " +
++                        "referenceProtectionEv=${referenceProtectionEv.coerceIn(0f, 1.5f)} " +
++                        "inferredLossAllowed=${referenceProtectionEv < 0.25f} " +
++                        "protectedNormalRequiresMeasuredSourceLoss=${referenceProtectionEv >= 0.25f}",
+                 )
+                 logSabreUniversalFusionDecision26651(fusionDecision26651)
+                 logSabreUniversalFusionRadiance26651(
+@@ -4417,6 +4428,7 @@ internal class GlesMgcRawSpatialStacker(
+         extractedWidth: Int,
+         extractedHeight: Int,
+         validityWeightScale: Float,
++        referenceProtectionEv: Float,
+     ) {
+         val program = sabreNormalMasterShortFusionProgram26651
+         check(program != 0)
+@@ -4455,6 +4467,7 @@ internal class GlesMgcRawSpatialStacker(
+         uniform3f(program, "uNormalReadNoiseRgb",
+             normalCalibration.cameraRgbReadNoise[0], normalCalibration.cameraRgbReadNoise[1], normalCalibration.cameraRgbReadNoise[2])
+         uniform1f(program, "uNormalFrameCount", normalFrameCount.toFloat().coerceAtLeast(1f))
++        uniform1f(program, "uReferenceProtectionEv", referenceProtectionEv.coerceIn(0f, 1.5f))
+         draw(program, width, height, intArrayOf(fusedOutput, decisionOutput, shortColorValidityOutput))
+     }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 1a964507307b8504eb31c66fad96ca773693a5e5..9d99412505f32760401ab73d36199ebe51810d4d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -379,6 +379,11 @@ object PhotonMotionMgc1271Bridge {
+                 vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
+                 enableSabreSuperRes = sabreSuperResEnabled,
+                 sabreSuperResTempDir = PhotonCamera.getApplicationContextStatic().cacheDir,
++                /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT
++                 * Read-only downstream context. This value is already frozen from the selected
++                 * 26674 NORMAL reference and cannot alter sensor/ZSL/capture exposure ownership. */
++                referenceProtectionEv = if (parameters.irisNightActive) 0f
++                    else parameters.motionV2ReferenceProtectionEv.coerceIn(0.0f, 1.50f),
+             )
+             val iris26535FusionStartNs = System.nanoTime()
+             val stacked = fusion.processFrames(frames)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 85757b3e89c041434fe6fc6d0bf834c8a544f95a..77d081d891f134ab5de03b0af6442715e18c5149 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -30,6 +30,7 @@ import android.content.Intent;
+ import android.content.pm.PackageManager;
+ import android.content.res.Resources;
+ import android.graphics.RectF;
++import android.graphics.drawable.Drawable;
+ import android.hardware.camera2.CameraCharacteristics;
+ import android.hardware.camera2.CameraManager;
+ import android.hardware.camera2.CaptureResult;
+@@ -165,13 +166,13 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     private ManualModeConsoleImpl iris26670ManualConsoleOwner;
+     private Observer iris26670ManualModeObserver;
+     private IrisManualSliderView iris26670ManualSlider;
+-    /* IRIS_26674_SINGLE_MANUAL_GEOMETRY_OWNER
+-     * Exactly one runtime owner may write the Focus/Shutter/ISO/EV row vertical translation.
+-     * The measured row position is frozen for this Fragment/layout instance; open/close is
+-     * visibility/alpha only and never changes panel/slider/chevron geometry. */
+-    private boolean iris26674ManualMidpointEstablished = false;
+-    private float iris26674ManualFixedRowTranslationY = Float.NaN;
+-    private android.view.ViewTreeObserver.OnPreDrawListener iris26674ManualPreDrawListener = null;
++    /* IRIS_26675_VISIBLE_MANUAL_ICON_GEOMETRY_OWNER
++     * Exactly one runtime owner may move the four visible Focus/Shutter/ISO/EV buttons vertically.
++     * buttons_container remains structural only and stays at translationY=0. The measured icon
++     * position is frozen for this Fragment/layout instance; open/close is visibility/alpha only. */
++    private boolean iris26675ManualIconMidpointEstablished = false;
++    private float iris26675ManualFixedIconTranslationY = Float.NaN;
++    private android.view.ViewTreeObserver.OnPreDrawListener iris26675ManualPreDrawListener = null;
+     public float displayAspectRatio;
+     private boolean iris26562DeferredForegroundReset = false;
+     private HorizonIndicatorView mHorizonIndicatorView;
+@@ -450,94 +451,128 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                 + " legacyResumeSkipped=true sliderReasserted=true");
+     }
+ 
+-    /* IRIS_26674_SINGLE_MANUAL_GEOMETRY_OWNER
+-     * Measure the actual laid-out slider outer bottom, current row center, and activated-chevron
+-     * visible upper tip. Move only buttons_container via translationY exactly once. No runtime
+-     * margin edit and no manual_mode/slider/chevron translation is permitted. */
+-    private boolean iris26674EstablishManualRowMidpoint(View panel) {
++    /* IRIS_26675_VISIBLE_MANUAL_ICON_GEOMETRY_OWNER
++     * buttons_container remains a structural/click-hierarchy parent only and is never translated.
++     * Center the four actual visible top compound drawables as one group between the slider outer
++     * bottom and activated-chevron visible upper tip. TextView top drawables are rendered from the
++     * view paddingTop, so their real visible centers are measurable without guessing a pixel offset.
++     * The four buttons receive one identical frozen translation; slider/chevron/panel stay unmoved. */
++    private float iris26675VisibleTopDrawableCenterY(TextView button) {
++        if (button == null || !button.isLaidOut() || button.getHeight() <= 0) return Float.NaN;
++        final Drawable[] drawables = button.getCompoundDrawablesRelative();
++        if (drawables == null || drawables.length < 2 || drawables[1] == null) return Float.NaN;
++        final Drawable top = drawables[1];
++        final int drawableHeight = top.getBounds().height() > 0
++                ? top.getBounds().height() : top.getIntrinsicHeight();
++        if (drawableHeight <= 0) return Float.NaN;
++        final int[] window = new int[2];
++        button.getLocationInWindow(window);
++        return window[1] + button.getPaddingTop() + 0.5f * drawableHeight;
++    }
++
++    private boolean iris26675EstablishManualIconMidpoint(View panel) {
+         if (activity == null || panel == null) return false;
+         final View slider = activity.findViewById(R.id.irisManualSliderContainer);
+         final View buttons = activity.findViewById(R.id.buttons_container);
+         final View chevron = activity.findViewById(R.id.approved_manual_chevron);
+-        if (slider == null || buttons == null || chevron == null) return false;
+-        if (iris26674ManualMidpointEstablished) return true;
++        final TextView focus = activity.findViewById(R.id.focus_option_tv);
++        final TextView shutter = activity.findViewById(R.id.exposure_option_tv);
++        final TextView iso = activity.findViewById(R.id.iso_option_tv);
++        final TextView ev = activity.findViewById(R.id.ev_option_tv);
++        if (slider == null || buttons == null || chevron == null || focus == null
++                || shutter == null || iso == null || ev == null) return false;
++        if (iris26675ManualIconMidpointEstablished) return true;
+         if (!slider.isLaidOut() || !buttons.isLaidOut() || !chevron.isLaidOut()
+-                || slider.getHeight() <= 0 || buttons.getHeight() <= 0 || chevron.getHeight() <= 0) {
+-            return false;
+-        }
++                || !focus.isLaidOut() || !shutter.isLaidOut() || !iso.isLaidOut() || !ev.isLaidOut()
++                || slider.getHeight() <= 0 || chevron.getHeight() <= 0) return false;
+ 
+         panel.setTranslationY(0.0f);
+         buttons.setTranslationY(0.0f);
++        focus.setTranslationY(0.0f);
++        shutter.setTranslationY(0.0f);
++        iso.setTranslationY(0.0f);
++        ev.setTranslationY(0.0f);
+         final int[] sliderWindow = new int[2];
+-        final int[] buttonsWindow = new int[2];
+         final int[] chevronWindow = new int[2];
+         slider.getLocationInWindow(sliderWindow);
+-        buttons.getLocationInWindow(buttonsWindow);
+         chevron.getLocationInWindow(chevronWindow);
+ 
+-        final float rowCenterBeforeY = buttonsWindow[1] + 0.5f * buttons.getHeight();
++        final float focusCenterY = iris26675VisibleTopDrawableCenterY(focus);
++        final float shutterCenterY = iris26675VisibleTopDrawableCenterY(shutter);
++        final float isoCenterY = iris26675VisibleTopDrawableCenterY(iso);
++        final float evCenterY = iris26675VisibleTopDrawableCenterY(ev);
++        if (!Float.isFinite(focusCenterY) || !Float.isFinite(shutterCenterY)
++                || !Float.isFinite(isoCenterY) || !Float.isFinite(evCenterY)) return false;
++        final float visibleIconCenterBeforeY =
++                0.25f * (focusCenterY + shutterCenterY + isoCenterY + evCenterY);
+         final float sliderOuterBottomY = sliderWindow[1] + slider.getHeight();
+         final float density = getResources().getDisplayMetrics().density;
+-        // Drawable geometry: the activated 180-degree V upper tip is 0.34h from ImageView top.
+-        // Include half of the existing 3.75dp outline to measure the visible rather than path edge.
+         final float activatedChevronVisibleTopY = chevronWindow[1] + 0.34f * chevron.getHeight()
+                 - 1.875f * density;
+         final float targetCenterY = 0.5f * (sliderOuterBottomY + activatedChevronVisibleTopY);
+-        final float fixedTranslationY = targetCenterY - rowCenterBeforeY;
+-        buttons.setTranslationY(fixedTranslationY);
+-        iris26674ManualFixedRowTranslationY = fixedTranslationY;
+-        iris26674ManualMidpointEstablished = true;
+-        Log.i(TAG, "IRIS_26674_MANUAL_GEOMETRY_OWNER"
++        final float fixedTranslationY = targetCenterY - visibleIconCenterBeforeY;
++        focus.setTranslationY(fixedTranslationY);
++        shutter.setTranslationY(fixedTranslationY);
++        iso.setTranslationY(fixedTranslationY);
++        ev.setTranslationY(fixedTranslationY);
++        iris26675ManualFixedIconTranslationY = fixedTranslationY;
++        iris26675ManualIconMidpointEstablished = true;
++        Log.i(TAG, "IRIS_26675_MANUAL_VISIBLE_ICON_GEOMETRY_OWNER"
+                 + " sliderBottomY=" + sliderOuterBottomY
+                 + " chevronOpenTipY=" + activatedChevronVisibleTopY
+-                + " rowCenterBeforeY=" + rowCenterBeforeY
++                + " focusIconCenterY=" + focusCenterY
++                + " shutterIconCenterY=" + shutterCenterY
++                + " isoIconCenterY=" + isoCenterY
++                + " evIconCenterY=" + evCenterY
++                + " visibleIconCenterBeforeY=" + visibleIconCenterBeforeY
+                 + " targetCenterY=" + targetCenterY
+-                + " fixedRowTranslationY=" + fixedTranslationY
++                + " fixedIconTranslationY=" + fixedTranslationY
++                + " buttonsContainerTranslationY=" + buttons.getTranslationY()
+                 + " panelTranslationY=" + panel.getTranslationY()
+-                + " sliderMoved=false chevronMoved=false topMarginWrite=false"
++                + " sliderMoved=false chevronMoved=false containerMoved=false topMarginWrite=false"
+                 + " ownerEstablished=true");
+         return true;
+     }
+ 
+-    private void iris26674RevealManualPanelWhenGeometryReady(
++    private void iris26675RevealManualPanelWhenGeometryReady(
+             View panel, ManualModeModel model) {
+         if (activity == null || panel == null || model == null) return;
+         if (!model.isManualPanelVisible() || panel.getVisibility() != View.VISIBLE) return;
+-        if (iris26674EstablishManualRowMidpoint(panel)) {
+-            final View buttons = activity.findViewById(R.id.buttons_container);
+-            final float rowNow = buttons == null ? Float.NaN : buttons.getTranslationY();
+-            Log.i(TAG, "IRIS_26674_MANUAL_VISIBILITY_INVARIANCE"
+-                    + " state=visible fixedRowTranslationY=" + iris26674ManualFixedRowTranslationY
+-                    + " rowTranslationBefore=" + rowNow + " rowTranslationAfter=" + rowNow
++        if (iris26675EstablishManualIconMidpoint(panel)) {
++            final TextView focus = activity.findViewById(R.id.focus_option_tv);
++            final float iconNow = focus == null ? Float.NaN : focus.getTranslationY();
++            Log.i(TAG, "IRIS_26675_MANUAL_VISIBILITY_INVARIANCE"
++                    + " state=visible fixedIconTranslationY=" + iris26675ManualFixedIconTranslationY
++                    + " iconTranslationBefore=" + iconNow + " iconTranslationAfter=" + iconNow
+                     + " panelTranslationY=" + panel.getTranslationY() + " positionChanged=false");
+             panel.animate().alpha(1.0f).setDuration(100).start();
+             return;
+         }
+-        if (iris26674ManualPreDrawListener != null) return;
+-        iris26674ManualPreDrawListener = () -> {
++        if (iris26675ManualPreDrawListener != null) return;
++        iris26675ManualPreDrawListener = () -> {
+             if (activity == null || !model.isManualPanelVisible()
+                     || panel.getVisibility() != View.VISIBLE) {
+                 if (panel.getViewTreeObserver().isAlive()) {
+-                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26674ManualPreDrawListener);
++                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26675ManualPreDrawListener);
+                 }
+-                iris26674ManualPreDrawListener = null;
++                iris26675ManualPreDrawListener = null;
+                 return true;
+             }
+-            if (!iris26674EstablishManualRowMidpoint(panel)) return true;
++            if (!iris26675EstablishManualIconMidpoint(panel)) return true;
+             if (panel.getViewTreeObserver().isAlive()) {
+-                panel.getViewTreeObserver().removeOnPreDrawListener(iris26674ManualPreDrawListener);
++                panel.getViewTreeObserver().removeOnPreDrawListener(iris26675ManualPreDrawListener);
+             }
+-            iris26674ManualPreDrawListener = null;
+-            final View buttons = activity.findViewById(R.id.buttons_container);
+-            final float rowNow = buttons == null ? Float.NaN : buttons.getTranslationY();
+-            Log.i(TAG, "IRIS_26674_MANUAL_VISIBILITY_INVARIANCE"
+-                    + " state=visible-preDraw fixedRowTranslationY=" + iris26674ManualFixedRowTranslationY
+-                    + " rowTranslationBefore=" + rowNow + " rowTranslationAfter=" + rowNow
++            iris26675ManualPreDrawListener = null;
++            final TextView focus = activity.findViewById(R.id.focus_option_tv);
++            final float iconNow = focus == null ? Float.NaN : focus.getTranslationY();
++            Log.i(TAG, "IRIS_26675_MANUAL_VISIBILITY_INVARIANCE"
++                    + " state=visible-preDraw fixedIconTranslationY=" + iris26675ManualFixedIconTranslationY
++                    + " iconTranslationBefore=" + iconNow + " iconTranslationAfter=" + iconNow
+                     + " panelTranslationY=" + panel.getTranslationY() + " positionChanged=false");
+             panel.animate().alpha(1.0f).setDuration(100).start();
+             return true;
+         };
+-        panel.getViewTreeObserver().addOnPreDrawListener(iris26674ManualPreDrawListener);
++        panel.getViewTreeObserver().addOnPreDrawListener(iris26675ManualPreDrawListener);
+     }
+ 
+     private void iris26670ApplyManualPresentationState(
+@@ -572,33 +607,34 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                 && panel != null) {
+             final boolean visible = model.isManualPanelVisible();
+             panel.animate().cancel();
+-            // IRIS_26674_MANUAL_VISIBILITY_ONLY_OWNER: parent position is permanently zero.
++            // IRIS_26675_MANUAL_VISIBILITY_ONLY_OWNER: panel and structural parent stay permanently zero.
+             panel.setTranslationY(0.0f);
+             if (visible) {
+                 panel.animate().cancel();
+                 panel.setAlpha(0.0f);
+                 panel.setVisibility(View.VISIBLE);
+-                panel.post(() -> iris26674RevealManualPanelWhenGeometryReady(panel, model));
++                panel.post(() -> iris26675RevealManualPanelWhenGeometryReady(panel, model));
+             } else {
+-                if (iris26674ManualPreDrawListener != null
++                if (iris26675ManualPreDrawListener != null
+                         && panel.getViewTreeObserver().isAlive()) {
+-                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26674ManualPreDrawListener);
+-                    iris26674ManualPreDrawListener = null;
++                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26675ManualPreDrawListener);
++                    iris26675ManualPreDrawListener = null;
+                 }
+-                final View buttons = activity.findViewById(R.id.buttons_container);
+-                final float rowTranslationBeforeHide = buttons == null ? Float.NaN : buttons.getTranslationY();
++                final TextView focusButton = activity.findViewById(R.id.focus_option_tv);
++                final float iconTranslationBeforeHide = focusButton == null
++                        ? Float.NaN : focusButton.getTranslationY();
+                 panel.animate().alpha(0.0f).setDuration(100)
+                         .withEndAction(() -> {
+                             panel.setTranslationY(0.0f);
+                             panel.setVisibility(View.GONE);
+-                            final float rowTranslationAfterHide = buttons == null
+-                                    ? Float.NaN : buttons.getTranslationY();
+-                            Log.i(TAG, "IRIS_26674_MANUAL_VISIBILITY_INVARIANCE"
+-                                    + " state=hidden fixedRowTranslationY=" + iris26674ManualFixedRowTranslationY
+-                                    + " rowTranslationBefore=" + rowTranslationBeforeHide
+-                                    + " rowTranslationAfter=" + rowTranslationAfterHide
++                            final float iconTranslationAfterHide = focusButton == null
++                                    ? Float.NaN : focusButton.getTranslationY();
++                            Log.i(TAG, "IRIS_26675_MANUAL_VISIBILITY_INVARIANCE"
++                                    + " state=hidden fixedIconTranslationY=" + iris26675ManualFixedIconTranslationY
++                                    + " iconTranslationBefore=" + iconTranslationBeforeHide
++                                    + " iconTranslationAfter=" + iconTranslationAfterHide
+                                     + " panelTranslationY=" + panel.getTranslationY()
+-                                    + " positionChanged=" + (Float.compare(rowTranslationBeforeHide, rowTranslationAfterHide) != 0));
++                                    + " positionChanged=" + (Float.compare(iconTranslationBeforeHide, iconTranslationAfterHide) != 0));
+                         }).start();
+             }
+         }
+diff --git a/app/version.properties b/app/version.properties
+index 44a8074927ed3401672dd9a01b3a09be76f37933..8622a4a41fa76c42420929c0ebd2df758d9bedd4 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726674
+-VERSION_BUILD=26674
++VERSION_NAME=0.9726675
++VERSION_BUILD=26675
