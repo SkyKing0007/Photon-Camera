@@ -1,0 +1,930 @@
+diff --git a/app/src/main/assets/shaders/preview/main_fs.glsl b/app/src/main/assets/shaders/preview/main_fs.glsl
+index a95114ca6957c8f216a593aedddf1cb47db56ca7..1e7f4b999b41a67f9d03cd44d7f153521e9a824b 100644
+--- a/app/src/main/assets/shaders/preview/main_fs.glsl
++++ b/app/src/main/assets/shaders/preview/main_fs.glsl
+@@ -5,7 +5,6 @@ uniform vec2 resolution;
+ uniform bool enablePeak;
+ uniform bool mirror;
+ uniform float irisSoftwareZoom;
+-uniform float iris26662ReferencePreviewGain;
+ /* IRIS_26524_PREVIEW_RESIDUAL_ZOOM */
+ out vec4 Output;
+ in vec2 texCoord;
+@@ -32,30 +31,5 @@ void main() {
+     vec4 dc = vec4(1.0,0.0,1.0,0.0);
+     if(enablePeak)
+         color = color + dc*32.0*diff*w;
+-
+-    /* IRIS_26662_FRAME_MATCHED_PREVIEW_PRESENTATION
+-     * Preserve exact 26660 preview bytes when no RAW protection is active. When protection is
+-     * active, restore body brightness with a white-anchored rational exposure map instead of the
+-     * 26661 full linear multiplier. The map is monotone, maps display white to display white, and
+-     * rescales RGB uniformly, so it cannot create the blown preview highlights seen in 26661.
+-     */
+-    float iris26662Gain = max(iris26662ReferencePreviewGain, 1.0);
+-    if (iris26662Gain > 1.0001) {
+-        vec3 encoded = clamp(color.rgb, vec3(0.0), vec3(1.0));
+-        vec3 lowLinear = encoded / 12.92;
+-        vec3 highLinear = pow((encoded + 0.055) / 1.055, vec3(2.4));
+-        vec3 linearRgb = mix(lowLinear, highLinear, step(vec3(0.04045), encoded));
+-        float y = dot(linearRgb, vec3(0.2126, 0.7152, 0.0722));
+-        float guide = max(y, max(linearRgb.r, max(linearRgb.g, linearRgb.b)));
+-        if (guide > 1.0e-6) {
+-            float mappedGuide = iris26662Gain * guide
+-                    / (1.0 + (iris26662Gain - 1.0) * guide);
+-            linearRgb *= mappedGuide / guide;
+-        }
+-        vec3 lowEncoded = 12.92 * linearRgb;
+-        vec3 highEncoded = 1.055 * pow(max(linearRgb, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+-        color.rgb = clamp(mix(lowEncoded, highEncoded, step(vec3(0.0031308), linearRgb)),
+-                          vec3(0.0), vec3(1.0));
+-    }
+     Output = color;
+ }
+\ No newline at end of file
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 74f6738900f28399c5f49e5e3b01aa8c2f28f59f..4321f6f6daa2589d9e19a014ebc0520635bcf779 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -797,17 +797,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                  * metadata for capture processing and JPEG normalization.
+                  */
+                 /* updateMotionV2ExposureAuthority(result); intentionally dormant */
+-                /* updateMotion26368AdaptiveAeBias(result); intentionally dormant */
+-                /*
+-                 * IRIS_26661_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+-                 *
+-                 * Keep HAL AE as the live controller, but give the Motion ZSL RAW group one
+-                 * slowly-changing NEGATIVE-only AE-compensation offset when fresh RAW evidence
+-                 * proves HDR/highlight pressure. This is the only active Motion AE writer.
+-                 * The controller debiases its own RAW guide before solving the next target, so
+-                 * its protection cannot oscillate merely because the previous offset worked.
+-                 */
+-                updateMotion26662GoogleReferenceExposureAuthority(result);
++                /* IRIS_26386_STABLE_HAL_AE_AUTHORITY */
++                // Asynchronous RAW evidence is diagnostic only; HAL AE owns live preview.
++                // updateMotion26368AdaptiveAeBias(result);
+             }
+             if (mTemp != null) mPreviewTemp = mTemp;
+             if (mPreviewTemp == null) {
+@@ -1575,82 +1567,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private static final long MOTION_26608_HDR_CONFLICT_HOLD_NS = 500_000_000L;
+     private static final int MOTION_26608_HISTOGRAM_BINS = 128;
+ 
+-    /*
+-     * IRIS_26661_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+-     *
+-     * Google HDR+ deliberately keeps its short/reference burst highlight-safe. 26658 already
+-     * changed the merge roles (ZSL reference + one longer shadow/SNR exposure), but deliberately
+-     * left ZSL exposure policy untouched. 26661 completes that acquisition contract without
+-     * reviving the old post-shutter HIGHLIGHT_SHORT frame:
+-     *
+-     *   - HAL AE stays ON.
+-     *   - only a negative AE-compensation offset is allowed;
+-     *   - the target is driven by fresh sensor-normalized RAW evidence, never scene semantics;
+-     *   - the already-applied offset is mathematically removed from the next RAW guide before
+-     *     solving, preventing a successful protection step from making the controller undo itself;
+-     *   - increases settle faster than releases and updates are cadence-limited to avoid the
+-     *     26412 preview-oscillation regression.
+-     */
+-    private static final float MOTION_26661_REFERENCE_HEADROOM_TARGET = 0.72f;
+-    private static final float MOTION_26661_HDR_MIN_PROTECTION_EV = 0.35f;
+-    private static final float MOTION_26661_CLIP_MIN_PROTECTION_EV = 0.70f;
+-    private static final float MOTION_26661_MAX_PROTECTION_EV = 1.50f;
+-    private static final int MOTION_26661_INCREASE_CONFIRM_FRAMES = 4;
+-    private static final int MOTION_26661_RELEASE_CONFIRM_FRAMES = 10;
+-    private static final long MOTION_26661_MIN_UPDATE_MS = 650L;
+-    private static final int MOTION_26662_AE_BASELINE_CONFIRM_FRAMES = 6;
+-    private static final int MOTION_26662_PREVIEW_RESULT_HISTORY = 16;
+-    private boolean mMotion26661ReferenceBaseReady = false;
+-    private int mMotion26661ReferenceBaseSteps = 0;
+-    private int mMotion26661ReferenceAppliedProtectionSteps = 0;
+-    private int mMotion26661ReferenceCandidateProtectionSteps = 0;
+-    private int mMotion26661ReferenceCandidateFrames = 0;
+-    private long mMotion26661ReferenceLastUpdateMs = 0L;
+-    private volatile float mMotion26661ReferenceAppliedProtectionEv = 0.0f;
+-    private int mMotion26662AeBaselineStableFrames = 0;
+-    private final Object mMotion26662PreviewResultLock = new Object();
+-    private final long[] mMotion26662PreviewResultTimestampNs =
+-            new long[MOTION_26662_PREVIEW_RESULT_HISTORY];
+-    private final float[] mMotion26662PreviewResultProtectionEv =
+-            new float[MOTION_26662_PREVIEW_RESULT_HISTORY];
+-    private int mMotion26662PreviewResultWriteIndex = 0;
+-
+-    /*
+-     * IRIS_26662_FRAME_MATCHED_PREVIEW_PROTECTION
+-     * Preview compensation must describe the exposure of the SurfaceTexture frame being drawn,
+-     * never the newly requested AE offset. Record the compensation reported by each completed
+-     * Camera2 result and resolve it by sensor timestamp. This removes the 26661 request/result
+-     * phase error that visibly flashed the viewfinder before the sensor exposure had changed.
+-     */
+-    private void recordMotion26662PreviewProtection(
+-            long sensorTimestampNs, float protectionEv) {
+-        if (sensorTimestampNs <= 0L) return;
+-        synchronized (mMotion26662PreviewResultLock) {
+-            int slot = mMotion26662PreviewResultWriteIndex % MOTION_26662_PREVIEW_RESULT_HISTORY;
+-            mMotion26662PreviewResultTimestampNs[slot] = sensorTimestampNs;
+-            mMotion26662PreviewResultProtectionEv[slot] = Math.max(0.0f,
+-                    Math.min(MOTION_26661_MAX_PROTECTION_EV, protectionEv));
+-            mMotion26662PreviewResultWriteIndex++;
+-        }
+-    }
+-
+-    /* IRIS_26663_STABLE_PREVIEW_METADATA_HANDOFF
+-     * A SurfaceTexture frame can arrive before its TotalCaptureResult callback. Missing metadata is
+-     * not evidence for zero protection: return NaN so the renderer holds the last confirmed actual
+-     * result until an exact timestamp is available. Capture exposure ownership is unchanged. */
+-    public float getMotion26663ReferencePreviewProtectionEv(long sensorTimestampNs) {
+-        if (!isZslMode()) return 0.0f;
+-        if (sensorTimestampNs <= 0L) return Float.NaN;
+-        synchronized (mMotion26662PreviewResultLock) {
+-            for (int i = 0; i < MOTION_26662_PREVIEW_RESULT_HISTORY; i++) {
+-                if (mMotion26662PreviewResultTimestampNs[i] == sensorTimestampNs) {
+-                    return mMotion26662PreviewResultProtectionEv[i];
+-                }
+-            }
+-        }
+-        return Float.NaN;
+-    }
+-
+     /* IRIS_26496_SPATIALLY_PERSISTENT_HIGHLIGHT_TRIGGER
+      * A global clipped-pixel percentage misses tiny but visually dominant LEDs,
+      * chandelier rims, flowers and window glints. Keep the per-frame sampler cheap,
+@@ -1988,210 +1904,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    /*
+-     * IRIS_26662_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+-     *
+-     * Preserve 26661's Google-style negative-only ZSL reference protection, but fix the two
+-     * measured runtime regressions from the chandelier/plant set:
+-     *   1) do not engage until HAL AE reports a stable baseline for several results;
+-     *   2) solve protection magnitude from CURRENT sensor-normalized RAW p99.5 only. Coherent
+-     *      highlight/HDR structure may trigger protection, but a held structure flag may never be
+-     *      multiplied by the already-applied EV and ratchet the reference progressively darker.
+-     */
+-    private void updateMotion26662GoogleReferenceExposureAuthority(
+-            @NonNull TotalCaptureResult result) {
+-        if (!isZslMode() || mZslCapturing || burst || isProcessing
+-                || mPreviewRequestBuilder == null || mCaptureSession == null
+-                || mCameraCharacteristics == null) {
+-            return;
+-        }
+-
+-        Integer aeMode = result.get(CaptureResult.CONTROL_AE_MODE);
+-        Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+-        Long actualExposure = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+-        Integer actualIso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+-        Long sensorTs = result.get(CaptureResult.SENSOR_TIMESTAMP);
+-        if (aeMode == null || aeMode == CaptureResult.CONTROL_AE_MODE_OFF
+-                || actualExposure == null || actualExposure <= 0L
+-                || actualIso == null || actualIso <= 0 || sensorTs == null) {
+-            return;
+-        }
+-
+-        android.util.Range<Integer> aeRange = mCameraCharacteristics.get(
+-                CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+-        android.util.Rational aeStep = mCameraCharacteristics.get(
+-                CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+-        if (aeRange == null || aeStep == null || aeStep.floatValue() <= 0.0f) return;
+-        final float stepEv = aeStep.floatValue();
+-
+-        Integer builderSteps = mPreviewRequestBuilder.get(
+-                CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
+-        int currentBuilderSteps = builderSteps != null ? builderSteps : 0;
+-
+-        if (!mMotion26661ReferenceBaseReady) {
+-            boolean aeSettled = aeState != null
+-                    && (aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED
+-                        || aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
+-                        || aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED);
+-            if (!aeSettled) {
+-                mMotion26662AeBaselineStableFrames = 0;
+-                return;
+-            }
+-            mMotion26662AeBaselineStableFrames++;
+-            if (mMotion26662AeBaselineStableFrames < MOTION_26662_AE_BASELINE_CONFIRM_FRAMES) {
+-                return;
+-            }
+-            mMotion26661ReferenceBaseSteps = Math.max(
+-                    aeRange.getLower(), Math.min(aeRange.getUpper(), currentBuilderSteps));
+-            mMotion26661ReferenceAppliedProtectionSteps = 0;
+-            mMotion26661ReferenceCandidateProtectionSteps = 0;
+-            mMotion26661ReferenceCandidateFrames = 0;
+-            mMotion26661ReferenceAppliedProtectionEv = 0.0f;
+-            mMotion26661ReferenceBaseReady = true;
+-        } else {
+-            int expectedBuilderSteps = mMotion26661ReferenceBaseSteps
+-                    - mMotion26661ReferenceAppliedProtectionSteps;
+-            if (currentBuilderSteps != expectedBuilderSteps) {
+-                mMotion26661ReferenceBaseSteps = Math.max(
+-                        aeRange.getLower(), Math.min(aeRange.getUpper(), currentBuilderSteps));
+-                mMotion26661ReferenceAppliedProtectionSteps = 0;
+-                mMotion26661ReferenceCandidateProtectionSteps = 0;
+-                mMotion26661ReferenceCandidateFrames = 0;
+-                mMotion26661ReferenceAppliedProtectionEv = 0.0f;
+-            }
+-        }
+-
+-        Integer resultCompSteps = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
+-        int observedSteps = resultCompSteps != null ? resultCompSteps : currentBuilderSteps;
+-        int observedProtectionSteps = Math.max(
+-                0, mMotion26661ReferenceBaseSteps - observedSteps);
+-        float observedProtectionEv = observedProtectionSteps * stepEv;
+-        recordMotion26662PreviewProtection(sensorTs, observedProtectionEv);
+-
+-        long rawAgeNs = mMotion26380RawSignalTimestampNs <= 0L
+-                ? Long.MAX_VALUE : Math.abs(sensorTs - mMotion26380RawSignalTimestampNs);
+-        boolean rawFresh = rawAgeNs <= 180_000_000L
+-                && mMotion26380RawSampleCount >= 64
+-                && Float.isFinite(mMotion26380RawHighlightFraction)
+-                && Float.isFinite(mMotion26608RawP995);
+-        if (!rawFresh) return;
+-
+-        /* Current radiometry owns the requested EV. Never use the held structured-peak value as
+-         * a magnitude, because 26661 showed that a value held at 1.0 was multiplied by the
+-         * already-applied protection and ratcheted 0.33 -> 0.67 -> 1.0 -> 1.33 -> 1.5 EV even
+-         * while measured RAW p99.5 had fallen safely below the headroom target. */
+-        float radiometricGuide = Math.max(0.0f, mMotion26608RawP995);
+-        float unbiasedGuide = radiometricGuide
+-                * (float) Math.pow(2.0, observedProtectionEv);
+-
+-        long hdrAgeNs = mMotion26608RecentHdrConflictTimestampNs <= 0L
+-                ? Long.MAX_VALUE
+-                : Math.abs(sensorTs - mMotion26608RecentHdrConflictTimestampNs);
+-        boolean hdrConflict = mMotion26608CurrentHdrConflict
+-                || hdrAgeNs <= MOTION_26608_HDR_CONFLICT_HOLD_NS;
+-        boolean currentCoherentClip = mMotion26496RawCoherentHighlightCells > 0;
+-        boolean broadClip = mMotion26380RawHighlightFraction
+-                >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER;
+-        boolean currentMeaningfulClip = broadClip
+-                || (currentCoherentClip && mMotion26608CurrentHdrConflict);
+-
+-        float requestedProtectionEv = 0.0f;
+-        if (hdrConflict || currentMeaningfulClip) {
+-            if (unbiasedGuide > MOTION_26661_REFERENCE_HEADROOM_TARGET) {
+-                requestedProtectionEv = (float) (
+-                        Math.log(unbiasedGuide / MOTION_26661_REFERENCE_HEADROOM_TARGET)
+-                                / Math.log(2.0));
+-            }
+-            if (mMotion26608CurrentHdrConflict && unbiasedGuide >= 0.45f) {
+-                requestedProtectionEv = Math.max(
+-                        requestedProtectionEv, MOTION_26661_HDR_MIN_PROTECTION_EV);
+-            }
+-            if (currentMeaningfulClip) {
+-                float clipPressure = motion26368Clamp01(
+-                        (mMotion26380RawHighlightFraction
+-                                - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER)
+-                                / (0.030f - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER));
+-                float clipFloor = MOTION_26661_CLIP_MIN_PROTECTION_EV
+-                        + 0.45f * clipPressure;
+-                requestedProtectionEv = Math.max(requestedProtectionEv, clipFloor);
+-            }
+-        }
+-        requestedProtectionEv = Math.max(
+-                0.0f, Math.min(MOTION_26661_MAX_PROTECTION_EV, requestedProtectionEv));
+-
+-        int maximumProtectionSteps = Math.max(
+-                0, mMotion26661ReferenceBaseSteps - aeRange.getLower());
+-        int desiredProtectionSteps = Math.max(
+-                0, Math.min(
+-                        maximumProtectionSteps,
+-                        Math.round(requestedProtectionEv / stepEv)));
+-
+-        if (desiredProtectionSteps != mMotion26661ReferenceCandidateProtectionSteps) {
+-            mMotion26661ReferenceCandidateProtectionSteps = desiredProtectionSteps;
+-            mMotion26661ReferenceCandidateFrames = 1;
+-        } else {
+-            mMotion26661ReferenceCandidateFrames++;
+-        }
+-
+-        int requiredConfirmFrames = desiredProtectionSteps
+-                > mMotion26661ReferenceAppliedProtectionSteps
+-                ? MOTION_26661_INCREASE_CONFIRM_FRAMES
+-                : MOTION_26661_RELEASE_CONFIRM_FRAMES;
+-        if (mMotion26661ReferenceCandidateFrames < requiredConfirmFrames) return;
+-
+-        long nowMs = android.os.SystemClock.elapsedRealtime();
+-        if (nowMs - mMotion26661ReferenceLastUpdateMs < MOTION_26661_MIN_UPDATE_MS) return;
+-        if (desiredProtectionSteps == mMotion26661ReferenceAppliedProtectionSteps) {
+-            mMotion26661ReferenceAppliedProtectionEv =
+-                    mMotion26661ReferenceAppliedProtectionSteps * stepEv;
+-            return;
+-        }
+-
+-        int delta = desiredProtectionSteps - mMotion26661ReferenceAppliedProtectionSteps;
+-        int boundedDelta = Math.max(-2, Math.min(2, delta));
+-        int nextProtectionSteps = mMotion26661ReferenceAppliedProtectionSteps + boundedDelta;
+-        int targetSteps = mMotion26661ReferenceBaseSteps - nextProtectionSteps;
+-        targetSteps = Math.max(aeRange.getLower(), Math.min(aeRange.getUpper(), targetSteps));
+-
+-        try {
+-            mPreviewRequestBuilder.set(
+-                    CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, targetSteps);
+-            mMotion26661ReferenceAppliedProtectionSteps =
+-                    Math.max(0, mMotion26661ReferenceBaseSteps - targetSteps);
+-            mMotion26661ReferenceAppliedProtectionEv =
+-                    mMotion26661ReferenceAppliedProtectionSteps * stepEv;
+-            mMotion26661ReferenceLastUpdateMs = nowMs;
+-            mMotion26661ReferenceCandidateFrames = 0;
+-            rebuildPreviewBuilder();
+-
+-            Log.i(TAG, "IRIS_26662_GOOGLE_REFERENCE_AE"
+-                    + " actualExposureNs=" + actualExposure
+-                    + " actualIso=" + actualIso
+-                    + " aeState=" + aeState
+-                    + " baselineStableFrames=" + mMotion26662AeBaselineStableFrames
+-                    + " rawAgeMs=" + rawAgeNs / 1_000_000L
+-                    + " rawP995=" + mMotion26608RawP995
+-                    + " structuredPeakSecondDiagnostic=" + mMotion26608StructuredPeakSecond
+-                    + " radiometricGuide=" + radiometricGuide
+-                    + " observedProtectionEv=" + observedProtectionEv
+-                    + " unbiasedGuide=" + unbiasedGuide
+-                    + " rawHighlightFraction=" + mMotion26380RawHighlightFraction
+-                    + " currentCoherentClip=" + currentCoherentClip
+-                    + " currentHdrConflict=" + mMotion26608CurrentHdrConflict
+-                    + " heldHdrConflict=" + hdrConflict
+-                    + " requestedProtectionEv=" + requestedProtectionEv
+-                    + " appliedProtectionEv=" + mMotion26661ReferenceAppliedProtectionEv
+-                    + " baseSteps=" + mMotion26661ReferenceBaseSteps
+-                    + " targetSteps=" + targetSteps
+-                    + " halAeRemainsOn=true negativeOnly=true"
+-                    + " heldStructureCannotOwnMagnitude=true"
+-                    + " postShutterHighlightShort=false");
+-        } catch (IllegalArgumentException | IllegalStateException e) {
+-            Log.w(TAG, "IRIS_26662 reference AE protection skipped: "
+-                    + e.getClass().getSimpleName());
+-        }
+-    }
+-
+     /*
+      * IRIS_26381_DYNAMIC_MOTION_SHUTTER_OPPORTUNITY
+      * Public Camera2 only. Advisory to system AE; no direct shutter/ISO set.
+@@ -5852,20 +5564,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         if(exp!=null&&exp>0L)frame.motionV2ActualExposureNs=exp;if(iso!=null&&iso>0)frame.motionV2ActualIso=iso;
+         if(frame.motionV2ActualExposureNs>0L&&frame.motionV2ActualIso>0)
+             frame.motionV2ExposureEnergy=ExposureIndex.time2sec(frame.motionV2ActualExposureNs)*frame.motionV2ActualIso;
+-        frame.motionV2ReferenceProtectionEv = 0.0f;
+-        if (!shortRole && PhotonCamera.getSettings().selectedMode == CameraMode.MOTION
+-                && mMotion26661ReferenceBaseReady) {
+-            Integer resultAeSteps = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
+-            android.util.Rational resultAeStep = mCameraCharacteristics == null ? null
+-                    : mCameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
+-            if (resultAeSteps != null && resultAeStep != null
+-                    && resultAeStep.floatValue() > 0.0f) {
+-                frame.motionV2ReferenceProtectionEv = Math.max(
+-                        0.0f,
+-                        (mMotion26661ReferenceBaseSteps - resultAeSteps)
+-                                * resultAeStep.floatValue());
+-            }
+-        }
+         if(ts!=null)frame.motionV2ResultSensorTimestampNs=ts;frame.motionV2FrameNumber=result.getFrameNumber();
+         if(skew!=null)frame.motionV2RollingShutterSkewNs=skew;if(focus!=null)frame.motionV2FocusDistanceDiopters=focus;
+         if(lens!=null)frame.motionV2LensState=lens;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+index 3534245489a112ee366179d80bd13684c3269ffa..68773da893479b4adb7935ac5d0acdd0b16f8991 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+@@ -59,11 +59,6 @@ public class ImageFrame {
+     public long motionV2ActualExposureNs = 0L;
+     public int motionV2ActualIso = 0;
+     public double motionV2ExposureEnergy = 0.0;
+-    /* IRIS_26661_GOOGLE_REFERENCE_PRESENTATION_HANDOFF
+-     * Acquisition-only underexposure applied to the equal-exposure Motion ZSL reference group.
+-     * This never changes RAW normalization or bracket ratios; presentation may compensate it once.
+-     */
+-    public float motionV2ReferenceProtectionEv = 0.0f;
+     public float motionV2NoiseS = Float.NaN;
+     public float motionV2NoiseO = Float.NaN;
+     /* IRIS_26490_PER_FRAME_RADIOMETRIC_CALIBRATION
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index c7eea6faa6d9769fe8c26fb9ccb09f22b021542f..7b178778479812cb8105c1e1d0ea52051320c8fe 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -971,37 +971,7 @@ public final class MotionV2Render extends Node {
+             throw new IllegalStateException("MotionV2Render used outside Motion V2");
+         }
+ 
+-        final GLTexture acquiredExtendedLinearHdr = previousNode.WorkingTexture;
+-        GLTexture iris26662CanonicalHdrOwned = null;
+-        GLTexture extendedLinearHdr = acquiredExtendedLinearHdr;
+-        final float iris26662ReferenceProtectionEv = basePipeline.mParameters.motionV2Active
+-                ? Math.max(0.0f, Math.min(1.50f,
+-                        basePipeline.mParameters.motionV2ReferenceProtectionEv))
+-                : 0.0f;
+-        final float iris26662ReferenceRestoreGain =
+-                (float)Math.pow(2.0, iris26662ReferenceProtectionEv);
+-        if (basePipeline.mParameters.motionV2Active
+-                && iris26662ReferenceRestoreGain > 1.0001f) {
+-            /* IRIS_26662_CANONICAL_HDR_REFERENCE_NORMALIZATION
+-             * 26661 correctly protected RAW highlights but left the merged float master in the
+-             * deliberately underexposed reference domain, making the plant/chandelier bodies dark.
+-             * Undo exactly that known acquisition EV here, before Local-Laplacian/tone/UHDR, in the
+-             * unclipped floating HDR carrier. Values above 1 remain above 1; LONG contributes only
+-             * through Sabre and never supplies this global scalar. */
+-            iris26662CanonicalHdrOwned = new GLTexture(
+-                    new Point(acquiredExtendedLinearHdr.mSize),
+-                    acquiredExtendedLinearHdr.mFormat, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-            glProg.useAssetProgram("motionv2/display_exposure");
+-            glProg.setTexture("InputBuffer", acquiredExtendedLinearHdr);
+-            glProg.setVar("displayGain", iris26662ReferenceRestoreGain);
+-            glProg.drawBlocks(iris26662CanonicalHdrOwned);
+-            extendedLinearHdr = iris26662CanonicalHdrOwned;
+-            Log.i(Name, "IRIS_26662_CANONICAL_HDR_REFERENCE_NORMALIZATION"
+-                    + " referenceProtectionEv=" + iris26662ReferenceProtectionEv
+-                    + " restoreGain=" + iris26662ReferenceRestoreGain
+-                    + " beforeLocalTone=true beforeSdrTone=true beforeUhdrGainMap=true"
+-                    + " unclippedFloatCarrier=true longGlobalBrightnessAuthority=false");
+-        }
++        final GLTexture extendedLinearHdr = previousNode.WorkingTexture;
+ 
+         float postDisplaySensorWhite = Math.max(
+                 1.0f, basePipeline.mParameters.motionV2DisplayGain);
+@@ -1304,10 +1274,6 @@ public final class MotionV2Render extends Node {
+                 try { iris26621LocalTone.close(); } catch (Throwable ignored) {}
+             }
+         }
+-        if (iris26662CanonicalHdrOwned != null) {
+-            try { iris26662CanonicalHdrOwned.close(); } catch (Throwable ignored) {}
+-            iris26662CanonicalHdrOwned = null;
+-        }
+ 
+         glProg.closed = true;
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 41e6ad75a1a924e4656a5dd0fe424c8f3c731c92..32ea365fcb943659dce1b6b3c753dd2d0914632b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -151,12 +151,8 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             }
+ 
+             ArrayList<Float> previewLuma = collectPreviewMidtones(preview);
+-            float referenceProtectionEv = iris26550Night ? 0.0f : clamp(
+-                    basePipeline.mParameters.motionV2ReferenceProtectionEv, 0.0f, 1.50f);
+-            float referenceRestoreGain = (float)Math.pow(2.0, referenceProtectionEv);
+             ArrayList<RgbSample> candidate = collectCandidateSamples(
+-                    previousNode.WorkingTexture, preview.getWidth(), preview.getHeight(),
+-                    referenceRestoreGain);
++                    previousNode.WorkingTexture, preview.getWidth(), preview.getHeight());
+             previewCount = previewLuma.size();
+             candidateCount = candidate.size();
+             if (previewCount < 32 || candidateCount < 32) {
+@@ -201,20 +197,10 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                         + " captureExposureWrite=false shortReferenceUnchanged=true"
+                         + " motionPresentationUnchanged=true preserveNightFeel=true viewfinderTarget=true");
+             } else {
+-                /* IRIS_26662_CANONICAL_REFERENCE_PRESENTATION_SOLVE
+-                 * Candidate samples above were restored by exactly 2^referenceProtectionEv before
+-                 * any viewfinder/tone decision. The matcher therefore returns to the proven 26660
+-                 * 65% presentation solve and must not add a second protection-EV residual. LONG
+-                 * remains shadow/SNR evidence only. */
++                /* Exact Motion behavior retained from 26549. */
+                 matchStrengthPercent = MOTION_FIXED_MATCH_STRENGTH_PERCENT;
+                 float matchStrength = matchStrengthPercent / 100.0f;
+                 solvedEv = clamp(rawSolvedEv * matchStrength, MIN_EV, MAX_EV);
+-                Log.i(Name, "IRIS_26662_CANONICAL_REFERENCE_PRESENTATION_SOLVE"
+-                        + " referenceProtectionEv=" + referenceProtectionEv
+-                        + " referenceRestoreGain=" + referenceRestoreGain
+-                        + " candidateMeterCanonicalized=true"
+-                        + " protectionResidualEvAdded=false"
+-                        + " longGlobalBrightnessAuthority=false");
+             }
+             float gain = (float)Math.pow(2.0, solvedEv);
+             if (!Float.isFinite(gain) || gain <= 0.0f) {
+@@ -327,10 +313,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     + " rawSolvedEv=" + rawSolvedEv
+                     + " matchStrengthPercent=" + matchStrengthPercent
+                     + " solvedEv=" + solvedEv
+-                    + " referenceProtectionEv="
+-                    + (iris26550Night ? 0.0f : basePipeline.mParameters.motionV2ReferenceProtectionEv)
+-                    + " referenceProtectionNormalizedBeforeTone=" + (!iris26550Night)
+-                    + " longGlobalBrightnessAuthority=false"
+                     + " cameraId=" + cameraIdForLog()
+                     + " brightnessTargetGain=" + gain
+                     + " meterToneAuthority=IRIS_26614_CANONICAL_SOURCE_DOMAIN finalHighlightAuthority=IRIS_26614_CANONICAL_SOURCE_DOMAIN"
+@@ -364,10 +346,6 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                                 + " rawSolvedEv=" + rawSolvedEv
+                                 + " matchStrengthPercent=" + matchStrengthPercent
+                                 + " solvedEv=" + solvedEv
+-                                + " referenceProtectionEv="
+-                                + (iris26550Night ? 0.0f : basePipeline.mParameters.motionV2ReferenceProtectionEv)
+-                                + " referenceProtectionNormalizedBeforeTone=" + (!iris26550Night)
+-                                + " longGlobalBrightnessAuthority=false"
+                                 + " cameraId=" + cameraIdForLog()
+                                 + " brightnessTargetGain=" + basePipeline.mParameters.motionV2DisplayGain
+                                 + " legacyRawGainAuthority=false"
+@@ -406,7 +384,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         return trimMiddle(luma, 0.25f, 0.50f);
+     }
+ 
+-    private ArrayList<RgbSample> collectCandidateSamples(GLTexture source, int previewW, int previewH, float referenceRestoreGain) {
++    private ArrayList<RgbSample> collectCandidateSamples(GLTexture source, int previewW, int previewH) {
+         int[] oldFramebuffer = new int[1];
+         GLTexture probe = null;
+         try {
+@@ -445,9 +423,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                 float r = fb.get(), g = fb.get(), b = fb.get();
+                 fb.get();
+                 if (Float.isFinite(r) && Float.isFinite(g) && Float.isFinite(b)) {
+-                    r = Math.max(0.0f, r) * referenceRestoreGain;
+-                    g = Math.max(0.0f, g) * referenceRestoreGain;
+-                    b = Math.max(0.0f, b) * referenceRestoreGain;
++                    r = Math.max(0.0f, r); g = Math.max(0.0f, g); b = Math.max(0.0f, b);
+                     float y = luma(r, g, b);
+                     if (y > 1.0e-4f && y < 8.0f) {
+                         all.add(new RgbSample(r, g, b));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 1a964507307b8504eb31c66fad96ca773693a5e5..2b6e5702b9a384153578dfd0a310a17e9e63e11d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -147,24 +147,14 @@ object PhotonMotionMgc1271Bridge {
+                     orderedPhysical += frame to role
+                 }
+             }
+-            /* IRIS_26674_PROTECTED_NORMAL_REFERENCE_HANDOFF
+-             * Preserve the successful-26673 NORMAL-master schedule, including isolated final
+-             * HIGHLIGHT_SHORT and fixed +2.5 EV SHADOW_LONG. The only restored 26661/26662
+-             * responsibility here is the immutable reference-protection EV carried by the selected
+-             * NORMAL reference into FLOAT-domain normalization/presentation. */
++            /* 26660 Sabre requires HIGHLIGHT_SHORT to be the final scheduled auxiliary frame. */
+             longFrame?.let { orderedPhysical += it to RawBurstFrameRole.SHADOW_LONG }
+             shortFrame?.let { orderedPhysical += it to RawBurstFrameRole.HIGHLIGHT_SHORT }
+-            parameters.motionV2ReferenceProtectionEv = if (parameters.irisNightActive) {
+-                0.0f
+-            } else {
+-                reference.motionV2ReferenceProtectionEv.coerceIn(0.0f, 1.50f)
+-            }
+-            PLog.i(TAG, "IRIS_26674_PROTECTED_NORMAL_REFERENCE_HANDOFF " +
++            PLog.i(TAG, "IRIS_26670_26660_NORMAL_MASTER_HDR_SCHEDULE " +
+                 "night=${parameters.irisNightActive} referenceTimestamp=${mgcBase.timestamp} " +
+                 "referenceFromOwnedZsl=${!parameters.irisNightActive} shadowLong=${longFrame != null} " +
+                 "highlightShort=${shortFrame != null} shortFinal=${shortFrame == null || orderedPhysical.last().second == RawBurstFrameRole.HIGHLIGHT_SHORT} " +
+-                "referenceProtectionEv=${parameters.motionV2ReferenceProtectionEv} " +
+-                "normalTemporalOwner=true shortTemporalOwner=false longGlobalBrightnessAuthority=false")
++                "normalTemporalOwner=true shortTemporalOwner=false")
+ 
+             orderedPhysical.forEachIndexed { index, (frame, role) ->
+                 validateFrame(frame, size, role, reference.motionV2ExposureEnergy, index)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index c71202436e3c9e6d684ff445253e8a837edb39b5..b5c0064e0e13c4b9bd504a08d54ecae6cf5d4a78 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -56,11 +56,6 @@ public class Parameters {
+      * Scene brightness normalization applied only after temporal Bayer fusion + RCD.
+      */
+     public float motionV2DisplayGain = 1.0f;
+-    /* IRIS_26661_GOOGLE_REFERENCE_PRESENTATION_HANDOFF
+-     * Positive magnitude of deliberate capture underexposure on the selected Motion reference.
+-     * It is presentation metadata only: RAW/Sabre/DNG/long-frame exposure ratios never consume it.
+-     */
+-    public float motionV2ReferenceProtectionEv = 0.0f;
+     /* IRIS_26582_SCENE_ADAPTIVE_GLOBAL_TONE_STATE
+      * Decision-only presentation state produced by MotionV2ViewfinderExposureMatcher from its
+      * existing low-resolution candidate probe. No RAW/capture/DNG owner consumes these fields.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 85757b3e89c041434fe6fc6d0bf834c8a544f95a..e5c06dd08323f04cd496fa9183a74b81ab390ecf 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -165,13 +165,11 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     private ManualModeConsoleImpl iris26670ManualConsoleOwner;
+     private Observer iris26670ManualModeObserver;
+     private IrisManualSliderView iris26670ManualSlider;
+-    /* IRIS_26674_SINGLE_MANUAL_GEOMETRY_OWNER
+-     * Exactly one runtime owner may write the Focus/Shutter/ISO/EV row vertical translation.
+-     * The measured row position is frozen for this Fragment/layout instance; open/close is
+-     * visibility/alpha only and never changes panel/slider/chevron geometry. */
+-    private boolean iris26674ManualMidpointEstablished = false;
+-    private float iris26674ManualFixedRowTranslationY = Float.NaN;
+-    private android.view.ViewTreeObserver.OnPreDrawListener iris26674ManualPreDrawListener = null;
++    /* IRIS_26673_MANUAL_FIXED_MIDPOINT_STATE
++     * Establish once from the exact successful-26672 final visible geometry for this Fragment
++     * instance. Chevron show/hide never recalculates or changes the row's vertical position. */
++    private boolean iris26673ManualMidpointEstablished = false;
++    private float iris26673ManualFixedRowTranslationY = Float.NaN;
+     public float displayAspectRatio;
+     private boolean iris26562DeferredForegroundReset = false;
+     private HorizonIndicatorView mHorizonIndicatorView;
+@@ -450,94 +448,57 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                 + " legacyResumeSkipped=true sliderReasserted=true");
+     }
+ 
+-    /* IRIS_26674_SINGLE_MANUAL_GEOMETRY_OWNER
+-     * Measure the actual laid-out slider outer bottom, current row center, and activated-chevron
+-     * visible upper tip. Move only buttons_container via translationY exactly once. No runtime
+-     * margin edit and no manual_mode/slider/chevron translation is permitted. */
+-    private boolean iris26674EstablishManualRowMidpoint(View panel) {
+-        if (activity == null || panel == null) return false;
++    /* IRIS_26673_MANUAL_FIXED_MIDPOINT_FROM_26672_VISIBLE_GEOMETRY
++     * Successful 26672 is the baseline. Its final visible state has manual_mode translationY=0
++     * after the older 26670 visibility animation, while the 26672 buttons_container top-margin
++     * correction remains applied. Recreate that exact final coded state first, then move ONLY the
++     * button row from that current 26672 center to the measured midpoint between the slider's
++     * visible outer bottom border and the activated chevron's visible upper tip. The slider and
++     * chevron never move. Show/hide changes alpha/visibility only; this row translation persists.
++     */
++    private void iris26673FixManualRowAtMeasuredMidpoint(View panel) {
++        if (activity == null || panel == null) return;
+         final View slider = activity.findViewById(R.id.irisManualSliderContainer);
+         final View buttons = activity.findViewById(R.id.buttons_container);
+         final View chevron = activity.findViewById(R.id.approved_manual_chevron);
+-        if (slider == null || buttons == null || chevron == null) return false;
+-        if (iris26674ManualMidpointEstablished) return true;
+-        if (!slider.isLaidOut() || !buttons.isLaidOut() || !chevron.isLaidOut()
+-                || slider.getHeight() <= 0 || buttons.getHeight() <= 0 || chevron.getHeight() <= 0) {
+-            return false;
++        if (slider == null || buttons == null || chevron == null || slider.getHeight() <= 0
++                || buttons.getHeight() <= 0 || chevron.getHeight() <= 0) return;
++        if (iris26673ManualMidpointEstablished) {
++            // Position was established from successful-26672 geometry already; toggling visibility
++            // must never recalculate or shift the row.
++            return;
+         }
+ 
++        // This is the exact successful-26672 FINAL VISIBLE parent position after its stale owner ran.
+         panel.setTranslationY(0.0f);
+-        buttons.setTranslationY(0.0f);
++        final int[] panelWindow = new int[2];
+         final int[] sliderWindow = new int[2];
+-        final int[] buttonsWindow = new int[2];
+         final int[] chevronWindow = new int[2];
++        panel.getLocationInWindow(panelWindow);
+         slider.getLocationInWindow(sliderWindow);
+-        buttons.getLocationInWindow(buttonsWindow);
+         chevron.getLocationInWindow(chevronWindow);
+ 
+-        final float rowCenterBeforeY = buttonsWindow[1] + 0.5f * buttons.getHeight();
++        final float current26672RowCenterY = panelWindow[1] + buttons.getTop()
++                + 0.5f * buttons.getHeight();
+         final float sliderOuterBottomY = sliderWindow[1] + slider.getHeight();
+         final float density = getResources().getDisplayMetrics().density;
+-        // Drawable geometry: the activated 180-degree V upper tip is 0.34h from ImageView top.
+-        // Include half of the existing 3.75dp outline to measure the visible rather than path edge.
++        // 26672 chevron path: closed V tip is 0.66h; after 180-degree activation it is 0.34h.
++        // Include half of the existing 3.75dp dark outline so this is the visible upper tip.
+         final float activatedChevronVisibleTopY = chevronWindow[1] + 0.34f * chevron.getHeight()
+                 - 1.875f * density;
+         final float targetCenterY = 0.5f * (sliderOuterBottomY + activatedChevronVisibleTopY);
+-        final float fixedTranslationY = targetCenterY - rowCenterBeforeY;
++        final float fixedTranslationY = targetCenterY - current26672RowCenterY;
+         buttons.setTranslationY(fixedTranslationY);
+-        iris26674ManualFixedRowTranslationY = fixedTranslationY;
+-        iris26674ManualMidpointEstablished = true;
+-        Log.i(TAG, "IRIS_26674_MANUAL_GEOMETRY_OWNER"
+-                + " sliderBottomY=" + sliderOuterBottomY
+-                + " chevronOpenTipY=" + activatedChevronVisibleTopY
+-                + " rowCenterBeforeY=" + rowCenterBeforeY
++        iris26673ManualFixedRowTranslationY = fixedTranslationY;
++        iris26673ManualMidpointEstablished = true;
++        Log.i(TAG, "IRIS_26673_MANUAL_FIXED_MIDPOINT baseline=current26672FinalVisible"
++                + " current26672RowCenterY=" + current26672RowCenterY
++                + " sliderOuterBottomY=" + sliderOuterBottomY
++                + " activatedChevronVisibleTopY=" + activatedChevronVisibleTopY
+                 + " targetCenterY=" + targetCenterY
+                 + " fixedRowTranslationY=" + fixedTranslationY
+                 + " panelTranslationY=" + panel.getTranslationY()
+-                + " sliderMoved=false chevronMoved=false topMarginWrite=false"
+-                + " ownerEstablished=true");
+-        return true;
+-    }
+-
+-    private void iris26674RevealManualPanelWhenGeometryReady(
+-            View panel, ManualModeModel model) {
+-        if (activity == null || panel == null || model == null) return;
+-        if (!model.isManualPanelVisible() || panel.getVisibility() != View.VISIBLE) return;
+-        if (iris26674EstablishManualRowMidpoint(panel)) {
+-            final View buttons = activity.findViewById(R.id.buttons_container);
+-            final float rowNow = buttons == null ? Float.NaN : buttons.getTranslationY();
+-            Log.i(TAG, "IRIS_26674_MANUAL_VISIBILITY_INVARIANCE"
+-                    + " state=visible fixedRowTranslationY=" + iris26674ManualFixedRowTranslationY
+-                    + " rowTranslationBefore=" + rowNow + " rowTranslationAfter=" + rowNow
+-                    + " panelTranslationY=" + panel.getTranslationY() + " positionChanged=false");
+-            panel.animate().alpha(1.0f).setDuration(100).start();
+-            return;
+-        }
+-        if (iris26674ManualPreDrawListener != null) return;
+-        iris26674ManualPreDrawListener = () -> {
+-            if (activity == null || !model.isManualPanelVisible()
+-                    || panel.getVisibility() != View.VISIBLE) {
+-                if (panel.getViewTreeObserver().isAlive()) {
+-                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26674ManualPreDrawListener);
+-                }
+-                iris26674ManualPreDrawListener = null;
+-                return true;
+-            }
+-            if (!iris26674EstablishManualRowMidpoint(panel)) return true;
+-            if (panel.getViewTreeObserver().isAlive()) {
+-                panel.getViewTreeObserver().removeOnPreDrawListener(iris26674ManualPreDrawListener);
+-            }
+-            iris26674ManualPreDrawListener = null;
+-            final View buttons = activity.findViewById(R.id.buttons_container);
+-            final float rowNow = buttons == null ? Float.NaN : buttons.getTranslationY();
+-            Log.i(TAG, "IRIS_26674_MANUAL_VISIBILITY_INVARIANCE"
+-                    + " state=visible-preDraw fixedRowTranslationY=" + iris26674ManualFixedRowTranslationY
+-                    + " rowTranslationBefore=" + rowNow + " rowTranslationAfter=" + rowNow
+-                    + " panelTranslationY=" + panel.getTranslationY() + " positionChanged=false");
+-            panel.animate().alpha(1.0f).setDuration(100).start();
+-            return true;
+-        };
+-        panel.getViewTreeObserver().addOnPreDrawListener(iris26674ManualPreDrawListener);
++                + " sliderMoved=false chevronMoved=false rowPositionPersistent=true");
+     }
+ 
+     private void iris26670ApplyManualPresentationState(
+@@ -572,19 +533,23 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                 && panel != null) {
+             final boolean visible = model.isManualPanelVisible();
+             panel.animate().cancel();
+-            // IRIS_26674_MANUAL_VISIBILITY_ONLY_OWNER: parent position is permanently zero.
++            // IRIS_26673_MANUAL_VISIBILITY_ONLY_OWNER: never move the panel or the centered row.
++            // Successful 26672's visible parent position is translationY=0; retain it in both states.
+             panel.setTranslationY(0.0f);
+             if (visible) {
+-                panel.animate().cancel();
+                 panel.setAlpha(0.0f);
+                 panel.setVisibility(View.VISIBLE);
+-                panel.post(() -> iris26674RevealManualPanelWhenGeometryReady(panel, model));
++                panel.post(() -> {
++                    if (!model.isManualPanelVisible() || panel.getVisibility() != View.VISIBLE) return;
++                    if (!iris26673ManualMidpointEstablished) {
++                        iris26673FixManualRowAtMeasuredMidpoint(panel);
++                    }
++                    Log.i(TAG, "IRIS_26673_MANUAL_VISIBLE_STATIONARY established="
++                            + iris26673ManualMidpointEstablished + " fixedRowTranslationY="
++                            + iris26673ManualFixedRowTranslationY);
++                    panel.animate().alpha(1.0f).setDuration(100).start();
++                });
+             } else {
+-                if (iris26674ManualPreDrawListener != null
+-                        && panel.getViewTreeObserver().isAlive()) {
+-                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26674ManualPreDrawListener);
+-                    iris26674ManualPreDrawListener = null;
+-                }
+                 final View buttons = activity.findViewById(R.id.buttons_container);
+                 final float rowTranslationBeforeHide = buttons == null ? Float.NaN : buttons.getTranslationY();
+                 panel.animate().alpha(0.0f).setDuration(100)
+@@ -593,12 +558,10 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                             panel.setVisibility(View.GONE);
+                             final float rowTranslationAfterHide = buttons == null
+                                     ? Float.NaN : buttons.getTranslationY();
+-                            Log.i(TAG, "IRIS_26674_MANUAL_VISIBILITY_INVARIANCE"
+-                                    + " state=hidden fixedRowTranslationY=" + iris26674ManualFixedRowTranslationY
+-                                    + " rowTranslationBefore=" + rowTranslationBeforeHide
+-                                    + " rowTranslationAfter=" + rowTranslationAfterHide
+-                                    + " panelTranslationY=" + panel.getTranslationY()
+-                                    + " positionChanged=" + (Float.compare(rowTranslationBeforeHide, rowTranslationAfterHide) != 0));
++                            Log.i(TAG, "IRIS_26673_MANUAL_HIDDEN_STATIONARY panelTranslationY="
++                                    + panel.getTranslationY() + " rowTranslationBeforeHide="
++                                    + rowTranslationBeforeHide + " rowTranslationAfterHide="
++                                    + rowTranslationAfterHide);
+                         }).start();
+             }
+         }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 0e6100fd7bfd78d59b16e20872ed89e6d8c35fd3..8c76a88cdd73ce47d31e5cbe76ca9b25f85f85a6 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -252,6 +252,7 @@ public class CameraUIViewImpl implements CameraUIView {
+         iris26644StyleManualPalette(root);
+         View approvedManualHandle = root.findViewById(R.id.approved_manual_handle);
+         ImageView approvedManualChevron = root.findViewById(R.id.approved_manual_chevron);
++        iris26672CenterManualModeRowFromCurrent26671Geometry(root, approvedManualChevron);
+         if (approvedManualHandle != null && approvedManualChevron != null) {
+             approvedManualChevron.setImageDrawable(iris26648CreateManualChevronDrawable(approvedManualChevron));
+             approvedManualHandle.setOnClickListener(v -> {
+@@ -272,6 +273,63 @@ public class CameraUIViewImpl implements CameraUIView {
+         refreshFormatStatus();
+     }
+ 
++    /* IRIS_26672_MANUAL_ROW_CURRENT_26671_MIDPOINT_OWNER
++     * The successful 26671 on-screen geometry is the baseline, including its existing +12px
++     * manual-panel translation. Do not remove or reinterpret that translation. Instead derive the
++     * delta that places the Focus/Shutter/ISO/EV row center halfway between the current slider
++     * bottom and the upper point of the chevron after its 180-degree open rotation. Increase the
++     * row's top margin by that delta and increase the panel translation by the same delta: the
++     * slider remains at its exact 26671 visual position while only the revealed mode row moves.
++     * All calculations use inflated pixel dimensions, so density/device scaling stays geometric.
++     */
++    private void iris26672CenterManualModeRowFromCurrent26671Geometry(View root, ImageView chevron) {
++        if (root == null || chevron == null) return;
++        final View manualMode = root.findViewById(R.id.manual_mode);
++        final View slider = root.findViewById(R.id.irisManualSliderContainer);
++        final View buttons = root.findViewById(R.id.buttons_container);
++        final View stack = root.findViewById(R.id.manual_toggle_stack);
++        if (manualMode == null || slider == null || buttons == null || stack == null) return;
++        if (!(manualMode.getLayoutParams() instanceof android.view.ViewGroup.MarginLayoutParams) ||
++                !(buttons.getLayoutParams() instanceof android.widget.RelativeLayout.LayoutParams)) return;
++
++        final int sliderHeight = slider.getLayoutParams().height;
++        final int rowHeight = buttons.getLayoutParams().height;
++        final int stackHeight = stack.getLayoutParams().height;
++        final int chevronHeight = chevron.getLayoutParams().height;
++        final int bottomMargin = ((android.view.ViewGroup.MarginLayoutParams)
++                manualMode.getLayoutParams()).bottomMargin;
++        if (sliderHeight <= 0 || rowHeight <= 0 || stackHeight <= 0 || chevronHeight <= 0) return;
++
++        final float current26671TranslationPx = manualMode.getTranslationY();
++        final float currentSliderBottomFromStackTop =
++                -bottomMargin - rowHeight + current26671TranslationPx;
++        final float currentRowCenterFromStackTop =
++                -bottomMargin - rowHeight * 0.5f + current26671TranslationPx;
++        // Chevron source path uses its lower vertex at 0.66h. A 180-degree open rotation places
++        // that vertex at 0.34h from the ImageView top, which is the requested upper point.
++        final float openChevronUpperPointFromStackTop =
++                (stackHeight - chevronHeight) * 0.5f + 0.34f * chevronHeight;
++        final float desiredCenterFromStackTop =
++                0.5f * (currentSliderBottomFromStackTop + openChevronUpperPointFromStackTop);
++        final int deltaPx = Math.round(desiredCenterFromStackTop - currentRowCenterFromStackTop);
++        if (deltaPx <= 0) {
++            Log.i(TAG, "IRIS_26672_MANUAL_ROW_MIDPOINT deltaPx=" + deltaPx
++                    + " baselineTranslationPx=" + current26671TranslationPx
++                    + " applied=false");
++            return;
++        }
++
++        android.widget.RelativeLayout.LayoutParams rowLp =
++                (android.widget.RelativeLayout.LayoutParams) buttons.getLayoutParams();
++        rowLp.topMargin += deltaPx;
++        buttons.setLayoutParams(rowLp);
++        manualMode.setTranslationY(current26671TranslationPx + deltaPx);
++        Log.i(TAG, "IRIS_26672_MANUAL_ROW_MIDPOINT deltaPx=" + deltaPx
++                + " baselineTranslationPx=" + current26671TranslationPx
++                + " finalTranslationPx=" + manualMode.getTranslationY()
++                + " sliderCurrent26671PositionPreserved=true geometricMidpoint=true");
++    }
++
+     /* IRIS_26553_SHUTTER_BASELINE_ANIMATION_OWNER
+      * Still modes deliberately draw the shutter at 0.83 inside the persistent outer ring. The
+      * generic press animation previously restored every View to 1.0, enlarging Motion/Night after
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index d49d60e8d95fac68837acc4dc4f6a0781d1813fa..dac85805944b94bc7a2080291f1d4ed8d9104f40 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -11,7 +11,6 @@ import com.particlesdevs.photoncamera.util.Log;
+ import androidx.annotation.NonNull;
+ 
+ import com.particlesdevs.photoncamera.app.PhotonCamera;
+-import com.particlesdevs.photoncamera.capture.CaptureController;
+ 
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+@@ -39,10 +38,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     private volatile boolean mMirrorPreview;
+     /* IRIS_26524_PREVIEW_RESIDUAL_ZOOM */
+     private volatile float mSoftwareZoom = 1.0f;
+-    /* IRIS_26667_FRAME_EXACT_PREVIEW_PRESENTATION_STATE
+-     * Keep only the last exact Camera2-result protection value. No second presentation slew is
+-     * permitted; metadata misses hold the last exact value. */
+-    private float mIris26663LastConfirmedProtectionEv = 0.0f;
+ 
+     private final GLPreview mView;
+ 
+@@ -76,21 +71,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         GLES20.glUniform1i(enablePeak, PhotonCamera.getSettings().focusPeak);
+         GLES20.glUniform1i(mirror, mMirrorPreview ? 1 : 0);
+         GLES20.glUniform1f(irisSoftwareZoom, mSoftwareZoom);
+-        /* IRIS_26667_FRAME_EXACT_PREVIEW_PRESENTATION
+-         * Preserve 26662 timestamp matching and 26663 hold-on-miss, with no additional display
+-         * slew. Compensation changes only when an exact Camera2 result for the displayed frame
+-         * proves the protection EV. */
+-        CaptureController iris26663Controller = PhotonCamera.getCaptureController();
+-        if (iris26663Controller != null && iris26553FrameTimestamp > 0L) {
+-            float exactEv = iris26663Controller.getMotion26663ReferencePreviewProtectionEv(
+-                    iris26553FrameTimestamp);
+-            if (Float.isFinite(exactEv)) {
+-                mIris26663LastConfirmedProtectionEv = Math.max(0.0f, exactEv);
+-            }
+-        }
+-        float iris26667PreviewGain = (float) Math.pow(2.0,
+-                Math.max(0.0f, mIris26663LastConfirmedProtectionEv));
+-        GLES20.glUniform1f(iris26662ReferencePreviewGain, iris26667PreviewGain);
+ 
+         GLES20.glVertexAttribPointer(vPosition, 2, GLES20.GL_FLOAT, false, 4 * 2, pVertex);
+         GLES20.glVertexAttribPointer(vTexCoord, 2, GLES20.GL_FLOAT, false, 4 * 2, pTexCoord);
+@@ -113,7 +93,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+     private int enablePeak;
+     private int mirror;
+     private int irisSoftwareZoom;
+-    private int iris26662ReferencePreviewGain;
+     @Override
+     public void onSurfaceCreated(GL10 gl, EGLConfig config) {
+         initTex();
+@@ -139,7 +118,6 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         enablePeak = GLES20.glGetUniformLocation(hProgram, "enablePeak");
+         mirror = GLES20.glGetUniformLocation(hProgram, "mirror");
+         irisSoftwareZoom = GLES20.glGetUniformLocation(hProgram, "irisSoftwareZoom");
+-        iris26662ReferencePreviewGain = GLES20.glGetUniformLocation(hProgram, "iris26662ReferencePreviewGain");
+         GLES20.glVertexAttribPointer(vPosition, 2, GLES20.GL_FLOAT, false, 4 * 2, pVertex);
+         GLES20.glVertexAttribPointer(vTexCoord, 2, GLES20.GL_FLOAT, false, 4 * 2, pTexCoord);
+         GLES20.glEnableVertexAttribArray(vPosition);
+diff --git a/app/version.properties b/app/version.properties
+index 44a8074927ed3401672dd9a01b3a09be76f37933..ae61bb7f4dc35ddd0541edaf0fade0f5ef18c365 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726674
+-VERSION_BUILD=26674
++VERSION_NAME=0.9726673
++VERSION_BUILD=26673
