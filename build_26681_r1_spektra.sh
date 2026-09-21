@@ -116,7 +116,7 @@ PY2
 verify_scope(){
  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed 26681 candidate; exact 49 runtime paths / 12 modified / 37 added / 0 deleted from successful 26680 compiled authority)"; return; fi
  [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
- [[ "$(git rev-parse HEAD^)" == "$UPLOAD_PARENT_COMMIT" ]] || fail "26681 parent must be exact successful 26680 R1 commit ${UPLOAD_PARENT_COMMIT}"
+ git merge-base --is-ancestor "$UPLOAD_PARENT_COMMIT" HEAD || fail "exact successful 26680 R1 commit ${UPLOAD_PARENT_COMMIT} must be an ancestor of 26681 handoff HEAD"
  [[ "$(git rev-parse "${MECHANICS_AUTHORITY_COMMIT}:build_26680_r1_stable_preview.sh")" == "$AUTH_26680_BUILD_SCRIPT_BLOB" ]] || fail "successful 26680 build-script blob changed"
  [[ "$(git rev-parse "${MECHANICS_AUTHORITY_COMMIT}:.github/workflows/build-26680-r1-stable-preview.yml")" == "$AUTH_26680_WORKFLOW_BLOB" ]] || fail "successful 26680 workflow blob changed"
  git diff --name-only "$UPLOAD_PARENT_COMMIT"..HEAD | sort > "$WORK/actual_upload_scope.txt"; sort "$UPLOADS" > "$WORK/expected_upload_scope.txt"; diff -u "$WORK/expected_upload_scope.txt" "$WORK/actual_upload_scope.txt" || fail "26681 upload scope mismatch"

@@ -31,6 +31,11 @@ assert gradle==[
 # Successful 26680 Actions/toolchain layout preserved.
 for x in ['actions/checkout@v5','actions/setup-java@v5','distribution: temurin',"java-version: '17'",'actions/setup-python@v5',"python-version: '3.12'",'bash build_26681_r1_spektra.sh','actions/upload-artifact@v4','runs-on: ubuntu-24.04']:
  assert x in wf,x
+# Split-upload provenance repair: exact successful 26680 remains ancestry authority while
+# cumulative upload scope from that authority to HEAD must remain exact. This changes no build stage.
+assert 'git merge-base --is-ancestor "$UPLOAD_PARENT_COMMIT" HEAD' in build
+assert 'git diff --name-only "$UPLOAD_PARENT_COMMIT"..HEAD' in build
+assert 'git rev-parse HEAD^' not in build
 # Runtime authority and mechanics authority are exact successful 26680 R1.
 for x in [
 'RUNTIME_AUTHORITY_COMMIT="e4a4cc41d56d3773872aae33ba69e87aea86d0ae"',
@@ -52,4 +57,4 @@ assert build.find('export IRIS26681_SPEKTRA_GLSLANG="$compiler"') < build.find("
 pv=Path(Path(sys.argv[1]).parent/'verify_26681_patches.py').read_text()
 for x in ["('7','12','40')", "'--binary','--full-index','--no-ext-diff'", "'git','apply','--check'", "'git','add','-A','app'"]:
  assert x in pv,x
-print('PASS 26681 infrastructure: successful 26680 R1 compiler/build order retained; explicit extensions limited to Spektra shader/source verification and additions-aware canonical patch representation')
+print('PASS 26681 infrastructure: successful 26680 R1 compiler/build order retained; exact-26680 ancestry + exact cumulative upload scope; extensions limited to Spektra shader/source verification and additions-aware canonical patch representation')
