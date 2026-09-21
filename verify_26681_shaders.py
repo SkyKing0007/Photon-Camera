@@ -31,13 +31,14 @@ def expand(rel):
  return '#version 310 es\n#line 1\n'+'\n'.join(out)+'\n'
 variants={f'local_{Path(rel).stem}.{"comp" if Path(rel).name in compute else "frag"}':expand(rel) for rel in new}
 expected=readm(R/'R1_26681_RUNTIME_EXPANDED_SHADERS.sha256');assert len(expected)==14 and set(expected)==set(variants)
+builtin_shadow=set('imageSize all any texture textureSize texelFetch imageLoad imageStore mix clamp min max abs exp log pow dot cross normalize length distance reflect refract step smoothstep floor ceil round fract mod sqrt inversesqrt sin cos tan asin acos atan matrixCompMult outerProduct transpose determinant inverse lessThan lessThanEqual greaterThan greaterThanEqual equal notEqual'.split())
 reserved=set("attribute const uniform varying buffer shared coherent volatile restrict readonly writeonly atomic_uint layout centroid flat smooth noperspective patch sample break continue do for while switch case default if else subroutine in out inout float double int void bool true false invariant precise discard return mat2 mat3 mat4 dmat2 dmat3 dmat4 vec2 vec3 vec4 ivec2 ivec3 ivec4 bvec2 bvec3 bvec4 dvec2 dvec3 dvec4 uint uvec2 uvec3 uvec4 lowp mediump highp precision struct common partition active asm class union enum typedef template this resource goto inline noinline public static extern external interface long short half fixed unsigned superp input output hvec2 hvec3 hvec4 fvec2 fvec3 fvec4 filter sizeof cast namespace using row_major gl_PerVertex".split())
 typepat=r'(?:float|double|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234](?:x[234])?|sampler\w*|[iu]?image\w*|atomic_uint|void)'
 def scan(name,s):
  clean=re.sub(r'/\*.*?\*/',' ',s,flags=re.S);clean=re.sub(r'//.*',' ',clean)
  ids=re.findall(r'\b'+typepat+r'\s+([A-Za-z_]\w*)\b',clean)+re.findall(r'\bstruct\s+([A-Za-z_]\w*)\b',clean)
- bad=sorted(set(ids)&reserved);impl=sorted(set(x for x in ids if '__' in x or x.startswith('gl_')))
- if bad or impl:raise SystemExit(f'FAIL {name} reserved={bad} impl={impl}')
+ bad=sorted(set(ids)&reserved);builtin=sorted(set(ids)&builtin_shadow);impl=sorted(set(x for x in ids if '__' in x or x.startswith('gl_')))
+ if bad or builtin or impl:raise SystemExit(f'FAIL {name} reserved={bad} builtin_shadow={builtin} impl={impl}')
  if clean.count('{')!=clean.count('}'):raise SystemExit('FAIL braces '+name)
  if '#import' in clean:raise SystemExit('FAIL unresolved import '+name)
 for name,s in variants.items():

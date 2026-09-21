@@ -97,4 +97,12 @@ for p in [
 bsh={str(p.relative_to(base)) for p in (base/'app/src/main/assets/shaders').rglob('*') if p.is_file()}
 csh={str(p.relative_to(cand)) for p in (cand/'app/src/main/assets/shaders').rglob('*') if p.is_file()}
 assert len(bsh)==257 and len(csh)==271 and bsh <= csh and len(csh-bsh)==14
+
+# 26681 real glslang 16.5.0 failure regression: GLSL built-in function names may not be redeclared.
+chroma=(cand/'app/src/main/assets/shaders/spektra/chroma_denoise.glsl').read_text()
+rawproc=(cand/'app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java').read_text()
+lpf=(cand/'app/src/main/assets/shaders/spektra/rcd26498_lpf.glsl').read_text()
+assert 'uniform ivec2 InputSize;' in chroma and 'uniform ivec2 imageSize;' not in chroma
+assert 'p.setVar("InputSize", rawSize);' in rawproc and 'p.setVar("imageSize", rawSize);' not in rawproc
+assert 'float allTrusted=' in lpf and 'float all=' not in lpf
 print('PASS 26681 regressions: 26680 stable-preview/shutter/HDR owners hardlocked; Spektra delegates before legacy mutation; only 14 shader additions')

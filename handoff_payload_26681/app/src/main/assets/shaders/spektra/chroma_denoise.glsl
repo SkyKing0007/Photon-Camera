@@ -1,6 +1,6 @@
 precision highp float; precision highp sampler2D;
-uniform sampler2D InputRgb; uniform ivec2 imageSize; uniform float strength; out vec4 Output;
-ivec2 clp(ivec2 p){return clamp(p,ivec2(0),imageSize-ivec2(1));}
+uniform sampler2D InputRgb; uniform ivec2 InputSize; uniform float strength; out vec4 Output;
+ivec2 clp(ivec2 p){return clamp(p,ivec2(0),InputSize-ivec2(1));}
 float lum(vec3 v){return dot(v,vec3(0.2126,0.7152,0.0722));}
 /* Single-frame luma-guided chroma-only denoise. Luma is exactly restored from the
  * center pixel; strength=0.75 is the audited saved-photo factory setting. */

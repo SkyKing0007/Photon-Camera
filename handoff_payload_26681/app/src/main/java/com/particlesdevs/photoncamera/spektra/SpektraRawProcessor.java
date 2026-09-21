@@ -159,7 +159,7 @@ public final class SpektraRawProcessor {
                         null, GL_LINEAR, GL_CLAMP_TO_EDGE);
                 p.useAssetProgram("spektra/chroma_denoise");
                 p.setTexture("InputRgb", linear);
-                p.setVar("imageSize", rawSize);
+                p.setVar("InputSize", rawSize);
                 p.setVar("strength", SAVED_CHROMA_DENOISE_STRENGTH);
                 p.drawBlocks(denoised);
                 linear.close();
