@@ -1,0 +1,357 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 6c4fb6e1f302f6393eee7da692f3e19139f173e6..70954590ed104a551445b2304d73924ce84d01b3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -820,20 +820,15 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 /* updateMotionV2ExposureAuthority(result); intentionally dormant */
+                 /* updateMotion26368AdaptiveAeBias(result); intentionally dormant */
+                 /*
+-                 * IRIS_26680_SCENE_INDEPENDENT_STABLE_PREVIEW_OWNER
++                 * IRIS_26661_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+                  *
+-                 * HAL AE/AWB owns initial 3A convergence. Once the phone is physically stationary,
+-                 * latch the settled HAL state so TV content, subject motion and periodic lighting
+-                 * cannot keep rewriting global exposure/color. Sustained device motion releases
+-                 * the latch for a genuine new composition; the old RAW-reactive 26662 AE writer
+-                 * remains below only as dormant historical code.
++                 * Keep HAL AE as the live controller, but give the Motion ZSL RAW group one
++                 * slowly-changing NEGATIVE-only AE-compensation offset when fresh RAW evidence
++                 * proves HDR/highlight pressure. This is the only active Motion AE writer.
++                 * The controller debiases its own RAW guide before solving the next target, so
++                 * its protection cannot oscillate merely because the previous offset worked.
+                  */
+-                /* IRIS_26680_SCENE_INDEPENDENT_STABLE_PREVIEW_OWNER
+-                 * Retire the continuously RAW-reactive 26662 compensation writer from production.
+-                 * HAL 3A converges, then 26680 latches it until physical camera motion proves an
+-                 * actual reframe. TV/subject/flicker content is never an exposure/WB unlock signal. */
+-                updateMotion26680StablePreviewAuthority(result);
+-                /* updateMotion26662GoogleReferenceExposureAuthority(result); intentionally dormant */
++                updateMotion26662GoogleReferenceExposureAuthority(result);
+             }
+             if (mTemp != null) mPreviewTemp = mTemp;
+             if (mPreviewTemp == null) {
+@@ -1700,25 +1695,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             new float[MOTION_26662_PREVIEW_RESULT_HISTORY];
+     private int mMotion26662PreviewResultWriteIndex = 0;
+ 
+-    /* IRIS_26680_SCENE_INDEPENDENT_STABLE_PREVIEW_OWNER
+-     * HAL AE/AWB may converge while the physical camera is being reframed, then Iris latches
+-     * those HAL decisions once the phone is physically stationary. Scene-content motion (TV,
+-     * people, foliage, periodic LEDs) is deliberately not an unlock signal. Only sustained device
+-     * motion can release the latch for a real reframe. No manual shutter/ISO authority is added. */
+-    private static final int MOTION_26680_STABLE_CONFIRM_FRAMES = 6;
+-    private static final int MOTION_26680_FORCE_LATCH_FRAMES = 15;
+-    private static final int MOTION_26680_REFRAME_GYRO_THRESHOLD = 70;
+-    private static final int MOTION_26680_REFRAME_CONFIRM_FRAMES = 3;
+-    private static final double MOTION_26680_STABLE_ENERGY_EV = 0.20;
+-    private boolean mMotion26680PreviewLatched = false;
+-    private boolean mMotion26680AeLockApplied = false;
+-    private boolean mMotion26680AwbLockApplied = false;
+-    private int mMotion26680StableFrames = 0;
+-    private int mMotion26680StationaryFrames = 0;
+-    private int mMotion26680ReframeMotionFrames = 0;
+-    private double mMotion26680LastExposureEnergy = Double.NaN;
+-    private long mMotion26680LatchGeneration = -1L;
+-
+     /*
+      * IRIS_26662_FRAME_MATCHED_PREVIEW_PROTECTION
+      * Preview compensation must describe the exposure of the SurfaceTexture frame being drawn,
+@@ -2209,15 +2185,16 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return out[3] > 0.0f;
+     }
+ 
+-    /* IRIS_26680_FLICKER_OBSERVER_ONLY_PREVIEW
+-     * 26679 device evidence proved that transient TV/LED/motion row evidence could drive visible
+-     * preview pulsation. Keep the 26678 detector for diagnostics, but never let it alter displayed
+-     * pixels. Physical anti-banding remains Camera2/HAL-owned. */
++    /* Active preview path consumes this only after the existing 26662/26667 WYSIWYG owner. */
+     public boolean getMotion26678PreviewFlicker(long sensorTimestampNs, @NonNull float[] out) {
+-        if (out != null && out.length >= 4) {
+-            out[0] = out[1] = out[2] = out[3] = 0.0f;
++        if (!isZslMode() || sensorTimestampNs <= 0L || out.length < 4) return false;
++        synchronized (mMotion26678FlickerLock) {
++            boolean ok = motion26678FindEvidenceLocked(sensorTimestampNs, true, false, out);
++            if (!ok) {
++                out[0] = out[1] = out[2] = out[3] = 0.0f;
++            }
++            return ok;
+         }
+-        return false;
+     }
+ 
+     private float motion26678ExactFlickerPenalty(long timestampNs) {
+@@ -2234,12 +2211,67 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return Float.NaN;
+     }
+ 
+-    /* IRIS_26680_FLICKER_OBSERVER_ONLY_CAPTURE
+-     * 26679 device evidence proved that synchronously rewriting every 4096x3072 NORMAL RAW could
+-     * stall processing for tens of seconds and imprint severe chroma/banding artifacts. The detector
+-     * remains diagnostic-only; NORMAL/SHORT/LONG source samples stay byte-physical and untouched. */
++    /* IRIS_26678_NORMAL_ROW_ILLUMINATION_NORMALIZATION
++     * Apply only to the copied NORMAL RAW backing after physical-frame ownership is frozen. The
++     * white-anchored rational map is CFA-neutral, preserves black/white endpoints, and never changes
++     * SHORT/LONG, HAL exposure, DNG source ownership, frame count, timestamps, or merge geometry. */
+     private boolean applyMotion26678NormalRowFlickerCorrection(@NonNull ImageFrame frame) {
+-        return false;
++        if (frame.motionV2FrameRole != ImageFrame.MotionV2FrameRole.NORMAL
++                || frame.buffer == null || frame.timestamp <= 0L
++                || !frame.motionV2BlackLevelValid || !frame.motionV2WhiteLevelValid) return false;
++        float[] evidence = new float[4];
++        synchronized (mMotion26678FlickerLock) {
++            if (!motion26678FindEvidenceLocked(frame.timestamp, false, true, evidence)) return false;
++        }
++        int width = frame.width;
++        int height = frame.height;
++        int rowStride;
++        int pixelStride = 2;
++        float blackScale = 1.0f;
++        float whiteScale = 1.0f;
++        if (frame.motionV2PlaneTransformedByBinning) {
++            rowStride = width * 2;
++            blackScale = 4.0f;
++            whiteScale = 4.0f;
++        } else if (frame.motionV2PlaneFormat == ImageFormat.RAW10) {
++            rowStride = width * 2;
++        } else {
++            rowStride = frame.motionV2PlaneRowStrideBytes;
++            pixelStride = frame.motionV2PlanePixelStrideBytes;
++        }
++        if (width <= 0 || height <= 0 || rowStride <= 0 || pixelStride < 2) return false;
++        java.nio.ByteBuffer data = frame.buffer.duplicate().order(java.nio.ByteOrder.nativeOrder());
++        if (data.limit() < rowStride || frame.motionV2WhiteLevel <= 0) return false;
++        int harmonic = Math.max(1, Math.round(evidence[0]));
++        float coeffA = evidence[1], coeffB = evidence[2], strength = evidence[3];
++        final double twoPi = 2.0 * Math.PI;
++        boolean changed = false;
++        for (int y = 0; y < height; y++) {
++            double phase = twoPi * harmonic * (y + 0.5) / Math.max(1, height);
++            float logMod = (float) (coeffA * Math.cos(phase) + coeffB * Math.sin(phase));
++            logMod = Math.max(-MOTION_26678_FLICKER_MAX_LOG_CORRECTION,
++                    Math.min(MOTION_26678_FLICKER_MAX_LOG_CORRECTION, logMod));
++            float gain = (float) Math.exp(-logMod * strength);
++            if (Math.abs(gain - 1.0f) < 0.001f) continue;
++            int rowBase = y * rowStride;
++            for (int x = 0; x < width; x++) {
++                int index = rowBase + x * pixelStride;
++                if (index < 0 || index + 1 >= data.limit()) break;
++                int raw = data.getShort(index) & 0xffff;
++                int phaseIndex = ((y & 1) << 1) | (x & 1);
++                float black = frame.motionV2BlackLevel[phaseIndex] * blackScale;
++                float white = Math.min(65535.0f, frame.motionV2WhiteLevel * whiteScale);
++                float span = Math.max(1.0f, white - black);
++                float norm = Math.max(0.0f, Math.min(1.0f, (raw - black) / span));
++                float denominator = 1.0f + (gain - 1.0f) * norm;
++                float mapped = denominator > 1.0e-6f ? gain * norm / denominator : norm;
++                int corrected = Math.round(black + Math.max(0.0f, Math.min(1.0f, mapped)) * span);
++                corrected = Math.max(0, Math.min(65535, corrected));
++                data.putShort(index, (short) (corrected & 0xffff));
++            }
++            changed = true;
++        }
++        return changed;
+     }
+ 
+     private long motion26678ChooseStructuralReferenceTimestamp(@NonNull List<ImageFrame> frames,
+@@ -2503,179 +2535,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    /* IRIS_26680_SCENE_INDEPENDENT_STABLE_PREVIEW_OWNER
+-     * HAL AE/AWB owns initial exposure/color convergence. Iris only latches a settled HAL state
+-     * against transient scene-content changes and releases it on sustained physical camera motion. */
+-    private void resetMotion26680StablePreviewAuthority(@NonNull String reason) {
+-        mMotion26680PreviewLatched = false;
+-        mMotion26680AeLockApplied = false;
+-        mMotion26680AwbLockApplied = false;
+-        mMotion26680StableFrames = 0;
+-        mMotion26680StationaryFrames = 0;
+-        mMotion26680ReframeMotionFrames = 0;
+-        mMotion26680LastExposureEnergy = Double.NaN;
+-        mMotion26680LatchGeneration = mIris26548CameraHealthGeneration;
+-
+-        /* Retire any state belonging to the older continuously-reactive HDR reference owner. */
+-        mMotion26661ReferenceBaseReady = false;
+-        mMotion26661ReferenceBaseSteps = 0;
+-        mMotion26661ReferenceAppliedProtectionSteps = 0;
+-        mMotion26661ReferenceCandidateProtectionSteps = 0;
+-        mMotion26661ReferenceCandidateFrames = 0;
+-        mMotion26661ReferenceAppliedProtectionEv = 0.0f;
+-        mMotion26662AeBaselineStableFrames = 0;
+-        synchronized (mMotion26662PreviewResultLock) {
+-            java.util.Arrays.fill(mMotion26662PreviewResultTimestampNs, 0L);
+-            java.util.Arrays.fill(mMotion26662PreviewResultProtectionEv, 0.0f);
+-            mMotion26662PreviewResultWriteIndex = 0;
+-        }
+-        Log.i(TAG, "IRIS_26680_STABLE_PREVIEW_RESET generation="
+-                + mIris26548CameraHealthGeneration + " reason=" + reason);
+-    }
+-
+-    private void updateMotion26680StablePreviewAuthority(@NonNull TotalCaptureResult result) {
+-        if (!isZslMode() || mZslCapturing || burst || isProcessing
+-                || mPreviewRequestBuilder == null || mCaptureSession == null
+-                || mCameraCharacteristics == null) {
+-            return;
+-        }
+-        if (mMotion26680LatchGeneration != mIris26548CameraHealthGeneration) {
+-            resetMotion26680StablePreviewAuthority("generation-change");
+-        }
+-
+-        Integer aeMode = result.get(CaptureResult.CONTROL_AE_MODE);
+-        Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+-        Integer awbState = result.get(CaptureResult.CONTROL_AWB_STATE);
+-        Long exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+-        Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+-        Long sensorTs = result.get(CaptureResult.SENSOR_TIMESTAMP);
+-        if (aeMode == null || aeMode == CaptureResult.CONTROL_AE_MODE_OFF
+-                || exposureNs == null || exposureNs <= 0L || iso == null || iso <= 0
+-                || sensorTs == null || sensorTs <= 0L) {
+-            return;
+-        }
+-
+-        /* 26680 has no Iris-owned exposure compensation. Preview presentation therefore carries
+-         * zero synthetic protection EV for every timestamp. */
+-        recordMotion26662PreviewProtection(sensorTs, 0.0f);
+-
+-        int shakiness = 0;
+-        try {
+-            if (PhotonCamera.getGyro() != null) {
+-                shakiness = Math.max(0, PhotonCamera.getGyro().getFilteredShakiness());
+-            }
+-        } catch (Exception ignored) {}
+-        boolean physicalReframe = shakiness > MOTION_26680_REFRAME_GYRO_THRESHOLD;
+-
+-        if (mMotion26680PreviewLatched) {
+-            if (physicalReframe) {
+-                mMotion26680ReframeMotionFrames++;
+-            } else {
+-                mMotion26680ReframeMotionFrames = 0;
+-            }
+-            if (mMotion26680ReframeMotionFrames < MOTION_26680_REFRAME_CONFIRM_FRAMES) return;
+-
+-            try {
+-                if (mMotion26680AeLockApplied) {
+-                    mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+-                }
+-                if (mMotion26680AwbLockApplied) {
+-                    mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, false);
+-                }
+-                mMotion26680PreviewLatched = false;
+-                mMotion26680AeLockApplied = false;
+-                mMotion26680AwbLockApplied = false;
+-                mMotion26680StableFrames = 0;
+-                mMotion26680StationaryFrames = 0;
+-                mMotion26680ReframeMotionFrames = 0;
+-                mMotion26680LastExposureEnergy = Double.NaN;
+-                rebuildPreviewBuilder();
+-                Log.i(TAG, "IRIS_26680_STABLE_PREVIEW_RELEASE generation="
+-                        + mIris26548CameraHealthGeneration
+-                        + " shakiness=" + shakiness
+-                        + " reason=physical-camera-reframe"
+-                        + " subjectMotionCannotUnlock=true");
+-            } catch (IllegalArgumentException | IllegalStateException e) {
+-                Log.w(TAG, "IRIS_26680 stable preview release skipped: "
+-                        + e.getClass().getSimpleName());
+-            }
+-            return;
+-        }
+-
+-        if (physicalReframe) {
+-            mMotion26680StableFrames = 0;
+-            mMotion26680StationaryFrames = 0;
+-            mMotion26680LastExposureEnergy = (double) exposureNs * (double) iso;
+-            return;
+-        }
+-
+-        mMotion26680StationaryFrames++;
+-        boolean aeSettled = aeState != null
+-                && (aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED
+-                    || aeState == CaptureResult.CONTROL_AE_STATE_LOCKED
+-                    || aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED);
+-        boolean awbSettled = awbState == null
+-                || awbState == CaptureResult.CONTROL_AWB_STATE_CONVERGED
+-                || awbState == CaptureResult.CONTROL_AWB_STATE_LOCKED;
+-        double exposureEnergy = (double) exposureNs * (double) iso;
+-        boolean energyStable = true;
+-        if (Double.isFinite(mMotion26680LastExposureEnergy)
+-                && mMotion26680LastExposureEnergy > 0.0 && exposureEnergy > 0.0) {
+-            double evDelta = Math.abs(Math.log(exposureEnergy / mMotion26680LastExposureEnergy)
+-                    / Math.log(2.0));
+-            energyStable = evDelta <= MOTION_26680_STABLE_ENERGY_EV;
+-        }
+-        mMotion26680LastExposureEnergy = exposureEnergy;
+-        if (aeSettled && awbSettled && energyStable) {
+-            mMotion26680StableFrames++;
+-        } else {
+-            mMotion26680StableFrames = 0;
+-        }
+-
+-        if (mMotion26680StableFrames < MOTION_26680_STABLE_CONFIRM_FRAMES
+-                && mMotion26680StationaryFrames < MOTION_26680_FORCE_LATCH_FRAMES) {
+-            return;
+-        }
+-
+-        Boolean aeLockAvailable = mCameraCharacteristics.get(
+-                CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE);
+-        Boolean awbLockAvailable = mCameraCharacteristics.get(
+-                CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE);
+-        if (!Boolean.TRUE.equals(aeLockAvailable)) {
+-            Log.w(TAG, "IRIS_26680_STABLE_PREVIEW_UNAVAILABLE aeLock=false");
+-            return;
+-        }
+-        try {
+-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
+-            mMotion26680AeLockApplied = true;
+-            if (Boolean.TRUE.equals(awbLockAvailable)) {
+-                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, true);
+-                mMotion26680AwbLockApplied = true;
+-            }
+-            mMotion26680PreviewLatched = true;
+-            mMotion26680ReframeMotionFrames = 0;
+-            rebuildPreviewBuilder();
+-            Log.i(TAG, "IRIS_26680_STABLE_PREVIEW_LATCH generation="
+-                    + mIris26548CameraHealthGeneration
+-                    + " exposureNs=" + exposureNs
+-                    + " iso=" + iso
+-                    + " aeState=" + aeState
+-                    + " awbState=" + awbState
+-                    + " stableFrames=" + mMotion26680StableFrames
+-                    + " stationaryFrames=" + mMotion26680StationaryFrames
+-                    + " shakiness=" + shakiness
+-                    + " aeLocked=true awbLocked=" + mMotion26680AwbLockApplied
+-                    + " rawSceneContentCannotRewriteExposure=true"
+-                    + " flickerObserverOnly=true");
+-        } catch (IllegalArgumentException | IllegalStateException e) {
+-            mMotion26680PreviewLatched = false;
+-            mMotion26680AeLockApplied = false;
+-            mMotion26680AwbLockApplied = false;
+-            Log.w(TAG, "IRIS_26680 stable preview latch skipped: "
+-                    + e.getClass().getSimpleName());
+-        }
+-    }
+-
+     /*
+      * IRIS_26662_GOOGLE_HDR_REFERENCE_EXPOSURE_OWNER
+      *
+@@ -3837,10 +3696,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mIris26548RepeatingSubmitted = false;
+         mIris26548FirstCaptureResult = false;
+         mIris26548FirstZslRaw = false;
+-        resetMotion26680StablePreviewAuthority(reason);
+-        synchronized (mMotion26678FlickerLock) {
+-            motion26678ResetDetectorLocked(mIris26548CameraHealthGeneration, 0L, 0);
+-        }
+         Log.i(TAG, "IRIS_26548_CAMERA_START_REQUESTED generation="
+                 + mIris26548CameraHealthGeneration + " reason=" + reason);
+     }
+diff --git a/app/version.properties b/app/version.properties
+index b5bf2347dd6e9d2f4a7c42af45c23aabca343795..6877f52a50505f4d4dbcc12450c6c0217b8215e1 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726680
+-VERSION_BUILD=26680
++VERSION_NAME=0.9726679
++VERSION_BUILD=26679
