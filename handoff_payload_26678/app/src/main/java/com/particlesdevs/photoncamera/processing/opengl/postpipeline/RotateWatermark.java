@@ -1,0 +1,104 @@
+package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+
+import android.hardware.camera2.CameraCharacteristics;
+
+import com.particlesdevs.photoncamera.util.Log;
+
+import com.particlesdevs.photoncamera.app.PhotonCamera;
+import com.particlesdevs.photoncamera.capture.CaptureController;
+import com.particlesdevs.photoncamera.processing.opengl.GLImage;
+import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+import com.particlesdevs.photoncamera.settings.PreferenceKeys;
+import java.io.IOException;
+
+import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+import static android.opengl.GLES20.GL_LINEAR;
+import static android.opengl.GLES20.GL_REPEAT;
+
+public class RotateWatermark extends Node {
+    private int rotate;
+    private boolean watermarkNeeded;
+    private GLImage watermarkDark;
+    private GLImage watermarkWhite;
+    private GLImage noise;
+    public RotateWatermark(int rotation) {
+        this(rotation, PreferenceKeys.isShowWatermarkOn());
+    }
+
+    /* IRIS_26540_NIGHT_FROZEN_WATERMARK_POLICY */
+    public RotateWatermark(int rotation, boolean frozenWatermarkNeeded) {
+        super("", "Rotate");
+        rotate = rotation;
+        watermarkNeeded = frozenWatermarkNeeded;
+    }
+
+    @Override
+    public void Compile() {}
+    @Override
+    public void AfterRun() {
+        if(watermarkDark != null) watermarkDark.close();
+        if(watermarkWhite != null) watermarkWhite.close();
+        if(noise != null) noise.close();
+    }
+
+    @Override
+    public void Run() {
+
+        //else lutbm = BitmapFactory.decodeResource(PhotonCamera.getResourcesStatic(), R.drawable.neutral_lut);
+        glProg.setDefine("WATERMARK",watermarkNeeded);
+
+        glProg.useAssetProgram("addwatermark_rotate");
+        try {
+            /* IRIS_26678_ADAPTIVE_WATERMARK_ASSET_OWNER
+             * General > Watermark remains the sole enable authority. The two exact user-supplied
+             * Iris variants are the only runtime watermark assets: dark for bright destination
+             * regions and white for dark destination regions. Selection occurs in the final-raster
+             * shader after HDR/tone/color; no legacy Photon/DCIM/Tuning fallback is permitted. */
+            watermarkDark = new GLImage(PhotonCamera.getAssetLoader().getInputStream(
+                    "watermark/iris_camera_watermark_dark.png"));
+            watermarkWhite = new GLImage(PhotonCamera.getAssetLoader().getInputStream(
+                    "watermark/iris_camera_watermark_white.png"));
+            noise = new GLImage(PhotonCamera.getAssetLoader().getInputStream("noise.png"));
+            glProg.setTexture("WatermarkDark", new GLTexture(watermarkDark,GL_LINEAR,GL_CLAMP_TO_EDGE,0));
+            glProg.setTexture("WatermarkWhite", new GLTexture(watermarkWhite,GL_LINEAR,GL_CLAMP_TO_EDGE,0));
+            glProg.setTexture("Noise", new GLTexture(noise,GL_LINEAR,GL_REPEAT,0));
+        } catch (IOException e) {
+            Log.d(Name,"Failed to load watermark or noise texture:" + Log.getStackTraceString(e));
+        }
+
+        glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
+        int rot = -1;
+        Log.d(Name,"Rotation:"+rotate);
+        switch (rotate){
+            case 0:
+                //WorkingTexture = new GLTexture(size.x,size.y, previousNode.WorkingTexture.mFormat, null);
+                rot = 0;
+                break;
+            case 90:
+                //WorkingTexture = new GLTexture(size.y,size.x, previousNode.WorkingTexture.mFormat, null);
+                rot = 3;
+                break;
+            case 180:
+                //WorkingTexture = new GLTexture(size, previousNode.WorkingTexture.mFormat, null);
+                rot = 2;
+                break;
+            case 270:
+                //WorkingTexture = new GLTexture(size.y,size.x, previousNode.WorkingTexture.mFormat, null);
+                rot = 1;
+                break;
+        }
+        Log.d(Name,"selected rotation:"+rot);
+        glProg.setVar("rotate",rot);
+        if(basePipeline.mParameters.mirror) {
+            glProg.setVar("mirror", 1);
+        } else {
+            glProg.setVar("mirror", 0);
+        }
+        glProg.setVar("cropSize",((PostPipeline)basePipeline).cropSize);
+        glProg.setVar("rawSize",basePipeline.mParameters.rawSize);
+        Log.d(Name,"Crop size:"+((PostPipeline)basePipeline).cropSize);
+        Log.d(Name,"Raw size:"+basePipeline.mParameters.rawSize);
+
+    }
+}

@@ -1,0 +1,1 @@
+Upload the complete 26678 handoff at repository root on experimental-clean-photon-rebuild, replace matching files, commit once, and push. GitHub Actions is authoritative. Do not upload app/src directly. Runtime authority is successful 26677 compiled candidate; verification/build mechanics are the exact successful 26676 sequence. No backup branch was requested.
