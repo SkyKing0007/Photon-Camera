@@ -58,3 +58,13 @@ pv=Path(Path(sys.argv[1]).parent/'verify_26681_patches.py').read_text()
 for x in ["('7','12','40')", "'--binary','--full-index','--no-ext-diff'", "'git','apply','--check'", "'git','add','-A','app'"]:
  assert x in pv,x
 print('PASS 26681 infrastructure: successful 26680 R1 compiler/build order retained; exact-26680 ancestry + exact cumulative upload scope; extensions limited to Spektra shader/source verification and additions-aware canonical patch representation')
+# 26681 R1 shader-validator correction after Actions run 35664833305:
+# preserve the successful-26680 reserved/implementation-name semantics and
+# keep the exact imageSize failure as a targeted local regression; pinned
+# upstream shader legality is decided by the real pinned glslang compiler.
+shader_verify=Path('verify_26681_shaders.py').read_text()
+assert 'builtin_shadow=' not in shader_verify
+assert 'global uniform imageSize reintroduced' in shader_verify
+assert "scan('upstream_'+Path(rel).name,s)" in shader_verify
+assert "subprocess.run([compiler,'-V','-S','comp',str(p)]" in shader_verify
+
