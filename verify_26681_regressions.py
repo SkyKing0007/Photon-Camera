@@ -105,4 +105,26 @@ lpf=(cand/'app/src/main/assets/shaders/spektra/rcd26498_lpf.glsl').read_text()
 assert 'uniform ivec2 InputSize;' in chroma and 'uniform ivec2 imageSize;' not in chroma
 assert 'p.setVar("InputSize", rawSize);' in rawproc and 'p.setVar("imageSize", rawSize);' not in rawproc
 assert 'float allTrusted=' in lpf and 'float all=' not in lpf
+
+# 26681 real Java compiler failure regressions from Actions run 35665471557.
+param=text(cand,'app/src/main/java/com/particlesdevs/photoncamera/manual/ParamController.java')
+assert '? 0L : Math.max(1L, Math.round(currentExposure));' in param
+assert '? ManualParamModel.EXPOSURE_AUTO : Math.max(1L, Math.round(currentExposure));' not in param
+owner=text(cand,'app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java')
+preview=text(cand,'app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java')
+for src in (owner,preview):
+    assert 'private static int valueOrZero(Byte value)' in src
+    assert 'Byte.toUnsignedInt(value)' in src
+ui=text(cand,'app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java')
+for good in [
+    'formatJpgButton.setOnClickListener',
+    'formatRawJpgButton.setOnClickListener',
+    'formatRawButton.setOnClickListener',
+    '                formatJpgButton,',
+    '                formatRawButton,',
+    '                formatRawJpgButton,']:
+    assert good in ui,good
+for bad in ['formatJpg.setOnClickListener','formatRawJpg.setOnClickListener','formatRaw.setOnClickListener','                formatJpg,','                formatRaw,','                formatRawJpg,']:
+    assert bad not in ui,bad
+
 print('PASS 26681 regressions: 26680 stable-preview/shutter/HDR owners hardlocked; Spektra delegates before legacy mutation; only 14 shader additions')

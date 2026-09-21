@@ -232,9 +232,9 @@ public class CameraUIViewImpl implements CameraUIView {
         View manualControls = root.findViewById(R.id.approved_manual_handle);
 
         formatSelectorPill.setOnClickListener(v -> toggleFormatPanel());
-        formatJpg.setOnClickListener(v -> selectFormat(0));
-        formatRawJpg.setOnClickListener(v -> selectFormat(1));
-        formatRaw.setOnClickListener(v -> selectFormat(2));
+        formatJpgButton.setOnClickListener(v -> selectFormat(0));
+        formatRawJpgButton.setOnClickListener(v -> selectFormat(1));
+        formatRawButton.setOnClickListener(v -> selectFormat(2));
         formatHeicButton.setOnClickListener(v -> selectHeicFormat());
         quadStatusToggleButton.setOnClickListener(v -> {
             if (uiEventsListener != null) uiEventsListener.onClick(v);
@@ -247,9 +247,9 @@ public class CameraUIViewImpl implements CameraUIView {
 
         installPressAnimation(
                 formatSelectorPill,
-                formatJpg,
-                formatRaw,
-                formatRawJpg,
+                formatJpgButton,
+                formatRawButton,
+                formatRawJpgButton,
                 formatHeicButton,
                 quadStatusToggleButton,
                 topbar.countdownTimerButton,

@@ -82,7 +82,7 @@ public class ParamController implements Observer {
     public void setISO(int isoVal, double currentExposure) {
         if (captureController.isSpektraModeActive()) {
             long exposureNs = currentExposure == ManualParamModel.EXPOSURE_AUTO
-                    ? ManualParamModel.EXPOSURE_AUTO : Math.max(1L, Math.round(currentExposure));
+                    ? 0L : Math.max(1L, Math.round(currentExposure));
             applySpektraExposure(isoVal, exposureNs);
             return;
         }

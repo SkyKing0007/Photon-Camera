@@ -890,6 +890,7 @@ public final class SpektraCameraOwner {
     }
 
     private static int valueOrZero(Integer value) { return value == null ? 0 : value; }
+    private static int valueOrZero(Byte value) { return value == null ? 0 : Byte.toUnsignedInt(value); }
 
     private void processShot(long g, SpektraShot shot) {
         File recovery = null;

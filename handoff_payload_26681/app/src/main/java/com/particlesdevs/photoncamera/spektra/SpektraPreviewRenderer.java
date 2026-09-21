@@ -119,4 +119,5 @@ public final class SpektraPreviewRenderer {
     }
 
     private static int valueOrZero(Integer value) { return value == null ? 0 : value; }
+    private static int valueOrZero(Byte value) { return value == null ? 0 : Byte.toUnsignedInt(value); }
 }
