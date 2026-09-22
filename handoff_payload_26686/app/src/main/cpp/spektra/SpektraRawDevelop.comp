@@ -1,0 +1,193 @@
+#version 450
+// IRIS_26686_SPEKTRA_NATIVE_RAW_DEVELOP
+// One Spektra-owned packed RAW -> scene-linear RGBA16F compute path.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) readonly buffer RawBuffer { uint rawWords[]; };
+layout(std430, set = 0, binding = 1) readonly buffer ParamBuffer { uint p[]; };
+layout(std430, set = 0, binding = 2) readonly buffer LscBuffer { vec4 lsc[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer OutputBuffer { uint outWords[]; };
+
+// Parameter indices are mirrored exactly by SpektraRawVulkanOwner.cpp.
+const uint P_SRC_W=0u, P_SRC_H=1u, P_ROW_STRIDE=2u, P_PIXEL_STRIDE=3u, P_FORMAT=4u, P_SRC_BYTES=5u;
+const uint P_CROP_L=6u, P_CROP_T=7u, P_CROP_R=8u, P_CROP_B=9u;
+const uint P_RAW_L=10u, P_RAW_T=11u, P_RAW_R=12u, P_RAW_B=13u;
+const uint P_ACTIVE_L=14u, P_ACTIVE_T=15u, P_ACTIVE_R=16u, P_ACTIVE_B=17u;
+const uint P_CFA=18u, P_BAYER_OFFSET=19u, P_WHITE=20u;
+const uint P_BLACK0=21u, P_BLACK1=22u, P_BLACK2=23u, P_BLACK3=24u;
+const uint P_LSC_COLS=25u, P_LSC_ROWS=26u, P_USE_LSC=27u;
+const uint P_OUT_W=28u, P_OUT_H=29u, P_SAVED=30u, P_CHROMA=31u, P_CLIP=32u;
+const uint P_M0=33u;
+
+uint readByte(uint byteIndex) {
+    if (byteIndex >= p[P_SRC_BYTES]) return 0u;
+    uint w = rawWords[byteIndex >> 2u];
+    return (w >> ((byteIndex & 3u) * 8u)) & 255u;
+}
+
+int clampParity(int value, int lo, int hi, int parity) {
+    int v=clamp(value,lo,hi);
+    if ((v&1)==parity) return v;
+    if (v+1<=hi) return v+1;
+    if (v-1>=lo) return v-1;
+    return v;
+}
+
+ivec2 clampActivePreservePhase(ivec2 xy) {
+    ivec2 lo=ivec2(int(p[P_ACTIVE_L]),int(p[P_ACTIVE_T]));
+    ivec2 hi=ivec2(int(p[P_ACTIVE_R])-1,int(p[P_ACTIVE_B])-1);
+    return ivec2(clampParity(xy.x,lo.x,hi.x,xy.x&1),
+                 clampParity(xy.y,lo.y,hi.y,xy.y&1));
+}
+
+uint rawSample(ivec2 xy) {
+    // Demosaic taps may cross the source crop edge but must never leave the
+    // physically active RAW domain. Preserve CFA phase while clamping so a
+    // border tap cannot silently become a different Bayer channel.
+    xy=clampActivePreservePhase(xy);
+    uint row=uint(xy.y)*p[P_ROW_STRIDE];
+    uint x=uint(xy.x);
+    uint fmt=p[P_FORMAT];
+    if (fmt==37u) { // ImageFormat.RAW10
+        uint q=row+(x>>2u)*5u, lane=x&3u;
+        return (readByte(q+lane)<<2u) | ((readByte(q+4u)>>(lane*2u))&3u);
+    }
+    if (fmt==38u) { // ImageFormat.RAW12
+        uint q=row+(x>>1u)*3u, lane=x&1u, lo=readByte(q+2u);
+        return (readByte(q+lane)<<4u) | (lane==0u ? (lo&15u) : ((lo>>4u)&15u));
+    }
+    uint stride=max(2u,p[P_PIXEL_STRIDE]);
+    uint q=row+x*stride;
+    return readByte(q) | (readByte(q+1u)<<8u);
+}
+
+int phaseAt(ivec2 xy) { return (xy.x&1) | ((xy.y&1)<<1); }
+int colorAt(ivec2 xy) {
+    int q=phaseAt(xy), cfa=int(p[P_CFA]);
+    if (q==cfa) return 0;
+    if (q==(cfa^3)) return 2;
+    return 1;
+}
+
+int semanticLscChannel(ivec2 xy) {
+    int q=phaseAt(xy), cfa=int(p[P_CFA]);
+    if (q==cfa) return 0;
+    if (q==(cfa^3)) return 3;
+    // Camera2 LensShadingMap channels are [R, G_even, G_odd, B]. The CFA
+    // arrangement above is already shifted into RAW-raster phase, but green
+    // even/odd is defined in the sensor Bayer-row domain. Recover that row
+    // parity explicitly from the verified Bayer-origin offset.
+    int sensorRowParity=(xy.y&1)^((int(p[P_BAYER_OFFSET])>>1)&1);
+    return sensorRowParity==0 ? 1 : 2;
+}
+
+float lscGain(ivec2 xy) {
+    if (p[P_USE_LSC]==0u || p[P_LSC_COLS]==0u || p[P_LSC_ROWS]==0u) return 1.0;
+    vec2 activeMin=vec2(float(p[P_ACTIVE_L]),float(p[P_ACTIVE_T]));
+    vec2 activeMax=vec2(float(max(p[P_ACTIVE_L]+1u,p[P_ACTIVE_R]-1u)),float(max(p[P_ACTIVE_T]+1u,p[P_ACTIVE_B]-1u)));
+    vec2 uv=clamp((vec2(xy)-activeMin)/max(activeMax-activeMin,vec2(1.0)),vec2(0.0),vec2(1.0));
+    vec2 pos=uv*vec2(max(1u,p[P_LSC_COLS]-1u),max(1u,p[P_LSC_ROWS]-1u));
+    uvec2 a=uvec2(floor(pos));
+    uvec2 b=min(a+uvec2(1),uvec2(p[P_LSC_COLS]-1u,p[P_LSC_ROWS]-1u));
+    vec2 f=fract(pos);
+    int ch=semanticLscChannel(xy);
+    float g00=lsc[a.y*p[P_LSC_COLS]+a.x][ch];
+    float g10=lsc[a.y*p[P_LSC_COLS]+b.x][ch];
+    float g01=lsc[b.y*p[P_LSC_COLS]+a.x][ch];
+    float g11=lsc[b.y*p[P_LSC_COLS]+b.x][ch];
+    return mix(mix(g00,g10,f.x),mix(g01,g11,f.x),f.y);
+}
+
+float sampleNorm(ivec2 xy) {
+    int q=phaseAt(xy);
+    uint black=q==0 ? p[P_BLACK0] : q==1 ? p[P_BLACK1] : q==2 ? p[P_BLACK2] : p[P_BLACK3];
+    float denom=max(1.0,float(p[P_WHITE])-float(black));
+    return max(0.0,(float(rawSample(xy))-float(black))/denom)*lscGain(xy);
+}
+
+float averageColor(ivec2 xy, int target, bool diagonal) {
+    float sum=0.0; int n=0;
+    ivec2 d0=diagonal ? ivec2(-1,-1) : ivec2(-1,0);
+    ivec2 d1=diagonal ? ivec2( 1,-1) : ivec2( 1,0);
+    ivec2 d2=diagonal ? ivec2(-1, 1) : ivec2(0,-1);
+    ivec2 d3=diagonal ? ivec2( 1, 1) : ivec2(0, 1);
+    ivec2 ds[4]=ivec2[4](d0,d1,d2,d3);
+    for(int i=0;i<4;i++) { ivec2 q=xy+ds[i]; if(colorAt(q)==target){sum+=sampleNorm(q);n++;} }
+    if(n==0) {
+        ivec2 ds2[8]=ivec2[8](ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2),ivec2(-2,-2),ivec2(2,-2),ivec2(-2,2),ivec2(2,2));
+        for(int i=0;i<8;i++){ivec2 q=xy+ds2[i];if(colorAt(q)==target){sum+=sampleNorm(q);n++;}}
+    }
+    return n>0 ? sum/float(n) : sampleNorm(xy);
+}
+
+vec3 demosaicRaw(ivec2 xy) {
+    int c=colorAt(xy);
+    vec3 rgb;
+    if(c==0){rgb.r=sampleNorm(xy);rgb.g=averageColor(xy,1,false);rgb.b=averageColor(xy,2,true);}
+    else if(c==2){rgb.b=sampleNorm(xy);rgb.g=averageColor(xy,1,false);rgb.r=averageColor(xy,0,true);}
+    else {rgb.g=sampleNorm(xy);rgb.r=averageColor(xy,0,false);rgb.b=averageColor(xy,2,false);}
+    return max(rgb,vec3(0.0));
+}
+
+vec3 highlightRecover(ivec2 xy, vec3 center) {
+    if(p[P_SAVED]==0u) return center;
+    float clip=uintBitsToFloat(p[P_CLIP]);
+    bvec3 clipped=greaterThanEqual(center,vec3(clip));
+    if(!any(clipped) || all(clipped)) return center;
+    vec3 n=(demosaicRaw(xy+ivec2(-2,0))+demosaicRaw(xy+ivec2(2,0))
+           +demosaicRaw(xy+ivec2(0,-2))+demosaicRaw(xy+ivec2(0,2)))*0.25;
+    float cg=max(center.g,1e-5), ng=max(n.g,1e-5);
+    vec3 ratio=n/ng;
+    if(clipped.r) center.r=max(center.r,ratio.r*cg);
+    if(clipped.b) center.b=max(center.b,ratio.b*cg);
+    if(clipped.g) {
+        float fromR=center.r/max(ratio.r,1e-4);
+        float fromB=center.b/max(ratio.b,1e-4);
+        center.g=max(center.g,0.5*(fromR+fromB));
+    }
+    return center;
+}
+
+vec3 sensorToLinear(vec3 rgb) {
+    vec3 r0=vec3(uintBitsToFloat(p[P_M0+0u]),uintBitsToFloat(p[P_M0+1u]),uintBitsToFloat(p[P_M0+2u]));
+    vec3 r1=vec3(uintBitsToFloat(p[P_M0+3u]),uintBitsToFloat(p[P_M0+4u]),uintBitsToFloat(p[P_M0+5u]));
+    vec3 r2=vec3(uintBitsToFloat(p[P_M0+6u]),uintBitsToFloat(p[P_M0+7u]),uintBitsToFloat(p[P_M0+8u]));
+    return vec3(dot(r0,rgb),dot(r1,rgb),dot(r2,rgb)); // explicit row-major convention
+}
+
+vec3 linearAt(ivec2 xy) { return sensorToLinear(highlightRecover(xy,demosaicRaw(xy))); }
+
+vec3 reconstructForOutput(uvec2 outxy) {
+    int cropL=int(p[P_CROP_L]), cropT=int(p[P_CROP_T]);
+    int cropW=int(p[P_CROP_R]-p[P_CROP_L]), cropH=int(p[P_CROP_B]-p[P_CROP_T]);
+    int outW=int(p[P_OUT_W]), outH=int(p[P_OUT_H]);
+    if(p[P_SAVED]!=0u && outW==cropW && outH==cropH) return linearAt(ivec2(cropL+int(outxy.x),cropT+int(outxy.y)));
+    // VF-S: reconstruct in source RAW first, then sample multiple positions inside each reduced footprint.
+    vec2 lo=vec2(cropL,cropT)+vec2(outxy)*vec2(cropW,cropH)/vec2(outW,outH);
+    vec2 hi=vec2(cropL,cropT)+vec2(outxy+uvec2(1))*vec2(cropW,cropH)/vec2(outW,outH);
+    ivec2 a=ivec2(floor(mix(lo,hi,0.25))), b=ivec2(floor(mix(lo,hi,0.75)));
+    return 0.25*(linearAt(ivec2(a.x,a.y))+linearAt(ivec2(b.x,a.y))+linearAt(ivec2(a.x,b.y))+linearAt(ivec2(b.x,b.y)));
+}
+
+vec3 savedChroma(vec3 center, uvec2 outxy) {
+    if(p[P_SAVED]==0u) return center;
+    float strength=clamp(uintBitsToFloat(p[P_CHROMA]),0.0,1.0);
+    if(strength<=0.0) return center;
+    int cropL=int(p[P_CROP_L]), cropT=int(p[P_CROP_T]);
+    ivec2 xy=ivec2(cropL+int(outxy.x),cropT+int(outxy.y));
+    vec3 avg=(linearAt(xy+ivec2(-2,0))+linearAt(xy+ivec2(2,0))+linearAt(xy+ivec2(0,-2))+linearAt(xy+ivec2(0,2)))*0.25;
+    const vec3 yv=vec3(0.2126,0.7152,0.0722);
+    float yc=dot(center,yv), ya=dot(avg,yv);
+    vec3 chromaCenter=center-vec3(yc), chromaAvg=avg-vec3(ya);
+    return vec3(yc)+mix(chromaCenter,chromaAvg,strength);
+}
+
+void main(){
+    uvec2 o=gl_GlobalInvocationID.xy;
+    if(o.x>=p[P_OUT_W] || o.y>=p[P_OUT_H]) return;
+    vec3 rgb=savedChroma(reconstructForOutput(o),o);
+    if(any(isnan(rgb)) || any(isinf(rgb))) rgb=vec3(0.0);
+    rgb=max(rgb,vec3(0.0));
+    uint index=(o.y*p[P_OUT_W]+o.x)*2u;
+    outWords[index+0u]=packHalf2x16(rgb.rg);
+    outWords[index+1u]=packHalf2x16(vec2(rgb.b,1.0));
+}

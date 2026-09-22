@@ -1,0 +1,2740 @@
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+index a0126ff333bdaa9fd650f886001e1b74feefbd1f..bfdaa04b607972fcd38561caca96a6764cee10a2 100644
+--- a/app/src/main/cpp/CMakeLists.txt
++++ b/app/src/main/cpp/CMakeLists.txt
+@@ -478,6 +478,17 @@ foreach(IRIS26681_SHADER_NAME IN LISTS IRIS26681_SPEKTRA_SHADER_NAMES)
+         VERBATIM)
+ endforeach()
+ 
++# IRIS_26686: compile the Spektra-owned packed RAW developer with the same pinned
++# glslang 16.5.0 instance before native compilation. This does not add a build phase.
++set(IRIS26686_RAW_SHADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/spektra/SpektraRawDevelop.comp")
++set(IRIS26686_RAW_SHADER_SPV "${IRIS26681_SPEKTRA_SPV_DIR}/SpektraRawDevelop.comp.spv")
++add_custom_command(
++    OUTPUT "${IRIS26686_RAW_SHADER_SPV}"
++    COMMAND "${IRIS26681_GLSLANG}" -V "${IRIS26686_RAW_SHADER_SRC}" -o "${IRIS26686_RAW_SHADER_SPV}"
++    DEPENDS "${IRIS26686_RAW_SHADER_SRC}"
++    VERBATIM)
++list(APPEND IRIS26681_SPEKTRA_SPV_FILES "${IRIS26686_RAW_SHADER_SPV}")
++
+ set(IRIS26681_EMBEDDED_SHADERS_CPP "${CMAKE_CURRENT_BINARY_DIR}/iris26681_spektra_generated/SpektraEmbeddedShaders.cpp")
+ get_filename_component(IRIS26681_EMBEDDED_SHADERS_DIR "${IRIS26681_EMBEDDED_SHADERS_CPP}" DIRECTORY)
+ file(MAKE_DIRECTORY "${IRIS26681_EMBEDDED_SHADERS_DIR}")
+@@ -501,6 +512,7 @@ target_link_libraries(iris26681-spektrafilm PUBLIC vulkan dl)
+ 
+ add_library(spektra_iris SHARED
+     spektra/SpektraNativeJni.cpp
++    spektra/SpektraRawVulkanOwner.cpp
+     spektra/SpektraProfileDataBridge.cpp
+     "${IRIS26681_EMBEDDED_SHADERS_CPP}")
+ set_target_properties(spektra_iris PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+diff --git a/app/src/main/cpp/spektra/EmbedSpektraSpirv.cmake b/app/src/main/cpp/spektra/EmbedSpektraSpirv.cmake
+index 8b51d32550dd7e84389f1672a14367faccc1b53b..77db1ba33bde9743cf85f2911f0f8a4daf73d086 100644
+--- a/app/src/main/cpp/spektra/EmbedSpektraSpirv.cmake
++++ b/app/src/main/cpp/spektra/EmbedSpektraSpirv.cmake
+@@ -11,7 +11,8 @@ set(NAMES
+   SpektraDiffusion.comp.spv
+   SpektraDir.comp.spv
+   SpektraScannerPost.comp.spv
+-  SpektraGrain.comp.spv)
++  SpektraGrain.comp.spv
++  SpektraRawDevelop.comp.spv)
+ file(WRITE "${OUT}" "#include \"SpektraEmbeddedShaders.h\"\n#include <cerrno>\n#include <cstdio>\n#include <cstring>\n#include <sys/stat.h>\n#include <sys/types.h>\n#include <vector>\nnamespace {\n")
+ set(INDEX 0)
+ foreach(NAME IN LISTS NAMES)
+diff --git a/app/src/main/cpp/spektra/SpektraNativeJni.cpp b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+index 89a31838db2466182c09f8898b754987761d7b03..238c20d9ad90a4048fe7e80068901cdec9f19ec9 100644
+--- a/app/src/main/cpp/spektra/SpektraNativeJni.cpp
++++ b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+@@ -8,6 +8,7 @@
+ #include "SpektraParameters.h"
+ #include "SpektraProfileDataBridge.h"
+ #include "SpektraEmbeddedShaders.h"
++#include "SpektraRawVulkanOwner.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -106,22 +107,6 @@ uint8_t toByte(uint16_t h) {
+     return static_cast<uint8_t>(std::floor(v * 255.0f + 0.5f));
+ }
+ 
+-uint16_t floatToHalf(float value) {
+-    uint32_t bits = 0;
+-    std::memcpy(&bits, &value, sizeof(bits));
+-    const uint32_t sign = (bits >> 16u) & 0x8000u;
+-    int32_t exp = static_cast<int32_t>((bits >> 23u) & 0xffu) - 127 + 15;
+-    uint32_t mantissa = bits & 0x7fffffu;
+-    if (exp <= 0) {
+-        if (exp < -10) return static_cast<uint16_t>(sign);
+-        mantissa = (mantissa | 0x800000u) >> static_cast<uint32_t>(1 - exp);
+-        return static_cast<uint16_t>(sign | ((mantissa + 0x1000u) >> 13u));
+-    }
+-    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10u)
+-            | ((mantissa + 0x1000u) >> 13u));
+-}
+-
+ constexpr int kAndroidRawSensor = 32;
+ constexpr int kAndroidRaw10 = 37;
+ constexpr int kAndroidRaw12 = 38;
+@@ -220,97 +205,6 @@ bool averageRawPhaseBox(const uint8_t *src, size_t sourceBytes, int format,
+ }
+ 
+ 
+-int rawColorAt(int x, int y, int cfaPattern) {
+-    const int q = (x & 1) | ((y & 1) << 1);
+-    if (cfaPattern == 0) return q == 0 ? 0 : (q == 3 ? 2 : 1); // RGGB
+-    if (cfaPattern == 1) return q == 1 ? 0 : (q == 2 ? 2 : 1); // GRBG
+-    if (cfaPattern == 2) return q == 2 ? 0 : (q == 1 ? 2 : 1); // GBRG
+-    return q == 3 ? 0 : (q == 0 ? 2 : 1);                      // BGGR
+-}
+-
+-bool normalizedRaw(const uint8_t *src, size_t sourceBytes, int format,
+-                   int width, int height, int rowStride, int pixelStride,
+-                   int x, int y, const int black4[4], int whiteLevel, float *out) {
+-    x = std::max(0, std::min(width - 1, x));
+-    y = std::max(0, std::min(height - 1, y));
+-    uint16_t sample = 0;
+-    if (!readRawSample(src, sourceBytes, format, width, height, rowStride, pixelStride, x, y, &sample)) {
+-        return false;
+-    }
+-    const int q = (x & 1) | ((y & 1) << 1);
+-    const int black = black4[q];
+-    const float denom = static_cast<float>(std::max(1, whiteLevel - black));
+-    *out = std::max(0.0f, (static_cast<float>(sample) - static_cast<float>(black)) / denom);
+-    return true;
+-}
+-
+-bool demosaicCameraRgb(const uint8_t *src, size_t sourceBytes, int format,
+-                       int width, int height, int rowStride, int pixelStride,
+-                       int x, int y, int cfaPattern, const int black4[4], int whiteLevel,
+-                       float rgb[3]) {
+-    // Bilinear reconstruction in the original sensor lattice. This is intentionally performed
+-    // before VF-S reduction so the 640x480 preview never pretends distant photosites are adjacent.
+-    for (int target = 0; target < 3; ++target) {
+-        float center = 0.0f;
+-        if (rawColorAt(x, y, cfaPattern) == target) {
+-            if (!normalizedRaw(src, sourceBytes, format, width, height, rowStride, pixelStride,
+-                    x, y, black4, whiteLevel, &center)) return false;
+-            rgb[target] = center;
+-            continue;
+-        }
+-        float sum = 0.0f;
+-        int count = 0;
+-        for (int dy = -1; dy <= 1; ++dy) {
+-            for (int dx = -1; dx <= 1; ++dx) {
+-                if (dx == 0 && dy == 0) continue;
+-                const int sx = std::max(0, std::min(width - 1, x + dx));
+-                const int sy = std::max(0, std::min(height - 1, y + dy));
+-                if (rawColorAt(sx, sy, cfaPattern) != target) continue;
+-                float v = 0.0f;
+-                if (!normalizedRaw(src, sourceBytes, format, width, height, rowStride, pixelStride,
+-                        sx, sy, black4, whiteLevel, &v)) return false;
+-                sum += v;
+-                ++count;
+-            }
+-        }
+-        if (count == 0) return false;
+-        rgb[target] = sum / static_cast<float>(count);
+-    }
+-    return true;
+-}
+-
+-bool reducedPreviewRgb(const uint8_t *src, size_t sourceBytes, int format,
+-                       int sourceWidth, int sourceHeight, int rowStride, int pixelStride,
+-                       int outputX, int outputY, int outputWidth, int outputHeight,
+-                       int cfaPattern, const int black4[4], int whiteLevel, float rgb[3]) {
+-    const double sx0 = static_cast<double>(outputX) * sourceWidth / outputWidth;
+-    const double sx1 = static_cast<double>(outputX + 1) * sourceWidth / outputWidth;
+-    const double sy0 = static_cast<double>(outputY) * sourceHeight / outputHeight;
+-    const double sy1 = static_cast<double>(outputY + 1) * sourceHeight / outputHeight;
+-    // Four source-domain taps approximate a box reduction, but every tap is first demosaiced from
+-    // physically adjacent Bayer samples. This is the key ownership difference from 26684.
+-    const double fx[2] = {0.25, 0.75};
+-    const double fy[2] = {0.25, 0.75};
+-    rgb[0] = rgb[1] = rgb[2] = 0.0f;
+-    int count = 0;
+-    for (double py : fy) {
+-        for (double px : fx) {
+-            int sx = static_cast<int>(std::floor(sx0 + (sx1 - sx0) * px));
+-            int sy = static_cast<int>(std::floor(sy0 + (sy1 - sy0) * py));
+-            sx = std::max(1, std::min(sourceWidth - 2, sx));
+-            sy = std::max(1, std::min(sourceHeight - 2, sy));
+-            float tap[3] = {0.0f, 0.0f, 0.0f};
+-            if (!demosaicCameraRgb(src, sourceBytes, format, sourceWidth, sourceHeight,
+-                    rowStride, pixelStride, sx, sy, cfaPattern, black4, whiteLevel, tap)) return false;
+-            rgb[0] += tap[0]; rgb[1] += tap[1]; rgb[2] += tap[2];
+-            ++count;
+-        }
+-    }
+-    if (count == 0) return false;
+-    rgb[0] /= count; rgb[1] /= count; rgb[2] /= count;
+-    return true;
+-}
+-
+ spektrafilm::RenderParams factoryParams(bool preview) {
+     spektrafilm::RenderParams p;
+     p.process = spektrafilm::ProcessMode::PrintSimulation;
+@@ -366,79 +260,7 @@ bool ensureRenderer(AAssetManager *manager, const std::string &root, std::string
+ }
+ 
+ extern "C" JNIEXPORT jbyteArray JNICALL
+-Java_com_particlesdevs_photoncamera_spektra_SpektraRawFrame_nativeDecodePreviewRgb16f(
+-        JNIEnv *env, jclass, jobject source, jint sourceOffset, jint sourceBytes,
+-        jint sourceWidth, jint sourceHeight, jint rowStride, jint pixelStride, jint format,
+-        jint outputWidth, jint outputHeight, jint sensorCfa, jint bayerOffset,
+-        jintArray sensorBlackArray, jint whiteLevel) {
+-    auto *base = static_cast<uint8_t *>(env->GetDirectBufferAddress(source));
+-    const jlong capacity = env->GetDirectBufferCapacity(source);
+-    if (!base || capacity < 0 || sourceOffset < 0 || sourceBytes <= 0
+-            || static_cast<jlong>(sourceOffset) + sourceBytes > capacity) {
+-        throwIllegalArgument(env, "Spektra VF-S RAW direct-buffer bounds are invalid");
+-        return nullptr;
+-    }
+-    if (sourceWidth <= 2 || sourceHeight <= 2 || outputWidth <= 0 || outputHeight <= 0
+-            || outputWidth > sourceWidth || outputHeight > sourceHeight || rowStride <= 0
+-            || sensorCfa < 0 || sensorCfa > 3 || bayerOffset < 0 || bayerOffset > 3
+-            || whiteLevel <= 0 || !sensorBlackArray || env->GetArrayLength(sensorBlackArray) < 4) {
+-        throwIllegalArgument(env, "Spektra VF-S geometry/CFA contract is invalid");
+-        return nullptr;
+-    }
+-    const int effectivePixelStride = format == kAndroidRawSensor ? std::max(2, static_cast<int>(pixelStride)) : 0;
+-    const int minimumRow = minRawRowBytes(format, sourceWidth, effectivePixelStride);
+-    const uint64_t minimumBytes = static_cast<uint64_t>(sourceHeight - 1) * static_cast<uint64_t>(rowStride)
+-            + static_cast<uint64_t>(std::max(0, minimumRow));
+-    if (minimumRow < 0 || rowStride < minimumRow || static_cast<uint64_t>(sourceBytes) < minimumBytes) {
+-        throwIllegalArgument(env, "Spektra VF-S row-stride/buffer contract is invalid");
+-        return nullptr;
+-    }
+-    jint sensorBlack[4] = {0, 0, 0, 0};
+-    env->GetIntArrayRegion(sensorBlackArray, 0, 4, sensorBlack);
+-    if (env->ExceptionCheck()) return nullptr;
+-    int black4[4];
+-    for (int q = 0; q < 4; ++q) black4[q] = sensorBlack[q ^ (bayerOffset & 3)];
+-    const int effectiveCfa = sensorCfa ^ (bayerOffset & 3);
+-    const uint64_t outBytes64 = static_cast<uint64_t>(outputWidth) * static_cast<uint64_t>(outputHeight) * 8u;
+-    if (outBytes64 > 0x7fffffffull) {
+-        throwIllegalArgument(env, "Spektra VF-S RGB16F output is too large");
+-        return nullptr;
+-    }
+-    jbyteArray output = env->NewByteArray(static_cast<jsize>(outBytes64));
+-    if (!output) return nullptr;
+-    jboolean isCopy = JNI_FALSE;
+-    jbyte *outBytes = env->GetByteArrayElements(output, &isCopy);
+-    if (!outBytes) return nullptr;
+-    auto *out = reinterpret_cast<uint16_t *>(outBytes);
+-    const uint8_t *src = base + sourceOffset;
+-    bool ok = true;
+-    for (int y = 0; y < outputHeight && ok; ++y) {
+-        for (int x = 0; x < outputWidth; ++x) {
+-            float rgb[3] = {0.0f, 0.0f, 0.0f};
+-            if (!reducedPreviewRgb(src, static_cast<size_t>(sourceBytes), format,
+-                    sourceWidth, sourceHeight, rowStride, effectivePixelStride,
+-                    x, y, outputWidth, outputHeight, effectiveCfa, black4, whiteLevel, rgb)) {
+-                ok = false;
+-                break;
+-            }
+-            const size_t d = (static_cast<size_t>(y) * static_cast<size_t>(outputWidth)
+-                    + static_cast<size_t>(x)) * 4u;
+-            out[d] = floatToHalf(rgb[0]);
+-            out[d + 1u] = floatToHalf(rgb[1]);
+-            out[d + 2u] = floatToHalf(rgb[2]);
+-            out[d + 3u] = floatToHalf(1.0f);
+-        }
+-    }
+-    env->ReleaseByteArrayElements(output, outBytes, ok ? 0 : JNI_ABORT);
+-    if (!ok) {
+-        throwIllegalArgument(env, "Spektra VF-S reconstruction reached an invalid RAW sample");
+-        return nullptr;
+-    }
+-    return output;
+-}
+-
+-extern "C" JNIEXPORT jbyteArray JNICALL
+-Java_com_particlesdevs_photoncamera_spektra_SpektraRawFrame_nativeDecodeRaw(
++Java_com_particlesdevs_photoncamera_spektra_SpektraRawFrame_nativeDecodeMeter(
+         JNIEnv *env, jclass, jobject source, jint sourceOffset, jint sourceBytes,
+         jint sourceWidth, jint sourceHeight, jint rowStride, jint pixelStride, jint format,
+         jint outputWidth, jint outputHeight) {
+@@ -452,8 +274,8 @@ Java_com_particlesdevs_photoncamera_spektra_SpektraRawFrame_nativeDecodeRaw(
+         throwIllegalArgument(env, "Spektra RAW direct-buffer bounds are invalid");
+         return nullptr;
+     }
+-    const bool packedWidthInvalid = (format == kAndroidRaw10 || format == kAndroidRaw12)
+-            && (sourceWidth & 3) != 0;
++    const bool packedWidthInvalid = (format == kAndroidRaw10 && (sourceWidth & 3) != 0)
++            || (format == kAndroidRaw12 && (sourceWidth & 1) != 0);
+     if (sourceWidth <= 0 || sourceHeight <= 0 || outputWidth <= 0 || outputHeight <= 0
+             || (sourceWidth & 1) != 0 || (sourceHeight & 1) != 0 || packedWidthInvalid
+             || (outputWidth & 1) != 0 || (outputHeight & 1) != 0
+@@ -485,16 +307,12 @@ Java_com_particlesdevs_photoncamera_spektra_SpektraRawFrame_nativeDecodeRaw(
+     if (!out) return nullptr;
+     const uint8_t *src = base + sourceOffset;
+     bool ok = true;
+-    const bool fullResolution = outputWidth == sourceWidth && outputHeight == sourceHeight;
+     for (int y = 0; y < outputHeight && ok; ++y) {
+         for (int x = 0; x < outputWidth; ++x) {
+             uint16_t sample = 0;
+-            const bool sampleOk = fullResolution
+-                    ? readRawSample(src, static_cast<size_t>(sourceBytes), format, sourceWidth, sourceHeight,
+-                            rowStride, effectivePixelStride, x, y, &sample)
+-                    : averageRawPhaseBox(src, static_cast<size_t>(sourceBytes), format,
+-                            sourceWidth, sourceHeight, rowStride, effectivePixelStride,
+-                            x, y, outputWidth, outputHeight, &sample);
++            const bool sampleOk = averageRawPhaseBox(src, static_cast<size_t>(sourceBytes), format,
++                    sourceWidth, sourceHeight, rowStride, effectivePixelStride,
++                    x, y, outputWidth, outputHeight, &sample);
+             if (!sampleOk) {
+                 ok = false;
+                 break;
+@@ -513,6 +331,112 @@ Java_com_particlesdevs_photoncamera_spektra_SpektraRawFrame_nativeDecodeRaw(
+     return output;
+ }
+ 
++
++static bool readInt4(JNIEnv* env, jintArray array, int out[4], const char* name) {
++    if (!array || env->GetArrayLength(array) != 4) {
++        throwIllegalArgument(env, std::string("Spektra ") + name + " must have four values");
++        return false;
++    }
++    jint v[4] = {0,0,0,0};
++    env->GetIntArrayRegion(array, 0, 4, v);
++    if (env->ExceptionCheck()) return false;
++    for (int i=0;i<4;++i) out[i]=v[i];
++    return true;
++}
++
++extern "C" JNIEXPORT jbyteArray JNICALL
++Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeProcessPackedRaw(
++        JNIEnv* env, jclass, jobject source, jint sourceOffset, jint sourceBytes,
++        jint sourceWidth, jint sourceHeight, jint rowStride, jint pixelStride, jint format,
++        jintArray rawBoundsArray, jintArray sourceCropArray, jintArray activeRawDomainArray,
++        jint cfaArrangement, jint bayerOffset, jintArray blackLevelArray, jint whiteLevel,
++        jfloatArray lensShadingArray, jint lensShadingRows, jint lensShadingCols,
++        jfloatArray matrixArray, jint outputWidth, jint outputHeight, jboolean savedPhoto,
++        jfloat chromaDenoiseStrength, jfloat sensorClipThreshold) {
++    auto* base = static_cast<uint8_t*>(env->GetDirectBufferAddress(source));
++    const jlong capacity = env->GetDirectBufferCapacity(source);
++    if (!base || capacity < 0 || sourceOffset < 0 || sourceBytes <= 0
++            || static_cast<jlong>(sourceOffset) + sourceBytes > capacity) {
++        throwIllegalArgument(env, "Spektra native RAW owner requires a valid direct Camera2 buffer");
++        return nullptr;
++    }
++    iris_spektra::RawDevelopRequest q;
++    q.source = base + sourceOffset;
++    q.sourceBytes = static_cast<size_t>(sourceBytes);
++    q.sourceWidth = sourceWidth; q.sourceHeight = sourceHeight;
++    q.rowStride = rowStride; q.pixelStride = pixelStride; q.format = format;
++    if (!readInt4(env, rawBoundsArray, q.rawBounds, "rawBounds")
++            || !readInt4(env, sourceCropArray, q.sourceCrop, "sourceCrop")
++            || !readInt4(env, activeRawDomainArray, q.activeRawDomain, "activeRawDomain")
++            || !readInt4(env, blackLevelArray, q.blackLevel4, "blackLevel4")) return nullptr;
++    q.cfaArrangement = cfaArrangement;
++    q.bayerOffset = bayerOffset;
++    q.whiteLevel = whiteLevel;
++    q.lensShadingRows = lensShadingRows;
++    q.lensShadingCols = lensShadingCols;
++    std::vector<float> lens;
++    if (lensShadingArray) {
++        const jsize n = env->GetArrayLength(lensShadingArray);
++        const int64_t expected = static_cast<int64_t>(lensShadingRows) * lensShadingCols * 4ll;
++        if (lensShadingRows <= 0 || lensShadingCols <= 0 || expected != n) {
++            throwIllegalArgument(env, "Spektra lens shading map dimensions mismatch");
++            return nullptr;
++        }
++        lens.resize(static_cast<size_t>(n));
++        env->GetFloatArrayRegion(lensShadingArray, 0, n, lens.data());
++        if (env->ExceptionCheck()) return nullptr;
++        q.lensShading = lens.data();
++    }
++    if (!matrixArray || env->GetArrayLength(matrixArray) != 9) {
++        throwIllegalArgument(env, "Spektra sensor-to-linear-sRGB matrix must have nine values");
++        return nullptr;
++    }
++    env->GetFloatArrayRegion(matrixArray, 0, 9, q.sensorToLinearSrgb);
++    if (env->ExceptionCheck()) return nullptr;
++    q.outputWidth = outputWidth; q.outputHeight = outputHeight;
++    q.savedPhoto = savedPhoto == JNI_TRUE;
++    q.chromaDenoiseStrength = chromaDenoiseStrength;
++    q.sensorClipThreshold = sensorClipThreshold;
++
++    std::vector<uint8_t> rgba;
++    bool dropped = false;
++    double micros = 0.0;
++    std::string error;
++    if (!iris_spektra::SpektraRawVulkanOwner::instance().process(q, &rgba, &dropped, &micros, &error)) {
++        jclass cls = env->FindClass("java/lang/IllegalStateException");
++        if (cls) env->ThrowNew(cls, error.empty() ? "Spektra Vulkan RAW processing failed" : error.c_str());
++        return nullptr;
++    }
++    if (dropped) return nullptr;
++    if (rgba.size() > static_cast<size_t>(0x7fffffff)) {
++        throwIllegalArgument(env, "Spektra Vulkan RAW output is too large");
++        return nullptr;
++    }
++    jbyteArray output = env->NewByteArray(static_cast<jsize>(rgba.size()));
++    if (!output) return nullptr;
++    if (!rgba.empty()) env->SetByteArrayRegion(output, 0, static_cast<jsize>(rgba.size()),
++            reinterpret_cast<const jbyte*>(rgba.data()));
++    return output;
++}
++
++extern "C" JNIEXPORT void JNICALL
++Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeReleaseRawOwner(
++        JNIEnv*, jclass) {
++    iris_spektra::SpektraRawVulkanOwner::instance().release();
++}
++
++extern "C" JNIEXPORT jlongArray JNICALL
++Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeRawOwnerStats(
++        JNIEnv* env, jclass) {
++    uint64_t stats[6] = {};
++    iris_spektra::SpektraRawVulkanOwner::instance().stats(stats);
++    jlong values[6];
++    for (int i=0;i<6;++i) values[i]=static_cast<jlong>(stats[i]);
++    jlongArray out=env->NewLongArray(6);
++    if (out) env->SetLongArrayRegion(out,0,6,values);
++    return out;
++}
++
+ extern "C" JNIEXPORT jboolean JNICALL
+ Java_com_particlesdevs_photoncamera_spektra_SpektraFilmRenderer_nativeInitialize(
+         JNIEnv *env, jclass, jobject assetManager, jstring resourceRoot) {
+diff --git a/app/src/main/cpp/spektra/SpektraRawDevelop.comp b/app/src/main/cpp/spektra/SpektraRawDevelop.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebedaff222881fdf344598efff26c822df374b7b
+--- /dev/null
++++ b/app/src/main/cpp/spektra/SpektraRawDevelop.comp
+@@ -0,0 +1,193 @@
++#version 450
++// IRIS_26686_SPEKTRA_NATIVE_RAW_DEVELOP
++// One Spektra-owned packed RAW -> scene-linear RGBA16F compute path.
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++layout(std430, set = 0, binding = 0) readonly buffer RawBuffer { uint rawWords[]; };
++layout(std430, set = 0, binding = 1) readonly buffer ParamBuffer { uint p[]; };
++layout(std430, set = 0, binding = 2) readonly buffer LscBuffer { vec4 lsc[]; };
++layout(std430, set = 0, binding = 3) writeonly buffer OutputBuffer { uint outWords[]; };
++
++// Parameter indices are mirrored exactly by SpektraRawVulkanOwner.cpp.
++const uint P_SRC_W=0u, P_SRC_H=1u, P_ROW_STRIDE=2u, P_PIXEL_STRIDE=3u, P_FORMAT=4u, P_SRC_BYTES=5u;
++const uint P_CROP_L=6u, P_CROP_T=7u, P_CROP_R=8u, P_CROP_B=9u;
++const uint P_RAW_L=10u, P_RAW_T=11u, P_RAW_R=12u, P_RAW_B=13u;
++const uint P_ACTIVE_L=14u, P_ACTIVE_T=15u, P_ACTIVE_R=16u, P_ACTIVE_B=17u;
++const uint P_CFA=18u, P_BAYER_OFFSET=19u, P_WHITE=20u;
++const uint P_BLACK0=21u, P_BLACK1=22u, P_BLACK2=23u, P_BLACK3=24u;
++const uint P_LSC_COLS=25u, P_LSC_ROWS=26u, P_USE_LSC=27u;
++const uint P_OUT_W=28u, P_OUT_H=29u, P_SAVED=30u, P_CHROMA=31u, P_CLIP=32u;
++const uint P_M0=33u;
++
++uint readByte(uint byteIndex) {
++    if (byteIndex >= p[P_SRC_BYTES]) return 0u;
++    uint w = rawWords[byteIndex >> 2u];
++    return (w >> ((byteIndex & 3u) * 8u)) & 255u;
++}
++
++int clampParity(int value, int lo, int hi, int parity) {
++    int v=clamp(value,lo,hi);
++    if ((v&1)==parity) return v;
++    if (v+1<=hi) return v+1;
++    if (v-1>=lo) return v-1;
++    return v;
++}
++
++ivec2 clampActivePreservePhase(ivec2 xy) {
++    ivec2 lo=ivec2(int(p[P_ACTIVE_L]),int(p[P_ACTIVE_T]));
++    ivec2 hi=ivec2(int(p[P_ACTIVE_R])-1,int(p[P_ACTIVE_B])-1);
++    return ivec2(clampParity(xy.x,lo.x,hi.x,xy.x&1),
++                 clampParity(xy.y,lo.y,hi.y,xy.y&1));
++}
++
++uint rawSample(ivec2 xy) {
++    // Demosaic taps may cross the source crop edge but must never leave the
++    // physically active RAW domain. Preserve CFA phase while clamping so a
++    // border tap cannot silently become a different Bayer channel.
++    xy=clampActivePreservePhase(xy);
++    uint row=uint(xy.y)*p[P_ROW_STRIDE];
++    uint x=uint(xy.x);
++    uint fmt=p[P_FORMAT];
++    if (fmt==37u) { // ImageFormat.RAW10
++        uint q=row+(x>>2u)*5u, lane=x&3u;
++        return (readByte(q+lane)<<2u) | ((readByte(q+4u)>>(lane*2u))&3u);
++    }
++    if (fmt==38u) { // ImageFormat.RAW12
++        uint q=row+(x>>1u)*3u, lane=x&1u, lo=readByte(q+2u);
++        return (readByte(q+lane)<<4u) | (lane==0u ? (lo&15u) : ((lo>>4u)&15u));
++    }
++    uint stride=max(2u,p[P_PIXEL_STRIDE]);
++    uint q=row+x*stride;
++    return readByte(q) | (readByte(q+1u)<<8u);
++}
++
++int phaseAt(ivec2 xy) { return (xy.x&1) | ((xy.y&1)<<1); }
++int colorAt(ivec2 xy) {
++    int q=phaseAt(xy), cfa=int(p[P_CFA]);
++    if (q==cfa) return 0;
++    if (q==(cfa^3)) return 2;
++    return 1;
++}
++
++int semanticLscChannel(ivec2 xy) {
++    int q=phaseAt(xy), cfa=int(p[P_CFA]);
++    if (q==cfa) return 0;
++    if (q==(cfa^3)) return 3;
++    // Camera2 LensShadingMap channels are [R, G_even, G_odd, B]. The CFA
++    // arrangement above is already shifted into RAW-raster phase, but green
++    // even/odd is defined in the sensor Bayer-row domain. Recover that row
++    // parity explicitly from the verified Bayer-origin offset.
++    int sensorRowParity=(xy.y&1)^((int(p[P_BAYER_OFFSET])>>1)&1);
++    return sensorRowParity==0 ? 1 : 2;
++}
++
++float lscGain(ivec2 xy) {
++    if (p[P_USE_LSC]==0u || p[P_LSC_COLS]==0u || p[P_LSC_ROWS]==0u) return 1.0;
++    vec2 activeMin=vec2(float(p[P_ACTIVE_L]),float(p[P_ACTIVE_T]));
++    vec2 activeMax=vec2(float(max(p[P_ACTIVE_L]+1u,p[P_ACTIVE_R]-1u)),float(max(p[P_ACTIVE_T]+1u,p[P_ACTIVE_B]-1u)));
++    vec2 uv=clamp((vec2(xy)-activeMin)/max(activeMax-activeMin,vec2(1.0)),vec2(0.0),vec2(1.0));
++    vec2 pos=uv*vec2(max(1u,p[P_LSC_COLS]-1u),max(1u,p[P_LSC_ROWS]-1u));
++    uvec2 a=uvec2(floor(pos));
++    uvec2 b=min(a+uvec2(1),uvec2(p[P_LSC_COLS]-1u,p[P_LSC_ROWS]-1u));
++    vec2 f=fract(pos);
++    int ch=semanticLscChannel(xy);
++    float g00=lsc[a.y*p[P_LSC_COLS]+a.x][ch];
++    float g10=lsc[a.y*p[P_LSC_COLS]+b.x][ch];
++    float g01=lsc[b.y*p[P_LSC_COLS]+a.x][ch];
++    float g11=lsc[b.y*p[P_LSC_COLS]+b.x][ch];
++    return mix(mix(g00,g10,f.x),mix(g01,g11,f.x),f.y);
++}
++
++float sampleNorm(ivec2 xy) {
++    int q=phaseAt(xy);
++    uint black=q==0 ? p[P_BLACK0] : q==1 ? p[P_BLACK1] : q==2 ? p[P_BLACK2] : p[P_BLACK3];
++    float denom=max(1.0,float(p[P_WHITE])-float(black));
++    return max(0.0,(float(rawSample(xy))-float(black))/denom)*lscGain(xy);
++}
++
++float averageColor(ivec2 xy, int target, bool diagonal) {
++    float sum=0.0; int n=0;
++    ivec2 d0=diagonal ? ivec2(-1,-1) : ivec2(-1,0);
++    ivec2 d1=diagonal ? ivec2( 1,-1) : ivec2( 1,0);
++    ivec2 d2=diagonal ? ivec2(-1, 1) : ivec2(0,-1);
++    ivec2 d3=diagonal ? ivec2( 1, 1) : ivec2(0, 1);
++    ivec2 ds[4]=ivec2[4](d0,d1,d2,d3);
++    for(int i=0;i<4;i++) { ivec2 q=xy+ds[i]; if(colorAt(q)==target){sum+=sampleNorm(q);n++;} }
++    if(n==0) {
++        ivec2 ds2[8]=ivec2[8](ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2),ivec2(-2,-2),ivec2(2,-2),ivec2(-2,2),ivec2(2,2));
++        for(int i=0;i<8;i++){ivec2 q=xy+ds2[i];if(colorAt(q)==target){sum+=sampleNorm(q);n++;}}
++    }
++    return n>0 ? sum/float(n) : sampleNorm(xy);
++}
++
++vec3 demosaicRaw(ivec2 xy) {
++    int c=colorAt(xy);
++    vec3 rgb;
++    if(c==0){rgb.r=sampleNorm(xy);rgb.g=averageColor(xy,1,false);rgb.b=averageColor(xy,2,true);}
++    else if(c==2){rgb.b=sampleNorm(xy);rgb.g=averageColor(xy,1,false);rgb.r=averageColor(xy,0,true);}
++    else {rgb.g=sampleNorm(xy);rgb.r=averageColor(xy,0,false);rgb.b=averageColor(xy,2,false);}
++    return max(rgb,vec3(0.0));
++}
++
++vec3 highlightRecover(ivec2 xy, vec3 center) {
++    if(p[P_SAVED]==0u) return center;
++    float clip=uintBitsToFloat(p[P_CLIP]);
++    bvec3 clipped=greaterThanEqual(center,vec3(clip));
++    if(!any(clipped) || all(clipped)) return center;
++    vec3 n=(demosaicRaw(xy+ivec2(-2,0))+demosaicRaw(xy+ivec2(2,0))
++           +demosaicRaw(xy+ivec2(0,-2))+demosaicRaw(xy+ivec2(0,2)))*0.25;
++    float cg=max(center.g,1e-5), ng=max(n.g,1e-5);
++    vec3 ratio=n/ng;
++    if(clipped.r) center.r=max(center.r,ratio.r*cg);
++    if(clipped.b) center.b=max(center.b,ratio.b*cg);
++    if(clipped.g) {
++        float fromR=center.r/max(ratio.r,1e-4);
++        float fromB=center.b/max(ratio.b,1e-4);
++        center.g=max(center.g,0.5*(fromR+fromB));
++    }
++    return center;
++}
++
++vec3 sensorToLinear(vec3 rgb) {
++    vec3 r0=vec3(uintBitsToFloat(p[P_M0+0u]),uintBitsToFloat(p[P_M0+1u]),uintBitsToFloat(p[P_M0+2u]));
++    vec3 r1=vec3(uintBitsToFloat(p[P_M0+3u]),uintBitsToFloat(p[P_M0+4u]),uintBitsToFloat(p[P_M0+5u]));
++    vec3 r2=vec3(uintBitsToFloat(p[P_M0+6u]),uintBitsToFloat(p[P_M0+7u]),uintBitsToFloat(p[P_M0+8u]));
++    return vec3(dot(r0,rgb),dot(r1,rgb),dot(r2,rgb)); // explicit row-major convention
++}
++
++vec3 linearAt(ivec2 xy) { return sensorToLinear(highlightRecover(xy,demosaicRaw(xy))); }
++
++vec3 reconstructForOutput(uvec2 outxy) {
++    int cropL=int(p[P_CROP_L]), cropT=int(p[P_CROP_T]);
++    int cropW=int(p[P_CROP_R]-p[P_CROP_L]), cropH=int(p[P_CROP_B]-p[P_CROP_T]);
++    int outW=int(p[P_OUT_W]), outH=int(p[P_OUT_H]);
++    if(p[P_SAVED]!=0u && outW==cropW && outH==cropH) return linearAt(ivec2(cropL+int(outxy.x),cropT+int(outxy.y)));
++    // VF-S: reconstruct in source RAW first, then sample multiple positions inside each reduced footprint.
++    vec2 lo=vec2(cropL,cropT)+vec2(outxy)*vec2(cropW,cropH)/vec2(outW,outH);
++    vec2 hi=vec2(cropL,cropT)+vec2(outxy+uvec2(1))*vec2(cropW,cropH)/vec2(outW,outH);
++    ivec2 a=ivec2(floor(mix(lo,hi,0.25))), b=ivec2(floor(mix(lo,hi,0.75)));
++    return 0.25*(linearAt(ivec2(a.x,a.y))+linearAt(ivec2(b.x,a.y))+linearAt(ivec2(a.x,b.y))+linearAt(ivec2(b.x,b.y)));
++}
++
++vec3 savedChroma(vec3 center, uvec2 outxy) {
++    if(p[P_SAVED]==0u) return center;
++    float strength=clamp(uintBitsToFloat(p[P_CHROMA]),0.0,1.0);
++    if(strength<=0.0) return center;
++    int cropL=int(p[P_CROP_L]), cropT=int(p[P_CROP_T]);
++    ivec2 xy=ivec2(cropL+int(outxy.x),cropT+int(outxy.y));
++    vec3 avg=(linearAt(xy+ivec2(-2,0))+linearAt(xy+ivec2(2,0))+linearAt(xy+ivec2(0,-2))+linearAt(xy+ivec2(0,2)))*0.25;
++    const vec3 yv=vec3(0.2126,0.7152,0.0722);
++    float yc=dot(center,yv), ya=dot(avg,yv);
++    vec3 chromaCenter=center-vec3(yc), chromaAvg=avg-vec3(ya);
++    return vec3(yc)+mix(chromaCenter,chromaAvg,strength);
++}
++
++void main(){
++    uvec2 o=gl_GlobalInvocationID.xy;
++    if(o.x>=p[P_OUT_W] || o.y>=p[P_OUT_H]) return;
++    vec3 rgb=savedChroma(reconstructForOutput(o),o);
++    if(any(isnan(rgb)) || any(isinf(rgb))) rgb=vec3(0.0);
++    rgb=max(rgb,vec3(0.0));
++    uint index=(o.y*p[P_OUT_W]+o.x)*2u;
++    outWords[index+0u]=packHalf2x16(rgb.rg);
++    outWords[index+1u]=packHalf2x16(vec2(rgb.b,1.0));
++}
+diff --git a/app/src/main/cpp/spektra/SpektraRawVulkanOwner.cpp b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..87b6a76e3f0be35a52808920b6ffc7d271fc4b8f
+--- /dev/null
++++ b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.cpp
+@@ -0,0 +1,378 @@
++#include "SpektraRawVulkanOwner.h"
++#include "SpektraEmbeddedShaders.h"
++
++#include <vulkan/vulkan.h>
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <mutex>
++#include <sstream>
++#include <vector>
++
++namespace iris_spektra {
++namespace {
++
++constexpr uint32_t kParamWords = 42u;
++constexpr const char* kRawShaderName = "SpektraRawDevelop.comp.spv";
++
++uint32_t floatBits(float v) {
++    uint32_t u = 0;
++    static_assert(sizeof(u) == sizeof(v), "float bits");
++    std::memcpy(&u, &v, sizeof(u));
++    return u;
++}
++
++std::string vkError(const char* where, VkResult result) {
++    std::ostringstream out;
++    out << where << " failed VkResult=" << static_cast<int>(result);
++    return out.str();
++}
++
++struct Buffer {
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    void* mapped = nullptr;
++    VkDeviceSize capacity = 0;
++};
++
++} // namespace
++
++struct SpektraRawVulkanOwner::Impl {
++    std::mutex workMutex;
++    std::atomic<bool> savedWaiting{false};
++    VkInstance instance = VK_NULL_HANDLE;
++    VkPhysicalDevice physical = VK_NULL_HANDLE;
++    VkDevice device = VK_NULL_HANDLE;
++    uint32_t queueFamily = UINT32_MAX;
++    VkQueue queue = VK_NULL_HANDLE;
++    VkDescriptorSetLayout descriptorLayout = VK_NULL_HANDLE;
++    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
++    VkPipeline pipeline = VK_NULL_HANDLE;
++    VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
++    VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
++    VkCommandPool commandPool = VK_NULL_HANDLE;
++    VkCommandBuffer command = VK_NULL_HANDLE;
++    VkFence fence = VK_NULL_HANDLE;
++    Buffer raw, params, lsc, output;
++    bool initialized = false;
++    uint64_t previewProcessed = 0;
++    uint64_t previewDropped = 0;
++    uint64_t previewMicrosTotal = 0;
++    uint64_t lastStillMicros = 0;
++
++    ~Impl() { destroy(); }
++
++    void destroyBuffer(Buffer& b) {
++        if (device != VK_NULL_HANDLE && b.memory != VK_NULL_HANDLE && b.mapped) vkUnmapMemory(device, b.memory);
++        if (device != VK_NULL_HANDLE && b.buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, b.buffer, nullptr);
++        if (device != VK_NULL_HANDLE && b.memory != VK_NULL_HANDLE) vkFreeMemory(device, b.memory, nullptr);
++        b = Buffer{};
++    }
++
++    void destroy() {
++        if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
++        destroyBuffer(output); destroyBuffer(lsc); destroyBuffer(params); destroyBuffer(raw);
++        if (device != VK_NULL_HANDLE && fence != VK_NULL_HANDLE) vkDestroyFence(device, fence, nullptr);
++        if (device != VK_NULL_HANDLE && commandPool != VK_NULL_HANDLE) vkDestroyCommandPool(device, commandPool, nullptr);
++        if (device != VK_NULL_HANDLE && descriptorPool != VK_NULL_HANDLE) vkDestroyDescriptorPool(device, descriptorPool, nullptr);
++        if (device != VK_NULL_HANDLE && pipeline != VK_NULL_HANDLE) vkDestroyPipeline(device, pipeline, nullptr);
++        if (device != VK_NULL_HANDLE && pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
++        if (device != VK_NULL_HANDLE && descriptorLayout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(device, descriptorLayout, nullptr);
++        if (device != VK_NULL_HANDLE) vkDestroyDevice(device, nullptr);
++        if (instance != VK_NULL_HANDLE) vkDestroyInstance(instance, nullptr);
++        instance = VK_NULL_HANDLE; physical = VK_NULL_HANDLE; device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
++        descriptorLayout = VK_NULL_HANDLE; pipelineLayout = VK_NULL_HANDLE; pipeline = VK_NULL_HANDLE;
++        descriptorPool = VK_NULL_HANDLE; descriptorSet = VK_NULL_HANDLE; commandPool = VK_NULL_HANDLE;
++        command = VK_NULL_HANDLE; fence = VK_NULL_HANDLE; queueFamily = UINT32_MAX; initialized = false;
++    }
++
++    bool memoryType(uint32_t typeBits, VkMemoryPropertyFlags required, uint32_t* out) const {
++        VkPhysicalDeviceMemoryProperties props{};
++        vkGetPhysicalDeviceMemoryProperties(physical, &props);
++        for (uint32_t i = 0; i < props.memoryTypeCount; ++i) {
++            if ((typeBits & (1u << i)) != 0u && (props.memoryTypes[i].propertyFlags & required) == required) {
++                *out = i; return true;
++            }
++        }
++        return false;
++    }
++
++    bool ensureBuffer(Buffer& b, VkDeviceSize needed, std::string* error) {
++        needed = std::max<VkDeviceSize>(needed, 16u);
++        if (b.buffer != VK_NULL_HANDLE && b.capacity >= needed) return true;
++        destroyBuffer(b);
++        VkDeviceSize capacity = 4096u;
++        while (capacity < needed) capacity = std::max(capacity * 2u, needed);
++        VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++        bi.size = capacity;
++        bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++        bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        VkResult r = vkCreateBuffer(device, &bi, nullptr, &b.buffer);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateBuffer", r); return false; }
++        VkMemoryRequirements req{};
++        vkGetBufferMemoryRequirements(device, b.buffer, &req);
++        uint32_t memoryIndex = 0;
++        if (!memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &memoryIndex)) {
++            if (error) *error = "No HOST_VISIBLE|HOST_COHERENT Vulkan memory type for Spektra RAW buffers";
++            return false;
++        }
++        VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++        ai.allocationSize = req.size;
++        ai.memoryTypeIndex = memoryIndex;
++        r = vkAllocateMemory(device, &ai, nullptr, &b.memory);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkAllocateMemory", r); return false; }
++        r = vkBindBufferMemory(device, b.buffer, b.memory, 0);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkBindBufferMemory", r); return false; }
++        r = vkMapMemory(device, b.memory, 0, capacity, 0, &b.mapped);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkMapMemory", r); return false; }
++        b.capacity = capacity;
++        return true;
++    }
++
++    bool updateDescriptors(std::string* error) {
++        Buffer* buffers[4] = {&raw, &params, &lsc, &output};
++        VkDescriptorBufferInfo infos[4]{};
++        VkWriteDescriptorSet writes[4]{};
++        for (uint32_t i = 0; i < 4; ++i) {
++            infos[i].buffer = buffers[i]->buffer;
++            infos[i].offset = 0;
++            infos[i].range = buffers[i]->capacity;
++            writes[i] = VkWriteDescriptorSet{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
++            writes[i].dstSet = descriptorSet;
++            writes[i].dstBinding = i;
++            writes[i].descriptorCount = 1;
++            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++            writes[i].pBufferInfo = &infos[i];
++        }
++        if (descriptorSet == VK_NULL_HANDLE) { if (error) *error = "Spektra descriptor set missing"; return false; }
++        vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
++        return true;
++    }
++
++    bool initialize(std::string* error) {
++        if (initialized) return true;
++        destroy();
++        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
++        app.pApplicationName = "IrisSpektraRaw";
++        app.applicationVersion = 26686;
++        app.pEngineName = "IrisSpektraRaw";
++        app.engineVersion = 1;
++        app.apiVersion = VK_API_VERSION_1_0;
++        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
++        ici.pApplicationInfo = &app;
++        VkResult r = vkCreateInstance(&ici, nullptr, &instance);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateInstance", r); destroy(); return false; }
++        uint32_t physicalCount = 0;
++        r = vkEnumeratePhysicalDevices(instance, &physicalCount, nullptr);
++        if (r != VK_SUCCESS || physicalCount == 0) { if (error) *error = "No Vulkan physical device"; destroy(); return false; }
++        std::vector<VkPhysicalDevice> physicals(physicalCount);
++        vkEnumeratePhysicalDevices(instance, &physicalCount, physicals.data());
++        physical = physicals[0];
++        uint32_t familyCount = 0;
++        vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, nullptr);
++        std::vector<VkQueueFamilyProperties> families(familyCount);
++        vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, families.data());
++        for (uint32_t i = 0; i < familyCount; ++i) {
++            if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) != 0u) { queueFamily = i; break; }
++        }
++        if (queueFamily == UINT32_MAX) { if (error) *error = "No Vulkan compute queue"; destroy(); return false; }
++        float priority = 1.0f;
++        VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
++        qci.queueFamilyIndex = queueFamily; qci.queueCount = 1; qci.pQueuePriorities = &priority;
++        VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
++        dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
++        r = vkCreateDevice(physical, &dci, nullptr, &device);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateDevice", r); destroy(); return false; }
++        vkGetDeviceQueue(device, queueFamily, 0, &queue);
++
++        VkDescriptorSetLayoutBinding bindings[4]{};
++        for (uint32_t i = 0; i < 4; ++i) {
++            bindings[i].binding = i;
++            bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++            bindings[i].descriptorCount = 1;
++            bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++        }
++        VkDescriptorSetLayoutCreateInfo dl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
++        dl.bindingCount = 4; dl.pBindings = bindings;
++        r = vkCreateDescriptorSetLayout(device, &dl, nullptr, &descriptorLayout);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateDescriptorSetLayout", r); destroy(); return false; }
++        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
++        pli.setLayoutCount = 1; pli.pSetLayouts = &descriptorLayout;
++        r = vkCreatePipelineLayout(device, &pli, nullptr, &pipelineLayout);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreatePipelineLayout", r); destroy(); return false; }
++
++        size_t shaderCount = 0;
++        const EmbeddedShader* shaders = embeddedShaders(&shaderCount);
++        const EmbeddedShader* rawShader = nullptr;
++        for (size_t i = 0; i < shaderCount; ++i) {
++            if (shaders[i].name && std::strcmp(shaders[i].name, kRawShaderName) == 0) { rawShader = &shaders[i]; break; }
++        }
++        if (!rawShader || rawShader->bytes == 0 || (rawShader->bytes & 3u) != 0u) {
++            if (error) *error = "Embedded SpektraRawDevelop.comp.spv missing or malformed"; destroy(); return false;
++        }
++        std::vector<uint32_t> code(rawShader->bytes / 4u);
++        std::memcpy(code.data(), rawShader->data, rawShader->bytes);
++        VkShaderModuleCreateInfo sm{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++        sm.codeSize = rawShader->bytes; sm.pCode = code.data();
++        VkShaderModule module = VK_NULL_HANDLE;
++        r = vkCreateShaderModule(device, &sm, nullptr, &module);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateShaderModule", r); destroy(); return false; }
++        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
++        stage.stage = VK_SHADER_STAGE_COMPUTE_BIT; stage.module = module; stage.pName = "main";
++        VkComputePipelineCreateInfo cp{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
++        cp.stage = stage; cp.layout = pipelineLayout;
++        r = vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &cp, nullptr, &pipeline);
++        vkDestroyShaderModule(device, module, nullptr);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateComputePipelines", r); destroy(); return false; }
++
++        VkDescriptorPoolSize ps{}; ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; ps.descriptorCount = 4;
++        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
++        dpi.maxSets = 1; dpi.poolSizeCount = 1; dpi.pPoolSizes = &ps;
++        r = vkCreateDescriptorPool(device, &dpi, nullptr, &descriptorPool);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateDescriptorPool", r); destroy(); return false; }
++        VkDescriptorSetAllocateInfo dai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
++        dai.descriptorPool = descriptorPool; dai.descriptorSetCount = 1; dai.pSetLayouts = &descriptorLayout;
++        r = vkAllocateDescriptorSets(device, &dai, &descriptorSet);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkAllocateDescriptorSets", r); destroy(); return false; }
++        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
++        cpi.queueFamilyIndex = queueFamily; cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
++        r = vkCreateCommandPool(device, &cpi, nullptr, &commandPool);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateCommandPool", r); destroy(); return false; }
++        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
++        cai.commandPool = commandPool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = 1;
++        r = vkAllocateCommandBuffers(device, &cai, &command);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkAllocateCommandBuffers", r); destroy(); return false; }
++        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++        r = vkCreateFence(device, &fi, nullptr, &fence);
++        if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateFence", r); destroy(); return false; }
++        initialized = true;
++        return true;
++    }
++
++    bool validate(const RawDevelopRequest& q, std::string* error) const {
++        auto fail = [&](const char* m){ if(error)*error=m; return false; };
++        if (!q.source || q.sourceBytes == 0 || q.sourceWidth <= 1 || q.sourceHeight <= 1 || q.rowStride <= 0) return fail("Invalid packed RAW input");
++        if (q.format != 32 && q.format != 37 && q.format != 38) return fail("Unsupported packed RAW format");
++        const int minRow = q.format == 37 ? ((q.sourceWidth + 3) / 4) * 5
++                : q.format == 38 ? ((q.sourceWidth + 1) / 2) * 3
++                : q.sourceWidth * std::max(2, q.pixelStride);
++        const uint64_t requiredBytes = static_cast<uint64_t>(q.sourceHeight - 1)
++                * static_cast<uint64_t>(q.rowStride) + static_cast<uint64_t>(minRow);
++        if (q.rowStride < minRow || requiredBytes > q.sourceBytes) return fail("Packed RAW row-stride/buffer contract mismatch");
++        if (q.cfaArrangement < 0 || q.cfaArrangement > 3 || q.bayerOffset < 0 || q.bayerOffset > 3) return fail("Unresolved CFA/Bayer origin");
++        if (q.whiteLevel <= 0 || q.outputWidth <= 0 || q.outputHeight <= 0) return fail("Invalid RAW/output levels");
++        if (q.rawBounds[0] < 0 || q.rawBounds[1] < 0 || q.rawBounds[2] > q.sourceWidth || q.rawBounds[3] > q.sourceHeight
++                || q.rawBounds[2] <= q.rawBounds[0] || q.rawBounds[3] <= q.rawBounds[1]) return fail("Invalid RAW bounds");
++        const int* domains[2] = {q.sourceCrop, q.activeRawDomain};
++        for (const int* r : domains) {
++            if (r[0] < q.rawBounds[0] || r[1] < q.rawBounds[1] || r[2] > q.rawBounds[2] || r[3] > q.rawBounds[3]
++                    || r[2] <= r[0] || r[3] <= r[1]) return fail("RAW domains disagree");
++        }
++        if (q.activeRawDomain[2] - q.activeRawDomain[0] < 2
++                || q.activeRawDomain[3] - q.activeRawDomain[1] < 2) return fail("Active RAW domain cannot preserve CFA phase");
++        if (q.lensShading && (q.lensShadingRows <= 0 || q.lensShadingCols <= 0)) return fail("Invalid lens shading dimensions");
++        return true;
++    }
++
++    bool run(const RawDevelopRequest& q, std::vector<uint8_t>* rgba16f, std::string* error) {
++        if (!validate(q, error) || !initialize(error)) return false;
++        const size_t rawPadded = (q.sourceBytes + 3u) & ~size_t(3u);
++        const size_t lscFloats = q.lensShading && q.lensShadingRows > 0 && q.lensShadingCols > 0
++                ? static_cast<size_t>(q.lensShadingRows) * q.lensShadingCols * 4u : 4u;
++        const size_t lscBytes = lscFloats * sizeof(float);
++        const size_t outputBytes = static_cast<size_t>(q.outputWidth) * q.outputHeight * 8u;
++        if (!ensureBuffer(raw, rawPadded, error) || !ensureBuffer(params, kParamWords * sizeof(uint32_t), error)
++                || !ensureBuffer(lsc, lscBytes, error) || !ensureBuffer(output, outputBytes, error)) return false;
++        std::memcpy(raw.mapped, q.source, q.sourceBytes);
++        if (rawPadded > q.sourceBytes) {
++            std::memset(static_cast<uint8_t*>(raw.mapped) + q.sourceBytes, 0, rawPadded - q.sourceBytes);
++        }
++        std::vector<uint32_t> words(kParamWords, 0u);
++        words[0]=q.sourceWidth; words[1]=q.sourceHeight; words[2]=q.rowStride; words[3]=q.pixelStride;
++        words[4]=q.format; words[5]=static_cast<uint32_t>(q.sourceBytes);
++        for(int i=0;i<4;i++){ words[6+i]=static_cast<uint32_t>(q.sourceCrop[i]); words[10+i]=static_cast<uint32_t>(q.rawBounds[i]); words[14+i]=static_cast<uint32_t>(q.activeRawDomain[i]); }
++        words[18]=static_cast<uint32_t>(q.cfaArrangement); words[19]=static_cast<uint32_t>(q.bayerOffset); words[20]=static_cast<uint32_t>(q.whiteLevel);
++        for(int i=0;i<4;i++) words[21+i]=static_cast<uint32_t>(std::max(0,q.blackLevel4[i]));
++        words[25]=static_cast<uint32_t>(std::max(0,q.lensShadingCols)); words[26]=static_cast<uint32_t>(std::max(0,q.lensShadingRows));
++        words[27]=q.lensShading ? 1u : 0u; words[28]=q.outputWidth; words[29]=q.outputHeight; words[30]=q.savedPhoto?1u:0u;
++        words[31]=floatBits(q.chromaDenoiseStrength); words[32]=floatBits(q.sensorClipThreshold);
++        for(int i=0;i<9;i++) words[33+i]=floatBits(q.sensorToLinearSrgb[i]);
++        std::memcpy(params.mapped, words.data(), words.size()*sizeof(uint32_t));
++        if (q.lensShading) std::memcpy(lsc.mapped, q.lensShading, lscBytes);
++        else { float unity[4]={1.f,1.f,1.f,1.f}; std::memcpy(lsc.mapped, unity, sizeof(unity)); }
++        if (!updateDescriptors(error)) return false;
++        vkResetFences(device,1,&fence);
++        vkResetCommandBuffer(command,0);
++        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
++        bi.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
++        VkResult r=vkBeginCommandBuffer(command,&bi);
++        if(r!=VK_SUCCESS){if(error)*error=vkError("vkBeginCommandBuffer",r);return false;}
++        vkCmdBindPipeline(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipeline);
++        vkCmdBindDescriptorSets(command,VK_PIPELINE_BIND_POINT_COMPUTE,pipelineLayout,0,1,&descriptorSet,0,nullptr);
++        vkCmdDispatch(command,(static_cast<uint32_t>(q.outputWidth)+7u)/8u,(static_cast<uint32_t>(q.outputHeight)+7u)/8u,1u);
++        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++        barrier.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
++        vkCmdPipelineBarrier(command,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,1,&barrier,0,nullptr,0,nullptr);
++        r=vkEndCommandBuffer(command);
++        if(r!=VK_SUCCESS){if(error)*error=vkError("vkEndCommandBuffer",r);return false;}
++        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&command;
++        r=vkQueueSubmit(queue,1,&si,fence);
++        if(r!=VK_SUCCESS){if(error)*error=vkError("vkQueueSubmit",r);return false;}
++        r=vkWaitForFences(device,1,&fence,VK_TRUE,UINT64_MAX);
++        if(r!=VK_SUCCESS){if(error)*error=vkError("vkWaitForFences",r);return false;}
++        rgba16f->resize(outputBytes);
++        std::memcpy(rgba16f->data(),output.mapped,outputBytes);
++        return true;
++    }
++};
++
++SpektraRawVulkanOwner& SpektraRawVulkanOwner::instance() {
++    static SpektraRawVulkanOwner owner;
++    return owner;
++}
++
++SpektraRawVulkanOwner::SpektraRawVulkanOwner() : impl_(new Impl()) {}
++SpektraRawVulkanOwner::~SpektraRawVulkanOwner() { delete impl_; }
++
++bool SpektraRawVulkanOwner::process(const RawDevelopRequest& request, std::vector<uint8_t>* rgba16f,
++        bool* previewDropped, double* elapsedMicros, std::string* error) {
++    if (previewDropped) *previewDropped=false;
++    const auto start=std::chrono::steady_clock::now();
++    std::unique_lock<std::mutex> lock(impl_->workMutex,std::defer_lock);
++    if (request.savedPhoto) {
++        impl_->savedWaiting.store(true,std::memory_order_release);
++        lock.lock();
++        impl_->savedWaiting.store(false,std::memory_order_release);
++    } else {
++        if (impl_->savedWaiting.load(std::memory_order_acquire) || !lock.try_lock()) {
++            impl_->previewDropped++;
++            if (previewDropped) *previewDropped=true;
++            return true;
++        }
++    }
++    bool ok=impl_->run(request,rgba16f,error);
++    const auto stop=std::chrono::steady_clock::now();
++    const uint64_t micros=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(stop-start).count());
++    if (elapsedMicros) *elapsedMicros=static_cast<double>(micros);
++    if (request.savedPhoto) impl_->lastStillMicros=micros;
++    else if (ok) { impl_->previewProcessed++; impl_->previewMicrosTotal+=micros; }
++    return ok;
++}
++
++void SpektraRawVulkanOwner::release() {
++    std::lock_guard<std::mutex> lock(impl_->workMutex);
++    impl_->destroy();
++}
++
++void SpektraRawVulkanOwner::stats(uint64_t out[6]) {
++    std::lock_guard<std::mutex> lock(impl_->workMutex);
++    out[0]=impl_->previewProcessed;
++    out[1]=impl_->previewDropped;
++    out[2]=impl_->previewProcessed ? impl_->previewMicrosTotal/impl_->previewProcessed : 0;
++    out[3]=impl_->lastStillMicros;
++    out[4]=impl_->initialized ? 1u : 0u;
++    out[5]=impl_->initialized ? 4u : 0u;
++}
++
++} // namespace iris_spektra
+diff --git a/app/src/main/cpp/spektra/SpektraRawVulkanOwner.h b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..693584f510428f5de2b25c603a23f2fc9af69a68
+--- /dev/null
++++ b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.h
+@@ -0,0 +1,53 @@
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <vector>
++#include <string>
++
++namespace iris_spektra {
++
++struct RawDevelopRequest {
++    const uint8_t* source = nullptr;
++    size_t sourceBytes = 0;
++    int sourceWidth = 0;
++    int sourceHeight = 0;
++    int rowStride = 0;
++    int pixelStride = 0;
++    int format = 0;
++    int rawBounds[4] = {};
++    int sourceCrop[4] = {};
++    int activeRawDomain[4] = {};
++    int cfaArrangement = -1;
++    int bayerOffset = -1;
++    int blackLevel4[4] = {};
++    int whiteLevel = 0;
++    const float* lensShading = nullptr;
++    int lensShadingRows = 0;
++    int lensShadingCols = 0;
++    float sensorToLinearSrgb[9] = {};
++    int outputWidth = 0;
++    int outputHeight = 0;
++    bool savedPhoto = false;
++    float chromaDenoiseStrength = 0.0f;
++    float sensorClipThreshold = 0.985f;
++};
++
++class SpektraRawVulkanOwner {
++public:
++    static SpektraRawVulkanOwner& instance();
++    bool process(const RawDevelopRequest& request, std::vector<uint8_t>* rgba16f, bool* previewDropped,
++                 double* elapsedMicros, std::string* error);
++    void release();
++    void stats(uint64_t out[6]);
++
++private:
++    SpektraRawVulkanOwner();
++    ~SpektraRawVulkanOwner();
++    SpektraRawVulkanOwner(const SpektraRawVulkanOwner&) = delete;
++    SpektraRawVulkanOwner& operator=(const SpektraRawVulkanOwner&) = delete;
++    struct Impl;
++    Impl* impl_;
++};
++
++} // namespace iris_spektra
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+index 523d6d78f1ecf02b92e869751525093eaefc2353..b2cfab5c8bd8560e1c86e4378b7d052c53eb6307 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+@@ -74,7 +74,7 @@ public final class SpektraCameraOwner {
+     private static final long PREVIEW_FIRST_FRAME_TIMEOUT_MS = 6500L;
+     private static final long STILL_CONFIG_TIMEOUT_MS = 4500L;
+     private static final long STILL_CAPTURE_TIMEOUT_MS = 6500L;
+-    private static final int SPEKTRA_PROFILE_SCHEMA = 26685;
++    private static final int SPEKTRA_PROFILE_SCHEMA = 26686;
+ 
+     public enum State {
+         IDLE, OPENING, CONFIGURING, STREAMING,
+@@ -231,7 +231,7 @@ public final class SpektraCameraOwner {
+         ensureThread();
+         cameraHandler.post(() -> {
+             closeCameraObjects(false);
+-            events.onCameraRestarted();
++            activity.runOnUiThread(events::onCameraRestarted);
+             openForPreview(g, true);
+         });
+     }
+@@ -446,8 +446,11 @@ public final class SpektraCameraOwner {
+                         this::onFirstPreviewFramePresented);
+             }
+             previewRenderer.configure(characteristics, previewSize, previewProcessSize, rawFormat);
+-            events.onCharacteristicsUpdated(characteristics);
+-            events.onOpenCamera(cameraManager);
++            activity.runOnUiThread(() -> {
++                if (!isCurrent(g)) return;
++                events.onCharacteristicsUpdated(characteristics);
++                events.onOpenCamera(cameraManager);
++            });
+             // Keep the legacy viewfinder visible until the first validated Spektra frame is
+             // actually posted. This prevents a stale SurfaceView buffer from masquerading as a
+             // live Spektra preview during ownership handoff.
+@@ -571,7 +574,7 @@ public final class SpektraCameraOwner {
+                 lensProfiles.edit().clear()
+                         .putInt("profileSchema", SPEKTRA_PROFILE_SCHEMA)
+                         .putString("topologyFingerprint", fingerprint).apply();
+-                Log.i(TAG, "IRIS_26685_SPEKTRA_DISCOVERY_INVALIDATE priorSchema=" + priorSchema
++                Log.i(TAG, "IRIS_26686_SPEKTRA_DISCOVERY_INVALIDATE priorSchema=" + priorSchema
+                         + " topologyChanged=" + !fingerprint.equals(prior));
+             }
+             SharedPreferences.Editor e = lensProfiles.edit();
+@@ -610,6 +613,7 @@ public final class SpektraCameraOwner {
+     private List<Route> enumerateSpektraRoutes() throws CameraAccessException {
+         java.util.LinkedHashMap<String, Route> out = new java.util.LinkedHashMap<>();
+         java.util.HashSet<String> claimedPhysicalIds = new java.util.HashSet<>();
++        java.util.HashSet<String> logicalOwnersWithPhysicalRaw = new java.util.HashSet<>();
+         final String[] publicIds = cameraManager.getCameraIdList();
+ 
+         // First establish logical->physical ownership. A physical lens owns RAW/calibration; the
+@@ -627,6 +631,7 @@ public final class SpektraCameraOwner {
+                         Route r = new Route(publicId + "-" + physicalId, publicId, physicalId, physicalId);
+                         out.put(routeProfileId(r), r);
+                         claimedPhysicalIds.add(physicalId);
++                        logicalOwnersWithPhysicalRaw.add(publicId);
+                     } catch (Throwable ignored) {}
+                 }
+             }
+@@ -635,7 +640,7 @@ public final class SpektraCameraOwner {
+         // Then add true direct RAW cameras that were not already claimed as a child of a logical
+         // owner. This prevents duplicate 0/2 + 2/direct profiles on devices that publicly list both.
+         for (String publicId : publicIds) {
+-            if (claimedPhysicalIds.contains(publicId)) continue;
++            if (claimedPhysicalIds.contains(publicId) || logicalOwnersWithPhysicalRaw.contains(publicId)) continue;
+             CameraCharacteristics direct = cameraManager.getCameraCharacteristics(publicId);
+             if (!hasRawCapability(direct) || !hasManualSensorCapability(direct)) continue;
+             Route r = new Route(publicId, publicId, publicId, null);
+@@ -881,17 +886,36 @@ public final class SpektraCameraOwner {
+             return;
+         }
+         final SpektraFrameMetadata baseMetadata = SpektraFrameMetadata.from(result, characteristics,
+-                result.getFrameNumber(), requestedIso);
++                result.getFrameNumber(), requestedIso, image.getWidth(), image.getHeight());
+         final int previewBayerOffset = activeBayerOffset >= 0
+-                ? activeBayerOffset : geometryBayerOffsetHint();
++                ? activeBayerOffset : baseMetadata.geometryBayerOffsetHint;
+         try {
+             previewDecodeExecutor.execute(() -> {
+                 SpektraRawFrame decoded = null;
+                 Throwable failure = null;
+                 try {
++                    // The Camera2 Image stays owned and open through native Vulkan RAW processing.
++                    // First-run discovery may be meter-only until Bayer origin is proven.
++                    SpektraFrameMetadata nativeMetadata = null;
++                    float[] nativeMatrix = null;
++                    if (previewBayerOffset >= 0 && previewBayerOffset <= 3 && baseMetadata.neutral3 != null) {
++                        nativeMetadata = SpektraFrameMetadata.from(result, characteristics,
++                                result.getFrameNumber(), requestedIso, image.getWidth(), image.getHeight(),
++                                previewBayerOffset);
++                        SpektraColorSolver.Solution color = SpektraColorSolver.solveQuiet(result,
++                                nativeMetadata.neutral3,
++                                characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1),
++                                characteristics.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2),
++                                characteristics.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1),
++                                characteristics.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2),
++                                characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1),
++                                characteristics.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2),
++                                valueOrZero(characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1)),
++                                valueOrZero(characteristics.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)));
++                        nativeMatrix = color == null ? null : color.sensorToLinearSrgb;
++                    }
+                     decoded = SpektraRawFrame.copyPreviewFrom(image, PREVIEW_SHORT_EDGE_DEFAULT,
+-                            baseMetadata.cfaArrangement, baseMetadata.blackLevel4, baseMetadata.whiteLevel,
+-                            previewBayerOffset);
++                            nativeMetadata, nativeMatrix);
+                 } catch (Throwable t) {
+                     failure = t;
+                 } finally {
+@@ -946,9 +970,12 @@ public final class SpektraCameraOwner {
+     private void consumePreviewPair(SpektraRawFrame frame, TotalCaptureResult result, long g) {
+         if (!isCurrent(g) || state != State.STREAMING || characteristics == null) return;
+         SpektraFrameMetadata baseMetadata = SpektraFrameMetadata.from(result, characteristics,
+-                result.getFrameNumber(), requestedIso);
++                result.getFrameNumber(), requestedIso, frame.sourceWidth(), frame.sourceHeight());
++        // Native owner intentionally dropped this verified preview because saved work or another
++        // VF-S dispatch already owned the persistent compute queue. Do not run AE on a fake meter.
++        if (activeBayerOffset >= 0 && frame.previewLinearRgba16f == null) return;
+         if (activeBayerOffset < 0) {
+-            int geometryHint = geometryBayerOffsetHint();
++            int geometryHint = baseMetadata.geometryBayerOffsetHint;
+             activeBayerOffset = frame.estimateBayerOffset(baseMetadata.cfaArrangement,
+                     baseMetadata.blackLevel4, baseMetadata.whiteLevel, geometryHint);
+             if (activeBayerOffset < 0) {
+@@ -964,7 +991,7 @@ public final class SpektraCameraOwner {
+                     + " sensorCfa=" + baseMetadata.cfaArrangement);
+         }
+         SpektraFrameMetadata metadata = SpektraFrameMetadata.from(result, characteristics,
+-                result.getFrameNumber(), requestedIso, activeBayerOffset);
++                result.getFrameNumber(), requestedIso, frame.sourceWidth(), frame.sourceHeight(), activeBayerOffset);
+         if (metadata.neutral3 == null) {
+             if (!loggedPreviewWaitWb) {
+                 loggedPreviewWaitWb = true;
+@@ -988,39 +1015,18 @@ public final class SpektraCameraOwner {
+         // The first discovery frame may exist only as a reduced RAW meter while Bayer origin is
+         // being verified. Never fall back to demosaicing that reduced Bayer carrier for display;
+         // wait for the next full RAW frame to produce source-lattice camera RGB with the verified origin.
+-        if (frame.previewCameraRgb16f == null) return;
+-        previewRenderer.render(frame, metadata, result);
+-    }
+-
+-    private int geometryBayerOffsetHint() {
+-        // -1 means the Camera2 geometry cannot objectively resolve the RAW buffer's 2x2 CFA origin.
+-        // Never collapse "unknown" into offset 0: doing that would silently recreate the green
+-        // two-pixel lattice seen in 26684 on a device whose RAW crop starts on another phase.
+-        if (characteristics == null || stillSize == null) return -1;
+-        Rect active = null;
+-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+-            active = characteristics.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
+-        }
+-        if (active == null) active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+-        if (active == null) return -1;
+-
+-        final int rawW = stillSize.getWidth();
+-        final int rawH = stillSize.getHeight();
+-        int scaleX = active.width() == rawW ? 1 : (rawW > 0 && active.width() % rawW == 0 ? active.width() / rawW : 0);
+-        int scaleY = active.height() == rawH ? 1 : (rawH > 0 && active.height() % rawH == 0 ? active.height() / rawH : 0);
+-        if (scaleX > 0 && scaleY > 0 && active.left % scaleX == 0 && active.top % scaleY == 0) {
+-            int hint = ((active.left / scaleX) & 1) | (((active.top / scaleY) & 1) << 1);
+-            android.util.Size pixel = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+-            Log.i(TAG, "IRIS_26685_SPEKTRA_RAW_GEOMETRY route=" + route
+-                    + " pixelArray=" + pixel + " active=" + active + " raw=" + stillSize
+-                    + " scale=" + scaleX + "x" + scaleY + " bayerHint=" + hint);
+-            return hint;
+-        }
+-        android.util.Size pixel = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+-        Log.i(TAG, "IRIS_26685_SPEKTRA_RAW_GEOMETRY route=" + route
+-                + " pixelArray=" + pixel + " active=" + active + " raw=" + stillSize
+-                + " scale=unresolved bayerHint=UNRESOLVED");
+-        return -1;
++        if (frame.previewLinearRgba16f == null) return;
++        previewRenderer.render(frame);
++    }
++
++    private int geometryBayerOffsetHint(int rawWidth, int rawHeight) {
++        if (characteristics == null) return -1;
++        try {
++            return SpektraFrameMetadata.geometryBayerOffsetHint(characteristics, null, rawWidth, rawHeight);
++        } catch (IllegalArgumentException unresolved) {
++            Log.e(TAG, "IRIS_26686_SPEKTRA_RAW_GEOMETRY_UNRESOLVED raw=" + rawWidth + "x" + rawHeight, unresolved);
++            return -1;
++        }
+     }
+ 
+     private void applyCurrentExposureToRepeating() {
+@@ -1347,13 +1353,14 @@ public final class SpektraCameraOwner {
+         closePendingStillImages();
+         pendingStillFrame = null;
+         pendingStillResult = null;
+-        int stillBayerOffset = activeBayerOffset >= 0 ? activeBayerOffset : geometryBayerOffsetHint();
++        int stillBayerOffset = activeBayerOffset >= 0 ? activeBayerOffset
++                : SpektraFrameMetadata.geometryBayerOffsetHint(characteristics, result, raw.sourceWidth(), raw.sourceHeight());
+         if (stillBayerOffset < 0) {
+             terminalStillFailure(g, "BAYER_ORIGIN_UNRESOLVED_AT_STILL", null);
+             return;
+         }
+         SpektraFrameMetadata metadata = SpektraFrameMetadata.from(result, characteristics,
+-                result.getFrameNumber(), pendingStillFrozenIso, stillBayerOffset);
++                result.getFrameNumber(), pendingStillFrozenIso, raw.sourceWidth(), raw.sourceHeight(), stillBayerOffset);
+         if (metadata.neutral3 == null) {
+             terminalStillFailure(g, "MISSING_RAW_WHITE_BALANCE", null);
+             return;
+@@ -1383,9 +1390,11 @@ public final class SpektraCameraOwner {
+         Log.i(TAG, "IRIS_26684_SPEKTRA_STILL_CAPTURED timestamp=" + raw.timestampNs
+                 + " frame=" + result.getFrameNumber() + " sessionReused=true");
+         CaptureController.isProcessing = true;
+-        events.onFrameCaptureCompleted("SPEKTRA");
+-        events.onCaptureSequenceCompleted("SPEKTRA");
+-        events.onProcessingStarted("Spektra");
++        activity.runOnUiThread(() -> {
++            events.onFrameCaptureCompleted("SPEKTRA");
++            events.onCaptureSequenceCompleted("SPEKTRA");
++            events.onProcessingStarted("Spektra");
++        });
+         final int outputRotation = outputRotationDegrees();
+         final String lensModel = metadata.focalLengthMm > 0f
+                 ? (route == null ? "" : route.characteristicsId) + " " + metadata.focalLengthMm + "mm"
+@@ -1722,6 +1731,7 @@ public final class SpektraCameraOwner {
+             previewRenderer = null;
+         }
+         if (hideSurface) {
++            SpektraRawProcessor.releaseNativeOwner();
+             SpektraFilmRenderer.releaseProcessRenderer();
+             setPreviewVisibility(false);
+         }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraFrameMetadata.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraFrameMetadata.java
+index 20ce6ac64e0ad5df20a45c968a1390be9fa3873e..74cc21f1cf40e466c835def61a036379949e901c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraFrameMetadata.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraFrameMetadata.java
+@@ -1,10 +1,13 @@
+ package com.particlesdevs.photoncamera.spektra;
+ 
++import android.graphics.Rect;
+ import android.hardware.camera2.CameraCharacteristics;
+ import android.hardware.camera2.CaptureResult;
+ import android.hardware.camera2.params.BlackLevelPattern;
+ import android.hardware.camera2.params.LensShadingMap;
++import android.os.Build;
+ import android.util.Rational;
++import android.util.Size;
+ 
+ import java.util.Arrays;
+ 
+@@ -16,6 +19,7 @@ public final class SpektraFrameMetadata {
+     public final long frameDurationNs;
+     public final int iso;
+     public final int requestedIso;
++    /** Black levels ordered for the RAW-raster 2x2 origin after the verified Bayer offset. */
+     public final int[] blackLevel4;
+     public final int whiteLevel;
+     public final float[] neutral3;
+@@ -26,12 +30,23 @@ public final class SpektraFrameMetadata {
+     public final float focalLengthMm;
+     public final float focalLength35Mm;
+     public final double[] noiseProfile;
++    /** CFA arrangement at RAW-raster coordinate (0,0) after the verified Bayer offset. */
+     public final int cfaArrangement;
++    /** Explicit 2x2 parity from the Camera2 CFA origin to RAW-raster origin. */
++    public final int bayerOffset;
++    /** Geometry-derived parity before image-statistical verification; -1 is deliberately unresolved. */
++    public final int geometryBayerOffsetHint;
++    /** All geometry below is normalized into RAW-raster coordinates. */
++    public final Rect rawBounds;
++    public final Rect sourceCrop;
++    public final Rect activeRawDomain;
+ 
+     private SpektraFrameMetadata(long timestampNs, long frameNumber, long exposureNs, long frameDurationNs,
+             int iso, int requestedIso, int[] blackLevel4, int whiteLevel, float[] neutral3,
+             float[] lensShading, int lensShadingRows, int lensShadingCols, float aperture,
+-            float focalLengthMm, float focalLength35Mm, double[] noiseProfile, int cfaArrangement) {
++            float focalLengthMm, float focalLength35Mm, double[] noiseProfile, int cfaArrangement,
++            int bayerOffset, int geometryBayerOffsetHint, Rect rawBounds, Rect sourceCrop,
++            Rect activeRawDomain) {
+         this.timestampNs = timestampNs;
+         this.frameNumber = frameNumber;
+         this.exposureNs = exposureNs;
+@@ -49,13 +64,20 @@ public final class SpektraFrameMetadata {
+         this.focalLength35Mm = focalLength35Mm;
+         this.noiseProfile = noiseProfile;
+         this.cfaArrangement = cfaArrangement;
++        this.bayerOffset = bayerOffset;
++        this.geometryBayerOffsetHint = geometryBayerOffsetHint;
++        this.rawBounds = new Rect(rawBounds);
++        this.sourceCrop = new Rect(sourceCrop);
++        this.activeRawDomain = new Rect(activeRawDomain);
+     }
+ 
+     static SpektraFrameMetadata restore(long timestampNs, long frameNumber, long exposureNs,
+             long frameDurationNs, int iso, int requestedIso, int[] blackLevel4, int whiteLevel,
+             float[] neutral3, float[] lensShading, int lensShadingRows, int lensShadingCols,
+             float aperture, float focalLengthMm, float focalLength35Mm, double[] noiseProfile,
+-            int cfaArrangement) {
++            int cfaArrangement, int bayerOffset, int geometryBayerOffsetHint, Rect rawBounds,
++            Rect sourceCrop, Rect activeRawDomain) {
++        validateGeometry(rawBounds, sourceCrop, activeRawDomain);
+         if (timestampNs <= 0L || frameNumber < 0L || exposureNs <= 0L || iso <= 0 || whiteLevel <= 0) {
+             throw new IllegalArgumentException("Invalid frozen Spektra metadata");
+         }
+@@ -65,6 +87,9 @@ public final class SpektraFrameMetadata {
+         if (neutral3 == null || neutral3.length != 3) {
+             throw new IllegalArgumentException("Frozen Spektra neutral point must have three values");
+         }
++        if (cfaArrangement < 0 || cfaArrangement > 3 || bayerOffset < 0 || bayerOffset > 3) {
++            throw new IllegalArgumentException("Frozen Spektra CFA/Bayer geometry is unresolved");
++        }
+         if (lensShading != null) {
+             long expected = (long) lensShadingRows * (long) lensShadingCols * 4L;
+             if (lensShadingRows <= 0 || lensShadingCols <= 0 || expected != lensShading.length) {
+@@ -77,17 +102,23 @@ public final class SpektraFrameMetadata {
+                 requestedIso, blackLevel4.clone(), whiteLevel, neutral3.clone(),
+                 lensShading == null ? null : lensShading.clone(), lensShadingRows, lensShadingCols,
+                 aperture, focalLengthMm, focalLength35Mm,
+-                noiseProfile == null ? null : noiseProfile.clone(), cfaArrangement);
++                noiseProfile == null ? null : noiseProfile.clone(), cfaArrangement,
++                bayerOffset, geometryBayerOffsetHint, rawBounds, sourceCrop, activeRawDomain);
+     }
+ 
+     public static SpektraFrameMetadata from(CaptureResult result, CameraCharacteristics chars,
+-            long frameNumber, int requestedIso) {
+-        return from(result, chars, frameNumber, requestedIso, 0);
++            long frameNumber, int requestedIso, int rawWidth, int rawHeight) {
++        return from(result, chars, frameNumber, requestedIso, rawWidth, rawHeight, -1);
+     }
+ 
+-    /** Apply the verified RAW-buffer origin parity before any demosaic/color owner consumes CFA data. */
++    /**
++     * Freeze one exact RAW/result geometry contract. SENSOR active-array and crop metadata begin in
++     * sensor coordinates; this method is the sole Java owner that converts them to RAW-raster space.
++     * Unknown Bayer origin is preserved as -1 and must never silently become phase zero.
++     */
+     public static SpektraFrameMetadata from(CaptureResult result, CameraCharacteristics chars,
+-            long frameNumber, int requestedIso, int bayerOffset) {
++            long frameNumber, int requestedIso, int rawWidth, int rawHeight, int verifiedBayerOffset) {
++        RawGeometry geometry = RawGeometry.resolve(chars, result, rawWidth, rawHeight);
+         Long ts = result.get(CaptureResult.SENSOR_TIMESTAMP);
+         Long exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+         Long duration = result.get(CaptureResult.SENSOR_FRAME_DURATION);
+@@ -99,11 +130,14 @@ public final class SpektraFrameMetadata {
+         Integer sensorCfaBox = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT);
+         int sensorCfa = sensorCfaBox == null ? -1 : sensorCfaBox;
+         int[] sensorBlack = blackLevels(result, chars);
+-        final int offset = bayerOffset & 3;
+-        int[] black = new int[4];
+-        for (int q = 0; q < 4; ++q) black[q] = sensorBlack[q ^ offset];
++        final int selectedOffset = verifiedBayerOffset >= 0 && verifiedBayerOffset <= 3
++                ? verifiedBayerOffset : -1;
++        int[] black = sensorBlack.clone();
+         int cfa = sensorCfa;
+-        if (sensorCfa >= 0 && sensorCfa <= 3) cfa = sensorCfa ^ offset;
++        if (selectedOffset >= 0) {
++            for (int q = 0; q < 4; ++q) black[q] = sensorBlack[q ^ selectedOffset];
++            if (sensorCfa >= 0 && sensorCfa <= 3) cfa = sensorCfa ^ selectedOffset;
++        }
+         float[] neutral = neutralPoint(result);
+         LensShadingMap lsm = result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP);
+         float[] lsc = null;
+@@ -131,7 +165,110 @@ public final class SpektraFrameMetadata {
+                 iso == null ? requestedIso : iso, requestedIso, black,
+                 resolvedWhite, neutral, lsc, rows, cols,
+                 aperture == null ? 0f : aperture, focal == null ? 0f : focal, focal35,
+-                noise == null ? null : Arrays.copyOf(noise, noise.length), cfa);
++                noise == null ? null : Arrays.copyOf(noise, noise.length), cfa,
++                selectedOffset, geometry.bayerOffsetHint,
++                geometry.rawBounds, geometry.sourceCrop, geometry.activeRawDomain);
++    }
++
++    public static int geometryBayerOffsetHint(CameraCharacteristics chars, CaptureResult result,
++            int rawWidth, int rawHeight) {
++        return RawGeometry.resolve(chars, result, rawWidth, rawHeight).bayerOffsetHint;
++    }
++
++    private static void validateGeometry(Rect rawBounds, Rect sourceCrop, Rect activeRawDomain) {
++        if (rawBounds == null || sourceCrop == null || activeRawDomain == null
++                || rawBounds.width() <= 0 || rawBounds.height() <= 0
++                || sourceCrop.width() <= 0 || sourceCrop.height() <= 0
++                || activeRawDomain.width() < 2 || activeRawDomain.height() < 2
++                || !rawBounds.contains(sourceCrop) || !rawBounds.contains(activeRawDomain)) {
++            throw new IllegalArgumentException("Invalid Spektra RAW-raster geometry");
++        }
++    }
++
++    private static final class RawGeometry {
++        final Rect rawBounds;
++        final Rect sourceCrop;
++        final Rect activeRawDomain;
++        final int bayerOffsetHint;
++
++        private RawGeometry(Rect rawBounds, Rect sourceCrop, Rect activeRawDomain, int bayerOffsetHint) {
++            this.rawBounds = rawBounds;
++            this.sourceCrop = sourceCrop;
++            this.activeRawDomain = activeRawDomain;
++            this.bayerOffsetHint = bayerOffsetHint;
++        }
++
++        static RawGeometry resolve(CameraCharacteristics chars, CaptureResult result,
++                int rawWidth, int rawHeight) {
++            if (chars == null || rawWidth <= 0 || rawHeight <= 0) {
++                throw new IllegalArgumentException("Spektra RAW geometry requires characteristics and dimensions");
++            }
++            Size pixelArray = chars.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
++            Rect activeSensor = null;
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
++                activeSensor = chars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE);
++            }
++            if (activeSensor == null) activeSensor = chars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
++            if (pixelArray == null || pixelArray.getWidth() <= 0 || pixelArray.getHeight() <= 0
++                    || activeSensor == null || activeSensor.width() <= 0 || activeSensor.height() <= 0) {
++                throw new IllegalArgumentException("Spektra Camera2 RAW geometry metadata missing");
++            }
++            Rect rawBounds = new Rect(0, 0, rawWidth, rawHeight);
++            Rect activeRaw = mapSensorRect(activeSensor, pixelArray, rawBounds);
++            if (activeRaw.width() <= 0 || activeRaw.height() <= 0) {
++                throw new IllegalArgumentException("Spektra active RAW domain collapsed during normalization");
++            }
++
++            Rect requestedSensorCrop = result == null ? null : result.get(CaptureResult.SCALER_CROP_REGION);
++            Rect sourceRaw = requestedSensorCrop == null
++                    ? new Rect(activeRaw)
++                    : mapSensorRect(requestedSensorCrop, pixelArray, rawBounds);
++            if (!sourceRaw.intersect(activeRaw)) sourceRaw.set(activeRaw);
++            if (sourceRaw.width() <= 0 || sourceRaw.height() <= 0) sourceRaw.set(activeRaw);
++
++            // Camera2 CFA is anchored to the active sensor domain. The RAW-raster origin therefore
++            // needs the active-domain top-left parity only when that mapping is exact. Fractional
++            // geometry remains unresolved rather than guessing a phase.
++            int hint = -1;
++            long leftNumerator = (long) activeSensor.left * (long) rawWidth;
++            long topNumerator = (long) activeSensor.top * (long) rawHeight;
++            if (leftNumerator % pixelArray.getWidth() == 0L
++                    && topNumerator % pixelArray.getHeight() == 0L) {
++                int activeLeftExact = (int) (leftNumerator / pixelArray.getWidth());
++                int activeTopExact = (int) (topNumerator / pixelArray.getHeight());
++                if (activeLeftExact == activeRaw.left && activeTopExact == activeRaw.top) {
++                    hint = (activeRaw.left & 1) | ((activeRaw.top & 1) << 1);
++                }
++            }
++            validateGeometry(rawBounds, sourceRaw, activeRaw);
++            return new RawGeometry(rawBounds, sourceRaw, activeRaw, hint);
++        }
++
++        private static Rect mapSensorRect(Rect sensor, Size pixelArray, Rect rawBounds) {
++            long pw = pixelArray.getWidth();
++            long ph = pixelArray.getHeight();
++            int left = floorDiv((long) sensor.left * rawBounds.width(), pw);
++            int top = floorDiv((long) sensor.top * rawBounds.height(), ph);
++            int right = ceilDiv((long) sensor.right * rawBounds.width(), pw);
++            int bottom = ceilDiv((long) sensor.bottom * rawBounds.height(), ph);
++            left = clamp(left, rawBounds.left, rawBounds.right);
++            top = clamp(top, rawBounds.top, rawBounds.bottom);
++            right = clamp(right, left, rawBounds.right);
++            bottom = clamp(bottom, top, rawBounds.bottom);
++            return new Rect(left, top, right, bottom);
++        }
++
++        private static int floorDiv(long numerator, long denominator) {
++            if (denominator <= 0L) throw new IllegalArgumentException("Invalid Spektra geometry denominator");
++            return (int) Math.floorDiv(numerator, denominator);
++        }
++
++        private static int ceilDiv(long numerator, long denominator) {
++            if (denominator <= 0L) throw new IllegalArgumentException("Invalid Spektra geometry denominator");
++            return (int) ((numerator + denominator - 1L) / denominator);
++        }
++
++        private static int clamp(int v, int lo, int hi) { return Math.max(lo, Math.min(hi, v)); }
+     }
+ 
+     private static float focal35mm(CameraCharacteristics chars, float focalMm) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+index 96e4e3352d4af24e1e8b3cf7d25306c23aaf0f8c..630cb29724e217fbf0d86b92d478f7fc74beb627 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+@@ -4,9 +4,7 @@ import android.app.Activity;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
+ import android.graphics.Matrix;
+-import android.graphics.RectF;
+ import android.hardware.camera2.CameraCharacteristics;
+-import android.hardware.camera2.TotalCaptureResult;
+ import android.util.Size;
+ import android.view.Surface;
+ import android.view.SurfaceHolder;
+@@ -18,7 +16,7 @@ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ 
+-/** Low-quality single-RAW preview owner. Camera callbacks only enqueue; rendering never blocks Camera2. */
++/** VF-S presenter. RAW development is already complete before this queue receives a frame. */
+ public final class SpektraPreviewRenderer {
+     private static final String TAG = "SpektraPreviewRenderer";
+     private final Activity activity;
+@@ -30,7 +28,6 @@ public final class SpektraPreviewRenderer {
+     private final Object renderLifecycleLock = new Object();
+     private final Runnable firstFramePresentedCallback;
+     private final AtomicBoolean firstFramePresented = new AtomicBoolean(false);
+-    private CameraCharacteristics characteristics;
+     private int sensorOrientation;
+     private boolean frontFacing;
+     private volatile boolean released;
+@@ -43,61 +40,45 @@ public final class SpektraPreviewRenderer {
+     }
+ 
+     public void configure(CameraCharacteristics characteristics, Size rawStreamSize, Size processSize, int rawFormat) {
+-        this.characteristics = characteristics;
+         Integer so = characteristics == null ? null : characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+         Integer facing = characteristics == null ? null : characteristics.get(CameraCharacteristics.LENS_FACING);
+         sensorOrientation = so == null ? 0 : so;
+         frontFacing = facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT;
+         released = false;
+         firstFramePresented.set(false);
+-        Log.d(TAG, "IRIS_26684_SPEKTRA_PREVIEW_CONFIG rawStream=" + rawStreamSize
++        Log.d(TAG, "IRIS_26686_SPEKTRA_PREVIEW_CONFIG rawStream=" + rawStreamSize
+                 + " process=" + processSize + " format=" + rawFormat
+-                + " targetFps=30 quality=LOW previewShortEdge=480 vfS=true");
++                + " targetFps=30 quality=LOW previewShortEdge=480 vfS=true rawOwner=Vulkan");
+     }
+ 
+-    public void beginPreviewSession() {
+-        firstFramePresented.set(false);
+-    }
++    public void beginPreviewSession() { firstFramePresented.set(false); }
+ 
+-    /** Drop RAW callbacks before decode when the previous VF-S frame is still rendering. */
+-    public boolean canAcceptFrame() {
+-        return !released && !busy.get();
+-    }
++    /** Drop presentation work instead of queueing when the previous frame is still being drawn. */
++    public boolean canAcceptFrame() { return !released && !busy.get(); }
+ 
+-    public void render(SpektraRawFrame frame, SpektraFrameMetadata metadata, TotalCaptureResult result) {
+-        if (released || frame == null || metadata == null || result == null || !busy.compareAndSet(false, true)) return;
+-        final CameraCharacteristics cc = characteristics;
++    public void render(SpektraRawFrame frame) {
++        if (released || frame == null || frame.previewLinearRgba16f == null || !busy.compareAndSet(false, true)) return;
+         try {
+             executor.execute(() -> {
+                 synchronized (renderLifecycleLock) {
+                     Bitmap bitmap = null;
+-                try {
+-                    if (released) return;
+-                    SpektraColorSolver.Solution color = SpektraColorSolver.solveQuiet(result, metadata.neutral3,
+-                        cc.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1), cc.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2),
+-                        cc.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1), cc.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2),
+-                        cc.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1), cc.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2),
+-                        valueOrZero(cc.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT1)),
+-                        valueOrZero(cc.get(CameraCharacteristics.SENSOR_REFERENCE_ILLUMINANT2)));
+-                if (color == null) return;
+-                SpektraShot shot = new SpektraShot(frame, metadata, System.currentTimeMillis(),
+-                        color.sensorToLinearSrgb,
+-                        0, "preview", "preview");
+-                SpektraRawProcessor.LinearFrame linear = new SpektraRawProcessor().process(shot, false);
+-                try (SpektraFilmRenderer film = new SpektraFilmRenderer(activity)) {
+-                    bitmap = film.render(linear, true, System.nanoTime() * 1.0e-9);
+-                }
+-                if (!released && draw(bitmap)
+-                        && firstFramePresented.compareAndSet(false, true)
+-                        && firstFramePresentedCallback != null) {
+-                    firstFramePresentedCallback.run();
+-                }
+-                } catch (Throwable t) {
+-                    if (!released) Log.e(TAG, "IRIS_26681_SPEKTRA_PREVIEW_RENDER_FAILED", t);
+-                } finally {
+-                    if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+-                    busy.set(false);
+-                }
++                    try {
++                        if (released) return;
++                        SpektraRawProcessor.LinearFrame linear = SpektraRawProcessor.previewLinearFrame(frame);
++                        try (SpektraFilmRenderer film = new SpektraFilmRenderer(activity)) {
++                            bitmap = film.render(linear, true, System.nanoTime() * 1.0e-9);
++                        }
++                        if (!released && draw(bitmap)
++                                && firstFramePresented.compareAndSet(false, true)
++                                && firstFramePresentedCallback != null) {
++                            activity.runOnUiThread(firstFramePresentedCallback);
++                        }
++                    } catch (Throwable t) {
++                        if (!released) Log.e(TAG, "IRIS_26686_SPEKTRA_PREVIEW_RENDER_FAILED", t);
++                    } finally {
++                        if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
++                        busy.set(false);
++                    }
+                 }
+             });
+         } catch (RuntimeException rejectedAfterRetire) {
+@@ -147,15 +128,11 @@ public final class SpektraPreviewRenderer {
+     public void release() {
+         released = true;
+         executor.shutdownNow();
+-        // IRIS_26682_SPEKTRA_PREVIEW_DRAIN_ON_HANDOFF
+-        // busy permits at most one render. Waiting on this lock therefore proves that the active
+-        // RAW/RCD/SPEKTRA render has left before Photo/Night/Motion may retake camera/GPU ownership.
+-        synchronized (renderLifecycleLock) {
+-            busy.set(false);
+-        }
+-        Log.i(TAG, "IRIS_26682_SPEKTRA_PREVIEW_DRAINED");
++        synchronized (renderLifecycleLock) { busy.set(false); }
++        long[] stats = SpektraRawProcessor.nativeStats();
++        Log.i(TAG, "IRIS_26686_SPEKTRA_PREVIEW_DRAINED"
++                + " vfProcessed=" + stats[0] + " vfDropped=" + stats[1]
++                + " avgVfMicros=" + stats[2] + " lastStillMicros=" + stats[3]
++                + " gpuOwners=" + stats[4] + " persistentAllocations=" + stats[5]);
+     }
+-
+-    private static int valueOrZero(Integer value) { return value == null ? 0 : value; }
+-    private static int valueOrZero(Byte value) { return value == null ? 0 : Byte.toUnsignedInt(value); }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java
+index 59b0e18ee0344abdbf554795608d9edf03f1c0c1..0938d97911cc55c02fdfe4f92f6e2c0d46b540b2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java
+@@ -24,6 +24,7 @@ public final class SpektraProcessor {
+     public SpektraProcessor(Context context) { this.context = context.getApplicationContext(); }
+ 
+     public Result process(SpektraShot shot, File recovery) {
++        final long processStartNs = System.nanoTime();
+         Bitmap rendered = null;
+         Bitmap oriented = null;
+         try {
+@@ -41,8 +42,14 @@ public final class SpektraProcessor {
+             }
+             Path path = new SpektraJpegPublisher(context).publish(oriented, shot);
+             oriented.recycle();
+-            Log.d(TAG, "IRIS_26681_SPEKTRA_SAVED path=" + path
++            long[] nativeStats = SpektraRawProcessor.nativeStats();
++            long totalMillis = (System.nanoTime() - processStartNs) / 1_000_000L;
++            Log.d(TAG, "IRIS_26686_SPEKTRA_SAVED path=" + path
+                     + " recovery=" + recovery
++                    + " processMillis=" + totalMillis
++                    + " nativeStillMicros=" + nativeStats[3]
++                    + " gpuOwners=" + nativeStats[4]
++                    + " persistentAllocations=" + nativeStats[5]
+                     + " film=kodak_portra_400 paper=kodak_supra_endura jpegQuality=100");
+             return new Result(true, path, null);
+         } catch (Throwable t) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+index 768eeede928ab180aa7f9749d57d88770bb025d4..cea9d5dc8ebe6600aa4e6f417db61fe8c806c571 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+@@ -6,72 +6,104 @@ import android.media.Image;
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+ 
+-/** Immutable Bayer frame owned only by Spektra. Packed Camera2 RAW decoding is native. */
++/** Immutable Camera2 RAW carrier owned only by Spektra. */
+ public final class SpektraRawFrame {
+     static { System.loadLibrary("spektra_iris"); }
+ 
++    /** Processing/output dimensions. Preview is VF-S size; saved still equals source RAW size. */
+     public final int width;
+     public final int height;
++    private final int sourceWidth;
++    private final int sourceHeight;
+     public final int sourceFormat;
++    public final int rowStride;
++    public final int pixelStride;
+     public final long timestampNs;
+-    /** Native-endian unsigned 16-bit Bayer samples, one sample per pixel. Saved stills own the full raster;
+-     * VF-S owns only a reduced Bayer meter used for AE/profile verification. */
++    /** Durable original packed RAW bytes. Present only for saved stills/recovery. */
++    public final byte[] packedRaw;
++    /** Reduced native-endian U16 Bayer meter. CPU use is restricted to AE/Bayer discovery. */
+     public final byte[] mosaic16;
+-    /** Optional native-order RGBA16F camera-RGB VF-S image reconstructed in the source RAW lattice
+-     * before reduction. Never serialized into the durable .shot capture recipe. */
+-    public final byte[] previewCameraRgb16f;
++    /** Scene-linear RGBA16F VF-S image produced by the persistent Spektra Vulkan RAW owner. */
++    public final byte[] previewLinearRgba16f;
+ 
+-    private SpektraRawFrame(int width, int height, int sourceFormat, long timestampNs, byte[] mosaic16,
+-            byte[] previewCameraRgb16f) {
++    private SpektraRawFrame(int width, int height, int sourceWidth, int sourceHeight,
++            int sourceFormat, int rowStride, int pixelStride, long timestampNs,
++            byte[] packedRaw, byte[] mosaic16, byte[] previewLinearRgba16f) {
+         this.width = width;
+         this.height = height;
++        this.sourceWidth = sourceWidth;
++        this.sourceHeight = sourceHeight;
+         this.sourceFormat = sourceFormat;
++        this.rowStride = rowStride;
++        this.pixelStride = pixelStride;
+         this.timestampNs = timestampNs;
++        this.packedRaw = packedRaw;
+         this.mosaic16 = mosaic16;
+-        this.previewCameraRgb16f = previewCameraRgb16f;
++        this.previewLinearRgba16f = previewLinearRgba16f;
+     }
+ 
+-    static SpektraRawFrame restore(int width, int height, int sourceFormat, long timestampNs, byte[] mosaic16) {
+-        validateFrozen(width, height, sourceFormat, mosaic16);
+-        return new SpektraRawFrame(width, height, sourceFormat, timestampNs, mosaic16.clone(), null);
++    static SpektraRawFrame restore(int sourceWidth, int sourceHeight, int sourceFormat,
++            int rowStride, int pixelStride, long timestampNs, byte[] packedRaw) {
++        validatePacked(sourceWidth, sourceHeight, sourceFormat, rowStride, pixelStride, packedRaw);
++        return new SpektraRawFrame(sourceWidth, sourceHeight, sourceWidth, sourceHeight,
++                sourceFormat, rowStride, pixelStride, timestampNs, packedRaw.clone(), null, null);
+     }
+ 
++    public int sourceWidth() { return sourceWidth; }
++    public int sourceHeight() { return sourceHeight; }
++
+     /**
+-     * VF-S live contract. Camera2 continues to provide the verified full-resolution RAW stream,
+-     * while the display path reconstructs camera RGB from physically adjacent source photosites
+-     * before reducing to the requested LOW preview size. The reduced Bayer carrier exists only
+-     * for exposure/profile verification; it is never demosaiced for display.
++     * VF-S live contract. The original Camera2 RAW plane remains valid for this entire call.
++     * Native Vulkan reconstructs sensor RGB/linear RGB in the source lattice and reduces only
++     * after reconstruction. A small CPU Bayer meter is retained solely for AE/Bayer discovery.
+      */
+-    public static SpektraRawFrame copyPreviewFrom(Image image, int previewShortEdge, int sensorCfa,
+-            int[] sensorBlack4, int whiteLevel, int bayerOffset) {
++    public static SpektraRawFrame copyPreviewFrom(Image image, int previewShortEdge,
++            SpektraFrameMetadata metadata, float[] sensorToLinearSrgb) {
+         if (previewShortEdge <= 0) throw new IllegalArgumentException("Invalid Spektra preview short edge");
+         final int srcWidth = requireImageWidth(image);
+         final int srcHeight = image.getHeight();
+-        int outWidth;
+-        int outHeight;
+-        if (srcWidth >= srcHeight) {
+-            outHeight = Math.min(srcHeight, previewShortEdge);
+-            outWidth = Math.max(2, (int)Math.round((double)srcWidth * outHeight / srcHeight));
+-        } else {
+-            outWidth = Math.min(srcWidth, previewShortEdge);
+-            outHeight = Math.max(2, (int)Math.round((double)srcHeight * outWidth / srcWidth));
++        final int[] out = previewDimensions(srcWidth, srcHeight, previewShortEdge);
++        RawPlane plane = rawPlane(image);
++
++        byte[] linear = null;
++        final boolean geometryReady = metadata != null && metadata.bayerOffset >= 0 && metadata.bayerOffset <= 3
++                && metadata.cfaArrangement >= 0 && metadata.cfaArrangement <= 3
++                && sensorToLinearSrgb != null && sensorToLinearSrgb.length == 9;
++        if (geometryReady) {
++            // Ask the native owner first. If saved work currently owns the GPU, it returns null and
++            // the preview frame is dropped before even the tiny CPU metering pass.
++            linear = SpektraRawProcessor.processLivePreview(plane.buffer, plane.offset, plane.bytes,
++                    srcWidth, srcHeight, plane.rowStride, plane.pixelStride, image.getFormat(),
++                    metadata, sensorToLinearSrgb, out[0], out[1]);
++            validatePreviewLinear(out[0], out[1], linear);
++            if (linear == null) {
++                return new SpektraRawFrame(out[0], out[1], srcWidth, srcHeight, image.getFormat(),
++                        plane.rowStride, plane.pixelStride, image.getTimestamp(), null, null, null);
++            }
+         }
+-        outWidth &= ~1;
+-        outHeight &= ~1;
+-        if (outWidth <= 0 || outHeight <= 0) throw new IllegalArgumentException("Invalid Spektra preview geometry");
+-        return decodePreviewNative(image, outWidth, outHeight, sensorCfa, sensorBlack4, whiteLevel, bayerOffset);
++        byte[] meter = nativeDecodeMeter(plane.buffer, plane.offset, plane.bytes,
++                srcWidth, srcHeight, plane.rowStride, plane.pixelStride, image.getFormat(), out[0], out[1]);
++        validateMeter(out[0], out[1], image.getFormat(), meter);
++        return new SpektraRawFrame(out[0], out[1], srcWidth, srcHeight, image.getFormat(),
++                plane.rowStride, plane.pixelStride, image.getTimestamp(), null, meter, linear);
+     }
+ 
+-    /** Full-resolution single-frame decode used only for the shutter capture. */
++    /** Saved path keeps the Camera2 plane packed; Java never expands the full Bayer raster. */
+     public static SpektraRawFrame copyStillFrom(Image image) {
+-        final int width = requireImageWidth(image);
+-        return decodeStillNative(image, width, image.getHeight());
++        final int srcWidth = requireImageWidth(image);
++        final int srcHeight = image.getHeight();
++        RawPlane plane = rawPlane(image);
++        byte[] packed = new byte[plane.bytes];
++        ByteBuffer src = plane.buffer.duplicate();
++        src.position(plane.offset);
++        src.limit(plane.offset + plane.bytes);
++        src.get(packed);
++        validatePacked(srcWidth, srcHeight, image.getFormat(), plane.rowStride, plane.pixelStride, packed);
++        return new SpektraRawFrame(srcWidth, srcHeight, srcWidth, srcHeight, image.getFormat(),
++                plane.rowStride, plane.pixelStride, image.getTimestamp(), packed, null, null);
+     }
+ 
+-    /** Kept as a compatibility alias for frozen single-frame callers; live preview must not call it. */
+-    public static SpektraRawFrame copyFrom(Image image) {
+-        return copyStillFrom(image);
+-    }
++    public static SpektraRawFrame copyFrom(Image image) { return copyStillFrom(image); }
+ 
+     private static int requireImageWidth(Image image) {
+         if (image == null || image.getPlanes() == null || image.getPlanes().length == 0) {
+@@ -80,111 +112,100 @@ public final class SpektraRawFrame {
+         if (image.getWidth() <= 0 || image.getHeight() <= 0) {
+             throw new IllegalArgumentException("RAW image has invalid dimensions");
+         }
+-        return image.getWidth();
+-    }
+-
+-    private static SpektraRawFrame decodeStillNative(Image image, int outWidth, int outHeight) {
+-        final int format = image.getFormat();
++        int format = image.getFormat();
+         if (format != ImageFormat.RAW_SENSOR && format != ImageFormat.RAW10 && format != ImageFormat.RAW12) {
+             throw new IllegalArgumentException("Unsupported Spektra RAW format " + format);
+         }
+-        final Image.Plane plane = image.getPlanes()[0];
+-        ByteBuffer src = plane.getBuffer().duplicate();
+-        final int rowStride = plane.getRowStride();
+-        final int pixelStride = plane.getPixelStride();
+-        final int sourceOffset;
+-        final int sourceBytes;
+-        if (src.isDirect()) {
+-            sourceOffset = src.position();
+-            sourceBytes = src.remaining();
++        return image.getWidth();
++    }
++
++    private static int[] previewDimensions(int srcWidth, int srcHeight, int previewShortEdge) {
++        int outWidth, outHeight;
++        if (srcWidth >= srcHeight) {
++            outHeight = Math.min(srcHeight, previewShortEdge);
++            outWidth = Math.max(2, (int) Math.round((double) srcWidth * outHeight / srcHeight));
+         } else {
+-            // Android RAW planes are normally direct. Keep a strict fallback for unusual devices,
+-            // but still decode packed RAW in native code rather than expanding it in Java.
+-            ByteBuffer direct = ByteBuffer.allocateDirect(src.remaining()).order(ByteOrder.nativeOrder());
+-            direct.put(src);
+-            direct.flip();
+-            src = direct;
+-            sourceOffset = 0;
+-            sourceBytes = direct.remaining();
++            outWidth = Math.min(srcWidth, previewShortEdge);
++            outHeight = Math.max(2, (int) Math.round((double) srcHeight * outWidth / srcWidth));
+         }
+-        byte[] out = nativeDecodeRaw(src, sourceOffset, sourceBytes, image.getWidth(), image.getHeight(),
+-                rowStride, pixelStride, format, outWidth, outHeight);
+-        validateFrozen(outWidth, outHeight, format, out);
+-        return new SpektraRawFrame(outWidth, outHeight, format, image.getTimestamp(), out, null);
++        outWidth &= ~1;
++        outHeight &= ~1;
++        if (outWidth <= 0 || outHeight <= 0) throw new IllegalArgumentException("Invalid Spektra preview geometry");
++        return new int[]{outWidth, outHeight};
+     }
+ 
+-    private static SpektraRawFrame decodePreviewNative(Image image, int outWidth, int outHeight,
+-            int sensorCfa, int[] sensorBlack4, int whiteLevel, int bayerOffset) {
+-        final int format = image.getFormat();
+-        if (format != ImageFormat.RAW_SENSOR && format != ImageFormat.RAW10 && format != ImageFormat.RAW12) {
+-            throw new IllegalArgumentException("Unsupported Spektra RAW format " + format);
++    private static final class RawPlane {
++        final ByteBuffer buffer;
++        final int offset, bytes, rowStride, pixelStride;
++        RawPlane(ByteBuffer buffer, int offset, int bytes, int rowStride, int pixelStride) {
++            this.buffer = buffer; this.offset = offset; this.bytes = bytes;
++            this.rowStride = rowStride; this.pixelStride = pixelStride;
+         }
+-        final Image.Plane plane = image.getPlanes()[0];
++    }
++
++    private static RawPlane rawPlane(Image image) {
++        Image.Plane plane = image.getPlanes()[0];
+         ByteBuffer src = plane.getBuffer().duplicate();
+-        final int rowStride = plane.getRowStride();
+-        final int pixelStride = plane.getPixelStride();
+-        final int sourceOffset;
+-        final int sourceBytes;
++        int offset;
++        int bytes;
+         if (src.isDirect()) {
+-            sourceOffset = src.position();
+-            sourceBytes = src.remaining();
++            offset = src.position();
++            bytes = src.remaining();
+         } else {
+             ByteBuffer direct = ByteBuffer.allocateDirect(src.remaining()).order(ByteOrder.nativeOrder());
+-            direct.put(src);
+-            direct.flip();
++            direct.put(src).flip();
+             src = direct;
+-            sourceOffset = 0;
+-            sourceBytes = direct.remaining();
++            offset = 0;
++            bytes = direct.remaining();
+         }
+-        // Keep a reduced raw meter for Unspektra AE and for first-run Bayer-origin verification.
+-        // It is never consumed by the display demosaic owner.
+-        byte[] meter = nativeDecodeRaw(src, sourceOffset, sourceBytes, image.getWidth(), image.getHeight(),
+-                rowStride, pixelStride, format, outWidth, outHeight);
+-        validateFrozen(outWidth, outHeight, format, meter);
+-
+-        byte[] rgb = null;
+-        if (sensorCfa >= 0 && sensorCfa <= 3 && sensorBlack4 != null && sensorBlack4.length >= 4
+-                && whiteLevel > 0 && bayerOffset >= 0 && bayerOffset <= 3) {
+-            rgb = nativeDecodePreviewRgb16f(src, sourceOffset, sourceBytes, image.getWidth(), image.getHeight(),
+-                    rowStride, pixelStride, format, outWidth, outHeight, sensorCfa, bayerOffset,
+-                    sensorBlack4, whiteLevel);
+-            validatePreviewRgb(outWidth, outHeight, rgb);
+-        }
+-        return new SpektraRawFrame(outWidth, outHeight, format, image.getTimestamp(), meter, rgb);
++        if (bytes <= 0 || plane.getRowStride() <= 0) throw new IllegalArgumentException("RAW plane is empty");
++        return new RawPlane(src, offset, bytes, plane.getRowStride(), plane.getPixelStride());
+     }
+ 
+-    private static void validatePreviewRgb(int width, int height, byte[] rgba16f) {
+-        if (rgba16f == null) return;
++    private static void validatePreviewLinear(int width, int height, byte[] rgba16f) {
++        if (rgba16f == null) return; // Native preview owner may deliberately drop while saved work owns the GPU.
+         long expected = (long) width * (long) height * 8L;
+         if (expected > Integer.MAX_VALUE || rgba16f.length != (int) expected) {
+-            throw new IllegalArgumentException("Spektra VF-S RGB16F byte count mismatch");
++            throw new IllegalArgumentException("Spektra VF-S RGBA16F byte count mismatch");
+         }
+     }
+ 
+-    private static void validateFrozen(int width, int height, int sourceFormat, byte[] mosaic16) {
+-        if (width <= 0 || height <= 0 || mosaic16 == null) {
+-            throw new IllegalArgumentException("Invalid frozen Spektra RAW");
+-        }
++    private static void validateMeter(int width, int height, int sourceFormat, byte[] mosaic16) {
++        if (width <= 0 || height <= 0 || mosaic16 == null) throw new IllegalArgumentException("Invalid Spektra meter");
+         long expected = (long) width * (long) height * 2L;
+         if (expected > Integer.MAX_VALUE || mosaic16.length != (int) expected) {
+-            throw new IllegalArgumentException("Frozen Spektra RAW byte count mismatch");
++            throw new IllegalArgumentException("Spektra meter byte count mismatch");
+         }
+         if (sourceFormat != ImageFormat.RAW_SENSOR && sourceFormat != ImageFormat.RAW10
+                 && sourceFormat != ImageFormat.RAW12) {
+-            throw new IllegalArgumentException("Invalid frozen Spektra RAW format " + sourceFormat);
++            throw new IllegalArgumentException("Invalid Spektra RAW format " + sourceFormat);
+         }
+     }
+ 
++    private static void validatePacked(int width, int height, int sourceFormat,
++            int rowStride, int pixelStride, byte[] packed) {
++        if (width <= 0 || height <= 0 || rowStride <= 0 || packed == null || packed.length <= 0) {
++            throw new IllegalArgumentException("Invalid packed Spektra RAW");
++        }
++        if (sourceFormat != ImageFormat.RAW_SENSOR && sourceFormat != ImageFormat.RAW10
++                && sourceFormat != ImageFormat.RAW12) {
++            throw new IllegalArgumentException("Invalid frozen Spektra RAW format " + sourceFormat);
++        }
++        long minimum;
++        if (sourceFormat == ImageFormat.RAW10) minimum = (long) ((width + 3) / 4) * 5L;
++        else if (sourceFormat == ImageFormat.RAW12) minimum = (long) ((width + 1) / 2) * 3L;
++        else minimum = (long) width * Math.max(2, pixelStride);
++        long required = (long) (height - 1) * rowStride + minimum;
++        if (required > packed.length) throw new IllegalArgumentException("Packed Spektra RAW byte count mismatch");
++    }
+ 
+     /**
+-     * IRIS_26685_SPEKTRA_BAYER_PHASE_DISCOVERY
+-     * Infer only the Bayer-origin parity that Camera2 stream/crop geometry leaves ambiguous.
+-     * The Camera2 CFA enum remains authority for the color ordering; this routine chooses the
+-     * buffer-origin parity whose two green phases have the most similar normalized statistics.
+-     * Ties stay on the geometry hint so this cannot casually swap red/blue on saturated scenes.
++     * Infer only the Bayer-origin parity left ambiguous by Camera2 stream geometry. The active RAW
++     * domain remains the geometry authority; image statistics may reject it but never invent R/B phase.
+      */
+     public int estimateBayerOffset(int cfaArrangement, int[] black4, int whiteLevel, int geometryHint) {
+-        if (cfaArrangement < 0 || cfaArrangement > 3 || black4 == null || black4.length < 4 || whiteLevel <= 0) {
++        if (mosaic16 == null || cfaArrangement < 0 || cfaArrangement > 3
++                || black4 == null || black4.length < 4 || whiteLevel <= 0) {
+             return geometryHint >= 0 && geometryHint <= 3 ? geometryHint : -1;
+         }
+         ByteBuffer b = ByteBuffer.wrap(mosaic16).order(ByteOrder.nativeOrder());
+@@ -193,15 +214,11 @@ public final class SpektraRawFrame {
+         long[] count = new long[4];
+         final int borderX = Math.max(2, width / 16);
+         final int borderY = Math.max(2, height / 16);
+-        // Regression: sample every CFA phase independently. A single even-stride walk can remain
+-        // forever on q0 and make Bayer-origin discovery silently degenerate.
+         int phaseStep = Math.max(4, Math.min(width, height) / 120);
+         if ((phaseStep & 1) != 0) phaseStep++;
+         for (int q = 0; q < 4; ++q) {
+-            final int qx = q & 1;
+-            final int qy = (q >> 1) & 1;
+-            int startX = borderX;
+-            int startY = borderY;
++            final int qx = q & 1, qy = (q >> 1) & 1;
++            int startX = borderX, startY = borderY;
+             if ((startX & 1) != qx) startX++;
+             if ((startY & 1) != qy) startY++;
+             for (int y = startY; y < height - borderY; y += phaseStep) {
+@@ -213,45 +230,30 @@ public final class SpektraRawFrame {
+                 }
+             }
+         }
+-
+-        // Image statistics can identify which diagonal contains the two green photosites, but they
+-        // cannot distinguish R/B orientation within that diagonal (0 vs 3 or 1 vs 2). The exact
+-        // X/Y origin therefore comes from Camera2 geometry. If geometry is unresolved or strongly
+-        // contradicts the observed green diagonal, fail closed instead of guessing a red/blue swap.
+-        double[] classScore = new double[] {Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY};
++        double[] classScore = {Double.POSITIVE_INFINITY, Double.POSITIVE_INFINITY};
+         for (int offset = 0; offset < 4; ++offset) {
+             int effectiveCfa = cfaArrangement ^ offset;
+-            int red = effectiveCfa;
+-            int blue = effectiveCfa ^ 3;
+-            int g0 = -1, g1 = -1;
++            int red = effectiveCfa, blue = effectiveCfa ^ 3, g0 = -1, g1 = -1;
+             for (int q = 0; q < 4; ++q) {
+                 if (q == red || q == blue) continue;
+                 if (g0 < 0) g0 = q; else g1 = q;
+             }
+             if (g0 < 0 || g1 < 0 || count[g0] == 0 || count[g1] == 0) continue;
+-            double m0raw = sum[g0] / count[g0];
+-            double m1raw = sum[g1] / count[g1];
+-            double m0 = Math.max(0.0, m0raw - black4[g0 ^ offset])
+-                    / Math.max(1.0, whiteLevel - black4[g0 ^ offset]);
+-            double m1 = Math.max(0.0, m1raw - black4[g1 ^ offset])
+-                    / Math.max(1.0, whiteLevel - black4[g1 ^ offset]);
++            double m0raw = sum[g0] / count[g0], m1raw = sum[g1] / count[g1];
++            double m0 = Math.max(0.0, m0raw - black4[g0 ^ offset]) / Math.max(1.0, whiteLevel - black4[g0 ^ offset]);
++            double m1 = Math.max(0.0, m1raw - black4[g1 ^ offset]) / Math.max(1.0, whiteLevel - black4[g1 ^ offset]);
+             double v0 = Math.max(0.0, sumSq[g0] / count[g0] - m0raw * m0raw);
+             double v1 = Math.max(0.0, sumSq[g1] / count[g1] - m1raw * m1raw);
+-            double meanScore = Math.abs(Math.log((m0 + 1.0e-6) / (m1 + 1.0e-6)));
+-            double varScore = Math.abs(Math.log((Math.sqrt(v0) + 1.0) / (Math.sqrt(v1) + 1.0)));
+-            int diagonalClass = (offset == 0 || offset == 3) ? 0 : 1;
+-            classScore[diagonalClass] = Math.min(classScore[diagonalClass], meanScore + 0.15 * varScore);
++            double score = Math.abs(Math.log((m0 + 1e-6) / (m1 + 1e-6)))
++                    + 0.15 * Math.abs(Math.log((Math.sqrt(v0) + 1.0) / (Math.sqrt(v1) + 1.0)));
++            int klass = (offset == 0 || offset == 3) ? 0 : 1;
++            classScore[klass] = Math.min(classScore[klass], score);
+         }
+         if (geometryHint < 0 || geometryHint > 3) return -1;
+-        final int geometryClass = (geometryHint == 0 || geometryHint == 3) ? 0 : 1;
+-        final int otherClass = 1 - geometryClass;
++        int geometryClass = (geometryHint == 0 || geometryHint == 3) ? 0 : 1;
++        int otherClass = 1 - geometryClass;
+         if (!Double.isFinite(classScore[geometryClass])) return -1;
+-        // Require only a meaningful contradiction to reject geometry; nearly equal class scores are
+-        // common in low-detail/neutral scenes and geometry remains the exact origin authority there.
+-        if (Double.isFinite(classScore[otherClass])
+-                && classScore[otherClass] + 0.08 < classScore[geometryClass]) {
+-            return -1;
+-        }
++        if (Double.isFinite(classScore[otherClass]) && classScore[otherClass] + 0.08 < classScore[geometryClass]) return -1;
+         return geometryHint;
+     }
+ 
+@@ -259,30 +261,26 @@ public final class SpektraRawFrame {
+         return centerWeightedMeter(black4, whiteLevel, 0.5, 0.5, false);
+     }
+ 
+-    /** Touch metering favors the tapped subject while retaining a whole-scene center-weighted reading. */
+-    public double centerWeightedMeter(int[] black4, int whiteLevel, double touchX, double touchY, boolean touchActive) {
+-        if (whiteLevel <= 0) return 0.18;
++    public double centerWeightedMeter(int[] black4, int whiteLevel,
++            double touchX, double touchY, boolean touchActive) {
++        if (mosaic16 == null || whiteLevel <= 0) return 0.18;
+         ByteBuffer b = ByteBuffer.wrap(mosaic16).order(ByteOrder.nativeOrder());
+         final int step = Math.max(2, Math.min(width, height) / 96);
+-        double weighted = 0.0;
+-        double weightSum = 0.0;
++        double weighted = 0.0, weightSum = 0.0;
+         for (int y = step / 2; y < height; y += step) {
+             double ny = (2.0 * y / Math.max(1.0, height - 1.0)) - 1.0;
+             for (int x = step / 2; x < width; x += step) {
+                 double nx = (2.0 * x / Math.max(1.0, width - 1.0)) - 1.0;
+-                double r2 = nx * nx + ny * ny;
+-                double sceneWeight = 0.25 + 0.75 * Math.exp(-1.5 * r2);
++                double sceneWeight = 0.25 + 0.75 * Math.exp(-1.5 * (nx * nx + ny * ny));
+                 double w = sceneWeight;
+                 if (touchActive) {
+-                    double px = x / Math.max(1.0, width - 1.0);
+-                    double py = y / Math.max(1.0, height - 1.0);
+-                    double dx = px - touchX;
+-                    double dy = py - touchY;
++                    double px = x / Math.max(1.0, width - 1.0), py = y / Math.max(1.0, height - 1.0);
++                    double dx = px - touchX, dy = py - touchY;
+                     double local = Math.exp(-24.0 * (dx * dx + dy * dy));
+                     w = 0.35 * sceneWeight + 0.65 * (0.20 + 0.80 * local);
+                 }
+-                int cfa = ((y & 1) << 1) | (x & 1);
+-                int black = black4 == null || black4.length < 4 ? 0 : black4[cfa];
++                int q = ((y & 1) << 1) | (x & 1);
++                int black = black4 == null || black4.length < 4 ? 0 : black4[q];
+                 int sample = b.getShort((y * width + x) * 2) & 0xffff;
+                 double normalized = Math.max(0.0, sample - black) / Math.max(1.0, whiteLevel - black);
+                 weighted += w * normalized;
+@@ -292,12 +290,7 @@ public final class SpektraRawFrame {
+         return weightSum > 0.0 ? weighted / weightSum : 0.18;
+     }
+ 
+-    private static native byte[] nativeDecodeRaw(ByteBuffer source, int sourceOffset, int sourceBytes,
++    private static native byte[] nativeDecodeMeter(ByteBuffer source, int sourceOffset, int sourceBytes,
+             int sourceWidth, int sourceHeight, int rowStride, int pixelStride, int format,
+             int outputWidth, int outputHeight);
+-
+-    private static native byte[] nativeDecodePreviewRgb16f(ByteBuffer source, int sourceOffset, int sourceBytes,
+-            int sourceWidth, int sourceHeight, int rowStride, int pixelStride, int format,
+-            int outputWidth, int outputHeight, int sensorCfa, int bayerOffset, int[] sensorBlack4,
+-            int whiteLevel);
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+index b35a685571d76c39804805bbded6dd76a523f856..c2f08dc0a1bf667ba5bbb888344cc5f264e72ca1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+@@ -1,35 +1,22 @@
+ package com.particlesdevs.photoncamera.spektra;
+ 
+-import android.graphics.Point;
++import android.graphics.Rect;
+ 
+-import com.particlesdevs.photoncamera.processing.opengl.GLBuffer;
+-import com.particlesdevs.photoncamera.processing.opengl.GLContext;
+-import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+-import com.particlesdevs.photoncamera.processing.opengl.GLProg;
+-import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+ 
+-import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+-import static android.opengl.GLES20.GL_LINEAR;
+-import static android.opengl.GLES20.GL_NEAREST;
+-import static android.opengl.GLES31.GL_ALL_BARRIER_BITS;
+-import static android.opengl.GLES31.GL_DYNAMIC_DRAW;
+-import static android.opengl.GLES31.glMemoryBarrier;
+-
+ /**
+- * Spektra-only single-frame RAW front end.
++ * Spektra-owned single-frame RAW front end.
+  *
+- * Ownership invariant: this class consumes only one physical RAW, exact matched Camera2 metadata,
+- * and the Spektra-owned sensor->linear-sRGB solution. It does not import Parameters, SpecificSensor,
+- * Motion/Night provenance, temporal merge state, or per-lens Iris IQ tuning.
++ * Active-path invariant for 26686: packed Camera2 RAW -> one persistent native Vulkan owner ->
++ * scene-linear RGBA16F. No Iris GLContext/GLProg/GLTexture and no Motion RCD runtime ownership.
+  */
+ public final class SpektraRawProcessor {
++    static { System.loadLibrary("spektra_iris"); }
++
+     private static final String TAG = "SpektraRawProcessor";
+-    private static final int BAND_CORE_ROWS = 256;
+-    private static final int RCD_HALO = 12;
+     public static final float SAVED_CHROMA_DENOISE_STRENGTH = 0.75f;
+     private static final float SENSOR_CLIP_THRESHOLD = 0.985f;
+ 
+@@ -45,311 +32,108 @@ public final class SpektraRawProcessor {
+         }
+     }
+ 
+-    private GLBuffer scratch(int pixels) {
+-        return new GLBuffer(pixels, new GLFormat(GLFormat.DataType.FLOAT_32), GL_DYNAMIC_DRAW, false);
+-    }
+-
+-    private static ByteBuffer directCopy(byte[] bytes) {
+-        ByteBuffer b = ByteBuffer.allocateDirect(bytes.length).order(ByteOrder.nativeOrder());
+-        b.put(bytes).position(0);
+-        return b;
+-    }
+-
+-    private static ByteBuffer floats(float[] values) {
+-        ByteBuffer b = ByteBuffer.allocateDirect(values.length * Float.BYTES).order(ByteOrder.nativeOrder());
+-        b.asFloatBuffer().put(values);
+-        b.position(0);
+-        return b;
+-    }
+-
+     public LinearFrame process(SpektraShot shot, boolean savedPhoto) {
+         if (shot == null || shot.raw == null || shot.metadata == null) {
+             throw new IllegalArgumentException("Spektra RAW recipe incomplete");
+         }
+-        if (shot.sensorToLinearSrgb == null || shot.sensorToLinearSrgb.length != 9) {
+-            throw new IllegalArgumentException("Spektra sensor-to-linear-sRGB matrix missing");
+-        }
+-        final int width = shot.raw.width;
+-        final int height = shot.raw.height;
++        validateRecipe(shot.metadata, shot.sensorToLinearSrgb);
+         if (!savedPhoto) {
+-            return processPreviewRgb(shot, width, height);
+-        }
+-        if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0) {
+-            throw new IllegalArgumentException("Spektra RCD requires positive even Bayer dimensions");
++            byte[] preview = shot.raw.previewLinearRgba16f;
++            if (preview == null) throw new IllegalArgumentException("Spektra VF-S native linear frame missing");
++            return linearFrame(shot.raw.width, shot.raw.height, preview);
+         }
+-        if (shot.metadata.cfaArrangement < 0 || shot.metadata.cfaArrangement > 3) {
+-            throw new IllegalArgumentException("Unsupported Spektra CFA arrangement " + shot.metadata.cfaArrangement);
++        if (shot.raw.packedRaw == null) {
++            throw new IllegalArgumentException("Saved Spektra packed RAW missing");
+         }
+-        if (shot.metadata.whiteLevel <= 0 || shot.metadata.blackLevel4 == null || shot.metadata.blackLevel4.length < 4) {
+-            throw new IllegalArgumentException("Spektra black/white metadata incomplete");
+-        }
+-
+-        final Point rawSize = new Point(width, height);
+-        final Point packedSize = new Point(width / 2, height / 2);
+-        try (GLContext gl = new GLContext(Math.max(1, width), Math.max(1, height))) {
+-            final GLProg p = gl.mProgram;
+-            GLTexture raw16 = null;
+-            GLTexture packed = null;
+-            GLTexture clipMask = null;
+-            GLTexture lsc = null;
+-            GLTexture rcd = null;
+-            GLTexture recovered = null;
+-            GLTexture linear = null;
+-            GLTexture denoised = null;
+-            try {
+-                raw16 = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.UNSIGNED_16),
+-                        directCopy(shot.raw.mosaic16), GL_NEAREST, GL_CLAMP_TO_EDGE);
+-                packed = new GLTexture(packedSize, new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+-                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+-                p.useAssetProgram("spektra/raw16_to_packed_linear_bayer");
+-                p.setTexture("InputBuffer", raw16);
+-                int[] black = shot.metadata.blackLevel4;
+-                p.setVar("blackLevel", (float) black[0], (float) black[1], (float) black[2], (float) black[3]);
+-                p.setVar("whiteLevel", (float) shot.metadata.whiteLevel);
+-                p.drawBlocks(packed);
+-
+-                if (savedPhoto) {
+-                    clipMask = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16),
+-                            null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+-                    p.useAssetProgram("spektra/raw_clip_mask");
+-                    p.setTexture("InputBayer", packed);
+-                    p.setVar("rawSize", rawSize);
+-                    p.setVar("clipThreshold", SENSOR_CLIP_THRESHOLD);
+-                    p.drawBlocks(clipMask);
+-                }
+-
+-                boolean hasLsc = shot.metadata.lensShading != null
+-                        && shot.metadata.lensShadingRows > 0 && shot.metadata.lensShadingCols > 0
+-                        && shot.metadata.lensShading.length >= shot.metadata.lensShadingRows * shot.metadata.lensShadingCols * 4;
+-                Point lscSize = hasLsc
+-                        ? new Point(shot.metadata.lensShadingCols, shot.metadata.lensShadingRows)
+-                        : new Point(1, 1);
+-                float[] lscValues = hasLsc ? shot.metadata.lensShading : new float[]{1f, 1f, 1f, 1f};
+-                lsc = new GLTexture(lscSize, new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+-                        floats(lscValues), GL_LINEAR, GL_CLAMP_TO_EDGE);
+-
+-                rcd = runRcd(p, packed, lsc, rawSize, shot.metadata.cfaArrangement, hasLsc, savedPhoto);
+-                GLTexture preColor = rcd;
+-                if (savedPhoto) {
+-                    recovered = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                            null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                    p.useAssetProgram("spektra/highlight_recover");
+-                    p.setTexture("InputRgb", rcd);
+-                    p.setTexture("ClipMask", clipMask);
+-                    p.setVar("rawSize", rawSize);
+-                    p.drawBlocks(recovered);
+-                    preColor = recovered;
+-                    // Highlight output now owns every sample needed downstream. Drop the full-frame
+-                    // RCD texture immediately so generic devices do not carry three RGB surfaces.
+-                    rcd.close();
+-                    rcd = null;
+-                }
+-
+-                linear = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                        null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                p.useAssetProgram("spektra/sensor_to_linear_srgb");
+-                p.setTexture("InputRgb", preColor);
+-                // Android GLES requires transpose=false for uniform matrices.
+-                p.setVar("sensorToLinearSrgb", false, shot.sensorToLinearSrgb);
+-                p.drawBlocks(linear);
+-                if (preColor == recovered && recovered != null) {
+-                    recovered.close();
+-                    recovered = null;
+-                } else if (preColor == rcd && rcd != null) {
+-                    rcd.close();
+-                    rcd = null;
+-                }
+-
+-                final GLTexture outputTexture;
+-                if (savedPhoto) {
+-                    denoised = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                            null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                    p.useAssetProgram("spektra/chroma_denoise");
+-                    p.setTexture("InputRgb", linear);
+-                    p.setVar("InputSize", rawSize);
+-                    p.setVar("strength", SAVED_CHROMA_DENOISE_STRENGTH);
+-                    p.drawBlocks(denoised);
+-                    linear.close();
+-                    linear = null;
+-                    outputTexture = denoised;
+-                } else {
+-                    // Standalone Unspektrawesome default: Chroma Denoise is a saved-photo owner.
+-                    // VF-S LOW preview stays lightweight and does not run saved-photo denoise.
+-                    outputTexture = linear;
+-                }
++        ByteBuffer packed = ByteBuffer.allocateDirect(shot.raw.packedRaw.length).order(ByteOrder.nativeOrder());
++        packed.put(shot.raw.packedRaw).flip();
++        Rect crop = shot.metadata.sourceCrop;
++        byte[] out = nativeProcessPackedRaw(packed, 0, shot.raw.packedRaw.length,
++                shot.raw.sourceWidth(), shot.raw.sourceHeight(), shot.raw.rowStride, shot.raw.pixelStride,
++                shot.raw.sourceFormat, rect4(shot.metadata.rawBounds), rect4(crop), rect4(shot.metadata.activeRawDomain),
++                shot.metadata.cfaArrangement, shot.metadata.bayerOffset, shot.metadata.blackLevel4,
++                shot.metadata.whiteLevel, shot.metadata.lensShading, shot.metadata.lensShadingRows,
++                shot.metadata.lensShadingCols, shot.sensorToLinearSrgb, crop.width(), crop.height(), true,
++                SAVED_CHROMA_DENOISE_STRENGTH, SENSOR_CLIP_THRESHOLD);
++        if (out == null) throw new IllegalStateException("Spektra saved Vulkan RAW owner returned no frame");
++        Log.d(TAG, "IRIS_26686_SPEKTRA_NATIVE_RAW_OWNER saved=true raw="
++                + shot.raw.sourceWidth() + "x" + shot.raw.sourceHeight()
++                + " crop=" + crop + " activeRaw=" + shot.metadata.activeRawDomain
++                + " bayerOffset=" + shot.metadata.bayerOffset
++                + " highlightRecovery=true chromaDenoise=" + SAVED_CHROMA_DENOISE_STRENGTH
++                + " output=sceneLinearRec709 owner=Vulkan");
++        return linearFrame(crop.width(), crop.height(), out);
++    }
+ 
+-                ByteBuffer out = outputTexture.textureBuffer(new GLFormat(GLFormat.DataType.FLOAT_16, 4), true)
+-                        .order(ByteOrder.nativeOrder());
+-                out.position(0);
+-                if (savedPhoto) Log.d(TAG, "IRIS_26685_SPEKTRA_RAW_FRONTEND"
+-                        + " saved=" + savedPhoto
+-                        + " raw=" + width + "x" + height
+-                        + " cfa=" + shot.metadata.cfaArrangement
+-                        + " lensShading=" + hasLsc
+-                        + " highlightRecovery=" + savedPhoto
+-                        + " chromaDenoise=" + (savedPhoto ? SAVED_CHROMA_DENOISE_STRENGTH : 0.0f)
+-                        + " previewQuality=" + (savedPhoto ? "FULL" : "LOW_480_SHORT_EDGE")
+-                        + " output=sceneLinearRec709");
+-                return new LinearFrame(width, height, out);
+-            } finally {
+-                if (denoised != null) denoised.close();
+-                if (linear != null) linear.close();
+-                if (recovered != null) recovered.close();
+-                if (rcd != null) rcd.close();
+-                if (lsc != null) lsc.close();
+-                if (clipMask != null) clipMask.close();
+-                if (packed != null) packed.close();
+-                if (raw16 != null) raw16.close();
+-            }
++    static byte[] processLivePreview(ByteBuffer source, int sourceOffset, int sourceBytes,
++            int sourceWidth, int sourceHeight, int rowStride, int pixelStride, int format,
++            SpektraFrameMetadata metadata, float[] sensorToLinearSrgb, int outputWidth, int outputHeight) {
++        validateRecipe(metadata, sensorToLinearSrgb);
++        if (source == null || !source.isDirect()) {
++            throw new IllegalArgumentException("VF-S native RAW owner requires a direct Camera2 plane");
+         }
++        return nativeProcessPackedRaw(source, sourceOffset, sourceBytes, sourceWidth, sourceHeight,
++                rowStride, pixelStride, format, rect4(metadata.rawBounds), rect4(metadata.sourceCrop),
++                rect4(metadata.activeRawDomain), metadata.cfaArrangement, metadata.bayerOffset,
++                metadata.blackLevel4, metadata.whiteLevel, metadata.lensShading,
++                metadata.lensShadingRows, metadata.lensShadingCols, sensorToLinearSrgb,
++                outputWidth, outputHeight, false, 0.0f, SENSOR_CLIP_THRESHOLD);
+     }
+ 
+-    /**
+-     * IRIS_26685_SPEKTRA_VFS_RGB_OWNER
+-     * VF-S receives camera RGB that was reconstructed from the original packed RAW lattice before
+-     * reduction. It must never run the reduced Bayer meter through RCD. The only GPU color stage
+-     * here is the existing camera-sensor RGB -> scene-linear Rec.709 transform before SPEKTRA film.
+-     */
+-    private LinearFrame processPreviewRgb(SpektraShot shot, int width, int height) {
+-        byte[] previewRgb = shot.raw.previewCameraRgb16f;
+-        if (width <= 0 || height <= 0 || previewRgb == null
+-                || previewRgb.length != (long) width * (long) height * 8L) {
+-            throw new IllegalArgumentException("Spektra VF-S camera-RGB frame missing or malformed");
+-        }
+-        final Point size = new Point(width, height);
+-        try (GLContext gl = new GLContext(Math.max(1, width), Math.max(1, height))) {
+-            final GLProg p = gl.mProgram;
+-            GLTexture cameraRgb = null;
+-            GLTexture linear = null;
+-            try {
+-                cameraRgb = new GLTexture(size, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                        directCopy(previewRgb), GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                linear = new GLTexture(size, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                        null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                p.useAssetProgram("spektra/sensor_to_linear_srgb");
+-                p.setTexture("InputRgb", cameraRgb);
+-                p.setVar("sensorToLinearSrgb", false, shot.sensorToLinearSrgb);
+-                p.drawBlocks(linear);
+-                ByteBuffer out = linear.textureBuffer(new GLFormat(GLFormat.DataType.FLOAT_16, 4), true)
+-                        .order(ByteOrder.nativeOrder());
+-                out.position(0);
+-                return new LinearFrame(width, height, out);
+-            } finally {
+-                if (linear != null) linear.close();
+-                if (cameraRgb != null) cameraRgb.close();
+-            }
++    static LinearFrame previewLinearFrame(SpektraRawFrame raw) {
++        if (raw == null || raw.previewLinearRgba16f == null) {
++            throw new IllegalArgumentException("Spektra VF-S native linear frame missing");
+         }
++        return linearFrame(raw.width, raw.height, raw.previewLinearRgba16f);
+     }
+ 
+-    private GLTexture runRcd(GLProg p, GLTexture packed, GLTexture lsc, Point raw,
+-            int cfaPattern, boolean hasLsc, boolean logDiagnostics) {
+-        GLTexture output = new GLTexture(raw, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-        int bands = 0;
+-        long maxScratchBytes = 0L;
+-        try {
+-            for (int coreY = 0; coreY < raw.y; coreY += BAND_CORE_ROWS) {
+-                int coreRows = Math.min(BAND_CORE_ROWS, raw.y - coreY);
+-                int bandOriginX = -RCD_HALO;
+-                int bandOriginY = coreY - RCD_HALO;
+-                int coreLocalX = RCD_HALO;
+-                int coreLocalY = RCD_HALO;
+-                Point bandSize = new Point(raw.x + 2 * RCD_HALO, coreRows + 2 * RCD_HALO);
+-                int pixels = Math.multiplyExact(bandSize.x, bandSize.y);
+-                maxScratchBytes = Math.max(maxScratchBytes, (long) pixels * 10L * Float.BYTES);
+-                try (GLBuffer cfa = scratch(pixels);
+-                     GLBuffer red = scratch(pixels);
+-                     GLBuffer green = scratch(pixels);
+-                     GLBuffer blue = scratch(pixels);
+-                     GLBuffer vh = scratch(pixels);
+-                     GLBuffer lpf = scratch(pixels);
+-                     GLBuffer pdiff = scratch(pixels);
+-                     GLBuffer qdiff = scratch(pixels);
+-                     GLBuffer pq = scratch(pixels);
+-                     GLBuffer trust = scratch(pixels)) {
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_populate", true);
+-                    p.setTexture("InputBayer", packed);
+-                    p.setTexture("LensShadingMap", lsc);
+-                    p.setBufferCompute("CfaBuf", cfa);
+-                    p.setBufferCompute("RedBuf", red);
+-                    p.setBufferCompute("GreenBuf", green);
+-                    p.setBufferCompute("BlueBuf", blue);
+-                    p.setBufferCompute("TrustBuf", trust);
+-                    p.setVar("rawSize", raw);
+-                    p.setVar("bandSize", bandSize);
+-                    p.setVar("bandOrigin", bandOriginX, bandOriginY);
+-                    p.setVar("cfaPattern", cfaPattern);
+-                    p.setVar("highlightCeiling", 8.0f);
+-                    p.setVar("useLensShading", hasLsc ? 1 : 0);
+-                    p.computeAutoDeferred(bandSize, 1);
+-
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_vh_direction", true);
+-                    p.setBufferCompute("CfaBuf", cfa); p.setBufferCompute("VhBuf", vh); p.setBufferCompute("TrustBuf", trust);
+-                    p.setVar("bandSize", bandSize); p.computeAutoDeferred(bandSize, 1);
+-
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_lpf", true);
+-                    p.setBufferCompute("CfaBuf", cfa); p.setBufferCompute("LpfBuf", lpf); p.setBufferCompute("TrustBuf", trust);
+-                    p.setVar("bandSize", bandSize); p.computeAutoDeferred(bandSize, 1);
+-
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_green", true);
+-                    p.setBufferCompute("CfaBuf", cfa); p.setBufferCompute("GreenBuf", green); p.setBufferCompute("VhBuf", vh);
+-                    p.setBufferCompute("LpfBuf", lpf); p.setBufferCompute("TrustBuf", trust);
+-                    p.setVar("bandSize", bandSize); p.setVar("bandOriginY", bandOriginY); p.setVar("cfaPattern", cfaPattern);
+-                    p.computeAutoDeferred(bandSize, 1);
+-
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_diag_residual", true);
+-                    p.setBufferCompute("CfaBuf", cfa); p.setBufferCompute("PBuf", pdiff); p.setBufferCompute("QBuf", qdiff);
+-                    p.setBufferCompute("TrustBuf", trust); p.setVar("bandSize", bandSize); p.computeAutoDeferred(bandSize, 1);
++    public static void releaseNativeOwner() {
++        nativeReleaseRawOwner();
++    }
+ 
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26489_diag_direction", true);
+-                    p.setBufferCompute("PBuf", pdiff); p.setBufferCompute("QBuf", qdiff); p.setBufferCompute("PqBuf", pq);
+-                    p.setVar("bandSize", bandSize); p.computeAutoDeferred(bandSize, 1);
++    /** Returns {previewProcessed, previewDropped, avgPreviewMicros, lastStillMicros, ownerCount, allocationCount}. */
++    public static long[] nativeStats() {
++        long[] stats = nativeRawOwnerStats();
++        return stats == null ? new long[6] : stats;
++    }
+ 
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_opposite", true);
+-                    p.setBufferCompute("RedBuf", red); p.setBufferCompute("GreenBuf", green); p.setBufferCompute("BlueBuf", blue);
+-                    p.setBufferCompute("PqBuf", pq); p.setBufferCompute("TrustBuf", trust);
+-                    p.setVar("bandSize", bandSize); p.setVar("bandOriginY", bandOriginY); p.setVar("cfaPattern", cfaPattern);
+-                    p.computeAutoDeferred(bandSize, 1);
++    private static void validateRecipe(SpektraFrameMetadata metadata, float[] matrix) {
++        if (metadata == null || metadata.cfaArrangement < 0 || metadata.cfaArrangement > 3
++                || metadata.bayerOffset < 0 || metadata.bayerOffset > 3
++                || metadata.blackLevel4 == null || metadata.blackLevel4.length != 4
++                || metadata.whiteLevel <= 0 || metadata.rawBounds == null || metadata.sourceCrop == null
++                || metadata.activeRawDomain == null || matrix == null || matrix.length != 9) {
++            throw new IllegalArgumentException("Spektra native RAW recipe incomplete");
++        }
++        if (!metadata.rawBounds.contains(metadata.sourceCrop)
++                || !metadata.rawBounds.contains(metadata.activeRawDomain)) {
++            throw new IllegalArgumentException("Spektra RAW geometry domains disagree");
++        }
++    }
+ 
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_green_rb", true);
+-                    p.setBufferCompute("RedBuf", red); p.setBufferCompute("GreenBuf", green); p.setBufferCompute("BlueBuf", blue);
+-                    p.setBufferCompute("VhBuf", vh); p.setBufferCompute("TrustBuf", trust);
+-                    p.setVar("bandSize", bandSize); p.setVar("bandOriginY", bandOriginY); p.setVar("cfaPattern", cfaPattern);
+-                    p.computeAutoDeferred(bandSize, 1);
++    private static int[] rect4(Rect r) {
++        return new int[]{r.left, r.top, r.right, r.bottom};
++    }
+ 
+-                    p.setLayout(8, 8, 1);
+-                    p.useAssetProgram("spektra/rcd26498_write", true);
+-                    p.setBufferCompute("RedBuf", red); p.setBufferCompute("GreenBuf", green); p.setBufferCompute("BlueBuf", blue);
+-                    p.setTextureCompute("OutputRgb", output, true);
+-                    p.setVar("rawSize", raw); p.setVar("bandSize", bandSize); p.setVar("bandOrigin", bandOriginX, bandOriginY);
+-                    p.setVar("coreLocalX", coreLocalX); p.setVar("coreLocalY", coreLocalY); p.setVar("coreRows", coreRows);
+-                    p.setVar("calculationWb", 1.0f, 1.0f, 1.0f);
+-                    p.computeAutoDeferred(new Point(raw.x, coreRows), 1);
+-                }
+-                bands++;
+-            }
+-            glMemoryBarrier(GL_ALL_BARRIER_BITS);
+-            p.closed = true;
+-            if (logDiagnostics) Log.d(TAG, "IRIS_26685_SPEKTRA_RCD"
+-                    + " ownership=singlePhysicalRaw"
+-                    + " bands=" + bands
+-                    + " halo=" + RCD_HALO
+-                    + " maxScratchMiB=" + (maxScratchBytes / (1024L * 1024L))
+-                    + " allPhysicalSamplesTrusted=true"
+-                    + " motionProvenance=false"
+-                    + " lensShading=" + hasLsc);
+-            return output;
+-        } catch (Throwable t) {
+-            output.close();
+-            throw t;
++    private static LinearFrame linearFrame(int width, int height, byte[] bytes) {
++        long expected = (long) width * (long) height * 8L;
++        if (width <= 0 || height <= 0 || expected > Integer.MAX_VALUE
++                || bytes == null || bytes.length != (int) expected) {
++            throw new IllegalArgumentException("Spektra native RGBA16F byte count mismatch");
+         }
++        ByteBuffer out = ByteBuffer.allocateDirect(bytes.length).order(ByteOrder.nativeOrder());
++        out.put(bytes).flip();
++        return new LinearFrame(width, height, out);
+     }
++
++    private static native byte[] nativeProcessPackedRaw(ByteBuffer source, int sourceOffset, int sourceBytes,
++            int sourceWidth, int sourceHeight, int rowStride, int pixelStride, int format,
++            int[] rawBounds4, int[] sourceCrop4, int[] activeRawDomain4, int cfaArrangement,
++            int bayerOffset, int[] blackLevel4, int whiteLevel, float[] lensShading,
++            int lensShadingRows, int lensShadingCols, float[] sensorToLinearSrgb,
++            int outputWidth, int outputHeight, boolean savedPhoto, float chromaDenoiseStrength,
++            float sensorClipThreshold);
++
++    private static native void nativeReleaseRawOwner();
++    private static native long[] nativeRawOwnerStats();
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraShotStore.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraShotStore.java
+index 914c435f523ace034b06d0f0b50dc92a76f2d033..fe94678e43f7feaf2d10be420d8a441e68157572 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraShotStore.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraShotStore.java
+@@ -1,6 +1,7 @@
+ package com.particlesdevs.photoncamera.spektra;
+ 
+ import android.content.Context;
++import android.graphics.Rect;
+ import android.system.ErrnoException;
+ import android.system.Os;
+ 
+@@ -18,14 +19,18 @@ import java.util.UUID;
+ /** Atomic private recovery store for Spektra Process-now captures. */
+ public final class SpektraShotStore {
+     private static final long MAGIC = 0x4953504b53485431L; // ISPKSHT1
+-    private static final int VERSION = 3;
++    private static final int VERSION = 4;
+     private static final int MAX_FLOAT_ARRAY = 16 * 1024 * 1024;
+     private static final int MAX_DOUBLE_ARRAY = 256;
+     private static final int MAX_SENSOR_PIXELS = 200_000_000;
++    private static final int MAX_PACKED_RAW_BYTES = 512 * 1024 * 1024;
+ 
+     private SpektraShotStore() {}
+ 
+     public static File writeAtomic(Context context, SpektraShot shot) throws IOException {
++        if (shot == null || shot.raw == null || shot.raw.packedRaw == null || shot.metadata == null) {
++            throw new IOException("Spektra recovery requires durable packed RAW recipe");
++        }
+         File dir = new File(context.getFilesDir(), "spektra_recovery");
+         if (!dir.exists() && !dir.mkdirs()) throw new IOException("Unable to create Spektra recovery directory");
+         String stem = "spektra_" + shot.raw.timestampNs + "_" + UUID.randomUUID();
+@@ -36,9 +41,11 @@ public final class SpektraShotStore {
+             out.writeLong(MAGIC);
+             out.writeInt(VERSION);
+             out.writeLong(shot.captureWallTimeMs);
+-            out.writeInt(shot.raw.width);
+-            out.writeInt(shot.raw.height);
++            out.writeInt(shot.raw.sourceWidth());
++            out.writeInt(shot.raw.sourceHeight());
+             out.writeInt(shot.raw.sourceFormat);
++            out.writeInt(shot.raw.rowStride);
++            out.writeInt(shot.raw.pixelStride);
+             out.writeLong(shot.raw.timestampNs);
+             SpektraFrameMetadata m = shot.metadata;
+             out.writeLong(m.frameNumber);
+@@ -48,7 +55,12 @@ public final class SpektraShotStore {
+             out.writeInt(m.requestedIso);
+             out.writeInt(m.whiteLevel);
+             out.writeInt(m.cfaArrangement);
+-            for (int i = 0; i < 4; ++i) out.writeInt(m.blackLevel4 != null && i < m.blackLevel4.length ? m.blackLevel4[i] : 0);
++            out.writeInt(m.bayerOffset);
++            out.writeInt(m.geometryBayerOffsetHint);
++            writeRect(out, m.rawBounds);
++            writeRect(out, m.sourceCrop);
++            writeRect(out, m.activeRawDomain);
++            for (int i = 0; i < 4; ++i) out.writeInt(m.blackLevel4[i]);
+             writeFloatArray(out, m.neutral3);
+             out.writeInt(m.lensShadingRows);
+             out.writeInt(m.lensShadingCols);
+@@ -61,8 +73,8 @@ public final class SpektraShotStore {
+             out.writeInt(shot.jpegOrientationDegrees);
+             out.writeUTF(shot.cameraId);
+             out.writeUTF(shot.lensModel);
+-            out.writeInt(shot.raw.mosaic16.length);
+-            out.write(shot.raw.mosaic16);
++            out.writeInt(shot.raw.packedRaw.length);
++            out.write(shot.raw.packedRaw);
+             out.flush();
+             fos.getFD().sync();
+         }
+@@ -75,7 +87,6 @@ public final class SpektraShotStore {
+         return dst;
+     }
+ 
+-    /** Process-now authority: deserialize the exact durable .shot, never the mutable in-memory recipe. */
+     public static SpektraShot read(File file) throws IOException {
+         if (file == null || !file.isFile()) throw new IOException("Spektra recovery file missing");
+         try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+@@ -86,10 +97,12 @@ public final class SpektraShotStore {
+             int width = in.readInt();
+             int height = in.readInt();
+             int sourceFormat = in.readInt();
++            int rowStride = in.readInt();
++            int pixelStride = in.readInt();
+             long timestampNs = in.readLong();
+             long pixels = (long) width * (long) height;
+-            if (width <= 0 || height <= 0 || pixels <= 0 || pixels > MAX_SENSOR_PIXELS) {
+-                throw new IOException("Invalid Spektra recovery dimensions " + width + "x" + height);
++            if (width <= 0 || height <= 0 || pixels <= 0 || pixels > MAX_SENSOR_PIXELS || rowStride <= 0) {
++                throw new IOException("Invalid Spektra recovery RAW geometry " + width + "x" + height);
+             }
+             long frameNumber = in.readLong();
+             long exposureNs = in.readLong();
+@@ -98,6 +111,11 @@ public final class SpektraShotStore {
+             int requestedIso = in.readInt();
+             int whiteLevel = in.readInt();
+             int cfaArrangement = in.readInt();
++            int bayerOffset = in.readInt();
++            int geometryBayerOffsetHint = in.readInt();
++            Rect rawBounds = readRect(in, "raw bounds");
++            Rect sourceCrop = readRect(in, "source crop");
++            Rect activeRawDomain = readRect(in, "active RAW domain");
+             int[] black = new int[4];
+             for (int i = 0; i < 4; ++i) black[i] = in.readInt();
+             float[] neutral = readFloatArray(in, 3, 3, "neutral");
+@@ -125,30 +143,43 @@ public final class SpektraShotStore {
+             String cameraId = in.readUTF();
+             String lensModel = in.readUTF();
+             int rawLength = in.readInt();
+-            long expectedRaw = pixels * 2L;
+-            if (expectedRaw > Integer.MAX_VALUE || rawLength != (int) expectedRaw) {
+-                throw new IOException("Spektra recovery RAW byte count mismatch");
++            if (rawLength <= 0 || rawLength > MAX_PACKED_RAW_BYTES) {
++                throw new IOException("Invalid Spektra recovery packed RAW length " + rawLength);
+             }
+             byte[] rawBytes = new byte[rawLength];
+             in.readFully(rawBytes);
+             if (in.read() != -1) throw new IOException("Spektra recovery has unexpected trailing data");
+ 
+-            SpektraRawFrame raw = SpektraRawFrame.restore(width, height, sourceFormat, timestampNs, rawBytes);
++            SpektraRawFrame raw;
+             SpektraFrameMetadata metadata;
+             try {
++                raw = SpektraRawFrame.restore(width, height, sourceFormat, rowStride, pixelStride,
++                        timestampNs, rawBytes);
+                 metadata = SpektraFrameMetadata.restore(timestampNs, frameNumber, exposureNs, frameDurationNs,
+                         iso, requestedIso, black, whiteLevel, neutral, lsc, lscRows, lscCols,
+-                        aperture, focalLengthMm, focalLength35Mm, noise, cfaArrangement);
+-                return new SpektraShot(raw, metadata, captureWallTimeMs, sensorToLinearSrgb,
+-                        jpegOrientationDegrees, cameraId, lensModel);
++                        aperture, focalLengthMm, focalLength35Mm, noise, cfaArrangement, bayerOffset,
++                        geometryBayerOffsetHint, rawBounds, sourceCrop, activeRawDomain);
+             } catch (IllegalArgumentException e) {
+                 throw new IOException("Invalid frozen Spektra recovery recipe", e);
+             }
++            return new SpektraShot(raw, metadata, captureWallTimeMs, sensorToLinearSrgb,
++                    jpegOrientationDegrees, cameraId, lensModel);
+         } catch (EOFException e) {
+             throw new IOException("Truncated Spektra recovery file", e);
+         }
+     }
+ 
++    private static void writeRect(DataOutputStream out, Rect r) throws IOException {
++        if (r == null) throw new IOException("Missing Spektra RAW geometry rect");
++        out.writeInt(r.left); out.writeInt(r.top); out.writeInt(r.right); out.writeInt(r.bottom);
++    }
++
++    private static Rect readRect(DataInputStream in, String name) throws IOException {
++        Rect r = new Rect(in.readInt(), in.readInt(), in.readInt(), in.readInt());
++        if (r.width() <= 0 || r.height() <= 0) throw new IOException("Invalid Spektra recovery " + name);
++        return r;
++    }
++
+     private static void writeFloatArray(DataOutputStream out, float[] values) throws IOException {
+         if (values == null) { out.writeInt(-1); return; }
+         out.writeInt(values.length);
+diff --git a/app/version.properties b/app/version.properties
+index 722a9a19ed6037d2e4e90023e42da6b63884278a..864abdcb5faebddcdffd5f9f53514eace813e6bf 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726685
+-VERSION_BUILD=26685
++VERSION_NAME=0.9726686
++VERSION_BUILD=26686
