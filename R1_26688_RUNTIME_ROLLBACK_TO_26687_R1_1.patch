@@ -1,0 +1,723 @@
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+index 069d4d3aa4426aa51cd8081a68d20164d0df93b2..bfdaa04b607972fcd38561caca96a6764cee10a2 100644
+--- a/app/src/main/cpp/CMakeLists.txt
++++ b/app/src/main/cpp/CMakeLists.txt
+@@ -512,7 +512,7 @@ target_link_libraries(iris26681-spektrafilm PUBLIC vulkan dl)
+ 
+ add_library(spektra_iris SHARED
+     spektra/SpektraNativeJni.cpp
+-    spektra/SpektraRawCpuOwner.cpp
++    spektra/SpektraRawVulkanOwner.cpp
+     spektra/SpektraProfileDataBridge.cpp
+     "${IRIS26681_EMBEDDED_SHADERS_CPP}")
+ set_target_properties(spektra_iris PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+diff --git a/app/src/main/cpp/spektra/SpektraNativeJni.cpp b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+index 9726735078404b562f1694dc10f920304a12e7d2..5422dcfb463b82260d4fe57613d6951925db62a6 100644
+--- a/app/src/main/cpp/spektra/SpektraNativeJni.cpp
++++ b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+@@ -8,7 +8,7 @@
+ #include "SpektraParameters.h"
+ #include "SpektraProfileDataBridge.h"
+ #include "SpektraEmbeddedShaders.h"
+-#include "SpektraRawCpuOwner.h"
++#include "SpektraRawVulkanOwner.h"
+ 
+ #include <algorithm>
+ #include <cmath>
+@@ -402,9 +402,9 @@ Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeProcessPac
+     bool dropped = false;
+     double micros = 0.0;
+     std::string error;
+-    if (!iris_spektra::SpektraRawCpuOwner::instance().process(q, &rgba, &dropped, &micros, &error)) {
++    if (!iris_spektra::SpektraRawVulkanOwner::instance().process(q, &rgba, &dropped, &micros, &error)) {
+         jclass cls = env->FindClass("java/lang/IllegalStateException");
+-        if (cls) env->ThrowNew(cls, error.empty() ? "Spektra native RAW processing failed" : error.c_str());
++        if (cls) env->ThrowNew(cls, error.empty() ? "Spektra Vulkan RAW processing failed" : error.c_str());
+         return nullptr;
+     }
+     if (dropped) return nullptr;
+@@ -419,17 +419,27 @@ Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeProcessPac
+     return output;
+ }
+ 
++extern "C" JNIEXPORT void JNICALL
++Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeWarmUpRawOwner(
++        JNIEnv* env, jclass) {
++    std::string error;
++    if (!iris_spektra::SpektraRawVulkanOwner::instance().warmUp(&error)) {
++        jclass cls = env->FindClass("java/lang/IllegalStateException");
++        if (cls) env->ThrowNew(cls, error.empty() ? "Spektra Vulkan RAW warm-up failed" : error.c_str());
++    }
++}
++
+ extern "C" JNIEXPORT void JNICALL
+ Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeReleaseRawOwner(
+         JNIEnv*, jclass) {
+-    iris_spektra::SpektraRawCpuOwner::instance().release();
++    iris_spektra::SpektraRawVulkanOwner::instance().release();
+ }
+ 
+ extern "C" JNIEXPORT jlongArray JNICALL
+ Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeRawOwnerStats(
+         JNIEnv* env, jclass) {
+     uint64_t stats[6] = {};
+-    iris_spektra::SpektraRawCpuOwner::instance().stats(stats);
++    iris_spektra::SpektraRawVulkanOwner::instance().stats(stats);
+     jlong values[6];
+     for (int i=0;i<6;++i) values[i]=static_cast<jlong>(stats[i]);
+     jlongArray out=env->NewLongArray(6);
+diff --git a/app/src/main/cpp/spektra/SpektraRawCpuOwner.cpp b/app/src/main/cpp/spektra/SpektraRawCpuOwner.cpp
+deleted file mode 100644
+index ad4448af7be3bc86a9d6f0c8459ff02671894a75..0000000000000000000000000000000000000000
+--- a/app/src/main/cpp/spektra/SpektraRawCpuOwner.cpp
++++ /dev/null
+@@ -1,375 +0,0 @@
+-#include "SpektraRawCpuOwner.h"
+-
+-#include <android/log.h>
+-#include <algorithm>
+-#include <atomic>
+-#include <chrono>
+-#include <cmath>
+-#include <cstring>
+-#include <mutex>
+-#include <thread>
+-#include <vector>
+-
+-namespace iris_spektra {
+-namespace {
+-
+-#define SPEKTRA_RAW_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SpektraRawCpu", __VA_ARGS__)
+-#define SPEKTRA_RAW_LOGW(...) __android_log_print(ANDROID_LOG_WARN, "SpektraRawCpu", __VA_ARGS__)
+-
+-struct Vec3 { float r, g, b; };
+-
+-inline Vec3 add(Vec3 a, Vec3 b) { return {a.r+b.r,a.g+b.g,a.b+b.b}; }
+-inline Vec3 mul(Vec3 a, float s) { return {a.r*s,a.g*s,a.b*s}; }
+-inline Vec3 max0(Vec3 a) { return {std::max(0.0f,a.r),std::max(0.0f,a.g),std::max(0.0f,a.b)}; }
+-inline float luminance(Vec3 a) { return 0.2126f*a.r + 0.7152f*a.g + 0.0722f*a.b; }
+-
+-uint16_t floatToHalf(float f) {
+-    uint32_t x = 0;
+-    std::memcpy(&x, &f, sizeof(x));
+-    const uint32_t sign = (x >> 16u) & 0x8000u;
+-    uint32_t mantissa = x & 0x007fffffu;
+-    int32_t exponent = static_cast<int32_t>((x >> 23u) & 0xffu) - 127 + 15;
+-    if (((x >> 23u) & 0xffu) == 0xffu) {
+-        if (mantissa == 0u) return static_cast<uint16_t>(sign | 0x7c00u);
+-        return static_cast<uint16_t>(sign | 0x7e00u);
+-    }
+-    if (exponent <= 0) {
+-        if (exponent < -10) return static_cast<uint16_t>(sign);
+-        mantissa = (mantissa | 0x00800000u) >> static_cast<uint32_t>(1 - exponent);
+-        if (mantissa & 0x00001000u) mantissa += 0x00002000u;
+-        return static_cast<uint16_t>(sign | (mantissa >> 13u));
+-    }
+-    if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+-    if (mantissa & 0x00001000u) {
+-        mantissa += 0x00002000u;
+-        if (mantissa & 0x00800000u) {
+-            mantissa = 0;
+-            ++exponent;
+-            if (exponent >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+-        }
+-    }
+-    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exponent) << 10u) | (mantissa >> 13u));
+-}
+-
+-float halfToFloat(uint16_t h) {
+-    const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16u;
+-    const uint32_t exponent = (h >> 10u) & 0x1fu;
+-    uint32_t mantissa = h & 0x03ffu;
+-    uint32_t bits = 0;
+-    if (exponent == 0u) {
+-        if (mantissa == 0u) bits = sign;
+-        else {
+-            int e = -14;
+-            while ((mantissa & 0x0400u) == 0u) { mantissa <<= 1u; --e; }
+-            mantissa &= 0x03ffu;
+-            bits = sign | (static_cast<uint32_t>(e + 127) << 23u) | (mantissa << 13u);
+-        }
+-    } else if (exponent == 31u) {
+-        bits = sign | 0x7f800000u | (mantissa << 13u);
+-    } else {
+-        bits = sign | ((exponent + (127u - 15u)) << 23u) | (mantissa << 13u);
+-    }
+-    float f = 0.0f;
+-    std::memcpy(&f, &bits, sizeof(f));
+-    return f;
+-}
+-
+-int clampParity(int value, int lo, int hi, int parity) {
+-    int v = std::max(lo, std::min(hi, value));
+-    if ((v & 1) == parity) return v;
+-    if (v + 1 <= hi) return v + 1;
+-    if (v - 1 >= lo) return v - 1;
+-    return v;
+-}
+-
+-struct CpuDevelop {
+-    const RawDevelopRequest& q;
+-
+-    uint8_t readByte(size_t index) const {
+-        return index < q.sourceBytes ? q.source[index] : 0u;
+-    }
+-
+-    void clampActivePreservePhase(int* x, int* y) const {
+-        *x = clampParity(*x, q.activeRawDomain[0], q.activeRawDomain[2]-1, *x & 1);
+-        *y = clampParity(*y, q.activeRawDomain[1], q.activeRawDomain[3]-1, *y & 1);
+-    }
+-
+-    uint16_t rawSample(int x, int y) const {
+-        clampActivePreservePhase(&x,&y);
+-        const size_t row = static_cast<size_t>(y) * static_cast<size_t>(q.rowStride);
+-        if (q.format == 37) { // RAW10
+-            const size_t group = row + static_cast<size_t>(x >> 2) * 5u;
+-            const int lane = x & 3;
+-            return static_cast<uint16_t>((static_cast<uint16_t>(readByte(group + lane)) << 2u)
+-                    | ((readByte(group + 4u) >> (lane * 2)) & 3u));
+-        }
+-        if (q.format == 38) { // RAW12
+-            const size_t group = row + static_cast<size_t>(x >> 1) * 3u;
+-            const int lane = x & 1;
+-            const uint8_t lo = readByte(group + 2u);
+-            return static_cast<uint16_t>((static_cast<uint16_t>(readByte(group + lane)) << 4u)
+-                    | (lane == 0 ? (lo & 15u) : ((lo >> 4u) & 15u)));
+-        }
+-        const int stride = std::max(2, q.pixelStride);
+-        const size_t p = row + static_cast<size_t>(x) * static_cast<size_t>(stride);
+-        return static_cast<uint16_t>(readByte(p) | (static_cast<uint16_t>(readByte(p+1u)) << 8u));
+-    }
+-
+-    int phaseAt(int x, int y) const { return (x & 1) | ((y & 1) << 1); }
+-    int colorAt(int x, int y) const {
+-        const int phase = phaseAt(x,y);
+-        if (phase == q.cfaArrangement) return 0;      // red
+-        if (phase == (q.cfaArrangement ^ 3)) return 2; // blue
+-        return 1;
+-    }
+-
+-    float lscGainChannel(int x, int y, int ch) const {
+-        if (!q.lensShading || q.lensShadingRows <= 0 || q.lensShadingCols <= 0) return 1.0f;
+-        const float minX = static_cast<float>(q.activeRawDomain[0]);
+-        const float minY = static_cast<float>(q.activeRawDomain[1]);
+-        const float maxX = static_cast<float>(std::max(q.activeRawDomain[0]+1, q.activeRawDomain[2]-1));
+-        const float maxY = static_cast<float>(std::max(q.activeRawDomain[1]+1, q.activeRawDomain[3]-1));
+-        const float u = std::max(0.0f, std::min(1.0f, (static_cast<float>(x)-minX) / std::max(1.0f,maxX-minX)));
+-        const float v = std::max(0.0f, std::min(1.0f, (static_cast<float>(y)-minY) / std::max(1.0f,maxY-minY)));
+-        const float fx = u * static_cast<float>(std::max(1,q.lensShadingCols-1));
+-        const float fy = v * static_cast<float>(std::max(1,q.lensShadingRows-1));
+-        const int x0 = std::max(0,std::min(q.lensShadingCols-1,static_cast<int>(std::floor(fx))));
+-        const int y0 = std::max(0,std::min(q.lensShadingRows-1,static_cast<int>(std::floor(fy))));
+-        const int x1 = std::min(q.lensShadingCols-1,x0+1);
+-        const int y1 = std::min(q.lensShadingRows-1,y0+1);
+-        const float tx = fx-static_cast<float>(x0), ty = fy-static_cast<float>(y0);
+-        auto at=[&](int xx,int yy){return q.lensShading[(yy*q.lensShadingCols+xx)*4+ch];};
+-        const float a = at(x0,y0)*(1.0f-tx)+at(x1,y0)*tx;
+-        const float b = at(x0,y1)*(1.0f-tx)+at(x1,y1)*tx;
+-        const float g = a*(1.0f-ty)+b*ty;
+-        return std::isfinite(g) && g > 0.0f ? g : 1.0f;
+-    }
+-
+-    int semanticLscChannel(int x, int y) const {
+-        const int c=colorAt(x,y);
+-        if (c==0) return 0;
+-        if (c==2) return 3;
+-        const int sensorRowParity=(y&1)^((q.bayerOffset>>1)&1);
+-        return sensorRowParity==0 ? 1 : 2;
+-    }
+-
+-    float sampleNorm(int x, int y) const {
+-        const int phase = phaseAt(x,y);
+-        const int black = q.blackLevel4[phase];
+-        const float denom = std::max(1.0f, static_cast<float>(q.whiteLevel-black));
+-        const float normalized=std::max(0.0f,(static_cast<float>(rawSample(x,y))-static_cast<float>(black))/denom);
+-        return normalized*lscGainChannel(x,y,semanticLscChannel(x,y));
+-    }
+-
+-    float averageColor(int x, int y, int target, bool diagonal) const {
+-        const int offsets[4][2] = {
+-            {diagonal?-1:-1, diagonal?-1:0},
+-            {diagonal? 1: 1, diagonal?-1:0},
+-            {diagonal?-1: 0, diagonal? 1:-1},
+-            {diagonal? 1: 0, diagonal? 1: 1}
+-        };
+-        float sum=0.0f; int n=0;
+-        for (const auto& d: offsets) {
+-            const int xx=x+d[0], yy=y+d[1];
+-            if (colorAt(xx,yy)==target) { sum += sampleNorm(xx,yy); ++n; }
+-        }
+-        if (n == 0) {
+-            const int farOffsets[8][2]={{-2,0},{2,0},{0,-2},{0,2},{-2,-2},{2,-2},{-2,2},{2,2}};
+-            for (const auto& d: farOffsets) {
+-                const int xx=x+d[0], yy=y+d[1];
+-                if (colorAt(xx,yy)==target) { sum += sampleNorm(xx,yy); ++n; }
+-            }
+-        }
+-        return n > 0 ? sum/static_cast<float>(n) : sampleNorm(x,y);
+-    }
+-
+-    Vec3 demosaicRaw(int x, int y) const {
+-        const int c=colorAt(x,y);
+-        Vec3 rgb{};
+-        if (c==0) { rgb.r=sampleNorm(x,y); rgb.g=averageColor(x,y,1,false); rgb.b=averageColor(x,y,2,true); }
+-        else if (c==2) { rgb.b=sampleNorm(x,y); rgb.g=averageColor(x,y,1,false); rgb.r=averageColor(x,y,0,true); }
+-        else { rgb.g=sampleNorm(x,y); rgb.r=averageColor(x,y,0,false); rgb.b=averageColor(x,y,2,false); }
+-        return max0(rgb);
+-    }
+-
+-    Vec3 highlightRecover(int x, int y, Vec3 center) const {
+-        if (!q.savedPhoto) return center;
+-        const float clip = std::max(0.5f,std::min(1.2f,q.sensorClipThreshold));
+-        const bool cr=center.r>=clip, cg=center.g>=clip, cb=center.b>=clip;
+-        if ((!cr&&!cg&&!cb) || (cr&&cg&&cb)) return center;
+-        Vec3 n = mul(add(add(demosaicRaw(x-2,y),demosaicRaw(x+2,y)),
+-                         add(demosaicRaw(x,y-2),demosaicRaw(x,y+2))),0.25f);
+-        const float centerG=std::max(center.g,1e-5f), neighborG=std::max(n.g,1e-5f);
+-        const float rr=n.r/neighborG, br=n.b/neighborG;
+-        if (cr) center.r=std::max(center.r,rr*centerG);
+-        if (cb) center.b=std::max(center.b,br*centerG);
+-        if (cg) {
+-            const float fromR=center.r/std::max(rr,1e-4f);
+-            const float fromB=center.b/std::max(br,1e-4f);
+-            center.g=std::max(center.g,0.5f*(fromR+fromB));
+-        }
+-        return center;
+-    }
+-
+-    Vec3 sensorToLinear(Vec3 s) const {
+-        Vec3 out{
+-            q.sensorToLinearSrgb[0]*s.r + q.sensorToLinearSrgb[1]*s.g + q.sensorToLinearSrgb[2]*s.b,
+-            q.sensorToLinearSrgb[3]*s.r + q.sensorToLinearSrgb[4]*s.g + q.sensorToLinearSrgb[5]*s.b,
+-            q.sensorToLinearSrgb[6]*s.r + q.sensorToLinearSrgb[7]*s.g + q.sensorToLinearSrgb[8]*s.b};
+-        if (!std::isfinite(out.r)) out.r=0.0f;
+-        if (!std::isfinite(out.g)) out.g=0.0f;
+-        if (!std::isfinite(out.b)) out.b=0.0f;
+-        return max0(out);
+-    }
+-
+-    Vec3 linearAt(int x,int y) const { return sensorToLinear(highlightRecover(x,y,demosaicRaw(x,y))); }
+-
+-    Vec3 reconstructForOutput(int ox,int oy) const {
+-        const int cropL=q.sourceCrop[0], cropT=q.sourceCrop[1];
+-        const int cropW=q.sourceCrop[2]-q.sourceCrop[0], cropH=q.sourceCrop[3]-q.sourceCrop[1];
+-        if (q.savedPhoto && q.outputWidth==cropW && q.outputHeight==cropH) return linearAt(cropL+ox,cropT+oy);
+-        // VF-S is a preview path, not a full-resolution reconstruction pass. Reconstruct one
+-        // source-lattice RGB sample at the center of each reduced footprint; this keeps CFA/color
+-        // semantics identical to the saved path while avoiding four redundant demosaic evaluations.
+-        const float sx=static_cast<float>(cropL)+(static_cast<float>(ox)+0.5f)*cropW/q.outputWidth;
+-        const float sy=static_cast<float>(cropT)+(static_cast<float>(oy)+0.5f)*cropH/q.outputHeight;
+-        return linearAt(static_cast<int>(std::floor(sx)),static_cast<int>(std::floor(sy)));
+-    }
+-};
+-
+-bool validate(const RawDevelopRequest& q, std::string* error) {
+-    auto fail=[&](const char* m){if(error)*error=m;return false;};
+-    if (!q.source || q.sourceBytes==0 || q.sourceWidth<=1 || q.sourceHeight<=1 || q.rowStride<=0) return fail("Invalid packed RAW input");
+-    if (q.format!=32 && q.format!=37 && q.format!=38) return fail("Unsupported packed RAW format");
+-    const int minRow=q.format==37?((q.sourceWidth+3)/4)*5:q.format==38?((q.sourceWidth+1)/2)*3:q.sourceWidth*std::max(2,q.pixelStride);
+-    const uint64_t required=static_cast<uint64_t>(q.sourceHeight-1)*q.rowStride+static_cast<uint64_t>(minRow);
+-    if (q.rowStride<minRow || required>q.sourceBytes) return fail("Packed RAW row-stride/buffer contract mismatch");
+-    if (q.cfaArrangement<0 || q.cfaArrangement>3 || q.bayerOffset<0 || q.bayerOffset>3) return fail("Unresolved CFA/Bayer origin");
+-    if (q.whiteLevel<=0 || q.outputWidth<=0 || q.outputHeight<=0) return fail("Invalid RAW/output levels");
+-    if (q.rawBounds[0]<0 || q.rawBounds[1]<0 || q.rawBounds[2]>q.sourceWidth || q.rawBounds[3]>q.sourceHeight || q.rawBounds[2]<=q.rawBounds[0] || q.rawBounds[3]<=q.rawBounds[1]) return fail("Invalid RAW bounds");
+-    const int* domains[2]={q.sourceCrop,q.activeRawDomain};
+-    for (const int* r:domains) if (r[0]<q.rawBounds[0] || r[1]<q.rawBounds[1] || r[2]>q.rawBounds[2] || r[3]>q.rawBounds[3] || r[2]<=r[0] || r[3]<=r[1]) return fail("RAW domains disagree");
+-    if (q.activeRawDomain[2]-q.activeRawDomain[0]<2 || q.activeRawDomain[3]-q.activeRawDomain[1]<2) return fail("Active RAW domain cannot preserve CFA phase");
+-    if (q.lensShading && (q.lensShadingRows<=0 || q.lensShadingCols<=0)) return fail("Invalid lens shading dimensions");
+-    const uint64_t outputBytes=static_cast<uint64_t>(q.outputWidth)*q.outputHeight*8ull;
+-    if (outputBytes==0 || outputBytes>static_cast<uint64_t>(0x7fffffff)) return fail("RAW output is too large");
+-    return true;
+-}
+-
+-void storePixel(std::vector<uint8_t>& out, int width, int x, int y, Vec3 rgb) {
+-    uint16_t h[4]={floatToHalf(std::max(0.0f,rgb.r)),floatToHalf(std::max(0.0f,rgb.g)),
+-                   floatToHalf(std::max(0.0f,rgb.b)),floatToHalf(1.0f)};
+-    const size_t p=(static_cast<size_t>(y)*width+static_cast<size_t>(x))*8u;
+-    std::memcpy(out.data()+p,h,sizeof(h));
+-}
+-
+-Vec3 loadPixel(const std::vector<uint8_t>& out, int width, int x, int y) {
+-    const size_t p=(static_cast<size_t>(y)*width+static_cast<size_t>(x))*8u;
+-    uint16_t h[4]{}; std::memcpy(h,out.data()+p,sizeof(h));
+-    return {halfToFloat(h[0]),halfToFloat(h[1]),halfToFloat(h[2])};
+-}
+-
+-void applySavedChromaDenoise(std::vector<uint8_t>& out, int width, int height, float strength) {
+-    strength=std::max(0.0f,std::min(1.0f,strength));
+-    if (strength<=0.0f || width<5 || height<5) return;
+-    // Preserve original rows that will be needed after earlier rows are overwritten. Future rows are
+-    // still original in `out`; horizontal neighbors come from a current-row snapshot.
+-    std::vector<uint8_t> prior2(static_cast<size_t>(width)*8u), prior1(static_cast<size_t>(width)*8u), current(static_cast<size_t>(width)*8u);
+-    bool have1=false,have2=false;
+-    for (int y=0;y<height;++y) {
+-        const size_t rowBytes=static_cast<size_t>(width)*8u;
+-        std::memcpy(current.data(),out.data()+static_cast<size_t>(y)*rowBytes,rowBytes);
+-        for (int x=0;x<width;++x) {
+-            auto rowPixel=[&](const std::vector<uint8_t>& row,int xx){
+-                xx=std::max(0,std::min(width-1,xx)); uint16_t h[4]{}; std::memcpy(h,row.data()+static_cast<size_t>(xx)*8u,sizeof(h));
+-                return Vec3{halfToFloat(h[0]),halfToFloat(h[1]),halfToFloat(h[2])};};
+-            Vec3 center=rowPixel(current,x);
+-            Vec3 left=rowPixel(current,x-2), right=rowPixel(current,x+2);
+-            Vec3 up=center,down=center;
+-            if (y>=2 && have2) up=rowPixel(prior2,x);
+-            if (y+2<height) down=loadPixel(out,width,x,y+2);
+-            Vec3 avg=mul(add(add(left,right),add(up,down)),0.25f);
+-            const float yc=luminance(center), ya=luminance(avg);
+-            Vec3 cc{center.r-yc,center.g-yc,center.b-yc};
+-            Vec3 ca{avg.r-ya,avg.g-ya,avg.b-ya};
+-            Vec3 result{yc + cc.r*(1.0f-strength)+ca.r*strength,
+-                        yc + cc.g*(1.0f-strength)+ca.g*strength,
+-                        yc + cc.b*(1.0f-strength)+ca.b*strength};
+-            storePixel(out,width,x,y,max0(result));
+-        }
+-        prior2.swap(prior1);
+-        prior1.swap(current);
+-        if (have1) have2=true;
+-        have1=true;
+-    }
+-}
+-
+-} // namespace
+-
+-struct SpektraRawCpuOwner::Impl {
+-    mutable std::mutex workMutex;
+-    std::atomic<bool> savedWaiting{false};
+-    std::atomic<uint64_t> previewProcessed{0};
+-    std::atomic<uint64_t> previewDropped{0};
+-    std::atomic<uint64_t> previewMicrosTotal{0};
+-    std::atomic<uint64_t> lastStillMicros{0};
+-
+-    bool run(const RawDevelopRequest& q,std::vector<uint8_t>* out,std::string* error) {
+-        if (!validate(q,error)) return false;
+-        const uint64_t bytes=static_cast<uint64_t>(q.outputWidth)*q.outputHeight*8ull;
+-        out->assign(static_cast<size_t>(bytes),0u);
+-        CpuDevelop d{q};
+-        SPEKTRA_RAW_LOGI("IRIS_26688_RAW_CPU_STAGE stage=%s_begin src=%dx%d out=%dx%d format=%d",
+-                q.savedPhoto?"saved":"preview",q.sourceWidth,q.sourceHeight,q.outputWidth,q.outputHeight,q.format);
+-        auto renderRows=[&](int y0,int y1){
+-            for(int y=y0;y<y1;++y) for(int x=0;x<q.outputWidth;++x) storePixel(*out,q.outputWidth,x,y,d.reconstructForOutput(x,y));
+-        };
+-        if (q.savedPhoto && q.outputHeight>=256) {
+-            const unsigned hc=std::thread::hardware_concurrency();
+-            const int workers=std::max(1,std::min(4,static_cast<int>(hc==0?4:hc)));
+-            std::atomic<int> next{0};
+-            std::vector<std::thread> threads; threads.reserve(static_cast<size_t>(workers));
+-            for(int i=0;i<workers;++i) threads.emplace_back([&]{for(;;){int y=next.fetch_add(1);if(y>=q.outputHeight)break;renderRows(y,y+1);}});
+-            for(auto& t:threads)t.join();
+-            applySavedChromaDenoise(*out,q.outputWidth,q.outputHeight,q.chromaDenoiseStrength);
+-        } else renderRows(0,q.outputHeight);
+-        SPEKTRA_RAW_LOGI("IRIS_26688_RAW_CPU_STAGE stage=%s_complete bytes=%zu",
+-                q.savedPhoto?"saved":"preview",out->size());
+-        return true;
+-    }
+-};
+-
+-SpektraRawCpuOwner& SpektraRawCpuOwner::instance(){static SpektraRawCpuOwner o;return o;}
+-SpektraRawCpuOwner::SpektraRawCpuOwner():impl_(new Impl()){}
+-SpektraRawCpuOwner::~SpektraRawCpuOwner(){delete impl_;}
+-
+-bool SpektraRawCpuOwner::process(const RawDevelopRequest& q,std::vector<uint8_t>* out,
+-        bool* previewDropped,double* elapsedMicros,std::string* error){
+-    if(previewDropped)*previewDropped=false;
+-    const auto start=std::chrono::steady_clock::now();
+-    std::unique_lock<std::mutex> lock(impl_->workMutex,std::defer_lock);
+-    if(q.savedPhoto){impl_->savedWaiting.store(true,std::memory_order_release);lock.lock();impl_->savedWaiting.store(false,std::memory_order_release);}
+-    else if(impl_->savedWaiting.load(std::memory_order_acquire)||!lock.try_lock()){
+-        impl_->previewDropped.fetch_add(1,std::memory_order_relaxed);if(previewDropped)*previewDropped=true;return true;
+-    }
+-    const bool ok=impl_->run(q,out,error);
+-    const auto stop=std::chrono::steady_clock::now();
+-    const uint64_t micros=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(stop-start).count());
+-    if(elapsedMicros)*elapsedMicros=static_cast<double>(micros);
+-    if(q.savedPhoto)impl_->lastStillMicros.store(micros,std::memory_order_relaxed);
+-    else if(ok){impl_->previewProcessed.fetch_add(1,std::memory_order_relaxed);impl_->previewMicrosTotal.fetch_add(micros,std::memory_order_relaxed);}
+-    return ok;
+-}
+-
+-void SpektraRawCpuOwner::release(){
+-    // No device/queue/fence lifetime exists. The owner is process-stable and owns only atomics/mutex.
+-}
+-
+-void SpektraRawCpuOwner::stats(uint64_t out[6]) const{
+-    const uint64_t p=impl_->previewProcessed.load(std::memory_order_relaxed);
+-    const uint64_t total=impl_->previewMicrosTotal.load(std::memory_order_relaxed);
+-    out[0]=p;out[1]=impl_->previewDropped.load(std::memory_order_relaxed);out[2]=p?total/p:0;
+-    out[3]=impl_->lastStillMicros.load(std::memory_order_relaxed);out[4]=1u;out[5]=0u;
+-}
+-
+-} // namespace iris_spektra
+diff --git a/app/src/main/cpp/spektra/SpektraRawCpuOwner.h b/app/src/main/cpp/spektra/SpektraRawCpuOwner.h
+deleted file mode 100644
+index 5987eed8517a4c160afb43309ae0ffb2165f823a..0000000000000000000000000000000000000000
+--- a/app/src/main/cpp/spektra/SpektraRawCpuOwner.h
++++ /dev/null
+@@ -1,60 +0,0 @@
+-#pragma once
+-
+-#include <cstddef>
+-#include <cstdint>
+-#include <string>
+-#include <vector>
+-
+-namespace iris_spektra {
+-
+-struct RawDevelopRequest {
+-    const uint8_t* source = nullptr;
+-    size_t sourceBytes = 0;
+-    int sourceWidth = 0;
+-    int sourceHeight = 0;
+-    int rowStride = 0;
+-    int pixelStride = 0;
+-    int format = 0;
+-    int rawBounds[4] = {0,0,0,0};
+-    int sourceCrop[4] = {0,0,0,0};
+-    int activeRawDomain[4] = {0,0,0,0};
+-    int cfaArrangement = -1;
+-    int bayerOffset = -1;
+-    int blackLevel4[4] = {0,0,0,0};
+-    int whiteLevel = 0;
+-    const float* lensShading = nullptr;
+-    int lensShadingRows = 0;
+-    int lensShadingCols = 0;
+-    float sensorToLinearSrgb[9] = {0};
+-    int outputWidth = 0;
+-    int outputHeight = 0;
+-    bool savedPhoto = false;
+-    float chromaDenoiseStrength = 0.0f;
+-    float sensorClipThreshold = 0.985f;
+-};
+-
+-/**
+- * Spektra-owned packed RAW developer used by both VF-S and saved stills.
+- *
+- * This owner deliberately has no Vulkan/GL dependency. It consumes only a detached Camera2 RAW
+- * buffer plus immutable metadata and produces scene-linear RGBA16F for the existing public
+- * SPEKTRA film/print renderer. Preview work is drop-if-busy; saved work has priority.
+- */
+-class SpektraRawCpuOwner {
+-public:
+-    static SpektraRawCpuOwner& instance();
+-    bool process(const RawDevelopRequest& request, std::vector<uint8_t>* rgba16f,
+-            bool* previewDropped, double* elapsedMicros, std::string* error);
+-    void release();
+-    void stats(uint64_t out[6]) const;
+-
+-private:
+-    SpektraRawCpuOwner();
+-    ~SpektraRawCpuOwner();
+-    SpektraRawCpuOwner(const SpektraRawCpuOwner&) = delete;
+-    SpektraRawCpuOwner& operator=(const SpektraRawCpuOwner&) = delete;
+-    struct Impl;
+-    Impl* impl_;
+-};
+-
+-} // namespace iris_spektra
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+index 259d6b991dff969eace0faa9440d948fd22fd545..a99b5f0aaedc66407f39a5e60cf3a15009064d09 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+@@ -69,11 +69,12 @@ final class SpektraCameraOwner {
+     private static final int TARGET_PREVIEW_FPS = 30;
+     private static final int PREVIEW_SHORT_EDGE_DEFAULT = 480;
+     private static final long CAMERA_OPEN_TIMEOUT_MS = 4000L;
++    private static final long RAW_GPU_WARMUP_TIMEOUT_MS = 10000L;
+     private static final long PREVIEW_CONFIG_TIMEOUT_MS = 4000L;
+     private static final long PREVIEW_FIRST_FRAME_TIMEOUT_MS = 6500L;
+     private static final long STILL_CONFIG_TIMEOUT_MS = 4500L;
+     private static final long STILL_CAPTURE_TIMEOUT_MS = 6500L;
+-    private static final int SPEKTRA_PROFILE_SCHEMA = 26688;
++    private static final int SPEKTRA_PROFILE_SCHEMA = 26687;
+ 
+     public enum State {
+         IDLE, OPENING, CONFIGURING, STREAMING,
+@@ -266,10 +267,32 @@ final class SpektraCameraOwner {
+                 activity.runOnUiThread(events::onCameraRestarted);
+             }
+             host.onSpektraPreviewPreparing();
+-            // IRIS_26688: mode entry never waits on RAW processing initialization. Camera2 owns
+-            // startup immediately; the CPU RAW frontend is stateless/lazy and cannot block opening.
+-            Log.i(TAG, "IRIS_26688_SPEKTRA_CAMERA_ENTRY_IMMEDIATE generation=" + g);
+-            openForPreview(g, restart);
++            setState(State.OPENING);
++            armFatalWatchdog(g, State.OPENING, RAW_GPU_WARMUP_TIMEOUT_MS, "RAW_GPU_WARMUP_TIMEOUT");
++            try {
++                previewDecodeExecutor.execute(() -> {
++                    Throwable warmupFailure = null;
++                    try {
++                        Log.i(TAG, "IRIS_26687_SPEKTRA_RAW_OWNER_WARMUP_BEGIN generation=" + g);
++                        SpektraRawProcessor.warmUpNativeOwner();
++                        Log.i(TAG, "IRIS_26687_SPEKTRA_RAW_OWNER_WARMUP_PASS generation=" + g);
++                    } catch (Throwable t) {
++                        warmupFailure = t;
++                    }
++                    final Throwable failure = warmupFailure;
++                    Handler camera = cameraHandler;
++                    if (camera != null) camera.post(() -> {
++                        if (!isCurrent(g)) return;
++                        if (failure != null) {
++                            failProcessor(g, "RAW_GPU_WARMUP_FAILED", failure);
++                            return;
++                        }
++                        openForPreview(g, restart);
++                    });
++                });
++            } catch (RuntimeException rejected) {
++                failProcessor(g, "RAW_GPU_WARMUP_QUEUE_REJECTED", rejected);
++            }
+         });
+     }
+ 
+@@ -963,7 +986,7 @@ final class SpektraCameraOwner {
+                 Throwable failure = null;
+                 try {
+                     // copyPreviewFrom detaches packed RAW and closes the Camera2 Image before
+-                    // native RAW processing. First-run discovery may be meter-only until Bayer origin is proven.
++                    // native Vulkan processing. First-run discovery may be meter-only until Bayer origin is proven.
+                     SpektraFrameMetadata nativeMetadata = null;
+                     float[] nativeMatrix = null;
+                     if (previewBayerOffset >= 0 && previewBayerOffset <= 3 && baseMetadata.neutral3 != null) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+index a69c16226ce76716025036bb7f5e2adaf42a20bc..5630ede41f8abe42fe836c2a4ef64023dcb89c45 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+@@ -51,7 +51,7 @@ public final class SpektraPreviewRenderer {
+         firstFramePresented.set(false);
+         Log.d(TAG, "IRIS_26687_SPEKTRA_PREVIEW_CONFIG rawStream=" + rawStreamSize
+                 + " process=" + processSize + " format=" + rawFormat
+-                + " targetFps=30 quality=LOW previewShortEdge=480 vfS=true rawOwner=CPU");
++                + " targetFps=30 quality=LOW previewShortEdge=480 vfS=true rawOwner=Vulkan");
+     }
+ 
+     public void beginPreviewSession() { firstFramePresented.set(false); }
+@@ -141,6 +141,6 @@ public final class SpektraPreviewRenderer {
+         Log.i(TAG, "IRIS_26687_SPEKTRA_PREVIEW_DRAINED"
+                 + " vfProcessed=" + stats[0] + " vfDropped=" + stats[1]
+                 + " avgVfMicros=" + stats[2] + " lastStillMicros=" + stats[3]
+-                + " rawOwners=" + stats[4] + " persistentRawAllocations=" + stats[5]);
++                + " gpuOwners=" + stats[4] + " persistentAllocations=" + stats[5]);
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java
+index 73ba495f6606dfa69aab55253c1c4bae6e08008d..0938d97911cc55c02fdfe4f92f6e2c0d46b540b2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraProcessor.java
+@@ -48,8 +48,8 @@ public final class SpektraProcessor {
+                     + " recovery=" + recovery
+                     + " processMillis=" + totalMillis
+                     + " nativeStillMicros=" + nativeStats[3]
+-                    + " rawOwners=" + nativeStats[4]
+-                    + " persistentRawAllocations=" + nativeStats[5]
++                    + " gpuOwners=" + nativeStats[4]
++                    + " persistentAllocations=" + nativeStats[5]
+                     + " film=kodak_portra_400 paper=kodak_supra_endura jpegQuality=100");
+             return new Result(true, path, null);
+         } catch (Throwable t) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+index 1de243119e5371b4eebb2b0aea74daa8948d702b..51cfcc9f9e2851dce1ab2c3f99ac4ca7c1b977f4 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+@@ -23,12 +23,12 @@ public final class SpektraRawFrame {
+     public final byte[] packedRaw;
+     /** Reduced native-endian U16 Bayer meter. CPU use is restricted to AE/Bayer discovery. */
+     public final byte[] mosaic16;
+-    /** Scene-linear RGBA16F VF-S image produced by the Spektra-owned native RAW developer. */
++    /** Scene-linear RGBA16F VF-S image produced by the persistent Spektra Vulkan RAW owner. */
+     public final byte[] previewLinearRgba16f;
+ 
+     /**
+      * One reusable direct staging allocation per preview-decode thread. Camera2 Images are copied
+-     * here and closed before native RAW development, so processing can never retain a camera buffer.
++     * here and closed before any Vulkan call, so a driver stall can never retain a camera buffer.
+      */
+     private static final ThreadLocal<ByteBuffer> PREVIEW_RAW_STAGING =
+             ThreadLocal.withInitial(() -> ByteBuffer.allocateDirect(1).order(ByteOrder.nativeOrder()));
+@@ -61,7 +61,7 @@ public final class SpektraRawFrame {
+ 
+     /**
+      * VF-S live contract. Packed RAW is detached into Spektra-owned reusable staging and the
+-     * Camera2 Image is closed before native RAW development. Native then reconstructs sensor
++     * Camera2 Image is closed before native Vulkan is entered. Native then reconstructs sensor
+      * RGB/linear RGB in the source lattice and reduces only after reconstruction.
+      */
+     public static SpektraRawFrame copyPreviewFrom(Image image, int previewShortEdge,
+@@ -76,8 +76,8 @@ public final class SpektraRawFrame {
+         try {
+             plane = detachedRawPlane(image);
+         } finally {
+-            // This is deliberately before processLivePreview/nativeDecodeMeter. Native processing
+-            // therefore cannot own or exhaust Camera2 ImageReader buffers.
++            // This is deliberately before processLivePreview/nativeDecodeMeter. A stuck GPU or
++            // native driver call therefore cannot own or exhaust Camera2 ImageReader buffers.
+             try { image.close(); } catch (Throwable ignored) {}
+         }
+ 
+@@ -197,7 +197,7 @@ public final class SpektraRawFrame {
+     }
+ 
+     private static void validatePreviewLinear(int width, int height, byte[] rgba16f) {
+-        if (rgba16f == null) return; // Preview may deliberately drop while saved RAW work owns the native developer.
++        if (rgba16f == null) return; // Native preview owner may deliberately drop while saved work owns the GPU.
+         long expected = (long) width * (long) height * 8L;
+         if (expected > Integer.MAX_VALUE || rgba16f.length != (int) expected) {
+             throw new IllegalArgumentException("Spektra VF-S RGBA16F byte count mismatch");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+index 3604ba7298277dfeaefeeee2b15de5e388a82073..8cad76e4b90819f88fc0231cee03d4c5b90ca737 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+@@ -10,8 +10,8 @@ import java.nio.ByteOrder;
+ /**
+  * Spektra-owned single-frame RAW front end.
+  *
+- * Active-path invariant for 26688: packed Camera2 RAW -> Spektra-owned native CPU RAW developer ->
+- * scene-linear RGBA16F -> public SPEKTRA film renderer. No Iris GL/RCD runtime ownership.
++ * Active-path invariant for 26687: packed Camera2 RAW -> one persistent native Vulkan owner ->
++ * scene-linear RGBA16F. No Iris GLContext/GLProg/GLTexture and no Motion RCD runtime ownership.
+  */
+ public final class SpektraRawProcessor {
+     static { System.loadLibrary("spektra_iris"); }
+@@ -55,13 +55,13 @@ public final class SpektraRawProcessor {
+                 shot.metadata.whiteLevel, shot.metadata.lensShading, shot.metadata.lensShadingRows,
+                 shot.metadata.lensShadingCols, shot.sensorToLinearSrgb, crop.width(), crop.height(), true,
+                 SAVED_CHROMA_DENOISE_STRENGTH, SENSOR_CLIP_THRESHOLD);
+-        if (out == null) throw new IllegalStateException("Spektra saved native RAW developer returned no frame");
+-        Log.d(TAG, "IRIS_26688_SPEKTRA_NATIVE_RAW_CPU saved=true raw="
++        if (out == null) throw new IllegalStateException("Spektra saved Vulkan RAW owner returned no frame");
++        Log.d(TAG, "IRIS_26687_SPEKTRA_NATIVE_RAW_OWNER saved=true raw="
+                 + shot.raw.sourceWidth() + "x" + shot.raw.sourceHeight()
+                 + " crop=" + crop + " activeRaw=" + shot.metadata.activeRawDomain
+                 + " bayerOffset=" + shot.metadata.bayerOffset
+                 + " highlightRecovery=true chromaDenoise=" + SAVED_CHROMA_DENOISE_STRENGTH
+-                + " output=sceneLinearRec709 owner=CPU");
++                + " output=sceneLinearRec709 owner=Vulkan");
+         return linearFrame(crop.width(), crop.height(), out);
+     }
+ 
+@@ -87,6 +87,8 @@ public final class SpektraRawProcessor {
+         return linearFrame(raw.width, raw.height, raw.previewLinearRgba16f);
+     }
+ 
++    public static void warmUpNativeOwner() { nativeWarmUpRawOwner(); }
++
+     public static void releaseNativeOwner() {
+         nativeReleaseRawOwner();
+     }
+@@ -134,6 +136,7 @@ public final class SpektraRawProcessor {
+             int outputWidth, int outputHeight, boolean savedPhoto, float chromaDenoiseStrength,
+             float sensorClipThreshold);
+ 
++    private static native void nativeWarmUpRawOwner();
+     private static native void nativeReleaseRawOwner();
+     private static native long[] nativeRawOwnerStats();
+ }
+diff --git a/app/version.properties b/app/version.properties
+index 8c41205259c116c9dfe66750e48c1ee251026e27..146d9c8ac01a09ad5d538fcddf21c3847dcc6415 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726688
+-VERSION_BUILD=26688
++VERSION_NAME=0.9726687
++VERSION_BUILD=26687
