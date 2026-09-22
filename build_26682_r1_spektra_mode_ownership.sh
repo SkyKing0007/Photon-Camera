@@ -4,6 +4,7 @@ export PYTHONDONTWRITEBYTECODE=1
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 pass(){ echo "PASS: $*"; }
 sha(){ sha256sum "$1" | awk '{print $1}'; }
+resolve_glslang_compiler(){ local root="$1" compiler="" compat=""; compiler="$(find "$root" -type f -name glslang -print -quit)"; if [[ -z "$compiler" ]]; then compat="$(find "$root" \( -type f -o -type l \) -name glslangValidator -print -quit)"; if [[ -n "$compat" ]]; then compiler="$(readlink -f "$compat" 2>/dev/null || true)"; fi; fi; [[ -n "$compiler" && -f "$compiler" ]] || return 1; printf '%s\n' "$compiler"; }
 ROOT="$(pwd)"
 EXPECTED_BRANCH="experimental-clean-photon-rebuild"
 UPLOAD_BASE_COMMIT="2ad49d56c50fc614870c20924c944b8b11f00f75"
@@ -14,6 +15,9 @@ BASE_ARTIFACT_NAME="photon-26681-r1-spektra"
 BASE_ARTIFACT_SHA="3de3e04131b19c8837b83a49e752af8b499c62c713cede88ffc0108c43a8f917"
 BASE_TAR_SHA="2d4e555aab56de861bdfc863e8164093eeae3178d60a13329057497adf82e324"
 VERSION_NAME="0.9726682"; VERSION_BUILD="26682"
+GLSLANG_VERSION="16.5.0"
+GLSLANG_ARCHIVE_SHA="b9b1f96acb898a62251b171f7695efcecfc206a530299054071919b06820f657"
+GLSLANG_URL="https://github.com/KhronosGroup/glslang/releases/download/16.5.0/glslang-16.5.0-linux-x86_64-release.tar.gz"
 MECHANICS_AUTHORITY_COMMIT="2ad49d56c50fc614870c20924c944b8b11f00f75"
 AUTH_26681_BUILD_SCRIPT_BLOB="2d6c42433097843e4120446d62ae3353e2c9e51e"
 AUTH_26681_WORKFLOW_BLOB="46778143726101a175904ab6fc17f802f90fb7ac"
@@ -29,7 +33,7 @@ FORWARD="$ROOT/R1_26682_RUNTIME_DELTA_FROM_26681_R1.patch"; ROLLBACK="$ROOT/R1_2
 TRANSFORM="$ROOT/transform_26682.py"; VALIDATE="$ROOT/validate_26682.py"; AUTHORITY="$ROOT/verify_26682_authority.py"; INFRA="$ROOT/verify_26682_infrastructure.py"; PATCHVERIFY="$ROOT/verify_26682_patches.py"; GATEVERIFY="$ROOT/verify_26682_regressions.py"
 BUILD_SCRIPT="$ROOT/build_26682_r1_spektra_mode_ownership.sh"; WORKFLOW="$ROOT/.github/workflows/build-26682-r1-spektra-mode-ownership.yml"
 OUT="$ROOT/build_26682_r1_spektra_mode_ownership_outputs"; WORK="$ROOT/.build_26682_r1_spektra_mode_ownership_work"
-ARTZIP="$WORK/26681_artifact.zip"; ARTDIR="$WORK/artifact"; BASE="$WORK/exact_successful_26681_compiled_candidate"; AFTER="$WORK/candidate_26682"; AFTER2="$WORK/candidate_26682_replay"; LIVE_CANON="$WORK/live_compiler_candidate_snapshot"; POST="$WORK/postbuild_source_snapshot"
+ARTZIP="$WORK/26681_artifact.zip"; ARTDIR="$WORK/artifact"; BASE="$WORK/exact_successful_26681_compiled_candidate"; AFTER="$WORK/candidate_26682"; AFTER2="$WORK/candidate_26682_replay"; LIVE_CANON="$WORK/live_compiler_candidate_snapshot"; POST="$WORK/postbuild_source_snapshot"; GLSLANG_DIR="$WORK/glslang-${GLSLANG_VERSION}"
 FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-r1-spektra-mode-ownership-debug.apk"
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"; LOCAL_ART=""
 if [[ "${1:-}" == "--local-prebuild" ]]; then [[ -n "${2:-}" ]] || fail "--local-prebuild requires exact successful 26681 artifact ZIP"; LOCAL_ART="$2"; elif [[ -n "${1:-}" ]]; then fail "unknown argument: $1"; fi
@@ -141,6 +145,18 @@ verify_shader_invariance(){
  set_report "SHADER UNIVERSE INVARIANCE" "PASS (271/271 source shaders byte-identical to successful 26681; exact 14 runtime-expanded + 10 upstream proof pins inherited)"
  set_report "REAL GLSL COMPILE" "PASS inherited from successful 26681 (all shader bytes identical; no modified GLSL)"; set_compiler "REAL GLSL COMPILE" "PASS inherited from successful 26681 (all shader bytes identical; no modified GLSL)"
 }
+prepare_inherited_glslang_for_native(){
+ local archive="$WORK/glslang-${GLSLANG_VERSION}.tar.gz" compiler
+ curl -L --fail --retry 3 "$GLSLANG_URL" -o "$archive"
+ [[ "$(sha "$archive")" == "$GLSLANG_ARCHIVE_SHA" ]] || fail "glslang archive SHA"
+ rm -rf "$GLSLANG_DIR"; mkdir -p "$GLSLANG_DIR"
+ tar -xzf "$archive" -C "$GLSLANG_DIR"
+ compiler="$(resolve_glslang_compiler "$GLSLANG_DIR")" || fail "pinned glslang compiler missing"
+ "$compiler" --version | tee "$OUT/26682_glslang_version.txt"
+ export IRIS26681_SPEKTRA_GLSLANG="$compiler"
+ [[ -x "$IRIS26681_SPEKTRA_GLSLANG" ]] || fail "IRIS26681_SPEKTRA_GLSLANG is not executable"
+ pass "26682 inherited native Spektra glslang contract prepared: ${IRIS26681_SPEKTRA_GLSLANG}"
+}
 verify_successful_26681_mechanics(){ python3 -S "$INFRA" "$BUILD_SCRIPT" "$WORKFLOW" | tee "$OUT/26682_infrastructure.txt"; set_report "VERIFICATION MECHANICS AUTHORITY" "PASS (successful 26681 R1 build-script ${AUTH_26681_BUILD_SCRIPT_BLOB} + workflow ${AUTH_26681_WORKFLOW_BLOB}; same compiler/build order)"; }
 verify_candidate_patches(){ python3 -S "$PATCHVERIFY" "$ROOT" "$BASE" "$AFTER" | tee "$OUT/26682_patch_validation.txt"; set_report "FORWARD PATCH FUZZ=0" "PASS"; set_report "ROLLBACK PATCH FUZZ=0" "PASS"; }
 install_frozen_candidate_live(){ rm -rf "$ROOT/app/src"; cp -a "$AFTER/app/src" "$ROOT/app/"; cp -a "$AFTER/app/build.gradle" "$ROOT/app/build.gradle"; cp -a "$AFTER/app/version.properties" "$ROOT/app/version.properties"; snapshot_candidate_from_authority "$BASE" "$ROOT" "$LIVE_CANON"; compare_app_trees "$AFTER" "$LIVE_CANON"; }
@@ -159,6 +175,7 @@ if [[ -n "$LOCAL_ART" ]]; then
  set_report "REAL KOTLIN COMPILE" "NOT RUN locally (Actions required)"; set_report "REAL JAVA COMPILE" "NOT RUN locally (Actions required)"; set_report "REAL NATIVE/NDK COMPILE" "NOT RUN locally (Actions required)"; set_report "PRE-BUILD SAFETY PROOF" "NOT RUN (real Kotlin/Java/NDK/full Android require Actions)"; set_report "FULL ANDROID ASSEMBLE" "NOT RUN locally (Actions required)"; set_report "EXACTLY ONE APK" "NOT RUN locally (Actions required)"; set_report "POST-BUILD INVARIANCE" "NOT RUN locally (Actions required)"; set_report "CLEAN ARTIFACT SOURCE EXPORT" "NOT RUN locally (Actions required)"
  set_compiler "REAL KOTLIN COMPILE" "NOT RUN locally (Actions required)"; set_compiler "REAL JAVA COMPILE" "NOT RUN locally (Actions required)"; set_compiler "NATIVE/NDK COMPILE" "NOT RUN locally (Actions required)"; set_compiler "FULL ANDROID ASSEMBLE" "NOT RUN locally (Actions required)"; set_compiler "POST-BUILD INVARIANCE" "NOT RUN locally (Actions required)"; cp "$OUT/26682_R1_STRICT_HANDOFF_REPORT.txt" "$OUT/26682_R1_local_prebuild_report.txt"; pass "26682 R1 LOCAL PREBUILD PREPARED: exact successful 26681 compiled authority; successful-26681 build ordering retained; all locally applicable packaged gates passed; real Android compiler/build gates explicitly unproven locally"; exit 0
 fi
+prepare_inherited_glslang_for_native
 install_frozen_candidate_live
 ./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace 2>&1 | tee "$OUT/26682_gradle_language_compilers.log"
 set_report "REAL KOTLIN COMPILE" "PASS"; set_report "REAL JAVA COMPILE" "PASS"; set_compiler "REAL KOTLIN COMPILE" "PASS"; set_compiler "REAL JAVA COMPILE" "PASS"
