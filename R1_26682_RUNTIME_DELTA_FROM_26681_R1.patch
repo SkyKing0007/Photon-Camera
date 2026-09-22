@@ -1,0 +1,269 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 938cb81db3c4132f0471c857a406733a3f2e2dcb..1b959dea4ecc2e3a41339eb752926c096fc905e2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -4101,6 +4101,83 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         });
+     }
+ 
++    /**
++     * IRIS_26682_STRICT_MODE_OWNER_RETIREMENT
++     *
++     * Mode changes are ownership handoffs, not ordinary camera restarts. Retire the complete
++     * departing owner while the old mode is still authoritative; only after this returns may the
++     * UI commit the destination mode and open its camera route. Processing transitions are already
++     * rejected by CameraUIViewImpl, so readers may be closed unconditionally here.
++     */
++    public void retireModeForTransition(@NonNull CameraMode previousMode,
++            @NonNull CameraMode nextMode) {
++        if (previousMode == nextMode) return;
++
++        if (previousMode == CameraMode.SPEKTRA || spektraCameraOwner.isActive()) {
++            final boolean retired = spektraCameraOwner.retireForHandoff();
++            Log.i(TAG, "IRIS_26682_MODE_OWNER_RETIRED from=" + previousMode
++                    + " to=" + nextMode + " owner=SPEKTRA retired=" + retired);
++            if (!retired) {
++                throw new IllegalStateException("Spektra owner did not retire before mode handoff");
++            }
++            return;
++        }
++
++        if (CaptureController.isProcessing) {
++            throw new IllegalStateException("Mode handoff attempted while legacy processing owns camera state");
++        }
++
++        boolean lockAcquired = false;
++        try {
++            mCameraOpenCloseLock.acquire();
++            lockAcquired = true;
++            if (mIsRecordingVideo) this.VideoEnd();
++            if (mCaptureSession != null) {
++                try { mCaptureSession.stopRepeating(); } catch (Throwable ignored) {}
++                try { mCaptureSession.abortCaptures(); } catch (Throwable ignored) {}
++                mCaptureSession.close();
++                mCaptureSession = null;
++            }
++            if (mCameraDevice != null) {
++                mCameraDevice.close();
++                mCameraDevice = null;
++            }
++            if (mImageReaderPreview != null) {
++                mImageReaderPreview.close();
++                mImageReaderPreview = null;
++            }
++            if (mImageReaderRaw != null) {
++                mImageReaderRaw.close();
++                mImageReaderRaw = null;
++            }
++            if (mMediaRecorder != null) {
++                mMediaRecorder.release();
++                mMediaRecorder = null;
++            }
++            mPreviewRequestBuilder = null;
++            mPreviewInputRequest = null;
++            if (surface != null) {
++                surface.release();
++                surface = null;
++            }
++            clearMotionUnifiedBuffer();
++            onUnlimited = false;
++            unlimitedStarted = false;
++            mState = STATE_CLOSED;
++        } catch (InterruptedException e) {
++            Thread.currentThread().interrupt();
++            throw new IllegalStateException("Interrupted while retiring camera mode owner", e);
++        } finally {
++            if (lockAcquired) mCameraOpenCloseLock.release();
++        }
++
++        // Join the departing CameraBackground after its Camera2 objects are closed. A new mode does
++        // not open until the old handler has stopped, so queued callbacks cannot leak across modes.
++        stopBackgroundThread();
++        Log.i(TAG, "IRIS_26682_MODE_OWNER_RETIRED from=" + previousMode
++                + " to=" + nextMode + " owner=IRIS_LEGACY retired=true");
++    }
++
+     @SuppressLint("MissingPermission")
+     public void restartCamera() {
+         Log.d(TAG, "restartCamera() called from \"" + Thread.currentThread().getName() + "\" Thread");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+index 44196d4cfa3183814b2e8ef28b27149b6f44de1a..89bff9c8dd04891284f45b74d64608401a0a1498 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+@@ -412,27 +412,50 @@ public final class SpektraCameraOwner {
+     }
+ 
+     private Route resolveRoute(String requestedValue) throws CameraAccessException {
+-        String requested = requestedValue == null ? "" : requestedValue;
+-        String logical = requested;
+-        String physical = requested;
+-        if (requested.contains("-")) {
++        final String requested = requestedValue == null ? "" : requestedValue.trim();
++        if (requested.isEmpty()) throw new IllegalArgumentException("Spektra camera ID is empty");
++
++        String logicalHint = requested;
++        String physicalHint = requested;
++        final boolean explicitLogicalPhysical = requested.contains("-");
++        if (explicitLogicalPhysical) {
+             String[] split = requested.split("-", 2);
+-            logical = split[0]; physical = split[1];
+-        }
+-        List<String> listed = Arrays.asList(cameraManager.getCameraIdList());
+-        if (listed.contains(physical)) return new Route(requested, physical, physical, null);
+-        if (!requested.equals(physical) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+-            if (listed.contains(logical)) {
+-                CameraCharacteristics lc = cameraManager.getCameraCharacteristics(logical);
+-                if (lc.getPhysicalCameraIds().contains(physical)) return new Route(requested, logical, physical, physical);
++            logicalHint = split[0];
++            physicalHint = split[1];
++        }
++
++        final List<String> listed = Arrays.asList(cameraManager.getCameraIdList());
++
++        // A directly openable public ID is authoritative whether it represents a logical camera
++        // or a directly listed physical camera. Do not translate it to an unrelated fallback ID.
++        if (listed.contains(physicalHint)) {
++            return new Route(requested, physicalHint, physicalHint, null);
++        }
++
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            // Preserve an explicit logical-physical route when the selected physical lens is a
++            // child of the hinted logical camera.
++            if (explicitLogicalPhysical && listed.contains(logicalHint)) {
++                CameraCharacteristics logicalChars = cameraManager.getCameraCharacteristics(logicalHint);
++                if (logicalChars.getPhysicalCameraIds().contains(physicalHint)) {
++                    return new Route(requested, logicalHint, physicalHint, physicalHint);
++                }
+             }
+-            for (String candidate : listed) {
+-                CameraCharacteristics cc = cameraManager.getCameraCharacteristics(candidate);
+-                if (cc.getPhysicalCameraIds().contains(physical)) return new Route(requested, candidate, physical, physical);
++
++            // A plain physical ID may not itself appear in getCameraIdList(). Search every public
++            // logical camera for that physical child and route the OutputConfiguration explicitly.
++            for (String candidateLogical : listed) {
++                CameraCharacteristics logicalChars = cameraManager.getCameraCharacteristics(candidateLogical);
++                if (logicalChars.getPhysicalCameraIds().contains(physicalHint)) {
++                    return new Route(requested, candidateLogical, physicalHint, physicalHint);
++                }
+             }
+         }
+-        String fallback = listed.contains(logical) ? logical : (listed.isEmpty() ? requested : listed.get(0));
+-        return new Route(requested, fallback, fallback, null);
++
++        // A plain logical ID that was not found above is not a valid public Camera2 ID. Failing
++        // closed is safer than silently opening camera 0 with the wrong CFA/calibration/LSC data.
++        throw new IllegalArgumentException("Unable to resolve Spektra Camera2 route for " + requested
++                + " publicIds=" + listed);
+     }
+ 
+     private void discoverRawStreams(CameraCharacteristics c) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+index c2bbe36cf013f120e9249ab8acf92686d8bfdb80..1bc69c9cac8164fbaae24503e871a99818059900 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+@@ -27,6 +27,7 @@ public final class SpektraPreviewRenderer {
+         Thread t = new Thread(r, "SpektraPreviewRender"); t.setDaemon(true); return t;
+     });
+     private final AtomicBoolean busy = new AtomicBoolean(false);
++    private final Object renderLifecycleLock = new Object();
+     private CameraCharacteristics characteristics;
+     private int sensorOrientation;
+     private boolean frontFacing;
+@@ -51,10 +52,13 @@ public final class SpektraPreviewRenderer {
+     public void render(SpektraRawFrame frame, SpektraFrameMetadata metadata, TotalCaptureResult result) {
+         if (released || frame == null || metadata == null || result == null || !busy.compareAndSet(false, true)) return;
+         final CameraCharacteristics cc = characteristics;
+-        executor.execute(() -> {
+-            Bitmap bitmap = null;
+-            try {
+-                SpektraColorSolver.Solution color = SpektraColorSolver.solve(result, metadata.neutral3,
++        try {
++            executor.execute(() -> {
++                synchronized (renderLifecycleLock) {
++                    Bitmap bitmap = null;
++                try {
++                    if (released) return;
++                    SpektraColorSolver.Solution color = SpektraColorSolver.solve(result, metadata.neutral3,
+                         cc.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1), cc.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2),
+                         cc.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM1), cc.get(CameraCharacteristics.SENSOR_CALIBRATION_TRANSFORM2),
+                         cc.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1), cc.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2),
+@@ -69,13 +73,18 @@ public final class SpektraPreviewRenderer {
+                     bitmap = film.render(linear, true, System.nanoTime() * 1.0e-9);
+                 }
+                 if (!released) draw(bitmap);
+-            } catch (Throwable t) {
+-                Log.e(TAG, "IRIS_26681_SPEKTRA_PREVIEW_RENDER_FAILED", t);
+-            } finally {
+-                if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+-                busy.set(false);
+-            }
+-        });
++                } catch (Throwable t) {
++                    if (!released) Log.e(TAG, "IRIS_26681_SPEKTRA_PREVIEW_RENDER_FAILED", t);
++                } finally {
++                    if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
++                    busy.set(false);
++                }
++                }
++            });
++        } catch (RuntimeException rejectedAfterRetire) {
++            busy.set(false);
++            if (!released) throw rejectedAfterRetire;
++        }
+     }
+ 
+     private void draw(Bitmap bitmap) {
+@@ -116,6 +125,13 @@ public final class SpektraPreviewRenderer {
+     public void release() {
+         released = true;
+         executor.shutdownNow();
++        // IRIS_26682_SPEKTRA_PREVIEW_DRAIN_ON_HANDOFF
++        // busy permits at most one render. Waiting on this lock therefore proves that the active
++        // RAW/RCD/SPEKTRA render has left before Photo/Night/Motion may retake camera/GPU ownership.
++        synchronized (renderLifecycleLock) {
++            busy.set(false);
++        }
++        Log.i(TAG, "IRIS_26682_SPEKTRA_PREVIEW_DRAINED");
+     }
+ 
+     private static int valueOrZero(Integer value) { return value == null ? 0 : value; }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+index e8168bf3fd9e1ace5b479170f3dec8ecff8f297d..c51cfd9fb7c2e1aa5004f47b07e315c9193b005a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+@@ -67,6 +67,7 @@ final class CameraUIController implements CameraUIEventsListener,
+                     case PHOTO:
+                     case MOTION:
+                     case NIGHT:
++                    case SPEKTRA:
+                         if (view.isHovered()) resetTimer();
+                         else startTimer();
+                         break;
+@@ -250,6 +251,15 @@ case R.id.flash_button:
+             Log.d(TAG, "Reset RAW Video start state on mode entry");
+         }
+ 
++        /* IRIS_26682_STRICT_MODE_OWNER_RETIREMENT
++         * The departing camera owner must be completely retired before the selected-mode
++         * preference changes. This prevents callbacks/resources from the old mode from observing
++         * the new mode and prevents the new owner from opening while the old owner is still alive.
++         */
++        if (previousMode != cameraMode) {
++            cameraFragment.captureController.retireModeForTransition(previousMode, cameraMode);
++        }
++
+         PreferenceKeys.setCameraModeOrdinal(cameraMode.ordinal());
+         Log.d(TAG, "onCameraModeChanged() called with: cameraMode = [" + cameraMode + "]");
+         switch (cameraMode) {
+diff --git a/app/version.properties b/app/version.properties
+index 3b258b944a5d7782c56774340da240762d818b99..98f7d85db3bd4a7266dcf2d30f474fe2631d9ad7 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726681
+-VERSION_BUILD=26681
++VERSION_NAME=0.9726682
++VERSION_BUILD=26682
