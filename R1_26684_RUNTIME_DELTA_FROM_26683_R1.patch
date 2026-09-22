@@ -1,0 +1,1363 @@
+diff --git a/app/src/main/cpp/spektra/SpektraNativeJni.cpp b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+index b280bb445e40e83c2a367686add5c41c393d6bf6..7a74fc5802792ec83ee556f14a88fd14350a8b8c 100644
+--- a/app/src/main/cpp/spektra/SpektraNativeJni.cpp
++++ b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+@@ -106,6 +106,71 @@ uint8_t toByte(uint16_t h) {
+     return static_cast<uint8_t>(std::floor(v * 255.0f + 0.5f));
+ }
+ 
++constexpr int kAndroidRawSensor = 32;
++constexpr int kAndroidRaw10 = 37;
++constexpr int kAndroidRaw12 = 38;
++
++bool throwIllegalArgument(JNIEnv *env, const std::string &message) {
++    jclass cls = env->FindClass("java/lang/IllegalArgumentException");
++    if (cls) env->ThrowNew(cls, message.c_str());
++    return false;
++}
++
++int minRawRowBytes(int format, int width, int pixelStride) {
++    if (format == kAndroidRaw10) return ((width + 3) / 4) * 5;
++    if (format == kAndroidRaw12) return ((width + 1) / 2) * 3;
++    if (format == kAndroidRawSensor) return width * std::max(2, pixelStride);
++    return -1;
++}
++
++bool readRawSample(const uint8_t *src, size_t sourceBytes, int format, int width, int height,
++                   int rowStride, int pixelStride, int x, int y, uint16_t *sample) {
++    if (!src || !sample || x < 0 || y < 0 || x >= width || y >= height) return false;
++    const size_t row = static_cast<size_t>(y) * static_cast<size_t>(rowStride);
++    size_t p = 0;
++    if (format == kAndroidRaw10) {
++        p = row + static_cast<size_t>(x / 4) * 5u;
++        if (p + 4u >= sourceBytes) return false;
++        const int lane = x & 3;
++        const uint8_t packed = src[p + 4u];
++        *sample = static_cast<uint16_t>((static_cast<uint16_t>(src[p + static_cast<size_t>(lane)]) << 2u)
++                | ((packed >> (lane * 2)) & 0x03u));
++        return true;
++    }
++    if (format == kAndroidRaw12) {
++        p = row + static_cast<size_t>(x / 2) * 3u;
++        if (p + 2u >= sourceBytes) return false;
++        const int lane = x & 1;
++        const uint8_t packed = src[p + 2u];
++        *sample = static_cast<uint16_t>((static_cast<uint16_t>(src[p + static_cast<size_t>(lane)]) << 4u)
++                | (lane == 0 ? (packed & 0x0fu) : ((packed >> 4u) & 0x0fu)));
++        return true;
++    }
++    if (format == kAndroidRawSensor) {
++        const int stride = std::max(2, pixelStride);
++        p = row + static_cast<size_t>(x) * static_cast<size_t>(stride);
++        if (p + 1u >= sourceBytes) return false;
++        *sample = static_cast<uint16_t>(static_cast<uint16_t>(src[p])
++                | (static_cast<uint16_t>(src[p + 1u]) << 8u));
++        return true;
++    }
++    return false;
++}
++
++int mapPreviewCoordinate(int outputCoordinate, int outputSize, int sourceSize) {
++    if (outputSize == sourceSize) return outputCoordinate;
++    const double sourcePosition = (static_cast<double>(outputCoordinate) + 0.5)
++            * static_cast<double>(sourceSize) / static_cast<double>(outputSize) - 0.5;
++    int sourceCoordinate = static_cast<int>(std::floor(sourcePosition + 0.5));
++    sourceCoordinate = std::max(0, std::min(sourceSize - 1, sourceCoordinate));
++    const int desiredParity = outputCoordinate & 1;
++    if ((sourceCoordinate & 1) != desiredParity) {
++        if (sourceCoordinate + 1 < sourceSize) ++sourceCoordinate;
++        else if (sourceCoordinate > 0) --sourceCoordinate;
++    }
++    return sourceCoordinate;
++}
++
+ spektrafilm::RenderParams factoryParams(bool preview) {
+     spektrafilm::RenderParams p;
+     p.process = spektrafilm::ProcessMode::PrintSimulation;
+@@ -160,6 +225,78 @@ bool ensureRenderer(AAssetManager *manager, const std::string &root, std::string
+ }
+ }
+ 
++extern "C" JNIEXPORT jbyteArray JNICALL
++Java_com_particlesdevs_photoncamera_spektra_SpektraRawFrame_nativeDecodeRaw(
++        JNIEnv *env, jclass, jobject source, jint sourceOffset, jint sourceBytes,
++        jint sourceWidth, jint sourceHeight, jint rowStride, jint pixelStride, jint format,
++        jint outputWidth, jint outputHeight) {
++    auto *base = static_cast<uint8_t *>(env->GetDirectBufferAddress(source));
++    const jlong capacity = env->GetDirectBufferCapacity(source);
++    if (!base || capacity < 0) {
++        throwIllegalArgument(env, "Spektra RAW plane must be a direct ByteBuffer");
++        return nullptr;
++    }
++    if (sourceOffset < 0 || sourceBytes <= 0 || static_cast<jlong>(sourceOffset) + sourceBytes > capacity) {
++        throwIllegalArgument(env, "Spektra RAW direct-buffer bounds are invalid");
++        return nullptr;
++    }
++    const bool packedWidthInvalid = (format == kAndroidRaw10 || format == kAndroidRaw12)
++            && (sourceWidth & 3) != 0;
++    if (sourceWidth <= 0 || sourceHeight <= 0 || outputWidth <= 0 || outputHeight <= 0
++            || (sourceWidth & 1) != 0 || (sourceHeight & 1) != 0 || packedWidthInvalid
++            || (outputWidth & 1) != 0 || (outputHeight & 1) != 0
++            || outputWidth > sourceWidth || outputHeight > sourceHeight || rowStride <= 0) {
++        throwIllegalArgument(env, "Spektra RAW dimensions are invalid");
++        return nullptr;
++    }
++    const int effectivePixelStride = format == kAndroidRawSensor ? std::max(2, static_cast<int>(pixelStride)) : 0;
++    const int minimumRow = minRawRowBytes(format, sourceWidth, effectivePixelStride);
++    if (minimumRow < 0) {
++        throwIllegalArgument(env, "Spektra RAW format is unsupported");
++        return nullptr;
++    }
++    const uint64_t minimumBytes = static_cast<uint64_t>(sourceHeight - 1) * static_cast<uint64_t>(rowStride)
++            + static_cast<uint64_t>(minimumRow);
++    if (rowStride < minimumRow || static_cast<uint64_t>(sourceBytes) < minimumBytes) {
++        throwIllegalArgument(env, "Spektra RAW row-stride/buffer contract is invalid");
++        return nullptr;
++    }
++    const uint64_t outputBytes64 = static_cast<uint64_t>(outputWidth) * static_cast<uint64_t>(outputHeight) * 2u;
++    if (outputBytes64 > 0x7fffffffull) {
++        throwIllegalArgument(env, "Spektra decoded RAW is too large");
++        return nullptr;
++    }
++    jbyteArray output = env->NewByteArray(static_cast<jsize>(outputBytes64));
++    if (!output) return nullptr;
++    jboolean isCopy = JNI_FALSE;
++    jbyte *out = env->GetByteArrayElements(output, &isCopy);
++    if (!out) return nullptr;
++    const uint8_t *src = base + sourceOffset;
++    bool ok = true;
++    for (int y = 0; y < outputHeight && ok; ++y) {
++        const int sy = mapPreviewCoordinate(y, outputHeight, sourceHeight);
++        for (int x = 0; x < outputWidth; ++x) {
++            const int sx = mapPreviewCoordinate(x, outputWidth, sourceWidth);
++            uint16_t sample = 0;
++            if (!readRawSample(src, static_cast<size_t>(sourceBytes), format, sourceWidth, sourceHeight,
++                    rowStride, effectivePixelStride, sx, sy, &sample)) {
++                ok = false;
++                break;
++            }
++            const size_t dst = (static_cast<size_t>(y) * static_cast<size_t>(outputWidth)
++                    + static_cast<size_t>(x)) * 2u;
++            out[dst] = static_cast<jbyte>(sample & 0xffu);
++            out[dst + 1u] = static_cast<jbyte>((sample >> 8u) & 0xffu);
++        }
++    }
++    env->ReleaseByteArrayElements(output, out, ok ? 0 : JNI_ABORT);
++    if (!ok) {
++        throwIllegalArgument(env, "Spektra RAW decoder reached an invalid packed offset");
++        return nullptr;
++    }
++    return output;
++}
++
+ extern "C" JNIEXPORT jboolean JNICALL
+ Java_com_particlesdevs_photoncamera_spektra_SpektraFilmRenderer_nativeInitialize(
+         JNIEnv *env, jclass, jobject assetManager, jstring resourceRoot) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index f794a9adfc202d9eff129e2591bfb35e517a315e..e6f94e82f5815f07e110a44f4d5b73ade8c1e8e0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1032,6 +1032,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         public void onOpened(@NonNull CameraDevice cameraDevice) {
+             // This method is called when the camera is opened.  We start camera preview here.
+             mCameraOpenCloseLock.release();
++            if (iris26684BlockLegacyCameraForSpektra("legacy_onOpened")) {
++                Log.w(TAG, "IRIS_26684_SPEKTRA_CLOSE_RACED_LEGACY_OPEN camera=" + cameraDevice.getId());
++                cameraDevice.close();
++                mCameraDevice = null;
++                return;
++            }
+             mCameraDevice = cameraDevice;
+             Log.i(TAG, "IRIS_26548_CAMERA_ON_OPENED generation=" + mIris26548CameraHealthGeneration
+                     + " camera=" + cameraDevice.getId());
+@@ -1076,6 +1082,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         @Override
+         public void onSurfaceTextureAvailable(@NonNull SurfaceTexture texture, int width, int height) {
+             try {
++                if (iris26684BlockLegacyCameraForSpektra("surface_available")) return;
+                 mIris26548ConsecutiveHealthRecoveries = 0;
+                 mIris26555PreviewRecoveryStage = IRIS_26555_RECOVERY_NONE;
+                 iris26548BeginCameraHealthGeneration("surface_available");
+@@ -1184,6 +1191,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return persisted;
+     }
+ 
++    /** Spektra owns Camera2 exclusively; legacy Iris may remain a UI surface but never open a camera. */
++    private boolean iris26684BlockLegacyCameraForSpektra(String entryPoint) {
++        final CameraMode mode = getAuthoritativeCameraMode();
++        final boolean ownerActive = spektraCameraOwner != null && spektraCameraOwner.isActive();
++        if (mode == CameraMode.SPEKTRA || ownerActive) {
++            Log.i(TAG, "IRIS_26684_SPEKTRA_LEGACY_CAMERA_BLOCK entry=" + entryPoint
++                    + " mode=" + mode + " ownerActive=" + ownerActive
++                    + " ownerState=" + (spektraCameraOwner == null ? "null" : spektraCameraOwner.getState()));
++            return true;
++        }
++        return false;
++    }
++
+     public void commitCameraModeForTransition(@NonNull CameraMode mode) {
+         PreferenceKeys.setCameraModeOrdinal(mode.ordinal());
+         PhotonCamera.getSettings().selectedMode = mode;
+@@ -4314,6 +4334,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         setUpCameraOutputs(optimal.getWidth(), optimal.getHeight());
+         configureTransform(optimal.getWidth(), optimal.getHeight());
+         irisRoute = mIrisOpeningRoute;
++        if (iris26684BlockLegacyCameraForSpektra("restart_pre_hal")) return;
+         try {
+             if (!mCameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                 throw new RuntimeException("Time out waiting to lock camera opening.");
+@@ -4321,6 +4342,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             Log.i(TAG, "IRIS_26548_CAMERA_OPEN_REQUESTED generation="
+                     + mIris26548CameraHealthGeneration + " camera=" + irisRoute.openedDeviceId
+                     + " restart=true");
++            if (iris26684BlockLegacyCameraForSpektra("restart_locked_pre_hal")) {
++                mCameraOpenCloseLock.release();
++                return;
++            }
+             this.mCameraManager.openCamera(irisRoute.openedDeviceId, mStateCallback, mBackgroundHandler);
+         } catch (CameraAccessException e) {
+             Log.e(TAG, Log.getStackTraceString(e));
+@@ -4465,8 +4490,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * Opens the camera specified by {@link Settings#mCameraID}.
+      */
+     public void openCamera(int width, int height) {
++        if (iris26684BlockLegacyCameraForSpektra("openCamera_entry")) return;
+         //Open camera in non ui thread
+         processExecutor.execute(()->{
++            if (iris26684BlockLegacyCameraForSpektra("openCamera_async")) return;
+             CameraFragment.mSelectedMode = PhotonCamera.getSettings().selectedMode;
+             if (ContextCompat.checkSelfPermission(activity, Manifest.permission.CAMERA)
+                     != PackageManager.PERMISSION_GRANTED) {
+@@ -4490,6 +4517,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 Log.i(TAG, "IRIS_26527_CAMERA_ROUTE_OPEN " + irisRoute);
+                 Log.i(TAG, "IRIS_26548_CAMERA_OPEN_REQUESTED generation="
+                         + mIris26548CameraHealthGeneration + " camera=" + irisRoute.openedDeviceId);
++                if (iris26684BlockLegacyCameraForSpektra("openCamera_pre_hal")) {
++                    mCameraOpenCloseLock.release();
++                    return;
++                }
+                 this.mCameraManager.openCamera(
+                         irisRoute.openedDeviceId, mStateCallback, mBackgroundHandler);
+             } catch (CameraAccessException e) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+index 3e53f121fcfac64cc5adb05de8dcd0b9f680572b..c3e04ced6c87e3cc6de7eade1de6d7b3c6bce3e3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+@@ -4,6 +4,7 @@ import android.Manifest;
+ import android.annotation.SuppressLint;
+ import android.app.Activity;
+ import android.content.Context;
++import android.content.SharedPreferences;
+ import android.content.pm.PackageManager;
+ import android.graphics.ImageFormat;
+ import android.graphics.Rect;
+@@ -49,6 +50,9 @@ import java.util.Comparator;
+ import java.util.List;
+ import java.util.concurrent.Executor;
+ import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.ScheduledExecutorService;
++import java.util.concurrent.ScheduledFuture;
+ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicLong;
+@@ -56,14 +60,14 @@ import java.util.concurrent.atomic.AtomicLong;
+ /**
+  * Independent Camera2 owner for CameraMode.SPEKTRA.
+  *
+- * No Motion/Night capture, ZSL, IsoExpoSelector, Parameters, per-lens IQ profile, Sabre/Wronski,
+- * UHDR or HEIC object is referenced from this class. Device truth comes only from Camera2.
++ * No Motion/Night capture, ZSL, IsoExpoSelector, Parameters, Sabre/Wronski, UHDR or HEIC object
++ * is referenced from this class. Spektra auto-discovers and persists only its own Camera2 RAW
++ * lens profile; Photo/Motion/Night IQ profiles are never imported.
+  */
+ public final class SpektraCameraOwner {
+     private static final String TAG = "SpektraCameraOwner";
+     private static final int TARGET_PREVIEW_FPS = 30;
+     private static final int PREVIEW_SHORT_EDGE_DEFAULT = 480;
+-    private static final double PREVIEW_QUALITY_SCALAR = 0.25;
+     private static final long CAMERA_OPEN_TIMEOUT_MS = 4000L;
+     private static final long PREVIEW_CONFIG_TIMEOUT_MS = 4000L;
+     private static final long PREVIEW_FIRST_FRAME_TIMEOUT_MS = 6500L;
+@@ -99,6 +103,12 @@ public final class SpektraCameraOwner {
+     private final CameraEventsListener events;
+     private final AtomicLong generation = new AtomicLong(0L);
+     private final Object stateLock = new Object();
++    private final SharedPreferences lensProfiles;
++    private final ScheduledExecutorService watchdogExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
++        Thread t = new Thread(r, "SpektraWatchdog");
++        t.setDaemon(true);
++        return t;
++    });
+ 
+     private HandlerThread cameraThread;
+     private Handler cameraHandler;
+@@ -108,7 +118,6 @@ public final class SpektraCameraOwner {
+     private CameraDevice cameraDevice;
+     private CameraCaptureSession session;
+     private ImageReader previewReader;
+-    private ImageReader stillReader;
+     private CaptureRequest.Builder repeatingBuilder;
+     private CameraCharacteristics characteristics;
+     private Route route;
+@@ -116,8 +125,11 @@ public final class SpektraCameraOwner {
+     private SpektraPreviewRenderer previewRenderer;
+     private State state = State.IDLE;
+     private int rawFormat = ImageFormat.RAW_SENSOR;
++    /** Full-resolution Camera2 RAW stream; shared by VF-S and still capture. */
+     private Size previewSize;
+     private Size stillSize;
++    /** LOW VF-S processing lattice (default 480 short edge, normally 640x480). */
++    private Size previewProcessSize;
+     private long activeGeneration = 0L;
+     private int requestedIso = 0;
+     private long requestedExposureNs = 0L;
+@@ -138,12 +150,16 @@ public final class SpektraCameraOwner {
+ 
+     private final LongSparseArray<TotalCaptureResult> previewResults = new LongSparseArray<>();
+     private final LongSparseArray<SpektraRawFrame> previewFrames = new LongSparseArray<>();
++    private final LongSparseArray<Image> pendingStillImages = new LongSparseArray<>();
+     private SpektraRawFrame pendingStillFrame;
+     private TotalCaptureResult pendingStillResult;
+     private long pendingStillTimestamp = 0L;
+     private long pendingStillWallTimeMs = 0L;
+-    private long watchdogToken = 0L;
+-    private Runnable watchdogRunnable;
++    private int pendingStillFrozenIso = 0;
++    private final AtomicLong watchdogToken = new AtomicLong(0L);
++    private volatile ScheduledFuture<?> watchdogFuture;
++    private volatile boolean awaitingPostStillPreview = false;
++    private boolean automaticLensDiscoverySeeded = false;
+     private boolean loggedPreviewRawContract = false;
+     private boolean loggedStillRawContract = false;
+ 
+@@ -152,6 +168,7 @@ public final class SpektraCameraOwner {
+         this.processExecutor = processExecutor;
+         this.events = events;
+         this.cameraManager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
++        this.lensProfiles = activity.getSharedPreferences("spektra_auto_lens_discovery", Context.MODE_PRIVATE);
+     }
+ 
+     public void bindPreviewSurface(@NonNull SurfaceView surfaceView) {
+@@ -375,6 +392,7 @@ public final class SpektraCameraOwner {
+                 fail(g, "CAMERA_PERMISSION_MISSING", null);
+                 return;
+             }
++            seedAutomaticLensProfiles();
+             setState(State.OPENING);
+             String requested = selectedCameraId;
+             route = resolveRoute(requested);
+@@ -390,15 +408,16 @@ public final class SpektraCameraOwner {
+                 previewRenderer = new SpektraPreviewRenderer(activity, previewSurfaceView,
+                         this::onFirstPreviewFramePresented);
+             }
+-            previewRenderer.configure(characteristics, previewSize, rawFormat);
++            previewRenderer.configure(characteristics, previewSize, previewProcessSize, rawFormat);
+             events.onCharacteristicsUpdated(characteristics);
+             events.onOpenCamera(cameraManager);
+             // Keep the legacy viewfinder visible until the first validated Spektra frame is
+             // actually posted. This prevents a stale SurfaceView buffer from masquerading as a
+             // live Spektra preview during ownership handoff.
+             preparePreviewPresentation();
+-            Log.i(TAG, "IRIS_26681_SPEKTRA_OPEN " + route + " rawFormat=" + rawFormat
+-                    + " preview=" + previewSize + " still=" + stillSize + " generation=" + g);
++            Log.i(TAG, "IRIS_26684_SPEKTRA_OPEN " + route + " rawFormat=" + rawFormat
++                    + " rawStream=" + previewSize + " vfS=" + previewProcessSize
++                    + " still=" + stillSize + " fps=" + TARGET_PREVIEW_FPS + " generation=" + g);
+             armFatalWatchdog(g, State.OPENING, CAMERA_OPEN_TIMEOUT_MS, "CAMERA_OPEN_TIMEOUT");
+             cameraManager.openCamera(route.openedId, new CameraDevice.StateCallback() {
+                 @Override public void onOpened(@NonNull CameraDevice camera) {
+@@ -480,39 +499,169 @@ public final class SpektraCameraOwner {
+                 + " publicIds=" + listed);
+     }
+ 
++    private void seedAutomaticLensProfiles() {
++        if (automaticLensDiscoverySeeded) return;
++        automaticLensDiscoverySeeded = true;
++        int discovered = 0;
++        try {
++            java.util.LinkedHashSet<String> ids = new java.util.LinkedHashSet<>();
++            for (String publicId : cameraManager.getCameraIdList()) {
++                ids.add(publicId);
++                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                    try {
++                        CameraCharacteristics logical = cameraManager.getCameraCharacteristics(publicId);
++                        ids.addAll(logical.getPhysicalCameraIds());
++                    } catch (Throwable ignored) {}
++                }
++            }
++            for (String id : ids) {
++                try {
++                    CameraCharacteristics cc = cameraManager.getCameraCharacteristics(id);
++                    int[] caps = cc.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
++                    boolean raw = false;
++                    if (caps != null) for (int cap : caps) raw |= cap == CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW;
++                    if (!raw) continue;
++                    StreamConfigurationMap map = cc.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
++                    if (map == null) continue;
++                    int chosenFormat = 0;
++                    Size chosen = null;
++                    for (int format : new int[]{ImageFormat.RAW10, ImageFormat.RAW_SENSOR}) {
++                        Size[] advertised = map.getOutputSizes(format);
++                        if (advertised == null) continue;
++                        for (Size candidate : advertised) {
++                            if (candidate == null || candidate.getWidth() <= 0 || candidate.getHeight() <= 0
++                                    || (candidate.getWidth() & 1) != 0 || (candidate.getHeight() & 1) != 0) continue;
++                            if (chosen == null || area(candidate) > area(chosen)) {
++                                chosen = candidate;
++                                chosenFormat = format;
++                            }
++                        }
++                        if (chosen != null) break;
++                    }
++                    if (chosen == null) continue;
++                    String key = lensProfileKeyForId(id);
++                    boolean changed = lensProfiles.getInt(key + ".format", 0) != chosenFormat
++                            || lensProfiles.getInt(key + ".width", 0) != chosen.getWidth()
++                            || lensProfiles.getInt(key + ".height", 0) != chosen.getHeight();
++                    SharedPreferences.Editor e = lensProfiles.edit()
++                            .putInt(key + ".format", chosenFormat)
++                            .putInt(key + ".width", chosen.getWidth())
++                            .putInt(key + ".height", chosen.getHeight())
++                            .putInt(key + ".previewShortEdge", PREVIEW_SHORT_EDGE_DEFAULT);
++                    if (changed) {
++                        e.remove(key + ".previewVerified");
++                        e.remove(key + ".captureVerified");
++                    }
++                    e.apply();
++                    discovered++;
++                } catch (Throwable perLensFailure) {
++                    Log.w(TAG, "IRIS_26684_SPEKTRA_AUTO_LENS_SKIP id=" + id
++                            + " reason=" + perLensFailure.getClass().getSimpleName());
++                }
++            }
++            Log.i(TAG, "IRIS_26684_SPEKTRA_AUTO_LENS_DISCOVERY discovered=" + discovered
++                    + " manualScanRequired=false");
++        } catch (Throwable t) {
++            Log.w(TAG, "IRIS_26684_SPEKTRA_AUTO_LENS_DISCOVERY_PARTIAL reason="
++                    + t.getClass().getSimpleName());
++        }
++    }
++
+     private void discoverRawStreams(CameraCharacteristics c) {
+         StreamConfigurationMap map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+         if (map == null) throw new IllegalStateException("Camera has no stream configuration map");
+-        int[] formats = new int[] {ImageFormat.RAW10, ImageFormat.RAW_SENSOR, ImageFormat.RAW12};
+-        Size[] selected = null;
+-        int selectedFormat = 0;
+-        for (int format : formats) {
+-            Size[] sizes = map.getOutputSizes(format);
+-            if (sizes != null && sizes.length > 0) { selected = sizes; selectedFormat = format; break; }
+-        }
+-        if (selected == null) throw new IllegalStateException("No RAW10/RAW_SENSOR/RAW12 output");
+-        List<Size> sizes = new ArrayList<>();
+-        for (Size s : selected) {
+-            if (s != null && s.getWidth() > 0 && s.getHeight() > 0
+-                    && (s.getWidth() & 1) == 0 && (s.getHeight() & 1) == 0) {
+-                sizes.add(s);
++
++        // Standalone Auto Lens Discovery preference order: RAW10 first, RAW_SENSOR fallback.
++        // Iris enumerates candidates automatically; the selected profile is only marked verified
++        // after a real RAW preview frame, still capture, and resumed viewfinder succeed.
++        final String key = lensProfileKey();
++        final int persistedFormat = lensProfiles.getInt(key + ".format", 0);
++        final int persistedWidth = lensProfiles.getInt(key + ".width", 0);
++        final int persistedHeight = lensProfiles.getInt(key + ".height", 0);
++        Size selectedSize = findAdvertisedRawSize(map, persistedFormat, persistedWidth, persistedHeight);
++        int selectedFormat = selectedSize == null ? 0 : persistedFormat;
++        boolean persisted = selectedSize != null;
++
++        if (selectedSize == null) {
++            final int[] formatOrder = new int[] {ImageFormat.RAW10, ImageFormat.RAW_SENSOR};
++            for (int format : formatOrder) {
++                Size[] advertised = map.getOutputSizes(format);
++                if (advertised == null || advertised.length == 0) continue;
++                List<Size> viable = new ArrayList<>();
++                for (Size candidate : advertised) {
++                    if (candidate != null && candidate.getWidth() > 0 && candidate.getHeight() > 0
++                            && (candidate.getWidth() & 1) == 0 && (candidate.getHeight() & 1) == 0) {
++                        viable.add(candidate);
++                    }
++                }
++                if (viable.isEmpty()) continue;
++                viable.sort(Comparator.comparingLong(SpektraCameraOwner::area));
++                selectedSize = viable.get(viable.size() - 1);
++                selectedFormat = format;
++                break;
+             }
+         }
+-        if (sizes.isEmpty()) throw new IllegalStateException("No even Bayer RAW dimensions for Spektra RCD");
+-        sizes.sort(Comparator.comparingLong(SpektraCameraOwner::area));
+-        stillSize = sizes.get(sizes.size() - 1);
+-        int targetShort = Math.max(PREVIEW_SHORT_EDGE_DEFAULT,
+-                (int)Math.round(Math.min(stillSize.getWidth(), stillSize.getHeight()) * PREVIEW_QUALITY_SCALAR));
+-        Size best = null;
+-        for (Size s : sizes) {
+-            int sh = Math.min(s.getWidth(), s.getHeight());
+-            if (sh >= targetShort) { best = s; break; }
++        if (selectedSize == null) {
++            throw new IllegalStateException("Auto Lens Discovery found no RAW10/RAW_SENSOR stream");
+         }
+-        previewSize = best != null ? best : sizes.get(0);
++
+         rawFormat = selectedFormat;
+-        Log.i(TAG, "IRIS_26683_SPEKTRA_STREAM_CONTRACT route=" + route
+-                + " format=" + rawFormat + " preview=" + previewSize + " still=" + stillSize
+-                + " targetShort=" + targetShort + " candidateCount=" + sizes.size());
++        stillSize = selectedSize;
++        // Critical standalone contract: VF-S and still share one full RAW Camera2 stream. LOW quality
++        // changes the processing/output lattice, not the sensor ImageReader dimensions.
++        previewSize = selectedSize;
++        previewProcessSize = derivePreviewProcessSize(selectedSize, PREVIEW_SHORT_EDGE_DEFAULT);
++
++        lensProfiles.edit()
++                .putInt(key + ".format", rawFormat)
++                .putInt(key + ".width", selectedSize.getWidth())
++                .putInt(key + ".height", selectedSize.getHeight())
++                .putInt(key + ".previewShortEdge", PREVIEW_SHORT_EDGE_DEFAULT)
++                .apply();
++        Log.i(TAG, "IRIS_26684_SPEKTRA_AUTO_LENS_PROFILE route=" + route
++                + " persisted=" + persisted + " format=" + rawFormat
++                + " rawStream=" + previewSize + " vfS=" + previewProcessSize
++                + " fps=" + TARGET_PREVIEW_FPS + " quality=LOW");
++    }
++
++    private Size findAdvertisedRawSize(StreamConfigurationMap map, int format, int width, int height) {
++        if ((format != ImageFormat.RAW10 && format != ImageFormat.RAW_SENSOR) || width <= 0 || height <= 0) {
++            return null;
++        }
++        Size[] advertised = map.getOutputSizes(format);
++        if (advertised == null) return null;
++        for (Size s : advertised) {
++            if (s != null && s.getWidth() == width && s.getHeight() == height
++                    && (width & 1) == 0 && (height & 1) == 0) return s;
++        }
++        return null;
++    }
++
++    private String lensProfileKey() {
++        return lensProfileKeyForId(route == null ? selectedCameraId : route.characteristicsId);
++    }
++
++    private static String lensProfileKeyForId(String id) {
++        String safe = id == null || id.isEmpty() ? "unknown" : id;
++        return "lens." + safe.replaceAll("[^A-Za-z0-9_.-]", "_");
++    }
++
++    private static Size derivePreviewProcessSize(Size source, int shortEdge) {
++        final int sw = source.getWidth();
++        final int sh = source.getHeight();
++        int w;
++        int h;
++        if (sw >= sh) {
++            h = Math.min(sh, shortEdge);
++            w = Math.max(2, (int)Math.round((double)sw * h / sh));
++        } else {
++            w = Math.min(sw, shortEdge);
++            h = Math.max(2, (int)Math.round((double)sh * w / sw));
++        }
++        w &= ~1;
++        h &= ~1;
++        if (w <= 0 || h <= 0) throw new IllegalStateException("Invalid VF-S preview dimensions");
++        return new Size(w, h);
+     }
+ 
+     private static long area(Size s) { return (long)s.getWidth() * s.getHeight(); }
+@@ -527,7 +676,7 @@ public final class SpektraCameraOwner {
+         if (previewRenderer != null) previewRenderer.beginPreviewSession();
+         closeSessionAndReaders();
+         previewReader = ImageReader.newInstance(previewSize.getWidth(), previewSize.getHeight(), rawFormat, 4);
+-        previewReader.setOnImageAvailableListener(reader -> onPreviewRaw(reader, g), cameraHandler);
++        previewReader.setOnImageAvailableListener(reader -> onRawAvailable(reader, g), cameraHandler);
+         Surface rawSurface = previewReader.getSurface();
+         try {
+             repeatingBuilder = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+@@ -553,8 +702,9 @@ public final class SpektraCameraOwner {
+                     if (focusLocked && touchMeterActive && manualFocusDistance == null) {
+                         applyTouchFocus(touchMeterX, touchMeterY, true);
+                     }
+-                    Log.i(TAG, "IRIS_26681_SPEKTRA_STREAMING generation=" + g
+-                            + " raw=" + previewSize + " format=" + rawFormat);
++                    Log.i(TAG, "IRIS_26684_SPEKTRA_STREAMING generation=" + g
++                            + " rawStream=" + previewSize + " vfS=" + previewProcessSize
++                            + " format=" + rawFormat + " sessionReuseReady=true");
+                 }
+                 @Override public void onConfigureFailed(@NonNull CameraCaptureSession s) {
+                     if (isCurrent(g)) fail(g, "PREVIEW_SESSION_CONFIGURE_FAILED", null);
+@@ -581,16 +731,33 @@ public final class SpektraCameraOwner {
+         }
+     }
+ 
+-    private void onPreviewRaw(ImageReader reader, long g) {
+-        if (!isCurrent(g) || state != State.STREAMING) {
+-            Image stale = reader.acquireLatestImage(); if (stale != null) stale.close(); return;
++    private void onRawAvailable(ImageReader reader, long g) {
++        if (!isCurrent(g)) {
++            Image stale = reader.acquireLatestImage();
++            if (stale != null) stale.close();
++            return;
++        }
++        final State current = getState();
++        if (current == State.STILL_CONFIGURING || current == State.STILL_CAPTURING) {
++            onStillRawFromSharedReader(reader, g);
++            return;
++        }
++        if (current != State.STREAMING) {
++            Image stale = reader.acquireLatestImage();
++            if (stale != null) stale.close();
++            return;
+         }
+         Image image = reader.acquireLatestImage();
+         if (image == null) return;
+         try {
++            if (previewRenderer == null || !previewRenderer.canAcceptFrame()) return;
+             validateRawImageContract(image, "preview", !loggedPreviewRawContract);
+             loggedPreviewRawContract = true;
+-            SpektraRawFrame frame = SpektraRawFrame.copyFrom(image);
++            SpektraRawFrame frame = SpektraRawFrame.copyPreviewFrom(image, PREVIEW_SHORT_EDGE_DEFAULT);
++            if (frame.width != previewProcessSize.getWidth() || frame.height != previewProcessSize.getHeight()) {
++                throw new IllegalStateException("VF-S decode size mismatch got=" + frame.width + "x" + frame.height
++                        + " expected=" + previewProcessSize);
++            }
+             TotalCaptureResult result = previewResults.get(frame.timestampNs);
+             if (result != null) {
+                 previewResults.remove(frame.timestampNs);
+@@ -600,7 +767,7 @@ public final class SpektraCameraOwner {
+                 trimSparse(previewFrames, 8);
+             }
+         } catch (Throwable t) {
+-            Log.e(TAG, "IRIS_26681_SPEKTRA_PREVIEW_RAW_FAILED", t);
++            Log.e(TAG, "IRIS_26684_SPEKTRA_PREVIEW_RAW_FAILED", t);
+         } finally {
+             image.close();
+         }
+@@ -764,40 +931,38 @@ public final class SpektraCameraOwner {
+     }
+ 
+     private void configureStillSession(long g) {
+-        if (!isCurrent(g) || cameraDevice == null) return;
++        if (!isCurrent(g) || cameraDevice == null || session == null || previewReader == null) {
++            terminalStillFailure(g, "STILL_ACTIVE_RAW_SESSION_MISSING", null);
++            return;
++        }
++        if (!previewSize.equals(stillSize)) {
++            terminalStillFailure(g, "STILL_PROFILE_NOT_REUSABLE preview=" + previewSize + " still=" + stillSize, null);
++            return;
++        }
+         armStillWatchdog(g, State.STILL_CONFIGURING, STILL_CONFIG_TIMEOUT_MS,
+-                "STILL_SESSION_CONFIG_TIMEOUT");
++                "STILL_ACTIVE_SESSION_REUSE_TIMEOUT");
+         try {
+-            if (session != null) { try { session.stopRepeating(); } catch (Throwable ignored) {} session.close(); session = null; }
+-            if (previewReader != null) { previewReader.close(); previewReader = null; }
+-            stillReader = ImageReader.newInstance(stillSize.getWidth(), stillSize.getHeight(), rawFormat, 2);
+-            stillReader.setOnImageAvailableListener(reader -> onStillRaw(reader, g), cameraHandler);
+-            Surface rawSurface = stillReader.getSurface();
+-            createSession(Collections.singletonList(rawSurface), g, new CameraCaptureSession.StateCallback() {
+-                @Override public void onConfigured(@NonNull CameraCaptureSession s) {
+-                    if (!isCurrent(g) || cameraDevice == null) { s.close(); return; }
+-                    session = s;
+-                    submitStill(g, rawSurface);
+-                }
+-                @Override public void onConfigureFailed(@NonNull CameraCaptureSession s) {
+-                    if (isCurrent(g)) terminalStillFailure(g, "STILL_SESSION_CONFIGURE_FAILED", null);
+-                }
+-            });
++            session.stopRepeating();
++            Log.i(TAG, "IRIS_26684_SPEKTRA_STILL_SESSION_REUSED=true raw=" + stillSize
++                    + " format=" + rawFormat + " generation=" + g);
++            submitStill(g, previewReader.getSurface());
+         } catch (Throwable t) {
+-            terminalStillFailure(g, "STILL_SESSION_CREATE_FAILED", t);
++            terminalStillFailure(g, "STILL_ACTIVE_SESSION_REUSE_FAILED", t);
+         }
+     }
+ 
+     private void submitStill(long g, Surface target) {
+-        if (!isCurrent(g) || cameraDevice == null || session == null) return;
++        if (!isCurrent(g) || cameraDevice == null || session == null || target == null) return;
+         try {
+             setState(State.STILL_CAPTURING);
+             armStillWatchdog(g, State.STILL_CAPTURING, STILL_CAPTURE_TIMEOUT_MS,
+                     "STILL_CAPTURE_TIMEOUT");
++            closePendingStillImages();
+             pendingStillFrame = null;
+             pendingStillResult = null;
+             pendingStillTimestamp = 0L;
+             pendingStillWallTimeMs = System.currentTimeMillis();
++            pendingStillFrozenIso = requestedIso;
+             final int frozenIso = requestedIso;
+             final long frozenExposure = requestedExposureNs;
+             CaptureRequest.Builder b = cameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+@@ -809,25 +974,26 @@ public final class SpektraCameraOwner {
+                     CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON);
+             if (touchAfRegion != null) b.set(CaptureRequest.CONTROL_AF_REGIONS, touchAfRegion);
+             applyFlashToStillRequest(b);
+-            b.setTag("IRIS_26681_SPEKTRA_" + g);
++            b.setTag("IRIS_26684_SPEKTRA_" + g);
+             session.capture(b.build(), new CameraCaptureSession.CaptureCallback() {
+-                @Override public void onCaptureStarted(@NonNull CameraCaptureSession session,
++                @Override public void onCaptureStarted(@NonNull CameraCaptureSession activeSession,
+                         @NonNull CaptureRequest request, long timestamp, long frameNumber) {
+                     if (isCurrent(g)) {
+                         pendingStillWallTimeMs = System.currentTimeMillis();
+                         events.onFrameCaptureStarted("SPEKTRA");
+                     }
+                 }
+-                @Override public void onCaptureCompleted(@NonNull CameraCaptureSession s,
++                @Override public void onCaptureCompleted(@NonNull CameraCaptureSession activeSession,
+                         @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
+-                    if (!isCurrent(g)) return;
++                    if (!isCurrent(g) || activeSession != session) return;
+                     Long ts = result.get(TotalCaptureResult.SENSOR_TIMESTAMP);
+                     if (ts == null) { terminalStillFailure(g, "STILL_RESULT_NO_TIMESTAMP", null); return; }
+                     pendingStillTimestamp = ts;
+                     pendingStillResult = result;
+-                    tryCompleteStill(g, frozenIso);
++                    discardPendingStillImagesExcept(ts);
++                    tryCompleteStill(g);
+                 }
+-                @Override public void onCaptureFailed(@NonNull CameraCaptureSession s,
++                @Override public void onCaptureFailed(@NonNull CameraCaptureSession activeSession,
+                         @NonNull CaptureRequest request, @NonNull android.hardware.camera2.CaptureFailure failure) {
+                     if (isCurrent(g)) terminalStillFailure(g, "STILL_CAPTURE_FAILED_" + failure.getReason(), null);
+                 }
+@@ -897,26 +1063,49 @@ public final class SpektraCameraOwner {
+         }
+     }
+ 
+-    private void onStillRaw(ImageReader reader, long g) {
++    private void onStillRawFromSharedReader(ImageReader reader, long g) {
+         Image image = reader.acquireNextImage();
+         if (image == null) return;
++        boolean retained = false;
+         try {
+-            validateRawImageContract(image, "still", !loggedStillRawContract);
++            validateRawImageContract(image, "still-shared-session", !loggedStillRawContract);
+             loggedStillRawContract = true;
+-            SpektraRawFrame frame = SpektraRawFrame.copyFrom(image);
+             if (!isCurrent(g)) return;
+-            pendingStillFrame = frame;
+-            if (pendingStillTimestamp == 0L) pendingStillTimestamp = frame.timestampNs;
+-            tryCompleteStill(g, requestedIso);
++            final long ts = image.getTimestamp();
++            if (pendingStillTimestamp != 0L && ts != pendingStillTimestamp) {
++                Log.d(TAG, "IRIS_26684_SPEKTRA_STILL_DROP_STALE_RAW timestamp=" + ts
++                        + " expected=" + pendingStillTimestamp);
++                return;
++            }
++            Image old = pendingStillImages.get(ts);
++            if (old != null && old != image) old.close();
++            pendingStillImages.put(ts, image);
++            retained = true;
++            trimPendingStillImages(3);
++            tryCompleteStill(g);
+         } catch (Throwable t) {
+-            terminalStillFailure(g, "STILL_RAW_COPY_FAILED", t);
++            terminalStillFailure(g, "STILL_RAW_PAIR_FAILED", t);
+         } finally {
+-            image.close();
++            if (!retained) image.close();
+         }
+     }
+ 
+-    private void tryCompleteStill(long g, int frozenRequestedIso) {
+-        if (!isCurrent(g) || pendingStillFrame == null || pendingStillResult == null) return;
++    private void tryCompleteStill(long g) {
++        if (!isCurrent(g) || pendingStillResult == null || pendingStillTimestamp == 0L) return;
++        if (pendingStillFrame == null) {
++            Image exact = pendingStillImages.get(pendingStillTimestamp);
++            if (exact == null) return;
++            pendingStillImages.remove(pendingStillTimestamp);
++            try {
++                pendingStillFrame = SpektraRawFrame.copyStillFrom(exact);
++            } catch (Throwable t) {
++                terminalStillFailure(g, "STILL_NATIVE_RAW_DECODE_FAILED", t);
++                return;
++            } finally {
++                exact.close();
++            }
++            closePendingStillImages();
++        }
+         Long resultTs = pendingStillResult.get(TotalCaptureResult.SENSOR_TIMESTAMP);
+         if (resultTs == null || pendingStillFrame.timestampNs != resultTs) {
+             terminalStillFailure(g, "RAW_RESULT_TIMESTAMP_MISMATCH raw=" + pendingStillFrame.timestampNs
+@@ -925,10 +1114,11 @@ public final class SpektraCameraOwner {
+         }
+         final SpektraRawFrame raw = pendingStillFrame;
+         final TotalCaptureResult result = pendingStillResult;
++        closePendingStillImages();
+         pendingStillFrame = null;
+         pendingStillResult = null;
+         SpektraFrameMetadata metadata = SpektraFrameMetadata.from(result, characteristics,
+-                result.getFrameNumber(), frozenRequestedIso);
++                result.getFrameNumber(), pendingStillFrozenIso);
+         if (metadata.neutral3 == null) {
+             terminalStillFailure(g, "MISSING_RAW_WHITE_BALANCE", null);
+             return;
+@@ -947,9 +1137,8 @@ public final class SpektraCameraOwner {
+             return;
+         }
+         setState(State.STILL_CAPTURED);
+-        Log.i(TAG, "IRIS_26683_SPEKTRA_STILL_CAPTURED timestamp=" + raw.timestampNs
+-                + " frame=" + result.getFrameNumber());
+-        setState(State.PROCESSING);
++        Log.i(TAG, "IRIS_26684_SPEKTRA_STILL_CAPTURED timestamp=" + raw.timestampNs
++                + " frame=" + result.getFrameNumber() + " sessionReused=true");
+         CaptureController.isProcessing = true;
+         events.onFrameCaptureCompleted("SPEKTRA");
+         events.onCaptureSequenceCompleted("SPEKTRA");
+@@ -963,9 +1152,38 @@ public final class SpektraCameraOwner {
+         final SpektraShot shot = new SpektraShot(raw, metadata, captureWallTimeMs,
+                 color.sensorToLinearSrgb, outputRotation,
+                 route == null ? "" : route.characteristicsId, lensModel);
++
++        // The immutable one-RAW recipe is now frozen. Resume the same RAW session immediately while
++        // durable .shot + full RCD/SPEKTRA/JPEG processing continues away from Camera2.
++        resumePreviewAfterStillReuse(g, true);
+         processExecutor.execute(() -> processShot(g, shot));
+     }
+ 
++    private void trimPendingStillImages(int max) {
++        while (pendingStillImages.size() > max) {
++            Image image = pendingStillImages.valueAt(0);
++            pendingStillImages.removeAt(0);
++            try { if (image != null) image.close(); } catch (Throwable ignored) {}
++        }
++    }
++
++    private void discardPendingStillImagesExcept(long timestamp) {
++        for (int i = pendingStillImages.size() - 1; i >= 0; --i) {
++            if (pendingStillImages.keyAt(i) == timestamp) continue;
++            Image image = pendingStillImages.valueAt(i);
++            pendingStillImages.removeAt(i);
++            try { if (image != null) image.close(); } catch (Throwable ignored) {}
++        }
++    }
++
++    private void closePendingStillImages() {
++        for (int i = pendingStillImages.size() - 1; i >= 0; --i) {
++            Image image = pendingStillImages.valueAt(i);
++            try { if (image != null) image.close(); } catch (Throwable ignored) {}
++        }
++        pendingStillImages.clear();
++    }
++
+     private static int valueOrZero(Integer value) { return value == null ? 0 : value; }
+     private static int valueOrZero(Byte value) { return value == null ? 0 : Byte.toUnsignedInt(value); }
+ 
+@@ -984,29 +1202,39 @@ public final class SpektraCameraOwner {
+             events.onProcessingError(t.getMessage() == null ? "Spektra processing failed" : t.getMessage());
+         } finally {
+             CaptureController.isProcessing = false;
+-            Handler h = cameraHandler;
+-            if (h != null) h.post(() -> restorePreviewAfterStill(g));
+         }
+     }
+ 
+-    private void restorePreviewAfterStill(long g) {
++    private void resumePreviewAfterStillReuse(long g, boolean successfulCapture) {
+         if (!isCurrent(g) || cameraDevice == null) return;
+-        setState(State.PREVIEW_RECONFIGURING);
+-        if (session != null) { session.close(); session = null; }
+-        if (stillReader != null) { stillReader.close(); stillReader = null; }
+-        configurePreviewSession(g, true);
++        closePendingStillImages();
++        pendingStillFrame = null;
++        pendingStillResult = null;
++        pendingStillTimestamp = 0L;
++        if (session == null || previewReader == null || repeatingBuilder == null) {
++            Log.w(TAG, "IRIS_26684_SPEKTRA_SESSION_REUSE_LOST rebuilding=true");
++            configurePreviewSession(g, true);
++            return;
++        }
++        if (previewRenderer != null) previewRenderer.beginPreviewSession();
++        awaitingPostStillPreview = successfulCapture;
++        setState(State.STREAMING);
++        submitRepeating();
++        armFatalWatchdog(g, State.STREAMING, PREVIEW_FIRST_FRAME_TIMEOUT_MS,
++                "PREVIEW_RESUME_FIRST_FRAME_TIMEOUT");
++        Log.i(TAG, "IRIS_26684_SPEKTRA_PREVIEW_RESUMED sessionReused=true generation=" + g);
+     }
+ 
+     private void terminalStillFailure(long g, String reason, Throwable t) {
+-        if (t != null) Log.e(TAG, "IRIS_26681_SPEKTRA_STILL_FAILURE reason=" + reason, t);
+-        else Log.e(TAG, "IRIS_26681_SPEKTRA_STILL_FAILURE reason=" + reason);
++        if (t != null) Log.e(TAG, "IRIS_26684_SPEKTRA_STILL_FAILURE reason=" + reason, t);
++        else Log.e(TAG, "IRIS_26684_SPEKTRA_STILL_FAILURE reason=" + reason);
+         setState(State.STILL_FAILED);
+         CaptureController.isProcessing = false;
+         activity.runOnUiThread(() -> {
+             events.onCaptureStillPictureRejected(reason);
+             events.onProcessingError(reason);
+         });
+-        restorePreviewAfterStill(g);
++        resumePreviewAfterStillReuse(g, false);
+     }
+ 
+     private void fail(long g, String reason, Throwable t) {
+@@ -1026,8 +1254,18 @@ public final class SpektraCameraOwner {
+             if (!isCurrent(g) || state != State.STREAMING) return;
+             cancelWatchdog();
+             setPreviewVisibility(true);
+-            Log.i(TAG, "IRIS_26683_SPEKTRA_FIRST_FRAME_PRESENTED generation=" + g
+-                    + " route=" + route + " raw=" + previewSize + " format=" + rawFormat);
++            final String key = lensProfileKey();
++            final boolean captureVerifiedNow = awaitingPostStillPreview;
++            SharedPreferences.Editor profileEdit = lensProfiles.edit().putBoolean(key + ".previewVerified", true);
++            if (captureVerifiedNow) {
++                profileEdit.putBoolean(key + ".captureVerified", true);
++                awaitingPostStillPreview = false;
++            }
++            profileEdit.apply();
++            Log.i(TAG, "IRIS_26684_SPEKTRA_FIRST_FRAME_PRESENTED generation=" + g
++                    + " route=" + route + " rawStream=" + previewSize + " vfS=" + previewProcessSize
++                    + " format=" + rawFormat + " previewVerified=true captureVerified="
++                    + (captureVerifiedNow || lensProfiles.getBoolean(key + ".captureVerified", false)));
+         });
+     }
+ 
+@@ -1054,15 +1292,17 @@ public final class SpektraCameraOwner {
+         }
+         final long minimumBuffer = height <= 0 ? 0L
+                 : (long) Math.max(0, height - 1) * rowStride + minRowBytes;
++        final boolean packedWidthInvalid = (format == ImageFormat.RAW10 || format == ImageFormat.RAW12)
++                && (width & 3) != 0;
+         if (width <= 0 || height <= 0 || (width & 1) != 0 || (height & 1) != 0
+-                || rowStride < minRowBytes || bufferBytes < minimumBuffer) {
++                || packedWidthInvalid || rowStride < minRowBytes || bufferBytes < minimumBuffer) {
+             throw new IllegalStateException("Invalid Spektra " + phase + " RAW geometry format="
+                     + format + " size=" + width + "x" + height + " rowStride=" + rowStride
+                     + " pixelStride=" + pixelStride + " bufferBytes=" + bufferBytes
+                     + " minRowBytes=" + minRowBytes + " minimumBuffer=" + minimumBuffer);
+         }
+         if (logContract) {
+-            Log.i(TAG, "IRIS_26683_SPEKTRA_RAW_PLANE phase=" + phase
++            Log.i(TAG, "IRIS_26684_SPEKTRA_RAW_PLANE phase=" + phase
+                     + " format=" + format + " size=" + width + "x" + height
+                     + " rowStride=" + rowStride + " pixelStride=" + pixelStride
+                     + " bufferBytes=" + bufferBytes + " minRowBytes=" + minRowBytes
+@@ -1072,38 +1312,41 @@ public final class SpektraCameraOwner {
+ 
+     private void armFatalWatchdog(long g, State expectedState, long timeoutMs, String reason) {
+         cancelWatchdog();
+-        final Handler h = cameraHandler;
+-        if (h == null) return;
+-        final long token = ++watchdogToken;
+-        watchdogRunnable = () -> {
+-            if (token != watchdogToken || !isCurrent(g) || getState() != expectedState) return;
+-            Log.e(TAG, "IRIS_26683_SPEKTRA_WATCHDOG_FATAL reason=" + reason
+-                    + " state=" + getState() + " generation=" + g);
+-            fail(g, reason, null);
+-        };
+-        h.postDelayed(watchdogRunnable, timeoutMs);
++        final long token = watchdogToken.incrementAndGet();
++        watchdogFuture = watchdogExecutor.schedule(() -> {
++            if (token != watchdogToken.get() || !isCurrent(g) || getState() != expectedState) return;
++            Log.e(TAG, "IRIS_26684_SPEKTRA_WATCHDOG_FATAL reason=" + reason
++                    + " state=" + getState() + " generation=" + g + " independentThread=true");
++            Handler h = cameraHandler;
++            if (h != null) h.post(() -> {
++                if (token == watchdogToken.get() && isCurrent(g) && getState() == expectedState) {
++                    fail(g, reason, null);
++                }
++            });
++        }, timeoutMs, TimeUnit.MILLISECONDS);
+     }
+ 
+     private void armStillWatchdog(long g, State expectedState, long timeoutMs, String reason) {
+         cancelWatchdog();
+-        final Handler h = cameraHandler;
+-        if (h == null) return;
+-        final long token = ++watchdogToken;
+-        watchdogRunnable = () -> {
+-            if (token != watchdogToken || !isCurrent(g) || getState() != expectedState) return;
+-            Log.e(TAG, "IRIS_26683_SPEKTRA_WATCHDOG_STILL reason=" + reason
+-                    + " state=" + getState() + " generation=" + g);
+-            terminalStillFailure(g, reason, null);
+-        };
+-        h.postDelayed(watchdogRunnable, timeoutMs);
++        final long token = watchdogToken.incrementAndGet();
++        watchdogFuture = watchdogExecutor.schedule(() -> {
++            if (token != watchdogToken.get() || !isCurrent(g) || getState() != expectedState) return;
++            Log.e(TAG, "IRIS_26684_SPEKTRA_WATCHDOG_STILL reason=" + reason
++                    + " state=" + getState() + " generation=" + g + " independentThread=true");
++            Handler h = cameraHandler;
++            if (h != null) h.post(() -> {
++                if (token == watchdogToken.get() && isCurrent(g) && getState() == expectedState) {
++                    terminalStillFailure(g, reason, null);
++                }
++            });
++        }, timeoutMs, TimeUnit.MILLISECONDS);
+     }
+ 
+     private void cancelWatchdog() {
+-        ++watchdogToken;
+-        Handler h = cameraHandler;
+-        Runnable r = watchdogRunnable;
+-        watchdogRunnable = null;
+-        if (h != null && r != null) h.removeCallbacks(r);
++        watchdogToken.incrementAndGet();
++        ScheduledFuture<?> future = watchdogFuture;
++        watchdogFuture = null;
++        if (future != null) future.cancel(false);
+     }
+ 
+     private void closeCameraObjects(boolean hideSurface) {
+@@ -1115,10 +1358,13 @@ public final class SpektraCameraOwner {
+         closeSessionAndReaders();
+         previewResults.clear();
+         previewFrames.clear();
++        closePendingStillImages();
+         pendingStillFrame = null;
+         pendingStillResult = null;
+         pendingStillTimestamp = 0L;
+         pendingStillWallTimeMs = 0L;
++        pendingStillFrozenIso = 0;
++        awaitingPostStillPreview = false;
+         loggedPreviewRawContract = false;
+         loggedStillRawContract = false;
+         cancelWatchdog();
+@@ -1141,8 +1387,6 @@ public final class SpektraCameraOwner {
+         session = null;
+         try { if (previewReader != null) previewReader.close(); } catch (Throwable ignored) {}
+         previewReader = null;
+-        try { if (stillReader != null) stillReader.close(); } catch (Throwable ignored) {}
+-        stillReader = null;
+     }
+ 
+     private void preparePreviewPresentation() {
+@@ -1174,7 +1418,7 @@ public final class SpektraCameraOwner {
+     private void setState(State s) {
+         cancelWatchdog();
+         synchronized (stateLock) { state = s; }
+-        Log.d(TAG, "IRIS_26683_SPEKTRA_STATE state=" + s + " generation=" + activeGeneration);
++        Log.d(TAG, "IRIS_26684_SPEKTRA_STATE state=" + s + " generation=" + activeGeneration);
+     }
+ 
+     private static <T> void trimSparse(LongSparseArray<T> a, int max) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+index 0e2db04ef4831c72009a1af53835a3f4d99d3f3e..5a4af27d49243d28635cc22ddeb66385a2d241e8 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+@@ -42,7 +42,7 @@ public final class SpektraPreviewRenderer {
+         this.firstFramePresentedCallback = firstFramePresentedCallback;
+     }
+ 
+-    public void configure(CameraCharacteristics characteristics, Size previewSize, int rawFormat) {
++    public void configure(CameraCharacteristics characteristics, Size rawStreamSize, Size processSize, int rawFormat) {
+         this.characteristics = characteristics;
+         Integer so = characteristics == null ? null : characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
+         Integer facing = characteristics == null ? null : characteristics.get(CameraCharacteristics.LENS_FACING);
+@@ -50,14 +50,20 @@ public final class SpektraPreviewRenderer {
+         frontFacing = facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT;
+         released = false;
+         firstFramePresented.set(false);
+-        Log.d(TAG, "IRIS_26681_SPEKTRA_PREVIEW_CONFIG raw=" + previewSize + " format=" + rawFormat
+-                + " targetFps=30 quality=LOW scalar=0.25");
++        Log.d(TAG, "IRIS_26684_SPEKTRA_PREVIEW_CONFIG rawStream=" + rawStreamSize
++                + " process=" + processSize + " format=" + rawFormat
++                + " targetFps=30 quality=LOW previewShortEdge=480 vfS=true");
+     }
+ 
+     public void beginPreviewSession() {
+         firstFramePresented.set(false);
+     }
+ 
++    /** Drop RAW callbacks before decode when the previous VF-S frame is still rendering. */
++    public boolean canAcceptFrame() {
++        return !released && !busy.get();
++    }
++
+     public void render(SpektraRawFrame frame, SpektraFrameMetadata metadata, TotalCaptureResult result) {
+         if (released || frame == null || metadata == null || result == null || !busy.compareAndSet(false, true)) return;
+         final CameraCharacteristics cc = characteristics;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+index b18f19b17cb35c1abf4bfd8bf6f0c9a4bfe5b306..da99b98a3e0770ec651be28bec692f4ee2ab2192 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+@@ -6,8 +6,10 @@ import android.media.Image;
+ import java.nio.ByteBuffer;
+ import java.nio.ByteOrder;
+ 
+-/** Immutable packed sensor frame owned only by Spektra. */
++/** Immutable Bayer frame owned only by Spektra. Packed Camera2 RAW decoding is native. */
+ public final class SpektraRawFrame {
++    static { System.loadLibrary("spektra_iris"); }
++
+     public final int width;
+     public final int height;
+     public final int sourceFormat;
+@@ -24,102 +26,96 @@ public final class SpektraRawFrame {
+     }
+ 
+     static SpektraRawFrame restore(int width, int height, int sourceFormat, long timestampNs, byte[] mosaic16) {
+-        if (width <= 0 || height <= 0 || mosaic16 == null) {
+-            throw new IllegalArgumentException("Invalid frozen Spektra RAW");
++        validateFrozen(width, height, sourceFormat, mosaic16);
++        return new SpektraRawFrame(width, height, sourceFormat, timestampNs, mosaic16.clone());
++    }
++
++    /**
++     * Unspektrawesome-compatible live contract: retain the full Camera2 RAW stream, but decode only
++     * the LOW-quality preview lattice (default short edge 480 -> 640x480 for a 4:3 sensor).
++     * No full-frame Java RAW10/RAW12 expansion is permitted on the Camera2 callback thread.
++     */
++    public static SpektraRawFrame copyPreviewFrom(Image image, int previewShortEdge) {
++        if (previewShortEdge <= 0) throw new IllegalArgumentException("Invalid Spektra preview short edge");
++        final int srcWidth = requireImageWidth(image);
++        final int srcHeight = image.getHeight();
++        int outWidth;
++        int outHeight;
++        if (srcWidth >= srcHeight) {
++            outHeight = Math.min(srcHeight, previewShortEdge);
++            outWidth = Math.max(2, (int)Math.round((double)srcWidth * outHeight / srcHeight));
++        } else {
++            outWidth = Math.min(srcWidth, previewShortEdge);
++            outHeight = Math.max(2, (int)Math.round((double)srcHeight * outWidth / srcWidth));
+         }
+-        long expected = (long) width * (long) height * 2L;
+-        if (expected > Integer.MAX_VALUE || mosaic16.length != (int) expected) {
+-            throw new IllegalArgumentException("Frozen Spektra RAW byte count mismatch");
++        outWidth &= ~1;
++        outHeight &= ~1;
++        if (outWidth <= 0 || outHeight <= 0) throw new IllegalArgumentException("Invalid Spektra preview geometry");
++        return decodeNative(image, outWidth, outHeight);
++    }
++
++    /** Full-resolution single-frame decode used only for the shutter capture. */
++    public static SpektraRawFrame copyStillFrom(Image image) {
++        final int width = requireImageWidth(image);
++        return decodeNative(image, width, image.getHeight());
++    }
++
++    /** Kept as a compatibility alias for frozen single-frame callers; live preview must not call it. */
++    public static SpektraRawFrame copyFrom(Image image) {
++        return copyStillFrom(image);
++    }
++
++    private static int requireImageWidth(Image image) {
++        if (image == null || image.getPlanes() == null || image.getPlanes().length == 0) {
++            throw new IllegalArgumentException("RAW image missing plane");
+         }
+-        if (sourceFormat != ImageFormat.RAW_SENSOR && sourceFormat != ImageFormat.RAW10
+-                && sourceFormat != ImageFormat.RAW12) {
+-            throw new IllegalArgumentException("Invalid frozen Spektra RAW format " + sourceFormat);
++        if (image.getWidth() <= 0 || image.getHeight() <= 0) {
++            throw new IllegalArgumentException("RAW image has invalid dimensions");
+         }
+-        return new SpektraRawFrame(width, height, sourceFormat, timestampNs, mosaic16.clone());
++        return image.getWidth();
+     }
+ 
+-    public static SpektraRawFrame copyFrom(Image image) {
+-        if (image == null || image.getPlanes().length == 0) throw new IllegalArgumentException("RAW image missing plane");
++    private static SpektraRawFrame decodeNative(Image image, int outWidth, int outHeight) {
+         final int format = image.getFormat();
+-        final int width = image.getWidth();
+-        final int height = image.getHeight();
++        if (format != ImageFormat.RAW_SENSOR && format != ImageFormat.RAW10 && format != ImageFormat.RAW12) {
++            throw new IllegalArgumentException("Unsupported Spektra RAW format " + format);
++        }
+         final Image.Plane plane = image.getPlanes()[0];
+-        final ByteBuffer src = plane.getBuffer().duplicate();
++        ByteBuffer src = plane.getBuffer().duplicate();
+         final int rowStride = plane.getRowStride();
+         final int pixelStride = plane.getPixelStride();
+-        final byte[] out = new byte[width * height * 2];
+-        final ByteBuffer dst = ByteBuffer.wrap(out).order(ByteOrder.nativeOrder());
+-        if (format == ImageFormat.RAW_SENSOR) {
+-            copyRaw16(src, dst, width, height, rowStride, pixelStride <= 0 ? 2 : pixelStride);
+-        } else if (format == ImageFormat.RAW10) {
+-            unpackRaw10(src, dst, width, height, rowStride);
+-        } else if (format == ImageFormat.RAW12) {
+-            unpackRaw12(src, dst, width, height, rowStride);
++        final int sourceOffset;
++        final int sourceBytes;
++        if (src.isDirect()) {
++            sourceOffset = src.position();
++            sourceBytes = src.remaining();
+         } else {
+-            throw new IllegalArgumentException("Unsupported Spektra RAW format " + format);
++            // Android RAW planes are normally direct. Keep a strict fallback for unusual devices,
++            // but still decode packed RAW in native code rather than expanding it in Java.
++            ByteBuffer direct = ByteBuffer.allocateDirect(src.remaining()).order(ByteOrder.nativeOrder());
++            direct.put(src);
++            direct.flip();
++            src = direct;
++            sourceOffset = 0;
++            sourceBytes = direct.remaining();
+         }
+-        return new SpektraRawFrame(width, height, format, image.getTimestamp(), out);
++        byte[] out = nativeDecodeRaw(src, sourceOffset, sourceBytes, image.getWidth(), image.getHeight(),
++                rowStride, pixelStride, format, outWidth, outHeight);
++        validateFrozen(outWidth, outHeight, format, out);
++        return new SpektraRawFrame(outWidth, outHeight, format, image.getTimestamp(), out);
+     }
+ 
+-    private static void copyRaw16(ByteBuffer src, ByteBuffer dst, int width, int height, int rowStride, int pixelStride) {
+-        for (int y = 0; y < height; y++) {
+-            int row = y * rowStride;
+-            for (int x = 0; x < width; x++) {
+-                int p = row + x * pixelStride;
+-                int lo = src.get(p) & 0xff;
+-                int hi = src.get(p + 1) & 0xff;
+-                dst.putShort((short)((hi << 8) | lo));
+-            }
++    private static void validateFrozen(int width, int height, int sourceFormat, byte[] mosaic16) {
++        if (width <= 0 || height <= 0 || mosaic16 == null) {
++            throw new IllegalArgumentException("Invalid frozen Spektra RAW");
+         }
+-    }
+-
+-    private static void unpackRaw10(ByteBuffer src, ByteBuffer dst, int width, int height, int rowStride) {
+-        // Android RAW10: groups of four 10-bit pixels occupy five bytes.
+-        for (int y = 0; y < height; y++) {
+-            int row = y * rowStride;
+-            int x = 0;
+-            for (; x + 3 < width; x += 4) {
+-                int p = row + (x / 4) * 5;
+-                int b0 = src.get(p) & 0xff;
+-                int b1 = src.get(p + 1) & 0xff;
+-                int b2 = src.get(p + 2) & 0xff;
+-                int b3 = src.get(p + 3) & 0xff;
+-                int b4 = src.get(p + 4) & 0xff;
+-                dst.putShort((short)((b0 << 2) | (b4 & 0x03)));
+-                dst.putShort((short)((b1 << 2) | ((b4 >> 2) & 0x03)));
+-                dst.putShort((short)((b2 << 2) | ((b4 >> 4) & 0x03)));
+-                dst.putShort((short)((b3 << 2) | ((b4 >> 6) & 0x03)));
+-            }
+-            if (x < width) {
+-                int p = row + (x / 4) * 5;
+-                int packed = src.get(p + 4) & 0xff;
+-                for (int i = 0; x + i < width && i < 4; i++) {
+-                    int msb = src.get(p + i) & 0xff;
+-                    dst.putShort((short)((msb << 2) | ((packed >> (i * 2)) & 0x03)));
+-                }
+-            }
++        long expected = (long) width * (long) height * 2L;
++        if (expected > Integer.MAX_VALUE || mosaic16.length != (int) expected) {
++            throw new IllegalArgumentException("Frozen Spektra RAW byte count mismatch");
+         }
+-    }
+-
+-    private static void unpackRaw12(ByteBuffer src, ByteBuffer dst, int width, int height, int rowStride) {
+-        // Android RAW12: groups of two 12-bit pixels occupy three bytes.
+-        for (int y = 0; y < height; y++) {
+-            int row = y * rowStride;
+-            int x = 0;
+-            for (; x + 1 < width; x += 2) {
+-                int p = row + (x / 2) * 3;
+-                int b0 = src.get(p) & 0xff;
+-                int b1 = src.get(p + 1) & 0xff;
+-                int b2 = src.get(p + 2) & 0xff;
+-                dst.putShort((short)((b0 << 4) | (b2 & 0x0f)));
+-                dst.putShort((short)((b1 << 4) | ((b2 >> 4) & 0x0f)));
+-            }
+-            if (x < width) {
+-                int p = row + (x / 2) * 3;
+-                int b0 = src.get(p) & 0xff;
+-                int b2 = src.get(p + 2) & 0xff;
+-                dst.putShort((short)((b0 << 4) | (b2 & 0x0f)));
+-            }
++        if (sourceFormat != ImageFormat.RAW_SENSOR && sourceFormat != ImageFormat.RAW10
++                && sourceFormat != ImageFormat.RAW12) {
++            throw new IllegalArgumentException("Invalid frozen Spektra RAW format " + sourceFormat);
+         }
+     }
+ 
+@@ -159,4 +155,8 @@ public final class SpektraRawFrame {
+         }
+         return weightSum > 0.0 ? weighted / weightSum : 0.18;
+     }
++
++    private static native byte[] nativeDecodeRaw(ByteBuffer source, int sourceOffset, int sourceBytes,
++            int sourceWidth, int sourceHeight, int rowStride, int pixelStride, int format,
++            int outputWidth, int outputHeight);
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+index 5ef807caf2ec6e605cb31144fbbfa5de98e58a48..97d1360697304a53833b4f68b0a9912ccb0bc665 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+@@ -105,13 +105,15 @@ public final class SpektraRawProcessor {
+                 p.setVar("whiteLevel", (float) shot.metadata.whiteLevel);
+                 p.drawBlocks(packed);
+ 
+-                clipMask = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16),
+-                        null, GL_NEAREST, GL_CLAMP_TO_EDGE);
+-                p.useAssetProgram("spektra/raw_clip_mask");
+-                p.setTexture("InputBayer", packed);
+-                p.setVar("rawSize", rawSize);
+-                p.setVar("clipThreshold", SENSOR_CLIP_THRESHOLD);
+-                p.drawBlocks(clipMask);
++                if (savedPhoto) {
++                    clipMask = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16),
++                            null, GL_NEAREST, GL_CLAMP_TO_EDGE);
++                    p.useAssetProgram("spektra/raw_clip_mask");
++                    p.setTexture("InputBayer", packed);
++                    p.setVar("rawSize", rawSize);
++                    p.setVar("clipThreshold", SENSOR_CLIP_THRESHOLD);
++                    p.drawBlocks(clipMask);
++                }
+ 
+                 boolean hasLsc = shot.metadata.lensShading != null
+                         && shot.metadata.lensShadingRows > 0 && shot.metadata.lensShadingCols > 0
+@@ -155,26 +157,35 @@ public final class SpektraRawProcessor {
+                     rcd = null;
+                 }
+ 
+-                denoised = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                        null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                p.useAssetProgram("spektra/chroma_denoise");
+-                p.setTexture("InputRgb", linear);
+-                p.setVar("InputSize", rawSize);
+-                p.setVar("strength", SAVED_CHROMA_DENOISE_STRENGTH);
+-                p.drawBlocks(denoised);
+-                linear.close();
+-                linear = null;
++                final GLTexture outputTexture;
++                if (savedPhoto) {
++                    denoised = new GLTexture(rawSize, new GLFormat(GLFormat.DataType.FLOAT_16, 4),
++                            null, GL_LINEAR, GL_CLAMP_TO_EDGE);
++                    p.useAssetProgram("spektra/chroma_denoise");
++                    p.setTexture("InputRgb", linear);
++                    p.setVar("InputSize", rawSize);
++                    p.setVar("strength", SAVED_CHROMA_DENOISE_STRENGTH);
++                    p.drawBlocks(denoised);
++                    linear.close();
++                    linear = null;
++                    outputTexture = denoised;
++                } else {
++                    // Standalone Unspektrawesome default: Chroma Denoise is a saved-photo owner.
++                    // VF-S LOW preview stays lightweight and does not run saved-photo denoise.
++                    outputTexture = linear;
++                }
+ 
+-                ByteBuffer out = denoised.textureBuffer(new GLFormat(GLFormat.DataType.FLOAT_16, 4), true)
++                ByteBuffer out = outputTexture.textureBuffer(new GLFormat(GLFormat.DataType.FLOAT_16, 4), true)
+                         .order(ByteOrder.nativeOrder());
+                 out.position(0);
+-                Log.d(TAG, "IRIS_26681_SPEKTRA_RAW_FRONTEND"
++                Log.d(TAG, "IRIS_26684_SPEKTRA_RAW_FRONTEND"
+                         + " saved=" + savedPhoto
+                         + " raw=" + width + "x" + height
+                         + " cfa=" + shot.metadata.cfaArrangement
+                         + " lensShading=" + hasLsc
+                         + " highlightRecovery=" + savedPhoto
+-                        + " chromaDenoise=" + SAVED_CHROMA_DENOISE_STRENGTH
++                        + " chromaDenoise=" + (savedPhoto ? SAVED_CHROMA_DENOISE_STRENGTH : 0.0f)
++                        + " previewQuality=" + (savedPhoto ? "FULL" : "LOW_480_SHORT_EDGE")
+                         + " output=sceneLinearRec709");
+                 return new LinearFrame(width, height, out);
+             } finally {
+diff --git a/app/version.properties b/app/version.properties
+index 4c011c6d0b7514ce795c1ecb3e5579b2c8697fd1..f8f516063ab2f75ebf541cd28b468b61d7011c14 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726683
+-VERSION_BUILD=26683
++VERSION_NAME=0.9726684
++VERSION_BUILD=26684
