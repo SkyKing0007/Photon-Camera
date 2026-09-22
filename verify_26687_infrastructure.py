@@ -17,6 +17,10 @@ for tok in ['GLSLANG_VERSION="16.5.0"','GLSLANG_ARCHIVE_SHA="b9b1f96acb898a62251
     if tok not in b: raise SystemExit('FAIL pinned glslang contract '+tok)
 for tok in ['AUTH_26686_BUILD_SCRIPT_BLOB="85222dd3d3d05c60f37771ae12bd56c3fa3328e4"','AUTH_26686_WORKFLOW_BLOB="8dcdaa6bc131443417563fc1a37d0c6dca3eaa52"','MECHANICS_AUTHORITY_COMMIT="b0620bfc0b750db35b8737e46aa0c5e92083be29"']:
     if tok not in b: raise SystemExit('FAIL successful 26686 mechanics pin '+tok)
+for tok in ['build_26686_r1_spektra_native_raw_vulkan_owner.sh','.github/workflows/build-26686-r1-spektra-native-raw-vulkan-owner.yml']:
+    if tok not in b: raise SystemExit('FAIL successful 26686 mechanics authority path '+tok)
+for stale in ['build_26686_r1_spektra_verified_autodiscovery_native_geometry.sh','.github/workflows/build-26686-r1-spektra-verified-autodiscovery-native-geometry.yml']:
+    if stale in b: raise SystemExit('FAIL stale 26685-derived mechanics path '+stale)
 # No new CMake/workflow compiler phase: 26687 runtime scope does not include CMake/shader/build.gradle.
 for rel in ['app/src/main/cpp/CMakeLists.txt','app/src/main/cpp/spektra/EmbedSpektraSpirv.cmake','app/build.gradle']:
     if rel in Path(Path(sys.argv[1]).parent/'R1_26687_RUNTIME_CHANGED_PATHS.txt').read_text().splitlines(): raise SystemExit('FAIL infrastructure/runtime scope broadened '+rel)

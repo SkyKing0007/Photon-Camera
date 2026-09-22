@@ -118,8 +118,8 @@ verify_scope(){
  if [[ -n "$LOCAL_ART" ]]; then set_report "CHANGED RUNTIME SCOPE" "PASS (local sealed candidate: exact 14 paths = 13 modified + 1 added; no deletions from successful 26686 compiled authority)"; return; fi
  [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
  git merge-base --is-ancestor "$UPLOAD_BASE_COMMIT" HEAD || fail "successful 26686 R1 commit must remain ancestor"
- [[ "$(git rev-parse "${MECHANICS_AUTHORITY_COMMIT}:build_26686_r1_spektra_verified_autodiscovery_native_geometry.sh")" == "$AUTH_26686_BUILD_SCRIPT_BLOB" ]] || fail "successful 26686 build-script blob changed"
- [[ "$(git rev-parse "${MECHANICS_AUTHORITY_COMMIT}:.github/workflows/build-26686-r1-spektra-verified-autodiscovery-native-geometry.yml")" == "$AUTH_26686_WORKFLOW_BLOB" ]] || fail "successful 26686 workflow blob changed"
+ [[ "$(git rev-parse "${MECHANICS_AUTHORITY_COMMIT}:build_26686_r1_spektra_native_raw_vulkan_owner.sh")" == "$AUTH_26686_BUILD_SCRIPT_BLOB" ]] || fail "successful 26686 build-script blob changed"
+ [[ "$(git rev-parse "${MECHANICS_AUTHORITY_COMMIT}:.github/workflows/build-26686-r1-spektra-native-raw-vulkan-owner.yml")" == "$AUTH_26686_WORKFLOW_BLOB" ]] || fail "successful 26686 workflow blob changed"
  git diff --name-only "$UPLOAD_BASE_COMMIT"..HEAD | sort > "$WORK/actual_upload_scope.txt"; sort "$UPLOADS" > "$WORK/expected_upload_scope.txt"; diff -u "$WORK/expected_upload_scope.txt" "$WORK/actual_upload_scope.txt" || fail "26687 upload scope mismatch"
  ! grep -Eq '^app/' "$WORK/actual_upload_scope.txt" || fail "handoff commit contains live app source"
  set_report "CHANGED RUNTIME SCOPE" "PASS (14 runtime/native paths carried only inside sealed payload; live app source not committed)"
