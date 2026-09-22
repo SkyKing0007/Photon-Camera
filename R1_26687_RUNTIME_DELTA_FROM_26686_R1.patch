@@ -1,0 +1,1628 @@
+diff --git a/app/src/main/cpp/spektra/SpektraNativeJni.cpp b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+index 238c20d9ad90a4048fe7e80068901cdec9f19ec9..5422dcfb463b82260d4fe57613d6951925db62a6 100644
+--- a/app/src/main/cpp/spektra/SpektraNativeJni.cpp
++++ b/app/src/main/cpp/spektra/SpektraNativeJni.cpp
+@@ -419,6 +419,16 @@ Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeProcessPac
+     return output;
+ }
+ 
++extern "C" JNIEXPORT void JNICALL
++Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeWarmUpRawOwner(
++        JNIEnv* env, jclass) {
++    std::string error;
++    if (!iris_spektra::SpektraRawVulkanOwner::instance().warmUp(&error)) {
++        jclass cls = env->FindClass("java/lang/IllegalStateException");
++        if (cls) env->ThrowNew(cls, error.empty() ? "Spektra Vulkan RAW warm-up failed" : error.c_str());
++    }
++}
++
+ extern "C" JNIEXPORT void JNICALL
+ Java_com_particlesdevs_photoncamera_spektra_SpektraRawProcessor_nativeReleaseRawOwner(
+         JNIEnv*, jclass) {
+diff --git a/app/src/main/cpp/spektra/SpektraRawVulkanOwner.cpp b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.cpp
+index 87b6a76e3f0be35a52808920b6ffc7d271fc4b8f..ed8b9498c7037fb32bca232c5ba4ae7359a60aa9 100644
+--- a/app/src/main/cpp/spektra/SpektraRawVulkanOwner.cpp
++++ b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.cpp
+@@ -2,6 +2,7 @@
+ #include "SpektraEmbeddedShaders.h"
+ 
+ #include <vulkan/vulkan.h>
++#include <android/log.h>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -15,6 +16,11 @@ namespace {
+ 
+ constexpr uint32_t kParamWords = 42u;
+ constexpr const char* kRawShaderName = "SpektraRawDevelop.comp.spv";
++constexpr uint64_t kPreviewFenceTimeoutNs = 750000000ull;
++constexpr uint64_t kSavedFenceTimeoutNs = 8000000000ull;
++#define SPEKTRA_RAW_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "SpektraRawVulkan", __VA_ARGS__)
++#define SPEKTRA_RAW_LOGW(...) __android_log_print(ANDROID_LOG_WARN, "SpektraRawVulkan", __VA_ARGS__)
++#define SPEKTRA_RAW_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "SpektraRawVulkan", __VA_ARGS__)
+ 
+ uint32_t floatBits(float v) {
+     uint32_t u = 0;
+@@ -55,13 +61,16 @@ struct SpektraRawVulkanOwner::Impl {
+     VkCommandBuffer command = VK_NULL_HANDLE;
+     VkFence fence = VK_NULL_HANDLE;
+     Buffer raw, params, lsc, output;
+-    bool initialized = false;
+-    uint64_t previewProcessed = 0;
+-    uint64_t previewDropped = 0;
+-    uint64_t previewMicrosTotal = 0;
+-    uint64_t lastStillMicros = 0;
++    std::atomic<bool> initialized{false};
++    std::atomic<bool> poisoned{false};
++    std::atomic<uint64_t> previewProcessed{0};
++    std::atomic<uint64_t> previewDropped{0};
++    std::atomic<uint64_t> previewMicrosTotal{0};
++    std::atomic<uint64_t> lastStillMicros{0};
++    std::atomic<uint64_t> gpuTimeouts{0};
++    bool firstPreviewTrace = true;
+ 
+-    ~Impl() { destroy(); }
++    ~Impl() { if (!poisoned.load(std::memory_order_acquire)) destroy(); }
+ 
+     void destroyBuffer(Buffer& b) {
+         if (device != VK_NULL_HANDLE && b.memory != VK_NULL_HANDLE && b.mapped) vkUnmapMemory(device, b.memory);
+@@ -84,7 +93,10 @@ struct SpektraRawVulkanOwner::Impl {
+         instance = VK_NULL_HANDLE; physical = VK_NULL_HANDLE; device = VK_NULL_HANDLE; queue = VK_NULL_HANDLE;
+         descriptorLayout = VK_NULL_HANDLE; pipelineLayout = VK_NULL_HANDLE; pipeline = VK_NULL_HANDLE;
+         descriptorPool = VK_NULL_HANDLE; descriptorSet = VK_NULL_HANDLE; commandPool = VK_NULL_HANDLE;
+-        command = VK_NULL_HANDLE; fence = VK_NULL_HANDLE; queueFamily = UINT32_MAX; initialized = false;
++        command = VK_NULL_HANDLE; fence = VK_NULL_HANDLE; queueFamily = UINT32_MAX;
++        initialized.store(false, std::memory_order_release);
++        poisoned.store(false, std::memory_order_release);
++        firstPreviewTrace = true;
+     }
+ 
+     bool memoryType(uint32_t typeBits, VkMemoryPropertyFlags required, uint32_t* out) const {
+@@ -150,12 +162,36 @@ struct SpektraRawVulkanOwner::Impl {
+         return true;
+     }
+ 
++    bool recoverTimedOutFence(std::string* error) {
++        if (!poisoned.load(std::memory_order_acquire)) return true;
++        if (device == VK_NULL_HANDLE || fence == VK_NULL_HANDLE) {
++            if (error) *error = "Spektra RAW owner poisoned without a recoverable fence";
++            return false;
++        }
++        const VkResult status = vkGetFenceStatus(device, fence);
++        if (status == VK_SUCCESS) {
++            poisoned.store(false, std::memory_order_release);
++            SPEKTRA_RAW_LOGI("IRIS_26687_RAW_VK_RECOVERED priorFenceCompleted=true");
++            return true;
++        }
++        if (status == VK_NOT_READY) {
++            if (error) *error = "Spektra RAW GPU job is still in flight after timeout";
++            return false;
++        }
++        if (error) *error = vkError("vkGetFenceStatus", status);
++        return false;
++    }
++
+     bool initialize(std::string* error) {
+-        if (initialized) return true;
++        if (initialized.load(std::memory_order_acquire)) return true;
++        if (poisoned.load(std::memory_order_acquire)) {
++            if (error) *error = "Spektra RAW owner is quarantined after GPU timeout";
++            return false;
++        }
+         destroy();
+         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+         app.pApplicationName = "IrisSpektraRaw";
+-        app.applicationVersion = 26686;
++        app.applicationVersion = 26687;
+         app.pEngineName = "IrisSpektraRaw";
+         app.engineVersion = 1;
+         app.apiVersion = VK_API_VERSION_1_0;
+@@ -246,7 +282,8 @@ struct SpektraRawVulkanOwner::Impl {
+         VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+         r = vkCreateFence(device, &fi, nullptr, &fence);
+         if (r != VK_SUCCESS) { if (error) *error = vkError("vkCreateFence", r); destroy(); return false; }
+-        initialized = true;
++        initialized.store(true, std::memory_order_release);
++        SPEKTRA_RAW_LOGI("IRIS_26687_RAW_VK_STAGE stage=warmup_ready");
+         return true;
+     }
+ 
+@@ -276,7 +313,11 @@ struct SpektraRawVulkanOwner::Impl {
+     }
+ 
+     bool run(const RawDevelopRequest& q, std::vector<uint8_t>* rgba16f, std::string* error) {
+-        if (!validate(q, error) || !initialize(error)) return false;
++        if (!validate(q, error) || !recoverTimedOutFence(error) || !initialize(error)) return false;
++        const bool trace = q.savedPhoto || firstPreviewTrace;
++        if (!q.savedPhoto && firstPreviewTrace) firstPreviewTrace = false;
++        if (trace) SPEKTRA_RAW_LOGI("IRIS_26687_RAW_VK_STAGE stage=dispatch_begin saved=%d out=%dx%d",
++                q.savedPhoto ? 1 : 0, q.outputWidth, q.outputHeight);
+         const size_t rawPadded = (q.sourceBytes + 3u) & ~size_t(3u);
+         const size_t lscFloats = q.lensShading && q.lensShadingRows > 0 && q.lensShadingCols > 0
+                 ? static_cast<size_t>(q.lensShadingRows) * q.lensShadingCols * 4u : 4u;
+@@ -319,8 +360,20 @@ struct SpektraRawVulkanOwner::Impl {
+         VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount=1; si.pCommandBuffers=&command;
+         r=vkQueueSubmit(queue,1,&si,fence);
+         if(r!=VK_SUCCESS){if(error)*error=vkError("vkQueueSubmit",r);return false;}
+-        r=vkWaitForFences(device,1,&fence,VK_TRUE,UINT64_MAX);
++        if (trace) SPEKTRA_RAW_LOGI("IRIS_26687_RAW_VK_STAGE stage=submitted saved=%d", q.savedPhoto ? 1 : 0);
++        const uint64_t timeoutNs = q.savedPhoto ? kSavedFenceTimeoutNs : kPreviewFenceTimeoutNs;
++        r=vkWaitForFences(device,1,&fence,VK_TRUE,timeoutNs);
++        if(r==VK_TIMEOUT){
++            poisoned.store(true,std::memory_order_release);
++            gpuTimeouts.fetch_add(1,std::memory_order_relaxed);
++            if(error){std::ostringstream out; out << "Spektra RAW GPU fence timeout saved="
++                    << (q.savedPhoto?1:0) << " timeoutNs=" << timeoutNs; *error=out.str();}
++            SPEKTRA_RAW_LOGE("IRIS_26687_RAW_VK_TIMEOUT saved=%d timeoutNs=%llu",
++                    q.savedPhoto ? 1 : 0, static_cast<unsigned long long>(timeoutNs));
++            return false;
++        }
+         if(r!=VK_SUCCESS){if(error)*error=vkError("vkWaitForFences",r);return false;}
++        if (trace) SPEKTRA_RAW_LOGI("IRIS_26687_RAW_VK_STAGE stage=fence_complete saved=%d", q.savedPhoto ? 1 : 0);
+         rgba16f->resize(outputBytes);
+         std::memcpy(rgba16f->data(),output.mapped,outputBytes);
+         return true;
+@@ -346,7 +399,7 @@ bool SpektraRawVulkanOwner::process(const RawDevelopRequest& request, std::vecto
+         impl_->savedWaiting.store(false,std::memory_order_release);
+     } else {
+         if (impl_->savedWaiting.load(std::memory_order_acquire) || !lock.try_lock()) {
+-            impl_->previewDropped++;
++            impl_->previewDropped.fetch_add(1,std::memory_order_relaxed);
+             if (previewDropped) *previewDropped=true;
+             return true;
+         }
+@@ -355,24 +408,99 @@ bool SpektraRawVulkanOwner::process(const RawDevelopRequest& request, std::vecto
+     const auto stop=std::chrono::steady_clock::now();
+     const uint64_t micros=static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(stop-start).count());
+     if (elapsedMicros) *elapsedMicros=static_cast<double>(micros);
+-    if (request.savedPhoto) impl_->lastStillMicros=micros;
+-    else if (ok) { impl_->previewProcessed++; impl_->previewMicrosTotal+=micros; }
++    if (request.savedPhoto) impl_->lastStillMicros.store(micros,std::memory_order_relaxed);
++    else if (ok) { impl_->previewProcessed.fetch_add(1,std::memory_order_relaxed); impl_->previewMicrosTotal.fetch_add(micros,std::memory_order_relaxed); }
+     return ok;
+ }
+ 
++bool SpektraRawVulkanOwner::warmUp(std::string* error) {
++    // A healthy owner has already passed a real dispatch self-test, so rapid re-entry never waits
++    // behind a saved job just to prove the Vulkan objects still exist.
++    if (impl_->initialized.load(std::memory_order_acquire)
++            && !impl_->poisoned.load(std::memory_order_acquire)) return true;
++    std::unique_lock<std::mutex> lock(impl_->workMutex, std::defer_lock);
++    if (!lock.try_lock()) {
++        if (impl_->initialized.load(std::memory_order_acquire)
++                && !impl_->poisoned.load(std::memory_order_acquire)) return true;
++        if (error) *error = "Spektra RAW owner warm-up already in progress";
++        return false;
++    }
++    if (!impl_->recoverTimedOutFence(error)) return false;
++    SPEKTRA_RAW_LOGI("IRIS_26687_RAW_VK_STAGE stage=warmup_begin");
++    if (!impl_->initialize(error)) return false;
++
++    // Execute the exact production shader/descriptor/queue/fence path before Camera2 is opened.
++    // This is intentionally tiny: it catches a driver/pipeline dispatch failure without holding a
++    // Camera2 Image or physical-camera lifecycle hostage.
++    uint16_t raw16[16] = {
++            256, 512, 256, 512,
++            512, 768, 512, 768,
++            256, 512, 256, 512,
++            512, 768, 512, 768};
++    RawDevelopRequest selfTest{};
++    selfTest.source = reinterpret_cast<const uint8_t*>(raw16);
++    selfTest.sourceBytes = sizeof(raw16);
++    selfTest.sourceWidth = 4;
++    selfTest.sourceHeight = 4;
++    selfTest.rowStride = 8;
++    selfTest.pixelStride = 2;
++    selfTest.format = 32; // ImageFormat.RAW_SENSOR
++    const int domain[4] = {0, 0, 4, 4};
++    std::memcpy(selfTest.rawBounds, domain, sizeof(domain));
++    std::memcpy(selfTest.sourceCrop, domain, sizeof(domain));
++    std::memcpy(selfTest.activeRawDomain, domain, sizeof(domain));
++    selfTest.cfaArrangement = 0;
++    selfTest.bayerOffset = 0;
++    selfTest.whiteLevel = 1023;
++    const float identity[9] = {1.f,0.f,0.f, 0.f,1.f,0.f, 0.f,0.f,1.f};
++    std::memcpy(selfTest.sensorToLinearSrgb, identity, sizeof(identity));
++    selfTest.outputWidth = 2;
++    selfTest.outputHeight = 2;
++    selfTest.savedPhoto = false;
++    selfTest.chromaDenoiseStrength = 0.0f;
++    selfTest.sensorClipThreshold = 0.985f;
++
++    std::vector<uint8_t> output;
++    const bool priorTrace = impl_->firstPreviewTrace;
++    impl_->firstPreviewTrace = false;
++    const bool ok = impl_->run(selfTest, &output, error);
++    impl_->firstPreviewTrace = priorTrace;
++    if (!ok) {
++        SPEKTRA_RAW_LOGE("IRIS_26687_RAW_VK_WARMUP_SELFTEST_FAIL");
++        return false;
++    }
++    if (output.size() != 2u * 2u * 8u) {
++        if (error) *error = "Spektra RAW warm-up self-test output size mismatch";
++        SPEKTRA_RAW_LOGE("IRIS_26687_RAW_VK_WARMUP_SELFTEST_FAIL size=%zu", output.size());
++        return false;
++    }
++    SPEKTRA_RAW_LOGI("IRIS_26687_RAW_VK_WARMUP_SELFTEST_PASS bytes=%zu", output.size());
++    return true;
++}
++
+ void SpektraRawVulkanOwner::release() {
+-    std::lock_guard<std::mutex> lock(impl_->workMutex);
++    std::unique_lock<std::mutex> lock(impl_->workMutex,std::defer_lock);
++    if (!lock.try_lock()) {
++        SPEKTRA_RAW_LOGW("IRIS_26687_RAW_VK_RELEASE_DEFERRED reason=work_in_flight");
++        return;
++    }
++    std::string recoveryError;
++    if (!impl_->recoverTimedOutFence(&recoveryError)) {
++        SPEKTRA_RAW_LOGW("IRIS_26687_RAW_VK_RELEASE_DEFERRED reason=poisoned_in_flight");
++        return;
++    }
+     impl_->destroy();
+ }
+ 
+ void SpektraRawVulkanOwner::stats(uint64_t out[6]) {
+-    std::lock_guard<std::mutex> lock(impl_->workMutex);
+-    out[0]=impl_->previewProcessed;
+-    out[1]=impl_->previewDropped;
+-    out[2]=impl_->previewProcessed ? impl_->previewMicrosTotal/impl_->previewProcessed : 0;
+-    out[3]=impl_->lastStillMicros;
+-    out[4]=impl_->initialized ? 1u : 0u;
+-    out[5]=impl_->initialized ? 4u : 0u;
++    const uint64_t processed=impl_->previewProcessed.load(std::memory_order_relaxed);
++    const uint64_t total=impl_->previewMicrosTotal.load(std::memory_order_relaxed);
++    out[0]=processed;
++    out[1]=impl_->previewDropped.load(std::memory_order_relaxed);
++    out[2]=processed ? total/processed : 0;
++    out[3]=impl_->lastStillMicros.load(std::memory_order_relaxed);
++    out[4]=impl_->initialized.load(std::memory_order_acquire) ? 1u : 0u;
++    out[5]=impl_->initialized.load(std::memory_order_acquire) ? 4u : 0u;
+ }
+ 
+ } // namespace iris_spektra
+diff --git a/app/src/main/cpp/spektra/SpektraRawVulkanOwner.h b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.h
+index 693584f510428f5de2b25c603a23f2fc9af69a68..a4505c81d6f54985d17e678cc714bb738d4cd9ee 100644
+--- a/app/src/main/cpp/spektra/SpektraRawVulkanOwner.h
++++ b/app/src/main/cpp/spektra/SpektraRawVulkanOwner.h
+@@ -36,6 +36,7 @@ struct RawDevelopRequest {
+ class SpektraRawVulkanOwner {
+ public:
+     static SpektraRawVulkanOwner& instance();
++    bool warmUp(std::string* error);
+     bool process(const RawDevelopRequest& request, std::vector<uint8_t>* rgba16f, bool* previewDropped,
+                  double* elapsedMicros, std::string* error);
+     void release();
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index e6f94e82f5815f07e110a44f4d5b73ade8c1e8e0..b40ae06e3f8181dedb5beea6b472ade172a94650 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -92,7 +92,7 @@ import com.particlesdevs.photoncamera.processing.parameters.IrisNightExposureSel
+ import com.particlesdevs.photoncamera.processing.parameters.IrisNightFrameSelector;
+ import com.particlesdevs.photoncamera.processing.parameters.ResolutionSolution;
+ import com.particlesdevs.photoncamera.settings.PreferenceKeys;
+-import com.particlesdevs.photoncamera.spektra.SpektraCameraOwner;
++import com.particlesdevs.photoncamera.spektra.SpektraModeController;
+ import com.particlesdevs.photoncamera.ui.camera.CameraFragment;
+ import com.particlesdevs.photoncamera.ui.camera.viewmodel.TimerFrameCountViewModel;
+ import com.particlesdevs.photoncamera.ui.camera.views.viewfinder.AutoFitPreviewView;
+@@ -154,7 +154,7 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+     private static final String TAG = CaptureController.class.getSimpleName();
+     public List<Future<?>> taskResults = new ArrayList<>();
+     private final ExecutorService processExecutor;
+-    private final SpektraCameraOwner spektraCameraOwner;
++    private final SpektraModeController spektraModeController;
+     /**
+      * Camera state: Showing camera preview.
+      */
+@@ -1128,7 +1128,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+     };
+-    public CaptureController(Activity activity, ExecutorService processExecutor, CameraEventsListener cameraEventsListener) {
++    public CaptureController(Activity activity, ExecutorService processExecutor, CameraEventsListener cameraEventsListener,
++            SpektraModeController.Host spektraHost) {
+         if(PhotonCamera.getSettings().previewFormat != 0) {
+             mPreviewTargetFormat = PhotonCamera.getSettings().previewFormat;
+         } else {
+@@ -1142,7 +1143,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         PreferenceKeys.addIds(mCameraManager2.getCameraIdList());
+ 
+         this.processExecutor = processExecutor;
+-        this.spektraCameraOwner = new SpektraCameraOwner(activity, processExecutor, cameraEventsListener);
++        this.spektraModeController = new SpektraModeController(activity, cameraEventsListener, spektraHost);
+         this.paramController = new ParamController(this);
+ 
+         this.fillInCameraCharacteristics();
+@@ -1154,7 +1155,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * resumeCamera must never manufacture a detached GLPreview as a fallback. */
+     public void bindPreviewTextureView(@NonNull GLPreview previewView) {
+         this.mTextureView = previewView;
+-        spektraCameraOwner.bindLegacyPreview(previewView);
+         Log.i(TAG, "IRIS_26608_PREVIEW_VIEW_BOUND identity="
+                 + System.identityHashCode(previewView)
+                 + " attached=" + previewView.isAttachedToWindow());
+@@ -1162,15 +1162,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+     // IRIS_26681_SPEKTRA_PREVIEW_SURFACE_BINDING
+     public void bindSpektraPreviewSurface(@NonNull SurfaceView previewView) {
+-        spektraCameraOwner.bindPreviewSurface(previewView);
+-        spektraCameraOwner.bindLegacyPreview(mTextureView);
+-        Log.i(TAG, "IRIS_26681_SPEKTRA_PREVIEW_SURFACE_BOUND identity="
++        spektraModeController.bindPreviewSurface(previewView);
++        Log.i(TAG, "IRIS_26687_SPEKTRA_PREVIEW_SURFACE_BOUND identity="
+                 + System.identityHashCode(previewView));
+     }
+ 
+-    public SpektraCameraOwner getSpektraCameraOwner() {
+-        return spektraCameraOwner;
+-    }
++    public SpektraModeController getSpektraModeController() { return spektraModeController; }
++
++    public void shutdownSpektraMode() { spektraModeController.shutdown(); }
+ 
+     public boolean isSpektraModeActive() {
+         return getAuthoritativeCameraMode() == CameraMode.SPEKTRA;
+@@ -1194,11 +1193,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     /** Spektra owns Camera2 exclusively; legacy Iris may remain a UI surface but never open a camera. */
+     private boolean iris26684BlockLegacyCameraForSpektra(String entryPoint) {
+         final CameraMode mode = getAuthoritativeCameraMode();
+-        final boolean ownerActive = spektraCameraOwner != null && spektraCameraOwner.isActive();
++        final boolean ownerActive = spektraModeController != null && spektraModeController.isActive();
+         if (mode == CameraMode.SPEKTRA || ownerActive) {
+             Log.i(TAG, "IRIS_26684_SPEKTRA_LEGACY_CAMERA_BLOCK entry=" + entryPoint
+                     + " mode=" + mode + " ownerActive=" + ownerActive
+-                    + " ownerState=" + (spektraCameraOwner == null ? "null" : spektraCameraOwner.getState()));
++                    + " ownerState=" + (spektraModeController == null ? "null" : spektraModeController.debugStatus()));
+             return true;
+         }
+         return false;
+@@ -1448,10 +1447,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      */
+     public void closeCamera() {
+         final boolean spektraSelected = getAuthoritativeCameraMode() == CameraMode.SPEKTRA;
+-        if (spektraCameraOwner.isActive() || spektraSelected) {
+-            final boolean retired = spektraCameraOwner.retireForHandoff();
+-            Log.i(TAG, "IRIS_26681_SPEKTRA_CLOSE_DELEGATE selected=" + spektraSelected
+-                    + " retired=" + retired);
++        if (spektraModeController.isActive() || spektraSelected) {
++            spektraModeController.exitForModeHandoff();
++            Log.i(TAG, "IRIS_26687_SPEKTRA_CLOSE_DELEGATE selected=" + spektraSelected
++                    + " retired=true");
+             if (spektraSelected) return;
+         }
+         try {
+@@ -4161,15 +4160,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             @NonNull CameraMode nextMode) {
+         if (previousMode == nextMode) return;
+ 
+-        if (previousMode == CameraMode.SPEKTRA || spektraCameraOwner.isActive()) {
+-            final boolean retired = spektraCameraOwner.retireForHandoff();
+-            Log.i(TAG, "IRIS_26682_MODE_OWNER_RETIRED from=" + previousMode
+-                    + " to=" + nextMode + " owner=SPEKTRA retired=" + retired);
+-            if (!retired) {
+-                throw new IllegalStateException("Spektra owner did not retire before mode handoff");
+-            }
++        if (previousMode == CameraMode.SPEKTRA) {
++            spektraModeController.exitForModeHandoff();
++            Log.i(TAG, "IRIS_26687_MODE_OWNER_RETIRED from=" + previousMode
++                    + " to=" + nextMode + " owner=SPEKTRA retired=true failContained=true");
+             return;
+         }
++        if (spektraModeController.isActive()) {
++            // A stale duplicate owner must be neutralized, but it must never suppress retirement
++            // of the authoritative legacy source owner below.
++            spektraModeController.exitForModeHandoff();
++            Log.w(TAG, "IRIS_26687_STALE_SPEKTRA_OWNER_RETIRED authoritativeSource="
++                    + previousMode + " destination=" + nextMode);
++        }
+ 
+         if (CaptureController.isProcessing) {
+             throw new IllegalStateException("Mode handoff attempted while legacy processing owns camera state");
+@@ -4232,12 +4235,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final CameraMode authoritativeMode = getAuthoritativeCameraMode();
+         CameraFragment.mSelectedMode = authoritativeMode;
+         final boolean spektraTarget = authoritativeMode == CameraMode.SPEKTRA;
+-        if (spektraCameraOwner.isActive()) {
+-            final boolean retired = spektraCameraOwner.retireForHandoff();
+-            if (!retired) {
+-                Log.e(TAG, "IRIS_26681_SPEKTRA_RESTART_ABORT reason=retire_timeout target=" + CameraFragment.mSelectedMode);
+-                return;
+-            }
++        if (spektraModeController.isActive()) {
++            spektraModeController.exitForModeHandoff();
++            Log.i(TAG, "IRIS_26687_SPEKTRA_RESTART_RETIRED target=" + CameraFragment.mSelectedMode);
+         }
+         if (spektraTarget) {
+             // Retire the legacy Camera2 owner with the same concrete objects it normally closes,
+@@ -4266,10 +4266,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             } finally {
+                 if (iris26681LegacyLockAcquired) mCameraOpenCloseLock.release();
+             }
+-            spektraCameraOwner.setSelectedCameraId(PhotonCamera.getSettings().mCameraID);
+-            spektraCameraOwner.setFlashPreference(PreferenceKeys.getAeMode());
+-            Log.i(TAG, "IRIS_26681_SPEKTRA_RESTART_DELEGATE camera=" + PhotonCamera.getSettings().mCameraID);
+-            spektraCameraOwner.restartCamera();
++            Log.i(TAG, "IRIS_26687_SPEKTRA_RESTART_DELEGATE camera=" + PhotonCamera.getSettings().mCameraID);
++            spektraModeController.restart(PhotonCamera.getSettings().mCameraID, PreferenceKeys.getAeMode());
+             return;
+         }
+         try {
+@@ -5006,20 +5004,20 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     public void takePicture() {
+         final CameraMode iris26555Mode = getAuthoritativeCameraMode();
+         if (iris26555Mode == CameraMode.SPEKTRA) {
+-            if (!spektraCameraOwner.isStreaming()) {
+-                Log.e(TAG, "IRIS_26683_SPEKTRA_SHUTTER_FAIL_CLOSED state="
+-                        + spektraCameraOwner.getState());
+-                iris26679RejectShutter("SPEKTRA_OWNER_NOT_STREAMING",
++            if (!spektraModeController.isShutterReady()) {
++                Log.e(TAG, "IRIS_26687_SPEKTRA_SHUTTER_FAIL_CLOSED status="
++                        + spektraModeController.debugStatus());
++                iris26679RejectShutter("SPEKTRA_NOT_SHUTTER_READY",
+                         "Spektra camera is still preparing");
+                 return;
+             }
+-            Log.i(TAG, "IRIS_26681_SPEKTRA_SHUTTER_DELEGATE state=" + spektraCameraOwner.getState());
+-            spektraCameraOwner.takePicture();
++            Log.i(TAG, "IRIS_26687_SPEKTRA_SHUTTER_DELEGATE status=" + spektraModeController.debugStatus());
++            spektraModeController.takePicture();
+             return;
+         }
+-        if (spektraCameraOwner.isActive()) {
++        if (spektraModeController.isActive()) {
+             Log.e(TAG, "IRIS_26683_MODE_OWNER_DIVERGENCE mode=" + iris26555Mode
+-                    + " spektraState=" + spektraCameraOwner.getState());
++                    + " spektraStatus=" + spektraModeController.debugStatus());
+             iris26679RejectShutter("MODE_OWNER_DIVERGENCE",
+                     "Camera mode is changing; try again");
+             return;
+@@ -9908,7 +9906,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+     public void reset3Aparams() {
+         if (isSpektraModeActive()) {
+-            spektraCameraOwner.setFlashPreference(PreferenceKeys.getAeMode());
++            spektraModeController.setFlashPreference(PreferenceKeys.getAeMode());
+             return;
+         }
+         setAEMode(mPreviewRequestBuilder, PreferenceKeys.getAeMode());
+@@ -9918,7 +9916,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+     public void setPreviewAEModeRebuild(int aeMode) {
+         if (isSpektraModeActive()) {
+-            spektraCameraOwner.setFlashPreference(aeMode);
++            spektraModeController.setFlashPreference(aeMode);
+             return;
+         }
+         setAEMode(mPreviewRequestBuilder, aeMode);
+@@ -9935,7 +9933,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+     public void resetPreviewAEMode() {
+         if (isSpektraModeActive()) {
+-            spektraCameraOwner.setFlashPreference(PreferenceKeys.getAeMode());
++            spektraModeController.setFlashPreference(PreferenceKeys.getAeMode());
+             return;
+         }
+         setAEMode(mPreviewRequestBuilder, PreferenceKeys.getAeMode());
+@@ -10116,10 +10114,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+     public void resumeCamera() {
+         if (getAuthoritativeCameraMode() == CameraMode.SPEKTRA) {
+-            spektraCameraOwner.setSelectedCameraId(PhotonCamera.getSettings().mCameraID);
+-            spektraCameraOwner.setFlashPreference(PreferenceKeys.getAeMode());
+-            Log.i(TAG, "IRIS_26681_SPEKTRA_RESUME_DELEGATE camera=" + PhotonCamera.getSettings().mCameraID);
+-            spektraCameraOwner.resumeCamera();
++            Log.i(TAG, "IRIS_26687_SPEKTRA_RESUME_DELEGATE camera=" + PhotonCamera.getSettings().mCameraID);
++            spektraModeController.resume(PhotonCamera.getSettings().mCameraID, PreferenceKeys.getAeMode());
+             return;
+         }
+         if(PhotonCamera.getSettings().previewFormat != 0) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java b/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java
+index b3eefe44002b89792bede32926bc023c449284b7..0597df3b9a29621f82ae74233286474c21fb83dd 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/control/TouchFocus.java
+@@ -128,7 +128,7 @@ public class TouchFocus {
+             if (width <= 0 || height <= 0) return;
+             float nx = Math.max(0f, Math.min(1f, previewX / (float) width));
+             float ny = Math.max(0f, Math.min(1f, previewY / (float) height));
+-            captureController.getSpektraCameraOwner().touchFocus(nx, ny, lockRequested);
++            captureController.getSpektraModeController().touchFocus(nx, ny, lockRequested);
+             isTouchFocus = true;
+             focusLocked = lockRequested;
+             Log.d(TAG, "IRIS_26681_SPEKTRA_TOUCH_FOCUS normalized=" + nx + "," + ny
+@@ -295,7 +295,7 @@ public class TouchFocus {
+         focusLocked = false;
+         activeTouchRegion = null;
+         if (captureController.isSpektraModeActive()) {
+-            captureController.getSpektraCameraOwner().unlockFocus();
++            captureController.getSpektraModeController().unlockFocus();
+             iris26679PendingAutoFocusReset = false;
+             isTouchFocus = false;
+             Log.d(TAG, "IRIS_26681_SPEKTRA_TOUCH_AF_RESET");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/manual/ParamController.java b/app/src/main/java/com/particlesdevs/photoncamera/manual/ParamController.java
+index c0e40009c04bff175a226353aa1ddede63355395..63a275996111df70d07f70462eb14e18f1897d22 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/manual/ParamController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/manual/ParamController.java
+@@ -53,7 +53,7 @@ public class ParamController implements Observer {
+     private void applySpektraExposure(int isoValue, long exposureValue) {
+         Integer iso = isoValue == ManualParamModel.ISO_AUTO ? null : isoValue;
+         Long exposureNs = exposureValue == ManualParamModel.EXPOSURE_AUTO ? null : exposureValue;
+-        captureController.getSpektraCameraOwner().setManualControls(iso, exposureNs, EV);
++        captureController.getSpektraModeController().setManualControls(iso, exposureNs, EV);
+     }
+ 
+     public void setShutter(long shutterNs, int currentISO) {
+@@ -106,7 +106,7 @@ public class ParamController implements Observer {
+ 
+     public void setFocus(float focusDist) {
+         if (captureController.isSpektraModeActive()) {
+-            captureController.getSpektraCameraOwner().setManualFocus(
++            captureController.getSpektraModeController().setManualFocus(
+                     focusDist == ManualParamModel.FOCUS_AUTO ? null : focusDist);
+             return;
+         }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+index b2cfab5c8bd8560e1c86e4378b7d052c53eb6307..a99b5f0aaedc66407f39a5e60cf3a15009064d09 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+@@ -32,14 +32,12 @@ import android.util.Rational;
+ import android.util.Size;
+ import android.view.Surface;
+ import android.view.SurfaceView;
+-import android.view.View;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+ import androidx.core.app.ActivityCompat;
+ 
+ import com.particlesdevs.photoncamera.api.CameraEventsListener;
+-import com.particlesdevs.photoncamera.capture.CaptureController;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+ import java.io.File;
+@@ -57,6 +55,7 @@ import java.util.concurrent.CountDownLatch;
+ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
+ import java.util.concurrent.atomic.AtomicLong;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ /**
+  * Independent Camera2 owner for CameraMode.SPEKTRA.
+@@ -65,23 +64,26 @@ import java.util.concurrent.atomic.AtomicLong;
+  * is referenced from this class. Spektra auto-discovers and persists only its own Camera2 RAW
+  * lens profile; Photo/Motion/Night IQ profiles are never imported.
+  */
+-public final class SpektraCameraOwner {
++final class SpektraCameraOwner {
+     private static final String TAG = "SpektraCameraOwner";
+     private static final int TARGET_PREVIEW_FPS = 30;
+     private static final int PREVIEW_SHORT_EDGE_DEFAULT = 480;
+     private static final long CAMERA_OPEN_TIMEOUT_MS = 4000L;
++    private static final long RAW_GPU_WARMUP_TIMEOUT_MS = 10000L;
+     private static final long PREVIEW_CONFIG_TIMEOUT_MS = 4000L;
+     private static final long PREVIEW_FIRST_FRAME_TIMEOUT_MS = 6500L;
+     private static final long STILL_CONFIG_TIMEOUT_MS = 4500L;
+     private static final long STILL_CAPTURE_TIMEOUT_MS = 6500L;
+-    private static final int SPEKTRA_PROFILE_SCHEMA = 26686;
++    private static final int SPEKTRA_PROFILE_SCHEMA = 26687;
+ 
+     public enum State {
+         IDLE, OPENING, CONFIGURING, STREAMING,
+-        STILL_CONFIGURING, STILL_CAPTURING, STILL_CAPTURED, STILL_FAILED, PROCESSING,
++        STILL_CONFIGURING, STILL_CAPTURING, STILL_CAPTURED, STILL_FAILED,
+         PREVIEW_RECONFIGURING, FAILED, CLOSED
+     }
+ 
++    private enum CaptureJobState { IDLE, PROCESSING }
++
+     private static final class Route {
+         final String requestedId;
+         final String openedId;
+@@ -101,7 +103,18 @@ public final class SpektraCameraOwner {
+ 
+     private final Activity activity;
+     private final CameraManager cameraManager;
+-    private final ExecutorService processExecutor;
++    /** Saved-photo processing belongs only to Spektra and never shares Iris processing state. */
++    private final ExecutorService savedProcessExecutor = Executors.newSingleThreadExecutor(r -> {
++        Thread t = new Thread(r, "SpektraSavedProcess");
++        t.setDaemon(true);
++        return t;
++    });
++    /** Native teardown is isolated from Camera2/UI teardown and is always non-blocking. */
++    private final ExecutorService nativeLifecycleExecutor = Executors.newSingleThreadExecutor(r -> {
++        Thread t = new Thread(r, "SpektraNativeLifecycle");
++        t.setDaemon(true);
++        return t;
++    });
+     /** VF-S RAW reconstruction must never run on the Camera2 callback thread. */
+     private final ExecutorService previewDecodeExecutor = Executors.newSingleThreadExecutor(r -> {
+         Thread t = new Thread(r, "SpektraVfsRawDecode");
+@@ -109,7 +122,13 @@ public final class SpektraCameraOwner {
+         return t;
+     });
+     private final AtomicBoolean previewDecodeBusy = new AtomicBoolean(false);
++    /** True only after a real Spektra frame from the current generation reached the SurfaceView. */
++    private final AtomicBoolean previewPresented = new AtomicBoolean(false);
+     private final CameraEventsListener events;
++    private final SpektraModeController.Host host;
++    private final AtomicReference<CaptureJobState> captureJobState =
++            new AtomicReference<>(CaptureJobState.IDLE);
++    private final AtomicReference<SpektraShot> pendingSavedShot = new AtomicReference<>(null);
+     private final AtomicLong generation = new AtomicLong(0L);
+     private final Object stateLock = new Object();
+     private final SharedPreferences lensProfiles;
+@@ -123,7 +142,6 @@ public final class SpektraCameraOwner {
+     private Handler cameraHandler;
+     private Executor cameraExecutor;
+     private SurfaceView previewSurfaceView;
+-    private View legacyPreviewView;
+     private CameraDevice cameraDevice;
+     private CameraCaptureSession session;
+     private ImageReader previewReader;
+@@ -182,11 +200,14 @@ public final class SpektraCameraOwner {
+     private boolean loggedPreviewRawContract = false;
+     private boolean loggedStillRawContract = false;
+     private boolean loggedPreviewWaitWb = false;
++    /** Camera transport evidence is separate from processor health; never poison discovery on GPU failure. */
++    private volatile boolean currentStreamRawSeen = false;
++    private volatile boolean currentStreamResultSeen = false;
+ 
+-    public SpektraCameraOwner(Activity activity, ExecutorService processExecutor, CameraEventsListener events) {
++    SpektraCameraOwner(Activity activity, CameraEventsListener events, SpektraModeController.Host host) {
+         this.activity = activity;
+-        this.processExecutor = processExecutor;
+         this.events = events;
++        this.host = host;
+         this.cameraManager = (CameraManager) activity.getSystemService(Context.CAMERA_SERVICE);
+         this.lensProfiles = activity.getSharedPreferences("spektra_auto_lens_discovery", Context.MODE_PRIVATE);
+     }
+@@ -194,11 +215,6 @@ public final class SpektraCameraOwner {
+     public void bindPreviewSurface(@NonNull SurfaceView surfaceView) {
+         previewSurfaceView = surfaceView;
+         previewSurfaceView.setZOrderOnTop(false);
+-        previewSurfaceView.setVisibility(View.GONE);
+-    }
+-
+-    public void bindLegacyPreview(@Nullable View legacyPreview) {
+-        legacyPreviewView = legacyPreview;
+     }
+ 
+     public void setSelectedCameraId(@Nullable String cameraId) {
+@@ -216,23 +232,67 @@ public final class SpektraCameraOwner {
+                 && !verificationCaptureInFlight;
+     }
+ 
+-    @SuppressLint("MissingPermission")
+-    public void resumeCamera() {
+-        final long g = generation.incrementAndGet();
+-        activeGeneration = g;
+-        ensureThread();
+-        cameraHandler.post(() -> openForPreview(g, false));
++    public boolean isShutterReady() {
++        return isStreaming() && previewPresented.get()
++                && captureJobState.get() == CaptureJobState.IDLE;
+     }
+ 
++    public String describeStatus() {
++        return getState() + "/presented=" + previewPresented.get()
++                + "/job=" + captureJobState.get()
++                + "/verify=" + currentProfileNeedsVerification
++                + "/verifyCapture=" + verificationCaptureInFlight;
++    }
++
++    @SuppressLint("MissingPermission")
++    public void resumeCamera() { startCamera(false); }
++
+     @SuppressLint("MissingPermission")
+-    public void restartCamera() {
++    public void restartCamera() { startCamera(true); }
++
++    private void startCamera(boolean restart) {
+         final long g = generation.incrementAndGet();
+         activeGeneration = g;
++        previewPresented.set(false);
+         ensureThread();
+-        cameraHandler.post(() -> {
+-            closeCameraObjects(false);
+-            activity.runOnUiThread(events::onCameraRestarted);
+-            openForPreview(g, true);
++        Handler h = cameraHandler;
++        if (h == null) {
++            failProcessor(g, "CAMERA_THREAD_UNAVAILABLE", null);
++            return;
++        }
++        h.post(() -> {
++            if (!isCurrent(g)) return;
++            if (restart) {
++                closeCameraObjects(false);
++                activity.runOnUiThread(events::onCameraRestarted);
++            }
++            host.onSpektraPreviewPreparing();
++            setState(State.OPENING);
++            armFatalWatchdog(g, State.OPENING, RAW_GPU_WARMUP_TIMEOUT_MS, "RAW_GPU_WARMUP_TIMEOUT");
++            try {
++                previewDecodeExecutor.execute(() -> {
++                    Throwable warmupFailure = null;
++                    try {
++                        Log.i(TAG, "IRIS_26687_SPEKTRA_RAW_OWNER_WARMUP_BEGIN generation=" + g);
++                        SpektraRawProcessor.warmUpNativeOwner();
++                        Log.i(TAG, "IRIS_26687_SPEKTRA_RAW_OWNER_WARMUP_PASS generation=" + g);
++                    } catch (Throwable t) {
++                        warmupFailure = t;
++                    }
++                    final Throwable failure = warmupFailure;
++                    Handler camera = cameraHandler;
++                    if (camera != null) camera.post(() -> {
++                        if (!isCurrent(g)) return;
++                        if (failure != null) {
++                            failProcessor(g, "RAW_GPU_WARMUP_FAILED", failure);
++                            return;
++                        }
++                        openForPreview(g, restart);
++                    });
++                });
++            } catch (RuntimeException rejected) {
++                failProcessor(g, "RAW_GPU_WARMUP_QUEUE_REJECTED", rejected);
++            }
+         });
+     }
+ 
+@@ -253,6 +313,7 @@ public final class SpektraCameraOwner {
+      * This is intentionally blocking only at mode/lifecycle handoff boundaries, never in capture.
+      */
+     public boolean retireForHandoff() {
++        startPendingSavedProcess("mode_handoff");
+         automaticDiscoveryActive = false;
+         automaticDiscoveryRoute = null;
+         automaticDiscoveryQueue.clear();
+@@ -269,18 +330,45 @@ public final class SpektraCameraOwner {
+         });
+         try {
+             final boolean completed = done.await(2500L, TimeUnit.MILLISECONDS);
+-            if (!completed) Log.e(TAG, "IRIS_26681_SPEKTRA_HANDOFF_TIMEOUT generation=" + retired);
+-            return completed;
++            if (completed) return true;
++            Log.e(TAG, "IRIS_26687_SPEKTRA_HANDOFF_TIMEOUT generation=" + retired
++                    + " action=force_transport_close");
++            forceCloseCameraTransportForHandoff();
++            host.onSpektraPreviewStopped();
++            setState(State.CLOSED);
++            return true;
+         } catch (InterruptedException e) {
+             Thread.currentThread().interrupt();
+-            Log.e(TAG, "IRIS_26681_SPEKTRA_HANDOFF_INTERRUPTED", e);
+-            return false;
++            Log.e(TAG, "IRIS_26687_SPEKTRA_HANDOFF_INTERRUPTED action=force_transport_close", e);
++            forceCloseCameraTransportForHandoff();
++            host.onSpektraPreviewStopped();
++            setState(State.CLOSED);
++            return true;
+         }
+     }
+ 
+     public void shutdown() {
+         retireForHandoff();
++        watchdogExecutor.shutdownNow();
+         previewDecodeExecutor.shutdownNow();
++        startPendingSavedProcess("shutdown");
++        savedProcessExecutor.shutdown();
++        try {
++            nativeLifecycleExecutor.execute(() -> {
++                try {
++                    if (!savedProcessExecutor.awaitTermination(30L, TimeUnit.SECONDS)) {
++                        Log.w(TAG, "IRIS_26687_SPEKTRA_NATIVE_RELEASE_DEFERRED savedJobStillActive=true");
++                        return;
++                    }
++                } catch (InterruptedException e) {
++                    Thread.currentThread().interrupt();
++                    return;
++                }
++                SpektraRawProcessor.releaseNativeOwner();
++                SpektraFilmRenderer.releaseProcessRenderer();
++            });
++        } catch (RuntimeException ignored) {}
++        nativeLifecycleExecutor.shutdown();
+         HandlerThread t = cameraThread;
+         if (t != null) {
+             t.quitSafely();
+@@ -387,13 +475,16 @@ public final class SpektraCameraOwner {
+             return;
+         }
+         h.post(() -> {
+-            if (state != State.STREAMING || cameraDevice == null || session == null || characteristics == null) {
+-                rejectShutter("SPEKTRA_SESSION_NOT_STREAMING");
++            if (!isShutterReady()) {
++                rejectShutter("SPEKTRA_NOT_SHUTTER_READY");
+                 return;
+             }
+-            if (currentProfileNeedsVerification || verificationCaptureInFlight
+-                    || !lensProfiles.getBoolean(lensProfileKey() + ".captureVerified", false)) {
+-                rejectShutter("SPEKTRA_PROFILE_VERIFYING");
++            if (cameraDevice == null || session == null || characteristics == null) {
++                rejectShutter("SPEKTRA_TRANSPORT_NOT_READY");
++                return;
++            }
++            if (!lensProfiles.getBoolean(lensProfileKey() + ".captureVerified", false)) {
++                rejectShutter("SPEKTRA_PROFILE_NOT_VERIFIED");
+                 return;
+             }
+             setState(State.STILL_CONFIGURING);
+@@ -443,7 +534,7 @@ public final class SpektraCameraOwner {
+             requestedExposureNs = exposureController.getCurrentExposureNs();
+             if (previewRenderer == null) {
+                 previewRenderer = new SpektraPreviewRenderer(activity, previewSurfaceView,
+-                        this::onFirstPreviewFramePresented);
++                        this::onFirstPreviewFramePresented, this::onPreviewRenderFailure);
+             }
+             previewRenderer.configure(characteristics, previewSize, previewProcessSize, rawFormat);
+             activity.runOnUiThread(() -> {
+@@ -451,10 +542,6 @@ public final class SpektraCameraOwner {
+                 events.onCharacteristicsUpdated(characteristics);
+                 events.onOpenCamera(cameraManager);
+             });
+-            // Keep the legacy viewfinder visible until the first validated Spektra frame is
+-            // actually posted. This prevents a stale SurfaceView buffer from masquerading as a
+-            // live Spektra preview during ownership handoff.
+-            preparePreviewPresentation();
+             Log.i(TAG, "IRIS_26684_SPEKTRA_OPEN " + route + " rawFormat=" + rawFormat
+                     + " rawStream=" + previewSize + " vfS=" + previewProcessSize
+                     + " still=" + stillSize + " fps=" + TARGET_PREVIEW_FPS + " generation=" + g);
+@@ -574,7 +661,7 @@ public final class SpektraCameraOwner {
+                 lensProfiles.edit().clear()
+                         .putInt("profileSchema", SPEKTRA_PROFILE_SCHEMA)
+                         .putString("topologyFingerprint", fingerprint).apply();
+-                Log.i(TAG, "IRIS_26686_SPEKTRA_DISCOVERY_INVALIDATE priorSchema=" + priorSchema
++                Log.i(TAG, "IRIS_26687_SPEKTRA_DISCOVERY_INVALIDATE priorSchema=" + priorSchema
+                         + " topologyChanged=" + !fingerprint.equals(prior));
+             }
+             SharedPreferences.Editor e = lensProfiles.edit();
+@@ -768,7 +855,10 @@ public final class SpektraCameraOwner {
+     private void configurePreviewSession(long g, boolean restoringAfterStill) {
+         if (!isCurrent(g) || cameraDevice == null) return;
+         setState(restoringAfterStill ? State.PREVIEW_RECONFIGURING : State.CONFIGURING);
++        previewPresented.set(false);
+         if (previewRenderer != null) previewRenderer.beginPreviewSession();
++        currentStreamRawSeen = false;
++        currentStreamResultSeen = false;
+         closeSessionAndReaders();
+         previewReader = ImageReader.newInstance(previewSize.getWidth(), previewSize.getHeight(), rawFormat, 4);
+         previewReader.setOnImageAvailableListener(reader -> onRawAvailable(reader, g), cameraHandler);
+@@ -847,6 +937,7 @@ public final class SpektraCameraOwner {
+         try {
+             validateRawImageContract(image, "preview", !loggedPreviewRawContract);
+             loggedPreviewRawContract = true;
++            currentStreamRawSeen = true;
+         } catch (Throwable t) {
+             image.close();
+             Log.e(TAG, "IRIS_26685_SPEKTRA_PREVIEW_RAW_CONTRACT_FAILED", t);
+@@ -894,8 +985,8 @@ public final class SpektraCameraOwner {
+                 SpektraRawFrame decoded = null;
+                 Throwable failure = null;
+                 try {
+-                    // The Camera2 Image stays owned and open through native Vulkan RAW processing.
+-                    // First-run discovery may be meter-only until Bayer origin is proven.
++                    // copyPreviewFrom detaches packed RAW and closes the Camera2 Image before
++                    // native Vulkan processing. First-run discovery may be meter-only until Bayer origin is proven.
+                     SpektraFrameMetadata nativeMetadata = null;
+                     float[] nativeMatrix = null;
+                     if (previewBayerOffset >= 0 && previewBayerOffset <= 3 && baseMetadata.neutral3 != null) {
+@@ -931,8 +1022,12 @@ public final class SpektraCameraOwner {
+                 h.post(() -> {
+                     previewDecodeBusy.set(false);
+                     if (!isCurrent(g) || state != State.STREAMING) return;
+-                    if (error != null || frame == null) {
+-                        Log.e(TAG, "IRIS_26685_SPEKTRA_PREVIEW_NATIVE_DECODE_FAILED", error);
++                    if (error != null) {
++                        failProcessor(g, "RAW_PREVIEW_PROCESS_FAILED", error);
++                        return;
++                    }
++                    if (frame == null) {
++                        failProcessor(g, "RAW_PREVIEW_PROCESS_RETURNED_NULL", null);
+                         return;
+                     }
+                     if (frame.width != previewProcessSize.getWidth() || frame.height != previewProcessSize.getHeight()) {
+@@ -956,6 +1051,7 @@ public final class SpektraCameraOwner {
+             if (s != session || state != State.STREAMING) return;
+             Long ts = result.get(TotalCaptureResult.SENSOR_TIMESTAMP);
+             if (ts == null) return;
++            currentStreamResultSeen = true;
+             Image image = previewImages.get(ts);
+             if (image != null) {
+                 previewImages.remove(ts);
+@@ -982,7 +1078,7 @@ public final class SpektraCameraOwner {
+                 Log.e(TAG, "IRIS_26685_SPEKTRA_BAYER_ORIGIN_AMBIGUOUS route=" + route
+                         + " geometryHint=" + geometryHint + " sensorCfa=" + baseMetadata.cfaArrangement
+                         + " action=reject_stream");
+-                retryDiscoveryStream(g, "BAYER_ORIGIN_AMBIGUOUS", null);
++                failProcessor(g, "BAYER_ORIGIN_AMBIGUOUS", null);
+                 return;
+             }
+             lensProfiles.edit().putInt(lensProfileKey() + ".bayerOffset", activeBayerOffset).apply();
+@@ -1316,7 +1412,7 @@ public final class SpektraCameraOwner {
+             pendingStillImages.remove(pendingStillTimestamp);
+             closePendingStillImages();
+             stillDecodeInFlight = true;
+-            processExecutor.execute(() -> {
++            savedProcessExecutor.execute(() -> {
+                 SpektraRawFrame decoded = null;
+                 Throwable failure = null;
+                 try {
+@@ -1389,7 +1485,10 @@ public final class SpektraCameraOwner {
+         setState(State.STILL_CAPTURED);
+         Log.i(TAG, "IRIS_26684_SPEKTRA_STILL_CAPTURED timestamp=" + raw.timestampNs
+                 + " frame=" + result.getFrameNumber() + " sessionReused=true");
+-        CaptureController.isProcessing = true;
++        if (!captureJobState.compareAndSet(CaptureJobState.IDLE, CaptureJobState.PROCESSING)) {
++            terminalStillFailure(g, "CAPTURE_JOB_STATE_BUSY", null);
++            return;
++        }
+         activity.runOnUiThread(() -> {
+             events.onFrameCaptureCompleted("SPEKTRA");
+             events.onCaptureSequenceCompleted("SPEKTRA");
+@@ -1405,10 +1504,14 @@ public final class SpektraCameraOwner {
+                 color.sensorToLinearSrgb, outputRotation,
+                 route == null ? "" : route.characteristicsId, lensModel);
+ 
+-        // The immutable one-RAW recipe is now frozen. Resume the same RAW session immediately while
+-        // durable .shot + full RCD/SPEKTRA/JPEG processing continues away from Camera2.
++        // Freeze one immutable recipe, restore one actual preview frame first, then run the heavy
++        // saved path. This prevents saved GPU priority from starving the proof-of-life frame.
++        if (!pendingSavedShot.compareAndSet(null, shot)) {
++            captureJobState.set(CaptureJobState.IDLE);
++            terminalStillFailure(g, "PENDING_SAVED_SHOT_ALREADY_OWNED", null);
++            return;
++        }
+         resumePreviewAfterStillReuse(g, true);
+-        processExecutor.execute(() -> processShot(g, shot));
+     }
+ 
+     private void trimPendingStillImages(int max) {
+@@ -1448,6 +1551,20 @@ public final class SpektraCameraOwner {
+     private static int valueOrZero(Integer value) { return value == null ? 0 : value; }
+     private static int valueOrZero(Byte value) { return value == null ? 0 : Byte.toUnsignedInt(value); }
+ 
++    private void startPendingSavedProcess(String trigger) {
++        final SpektraShot shot = pendingSavedShot.getAndSet(null);
++        if (shot == null) return;
++        Log.i(TAG, "IRIS_26687_SPEKTRA_SAVED_JOB_START trigger=" + trigger
++                + " timestamp=" + shot.raw.timestampNs);
++        try {
++            savedProcessExecutor.execute(() -> processShot(activeGeneration, shot));
++        } catch (RuntimeException rejected) {
++            captureJobState.set(CaptureJobState.IDLE);
++            Log.e(TAG, "IRIS_26687_SPEKTRA_SAVED_PROCESS_QUEUE_REJECTED trigger=" + trigger, rejected);
++            activity.runOnUiThread(() -> events.onProcessingError("Spektra processing queue unavailable"));
++        }
++    }
++
+     private void processShot(long g, SpektraShot shot) {
+         File recovery = null;
+         try {
+@@ -1462,7 +1579,7 @@ public final class SpektraCameraOwner {
+             Log.e(TAG, "IRIS_26681_SPEKTRA_PROCESS_FAILED recovery=" + recovery, t);
+             events.onProcessingError(t.getMessage() == null ? "Spektra processing failed" : t.getMessage());
+         } finally {
+-            CaptureController.isProcessing = false;
++            captureJobState.set(CaptureJobState.IDLE);
+         }
+     }
+ 
+@@ -1480,6 +1597,7 @@ public final class SpektraCameraOwner {
+         }
+         if (previewRenderer != null) previewRenderer.beginPreviewSession();
+         awaitingPostStillPreview = successfulCapture;
++        previewPresented.set(false);
+         setState(State.STREAMING);
+         submitRepeating();
+         armFatalWatchdog(g, State.STREAMING, PREVIEW_FIRST_FRAME_TIMEOUT_MS,
+@@ -1489,13 +1607,16 @@ public final class SpektraCameraOwner {
+ 
+     private void terminalStillFailure(long g, String reason, Throwable t) {
+         if (verificationCaptureInFlight || currentProfileNeedsVerification) {
+-            retryDiscoveryStream(g, reason, t);
++            if (isDiscoveryStreamFailure(reason)) {
++                retryDiscoveryStream(g, reason, t);
++            } else {
++                failProcessor(g, reason, t);
++            }
+             return;
+         }
+-        if (t != null) Log.e(TAG, "IRIS_26685_SPEKTRA_STILL_FAILURE reason=" + reason, t);
+-        else Log.e(TAG, "IRIS_26685_SPEKTRA_STILL_FAILURE reason=" + reason);
++        if (t != null) Log.e(TAG, "IRIS_26687_SPEKTRA_STILL_FAILURE reason=" + reason, t);
++        else Log.e(TAG, "IRIS_26687_SPEKTRA_STILL_FAILURE reason=" + reason);
+         setState(State.STILL_FAILED);
+-        CaptureController.isProcessing = false;
+         activity.runOnUiThread(() -> {
+             events.onCaptureStillPictureRejected(reason);
+             events.onProcessingError(reason);
+@@ -1503,20 +1624,55 @@ public final class SpektraCameraOwner {
+         resumePreviewAfterStillReuse(g, false);
+     }
+ 
++    private boolean isDiscoveryStreamFailure(String reason) {
++        if (reason == null) return false;
++        if (reason.startsWith("PREVIEW_SESSION_CONFIGURE_FAILED")
++                || reason.startsWith("PREVIEW_SESSION_CREATE_FAILED")) return true;
++        if (reason.contains("FIRST_FRAME_TIMEOUT")) return !currentStreamRawSeen;
++        return reason.startsWith("STILL_CAPTURE_FAILED_")
++                || reason.equals("STILL_CAPTURE_TIMEOUT")
++                || reason.equals("STILL_SUBMIT_FAILED")
++                || reason.equals("STILL_ACTIVE_SESSION_REUSE_FAILED");
++    }
++
++    private void failProcessor(long g, String reason, Throwable t) {
++        if (!isCurrent(g)) return;
++        previewPresented.set(false);
++        startPendingSavedProcess("processor_failure");
++        automaticDiscoveryActive = false;
++        automaticDiscoveryRoute = null;
++        automaticDiscoveryQueue.clear();
++        if (t != null) Log.e(TAG, "IRIS_26687_SPEKTRA_PROCESSOR_FATAL reason=" + reason
++                + " rawSeen=" + currentStreamRawSeen + " resultSeen=" + currentStreamResultSeen, t);
++        else Log.e(TAG, "IRIS_26687_SPEKTRA_PROCESSOR_FATAL reason=" + reason
++                + " rawSeen=" + currentStreamRawSeen + " resultSeen=" + currentStreamResultSeen);
++        closeCameraObjects(true);
++        setState(State.FAILED);
++        activity.runOnUiThread(() -> events.onError(reason));
++    }
++
+     private void fail(long g, String reason, Throwable t) {
+         if (!isCurrent(g)) return;
+-        if (currentProfileNeedsVerification && route != null && previewSize != null
+-                && !reason.contains("PERMISSION") && !reason.contains("MANUAL_SENSOR")) {
+-            retryDiscoveryStream(g, reason, t);
++        previewPresented.set(false);
++        startPendingSavedProcess("fatal_failure");
++        if (currentProfileNeedsVerification && route != null && previewSize != null) {
++            if (isDiscoveryStreamFailure(reason)) retryDiscoveryStream(g, reason, t);
++            else failProcessor(g, reason, t);
+             return;
+         }
+-        if (t != null) Log.e(TAG, "IRIS_26685_SPEKTRA_FATAL reason=" + reason, t);
+-        else Log.e(TAG, "IRIS_26681_SPEKTRA_FATAL reason=" + reason);
++        if (t != null) Log.e(TAG, "IRIS_26687_SPEKTRA_FATAL reason=" + reason, t);
++        else Log.e(TAG, "IRIS_26687_SPEKTRA_FATAL reason=" + reason);
+         closeCameraObjects(true);
+         setState(State.FAILED);
+         activity.runOnUiThread(() -> events.onError(reason));
+     }
+ 
++    private void onPreviewRenderFailure(Throwable t) {
++        final long g = activeGeneration;
++        Handler h = cameraHandler;
++        if (h != null) h.post(() -> failProcessor(g, "FILM_PREVIEW_RENDER_FAILED", t));
++    }
++
+     private void onFirstPreviewFramePresented() {
+         final long g = activeGeneration;
+         Handler h = cameraHandler;
+@@ -1526,6 +1682,14 @@ public final class SpektraCameraOwner {
+             cancelWatchdog();
+             final String key = lensProfileKey();
+             SharedPreferences.Editor profileEdit = lensProfiles.edit().putBoolean(key + ".previewVerified", true);
++            if (awaitingPostStillPreview && !verificationCaptureInFlight && pendingSavedShot.get() != null) {
++                awaitingPostStillPreview = false;
++                profileEdit.apply();
++                previewPresented.set(true);
++                host.onSpektraPreviewReady();
++                startPendingSavedProcess("preview_restored");
++                return;
++            }
+             if (awaitingPostStillPreview && verificationCaptureInFlight && verificationCaptureSucceeded) {
+                 profileEdit.putBoolean(key + ".captureVerified", true).remove(key + ".unsupported").apply();
+                 awaitingPostStillPreview = false;
+@@ -1538,7 +1702,8 @@ public final class SpektraCameraOwner {
+                 if (automaticDiscoveryActive) {
+                     advanceAutomaticDiscovery(g);
+                 } else {
+-                    setPreviewVisibility(true);
++                    previewPresented.set(true);
++                    host.onSpektraPreviewReady();
+                 }
+                 return;
+             }
+@@ -1551,7 +1716,10 @@ public final class SpektraCameraOwner {
+             if (captureVerified) {
+                 currentProfileNeedsVerification = false;
+                 if (automaticDiscoveryActive) advanceAutomaticDiscovery(g);
+-                else setPreviewVisibility(true);
++                else {
++                    previewPresented.set(true);
++                    host.onSpektraPreviewReady();
++                }
+                 return;
+             }
+             if (currentProfileNeedsVerification && !verificationCaptureInFlight) {
+@@ -1597,11 +1765,15 @@ public final class SpektraCameraOwner {
+ 
+     private void retryDiscoveryStream(long g, String reason, Throwable t) {
+         if (!isCurrent(g) || route == null || previewSize == null) return;
++        if (!isDiscoveryStreamFailure(reason)) {
++            failProcessor(g, "DISCOVERY_REJECT_DOMAIN_VIOLATION_" + reason, t);
++            return;
++        }
+         final String key = lensProfileKey();
+         final String failed = streamFailureKey(key, rawFormat, previewSize);
+-        if (t != null) Log.w(TAG, "IRIS_26685_SPEKTRA_DISCOVERY_STREAM_REJECT reason=" + reason
++        if (t != null) Log.w(TAG, "IRIS_26687_SPEKTRA_DISCOVERY_STREAM_REJECT reason=" + reason
+                 + " route=" + route + " format=" + rawFormat + " raw=" + previewSize, t);
+-        else Log.w(TAG, "IRIS_26685_SPEKTRA_DISCOVERY_STREAM_REJECT reason=" + reason
++        else Log.w(TAG, "IRIS_26687_SPEKTRA_DISCOVERY_STREAM_REJECT reason=" + reason
+                 + " route=" + route + " format=" + rawFormat + " raw=" + previewSize);
+         lensProfiles.edit().putBoolean(failed, true)
+                 .remove(key + ".format").remove(key + ".width").remove(key + ".height")
+@@ -1695,6 +1867,44 @@ public final class SpektraCameraOwner {
+         if (future != null) future.cancel(false);
+     }
+ 
++    /** Camera transport retirement never waits on RAW/film GPU workers. */
++    private void forceCloseCameraTransportForHandoff() {
++        CameraCaptureSession localSession;
++        CameraDevice localDevice;
++        ImageReader localReader;
++        SpektraPreviewRenderer localRenderer;
++        synchronized (stateLock) {
++            localSession = session;
++            session = null;
++            localDevice = cameraDevice;
++            cameraDevice = null;
++            localReader = previewReader;
++            previewReader = null;
++            localRenderer = previewRenderer;
++            previewRenderer = null;
++            repeatingBuilder = null;
++            state = State.CLOSED;
++        }
++        try { if (localSession != null) localSession.close(); } catch (Throwable ignored) {}
++        try { if (localDevice != null) localDevice.close(); } catch (Throwable ignored) {}
++        try { if (localReader != null) localReader.close(); } catch (Throwable ignored) {}
++        // A force handoff is terminal for the retired generation. Close any Camera2-owned pending
++        // images/results immediately; the decode worker has already detached an accepted RAW before
++        // entering native processing, so this cannot invalidate a GPU submission.
++        previewResults.clear();
++        closePendingPreviewImages();
++        closePendingStillImages();
++        pendingStillFrame = null;
++        pendingStillResult = null;
++        pendingStillTimestamp = 0L;
++        pendingStillWallTimeMs = 0L;
++        stillDecodeInFlight = false;
++        if (localRenderer != null) localRenderer.release();
++        previewPresented.set(false);
++        cancelWatchdog();
++        Log.i(TAG, "IRIS_26687_SPEKTRA_TRANSPORT_FORCE_CLOSED generation=" + activeGeneration);
++    }
++
+     private void closeCameraObjects(boolean hideSurface) {
+         try { if (session != null) session.close(); } catch (Throwable ignored) {}
+         session = null;
+@@ -1722,6 +1932,9 @@ public final class SpektraCameraOwner {
+         loggedPreviewRawContract = false;
+         loggedStillRawContract = false;
+         loggedPreviewWaitWb = false;
++        currentStreamRawSeen = false;
++        currentStreamResultSeen = false;
++        previewPresented.set(false);
+         cancelWatchdog();
+         characteristics = null;
+         route = null;
+@@ -1730,11 +1943,7 @@ public final class SpektraCameraOwner {
+             previewRenderer.release();
+             previewRenderer = null;
+         }
+-        if (hideSurface) {
+-            SpektraRawProcessor.releaseNativeOwner();
+-            SpektraFilmRenderer.releaseProcessRenderer();
+-            setPreviewVisibility(false);
+-        }
++        if (hideSurface) host.onSpektraPreviewStopped();
+         setState(hideSurface ? State.CLOSED : State.IDLE);
+     }
+ 
+@@ -1745,36 +1954,11 @@ public final class SpektraCameraOwner {
+         previewReader = null;
+     }
+ 
+-    private void preparePreviewPresentation() {
+-        final SurfaceView sv = previewSurfaceView;
+-        final View legacy = legacyPreviewView;
+-        activity.runOnUiThread(() -> {
+-            // Keep a valid Surface for the first renderer frame without exposing an old buffer.
+-            if (sv != null) {
+-                sv.setAlpha(0.0f);
+-                sv.setVisibility(View.VISIBLE);
+-            }
+-            if (legacy != null) legacy.setVisibility(View.VISIBLE);
+-        });
+-    }
+-
+-    private void setPreviewVisibility(boolean visible) {
+-        final SurfaceView sv = previewSurfaceView;
+-        final View legacy = legacyPreviewView;
+-        activity.runOnUiThread(() -> {
+-            if (sv != null) {
+-                sv.setAlpha(visible ? 1.0f : 0.0f);
+-                sv.setVisibility(visible ? View.VISIBLE : View.GONE);
+-            }
+-            if (legacy != null) legacy.setVisibility(visible ? View.INVISIBLE : View.VISIBLE);
+-        });
+-    }
+-
+     private boolean isCurrent(long g) { return g == activeGeneration && g == generation.get(); }
+     private void setState(State s) {
+         cancelWatchdog();
+         synchronized (stateLock) { state = s; }
+-        Log.d(TAG, "IRIS_26685_SPEKTRA_STATE state=" + s + " generation=" + activeGeneration);
++        Log.d(TAG, "IRIS_26687_SPEKTRA_STATE state=" + s + " generation=" + activeGeneration);
+     }
+ 
+     private static <T> void trimSparse(LongSparseArray<T> a, int max) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6b058ed744f5c7288d12d8fe949736d8c7849f5
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+@@ -0,0 +1,63 @@
++package com.particlesdevs.photoncamera.spektra;
++
++import android.app.Activity;
++import android.view.SurfaceView;
++
++import androidx.annotation.NonNull;
++import androidx.annotation.Nullable;
++
++import com.particlesdevs.photoncamera.api.CameraEventsListener;
++
++/**
++ * The only Iris <-> Spektra control-plane boundary.
++ *
++ * Iris may host UI/surfaces and request enter/shutter/controls/exit. Camera2, RAW/result pairing,
++ * discovery, processing executors, native GPU lifetime and Spektra capture-job state stay hidden
++ * behind this facade.
++ */
++public final class SpektraModeController {
++    public interface Host {
++        void onSpektraPreviewPreparing();
++        void onSpektraPreviewReady();
++        void onSpektraPreviewStopped();
++    }
++
++    private final SpektraCameraOwner owner;
++
++    public SpektraModeController(@NonNull Activity activity, @NonNull CameraEventsListener events,
++            @NonNull Host host) {
++        owner = new SpektraCameraOwner(activity, events, host);
++    }
++
++    public void bindPreviewSurface(@NonNull SurfaceView surfaceView) { owner.bindPreviewSurface(surfaceView); }
++
++    public void resume(@Nullable String cameraId, int flashPreference) {
++        owner.setSelectedCameraId(cameraId);
++        owner.setFlashPreference(flashPreference);
++        owner.resumeCamera();
++    }
++
++    public void restart(@Nullable String cameraId, int flashPreference) {
++        owner.setSelectedCameraId(cameraId);
++        owner.setFlashPreference(flashPreference);
++        owner.restartCamera();
++    }
++
++    /** Mode handoff is fail-contained: Spektra relinquishes Camera2 even if a processor is wedged. */
++    public void exitForModeHandoff() { owner.retireForHandoff(); }
++    public void shutdown() { owner.shutdown(); }
++
++    public boolean isActive() { return owner.isActive(); }
++    public boolean isShutterReady() { return owner.isShutterReady(); }
++    public String debugStatus() { return owner.describeStatus(); }
++    public void takePicture() { owner.takePicture(); }
++    public void setFlashPreference(int value) { owner.setFlashPreference(value); }
++    public void setManualControls(@Nullable Integer iso, @Nullable Long exposureNs, int evSteps) {
++        owner.setManualControls(iso, exposureNs, evSteps);
++    }
++    public void setManualFocus(@Nullable Float focusDistance) { owner.setManualFocus(focusDistance); }
++    public void touchFocus(float normalizedX, float normalizedY, boolean lock) {
++        owner.touchFocus(normalizedX, normalizedY, lock);
++    }
++    public void unlockFocus() { owner.unlockFocus(); }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+index 630cb29724e217fbf0d86b92d478f7fc74beb627..5630ede41f8abe42fe836c2a4ef64023dcb89c45 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraPreviewRenderer.java
+@@ -15,6 +15,7 @@ import com.particlesdevs.photoncamera.util.Log;
+ import java.util.concurrent.ExecutorService;
+ import java.util.concurrent.Executors;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.function.Consumer;
+ 
+ /** VF-S presenter. RAW development is already complete before this queue receives a frame. */
+ public final class SpektraPreviewRenderer {
+@@ -27,16 +28,18 @@ public final class SpektraPreviewRenderer {
+     private final AtomicBoolean busy = new AtomicBoolean(false);
+     private final Object renderLifecycleLock = new Object();
+     private final Runnable firstFramePresentedCallback;
++    private final Consumer<Throwable> failureCallback;
+     private final AtomicBoolean firstFramePresented = new AtomicBoolean(false);
+     private int sensorOrientation;
+     private boolean frontFacing;
+     private volatile boolean released;
+ 
+     public SpektraPreviewRenderer(Activity activity, SurfaceView surfaceView,
+-            Runnable firstFramePresentedCallback) {
++            Runnable firstFramePresentedCallback, Consumer<Throwable> failureCallback) {
+         this.activity = activity;
+         this.surfaceView = surfaceView;
+         this.firstFramePresentedCallback = firstFramePresentedCallback;
++        this.failureCallback = failureCallback;
+     }
+ 
+     public void configure(CameraCharacteristics characteristics, Size rawStreamSize, Size processSize, int rawFormat) {
+@@ -46,7 +49,7 @@ public final class SpektraPreviewRenderer {
+         frontFacing = facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT;
+         released = false;
+         firstFramePresented.set(false);
+-        Log.d(TAG, "IRIS_26686_SPEKTRA_PREVIEW_CONFIG rawStream=" + rawStreamSize
++        Log.d(TAG, "IRIS_26687_SPEKTRA_PREVIEW_CONFIG rawStream=" + rawStreamSize
+                 + " process=" + processSize + " format=" + rawFormat
+                 + " targetFps=30 quality=LOW previewShortEdge=480 vfS=true rawOwner=Vulkan");
+     }
+@@ -74,7 +77,10 @@ public final class SpektraPreviewRenderer {
+                             activity.runOnUiThread(firstFramePresentedCallback);
+                         }
+                     } catch (Throwable t) {
+-                        if (!released) Log.e(TAG, "IRIS_26686_SPEKTRA_PREVIEW_RENDER_FAILED", t);
++                        if (!released) {
++                            Log.e(TAG, "IRIS_26687_SPEKTRA_PREVIEW_RENDER_FAILED", t);
++                            if (failureCallback != null) failureCallback.accept(t);
++                        }
+                     } finally {
+                         if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+                         busy.set(false);
+@@ -126,11 +132,13 @@ public final class SpektraPreviewRenderer {
+     }
+ 
+     public void release() {
++        // Never join a potentially wedged film/Vulkan render from camera teardown. The render task
++        // observes released when it returns; Camera2 ownership is free immediately.
+         released = true;
+         executor.shutdownNow();
+-        synchronized (renderLifecycleLock) { busy.set(false); }
++        busy.set(false);
+         long[] stats = SpektraRawProcessor.nativeStats();
+-        Log.i(TAG, "IRIS_26686_SPEKTRA_PREVIEW_DRAINED"
++        Log.i(TAG, "IRIS_26687_SPEKTRA_PREVIEW_DRAINED"
+                 + " vfProcessed=" + stats[0] + " vfDropped=" + stats[1]
+                 + " avgVfMicros=" + stats[2] + " lastStillMicros=" + stats[3]
+                 + " gpuOwners=" + stats[4] + " persistentAllocations=" + stats[5]);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+index cea9d5dc8ebe6600aa4e6f417db61fe8c806c571..51cfcc9f9e2851dce1ab2c3f99ac4ca7c1b977f4 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawFrame.java
+@@ -26,6 +26,13 @@ public final class SpektraRawFrame {
+     /** Scene-linear RGBA16F VF-S image produced by the persistent Spektra Vulkan RAW owner. */
+     public final byte[] previewLinearRgba16f;
+ 
++    /**
++     * One reusable direct staging allocation per preview-decode thread. Camera2 Images are copied
++     * here and closed before any Vulkan call, so a driver stall can never retain a camera buffer.
++     */
++    private static final ThreadLocal<ByteBuffer> PREVIEW_RAW_STAGING =
++            ThreadLocal.withInitial(() -> ByteBuffer.allocateDirect(1).order(ByteOrder.nativeOrder()));
++
+     private SpektraRawFrame(int width, int height, int sourceWidth, int sourceHeight,
+             int sourceFormat, int rowStride, int pixelStride, long timestampNs,
+             byte[] packedRaw, byte[] mosaic16, byte[] previewLinearRgba16f) {
+@@ -53,39 +60,46 @@ public final class SpektraRawFrame {
+     public int sourceHeight() { return sourceHeight; }
+ 
+     /**
+-     * VF-S live contract. The original Camera2 RAW plane remains valid for this entire call.
+-     * Native Vulkan reconstructs sensor RGB/linear RGB in the source lattice and reduces only
+-     * after reconstruction. A small CPU Bayer meter is retained solely for AE/Bayer discovery.
++     * VF-S live contract. Packed RAW is detached into Spektra-owned reusable staging and the
++     * Camera2 Image is closed before native Vulkan is entered. Native then reconstructs sensor
++     * RGB/linear RGB in the source lattice and reduces only after reconstruction.
+      */
+     public static SpektraRawFrame copyPreviewFrom(Image image, int previewShortEdge,
+             SpektraFrameMetadata metadata, float[] sensorToLinearSrgb) {
+         if (previewShortEdge <= 0) throw new IllegalArgumentException("Invalid Spektra preview short edge");
+         final int srcWidth = requireImageWidth(image);
+         final int srcHeight = image.getHeight();
++        final int format = image.getFormat();
++        final long timestampNs = image.getTimestamp();
+         final int[] out = previewDimensions(srcWidth, srcHeight, previewShortEdge);
+-        RawPlane plane = rawPlane(image);
++        final RawPlane plane;
++        try {
++            plane = detachedRawPlane(image);
++        } finally {
++            // This is deliberately before processLivePreview/nativeDecodeMeter. A stuck GPU or
++            // native driver call therefore cannot own or exhaust Camera2 ImageReader buffers.
++            try { image.close(); } catch (Throwable ignored) {}
++        }
+ 
+         byte[] linear = null;
+         final boolean geometryReady = metadata != null && metadata.bayerOffset >= 0 && metadata.bayerOffset <= 3
+                 && metadata.cfaArrangement >= 0 && metadata.cfaArrangement <= 3
+                 && sensorToLinearSrgb != null && sensorToLinearSrgb.length == 9;
+         if (geometryReady) {
+-            // Ask the native owner first. If saved work currently owns the GPU, it returns null and
+-            // the preview frame is dropped before even the tiny CPU metering pass.
+             linear = SpektraRawProcessor.processLivePreview(plane.buffer, plane.offset, plane.bytes,
+-                    srcWidth, srcHeight, plane.rowStride, plane.pixelStride, image.getFormat(),
++                    srcWidth, srcHeight, plane.rowStride, plane.pixelStride, format,
+                     metadata, sensorToLinearSrgb, out[0], out[1]);
+             validatePreviewLinear(out[0], out[1], linear);
+             if (linear == null) {
+-                return new SpektraRawFrame(out[0], out[1], srcWidth, srcHeight, image.getFormat(),
+-                        plane.rowStride, plane.pixelStride, image.getTimestamp(), null, null, null);
++                return new SpektraRawFrame(out[0], out[1], srcWidth, srcHeight, format,
++                        plane.rowStride, plane.pixelStride, timestampNs, null, null, null);
+             }
+         }
+         byte[] meter = nativeDecodeMeter(plane.buffer, plane.offset, plane.bytes,
+-                srcWidth, srcHeight, plane.rowStride, plane.pixelStride, image.getFormat(), out[0], out[1]);
+-        validateMeter(out[0], out[1], image.getFormat(), meter);
+-        return new SpektraRawFrame(out[0], out[1], srcWidth, srcHeight, image.getFormat(),
+-                plane.rowStride, plane.pixelStride, image.getTimestamp(), null, meter, linear);
++                srcWidth, srcHeight, plane.rowStride, plane.pixelStride, format, out[0], out[1]);
++        validateMeter(out[0], out[1], format, meter);
++        return new SpektraRawFrame(out[0], out[1], srcWidth, srcHeight, format,
++                plane.rowStride, plane.pixelStride, timestampNs, null, meter, linear);
+     }
+ 
+     /** Saved path keeps the Camera2 plane packed; Java never expands the full Bayer raster. */
+@@ -143,6 +157,26 @@ public final class SpektraRawFrame {
+         }
+     }
+ 
++    private static RawPlane detachedRawPlane(Image image) {
++        RawPlane live = rawPlane(image);
++        ByteBuffer staging = PREVIEW_RAW_STAGING.get();
++        if (staging.capacity() < live.bytes) {
++            int capacity = 1;
++            while (capacity < live.bytes && capacity <= (Integer.MAX_VALUE >>> 1)) capacity <<= 1;
++            if (capacity < live.bytes) capacity = live.bytes;
++            staging = ByteBuffer.allocateDirect(capacity).order(ByteOrder.nativeOrder());
++            PREVIEW_RAW_STAGING.set(staging);
++        }
++        ByteBuffer src = live.buffer.duplicate();
++        src.position(live.offset);
++        src.limit(live.offset + live.bytes);
++        staging.clear();
++        staging.limit(live.bytes);
++        staging.put(src);
++        staging.flip();
++        return new RawPlane(staging, 0, live.bytes, live.rowStride, live.pixelStride);
++    }
++
+     private static RawPlane rawPlane(Image image) {
+         Image.Plane plane = image.getPlanes()[0];
+         ByteBuffer src = plane.getBuffer().duplicate();
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+index c2f08dc0a1bf667ba5bbb888344cc5f264e72ca1..8cad76e4b90819f88fc0231cee03d4c5b90ca737 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraRawProcessor.java
+@@ -10,7 +10,7 @@ import java.nio.ByteOrder;
+ /**
+  * Spektra-owned single-frame RAW front end.
+  *
+- * Active-path invariant for 26686: packed Camera2 RAW -> one persistent native Vulkan owner ->
++ * Active-path invariant for 26687: packed Camera2 RAW -> one persistent native Vulkan owner ->
+  * scene-linear RGBA16F. No Iris GLContext/GLProg/GLTexture and no Motion RCD runtime ownership.
+  */
+ public final class SpektraRawProcessor {
+@@ -56,7 +56,7 @@ public final class SpektraRawProcessor {
+                 shot.metadata.lensShadingCols, shot.sensorToLinearSrgb, crop.width(), crop.height(), true,
+                 SAVED_CHROMA_DENOISE_STRENGTH, SENSOR_CLIP_THRESHOLD);
+         if (out == null) throw new IllegalStateException("Spektra saved Vulkan RAW owner returned no frame");
+-        Log.d(TAG, "IRIS_26686_SPEKTRA_NATIVE_RAW_OWNER saved=true raw="
++        Log.d(TAG, "IRIS_26687_SPEKTRA_NATIVE_RAW_OWNER saved=true raw="
+                 + shot.raw.sourceWidth() + "x" + shot.raw.sourceHeight()
+                 + " crop=" + crop + " activeRaw=" + shot.metadata.activeRawDomain
+                 + " bayerOffset=" + shot.metadata.bayerOffset
+@@ -87,6 +87,8 @@ public final class SpektraRawProcessor {
+         return linearFrame(raw.width, raw.height, raw.previewLinearRgba16f);
+     }
+ 
++    public static void warmUpNativeOwner() { nativeWarmUpRawOwner(); }
++
+     public static void releaseNativeOwner() {
+         nativeReleaseRawOwner();
+     }
+@@ -134,6 +136,7 @@ public final class SpektraRawProcessor {
+             int outputWidth, int outputHeight, boolean savedPhoto, float chromaDenoiseStrength,
+             float sensorClipThreshold);
+ 
++    private static native void nativeWarmUpRawOwner();
+     private static native void nativeReleaseRawOwner();
+     private static native long[] nativeRawOwnerStats();
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 22ea53d8416754c283fc981712a73872cf8d309f..bca3f0fdb84b9cd6772153c44cfdefd835560a26 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -73,6 +73,7 @@ import com.particlesdevs.photoncamera.api.CameraReflectionApi;
+ import com.particlesdevs.photoncamera.app.PhotonCamera;
+ import com.particlesdevs.photoncamera.app.base.BaseActivity;
+ import com.particlesdevs.photoncamera.capture.CaptureController;
++import com.particlesdevs.photoncamera.spektra.SpektraModeController;
+ import com.particlesdevs.photoncamera.capture.CaptureEventsListener;
+ import com.particlesdevs.photoncamera.circularbarlib.api.ManualInstanceProvider;
+ import com.particlesdevs.photoncamera.circularbarlib.api.ManualModeConsole;
+@@ -273,7 +274,23 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         this.mCameraUIView = new CameraUIViewImpl(this);
+         this.mCameraUIEventsListener = new CameraUIController(this);
+         this.mCameraUIView.setCameraUIEventsListener(mCameraUIEventsListener);
+-        this.captureController = new CaptureController(activity, processExecutorService, new CameraEventsListenerImpl());
++        this.captureController = new CaptureController(activity, processExecutorService,
++                new CameraEventsListenerImpl(), new SpektraModeController.Host() {
++                    @Override public void onSpektraPreviewPreparing() {
++                        if (activity != null) activity.runOnUiThread(() -> setSpektraPreviewVisible(false));
++                    }
++                    @Override public void onSpektraPreviewReady() {
++                        if (activity != null) activity.runOnUiThread(() -> {
++                            if (captureController != null
++                                    && captureController.getAuthoritativeCameraMode() == CameraMode.SPEKTRA) {
++                                setSpektraPreviewVisible(true);
++                            }
++                        });
++                    }
++                    @Override public void onSpektraPreviewStopped() {
++                        if (activity != null) activity.runOnUiThread(() -> setSpektraPreviewVisible(false));
++                    }
++                });
+         this.captureController.bindPreviewTextureView(textureView);
+         this.captureController.bindSpektraPreviewSurface(spektraSurfaceView);
+         this.manualModeConsole.addParamObserver(captureController.getParamController());
+@@ -684,8 +701,10 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     public void onDestroy() {
+         super.onDestroy();
+ //        Log.d(TAG, "onDestroy() called");
++        CaptureController retiringController = captureController;
++        if (retiringController != null) retiringController.shutdownSpektraMode();
+         try {
+-            captureController.stopBackgroundThread();
++            if (captureController != null) captureController.stopBackgroundThread();
+         } catch (Exception e) {
+             e.printStackTrace();
+         }
+@@ -708,7 +727,6 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         iris26670ManualConsoleOwner = null;
+         iris26670ManualSlider = null;
+         manualModeConsole.onDestroy();
+-        CaptureController retiringController = captureController;
+         if (PhotonCamera.getCaptureController() == retiringController) {
+             PhotonCamera.setCaptureController(null);
+         } else {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+index b6613379640713204e1f35afc6e408de7e69dda1..7f746f27c8a6289c8631360ccc149b971e2e23d9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+@@ -71,9 +71,9 @@ final class CameraUIController implements CameraUIEventsListener,
+                         else startTimer();
+                         break;
+                     case SPEKTRA:
+-                        if (!cameraFragment.captureController.getSpektraCameraOwner().isStreaming()) {
+-                            Log.w(TAG, "IRIS_26683_SPEKTRA_SHUTTER_UI_REJECT state="
+-                                    + cameraFragment.captureController.getSpektraCameraOwner().getState());
++                        if (!cameraFragment.captureController.getSpektraModeController().isShutterReady()) {
++                            Log.w(TAG, "IRIS_26687_SPEKTRA_SHUTTER_UI_REJECT status="
++                                    + cameraFragment.captureController.getSpektraModeController().debugStatus());
+                             cameraFragment.showToast("Spektra camera is preparing");
+                             break;
+                         }
+diff --git a/app/version.properties b/app/version.properties
+index 864abdcb5faebddcdffd5f9f53514eace813e6bf..146d9c8ac01a09ad5d538fcddf21c3847dcc6415 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726686
+-VERSION_BUILD=26686
++VERSION_NAME=0.9726687
++VERSION_BUILD=26687
