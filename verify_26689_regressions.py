@@ -16,6 +16,17 @@ jpeg=text('app/src/main/java/com/unspektrawesome/capture/JpegMediaStoreWriter.kt
 prep=frag[frag.index('onSpektraPreviewPreparing()'):frag.index('onSpektraPreviewReady()')]
 assert 'setSpektraPreviewVisible(true)' in prep and 'setSpektraPreviewVisible(false)' not in prep
 assert 'surfaceCreated' in view and 'attachSurface(holder.surface)' in view and 'surfaceDestroyed' in view and 'detachSurface(holder.surface)' in view
+# 26689 R1 compiler failure: plan-selection error path must call publishLocked;
+# never leave RawPreviewPhase.ERROR/message as orphaned arguments.
+plan_error_block='''}.getOrElse { error ->
+            stopActiveLocked()
+            publishLocked(
+                RawPreviewPhase.ERROR,
+                "RAW preview selection failed: ${error.message ?: error.javaClass.simpleName}",
+            )
+            return
+        }'''
+assert plan_error_block in ctrl, '26689 compiler regression: publishLocked call missing from plan-selection error path'
 # 26687 failure: no Iris-created warmup gate may block camera opening.
 assert '.warmUp(' not in ctrl and '.warmUp(' not in mode
 # Old recreated owners may remain protected bytes but cannot be reachable from sole facade/controller.
@@ -39,4 +50,4 @@ for rel in ('app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewContr
  s=text(rel); assert 'DngCreator' not in s and 'image/x-adobe-dng' not in s
 # Historical source contamination rules.
 assert not any(str(p.relative_to(c)).startswith('app/build/') or str(p.relative_to(c)).startswith('app/.cxx/') for p in c.rglob('*') if p.is_file())
-print('PASS 26689 permanent regressions: 26687 warmup, 26688 Surface gate, owner isolation, one-RAW capture, exact 1.1.2 defaults')
+print('PASS 26689 permanent regressions: 26689 publishLocked compiler fix, 26687 warmup, 26688 Surface gate, owner isolation, one-RAW capture, exact 1.1.2 defaults')

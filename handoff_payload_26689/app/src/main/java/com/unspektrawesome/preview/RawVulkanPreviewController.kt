@@ -510,6 +510,7 @@ class RawVulkanPreviewController(
             )
         }.getOrElse { error ->
             stopActiveLocked()
+            publishLocked(
                 RawPreviewPhase.ERROR,
                 "RAW preview selection failed: ${error.message ?: error.javaClass.simpleName}",
             )

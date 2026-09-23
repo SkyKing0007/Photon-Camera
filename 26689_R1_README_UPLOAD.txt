@@ -1,6 +1,6 @@
-PHOTON 26689 R1 — UNSPEKTRAWESOME HOSTED MODE
+PHOTON 26689 R1.1 — UNSPEKTRAWESOME HOSTED MODE COMPILER REPAIR
 
-STATUS: PREPARED / UPLOAD-READY ONLY. NOT ACTIONS-PROVEN YET.
+STATUS: R1.1 COMPILER REPAIR PREPARED / UPLOAD-READY ONLY. NOT ACTIONS-PROVEN YET.
 BACKUP: NONE, per user instruction.
 BRANCH: experimental-clean-photon-rebuild
 
@@ -36,6 +36,7 @@ Unspektrawesome owns Camera2 RAW discovery/session, preview Surface lifecycle, n
 The 26688 recreated SpektraCameraOwner/CPU/Vulkan RAW owners remain protected historical bytes but are unreachable from the active SpektraModeController facade.
 
 KEY PERMANENT REGRESSIONS
+- 26689 R1 Kotlin compiler regression: plan-selection error path must retain publishLocked(...) around RawPreviewPhase.ERROR/message.
 - Surface exists/is visible before first Spektra frame; no 26688 circular presentation gate.
 - no Iris-created pre-camera warmup gate; no 26687 warmup stall.
 - no active SpektraRawCpuOwner/SpektraRawVulkanOwner/SpektraRawDevelop path.
