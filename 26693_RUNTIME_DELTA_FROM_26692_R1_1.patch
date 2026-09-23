@@ -1,0 +1,575 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+index 51b2ecb267bd2fff600c3c5a68099e90e54df521..58f3dfb43f4a678f4d7eae43b6245078b5198f07 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+@@ -67,6 +67,8 @@ public final class SpektraModeController {
+     private volatile String bridgeError;
+     private VulkanRawPreviewView previewView;
+     private LifecycleOwner lifecycleOwner;
++    @Nullable
++    private volatile RawVulkanPreviewController.HistogramListener histogramListener;
+ 
+     public SpektraModeController(@NonNull Activity activity, @NonNull CameraEventsListener events,
+             @NonNull Host host) {
+@@ -108,6 +110,7 @@ public final class SpektraModeController {
+         if (controller != null) return controller;
+         RawVulkanPreviewController created = new RawVulkanPreviewController(
+                 activity.getApplicationContext(), spektraRepository);
++        created.setHistogramListener(histogramListener);
+         controller = created;
+         if (previewView != null && lifecycleOwner != null) {
+             previewView.bind(created, lifecycleOwner);
+@@ -232,7 +235,9 @@ public final class SpektraModeController {
+         if (previewView != null) previewView.unbind();
+         previewView = null;
+         lifecycleOwner = null;
++        histogramListener = null;
+         if (controller != null) {
++            controller.setHistogramListener(null);
+             controller.close();
+             controller = null;
+         }
+@@ -263,12 +268,16 @@ public final class SpektraModeController {
+         current.captureStill();
+     }
+ 
+-    /** Spektra-only native viewfinder histogram; ordinary Iris modes never call this path. */
+-    @NonNull
+-    public int[] histogramPixels(float scale) {
++    /**
++     * IRIS_26693_SPEKTRA_HISTOGRAM_PRESENTATION_BRIDGE
++     * Iris registers only a presentation sink. The Unspektrawesome preview controller owns when
++     * native histogram acquisition runs and automatically follows preview/session lifecycle.
++     */
++    public synchronized void setHistogramListener(
++            @Nullable RawVulkanPreviewController.HistogramListener listener) {
++        histogramListener = listener;
+         RawVulkanPreviewController current = controller;
+-        if (!isActive() || current == null) return new int[0];
+-        return current.histogramPixels(scale);
++        if (current != null) current.setHistogramListener(listener);
+     }
+ 
+     public void setFlashPreference(int value) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+index 64621cf6b4b8df150b76e8ce948a18d886bab8b8..51f2834e5bef3588e4ab906c8b40da3236299a3b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIViewImpl.java
+@@ -94,6 +94,7 @@ public class CameraUIViewImpl implements CameraUIView {
+     private int iris26627BottomSystemInsetPx = 0;
+     private float iris26627LastLensClearanceShiftPx = Float.NaN;
+     private float iris26627LastControlScale = Float.NaN;
++    private String iris26693LastSettledGeometrySignature = "";
+     private LayoutMainTopbarBinding topbar;
+     private LayoutBottombuttonsBinding bottombuttons;
+     private CameraUIEventsListener uiEventsListener;
+@@ -902,21 +903,55 @@ public class CameraUIViewImpl implements CameraUIView {
+         view.setTranslationY(desiredCenterY - baseCenterY);
+     }
+ 
++    /* IRIS_26693_GLOBAL_CONTROL_GEOMETRY_OWNER
++     * Preview geometry and camera-chrome geometry are deliberately separate authorities. The
++     * preview container may move/resize for Video, RAW Video or 16:9. This fixed 3:4 reference is
++     * normalized to the root Photo top-shell boundary in window space, so every mode/aspect sees
++     * the same final control coordinate system without hard-coding device pixels.
++     */
++    private boolean iris26693SyncFixedControlGeometryReference(View root, View controlReference) {
++        final View cameraContainer = root.findViewById(R.id.camera_container);
++        final View topShell = root.findViewById(R.id.top_black_shell);
++        if (cameraContainer == null || topShell == null || controlReference == null) return false;
++        if (!root.isLaidOut() || !cameraContainer.isLaidOut() || !topShell.isLaidOut()) return false;
++        int[] cameraLocation = new int[2];
++        int[] shellLocation = new int[2];
++        cameraContainer.getLocationInWindow(cameraLocation);
++        topShell.getLocationInWindow(shellLocation);
++        final int desiredTopMargin = Math.round(
++                shellLocation[1] + topShell.getHeight() - cameraLocation[1]);
++        android.view.ViewGroup.LayoutParams raw = controlReference.getLayoutParams();
++        if (!(raw instanceof androidx.constraintlayout.widget.ConstraintLayout.LayoutParams)) {
++            return false;
++        }
++        androidx.constraintlayout.widget.ConstraintLayout.LayoutParams params =
++                (androidx.constraintlayout.widget.ConstraintLayout.LayoutParams) raw;
++        if (params.topMargin != desiredTopMargin) {
++            params.topMargin = desiredTopMargin;
++            controlReference.setLayoutParams(params);
++            return false;
++        }
++        return controlReference.getHeight() > 0;
++    }
++
+     private void applyAdaptiveBottomSafeLayout(boolean videoStyle) {
+         if (bottombuttons == null || bottombuttons.shutterButtonContainer == null) return;
+         final View root = cameraFragment.cameraFragmentBinding.getRoot();
+-        final View viewfinderReference = root.findViewById(R.id.dummy_reference_view);
++        final View previewReference = root.findViewById(R.id.dummy_reference_view);
++        final View controlReference = root.findViewById(R.id.control_geometry_reference);
+         final View lensSelector = root.findViewById(R.id.aux_buttons_container);
+         final View shutter = bottombuttons.shutterButtonContainer;
+         final View gallery = root.findViewById(R.id.galery_button_container);
+         final View cameraSwitch = root.findViewById(R.id.camera_switch_container);
+         final View modePicker = mModePicker;
+         final View manualToggle = root.findViewById(R.id.manual_toggle_stack);
+-        if (viewfinderReference == null || lensSelector == null || gallery == null
+-                || cameraSwitch == null || modePicker == null || manualToggle == null) return;
+-        if (root.getHeight() <= 0 || viewfinderReference.getHeight() <= 0
+-                || lensSelector.getHeight() <= 0 || shutter.getHeight() <= 0
+-                || modePicker.getHeight() <= 0) return;
++        if (previewReference == null || controlReference == null || lensSelector == null
++                || gallery == null || cameraSwitch == null || modePicker == null
++                || manualToggle == null) return;
++        if (!iris26693SyncFixedControlGeometryReference(root, controlReference)) return;
++        if (root.getHeight() <= 0 || previewReference.getHeight() <= 0
++                || controlReference.getHeight() <= 0 || lensSelector.getHeight() <= 0
++                || shutter.getHeight() <= 0 || modePicker.getHeight() <= 0) return;
+ 
+         final float density = cameraFragment.getResources().getDisplayMetrics().density;
+         // IRIS_26692_VIDEO_PHOTO_CONTROL_GEOMETRY
+@@ -940,18 +975,22 @@ public class CameraUIViewImpl implements CameraUIView {
+         iris26627ResetAdaptiveControl(modePicker);
+ 
+         int[] rootLocation = new int[2];
+-        int[] referenceLocation = new int[2];
++        int[] previewLocation = new int[2];
++        int[] controlReferenceLocation = new int[2];
+         root.getLocationInWindow(rootLocation);
+-        viewfinderReference.getLocationInWindow(referenceLocation);
++        previewReference.getLocationInWindow(previewLocation);
++        controlReference.getLocationInWindow(controlReferenceLocation);
+         final float rootBottom = rootLocation[1] + root.getHeight();
+-        final float viewfinderBottom = referenceLocation[1] + viewfinderReference.getHeight();
++        final float previewBottom = previewLocation[1] + previewReference.getHeight();
++        final float controlReferenceBottom =
++                controlReferenceLocation[1] + controlReference.getHeight();
+ 
+         View selectedLens = iris26627SelectedLensChild(lensSelector);
+         float selectedTop = iris26627WindowTop(selectedLens);
+         float selectedBottom = selectedTop + selectedLens.getHeight();
+         final float chevronBottom = iris26627WindowTop(manualToggle) + manualToggle.getHeight();
+         final float minimumSelectedTop = Math.max(
+-                viewfinderBottom + previewClearancePx, chevronBottom + chevronClearancePx);
++                controlReferenceBottom + previewClearancePx, chevronBottom + chevronClearancePx);
+         /* Prefer the lens row 3dp higher for more shutter separation, but never weaken the
+          * measured 10dp viewfinder or 8dp chevron hard clearances. */
+         final float lensShiftPx = Math.max(-preferredLensLiftPx, minimumSelectedTop - selectedTop);
+@@ -1022,19 +1061,33 @@ public class CameraUIViewImpl implements CameraUIView {
+         modePicker.setScaleY(scale);
+         modePicker.setTranslationY(modeShift);
+ 
++        final boolean aspect169 = PhotonCamera.getSettings().aspect169;
++        final String settledSignature = displayedMode + ":" + aspect169 + ":" + videoStyle
++                + ":" + Math.round(previewBottom) + ":" + Math.round(controlReferenceBottom);
+         if (!Float.isFinite(iris26627LastLensClearanceShiftPx)
+                 || Math.abs(iris26627LastLensClearanceShiftPx - lensShiftPx) > 0.5f
+                 || !Float.isFinite(iris26627LastControlScale)
+-                || Math.abs(iris26627LastControlScale - scale) > 0.002f) {
++                || Math.abs(iris26627LastControlScale - scale) > 0.002f
++                || !settledSignature.equals(iris26693LastSettledGeometrySignature)) {
+             Log.i(TAG, "IRIS_26627_UI_SAFE_REGION lensShiftPx=" + lensShiftPx
+                     + " controlScale=" + scale
+                     + " systemBottomInsetPx=" + iris26627BottomSystemInsetPx
+-                    + " viewfinderBottom=" + viewfinderBottom
++                    + " viewfinderBottom=" + previewBottom
++                    + " controlReferenceBottom=" + controlReferenceBottom
+                     + " chevronBottom=" + chevronBottom
+                     + " safeBottom=" + safeBottom
+                     + " videoStyle=" + videoStyle);
++            Log.i(TAG, "IRIS_26693_UI_GEOMETRY_INVARIANT mode=" + displayedMode
++                    + " aspect169=" + aspect169
++                    + " previewBottom=" + previewBottom
++                    + " controlReferenceBottom=" + controlReferenceBottom
++                    + " controlScale=" + scale
++                    + " lensShiftPx=" + lensShiftPx
++                    + " finalOwner=fixedPhotoControlReference"
++                    + " videoStyleGeometryAuthority=false");
+             iris26627LastLensClearanceShiftPx = lensShiftPx;
+             iris26627LastControlScale = scale;
++            iris26693LastSettledGeometrySignature = settledSignature;
+         }
+     }
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/SpektraLiveHistogramView.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/SpektraLiveHistogramView.java
+index 79e59ba1fa78c6176c0ecfb4182af8152862f0e8..968e2c9368c3211a93c478ce67fa30a7de32747f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/SpektraLiveHistogramView.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/SpektraLiveHistogramView.java
+@@ -7,7 +7,6 @@ import android.graphics.Paint;
+ import android.graphics.Path;
+ import android.graphics.RectF;
+ import android.os.Handler;
+-import android.os.HandlerThread;
+ import android.os.Looper;
+ import android.util.AttributeSet;
+ import android.view.View;
+@@ -18,25 +17,22 @@ import com.particlesdevs.photoncamera.spektra.SpektraModeController;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+ /**
+- * IRIS_26692_SPEKTRA_PHOTO_STYLE_HISTOGRAM_OWNER
++ * IRIS_26693_SPEKTRA_PRESENTATION_ONLY_HISTOGRAM
+  *
+- * Spektra-only histogram data comes from the active Unspektrawesome renderer, while presentation
+- * intentionally matches IrisLiveHistogramView exactly. The returned native pixels are samples of
+- * the rendered Spektra viewfinder; they are reduced to 64 RGB bins and are never drawn as an image.
+- * The ordinary Iris histogram implementation remains untouched.
++ * Unspektrawesome owns native histogram acquisition and lifecycle. This Iris View is deliberately
++ * presentation-only: it receives completed native viewfinder samples, reduces them to Photo-style
++ * 64-bin RGB curves, and draws the same pill/geometry as IrisLiveHistogramView. It owns no worker,
++ * polling cadence, renderer generation, camera session, lens switch or capture lifecycle.
+  */
+ public final class SpektraLiveHistogramView extends View {
+     private static final String TAG = "SpektraHistogram";
+     private static final int NATIVE_SIDE = 128;
+     private static final int NATIVE_PIXELS = NATIVE_SIDE * NATIVE_SIDE;
+     private static final int BINS = 64;
+-    private static final long POLL_MS = 50L;
+ 
+     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+-    private HandlerThread workerThread;
+-    private Handler workerHandler;
+     private volatile SpektraModeController controller;
+-    private volatile boolean running;
++    private volatile boolean spektraActive;
+     private boolean failureLogged;
+ 
+     private volatile float[] red = new float[BINS];
+@@ -50,6 +46,8 @@ public final class SpektraLiveHistogramView extends View {
+     private final Path innerClipPath = new Path();
+     private final RectF innerClipRect = new RectF();
+     private final RectF borderRect = new RectF();
++    private final com.unspektrawesome.preview.RawVulkanPreviewController.HistogramListener
++            histogramListener = this::acceptHistogramPixels;
+ 
+     public SpektraLiveHistogramView(Context context) { super(context); init(); }
+     public SpektraLiveHistogramView(Context context, @Nullable AttributeSet attrs) {
+@@ -71,89 +69,76 @@ public final class SpektraLiveHistogramView extends View {
+         borderPaint.setColor(Color.argb(0xCC, 255, 255, 255));
+     }
+ 
+-    public void bind(@Nullable SpektraModeController controller) {
+-        this.controller = controller;
+-        if (controller == null) clearHistogram();
++    public void bind(@Nullable SpektraModeController nextController) {
++        SpektraModeController previous = controller;
++        if (previous == nextController) return;
++        if (previous != null) previous.setHistogramListener(null);
++        controller = nextController;
++        syncPresentationSubscription();
+     }
+ 
+     public void setSpektraActive(boolean active) {
++        spektraActive = active;
+         setVisibility(active ? VISIBLE : GONE);
+-        if (active && isAttachedToWindow()) startPolling(); else stopPolling();
++        syncPresentationSubscription();
++        if (!active) clearHistogram();
+     }
+ 
+     @Override protected void onAttachedToWindow() {
+         super.onAttachedToWindow();
+-        if (getVisibility() == VISIBLE) startPolling();
++        syncPresentationSubscription();
+     }
+ 
+     @Override protected void onDetachedFromWindow() {
+-        stopPolling();
+-        controller = null;
++        SpektraModeController current = controller;
++        if (current != null) current.setHistogramListener(null);
++        clearHistogram();
+         super.onDetachedFromWindow();
+     }
+ 
+-    private void startPolling() {
+-        if (running) return;
+-        running = true;
+-        if (workerThread == null || !workerThread.isAlive()) {
+-            workerThread = new HandlerThread("Iris26692SpektraHistogram");
+-            workerThread.start();
+-            workerHandler = new Handler(workerThread.getLooper());
+-        }
+-        schedulePoll(0L);
++    private void syncPresentationSubscription() {
++        SpektraModeController current = controller;
++        if (current == null) return;
++        current.setHistogramListener(
++                spektraActive && isAttachedToWindow() ? histogramListener : null);
+     }
+ 
+-    private void stopPolling() {
+-        running = false;
+-        if (workerHandler != null) workerHandler.removeCallbacksAndMessages(null);
+-        if (workerThread != null) {
+-            workerThread.quitSafely();
+-            workerThread = null;
+-            workerHandler = null;
++    private void acceptHistogramPixels(int[] pixels) {
++        if (!spektraActive || pixels == null || pixels.length == 0) {
++            if (spektraActive) clearHistogram();
++            return;
+         }
+-        clearHistogram();
+-    }
+-
+-    private void schedulePoll(long delayMs) {
+-        Handler worker = workerHandler;
+-        if (!running || worker == null) return;
+-        worker.postDelayed(this::pollOnce, delayMs);
+-    }
+-
+-    private void pollOnce() {
+-        if (!running) return;
+-        SpektraModeController active = controller;
+-        int[] pixels = active == null ? new int[0] : active.histogramPixels(1.0f);
+-        if (pixels.length == NATIVE_PIXELS) {
+-            float[] r = new float[BINS];
+-            float[] g = new float[BINS];
+-            float[] b = new float[BINS];
+-            for (int color : pixels) {
+-                r[Math.min(BINS - 1, Color.red(color) * BINS / 256)] += 1.0f;
+-                g[Math.min(BINS - 1, Color.green(color) * BINS / 256)] += 1.0f;
+-                b[Math.min(BINS - 1, Color.blue(color) * BINS / 256)] += 1.0f;
+-            }
+-            smooth3(r); smooth3(g); smooth3(b);
+-            float max = 1.0f;
+-            for (int i = 2; i < BINS; i++) {
+-                max = Math.max(max, Math.max(r[i], Math.max(g[i], b[i])));
++        if (pixels.length != NATIVE_PIXELS) {
++            if (!failureLogged) {
++                failureLogged = true;
++                Log.w(TAG, "IRIS_26693_SPEKTRA_HISTOGRAM_BAD_SOURCE_SIZE length=" + pixels.length);
+             }
+-            float darkCap = max * 1.25f;
+-            r[0] = Math.min(r[0], darkCap); r[1] = Math.min(r[1], darkCap);
+-            g[0] = Math.min(g[0], darkCap); g[1] = Math.min(g[1], darkCap);
+-            b[0] = Math.min(b[0], darkCap); b[1] = Math.min(b[1], darkCap);
+-            normalize(r, max); normalize(g, max); normalize(b, max);
+-            mainHandler.post(() -> {
+-                if (!running) return;
+-                red = r; green = g; blue = b;
+-                failureLogged = false;
+-                postInvalidateOnAnimation();
+-            });
+-        } else if (pixels.length != 0 && !failureLogged) {
+-            failureLogged = true;
+-            Log.w(TAG, "IRIS_26692_SPEKTRA_HISTOGRAM_BAD_SOURCE_SIZE length=" + pixels.length);
++            return;
++        }
++        float[] r = new float[BINS];
++        float[] g = new float[BINS];
++        float[] b = new float[BINS];
++        for (int color : pixels) {
++            r[Math.min(BINS - 1, Color.red(color) * BINS / 256)] += 1.0f;
++            g[Math.min(BINS - 1, Color.green(color) * BINS / 256)] += 1.0f;
++            b[Math.min(BINS - 1, Color.blue(color) * BINS / 256)] += 1.0f;
++        }
++        smooth3(r); smooth3(g); smooth3(b);
++        float max = 1.0f;
++        for (int i = 2; i < BINS; i++) {
++            max = Math.max(max, Math.max(r[i], Math.max(g[i], b[i])));
+         }
+-        schedulePoll(POLL_MS);
++        float darkCap = max * 1.25f;
++        r[0] = Math.min(r[0], darkCap); r[1] = Math.min(r[1], darkCap);
++        g[0] = Math.min(g[0], darkCap); g[1] = Math.min(g[1], darkCap);
++        b[0] = Math.min(b[0], darkCap); b[1] = Math.min(b[1], darkCap);
++        normalize(r, max); normalize(g, max); normalize(b, max);
++        mainHandler.post(() -> {
++            if (!spektraActive) return;
++            red = r; green = g; blue = b;
++            failureLogged = false;
++            postInvalidateOnAnimation();
++        });
+     }
+ 
+     private static void smooth3(float[] x) {
+diff --git a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+index b9ce4097e1ef072b2a1eb0f9ca767f958f68e98f..138d18e5dbad727e00d8bd11b7ca7afeae38e67c 100644
+--- a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
++++ b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+@@ -74,6 +74,9 @@ class RawVulkanPreviewController(
+     context: Context,
+     private val spektraRepository: SpektraStateRepository,
+ ) : DefaultLifecycleObserver, AutoCloseable {
++    fun interface HistogramListener {
++        fun onHistogramPixels(pixels: IntArray)
++    }
+     private val lock = Any()
+     private val cameraManager = context.applicationContext
+         .getSystemService(CameraManager::class.java)
+@@ -108,6 +111,10 @@ class RawVulkanPreviewController(
+     private var previewSpektraRevision = Long.MIN_VALUE
+     private var lensShadingBuffer: ByteBuffer? = null
+     private var lastSuccessPublishAtMs = 0L
++    // IRIS_26693_STANDALONE_HISTOGRAM_LIFECYCLE_OWNER
++    // Acquisition lives with the Unspektrawesome preview owner, never in an Iris worker/poller.
++    private var histogramListener: HistogramListener? = null
++    private var lastHistogramPublishAtMs = 0L
+     private val exposureMeterBuffer = directBuffer(VulkanRenderer.EXPOSURE_METER_BYTES)
+     private val previewTimingBuffer = directBuffer(8)
+     private var lastExposureMeterSequence = Long.MIN_VALUE
+@@ -225,6 +232,7 @@ class RawVulkanPreviewController(
+             return@synchronized false
+         }
+         pendingCapture = request
++        clearHistogramLocked()
+         Log.i(
+             TAG,
+             "IRIS_26691_SPEKTRA_CAPTURE_ACCEPT route=${request.owner.camera.route.routeId} " +
+@@ -322,6 +330,8 @@ class RawVulkanPreviewController(
+         active = null
+         attachedSurface = null
+         pendingCapture = null
++        clearHistogramLocked()
++        histogramListener = null
+         renderer.close()
+         captureWriter.shutdownNow()
+         publishLocked(RawPreviewPhase.CLOSED, "RAW preview is closed")
+@@ -497,14 +507,38 @@ class RawVulkanPreviewController(
+         )
+     }
+ 
+-    fun histogramPixels(scale: Float): IntArray {
+-        require(scale.isFinite() && scale > 0f) { "Histogram scale must be finite and positive" }
+-        val available = synchronized(lock) {
+-            !closed && resumed && active?.session?.state() == Camera2RawSession.State.STREAMING &&
+-                mutableStatus.value.phase == RawPreviewPhase.STREAMING
++    fun setHistogramListener(listener: HistogramListener?) = synchronized(lock) {
++        histogramListener = listener
++        lastHistogramPublishAtMs = 0L
++        if (listener != null && (closed || !resumed ||
++            active?.session?.state() != Camera2RawSession.State.STREAMING ||
++            mutableStatus.value.phase != RawPreviewPhase.STREAMING
++        )) {
++            runCatching { listener.onHistogramPixels(IntArray(0)) }
++        }
++    }
++
++    private fun publishHistogramFromRenderedFrameLocked(owner: ActiveSession, nowMs: Long) {
++        val listener = histogramListener ?: return
++        if (closed || !resumed || active !== owner ||
++            owner.session.state() != Camera2RawSession.State.STREAMING
++        ) return
++        if (nowMs - lastHistogramPublishAtMs < HISTOGRAM_MIN_INTERVAL_MS) return
++        lastHistogramPublishAtMs = nowMs
++        val pixels = runCatching { renderer.histogramPixels(1.0f) }.getOrElse { IntArray(0) }
++        runCatching { listener.onHistogramPixels(pixels) }.onFailure { error ->
++            Log.w(TAG, "IRIS_26693_SPEKTRA_HISTOGRAM_PRESENTATION_FAILURE " +
++                (error.message ?: error.javaClass.simpleName))
++        }
++    }
++
++    private fun clearHistogramLocked() {
++        lastHistogramPublishAtMs = 0L
++        val listener = histogramListener ?: return
++        runCatching { listener.onHistogramPixels(IntArray(0)) }.onFailure { error ->
++            Log.w(TAG, "IRIS_26693_SPEKTRA_HISTOGRAM_CLEAR_FAILURE " +
++                (error.message ?: error.javaClass.simpleName))
+         }
+-        if (!available) return IntArray(0)
+-        return runCatching { renderer.histogramPixels(scale) }.getOrDefault(IntArray(0))
+     }
+ 
+     private fun lensShadingSummary(map: LensShadingMapParameters?): String =
+@@ -599,6 +633,7 @@ class RawVulkanPreviewController(
+     }
+ 
+     private fun stopActiveLocked() {
++        clearHistogramLocked()
+         val current = active ?: return
+         if (pendingCapture?.owner === current &&
+             mutableCaptureStatus.value.phase == RawCapturePhase.CAPTURING
+@@ -738,6 +773,7 @@ class RawVulkanPreviewController(
+                 )
+                 renderedFrames++
+                 val now = SystemClock.elapsedRealtime()
++                publishHistogramFromRenderedFrameLocked(owner, now)
+                 val previous = mutableStatus.value
+                 if (previous.phase != RawPreviewPhase.STREAMING ||
+                     previous.spektraRevision != state.revisionId ||
+@@ -917,6 +953,7 @@ class RawVulkanPreviewController(
+     private companion object {
+         const val TAG = "UnspekRawPreview"
+         const val STATUS_PUBLISH_INTERVAL_MS = 1_000L
++        const val HISTOGRAM_MIN_INTERVAL_MS = 50L
+         const val NANOSECONDS_TO_SECONDS = 1e-9
+ 
+         val BUSY_CAPTURE_PHASES = setOf(RawCapturePhase.CAPTURING, RawCapturePhase.SAVING)
+diff --git a/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt b/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt
+index 19d897247915b758d7478db7f4d1942eb273851a..30456517e9512a2b8e3c62c2283ce2d28f6c3be7 100644
+--- a/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt
++++ b/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt
+@@ -133,7 +133,8 @@ class VulkanRenderer(context: Context) : AutoCloseable {
+ 
+     @Synchronized
+     fun histogramPixels(scale: Float): IntArray = withHandle { current ->
+-        nativeHistogramPixels(current, scale)
++        // IRIS_26693_NATIVE_HISTOGRAM_NULL_CONTRACT: JNI may transiently report no frame as null.
++        nativeHistogramPixels(current, scale) ?: IntArray(0)
+     }
+ 
+     @Synchronized
+@@ -200,7 +201,7 @@ class VulkanRenderer(context: Context) : AutoCloseable {
+     private external fun nativeGetDiagnosticString(handle: Long): String
+     private external fun nativeWarmUp(handle: Long, preview: Boolean, step: Int): Boolean
+     private external fun nativePollExposureMeter(handle: Long, target: ByteBuffer): Boolean
+-    private external fun nativeHistogramPixels(handle: Long, scale: Float): IntArray
++    private external fun nativeHistogramPixels(handle: Long, scale: Float): IntArray?
+     private external fun nativeBeginLensSwitchBlur(handle: Long): Boolean
+     private external fun nativeRelease(handle: Long)
+ 
+diff --git a/app/src/main/res/layout/camera_fragment.xml b/app/src/main/res/layout/camera_fragment.xml
+index b36a5536a08b81056afa34d40d3064cc22b8dd43..c9f1b32dfb4df17ac4450ed6ca0a8a3be0ec7a4c 100644
+--- a/app/src/main/res/layout/camera_fragment.xml
++++ b/app/src/main/res/layout/camera_fragment.xml
+@@ -178,6 +178,22 @@
+                     app:layout_constraintStart_toStartOf="parent"
+                     app:layout_constraintEnd_toEndOf="parent" />
+ 
++            <!-- IRIS_26693_GLOBAL_CONTROL_GEOMETRY_REFERENCE
++                 Fixed camera chrome owns a Photo 4:3 reference independently of the preview.
++                 CameraUIViewImpl normalizes this reference to the root Photo top-shell boundary,
++                 so Video/RAW Video and 16:9 may keep their legitimate preview geometry without
++                 moving lens/manual/bottom controls. -->
++            <FrameLayout
++                    android:id="@+id/control_geometry_reference"
++                    android:layout_width="0dp"
++                    android:layout_height="0dp"
++                    android:clickable="false"
++                    android:visibility="invisible"
++                    app:layout_constraintDimensionRatio="3:4"
++                    app:layout_constraintTop_toTopOf="parent"
++                    app:layout_constraintStart_toStartOf="parent"
++                    app:layout_constraintEnd_toEndOf="parent" />
++
+             <include
+                     android:id="@+id/layout_bottombar"
+                     layout="@layout/layout_main_bottombar"
+@@ -195,7 +211,7 @@
+                     android:layout_marginStart="14dp"
+                     android:layout_marginEnd="14dp"
+                     android:layout_marginBottom="6dp"
+-                    app:layout_constraintBottom_toBottomOf="@id/dummy_reference_view"
++                    app:layout_constraintBottom_toBottomOf="@id/control_geometry_reference"
+                     app:layout_constraintStart_toStartOf="parent"
+                     app:layout_constraintEnd_toEndOf="parent" />
+             <com.particlesdevs.photoncamera.ui.camera.views.AuxButtonsLayout
+@@ -211,7 +227,7 @@
+                     setAuxButtonModel="@{auxmodel}"
+                     setActiveId="@{auxmodel.currentCameraId}"
+                     bindViewGroupChildrenRotate="@{uimodel}"
+-                    app:layout_constraintBottom_toBottomOf="@id/dummy_reference_view"
++                    app:layout_constraintBottom_toBottomOf="@id/control_geometry_reference"
+                     app:layout_constraintStart_toStartOf="parent"
+                     app:layout_constraintEnd_toEndOf="parent"
+                     android:layout_marginBottom="-58dp" />
+diff --git a/app/version.properties b/app/version.properties
+index 6b9c0ac14bd8c1cc2797bb42cf893f061a6c3760..cf0a12b25d457c282eaab8f315627ef614d73688 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726692
+-VERSION_BUILD=26692
++VERSION_NAME=0.9726693
++VERSION_BUILD=26693
