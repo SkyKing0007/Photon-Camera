@@ -1,0 +1,244 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+index 66f336316321ddfb32d0d16894cd11b79fd5d241..520b642799ae368a50679e4a4e32b7a734cf9769 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+@@ -45,7 +45,8 @@ public final class SpektraModeController {
+     private final Host host;
+     private final CameraCatalog cameraCatalog;
+     private final SpektraStateRepository spektraRepository;
+-    private final RawVulkanPreviewController controller;
++    @Nullable
++    private volatile RawVulkanPreviewController controller;
+     private final CameraPreferences preferences;
+     private final ExecutorService bridgeExecutor = Executors.newSingleThreadExecutor(r -> {
+         Thread thread = new Thread(r, "IrisSpektraBridge");
+@@ -75,8 +76,10 @@ public final class SpektraModeController {
+         this.cameraCatalog = new CameraCatalog(activity.getApplicationContext());
+         this.spektraRepository = new SpektraStateRepository(
+                 InMemorySpektraStatePersistence.INSTANCE, 50);
+-        this.controller = new RawVulkanPreviewController(
+-                activity.getApplicationContext(), spektraRepository);
++        // IRIS_26690_SPEKTRA_LAZY_NATIVE_OWNER
++        // Do not construct RawVulkanPreviewController/VulkanRenderer during ordinary Iris startup.
++        // The exact Unspektrawesome native owner is created only when SPEKTRA becomes active.
++        this.controller = null;
+         // Exact 1.1.2 factory viewfinder default: LOW / 0.25 at 30 fps.
+         this.preferences = new CameraPreferences(
+                 RawPreviewQuality.LOW,
+@@ -95,7 +98,30 @@ public final class SpektraModeController {
+         if (previewView != null) previewView.unbind();
+         previewView = surfaceView;
+         lifecycleOwner = owner;
+-        previewView.bind(controller, owner);
++        // Binding the dormant Spektra SurfaceView must not load the native renderer.
++        if (controller != null) previewView.bind(controller, owner);
++    }
++
++    @NonNull
++    private synchronized RawVulkanPreviewController ensureControllerForActivation() {
++        if (shutdown) throw new IllegalStateException("Spektra controller is shut down");
++        if (controller != null) return controller;
++        RawVulkanPreviewController created = new RawVulkanPreviewController(
++                activity.getApplicationContext(), spektraRepository);
++        controller = created;
++        if (previewView != null && lifecycleOwner != null) {
++            previewView.bind(created, lifecycleOwner);
++        }
++        return created;
++    }
++
++    private void failActivation(int token, @NonNull Throwable error) {
++        if (token != generation.get()) return;
++        active = false;
++        selectedCamera = null;
++        bridgeError = error.getClass().getSimpleName() + ": "
++                + (error.getMessage() == null ? "Spektra initialization failed" : error.getMessage());
++        activity.runOnUiThread(host::onSpektraPreviewStopped);
+     }
+ 
+     public void resume(@Nullable String cameraId, int flashPreference) {
+@@ -105,7 +131,14 @@ public final class SpektraModeController {
+         bridgeError = null;
+         final int token = generation.incrementAndGet();
+         activity.runOnUiThread(host::onSpektraPreviewPreparing);
+-        configureAsync(token, cameraId);
++        final RawVulkanPreviewController activeController;
++        try {
++            activeController = ensureControllerForActivation();
++        } catch (RuntimeException | LinkageError error) {
++            failActivation(token, error);
++            return;
++        }
++        configureAsync(token, cameraId, activeController);
+     }
+ 
+     public void restart(@Nullable String cameraId, int flashPreference) {
+@@ -115,11 +148,19 @@ public final class SpektraModeController {
+         bridgeError = null;
+         final int token = generation.incrementAndGet();
+         activity.runOnUiThread(host::onSpektraPreviewPreparing);
+-        controller.configure(null, preferences);
+-        configureAsync(token, cameraId);
++        final RawVulkanPreviewController activeController;
++        try {
++            activeController = ensureControllerForActivation();
++            activeController.configure(null, preferences);
++        } catch (RuntimeException | LinkageError error) {
++            failActivation(token, error);
++            return;
++        }
++        configureAsync(token, cameraId, activeController);
+     }
+ 
+-    private void configureAsync(int token, @Nullable String cameraId) {
++    private void configureAsync(int token, @Nullable String cameraId,
++            @NonNull RawVulkanPreviewController activeController) {
+         bridgeExecutor.execute(() -> {
+             if (shutdown || !active || token != generation.get()) return;
+             try {
+@@ -130,15 +171,15 @@ public final class SpektraModeController {
+                 }
+                 if (shutdown || !active || token != generation.get()) return;
+                 selectedCamera = selected;
+-                controller.setManualControls(manualIso, manualExposureNs, manualEvSteps);
+-                controller.setManualFocus(manualFocusDistance);
+-                controller.configure(selected, preferences);
++                activeController.setManualControls(manualIso, manualExposureNs, manualEvSteps);
++                activeController.setManualFocus(manualFocusDistance);
++                activeController.configure(selected, preferences);
+             } catch (CameraAccessException | RuntimeException error) {
+                 if (token != generation.get()) return;
+                 bridgeError = error.getClass().getSimpleName() + ": "
+                         + (error.getMessage() == null ? "camera configuration failed" : error.getMessage());
+                 selectedCamera = null;
+-                controller.configure(null, preferences);
++                activeController.configure(null, preferences);
+             }
+         });
+     }
+@@ -177,7 +218,8 @@ public final class SpektraModeController {
+         active = false;
+         generation.incrementAndGet();
+         selectedCamera = null;
+-        controller.configure(null, preferences);
++        RawVulkanPreviewController current = controller;
++        if (current != null) current.configure(null, preferences);
+         activity.runOnUiThread(host::onSpektraPreviewStopped);
+     }
+ 
+@@ -190,25 +232,35 @@ public final class SpektraModeController {
+         if (previewView != null) previewView.unbind();
+         previewView = null;
+         lifecycleOwner = null;
+-        controller.close();
++        if (controller != null) {
++            controller.close();
++            controller = null;
++        }
+         bridgeExecutor.shutdownNow();
+         activity.runOnUiThread(host::onSpektraPreviewStopped);
+     }
+ 
+     public boolean isActive() { return active && !shutdown; }
+-    public boolean isShutterReady() { return isActive() && controller.isCaptureReady(); }
++
++    public boolean isShutterReady() {
++        RawVulkanPreviewController current = controller;
++        return isActive() && current != null && current.isCaptureReady();
++    }
+ 
+     public String debugStatus() {
+         String selected = selectedCamera == null ? "none" : selectedCamera.route.routeId;
+         String error = bridgeError == null ? "none" : bridgeError;
++        RawVulkanPreviewController current = controller;
++        String controllerStatus = current == null ? "not_initialized" : current.debugStatus();
+         return "active=" + active + " shutdown=" + shutdown + " requested=" + requestedCameraId
+                 + " selected=" + selected + " flashPref=" + flashPreference
+-                + " error=" + error + " controller={" + controller.debugStatus() + "}";
++                + " error=" + error + " controller={" + controllerStatus + "}";
+     }
+ 
+     public void takePicture() {
+-        if (!isActive()) return;
+-        controller.captureStill();
++        RawVulkanPreviewController current = controller;
++        if (!isActive() || current == null) return;
++        current.captureStill();
+     }
+ 
+     public void setFlashPreference(int value) {
+@@ -221,17 +273,23 @@ public final class SpektraModeController {
+         manualIso = iso;
+         manualExposureNs = exposureNs;
+         manualEvSteps = evSteps;
+-        controller.setManualControls(iso, exposureNs, evSteps);
++        RawVulkanPreviewController current = controller;
++        if (current != null) current.setManualControls(iso, exposureNs, evSteps);
+     }
+ 
+     public void setManualFocus(@Nullable Float focusDistance) {
+         manualFocusDistance = focusDistance;
+-        controller.setManualFocus(focusDistance);
++        RawVulkanPreviewController current = controller;
++        if (current != null) current.setManualFocus(focusDistance);
+     }
+ 
+     public void touchFocus(float normalizedX, float normalizedY, boolean lock) {
+-        controller.touchFocus(normalizedX, normalizedY, lock);
++        RawVulkanPreviewController current = controller;
++        if (current != null) current.touchFocus(normalizedX, normalizedY, lock);
+     }
+ 
+-    public void unlockFocus() { controller.unlockFocus(); }
++    public void unlockFocus() {
++        RawVulkanPreviewController current = controller;
++        if (current != null) current.unlockFocus();
++    }
+ }
+diff --git a/app/src/main/java/com/unspektrawesome/diagnostics/InternalLogRecorder.java b/app/src/main/java/com/unspektrawesome/diagnostics/InternalLogRecorder.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4689b61b9019137ce980bfabce1c7b66b21d85fd
+--- /dev/null
++++ b/app/src/main/java/com/unspektrawesome/diagnostics/InternalLogRecorder.java
+@@ -0,0 +1,30 @@
++package com.unspektrawesome.diagnostics;
++
++import android.util.Log;
++
++import androidx.annotation.Keep;
++
++/**
++ * JNI load-time contract required by the exact Unspektrawesome 1.1.2 native library.
++ *
++ * The native JNI_OnLoad resolves this exact class name and the exact static method descriptor
++ * recordNative(int, String, String): void before VulkanRenderer can be used. Keep both names
++ * stable and never allow a native diagnostic callback to throw back across JNI.
++ */
++@Keep
++public final class InternalLogRecorder {
++    private static final String FALLBACK_TAG = "UnspektrawesomeNative";
++
++    private InternalLogRecorder() {}
++
++    @Keep
++    public static void recordNative(int priority, String tag, String message) {
++        try {
++            Log.println(priority,
++                    tag == null || tag.isEmpty() ? FALLBACK_TAG : tag,
++                    message == null ? "" : message);
++        } catch (Throwable ignored) {
++            // Diagnostics must never destabilize JNI/native rendering.
++        }
++    }
++}
+diff --git a/app/version.properties b/app/version.properties
+index 4fef5fed09fe86c567b0144c7a4fe0a9642c94c7..1092e0f815d23e62f7d570494297b41703966e23 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726689
+-VERSION_BUILD=26689
++VERSION_NAME=0.9726690
++VERSION_BUILD=26690
