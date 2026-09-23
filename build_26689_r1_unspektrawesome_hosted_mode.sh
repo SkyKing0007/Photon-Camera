@@ -156,10 +156,10 @@ prepare_glslang(){
  rm -rf "$GLSLANG_DIR"; mkdir -p "$GLSLANG_DIR"; tar -xzf "$archive" -C "$GLSLANG_DIR"
  compiler="$(resolve_glslang_compiler "$GLSLANG_DIR")" || fail "pinned glslang compiler missing"
  "$compiler" --version | tee "$OUT/26689_glslang_version.txt"
- export IRIS26689_SPEKTRA_GLSLANG="$compiler"; [[ -x "$IRIS26689_SPEKTRA_GLSLANG" ]] || fail "pinned glslang is not executable"
+ export IRIS26681_SPEKTRA_GLSLANG="$compiler"; [[ -x "$IRIS26681_SPEKTRA_GLSLANG" ]] || fail "pinned glslang is not executable"
 }
 compile_spektra_raw_shader(){
- local compiler="$IRIS26689_SPEKTRA_GLSLANG" outspv="$WORK/SpektraRawDevelop.comp.spv"
+ local compiler="$IRIS26681_SPEKTRA_GLSLANG" outspv="$WORK/SpektraRawDevelop.comp.spv"
  "$compiler" -V "$AFTER/app/src/main/cpp/spektra/SpektraRawDevelop.comp" -o "$outspv" 2>&1 | tee "$OUT/26689_glslang_raw_develop.log"
  [[ -s "$outspv" ]] || fail "Spektra RAW shader SPIR-V missing"
  sha256sum "$AFTER/app/src/main/cpp/spektra/SpektraRawDevelop.comp" "$outspv" > "$OUT/26689_spektra_raw_shader_compile.sha256"
