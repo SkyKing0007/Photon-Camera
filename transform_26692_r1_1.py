@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+from pathlib import Path
+import hashlib, shutil, sys
+if len(sys.argv)!=3: raise SystemExit('usage: transform_26692_r1_1.py BASE DEST')
+base=Path(sys.argv[1]); dest=Path(sys.argv[2]); root=Path(__file__).resolve().parent
+changed=[x.strip() for x in (root/'R1_1_26692_RUNTIME_CHANGED_PATHS.txt').read_text().splitlines() if x.strip()]
+def sha(p): return hashlib.sha256(p.read_bytes()).hexdigest()
+def manifest(path):
+ out={}
+ for line in path.read_text().splitlines():
+  if line.strip(): h,p=line.split('  ',1); out[p]=h
+ return out
+pre=manifest(root/'R1_1_26692_PREWRITE_SOURCE_HASHES.sha256')
+files=[p for p in base.rglob('*') if p.is_file()]
+assert len(files)==1822,len(files)
+assert len(changed)==11,len(changed)
+for rel,h in pre.items():
+ p=base/rel; assert p.is_file() and sha(p)==h,f'prewrite authority mismatch: {rel}'
+if dest.exists(): shutil.rmtree(dest)
+shutil.copytree(base,dest)
+payload=root/'handoff_payload_26692_r1_1'
+for rel in changed:
+ src=payload/rel; dst=dest/rel
+ assert src.is_file(),f'payload missing: {rel}'
+ dst.parent.mkdir(parents=True,exist_ok=True); shutil.copy2(src,dst)
+expected=manifest(root/'R1_1_26692_EXPECTED_CHANGED_SOURCE_HASHES.sha256')
+for rel,h in expected.items(): assert sha(dest/rel)==h,f'transform output mismatch: {rel}'
+assert len([p for p in dest.rglob('*') if p.is_file()])==1822
+print('PASS 26692 deterministic transform: 1822 successful-26691 authority -> 1822 candidate; 11 exact paths')
