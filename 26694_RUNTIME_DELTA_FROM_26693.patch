@@ -1,0 +1,449 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 876a2adfeaf50baaeab3d7b6e9744b5b31519c23..ae07884b881bb538e340acfdbe1fc0bd31008713 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -5014,7 +5014,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 return;
+             }
+             Log.i(TAG, "IRIS_26687_SPEKTRA_SHUTTER_DELEGATE status=" + spektraModeController.debugStatus());
+-            spektraModeController.takePicture();
++            if (!spektraModeController.takePicture()) {
++                iris26679RejectShutter("SPEKTRA_CAPTURE_RACE_REJECTED",
++                        "Spektra camera is still preparing");
++            }
+             return;
+         }
+         if (spektraModeController.isActive()) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+index 58f3dfb43f4a678f4d7eae43b6245078b5198f07..011411a8a2a9e8b316ddebe6e7065847e0de2ec1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+@@ -2,6 +2,7 @@ package com.particlesdevs.photoncamera.spektra;
+ 
+ import android.app.Activity;
+ import android.hardware.camera2.CameraAccessException;
++import android.net.Uri;
+ 
+ import androidx.annotation.NonNull;
+ import androidx.annotation.Nullable;
+@@ -37,10 +38,10 @@ public final class SpektraModeController {
+         void onSpektraPreviewPreparing();
+         void onSpektraPreviewReady();
+         void onSpektraPreviewStopped();
++        void onSpektraImageSaved(@NonNull Uri uri);
+     }
+ 
+     private final Activity activity;
+-    @SuppressWarnings("unused")
+     private final CameraEventsListener events;
+     private final Host host;
+     private final CameraCatalog cameraCatalog;
+@@ -69,6 +70,10 @@ public final class SpektraModeController {
+     private LifecycleOwner lifecycleOwner;
+     @Nullable
+     private volatile RawVulkanPreviewController.HistogramListener histogramListener;
++    private final Object captureUiLock = new Object();
++    private long captureUiRevision = Long.MIN_VALUE;
++    private int captureUiGeneration = -1;
++    private boolean captureUiProcessing;
+ 
+     public SpektraModeController(@NonNull Activity activity, @NonNull CameraEventsListener events,
+             @NonNull Host host) {
+@@ -111,6 +116,20 @@ public final class SpektraModeController {
+         RawVulkanPreviewController created = new RawVulkanPreviewController(
+                 activity.getApplicationContext(), spektraRepository);
+         created.setHistogramListener(histogramListener);
++        created.setCaptureListener(new RawVulkanPreviewController.CaptureListener() {
++            @Override public void onCaptureAccepted(long revisionId) {
++                bridgeCaptureAccepted(created, revisionId);
++            }
++            @Override public void onProcessingStarted(long revisionId) {
++                bridgeProcessingStarted(created, revisionId);
++            }
++            @Override public void onCaptureSucceeded(long revisionId, @NonNull Uri uri) {
++                bridgeCaptureSucceeded(created, revisionId, uri);
++            }
++            @Override public void onCaptureFailed(@Nullable Long revisionId, @NonNull String message) {
++                bridgeCaptureFailed(created, revisionId, message);
++            }
++        });
+         controller = created;
+         if (previewView != null && lifecycleOwner != null) {
+             previewView.bind(created, lifecycleOwner);
+@@ -118,6 +137,116 @@ public final class SpektraModeController {
+         return created;
+     }
+ 
++    // IRIS_26694_SPEKTRA_IRIS_CAPTURE_PRESENTATION_BRIDGE
++    // Camera/RAW/RCD/save ownership remains inside RawVulkanPreviewController. These callbacks only
++    // adapt the current generation to Iris's proven capture progress, processing ring and gallery.
++    // A dedicated presentation lock avoids lock inversion with the RAW controller's camera lock.
++    private boolean captureUiIsCurrentLocked(@NonNull RawVulkanPreviewController source, long revisionId) {
++        return !shutdown && active && controller == source
++                && captureUiGeneration == generation.get() && captureUiRevision == revisionId;
++    }
++
++    private void bridgeCaptureAccepted(@NonNull RawVulkanPreviewController source, long revisionId) {
++        final int token;
++        synchronized (captureUiLock) {
++            if (shutdown || !active || controller != source) return;
++            captureUiRevision = revisionId;
++            captureUiGeneration = generation.get();
++            captureUiProcessing = false;
++            token = captureUiGeneration;
++        }
++        activity.runOnUiThread(() -> {
++            synchronized (captureUiLock) {
++                if (shutdown || !active || controller != source || generation.get() != token
++                        || captureUiRevision != revisionId) return;
++            }
++            events.onFrameCountSet(1);
++            events.onCaptureStillPictureStarted("Spektra");
++        });
++    }
++
++    private void bridgeProcessingStarted(@NonNull RawVulkanPreviewController source, long revisionId) {
++        final int token;
++        synchronized (captureUiLock) {
++            if (!captureUiIsCurrentLocked(source, revisionId) || captureUiProcessing) return;
++            captureUiProcessing = true;
++            token = captureUiGeneration;
++        }
++        activity.runOnUiThread(() -> {
++            synchronized (captureUiLock) {
++                if (shutdown || !active || controller != source || generation.get() != token
++                        || captureUiRevision != revisionId || !captureUiProcessing) return;
++            }
++            events.onFrameCaptureCompleted(null);
++            events.onCaptureSequenceCompleted("Spektra RAW acquired");
++            events.onProcessingStarted("Spektra");
++        });
++    }
++
++    private void bridgeCaptureSucceeded(@NonNull RawVulkanPreviewController source, long revisionId,
++            @NonNull Uri uri) {
++        final int token;
++        synchronized (captureUiLock) {
++            if (!captureUiIsCurrentLocked(source, revisionId)) return;
++            token = captureUiGeneration;
++        }
++        activity.runOnUiThread(() -> {
++            synchronized (captureUiLock) {
++                if (shutdown || !active || controller != source || generation.get() != token
++                        || captureUiRevision != revisionId) return;
++                clearCaptureUiOwnershipLocked();
++            }
++            host.onSpektraImageSaved(uri);
++            events.onProcessingFinished("Spektra");
++        });
++    }
++
++    private void bridgeCaptureFailed(@NonNull RawVulkanPreviewController source, @Nullable Long revisionId,
++            @NonNull String message) {
++        if (revisionId == null) return;
++        final int token;
++        final boolean wasProcessing;
++        synchronized (captureUiLock) {
++            if (!captureUiIsCurrentLocked(source, revisionId)) return;
++            token = captureUiGeneration;
++            wasProcessing = captureUiProcessing;
++        }
++        activity.runOnUiThread(() -> {
++            synchronized (captureUiLock) {
++                if (shutdown || !active || controller != source || generation.get() != token
++                        || captureUiRevision != revisionId) return;
++                clearCaptureUiOwnershipLocked();
++            }
++            if (!wasProcessing) {
++                events.onCaptureSequenceCompleted("Spektra capture failed");
++            }
++            events.onProcessingError(message);
++        });
++    }
++
++    private void clearCaptureUiOwnershipLocked() {
++        captureUiRevision = Long.MIN_VALUE;
++        captureUiGeneration = -1;
++        captureUiProcessing = false;
++    }
++
++    private void releaseCaptureUiBeforeHandoff() {
++        final boolean hadCapture;
++        final boolean wasProcessing;
++        synchronized (captureUiLock) {
++            hadCapture = captureUiRevision != Long.MIN_VALUE;
++            wasProcessing = captureUiProcessing;
++            clearCaptureUiOwnershipLocked();
++        }
++        if (!hadCapture) return;
++        activity.runOnUiThread(() -> {
++            if (!wasProcessing) {
++                events.onCaptureSequenceCompleted("Spektra mode handoff");
++            }
++            events.onProcessingFinished("Spektra mode handoff");
++        });
++    }
++
+     private void failActivation(int token, @NonNull Throwable error) {
+         if (token != generation.get()) return;
+         active = false;
+@@ -218,6 +347,7 @@ public final class SpektraModeController {
+ 
+     /** Fail-contained mode handoff: stop Unspektrawesome Camera2 before Iris may reopen Camera2. */
+     public void exitForModeHandoff() {
++        releaseCaptureUiBeforeHandoff();
+         active = false;
+         generation.incrementAndGet();
+         selectedCamera = null;
+@@ -229,6 +359,7 @@ public final class SpektraModeController {
+     public synchronized void shutdown() {
+         if (shutdown) return;
+         shutdown = true;
++        releaseCaptureUiBeforeHandoff();
+         active = false;
+         generation.incrementAndGet();
+         selectedCamera = null;
+@@ -238,6 +369,7 @@ public final class SpektraModeController {
+         histogramListener = null;
+         if (controller != null) {
+             controller.setHistogramListener(null);
++            controller.setCaptureListener(null);
+             controller.close();
+             controller = null;
+         }
+@@ -262,10 +394,9 @@ public final class SpektraModeController {
+                 + " error=" + error + " controller={" + controllerStatus + "}";
+     }
+ 
+-    public void takePicture() {
++    public boolean takePicture() {
+         RawVulkanPreviewController current = controller;
+-        if (!isActive() || current == null) return;
+-        current.captureStill();
++        return isActive() && current != null && current.captureStill();
+     }
+ 
+     /**
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index c246600605a7403404af7227f977b20a0791a8bf..4b1ac9a89cd6ba17c20c5bd688c630f0065c98df 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -302,6 +302,12 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                     @Override public void onSpektraPreviewStopped() {
+                         if (activity != null) activity.runOnUiThread(() -> setSpektraPreviewVisible(false));
+                     }
++                    @Override public void onSpektraImageSaved(@NonNull Uri uri) {
++                        if (activity != null) activity.runOnUiThread(() -> {
++                            cameraFragmentViewModel.updateGalleryThumb(uri);
++                            Log.i(TAG, "IRIS_26694_SPEKTRA_GALLERY_URI uri=" + uri);
++                        });
++                    }
+                 });
+         this.captureController.bindPreviewTextureView(textureView);
+         this.captureController.bindSpektraPreviewSurface(spektraSurfaceView, getViewLifecycleOwner());
+diff --git a/app/src/main/java/com/unspektrawesome/capture/JpegMediaStoreWriter.kt b/app/src/main/java/com/unspektrawesome/capture/JpegMediaStoreWriter.kt
+index 9c3341e7e6e95ced54f0689d8f7398c30300d93c..840666a15e2047b24054290d0d85c06d79283c8e 100644
+--- a/app/src/main/java/com/unspektrawesome/capture/JpegMediaStoreWriter.kt
++++ b/app/src/main/java/com/unspektrawesome/capture/JpegMediaStoreWriter.kt
+@@ -72,7 +72,9 @@ class JpegMediaStoreWriter(private val contentResolver: ContentResolver) {
+     companion object {
+         const val DEFAULT_JPEG_QUALITY = 100
+         private val PICTURES_DIRECTORY = Environment.DIRECTORY_DCIM
+-        private const val ALBUM_NAME = "Unspektrawesome"
++        // IRIS_26694_SPEKTRA_IRIS_MEDIASTORE_PATH: Spektra keeps this single publisher, but
++        // Iris owns the public camera album contract and gallery discovery.
++        private const val ALBUM_NAME = "Camera"
+         private val FILE_DATE_FORMAT = object : ThreadLocal<SimpleDateFormat>() {
+             override fun initialValue(): SimpleDateFormat = SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US)
+         }
+diff --git a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+index 138d18e5dbad727e00d8bd11b7ca7afeae38e67c..3297d2b5860300795dedef91ece7954680e4e459 100644
+--- a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
++++ b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+@@ -77,6 +77,14 @@ class RawVulkanPreviewController(
+     fun interface HistogramListener {
+         fun onHistogramPixels(pixels: IntArray)
+     }
++
++    interface CaptureListener {
++        fun onCaptureAccepted(revisionId: Long)
++        fun onProcessingStarted(revisionId: Long)
++        fun onCaptureSucceeded(revisionId: Long, uri: Uri)
++        fun onCaptureFailed(revisionId: Long?, message: String)
++    }
++
+     private val lock = Any()
+     private val cameraManager = context.applicationContext
+         .getSystemService(CameraManager::class.java)
+@@ -114,8 +122,14 @@ class RawVulkanPreviewController(
+     // IRIS_26693_STANDALONE_HISTOGRAM_LIFECYCLE_OWNER
+     // Acquisition lives with the Unspektrawesome preview owner, never in an Iris worker/poller.
+     private var histogramListener: HistogramListener? = null
++    private var captureListener: CaptureListener? = null
+     private var lastHistogramPublishAtMs = 0L
+-    private val exposureMeterBuffer = directBuffer(VulkanRenderer.EXPOSURE_METER_BYTES)
++    private var lastExposureMeterLogAtMs = 0L
++    // IRIS_26694_STANDALONE_AE_METER_INPUT: the carrier is bidirectional. Configure the
++    // standalone default center-weighted point before the first native render.
++    private val exposureMeterBuffer = directBuffer(VulkanRenderer.EXPOSURE_METER_BYTES).also {
++        renderer.configureCenterWeightedExposureMeter(it)
++    }
+     private val previewTimingBuffer = directBuffer(8)
+     private var lastExposureMeterSequence = Long.MIN_VALUE
+     private var manualIso: Int? = null
+@@ -244,6 +258,7 @@ class RawVulkanPreviewController(
+             revisionId = request.snapshot.revisionId,
+             lastUri = mutableCaptureStatus.value.lastUri,
+         )
++        notifyCaptureAcceptedLocked(request.snapshot.revisionId)
+         runCatching {
+             owner.session.captureStill(
+                 owner.camera.rawOutputs,
+@@ -332,6 +347,7 @@ class RawVulkanPreviewController(
+         pendingCapture = null
+         clearHistogramLocked()
+         histogramListener = null
++        captureListener = null
+         renderer.close()
+         captureWriter.shutdownNow()
+         publishLocked(RawPreviewPhase.CLOSED, "RAW preview is closed")
+@@ -360,6 +376,7 @@ class RawVulkanPreviewController(
+             pendingCapture = null
+             return@synchronized
+         }
++        notifyProcessingStartedLocked(request.snapshot.revisionId)
+         val processed = runCatching {
+             runCatching { WhiteBalanceGains.fromRawCaptureMetadata(frame.metadata) }
+                 .getOrNull()?.also { latestWhiteBalance = it }
+@@ -477,6 +494,7 @@ class RawVulkanPreviewController(
+                         revisionId = request.snapshot.revisionId,
+                         lastUri = uri,
+                     )
++                    notifyCaptureSucceededLocked(request.snapshot.revisionId, uri)
+                 }.onFailure { error ->
+                     publishCaptureErrorLocked(
+                         "JPEG save failed: ${error.message ?: error.javaClass.simpleName}",
+@@ -505,6 +523,39 @@ class RawVulkanPreviewController(
+             revisionId = revisionId,
+             lastUri = mutableCaptureStatus.value.lastUri,
+         )
++        notifyCaptureFailedLocked(revisionId, message)
++    }
++
++    fun setCaptureListener(listener: CaptureListener?) = synchronized(lock) {
++        captureListener = listener
++    }
++
++    private fun notifyCaptureAcceptedLocked(revisionId: Long) {
++        runCatching { captureListener?.onCaptureAccepted(revisionId) }.onFailure { error ->
++            Log.e(TAG, "IRIS_26694_SPEKTRA_CAPTURE_UI_CALLBACK_FAILED phase=ACCEPTED " +
++                (error.message ?: error.javaClass.simpleName))
++        }
++    }
++
++    private fun notifyProcessingStartedLocked(revisionId: Long) {
++        runCatching { captureListener?.onProcessingStarted(revisionId) }.onFailure { error ->
++            Log.e(TAG, "IRIS_26694_SPEKTRA_CAPTURE_UI_CALLBACK_FAILED phase=PROCESSING " +
++                (error.message ?: error.javaClass.simpleName))
++        }
++    }
++
++    private fun notifyCaptureSucceededLocked(revisionId: Long, uri: Uri) {
++        runCatching { captureListener?.onCaptureSucceeded(revisionId, uri) }.onFailure { error ->
++            Log.e(TAG, "IRIS_26694_SPEKTRA_CAPTURE_UI_CALLBACK_FAILED phase=SUCCEEDED " +
++                (error.message ?: error.javaClass.simpleName))
++        }
++    }
++
++    private fun notifyCaptureFailedLocked(revisionId: Long?, message: String) {
++        runCatching { captureListener?.onCaptureFailed(revisionId, message) }.onFailure { error ->
++            Log.e(TAG, "IRIS_26694_SPEKTRA_CAPTURE_UI_CALLBACK_FAILED phase=ERROR " +
++                (error.message ?: error.javaClass.simpleName))
++        }
+     }
+ 
+     fun setHistogramListener(listener: HistogramListener?) = synchronized(lock) {
+@@ -858,6 +909,16 @@ class RawVulkanPreviewController(
+         if (solution.iso != previousIso || solution.exposureNs != previousExposure) {
+             owner.session.setSensorExposure(solution.iso, solution.exposureNs)
+         }
++        val logNowMs = SystemClock.elapsedRealtime()
++        if (lastExposureMeterLogAtMs == 0L || logNowMs - lastExposureMeterLogAtMs >= AE_METER_LOG_INTERVAL_MS) {
++            lastExposureMeterLogAtMs = logNowMs
++            Log.i(
++                TAG,
++                "IRIS_26694_SPEKTRA_AE_METER sequence=$sequence meter=$meter " +
++                    "iso=${solution.iso} exposureNs=${solution.exposureNs} " +
++                    "changed=${solution.iso != previousIso || solution.exposureNs != previousExposure}",
++            )
++        }
+     }
+ 
+     private fun lensShadingByteBuffer(
+@@ -954,6 +1015,7 @@ class RawVulkanPreviewController(
+         const val TAG = "UnspekRawPreview"
+         const val STATUS_PUBLISH_INTERVAL_MS = 1_000L
+         const val HISTOGRAM_MIN_INTERVAL_MS = 50L
++        const val AE_METER_LOG_INTERVAL_MS = 500L
+         const val NANOSECONDS_TO_SECONDS = 1e-9
+ 
+         val BUSY_CAPTURE_PHASES = setOf(RawCapturePhase.CAPTURING, RawCapturePhase.SAVING)
+diff --git a/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt b/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt
+index 30456517e9512a2b8e3c62c2283ce2d28f6c3be7..a61635b3a81e718f0aa5f3a16263c67edbc38ef1 100644
+--- a/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt
++++ b/app/src/main/java/com/unspektrawesome/vulkan/VulkanRenderer.kt
+@@ -6,6 +6,7 @@ import android.hardware.HardwareBuffer
+ import android.view.Surface
+ import java.io.File
+ import java.nio.ByteBuffer
++import java.nio.ByteOrder
+ 
+ /**
+  * Iris host wrapper for the exact Unspektrawesome 1.1.2 native renderer.
+@@ -131,6 +132,23 @@ class VulkanRenderer(context: Context) : AutoCloseable {
+         nativePollExposureMeter(current, target)
+     }
+ 
++    /**
++     * IRIS_26694_STANDALONE_CENTER_WEIGHTED_METER_CONTRACT
++     * The first 24 bytes of the exact 1.1.2 40-byte carrier are input configuration. The native
++     * renderer preserves them while publishing sequence/value at +24/+32. A freshly allocated
++     * zero buffer therefore means CenterWeighted at (0,0), not the standalone default center.
++     */
++    fun configureCenterWeightedExposureMeter(target: ByteBuffer) {
++        require(target.isDirect && target.capacity() >= EXPOSURE_METER_BYTES) {
++            "Exposure-meter carrier must be a direct ByteBuffer of at least $EXPOSURE_METER_BYTES bytes"
++        }
++        target.order(ByteOrder.nativeOrder())
++        target.putInt(EXPOSURE_METER_METHOD_OFFSET, EXPOSURE_METER_METHOD_CENTER_WEIGHTED)
++        target.putFloat(EXPOSURE_METER_CENTER_X_OFFSET, EXPOSURE_METER_DEFAULT_CENTER)
++        target.putFloat(EXPOSURE_METER_CENTER_Y_OFFSET, EXPOSURE_METER_DEFAULT_CENTER)
++        target.position(0)
++    }
++
+     @Synchronized
+     fun histogramPixels(scale: Float): IntArray = withHandle { current ->
+         // IRIS_26693_NATIVE_HISTOGRAM_NULL_CONTRACT: JNI may transiently report no frame as null.
+@@ -207,6 +225,11 @@ class VulkanRenderer(context: Context) : AutoCloseable {
+ 
+     companion object {
+         const val EXPOSURE_METER_BYTES = 40
++        const val EXPOSURE_METER_METHOD_OFFSET = 8
++        const val EXPOSURE_METER_CENTER_X_OFFSET = 12
++        const val EXPOSURE_METER_CENTER_Y_OFFSET = 16
++        const val EXPOSURE_METER_METHOD_CENTER_WEIGHTED = 0
++        const val EXPOSURE_METER_DEFAULT_CENTER = 0.5f
+         const val EXPOSURE_METER_SEQUENCE_OFFSET = 24
+         const val EXPOSURE_METER_VALUE_OFFSET = 32
+ 
+diff --git a/app/version.properties b/app/version.properties
+index cf0a12b25d457c282eaab8f315627ef614d73688..34a6132445e3e9eda221d640be3f402e961ec03c 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726693
+-VERSION_BUILD=26693
++VERSION_NAME=0.9726694
++VERSION_BUILD=26694

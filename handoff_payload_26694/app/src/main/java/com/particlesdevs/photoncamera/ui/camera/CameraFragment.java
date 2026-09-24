@@ -1,0 +1,1288 @@
+/*
+ *
+ *  PhotonCamera
+ *  CameraFragment.java
+ *  Copyright (C) 2020 - 2021  Eszdman
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ *
+ */
+
+package com.particlesdevs.photoncamera.ui.camera;
+
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.app.AlertDialog;
+import android.app.Dialog;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.res.Resources;
+import android.graphics.RectF;
+import android.graphics.drawable.Drawable;
+import android.hardware.camera2.CameraCharacteristics;
+import android.hardware.camera2.CameraManager;
+import android.hardware.camera2.CaptureResult;
+import android.hardware.camera2.params.MeteringRectangle;
+import android.media.MediaPlayer;
+import android.net.Uri;
+import android.os.AsyncTask;
+import android.os.Bundle;
+import android.util.DisplayMetrics;
+
+import com.particlesdevs.photoncamera.ui.camera.views.viewfinder.HorizonIndicatorView;
+import com.particlesdevs.photoncamera.util.log.ActivityLifecycleMonitor;
+import com.particlesdevs.photoncamera.util.Log;
+import android.util.Size;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.Toast;
+import android.widget.TextView;
+
+import androidx.annotation.IdRes;
+import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
+import androidx.annotation.StringRes;
+import androidx.constraintlayout.widget.ConstraintLayout;
+import androidx.core.app.NotificationCompat;
+import androidx.core.app.NotificationManagerCompat;
+import androidx.databinding.DataBindingUtil;
+import androidx.fragment.app.DialogFragment;
+import androidx.fragment.app.Fragment;
+import androidx.lifecycle.ViewModelProvider;
+
+import com.google.android.material.snackbar.Snackbar;
+import com.particlesdevs.photoncamera.R;
+import com.particlesdevs.photoncamera.api.CameraEventsListener;
+import com.particlesdevs.photoncamera.api.CameraManager2;
+import com.particlesdevs.photoncamera.api.CameraMode;
+import com.particlesdevs.photoncamera.api.CameraReflectionApi;
+import com.particlesdevs.photoncamera.app.PhotonCamera;
+import com.particlesdevs.photoncamera.app.base.BaseActivity;
+import com.particlesdevs.photoncamera.capture.CaptureController;
+import com.particlesdevs.photoncamera.spektra.SpektraModeController;
+import com.particlesdevs.photoncamera.capture.CaptureEventsListener;
+import com.particlesdevs.photoncamera.circularbarlib.api.ManualInstanceProvider;
+import com.particlesdevs.photoncamera.circularbarlib.api.ManualModeConsole;
+import com.particlesdevs.photoncamera.circularbarlib.console.ManualModeConsoleImpl;
+import com.particlesdevs.photoncamera.circularbarlib.model.ManualModeModel;
+import com.particlesdevs.photoncamera.control.Swipe;
+import com.particlesdevs.photoncamera.control.IrisZoomController;
+import com.particlesdevs.photoncamera.control.TouchFocus;
+import com.particlesdevs.photoncamera.databinding.CameraFragmentBinding;
+import com.particlesdevs.photoncamera.gallery.ui.GalleryActivity;
+import com.particlesdevs.photoncamera.pro.SupportedDevice;
+import com.particlesdevs.photoncamera.processing.ProcessingEventsListener;
+import com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector;
+import com.particlesdevs.photoncamera.settings.PreferenceKeys;
+import com.particlesdevs.photoncamera.settings.SettingsManager;
+import com.particlesdevs.photoncamera.ui.camera.data.CameraLensData;
+import com.particlesdevs.photoncamera.ui.camera.viewmodel.*;
+import com.particlesdevs.photoncamera.ui.camera.views.IrisManualSliderView;
+import com.particlesdevs.photoncamera.ui.camera.views.viewfinder.GLPreview;
+import com.particlesdevs.photoncamera.ui.camera.views.viewfinder.SurfaceViewOverViewfinder;
+import com.unspektrawesome.preview.VulkanRawPreviewView;
+import com.particlesdevs.photoncamera.ui.camera.views.SpektraLiveHistogramView;
+import com.particlesdevs.photoncamera.ui.settings.SettingsActivity;
+import com.particlesdevs.photoncamera.util.log.Logger;
+
+import java.lang.reflect.Field;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Observable;
+import java.util.Observer;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+
+public class CameraFragment extends Fragment implements BaseActivity.BackPressedListener {
+    public static final int REQUEST_CAMERA_PERMISSION = 1;
+    public static final String FRAGMENT_DIALOG = "dialog";
+    /**
+     * Tag for the {@link Log}.
+     */
+    private static final String TAG = CameraFragment.class.getSimpleName();
+    private static final String ACTIVE_BACKCAM_ID = "ACTIVE_BACKCAM_ID"; //key for savedInstanceState
+    private static final String ACTIVE_FRONTCAM_ID = "ACTIVE_FRONTCAM_ID"; //key for savedInstanceState
+    private static final String NOTIFICATION_CHANNEL_ID = "NOTIFICATION_CHANNEL_ID";
+    /**
+     * sActiveBackCamId is either
+     * = 0 or camera_id stored in SharedPreferences in case of fresh application Start; or
+     * = camera id set from {@link CameraFragment#onViewStateRestored(Bundle)} if Activity re-created due to configuration change.
+     * it will NEVER be = 1 *assuming* that 1 is the id of Front Camera on most devices
+     */
+    public static String sActiveBackCamId = "0";
+    public static String sActiveFrontCamId = "1";
+    public static CameraMode mSelectedMode;
+    private final Field[] metadataFields = CameraReflectionApi.getAllMetadataFields();
+    private final int NOTIFICATION_ID = 1;
+    /*
+    private final ExecutorService processExecutorService = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ProcessingThread");
+        t.setPriority(Thread.MIN_PRIORITY);
+        return t;
+    });*/
+    private final ExecutorService processExecutorService = Executors.newFixedThreadPool(2);
+    public SurfaceViewOverViewfinder surfaceView;
+    public VulkanRawPreviewView spektraSurfaceView;
+    private SpektraLiveHistogramView spektraLiveHistogramView;
+    public Map<String, CameraLensData> mCameraLensDataMap;
+    public Activity activity;
+    private TimerFrameCountViewModel timerFrameCountViewModel;
+    private CameraUIView mCameraUIView;
+    private CameraUIController mCameraUIEventsListener;
+    public CaptureController captureController;
+    private CameraFragmentViewModel cameraFragmentViewModel;
+    public AuxButtonsViewModel auxButtonsViewModel;
+    public CameraFragmentBinding cameraFragmentBinding;
+    private TouchFocus mTouchFocus;
+    public Swipe mSwipe;
+    /* IRIS_26524_ZOOM_CONTROLLER_LIFECYCLE */
+    private IrisZoomController irisZoomController;
+    private MediaPlayer burstPlayer;
+    private MediaPlayer endPlayer;
+    public GLPreview textureView;
+    private NotificationManagerCompat notificationManager;
+    private SettingsManager settingsManager;
+    private SupportedDevice supportedDevice;
+    private SettingsBarEntryProvider settingsBarEntryProvider;
+    private ManualModeConsole manualModeConsole;
+    /* IRIS_26670_APP_OWNED_MANUAL_PRESENTATION
+     * circularbarlib remains only the proven parameter/model authority. Its legacy ViewObserver /
+     * KnobView presentation is explicitly detached after model creation; this Fragment owns the
+     * four manual buttons, panel visibility and IrisManualSliderView binding thereafter.
+     */
+    private ManualModeConsoleImpl iris26670ManualConsoleOwner;
+    private Observer iris26670ManualModeObserver;
+    private IrisManualSliderView iris26670ManualSlider;
+    /* IRIS_26675_VISIBLE_MANUAL_ICON_GEOMETRY_OWNER
+     * Exactly one runtime owner may move the four visible Focus/Shutter/ISO/EV buttons vertically.
+     * buttons_container remains structural only and stays at translationY=0. The measured icon
+     * position is frozen for this Fragment/layout instance; open/close is visibility/alpha only. */
+    private boolean iris26675ManualIconMidpointEstablished = false;
+    private float iris26675ManualFixedIconTranslationY = Float.NaN;
+    private android.view.ViewTreeObserver.OnPreDrawListener iris26675ManualPreDrawListener = null;
+    public float displayAspectRatio;
+    private boolean iris26562DeferredForegroundReset = false;
+    private HorizonIndicatorView mHorizonIndicatorView;
+
+    public CameraFragment() {
+        Log.v(TAG, "fragment created");
+    }
+
+    public static CameraFragment newInstance() {
+        return new CameraFragment();
+    }
+
+    public TouchFocus getTouchFocus() {
+        return mTouchFocus;
+    }
+
+    public CaptureController getCaptureController() {
+        return captureController;
+    }
+
+    public IrisZoomController getIrisZoomController() {
+        return irisZoomController;
+    }
+
+    public ManualModeConsole getManualModeConsole() {
+        return manualModeConsole;
+    }
+
+    public CameraFragmentViewModel getCameraFragmentViewModel() {
+        return cameraFragmentViewModel;
+    }
+    @Override
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setRetainInstance(true);
+        activity = getActivity();
+        assert activity != null;
+        notificationManager = NotificationManagerCompat.from(activity);
+        settingsManager = Objects.requireNonNull(PhotonCamera.getInstance(activity)).getSettingsManager();
+        supportedDevice = Objects.requireNonNull(PhotonCamera.getInstance(activity)).getSupportedDevice();
+    }
+    @Override
+    public View onCreateView(@NonNull LayoutInflater inflater, ViewGroup container,
+                             Bundle savedInstanceState) {
+        //create the ui binding
+        this.cameraFragmentBinding = DataBindingUtil.inflate(inflater, R.layout.camera_fragment, container, false);
+        Log.d(TAG, "onCreateView: ");
+        initMembers();
+        setModelsToLayout();
+        return cameraFragmentBinding.getRoot();
+    }
+    private void initMembers() {
+        //create the viewmodel which updates the model
+        cameraFragmentViewModel = new ViewModelProvider(this).get(CameraFragmentViewModel.class);
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        logDisplayProperties(dm);
+        displayAspectRatio = (float) Math.max(dm.heightPixels, dm.widthPixels) / Math.min(dm.heightPixels, dm.widthPixels);
+        cameraFragmentViewModel.setScreenAspectRatio(displayAspectRatio);
+
+        timerFrameCountViewModel = new ViewModelProvider(this).get(TimerFrameCountViewModel.class);
+        manualModeConsole = ManualInstanceProvider.getNewManualModeConsole();
+        settingsBarEntryProvider = new ViewModelProvider(this).get(SettingsBarEntryProvider.class);
+        auxButtonsViewModel = new ViewModelProvider(this).get(AuxButtonsViewModel.class);
+        surfaceView = cameraFragmentBinding.layoutViewfinder.surfaceView;
+        spektraSurfaceView = cameraFragmentBinding.layoutViewfinder.spektraSurface;
+        spektraLiveHistogramView = cameraFragmentBinding.getRoot().findViewById(R.id.spektra_live_histogram);
+        textureView = cameraFragmentBinding.layoutViewfinder.texture;
+    }
+
+    // IRIS_26681_SPEKTRA_PREVIEW_VISIBILITY_OWNER
+    // Presentation-only switch: existing GLPreview/MainRenderer bytes remain untouched.
+    // The dedicated Spektra SurfaceView occupies the exact same bounds under existing overlays.
+    public void setSpektraPreviewVisible(boolean spektraVisible) {
+        if (spektraSurfaceView != null) {
+            spektraSurfaceView.setVisibility(spektraVisible ? View.VISIBLE : View.GONE);
+        }
+        if (textureView != null) {
+            // Keep the proven GLPreview laid out so Spektra inherits identical geometry and
+            // touch-coordinate bounds; INVISIBLE suppresses presentation without collapsing it.
+            textureView.setVisibility(spektraVisible ? View.INVISIBLE : View.VISIBLE);
+        }
+        // IRIS_26692_SPEKTRA_ALWAYS_VISIBLE_PHOTO_HISTOGRAM
+        // Photo's histogram owner remains untouched. Spektra swaps in its own data source at the
+        // exact same presentation position and keeps it live for the entire Spektra presentation.
+        View irisHistogram = cameraFragmentBinding == null ? null
+                : cameraFragmentBinding.getRoot().findViewById(R.id.iris_live_histogram);
+        if (irisHistogram != null) irisHistogram.setVisibility(spektraVisible ? View.GONE : View.VISIBLE);
+        if (spektraLiveHistogramView != null) {
+            spektraLiveHistogramView.setSpektraActive(spektraVisible);
+        }
+    }
+
+    private void setModelsToLayout() {
+        //bind the model to the ui, it applies changes when the model values get changed
+        cameraFragmentBinding.setUimodel(cameraFragmentViewModel.getCameraFragmentModel());
+        cameraFragmentBinding.layoutTopbar.setUimodel(cameraFragmentViewModel.getCameraFragmentModel());
+        cameraFragmentBinding.layoutBottombar.bottomButtons.setUimodel(cameraFragmentViewModel.getCameraFragmentModel());
+        // associating timer model with layouts
+        cameraFragmentBinding.layoutBottombar.bottomButtons.setTimermodel(timerFrameCountViewModel.getTimerFrameCountModel());
+        cameraFragmentBinding.layoutViewfinder.setTimermodel(timerFrameCountViewModel.getTimerFrameCountModel());
+        // associating AuxButtonsModel with layout
+        cameraFragmentBinding.setAuxmodel(auxButtonsViewModel.getAuxButtonsModel());
+    }
+    @Override
+    public void onViewCreated(@NonNull final View view, Bundle savedInstanceState) {
+        this.mCameraUIView = new CameraUIViewImpl(this);
+        this.mCameraUIEventsListener = new CameraUIController(this);
+        this.mCameraUIView.setCameraUIEventsListener(mCameraUIEventsListener);
+        this.captureController = new CaptureController(activity, processExecutorService,
+                new CameraEventsListenerImpl(), new SpektraModeController.Host() {
+                    @Override public void onSpektraPreviewPreparing() {
+                        if (activity != null) activity.runOnUiThread(() -> setSpektraPreviewVisible(true));
+                    }
+                    @Override public void onSpektraPreviewReady() {
+                        if (activity != null) activity.runOnUiThread(() -> {
+                            if (captureController != null
+                                    && captureController.getAuthoritativeCameraMode() == CameraMode.SPEKTRA) {
+                                setSpektraPreviewVisible(true);
+                            }
+                        });
+                    }
+                    @Override public void onSpektraPreviewStopped() {
+                        if (activity != null) activity.runOnUiThread(() -> setSpektraPreviewVisible(false));
+                    }
+                    @Override public void onSpektraImageSaved(@NonNull Uri uri) {
+                        if (activity != null) activity.runOnUiThread(() -> {
+                            cameraFragmentViewModel.updateGalleryThumb(uri);
+                            Log.i(TAG, "IRIS_26694_SPEKTRA_GALLERY_URI uri=" + uri);
+                        });
+                    }
+                });
+        this.captureController.bindPreviewTextureView(textureView);
+        this.captureController.bindSpektraPreviewSurface(spektraSurfaceView, getViewLifecycleOwner());
+        if (spektraLiveHistogramView != null) {
+            spektraLiveHistogramView.bind(captureController.getSpektraModeController());
+        }
+        this.manualModeConsole.addParamObserver(captureController.getParamController());
+        PhotonCamera.setCaptureController(captureController);
+        captureController.isDualSession = supportedDevice.specific.specificSetting.isDualSessionSupported;
+        mHorizonIndicatorView = cameraFragmentBinding.layoutViewfinder.horizonIndicatorView;
+        this.mSwipe = new Swipe(this);
+        var gyro = PhotonCamera.getGyro();
+        if ((mHorizonIndicatorView != null) && (gyro != null)) {
+            mHorizonIndicatorView.updateDisplayRotation(getCameraFragmentViewModel().getCameraFragmentModel().getOrientation());
+            mHorizonIndicatorView.setGyro(gyro);
+        }
+        if (mHorizonIndicatorView != null) {
+            mHorizonIndicatorView.setVisible(PreferenceKeys.isHorizonOn());
+        }
+        initSettingsBar();
+    }
+
+    private void initSettingsBar() {
+        settingsBarEntryProvider.createEntries();
+        settingsBarEntryProvider.addObserver(mCameraUIEventsListener);
+        settingsBarEntryProvider.addEntries(cameraFragmentBinding.settingsBar);
+    }
+
+    public void updateSettingsBar(){
+        settingsBarEntryProvider.updateAllEntries();
+        settingsBarEntryProvider.addEntries(cameraFragmentBinding.settingsBar);
+        this.mCameraUIView.refresh(CaptureController.isProcessing);
+    }
+    void clearTimerFrameCountForModeTransition() {
+        timerFrameCountViewModel.clearFrameTimeCnt();
+    }
+
+    @Override
+    public void onSaveInstanceState(@NonNull Bundle outState) {
+        super.onSaveInstanceState(outState);
+        outState.putString(ACTIVE_BACKCAM_ID, sActiveBackCamId);
+        outState.putString(ACTIVE_FRONTCAM_ID, sActiveFrontCamId);
+    }
+
+    @Override
+    public void onViewStateRestored(@Nullable Bundle savedInstanceState) {
+        super.onViewStateRestored(savedInstanceState);
+        if (PhotonCamera.DEBUG)
+            Log.d("FragmentMonitor", "[" + getClass().getSimpleName() + "] : onViewStateRestored(), savedInstanceState = [" + savedInstanceState + "]");
+        if (savedInstanceState != null) {
+            sActiveBackCamId = savedInstanceState.getString(ACTIVE_BACKCAM_ID);
+            sActiveFrontCamId = savedInstanceState.getString(ACTIVE_FRONTCAM_ID);
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, @NonNull String[] permissions,
+                                           @NonNull int[] grantResults) {
+        if (requestCode == REQUEST_CAMERA_PERMISSION) {
+            if (grantResults.length != 1 || grantResults[0] != PackageManager.PERMISSION_GRANTED) {
+                showErrorDialog(R.string.request_permission);
+            }
+        } else {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        }
+    }
+    private boolean iris26562ApplyForegroundResetIfReady() {
+        if (!ActivityLifecycleMonitor.isCameraResetPending()) return true;
+        if (CaptureController.isProcessing) {
+            iris26562DeferredForegroundReset = true;
+            Log.critical(TAG, "IRIS_26562_FOREGROUND_RESET_DEFERRED processing=true cameraResume=false");
+            return false;
+        }
+        if (!ActivityLifecycleMonitor.consumeCameraResetPending()) return true;
+        PreferenceKeys.setCameraModeOrdinal(CameraMode.MOTION.ordinal());
+        PreferenceKeys.setIrisSuperRes(false);
+        IrisZoomController.resetForForegroundSession();
+        PhotonCamera.getSettings().loadCache();
+        if (mCameraUIView != null) mCameraUIView.forceForegroundMotionReset();
+        updateSettingsBar();
+        iris26562DeferredForegroundReset = false;
+        Log.critical(TAG, "IRIS_26562_FOREGROUND_RESET_APPLIED mode=MOTION physicalZoomReset=1x superRes=false");
+        return true;
+    }
+
+    @Override
+    public void onResume() {
+        super.onResume();
+        updateSettingsBar();
+        mSwipe.init();
+        this.mCameraUIView.refresh(CaptureController.isProcessing);
+        AsyncTask.execute(() -> {
+            PhotonCamera.getGyro().register();
+            PhotonCamera.getGravity().register();
+            burstPlayer = MediaPlayer.create(activity, R.raw.sound_burst2);
+            endPlayer = MediaPlayer.create(activity,R.raw.sound_end);
+            cameraFragmentViewModel.updateGalleryThumb(null);
+        });
+        cameraFragmentViewModel.onResume();
+        auxButtonsViewModel.setAuxButtonListener(mCameraUIEventsListener);
+        if (mHorizonIndicatorView != null) {
+            mHorizonIndicatorView.setVisible(PreferenceKeys.isHorizonOn());
+        }
+        captureController.startBackgroundThread();
+        textureView.onResume();
+        if (iris26562ApplyForegroundResetIfReady()) {
+            captureController.resumeCamera();
+        }
+        initTouchFocus();
+        /* IRIS_26670_NO_LEGACY_MANUAL_RESUME
+         * Never reattach circularbarlib ViewObserver/KnobView. App-owned observers survive pause/resume.
+         */
+        iris26670EnsureManualPresentationBound();
+    }
+
+    private void initTouchFocus() {
+        if (cameraFragmentBinding != null && captureController != null) {
+            View focusCircle = cameraFragmentBinding.layoutViewfinder.touchFocus;
+            textureView.post(() -> {
+                mTouchFocus = new TouchFocus(captureController,focusCircle,textureView);
+                captureController.mTouchFocus = mTouchFocus;
+            });
+        }
+    }
+
+    @Override
+    public void onPause() {
+        PhotonCamera.getGravity().unregister();
+        PhotonCamera.getGyro().unregister();
+        PhotonCamera.getSettings().saveID();
+        textureView.onPause();
+        captureController.closeCamera();
+//        stopBackgroundThread();
+        cameraFragmentViewModel.onPause();
+        mCameraUIEventsListener.onPause();
+        auxButtonsViewModel.setAuxButtonListener(null);
+        burstPlayer.release();
+        endPlayer.release();
+        mSwipe.SwipeDown();
+        /* IRIS_26670_NO_LEGACY_MANUAL_PAUSE
+         * ManualModeConsoleImpl.onPause() deletes all KnobModel/ManualModeModel observers, including
+         * the Iris slider. Legacy observer stays permanently disabled after camera-model init.
+         */
+        super.onPause();
+    }
+
+    @SuppressWarnings("deprecation")
+    private void iris26670BindManualPresentationOwner() {
+        if (!(manualModeConsole instanceof ManualModeConsoleImpl) || activity == null) {
+            Log.e(TAG, "IRIS_26670_MANUAL_OWNER_BIND rejected=true");
+            return;
+        }
+        final ManualModeConsoleImpl owner = (ManualModeConsoleImpl) manualModeConsole;
+
+        /* init() temporarily creates the library ViewObserver so its proven Focus/Shutter/ISO/EV
+         * ManualModel objects and click callbacks are populated. Immediately retire that observer
+         * before any user input. This does not remove ManualParamModel observers such as ParamController. */
+        manualModeConsole.onPause();
+
+        if (iris26670ManualConsoleOwner != null && iris26670ManualModeObserver != null) {
+            iris26670ManualConsoleOwner.getManualModeModel().deleteObserver(iris26670ManualModeObserver);
+        }
+        iris26670ManualConsoleOwner = owner;
+        iris26670ManualSlider = activity.findViewById(R.id.iris_manual_slider);
+        if (iris26670ManualSlider == null) {
+            Log.e(TAG, "IRIS_26670_MANUAL_OWNER_BIND sliderMissing=true");
+            return;
+        }
+        iris26670ManualSlider.bindManualModeConsole(owner);
+
+        final ManualModeModel model = owner.getManualModeModel();
+        iris26670ManualModeObserver = new Observer() {
+            @Override
+            public void update(Observable observable, Object arg) {
+                if (!(arg instanceof ManualModeModel.ManualModelFields)) return;
+                final ManualModeModel.ManualModelFields field =
+                        (ManualModeModel.ManualModelFields) arg;
+                activity.runOnUiThread(() -> iris26670ApplyManualPresentationState(model, field));
+            }
+        };
+        model.addObserver(iris26670ManualModeObserver);
+        iris26670ApplyManualPresentationState(model, null);
+        Log.i(TAG, "IRIS_26670_MANUAL_OWNER_BOUND"
+                + " legacyKnobView=false legacyViewObserver=false"
+                + " sliderObserver=true modes=FOCUS,SHUTTER,ISO,EV");
+    }
+
+    @SuppressWarnings("deprecation")
+    private void iris26670EnsureManualPresentationBound() {
+        if (iris26670ManualConsoleOwner == null || iris26670ManualModeObserver == null
+                || iris26670ManualSlider == null) return;
+        iris26670ManualConsoleOwner.getManualModeModel().addObserver(iris26670ManualModeObserver);
+        iris26670ManualSlider.bindManualModeConsole(iris26670ManualConsoleOwner);
+        iris26670ApplyManualPresentationState(
+                iris26670ManualConsoleOwner.getManualModeModel(), null);
+        Log.i(TAG, "IRIS_26670_MANUAL_OWNER_RESUME"
+                + " legacyResumeSkipped=true sliderReasserted=true");
+    }
+
+    /* IRIS_26675_VISIBLE_MANUAL_ICON_GEOMETRY_OWNER
+     * buttons_container remains a structural/click-hierarchy parent only and is never translated.
+     * Center the four actual visible top compound drawables as one group between the slider outer
+     * bottom and activated-chevron visible upper tip. TextView top drawables are rendered from the
+     * view paddingTop, so their real visible centers are measurable without guessing a pixel offset.
+     * The four buttons receive one identical frozen translation; slider/chevron/panel stay unmoved. */
+    private float iris26675VisibleTopDrawableCenterY(TextView button) {
+        if (button == null || !button.isLaidOut() || button.getHeight() <= 0) return Float.NaN;
+        final Drawable[] drawables = button.getCompoundDrawablesRelative();
+        if (drawables == null || drawables.length < 2 || drawables[1] == null) return Float.NaN;
+        final Drawable top = drawables[1];
+        final int drawableHeight = top.getBounds().height() > 0
+                ? top.getBounds().height() : top.getIntrinsicHeight();
+        if (drawableHeight <= 0) return Float.NaN;
+        final int[] window = new int[2];
+        button.getLocationInWindow(window);
+        return window[1] + button.getPaddingTop() + 0.5f * drawableHeight;
+    }
+
+    private boolean iris26675EstablishManualIconMidpoint(View panel) {
+        if (activity == null || panel == null) return false;
+        final View slider = activity.findViewById(R.id.irisManualSliderContainer);
+        final View buttons = activity.findViewById(R.id.buttons_container);
+        final View chevron = activity.findViewById(R.id.approved_manual_chevron);
+        final TextView focus = activity.findViewById(R.id.focus_option_tv);
+        final TextView shutter = activity.findViewById(R.id.exposure_option_tv);
+        final TextView iso = activity.findViewById(R.id.iso_option_tv);
+        final TextView ev = activity.findViewById(R.id.ev_option_tv);
+        if (slider == null || buttons == null || chevron == null || focus == null
+                || shutter == null || iso == null || ev == null) return false;
+        if (iris26675ManualIconMidpointEstablished) return true;
+        if (!slider.isLaidOut() || !buttons.isLaidOut() || !chevron.isLaidOut()
+                || !focus.isLaidOut() || !shutter.isLaidOut() || !iso.isLaidOut() || !ev.isLaidOut()
+                || slider.getHeight() <= 0 || chevron.getHeight() <= 0) return false;
+
+        panel.setTranslationY(0.0f);
+        buttons.setTranslationY(0.0f);
+        focus.setTranslationY(0.0f);
+        shutter.setTranslationY(0.0f);
+        iso.setTranslationY(0.0f);
+        ev.setTranslationY(0.0f);
+        final int[] sliderWindow = new int[2];
+        final int[] chevronWindow = new int[2];
+        slider.getLocationInWindow(sliderWindow);
+        chevron.getLocationInWindow(chevronWindow);
+
+        final float focusCenterY = iris26675VisibleTopDrawableCenterY(focus);
+        final float shutterCenterY = iris26675VisibleTopDrawableCenterY(shutter);
+        final float isoCenterY = iris26675VisibleTopDrawableCenterY(iso);
+        final float evCenterY = iris26675VisibleTopDrawableCenterY(ev);
+        if (!Float.isFinite(focusCenterY) || !Float.isFinite(shutterCenterY)
+                || !Float.isFinite(isoCenterY) || !Float.isFinite(evCenterY)) return false;
+        final float visibleIconCenterBeforeY =
+                0.25f * (focusCenterY + shutterCenterY + isoCenterY + evCenterY);
+        final float sliderOuterBottomY = sliderWindow[1] + slider.getHeight();
+        final float density = getResources().getDisplayMetrics().density;
+        final float activatedChevronVisibleTopY = chevronWindow[1] + 0.34f * chevron.getHeight()
+                - 1.875f * density;
+        final float targetCenterY = 0.5f * (sliderOuterBottomY + activatedChevronVisibleTopY);
+        final float fixedTranslationY = targetCenterY - visibleIconCenterBeforeY;
+        focus.setTranslationY(fixedTranslationY);
+        shutter.setTranslationY(fixedTranslationY);
+        iso.setTranslationY(fixedTranslationY);
+        ev.setTranslationY(fixedTranslationY);
+        iris26675ManualFixedIconTranslationY = fixedTranslationY;
+        iris26675ManualIconMidpointEstablished = true;
+        Log.i(TAG, "IRIS_26675_MANUAL_VISIBLE_ICON_GEOMETRY_OWNER"
+                + " sliderBottomY=" + sliderOuterBottomY
+                + " chevronOpenTipY=" + activatedChevronVisibleTopY
+                + " focusIconCenterY=" + focusCenterY
+                + " shutterIconCenterY=" + shutterCenterY
+                + " isoIconCenterY=" + isoCenterY
+                + " evIconCenterY=" + evCenterY
+                + " visibleIconCenterBeforeY=" + visibleIconCenterBeforeY
+                + " targetCenterY=" + targetCenterY
+                + " fixedIconTranslationY=" + fixedTranslationY
+                + " buttonsContainerTranslationY=" + buttons.getTranslationY()
+                + " panelTranslationY=" + panel.getTranslationY()
+                + " sliderMoved=false chevronMoved=false containerMoved=false topMarginWrite=false"
+                + " ownerEstablished=true");
+        return true;
+    }
+
+    private void iris26675RevealManualPanelWhenGeometryReady(
+            View panel, ManualModeModel model) {
+        if (activity == null || panel == null || model == null) return;
+        if (!model.isManualPanelVisible() || panel.getVisibility() != View.VISIBLE) return;
+        if (iris26675EstablishManualIconMidpoint(panel)) {
+            final TextView focus = activity.findViewById(R.id.focus_option_tv);
+            final float iconNow = focus == null ? Float.NaN : focus.getTranslationY();
+            Log.i(TAG, "IRIS_26675_MANUAL_VISIBILITY_INVARIANCE"
+                    + " state=visible fixedIconTranslationY=" + iris26675ManualFixedIconTranslationY
+                    + " iconTranslationBefore=" + iconNow + " iconTranslationAfter=" + iconNow
+                    + " panelTranslationY=" + panel.getTranslationY() + " positionChanged=false");
+            panel.animate().alpha(1.0f).setDuration(100).start();
+            return;
+        }
+        if (iris26675ManualPreDrawListener != null) return;
+        iris26675ManualPreDrawListener = () -> {
+            if (activity == null || !model.isManualPanelVisible()
+                    || panel.getVisibility() != View.VISIBLE) {
+                if (panel.getViewTreeObserver().isAlive()) {
+                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26675ManualPreDrawListener);
+                }
+                iris26675ManualPreDrawListener = null;
+                return true;
+            }
+            if (!iris26675EstablishManualIconMidpoint(panel)) return true;
+            if (panel.getViewTreeObserver().isAlive()) {
+                panel.getViewTreeObserver().removeOnPreDrawListener(iris26675ManualPreDrawListener);
+            }
+            iris26675ManualPreDrawListener = null;
+            final TextView focus = activity.findViewById(R.id.focus_option_tv);
+            final float iconNow = focus == null ? Float.NaN : focus.getTranslationY();
+            Log.i(TAG, "IRIS_26675_MANUAL_VISIBILITY_INVARIANCE"
+                    + " state=visible-preDraw fixedIconTranslationY=" + iris26675ManualFixedIconTranslationY
+                    + " iconTranslationBefore=" + iconNow + " iconTranslationAfter=" + iconNow
+                    + " panelTranslationY=" + panel.getTranslationY() + " positionChanged=false");
+            panel.animate().alpha(1.0f).setDuration(100).start();
+            return true;
+        };
+        panel.getViewTreeObserver().addOnPreDrawListener(iris26675ManualPreDrawListener);
+    }
+
+    private void iris26670ApplyManualPresentationState(
+            ManualModeModel model, @Nullable ManualModeModel.ManualModelFields field) {
+        if (activity == null || model == null) return;
+        final View panel = activity.findViewById(R.id.manual_mode);
+        final TextView focus = activity.findViewById(R.id.focus_option_tv);
+        final TextView shutter = activity.findViewById(R.id.exposure_option_tv);
+        final TextView iso = activity.findViewById(R.id.iso_option_tv);
+        final TextView ev = activity.findViewById(R.id.ev_option_tv);
+
+        if (field == null || field == ManualModeModel.ManualModelFields.FOCUS_LISTENER) {
+            if (focus != null) focus.setOnClickListener(model.getFocusTextClicked());
+        }
+        if (field == null || field == ManualModeModel.ManualModelFields.EXP_LISTENER) {
+            if (shutter != null) shutter.setOnClickListener(model.getExposureTextClicked());
+        }
+        if (field == null || field == ManualModeModel.ManualModelFields.ISO_LISTENER) {
+            if (iso != null) iso.setOnClickListener(model.getIsoTextClicked());
+        }
+        if (field == null || field == ManualModeModel.ManualModelFields.EV_LISTENER) {
+            if (ev != null) ev.setOnClickListener(model.getEvTextClicked());
+        }
+        if (field == null || field == ManualModeModel.ManualModelFields.SELECTED_TV) {
+            final int selected = model.getSelectedTextViewId();
+            if (focus != null) focus.setSelected(selected == R.id.focus_option_tv);
+            if (shutter != null) shutter.setSelected(selected == R.id.exposure_option_tv);
+            if (iso != null) iso.setSelected(selected == R.id.iso_option_tv);
+            if (ev != null) ev.setSelected(selected == R.id.ev_option_tv);
+        }
+        if ((field == null || field == ManualModeModel.ManualModelFields.PANEL_VISIBILITY)
+                && panel != null) {
+            final boolean visible = model.isManualPanelVisible();
+            panel.animate().cancel();
+            // IRIS_26675_MANUAL_VISIBILITY_ONLY_OWNER: panel and structural parent stay permanently zero.
+            panel.setTranslationY(0.0f);
+            if (visible) {
+                panel.animate().cancel();
+                panel.setAlpha(0.0f);
+                panel.setVisibility(View.VISIBLE);
+                panel.post(() -> iris26675RevealManualPanelWhenGeometryReady(panel, model));
+            } else {
+                if (iris26675ManualPreDrawListener != null
+                        && panel.getViewTreeObserver().isAlive()) {
+                    panel.getViewTreeObserver().removeOnPreDrawListener(iris26675ManualPreDrawListener);
+                    iris26675ManualPreDrawListener = null;
+                }
+                final TextView focusButton = activity.findViewById(R.id.focus_option_tv);
+                final float iconTranslationBeforeHide = focusButton == null
+                        ? Float.NaN : focusButton.getTranslationY();
+                panel.animate().alpha(0.0f).setDuration(100)
+                        .withEndAction(() -> {
+                            panel.setTranslationY(0.0f);
+                            panel.setVisibility(View.GONE);
+                            final float iconTranslationAfterHide = focusButton == null
+                                    ? Float.NaN : focusButton.getTranslationY();
+                            Log.i(TAG, "IRIS_26675_MANUAL_VISIBILITY_INVARIANCE"
+                                    + " state=hidden fixedIconTranslationY=" + iris26675ManualFixedIconTranslationY
+                                    + " iconTranslationBefore=" + iconTranslationBeforeHide
+                                    + " iconTranslationAfter=" + iconTranslationAfterHide
+                                    + " panelTranslationY=" + panel.getTranslationY()
+                                    + " positionChanged=" + (Float.compare(iconTranslationBeforeHide, iconTranslationAfterHide) != 0));
+                        }).start();
+            }
+        }
+    }
+
+    void toggleManualControls() {
+        if (manualModeConsole.isPanelVisible()) {
+            mSwipe.SwipeDown();
+        } else {
+            mSwipe.SwipeUp();
+        }
+    }
+
+    @Override
+    public boolean onBackPressed() {
+        boolean handleBack = false;
+        if (cameraFragmentViewModel.isSettingsBarVisible()) {
+            cameraFragmentViewModel.setSettingsBarVisible(false);
+            handleBack = true;
+        }
+        if (manualModeConsole.isPanelVisible()) {
+            mSwipe.SwipeDown();
+            handleBack = true;
+        }
+        return handleBack;
+    }
+
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+//        Log.d(TAG, "onDestroy() called");
+        CaptureController retiringController = captureController;
+        if (retiringController != null) retiringController.shutdownSpektraMode();
+        try {
+            if (captureController != null) captureController.stopBackgroundThread();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        getParentFragmentManager().beginTransaction().remove(CameraFragment.this).commitAllowingStateLoss();
+        for (Future<?> taskResult : captureController.taskResults) {
+            try {
+                taskResult.get(); //wait for all tasks to complete
+            } catch (ExecutionException | InterruptedException ignored) {
+            }
+        }
+        settingsBarEntryProvider.removeObserver(mCameraUIEventsListener);
+        cameraFragmentBinding = null;
+        mCameraUIView.destroy();
+        mCameraUIView = null;
+        mCameraUIEventsListener = null;
+        if (iris26670ManualConsoleOwner != null && iris26670ManualModeObserver != null) {
+            iris26670ManualConsoleOwner.getManualModeModel().deleteObserver(iris26670ManualModeObserver);
+        }
+        iris26670ManualModeObserver = null;
+        iris26670ManualConsoleOwner = null;
+        iris26670ManualSlider = null;
+        manualModeConsole.onDestroy();
+        if (PhotonCamera.getCaptureController() == retiringController) {
+            PhotonCamera.setCaptureController(null);
+        } else {
+            Log.i(TAG, "IRIS_26608_STALE_FRAGMENT_DESTROY_PRESERVED_CURRENT_CONTROLLER");
+        }
+        captureController = null;
+        processExecutorService.shutdown();
+        Log.d(TAG, "onDestroy() finished");
+    }
+
+    @SuppressLint("DefaultLocale")
+    private void updateScreenLog(CaptureResult result) {
+        surfaceView.post(() -> {
+            if (mHorizonIndicatorView != null) {
+                mHorizonIndicatorView.updateDisplayRotation(getCameraFragmentViewModel().getCameraFragmentModel().getOrientation());
+            }
+            mTouchFocus.setState(result.get(CaptureResult.CONTROL_AF_STATE));
+            if (PreferenceKeys.isAfDataOn()) {
+                IsoExpoSelector.ExpoPair expoPair = IsoExpoSelector.GenerateExpoPair(-1, captureController);
+                LinkedHashMap<String, String> stringMap = new LinkedHashMap<>();
+                stringMap.put("AF_MODE", getResultFieldName("CONTROL_AF_MODE_", result.get(CaptureResult.CONTROL_AF_MODE)));
+                stringMap.put("AF_TRIGGER", getResultFieldName("CONTROL_AF_TRIGGER_", result.get(CaptureResult.CONTROL_AF_TRIGGER)));
+                stringMap.put("AF_STATE", getResultFieldName("CONTROL_AF_STATE_", result.get(CaptureResult.CONTROL_AF_STATE)));
+                stringMap.put("AE_MODE", getResultFieldName("CONTROL_AE_MODE_", result.get(CaptureResult.CONTROL_AE_MODE)));
+                stringMap.put("FLASH_MODE", getResultFieldName("FLASH_MODE_", result.get(CaptureResult.FLASH_MODE)));
+                stringMap.put("FOCUS_DISTANCE", String.valueOf(result.get(CaptureResult.LENS_FOCUS_DISTANCE)));
+                stringMap.put("EXPOSURE_TIME", expoPair.ExposureString() + "s");
+//            stringMap.put("EXPOSURE_TIME_CR", String.format(Locale.ROOT,"%.5f",result.get(CaptureResult.SENSOR_EXPOSURE_TIME).doubleValue()/1E9)+ "s");
+                stringMap.put("ISO", String.valueOf(expoPair.iso));
+//            stringMap.put("ISO_CR", String.valueOf(result.get(CaptureResult.SENSOR_SENSITIVITY)));
+                stringMap.put("Shakiness", String.valueOf(PhotonCamera.getGyro().getShakiness()));
+                stringMap.put("TripodShakiness", String.valueOf(PhotonCamera.getGyro().tripodShakiness));
+                stringMap.put("Tripod", String.valueOf(PhotonCamera.getGyro().getTripod()));
+                stringMap.put("FrameNumber", String.valueOf(result.getFrameNumber()));
+                float[] temp = new float[3];
+                temp[0] = captureController.mPreviewTemp[0].floatValue();
+                temp[1] = captureController.mPreviewTemp[1].floatValue();
+                temp[2] = captureController.mPreviewTemp[2].floatValue();
+                stringMap.put("White Point", String.format("%.3f %.3f %.3f", temp[0], temp[1], temp[2]));
+                MeteringRectangle[] afRect = result.get(CaptureResult.CONTROL_AF_REGIONS);
+                stringMap.put("AF_RECT", Arrays.deepToString(afRect));
+                if (afRect != null && afRect.length > 0) {
+                    RectF rect = getScreenRectFromMeteringRect(afRect[0]);
+                    stringMap.put("AF_RECT(px)", rect.toString());
+                    surfaceView.setAFRect(rect);
+                } else {
+                    surfaceView.setAFRect(null);
+                }
+                MeteringRectangle[] aeRect = result.get(CaptureResult.CONTROL_AE_REGIONS);
+                stringMap.put("AE_RECT", Arrays.deepToString(aeRect));
+                if (aeRect != null && aeRect.length > 0) {
+                    RectF rect = getScreenRectFromMeteringRect(aeRect[0]);
+                    stringMap.put("AE_RECT(px)", rect.toString());
+                    surfaceView.setAERect(rect);
+                } else {
+                    surfaceView.setAERect(null);
+                }
+                surfaceView.setDebugText(Logger.createTextFrom(stringMap));
+                surfaceView.refresh();
+            } else {
+                if (surfaceView.isCanvasDrawn) {
+                    surfaceView.clear();
+                }
+            }
+        });
+    }
+
+    private RectF getScreenRectFromMeteringRect(MeteringRectangle meteringRectangle) {
+        if (captureController.mImageReaderPreview == null) return new RectF();
+        Size size = CaptureController.mCameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE);
+        if (size == null) {
+            size = new Size(captureController.mImageReaderPreview.getWidth(), captureController.mImageReaderPreview.getHeight());
+        }
+        float left = (((float) meteringRectangle.getY() / size.getHeight()) * (textureView.getWidth()));
+        float top = (((float) meteringRectangle.getX() / size.getWidth()) * (textureView.getHeight()));
+        float width = (((float) meteringRectangle.getHeight() / size.getHeight()) * (textureView.getWidth()));
+        float height = (((float) meteringRectangle.getWidth() / size.getWidth()) * (textureView.getHeight()));
+        //left = textureView.getWidth() - left;
+        return new RectF(
+                //meteringRectangle.getY()-left, //Left
+                textureView.getWidth()-left-width,//Right
+                top,  //Top
+                //meteringRectangle.getY() - (left + width),//Right
+                textureView.getWidth()-left,
+                top + height //Bottom
+        );
+    }
+
+    private String getResultFieldName(String prefix, Integer value) {
+        if(value == null) return "";
+        for (Field f : this.metadataFields)
+            if (f.getName().startsWith(prefix)) {
+                try {
+                    if (f.getInt(f) == value)
+                        return f.getName().replace(prefix, "").concat("(" + value + ")");
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        return "";
+    }
+
+    /**
+     * Shows a {@link Toast} on the UI thread.
+     *
+     * @param text The message to show
+     */
+    public void showToast(final String text) {
+        if (activity != null) {
+            activity.runOnUiThread(() -> Toast.makeText(activity, text, Toast.LENGTH_SHORT).show());
+        }
+    }
+
+    public void showSnackBar(final String text) {
+        final View v = getView();
+        if (v != null) {
+            v.post(() -> Snackbar.make(v, text, Snackbar.LENGTH_SHORT).show());
+        }
+    }
+
+    /**
+     * Returns the ConstraintLayout object after adjusting the LayoutParams of Views contained in it.
+     * Adjusts the relative position of layout_top-bar and camera_container (= viewfinder + rest of the buttons excluding layout_topbar)
+     * depending on the aspect ratio of device.
+     * This is done in order to re-organise the camera layout for long displays (having aspect ratio > 16:9)
+     *
+     * @param aspectRatio     the aspect ratio of device display given by (height in pixels / width in pixels)
+     * @param activity_layout here, the layout of activity_main
+     * @return Object of {@param activity_layout} after adjustments.
+     */
+    private ConstraintLayout getAdjustedLayout(float aspectRatio, ConstraintLayout activity_layout) {
+        ConstraintLayout camera_container = activity_layout.findViewById(R.id.camera_container);
+        ConstraintLayout.LayoutParams camera_containerLP = (ConstraintLayout.LayoutParams) camera_container.getLayoutParams();
+        if (aspectRatio > 16f / 9f) {
+            DisplayMetrics displayMetrics = activity.getResources().getDisplayMetrics();
+            float dpHeight = displayMetrics.heightPixels / displayMetrics.density;
+            float dpWidth = displayMetrics.widthPixels / displayMetrics.density;
+
+            float dpmargin = (dpHeight - (dpWidth / 9f * 16f));
+            ConstraintLayout.LayoutParams layout_topbarLP = ((ConstraintLayout.LayoutParams) activity_layout.findViewById(R.id.layout_topbar).getLayoutParams());
+
+            layout_topbarLP.topMargin = (int) dpmargin;
+            camera_containerLP.bottomMargin = (int) dpmargin;
+            camera_containerLP.topToTop = -1;
+            camera_containerLP.topToBottom = R.id.layout_topbar;
+        }
+        return activity_layout;
+    }
+
+    /**
+     * Logs the device display properties
+     *
+     * @param dm Object of {@link DisplayMetrics} obtained from Fragment
+     */
+    private void logDisplayProperties(DisplayMetrics dm) {
+        String TAG = "DisplayProps";
+        Log.i(TAG, "ScreenResolution = " + Math.max(dm.heightPixels, dm.widthPixels) + "x" + Math.min(dm.heightPixels, dm.widthPixels));
+        Log.i(TAG, "AspectRatio = " + ((float) Math.max(dm.heightPixels, dm.widthPixels) / Math.min(dm.heightPixels, dm.widthPixels)));
+        Log.i(TAG, "SmallestWidth = " + (int) (Math.min(dm.heightPixels, dm.widthPixels) / (dm.densityDpi / 160f)) + "dp");
+    }
+
+    public void initCameraIDLists(CameraManager cameraManager) {
+        CameraManager2 manager2 = new CameraManager2(cameraManager, settingsManager);
+        this.mCameraLensDataMap = manager2.getCameraLensDataMap();
+        if (irisZoomController == null) {
+            irisZoomController = new IrisZoomController(this);
+        }
+        irisZoomController.onLensInventoryReady();
+        // Re-anchor sActiveBackCamId / sActiveFrontCamId to real cameras.
+        // The static defaults ("0" / "1") may not exist on every device (e.g. devices
+        // whose camera IDs start at 1).  After a full process restart there is no
+        // savedInstanceState to restore them, so we must derive them from the map here.
+        if (!mCameraLensDataMap.containsKey(sActiveBackCamId)) {
+            for (Map.Entry<String, CameraLensData> entry : mCameraLensDataMap.entrySet()) {
+                if (entry.getValue().getFacing() == CameraCharacteristics.LENS_FACING_BACK) {
+                    sActiveBackCamId = entry.getKey();
+                    break;
+                }
+            }
+        }
+        if (!mCameraLensDataMap.containsKey(sActiveFrontCamId)) {
+            for (Map.Entry<String, CameraLensData> entry : mCameraLensDataMap.entrySet()) {
+                if (entry.getValue().getFacing() == CameraCharacteristics.LENS_FACING_FRONT) {
+                    sActiveFrontCamId = entry.getKey();
+                    break;
+                }
+            }
+        }
+    }
+
+    public String cycler(String savedCameraID) {
+        if (Objects.requireNonNull(mCameraLensDataMap.get(savedCameraID)).getFacing() == CameraCharacteristics.LENS_FACING_BACK) {
+            sActiveBackCamId = savedCameraID;
+            return sActiveFrontCamId;
+        } else {
+            sActiveFrontCamId = savedCameraID;
+            return sActiveBackCamId;
+        }
+    }
+
+    public void triggerMediaScanner(Uri imageUri) {
+        Intent mediaScanIntent = new Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE);
+//        Bitmap bitmap = BitmapDecoder.from(Uri.fromFile(imageToSave)).scaleBy(0.1f).decode();
+        mediaScanIntent.setData(imageUri);
+        if (activity != null)
+            activity.sendBroadcast(mediaScanIntent);
+    }
+
+    public void launchGallery() {
+        Intent galleryIntent = new Intent(activity, GalleryActivity.class);
+        // Create gallery bundle
+        galleryIntent.putExtra("CameraFragment", true);
+        
+        startActivity(galleryIntent, null);
+    }
+
+    public void launchSettings() {
+        Intent settingsIntent = new Intent(activity, SettingsActivity.class);
+        // Pass current camera mode to settings
+        settingsIntent.putExtra("camera_mode", PreferenceKeys.getCameraModeOrdinal());
+        startActivity(settingsIntent);
+    }
+
+    public <T extends View> T findViewById(@IdRes int id) {
+        return activity.findViewById(id);
+    }
+
+    public void showErrorDialog(String errorMsg) {
+        ErrorDialog.newInstance(errorMsg).show(getChildFragmentManager(), FRAGMENT_DIALOG);
+    }
+
+    public void showErrorDialog(@StringRes int stringRes) {
+        try {
+            ErrorDialog.newInstance(getString(stringRes)).show(getChildFragmentManager(), FRAGMENT_DIALOG);
+        } catch (Resources.NotFoundException e) {
+            showErrorDialog(String.valueOf(stringRes));
+        }
+    }
+
+    public void invalidateSurfaceView() {
+        if (surfaceView != null) {
+            surfaceView.invalidate();
+        }
+    }
+
+    private void showNotification(String processName) {
+        NotificationCompat.Builder notificationBuilder = new NotificationCompat.Builder(activity, NOTIFICATION_CHANNEL_ID);
+        NotificationChannel channel = new NotificationChannel
+                (NOTIFICATION_CHANNEL_ID, "NotificationChannel", NotificationManager.IMPORTANCE_LOW);
+        notificationManager.createNotificationChannel(channel);
+        notificationBuilder
+                .setSmallIcon(R.drawable.ic_round_photo_camera_24)
+                .setContentTitle(activity.getString(R.string.app_name))
+                .setContentText(activity.getString(R.string.processing_processname, processName))
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setProgress(0, 0, true);
+        notificationManager.notify(NOTIFICATION_ID, notificationBuilder.build());
+    }
+
+    private void stopNotification() {
+        notificationManager.cancel(NOTIFICATION_ID);
+    }
+
+    //*****************************************************************************************************************
+    //**************************************ErrorDialog****************************************************************
+    //*****************************************************************************************************************
+
+    /**
+     * Shows an error message dialog.
+     */
+    public static class ErrorDialog extends DialogFragment {
+
+        private static final String ARG_MESSAGE = "message";
+
+        public static ErrorDialog newInstance(String message) {
+            ErrorDialog dialog = new ErrorDialog();
+            Bundle args = new Bundle();
+            args.putString(ARG_MESSAGE, message);
+            dialog.setArguments(args);
+            return dialog;
+        }
+
+        @NonNull
+        @Override
+        public Dialog onCreateDialog(Bundle savedInstanceState) {
+            final Activity activity = getActivity();
+            assert getArguments() != null;
+            return new AlertDialog.Builder(activity)
+                    .setMessage(getArguments().getString(ARG_MESSAGE))
+                    .setPositiveButton(android.R.string.ok, (dialogInterface, i) -> {
+                        if (activity != null) {
+                            activity.finish();
+                        }
+                    })
+                    .create();
+        }
+    }
+
+    //*****************************************************************************************************************
+    //**************************************CameraEventsListenerImpl***************************************************
+    //*****************************************************************************************************************
+
+    private class CameraEventsListenerImpl extends CameraEventsListener {
+        /* IRIS_26551_CAPTURE_UI_OWNER
+         * Capture-progress/countdown callbacks belong to the mode that started the burst.
+         * A late callback from a completed/retired mode must never repaint the destination mode.
+         */
+        private CameraMode iris26551CaptureUiMode = null;
+
+        private boolean iris26551CaptureUiIsCurrent(String event) {
+            final CameraMode currentMode = PhotonCamera.getSettings().selectedMode;
+            final boolean current = iris26551CaptureUiMode == null
+                    || iris26551CaptureUiMode == currentMode;
+            if (!current) {
+                Log.i(TAG, "IRIS_26551_STALE_UI_REJECT event=" + event
+                        + " sourceMode=" + iris26551CaptureUiMode
+                        + " currentMode=" + currentMode);
+            }
+            return current;
+        }
+        /**
+         * Implementation of {@link ProcessingEventsListener}
+         */
+        @Override
+        public void onProcessingStarted(String processName) {
+            logD("onProcessingStarted: " + processName + " Processing Started");
+            if (PhotonCamera.getSettings().selectedMode == CameraMode.RAWVIDEO) {
+                mCameraUIView.setProcessingProgressBarIndeterminate(false);
+                mCameraUIView.activateShutterButton(true);
+                return;
+            }
+            mCameraUIView.setProcessingProgressBarIndeterminate(true);
+            mCameraUIView.activateShutterButton(true);
+            showNotification(processName);
+        }
+
+        @Override
+        public void onProcessingChanged(Object obj) {
+            if (PhotonCamera.getSettings().selectedMode == CameraMode.RAWVIDEO
+                    && obj instanceof com.particlesdevs.photoncamera.processing.processor.RawVideoProcessor.RawVideoStats) {
+                com.particlesdevs.photoncamera.processing.processor.RawVideoProcessor.RawVideoStats stats =
+                        (com.particlesdevs.photoncamera.processing.processor.RawVideoProcessor.RawVideoStats) obj;
+                timerFrameCountViewModel.setFrameTimeCnt(
+                        new TimerFrameCountViewModel.FrameCntTime(stats.pendingWrites, 0, 0));
+                mCameraUIView.updateVideoRecordingInfo(stats.elapsedMs, stats.estimatedBytes, stats.availableBytes);
+            }
+        }
+
+        @Override
+        public void onProcessingFinished(Object obj) {
+            logD("onProcessingFinished: " + obj);
+            mCameraUIView.setProcessingProgressBarIndeterminate(false);
+            mCameraUIView.activateShutterButton(true);
+            mCameraUIView.lockUIForBurst(false);
+            if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                stopNotification();
+            }
+            if (iris26562DeferredForegroundReset && isResumed()) {
+                final Activity foregroundActivity = activity;
+                if (foregroundActivity != null) {
+                    foregroundActivity.runOnUiThread(() -> {
+                        if (isResumed() && iris26562ApplyForegroundResetIfReady()) {
+                            captureController.resumeCamera();
+                            Log.critical(TAG, "IRIS_26562_DEFERRED_FOREGROUND_CAMERA_RESUMED");
+                        }
+                    });
+                }
+            }
+
+        }
+
+        @Override
+        public void notifyImageSavedStatus(boolean saved, Path savedFilePath) {
+            if (saved) {
+                Uri imageUri = null;
+                if (savedFilePath != null) {
+                    triggerMediaScanner(imageUri = Uri.fromFile(savedFilePath.toFile()));
+                    logD("ImageSaved: " + savedFilePath);
+//                    showSnackBar("ImageSaved: " + savedFilePath.toString());
+                }
+                cameraFragmentViewModel.updateGalleryThumb(imageUri);
+            } else {
+                logE("ImageSavingError");
+                showSnackBar("ImageSavingError");
+            }
+        }
+
+        @Override
+        public void onProcessingError(Object obj) {
+            if (obj instanceof String)
+                showToast((String) obj);
+            mCameraUIView.lockUIForBurst(false);
+            onProcessingFinished("Processing Finished Unexpectedly!!");
+        }
+
+        //*****************************************************************************************************************
+
+        /**
+         * Implementation of {@link CaptureEventsListener}
+         */
+        @Override
+        public void onFrameCountSet(int frameCount) {
+            iris26551CaptureUiMode = PhotonCamera.getSettings().selectedMode;
+            mCameraUIView.setCaptureProgressMax(frameCount);
+            Log.i(TAG, "IRIS_26551_CAPTURE_UI_OWNER mode=" + iris26551CaptureUiMode
+                    + " frameCount=" + frameCount);
+        }
+
+        @Override
+        public void onCaptureStillPictureStarted(Object o) {
+            if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                /* IRIS_26551_MODE_GENERIC_PROGRESS_REARM
+                 * setCaptureProgressMax() already opened a fresh UI generation for this burst.
+                 * Never post a processing-ring hide from capture start: onProcessingStarted() is
+                 * the sole SHOW authority and onProcessingFinished()/error is the HIDE authority.
+                 */
+                mCameraUIView.setCaptureProgressBarOpacity(1.0f);
+                mCameraUIView.lockUIForBurst(true);
+            }
+            //textureView.post(() -> textureView.setAlpha(0.8f));
+        }
+
+        @Override
+        public void onCaptureStillPictureRejected(Object o) {
+            /* IRIS_26679_SHUTTER_TERMINAL_REJECTION
+             * onTimerFinished() disables the shutter before entering CaptureController.
+             * A pre-capture terminal rejection therefore owns one explicit UI release; it must
+             * not masquerade as processing completion or mutate the active camera generation. */
+            logD("IRIS_26679_SHUTTER_UI_RELEASE reason=" + o);
+            mCameraUIView.activateShutterButton(true);
+            mCameraUIView.lockUIForBurst(false);
+        }
+
+        private long prevPlayTime = 0;
+        @Override
+        public void onFrameCaptureStarted(Object o) {
+            long seekDelay = 50;
+            if(prevPlayTime + seekDelay < System.currentTimeMillis()){
+                prevPlayTime = System.currentTimeMillis();
+                burstPlayer.seekTo(0);
+            }
+        }
+
+        @Override
+        public void onBurstPrepared(Object o) {
+        }
+        @Override
+        public void onFrameCaptureProgressed(Object o) {
+        }
+
+        @Override
+        public void onFrameCaptureCompleted(Object o) {
+            if (!iris26551CaptureUiIsCurrent("frame-complete")) return;
+            if (PhotonCamera.getSettings().selectedMode != CameraMode.RAWVIDEO) {
+                mCameraUIView.incrementCaptureProgressBar(1);
+                if (PreferenceKeys.isCameraSoundsOn()) {
+                    burstPlayer.start();
+                }
+                if (o instanceof TimerFrameCountViewModel.FrameCntTime) {
+                    timerFrameCountViewModel.setFrameTimeCnt((TimerFrameCountViewModel.FrameCntTime) o);
+                }
+            }
+        }
+
+        @Override
+        public void onCaptureSequenceCompleted(Object o) {
+            final boolean currentUiOwner = iris26551CaptureUiIsCurrent("capture-sequence-complete");
+            iris26551CaptureUiMode = null;
+            if (!currentUiOwner) return;
+            if (PreferenceKeys.isCameraSoundsOn()) {
+                endPlayer.start();
+            }
+            timerFrameCountViewModel.clearFrameTimeCnt();
+            mCameraUIView.resetCaptureProgressBar();
+            mCameraUIView.lockUIForBurst(false);
+            mCameraUIView.setVideoRecordingInfoVisible(false);
+            textureView.post(() -> textureView.setAlpha(1f));
+        }
+
+        @Override
+        public void onPreviewCaptureCompleted(CaptureResult captureResult) {
+            updateScreenLog(captureResult);
+        }
+
+        /**
+         * Implementation of abstract methods of {@link CameraEventsListener}
+         */
+
+        @Override
+        public void onOpenCamera(CameraManager cameraManager) {
+            initCameraIDLists(cameraManager);
+            auxButtonsViewModel.initCameraLists(mCameraLensDataMap);
+        }
+
+        @Override
+        public void onCameraRestarted() {
+            mCameraUIView.refresh(CaptureController.isProcessing);
+            mTouchFocus.resetFocusCircle();
+        }
+
+        @Override
+        public void onCharacteristicsUpdated(CameraCharacteristics characteristics) {
+            auxButtonsViewModel.setActiveId(PreferenceKeys.getCameraID());
+            Boolean flashAvailable = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+            mCameraUIView.showFlashButton(flashAvailable != null && flashAvailable);
+            manualModeConsole.init(activity, characteristics);
+            /* IRIS_26670_APP_OWNED_MANUAL_PRESENTATION
+             * Model construction stays proven; the legacy wheel observer is retired immediately.
+             * IrisManualSliderView and this Fragment become the only active manual presentation.
+             */
+            iris26670BindManualPresentationOwner();
+        }
+
+        @Override
+        public void onError(Object o) {
+            if (o instanceof String) {
+                showErrorDialog(o.toString());
+            }
+            if (o instanceof Integer) {
+                showErrorDialog((Integer) o);
+            }
+        }
+
+        @Override
+        public void onFatalError(String errorMsg) {
+            logE("onFatalError: " + errorMsg);
+            activity.finish();
+        }
+
+        @Override
+        public void onRequestTriggerMediaScanner(Uri fileUri) {
+            triggerMediaScanner(fileUri);
+        }
+    }
+
+
+}
