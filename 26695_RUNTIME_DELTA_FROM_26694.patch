@@ -1,0 +1,353 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+index 011411a8a2a9e8b316ddebe6e7065847e0de2ec1..deae58482ac71b5bbaeb31b9b7bb8d22879e9d51 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java
+@@ -9,6 +9,8 @@ import androidx.annotation.Nullable;
+ import androidx.lifecycle.LifecycleOwner;
+ 
+ import com.particlesdevs.photoncamera.api.CameraEventsListener;
++import com.particlesdevs.photoncamera.capture.CaptureController;
++import com.particlesdevs.photoncamera.util.Log;
+ import com.unspektrawesome.camera.CameraCatalog;
+ import com.unspektrawesome.camera.CameraDescriptor;
+ import com.unspektrawesome.camera.LensFacing;
+@@ -179,6 +181,8 @@ public final class SpektraModeController {
+             }
+             events.onFrameCaptureCompleted(null);
+             events.onCaptureSequenceCompleted("Spektra RAW acquired");
++            // IRIS_26695_SPEKTRA_PROCESSING_UI_AUTHORITY: same process-wide gate as Photo.
++            CaptureController.isProcessing = true;
+             events.onProcessingStarted("Spektra");
+         });
+     }
+@@ -196,6 +200,7 @@ public final class SpektraModeController {
+                         || captureUiRevision != revisionId) return;
+                 clearCaptureUiOwnershipLocked();
+             }
++            CaptureController.isProcessing = false;
+             host.onSpektraImageSaved(uri);
+             events.onProcessingFinished("Spektra");
+         });
+@@ -217,6 +222,7 @@ public final class SpektraModeController {
+                         || captureUiRevision != revisionId) return;
+                 clearCaptureUiOwnershipLocked();
+             }
++            CaptureController.isProcessing = false;
+             if (!wasProcessing) {
+                 events.onCaptureSequenceCompleted("Spektra capture failed");
+             }
+@@ -240,6 +246,7 @@ public final class SpektraModeController {
+         }
+         if (!hadCapture) return;
+         activity.runOnUiThread(() -> {
++            CaptureController.isProcessing = false;
+             if (!wasProcessing) {
+                 events.onCaptureSequenceCompleted("Spektra mode handoff");
+             }
+@@ -352,7 +359,8 @@ public final class SpektraModeController {
+         generation.incrementAndGet();
+         selectedCamera = null;
+         RawVulkanPreviewController current = controller;
+-        if (current != null) current.configure(null, preferences);
++        boolean released = current == null || current.retireForModeHandoff(2500L);
++        Log.i("SpektraModeController", "IRIS_26695_MODE_HANDOFF_RELEASED released=" + released);
+         activity.runOnUiThread(host::onSpektraPreviewStopped);
+     }
+ 
+diff --git a/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java b/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java
+index 6edfd9caef9eaadc5b8d432e5af5fb6fc44b3d91..54f362765596e6272ad81a848b0c7e8285b8b13a 100644
+--- a/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java
++++ b/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java
+@@ -41,6 +41,8 @@ import java.util.Set;
+ import java.util.EnumSet;
+ import java.nio.ByteBuffer;
+ import java.util.concurrent.Executor;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
+ 
+ /** Single-route RAW-only Camera2 session with borrowed GPU and packed plane buffers. */
+ public final class Camera2RawSession implements AutoCloseable {
+@@ -118,6 +120,8 @@ public final class Camera2RawSession implements AutoCloseable {
+     private RawStillCaptureCallback stillCaptureCallback;
+     private boolean stillFrameDelivered;
+     private Runnable stillCaptureTimeout;
++    // IRIS_26695_CAMERA_DEVICE_RELEASE_AUTHORITY: close request is not release proof.
++    private volatile CountDownLatch cameraDeviceClosedLatch = new CountDownLatch(0);
+     private volatile int sensorIso;
+     private volatile long sensorExposureNs;
+     private int stillIso;
+@@ -201,6 +205,8 @@ public final class Camera2RawSession implements AutoCloseable {
+         stillFrameDelivered = false;
+         stillIso = sensorIso;
+         stillExposureNs = sensorExposureNs;
++        Log.i(TAG, "IRIS_26695_SPEKTRA_SHUTTER_EXPOSURE iso=" + stillIso
++                + " exposureNs=" + stillExposureNs);
+         transition(State.STILL_CONFIGURING);
+         Handler handler = cameraHandler;
+         if (handler == null || !handler.post(() -> beginStillReconfiguration(selected))) {
+@@ -253,9 +259,11 @@ public final class Camera2RawSession implements AutoCloseable {
+         try {
+             imageReader = Api29.createCpuReadableRawReader(output);
+             imageReader.setOnImageAvailableListener(this::onPreviewImageAvailable, cameraHandler);
++            cameraDeviceClosedLatch = new CountDownLatch(1);
+             transition(State.OPENING);
+             cameraManager.openCamera(route.openCameraId, deviceCallback(route), cameraHandler);
+         } catch (CameraAccessException | SecurityException | IllegalArgumentException error) {
++            signalCameraDeviceClosed();
+             fail(new SessionError(ErrorCode.CAMERA_ACCESS,
+                     "Unable to open RAW camera route " + route.routeId, true, error));
+         } catch (RuntimeException error) {
+@@ -276,6 +284,11 @@ public final class Camera2RawSession implements AutoCloseable {
+                 configureSession(SessionMode.PREVIEW);
+             }
+ 
++            @Override
++            public void onClosed(CameraDevice device) {
++                signalCameraDeviceClosed();
++            }
++
+             @Override
+             public void onDisconnected(CameraDevice device) {
+                 device.close();
+@@ -962,6 +975,39 @@ public final class Camera2RawSession implements AutoCloseable {
+         catch (RuntimeException ignored) { }
+     }
+ 
++    /** Wait until CameraDevice.onClosed proves the transport is actually released. */
++    public boolean closeAndAwaitCameraRelease(long timeoutMs) {
++        final CountDownLatch latch;
++        synchronized (this) {
++            latch = cameraDeviceClosedLatch;
++            close();
++        }
++        if (latch.getCount() == 0L) return true;
++        try {
++            boolean released = latch.await(Math.max(1L, timeoutMs), TimeUnit.MILLISECONDS);
++            Log.i(TAG, "IRIS_26695_CAMERA_DEVICE_RELEASE released=" + released
++                    + " timeoutMs=" + timeoutMs + " state=" + state);
++            return released;
++        } catch (InterruptedException error) {
++            Thread.currentThread().interrupt();
++            Log.e(TAG, "IRIS_26695_CAMERA_DEVICE_RELEASE_INTERRUPTED", error);
++            return false;
++        }
++    }
++
++    private void signalCameraDeviceClosed() {
++        CountDownLatch latch = cameraDeviceClosedLatch;
++        if (latch != null) latch.countDown();
++        finishCameraThreadAfterDeviceClose();
++    }
++
++    private synchronized void finishCameraThreadAfterDeviceClose() {
++        HandlerThread thread = cameraThread;
++        cameraThread = null;
++        cameraHandler = null;
++        if (thread != null) thread.quitSafely();
++    }
++
+     @Override
+     public synchronized void close() {
+         if (state == State.CLOSED || state == State.CLOSING) return;
+@@ -992,7 +1038,11 @@ public final class Camera2RawSession implements AutoCloseable {
+         }
+         CameraDevice device = cameraDevice;
+         cameraDevice = null;
+-        if (device != null) device.close();
++        if (device != null) {
++            device.close();
++        } else {
++            signalCameraDeviceClosed();
++        }
+         pendingImage.clear();
+         metadata.clear();
+         ImageReader reader = imageReader;
+@@ -1001,10 +1051,7 @@ public final class Camera2RawSession implements AutoCloseable {
+             reader.setOnImageAvailableListener(null, null);
+             reader.close();
+         }
+-        HandlerThread thread = cameraThread;
+-        cameraThread = null;
+-        cameraHandler = null;
+-        if (thread != null) thread.quitSafely();
++        // Keep the callback looper alive until CameraDevice.onClosed proves transport release.
+         stillCaptureCallback = null;
+         transition(terminalState);
+     }
+diff --git a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+index 3297d2b5860300795dedef91ece7954680e4e459..60d1ed40b3252ae052900b973cbbbd05a64d5e05 100644
+--- a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
++++ b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+@@ -93,6 +93,12 @@ class RawVulkanPreviewController(
+     private val captureWriter = Executors.newSingleThreadExecutor { task ->
+         Thread(task, "UnspektrawesomeJpegWriter")
+     }
++    // IRIS_26695_STANDALONE_CAPTURE_PIPELINE_WARMUP_OWNER
++    // Exact 1.1.2 exposes startup steps 0..9. Warm the still/capture side before Camera2 opens
++    // so pipeline compilation cannot land on the first shutter.
++    private val warmupExecutor = Executors.newSingleThreadExecutor { task ->
++        Thread(task, "UnspektrawesomeVulkanWarmup")
++    }
+     private val windowManager = context.getSystemService(WindowManager::class.java)
+     private val mutableStatus = MutableStateFlow(RawPreviewStatus())
+     private val mutableCaptureStatus = MutableStateFlow(RawCaptureStatus())
+@@ -131,7 +137,11 @@ class RawVulkanPreviewController(
+         renderer.configureCenterWeightedExposureMeter(it)
+     }
+     private val previewTimingBuffer = directBuffer(8)
+-    private var lastExposureMeterSequence = Long.MIN_VALUE
++    private var lastExposureMeterSequence = 0L
++    private var captureWarmupEpoch = 0L
++    private var captureWarmupRunning = false
++    private var captureWarmupAttempted = false
++    private var captureWarmupReady = false
+     private var manualIso: Int? = null
+     private var manualExposureNs: Long? = null
+     private var manualEvSteps: Int = 0
+@@ -297,6 +307,7 @@ class RawVulkanPreviewController(
+         }
+         if (attachedSurface === surface) return@synchronized
+         stopActiveLocked()
++        resetCaptureWarmupLocked()
+         attachedSurface = surface
+         blockedConfiguration = null
+         if (!renderer.setSurface(surface)) {
+@@ -314,6 +325,7 @@ class RawVulkanPreviewController(
+     fun detachSurface(surface: Surface? = null) = synchronized(lock) {
+         if (closed || (surface != null && attachedSurface !== surface)) return@synchronized
+         stopActiveLocked()
++        resetCaptureWarmupLocked()
+         attachedSurface = null
+         renderer.setSurface(null)
+         publishLocked(RawPreviewPhase.WAITING_FOR_SURFACE, "Waiting for viewfinder surface")
+@@ -349,10 +361,42 @@ class RawVulkanPreviewController(
+         histogramListener = null
+         captureListener = null
+         renderer.close()
++        warmupExecutor.shutdownNow()
+         captureWriter.shutdownNow()
+         publishLocked(RawPreviewPhase.CLOSED, "RAW preview is closed")
+     }
+ 
++    /**
++     * IRIS_26695_SPEKTRA_RELEASE_BARRIER
++     * Handoff completes only after CameraDevice.onClosed, not when close() is merely requested.
++     * Wait outside the controller lock so Camera2 callbacks remain free to complete.
++     */
++    fun retireForModeHandoff(timeoutMs: Long): Boolean {
++        val owner = synchronized(lock) {
++            configuredCamera = null
++            blockedConfiguration = null
++            clearHistogramLocked()
++            val current = active
++            if (current != null && pendingCapture?.owner === current) {
++                val revision = pendingCapture?.snapshot?.revisionId
++                pendingCapture = null
++                publishCaptureErrorLocked("RAW capture was canceled by mode handoff", revision)
++            }
++            current
++        } ?: return true
++        val released = owner.session.closeAndAwaitCameraRelease(timeoutMs)
++        synchronized(lock) {
++            if (active === owner) active = null
++            publishLocked(RawPreviewPhase.IDLE, "Spektra camera retired for mode handoff")
++        }
++        Log.i(
++            TAG,
++            "IRIS_26695_SPEKTRA_RELEASE_BARRIER released=$released timeoutMs=$timeoutMs " +
++                "route=${owner.camera.route.routeId}",
++        )
++        return released
++    }
++
+     private fun stillCallback(request: PendingCapture) = object : RawStillCaptureCallback {
+         override fun onStillFrame(frame: RawHardwareFrame) {
+             processStillFrame(request, frame)
+@@ -646,9 +690,54 @@ class RawVulkanPreviewController(
+             stopActiveLocked()
+             return
+         }
++        if (!ensureCaptureWarmupLocked()) return
+         startLocked(camera, plan, key)
+     }
+ 
++    private fun resetCaptureWarmupLocked() {
++        captureWarmupEpoch++
++        captureWarmupRunning = false
++        captureWarmupAttempted = false
++        captureWarmupReady = false
++    }
++
++    private fun ensureCaptureWarmupLocked(): Boolean {
++        if (captureWarmupReady || captureWarmupAttempted) return true
++        if (captureWarmupRunning) return false
++        val surface = attachedSurface ?: return false
++        val epoch = ++captureWarmupEpoch
++        captureWarmupRunning = true
++        publishLocked(RawPreviewPhase.OPENING, "Warming Spektra capture pipelines")
++        warmupExecutor.execute {
++            val startedMs = SystemClock.elapsedRealtime()
++            var successfulSteps = 0
++            val completed = runCatching {
++                for (step in 0..9) {
++                    if (!renderer.warmUp(false, step)) break
++                    successfulSteps++
++                }
++                successfulSteps == 10
++            }.getOrElse { error ->
++                Log.e(TAG, "IRIS_26695_SPEKTRA_CAPTURE_WARMUP_FAILED step=$successfulSteps", error)
++                false
++            }
++            val elapsedMs = SystemClock.elapsedRealtime() - startedMs
++            synchronized(lock) {
++                if (closed || epoch != captureWarmupEpoch || attachedSurface !== surface) return@synchronized
++                captureWarmupRunning = false
++                captureWarmupAttempted = true
++                captureWarmupReady = completed
++                Log.i(
++                    TAG,
++                    "IRIS_26695_SPEKTRA_CAPTURE_WARMUP completed=$completed " +
++                        "steps=$successfulSteps elapsedMs=$elapsedMs",
++                )
++                reconcileLocked()
++            }
++        }
++        return false
++    }
++
+     private fun startLocked(
+         camera: CameraDescriptor,
+         plan: RawPreviewPolicy.Plan,
+@@ -660,7 +749,9 @@ class RawVulkanPreviewController(
+         val owner = ActiveSession(session, camera, plan, key, characteristics, exposure)
+         applyStoredManualControls(owner)
+         session.setManualFocus(manualFocusDistance)
+-        lastExposureMeterSequence = Long.MIN_VALUE
++        exposureMeterBuffer.putLong(VulkanRenderer.EXPOSURE_METER_SEQUENCE_OFFSET, 0L)
++        exposureMeterBuffer.putDouble(VulkanRenderer.EXPOSURE_METER_VALUE_OFFSET, 0.0)
++        lastExposureMeterSequence = 0L
+         active = owner
+         publishLocked(
+             RawPreviewPhase.OPENING,
+@@ -898,7 +989,9 @@ class RawVulkanPreviewController(
+     }
+ 
+     private fun updateExposureFromNativeMeter(owner: ActiveSession) {
+-        if (!renderer.pollExposureMeter(exposureMeterBuffer)) return
++        // IRIS_26695_RENDER_DELIVERED_AE_METER_OWNER
++        // Exact 1.1.2 nativeRender() consumes the completed meter fence and writes sequence/value
++        // into this carrier before returning. A second poll can therefore erase the Java handoff.
+         val sequence = exposureMeterBuffer.getLong(VulkanRenderer.EXPOSURE_METER_SEQUENCE_OFFSET)
+         val meter = exposureMeterBuffer.getDouble(VulkanRenderer.EXPOSURE_METER_VALUE_OFFSET)
+         if (sequence == lastExposureMeterSequence || !meter.isFinite() || meter <= 0.0) return
+diff --git a/app/version.properties b/app/version.properties
+index 34a6132445e3e9eda221d640be3f402e961ec03c..f349a907ba2757cf54279fe34a702a85cdf85207 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726694
+-VERSION_BUILD=26694
++VERSION_NAME=0.9726695
++VERSION_BUILD=26695
