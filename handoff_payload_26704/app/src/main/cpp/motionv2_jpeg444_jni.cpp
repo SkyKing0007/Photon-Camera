@@ -900,8 +900,7 @@ struct Iris26571BandQueue {
     }
 };
 
-static const char*kIris26571PublicationCompute=R"GLSL(
-#version 310 es
+static const char*kIris26571PublicationCompute=R"GLSL(#version 310 es
 precision highp float;
 precision highp int;
 precision highp usampler2D;
