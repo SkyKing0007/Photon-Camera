@@ -1,0 +1,389 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 768ef821ea58771e50add0e3bf170ce04f3fe8ac..4332eb7bb6ffffbb4a23835cf0eb2a54030a01c4 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1794,6 +1794,27 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private double mMotion26680LastExposureEnergy = Double.NaN;
+     private long mMotion26680LatchGeneration = -1L;
+ 
++    /* IRIS_26701_BOUNDED_PRELATCH_HIGHLIGHT_OWNER
++     * Recover the proven 26662 RAW highlight-safe reference policy without restoring its
++     * continuously scene-reactive lifetime. One negative-only target may be solved after the
++     * stationary HAL baseline, applied once, observed physically, then 26680 locks AE/AWB.
++     * Subject/TV/flicker content cannot unlock or continuously rewrite it, and shutter never waits
++     * for this transaction: capture always freezes the latest physically observed exposure group. */
++    private static final int MOTION_26701_HIGHLIGHT_CONFIRM_FRAMES = 4;
++    private static final int MOTION_26701_HIGHLIGHT_FORCE_DECISION_FRAMES = 15;
++    private static final int MOTION_26701_HIGHLIGHT_OBSERVE_TIMEOUT_FRAMES = 12;
++    private boolean mMotion26701HighlightBaseReady = false;
++    private boolean mMotion26701HighlightRequestIssued = false;
++    private boolean mMotion26701HighlightRequestObserved = false;
++    private int mMotion26701HighlightBaseSteps = 0;
++    private int mMotion26701HighlightTargetSteps = 0;
++    private int mMotion26701HighlightCandidateSteps = Integer.MIN_VALUE;
++    private int mMotion26701HighlightCandidateFrames = 0;
++    private int mMotion26701HighlightDecisionFrames = 0;
++    private int mMotion26701HighlightObserveFrames = 0;
++    private float mMotion26701HighlightStepEv = 0.0f;
++    private float mMotion26701HighlightObservedProtectionEv = 0.0f;
++
+     /*
+      * IRIS_26662_FRAME_MATCHED_PREVIEW_PROTECTION
+      * Preview compensation must describe the exposure of the SurfaceTexture frame being drawn,
+@@ -2590,6 +2611,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotion26680ReframeMotionFrames = 0;
+         mMotion26680LastExposureEnergy = Double.NaN;
+         mMotion26680LatchGeneration = mIris26548CameraHealthGeneration;
++        resetMotion26701HighlightTransaction();
+ 
+         /* Retire any state belonging to the older continuously-reactive HDR reference owner. */
+         mMotion26661ReferenceBaseReady = false;
+@@ -2608,6 +2630,193 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + mIris26548CameraHealthGeneration + " reason=" + reason);
+     }
+ 
++    private void resetMotion26701HighlightTransaction() {
++        mMotion26701HighlightBaseReady = false;
++        mMotion26701HighlightRequestIssued = false;
++        mMotion26701HighlightRequestObserved = false;
++        mMotion26701HighlightBaseSteps = 0;
++        mMotion26701HighlightTargetSteps = 0;
++        mMotion26701HighlightCandidateSteps = Integer.MIN_VALUE;
++        mMotion26701HighlightCandidateFrames = 0;
++        mMotion26701HighlightDecisionFrames = 0;
++        mMotion26701HighlightObserveFrames = 0;
++        mMotion26701HighlightStepEv = 0.0f;
++        mMotion26701HighlightObservedProtectionEv = 0.0f;
++    }
++
++    private float motion26701ObservedProtectionEv(@NonNull TotalCaptureResult result) {
++        if (!mMotion26701HighlightBaseReady || mMotion26701HighlightStepEv <= 0.0f) return 0.0f;
++        Integer observed = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
++        if (observed == null) return mMotion26701HighlightObservedProtectionEv;
++        int observedProtectionSteps = Math.max(0, mMotion26701HighlightBaseSteps - observed);
++        return observedProtectionSteps * mMotion26701HighlightStepEv;
++    }
++
++    /* Returns true only when the one-shot highlight decision is safe to latch. */
++    private boolean updateMotion26701BoundedHighlightProtection(
++            @NonNull TotalCaptureResult result, boolean aeSettled, long sensorTs) {
++        android.util.Range<Integer> aeRange = mCameraCharacteristics.get(
++                CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
++        android.util.Rational aeStep = mCameraCharacteristics.get(
++                CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP);
++        if (aeRange == null || aeStep == null || aeStep.floatValue() <= 0.0f) {
++            mMotion26701HighlightRequestObserved = true;
++            return true;
++        }
++        final float stepEv = aeStep.floatValue();
++        Integer observedObj = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
++        Integer builderObj = mPreviewRequestBuilder.get(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION);
++        int observedSteps = observedObj != null ? observedObj : (builderObj != null ? builderObj : 0);
++
++        if (!mMotion26701HighlightBaseReady) {
++            mMotion26701HighlightBaseSteps = Math.max(
++                    aeRange.getLower(), Math.min(aeRange.getUpper(), observedSteps));
++            mMotion26701HighlightTargetSteps = mMotion26701HighlightBaseSteps;
++            mMotion26701HighlightStepEv = stepEv;
++            mMotion26701HighlightBaseReady = true;
++        }
++
++        if (mMotion26701HighlightRequestIssued) {
++            mMotion26701HighlightObserveFrames++;
++            if (observedSteps == mMotion26701HighlightTargetSteps && aeSettled) {
++                mMotion26701HighlightRequestObserved = true;
++                mMotion26701HighlightObservedProtectionEv = Math.max(0,
++                        mMotion26701HighlightBaseSteps - observedSteps) * stepEv;
++                Log.i(TAG, "IRIS_26701_HIGHLIGHT_PROTECTION_OBSERVED"
++                        + " generation=" + mIris26548CameraHealthGeneration
++                        + " baseSteps=" + mMotion26701HighlightBaseSteps
++                        + " targetSteps=" + mMotion26701HighlightTargetSteps
++                        + " observedSteps=" + observedSteps
++                        + " protectionEv=" + mMotion26701HighlightObservedProtectionEv
++                        + " shutterWaitAdded=false");
++                return true;
++            }
++            if (mMotion26701HighlightObserveFrames < MOTION_26701_HIGHLIGHT_OBSERVE_TIMEOUT_FRAMES) {
++                return false;
++            }
++            /* Bounded fail-safe: keep whatever exposure the sensor physically reached and latch it.
++             * Never wait/retry the user's shutter and never revive 26679's capture freeze mode. */
++            mMotion26701HighlightTargetSteps = observedSteps;
++            mMotion26701HighlightObservedProtectionEv = Math.max(0,
++                    mMotion26701HighlightBaseSteps - observedSteps) * stepEv;
++            mMotion26701HighlightRequestObserved = true;
++            try {
++                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, observedSteps);
++                rebuildPreviewBuilder();
++            } catch (IllegalArgumentException | IllegalStateException ignored) {}
++            Log.w(TAG, "IRIS_26701_HIGHLIGHT_PROTECTION_BOUNDED_TIMEOUT"
++                    + " generation=" + mIris26548CameraHealthGeneration
++                    + " observedSteps=" + observedSteps
++                    + " shutterWaitAdded=false latchCurrentPhysicalState=true");
++            return true;
++        }
++
++        mMotion26701HighlightDecisionFrames++;
++        long rawAgeNs = mMotion26380RawSignalTimestampNs <= 0L
++                ? Long.MAX_VALUE : Math.abs(sensorTs - mMotion26380RawSignalTimestampNs);
++        boolean rawFresh = rawAgeNs <= 180_000_000L
++                && mMotion26380RawSampleCount >= 64
++                && Float.isFinite(mMotion26380RawHighlightFraction)
++                && Float.isFinite(mMotion26608RawP995);
++
++        if (rawFresh) {
++            float radiometricGuide = Math.max(0.0f, mMotion26608RawP995);
++            long hdrAgeNs = mMotion26608RecentHdrConflictTimestampNs <= 0L
++                    ? Long.MAX_VALUE : Math.abs(sensorTs - mMotion26608RecentHdrConflictTimestampNs);
++            boolean hdrConflict = mMotion26608CurrentHdrConflict
++                    || hdrAgeNs <= MOTION_26608_HDR_CONFLICT_HOLD_NS;
++            boolean currentCoherentClip = mMotion26496RawCoherentHighlightCells > 0;
++            boolean broadClip = mMotion26380RawHighlightFraction
++                    >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER;
++            boolean currentMeaningfulClip = broadClip
++                    || (currentCoherentClip && mMotion26608CurrentHdrConflict);
++
++            float requestedProtectionEv = 0.0f;
++            if (hdrConflict || currentMeaningfulClip) {
++                if (radiometricGuide > MOTION_26661_REFERENCE_HEADROOM_TARGET) {
++                    requestedProtectionEv = (float)(Math.log(
++                            radiometricGuide / MOTION_26661_REFERENCE_HEADROOM_TARGET) / Math.log(2.0));
++                }
++                if (mMotion26608CurrentHdrConflict && radiometricGuide >= 0.45f) {
++                    requestedProtectionEv = Math.max(
++                            requestedProtectionEv, MOTION_26661_HDR_MIN_PROTECTION_EV);
++                }
++                if (currentMeaningfulClip) {
++                    float clipPressure = motion26368Clamp01(
++                            (mMotion26380RawHighlightFraction - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER)
++                                    / (0.030f - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER));
++                    float clipFloor = MOTION_26661_CLIP_MIN_PROTECTION_EV + 0.45f * clipPressure;
++                    requestedProtectionEv = Math.max(requestedProtectionEv, clipFloor);
++                }
++            }
++            requestedProtectionEv = Math.max(
++                    0.0f, Math.min(MOTION_26661_MAX_PROTECTION_EV, requestedProtectionEv));
++            int maximumProtectionSteps = Math.max(
++                    0, mMotion26701HighlightBaseSteps - aeRange.getLower());
++            int desiredProtectionSteps = Math.max(0, Math.min(maximumProtectionSteps,
++                    Math.round(requestedProtectionEv / stepEv)));
++
++            if (desiredProtectionSteps != mMotion26701HighlightCandidateSteps) {
++                mMotion26701HighlightCandidateSteps = desiredProtectionSteps;
++                mMotion26701HighlightCandidateFrames = 1;
++            } else {
++                mMotion26701HighlightCandidateFrames++;
++            }
++
++            if (mMotion26701HighlightCandidateFrames >= MOTION_26701_HIGHLIGHT_CONFIRM_FRAMES) {
++                mMotion26701HighlightTargetSteps = Math.max(aeRange.getLower(), Math.min(
++                        aeRange.getUpper(), mMotion26701HighlightBaseSteps - desiredProtectionSteps));
++                if (desiredProtectionSteps <= 0) {
++                    mMotion26701HighlightRequestObserved = true;
++                    mMotion26701HighlightObservedProtectionEv = 0.0f;
++                    Log.i(TAG, "IRIS_26701_HIGHLIGHT_PROTECTION_COMMIT"
++                            + " generation=" + mIris26548CameraHealthGeneration
++                            + " targetProtectionEv=0.0 rawP995=" + mMotion26608RawP995
++                            + " hdrConflict=" + hdrConflict
++                            + " decision=stable-no-protection shutterWaitAdded=false");
++                    return true;
++                }
++                try {
++                    mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
++                            mMotion26701HighlightTargetSteps);
++                    mMotion26701HighlightRequestIssued = true;
++                    mMotion26701HighlightObserveFrames = 0;
++                    rebuildPreviewBuilder();
++                    Log.i(TAG, "IRIS_26701_HIGHLIGHT_PROTECTION_COMMIT"
++                            + " generation=" + mIris26548CameraHealthGeneration
++                            + " baseSteps=" + mMotion26701HighlightBaseSteps
++                            + " targetSteps=" + mMotion26701HighlightTargetSteps
++                            + " targetProtectionEv=" + (desiredProtectionSteps * stepEv)
++                            + " rawP995=" + mMotion26608RawP995
++                            + " rawHighlightFraction=" + mMotion26380RawHighlightFraction
++                            + " coherentCells=" + mMotion26496RawCoherentHighlightCells
++                            + " hdrConflict=" + hdrConflict
++                            + " singleStep=true continuousSceneRewrite=false shutterWaitAdded=false");
++                    return false;
++                } catch (IllegalArgumentException | IllegalStateException e) {
++                    mMotion26701HighlightRequestObserved = true;
++                    Log.w(TAG, "IRIS_26701 highlight protection request skipped: "
++                            + e.getClass().getSimpleName());
++                    return true;
++                }
++            }
++        } else {
++            mMotion26701HighlightCandidateSteps = Integer.MIN_VALUE;
++            mMotion26701HighlightCandidateFrames = 0;
++        }
++
++        if (mMotion26680StationaryFrames >= MOTION_26701_HIGHLIGHT_FORCE_DECISION_FRAMES) {
++            mMotion26701HighlightRequestObserved = true;
++            mMotion26701HighlightObservedProtectionEv = 0.0f;
++            Log.i(TAG, "IRIS_26701_HIGHLIGHT_PROTECTION_COMMIT"
++                    + " generation=" + mIris26548CameraHealthGeneration
++                    + " targetProtectionEv=0.0 rawFresh=" + rawFresh
++                    + " decision=bounded-no-confirmation shutterWaitAdded=false");
++            return true;
++        }
++        return false;
++    }
++
+     private void updateMotion26680StablePreviewAuthority(@NonNull TotalCaptureResult result) {
+         if (!isZslMode() || mZslCapturing || burst || isProcessing
+                 || mPreviewRequestBuilder == null || mCaptureSession == null
+@@ -2630,9 +2839,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+ 
+-        /* 26680 has no Iris-owned exposure compensation. Preview presentation therefore carries
+-         * zero synthetic protection EV for every timestamp. */
+-        recordMotion26662PreviewProtection(sensorTs, 0.0f);
++        /* IRIS_26701_FRAME_MATCHED_PREVIEW_PROTECTION
++         * Presentation follows only the compensation physically reported for this exact sensor
++         * timestamp. A newly requested protection target is never shown before the sensor sees it. */
++        mMotion26701HighlightObservedProtectionEv = motion26701ObservedProtectionEv(result);
++        recordMotion26662PreviewProtection(sensorTs, mMotion26701HighlightObservedProtectionEv);
+ 
+         int shakiness = 0;
+         try {
+@@ -2664,6 +2875,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 mMotion26680StationaryFrames = 0;
+                 mMotion26680ReframeMotionFrames = 0;
+                 mMotion26680LastExposureEnergy = Double.NaN;
++                resetMotion26701HighlightTransaction();
+                 rebuildPreviewBuilder();
+                 Log.i(TAG, "IRIS_26680_STABLE_PREVIEW_RELEASE generation="
+                         + mIris26548CameraHealthGeneration
+@@ -2681,6 +2893,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26680StableFrames = 0;
+             mMotion26680StationaryFrames = 0;
+             mMotion26680LastExposureEnergy = (double) exposureNs * (double) iso;
++            if (mMotion26701HighlightBaseReady || mMotion26701HighlightRequestIssued
++                    || mMotion26701HighlightCandidateFrames > 0) {
++                resetMotion26701HighlightTransaction();
++            }
+             return;
+         }
+ 
+@@ -2707,10 +2923,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26680StableFrames = 0;
+         }
+ 
+-        if (mMotion26680StableFrames < MOTION_26680_STABLE_CONFIRM_FRAMES
+-                && mMotion26680StationaryFrames < MOTION_26680_FORCE_LATCH_FRAMES) {
+-            return;
+-        }
++        boolean iris26701BaselineReady =
++                mMotion26680StableFrames >= MOTION_26680_STABLE_CONFIRM_FRAMES
++                || mMotion26680StationaryFrames >= MOTION_26680_FORCE_LATCH_FRAMES;
++        if (!iris26701BaselineReady && !mMotion26701HighlightRequestIssued) return;
++        if (!updateMotion26701BoundedHighlightProtection(result, aeSettled, sensorTs)) return;
+ 
+         Boolean aeLockAvailable = mCameraCharacteristics.get(
+                 CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE);
+@@ -2741,7 +2958,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     + " shakiness=" + shakiness
+                     + " aeLocked=true awbLocked=" + mMotion26680AwbLockApplied
+                     + " rawSceneContentCannotRewriteExposure=true"
+-                    + " flickerObserverOnly=true");
++                    + " flickerObserverOnly=true"
++                    + " iris26701BoundedHighlightProtection=true"
++                    + " referenceProtectionEv=" + mMotion26701HighlightObservedProtectionEv
++                    + " shutterWaitAdded=false");
+         } catch (IllegalArgumentException | IllegalStateException e) {
+             mMotion26680PreviewLatched = false;
+             mMotion26680AeLockApplied = false;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index c7eea6faa6d9769fe8c26fb9ccb09f22b021542f..d01944407c513ef66548d0accfa334aadc060e01 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1142,10 +1142,21 @@ public final class MotionV2Render extends Node {
+ 
+                 int pixels = gainSize.x * gainSize.y;
+                 ByteBuffer alpha = ByteBuffer.allocateDirect(pixels);
++                /* IRIS_26701_GAINMAP_BYTE_ARRAY_EXACT_REMAP
++                 * Bulk-copy the exact R8 gain codes once, then scan/remap ordinary byte[] memory.
++                 * The 256-entry LUT executes the identical 26700 exp/log/round expression for each
++                 * possible input code; only Java direct-ByteBuffer per-pixel access is removed. */
++                byte[] gainCodes = new byte[pixels];
++                ByteBuffer rgbaRead = rgba.duplicate();
++                rgbaRead.position(0);
++                if (rgbaRead.remaining() < pixels) {
++                    throw new IllegalStateException("26701 gain-map readback too small");
++                }
++                rgbaRead.get(gainCodes, 0, pixels);
+                 int nonUnity = 0;
+                 int encodedPeakCode = 0;
+                 for (int i = 0; i < pixels; i++) {
+-                    int code = rgba.get(i) & 0xff;
++                    int code = gainCodes[i] & 0xff;
+                     if (code > 0) nonUnity++;
+                     encodedPeakCode = Math.max(encodedPeakCode, code);
+                 }
+@@ -1160,17 +1171,22 @@ public final class MotionV2Render extends Node {
+                 int peakCode = 0;
+                 final double logEncodingMax = Math.log(Math.max(encodingMaxGainRatio, 1.001f));
+                 final double logDeclaredMax = Math.log(Math.max(maxGainRatio, 1.001f));
+-                for (int i = 0; i < pixels; i++) {
+-                    int encodedCode = rgba.get(i) & 0xff;
++                final int[] iris26701GainRemap = new int[256];
++                for (int encodedCode = 0; encodedCode < iris26701GainRemap.length; encodedCode++) {
+                     int outputCode = encodedCode;
+                     if (basePipeline.mParameters.motionV2Active && encodedCode > 0) {
+                         double ratioAtPixel = Math.exp(logEncodingMax * encodedCode / 255.0);
+                         outputCode = (int)Math.round(255.0 * Math.log(ratioAtPixel) / logDeclaredMax);
+                         outputCode = Math.max(0, Math.min(255, outputCode));
+                     }
++                    iris26701GainRemap[encodedCode] = outputCode;
++                }
++                for (int i = 0; i < pixels; i++) {
++                    int outputCode = iris26701GainRemap[gainCodes[i] & 0xff];
+                     peakCode = Math.max(peakCode, outputCode);
+-                    alpha.put((byte)outputCode);
++                    gainCodes[i] = (byte)outputCode;
+                 }
++                alpha.put(gainCodes, 0, pixels);
+                 alpha.position(0);
+                 iris26641AfterScanNs = System.nanoTime();
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+index 259d6b991dff969eace0faa9440d948fd22fd545..e2acbe2adfda22269848831826aabef5ed1055bc 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraCameraOwner.java
+@@ -38,6 +38,7 @@ import androidx.annotation.Nullable;
+ import androidx.core.app.ActivityCompat;
+ 
+ import com.particlesdevs.photoncamera.api.CameraEventsListener;
++import com.particlesdevs.photoncamera.app.PhotonCamera;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
+ import java.io.File;
+@@ -1471,7 +1472,15 @@ final class SpektraCameraOwner {
+             events.onCaptureSequenceCompleted("SPEKTRA");
+             events.onProcessingStarted("Spektra");
+         });
+-        final int outputRotation = outputRotationDegrees();
++        /* IRIS_26701_SPEKTRA_MOTION_ORIENTATION_PARITY
++         * CameraActivity is portrait-locked, so Display.getRotation() is not physical device
++         * orientation. Freeze the exact Gravity/camera-rotation authority Motion uses at shutter. */
++        Integer iris26701SensorOrientation = characteristics == null ? null
++                : characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION);
++        final int outputRotation = PhotonCamera.getGravity().getCameraRotation(
++                iris26701SensorOrientation == null ? 0 : iris26701SensorOrientation);
++        Log.i(TAG, "IRIS_26701_SPEKTRA_CAPTURE_ORIENTATION rotation=" + outputRotation
++                + " source=PhotonCamera.Gravity motionParity=true");
+         final String lensModel = metadata.focalLengthMm > 0f
+                 ? (route == null ? "" : route.characteristicsId) + " " + metadata.focalLengthMm + "mm"
+                 : (route == null ? "" : route.characteristicsId);
+diff --git a/app/version.properties b/app/version.properties
+index 197e8c491b006cd734dfa482e9d7a9a10e2349a1..22b510671655c32204f79309fa4d2f1c4754f8c1 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726700
+-VERSION_BUILD=26700
++VERSION_NAME=0.9726701
++VERSION_BUILD=26701
