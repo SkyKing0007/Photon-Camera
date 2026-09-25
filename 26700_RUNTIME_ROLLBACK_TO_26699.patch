@@ -1,0 +1,272 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+index 48a3bad40e11dd60bd315634206fcc14f33c0647..90b8439ba5fb81d59d3fbcd9d34cfa054c06c60c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+@@ -1,6 +1,7 @@
+ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+ 
+ import android.graphics.Point;
++import android.opengl.GLES30;
+ 
+ import com.particlesdevs.photoncamera.processing.opengl.GLDrawParams;
+ import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+@@ -70,24 +71,54 @@ public final class MotionV2CfaInput extends Node {
+                         && raw.x > 0 && raw.y > 0
+                         && (raw.x % 2) == 0 && (raw.y % 2) == 0;
+         boolean directRgbCarrier = directBayer && pipeline.motionV2DirectRgbCarrier;
++        long directHalfBytes = (long) raw.x * (long) raw.y * 4L * 2L;
+         long directFloatBytes = (long) raw.x * (long) raw.y * 4L * 4L;
+-        if (directRgbCarrier && source.capacity() != directFloatBytes) {
+-            throw new IllegalStateException("26700 Motion RGBA32F recovery carrier byte contract invalid bytes="
+-                    + source.capacity() + " expected=" + directFloatBytes);
++        boolean directHalfRgbCarrier = directRgbCarrier && source.capacity() == directHalfBytes;
++        if (directRgbCarrier
++                && source.capacity() != directHalfBytes
++                && source.capacity() != directFloatBytes) {
++            throw new IllegalStateException("26699 Motion direct RGB carrier byte contract invalid bytes="
++                    + source.capacity() + " halfExpected=" + directHalfBytes
++                    + " floatExpected=" + directFloatBytes);
+         }
+ 
+         try {
+-            WorkingTexture = new GLTexture(
+-                    directRgbCarrier ? raw : half,
+-                    new GLFormat(GLFormat.DataType.FLOAT_32, 4),
+-                    view,
+-                    GL_NEAREST,
+-                    GL_CLAMP_TO_EDGE);
++            if (directHalfRgbCarrier) {
++                /* IRIS_26699_MOTION_DIRECT_RGBA16F_UPLOAD
++                 * GLTexture FLOAT_16 historically uses GL_FLOAT as its generic client type. The
++                 * Sabre carrier physically contains IEEE half values, so allocate the same RGBA16F
++                 * internal texture but upload these bytes explicitly as GL_HALF_FLOAT. */
++                WorkingTexture = new GLTexture(
++                        raw,
++                        new GLFormat(GLFormat.DataType.FLOAT_16, 4),
++                        GL_NEAREST,
++                        GL_CLAMP_TO_EDGE);
++                int[] previousBinding = new int[1];
++                GLES30.glGetIntegerv(GLES30.GL_TEXTURE_BINDING_2D, previousBinding, 0);
++                try {
++                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, WorkingTexture.mTextureID);
++                    GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 8);
++                    view.position(0);
++                    GLES30.glTexSubImage2D(
++                            GLES30.GL_TEXTURE_2D, 0, 0, 0, raw.x, raw.y,
++                            GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, view);
++                    com.particlesdevs.photoncamera.processing.opengl.GLCoreBlockProcessing
++                            .checkEglError("26699 Motion RGBA16F direct client upload");
++                } finally {
++                    GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1);
++                    GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, previousBinding[0]);
++                }
++            } else {
++                WorkingTexture = new GLTexture(
++                        directRgbCarrier ? raw : half,
++                        new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                        view,
++                        GL_NEAREST,
++                        GL_CLAMP_TO_EDGE);
++            }
+         } finally {
+-            /* IRIS_26700_MOTION_RGBA32F_RELEASE_OWNER
+-             * Retain the 26699 ownership fix while restoring the successful-26698 carrier format:
+-             * GLTexture upload has consumed client memory before returning, so release the native
+-             * RGBA32F carrier immediately instead of leaking ~192 MiB per 4096x3072 capture. */
++            /* glTexSubImage2D has consumed client memory before returning. Match Night's proven
++             * ownership contract and release the native carrier before ping-pong allocation. */
+             pipeline.motionV2FloatCfa = null;
+             Allocator.free(source);
+             source = null;
+@@ -139,10 +170,10 @@ public final class MotionV2CfaInput extends Node {
+                 GL_CLAMP_TO_EDGE);
+         basePipeline.texnum = 0;
+ 
+-        Log.d(Name, "IRIS_26700_V2_RGB_INPUT"
++        Log.d(Name, "IRIS_26699_V2_RGB_INPUT"
+                 + " carrier=" + (directRgbCarrier ? "properPerFrameCameraRgbFullRes" : "packedCfaHalfRes")
+-                + " transferFormat=rgba32f"
+-                + " bytesPerChannel=4"
++                + " transferFormat=" + (directHalfRgbCarrier ? "rgba16f_direct" : "rgba32f")
++                + " bytesPerChannel=" + (directHalfRgbCarrier ? 2 : 4)
+                 + " cpuCarrierReleasedAfterUpload=true"
+                 + " rgbPingPong=" + raw.x + "x" + raw.y
+                 + " main1=true main2=true main3=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index ea9262809420ec445b590ee26b9379b8ff82d29e..935cab6f60a9c2cc4f2d0ac9e51add14d0808a54 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -636,17 +636,22 @@ object PhotonMotionMgc1271Bridge {
+                 }
+             }
+             forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+-            /* IRIS_26700_MOTION_RGBA32F_CAPTURE_RECOVERY
+-             * 26699 device evidence proved the experimental direct-half carrier reaches the
+-             * bridge correctly but is rejected by the established Hdrx/PostPipeline RGBA32F
+-             * contract before capture can finish. Restore the exact successful-26698 transport:
+-             * keep the accepted RGBA16F CPU residual-denoise result, convert it to the proven
+-             * RGBA32F cross-context carrier, then release that carrier after PostPipeline upload.
+-             * Reconstruction, denoise, exposure, tone, UHDR, and saved-image math are unchanged.
++            /* IRIS_26699_MOTION_DIRECT_RGBA16F_HANDOFF
++             * Keep the exact accepted CPU RGBA16F residual-denoise result. Standard Motion now
++             * transfers those half-float bytes directly to PostPipeline, avoiding the old
++             * half->GPU->float32 CPU conversion. Night deliberately retains its proven RGBA32F
++             * parity bridge because its dedicated input contract is separate.
+              */
+-            val output: ByteBuffer = convertHalfRgbaToFloatRgba(denoiseBuffer, size.x, size.y)
+-            PLog.i(TAG, "IRIS_26700_MOTION_RGBA32F_CAPTURE_RECOVERY bytes=${output.capacity()} " +
+-                "source=denoisedRGBA16F transfer=RGBA32F proven26698=true")
++            val directHalfMotionCarrier = !parameters.irisNightActive && cfa in 0..3
++            val output: ByteBuffer = if (directHalfMotionCarrier) {
++                denoiseBuffer
++            } else {
++                convertHalfRgbaToFloatRgba(denoiseBuffer, size.x, size.y)
++            }
++            if (directHalfMotionCarrier) {
++                PLog.i(TAG, "IRIS_26699_MOTION_DIRECT_RGBA16F_HANDOFF bytes=${output.capacity()} " +
++                    "denoiseUnchanged=true conversionRoundTrip=false clientType=GL_HALF_FLOAT")
++            }
+             GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
+             resultTexture = 0
+             checkGl("delete exported MGC RGB")
+@@ -757,7 +762,7 @@ object PhotonMotionMgc1271Bridge {
+                 "denoise=SABRE_RESOLVE_PLUS_SABRE_DEFAULT_RESIDUAL " +
+                 "baselineEv=${stacked.baselineExposureEv} " +
+                 "displayGain=${parameters.motionV2DisplayGain} " +
+-                "crossContext=${if (parameters.irisNightActive) "float32_rgba_cpu_night_motion_parity" else "float32_rgba_cpu_motion_26700_recovery"} alphaSupport=disabled")
++                "crossContext=${if (parameters.irisNightActive) "float32_rgba_cpu_night_motion_parity" else if (directHalfMotionCarrier) "half16_rgba_cpu_motion_direct" else "float32_rgba_cpu_motion"} alphaSupport=disabled")
+ 
+             return MotionV2Merger.Result(
+                 output,
+@@ -787,8 +792,9 @@ object PhotonMotionMgc1271Bridge {
+                 stacked.true2xReconstructionMs,
+             ).also { result ->
+                 result.sabreSelected = true
+-                /* The RGBA32F output carrier is independently allocated. The original RGBA16F
+-                 * denoise carrier remains owned here and is released by this bridge's finally block. */
++                /* Successful Motion Result now owns the native RGBA16F carrier until the
++                 * PostPipeline input uploads and frees it. Keep Night's float32 ownership unchanged. */
++                if (directHalfMotionCarrier) halfBuffer = null
+                 true2xOutputHandedOff = resultTrue2xRenderRgbPath != null &&
+                     (!produceNormalStackedDng || resultTrue2xLinearRawPath != null)
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index 547b4a303506e673924bef076f5b023cac749e49..04cf72a7910b2e205dab854a0e267eddc31beaa7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -3,8 +3,6 @@ package com.particlesdevs.photoncamera.processing.ultrahdr;
+ import android.graphics.Bitmap;
+ import android.graphics.Canvas;
+ import android.graphics.ColorSpace;
+-import android.graphics.Paint;
+-import android.graphics.RectF;
+ import android.graphics.Gainmap;
+ import android.graphics.BitmapFactory;
+ import android.graphics.Point;
+@@ -447,49 +445,6 @@ public final class MotionV2Jpeg444Encoder {
+         }
+     }
+ 
+-    /** IRIS_26700_SPEKTRA_MOTION_WATERMARK_PARITY
+-     * Apply the same final-raster Iris watermark contract used by Motion to an already-oriented
+-     * ARGB_8888 raster. This reuses Motion's exact adaptive five-point luma decision, 0.55
+-     * threshold, Iris dark/white assets, 11.5% width, 2.5% inset, lower-right placement, and
+-     * filtered alpha compositing. It does not alter exposure, color rendering, or JPEG settings.
+-     */
+-    public static boolean applyFinalRasterWatermark(Bitmap bitmap) {
+-        if (bitmap == null || bitmap.isRecycled() || bitmap.getConfig() != Bitmap.Config.ARGB_8888
+-                || !bitmap.isMutable() || bitmap.getWidth() <= 0 || bitmap.getHeight() <= 0) {
+-            return false;
+-        }
+-        Bitmap watermark = null;
+-        try {
+-            final boolean useDark = useDarkWatermarkForBackground(bitmap);
+-            watermark = loadTrue2xWatermark(useDark);
+-            if (watermark == null || watermark.isRecycled()
+-                    || watermark.getWidth() <= 0 || watermark.getHeight() <= 0) {
+-                return false;
+-            }
+-            final float width = bitmap.getWidth();
+-            final float height = bitmap.getHeight();
+-            final float wmWidth = width * 0.115f;
+-            final float wmHeight = wmWidth * ((float) watermark.getHeight() / (float) watermark.getWidth());
+-            final float margin = Math.max(2.0f, Math.min(width, height) * 0.025f);
+-            final float left = width - margin - wmWidth;
+-            final float top = height - margin - wmHeight;
+-            final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+-            paint.setAlpha(255);
+-            new Canvas(bitmap).drawBitmap(watermark, null,
+-                    new RectF(left, top, left + wmWidth, top + wmHeight), paint);
+-            Log.i(TAG, "IRIS_26700_FINAL_RASTER_WATERMARK_PARITY variant="
+-                    + (useDark ? "DARK_ON_BRIGHT" : "WHITE_ON_DARK")
+-                    + " size=" + bitmap.getWidth() + "x" + bitmap.getHeight()
+-                    + " widthFrac=0.115 marginFrac=0.025 threshold=0.55");
+-            return true;
+-        } catch (Throwable t) {
+-            Log.e(TAG, "IRIS_26700_FINAL_RASTER_WATERMARK_FAILED", t);
+-            return false;
+-        } finally {
+-            if (watermark != null && !watermark.isRecycled()) watermark.recycle();
+-        }
+-    }
+-
+     private static native String getLastTrue2xPublicationTelemetryNative();
+     private static native boolean writeNative(Bitmap bitmap,String path,int quality,boolean sourceDisplayP3);
+     private static native boolean convertSrgbToDisplayP3Native(Bitmap bitmap);
+diff --git a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+index c5a50994b7bd15ccdd69529437f3bf2dfb37088c..7b49e08abf1a8d982329e3e20d81e4cfd91db6e9 100644
+--- a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
++++ b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+@@ -36,8 +36,6 @@ import com.unspektrawesome.vulkan.params.RawColorShaderParameters
+ import com.unspektrawesome.vulkan.params.VulkanCaptureSnapshot
+ import com.unspektrawesome.vulkan.params.WhiteBalanceGains
+ import com.particlesdevs.photoncamera.spektra.SpektraExposureController
+-import com.particlesdevs.photoncamera.processing.ultrahdr.MotionV2Jpeg444Encoder
+-import com.particlesdevs.photoncamera.settings.PreferenceKeys
+ import com.particlesdevs.photoncamera.util.Log
+ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+@@ -252,7 +250,6 @@ class RawVulkanPreviewController(
+                 snapshot.params.toByteBuffer(),
+                 System.nanoTime() * NANOSECONDS_TO_SECONDS,
+                 System.currentTimeMillis(),
+-                PreferenceKeys.isShowWatermarkOn(),
+             )
+         }.getOrElse { error ->
+             publishCaptureErrorLocked(
+@@ -520,16 +517,6 @@ class RawVulkanPreviewController(
+         captureWriter.execute {
+             val result = try {
+                 runCatching {
+-                    if (request.watermarkEnabled) {
+-                        check(MotionV2Jpeg444Encoder.applyFinalRasterWatermark(image)) {
+-                            "Spektra Motion-parity watermark application failed"
+-                        }
+-                        Log.i(TAG, "IRIS_26700_SPEKTRA_WATERMARK_PARITY applied=true " +
+-                            "revision=${request.snapshot.revisionId} finalRaster=${image.width}x${image.height}")
+-                    } else {
+-                        Log.i(TAG, "IRIS_26700_SPEKTRA_WATERMARK_PARITY applied=false " +
+-                            "revision=${request.snapshot.revisionId} toggleFrozen=false")
+-                    }
+                     jpegWriter.write(
+                         image,
+                         metadata,
+@@ -1161,7 +1148,6 @@ class RawVulkanPreviewController(
+         val spektraParameters: ByteBuffer,
+         val spektraTimeSeconds: Double,
+         val capturedAtMillis: Long,
+-        val watermarkEnabled: Boolean,
+     )
+ 
+     private companion object {
+diff --git a/app/version.properties b/app/version.properties
+index 197e8c491b006cd734dfa482e9d7a9a10e2349a1..f58ca58803c1c859e7423dddac377202fa49cb5e 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726700
+-VERSION_BUILD=26700
++VERSION_NAME=0.9726699
++VERSION_BUILD=26699
