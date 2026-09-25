@@ -182,7 +182,7 @@ with zipfile.ZipFile(apk) as z:
   data=z.read(n)
   if b'Lcom/unspektrawesome/diagnostics/InternalLogRecorder;' in data:hits.append((n,data))
  assert len(hits)==1 and b'recordNative' in hits[0][1]
- assert any(b'writeTrue2xNative' in z.read(n) and b'iris26705BodyToneStrength' in z.read(n) for n in dex)
+ assert any(b'writeTrue2xNative' in z.read(n) and b'iris26704BodyToneStrength' in z.read(n) for n in dex)
  so_name='lib/arm64-v8a/libunspektrawesome_vulkan.so';assert so_name in names;h=hashlib.sha256(z.read(so_name)).hexdigest();assert h=='f40b4707ae27e7d181563d99c31370d5a0e39daef1edb6366bba27da7a201dbd'
  motion='lib/arm64-v8a/libmotionv2jpeg.so';assert motion in names;md=z.read(motion);assert b'Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTrue2xNative' in md and b'uBodyToneStrength' in md
  result=f'PASS APK JNI CONTRACT: {hits[0][0]} recorder ABI; Spektra native invariant {h}; MotionV2 writeTrue2x + body-tone uniform present\n';open(out,'w').write(result);print(result,end='')

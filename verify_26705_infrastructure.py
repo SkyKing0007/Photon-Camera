@@ -10,6 +10,10 @@ assert s.count('export IRIS26705_GLSLANG="$compiler"')==1
 assert s.count('export IRIS26681_SPEKTRA_GLSLANG="$compiler"')==1
 prep=s[s.index('prepare_glslang(){'):s.index('compile_modified_runtime_shaders(){')]
 for t in ['export IRIS26705_GLSLANG="$compiler"','export IRIS26681_SPEKTRA_GLSLANG="$compiler"']:assert t in prep
+# Permanent 26705 R1 regression: body-tone runtime owner is inherited byte-identically from successful 26704.
+# The post-build APK verifier must test the inherited marker and must never invent a 26705 rename.
+assert s.count("b'iris26704BodyToneStrength'")==1
+assert "b'iris26705BodyToneStrength'" not in s
 marker='# IRIS_26705_AUTHORITATIVE_ACTIONS_STAGE_ORDER';assert s.count(marker)==1
 main=s[s.index(marker):]
 order=['verify_package','verify_scope','obtain_authority','make_candidate','verify_successful_26704_mechanics','prepare_glslang','compile_modified_runtime_shaders','compile_spektra_raw_shader','install_frozen_candidate_live','./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace','verify_compiled_jni_callback','verify_compiled_motion_jni','after_language_compiler_snapshot',"./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDebug[armeabi-v7a]' --stacktrace",'verify_candidate_patches','26705 PRE-BUILD SAFETY PROOF PASSED','./gradlew :app:assembleDebug --stacktrace','verify_apk_jni_contract','postbuild_proof','26705 ACTIONS BUILD COMPLETE']
