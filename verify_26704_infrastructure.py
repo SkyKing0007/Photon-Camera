@@ -10,6 +10,14 @@ required=[
 'GLSLANG_VERSION="16.5.0"','EXPECTED_BRANCH="experimental-clean-photon-rebuild"',
 'build_26703_spektra_full_frame_still_geometry.sh','.github/workflows/build-26703-spektra-full-frame-still-geometry.yml']
 for t in required:assert t in s,t
+# Permanent regression for the failed 26704 R1 CMake configure: retain the exact successful-26703
+# CMake/Spektra compiler handoff while also exposing the same pinned binary to the 26704 shader verifier.
+assert s.count('export IRIS26681_SPEKTRA_GLSLANG="$compiler"')==1
+assert s.count('export IRIS26704_GLSLANG="$compiler"')==1
+prep=s[s.index('prepare_glslang(){'):s.index('compile_modified_runtime_shaders(){')]
+assert 'export IRIS26704_GLSLANG="$compiler"' in prep
+assert 'export IRIS26681_SPEKTRA_GLSLANG="$compiler"' in prep
+assert prep.index('export IRIS26704_GLSLANG="$compiler"') < prep.index('export IRIS26681_SPEKTRA_GLSLANG="$compiler"')
 marker='# IRIS_26704_AUTHORITATIVE_ACTIONS_STAGE_ORDER';assert s.count(marker)==1
 main=s[s.index(marker):]
 # Exact successful-26703 outer order retained; only applicable modified-runtime GLSL proof is inserted inside inherited GLSL phase.
@@ -28,4 +36,4 @@ for t in wo:
 push=w.split('workflow_dispatch:',1)[0]
 assert '26703_*' not in push and 'handoff_payload_26703' not in push
 assert '26704_*' in push and 'handoff_payload_26704/**' in push
-print('PASS 26704 infrastructure audit: exact successful 26703 authority/toolchain/outer compiler-build order retained; only required modified-runtime shader proof + 26704 identity/scope/regression wrappers adapted')
+print('PASS 26704 infrastructure audit: exact successful 26703 authority/toolchain/outer compiler-build order retained; successful-26703 IRIS26681_SPEKTRA_GLSLANG CMake handoff preserved; only required modified-runtime shader proof + 26704 identity/scope/regression wrappers adapted')
