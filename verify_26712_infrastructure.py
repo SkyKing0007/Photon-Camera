@@ -11,7 +11,7 @@ for t in [
 'GLSLANG_VERSION="16.5.0"','EXPECTED_BRANCH="experimental-clean-photon-rebuild"',
 'export IRIS26712_GLSLANG="$compiler"','export IRIS26681_SPEKTRA_GLSLANG="$compiler"',
 '63acc8fa4e850aec5b8701c714545229fd8ef75e684dd821e13e7035e9859289',
-'1e8cc3e713d38b8dbecb8e7ef22d189fcc60b4bec83c831244975d69b0e22']:
+'1e8cc3e713d38b8db0dbecb8e7ef22d189fcc60b4bec83c831244975d69b0e22']:
  assert t in s,t
 m='# IRIS_26712_AUTHORITATIVE_ACTIONS_STAGE_ORDER';assert s.count(m)==1;main=s[s.index(m):]
 order=['verify_package','verify_scope','obtain_authority','make_candidate','verify_successful_26711_mechanics','prepare_glslang','compile_modified_runtime_shaders','compile_spektra_raw_shader','install_frozen_candidate_live','./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace','JNI callback/motion ABI compiler checkpoint','after_language_compiler_snapshot',"./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDebug[armeabi-v7a]' --stacktrace",'verify_candidate_patches','26712 PRE-BUILD SAFETY PROOF PASSED','./gradlew :app:assembleDebug --stacktrace','postbuild_proof','26712 ACTIONS BUILD COMPLETE']

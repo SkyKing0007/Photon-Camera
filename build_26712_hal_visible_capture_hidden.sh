@@ -47,7 +47,7 @@ verify_successful_26711_mechanics(){
  bs="$(git show "${RUNTIME_AUTHORITY_COMMIT}:build_26711_locked_reference_lifecycle.sh" | sha256sum | awk '{print $1}')"
  wh="$(git show "${RUNTIME_AUTHORITY_COMMIT}:.github/workflows/build-26711-locked-reference-lifecycle.yml" | sha256sum | awk '{print $1}')"
  [[ "$bs" == "63acc8fa4e850aec5b8701c714545229fd8ef75e684dd821e13e7035e9859289" ]]||fail "26711 build mechanics hash"
- [[ "$wh" == "1e8cc3e713d38b8dbecb8e7ef22d189fcc60b4bec83c831244975d69b0e22" ]]||fail "26711 workflow mechanics hash"
+ [[ "$wh" == "1e8cc3e713d38b8db0dbecb8e7ef22d189fcc60b4bec83c831244975d69b0e22" ]]||fail "26711 workflow mechanics hash"
  pass "exact successful 26711 mechanics authority hash-pinned"
 }
 prepare_glslang(){
