@@ -19,3 +19,8 @@ STEP 1: upload/replace every path in 26709_UPLOAD_PATHS.txt EXCEPT .github/workf
 STEP 2: upload only .github/workflows/build-26709-adaptive-reference-long.yml, then commit/push. This activates the authoritative Actions build.
 
 Real GLSL/Kotlin/Java/NDK/full assemble are Actions-only. Before successful Actions, this handoff is prepared/upload-ready, not build-proven.
+
+26709 R1 COMPILER REPAIR:
+- Failed Actions run 36244684183 stopped at the real Java compiler because adaptiveLongEv was multiply assigned and then captured by an anonymous CaptureCallback.
+- R1 freezes the completed adaptive LONG EV into final adaptiveLongEvFinal before callback creation. Exposure math/ownership is unchanged.
+- The exact failure condition is now a permanent packaged regression. Successful 26708 remains runtime/build authority until R1 Actions succeeds.

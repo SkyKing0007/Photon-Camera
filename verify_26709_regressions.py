@@ -51,3 +51,11 @@ protected=[
 for rel in protected:assert (b/rel).read_bytes()==(c/rel).read_bytes(),rel
 stack=txt(c,'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt');assert 'IRIS_26707_MOVING_CONTENT_LOW_CONFIDENCE_TAIL_REJECT' in stack
 print('PASS 26709 regressions: 26708 viewfinder ownership preserved; one signed adaptive NORMAL owner; no cumulative rebase/pump; SHORT retired; NORMAL+adaptive LONG budget; exact top-up retained; downstream reference normalization restored; Sabre/render/UHDR/chroma/moving-tail protected')
+# Permanent exact 26709 Actions failure regression (run 36244684183):
+# Java anonymous CaptureCallback must never capture the multiply-assigned adaptiveLongEv local.
+assert 'IRIS_26709_R1_JAVAC_EFFECTIVELY_FINAL_LONG_EV' in cap
+assert 'final double adaptiveLongEvFinal = adaptiveLongEv;' in cap
+callback=cap[cap.index('mCaptureSession.capture(b.build(), new CameraCaptureSession.CaptureCallback()'):cap.index('}, mBackgroundHandler);',cap.index('mCaptureSession.capture(b.build(), new CameraCaptureSession.CaptureCallback()'))]
+assert '+ " targetDeltaEv=" + adaptiveLongEvFinal' in callback
+assert '+ " targetDeltaEv=" + adaptiveLongEv\n' not in callback
+print('PASS 26709 R1 regression: Actions run 36244684183 Javac inner-class effectively-final failure permanently blocked')

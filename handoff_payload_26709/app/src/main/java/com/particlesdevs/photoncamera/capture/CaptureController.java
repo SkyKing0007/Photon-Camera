@@ -5964,6 +5964,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 targetEnergy / Math.max(reqIso, 1) * 1_000_000_000.0);
         reqExp = Math.max(er.getLower(), Math.min(maxLongExp, recomputedExp));
 
+        // IRIS_26709_R1_JAVAC_EFFECTIVELY_FINAL_LONG_EV -- freeze the completed
+        // adaptive LONG solution before the asynchronous CaptureCallback captures it.
+        final double adaptiveLongEvFinal = adaptiveLongEv;
         final double requestedEnergy = ExposureIndex.time2sec(reqExp) * reqIso;
         final double requestedRatio = requestedEnergy / ticket.baselineEnergy;
         final double requestedShutterRatio = reqExp / (double) baseExp;
@@ -6060,7 +6063,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                                 + " requestedShutterRatio=" + requestedShutterRatio
                                 + " actualShutterRatio=" + shutterRatio
                                 + " actualDeltaEv=" + actualDeltaEv
-                                + " targetDeltaEv=" + adaptiveLongEv
+                                + " targetDeltaEv=" + adaptiveLongEvFinal
                                 + " allowedAroundClampedRequest="
                                 + requestedRatioMin + ".." + requestedRatioMax
                                 + " normalAccumulatorAdmission=GOOGLE_BRACKET_COMMON_SABRE shutterGate=false");
