@@ -1,0 +1,691 @@
+diff --git a/app/src/main/assets/shaders/preview/main_fs.glsl b/app/src/main/assets/shaders/preview/main_fs.glsl
+index 42ce21ae4108c40297ad6de0b27bb5b188593076..1259b675ca350a82520a33b6028d82c563dd6cf4 100644
+--- a/app/src/main/assets/shaders/preview/main_fs.glsl
++++ b/app/src/main/assets/shaders/preview/main_fs.glsl
+@@ -34,29 +34,20 @@ void main() {
+     if(enablePeak)
+         color = color + dc*32.0*diff*w;
+ 
+-    /* IRIS_26662_FRAME_MATCHED_PREVIEW_PRESENTATION
+-     * Preserve exact 26660 preview bytes when no RAW protection is active. When protection is
+-     * active, restore body brightness with a white-anchored rational exposure map instead of the
+-     * 26661 full linear multiplier. The map is monotone, maps display white to display white, and
+-     * rescales RGB uniformly, so it cannot create the blown preview highlights seen in 26661.
++    /* IRIS_26712_FULL_INVERSE_HAL_PREVIEW_PRESENTATION
++     * 26708 remains the visible authority. Iris may physically move the shared sensor exposure
++     * only while a composition is stationary, but that capture-domain offset must be invisible.
++     * Apply the exact frame-owned inverse exposure as a true linear multiplier, then encode/clamp.
++     * This intentionally allows the viewfinder highlights to clip exactly as the HAL-looking
++     * baseline would; protected RAW headroom remains capture data and is not advertised visually.
+      */
+-    /* IRIS_26709_SIGNED_FRAME_EXACT_PREVIEW_PRESENTATION
+-     * The physical adaptive NORMAL epoch may be darker or brighter than HAL. Apply the same
+-     * white-anchored rational map for either direction so only Iris' hidden sensor offset is
+-     * cancelled; ordinary HAL scene adaptation remains visible exactly as in 26708. */
+     float iris26662Gain = clamp(iris26662ReferencePreviewGain, 0.3535534, 2.8284271);
+     if (abs(iris26662Gain - 1.0) > 0.0001) {
+         vec3 encoded = clamp(color.rgb, vec3(0.0), vec3(1.0));
+         vec3 lowLinear = encoded / 12.92;
+         vec3 highLinear = pow((encoded + 0.055) / 1.055, vec3(2.4));
+         vec3 linearRgb = mix(lowLinear, highLinear, step(vec3(0.04045), encoded));
+-        float y = dot(linearRgb, vec3(0.2126, 0.7152, 0.0722));
+-        float guide = max(y, max(linearRgb.r, max(linearRgb.g, linearRgb.b)));
+-        if (guide > 1.0e-6) {
+-            float mappedGuide = iris26662Gain * guide
+-                    / (1.0 + (iris26662Gain - 1.0) * guide);
+-            linearRgb *= mappedGuide / guide;
+-        }
++        linearRgb = max(linearRgb, vec3(0.0)) * iris26662Gain;
+         vec3 lowEncoded = 12.92 * linearRgb;
+         vec3 highEncoded = 1.055 * pow(max(linearRgb, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+         color.rgb = clamp(mix(lowEncoded, highEncoded, step(vec3(0.0031308), linearRgb)),
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index ff397b649bba65c5e63f4a49733b163b56de606f..1ba2811eec174bd3a27c926eb1f118f975bdd167 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1868,12 +1868,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private volatile long mMotion26708PublishedTimestampNs = 0L, mMotion26708PublishedGeneration = -1L;
+     private volatile double mMotion26708PublishedExposureEnergy = Double.NaN;
+ 
+-    /* IRIS_26710_ONE_SHOT_HAL_REFERENCE_OWNER
+-     * HAL/System AE owns initial scene observation. After one complete RAW meter cycle at that
+-     * immutable HAL baseline, Iris computes one negative-only highlight-protection target and
+-     * switches the repeating RAW+preview request directly to the final manual shutter/ISO pair.
+-     * No RAW captured after that switch can vote on exposure again. The target remains immutable
+-     * until 26711 proves a sustained net camera-pose change or whole-frame scene replacement. */
++    /* IRIS_26712_ONE_SHOT_HAL_REFERENCE_OWNER
++     * HAL/System AE owns visible navigation and the untouched scene baseline. After one complete
++     * RAW meter cycle on a stable composition, Iris computes exactly one signed capture target,
++     * switches the shared RAW+preview request directly to that manual shutter/ISO pair, and hides
++     * the physical offset through frame-exact presentation. No adjusted RAW can vote again.
++     * Intentional navigation releases back to HAL while movement is underway. */
+     private static final float MOTION_26710_REFERENCE_HEADROOM_TARGET = 0.72f;
+     private static final float MOTION_26710_HDR_MIN_PROTECTION_EV = 0.35f;
+     private static final float MOTION_26710_CLIP_MIN_PROTECTION_EV = 0.70f;
+@@ -1945,6 +1945,32 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private boolean mMotion26711PostCaptureHalRestorePending = false;
+     private int mMotion26711PostCaptureHalConfirmFrames = 0;
+ 
++    /* IRIS_26712_HAL_VISIBLE_CAPTURE_HIDDEN_OWNER
++     * The visible camera follows 26708 semantics: HAL/System AE owns navigation continuously.
++     * Iris may take the shared repeating request only after a stable composition is established,
++     * and that physical offset is presentation-cancelled. Intentional navigation releases the
++     * hidden capture exposure while the movement is happening; subject/local motion cannot.
++     */
++    private static final float MOTION_26712_NAV_MIN_ANGLE_DEG = 2.75f;
++    private static final float MOTION_26712_NAV_STRONG_ANGLE_DEG = 7.0f;
++    private static final float MOTION_26712_NAV_RETURN_ANGLE_DEG = 1.25f;
++    private static final int MOTION_26712_NAV_CONFIRM_FRAMES = 5;
++    private static final long MOTION_26712_NAV_CONFIRM_MS = 150L;
++    private static final int MOTION_26712_NAV_STRUCTURAL_TILES = 8;
++    private static final int MOTION_26712_WHOLE_FRAME_TILES = 12;
++    private static final int MOTION_26712_WHOLE_FRAME_CONFIRM_SAMPLES = 4;
++    private static final float MOTION_26712_SCENE_TILE_CHANGE_EV = 0.55f;
++    private static final float MOTION_26712_BRIGHTEN_MAX_EV = 0.75f;
++    private static final float MOTION_26712_BRIGHTEN_MIN_EV = 0.18f;
++    private int mMotion26712NavigationFrames = 0;
++    private long mMotion26712NavigationStartMs = 0L;
++    private float mMotion26712LastNetAngleDeg = 0.0f;
++    private long mMotion26712LastSceneEvalTimestampNs = 0L;
++    private int mMotion26712WholeFrameSamples = 0;
++    private int mMotion26712LastChangedTiles = 0;
++    private float mMotion26712LastMeanTileEv = 0.0f;
++    private float mMotion26712TargetPhysicalOffsetEv = 0.0f;
++
+     private static final int MOTION_26496_MIN_HIGHLIGHT_SAMPLES = 2;
+     private static final long MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS = 400_000_000L;
+ 
+@@ -2831,6 +2857,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotion26711LastSceneChangedTiles = 0;
+         mMotion26711LockedResultMismatchFrames = 0;
+         mMotion26711PreviewTransitionHold = false;
++        mMotion26712NavigationFrames = 0;
++        mMotion26712NavigationStartMs = 0L;
++        mMotion26712LastNetAngleDeg = 0.0f;
++        mMotion26712LastSceneEvalTimestampNs = 0L;
++        mMotion26712WholeFrameSamples = 0;
++        mMotion26712LastChangedTiles = 0;
++        mMotion26712LastMeanTileEv = 0.0f;
++        mMotion26712TargetPhysicalOffsetEv = 0.0f;
+         /* Post-capture HAL restore is a separate live-session transaction and is not cleared here. */
+         /* IRIS_26705_NORMAL_AE_SHORT_HEADROOM_OWNER
+          * No 26701 transaction survives: NORMAL compensation is never changed by HDR logic. */
+@@ -2926,6 +2960,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotion26711SceneChangeFrames = 0;
+         mMotion26711LastSceneChangedTiles = 0;
+         mMotion26711LockedResultMismatchFrames = 0;
++        mMotion26712NavigationFrames = 0;
++        mMotion26712NavigationStartMs = 0L;
++        mMotion26712LastNetAngleDeg = 0.0f;
++        mMotion26712LastSceneEvalTimestampNs = mMotion26711LatestSceneSignatureTimestampNs;
++        mMotion26712WholeFrameSamples = 0;
++        mMotion26712LastChangedTiles = 0;
++        mMotion26712LastMeanTileEv = 0.0f;
+     }
+ 
+     private boolean motion26711PoseReframeConfirmed(int shakiness) {
+@@ -2981,6 +3022,98 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return mMotion26711SceneChangeFrames >= MOTION_26711_SCENE_CHANGE_CONFIRM_FRAMES;
+     }
+ 
++    /* IRIS_26712_SEMANTIC_NAVIGATION_RELEASE
++     * Release capture exposure while intentional navigation is underway, not after the camera
++     * becomes still. A real reframe is supported by sustained net pose travel and/or broad
++     * exposure-normalized structural replacement. Local subject/TV/flicker motion cannot vote
++     * enough tiles, and a hand jerk that returns toward the lock pose resets the candidate.
++     */
++    private boolean motion26712NavigationConfirmed() {
++        if (!mMotion26711LockPoseValid || PhotonCamera.getGyro() == null) return false;
++        final long nowMs = SystemClock.elapsedRealtime();
++        float netAngle;
++        try {
++            float yaw = PhotonCamera.getGyro().getYaw();
++            float pitch = PhotonCamera.getGyro().getPitch();
++            float roll = PhotonCamera.getGyro().getRoll();
++            float dy = motion26711AngleDistanceDeg(yaw, mMotion26711LockYawDeg);
++            float dp = motion26711AngleDistanceDeg(pitch, mMotion26711LockPitchDeg);
++            float dr = motion26711AngleDistanceDeg(roll, mMotion26711LockRollDeg);
++            netAngle = (float)Math.sqrt(dy * dy + dp * dp + 0.50f * dr * dr);
++        } catch (Exception e) {
++            return false;
++        }
++
++        int changedTiles = mMotion26712LastChangedTiles;
++        float meanTileEv = mMotion26712LastMeanTileEv;
++        float[] base = mMotion26711LockedSceneSignature;
++        float[] now = mMotion26711LatestSceneSignature;
++        long sceneTs = mMotion26711LatestSceneSignatureTimestampNs;
++        if (base != null && now != null && base.length == MOTION_26711_SCENE_TILES
++                && now.length == MOTION_26711_SCENE_TILES && sceneTs > 0L
++                && sceneTs != mMotion26712LastSceneEvalTimestampNs) {
++            mMotion26712LastSceneEvalTimestampNs = sceneTs;
++            int changed = 0;
++            double evSum = 0.0;
++            for (int i = 0; i < MOTION_26711_SCENE_TILES; i++) {
++                double a = Math.max(0.02, base[i]);
++                double b = Math.max(0.02, now[i]);
++                double ev = Math.abs(Math.log(b / a) / Math.log(2.0));
++                evSum += ev;
++                if (ev >= MOTION_26712_SCENE_TILE_CHANGE_EV) changed++;
++            }
++            changedTiles = changed;
++            meanTileEv = (float)(evSum / MOTION_26711_SCENE_TILES);
++            mMotion26712LastChangedTiles = changedTiles;
++            mMotion26712LastMeanTileEv = meanTileEv;
++            if (changedTiles >= MOTION_26712_WHOLE_FRAME_TILES && meanTileEv >= 0.50f) {
++                mMotion26712WholeFrameSamples++;
++            } else {
++                mMotion26712WholeFrameSamples = 0;
++            }
++        }
++
++        if (netAngle <= MOTION_26712_NAV_RETURN_ANGLE_DEG) {
++            mMotion26712NavigationFrames = 0;
++            mMotion26712NavigationStartMs = 0L;
++            mMotion26712LastNetAngleDeg = netAngle;
++            return false;
++        }
++
++        boolean outward = netAngle + 0.20f >= mMotion26712LastNetAngleDeg;
++        if (netAngle >= MOTION_26712_NAV_MIN_ANGLE_DEG && outward) {
++            if (mMotion26712NavigationFrames == 0) mMotion26712NavigationStartMs = nowMs;
++            mMotion26712NavigationFrames++;
++        } else if (netAngle + 0.55f < mMotion26712LastNetAngleDeg) {
++            mMotion26712NavigationFrames = 0;
++            mMotion26712NavigationStartMs = 0L;
++        }
++        mMotion26712LastNetAngleDeg = netAngle;
++
++        long candidateAgeMs = mMotion26712NavigationStartMs > 0L
++                ? nowMs - mMotion26712NavigationStartMs : 0L;
++        boolean sustainedTravel = mMotion26712NavigationFrames >= MOTION_26712_NAV_CONFIRM_FRAMES
++                && candidateAgeMs >= MOTION_26712_NAV_CONFIRM_MS;
++        boolean structuralSupport = changedTiles >= MOTION_26712_NAV_STRUCTURAL_TILES
++                && meanTileEv >= 0.35f;
++        boolean strongTravel = netAngle >= MOTION_26712_NAV_STRONG_ANGLE_DEG;
++        boolean wholeFrameReplacement =
++                mMotion26712WholeFrameSamples >= MOTION_26712_WHOLE_FRAME_CONFIRM_SAMPLES;
++
++        if ((sustainedTravel && (strongTravel || structuralSupport)) || wholeFrameReplacement) {
++            Log.i(TAG, "IRIS_26712_NAVIGATION_CONFIRMED"
++                    + " netAngleDeg=" + netAngle
++                    + " navigationFrames=" + mMotion26712NavigationFrames
++                    + " candidateAgeMs=" + candidateAgeMs
++                    + " changedTiles=" + changedTiles
++                    + " meanTileEv=" + meanTileEv
++                    + " wholeFrameSamples=" + mMotion26712WholeFrameSamples
++                    + " localSubjectMotionCannotRelease=true");
++            return true;
++        }
++        return false;
++    }
++
+     private boolean motion26711LockedManualRequestMatchesBuilder() {
+         if (mPreviewRequestBuilder == null || !mMotion26710ManualReferenceActive
+                 || mMotion26710TargetExposureNs <= 0L || mMotion26710TargetIso <= 0) return false;
+@@ -3016,14 +3149,22 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+ 
+     public boolean shouldHoldMotion26711PreviewExposureTransition() {
+-        return isZslMode() && mMotion26711PreviewTransitionHold;
++        /* IRIS_26712_NO_VISIBLE_PREVIEW_FREEZE
++         * 26712 never freezes the OES viewfinder for Iris exposure machinery. Every physical
++         * result is presented continuously; exact timestamp-owned inverse exposure compensation
++         * hides the capture offset instead. This preserves 26708-style motion/cadence. */
++        return false;
+     }
+ 
+     private void motion26711ReleaseToHalAfterPhysicalCapture() {
+         if (!isZslMode() || mPreviewRequestBuilder == null || mCaptureSession == null) return;
+         try {
+-            mMotion26711PreviewTransitionHold = true;
+-            mMotion26711PostCaptureHalRestorePending = true;
++            /* IRIS_26712_POST_CAPTURE_HAL_LIVE_IMMEDIATE
++             * Physical capture ownership ends at immutable-batch formation. Do not freeze the
++             * viewfinder waiting for HAL convergence; return the repeating request to normal
++             * AE/0EV immediately and let the visible preview follow HAL while processing runs. */
++            mMotion26711PreviewTransitionHold = false;
++            mMotion26711PostCaptureHalRestorePending = false;
+             mMotion26711PostCaptureHalConfirmFrames = 0;
+             mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+             mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+@@ -3036,18 +3177,35 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26680PreviewLatched = false;
+             mMotion26680AeLockApplied = false;
+             mMotion26680AwbLockApplied = false;
++            mMotion26709HalBaselineReady = false;
+             mMotion26709ReferenceSettled = false;
+             mMotion26709ReleasePending = false;
++            mMotion26709HalBaselineEnergy = Double.NaN;
++            mMotion26709HalBaselineExposureNs = 0L;
++            mMotion26709HalBaselineIso = 0;
++            mMotion26709LastConsumedMeterTimestampNs = 0L;
++            mMotion26710DecisionIssued = false;
++            mMotion26710TargetExposureNs = 0L;
++            mMotion26710TargetIso = 0;
++            mMotion26710TargetEnergy = Double.NaN;
++            mMotion26710TargetProtectionEv = 0.0f;
++            mMotion26712TargetPhysicalOffsetEv = 0.0f;
++            mMotion26680StableFrames = 0;
++            mMotion26680StationaryFrames = 0;
+             mMotion26711LockPoseValid = false;
+             mMotion26711LockedSceneSignature = null;
++            mMotion26712NavigationFrames = 0;
++            mMotion26712NavigationStartMs = 0L;
++            mMotion26712WholeFrameSamples = 0;
+             rebuildPreviewBuilder();
+-            Log.i(TAG, "IRIS_26711_PHYSICAL_CAPTURE_COMPLETE_HAL_RELEASE"
++            Log.i(TAG, "IRIS_26712_PHYSICAL_CAPTURE_COMPLETE_HAL_LIVE_IMMEDIATE"
+                     + " aeMode=ON compensationSteps=0 processingIndependent=true"
+-                    + " immutableBatchAlreadyFrozen=true previewTransitionHidden=true");
++                    + " immutableBatchAlreadyFrozen=true waitForAeConvergence=false"
++                    + " previewHold=false");
+         } catch (IllegalArgumentException | IllegalStateException e) {
+             mMotion26711PreviewTransitionHold = false;
+             mMotion26711PostCaptureHalRestorePending = false;
+-            Log.w(TAG, "IRIS_26711 post-capture HAL release skipped: "
++            Log.w(TAG, "IRIS_26712 post-capture HAL release skipped: "
+                     + e.getClass().getSimpleName());
+         }
+     }
+@@ -3079,17 +3237,30 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return true;
+     }
+ 
+-    /* IRIS_26710_ONE_SHOT_HAL_REFERENCE_OWNER
++    /* IRIS_26712_ONE_SHOT_HAL_REFERENCE_OWNER
+      * Exact ownership contract:
+-     *   HAL AE/AWB settles untouched -> one baseline RAW decision -> one direct manual target -> hold.
+-     * The underexposed RAWs produced after the target switch are capture evidence only and are
+-     * forbidden from changing NORMAL exposure. Subject/TV/flicker content cannot unlock the epoch;
+-     * only the inherited sustained physical-camera-reframe proof can return ownership to HAL. */
++     *   HAL AE/AWB navigates visibly -> stable scene -> one RAW decision -> one hidden manual target.
++     * Adjusted RAWs are capture evidence only and can never rewrite NORMAL. Local subject/TV/flicker
++     * motion cannot release the epoch; semantic navigation releases to HAL during movement. */
+     private void updateMotion26680StablePreviewAuthority(@NonNull TotalCaptureResult result) {
+         /* IRIS_26711_POST_CAPTURE_HAL_RESTORE_CALLBACK
+          * Processing may already be running; HAL restoration belongs to live preview and must not
+          * wait for image processing to finish. */
+         if (isZslMode() && motion26711HandlePostCaptureHalRestore(result)) return;
++        /* IRIS_26712_PROCESSING_PREVIEW_STAYS_HAL
++         * Once the immutable physical batch exists, processing has zero live-camera ownership.
++         * Keep publishing zero presentation offset for HAL preview results even while the image
++         * pipeline is busy, so the renderer cannot retain the prior hidden capture compensation. */
++        if (isZslMode() && isProcessing && !mMotion26710ManualReferenceActive) {
++            Long processingPreviewTs = result.get(CaptureResult.SENSOR_TIMESTAMP);
++            Integer processingPreviewAeMode = result.get(CaptureResult.CONTROL_AE_MODE);
++            if (processingPreviewTs != null && processingPreviewTs > 0L
++                    && processingPreviewAeMode != null
++                    && processingPreviewAeMode != CaptureResult.CONTROL_AE_MODE_OFF) {
++                recordMotion26662PreviewProtection(processingPreviewTs, 0.0f);
++            }
++            return;
++        }
+         if (!isZslMode() || mZslCapturing || burst || isProcessing
+                 || mPreviewRequestBuilder == null || mCaptureSession == null
+                 || mCameraCharacteristics == null) {
+@@ -3177,21 +3348,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+         if (mMotion26680PreviewLatched) {
+-            final boolean iris26711PoseReframe = motion26711PoseReframeConfirmed(shakiness);
+-            final boolean iris26711SceneReplacement = motion26711WholeFrameSceneReplacementConfirmed();
+-            if (iris26711PoseReframe || iris26711SceneReplacement) {
++            final boolean iris26712Navigation = motion26712NavigationConfirmed();
++            if (iris26712Navigation) {
+                 try {
++                    /* IRIS_26712_HAL_NAVIGATION_RELEASE
++                     * The viewfinder must behave like 26708 while the user navigates. Release the
++                     * hidden capture exposure while the composition is moving, not after it settles. */
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                             CaptureRequest.CONTROL_AE_MODE_ON);
++                    mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0);
+                     if (mMotion26680AwbLockApplied) {
+                         mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, false);
+                     }
+-                    if (adaptiveAeAvailable) {
+-                        mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION,
+-                                Math.max(aeRange.getLower(), Math.min(aeRange.getUpper(),
+-                                        mMotion26709HalBaseCompSteps)));
+-                    }
+                     mMotion26710ManualReferenceActive = false;
+                     mMotion26680PreviewLatched = false;
+                     mMotion26680AeLockApplied = false;
+@@ -3199,27 +3368,42 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     mMotion26680StableFrames = 0;
+                     mMotion26680StationaryFrames = 0;
+                     mMotion26680ReframeMotionFrames = 0;
++                    mMotion26709HalBaselineReady = false;
+                     mMotion26709ReferenceSettled = false;
+-                    mMotion26709ReleasePending = mMotion26709HalBaselineReady;
++                    mMotion26709ReleasePending = false;
++                    mMotion26709AeStepEv = 0.0f;
++                    mMotion26709HalBaselineEnergy = Double.NaN;
++                    mMotion26709HalBaselineExposureNs = 0L;
++                    mMotion26709HalBaselineIso = 0;
+                     mMotion26709LastConsumedMeterTimestampNs = 0L;
++                    mMotion26710DecisionIssued = false;
++                    mMotion26710TargetExposureNs = 0L;
++                    mMotion26710TargetIso = 0;
++                    mMotion26710TargetEnergy = Double.NaN;
++                    mMotion26710TargetProtectionEv = 0.0f;
++                    mMotion26712TargetPhysicalOffsetEv = 0.0f;
++                    mMotion26710TargetObserveFrames = 0;
+                     mMotion26711LockPoseValid = false;
+                     mMotion26711LockedSceneSignature = null;
+                     mMotion26711ReframeSettledFrames = 0;
+                     mMotion26711SceneChangeFrames = 0;
+-                    mMotion26711PreviewTransitionHold = true;
+-                    clearMotion26708HighlightClassifier("26711-proven-scene-epoch-change");
++                    mMotion26712NavigationFrames = 0;
++                    mMotion26712NavigationStartMs = 0L;
++                    mMotion26712WholeFrameSamples = 0;
++                    mMotion26711PreviewTransitionHold = false;
++                    clearMotion26708HighlightClassifier("26712-navigation-release");
+                     rebuildPreviewBuilder();
+-                    Log.i(TAG, "IRIS_26711_REFERENCE_EPOCH_RELEASE generation="
++                    Log.i(TAG, "IRIS_26712_HAL_NAVIGATION_RELEASE generation="
+                             + mIris26548CameraHealthGeneration
+-                            + " reason=" + (iris26711PoseReframe ? "NET_POSE_CHANGE" : "WHOLE_FRAME_REPLACEMENT")
+-                            + " shakiness=" + shakiness
+-                            + " changedTiles=" + mMotion26711LastSceneChangedTiles
+-                            + " restoreUserHalCompSteps=" + mMotion26709HalBaseCompSteps
++                            + " restoreHalAeNow=true compensationSteps=0"
++                            + " waitForNewSceneSettle=false previewHold=false"
++                            + " changedTiles=" + mMotion26712LastChangedTiles
++                            + " meanTileEv=" + mMotion26712LastMeanTileEv
+                             + " handShakeCannotUnlock=true returningHandJerkCannotUnlock=true"
+                             + " subjectMotionCannotUnlock=true tvContentCannotUnlock=true"
+-                            + " rawBrightnessCannotUnlock=true noExposurePump=true");
++                            + " viewfinderAuthority=HAL_26708");
+                 } catch (IllegalArgumentException | IllegalStateException e) {
+-                    Log.w(TAG, "IRIS_26710 one-shot reference release skipped: "
++                    Log.w(TAG, "IRIS_26712 navigation release skipped: "
+                             + e.getClass().getSimpleName());
+                 }
+                 return;
+@@ -3244,6 +3428,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     mMotion26709HalBaselineReady = false;
+                     mMotion26709ReferenceSettled = false;
+                     mMotion26710DecisionIssued = false;
++                    mMotion26712TargetPhysicalOffsetEv = 0.0f;
+                     mMotion26709LastConsumedMeterTimestampNs = 0L;
+                     clearMotion26708HighlightClassifier("26710-user-ev-change");
+                     rebuildPreviewBuilder();
+@@ -3271,19 +3456,25 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                             mMotion26709ReferenceSettled = true;
+                             mMotion26711PreviewTransitionHold = false;
+                             motion26711CaptureLockPoseAndScene();
+-                            float observedProtectionEv = (float)Math.max(0.0,
+-                                    Math.min(MOTION_26709_MAX_RELATIVE_EV,
+-                                        Math.log(mMotion26709HalBaselineEnergy / exposureEnergy)
++                            float observedPhysicalOffsetEv = (float)Math.max(
++                                    -MOTION_26709_MAX_RELATIVE_EV,
++                                    Math.min(MOTION_26712_BRIGHTEN_MAX_EV,
++                                        Math.log(exposureEnergy / mMotion26709HalBaselineEnergy)
+                                             / Math.log(2.0)));
+-                            Log.i(TAG, "IRIS_26711_REFERENCE_LOCKED"
++                            float observedProtectionEv = Math.max(0.0f,
++                                    -observedPhysicalOffsetEv);
++                            Log.i(TAG, "IRIS_26712_REFERENCE_LOCKED"
+                                     + " exposureNs=" + exposureNs + " iso=" + iso
+                                     + " targetExposureNs=" + mMotion26710TargetExposureNs
+                                     + " targetIso=" + mMotion26710TargetIso
++                                    + " targetPhysicalOffsetEv=" + mMotion26712TargetPhysicalOffsetEv
+                                     + " targetProtectionEv=" + mMotion26710TargetProtectionEv
++                                    + " observedPhysicalOffsetEv=" + observedPhysicalOffsetEv
+                                     + " observedProtectionEv=" + observedProtectionEv
+                                     + " mismatchEv=" + mismatchEv
+                                     + " manualAeOff=true oneDecisionPerEpoch=true"
+-                                    + " continuousEnforcement=true transitionHidden=true");
++                                    + " continuousEnforcement=true transitionHidden=true"
++                                    + " viewfinderAuthority=HAL_26708");
+                         } else if (mMotion26710TargetObserveFrames
+                                 >= MOTION_26710_TARGET_OBSERVE_MAX_FRAMES || !builderExact) {
+                             mMotion26710TargetObserveFrames = 0;
+@@ -3384,23 +3575,51 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             if (requestedProtectionEv < MOTION_26710_DECISION_DEADBAND_EV) {
+                 requestedProtectionEv = 0.0f;
+             }
+-            mMotion26710TargetProtectionEv = requestedProtectionEv;
++
++            /* IRIS_26712_ONE_SHOT_SIGNED_SCENE_CORRECTION
++             * Still one immutable vote from the untouched HAL epoch. Highlight pressure may move
++             * NORMAL darker. Only a clearly dark, highlight-safe scene may move NORMAL brighter;
++             * no post-adjustment RAW is allowed to vote again. */
++            float requestedPhysicalOffsetEv = -requestedProtectionEv;
++            if (requestedProtectionEv <= 0.0f
++                    && Float.isFinite(mMotion26710HalBaselineFloorFraction)
++                    && Float.isFinite(mMotion26710HalBaselineShadowFraction)
++                    && Float.isFinite(mMotion26710HalBaselineMeanSignal)
++                    && Float.isFinite(mMotion26710HalBaselineHighlightFraction)
++                    && mMotion26710HalBaselineHighlightFraction < 0.0015f
++                    && mMotion26709PublishedP995 < 0.50f) {
++                float floorNeed = motion26368Clamp01(
++                        (mMotion26710HalBaselineFloorFraction - 0.20f) / (0.55f - 0.20f));
++                float shadowNeed = motion26368Clamp01(
++                        (mMotion26710HalBaselineShadowFraction - 0.40f) / (0.78f - 0.40f));
++                float meanNeed = 1.0f - motion26368Clamp01(
++                        (mMotion26710HalBaselineMeanSignal - 0.045f) / (0.16f - 0.045f));
++                float brightenNeed = Math.max(floorNeed, 0.75f * shadowNeed)
++                        * (0.40f + 0.60f * meanNeed);
++                float requestedBrightenEv = Math.min(MOTION_26712_BRIGHTEN_MAX_EV,
++                        0.85f * brightenNeed);
++                if (requestedBrightenEv >= MOTION_26712_BRIGHTEN_MIN_EV) {
++                    requestedPhysicalOffsetEv = requestedBrightenEv;
++                }
++            }
++            mMotion26712TargetPhysicalOffsetEv = requestedPhysicalOffsetEv;
++            mMotion26710TargetProtectionEv = Math.max(0.0f, -requestedPhysicalOffsetEv);
+             mMotion26710DecisionIssued = true;
+ 
+-            if (requestedProtectionEv <= 0.0f) {
++            if (Math.abs(requestedPhysicalOffsetEv) < MOTION_26710_DECISION_DEADBAND_EV) {
+                 try {
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
+                     mMotion26680AeLockApplied = true;
+                     mMotion26709ReferenceSettled = true;
+                     motion26711CaptureLockPoseAndScene();
+                     rebuildPreviewBuilder();
+-                    Log.i(TAG, "IRIS_26711_REFERENCE_LOCKED"
++                    Log.i(TAG, "IRIS_26712_REFERENCE_LOCKED"
+                             + " exposureNs=" + exposureNs + " iso=" + iso
+-                            + " targetProtectionEv=0.0 decision=HAL_BASELINE"
++                            + " targetPhysicalOffsetEv=0.0 decision=HAL_BASELINE"
+                             + " oneDecisionPerEpoch=true postAdjustmentRawCannotRewriteExposure=true"
+-                            + " subjectMotionCannotUnlock=true");
++                            + " navigationReleaseOnly=true viewfinderAuthority=HAL_26708");
+                 } catch (IllegalArgumentException | IllegalStateException e) {
+-                    Log.w(TAG, "IRIS_26710 HAL baseline lock skipped: "
++                    Log.w(TAG, "IRIS_26712 HAL baseline lock skipped: "
+                             + e.getClass().getSimpleName());
+                 }
+                 return;
+@@ -3423,60 +3642,90 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 /* Zero-pump invariant wins over speculative AE-compensation fallback. */
+                 try {
+                     mMotion26710TargetProtectionEv = 0.0f;
++                    mMotion26712TargetPhysicalOffsetEv = 0.0f;
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
+                     mMotion26680AeLockApplied = true;
+                     mMotion26709ReferenceSettled = true;
+                     rebuildPreviewBuilder();
+                     Log.w(TAG, "IRIS_26710_MANUAL_REFERENCE_UNAVAILABLE"
+                             + " fallback=LOCK_HAL_BASELINE zeroPumpInvariant=true"
+-                            + " requestedProtectionEv=" + requestedProtectionEv);
++                            + " requestedPhysicalOffsetEv=" + requestedPhysicalOffsetEv);
+                 } catch (IllegalArgumentException | IllegalStateException ignored) {}
+                 return;
+             }
+ 
+-            final double targetScale = Math.pow(2.0, requestedProtectionEv);
+-            final double targetEnergy = mMotion26709HalBaselineEnergy / targetScale;
+-            /* IRIS_26711_HAL_ANTIBANDING_SHUTTER_PRESERVATION
+-             * Preserve the HAL-selected shutter first and remove exposure through ISO while sensor
+-             * gain has room. This keeps HAL anti-banding timing/duration intact whenever possible.
+-             * Only when ISO reaches the sensor floor may shutter shorten; this remains one direct
+-             * deterministic target and never becomes an exposure search. */
+-            long targetExposureNs = Math.max(exposureRange.getLower(),
+-                    Math.min(exposureRange.getUpper(), mMotion26709HalBaselineExposureNs));
+-            int targetIso = (int)Math.round(targetEnergy / Math.max(1.0, targetExposureNs));
+-            targetIso = Math.max(sensitivityRange.getLower(),
+-                    Math.min(Math.min(sensitivityRange.getUpper(), mMotion26709HalBaselineIso),
+-                            targetIso));
+-            double quantizedEnergy = (double)targetExposureNs * (double)targetIso;
+-            boolean iris26711HalShutterPreserved = targetIso > sensitivityRange.getLower()
+-                    || quantizedEnergy <= targetEnergy * 1.015;
+-            if (quantizedEnergy > targetEnergy * 1.015) {
+-                targetIso = sensitivityRange.getLower();
+-                targetExposureNs = Math.round(targetEnergy / Math.max(1, targetIso));
++            final double targetEnergy = mMotion26709HalBaselineEnergy
++                    * Math.pow(2.0, requestedPhysicalOffsetEv);
++            long targetExposureNs;
++            int targetIso;
++            boolean iris26711HalShutterPreserved;
++            if (requestedPhysicalOffsetEv < 0.0f) {
++                /* Preserve HAL anti-banding shutter and remove exposure through ISO first. */
+                 targetExposureNs = Math.max(exposureRange.getLower(),
+-                        Math.min(Math.min(exposureRange.getUpper(), mMotion26709HalBaselineExposureNs),
+-                                targetExposureNs));
+-                quantizedEnergy = (double)targetExposureNs * (double)targetIso;
+-                iris26711HalShutterPreserved = targetExposureNs == mMotion26709HalBaselineExposureNs;
++                        Math.min(exposureRange.getUpper(), mMotion26709HalBaselineExposureNs));
++                targetIso = (int)Math.round(targetEnergy / Math.max(1.0, targetExposureNs));
++                targetIso = Math.max(sensitivityRange.getLower(),
++                        Math.min(Math.min(sensitivityRange.getUpper(), mMotion26709HalBaselineIso),
++                                targetIso));
++                double preliminaryEnergy = (double)targetExposureNs * (double)targetIso;
++                iris26711HalShutterPreserved = targetIso > sensitivityRange.getLower()
++                        || preliminaryEnergy <= targetEnergy * 1.015;
++                if (preliminaryEnergy > targetEnergy * 1.015) {
++                    targetIso = sensitivityRange.getLower();
++                    targetExposureNs = Math.round(targetEnergy / Math.max(1, targetIso));
++                    targetExposureNs = Math.max(exposureRange.getLower(),
++                            Math.min(Math.min(exposureRange.getUpper(),
++                                    mMotion26709HalBaselineExposureNs), targetExposureNs));
++                    iris26711HalShutterPreserved =
++                            targetExposureNs == mMotion26709HalBaselineExposureNs;
++                }
++            } else {
++                /* A rare HAL-underexposed scene needs photons, not a fake display lift. Spend
++                 * available motion-safe shutter first, then ISO only if the shutter opportunity
++                 * cannot reach the single predicted target. */
++                long shutterCeilingNs = Math.max(mMotion26709HalBaselineExposureNs,
++                        iris26381MotionOpportunityCeilingNs(result));
++                shutterCeilingNs = Math.max(exposureRange.getLower(),
++                        Math.min(exposureRange.getUpper(), shutterCeilingNs));
++                targetIso = Math.max(sensitivityRange.getLower(),
++                        Math.min(sensitivityRange.getUpper(), mMotion26709HalBaselineIso));
++                targetExposureNs = Math.round(targetEnergy / Math.max(1, targetIso));
++                targetExposureNs = Math.max(mMotion26709HalBaselineExposureNs,
++                        Math.min(shutterCeilingNs, targetExposureNs));
++                double preliminaryEnergy = (double)targetExposureNs * (double)targetIso;
++                if (preliminaryEnergy < targetEnergy * 0.985) {
++                    targetIso = (int)Math.ceil(targetEnergy / Math.max(1.0, targetExposureNs));
++                    targetIso = Math.max(mMotion26709HalBaselineIso,
++                            Math.min(sensitivityRange.getUpper(), targetIso));
++                }
++                iris26711HalShutterPreserved =
++                        targetExposureNs == mMotion26709HalBaselineExposureNs;
+             }
+-            if (!(quantizedEnergy > 0.0) || quantizedEnergy >= mMotion26709HalBaselineEnergy) {
++            double quantizedEnergy = (double)targetExposureNs * (double)targetIso;
++            final float quantizedPhysicalOffsetEv = (float)Math.max(-MOTION_26709_MAX_RELATIVE_EV,
++                    Math.min(MOTION_26712_BRIGHTEN_MAX_EV,
++                        Math.log(quantizedEnergy / mMotion26709HalBaselineEnergy) / Math.log(2.0)));
++            if (!(quantizedEnergy > 0.0)
++                    || (requestedPhysicalOffsetEv < 0.0f && quantizedPhysicalOffsetEv >= -0.03f)
++                    || (requestedPhysicalOffsetEv > 0.0f && quantizedPhysicalOffsetEv <= 0.03f)) {
+                 mMotion26710TargetProtectionEv = 0.0f;
++                mMotion26712TargetPhysicalOffsetEv = 0.0f;
+                 try {
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
+                     mMotion26680AeLockApplied = true;
+                     mMotion26709ReferenceSettled = true;
++                    motion26711CaptureLockPoseAndScene();
+                     rebuildPreviewBuilder();
+                 } catch (IllegalArgumentException | IllegalStateException ignored) {}
+-                Log.w(TAG, "IRIS_26710_TARGET_CLAMPED_TO_HAL zeroPumpInvariant=true");
++                Log.w(TAG, "IRIS_26712_TARGET_CLAMPED_TO_HAL zeroPumpInvariant=true");
+                 return;
+             }
+-            final float quantizedProtectionEv = (float)Math.max(0.0,
+-                    Math.min(MOTION_26709_MAX_RELATIVE_EV,
+-                        Math.log(mMotion26709HalBaselineEnergy / quantizedEnergy) / Math.log(2.0)));
++            final float quantizedProtectionEv = Math.max(0.0f, -quantizedPhysicalOffsetEv);
+             mMotion26710TargetExposureNs = targetExposureNs;
+             mMotion26710TargetIso = targetIso;
+             mMotion26710TargetEnergy = quantizedEnergy;
+             mMotion26710TargetProtectionEv = quantizedProtectionEv;
++            mMotion26712TargetPhysicalOffsetEv = quantizedPhysicalOffsetEv;
+             mMotion26710TargetObserveFrames = 0;
+             try {
+                 mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+@@ -3488,12 +3737,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 mMotion26710ManualReferenceActive = true;
+                 mMotion26711PreviewTransitionHold = true;
+                 rebuildPreviewBuilder();
+-                Log.i(TAG, "IRIS_26711_ONE_SHOT_REFERENCE_COMMIT"
++                Log.i(TAG, "IRIS_26712_ONE_SHOT_REFERENCE_COMMIT"
+                         + " halExposureNs=" + mMotion26709HalBaselineExposureNs
+                         + " halIso=" + mMotion26709HalBaselineIso
+                         + " targetExposureNs=" + targetExposureNs
+                         + " targetIso=" + targetIso
+-                        + " requestedProtectionEv=" + requestedProtectionEv
++                        + " requestedPhysicalOffsetEv=" + requestedPhysicalOffsetEv
++                        + " quantizedPhysicalOffsetEv=" + quantizedPhysicalOffsetEv
+                         + " quantizedProtectionEv=" + quantizedProtectionEv
+                         + " rawP995=" + mMotion26709PublishedP995
+                         + " rawHighlightFraction=" + mMotion26710HalBaselineHighlightFraction
+@@ -3503,11 +3753,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + " halShutterPreservedForAntibanding=" + iris26711HalShutterPreserved
+                         + " isoFloor=" + sensitivityRange.getLower()
+                         + " directManualJump=true intermediateTargetsForbidden=true"
++                        + " signedOneShot=true viewfinderAuthority=HAL_26708"
+                         + " postAdjustmentRawCannotRewriteExposure=true");
+             } catch (IllegalArgumentException | IllegalStateException e) {
+                 mMotion26710ManualReferenceActive = false;
+                 mMotion26711PreviewTransitionHold = false;
+                 mMotion26710TargetProtectionEv = 0.0f;
++                mMotion26712TargetPhysicalOffsetEv = 0.0f;
+                 try {
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+                             CaptureRequest.CONTROL_AE_MODE_ON);
+@@ -3579,8 +3831,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26710TargetIso = 0;
+             mMotion26710TargetEnergy = Double.NaN;
+             mMotion26710TargetProtectionEv = 0.0f;
++            mMotion26712TargetPhysicalOffsetEv = 0.0f;
+             mMotion26710TargetObserveFrames = 0;
+-            clearMotion26708HighlightClassifier("26710-hal-baseline-start");
++            clearMotion26708HighlightClassifier("26712-hal-baseline-start");
+             if (Boolean.TRUE.equals(awbLockAvailable)) {
+                 mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, true);
+                 mMotion26680AwbLockApplied = true;
+@@ -6377,7 +6630,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         double longOverHalEv = MOTION_26710_LONG_MIN_OVER_HAL_EV
+                 + (MOTION_26710_LONG_MAX_OVER_HAL_EV - MOTION_26710_LONG_MIN_OVER_HAL_EV)
+                     * rawNeed;
+-        longOverHalEv = Math.max(MOTION_26710_LONG_MIN_OVER_HAL_EV,
++        /* IRIS_26712_LONG_STAYS_ABOVE_SIGNED_NORMAL
++         * If the one-shot NORMAL was brightened above HAL, LONG must still remain a true longer
++         * shadow/SNR exposure. Keep at least +0.50 EV above the signed NORMAL target while
++         * preserving the established scene-driven HAL-relative ceiling. */
++        double minLongOverHalForNormal = Math.max(MOTION_26710_LONG_MIN_OVER_HAL_EV,
++                mMotion26712TargetPhysicalOffsetEv + 0.50);
++        longOverHalEv = Math.max(minLongOverHalForNormal,
+                 Math.min(MOTION_26710_LONG_MAX_OVER_HAL_EV, longOverHalEv));
+         double targetEnergy = halBaselineEnergySecIso * Math.pow(2.0, longOverHalEv);
+         double adaptiveLongEv = Math.max(0.0,
+diff --git a/app/version.properties b/app/version.properties
+index edc8277d4f4651d2c091730184e50ea4af727301..ca48333a352e87625ed877d78d2bcbcff7351b2d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726711
+-VERSION_BUILD=26711
++VERSION_NAME=0.9726712
++VERSION_BUILD=26712
