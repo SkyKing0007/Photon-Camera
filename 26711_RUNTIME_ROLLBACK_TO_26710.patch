@@ -1,0 +1,624 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index ff397b649bba65c5e63f4a49733b163b56de606f..59c5ee5f7cefb7cae87e75a3097d9710abeed7b9 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1873,7 +1873,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * immutable HAL baseline, Iris computes one negative-only highlight-protection target and
+      * switches the repeating RAW+preview request directly to the final manual shutter/ISO pair.
+      * No RAW captured after that switch can vote on exposure again. The target remains immutable
+-     * until 26711 proves a sustained net camera-pose change or whole-frame scene replacement. */
++     * until the inherited sustained physical-camera-reframe owner releases the scene epoch. */
+     private static final float MOTION_26710_REFERENCE_HEADROOM_TARGET = 0.72f;
+     private static final float MOTION_26710_HDR_MIN_PROTECTION_EV = 0.35f;
+     private static final float MOTION_26710_CLIP_MIN_PROTECTION_EV = 0.70f;
+@@ -1913,38 +1913,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private volatile float mMotion26709PublishedShadowFraction = Float.NaN;
+     private volatile float mMotion26709PublishedMeanSignal = Float.NaN;
+     private volatile float mMotion26709FrozenCaptureProtectionEv = 0.0f;
+-
+-    /* IRIS_26711_IMMUTABLE_REFERENCE_LIFECYCLE_OWNER
+-     * 26710 proved the one-shot exposure solve but still released on filtered shakiness and
+-     * stopped policing the request after the first matching result. 26711 makes the exposure
+-     * epoch an invariant: net camera pose / whole-frame structural replacement may release it;
+-     * transient hand shake, a returning hand jerk, subject/TV motion and luminance fluctuation
+-     * may not. Any post-lock Camera2 drift reasserts the SAME target, never recomputes it. */
+-    private static final float MOTION_26711_REFRAME_ANGLE_DEG = 7.0f;
+-    private static final int MOTION_26711_REFRAME_SETTLED_SHAKINESS = 48;
+-    private static final int MOTION_26711_REFRAME_SETTLED_FRAMES = 6;
+-    private static final int MOTION_26711_SCENE_TILES = 16;
+-    private static final float MOTION_26711_SCENE_TILE_CHANGE_EV = 0.70f;
+-    private static final int MOTION_26711_SCENE_CHANGED_TILES = 12;
+-    private static final int MOTION_26711_SCENE_CHANGE_CONFIRM_FRAMES = 18;
+-    private static final int MOTION_26711_LOCK_REASSERT_FRAMES = 2;
+-    private static final int MOTION_26711_POST_CAPTURE_HAL_CONFIRM_FRAMES = 3;
+-    private boolean mMotion26711LockPoseValid = false;
+-    private float mMotion26711LockYawDeg = 0.0f;
+-    private float mMotion26711LockPitchDeg = 0.0f;
+-    private float mMotion26711LockRollDeg = 0.0f;
+-    private int mMotion26711ReframeSettledFrames = 0;
+-    private volatile float[] mMotion26711LatestSceneSignature = null;
+-    private volatile long mMotion26711LatestSceneSignatureTimestampNs = 0L;
+-    private float[] mMotion26711LockedSceneSignature = null;
+-    private long mMotion26711LastSceneSignatureEvalTimestampNs = 0L;
+-    private int mMotion26711SceneChangeFrames = 0;
+-    private int mMotion26711LastSceneChangedTiles = 0;
+-    private int mMotion26711LockedResultMismatchFrames = 0;
+-    private volatile boolean mMotion26711PreviewTransitionHold = false;
+-    private boolean mMotion26711PostCaptureHalRestorePending = false;
+-    private int mMotion26711PostCaptureHalConfirmFrames = 0;
+-
+     private static final int MOTION_26496_MIN_HIGHLIGHT_SAMPLES = 2;
+     private static final long MOTION_26496_HIGHLIGHT_EVIDENCE_HOLD_NS = 400_000_000L;
+ 
+@@ -2488,8 +2456,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             long shadowCount = 0L;
+             long highlightCount = 0L;
+             double signalSum = 0.0;
+-            double[] iris26711TileSum = new double[MOTION_26711_SCENE_TILES];
+-            int[] iris26711TileCount = new int[MOTION_26711_SCENE_TILES];
+ 
+             for (int y = 2; y < height - 2; y += stepY) {
+                 for (int x = 2; x < width - 2; x += stepX) {
+@@ -2516,11 +2482,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+                             signalSum += signal;
+                             count++;
+-                            int iris26711TileX = Math.min(3, Math.max(0, (sx * 4) / Math.max(1, width)));
+-                            int iris26711TileY = Math.min(3, Math.max(0, (sy * 4) / Math.max(1, height)));
+-                            int iris26711Tile = iris26711TileY * 4 + iris26711TileX;
+-                            iris26711TileSum[iris26711Tile] += signal;
+-                            iris26711TileCount[iris26711Tile]++;
+ 
+                             if (signal <= 0.010f) floorCount++;
+                             if (signal <= 0.040f) shadowCount++;
+@@ -2542,26 +2503,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26380RawSampleCount =
+                     (int) Math.min(Integer.MAX_VALUE, count);
+ 
+-            /* IRIS_26711_WHOLE_FRAME_SCENE_SIGNATURE
+-             * Exposure-normalized 4x4 RAW structure. Requiring 12/16 tiles to change makes TV,
+-             * people, foliage and row flicker local disturbances rather than exposure unlocks. */
+-            float iris26711GlobalMean = Math.max(0.010f, mMotion26380RawMeanSignal);
+-            float[] iris26711Signature = new float[MOTION_26711_SCENE_TILES];
+-            boolean iris26711SignatureComplete = true;
+-            for (int i = 0; i < MOTION_26711_SCENE_TILES; i++) {
+-                if (iris26711TileCount[i] <= 0) {
+-                    iris26711SignatureComplete = false;
+-                    break;
+-                }
+-                float tileMean = (float)(iris26711TileSum[i] / iris26711TileCount[i]);
+-                iris26711Signature[i] = Math.max(0.0f, Math.min(8.0f,
+-                        (tileMean + 0.010f) / (iris26711GlobalMean + 0.010f)));
+-            }
+-            if (iris26711SignatureComplete) {
+-                mMotion26711LatestSceneSignature = iris26711Signature;
+-                mMotion26711LatestSceneSignatureTimestampNs = image.getTimestamp();
+-            }
+-
+             /* Keep all 26380 AE/readiness statistics above byte-for-byte equivalent
+              * to 26494. The 26496 small-highlight detector is a separate read-only
+              * pass so it cannot perturb normal exposure authority. */
+@@ -2823,15 +2764,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotion26710HalBaselineShadowFraction = Float.NaN;
+         mMotion26710HalBaselineMeanSignal = Float.NaN;
+         mMotion26709FrozenCaptureProtectionEv = 0.0f;
+-        mMotion26711LockPoseValid = false;
+-        mMotion26711ReframeSettledFrames = 0;
+-        mMotion26711LockedSceneSignature = null;
+-        mMotion26711LastSceneSignatureEvalTimestampNs = 0L;
+-        mMotion26711SceneChangeFrames = 0;
+-        mMotion26711LastSceneChangedTiles = 0;
+-        mMotion26711LockedResultMismatchFrames = 0;
+-        mMotion26711PreviewTransitionHold = false;
+-        /* Post-capture HAL restore is a separate live-session transaction and is not cleared here. */
+         /* IRIS_26705_NORMAL_AE_SHORT_HEADROOM_OWNER
+          * No 26701 transaction survives: NORMAL compensation is never changed by HDR logic. */
+ 
+@@ -2903,182 +2835,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return Math.max(0.0f, Math.min(MOTION_26705_SHORT_EXTRA_MAX_EV, extraEv));
+     }
+ 
+-    private static float motion26711AngleDistanceDeg(float a, float b) {
+-        float d = Math.abs(a - b) % 360.0f;
+-        return d > 180.0f ? 360.0f - d : d;
+-    }
+-
+-    private void motion26711CaptureLockPoseAndScene() {
+-        try {
+-            if (PhotonCamera.getGyro() != null) {
+-                mMotion26711LockYawDeg = PhotonCamera.getGyro().getYaw();
+-                mMotion26711LockPitchDeg = PhotonCamera.getGyro().getPitch();
+-                mMotion26711LockRollDeg = PhotonCamera.getGyro().getRoll();
+-                mMotion26711LockPoseValid = true;
+-            }
+-        } catch (Exception ignored) {
+-            mMotion26711LockPoseValid = false;
+-        }
+-        float[] latest = mMotion26711LatestSceneSignature;
+-        mMotion26711LockedSceneSignature = latest == null ? null : latest.clone();
+-        mMotion26711LastSceneSignatureEvalTimestampNs = mMotion26711LatestSceneSignatureTimestampNs;
+-        mMotion26711ReframeSettledFrames = 0;
+-        mMotion26711SceneChangeFrames = 0;
+-        mMotion26711LastSceneChangedTiles = 0;
+-        mMotion26711LockedResultMismatchFrames = 0;
+-    }
+-
+-    private boolean motion26711PoseReframeConfirmed(int shakiness) {
+-        if (!mMotion26711LockPoseValid || PhotonCamera.getGyro() == null) return false;
+-        try {
+-            float yaw = PhotonCamera.getGyro().getYaw();
+-            float pitch = PhotonCamera.getGyro().getPitch();
+-            float roll = PhotonCamera.getGyro().getRoll();
+-            float dy = motion26711AngleDistanceDeg(yaw, mMotion26711LockYawDeg);
+-            float dp = motion26711AngleDistanceDeg(pitch, mMotion26711LockPitchDeg);
+-            float dr = motion26711AngleDistanceDeg(roll, mMotion26711LockRollDeg);
+-            float netAngle = (float)Math.sqrt(dy * dy + dp * dp + 0.50f * dr * dr);
+-            if (netAngle >= MOTION_26711_REFRAME_ANGLE_DEG
+-                    && shakiness <= MOTION_26711_REFRAME_SETTLED_SHAKINESS) {
+-                mMotion26711ReframeSettledFrames++;
+-            } else if (netAngle < MOTION_26711_REFRAME_ANGLE_DEG * 0.70f) {
+-                /* Returning hand jerk: explicitly forget the candidate instead of unlocking. */
+-                mMotion26711ReframeSettledFrames = 0;
+-            } else if (shakiness > MOTION_26711_REFRAME_SETTLED_SHAKINESS) {
+-                /* Camera is still moving; do not call motion itself a new scene. */
+-                mMotion26711ReframeSettledFrames = 0;
+-            }
+-            return mMotion26711ReframeSettledFrames >= MOTION_26711_REFRAME_SETTLED_FRAMES;
+-        } catch (Exception ignored) {
+-            return false;
+-        }
+-    }
+-
+-    private boolean motion26711WholeFrameSceneReplacementConfirmed() {
+-        float[] base = mMotion26711LockedSceneSignature;
+-        float[] now = mMotion26711LatestSceneSignature;
+-        long ts = mMotion26711LatestSceneSignatureTimestampNs;
+-        if (base == null || now == null || base.length != MOTION_26711_SCENE_TILES
+-                || now.length != MOTION_26711_SCENE_TILES || ts <= 0L
+-                || ts == mMotion26711LastSceneSignatureEvalTimestampNs) return false;
+-        mMotion26711LastSceneSignatureEvalTimestampNs = ts;
+-        int changed = 0;
+-        double evSum = 0.0;
+-        for (int i = 0; i < MOTION_26711_SCENE_TILES; i++) {
+-            double a = Math.max(0.02, base[i]);
+-            double b = Math.max(0.02, now[i]);
+-            double ev = Math.abs(Math.log(b / a) / Math.log(2.0));
+-            evSum += ev;
+-            if (ev >= MOTION_26711_SCENE_TILE_CHANGE_EV) changed++;
+-        }
+-        mMotion26711LastSceneChangedTiles = changed;
+-        double meanEv = evSum / MOTION_26711_SCENE_TILES;
+-        if (changed >= MOTION_26711_SCENE_CHANGED_TILES && meanEv >= 0.65) {
+-            mMotion26711SceneChangeFrames++;
+-        } else {
+-            mMotion26711SceneChangeFrames = 0;
+-        }
+-        return mMotion26711SceneChangeFrames >= MOTION_26711_SCENE_CHANGE_CONFIRM_FRAMES;
+-    }
+-
+-    private boolean motion26711LockedManualRequestMatchesBuilder() {
+-        if (mPreviewRequestBuilder == null || !mMotion26710ManualReferenceActive
+-                || mMotion26710TargetExposureNs <= 0L || mMotion26710TargetIso <= 0) return false;
+-        Integer ae = mPreviewRequestBuilder.get(CaptureRequest.CONTROL_AE_MODE);
+-        Long exp = mPreviewRequestBuilder.get(CaptureRequest.SENSOR_EXPOSURE_TIME);
+-        Integer iso = mPreviewRequestBuilder.get(CaptureRequest.SENSOR_SENSITIVITY);
+-        return ae != null && ae == CaptureRequest.CONTROL_AE_MODE_OFF
+-                && exp != null && exp == mMotion26710TargetExposureNs
+-                && iso != null && iso == mMotion26710TargetIso;
+-    }
+-
+-    private void motion26711ReassertLockedManualReference(@NonNull String reason) {
+-        if (mPreviewRequestBuilder == null || mCaptureSession == null
+-                || !mMotion26710ManualReferenceActive
+-                || mMotion26710TargetExposureNs <= 0L || mMotion26710TargetIso <= 0) return;
+-        try {
+-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+-                    CaptureRequest.CONTROL_AE_MODE_OFF);
+-            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,
+-                    mMotion26710TargetExposureNs);
+-            mPreviewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY,
+-                    mMotion26710TargetIso);
+-            mMotion26711PreviewTransitionHold = true;
+-            rebuildPreviewBuilder();
+-            Log.w(TAG, "IRIS_26711_LOCK_REASSERT reason=" + reason
+-                    + " targetExposureNs=" + mMotion26710TargetExposureNs
+-                    + " targetIso=" + mMotion26710TargetIso
+-                    + " exposureRecompute=false sameFrozenTarget=true");
+-        } catch (IllegalArgumentException | IllegalStateException e) {
+-            Log.w(TAG, "IRIS_26711 lock reassert skipped: " + e.getClass().getSimpleName());
+-        }
+-    }
+-
+-    public boolean shouldHoldMotion26711PreviewExposureTransition() {
+-        return isZslMode() && mMotion26711PreviewTransitionHold;
+-    }
+-
+-    private void motion26711ReleaseToHalAfterPhysicalCapture() {
+-        if (!isZslMode() || mPreviewRequestBuilder == null || mCaptureSession == null) return;
+-        try {
+-            mMotion26711PreviewTransitionHold = true;
+-            mMotion26711PostCaptureHalRestorePending = true;
+-            mMotion26711PostCaptureHalConfirmFrames = 0;
+-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+-                    CaptureRequest.CONTROL_AE_MODE_ON);
+-            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, 0);
+-            if (mMotion26680AwbLockApplied) {
+-                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, false);
+-            }
+-            mMotion26710ManualReferenceActive = false;
+-            mMotion26680PreviewLatched = false;
+-            mMotion26680AeLockApplied = false;
+-            mMotion26680AwbLockApplied = false;
+-            mMotion26709ReferenceSettled = false;
+-            mMotion26709ReleasePending = false;
+-            mMotion26711LockPoseValid = false;
+-            mMotion26711LockedSceneSignature = null;
+-            rebuildPreviewBuilder();
+-            Log.i(TAG, "IRIS_26711_PHYSICAL_CAPTURE_COMPLETE_HAL_RELEASE"
+-                    + " aeMode=ON compensationSteps=0 processingIndependent=true"
+-                    + " immutableBatchAlreadyFrozen=true previewTransitionHidden=true");
+-        } catch (IllegalArgumentException | IllegalStateException e) {
+-            mMotion26711PreviewTransitionHold = false;
+-            mMotion26711PostCaptureHalRestorePending = false;
+-            Log.w(TAG, "IRIS_26711 post-capture HAL release skipped: "
+-                    + e.getClass().getSimpleName());
+-        }
+-    }
+-
+-    private boolean motion26711HandlePostCaptureHalRestore(@NonNull TotalCaptureResult result) {
+-        if (!mMotion26711PostCaptureHalRestorePending) return false;
+-        Integer aeMode = result.get(CaptureResult.CONTROL_AE_MODE);
+-        Integer aeState = result.get(CaptureResult.CONTROL_AE_STATE);
+-        Integer comp = result.get(CaptureResult.CONTROL_AE_EXPOSURE_COMPENSATION);
+-        boolean aeOn = aeMode != null && aeMode != CaptureResult.CONTROL_AE_MODE_OFF;
+-        boolean zeroEv = comp == null || comp == 0;
+-        boolean settled = aeState == null
+-                || aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED
+-                || aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
+-                || aeState == CaptureResult.CONTROL_AE_STATE_LOCKED;
+-        if (aeOn && zeroEv && settled) {
+-            mMotion26711PostCaptureHalConfirmFrames++;
+-        } else {
+-            mMotion26711PostCaptureHalConfirmFrames = 0;
+-        }
+-        if (mMotion26711PostCaptureHalConfirmFrames >= MOTION_26711_POST_CAPTURE_HAL_CONFIRM_FRAMES) {
+-            mMotion26711PostCaptureHalRestorePending = false;
+-            mMotion26711PreviewTransitionHold = false;
+-            mMotion26711PostCaptureHalConfirmFrames = 0;
+-            Log.i(TAG, "IRIS_26711_POST_CAPTURE_HAL_RESTORED"
+-                    + " aeMode=" + aeMode + " compSteps=" + comp
+-                    + " processingMayContinue=true previewReleased=true");
+-        }
+-        return true;
+-    }
+-
+     /* IRIS_26710_ONE_SHOT_HAL_REFERENCE_OWNER
+      * Exact ownership contract:
+      *   HAL AE/AWB settles untouched -> one baseline RAW decision -> one direct manual target -> hold.
+@@ -3086,10 +2842,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * forbidden from changing NORMAL exposure. Subject/TV/flicker content cannot unlock the epoch;
+      * only the inherited sustained physical-camera-reframe proof can return ownership to HAL. */
+     private void updateMotion26680StablePreviewAuthority(@NonNull TotalCaptureResult result) {
+-        /* IRIS_26711_POST_CAPTURE_HAL_RESTORE_CALLBACK
+-         * Processing may already be running; HAL restoration belongs to live preview and must not
+-         * wait for image processing to finish. */
+-        if (isZslMode() && motion26711HandlePostCaptureHalRestore(result)) return;
+         if (!isZslMode() || mZslCapturing || burst || isProcessing
+                 || mPreviewRequestBuilder == null || mCaptureSession == null
+                 || mCameraCharacteristics == null) {
+@@ -3121,6 +2873,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 shakiness = Math.max(0, PhotonCamera.getGyro().getFilteredShakiness());
+             }
+         } catch (Exception ignored) {}
++        final boolean physicalReframe = shakiness > MOTION_26680_REFRAME_GYRO_THRESHOLD;
+ 
+         android.util.Range<Integer> aeRange = mCameraCharacteristics.get(
+                 CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+@@ -3169,17 +2922,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mMotion26710TargetObserveFrames = 0;
+             mMotion26680StableFrames = 0;
+             mMotion26680StationaryFrames = 0;
+-            mMotion26711PreviewTransitionHold = false;
+-            Log.i(TAG, "IRIS_26711_REFERENCE_RELEASE_CONFIRMED compSteps=" + resultCompSteps
++            Log.i(TAG, "IRIS_26710_REFERENCE_RELEASE_CONFIRMED compSteps=" + resultCompSteps
+                     + " aeMode=" + aeMode
+                     + " newUntouchedHalEpoch=true exposureFeedbackForbidden=true");
+             return;
+         }
+ 
+         if (mMotion26680PreviewLatched) {
+-            final boolean iris26711PoseReframe = motion26711PoseReframeConfirmed(shakiness);
+-            final boolean iris26711SceneReplacement = motion26711WholeFrameSceneReplacementConfirmed();
+-            if (iris26711PoseReframe || iris26711SceneReplacement) {
++            if (physicalReframe) {
++                mMotion26680ReframeMotionFrames++;
++            } else {
++                mMotion26680ReframeMotionFrames = 0;
++            }
++            if (mMotion26680ReframeMotionFrames >= MOTION_26680_REFRAME_CONFIRM_FRAMES) {
+                 try {
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+@@ -3202,22 +2957,14 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     mMotion26709ReferenceSettled = false;
+                     mMotion26709ReleasePending = mMotion26709HalBaselineReady;
+                     mMotion26709LastConsumedMeterTimestampNs = 0L;
+-                    mMotion26711LockPoseValid = false;
+-                    mMotion26711LockedSceneSignature = null;
+-                    mMotion26711ReframeSettledFrames = 0;
+-                    mMotion26711SceneChangeFrames = 0;
+-                    mMotion26711PreviewTransitionHold = true;
+-                    clearMotion26708HighlightClassifier("26711-proven-scene-epoch-change");
++                    clearMotion26708HighlightClassifier("26710-physical-reframe");
+                     rebuildPreviewBuilder();
+-                    Log.i(TAG, "IRIS_26711_REFERENCE_EPOCH_RELEASE generation="
++                    Log.i(TAG, "IRIS_26710_REFERENCE_EPOCH_RELEASE generation="
+                             + mIris26548CameraHealthGeneration
+-                            + " reason=" + (iris26711PoseReframe ? "NET_POSE_CHANGE" : "WHOLE_FRAME_REPLACEMENT")
+                             + " shakiness=" + shakiness
+-                            + " changedTiles=" + mMotion26711LastSceneChangedTiles
+                             + " restoreUserHalCompSteps=" + mMotion26709HalBaseCompSteps
+-                            + " handShakeCannotUnlock=true returningHandJerkCannotUnlock=true"
+                             + " subjectMotionCannotUnlock=true tvContentCannotUnlock=true"
+-                            + " rawBrightnessCannotUnlock=true noExposurePump=true");
++                            + " luminanceChangeCannotUnlock=true physicalCameraReframeOnly=true");
+                 } catch (IllegalArgumentException | IllegalStateException e) {
+                     Log.w(TAG, "IRIS_26710 one-shot reference release skipped: "
+                             + e.getClass().getSimpleName());
+@@ -3257,70 +3004,30 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             /* Once the one-shot target has been issued, no RAW statistic is allowed to write
+              * exposure again. We only observe whether the exact manual target has reached sensor. */
+             if (mMotion26710DecisionIssued) {
+-                if (mMotion26710ManualReferenceActive) {
++                if (mMotion26710ManualReferenceActive && !mMotion26709ReferenceSettled) {
+                     mMotion26710TargetObserveFrames++;
+                     double mismatchEv = Double.isFinite(mMotion26710TargetEnergy)
+                             && mMotion26710TargetEnergy > 0.0 && exposureEnergy > 0.0
+                             ? Math.abs(Math.log(exposureEnergy / mMotion26710TargetEnergy)
+                                 / Math.log(2.0)) : Double.POSITIVE_INFINITY;
+-                    boolean builderExact = motion26711LockedManualRequestMatchesBuilder();
+-                    boolean resultExact = iris26710ManualResult
+-                            && mismatchEv <= MOTION_26710_TARGET_OBSERVED_TOLERANCE_EV;
+-                    if (!mMotion26709ReferenceSettled) {
+-                        if (resultExact) {
+-                            mMotion26709ReferenceSettled = true;
+-                            mMotion26711PreviewTransitionHold = false;
+-                            motion26711CaptureLockPoseAndScene();
+-                            float observedProtectionEv = (float)Math.max(0.0,
+-                                    Math.min(MOTION_26709_MAX_RELATIVE_EV,
+-                                        Math.log(mMotion26709HalBaselineEnergy / exposureEnergy)
+-                                            / Math.log(2.0)));
+-                            Log.i(TAG, "IRIS_26711_REFERENCE_LOCKED"
+-                                    + " exposureNs=" + exposureNs + " iso=" + iso
+-                                    + " targetExposureNs=" + mMotion26710TargetExposureNs
+-                                    + " targetIso=" + mMotion26710TargetIso
+-                                    + " targetProtectionEv=" + mMotion26710TargetProtectionEv
+-                                    + " observedProtectionEv=" + observedProtectionEv
+-                                    + " mismatchEv=" + mismatchEv
+-                                    + " manualAeOff=true oneDecisionPerEpoch=true"
+-                                    + " continuousEnforcement=true transitionHidden=true");
+-                        } else if (mMotion26710TargetObserveFrames
+-                                >= MOTION_26710_TARGET_OBSERVE_MAX_FRAMES || !builderExact) {
+-                            mMotion26710TargetObserveFrames = 0;
+-                            motion26711ReassertLockedManualReference(
+-                                    builderExact ? "TARGET_NOT_OBSERVED" : "BUILDER_OWNER_LOST");
+-                        }
+-                    } else {
+-                        if (!resultExact || !builderExact) {
+-                            mMotion26711LockedResultMismatchFrames++;
+-                            if (mMotion26711LockedResultMismatchFrames
+-                                    >= MOTION_26711_LOCK_REASSERT_FRAMES) {
+-                                mMotion26711LockedResultMismatchFrames = 0;
+-                                motion26711ReassertLockedManualReference(
+-                                        builderExact ? "RESULT_DRIFT" : "BUILDER_OWNER_LOST");
+-                            }
+-                        } else {
+-                            mMotion26711LockedResultMismatchFrames = 0;
+-                            if (mMotion26711PreviewTransitionHold) {
+-                                mMotion26711PreviewTransitionHold = false;
+-                                Log.i(TAG, "IRIS_26711_LOCK_REASSERT_CONFIRMED"
+-                                        + " exposureNs=" + exposureNs + " iso=" + iso
+-                                        + " sameFrozenTarget=true previewReleased=true");
+-                            }
+-                        }
+-                    }
+-                } else if (mMotion26709ReferenceSettled) {
+-                    /* A zero-protection epoch is still immutable: keep HAL AE locked until a
+-                     * proven scene epoch change or physical capture completion. */
+-                    Boolean resultAeLock = result.get(CaptureResult.CONTROL_AE_LOCK);
+-                    Boolean builderAeLock = mPreviewRequestBuilder.get(CaptureRequest.CONTROL_AE_LOCK);
+-                    if (!Boolean.TRUE.equals(resultAeLock) || !Boolean.TRUE.equals(builderAeLock)) {
+-                        try {
+-                            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
+-                            rebuildPreviewBuilder();
+-                            Log.w(TAG, "IRIS_26711_HAL_BASELINE_LOCK_REASSERT"
+-                                    + " exposureRecompute=false sameHalEpoch=true");
+-                        } catch (IllegalArgumentException | IllegalStateException ignored) {}
++                    if (iris26710ManualResult
++                            && (mismatchEv <= MOTION_26710_TARGET_OBSERVED_TOLERANCE_EV
++                                || mMotion26710TargetObserveFrames >= MOTION_26710_TARGET_OBSERVE_MAX_FRAMES)) {
++                        mMotion26709ReferenceSettled = true;
++                        float observedProtectionEv = (float)Math.max(0.0,
++                                Math.min(MOTION_26709_MAX_RELATIVE_EV,
++                                    Math.log(mMotion26709HalBaselineEnergy / exposureEnergy)
++                                        / Math.log(2.0)));
++                        Log.i(TAG, "IRIS_26710_REFERENCE_LOCKED"
++                                + " exposureNs=" + exposureNs + " iso=" + iso
++                                + " targetExposureNs=" + mMotion26710TargetExposureNs
++                                + " targetIso=" + mMotion26710TargetIso
++                                + " targetProtectionEv=" + mMotion26710TargetProtectionEv
++                                + " observedProtectionEv=" + observedProtectionEv
++                                + " mismatchEv=" + mismatchEv
++                                + " manualAeOff=true oneDecisionPerEpoch=true"
++                                + " postAdjustmentRawCannotRewriteExposure=true"
++                                + " subjectMotionCannotUnlock=true");
+                     }
+                 }
+                 return;
+@@ -3392,9 +3099,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
+                     mMotion26680AeLockApplied = true;
+                     mMotion26709ReferenceSettled = true;
+-                    motion26711CaptureLockPoseAndScene();
+                     rebuildPreviewBuilder();
+-                    Log.i(TAG, "IRIS_26711_REFERENCE_LOCKED"
++                    Log.i(TAG, "IRIS_26710_REFERENCE_LOCKED"
+                             + " exposureNs=" + exposureNs + " iso=" + iso
+                             + " targetProtectionEv=0.0 decision=HAL_BASELINE"
+                             + " oneDecisionPerEpoch=true postAdjustmentRawCannotRewriteExposure=true"
+@@ -3436,28 +3142,17 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+             final double targetScale = Math.pow(2.0, requestedProtectionEv);
+             final double targetEnergy = mMotion26709HalBaselineEnergy / targetScale;
+-            /* IRIS_26711_HAL_ANTIBANDING_SHUTTER_PRESERVATION
+-             * Preserve the HAL-selected shutter first and remove exposure through ISO while sensor
+-             * gain has room. This keeps HAL anti-banding timing/duration intact whenever possible.
+-             * Only when ISO reaches the sensor floor may shutter shorten; this remains one direct
+-             * deterministic target and never becomes an exposure search. */
+-            long targetExposureNs = Math.max(exposureRange.getLower(),
+-                    Math.min(exposureRange.getUpper(), mMotion26709HalBaselineExposureNs));
+-            int targetIso = (int)Math.round(targetEnergy / Math.max(1.0, targetExposureNs));
+-            targetIso = Math.max(sensitivityRange.getLower(),
+-                    Math.min(Math.min(sensitivityRange.getUpper(), mMotion26709HalBaselineIso),
+-                            targetIso));
++            long targetExposureNs = Math.round(mMotion26709HalBaselineExposureNs / targetScale);
++            targetExposureNs = Math.max(exposureRange.getLower(),
++                    Math.min(exposureRange.getUpper(), targetExposureNs));
++            int targetIso = mMotion26709HalBaselineIso;
+             double quantizedEnergy = (double)targetExposureNs * (double)targetIso;
+-            boolean iris26711HalShutterPreserved = targetIso > sensitivityRange.getLower()
+-                    || quantizedEnergy <= targetEnergy * 1.015;
+-            if (quantizedEnergy > targetEnergy * 1.015) {
+-                targetIso = sensitivityRange.getLower();
+-                targetExposureNs = Math.round(targetEnergy / Math.max(1, targetIso));
+-                targetExposureNs = Math.max(exposureRange.getLower(),
+-                        Math.min(Math.min(exposureRange.getUpper(), mMotion26709HalBaselineExposureNs),
+-                                targetExposureNs));
++            if (quantizedEnergy > targetEnergy && targetExposureNs <= exposureRange.getLower()) {
++                targetIso = (int)Math.round(targetEnergy / Math.max(1.0, targetExposureNs));
++                targetIso = Math.max(sensitivityRange.getLower(),
++                        Math.min(Math.min(sensitivityRange.getUpper(), mMotion26709HalBaselineIso),
++                                targetIso));
+                 quantizedEnergy = (double)targetExposureNs * (double)targetIso;
+-                iris26711HalShutterPreserved = targetExposureNs == mMotion26709HalBaselineExposureNs;
+             }
+             if (!(quantizedEnergy > 0.0) || quantizedEnergy >= mMotion26709HalBaselineEnergy) {
+                 mMotion26710TargetProtectionEv = 0.0f;
+@@ -3486,9 +3181,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 mPreviewRequestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, targetExposureNs);
+                 mPreviewRequestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY, targetIso);
+                 mMotion26710ManualReferenceActive = true;
+-                mMotion26711PreviewTransitionHold = true;
+                 rebuildPreviewBuilder();
+-                Log.i(TAG, "IRIS_26711_ONE_SHOT_REFERENCE_COMMIT"
++                Log.i(TAG, "IRIS_26710_ONE_SHOT_REFERENCE_COMMIT"
+                         + " halExposureNs=" + mMotion26709HalBaselineExposureNs
+                         + " halIso=" + mMotion26709HalBaselineIso
+                         + " targetExposureNs=" + targetExposureNs
+@@ -3500,13 +3194,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + " broadVotes=" + mMotion26709PublishedBroadVotes
+                         + " mixedVotes=" + mMotion26709PublishedMixedVotes
+                         + " coherentCells=" + mMotion26709PublishedCoherentCells
+-                        + " halShutterPreservedForAntibanding=" + iris26711HalShutterPreserved
+-                        + " isoFloor=" + sensitivityRange.getLower()
+                         + " directManualJump=true intermediateTargetsForbidden=true"
+                         + " postAdjustmentRawCannotRewriteExposure=true");
+             } catch (IllegalArgumentException | IllegalStateException e) {
+                 mMotion26710ManualReferenceActive = false;
+-                mMotion26711PreviewTransitionHold = false;
+                 mMotion26710TargetProtectionEv = 0.0f;
+                 try {
+                     mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+@@ -3522,9 +3213,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+ 
+-        /* Before a scene is latched, raw gyro shakiness may delay HAL-baseline qualification,
+-         * but after lock only net pose/whole-frame proof above can release exposure. */
+-        if (shakiness > MOTION_26680_REFRAME_GYRO_THRESHOLD) {
++        if (physicalReframe) {
+             mMotion26680StableFrames = 0;
+             mMotion26680StationaryFrames = 0;
+             return;
+@@ -10089,10 +9778,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mZslCapturing = false;
+         burst = false;
+         mState = STATE_PREVIEW;
+-        /* IRIS_26711_CAPTURE_EXPOSURE_OWNER_ENDS_AT_PHYSICAL_BATCH
+-         * All NORMAL/LONG pixels and metadata are immutable above. Live preview now returns to
+-         * ordinary HAL AE at 0 EV immediately; Sabre/render/JPEG/UHDR processing is independent. */
+-        motion26711ReleaseToHalAfterPhysicalCapture();
+         processExecutor.execute(() -> {
+             try {
+                 mBackgroundHandler.post(this::unlockFocus);
+@@ -10809,27 +10494,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      */
+     private void setAEMode(CaptureRequest.Builder requestBuilder, int aeMode) {
+         if (requestBuilder != null) {
+-            /* IRIS_26711_LEGACY_3A_TAKEOVER_GUARD
+-             * Legacy reset/setup paths may configure AF/flash, but while the one-shot reference
+-             * owns live exposure they are forbidden from turning preview AE back on. */
+-            if (requestBuilder == mPreviewRequestBuilder
+-                    && isZslMode()
+-                    && mMotion26710ManualReferenceActive
+-                    && mMotion26709ReferenceSettled
+-                    && !mMotion26711PostCaptureHalRestorePending
+-                    && mMotion26710TargetExposureNs > 0L
+-                    && mMotion26710TargetIso > 0) {
+-                requestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, false);
+-                requestBuilder.set(CaptureRequest.CONTROL_AE_MODE,
+-                        CaptureRequest.CONTROL_AE_MODE_OFF);
+-                requestBuilder.set(CaptureRequest.SENSOR_EXPOSURE_TIME,
+-                        mMotion26710TargetExposureNs);
+-                requestBuilder.set(CaptureRequest.SENSOR_SENSITIVITY,
+-                        mMotion26710TargetIso);
+-                Log.i(TAG, "IRIS_26711_LEGACY_3A_TAKEOVER_BLOCKED"
+-                        + " sameFrozenTarget=true requestedAeMode=" + aeMode);
+-                return;
+-            }
+             if (mFlashSupported) {
+                 requestBuilder.set(CONTROL_AE_MODE, Math.max(aeMode, 1));//here AE_MODE will never be OFF(0)
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+index a05274d91ce7ad9c8e27de167841dd9c8d4bda31..f6f6a44dd1c7cb6833aefb7768c72a11d48963ed 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/views/viewfinder/MainRenderer.java
+@@ -69,15 +69,8 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+         //GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+ 
+         long iris26553FrameTimestamp = -1L;
+-        CaptureController iris26711Controller = PhotonCamera.getCaptureController();
+-        /* IRIS_26711_HIDDEN_PHYSICAL_EXPOSURE_TRANSITION
+-         * Do not consume sensor frames while HAL->manual, lock-reassert or post-capture HAL
+-         * restoration is physically transitioning. The OES texture therefore keeps the last
+-         * stable displayed frame; SurfaceTexture will deliver the newest frame when the hold ends. */
+-        boolean iris26711HoldExposureTransition = iris26711Controller != null
+-                && iris26711Controller.shouldHoldMotion26711PreviewExposureTransition();
+         synchronized (this) {
+-            if (mUpdateST && !iris26711HoldExposureTransition) {
++            if (mUpdateST) {
+                 mSTexture.updateTexImage();
+                 iris26553FrameTimestamp = mSTexture.getTimestamp();
+                 mUpdateST = false;
+@@ -91,7 +84,7 @@ public class MainRenderer implements GLSurfaceView.Renderer, SurfaceTexture.OnFr
+          * Preserve 26662 timestamp matching and 26663 hold-on-miss, with no additional display
+          * slew. Compensation changes only when an exact Camera2 result for the displayed frame
+          * proves the protection EV. */
+-        CaptureController iris26663Controller = iris26711Controller;
++        CaptureController iris26663Controller = PhotonCamera.getCaptureController();
+         if (iris26663Controller != null && iris26553FrameTimestamp > 0L) {
+             float exactEv = iris26663Controller.getMotion26663ReferencePreviewProtectionEv(
+                     iris26553FrameTimestamp);
+diff --git a/app/version.properties b/app/version.properties
+index edc8277d4f4651d2c091730184e50ea4af727301..eb86ad8b9ade44a9767b86004bff6cbd38cfd2c3 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726711
+-VERSION_BUILD=26711
++VERSION_NAME=0.9726710
++VERSION_BUILD=26710
