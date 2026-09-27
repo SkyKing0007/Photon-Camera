@@ -104,6 +104,12 @@ color=txt(c,'app/src/main/assets/shaders/motionv2/color_transform.glsl')
 for t in ['USE_IRIS_26720_HIGH_ZOOM_RGB','iris26720HighZoomRgb','iris26720HighZoomOrigin','iris26720HighZoomFullSize','iris26720HighZoomSourceZoom']:
  assert t in color,t
 assert color.count('cameraRgb=max(texture(iris26720HighZoomRgb')==1
+# Permanent regression from failed 26720 Actions run 36349017340: GLSL ES forbids
+# evaluating an undefined macro in #if. The default definition must precede first use.
+macro_define='#define USE_IRIS_26720_HIGH_ZOOM_RGB 0'
+macro_use='#if USE_IRIS_26720_HIGH_ZOOM_RGB == 1'
+assert color.count(macro_define)==1 and color.count(macro_use)==2
+assert color.index(macro_define) < color.index(macro_use), '26720 high-zoom macro used before default definition'
 ct=txt(c,'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java')
 for t in ['IRIS_26720_HIGH_ZOOM_RGB_TEXTURE_OWNER','motionV2HighZoomRgbPrepared','motionV2HighZoomRgbApplied=true','USE_IRIS_26720_HIGH_ZOOM_RGB']:
  assert t in ct,t

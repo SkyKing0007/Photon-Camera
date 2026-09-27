@@ -1,6 +1,10 @@
 precision highp float;
 precision mediump sampler2D;
 
+#ifndef USE_IRIS_26720_HIGH_ZOOM_RGB
+#define USE_IRIS_26720_HIGH_ZOOM_RGB 0
+#endif
+
 uniform sampler2D InputBuffer;
 #if USE_IRIS_26720_HIGH_ZOOM_RGB == 1
 uniform sampler2D iris26720HighZoomRgb;
@@ -27,9 +31,6 @@ uniform vec3 profileToSrgbRow1;
 uniform vec3 profileToSrgbRow2;
 out vec3 Output;
 
-#ifndef USE_IRIS_26720_HIGH_ZOOM_RGB
-#define USE_IRIS_26720_HIGH_ZOOM_RGB 0
-#endif
 #ifndef USE_PROFILE_HUESAT
 #define USE_PROFILE_HUESAT 0
 #endif

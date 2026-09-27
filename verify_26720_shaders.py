@@ -62,6 +62,12 @@ def make_sources(cand):
  m=re.search(r'val\s+highZoomDetailResolve26718\s*:\s*String\s+by\s+lazy\s*\{\s*"""\n(.*?)\n\s*"""\.trimIndent\(\)\s*\}',k,re.S); assert m
  scalarresolve=textwrap.dedent(m.group(1))
  asset=(cand/'app/src/main/assets/shaders/motionv2/color_transform.glsl').read_text()
+ # Permanent regression from failed 26720 Actions run 36349017340. In GLSL ES the
+ # high-zoom macro must have a default definition before the first #if expression.
+ macro_define='#define USE_IRIS_26720_HIGH_ZOOM_RGB 0'
+ macro_use='#if USE_IRIS_26720_HIGH_ZOOM_RGB == 1'
+ assert asset.count(macro_define)==1 and asset.count(macro_use)==2
+ assert asset.index(macro_define) < asset.index(macro_use), 'high-zoom macro used before default definition'
  def glinterface(defval):
   lines=[]
   for line in asset.splitlines():
