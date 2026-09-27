@@ -1,0 +1,270 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 791fde90c907c99379a4da9fdca89d7fbd41db0c..a23c650ae1242731d101d85ac8ed98137491ea19 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -226,6 +226,12 @@ internal class GlesMgcRawSpatialStacker(
+         val phase: True2xPhaseStats,
+     )
+ 
++    private data class HighZoomRgb32fValidation26721(
++        val samples: Long,
++        val positiveSamples: Long,
++        val maxSignal: Float,
++    )
++
+     private data class True2xPhaseStats(
+         val mean: Float,
+         val p10: Float,
+@@ -3186,7 +3192,7 @@ internal class GlesMgcRawSpatialStacker(
+                 if (rgbAttempt.isSuccess) {
+                     highZoomRgbResult = rgbAttempt.getOrThrow()
+                     val hz = checkNotNull(highZoomRgbResult)
+-                    require(File(hz.path).length() == hz.width.toLong() * hz.height * TRUE2X_RGB16F_BYTES_PER_PIXEL)
++                    require(File(hz.path).length() == hz.width.toLong() * hz.height * HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL)
+                     val ready = "size=${hz.width}x${hz.height} origin=${hz.originX},${hz.originY} " +
+                         "full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} frames=${hz.frames} " +
+                         "activePct=${hz.activePct} fullColorPct=${hz.fullColorPct} phaseMean=${hz.phaseMean} phaseP10=${hz.phaseP10} " +
+@@ -12869,6 +12875,127 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /* IRIS_26721_HIGH_ZOOM_RGB32F_TRANSFER_OWNER
++     * The established Motion V2 cross-context transport is FLOAT32/RGBA32F (26700).
++     * Keep every inherited true-2x RGB16F publication path unchanged; only the >=20x compact
++     * direct-CFA carrier converts the already-rendered RGBA16F tile to a persisted RGB32F file.
++     * This prevents packed binary16 bytes from being interpreted by GLTexture as GL_FLOAT.
++     */
++    private fun writeHighZoomRgb32fTile26721(
++        output: RandomAccessFile,
++        texture: Int,
++        left: Int,
++        top: Int,
++        tileWidth: Int,
++        tileHeight: Int,
++        fullOutputWidth: Int,
++        label: String,
++        phaseHistogram: LongArray,
++        reasonHistogram: LongArray,
++        fullOutputHeight: Int,
++    ) {
++        val rgba = allocateTrue2xHostBuffer(
++            Math.multiplyExact(Math.multiplyExact(tileWidth, tileHeight), 4 * Float.SIZE_BYTES),
++            "$label RGBA32F readback",
++        )
++        val rgb = allocateTrue2xHostBuffer(
++            Math.multiplyExact(Math.multiplyExact(tileWidth, tileHeight), HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL),
++            "$label RGB32F pack",
++        )
++        try {
++            bindRenderTargets(intArrayOf(texture), "$label framebuffer")
++            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
++            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, Float.SIZE_BYTES)
++            rgba.clear()
++            /* Exact established 26700 transport boundary: floating render target -> GL_FLOAT CPU carrier. */
++            GLES30.glReadPixels(
++                0, 0, tileWidth, tileHeight,
++                GLES30.GL_RGBA, GLES30.GL_FLOAT, rgba,
++            )
++            checkGlError("$label RGBA32F readback")
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++            val rgbaFloat = rgba.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
++            val rgbFloat = rgb.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
++            for (index in 0 until tileWidth * tileHeight) {
++                val r = rgbaFloat.get(index * 4)
++                val g = rgbaFloat.get(index * 4 + 1)
++                val b = rgbaFloat.get(index * 4 + 2)
++                require(r.isFinite() && g.isFinite() && b.isFinite()) {
++                    "26721 non-finite high-zoom RGB32F sample index=$index rgb=$r,$g,$b"
++                }
++                rgbFloat.put(index * 3, r)
++                rgbFloat.put(index * 3 + 1, g)
++                rgbFloat.put(index * 3 + 2, b)
++                val diagnosticFloat = rgbaFloat.get(index * 4 + 3)
++                require(diagnosticFloat.isFinite()) { "26721 non-finite high-zoom diagnostic index=$index" }
++                val diagnostic = diagnosticFloat.roundToInt()
++                require(diagnostic in 0..39) { "26721 invalid high-zoom diagnostic code=$diagnostic" }
++                val phaseCount = (diagnostic / 8).coerceIn(0, 4)
++                val reasonClass = diagnostic % 8
++                phaseHistogram[phaseCount]++
++                reasonHistogram[reasonClass]++
++            }
++            rgb.position(0)
++            writeTrue2xTileRows(
++                output, rgb, left, top, tileWidth, tileHeight,
++                fullOutputWidth, HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL,
++            )
++        } finally {
++            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
++            LargeDirectBuffer.free(rgb)
++            LargeDirectBuffer.free(rgba)
++        }
++    }
++
++    private fun validateHighZoomRgb32f26721(
++        file: File,
++        width: Int,
++        height: Int,
++    ): HighZoomRgb32fValidation26721 {
++        val expectedSamples = width.toLong() * height.toLong() * 3L
++        val expectedBytes = expectedSamples * Float.SIZE_BYTES
++        require(file.isFile && file.length() == expectedBytes) {
++            "26721 RGB32F carrier size=${if (file.isFile) file.length() else -1L} expected=$expectedBytes"
++        }
++        val chunk = allocateTrue2xHostBuffer(1024 * 1024, "IRIS26721 RGB32F validation")
++        var samples = 0L
++        var positiveSamples = 0L
++        var maxSignal = 0f
++        try {
++            RandomAccessFile(file, "r").channel.use { channel ->
++                while (samples < expectedSamples) {
++                    val remainingBytes = ((expectedSamples - samples) * Float.SIZE_BYTES)
++                        .coerceAtMost(chunk.capacity().toLong()).toInt()
++                    require((remainingBytes % Float.SIZE_BYTES) == 0)
++                    chunk.clear()
++                    chunk.limit(remainingBytes)
++                    while (chunk.hasRemaining()) {
++                        val read = channel.read(chunk)
++                        require(read > 0) { "26721 truncated RGB32F carrier at sample=$samples" }
++                    }
++                    chunk.flip()
++                    val values = chunk.duplicate().order(ByteOrder.nativeOrder()).asFloatBuffer()
++                    while (values.hasRemaining()) {
++                        val value = values.get()
++                        require(value.isFinite()) { "26721 non-finite RGB32F carrier sample=$samples value=$value" }
++                        if (value > 0f) {
++                            positiveSamples++
++                            if (value > maxSignal) maxSignal = value
++                        }
++                        samples++
++                    }
++                }
++            }
++        } finally {
++            LargeDirectBuffer.free(chunk)
++        }
++        require(samples == expectedSamples) { "26721 RGB32F sample count=$samples expected=$expectedSamples" }
++        require(positiveSamples > 0L && maxSignal > 0f) {
++            "26721 RGB32F carrier has no positive image energy"
++        }
++        return HighZoomRgb32fValidation26721(samples, positiveSamples, maxSignal)
++    }
++
+     private fun writeTrue2xGpuRgbTile(
+         output: RandomAccessFile,
+         texture: Int,
+@@ -13553,7 +13680,7 @@ internal class GlesMgcRawSpatialStacker(
+         val lensTexture = if (hasLensShading()) createLensShadingTexture() else 0
+         try {
+             RandomAccessFile(outputFile, "rw").use { out ->
+-                out.setLength(outputWidth.toLong() * outputHeight * TRUE2X_RGB16F_BYTES_PER_PIXEL)
++                out.setLength(outputWidth.toLong() * outputHeight * HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL)
+                 var localTop = 0
+                 var bands = 0
+                 while (localTop < outputHeight) {
+@@ -13645,7 +13772,10 @@ internal class GlesMgcRawSpatialStacker(
+                             program=highZoomRgbProtectProgram26720; GLES30.glUseProgram(program); bindTexture(program,"uDirectRgb",0,resolved); bindTexture(program,"uPhaseOccupancy",1,phase); bindTexture(program,"uNativeVgnGuide",2,nativeVgnGuideTexture); bindTexture(program,"uTemporalLumaStats",3,temporal)
+                             uniform2i(program,"uOutputOrigin",globalLeft,globalTop); uniform2i(program,"uOutputFullSize",fullOutputWidth,fullOutputHeight); uniform2i(program,"uGuideSize",width,height)
+                             draw(program,tileWidth,tileHeight,intArrayOf(render))
+-                            writeTrue2xGpuRgbTile(out,render,localLeft,localTop,tileWidth,tileHeight,outputWidth,"IRIS26720 high-zoom RGB",phaseHistogram,reasonHistogram,null,outputHeight)
++                            writeHighZoomRgb32fTile26721(
++                                out, render, localLeft, localTop, tileWidth, tileHeight, outputWidth,
++                                "IRIS26721 high-zoom RGB32F", phaseHistogram, reasonHistogram, outputHeight,
++                            )
+                             checkGlError("IRIS26720 high-zoom RGB tile")
+                         } finally { releaseTexturesFrom(tileStart) }
+                         localLeft += tileWidth
+@@ -13689,11 +13819,18 @@ internal class GlesMgcRawSpatialStacker(
+         val outputHeight=roundUp4((kotlin.math.ceil(fullHeight/highZoomSourceZoom.toDouble()).toInt()+4).coerceAtMost(fullHeight)).coerceAtLeast(4).coerceAtMost(fullHeight)
+         val originX=(fullWidth-outputWidth)/2; val originY=(fullHeight-outputHeight)/2
+         require((originX and 1)==0 && (originY and 1)==0)
+-        val output=File(directory,"iris26720_high_zoom_rgb_${System.nanoTime()}.rgb16f")
++        val output=File(directory,"iris26721_high_zoom_rgb_${System.nanoTime()}.rgb32f")
+         val start=System.nanoTime()
+         return try {
+             val stats=runHighZoomRgbGpu26720(frames,images,evidence,output,nativeVgnGuideTexture,outputWidth,outputHeight,originX,originY,fullWidth,fullHeight)
+-            require(output.length()==outputWidth.toLong()*outputHeight*TRUE2X_RGB16F_BYTES_PER_PIXEL)
++            require(output.length()==outputWidth.toLong()*outputHeight*HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL)
++            val rgb32fValidation26721 = validateHighZoomRgb32f26721(output, outputWidth, outputHeight)
++            val rgb32fProof26721 = "bytes=${output.length()} samples=${rgb32fValidation26721.samples} " +
++                "positiveSamples=${rgb32fValidation26721.positiveSamples} maxSignal=${rgb32fValidation26721.maxSignal} " +
++                "source=RGBA16F transfer=RGB32F bytesPerChannel=4 float16Transfer=false " +
++                "proven26700FloatTransport=true scalar26719FallbackOnFailure=true"
++            PLog.i(SABRE_TAG, "IRIS_26721_HIGH_ZOOM_RGB32F_CARRIER $rgb32fProof26721")
++            MotionTrace.processingState("IRIS_26721_HIGH_ZOOM_RGB32F_CARRIER", rgb32fProof26721)
+             val refined=evidence.filter{it.frameIndex!=0}
+             val refinePct=if(refined.isEmpty())0f else refined.map{it.refineAcceptedPct}.average().toFloat()
+             HighZoomRgbResult(output.absolutePath,outputWidth,outputHeight,originX,originY,fullWidth,fullHeight,highZoomSourceZoom,stats.activePct,stats.fullColorPct,stats.phase.mean,stats.phase.p10,refinePct,evidence.size,elapsedMs(start))
+@@ -13964,6 +14101,7 @@ internal class GlesMgcRawSpatialStacker(
+         private const val TRUE2X_ACCUMULATOR_FLOATS_PER_PIXEL = 10
+         private const val TRUE2X_ACCUMULATOR_BYTES_PER_PIXEL = TRUE2X_ACCUMULATOR_FLOATS_PER_PIXEL * Float.SIZE_BYTES
+         private const val TRUE2X_RGB16F_BYTES_PER_PIXEL = 3 * Short.SIZE_BYTES
++        private const val HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL = 3 * Float.SIZE_BYTES
+         private const val TRUE2X_PROOF_GRID_WIDTH = 32
+         private const val TRUE2X_PROOF_GRID_HEIGHT = 24
+         private const val SABRE_LONG_DURATION_ROBUSTNESS_MAX = 4f
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+index 2a448d4dd636f90a80c71f9ac09534367590ef0b..f4c6470141e3895fc8d61940ad6b05950aeed915 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+@@ -122,7 +122,8 @@ data class RawStackResult(
+     val highZoomDetailFrames: Int = 0,
+     val highZoomDetailReconstructionMs: Long = 0L,
+     /* IRIS_26720_HIGH_ZOOM_DIRECT_CFA_RGB_ROI
+-     * Protected camera-linear RGB16F centered ROI reconstructed directly from aligned NORMAL CFA
++     * IRIS_26721_HIGH_ZOOM_RGB32F_TRANSPORT_CONTRACT
++     * Protected camera-linear RGB32F centered ROI reconstructed directly from aligned NORMAL CFA
+      * samples. Native Sabre/VGN remains the local fallback and the sole highlight-safe guide.
+      * The legacy 26719 scalar sidecar is retained only as a failure fallback for this >=20x route.
+      */
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+index fffed9d810e8645d46c3d0c4d6b705ad261e7b4d..d86192c3287ac1f0ee123ef002d720be36572fd0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+@@ -47,7 +47,8 @@ public final class MotionV2ColorTransform extends Node {
+     }
+ 
+     /* IRIS_26720_HIGH_ZOOM_RGB_TEXTURE_OWNER
+-     * Consume the compact camera-linear RGB16F ROI once, after native Sabre/SHORT highlight
++     * IRIS_26721_HIGH_ZOOM_RGB32F_TEXTURE_TRANSFER
++     * Consume the compact camera-linear RGB32F ROI once, after native Sabre/SHORT highlight
+      * analysis and immediately before the existing color owner. Below 20x this is never called.
+      */
+     private GLTexture loadHighZoomRgb26720() {
+@@ -57,7 +58,7 @@ public final class MotionV2ColorTransform extends Node {
+         if (w<=0 || h<=0 || p.motionV2HighZoomRgbFullWidth<=0 || p.motionV2HighZoomRgbFullHeight<=0)
+             throw new IllegalStateException("26720 invalid high-zoom RGB geometry");
+         final File file=new File(p.motionV2HighZoomRgbPath);
+-        final long expected=(long)w*h*3L*2L;
++        final long expected=(long)w*h*3L*Float.BYTES;
+         if (!file.isFile() || file.length()!=expected)
+             throw new IllegalStateException("26720 high-zoom RGB file mismatch expected="+expected+
+                     " actual="+(file.isFile()?file.length():-1));
+@@ -68,14 +69,15 @@ public final class MotionV2ColorTransform extends Node {
+             if(bytes.hasRemaining()) throw new IllegalStateException("26720 short high-zoom RGB read");
+             bytes.flip();
+             GLTexture texture=new GLTexture(new Point(w,h),
+-                    new GLFormat(GLFormat.DataType.FLOAT_16,3),bytes,GL_LINEAR,GL_CLAMP_TO_EDGE);
++                    new GLFormat(GLFormat.DataType.FLOAT_32,3),bytes,GL_LINEAR,GL_CLAMP_TO_EDGE);
+             if(!file.delete() && file.exists()) try { java.nio.file.Files.deleteIfExists(file.toPath()); } catch(Throwable ignored) {}
+             p.motionV2HighZoomRgbPath=null;
+             Log.i(Name,"IRIS_26720_HIGH_ZOOM_RGB_TEXTURE_LOADED size="+w+"x"+h+
+                     " origin="+p.motionV2HighZoomRgbOriginX+","+p.motionV2HighZoomRgbOriginY+
+                     " activePct="+p.motionV2HighZoomRgbActivePct+" fullColorPct="+p.motionV2HighZoomRgbFullColorPct+
+                     " phaseMean="+p.motionV2HighZoomRgbPhaseMean+" phaseP10="+p.motionV2HighZoomRgbPhaseP10+
+-                    " frames="+p.motionV2HighZoomRgbFrames);
++                    " frames="+p.motionV2HighZoomRgbFrames+
++                    " transfer=RGB32F bytesPerChannel=4 float16Transfer=false");
+             return texture;
+         } catch(Exception error) {
+             throw new IllegalStateException("26720 high-zoom RGB load failed",error);
+diff --git a/app/version.properties b/app/version.properties
+index f4fbfcbd9eb145724c555c9dd216f98f91294698..4b8a883dacca196837df077897986744577ce0b8 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726720
+-VERSION_BUILD=26720
++VERSION_NAME=0.9726721
++VERSION_BUILD=26721
