@@ -1,0 +1,104 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 914d256f2a8fabc92b42d069f6cc8f00be5f9e09..15801b3146ad440ddd856850050307e1f1281661 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -4978,16 +4978,46 @@ internal object GlesMgcRawSabreShaders {
+         source
+     }
+ 
+-    /* IRIS_26722_HIGH_ZOOM_NATIVE_SABRE_VGN_CHROMA_AUTHORITY
+-     * >=20x keeps direct-CFA temporal reconstruction only as the high-resolution luminance/detail
+-     * owner. Reuse the exact proven 26568/26579/26580/26581 topology-aware native Sabre/VGN
+-     * chroma reconstruction: direct CFA may select the correct material side through luminance,
+-     * but never contributes independent R/G/B chroma. Real color already present in the native
+-     * guide is preserved, including small colored structure protected by local chroma occupancy;
+-     * unsupported cyan/magenta cross-edge transfer is impossible by construction.
++    /* IRIS_26720_HIGH_ZOOM_PROTECTED_RGB_RESOLVE
++     * Reuse the proven 26568 luma/topology protection. Direct-CFA chroma becomes authoritative
++     * only where full phase support, temporal repeatability, guide agreement, highlight safety,
++     * and same-material topology all agree; otherwise native Sabre/VGN chroma wins locally.
+      */
+     val highZoomRgbProtect26720: String by lazy {
+-        true2xGuideRender26568
++        val old = "    oRenderRgb = vec4(max(guideRgb * factor, vec3(0.0)), float(phaseCount * 8 + reasonClass));"
++        val replacement = """
++            vec3 luminanceOwnedRgb = max(guideRgb * factor, vec3(0.0));
++            float outputY = max(irisLuma(luminanceOwnedRgb), 0.0);
++            vec3 guideChroma = luminanceOwnedRgb - vec3(outputY);
++            float directPixelY = max(irisLuma(directRgb), 0.0);
++            vec3 directChroma = directRgb - vec3(directPixelY);
++            float pixelChromaDistance = length(irisChroma(directRgb) - irisChroma(guideRgb));
++            float strictChromaAgreement = 1.0 - irisSmooth01((pixelChromaDistance - 0.008) / 0.030);
++            float fullPhaseGate = phaseCount >= 4 ? 1.0 : 0.0;
++            float strongTemporalGate = irisSmooth01((temporalGate - 0.55) / 0.35);
++            float boundarySafe = 1.0 - irisSmooth01((materialBoundary - 0.08) / 0.42);
++            float directChromaConfidence = clamp(confidence * fullPhaseGate * strongTemporalGate *
++                strictChromaAgreement * highlightGate * boundarySafe, 0.0, 1.0);
++            vec3 chromaDelta = directChroma - guideChroma;
++            float chromaDeltaMagnitude = length(chromaDelta);
++            float maxChromaDelta = 0.020 + 0.30 * length(guideChroma);
++            if (chromaDeltaMagnitude > maxChromaDelta && chromaDeltaMagnitude > 1.0e-7)
++                chromaDelta *= maxChromaDelta / chromaDeltaMagnitude;
++            vec3 protectedChroma = guideChroma + chromaDelta * directChromaConfidence;
++            float nonNegativeScale26720 = 1.0;
++            if (protectedChroma.r < 0.0) nonNegativeScale26720 = min(nonNegativeScale26720,
++                outputY / max(-protectedChroma.r, 1.0e-7));
++            if (protectedChroma.g < 0.0) nonNegativeScale26720 = min(nonNegativeScale26720,
++                outputY / max(-protectedChroma.g, 1.0e-7));
++            if (protectedChroma.b < 0.0) nonNegativeScale26720 = min(nonNegativeScale26720,
++                outputY / max(-protectedChroma.b, 1.0e-7));
++            vec3 protectedRgb = vec3(outputY) + protectedChroma * clamp(nonNegativeScale26720, 0.0, 1.0);
++            oRenderRgb = vec4(max(protectedRgb, vec3(0.0)), float(phaseCount * 8 + reasonClass));
++        """.trimIndent().prependIndent("    ").trimEnd()
++        val first = true2xGuideRender26568.indexOf(old)
++        check(first >= 0) { "26720 protected RGB output anchor missing" }
++        check(true2xGuideRender26568.indexOf(old, first + old.length) < 0) { "26720 protected RGB output anchor duplicated" }
++        true2xGuideRender26568.replaceRange(first, first + old.length, replacement)
+     }
+ 
+     /* IRIS_26719_HIGH_ZOOM_LAZY_ISOLATION
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 01320351adcbbaac2b8613f3fb429d08c9166ebb..a23c650ae1242731d101d85ac8ed98137491ea19 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -3195,10 +3195,9 @@ internal class GlesMgcRawSpatialStacker(
+                     require(File(hz.path).length() == hz.width.toLong() * hz.height * HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL)
+                     val ready = "size=${hz.width}x${hz.height} origin=${hz.originX},${hz.originY} " +
+                         "full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} frames=${hz.frames} " +
+-                        "activePct=${hz.activePct} strongDetailPct=${hz.fullColorPct} phaseMean=${hz.phaseMean} phaseP10=${hz.phaseP10} " +
++                        "activePct=${hz.activePct} fullColorPct=${hz.fullColorPct} phaseMean=${hz.phaseMean} phaseP10=${hz.phaseP10} " +
+                         "refineAcceptedPct=${hz.refineAcceptedPct} ms=${hz.reconstructionMs} " +
+-                        "lumaDetailOwner=DIRECT_CFA_TEMPORAL nativeSabreVgnChromaOwner=true directChromaOwner=false " +
+-                        "sameMaterialTopology=true realGuideColorPreserved=true highlightOwnerUnchanged=true"
++                        "rgbOwner=DIRECT_CFA_WITH_NATIVE_SABRE_VGN_LOCAL_FALLBACK highlightOwnerUnchanged=true"
+                     PLog.i(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_RGB_READY $ready")
+                     MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_READY", ready)
+                 } else {
+@@ -13796,12 +13795,11 @@ internal class GlesMgcRawSpatialStacker(
+         val activePct=(100.0*active.toDouble()/expectedPixels.toDouble()).toFloat()
+         val fullColorPct=(100.0*fullColor.toDouble()/expectedPixels.toDouble()).toFloat()
+         val phaseStats=true2xPhaseStats(phaseHistogram)
+-        val proof="pixels=$expectedPixels active=$active activePct=$activePct strongDetail=$fullColor strongDetailPct=$fullColorPct " +
++        val proof="pixels=$expectedPixels active=$active activePct=$activePct fullColor=$fullColor fullColorPct=$fullColorPct " +
+             "phaseMean=${phaseStats.mean} phaseP10=${phaseStats.p10} temporalRejected=${reasonHistogram[3]} " +
+-            "highlightRejected=${reasonHistogram[4]} materialOrAgreementRejected=${reasonHistogram[5]} phaseRejected=${reasonHistogram[6]} " +
+-            "signalRejected=${reasonHistogram[7]} fallbackOther=${reasonHistogram[0]} " +
+-            "lumaDetailOwner=DIRECT_CFA_TEMPORAL nativeSabreVgnChromaOwner=true directChromaOwner=false " +
+-            "sameMaterialTopology=true realGuideColorPreserved=true rawRewrite=false shortHighlightOwnerUnchanged=true"
++            "highlightRejected=${reasonHistogram[4]} chromaOrAgreementRejected=${reasonHistogram[5]} phaseRejected=${reasonHistogram[6]} " +
++            "signalRejected=${reasonHistogram[7]} fallbackOther=${reasonHistogram[0]} rgbOwner=DIRECT_CFA_WITH_NATIVE_SABRE_VGN_LOCAL_FALLBACK " +
++            "rawRewrite=false shortHighlightOwnerUnchanged=true"
+         PLog.i(SABRE_TAG,"IRIS_26720_HIGH_ZOOM_RGB_PROOF $proof")
+         MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_PROOF",proof)
+         return HighZoomRgbStats(activePct,fullColorPct,phaseStats)
+diff --git a/app/version.properties b/app/version.properties
+index 8059c0e738136aaad8170ff3bd4c6e323884e1cb..4b8a883dacca196837df077897986744577ce0b8 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726722
+-VERSION_BUILD=26722
++VERSION_NAME=0.9726721
++VERSION_BUILD=26721
