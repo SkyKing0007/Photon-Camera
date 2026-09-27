@@ -1,0 +1,483 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java b/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
+index be5aad4a561fc7ffb5db79ee593ae3c7fc58d115..9f61fb281275d33e58ab54115ef859e0352e8721 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/app/PhotonCamera.java
+@@ -217,6 +217,9 @@ public class PhotonCamera extends Application {
+     public void onCreate() {
+         registerActivityLifecycleCallbacks(new ActivityLifecycleMonitor());
+         sPhotonCamera = this;
++        // IRIS_26716_NATIVE_MEDIASTORE_LOG_INIT: initialize Iris-owned persistent logs from
++        // Application startup, independent of PhotonCamera SAF permission/setup.
++        Log.setLogFolder(this);
+         Log.initProcessDiagnostics(this);
+         Log.critical("PhotonCamera", "IRIS_26544_APPLICATION_ONCREATE_BEGIN");
+         Log.d("PhotonCamera", "Initializing PhotonCamera Modules");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+index f16cae513f3fc92f2c0b0157cd27136c06f050dd..e000fcced96d956432ad504956943b574a855b29 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+@@ -1,18 +1,20 @@
+ package com.particlesdevs.photoncamera.util;
+ 
++import android.content.ContentResolver;
++import android.content.ContentUris;
++import android.content.ContentValues;
+ import android.content.Context;
++import android.database.Cursor;
++import android.net.Uri;
++import android.os.Build;
++import android.os.Environment;
+ import android.os.Handler;
+ import android.os.HandlerThread;
+-
+-import androidx.documentfile.provider.DocumentFile;
+-
+-import com.anggrayudi.storage.file.DocumentFileCompat;
+-import com.anggrayudi.storage.file.DocumentFileType;
+-import com.anggrayudi.storage.file.DocumentFileUtils;
+-import com.anggrayudi.storage.file.StorageId;
++import android.provider.MediaStore;
+ 
+ import java.io.BufferedWriter;
+ import java.io.FileWriter;
++import java.io.OutputStream;
+ import java.io.OutputStreamWriter;
+ import java.text.SimpleDateFormat;
+ import java.util.Locale;
+@@ -24,15 +26,18 @@ public class Log {
+         return "DynamicNoise".equals(tag);
+     }
+ 
+-    /* IRIS_26715_IRIS_OWNED_LOG_DIRECTORY
+-     * Persistent Iris logs live under the system camera tree, independent of the inherited
+-     * PhotonCamera tuning/backup directory. The folder is created automatically on first app
+-     * launch after the existing DCIM SAF grant is available.
++    /* IRIS_26716_NATIVE_MEDIASTORE_IRIS_LOG_OWNER
++     * Persistent Iris logs live under DCIM/Camera/Iris Camera/Logs and are owned directly by
++     * Android MediaStore.Files on Android 10+. This is intentionally independent of PhotonCamera
++     * SAF/backup storage. Android does not execute app code at install time, so the directory is
++     * materialized automatically on the first Iris process launch by creating today's log files.
+      */
+-    private static final String IRIS_LOG_RELATIVE_PATH = "DCIM/Camera/Iris Camera/Logs";
++    private static final String IRIS_LOG_RELATIVE_PATH =
++            Environment.DIRECTORY_DCIM + "/Camera/Iris Camera/Logs/";
+ 
+     private static java.io.File logDir = null;
+-    private static Context logContext = null; // Application context for SimpleStorage
++    private static Context logContext = null; // Application context for Iris-owned storage
++    private static volatile boolean logStorageReady = false;
+     private static final int LOG_RETENTION_DAYS = 10;
+     private static String currentLogFileName = null;
+     private static boolean logEnabled = true;
+@@ -102,67 +107,142 @@ public class Log {
+     }
+ 
+     /**
+-     * Use SimpleStorage to write logs to DCIM/Camera/Iris Camera/Logs.
+-     * Call this when the app has SAF storage access (e.g. from SplashActivity).
++     * Initialize Iris-owned persistent logging. Android 10+ uses MediaStore.Files directly and
++     * never depends on PhotonCamera's SAF tree. Android 9 and below retain direct-file fallback.
+      */
+     public static void setLogFolder(Context context) {
+-        if (context != null) {
+-            logContext = context.getApplicationContext();
++        if (context == null) {
++            closeWriter();
++            closeMotionWriter();
++            logContext = null;
++            logDir = null;
++            logStorageReady = false;
++            return;
++        }
++
++        Context appContext = context.getApplicationContext();
++        if (logContext == appContext && logStorageReady) {
++            return;
++        }
++        if (logContext != appContext) {
++            closeWriter();
++            closeMotionWriter();
++        }
++        logContext = appContext;
++
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+             logDir = null;
+             logHandler.post(() -> {
+-                // IRIS_26715: create Iris Camera/Logs eagerly once the existing DCIM grant exists.
+-                getLogFolderDocumentFile();
++                try {
++                    String today = dateFormatter.get().format(new java.util.Date());
++                    Uri normal = getOrCreateMediaStoreLogUri("log-" + today + ".txt");
++                    Uri motion = getOrCreateMediaStoreLogUri("motion-trace-" + today + ".txt");
++                    if (normal != null && motion != null) {
++                        logStorageReady = true;
++                        android.util.Log.i("IrisLog",
++                                "IRIS_26716_NATIVE_LOG_STORAGE_READY path=" + IRIS_LOG_RELATIVE_PATH);
++                    } else {
++                        logStorageReady = false;
++                        android.util.Log.e("IrisLog",
++                                "IRIS_26716_NATIVE_LOG_STORAGE_INIT_FAIL path=" + IRIS_LOG_RELATIVE_PATH);
++                    }
++                } catch (Throwable t) {
++                    logStorageReady = false;
++                    android.util.Log.e("IrisLog",
++                            "IRIS_26716_NATIVE_LOG_STORAGE_INIT_FAIL path="
++                                    + IRIS_LOG_RELATIVE_PATH, t);
++                }
+                 cleanupOldLogs();
+             });
+         } else {
+-            logContext = null;
+-            closeWriter();
++            java.io.File dcim = Environment.getExternalStoragePublicDirectory(
++                    Environment.DIRECTORY_DCIM);
++            java.io.File folder =
++                    new java.io.File(dcim, "Camera/Iris Camera/Logs");
++            if (!folder.exists() && !folder.mkdirs()) {
++                android.util.Log.e("IrisLog",
++                        "IRIS_26716_LEGACY_LOG_DIRECTORY_CREATE_FAIL path="
++                                + folder.getAbsolutePath());
++                logDir = null;
++                logStorageReady = false;
++            } else {
++                logDir = folder;
++                logStorageReady = true;
++                logHandler.post(Log::cleanupOldLogs);
++            }
+         }
+     }
+ 
+-    /** @deprecated Prefer {@link #setLogFolder(Context)} with SimpleStorage. Kept for fallback. */
++    /** @deprecated Kept only for legacy tests/fallback callers. */
+     @Deprecated
+     public static void setLogFile(java.io.File folder) {
++        closeWriter();
++        closeMotionWriter();
+         if (folder != null && folder.isDirectory()) {
+             logDir = folder;
+             logContext = null;
+-            logHandler.post(() -> cleanupOldLogs());
++            logStorageReady = true;
++            logHandler.post(Log::cleanupOldLogs);
+         } else {
+             logDir = null;
+-            closeWriter();
++            logStorageReady = false;
+         }
+     }
+ 
+-    /** Returns DCIM/Camera/Iris Camera/Logs via SimpleStorage, creating it when authorized. */
+-    private static DocumentFile getLogFolderDocumentFile() {
+-        if (logContext == null || !SimpleStorageHelper.hasStorageAccess(logContext)) {
+-            return null;
+-        }
+-        DocumentFile logFolder = DocumentFileCompat.fromSimplePath(
+-                logContext,
+-                StorageId.PRIMARY,
+-                IRIS_LOG_RELATIVE_PATH,
+-                DocumentFileType.FOLDER,
+-                true);
+-        return logFolder != null && logFolder.exists() && logFolder.isDirectory()
+-                ? logFolder : null;
+-    }
+-
+-    private static DocumentFile getLogFileDocumentFile() {
+-        DocumentFile folder = getLogFolderDocumentFile();
+-        if (folder == null || !folder.isDirectory()) return null;
+-        String today = dateFormatter.get().format(new java.util.Date());
+-        if (currentDate == null || !currentDate.equals(today)) {
+-            currentDate = today;
+-            currentLogFileName = "log-" + today + ".txt";
+-            closeWriter();
++    private static Uri getMediaStoreFilesCollection() {
++        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null;
++        return MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY);
++    }
++
++    /**
++     * Return an app-owned text file in DCIM/Camera/Iris Camera/Logs, creating it through
++     * MediaStore.Files when absent. No PhotonCamera SAF grant is consulted.
++     */
++    private static Uri getOrCreateMediaStoreLogUri(String fileName) {
++        if (logContext == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return null;
++
++        ContentResolver resolver = logContext.getContentResolver();
++        Uri collection = getMediaStoreFilesCollection();
++        if (collection == null) return null;
++
++        String[] projection = { MediaStore.MediaColumns._ID };
++        String selection =
++                MediaStore.MediaColumns.DISPLAY_NAME + "=? AND "
++                        + MediaStore.MediaColumns.RELATIVE_PATH + "=?";
++        String[] args = { fileName, IRIS_LOG_RELATIVE_PATH };
++
++        try (Cursor cursor = resolver.query(collection, projection, selection, args, null)) {
++            if (cursor != null && cursor.moveToFirst()) {
++                long id = cursor.getLong(0);
++                return ContentUris.withAppendedId(collection, id);
++            }
++        } catch (Throwable t) {
++            android.util.Log.w("IrisLog",
++                    "IRIS_26716_MEDIASTORE_QUERY_FAIL file=" + fileName, t);
+         }
+-        DocumentFile file = folder.findFile(currentLogFileName);
+-        if (file != null && file.exists()) {
+-            return file;
++
++        ContentValues values = new ContentValues();
++        values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
++        values.put(MediaStore.MediaColumns.MIME_TYPE, "text/plain");
++        values.put(MediaStore.MediaColumns.RELATIVE_PATH, IRIS_LOG_RELATIVE_PATH);
++
++        try {
++            return resolver.insert(collection, values);
++        } catch (Throwable t) {
++            android.util.Log.e("IrisLog",
++                    "IRIS_26716_MEDIASTORE_INSERT_FAIL file=" + fileName
++                            + " path=" + IRIS_LOG_RELATIVE_PATH, t);
++            return null;
+         }
+-        file = folder.createFile("text/plain", currentLogFileName);
+-        return file;
++    }
++
++    private static BufferedWriter openMediaStoreWriter(String fileName, int bufferSize)
++            throws java.io.IOException {
++        Uri uri = getOrCreateMediaStoreLogUri(fileName);
++        if (uri == null || logContext == null) return null;
++        OutputStream os = logContext.getContentResolver().openOutputStream(uri, "wa");
++        if (os == null) return null;
++        return new BufferedWriter(new OutputStreamWriter(os), bufferSize);
+     }
+ 
+     private static java.io.File getLogFile() {
+@@ -178,31 +258,24 @@ public class Log {
+         return new java.io.File(logDir, currentLogFileName);
+     }
+ 
+-    private static DocumentFile getMotionLogFileDocumentFile() {
+-        DocumentFile folder = getLogFolderDocumentFile();
+-        if (folder == null || !folder.isDirectory()) return null;
+-
+-        String today =
+-                dateFormatter.get().format(new java.util.Date());
++    private static String getCurrentLogFileName() {
++        String today = dateFormatter.get().format(new java.util.Date());
++        if (currentDate == null || !currentDate.equals(today)) {
++            currentDate = today;
++            currentLogFileName = "log-" + today + ".txt";
++            closeWriter();
++        }
++        return currentLogFileName;
++    }
+ 
+-        if (motionCurrentDate == null
+-                || !motionCurrentDate.equals(today)) {
++    private static String getCurrentMotionLogFileName() {
++        String today = dateFormatter.get().format(new java.util.Date());
++        if (motionCurrentDate == null || !motionCurrentDate.equals(today)) {
+             motionCurrentDate = today;
+-            motionLogFileName =
+-                    "motion-trace-" + today + ".txt";
++            motionLogFileName = "motion-trace-" + today + ".txt";
+             closeMotionWriter();
+         }
+-
+-        DocumentFile file =
+-                folder.findFile(motionLogFileName);
+-
+-        if (file != null && file.exists()) {
+-            return file;
+-        }
+-
+-        return folder.createFile(
+-                "text/plain",
+-                motionLogFileName);
++        return motionLogFileName;
+     }
+ 
+     private static void closeMotionWriter() {
+@@ -234,9 +307,7 @@ public class Log {
+ 
+         if (!logEnabled
+                 || motionLogHandler == null
+-                || logContext == null
+-                || !SimpleStorageHelper.hasStorageAccess(
+-                        logContext)) {
++                || (logContext == null && logDir == null)) {
+             return;
+         }
+ 
+@@ -244,28 +315,20 @@ public class Log {
+ 
+         motionLogHandler.post(() -> {
+             try {
+-                DocumentFile file =
+-                        getMotionLogFileDocumentFile();
+-
+-                if (file == null || !file.exists()) {
+-                    return;
+-                }
+-
+                 if (motionBufferedWriter == null) {
+-                    java.io.OutputStream os =
+-                            DocumentFileUtils.openOutputStream(
+-                                    file,
+-                                    logContext,
+-                                    true);
+-
+-                    if (os == null) return;
+-
+-                    motionBufferedWriter =
+-                            new BufferedWriter(
+-                                    new OutputStreamWriter(os),
+-                                    4096);
++                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && logContext != null) {
++                        motionBufferedWriter =
++                                openMediaStoreWriter(getCurrentMotionLogFileName(), 4096);
++                    } else if (logDir != null) {
++                        java.io.File file =
++                                new java.io.File(logDir, getCurrentMotionLogFileName());
++                        motionBufferedWriter =
++                                new BufferedWriter(new FileWriter(file, true), 4096);
++                    }
+                 }
+ 
++                if (motionBufferedWriter == null) return;
++
+                 String time =
+                         timeFormatter.get().format(
+                                 new java.util.Date(timestamp));
+@@ -290,40 +353,59 @@ public class Log {
+     }
+ 
+     private static void cleanupOldLogs() {
+-        if (logContext != null) {
+-            DocumentFile folder = getLogFolderDocumentFile();
+-            if (folder != null && folder.isDirectory()) {
+-                DocumentFile[] files = folder.listFiles();
+-                if (files != null) {
+-                    long now = System.currentTimeMillis();
+-                    long retentionMillis = LOG_RETENTION_DAYS * 24L * 60L * 60L * 1000L;
+-                    for (DocumentFile file : files) {
+-                        if (file != null && file.isFile()) {
+-                            String name = file.getName();
+-                            if (name != null && name.startsWith("log-") && name.endsWith(".txt")) {
+-                                long lastModified = file.lastModified();
+-                                if (lastModified > 0 && now - lastModified > retentionMillis) {
+-                                    file.delete();
+-                                }
+-                            }
+-                        }
++        long now = System.currentTimeMillis();
++        long retentionMillis = LOG_RETENTION_DAYS * 24L * 60L * 60L * 1000L;
++
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && logContext != null) {
++            ContentResolver resolver = logContext.getContentResolver();
++            Uri collection = getMediaStoreFilesCollection();
++            if (collection == null) return;
++
++            String[] projection = {
++                    MediaStore.MediaColumns._ID,
++                    MediaStore.MediaColumns.DISPLAY_NAME,
++                    MediaStore.MediaColumns.DATE_MODIFIED
++            };
++            String selection = MediaStore.MediaColumns.RELATIVE_PATH + "=?";
++            String[] args = { IRIS_LOG_RELATIVE_PATH };
++
++            try (Cursor cursor =
++                         resolver.query(collection, projection, selection, args, null)) {
++                if (cursor == null) return;
++                while (cursor.moveToNext()) {
++                    long id = cursor.getLong(0);
++                    String name = cursor.getString(1);
++                    long modifiedSeconds = cursor.getLong(2);
++                    boolean irisLog =
++                            name != null
++                                    && ((name.startsWith("log-") && name.endsWith(".txt"))
++                                    || (name.startsWith("motion-trace-")
++                                    && name.endsWith(".txt")));
++                    if (irisLog && modifiedSeconds > 0
++                            && now - (modifiedSeconds * 1000L) > retentionMillis) {
++                        resolver.delete(ContentUris.withAppendedId(collection, id),
++                                null, null);
+                     }
+                 }
++            } catch (Throwable t) {
++                android.util.Log.w("IrisLog",
++                        "IRIS_26716_MEDIASTORE_RETENTION_FAIL", t);
+             }
+             return;
+         }
++
+         if (logDir == null) return;
+         java.io.File[] files = logDir.listFiles();
+         if (files == null) return;
+-        long now = System.currentTimeMillis();
+-        long retentionMillis = LOG_RETENTION_DAYS * 24L * 60L * 60L * 1000L;
+         for (java.io.File file : files) {
+-            if (file.isFile() && file.getName().startsWith("log-") && file.getName().endsWith(".txt")) {
+-                long lastModified = file.lastModified();
+-                if (now - lastModified > retentionMillis) {
+-                    //noinspection ResultOfMethodCallIgnored
+-                    file.delete();
+-                }
++            String name = file.getName();
++            boolean irisLog =
++                    file.isFile()
++                            && ((name.startsWith("log-") && name.endsWith(".txt"))
++                            || (name.startsWith("motion-trace-") && name.endsWith(".txt")));
++            if (irisLog && now - file.lastModified() > retentionMillis) {
++                //noinspection ResultOfMethodCallIgnored
++                file.delete();
+             }
+         }
+     }
+@@ -355,21 +437,19 @@ public class Log {
+ 
+     private static void writeToFile(String level, String tag, String message) {
+         if (shouldSkipPersistentSpam(tag, message)) return;
+-        boolean useSimpleStorage = (logContext != null && SimpleStorageHelper.hasStorageAccess(logContext));
++        boolean useMediaStore =
++                (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && logContext != null);
+         if (!logEnabled) return;
+-        if (!useSimpleStorage && logDir == null) return;
++        if (!useMediaStore && logDir == null) return;
+ 
+         long timestamp = System.currentTimeMillis();
+ 
+         logHandler.post(() -> {
+             try {
+-                if (useSimpleStorage) {
+-                    DocumentFile file = getLogFileDocumentFile();
+-                    if (file == null || !file.exists()) return;
++                if (useMediaStore) {
+                     if (bufferedWriter == null) {
+-                        java.io.OutputStream os = DocumentFileUtils.openOutputStream(file, logContext, true);
+-                        if (os == null) return;
+-                        bufferedWriter = new BufferedWriter(new OutputStreamWriter(os), 8192);
++                        bufferedWriter =
++                                openMediaStoreWriter(getCurrentLogFileName(), 8192);
+                     }
+                 } else {
+                     java.io.File file = getLogFile();
+@@ -385,6 +465,8 @@ public class Log {
+                 bufferedWriter.write(logEntry);
+             } catch (Exception e) {
+                 closeWriter();
++                android.util.Log.w("IrisLog",
++                        "IRIS_26716_NATIVE_LOG_WRITE_FAIL", e);
+             }
+         });
+     }
+diff --git a/app/version.properties b/app/version.properties
+index 276e0ab6fa813e6b31e8fa17a8eb87109f4c111d..c8b38b896e6062e6b508dd361e16099ca2a44fa0 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726715
+-VERSION_BUILD=26715
++VERSION_NAME=0.9726716
++VERSION_BUILD=26716
