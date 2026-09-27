@@ -78,6 +78,12 @@ for t in [
 'rawRewrite=false shortHighlightOwnerUnchanged=true']:
  assert t in stack,t
 assert stack.count('uniform1i(program,"uRowFlickerEnabled",if(rowFlickerActive26720)1 else 0)')==1
+# Permanent regression from failed 26720 R1 Actions run 36349907215: Result.exceptionOrNull()
+# is Throwable?, while PLog.e(tag,message,error) requires a non-null Throwable. In the failure
+# branch, prove non-null once before logging and reuse that non-null value.
+assert 'val failure = checkNotNull(rgbAttempt.exceptionOrNull())' in stack
+assert 'reason=${failure.message}", failure)' in stack
+assert 'reason=${failure?.message}", failure)' not in stack
 # Explicit SR reservoir remains separate and high zoom retains all admitted NORMAL evidence.
 for t in ['val true2xFastPhaseSlots: Array<True2xFrameEvidence?>?','val highZoomEvidence26718 = ArrayList<True2xFrameEvidence>()','existingPhaseEvidence = null','refineForHighZoom26718 = true','enableSabreSuperRes && enableHighZoomDetail']:
  assert t in stack,t

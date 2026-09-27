@@ -3195,10 +3195,10 @@ internal class GlesMgcRawSpatialStacker(
                     PLog.i(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_RGB_READY $ready")
                     MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_READY", ready)
                 } else {
-                    val failure = rgbAttempt.exceptionOrNull()
-                    PLog.e(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_RGB_FALLBACK_26719 reason=${failure?.message}", failure)
+                    val failure = checkNotNull(rgbAttempt.exceptionOrNull())
+                    PLog.e(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_RGB_FALLBACK_26719 reason=${failure.message}", failure)
                     MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_FALLBACK_26719",
-                        "reason=${failure?.javaClass?.simpleName}:${failure?.message} fallback=NORMAL_SCALAR_2X_LUMA_ROI")
+                        "reason=${failure.javaClass.simpleName}:${failure.message} fallback=NORMAL_SCALAR_2X_LUMA_ROI")
                     highZoomDetailResult = reconstructHighZoomDetail26718(
                         images = images, evidence = reconstructionEvidence,
                         nativeVgnGuideTexture = nativeHdrAuthority26601,
