@@ -1,0 +1,1132 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index a7aec906907756153024d076f879b5ad261cb58b..e83b2aa464ba563d1467e488d47bb83d31c2c139 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -9,6 +9,10 @@ uniform float displayGain;
+ uniform int motionHdrHandoff;
+ uniform float maxGainRatio;
+ uniform float irisOutputZoom;
++/* IRIS_26718_UHDR_HIGH_ZOOM_DETAIL_PARITY */
++uniform sampler2D iris26718HighZoomDetail;
++uniform int iris26718HighZoomDetailEnabled;
++uniform ivec2 iris26718HighZoomDetailOrigin;
+ uniform sampler2D iris26621LocalToneLog;
+ uniform int iris26621LocalToneEnabled;
+ uniform float iris26623ToneBroadNearFraction;
+@@ -265,6 +269,16 @@ vec3 iris26641BilinearSdrLinear(vec2 sourcePixel){
+                srgbDecode(texelFetch(SdrBuffer,ivec2(p1.x,p1.y),0).rgb),f.x);
+     return mix(a,b,f.y);
+ }
++float iris26718HighZoomLogDetail(vec2 sourcePixel){
++    if(iris26718HighZoomDetailEnabled==0)return 0.0;
++    vec2 global2x=(sourcePixel+vec2(0.5))*2.0-vec2(0.5);
++    vec2 local=global2x-vec2(iris26718HighZoomDetailOrigin);
++    ivec2 sz=textureSize(iris26718HighZoomDetail,0);
++    if(any(lessThan(local,vec2(0.0)))||any(greaterThan(local,vec2(sz)-vec2(1.0))))return 0.0;
++    vec2 uv=(local+vec2(0.5))/vec2(sz);
++    return clamp(texture(iris26718HighZoomDetail,uv).r,-0.56,0.56);
++}
++
+ void main(){
+     ivec2 p=ivec2(gl_FragCoord.xy);
+     if(any(greaterThanEqual(p,gainMapSize))){Output=0.0;return;}
+@@ -281,6 +295,9 @@ void main(){
+         masterSourcePixel=center+(sourcePixel-center)/zoom;
+         hdrRgb=iris26524BilinearHdr(masterSourcePixel);
+     }
++    if(iris26718HighZoomDetailEnabled!=0){
++        hdrRgb=max(hdrRgb*exp2(iris26718HighZoomLogDetail(masterSourcePixel)),vec3(0.0));
++    }
+     vec3 hdrPositive=max(hdrRgb,vec3(0.0));
+     float sdr=motionHdrHandoff!=0
+         ? max(luminance(iris26641BilinearSdrLinear(sourcePixel)),0.0)
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 8127aa6217f6947602fe7ac483cabd03e918172f..c31ca73642ab16072d1cb3ce7f1104a20bb563a3 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -5,6 +5,10 @@ uniform sampler2D InputBuffer;
+ uniform float sceneWhite;
+ uniform float outputExposureScale;
+ uniform float irisOutputZoom;
++/* IRIS_26718_FINAL_SAMPLE_HIGH_ZOOM_DETAIL */
++uniform sampler2D iris26718HighZoomDetail;
++uniform int iris26718HighZoomDetailEnabled;
++uniform ivec2 iris26718HighZoomDetailOrigin;
+ uniform int iris26592MotionHdrHandoff;
+ uniform float displayGain;
+ uniform sampler2D iris26621LocalToneLog;
+@@ -446,6 +450,20 @@ vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
+     return clamp(vec3(y)+chroma*min(requestedGain,limit),vec3(0.0),vec3(1.0));
+ }
+ 
++/* IRIS_26718_HIGH_ZOOM_DETAIL_SAMPLE
++ * The sidecar is a centered subset of the global true-2x sensor lattice. It carries only signed
++ * log2 luminance detail; zero and out-of-bounds are exact no-ops.
++ */
++float iris26718HighZoomLogDetail(vec2 sourcePixel){
++    if(iris26718HighZoomDetailEnabled==0)return 0.0;
++    vec2 global2x=(sourcePixel+vec2(0.5))*2.0-vec2(0.5);
++    vec2 local=global2x-vec2(iris26718HighZoomDetailOrigin);
++    ivec2 sz=textureSize(iris26718HighZoomDetail,0);
++    if(any(lessThan(local,vec2(0.0)))||any(greaterThan(local,vec2(sz)-vec2(1.0))))return 0.0;
++    vec2 uv=(local+vec2(0.5))/vec2(sz);
++    return clamp(texture(iris26718HighZoomDetail,uv).r,-0.56,0.56);
++}
++
+ void main() {
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+     ivec2 sourceSize=textureSize(InputBuffer,0);
+@@ -467,6 +485,9 @@ void main() {
+         sourceXY=ivec2(clamp(floor(sourcePixel+vec2(0.5)),
+                             vec2(0.0),vec2(sourceSize-ivec2(1))));
+     }
++    if(iris26718HighZoomDetailEnabled!=0){
++        linearSrgb=max(linearSrgb*exp2(iris26718HighZoomLogDetail(sourcePixel)),vec3(0.0));
++    }
+ 
+     /* IRIS_26559_REMOVE_SHARED_MICROCONTRAST_HALO
+      * Do not apply the legacy 5x5 local-luma contrast multiplier here. Sabre remains
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+index 62ed626b46a8914a41451b34f6856736a3138e44..df0949f2c8efe79436acbaafa49eac4d3ac59c02 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+@@ -33,6 +33,8 @@ internal class GlesIris26545SabreProcessor(
+     private val preserveExtendedHdrThroughVgn: Boolean = false,
+     private val enableSuperRes: Boolean = false,
+     private val superResTempDir: File? = null,
++    private val enableHighZoomDetail: Boolean = false,
++    private val highZoomSourceZoom: Float = 1f,
+     /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT: no acquisition authority. */
+     private val referenceProtectionEv: Float = 0f,
+ ) {
+@@ -93,7 +95,8 @@ internal class GlesIris26545SabreProcessor(
+                 "allowShadowLong=$allowShadowLong preserveExtendedHdrThroughVgn=$preserveExtendedHdrThroughVgn " +
+                 "excluded=${excluded.size} normalMergeOwner=true shortReferenceImmutable=true " +
+                 "spatial=false bento=false output=linear-rgb " +
+-                "superRes=$enableSuperRes srEvidence=NORMAL_ONLY shortContribution=NORMAL_ACCUMULATOR_EXCLUDED",
++                "superRes=$enableSuperRes highZoomDetail=$enableHighZoomDetail highZoomSourceZoom=$highZoomSourceZoom " +
++                "srEvidence=NORMAL_ONLY shortContribution=NORMAL_ACCUMULATOR_EXCLUDED",
+         )
+         /* IRIS_26545_V1_2_SABRE_LOW_LEVEL_ISOLATION
+          * Match bjzhou's current Sabre architecture: the shared low-level GL class is used only
+@@ -125,6 +128,8 @@ internal class GlesIris26545SabreProcessor(
+                 exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F,
+             enableSabreSuperRes = enableSuperRes,
+             sabreSuperResTempDir = superResTempDir,
++            enableHighZoomDetail = enableHighZoomDetail,
++            highZoomSourceZoom = highZoomSourceZoom,
+             referenceProtectionEv = referenceProtectionEv,
+         ).processFrames(admitted)
+     }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index 1b2de3eb0f0b912d5bc606a282d1a58c22b74619..cd2fd8a6803aa80046c417d3ce32cfadb3854014 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -30,6 +30,11 @@ internal class GlesMgcRawFusion(
+     private val vgnChromaCorrectionStrength: Float = 1f,
+     private val enableSabreSuperRes: Boolean = false,
+     private val sabreSuperResTempDir: File? = null,
++    /* IRIS_26718_NORMAL_HIGH_ZOOM_DETAIL_TRANSPORT
++     * Independent of the user Super Res switch. Native Sabre RGB remains the color owner.
++     */
++    private val enableHighZoomDetail: Boolean = false,
++    private val highZoomSourceZoom: Float = 1f,
+     /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT: downstream fusion context only. */
+     private val referenceProtectionEv: Float = 0f,
+ ) {
+@@ -60,6 +65,8 @@ internal class GlesMgcRawFusion(
+             preserveExtendedHdrThroughVgn = preserveExtendedHdrThroughVgn,
+             enableSuperRes = enableSabreSuperRes,
+             superResTempDir = sabreSuperResTempDir,
++            enableHighZoomDetail = enableHighZoomDetail,
++            highZoomSourceZoom = highZoomSourceZoom,
+             referenceProtectionEv = referenceProtectionEv,
+         ).processFrames(frames)
+     }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 1a0b95c9abc70d7dac6971896908693270186b5b..8c4a465e3dd909a7046c4315c5f642201f2c8fa3 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -4878,6 +4878,142 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26718_HIGH_ZOOM_SCALAR_MERGE
++     * Reuse the proven direct-CFA RBF sampler only to derive per-frame luminance moments and
++     * fractional-flow phase occupancy. No high-resolution R/G/B carrier is accumulated.
++     */
++    val highZoomDetailMerge26718: String = true2xMerge26564
++        .replace(
++            "layout(location = 0) out vec4 oColorAndRWeight;\n        layout(location = 1) out vec2 oWeightsGb;\n        layout(location = 2) out vec4 oPhaseOccupancy;\n        layout(location = 3) out vec4 oTemporalLumaStats;",
++            "layout(location = 0) out vec4 oTemporalLumaStats;\n        layout(location = 1) out vec4 oPhaseOccupancy;",
++        )
++        .replace(
++            "            color *= frameWeight;\n            weights *= frameWeight;\n            oColorAndRWeight = vec4(color, weights.r);\n            oWeightsGb = weights.gb;\n\n",
++            "",
++        )
++        .also { source ->
++            check(source.contains("layout(location = 0) out vec4 oTemporalLumaStats;"))
++            check(source.contains("layout(location = 1) out vec4 oPhaseOccupancy;"))
++            check(!source.contains("oColorAndRWeight"))
++            check(!source.contains("oWeightsGb"))
++        }
++
++    /* IRIS_26718_HIGH_ZOOM_DETAIL_RESOLVE
++     * Build only a support-gated, zero-DC 2x2 luminance residual from cross-frame moments.
++     * Native Sabre/VGN is sampled solely as the low-frequency luminance guide and remains the
++     * only RGB/chroma/highlight authority. Unsafe evidence resolves to exact zero detail.
++     */
++    val highZoomDetailResolve26718 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uTemporalLumaStats;
++        uniform sampler2D uPhaseOccupancy;
++        uniform sampler2D uNativeVgnGuide;
++        uniform ivec2 uOutputOrigin;
++        uniform ivec2 uOutputFullSize;
++        uniform ivec2 uGuideSize;
++        layout(location = 0) out vec4 oDetailAndDiagnostic;
++
++        float irisSmooth01(float x) {
++            float t=clamp(x,0.0,1.0);
++            return t*t*(3.0-2.0*t);
++        }
++        float irisLuma(vec3 v) { return 0.25*v.r+0.50*v.g+0.25*v.b; }
++        float irisGuideY(ivec2 globalP) {
++            vec2 s=clamp((vec2(globalP)+vec2(0.5))*0.5-vec2(0.5),
++                         vec2(0.0),vec2(uGuideSize-ivec2(1)));
++            ivec2 p0=ivec2(floor(s));
++            ivec2 p1=min(p0+ivec2(1),uGuideSize-ivec2(1));
++            vec2 f=s-vec2(p0);
++            float a=irisLuma(texelFetch(uNativeVgnGuide,p0,0).rgb);
++            float b=irisLuma(texelFetch(uNativeVgnGuide,ivec2(p1.x,p0.y),0).rgb);
++            float c=irisLuma(texelFetch(uNativeVgnGuide,ivec2(p0.x,p1.y),0).rgb);
++            float d=irisLuma(texelFetch(uNativeVgnGuide,p1,0).rgb);
++            return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
++        }
++        int irisPhaseCount(ivec2 localP) {
++            vec4 phases=texelFetch(uPhaseOccupancy,localP,0);
++            return (phases.r>0.0?1:0)+(phases.g>0.0?1:0)+
++                   (phases.b>0.0?1:0)+(phases.a>0.0?1:0);
++        }
++        float irisMeanY(ivec2 localP) {
++            vec4 m=texelFetch(uTemporalLumaStats,localP,0);
++            return m.z>0.08 ? max(m.x/m.z,0.0) : 0.0;
++        }
++        float irisTemporalAgreement(ivec2 localP) {
++            vec4 m=texelFetch(uTemporalLumaStats,localP,0);
++            float sumW=max(m.z,0.0), sumW2=max(m.w,0.0);
++            if(sumW<=0.08||sumW2<=1.0e-6)return 0.0;
++            float meanY=m.x/sumW;
++            float varianceY=max(m.y/sumW-meanY*meanY,0.0);
++            float effectiveN=(sumW*sumW)/max(sumW2,1.0e-6);
++            float supportGate=irisSmooth01((effectiveN-1.50)/1.50);
++            float relativeSigma=sqrt(varianceY)/max(abs(meanY),0.030);
++            float stabilityGate=1.0-irisSmooth01((relativeSigma-0.060)/0.120);
++            return clamp(supportGate*stabilityGate,0.0,1.0);
++        }
++        void main() {
++            ivec2 localP=ivec2(gl_FragCoord.xy);
++            ivec2 globalP=uOutputOrigin+localP;
++            ivec2 globalBlock=(globalP/2)*2;
++            ivec2 block=globalBlock-uOutputOrigin;
++            ivec2 q00=block;
++            ivec2 q10=block+ivec2(1,0);
++            ivec2 q01=block+ivec2(0,1);
++            ivec2 q11=block+ivec2(1,1);
++            ivec2 cell=globalP-globalBlock;
++
++            float y00=irisMeanY(q00), y10=irisMeanY(q10);
++            float y01=irisMeanY(q01), y11=irisMeanY(q11);
++            float directY=cell.y==0 ? (cell.x==0?y00:y10) : (cell.x==0?y01:y11);
++            float lowY=max(0.25*(y00+y10+y01+y11),0.0);
++            float guideY=max(irisGuideY(globalP),0.0);
++            float guideBlockY=max(irisGuideY(globalBlock),0.0);
++
++            int p00=irisPhaseCount(q00), p10=irisPhaseCount(q10);
++            int p01=irisPhaseCount(q01), p11=irisPhaseCount(q11);
++            int phaseCount=cell.y==0 ? (cell.x==0?p00:p10) : (cell.x==0?p01:p11);
++            int blockPhaseCount=min(min(p00,p10),min(p01,p11));
++            float phaseGate=blockPhaseCount>=4?1.0:(blockPhaseCount==3?0.85:(blockPhaseCount==2?0.50:0.0));
++            float temporalGate=min(min(irisTemporalAgreement(q00),irisTemporalAgreement(q10)),
++                                   min(irisTemporalAgreement(q01),irisTemporalAgreement(q11)));
++            float signalGate=irisSmooth01((guideBlockY-0.015)/0.055);
++            float agreement=abs(log2((lowY+0.01)/(guideBlockY+0.01)));
++            float agreementGate=1.0-irisSmooth01((agreement-0.08)/0.27);
++
++            float g00=irisGuideY(globalBlock);
++            float g10=irisGuideY(globalBlock+ivec2(1,0));
++            float g01=irisGuideY(globalBlock+ivec2(0,1));
++            float g11=irisGuideY(globalBlock+ivec2(1,1));
++            float guideMin=min(min(g00,g10),min(g01,g11));
++            float guideMax=max(max(g00,g10),max(g01,g11));
++            float guideRange=(guideMax-guideMin)/max(guideBlockY,0.015);
++            float edgeConservatism=irisSmooth01((guideRange-0.10)/0.45);
++            float detailBound=mix(0.30,0.14,edgeConservatism);
++
++            float denom=max(lowY,0.015);
++            float d00=(y00-lowY)/denom, d10=(y10-lowY)/denom;
++            float d01=(y01-lowY)/denom, d11=(y11-lowY)/denom;
++            float directDetail=cell.y==0 ? (cell.x==0?d00:d10) : (cell.x==0?d01:d11);
++            float maxAbs=max(max(abs(d00),abs(d10)),max(abs(d01),abs(d11)));
++            float shapeScale=maxAbs>1.0e-6 ? min(1.0,detailBound/maxAbs) : 0.0;
++            float confidence=clamp(phaseGate*temporalGate*signalGate*agreementGate,0.0,1.0);
++            float boundedDetail=directDetail*shapeScale*confidence;
++            float factor=max(1.0+boundedDetail,0.68);
++            float logDetail=confidence>0.02 ? clamp(log2(factor),-0.56,0.56) : 0.0;
++
++            int reasonClass=0;
++            if(blockPhaseCount<2)reasonClass=6;
++            else if(temporalGate<=0.02)reasonClass=3;
++            else if(agreementGate<=0.02)reasonClass=5;
++            else if(signalGate<=0.02)reasonClass=7;
++            else if(confidence>=0.50)reasonClass=2;
++            else if(confidence>0.02)reasonClass=1;
++            oDetailAndDiagnostic=vec4(logDetail,float(phaseCount*8+reasonClass),guideY,1.0);
++        }
++    """.trimIndent()
++
+     private val outputTransformBody = """
+         precision highp float;
+         precision highp int;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 42ff5c2413d4f5b26d957d2f7665a92542aa50d6..f4138ce73621125b2221570821add5730c652716 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -100,6 +100,9 @@ internal class GlesMgcRawSpatialStacker(
+     private val preserveExtendedHdrThroughVgn: Boolean = false,
+     private val enableSabreSuperRes: Boolean = false,
+     private val sabreSuperResTempDir: File? = null,
++    /* IRIS_26718_NORMAL_HIGH_ZOOM_DETAIL_OWNER */
++    private val enableHighZoomDetail: Boolean = false,
++    private val highZoomSourceZoom: Float = 1f,
+     /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT
+      * Read-only selected-reference protection metadata; never writes capture state. */
+     private val referenceProtectionEv: Float = 0f,
+@@ -175,6 +178,28 @@ internal class GlesMgcRawSpatialStacker(
+         val useFrameWeight: Boolean,
+         val dominantPhaseBin: Int,
+         val qualityScore: Float,
++        val refineAcceptedPct: Float = 0f,
++    )
++
++    private data class HighZoomDetailResult(
++        val path: String,
++        val width: Int,
++        val height: Int,
++        val originX: Int,
++        val originY: Int,
++        val fullWidth: Int,
++        val fullHeight: Int,
++        val sourceZoom: Float,
++        val activePct: Float,
++        val strongPct: Float,
++        val refineAcceptedPct: Float,
++        val frames: Int,
++        val reconstructionMs: Long,
++    )
++
++    private data class HighZoomDetailStats(
++        val activePct: Float,
++        val strongPct: Float,
+     )
+ 
+     private data class True2xPhaseStats(
+@@ -587,6 +612,8 @@ internal class GlesMgcRawSpatialStacker(
+     private var true2xFlowRefineProgram26574 = 0
+     private var true2xResolveProgram26564 = 0
+     private var true2xGuideRenderProgram26568 = 0
++    private var highZoomDetailMergeProgram26718 = 0
++    private var highZoomDetailResolveProgram26718 = 0
+     private var sabreShadowLongMergeProgram = 0
+     private var sabreShadowLongCopyMaskProgram = 0
+     private var sabreNormalDngMergeProgram = 0
+@@ -2180,14 +2207,24 @@ internal class GlesMgcRawSpatialStacker(
+         var superResDetailPath: String? = null
+         var superResLinearRawPath: String? = null
+         var true2xResult: True2xResult? = null
++        var highZoomDetailResult: HighZoomDetailResult? = null
+         val true2xEvidence = ArrayList<True2xFrameEvidence>()
+         /* IRIS_26568_JPEG_TRUE2X_PHASE_RESERVOIR
+          * DNG requests retain the exact full 26567 NORMAL evidence population. JPEG-only SR keeps
+          * the best two accepted frames per global phase (max 8). The strongest 26567 member of
+          * every phase is therefore preserved while a second observation can add local phase/SNR.
+          */
++        require(!(enableSabreSuperRes && enableHighZoomDetail)) {
++            "26718 Super Res and normal high-zoom detail are mutually exclusive reconstruction routes"
++        }
+         val true2xFastPhaseSlots: Array<True2xFrameEvidence?>? =
+             if (enableSabreSuperRes && !exportNormalStackedDng) arrayOfNulls(TRUE2X_JPEG_MAX_EVIDENCE) else null
++        /* IRIS_26718_HIGH_ZOOM_ALL_NORMAL_EVIDENCE
++         * Normal high zoom retains every admitted NORMAL observation. This route deliberately does
++         * not inherit Super Res JPEG's top-two-per-phase reservoir or publication policy. SHORT/LONG
++         * remain excluded from high-zoom detail evidence; native Sabre/VGN stays the RGB authority.
++         */
++        val highZoomEvidence26718 = ArrayList<True2xFrameEvidence>()
+         var exportedTexture = 0
+         /* IRIS_26604_CONTINUOUS_ONE_TUNNEL_TELEMETRY
+          * No private SHORT texture, mask, mean or accumulator survives. These legacy-named booleans
+@@ -2220,10 +2257,20 @@ internal class GlesMgcRawSpatialStacker(
+             val extractedHeight = ceilDiv(height, 2)
+             val superResWidth = if (enableSabreSuperRes) width * 2 else 0
+             val superResHeight = if (enableSabreSuperRes) height * 2 else 0
+-            if (enableSabreSuperRes) {
++            if (enableSabreSuperRes || enableHighZoomDetail) {
+                 requireNotNull(sabreSuperResTempDir) {
+-                    "26564 true 2x Sabre Super Res requires a temp directory"
++                    "26718 true2x evidence requires a temp directory"
++                }
++            }
++            if (enableHighZoomDetail) {
++                require(highZoomSourceZoom.isFinite() && highZoomSourceZoom > 1f) {
++                    "26718 invalid high-zoom source zoom=$highZoomSourceZoom"
++                }
++                require(exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
++                    "26718 high-zoom detail requires the proven Sabre RGBA16F post-VGN carrier"
+                 }
++            }
++            if (enableSabreSuperRes) {
+                 /* The CPU fallback applies only to the new reconstruction stage. Native Sabre/VGN
+                  * remains the proven GPU owner and supplies the low-frequency chroma guide.
+                  */
+@@ -2458,6 +2505,25 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+                 if (true2xFastPhaseSlots == null) true2xEvidence += referenceEvidence
+             }
++            if (enableHighZoomDetail) {
++                highZoomEvidence26718 += persistTrue2xEvidence(
++                    frameIndex = 0,
++                    calibration = referenceCalibration,
++                    flow = zeroFlow,
++                    covariance = referenceCovariance,
++                    rejection = identityWeight,
++                    covarianceWidth = extractedWidth,
++                    covarianceHeight = extractedHeight,
++                    rejectionWidth = coverageWidth,
++                    rejectionHeight = coverageHeight,
++                    useFrameWeight = false,
++                    existingPhaseEvidence = null,
++                    referenceRawTexture = referenceRaw,
++                    currentRawTexture = referenceRaw,
++                    referenceCalibration = referenceCalibration,
++                    refineForHighZoom26718 = false,
++                )
++            }
+             if (normalDngAccumulator != 0) {
+                 renderSabreNormalDngMerge(
+                     raw = referenceRaw,
+@@ -2677,6 +2743,25 @@ internal class GlesMgcRawSpatialStacker(
+                     )
+                     if (true2xFastPhaseSlots == null) true2xEvidence += candidateEvidence
+                 }
++                if (enableHighZoomDetail && frame.role == RawBurstFrameRole.NORMAL) {
++                    highZoomEvidence26718 += persistTrue2xEvidence(
++                        frameIndex = index,
++                        calibration = calibration,
++                        flow = flow,
++                        covariance = currentCovariance,
++                        rejection = frameWeight,
++                        covarianceWidth = extractedWidth,
++                        covarianceHeight = extractedHeight,
++                        rejectionWidth = coverageWidth,
++                        rejectionHeight = coverageHeight,
++                        useFrameWeight = true,
++                        existingPhaseEvidence = null,
++                        referenceRawTexture = referenceRaw,
++                        currentRawTexture = currentRaw,
++                        referenceCalibration = referenceCalibration,
++                        refineForHighZoom26718 = true,
++                    )
++                }
+                 if (normalDngAccumulator != 0 && frame.role == RawBurstFrameRole.NORMAL) {
+                     renderSabreNormalDngMerge(
+                         raw = currentRaw,
+@@ -3053,6 +3138,30 @@ internal class GlesMgcRawSpatialStacker(
+                 PLog.i(SABRE_TAG, "IRIS_26651_FUSION_OUTPUT_PRESERVED $details26648")
+                 MotionTrace.processingState("IRIS_26651_FUSION_OUTPUT_PRESERVED", details26648)
+             }
++            if (enableHighZoomDetail) {
++                val reconstructionEvidence = highZoomEvidence26718.toList()
++                require(reconstructionEvidence.isNotEmpty()) { "26718 high-zoom has no NORMAL evidence" }
++                val evidencePolicy = "retained=${reconstructionEvidence.size} allAdmittedNormal=true " +
++                    "srReservoirIndependent=true normalOnly=true shortDetailEvidence=false longDetailEvidence=false"
++                PLog.i(SABRE_TAG, "IRIS_26718_HIGH_ZOOM_EVIDENCE_POLICY $evidencePolicy")
++                MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_EVIDENCE_POLICY", evidencePolicy)
++                highZoomDetailResult = reconstructHighZoomDetail26718(
++                    images = images, evidence = reconstructionEvidence,
++                    nativeVgnGuideTexture = nativeHdrAuthority26601,
++                )
++                val hz = checkNotNull(highZoomDetailResult)
++                require(File(hz.path).length() == hz.width.toLong() * hz.height * Short.SIZE_BYTES) {
++                    "26718 high-zoom R16F sidecar size mismatch"
++                }
++                val ready = "size=${hz.width}x${hz.height} origin=${hz.originX},${hz.originY} " +
++                    "full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} frames=${hz.frames} " +
++                    "activePct=${hz.activePct} strongPct=${hz.strongPct} refineAcceptedPct=${hz.refineAcceptedPct} " +
++                    "ms=${hz.reconstructionMs} rgbOwner=NATIVE_SABRE_VGN detailOwner=NORMAL_SCALAR_2X_LUMA_ROI"
++                PLog.i(SABRE_TAG, "IRIS_26718_HIGH_ZOOM_DETAIL_READY $ready")
++                MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_DETAIL_READY", ready)
++                cleanupTrue2xEvidence(reconstructionEvidence)
++                highZoomEvidence26718.clear()
++            }
+             if (enableSabreSuperRes) {
+                 val reconstructionStartNs=System.nanoTime()
+                 val reconstructionEvidence=true2xFastPhaseSlots?.filterNotNull()?:true2xEvidence
+@@ -3184,6 +3293,19 @@ internal class GlesMgcRawSpatialStacker(
+                 true2xPhaseSupportMean = true2xResult?.phaseSupportMean ?: 0f,
+                 true2xPhaseSupportP10 = true2xResult?.phaseSupportP10 ?: 0f,
+                 true2xReconstructionMs = true2xResult?.reconstructionMs ?: 0L,
++                highZoomDetailPath = highZoomDetailResult?.path,
++                highZoomDetailWidth = highZoomDetailResult?.width ?: 0,
++                highZoomDetailHeight = highZoomDetailResult?.height ?: 0,
++                highZoomDetailOriginX = highZoomDetailResult?.originX ?: 0,
++                highZoomDetailOriginY = highZoomDetailResult?.originY ?: 0,
++                highZoomDetailFullWidth = highZoomDetailResult?.fullWidth ?: 0,
++                highZoomDetailFullHeight = highZoomDetailResult?.fullHeight ?: 0,
++                highZoomDetailSourceZoom = highZoomDetailResult?.sourceZoom ?: 1f,
++                highZoomDetailActivePct = highZoomDetailResult?.activePct ?: 0f,
++                highZoomDetailStrongPct = highZoomDetailResult?.strongPct ?: 0f,
++                highZoomRefineAcceptedPct = highZoomDetailResult?.refineAcceptedPct ?: 0f,
++                highZoomDetailFrames = highZoomDetailResult?.frames ?: 0,
++                highZoomDetailReconstructionMs = highZoomDetailResult?.reconstructionMs ?: 0L,
+             )
+         } catch (error: Exception) {
+             PLog.e(SABRE_TAG, "MGC Sabre merge failed", error)
+@@ -3195,6 +3317,8 @@ internal class GlesMgcRawSpatialStacker(
+             LargeDirectBuffer.free(sabreAccumulatedReadback)
+             LargeDirectBuffer.free(sabreResolvedRgb)
+             cleanupTrue2xEvidence(true2xEvidence)
++            cleanupTrue2xEvidence(highZoomEvidence26718)
++            highZoomEvidence26718.clear()
+             if (!returned) {
+                 runCatching { true2xResult?.linearRgbPath?.let { File(it).delete() } }
+                 runCatching { true2xResult?.renderRgbPath?.let { File(it).delete() } }
+@@ -3202,6 +3326,7 @@ internal class GlesMgcRawSpatialStacker(
+                 runCatching { true2xResult?.phaseSupportPath?.takeIf { it.isNotEmpty() }?.let { File(it).delete() } }
+                 runCatching { superResDetailPath?.let { File(it).delete() } }
+                 runCatching { superResLinearRawPath?.let { File(it).delete() } }
++                runCatching { highZoomDetailResult?.path?.let { File(it).delete() } }
+                 LargeDirectBuffer.free(cpuOutput)
+                 LargeDirectBuffer.free(normalStackedDngRaw16)
+                 if (exportedTexture != 0) {
+@@ -12309,6 +12434,7 @@ internal class GlesMgcRawSpatialStacker(
+         referenceRawTexture: Int,
+         currentRawTexture: Int,
+         referenceCalibration: FrameCalibration,
++        refineForHighZoom26718: Boolean = false,
+     ): True2xFrameEvidence {
+         val directory = checkNotNull(sabreSuperResTempDir) { "True2x temp directory is absent" }
+         require(directory.exists() || directory.mkdirs()) { "Unable to create ${directory.absolutePath}" }
+@@ -12359,13 +12485,14 @@ internal class GlesMgcRawSpatialStacker(
+         var persistedFlowOffsetY = flow.offsetY
+         var persistedMaxX = selectionMaxX
+         var persistedMaxY = selectionMaxY
++        var persistedRefineAcceptedPct = 0f
+         /* IRIS_26574_JPEG_RETAINED_FLOW_REFINEMENT_ONLY
+          * Selection remains the exact 26568 global top-two-per-phase contract. Only after a frame
+          * wins that bounded JPEG reservoir do we spend work on local SR alignment. DNG/full-evidence
+          * mode is byte-semantically the 26573 sparse-flow path. Any GL/refinement failure keeps the
+          * exact sparse flow rather than failing capture or introducing an unaligned fallback.
+          */
+-        if (existingPhaseEvidence != null && frameIndex != 0) {
++        if ((existingPhaseEvidence != null || refineForHighZoom26718) && frameIndex != 0) {
+             runCatching {
+                 val refinedFlow = renderTrue2xFlowRefinement26574(
+                     referenceRawTexture = referenceRawTexture,
+@@ -12391,17 +12518,22 @@ internal class GlesMgcRawSpatialStacker(
+                     persistedFlowOffsetY = refinedFlow.offsetY
+                     persistedMaxX = refinedMaxX
+                     persistedMaxY = refinedMaxY
++                    persistedRefineAcceptedPct = refineStats.third
+                     LargeDirectBuffer.free(previousFlowData)
+                     val details = "frame=$frameIndex phase=$phaseBin accepted=${refineStats.first}/${refineStats.second} " +
+                         "acceptedPct=${refineStats.third} deltaBoundRawPx=0.5"
+-                    PLog.i(SABRE_TAG, "IRIS_26574_TRUE2X_FLOW_REFINE $details")
+-                    MotionTrace.processingState("IRIS_26574_TRUE2X_FLOW_REFINE", details)
++                    val refineMarker = if (refineForHighZoom26718)
++                        "IRIS_26718_HIGH_ZOOM_FLOW_REFINE" else "IRIS_26574_TRUE2X_FLOW_REFINE"
++                    PLog.i(SABRE_TAG, "$refineMarker $details")
++                    MotionTrace.processingState(refineMarker, details)
+                 } finally {
+                     LargeDirectBuffer.free(refinedDataToFree)
+                     runCatching { releaseOwnedTexture(refinedFlow.texture, "IRIS26574 true2x refined flow") }
+                 }
+             }.onFailure { error ->
+-                PLog.e(SABRE_TAG, "IRIS_26574_TRUE2X_FLOW_REFINE_FALLBACK frame=$frameIndex reason=${error.message}", error)
++                val refineMarker = if (refineForHighZoom26718)
++                    "IRIS_26718_HIGH_ZOOM_FLOW_REFINE_FALLBACK" else "IRIS_26574_TRUE2X_FLOW_REFINE_FALLBACK"
++                PLog.e(SABRE_TAG, "$refineMarker frame=$frameIndex reason=${error.message}", error)
+             }
+         }
+ 
+@@ -12438,6 +12570,7 @@ internal class GlesMgcRawSpatialStacker(
+             useFrameWeight = useFrameWeight,
+             dominantPhaseBin = phaseBin,
+             qualityScore = quality,
++            refineAcceptedPct = persistedRefineAcceptedPct,
+         )
+         if (existingPhaseEvidence != null) {
+             val slot = phaseBin * TRUE2X_JPEG_EVIDENCE_PER_PHASE + retainedRank
+@@ -13197,6 +13330,216 @@ internal class GlesMgcRawSpatialStacker(
+         return phaseStats
+     }
+ 
++    private fun writeHighZoomDetailTile26718(
++        output: RandomAccessFile,
++        texture: Int,
++        left: Int,
++        top: Int,
++        tileWidth: Int,
++        tileHeight: Int,
++        fullOutputWidth: Int,
++        phaseHistogram: LongArray,
++        reasonHistogram: LongArray,
++    ) {
++        val rg = allocateTrue2xHostBuffer(
++            Math.multiplyExact(Math.multiplyExact(tileWidth, tileHeight), 4 * Short.SIZE_BYTES),
++            "IRIS26718 high-zoom RGBA16F readback",
++        )
++        val detail = allocateTrue2xHostBuffer(
++            Math.multiplyExact(Math.multiplyExact(tileWidth, tileHeight), Short.SIZE_BYTES),
++            "IRIS26718 high-zoom R16F pack",
++        )
++        try {
++            bindRenderTargets(intArrayOf(texture), "IRIS26718 high-zoom detail framebuffer")
++            GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
++            GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 1)
++            rg.clear()
++            GLES30.glReadPixels(0, 0, tileWidth, tileHeight, GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, rg)
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++            checkGlError("IRIS26718 high-zoom detail readback")
++            val rgShort = rg.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
++            val detailShort = detail.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
++            for (index in 0 until tileWidth * tileHeight) {
++                detailShort.put(index, rgShort.get(index * 4))
++                val diagnostic = Half.toFloat(rgShort.get(index * 4 + 1)).toInt()
++                require(diagnostic in 0..39) { "26718 invalid high-zoom diagnostic=$diagnostic" }
++                phaseHistogram[(diagnostic / 8).coerceIn(0, 4)]++
++                reasonHistogram[diagnostic % 8]++
++            }
++            detail.position(0)
++            writeTrue2xTileRows(
++                output, detail, left, top, tileWidth, tileHeight,
++                fullOutputWidth, Short.SIZE_BYTES,
++            )
++        } finally {
++            LargeDirectBuffer.free(detail)
++            LargeDirectBuffer.free(rg)
++        }
++    }
++
++    private fun runHighZoomDetailGpu26718(
++        images: List<SafeImage>,
++        evidence: List<True2xFrameEvidence>,
++        detailOutputFile: File,
++        nativeVgnGuideTexture: Int,
++        detailWidth: Int,
++        detailHeight: Int,
++        originX: Int,
++        originY: Int,
++        fullOutputWidth: Int,
++        fullOutputHeight: Int,
++    ): HighZoomDetailStats {
++        if (highZoomDetailMergeProgram26718 == 0) highZoomDetailMergeProgram26718 = linkProgram(
++            GlesMgcRawSabreShaders.highZoomDetailMerge26718, "iris_26718_high_zoom_detail_merge",
++        )
++        if (highZoomDetailResolveProgram26718 == 0) highZoomDetailResolveProgram26718 = linkProgram(
++            GlesMgcRawSabreShaders.highZoomDetailResolve26718, "iris_26718_high_zoom_detail_resolve",
++        )
++        require(nativeVgnGuideTexture != 0)
++        val maxTexture = IntArray(1)
++        GLES30.glGetIntegerv(GLES30.GL_MAX_TEXTURE_SIZE, maxTexture, 0)
++        checkGlError("IRIS26718 query GL_MAX_TEXTURE_SIZE")
++        require(maxTexture[0] >= TRUE2X_GPU_MIN_TEXTURE_SIZE)
++        val tileWidthLimit = minOf(detailWidth, maxTexture[0], TRUE2X_GPU_MAX_BAND_WIDTH).and(-2)
++        val tileHeightLimit = minOf(detailHeight, TRUE2X_GPU_TILE_HEIGHT, maxTexture[0]).and(-2)
++        require(tileWidthLimit >= 2 && tileHeightLimit >= 2)
++        val phaseHistogram = LongArray(5)
++        val reasonHistogram = LongArray(8)
++        RandomAccessFile(detailOutputFile, "rw").use { out ->
++            out.setLength(detailWidth.toLong() * detailHeight * Short.SIZE_BYTES)
++            var localTop = 0
++            while (localTop < detailHeight) {
++                var tileHeight = minOf(tileHeightLimit, detailHeight - localTop)
++                if ((tileHeight and 1) != 0) tileHeight--
++                require(tileHeight > 0)
++                var localLeft = 0
++                while (localLeft < detailWidth) {
++                    var tileWidth = minOf(tileWidthLimit, detailWidth - localLeft)
++                    if ((tileWidth and 1) != 0) tileWidth--
++                    require(tileWidth > 0)
++                    val globalLeft = originX + localLeft
++                    val globalTop = originY + localTop
++                    require((globalLeft and 1) == 0 && (globalTop and 1) == 0)
++                    val tileStart = textures.size
++                    val temporal = createTexture(tileWidth, tileHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++                    val phase = createTexture(tileWidth, tileHeight, GLES30.GL_RGBA8, GLES30.GL_NEAREST)
++                    try {
++                        bindRenderTargets(intArrayOf(temporal, phase), "IRIS26718 high-zoom scalar clear")
++                        GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f,0f,0f,0f), 0)
++                        GLES30.glClearBufferfv(GLES30.GL_COLOR, 1, floatArrayOf(0f,0f,0f,0f), 0)
++                        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++                        for (ev in evidence) {
++                            val rawRect = true2xRegionForOutput(
++                                globalLeft, globalTop, tileWidth, tileHeight,
++                                ev.maxAbsFlowPixelsX, ev.maxAbsFlowPixelsY,
++                            )
++                            val rawLeft=rawRect[0]; val rawTop=rawRect[1]
++                            val rawWidth=rawRect[2]-rawLeft; val rawHeight=rawRect[3]-rawTop
++                            val covRect=true2xRawScaledRegion(rawRect,ev.covarianceWidth,ev.covarianceHeight,TRUE2X_EVIDENCE_HALO)
++                            val covLeft=covRect[0]; val covTop=covRect[1]
++                            val covWidth=covRect[2]-covLeft; val covHeight=covRect[3]-covTop
++                            val rejRect=true2xScaledRegion(globalLeft,globalTop,tileWidth,tileHeight,fullOutputWidth,fullOutputHeight,ev.rejectionWidth,ev.rejectionHeight,TRUE2X_EVIDENCE_HALO)
++                            val rejLeft=rejRect[0]; val rejTop=rejRect[1]
++                            val rejWidth=rejRect[2]-rejLeft; val rejHeight=rejRect[3]-rejTop
++                            readTrue2xRawRegion(images[ev.frameIndex],rawLeft,rawTop,rawWidth,rawHeight).use { raw ->
++                                val cov=readTrue2xFileRegion(ev.covarianceFile,ev.covarianceWidth,4,covLeft,covTop,covWidth,covHeight,"26718 covariance")
++                                val rejection=ev.rejectionFile?.let { file ->
++                                    readTrue2xFileRegion(file,ev.rejectionWidth,1,rejLeft,rejTop,rejWidth,rejHeight,"26718 rejection")
++                                } ?: allocateTrue2xHostBuffer(1,"IRIS26718 identity rejection").apply { put(0,0xff.toByte()) }
++                                try {
++                                    val rawTexture=uploadTrue2xTexture(rawWidth,rawHeight,GLES30.GL_R16UI,GLES30.GL_RED_INTEGER,GLES30.GL_UNSIGNED_SHORT,GLES30.GL_NEAREST,raw.buffer,"IRIS26718 raw upload",unpackRowLength=raw.rowStrideSamples)
++                                    val flowTexture=uploadTrue2xTexture(ev.flowWidth,ev.flowHeight,GLES30.GL_RGBA16F,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,GLES30.GL_LINEAR,ev.flowData.duplicate().order(ByteOrder.nativeOrder()),"IRIS26718 flow upload")
++                                    val covTexture=uploadTrue2xTexture(covWidth,covHeight,GLES30.GL_RGB10_A2,GLES30.GL_RGBA,GLES30.GL_UNSIGNED_INT_2_10_10_10_REV,GLES30.GL_LINEAR,cov,"IRIS26718 covariance upload")
++                                    val rejectionTexture=uploadTrue2xTexture(if(ev.useFrameWeight)rejWidth else 1,if(ev.useFrameWeight)rejHeight else 1,GLES30.GL_R8,GLES30.GL_RED,GLES30.GL_UNSIGNED_BYTE,GLES30.GL_LINEAR,rejection,"IRIS26718 rejection upload")
++                                    try {
++                                        val program=highZoomDetailMergeProgram26718
++                                        GLES30.glUseProgram(program)
++                                        bindTexture(program,"uRawRegion",0,rawTexture); bindTexture(program,"uFlow",1,flowTexture); bindTexture(program,"uCovarianceRegion",2,covTexture); bindTexture(program,"uRejectionRegion",3,rejectionTexture)
++                                        uniform2i(program,"uRawOrigin",rawLeft,rawTop); uniform2i(program,"uRawRegionSize",rawWidth,rawHeight); uniform2i(program,"uRawFullSize",width,height)
++                                        uniform2i(program,"uCovarianceOrigin",covLeft,covTop); uniform2i(program,"uCovarianceRegionSize",covWidth,covHeight); uniform2i(program,"uCovarianceFullSize",ev.covarianceWidth,ev.covarianceHeight)
++                                        uniform2i(program,"uRejectionOrigin",rejLeft,rejTop); uniform2i(program,"uRejectionRegionSize",rejWidth,rejHeight); uniform2i(program,"uRejectionFullSize",ev.rejectionWidth,ev.rejectionHeight)
++                                        uniform2i(program,"uOutputOrigin",globalLeft,globalTop); uniform2i(program,"uOutputFullSize",fullOutputWidth,fullOutputHeight)
++                                        uniform4f(program,"uFlowScaleOffset",ev.flowScaleX,ev.flowScaleY,ev.flowOffsetX,ev.flowOffsetY)
++                                        uniform1i(program,"uCfaPattern",cfaPattern); uniform1i(program,"uUseFrameWeight",if(ev.useFrameWeight)1 else 0)
++                                        uniform4fv(program,"uGains",ev.calibration.gains); uniform4fv(program,"uBlackLevelsTimesGains",ev.calibration.blackTerms)
++                                        uniform4f(program,"uCovRangeRg",COV_MIN_R,COV_MAX_R-COV_MIN_R,COV_MIN_G,COV_MAX_G-COV_MIN_G); uniform2f(program,"uCovRangeB",COV_MIN_B,COV_MAX_B-COV_MIN_B)
++                                        uniform1f(program,"uRawClipThreshold",sensorWhiteLevel*0.985f)
++                                        GLES30.glEnable(GLES30.GL_BLEND); GLES30.glBlendEquation(GLES30.GL_FUNC_ADD); GLES30.glBlendFunc(GLES30.GL_ONE,GLES30.GL_ONE)
++                                        draw(program,tileWidth,tileHeight,intArrayOf(temporal,phase),preserveBlend=true)
++                                        GLES30.glDisable(GLES30.GL_BLEND)
++                                    } finally {
++                                        releaseOwnedTexture(rawTexture,"IRIS26718 raw band"); releaseOwnedTexture(flowTexture,"IRIS26718 flow band"); releaseOwnedTexture(covTexture,"IRIS26718 covariance band"); releaseOwnedTexture(rejectionTexture,"IRIS26718 rejection band")
++                                    }
++                                } finally { LargeDirectBuffer.free(rejection); LargeDirectBuffer.free(cov) }
++                            }
++                        }
++                        val detail=createTexture(tileWidth,tileHeight,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++                        val program=highZoomDetailResolveProgram26718
++                        GLES30.glUseProgram(program)
++                        bindTexture(program,"uTemporalLumaStats",0,temporal)
++                        bindTexture(program,"uPhaseOccupancy",1,phase)
++                        bindTexture(program,"uNativeVgnGuide",2,nativeVgnGuideTexture)
++                        uniform2i(program,"uOutputOrigin",globalLeft,globalTop)
++                        uniform2i(program,"uOutputFullSize",fullOutputWidth,fullOutputHeight)
++                        uniform2i(program,"uGuideSize",width,height)
++                        draw(program,tileWidth,tileHeight,intArrayOf(detail))
++                        writeHighZoomDetailTile26718(out,detail,localLeft,localTop,tileWidth,tileHeight,detailWidth,phaseHistogram,reasonHistogram)
++                        checkGlError("IRIS26718 high-zoom scalar tile")
++                    } finally { releaseTexturesFrom(tileStart) }
++                    localLeft += tileWidth
++                }
++                localTop += tileHeight
++                GlesGpuScheduler.yieldToUiRenderer()
++            }
++        }
++        val pixels=detailWidth.toLong()*detailHeight.toLong()
++        require(phaseHistogram.sum()==pixels) { "26718 phase proof incomplete" }
++        require(reasonHistogram.sum()==pixels) { "26718 reason proof incomplete" }
++        val active=reasonHistogram[1]+reasonHistogram[2]
++        val strong=reasonHistogram[2]
++        val activePct=(100.0*active.toDouble()/pixels.toDouble()).toFloat()
++        val strongPct=(100.0*strong.toDouble()/pixels.toDouble()).toFloat()
++        val proof="pixels=$pixels active=$active activePct=$activePct strong=$strong strongPct=$strongPct " +
++            "phase0=${phaseHistogram[0]} phase1=${phaseHistogram[1]} phase2=${phaseHistogram[2]} " +
++            "phase3=${phaseHistogram[3]} phase4=${phaseHistogram[4]} temporalRejected=${reasonHistogram[3]} " +
++            "sourceClipOrSupportRejected=${reasonHistogram[4]} agreementRejected=${reasonHistogram[5]} phaseRejected=${reasonHistogram[6]} " +
++            "signalRejected=${reasonHistogram[7]} rgbOwner=NATIVE_SABRE_VGN directHighResRgb=false detailOwner=NORMAL_SCALAR_2X_LUMA_ROI"
++        PLog.i(SABRE_TAG,"IRIS_26718_HIGH_ZOOM_DETAIL_PROOF $proof")
++        MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_DETAIL_PROOF",proof)
++        return HighZoomDetailStats(activePct,strongPct)
++    }
++
++    private fun reconstructHighZoomDetail26718(
++        images: List<SafeImage>,
++        evidence: List<True2xFrameEvidence>,
++        nativeVgnGuideTexture: Int,
++    ): HighZoomDetailResult {
++        require(enableHighZoomDetail && !enableSabreSuperRes)
++        require(evidence.isNotEmpty())
++        val directory=checkNotNull(sabreSuperResTempDir)
++        require(directory.exists()||directory.mkdirs())
++        val fullWidth=Math.multiplyExact(width,2)
++        val fullHeight=Math.multiplyExact(height,2)
++        fun roundUp4(value:Int):Int = (value + 3) and -4
++        val detailWidth=roundUp4((kotlin.math.ceil(fullWidth/highZoomSourceZoom.toDouble()).toInt()+4).coerceAtMost(fullWidth)).coerceAtLeast(4).coerceAtMost(fullWidth)
++        val detailHeight=roundUp4((kotlin.math.ceil(fullHeight/highZoomSourceZoom.toDouble()).toInt()+4).coerceAtMost(fullHeight)).coerceAtLeast(4).coerceAtMost(fullHeight)
++        require((detailWidth and 3)==0 && (detailHeight and 3)==0)
++        val originX=(fullWidth-detailWidth)/2
++        val originY=(fullHeight-detailHeight)/2
++        require((originX and 1)==0 && (originY and 1)==0)
++        val output=File(directory,"iris26718_high_zoom_detail_${System.nanoTime()}.r16f")
++        val start=System.nanoTime()
++        return try {
++            val stats=runHighZoomDetailGpu26718(images,evidence,output,nativeVgnGuideTexture,detailWidth,detailHeight,originX,originY,fullWidth,fullHeight)
++            val refined=evidence.filter { it.frameIndex!=0 }
++            val refinePct=if(refined.isEmpty())0f else refined.map{it.refineAcceptedPct}.average().toFloat()
++            HighZoomDetailResult(output.absolutePath,detailWidth,detailHeight,originX,originY,fullWidth,fullHeight,highZoomSourceZoom,stats.activePct,stats.strongPct,refinePct,evidence.size,elapsedMs(start))
++        } catch(error:Throwable) {
++            runCatching { output.delete() }
++            throw error
++        }
++    }
++
+     private fun reconstructTrue2x(
+         frames: List<RawStackFrame>,
+         images: List<SafeImage>,
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+index dd0607c723244551a2b7c4ea24899273358a0f0e..7503957ebc2cd4da53a94e16de360198336d9949 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+@@ -104,6 +104,23 @@ data class RawStackResult(
+     val true2xPhaseSupportMean: Float = 0f,
+     val true2xPhaseSupportP10: Float = 0f,
+     val true2xReconstructionMs: Long = 0L,
++    /* IRIS_26718_NORMAL_HIGH_ZOOM_DETAIL_SIDECAR
++     * Signed R16F log2 luminance-detail field on a centered subset of the global true-2x sensor
++     * grid. It never owns RGB/chroma, DNG, exposure or tone. Zero is an exact no-op.
++     */
++    val highZoomDetailPath: String? = null,
++    val highZoomDetailWidth: Int = 0,
++    val highZoomDetailHeight: Int = 0,
++    val highZoomDetailOriginX: Int = 0,
++    val highZoomDetailOriginY: Int = 0,
++    val highZoomDetailFullWidth: Int = 0,
++    val highZoomDetailFullHeight: Int = 0,
++    val highZoomDetailSourceZoom: Float = 1f,
++    val highZoomDetailActivePct: Float = 0f,
++    val highZoomDetailStrongPct: Float = 0f,
++    val highZoomRefineAcceptedPct: Float = 0f,
++    val highZoomDetailFrames: Int = 0,
++    val highZoomDetailReconstructionMs: Long = 0L,
+     /* IRIS_26520_V4_LIVE_MGC_NORMAL_DNG_SIDECAR */
+     val normalStackedDngRaw16: ByteBuffer? = null,
+     val normalStackedDngFrameCount: Int = 0,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 44c4fd6451041bd0ee27b137d227cf8cf65f4b0c..f9544950dfe527ba616e8ea56e9dba8d77150931 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -17,7 +17,10 @@ import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings;
+ import com.particlesdevs.photoncamera.app.PhotonCamera;
+ import com.particlesdevs.photoncamera.util.Log;
+ 
++import java.io.File;
++import java.io.FileInputStream;
+ import java.nio.ByteBuffer;
++import java.nio.channels.FileChannel;
+ 
+ import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+ import static android.opengl.GLES20.GL_LINEAR;
+@@ -1027,6 +1030,52 @@ public final class MotionV2Render extends Node {
+         } catch (Throwable ignored) {}
+     }
+ 
++    /* IRIS_26718_HIGH_ZOOM_DETAIL_TEXTURE_OWNER
++     * Consume the exact disk-backed R16F sidecar once. MotionV2Render owns its GL lifetime through
++     * both SDR and UHDR passes; the file is deleted only after successful texture upload.
++     */
++    private GLTexture iris26718LoadHighZoomDetail() {
++        Parameters p = basePipeline.mParameters;
++        if (p.motionV2HighZoomDetailPath == null) return null;
++        int w = p.motionV2HighZoomDetailWidth;
++        int h = p.motionV2HighZoomDetailHeight;
++        if (w <= 0 || h <= 0 || p.motionV2HighZoomDetailFullWidth <= 0 ||
++                p.motionV2HighZoomDetailFullHeight <= 0) {
++            throw new IllegalStateException("26718 invalid high-zoom detail geometry");
++        }
++        File file = new File(p.motionV2HighZoomDetailPath);
++        long expected = (long)w * (long)h * 2L;
++        if (!file.isFile() || file.length() != expected) {
++            throw new IllegalStateException("26718 high-zoom detail file mismatch expected=" + expected +
++                    " actual=" + (file.isFile() ? file.length() : -1));
++        }
++        if (expected > Integer.MAX_VALUE) throw new IllegalStateException("26718 detail buffer too large");
++        ByteBuffer bytes = ByteBuffer.allocateDirect((int)expected);
++        try (FileInputStream input = new FileInputStream(file); FileChannel channel = input.getChannel()) {
++            while (bytes.hasRemaining()) {
++                int read = channel.read(bytes);
++                if (read < 0) break;
++            }
++            if (bytes.hasRemaining()) throw new IllegalStateException("26718 short detail read");
++            bytes.flip();
++            GLTexture texture = new GLTexture(new Point(w, h),
++                    new GLFormat(GLFormat.DataType.FLOAT_16, 1), bytes, GL_LINEAR, GL_CLAMP_TO_EDGE);
++            if (!file.delete() && file.exists()) {
++                try { java.nio.file.Files.deleteIfExists(file.toPath()); } catch (Throwable ignored) {}
++            }
++            p.motionV2HighZoomDetailPath = null;
++            Log.i(Name, "IRIS_26718_HIGH_ZOOM_DETAIL_TEXTURE_LOADED size=" + w + "x" + h +
++                    " origin=" + p.motionV2HighZoomDetailOriginX + "," + p.motionV2HighZoomDetailOriginY +
++                    " activePct=" + p.motionV2HighZoomDetailActivePct +
++                    " strongPct=" + p.motionV2HighZoomDetailStrongPct +
++                    " refineAcceptedPct=" + p.motionV2HighZoomRefineAcceptedPct +
++                    " frames=" + p.motionV2HighZoomDetailFrames);
++            return texture;
++        } catch (Exception error) {
++            throw new IllegalStateException("26718 high-zoom detail load failed", error);
++        }
++    }
++
+     @Override
+     public void Run() {
+         if (!(basePipeline.mParameters.motionV2Active || basePipeline.mParameters.irisNightActive)) {
+@@ -1100,6 +1149,16 @@ public final class MotionV2Render extends Node {
+                 + " reconstructionZoom=" + reconstructionZoom
+                 + " renderResidual=" + irisOutputZoom
+                 + " product=" + (reconstructionZoom * irisOutputZoom));
++        GLTexture iris26718HighZoomDetail = iris26718LoadHighZoomDetail();
++        final boolean iris26718HighZoomDetailEnabled = iris26718HighZoomDetail != null;
++        if (basePipeline.mParameters.motionV2Active &&
++                !basePipeline.mParameters.irisNightActive &&
++                basePipeline.mParameters.motionV2GlobalZoom >= 20.0f &&
++                basePipeline.mParameters.motionV2OutputZoom > 1.00001f &&
++                !basePipeline.mParameters.motionV2SuperResOutputEnabled &&
++                !iris26718HighZoomDetailEnabled) {
++            throw new IllegalStateException("26718 high-zoom route active without detail texture");
++        }
+         final boolean iris26702LocalLaplacianEnabled =
+                 basePipeline.mParameters.motionV2Active
+                         && basePipeline.mParameters.motionV2LocalLaplacianToneEnabled;
+@@ -1139,6 +1198,13 @@ public final class MotionV2Render extends Node {
+             glProg.setVar("outputExposureScale", OUTPUT_EXPOSURE_SCALE);
+             iris26653SetFinalToneUniforms();
+             glProg.setVar("irisOutputZoom", irisOutputZoom);
++            glProg.setVar("iris26718HighZoomDetailEnabled", iris26718HighZoomDetailEnabled ? 1 : 0);
++            glProg.setVar("iris26718HighZoomDetailOrigin", new Point(
++                    basePipeline.mParameters.motionV2HighZoomDetailOriginX,
++                    basePipeline.mParameters.motionV2HighZoomDetailOriginY));
++            if (iris26718HighZoomDetailEnabled) {
++                glProg.setTexture("iris26718HighZoomDetail", iris26718HighZoomDetail);
++            }
+             glProg.setVar("iris26630MotionSaturation", iris26630MotionSaturation);
+             glProg.setVar("iris26621LocalToneEnabled", iris26621LocalTone != null ? 1 : 0);
+             if (iris26621LocalTone != null) {
+@@ -1211,6 +1277,13 @@ public final class MotionV2Render extends Node {
+                 iris26653SetFinalToneUniforms();
+ 
+                 glProg.setVar("irisOutputZoom", irisOutputZoom);
++                glProg.setVar("iris26718HighZoomDetailEnabled", iris26718HighZoomDetailEnabled ? 1 : 0);
++                glProg.setVar("iris26718HighZoomDetailOrigin", new Point(
++                        basePipeline.mParameters.motionV2HighZoomDetailOriginX,
++                        basePipeline.mParameters.motionV2HighZoomDetailOriginY));
++                if (iris26718HighZoomDetailEnabled) {
++                    glProg.setTexture("iris26718HighZoomDetail", iris26718HighZoomDetail);
++                }
+                 glProg.drawBlocks(gainTexture);
+                 iris26641AfterDrawNs = System.nanoTime();
+ 
+@@ -1401,6 +1474,9 @@ public final class MotionV2Render extends Node {
+             if (iris26640KeepLocalToneForGainMap && iris26621LocalTone != null) {
+                 try { iris26621LocalTone.close(); } catch (Throwable ignored) {}
+             }
++            if (iris26718HighZoomDetail != null) {
++                try { iris26718HighZoomDetail.close(); } catch (Throwable ignored) {}
++            }
+         }
+         if (iris26662CanonicalHdrOwned != null) {
+             try { iris26662CanonicalHdrOwned.close(); } catch (Throwable ignored) {}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 6ec80bb13b1129c7c783d05d2931e6bed9d362b3..8add03ac9a248cedb2b4f214061ab8dbac96054d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -62,6 +62,8 @@ public class HdrxProcessor extends ProcessorBase {
+      */
+     private String mMotion26564True2xLinearRgbPathForCleanup;
+     private String mMotion26564True2xRenderRgbPathForCleanup;
++    /* IRIS_26718_HIGH_ZOOM_EXCEPTION_CLEANUP_OWNER */
++    private String mMotion26718HighZoomDetailPathForCleanup;
+     private int imageFormat;
+     /* config */
+     private int alignAlgorithm;
+@@ -105,6 +107,7 @@ public class HdrxProcessor extends ProcessorBase {
+         this.captureRequest = captureRequest;
+         this.mMotion26564True2xLinearRgbPathForCleanup = null;
+         this.mMotion26564True2xRenderRgbPathForCleanup = null;
++        this.mMotion26718HighZoomDetailPathForCleanup = null;
+         Log.d(TAG, "HdrxProcessor called start()");
+         Run();
+     }
+@@ -207,6 +210,10 @@ public class HdrxProcessor extends ProcessorBase {
+                 try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(mMotion26564True2xRenderRgbPathForCleanup)); } catch (Throwable ignored) {}
+                 mMotion26564True2xRenderRgbPathForCleanup = null;
+             }
++            if (mMotion26718HighZoomDetailPathForCleanup != null) {
++                try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(mMotion26718HighZoomDetailPathForCleanup)); } catch (Throwable ignored) {}
++                mMotion26718HighZoomDetailPathForCleanup = null;
++            }
+             if(iris26480OriginalPriority!=null)try{android.os.Process.setThreadPriority(
+                     android.os.Process.myTid(),iris26480OriginalPriority);}catch(Throwable ignored){}
+         }
+@@ -696,6 +703,7 @@ private void ApplyHdrX() {
+             iris26564True2xRenderRgbPath = iris26409V2.true2xRenderRgbPath;
+             mMotion26564True2xLinearRgbPathForCleanup = iris26564True2xLinearRgbPath;
+             mMotion26564True2xRenderRgbPathForCleanup = iris26564True2xRenderRgbPath;
++            mMotion26718HighZoomDetailPathForCleanup = processingParameters.motionV2HighZoomDetailPath;
+             iris26564True2xWidth = iris26409V2.true2xWidth;
+             iris26564True2xHeight = iris26409V2.true2xHeight;
+             iris26564True2xBackend = iris26409V2.true2xBackend;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 2e978e852d2ee4acdb0534f87633e1b1d459097a..299730e2873e81aa9d6becedccc89096e7de8520 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -104,6 +104,8 @@ object PhotonMotionMgc1271Bridge {
+         var true2xPhaseSupportPathForCleanup: String? = null
+         var true2xRenderRgbPathForCleanup: String? = null
+         var true2xOutputHandedOff = false
++        var highZoomDetailPathForCleanup: String? = null
++        var highZoomDetailHandedOff = false
+         val iris26535TotalStartNs = System.nanoTime()
+         var iris26535FusionMs = -1L
+         var iris26535DenoiseMs = -1L
+@@ -383,6 +385,32 @@ object PhotonMotionMgc1271Bridge {
+             val sabreSuperResEnabled = parameters.motionV2SuperResOutputEnabled
+             val sabreSuperResOutputScale = if (sabreSuperResEnabled) 2f else 1f
+             parameters.motionV2SuperResOutputScale = sabreSuperResOutputScale
++            /* IRIS_26718_NORMAL_20X_HIGH_ZOOM_OWNER
++             * Normal Motion only. This is not the Super Res publication route: native Sabre/VGN
++             * remains RGB/chroma authority and the new sidecar carries only support-gated luma detail.
++             */
++            val highZoomDetailEnabled = parameters.motionV2Active && !parameters.irisNightActive &&
++                !sabreSuperResEnabled && displayedGlobalZoom >= 20f && localOutputZoom > 1.00001f
++            parameters.motionV2HighZoomDetailPath = null
++            parameters.motionV2HighZoomDetailWidth = 0
++            parameters.motionV2HighZoomDetailHeight = 0
++            parameters.motionV2HighZoomDetailOriginX = 0
++            parameters.motionV2HighZoomDetailOriginY = 0
++            parameters.motionV2HighZoomDetailFullWidth = 0
++            parameters.motionV2HighZoomDetailFullHeight = 0
++            parameters.motionV2HighZoomDetailSourceZoom = localOutputZoom
++            parameters.motionV2HighZoomDetailActivePct = 0f
++            parameters.motionV2HighZoomDetailStrongPct = 0f
++            parameters.motionV2HighZoomRefineAcceptedPct = 0f
++            parameters.motionV2HighZoomDetailFrames = 0
++            parameters.motionV2HighZoomDetailReconstructionMs = 0L
++            val referenceStackFrame = frames.firstOrNull { it.frameNumber == mgcBase.frameNumber } ?: frames.first()
++            val highZoomActivation = "enabled=$highZoomDetailEnabled displayedGlobalZoom=$displayedGlobalZoom " +
++                "localOutputZoom=$localOutputZoom threshold=20.0 superResRequested=$sabreSuperResEnabled " +
++                "focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} lensState=${referenceStackFrame.lensState} " +
++                "rgbOwner=NATIVE_SABRE_VGN detailOwner=${if (highZoomDetailEnabled) "NORMAL_SCALAR_2X_LUMA_ROI" else "NONE"}"
++            PLog.i(TAG, "IRIS_26718_HIGH_ZOOM_ACTIVATION $highZoomActivation")
++            MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_ACTIVATION", highZoomActivation)
+             PLog.i(TAG, "IRIS_26564_TRUE_2X_SR_DNG_AUTHORITY " +
+                 "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
+                 "reconstructionZoom=$reconstructionZoom renderResidualZoom=$renderResidualZoom " +
+@@ -412,6 +440,8 @@ object PhotonMotionMgc1271Bridge {
+                 vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
+                 enableSabreSuperRes = sabreSuperResEnabled,
+                 sabreSuperResTempDir = PhotonCamera.getApplicationContextStatic().cacheDir,
++                enableHighZoomDetail = highZoomDetailEnabled,
++                highZoomSourceZoom = localOutputZoom,
+                 /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT
+                  * Read-only downstream context. This value is already frozen from the selected
+                  * 26674 NORMAL reference and cannot alter sensor/ZSL/capture exposure ownership. */
+@@ -430,6 +460,42 @@ object PhotonMotionMgc1271Bridge {
+             true2xRenderRgbPathForCleanup = stacked.true2xRenderRgbPath
+             true2xPhaseSupportPathForCleanup = stacked.true2xPhaseSupportPath
+             true2xNativeVgnGuidePathForCleanup = stacked.true2xNativeVgnGuidePath
++            highZoomDetailPathForCleanup = stacked.highZoomDetailPath
++            if (highZoomDetailEnabled) {
++                requireParity(stacked.highZoomDetailPath != null,
++                    "26718 high-zoom enabled without detail sidecar")
++                requireParity(stacked.highZoomDetailWidth > 0 && stacked.highZoomDetailHeight > 0 &&
++                    stacked.highZoomDetailFullWidth == size.x * 2 &&
++                    stacked.highZoomDetailFullHeight == size.y * 2,
++                    "26718 invalid high-zoom detail geometry")
++                requireParity(stacked.highZoomDetailSourceZoom == localOutputZoom,
++                    "26718 high-zoom source zoom mismatch")
++                parameters.motionV2HighZoomDetailPath = stacked.highZoomDetailPath
++                parameters.motionV2HighZoomDetailWidth = stacked.highZoomDetailWidth
++                parameters.motionV2HighZoomDetailHeight = stacked.highZoomDetailHeight
++                parameters.motionV2HighZoomDetailOriginX = stacked.highZoomDetailOriginX
++                parameters.motionV2HighZoomDetailOriginY = stacked.highZoomDetailOriginY
++                parameters.motionV2HighZoomDetailFullWidth = stacked.highZoomDetailFullWidth
++                parameters.motionV2HighZoomDetailFullHeight = stacked.highZoomDetailFullHeight
++                parameters.motionV2HighZoomDetailSourceZoom = stacked.highZoomDetailSourceZoom
++                parameters.motionV2HighZoomDetailActivePct = stacked.highZoomDetailActivePct
++                parameters.motionV2HighZoomDetailStrongPct = stacked.highZoomDetailStrongPct
++                parameters.motionV2HighZoomRefineAcceptedPct = stacked.highZoomRefineAcceptedPct
++                parameters.motionV2HighZoomDetailFrames = stacked.highZoomDetailFrames
++                parameters.motionV2HighZoomDetailReconstructionMs = stacked.highZoomDetailReconstructionMs
++                val handoff = "path=true size=${stacked.highZoomDetailWidth}x${stacked.highZoomDetailHeight} " +
++                    "origin=${stacked.highZoomDetailOriginX},${stacked.highZoomDetailOriginY} " +
++                    "full=${stacked.highZoomDetailFullWidth}x${stacked.highZoomDetailFullHeight} " +
++                    "sourceZoom=${stacked.highZoomDetailSourceZoom} frames=${stacked.highZoomDetailFrames} " +
++                    "activePct=${stacked.highZoomDetailActivePct} strongPct=${stacked.highZoomDetailStrongPct} " +
++                    "refineAcceptedPct=${stacked.highZoomRefineAcceptedPct} ms=${stacked.highZoomDetailReconstructionMs}"
++                PLog.i(TAG, "IRIS_26718_HIGH_ZOOM_DETAIL_HANDOFF $handoff")
++                MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_DETAIL_HANDOFF", handoff)
++            } else {
++                requireParity(stacked.highZoomDetailPath == null && stacked.highZoomDetailWidth == 0 &&
++                    stacked.highZoomDetailHeight == 0,
++                    "26718 high-zoom detail survived disabled route")
++            }
+             if (parameters.irisNightActive) {
+                 /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
+                  * A HAL-shortened batch may contain fewer than 15 physical frames, but every frame
+@@ -832,6 +898,7 @@ object PhotonMotionMgc1271Bridge {
+                  * denoise carrier remains owned here and is released by this bridge's finally block. */
+                 true2xOutputHandedOff = resultTrue2xRenderRgbPath != null &&
+                     (!produceNormalStackedDng || resultTrue2xLinearRawPath != null)
++                highZoomDetailHandedOff = !highZoomDetailEnabled || parameters.motionV2HighZoomDetailPath != null
+             }
+         } catch (error: Throwable) {
+             PLog.e(TAG, "MGC PARITY ARCHITECTURE INVALID", error)
+@@ -852,6 +919,9 @@ object PhotonMotionMgc1271Bridge {
+                 true2xPhaseSupportPathForCleanup?.let { path -> runCatching { File(path).delete() } }
+                 true2xRenderRgbPathForCleanup?.let { path -> runCatching { File(path).delete() } }
+             }
++            if (!highZoomDetailHandedOff) {
++                highZoomDetailPathForCleanup?.let { path -> runCatching { File(path).delete() } }
++            }
+             egl?.close()
+             inputImages.forEach { frame ->
+                 if (frame.hasMotionV2RawBacking()) runCatching { frame.close() }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 3b359674eace81614857bfd6af4ae9fb21b02867..d4a8b779d4dedc67bc53cdfd0290aab84c7308b6 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -141,6 +141,22 @@ public class Parameters {
+     public float motionV2RenderResidualZoom = 1.0f;
+     public boolean motionV2SuperResOutputEnabled = false;
+     public float motionV2SuperResOutputScale = 1.0f;
++    /* IRIS_26718_20X_HIGH_ZOOM_DETAIL_HANDOFF
++     * Disk-backed R16F signed log2 detail sampled directly at final SDR/UHDR coordinates.
++     */
++    public String motionV2HighZoomDetailPath = null;
++    public int motionV2HighZoomDetailWidth = 0;
++    public int motionV2HighZoomDetailHeight = 0;
++    public int motionV2HighZoomDetailOriginX = 0;
++    public int motionV2HighZoomDetailOriginY = 0;
++    public int motionV2HighZoomDetailFullWidth = 0;
++    public int motionV2HighZoomDetailFullHeight = 0;
++    public float motionV2HighZoomDetailSourceZoom = 1.0f;
++    public float motionV2HighZoomDetailActivePct = 0.0f;
++    public float motionV2HighZoomDetailStrongPct = 0.0f;
++    public float motionV2HighZoomRefineAcceptedPct = 0.0f;
++    public int motionV2HighZoomDetailFrames = 0;
++    public long motionV2HighZoomDetailReconstructionMs = 0L;
+     /* IRIS_26621_TRUE2X_SHARED_LOCAL_TONE_MAP
+      * Full-resolution R16F log2 SDR target produced by the MotionV2Render Local-Laplacian owner.
+      * This is an absolute presentation target, not a coarse correction/gain field. CPU/GPU true-2x
+diff --git a/app/version.properties b/app/version.properties
+index bee8b0160435881a7030c9470169ed18f07f09a4..8e98d13024acadaedaeb61b040348d038f28769b 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726717
+-VERSION_BUILD=26717
++VERSION_NAME=0.9726718
++VERSION_BUILD=26718
