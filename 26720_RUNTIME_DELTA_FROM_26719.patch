@@ -1,0 +1,1439 @@
+diff --git a/app/src/main/assets/shaders/motionv2/color_transform.glsl b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+index 45911b226763bfd1396d38132410e3886459f4a1..f64d50bceae41f227c2f6891994e29e13188420b 100644
+--- a/app/src/main/assets/shaders/motionv2/color_transform.glsl
++++ b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+@@ -2,6 +2,12 @@ precision highp float;
+ precision mediump sampler2D;
+ 
+ uniform sampler2D InputBuffer;
++#if USE_IRIS_26720_HIGH_ZOOM_RGB == 1
++uniform sampler2D iris26720HighZoomRgb;
++uniform ivec2 iris26720HighZoomOrigin;
++uniform ivec2 iris26720HighZoomFullSize;
++uniform float iris26720HighZoomSourceZoom;
++#endif
+ uniform sampler2D ProfileHueSatMap;
+ uniform sampler2D ProfileLookMap;
+ uniform sampler2D Acr3Curve;
+@@ -21,6 +27,9 @@ uniform vec3 profileToSrgbRow1;
+ uniform vec3 profileToSrgbRow2;
+ out vec3 Output;
+ 
++#ifndef USE_IRIS_26720_HIGH_ZOOM_RGB
++#define USE_IRIS_26720_HIGH_ZOOM_RGB 0
++#endif
+ #ifndef USE_PROFILE_HUESAT
+ #define USE_PROFILE_HUESAT 0
+ #endif
+@@ -148,7 +157,20 @@ vec3 iris26638ApplyAcr3(vec3 color){
+ 
+ void main(){
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+-    vec3 cameraRgb=max(texelFetch(InputBuffer,xy,0).rgb,vec3(0.0));
++    vec3 cameraRgb;
++#if USE_IRIS_26720_HIGH_ZOOM_RGB == 1
++    vec2 nativeSize=vec2(textureSize(InputBuffer,0));
++    vec2 outputCenter=nativeSize*0.5;
++    vec2 fullCenter=(vec2(iris26720HighZoomFullSize)-vec2(1.0))*0.5;
++    vec2 global2x=fullCenter+(vec2(xy)+vec2(0.5)-outputCenter)*(2.0/max(iris26720HighZoomSourceZoom,1.0));
++    vec2 local=global2x-vec2(iris26720HighZoomOrigin);
++    vec2 sideSize=vec2(textureSize(iris26720HighZoomRgb,0));
++    vec2 uv=(local+vec2(0.5))/sideSize;
++    vec2 halfTexel=vec2(0.5)/sideSize;
++    cameraRgb=max(texture(iris26720HighZoomRgb,clamp(uv,halfTexel,vec2(1.0)-halfTexel)).rgb,vec3(0.0));
++#else
++    cameraRgb=max(texelFetch(InputBuffer,xy,0).rgb,vec3(0.0));
++#endif
+     /* IRIS_26653_HIGHLIGHT_TONE_DEFERRED_TO_FINAL_RENDER: cameraRgb unchanged here. */
+     vec3 profileRgb=vec3(dot(sensorToProfileRow0,cameraRgb),dot(sensorToProfileRow1,cameraRgb),dot(sensorToProfileRow2,cameraRgb));
+ #if USE_PROFILE_HUESAT == 1
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 5c987efb19073ace4345bde6388b9d52ade94dd1..15801b3146ad440ddd856850050307e1f1281661 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -294,6 +294,19 @@ internal object GlesMgcRawSabreShaders {
+         uniform float uMotionRobustnessBoostVarianceThreshold;
+         uniform float uExtraMotionRobustnessMotionThreshold;
+         uniform int uRejectLowConfidenceTemporalTail;
++        /* IRIS_26720_CAPTURE_ROW_FLICKER_CONFIDENCE
++         * Read-only timestamp-matched NORMAL evidence. These uniforms are disabled for SHORT/LONG.
++         * RAW values are never rewritten. Current dark-band rows lose merge confidence; a proven
++         * dark reference row relaxes only photometric disagreement so a clean NORMAL can replace it.
++         * Physical unblocker/motion protection remains mandatory. */
++        uniform int uReferenceRowFlickerEnabled;
++        uniform int uReferenceRowFlickerHarmonic;
++        uniform vec2 uReferenceRowFlickerAB;
++        uniform float uReferenceRowFlickerStrength;
++        uniform int uCurrentRowFlickerEnabled;
++        uniform int uCurrentRowFlickerHarmonic;
++        uniform vec2 uCurrentRowFlickerAB;
++        uniform float uCurrentRowFlickerStrength;
+         layout(location = 0) out float oReverseWeight;
+         layout(location = 1) out float oPixelDifference;
+         /* IRIS_26610_SHARED_NORMAL_SHORT_PHYSICAL_PROTECTION_OUTPUT
+@@ -319,6 +332,16 @@ internal object GlesMgcRawSabreShaders {
+             return sampleUv;
+         }
+ 
++        float iris26720RowReliability(int enabled, int harmonic, vec2 ab, float strength, float rowUv) {
++            if (enabled == 0 || harmonic <= 0 || strength <= 0.0) return 1.0;
++            float phase = 6.283185307179586 * float(harmonic) * clamp(rowUv, 0.0, 1.0);
++            float logModulation = ab.x * cos(phase) + ab.y * sin(phase);
++            float amplitude = length(ab);
++            float darkMagnitude = max(-logModulation, 0.0);
++            float darkBand = smoothstep(0.010, max(0.030, amplitude * 0.90), darkMagnitude);
++            return mix(1.0, 0.08, clamp(darkBand * clamp(strength, 0.0, 1.0), 0.0, 1.0));
++        }
++
+         vec4 sampleBiquadraticAbsolute(sampler2D image, vec2 uv) {
+             vec2 fractionalOffset = fract(uv * vec2(uGuideSize));
+             vec2 c = fractionalOffset * fractionalOffset - fractionalOffset + 0.5;
+@@ -395,9 +418,18 @@ internal object GlesMgcRawSabreShaders {
+                 ? uColorDifferenceMultiplier.y * pixelDistanceSquared.y
+                 : uColorDifferenceMultiplier.x *
+                     dot(pixelDistanceSquared, vec3(1.0 / 3.0));
++            float referencePhotometricReliability = iris26720RowReliability(
++                uReferenceRowFlickerEnabled, uReferenceRowFlickerHarmonic,
++                uReferenceRowFlickerAB, uReferenceRowFlickerStrength, referenceUv.y);
++            pixelDistance *= referencePhotometricReliability;
++            distance *= referencePhotometricReliability;
+             float pixelDifference = exp2(min(-pixelDistance, 0.0));
+             distance *= robustnessBoost;
+             float frameWeight = exp2(min(-distance, 0.0));
++            float currentRowReliability = iris26720RowReliability(
++                uCurrentRowFlickerEnabled, uCurrentRowFlickerHarmonic,
++                uCurrentRowFlickerAB, uCurrentRowFlickerStrength, warpedUv.y);
++            frameWeight *= currentRowReliability;
+             float weight = min(1.0 - unblocker, frameWeight);
+             /* IRIS_26707_MOVING_CONTENT_LOW_CONFIDENCE_TAIL_REJECT
+              * 26706 TV/bus evidence showed effective temporal support collapsing close to one
+@@ -2505,6 +2537,14 @@ internal object GlesMgcRawSabreShaders {
+         uniform vec4 uFrameBorderPadded;
+         uniform int uCfaPattern;
+         uniform int uUseFrameWeight;
++        /* IRIS_26720_REFERENCE_ROW_FLICKER_MERGE_CONFIDENCE
++         * Reference NORMAL bypasses ordinary rejection, so only it needs this additional merge
++         * reliability. Alternate NORMALs already carry row confidence in their rejection texture.
++         * SHORT/LONG keep this disabled. */
++        uniform int uRowFlickerEnabled;
++        uniform int uRowFlickerHarmonic;
++        uniform vec2 uRowFlickerAB;
++        uniform float uRowFlickerStrength;
+         /* IRIS_26603_ONE_TUNNEL_SOURCE_CLIPPING
+          * Every bracket observation, including the reference, reaches this same RBF accumulator.
+          * Source headroom is one continuous scalar for the complete consumed 3x3 CFA footprint,
+@@ -2544,6 +2584,16 @@ internal object GlesMgcRawSabreShaders {
+             return sampleUv;
+         }
+ 
++        float iris26720MergeRowReliability(float rowUv) {
++            if (uRowFlickerEnabled == 0 || uRowFlickerHarmonic <= 0 || uRowFlickerStrength <= 0.0) return 1.0;
++            float phase = 6.283185307179586 * float(uRowFlickerHarmonic) * clamp(rowUv, 0.0, 1.0);
++            float logModulation = uRowFlickerAB.x * cos(phase) + uRowFlickerAB.y * sin(phase);
++            float amplitude = length(uRowFlickerAB);
++            float darkMagnitude = max(-logModulation, 0.0);
++            float darkBand = smoothstep(0.010, max(0.030, amplitude * 0.90), darkMagnitude);
++            return mix(1.0, 0.08, clamp(darkBand * clamp(uRowFlickerStrength, 0.0, 1.0), 0.0, 1.0));
++        }
++
+         float kernelWeight(vec2 pixelOffset, vec3 covariance) {
+             float kernelDistance =
+                 pixelOffset.x * pixelOffset.x * covariance.x +
+@@ -2736,6 +2786,7 @@ internal object GlesMgcRawSabreShaders {
+             float frameWeight = uUseFrameWeight != 0
+                 ? texture(uRejection, referenceUv).r
+                 : 1.0;
++            frameWeight *= iris26720MergeRowReliability(sampleUv.y);
+             if (uSourceClipGuard != 0) {
+                 frameWeight *= mix(
+                     uSourceClippedWeight,1.0,
+@@ -4878,6 +4929,97 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26720_HIGH_ZOOM_DIRECT_CFA_RGB_OWNER
++     * High-zoom-only lazy variant of the proven direct-CFA 26564 estimator. Adds bounded
++     * observation confidence plus row-flicker reliability; explicit Super Res remains unchanged.
++     */
++    val highZoomRgbMerge26720: String by lazy {
++        fun replaceExactlyOnce(source: String, old: String, replacement: String, label: String): String {
++            val first = source.indexOf(old)
++            check(first >= 0) { "26720 high-zoom RGB shader anchor missing: $label" }
++            check(source.indexOf(old, first + old.length) < 0) { "26720 high-zoom RGB shader anchor duplicated: $label" }
++            return source.replaceRange(first, first + old.length, replacement)
++        }
++        var source = true2xMerge26564
++        source = replaceExactlyOnce(
++            source,
++            "uniform float uRawClipThreshold;",
++            "uniform float uRawClipThreshold;\n" +
++                "uniform float uObservationConfidence;\n" +
++                "uniform int uRowFlickerEnabled;\n" +
++                "uniform int uRowFlickerHarmonic;\n" +
++                "uniform vec2 uRowFlickerAB;\n" +
++                "uniform float uRowFlickerStrength;",
++            "confidence-uniforms",
++        )
++        source = replaceExactlyOnce(
++            source,
++            "float kernelWeight(vec2 offset, vec3 covariance) {",
++            "float iris26720HighZoomRowReliability(float rowUv) {\n" +
++                "    if (uRowFlickerEnabled == 0 || uRowFlickerHarmonic <= 0 || uRowFlickerStrength <= 0.0) return 1.0;\n" +
++                "    float phase = 6.283185307179586 * float(uRowFlickerHarmonic) * clamp(rowUv, 0.0, 1.0);\n" +
++                "    float logModulation = uRowFlickerAB.x * cos(phase) + uRowFlickerAB.y * sin(phase);\n" +
++                "    float amplitude = length(uRowFlickerAB);\n" +
++                "    float darkMagnitude = max(-logModulation, 0.0);\n" +
++                "    float darkBand = smoothstep(0.010, max(0.030, amplitude * 0.90), darkMagnitude);\n" +
++                "    return mix(1.0, 0.08, clamp(darkBand * clamp(uRowFlickerStrength, 0.0, 1.0), 0.0, 1.0));\n" +
++                "}\n\n" +
++                "float kernelWeight(vec2 offset, vec3 covariance) {",
++            "row-reliability-helper",
++        )
++        source = replaceExactlyOnce(
++            source,
++            "float frameWeight = sampleRejection(referenceUv);",
++            "float frameWeight = sampleRejection(referenceUv);\n" +
++                "    frameWeight *= clamp(uObservationConfidence, 0.05, 1.0);\n" +
++                "    frameWeight *= iris26720HighZoomRowReliability(sampleUv.y);",
++            "frame-confidence",
++        )
++        source
++    }
++
++    /* IRIS_26720_HIGH_ZOOM_PROTECTED_RGB_RESOLVE
++     * Reuse the proven 26568 luma/topology protection. Direct-CFA chroma becomes authoritative
++     * only where full phase support, temporal repeatability, guide agreement, highlight safety,
++     * and same-material topology all agree; otherwise native Sabre/VGN chroma wins locally.
++     */
++    val highZoomRgbProtect26720: String by lazy {
++        val old = "    oRenderRgb = vec4(max(guideRgb * factor, vec3(0.0)), float(phaseCount * 8 + reasonClass));"
++        val replacement = """
++            vec3 luminanceOwnedRgb = max(guideRgb * factor, vec3(0.0));
++            float outputY = max(irisLuma(luminanceOwnedRgb), 0.0);
++            vec3 guideChroma = luminanceOwnedRgb - vec3(outputY);
++            float directPixelY = max(irisLuma(directRgb), 0.0);
++            vec3 directChroma = directRgb - vec3(directPixelY);
++            float pixelChromaDistance = length(irisChroma(directRgb) - irisChroma(guideRgb));
++            float strictChromaAgreement = 1.0 - irisSmooth01((pixelChromaDistance - 0.008) / 0.030);
++            float fullPhaseGate = phaseCount >= 4 ? 1.0 : 0.0;
++            float strongTemporalGate = irisSmooth01((temporalGate - 0.55) / 0.35);
++            float boundarySafe = 1.0 - irisSmooth01((materialBoundary - 0.08) / 0.42);
++            float directChromaConfidence = clamp(confidence * fullPhaseGate * strongTemporalGate *
++                strictChromaAgreement * highlightGate * boundarySafe, 0.0, 1.0);
++            vec3 chromaDelta = directChroma - guideChroma;
++            float chromaDeltaMagnitude = length(chromaDelta);
++            float maxChromaDelta = 0.020 + 0.30 * length(guideChroma);
++            if (chromaDeltaMagnitude > maxChromaDelta && chromaDeltaMagnitude > 1.0e-7)
++                chromaDelta *= maxChromaDelta / chromaDeltaMagnitude;
++            vec3 protectedChroma = guideChroma + chromaDelta * directChromaConfidence;
++            float nonNegativeScale26720 = 1.0;
++            if (protectedChroma.r < 0.0) nonNegativeScale26720 = min(nonNegativeScale26720,
++                outputY / max(-protectedChroma.r, 1.0e-7));
++            if (protectedChroma.g < 0.0) nonNegativeScale26720 = min(nonNegativeScale26720,
++                outputY / max(-protectedChroma.g, 1.0e-7));
++            if (protectedChroma.b < 0.0) nonNegativeScale26720 = min(nonNegativeScale26720,
++                outputY / max(-protectedChroma.b, 1.0e-7));
++            vec3 protectedRgb = vec3(outputY) + protectedChroma * clamp(nonNegativeScale26720, 0.0, 1.0);
++            oRenderRgb = vec4(max(protectedRgb, vec3(0.0)), float(phaseCount * 8 + reasonClass));
++        """.trimIndent().prependIndent("    ").trimEnd()
++        val first = true2xGuideRender26568.indexOf(old)
++        check(first >= 0) { "26720 protected RGB output anchor missing" }
++        check(true2xGuideRender26568.indexOf(old, first + old.length) < 0) { "26720 protected RGB output anchor duplicated" }
++        true2xGuideRender26568.replaceRange(first, first + old.length, replacement)
++    }
++
+     /* IRIS_26719_HIGH_ZOOM_LAZY_ISOLATION
+      * High-zoom shader derivation is intentionally lazy. Ordinary Sabre (<20x, or any route with
+      * enableHighZoomDetail=false) must never evaluate this transform while the shared shader object
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index f4138ce73621125b2221570821add5730c652716..c0eb16ee695080669459721b2be6ac9b8989a60a 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -202,6 +202,30 @@ internal class GlesMgcRawSpatialStacker(
+         val strongPct: Float,
+     )
+ 
++    private data class HighZoomRgbResult(
++        val path: String,
++        val width: Int,
++        val height: Int,
++        val originX: Int,
++        val originY: Int,
++        val fullWidth: Int,
++        val fullHeight: Int,
++        val sourceZoom: Float,
++        val activePct: Float,
++        val fullColorPct: Float,
++        val phaseMean: Float,
++        val phaseP10: Float,
++        val refineAcceptedPct: Float,
++        val frames: Int,
++        val reconstructionMs: Long,
++    )
++
++    private data class HighZoomRgbStats(
++        val activePct: Float,
++        val fullColorPct: Float,
++        val phase: True2xPhaseStats,
++    )
++
+     private data class True2xPhaseStats(
+         val mean: Float,
+         val p10: Float,
+@@ -614,6 +638,8 @@ internal class GlesMgcRawSpatialStacker(
+     private var true2xGuideRenderProgram26568 = 0
+     private var highZoomDetailMergeProgram26718 = 0
+     private var highZoomDetailResolveProgram26718 = 0
++    private var highZoomRgbMergeProgram26720 = 0
++    private var highZoomRgbProtectProgram26720 = 0
+     private var sabreShadowLongMergeProgram = 0
+     private var sabreShadowLongCopyMaskProgram = 0
+     private var sabreNormalDngMergeProgram = 0
+@@ -2208,6 +2234,7 @@ internal class GlesMgcRawSpatialStacker(
+         var superResLinearRawPath: String? = null
+         var true2xResult: True2xResult? = null
+         var highZoomDetailResult: HighZoomDetailResult? = null
++        var highZoomRgbResult: HighZoomRgbResult? = null
+         val true2xEvidence = ArrayList<True2xFrameEvidence>()
+         /* IRIS_26568_JPEG_TRUE2X_PHASE_RESERVOIR
+          * DNG requests retain the exact full 26567 NORMAL evidence population. JPEG-only SR keeps
+@@ -2485,6 +2512,7 @@ internal class GlesMgcRawSpatialStacker(
+                 sourceClippedWeight = if (highlightShortOneTunnel26604) 0.001f else 1f,
+                 accumulatedValidity26614 = accumulatedValidity26614,
+                 validityWeightScale26614 = validityWeightScale26614,
++                rowFlickerFrame26720 = frames.first().takeIf(::hasRowFlickerEvidence26720),
+             )
+             if (enableSabreSuperRes) {
+                 val referenceEvidence = persistTrue2xEvidence(
+@@ -2635,6 +2663,8 @@ internal class GlesMgcRawSpatialStacker(
+                     extractedHeight,
+                     durationRobustness,
+                     frame.role == RawBurstFrameRole.NORMAL,
++                    if (frame.role == RawBurstFrameRole.NORMAL) frames.first() else null,
++                    if (frame.role == RawBurstFrameRole.NORMAL) frame else null,
+                 )
+                 var frameWeight = createTexture(
+                     coverageWidth,
+@@ -2704,6 +2734,7 @@ internal class GlesMgcRawSpatialStacker(
+                         sourceClippedWeight = 0f,
+                         accumulatedValidity26614 = accumulatedValidity26614,
+                         validityWeightScale26614 = validityWeightScale26614,
++                        rowFlickerFrame26720 = frame.takeIf(::hasRowFlickerEvidence26720),
+                     )
+                 } else {
+                     require(index == frames.lastIndex) {
+@@ -3140,25 +3171,41 @@ internal class GlesMgcRawSpatialStacker(
+             }
+             if (enableHighZoomDetail) {
+                 val reconstructionEvidence = highZoomEvidence26718.toList()
+-                require(reconstructionEvidence.isNotEmpty()) { "26718 high-zoom has no NORMAL evidence" }
++                require(reconstructionEvidence.isNotEmpty()) { "26720 high-zoom has no NORMAL evidence" }
+                 val evidencePolicy = "retained=${reconstructionEvidence.size} allAdmittedNormal=true " +
+-                    "srReservoirIndependent=true normalOnly=true shortDetailEvidence=false longDetailEvidence=false"
+-                PLog.i(SABRE_TAG, "IRIS_26718_HIGH_ZOOM_EVIDENCE_POLICY $evidencePolicy")
+-                MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_EVIDENCE_POLICY", evidencePolicy)
+-                highZoomDetailResult = reconstructHighZoomDetail26718(
+-                    images = images, evidence = reconstructionEvidence,
+-                    nativeVgnGuideTexture = nativeHdrAuthority26601,
+-                )
+-                val hz = checkNotNull(highZoomDetailResult)
+-                require(File(hz.path).length() == hz.width.toLong() * hz.height * Short.SIZE_BYTES) {
+-                    "26718 high-zoom R16F sidecar size mismatch"
++                    "srReservoirIndependent=true normalOnly=true shortDetailEvidence=false longDetailEvidence=false " +
++                    "directCfaRgbAttempt=true scalar26719Fallback=true"
++                PLog.i(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_EVIDENCE_POLICY $evidencePolicy")
++                MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_EVIDENCE_POLICY", evidencePolicy)
++                val rgbAttempt = runCatching {
++                    reconstructHighZoomRgb26720(
++                        frames = frames, images = images, evidence = reconstructionEvidence,
++                        nativeVgnGuideTexture = nativeHdrAuthority26601,
++                    )
++                }
++                if (rgbAttempt.isSuccess) {
++                    highZoomRgbResult = rgbAttempt.getOrThrow()
++                    val hz = checkNotNull(highZoomRgbResult)
++                    require(File(hz.path).length() == hz.width.toLong() * hz.height * TRUE2X_RGB16F_BYTES_PER_PIXEL)
++                    val ready = "size=${hz.width}x${hz.height} origin=${hz.originX},${hz.originY} " +
++                        "full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} frames=${hz.frames} " +
++                        "activePct=${hz.activePct} fullColorPct=${hz.fullColorPct} phaseMean=${hz.phaseMean} phaseP10=${hz.phaseP10} " +
++                        "refineAcceptedPct=${hz.refineAcceptedPct} ms=${hz.reconstructionMs} " +
++                        "rgbOwner=DIRECT_CFA_WITH_NATIVE_SABRE_VGN_LOCAL_FALLBACK highlightOwnerUnchanged=true"
++                    PLog.i(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_RGB_READY $ready")
++                    MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_READY", ready)
++                } else {
++                    val failure = rgbAttempt.exceptionOrNull()
++                    PLog.e(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_RGB_FALLBACK_26719 reason=${failure?.message}", failure)
++                    MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_FALLBACK_26719",
++                        "reason=${failure?.javaClass?.simpleName}:${failure?.message} fallback=NORMAL_SCALAR_2X_LUMA_ROI")
++                    highZoomDetailResult = reconstructHighZoomDetail26718(
++                        images = images, evidence = reconstructionEvidence,
++                        nativeVgnGuideTexture = nativeHdrAuthority26601,
++                    )
++                    val hz = checkNotNull(highZoomDetailResult)
++                    require(File(hz.path).length() == hz.width.toLong() * hz.height * Short.SIZE_BYTES)
+                 }
+-                val ready = "size=${hz.width}x${hz.height} origin=${hz.originX},${hz.originY} " +
+-                    "full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} frames=${hz.frames} " +
+-                    "activePct=${hz.activePct} strongPct=${hz.strongPct} refineAcceptedPct=${hz.refineAcceptedPct} " +
+-                    "ms=${hz.reconstructionMs} rgbOwner=NATIVE_SABRE_VGN detailOwner=NORMAL_SCALAR_2X_LUMA_ROI"
+-                PLog.i(SABRE_TAG, "IRIS_26718_HIGH_ZOOM_DETAIL_READY $ready")
+-                MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_DETAIL_READY", ready)
+                 cleanupTrue2xEvidence(reconstructionEvidence)
+                 highZoomEvidence26718.clear()
+             }
+@@ -3306,6 +3353,21 @@ internal class GlesMgcRawSpatialStacker(
+                 highZoomRefineAcceptedPct = highZoomDetailResult?.refineAcceptedPct ?: 0f,
+                 highZoomDetailFrames = highZoomDetailResult?.frames ?: 0,
+                 highZoomDetailReconstructionMs = highZoomDetailResult?.reconstructionMs ?: 0L,
++                highZoomRgbPath = highZoomRgbResult?.path,
++                highZoomRgbWidth = highZoomRgbResult?.width ?: 0,
++                highZoomRgbHeight = highZoomRgbResult?.height ?: 0,
++                highZoomRgbOriginX = highZoomRgbResult?.originX ?: 0,
++                highZoomRgbOriginY = highZoomRgbResult?.originY ?: 0,
++                highZoomRgbFullWidth = highZoomRgbResult?.fullWidth ?: 0,
++                highZoomRgbFullHeight = highZoomRgbResult?.fullHeight ?: 0,
++                highZoomRgbSourceZoom = highZoomRgbResult?.sourceZoom ?: 1f,
++                highZoomRgbActivePct = highZoomRgbResult?.activePct ?: 0f,
++                highZoomRgbFullColorPct = highZoomRgbResult?.fullColorPct ?: 0f,
++                highZoomRgbPhaseMean = highZoomRgbResult?.phaseMean ?: 0f,
++                highZoomRgbPhaseP10 = highZoomRgbResult?.phaseP10 ?: 0f,
++                highZoomRgbRefineAcceptedPct = highZoomRgbResult?.refineAcceptedPct ?: 0f,
++                highZoomRgbFrames = highZoomRgbResult?.frames ?: 0,
++                highZoomRgbReconstructionMs = highZoomRgbResult?.reconstructionMs ?: 0L,
+             )
+         } catch (error: Exception) {
+             PLog.e(SABRE_TAG, "MGC Sabre merge failed", error)
+@@ -3327,6 +3389,7 @@ internal class GlesMgcRawSpatialStacker(
+                 runCatching { superResDetailPath?.let { File(it).delete() } }
+                 runCatching { superResLinearRawPath?.let { File(it).delete() } }
+                 runCatching { highZoomDetailResult?.path?.let { File(it).delete() } }
++                runCatching { highZoomRgbResult?.path?.let { File(it).delete() } }
+                 LargeDirectBuffer.free(cpuOutput)
+                 LargeDirectBuffer.free(normalStackedDngRaw16)
+                 if (exportedTexture != 0) {
+@@ -4380,6 +4443,8 @@ internal class GlesMgcRawSpatialStacker(
+         guideHeight: Int,
+         durationRobustness: Float = 1f,
+         rejectLowConfidenceTemporalTail: Boolean = false,
++        rowFlickerReference26720: RawStackFrame? = null,
++        rowFlickerCurrent26720: RawStackFrame? = null,
+     ) {
+         val program = rejectionProgram
+         GLES30.glUseProgram(program)
+@@ -4436,6 +4501,16 @@ internal class GlesMgcRawSpatialStacker(
+             "uRejectLowConfidenceTemporalTail",
+             if (rejectLowConfidenceTemporalTail) 1 else 0,
+         )
++        val refFlicker26720 = rowFlickerReference26720?.takeIf(::hasRowFlickerEvidence26720)
++        val curFlicker26720 = rowFlickerCurrent26720?.takeIf(::hasRowFlickerEvidence26720)
++        uniform1i(program, "uReferenceRowFlickerEnabled", if (refFlicker26720 != null) 1 else 0)
++        uniform1i(program, "uReferenceRowFlickerHarmonic", refFlicker26720?.rowFlickerHarmonic ?: 0)
++        uniform2f(program, "uReferenceRowFlickerAB", refFlicker26720?.rowFlickerA ?: 0f, refFlicker26720?.rowFlickerB ?: 0f)
++        uniform1f(program, "uReferenceRowFlickerStrength", refFlicker26720?.rowFlickerStrength?.coerceIn(0f, 1f) ?: 0f)
++        uniform1i(program, "uCurrentRowFlickerEnabled", if (curFlicker26720 != null) 1 else 0)
++        uniform1i(program, "uCurrentRowFlickerHarmonic", curFlicker26720?.rowFlickerHarmonic ?: 0)
++        uniform2f(program, "uCurrentRowFlickerAB", curFlicker26720?.rowFlickerA ?: 0f, curFlicker26720?.rowFlickerB ?: 0f)
++        uniform1f(program, "uCurrentRowFlickerStrength", curFlicker26720?.rowFlickerStrength?.coerceIn(0f, 1f) ?: 0f)
+         val targets = if (physicalReverseWeight != 0) {
+             intArrayOf(reverseWeight, pixelDifference, physicalReverseWeight)
+         } else {
+@@ -4774,6 +4849,31 @@ internal class GlesMgcRawSpatialStacker(
+         MotionTrace.processingState("IRIS_26651_NORMAL_MASTER_SHORT_FUSION", details)
+     }
+ 
++    private fun hasRowFlickerEvidence26720(frame: RawStackFrame): Boolean =
++        frame.role == RawBurstFrameRole.NORMAL && frame.rowFlickerHarmonic > 0 &&
++            frame.rowFlickerStrength.isFinite() && frame.rowFlickerStrength > 0f &&
++            frame.rowFlickerA.isFinite() && frame.rowFlickerB.isFinite()
++
++    private fun highZoomObservationQuality26720(
++        frame: RawStackFrame,
++        reference: RawStackFrame,
++        medianGyro: Float,
++    ): Float {
++        val gyroQuality = if (frame.gyroSampleCount > 0 && frame.gyroShakiness.isFinite() &&
++            frame.gyroShakiness >= 0f && medianGyro.isFinite() && medianGyro > 1.0e-8f) {
++            (medianGyro / max(frame.gyroShakiness, medianGyro)).coerceIn(0.45f, 1f)
++        } else 1f
++        val focusQuality = if (frame.focusDistanceDiopters.isFinite() &&
++            reference.focusDistanceDiopters.isFinite() && frame.focusDistanceDiopters >= 0f &&
++            reference.focusDistanceDiopters >= 0f) {
++            val delta = kotlin.math.abs(frame.focusDistanceDiopters - reference.focusDistanceDiopters)
++            val t = ((delta - 0.04f) / 0.14f).coerceIn(0f, 1f)
++            val smooth = t * t * (3f - 2f * t)
++            (1f - 0.40f * smooth).coerceIn(0.60f, 1f)
++        } else 1f
++        return (gyroQuality * focusQuality).coerceIn(0.35f, 1f)
++    }
++
+     private fun renderSabreMerge(
+         extracted: Int,
+         flow: SabreConvertedAlignment,
+@@ -4789,7 +4889,9 @@ internal class GlesMgcRawSpatialStacker(
+         sourceClippedWeight: Float,
+         accumulatedValidity26614: Int = 0,
+         validityWeightScale26614: Float = 1f,
++        rowFlickerFrame26720: RawStackFrame? = null,
+     ) {
++        val rowFlickerActive26720 = rowFlickerFrame26720?.let(::hasRowFlickerEvidence26720) == true
+         val program = sabreMergeProgram
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uExtractedBayer", 0, extracted)
+@@ -4813,6 +4915,17 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
+         uniform1f(program, "uSourceClippedWeight", sourceClippedWeight.coerceIn(0f, 1f))
+         uniform1f(program, "uValidityWeightScale", validityWeightScale26614.coerceAtLeast(1f))
++        uniform1i(program, "uRowFlickerEnabled", if (rowFlickerActive26720) 1 else 0)
++        if (rowFlickerActive26720) {
++            val f = checkNotNull(rowFlickerFrame26720)
++            uniform1i(program, "uRowFlickerHarmonic", f.rowFlickerHarmonic)
++            uniform2f(program, "uRowFlickerAB", f.rowFlickerA, f.rowFlickerB)
++            uniform1f(program, "uRowFlickerStrength", f.rowFlickerStrength.coerceIn(0f, 1f))
++        } else {
++            uniform1i(program, "uRowFlickerHarmonic", 0)
++            uniform2f(program, "uRowFlickerAB", 0f, 0f)
++            uniform1f(program, "uRowFlickerStrength", 0f)
++        }
+         uniform4fv(program, "uGains", calibration.gains)
+         uniform4fv(program, "uBlackLevelsTimesGains", calibration.blackTerms)
+         uniform4f(
+@@ -13377,6 +13490,216 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /* IRIS_26720_HIGH_ZOOM_DIRECT_CFA_RGB_GPU
++     * Compact ROI variant of the proven true2x GPU writer. It reconstructs camera-linear RGB
++     * directly from all admitted NORMAL CFA observations at supported 2x density. The native
++     * Sabre/VGN carrier remains the local guide/fallback in highZoomRgbProtect26720.
++     */
++    private fun runHighZoomRgbGpu26720(
++        frames: List<RawStackFrame>,
++        images: List<SafeImage>,
++        evidence: List<True2xFrameEvidence>,
++        outputFile: File,
++        nativeVgnGuideTexture: Int,
++        outputWidth: Int,
++        outputHeight: Int,
++        originX: Int,
++        originY: Int,
++        fullOutputWidth: Int,
++        fullOutputHeight: Int,
++    ): HighZoomRgbStats {
++        if (highZoomRgbMergeProgram26720 == 0) {
++            highZoomRgbMergeProgram26720 = linkProgram(
++                GlesMgcRawSabreShaders.highZoomRgbMerge26720, "iris_26720_high_zoom_rgb_merge",
++            )
++        }
++        if (true2xResolveProgram26564 == 0) {
++            true2xResolveProgram26564 = linkProgram(
++                GlesMgcRawSabreShaders.true2xResolve26564, "iris_26564_true2x_resolve",
++            )
++        }
++        if (highZoomRgbProtectProgram26720 == 0) {
++            highZoomRgbProtectProgram26720 = linkProgram(
++                GlesMgcRawSabreShaders.highZoomRgbProtect26720, "iris_26720_high_zoom_rgb_protect",
++            )
++        }
++        require(nativeVgnGuideTexture != 0) { "26720 high-zoom RGB requires native Sabre/VGN guide" }
++        require(evidence.isNotEmpty())
++        val normalGyro = frames.filter { it.role == RawBurstFrameRole.NORMAL && it.gyroSampleCount > 0 &&
++            it.gyroShakiness.isFinite() && it.gyroShakiness >= 0f }.map { it.gyroShakiness }.sorted()
++        val medianGyro = if (normalGyro.isEmpty()) Float.NaN else normalGyro[normalGyro.size / 2]
++        val reference = frames.first()
++        val qualities = FloatArray(frames.size) { index ->
++            highZoomObservationQuality26720(frames[index], reference, medianGyro)
++        }
++        val evidenceQualities = evidence.map { qualities[it.frameIndex] }
++        val qSorted = evidenceQualities.sorted()
++        val qMedian = if (qSorted.isEmpty()) 1f else qSorted[qSorted.size / 2]
++        val qualityProof = "frames=${evidence.size} gyroSamples=${normalGyro.size} medianGyro=$medianGyro " +
++            "qualityMin=${evidenceQualities.minOrNull() ?: 1f} qualityMedian=$qMedian " +
++            "qualityMax=${evidenceQualities.maxOrNull() ?: 1f} globalGyroDiscard=false opticalFlowAuthority=true"
++        PLog.i(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_SOURCE_QUALITY $qualityProof")
++        MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_SOURCE_QUALITY", qualityProof)
++
++        val maxTexture = IntArray(1)
++        GLES30.glGetIntegerv(GLES30.GL_MAX_TEXTURE_SIZE, maxTexture, 0)
++        checkGlError("IRIS26720 query GL_MAX_TEXTURE_SIZE")
++        require(maxTexture[0] >= TRUE2X_GPU_MIN_TEXTURE_SIZE)
++        val tileWidthLimit = minOf(outputWidth, maxTexture[0], TRUE2X_GPU_MAX_BAND_WIDTH).and(-2)
++        val tileHeightLimit = minOf(outputHeight, TRUE2X_GPU_TILE_HEIGHT, maxTexture[0]).and(-2)
++        require(tileWidthLimit >= 2 && tileHeightLimit >= 2)
++        val phaseHistogram = LongArray(5)
++        val reasonHistogram = LongArray(8)
++        val lensTexture = if (hasLensShading()) createLensShadingTexture() else 0
++        try {
++            RandomAccessFile(outputFile, "rw").use { out ->
++                out.setLength(outputWidth.toLong() * outputHeight * TRUE2X_RGB16F_BYTES_PER_PIXEL)
++                var localTop = 0
++                var bands = 0
++                while (localTop < outputHeight) {
++                    var tileHeight = minOf(tileHeightLimit, outputHeight - localTop)
++                    if ((tileHeight and 1) != 0) tileHeight--
++                    require(tileHeight > 0)
++                    var localLeft = 0
++                    while (localLeft < outputWidth) {
++                        var tileWidth = minOf(tileWidthLimit, outputWidth - localLeft)
++                        if ((tileWidth and 1) != 0) tileWidth--
++                        require(tileWidth > 0)
++                        val globalLeft = originX + localLeft
++                        val globalTop = originY + localTop
++                        require((globalLeft and 1) == 0 && (globalTop and 1) == 0)
++                        val tileStart = textures.size
++                        val color = createTexture(tileWidth, tileHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++                        val weights = createTexture(tileWidth, tileHeight, GLES30.GL_RG16F, GLES30.GL_NEAREST)
++                        val phase = createTexture(tileWidth, tileHeight, GLES30.GL_RGBA8, GLES30.GL_NEAREST)
++                        val temporal = createTexture(tileWidth, tileHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++                        try {
++                            bindRenderTargets(intArrayOf(color, weights, phase, temporal), "IRIS26720 high-zoom RGB tile clear")
++                            GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f,0f,0f,0f), 0)
++                            GLES30.glClearBufferfv(GLES30.GL_COLOR, 1, floatArrayOf(0f,0f,0f,0f), 0)
++                            GLES30.glClearBufferfv(GLES30.GL_COLOR, 2, floatArrayOf(0f,0f,0f,0f), 0)
++                            GLES30.glClearBufferfv(GLES30.GL_COLOR, 3, floatArrayOf(0f,0f,0f,0f), 0)
++                            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++                            for (ev in evidence) {
++                                val rawRect = true2xRegionForOutput(
++                                    globalLeft, globalTop, tileWidth, tileHeight,
++                                    ev.maxAbsFlowPixelsX, ev.maxAbsFlowPixelsY,
++                                )
++                                val rawLeft=rawRect[0]; val rawTop=rawRect[1]
++                                val rawWidth=rawRect[2]-rawLeft; val rawHeight=rawRect[3]-rawTop
++                                val covRect=true2xRawScaledRegion(rawRect,ev.covarianceWidth,ev.covarianceHeight,TRUE2X_EVIDENCE_HALO)
++                                val covLeft=covRect[0]; val covTop=covRect[1]
++                                val covWidth=covRect[2]-covLeft; val covHeight=covRect[3]-covTop
++                                val rejRect=true2xScaledRegion(globalLeft,globalTop,tileWidth,tileHeight,fullOutputWidth,fullOutputHeight,ev.rejectionWidth,ev.rejectionHeight,TRUE2X_EVIDENCE_HALO)
++                                val rejLeft=rejRect[0]; val rejTop=rejRect[1]
++                                val rejWidth=rejRect[2]-rejLeft; val rejHeight=rejRect[3]-rejTop
++                                readTrue2xRawRegion(images[ev.frameIndex],rawLeft,rawTop,rawWidth,rawHeight).use { raw ->
++                                    val cov=readTrue2xFileRegion(ev.covarianceFile,ev.covarianceWidth,4,covLeft,covTop,covWidth,covHeight,"26720 RGB covariance")
++                                    val rejection=ev.rejectionFile?.let { file ->
++                                        readTrue2xFileRegion(file,ev.rejectionWidth,1,rejLeft,rejTop,rejWidth,rejHeight,"26720 RGB rejection")
++                                    } ?: allocateTrue2xHostBuffer(1,"IRIS26720 identity rejection").apply { put(0,0xff.toByte()) }
++                                    try {
++                                        val rawTexture=uploadTrue2xTexture(rawWidth,rawHeight,GLES30.GL_R16UI,GLES30.GL_RED_INTEGER,GLES30.GL_UNSIGNED_SHORT,GLES30.GL_NEAREST,raw.buffer,"IRIS26720 RGB raw",unpackRowLength=raw.rowStrideSamples)
++                                        val flowTexture=uploadTrue2xTexture(ev.flowWidth,ev.flowHeight,GLES30.GL_RGBA16F,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,GLES30.GL_LINEAR,ev.flowData.duplicate().order(ByteOrder.nativeOrder()),"IRIS26720 RGB flow")
++                                        val covTexture=uploadTrue2xTexture(covWidth,covHeight,GLES30.GL_RGB10_A2,GLES30.GL_RGBA,GLES30.GL_UNSIGNED_INT_2_10_10_10_REV,GLES30.GL_LINEAR,cov,"IRIS26720 RGB covariance")
++                                        val rejectionTexture=uploadTrue2xTexture(if(ev.useFrameWeight)rejWidth else 1,if(ev.useFrameWeight)rejHeight else 1,GLES30.GL_R8,GLES30.GL_RED,GLES30.GL_UNSIGNED_BYTE,GLES30.GL_LINEAR,rejection,"IRIS26720 RGB rejection")
++                                        try {
++                                            val program=highZoomRgbMergeProgram26720
++                                            GLES30.glUseProgram(program)
++                                            bindTexture(program,"uRawRegion",0,rawTexture); bindTexture(program,"uFlow",1,flowTexture); bindTexture(program,"uCovarianceRegion",2,covTexture); bindTexture(program,"uRejectionRegion",3,rejectionTexture)
++                                            uniform2i(program,"uRawOrigin",rawLeft,rawTop); uniform2i(program,"uRawRegionSize",rawWidth,rawHeight); uniform2i(program,"uRawFullSize",width,height)
++                                            uniform2i(program,"uCovarianceOrigin",covLeft,covTop); uniform2i(program,"uCovarianceRegionSize",covWidth,covHeight); uniform2i(program,"uCovarianceFullSize",ev.covarianceWidth,ev.covarianceHeight)
++                                            uniform2i(program,"uRejectionOrigin",rejLeft,rejTop); uniform2i(program,"uRejectionRegionSize",rejWidth,rejHeight); uniform2i(program,"uRejectionFullSize",ev.rejectionWidth,ev.rejectionHeight)
++                                            uniform2i(program,"uOutputOrigin",globalLeft,globalTop); uniform2i(program,"uOutputFullSize",fullOutputWidth,fullOutputHeight)
++                                            uniform4f(program,"uFlowScaleOffset",ev.flowScaleX,ev.flowScaleY,ev.flowOffsetX,ev.flowOffsetY)
++                                            uniform1i(program,"uCfaPattern",cfaPattern); uniform1i(program,"uUseFrameWeight",if(ev.useFrameWeight)1 else 0)
++                                            uniform4fv(program,"uGains",ev.calibration.gains); uniform4fv(program,"uBlackLevelsTimesGains",ev.calibration.blackTerms)
++                                            uniform4f(program,"uCovRangeRg",COV_MIN_R,COV_MAX_R-COV_MIN_R,COV_MIN_G,COV_MAX_G-COV_MIN_G); uniform2f(program,"uCovRangeB",COV_MIN_B,COV_MAX_B-COV_MIN_B)
++                                            uniform1f(program,"uRawClipThreshold",sensorWhiteLevel*0.985f)
++                                            uniform1f(program,"uObservationConfidence",qualities[ev.frameIndex])
++                                            val f=frames[ev.frameIndex]
++                                            val rowFlickerActive26720=hasRowFlickerEvidence26720(f)
++                                            uniform1i(program,"uRowFlickerEnabled",if(rowFlickerActive26720)1 else 0)
++                                            if(rowFlickerActive26720) {
++                                                uniform1i(program,"uRowFlickerHarmonic",f.rowFlickerHarmonic)
++                                                uniform2f(program,"uRowFlickerAB",f.rowFlickerA,f.rowFlickerB)
++                                                uniform1f(program,"uRowFlickerStrength",f.rowFlickerStrength.coerceIn(0f,1f))
++                                            } else {
++                                                uniform1i(program,"uRowFlickerHarmonic",0); uniform2f(program,"uRowFlickerAB",0f,0f); uniform1f(program,"uRowFlickerStrength",0f)
++                                            }
++                                            GLES30.glEnable(GLES30.GL_BLEND); GLES30.glBlendEquation(GLES30.GL_FUNC_ADD); GLES30.glBlendFunc(GLES30.GL_ONE,GLES30.GL_ONE)
++                                            draw(program,tileWidth,tileHeight,intArrayOf(color,weights,phase,temporal),preserveBlend=true)
++                                            GLES30.glDisable(GLES30.GL_BLEND)
++                                        } finally {
++                                            releaseOwnedTexture(rawTexture,"IRIS26720 raw"); releaseOwnedTexture(flowTexture,"IRIS26720 flow"); releaseOwnedTexture(covTexture,"IRIS26720 covariance"); releaseOwnedTexture(rejectionTexture,"IRIS26720 rejection")
++                                        }
++                                    } finally { LargeDirectBuffer.free(rejection); LargeDirectBuffer.free(cov) }
++                                }
++                            }
++                            val resolved=createTexture(tileWidth,tileHeight,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++                            var program=true2xResolveProgram26564
++                            GLES30.glUseProgram(program); bindTexture(program,"uAccumulatedColor",0,color); bindTexture(program,"uAccumulatedWeightsGb",1,weights); if(lensTexture!=0)bindTexture(program,"uLensShading",2,lensTexture)
++                            uniform2i(program,"uOutputOrigin",globalLeft,globalTop); uniform2i(program,"uOutputFullSize",fullOutputWidth,fullOutputHeight); uniform3f(program,"uCameraDomainScale",cameraDomainScale[0],cameraDomainScale[1],cameraDomainScale[2]); uniform1i(program,"uUseLensShading",if(lensTexture!=0)1 else 0)
++                            draw(program,tileWidth,tileHeight,intArrayOf(resolved))
++                            val render=createTexture(tileWidth,tileHeight,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++                            program=highZoomRgbProtectProgram26720; GLES30.glUseProgram(program); bindTexture(program,"uDirectRgb",0,resolved); bindTexture(program,"uPhaseOccupancy",1,phase); bindTexture(program,"uNativeVgnGuide",2,nativeVgnGuideTexture); bindTexture(program,"uTemporalLumaStats",3,temporal)
++                            uniform2i(program,"uOutputOrigin",globalLeft,globalTop); uniform2i(program,"uOutputFullSize",fullOutputWidth,fullOutputHeight); uniform2i(program,"uGuideSize",width,height)
++                            draw(program,tileWidth,tileHeight,intArrayOf(render))
++                            writeTrue2xGpuRgbTile(out,render,localLeft,localTop,tileWidth,tileHeight,outputWidth,"IRIS26720 high-zoom RGB",phaseHistogram,reasonHistogram,null,outputHeight)
++                            checkGlError("IRIS26720 high-zoom RGB tile")
++                        } finally { releaseTexturesFrom(tileStart) }
++                        localLeft += tileWidth
++                    }
++                    localTop += tileHeight; bands++; GlesGpuScheduler.yieldToUiRenderer()
++                }
++                PLog.i(SABRE_TAG,"IRIS_26720_HIGH_ZOOM_RGB_BANDS width=$tileWidthLimit height=$tileHeightLimit bands=$bands evidence=${evidence.size}")
++            }
++        } finally {
++            if(lensTexture!=0&&textures.contains(lensTexture))releaseOwnedTexture(lensTexture,"IRIS26720 lens shading")
++        }
++        val expectedPixels=outputWidth.toLong()*outputHeight.toLong()
++        require(phaseHistogram.sum()==expectedPixels) { "26720 RGB phase proof incomplete" }
++        require(reasonHistogram.sum()==expectedPixels) { "26720 RGB reason proof incomplete" }
++        val active=reasonHistogram[1]+reasonHistogram[2]
++        val fullColor=reasonHistogram[2]
++        val activePct=(100.0*active.toDouble()/expectedPixels.toDouble()).toFloat()
++        val fullColorPct=(100.0*fullColor.toDouble()/expectedPixels.toDouble()).toFloat()
++        val phaseStats=true2xPhaseStats(phaseHistogram)
++        val proof="pixels=$expectedPixels active=$active activePct=$activePct fullColor=$fullColor fullColorPct=$fullColorPct " +
++            "phaseMean=${phaseStats.mean} phaseP10=${phaseStats.p10} temporalRejected=${reasonHistogram[3]} " +
++            "highlightRejected=${reasonHistogram[4]} chromaOrAgreementRejected=${reasonHistogram[5]} phaseRejected=${reasonHistogram[6]} " +
++            "signalRejected=${reasonHistogram[7]} fallbackOther=${reasonHistogram[0]} rgbOwner=DIRECT_CFA_WITH_NATIVE_SABRE_VGN_LOCAL_FALLBACK " +
++            "rawRewrite=false shortHighlightOwnerUnchanged=true"
++        PLog.i(SABRE_TAG,"IRIS_26720_HIGH_ZOOM_RGB_PROOF $proof")
++        MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_PROOF",proof)
++        return HighZoomRgbStats(activePct,fullColorPct,phaseStats)
++    }
++
++    private fun reconstructHighZoomRgb26720(
++        frames: List<RawStackFrame>,
++        images: List<SafeImage>,
++        evidence: List<True2xFrameEvidence>,
++        nativeVgnGuideTexture: Int,
++    ): HighZoomRgbResult {
++        require(enableHighZoomDetail && !enableSabreSuperRes)
++        val directory=checkNotNull(sabreSuperResTempDir); require(directory.exists()||directory.mkdirs())
++        val fullWidth=Math.multiplyExact(width,2); val fullHeight=Math.multiplyExact(height,2)
++        fun roundUp4(value:Int):Int=(value+3) and -4
++        val outputWidth=roundUp4((kotlin.math.ceil(fullWidth/highZoomSourceZoom.toDouble()).toInt()+4).coerceAtMost(fullWidth)).coerceAtLeast(4).coerceAtMost(fullWidth)
++        val outputHeight=roundUp4((kotlin.math.ceil(fullHeight/highZoomSourceZoom.toDouble()).toInt()+4).coerceAtMost(fullHeight)).coerceAtLeast(4).coerceAtMost(fullHeight)
++        val originX=(fullWidth-outputWidth)/2; val originY=(fullHeight-outputHeight)/2
++        require((originX and 1)==0 && (originY and 1)==0)
++        val output=File(directory,"iris26720_high_zoom_rgb_${System.nanoTime()}.rgb16f")
++        val start=System.nanoTime()
++        return try {
++            val stats=runHighZoomRgbGpu26720(frames,images,evidence,output,nativeVgnGuideTexture,outputWidth,outputHeight,originX,originY,fullWidth,fullHeight)
++            require(output.length()==outputWidth.toLong()*outputHeight*TRUE2X_RGB16F_BYTES_PER_PIXEL)
++            val refined=evidence.filter{it.frameIndex!=0}
++            val refinePct=if(refined.isEmpty())0f else refined.map{it.refineAcceptedPct}.average().toFloat()
++            HighZoomRgbResult(output.absolutePath,outputWidth,outputHeight,originX,originY,fullWidth,fullHeight,highZoomSourceZoom,stats.activePct,stats.fullColorPct,stats.phase.mean,stats.phase.p10,refinePct,evidence.size,elapsedMs(start))
++        } catch(error:Throwable) { runCatching{output.delete()}; throw error }
++    }
++
+     private fun runHighZoomDetailGpu26718(
+         images: List<SafeImage>,
+         evidence: List<True2xFrameEvidence>,
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+index 7503957ebc2cd4da53a94e16de360198336d9949..2a448d4dd636f90a80c71f9ac09534367590ef0b 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+@@ -121,6 +121,26 @@ data class RawStackResult(
+     val highZoomRefineAcceptedPct: Float = 0f,
+     val highZoomDetailFrames: Int = 0,
+     val highZoomDetailReconstructionMs: Long = 0L,
++    /* IRIS_26720_HIGH_ZOOM_DIRECT_CFA_RGB_ROI
++     * Protected camera-linear RGB16F centered ROI reconstructed directly from aligned NORMAL CFA
++     * samples. Native Sabre/VGN remains the local fallback and the sole highlight-safe guide.
++     * The legacy 26719 scalar sidecar is retained only as a failure fallback for this >=20x route.
++     */
++    val highZoomRgbPath: String? = null,
++    val highZoomRgbWidth: Int = 0,
++    val highZoomRgbHeight: Int = 0,
++    val highZoomRgbOriginX: Int = 0,
++    val highZoomRgbOriginY: Int = 0,
++    val highZoomRgbFullWidth: Int = 0,
++    val highZoomRgbFullHeight: Int = 0,
++    val highZoomRgbSourceZoom: Float = 1f,
++    val highZoomRgbActivePct: Float = 0f,
++    val highZoomRgbFullColorPct: Float = 0f,
++    val highZoomRgbPhaseMean: Float = 0f,
++    val highZoomRgbPhaseP10: Float = 0f,
++    val highZoomRgbRefineAcceptedPct: Float = 0f,
++    val highZoomRgbFrames: Int = 0,
++    val highZoomRgbReconstructionMs: Long = 0L,
+     /* IRIS_26520_V4_LIVE_MGC_NORMAL_DNG_SIDECAR */
+     val normalStackedDngRaw16: ByteBuffer? = null,
+     val normalStackedDngFrameCount: Int = 0,
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt
+index 0ae68032c220a4e55e4e484959d12a1526ab6759..6fe76fd34bb4ed5876e09f13fefc5d2ead137695 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt
+@@ -23,5 +23,14 @@ data class RawStackFrame(
+     val rollingShutterSkewNs: Long? = null,
+     val channelNoiseProfile: FloatArray? = null,
+     val dynamicBlackLevelByCfaPosition: FloatArray? = null,
++    /* IRIS_26720_NORMAL_CONFIDENCE_METADATA
++     * Read-only NORMAL confidence inputs. No source sample or exposure authority is transferred.
++     */
++    val rowFlickerHarmonic: Int = 0,
++    val rowFlickerA: Float = 0f,
++    val rowFlickerB: Float = 0f,
++    val rowFlickerStrength: Float = 0f,
++    val gyroShakiness: Float = Float.NaN,
++    val gyroSampleCount: Int = 0,
+     val role: RawBurstFrameRole = RawBurstFrameRole.NORMAL,
+ )
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 955232ba2e2bd8b9a9b98d068179bcbc87ae1563..ba9ae41a7fe9ae8f62b61fd15447bba1c67b1d9f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -2613,22 +2613,127 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return false;
+     }
+ 
+-    private long motion26678ChooseStructuralReferenceTimestamp(@NonNull List<ImageFrame> frames,
+-            @NonNull java.util.Set<Long> correctedTimestamps) {
++    /* IRIS_26720_CAPTURE_ROW_FLICKER_EVIDENCE
++     * Every ordinary ZSL RAW and every exact NORMAL top-up is already sampled by the 26678
++     * read-only detector before it can enter the frozen capture. Resolve that history by exact
++     * sensor timestamp only; never borrow preview evidence from another physical frame.
++     *
++     * Detector activation has temporal hysteresis, so a burst may contain coherent matching-band
++     * observations immediately before the detector's active bit rises. Once one selected NORMAL
++     * proves an active harmonic, retroactively admit only exact selected NORMAL observations with
++     * the same harmonic, >=3 coherent horizontal blocks and sufficient amplitude. This removes
++     * dependence on detector state at the later drain/dispatch instant without inventing phase.
++     */
++    private boolean motion26720FindExactFrameFlickerEvidenceLocked(long timestampNs,
++            @NonNull float[] out) {
++        if (out.length < 6) return false;
++        for (int i = 0; i < MOTION_26678_FLICKER_HISTORY; i++) {
++            if (mMotion26678FlickerTimestampNs[i] != timestampNs) continue;
++            out[0] = mMotion26678FlickerHarmonic[i];
++            out[1] = mMotion26678FlickerA[i];
++            out[2] = mMotion26678FlickerB[i];
++            out[3] = mMotion26678FlickerAmplitude[i];
++            out[4] = mMotion26678FlickerStrength[i];
++            out[5] = mMotion26678FlickerCoherentBlocks[i];
++            return mMotion26678FlickerHarmonic[i] > 0;
++        }
++        java.util.Arrays.fill(out, 0.0f);
++        return false;
++    }
++
++    private static void motion26720ClearNormalRowFlickerEvidence(@NonNull ImageFrame frame) {
++        frame.motionV2RowFlickerValid = false;
++        frame.motionV2RowFlickerHarmonic = 0;
++        frame.motionV2RowFlickerA = 0.0f;
++        frame.motionV2RowFlickerB = 0.0f;
++        frame.motionV2RowFlickerAmplitude = 0.0f;
++        frame.motionV2RowFlickerStrength = 0.0f;
++    }
++
++    private int motion26720AttachNormalRowFlickerEvidence(@NonNull List<ImageFrame> frames) {
++        if (frames.isEmpty()) return 0;
++        synchronized (mMotion26678FlickerLock) {
++            int confirmedHarmonic = 0;
++            long newestConfirmedTimestamp = -1L;
++            final float[] evidence = new float[6];
++            for (ImageFrame frame : frames) {
++                if (frame == null) continue;
++                if (!motion26720FindExactFrameFlickerEvidenceLocked(frame.timestamp, evidence)) continue;
++                final boolean activeExact = evidence[0] > 0.0f
++                        && evidence[5] >= 3.0f
++                        && evidence[3] >= MOTION_26678_FLICKER_MIN_LOG_AMPLITUDE
++                        && evidence[4] > 0.0f;
++                if (activeExact && frame.timestamp > newestConfirmedTimestamp) {
++                    confirmedHarmonic = Math.max(0, Math.round(evidence[0]));
++                    newestConfirmedTimestamp = frame.timestamp;
++                }
++            }
++            if (confirmedHarmonic <= 0) {
++                for (ImageFrame frame : frames) {
++                    if (frame != null) motion26720ClearNormalRowFlickerEvidence(frame);
++                }
++                return 0;
++            }
++
++            int attached = 0;
++            for (ImageFrame frame : frames) {
++                if (frame == null) continue;
++                final boolean measured = motion26720FindExactFrameFlickerEvidenceLocked(
++                        frame.timestamp, evidence);
++                final boolean valid = measured
++                        && Math.max(0, Math.round(evidence[0])) == confirmedHarmonic
++                        && evidence[5] >= 3.0f
++                        && evidence[3] >= MOTION_26678_FLICKER_MIN_LOG_AMPLITUDE;
++                if (!valid) {
++                    motion26720ClearNormalRowFlickerEvidence(frame);
++                    continue;
++                }
++                frame.motionV2RowFlickerValid = true;
++                frame.motionV2RowFlickerHarmonic = confirmedHarmonic;
++                frame.motionV2RowFlickerA = evidence[1];
++                frame.motionV2RowFlickerB = evidence[2];
++                frame.motionV2RowFlickerAmplitude = Math.max(0.0f, evidence[3]);
++                frame.motionV2RowFlickerStrength = 1.0f;
++                attached++;
++            }
++            return attached;
++        }
++    }
++
++    /* IRIS_26720_LEAST_FLICKERED_STRUCTURAL_REFERENCE
++     * Keep 26719's newest-NORMAL structural reference unless the selected burst itself contains
++     * confirmed exact-timestamp row-flicker evidence. Then choose the exact sampled NORMAL with
++     * the lowest measured global row-harmonic amplitude (tie newest). A measured frame where the
++     * confirmed band is absent therefore naturally wins over a dark-band observation.
++     */
++    private long motion26678ChooseStructuralReferenceTimestamp(@NonNull List<ImageFrame> frames) {
+         if (frames.isEmpty()) return -1L;
+-        long fallback = frames.get(frames.size() - 1).timestamp;
+-        if (!mMotion26678FlickerActive || correctedTimestamps.isEmpty()) return fallback;
++        final long fallback = frames.get(frames.size() - 1).timestamp;
++        int confirmedHarmonic = 0;
++        for (ImageFrame frame : frames) {
++            if (frame != null && frame.motionV2RowFlickerValid) {
++                confirmedHarmonic = frame.motionV2RowFlickerHarmonic;
++                break;
++            }
++        }
++        if (confirmedHarmonic <= 0) return fallback;
++
+         float bestPenalty = Float.POSITIVE_INFINITY;
+         long bestTimestamp = -1L;
+-        for (ImageFrame frame : frames) {
+-            if (frame == null || !correctedTimestamps.contains(frame.timestamp)) continue;
+-            float penalty = motion26678ExactFlickerPenalty(frame.timestamp);
+-            if (!Float.isFinite(penalty)) continue;
+-            if (penalty < bestPenalty - 1.0e-6f
+-                    || (Math.abs(penalty - bestPenalty) <= 1.0e-6f
+-                            && frame.timestamp > bestTimestamp)) {
+-                bestPenalty = penalty;
+-                bestTimestamp = frame.timestamp;
++        final float[] evidence = new float[6];
++        synchronized (mMotion26678FlickerLock) {
++            for (ImageFrame frame : frames) {
++                if (frame == null) continue;
++                if (!motion26720FindExactFrameFlickerEvidenceLocked(frame.timestamp, evidence)) continue;
++                final int harmonic = Math.max(0, Math.round(evidence[0]));
++                final float penalty = harmonic == confirmedHarmonic
++                        ? Math.max(0.0f, evidence[3]) : 0.0f;
++                if (penalty < bestPenalty - 1.0e-6f
++                        || (Math.abs(penalty - bestPenalty) <= 1.0e-6f
++                                && frame.timestamp > bestTimestamp)) {
++                    bestPenalty = penalty;
++                    bestTimestamp = frame.timestamp;
++                }
+             }
+         }
+         return bestTimestamp > 0L ? bestTimestamp : fallback;
+@@ -9840,8 +9945,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         // Copy selected Images to ImageFrames only now (on shutter press)
+         List<ImageFrame> selected = new ArrayList<>();
+         HashMap<Long, TotalCaptureResult> selectedResults = new HashMap<>();
+-        java.util.HashSet<Long> iris26678CorrectedNormalTimestamps = new java.util.HashSet<>();
+         int iris26678CorrectedNormals = 0;
++        int iris26720FlickerEvidenceNormals = 0;
+         ImageFrame iris26480ShortFrame = null;
+         TotalCaptureResult iris26480ShortResult = null;
+ 
+@@ -9991,8 +10096,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             frame.motionV2ExposureEnergy = ExposureIndex.time2sec(actualExposureNs) * actualIso;
+             populateMotion26480FrameMetadata(frame, frameResult, false);
+             if (applyMotion26678NormalRowFlickerCorrection(frame)) {
++                // Permanent regression sentinel: this must remain unreachable in 26720.
+                 iris26678CorrectedNormals++;
+-                iris26678CorrectedNormalTimestamps.add(frame.timestamp);
+             }
+             if (frame.motionV2ExposureEnergy <= 0.0)
+                 frame.motionV2ExposureEnergy = ExposureIndex.time2sec(actualExposureNs) * actualIso;
+@@ -10258,19 +10363,22 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+         final int capturedCount = actualCount;
++        iris26720FlickerEvidenceNormals = motion26720AttachNormalRowFlickerEvidence(selected);
+         final long iris26678StructuralReferenceTimestamp =
+-                motion26678ChooseStructuralReferenceTimestamp(
+-                        selected, iris26678CorrectedNormalTimestamps);
++                motion26678ChooseStructuralReferenceTimestamp(selected);
+         final TotalCaptureResult iris26678StructuralReferenceResult =
+                 selectedResults.get(iris26678StructuralReferenceTimestamp);
+         com.particlesdevs.photoncamera.util.MotionTrace.state(
+                 mMotionDiagnosticShotId, "IRIS_26678_ROW_FLICKER_CAPTURE",
+-                "active=" + mMotion26678FlickerActive
++                "active=" + (iris26720FlickerEvidenceNormals > 0)
++                        + " detectorCurrentActive=" + mMotion26678FlickerActive
+                         + " correctedNormals=" + iris26678CorrectedNormals
++                        + " evidenceNormals=" + iris26720FlickerEvidenceNormals
+                         + " totalNormals=" + actualCount
+                         + " structuralReferenceTimestamp=" + iris26678StructuralReferenceTimestamp
+                         + " exactFrameBudgetUnchanged=true"
+-                        + " shortLongUntouched=true");
++                        + " rawRewritten=false confidenceOnly=true"
++                        + " shortLongUntouched=true highlightRecoveryUntouched=true dngUntouched=true");
+ 
+         com.particlesdevs.photoncamera.util.MotionTrace.state(
+                 mMotionDiagnosticShotId,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+index 3534245489a112ee366179d80bd13684c3269ffa..1c8520517be0038f3abf8b38b29036976e786dd3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+@@ -86,6 +86,17 @@ public class ImageFrame {
+     public boolean motionV2NoiseProfileValid = false;
+     public String motionV2NoiseProfileSource = "UNAVAILABLE";
+ 
++    /* IRIS_26720_CAPTURE_ROW_FLICKER_EVIDENCE
++     * Exact SENSOR_TIMESTAMP-owned detector evidence for this physical NORMAL RAW. These values
++     * are metadata only: RAW bytes, HAL AE, SHORT/LONG and DNG publication remain untouched.
++     */
++    public boolean motionV2RowFlickerValid = false;
++    public int motionV2RowFlickerHarmonic = 0;
++    public float motionV2RowFlickerA = 0.0f;
++    public float motionV2RowFlickerB = 0.0f;
++    public float motionV2RowFlickerAmplitude = 0.0f;
++    public float motionV2RowFlickerStrength = 0.0f;
++
+     /* IRIS_26512_MGC1271_IMMUTABLE_RAW_PLANE_CONTRACT
+      * Preserve Camera2 logical geometry separately from row/pixel stride. The existing Motion
+      * copy remains the owner of the direct buffer; this metadata only describes that copy.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+index 85226d3575515bff95e12f32e508b7eaa170f279..fffed9d810e8645d46c3d0c4d6b705ad261e7b4d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ColorTransform.java
+@@ -2,6 +2,12 @@ package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
+ 
+ import android.graphics.Point;
+ 
++import java.io.File;
++import java.io.FileInputStream;
++import java.nio.ByteBuffer;
++import java.nio.ByteOrder;
++import java.nio.channels.FileChannel;
++
+ import com.particlesdevs.photoncamera.processing.opengl.GLFormat;
+ import com.particlesdevs.photoncamera.processing.opengl.GLTexture;
+ import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
+@@ -10,6 +16,7 @@ import com.particlesdevs.photoncamera.util.Log;
+ 
+ import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+ import static android.opengl.GLES20.GL_NEAREST;
++import static android.opengl.GLES20.GL_LINEAR;
+ 
+ /**
+  * IRIS_26628_MOTION_NIGHT_DNG_PROFILE_COLOR_OWNER
+@@ -23,6 +30,7 @@ public final class MotionV2ColorTransform extends Node {
+     private GLTexture profileHueSatTexture;
+     private GLTexture profileLookTexture;
+     private GLTexture acr3Texture;
++    private GLTexture highZoomRgbTexture26720;
+ 
+     public MotionV2ColorTransform() { super("", "MotionV2ColorTransform"); }
+     @Override public void Compile() {}
+@@ -31,9 +39,47 @@ public final class MotionV2ColorTransform extends Node {
+         if (profileHueSatTexture != null) profileHueSatTexture.close();
+         if (profileLookTexture != null) profileLookTexture.close();
+         if (acr3Texture != null) acr3Texture.close();
++        if (highZoomRgbTexture26720 != null) highZoomRgbTexture26720.close();
+         profileHueSatTexture = null;
+         profileLookTexture = null;
+         acr3Texture = null;
++        highZoomRgbTexture26720 = null;
++    }
++
++    /* IRIS_26720_HIGH_ZOOM_RGB_TEXTURE_OWNER
++     * Consume the compact camera-linear RGB16F ROI once, after native Sabre/SHORT highlight
++     * analysis and immediately before the existing color owner. Below 20x this is never called.
++     */
++    private GLTexture loadHighZoomRgb26720() {
++        final com.particlesdevs.photoncamera.processing.render.Parameters p = basePipeline.mParameters;
++        if (!p.motionV2HighZoomRgbPrepared || p.motionV2HighZoomRgbPath == null) return null;
++        final int w=p.motionV2HighZoomRgbWidth, h=p.motionV2HighZoomRgbHeight;
++        if (w<=0 || h<=0 || p.motionV2HighZoomRgbFullWidth<=0 || p.motionV2HighZoomRgbFullHeight<=0)
++            throw new IllegalStateException("26720 invalid high-zoom RGB geometry");
++        final File file=new File(p.motionV2HighZoomRgbPath);
++        final long expected=(long)w*h*3L*2L;
++        if (!file.isFile() || file.length()!=expected)
++            throw new IllegalStateException("26720 high-zoom RGB file mismatch expected="+expected+
++                    " actual="+(file.isFile()?file.length():-1));
++        if (expected>Integer.MAX_VALUE) throw new IllegalStateException("26720 high-zoom RGB buffer too large");
++        final ByteBuffer bytes=ByteBuffer.allocateDirect((int)expected).order(ByteOrder.nativeOrder());
++        try (FileInputStream input=new FileInputStream(file); FileChannel channel=input.getChannel()) {
++            while(bytes.hasRemaining()) { int read=channel.read(bytes); if(read<0) break; }
++            if(bytes.hasRemaining()) throw new IllegalStateException("26720 short high-zoom RGB read");
++            bytes.flip();
++            GLTexture texture=new GLTexture(new Point(w,h),
++                    new GLFormat(GLFormat.DataType.FLOAT_16,3),bytes,GL_LINEAR,GL_CLAMP_TO_EDGE);
++            if(!file.delete() && file.exists()) try { java.nio.file.Files.deleteIfExists(file.toPath()); } catch(Throwable ignored) {}
++            p.motionV2HighZoomRgbPath=null;
++            Log.i(Name,"IRIS_26720_HIGH_ZOOM_RGB_TEXTURE_LOADED size="+w+"x"+h+
++                    " origin="+p.motionV2HighZoomRgbOriginX+","+p.motionV2HighZoomRgbOriginY+
++                    " activePct="+p.motionV2HighZoomRgbActivePct+" fullColorPct="+p.motionV2HighZoomRgbFullColorPct+
++                    " phaseMean="+p.motionV2HighZoomRgbPhaseMean+" phaseP10="+p.motionV2HighZoomRgbPhaseP10+
++                    " frames="+p.motionV2HighZoomRgbFrames);
++            return texture;
++        } catch(Exception error) {
++            throw new IllegalStateException("26720 high-zoom RGB load failed",error);
++        }
+     }
+ 
+     @Override
+@@ -65,12 +111,28 @@ public final class MotionV2ColorTransform extends Node {
+                 basePipeline.mParameters.irisJpegLookMapSize);
+         if (hasHueSat) glProg.setDefine("USE_PROFILE_HUESAT", 1);
+         if (hasLook) glProg.setDefine("USE_PROFILE_LOOK", 1);
++        final boolean useHighZoomRgb26720=basePipeline.mParameters.motionV2HighZoomRgbPrepared;
++        if (useHighZoomRgb26720) {
++            highZoomRgbTexture26720=loadHighZoomRgb26720();
++            if (highZoomRgbTexture26720==null) throw new IllegalStateException("26720 prepared high-zoom RGB missing texture");
++            glProg.setDefine("USE_IRIS_26720_HIGH_ZOOM_RGB",1);
++        }
+         final PostPipeline pipeline = (PostPipeline) basePipeline;
+         final boolean iris26653HighlightCompression =
+                 basePipeline.mParameters.motionV2Active
+                         && pipeline.motionV2PhotonHighlightCompressionEnabled;
+         glProg.useAssetProgram("motionv2/color_transform");
+         glProg.setTexture("InputBuffer", previousNode.WorkingTexture);
++        if(useHighZoomRgb26720) {
++            glProg.setTexture("iris26720HighZoomRgb",highZoomRgbTexture26720);
++            glProg.setVar("iris26720HighZoomOrigin",new Point(
++                    basePipeline.mParameters.motionV2HighZoomRgbOriginX,
++                    basePipeline.mParameters.motionV2HighZoomRgbOriginY));
++            glProg.setVar("iris26720HighZoomFullSize",new Point(
++                    basePipeline.mParameters.motionV2HighZoomRgbFullWidth,
++                    basePipeline.mParameters.motionV2HighZoomRgbFullHeight));
++            glProg.setVar("iris26720HighZoomSourceZoom",basePipeline.mParameters.motionV2HighZoomRgbSourceZoom);
++        }
+         /* IRIS_26653_NO_PRECOLOR_HIGHLIGHT_TONE
+          * Highlight Compression is analysis-only here. Color formation receives the exact fused
+          * extended-linear carrier; the final common-RGB scalar tone is applied only after the
+@@ -110,6 +172,12 @@ public final class MotionV2ColorTransform extends Node {
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+         glProg.closed = true;
++        if(useHighZoomRgb26720) {
++            basePipeline.mParameters.motionV2HighZoomRgbApplied=true;
++            Log.i(Name,"IRIS_26720_HIGH_ZOOM_RGB_APPLIED reconstructionZoom="+
++                    basePipeline.mParameters.motionV2ReconstructionZoom+" renderResidualZoom="+
++                    basePipeline.mParameters.motionV2RenderResidualZoom+" nativeSabreFallback=true highlightRecoveryUnchanged=true");
++        }
+ 
+         Log.i(Name, "IRIS_26628_BJZHOU_PROFILE_COLOR"
+                 + " mode=" + (basePipeline.mParameters.irisNightActive ? "NIGHT" : "MOTION")
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index f9544950dfe527ba616e8ea56e9dba8d77150931..ace56959ddb38627446406d5a0aefffdfa7a73c3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1156,8 +1156,14 @@ public final class MotionV2Render extends Node {
+                 basePipeline.mParameters.motionV2GlobalZoom >= 20.0f &&
+                 basePipeline.mParameters.motionV2OutputZoom > 1.00001f &&
+                 !basePipeline.mParameters.motionV2SuperResOutputEnabled &&
+-                !iris26718HighZoomDetailEnabled) {
+-            throw new IllegalStateException("26718 high-zoom route active without detail texture");
++                !iris26718HighZoomDetailEnabled &&
++                !basePipeline.mParameters.motionV2HighZoomRgbApplied) {
++            throw new IllegalStateException("26720 high-zoom route active without RGB owner or 26719 scalar fallback");
++        }
++        if (basePipeline.mParameters.motionV2HighZoomRgbApplied &&
++                (Math.abs(basePipeline.mParameters.motionV2RenderResidualZoom - 1.0f) > 1.0e-5f ||
++                 iris26718HighZoomDetailEnabled)) {
++            throw new IllegalStateException("26720 RGB high-zoom must own crop exactly once");
+         }
+         final boolean iris26702LocalLaplacianEnabled =
+                 basePipeline.mParameters.motionV2Active
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 28bd5807cdb0e7914ffbb39e0607c91956f35cea..005af49cd55e2a6e539b6d8b7d287e58c73968c4 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -108,16 +108,26 @@ public class PostPipeline extends GLBasePipeline {
+                     + " Sabre reconstruction owner=" + owner);
+         }
+         final float expectedOutputScale = mParameters.motionV2SuperResOutputEnabled ? 2.0f : 1.0f;
+-        if (Math.abs(mParameters.motionV2ReconstructionZoom - 1.0f) > 1.0e-5f
++        final boolean highZoomRgb26720 = mParameters.motionV2HighZoomRgbPrepared;
++        final float expectedReconstructionZoom26720 = highZoomRgb26720 ? mParameters.motionV2OutputZoom : 1.0f;
++        final boolean highZoomRgbContract26720 = !highZoomRgb26720 || (mParameters.motionV2Active
++                && !mParameters.irisNightActive && !mParameters.motionV2SuperResOutputEnabled
++                && mParameters.motionV2GlobalZoom >= 20.0f && mParameters.motionV2OutputZoom > 1.00001f
++                && mParameters.motionV2HighZoomRgbPath != null
++                && Math.abs(mParameters.motionV2RenderResidualZoom - 1.0f) <= 1.0e-5f);
++        if (Math.abs(mParameters.motionV2ReconstructionZoom - expectedReconstructionZoom26720) > 1.0e-5f
+                 || Math.abs(mParameters.motionV2SpatialReconstructionZoom - 1.0f) > 1.0e-5f
+-                || Math.abs(mParameters.motionV2SuperResOutputScale - expectedOutputScale) > 1.0e-5f) {
++                || Math.abs(mParameters.motionV2SuperResOutputScale - expectedOutputScale) > 1.0e-5f
++                || !highZoomRgbContract26720) {
+             throw new IllegalStateException("26562 " + pipeline
+                     + " invalid Sabre SR geometry reconstructionZoom="
+                     + mParameters.motionV2ReconstructionZoom
+                     + " spatialZoom=" + mParameters.motionV2SpatialReconstructionZoom
+                     + " srEnabled=" + mParameters.motionV2SuperResOutputEnabled
+                     + " outputScale=" + mParameters.motionV2SuperResOutputScale
+-                    + " expectedOutputScale=" + expectedOutputScale);
++                    + " expectedOutputScale=" + expectedOutputScale
++                    + " highZoomRgb26720=" + highZoomRgb26720
++                    + " highZoomRgbPath=" + (mParameters.motionV2HighZoomRgbPath != null));
+         }
+         if (Math.abs(mParameters.motionV2MgcSourceExposureGain - 1.0f) > 1.0e-5f) {
+             throw new IllegalStateException("26560 " + pipeline
+@@ -129,7 +139,8 @@ public class PostPipeline extends GLBasePipeline {
+                 + " sourceGain=" + mParameters.motionV2MgcSourceExposureGain
+                 + " reconstructionZoom=" + mParameters.motionV2ReconstructionZoom
+                 + " superResRequested=" + mParameters.motionV2SuperResOutputEnabled
+-                + " superResScale=" + mParameters.motionV2SuperResOutputScale);
++                + " superResScale=" + mParameters.motionV2SuperResOutputScale
++                + " highZoomRgb26720=" + highZoomRgb26720);
+     }
+ 
+     public int getRotation() {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 8add03ac9a248cedb2b4f214061ab8dbac96054d..f4cde8fe35233a3446b5f57eb72a23a3a7f449c0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -64,6 +64,8 @@ public class HdrxProcessor extends ProcessorBase {
+     private String mMotion26564True2xRenderRgbPathForCleanup;
+     /* IRIS_26718_HIGH_ZOOM_EXCEPTION_CLEANUP_OWNER */
+     private String mMotion26718HighZoomDetailPathForCleanup;
++    /* IRIS_26720_HIGH_ZOOM_RGB_EXCEPTION_CLEANUP_OWNER */
++    private String mMotion26720HighZoomRgbPathForCleanup;
+     private int imageFormat;
+     /* config */
+     private int alignAlgorithm;
+@@ -108,6 +110,7 @@ public class HdrxProcessor extends ProcessorBase {
+         this.mMotion26564True2xLinearRgbPathForCleanup = null;
+         this.mMotion26564True2xRenderRgbPathForCleanup = null;
+         this.mMotion26718HighZoomDetailPathForCleanup = null;
++        this.mMotion26720HighZoomRgbPathForCleanup = null;
+         Log.d(TAG, "HdrxProcessor called start()");
+         Run();
+     }
+@@ -214,6 +217,10 @@ public class HdrxProcessor extends ProcessorBase {
+                 try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(mMotion26718HighZoomDetailPathForCleanup)); } catch (Throwable ignored) {}
+                 mMotion26718HighZoomDetailPathForCleanup = null;
+             }
++            if (mMotion26720HighZoomRgbPathForCleanup != null) {
++                try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(mMotion26720HighZoomRgbPathForCleanup)); } catch (Throwable ignored) {}
++                mMotion26720HighZoomRgbPathForCleanup = null;
++            }
+             if(iris26480OriginalPriority!=null)try{android.os.Process.setThreadPriority(
+                     android.os.Process.myTid(),iris26480OriginalPriority);}catch(Throwable ignored){}
+         }
+@@ -704,6 +711,7 @@ private void ApplyHdrX() {
+             mMotion26564True2xLinearRgbPathForCleanup = iris26564True2xLinearRgbPath;
+             mMotion26564True2xRenderRgbPathForCleanup = iris26564True2xRenderRgbPath;
+             mMotion26718HighZoomDetailPathForCleanup = processingParameters.motionV2HighZoomDetailPath;
++            mMotion26720HighZoomRgbPathForCleanup = processingParameters.motionV2HighZoomRgbPath;
+             iris26564True2xWidth = iris26409V2.true2xWidth;
+             iris26564True2xHeight = iris26409V2.true2xHeight;
+             iris26564True2xBackend = iris26409V2.true2xBackend;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 2db200ba7beca613db0d285b59f8085f5ac51b2f..d551ef59928259c7f7d18c88b00f3ba74fd37f4f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -107,6 +107,8 @@ object PhotonMotionMgc1271Bridge {
+         var true2xOutputHandedOff = false
+         var highZoomDetailPathForCleanup: String? = null
+         var highZoomDetailHandedOff = false
++        var highZoomRgbPathForCleanup: String? = null
++        var highZoomRgbHandedOff = false
+         val iris26535TotalStartNs = System.nanoTime()
+         var iris26535FusionMs = -1L
+         var iris26535DenoiseMs = -1L
+@@ -364,6 +366,16 @@ object PhotonMotionMgc1271Bridge {
+                         frame.motionV2NoiseProfile.copyOf()
+                     },
+                     dynamicBlackLevelByCfaPosition = frame.motionV2BlackLevel.copyOf(),
++                    rowFlickerHarmonic = if (role == RawBurstFrameRole.NORMAL && frame.motionV2RowFlickerValid)
++                        frame.motionV2RowFlickerHarmonic else 0,
++                    rowFlickerA = if (role == RawBurstFrameRole.NORMAL && frame.motionV2RowFlickerValid)
++                        frame.motionV2RowFlickerA else 0f,
++                    rowFlickerB = if (role == RawBurstFrameRole.NORMAL && frame.motionV2RowFlickerValid)
++                        frame.motionV2RowFlickerB else 0f,
++                    rowFlickerStrength = if (role == RawBurstFrameRole.NORMAL && frame.motionV2RowFlickerValid)
++                        frame.motionV2RowFlickerStrength else 0f,
++                    gyroShakiness = frame.frameGyro?.shakiness?.takeIf { it.isFinite() && it >= 0f } ?: Float.NaN,
++                    gyroSampleCount = frame.frameGyro?.samples ?: 0,
+                     role = role,
+                 )
+             }
+@@ -405,11 +417,29 @@ object PhotonMotionMgc1271Bridge {
+             parameters.motionV2HighZoomRefineAcceptedPct = 0f
+             parameters.motionV2HighZoomDetailFrames = 0
+             parameters.motionV2HighZoomDetailReconstructionMs = 0L
++            parameters.motionV2HighZoomRgbPath = null
++            parameters.motionV2HighZoomRgbWidth = 0
++            parameters.motionV2HighZoomRgbHeight = 0
++            parameters.motionV2HighZoomRgbOriginX = 0
++            parameters.motionV2HighZoomRgbOriginY = 0
++            parameters.motionV2HighZoomRgbFullWidth = 0
++            parameters.motionV2HighZoomRgbFullHeight = 0
++            parameters.motionV2HighZoomRgbSourceZoom = localOutputZoom
++            parameters.motionV2HighZoomRgbActivePct = 0f
++            parameters.motionV2HighZoomRgbFullColorPct = 0f
++            parameters.motionV2HighZoomRgbPhaseMean = 0f
++            parameters.motionV2HighZoomRgbPhaseP10 = 0f
++            parameters.motionV2HighZoomRgbRefineAcceptedPct = 0f
++            parameters.motionV2HighZoomRgbFrames = 0
++            parameters.motionV2HighZoomRgbReconstructionMs = 0L
++            parameters.motionV2HighZoomRgbPrepared = false
++            parameters.motionV2HighZoomRgbApplied = false
+             val referenceStackFrame = frames.firstOrNull { it.frameNumber == mgcBase.motionV2FrameNumber } ?: frames.first()
+             val highZoomActivation = "enabled=$highZoomDetailEnabled displayedGlobalZoom=$displayedGlobalZoom " +
+                 "localOutputZoom=$localOutputZoom threshold=20.0 superResRequested=$sabreSuperResEnabled " +
+                 "focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} lensState=${referenceStackFrame.lensState} " +
+-                "rgbOwner=NATIVE_SABRE_VGN detailOwner=${if (highZoomDetailEnabled) "NORMAL_SCALAR_2X_LUMA_ROI" else "NONE"}"
++                "rgbOwner=${if (highZoomDetailEnabled) "DIRECT_CFA_2X_WITH_NATIVE_SABRE_VGN_FALLBACK" else "NATIVE_SABRE_VGN"} " +
++                "scalar26719Fallback=${highZoomDetailEnabled}"
+             PLog.i(TAG, "IRIS_26718_HIGH_ZOOM_ACTIVATION $highZoomActivation")
+             MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_ACTIVATION", highZoomActivation)
+             PLog.i(TAG, "IRIS_26564_TRUE_2X_SR_DNG_AUTHORITY " +
+@@ -462,40 +492,64 @@ object PhotonMotionMgc1271Bridge {
+             true2xPhaseSupportPathForCleanup = stacked.true2xPhaseSupportPath
+             true2xNativeVgnGuidePathForCleanup = stacked.true2xNativeVgnGuidePath
+             highZoomDetailPathForCleanup = stacked.highZoomDetailPath
++            highZoomRgbPathForCleanup = stacked.highZoomRgbPath
+             if (highZoomDetailEnabled) {
+-                requireParity(stacked.highZoomDetailPath != null,
+-                    "26718 high-zoom enabled without detail sidecar")
+-                requireParity(stacked.highZoomDetailWidth > 0 && stacked.highZoomDetailHeight > 0 &&
+-                    stacked.highZoomDetailFullWidth == size.x * 2 &&
+-                    stacked.highZoomDetailFullHeight == size.y * 2,
+-                    "26718 invalid high-zoom detail geometry")
+-                requireParity(stacked.highZoomDetailSourceZoom == localOutputZoom,
+-                    "26718 high-zoom source zoom mismatch")
+-                parameters.motionV2HighZoomDetailPath = stacked.highZoomDetailPath
+-                parameters.motionV2HighZoomDetailWidth = stacked.highZoomDetailWidth
+-                parameters.motionV2HighZoomDetailHeight = stacked.highZoomDetailHeight
+-                parameters.motionV2HighZoomDetailOriginX = stacked.highZoomDetailOriginX
+-                parameters.motionV2HighZoomDetailOriginY = stacked.highZoomDetailOriginY
+-                parameters.motionV2HighZoomDetailFullWidth = stacked.highZoomDetailFullWidth
+-                parameters.motionV2HighZoomDetailFullHeight = stacked.highZoomDetailFullHeight
+-                parameters.motionV2HighZoomDetailSourceZoom = stacked.highZoomDetailSourceZoom
+-                parameters.motionV2HighZoomDetailActivePct = stacked.highZoomDetailActivePct
+-                parameters.motionV2HighZoomDetailStrongPct = stacked.highZoomDetailStrongPct
+-                parameters.motionV2HighZoomRefineAcceptedPct = stacked.highZoomRefineAcceptedPct
+-                parameters.motionV2HighZoomDetailFrames = stacked.highZoomDetailFrames
+-                parameters.motionV2HighZoomDetailReconstructionMs = stacked.highZoomDetailReconstructionMs
+-                val handoff = "path=true size=${stacked.highZoomDetailWidth}x${stacked.highZoomDetailHeight} " +
+-                    "origin=${stacked.highZoomDetailOriginX},${stacked.highZoomDetailOriginY} " +
+-                    "full=${stacked.highZoomDetailFullWidth}x${stacked.highZoomDetailFullHeight} " +
+-                    "sourceZoom=${stacked.highZoomDetailSourceZoom} frames=${stacked.highZoomDetailFrames} " +
+-                    "activePct=${stacked.highZoomDetailActivePct} strongPct=${stacked.highZoomDetailStrongPct} " +
+-                    "refineAcceptedPct=${stacked.highZoomRefineAcceptedPct} ms=${stacked.highZoomDetailReconstructionMs}"
+-                PLog.i(TAG, "IRIS_26718_HIGH_ZOOM_DETAIL_HANDOFF $handoff")
+-                MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_DETAIL_HANDOFF", handoff)
++                if (stacked.highZoomRgbPath != null) {
++                    requireParity(stacked.highZoomDetailPath == null, "26720 RGB success must not also publish scalar sidecar")
++                    requireParity(stacked.highZoomRgbWidth > 0 && stacked.highZoomRgbHeight > 0 &&
++                        stacked.highZoomRgbFullWidth == size.x * 2 && stacked.highZoomRgbFullHeight == size.y * 2,
++                        "26720 invalid high-zoom RGB geometry")
++                    requireParity(kotlin.math.abs(stacked.highZoomRgbSourceZoom - localOutputZoom) < 1.0e-5f,
++                        "26720 high-zoom RGB source zoom mismatch")
++                    parameters.motionV2HighZoomRgbPath = stacked.highZoomRgbPath
++                    parameters.motionV2HighZoomRgbWidth = stacked.highZoomRgbWidth
++                    parameters.motionV2HighZoomRgbHeight = stacked.highZoomRgbHeight
++                    parameters.motionV2HighZoomRgbOriginX = stacked.highZoomRgbOriginX
++                    parameters.motionV2HighZoomRgbOriginY = stacked.highZoomRgbOriginY
++                    parameters.motionV2HighZoomRgbFullWidth = stacked.highZoomRgbFullWidth
++                    parameters.motionV2HighZoomRgbFullHeight = stacked.highZoomRgbFullHeight
++                    parameters.motionV2HighZoomRgbSourceZoom = stacked.highZoomRgbSourceZoom
++                    parameters.motionV2HighZoomRgbActivePct = stacked.highZoomRgbActivePct
++                    parameters.motionV2HighZoomRgbFullColorPct = stacked.highZoomRgbFullColorPct
++                    parameters.motionV2HighZoomRgbPhaseMean = stacked.highZoomRgbPhaseMean
++                    parameters.motionV2HighZoomRgbPhaseP10 = stacked.highZoomRgbPhaseP10
++                    parameters.motionV2HighZoomRgbRefineAcceptedPct = stacked.highZoomRgbRefineAcceptedPct
++                    parameters.motionV2HighZoomRgbFrames = stacked.highZoomRgbFrames
++                    parameters.motionV2HighZoomRgbReconstructionMs = stacked.highZoomRgbReconstructionMs
++                    parameters.motionV2HighZoomRgbPrepared = true
++                    parameters.motionV2ReconstructionZoom = localOutputZoom
++                    parameters.motionV2RenderResidualZoom = 1f
++                    val handoff = "path=true size=${stacked.highZoomRgbWidth}x${stacked.highZoomRgbHeight} " +
++                        "origin=${stacked.highZoomRgbOriginX},${stacked.highZoomRgbOriginY} full=${stacked.highZoomRgbFullWidth}x${stacked.highZoomRgbFullHeight} " +
++                        "sourceZoom=${stacked.highZoomRgbSourceZoom} frames=${stacked.highZoomRgbFrames} activePct=${stacked.highZoomRgbActivePct} " +
++                        "fullColorPct=${stacked.highZoomRgbFullColorPct} phaseMean=${stacked.highZoomRgbPhaseMean} phaseP10=${stacked.highZoomRgbPhaseP10} " +
++                        "refineAcceptedPct=${stacked.highZoomRgbRefineAcceptedPct} ms=${stacked.highZoomRgbReconstructionMs}"
++                    PLog.i(TAG, "IRIS_26720_HIGH_ZOOM_RGB_HANDOFF $handoff")
++                    MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_HANDOFF", handoff)
++                } else {
++                    requireParity(stacked.highZoomDetailPath != null, "26720 high-zoom has neither RGB nor 26719 scalar fallback")
++                    requireParity(stacked.highZoomDetailWidth > 0 && stacked.highZoomDetailHeight > 0 &&
++                        stacked.highZoomDetailFullWidth == size.x * 2 && stacked.highZoomDetailFullHeight == size.y * 2,
++                        "26720 invalid scalar fallback geometry")
++                    parameters.motionV2HighZoomDetailPath = stacked.highZoomDetailPath
++                    parameters.motionV2HighZoomDetailWidth = stacked.highZoomDetailWidth
++                    parameters.motionV2HighZoomDetailHeight = stacked.highZoomDetailHeight
++                    parameters.motionV2HighZoomDetailOriginX = stacked.highZoomDetailOriginX
++                    parameters.motionV2HighZoomDetailOriginY = stacked.highZoomDetailOriginY
++                    parameters.motionV2HighZoomDetailFullWidth = stacked.highZoomDetailFullWidth
++                    parameters.motionV2HighZoomDetailFullHeight = stacked.highZoomDetailFullHeight
++                    parameters.motionV2HighZoomDetailSourceZoom = stacked.highZoomDetailSourceZoom
++                    parameters.motionV2HighZoomDetailActivePct = stacked.highZoomDetailActivePct
++                    parameters.motionV2HighZoomDetailStrongPct = stacked.highZoomDetailStrongPct
++                    parameters.motionV2HighZoomRefineAcceptedPct = stacked.highZoomRefineAcceptedPct
++                    parameters.motionV2HighZoomDetailFrames = stacked.highZoomDetailFrames
++                    parameters.motionV2HighZoomDetailReconstructionMs = stacked.highZoomDetailReconstructionMs
++                    PLog.i(TAG, "IRIS_26720_HIGH_ZOOM_RGB_FALLBACK_HANDOFF scalar26719=true")
++                }
+             } else {
+-                requireParity(stacked.highZoomDetailPath == null && stacked.highZoomDetailWidth == 0 &&
+-                    stacked.highZoomDetailHeight == 0,
+-                    "26718 high-zoom detail survived disabled route")
++                requireParity(stacked.highZoomRgbPath == null && stacked.highZoomDetailPath == null &&
++                    stacked.highZoomRgbWidth == 0 && stacked.highZoomDetailWidth == 0,
++                    "26720 high-zoom sidecar survived disabled route")
+             }
+             if (parameters.irisNightActive) {
+                 /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
+@@ -622,9 +676,10 @@ object PhotonMotionMgc1271Bridge {
+                 "Sabre reconstruction owner was not durably published")
+             requireParity(stacked.baselineExposureEv == null,
+                 "Sabre unexpectedly inherited Spatial/Bento BaselineExposure")
+-            requireParity(parameters.motionV2ReconstructionZoom == 1f &&
++            val expectedReconstructionZoom26720 = if (parameters.motionV2HighZoomRgbPrepared) localOutputZoom else 1f
++            requireParity(kotlin.math.abs(parameters.motionV2ReconstructionZoom - expectedReconstructionZoom26720) < 1.0e-5f &&
+                     parameters.motionV2SuperResOutputScale == sabreSuperResOutputScale,
+-                "26561 Sabre base-grid/SR output-scale contract drifted")
++                "26720 Sabre/high-zoom reconstruction geometry contract drifted")
+             requireParity(lsc == null || stacked.lensShadingCorrectionApplied,
+                 "LSC supplied but MGC output did not apply it")
+ 
+@@ -899,7 +954,8 @@ object PhotonMotionMgc1271Bridge {
+                  * denoise carrier remains owned here and is released by this bridge's finally block. */
+                 true2xOutputHandedOff = resultTrue2xRenderRgbPath != null &&
+                     (!produceNormalStackedDng || resultTrue2xLinearRawPath != null)
+-                highZoomDetailHandedOff = !highZoomDetailEnabled || parameters.motionV2HighZoomDetailPath != null
++                highZoomDetailHandedOff = !highZoomDetailEnabled || parameters.motionV2HighZoomRgbPrepared || parameters.motionV2HighZoomDetailPath != null
++                highZoomRgbHandedOff = !parameters.motionV2HighZoomRgbPrepared || parameters.motionV2HighZoomRgbPath != null
+             }
+         } catch (error: Throwable) {
+             PLog.e(TAG, "MGC PARITY ARCHITECTURE INVALID", error)
+@@ -923,6 +979,9 @@ object PhotonMotionMgc1271Bridge {
+             if (!highZoomDetailHandedOff) {
+                 highZoomDetailPathForCleanup?.let { path -> runCatching { File(path).delete() } }
+             }
++            if (!highZoomRgbHandedOff) {
++                highZoomRgbPathForCleanup?.let { path -> runCatching { File(path).delete() } }
++            }
+             egl?.close()
+             inputImages.forEach { frame ->
+                 if (frame.hasMotionV2RawBacking()) runCatching { frame.close() }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index d4a8b779d4dedc67bc53cdfd0290aab84c7308b6..36905d53c66a23e51fd4e907a65e9ca563e42d7a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -157,6 +157,24 @@ public class Parameters {
+     public float motionV2HighZoomRefineAcceptedPct = 0.0f;
+     public int motionV2HighZoomDetailFrames = 0;
+     public long motionV2HighZoomDetailReconstructionMs = 0L;
++    /* IRIS_26720_HIGH_ZOOM_DIRECT_CFA_RGB_HANDOFF */
++    public String motionV2HighZoomRgbPath = null;
++    public int motionV2HighZoomRgbWidth = 0;
++    public int motionV2HighZoomRgbHeight = 0;
++    public int motionV2HighZoomRgbOriginX = 0;
++    public int motionV2HighZoomRgbOriginY = 0;
++    public int motionV2HighZoomRgbFullWidth = 0;
++    public int motionV2HighZoomRgbFullHeight = 0;
++    public float motionV2HighZoomRgbSourceZoom = 1.0f;
++    public float motionV2HighZoomRgbActivePct = 0.0f;
++    public float motionV2HighZoomRgbFullColorPct = 0.0f;
++    public float motionV2HighZoomRgbPhaseMean = 0.0f;
++    public float motionV2HighZoomRgbPhaseP10 = 0.0f;
++    public float motionV2HighZoomRgbRefineAcceptedPct = 0.0f;
++    public int motionV2HighZoomRgbFrames = 0;
++    public long motionV2HighZoomRgbReconstructionMs = 0L;
++    public boolean motionV2HighZoomRgbPrepared = false;
++    public boolean motionV2HighZoomRgbApplied = false;
+     /* IRIS_26621_TRUE2X_SHARED_LOCAL_TONE_MAP
+      * Full-resolution R16F log2 SDR target produced by the MotionV2Render Local-Laplacian owner.
+      * This is an absolute presentation target, not a coarse correction/gain field. CPU/GPU true-2x
+diff --git a/app/version.properties b/app/version.properties
+index bec7c73f3a86e21cad6956472686ae010df21612..f4fbfcbd9eb145724c555c9dd216f98f91294698 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726719
+-VERSION_BUILD=26719
++VERSION_NAME=0.9726720
++VERSION_BUILD=26720
