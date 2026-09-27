@@ -23,6 +23,12 @@ for rel in [
 'app/src/main/java/com/particlesdevs/photoncamera/api/VendorTagUtils.java']:
  assert (b/rel).read_bytes()==(c/rel).read_bytes(),rel
 bridge=txt(c,'app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt')
+# IRIS_26718_R1_KOTLIN_COMPILER_REGRESSION: exact Actions failure must be impossible.
+assert 'import com.particlesdevs.photoncamera.util.MotionTrace' in bridge
+assert 'frames.firstOrNull { it.frameNumber == mgcBase.motionV2FrameNumber }' in bridge
+assert 'mgcBase.frameNumber' not in bridge
+assert 'MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_ACTIVATION", highZoomActivation)' in bridge
+assert 'MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_DETAIL_HANDOFF", handoff)' in bridge
 for t in ['parameters.motionV2Active && !parameters.irisNightActive','!sabreSuperResEnabled && displayedGlobalZoom >= 20f','localOutputZoom > 1.00001f','IRIS_26718_HIGH_ZOOM_ACTIVATION','focusDistanceDiopters=','lensState=','rgbOwner=NATIVE_SABRE_VGN','detailOwner=${if (highZoomDetailEnabled) "NORMAL_SCALAR_2X_LUMA_ROI" else "NONE"}','enableHighZoomDetail = highZoomDetailEnabled','highZoomSourceZoom = localOutputZoom','IRIS_26718_HIGH_ZOOM_DETAIL_HANDOFF']:
  assert t in bridge,t
 stack=txt(c,'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt')

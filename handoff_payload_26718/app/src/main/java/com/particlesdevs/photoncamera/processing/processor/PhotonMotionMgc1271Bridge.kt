@@ -30,6 +30,7 @@ import com.particlesdevs.photoncamera.app.PhotonCamera
 import com.particlesdevs.photoncamera.processing.ImageFrame
 import com.particlesdevs.photoncamera.processing.MotionBatch
 import com.particlesdevs.photoncamera.processing.render.Parameters
+import com.particlesdevs.photoncamera.util.MotionTrace
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.ByteBuffer
@@ -404,7 +405,7 @@ object PhotonMotionMgc1271Bridge {
             parameters.motionV2HighZoomRefineAcceptedPct = 0f
             parameters.motionV2HighZoomDetailFrames = 0
             parameters.motionV2HighZoomDetailReconstructionMs = 0L
-            val referenceStackFrame = frames.firstOrNull { it.frameNumber == mgcBase.frameNumber } ?: frames.first()
+            val referenceStackFrame = frames.firstOrNull { it.frameNumber == mgcBase.motionV2FrameNumber } ?: frames.first()
             val highZoomActivation = "enabled=$highZoomDetailEnabled displayedGlobalZoom=$displayedGlobalZoom " +
                 "localOutputZoom=$localOutputZoom threshold=20.0 superResRequested=$sabreSuperResEnabled " +
                 "focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} lensState=${referenceStackFrame.lensState} " +
