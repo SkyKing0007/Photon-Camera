@@ -1,0 +1,362 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index ee263a46d190694fec21077632c54e4a3eca9f69..42ff5c2413d4f5b26d957d2f7665a92542aa50d6 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -33,6 +33,35 @@ internal enum class MgcRawProcessorPipeline {
+     SABRE,
+ }
+ 
++/* IRIS_26715_IDLE_SABRE_PROGRAM_PREWARM
++ * Compile/link only the already-proven Sabre program set on a caller-owned current EGL context.
++ * No RAW image, capture metadata, alignment state, or persistent GPU allocation is consumed.
++ */
++internal fun prewarmGlesMgcSabreCapturePrograms(width: Int, height: Int, cfaPattern: Int) {
++    GlesMgcRawSpatialStacker(
++        width = width.coerceAtLeast(2),
++        height = height.coerceAtLeast(2),
++        cfaPattern = cfaPattern.coerceIn(0, 3),
++        blackLevel = floatArrayOf(0f, 0f, 0f, 0f),
++        whiteLevel = 1023,
++        whiteBalanceGains = floatArrayOf(1f, 1f, 1f, 1f),
++        noiseProfileSelection = RawNoiseProfileSelection.Camera2,
++        lensShading = null,
++        lensShadingWidth = 0,
++        lensShadingHeight = 0,
++        outputMode = MgcSpatialOutputMode.RGB,
++        mergeMethod = MgcMergeMethod.SABRE,
++        outputScale = 1f,
++        useCurrentGlContext = true,
++        exportGpuLinearRgbSource = true,
++        gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
++        processorPipeline = MgcRawProcessorPipeline.SABRE,
++        exportNormalStackedDng = false,
++        preserveExtendedHdrThroughVgn = true,
++        enableSabreSuperRes = false,
++    ).prewarmCapturePipeline(frameCount = 15, includeBento = false)
++}
++
+ /**
+  * Independent GLES MGC Spatial RAW merge pipeline.
+  *
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 6d4e3cd7fd5c9472897629ae91b59436b00c4278..955232ba2e2bd8b9a9b98d068179bcbc87ae1563 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -155,6 +155,8 @@ public class CaptureController implements MediaRecorder.OnInfoListener {
+     private static final String TAG = CaptureController.class.getSimpleName();
+     public List<Future<?>> taskResults = new ArrayList<>();
+     private final ExecutorService processExecutor;
++    private static final java.util.concurrent.atomic.AtomicBoolean mMotion26715IdlePrewarmScheduled =
++            new java.util.concurrent.atomic.AtomicBoolean(false);
+     private final SpektraModeController spektraModeController;
+     /**
+      * Camera state: Showing camera preview.
+@@ -1129,6 +1131,51 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+     };
++    /* IRIS_26715_IDLE_PIPELINE_PREWARM
++     * Move first-use Sabre shader compile/link cost into low-priority camera idle time. This is
++     * best-effort only: it never blocks shutter, never owns preview/capture state, and failure
++     * leaves the exact 26714 processing path unchanged.
++     */
++    private void scheduleMotion26715IdlePipelinePrewarm() {
++        if (!isZslMode() || PhotonCamera.getSettings().selectedMode != CameraMode.MOTION
++                || !mMotion26715IdlePrewarmScheduled.compareAndSet(false, true)) return;
++        Thread worker = new Thread(() -> {
++            try {
++                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND);
++                // Allow the HAL preview/ring to establish before spending background GPU compile work.
++                android.os.SystemClock.sleep(1400L);
++                for (int attempt = 0; attempt < 12; attempt++) {
++                    int iris26715Shakiness = 0;
++                    try {
++                        if (PhotonCamera.getGyro() != null) {
++                            iris26715Shakiness = Math.max(0,
++                                    PhotonCamera.getGyro().getFilteredShakiness());
++                        }
++                    } catch (Exception ignored) {}
++                    final boolean iris26715CameraSettled = PhotonCamera.getGyro() == null
++                            || iris26715Shakiness <= MOTION_26714_STATIONARY_SHAKINESS_THRESHOLD;
++                    if (!mZslCapturing && !CaptureController.isProcessing && !burst
++                            && iris26715CameraSettled
++                            && mCameraDevice != null && mCaptureSession != null) {
++                        boolean success = com.particlesdevs.photoncamera.processing.processor
++                                .PhotonMotionMgc1271Bridge.prewarmCapturePrograms();
++                        Log.i(TAG, "IRIS_26715_IDLE_PIPELINE_PREWARM success=" + success
++                                + " attempt=" + attempt + " captureMathChanged=false");
++                        return;
++                    }
++                    android.os.SystemClock.sleep(350L);
++                }
++                Log.i(TAG, "IRIS_26715_IDLE_PIPELINE_PREWARM skipped=busy captureMathChanged=false");
++                mMotion26715IdlePrewarmScheduled.set(false);
++            } catch (Throwable t) {
++                Log.w(TAG, "IRIS_26715_IDLE_PIPELINE_PREWARM failure="
++                        + t.getClass().getSimpleName());
++                mMotion26715IdlePrewarmScheduled.set(false);
++            }
++        }, "Iris26715IdlePrewarm");
++        worker.start();
++    }
++
+     public CaptureController(Activity activity, ExecutorService processExecutor, CameraEventsListener cameraEventsListener,
+             SpektraModeController.Host spektraHost) {
+         if(PhotonCamera.getSettings().previewFormat != 0) {
+@@ -5770,6 +5817,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                              * readiness checks before they can mutate/capture. */
+                             if (mTouchFocus != null) mTouchFocus.onPreviewSessionReady();
+                             scheduleMotion26598DeferredShutterReplay("session_configured");
++                            scheduleMotion26715IdlePipelinePrewarm();
+                         }
+                     } catch (Exception e) {
+                         Log.e(TAG, Log.getStackTraceString(e));
+@@ -8675,6 +8723,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+         Boolean aeLockAvailable = mCameraCharacteristics == null ? null
+                 : mCameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE);
++        final boolean iris26715HalEquivalentTopUp = Boolean.TRUE.equals(aeLockAvailable)
++                && plan.normalReferenceResult != null
++                && motion26713ResultMatchesTarget(
++                        plan.normalReferenceResult, plan.normalTargetExposureNs, plan.normalTargetIso);
+         if (!manual && !Boolean.TRUE.equals(aeLockAvailable)) {
+             Log.w(TAG, "IRIS_26593_NORMAL_TOPUP_UNAVAILABLE manual=false aeLock=false");
+             return false;
+@@ -8694,7 +8746,15 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     try { b.set(CaptureRequest.LENS_FOCUS_DISTANCE, mFocus); }
+                     catch (IllegalArgumentException ignored) {}
+                 }
+-                if (manual) {
++                if (iris26715HalEquivalentTopUp) {
++                    /* IRIS_26715_HAL_EQUIVALENT_ZSL_TOPUP
++                     * If the ZSL ring is short but physical NORMAL equals current HAL, keep the
++                     * top-up in HAL AE with a capture-local lock. Never convert an extreme-dark HAL
++                     * state into a manual 70 ms burst merely because MANUAL_SENSOR is available.
++                     */
++                    b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
++                    b.set(CaptureRequest.CONTROL_AE_LOCK, true);
++                } else if (manual) {
+                     b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+                     b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, expObj);
+                     b.set(CaptureRequest.SENSOR_SENSITIVITY, isoObj);
+@@ -8806,7 +8866,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 }
+             }, mBackgroundHandler);
+             Log.i(TAG, "IRIS_26598_NORMAL_TOPUP_SUBMITTED count=" + missingNormals
+-                    + " mode=" + (manual ? "MANUAL_FROZEN_EXPOSURE" : "CAPTURE_LOCAL_AE_LOCK")
++                    + " mode=" + (iris26715HalEquivalentTopUp ? "CAPTURE_LOCAL_AE_LOCK_HAL_EQUIVALENT"
++                            : (manual ? "MANUAL_FROZEN_EXPOSURE" : "CAPTURE_LOCAL_AE_LOCK"))
+                     + " exposureNs=" + expObj + " iso=" + isoObj
+                     + " previewRepeatingRequestMutated=false rawOnlyTarget=true"
+                     + " captureDomainOnly26713=true"
+@@ -9098,23 +9159,19 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                         iris26714RebasedTargetExp));
+                     }
+                 } else if (desiredOffsetEv > 0.03f) {
+-                    long shutterCeilingNs = Math.max(iris26593ReferenceExp,
+-                            iris26381MotionOpportunityCeilingNs(iris26593NormalReference));
+-                    shutterCeilingNs = Math.max(iris26714ExposureRange.getLower(),
+-                            Math.min(iris26714ExposureRange.getUpper(), shutterCeilingNs));
+-                    iris26714RebasedTargetIso = Math.max(iris26714SensitivityRange.getLower(),
+-                            Math.min(iris26714SensitivityRange.getUpper(), iris26593ReferenceIso));
+-                    iris26714RebasedTargetExp = Math.round(
+-                            desiredEnergy / Math.max(1, iris26714RebasedTargetIso));
+-                    iris26714RebasedTargetExp = Math.max(iris26593ReferenceExp,
+-                            Math.min(shutterCeilingNs, iris26714RebasedTargetExp));
+-                    double rebasedEnergy = (double)iris26714RebasedTargetExp * iris26714RebasedTargetIso;
+-                    if (rebasedEnergy < desiredEnergy * 0.985) {
+-                        iris26714RebasedTargetIso = (int)Math.ceil(
+-                                desiredEnergy / Math.max(1.0, iris26714RebasedTargetExp));
+-                        iris26714RebasedTargetIso = Math.max(iris26593ReferenceIso,
+-                                Math.min(iris26714SensitivityRange.getUpper(), iris26714RebasedTargetIso));
+-                    }
++                    /* IRIS_26715_SDR_ZSL_NORMAL_OWNER
++                     * Positive recipe intent means highlight protection is not required. Do not
++                     * manufacture a brighter manual NORMAL (the 26714 dark-room failure reached
++                     * 70 ms / ISO 5391). Keep physical NORMAL exactly at untouched HAL so the
++                     * equal-exposure pre-shutter RAW ring remains the capture source. Any desired
++                     * display lift stays downstream; LONG remains independently HAL-baselined.
++                     */
++                    iris26714RebasedTargetExp = iris26593ReferenceExp;
++                    iris26714RebasedTargetIso = iris26593ReferenceIso;
++                    Log.i(TAG, "IRIS_26715_SDR_ZSL_ROUTE desiredOffsetEv=" + desiredOffsetEv
++                            + " physicalNormalOffsetEv=0.0 highlightProtectionRequired=false"
++                            + " halExposureNs=" + iris26593ReferenceExp
++                            + " halIso=" + iris26593ReferenceIso);
+                 }
+                 final double actualRebasedEnergy =
+                         (double)iris26714RebasedTargetExp * iris26714RebasedTargetIso;
+@@ -9127,6 +9184,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final long iris26713NormalTargetExp = iris26714RebasedTargetExp;
+         final int iris26713NormalTargetIso = iris26714RebasedTargetIso;
+         final float iris26713NormalTargetOffsetEv = iris26714RebasedOffsetEv;
++        final boolean iris26715NegativeProtectionRequired = iris26713RecipeValidAtShutter
++                && iris26713NormalTargetOffsetEv < -0.03f;
++        final boolean iris26715SdrZslEligible = !iris26715NegativeProtectionRequired;
+         /* IRIS_26714_SHUTTER_HAL_REBASE
+          * Recipe stores scene-relative EV intent only. Rebase it to the untouched current HAL
+          * result at shutter so harmless AE settling never makes the recipe stale. LONG uses this
+@@ -9228,6 +9288,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 + " equalExposureNormalReference=true captureDomainOnly=true"
+                 + " previewRepeatingNeverMutated=true recipeValidAtShutter="
+                 + iris26713RecipeValidAtShutter
++                + " sdrZslEligible=" + iris26715SdrZslEligible
++                + " negativeProtectionRequired=" + iris26715NegativeProtectionRequired
++                + " zslDisabledOnlyForNegativeProtection=" + iris26715NegativeProtectionRequired
+                 + " recipeRebasedToCurrentHal=true targetOffsetEv="
+                 + iris26713NormalTargetOffsetEv);
+         final int iris26593NormalTarget = iris26593TotalTarget - iris26593AuxCount;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 82473058261be5a82dcf7c4a833e6eaed2a18ab1..2e978e852d2ee4acdb0534f87633e1b1d459097a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -20,6 +20,7 @@ import com.hinnka.mycamera.processor.RawNoiseProfileSelection
+ import com.hinnka.mycamera.processor.RawNoiseModel
+ import com.hinnka.mycamera.processor.RawStackBufferLayout
+ import com.hinnka.mycamera.processor.RawStackFrame
++import com.hinnka.mycamera.processor.prewarmGlesMgcSabreCapturePrograms
+ import com.hinnka.mycamera.raw.MgcFullResolutionDenoise
+ import com.hinnka.mycamera.raw.RawMetadata
+ import com.hinnka.mycamera.raw.RawNoiseProfileLayout
+@@ -33,6 +34,7 @@ import java.io.File
+ import java.io.RandomAccessFile
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
++import java.util.concurrent.atomic.AtomicBoolean
+ 
+ /**
+  * IRIS_26560_SABRE_ONLY_BRIDGE_OWNER
+@@ -46,11 +48,42 @@ object PhotonMotionMgc1271Bridge {
+     private const val TAG = "Mgc1271Bridge"
+     private const val EGL_OPENGL_ES3_BIT_KHR = 0x40
+     private const val HALF_ONE: Short = 0x3c00
++    private val iris26715PrewarmStarted = AtomicBoolean(false)
+ 
+     init {
+         System.loadLibrary("my-native-lib")
+     }
+ 
++    /* IRIS_26715_IDLE_SABRE_PROGRAM_PREWARM
++     * Best-effort first-shot latency optimization. It compiles only the existing Sabre GL program
++     * set on an isolated pbuffer context while the camera is idle; failure is non-fatal and never
++     * changes capture, merge, tone, or publication math.
++     */
++    @JvmStatic
++    fun prewarmCapturePrograms(): Boolean {
++        if (!iris26715PrewarmStarted.compareAndSet(false, true)) return true
++        var egl: EglOwner? = null
++        val tid = android.os.Process.myTid()
++        val oldPriority = runCatching { android.os.Process.getThreadPriority(tid) }.getOrNull()
++        val startNs = System.nanoTime()
++        return try {
++            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND) }
++            egl = EglOwner.create()
++            prewarmGlesMgcSabreCapturePrograms(4096, 3072, 0)
++            PLog.i(TAG, "IRIS_26715_IDLE_SABRE_PROGRAM_PREWARM success=true tookMs=" +
++                ((System.nanoTime() - startNs) / 1_000_000L))
++            true
++        } catch (error: Throwable) {
++            iris26715PrewarmStarted.set(false)
++            PLog.w(TAG, "IRIS_26715_IDLE_SABRE_PROGRAM_PREWARM success=false reason=" +
++                error.javaClass.simpleName)
++            false
++        } finally {
++            runCatching { egl?.close() }
++            if (oldPriority != null) runCatching { android.os.Process.setThreadPriority(tid, oldPriority) }
++        }
++    }
++
+     @JvmStatic
+     fun reconstruct(
+         size: Point,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+index 62261d26e811bb10b3960d87279157ae191b9e6b..f16cae513f3fc92f2c0b0157cd27136c06f050dd 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+@@ -24,7 +24,12 @@ public class Log {
+         return "DynamicNoise".equals(tag);
+     }
+ 
+-    private static final String PHOTON_LOG_SUBFOLDER = "PhotonLog";
++    /* IRIS_26715_IRIS_OWNED_LOG_DIRECTORY
++     * Persistent Iris logs live under the system camera tree, independent of the inherited
++     * PhotonCamera tuning/backup directory. The folder is created automatically on first app
++     * launch after the existing DCIM SAF grant is available.
++     */
++    private static final String IRIS_LOG_RELATIVE_PATH = "DCIM/Camera/Iris Camera/Logs";
+ 
+     private static java.io.File logDir = null;
+     private static Context logContext = null; // Application context for SimpleStorage
+@@ -33,7 +38,7 @@ public class Log {
+     private static boolean logEnabled = true;
+ 
+     /* IRIS_26634_RETIRE_PROCESS_LIFECYCLE_FILES
+-     * Keep PhotonLog/log-YYYY-MM-DD.txt and motion-trace-YYYY-MM-DD.txt. The private
++     * Keep Iris Camera/Logs/log-YYYY-MM-DD.txt and motion-trace-YYYY-MM-DD.txt. The private
+      * iris-process-lifecycle files, synchronous fsync breadcrumbs and process-state persistence
+      * are retired to remove capture/processing-boundary filesystem stalls. Public call sites stay
+      * source-compatible: critical() routes to the normal async logger and processState() is a no-op.
+@@ -97,14 +102,18 @@ public class Log {
+     }
+ 
+     /**
+-     * Use SimpleStorage to write logs to DCIM/PhotonCamera/PhotonLog.
++     * Use SimpleStorage to write logs to DCIM/Camera/Iris Camera/Logs.
+      * Call this when the app has SAF storage access (e.g. from SplashActivity).
+      */
+     public static void setLogFolder(Context context) {
+         if (context != null) {
+             logContext = context.getApplicationContext();
+             logDir = null;
+-            logHandler.post(Log::cleanupOldLogs);
++            logHandler.post(() -> {
++                // IRIS_26715: create Iris Camera/Logs eagerly once the existing DCIM grant exists.
++                getLogFolderDocumentFile();
++                cleanupOldLogs();
++            });
+         } else {
+             logContext = null;
+             closeWriter();
+@@ -124,26 +133,19 @@ public class Log {
+         }
+     }
+ 
+-    /** Returns PhotonCamera/PhotonLog folder via SimpleStorage, or null if no access. */
++    /** Returns DCIM/Camera/Iris Camera/Logs via SimpleStorage, creating it when authorized. */
+     private static DocumentFile getLogFolderDocumentFile() {
+         if (logContext == null || !SimpleStorageHelper.hasStorageAccess(logContext)) {
+             return null;
+         }
+-        DocumentFile photonCamera = DocumentFileCompat.fromSimplePath(
++        DocumentFile logFolder = DocumentFileCompat.fromSimplePath(
+                 logContext,
+                 StorageId.PRIMARY,
+-                SimpleStorageHelper.PHOTON_CAMERA_RELATIVE_PATH,
++                IRIS_LOG_RELATIVE_PATH,
+                 DocumentFileType.FOLDER,
+                 true);
+-        if (photonCamera == null || !photonCamera.exists()) {
+-            return null;
+-        }
+-        DocumentFile logFolder = photonCamera.findFile(PHOTON_LOG_SUBFOLDER);
+-        if (logFolder != null && logFolder.exists()) {
+-            return logFolder;
+-        }
+-        logFolder = photonCamera.createDirectory(PHOTON_LOG_SUBFOLDER);
+-        return logFolder;
++        return logFolder != null && logFolder.exists() && logFolder.isDirectory()
++                ? logFolder : null;
+     }
+ 
+     private static DocumentFile getLogFileDocumentFile() {
+diff --git a/app/version.properties b/app/version.properties
+index 5630170fc4b9fa407895bc3567550026249b29e4..276e0ab6fa813e6b31e8fa17a8eb87109f4c111d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726714
+-VERSION_BUILD=26714
++VERSION_NAME=0.9726715
++VERSION_BUILD=26715
