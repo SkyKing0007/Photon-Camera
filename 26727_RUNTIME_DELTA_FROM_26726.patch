@@ -1,0 +1,130 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java
+index 6ef2eccaa67310152c9df0ab9f0a68dc247a1859..86a13393c74847c157104d835bc7aea238de9a18 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/GLTexture.java
+@@ -158,6 +158,34 @@ public class GLTexture implements AutoCloseable {
+         glBindTexture(GL_TEXTURE_2D, mTextureID);
+         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, mSize.x, mSize.y, mFormat.getGLFormatExternal(), mFormat.getGLType(), pixels);
+     }
++
++    /* IRIS_26727_EXPLICIT_RGBA16F_CLIENT_UPLOAD
++     * The universal Iris carrier already contains IEEE-754 half-float client bytes. Do not route
++     * those bytes through GLFormat.FLOAT_16#getGLType(), which intentionally returns GL_FLOAT for
++     * older FloatBuffer callers that rely on GL converting float32 client values into RGBA16F.
++     * This path is intentionally explicit and fail-closed: exact FLOAT_16 destination, exact
++     * 2-byte/channel payload, GL_HALF_FLOAT client type, and restored texture binding. */
++    public void loadHalfFloatData(ByteBuffer pixels) {
++        if (mFormat.mFormat != GLFormat.DataType.FLOAT_16) {
++            throw new IllegalStateException("26727 half-float client upload requires FLOAT_16 destination");
++        }
++        if (pixels == null) {
++            throw new IllegalStateException("26727 half-float client upload buffer is null");
++        }
++        long expected = (long) mSize.x * (long) mSize.y * (long) mFormat.mChannels * 2L;
++        if (pixels.remaining() != expected) {
++            throw new IllegalStateException("26727 half-float client upload byte contract invalid bytes="
++                    + pixels.remaining() + " expected=" + expected);
++        }
++        int[] previousBinding = new int[1];
++        glGetIntegerv(GL_TEXTURE_BINDING_2D, previousBinding, 0);
++        glBindTexture(GL_TEXTURE_2D, mTextureID);
++        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, mSize.x, mSize.y,
++                mFormat.getGLFormatExternal(), GL_HALF_FLOAT, pixels);
++        checkEglError("26727 glTexSubImage2D GL_HALF_FLOAT");
++        glBindTexture(GL_TEXTURE_2D, previousBinding[0]);
++        checkEglError("26727 half-float restore binding");
++    }
+     void reSetParameters(){
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, mFormat.filter);
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, mFormat.filter);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
+index 922cb795630c3ff6402e40099f2072e22540475b..4557f8f22060036bf3d4d0c49719f372e0e071be 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisNightRgbInput.java
+@@ -47,15 +47,18 @@ public final class IrisNightRgbInput extends Node {
+ 
+         ByteBuffer view = source.duplicate();
+         view.position(0);
++        /* IRIS_26727_NIGHT_EXPLICIT_HALF_FLOAT_UPLOAD
++         * Keep the universal RGBA16F carrier and identify its client bytes correctly as GL_HALF_FLOAT. */
+         WorkingTexture = new GLTexture(
+                 raw,
+                 new GLFormat(GLFormat.DataType.FLOAT_16, 4),
+-                view,
++                null,
+                 GL_NEAREST,
+                 GL_CLAMP_TO_EDGE);
++        WorkingTexture.loadHalfFloatData(view);
+ 
+-        // glTexSubImage2D has consumed the client bytes before GLTexture construction returns.
+-        // Release the ~192 MiB CPU transfer carrier before allocating the working ping-pong set.
++        // glTexSubImage2D has consumed the client bytes before this call returns.
++        // Release the ~96 MiB CPU transfer carrier before allocating the working ping-pong set.
+         pipeline.irisNightLinearRgb = null;
+         pipeline.irisNightLinearRgbCarrierFormat = MotionV2Merger.Result.LINEAR_RGB_CARRIER_NONE;
+         Allocator.free(source);
+@@ -72,7 +75,7 @@ public final class IrisNightRgbInput extends Node {
+ 
+         Log.i(Name, "IRIS_26726_NIGHT_RGBA16F_MOTION_PARITY_INPUT"
+                 + " carrier=fullResCameraLinearRGBA16F"
+-                + " uploadSeparate=true main1=true main2=true main3=true texnum=0"
++                + " uploadSeparate=true halfFloatClientType=true main1=true main2=true main3=true texnum=0"
+                 + " cpuCarrierReleasedBeforePingPong=true"
+                 + " rcd=false demosaic=false photonNight=false"
+                 + " transportOnly=true reconstructionMathUnchanged=true"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+index 12a979e3e8e7a7f68f11361797cc3232f4b9e7f2..8967044e1c6440419ba6b933451db121f8e2e682 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2CfaInput.java
+@@ -88,12 +88,26 @@ public final class MotionV2CfaInput extends Node {
+         }
+ 
+         try {
+-            WorkingTexture = new GLTexture(
+-                    directRgbCarrier ? raw : half,
+-                    new GLFormat(directRgbCarrier ? GLFormat.DataType.FLOAT_16 : GLFormat.DataType.FLOAT_32, 4),
+-                    view,
+-                    GL_NEAREST,
+-                    GL_CLAMP_TO_EDGE);
++            if (directRgbCarrier) {
++                /* IRIS_26727_MOTION_EXPLICIT_HALF_FLOAT_UPLOAD
++                 * 26726 correctly transported 8-Bpp RGBA16F but the inherited GLTexture constructor
++                 * described its client bytes as GL_FLOAT (4 B/component). Allocate identical RGBA16F
++                 * storage, then upload the exact half-float carrier with GL_HALF_FLOAT. */
++                WorkingTexture = new GLTexture(
++                        raw,
++                        new GLFormat(GLFormat.DataType.FLOAT_16, 4),
++                        null,
++                        GL_NEAREST,
++                        GL_CLAMP_TO_EDGE);
++                WorkingTexture.loadHalfFloatData(view);
++            } else {
++                WorkingTexture = new GLTexture(
++                        half,
++                        new GLFormat(GLFormat.DataType.FLOAT_32, 4),
++                        view,
++                        GL_NEAREST,
++                        GL_CLAMP_TO_EDGE);
++            }
+         } finally {
+             /* IRIS_26726_MOTION_RGBA16F_RELEASE_OWNER
+              * GLTexture upload has consumed client memory before returning, so release the native
+@@ -161,6 +175,7 @@ public final class MotionV2CfaInput extends Node {
+                 + " Bayer2FloatBypassed=true"
+                 + " raw16RoundTrip=false"
+                 + " float16Transfer=" + directRgbCarrier
++                + " halfFloatClientType=" + directRgbCarrier
+                 + " reconstructionOwner=" + basePipeline.mParameters.motionV2ReconstructionOwner
+                 + " directMultiframeRgb=" + directRgbCarrier
+                 + " fusedBayerCanonical=false"
+diff --git a/app/version.properties b/app/version.properties
+index f73035a97e7d82ece6d82356d365b3af0aa1572c..aa226f856905d9a389d003d54363c4eb26786dd1 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726726
+-VERSION_BUILD=26726
++VERSION_NAME=0.9726727
++VERSION_BUILD=26727
