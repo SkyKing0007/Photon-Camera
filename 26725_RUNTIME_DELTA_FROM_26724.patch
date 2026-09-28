@@ -1,0 +1,310 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 4b59bfb078032a8f386e7eb58e462a84290fe5fb..a16def23b543e94cef767ccdedff1517bf802565 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -26,6 +26,7 @@ import android.graphics.Point;
+ import android.graphics.Rect;
+ import android.graphics.RectF;
+ import android.graphics.SurfaceTexture;
++import android.hardware.HardwareBuffer;
+ import android.hardware.camera2.CameraAccessException;
+ import android.hardware.camera2.CameraCaptureSession;
+ import android.hardware.camera2.CameraCharacteristics;
+@@ -5817,7 +5818,32 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+         final boolean iris26555TargetOutputAvailable = !allTargets.isEmpty();
+         if (iris26555TargetOutputAvailable) {
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && (PhotonCamera.getSettings().QuadBayer
++            final boolean iris26725GoogleCpuReadableMotionRaw =
++                    isMotion26725GooglePixelCompatibilityRoute()
++                            && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
++                            && (mTargetFormat == ImageFormat.RAW_SENSOR
++                                || mTargetFormat == ImageFormat.RAW10
++                                || mTargetFormat == ImageFormat.RAW12);
++            if (iris26725GoogleCpuReadableMotionRaw) {
++                try {
++                    mImageReaderRaw = ImageReader.newInstance(
++                            target.getWidth(), target.getHeight(), mTargetFormat, maxjpg,
++                            HardwareBuffer.USAGE_CPU_READ_OFTEN);
++                    Log.i(TAG, "IRIS_26725_GOOGLE_CPU_READABLE_RAW_READER"
++                            + " format=" + mTargetFormat
++                            + " width=" + target.getWidth()
++                            + " height=" + target.getHeight()
++                            + " maxImages=" + maxjpg
++                            + " usage=USAGE_CPU_READ_OFTEN"
++                            + " nonGoogleReaderUnchanged=true");
++                } catch (IllegalArgumentException | UnsupportedOperationException e) {
++                    Log.w(TAG, "IRIS_26725_GOOGLE_CPU_READABLE_RAW_READER_UNAVAILABLE"
++                            + " reason=" + e.getClass().getSimpleName()
++                            + " fallbackReaderOnly=true finalCpuPreflightStillRequired=true");
++                    mImageReaderRaw = ImageReader.newInstance(
++                            target.getWidth(), target.getHeight(), mTargetFormat, maxjpg, 0x00100000);
++                }
++            } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && (PhotonCamera.getSettings().QuadBayer
+                     || !(Build.BRAND.equalsIgnoreCase("oppo")
+                     || Build.BRAND.equalsIgnoreCase("vivo")
+                     || Build.BRAND.equalsIgnoreCase("oneplus")
+@@ -6516,6 +6542,66 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 && !isDualSession;
+     }
+ 
++    /* IRIS_26725_GOOGLE_PIXEL_RAW_CPU_COMPATIBILITY
++     * Pixel 8/9 logs prove Camera2 metadata/RAW delivery succeeds while CPU plane access can throw.
++     * Keep successful 26724 behavior byte-for-byte on non-Google devices and request/validate a
++     * CPU-readable RAW carrier only for Google Motion. No RAW values or downstream IQ ownership change.
++     */
++    private boolean isMotion26725GooglePixelCompatibilityRoute() {
++        return isZslMode()
++                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
++                && "google".equalsIgnoreCase(Build.BRAND)
++                && "google".equalsIgnoreCase(Build.MANUFACTURER);
++    }
++
++    private boolean motion26725ValidateGoogleRawImageForCpuCopy(
++            Image image, @NonNull String role) {
++        if (!isMotion26725GooglePixelCompatibilityRoute()) return true;
++        try {
++            if (image == null) throw new IllegalStateException("null_image");
++            Image.Plane[] planes = image.getPlanes();
++            if (planes == null || planes.length < 1 || planes[0] == null)
++                throw new IllegalStateException("missing_plane0");
++            Image.Plane plane = planes[0];
++            java.nio.ByteBuffer buffer = plane.getBuffer();
++            if (buffer == null) throw new IllegalStateException("null_plane_buffer");
++            int rowStride = plane.getRowStride();
++            int pixelStride = plane.getPixelStride();
++            int width = image.getWidth();
++            int height = image.getHeight();
++            int capacity = buffer.capacity();
++            if (width <= 0 || height <= 0 || rowStride <= 0 || capacity <= 0)
++                throw new IllegalStateException("invalid_plane_geometry");
++            if (!buffer.isDirect()) throw new IllegalStateException("non_direct_plane_buffer");
++            long minRowBytes;
++            if (image.getFormat() == ImageFormat.RAW10) {
++                minRowBytes = ((long) width * 10L + 7L) / 8L;
++            } else if (image.getFormat() == ImageFormat.RAW12) {
++                minRowBytes = ((long) width * 12L + 7L) / 8L;
++            } else {
++                if (pixelStride <= 0) throw new IllegalStateException("invalid_pixel_stride");
++                minRowBytes = (long) width * (long) pixelStride;
++            }
++            long minSpan = (long) (height - 1) * (long) rowStride + minRowBytes;
++            if (minRowBytes <= 0L || minRowBytes > rowStride || minSpan > capacity)
++                throw new IllegalStateException("plane_capacity_too_small");
++            return true;
++        } catch (Throwable t) {
++            Log.e(TAG, "IRIS_26725_GOOGLE_RAW_CPU_PLANE_REJECTED"
++                    + " role=" + role
++                    + " format=" + (image == null ? -1 : image.getFormat())
++                    + " width=" + (image == null ? -1 : image.getWidth())
++                    + " height=" + (image == null ? -1 : image.getHeight())
++                    + " reason=" + t.getClass().getSimpleName()
++                    + " processCrashPrevented=true", t);
++            com.particlesdevs.photoncamera.util.MotionTrace.state(
++                    mMotionDiagnosticShotId, "IRIS_26725_GOOGLE_RAW_CPU_PLANE_REJECTED",
++                    "role=" + role + " reason=" + t.getClass().getSimpleName()
++                            + " processCrashPrevented=true");
++            return false;
++        }
++    }
++
+     /* IRIS_26481_EXACT_TIMESTAMP_METADATA_OWNERSHIP
+      * RAW Image SENSOR_TIMESTAMP is frame identity. Never borrow Camera2
+      * metadata from an adjacent ~33 ms frame: that makes exposure/noise/role
+@@ -6541,6 +6627,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private ImageFrame copyMotion26505LongFrame(
+             Image img, TotalCaptureResult result) {
+         if (img == null) return null;
++        if (!motion26725ValidateGoogleRawImageForCpuCopy(img, "SHADOW_LONG")) return null;
+         int rowStride = img.getPlanes()[0].getRowStride();
+         int pixelStride = img.getPlanes()[0].getPixelStride();
+         int width = (img.getFormat() == ImageFormat.RAW10)
+@@ -7206,6 +7293,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+ 
+     private ImageFrame copyMotion26486ShortFrame(Image img, TotalCaptureResult result) {
+         if (img == null) return null;
++        if (!motion26725ValidateGoogleRawImageForCpuCopy(img, "HIGHLIGHT_SHORT")) return null;
+         int rowStride = img.getPlanes()[0].getRowStride();
+         int pixelStride = img.getPlanes()[0].getPixelStride();
+         int width = (img.getFormat() == ImageFormat.RAW10)
+@@ -8474,6 +8562,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         volatile boolean retired = false;
+         volatile String failureReason = "";
+         volatile boolean exposureAccepted = false;
++        volatile boolean forceManualSensor = false;
++        volatile boolean manualSensorRequest = false;
++        volatile boolean deterministicExposureFailure = false;
+         volatile TotalCaptureResult result = null;
+         private Image rawImage = null;
+         Motion26598NormalTopUpTicket(int ordinal) { this(ordinal, 1); }
+@@ -8645,6 +8736,13 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             }
+             return active;
+         }
++        synchronized Motion26598NormalTopUpTicket deterministicExposureFailure() {
++            for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
++                if (ticket != null && !ticket.retired && ticket.failed
++                        && ticket.deterministicExposureFailure) return ticket;
++            }
++            return null;
++        }
+         synchronized int normalRetryCount() {
+             int retries = 0;
+             for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
+@@ -9064,10 +9162,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             try { b.set(CaptureRequest.LENS_FOCUS_DISTANCE, plan.frozenFocusDistance); }
+             catch (IllegalArgumentException ignored) {}
+         }
+-        if (halEquivalent) {
++        final boolean useManualSensor = manual && (ticket.forceManualSensor || !halEquivalent);
++        ticket.manualSensorRequest = useManualSensor;
++        if (halEquivalent && !ticket.forceManualSensor) {
+             b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+             b.set(CaptureRequest.CONTROL_AE_LOCK, true);
+-        } else if (manual) {
++        } else if (useManualSensor) {
+             b.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF);
+             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, plan.normalTargetExposureNs);
+             b.set(CaptureRequest.SENSOR_SENSITIVITY, plan.normalTargetIso);
+@@ -9093,6 +9193,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         ticket.completed = true;
+         ticket.failed = true;
+         ticket.failureReason = reason == null ? "UNKNOWN" : reason;
++        ticket.deterministicExposureFailure = isMotion26725GooglePixelCompatibilityRoute()
++                && "EXPOSURE_REJECTED".equals(ticket.failureReason)
++                && ticket.manualSensorRequest;
+         ticket.closeRaw();
+     }
+ 
+@@ -9147,9 +9250,41 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         result, plan.normalTargetExposureNs, plan.normalTargetIso);
+                 if (!ticket.exposureAccepted) {
+                     markMotion26724NormalAttemptFailed(ticket, "EXPOSURE_REJECTED", ts);
++                    Long iris26725ActualExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++                    Integer iris26725ActualIso = result.get(CaptureResult.SENSOR_SENSITIVITY);
++                    double iris26725DeltaEv = Double.NaN;
++                    if (iris26725ActualExposureNs != null && iris26725ActualExposureNs > 0L
++                            && iris26725ActualIso != null && iris26725ActualIso > 0) {
++                        double iris26725ActualEnergy = (double) iris26725ActualExposureNs
++                                * (double) iris26725ActualIso;
++                        double iris26725TargetEnergy = (double) plan.normalTargetExposureNs
++                                * (double) plan.normalTargetIso;
++                        iris26725DeltaEv = Math.log(iris26725ActualEnergy / iris26725TargetEnergy)
++                                / Math.log(2.0);
++                    }
+                     Log.w(TAG, "IRIS_26724_NORMAL_ATTEMPT_EXPOSURE_REJECTED slot="
+                             + ticket.ordinal + " attempt=" + ticket.attempt
+-                            + " sensorTimestamp=" + ts + " frozenExposureRequired=true");
++                            + " sensorTimestamp=" + ts + " frozenExposureRequired=true"
++                            + " requestMode=" + (ticket.manualSensorRequest ? "MANUAL_SENSOR" : "AE_LOCK")
++                            + " targetExposureNs=" + plan.normalTargetExposureNs
++                            + " targetIso=" + plan.normalTargetIso
++                            + " actualExposureNs=" + iris26725ActualExposureNs
++                            + " actualIso=" + iris26725ActualIso
++                            + " deltaEv=" + iris26725DeltaEv
++                            + " deterministic=" + ticket.deterministicExposureFailure);
++                    if (isMotion26725GooglePixelCompatibilityRoute()) {
++                        com.particlesdevs.photoncamera.util.MotionTrace.state(
++                                mMotionDiagnosticShotId, "IRIS_26725_GOOGLE_EXPOSURE_REJECTED",
++                                "slot=" + ticket.ordinal + " attempt=" + ticket.attempt
++                                        + " requestMode=" + (ticket.manualSensorRequest
++                                            ? "MANUAL_SENSOR" : "AE_LOCK")
++                                        + " targetExposureNs=" + plan.normalTargetExposureNs
++                                        + " targetIso=" + plan.normalTargetIso
++                                        + " actualExposureNs=" + iris26725ActualExposureNs
++                                        + " actualIso=" + iris26725ActualIso
++                                        + " deltaEv=" + iris26725DeltaEv
++                                        + " deterministic=" + ticket.deterministicExposureFailure);
++                    }
+                     return;
+                 }
+                 plan.recordTopUpResult(ticket, result);
+@@ -9225,6 +9360,22 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         rememberMotion26598RetiredNormalTopUpTimestamp(failedTicket.resultTimestampNs);
+         Motion26598NormalTopUpTicket replacement = new Motion26598NormalTopUpTicket(
+                 failedTicket.ordinal, failedTicket.attempt + 1);
++        replacement.forceManualSensor = failedTicket.forceManualSensor;
++        final boolean iris26725GoogleManualFallback =
++                isMotion26725GooglePixelCompatibilityRoute()
++                        && "EXPOSURE_REJECTED".equals(failedTicket.failureReason)
++                        && !failedTicket.manualSensorRequest
++                        && motion26713ManualSensorAvailable();
++        if (iris26725GoogleManualFallback) {
++            replacement.forceManualSensor = true;
++            com.particlesdevs.photoncamera.util.MotionTrace.state(
++                    mMotionDiagnosticShotId, "IRIS_26725_GOOGLE_AE_LOCK_TO_MANUAL",
++                    "slot=" + replacement.ordinal + " previousAttempt=" + failedTicket.attempt
++                            + " replacementAttempt=" + replacement.attempt
++                            + " targetExposureNs=" + plan.normalTargetExposureNs
++                            + " targetIso=" + plan.normalTargetIso
++                            + " exposureWindowUnchanged=true deadlineReset=false");
++        }
+         plan.addTopUpTicket(replacement);
+         try {
+             CaptureRequest request = buildMotion26724NormalTopUpRequest(plan, replacement);
+@@ -9263,6 +9414,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         boolean retried = false;
+         long now = android.os.SystemClock.elapsedRealtime();
+         for (Motion26598NormalTopUpTicket failed : plan.failedActiveTopUpTickets()) {
++            if (failed.deterministicExposureFailure) continue;
+             if (failed.submittedElapsedMs > 0L
+                     && now - failed.submittedElapsedMs < MOTION_26724_RETRY_BACKOFF_MS) continue;
+             retried |= submitMotion26724ReplacementNormalAttempt(plan, failed);
+@@ -9504,6 +9656,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             retryMotion26724FailedNormalSlots(plan, elapsed);
+             retryMotion26724LongSlotIfNeeded(plan, elapsed);
+         }
++        Motion26598NormalTopUpTicket iris26725DeterministicExposureFailure =
++                plan.deterministicExposureFailure();
++        if (iris26725DeterministicExposureFailure != null) {
++            com.particlesdevs.photoncamera.util.MotionTrace.state(
++                    mMotionDiagnosticShotId, "IRIS_26725_GOOGLE_MANUAL_EXPOSURE_UNACHIEVABLE",
++                    "slot=" + iris26725DeterministicExposureFailure.ordinal
++                            + " attempt=" + iris26725DeterministicExposureFailure.attempt
++                            + " retryStormPrevented=true exposureWindowUnchanged=true");
++            failMotion26593CapturePlan(plan, "NORMAL_EXPOSURE_UNACHIEVABLE",
++                    "Camera could not reproduce the required Motion exposure");
++            return;
++        }
+         int normalReadyCount = countMotion26593NormalFrames(plan);
+         boolean shortPresent = !plan.shortExpected || plan.shortTicket.slot.hasFrame();
+         boolean longPresent = !plan.longExpected
+@@ -10210,6 +10374,27 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return;
+         }
+ 
++        if (isMotion26725GooglePixelCompatibilityRoute()) {
++            boolean iris26725AllNormalPlanesReadable = true;
++            for (Image image : rawImages) {
++                if (!motion26725ValidateGoogleRawImageForCpuCopy(image, "NORMAL")) {
++                    iris26725AllNormalPlanesReadable = false;
++                    break;
++                }
++            }
++            if (!iris26725AllNormalPlanesReadable) {
++                for (Image image : rawImages) {
++                    if (image != null) try { image.close(); } catch (Throwable ignored) {}
++                }
++                failMotion26593CapturePlan(iris26593Plan, "GOOGLE_RAW_CPU_PLANE_UNREADABLE",
++                        "RAW capture unavailable on this camera session");
++                return;
++            }
++            Log.i(TAG, "IRIS_26725_GOOGLE_RAW_CPU_BATCH_PREFLIGHT"
++                    + " normalFrames=" + rawImages.size()
++                    + " allCpuReadable=true nativeCopySafe=true");
++        }
++
+         /* IRIS_26593_WHOLE_RING_EXACT_NORMAL_SELECTION */
+         int skip = 0;
+ 
+diff --git a/app/version.properties b/app/version.properties
+index 8732c6e6514e9dbfc6b592b9206923d37ce91602..c419b277e1d8cb851c88b53ecf7d6282c352126a 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726724
+-VERSION_BUILD=26724
++VERSION_NAME=0.9726725
++VERSION_BUILD=26725
