@@ -1,0 +1,461 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 6b03ad7e6c4463817d3044d58a5402154014ff03..37e6789dc97e24e2181f71ec525e076cb46223b3 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -1205,18 +1205,45 @@ internal object Iris26529SpatialRgbChromaShaders {
+             return clamp(vec3(decodeU16(e.r),decodeU16(e.g),decodeU16(e.b))*uCalculationGains,vec3(0.0),vec3(65504.0));
+         }
+         float yAt(ivec2 p){ return dot(calculationRgbAt(p),vec3(0.25,0.5,0.25)); }
++        vec2 materialChromaAt(ivec2 p){
++            vec3 rgb=calculationRgbAt(p);
++            float sum=max(rgb.r+2.0*rgb.g+rgb.b,1.0);
++            return (rgb.rb-vec2(rgb.g))/sum;
++        }
+         uint directionMaskAt(ivec2 p){
+             const ivec2 d[8]=ivec2[8](ivec2(0,-1),ivec2(1,0),ivec2(0,1),ivec2(-1,0),ivec2(1,-1),ivec2(1,1),ivec2(-1,1),ivec2(-1,-1));
+-            float center=yAt(p); float g[8]; float lo=65504.0; float hi=0.0;
++            float center=yAt(p); vec2 centerChroma=materialChromaAt(p);
++            float g[8]; float chromaJump[8]; float neighborContinuation[8];
++            float lo=65504.0; float hi=0.0; float centerContinuation=0.0;
+             for(int i=0;i<8;++i){
+                 float first=yAt(p+d[i]); float second=yAt(p+d[i]*2);
++                vec2 firstChroma=materialChromaAt(p+d[i]);
++                vec2 secondChroma=materialChromaAt(p+d[i]*2);
+                 float rgbGradient=abs(center-first)+0.5*abs(first-second);
+                 g[i]=rgbGradient; lo=min(lo,g[i]); hi=max(hi,g[i]);
++                chromaJump[i]=length(centerChroma-firstChroma);
++                neighborContinuation[i]=1.0-smoothstep(0.020,0.070,length(firstChroma-secondChroma));
++                float lumaCompatible=1.0-smoothstep(0.10,0.30,abs(first-center)/max(max(first,center),3930.0));
++                centerContinuation=max(centerContinuation,lumaCompatible*(1.0-smoothstep(0.020,0.070,chromaJump[i])));
+             }
+             float threshold=max(uMinimumDirectionGradient,1.5*lo+0.09375*(hi-lo));
+             int mask=0; int count=0;
+-            for(int i=0;i<8;++i){ if(g[i]<=threshold){ mask|=1<<i; count++; } }
+-            if(count==0){ mask=0xFF; count=8; }
++            for(int i=0;i<8;++i){
++                /* IRIS_26729_COLOR_MATERIAL_DIRECTION_GATE
++                 * A coherent color boundary blocks chroma transport even when luma is nearly equal.
++                 * Isolated false-color dots do not gain protection because the center must continue
++                 * coherently in at least one other direction and the neighboring material must also
++                 * continue away from the boundary. */
++                float colorBoundary=smoothstep(0.030,0.095,chromaJump[i]) *
++                    smoothstep(0.35,0.75,centerContinuation) * neighborContinuation[i];
++                if(g[i]<=threshold&&colorBoundary<0.50){ mask|=1<<i; count++; }
++            }
++            if(count==0){
++                /* A coherent tiny structure may legitimately have no safe cross-boundary direction.
++                 * Preserve it rather than reopening every direction; isolated false-color has low
++                 * centerContinuation and retains the inherited all-direction fallback for cleanup. */
++                if(centerContinuation>0.35){mask=0;count=0;}else{mask=0xFF;count=8;}
++            }
+             return uint(mask | (count << 8));
+         }
+         uvec4 toYccd(vec3 rgb,uint direction){
+@@ -1265,6 +1292,21 @@ internal object Iris26529SpatialRgbChromaShaders {
+             ivec2 centerChroma=ivec2(signedChroma(center.g),signedChroma(center.b));
+             float centerY=float(center.r)/65504.0;
+             float maximumRelativeLumaDelta=0.0;
++            float colorBoundaryProtection=0.0;
++            /* IRIS_26729_COLOR_MATERIAL_MEDIAN_GATE: establish center continuity before
++             * deciding which neighbors are allowed to contribute chroma. */
++            float centerMaterialContinuation=0.0;
++            const ivec2 materialDirections[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
++            for(int i=0;i<8;++i){
++                uvec4 neighbor=imageLoad(uInput,safePos(p+materialDirections[i]));
++                float neighborY=float(neighbor.r)/65504.0;
++                vec2 neighborC=vec2(float(signedChroma(neighbor.g)),float(signedChroma(neighbor.b)));
++                float lumaDelta=abs(neighborY-centerY)/max(max(neighborY,centerY),0.060);
++                float chromaScale=max(max(length(vec2(centerChroma)),length(neighborC)),512.0);
++                float chromaDelta=length(vec2(centerChroma)-neighborC)/chromaScale;
++                centerMaterialContinuation=max(centerMaterialContinuation,
++                    (1.0-smoothstep(0.10,0.30,lumaDelta))*(1.0-smoothstep(0.18,0.42,chromaDelta)));
++            }
+             int brighterSide=0;
+             int darkerSide=0;
+             vec2 brighterChromaSum=vec2(0.0);
+@@ -1277,6 +1319,19 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 float signedDelta=(neighborY-centerY)/scale;
+                 maximumRelativeLumaDelta=max(maximumRelativeLumaDelta,abs(signedDelta));
+                 vec2 neighborChroma=vec2(float(signedChroma(neighbor.g)),float(signedChroma(neighbor.b)));
++                float localChromaScale=max(max(length(vec2(centerChroma)),length(neighborChroma)),512.0);
++                float localChromaJump=length(vec2(centerChroma)-neighborChroma)/localChromaScale;
++                ivec2 delta=ivec2(x,y);
++                uvec4 farPixel=imageLoad(uInput,safePos(p+delta*2));
++                vec2 farChroma=vec2(float(signedChroma(farPixel.g)),float(signedChroma(farPixel.b)));
++                float farScale=max(max(length(neighborChroma),length(farChroma)),512.0);
++                float neighborContinuation=1.0-smoothstep(0.18,0.42,length(neighborChroma-farChroma)/farScale);
++                float colorMaterialBoundary=smoothstep(0.35,0.70,localChromaJump)*
++                    smoothstep(0.35,0.75,centerMaterialContinuation)*neighborContinuation;
++                colorBoundaryProtection=max(colorBoundaryProtection,colorMaterialBoundary);
++                /* Cross-material neighbors do not participate in the side statistics. The final
++                 * strength veto below also blocks the precomputed 3x3 median itself. */
++                if(colorMaterialBoundary>0.50)continue;
+                 if(signedDelta>0.16){brighterSide++;brighterChromaSum+=neighborChroma;}
+                 if(signedDelta<-0.16){darkerSide++;darkerChromaSum+=neighborChroma;}
+             }
+@@ -1308,7 +1363,8 @@ internal object Iris26529SpatialRgbChromaShaders {
+             }
+             float topologyProtection=smoothstep(1.25,2.75,topologySupport)*
+                 smoothstep(0.20,0.55,max(legacyEdge,sideCount>0.0?1.0:0.0));
+-            float edgeProtection=max(max(max(oneSidedProtection,materialBoundary),legacyEdge),topologyProtection);
++            float edgeProtection=max(max(max(max(oneSidedProtection,materialBoundary),legacyEdge),topologyProtection),
++                smoothstep(0.35,0.65,colorBoundaryProtection));
+             float strength=clamp(uChromaStrength,0.0,1.0)*(1.0-edgeProtection);
+             ivec2 corrected=strength<=0.0001?centerChroma:ivec2(mix(vec2(centerChroma),vec2(sum),strength));
+             /* IRIS_26571_CROSS_EDGE_CHROMA_OWNERSHIP
+@@ -1457,8 +1513,13 @@ internal object Iris26529SpatialRgbChromaShaders {
+                     if(previousLumaDelta<0.18&&(previousChromaMagnitude<256.0||previousHue>0.84))previousPerpendicularSupport++;
+                 }
+                 bool topologyBoundary=currentPerpendicularSupport>0&&previousPerpendicularSupport>0;
+-                bool materialColorBoundary=edgeRatio>0.24&&chromaJump>0.45&&
+-                    (highlightPreservePermission>0.5||topologyBoundary);
++                /* IRIS_26729_COLOR_ONLY_IIR_STATE_RESET
++                 * A coherent material/color transition is a boundary even when two colors have the
++                 * same luminance. Perpendicular support is required for the color-only case so an
++                 * isolated CFA false-color dot cannot protect itself from cleanup. */
++                bool colorOnlyMaterialBoundary=chromaJump>0.38&&topologyBoundary;
++                bool materialColorBoundary=(edgeRatio>0.24&&chromaJump>0.45&&
++                    (highlightPreservePermission>0.5||topologyBoundary))||colorOnlyMaterialBoundary;
+                 /* IRIS_26571_IIR_MATERIAL_EDGE_STATE_RESET
+                  * Keep the 26570 strong-edge reset and additionally stop recursive chroma state at
+                  * moderate luma transitions when the input chroma itself proves a material/color
+diff --git a/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt b/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
+index 80bfa66c4afec659d911a557900ee7ebe151ead5..e698fd0d66d4778ae2b6b5221cfa3fc951b27024 100644
+--- a/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
++++ b/app/src/main/java/com/hinnka/mycamera/raw/MgcFullResolutionDenoise.kt
+@@ -153,11 +153,19 @@ internal object MgcFullResolutionDenoise {
+         pass: Pass,
+         lumaStrengthScale: Float,
+         chromaStrengthScale: Float,
++        customChromaStrength: FloatArray? = null,
+     ): Boolean {
+         val finiteLumaScale = DenoiseStrength.clamp(lumaStrengthScale)
+         val finiteChromaScale = DenoiseStrength.clamp(chromaStrengthScale)
++        val customChroma = customChromaStrength?.copyOf()?.takeIf { values ->
++            values.size == 5 && values.all { it.isFinite() && it in 0f..5f }
++        }
++        if (customChromaStrength != null && customChroma == null) {
++            PLog.e(TAG, "MGC denoise rejected malformed custom chroma strength=${customChromaStrength.contentToString()}")
++            return false
++        }
+         val lumaEnabled = finiteLumaScale > 0f
+-        val chromaEnabled = finiteChromaScale > 0f
++        val chromaEnabled = customChroma?.any { it > 0f } ?: (finiteChromaScale > 0f)
+         if (!initialized || !rgba16f.isDirect || width <= 0 || height <= 0 ||
+             !outputScale.isFinite() || outputScale <= 0f ||
+             (!lumaEnabled && !chromaEnabled)
+@@ -282,8 +290,16 @@ internal object MgcFullResolutionDenoise {
+         }
+         val lumaTuning = interpolateTuning(tuningSnr, selectedLumaTuningPoints)
+             .withStrengthScale(finiteLumaScale)
+-        val chromaTuning = interpolateTuning(tuningSnr, chromaTuningPoints)
+-            .withStrengthScale(finiteChromaScale)
++        val automaticChromaTuning = interpolateTuning(tuningSnr, chromaTuningPoints)
++        /* IRIS_26729_EXACT_RESIDUAL_CHROMA_LEVELS
++         * Custom Motion mode replaces only the five final chroma pyramid strengths. The inherited
++         * SNR-selected outlier/revert tuning and native algorithm remain unchanged. Auto stays
++         * byte-behavior compatible with 26728. */
++        val chromaTuning = if (customChroma != null) {
++            automaticChromaTuning.copy(strength = customChroma)
++        } else {
++            automaticChromaTuning.withStrengthScale(finiteChromaScale)
++        }
+         // MGC process_raw enables MeasureMoire only for a standard Bayer
+         // capture at exact 1x output. The AOT consumes RawToYuv's Y plane, so
+         // this remains valid when the current handoff already contains RGB.
+@@ -350,6 +366,7 @@ internal object MgcFullResolutionDenoise {
+                 "snr=$tuningSnr pass=$pass " +
+                 "luma=$lumaEnabled($finiteLumaScale) " +
+                 "chroma=$chromaEnabled($finiteChromaScale) " +
++                "chromaMode=${if (customChroma != null) "CUSTOM_EXACT" else "AUTO_SNR"} " +
+                 "measureMoire=$measureMoireEnabled outputScale=$outputScale " +
+                 "rgbShot=${rgbShot.contentToString()} " +
+                 "rgbRead=${rgbRead.contentToString()} " +
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+index 4b94a5310848ca84b4c1665534fd31e5d0154e88..7722fd6a16aed5d59bca628669599eae5780b5c0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+@@ -22,6 +22,16 @@ public final class IrisMotionSettings {
+      */
+     public static final String KEY_LUMA_DENOISE = "pref_iris_luma_denoise_v2";
+     public static final String KEY_CHROMA_DENOISE = "pref_iris_chroma_denoise";
++    /* IRIS_26729_PER_LENS_RESIDUAL_CHROMA_LEVELS
++     * Auto preserves 26728's SNR-interpolated MGC recipe. Custom is Motion-only and supplies
++     * the exact five final pyramid strengths; 0/0/0/0/0 is a true residual chroma bypass. */
++    public static final String KEY_RESIDUAL_CHROMA_CUSTOM = "pref_iris_residual_chroma_custom";
++    public static final String KEY_RESIDUAL_CHROMA_LEVEL1 = "pref_iris_residual_chroma_level1";
++    public static final String KEY_RESIDUAL_CHROMA_LEVEL2 = "pref_iris_residual_chroma_level2";
++    public static final String KEY_RESIDUAL_CHROMA_LEVEL3 = "pref_iris_residual_chroma_level3";
++    public static final String KEY_RESIDUAL_CHROMA_LEVEL4 = "pref_iris_residual_chroma_level4";
++    public static final String KEY_RESIDUAL_CHROMA_LEVEL5 = "pref_iris_residual_chroma_level5";
++    private static final float[] DEFAULT_RESIDUAL_CHROMA_LEVELS = new float[]{5.0f, 4.0f, 4.0f, 0.8f, 1.0f};
+     /* IRIS_26630_MOTION_PRESENTATION_SETTINGS
+      * VGN is no longer user-controlled: reconstruction is fixed at the proven 1.0 policy.
+      * Saturation remains the only new color presentation control and is intentionally per-lens.
+@@ -51,6 +61,8 @@ public final class IrisMotionSettings {
+         public final String profileDisplayName;
+         public final float lumaDenoise;
+         public final float chromaDenoise;
++        public final boolean residualChromaCustom;
++        public final float[] residualChromaLevels;
+         public final float saturation;
+         public final float exposureEv;
+         public final float shadows;
+@@ -62,6 +74,8 @@ public final class IrisMotionSettings {
+                  String profileDisplayName,
+                  float lumaDenoise,
+                  float chromaDenoise,
++                 boolean residualChromaCustom,
++                 float[] residualChromaLevels,
+                  float saturation,
+                  float exposureEv,
+                  float shadows,
+@@ -72,6 +86,9 @@ public final class IrisMotionSettings {
+             this.profileDisplayName = profileDisplayName == null ? "" : profileDisplayName;
+             this.lumaDenoise = lumaDenoise;
+             this.chromaDenoise = chromaDenoise;
++            this.residualChromaCustom = residualChromaCustom;
++            this.residualChromaLevels = residualChromaLevels == null
++                    ? DEFAULT_RESIDUAL_CHROMA_LEVELS.clone() : residualChromaLevels.clone();
+             this.saturation = saturation;
+             this.exposureEv = exposureEv;
+             this.shadows = shadows;
+@@ -87,7 +104,8 @@ public final class IrisMotionSettings {
+     public static Snapshot current() {
+         SettingsManager sm = PhotonCamera.getSettingsManagerStatic();
+         if (sm == null) {
+-            return new Snapshot(true, false, "", "", 1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f);
++            return new Snapshot(true, false, "", "", 1.0f, 1.0f, false,
++                    DEFAULT_RESIDUAL_CHROMA_LEVELS, 1.0f, 0.0f, 0.0f, 0.0f);
+         }
+         boolean nr = PreferenceKeys.isHdrxNrOn();
+         boolean custom = getBoolean(sm, KEY_CUSTOM_NOISE_MODEL, false);
+@@ -95,11 +113,20 @@ public final class IrisMotionSettings {
+         String name = getString(sm, KEY_PROFILE_NAME, "");
+         float luma = snap01(getFloat(sm, KEY_LUMA_DENOISE, 0.0f), 0.0f, 2.0f);
+         float chroma = snap01(getFloat(sm, KEY_CHROMA_DENOISE, 1.0f), 0.0f, 2.0f);
++        boolean residualCustom = getBoolean(sm, KEY_RESIDUAL_CHROMA_CUSTOM, false);
++        float[] residualLevels = new float[]{
++                snap01(getFloat(sm, KEY_RESIDUAL_CHROMA_LEVEL1, 5.0f), 0.0f, 5.0f),
++                snap01(getFloat(sm, KEY_RESIDUAL_CHROMA_LEVEL2, 4.0f), 0.0f, 5.0f),
++                snap01(getFloat(sm, KEY_RESIDUAL_CHROMA_LEVEL3, 4.0f), 0.0f, 5.0f),
++                snap01(getFloat(sm, KEY_RESIDUAL_CHROMA_LEVEL4, 0.8f), 0.0f, 5.0f),
++                snap01(getFloat(sm, KEY_RESIDUAL_CHROMA_LEVEL5, 1.0f), 0.0f, 5.0f),
++        };
+         float saturation = snap01(getFloat(sm, KEY_SATURATION, 1.0f), 0.0f, 2.0f);
+         float exposure = snap01(getFloat(sm, KEY_EXPOSURE_EV, 0.0f), -1.0f, 1.0f);
+         float shadows = snap01(getFloat(sm, KEY_SHADOWS, 0.0f), -1.0f, 1.0f);
+         float contrast = snap01(getFloat(sm, KEY_CONTRAST, 0.0f), -1.0f, 1.0f);
+-        return new Snapshot(nr, custom, id, name, luma, chroma, saturation, exposure, shadows, contrast);
++        return new Snapshot(nr, custom, id, name, luma, chroma, residualCustom, residualLevels,
++                saturation, exposure, shadows, contrast);
+     }
+ 
+     /* IRIS_26540_NIGHT_EXACT_CAMERA2_NOISE_SNAPSHOT
+@@ -109,7 +136,7 @@ public final class IrisMotionSettings {
+     public static Snapshot exactCamera2NightSnapshot() {
+         Snapshot source = current();
+         return new Snapshot(source.noiseReductionEnabled, false, "", "Camera2 exact",
+-                0.0f, source.chromaDenoise, 1.0f,
++                0.0f, source.chromaDenoise, false, DEFAULT_RESIDUAL_CHROMA_LEVELS, 1.0f,
+                 source.exposureEv, source.shadows, source.contrast);
+     }
+ 
+@@ -121,8 +148,10 @@ public final class IrisMotionSettings {
+ 
+     public static boolean isQuantizedSliderKey(String key) {
+         return KEY_LUMA_DENOISE.equals(key) || KEY_CHROMA_DENOISE.equals(key) ||
+-                KEY_SATURATION.equals(key) || KEY_EXPOSURE_EV.equals(key) || KEY_SHADOWS.equals(key) ||
+-                KEY_CONTRAST.equals(key);
++                KEY_RESIDUAL_CHROMA_LEVEL1.equals(key) || KEY_RESIDUAL_CHROMA_LEVEL2.equals(key) ||
++                KEY_RESIDUAL_CHROMA_LEVEL3.equals(key) || KEY_RESIDUAL_CHROMA_LEVEL4.equals(key) ||
++                KEY_RESIDUAL_CHROMA_LEVEL5.equals(key) || KEY_SATURATION.equals(key) ||
++                KEY_EXPOSURE_EV.equals(key) || KEY_SHADOWS.equals(key) || KEY_CONTRAST.equals(key);
+     }
+ 
+     public static void normalizePersistedSlider(String key) {
+@@ -130,11 +159,18 @@ public final class IrisMotionSettings {
+         SettingsManager sm = PhotonCamera.getSettingsManagerStatic();
+         if (sm == null) return;
+         boolean denoiseSlider = KEY_LUMA_DENOISE.equals(key) || KEY_CHROMA_DENOISE.equals(key);
++        boolean residualLevel = KEY_RESIDUAL_CHROMA_LEVEL1.equals(key) ||
++                KEY_RESIDUAL_CHROMA_LEVEL2.equals(key) || KEY_RESIDUAL_CHROMA_LEVEL3.equals(key) ||
++                KEY_RESIDUAL_CHROMA_LEVEL4.equals(key) || KEY_RESIDUAL_CHROMA_LEVEL5.equals(key);
+         boolean saturationSlider = KEY_SATURATION.equals(key);
+-        float min = (denoiseSlider || saturationSlider) ? 0.0f : -1.0f;
+-        float max = (denoiseSlider || saturationSlider) ? 2.0f : 1.0f;
++        float min = (denoiseSlider || residualLevel || saturationSlider) ? 0.0f : -1.0f;
++        float max = residualLevel ? 5.0f : ((denoiseSlider || saturationSlider) ? 2.0f : 1.0f);
+         float def = KEY_LUMA_DENOISE.equals(key) ? 0.0f :
+-                ((KEY_CHROMA_DENOISE.equals(key) || saturationSlider) ? 1.0f : 0.0f);
++                (KEY_RESIDUAL_CHROMA_LEVEL1.equals(key) ? 5.0f :
++                (KEY_RESIDUAL_CHROMA_LEVEL2.equals(key) || KEY_RESIDUAL_CHROMA_LEVEL3.equals(key) ? 4.0f :
++                (KEY_RESIDUAL_CHROMA_LEVEL4.equals(key) ? 0.8f :
++                (KEY_RESIDUAL_CHROMA_LEVEL5.equals(key) ? 1.0f :
++                ((KEY_CHROMA_DENOISE.equals(key) || saturationSlider) ? 1.0f : 0.0f)))));
+         float snapped = snap01(getFloat(sm, key, def), min, max);
+         String normalized = String.format(Locale.ROOT, "%.1f", snapped);
+         String current = getString(sm, key, String.format(Locale.ROOT, "%.1f", def));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 97dd8186bc36fc0803be1c285bffe7b3b1bc10bc..31f44acb1ad4d8c19c32ebd82b5ce3e48ce211d3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -730,9 +730,24 @@ object PhotonMotionMgc1271Bridge {
+              */
+             val lumaScale = maxOf(requestedLumaScale, automaticLumaScale26639).coerceIn(0f, 2f)
+             val chromaScale = irisSettings.chromaDenoise.coerceIn(0f, 2f)
++            /* IRIS_26729_ONE_PRIMARY_CHROMA_OWNER
++             * VGN is the primary Motion chroma owner. The inherited MGC residual pass is subordinate:
++             * Auto preserves 26728; Custom supplies exact per-lens five-level strengths. Night is
++             * deliberately firewalled from Custom until its separate color ownership is audited. */
++            val customResidualChroma = if (!parameters.irisNightActive && irisSettings.residualChromaCustom) {
++                irisSettings.residualChromaLevels.copyOf()
++            } else {
++                null
++            }
++            val customResidualChromaEnabled = customResidualChroma?.any { it > 0f } ?: false
++            val residualChromaEnabled = customResidualChromaEnabled ||
++                (customResidualChroma == null && chromaScale > 0f)
+             val denoisePass = MgcFullResolutionDenoise.Pass.SABRE_DEFAULT
+             val runFullResolutionDenoise = irisSettings.noiseReductionEnabled &&
+-                (lumaScale > 0f || chromaScale > 0f)
++                (lumaScale > 0f || residualChromaEnabled)
++            if (!parameters.irisNightActive) {
++                PLog.i("MotionTrace", "IRIS_26729_RESIDUAL_CHROMA_CONTROL mode=${if (customResidualChroma != null) "CUSTOM_EXACT" else "AUTO_SNR"} levels=${customResidualChroma?.contentToString() ?: "AUTO"} autoScale=$chromaScale bypass=${customResidualChroma != null && !customResidualChromaEnabled}")
++            }
+             var resultTrue2xLinearRawPath: String? = null
+             var resultTrue2xRenderRgbPath: String? = null
+             var iris26564True2xRenderPrepMs = 0L
+@@ -777,7 +792,8 @@ object PhotonMotionMgc1271Bridge {
+                     tuningSnr = tuningSnr!!,
+                     pass = denoisePass,
+                     lumaStrengthScale = lumaScale,
+-                    chromaStrengthScale = chromaScale,
++                    chromaStrengthScale = if (customResidualChroma != null) 0f else chromaScale,
++                    customChromaStrength = customResidualChroma,
+                 ), "MGC $denoisePass pre-PostPipeline linear-RGB denoise rejected its noise state")
+             }
+             iris26535DenoiseMs = (System.nanoTime() - iris26535DenoiseStartNs) / 1_000_000L
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+index 0e58ebcdc820b78e24a751535211806ff76f2105..6e389d134b89c901e86c046aca2b0f4d5b883b24 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+@@ -96,6 +96,13 @@ public class PreferenceKeys {
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_luma_denoise", "1.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_luma_denoise_v2", "0.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_chroma_denoise", "1.0");
++        /* IRIS_26729_PER_LENS_RESIDUAL_CHROMA_DEFAULT_SEED */
++        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_custom", false);
++        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level1", "5.0");
++        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level2", "4.0");
++        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level3", "4.0");
++        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level4", "0.8");
++        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level5", "1.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_saturation", "1.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_exposure_ev", "0.0");
+         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_shadows", "0.0");
+@@ -180,6 +187,13 @@ public class PreferenceKeys {
+         map.putIfAbsent("pref_iris_luma_denoise", "1.0");
+         map.putIfAbsent("pref_iris_luma_denoise_v2", "0.0");
+         map.putIfAbsent("pref_iris_chroma_denoise", "1.0");
++        /* IRIS_26729_PER_LENS_RESIDUAL_CHROMA_LEGACY_DEFAULTS */
++        map.putIfAbsent("pref_iris_residual_chroma_custom", "0");
++        map.putIfAbsent("pref_iris_residual_chroma_level1", "5.0");
++        map.putIfAbsent("pref_iris_residual_chroma_level2", "4.0");
++        map.putIfAbsent("pref_iris_residual_chroma_level3", "4.0");
++        map.putIfAbsent("pref_iris_residual_chroma_level4", "0.8");
++        map.putIfAbsent("pref_iris_residual_chroma_level5", "1.0");
+         map.remove("pref_iris_vgn_chroma_correction");
+         map.remove("pref_motion_viewfinder_match_strength");
+         map.putIfAbsent("pref_iris_saturation", "1.0");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index ff841c9c0c890dbb3a9259121414eb591903088d..a2361974353ec72b2a23b87212bb6390c42557d1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -371,6 +371,12 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_IMPORT_NOISE_MODEL);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_LUMA_DENOISE);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_CHROMA_DENOISE);
++                    removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM);
++                    removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_LEVEL1);
++                    removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_LEVEL2);
++                    removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_LEVEL3);
++                    removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_LEVEL4);
++                    removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_LEVEL5);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_EXPOSURE_EV);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_SHADOWS);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_CONTRAST);
+diff --git a/app/src/main/res/values/default_prefs.xml b/app/src/main/res/values/default_prefs.xml
+index b8a858d3401fa8a1282d072a3a8180a1ab519ea6..ff59b1a9ead5c873b62a5348db07c957c495b122 100644
+--- a/app/src/main/res/values/default_prefs.xml
++++ b/app/src/main/res/values/default_prefs.xml
+@@ -16,6 +16,13 @@
+     <bool name="pref_highlight_compression_default">false</bool>
+     <string name="pref_iris_luma_denoise_default" translatable="false">0.0</string>
+     <string name="pref_iris_chroma_denoise_default" translatable="false">1.0</string>
++    <!-- IRIS_26729_PER_LENS_RESIDUAL_CHROMA_LEVELS: custom mode is opt-in; Auto preserves 26728. -->
++    <bool name="pref_iris_residual_chroma_custom_default">false</bool>
++    <string name="pref_iris_residual_chroma_level1_default" translatable="false">5.0</string>
++    <string name="pref_iris_residual_chroma_level2_default" translatable="false">4.0</string>
++    <string name="pref_iris_residual_chroma_level3_default" translatable="false">4.0</string>
++    <string name="pref_iris_residual_chroma_level4_default" translatable="false">0.8</string>
++    <string name="pref_iris_residual_chroma_level5_default" translatable="false">1.0</string>
+     <string name="pref_iris_saturation_default" translatable="false">1.0</string>
+     <string name="pref_iris_exposure_default" translatable="false">0.0</string>
+     <string name="pref_iris_shadows_default" translatable="false">0.0</string>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+index d14dbe95c8672eeb65e9bf5c7fb1f597e3cbef30..feda6e768ed28d35a1b2279eed81505aef10bb03 100644
+--- a/app/src/main/res/values/strings.xml
++++ b/app/src/main/res/values/strings.xml
+@@ -41,8 +41,20 @@
+     <string name="iris_import_noise_model_summary">Tap to choose a validated .c file</string>
+     <string name="iris_luma_denoise">Luma Denoise</string>
+     <string name="iris_luma_denoise_summary">Residual luminance denoise after reconstruction and before tone mapping. 0 = off, 1 = calibrated, 2 = strongest.</string>
+-    <string name="iris_chroma_denoise">Chroma Denoise</string>
+-    <string name="iris_chroma_denoise_summary">Residual color denoise after reconstruction and before tone mapping. 0 = off, 1 = calibrated, 2 = strongest.</string>
++    <string name="iris_chroma_denoise">Residual Chroma Auto Scale</string>
++    <string name="iris_chroma_denoise_summary">Auto mode only. Scales the inherited SNR-based five-level MGC residual chroma recipe. Ignored when Custom Residual Chroma Levels is enabled.</string>
++    <string name="iris_residual_chroma_custom">Custom Residual Chroma Levels</string>
++    <string name="iris_residual_chroma_custom_summary">Per-lens Motion control. Off = inherited SNR-based Auto recipe. On = the five levels below are exact final MGC chroma strengths; all five at 0.0 bypass residual chroma denoise.</string>
++    <string name="iris_residual_chroma_level1">Residual Chroma Level 1</string>
++    <string name="iris_residual_chroma_level1_summary">Finest/full-resolution chroma cleanup strength. 0.0 disables this level.</string>
++    <string name="iris_residual_chroma_level2">Residual Chroma Level 2</string>
++    <string name="iris_residual_chroma_level2_summary">Fine-to-medium chroma pyramid strength. 0.0 disables this level.</string>
++    <string name="iris_residual_chroma_level3">Residual Chroma Level 3</string>
++    <string name="iris_residual_chroma_level3_summary">Medium chroma pyramid strength. 0.0 disables this level.</string>
++    <string name="iris_residual_chroma_level4">Residual Chroma Level 4</string>
++    <string name="iris_residual_chroma_level4_summary">Medium-to-coarse chroma pyramid strength. 0.0 disables this level.</string>
++    <string name="iris_residual_chroma_level5">Residual Chroma Level 5</string>
++    <string name="iris_residual_chroma_level5_summary">Coarsest chroma cleanup strength. 0.0 disables this level.</string>
+     <string name="iris_saturation">Iris Saturation</string>
+     <string name="iris_saturation_summary">Per-lens Motion colorfulness after calibrated profile color. 1.0 = adaptive calibrated default; Night does not inherit this control.</string>
+     <string name="iris_local_laplacian_tone">Local Laplacian Tone</string>
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index 0aa47896ff2532a2edce6bc0f12567bef93efdc2..b89213422ae4cfe8ec94bdb25a4081ab4159001b 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -36,6 +36,13 @@
+         <Preference ns0:key="pref_iris_import_noise_model" ns0:layout="@layout/preference_with_margin" ns0:title="@string/iris_import_noise_model" ns0:summary="@string/iris_import_noise_model_summary" ns0:icon="@drawable/ic_save" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_luma_denoise_v2" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_luma_denoise" ns0:summary="@string/iris_luma_denoise_summary" ns0:defaultValue="@string/pref_iris_luma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_grain_black_24dp" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_chroma_denoise" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_chroma_denoise" ns0:summary="@string/iris_chroma_denoise_summary" ns0:defaultValue="@string/pref_iris_chroma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <!-- IRIS_26729_PER_LENS_RESIDUAL_CHROMA_UI -->
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.ManagedSwitchPreference ns0:key="pref_iris_residual_chroma_custom" ns0:layout="@layout/preference_with_margin" ns0:title="@string/iris_residual_chroma_custom" ns0:summary="@string/iris_residual_chroma_custom_summary" ns0:defaultValue="@bool/pref_iris_residual_chroma_custom_default" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_residual_chroma_level1" ns0:dependency="pref_iris_residual_chroma_custom" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_residual_chroma_level1" ns0:summary="@string/iris_residual_chroma_level1_summary" ns0:defaultValue="@string/pref_iris_residual_chroma_level1_default" ns1:maxValue="5.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_residual_chroma_level2" ns0:dependency="pref_iris_residual_chroma_custom" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_residual_chroma_level2" ns0:summary="@string/iris_residual_chroma_level2_summary" ns0:defaultValue="@string/pref_iris_residual_chroma_level2_default" ns1:maxValue="5.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_residual_chroma_level3" ns0:dependency="pref_iris_residual_chroma_custom" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_residual_chroma_level3" ns0:summary="@string/iris_residual_chroma_level3_summary" ns0:defaultValue="@string/pref_iris_residual_chroma_level3_default" ns1:maxValue="5.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_residual_chroma_level4" ns0:dependency="pref_iris_residual_chroma_custom" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_residual_chroma_level4" ns0:summary="@string/iris_residual_chroma_level4_summary" ns0:defaultValue="@string/pref_iris_residual_chroma_level4_default" ns1:maxValue="5.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_residual_chroma_level5" ns0:dependency="pref_iris_residual_chroma_custom" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_residual_chroma_level5" ns0:summary="@string/iris_residual_chroma_level5_summary" ns0:defaultValue="@string/pref_iris_residual_chroma_level5_default" ns1:maxValue="5.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_saturation" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_saturation" ns0:summary="@string/iris_saturation_summary" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_exposure_ev" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_exposure" ns0:summary="" ns0:defaultValue="@string/pref_iris_exposure_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_shadows" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_shadows" ns0:summary="" ns0:defaultValue="@string/pref_iris_shadows_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_compressor" />
+diff --git a/app/version.properties b/app/version.properties
+index 052561b7533d60ea3a36b9f128d3829bdc21bc1c..944a4db0ca28b3d8e3577f9d056713e7dd6b32df 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726728
+-VERSION_BUILD=26728
++VERSION_NAME=0.9726729
++VERSION_BUILD=26729
