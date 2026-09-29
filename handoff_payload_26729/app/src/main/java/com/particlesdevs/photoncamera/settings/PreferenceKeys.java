@@ -97,7 +97,7 @@ public class PreferenceKeys {
         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_luma_denoise_v2", "0.0");
         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_chroma_denoise", "1.0");
         /* IRIS_26729_PER_LENS_RESIDUAL_CHROMA_DEFAULT_SEED */
-        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_custom", false);
+        settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_custom", "0");
         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level1", "5.0");
         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level2", "4.0");
         settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_level3", "4.0");

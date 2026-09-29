@@ -55,8 +55,15 @@ for t in ['IRIS_26729_R1_EXACT_KOTLIN_RUNTIME_SHADER_EXPANSION',
           'bs=runtime_shader(base,rel,name); cs=runtime_shader(cand,rel,name)']:
  assert t in sv,t
 assert 'textwrap.dedent' not in sv
+# Permanent regression for failed Actions run 36502835664: Java SettingsManager
+# raw String preference keys have no boolean setInitial overload.
+rv=Path('verify_26729_regressions.py').read_text()
+for t in ['IRIS_26729_R2_STRING_KEY_BOOLEAN_DEFAULT_REGRESSION',
+          'pref_iris_residual_chroma_custom\", \"0\"',
+          'setInitial\\(\\s*SCOPE_GLOBAL']:
+ assert t in rv,t
 assert 'backup-' not in s.lower() and 'git branch backup' not in s.lower()
 assert not re.search(r'\bgit\s+(commit|push)\b',s)
 for t in ['compare_app "$AFTER" "$AFTER2"','compare_app "$AFTER" "$LIVE_CANON"','expected one Gradle APK','one intended root APK','post-build candidate/protected/native/vendor/DNG invariance']:
  assert t in s,t
-print('PASS 26729 infrastructure: exact successful 26728 authority hash-pinned; compiler/build commands and stage order unchanged; R1 exact Kotlin runtime shader expansion regression enforced; mechanics delta ZERO; no backup/commit/push')
+print('PASS 26729 infrastructure: exact successful 26728 authority hash-pinned; compiler/build commands and stage order unchanged; R1 exact Kotlin runtime shader expansion + R2 String-key boolean default regressions enforced; mechanics delta ZERO; no backup/commit/push')

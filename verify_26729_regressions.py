@@ -11,6 +11,11 @@ for t in ['KEY_RESIDUAL_CHROMA_CUSTOM','KEY_RESIDUAL_CHROMA_LEVEL1','KEY_RESIDUA
  assert t in ims,t
 assert '0.0f, source.chromaDenoise, false, DEFAULT_RESIDUAL_CHROMA_LEVELS' in ims
 pk=txt(c,'app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java')
+# IRIS_26729_R2_STRING_KEY_BOOLEAN_DEFAULT_REGRESSION: SettingsManager has no
+# setInitial(String,String,boolean); raw String keys must use the persisted "0"/"1" String convention.
+assert 'settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_custom", "0");' in pk
+assert 'settingsManager.setInitial(SCOPE_GLOBAL, "pref_iris_residual_chroma_custom", false);' not in pk
+assert not re.search(r'setInitial\(\s*SCOPE_GLOBAL\s*,\s*"[^"]+"\s*,\s*(?:true|false)\s*\)',pk)
 for key,default in [('pref_iris_residual_chroma_custom','0'),('pref_iris_residual_chroma_level1','5.0'),('pref_iris_residual_chroma_level2','4.0'),('pref_iris_residual_chroma_level3','4.0'),('pref_iris_residual_chroma_level4','0.8'),('pref_iris_residual_chroma_level5','1.0')]:
  assert key in pk,key
  assert f'map.putIfAbsent("{key}", "{default}")' in pk,(key,'legacy default')
