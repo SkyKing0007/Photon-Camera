@@ -2,7 +2,7 @@
 from pathlib import Path
 import hashlib,subprocess,sys,re
 if len(sys.argv)!=3: raise SystemExit('usage: verify_26729_infrastructure.py BUILD_SCRIPT WORKFLOW')
-build=Path(sys.argv[1]); workflow=Path(sys.argv[2]); s=build.read_text(); w=workflow.read_text()
+build=Path(sys.argv[1]); workflow=Path(sys.argv[2]); s=build.read_text(); w=workflow.read_text(); sv=Path('verify_26729_shaders.py').read_text()
 AUTH='5d0482abd0b99979f5f8b800bf55b7a39ef40dab'
 PRIOR={
  'build_26728_physically_supported_chroma.sh':'99b6bbcee7724fece17e631891d12d033b870e3d458c7c31a7378900f7bd9b75',
@@ -47,8 +47,16 @@ for t in [
  assert t in (s+'\n'+w),t
 assert "branches: [experimental-clean-photon-rebuild]" in w
 assert '.github/workflows/build-26729-vgn-chroma-containment.yml' in w
+# Permanent regression for failed Actions run 36492814037: Kotlin shader interpolation
+# must be resolved before manifests, reserved scans, and pinned real glslang.
+for t in ['IRIS_26729_R1_EXACT_KOTLIN_RUNTIME_SHADER_EXPANSION',
+          "raw=raw.replace('$common',common)",
+          "assert '$' not in expanded",
+          'bs=runtime_shader(base,rel,name); cs=runtime_shader(cand,rel,name)']:
+ assert t in sv,t
+assert 'textwrap.dedent' not in sv
 assert 'backup-' not in s.lower() and 'git branch backup' not in s.lower()
 assert not re.search(r'\bgit\s+(commit|push)\b',s)
 for t in ['compare_app "$AFTER" "$AFTER2"','compare_app "$AFTER" "$LIVE_CANON"','expected one Gradle APK','one intended root APK','post-build candidate/protected/native/vendor/DNG invariance']:
  assert t in s,t
-print('PASS 26729 infrastructure: exact successful 26728 authority hash-pinned; compiler/build commands and stage order unchanged; mechanics delta ZERO; no backup/commit/push')
+print('PASS 26729 infrastructure: exact successful 26728 authority hash-pinned; compiler/build commands and stage order unchanged; R1 exact Kotlin runtime shader expansion regression enforced; mechanics delta ZERO; no backup/commit/push')

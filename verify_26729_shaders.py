@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import argparse,hashlib,re,textwrap,subprocess,tempfile,shutil
+import argparse,hashlib,re,subprocess,tempfile,shutil
 ap=argparse.ArgumentParser(); ap.add_argument('root'); ap.add_argument('base'); ap.add_argument('cand'); ap.add_argument('--compiler'); a=ap.parse_args()
 pkg=Path(a.root); base=Path(a.base); cand=Path(a.cand); out=Path(tempfile.mkdtemp(prefix='i26729_expanded_'))
 specs=[
@@ -9,8 +9,30 @@ specs=[
 ('app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt','iirRgb','26729_vgn_iir_rgb.comp','comp',True),
 ('app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt','universalAdaptiveColor26561','26728_universal_adaptive_color.comp','comp',False),
 ('app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt','restoreExtendedHdrAfterVgn','26728_restore_extended_hdr_after_vgn.frag','frag',False)]
-def triple(root,rel,name):
- s=(root/rel).read_text(); m=re.search(r'val\s+'+re.escape(name)+r'(?:\s*:\s*String)?\s*=\s*"""\n(.*?)\n\s*"""\.trimIndent\(\)',s,re.S); assert m,name; return textwrap.dedent(m.group(1))
+def raw_triple(root,rel,name):
+ s=(root/rel).read_text()
+ m=re.search(r'(?:private\s+)?val\s+'+re.escape(name)+r'(?:\s*:\s*String)?\s*=\s*"""(.*?)"""\.trimIndent\(\)',s,re.S)
+ assert m,name
+ return m.group(1)
+def kotlin_trim_indent(value):
+ # Kotlin trimIndent(): remove a blank first/last line, compute the minimum leading
+ # whitespace of all non-blank lines, remove exactly that indent, normalize to LF.
+ lines=value.replace('\r\n','\n').replace('\r','\n').split('\n')
+ if lines and lines[0].strip()=='': lines=lines[1:]
+ if lines and lines[-1].strip()=='': lines=lines[:-1]
+ nonblank=[line for line in lines if line.strip()]
+ indent=min((len(line)-len(line.lstrip()) for line in nonblank),default=0)
+ return '\n'.join(line[indent:] if line.strip() else '' for line in lines)
+def runtime_shader(root,rel,name):
+ raw=raw_triple(root,rel,name)
+ # IRIS_26729_R1_EXACT_KOTLIN_RUNTIME_SHADER_EXPANSION: interpolation is evaluated
+ # before the shader template's trimIndent(), exactly like Kotlin.
+ if '$common' in raw:
+  common=kotlin_trim_indent(raw_triple(root,rel,'common'))
+  raw=raw.replace('$common',common)
+ expanded=kotlin_trim_indent(raw)
+ assert '$' not in expanded,(name,'unresolved Kotlin interpolation')
+ return expanded
 def load_manifest(n):
  d={}
  for line in (pkg/n).read_text().splitlines():
@@ -22,7 +44,7 @@ reserved=set('attribute const uniform varying buffer shared coherent volatile re
 typepat=r'(?:float|double|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234](?:x[234])?|sampler\w*|[iu]?image\w*|atomic_uint|void)'
 bm=load_manifest('26729_RUNTIME_EXPANDED_BASE.sha256'); cm=load_manifest('26729_RUNTIME_EXPANDED_CANDIDATE.sha256'); assert len(bm)==len(cm)==15
 for rel,name,fn,stage,modified in specs:
- bs=triple(base,rel,name); cs=triple(cand,rel,name)
+ bs=runtime_shader(base,rel,name); cs=runtime_shader(cand,rel,name)
  assert hashlib.sha256(bs.encode()).hexdigest()==bm[fn],('base shader hash',fn)
  assert hashlib.sha256(cs.encode()).hexdigest()==cm[fn],('candidate shader hash',fn)
  assert (bs!=cs)==modified,('modified expectation',fn)
@@ -33,7 +55,7 @@ for rel,name,fn,stage,modified in specs:
  (out/fn).write_text(cs)
 assert cm['26728_universal_adaptive_color.comp']=='d2b0e15f49800fa27902e41c82a84291d47226c1e79741ea062da3c4eac5418d'
 assert cm['26728_restore_extended_hdr_after_vgn.frag']=='ee8a4b306a2e0e2f6ff067f036fb626f75d02ca215a24f83e0cedaa3217d5cc8'
-seed=triple(cand,specs[0][0],'seed'); med=triple(cand,specs[1][0],'localMedian'); iir=triple(cand,specs[2][0],'iirRgb')
+seed=runtime_shader(cand,specs[0][0],'seed'); med=runtime_shader(cand,specs[1][0],'localMedian'); iir=runtime_shader(cand,specs[2][0],'iirRgb')
 for t in ['IRIS_26729_COLOR_MATERIAL_DIRECTION_GATE','centerContinuation','neighborContinuation']: assert t in seed,t
 for t in ['IRIS_26729_COLOR_MATERIAL_MEDIAN_GATE','colorBoundaryProtection','colorMaterialBoundary']: assert t in med,t
 for t in ['IRIS_26729_COLOR_ONLY_IIR_STATE_RESET','colorOnlyMaterialBoundary','topologyBoundary']: assert t in iir,t
@@ -44,4 +66,4 @@ if a.compiler:
   if cp.returncode:
    print(cp.stdout); raise SystemExit(f'glslang FAIL {fn}')
 shutil.rmtree(out,ignore_errors=True)
-print(f'PASS 26729 shaders: 271-asset universe unchanged; exact 15 tracked runtime-expanded variants; 3 modified containment shaders + 2 inherited 26728 hue-safety shaders reserved/structure clean; real_compiler={bool(a.compiler)}')
+print(f'PASS 26729 shaders: 271-asset universe unchanged; exact 15 tracked runtime-expanded variants; Kotlin interpolation fully expanded before hash/scan/compile; 3 modified containment shaders + 2 inherited 26728 hue-safety shaders reserved/structure clean; real_compiler={bool(a.compiler)}')
