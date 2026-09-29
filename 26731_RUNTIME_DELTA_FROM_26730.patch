@@ -1,0 +1,331 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index af3f2f8cf59fd39c918fabc8698a931351f597bd..c5db1e8b6bd2de676a2e636def04b519c450b169 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -177,7 +177,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         var smoothYccd = workA
+         var scratchYccd = workB
+         runIirRgb(
+-            smoothYccd, scratchYccd, coefficients.pass1, filterLuma = true, "IIR1",
++            smoothYccd, scratchYccd, originalYccd, coefficients.pass1, filterLuma = true, "IIR1",
+             sabreSupportR, sabreSupportGb, sabreValidWeights, sabreValidityWeightScale, sabreSupportValid,
+         ).also {
+             smoothYccd = it.first
+@@ -194,7 +194,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         var filteredYccd = spare
+         var finalScratch = filteredError
+         runIirRgb(
+-            filteredYccd, finalScratch, coefficients.pass3, filterLuma = false, "IIR3",
++            filteredYccd, finalScratch, originalYccd, coefficients.pass3, filterLuma = false, "IIR3",
+             sabreSupportR, sabreSupportGb, sabreValidWeights, sabreValidityWeightScale, sabreSupportValid,
+         ).also {
+             filteredYccd = it.first
+@@ -401,6 +401,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+     private fun runIirRgb(
+         source: Int,
+         destination: Int,
++        ownership: Int,
+         pass: Iris26529SpatialRgbIirCoefficients.Pass,
+         filterLuma: Boolean,
+         label: String,
+@@ -422,10 +423,11 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+             GLES31.glUniform1i(host.uniformLocation(iirRgbProgram, "uAxis"), d[1])
+             bindImage(0, input, GLES31.GL_READ_ONLY)
+             bindImage(1, output, GLES31.GL_WRITE_ONLY)
++            bindImage(2, ownership, GLES31.GL_READ_ONLY)
+             bindSabreValidity(iirRgbProgram, sabreSupportR, sabreSupportGb, sabreValidWeights, sabreValidityWeightScale, sabreSupportValid)
+             trackedIirDispatch(
+                 d[1], "$label/$index", input, output,
+-                if (sabreSupportValid) intArrayOf(sabreSupportR, sabreSupportGb, sabreValidWeights) else intArrayOf(),
++                intArrayOf(ownership) + if (sabreSupportValid) intArrayOf(sabreSupportR, sabreSupportGb, sabreValidWeights) else intArrayOf(),
+             )
+             clearSabreValidityBindings()
+             clearImages()
+@@ -1354,7 +1356,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 centerContinuation=max(centerContinuation,lumaCompatible*(1.0-smoothstep(0.020,0.070,chromaJump[i]))*trustedCenterNeighbor);
+             }
+             float threshold=max(uMinimumDirectionGradient,1.5*lo+0.09375*(hi-lo));
+-            int mask=0; int count=0;
++            int mask=0; int count=0; int cleanupFallback=0;
+             for(int i=0;i<8;++i){
+                 /* IRIS_26729_COLOR_MATERIAL_DIRECTION_GATE
+                  * A coherent color boundary blocks chroma transport even when luma is nearly equal.
+@@ -1375,9 +1377,13 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 /* A coherent tiny structure may legitimately have no safe cross-boundary direction.
+                  * Preserve it rather than reopening every direction; isolated false-color has low
+                  * centerContinuation and retains the inherited all-direction fallback for cleanup. */
+-                if(centerContinuation>0.35){mask=0;count=0;}else{mask=0xFF;count=8;}
++                if(centerContinuation>0.35){mask=0;count=0;}else{mask=0xFF;count=8;cleanupFallback=1;}
+             }
+-            return uint(mask | (count << 8));
++            /* IRIS_26731_ISOLATED_FALSE_COLOR_CLEANUP_FLAG
++             * Bit 12 distinguishes the inherited all-direction cleanup fallback from genuine
++             * all-direction same-material connectivity. Downstream filters may pull trusted color
++             * into this suspicious center, but trusted neighbors must never pull from it. */
++            return uint(mask | (count << 8) | (cleanupFallback << 12));
+         }
+         uvec4 toYccd(vec3 rgb,uint direction){
+             float sum=rgb.r+2.0*rgb.g+rgb.b+1.0;
+@@ -1433,6 +1439,31 @@ internal object Iris26529SpatialRgbChromaShaders {
+         }
+         ivec3 s(ivec2 p){ uvec4 v=imageLoad(uInput,safePos(p)); return ivec3(int(v.r),signedChroma(v.g),signedChroma(v.b)); }
+         float chromaAgreement(vec2 a, vec2 b){return dot(a,b)/max(length(a)*length(b),1.0);}
++        /* IRIS_26731_FROZEN_RECIPROCAL_MATERIAL_OWNERSHIP
++         * Alpha is the 26730 validity-owned seed map. It is immutable through this stage. A
++         * neighbor belongs to the same transport region only when both pixels explicitly agree. */
++        bool insideImage(ivec2 q){return all(greaterThanEqual(q,ivec2(0)))&&all(lessThan(q,uImageSize));}
++        int directionBitForDelta(ivec2 d){
++            if(d==ivec2(0,-1))return 0; if(d==ivec2(1,0))return 1;
++            if(d==ivec2(0,1))return 2; if(d==ivec2(-1,0))return 3;
++            if(d==ivec2(1,-1))return 4; if(d==ivec2(1,1))return 5;
++            if(d==ivec2(-1,1))return 6; if(d==ivec2(-1,-1))return 7;
++            return -1;
++        }
++        int oppositeDirectionBit(int bit){
++            if(bit==0)return 2; if(bit==1)return 3; if(bit==2)return 0; if(bit==3)return 1;
++            if(bit==4)return 6; if(bit==5)return 7; if(bit==6)return 4; if(bit==7)return 5; return -1;
++        }
++        bool cleanupFallbackAt(ivec2 p){return (int(imageLoad(uInput,p).a)&0x1000)!=0;}
++        bool reciprocalConnected(ivec2 centerP,ivec2 delta){
++            ivec2 neighborP=centerP+delta; if(!insideImage(neighborP))return false;
++            int bit=directionBitForDelta(delta); int opposite=oppositeDirectionBit(bit); if(bit<0||opposite<0)return false;
++            int centerMask=int(imageLoad(uInput,centerP).a)&0xFF; int neighborMask=int(imageLoad(uInput,neighborP).a)&0xFF;
++            bool centerAllows=(centerMask&(1<<bit))!=0;
++            if(cleanupFallbackAt(centerP))return centerAllows;
++            if(cleanupFallbackAt(neighborP))return false;
++            return centerAllows&&(neighborMask&(1<<opposite))!=0;
++        }
+         void main(){
+             ivec2 p=ivec2(gl_GlobalInvocationID.xy); if(any(greaterThanEqual(p,uImageSize)))return;
+             ivec3 a=s(p+ivec2(-1,-1)),b=s(p+ivec2(0,-1)),c=s(p+ivec2(1,-1));
+@@ -1477,6 +1508,10 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 float localChromaScale=max(max(length(vec2(centerChroma)),length(neighborChroma)),512.0);
+                 float localChromaJump=length(vec2(centerChroma)-neighborChroma)/localChromaScale;
+                 ivec2 delta=ivec2(x,y);
++                /* A precomputed 3x3 median is never allowed to cross a frozen ownership edge.
++                 * At such pixels the median strength is forced to zero; the following directional
++                 * stage can still denoise along reciprocally connected same-material directions. */
++                if(!reciprocalConnected(p,delta)){colorBoundaryProtection=1.0;continue;}
+                 uvec4 farPixel=imageLoad(uInput,safePos(p+delta*2));
+                 vec2 farChroma=vec2(float(signedChroma(farPixel.g)),float(signedChroma(farPixel.b)));
+                 float farScale=max(max(length(neighborChroma),length(farChroma)),512.0);
+@@ -1551,22 +1586,64 @@ internal object Iris26529SpatialRgbChromaShaders {
+         $common
+         vec3 smoothAt(ivec2 p){uvec4 v=imageLoad(uSmooth,safePos(p));return vec3(decodeU16(v.r),float(signedChroma(v.g)),float(signedChroma(v.b)));}
+         float chromaAgreement(vec2 a,vec2 b){return dot(a,b)/max(length(a)*length(b),1.0);}
++        bool insideImage(ivec2 q){return all(greaterThanEqual(q,ivec2(0)))&&all(lessThan(q,uImageSize));}
++        bool directionBitSet(ivec2 p,int bit){return (int(imageLoad(uOriginal,p).a)&(1<<bit))!=0;}
++        bool cleanupFallbackAt(ivec2 p){return (int(imageLoad(uOriginal,p).a)&0x1000)!=0;}
++        bool reciprocalConnected(ivec2 p,ivec2 delta,int bit,int oppositeBit){
++            ivec2 q=p+delta; if(!insideImage(q))return false;
++            bool centerAllows=directionBitSet(p,bit);
++            if(cleanupFallbackAt(p))return centerAllows;
++            if(cleanupFallbackAt(q))return false;
++            return centerAllows&&directionBitSet(q,oppositeBit);
++        }
++        /* IRIS_26731_DIRECTION_PAIR_GEOMETRY
++         * Seed bits are N=0,E=1,S=2,W=3,NE=4,SE=5,SW=6,NW=7. Opposite
++         * geometric filters therefore are W/E=(3,1), N/S=(0,2), NE/SW=(4,6),
++         * and NW/SE=(7,5). Never reinterpret adjacent bit numbers as a pair. */
++        vec3 pairCandidate(ivec2 p,vec3 center,ivec2 negDelta,int negBit,int negOpp,
++            ivec2 posDelta,int posBit,int posOpp,out float sampleWeight){
++            bool negOk=reciprocalConnected(p,negDelta,negBit,negOpp);
++            bool posOk=reciprocalConnected(p,posDelta,posBit,posOpp);
++            sampleWeight=float((negOk?1:0)+(posOk?1:0));
++            if(sampleWeight<0.5)return vec3(center.y,center.z,0.0);
++            vec3 directional;
++            if(negOk&&posOk){
++                vec3 x=smoothAt(p+negDelta),y=smoothAt(p+posDelta);
++                float dx=dot(abs(center-x),vec3(1.0/6.0));
++                float dy=dot(abs(center-y),vec3(1.0/6.0));
++                float total=dx+dy;
++                directional=total!=0.0?(x*dy+y*dx)/total:(x+y)*0.5;
++            }else{
++                directional=smoothAt(p+(negOk?negDelta:posDelta));
++            }
++            float scale=min(abs(center.x-directional.x)/max(center.x+directional.x,1.0)*2.0,1.0);
++            return vec3(mix(center.y,directional.y,scale),mix(center.z,directional.z,scale),scale);
++        }
+         vec4 filter3(uvec4 encoded,ivec2 p){
+-            vec3 neg[4]; vec3 pos[4];
+-            neg[0]=smoothAt(p+ivec2(-1,0));pos[0]=smoothAt(p+ivec2(1,0));neg[1]=smoothAt(p+ivec2(0,-1));pos[1]=smoothAt(p+ivec2(0,1));neg[2]=smoothAt(p+ivec2(1,-1));pos[2]=smoothAt(p+ivec2(-1,1));neg[3]=smoothAt(p+ivec2(-1,-1));pos[3]=smoothAt(p+ivec2(1,1));
+-            vec3 center=vec3(decodeU16(encoded.r),float(signedChroma(encoded.g)),float(signedChroma(encoded.b))); vec4 cr;vec4 cb;vec4 scale;
+-            for(int i=0;i<4;++i){vec3 x=neg[i],y=pos[i];float dx=dot(abs(center-x),vec3(1.0/6.0));float dy=dot(abs(center-y),vec3(1.0/6.0));float total=dx+dy;vec3 directional=total!=0.0?(x*dy+y*dx)/total:(x+y)*0.5;scale[i]=min(abs(center.x-directional.x)/max(center.x+directional.x,1.0)*2.0,1.0);cr[i]=mix(center.y,directional.y,scale[i]);cb[i]=mix(center.z,directional.z,scale[i]);}
+-            vec3 selected=vec3(0.0);int count=0;int direction=int(encoded.a);
+-            if((direction&(1<<0))!=0){selected+=vec3(cr[0],cb[0],scale[0]);count++;} if((direction&(1<<1))!=0){selected+=vec3(cr[0],cb[0],scale[0]);count++;}
+-            if((direction&(1<<2))!=0){selected+=vec3(cr[1],cb[1],scale[1]);count++;} if((direction&(1<<3))!=0){selected+=vec3(cr[1],cb[1],scale[1]);count++;}
+-            if((direction&(1<<4))!=0){selected+=vec3(cr[2],cb[2],scale[2]);count++;} if((direction&(1<<5))!=0){selected+=vec3(cr[2],cb[2],scale[2]);count++;}
+-            if((direction&(1<<6))!=0){selected+=vec3(cr[3],cb[3],scale[3]);count++;} if((direction&(1<<7))!=0){selected+=vec3(cr[3],cb[3],scale[3]);count++;}
+-            if(count>0)selected/=float(count); float minScale=min(min(scale.x,scale.y),min(scale.z,scale.w)); float yScale=clamp(1.0-center.x/16384.0*minScale,0.0,1.0); return vec4(center.x,yScale*selected.x,yScale*selected.y,selected.z*65504.0);
++            vec3 center=vec3(decodeU16(encoded.r),float(signedChroma(encoded.g)),float(signedChroma(encoded.b)));
++            vec3 selected=vec3(0.0); float totalWeight=0.0; float minActiveScale=1.0;
++            float w; vec3 candidate;
++            /* IRIS_26731_RECIPROCAL_ONE_SIDED_DIRECTIONAL
++             * Each opposite-axis candidate consumes only sides that are reciprocally owned. If one
++             * side is blocked, it contributes exactly zero; the safe side becomes a one-sided
++             * estimate rather than pulling chroma through the material boundary. */
++            candidate=pairCandidate(p,center,ivec2(-1,0),3,1,ivec2(1,0),1,3,w);
++            if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
++            candidate=pairCandidate(p,center,ivec2(0,-1),0,2,ivec2(0,1),2,0,w);
++            if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
++            candidate=pairCandidate(p,center,ivec2(1,-1),4,6,ivec2(-1,1),6,4,w);
++            if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
++            candidate=pairCandidate(p,center,ivec2(-1,-1),7,5,ivec2(1,1),5,7,w);
++            if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
++            if(totalWeight<=0.0)return vec4(center.x,center.y,center.z,0.0);
++            selected/=totalWeight;
++            float yScale=clamp(1.0-center.x/16384.0*minActiveScale,0.0,1.0);
++            return vec4(center.x,yScale*selected.x,yScale*selected.y,selected.z*65504.0);
+         }
+         void main(){
+             ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
+             uvec4 e=imageLoad(uOriginal,p);vec4 f=vec4(decodeU16(e.r),float(signedChroma(e.g)),float(signedChroma(e.b)),0.0);
+-            if(e.r!=0u&&e.a!=0u)f=filter3(e,p);
++            if(e.r!=0u&&(int(e.a)&0xFF)!=0)f=filter3(e,p);
+             uvec4 sm=imageLoad(uSmooth,p);
+             vec2 originalChroma=vec2(float(signedChroma(e.g)),float(signedChroma(e.b)));
+             vec2 smoothChroma=vec2(float(signedChroma(sm.g)),float(signedChroma(sm.b)));
+@@ -1634,89 +1711,61 @@ internal object Iris26529SpatialRgbChromaShaders {
+         layout(local_size_x=1,local_size_y=1) in;
+         layout(rgba16ui,binding=0) readonly uniform highp uimage2D uInput;
+         layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uOutput;
++        layout(rgba16ui,binding=2) readonly uniform highp uimage2D uOwnership;
+         uniform vec4 uA10;uniform vec4 uB10;uniform vec4 uADyn1;uniform vec4 uBDyn1;uniform vec4 uADyn2;uniform vec4 uBDyn2;uniform int uDirection;uniform int uAxis;uniform int uFilterLuma;
+         $common
+-        /* IRIS_26730_PHYSICAL_VALIDITY_CONTAINMENT_AUTHORITY
+-         * The 26729 material-preservation gates may only be established by reconstructed color
+-         * whose consumed CFA support remains valid in every RGB channel. Clipped/invalid hue may
+-         * still be repaired later, but it cannot grant itself early VGN ownership. */
++        /* Keep the 26730 Sabre-validity interface stable. The validity-owned seed already consumed
++         * this provenance to create uOwnership before any VGN chroma filtering begins. */
+         uniform highp sampler2D uSabreWeightR;
+         uniform highp sampler2D uSabreWeightsGb;
+         uniform highp sampler2D uSabreValidWeights;
+         uniform highp float uSabreValidityWeightScale;
+         uniform int uSabreSupportValid;
+-        float physicalColorTrust(ivec2 p){
+-            if(uSabreSupportValid==0)return 1.0;
+-            ivec2 q=safePos(p);
+-            vec3 totalWeight=vec3(max(texelFetch(uSabreWeightR,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).g,0.0));
+-            vec3 validWeight=max(texelFetch(uSabreValidWeights,q,0).rgb,vec3(0.0))*max(uSabreValidityWeightScale,1.0);
+-            vec3 channelValidity=clamp(validWeight/max(totalWeight,vec3(1.0e-6)),vec3(0.0),vec3(1.0));
+-            float measured=min(channelValidity.r,min(channelValidity.g,channelValidity.b));
+-            return smoothstep(0.985,0.9995,measured);
+-        }
+         struct State{float x0;float x1;float y0;float y1;};
+         float apply(inout State s,float v,vec4 a,vec4 b,bool unsignedOut){float r=a[0]*v+a[1]*s.x0+a[2]*s.x1-b[1]*s.y0-b[2]*s.y1;s.x1=s.x0;s.y1=s.y0;s.x0=v;s.y0=unsignedOut?clamp(r,0.0,65504.0):r;return s.y0;}
+         float steadyOutput(float v,vec4 a,vec4 b,bool u){float r=v*(a[0]+a[1]+a[2])/(1.0+b[1]+b[2]);return u?clamp(r,0.0,65504.0):r;}
+         State steady(float x,float y){return State(x,x,y,y);} ivec2 pos(int inner,int outer){return uAxis==0?ivec2(inner,outer):ivec2(outer,inner);}
++        bool insideImage(ivec2 q){return all(greaterThanEqual(q,ivec2(0)))&&all(lessThan(q,uImageSize));}
++        int directionBitForDelta(ivec2 d){
++            if(d==ivec2(0,-1))return 0; if(d==ivec2(1,0))return 1;
++            if(d==ivec2(0,1))return 2; if(d==ivec2(-1,0))return 3;
++            if(d==ivec2(1,-1))return 4; if(d==ivec2(1,1))return 5;
++            if(d==ivec2(-1,1))return 6; if(d==ivec2(-1,-1))return 7; return -1;
++        }
++        int oppositeDirectionBit(int bit){
++            if(bit==0)return 2; if(bit==1)return 3; if(bit==2)return 0; if(bit==3)return 1;
++            if(bit==4)return 6; if(bit==5)return 7; if(bit==6)return 4; if(bit==7)return 5; return -1;
++        }
++        bool cleanupFallbackAt(ivec2 p){return (int(imageLoad(uOwnership,p).a)&0x1000)!=0;}
++        bool transportFromPreviousAllowed(ivec2 currentP,ivec2 previousP){
++            if(!insideImage(currentP)||!insideImage(previousP))return false;
++            /* A suspicious center may receive trusted recursive state for cleanup. Once the scan
++             * leaves that center, reset before its state can contaminate a trusted neighbor. */
++            if(cleanupFallbackAt(currentP))return true;
++            if(cleanupFallbackAt(previousP))return false;
++            ivec2 delta=previousP-currentP; int bit=directionBitForDelta(delta); int opposite=oppositeDirectionBit(bit);
++            if(bit<0||opposite<0)return false;
++            int currentMask=int(imageLoad(uOwnership,currentP).a)&0xFF; int previousMask=int(imageLoad(uOwnership,previousP).a)&0xFF;
++            return (currentMask&(1<<bit))!=0&&(previousMask&(1<<opposite))!=0;
++        }
+         void main(){
+             int outer=uAxis==0?int(gl_GlobalInvocationID.y):int(gl_GlobalInvocationID.x);int outerLimit=uAxis==0?uImageSize.y:uImageSize.x;int innerSize=uAxis==0?uImageSize.x:uImageSize.y;if(outer>=outerLimit)return;
+             int start=uDirection==0?0:innerSize-1;int step=uDirection==0?1:-1;uvec4 boundary=imageLoad(uInput,pos(start,outer));float by=decodeU16(boundary.r),cr=float(signedChroma(boundary.g)),cb=float(signedChroma(boundary.b));
+             float sy=steadyOutput(by,uA10,uB10,true),sc1=steadyOutput(cr,uADyn1,uBDyn1,false),sb1=steadyOutput(cb,uADyn1,uBDyn1,false),sc2=steadyOutput(sc1,uADyn2,uBDyn2,false),sb2=steadyOutput(sb1,uADyn2,uBDyn2,false);
+-            State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);float previousY=by;float previousCr=cr;float previousCb=cb;
++            State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);float previousY=by;
+             for(int i=0;i<innerSize;++i){
+                 ivec2 p=pos(start+i*step,outer);uvec4 px=imageLoad(uInput,p);float currentY=decodeU16(px.r);float inCr=float(signedChroma(px.g)),inCb=float(signedChroma(px.b));
+                 float edgeRatio=abs(currentY-previousY)/max(max(currentY,previousY),3930.0);
+-                float previousChromaMagnitude=length(vec2(previousCr,previousCb));
+-                float currentChromaMagnitude=length(vec2(inCr,inCb));
+-                float chromaScale=max(max(previousChromaMagnitude,currentChromaMagnitude),512.0);
+-                float chromaJump=length(vec2(inCr-previousCr,inCb-previousCb))/chromaScale;
+-                float highlightPreservePermission=1.0-smoothstep(47162.88,60263.68,max(currentY,previousY));
+                 bool strongLumaBoundary=edgeRatio>0.55;
+                 ivec2 scanStep=uAxis==0?ivec2(step,0):ivec2(0,step);
+-                ivec2 perpendicular=uAxis==0?ivec2(0,1):ivec2(1,0);
+                 ivec2 previousP=p-scanStep;
+-                int currentPerpendicularSupport=0;
+-                int previousPerpendicularSupport=0;
+-                float currentWithinDelta=65504.0;
+-                float previousWithinDelta=65504.0;
+-                for(int side=-1;side<=1;side+=2){
+-                    uvec4 currentSide=imageLoad(uInput,safePos(p+perpendicular*side));
+-                    uvec4 previousSide=imageLoad(uInput,safePos(previousP+perpendicular*side));
+-                    float cy=decodeU16(currentSide.r),py=decodeU16(previousSide.r);
+-                    vec2 cc=vec2(float(signedChroma(currentSide.g)),float(signedChroma(currentSide.b)));
+-                    vec2 pc=vec2(float(signedChroma(previousSide.g)),float(signedChroma(previousSide.b)));
+-                    float currentLumaDelta=abs(cy-currentY)/max(max(cy,currentY),3930.0);
+-                    float previousLumaDelta=abs(py-previousY)/max(max(py,previousY),3930.0);
+-                    float currentHue=dot(cc,vec2(inCr,inCb))/max(length(cc)*max(currentChromaMagnitude,1.0),1.0);
+-                    float previousHue=dot(pc,vec2(previousCr,previousCb))/max(length(pc)*max(previousChromaMagnitude,1.0),1.0);
+-                    float currentLocalScale=max(max(length(cc),currentChromaMagnitude),512.0);
+-                    float previousLocalScale=max(max(length(pc),previousChromaMagnitude),512.0);
+-                    currentWithinDelta=min(currentWithinDelta,length(cc-vec2(inCr,inCb))/currentLocalScale);
+-                    previousWithinDelta=min(previousWithinDelta,length(pc-vec2(previousCr,previousCb))/previousLocalScale);
+-                    if(currentLumaDelta<0.18&&(currentChromaMagnitude<256.0||currentHue>0.84))currentPerpendicularSupport++;
+-                    if(previousLumaDelta<0.18&&(previousChromaMagnitude<256.0||previousHue>0.84))previousPerpendicularSupport++;
+-                }
+-                bool topologyBoundary=currentPerpendicularSupport>0&&previousPerpendicularSupport>0;
+-                /* IRIS_26729_COLOR_ONLY_IIR_STATE_RESET
+-                 * A coherent material/color transition is a boundary even when two colors have the
+-                 * same luminance. Perpendicular support is required for the color-only case so an
+-                 * isolated CFA false-color dot cannot protect itself from cleanup. */
+-                float physicalTrust=min(physicalColorTrust(p),physicalColorTrust(previousP));
+-                float withinScale=max(max(currentWithinDelta,previousWithinDelta),0.080);
+-                bool trueMaterialStep=(chromaJump/withinScale)>1.70;
+-                /* IRIS_26730_VALIDITY_OWNED_COLOR_ONLY_IIR_RESET: invalid/clipped chroma and
+-                 * smooth within-material gradients cannot reset recursive state into L/box shapes. */
+-                bool colorOnlyMaterialBoundary=chromaJump>0.38&&topologyBoundary&&
+-                    physicalTrust>0.85&&trueMaterialStep;
+-                bool materialColorBoundary=(edgeRatio>0.24&&chromaJump>0.45&&
+-                    (highlightPreservePermission>0.5||topologyBoundary))||colorOnlyMaterialBoundary;
+-                /* IRIS_26571_IIR_MATERIAL_EDGE_STATE_RESET
+-                 * Keep the 26570 strong-edge reset and additionally stop recursive chroma state at
+-                 * moderate luma transitions when the input chroma itself proves a material/color
+-                 * change. Smooth illumination with stable chroma stays recursive. Highlight pairs
+-                 * retain 26570 behavior so false pink/magenta suppression is not relaxed.
+-                 */
+-                if(i>0&&(strongLumaBoundary||materialColorBoundary)){
++                /* IRIS_26731_FROZEN_IIR_MATERIAL_OWNERSHIP
++                 * Never re-classify material ownership from already-filtered chroma. The exact
++                 * 26730 validity-owned seed map is frozen before VGN and shared by IIR1 and IIR3.
++                 * A missing reciprocal connection is a hard chroma-state boundary in either scan
++                 * direction, preventing row/column-specific feedback from forming teeth or L blocks. */
++                bool frozenMaterialBoundary=i>0&&!transportFromPreviousAllowed(p,previousP);
++                if(i>0&&(strongLumaBoundary||frozenMaterialBoundary)){
+                     if(uFilterLuma!=0){float resetY=steadyOutput(currentY,uA10,uB10,true);ys=steady(currentY,resetY);}
+                     float resetCr1=steadyOutput(inCr,uADyn1,uBDyn1,false),resetCb1=steadyOutput(inCb,uADyn1,uBDyn1,false);
+                     float resetCr2=steadyOutput(resetCr1,uADyn2,uBDyn2,false),resetCb2=steadyOutput(resetCb1,uADyn2,uBDyn2,false);
+@@ -1724,7 +1773,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 }
+                 float y=uFilterLuma!=0?apply(ys,currentY,uA10,uB10,true):currentY;
+                 float r=apply(c1,inCr,uADyn1,uBDyn1,false);float q=apply(b1,inCb,uADyn1,uBDyn1,false);r=apply(c2,r,uADyn2,uBDyn2,false);q=apply(b2,q,uADyn2,uBDyn2,false);
+-                imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));previousY=currentY;previousCr=inCr;previousCb=inCb;
++                imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));previousY=currentY;
+             }
+         }
+     """.trimIndent()
+diff --git a/app/version.properties b/app/version.properties
+index cbe6b958b37e3d01db0bb12711117986dc82e36d..79d5b3d0808d333579641ff6b667b8e7d0ff06c3 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726730
+-VERSION_BUILD=26730
++VERSION_NAME=0.9726731
++VERSION_BUILD=26731
