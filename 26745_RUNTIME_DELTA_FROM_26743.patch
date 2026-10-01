@@ -1,0 +1,167 @@
+diff --git a/app/src/main/assets/shaders/motionv2/color_transform.glsl b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+index 8f2c834831b2eab542b49a61f8d731b3eaf18505..a1208c9db513fb537272383f98d722bb1e4e2a6b 100644
+--- a/app/src/main/assets/shaders/motionv2/color_transform.glsl
++++ b/app/src/main/assets/shaders/motionv2/color_transform.glsl
+@@ -156,6 +156,31 @@ vec3 iris26638ApplyAcr3(vec3 color){
+     return vec3(r,g,b);
+ }
+ 
++/* IRIS_26745_POST_VGN_ACR3_HUE_AUTHORITY
++ * ACR3 remains the photographic appearance owner. For bright, already-near-neutral VGN output
++ * only, it may change chroma magnitude but may not rotate the calibrated Display-P3 hue direction.
++ * Exact neutral stays neutral; ordinary/strong color is untouched. This is color ownership only:
++ * no RGB reconstruction, clipping, semantic color suppression, or luma/tone change. */
++vec3 iris26745ProtectBrightNeutralHue(vec3 calibratedDisplay,vec3 renderedDisplay,float targetY){
++    vec3 neutral=vec3(targetY);
++    vec3 baseChroma=calibratedDisplay-neutral;
++    vec3 renderedChroma=renderedDisplay-neutral;
++    float baseMagnitude=length(baseChroma);
++    float renderedMagnitude=length(renderedChroma);
++    float normalizedBase=baseMagnitude/max(targetY,0.08);
++    float brightAuthority=smoothstep(0.58,0.78,targetY);
++    float nearNeutralAuthority=1.0-smoothstep(0.035,0.090,normalizedBase);
++    float chromaPresent=smoothstep(0.0025,0.012,baseMagnitude)*
++        smoothstep(0.0025,0.012,renderedMagnitude);
++    float directionAgreement=dot(baseChroma,renderedChroma)/
++        max(baseMagnitude*renderedMagnitude,1.0e-8);
++    float rotationAuthority=1.0-smoothstep(0.997,0.9998,directionAgreement);
++    float authority=clamp(brightAuthority*nearNeutralAuthority*chromaPresent*rotationAuthority,0.0,1.0);
++    vec3 trustedDirection=baseChroma/max(baseMagnitude,1.0e-8);
++    vec3 trustedChroma=trustedDirection*max(renderedMagnitude,baseMagnitude);
++    return neutral+mix(renderedChroma,trustedChroma,authority);
++}
++
+ void main(){
+     ivec2 xy=ivec2(gl_FragCoord.xy);
+     vec3 cameraRgb;
+@@ -209,6 +234,8 @@ void main(){
+                     linearDisplay=linearDisplayOriginal;
+                 }
+             }
++            linearDisplay=iris26745ProtectBrightNeutralHue(
++                linearDisplayOriginal,linearDisplay,targetY);
+         }
+     }
+     /* Frozen pink/cyan-edge invariant: translate all channels together, never clip one channel. */
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index eab1732bfa087b849038797692f0ae4b0ba1b3b8..c3acbb3ec39dd27ee7334ba099e597f7cf3ced7f 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -627,6 +627,21 @@ inline Vec3 iris26638ApplyAcr3(const Params&p,Vec3 color){
+     }
+     return {r,g,b};
+ }
++inline Vec3 iris26745ProtectBrightNeutralHue(Vec3 calibrated,Vec3 rendered,float targetY){
++    Vec3 neutral{targetY,targetY,targetY};Vec3 base=sub(calibrated,neutral),out=sub(rendered,neutral);
++    float baseMag=std::sqrt(base.r*base.r+base.g*base.g+base.b*base.b);
++    float outMag=std::sqrt(out.r*out.r+out.g*out.g+out.b*out.b);
++    float normalizedBase=baseMag/std::max(targetY,0.08f);
++    float bright=smoothstep(0.58f,0.78f,targetY);
++    float nearNeutral=1.f-smoothstep(0.035f,0.090f,normalizedBase);
++    float present=smoothstep(0.0025f,0.012f,baseMag)*smoothstep(0.0025f,0.012f,outMag);
++    float agreement=(base.r*out.r+base.g*out.g+base.b*out.b)/std::max(baseMag*outMag,1.0e-8f);
++    float rotation=1.f-smoothstep(0.997f,0.9998f,agreement);
++    float authority=clampf(bright*nearNeutral*present*rotation,0.f,1.f);
++    float trustedMag=std::max(outMag,baseMag);
++    Vec3 trusted=mul(base, trustedMag/std::max(baseMag,1.0e-8f));
++    return add(neutral,mix3(out,trusted,authority));
++}
+ inline bool profileColor(const SourceRegion&s,const Params&p,int x,int y,Vec3*out){
+     Vec3 camera;if(!s.cameraAt(x,y,&camera))return false;Vec3 profile=mat(p.sensorToProfile,camera);
+     profile=iris26628ApplyDcp(profile,p.dcpHueSatMap,p.dcpHueDivisions,p.dcpSatDivisions,p.dcpValueDivisions);
+@@ -644,6 +659,7 @@ inline bool profileColor(const SourceRegion&s,const Params&p,int x,int y,Vec3*ou
+                 if(renderedSpan>1.0e-8f){Vec3 neutral{targetY,targetY,targetY};Vec3 c=sub(linear,neutral);linear=add(neutral,mul(c,baselineSpan/renderedSpan));}
+                 else linear=original;
+             }
++            linear=iris26745ProtectBrightNeutralHue(original,linear,targetY);
+         }
+     }
+     float floor=std::min(linear.r,std::min(linear.g,linear.b));if(floor<0.f){linear.r-=floor;linear.g-=floor;linear.b-=floor;}*out=linear;
+@@ -994,9 +1010,16 @@ vec3 iris26638ApplyAcr3(vec3 color){
+     float r=color.r,g=color.g,b=color.b;if(r>=g){if(g>b)iris26638AdobeRgbTone(r,g,b);else if(b>r)iris26638AdobeRgbTone(b,r,g);else if(b>g)iris26638AdobeRgbTone(r,b,g);else{r=iris26638SampleAcr3(r);g=iris26638SampleAcr3(g);b=g;}}
+     else{if(r>=b)iris26638AdobeRgbTone(g,r,b);else if(b>g)iris26638AdobeRgbTone(b,g,r);else iris26638AdobeRgbTone(g,b,r);}return vec3(r,g,b);
+ }
++vec3 iris26745ProtectBrightNeutralHue(vec3 calibrated,vec3 rendered,float targetY){
++    vec3 neutral=vec3(targetY),base=calibrated-neutral,outColor=rendered-neutral;float baseMag=length(base),outMag=length(outColor);
++    float normalizedBase=baseMag/max(targetY,0.08),bright=smoothstep(0.58,0.78,targetY),nearNeutral=1.0-smoothstep(0.035,0.090,normalizedBase);
++    float present=smoothstep(0.0025,0.012,baseMag)*smoothstep(0.0025,0.012,outMag);float agreement=dot(base,outColor)/max(baseMag*outMag,1.0e-8);
++    float rotation=1.0-smoothstep(0.997,0.9998,agreement);float authority=clamp(bright*nearNeutral*present*rotation,0.0,1.0);
++    vec3 trusted=base/max(baseMag,1.0e-8)*max(outMag,baseMag);return neutral+mix(outColor,trusted,authority);
++}
+ vec3 irisProfileColor(ivec2 p){
+     vec3 camera=irisCameraAt(p),profile=irisMatRows(uSensorRow0,uSensorRow1,uSensorRow2,camera);vec3 original=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,profile),linear=original;
+-    if(uAcr3Enabled!=0&&min(profile.r,min(profile.g,profile.b))>=0.0&&min(original.r,min(original.g,original.b))>=0.0){vec3 rendered=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,iris26638ApplyAcr3(profile));float targetY=irisLuma(original),renderedY=irisLuma(rendered);if(targetY>=0.0&&renderedY>1.0e-8){linear=rendered*(targetY/renderedY);float baselineSpan=irisPeak(original)-min(original.r,min(original.g,original.b));float renderedSpan=irisPeak(linear)-min(linear.r,min(linear.g,linear.b));if(renderedSpan+1.0e-8<baselineSpan){if(renderedSpan>1.0e-8){vec3 c=linear-vec3(targetY);linear=vec3(targetY)+c*(baselineSpan/renderedSpan);}else linear=original;}}}
++    if(uAcr3Enabled!=0&&min(profile.r,min(profile.g,profile.b))>=0.0&&min(original.r,min(original.g,original.b))>=0.0){vec3 rendered=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,iris26638ApplyAcr3(profile));float targetY=irisLuma(original),renderedY=irisLuma(rendered);if(targetY>=0.0&&renderedY>1.0e-8){linear=rendered*(targetY/renderedY);float baselineSpan=irisPeak(original)-min(original.r,min(original.g,original.b));float renderedSpan=irisPeak(linear)-min(linear.r,min(linear.g,linear.b));if(renderedSpan+1.0e-8<baselineSpan){if(renderedSpan>1.0e-8){vec3 c=linear-vec3(targetY);linear=vec3(targetY)+c*(baselineSpan/renderedSpan);}else linear=original;}linear=iris26745ProtectBrightNeutralHue(original,linear,targetY);}}
+     float floorV=min(linear.r,min(linear.g,linear.b));if(floorV<0.0)linear-=vec3(floorV);return irisClampNonnegative(linear);
+ }
+ vec3 irisTone(vec3 rgb){
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index ace1e58d2ddd791e9c3212dfad4cfe76eb43cd15..3be9e5e39051afaf102342e6ba1adc8c3b31f0a5 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -1578,8 +1578,34 @@ internal object Iris26529SpatialRgbChromaShaders {
+             }
+             float visibleFringeAuthority26743 = neighboringVisibleCore26743 *
+                 smoothstep(0.58, 0.72, visibleCenterLuma26743);
+-            float visibleHighlightNeutralAuthority26743 = clamp(max(
+-                visibleCoreAuthority26743, visibleFringeAuthority26743), 0.0, 1.0);
++
++            /* IRIS_26745_CONNECTED_BRIGHT_FRINGE_COLOR_AUTHORITY
++             * Preserve the exact successful 26743 core + immediate-neighbor rule above. The only
++             * extension is one additional connected hop: a radius-two highlight core may reach this
++             * center only through a radius-one bright-transition sample on the same direction. This
++             * closes the multi-pixel marker-outline gap without flooding across a dark separator.
++             * This never reconstructs RGB or detail. Independent physical real-color
++             * continuation below highlight headroom vetoes only this new radius-two extension. */
++            float connectedSecondRingCore26745 = 0.0;
++            for (int i26745 = 0; i26745 < 8; ++i26745) {
++                ivec2 d26745 = highlightNeighbors26743[i26745];
++                float bridgeLuma26745 = visibleHighlightLuma26743(p + d26745);
++                float farCore26745 = smoothstep(0.72, 0.92,
++                    visibleHighlightLuma26743(p + 2 * d26745));
++                float connectedBridge26745 = smoothstep(0.58, 0.72, bridgeLuma26745);
++                connectedSecondRingCore26745 = max(connectedSecondRingCore26745,
++                    farCore26745 * connectedBridge26745);
++            }
++            float physicalBrightColorVeto26745 =
++                smoothstep(0.55, 0.88, physicalRealColorVeto26735) *
++                physicalHeadroomColorProof26741;
++            float visibleSecondRingFringe26745 = 0.85 * connectedSecondRingCore26745 *
++                smoothstep(0.58, 0.72, visibleCenterLuma26743) *
++                (1.0 - physicalBrightColorVeto26745);
++            float visibleFringeAuthority26745 = max(visibleFringeAuthority26743,
++                visibleSecondRingFringe26745);
++            float visibleHighlightNeutralAuthority26745 = clamp(max(
++                visibleCoreAuthority26743, visibleFringeAuthority26745), 0.0, 1.0);
+ 
+             /* Neutralize hue after calculation WB, then return only the cleaned direction to camera
+              * RGB. Preserve the pre-pass camera-RGB scalar so below-white brightness cannot shift;
+@@ -1588,7 +1614,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float correctedCalculationLuma26743 = luminanceOf(correctedCalculationRgb26743);
+             vec3 correctedCalculationChroma26743 = correctedCalculationRgb26743 -
+                 vec3(correctedCalculationLuma26743);
+-            correctedCalculationChroma26743 *= 1.0 - visibleHighlightNeutralAuthority26743;
++            correctedCalculationChroma26743 *= 1.0 - visibleHighlightNeutralAuthority26745;
+             vec3 neutralizedCalculationRgb26743 = max(vec3(correctedCalculationLuma26743) +
+                 correctedCalculationChroma26743, vec3(0.0));
+             vec3 neutralizedCameraRgb26743 = neutralizedCalculationRgb26743 /
+@@ -1599,7 +1625,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 neutralizedCameraRgb26743 *= originalCameraPeak26743 / neutralizedCameraPeak26743;
+             }
+             correctedRgb = clamp(neutralizedCameraRgb26743, 0.0, 1.0);
+-            protectedPreVgnMagnitude *= 1.0 - visibleHighlightNeutralAuthority26743;
++            protectedPreVgnMagnitude *= 1.0 - visibleHighlightNeutralAuthority26745;
+ 
+             uvec3 encodedRgb = uvec3(round(correctedRgb * 65535.0));
+             uint encodedProtection = uPhysicalPreVgnValid != 0
+diff --git a/app/version.properties b/app/version.properties
+index 81b71282505b8641ae1ccb2eb1ce225f8a870290..e325c10564cb4ab257013de1c9d5ab1464009bd0 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726743
+-VERSION_BUILD=26743
++VERSION_NAME=0.9726745
++VERSION_BUILD=26745
