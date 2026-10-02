@@ -1,0 +1,1438 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 54419913bc625a51175eab03ff5906c8a608a1cb..e83b2aa464ba563d1467e488d47bb83d31c2c139 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -12,8 +12,7 @@ uniform float irisOutputZoom;
+ /* IRIS_26718_UHDR_HIGH_ZOOM_DETAIL_PARITY */
+ uniform sampler2D iris26718HighZoomDetail;
+ uniform int iris26718HighZoomDetailEnabled;
+-uniform vec2 iris26752PlanBDetailScale;
+-uniform vec2 iris26752PlanBDetailOrigin;
++uniform ivec2 iris26718HighZoomDetailOrigin;
+ uniform sampler2D iris26621LocalToneLog;
+ uniform int iris26621LocalToneEnabled;
+ uniform float iris26623ToneBroadNearFraction;
+@@ -272,10 +271,8 @@ vec3 iris26641BilinearSdrLinear(vec2 sourcePixel){
+ }
+ float iris26718HighZoomLogDetail(vec2 sourcePixel){
+     if(iris26718HighZoomDetailEnabled==0)return 0.0;
+-    /* IRIS_26752_IPOL_PLAN_B_NONINTEGER_SAMPLE
+-     * Preserve the paper's arbitrary continuous output lattice instead of snapping Plan B to
+-     * the retired fixed true-2x direct-CFA lattice. */
+-    vec2 local=sourcePixel*iris26752PlanBDetailScale-iris26752PlanBDetailOrigin;
++    vec2 global2x=(sourcePixel+vec2(0.5))*2.0-vec2(0.5);
++    vec2 local=global2x-vec2(iris26718HighZoomDetailOrigin);
+     ivec2 sz=textureSize(iris26718HighZoomDetail,0);
+     if(any(lessThan(local,vec2(0.0)))||any(greaterThan(local,vec2(sz)-vec2(1.0))))return 0.0;
+     vec2 uv=(local+vec2(0.5))/vec2(sz);
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 6fa810e14653d5970086a6503ba42f656f1642f6..c31ca73642ab16072d1cb3ce7f1104a20bb563a3 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -8,8 +8,7 @@ uniform float irisOutputZoom;
+ /* IRIS_26718_FINAL_SAMPLE_HIGH_ZOOM_DETAIL */
+ uniform sampler2D iris26718HighZoomDetail;
+ uniform int iris26718HighZoomDetailEnabled;
+-uniform vec2 iris26752PlanBDetailScale;
+-uniform vec2 iris26752PlanBDetailOrigin;
++uniform ivec2 iris26718HighZoomDetailOrigin;
+ uniform int iris26592MotionHdrHandoff;
+ uniform float displayGain;
+ uniform sampler2D iris26621LocalToneLog;
+@@ -457,10 +456,8 @@ vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
+  */
+ float iris26718HighZoomLogDetail(vec2 sourcePixel){
+     if(iris26718HighZoomDetailEnabled==0)return 0.0;
+-    /* IRIS_26752_IPOL_PLAN_B_NONINTEGER_SAMPLE
+-     * Preserve the paper's arbitrary continuous output lattice instead of snapping Plan B to
+-     * the retired fixed true-2x direct-CFA lattice. */
+-    vec2 local=sourcePixel*iris26752PlanBDetailScale-iris26752PlanBDetailOrigin;
++    vec2 global2x=(sourcePixel+vec2(0.5))*2.0-vec2(0.5);
++    vec2 local=global2x-vec2(iris26718HighZoomDetailOrigin);
+     ivec2 sz=textureSize(iris26718HighZoomDetail,0);
+     if(any(lessThan(local,vec2(0.0)))||any(greaterThan(local,vec2(sz)-vec2(1.0))))return 0.0;
+     vec2 uv=(local+vec2(0.5))/vec2(sz);
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index beaf34c2e69e57329a3e4b02524800c87ae5bbab..aca72835351009a4645f6cf1059defcc5e86fb95 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -4,9 +4,6 @@
+ #include <array>
+ #include <atomic>
+ #include <chrono>
+-#include <complex>
+-#include <memory>
+-#include <numeric>
+ #include <condition_variable>
+ #include <cstdarg>
+ #include <deque>
+@@ -1581,203 +1578,3 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+ }
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_isJpegRNative(JNIEnv*e,jclass,jstring p){U u(e,p);return u.c&&iris26507::isJpegR(u.c)?JNI_TRUE:JNI_FALSE;}
+-
+-/* IRIS_26752_IPOL_PLAN_B_TRANSLATIONAL_SUPERRES
+- * Android-native adaptation of Abergel/Almansa/Moisan/Nous, "Linear Super-Resolution Through
+- * Translational Motion" (IPOL 2026). The mathematical owner is unchanged: modified-Tukey
+- * apodization, Shannon/Fourier translation+subsampling operator, direct block pseudoinverse
+- * weighted least-squares, and Equation (56) l1-l2 IRLS. Iris supplies only scalar camera-linear
+- * luma and one global translation per NORMAL frame; RGB/chroma/highlight publication remains the
+- * successful 26733 Sabre/VGN owner.
+- */
+-namespace iris26752planb {
+-using C = std::complex<float>;
+-constexpr double kPi = 3.141592653589793238462643383279502884;
+-constexpr double kPseudoInverseEps = 1.0e-9;
+-constexpr double kIrlsEtaFloor = 1.0e-2; // exact reference CLI default (-e)
+-constexpr double kIrlsRelativeStop = 1.0e-5;
+-constexpr int kIrlsMaxIterations = 50;
+-constexpr double kTukeyR = 0.025;
+-
+-struct MapFile {
+-    int fd=-1; size_t bytes=0; void* ptr=MAP_FAILED; bool writable=false;
+-    ~MapFile(){ if(ptr!=MAP_FAILED) munmap(ptr,bytes); if(fd>=0) close(fd); }
+-    bool openExisting(const char*path,size_t expected,bool writeAccess=false){
+-        writable=writeAccess;fd=open(path,writeAccess?O_RDWR:O_RDONLY);if(fd<0)return false;
+-        struct stat st{};if(fstat(fd,&st)!=0||(size_t)st.st_size!=expected)return false;
+-        bytes=expected;ptr=mmap(nullptr,bytes,writeAccess?(PROT_READ|PROT_WRITE):PROT_READ,MAP_SHARED,fd,0);
+-        return ptr!=MAP_FAILED;
+-    }
+-    bool create(const char*path,size_t n){
+-        writable=true;fd=open(path,O_RDWR|O_CREAT|O_TRUNC,0600);if(fd<0)return false;
+-        if(ftruncate(fd,(off_t)n)!=0)return false;bytes=n;
+-        ptr=mmap(nullptr,bytes,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);return ptr!=MAP_FAILED;
+-    }
+-    void sync(){if(ptr!=MAP_FAILED&&writable)msync(ptr,bytes,MS_SYNC);}
+-};
+-
+-inline bool isPow2(size_t n){return n&&!(n&(n-1));}
+-inline size_t nextPow2(size_t n){size_t p=1;while(p<n){if(p>(std::numeric_limits<size_t>::max()>>1))return 0;p<<=1;}return p;}
+-
+-void radix2(std::vector<C>&a,bool inverse){
+-    const size_t n=a.size();
+-    for(size_t i=1,j=0;i<n;i++){size_t bit=n>>1;for(;j&bit;bit>>=1)j^=bit;j^=bit;if(i<j)std::swap(a[i],a[j]);}
+-    for(size_t len=2;len<=n;len<<=1){
+-        const double ang=(inverse?2.0:-2.0)*kPi/(double)len;C wlen((float)std::cos(ang),(float)std::sin(ang));
+-        for(size_t i=0;i<n;i+=len){C w(1.f,0.f);for(size_t j=0;j<len/2;j++){C u=a[i+j],v=a[i+j+len/2]*w;a[i+j]=u+v;a[i+j+len/2]=u-v;w*=wlen;}}
+-    }
+-    if(inverse){float inv=1.f/(float)n;for(auto&v:a)v*=inv;}
+-}
+-
+-struct FftPlan {
+-    int n=0; bool radix=false; size_t m=0; std::vector<C> chirp; std::vector<C> bFft;
+-    explicit FftPlan(int size=0):n(size),radix(isPow2((size_t)size)){
+-        if(n<=0)return;if(radix)return;m=nextPow2((size_t)2*n-1);chirp.resize((size_t)n);bFft.assign(m,C(0,0));
+-        for(int k=0;k<n;k++){
+-            double angle=kPi*(double)k*(double)k/(double)n;C pos((float)std::cos(angle),(float)std::sin(angle));
+-            chirp[(size_t)k]=std::conj(pos); // exp(-i*pi*k^2/n)
+-            bFft[(size_t)k]=pos;if(k>0)bFft[m-(size_t)k]=pos;
+-        }
+-        radix2(bFft,false);
+-    }
+-    bool valid()const{return n>0&&(radix||m>0);}
+-};
+-
+-void fftForward(std::vector<C>&v,const FftPlan&p,std::vector<C>&scratch){
+-    if(p.radix){radix2(v,false);return;}
+-    scratch.assign(p.m,C(0,0));for(int k=0;k<p.n;k++)scratch[(size_t)k]=v[(size_t)k]*p.chirp[(size_t)k];
+-    radix2(scratch,false);for(size_t i=0;i<p.m;i++)scratch[i]*=p.bFft[i];radix2(scratch,true);
+-    for(int k=0;k<p.n;k++)v[(size_t)k]=scratch[(size_t)k]*p.chirp[(size_t)k];
+-}
+-void fftVector(std::vector<C>&v,const FftPlan&p,bool inverse,std::vector<C>&scratch){
+-    if(!inverse){fftForward(v,p,scratch);return;}for(auto&z:v)z=std::conj(z);fftForward(v,p,scratch);float inv=1.f/(float)p.n;for(auto&z:v)z=std::conj(z)*inv;
+-}
+-
+-bool fft2d(C*data,int w,int h,bool inverse){
+-    FftPlan pw(w),ph(h);if(!pw.valid()||!ph.valid())return false;
+-    auto runRows=[&](int workers){std::atomic<int> next{0};std::vector<std::thread> ts;ts.reserve((size_t)workers);
+-        for(int t=0;t<workers;t++)ts.emplace_back([&](){std::vector<C> line((size_t)w),scratch;for(;;){int y=next.fetch_add(1);if(y>=h)break;std::copy(data+(size_t)y*w,data+(size_t)(y+1)*w,line.begin());fftVector(line,pw,inverse,scratch);std::copy(line.begin(),line.end(),data+(size_t)y*w);}});
+-        for(auto&t:ts)t.join();};
+-    auto runCols=[&](int workers){std::atomic<int> next{0};std::vector<std::thread> ts;ts.reserve((size_t)workers);
+-        for(int t=0;t<workers;t++)ts.emplace_back([&](){std::vector<C> line((size_t)h),scratch;for(;;){int x=next.fetch_add(1);if(x>=w)break;for(int y=0;y<h;y++)line[(size_t)y]=data[(size_t)y*w+x];fftVector(line,ph,inverse,scratch);for(int y=0;y<h;y++)data[(size_t)y*w+x]=line[(size_t)y];}});
+-        for(auto&t:ts)t.join();};
+-    int workers=(int)std::thread::hardware_concurrency();workers=std::max(1,std::min(4,workers?workers:2));runRows(workers);runCols(workers);return true;
+-}
+-
+-inline double tukeyProfile(double x,double r,double d){
+-    if(x<=d)return 0.;if(x<=d+.5*r)return .5-.5*std::cos(2.*kPi*(x-d)/r);
+-    if(x<=1.-d-.5*r)return 1.;if(x<=1.-d)return .5-.5*std::cos(2.*kPi*(1.-d-x)/r);return 0.;
+-}
+-
+-struct PInv {int z=0;std::vector<std::complex<double>> a;};
+-
+-bool jacobiSymmetric(std::vector<double>a,int n,std::vector<double>&eval,std::vector<double>&vec){
+-    vec.assign((size_t)n*n,0.);for(int i=0;i<n;i++)vec[(size_t)i*n+i]=1.;
+-    const int maxIter=120*n*n;for(int it=0;it<maxIter;it++){
+-        int p=0,q=1;double mx=0.;for(int i=0;i<n;i++)for(int j=i+1;j<n;j++){double v=std::fabs(a[(size_t)i*n+j]);if(v>mx){mx=v;p=i;q=j;}}
+-        if(mx<1e-13)break;double app=a[(size_t)p*n+p],aqq=a[(size_t)q*n+q],apq=a[(size_t)p*n+q];
+-        double phi=.5*std::atan2(2.*apq,aqq-app),c=std::cos(phi),s=std::sin(phi);
+-        for(int k=0;k<n;k++)if(k!=p&&k!=q){double akp=a[(size_t)k*n+p],akq=a[(size_t)k*n+q];double np=c*akp-s*akq,nq=s*akp+c*akq;a[(size_t)k*n+p]=a[(size_t)p*n+k]=np;a[(size_t)k*n+q]=a[(size_t)q*n+k]=nq;}
+-        a[(size_t)p*n+p]=c*c*app-2.*s*c*apq+s*s*aqq;a[(size_t)q*n+q]=s*s*app+2.*s*c*apq+c*c*aqq;a[(size_t)p*n+q]=a[(size_t)q*n+p]=0.;
+-        for(int k=0;k<n;k++){double vkp=vec[(size_t)k*n+p],vkq=vec[(size_t)k*n+q];vec[(size_t)k*n+p]=c*vkp-s*vkq;vec[(size_t)k*n+q]=s*vkp+c*vkq;}
+-    }
+-    eval.resize((size_t)n);for(int i=0;i<n;i++)eval[(size_t)i]=a[(size_t)i*n+i];return true;
+-}
+-
+-PInv blockPseudoInverse(int sp,int sq,const std::vector<double>&dx,const std::vector<double>&dy,const std::vector<double>&weights,double cof){
+-    const int z=sp*sq,n=2*z;std::vector<std::complex<double>> h((size_t)z*z,{0.,0.});
+-    for(size_t j=0;j<dx.size();j++){double w=weights.empty()?1.:weights[j];for(int k=0;k<z;k++)for(int l=0;l<z;l++){
+-        double theta=2.*kPi*((double)(l/sq-k/sq)*dx[j]+(double)(l%sq-k%sq)*dy[j]);h[(size_t)k*z+l]+=cof*w*std::complex<double>(std::cos(theta),std::sin(theta));}}
+-    std::vector<double> r((size_t)n*n,0.);for(int i=0;i<z;i++)for(int j=0;j<z;j++){auto v=h[(size_t)i*z+j];r[(size_t)i*n+j]=v.real();r[(size_t)i*n+(j+z)]=-v.imag();r[(size_t)(i+z)*n+j]=v.imag();r[(size_t)(i+z)*n+(j+z)]=v.real();}
+-    std::vector<double> eval,vec;jacobiSymmetric(r,n,eval,vec);std::vector<double> rp((size_t)n*n,0.);
+-    for(int k=0;k<n;k++){double inv=eval[(size_t)k]>kPseudoInverseEps?1./eval[(size_t)k]:0.;if(inv==0.)continue;for(int i=0;i<n;i++){double vik=vec[(size_t)i*n+k]*inv;for(int j=0;j<n;j++)rp[(size_t)i*n+j]+=vik*vec[(size_t)j*n+k];}}
+-    PInv out;out.z=z;out.a.resize((size_t)z*z);for(int i=0;i<z;i++)for(int j=0;j<z;j++)out.a[(size_t)i*z+j]={rp[(size_t)i*n+j],rp[(size_t)(i+z)*n+j]};return out;
+-}
+-
+-inline int modIndex(int f,int n){int v=f%n;if(v<0)v+=n;return v;}
+-
+-bool solveWeighted(C*out,const std::vector<C*>&inputs,const std::vector<double>&dx,const std::vector<double>&dy,const std::vector<double>&weights,int nx,int ny,int Nx,int Ny){
+-    const double zx=(double)Nx/nx,zy=(double)Ny/ny,cof=1./(zx*zy);int fx=(int)std::floor(zx),cx=(int)std::ceil(zx),fy=(int)std::floor(zy),cy=(int)std::ceil(zy);
+-    std::array<PInv,4> pinv={blockPseudoInverse(fx,fy,dx,dy,weights,cof),blockPseudoInverse(cx,fy,dx,dy,weights,cof),blockPseudoInverse(fx,cy,dx,dy,weights,cof),blockPseudoInverse(cx,cy,dx,dy,weights,cof)};
+-    std::fill(out,out+(size_t)Nx*Ny,C(0,0));
+-    for(int b=-ny/2;b<=(ny-1)/2;b++){int qmin=(int)std::ceil(-(Ny+2.0*b)/(2.0*ny)),qmax=(int)std::ceil((Ny-2.0*b)/(2.0*ny))-1,sq=qmax-qmin+1;int ib=modIndex(b,ny);
+-        for(int a=-nx/2;a<=(nx-1)/2;a++){int pmin=(int)std::ceil(-(Nx+2.0*a)/(2.0*nx)),pmax=(int)std::ceil((Nx-2.0*a)/(2.0*nx))-1,sp=pmax-pmin+1;int ia=modIndex(a,nx),low=ib*nx+ia;
+-            const PInv*pm=nullptr;if(sp==fx&&sq==fy)pm=&pinv[0];else if(sp==cx&&sq==fy)pm=&pinv[1];else if(sp==fx&&sq==cy)pm=&pinv[2];else pm=&pinv[3];int z=sp*sq;if(pm->z!=z)return false;
+-            std::vector<std::complex<double>> rhs((size_t)z),left((size_t)z);int adr=0;for(int p=pmin;p<=pmax;p++){int alpha=a+p*nx;for(int q=qmin;q<=qmax;q++,adr++){int beta=b+q*ny;std::complex<double> sum(0,0);for(size_t j=0;j<inputs.size();j++){C obs=inputs[j][low];double theta=-2.*kPi*(dx[j]*(double)alpha/(double)nx+dy[j]*(double)beta/(double)ny);sum+=weights[j]*std::complex<double>(obs.real(),obs.imag())*std::complex<double>(std::cos(theta),std::sin(theta));}rhs[(size_t)adr]=sum;}}
+-            for(int i=0;i<z;i++){std::complex<double> v(0,0);for(int j=0;j<z;j++)v+=pm->a[(size_t)i*z+j]*rhs[(size_t)j];left[(size_t)i]=v;}
+-            adr=0;for(int p=pmin;p<=pmax;p++){int alpha=a+p*nx,oa=modIndex(alpha,Nx);for(int q=qmin;q<=qmax;q++,adr++){int beta=b+q*ny,ob=modIndex(beta,Ny);auto v=left[(size_t)adr];out[(size_t)ob*Nx+oa]=C((float)v.real(),(float)v.imag());}}
+-        }
+-    }return true;
+-}
+-
+-double residualNorm(const C*out,const C*obs,double dx,double dy,int nx,int ny,int Nx,int Ny){
+-    const double zx=(double)Nx/nx,zy=(double)Ny/ny,cof=1./(zx*zy);long double sum2=0.;
+-    for(int b=-ny/2;b<=(ny-1)/2;b++){int q0=(int)std::ceil(-zy/2.-(double)b/ny),q1=(int)std::ceil(zy/2.-(double)b/ny)-1,ib=modIndex(b,ny);
+-        for(int a=-nx/2;a<=(nx-1)/2;a++){int p0=(int)std::ceil(-zx/2.-(double)a/nx),p1=(int)std::ceil(zx/2.-(double)a/nx)-1,ia=modIndex(a,nx);std::complex<double> pred(0,0);
+-            for(int q=q0;q<=q1;q++){int beta=b+q*ny,ob=modIndex(beta,Ny);for(int p=p0;p<=p1;p++){int alpha=a+p*nx,oa=modIndex(alpha,Nx);C u=out[(size_t)ob*Nx+oa];double theta=2.*kPi*(dx*(double)alpha/(double)nx+dy*(double)beta/(double)ny);pred+=std::complex<double>(u.real(),u.imag())*std::complex<double>(std::cos(theta),std::sin(theta));}}
+-            pred*=cof;C o=obs[(size_t)ib*nx+ia];double dr=pred.real()-o.real(),di=pred.imag()-o.imag();sum2+=dr*dr+di*di;
+-        }}
+-    return std::sqrt((double)(sum2/((long double)nx*ny)));
+-}
+-
+-bool createInputDft(const char*lumaPath,const char*dftPath,int nx,int ny,int Nx,int Ny,double dx,double dy,double maxAbsDx,double maxAbsDy){
+-    MapFile lm,dm;if(!lm.openExisting(lumaPath,(size_t)nx*ny*sizeof(float),false)||!dm.create(dftPath,(size_t)nx*ny*sizeof(C)))return false;const float*l=(const float*)lm.ptr;C*d=(C*)dm.ptr;
+-    /* Exact revised-paper modified-Tukey geometry: every frame uses the same zero-extension, derived from the maximum absolute displacement across the complete sequence. */
+-    const double zx=(double)Nx/nx,zy=(double)Ny/ny,Dx=maxAbsDx*zx/(double)std::max(1,Nx-1),Dy=maxAbsDy*zy/(double)std::max(1,Ny-1);
+-    for(int y=0;y<ny;y++){double ty=tukeyProfile(zy*(double)(y+dy)/(double)std::max(1,Ny-1),kTukeyR,Dy);for(int x=0;x<nx;x++){double tx=tukeyProfile(zx*(double)(x+dx)/(double)std::max(1,Nx-1),kTukeyR,Dx);float v=l[(size_t)y*nx+x];if(!std::isfinite(v))return false;d[(size_t)y*nx+x]=C(v*(float)(tx*ty),0.f);}}
+-    if(!fft2d(d,nx,ny,false))return false;dm.sync();return true;
+-}
+-
+-inline std::array<float,3> guideSample(const uint16_t*g,int w,int h,float x,float y){
+-    x=clampf(x,0.f,(float)(w-1));y=clampf(y,0.f,(float)(h-1));int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);float fx=x-x0,fy=y-y0;std::array<float,3>o{};
+-    for(int c=0;c<3;c++){auto at=[&](int xx,int yy){return iris26564::halfToFloat(g[((size_t)yy*w+xx)*3+c]);};float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;o[c]=a+(b-a)*fy;}return o;
+-}
+-inline float detailSample(const uint16_t*d,int w,int h,float x,float y){
+-    if(x<0.f||y<0.f||x>(float)(w-1)||y>(float)(h-1))return 0.f;int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);float fx=x-x0,fy=y-y0;auto at=[&](int xx,int yy){return iris26564::halfToFloat(d[(size_t)yy*w+xx]);};float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;return a+(b-a)*fy;
+-}
+-}
+-
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_writePlanBLumaTile(
+-        JNIEnv*e,jclass,jstring outputPath,jint outW,jint outH,jint tileX,jint tileY,jint tileW,jint tileH,jint sampleOriginX,jint sampleOriginY,
+-        jobject rawBuffer,jint rawX,jint rawY,jint rawW,jint rawH,jint rawStride,jobject covBuffer,jint covX,jint covY,jint covW,jint covH,jint covFullW,jint covFullH,
+-        jint fullRawW,jint fullRawH,jint cfa,jfloatArray gainsArray,jfloatArray blackArray,jfloatArray covRgArray,jfloatArray covBArray,jfloatArray cameraScaleArray,jfloatArray lensArray,jint lensW,jint lensH){
+-    if(!outputPath||!rawBuffer||!covBuffer||outW<=0||outH<=0||tileW<=0||tileH<=0||tileX<0||tileY<0||tileX>outW-tileW||tileY>outH-tileH||fullRawW<=0||fullRawH<=0||rawStride<rawW)return JNI_FALSE;
+-    auto*raw=(const uint16_t*)e->GetDirectBufferAddress(rawBuffer);auto*cov=(const uint32_t*)e->GetDirectBufferAddress(covBuffer);if(!raw||!cov)return JNI_FALSE;
+-    float gains[4],black[4],crg[4],cb[2],scale[3];if(!gainsArray||!blackArray||!covRgArray||!covBArray||!cameraScaleArray||e->GetArrayLength(gainsArray)!=4||e->GetArrayLength(blackArray)!=4||e->GetArrayLength(covRgArray)!=4||e->GetArrayLength(covBArray)!=2||e->GetArrayLength(cameraScaleArray)!=3)return JNI_FALSE;
+-    e->GetFloatArrayRegion(gainsArray,0,4,gains);e->GetFloatArrayRegion(blackArray,0,4,black);e->GetFloatArrayRegion(covRgArray,0,4,crg);e->GetFloatArrayRegion(covBArray,0,2,cb);e->GetFloatArrayRegion(cameraScaleArray,0,3,scale);if(e->ExceptionCheck())return JNI_FALSE;
+-    std::vector<float>lens;if(lensArray&&lensW>0&&lensH>0){jsize n=e->GetArrayLength(lensArray);if(n<lensW*lensH*4)return JNI_FALSE;lens.resize((size_t)lensW*lensH*4);e->GetFloatArrayRegion(lensArray,0,(jsize)lens.size(),lens.data());if(e->ExceptionCheck())return JNI_FALSE;}
+-    U op(e,outputPath);if(!op.c)return JNI_FALSE;int fd=open(op.c,O_RDWR);if(fd<0)return JNI_FALSE;struct stat st{};if(fstat(fd,&st)!=0||(uint64_t)st.st_size!=(uint64_t)outW*outH*sizeof(float)){close(fd);return JNI_FALSE;}
+-    std::vector<float>row((size_t)tileW);bool ok=true;for(int ly=0;ok&&ly<tileH;ly++){for(int lx=0;lx<tileW;lx++){
+-        int gx=sampleOriginX+tileX+lx,gy=sampleOriginY+tileY+ly;float u=((float)gx+.5f)/(float)fullRawW,v=((float)gy+.5f)/(float)fullRawH,packed[3],cc[3];iris26564::covSample(cov,covW,covH,covX,covY,covFullW,covFullH,u,v,packed);cc[0]=packed[0]*crg[1]+crg[0];cc[1]=packed[1]*crg[3]+crg[2];cc[2]=packed[2]*cb[1]+cb[0];
+-        float rgb[3],ww[3];iris26564::sampleRbf(raw,rawW,rawH,rawStride,rawX,rawY,fullRawW,fullRawH,(float)gx+.5f,(float)gy+.5f,cfa,gains,black,cc,rgb,ww);for(int k=0;k<3;k++)rgb[k]=std::max(0.f,rgb[k]/std::max(ww[k],1.0e-7f))*scale[k];float ls[4];iris26564::lensSample(lens.empty()?nullptr:lens.data(),lensW,lensH,u,v,ls);rgb[0]*=ls[0];rgb[1]*=.5f*(ls[1]+ls[2]);rgb[2]*=ls[3];float y=.25f*rgb[0]+.50f*rgb[1]+.25f*rgb[2];if(!std::isfinite(y)){ok=false;break;}row[(size_t)lx]=std::max(y,0.f);
+-    }if(!ok)break;off_t off=((off_t)(tileY+ly)*outW+tileX)*(off_t)sizeof(float);const uint8_t*p=(const uint8_t*)row.data();size_t bytes=row.size()*sizeof(float),done=0;while(done<bytes){ssize_t n=pwrite(fd,p+done,bytes-done,off+(off_t)done);if(n<=0){ok=false;break;}done+=(size_t)n;}}
+-    close(fd);return ok?JNI_TRUE:JNI_FALSE;
+-}
+-
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_reconstructPlanBIrls(
+-        JNIEnv*e,jclass,jobjectArray paths,jint nx,jint ny,jint Nx,jint Ny,jfloatArray dxArray,jfloatArray dyArray,jstring outputPath,jfloatArray outWeights,jlongArray statsArray){
+-    if(!paths||!dxArray||!dyArray||!outputPath||nx<=0||ny<=0||Nx<nx||Ny<ny)return JNI_FALSE;jsize L=e->GetArrayLength(paths);if(L<=0||e->GetArrayLength(dxArray)!=L||e->GetArrayLength(dyArray)!=L||!outWeights||e->GetArrayLength(outWeights)<L)return JNI_FALSE;
+-    std::vector<float>dxf((size_t)L),dyf((size_t)L);e->GetFloatArrayRegion(dxArray,0,L,dxf.data());e->GetFloatArrayRegion(dyArray,0,L,dyf.data());if(e->ExceptionCheck())return JNI_FALSE;std::vector<double>dx((size_t)L),dy((size_t)L);for(int j=0;j<L;j++){dx[j]=dxf[(size_t)j];dy[j]=dyf[(size_t)j];if(!std::isfinite(dx[j])||!std::isfinite(dy[j]))return JNI_FALSE;}
+-    if(L<(jsize)(std::ceil((double)Nx/nx)*std::ceil((double)Ny/ny)))return JNI_FALSE;U op(e,outputPath);if(!op.c)return JNI_FALSE;std::string base(op.c);std::vector<std::string>dftNames;std::vector<std::unique_ptr<iris26752planb::MapFile>>maps;dftNames.reserve((size_t)L);maps.reserve((size_t)L);bool ok=true;
+-    double maxAbsDx=0.,maxAbsDy=0.;for(int j=0;j<L;j++){maxAbsDx=std::max(maxAbsDx,std::fabs(dx[(size_t)j]));maxAbsDy=std::max(maxAbsDy,std::fabs(dy[(size_t)j]));}
+-    for(int j=0;j<L&&ok;j++){auto js=(jstring)e->GetObjectArrayElement(paths,j);if(!js){ok=false;break;}U ip(e,js);std::string in=ip.c?ip.c:"";e->DeleteLocalRef(js);if(in.empty()){ok=false;break;}std::string dn=base+".iris26752_input_"+std::to_string(j)+".cfloat";unlink(dn.c_str());if(!iris26752planb::createInputDft(in.c_str(),dn.c_str(),nx,ny,Nx,Ny,dx[(size_t)j],dy[(size_t)j],maxAbsDx,maxAbsDy)){ok=false;break;}auto mf=std::make_unique<iris26752planb::MapFile>();if(!mf->openExisting(dn.c_str(),(size_t)nx*ny*sizeof(iris26752planb::C),false)){ok=false;break;}dftNames.push_back(dn);maps.push_back(std::move(mf));}
+-    std::string outDft=base+".iris26752_output.cfloat";iris26752planb::MapFile outMap;if(ok)ok=outMap.create(outDft.c_str(),(size_t)Nx*Ny*sizeof(iris26752planb::C));std::vector<iris26752planb::C*>inputs;for(auto&m:maps)inputs.push_back((iris26752planb::C*)m->ptr);std::vector<double>w((size_t)L,1.);double E=0.,prev=0.;int iterations=0;long zeroGuards=0;
+-    while(ok&&iterations<iris26752planb::kIrlsMaxIterations){iterations++;ok=iris26752planb::solveWeighted((iris26752planb::C*)outMap.ptr,inputs,dx,dy,w,nx,ny,Nx,Ny);if(!ok)break;prev=E;E=0.;for(int j=0;j<L;j++){double z=iris26752planb::residualNorm((iris26752planb::C*)outMap.ptr,inputs[(size_t)j],dx[(size_t)j],dy[(size_t)j],nx,ny,Nx,Ny);if(!std::isfinite(z)){ok=false;break;}double eta=std::max(iris26752planb::kIrlsEtaFloor,z);if(eta!=z)zeroGuards++;w[(size_t)j]=1./eta;E+=z;}if(!ok)break;if(iterations>1&&std::fabs(E-prev)<=iris26752planb::kIrlsRelativeStop*std::fabs(prev))break;}
+-    if(ok){ok=iris26752planb::fft2d((iris26752planb::C*)outMap.ptr,Nx,Ny,true);if(ok){iris26752planb::MapFile out;if(out.create(base.c_str(),(size_t)Nx*Ny*sizeof(float))){float*dst=(float*)out.ptr;auto*src=(iris26752planb::C*)outMap.ptr;for(size_t i=0;i<(size_t)Nx*Ny;i++){float v=src[i].real();if(!std::isfinite(v)){ok=false;break;}dst[i]=std::max(v,0.f);}out.sync();}else ok=false;}}
+-    if(ok){std::vector<jfloat>wf((size_t)L);for(int j=0;j<L;j++)wf[(size_t)j]=(jfloat)w[(size_t)j];e->SetFloatArrayRegion(outWeights,0,L,wf.data());if(e->ExceptionCheck())ok=false;if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=iterations;if(n>1)st[1]=L;if(n>2)st[2]=(jlong)nx*ny;if(n>3)st[3]=(jlong)Nx*Ny;if(n>4)st[4]=zeroGuards;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())ok=false;}}
+-    outMap.sync();for(auto&m:maps)m.reset();for(auto&n:dftNames)unlink(n.c_str());unlink(outDft.c_str());if(!ok)unlink(base.c_str());return ok?JNI_TRUE:JNI_FALSE;
+-}
+-
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_buildPlanBDetail(
+-        JNIEnv*e,jclass,jstring reconstructionPath,jint rw,jint rh,jstring guidePath,jint gw,jint gh,jfloat originX,jfloat originY,jfloat sx,jfloat sy,jfloat maxDx,jfloat maxDy,jstring detailPath,jlongArray statsArray){
+-    if(!reconstructionPath||!guidePath||!detailPath||rw<=0||rh<=0||gw<=0||gh<=0||sx<1.f||sy<1.f)return JNI_FALSE;U rp(e,reconstructionPath),gp(e,guidePath),dp(e,detailPath);if(!rp.c||!gp.c||!dp.c)return JNI_FALSE;iris26752planb::MapFile rm,gm,dm;if(!rm.openExisting(rp.c,(size_t)rw*rh*sizeof(float),false)||!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.create(dp.c,(size_t)rw*rh*sizeof(uint16_t)))return JNI_FALSE;auto*recon=(const float*)rm.ptr;auto*guide=(const uint16_t*)gm.ptr;auto*out=(uint16_t*)dm.ptr;long total=0,active=0,strong=0,highlightBlocked=0,agreementBlocked=0,apodBlocked=0;double Dx=std::fabs((double)maxDx)*sx/(double)std::max(1,rw-1),Dy=std::fabs((double)maxDy)*sy/(double)std::max(1,rh-1);
+-    for(int y=0;y<rh;y++){double ay=iris26752planb::tukeyProfile((double)y/(double)std::max(1,rh-1),iris26752planb::kTukeyR,Dy);for(int x=0;x<rw;x++){double ax=iris26752planb::tukeyProfile((double)x/(double)std::max(1,rw-1),iris26752planb::kTukeyR,Dx);float apod=(float)(ax*ay);float sourceX=originX+(float)x/sx,sourceY=originY+(float)y/sy;auto g=iris26752planb::guideSample(guide,gw,gh,sourceX,sourceY);float gy=.25f*g[0]+.50f*g[1]+.25f*g[2],py=std::max(recon[(size_t)y*rw+x],0.f);float peak=std::max(py,std::max(g[0],std::max(g[1],g[2])));float signal=iris26564::smooth01((gy-.015f)/.055f);float hg=1.f-iris26564::smooth01((peak-.72f)/.20f);float delta=std::fabs(std::log2((py+.01f)/(gy+.01f)));float ag=1.f-iris26564::smooth01((delta-.08f)/.27f);float confidence=clampf(signal*hg*ag*apod,0.f,1.f);float d=clampf(std::log2((py+.01f)/(gy+.01f)),-.56f,.56f)*confidence;if(!std::isfinite(d))return JNI_FALSE;out[(size_t)y*rw+x]=iris26564::floatToHalf(d);total++;if(std::fabs(d)>.005f)active++;if(std::fabs(d)>.03f)strong++;if(hg<=.001f)highlightBlocked++;if(ag<=.001f)agreementBlocked++;if(apod<=.001f)apodBlocked++;}}
+-    dm.sync();if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=total;if(n>1)st[1]=active;if(n>2)st[2]=strong;if(n>3)st[3]=highlightBlocked;if(n>4)st[4]=agreementBlocked;if(n>5)st[5]=apodBlocked;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}return JNI_TRUE;
+-}
+-
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_composePlanBRender(
+-        JNIEnv*e,jclass,jstring guidePath,jint gw,jint gh,jstring detailPath,jint dw,jint dh,jfloat originX,jfloat originY,jfloat dsx,jfloat dsy,jint ow,jint oh,jfloat psx,jfloat psy,jstring outputPath){
+-    if(!guidePath||!detailPath||!outputPath||gw<=0||gh<=0||dw<=0||dh<=0||ow<=0||oh<=0||dsx<1.f||dsy<1.f||psx<1.f||psy<1.f)return JNI_FALSE;U gp(e,guidePath),dp(e,detailPath),op(e,outputPath);if(!gp.c||!dp.c||!op.c)return JNI_FALSE;iris26752planb::MapFile gm,dm,om;if(!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.openExisting(dp.c,(size_t)dw*dh*sizeof(uint16_t),false)||!om.create(op.c,(size_t)ow*oh*3*sizeof(uint16_t)))return JNI_FALSE;auto*g=(const uint16_t*)gm.ptr;auto*d=(const uint16_t*)dm.ptr;auto*out=(uint16_t*)om.ptr;
+-    for(int y=0;y<oh;y++)for(int x=0;x<ow;x++){float sourceX=(float)x/psx,sourceY=(float)y/psy;auto rgb=iris26752planb::guideSample(g,gw,gh,sourceX,sourceY);float lx=sourceX*dsx-originX,ly=sourceY*dsy-originY;float logd=iris26752planb::detailSample(d,dw,dh,lx,ly),factor=std::exp2(clampf(logd,-.56f,.56f));size_t q=((size_t)y*ow+x)*3;for(int c=0;c<3;c++)out[q+c]=iris26564::floatToHalf(std::max(rgb[c]*factor,0.f));}
+-    om.sync();return JNI_TRUE;
+-}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index a54b8c5a35f6a0247bb8755868a8914dac117170..7b17c4d7e9efbcb1e240659d1d8913bc50b147a2 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -189,11 +189,6 @@ internal class GlesMgcRawSpatialStacker(
+         val originY: Int,
+         val fullWidth: Int,
+         val fullHeight: Int,
+-        /* IRIS_26752_IPOL_PLAN_B_EXACT_GEOMETRY */
+-        val scaleX: Float,
+-        val scaleY: Float,
+-        val originXF: Float,
+-        val originYF: Float,
+         val sourceZoom: Float,
+         val activePct: Float,
+         val strongPct: Float,
+@@ -207,19 +202,6 @@ internal class GlesMgcRawSpatialStacker(
+         val strongPct: Float,
+     )
+ 
+-    private data class PlanBTranslation26752(
+-        val evidence: True2xFrameEvidence,
+-        val dx: Float,
+-        val dy: Float,
+-    )
+-
+-    private data class PlanBReconstruction26752(
+-        val detail: HighZoomDetailResult,
+-        val renderRgbPath: String?,
+-        val iterations: Int,
+-        val weights: FloatArray,
+-    )
+-
+     private data class HighZoomRgbResult(
+         val path: String,
+         val width: Int,
+@@ -2276,11 +2258,8 @@ internal class GlesMgcRawSpatialStacker(
+         require(!(enableSabreSuperRes && enableHighZoomDetail)) {
+             "26718 Super Res and normal high-zoom detail are mutually exclusive reconstruction routes"
+         }
+-        /* IRIS_26752_PLAN_B_ALL_NORMAL_TRANSLATION_EVIDENCE
+-         * Plan B's robust IRLS needs the translation sequence itself, not the old 2x phase reservoir.
+-         * The bounded mobile solver later retains at most nine same-lens NORMAL observations.
+-         */
+-        val true2xFastPhaseSlots: Array<True2xFrameEvidence?>? = null
++        val true2xFastPhaseSlots: Array<True2xFrameEvidence?>? =
++            if (enableSabreSuperRes && !exportNormalStackedDng) arrayOfNulls(TRUE2X_JPEG_MAX_EVIDENCE) else null
+         /* IRIS_26718_HIGH_ZOOM_ALL_NORMAL_EVIDENCE
+          * Normal high zoom retains every admitted NORMAL observation. This route deliberately does
+          * not inherit Super Res JPEG's top-two-per-phase reservoir or publication policy. SHORT/LONG
+@@ -2825,7 +2804,7 @@ internal class GlesMgcRawSpatialStacker(
+                         referenceRawTexture = referenceRaw,
+                         currentRawTexture = currentRaw,
+                         referenceCalibration = referenceCalibration,
+-                        refineForHighZoom26718 = false,
++                        refineForHighZoom26718 = true,
+                     )
+                 }
+                 if (normalDngAccumulator != 0 && frame.role == RawBurstFrameRole.NORMAL) {
+@@ -3207,37 +3186,39 @@ internal class GlesMgcRawSpatialStacker(
+             }
+             if (enableHighZoomDetail) {
+                 val reconstructionEvidence = highZoomEvidence26718.toList()
+-                require(reconstructionEvidence.isNotEmpty()) { "26752 Plan-B high zoom has no NORMAL evidence" }
++                require(reconstructionEvidence.isNotEmpty()) { "26720 high-zoom has no NORMAL evidence" }
+                 val evidencePolicy = "retained=${reconstructionEvidence.size} allAdmittedNormal=true " +
+-                    "paperModel=pureTranslation normalOnly=true shortDetailEvidence=false longDetailEvidence=false " +
+-                    "rgbOwner=NATIVE_SABRE_VGN directCfaHighZoom=false deviceGate=false"
+-                PLog.i(SABRE_TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_EVIDENCE $evidencePolicy")
+-                MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_EVIDENCE", evidencePolicy)
+-                val attempt = runCatching {
+-                    reconstructPlanB26752(
++                    "srReservoirIndependent=true normalOnly=true shortDetailEvidence=false longDetailEvidence=false " +
++                    "directCfaRgbAttempt=true scalar26719Fallback=false cleanNativeFallback=true"
++                PLog.i(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_EVIDENCE_POLICY $evidencePolicy")
++                MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_EVIDENCE_POLICY", evidencePolicy)
++                val rgbAttempt = runCatching {
++                    reconstructHighZoomRgb26720(
+                         frames = frames, images = images, evidence = reconstructionEvidence,
+-                        nativeVgnGuideTexture = nativeHdrAuthority26601, publicationScale = 1f,
++                        nativeVgnGuideTexture = nativeHdrAuthority26601,
+                     )
+                 }
+-                if (attempt.isSuccess) {
+-                    val planB = attempt.getOrThrow()
+-                    highZoomDetailResult = planB.detail
+-                    highZoomRgbResult = null
+-                    val hz = planB.detail
+-                    val ready = "size=${hz.width}x${hz.height} origin=${hz.originXF},${hz.originYF} " +
+-                        "scale=${hz.scaleX},${hz.scaleY} full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} " +
+-                        "frames=${hz.frames} activePct=${hz.activePct} strongPct=${hz.strongPct} ms=${hz.reconstructionMs} " +
+-                        "lumaDetailOwner=IPOL_PLAN_B_IRLS nativeSabreVgnChromaOwner=true directChromaOwner=false " +
+-                        "highlightOwnerUnchanged=true directCfaHighZoom=false"
+-                    PLog.i(SABRE_TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_READY $ready")
+-                    MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_READY", ready)
++                if (rgbAttempt.isSuccess) {
++                    highZoomRgbResult = rgbAttempt.getOrThrow()
++                    val hz = checkNotNull(highZoomRgbResult)
++                    require(File(hz.path).length() == hz.width.toLong() * hz.height * HIGH_ZOOM_RGB32F_BYTES_PER_PIXEL)
++                    val ready = "size=${hz.width}x${hz.height} origin=${hz.originX},${hz.originY} " +
++                        "full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} frames=${hz.frames} " +
++                        "activePct=${hz.activePct} strongDetailPct=${hz.fullColorPct} phaseMean=${hz.phaseMean} phaseP10=${hz.phaseP10} " +
++                        "refineAcceptedPct=${hz.refineAcceptedPct} ms=${hz.reconstructionMs} " +
++                        "lumaDetailOwner=DIRECT_CFA_TEMPORAL nativeSabreVgnChromaOwner=true directChromaOwner=false " +
++                        "sameMaterialTopology=true realGuideColorPreserved=true highlightOwnerUnchanged=true"
++                    PLog.i(SABRE_TAG, "IRIS_26720_HIGH_ZOOM_RGB_READY $ready")
++                    MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_READY", ready)
+                 } else {
+-                    val failure = checkNotNull(attempt.exceptionOrNull())
+-                    PLog.e(SABRE_TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_FAIL_CLOSED reason=${failure.message}", failure)
+-                    MotionTrace.processingState(
+-                        "IRIS_26752_PLAN_B_HIGH_ZOOM_FAIL_CLOSED",
+-                        "reason=${failure.javaClass.simpleName}:${failure.message} fallback=NATIVE_SABRE_VGN_NO_DETAIL",
+-                    )
++                    val failure = checkNotNull(rgbAttempt.exceptionOrNull())
++                    /* IRIS_26732_HIGH_ZOOM_FAIL_CLOSED_NATIVE_FALLBACK
++                     * A failed direct-CFA high-zoom reconstruction must never hand a partially derived
++                     * scalar detail texture to rendering. Native Sabre/VGN is already complete and is
++                     * the deterministic clean fallback for this shot. */
++                    PLog.e(SABRE_TAG, "IRIS_26732_HIGH_ZOOM_CLEAN_NATIVE_FALLBACK reason=${failure.message}", failure)
++                    MotionTrace.processingState("IRIS_26732_HIGH_ZOOM_CLEAN_NATIVE_FALLBACK",
++                        "reason=${failure.javaClass.simpleName}:${failure.message} fallback=NATIVE_SABRE_VGN_NO_DETAIL staleOverlayImpossible=true")
+                     highZoomDetailResult = null
+                     highZoomRgbResult = null
+                 }
+@@ -3260,12 +3241,7 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+                 require(rawResult.width==superResWidth&&rawResult.height==superResHeight)
+                 val expectedTrueBytes=rawResult.width.toLong()*rawResult.height*TRUE2X_RGB16F_BYTES_PER_PIXEL
+-                if(rawResult.backend=="PLAN_B") {
+-                    require(rawResult.renderRgbPath?.let { File(it).length()==expectedTrueBytes }==true) { "26752 Plan-B true2x render carrier invalid" }
+-                    require((rawResult.linearRgbPath!=null)==exportNormalStackedDng) { "26752 Plan-B DNG ownership mismatch" }
+-                    rawResult.linearRgbPath?.let { require(File(it).length()==expectedTrueBytes) }
+-                    require(rawResult.nativeVgnGuidePath==null&&rawResult.phaseSupportPath==null) { "26752 Plan-B must not publish internal guide/phase intermediates" }
+-                } else if(rawResult.backend=="GPU") {
++                if(rawResult.backend=="GPU") {
+                     require(rawResult.renderRgbPath?.let { File(it).length()==expectedTrueBytes }==true) { "26568 fused true2x render carrier invalid" }
+                     require((rawResult.linearRgbPath!=null)==exportNormalStackedDng) { "26568 GPU direct-CFA DNG carrier ownership mismatch" }
+                     rawResult.linearRgbPath?.let { require(File(it).length()==expectedTrueBytes) }
+@@ -3286,7 +3262,7 @@ internal class GlesMgcRawSpatialStacker(
+                 val readyDetails = "normalFrames=$normalFrameCount shadowLongExcluded=$shadowLongFrameCount " +
+                     "size=${result.width}x${result.height} backend=${result.backend} phaseMean=${result.phaseSupportMean} phaseP10=${result.phaseSupportP10} " +
+                     "reconstruction=${result.reconstructionMs}ms dngBoundary=PRE_VGN sabreRgbChromaOwner=true " +
+-                    "highResLumaOwner=${if (result.backend == "PLAN_B") "IPOL_PLAN_B_IRLS" else "DIRECT_CFA"} directChromaOwner=false trueDetail26573=temporal-cross-frame " +
++                    "highResLumaOwner=DIRECT_CFA directChromaOwner=false trueDetail26573=temporal-cross-frame " +
+                     "directDng=${result.linearRgbPath!=null} fusedRender=${result.renderRgbPath!=null}"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_READY $readyDetails")
+                 MotionTrace.processingState("IRIS_26576_SR_RECONSTRUCTION_SUMMARY", readyDetails)
+@@ -3387,10 +3363,6 @@ internal class GlesMgcRawSpatialStacker(
+                 highZoomDetailOriginY = highZoomDetailResult?.originY ?: 0,
+                 highZoomDetailFullWidth = highZoomDetailResult?.fullWidth ?: 0,
+                 highZoomDetailFullHeight = highZoomDetailResult?.fullHeight ?: 0,
+-                highZoomDetailScaleX = highZoomDetailResult?.scaleX ?: 1f,
+-                highZoomDetailScaleY = highZoomDetailResult?.scaleY ?: 1f,
+-                highZoomDetailOriginXF = highZoomDetailResult?.originXF ?: 0f,
+-                highZoomDetailOriginYF = highZoomDetailResult?.originYF ?: 0f,
+                 highZoomDetailSourceZoom = highZoomDetailResult?.sourceZoom ?: 1f,
+                 highZoomDetailActivePct = highZoomDetailResult?.activePct ?: 0f,
+                 highZoomDetailStrongPct = highZoomDetailResult?.strongPct ?: 0f,
+@@ -13165,7 +13137,7 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun streamTrue2xNativeVgnGuideRgb16f(texture: Int): File {
+-        require(enableSabreSuperRes || enableHighZoomDetail)
++        require(enableSabreSuperRes)
+         require(texture != 0)
+         require(exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
+             "26564 true2x VGN guide requires the proven RGBA16F Sabre GPU carrier"
+@@ -14064,266 +14036,6 @@ internal class GlesMgcRawSpatialStacker(
+         return HighZoomDetailStats(activePct,strongPct)
+     }
+ 
+-    /* IRIS_26752_IPOL_PLAN_B_GLOBAL_TRANSLATION
+-     * The paper's observation model is translation-only. Reduce Iris's persisted flow field to one
+-     * robust frame translation and never feed local/non-rigid flow into the Plan-B solver. Flow is
+-     * reference->current sampling displacement, hence the paper's Aj translation has opposite sign.
+-     */
+-    private fun planBGlobalTranslation26752(ev: True2xFrameEvidence): Pair<Float, Float>? {
+-        if (ev.frameIndex == 0) return 0f to 0f
+-        val values = ev.flowData.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
+-        val xs = ArrayList<Float>()
+-        val ys = ArrayList<Float>()
+-        for (index in 0 until ev.flowWidth * ev.flowHeight) {
+-            val confidence = Half.toFloat(values.get(index * 4 + 3))
+-            if (!confidence.isFinite() || confidence <= 0.5f) continue
+-            val fx = Half.toFloat(values.get(index * 4)) * width.toFloat()
+-            val fy = Half.toFloat(values.get(index * 4 + 1)) * height.toFloat()
+-            if (fx.isFinite() && fy.isFinite()) {
+-                xs += fx
+-                ys += fy
+-            }
+-        }
+-        if (xs.size < 16) return null
+-        xs.sort(); ys.sort()
+-        fun median(v: List<Float>): Float {
+-            val n = v.size
+-            return if ((n and 1) != 0) v[n / 2] else 0.5f * (v[n / 2 - 1] + v[n / 2])
+-        }
+-        return -median(xs) to -median(ys)
+-    }
+-
+-    private fun writePlanBLumaFrame26752(
+-        image: SafeImage,
+-        ev: True2xFrameEvidence,
+-        cropX: Int,
+-        cropY: Int,
+-        cropWidth: Int,
+-        cropHeight: Int,
+-        output: File,
+-    ) {
+-        RandomAccessFile(output, "rw").use { it.setLength(cropWidth.toLong() * cropHeight * Float.SIZE_BYTES) }
+-        val tileMaxWidth = 512
+-        val tileMaxHeight = 128
+-        var top = 0
+-        while (top < cropHeight) {
+-            val tileHeight = minOf(tileMaxHeight, cropHeight - top)
+-            var left = 0
+-            while (left < cropWidth) {
+-                val tileWidth = minOf(tileMaxWidth, cropWidth - left)
+-                val globalLeft = cropX + left
+-                val globalTop = cropY + top
+-                val rawLeft = (globalLeft - 2).coerceAtLeast(0)
+-                val rawTop = (globalTop - 2).coerceAtLeast(0)
+-                val rawRight = (globalLeft + tileWidth + 2).coerceAtMost(width)
+-                val rawBottom = (globalTop + tileHeight + 2).coerceAtMost(height)
+-                val rawWidth = rawRight - rawLeft
+-                val rawHeight = rawBottom - rawTop
+-                val rawRect = intArrayOf(rawLeft, rawTop, rawRight, rawBottom)
+-                val covRect = true2xRawScaledRegion(
+-                    rawRect, ev.covarianceWidth, ev.covarianceHeight, TRUE2X_EVIDENCE_HALO,
+-                )
+-                val covLeft = covRect[0]
+-                val covTop = covRect[1]
+-                val covWidth = covRect[2] - covLeft
+-                val covHeight = covRect[3] - covTop
+-                readTrue2xRawRegion(image, rawLeft, rawTop, rawWidth, rawHeight).use { raw ->
+-                    val covariance = readTrue2xFileRegion(
+-                        ev.covarianceFile, ev.covarianceWidth, 4,
+-                        covLeft, covTop, covWidth, covHeight, "IRIS26752 Plan-B covariance",
+-                    )
+-                    try {
+-                        check(
+-                            IrisTrue2xSrNative.writePlanBLumaTile(
+-                                output.absolutePath, cropWidth, cropHeight,
+-                                left, top, tileWidth, tileHeight,
+-                                cropX, cropY,
+-                                raw.buffer, rawLeft, rawTop, rawWidth, rawHeight, raw.rowStrideSamples,
+-                                covariance, covLeft, covTop, covWidth, covHeight,
+-                                ev.covarianceWidth, ev.covarianceHeight,
+-                                width, height, cfaPattern,
+-                                ev.calibration.gains, ev.calibration.blackTerms,
+-                                floatArrayOf(
+-                                    COV_MIN_R, COV_MAX_R - COV_MIN_R,
+-                                    COV_MIN_G, COV_MAX_G - COV_MIN_G,
+-                                ),
+-                                floatArrayOf(COV_MIN_B, COV_MAX_B - COV_MIN_B),
+-                                cameraDomainScale, lensShading, lensShadingWidth, lensShadingHeight,
+-                            )
+-                        ) { "26752 Plan-B luma tile failed frame=${ev.frameIndex} tile=$left,$top" }
+-                    } finally {
+-                        LargeDirectBuffer.free(covariance)
+-                    }
+-                }
+-                left += tileWidth
+-            }
+-            top += tileHeight
+-        }
+-        require(output.length() == cropWidth.toLong() * cropHeight * Float.SIZE_BYTES) {
+-            "26752 Plan-B luma carrier size mismatch frame=${ev.frameIndex}"
+-        }
+-    }
+-
+-    /* IRIS_26752_IPOL_PLAN_B_RECONSTRUCTION_OWNER
+-     * Exact paper core, device-agnostic and lens-relative. NORMAL frames from exactly one physical
+-     * lens become unwarped scalar camera-luma observations. Modified-Tukey + Fourier direct WLS +
+-     * l1-l2 IRLS run natively. Sabre/VGN remains the only RGB/chroma/highlight publication owner.
+-     */
+-    private fun reconstructPlanB26752(
+-        frames: List<RawStackFrame>,
+-        images: List<SafeImage>,
+-        evidence: List<True2xFrameEvidence>,
+-        nativeVgnGuideTexture: Int,
+-        publicationScale: Float,
+-    ): PlanBReconstruction26752 {
+-        require(publicationScale == 1f || publicationScale == 2f)
+-        require(evidence.isNotEmpty())
+-        val directory = checkNotNull(sabreSuperResTempDir)
+-        require(directory.exists() || directory.mkdirs())
+-        val referenceLens = frames[evidence.first().frameIndex].lensState
+-        val sameLens = evidence.filter { ev ->
+-            ev.frameIndex in frames.indices &&
+-                frames[ev.frameIndex].role == RawBurstFrameRole.NORMAL &&
+-                frames[ev.frameIndex].lensState == referenceLens
+-        }
+-        require(sameLens.size >= 4) { "26752 Plan-B needs >=4 same-lens NORMAL frames, got=${sameLens.size}" }
+-        /* Bound the mobile cache while retaining the 3x alias-system minimum. This is evidence
+-         * selection only; the reconstruction equations below remain the paper's exact estimator.
+-         * Reference is immutable; remaining slots use existing Sabre rejection quality only. */
+-        val reference = sameLens.firstOrNull { it.frameIndex == 0 } ?: sameLens.first()
+-        val selectedEvidence = if (sameLens.size <= PLAN_B_MAX_EVIDENCE_26752) sameLens else {
+-            listOf(reference) + sameLens.asSequence()
+-                .filter { it !== reference }
+-                .sortedByDescending { it.qualityScore }
+-                .take(PLAN_B_MAX_EVIDENCE_26752 - 1)
+-                .toList()
+-        }
+-        val translations = selectedEvidence.mapNotNull { ev ->
+-            planBGlobalTranslation26752(ev)?.let { shift -> PlanBTranslation26752(ev, shift.first, shift.second) }
+-        }
+-        require(translations.size >= 4) {
+-            "26752 Plan-B translation proof insufficient accepted=${translations.size} selected=${selectedEvidence.size}"
+-        }
+-        val supportedCeil = kotlin.math.floor(kotlin.math.sqrt(translations.size.toDouble())).toInt().coerceIn(1, 3)
+-        require(supportedCeil >= 2)
+-        val desiredScale = (publicationScale * highZoomSourceZoom)
+-            .coerceAtLeast(publicationScale)
+-            .coerceAtMost(supportedCeil.toFloat())
+-        val maxShiftX = translations.maxOf { kotlin.math.abs(it.dx) }
+-        val maxShiftY = translations.maxOf { kotlin.math.abs(it.dy) }
+-        val visibleWidth = kotlin.math.ceil(width / highZoomSourceZoom.toDouble()).toInt().coerceIn(1, width)
+-        val visibleHeight = kotlin.math.ceil(height / highZoomSourceZoom.toDouble()).toInt().coerceIn(1, height)
+-        val marginX = (kotlin.math.ceil(visibleWidth * 0.02).toInt() + kotlin.math.ceil(maxShiftX.toDouble()).toInt() + 8)
+-        val marginY = (kotlin.math.ceil(visibleHeight * 0.02).toInt() + kotlin.math.ceil(maxShiftY.toDouble()).toInt() + 8)
+-        val cropWidth = (visibleWidth + 2 * marginX).coerceAtMost(width)
+-        val cropHeight = (visibleHeight + 2 * marginY).coerceAtMost(height)
+-        val cropX = ((width - cropWidth) / 2).coerceAtLeast(0)
+-        val cropY = ((height - cropHeight) / 2).coerceAtLeast(0)
+-        val outputWidth = kotlin.math.round(cropWidth * desiredScale).toInt().coerceAtLeast(cropWidth)
+-        val outputHeight = kotlin.math.round(cropHeight * desiredScale).toInt().coerceAtLeast(cropHeight)
+-        val scaleX = outputWidth.toFloat() / cropWidth.toFloat()
+-        val scaleY = outputHeight.toFloat() / cropHeight.toFloat()
+-        val aliasUnknowns = kotlin.math.ceil(scaleX.toDouble()).toInt() * kotlin.math.ceil(scaleY.toDouble()).toInt()
+-        require(translations.size >= aliasUnknowns) {
+-            "26752 Plan-B underdetermined L=${translations.size} aliases=$aliasUnknowns scale=$scaleX,$scaleY"
+-        }
+-        val guideFile = streamTrue2xNativeVgnGuideRgb16f(nativeVgnGuideTexture)
+-        val lumaFiles = ArrayList<File>(translations.size)
+-        val reconstruction = File(directory, "iris26752_planb_reconstruction_${System.nanoTime()}.f32")
+-        val detail = File(directory, "iris26752_planb_detail_${System.nanoTime()}.r16f")
+-        val render = if (publicationScale > 1.5f) File(directory, "iris26752_planb_render_${System.nanoTime()}.rgb16f") else null
+-        val startNs = System.nanoTime()
+-        try {
+-            translations.forEachIndexed { ordinal, item ->
+-                val f = File(directory, "iris26752_planb_luma_${ordinal}_${System.nanoTime()}.f32")
+-                writePlanBLumaFrame26752(
+-                    images[item.evidence.frameIndex], item.evidence,
+-                    cropX, cropY, cropWidth, cropHeight, f,
+-                )
+-                lumaFiles += f
+-            }
+-            val weights = FloatArray(translations.size)
+-            val solverStats = LongArray(8)
+-            check(
+-                IrisTrue2xSrNative.reconstructPlanBIrls(
+-                    lumaFiles.map { it.absolutePath }.toTypedArray(), cropWidth, cropHeight,
+-                    outputWidth, outputHeight,
+-                    translations.map { it.dx }.toFloatArray(), translations.map { it.dy }.toFloatArray(),
+-                    reconstruction.absolutePath, weights, solverStats,
+-                )
+-            ) { "26752 Plan-B IRLS failed" }
+-            require(reconstruction.length() == outputWidth.toLong() * outputHeight * Float.SIZE_BYTES)
+-            val detailStats = LongArray(8)
+-            check(
+-                IrisTrue2xSrNative.buildPlanBDetail(
+-                    reconstruction.absolutePath, outputWidth, outputHeight,
+-                    guideFile.absolutePath, width, height,
+-                    cropX.toFloat(), cropY.toFloat(), scaleX, scaleY,
+-                    maxShiftX, maxShiftY, detail.absolutePath, detailStats,
+-                )
+-            ) { "26752 Plan-B detail publication failed" }
+-            require(detail.length() == outputWidth.toLong() * outputHeight * Short.SIZE_BYTES)
+-            if (render != null) {
+-                check(
+-                    IrisTrue2xSrNative.composePlanBRender(
+-                        guideFile.absolutePath, width, height,
+-                        detail.absolutePath, outputWidth, outputHeight,
+-                        cropX * scaleX, cropY * scaleY, scaleX, scaleY,
+-                        width * 2, height * 2, 2f, 2f, render.absolutePath,
+-                    )
+-                ) { "26752 Plan-B 2x render composition failed" }
+-                require(render.length() == width.toLong() * 2L * height.toLong() * 2L * TRUE2X_RGB16F_BYTES_PER_PIXEL)
+-            }
+-            val total = detailStats.getOrElse(0) { 0L }.coerceAtLeast(1L)
+-            val activePct = 100f * detailStats.getOrElse(1) { 0L }.toFloat() / total.toFloat()
+-            val strongPct = 100f * detailStats.getOrElse(2) { 0L }.toFloat() / total.toFloat()
+-            val iterations = solverStats.getOrElse(0) { 0L }.toInt()
+-            val originXF = cropX * scaleX
+-            val originYF = cropY * scaleY
+-            val proof = "paper=IPOL550 model=PURE_TRANSLATION_SHANNON_WLS_IRLS " +
+-                "frames=${translations.size} input=${cropWidth}x$cropHeight output=${outputWidth}x$outputHeight " +
+-                "scale=$scaleX,$scaleY sourceZoom=$highZoomSourceZoom publicationScale=$publicationScale " +
+-                "origin=$originXF,$originYF iterations=$iterations tukeyR=0.025 pinvEps=1e-9 irlsEtaFloor=0.01 irlsStop=1e-5 irlsMax=50 " +
+-                "activePct=$activePct strongPct=$strongPct highlightOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN " +
+-                "deviceGate=false lensState=$referenceLens weights=${weights.joinToString(",") { "%.5g".format(it) }}"
+-            PLog.i(SABRE_TAG, "IRIS_26752_IPOL_PLAN_B_PROOF $proof")
+-            MotionTrace.processingState("IRIS_26752_IPOL_PLAN_B_PROOF", proof)
+-            return PlanBReconstruction26752(
+-                detail = HighZoomDetailResult(
+-                    path = detail.absolutePath,
+-                    width = outputWidth,
+-                    height = outputHeight,
+-                    originX = kotlin.math.floor(originXF.toDouble()).toInt(),
+-                    originY = kotlin.math.floor(originYF.toDouble()).toInt(),
+-                    fullWidth = kotlin.math.round(width * scaleX).toInt(),
+-                    fullHeight = kotlin.math.round(height * scaleY).toInt(),
+-                    scaleX = scaleX,
+-                    scaleY = scaleY,
+-                    originXF = originXF,
+-                    originYF = originYF,
+-                    sourceZoom = highZoomSourceZoom,
+-                    activePct = activePct,
+-                    strongPct = strongPct,
+-                    refineAcceptedPct = 100f,
+-                    frames = translations.size,
+-                    reconstructionMs = (System.nanoTime() - startNs) / 1_000_000L,
+-                ),
+-                renderRgbPath = render?.absolutePath,
+-                iterations = iterations,
+-                weights = weights,
+-            )
+-        } catch (error: Throwable) {
+-            runCatching { detail.delete() }
+-            runCatching { render?.delete() }
+-            throw error
+-        } finally {
+-            lumaFiles.forEach { runCatching { it.delete() } }
+-            runCatching { reconstruction.delete() }
+-            runCatching { guideFile.delete() }
+-            if (render != null) runCatching { detail.delete() }
+-        }
+-    }
+-
+     private fun reconstructHighZoomDetail26718(
+         images: List<SafeImage>,
+         evidence: List<True2xFrameEvidence>,
+@@ -14348,25 +14060,7 @@ internal class GlesMgcRawSpatialStacker(
+             val stats=runHighZoomDetailGpu26718(images,evidence,output,nativeVgnGuideTexture,detailWidth,detailHeight,originX,originY,fullWidth,fullHeight)
+             val refined=evidence.filter { it.frameIndex!=0 }
+             val refinePct=if(refined.isEmpty())0f else refined.map{it.refineAcceptedPct}.average().toFloat()
+-            HighZoomDetailResult(
+-                path = output.absolutePath,
+-                width = detailWidth,
+-                height = detailHeight,
+-                originX = originX,
+-                originY = originY,
+-                fullWidth = fullWidth,
+-                fullHeight = fullHeight,
+-                scaleX = 2f,
+-                scaleY = 2f,
+-                originXF = originX.toFloat(),
+-                originYF = originY.toFloat(),
+-                sourceZoom = highZoomSourceZoom,
+-                activePct = stats.activePct,
+-                strongPct = stats.strongPct,
+-                refineAcceptedPct = refinePct,
+-                frames = evidence.size,
+-                reconstructionMs = elapsedMs(start),
+-            )
++            HighZoomDetailResult(output.absolutePath,detailWidth,detailHeight,originX,originY,fullWidth,fullHeight,highZoomSourceZoom,stats.activePct,stats.strongPct,refinePct,evidence.size,elapsedMs(start))
+         } catch(error:Throwable) {
+             runCatching { output.delete() }
+             throw error
+@@ -14379,62 +14073,6 @@ internal class GlesMgcRawSpatialStacker(
+         evidence: List<True2xFrameEvidence>,
+         nativeVgnGuideTexture: Int,
+         preserveLinearRgbForDng: Boolean,
+-    ): True2xResult {
+-        require(enableSabreSuperRes)
+-        val start = System.nanoTime()
+-        val planB = reconstructPlanB26752(
+-            frames = frames,
+-            images = images,
+-            evidence = evidence,
+-            nativeVgnGuideTexture = nativeVgnGuideTexture,
+-            publicationScale = 2f,
+-        )
+-        val renderPath = checkNotNull(planB.renderRgbPath) { "26752 Plan-B SR render carrier absent" }
+-        var dngPath: String? = null
+-        var phaseMean = 0f
+-        var phaseP10 = 0f
+-        if (preserveLinearRgbForDng) {
+-            /* IRIS_26752_DNG_OWNER_UNCHANGED
+-             * Plan B is scalar luma only and can never become a RAW/DNG authority. Re-run the exact
+-             * successful 26733 direct-CFA reconstruction only for the requested 2x DNG boundary;
+-             * its JPEG derivative is discarded and can never reach publication.
+-             */
+-            val dng = reconstructDirectTrue2x26733(
+-                frames, images, evidence, nativeVgnGuideTexture, preserveLinearRgbForDng = true,
+-            )
+-            dngPath = checkNotNull(dng.linearRgbPath)
+-            phaseMean = dng.phaseSupportMean
+-            phaseP10 = dng.phaseSupportP10
+-            dng.renderRgbPath?.let { runCatching { File(it).delete() } }
+-            dng.nativeVgnGuidePath?.let { runCatching { File(it).delete() } }
+-            dng.phaseSupportPath?.let { runCatching { File(it).delete() } }
+-        }
+-        val proof = "backend=PLAN_B_IPOL550 render=true dngRequested=$preserveLinearRgbForDng " +
+-            "dngOwner=${if (preserveLinearRgbForDng) "DIRECT_CFA_26733" else "NONE"} " +
+-            "rgbChromaOwner=NATIVE_SABRE_VGN lumaOwner=IPOL_PLAN_B_IRLS iterations=${planB.iterations} " +
+-            "highlightFlattenedProtection=UNCHANGED"
+-        PLog.i(SABRE_TAG, "IRIS_26752_PLAN_B_SR_READY $proof")
+-        MotionTrace.processingState("IRIS_26752_PLAN_B_SR_READY", proof)
+-        return True2xResult(
+-            linearRgbPath = dngPath,
+-            renderRgbPath = renderPath,
+-            nativeVgnGuidePath = null,
+-            phaseSupportPath = null,
+-            width = width * 2,
+-            height = height * 2,
+-            backend = "PLAN_B",
+-            phaseSupportMean = phaseMean,
+-            phaseSupportP10 = phaseP10,
+-            reconstructionMs = elapsedMs(start),
+-        )
+-    }
+-
+-    private fun reconstructDirectTrue2x26733(
+-        frames: List<RawStackFrame>,
+-        images: List<SafeImage>,
+-        evidence: List<True2xFrameEvidence>,
+-        nativeVgnGuideTexture: Int,
+-        preserveLinearRgbForDng: Boolean,
+     ): True2xResult {
+         require(enableSabreSuperRes)
+         require(evidence.isNotEmpty()) { "True2x has no NORMAL Sabre evidence" }
+@@ -14523,7 +14161,6 @@ internal class GlesMgcRawSpatialStacker(
+         private const val TRUE2X_REFINE_CELL_RAW_PIXELS = 16
+         private const val TRUE2X_JPEG_EVIDENCE_PER_PHASE = 2
+         private const val TRUE2X_JPEG_MAX_EVIDENCE = 4 * TRUE2X_JPEG_EVIDENCE_PER_PHASE
+-        private const val PLAN_B_MAX_EVIDENCE_26752 = 9
+         private const val TRUE2X_GPU_MIN_TEXTURE_SIZE = 1024
+         private const val TRUE2X_RAW_RBF_HALO = 4f
+         private const val TRUE2X_EVIDENCE_HALO = 2
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+index 091e7b56e682b8d81e7309694a46b642e762baff..f4c6470141e3895fc8d61940ad6b05950aeed915 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+@@ -115,11 +115,6 @@ data class RawStackResult(
+     val highZoomDetailOriginY: Int = 0,
+     val highZoomDetailFullWidth: Int = 0,
+     val highZoomDetailFullHeight: Int = 0,
+-    /* IRIS_26752_IPOL_PLAN_B_EXACT_GEOMETRY */
+-    val highZoomDetailScaleX: Float = 1f,
+-    val highZoomDetailScaleY: Float = 1f,
+-    val highZoomDetailOriginXF: Float = 0f,
+-    val highZoomDetailOriginYF: Float = 0f,
+     val highZoomDetailSourceZoom: Float = 1f,
+     val highZoomDetailActivePct: Float = 0f,
+     val highZoomDetailStrongPct: Float = 0f,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index a9d4f8a5bc6a00bce50f52d552cb5f57caf27dab..a16def23b543e94cef767ccdedff1517bf802565 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -366,12 +366,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private static final long MOTION_26724_NORMAL_ATTEMPT_WATCHDOG_MS = 900L;
+     private static final long MOTION_26724_LONG_ATTEMPT_WATCHDOG_MS = 1400L;
+     private static final long MOTION_26724_RETRY_BACKOFF_MS = 80L;
+-    /* IRIS_26752_CAPTURE_TRANSACTION_RACE_FIX
+-     * ImageReader may deliver a still RAW a few milliseconds before Camera2 publishes the exact
+-     * onCaptureStarted sensor timestamp that owns it. Keep only a tiny bounded staging window;
+-     * exact timestamp equality is still mandatory before the RAW can satisfy a logical slot. */
+-    private static final long MOTION_26752_EARLY_NORMAL_RAW_STAGING_MS = 150L;
+-    private static final int MOTION_26752_EARLY_NORMAL_RAW_LIMIT = 4;
+     private static final long MOTION_26593_AUX_COMPLETION_MS = 1200L;
+ 
+     private static int iris26556RequestedMotionFrames() {
+@@ -519,25 +513,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                                     + " repeatingRingAdmission=false");
+                             continue;
+                         }
+-                        /* IRIS_26752_EARLY_NORMAL_RAW_TIMESTAMP_STAGING
+-                         * Do not discard a still RAW solely because ImageReader won the callback
+-                         * ordering race against onCaptureStarted. The staged Image is unusable until
+-                         * a live ticket claims the exact same sensor timestamp; unrelated repeating
+-                         * RAWs simply expire/close and never enter the capture. */
+-                        if (iris26598SameGeneration && iris26598Plan.stageEarlyTopUpRaw(img)) {
+-                            final long iris26752EarlyTs = img.getTimestamp();
+-                            Log.i(TAG, "IRIS_26752_EARLY_NORMAL_RAW_STAGED timestamp="
+-                                    + iris26752EarlyTs
+-                                    + " exactTimestampOwnerPending=true"
+-                                    + " repeatingRingAdmission=false");
+-                            Handler iris26752Handler = mBackgroundHandler;
+-                            if (iris26752Handler != null) {
+-                                iris26752Handler.postDelayed(
+-                                        () -> iris26598Plan.expireStagedTopUpRaw(iris26752EarlyTs),
+-                                        MOTION_26752_EARLY_NORMAL_RAW_STAGING_MS);
+-                            }
+-                            continue;
+-                        }
+                         if (iris26489ShortCandidateCopied) {
+                             Log.d(TAG, "IRIS_26489_SHORT_RAW_SURVIVED_EARLY_CLOSE timestamp="
+                                     + img.getTimestamp());
+@@ -8608,10 +8583,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             rawImage = image;
+             return true;
+         }
+-        synchronized boolean awaitsTimestampOwnership() {
+-            return !retired && !failed && rawImage == null && submittedElapsedMs > 0L
+-                    && expectedTimestampNs() <= 0L;
+-        }
+         synchronized boolean isReady() {
+             return !retired && !failed && completed && exposureAccepted && result != null && rawImage != null
+                     && resultTimestampNs > 0L && rawImage.getTimestamp() == resultTimestampNs;
+@@ -8635,18 +8606,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+     }
+ 
+-    private static final class Motion26752EarlyNormalRaw {
+-        final Image image;
+-        final long stagedElapsedMs;
+-        Motion26752EarlyNormalRaw(Image image, long stagedElapsedMs) {
+-            this.image = image;
+-            this.stagedElapsedMs = stagedElapsedMs;
+-        }
+-        void close() {
+-            if (image != null) try { image.close(); } catch (Throwable ignored) {}
+-        }
+-    }
+-
+     private static final class Motion26598NormalTopUpTag {
+         final Motion26598NormalTopUpTicket ticket;
+         Motion26598NormalTopUpTag(Motion26598NormalTopUpTicket ticket) {
+@@ -8668,10 +8627,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         volatile long normalReferenceTimestampNs;
+         final long normalTargetExposureNs;
+         final int normalTargetIso;
+-        /* IRIS_26752_FROZEN_NORMAL_REQUEST_MODE
+-         * Whether HAL AE already matched the NORMAL target is shutter-time evidence. A later
+-         * manually-produced top-up result must never mutate retries back to AE_LOCK. */
+-        final boolean normalTargetMatchedHalAtShutter;
+         final double normalTargetEnergy;
+         final float normalTargetOffsetEv;
+         final long startElapsedMs;
+@@ -8685,8 +8640,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final ArrayList<Image> preShutterNormalImages = new ArrayList<>();
+         final HashMap<Long, TotalCaptureResult> ownedNormalResults = new HashMap<>();
+         final ArrayList<Motion26598NormalTopUpTicket> normalTopUpTickets = new ArrayList<>();
+-        final java.util.LinkedHashMap<Long, Motion26752EarlyNormalRaw> stagedEarlyTopUpRaws =
+-                new java.util.LinkedHashMap<>();
+         /* IRIS_26670_CAPTURE_TRANSACTION_PREVIEW_RESTORE */
+         volatile boolean livePreviewRestoreAttempted = false;
+         volatile boolean livePreviewRestoredAfterCaptureLocalRequests = false;
+@@ -8695,8 +8648,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 boolean shortExpected, boolean longExpected,
+                 Motion26486ShortTicket shortTicket, Motion26505LongTicket longTicket,
+                 TotalCaptureResult normalReferenceResult, long normalReferenceTimestampNs,
+-                long normalTargetExposureNs, int normalTargetIso,
+-                boolean normalTargetMatchedHalAtShutter, float normalTargetOffsetEv,
++                long normalTargetExposureNs, int normalTargetIso, float normalTargetOffsetEv,
+                 long startElapsedMs, long completionTimeoutMs,
+                 Motion26598PreShutterNormals preShutter,
+                 long cameraHealthGeneration, String physicalCameraId,
+@@ -8711,7 +8663,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             this.normalReferenceTimestampNs = normalReferenceTimestampNs;
+             this.normalTargetExposureNs = normalTargetExposureNs;
+             this.normalTargetIso = normalTargetIso;
+-            this.normalTargetMatchedHalAtShutter = normalTargetMatchedHalAtShutter;
+             this.normalTargetEnergy = (double) normalTargetExposureNs * (double) normalTargetIso;
+             this.normalTargetOffsetEv = normalTargetOffsetEv;
+             this.startElapsedMs = startElapsedMs;
+@@ -8751,53 +8702,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             }
+             return false;
+         }
+-        synchronized boolean stageEarlyTopUpRaw(Image image) {
+-            if (image == null || image.getTimestamp() <= 0L) return false;
+-            boolean ownerPending = false;
+-            for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
+-                if (ticket != null && ticket.awaitsTimestampOwnership()) {
+-                    ownerPending = true;
+-                    break;
+-                }
+-            }
+-            if (!ownerPending || stagedEarlyTopUpRaws.containsKey(image.getTimestamp())) return false;
+-            while (stagedEarlyTopUpRaws.size() >= MOTION_26752_EARLY_NORMAL_RAW_LIMIT) {
+-                java.util.Iterator<Map.Entry<Long, Motion26752EarlyNormalRaw>> it =
+-                        stagedEarlyTopUpRaws.entrySet().iterator();
+-                if (!it.hasNext()) break;
+-                Map.Entry<Long, Motion26752EarlyNormalRaw> oldest = it.next();
+-                it.remove();
+-                if (oldest.getValue() != null) oldest.getValue().close();
+-            }
+-            stagedEarlyTopUpRaws.put(image.getTimestamp(),
+-                    new Motion26752EarlyNormalRaw(image, android.os.SystemClock.elapsedRealtime()));
+-            return true;
+-        }
+-        synchronized boolean claimStagedTopUpRaw(
+-                Motion26598NormalTopUpTicket ticket, long timestampNs) {
+-            if (ticket == null || timestampNs <= 0L || ticket.retired || ticket.failed) return false;
+-            Motion26752EarlyNormalRaw staged = stagedEarlyTopUpRaws.remove(timestampNs);
+-            if (staged == null || staged.image == null) return false;
+-            if (ticket.offerRaw(staged.image)) return true;
+-            staged.close();
+-            return false;
+-        }
+-        synchronized void expireStagedTopUpRaw(long timestampNs) {
+-            Motion26752EarlyNormalRaw staged = stagedEarlyTopUpRaws.get(timestampNs);
+-            if (staged == null) return;
+-            long ageMs = android.os.SystemClock.elapsedRealtime() - staged.stagedElapsedMs;
+-            if (ageMs < MOTION_26752_EARLY_NORMAL_RAW_STAGING_MS) return;
+-            stagedEarlyTopUpRaws.remove(timestampNs);
+-            staged.close();
+-            Log.d(TAG, "IRIS_26752_EARLY_NORMAL_RAW_EXPIRED timestamp=" + timestampNs
+-                    + " ageMs=" + ageMs + " exactTimestampOwnerNeverArrived=true");
+-        }
+-        synchronized void closeStagedEarlyTopUpRaws() {
+-            for (Motion26752EarlyNormalRaw staged : stagedEarlyTopUpRaws.values()) {
+-                if (staged != null) staged.close();
+-            }
+-            stagedEarlyTopUpRaws.clear();
+-        }
+         synchronized void recordTopUpResult(Motion26598NormalTopUpTicket ticket,
+                 TotalCaptureResult result) {
+             if (ticket == null || result == null || ticket.retired || ticket.failed
+@@ -8862,7 +8766,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return ownedNormalResults.get(timestampNs);
+         }
+         synchronized List<Image> takeOwnedNormalImages() {
+-            closeStagedEarlyTopUpRaws();
+             ArrayList<Image> out = new ArrayList<>(normalTargetFrames);
+             out.addAll(preShutterNormalImages);
+             preShutterNormalImages.clear();
+@@ -8882,7 +8785,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             for (Motion26598NormalTopUpTicket ticket : normalTopUpTickets) {
+                 if (ticket != null) ticket.closeRaw();
+             }
+-            closeStagedEarlyTopUpRaws();
+             ownedNormalResults.clear();
+         }
+     }
+@@ -9245,7 +9147,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         Boolean aeLockAvailable = mCameraCharacteristics == null ? null
+                 : mCameraCharacteristics.get(CameraCharacteristics.CONTROL_AE_LOCK_AVAILABLE);
+         final boolean halEquivalent = Boolean.TRUE.equals(aeLockAvailable)
+-                && plan.normalTargetMatchedHalAtShutter;
++                && plan.normalReferenceResult != null
++                && motion26713ResultMatchesTarget(
++                        plan.normalReferenceResult, plan.normalTargetExposureNs, plan.normalTargetIso);
+         if (!manual && !Boolean.TRUE.equals(aeLockAvailable)) {
+             throw new IllegalStateException("NORMAL_TOPUP_SENSOR_CONTROL_UNAVAILABLE");
+         }
+@@ -9312,11 +9216,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     return;
+                 }
+                 ticket.captureStartedTimestampNs = timestamp;
+-                boolean iris26752EarlyRawClaimed = plan.claimStagedTopUpRaw(ticket, timestamp);
+                 Log.i(TAG, "IRIS_26724_NORMAL_ATTEMPT_STARTED slot=" + ticket.ordinal
+                         + " attempt=" + ticket.attempt + " sensorTimestamp=" + timestamp
+-                        + " frameNumber=" + frameNumber
+-                        + " earlyRawClaimed=" + iris26752EarlyRawClaimed);
++                        + " frameNumber=" + frameNumber);
+             }
+             @Override public void onCaptureCompleted(@NonNull CameraCaptureSession session,
+                     @NonNull CaptureRequest request, @NonNull TotalCaptureResult result) {
+@@ -9336,12 +9238,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     return;
+                 }
+                 ticket.resultTimestampNs = ts;
+-                boolean iris26752ResultEarlyRawClaimed = plan.claimStagedTopUpRaw(ticket, ts);
+-                if (iris26752ResultEarlyRawClaimed) {
+-                    Log.i(TAG, "IRIS_26752_EARLY_NORMAL_RAW_CLAIMED_BY_RESULT slot="
+-                            + ticket.ordinal + " attempt=" + ticket.attempt
+-                            + " sensorTimestamp=" + ts);
+-                }
+                 if (ticket.captureStartedTimestampNs > 0L
+                         && ticket.captureStartedTimestampNs != ts) {
+                     markMotion26724NormalAttemptFailed(ticket, "TIMESTAMP_MISMATCH", ts);
+@@ -9440,8 +9336,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     mBackgroundHandler);
+             Log.i(TAG, "IRIS_26724_NORMAL_INITIAL_BURST_SUBMITTED count=" + missingNormals
+                     + " exposureNs=" + plan.normalTargetExposureNs + " iso=" + plan.normalTargetIso
+-                    + " requestModeFrozenAtShutter="
+-                    + (plan.normalTargetMatchedHalAtShutter ? "AE_LOCK" : "MANUAL_WHEN_AVAILABLE")
+                     + " previewRepeatingRequestMutated=false logicalSlotsRetryable=true");
+             return true;
+         } catch (CameraAccessException | IllegalArgumentException | IllegalStateException e) {
+@@ -10132,8 +10026,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 iris26486ShortTicket, iris26505LongTicket,
+                 iris26713TargetMatchesHal ? iris26593NormalReference : null,
+                 iris26713TargetMatchesHal && iris26593ReferenceTs != null ? iris26593ReferenceTs : 0L,
+-                iris26713NormalTargetExp, iris26713NormalTargetIso,
+-                iris26713TargetMatchesHal, iris26713NormalTargetOffsetEv,
++                iris26713NormalTargetExp, iris26713NormalTargetIso, iris26713NormalTargetOffsetEv,
+                 iris26593StartMs, iris26593TimeoutMs,
+                 iris26598PreShutterNormals, mIris26548CameraHealthGeneration, physicalID,
+                 mPreviewAFMode, mFocus);
+@@ -10170,8 +10063,6 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + " captureDomainOnly=true previewRepeatingMutated=false"
+                         + " preShutterNormalsGenerationOwned=true"
+                         + " postShutterNormalsTicketOwned=true"
+-                        + " earlyRawTimestampRaceStaging=true"
+-                        + " normalRequestModeFrozenAtShutter=true"
+                         + " superResCaptureBudgetOwner=false"
+                         + " exactTotalRequired=true"
+                         + " livePreviewOwner=SUCCESSFUL_26660_HAL_USER_AE"
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
+index 94cea79440b42d9ae76fd1ac338d3d8af4c6d3fa..1f3d72055cf5f7d7690d97cf4410e1cd0e2e1850 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
+@@ -73,51 +73,6 @@ public final class IrisTrue2xSrNative {
+             String phaseSupportPath, int regionX, int regionY, int regionWidth, int regionHeight,
+             ByteBuffer outputRgba16f, long[] detailStats);
+ 
+-
+-    /** IRIS_26752_IPOL_PLAN_B_INPUT
+-     * Resolve one unwarped NORMAL RAW tile to scalar linear camera-luma on the native grid.
+-     * No flow is applied here: the paper's translation operator owns registration.
+-     */
+-    public static native boolean writePlanBLumaTile(
+-            String outputF32Path, int outputWidth, int outputHeight,
+-            int tileX, int tileY, int tileWidth, int tileHeight,
+-            int sampleOriginX, int sampleOriginY,
+-            ByteBuffer raw16, int rawOriginX, int rawOriginY, int rawRegionWidth, int rawRegionHeight,
+-            int rawRowStrideSamples,
+-            ByteBuffer covarianceRgb10a2, int covarianceOriginX, int covarianceOriginY,
+-            int covarianceRegionWidth, int covarianceRegionHeight, int covarianceFullWidth, int covarianceFullHeight,
+-            int fullRawWidth, int fullRawHeight, int cfaPattern,
+-            float[] gains, float[] blackTerms, float[] covarianceRangeRg, float[] covarianceRangeB,
+-            float[] cameraDomainScale, float[] lensShading, int lensShadingWidth, int lensShadingHeight);
+-
+-    /**
+-     * Exact IPOL Plan-B core: modified-Tukey apodization plus Fourier-domain direct weighted
+-     * least-squares, iterated with the paper's l1-l2 IRLS update. Output is float32 linear luma.
+-     */
+-    public static native boolean reconstructPlanBIrls(
+-            String[] lumaF32Paths, int inputWidth, int inputHeight,
+-            int outputWidth, int outputHeight, float[] shiftX, float[] shiftY,
+-            String outputF32Path, float[] finalWeights, long[] stats);
+-
+-    /**
+-     * Convert the absolute Plan-B luma result to a bounded R16F log2 luminance sidecar against
+-     * the untouched native Sabre/VGN guide. Existing signal/highlight/agreement safety gates remain
+-     * authoritative; the modified-Tukey border is fail-closed to zero detail.
+-     */
+-    public static native boolean buildPlanBDetail(
+-            String reconstructedLumaF32Path, int reconstructedWidth, int reconstructedHeight,
+-            String nativeVgnRgb16fPath, int nativeWidth, int nativeHeight,
+-            float sourceOriginX, float sourceOriginY, float scaleX, float scaleY,
+-            float maxAbsShiftX, float maxAbsShiftY, String detailR16fPath, long[] detailStats);
+-
+-    /** Build a full publication RGB16F carrier from native Sabre/VGN RGB and Plan-B luma detail. */
+-    public static native boolean composePlanBRender(
+-            String nativeVgnRgb16fPath, int nativeWidth, int nativeHeight,
+-            String detailR16fPath, int detailWidth, int detailHeight,
+-            float detailOriginX, float detailOriginY, float detailScaleX, float detailScaleY,
+-            int outputWidth, int outputHeight, float publicationScaleX, float publicationScaleY,
+-            String outputRgb16fPath);
+-
+     /** Pack the requested interior of an RGBA16F region into a disk-backed RGB16F render carrier. */
+     public static native boolean writeRenderTileInterior(
+             String outputRgb16fPath, int fullWidth, int fullHeight,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index ac9a77a92d6369b6353c9fc77d165ad6e88aaae2..ace56959ddb38627446406d5a0aefffdfa7a73c3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1064,9 +1064,8 @@ public final class MotionV2Render extends Node {
+                 try { java.nio.file.Files.deleteIfExists(file.toPath()); } catch (Throwable ignored) {}
+             }
+             p.motionV2HighZoomDetailPath = null;
+-            Log.i(Name, "IRIS_26752_PLAN_B_DETAIL_TEXTURE_LOADED size=" + w + "x" + h +
+-                    " origin=" + p.motionV2HighZoomDetailOriginXF + "," + p.motionV2HighZoomDetailOriginYF +
+-                    " scale=" + p.motionV2HighZoomDetailScaleX + "," + p.motionV2HighZoomDetailScaleY +
++            Log.i(Name, "IRIS_26718_HIGH_ZOOM_DETAIL_TEXTURE_LOADED size=" + w + "x" + h +
++                    " origin=" + p.motionV2HighZoomDetailOriginX + "," + p.motionV2HighZoomDetailOriginY +
+                     " activePct=" + p.motionV2HighZoomDetailActivePct +
+                     " strongPct=" + p.motionV2HighZoomDetailStrongPct +
+                     " refineAcceptedPct=" + p.motionV2HighZoomRefineAcceptedPct +
+@@ -1152,13 +1151,19 @@ public final class MotionV2Render extends Node {
+                 + " product=" + (reconstructionZoom * irisOutputZoom));
+         GLTexture iris26718HighZoomDetail = iris26718LoadHighZoomDetail();
+         final boolean iris26718HighZoomDetailEnabled = iris26718HighZoomDetail != null;
+-        /* IRIS_26752_PLAN_B_FAIL_CLOSED_RENDER
+-         * Plan B is optional luma evidence from local 1.10x upward. If translation/SR proof fails,
+-         * native Sabre/VGN renders normally with zero overlay. The retired direct-CFA high-zoom
+-         * RGB owner is forbidden so Plan B can never replace RGB/chroma/highlight ownership.
+-         */
+-        if (basePipeline.mParameters.motionV2HighZoomRgbApplied) {
+-            throw new IllegalStateException("26752 direct-CFA high-zoom RGB owner must remain disabled");
++        if (basePipeline.mParameters.motionV2Active &&
++                !basePipeline.mParameters.irisNightActive &&
++                basePipeline.mParameters.motionV2GlobalZoom >= 20.0f &&
++                basePipeline.mParameters.motionV2OutputZoom > 1.00001f &&
++                !basePipeline.mParameters.motionV2SuperResOutputEnabled &&
++                !iris26718HighZoomDetailEnabled &&
++                !basePipeline.mParameters.motionV2HighZoomRgbApplied) {
++            throw new IllegalStateException("26720 high-zoom route active without RGB owner or 26719 scalar fallback");
++        }
++        if (basePipeline.mParameters.motionV2HighZoomRgbApplied &&
++                (Math.abs(basePipeline.mParameters.motionV2RenderResidualZoom - 1.0f) > 1.0e-5f ||
++                 iris26718HighZoomDetailEnabled)) {
++            throw new IllegalStateException("26720 RGB high-zoom must own crop exactly once");
+         }
+         final boolean iris26702LocalLaplacianEnabled =
+                 basePipeline.mParameters.motionV2Active
+@@ -1200,17 +1205,9 @@ public final class MotionV2Render extends Node {
+             iris26653SetFinalToneUniforms();
+             glProg.setVar("irisOutputZoom", irisOutputZoom);
+             glProg.setVar("iris26718HighZoomDetailEnabled", iris26718HighZoomDetailEnabled ? 1 : 0);
+-            glProg.setVar("iris26752PlanBDetailScale",
+-
+-                    basePipeline.mParameters.motionV2HighZoomDetailScaleX,
+-
+-                    basePipeline.mParameters.motionV2HighZoomDetailScaleY);
+-
+-            glProg.setVar("iris26752PlanBDetailOrigin",
+-
+-                    basePipeline.mParameters.motionV2HighZoomDetailOriginXF,
+-
+-                    basePipeline.mParameters.motionV2HighZoomDetailOriginYF);
++            glProg.setVar("iris26718HighZoomDetailOrigin", new Point(
++                    basePipeline.mParameters.motionV2HighZoomDetailOriginX,
++                    basePipeline.mParameters.motionV2HighZoomDetailOriginY));
+             if (iris26718HighZoomDetailEnabled) {
+                 glProg.setTexture("iris26718HighZoomDetail", iris26718HighZoomDetail);
+             }
+@@ -1287,17 +1284,9 @@ public final class MotionV2Render extends Node {
+ 
+                 glProg.setVar("irisOutputZoom", irisOutputZoom);
+                 glProg.setVar("iris26718HighZoomDetailEnabled", iris26718HighZoomDetailEnabled ? 1 : 0);
+-                glProg.setVar("iris26752PlanBDetailScale",
+-
+-                        basePipeline.mParameters.motionV2HighZoomDetailScaleX,
+-
+-                        basePipeline.mParameters.motionV2HighZoomDetailScaleY);
+-
+-                glProg.setVar("iris26752PlanBDetailOrigin",
+-
+-                        basePipeline.mParameters.motionV2HighZoomDetailOriginXF,
+-
+-                        basePipeline.mParameters.motionV2HighZoomDetailOriginYF);
++                glProg.setVar("iris26718HighZoomDetailOrigin", new Point(
++                        basePipeline.mParameters.motionV2HighZoomDetailOriginX,
++                        basePipeline.mParameters.motionV2HighZoomDetailOriginY));
+                 if (iris26718HighZoomDetailEnabled) {
+                     glProg.setTexture("iris26718HighZoomDetail", iris26718HighZoomDetail);
+                 }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 190e7ed027c535820e24484128e81de0c6190df2..09ef5ca0694d58d657d64c163163d6409159a4e4 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -398,13 +398,12 @@ object PhotonMotionMgc1271Bridge {
+             val sabreSuperResEnabled = parameters.motionV2SuperResOutputEnabled
+             val sabreSuperResOutputScale = if (sabreSuperResEnabled) 2f else 1f
+             parameters.motionV2SuperResOutputScale = sabreSuperResOutputScale
+-            /* IRIS_26752_LENS_RELATIVE_PLAN_B_1P1X
+-             * Device-independent, physical-lens-relative activation. Every optical owner uses the
+-             * same Plan-B luma solver from local 1.10x upward; Super Res uses the same solver via
+-             * its dedicated 2x publication route. Sabre/VGN remains RGB/chroma/highlight owner.
++            /* IRIS_26718_NORMAL_20X_HIGH_ZOOM_OWNER
++             * Normal Motion only. This is not the Super Res publication route: native Sabre/VGN
++             * remains RGB/chroma authority and the new sidecar carries only support-gated luma detail.
+              */
+             val highZoomDetailEnabled = parameters.motionV2Active && !parameters.irisNightActive &&
+-                !sabreSuperResEnabled && localOutputZoom >= 1.10f
++                !sabreSuperResEnabled && displayedGlobalZoom >= 20f && localOutputZoom > 1.00001f
+             parameters.motionV2HighZoomDetailPath = null
+             parameters.motionV2HighZoomDetailWidth = 0
+             parameters.motionV2HighZoomDetailHeight = 0
+@@ -412,10 +411,6 @@ object PhotonMotionMgc1271Bridge {
+             parameters.motionV2HighZoomDetailOriginY = 0
+             parameters.motionV2HighZoomDetailFullWidth = 0
+             parameters.motionV2HighZoomDetailFullHeight = 0
+-            parameters.motionV2HighZoomDetailScaleX = 1f
+-            parameters.motionV2HighZoomDetailScaleY = 1f
+-            parameters.motionV2HighZoomDetailOriginXF = 0f
+-            parameters.motionV2HighZoomDetailOriginYF = 0f
+             parameters.motionV2HighZoomDetailSourceZoom = localOutputZoom
+             parameters.motionV2HighZoomDetailActivePct = 0f
+             parameters.motionV2HighZoomDetailStrongPct = 0f
+@@ -441,11 +436,10 @@ object PhotonMotionMgc1271Bridge {
+             parameters.motionV2HighZoomRgbApplied = false
+             val referenceStackFrame = frames.firstOrNull { it.frameNumber == mgcBase.motionV2FrameNumber } ?: frames.first()
+             val highZoomActivation = "enabled=$highZoomDetailEnabled displayedGlobalZoom=$displayedGlobalZoom " +
+-                "localOutputZoom=$localOutputZoom localThreshold=1.10 opticalAnchor=${parameters.motionV2OpticalZoomAnchor} " +
+-                "superResRequested=$sabreSuperResEnabled focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} " +
+-                "lensState=${referenceStackFrame.lensState} rgbOwner=NATIVE_SABRE_VGN " +
+-                "lumaDetailOwner=${if (highZoomDetailEnabled || sabreSuperResEnabled) "IPOL_PLAN_B_IRLS" else "NATIVE"} " +
+-                "deviceGate=false cleanNativeFallback=true"
++                "localOutputZoom=$localOutputZoom threshold=20.0 superResRequested=$sabreSuperResEnabled " +
++                "focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} lensState=${referenceStackFrame.lensState} " +
++                "rgbOwner=${if (highZoomDetailEnabled) "DIRECT_CFA_2X_WITH_CLEAN_NATIVE_SABRE_VGN_FALLBACK" else "NATIVE_SABRE_VGN"} " +
++                "scalar26719Fallback=false cleanNativeFallback=true"
+             PLog.i(TAG, "IRIS_26718_HIGH_ZOOM_ACTIVATION $highZoomActivation")
+             MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_ACTIVATION", highZoomActivation)
+             PLog.i(TAG, "IRIS_26564_TRUE_2X_SR_DNG_AUTHORITY " +
+@@ -500,13 +494,43 @@ object PhotonMotionMgc1271Bridge {
+             highZoomDetailPathForCleanup = stacked.highZoomDetailPath
+             highZoomRgbPathForCleanup = stacked.highZoomRgbPath
+             if (highZoomDetailEnabled) {
+-                requireParity(stacked.highZoomRgbPath == null, "26752 Plan-B must never publish high-zoom RGB/chroma")
+-                if (stacked.highZoomDetailPath != null) {
++                if (stacked.highZoomRgbPath != null) {
++                    requireParity(stacked.highZoomDetailPath == null, "26720 RGB success must not also publish scalar sidecar")
++                    requireParity(stacked.highZoomRgbWidth > 0 && stacked.highZoomRgbHeight > 0 &&
++                        stacked.highZoomRgbFullWidth == size.x * 2 && stacked.highZoomRgbFullHeight == size.y * 2,
++                        "26720 invalid high-zoom RGB geometry")
++                    requireParity(kotlin.math.abs(stacked.highZoomRgbSourceZoom - localOutputZoom) < 1.0e-5f,
++                        "26720 high-zoom RGB source zoom mismatch")
++                    parameters.motionV2HighZoomRgbPath = stacked.highZoomRgbPath
++                    parameters.motionV2HighZoomRgbWidth = stacked.highZoomRgbWidth
++                    parameters.motionV2HighZoomRgbHeight = stacked.highZoomRgbHeight
++                    parameters.motionV2HighZoomRgbOriginX = stacked.highZoomRgbOriginX
++                    parameters.motionV2HighZoomRgbOriginY = stacked.highZoomRgbOriginY
++                    parameters.motionV2HighZoomRgbFullWidth = stacked.highZoomRgbFullWidth
++                    parameters.motionV2HighZoomRgbFullHeight = stacked.highZoomRgbFullHeight
++                    parameters.motionV2HighZoomRgbSourceZoom = stacked.highZoomRgbSourceZoom
++                    parameters.motionV2HighZoomRgbActivePct = stacked.highZoomRgbActivePct
++                    parameters.motionV2HighZoomRgbFullColorPct = stacked.highZoomRgbFullColorPct
++                    parameters.motionV2HighZoomRgbPhaseMean = stacked.highZoomRgbPhaseMean
++                    parameters.motionV2HighZoomRgbPhaseP10 = stacked.highZoomRgbPhaseP10
++                    parameters.motionV2HighZoomRgbRefineAcceptedPct = stacked.highZoomRgbRefineAcceptedPct
++                    parameters.motionV2HighZoomRgbFrames = stacked.highZoomRgbFrames
++                    parameters.motionV2HighZoomRgbReconstructionMs = stacked.highZoomRgbReconstructionMs
++                    parameters.motionV2HighZoomRgbPrepared = true
++                    parameters.motionV2ReconstructionZoom = localOutputZoom
++                    parameters.motionV2RenderResidualZoom = 1f
++                    val handoff = "path=true size=${stacked.highZoomRgbWidth}x${stacked.highZoomRgbHeight} " +
++                        "origin=${stacked.highZoomRgbOriginX},${stacked.highZoomRgbOriginY} full=${stacked.highZoomRgbFullWidth}x${stacked.highZoomRgbFullHeight} " +
++                        "sourceZoom=${stacked.highZoomRgbSourceZoom} frames=${stacked.highZoomRgbFrames} activePct=${stacked.highZoomRgbActivePct} " +
++                        "fullColorPct=${stacked.highZoomRgbFullColorPct} phaseMean=${stacked.highZoomRgbPhaseMean} phaseP10=${stacked.highZoomRgbPhaseP10} " +
++                        "refineAcceptedPct=${stacked.highZoomRgbRefineAcceptedPct} ms=${stacked.highZoomRgbReconstructionMs}"
++                    PLog.i(TAG, "IRIS_26720_HIGH_ZOOM_RGB_HANDOFF $handoff")
++                    MotionTrace.processingState("IRIS_26720_HIGH_ZOOM_RGB_HANDOFF", handoff)
++                } else {
++                    requireParity(stacked.highZoomDetailPath != null, "26720 high-zoom has neither RGB nor 26719 scalar fallback")
+                     requireParity(stacked.highZoomDetailWidth > 0 && stacked.highZoomDetailHeight > 0 &&
+-                        stacked.highZoomDetailScaleX >= 1f && stacked.highZoomDetailScaleY >= 1f,
+-                        "26752 invalid Plan-B detail geometry")
+-                    requireParity(kotlin.math.abs(stacked.highZoomDetailSourceZoom - localOutputZoom) < 1.0e-5f,
+-                        "26752 Plan-B source zoom mismatch")
++                        stacked.highZoomDetailFullWidth == size.x * 2 && stacked.highZoomDetailFullHeight == size.y * 2,
++                        "26720 invalid scalar fallback geometry")
+                     parameters.motionV2HighZoomDetailPath = stacked.highZoomDetailPath
+                     parameters.motionV2HighZoomDetailWidth = stacked.highZoomDetailWidth
+                     parameters.motionV2HighZoomDetailHeight = stacked.highZoomDetailHeight
+@@ -514,33 +538,18 @@ object PhotonMotionMgc1271Bridge {
+                     parameters.motionV2HighZoomDetailOriginY = stacked.highZoomDetailOriginY
+                     parameters.motionV2HighZoomDetailFullWidth = stacked.highZoomDetailFullWidth
+                     parameters.motionV2HighZoomDetailFullHeight = stacked.highZoomDetailFullHeight
+-                    parameters.motionV2HighZoomDetailScaleX = stacked.highZoomDetailScaleX
+-                    parameters.motionV2HighZoomDetailScaleY = stacked.highZoomDetailScaleY
+-                    parameters.motionV2HighZoomDetailOriginXF = stacked.highZoomDetailOriginXF
+-                    parameters.motionV2HighZoomDetailOriginYF = stacked.highZoomDetailOriginYF
+                     parameters.motionV2HighZoomDetailSourceZoom = stacked.highZoomDetailSourceZoom
+                     parameters.motionV2HighZoomDetailActivePct = stacked.highZoomDetailActivePct
+                     parameters.motionV2HighZoomDetailStrongPct = stacked.highZoomDetailStrongPct
+                     parameters.motionV2HighZoomRefineAcceptedPct = stacked.highZoomRefineAcceptedPct
+                     parameters.motionV2HighZoomDetailFrames = stacked.highZoomDetailFrames
+                     parameters.motionV2HighZoomDetailReconstructionMs = stacked.highZoomDetailReconstructionMs
+-                    val handoff = "path=true size=${stacked.highZoomDetailWidth}x${stacked.highZoomDetailHeight} " +
+-                        "origin=${stacked.highZoomDetailOriginXF},${stacked.highZoomDetailOriginYF} " +
+-                        "scale=${stacked.highZoomDetailScaleX},${stacked.highZoomDetailScaleY} " +
+-                        "sourceZoom=${stacked.highZoomDetailSourceZoom} frames=${stacked.highZoomDetailFrames} " +
+-                        "activePct=${stacked.highZoomDetailActivePct} strongPct=${stacked.highZoomDetailStrongPct} " +
+-                        "ms=${stacked.highZoomDetailReconstructionMs} rgbOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN"
+-                    PLog.i(TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_HANDOFF $handoff")
+-                    MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_HANDOFF", handoff)
+-                } else {
+-                    PLog.i(TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK sourceZoom=$localOutputZoom")
+-                    MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK",
+-                        "sourceZoom=$localOutputZoom rgbOwner=NATIVE_SABRE_VGN detail=false")
++                    PLog.i(TAG, "IRIS_26720_HIGH_ZOOM_RGB_FALLBACK_HANDOFF scalar26719=true")
+                 }
+             } else {
+                 requireParity(stacked.highZoomRgbPath == null && stacked.highZoomDetailPath == null &&
+                     stacked.highZoomRgbWidth == 0 && stacked.highZoomDetailWidth == 0,
+-                    "26752 Plan-B sidecar survived disabled route")
++                    "26720 high-zoom sidecar survived disabled route")
+             }
+             if (parameters.irisNightActive) {
+                 /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
+@@ -556,10 +565,9 @@ object PhotonMotionMgc1271Bridge {
+                 "Sabre native-grid output geometry ${stacked.width}x${stacked.height} != ${size.x}x${size.y}")
+             val expectedSuperResWidth = if (sabreSuperResEnabled) size.x * 2 else 0
+             val expectedSuperResHeight = if (sabreSuperResEnabled) size.y * 2 else 0
+-            /* IRIS_26752_TRUE_2X_PUBLICATION_SPLIT
+-             * Retired fake-SR carriers remain forbidden. JPEG/UHDR use Plan-B luma detail over the
+-             * native Sabre/VGN RGB/chroma/highlight owner. If DNG is requested, its established
+-             * 26733 direct-CFA linear-RAW boundary remains separate and unchanged.
++            /* IRIS_26564_TRUE_2X_SINGLE_CARRIER_CONTRACT
++             * The retired 26561 detail/native-upscale and 26562 reconstructed-from-native LinearRaw
++             * carriers are forbidden. JPEG and DNG share one direct-CFA RGB16F 2x reconstruction.
+              */
+             requireParity(
+                 stacked.superResDetailPath == null && stacked.superResLinearRawPath == null &&
+@@ -571,13 +579,6 @@ object PhotonMotionMgc1271Bridge {
+                     "26568 true2x geometry ${stacked.true2xWidth}x${stacked.true2xHeight} expected=${expectedSuperResWidth}x$expectedSuperResHeight")
+                 val expectedBytes=expectedSuperResWidth.toLong()*expectedSuperResHeight*3L*Short.SIZE_BYTES
+                 when(stacked.true2xBackend) {
+-                    "PLAN_B" -> {
+-                        val render=stacked.true2xRenderRgbPath?.let(::File)
+-                        requireParity(render?.isFile==true&&render.length()==expectedBytes,"26752 Plan-B SR render carrier invalid")
+-                        requireParity((stacked.true2xLinearRgbPath!=null)==produceNormalStackedDng,"26752 Plan-B DNG carrier ownership mismatch")
+-                        stacked.true2xLinearRgbPath?.let { path -> val f=File(path);requireParity(f.isFile&&f.length()==expectedBytes,"26752 Plan-B DNG carrier invalid") }
+-                        requireParity(stacked.true2xNativeVgnGuidePath==null&&stacked.true2xPhaseSupportPath==null,"26752 Plan-B intermediates escaped stacker")
+-                    }
+                     "GPU" -> {
+                         val render=stacked.true2xRenderRgbPath?.let(::File)
+                         requireParity(render?.isFile==true&&render.length()==expectedBytes,"26568 fused GPU render carrier invalid")
+@@ -675,15 +676,10 @@ object PhotonMotionMgc1271Bridge {
+                 "Sabre reconstruction owner was not durably published")
+             requireParity(stacked.baselineExposureEv == null,
+                 "Sabre unexpectedly inherited Spatial/Bento BaselineExposure")
+-            /* IRIS_26752_PLAN_B_ZOOM_GEOMETRY
+-             * Plan B never owns FOV/crop. Native Sabre stays at reconstructionZoom=1 and the
+-             * existing render residual remains the exact physical-lens-relative zoom request.
+-             */
+-            requireParity(kotlin.math.abs(parameters.motionV2ReconstructionZoom - 1f) < 1.0e-5f &&
+-                    kotlin.math.abs(parameters.motionV2RenderResidualZoom - localOutputZoom) < 1.0e-5f &&
+-                    parameters.motionV2SuperResOutputScale == sabreSuperResOutputScale &&
+-                    !parameters.motionV2HighZoomRgbPrepared && !parameters.motionV2HighZoomRgbApplied,
+-                "26752 Plan-B/Sabre zoom geometry contract drifted")
++            val expectedReconstructionZoom26720 = if (parameters.motionV2HighZoomRgbPrepared) localOutputZoom else 1f
++            requireParity(kotlin.math.abs(parameters.motionV2ReconstructionZoom - expectedReconstructionZoom26720) < 1.0e-5f &&
++                    parameters.motionV2SuperResOutputScale == sabreSuperResOutputScale,
++                "26720 Sabre/high-zoom reconstruction geometry contract drifted")
+             requireParity(lsc == null || stacked.lensShadingCorrectionApplied,
+                 "LSC supplied but MGC output did not apply it")
+ 
+@@ -818,13 +814,12 @@ object PhotonMotionMgc1271Bridge {
+              * cross-frame-temporal, zero-chroma-transfer 2x2 luminance structure contract in the bounded file builder.
+              */
+             if(parameters.motionV2SuperResOutputEnabled) {
+-                if(stacked.true2xBackend=="PLAN_B" || stacked.true2xBackend=="GPU") {
++                if(stacked.true2xBackend=="GPU") {
+                     val fused=checkNotNull(stacked.true2xRenderRgbPath)
+                     resultTrue2xRenderRgbPath=fused; true2xRenderRgbPathForCleanup=fused; iris26564True2xRenderPrepMs=0L
+                     if(produceNormalStackedDng)resultTrue2xLinearRawPath=checkNotNull(stacked.true2xLinearRgbPath)
+-                    val lumaOwner=if(stacked.true2xBackend=="PLAN_B") "IPOL_PLAN_B_IRLS" else "DIRECT_CFA_TEMPORAL"
+-                    PLog.i(TAG,"IRIS_26752_TRUE_DETAIL_RENDER_FUSED backend=${stacked.true2xBackend} size=${stacked.true2xWidth}x${stacked.true2xHeight} dngRawPreserved=${resultTrue2xLinearRawPath!=null} sabreRgbChromaOwner=true highResLumaOwner=$lumaOwner directChromaOwner=false prepMs=0")
+-                    PLog.i("MotionTrace", "PIPELINE_STATE stage=IRIS_26752_SR_PROOF_HANDOFF details=backend=${stacked.true2xBackend} statsValidatedByStacker=true fusedCarrier=true")
++                    PLog.i(TAG,"IRIS_26573_TRUE_DETAIL_RENDER_FUSED size=${stacked.true2xWidth}x${stacked.true2xHeight} dngRawPreserved=${resultTrue2xLinearRawPath!=null} sabreRgbChromaOwner=true highResLumaOwner=DIRECT_CFA_TEMPORAL directChromaOwner=false prepMs=0")
++                    PLog.i("MotionTrace", "PIPELINE_STATE stage=IRIS_26573_SR_PROOF_HANDOFF details=backend=GPU statsValidatedByStacker=true fusedCarrier=true")
+                 } else {
+                     val rawPath=checkNotNull(stacked.true2xLinearRgbPath); val guidePath=checkNotNull(stacked.true2xNativeVgnGuidePath); val phaseSupportPath=checkNotNull(stacked.true2xPhaseSupportPath)
+                     val prepStartNs=System.nanoTime(); val runTrue2xFullResolutionMgc=false
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index b9825c50e5ed0bc32cb7f11e0832eb18aeb528cd..36905d53c66a23e51fd4e907a65e9ca563e42d7a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -151,14 +151,6 @@ public class Parameters {
+     public int motionV2HighZoomDetailOriginY = 0;
+     public int motionV2HighZoomDetailFullWidth = 0;
+     public int motionV2HighZoomDetailFullHeight = 0;
+-    /* IRIS_26752_IPOL_PLAN_B_EXACT_GEOMETRY
+-     * Exact non-integer Plan-B lattice transform. Integer origin/full-size fields remain for
+-     * carrier bounds; these floats prevent sub-pixel phase loss at arbitrary lens-relative zoom.
+-     */
+-    public float motionV2HighZoomDetailScaleX = 1.0f;
+-    public float motionV2HighZoomDetailScaleY = 1.0f;
+-    public float motionV2HighZoomDetailOriginXF = 0.0f;
+-    public float motionV2HighZoomDetailOriginYF = 0.0f;
+     public float motionV2HighZoomDetailSourceZoom = 1.0f;
+     public float motionV2HighZoomDetailActivePct = 0.0f;
+     public float motionV2HighZoomDetailStrongPct = 0.0f;
+diff --git a/app/version.properties b/app/version.properties
+index 9565f48fbe1bdb927be462e4a1a65880762cdf91..5fd7444043b2ef1b10c410ab03851c7e9c856e0b 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726752
+-VERSION_BUILD=26752
++VERSION_NAME=0.9726733
++VERSION_BUILD=26733
