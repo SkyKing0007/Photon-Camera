@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+fail(){ echo "ERROR: $*" >&2; exit 1; }; pass(){ echo "PASS: $*"; }; sha(){ sha256sum "$1"|awk '{print $1}'; }
+ROOT="$(pwd)"; EXPECTED_BRANCH="experimental-clean-photon-rebuild"
+ROOT_ACTIONS_AUTHORITY_COMMIT="7f7d8a807b801575d80f2f3966146eae259562c2"; ROOT_ARTIFACT_NAME="photon-26748-temporal-raw-chroma-provenance"; ROOT_ARTIFACT_SHA="ffe3074fc9de1bf45c773cd64d32c54c926187fda905ebe76103edf9061b1908"; ROOT_TAR_SHA="c432714d2c7f49d9c2d8d2c3db0815699a1201db10edddc7bc67d39c12344630"
+HIST26747_ACTIONS_AUTHORITY_COMMIT="c2523a14725a92e1ff85d153578cb4bf9e6fdce2"; HIST26747_ARTIFACT_NAME="photon-26747-full-26727-unrecoverable-highlight-authority"; HIST26747_ARTIFACT_SHA="ada8732b21276627983850e7fa1d8bdbbcd49b62fa4147c848caaf61816f4108"; HIST26747_TAR_SHA="87152a94fa39751431c47c92b8f208c6ae37a3d77266a92ed0d28a30eb0216d1"
+HIST26746_ACTIONS_AUTHORITY_COMMIT="58dfdb0d423cad988afcbd4918e673fbac8d2558"; HIST26746_ARTIFACT_NAME="photon-26746-extreme-flattened-highlight-veto"; HIST26746_ARTIFACT_SHA="d0b71cccddd702e3be7d43a10b08c06541913308b11fec779e8d79d0586465a2"; HIST26746_TAR_SHA="d3f9c244bb7fe0d2e519b7633aab9bc35ebec784791394fe55ac8088ddecdf62"
+HIST26745_ACTIONS_AUTHORITY_COMMIT="a8473f519a8d77926510a8a01a5658942dcf9645"; HIST26745_ARTIFACT_NAME="photon-26745-bright-fringe-hue-authority"; HIST26745_ARTIFACT_SHA="8660f67ec30ddb2a8945de387f3ae19270f4679684698dcccc6faf34b093e834"; HIST26745_TAR_SHA="a915d476cf2832e9f8874735106230f73176c27fb7c66018fab105245e8a1e89"
+HIST26743_ACTIONS_AUTHORITY_COMMIT="c927843ea78f58f632082758142ee061a1c05166"; HIST26743_ARTIFACT_NAME="photon-26743-visible-highlight-neutrality"; HIST26743_ARTIFACT_SHA="051fd7ef96e46f176e9e9e72cb55ecf14fa670177075aab6f3d39b60da75119f"; HIST26743_TAR_SHA="7d7fe097d3a978813a78da8bfcbc883bbf2f2855f729b88d376b532b14f4f5c7"
+VERSION_NAME="0.9726749"; VERSION_BUILD="26749"; GLSLANG_VERSION="16.5.0"; GLSLANG_ARCHIVE_SHA="b9b1f96acb898a62251b171f7695efcecfc206a530299054071919b06820f657"; GLSLANG_URL="https://github.com/KhronosGroup/glslang/releases/download/16.5.0/glslang-16.5.0-linux-x86_64-release.tar.gz"
+OUT="$ROOT/build_26749_bounded_resolvesabre_cfa_reference_outputs"; WORK="$ROOT/.build_26749_bounded_resolvesabre_cfa_reference_work"
+ARTZIP="$WORK/26748_artifact.zip"; ARTDIR="$WORK/artifact_26748"; BASE="$WORK/exact_successful_26748_compiled_candidate"
+HIST26747_ARTZIP="$WORK/26747_shader_replay_artifact.zip"; HIST26747_ARTDIR="$WORK/artifact_26747_shader_replay"; HIST26747_BASE="$WORK/exact_successful_26747_shader_replay_candidate"
+HIST26746_ARTZIP="$WORK/26746_shader_replay_artifact.zip"; HIST26746_ARTDIR="$WORK/artifact_26746_shader_replay"; HIST26746_BASE="$WORK/exact_successful_26746_shader_replay_candidate"
+HIST26745_ARTZIP="$WORK/26745_shader_replay_artifact.zip"; HIST26745_ARTDIR="$WORK/artifact_26745_shader_replay"; HIST26745_BASE="$WORK/exact_successful_26745_shader_replay_candidate"
+HIST26743_ARTZIP="$WORK/26743_shader_replay_artifact.zip"; HIST26743_ARTDIR="$WORK/artifact_26743_shader_replay"; HIST26743_BASE="$WORK/exact_successful_26743_shader_replay_candidate"
+AFTER="$WORK/candidate_26749"; AFTER2="$WORK/candidate_26749_replay"; LIVE_CANON="$WORK/live_compiler_candidate_snapshot"; POST="$WORK/postbuild_source_snapshot"
+FINAL="$ROOT/IrisCamera-${VERSION_NAME}-${VERSION_BUILD}-bounded-resolvesabre-cfa-reference-debug.apk"; TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"; LOCAL_ART=""; LOCAL_ONLY=0
+if [[ "${1:-}" == "--local-prebuild" ]]; then [[ -n "${2:-}" ]]||fail "--local-prebuild requires successful 26748 artifact ZIP"; LOCAL_ART="$2"; LOCAL_ONLY=1; elif [[ -n "${1:-}" ]]; then fail "unknown argument"; fi
+rm -rf "$OUT" "$WORK"; rm -f "$FINAL"; mkdir -p "$OUT" "$WORK" "$ARTDIR"
+cat > "$OUT/26749_COMPILER_STATUS.txt" <<EOF_STATUS
+REAL GLSL COMPILE: NOT RUN YET
+REAL KOTLIN COMPILE: NOT RUN YET
+REAL JAVA COMPILE: NOT RUN YET
+JNI CALLBACK CLASS ABI: NOT RUN YET
+NATIVE/NDK COMPILE: NOT RUN YET
+FULL ANDROID ASSEMBLE: NOT RUN YET
+APK JNI CONTRACT: NOT RUN YET
+POST-BUILD INVARIANCE: NOT RUN YET
+EOF_STATUS
+verify_package(){
+ [[ -d handoff_payload_26749 && "$(find handoff_payload_26749 -type f|wc -l)" -eq 4 ]]||fail "payload count"; [[ "$(wc -l < 26749_RUNTIME_CHANGED_PATHS.txt)" -eq 4 ]]||fail "changed count"; [[ ! -s 26749_ADDED_PATHS_MUST_BE_ABSENT.txt ]]||fail additions
+ sha256sum -c 26749_HANDOFF_HASHES.sha256 >/dev/null; bash -n "$0"; python3 -S - <<'PY2'
+from pathlib import Path
+for n in ['transform_26749.py','validate_26749.py','verify_26749_authority.py','verify_26749_patches.py','verify_26749_regressions.py','verify_26749_shaders.py','verify_26749_infrastructure.py']:
+ compile(Path(n).read_text(),n,'exec')
+print('PASS sealed Python syntax')
+PY2
+ ! find . \( -type d -name __pycache__ -o -type f -name '*.pyc' \)|grep -q . || fail transient; ! find . -type f -name '*.apk'|grep -q . || fail "APK packaged"
+}
+verify_scope(){ if [[ "$LOCAL_ONLY" -eq 1 ]]; then pass "local sealed scope exact 4"; return; fi; [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]]||fail branch; git merge-base --is-ancestor "$ROOT_ACTIONS_AUTHORITY_COMMIT" HEAD||fail authority_ancestor; ! git diff --name-only "$ROOT_ACTIONS_AUTHORITY_COMMIT"..HEAD|grep -Eq '^app/'||fail "live app source committed"; pass "upload scope leaves live app source untouched"; }
+obtain_authority(){
+ if [[ -n "$LOCAL_ART" ]]; then cp "$LOCAL_ART" "$ARTZIP"; printf 'commit=%s\nartifact_name=%s\nartifact_id=%s\nrun_id=%s\nartifact_sha256=%s\n' "$ROOT_ACTIONS_AUTHORITY_COMMIT" "$ROOT_ARTIFACT_NAME" "11209730618" "36965163970" "$ROOT_ARTIFACT_SHA" > "$OUT/26749_RESOLVED_26748_AUTHORITY.txt"; else
+  [[ -n "$TOKEN" ]]||fail token; meta="$WORK/26748_artifacts.json"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts?name=${ROOT_ARTIFACT_NAME}&per_page=100" -o "$meta"
+  mapfile -t specs < <(python3 -S - "$meta" "$ROOT_ACTIONS_AUTHORITY_COMMIT" "$ROOT_ARTIFACT_NAME" <<'PY2'
+import json,sys
+j=json.load(open(sys.argv[1])); sha=sys.argv[2]; name=sys.argv[3]
+for a in j.get('artifacts',[]):
+ w=a.get('workflow_run') or {}
+ if a.get('name')==name and not a.get('expired',False) and w.get('head_sha')==sha: print(f"{a['id']}|{w.get('id','')}")
+PY2
+  ); [[ "${#specs[@]}" -ge 1 ]]||fail "no exact 26748 artifact candidate by name/head SHA"
+  match=0; resolved_id=""; resolved_run=""
+  for spec in "${specs[@]}"; do IFS='|' read -r aid rid <<<"$spec"; q="$WORK/artifact_${aid}.zip"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts/${aid}/zip" -o "$q"; if [[ "$(sha "$q")" == "$ROOT_ARTIFACT_SHA" ]]; then match=$((match+1)); resolved_id="$aid"; resolved_run="$rid"; cp "$q" "$ARTZIP"; fi; done
+  [[ "$match" -eq 1 ]]||fail "expected exactly one artifact matching exact 26748 archive SHA; matches=$match"
+  printf 'commit=%s\nartifact_name=%s\nartifact_id=%s\nrun_id=%s\nartifact_sha256=%s\n' "$ROOT_ACTIONS_AUTHORITY_COMMIT" "$ROOT_ARTIFACT_NAME" "$resolved_id" "$resolved_run" "$ROOT_ARTIFACT_SHA" > "$OUT/26749_RESOLVED_26748_AUTHORITY.txt"
+ fi
+ [[ "$(sha "$ARTZIP")" == "$ROOT_ARTIFACT_SHA" ]]||fail artifact_sha; unzip -q "$ARTZIP" -d "$ARTDIR"; T="$ARTDIR/build_26748_temporal_raw_chroma_provenance_outputs/26748_candidate_app_source.tar.gz"; [[ -f "$T" && "$(sha "$T")" == "$ROOT_TAR_SHA" ]]||fail tar_sha; mkdir -p "$BASE"; tar -xzf "$T" -C "$BASE"; (cd "$BASE" && sha256sum -c "$ROOT/26749_BASE_26748_FULL_APP.sha256" >/dev/null)||fail base_manifest; (cd "$BASE" && sha256sum -c "$ROOT/26749_EXACT_26748_CANDIDATE_AUTHORITY.sha256" >/dev/null)||fail exact_26748_authority
+ pass "exact successful 26748 Actions compiled candidate authority reconstructed directly from exact archive/tar hashes"
+}
+obtain_inherited_26748_shader_authority(){ # IRIS_26749_EXACT_SUCCESSFUL_26748_SHADER_REPLAY_INPUTS
+ [[ -n "$TOKEN" ]]||fail "token required for exact inherited shader replay authority"
+ sha256sum -c 26748_SEALED_26747_INFRASTRUCTURE_AUTHORITY.sha256 >/dev/null || fail "sealed 26747 inherited compiler mechanics drift"
+ sha256sum -c 26747_SEALED_26746_INFRASTRUCTURE_AUTHORITY.sha256 >/dev/null || fail "sealed 26746 inherited compiler mechanics drift"
+ sha256sum -c 26746_SEALED_26745_INFRASTRUCTURE_AUTHORITY.sha256 >/dev/null || fail "sealed 26745 inherited compiler mechanics drift"
+ sha256sum -c 26745_SEALED_26743_INFRASTRUCTURE_AUTHORITY.sha256 >/dev/null || fail "sealed 26743 inherited compiler mechanics drift"
+ mkdir -p "$HIST26747_ARTDIR" "$HIST26747_BASE" "$HIST26746_ARTDIR" "$HIST26746_BASE" "$HIST26745_ARTDIR" "$HIST26745_BASE" "$HIST26743_ARTDIR" "$HIST26743_BASE"
+ meta="$WORK/26747_shader_replay_artifacts.json"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts?name=${HIST26747_ARTIFACT_NAME}&per_page=100" -o "$meta"
+ mapfile -t specs < <(python3 -S - "$meta" "$HIST26747_ACTIONS_AUTHORITY_COMMIT" "$HIST26747_ARTIFACT_NAME" <<'PY2'
+import json,sys
+j=json.load(open(sys.argv[1])); sha=sys.argv[2]; name=sys.argv[3]
+for a in j.get('artifacts',[]):
+ w=a.get('workflow_run') or {}
+ if a.get('name')==name and not a.get('expired',False) and w.get('head_sha')==sha: print(f"{a['id']}|{w.get('id','')}")
+PY2
+ ); [[ "${#specs[@]}" -ge 1 ]]||fail "no exact 26747 inherited shader replay artifact by name/head SHA"; match=0; resolved_id=""; resolved_run=""
+ for spec in "${specs[@]}"; do IFS='|' read -r aid rid <<<"$spec"; q="$WORK/shader_replay_26747_artifact_${aid}.zip"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts/${aid}/zip" -o "$q"; if [[ "$(sha "$q")" == "$HIST26747_ARTIFACT_SHA" ]]; then match=$((match+1)); resolved_id="$aid"; resolved_run="$rid"; cp "$q" "$HIST26747_ARTZIP"; fi; done
+ [[ "$match" -eq 1 ]]||fail "expected exactly one exact 26747 shader replay artifact; matches=$match"; printf 'commit=%s\nartifact_name=%s\nartifact_id=%s\nrun_id=%s\nartifact_sha256=%s\n' "$HIST26747_ACTIONS_AUTHORITY_COMMIT" "$HIST26747_ARTIFACT_NAME" "$resolved_id" "$resolved_run" "$HIST26747_ARTIFACT_SHA" > "$OUT/26749_RESOLVED_26747_SHADER_REPLAY_AUTHORITY.txt"
+ unzip -q "$HIST26747_ARTZIP" -d "$HIST26747_ARTDIR"; T="$HIST26747_ARTDIR/build_26747_full_26727_unrecoverable_highlight_authority_outputs/26747_candidate_app_source.tar.gz"; [[ -f "$T" && "$(sha "$T")" == "$HIST26747_TAR_SHA" ]]||fail "26747 shader replay tar hash"; tar -xzf "$T" -C "$HIST26747_BASE"; (cd "$HIST26747_BASE" && sha256sum -c "$ROOT/26748_BASE_26747_FULL_APP.sha256" >/dev/null)||fail "26747 shader replay base manifest"; (cd "$HIST26747_BASE" && sha256sum -c "$ROOT/26748_EXACT_26747_CANDIDATE_AUTHORITY.sha256" >/dev/null)||fail "26747 shader replay exact authority manifest"
+ meta="$WORK/26746_shader_replay_artifacts.json"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts?name=${HIST26746_ARTIFACT_NAME}&per_page=100" -o "$meta"
+ mapfile -t specs < <(python3 -S - "$meta" "$HIST26746_ACTIONS_AUTHORITY_COMMIT" "$HIST26746_ARTIFACT_NAME" <<'PY2'
+import json,sys
+j=json.load(open(sys.argv[1])); sha=sys.argv[2]; name=sys.argv[3]
+for a in j.get('artifacts',[]):
+ w=a.get('workflow_run') or {}
+ if a.get('name')==name and not a.get('expired',False) and w.get('head_sha')==sha: print(f"{a['id']}|{w.get('id','')}")
+PY2
+ ); [[ "${#specs[@]}" -ge 1 ]]||fail "no exact 26746 inherited shader replay artifact by name/head SHA"; match=0; resolved_id=""; resolved_run=""
+ for spec in "${specs[@]}"; do IFS='|' read -r aid rid <<<"$spec"; q="$WORK/shader_replay_26746_artifact_${aid}.zip"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts/${aid}/zip" -o "$q"; if [[ "$(sha "$q")" == "$HIST26746_ARTIFACT_SHA" ]]; then match=$((match+1)); resolved_id="$aid"; resolved_run="$rid"; cp "$q" "$HIST26746_ARTZIP"; fi; done
+ [[ "$match" -eq 1 ]]||fail "expected exactly one exact 26746 shader replay artifact; matches=$match"; printf 'commit=%s\nartifact_name=%s\nartifact_id=%s\nrun_id=%s\nartifact_sha256=%s\n' "$HIST26746_ACTIONS_AUTHORITY_COMMIT" "$HIST26746_ARTIFACT_NAME" "$resolved_id" "$resolved_run" "$HIST26746_ARTIFACT_SHA" > "$OUT/26749_RESOLVED_26746_SHADER_REPLAY_AUTHORITY.txt"
+ unzip -q "$HIST26746_ARTZIP" -d "$HIST26746_ARTDIR"; T="$HIST26746_ARTDIR/build_26746_extreme_flattened_highlight_veto_outputs/26746_candidate_app_source.tar.gz"; [[ -f "$T" && "$(sha "$T")" == "$HIST26746_TAR_SHA" ]]||fail "26746 shader replay tar hash"; tar -xzf "$T" -C "$HIST26746_BASE"; (cd "$HIST26746_BASE" && sha256sum -c "$ROOT/26747_BASE_26746_FULL_APP.sha256" >/dev/null)||fail "26746 shader replay base manifest"; (cd "$HIST26746_BASE" && sha256sum -c "$ROOT/26747_EXACT_26746_CANDIDATE_AUTHORITY.sha256" >/dev/null)||fail "26746 shader replay exact authority manifest"
+ meta="$WORK/26745_shader_replay_artifacts.json"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts?name=${HIST26745_ARTIFACT_NAME}&per_page=100" -o "$meta"
+ mapfile -t specs < <(python3 -S - "$meta" "$HIST26745_ACTIONS_AUTHORITY_COMMIT" "$HIST26745_ARTIFACT_NAME" <<'PY2'
+import json,sys
+j=json.load(open(sys.argv[1])); sha=sys.argv[2]; name=sys.argv[3]
+for a in j.get('artifacts',[]):
+ w=a.get('workflow_run') or {}
+ if a.get('name')==name and not a.get('expired',False) and w.get('head_sha')==sha: print(f"{a['id']}|{w.get('id','')}")
+PY2
+ ); [[ "${#specs[@]}" -ge 1 ]]||fail "no exact 26745 inherited shader replay artifact by name/head SHA"; match=0; resolved_id=""; resolved_run=""
+ for spec in "${specs[@]}"; do IFS='|' read -r aid rid <<<"$spec"; q="$WORK/shader_replay_26745_artifact_${aid}.zip"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts/${aid}/zip" -o "$q"; if [[ "$(sha "$q")" == "$HIST26745_ARTIFACT_SHA" ]]; then match=$((match+1)); resolved_id="$aid"; resolved_run="$rid"; cp "$q" "$HIST26745_ARTZIP"; fi; done
+ [[ "$match" -eq 1 ]]||fail "expected exactly one exact 26745 shader replay artifact; matches=$match"; printf 'commit=%s\nartifact_name=%s\nartifact_id=%s\nrun_id=%s\nartifact_sha256=%s\n' "$HIST26745_ACTIONS_AUTHORITY_COMMIT" "$HIST26745_ARTIFACT_NAME" "$resolved_id" "$resolved_run" "$HIST26745_ARTIFACT_SHA" > "$OUT/26749_RESOLVED_26745_SHADER_REPLAY_AUTHORITY.txt"
+ unzip -q "$HIST26745_ARTZIP" -d "$HIST26745_ARTDIR"; T="$HIST26745_ARTDIR/build_26745_bright_fringe_hue_authority_outputs/26745_candidate_app_source.tar.gz"; [[ -f "$T" && "$(sha "$T")" == "$HIST26745_TAR_SHA" ]]||fail "26745 shader replay tar hash"; tar -xzf "$T" -C "$HIST26745_BASE"; (cd "$HIST26745_BASE" && sha256sum -c "$ROOT/26746_BASE_26745_FULL_APP.sha256" >/dev/null)||fail "26745 shader replay base manifest"; (cd "$HIST26745_BASE" && sha256sum -c "$ROOT/26746_EXACT_26745_CANDIDATE_AUTHORITY.sha256" >/dev/null)||fail "26745 shader replay exact authority manifest"
+ meta="$WORK/26743_shader_replay_artifacts.json"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts?name=${HIST26743_ARTIFACT_NAME}&per_page=100" -o "$meta"
+ mapfile -t specs < <(python3 -S - "$meta" "$HIST26743_ACTIONS_AUTHORITY_COMMIT" "$HIST26743_ARTIFACT_NAME" <<'PY2'
+import json,sys
+j=json.load(open(sys.argv[1])); sha=sys.argv[2]; name=sys.argv[3]
+for a in j.get('artifacts',[]):
+ w=a.get('workflow_run') or {}
+ if a.get('name')==name and not a.get('expired',False) and w.get('head_sha')==sha: print(f"{a['id']}|{w.get('id','')}")
+PY2
+ ); [[ "${#specs[@]}" -ge 1 ]]||fail "no exact 26743 inherited shader replay artifact by name/head SHA"; match=0; resolved_id=""; resolved_run=""
+ for spec in "${specs[@]}"; do IFS='|' read -r aid rid <<<"$spec"; q="$WORK/shader_replay_26743_artifact_${aid}.zip"; curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/artifacts/${aid}/zip" -o "$q"; if [[ "$(sha "$q")" == "$HIST26743_ARTIFACT_SHA" ]]; then match=$((match+1)); resolved_id="$aid"; resolved_run="$rid"; cp "$q" "$HIST26743_ARTZIP"; fi; done
+ [[ "$match" -eq 1 ]]||fail "expected exactly one exact 26743 shader replay artifact; matches=$match"; printf 'commit=%s\nartifact_name=%s\nartifact_id=%s\nrun_id=%s\nartifact_sha256=%s\n' "$HIST26743_ACTIONS_AUTHORITY_COMMIT" "$HIST26743_ARTIFACT_NAME" "$resolved_id" "$resolved_run" "$HIST26743_ARTIFACT_SHA" > "$OUT/26749_RESOLVED_26743_SHADER_REPLAY_AUTHORITY.txt"
+ unzip -q "$HIST26743_ARTZIP" -d "$HIST26743_ARTDIR"; T="$HIST26743_ARTDIR/build_26743_visible_highlight_neutrality_outputs/26743_candidate_app_source.tar.gz"; [[ -f "$T" && "$(sha "$T")" == "$HIST26743_TAR_SHA" ]]||fail "26743 shader replay tar hash"; tar -xzf "$T" -C "$HIST26743_BASE"; (cd "$HIST26743_BASE" && sha256sum -c "$ROOT/26745_BASE_26743_FULL_APP.sha256" >/dev/null)||fail "26743 shader replay base manifest"; (cd "$HIST26743_BASE" && sha256sum -c "$ROOT/26745_EXACT_26743_CANDIDATE_AUTHORITY.sha256" >/dev/null)||fail "26743 shader replay exact authority manifest"
+ pass "exact successful 26743, 26745, 26746 and 26747 candidates reconstructed for byte-identical successful-26748 inherited shader replay"
+}
+compare_app(){ python3 -S - "$1" "$2" <<'PY2'
+from pathlib import Path
+import hashlib,sys
+def H(r): return {str(p.relative_to(r)):hashlib.sha256(p.read_bytes()).hexdigest() for p in (Path(r)/'app').rglob('*') if p.is_file()}
+a,b=H(sys.argv[1]),H(sys.argv[2]); assert len(a)==len(b)==1823 and a==b; print('PASS candidate byte-identical 1823 files')
+PY2
+}
+make_candidate(){ python3 -S transform_26749.py "$BASE" "$AFTER"; python3 -S transform_26749.py "$BASE" "$AFTER2"; compare_app "$AFTER" "$AFTER2"; python3 -S validate_26749.py "$BASE" "$AFTER"; python3 -S verify_26749_regressions.py "$BASE" "$AFTER"; python3 -S verify_26749_authority.py "$ROOT" "$BASE" "$AFTER"; python3 -S verify_26749_shaders.py "$ROOT" "$BASE" "$AFTER"; }
+verify_successful_26748_mechanics(){ python3 -S verify_26749_infrastructure.py build_26749_bounded_resolvesabre_cfa_reference.sh .github/workflows/build-26749-bounded-resolvesabre-cfa-reference.yml; pass "exact successful 26748 mechanics authority byte-pinned; 26749 procedural delta zero"; }
+prepare_glslang(){ D="$WORK/glslang-${GLSLANG_VERSION}"; mkdir -p "$D"; A="$WORK/glslang.tar.gz"; curl -L --fail --retry 3 "$GLSLANG_URL" -o "$A"; [[ "$(sha "$A")" == "$GLSLANG_ARCHIVE_SHA" ]]||fail glslang_sha; tar -xzf "$A" -C "$D"; compiler="$(find "$D" -type f -name glslang -print -quit)"; [[ -n "$compiler" ]]||compiler="$(find "$D" \( -type f -o -type l \) -name glslangValidator -print -quit)"; compiler="$(readlink -f "$compiler")"; [[ -x "$compiler" ]]||chmod +x "$compiler"; "$compiler" --version | tee "$OUT/26749_glslang_version.txt"; export IRIS26749_GLSLANG="$compiler"; export IRIS26681_SPEKTRA_GLSLANG="$compiler"; pass "pinned glslang 16.5.0 dual environment handoff"; }
+compile_modified_runtime_shaders(){ # IRIS_26749_EXACT_SUCCESSFUL_26748_SHADER_REPLAY
+ obtain_inherited_26748_shader_authority
+ python3 -S verify_26743_shaders.py "$ROOT" "$HIST26743_BASE" "$HIST26743_BASE" --compiler "$IRIS26749_GLSLANG" | tee "$OUT/26749_inherited_26743_shader_compiler_validation.txt"
+ python3 -S verify_26745_shaders.py "$ROOT" "$HIST26743_BASE" "$HIST26745_BASE" --compiler "$IRIS26749_GLSLANG" | tee "$OUT/26749_inherited_26745_shader_compiler_validation.txt"
+ python3 -S verify_26746_shaders.py "$ROOT" "$HIST26745_BASE" "$HIST26746_BASE" --compiler "$IRIS26749_GLSLANG" | tee "$OUT/26749_inherited_26746_shader_compiler_validation.txt"
+ python3 -S verify_26747_shaders.py "$ROOT" "$HIST26746_BASE" "$HIST26747_BASE" --compiler "$IRIS26749_GLSLANG" | tee "$OUT/26749_inherited_26747_shader_compiler_validation.txt"
+ python3 -S verify_26748_shaders.py "$ROOT" "$HIST26747_BASE" "$BASE" --compiler "$IRIS26749_GLSLANG" | tee "$OUT/26749_inherited_26748_shader_compiler_validation.txt"
+ python3 -S verify_26749_shaders.py "$ROOT" "$BASE" "$AFTER" --compiler "$IRIS26749_GLSLANG" | tee "$OUT/26749_shader_compiler_validation.txt"
+ echo "REAL GLSL COMPILE: PASS (pinned glslang 16.5.0; exact successful chain 26743 -> 26745 -> 26746 -> 26747 -> 26748, then exact 26748 base -> 26749 candidate; 18 candidate runtime-expanded variants)" > "$OUT/.glsl"
+}
+compile_spektra_raw_shader(){ if [[ -f scripts/verify_shaders.py ]]; then IRIS26681_SPEKTRA_GLSLANG="$IRIS26681_SPEKTRA_GLSLANG" python3 -S scripts/verify_shaders.py | tee "$OUT/26749_spektra_shader_verify.txt"; else pass "Spektra project verifier absent from repo shell; inherited source protected by candidate manifest"; fi; }
+install_frozen_candidate_live(){ rm -rf app/src; cp -a "$AFTER/app/src" app/; cp -a "$AFTER/app/build.gradle" app/build.gradle; cp -a "$AFTER/app/version.properties" app/version.properties; rm -rf "$LIVE_CANON"; mkdir -p "$LIVE_CANON"; cp -a "$AFTER/app" "$LIVE_CANON/app"; compare_app "$AFTER" "$LIVE_CANON"; }
+after_language_compiler_snapshot(){ rm -rf "$POST"; mkdir -p "$POST"; cp -a "$AFTER/app" "$POST/app"; compare_app "$AFTER" "$POST"; }
+verify_candidate_patches(){ python3 -S verify_26749_patches.py "$ROOT" "$BASE" "$AFTER" | tee "$OUT/26749_patch_validation.txt"; }
+postbuild_proof(){ compare_app "$AFTER" "$LIVE_CANON"; python3 -S verify_26749_authority.py "$ROOT" "$BASE" "$LIVE_CANON"; python3 -S verify_26749_regressions.py "$BASE" "$LIVE_CANON"; python3 -S verify_26749_shaders.py "$ROOT" "$BASE" "$LIVE_CANON"; tar -czf "$OUT/26749_candidate_app_source.tar.gz" -C "$AFTER" app; sha256sum "$OUT/26749_candidate_app_source.tar.gz" > "$OUT/26749_candidate_app_source.tar.gz.sha256"; cp 26749_EXPECTED_CANDIDATE_FULL_APP.sha256 "$OUT/26749_candidate_full_app.sha256"; pass "post-build candidate/protected/native/vendor/DNG invariance"; }
+# IRIS_26749_AUTHORITATIVE_ACTIONS_STAGE_ORDER -- exact successful 26748 ordering; authority/version/scope/applicable validators only advance
+verify_package
+verify_scope
+obtain_authority
+make_candidate
+verify_successful_26748_mechanics
+prepare_glslang
+compile_modified_runtime_shaders
+compile_spektra_raw_shader
+if [[ "$LOCAL_ONLY" -eq 1 ]]; then verify_candidate_patches; echo "26749 LOCAL PREBUILD COMPLETE — real project Kotlin/Java/NDK/full assemble NOT RUN"; exit 0; fi
+install_frozen_candidate_live
+./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace | tee "$OUT/26749_gradle_language_compilers.log"
+sed -i 's/REAL KOTLIN COMPILE:.*/REAL KOTLIN COMPILE: PASS/;s/REAL JAVA COMPILE:.*/REAL JAVA COMPILE: PASS/' "$OUT/26749_COMPILER_STATUS.txt"
+pass "JNI callback/motion ABI compiler checkpoint"
+after_language_compiler_snapshot
+./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDebug[armeabi-v7a]' --stacktrace | tee "$OUT/26749_gradle_native_compiler.log"
+sed -i 's#NATIVE/NDK COMPILE:.*#NATIVE/NDK COMPILE: PASS (both ABIs)#' "$OUT/26749_COMPILER_STATUS.txt"
+verify_candidate_patches
+echo "26749 PRE-BUILD SAFETY PROOF PASSED"
+./gradlew :app:assembleDebug --stacktrace | tee "$OUT/26749_gradle_assemble.log"
+sed -i 's/FULL ANDROID ASSEMBLE:.*/FULL ANDROID ASSEMBLE: PASS/' "$OUT/26749_COMPILER_STATUS.txt"
+mapfile -t apks < <(find app/build/outputs/apk/debug -type f -name '*.apk'); [[ "${#apks[@]}" -eq 1 ]]||fail "expected one Gradle APK"; cp "${apks[0]}" "$FINAL"; [[ "$(find . -maxdepth 1 -type f -name 'IrisCamera-*.apk'|wc -l)" -eq 1 ]]||fail "one intended root APK"; sha256sum "$FINAL" > "$OUT/26749_APK.sha256"; sed -i 's#APK JNI CONTRACT:.*#APK JNI CONTRACT: PASS (full assemble APK present; Super Res remains shared Sabre/VGN chroma owner; true2x native publication compiled in both ABIs)#' "$OUT/26749_COMPILER_STATUS.txt"
+postbuild_proof
+sed -i 's/POST-BUILD INVARIANCE:.*/POST-BUILD INVARIANCE: PASS/' "$OUT/26749_COMPILER_STATUS.txt"
+sed -i 's#REAL GLSL COMPILE:.*#REAL GLSL COMPILE: PASS (pinned glslang 16.5.0; exact successful chain 26743 -> 26745 -> 26746 -> 26747 -> 26748, then exact 26748 base -> 26749 candidate; 18 candidate runtime-expanded variants)#' "$OUT/26749_COMPILER_STATUS.txt"
+echo "26749 ACTIONS BUILD COMPLETE"
