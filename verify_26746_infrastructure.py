@@ -36,7 +36,13 @@ for t in [
 # real compiler function so earlier structural verifier calls cannot confuse ordering.
 compile_block=s[s.index('compile_modified_runtime_shaders(){'):s.index('compile_spektra_raw_shader(){')]
 assert compile_block.index('verify_26743_shaders.py "$ROOT" "$HIST26743_BASE" "$HIST26743_BASE"') < compile_block.index('verify_26745_shaders.py "$ROOT" "$HIST26743_BASE" "$BASE"') < compile_block.index('verify_26746_shaders.py "$ROOT" "$BASE" "$AFTER"')
+# IRIS_26746_R2_SED_DELIMITER_REGRESSION: failed R1 Actions after successful assemble because
+# the '/' delimiter collided with the literal 'Sabre/VGN' in replacement text.
+unsafe_sed = "sed -i 's/APK JNI CONTRACT:.*/APK JNI CONTRACT: PASS (full assemble APK present; Super Res remains shared Sabre/VGN chroma owner; true2x native publication compiled in both ABIs)/'"
+safe_sed = "sed -i 's#APK JNI CONTRACT:.*#APK JNI CONTRACT: PASS (full assemble APK present; Super Res remains shared Sabre/VGN chroma owner; true2x native publication compiled in both ABIs)#'"
+assert unsafe_sed not in s
+assert safe_sed in s
 assert 'git commit' not in main and 'git push' not in main and 'backup' not in main.lower()
 assert '"$(find handoff_payload_26746 -type f|wc -l)" -eq 2' in s
 assert '"$(wc -l < 26746_RUNTIME_CHANGED_PATHS.txt)" -eq 2' in s
-print('PASS 26746 R1 infrastructure: successful-26745 stage/toolchain/order unchanged; failed wrong-role shader replay permanently rejected; exact 26743->26745 successful shader replay restored before exact 26745->26746 shader compile; both-ABI native stage preserved; no backup/commit/push')
+print('PASS 26746 R2 infrastructure: successful-26745 stage/toolchain/order unchanged; wrong-role shader replay rejected; post-assemble sed delimiter regression fixed; exact 26743->26745 then 26745->26746 shader replay preserved; both-ABI native stage preserved; no backup/commit/push')
