@@ -1315,11 +1315,11 @@ internal object Iris26529SpatialRgbChromaShaders {
                 float chainLumaB26735 = 1.0 - smoothstep(0.10, 0.32,
                     abs(nearBY - farBY) / max(max(nearBY, farBY), 0.060));
                 float chainA26735 = nearPhysicalA * farPhysicalA26735 *
-                    temporalColorTrust26748(p + axisA) * temporalColorTrust26748(p + axisA * 2) *
+                    temporalColorTrust26748(p + d) * temporalColorTrust26748(p + 2 * d) *
                     nearColorA26735 * farColorA26735 * chainLumaA26735 *
                     smoothstep(0.88, 0.97, hueAgreement(nearNormA, farNormA));
                 float chainB26735 = nearPhysicalB * farPhysicalB26735 *
-                    temporalColorTrust26748(p + axisB) * temporalColorTrust26748(p + axisB * 2) *
+                    temporalColorTrust26748(p - d) * temporalColorTrust26748(p - 2 * d) *
                     nearColorB26735 * farColorB26735 * chainLumaB26735 *
                     smoothstep(0.88, 0.97, hueAgreement(nearNormB, farNormB));
                 physicalColorContinuation26735 = max(physicalColorContinuation26735,
@@ -2103,9 +2103,9 @@ internal object Iris26529SpatialRgbChromaShaders {
             float meanFrameEnergy=max(stats.b,0.0)/max(support,1.0e-6);
             float rawCoherence=clamp(dot(meanChroma,meanChroma)/
                 max(meanFrameEnergy,1.0e-6),0.0,1.0);
-            uvec4 packed=imageLoad(uInput,q);
-            vec2 finalChroma=vec2(float(signedChroma(packed.g)),
-                float(signedChroma(packed.b)))/32768.0;
+            uvec4 packedPixel26748=imageLoad(uInput,q);
+            vec2 finalChroma=vec2(float(signedChroma(packedPixel26748.g)),
+                float(signedChroma(packedPixel26748.b)))/32768.0;
             float finalMagnitude=length(finalChroma);
             float meanMagnitude=length(meanChroma);
             float directionAgreement=dot(finalChroma,meanChroma)/

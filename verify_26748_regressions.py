@@ -34,6 +34,17 @@ assert 'temporalChromaEvidence26748 = frame.role == RawBurstFrameRole.LONG' not 
 for t in ['temporalColorTrust26748','rawCoherence','directionAgreement','rawConsensusProof','colorProtectionEvidence26748','IRIS_26729_COLOR_MATERIAL_DIRECTION_GATE','IRIS_26731_FROZEN_RECIPROCAL_MATERIAL_OWNERSHIP']:
  assert t in vgn,t
 assert vgn.count('temporalColorTrust26748')>=12
+# Permanent regression for failed 26748 R1 Actions run 36963590742: the universal
+# continuation loop has only `d`; do not invent axisA/axisB aliases.
+assert 'axisA' not in vgn and 'axisB' not in vgn
+for t in [
+    'temporalColorTrust26748(p + d) * temporalColorTrust26748(p + 2 * d)',
+    'temporalColorTrust26748(p - d) * temporalColorTrust26748(p - 2 * d)',
+]:
+    assert t in vgn,t
+# Same failed R1 candidate used GLSL reserved identifier `packed` in localMedian.
+assert 'uvec4 packed=' not in vgn
+assert 'uvec4 packedPixel26748=imageLoad(uInput,q);' in vgn
 # 26747 highlight behavior is inherited, not redesigned.
 for t in ['IRIS_26747_CONNECTED_UNRECOVERABLE_HIGHLIGHT_OWNER','IRIS_26747_FULL_26727_UNRECOVERABLE_HEADROOM_VETO','float highlightPreservePermission = 1.0 - smoothstep(0.72, 0.92, centerLuma);','float highlightSafe = 1.0 - smoothstep(0.78, 0.92, max(preVgnPeak, centerLuma));']:
  assert t in vgn,t

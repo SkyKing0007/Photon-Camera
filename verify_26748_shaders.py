@@ -24,7 +24,7 @@ def runtime_color(root,h,l,z):
  assert '#version' not in src; return '#version 310 es\n\n#line 1\n'+src
 def runtime_native(root):
  s=(root/nrel).read_text(); m=re.search(r'static const char\*kIris26571PublicationCompute=R"GLSL\((.*?)\)GLSL";',s,re.S); assert m; return m.group(1)
-reserved=set('attribute const uniform varying buffer shared coherent volatile restrict readonly writeonly atomic_uint layout centroid flat smooth noperspective patch sample break continue do for while switch case default if else subroutine in out inout float double int void bool true false invariant precise discard return mat2 mat3 mat4 dmat2 dmat3 dmat4 vec2 vec3 vec4 ivec2 ivec3 ivec4 uvec2 uvec3 uvec4 bvec2 bvec3 bvec4 dvec2 dvec3 dvec4 uint lowp mediump highp precision struct common partition active asm class union enum typedef template this resource goto inline noinline public static extern external interface long short half fixed unsigned superp input output hvec2 hvec3 hvec4 fvec2 fvec3 fvec4 filter sizeof cast namespace using row_major'.split())
+reserved=set('attribute const uniform varying buffer shared coherent volatile restrict readonly writeonly atomic_uint layout centroid flat smooth noperspective patch sample break continue do for while switch case default if else subroutine in out inout float double int void bool true false invariant precise discard return mat2 mat3 mat4 dmat2 dmat3 dmat4 vec2 vec3 vec4 ivec2 ivec3 ivec4 uvec2 uvec3 uvec4 bvec2 bvec3 bvec4 dvec2 dvec3 dvec4 uint lowp mediump highp precision struct common partition active asm class union enum typedef template this resource goto inline noinline public static extern external interface long short half fixed unsigned superp input output hvec2 hvec3 hvec4 fvec2 fvec3 fvec4 filter sizeof cast namespace using row_major packed'.split())
 typepat=r'(?:float|double|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234](?:x[234])?|sampler\w*|[iu]?image\w*|atomic_uint|void)'
 def scan(fn,src):
  clean=re.sub(r'/\*.*?\*/',' ',src,flags=re.S); clean=re.sub(r'//.*',' ',clean); ids=re.findall(r'\b'+typepat+r'\s+([A-Za-z_]\w*)\b',clean)+re.findall(r'\bstruct\s+([A-Za-z_]\w*)\b',clean); bad=sorted(set(ids)&reserved); impl=sorted(set(x for x in ids if '__' in x or x.startswith('gl_'))); assert not bad,(fn,bad); assert not impl,(fn,impl); assert clean.count('{')==clean.count('}'),fn; assert '#import' not in clean,fn
@@ -69,6 +69,18 @@ for fn in ['universal_adaptive_color.comp','vgn_seed.comp','vgn_local_median.com
  src=specs(cand)[fn][0]
  for t in ['IRIS_26748_TEMPORAL_RAW_CHROMA_PROVENANCE','temporalColorTrust26748','rawCoherence','directionAgreement','rawConsensusProof']:
   assert t in src,(fn,t)
+# Permanent regression for failed 26748 R1 Actions run 36963590742: the
+# universal continuation loop owns one direction `d`; chain A is +d/+2d and chain B is -d/-2d.
+uv26748=specs(cand)['universal_adaptive_color.comp'][0]
+assert 'axisA' not in uv26748 and 'axisB' not in uv26748
+for t in [
+ 'temporalColorTrust26748(p + d) * temporalColorTrust26748(p + 2 * d)',
+ 'temporalColorTrust26748(p - d) * temporalColorTrust26748(p - 2 * d)']:
+ assert t in uv26748,t
+# Same failed R1 candidate also introduced GLSL reserved identifier `packed` in localMedian.
+lm26748=specs(cand)['vgn_local_median.comp'][0]
+assert 'uvec4 packed=' not in lm26748
+assert 'uvec4 packedPixel26748=imageLoad(uInput,q);' in lm26748
 # 26747 highlight/color authority remains present.
 uv=specs(cand)['universal_adaptive_color.comp'][0]
 for t in ['IRIS_26747_CONNECTED_UNRECOVERABLE_HIGHLIGHT_OWNER','IRIS_26747_FULL_26727_UNRECOVERABLE_HEADROOM_VETO']:
