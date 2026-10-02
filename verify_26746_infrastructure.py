@@ -11,7 +11,7 @@ def load(n):
 auth=load('26746_SEALED_26745_INFRASTRUCTURE_AUTHORITY.sha256'); assert len(auth)==9
 for p,h in auth.items():
  q=Path(p); assert q.exists(),('missing sealed 26745 mechanics authority',p); assert hashlib.sha256(q.read_bytes()).hexdigest()==h,('26745 mechanics authority drift',p)
-for t in ['ROOT_ACTIONS_AUTHORITY_COMMIT="a8473f519a8d77926510a8a01a5658942dcf9645"','ROOT_ARTIFACT_NAME="photon-26745-bright-fringe-hue-authority"','ROOT_ARTIFACT_SHA="8660f67ec30ddb2a8945de387f3ae19270f4679684698dcccc6faf34b093e834"','ROOT_TAR_SHA="a915d476cf2832e9f8874735106230f73176c27fb7c66018fab105245e8a1e89"','VERSION_NAME="0.9726746"','VERSION_BUILD="26746"','GLSLANG_VERSION="16.5.0"','EXPECTED_BRANCH="experimental-clean-photon-rebuild"']:
+for t in ['ROOT_ACTIONS_AUTHORITY_COMMIT="a8473f519a8d77926510a8a01a5658942dcf9645"','HIST26743_ACTIONS_AUTHORITY_COMMIT="c927843ea78f58f632082758142ee061a1c05166"','HIST26743_ARTIFACT_NAME="photon-26743-visible-highlight-neutrality"','HIST26743_ARTIFACT_SHA="051fd7ef96e46f176e9e9e72cb55ecf14fa670177075aab6f3d39b60da75119f"','HIST26743_TAR_SHA="7d7fe097d3a978813a78da8bfcbc883bbf2f2855f729b88d376b532b14f4f5c7"','HIST26743_FULL_MANIFEST_SHA="cf5c15be188f17aaff3761be8b6dd1c254ccdf902a7c6cd1dc039287d97d7965"','HIST26743_INFRA_MANIFEST_SHA="6a9d3790025931a6415841e0af048123e00e95684731e9c6c134260fc19f20af"','ROOT_ARTIFACT_NAME="photon-26745-bright-fringe-hue-authority"','ROOT_ARTIFACT_SHA="8660f67ec30ddb2a8945de387f3ae19270f4679684698dcccc6faf34b093e834"','ROOT_TAR_SHA="a915d476cf2832e9f8874735106230f73176c27fb7c66018fab105245e8a1e89"','VERSION_NAME="0.9726746"','VERSION_BUILD="26746"','GLSLANG_VERSION="16.5.0"','EXPECTED_BRANCH="experimental-clean-photon-rebuild"']:
  assert t in s,t
 marker='# IRIS_26746_AUTHORITATIVE_ACTIONS_STAGE_ORDER'; assert s.count(marker)==1
 main=s[s.index(marker):]
@@ -21,9 +21,22 @@ for t in order:
  n=main.find(t,pos+1); assert n>pos,('26745 stage order drift',t); pos=n
 for t in ['runs-on: ubuntu-24.04','actions/checkout@v5','fetch-depth: 0','actions/setup-java@v5','distribution: temurin',"java-version: '17'",'cache: gradle','actions/setup-python@v5',"python-version: '3.12'",'actions/upload-artifact@v4','retention-days: 90','bash build_26746_extreme_flattened_highlight_veto.sh']:
  assert t in s+w,t
-assert 'verify_26745_shaders.py "$ROOT" "$BASE" "$BASE" --compiler "$IRIS26746_GLSLANG"' in s
-assert 'verify_26746_shaders.py "$ROOT" "$BASE" "$AFTER" --compiler "$IRIS26746_GLSLANG"' in s
+assert 'verify_26745_shaders.py "$ROOT" "$BASE" "$BASE" --compiler "$IRIS26746_GLSLANG"' not in s
+for t in [
+ 'obtain_inherited_26745_shader_authority',
+ 'verify_26743_shaders.py "$ROOT" "$HIST26743_BASE" "$HIST26743_BASE" --compiler "$IRIS26746_GLSLANG"',
+ 'verify_26745_shaders.py "$ROOT" "$HIST26743_BASE" "$BASE" --compiler "$IRIS26746_GLSLANG"',
+ 'verify_26746_shaders.py "$ROOT" "$BASE" "$AFTER" --compiler "$IRIS26746_GLSLANG"',
+ '26745_BASE_26743_FULL_APP.sha256',
+ '26745_EXACT_26743_CANDIDATE_AUTHORITY.sha256',
+ '26745_SEALED_26743_INFRASTRUCTURE_AUTHORITY.sha256']:
+ assert t in s,t
+# Permanent regression for the failed first 26746 Actions attempt: the sealed 26745
+# verifier's base role is 26743, never the current 26745 base. Check only the
+# real compiler function so earlier structural verifier calls cannot confuse ordering.
+compile_block=s[s.index('compile_modified_runtime_shaders(){'):s.index('compile_spektra_raw_shader(){')]
+assert compile_block.index('verify_26743_shaders.py "$ROOT" "$HIST26743_BASE" "$HIST26743_BASE"') < compile_block.index('verify_26745_shaders.py "$ROOT" "$HIST26743_BASE" "$BASE"') < compile_block.index('verify_26746_shaders.py "$ROOT" "$BASE" "$AFTER"')
 assert 'git commit' not in main and 'git push' not in main and 'backup' not in main.lower()
 assert '"$(find handoff_payload_26746 -type f|wc -l)" -eq 2' in s
 assert '"$(wc -l < 26746_RUNTIME_CHANGED_PATHS.txt)" -eq 2' in s
-print('PASS 26746 infrastructure: exact successful 26745 nine-role mechanics hash-pinned; stage/toolchain/order unchanged; exact 26745 authority identity hash-pinned; inherited base + current shader compile; both-ABI native stage preserved; no backup/commit/push')
+print('PASS 26746 R1 infrastructure: successful-26745 stage/toolchain/order unchanged; failed wrong-role shader replay permanently rejected; exact 26743->26745 successful shader replay restored before exact 26745->26746 shader compile; both-ABI native stage preserved; no backup/commit/push')
