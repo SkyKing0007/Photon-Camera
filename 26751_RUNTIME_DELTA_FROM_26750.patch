@@ -1,0 +1,560 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 3265c34fc5ded86a42b238b87d6261e749143a52..30020881400afa98da44ab646dbe2d84b393d77d 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -74,6 +74,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+     private var blendProgram = 0
+     private var finalProgram = 0
+     private var universalAdaptiveColorProgram = 0
++    private var fineColorApply26751Program = 0
+ 
+     private var assembledRgb = 0
+     private var workA = 0
+@@ -103,6 +104,10 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+             Iris26529SpatialRgbChromaShaders.universalAdaptiveColor26561,
+             "iris26561_universal_adaptive_color",
+         )
++        fineColorApply26751Program = host.linkComputeProgram(
++            Iris26529SpatialRgbChromaShaders.fineColorApply26751,
++            "iris26751_frozen_fine_color_apply",
++        )
+     }
+ 
+     fun beginFullFrame(newBands: List<MgcSpatialRgbTile>) {
+@@ -194,12 +199,32 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+          * highlight false-color suppression remains authoritative.
+          */
+         dispatchUniversalAdaptiveColor(
+-            assembledRgb, workA, sabreSupportR, sabreSupportGb, sabreValidWeights,
++            assembledRgb, workA, workB, sabreSupportR, sabreSupportGb, sabreValidWeights,
+             sabreValidityWeightScale, preVgnPhysicalRgb,
+         )
+-        val completedVgn = assembledRgb
+-        assembledRgb = workA
+-        workA = completedVgn
++        val fineColorEvidenceValid = preVgnPhysicalRgb != 0 &&
++            sabreSupportR != 0 && sabreSupportGb != 0 && sabreValidWeights != 0
++        if (fineColorEvidenceValid) {
++            /* IRIS_26751_FROZEN_RECIPROCAL_FINE_COLOR_OWNER
++             * Universal cleanup publishes the immutable 26728-clean RGB plus a frozen fine-color
++             * seed map. A second non-recursive pass may restore only missing same-owner chroma.
++             * The already-corrected output never participates in seed ownership, so restored color
++             * cannot spread, certify itself or form scan-direction teeth. */
++            dispatchFineColorApply26751(
++                cleaned = workA,
++                seed = workB,
++                destination = assembledRgb,
++                sabreSupportR = sabreSupportR,
++                sabreSupportGb = sabreSupportGb,
++                sabreValidWeights = sabreValidWeights,
++                sabreValidityWeightScale = sabreValidityWeightScale,
++                preVgnPhysicalRgb = preVgnPhysicalRgb,
++            )
++        } else {
++            val completedVgn = assembledRgb
++            assembledRgb = workA
++            workA = completedVgn
++        }
+         val finalMs = (System.nanoTime() - finalStart) / 1_000_000L
+         onFinalSubmitted?.invoke()
+ 
+@@ -368,6 +393,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+     private fun dispatchUniversalAdaptiveColor(
+         source: Int,
+         destination: Int,
++        fineColorSeedDestination: Int,
+         sabreSupportR: Int,
+         sabreSupportGb: Int,
+         sabreValidWeights: Int,
+@@ -388,6 +414,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         setImageSize(universalAdaptiveColorProgram)
+         bindImage(0, source, GLES31.GL_READ_ONLY)
+         bindImage(1, destination, GLES31.GL_WRITE_ONLY)
++        bindImage(2, fineColorSeedDestination, GLES31.GL_WRITE_ONLY)
+         GLES31.glUniform1i(
+             host.uniformLocation(universalAdaptiveColorProgram, "uSabreSupportValid"),
+             if (sabreSupportValid) 1 else 0,
+@@ -424,7 +451,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+                 sabreSupportValid -> intArrayOf(source, sabreSupportR, sabreSupportGb, sabreValidWeights)
+                 else -> intArrayOf(source)
+             },
+-            intArrayOf(destination),
++            intArrayOf(destination, fineColorSeedDestination),
+         )
+         if (preVgnPhysicalValid) {
+             GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + 5)
+@@ -442,6 +469,51 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         clearImages()
+     }
+ 
++    private fun dispatchFineColorApply26751(
++        cleaned: Int,
++        seed: Int,
++        destination: Int,
++        sabreSupportR: Int,
++        sabreSupportGb: Int,
++        sabreValidWeights: Int,
++        sabreValidityWeightScale: Float,
++        preVgnPhysicalRgb: Int,
++    ) {
++        check(fineColorApply26751Program != 0)
++        GLES31.glUseProgram(fineColorApply26751Program)
++        setImageSize(fineColorApply26751Program)
++        bindImage(0, cleaned, GLES31.GL_READ_ONLY)
++        bindImage(1, seed, GLES31.GL_READ_ONLY)
++        bindImage(2, destination, GLES31.GL_WRITE_ONLY)
++        GLES31.glUniform1f(
++            host.uniformLocation(fineColorApply26751Program, "uSabreValidityWeightScale"),
++            sabreValidityWeightScale.coerceAtLeast(1f),
++        )
++        GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + 3)
++        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sabreSupportR)
++        GLES31.glUniform1i(host.uniformLocation(fineColorApply26751Program, "uSabreWeightR"), 3)
++        GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + 4)
++        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sabreSupportGb)
++        GLES31.glUniform1i(host.uniformLocation(fineColorApply26751Program, "uSabreWeightsGb"), 4)
++        GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + 5)
++        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sabreValidWeights)
++        GLES31.glUniform1i(host.uniformLocation(fineColorApply26751Program, "uSabreValidWeights"), 5)
++        GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + 6)
++        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, preVgnPhysicalRgb)
++        GLES31.glUniform1i(host.uniformLocation(fineColorApply26751Program, "uPhysicalPreVgn"), 6)
++        trackedDispatch(
++            "IRIS 26751 frozen reciprocal fine-color apply",
++            intArrayOf(cleaned, seed, sabreSupportR, sabreSupportGb, sabreValidWeights, preVgnPhysicalRgb),
++            intArrayOf(destination),
++        )
++        for (unit in 6 downTo 3) {
++            GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + unit)
++            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
++        }
++        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
++        clearImages()
++    }
++
+     private fun runIirError(source: Int, destination: Int, a10: FloatArray, b10: FloatArray): Pair<Int, Int> {
+         var input = source
+         var output = destination
+@@ -683,6 +755,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+         // IRIS_26578_FAIL_CLOSED_REAL_COLOR_GATE
+         layout(rgba16ui, binding = 0) readonly uniform highp uimage2D uSource;
+         layout(rgba16ui, binding = 1) writeonly uniform highp uimage2D uDestination;
++        layout(rgba16ui, binding = 2) writeonly uniform highp uimage2D uFineColorSeed26751;
+         uniform ivec2 uImageSize;
+         /* IRIS_26614_RAW_CFA_CHANNEL_VALIDITY_PROVENANCE
+          * Total R/G/B reconstruction weights plus the additive subset backed by source CFA samples
+@@ -731,6 +804,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+         void main() {
+             ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+             if (any(greaterThanEqual(p, uImageSize))) return;
++            uvec4 fineColorSeed26751 = uvec4(0u);
+             vec3 center = loadRgb(p);
+             float centerLuma = luminanceOf(center);
+             float centerScale = max(centerLuma, 0.060);
+@@ -1176,108 +1250,114 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 if (cleanedMagnitude > 1.0e-7 && restoredMagnitude > cleanedMagnitude) {
+                     correctedChroma *= restoredMagnitude / cleanedMagnitude;
+                 }
+-                /* IRIS_26750_SOURCE_PROVEN_FINE_COLOR
+-                 * 26728 already has the correct pre-VGN ResolveSabre color, but its restoration
+-                 * requires the post-cleanup hue to have survived. That fails for tiny legitimate
+-                 * print/icons because the conservative VGN cleanup can neutralize the hue first.
++                /* IRIS_26751_FROZEN_RECIPROCAL_FINE_COLOR_SEED
++                 * 26750 proved that per-pixel pre-VGN hue replacement is unsafe: different rows can
++                 * publish different CFA/interpolation colors, saturated backgrounds can certify a
++                 * neutral glyph, and broad material regions can be repainted into QR/maze blocks.
+                  *
+-                 * Re-prove only a compact two-dimensional colored micro-object from the immutable
+-                 * pre-VGN ResolveSabre image, weighted by near-perfect all-channel CFA validity.
+-                 * Unlike 26729+, no one-axis hue continuation, reconstructed-material boundary or
+-                 * recursive chroma state may certify color. A line/ribbon-like fringe therefore
+-                 * remains owned by the unchanged 26728 suppressor. The existing highlightSafe gate
+-                 * is a hard lock: clipped/flattened bright regions receive zero permission. */
+-                vec3 preVgnNormalizedChroma26750 = preVgnChroma / max(preVgnLuma, 0.060);
+-                float sourceMicroWeight26750 = 0.0;
+-                float sourceMicroNearWeight26750 = 0.0;
+-                float sourceMomentXX26750 = 0.0;
+-                float sourceMomentYY26750 = 0.0;
+-                float sourceMomentXY26750 = 0.0;
+-                float sourceNearLeft26750 = 0.0;
+-                float sourceNearRight26750 = 0.0;
+-                float sourceNearUp26750 = 0.0;
+-                float sourceNearDown26750 = 0.0;
+-                for (int sourceY26750 = -2; sourceY26750 <= 2; ++sourceY26750) {
+-                    for (int sourceX26750 = -2; sourceX26750 <= 2; ++sourceX26750) {
+-                        if (sourceX26750 == 0 && sourceY26750 == 0) continue;
+-                        ivec2 sourceQ26750 = clamp(
+-                            p + ivec2(sourceX26750, sourceY26750),
++                 * 26751 never changes correctedChroma in this seed stage. It freezes a sparse seed
++                 * map from immutable pre-VGN ResolveSabre color + exact CFA validity while the exact
++                 * 26728 cleaned RGB remains authoritative. A seed exists only where:
++                 *   - color is materially missing from the clean 26728 result;
++                 *   - same-hue, same-luma source support exists in both image axes;
++                 *   - a nearby material boundary proves this is bounded fine structure, not a broad
++                 *     already-correct field;
++                 *   - a different-luma saturated background does not explain the center hue;
++                 *   - all-channel source validity is near-perfect and highlightSafe is nonzero.
++                 * The later apply pass reads this map but never writes back into it, so ownership is
++                 * frozen and non-recursive. */
++                vec3 sourceNorm26751 = preVgnChroma / max(preVgnLuma, 0.060);
++                float sourceNormMag26751 = length(sourceNorm26751);
++                float cleanedNormMag26751 = length(correctedChroma) / centerScale;
++                float missingNorm26751 = max(sourceNormMag26751 - cleanedNormMag26751, 0.0);
++                float missingAbs26751 = smoothstep(0.025, 0.075, missingNorm26751);
++                float missingRatio26751 = smoothstep(1.18, 1.55,
++                    sourceNormMag26751 / max(cleanedNormMag26751, 0.025));
++                float sourceCenterChromatic26751 = smoothstep(0.055, 0.120, sourceNormMag26751);
++
++                float sameHueWeight26751 = 0.0;
++                float nearSameHueWeight26751 = 0.0;
++                float nearLeft26751 = 0.0;
++                float nearRight26751 = 0.0;
++                float nearUp26751 = 0.0;
++                float nearDown26751 = 0.0;
++                float boundaryEvidence26751 = 0.0;
++                vec3 differentLumaColorSum26751 = vec3(0.0);
++                float differentLumaColorWeight26751 = 0.0;
++                for (int sy26751 = -2; sy26751 <= 2; ++sy26751) {
++                    for (int sx26751 = -2; sx26751 <= 2; ++sx26751) {
++                        if (sx26751 == 0 && sy26751 == 0) continue;
++                        ivec2 q26751 = clamp(p + ivec2(sx26751, sy26751),
+                             ivec2(0), uImageSize - ivec2(1));
+-                        vec3 sourceRgb26750 = max(
+-                            texelFetch(uPhysicalPreVgn, sourceQ26750, 0).rgb, vec3(0.0));
+-                        float sourceLuma26750 = luminanceOf(sourceRgb26750);
+-                        vec3 sourceNormChroma26750 =
+-                            (sourceRgb26750 - vec3(sourceLuma26750)) /
+-                            max(sourceLuma26750, 0.060);
+-                        float sourceValidity26750 = minimum3(
+-                            loadSabreChannelValidity(sourceQ26750));
+-                        float sourceMeasured26750 =
+-                            smoothstep(0.992, 0.9995, sourceValidity26750);
+-                        float sourceChromatic26750 = smoothstep(
+-                            0.050, 0.115, length(sourceNormChroma26750));
+-                        float sourceRelativeLuma26750 = abs(sourceLuma26750 - preVgnLuma) /
+-                            max(max(sourceLuma26750, preVgnLuma), 0.060);
+-                        float sourceCompatible26750 =
+-                            1.0 - smoothstep(0.72, 1.20, sourceRelativeLuma26750);
+-                        float sourceWeight26750 = sourceMeasured26750 *
+-                            sourceChromatic26750 * sourceCompatible26750;
+-                        sourceMicroWeight26750 += sourceWeight26750;
+-                        if (abs(sourceX26750) <= 1 && abs(sourceY26750) <= 1) {
+-                            sourceMicroNearWeight26750 += sourceWeight26750;
+-                            if (sourceX26750 < 0) sourceNearLeft26750 =
+-                                max(sourceNearLeft26750, sourceWeight26750);
+-                            if (sourceX26750 > 0) sourceNearRight26750 =
+-                                max(sourceNearRight26750, sourceWeight26750);
+-                            if (sourceY26750 < 0) sourceNearUp26750 =
+-                                max(sourceNearUp26750, sourceWeight26750);
+-                            if (sourceY26750 > 0) sourceNearDown26750 =
+-                                max(sourceNearDown26750, sourceWeight26750);
++                        vec3 sourceRgbQ26751 = max(
++                            texelFetch(uPhysicalPreVgn, q26751, 0).rgb, vec3(0.0));
++                        float sourceLumaQ26751 = luminanceOf(sourceRgbQ26751);
++                        vec3 sourceNormQ26751 = (sourceRgbQ26751 - vec3(sourceLumaQ26751)) /
++                            max(sourceLumaQ26751, 0.060);
++                        float sourceMagQ26751 = length(sourceNormQ26751);
++                        float validityQ26751 = minimum3(loadSabreChannelValidity(q26751));
++                        float measuredQ26751 = smoothstep(0.992, 0.9995, validityQ26751);
++                        float chromaticQ26751 = smoothstep(0.055, 0.120, sourceMagQ26751);
++                        float relativeLumaQ26751 = abs(sourceLumaQ26751 - preVgnLuma) /
++                            max(max(sourceLumaQ26751, preVgnLuma), 0.060);
++                        float sameLumaQ26751 = 1.0 - smoothstep(0.18, 0.42, relativeLumaQ26751);
++                        float hueQ26751 = smoothstep(0.93, 0.985,
++                            hueAgreement(sourceNorm26751, sourceNormQ26751));
++                        float sameOwnerQ26751 = measuredQ26751 * chromaticQ26751 *
++                            sameLumaQ26751 * hueQ26751;
++                        sameHueWeight26751 += sameOwnerQ26751;
++                        if (abs(sx26751) <= 1 && abs(sy26751) <= 1) {
++                            nearSameHueWeight26751 += sameOwnerQ26751;
++                            if (sx26751 < 0) nearLeft26751 = max(nearLeft26751, sameOwnerQ26751);
++                            if (sx26751 > 0) nearRight26751 = max(nearRight26751, sameOwnerQ26751);
++                            if (sy26751 < 0) nearUp26751 = max(nearUp26751, sameOwnerQ26751);
++                            if (sy26751 > 0) nearDown26751 = max(nearDown26751, sameOwnerQ26751);
++                        }
++                        float differentLumaQ26751 = smoothstep(0.22, 0.52, relativeLumaQ26751);
++                        boundaryEvidence26751 = max(boundaryEvidence26751,
++                            measuredQ26751 * differentLumaQ26751);
++                        if (max(abs(sx26751), abs(sy26751)) == 2) {
++                            float backgroundWeight26751 = measuredQ26751 * chromaticQ26751 *
++                                differentLumaQ26751;
++                            differentLumaColorSum26751 += sourceNormQ26751 * backgroundWeight26751;
++                            differentLumaColorWeight26751 += backgroundWeight26751;
+                         }
+-                        sourceMomentXX26750 += sourceWeight26750 *
+-                            float(sourceX26750 * sourceX26750);
+-                        sourceMomentYY26750 += sourceWeight26750 *
+-                            float(sourceY26750 * sourceY26750);
+-                        sourceMomentXY26750 += sourceWeight26750 *
+-                            float(sourceX26750 * sourceY26750);
+                     }
+                 }
+-                float sourceTrace26750 = sourceMomentXX26750 + sourceMomentYY26750;
+-                float sourceDet26750 = max(
+-                    sourceMomentXX26750 * sourceMomentYY26750 -
+-                    sourceMomentXY26750 * sourceMomentXY26750, 0.0);
+-                float sourceMinorMoment26750 = sourceTrace26750 > 1.0e-6
+-                    ? 0.5 * (sourceTrace26750 - sqrt(max(
+-                        sourceTrace26750 * sourceTrace26750 - 4.0 * sourceDet26750, 0.0))) /
+-                        max(sourceMicroWeight26750, 1.0e-6)
+-                    : 0.0;
+-                float sourceArea26750 =
+-                    smoothstep(1.35, 3.25, sourceMicroWeight26750) *
+-                    smoothstep(1.15, 2.75, sourceMicroNearWeight26750) *
+-                    smoothstep(0.10, 0.32, sourceMinorMoment26750);
+-                float sourceHorizontal26750 = max(sourceNearLeft26750, sourceNearRight26750);
+-                float sourceVertical26750 = max(sourceNearUp26750, sourceNearDown26750);
+-                float sourceTwoAxis26750 =
+-                    smoothstep(0.18, 0.60, sourceHorizontal26750) *
+-                    smoothstep(0.18, 0.60, sourceVertical26750);
+-                float sourceCompact26750 = sourceArea26750 * sourceTwoAxis26750;
+-
+-                /* Strong source proof may restore the pre-VGN hue even when 26728 cleanup has
+-                 * already neutralized that hue. Physical invalid-channel evidence remains a hard
+-                 * veto, and the original bright/highlight lock remains unchanged. */
+-                float sourceFineColorProof26750 = smoothstep(0.72, 0.94, sourceCompact26750);
+-                float physicalInvalidVeto26750 = smoothstep(0.20, 0.55,
++                float horizontalSupport26751 = max(nearLeft26751, nearRight26751);
++                float verticalSupport26751 = max(nearUp26751, nearDown26751);
++                float reciprocalTwoAxis26751 = smoothstep(0.34, 0.72, horizontalSupport26751) *
++                    smoothstep(0.34, 0.72, verticalSupport26751);
++                float boundedCore26751 = smoothstep(1.45, 3.25, sameHueWeight26751) *
++                    smoothstep(0.85, 2.20, nearSameHueWeight26751) *
++                    reciprocalTwoAxis26751 * smoothstep(0.38, 0.78, boundaryEvidence26751);
++
++                vec3 backgroundConsensus26751 = differentLumaColorWeight26751 > 1.0e-6
++                    ? differentLumaColorSum26751 / differentLumaColorWeight26751
++                    : vec3(0.0);
++                float cleanedNeutral26751 = 1.0 - smoothstep(0.030, 0.085, cleanedNormMag26751);
++                float backgroundColorSupport26751 = smoothstep(0.80, 2.10,
++                    differentLumaColorWeight26751);
++                float backgroundHueMatch26751 = smoothstep(0.94, 0.985,
++                    hueAgreement(sourceNorm26751, backgroundConsensus26751));
++                float neutralBackgroundLeakVeto26751 = cleanedNeutral26751 *
++                    backgroundColorSupport26751 * backgroundHueMatch26751;
++
++                float physicalInvalidVeto26751 = smoothstep(0.20, 0.55,
+                     maximum3(channelInvalidity));
+-                float sourceFineColorPermission26750 = measuredProof * preVgnChromaPresent *
+-                    sourceFineColorProof26750 * highlightSafe * (1.0 - physicalInvalidVeto26750);
+-                vec3 sourceFineTarget26750 = preVgnNormalizedChroma26750 * centerScale;
+-                correctedChroma = mix(correctedChroma, sourceFineTarget26750,
+-                    sourceFineColorPermission26750);
+-
+-                float floorPermission = max(
+-                    smoothstep(0.78, 0.92, restorePermission),
+-                    smoothstep(0.78, 0.92, sourceFineColorPermission26750));
+-                protectedPreVgnMagnitude = floorPermission >= 0.5
+-                    ? max(preVgnMagnitude, length(sourceFineTarget26750)) : 0.0;
++                float fineSeedPermission26751 = measuredProof * sourceCenterChromatic26751 *
++                    missingAbs26751 * missingRatio26751 * boundedCore26751 * highlightSafe *
++                    (1.0 - physicalInvalidVeto26751) * (1.0 - neutralBackgroundLeakVeto26751);
++                if (fineSeedPermission26751 > 0.001) {
++                    uvec3 seedRgb26751 = uvec3(round(clamp(preVgnRgb, vec3(0.0), vec3(1.0)) *
++                        65535.0));
++                    uint seedPermission26751 = uint(round(clamp(fineSeedPermission26751,
++                        0.0, 1.0) * 65535.0));
++                    fineColorSeed26751 = uvec4(seedRgb26751, seedPermission26751);
++                }
++
++                float floorPermission = smoothstep(0.78, 0.92, restorePermission);
++                protectedPreVgnMagnitude = floorPermission >= 0.5 ? preVgnMagnitude : 0.0;
+             }
+ 
+             vec3 correctedRgb = clamp(vec3(centerLuma) + correctedChroma, 0.0, 1.0);
+@@ -1286,6 +1366,184 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 ? uint(round(clamp(protectedPreVgnMagnitude, 0.0, 1.0) * 65535.0))
+                 : 65535u;
+             imageStore(uDestination, p, uvec4(encodedRgb, encodedProtection));
++            imageStore(uFineColorSeed26751, p, fineColorSeed26751);
++        }
++    """.trimIndent()
++
++    /* IRIS_26751_FROZEN_RECIPROCAL_FINE_COLOR_OWNER
++     * Read only the immutable seed map published by the 26728-clean universal pass. No restored
++     * pixel can create a seed or alter ownership. Candidate pixels must still be missing color,
++     * match a nearby seed in hue and source luminance, retain near-perfect CFA validity, and remain
++     * outside the inherited highlight lock. The target hue/magnitude is a local seed consensus, not
++     * the center pixel's pre-VGN color; this removes row-dependent CFA teeth. Broad already-correct
++     * materials have zero missing-color permission and remain byte-equivalent to clean 26728 RGB. */
++    val fineColorApply26751 = """
++        #version 310 es
++        layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++        precision highp float;
++        precision highp int;
++        /* IRIS_26751_FROZEN_RECIPROCAL_FINE_COLOR_OWNER */
++        layout(rgba16ui, binding = 0) readonly uniform highp uimage2D uCleaned26751;
++        layout(rgba16ui, binding = 1) readonly uniform highp uimage2D uSeed26751;
++        layout(rgba16ui, binding = 2) writeonly uniform highp uimage2D uOutput26751;
++        uniform ivec2 uImageSize;
++        uniform highp sampler2D uSabreWeightR;
++        uniform highp sampler2D uSabreWeightsGb;
++        uniform highp sampler2D uSabreValidWeights;
++        uniform highp sampler2D uPhysicalPreVgn;
++        uniform highp float uSabreValidityWeightScale;
++
++        float luma26751(vec3 rgb) { return dot(rgb, vec3(0.25, 0.50, 0.25)); }
++        float min326751(vec3 v) { return min(v.r, min(v.g, v.b)); }
++        float max326751(vec3 v) { return max(v.r, max(v.g, v.b)); }
++        float hue26751(vec3 a, vec3 b) {
++            return clamp(dot(a, b) / max(length(a) * length(b), 1.0e-6), -1.0, 1.0);
++        }
++        vec3 validity26751(ivec2 p) {
++            ivec2 q = clamp(p, ivec2(0), uImageSize - ivec2(1));
++            vec3 totalWeight = vec3(
++                max(texelFetch(uSabreWeightR, q, 0).r, 0.0),
++                max(texelFetch(uSabreWeightsGb, q, 0).r, 0.0),
++                max(texelFetch(uSabreWeightsGb, q, 0).g, 0.0));
++            vec3 validWeight = max(texelFetch(uSabreValidWeights, q, 0).rgb, vec3(0.0)) *
++                max(uSabreValidityWeightScale, 1.0);
++            return clamp(validWeight / max(totalWeight, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
++        }
++        vec3 seedRgb26751(uvec4 packedSeed) { return vec3(packedSeed.rgb) / 65535.0; }
++
++        void main() {
++            ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++            if (any(greaterThanEqual(p, uImageSize))) return;
++            uvec4 cleanedPacked26751 = imageLoad(uCleaned26751, p);
++            vec3 cleanedRgb26751 = vec3(cleanedPacked26751.rgb) / 65535.0;
++            float cleanedLuma26751 = luma26751(cleanedRgb26751);
++            float cleanedScale26751 = max(cleanedLuma26751, 0.060);
++            vec3 cleanedChroma26751 = cleanedRgb26751 - vec3(cleanedLuma26751);
++            float cleanedNormMag26751 = length(cleanedChroma26751) / cleanedScale26751;
++
++            vec3 sourceRgb26751 = max(texelFetch(uPhysicalPreVgn, p, 0).rgb, vec3(0.0));
++            float sourcePeak26751 = max326751(sourceRgb26751);
++            float sourceLuma26751 = luma26751(sourceRgb26751);
++            vec3 sourceNorm26751 = (sourceRgb26751 - vec3(sourceLuma26751)) /
++                max(sourceLuma26751, 0.060);
++            float sourceNormMag26751 = length(sourceNorm26751);
++            float measured26751 = smoothstep(0.992, 0.9995,
++                min326751(validity26751(p)));
++            float highlightSafe26751 = 1.0 - smoothstep(0.78, 0.92,
++                max(sourcePeak26751, cleanedLuma26751));
++
++            vec3 consensusNormSum26751 = vec3(0.0);
++            float consensusWeight26751 = 0.0;
++            float consensusPermission26751 = 0.0;
++            for (int sy26751 = -2; sy26751 <= 2; ++sy26751) {
++                for (int sx26751 = -2; sx26751 <= 2; ++sx26751) {
++                    ivec2 q26751 = clamp(p + ivec2(sx26751, sy26751),
++                        ivec2(0), uImageSize - ivec2(1));
++                    uvec4 seed26751 = imageLoad(uSeed26751, q26751);
++                    float seedPermission26751 = float(seed26751.a) / 65535.0;
++                    if (seedPermission26751 <= 0.0) continue;
++                    vec3 seedRgbValue26751 = seedRgb26751(seed26751);
++                    float seedLuma26751 = luma26751(seedRgbValue26751);
++                    vec3 seedNorm26751 = (seedRgbValue26751 - vec3(seedLuma26751)) /
++                        max(seedLuma26751, 0.060);
++                    float seedNormMag26751 = length(seedNorm26751);
++                    float hueMatch26751 = smoothstep(0.88, 0.975,
++                        hue26751(sourceNorm26751, seedNorm26751));
++                    float relativeLuma26751 = abs(sourceLuma26751 - seedLuma26751) /
++                        max(max(sourceLuma26751, seedLuma26751), 0.060);
++                    float lumaMatch26751 = 1.0 - smoothstep(0.20, 0.46, relativeLuma26751);
++                    float d226751 = float(sx26751 * sx26751 + sy26751 * sy26751);
++                    float spatial26751 = 1.0 / (1.0 + 0.38 * d226751);
++                    float w26751 = seedPermission26751 * hueMatch26751 *
++                        lumaMatch26751 * spatial26751 * smoothstep(0.055, 0.120, seedNormMag26751);
++                    consensusNormSum26751 += seedNorm26751 * w26751;
++                    consensusWeight26751 += w26751;
++                    consensusPermission26751 = max(consensusPermission26751,
++                        seedPermission26751 * hueMatch26751 * lumaMatch26751);
++                }
++            }
++
++            vec3 consensusNorm26751 = consensusWeight26751 > 1.0e-6
++                ? consensusNormSum26751 / consensusWeight26751 : vec3(0.0);
++            float consensusNormMag26751 = length(consensusNorm26751);
++            float seedSupport26751 = smoothstep(0.55, 1.80, consensusWeight26751) *
++                smoothstep(0.55, 0.90, consensusPermission26751);
++            float sourceHueConsensus26751 = smoothstep(0.88, 0.975,
++                hue26751(sourceNorm26751, consensusNorm26751));
++            float sourceCoverage26751 = smoothstep(0.58, 0.84,
++                sourceNormMag26751 / max(consensusNormMag26751, 0.030));
++            float missingAbs26751 = smoothstep(0.020, 0.070,
++                max(consensusNormMag26751 - cleanedNormMag26751, 0.0));
++            float missingRatio26751 = smoothstep(1.14, 1.48,
++                consensusNormMag26751 / max(cleanedNormMag26751, 0.025));
++
++            /* Neutral-polarity / background-hue veto. A neutral glyph may sit inside a saturated
++             * field, but that field cannot become its color owner. Use only four frozen radius-two
++             * source samples so this veto is structural, cheap and independent of restored RGB. */
++            const ivec2 bgDir26751[4] = ivec2[4](
++                ivec2(-2,0), ivec2(2,0), ivec2(0,-2), ivec2(0,2));
++            vec3 bgNormSum26751 = vec3(0.0);
++            float bgWeight26751 = 0.0;
++            for (int i26751 = 0; i26751 < 4; ++i26751) {
++                ivec2 q26751 = clamp(p + bgDir26751[i26751],
++                    ivec2(0), uImageSize - ivec2(1));
++                vec3 qRgb26751 = max(texelFetch(uPhysicalPreVgn, q26751, 0).rgb, vec3(0.0));
++                float qLuma26751 = luma26751(qRgb26751);
++                vec3 qNorm26751 = (qRgb26751 - vec3(qLuma26751)) / max(qLuma26751, 0.060);
++                float qMag26751 = length(qNorm26751);
++                float qMeasured26751 = smoothstep(0.992, 0.9995,
++                    min326751(validity26751(q26751)));
++                float rel26751 = abs(qLuma26751 - sourceLuma26751) /
++                    max(max(qLuma26751, sourceLuma26751), 0.060);
++                float w26751 = qMeasured26751 * smoothstep(0.055, 0.120, qMag26751) *
++                    smoothstep(0.22, 0.52, rel26751);
++                bgNormSum26751 += qNorm26751 * w26751;
++                bgWeight26751 += w26751;
++            }
++            vec3 bgConsensus26751 = bgWeight26751 > 1.0e-6
++                ? bgNormSum26751 / bgWeight26751 : vec3(0.0);
++            float cleanedNeutral26751 = 1.0 - smoothstep(0.030, 0.085, cleanedNormMag26751);
++            float backgroundLeakVeto26751 = cleanedNeutral26751 *
++                smoothstep(0.80, 2.00, bgWeight26751) *
++                smoothstep(0.94, 0.985, hue26751(consensusNorm26751, bgConsensus26751));
++
++            float permission26751 = measured26751 * highlightSafe26751 * seedSupport26751 *
++                sourceHueConsensus26751 * sourceCoverage26751 * missingAbs26751 *
++                missingRatio26751 * (1.0 - backgroundLeakVeto26751);
++
++            vec3 finalChroma26751 = cleanedChroma26751;
++            float protectedMagnitude26751 = float(cleanedPacked26751.a) / 65535.0;
++            if (permission26751 > 0.001 && consensusNormMag26751 > 1.0e-7) {
++                vec3 targetChroma26751 = consensusNorm26751 * cleanedScale26751;
++                float targetScale26751 = 1.0;
++                for (int c26751 = 0; c26751 < 3; ++c26751) {
++                    float cc26751 = targetChroma26751[c26751];
++                    if (cc26751 < -1.0e-7) {
++                        targetScale26751 = min(targetScale26751,
++                            cleanedLuma26751 / max(-cc26751, 1.0e-7));
++                    } else if (cc26751 > 1.0e-7) {
++                        targetScale26751 = min(targetScale26751,
++                            (1.0 - cleanedLuma26751) / cc26751);
++                    }
++                }
++                targetChroma26751 *= clamp(targetScale26751, 0.0, 1.0);
++                float targetMagnitude26751 = length(targetChroma26751);
++                float cleanedMagnitude26751 = length(cleanedChroma26751);
++                if (targetMagnitude26751 > cleanedMagnitude26751 + 1.0e-7) {
++                    finalChroma26751 = mix(cleanedChroma26751, targetChroma26751,
++                        clamp(permission26751, 0.0, 1.0));
++                    if (permission26751 >= 0.50) {
++                        protectedMagnitude26751 = max(protectedMagnitude26751,
++                            length(finalChroma26751));
++                    }
++                }
++            }
++            vec3 outputRgb26751 = clamp(vec3(cleanedLuma26751) + finalChroma26751,
++                vec3(0.0), vec3(1.0));
++            uvec3 outputEncoded26751 = uvec3(round(outputRgb26751 * 65535.0));
++            uint protectionEncoded26751 = uint(round(clamp(protectedMagnitude26751,
++                0.0, 1.0) * 65535.0));
++            imageStore(uOutput26751, p, uvec4(outputEncoded26751, protectionEncoded26751));
+         }
+     """.trimIndent()
+ 
+diff --git a/app/version.properties b/app/version.properties
+index 37cff997e02f7ebaf82d56c808fb725147a92d3c..bc377912b648f2cafcd7224b013b6154e16bc938 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726750
+-VERSION_BUILD=26750
++VERSION_NAME=0.9726751
++VERSION_BUILD=26751
