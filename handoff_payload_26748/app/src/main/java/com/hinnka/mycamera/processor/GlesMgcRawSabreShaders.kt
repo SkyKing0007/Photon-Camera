@@ -2802,6 +2802,7 @@ internal object GlesMgcRawSabreShaders {
             /* IRIS_26748_NORMAL_ONLY_CHROMA_ENERGY_MOMENT
              * Independent aligned NORMAL observations report what chroma energy they actually
              * measured before cross-frame RGB collapse. This sidecar never modifies frameWeight. */
+            vec2 chroma26748 = vec2(0.0);
             float temporalChromaWeight26748 = 0.0;
             float temporalChromaEnergy26748 = 0.0;
             if (uTemporalChromaEvidence26748 != 0 && frameWeight > 0.08) {
@@ -2811,7 +2812,7 @@ internal object GlesMgcRawSabreShaders {
                 float sum26748 = max(
                     calculationRgb26748.r + 2.0 * calculationRgb26748.g + calculationRgb26748.b,
                     1.0e-6);
-                vec2 chroma26748 =
+                chroma26748 =
                     (calculationRgb26748.rb - vec2(calculationRgb26748.g)) / sum26748;
                 vec3 channelValidity26748 = clamp(
                     validAccumulatedWeight / max(accumulatedWeight, vec3(1.0e-6)),

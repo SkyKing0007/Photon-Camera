@@ -56,6 +56,15 @@ assert changed=={'sabre_merge.frag','universal_adaptive_color.comp','vgn_seed.co
 mv=specs(cand)['sabre_merge.frag'][0]
 for t in ['IRIS_26748_TEMPORAL_RAW_CHROMA_PROVENANCE','IRIS_26748_NORMAL_ONLY_CHROMA_ENERGY_MOMENT','layout(location = 3) out vec4 oTemporalChromaStats26748','chroma26748 * temporalChromaWeight26748']:
  assert t in mv,t
+# Permanent regression for failed 26748 Actions run 36962501149: chroma26748 must live in
+# main() scope because oTemporalChromaStats26748 consumes it after the evidence if-block.
+scope_decl='vec2 chroma26748 = vec2(0.0);'
+scope_if='if (uTemporalChromaEvidence26748 != 0 && frameWeight > 0.08) {'
+assert mv.count(scope_decl)==1 and mv.count('vec2 chroma26748 =')==1
+assert mv.index(scope_decl) < mv.index(scope_if) < mv.index('oTemporalChromaStats26748 = vec4(')
+evidence_block=mv[mv.index(scope_if):mv.index('oTemporalChromaStats26748 = vec4(')]
+assert 'vec2 chroma26748 =' not in evidence_block
+assert evidence_block.count('chroma26748 =')==1
 for fn in ['universal_adaptive_color.comp','vgn_seed.comp','vgn_local_median.comp']:
  src=specs(cand)[fn][0]
  for t in ['IRIS_26748_TEMPORAL_RAW_CHROMA_PROVENANCE','temporalColorTrust26748','rawCoherence','directionAgreement','rawConsensusProof']:

@@ -20,6 +20,12 @@ for t in ['IRIS_26748_TEMPORAL_RAW_CHROMA_PROVENANCE','IRIS_26748_NORMAL_ONLY_CH
  assert t in sab,t
 block=sab[sab.index('/* IRIS_26748_NORMAL_ONLY_CHROMA_ENERGY_MOMENT'):sab.index('accumulatedColor *= frameWeight;',sab.index('/* IRIS_26748_NORMAL_ONLY_CHROMA_ENERGY_MOMENT'))]
 assert 'frameWeight =' not in block and 'frameWeight *=' not in block
+# Permanent regression for failed 26748 Actions run 36962501149: output write occurs
+# after the evidence block, therefore chroma26748 must be declared in main() scope.
+assert block.count('vec2 chroma26748 = vec2(0.0);')==1
+assert block.index('vec2 chroma26748 = vec2(0.0);') < block.index('if (uTemporalChromaEvidence26748 != 0 && frameWeight > 0.08) {')
+evidence=block[block.index('if (uTemporalChromaEvidence26748 != 0 && frameWeight > 0.08) {'):block.index('oTemporalChromaStats26748 = vec4(')]
+assert 'vec2 chroma26748 =' not in evidence and evidence.count('chroma26748 =')==1
 for t in ['GLES30.GL_RGBA16F','temporalChromaEvidence26748 = true','temporalChromaEvidence26748 = frame.role == RawBurstFrameRole.NORMAL','sabreTemporalChromaStats26748 = temporalChromaStats26748','longShortExcluded=true','superResSharedNativeVgnGuide=true']:
  assert t in stack,t
 assert 'temporalChromaEvidence26748 = frame.role == RawBurstFrameRole.SHORT' not in stack
