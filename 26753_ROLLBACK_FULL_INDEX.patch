@@ -1,0 +1,1185 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index a3ea9718665254cdf26af0c53a7dd779bb3fb917..beaf34c2e69e57329a3e4b02524800c87ae5bbab 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -6,7 +6,6 @@
+ #include <chrono>
+ #include <complex>
+ #include <memory>
+-#include <new>
+ #include <numeric>
+ #include <condition_variable>
+ #include <cstdarg>
+@@ -1583,43 +1582,22 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_isJpegRNative(JNIEnv*e,jclass,jstring p){U u(e,p);return u.c&&iris26507::isJpegR(u.c)?JNI_TRUE:JNI_FALSE;}
+ 
+-/* IRIS_26753_IPOL_PLAN_B_MOBILE_DIRECT_NATIVE
+- * Mobile-safe adaptation of Abergel/Almansa/Moisan/Nous, "Linear Super-Resolution Through
+- * Translational Motion" (IPOL 2026). The estimator remains pure Plan B: modified-Tukey
+- * apodization, the Shannon/Fourier translation+subsampling observation model, and one direct
+- * Moore-Penrose weighted least-squares solve. If and only if the direct residuals contain a
+- * robustly detected frame outlier, Equation (56) l1-l2 IRLS is allowed for at most five updates.
+- *
+- * 26753 changes only the computational realization. Instead of inverting the zoom^2 alias-space
+- * normal matrix, it uses the mathematically equivalent observation-space (dual) Moore-Penrose
+- * system, so every eigensystem is bounded by the retained frame count. Kotlin supplies bounded
+- * overlapping spatial tiles and accumulates them directly on the requested native output grid.
+- * RGB/chroma/highlight publication remains the successful Sabre/VGN owner.
++/* IRIS_26752_IPOL_PLAN_B_TRANSLATIONAL_SUPERRES
++ * Android-native adaptation of Abergel/Almansa/Moisan/Nous, "Linear Super-Resolution Through
++ * Translational Motion" (IPOL 2026). The mathematical owner is unchanged: modified-Tukey
++ * apodization, Shannon/Fourier translation+subsampling operator, direct block pseudoinverse
++ * weighted least-squares, and Equation (56) l1-l2 IRLS. Iris supplies only scalar camera-linear
++ * luma and one global translation per NORMAL frame; RGB/chroma/highlight publication remains the
++ * successful 26733 Sabre/VGN owner.
+  */
+ namespace iris26752planb {
+ using C = std::complex<float>;
+ constexpr double kPi = 3.141592653589793238462643383279502884;
+ constexpr double kPseudoInverseEps = 1.0e-9;
+-constexpr double kIrlsEtaFloor = 1.0e-2;
++constexpr double kIrlsEtaFloor = 1.0e-2; // exact reference CLI default (-e)
+ constexpr double kIrlsRelativeStop = 1.0e-5;
+-constexpr int kIrlsMaxUpdates = 5;
+-constexpr int kJacobiMaxSweeps = 64;
++constexpr int kIrlsMaxIterations = 50;
+ constexpr double kTukeyR = 0.025;
+-constexpr uint64_t kNativeReserveBytes = 8ULL * 1024ULL * 1024ULL;
+-
+-struct Deadline {
+-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+-    int64_t maxMs = 0;
+-    bool expired() const {
+-        if(maxMs<=0)return false;
+-        return std::chrono::duration_cast<std::chrono::milliseconds>(
+-            std::chrono::steady_clock::now()-start).count() >= maxMs;
+-    }
+-    int64_t elapsedMs() const {
+-        return std::chrono::duration_cast<std::chrono::milliseconds>(
+-            std::chrono::steady_clock::now()-start).count();
+-    }
+-};
+ 
+ struct MapFile {
+     int fd=-1; size_t bytes=0; void* ptr=MAP_FAILED; bool writable=false;
+@@ -1654,14 +1632,15 @@ void radix2(std::vector<C>&a,bool inverse){
+ struct FftPlan {
+     int n=0; bool radix=false; size_t m=0; std::vector<C> chirp; std::vector<C> bFft;
+     explicit FftPlan(int size=0):n(size),radix(isPow2((size_t)size)){
+-        if(n<=0)return;if(radix)return;m=nextPow2((size_t)2*n-1);if(m==0)return;chirp.resize((size_t)n);bFft.assign(m,C(0,0));
++        if(n<=0)return;if(radix)return;m=nextPow2((size_t)2*n-1);chirp.resize((size_t)n);bFft.assign(m,C(0,0));
+         for(int k=0;k<n;k++){
+             double angle=kPi*(double)k*(double)k/(double)n;C pos((float)std::cos(angle),(float)std::sin(angle));
+-            chirp[(size_t)k]=std::conj(pos);bFft[(size_t)k]=pos;if(k>0)bFft[m-(size_t)k]=pos;
++            chirp[(size_t)k]=std::conj(pos); // exp(-i*pi*k^2/n)
++            bFft[(size_t)k]=pos;if(k>0)bFft[m-(size_t)k]=pos;
+         }
+         radix2(bFft,false);
+     }
+-    bool valid()const{return n>0&&(radix||(m>0&&bFft.size()==m));}
++    bool valid()const{return n>0&&(radix||m>0);}
+ };
+ 
+ void fftForward(std::vector<C>&v,const FftPlan&p,std::vector<C>&scratch){
+@@ -1674,17 +1653,15 @@ void fftVector(std::vector<C>&v,const FftPlan&p,bool inverse,std::vector<C>&scra
+     if(!inverse){fftForward(v,p,scratch);return;}for(auto&z:v)z=std::conj(z);fftForward(v,p,scratch);float inv=1.f/(float)p.n;for(auto&z:v)z=std::conj(z)*inv;
+ }
+ 
+-bool fft2dPlanned(C*data,int w,int h,bool inverse,const FftPlan&pw,const FftPlan&ph,int workerLimit,const Deadline*deadline){
+-    if(!data||!pw.valid()||!ph.valid()||pw.n!=w||ph.n!=h)return false;
+-    std::atomic<bool> cancelled{false};
++bool fft2d(C*data,int w,int h,bool inverse){
++    FftPlan pw(w),ph(h);if(!pw.valid()||!ph.valid())return false;
+     auto runRows=[&](int workers){std::atomic<int> next{0};std::vector<std::thread> ts;ts.reserve((size_t)workers);
+-        for(int t=0;t<workers;t++)ts.emplace_back([&](){std::vector<C> line((size_t)w),scratch;for(;;){if(cancelled.load()||(deadline&&deadline->expired())){cancelled.store(true);break;}int y=next.fetch_add(1);if(y>=h)break;std::copy(data+(size_t)y*w,data+(size_t)(y+1)*w,line.begin());fftVector(line,pw,inverse,scratch);std::copy(line.begin(),line.end(),data+(size_t)y*w);}});
++        for(int t=0;t<workers;t++)ts.emplace_back([&](){std::vector<C> line((size_t)w),scratch;for(;;){int y=next.fetch_add(1);if(y>=h)break;std::copy(data+(size_t)y*w,data+(size_t)(y+1)*w,line.begin());fftVector(line,pw,inverse,scratch);std::copy(line.begin(),line.end(),data+(size_t)y*w);}});
+         for(auto&t:ts)t.join();};
+     auto runCols=[&](int workers){std::atomic<int> next{0};std::vector<std::thread> ts;ts.reserve((size_t)workers);
+-        for(int t=0;t<workers;t++)ts.emplace_back([&](){std::vector<C> line((size_t)h),scratch;for(;;){if(cancelled.load()||(deadline&&deadline->expired())){cancelled.store(true);break;}int x=next.fetch_add(1);if(x>=w)break;for(int y=0;y<h;y++)line[(size_t)y]=data[(size_t)y*w+x];fftVector(line,ph,inverse,scratch);for(int y=0;y<h;y++)data[(size_t)y*w+x]=line[(size_t)y];}});
++        for(int t=0;t<workers;t++)ts.emplace_back([&](){std::vector<C> line((size_t)h),scratch;for(;;){int x=next.fetch_add(1);if(x>=w)break;for(int y=0;y<h;y++)line[(size_t)y]=data[(size_t)y*w+x];fftVector(line,ph,inverse,scratch);for(int y=0;y<h;y++)data[(size_t)y*w+x]=line[(size_t)y];}});
+         for(auto&t:ts)t.join();};
+-    int hardware=(int)std::thread::hardware_concurrency();int workers=std::max(1,std::min(workerLimit,std::min(4,hardware?hardware:2)));
+-    runRows(workers);if(cancelled.load())return false;runCols(workers);return !cancelled.load();
++    int workers=(int)std::thread::hardware_concurrency();workers=std::max(1,std::min(4,workers?workers:2));runRows(workers);runCols(workers);return true;
+ }
+ 
+ inline double tukeyProfile(double x,double r,double d){
+@@ -1692,101 +1669,65 @@ inline double tukeyProfile(double x,double r,double d){
+     if(x<=1.-d-.5*r)return 1.;if(x<=1.-d)return .5-.5*std::cos(2.*kPi*(1.-d-x)/r);return 0.;
+ }
+ 
+-struct PInv {int n=0;std::vector<std::complex<double>> a;bool valid=false;};
+-
+-bool jacobiSymmetric(std::vector<double>a,int n,std::vector<double>&eval,std::vector<double>&vec,const Deadline*deadline){
+-    if(n<=0)return false;vec.assign((size_t)n*n,0.);for(int i=0;i<n;i++)vec[(size_t)i*n+i]=1.;
+-    if(n==1){eval.assign(1,a[0]);return true;}
+-    bool converged=false;
+-    for(int sweep=0;sweep<kJacobiMaxSweeps;sweep++){
+-        if(deadline&&deadline->expired())return false;double maxOff=0.;
+-        for(int p=0;p<n-1;p++)for(int q=p+1;q<n;q++){
+-            double apq=a[(size_t)p*n+q];maxOff=std::max(maxOff,std::fabs(apq));if(std::fabs(apq)<1.0e-14)continue;
+-            double app=a[(size_t)p*n+p],aqq=a[(size_t)q*n+q];double phi=.5*std::atan2(2.*apq,aqq-app),c=std::cos(phi),ss=std::sin(phi);
+-            for(int k=0;k<n;k++)if(k!=p&&k!=q){double akp=a[(size_t)k*n+p],akq=a[(size_t)k*n+q];double np=c*akp-ss*akq,nq=ss*akp+c*akq;a[(size_t)k*n+p]=a[(size_t)p*n+k]=np;a[(size_t)k*n+q]=a[(size_t)q*n+k]=nq;}
+-            a[(size_t)p*n+p]=c*c*app-2.*ss*c*apq+ss*ss*aqq;a[(size_t)q*n+q]=ss*ss*app+2.*ss*c*apq+c*c*aqq;a[(size_t)p*n+q]=a[(size_t)q*n+p]=0.;
+-            for(int k=0;k<n;k++){double vkp=vec[(size_t)k*n+p],vkq=vec[(size_t)k*n+q];vec[(size_t)k*n+p]=c*vkp-ss*vkq;vec[(size_t)k*n+q]=ss*vkp+c*vkq;}
+-        }
+-        if(maxOff<1.0e-12){converged=true;break;}
+-    }
+-    if(!converged)return false;eval.resize((size_t)n);for(int i=0;i<n;i++)eval[(size_t)i]=a[(size_t)i*n+i];return true;
+-}
++struct PInv {int z=0;std::vector<std::complex<double>> a;};
+ 
+-PInv pseudoInverseHermitian(const std::vector<std::complex<double>>&h,int z,const Deadline*deadline){
+-    PInv out;if(z<=0||h.size()!=(size_t)z*z)return out;const int n=2*z;std::vector<double>r((size_t)n*n,0.);
+-    for(int i=0;i<z;i++)for(int j=0;j<z;j++){auto v=h[(size_t)i*z+j];r[(size_t)i*n+j]=v.real();r[(size_t)i*n+(j+z)]=-v.imag();r[(size_t)(i+z)*n+j]=v.imag();r[(size_t)(i+z)*n+(j+z)]=v.real();}
+-    std::vector<double>eval,vec;if(!jacobiSymmetric(std::move(r),n,eval,vec,deadline))return out;std::vector<double>rp((size_t)n*n,0.);
+-    for(int k=0;k<n;k++){double lambda=eval[(size_t)k];double inv=lambda>kPseudoInverseEps?1./lambda:0.;if(inv==0.)continue;for(int i=0;i<n;i++){double vik=vec[(size_t)i*n+k]*inv;for(int j=0;j<n;j++)rp[(size_t)i*n+j]+=vik*vec[(size_t)j*n+k];}}
+-    out.n=z;out.a.resize((size_t)z*z);for(int i=0;i<z;i++)for(int j=0;j<z;j++)out.a[(size_t)i*z+j]={rp[(size_t)i*n+j],rp[(size_t)(i+z)*n+j]};out.valid=true;return out;
++bool jacobiSymmetric(std::vector<double>a,int n,std::vector<double>&eval,std::vector<double>&vec){
++    vec.assign((size_t)n*n,0.);for(int i=0;i<n;i++)vec[(size_t)i*n+i]=1.;
++    const int maxIter=120*n*n;for(int it=0;it<maxIter;it++){
++        int p=0,q=1;double mx=0.;for(int i=0;i<n;i++)for(int j=i+1;j<n;j++){double v=std::fabs(a[(size_t)i*n+j]);if(v>mx){mx=v;p=i;q=j;}}
++        if(mx<1e-13)break;double app=a[(size_t)p*n+p],aqq=a[(size_t)q*n+q],apq=a[(size_t)p*n+q];
++        double phi=.5*std::atan2(2.*apq,aqq-app),c=std::cos(phi),s=std::sin(phi);
++        for(int k=0;k<n;k++)if(k!=p&&k!=q){double akp=a[(size_t)k*n+p],akq=a[(size_t)k*n+q];double np=c*akp-s*akq,nq=s*akp+c*akq;a[(size_t)k*n+p]=a[(size_t)p*n+k]=np;a[(size_t)k*n+q]=a[(size_t)q*n+k]=nq;}
++        a[(size_t)p*n+p]=c*c*app-2.*s*c*apq+s*s*aqq;a[(size_t)q*n+q]=s*s*app+2.*s*c*apq+c*c*aqq;a[(size_t)p*n+q]=a[(size_t)q*n+p]=0.;
++        for(int k=0;k<n;k++){double vkp=vec[(size_t)k*n+p],vkq=vec[(size_t)k*n+q];vec[(size_t)k*n+p]=c*vkp-s*vkq;vec[(size_t)k*n+q]=s*vkp+c*vkq;}
++    }
++    eval.resize((size_t)n);for(int i=0;i<n;i++)eval[(size_t)i]=a[(size_t)i*n+i];return true;
+ }
+ 
+-struct DualPInv {int sp=0,sq=0,L=0;double cof=0.;std::vector<double>sqrtW;PInv gram;bool valid=false;};
+-
+-DualPInv dualBlockPseudoInverse(int sp,int sq,const std::vector<double>&dx,const std::vector<double>&dy,const std::vector<double>&weights,double cof,const Deadline*deadline){
+-    DualPInv out;const int L=(int)dx.size();if(sp<=0||sq<=0||L<=0||dy.size()!=dx.size()||weights.size()!=dx.size())return out;
+-    out.sp=sp;out.sq=sq;out.L=L;out.cof=cof;out.sqrtW.resize((size_t)L);for(int j=0;j<L;j++)out.sqrtW[(size_t)j]=std::sqrt(std::max(0.,weights[(size_t)j]));
+-    std::vector<std::complex<double>>g((size_t)L*L,{0.,0.});
+-    for(int j=0;j<L;j++){if(deadline&&deadline->expired())return out;for(int l=0;l<L;l++){
+-        std::complex<double>sum(0.,0.);double ddx=dx[(size_t)j]-dx[(size_t)l],ddy=dy[(size_t)j]-dy[(size_t)l];
+-        for(int r=0;r<sp;r++)for(int q=0;q<sq;q++){double theta=2.*kPi*(ddx*r+ddy*q);sum+=std::complex<double>(std::cos(theta),std::sin(theta));}
+-        g[(size_t)j*L+l]=cof*cof*out.sqrtW[(size_t)j]*out.sqrtW[(size_t)l]*sum;
+-    }}
+-    out.gram=pseudoInverseHermitian(g,L,deadline);out.valid=out.gram.valid;return out;
++PInv blockPseudoInverse(int sp,int sq,const std::vector<double>&dx,const std::vector<double>&dy,const std::vector<double>&weights,double cof){
++    const int z=sp*sq,n=2*z;std::vector<std::complex<double>> h((size_t)z*z,{0.,0.});
++    for(size_t j=0;j<dx.size();j++){double w=weights.empty()?1.:weights[j];for(int k=0;k<z;k++)for(int l=0;l<z;l++){
++        double theta=2.*kPi*((double)(l/sq-k/sq)*dx[j]+(double)(l%sq-k%sq)*dy[j]);h[(size_t)k*z+l]+=cof*w*std::complex<double>(std::cos(theta),std::sin(theta));}}
++    std::vector<double> r((size_t)n*n,0.);for(int i=0;i<z;i++)for(int j=0;j<z;j++){auto v=h[(size_t)i*z+j];r[(size_t)i*n+j]=v.real();r[(size_t)i*n+(j+z)]=-v.imag();r[(size_t)(i+z)*n+j]=v.imag();r[(size_t)(i+z)*n+(j+z)]=v.real();}
++    std::vector<double> eval,vec;jacobiSymmetric(r,n,eval,vec);std::vector<double> rp((size_t)n*n,0.);
++    for(int k=0;k<n;k++){double inv=eval[(size_t)k]>kPseudoInverseEps?1./eval[(size_t)k]:0.;if(inv==0.)continue;for(int i=0;i<n;i++){double vik=vec[(size_t)i*n+k]*inv;for(int j=0;j<n;j++)rp[(size_t)i*n+j]+=vik*vec[(size_t)j*n+k];}}
++    PInv out;out.z=z;out.a.resize((size_t)z*z);for(int i=0;i<z;i++)for(int j=0;j<z;j++)out.a[(size_t)i*z+j]={rp[(size_t)i*n+j],rp[(size_t)(i+z)*n+j]};return out;
+ }
+ 
+ inline int modIndex(int f,int n){int v=f%n;if(v<0)v+=n;return v;}
+ 
+-bool solveWeightedDual(C*out,const std::vector<C*>&inputs,const std::vector<double>&dx,const std::vector<double>&dy,const std::vector<double>&weights,int nx,int ny,int Nx,int Ny,const Deadline*deadline){
+-    if(!out||inputs.empty()||inputs.size()!=dx.size()||dy.size()!=dx.size()||weights.size()!=dx.size())return false;
+-    const double zx=(double)Nx/nx,zy=(double)Ny/ny,cof=1./(zx*zy);int fx=(int)std::floor(zx),cx=(int)std::ceil(zx),fy=(int)std::floor(zy),cy=(int)std::ceil(zy);if(fx<1||fy<1)return false;
+-    std::array<DualPInv,4> pinv={dualBlockPseudoInverse(fx,fy,dx,dy,weights,cof,deadline),dualBlockPseudoInverse(cx,fy,dx,dy,weights,cof,deadline),dualBlockPseudoInverse(fx,cy,dx,dy,weights,cof,deadline),dualBlockPseudoInverse(cx,cy,dx,dy,weights,cof,deadline)};
+-    for(const auto&p:pinv)if(!p.valid)return false;std::fill(out,out+(size_t)Nx*Ny,C(0,0));const int L=(int)inputs.size();std::vector<std::complex<double>>rot((size_t)L),u((size_t)L);
+-    for(int b=-ny/2;b<=(ny-1)/2;b++){if(deadline&&deadline->expired())return false;int qmin=(int)std::ceil(-(Ny+2.0*b)/(2.0*ny)),qmax=(int)std::ceil((Ny-2.0*b)/(2.0*ny))-1,sq=qmax-qmin+1;int ib=modIndex(b,ny);
+-        for(int a=-nx/2;a<=(nx-1)/2;a++){int pmin=(int)std::ceil(-(Nx+2.0*a)/(2.0*nx)),pmax=(int)std::ceil((Nx-2.0*a)/(2.0*nx))-1,sp=pmax-pmin+1;int ia=modIndex(a,nx),low=ib*nx+ia;const DualPInv*pm=nullptr;
+-            if(sp==fx&&sq==fy)pm=&pinv[0];else if(sp==cx&&sq==fy)pm=&pinv[1];else if(sp==fx&&sq==cy)pm=&pinv[2];else pm=&pinv[3];if(!pm||pm->L!=L)return false;
+-            for(int j=0;j<L;j++){C obs=inputs[(size_t)j][low];double phi=2.*kPi*(dx[(size_t)j]*((double)a/(double)nx+pmin)+dy[(size_t)j]*((double)b/(double)ny+qmin));std::complex<double>phase(std::cos(phi),-std::sin(phi));rot[(size_t)j]=pm->sqrtW[(size_t)j]*std::complex<double>(obs.real(),obs.imag())*phase;}
+-            for(int i=0;i<L;i++){std::complex<double>v(0,0);for(int j=0;j<L;j++)v+=pm->gram.a[(size_t)i*L+j]*rot[(size_t)j];u[(size_t)i]=v;}
+-            for(int r=0;r<sp;r++){int alpha=a+(pmin+r)*nx,oa=modIndex(alpha,Nx);for(int q=0;q<sq;q++){int beta=b+(qmin+q)*ny,ob=modIndex(beta,Ny);std::complex<double>v(0,0);for(int j=0;j<L;j++){double psi=2.*kPi*(dx[(size_t)j]*r+dy[(size_t)j]*q);v+=pm->sqrtW[(size_t)j]*std::complex<double>(std::cos(psi),-std::sin(psi))*u[(size_t)j];}v*=cof;out[(size_t)ob*Nx+oa]=C((float)v.real(),(float)v.imag());}}
++bool solveWeighted(C*out,const std::vector<C*>&inputs,const std::vector<double>&dx,const std::vector<double>&dy,const std::vector<double>&weights,int nx,int ny,int Nx,int Ny){
++    const double zx=(double)Nx/nx,zy=(double)Ny/ny,cof=1./(zx*zy);int fx=(int)std::floor(zx),cx=(int)std::ceil(zx),fy=(int)std::floor(zy),cy=(int)std::ceil(zy);
++    std::array<PInv,4> pinv={blockPseudoInverse(fx,fy,dx,dy,weights,cof),blockPseudoInverse(cx,fy,dx,dy,weights,cof),blockPseudoInverse(fx,cy,dx,dy,weights,cof),blockPseudoInverse(cx,cy,dx,dy,weights,cof)};
++    std::fill(out,out+(size_t)Nx*Ny,C(0,0));
++    for(int b=-ny/2;b<=(ny-1)/2;b++){int qmin=(int)std::ceil(-(Ny+2.0*b)/(2.0*ny)),qmax=(int)std::ceil((Ny-2.0*b)/(2.0*ny))-1,sq=qmax-qmin+1;int ib=modIndex(b,ny);
++        for(int a=-nx/2;a<=(nx-1)/2;a++){int pmin=(int)std::ceil(-(Nx+2.0*a)/(2.0*nx)),pmax=(int)std::ceil((Nx-2.0*a)/(2.0*nx))-1,sp=pmax-pmin+1;int ia=modIndex(a,nx),low=ib*nx+ia;
++            const PInv*pm=nullptr;if(sp==fx&&sq==fy)pm=&pinv[0];else if(sp==cx&&sq==fy)pm=&pinv[1];else if(sp==fx&&sq==cy)pm=&pinv[2];else pm=&pinv[3];int z=sp*sq;if(pm->z!=z)return false;
++            std::vector<std::complex<double>> rhs((size_t)z),left((size_t)z);int adr=0;for(int p=pmin;p<=pmax;p++){int alpha=a+p*nx;for(int q=qmin;q<=qmax;q++,adr++){int beta=b+q*ny;std::complex<double> sum(0,0);for(size_t j=0;j<inputs.size();j++){C obs=inputs[j][low];double theta=-2.*kPi*(dx[j]*(double)alpha/(double)nx+dy[j]*(double)beta/(double)ny);sum+=weights[j]*std::complex<double>(obs.real(),obs.imag())*std::complex<double>(std::cos(theta),std::sin(theta));}rhs[(size_t)adr]=sum;}}
++            for(int i=0;i<z;i++){std::complex<double> v(0,0);for(int j=0;j<z;j++)v+=pm->a[(size_t)i*z+j]*rhs[(size_t)j];left[(size_t)i]=v;}
++            adr=0;for(int p=pmin;p<=pmax;p++){int alpha=a+p*nx,oa=modIndex(alpha,Nx);for(int q=qmin;q<=qmax;q++,adr++){int beta=b+q*ny,ob=modIndex(beta,Ny);auto v=left[(size_t)adr];out[(size_t)ob*Nx+oa]=C((float)v.real(),(float)v.imag());}}
+         }
+     }return true;
+ }
+ 
+-double residualNorm(const C*out,const C*obs,double dx,double dy,int nx,int ny,int Nx,int Ny,const Deadline*deadline){
++double residualNorm(const C*out,const C*obs,double dx,double dy,int nx,int ny,int Nx,int Ny){
+     const double zx=(double)Nx/nx,zy=(double)Ny/ny,cof=1./(zx*zy);long double sum2=0.;
+-    for(int b=-ny/2;b<=(ny-1)/2;b++){if(deadline&&deadline->expired())return std::numeric_limits<double>::quiet_NaN();int q0=(int)std::ceil(-zy/2.-(double)b/ny),q1=(int)std::ceil(zy/2.-(double)b/ny)-1,ib=modIndex(b,ny);
+-        for(int a=-nx/2;a<=(nx-1)/2;a++){int p0=(int)std::ceil(-zx/2.-(double)a/nx),p1=(int)std::ceil(zx/2.-(double)a/nx)-1,ia=modIndex(a,nx);std::complex<double>pred(0,0);
+-            for(int q=q0;q<=q1;q++){int beta=b+q*ny,ob=modIndex(beta,Ny);for(int p=p0;p<=p1;p++){int alpha=a+p*nx,oa=modIndex(alpha,Nx);C uu=out[(size_t)ob*Nx+oa];double theta=2.*kPi*(dx*(double)alpha/(double)nx+dy*(double)beta/(double)ny);pred+=std::complex<double>(uu.real(),uu.imag())*std::complex<double>(std::cos(theta),std::sin(theta));}}
++    for(int b=-ny/2;b<=(ny-1)/2;b++){int q0=(int)std::ceil(-zy/2.-(double)b/ny),q1=(int)std::ceil(zy/2.-(double)b/ny)-1,ib=modIndex(b,ny);
++        for(int a=-nx/2;a<=(nx-1)/2;a++){int p0=(int)std::ceil(-zx/2.-(double)a/nx),p1=(int)std::ceil(zx/2.-(double)a/nx)-1,ia=modIndex(a,nx);std::complex<double> pred(0,0);
++            for(int q=q0;q<=q1;q++){int beta=b+q*ny,ob=modIndex(beta,Ny);for(int p=p0;p<=p1;p++){int alpha=a+p*nx,oa=modIndex(alpha,Nx);C u=out[(size_t)ob*Nx+oa];double theta=2.*kPi*(dx*(double)alpha/(double)nx+dy*(double)beta/(double)ny);pred+=std::complex<double>(u.real(),u.imag())*std::complex<double>(std::cos(theta),std::sin(theta));}}
+             pred*=cof;C o=obs[(size_t)ib*nx+ia];double dr=pred.real()-o.real(),di=pred.imag()-o.imag();sum2+=dr*dr+di*di;
+         }}
+     return std::sqrt((double)(sum2/((long double)nx*ny)));
+ }
+ 
+-bool createInputDft(const float*luma,C*d,int nx,int ny,int Nx,int Ny,double dx,double dy,double maxAbsDx,double maxAbsDy,const FftPlan&pw,const FftPlan&ph,int workers,const Deadline*deadline){
+-    if(!luma||!d)return false;const double zx=(double)Nx/nx,zy=(double)Ny/ny,Dx=maxAbsDx*zx/(double)std::max(1,Nx-1),Dy=maxAbsDy*zy/(double)std::max(1,Ny-1);
+-    for(int y=0;y<ny;y++){if(deadline&&deadline->expired())return false;double ty=tukeyProfile(zy*(double)(y+dy)/(double)std::max(1,Ny-1),kTukeyR,Dy);for(int x=0;x<nx;x++){double tx=tukeyProfile(zx*(double)(x+dx)/(double)std::max(1,Nx-1),kTukeyR,Dx);float v=luma[(size_t)y*nx+x];if(!std::isfinite(v))return false;d[(size_t)y*nx+x]=C(v*(float)(tx*ty),0.f);}}
+-    return fft2dPlanned(d,nx,ny,false,pw,ph,workers,deadline);
+-}
+-
+-double median(std::vector<double>v){if(v.empty())return 0.;size_t m=v.size()/2;std::nth_element(v.begin(),v.begin()+m,v.end());double hi=v[m];if(v.size()&1)return hi;std::nth_element(v.begin(),v.begin()+m-1,v.begin()+m);return .5*(hi+v[m-1]);}
+-
+-int robustOutlierCount(const std::vector<double>&residuals){
+-    if(residuals.size()<4)return 0;double med=median(residuals);std::vector<double>dev;dev.reserve(residuals.size());for(double z:residuals)dev.push_back(std::fabs(z-med));double mad=median(std::move(dev));double sigma=1.4826*mad;double threshold=med+std::max(3.*sigma,std::max(.25*std::max(med,1.0e-9),1.0e-6));int count=0;for(double z:residuals)if(z>threshold&&z>1.25*std::max(med,1.0e-9))count++;return count;
+-}
+-
+-uint64_t fftPlanBytes(int n){if(n<=0||isPow2((size_t)n))return 0;size_t m=nextPow2((size_t)2*n-1);if(!m)return std::numeric_limits<uint64_t>::max();return ((uint64_t)n+(uint64_t)m)*sizeof(C);}
+-
+-uint64_t estimateTileBytes(int L,int nx,int ny,int Nx,int Ny,int workers){
+-    auto mul=[](uint64_t a,uint64_t b)->uint64_t{if(a&&b>std::numeric_limits<uint64_t>::max()/a)return std::numeric_limits<uint64_t>::max();return a*b;};
+-    uint64_t inPix=mul((uint64_t)nx,(uint64_t)ny),outPix=mul((uint64_t)Nx,(uint64_t)Ny);if(inPix==std::numeric_limits<uint64_t>::max()||outPix==std::numeric_limits<uint64_t>::max())return std::numeric_limits<uint64_t>::max();
+-    uint64_t obs=mul(mul((uint64_t)L,inPix),sizeof(C)),out=mul(outPix,sizeof(C)),mapped=mul(inPix,sizeof(float));if(obs==std::numeric_limits<uint64_t>::max()||out==std::numeric_limits<uint64_t>::max())return std::numeric_limits<uint64_t>::max();
+-    uint64_t lines=(uint64_t)workers*2ULL*(uint64_t)std::max(std::max(nx,ny),std::max(Nx,Ny))*sizeof(C);uint64_t solver=8ULL*(uint64_t)(2*L)*(uint64_t)(2*L)*sizeof(double);
+-    uint64_t plans=fftPlanBytes(nx)+fftPlanBytes(ny)+fftPlanBytes(Nx)+fftPlanBytes(Ny);return obs+out+mapped+lines+solver+plans+kNativeReserveBytes;
++bool createInputDft(const char*lumaPath,const char*dftPath,int nx,int ny,int Nx,int Ny,double dx,double dy,double maxAbsDx,double maxAbsDy){
++    MapFile lm,dm;if(!lm.openExisting(lumaPath,(size_t)nx*ny*sizeof(float),false)||!dm.create(dftPath,(size_t)nx*ny*sizeof(C)))return false;const float*l=(const float*)lm.ptr;C*d=(C*)dm.ptr;
++    /* Exact revised-paper modified-Tukey geometry: every frame uses the same zero-extension, derived from the maximum absolute displacement across the complete sequence. */
++    const double zx=(double)Nx/nx,zy=(double)Ny/ny,Dx=maxAbsDx*zx/(double)std::max(1,Nx-1),Dy=maxAbsDy*zy/(double)std::max(1,Ny-1);
++    for(int y=0;y<ny;y++){double ty=tukeyProfile(zy*(double)(y+dy)/(double)std::max(1,Ny-1),kTukeyR,Dy);for(int x=0;x<nx;x++){double tx=tukeyProfile(zx*(double)(x+dx)/(double)std::max(1,Nx-1),kTukeyR,Dx);float v=l[(size_t)y*nx+x];if(!std::isfinite(v))return false;d[(size_t)y*nx+x]=C(v*(float)(tx*ty),0.f);}}
++    if(!fft2d(d,nx,ny,false))return false;dm.sync();return true;
+ }
+ 
+-inline bool readExact(int fd,void*dst,size_t bytes,off_t offset){uint8_t*p=(uint8_t*)dst;size_t done=0;while(done<bytes){ssize_t n=pread(fd,p+done,bytes-done,offset+(off_t)done);if(n<=0)return false;done+=(size_t)n;}return true;}
+-inline bool writeExact(int fd,const void*src,size_t bytes,off_t offset){const uint8_t*p=(const uint8_t*)src;size_t done=0;while(done<bytes){ssize_t n=pwrite(fd,p+done,bytes-done,offset+(off_t)done);if(n<=0)return false;done+=(size_t)n;}return true;}
+-inline float smoothRamp(float x){x=clampf(x,0.f,1.f);return x*x*(3.f-2.f*x);}
+-
+ inline std::array<float,3> guideSample(const uint16_t*g,int w,int h,float x,float y){
+     x=clampf(x,0.f,(float)(w-1));y=clampf(y,0.f,(float)(h-1));int x0=(int)std::floor(x),y0=(int)std::floor(y),x1=std::min(x0+1,w-1),y1=std::min(y0+1,h-1);float fx=x-x0,fy=y-y0;std::array<float,3>o{};
+     for(int c=0;c<3;c++){auto at=[&](int xx,int yy){return iris26564::halfToFloat(g[((size_t)yy*w+xx)*3+c]);};float a=at(x0,y0)+(at(x1,y0)-at(x0,y0))*fx,b=at(x0,y1)+(at(x1,y1)-at(x0,y1))*fx;o[c]=a+(b-a)*fy;}return o;
+@@ -1800,7 +1741,6 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+         JNIEnv*e,jclass,jstring outputPath,jint outW,jint outH,jint tileX,jint tileY,jint tileW,jint tileH,jint sampleOriginX,jint sampleOriginY,
+         jobject rawBuffer,jint rawX,jint rawY,jint rawW,jint rawH,jint rawStride,jobject covBuffer,jint covX,jint covY,jint covW,jint covH,jint covFullW,jint covFullH,
+         jint fullRawW,jint fullRawH,jint cfa,jfloatArray gainsArray,jfloatArray blackArray,jfloatArray covRgArray,jfloatArray covBArray,jfloatArray cameraScaleArray,jfloatArray lensArray,jint lensW,jint lensH){
+-    try {
+     if(!outputPath||!rawBuffer||!covBuffer||outW<=0||outH<=0||tileW<=0||tileH<=0||tileX<0||tileY<0||tileX>outW-tileW||tileY>outH-tileH||fullRawW<=0||fullRawH<=0||rawStride<rawW)return JNI_FALSE;
+     auto*raw=(const uint16_t*)e->GetDirectBufferAddress(rawBuffer);auto*cov=(const uint32_t*)e->GetDirectBufferAddress(covBuffer);if(!raw||!cov)return JNI_FALSE;
+     float gains[4],black[4],crg[4],cb[2],scale[3];if(!gainsArray||!blackArray||!covRgArray||!covBArray||!cameraScaleArray||e->GetArrayLength(gainsArray)!=4||e->GetArrayLength(blackArray)!=4||e->GetArrayLength(covRgArray)!=4||e->GetArrayLength(covBArray)!=2||e->GetArrayLength(cameraScaleArray)!=3)return JNI_FALSE;
+@@ -1812,76 +1752,32 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+         float rgb[3],ww[3];iris26564::sampleRbf(raw,rawW,rawH,rawStride,rawX,rawY,fullRawW,fullRawH,(float)gx+.5f,(float)gy+.5f,cfa,gains,black,cc,rgb,ww);for(int k=0;k<3;k++)rgb[k]=std::max(0.f,rgb[k]/std::max(ww[k],1.0e-7f))*scale[k];float ls[4];iris26564::lensSample(lens.empty()?nullptr:lens.data(),lensW,lensH,u,v,ls);rgb[0]*=ls[0];rgb[1]*=.5f*(ls[1]+ls[2]);rgb[2]*=ls[3];float y=.25f*rgb[0]+.50f*rgb[1]+.25f*rgb[2];if(!std::isfinite(y)){ok=false;break;}row[(size_t)lx]=std::max(y,0.f);
+     }if(!ok)break;off_t off=((off_t)(tileY+ly)*outW+tileX)*(off_t)sizeof(float);const uint8_t*p=(const uint8_t*)row.data();size_t bytes=row.size()*sizeof(float),done=0;while(done<bytes){ssize_t n=pwrite(fd,p+done,bytes-done,off+(off_t)done);if(n<=0){ok=false;break;}done+=(size_t)n;}}
+     close(fd);return ok?JNI_TRUE:JNI_FALSE;
+-
+-    } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
+-}
+-
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_reconstructPlanBTileDirect(
+-        JNIEnv*e,jclass,jobjectArray paths,jint nx,jint ny,jint Nx,jint Ny,jfloatArray dxArray,jfloatArray dyArray,jlong memoryBudgetBytes,jlong maxDurationMs,jstring outputPath,jfloatArray outWeights,jlongArray statsArray){
+-    try {
+-        if(!paths||!dxArray||!dyArray||!outputPath||nx<=0||ny<=0||Nx<nx||Ny<ny||memoryBudgetBytes<(jlong)(8ULL*1024ULL*1024ULL)||maxDurationMs<=0)return JNI_FALSE;
+-        jsize L=e->GetArrayLength(paths);if(L<4||e->GetArrayLength(dxArray)!=L||e->GetArrayLength(dyArray)!=L||!outWeights||e->GetArrayLength(outWeights)<L)return JNI_FALSE;
+-        std::vector<float>dxf((size_t)L),dyf((size_t)L);e->GetFloatArrayRegion(dxArray,0,L,dxf.data());e->GetFloatArrayRegion(dyArray,0,L,dyf.data());if(e->ExceptionCheck())return JNI_FALSE;
+-        std::vector<double>dx((size_t)L),dy((size_t)L);double maxAbsDx=0.,maxAbsDy=0.;for(int j=0;j<L;j++){dx[(size_t)j]=dxf[(size_t)j];dy[(size_t)j]=dyf[(size_t)j];if(!std::isfinite(dx[(size_t)j])||!std::isfinite(dy[(size_t)j]))return JNI_FALSE;maxAbsDx=std::max(maxAbsDx,std::fabs(dx[(size_t)j]));maxAbsDy=std::max(maxAbsDy,std::fabs(dy[(size_t)j]));}
+-        iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;int workers=4;uint64_t estimated=iris26752planb::estimateTileBytes(L,nx,ny,Nx,Ny,workers);while(workers>1&&estimated>(uint64_t)memoryBudgetBytes){workers/=2;estimated=iris26752planb::estimateTileBytes(L,nx,ny,Nx,Ny,workers);}if(estimated>(uint64_t)memoryBudgetBytes)return JNI_FALSE;
+-        const size_t inPix=(size_t)nx*ny,outPix=(size_t)Nx*Ny;std::vector<iris26752planb::C>observations((size_t)L*inPix),output(outPix);iris26752planb::FftPlan inW(nx),inH(ny),outW(Nx),outH(Ny);if(!inW.valid()||!inH.valid()||!outW.valid()||!outH.valid())return JNI_FALSE;
+-        for(int j=0;j<L;j++){if(deadline.expired())return JNI_FALSE;auto js=(jstring)e->GetObjectArrayElement(paths,j);if(!js)return JNI_FALSE;U ip(e,js);std::string path=ip.c?ip.c:"";e->DeleteLocalRef(js);if(path.empty())return JNI_FALSE;iris26752planb::MapFile lm;if(!lm.openExisting(path.c_str(),inPix*sizeof(float),false))return JNI_FALSE;if(!iris26752planb::createInputDft((const float*)lm.ptr,observations.data()+(size_t)j*inPix,nx,ny,Nx,Ny,dx[(size_t)j],dy[(size_t)j],maxAbsDx,maxAbsDy,inW,inH,workers,&deadline))return JNI_FALSE;}
+-        std::vector<iris26752planb::C*>inputs;inputs.reserve((size_t)L);for(int j=0;j<L;j++)inputs.push_back(observations.data()+(size_t)j*inPix);std::vector<double>weights((size_t)L,1.),residuals((size_t)L,0.);
+-        if(deadline.expired()||!iris26752planb::solveWeightedDual(output.data(),inputs,dx,dy,weights,nx,ny,Nx,Ny,&deadline))return JNI_FALSE;
+-        double energy=0.;for(int j=0;j<L;j++){double z=iris26752planb::residualNorm(output.data(),inputs[(size_t)j],dx[(size_t)j],dy[(size_t)j],nx,ny,Nx,Ny,&deadline);if(!std::isfinite(z))return JNI_FALSE;residuals[(size_t)j]=z;energy+=z;}
+-        const int initialOutliers=iris26752planb::robustOutlierCount(residuals);int irlsUpdates=0;long etaGuards=0;double previousEnergy=energy;
+-        if(initialOutliers>0){
+-            for(int update=0;update<iris26752planb::kIrlsMaxUpdates;update++){
+-                if(deadline.expired())return JNI_FALSE;double maxWeight=0.;for(int j=0;j<L;j++){double eta=std::max(iris26752planb::kIrlsEtaFloor,residuals[(size_t)j]);if(eta!=residuals[(size_t)j])etaGuards++;weights[(size_t)j]=1./eta;maxWeight=std::max(maxWeight,weights[(size_t)j]);}if(!(maxWeight>0.)||!std::isfinite(maxWeight))return JNI_FALSE;for(double&w:weights)w/=maxWeight;
+-                if(!iris26752planb::solveWeightedDual(output.data(),inputs,dx,dy,weights,nx,ny,Nx,Ny,&deadline))return JNI_FALSE;double newEnergy=0.;for(int j=0;j<L;j++){double z=iris26752planb::residualNorm(output.data(),inputs[(size_t)j],dx[(size_t)j],dy[(size_t)j],nx,ny,Nx,Ny,&deadline);if(!std::isfinite(z))return JNI_FALSE;residuals[(size_t)j]=z;newEnergy+=z;}irlsUpdates++;
+-                double denom=std::max(std::fabs(previousEnergy),1.0e-12);if(std::fabs(newEnergy-previousEnergy)<=iris26752planb::kIrlsRelativeStop*denom){previousEnergy=newEnergy;break;}previousEnergy=newEnergy;
+-            }
+-        }
+-        if(deadline.expired()||!iris26752planb::fft2dPlanned(output.data(),Nx,Ny,true,outW,outH,workers,&deadline))return JNI_FALSE;U op(e,outputPath);if(!op.c)return JNI_FALSE;iris26752planb::MapFile out;if(!out.create(op.c,outPix*sizeof(float)))return JNI_FALSE;float*dst=(float*)out.ptr;for(size_t i=0;i<outPix;i++){float v=output[i].real();if(!std::isfinite(v))return JNI_FALSE;dst[i]=std::max(v,0.f);}out.sync();
+-        std::vector<jfloat>wf((size_t)L);for(int j=0;j<L;j++)wf[(size_t)j]=(jfloat)weights[(size_t)j];e->SetFloatArrayRegion(outWeights,0,L,wf.data());if(e->ExceptionCheck())return JNI_FALSE;
+-        if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=irlsUpdates;if(n>1)st[1]=L;if(n>2)st[2]=(jlong)inPix;if(n>3)st[3]=(jlong)outPix;if(n>4)st[4]=initialOutliers;if(n>5)st[5]=(jlong)estimated;if(n>6)st[6]=workers;if(n>7)st[7]=(jlong)deadline.elapsedMs();if(n>8)st[8]=etaGuards;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}
+-        return deadline.expired()?JNI_FALSE:JNI_TRUE;
+-    } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
+-}
+-
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_accumulatePlanBTile(
+-        JNIEnv*e,jclass,jstring tilePath,jint tileW,jint tileH,jint originX,jint originY,jint fullW,jint fullH,jint overlap,jstring sumPath,jstring weightPath,jlong maxDurationMs){
+-    try {
+-        if(!tilePath||!sumPath||!weightPath||tileW<=0||tileH<=0||fullW<=0||fullH<=0||originX<0||originY<0||originX>fullW-tileW||originY>fullH-tileH||overlap<0||maxDurationMs<=0)return JNI_FALSE;iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U tp(e,tilePath),sp(e,sumPath),wp(e,weightPath);if(!tp.c||!sp.c||!wp.c)return JNI_FALSE;
+-        iris26752planb::MapFile tm;if(!tm.openExisting(tp.c,(size_t)tileW*tileH*sizeof(float),false))return JNI_FALSE;int sf=open(sp.c,O_RDWR),wf=open(wp.c,O_RDWR);if(sf<0||wf<0){if(sf>=0)close(sf);if(wf>=0)close(wf);return JNI_FALSE;}struct stat ss{},ws{};bool ok=fstat(sf,&ss)==0&&fstat(wf,&ws)==0&&(uint64_t)ss.st_size==(uint64_t)fullW*fullH*sizeof(float)&&(uint64_t)ws.st_size==(uint64_t)fullW*fullH*sizeof(float);std::vector<float>sumRow((size_t)tileW),weightRow((size_t)tileW);const float*tile=(const float*)tm.ptr;
+-        for(int y=0;ok&&y<tileH;y++){if(deadline.expired()){ok=false;break;}off_t off=((off_t)(originY+y)*fullW+originX)*(off_t)sizeof(float);ok=iris26752planb::readExact(sf,sumRow.data(),sumRow.size()*sizeof(float),off)&&iris26752planb::readExact(wf,weightRow.data(),weightRow.size()*sizeof(float),off);if(!ok)break;float wy=1.f;if(overlap>0&&originY>0&&y<overlap)wy=iris26752planb::smoothRamp((float)(y+1)/(float)(overlap+1));if(overlap>0&&originY+tileH<fullH&&y>=tileH-overlap)wy=std::min(wy,iris26752planb::smoothRamp((float)(tileH-y)/(float)(overlap+1)));
+-            for(int x=0;x<tileW;x++){float wx=1.f;if(overlap>0&&originX>0&&x<overlap)wx=iris26752planb::smoothRamp((float)(x+1)/(float)(overlap+1));if(overlap>0&&originX+tileW<fullW&&x>=tileW-overlap)wx=std::min(wx,iris26752planb::smoothRamp((float)(tileW-x)/(float)(overlap+1)));float w=wx*wy,v=tile[(size_t)y*tileW+x];if(!std::isfinite(v)){ok=false;break;}sumRow[(size_t)x]+=v*w;weightRow[(size_t)x]+=w;}
+-            if(ok)ok=iris26752planb::writeExact(sf,sumRow.data(),sumRow.size()*sizeof(float),off)&&iris26752planb::writeExact(wf,weightRow.data(),weightRow.size()*sizeof(float),off);
+-        }
+-        if(sf>=0)close(sf);if(wf>=0)close(wf);return (ok&&!deadline.expired())?JNI_TRUE:JNI_FALSE;
+-    } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
+ }
+ 
+-extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_finalizePlanBAccumulation(
+-        JNIEnv*e,jclass,jstring sumPath,jstring weightPath,jint fullW,jint fullH,jstring outputPath,jlong maxDurationMs){
+-    try {
+-        if(!sumPath||!weightPath||!outputPath||fullW<=0||fullH<=0||maxDurationMs<=0)return JNI_FALSE;iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U sp(e,sumPath),wp(e,weightPath),op(e,outputPath);if(!sp.c||!wp.c||!op.c)return JNI_FALSE;int sf=open(sp.c,O_RDONLY),wf=open(wp.c,O_RDONLY),of=open(op.c,O_RDWR|O_CREAT|O_TRUNC,0600);if(sf<0||wf<0||of<0){if(sf>=0)close(sf);if(wf>=0)close(wf);if(of>=0)close(of);return JNI_FALSE;}uint64_t bytes=(uint64_t)fullW*fullH*sizeof(float);struct stat ss{},ws{};bool ok=fstat(sf,&ss)==0&&fstat(wf,&ws)==0&&(uint64_t)ss.st_size==bytes&&(uint64_t)ws.st_size==bytes&&ftruncate(of,(off_t)bytes)==0;std::vector<float>sumRow((size_t)fullW),weightRow((size_t)fullW),outRow((size_t)fullW);
+-        for(int y=0;ok&&y<fullH;y++){if(deadline.expired()){ok=false;break;}off_t off=(off_t)y*fullW*(off_t)sizeof(float);ok=iris26752planb::readExact(sf,sumRow.data(),sumRow.size()*sizeof(float),off)&&iris26752planb::readExact(wf,weightRow.data(),weightRow.size()*sizeof(float),off);if(!ok)break;for(int x=0;x<fullW;x++){float w=weightRow[(size_t)x];if(!(w>1.0e-8f)||!std::isfinite(w)){ok=false;break;}float v=sumRow[(size_t)x]/w;if(!std::isfinite(v)){ok=false;break;}outRow[(size_t)x]=std::max(v,0.f);}if(ok)ok=iris26752planb::writeExact(of,outRow.data(),outRow.size()*sizeof(float),off);}
+-        if(sf>=0)close(sf);if(wf>=0)close(wf);if(of>=0)close(of);if(!ok||deadline.expired())unlink(op.c);return (ok&&!deadline.expired())?JNI_TRUE:JNI_FALSE;
+-    } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
++extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_reconstructPlanBIrls(
++        JNIEnv*e,jclass,jobjectArray paths,jint nx,jint ny,jint Nx,jint Ny,jfloatArray dxArray,jfloatArray dyArray,jstring outputPath,jfloatArray outWeights,jlongArray statsArray){
++    if(!paths||!dxArray||!dyArray||!outputPath||nx<=0||ny<=0||Nx<nx||Ny<ny)return JNI_FALSE;jsize L=e->GetArrayLength(paths);if(L<=0||e->GetArrayLength(dxArray)!=L||e->GetArrayLength(dyArray)!=L||!outWeights||e->GetArrayLength(outWeights)<L)return JNI_FALSE;
++    std::vector<float>dxf((size_t)L),dyf((size_t)L);e->GetFloatArrayRegion(dxArray,0,L,dxf.data());e->GetFloatArrayRegion(dyArray,0,L,dyf.data());if(e->ExceptionCheck())return JNI_FALSE;std::vector<double>dx((size_t)L),dy((size_t)L);for(int j=0;j<L;j++){dx[j]=dxf[(size_t)j];dy[j]=dyf[(size_t)j];if(!std::isfinite(dx[j])||!std::isfinite(dy[j]))return JNI_FALSE;}
++    if(L<(jsize)(std::ceil((double)Nx/nx)*std::ceil((double)Ny/ny)))return JNI_FALSE;U op(e,outputPath);if(!op.c)return JNI_FALSE;std::string base(op.c);std::vector<std::string>dftNames;std::vector<std::unique_ptr<iris26752planb::MapFile>>maps;dftNames.reserve((size_t)L);maps.reserve((size_t)L);bool ok=true;
++    double maxAbsDx=0.,maxAbsDy=0.;for(int j=0;j<L;j++){maxAbsDx=std::max(maxAbsDx,std::fabs(dx[(size_t)j]));maxAbsDy=std::max(maxAbsDy,std::fabs(dy[(size_t)j]));}
++    for(int j=0;j<L&&ok;j++){auto js=(jstring)e->GetObjectArrayElement(paths,j);if(!js){ok=false;break;}U ip(e,js);std::string in=ip.c?ip.c:"";e->DeleteLocalRef(js);if(in.empty()){ok=false;break;}std::string dn=base+".iris26752_input_"+std::to_string(j)+".cfloat";unlink(dn.c_str());if(!iris26752planb::createInputDft(in.c_str(),dn.c_str(),nx,ny,Nx,Ny,dx[(size_t)j],dy[(size_t)j],maxAbsDx,maxAbsDy)){ok=false;break;}auto mf=std::make_unique<iris26752planb::MapFile>();if(!mf->openExisting(dn.c_str(),(size_t)nx*ny*sizeof(iris26752planb::C),false)){ok=false;break;}dftNames.push_back(dn);maps.push_back(std::move(mf));}
++    std::string outDft=base+".iris26752_output.cfloat";iris26752planb::MapFile outMap;if(ok)ok=outMap.create(outDft.c_str(),(size_t)Nx*Ny*sizeof(iris26752planb::C));std::vector<iris26752planb::C*>inputs;for(auto&m:maps)inputs.push_back((iris26752planb::C*)m->ptr);std::vector<double>w((size_t)L,1.);double E=0.,prev=0.;int iterations=0;long zeroGuards=0;
++    while(ok&&iterations<iris26752planb::kIrlsMaxIterations){iterations++;ok=iris26752planb::solveWeighted((iris26752planb::C*)outMap.ptr,inputs,dx,dy,w,nx,ny,Nx,Ny);if(!ok)break;prev=E;E=0.;for(int j=0;j<L;j++){double z=iris26752planb::residualNorm((iris26752planb::C*)outMap.ptr,inputs[(size_t)j],dx[(size_t)j],dy[(size_t)j],nx,ny,Nx,Ny);if(!std::isfinite(z)){ok=false;break;}double eta=std::max(iris26752planb::kIrlsEtaFloor,z);if(eta!=z)zeroGuards++;w[(size_t)j]=1./eta;E+=z;}if(!ok)break;if(iterations>1&&std::fabs(E-prev)<=iris26752planb::kIrlsRelativeStop*std::fabs(prev))break;}
++    if(ok){ok=iris26752planb::fft2d((iris26752planb::C*)outMap.ptr,Nx,Ny,true);if(ok){iris26752planb::MapFile out;if(out.create(base.c_str(),(size_t)Nx*Ny*sizeof(float))){float*dst=(float*)out.ptr;auto*src=(iris26752planb::C*)outMap.ptr;for(size_t i=0;i<(size_t)Nx*Ny;i++){float v=src[i].real();if(!std::isfinite(v)){ok=false;break;}dst[i]=std::max(v,0.f);}out.sync();}else ok=false;}}
++    if(ok){std::vector<jfloat>wf((size_t)L);for(int j=0;j<L;j++)wf[(size_t)j]=(jfloat)w[(size_t)j];e->SetFloatArrayRegion(outWeights,0,L,wf.data());if(e->ExceptionCheck())ok=false;if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=iterations;if(n>1)st[1]=L;if(n>2)st[2]=(jlong)nx*ny;if(n>3)st[3]=(jlong)Nx*Ny;if(n>4)st[4]=zeroGuards;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())ok=false;}}
++    outMap.sync();for(auto&m:maps)m.reset();for(auto&n:dftNames)unlink(n.c_str());unlink(outDft.c_str());if(!ok)unlink(base.c_str());return ok?JNI_TRUE:JNI_FALSE;
+ }
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_buildPlanBDetail(
+-        JNIEnv*e,jclass,jstring reconstructionPath,jint rw,jint rh,jstring guidePath,jint gw,jint gh,jfloat originX,jfloat originY,jfloat sx,jfloat sy,jfloat maxDx,jfloat maxDy,jstring detailPath,jlongArray statsArray,jlong maxDurationMs){
+-    try {
+-    if(!reconstructionPath||!guidePath||!detailPath||rw<=0||rh<=0||gw<=0||gh<=0||sx<1.f||sy<1.f||maxDurationMs<=0)return JNI_FALSE;iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U rp(e,reconstructionPath),gp(e,guidePath),dp(e,detailPath);if(!rp.c||!gp.c||!dp.c)return JNI_FALSE;iris26752planb::MapFile rm,gm,dm;if(!rm.openExisting(rp.c,(size_t)rw*rh*sizeof(float),false)||!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.create(dp.c,(size_t)rw*rh*sizeof(uint16_t)))return JNI_FALSE;auto*recon=(const float*)rm.ptr;auto*guide=(const uint16_t*)gm.ptr;auto*out=(uint16_t*)dm.ptr;long total=0,active=0,strong=0,highlightBlocked=0,agreementBlocked=0,apodBlocked=0;double Dx=std::fabs((double)maxDx)*sx/(double)std::max(1,rw-1),Dy=std::fabs((double)maxDy)*sy/(double)std::max(1,rh-1);
+-    for(int y=0;y<rh;y++){if(deadline.expired())return JNI_FALSE;double ay=iris26752planb::tukeyProfile((double)y/(double)std::max(1,rh-1),iris26752planb::kTukeyR,Dy);for(int x=0;x<rw;x++){double ax=iris26752planb::tukeyProfile((double)x/(double)std::max(1,rw-1),iris26752planb::kTukeyR,Dx);float apod=(float)(ax*ay);float sourceX=originX+(float)x/sx,sourceY=originY+(float)y/sy;auto g=iris26752planb::guideSample(guide,gw,gh,sourceX,sourceY);float gy=.25f*g[0]+.50f*g[1]+.25f*g[2],py=std::max(recon[(size_t)y*rw+x],0.f);float peak=std::max(py,std::max(g[0],std::max(g[1],g[2])));float signal=iris26564::smooth01((gy-.015f)/.055f);float hg=1.f-iris26564::smooth01((peak-.72f)/.20f);float delta=std::fabs(std::log2((py+.01f)/(gy+.01f)));float ag=1.f-iris26564::smooth01((delta-.08f)/.27f);float confidence=clampf(signal*hg*ag*apod,0.f,1.f);float d=clampf(std::log2((py+.01f)/(gy+.01f)),-.56f,.56f)*confidence;if(!std::isfinite(d))return JNI_FALSE;out[(size_t)y*rw+x]=iris26564::floatToHalf(d);total++;if(std::fabs(d)>.005f)active++;if(std::fabs(d)>.03f)strong++;if(hg<=.001f)highlightBlocked++;if(ag<=.001f)agreementBlocked++;if(apod<=.001f)apodBlocked++;}}
+-    if(deadline.expired())return JNI_FALSE;dm.sync();if(deadline.expired())return JNI_FALSE;if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=total;if(n>1)st[1]=active;if(n>2)st[2]=strong;if(n>3)st[3]=highlightBlocked;if(n>4)st[4]=agreementBlocked;if(n>5)st[5]=apodBlocked;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}return JNI_TRUE;
+-
+-    } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
++        JNIEnv*e,jclass,jstring reconstructionPath,jint rw,jint rh,jstring guidePath,jint gw,jint gh,jfloat originX,jfloat originY,jfloat sx,jfloat sy,jfloat maxDx,jfloat maxDy,jstring detailPath,jlongArray statsArray){
++    if(!reconstructionPath||!guidePath||!detailPath||rw<=0||rh<=0||gw<=0||gh<=0||sx<1.f||sy<1.f)return JNI_FALSE;U rp(e,reconstructionPath),gp(e,guidePath),dp(e,detailPath);if(!rp.c||!gp.c||!dp.c)return JNI_FALSE;iris26752planb::MapFile rm,gm,dm;if(!rm.openExisting(rp.c,(size_t)rw*rh*sizeof(float),false)||!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.create(dp.c,(size_t)rw*rh*sizeof(uint16_t)))return JNI_FALSE;auto*recon=(const float*)rm.ptr;auto*guide=(const uint16_t*)gm.ptr;auto*out=(uint16_t*)dm.ptr;long total=0,active=0,strong=0,highlightBlocked=0,agreementBlocked=0,apodBlocked=0;double Dx=std::fabs((double)maxDx)*sx/(double)std::max(1,rw-1),Dy=std::fabs((double)maxDy)*sy/(double)std::max(1,rh-1);
++    for(int y=0;y<rh;y++){double ay=iris26752planb::tukeyProfile((double)y/(double)std::max(1,rh-1),iris26752planb::kTukeyR,Dy);for(int x=0;x<rw;x++){double ax=iris26752planb::tukeyProfile((double)x/(double)std::max(1,rw-1),iris26752planb::kTukeyR,Dx);float apod=(float)(ax*ay);float sourceX=originX+(float)x/sx,sourceY=originY+(float)y/sy;auto g=iris26752planb::guideSample(guide,gw,gh,sourceX,sourceY);float gy=.25f*g[0]+.50f*g[1]+.25f*g[2],py=std::max(recon[(size_t)y*rw+x],0.f);float peak=std::max(py,std::max(g[0],std::max(g[1],g[2])));float signal=iris26564::smooth01((gy-.015f)/.055f);float hg=1.f-iris26564::smooth01((peak-.72f)/.20f);float delta=std::fabs(std::log2((py+.01f)/(gy+.01f)));float ag=1.f-iris26564::smooth01((delta-.08f)/.27f);float confidence=clampf(signal*hg*ag*apod,0.f,1.f);float d=clampf(std::log2((py+.01f)/(gy+.01f)),-.56f,.56f)*confidence;if(!std::isfinite(d))return JNI_FALSE;out[(size_t)y*rw+x]=iris26564::floatToHalf(d);total++;if(std::fabs(d)>.005f)active++;if(std::fabs(d)>.03f)strong++;if(hg<=.001f)highlightBlocked++;if(ag<=.001f)agreementBlocked++;if(apod<=.001f)apodBlocked++;}}
++    dm.sync();if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=total;if(n>1)st[1]=active;if(n>2)st[2]=strong;if(n>3)st[3]=highlightBlocked;if(n>4)st[4]=agreementBlocked;if(n>5)st[5]=apodBlocked;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}return JNI_TRUE;
+ }
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_composePlanBRender(
+-        JNIEnv*e,jclass,jstring guidePath,jint gw,jint gh,jstring detailPath,jint dw,jint dh,jfloat originX,jfloat originY,jfloat dsx,jfloat dsy,jint ow,jint oh,jfloat psx,jfloat psy,jstring outputPath,jlong maxDurationMs){
+-    try {
+-    if(!guidePath||!detailPath||!outputPath||gw<=0||gh<=0||dw<=0||dh<=0||ow<=0||oh<=0||dsx<1.f||dsy<1.f||psx<1.f||psy<1.f||maxDurationMs<=0)return JNI_FALSE;iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U gp(e,guidePath),dp(e,detailPath),op(e,outputPath);if(!gp.c||!dp.c||!op.c)return JNI_FALSE;iris26752planb::MapFile gm,dm,om;if(!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.openExisting(dp.c,(size_t)dw*dh*sizeof(uint16_t),false)||!om.create(op.c,(size_t)ow*oh*3*sizeof(uint16_t)))return JNI_FALSE;auto*g=(const uint16_t*)gm.ptr;auto*d=(const uint16_t*)dm.ptr;auto*out=(uint16_t*)om.ptr;
+-    for(int y=0;y<oh;y++){if(deadline.expired())return JNI_FALSE;for(int x=0;x<ow;x++){float sourceX=(float)x/psx,sourceY=(float)y/psy;auto rgb=iris26752planb::guideSample(g,gw,gh,sourceX,sourceY);float lx=sourceX*dsx-originX,ly=sourceY*dsy-originY;float logd=iris26752planb::detailSample(d,dw,dh,lx,ly),factor=std::exp2(clampf(logd,-.56f,.56f));size_t q=((size_t)y*ow+x)*3;for(int c=0;c<3;c++)out[q+c]=iris26564::floatToHalf(std::max(rgb[c]*factor,0.f));}}
+-    if(deadline.expired())return JNI_FALSE;om.sync();return deadline.expired()?JNI_FALSE:JNI_TRUE;
+-
+-    } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
++        JNIEnv*e,jclass,jstring guidePath,jint gw,jint gh,jstring detailPath,jint dw,jint dh,jfloat originX,jfloat originY,jfloat dsx,jfloat dsy,jint ow,jint oh,jfloat psx,jfloat psy,jstring outputPath){
++    if(!guidePath||!detailPath||!outputPath||gw<=0||gh<=0||dw<=0||dh<=0||ow<=0||oh<=0||dsx<1.f||dsy<1.f||psx<1.f||psy<1.f)return JNI_FALSE;U gp(e,guidePath),dp(e,detailPath),op(e,outputPath);if(!gp.c||!dp.c||!op.c)return JNI_FALSE;iris26752planb::MapFile gm,dm,om;if(!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.openExisting(dp.c,(size_t)dw*dh*sizeof(uint16_t),false)||!om.create(op.c,(size_t)ow*oh*3*sizeof(uint16_t)))return JNI_FALSE;auto*g=(const uint16_t*)gm.ptr;auto*d=(const uint16_t*)dm.ptr;auto*out=(uint16_t*)om.ptr;
++    for(int y=0;y<oh;y++)for(int x=0;x<ow;x++){float sourceX=(float)x/psx,sourceY=(float)y/psy;auto rgb=iris26752planb::guideSample(g,gw,gh,sourceX,sourceY);float lx=sourceX*dsx-originX,ly=sourceY*dsy-originY;float logd=iris26752planb::detailSample(d,dw,dh,lx,ly),factor=std::exp2(clampf(logd,-.56f,.56f));size_t q=((size_t)y*ow+x)*3;for(int c=0;c<3;c++)out[q+c]=iris26564::floatToHalf(std::max(rgb[c]*factor,0.f));}
++    om.sync();return JNI_TRUE;
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 8308a894a06f58187551b31a0205b66677c8a3bb..a54b8c5a35f6a0247bb8755868a8914dac117170 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -189,7 +189,7 @@ internal class GlesMgcRawSpatialStacker(
+         val originY: Int,
+         val fullWidth: Int,
+         val fullHeight: Int,
+-        /* IRIS_26753_IPOL_PLAN_B_DIRECT_NATIVE_GEOMETRY */
++        /* IRIS_26752_IPOL_PLAN_B_EXACT_GEOMETRY */
+         val scaleX: Float,
+         val scaleY: Float,
+         val originXF: Float,
+@@ -207,16 +207,16 @@ internal class GlesMgcRawSpatialStacker(
+         val strongPct: Float,
+     )
+ 
+-    private data class PlanBTranslation26753(
++    private data class PlanBTranslation26752(
+         val evidence: True2xFrameEvidence,
+         val dx: Float,
+         val dy: Float,
+     )
+ 
+-    private data class PlanBReconstruction26753(
++    private data class PlanBReconstruction26752(
+         val detail: HighZoomDetailResult,
+         val renderRgbPath: String?,
+-        val irlsUpdates: Int,
++        val iterations: Int,
+         val weights: FloatArray,
+     )
+ 
+@@ -2276,11 +2276,11 @@ internal class GlesMgcRawSpatialStacker(
+         require(!(enableSabreSuperRes && enableHighZoomDetail)) {
+             "26718 Super Res and normal high-zoom detail are mutually exclusive reconstruction routes"
+         }
+-        /* IRIS_26753_PLAN_B_ALL_NORMAL_TRANSLATION_EVIDENCE
+-         * Plan B owns one fixed same-lens NORMAL population. The retired JPEG top-two-per-phase
+-         * reservoir is not instantiated: memory is bounded by reconstruction tiling, never by
+-         * dropping user-requested frames.
++        /* IRIS_26752_PLAN_B_ALL_NORMAL_TRANSLATION_EVIDENCE
++         * Plan B's robust IRLS needs the translation sequence itself, not the old 2x phase reservoir.
++         * The bounded mobile solver later retains at most nine same-lens NORMAL observations.
+          */
++        val true2xFastPhaseSlots: Array<True2xFrameEvidence?>? = null
+         /* IRIS_26718_HIGH_ZOOM_ALL_NORMAL_EVIDENCE
+          * Normal high zoom retains every admitted NORMAL observation. This route deliberately does
+          * not inherit Super Res JPEG's top-two-per-phase reservoir or publication policy. SHORT/LONG
+@@ -2561,12 +2561,12 @@ internal class GlesMgcRawSpatialStacker(
+                     rejectionWidth = coverageWidth,
+                     rejectionHeight = coverageHeight,
+                     useFrameWeight = false,
+-                    existingPhaseEvidence = null,
++                    existingPhaseEvidence = true2xFastPhaseSlots,
+                     referenceRawTexture = referenceRaw,
+                     currentRawTexture = referenceRaw,
+                     referenceCalibration = referenceCalibration,
+                 )
+-                true2xEvidence += referenceEvidence
++                if (true2xFastPhaseSlots == null) true2xEvidence += referenceEvidence
+             }
+             if (enableHighZoomDetail) {
+                 highZoomEvidence26718 += persistTrue2xEvidence(
+@@ -2802,12 +2802,12 @@ internal class GlesMgcRawSpatialStacker(
+                         rejectionWidth = coverageWidth,
+                         rejectionHeight = coverageHeight,
+                         useFrameWeight = true,
+-                        existingPhaseEvidence = null,
++                        existingPhaseEvidence = true2xFastPhaseSlots,
+                         referenceRawTexture = referenceRaw,
+                         currentRawTexture = currentRaw,
+                         referenceCalibration = referenceCalibration,
+                     )
+-                    true2xEvidence += candidateEvidence
++                    if (true2xFastPhaseSlots == null) true2xEvidence += candidateEvidence
+                 }
+                 if (enableHighZoomDetail && frame.role == RawBurstFrameRole.NORMAL) {
+                     highZoomEvidence26718 += persistTrue2xEvidence(
+@@ -3207,14 +3207,14 @@ internal class GlesMgcRawSpatialStacker(
+             }
+             if (enableHighZoomDetail) {
+                 val reconstructionEvidence = highZoomEvidence26718.toList()
+-                require(reconstructionEvidence.isNotEmpty()) { "26753 Plan-B high zoom has no NORMAL evidence" }
++                require(reconstructionEvidence.isNotEmpty()) { "26752 Plan-B high zoom has no NORMAL evidence" }
+                 val evidencePolicy = "retained=${reconstructionEvidence.size} allAdmittedNormal=true " +
+                     "paperModel=pureTranslation normalOnly=true shortDetailEvidence=false longDetailEvidence=false " +
+                     "rgbOwner=NATIVE_SABRE_VGN directCfaHighZoom=false deviceGate=false"
+-                PLog.i(SABRE_TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_EVIDENCE $evidencePolicy")
+-                MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_EVIDENCE", evidencePolicy)
++                PLog.i(SABRE_TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_EVIDENCE $evidencePolicy")
++                MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_EVIDENCE", evidencePolicy)
+                 val attempt = runCatching {
+-                    reconstructPlanB26753(
++                    reconstructPlanB26752(
+                         frames = frames, images = images, evidence = reconstructionEvidence,
+                         nativeVgnGuideTexture = nativeHdrAuthority26601, publicationScale = 1f,
+                     )
+@@ -3227,15 +3227,15 @@ internal class GlesMgcRawSpatialStacker(
+                     val ready = "size=${hz.width}x${hz.height} origin=${hz.originXF},${hz.originYF} " +
+                         "scale=${hz.scaleX},${hz.scaleY} full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} " +
+                         "frames=${hz.frames} activePct=${hz.activePct} strongPct=${hz.strongPct} ms=${hz.reconstructionMs} " +
+-                        "lumaDetailOwner=IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS nativeSabreVgnChromaOwner=true directChromaOwner=false " +
++                        "lumaDetailOwner=IPOL_PLAN_B_IRLS nativeSabreVgnChromaOwner=true directChromaOwner=false " +
+                         "highlightOwnerUnchanged=true directCfaHighZoom=false"
+-                    PLog.i(SABRE_TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_READY $ready")
+-                    MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_READY", ready)
++                    PLog.i(SABRE_TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_READY $ready")
++                    MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_READY", ready)
+                 } else {
+                     val failure = checkNotNull(attempt.exceptionOrNull())
+-                    PLog.e(SABRE_TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_FAIL_CLOSED reason=${failure.message}", failure)
++                    PLog.e(SABRE_TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_FAIL_CLOSED reason=${failure.message}", failure)
+                     MotionTrace.processingState(
+-                        "IRIS_26753_PLAN_B_HIGH_ZOOM_FAIL_CLOSED",
++                        "IRIS_26752_PLAN_B_HIGH_ZOOM_FAIL_CLOSED",
+                         "reason=${failure.javaClass.simpleName}:${failure.message} fallback=NATIVE_SABRE_VGN_NO_DETAIL",
+                     )
+                     highZoomDetailResult = null
+@@ -3246,10 +3246,10 @@ internal class GlesMgcRawSpatialStacker(
+             }
+             if (enableSabreSuperRes) {
+                 val reconstructionStartNs=System.nanoTime()
+-                val reconstructionEvidence = true2xEvidence.toList()
++                val reconstructionEvidence=true2xFastPhaseSlots?.filterNotNull()?:true2xEvidence
+                 val evidencePolicy = "dngRequested=$exportNormalStackedDng normalFrames=$normalFrameCount " +
+-                    "retained=${reconstructionEvidence.size} fixedAllNormal=true jpegTop2PerPhase=false " +
+-                    "maxEvidence=${reconstructionEvidence.size} " +
++                    "retained=${reconstructionEvidence.size} jpegTop2PerPhase=${true2xFastPhaseSlots!=null} " +
++                    "maxEvidence=${if (true2xFastPhaseSlots!=null) TRUE2X_JPEG_MAX_EVIDENCE else reconstructionEvidence.size} " +
+                     "shortDetailEvidence=false shortUnifiedGuide=${highlightShortScheduled26607} " +
+                     "shortTargetAccumulatorEligibleCells=${highlightShortTargetEligibleCellsAbi26607 ?: 0} " +
+                     "shortGuideOwner=SINGLE_COMMON_RBF_RESOLVE_VGN srDetailOwner=NORMAL_ONLY"
+@@ -3261,10 +3261,10 @@ internal class GlesMgcRawSpatialStacker(
+                 require(rawResult.width==superResWidth&&rawResult.height==superResHeight)
+                 val expectedTrueBytes=rawResult.width.toLong()*rawResult.height*TRUE2X_RGB16F_BYTES_PER_PIXEL
+                 if(rawResult.backend=="PLAN_B") {
+-                    require(rawResult.renderRgbPath?.let { File(it).length()==expectedTrueBytes }==true) { "26753 Plan-B true2x render carrier invalid" }
+-                    require((rawResult.linearRgbPath!=null)==exportNormalStackedDng) { "26753 Plan-B DNG ownership mismatch" }
++                    require(rawResult.renderRgbPath?.let { File(it).length()==expectedTrueBytes }==true) { "26752 Plan-B true2x render carrier invalid" }
++                    require((rawResult.linearRgbPath!=null)==exportNormalStackedDng) { "26752 Plan-B DNG ownership mismatch" }
+                     rawResult.linearRgbPath?.let { require(File(it).length()==expectedTrueBytes) }
+-                    require(rawResult.nativeVgnGuidePath==null&&rawResult.phaseSupportPath==null) { "26753 Plan-B must not publish internal guide/phase intermediates" }
++                    require(rawResult.nativeVgnGuidePath==null&&rawResult.phaseSupportPath==null) { "26752 Plan-B must not publish internal guide/phase intermediates" }
+                 } else if(rawResult.backend=="GPU") {
+                     require(rawResult.renderRgbPath?.let { File(it).length()==expectedTrueBytes }==true) { "26568 fused true2x render carrier invalid" }
+                     require((rawResult.linearRgbPath!=null)==exportNormalStackedDng) { "26568 GPU direct-CFA DNG carrier ownership mismatch" }
+@@ -3286,11 +3286,11 @@ internal class GlesMgcRawSpatialStacker(
+                 val readyDetails = "normalFrames=$normalFrameCount shadowLongExcluded=$shadowLongFrameCount " +
+                     "size=${result.width}x${result.height} backend=${result.backend} phaseMean=${result.phaseSupportMean} phaseP10=${result.phaseSupportP10} " +
+                     "reconstruction=${result.reconstructionMs}ms dngBoundary=PRE_VGN sabreRgbChromaOwner=true " +
+-                    "highResLumaOwner=${if (result.backend == "PLAN_B") "IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS" else "DIRECT_CFA"} directChromaOwner=false trueDetail26573=temporal-cross-frame " +
++                    "highResLumaOwner=${if (result.backend == "PLAN_B") "IPOL_PLAN_B_IRLS" else "DIRECT_CFA"} directChromaOwner=false trueDetail26573=temporal-cross-frame " +
+                     "directDng=${result.linearRgbPath!=null} fusedRender=${result.renderRgbPath!=null}"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_READY $readyDetails")
+                 MotionTrace.processingState("IRIS_26576_SR_RECONSTRUCTION_SUMMARY", readyDetails)
+-                cleanupTrue2xEvidence(true2xEvidence); true2xEvidence.clear()
++                cleanupTrue2xEvidence(true2xFastPhaseSlots?.filterNotNull()?:true2xEvidence); true2xEvidence.clear(); true2xFastPhaseSlots?.fill(null)
+             }
+             /* IRIS_26601_POST_SR_SHARED_HDR_PUBLICATION
+              * 1x is already the single common Sabre/Resolve/VGN reconstruction. True-2x consumed
+@@ -14064,18 +14064,13 @@ internal class GlesMgcRawSpatialStacker(
+         return HighZoomDetailStats(activePct,strongPct)
+     }
+ 
+-    /* IRIS_26753_IPOL_PLAN_B_TRANSLATION_VALIDATION
+-     * The paper's geometry remains translation-only. Iris optical-flow registration is the pixel
+-     * geometry owner. Gyro evidence is used only as independent camera-motion support because the
+-     * current RawStackFrame contract has no calibrated per-frame OIS pixel displacement; OIS is
+-     * therefore never invented as geometry. A missing translation fails the complete Plan-B solve
+-     * instead of silently reducing the user's fixed frame count.
++    /* IRIS_26752_IPOL_PLAN_B_GLOBAL_TRANSLATION
++     * The paper's observation model is translation-only. Reduce Iris's persisted flow field to one
++     * robust frame translation and never feed local/non-rigid flow into the Plan-B solver. Flow is
++     * reference->current sampling displacement, hence the paper's Aj translation has opposite sign.
+      */
+-    private fun planBGlobalTranslation26753(
+-        ev: True2xFrameEvidence,
+-        referenceFrameIndex: Int,
+-    ): Pair<Float, Float>? {
+-        if (ev.frameIndex == referenceFrameIndex) return 0f to 0f
++    private fun planBGlobalTranslation26752(ev: True2xFrameEvidence): Pair<Float, Float>? {
++        if (ev.frameIndex == 0) return 0f to 0f
+         val values = ev.flowData.duplicate().order(ByteOrder.nativeOrder()).asShortBuffer()
+         val xs = ArrayList<Float>()
+         val ys = ArrayList<Float>()
+@@ -14095,13 +14090,10 @@ internal class GlesMgcRawSpatialStacker(
+             val n = v.size
+             return if ((n and 1) != 0) v[n / 2] else 0.5f * (v[n / 2 - 1] + v[n / 2])
+         }
+-        val mx = median(xs)
+-        val my = median(ys)
+-        if (!mx.isFinite() || !my.isFinite()) return null
+-        return -mx to -my
++        return -median(xs) to -median(ys)
+     }
+ 
+-    private fun writePlanBLumaFrame26753(
++    private fun writePlanBLumaFrame26752(
+         image: SafeImage,
+         ev: True2xFrameEvidence,
+         cropX: Int,
+@@ -14138,7 +14130,7 @@ internal class GlesMgcRawSpatialStacker(
+                 readTrue2xRawRegion(image, rawLeft, rawTop, rawWidth, rawHeight).use { raw ->
+                     val covariance = readTrue2xFileRegion(
+                         ev.covarianceFile, ev.covarianceWidth, 4,
+-                        covLeft, covTop, covWidth, covHeight, "IRIS26753 Plan-B covariance",
++                        covLeft, covTop, covWidth, covHeight, "IRIS26752 Plan-B covariance",
+                     )
+                     try {
+                         check(
+@@ -14158,7 +14150,7 @@ internal class GlesMgcRawSpatialStacker(
+                                 floatArrayOf(COV_MIN_B, COV_MAX_B - COV_MIN_B),
+                                 cameraDomainScale, lensShading, lensShadingWidth, lensShadingHeight,
+                             )
+-                        ) { "26753 Plan-B luma tile failed frame=${ev.frameIndex} tile=$left,$top" }
++                        ) { "26752 Plan-B luma tile failed frame=${ev.frameIndex} tile=$left,$top" }
+                     } finally {
+                         LargeDirectBuffer.free(covariance)
+                     }
+@@ -14168,254 +14160,98 @@ internal class GlesMgcRawSpatialStacker(
+             top += tileHeight
+         }
+         require(output.length() == cropWidth.toLong() * cropHeight * Float.SIZE_BYTES) {
+-            "26753 Plan-B luma carrier size mismatch frame=${ev.frameIndex}"
+-        }
+-    }
+-
+-    private fun planBMemoryBudgetBytes26753(): Long {
+-        val maxHeap = Runtime.getRuntime().maxMemory().coerceAtLeast(1L)
+-        return (maxHeap / 8L).coerceIn(PLAN_B_MIN_MEMORY_BYTES_26753, PLAN_B_MAX_MEMORY_BYTES_26753)
+-    }
+-
+-    private fun planBEstimatedTileBytes26753(
+-        frameCount: Int,
+-        inputWidth: Int,
+-        inputHeight: Int,
+-        outputWidth: Int,
+-        outputHeight: Int,
+-        workers: Int,
+-    ): Long {
+-        fun fftPlanBytes(n: Int): Long {
+-            if (n <= 0 || (n and (n - 1)) == 0) return 0L
+-            val target = 2L * n - 1L
+-            var power = 1L
+-            while (power < target) power = Math.multiplyExact(power, 2L)
+-            return (n.toLong() + power) * 8L
+-        }
+-        val inputPixels = inputWidth.toLong() * inputHeight.toLong()
+-        val outputPixels = outputWidth.toLong() * outputHeight.toLong()
+-        val observations = frameCount.toLong() * inputPixels * 8L
+-        val outputComplex = outputPixels * 8L
+-        val mappedLuma = inputPixels * Float.SIZE_BYTES
+-        val lines = workers.toLong() * 2L * maxOf(inputWidth, inputHeight, outputWidth, outputHeight) * 8L
+-        val solver = 8L * (2L * frameCount) * (2L * frameCount) * java.lang.Double.BYTES
+-        val fftPlans = fftPlanBytes(inputWidth) + fftPlanBytes(inputHeight) +
+-            fftPlanBytes(outputWidth) + fftPlanBytes(outputHeight)
+-        return observations + outputComplex + mappedLuma + lines + solver + fftPlans + PLAN_B_NATIVE_RESERVE_BYTES_26753
+-    }
+-
+-    private fun planBCoreOutputTile26753(
+-        frameCount: Int,
+-        cropWidth: Int,
+-        cropHeight: Int,
+-        outputWidth: Int,
+-        outputHeight: Int,
+-        memoryBudgetBytes: Long,
+-    ): Int {
+-        for (candidate in PLAN_B_CORE_TILE_CANDIDATES_26753) {
+-            val expandedOutW = minOf(outputWidth, candidate + 2 * PLAN_B_OUTPUT_OVERLAP_26753)
+-            val expandedOutH = minOf(outputHeight, candidate + 2 * PLAN_B_OUTPUT_OVERLAP_26753)
+-            val sourceW = kotlin.math.ceil(expandedOutW.toDouble() * cropWidth / outputWidth).toInt().coerceAtLeast(1)
+-            val sourceH = kotlin.math.ceil(expandedOutH.toDouble() * cropHeight / outputHeight).toInt().coerceAtLeast(1)
+-            val estimated = planBEstimatedTileBytes26753(frameCount, sourceW, sourceH, expandedOutW, expandedOutH, 1)
+-            if (estimated <= memoryBudgetBytes * 3L / 4L) return candidate
++            "26752 Plan-B luma carrier size mismatch frame=${ev.frameIndex}"
+         }
+-        throw IllegalStateException(
+-            "26753 Plan-B memory preflight failed frames=$frameCount crop=${cropWidth}x$cropHeight " +
+-                "output=${outputWidth}x$outputHeight budget=$memoryBudgetBytes",
+-        )
+     }
+ 
+-    /* IRIS_26753_IPOL_PLAN_B_RECONSTRUCTION_OWNER
+-     * Pure Plan B, crop-first and direct to the lens publication grid. All same-lens NORMAL frames
+-     * are retained. Work is streamed as bounded overlapping spatial tiles; no full-frame Fourier
+-     * spectra coexist in RAM and there is no second scaler. Each tile performs one direct WLS solve;
+-     * robustly detected frame outliers alone may trigger <=5 early-stopping IRLS updates.
++    /* IRIS_26752_IPOL_PLAN_B_RECONSTRUCTION_OWNER
++     * Exact paper core, device-agnostic and lens-relative. NORMAL frames from exactly one physical
++     * lens become unwarped scalar camera-luma observations. Modified-Tukey + Fourier direct WLS +
++     * l1-l2 IRLS run natively. Sabre/VGN remains the only RGB/chroma/highlight publication owner.
+      */
+-    private fun reconstructPlanB26753(
++    private fun reconstructPlanB26752(
+         frames: List<RawStackFrame>,
+         images: List<SafeImage>,
+         evidence: List<True2xFrameEvidence>,
+         nativeVgnGuideTexture: Int,
+         publicationScale: Float,
+-    ): PlanBReconstruction26753 {
++    ): PlanBReconstruction26752 {
+         require(publicationScale == 1f || publicationScale == 2f)
+         require(evidence.isNotEmpty())
+         val directory = checkNotNull(sabreSuperResTempDir)
+         require(directory.exists() || directory.mkdirs())
+-        require(evidence.all { it.frameIndex in frames.indices && it.frameIndex in images.indices }) {
+-            "26753 Plan-B evidence index outside immutable burst"
+-        }
+-        require(evidence.all { frames[it.frameIndex].role == RawBurstFrameRole.NORMAL }) {
+-            "26753 Plan-B evidence must be NORMAL-only"
+-        }
+-        val reference = evidence.firstOrNull { it.frameIndex == 0 } ?: evidence.first()
+-        require(reference.frameIndex == 0) { "26753 Plan-B reference NORMAL frame missing" }
+-        val referenceLens = frames[reference.frameIndex].lensState
+-        require(evidence.all { frames[it.frameIndex].lensState == referenceLens }) {
+-            "26753 Plan-B cross-lens evidence rejected referenceLens=$referenceLens"
+-        }
+-        require(evidence.size >= 4) { "26753 Plan-B needs >=4 same-lens NORMAL frames, got=${evidence.size}" }
+-        val gyroSupportFrames = evidence.count { ev ->
+-            val frame = frames[ev.frameIndex]
+-            frame.gyroSampleCount > 0 && frame.gyroShakiness.isFinite() && frame.gyroShakiness >= 0f
+-        }
+-        require(evidence.none { ev ->
+-            val frame = frames[ev.frameIndex]
+-            frame.gyroSampleCount > 0 && (!frame.gyroShakiness.isFinite() || frame.gyroShakiness < 0f)
+-        }) { "26753 Plan-B invalid gyro support metadata" }
+-        val translations = evidence.map { ev ->
+-            val shift = requireNotNull(planBGlobalTranslation26753(ev, reference.frameIndex)) {
+-                "26753 Plan-B translation proof missing frame=${ev.frameIndex}; fixed frame count forbids silent drop"
+-            }
+-            PlanBTranslation26753(ev, shift.first, shift.second)
+-        }
+-        require(translations.size == evidence.size) { "26753 fixed Plan-B frame population changed" }
++        val referenceLens = frames[evidence.first().frameIndex].lensState
++        val sameLens = evidence.filter { ev ->
++            ev.frameIndex in frames.indices &&
++                frames[ev.frameIndex].role == RawBurstFrameRole.NORMAL &&
++                frames[ev.frameIndex].lensState == referenceLens
++        }
++        require(sameLens.size >= 4) { "26752 Plan-B needs >=4 same-lens NORMAL frames, got=${sameLens.size}" }
++        /* Bound the mobile cache while retaining the 3x alias-system minimum. This is evidence
++         * selection only; the reconstruction equations below remain the paper's exact estimator.
++         * Reference is immutable; remaining slots use existing Sabre rejection quality only. */
++        val reference = sameLens.firstOrNull { it.frameIndex == 0 } ?: sameLens.first()
++        val selectedEvidence = if (sameLens.size <= PLAN_B_MAX_EVIDENCE_26752) sameLens else {
++            listOf(reference) + sameLens.asSequence()
++                .filter { it !== reference }
++                .sortedByDescending { it.qualityScore }
++                .take(PLAN_B_MAX_EVIDENCE_26752 - 1)
++                .toList()
++        }
++        val translations = selectedEvidence.mapNotNull { ev ->
++            planBGlobalTranslation26752(ev)?.let { shift -> PlanBTranslation26752(ev, shift.first, shift.second) }
++        }
++        require(translations.size >= 4) {
++            "26752 Plan-B translation proof insufficient accepted=${translations.size} selected=${selectedEvidence.size}"
++        }
++        val supportedCeil = kotlin.math.floor(kotlin.math.sqrt(translations.size.toDouble())).toInt().coerceIn(1, 3)
++        require(supportedCeil >= 2)
++        val desiredScale = (publicationScale * highZoomSourceZoom)
++            .coerceAtLeast(publicationScale)
++            .coerceAtMost(supportedCeil.toFloat())
+         val maxShiftX = translations.maxOf { kotlin.math.abs(it.dx) }
+         val maxShiftY = translations.maxOf { kotlin.math.abs(it.dy) }
+         val visibleWidth = kotlin.math.ceil(width / highZoomSourceZoom.toDouble()).toInt().coerceIn(1, width)
+         val visibleHeight = kotlin.math.ceil(height / highZoomSourceZoom.toDouble()).toInt().coerceIn(1, height)
+-        val cropWidth = visibleWidth
+-        val cropHeight = visibleHeight
++        val marginX = (kotlin.math.ceil(visibleWidth * 0.02).toInt() + kotlin.math.ceil(maxShiftX.toDouble()).toInt() + 8)
++        val marginY = (kotlin.math.ceil(visibleHeight * 0.02).toInt() + kotlin.math.ceil(maxShiftY.toDouble()).toInt() + 8)
++        val cropWidth = (visibleWidth + 2 * marginX).coerceAtMost(width)
++        val cropHeight = (visibleHeight + 2 * marginY).coerceAtMost(height)
+         val cropX = ((width - cropWidth) / 2).coerceAtLeast(0)
+         val cropY = ((height - cropHeight) / 2).coerceAtLeast(0)
+-        val outputWidth = Math.multiplyExact(width, publicationScale.toInt())
+-        val outputHeight = Math.multiplyExact(height, publicationScale.toInt())
++        val outputWidth = kotlin.math.round(cropWidth * desiredScale).toInt().coerceAtLeast(cropWidth)
++        val outputHeight = kotlin.math.round(cropHeight * desiredScale).toInt().coerceAtLeast(cropHeight)
+         val scaleX = outputWidth.toFloat() / cropWidth.toFloat()
+         val scaleY = outputHeight.toFloat() / cropHeight.toFloat()
+-        val memoryBudgetBytes = planBMemoryBudgetBytes26753()
+-        val coreTile = planBCoreOutputTile26753(
+-            translations.size, cropWidth, cropHeight, outputWidth, outputHeight, memoryBudgetBytes,
+-        )
+-        val tilesX = (outputWidth + coreTile - 1) / coreTile
+-        val tilesY = (outputHeight + coreTile - 1) / coreTile
+-        val plannedTiles = Math.multiplyExact(tilesX, tilesY)
+-        require(plannedTiles <= PLAN_B_MAX_TILE_COUNT_26753) {
+-            "26753 Plan-B tile count bound exceeded count=$plannedTiles core=$coreTile"
++        val aliasUnknowns = kotlin.math.ceil(scaleX.toDouble()).toInt() * kotlin.math.ceil(scaleY.toDouble()).toInt()
++        require(translations.size >= aliasUnknowns) {
++            "26752 Plan-B underdetermined L=${translations.size} aliases=$aliasUnknowns scale=$scaleX,$scaleY"
+         }
+         val guideFile = streamTrue2xNativeVgnGuideRgb16f(nativeVgnGuideTexture)
+-        val reconstruction = File(directory, "iris26753_planb_reconstruction_${System.nanoTime()}.f32")
+-        val accumulation = File(directory, "iris26753_planb_sum_${System.nanoTime()}.f32")
+-        val accumulationWeight = File(directory, "iris26753_planb_weight_${System.nanoTime()}.f32")
+-        val detail = File(directory, "iris26753_planb_detail_${System.nanoTime()}.r16f")
+-        val render = if (publicationScale > 1.5f) File(directory, "iris26753_planb_render_${System.nanoTime()}.rgb16f") else null
+-        RandomAccessFile(accumulation, "rw").use { it.setLength(outputWidth.toLong() * outputHeight * Float.SIZE_BYTES) }
+-        RandomAccessFile(accumulationWeight, "rw").use { it.setLength(outputWidth.toLong() * outputHeight * Float.SIZE_BYTES) }
++        val lumaFiles = ArrayList<File>(translations.size)
++        val reconstruction = File(directory, "iris26752_planb_reconstruction_${System.nanoTime()}.f32")
++        val detail = File(directory, "iris26752_planb_detail_${System.nanoTime()}.r16f")
++        val render = if (publicationScale > 1.5f) File(directory, "iris26752_planb_render_${System.nanoTime()}.rgb16f") else null
+         val startNs = System.nanoTime()
+-        val aggregateWeights = DoubleArray(translations.size)
+-        var completedTiles = 0
+-        var maxIrlsUpdates = 0
+-        var outlierTiles = 0
+-        var peakEstimatedBytes = 0L
+-        var maxWorkers = 0L
+         try {
+-            var coreTop = 0
+-            while (coreTop < outputHeight) {
+-                val coreHeight = minOf(coreTile, outputHeight - coreTop)
+-                var coreLeft = 0
+-                while (coreLeft < outputWidth) {
+-                    val tileStartNs = System.nanoTime()
+-                    val elapsedBeforeTile = (tileStartNs - startNs) / 1_000_000L
+-                    val remainingBeforeTile = PLAN_B_STAGE_MAX_MS_26753 - elapsedBeforeTile
+-                    check(remainingBeforeTile > 0L) { "26753 Plan-B stage deadline exhausted before tile=$completedTiles" }
+-                    val coreWidth = minOf(coreTile, outputWidth - coreLeft)
+-                    val tentativeOutLeft = (coreLeft - PLAN_B_OUTPUT_OVERLAP_26753).coerceAtLeast(0)
+-                    val tentativeOutTop = (coreTop - PLAN_B_OUTPUT_OVERLAP_26753).coerceAtLeast(0)
+-                    val tentativeOutRight = (coreLeft + coreWidth + PLAN_B_OUTPUT_OVERLAP_26753).coerceAtMost(outputWidth)
+-                    val tentativeOutBottom = (coreTop + coreHeight + PLAN_B_OUTPUT_OVERLAP_26753).coerceAtMost(outputHeight)
+-                    val sourceLeft = kotlin.math.floor(tentativeOutLeft.toDouble() * cropWidth / outputWidth).toInt().coerceIn(0, cropWidth - 1)
+-                    val sourceTop = kotlin.math.floor(tentativeOutTop.toDouble() * cropHeight / outputHeight).toInt().coerceIn(0, cropHeight - 1)
+-                    val sourceRight = kotlin.math.ceil(tentativeOutRight.toDouble() * cropWidth / outputWidth).toInt().coerceIn(sourceLeft + 1, cropWidth)
+-                    val sourceBottom = kotlin.math.ceil(tentativeOutBottom.toDouble() * cropHeight / outputHeight).toInt().coerceIn(sourceTop + 1, cropHeight)
+-                    val outLeft = kotlin.math.floor(sourceLeft.toDouble() * outputWidth / cropWidth).toInt().coerceIn(0, outputWidth - 1)
+-                    val outTop = kotlin.math.floor(sourceTop.toDouble() * outputHeight / cropHeight).toInt().coerceIn(0, outputHeight - 1)
+-                    val outRight = kotlin.math.ceil(sourceRight.toDouble() * outputWidth / cropWidth).toInt().coerceIn(outLeft + 1, outputWidth)
+-                    val outBottom = kotlin.math.ceil(sourceBottom.toDouble() * outputHeight / cropHeight).toInt().coerceIn(outTop + 1, outputHeight)
+-                    val sourceWidth = sourceRight - sourceLeft
+-                    val sourceHeight = sourceBottom - sourceTop
+-                    val tileOutputWidth = outRight - outLeft
+-                    val tileOutputHeight = outBottom - outTop
+-                    val lumaFiles = ArrayList<File>(translations.size)
+-                    val tileReconstruction = File(directory, "iris26753_planb_tile_${completedTiles}_${System.nanoTime()}.f32")
+-                    try {
+-                        translations.forEachIndexed { ordinal, item ->
+-                            val nowNs = System.nanoTime()
+-                            val elapsed = (nowNs - startNs) / 1_000_000L
+-                            val tileElapsed = (nowNs - tileStartNs) / 1_000_000L
+-                            check(elapsed < PLAN_B_STAGE_MAX_MS_26753) { "26753 Plan-B deadline during luma stream tile=$completedTiles" }
+-                            check(tileElapsed < PLAN_B_TILE_MAX_MS_26753) { "26753 Plan-B tile deadline during luma stream tile=$completedTiles" }
+-                            val luma = File(directory, "iris26753_planb_tile_${completedTiles}_luma_${ordinal}_${System.nanoTime()}.f32")
+-                            writePlanBLumaFrame26753(
+-                                images[item.evidence.frameIndex], item.evidence,
+-                                cropX + sourceLeft, cropY + sourceTop, sourceWidth, sourceHeight, luma,
+-                            )
+-                            lumaFiles += luma
+-                        }
+-                        val beforeSolveNs = System.nanoTime()
+-                        val elapsedAfterInput = (beforeSolveNs - startNs) / 1_000_000L
+-                        val tileElapsedAfterInput = (beforeSolveNs - tileStartNs) / 1_000_000L
+-                        val remaining = PLAN_B_STAGE_MAX_MS_26753 - elapsedAfterInput
+-                        val remainingTile = PLAN_B_TILE_MAX_MS_26753 - tileElapsedAfterInput
+-                        check(remaining > 0L) { "26753 Plan-B deadline before direct solve tile=$completedTiles" }
+-                        check(remainingTile > 0L) { "26753 Plan-B tile deadline before direct solve tile=$completedTiles" }
+-                        val tileWeights = FloatArray(translations.size)
+-                        val solverStats = LongArray(10)
+-                        check(
+-                            IrisTrue2xSrNative.reconstructPlanBTileDirect(
+-                                lumaFiles.map { it.absolutePath }.toTypedArray(), sourceWidth, sourceHeight,
+-                                tileOutputWidth, tileOutputHeight,
+-                                translations.map { it.dx }.toFloatArray(), translations.map { it.dy }.toFloatArray(),
+-                                memoryBudgetBytes, minOf(remainingTile, remaining),
+-                                tileReconstruction.absolutePath, tileWeights, solverStats,
+-                            )
+-                        ) { "26753 Plan-B bounded direct tile solve failed tile=$completedTiles" }
+-                        require(tileReconstruction.length() == tileOutputWidth.toLong() * tileOutputHeight * Float.SIZE_BYTES)
+-                        val beforeAccumulateNs = System.nanoTime()
+-                        val remainingForAccumulate = minOf(
+-                            PLAN_B_STAGE_MAX_MS_26753 - (beforeAccumulateNs - startNs) / 1_000_000L,
+-                            PLAN_B_TILE_MAX_MS_26753 - (beforeAccumulateNs - tileStartNs) / 1_000_000L,
+-                        )
+-                        check(remainingForAccumulate > 0L) { "26753 Plan-B tile/stage deadline before accumulation tile=$completedTiles" }
+-                        check(
+-                            IrisTrue2xSrNative.accumulatePlanBTile(
+-                                tileReconstruction.absolutePath, tileOutputWidth, tileOutputHeight,
+-                                outLeft, outTop, outputWidth, outputHeight, PLAN_B_OUTPUT_OVERLAP_26753,
+-                                accumulation.absolutePath, accumulationWeight.absolutePath,
+-                                remainingForAccumulate,
+-                            )
+-                        ) { "26753 Plan-B overlap accumulation failed tile=$completedTiles" }
+-                        for (j in tileWeights.indices) aggregateWeights[j] += tileWeights[j].toDouble()
+-                        maxIrlsUpdates = maxOf(maxIrlsUpdates, solverStats.getOrElse(0) { 0L }.toInt())
+-                        if (solverStats.getOrElse(4) { 0L } > 0L) outlierTiles++
+-                        peakEstimatedBytes = maxOf(peakEstimatedBytes, solverStats.getOrElse(5) { 0L })
+-                        maxWorkers = maxOf(maxWorkers, solverStats.getOrElse(6) { 0L })
+-                        completedTiles++
+-                    } finally {
+-                        lumaFiles.forEach { runCatching { it.delete() } }
+-                        runCatching { tileReconstruction.delete() }
+-                    }
+-                    coreLeft += coreWidth
+-                }
+-                coreTop += coreHeight
+-                GlesGpuScheduler.yieldToUiRenderer()
+-            }
+-            require(completedTiles == plannedTiles) { "26753 Plan-B tile completion mismatch completed=$completedTiles planned=$plannedTiles" }
+-            check((System.nanoTime() - startNs) / 1_000_000L < PLAN_B_STAGE_MAX_MS_26753) {
+-                "26753 Plan-B stage deadline exhausted before finalize"
+-            }
+-            fun remainingPlanBMs26753(stage: String): Long {
+-                val elapsed = (System.nanoTime() - startNs) / 1_000_000L
+-                val remaining = PLAN_B_STAGE_MAX_MS_26753 - elapsed
+-                check(remaining > 0L) { "26753 Plan-B stage deadline exhausted before $stage" }
+-                return remaining
++            translations.forEachIndexed { ordinal, item ->
++                val f = File(directory, "iris26752_planb_luma_${ordinal}_${System.nanoTime()}.f32")
++                writePlanBLumaFrame26752(
++                    images[item.evidence.frameIndex], item.evidence,
++                    cropX, cropY, cropWidth, cropHeight, f,
++                )
++                lumaFiles += f
+             }
++            val weights = FloatArray(translations.size)
++            val solverStats = LongArray(8)
+             check(
+-                IrisTrue2xSrNative.finalizePlanBAccumulation(
+-                    accumulation.absolutePath, accumulationWeight.absolutePath,
+-                    outputWidth, outputHeight, reconstruction.absolutePath,
+-                    remainingPlanBMs26753("overlap finalize"),
++                IrisTrue2xSrNative.reconstructPlanBIrls(
++                    lumaFiles.map { it.absolutePath }.toTypedArray(), cropWidth, cropHeight,
++                    outputWidth, outputHeight,
++                    translations.map { it.dx }.toFloatArray(), translations.map { it.dy }.toFloatArray(),
++                    reconstruction.absolutePath, weights, solverStats,
+                 )
+-            ) { "26753 Plan-B overlap finalization failed" }
++            ) { "26752 Plan-B IRLS failed" }
+             require(reconstruction.length() == outputWidth.toLong() * outputHeight * Float.SIZE_BYTES)
+             val detailStats = LongArray(8)
+             check(
+@@ -14424,9 +14260,8 @@ internal class GlesMgcRawSpatialStacker(
+                     guideFile.absolutePath, width, height,
+                     cropX.toFloat(), cropY.toFloat(), scaleX, scaleY,
+                     maxShiftX, maxShiftY, detail.absolutePath, detailStats,
+-                    remainingPlanBMs26753("detail publication"),
+                 )
+-            ) { "26753 Plan-B detail publication failed" }
++            ) { "26752 Plan-B detail publication failed" }
+             require(detail.length() == outputWidth.toLong() * outputHeight * Short.SIZE_BYTES)
+             if (render != null) {
+                 check(
+@@ -14435,42 +14270,33 @@ internal class GlesMgcRawSpatialStacker(
+                         detail.absolutePath, outputWidth, outputHeight,
+                         cropX * scaleX, cropY * scaleY, scaleX, scaleY,
+                         width * 2, height * 2, 2f, 2f, render.absolutePath,
+-                        remainingPlanBMs26753("2x render composition"),
+                     )
+-                ) { "26753 Plan-B 2x render composition failed" }
++                ) { "26752 Plan-B 2x render composition failed" }
+                 require(render.length() == width.toLong() * 2L * height.toLong() * 2L * TRUE2X_RGB16F_BYTES_PER_PIXEL)
+             }
+             val total = detailStats.getOrElse(0) { 0L }.coerceAtLeast(1L)
+             val activePct = 100f * detailStats.getOrElse(1) { 0L }.toFloat() / total.toFloat()
+             val strongPct = 100f * detailStats.getOrElse(2) { 0L }.toFloat() / total.toFloat()
++            val iterations = solverStats.getOrElse(0) { 0L }.toInt()
+             val originXF = cropX * scaleX
+             val originYF = cropY * scaleY
+-            val finalWeights = FloatArray(translations.size) { index ->
+-                (aggregateWeights[index] / completedTiles.coerceAtLeast(1).toDouble()).toFloat()
+-            }
+-            val proof = "paper=IPOL550 model=PURE_TRANSLATION_SHANNON_MOORE_PENROSE " +
+-                "solve=DUAL_FRAME_SPACE_DIRECT_WLS directSolvesPerTile=1 frames=${translations.size} fixedFrameCount=true " +
+-                "inputCrop=${cropWidth}x$cropHeight output=${outputWidth}x$outputHeight directNativeGrid=true secondScaler=false " +
++            val proof = "paper=IPOL550 model=PURE_TRANSLATION_SHANNON_WLS_IRLS " +
++                "frames=${translations.size} input=${cropWidth}x$cropHeight output=${outputWidth}x$outputHeight " +
+                 "scale=$scaleX,$scaleY sourceZoom=$highZoomSourceZoom publicationScale=$publicationScale " +
+-                "origin=$originXF,$originYF tiles=$completedTiles coreTile=$coreTile overlap=$PLAN_B_OUTPUT_OVERLAP_26753 " +
+-                "irlsTriggeredTiles=$outlierTiles maxIrlsUpdates=$maxIrlsUpdates irlsHardMax=$PLAN_B_IRLS_MAX_UPDATES_26753 " +
+-                "memoryBudgetBytes=$memoryBudgetBytes peakEstimatedBytes=$peakEstimatedBytes maxFftWorkers=$maxWorkers " +
+-                "stageBoundMs=$PLAN_B_STAGE_MAX_MS_26753 tileBoundMs=$PLAN_B_TILE_MAX_MS_26753 " +
+-                "gyroSupportFrames=$gyroSupportFrames oisPixelGeometryAvailable=false opticalFlowGeometryOwner=true " +
+-                "tukeyR=0.025 pinvEps=1e-9 irlsEtaFloor=0.01 irlsStop=1e-5 " +
++                "origin=$originXF,$originYF iterations=$iterations tukeyR=0.025 pinvEps=1e-9 irlsEtaFloor=0.01 irlsStop=1e-5 irlsMax=50 " +
+                 "activePct=$activePct strongPct=$strongPct highlightOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN " +
+-                "lensState=$referenceLens weights=${finalWeights.joinToString(",") { "%.5g".format(it) }}"
+-            PLog.i(SABRE_TAG, "IRIS_26753_IPOL_PLAN_B_PROOF $proof")
+-            MotionTrace.processingState("IRIS_26753_IPOL_PLAN_B_PROOF", proof)
+-            return PlanBReconstruction26753(
++                "deviceGate=false lensState=$referenceLens weights=${weights.joinToString(",") { "%.5g".format(it) }}"
++            PLog.i(SABRE_TAG, "IRIS_26752_IPOL_PLAN_B_PROOF $proof")
++            MotionTrace.processingState("IRIS_26752_IPOL_PLAN_B_PROOF", proof)
++            return PlanBReconstruction26752(
+                 detail = HighZoomDetailResult(
+                     path = detail.absolutePath,
+                     width = outputWidth,
+                     height = outputHeight,
+                     originX = kotlin.math.floor(originXF.toDouble()).toInt(),
+                     originY = kotlin.math.floor(originYF.toDouble()).toInt(),
+-                    fullWidth = outputWidth,
+-                    fullHeight = outputHeight,
++                    fullWidth = kotlin.math.round(width * scaleX).toInt(),
++                    fullHeight = kotlin.math.round(height * scaleY).toInt(),
+                     scaleX = scaleX,
+                     scaleY = scaleY,
+                     originXF = originXF,
+@@ -14483,17 +14309,16 @@ internal class GlesMgcRawSpatialStacker(
+                     reconstructionMs = (System.nanoTime() - startNs) / 1_000_000L,
+                 ),
+                 renderRgbPath = render?.absolutePath,
+-                irlsUpdates = maxIrlsUpdates,
+-                weights = finalWeights,
++                iterations = iterations,
++                weights = weights,
+             )
+         } catch (error: Throwable) {
+             runCatching { detail.delete() }
+             runCatching { render?.delete() }
+             throw error
+         } finally {
++            lumaFiles.forEach { runCatching { it.delete() } }
+             runCatching { reconstruction.delete() }
+-            runCatching { accumulation.delete() }
+-            runCatching { accumulationWeight.delete() }
+             runCatching { guideFile.delete() }
+             if (render != null) runCatching { detail.delete() }
+         }
+@@ -14557,14 +14382,14 @@ internal class GlesMgcRawSpatialStacker(
+     ): True2xResult {
+         require(enableSabreSuperRes)
+         val start = System.nanoTime()
+-        val planB = reconstructPlanB26753(
++        val planB = reconstructPlanB26752(
+             frames = frames,
+             images = images,
+             evidence = evidence,
+             nativeVgnGuideTexture = nativeVgnGuideTexture,
+             publicationScale = 2f,
+         )
+-        val renderPath = checkNotNull(planB.renderRgbPath) { "26753 Plan-B SR render carrier absent" }
++        val renderPath = checkNotNull(planB.renderRgbPath) { "26752 Plan-B SR render carrier absent" }
+         var dngPath: String? = null
+         var phaseMean = 0f
+         var phaseP10 = 0f
+@@ -14586,10 +14411,10 @@ internal class GlesMgcRawSpatialStacker(
+         }
+         val proof = "backend=PLAN_B_IPOL550 render=true dngRequested=$preserveLinearRgbForDng " +
+             "dngOwner=${if (preserveLinearRgbForDng) "DIRECT_CFA_26733" else "NONE"} " +
+-            "rgbChromaOwner=NATIVE_SABRE_VGN lumaOwner=IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS iterations=${planB.irlsUpdates} " +
++            "rgbChromaOwner=NATIVE_SABRE_VGN lumaOwner=IPOL_PLAN_B_IRLS iterations=${planB.iterations} " +
+             "highlightFlattenedProtection=UNCHANGED"
+-        PLog.i(SABRE_TAG, "IRIS_26753_PLAN_B_SR_READY $proof")
+-        MotionTrace.processingState("IRIS_26753_PLAN_B_SR_READY", proof)
++        PLog.i(SABRE_TAG, "IRIS_26752_PLAN_B_SR_READY $proof")
++        MotionTrace.processingState("IRIS_26752_PLAN_B_SR_READY", proof)
+         return True2xResult(
+             linearRgbPath = dngPath,
+             renderRgbPath = renderPath,
+@@ -14698,15 +14523,7 @@ internal class GlesMgcRawSpatialStacker(
+         private const val TRUE2X_REFINE_CELL_RAW_PIXELS = 16
+         private const val TRUE2X_JPEG_EVIDENCE_PER_PHASE = 2
+         private const val TRUE2X_JPEG_MAX_EVIDENCE = 4 * TRUE2X_JPEG_EVIDENCE_PER_PHASE
+-        private const val PLAN_B_OUTPUT_OVERLAP_26753 = 24
+-        private const val PLAN_B_IRLS_MAX_UPDATES_26753 = 5
+-        private const val PLAN_B_STAGE_MAX_MS_26753 = 20_000L
+-        private const val PLAN_B_TILE_MAX_MS_26753 = 4_000L
+-        private const val PLAN_B_MAX_TILE_COUNT_26753 = 1024
+-        private const val PLAN_B_MIN_MEMORY_BYTES_26753 = 24L * 1024L * 1024L
+-        private const val PLAN_B_MAX_MEMORY_BYTES_26753 = 96L * 1024L * 1024L
+-        private const val PLAN_B_NATIVE_RESERVE_BYTES_26753 = 8L * 1024L * 1024L
+-        private val PLAN_B_CORE_TILE_CANDIDATES_26753 = intArrayOf(1024, 896, 768, 640, 512, 384, 256, 192, 128)
++        private const val PLAN_B_MAX_EVIDENCE_26752 = 9
+         private const val TRUE2X_GPU_MIN_TEXTURE_SIZE = 1024
+         private const val TRUE2X_RAW_RBF_HALO = 4f
+         private const val TRUE2X_EVIDENCE_HALO = 2
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
+index 3e9e7a45409adcda218b35f1496c829eca1de2a7..94cea79440b42d9ae76fd1ac338d3d8af4c6d3fa 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
+@@ -90,29 +90,15 @@ public final class IrisTrue2xSrNative {
+             float[] gains, float[] blackTerms, float[] covarianceRangeRg, float[] covarianceRangeB,
+             float[] cameraDomainScale, float[] lensShading, int lensShadingWidth, int lensShadingHeight);
+ 
+-    /** IRIS_26753_IPOL_PLAN_B_MOBILE_TILE
+-     * Solve one bounded Plan-B tile directly on its requested output grid. The native owner runs
+-     * exactly one direct Moore-Penrose WLS solve, then enters at most five l1-l2 IRLS updates only
+-     * when robust residual statistics prove an actual frame outlier. Memory and wall-clock work are
+-     * hard-bounded by the caller.
++    /**
++     * Exact IPOL Plan-B core: modified-Tukey apodization plus Fourier-domain direct weighted
++     * least-squares, iterated with the paper's l1-l2 IRLS update. Output is float32 linear luma.
+      */
+-    public static native boolean reconstructPlanBTileDirect(
++    public static native boolean reconstructPlanBIrls(
+             String[] lumaF32Paths, int inputWidth, int inputHeight,
+             int outputWidth, int outputHeight, float[] shiftX, float[] shiftY,
+-            long memoryBudgetBytes, long maxDurationMs,
+             String outputF32Path, float[] finalWeights, long[] stats);
+ 
+-    /** Feather one directly reconstructed overlapping tile into disk-backed float accumulators. */
+-    public static native boolean accumulatePlanBTile(
+-            String tileF32Path, int tileWidth, int tileHeight, int originX, int originY,
+-            int fullWidth, int fullHeight, int overlapPixels,
+-            String sumF32Path, String weightF32Path, long maxDurationMs);
+-
+-    /** Normalize the bounded overlap accumulators to the final direct native-grid Plan-B luma. */
+-    public static native boolean finalizePlanBAccumulation(
+-            String sumF32Path, String weightF32Path, int fullWidth, int fullHeight,
+-            String outputF32Path, long maxDurationMs);
+-
+     /**
+      * Convert the absolute Plan-B luma result to a bounded R16F log2 luminance sidecar against
+      * the untouched native Sabre/VGN guide. Existing signal/highlight/agreement safety gates remain
+@@ -122,8 +108,7 @@ public final class IrisTrue2xSrNative {
+             String reconstructedLumaF32Path, int reconstructedWidth, int reconstructedHeight,
+             String nativeVgnRgb16fPath, int nativeWidth, int nativeHeight,
+             float sourceOriginX, float sourceOriginY, float scaleX, float scaleY,
+-            float maxAbsShiftX, float maxAbsShiftY, String detailR16fPath, long[] detailStats,
+-            long maxDurationMs);
++            float maxAbsShiftX, float maxAbsShiftY, String detailR16fPath, long[] detailStats);
+ 
+     /** Build a full publication RGB16F carrier from native Sabre/VGN RGB and Plan-B luma detail. */
+     public static native boolean composePlanBRender(
+@@ -131,7 +116,7 @@ public final class IrisTrue2xSrNative {
+             String detailR16fPath, int detailWidth, int detailHeight,
+             float detailOriginX, float detailOriginY, float detailScaleX, float detailScaleY,
+             int outputWidth, int outputHeight, float publicationScaleX, float publicationScaleY,
+-            String outputRgb16fPath, long maxDurationMs);
++            String outputRgb16fPath);
+ 
+     /** Pack the requested interior of an RGBA16F region into a disk-backed RGB16F render carrier. */
+     public static native boolean writeRenderTileInterior(
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 720b7a1f7f40b9c5e1b6f74dccb34b32839f59e8..190e7ed027c535820e24484128e81de0c6190df2 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -398,7 +398,7 @@ object PhotonMotionMgc1271Bridge {
+             val sabreSuperResEnabled = parameters.motionV2SuperResOutputEnabled
+             val sabreSuperResOutputScale = if (sabreSuperResEnabled) 2f else 1f
+             parameters.motionV2SuperResOutputScale = sabreSuperResOutputScale
+-            /* IRIS_26753_LENS_RELATIVE_PLAN_B_MOBILE_DIRECT_NATIVE
++            /* IRIS_26752_LENS_RELATIVE_PLAN_B_1P1X
+              * Device-independent, physical-lens-relative activation. Every optical owner uses the
+              * same Plan-B luma solver from local 1.10x upward; Super Res uses the same solver via
+              * its dedicated 2x publication route. Sabre/VGN remains RGB/chroma/highlight owner.
+@@ -444,10 +444,10 @@ object PhotonMotionMgc1271Bridge {
+                 "localOutputZoom=$localOutputZoom localThreshold=1.10 opticalAnchor=${parameters.motionV2OpticalZoomAnchor} " +
+                 "superResRequested=$sabreSuperResEnabled focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} " +
+                 "lensState=${referenceStackFrame.lensState} rgbOwner=NATIVE_SABRE_VGN " +
+-                "lumaDetailOwner=${if (highZoomDetailEnabled || sabreSuperResEnabled) "IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS" else "NATIVE"} " +
+-                "deviceGate=false cleanNativeFallback=true fixedFrameCount=true directNativePlanB=true irlsHardMax=5 secondScaler=false"
+-            PLog.i(TAG, "IRIS_26753_HIGH_ZOOM_ACTIVATION $highZoomActivation")
+-            MotionTrace.processingState("IRIS_26753_HIGH_ZOOM_ACTIVATION", highZoomActivation)
++                "lumaDetailOwner=${if (highZoomDetailEnabled || sabreSuperResEnabled) "IPOL_PLAN_B_IRLS" else "NATIVE"} " +
++                "deviceGate=false cleanNativeFallback=true"
++            PLog.i(TAG, "IRIS_26718_HIGH_ZOOM_ACTIVATION $highZoomActivation")
++            MotionTrace.processingState("IRIS_26718_HIGH_ZOOM_ACTIVATION", highZoomActivation)
+             PLog.i(TAG, "IRIS_26564_TRUE_2X_SR_DNG_AUTHORITY " +
+                 "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
+                 "reconstructionZoom=$reconstructionZoom renderResidualZoom=$renderResidualZoom " +
+@@ -500,23 +500,13 @@ object PhotonMotionMgc1271Bridge {
+             highZoomDetailPathForCleanup = stacked.highZoomDetailPath
+             highZoomRgbPathForCleanup = stacked.highZoomRgbPath
+             if (highZoomDetailEnabled) {
+-                requireParity(stacked.highZoomRgbPath == null, "26753 Plan-B must never publish high-zoom RGB/chroma")
++                requireParity(stacked.highZoomRgbPath == null, "26752 Plan-B must never publish high-zoom RGB/chroma")
+                 if (stacked.highZoomDetailPath != null) {
+                     requireParity(stacked.highZoomDetailWidth > 0 && stacked.highZoomDetailHeight > 0 &&
+                         stacked.highZoomDetailScaleX >= 1f && stacked.highZoomDetailScaleY >= 1f,
+-                        "26753 invalid Plan-B detail geometry")
+-                    val expectedPlanBFrames26753 = frames.count { it.role == RawBurstFrameRole.NORMAL }
+-                    requireParity(
+-                        stacked.highZoomDetailWidth == size.x && stacked.highZoomDetailHeight == size.y,
+-                        "26753 Plan-B high-zoom output must be direct physical-lens native size expected=${size.x}x${size.y} " +
+-                            "actual=${stacked.highZoomDetailWidth}x${stacked.highZoomDetailHeight}",
+-                    )
+-                    requireParity(
+-                        stacked.highZoomDetailFrames == expectedPlanBFrames26753,
+-                        "26753 Plan-B fixed frame count mismatch expected=$expectedPlanBFrames26753 actual=${stacked.highZoomDetailFrames}",
+-                    )
++                        "26752 invalid Plan-B detail geometry")
+                     requireParity(kotlin.math.abs(stacked.highZoomDetailSourceZoom - localOutputZoom) < 1.0e-5f,
+-                        "26753 Plan-B source zoom mismatch")
++                        "26752 Plan-B source zoom mismatch")
+                     parameters.motionV2HighZoomDetailPath = stacked.highZoomDetailPath
+                     parameters.motionV2HighZoomDetailWidth = stacked.highZoomDetailWidth
+                     parameters.motionV2HighZoomDetailHeight = stacked.highZoomDetailHeight
+@@ -539,19 +529,18 @@ object PhotonMotionMgc1271Bridge {
+                         "scale=${stacked.highZoomDetailScaleX},${stacked.highZoomDetailScaleY} " +
+                         "sourceZoom=${stacked.highZoomDetailSourceZoom} frames=${stacked.highZoomDetailFrames} " +
+                         "activePct=${stacked.highZoomDetailActivePct} strongPct=${stacked.highZoomDetailStrongPct} " +
+-                        "ms=${stacked.highZoomDetailReconstructionMs} directNativeSize=true fixedFrameCount=true secondScaler=false " +
+-                        "rgbOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN"
+-                    PLog.i(TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_HANDOFF $handoff")
+-                    MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_HANDOFF", handoff)
++                        "ms=${stacked.highZoomDetailReconstructionMs} rgbOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN"
++                    PLog.i(TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_HANDOFF $handoff")
++                    MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_HANDOFF", handoff)
+                 } else {
+-                    PLog.i(TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK sourceZoom=$localOutputZoom")
+-                    MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK",
++                    PLog.i(TAG, "IRIS_26752_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK sourceZoom=$localOutputZoom")
++                    MotionTrace.processingState("IRIS_26752_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK",
+                         "sourceZoom=$localOutputZoom rgbOwner=NATIVE_SABRE_VGN detail=false")
+                 }
+             } else {
+                 requireParity(stacked.highZoomRgbPath == null && stacked.highZoomDetailPath == null &&
+                     stacked.highZoomRgbWidth == 0 && stacked.highZoomDetailWidth == 0,
+-                    "26753 Plan-B sidecar survived disabled route")
++                    "26752 Plan-B sidecar survived disabled route")
+             }
+             if (parameters.irisNightActive) {
+                 /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
+@@ -833,7 +822,7 @@ object PhotonMotionMgc1271Bridge {
+                     val fused=checkNotNull(stacked.true2xRenderRgbPath)
+                     resultTrue2xRenderRgbPath=fused; true2xRenderRgbPathForCleanup=fused; iris26564True2xRenderPrepMs=0L
+                     if(produceNormalStackedDng)resultTrue2xLinearRawPath=checkNotNull(stacked.true2xLinearRgbPath)
+-                    val lumaOwner=if(stacked.true2xBackend=="PLAN_B") "IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS" else "DIRECT_CFA_TEMPORAL"
++                    val lumaOwner=if(stacked.true2xBackend=="PLAN_B") "IPOL_PLAN_B_IRLS" else "DIRECT_CFA_TEMPORAL"
+                     PLog.i(TAG,"IRIS_26752_TRUE_DETAIL_RENDER_FUSED backend=${stacked.true2xBackend} size=${stacked.true2xWidth}x${stacked.true2xHeight} dngRawPreserved=${resultTrue2xLinearRawPath!=null} sabreRgbChromaOwner=true highResLumaOwner=$lumaOwner directChromaOwner=false prepMs=0")
+                     PLog.i("MotionTrace", "PIPELINE_STATE stage=IRIS_26752_SR_PROOF_HANDOFF details=backend=${stacked.true2xBackend} statsValidatedByStacker=true fusedCarrier=true")
+                 } else {
+diff --git a/app/version.properties b/app/version.properties
+index 800fb1534dfb1462490751d8002866982a1f21f7..9565f48fbe1bdb927be462e4a1a65880762cdf91 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726753
+-VERSION_BUILD=26753
++VERSION_NAME=0.9726752
++VERSION_BUILD=26752
