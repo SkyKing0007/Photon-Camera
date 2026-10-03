@@ -1,0 +1,372 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index a3ea9718665254cdf26af0c53a7dd779bb3fb917..97c9cfab237880944597c3db3755f69a034be8dc 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -1751,6 +1751,35 @@ bool solveWeightedDual(C*out,const std::vector<C*>&inputs,const std::vector<doub
+     }return true;
+ }
+ 
++/* IRIS_26754_IPOL_SECTION7_SPECTRAL_ENHANCEMENT
++ * IPOL Eq. (57)-(58): psi_lambda = 1 + lambda * (1-exp(-rho)),
++ * rho=sqrt((2a/M)^2+(2b/N)^2).  Lambda is conservatively bounded by the paper's
++ * support ratio L/(ceil(zx)*ceil(zy)) so underdetermined extreme zoom cannot be over-sharpened.
++ */
++double spectralLambda(int L,int nx,int ny,int Nx,int Ny){
++    if(L<=0||nx<=0||ny<=0||Nx<nx||Ny<ny)return 0.;
++    const double zx=(double)Nx/(double)nx,zy=(double)Ny/(double)ny;
++    const double denom=std::max(1.0,std::ceil(zx)*std::ceil(zy));
++    return std::max(0.0,std::min(5.0,(double)L/denom));
++}
++bool applySpectralEnhancement(C*out,int Nx,int Ny,double lambda,const Deadline*deadline){
++    if(!out||Nx<=0||Ny<=0||!std::isfinite(lambda)||lambda<0.)return false;
++    if(lambda==0.)return true;
++    for(int y=0;y<Ny;y++){
++        if(deadline&&deadline->expired())return false;
++        const int beta=(y<=(Ny-1)/2)?y:y-Ny;
++        const double fy=2.0*(double)beta/(double)Ny;
++        for(int x=0;x<Nx;x++){
++            const int alpha=(x<=(Nx-1)/2)?x:x-Nx;
++            const double fx=2.0*(double)alpha/(double)Nx;
++            const double rho=std::sqrt(fx*fx+fy*fy);
++            const double gain=1.0+lambda*(1.0-std::exp(-rho));
++            out[(size_t)y*Nx+x]*=(float)gain;
++        }
++    }
++    return true;
++}
++
+ double residualNorm(const C*out,const C*obs,double dx,double dy,int nx,int ny,int Nx,int Ny,const Deadline*deadline){
+     const double zx=(double)Nx/nx,zy=(double)Ny/ny,cof=1./(zx*zy);long double sum2=0.;
+     for(int b=-ny/2;b<=(ny-1)/2;b++){if(deadline&&deadline->expired())return std::numeric_limits<double>::quiet_NaN();int q0=(int)std::ceil(-zy/2.-(double)b/ny),q1=(int)std::ceil(zy/2.-(double)b/ny)-1,ib=modIndex(b,ny);
+@@ -1837,9 +1866,11 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+                 double denom=std::max(std::fabs(previousEnergy),1.0e-12);if(std::fabs(newEnergy-previousEnergy)<=iris26752planb::kIrlsRelativeStop*denom){previousEnergy=newEnergy;break;}previousEnergy=newEnergy;
+             }
+         }
++        const double spectralLambda=iris26752planb::spectralLambda(L,nx,ny,Nx,Ny);
++        if(deadline.expired()||!iris26752planb::applySpectralEnhancement(output.data(),Nx,Ny,spectralLambda,&deadline))return JNI_FALSE;
+         if(deadline.expired()||!iris26752planb::fft2dPlanned(output.data(),Nx,Ny,true,outW,outH,workers,&deadline))return JNI_FALSE;U op(e,outputPath);if(!op.c)return JNI_FALSE;iris26752planb::MapFile out;if(!out.create(op.c,outPix*sizeof(float)))return JNI_FALSE;float*dst=(float*)out.ptr;for(size_t i=0;i<outPix;i++){float v=output[i].real();if(!std::isfinite(v))return JNI_FALSE;dst[i]=std::max(v,0.f);}out.sync();
+         std::vector<jfloat>wf((size_t)L);for(int j=0;j<L;j++)wf[(size_t)j]=(jfloat)weights[(size_t)j];e->SetFloatArrayRegion(outWeights,0,L,wf.data());if(e->ExceptionCheck())return JNI_FALSE;
+-        if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=irlsUpdates;if(n>1)st[1]=L;if(n>2)st[2]=(jlong)inPix;if(n>3)st[3]=(jlong)outPix;if(n>4)st[4]=initialOutliers;if(n>5)st[5]=(jlong)estimated;if(n>6)st[6]=workers;if(n>7)st[7]=(jlong)deadline.elapsedMs();if(n>8)st[8]=etaGuards;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}
++        if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=irlsUpdates;if(n>1)st[1]=L;if(n>2)st[2]=(jlong)inPix;if(n>3)st[3]=(jlong)outPix;if(n>4)st[4]=initialOutliers;if(n>5)st[5]=(jlong)estimated;if(n>6)st[6]=workers;if(n>7)st[7]=(jlong)deadline.elapsedMs();if(n>8)st[8]=etaGuards;if(n>9)st[9]=(jlong)std::llround(spectralLambda*1000000.0);e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}
+         return deadline.expired()?JNI_FALSE:JNI_TRUE;
+     } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
+ }
+@@ -1869,19 +1900,33 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_buildPlanBDetail(
+         JNIEnv*e,jclass,jstring reconstructionPath,jint rw,jint rh,jstring guidePath,jint gw,jint gh,jfloat originX,jfloat originY,jfloat sx,jfloat sy,jfloat maxDx,jfloat maxDy,jstring detailPath,jlongArray statsArray,jlong maxDurationMs){
+     try {
+-    if(!reconstructionPath||!guidePath||!detailPath||rw<=0||rh<=0||gw<=0||gh<=0||sx<1.f||sy<1.f||maxDurationMs<=0)return JNI_FALSE;iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U rp(e,reconstructionPath),gp(e,guidePath),dp(e,detailPath);if(!rp.c||!gp.c||!dp.c)return JNI_FALSE;iris26752planb::MapFile rm,gm,dm;if(!rm.openExisting(rp.c,(size_t)rw*rh*sizeof(float),false)||!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.create(dp.c,(size_t)rw*rh*sizeof(uint16_t)))return JNI_FALSE;auto*recon=(const float*)rm.ptr;auto*guide=(const uint16_t*)gm.ptr;auto*out=(uint16_t*)dm.ptr;long total=0,active=0,strong=0,highlightBlocked=0,agreementBlocked=0,apodBlocked=0;double Dx=std::fabs((double)maxDx)*sx/(double)std::max(1,rw-1),Dy=std::fabs((double)maxDy)*sy/(double)std::max(1,rh-1);
+-    for(int y=0;y<rh;y++){if(deadline.expired())return JNI_FALSE;double ay=iris26752planb::tukeyProfile((double)y/(double)std::max(1,rh-1),iris26752planb::kTukeyR,Dy);for(int x=0;x<rw;x++){double ax=iris26752planb::tukeyProfile((double)x/(double)std::max(1,rw-1),iris26752planb::kTukeyR,Dx);float apod=(float)(ax*ay);float sourceX=originX+(float)x/sx,sourceY=originY+(float)y/sy;auto g=iris26752planb::guideSample(guide,gw,gh,sourceX,sourceY);float gy=.25f*g[0]+.50f*g[1]+.25f*g[2],py=std::max(recon[(size_t)y*rw+x],0.f);float peak=std::max(py,std::max(g[0],std::max(g[1],g[2])));float signal=iris26564::smooth01((gy-.015f)/.055f);float hg=1.f-iris26564::smooth01((peak-.72f)/.20f);float delta=std::fabs(std::log2((py+.01f)/(gy+.01f)));float ag=1.f-iris26564::smooth01((delta-.08f)/.27f);float confidence=clampf(signal*hg*ag*apod,0.f,1.f);float d=clampf(std::log2((py+.01f)/(gy+.01f)),-.56f,.56f)*confidence;if(!std::isfinite(d))return JNI_FALSE;out[(size_t)y*rw+x]=iris26564::floatToHalf(d);total++;if(std::fabs(d)>.005f)active++;if(std::fabs(d)>.03f)strong++;if(hg<=.001f)highlightBlocked++;if(ag<=.001f)agreementBlocked++;if(apod<=.001f)apodBlocked++;}}
+-    if(deadline.expired())return JNI_FALSE;dm.sync();if(deadline.expired())return JNI_FALSE;if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=total;if(n>1)st[1]=active;if(n>2)st[2]=strong;if(n>3)st[3]=highlightBlocked;if(n>4)st[4]=agreementBlocked;if(n>5)st[5]=apodBlocked;e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}return JNI_TRUE;
+-
++    if(!reconstructionPath||!guidePath||!detailPath||rw<=0||rh<=0||gw<=0||gh<=0||sx<1.f||sy<1.f||maxDurationMs<=0)return JNI_FALSE;
++    iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U rp(e,reconstructionPath),gp(e,guidePath),dp(e,detailPath);if(!rp.c||!gp.c||!dp.c)return JNI_FALSE;
++    int rf=open(rp.c,O_RDONLY),gf=open(gp.c,O_RDONLY),df=open(dp.c,O_RDWR|O_CREAT|O_TRUNC,0600);if(rf<0||gf<0||df<0){if(rf>=0)close(rf);if(gf>=0)close(gf);if(df>=0)close(df);return JNI_FALSE;}
++    const uint64_t rbytes=(uint64_t)rw*rh*sizeof(float),gbytes=(uint64_t)gw*gh*3*sizeof(uint16_t),dbytes=(uint64_t)rw*rh*sizeof(uint16_t);struct stat rs{},gs{};bool ok=fstat(rf,&rs)==0&&fstat(gf,&gs)==0&&(uint64_t)rs.st_size==rbytes&&(uint64_t)gs.st_size==gbytes&&ftruncate(df,(off_t)dbytes)==0;
++    std::vector<float>reconRow((size_t)rw);std::vector<uint16_t>g0((size_t)gw*3),g1((size_t)gw*3),detailRow((size_t)rw);int cached0=-1,cached1=-1;long total=0,active=0,strong=0,highlightBlocked=0,agreementBlocked=0,apodBlocked=0;double Dx=std::fabs((double)maxDx)*sx/(double)std::max(1,rw-1),Dy=std::fabs((double)maxDy)*sy/(double)std::max(1,rh-1);
++    auto loadGuide=[&](int yy,std::vector<uint16_t>&row,int&cached)->bool{if(cached==yy)return true;off_t off=(off_t)yy*gw*3*(off_t)sizeof(uint16_t);if(!iris26752planb::readExact(gf,row.data(),row.size()*sizeof(uint16_t),off))return false;cached=yy;return true;};
++    for(int y=0;ok&&y<rh;y++){if(deadline.expired()){ok=false;break;}off_t roff=(off_t)y*rw*(off_t)sizeof(float);if(!iris26752planb::readExact(rf,reconRow.data(),reconRow.size()*sizeof(float),roff)){ok=false;break;}float sourceY=originY+(float)y/sy;sourceY=clampf(sourceY,0.f,(float)(gh-1));int y0=(int)std::floor(sourceY),y1=std::min(y0+1,gh-1);float fy=sourceY-y0;if(!loadGuide(y0,g0,cached0)){ok=false;break;}if(y1==y0){g1=g0;cached1=y1;}else if(!loadGuide(y1,g1,cached1)){ok=false;break;}double ay=iris26752planb::tukeyProfile((double)y/(double)std::max(1,rh-1),iris26752planb::kTukeyR,Dy);
++        for(int x=0;x<rw;x++){double ax=iris26752planb::tukeyProfile((double)x/(double)std::max(1,rw-1),iris26752planb::kTukeyR,Dx);float apod=(float)(ax*ay);float sourceX=clampf(originX+(float)x/sx,0.f,(float)(gw-1));int x0=(int)std::floor(sourceX),x1=std::min(x0+1,gw-1);float fx=sourceX-x0;float g[3];for(int c=0;c<3;c++){float a=iris26564::halfToFloat(g0[(size_t)x0*3+c])+(iris26564::halfToFloat(g0[(size_t)x1*3+c])-iris26564::halfToFloat(g0[(size_t)x0*3+c]))*fx;float b=iris26564::halfToFloat(g1[(size_t)x0*3+c])+(iris26564::halfToFloat(g1[(size_t)x1*3+c])-iris26564::halfToFloat(g1[(size_t)x0*3+c]))*fx;g[c]=a+(b-a)*fy;}float gy=.25f*g[0]+.50f*g[1]+.25f*g[2],py=std::max(reconRow[(size_t)x],0.f);float peak=std::max(py,std::max(g[0],std::max(g[1],g[2])));float signal=iris26564::smooth01((gy-.015f)/.055f);float hg=1.f-iris26564::smooth01((peak-.72f)/.20f);float delta=std::fabs(std::log2((py+.01f)/(gy+.01f)));float ag=1.f-iris26564::smooth01((delta-.08f)/.27f);float confidence=clampf(signal*hg*ag*apod,0.f,1.f);float d=clampf(std::log2((py+.01f)/(gy+.01f)),-.56f,.56f)*confidence;if(!std::isfinite(d)){ok=false;break;}detailRow[(size_t)x]=iris26564::floatToHalf(d);total++;if(std::fabs(d)>.005f)active++;if(std::fabs(d)>.03f)strong++;if(hg<=.001f)highlightBlocked++;if(ag<=.001f)agreementBlocked++;if(apod<=.001f)apodBlocked++;}
++        if(ok){off_t doff=(off_t)y*rw*(off_t)sizeof(uint16_t);ok=iris26752planb::writeExact(df,detailRow.data(),detailRow.size()*sizeof(uint16_t),doff);}
++    }
++    if(rf>=0)close(rf);if(gf>=0)close(gf);if(df>=0)close(df);if(!ok||deadline.expired()){unlink(dp.c);return JNI_FALSE;}if(statsArray){jsize n=e->GetArrayLength(statsArray);std::vector<jlong>st((size_t)n,0);if(n>0)st[0]=total;if(n>1)st[1]=active;if(n>2)st[2]=strong;if(n>3)st[3]=highlightBlocked;if(n>4)st[4]=agreementBlocked;if(n>5)st[5]=apodBlocked;if(n>6)st[6]=(jlong)((reconRow.size()*sizeof(float))+(g0.size()+g1.size())*sizeof(uint16_t)+detailRow.size()*sizeof(uint16_t));e->SetLongArrayRegion(statsArray,0,n,st.data());if(e->ExceptionCheck())return JNI_FALSE;}return JNI_TRUE;
+     } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
+ }
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_composePlanBRender(
+         JNIEnv*e,jclass,jstring guidePath,jint gw,jint gh,jstring detailPath,jint dw,jint dh,jfloat originX,jfloat originY,jfloat dsx,jfloat dsy,jint ow,jint oh,jfloat psx,jfloat psy,jstring outputPath,jlong maxDurationMs){
+     try {
+-    if(!guidePath||!detailPath||!outputPath||gw<=0||gh<=0||dw<=0||dh<=0||ow<=0||oh<=0||dsx<1.f||dsy<1.f||psx<1.f||psy<1.f||maxDurationMs<=0)return JNI_FALSE;iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U gp(e,guidePath),dp(e,detailPath),op(e,outputPath);if(!gp.c||!dp.c||!op.c)return JNI_FALSE;iris26752planb::MapFile gm,dm,om;if(!gm.openExisting(gp.c,(size_t)gw*gh*3*sizeof(uint16_t),false)||!dm.openExisting(dp.c,(size_t)dw*dh*sizeof(uint16_t),false)||!om.create(op.c,(size_t)ow*oh*3*sizeof(uint16_t)))return JNI_FALSE;auto*g=(const uint16_t*)gm.ptr;auto*d=(const uint16_t*)dm.ptr;auto*out=(uint16_t*)om.ptr;
+-    for(int y=0;y<oh;y++){if(deadline.expired())return JNI_FALSE;for(int x=0;x<ow;x++){float sourceX=(float)x/psx,sourceY=(float)y/psy;auto rgb=iris26752planb::guideSample(g,gw,gh,sourceX,sourceY);float lx=sourceX*dsx-originX,ly=sourceY*dsy-originY;float logd=iris26752planb::detailSample(d,dw,dh,lx,ly),factor=std::exp2(clampf(logd,-.56f,.56f));size_t q=((size_t)y*ow+x)*3;for(int c=0;c<3;c++)out[q+c]=iris26564::floatToHalf(std::max(rgb[c]*factor,0.f));}}
+-    if(deadline.expired())return JNI_FALSE;om.sync();return deadline.expired()?JNI_FALSE:JNI_TRUE;
+-
++    if(!guidePath||!detailPath||!outputPath||gw<=0||gh<=0||dw<=0||dh<=0||ow<=0||oh<=0||dsx<1.f||dsy<1.f||psx<1.f||psy<1.f||maxDurationMs<=0)return JNI_FALSE;
++    iris26752planb::Deadline deadline;deadline.maxMs=(int64_t)maxDurationMs;U gp(e,guidePath),dp(e,detailPath),op(e,outputPath);if(!gp.c||!dp.c||!op.c)return JNI_FALSE;
++    int gf=open(gp.c,O_RDONLY),df=open(dp.c,O_RDONLY),of=open(op.c,O_RDWR|O_CREAT|O_TRUNC,0600);if(gf<0||df<0||of<0){if(gf>=0)close(gf);if(df>=0)close(df);if(of>=0)close(of);return JNI_FALSE;}
++    const uint64_t gbytes=(uint64_t)gw*gh*3*sizeof(uint16_t),dbytes=(uint64_t)dw*dh*sizeof(uint16_t),obytes=(uint64_t)ow*oh*3*sizeof(uint16_t);struct stat gs{},ds{};bool ok=fstat(gf,&gs)==0&&fstat(df,&ds)==0&&(uint64_t)gs.st_size==gbytes&&(uint64_t)ds.st_size==dbytes&&ftruncate(of,(off_t)obytes)==0;
++    std::vector<uint16_t>g0((size_t)gw*3),g1((size_t)gw*3),d0((size_t)dw),d1((size_t)dw),outRow((size_t)ow*3);int gy0c=-1,gy1c=-1,dy0c=-1,dy1c=-1;
++    auto load=[&](int fd,int yy,size_t rowElems,std::vector<uint16_t>&row,int&cached)->bool{if(cached==yy)return true;off_t off=(off_t)yy*(off_t)rowElems*(off_t)sizeof(uint16_t);if(!iris26752planb::readExact(fd,row.data(),rowElems*sizeof(uint16_t),off))return false;cached=yy;return true;};
++    for(int y=0;ok&&y<oh;y++){if(deadline.expired()){ok=false;break;}float sourceY=clampf((float)y/psy,0.f,(float)(gh-1));int gy0=(int)std::floor(sourceY),gy1=std::min(gy0+1,gh-1);float gfy=sourceY-gy0;if(!load(gf,gy0,(size_t)gw*3,g0,gy0c)){ok=false;break;}if(gy1==gy0){g1=g0;gy1c=gy1;}else if(!load(gf,gy1,(size_t)gw*3,g1,gy1c)){ok=false;break;}float ly=sourceY*dsy-originY;bool detailYValid=ly>=0.f&&ly<=(float)(dh-1);int dy0=0,dy1=0;float dfy=0.f;if(detailYValid){dy0=(int)std::floor(ly);dy1=std::min(dy0+1,dh-1);dfy=ly-dy0;if(!load(df,dy0,(size_t)dw,d0,dy0c)){ok=false;break;}if(dy1==dy0){d1=d0;dy1c=dy1;}else if(!load(df,dy1,(size_t)dw,d1,dy1c)){ok=false;break;}}
++        for(int x=0;x<ow;x++){float sourceX=clampf((float)x/psx,0.f,(float)(gw-1));int gx0=(int)std::floor(sourceX),gx1=std::min(gx0+1,gw-1);float gfx=sourceX-gx0;float rgb[3];for(int c=0;c<3;c++){float a=iris26564::halfToFloat(g0[(size_t)gx0*3+c])+(iris26564::halfToFloat(g0[(size_t)gx1*3+c])-iris26564::halfToFloat(g0[(size_t)gx0*3+c]))*gfx;float b=iris26564::halfToFloat(g1[(size_t)gx0*3+c])+(iris26564::halfToFloat(g1[(size_t)gx1*3+c])-iris26564::halfToFloat(g1[(size_t)gx0*3+c]))*gfx;rgb[c]=a+(b-a)*gfy;}float logd=0.f;if(detailYValid){float lx=sourceX*dsx-originX;if(lx>=0.f&&lx<=(float)(dw-1)){int dx0=(int)std::floor(lx),dx1=std::min(dx0+1,dw-1);float dfx=lx-dx0;float a=iris26564::halfToFloat(d0[(size_t)dx0])+(iris26564::halfToFloat(d0[(size_t)dx1])-iris26564::halfToFloat(d0[(size_t)dx0]))*dfx;float b=iris26564::halfToFloat(d1[(size_t)dx0])+(iris26564::halfToFloat(d1[(size_t)dx1])-iris26564::halfToFloat(d1[(size_t)dx0]))*dfx;logd=a+(b-a)*dfy;}}float factor=std::exp2(clampf(logd,-.56f,.56f));size_t q=(size_t)x*3;for(int c=0;c<3;c++)outRow[q+c]=iris26564::floatToHalf(std::max(rgb[c]*factor,0.f));}
++        if(ok){off_t off=(off_t)y*ow*3*(off_t)sizeof(uint16_t);ok=iris26752planb::writeExact(of,outRow.data(),outRow.size()*sizeof(uint16_t),off);}
++    }
++    if(gf>=0)close(gf);if(df>=0)close(df);if(of>=0)close(of);if(!ok||deadline.expired()){unlink(op.c);return JNI_FALSE;}return JNI_TRUE;
+     } catch(const std::bad_alloc&) { return JNI_FALSE; } catch(...) { return JNI_FALSE; }
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 8308a894a06f58187551b31a0205b66677c8a3bb..b168c8e5c65939579b7d44597b4ba6b82b671887 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -13164,7 +13164,7 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun streamTrue2xNativeVgnGuideRgb16f(texture: Int): File {
++    private fun streamTrue2xNativeVgnGuideRgb16f(texture: Int, deadlineNs: Long = Long.MAX_VALUE): File {
+         require(enableSabreSuperRes || enableHighZoomDetail)
+         require(texture != 0)
+         require(exportGpuLinearRgbSource && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
+@@ -13201,6 +13201,7 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.glPixelStorei(GLES30.GL_PACK_ROW_LENGTH, 0)
+                 var top = 0
+                 while (top < height) {
++                    check(System.nanoTime() < deadlineNs) { "26754 Plan-B deadline during VGN guide export" }
+                     val bandHeight = minOf(bandHeightMax, height - top)
+                     val rgbaBytes = Math.multiplyExact(
+                         Math.multiplyExact(width, bandHeight), 4 * Short.SIZE_BYTES,
+@@ -14251,10 +14252,13 @@ internal class GlesMgcRawSpatialStacker(
+         }
+         val reference = evidence.firstOrNull { it.frameIndex == 0 } ?: evidence.first()
+         require(reference.frameIndex == 0) { "26753 Plan-B reference NORMAL frame missing" }
+-        val referenceLens = frames[reference.frameIndex].lensState
+-        require(evidence.all { frames[it.frameIndex].lensState == referenceLens }) {
+-            "26753 Plan-B cross-lens evidence rejected referenceLens=$referenceLens"
++        val referencePhysicalCameraId = frames[reference.frameIndex].physicalCameraId
++        require(!referencePhysicalCameraId.isNullOrBlank()) { "26754 Plan-B reference physical camera ID missing" }
++        require(evidence.all { frames[it.frameIndex].physicalCameraId == referencePhysicalCameraId }) {
++            "26754 Plan-B cross-physical-camera evidence rejected referencePhysicalCameraId=$referencePhysicalCameraId"
+         }
++        /* Camera2 LENS_STATE is actuator telemetry only. Focus movement is explicitly allowed. */
++        val lensStateTransitions = evidence.map { frames[it.frameIndex].lensState }.filterNotNull().distinct().size
+         require(evidence.size >= 4) { "26753 Plan-B needs >=4 same-lens NORMAL frames, got=${evidence.size}" }
+         val gyroSupportFrames = evidence.count { ev ->
+             val frame = frames[ev.frameIndex]
+@@ -14283,6 +14287,8 @@ internal class GlesMgcRawSpatialStacker(
+         val outputHeight = Math.multiplyExact(height, publicationScale.toInt())
+         val scaleX = outputWidth.toFloat() / cropWidth.toFloat()
+         val scaleY = outputHeight.toFloat() / cropHeight.toFloat()
++        val startNs = System.nanoTime()
++        val stageDeadlineNs = startNs + PLAN_B_STAGE_MAX_MS_26753 * 1_000_000L
+         val memoryBudgetBytes = planBMemoryBudgetBytes26753()
+         val coreTile = planBCoreOutputTile26753(
+             translations.size, cropWidth, cropHeight, outputWidth, outputHeight, memoryBudgetBytes,
+@@ -14293,21 +14299,29 @@ internal class GlesMgcRawSpatialStacker(
+         require(plannedTiles <= PLAN_B_MAX_TILE_COUNT_26753) {
+             "26753 Plan-B tile count bound exceeded count=$plannedTiles core=$coreTile"
+         }
+-        val guideFile = streamTrue2xNativeVgnGuideRgb16f(nativeVgnGuideTexture)
+-        val reconstruction = File(directory, "iris26753_planb_reconstruction_${System.nanoTime()}.f32")
+-        val accumulation = File(directory, "iris26753_planb_sum_${System.nanoTime()}.f32")
+-        val accumulationWeight = File(directory, "iris26753_planb_weight_${System.nanoTime()}.f32")
+-        val detail = File(directory, "iris26753_planb_detail_${System.nanoTime()}.r16f")
+-        val render = if (publicationScale > 1.5f) File(directory, "iris26753_planb_render_${System.nanoTime()}.rgb16f") else null
++        val guideBegin = "physicalCameraId=$referencePhysicalCameraId lensStateTransitions=$lensStateTransitions " +
++            "crop=${cropWidth}x$cropHeight output=${outputWidth}x$outputHeight frames=${translations.size} stageBoundMs=$PLAN_B_STAGE_MAX_MS_26753"
++        PLog.i(SABRE_TAG, "IRIS_26754_PLAN_B_GUIDE_BEGIN $guideBegin")
++        MotionTrace.processingState("IRIS_26754_PLAN_B_GUIDE_BEGIN", guideBegin)
++        val guideFile = streamTrue2xNativeVgnGuideRgb16f(nativeVgnGuideTexture, stageDeadlineNs)
++        check(System.nanoTime() < stageDeadlineNs) { "26754 Plan-B deadline exhausted by VGN guide export" }
++        val guideDone = "bytes=${guideFile.length()} elapsedMs=${(System.nanoTime() - startNs) / 1_000_000L}"
++        PLog.i(SABRE_TAG, "IRIS_26754_PLAN_B_GUIDE_DONE $guideDone")
++        MotionTrace.processingState("IRIS_26754_PLAN_B_GUIDE_DONE", guideDone)
++        val reconstruction = File(directory, "iris26754_planb_reconstruction_${System.nanoTime()}.f32")
++        val accumulation = File(directory, "iris26754_planb_sum_${System.nanoTime()}.f32")
++        val accumulationWeight = File(directory, "iris26754_planb_weight_${System.nanoTime()}.f32")
++        val detail = File(directory, "iris26754_planb_detail_${System.nanoTime()}.r16f")
++        val render = if (publicationScale > 1.5f) File(directory, "iris26754_planb_render_${System.nanoTime()}.rgb16f") else null
+         RandomAccessFile(accumulation, "rw").use { it.setLength(outputWidth.toLong() * outputHeight * Float.SIZE_BYTES) }
+         RandomAccessFile(accumulationWeight, "rw").use { it.setLength(outputWidth.toLong() * outputHeight * Float.SIZE_BYTES) }
+-        val startNs = System.nanoTime()
+         val aggregateWeights = DoubleArray(translations.size)
+         var completedTiles = 0
+         var maxIrlsUpdates = 0
+         var outlierTiles = 0
+         var peakEstimatedBytes = 0L
+         var maxWorkers = 0L
++        var maxSpectralLambdaMicros = 0L
+         try {
+             var coreTop = 0
+             while (coreTop < outputHeight) {
+@@ -14389,6 +14403,7 @@ internal class GlesMgcRawSpatialStacker(
+                         if (solverStats.getOrElse(4) { 0L } > 0L) outlierTiles++
+                         peakEstimatedBytes = maxOf(peakEstimatedBytes, solverStats.getOrElse(5) { 0L })
+                         maxWorkers = maxOf(maxWorkers, solverStats.getOrElse(6) { 0L })
++                        maxSpectralLambdaMicros = maxOf(maxSpectralLambdaMicros, solverStats.getOrElse(9) { 0L })
+                         completedTiles++
+                     } finally {
+                         lumaFiles.forEach { runCatching { it.delete() } }
+@@ -14418,6 +14433,9 @@ internal class GlesMgcRawSpatialStacker(
+             ) { "26753 Plan-B overlap finalization failed" }
+             require(reconstruction.length() == outputWidth.toLong() * outputHeight * Float.SIZE_BYTES)
+             val detailStats = LongArray(8)
++            val detailBegin = "streaming=true output=${outputWidth}x$outputHeight elapsedMs=${(System.nanoTime() - startNs) / 1_000_000L}"
++            PLog.i(SABRE_TAG, "IRIS_26754_PLAN_B_DETAIL_BEGIN $detailBegin")
++            MotionTrace.processingState("IRIS_26754_PLAN_B_DETAIL_BEGIN", detailBegin)
+             check(
+                 IrisTrue2xSrNative.buildPlanBDetail(
+                     reconstruction.absolutePath, outputWidth, outputHeight,
+@@ -14428,7 +14446,11 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+             ) { "26753 Plan-B detail publication failed" }
+             require(detail.length() == outputWidth.toLong() * outputHeight * Short.SIZE_BYTES)
++            PLog.i(SABRE_TAG, "IRIS_26754_PLAN_B_DETAIL_DONE bytes=${detail.length()} elapsedMs=${(System.nanoTime() - startNs) / 1_000_000L}")
++            MotionTrace.processingState("IRIS_26754_PLAN_B_DETAIL_DONE", "bytes=${detail.length()} streaming=true")
+             if (render != null) {
++                PLog.i(SABRE_TAG, "IRIS_26754_PLAN_B_SR_RENDER_BEGIN streaming=true size=${width * 2}x${height * 2}")
++                MotionTrace.processingState("IRIS_26754_PLAN_B_SR_RENDER_BEGIN", "streaming=true size=${width * 2}x${height * 2}")
+                 check(
+                     IrisTrue2xSrNative.composePlanBRender(
+                         guideFile.absolutePath, width, height,
+@@ -14439,6 +14461,8 @@ internal class GlesMgcRawSpatialStacker(
+                     )
+                 ) { "26753 Plan-B 2x render composition failed" }
+                 require(render.length() == width.toLong() * 2L * height.toLong() * 2L * TRUE2X_RGB16F_BYTES_PER_PIXEL)
++                PLog.i(SABRE_TAG, "IRIS_26754_PLAN_B_SR_RENDER_DONE bytes=${render.length()} elapsedMs=${(System.nanoTime() - startNs) / 1_000_000L}")
++                MotionTrace.processingState("IRIS_26754_PLAN_B_SR_RENDER_DONE", "bytes=${render.length()} streaming=true")
+             }
+             val total = detailStats.getOrElse(0) { 0L }.coerceAtLeast(1L)
+             val activePct = 100f * detailStats.getOrElse(1) { 0L }.toFloat() / total.toFloat()
+@@ -14455,11 +14479,13 @@ internal class GlesMgcRawSpatialStacker(
+                 "origin=$originXF,$originYF tiles=$completedTiles coreTile=$coreTile overlap=$PLAN_B_OUTPUT_OVERLAP_26753 " +
+                 "irlsTriggeredTiles=$outlierTiles maxIrlsUpdates=$maxIrlsUpdates irlsHardMax=$PLAN_B_IRLS_MAX_UPDATES_26753 " +
+                 "memoryBudgetBytes=$memoryBudgetBytes peakEstimatedBytes=$peakEstimatedBytes maxFftWorkers=$maxWorkers " +
+-                "stageBoundMs=$PLAN_B_STAGE_MAX_MS_26753 tileBoundMs=$PLAN_B_TILE_MAX_MS_26753 " +
++                "stageBoundMs=$PLAN_B_STAGE_MAX_MS_26753 tileBoundMs=$PLAN_B_TILE_MAX_MS_26753 publicationStreaming=true " +
++                "ipolSpectralEnhancement=true maxLambda=${maxSpectralLambdaMicros / 1_000_000.0} lambdaPolicy=min(5,L/(ceil(zx)*ceil(zy))) " +
+                 "gyroSupportFrames=$gyroSupportFrames oisPixelGeometryAvailable=false opticalFlowGeometryOwner=true " +
+                 "tukeyR=0.025 pinvEps=1e-9 irlsEtaFloor=0.01 irlsStop=1e-5 " +
+                 "activePct=$activePct strongPct=$strongPct highlightOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN " +
+-                "lensState=$referenceLens weights=${finalWeights.joinToString(",") { "%.5g".format(it) }}"
++                "physicalCameraId=$referencePhysicalCameraId lensStateTransitions=$lensStateTransitions lensStateIdentityOwner=false " +
++                "weights=${finalWeights.joinToString(",") { "%.5g".format(it) }}"
+             PLog.i(SABRE_TAG, "IRIS_26753_IPOL_PLAN_B_PROOF $proof")
+             MotionTrace.processingState("IRIS_26753_IPOL_PLAN_B_PROOF", proof)
+             return PlanBReconstruction26753(
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt
+index 6fe76fd34bb4ed5876e09f13fefc5d2ead137695..76abdffa6af100e4d595eb5ed4434c31a14e14c4 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackFrameCompat.kt
+@@ -20,6 +20,8 @@ data class RawStackFrame(
+     val desiredExposureProduct: Double? = null,
+     val focusDistanceDiopters: Float = Float.NaN,
+     val lensState: Int? = null,
++    /* IRIS_26754_EXACT_PHYSICAL_CAMERA_ID */
++    val physicalCameraId: String? = null,
+     val rollingShutterSkewNs: Long? = null,
+     val channelNoiseProfile: FloatArray? = null,
+     val dynamicBlackLevelByCfaPosition: FloatArray? = null,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index a9d4f8a5bc6a00bce50f52d552cb5f57caf27dab..7f590fe59a78136a73be3b4f3d01d6709974c796 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -5064,7 +5064,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             return new IrisCameraRoute(requested, physical, null, physical, requested,
+                     "direct-physical");
+         }
+-        if (!requested.equals(physical) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++        if (!requested.equals(physical) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+             try {
+                 CameraCharacteristics logicalChars = mCameraManager.getCameraCharacteristics(logical);
+                 if (logicalChars.getPhysicalCameraIds().contains(physical)) {
+@@ -6020,7 +6020,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             for (Surface surfacei : surfaces) {
+                 var config = new OutputConfiguration(surfacei);
+                 if (irisSessionRoute.physicalOutputId != null
+-                        && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++                        && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                     config.setPhysicalCameraId(irisSessionRoute.physicalOutputId);
+                 }
+                 outputConfigurations.add(config);
+@@ -6137,7 +6137,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     super.onClosed(cameraCaptureSession);
+                 }
+             };
+-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                 SessionConfiguration configuration = new SessionConfiguration(
+                         SessionConfiguration.SESSION_REGULAR,
+                         outputConfigurations,
+@@ -8263,6 +8263,28 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         mMotion26480ShortActualIso=0;mMotion26480ShortActualEnergy=0.0;
+     }
+ 
++    /* IRIS_26754_EXACT_PHYSICAL_CAMERA_OWNER
++     * Camera2 LENS_STATE is only lens-actuator motion state. It is not a physical camera ID.
++     * Prefer the exact result-owned active physical camera when a logical multi-camera exposes it;
++     * otherwise the opened CameraDevice ID is the immutable owner for this capture session.
++     */
++    private String iris26754PhysicalCameraId(@NonNull TotalCaptureResult result) {
++        String physicalId = null;
++        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
++            try {
++                physicalId = result.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID);
++            } catch (Throwable ignored) {}
++        }
++        if (physicalId == null || physicalId.isEmpty()) {
++            CameraDevice device = mCameraDevice;
++            if (device != null) physicalId = device.getId();
++        }
++        if (physicalId == null || physicalId.isEmpty()) {
++            physicalId = IrisZoomController.getOwnerCameraId();
++        }
++        return (physicalId == null || physicalId.isEmpty()) ? null : physicalId;
++    }
++
+     private void populateMotion26480FrameMetadata(@NonNull ImageFrame frame,
+             TotalCaptureResult result,boolean shortRole){
+         frame.motionV2FrameRole=shortRole?ImageFrame.MotionV2FrameRole.HIGHLIGHT_SHORT:ImageFrame.MotionV2FrameRole.NORMAL;
+@@ -8285,6 +8307,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         if(ts!=null)frame.motionV2ResultSensorTimestampNs=ts;frame.motionV2FrameNumber=result.getFrameNumber();
+         if(skew!=null)frame.motionV2RollingShutterSkewNs=skew;if(focus!=null)frame.motionV2FocusDistanceDiopters=focus;
+         if(lens!=null)frame.motionV2LensState=lens;
++        frame.motionV2PhysicalCameraId = iris26754PhysicalCameraId(result);
+ 
+         /* IRIS_26490_TIMESTAMP_OWNED_FRAME_RADIOMETRY
+          * Use per-result dynamic levels when exposed by the HAL; otherwise fall back to the
+@@ -11562,7 +11585,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 mImageSaver = null;
+             }
+ //            final int[] burstcount = {0, 0, frameCount};
+-            /*if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
++            /*if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                 mImageReaderRaw.discardFreeBuffers();
+             }*/
+             Log.d(TAG, "CaptureStarted!");
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+index 1c8520517be0038f3abf8b38b29036976e786dd3..b35656c1727cdb2f0ff92f39207d5b93ca2dff4a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageFrame.java
+@@ -82,6 +82,11 @@ public class ImageFrame {
+     public long motionV2RollingShutterSkewNs = 0L;
+     public float motionV2FocusDistanceDiopters = Float.NaN;
+     public int motionV2LensState = -1;
++    /* IRIS_26754_EXACT_PHYSICAL_CAMERA_ID
++     * Immutable Camera2 physical-camera owner for this exact RAW result. LENS_STATE remains
++     * actuator telemetry only and must never be used as a camera/lens identity.
++     */
++    public String motionV2PhysicalCameraId = null;
+     public final float[] motionV2NoiseProfile = new float[8];
+     public boolean motionV2NoiseProfileValid = false;
+     public String motionV2NoiseProfileSource = "UNAVAILABLE";
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 720b7a1f7f40b9c5e1b6f74dccb34b32839f59e8..a1196d3684561bfd6d102cb2fdb532315c70c812 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -359,6 +359,7 @@ object PhotonMotionMgc1271Bridge {
+                     desiredExposureProduct = null,
+                     focusDistanceDiopters = frame.motionV2FocusDistanceDiopters,
+                     lensState = frame.motionV2LensState.takeIf { it >= 0 },
++                    physicalCameraId = frame.motionV2PhysicalCameraId,
+                     rollingShutterSkewNs = frame.motionV2RollingShutterSkewNs.takeIf { it > 0L },
+                     channelNoiseProfile = if (irisSettings.customNoiseModelEnabled) {
+                         null
+@@ -443,7 +444,7 @@ object PhotonMotionMgc1271Bridge {
+             val highZoomActivation = "enabled=$highZoomDetailEnabled displayedGlobalZoom=$displayedGlobalZoom " +
+                 "localOutputZoom=$localOutputZoom localThreshold=1.10 opticalAnchor=${parameters.motionV2OpticalZoomAnchor} " +
+                 "superResRequested=$sabreSuperResEnabled focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} " +
+-                "lensState=${referenceStackFrame.lensState} rgbOwner=NATIVE_SABRE_VGN " +
++                "lensState=${referenceStackFrame.lensState} physicalCameraId=${referenceStackFrame.physicalCameraId} rgbOwner=NATIVE_SABRE_VGN " +
+                 "lumaDetailOwner=${if (highZoomDetailEnabled || sabreSuperResEnabled) "IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS" else "NATIVE"} " +
+                 "deviceGate=false cleanNativeFallback=true fixedFrameCount=true directNativePlanB=true irlsHardMax=5 secondScaler=false"
+             PLog.i(TAG, "IRIS_26753_HIGH_ZOOM_ACTIVATION $highZoomActivation")
+diff --git a/app/version.properties b/app/version.properties
+index 800fb1534dfb1462490751d8002866982a1f21f7..ba8b1da494d40a0b56cb14da69b77e8ea74522e5 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726753
+-VERSION_BUILD=26753
++VERSION_NAME=0.9726754
++VERSION_BUILD=26754
