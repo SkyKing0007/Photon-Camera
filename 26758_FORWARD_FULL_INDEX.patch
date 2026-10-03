@@ -1,0 +1,488 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 82f388f50e67ae25112aebcc2e3de5fe0b40a3b4..6ee527a1349d0dfffcdba1f7d2fe12fa8dd49e89 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -5055,7 +5055,31 @@ internal object GlesMgcRawSabreShaders {
+             float agreement = abs(log2((lowY + 0.01) / (guideBlockY + 0.01)));
+             float agreementGate = 1.0 - irisSmooth01((agreement - 0.08) / 0.27);
+             float safetyGate = min(signalGate, min(highlightGate, min(chromaGate, agreementGate)));
+-            float confidence = clamp(phaseGate * temporalGate * safetyGate, 0.0, 1.0);
++
++            /* IRIS_26758_SR_ADAPTIVE_ALIGNMENT_REJECTION
++             * Keep true-2x measurement-driven while rejecting the historical failure signatures:
++             * alternating row/column/checker residual unsupported by the native VGN structure.
++             * The continuous gate is analogous to hybrid fusion uncertainty masking: unsafe SR
++             * detail returns to the exact Sabre/VGN guide rather than creating zipper/line aliasing.
++             */
++            float aliasDenom=max(lowY,0.015);
++            float rowAlternation=0.5*abs((y00+y10)-(y01+y11))/aliasDenom;
++            float colAlternation=0.5*abs((y00+y01)-(y10+y11))/aliasDenom;
++            float checkerAlternation=0.5*abs((y00+y11)-(y10+y01))/aliasDenom;
++            float gg00=max(irisLuma(irisGuide(globalBlock)),0.0);
++            float gg10=max(irisLuma(irisGuide(globalBlock+ivec2(1,0))),0.0);
++            float gg01=max(irisLuma(irisGuide(globalBlock+ivec2(0,1))),0.0);
++            float gg11=max(irisLuma(irisGuide(globalBlock+ivec2(1,1))),0.0);
++            float guideGradX=0.5*(abs(gg10-gg00)+abs(gg11-gg01))/max(guideBlockY,0.015);
++            float guideGradY=0.5*(abs(gg01-gg00)+abs(gg11-gg10))/max(guideBlockY,0.015);
++            float guideRange26758=(max(max(gg00,gg10),max(gg01,gg11))-min(min(gg00,gg10),min(gg01,gg11)))/max(guideBlockY,0.015);
++            float supportedEdge26758=irisSmooth01((guideRange26758-0.10)/0.45);
++            float unsupportedRow=rowAlternation*(1.0-irisSmooth01((guideGradY-0.035)/0.18));
++            float unsupportedCol=colAlternation*(1.0-irisSmooth01((guideGradX-0.035)/0.18));
++            float unsupportedChecker=checkerAlternation*(1.0-supportedEdge26758);
++            float aliasMetric=max(unsupportedChecker,max(unsupportedRow,unsupportedCol));
++            float aliasGate=1.0-irisSmooth01((aliasMetric-0.10)/0.22);
++            float confidence = clamp(phaseGate * temporalGate * safetyGate * aliasGate, 0.0, 1.0);
+ 
+             /* Zero-mean direct-CFA microstructure inside this exact 2x2 cell.  Scaling all four
+              * deviations by one block scalar preserves their zero DC while allowing materially
+@@ -5135,7 +5159,7 @@ internal object GlesMgcRawSabreShaders {
+             if (blockPhaseCount < 2) reasonClass = 6;
+             else if (temporalGate <= 0.02) reasonClass = 3;
+             else if (highlightGate <= 0.001) reasonClass = 4;
+-            else if (chromaGate <= 0.001 || agreementGate <= 0.001) reasonClass = 5;
++            else if (chromaGate <= 0.001 || agreementGate <= 0.001 || aliasGate <= 0.02) reasonClass = 5;
+             else if (signalGate <= 0.001) reasonClass = 7;
+             else if (confidence >= 0.50) reasonClass = 2;
+             else if (confidence > 0.02) reasonClass = 1;
+@@ -5576,7 +5600,12 @@ internal object GlesMgcRawSabreShaders {
+             return source.replaceRange(first, first + anchor.length, replacement)
+         }
+ 
+-        var source = true2xMerge26564
++        /* IRIS_26758_DIRECT_CFA_OBSERVATION_RELIABILITY
++         * Scalar zoom detail inherits the current-candidate high-zoom observation-confidence and
++         * row-flicker reliability terms before RGB outputs are stripped. This prevents a known
++         * banded/misaligned observation from becoming high-frequency luma detail.
++         */
++        var source = highZoomRgbMerge26720
+         source = replaceExactlyOnce(source, outputs, scalarOutputs, "outputs")
+         source = replaceExactlyOnce(source, rgbWrite, "", "rgb-write")
+         check(source.contains("layout(location = 0) out vec4 oTemporalLumaStats;"))
+@@ -5687,7 +5716,25 @@ internal object GlesMgcRawSabreShaders {
+             float directDetail=cell.y==0 ? (cell.x==0?d00:d10) : (cell.x==0?d01:d11);
+             float maxAbs=max(max(abs(d00),abs(d10)),max(abs(d01),abs(d11)));
+             float shapeScale=maxAbs>1.0e-6 ? min(1.0,detailBound/maxAbs) : 0.0;
+-            float confidence=clamp(phaseGate*temporalGate*signalGate*agreementGate,0.0,1.0);
++
++            /* IRIS_26758_ADAPTIVE_FUSION_REJECTION
++             * Paper-inspired hybrid rule applied to same-lens RAW evidence: uncertain alignment,
++             * unsupported alternating row/column/checker energy, and flattened highlights fade
++             * continuously to the native Sabre/VGN base instead of being forced into the output.
++             * This is a detail veto only; it never changes RGB/chroma/highlight ownership.
++             */
++            float guideGradX=0.5*(abs(g10-g00)+abs(g11-g01))/max(guideBlockY,0.015);
++            float guideGradY=0.5*(abs(g01-g00)+abs(g11-g10))/max(guideBlockY,0.015);
++            float rowAlternation=0.5*abs((d00+d10)-(d01+d11));
++            float colAlternation=0.5*abs((d00+d01)-(d10+d11));
++            float checkerAlternation=0.5*abs((d00+d11)-(d10+d01));
++            float unsupportedRow=rowAlternation*(1.0-irisSmooth01((guideGradY-0.035)/0.18));
++            float unsupportedCol=colAlternation*(1.0-irisSmooth01((guideGradX-0.035)/0.18));
++            float unsupportedChecker=checkerAlternation*(1.0-edgeConservatism);
++            float aliasMetric=max(unsupportedChecker,max(unsupportedRow,unsupportedCol));
++            float aliasGate=1.0-irisSmooth01((aliasMetric-0.10)/0.22);
++            float highlightGate=1.0-irisSmooth01((guideMax-0.72)/0.20);
++            float confidence=clamp(phaseGate*temporalGate*signalGate*agreementGate*aliasGate*highlightGate,0.0,1.0);
+             float boundedDetail=directDetail*shapeScale*confidence;
+             float factor=max(1.0+boundedDetail,0.68);
+             float logDetail=confidence>0.02 ? clamp(log2(factor),-0.56,0.56) : 0.0;
+@@ -5695,7 +5742,8 @@ internal object GlesMgcRawSabreShaders {
+             int reasonClass=0;
+             if(blockPhaseCount<2)reasonClass=6;
+             else if(temporalGate<=0.02)reasonClass=3;
+-            else if(agreementGate<=0.02)reasonClass=5;
++            else if(highlightGate<=0.001)reasonClass=4;
++            else if(agreementGate<=0.02 || aliasGate<=0.02)reasonClass=5;
+             else if(signalGate<=0.02)reasonClass=7;
+             else if(confidence>=0.50)reasonClass=2;
+             else if(confidence>0.02)reasonClass=1;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index bbd3dfb9090eb8d92c51f41078391f3f902a477b..ad070181d747b035a384cfbe68ce8ff40320e777 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -3206,42 +3206,49 @@ internal class GlesMgcRawSpatialStacker(
+                 MotionTrace.processingState("IRIS_26651_FUSION_OUTPUT_PRESERVED", details26648)
+             }
+             if (enableHighZoomDetail) {
++                /* IRIS_26758_UNIVERSAL_CROP_FIRST_DIRECT_CFA_DETAIL
++                 * Every physical lens keeps the exact current Sabre/VGN RGB/chroma/highlight owner.
++                 * Digital zoom reuses only the already-captured same-lens NORMAL evidence and the
++                 * existing Sabre flow/covariance/rejection products. A bounded phase-diverse subset
++                 * drives a crop-first scalar direct-CFA detail sidecar; no Plan-B CPU/FFT route,
++                 * no second RGB owner, no cross-lens frame mixing, and no extra capture wait exist.
++                 */
+                 val allReconstructionEvidence = highZoomEvidence26718.toList()
+-                require(allReconstructionEvidence.isNotEmpty()) { "26753 Plan-B high zoom has no NORMAL evidence" }
+-                val supportedScale26757 = minOf(highZoomSourceZoom, planBSupportedScale26757(allReconstructionEvidence.size))
+-                val reconstructionEvidence = selectPlanBEvidence26757(allReconstructionEvidence, supportedScale26757)
+-                val evidencePolicy = "retained=${allReconstructionEvidence.size} planBSelected=${reconstructionEvidence.size} " +
+-                    "allAdmittedNormalMergedBySabre=true phaseDiverseSubset=true supportedScale=$supportedScale26757 " +
+-                    "paperModel=pureTranslation normalOnly=true shortDetailEvidence=false longDetailEvidence=false " +
+-                    "rgbOwner=NATIVE_SABRE_VGN directCfaHighZoom=false deviceGate=false"
+-                PLog.i(SABRE_TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_EVIDENCE $evidencePolicy")
+-                MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_EVIDENCE", evidencePolicy)
++                require(allReconstructionEvidence.isNotEmpty()) { "26758 high zoom has no NORMAL evidence" }
++                val reconstructionEvidence = selectDirectCfaEvidence26758(allReconstructionEvidence)
++                require(reconstructionEvidence.size >= 2) { "26758 high zoom requires >=2 temporally distinct NORMAL observations" }
++                val evidencePolicy = "retained=${allReconstructionEvidence.size} detailSelected=${reconstructionEvidence.size} " +
++                    "allAdmittedNormalMergedBySabre=true maxDetailEvidence=$TRUE2X_JPEG_MAX_EVIDENCE phaseDiverseSubset=true " +
++                    "samePhysicalLens=true cropFirst=true maxSpatialScale=2.0 normalOnly=true " +
++                    "shortDetailEvidence=false longDetailEvidence=false rgbOwner=NATIVE_SABRE_VGN directChromaOwner=false " +
++                    "adaptiveReject=temporal+phase+rejection+rowFlicker+highlight+alias"
++                PLog.i(SABRE_TAG, "IRIS_26758_DIRECT_CFA_HIGH_ZOOM_EVIDENCE $evidencePolicy")
++                MotionTrace.processingState("IRIS_26758_DIRECT_CFA_HIGH_ZOOM_EVIDENCE", evidencePolicy)
+                 val attempt = runCatching {
+-                    stagePlanBRawEvidence26755(images, reconstructionEvidence).use { staged ->
+-                        reconstructPlanB26753(
+-                            frames = frames, images = staged.images, evidence = reconstructionEvidence,
+-                            nativeVgnGuideTexture = nativeHdrAuthority26601, publicationScale = 1f,
+-                        )
+-                    }
++                    reconstructHighZoomDetail26718(
++                        frames = frames,
++                        images = images,
++                        evidence = reconstructionEvidence,
++                        nativeVgnGuideTexture = nativeHdrAuthority26601,
++                    )
+                 }
+                 if (attempt.isSuccess) {
+-                    val planB = attempt.getOrThrow()
+-                    highZoomDetailResult = planB.detail
++                    val hz = attempt.getOrThrow()
++                    highZoomDetailResult = hz
+                     highZoomRgbResult = null
+-                    val hz = planB.detail
+                     val ready = "size=${hz.width}x${hz.height} origin=${hz.originXF},${hz.originYF} " +
+                         "scale=${hz.scaleX},${hz.scaleY} full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} " +
+                         "frames=${hz.frames} activePct=${hz.activePct} strongPct=${hz.strongPct} ms=${hz.reconstructionMs} " +
+-                        "lumaDetailOwner=IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS nativeSabreVgnChromaOwner=true directChromaOwner=false " +
+-                        "highlightOwnerUnchanged=true directCfaHighZoom=false"
+-                    PLog.i(SABRE_TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_READY $ready")
+-                    MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_READY", ready)
++                        "detailOwner=DIRECT_CFA_TEMPORAL_ADAPTIVE nativeSabreVgnRgbChromaHighlightOwner=true " +
++                        "flatHighlightVeto=true unsupportedAliasVeto=true secondScaler=false"
++                    PLog.i(SABRE_TAG, "IRIS_26758_DIRECT_CFA_HIGH_ZOOM_READY $ready")
++                    MotionTrace.processingState("IRIS_26758_DIRECT_CFA_HIGH_ZOOM_READY", ready)
+                 } else {
+                     val failure = checkNotNull(attempt.exceptionOrNull())
+-                    PLog.e(SABRE_TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_FAIL_CLOSED reason=${failure.message}", failure)
++                    PLog.e(SABRE_TAG, "IRIS_26758_DIRECT_CFA_HIGH_ZOOM_FAIL_CLOSED reason=${failure.message}", failure)
+                     MotionTrace.processingState(
+-                        "IRIS_26753_PLAN_B_HIGH_ZOOM_FAIL_CLOSED",
+-                        "reason=${failure.javaClass.simpleName}:${failure.message} fallback=NATIVE_SABRE_VGN_NO_DETAIL",
++                        "IRIS_26758_DIRECT_CFA_HIGH_ZOOM_FAIL_CLOSED",
++                        "reason=${failure.javaClass.simpleName}:${failure.message} fallback=NATIVE_SABRE_VGN_NO_DETAIL noExtraDelay=true",
+                     )
+                     highZoomDetailResult = null
+                     highZoomRgbResult = null
+@@ -3269,12 +3276,7 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+                 require(rawResult.width==superResWidth&&rawResult.height==superResHeight)
+                 val expectedTrueBytes=rawResult.width.toLong()*rawResult.height*TRUE2X_RGB16F_BYTES_PER_PIXEL
+-                if(rawResult.backend=="PLAN_B") {
+-                    require(rawResult.renderRgbPath?.let { File(it).length()==expectedTrueBytes }==true) { "26753 Plan-B true2x render carrier invalid" }
+-                    require((rawResult.linearRgbPath!=null)==exportNormalStackedDng) { "26753 Plan-B DNG ownership mismatch" }
+-                    rawResult.linearRgbPath?.let { require(File(it).length()==expectedTrueBytes) }
+-                    require(rawResult.nativeVgnGuidePath==null&&rawResult.phaseSupportPath==null) { "26753 Plan-B must not publish internal guide/phase intermediates" }
+-                } else if(rawResult.backend=="GPU") {
++                if(rawResult.backend=="GPU") {
+                     require(rawResult.renderRgbPath?.let { File(it).length()==expectedTrueBytes }==true) { "26568 fused true2x render carrier invalid" }
+                     require((rawResult.linearRgbPath!=null)==exportNormalStackedDng) { "26568 GPU direct-CFA DNG carrier ownership mismatch" }
+                     rawResult.linearRgbPath?.let { require(File(it).length()==expectedTrueBytes) }
+@@ -3295,7 +3297,7 @@ internal class GlesMgcRawSpatialStacker(
+                 val readyDetails = "normalFrames=$normalFrameCount shadowLongExcluded=$shadowLongFrameCount " +
+                     "size=${result.width}x${result.height} backend=${result.backend} phaseMean=${result.phaseSupportMean} phaseP10=${result.phaseSupportP10} " +
+                     "reconstruction=${result.reconstructionMs}ms dngBoundary=PRE_VGN sabreRgbChromaOwner=true " +
+-                    "highResLumaOwner=${if (result.backend == "PLAN_B") "IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS" else "DIRECT_CFA"} directChromaOwner=false trueDetail26573=temporal-cross-frame " +
++                    "highResLumaOwner=DIRECT_CFA_TEMPORAL_ADAPTIVE directChromaOwner=false trueDetail26573=temporal-cross-frame " +
+                     "directDng=${result.linearRgbPath!=null} fusedRender=${result.renderRgbPath!=null}"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_READY $readyDetails")
+                 MotionTrace.processingState("IRIS_26576_SR_RECONSTRUCTION_SUMMARY", readyDetails)
+@@ -13943,6 +13945,7 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun runHighZoomDetailGpu26718(
++        frames: List<RawStackFrame>,
+         images: List<SafeImage>,
+         evidence: List<True2xFrameEvidence>,
+         detailOutputFile: File,
+@@ -13961,6 +13964,16 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.highZoomDetailResolve26718, "iris_26718_high_zoom_detail_resolve",
+         )
+         require(nativeVgnGuideTexture != 0)
++        val normalGyro = frames.filter { it.role == RawBurstFrameRole.NORMAL && it.gyroSampleCount > 0 &&
++            it.gyroShakiness.isFinite() && it.gyroShakiness >= 0f }.map { it.gyroShakiness }.sorted()
++        val medianGyro = if (normalGyro.isEmpty()) Float.NaN else normalGyro[normalGyro.size / 2]
++        val referenceFrame = frames.first()
++        val qualities = FloatArray(frames.size) { index ->
++            highZoomObservationQuality26720(frames[index], referenceFrame, medianGyro)
++        }
++        PLog.i(SABRE_TAG, "IRIS_26758_DIRECT_CFA_SOURCE_QUALITY evidence=${evidence.size} " +
++            "qualityMin=${evidence.minOf { qualities[it.frameIndex] }} " +
++            "qualityMax=${evidence.maxOf { qualities[it.frameIndex] }} rowFlickerAware=true")
+         val maxTexture = IntArray(1)
+         GLES30.glGetIntegerv(GLES30.GL_MAX_TEXTURE_SIZE, maxTexture, 0)
+         checkGlError("IRIS26718 query GL_MAX_TEXTURE_SIZE")
+@@ -14029,6 +14042,17 @@ internal class GlesMgcRawSpatialStacker(
+                                         uniform4fv(program,"uGains",ev.calibration.gains); uniform4fv(program,"uBlackLevelsTimesGains",ev.calibration.blackTerms)
+                                         uniform4f(program,"uCovRangeRg",COV_MIN_R,COV_MAX_R-COV_MIN_R,COV_MIN_G,COV_MAX_G-COV_MIN_G); uniform2f(program,"uCovRangeB",COV_MIN_B,COV_MAX_B-COV_MIN_B)
+                                         uniform1f(program,"uRawClipThreshold",sensorWhiteLevel*0.985f)
++                                        uniform1f(program,"uObservationConfidence",qualities[ev.frameIndex])
++                                        val frame26758=frames[ev.frameIndex]
++                                        val rowFlickerActive26758=hasRowFlickerEvidence26720(frame26758)
++                                        uniform1i(program,"uRowFlickerEnabled",if(rowFlickerActive26758)1 else 0)
++                                        if(rowFlickerActive26758) {
++                                            uniform1i(program,"uRowFlickerHarmonic",frame26758.rowFlickerHarmonic)
++                                            uniform2f(program,"uRowFlickerAB",frame26758.rowFlickerA,frame26758.rowFlickerB)
++                                            uniform1f(program,"uRowFlickerStrength",frame26758.rowFlickerStrength.coerceIn(0f,1f))
++                                        } else {
++                                            uniform1i(program,"uRowFlickerHarmonic",0); uniform2f(program,"uRowFlickerAB",0f,0f); uniform1f(program,"uRowFlickerStrength",0f)
++                                        }
+                                         GLES30.glEnable(GLES30.GL_BLEND); GLES30.glBlendEquation(GLES30.GL_FUNC_ADD); GLES30.glBlendFunc(GLES30.GL_ONE,GLES30.GL_ONE)
+                                         draw(program,tileWidth,tileHeight,intArrayOf(temporal,phase),preserveBlend=true)
+                                         GLES30.glDisable(GLES30.GL_BLEND)
+@@ -14182,6 +14206,37 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /* IRIS_26758_PHASE_DIVERSE_DIRECT_CFA_EVIDENCE
++     * The base Sabre merge still consumes every admitted NORMAL. The auxiliary high-resolution
++     * detail sidecar uses at most the strongest two observations per global quarter-pixel phase,
++     * including the immutable reference. This bounds zoom cost without changing capture count or
++     * RGB/chroma/noise ownership. Selection uses only evidence already produced by Sabre.
++     */
++    private fun selectDirectCfaEvidence26758(all: List<True2xFrameEvidence>): List<True2xFrameEvidence> {
++        require(all.isNotEmpty())
++        val reference = all.firstOrNull { it.frameIndex == 0 } ?: all.first()
++        val selected = ArrayList<True2xFrameEvidence>(TRUE2X_JPEG_MAX_EVIDENCE)
++        for (phase in 0 until 4) {
++            val phaseEvidence = all.filter { it.dominantPhaseBin == phase }
++                .sortedWith(compareByDescending<True2xFrameEvidence> { if (it.frameIndex == reference.frameIndex) Float.POSITIVE_INFINITY else it.qualityScore }
++                    .thenBy { it.frameIndex })
++            phaseEvidence.take(TRUE2X_JPEG_EVIDENCE_PER_PHASE).forEach { ev ->
++                if (selected.none { it.frameIndex == ev.frameIndex }) selected += ev
++            }
++        }
++        if (selected.none { it.frameIndex == reference.frameIndex }) {
++            if (selected.size >= TRUE2X_JPEG_MAX_EVIDENCE) selected.removeAt(selected.lastIndex)
++            selected.add(0, reference)
++        }
++        if (selected.size < minOf(4, all.size)) {
++            all.asSequence().filter { ev -> selected.none { it.frameIndex == ev.frameIndex } }
++                .sortedByDescending { it.qualityScore }
++                .take(minOf(4, all.size) - selected.size)
++                .forEach { selected += it }
++        }
++        return selected.take(TRUE2X_JPEG_MAX_EVIDENCE)
++    }
++
+     /* IRIS_26757_EVIDENCE_LIMITED_PLAN_B
+      * Sabre still merges every admitted NORMAL. Plan B is only a scalar detail sidecar, so its
+      * Fourier system uses the smallest phase-diverse evidence basis with redundancy: up to six
+@@ -14689,6 +14744,7 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun reconstructHighZoomDetail26718(
++        frames: List<RawStackFrame>,
+         images: List<SafeImage>,
+         evidence: List<True2xFrameEvidence>,
+         nativeVgnGuideTexture: Int,
+@@ -14709,7 +14765,7 @@ internal class GlesMgcRawSpatialStacker(
+         val output=File(directory,"iris26718_high_zoom_detail_${System.nanoTime()}.r16f")
+         val start=System.nanoTime()
+         return try {
+-            val stats=runHighZoomDetailGpu26718(images,evidence,output,nativeVgnGuideTexture,detailWidth,detailHeight,originX,originY,fullWidth,fullHeight)
++            val stats=runHighZoomDetailGpu26718(frames,images,evidence,output,nativeVgnGuideTexture,detailWidth,detailHeight,originX,originY,fullWidth,fullHeight)
+             val refined=evidence.filter { it.frameIndex!=0 }
+             val refinePct=if(refined.isEmpty())0f else refined.map{it.refineAcceptedPct}.average().toFloat()
+             HighZoomDetailResult(
+@@ -14745,17 +14801,14 @@ internal class GlesMgcRawSpatialStacker(
+         preserveLinearRgbForDng: Boolean,
+     ): True2xResult {
+         require(enableSabreSuperRes)
+-        /* IRIS_26757_SR_GPU_COST_ROUTER
+-         * A full-frame 2x Plan-B solve is ~50 MP on this sensor and cannot satisfy the user's
+-         * no-extra-latency requirement on the CPU. The already-active 26733 direct-CFA GPU owner
+-         * is purpose-built for true 2x and already remains the DNG authority. Reuse it for SR JPEG
+-         * publication as well; native Sabre/VGN still owns RGB/chroma/highlights. CPU remains only
+-         * the established bounded fallback when the GPU route itself is unavailable.
++        /* IRIS_26758_SR_DIRECT_CFA_ONLY_ROUTER
++         * Super Res is the existing full-frame true-2x GPU direct-CFA reconstruction. Plan B is
++         * not an active backend or fallback. Sabre/VGN remains RGB/chroma/highlight authority.
+          */
+-        val route = "backend=DIRECT_CFA_GPU_FIRST reason=FULL_FRAME_PLAN_B_COST " +
+-            "normalEvidence=${evidence.size} planBHighZoomOnly=true rgbChromaOwner=NATIVE_SABRE_VGN"
+-        PLog.i(SABRE_TAG, "IRIS_26757_SR_COST_ROUTER $route")
+-        MotionTrace.processingState("IRIS_26757_SR_COST_ROUTER", route)
++        val route = "backend=DIRECT_CFA_GPU_ONLY normalEvidence=${evidence.size} " +
++            "adaptiveReject=true rgbChromaHighlightOwner=NATIVE_SABRE_VGN"
++        PLog.i(SABRE_TAG, "IRIS_26758_SR_COST_ROUTER $route")
++        MotionTrace.processingState("IRIS_26758_SR_COST_ROUTER", route)
+         return reconstructDirectTrue2x26733(
+             frames, images, evidence, nativeVgnGuideTexture, preserveLinearRgbForDng,
+         )
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index f9c4e38342fb312af4e3d295a68bfdb855da4757..093a20c684302213c98432123f64a4a0a0b900ce 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -399,10 +399,11 @@ object PhotonMotionMgc1271Bridge {
+             val sabreSuperResEnabled = parameters.motionV2SuperResOutputEnabled
+             val sabreSuperResOutputScale = if (sabreSuperResEnabled) 2f else 1f
+             parameters.motionV2SuperResOutputScale = sabreSuperResOutputScale
+-            /* IRIS_26753_LENS_RELATIVE_PLAN_B_MOBILE_DIRECT_NATIVE
+-             * Device-independent, physical-lens-relative activation. Every optical owner uses the
+-             * same Plan-B luma solver from local 1.10x upward; Super Res uses the same solver via
+-             * its dedicated 2x publication route. Sabre/VGN remains RGB/chroma/highlight owner.
++            /* IRIS_26758_UNIVERSAL_LENS_RELATIVE_DIRECT_CFA_SR
++             * Device-independent and physical-lens-relative: every optical lens may contribute
++             * same-lens multiframe SR detail from local 1.10x upward. Super Res uses the full true-2x
++             * GPU route. Ordinary zoom uses only the centered crop-first scalar sidecar. Sabre/VGN
++             * remains the sole RGB/chroma/highlight owner and no cross-lens frame mixing is allowed.
+              */
+             val highZoomDetailEnabled = parameters.motionV2Active && !parameters.irisNightActive &&
+                 !sabreSuperResEnabled && localOutputZoom >= 1.10f
+@@ -445,10 +446,11 @@ object PhotonMotionMgc1271Bridge {
+                 "localOutputZoom=$localOutputZoom localThreshold=1.10 opticalAnchor=${parameters.motionV2OpticalZoomAnchor} " +
+                 "superResRequested=$sabreSuperResEnabled focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} " +
+                 "lensState=${referenceStackFrame.lensState} physicalCameraId=${referenceStackFrame.physicalCameraId} rgbOwner=NATIVE_SABRE_VGN " +
+-                "lumaDetailOwner=${if (highZoomDetailEnabled || sabreSuperResEnabled) "IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS" else "NATIVE"} " +
+-                "deviceGate=false cleanNativeFallback=true fixedFrameCount=true directNativePlanB=true irlsHardMax=5 secondScaler=false"
+-            PLog.i(TAG, "IRIS_26753_HIGH_ZOOM_ACTIVATION $highZoomActivation")
+-            MotionTrace.processingState("IRIS_26753_HIGH_ZOOM_ACTIVATION", highZoomActivation)
++                "lumaDetailOwner=${if (highZoomDetailEnabled || sabreSuperResEnabled) "DIRECT_CFA_TEMPORAL_ADAPTIVE" else "NATIVE"} " +
++                "deviceGate=false cleanNativeFallback=true allNormalsSabre=true detailEvidenceBounded=true directNativePlanB=false " +
++                "adaptiveReject=true flatHighlightVeto=true secondScaler=false"
++            PLog.i(TAG, "IRIS_26758_UNIVERSAL_SR_ACTIVATION $highZoomActivation")
++            MotionTrace.processingState("IRIS_26758_UNIVERSAL_SR_ACTIVATION", highZoomActivation)
+             PLog.i(TAG, "IRIS_26564_TRUE_2X_SR_DNG_AUTHORITY " +
+                 "displayedGlobalZoom=$displayedGlobalZoom localOutputZoom=$localOutputZoom " +
+                 "reconstructionZoom=$reconstructionZoom renderResidualZoom=$renderResidualZoom " +
+@@ -501,28 +503,28 @@ object PhotonMotionMgc1271Bridge {
+             highZoomDetailPathForCleanup = stacked.highZoomDetailPath
+             highZoomRgbPathForCleanup = stacked.highZoomRgbPath
+             if (highZoomDetailEnabled) {
+-                requireParity(stacked.highZoomRgbPath == null, "26753 Plan-B must never publish high-zoom RGB/chroma")
++                requireParity(stacked.highZoomRgbPath == null, "26758 direct-CFA detail must never publish high-zoom RGB/chroma")
+                 if (stacked.highZoomDetailPath != null) {
+                     requireParity(stacked.highZoomDetailWidth > 0 && stacked.highZoomDetailHeight > 0 &&
+                         stacked.highZoomDetailScaleX >= 1f && stacked.highZoomDetailScaleY >= 1f,
+-                        "26753 invalid Plan-B detail geometry")
+-                    val expectedPlanBFrames26753 = frames.count { it.role == RawBurstFrameRole.NORMAL }
+-                    /* IRIS_26757_EVIDENCE_LIMITED_DETAIL_HANDOFF
+-                     * Sabre still merged every NORMAL; Plan B may publish a smaller, phase-diverse
+-                     * scalar-detail lattice which MotionV2Render samples directly during the one final
+-                     * zoom render. No second full-image scaler or RGB/chroma owner is introduced.
++                        "26758 invalid direct-CFA detail geometry")
++                    val expectedNormalFrames26758 = frames.count { it.role == RawBurstFrameRole.NORMAL }
++                    /* IRIS_26758_DIRECT_CFA_DETAIL_HANDOFF
++                     * The sidecar is a centered subset of the same lens's true-2x lattice and may
++                     * therefore be up to 2x native dimensions at short digital zoom. Sabre still
++                     * consumed every NORMAL; only auxiliary detail evidence is bounded to <=8.
+                      */
+                     requireParity(
+-                        stacked.highZoomDetailWidth in 1..size.x && stacked.highZoomDetailHeight in 1..size.y,
+-                        "26757 Plan-B detail lattice outside native bounds expected<=${size.x}x${size.y} " +
++                        stacked.highZoomDetailWidth in 1..(size.x * 2) && stacked.highZoomDetailHeight in 1..(size.y * 2),
++                        "26758 direct-CFA detail lattice outside true2x bounds expected<=${size.x * 2}x${size.y * 2} " +
+                             "actual=${stacked.highZoomDetailWidth}x${stacked.highZoomDetailHeight}",
+                     )
+                     requireParity(
+-                        stacked.highZoomDetailFrames in 4..expectedPlanBFrames26753,
+-                        "26757 Plan-B evidence count invalid baseNormals=$expectedPlanBFrames26753 actual=${stacked.highZoomDetailFrames}",
++                        stacked.highZoomDetailFrames in 2..minOf(8, expectedNormalFrames26758),
++                        "26758 detail evidence count invalid baseNormals=$expectedNormalFrames26758 actual=${stacked.highZoomDetailFrames}",
+                     )
+                     requireParity(kotlin.math.abs(stacked.highZoomDetailSourceZoom - localOutputZoom) < 1.0e-5f,
+-                        "26753 Plan-B source zoom mismatch")
++                        "26758 direct-CFA source zoom mismatch")
+                     parameters.motionV2HighZoomDetailPath = stacked.highZoomDetailPath
+                     parameters.motionV2HighZoomDetailWidth = stacked.highZoomDetailWidth
+                     parameters.motionV2HighZoomDetailHeight = stacked.highZoomDetailHeight
+@@ -545,19 +547,19 @@ object PhotonMotionMgc1271Bridge {
+                         "scale=${stacked.highZoomDetailScaleX},${stacked.highZoomDetailScaleY} " +
+                         "sourceZoom=${stacked.highZoomDetailSourceZoom} frames=${stacked.highZoomDetailFrames} " +
+                         "activePct=${stacked.highZoomDetailActivePct} strongPct=${stacked.highZoomDetailStrongPct} " +
+-                        "ms=${stacked.highZoomDetailReconstructionMs} evidenceLimitedLattice=true baseNormals=$expectedPlanBFrames26753 secondScaler=false " +
+-                        "rgbOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN"
+-                    PLog.i(TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_HANDOFF $handoff")
+-                    MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_HANDOFF", handoff)
++                        "ms=${stacked.highZoomDetailReconstructionMs} cropFirstTrue2xLattice=true baseNormals=$expectedNormalFrames26758 secondScaler=false " +
++                        "rgbOwner=NATIVE_SABRE_VGN chromaOwner=NATIVE_SABRE_VGN highlightOwner=NATIVE_SABRE_VGN adaptiveReject=true"
++                    PLog.i(TAG, "IRIS_26758_DIRECT_CFA_HIGH_ZOOM_HANDOFF $handoff")
++                    MotionTrace.processingState("IRIS_26758_DIRECT_CFA_HIGH_ZOOM_HANDOFF", handoff)
+                 } else {
+-                    PLog.i(TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK sourceZoom=$localOutputZoom")
+-                    MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_NATIVE_FALLBACK",
+-                        "sourceZoom=$localOutputZoom rgbOwner=NATIVE_SABRE_VGN detail=false")
++                    PLog.i(TAG, "IRIS_26758_DIRECT_CFA_HIGH_ZOOM_NATIVE_FALLBACK sourceZoom=$localOutputZoom")
++                    MotionTrace.processingState("IRIS_26758_DIRECT_CFA_HIGH_ZOOM_NATIVE_FALLBACK",
++                        "sourceZoom=$localOutputZoom rgbOwner=NATIVE_SABRE_VGN detail=false noExtraDelay=true")
+                 }
+             } else {
+                 requireParity(stacked.highZoomRgbPath == null && stacked.highZoomDetailPath == null &&
+                     stacked.highZoomRgbWidth == 0 && stacked.highZoomDetailWidth == 0,
+-                    "26753 Plan-B sidecar survived disabled route")
++                    "26758 direct-CFA sidecar survived disabled route")
+             }
+             if (parameters.irisNightActive) {
+                 /* IRIS_26547_NIGHT_NO_SILENT_LONG_DROP
+@@ -588,13 +590,6 @@ object PhotonMotionMgc1271Bridge {
+                     "26568 true2x geometry ${stacked.true2xWidth}x${stacked.true2xHeight} expected=${expectedSuperResWidth}x$expectedSuperResHeight")
+                 val expectedBytes=expectedSuperResWidth.toLong()*expectedSuperResHeight*3L*Short.SIZE_BYTES
+                 when(stacked.true2xBackend) {
+-                    "PLAN_B" -> {
+-                        val render=stacked.true2xRenderRgbPath?.let(::File)
+-                        requireParity(render?.isFile==true&&render.length()==expectedBytes,"26752 Plan-B SR render carrier invalid")
+-                        requireParity((stacked.true2xLinearRgbPath!=null)==produceNormalStackedDng,"26752 Plan-B DNG carrier ownership mismatch")
+-                        stacked.true2xLinearRgbPath?.let { path -> val f=File(path);requireParity(f.isFile&&f.length()==expectedBytes,"26752 Plan-B DNG carrier invalid") }
+-                        requireParity(stacked.true2xNativeVgnGuidePath==null&&stacked.true2xPhaseSupportPath==null,"26752 Plan-B intermediates escaped stacker")
+-                    }
+                     "GPU" -> {
+                         val render=stacked.true2xRenderRgbPath?.let(::File)
+                         requireParity(render?.isFile==true&&render.length()==expectedBytes,"26568 fused GPU render carrier invalid")
+@@ -692,15 +687,15 @@ object PhotonMotionMgc1271Bridge {
+                 "Sabre reconstruction owner was not durably published")
+             requireParity(stacked.baselineExposureEv == null,
+                 "Sabre unexpectedly inherited Spatial/Bento BaselineExposure")
+-            /* IRIS_26752_PLAN_B_ZOOM_GEOMETRY
+-             * Plan B never owns FOV/crop. Native Sabre stays at reconstructionZoom=1 and the
+-             * existing render residual remains the exact physical-lens-relative zoom request.
++            /* IRIS_26758_DIRECT_CFA_ZOOM_GEOMETRY
++             * Direct-CFA detail never owns FOV/crop. Native Sabre stays at reconstructionZoom=1
++             * and the existing render residual remains the exact physical-lens-relative request.
+              */
+             requireParity(kotlin.math.abs(parameters.motionV2ReconstructionZoom - 1f) < 1.0e-5f &&
+                     kotlin.math.abs(parameters.motionV2RenderResidualZoom - localOutputZoom) < 1.0e-5f &&
+                     parameters.motionV2SuperResOutputScale == sabreSuperResOutputScale &&
+                     !parameters.motionV2HighZoomRgbPrepared && !parameters.motionV2HighZoomRgbApplied,
+-                "26752 Plan-B/Sabre zoom geometry contract drifted")
++                "26758 direct-CFA/Sabre zoom geometry contract drifted")
+             requireParity(lsc == null || stacked.lensShadingCorrectionApplied,
+                 "LSC supplied but MGC output did not apply it")
+ 
+@@ -835,12 +830,12 @@ object PhotonMotionMgc1271Bridge {
+              * cross-frame-temporal, zero-chroma-transfer 2x2 luminance structure contract in the bounded file builder.
+              */
+             if(parameters.motionV2SuperResOutputEnabled) {
+-                if(stacked.true2xBackend=="PLAN_B" || stacked.true2xBackend=="GPU") {
++                if(stacked.true2xBackend=="GPU") {
+                     val fused=checkNotNull(stacked.true2xRenderRgbPath)
+                     resultTrue2xRenderRgbPath=fused; true2xRenderRgbPathForCleanup=fused; iris26564True2xRenderPrepMs=0L
+                     if(produceNormalStackedDng)resultTrue2xLinearRawPath=checkNotNull(stacked.true2xLinearRgbPath)
+-                    val lumaOwner=if(stacked.true2xBackend=="PLAN_B") "IPOL_PLAN_B_DIRECT_WLS_OPTIONAL_IRLS" else "DIRECT_CFA_TEMPORAL"
+-                    PLog.i(TAG,"IRIS_26752_TRUE_DETAIL_RENDER_FUSED backend=${stacked.true2xBackend} size=${stacked.true2xWidth}x${stacked.true2xHeight} dngRawPreserved=${resultTrue2xLinearRawPath!=null} sabreRgbChromaOwner=true highResLumaOwner=$lumaOwner directChromaOwner=false prepMs=0")
++                    val lumaOwner="DIRECT_CFA_TEMPORAL_ADAPTIVE"
++                    PLog.i(TAG,"IRIS_26758_TRUE_DETAIL_RENDER_FUSED backend=${stacked.true2xBackend} size=${stacked.true2xWidth}x${stacked.true2xHeight} dngRawPreserved=${resultTrue2xLinearRawPath!=null} sabreRgbChromaOwner=true highResLumaOwner=$lumaOwner directChromaOwner=false prepMs=0")
+                     PLog.i("MotionTrace", "PIPELINE_STATE stage=IRIS_26752_SR_PROOF_HANDOFF details=backend=${stacked.true2xBackend} statsValidatedByStacker=true fusedCarrier=true")
+                 } else {
+                     val rawPath=checkNotNull(stacked.true2xLinearRgbPath); val guidePath=checkNotNull(stacked.true2xNativeVgnGuidePath); val phaseSupportPath=checkNotNull(stacked.true2xPhaseSupportPath)
+diff --git a/app/version.properties b/app/version.properties
+index fd1b7fb9e5c396c715b5359521a6938256dc060d..6065d75a15d4fd9a8cbce0851a98138342d0d302 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726757
+-VERSION_BUILD=26757
++VERSION_NAME=0.9726758
++VERSION_BUILD=26758
