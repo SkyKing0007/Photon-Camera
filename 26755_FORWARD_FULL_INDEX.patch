@@ -1,0 +1,264 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt b/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt
+index 4d6f16a2906a0d1a3519202fb8cf61841f4221e5..540c6167ad91a2628706d588e56f60f68e633dab 100644
+--- a/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt
++++ b/app/src/main/java/com/hinnka/mycamera/model/SafeImage.kt
+@@ -4,6 +4,7 @@ import com.hinnka.mycamera.utils.LargeDirectBuffer
+ import com.hinnka.mycamera.utils.PLog
+ import java.io.File
+ import java.io.FileInputStream
++import java.io.FileOutputStream
+ import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+ import java.util.concurrent.atomic.AtomicBoolean
+@@ -78,6 +79,73 @@ class SafeImage private constructor(
+         }
+     }
+ 
++    /** IRIS_26755_PLAN_B_RAW_LIFETIME_OWNER
++     * Create an independent immutable disk-backed copy of this exact RAW plane without changing
++     * row/pixel stride. The caller decides when to close the original owner, so a complete staged
++     * population can be proven before any in-memory RAW is released.
++     */
++    fun copyRawBackingTo(destination: File, deadlineNs: Long): SafeImage {
++        check(!closed.get()) { "SafeImage is closed" }
++        require(deadlineNs > System.nanoTime()) { "RAW staging deadline already expired" }
++        val byteCountLong = rowStrideBytes.toLong() * height.toLong()
++        require(byteCountLong in 1..Int.MAX_VALUE.toLong())
++        val byteCount = byteCountLong.toInt()
++        destination.parentFile?.let { require(it.exists() || it.mkdirs()) }
++        if (destination.exists()) require(destination.delete())
++        val chunk = 1L shl 20
++        try {
++            FileOutputStream(destination).channel.use { out ->
++                if (backingFile != null) {
++                    FileInputStream(backingFile).channel.use { input ->
++                        require(backingByteCount >= byteCount) {
++                            "Disk-backed RAW bytes=$backingByteCount required=$byteCount"
++                        }
++                        var position = 0L
++                        while (position < byteCountLong) {
++                            check(System.nanoTime() < deadlineNs) { "RAW staging deadline exceeded" }
++                            val amount = minOf(chunk, byteCountLong - position)
++                            out.position(position)
++                            val moved = input.transferTo(position, amount, out)
++                            if (moved <= 0L) throw IllegalStateException("RAW staging made no progress")
++                            position += moved
++                        }
++                    }
++                } else {
++                    val plane = memoryPlane.singleOrNull()
++                        ?: throw IllegalStateException("In-memory RAW plane is unavailable")
++                    val source = plane.buffer.duplicate().order(ByteOrder.nativeOrder())
++                    require(source.capacity() >= byteCount) {
++                        "In-memory RAW capacity=${source.capacity()} required=$byteCount"
++                    }
++                    source.position(0)
++                    source.limit(byteCount)
++                    while (source.hasRemaining()) {
++                        check(System.nanoTime() < deadlineNs) { "RAW staging deadline exceeded" }
++                        val oldLimit = source.limit()
++                        source.limit(minOf(oldLimit, source.position() + chunk.toInt()))
++                        while (source.hasRemaining()) {
++                            val written = out.write(source)
++                            if (written <= 0) throw IllegalStateException("RAW staging made no progress")
++                        }
++                        source.limit(oldLimit)
++                    }
++                }
++            }
++            require(destination.length() == byteCountLong) {
++                "Staged RAW bytes=${destination.length()} expected=$byteCountLong"
++            }
++            return SafeImage(
++                width = width, height = height, format = format, timestamp = timestamp,
++                backingFile = destination, backingByteCount = byteCount,
++                rowStride = rowStrideBytes, pixelStride = pixelStrideBytes,
++                closeAction = { runCatching { destination.delete() } },
++            )
++        } catch (t: Throwable) {
++            runCatching { destination.delete() }
++            throw t
++        }
++    }
++
+     /** Read a packed RAW16 rectangle without retaining the entire disk-backed frame in RAM. */
+     fun readFileRegion(left: Int, top: Int, regionWidth: Int, regionHeight: Int): FileRegion {
+         check(!closed.get()) { "SafeImage is closed" }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index b168c8e5c65939579b7d44597b4ba6b82b671887..47f65c1dce27c8884ea1fa42c115426380d2ec18 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -3214,10 +3214,12 @@ internal class GlesMgcRawSpatialStacker(
+                 PLog.i(SABRE_TAG, "IRIS_26753_PLAN_B_HIGH_ZOOM_EVIDENCE $evidencePolicy")
+                 MotionTrace.processingState("IRIS_26753_PLAN_B_HIGH_ZOOM_EVIDENCE", evidencePolicy)
+                 val attempt = runCatching {
+-                    reconstructPlanB26753(
+-                        frames = frames, images = images, evidence = reconstructionEvidence,
+-                        nativeVgnGuideTexture = nativeHdrAuthority26601, publicationScale = 1f,
+-                    )
++                    stagePlanBRawEvidence26755(images, reconstructionEvidence).use { staged ->
++                        reconstructPlanB26753(
++                            frames = frames, images = staged.images, evidence = reconstructionEvidence,
++                            nativeVgnGuideTexture = nativeHdrAuthority26601, publicationScale = 1f,
++                        )
++                    }
+                 }
+                 if (attempt.isSuccess) {
+                     val planB = attempt.getOrThrow()
+@@ -3255,9 +3257,11 @@ internal class GlesMgcRawSpatialStacker(
+                     "shortGuideOwner=SINGLE_COMMON_RBF_RESOLVE_VGN srDetailOwner=NORMAL_ONLY"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_EVIDENCE_POLICY $evidencePolicy")
+                 MotionTrace.processingState("IRIS_26576_SR_EVIDENCE", evidencePolicy)
+-                val rawResult=reconstructTrue2x(
+-                    frames, images, reconstructionEvidence, nativeHdrAuthority26601, exportNormalStackedDng,
+-                )
++                val rawResult=stagePlanBRawEvidence26755(images, reconstructionEvidence).use { staged ->
++                    reconstructTrue2x(
++                        frames, staged.images, reconstructionEvidence, nativeHdrAuthority26601, exportNormalStackedDng,
++                    )
++                }
+                 require(rawResult.width==superResWidth&&rawResult.height==superResHeight)
+                 val expectedTrueBytes=rawResult.width.toLong()*rawResult.height*TRUE2X_RGB16F_BYTES_PER_PIXEL
+                 if(rawResult.backend=="PLAN_B") {
+@@ -14174,8 +14178,87 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun planBMemoryBudgetBytes26753(): Long {
+-        val maxHeap = Runtime.getRuntime().maxMemory().coerceAtLeast(1L)
+-        return (maxHeap / 8L).coerceIn(PLAN_B_MIN_MEMORY_BYTES_26753, PLAN_B_MAX_MEMORY_BYTES_26753)
++        /* IRIS_26755_PROCESS_SAFE_TILE_BUDGET
++         * Java maxHeap does not represent Camera2/native/GLES residency. Keep the solver's own
++         * peak bounded to 32 MiB after RAW release and let the existing estimator/workers shrink
++         * further as needed.
++         */
++        return PLAN_B_MAX_MEMORY_BYTES_26753
++    }
++
++    /* IRIS_26755_PLAN_B_RAW_LIFETIME_OWNER
++     * Sabre/VGN has already consumed the full RAW burst before Plan B starts. Stage every admitted
++     * NORMAL observation to an independent immutable cache file, prove the complete population,
++     * then release all original SafeImage/ImageFrame RAW owners before any Fourier allocation.
++     */
++    private data class PlanBRawStage26755(
++        val images: List<SafeImage>,
++        val ownedDiskImages: List<SafeImage>,
++        val stagedBytes: Long,
++        val releasedBytes: Long,
++    ) : AutoCloseable {
++        override fun close() { ownedDiskImages.forEach { runCatching { it.close() } } }
++    }
++
++    private fun processRssBytes26755(): Long = runCatching {
++        File("/proc/self/status").useLines { lines ->
++            val row = lines.firstOrNull { it.startsWith("VmRSS:") } ?: return@useLines -1L
++            val kb = row.substringAfter(':').trim().substringBefore(' ').toLong()
++            kb * 1024L
++        }
++    }.getOrDefault(-1L)
++
++    private fun stagePlanBRawEvidence26755(
++        images: List<SafeImage>,
++        evidence: List<True2xFrameEvidence>,
++    ): PlanBRawStage26755 {
++        val directory = checkNotNull(sabreSuperResTempDir)
++        val indices = evidence.map { it.frameIndex }
++        require(indices.distinct().size == indices.size) { "26755 duplicate Plan-B evidence frame index" }
++        require(indices.all { it in images.indices }) { "26755 Plan-B evidence index outside image list" }
++        val deadlineNs = System.nanoTime() + PLAN_B_RAW_STAGE_MAX_MS_26755 * 1_000_000L
++        val beforeRss = processRssBytes26755()
++        val mapped = images.toMutableList()
++        val owned = ArrayList<SafeImage>(indices.size)
++        var stagedBytes = 0L
++        val releaseBytes = images.filterNot { it.isFileBacked }
++            .sumOf { it.rowStrideBytes.toLong() * it.height.toLong() }
++        PLog.i(SABRE_TAG, "IRIS_26755_PLAN_B_MEMORY_BEFORE_RAW_RELEASE rssBytes=$beforeRss " +
++            "frames=${images.size} admittedNormals=${indices.size} rawOwnedBytes=$releaseBytes")
++        MotionTrace.processingState(
++            "IRIS_26755_PLAN_B_MEMORY_BEFORE_RAW_RELEASE",
++            "rssBytes=$beforeRss frames=${images.size} admittedNormals=${indices.size} rawOwnedBytes=$releaseBytes",
++        )
++        try {
++            indices.forEachIndexed { ordinal, index ->
++                check(System.nanoTime() < deadlineNs) { "26755 RAW staging deadline before frame=$ordinal" }
++                val source = images[index]
++                val file = File(directory, "iris26755_planb_raw_${ordinal}_${source.timestamp}_${System.nanoTime()}.raw16")
++                val staged = source.copyRawBackingTo(file, deadlineNs)
++                require(staged.isFileBacked && file.isFile) { "26755 staged RAW backing missing frame=$ordinal" }
++                val expected = source.rowStrideBytes.toLong() * source.height.toLong()
++                require(file.length() == expected) { "26755 staged RAW byte mismatch frame=$ordinal" }
++                mapped[index] = staged
++                owned += staged
++                stagedBytes += expected
++            }
++            require(owned.size == indices.size) { "26755 staged RAW population changed" }
++            // Only after every admitted NORMAL has an independent proven backing may old owners die.
++            images.forEach { it.close() }
++            val afterRss = processRssBytes26755()
++            PLog.i(SABRE_TAG, "IRIS_26755_PLAN_B_MEMORY_AFTER_RAW_RELEASE rssBytes=$afterRss " +
++                "rssDeltaBytes=${if (beforeRss >= 0L && afterRss >= 0L) beforeRss - afterRss else -1L} " +
++                "stagedBytes=$stagedBytes releasedRawBytes=$releaseBytes diskBackedNormals=${owned.size}")
++            MotionTrace.processingState(
++                "IRIS_26755_PLAN_B_MEMORY_AFTER_RAW_RELEASE",
++                "rssBytes=$afterRss rssDeltaBytes=${if (beforeRss >= 0L && afterRss >= 0L) beforeRss - afterRss else -1L} " +
++                    "stagedBytes=$stagedBytes releasedRawBytes=$releaseBytes diskBackedNormals=${owned.size}",
++            )
++            return PlanBRawStage26755(mapped, owned, stagedBytes, releaseBytes)
++        } catch (t: Throwable) {
++            owned.forEach { runCatching { it.close() } }
++            throw t
++        }
+     }
+ 
+     private fun planBEstimatedTileBytes26753(
+@@ -14374,6 +14457,12 @@ internal class GlesMgcRawSpatialStacker(
+                         check(remainingTile > 0L) { "26753 Plan-B tile deadline before direct solve tile=$completedTiles" }
+                         val tileWeights = FloatArray(translations.size)
+                         val solverStats = LongArray(10)
++                        if (completedTiles == 0) {
++                            val tile0 = "rssBytes=${processRssBytes26755()} source=${sourceWidth}x$sourceHeight " +
++                                "output=${tileOutputWidth}x$tileOutputHeight budgetBytes=$memoryBudgetBytes frames=${translations.size}"
++                            PLog.i(SABRE_TAG, "IRIS_26755_PLAN_B_TILE0_NATIVE_BEGIN $tile0")
++                            MotionTrace.processingState("IRIS_26755_PLAN_B_TILE0_NATIVE_BEGIN", tile0)
++                        }
+                         check(
+                             IrisTrue2xSrNative.reconstructPlanBTileDirect(
+                                 lumaFiles.map { it.absolutePath }.toTypedArray(), sourceWidth, sourceHeight,
+@@ -14384,6 +14473,12 @@ internal class GlesMgcRawSpatialStacker(
+                             )
+                         ) { "26753 Plan-B bounded direct tile solve failed tile=$completedTiles" }
+                         require(tileReconstruction.length() == tileOutputWidth.toLong() * tileOutputHeight * Float.SIZE_BYTES)
++                        if (completedTiles == 0) {
++                            val tile0Done = "rssBytes=${processRssBytes26755()} estimatedBytes=${solverStats.getOrElse(5) { 0L }} " +
++                                "workers=${solverStats.getOrElse(6) { 0L }} irlsUpdates=${solverStats.getOrElse(0) { 0L }}"
++                            PLog.i(SABRE_TAG, "IRIS_26755_PLAN_B_TILE0_NATIVE_DONE $tile0Done")
++                            MotionTrace.processingState("IRIS_26755_PLAN_B_TILE0_NATIVE_DONE", tile0Done)
++                        }
+                         val beforeAccumulateNs = System.nanoTime()
+                         val remainingForAccumulate = minOf(
+                             PLAN_B_STAGE_MAX_MS_26753 - (beforeAccumulateNs - startNs) / 1_000_000L,
+@@ -14729,10 +14824,11 @@ internal class GlesMgcRawSpatialStacker(
+         private const val PLAN_B_STAGE_MAX_MS_26753 = 20_000L
+         private const val PLAN_B_TILE_MAX_MS_26753 = 4_000L
+         private const val PLAN_B_MAX_TILE_COUNT_26753 = 1024
+-        private const val PLAN_B_MIN_MEMORY_BYTES_26753 = 24L * 1024L * 1024L
+-        private const val PLAN_B_MAX_MEMORY_BYTES_26753 = 96L * 1024L * 1024L
++        private const val PLAN_B_MIN_MEMORY_BYTES_26753 = 16L * 1024L * 1024L
++        private const val PLAN_B_MAX_MEMORY_BYTES_26753 = 32L * 1024L * 1024L
+         private const val PLAN_B_NATIVE_RESERVE_BYTES_26753 = 8L * 1024L * 1024L
+-        private val PLAN_B_CORE_TILE_CANDIDATES_26753 = intArrayOf(1024, 896, 768, 640, 512, 384, 256, 192, 128)
++        private const val PLAN_B_RAW_STAGE_MAX_MS_26755 = 8_000L
++        private val PLAN_B_CORE_TILE_CANDIDATES_26753 = intArrayOf(512, 384, 256, 192, 128)
+         private const val TRUE2X_GPU_MIN_TEXTURE_SIZE = 1024
+         private const val TRUE2X_RAW_RBF_HALO = 4f
+         private const val TRUE2X_EVIDENCE_HALO = 2
+diff --git a/app/version.properties b/app/version.properties
+index ba8b1da494d40a0b56cb14da69b77e8ea74522e5..9d949f6a4c63ecd56f204037c6decb16ad360569 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726754
+-VERSION_BUILD=26754
++VERSION_NAME=0.9726755
++VERSION_BUILD=26755
