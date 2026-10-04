@@ -29,4 +29,10 @@ pos=[xml.index(x) for x in order]; assert pos==sorted(pos)
 shader=(c/'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt').read_text()
 assert 'mix(selectedChroma, denoisedChroma26760, adaptive26762)' not in shader
 assert 'clamp(uChromaDenoiseStrength26762, 0.50, 2.00)' in shader
+# Permanent regression: SettingsManager String-key boolean access must use the 3-argument overload.
+sa=(c/'app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java').read_text()
+bad='mSettingsManager.getBoolean(SettingsManager.SCOPE_GLOBAL,\n                    IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM);'
+good='mSettingsManager.getBoolean(SettingsManager.SCOPE_GLOBAL,\n                    IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM, false);'
+assert bad not in sa, '26762 regression: String key passed to PreferenceKeys.Key overload'
+assert sa.count(good)==1, '26762 regression: corrected String-key boolean overload missing/duplicated'
 print('PASS 26762 validate: 1823 authority-seeded files; exact 12 existing changes; 0 additions/deletions; ownership/UI invariants')

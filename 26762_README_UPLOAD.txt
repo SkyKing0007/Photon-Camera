@@ -24,22 +24,19 @@ Behavior:
 - Super Res values above 1.0 use a second bounded same-material near-neutral cleanup; never unsafe mix extrapolation.
 - MgcFullResolutionDenoise.kt and MgcSabreKernelTuning.kt remain byte-identical.
 
-TWO-STAGE vscode.dev UPLOAD
+26762 COMPILER-REPAIR NOTE
+- The first 26762 Actions attempt failed in :app:compileDebugJavaWithJavac because SettingsActivity passed the String KEY_RESIDUAL_CHROMA_CUSTOM to the two-argument SettingsManager.getBoolean overload, which expects PreferenceKeys.Key.
+- This repair uses the correct String-key overload: getBoolean(SettingsManager.SCOPE_GLOBAL, IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM, false).
+- validate_26762.py permanently rejects the exact failed two-argument call.
+- Runtime architecture, 12-file allowlist, version/build, and successful-26761/26752 authorities are unchanged.
 
-STAGE 1
-Upload/replace EVERY path from this ZIP EXCEPT:
-.github/workflows/build-26762-per-lens-chroma-controls.yml
+SINGLE-COMMIT vscode.dev REPAIR UPLOAD
 
-Commit and push exactly:
-26762: prepare per-lens chroma controls
+The 26762 workflow is already present from the failed attempt. Do NOT repeat the original two-stage trigger sequence.
 
-Wait for that commit/push to finish. It should NOT launch the 26762 workflow because the workflow file is not present yet.
-
-STAGE 2
-Upload only:
-.github/workflows/build-26762-per-lens-chroma-controls.yml
+Upload/replace EVERY path from this repair ZIP in one vscode.dev change set. The workflow file is unchanged and may not appear as modified; that is expected.
 
 Commit and push exactly:
-26762: trigger per-lens chroma controls build
+26762: repair SettingsActivity boolean key compile
 
-Then send the GitHub Actions run result/log here. GitHub Actions performs the authoritative pinned GLSL, Kotlin, Java, both-ABI NDK, full assemble, one-APK and post-build invariance proof.
+That single push will trigger the existing 26762 workflow from the repaired 26762_* / handoff payload paths. Then send the GitHub Actions run result/log here. GitHub Actions performs the authoritative pinned GLSL, Kotlin, Java, both-ABI NDK, full assemble, one-APK and post-build invariance proof.

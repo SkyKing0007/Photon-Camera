@@ -431,7 +431,7 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
             Preference adaptive = findPreference(IrisMotionSettings.KEY_ADAPTIVE_SNR_CHROMA_DENOISE);
             if (adaptive == null) return;
             boolean custom = mSettingsManager.getBoolean(SettingsManager.SCOPE_GLOBAL,
-                    IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM);
+                    IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM, false);
             adaptive.setEnabled(!custom);
         }
 
