@@ -50,7 +50,7 @@ verify_package(){
   for p in 26775_FORWARD_FULL_INDEX.patch 26775_ROLLBACK_FULL_INDEX.patch; do
     ! grep -Eq '^(rename from|rename to|copy from|copy to) ' "$p" || fail "26775 patch contains rename/copy inference: $p"
   done
-  grep -Fx 'RUN_26775_RESOLVE_VGN_PHASE_VALIDITY' TRIGGER_26775.txt >/dev/null || fail "26775 trigger contents"
+  grep -Fx 'RUN_26775_R2_MANIFEST_ORDER_REPAIR' TRIGGER_26775.txt >/dev/null || fail "26775 R2 trigger contents"
   ! find . -type f -name '*.apk' | grep -q . || fail "APK unexpectedly packaged"
   pass "sealed 26775 package hashes/syntax/allowlist/patch identity"
 }
@@ -266,8 +266,24 @@ postbuild_proof(){
   done
   tar -czf "$OUT/26775_candidate_app_source.tar.gz" -C "$CAND" app
   sha256sum "$OUT/26775_candidate_app_source.tar.gz" > "$OUT/26775_candidate_app_source.tar.gz.sha256"
-  (cd "$CAND" && find app -type f -print0 | sort -z | xargs -0 sha256sum) > "$OUT/26775_candidate_full_app.sha256"
-  cmp -s "$OUT/26775_candidate_full_app.sha256" "$ROOT/26775_EXPECTED_CANDIDATE_FULL_APP.sha256" || fail "final candidate manifest differs from frozen candidate"
+  (cd "$CAND" && find app -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum) > "$OUT/26775_candidate_full_app.sha256"
+  python3 -S - "$OUT/26775_candidate_full_app.sha256" "$ROOT/26775_EXPECTED_CANDIDATE_FULL_APP.sha256" <<'PY_FINAL_MANIFEST'
+from pathlib import Path
+import sys
+def manifest(path):
+    lines=Path(path).read_text().splitlines()
+    assert len(lines)==1779,(path,len(lines))
+    out={}
+    for line in lines:
+        digest,rel=line.split('  ',1)
+        assert len(digest)==64 and all(c in '0123456789abcdef' for c in digest),(path,line)
+        assert rel not in out,(path,'duplicate path',rel)
+        out[rel]=digest
+    return out
+actual=manifest(sys.argv[1]); frozen=manifest(sys.argv[2])
+assert actual==frozen,'final candidate manifest hash/path set differs from frozen candidate'
+print('PASS 26775 final candidate manifest: 1779 hash/path entries equal independent of ordering')
+PY_FINAL_MANIFEST
   sed -i 's#POST-BUILD INVARIANCE:.*#POST-BUILD INVARIANCE: PASS#' "$OUT/26775_COMPILER_STATUS.txt"
   pass "authority-seeded post-build protected/DNG/native/vendor/source invariance"
 }

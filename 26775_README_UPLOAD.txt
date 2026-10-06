@@ -1,23 +1,23 @@
-26775 — Resolve/VGN CFA-Phase Chroma Validity
+26775 R2 — Resolve/VGN CFA-Phase Chroma Validity — manifest-order repair
 
 Use vscode.dev in exactly three stages. Do not combine root and .github/workflows uploads.
 
 STAGE 1 — repository root
 Upload all contents of STAGE1_UPLOAD_TO_REPO_ROOT.
 Commit message:
-26775: upload Resolve VGN phase-validity correction
+26775 R2: repair final candidate manifest ordering
 Push. No 26775 Actions run should start.
 
 STAGE 2 — .github/workflows only
 Upload only build-26775-resolve-vgn-phase-validity.yml into .github/workflows/.
 Commit message:
-26775: add Resolve VGN phase-validity workflow
+26775 R2: update manifest repair workflow
 Push. No 26775 Actions run should start.
 
 STAGE 3 — repository root
 Upload only TRIGGER_26775.txt.
 Commit message:
-26775: trigger Resolve VGN phase-validity build
+26775 R2: trigger repaired Resolve VGN build
 Push.
 
 Expected workflow:
@@ -28,3 +28,5 @@ photon-26775-resolve-vgn-phase-validity
 
 Expected APK inside artifact:
 IrisCamera-0.9726775-26775-resolve-vgn-phase-validity-debug.apk
+
+R2 changes no runtime candidate bytes. It repairs the final manifest proof by pinning generation to LC_ALL=C and comparing the complete 1779-entry path->SHA-256 map independent of presentation order.
