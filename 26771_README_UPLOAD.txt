@@ -1,47 +1,46 @@
-PHOTON 26771 R1 — SHADER VERIFIER INFRASTRUCTURE REPAIR
+PHOTON 26771 R2 — MECHANICS SENTINEL METADATA REPAIR
 STATUS: PREPARED / UPLOAD-READY. NOT ACTIONS-PROVEN.
 
-WHY R1 EXISTS
-The first 26771 Actions run failed inside verify_26771_shaders.py before language/full-build proof. The runtime candidate did NOT fail. The verifier prepended '#version 310 es' to an embedded compute shader that already contained its own #version, causing the exact real-glslang error '#version must occur first in shader'. The original verifier also reduced the successful-26770 reserved set and changed base+candidate compiler replay to candidate-only.
+WHY R2 EXISTS
+R1 successfully repaired the 26771 shader verifier. The R1 Actions log reached the final shader-scope PASS and then exited before prepare_glslang. The unchanged build script's verify_successful_mechanics() requires the exact literal sentence:
+  Core build/handoff mechanics delta from successful 26770/26752 procedure: ZERO.
+R1's rewritten infrastructure-audit metadata accidentally omitted that sentence. Because the build runs with set -euo pipefail, the silent grep -F returned exit code 1 and stopped Actions.
 
-R1 IS INFRASTRUCTURE-ONLY
+R2 IS METADATA-ONLY
 - ZERO runtime candidate changes.
-- Exact original 30-path 26771 runtime payload remains frozen byte-for-byte.
+- verify_26771_shaders.py remains exactly the repaired R1 verifier.
 - build_26771_ui_storage_ownership.sh unchanged.
 - workflow unchanged.
 - transform_26771.py unchanged.
 - validate_26771.py unchanged.
 - verify_26771_patches.py unchanged.
-- forward/rollback patches and all runtime/protected/DNG/native/vendor/shader manifests unchanged.
+- exact original 30-path runtime payload unchanged.
+- forward/rollback patches and runtime/protected/DNG/native/vendor/shader manifests unchanged.
 
-R1 REPAIRS ONLY
-- verify_26771_shaders.py
-- sealed metadata/checksums describing that verifier repair.
+R2 REPAIRS ONLY
+- 26771_INFRASTRUCTURE_DIFF_AUDIT.txt — restores exact required mechanics sentinel and records the R2 regression.
+- 26771_CHECKPOINT.txt — R2 status.
+- 26771_README_UPLOAD.txt — R2 upload instructions.
+- 26771_HANDOFF_HASHES.sha256 — updated checksums for those metadata files.
 
-REPAIRED SHADER PROOF
-- exact successful-26770 trimIndent extraction restored: textwrap.dedent(...).lstrip('\n')
-- no synthetic #version prepended to the embedded shader
-- complete successful-26770 reserved-identifier set restored
-- successful-26770 base+candidate real glslang replay restored
-- permanent regression requires exactly one #version directive at byte 0
-- exact 26770 authority and frozen 26771 expanded GLSL are byte-identical for bipolarColorTrust26769, render.glsl and gainmap.glsl
+THOROUGH R2 PREPACKAGE PROOF
+The packaged files were replayed through the full locally available pre-build chain using the exact successful 26770 Actions artifact. R2 must reach and print the successful 26770/26752 mechanics-inheritance PASS messages before the environment-dependent glslang download. The exact build-script sentinel, authoritative stage-order parser, deterministic candidate, semantic/domain checks, shader static checks and package hashes are all replayed. The R1 shader verifier remains byte-identical.
 
-UPLOAD — ONE REPAIR COMMIT
-The original failed 26771 workflow and Stage-1 handoff files are already present on branch experimental-clean-photon-rebuild.
-1. Upload/replace every file from the R1 repair ZIP at repository root.
-2. Confirm Source Control shows NO app/src, app/version.properties, handoff_payload_26771, build script, workflow, transform, runtime validator, patch verifier or patch changes.
-3. Expected changed files are only:
-   - verify_26771_shaders.py
+UPLOAD — ONE R2 REPAIR COMMIT
+The original 26771 handoff and R1 verifier are already present on branch experimental-clean-photon-rebuild.
+1. Upload/replace every file from the R2 repair ZIP at repository root.
+2. Confirm Source Control shows NO app/src, app/version.properties, handoff_payload_26771, workflow, build script, transform, runtime validator, patch verifier, shader verifier or patch changes.
+3. Expected changed files are exactly:
    - 26771_HANDOFF_HASHES.sha256
    - 26771_INFRASTRUCTURE_DIFF_AUDIT.txt
    - 26771_CHECKPOINT.txt
    - 26771_README_UPLOAD.txt
 4. Commit and push:
-   26771 R1: repair shader verifier mechanics
-5. That push should trigger the existing “Build 26771 UI + Storage Ownership” workflow because verify_26771_shaders.py matches its 26771 path filter.
+   26771 R2: repair mechanics sentinel metadata
+5. That push triggers the existing Build 26771 UI + Storage Ownership workflow because 26771_* is in its path filter.
 6. Do not manually run historical workflows. Do not create a backup branch. Do not upload an APK. Do not modify dev.
 
-RUNTIME AUTHORITY UNTIL R1 SUCCEEDS
+RUNTIME AUTHORITY UNTIL R2 SUCCEEDS
 Successful 26770 commit 0520e6a6f125fa5ff2ebf460d3d379cf9a7a9572 / Actions run 37361885012 / artifact 11367536491.
 
-26771 may be called build-proven only after R1 Actions passes pinned GLSL 16.5.0, real Kotlin/Java, both-ABI native, full-index patch proof, PRE-BUILD SAFETY PROOF, full assemble, one-APK proof and final invariance/export.
+26771 may be called build-proven only after R2 Actions passes pinned GLSL 16.5.0, real Kotlin/Java, both-ABI native, full-index patch proof, PRE-BUILD SAFETY PROOF, full assemble, one-APK proof and final invariance/export.
