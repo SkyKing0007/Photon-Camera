@@ -5617,7 +5617,7 @@ internal class GlesMgcRawSpatialStacker(
         gridWidth: Int,
         gridHeight: Int,
         label: String,
-    ): IntArray {
+    ): Pair<Int, Int> {
         val geometryMask = createTexture(gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_NEAREST)
         val boundaryMask = createTexture(gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_NEAREST)
         try {
@@ -6242,7 +6242,7 @@ internal class GlesMgcRawSpatialStacker(
     private fun runEdgeFalseColorSuppressor26778(
         sourceAndFinal: Int,
         temporary: Int,
-    ): Pair<Int, Int> {
+    ): IntArray {
         check(edgeFalseColorSuppressor26778Program != 0) { "26778 edge false-color program unavailable" }
         val ids = IntArray(1)
         GLES31.glGenBuffers(1, ids, 0)

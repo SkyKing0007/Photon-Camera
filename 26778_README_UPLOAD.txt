@@ -1,23 +1,21 @@
-26778 — Claude Edge False-Color Suppressor (Claude follow-up integrated)
+26778 R3 — Kotlin compiler repair for Claude Edge False-Color Suppressor
 
-Use vscode.dev in exactly three stages. Do not combine repository-root and .github/workflows uploads.
-No backup branch.
+Successful 26777 remains runtime authority. No backup branch.
+The 26778 algorithm is unchanged; R3 repairs only two Kotlin return-type declarations and adds their permanent regression.
+
+The 26778 workflow is already installed and is byte-unchanged. Use vscode.dev in TWO stages:
 
 STAGE 1 — repository root
-Upload all contents of STAGE1_UPLOAD_TO_REPO_ROOT.
-Commit: 26778: upload Claude edge false-color suppressor
-Push. No 26778 run should start.
+Upload all contents of STAGE1_UPLOAD_TO_REPO_ROOT, replacing the existing 26778 root files.
+Commit: 26778 R3: repair Kotlin telemetry return types
+Push. No run should start.
 
-STAGE 2 — .github/workflows only
-Upload build-26778-claude-edge-false-color-suppressor.yml into .github/workflows/.
-Commit: 26778: add Claude edge false-color suppressor workflow
-Push. No 26778 run should start.
-
-STAGE 3 — repository root
-Upload only TRIGGER_26778.txt.
-Commit: 26778: trigger Claude edge false-color suppressor build
+STAGE 2 — repository root
+Upload only STAGE3_UPLOAD_TO_REPO_ROOT/TRIGGER_26778.txt, replacing the existing trigger.
+Commit: 26778 R3: trigger Kotlin compiler repair
 Push.
 
+Do NOT re-upload the workflow; the existing .github/workflows/build-26778-claude-edge-false-color-suppressor.yml is retained byte-for-byte.
 Expected workflow: Build 26778 Claude Edge False Color Suppressor
 Expected artifact: photon-26778-claude-edge-false-color-suppressor
 Expected APK: IrisCamera-0.9726778-26778-claude-edge-false-color-suppressor-debug.apk

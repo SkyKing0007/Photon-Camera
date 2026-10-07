@@ -61,6 +61,26 @@ assert '#version 310 es' in shader
 assert 'gateGt05' in shader and 'blendGt05Pass1' in shader and 'blendGt05Pass2' in shader and 'uStatsPass' in shader
 assert 'if (uStatsPass == 1 && gate > 0.5)' in shader
 assert 'else if (uStatsPass == 2) atomicAdd(blendGt05Pass2, 1u);' in shader
+# Permanent 26778 R1 Kotlin compiler regression: telemetry and inherited SHORT probe return types must not be swapped.
+assert '''private fun probeSabreShortBoundaryGeometry26600(
+        geometry: Int,
+        gridWidth: Int,
+        gridHeight: Int,
+        label: String,
+    ): Pair<Int, Int> {''' in stack
+assert 'return Pair(\n                geometryBytes.count' in stack
+assert '''private fun runEdgeFalseColorSuppressor26778(
+        sourceAndFinal: Int,
+        temporary: Int,
+    ): IntArray {''' in stack
+assert 'return intArrayOf(gate, blendPass1, blendPass2)' in stack
+assert 'gateGt05Pass1=${counts26778[0]}' in stack and 'blendGt05Pass1=${counts26778[1]}' in stack and 'blendGt05Pass2=${counts26778[2]}' in stack
+assert '''): IntArray {
+        val geometryMask = createTexture''' not in stack
+assert '''private fun runEdgeFalseColorSuppressor26778(
+        sourceAndFinal: Int,
+        temporary: Int,
+    ): Pair<Int, Int> {''' not in stack
 # Claude follow-up safety/scale proofs.
 assert 'physicalWhiteScale=1.0 physicalWhiteOwner=DEMOSAIC_WHITE_NORMALIZED magnitudeOwner=CLEANED_PHYSICAL_HDR' in stack
 assert 'check(source != destination)' in stack
@@ -79,4 +99,5 @@ print('PASS 26778 Claude algorithm: post-Resolve/pre-VGN two-pass isolated chrom
 print('PASS 26778 ownership: cleaned RGBA16F feeds VGN seed and pre-VGN physical authority; OFF bypass retains exact U16 VGN seed; 26611 HDR direction normalization preserved')
 print('PASS 26778 26776 guard restoration: successful 26776 guard retained exactly in active domain; ineffective 26777 radius-3 experiment removed')
 print('PASS 26778 tunables: suppressor default ON; five Claude scalar defaults; demosaic sharpness multiplier default 1 / A-B 0; Motion+Night share live immutable per-shot tunables')
+print('PASS 26778 R3 Kotlin regression: inherited SHORT probe remains Pair<Int,Int>; suppressor telemetry remains IntArray[3]')
 print('PASS 26778 exact runtime allowlist: 8 modified + 0 added + 0 deleted; 1771 protected files unchanged')
