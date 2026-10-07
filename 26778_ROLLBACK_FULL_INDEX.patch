@@ -1,0 +1,982 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 03514c1f20a77df72180cc30d436257920299126..5a0dd5ae91a16f85f502525fdff50289365f7838 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -63,6 +63,8 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+     )
+     private val passWindow = GlesGpuScheduler.PassWindow("IrisCurrentMgcVgn", 2)
+ 
++    private var phaseRisk26777Program = 0
++    private var phaseDilate26777Program = 0
+     private var seedProgram = 0
+     private var localClampProgram = 0
+     private var localMedianProgram = 0
+@@ -90,6 +92,14 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+ 
+     fun initPrograms() {
+         if (seedProgram != 0) return
++        phaseRisk26777Program = host.linkComputeProgram(
++            Iris26529SpatialRgbChromaShaders.phaseRisk26777,
++            "iris26777_resolve_phase_risk",
++        )
++        phaseDilate26777Program = host.linkComputeProgram(
++            Iris26529SpatialRgbChromaShaders.phaseDilate26777,
++            "iris26777_resolve_support_dilate",
++        )
+         seedProgram = host.linkComputeProgram(Iris26529SpatialRgbChromaShaders.seed, "iris26529_chroma_seed")
+         localClampProgram = host.linkComputeProgram(Iris26529SpatialRgbChromaShaders.localClamp, "iris26529_chroma_local_clamp")
+         localMedianProgram = host.linkComputeProgram(Iris26529SpatialRgbChromaShaders.localMedian, "iris26529_chroma_local_median")
+@@ -147,7 +157,6 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         sabreValidWeights: Int = 0,
+         sabreValidityWeightScale: Float = 1f,
+         preVgnPhysicalRgb: Int = 0,
+-        vgnSeedPhysicalRgb26778: Int = 0,
+     ): Result {
+         check(assembledRgb != 0)
+         check(writtenBands == bands.size) {
+@@ -162,26 +171,38 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         }
+         val chromaStart = System.nanoTime()
+ 
+-        // Keep the c317/MGC stage domains but use Iris-owned storage rotation:
+-        // workA = seed YCCD, workB = local-clamped YCCD, assembledRgb = median YCCD,
+-        // then workA = directional YCCD and assembledRgb = restored-direction YCCD.
+-        dispatchSeed(
++        /* IRIS_26777_CLAUDE_RESOLVE_SUPPORT_FOOTPRINT_OWNER
++         * Claude's clip-aware pipeline order is enforced without changing ResolveSabre AOT bytes:
++         * classify exact consumed-CFA weakness and Resolve 2px chroma phase first, expand measured
++         * CFA invalidity through a radius-3 soft demosaic-support footprint, and only then allow the
++         * VGN seed to establish material/color ownership. workA/workB are reused; no new full-size
++         * GPU texture or persistent allocation is introduced. */
++        dispatchPhaseRisk26777(
+             assembledRgb, workA, sabreSupportR, sabreSupportGb, sabreValidWeights,
+-            sabreValidityWeightScale, sabreSupportValid, vgnSeedPhysicalRgb26778,
++            sabreValidityWeightScale, sabreSupportValid,
+         )
+-        dispatchLocal(localClampProgram, workA, workB, "local clamp")
++        dispatchPhaseDilate26777(workA, workB, axis = 0)
++        dispatchPhaseDilate26777(workB, workA, axis = 1)
++        // Storage rotation after the temporary classification footprint:
++        // workB = seed YCCD, workA = local-clamped YCCD, assembledRgb = median YCCD,
++        // then workB = directional YCCD and assembledRgb = restored-direction YCCD.
++        dispatchSeed(
++            assembledRgb, workA, workB, sabreSupportR, sabreSupportGb, sabreValidWeights,
++            sabreValidityWeightScale, sabreSupportValid,
++        )
++        dispatchLocal(localClampProgram, workB, workA, "local clamp")
+         dispatchLocalMedian(
+-            workB, assembledRgb, chromaCorrectionStrength, sabreSupportR, sabreSupportGb,
++            workA, assembledRgb, chromaCorrectionStrength, sabreSupportR, sabreSupportGb,
+             sabreValidWeights, sabreValidityWeightScale, sabreSupportValid,
+         )
+-        dispatchDirectional(workB, assembledRgb, workA)
+-        dispatchRestoreDirection(workA, workB, assembledRgb)
++        dispatchDirectional(workA, assembledRgb, workB)
++        dispatchRestoreDirection(workB, workA, assembledRgb)
+ 
+         // Preserve the restored-direction YCCD as the original reference until the final blend.
+         // This rotation mirrors the reference stage ownership without copying its host structure.
+         val originalYccd = assembledRgb
+-        var smoothYccd = workA
+-        var scratchYccd = workB
++        var smoothYccd = workB
++        var scratchYccd = workA
+         runIirRgb(
+             smoothYccd, scratchYccd, originalYccd, coefficients.pass1, filterLuma = true, "IIR1",
+             sabreSupportR, sabreSupportGb, sabreValidWeights, sabreValidityWeightScale, sabreSupportValid,
+@@ -293,15 +314,63 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         }
+     }
+ 
++    private fun dispatchPhaseRisk26777(
++        source: Int,
++        destination: Int,
++        sabreSupportR: Int,
++        sabreSupportGb: Int,
++        sabreValidWeights: Int,
++        sabreValidityWeightScale: Float,
++        sabreSupportValid: Boolean,
++    ) {
++        GLES31.glUseProgram(phaseRisk26777Program)
++        setImageSize(phaseRisk26777Program)
++        GLES31.glUniform3fv(
++            host.uniformLocation(phaseRisk26777Program, "uCalculationGains"),
++            1,
++            calculationRgbGains,
++            0,
++        )
++        bindImage(0, source, GLES31.GL_READ_ONLY)
++        bindImage(1, destination, GLES31.GL_WRITE_ONLY)
++        bindSabreValidity(
++            phaseRisk26777Program, sabreSupportR, sabreSupportGb, sabreValidWeights,
++            sabreValidityWeightScale, sabreSupportValid,
++        )
++        trackedDispatch(
++            "26777 Resolve/CFA phase classify",
++            if (sabreSupportValid) {
++                intArrayOf(source, sabreSupportR, sabreSupportGb, sabreValidWeights)
++            } else {
++                intArrayOf(source)
++            },
++            intArrayOf(destination),
++        )
++        clearSabreValidityBindings()
++        clearImages()
++    }
++
++    private fun dispatchPhaseDilate26777(source: Int, destination: Int, axis: Int) {
++        GLES31.glUseProgram(phaseDilate26777Program)
++        setImageSize(phaseDilate26777Program)
++        GLES31.glUniform1i(host.uniformLocation(phaseDilate26777Program, "uAxis"), axis)
++        dispatch2d(
++            phaseDilate26777Program,
++            intArrayOf(source),
++            destination,
++            "26777 Resolve support ${if (axis == 0) "horizontal" else "vertical"} radius-3 dilation",
++        )
++    }
++
+     private fun dispatchSeed(
+         source: Int,
++        phaseMask: Int,
+         destination: Int,
+         sabreSupportR: Int,
+         sabreSupportGb: Int,
+         sabreValidWeights: Int,
+         sabreValidityWeightScale: Float,
+         sabreSupportValid: Boolean,
+-        preVgnPhysicalRgb: Int,
+     ) {
+         GLES31.glUseProgram(seedProgram)
+         setImageSize(seedProgram)
+@@ -309,27 +378,17 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         GLES31.glUniform1f(host.uniformLocation(seedProgram, "uMinimumDirectionGradient"), 8f)
+         bindImage(0, source, GLES31.GL_READ_ONLY)
+         bindImage(1, destination, GLES31.GL_WRITE_ONLY)
+-        val physicalPreVgnValid = preVgnPhysicalRgb != 0
+-        GLES31.glUniform1i(host.uniformLocation(seedProgram, "uPhysicalPreVgnValid"), if (physicalPreVgnValid) 1 else 0)
+-        if (physicalPreVgnValid) {
+-            GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + 5)
+-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, preVgnPhysicalRgb)
+-            GLES31.glUniform1i(host.uniformLocation(seedProgram, "uPhysicalPreVgn"), 5)
+-        }
++        bindImage(2, phaseMask, GLES31.GL_READ_ONLY)
+         bindSabreValidity(seedProgram, sabreSupportR, sabreSupportGb, sabreValidWeights, sabreValidityWeightScale, sabreSupportValid)
+         trackedDispatch(
+             "seed",
+-            buildList {
+-                add(source)
+-                if (sabreSupportValid) { add(sabreSupportR); add(sabreSupportGb); add(sabreValidWeights) }
+-                if (physicalPreVgnValid) add(preVgnPhysicalRgb)
+-            }.toIntArray(),
++            if (sabreSupportValid) {
++                intArrayOf(source, phaseMask, sabreSupportR, sabreSupportGb, sabreValidWeights)
++            } else {
++                intArrayOf(source, phaseMask)
++            },
+             intArrayOf(destination),
+         )
+-        if (physicalPreVgnValid) {
+-            GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + 5)
+-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+-        }
+         clearSabreValidityBindings()
+         clearImages()
+     }
+@@ -1653,7 +1712,11 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float blockRisk=phaseInvalid26776(p)?1.0:0.0;
+             float eradicateThreshold=mix(0.60,0.28,blockRisk);
+             bool eradicate=bipolar>=eradicateThreshold;
+-            float phaseFloorVeto=blockRisk*smoothstep(0.12,0.30,bipolar);
++            /* IRIS_26777_DILATED_FOOTPRINT_NO_CHROMA_RESURRECTION
++             * Once the pre-ownership Resolve/CFA support footprint proves this center contaminated,
++             * later recovery/floor owners may not re-amplify its hue even when the residual is too
++             * one-sided to satisfy the older bipolar detector. RGB cleanup itself remains bounded. */
++            float phaseFloorVeto=blockRisk;
+             /* Full-strength means 100% of the proven center-owned oscillating projection is removed;
+              * it does not mean replacing the pixel by a neighbor-derived chroma baseline. */
+             vec3 cleanedNC=postNC-(eradicate?bipolarComponent:vec3(0.0));
+@@ -1701,6 +1764,94 @@ internal object Iris26529SpatialRgbChromaShaders {
+         }
+     """.trimIndent()
+ 
++    val phaseRisk26777 = """
++        #version 310 es
++        precision highp float; precision highp int; precision highp uimage2D;
++        layout(local_size_x=8,local_size_y=8) in;
++        layout(rgba16ui,binding=0) readonly uniform highp uimage2D uInput;
++        layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uOutput;
++        uniform vec3 uCalculationGains;
++        uniform highp sampler2D uSabreWeightR;
++        uniform highp sampler2D uSabreWeightsGb;
++        uniform highp sampler2D uSabreValidWeights;
++        uniform highp float uSabreValidityWeightScale;
++        uniform int uSabreSupportValid;
++        $common
++        float physicalColorTrust26777(ivec2 p){
++            if(uSabreSupportValid==0)return 1.0;
++            ivec2 q=safePos(p);
++            vec3 totalWeight=vec3(max(texelFetch(uSabreWeightR,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).g,0.0));
++            vec3 validWeight=max(texelFetch(uSabreValidWeights,q,0).rgb,vec3(0.0))*max(uSabreValidityWeightScale,1.0);
++            vec3 channelValidity=clamp(validWeight/max(totalWeight,vec3(1.0e-6)),vec3(0.0),vec3(1.0));
++            float measured=min(channelValidity.r,min(channelValidity.g,channelValidity.b));
++            return smoothstep(0.985,0.9995,measured);
++        }
++        vec3 calculationRgb26777(ivec2 p){
++            uvec3 e=imageLoad(uInput,safePos(p)).rgb;
++            return clamp(vec3(decodeU16(e.r),decodeU16(e.g),decodeU16(e.b))*uCalculationGains,vec3(0.0),vec3(65504.0));
++        }
++        float y26777(ivec2 p){return dot(calculationRgb26777(p),vec3(0.25,0.5,0.25));}
++        vec2 chroma26777(ivec2 p){
++            vec3 rgb=calculationRgb26777(p);
++            float sum=max(rgb.r+2.0*rgb.g+rgb.b,1.0);
++            return (rgb.rb-vec2(rgb.g))/sum;
++        }
++        float agreement26777(vec2 a,vec2 b){return dot(a,b)/max(length(a)*length(b),1.0e-7);}
++        float axisPeriodic26777(ivec2 p,ivec2 d){
++            vec2 cm2=chroma26777(p-2*d),cm1=chroma26777(p-d),c0=chroma26777(p),cp1=chroma26777(p+d),cp2=chroma26777(p+2*d);
++            vec2 baseline=(cm2+4.0*cm1+6.0*c0+4.0*cp1+cp2)*(1.0/16.0);
++            vec2 centerDev=c0-baseline,nearDev=0.5*(cm1+cp1)-baseline,farDev=0.5*(cm2+cp2)-baseline;
++            float centerMag=length(centerDev),nearMag=length(nearDev),farMag=length(farDev);
++            float nearOpp=smoothstep(0.60,0.92,-agreement26777(centerDev,nearDev));
++            float farSame=smoothstep(0.55,0.90,agreement26777(centerDev,farDev));
++            float nearSym=1.0-smoothstep(0.070,0.220,length(cm1-cp1));
++            float farSym=1.0-smoothstep(0.070,0.220,length(cm2-cp2));
++            float magnitude=smoothstep(0.012,0.055,min(centerMag,min(nearMag,farMag)));
++            return nearOpp*farSame*nearSym*farSym*magnitude;
++        }
++        void main(){
++            ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
++            float periodic=max(max(axisPeriodic26777(p,ivec2(1,0)),axisPeriodic26777(p,ivec2(0,1))),
++                max(axisPeriodic26777(p,ivec2(1,1)),axisPeriodic26777(p,ivec2(1,-1))));
++            float centerY=y26777(p),maximumRelativeGradient=0.0;
++            const ivec2 gd[4]=ivec2[4](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1));
++            for(int i=0;i<4;++i){float qY=y26777(p+gd[i]);maximumRelativeGradient=max(maximumRelativeGradient,abs(qY-centerY)/max(max(qY,centerY),0.060));}
++            float gradientRisk=smoothstep(0.10,0.28,maximumRelativeGradient);
++            ivec2 base=(safePos(p)/2)*2;
++            float blockTrust=min(min(physicalColorTrust26777(base),physicalColorTrust26777(base+ivec2(1,0))),
++                min(physicalColorTrust26777(base+ivec2(0,1)),physicalColorTrust26777(base+ivec2(1,1))));
++            float cfaInvalidity=1.0-blockTrust;
++            imageStore(uOutput,p,uvec4(
++                uint(round(clamp(periodic,0.0,1.0)*65535.0)),
++                uint(round(clamp(cfaInvalidity,0.0,1.0)*65535.0)),
++                uint(round(clamp(gradientRisk,0.0,1.0)*65535.0)),
++                0u));
++        }
++    """.trimIndent()
++
++    val phaseDilate26777 = """
++        #version 310 es
++        precision highp float; precision highp int; precision highp uimage2D;
++        layout(local_size_x=8,local_size_y=8) in;
++        layout(rgba16ui,binding=0) readonly uniform highp uimage2D uInput;
++        layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uOutput;
++        uniform int uAxis;
++        $common
++        float feather26777(int d){int a=abs(d);if(a==0)return 1.0;if(a==1)return 0.92;if(a==2)return 0.74;return 0.56;}
++        void main(){
++            ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
++            uvec4 center=imageLoad(uInput,p);
++            float invalidity=0.0,gradient=0.0;
++            for(int i=-3;i<=3;++i){
++                ivec2 d=uAxis==0?ivec2(i,0):ivec2(0,i);
++                uvec4 q=imageLoad(uInput,safePos(p+d));float w=feather26777(i);
++                invalidity=max(invalidity,(float(q.g)/65535.0)*w);
++                gradient=max(gradient,float(q.b)/65535.0);
++            }
++            imageStore(uOutput,p,uvec4(center.r,uint(round(clamp(invalidity,0.0,1.0)*65535.0)),uint(round(clamp(gradient,0.0,1.0)*65535.0)),center.a));
++        }
++    """.trimIndent()
++
+     val seed = """
+         #version 310 es
+         precision highp float;
+@@ -1709,10 +1860,9 @@ internal object Iris26529SpatialRgbChromaShaders {
+         layout(local_size_x=8, local_size_y=8) in;
+         layout(rgba16ui,binding=0) readonly uniform highp uimage2D uInput;
+         layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uOutput;
++        layout(rgba16ui,binding=2) readonly uniform highp uimage2D uPhaseMask26777;
+         uniform vec3 uCalculationGains;
+         uniform float uMinimumDirectionGradient;
+-        uniform highp sampler2D uPhysicalPreVgn;
+-        uniform int uPhysicalPreVgnValid;
+         $common
+         /* IRIS_26730_PHYSICAL_VALIDITY_CONTAINMENT_AUTHORITY
+          * The 26729 material-preservation gates may only be established by reconstructed color
+@@ -1733,14 +1883,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+             return smoothstep(0.985,0.9995,measured);
+         }
+         vec3 calculationRgbAt(ivec2 p) {
+-            ivec2 q=safePos(p);
+-            if(uPhysicalPreVgnValid!=0){
+-                vec3 linearRgb=max(texelFetch(uPhysicalPreVgn,q,0).rgb,vec3(0.0));
+-                float physicalMagnitude=max(max(linearRgb.r,max(linearRgb.g,linearRgb.b)),1.0);
+-                vec3 directionDomain=clamp(linearRgb/physicalMagnitude,vec3(0.0),vec3(1.0));
+-                return clamp(directionDomain*(65504.0*uCalculationGains),vec3(0.0),vec3(65504.0));
+-            }
+-            uvec3 e=imageLoad(uInput,q).rgb;
++            uvec3 e=imageLoad(uInput,safePos(p)).rgb;
+             return clamp(vec3(decodeU16(e.r),decodeU16(e.g),decodeU16(e.b))*uCalculationGains,vec3(0.0),vec3(65504.0));
+         }
+         float yAt(ivec2 p){ return dot(calculationRgbAt(p),vec3(0.25,0.5,0.25)); }
+@@ -1749,48 +1892,11 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float sum=max(rgb.r+2.0*rgb.g+rgb.b,1.0);
+             return (rgb.rb-vec2(rgb.g))/sum;
+         }
+-        /* IRIS_26776_CLAUDE_PRE_OWNERSHIP_CFA_VALIDITY
+-         * Claude's ~2 px diagnosis must be proven as a real alternating chroma phase, not inferred
+-         * from a single 2x2 material edge. Separately, physically weak CFA support may authorize
+-         * cleanup only at a high-gradient edge. Both tests happen before material/color ownership,
+-         * so false reconstructed hue cannot protect itself. Final-JPEG brightness is never used. */
+-        float seedAgreement26776(vec2 a,vec2 b){return dot(a,b)/max(length(a)*length(b),1.0e-7);}
+-        float axisPeriodicRisk26776(ivec2 p,ivec2 d){
+-            vec2 cm2=materialChromaAt(p-2*d),cm1=materialChromaAt(p-d);
+-            vec2 c0=materialChromaAt(p),cp1=materialChromaAt(p+d),cp2=materialChromaAt(p+2*d);
+-            vec2 baseline=(cm2+4.0*cm1+6.0*c0+4.0*cp1+cp2)*(1.0/16.0);
+-            vec2 centerDev=c0-baseline;
+-            vec2 nearDev=0.5*(cm1+cp1)-baseline;
+-            vec2 farDev=0.5*(cm2+cp2)-baseline;
+-            float centerMag=length(centerDev),nearMag=length(nearDev),farMag=length(farDev);
+-            float nearOpp=smoothstep(0.60,0.92,-seedAgreement26776(centerDev,nearDev));
+-            float farSame=smoothstep(0.55,0.90,seedAgreement26776(centerDev,farDev));
+-            float nearSym=1.0-smoothstep(0.070,0.220,length(cm1-cp1));
+-            float farSym=1.0-smoothstep(0.070,0.220,length(cm2-cp2));
+-            float magnitude=smoothstep(0.012,0.055,min(centerMag,min(nearMag,farMag)));
+-            return nearOpp*farSame*nearSym*farSym*magnitude;
+-        }
+-        float phaseInvalidRisk26776(ivec2 p){
+-            float periodic=max(max(axisPeriodicRisk26776(p,ivec2(1,0)),axisPeriodicRisk26776(p,ivec2(0,1))),
+-                max(axisPeriodicRisk26776(p,ivec2(1,1)),axisPeriodicRisk26776(p,ivec2(1,-1))));
+-            float centerY=yAt(p);
+-            const ivec2 gd[4]=ivec2[4](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1));
+-            float maximumRelativeGradient=0.0;
+-            for(int i=0;i<4;++i){
+-                float qY=yAt(p+gd[i]);
+-                maximumRelativeGradient=max(maximumRelativeGradient,abs(qY-centerY)/max(max(qY,centerY),0.060));
+-            }
+-            float gradientRisk=smoothstep(0.10,0.28,maximumRelativeGradient);
+-            ivec2 base=(safePos(p)/2)*2;
+-            float blockTrust=min(min(physicalColorTrust(base),physicalColorTrust(base+ivec2(1,0))),
+-                min(physicalColorTrust(base+ivec2(0,1)),physicalColorTrust(base+ivec2(1,1))));
+-            float physicallyInvalidEdge=(1.0-blockTrust)*gradientRisk;
+-            /* IRIS_26776_HIGH_GRADIENT_OR_INVALID_GATE
+-             * Strong periodic phase is sufficient at any brightness. Non-periodic cleanup requires
+-             * measured CFA invalidity AND a high-gradient edge; high gradient alone never erases a
+-             * legitimate coherent color boundary. */
+-            return max(periodic,physicallyInvalidEdge);
+-        }
++        /* IRIS_26777_PRE_OWNERSHIP_DILATED_CFA_VALIDITY
++         * uPhaseMask26777 is produced from Resolve RGB periodic evidence plus exact consumed-CFA
++         * channel validity before this seed establishes material/color ownership. Measured CFA
++         * invalidity and its nearby high-gradient support are expanded with a radius-3 soft
++         * separable footprint, matching the Resolve demosaic support rather than only the center. */
+         uint directionMaskAt(ivec2 p){
+             const ivec2 d[8]=ivec2[8](ivec2(0,-1),ivec2(1,0),ivec2(0,1),ivec2(-1,0),ivec2(1,-1),ivec2(1,1),ivec2(-1,1),ivec2(-1,-1));
+             float center=yAt(p); vec2 centerChroma=materialChromaAt(p);
+@@ -1799,8 +1905,13 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float lo=65504.0; float hi=0.0; float centerContinuation=0.0; float centerWithinDelta=65504.0;
+             float brighterNeutralSupport=0.0;
+             float centerTrust=physicalColorTrust(p);
+-            int phaseInvalid26776=phaseInvalidRisk26776(p)>0.42?1:0;
+-            float phaseColorOwnershipPermission=phaseInvalid26776!=0?0.0:1.0;
++            uvec4 phasePacked26777=imageLoad(uPhaseMask26777,safePos(p));
++            float periodicRisk26777=float(phasePacked26777.r)/65535.0;
++            float dilatedCfaInvalidity26777=float(phasePacked26777.g)/65535.0;
++            float dilatedGradientRisk26777=float(phasePacked26777.b)/65535.0;
++            float phaseRisk26777=max(periodicRisk26777,dilatedCfaInvalidity26777*dilatedGradientRisk26777);
++            int phaseInvalid26777=phaseRisk26777>0.42?1:0;
++            float phaseColorOwnershipPermission=phaseInvalid26777!=0?0.0:1.0;
+             for(int i=0;i<8;++i){
+                 float first=yAt(p+d[i]); float second=yAt(p+d[i]*2);
+                 vec2 firstChroma=materialChromaAt(p+d[i]);
+@@ -1833,7 +1944,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 smoothstep(0.55,0.82,centerContinuation)*phaseColorOwnershipPermission;
+             float highlightColorOwnershipPermission=max(inheritedHighlightPermission,realBrightColorProof);
+             int highlightInvalidCleanup=(1.0-highlightColorOwnershipPermission)>0.35?1:0;
+-            /* IRIS_26776_PHASE_INVALID_CANNOT_SELF_PROTECT
++            /* IRIS_26777_DILATED_PHASE_INVALID_CANNOT_SELF_PROTECT
+              * Bit 15 is an upstream ownership veto: a proven CFA-periodic/high-gradient center may
+              * receive cleanup, but its reconstructed hue cannot establish material protection. */
+             /* IRIS_26733_EARLY_ACHROMATIC_STRUCTURE_OWNER
+@@ -1876,7 +1987,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+              * into this suspicious center, but trusted neighbors must never pull from it. */
+             return uint(mask | (count << 8) | (cleanupFallback << 12) |
+                 (highlightInvalidCleanup << 13) | (neutralStructure << 14) |
+-                (phaseInvalid26776 << 15));
++                (phaseInvalid26777 << 15));
+         }
+         uvec4 toYccd(vec3 rgb,uint direction){
+             float sum=rgb.r+2.0*rgb.g+rgb.b+1.0;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+index 776b4c27d5c72c8c2353c46396d806fc8069ed8a..fd8b3ec7ba926e46237975f1db6439ee233ab24a 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt
+@@ -1,7 +1,6 @@
+ package com.hinnka.mycamera.processor
+ 
+ import com.hinnka.mycamera.utils.PLog
+-import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings
+ import java.io.File
+ 
+ /**
+@@ -39,7 +38,6 @@ internal class GlesIris26545SabreProcessor(
+     /* IRIS_26762_FROZEN_ADAPTIVE_CHROMA_TRANSPORT */
+     private val adaptiveSnrChromaDenoise: Float = 1f,
+     private val residualChromaCustom: Boolean = false,
+-    private val edgeFalseColor26778: IrisMotionSettings.EdgeFalseColorTunables.Snapshot = IrisMotionSettings.EdgeFalseColorTunables.defaults(),
+     /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT: no acquisition authority. */
+     private val referenceProtectionEv: Float = 0f,
+ ) {
+@@ -137,7 +135,6 @@ internal class GlesIris26545SabreProcessor(
+             highZoomSourceZoom = highZoomSourceZoom,
+             adaptiveSnrChromaDenoise = adaptiveSnrChromaDenoise,
+             residualChromaCustom = residualChromaCustom,
+-            edgeFalseColor26778 = edgeFalseColor26778,
+             referenceProtectionEv = referenceProtectionEv,
+         ).processFrames(admitted)
+     }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index 243c3afda147a6b0e8e5a796d999c654f21b6b50..17741238c7a369e6cf67dd7267cdde556e3de754 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -1,7 +1,6 @@
+ package com.hinnka.mycamera.processor
+ 
+ import com.hinnka.mycamera.utils.PLog
+-import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings
+ import java.io.File
+ 
+ /**
+@@ -39,7 +38,6 @@ internal class GlesMgcRawFusion(
+     /* IRIS_26762_FROZEN_ADAPTIVE_CHROMA_TRANSPORT */
+     private val adaptiveSnrChromaDenoise: Float = 1f,
+     private val residualChromaCustom: Boolean = false,
+-    private val edgeFalseColor26778: IrisMotionSettings.EdgeFalseColorTunables.Snapshot = IrisMotionSettings.EdgeFalseColorTunables.defaults(),
+     /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT: downstream fusion context only. */
+     private val referenceProtectionEv: Float = 0f,
+ ) {
+@@ -74,7 +72,6 @@ internal class GlesMgcRawFusion(
+             highZoomSourceZoom = highZoomSourceZoom,
+             adaptiveSnrChromaDenoise = adaptiveSnrChromaDenoise,
+             residualChromaCustom = residualChromaCustom,
+-            edgeFalseColor26778 = edgeFalseColor26778,
+             referenceProtectionEv = referenceProtectionEv,
+         ).processFrames(frames)
+     }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index d0798a7781f34421a4fcca67b0ce603ffda7b51d..b7340c1297beaf4e3f90d349ad216aacb0b9eba3 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -15,7 +15,6 @@ import com.hinnka.mycamera.raw.MgcSpatialStrengthMap
+ import com.hinnka.mycamera.utils.LargeDirectBuffer
+ import com.hinnka.mycamera.utils.PLog
+ import com.particlesdevs.photoncamera.processing.IrisTrue2xSrNative
+-import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings
+ import com.particlesdevs.photoncamera.util.MotionTrace
+ import java.io.BufferedOutputStream
+ import java.io.File
+@@ -107,7 +106,6 @@ internal class GlesMgcRawSpatialStacker(
+     /* IRIS_26762_FROZEN_ADAPTIVE_CHROMA_OWNER */
+     private val adaptiveSnrChromaDenoise: Float = 1f,
+     private val residualChromaCustom: Boolean = false,
+-    private val edgeFalseColor26778: IrisMotionSettings.EdgeFalseColorTunables.Snapshot = IrisMotionSettings.EdgeFalseColorTunables.defaults(),
+     /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT
+      * Read-only selected-reference protection metadata; never writes capture state. */
+     private val referenceProtectionEv: Float = 0f,
+@@ -681,7 +679,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreDehomogenizeProgram = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreOutputTransformFloatProgram = 0
+-    private var edgeFalseColorSuppressor26778Program = 0
+     private var sabreExtendedHdrRestoreProgram = 0
+     private var sabreExtendedHdrTelemetryProbeProgram = 0
+     private var sabreRgb16ToFloatProgram = 0
+@@ -2228,10 +2225,12 @@ internal class GlesMgcRawSpatialStacker(
+         )
+         PLog.i(
+             SABRE_TAG,
+-            "IRIS_26776_CLAUDE_CFA_CHROMA_OWNER commonSourceClipGuard=true " +
++            "IRIS_26777_CLAUDE_RESOLVE_SUPPORT_FOOTPRINT commonSourceClipGuard=true " +
+                 "sourceValidityFootprint=EXACT_CONSUMED_3X3 sharedRgbTemporalWeight=true " +
++                "resolveSupportDilationRadius=3 resolveSupportFeather=SEPARABLE_SOFT_MAX " +
+                 "phaseValidity=PRE_VGN_MATERIAL_OWNERSHIP periodicProof=FIVE_TAP_2PX " +
+-                "invalidEdgeRequiresMeasuredCfaWeakness=true chromaMedianPasses=1 lumaModified=false",
++                "invalidEdgeRequiresMeasuredCfaWeakness=true chromaMedianPasses=1 " +
++                "phaseInvalidFloorResurrection=false lumaModified=false",
+         )
+         if (shadowLongFrameCount > 0) {
+             PLog.i(
+@@ -2482,14 +2481,11 @@ internal class GlesMgcRawSpatialStacker(
+                 frameCount = normalFrameCount,
+                 mergeGradientThreshold = sabreMergeGradientThreshold,
+             )
+-            val sabreResolveBaseParameters26778 = MgcSabreResolveTuning.build(
++            val sabreResolveParameters = MgcSabreResolveTuning.build(
+                 referenceSnr = kernelTuning.referenceSnr,
+                 desiredExposureProduct = frames.first().desiredExposureProduct,
+                 actualExposureProduct = frames.first().exposureProduct,
+             )
+-            val sabreResolveParameters = sabreResolveBaseParameters26778.copy(
+-                demosaicSharpness = (sabreResolveBaseParameters26778.demosaicSharpness * edgeFalseColor26778.demosaicSharpness).coerceIn(0f, 1f),
+-            )
+             val referenceCalibration = calibrationForFrame(
+                 frame = frames.first(),
+                 exposureScale = 1f,
+@@ -3072,9 +3068,7 @@ internal class GlesMgcRawSpatialStacker(
+                     "gains=${sabreResolveFinalGains.contentToString()} " +
+                     "demosaicWhite=$demosaicWhiteLevel " +
+                     "outputWhite=${sabreResolveParameters.outputWhiteLevel} " +
+-                    "demosaicSharpness=${sabreResolveParameters.demosaicSharpness} " +
+-                    "demosaicSharpnessBase26778=${sabreResolveBaseParameters26778.demosaicSharpness} " +
+-                    "demosaicSharpnessTunable26778=${edgeFalseColor26778.demosaicSharpness}",
++                    "demosaicSharpness=${sabreResolveParameters.demosaicSharpness}",
+             )
+             MgcSabreResolver.resolve(
+                 accumulatedColorRgba16f = sabreAccumulatedReadback,
+@@ -3131,17 +3125,6 @@ internal class GlesMgcRawSpatialStacker(
+                     program = sabreOutputTransformFloatProgram,
+                 )
+                 PLog.i(SABRE_TAG, "IRIS_26699_HDR_PROBE_BARRIER_REMOVED stage=FLOAT_HDR_HANDOFF_PRE_VGN productionHdrUnchanged=true")
+-                if (edgeFalseColor26778.enabled) {
+-                    val tmp26778 = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-                    try {
+-                        val counts26778 = runEdgeFalseColorSuppressor26778(physicalHdr26605, tmp26778)
+-                        PLog.i(SABRE_TAG, "IRIS_26778_EDGE_FALSE_COLOR_SUPPRESSOR gateGt05Pass1=${counts26778[0]} blendGt05Pass1=${counts26778[1]} blendGt05Pass2=${counts26778[2]} passes=2 settingsSource=${edgeFalseColor26778.source} lumaPreserved=true alphaPreserved=true clipGate=false periodicGate=false physicalWhiteScale=1.0 physicalWhiteOwner=DEMOSAIC_WHITE_NORMALIZED magnitudeOwner=CLEANED_PHYSICAL_HDR noiseFloor=${edgeFalseColor26778.noiseFloor} contrastLo=${edgeFalseColor26778.contrastLo} contrastHi=${edgeFalseColor26778.contrastHi} outlierLo=${edgeFalseColor26778.outlierLo} outlierHi=${edgeFalseColor26778.outlierHi}")
+-                    } finally {
+-                        releaseOwnedTexture(tmp26778, "26778 edge false-color ping-pong")
+-                    }
+-                } else {
+-                    PLog.i(SABRE_TAG, "IRIS_26778_EDGE_FALSE_COLOR_SUPPRESSOR enabled=false passes=0 settingsSource=${edgeFalseColor26778.source} physicalWhiteScale=1.0 physicalWhiteOwner=DEMOSAIC_WHITE_NORMALIZED magnitudeOwner=CLEANED_PHYSICAL_HDR")
+-                }
+             }
+             renderSabreOutputTransform(
+                 resolvedRgbPlanes = nativeResolvedPlanes,
+@@ -3176,7 +3159,6 @@ internal class GlesMgcRawSpatialStacker(
+                 sabreValidWeights = accumulatedValidity26614,
+                 sabreValidityWeightScale = validityWeightScale26614,
+                 preVgnPhysicalRgb = physicalHdr26605,
+-                vgnSeedPhysicalRgb26778 = if (edgeFalseColor26778.enabled) physicalHdr26605 else 0,
+             )
+             releaseOwnedTexture(sabreRSupport26613, "26613 Sabre R support provenance")
+             releaseOwnedTexture(accumulatedValidity26614, "26614 Sabre channel validity provenance")
+@@ -5617,7 +5599,7 @@ internal class GlesMgcRawSpatialStacker(
+         gridWidth: Int,
+         gridHeight: Int,
+         label: String,
+-    ): IntArray {
++    ): Pair<Int, Int> {
+         val geometryMask = createTexture(gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_NEAREST)
+         val boundaryMask = createTexture(gridWidth, gridHeight, GLES30.GL_R8, GLES30.GL_NEAREST)
+         try {
+@@ -6195,6 +6177,103 @@ internal class GlesMgcRawSpatialStacker(
+         val aboveFraction = if (normalizedMax.isNotEmpty()) {
+             aboveNominalWhite.toFloat() / normalizedMax.size.toFloat()
+         } else Float.NaN
++        /* IRIS_26777_RESOLVE_PRE_VGN_PHASE_DIAGNOSTIC
++         * Claude's stage-isolation check runs on the ResolveSabre planar RGB buffer that already
++         * exists on CPU; no extra GPU readback, stage replay, or diagnostic APK is introduced.
++         * Sparse 32px centers count the same five-tap ~2px alternating chroma signature before VGN. */
++        fun smooth26777(a: Float, b: Float, x: Float): Float {
++            val q = ((x - a) / (b - a)).coerceIn(0f, 1f)
++            return q * q * (3f - 2f * q)
++        }
++        fun normalizedChannel26777(channel: Int, x: Int, y: Int): Float {
++            val p = y * width + x
++            val value = values.get(channel * pixelCount + p).toInt() and 0xffff
++            return max(
++                0f,
++                (value.toFloat() - finalBlackLevel[channel]) /
++                    max(1f, demosaicWhiteLevel - finalBlackLevel[channel]),
++            )
++        }
++        fun chroma26777(x: Int, y: Int, rb: Boolean): Float {
++            val r = normalizedChannel26777(0, x, y)
++            val g = normalizedChannel26777(1, x, y)
++            val b = normalizedChannel26777(2, x, y)
++            val denom = max(r + 2f * g + b, 1f / 65535f)
++            return ((if (rb) r else b) - g) / denom
++        }
++        fun agreement26777(ax: Float, ay: Float, bx: Float, by: Float): Float {
++            val denom = max(kotlin.math.sqrt(ax * ax + ay * ay) * kotlin.math.sqrt(bx * bx + by * by), 1e-7f)
++            return (ax * bx + ay * by) / denom
++        }
++        fun axisPeriodic26777(x: Int, y: Int, dx: Int, dy: Int): Float {
++            val rm2 = chroma26777(x - 2 * dx, y - 2 * dy, true)
++            val bm2 = chroma26777(x - 2 * dx, y - 2 * dy, false)
++            val rm1 = chroma26777(x - dx, y - dy, true)
++            val bm1 = chroma26777(x - dx, y - dy, false)
++            val r0 = chroma26777(x, y, true)
++            val b0 = chroma26777(x, y, false)
++            val rp1 = chroma26777(x + dx, y + dy, true)
++            val bp1 = chroma26777(x + dx, y + dy, false)
++            val rp2 = chroma26777(x + 2 * dx, y + 2 * dy, true)
++            val bp2 = chroma26777(x + 2 * dx, y + 2 * dy, false)
++            val baseR = (rm2 + 4f * rm1 + 6f * r0 + 4f * rp1 + rp2) / 16f
++            val baseB = (bm2 + 4f * bm1 + 6f * b0 + 4f * bp1 + bp2) / 16f
++            val cR = r0 - baseR; val cB = b0 - baseB
++            val nR = 0.5f * (rm1 + rp1) - baseR; val nB = 0.5f * (bm1 + bp1) - baseB
++            val fR = 0.5f * (rm2 + rp2) - baseR; val fB = 0.5f * (bm2 + bp2) - baseB
++            val cM = kotlin.math.sqrt(cR * cR + cB * cB)
++            val nM = kotlin.math.sqrt(nR * nR + nB * nB)
++            val fM = kotlin.math.sqrt(fR * fR + fB * fB)
++            val nearOpp = smooth26777(0.60f, 0.92f, -agreement26777(cR, cB, nR, nB))
++            val farSame = smooth26777(0.55f, 0.90f, agreement26777(cR, cB, fR, fB))
++            val nearDelta = kotlin.math.sqrt((rm1 - rp1) * (rm1 - rp1) + (bm1 - bp1) * (bm1 - bp1))
++            val farDelta = kotlin.math.sqrt((rm2 - rp2) * (rm2 - rp2) + (bm2 - bp2) * (bm2 - bp2))
++            val nearSym = 1f - smooth26777(0.070f, 0.220f, nearDelta)
++            val farSym = 1f - smooth26777(0.070f, 0.220f, farDelta)
++            val magnitude = smooth26777(0.012f, 0.055f, minOf(cM, nM, fM))
++            return nearOpp * farSame * nearSym * farSym * magnitude
++        }
++        fun luma26777(x: Int, y: Int): Float =
++            0.25f * normalizedChannel26777(0, x, y) +
++                0.5f * normalizedChannel26777(1, x, y) +
++                0.25f * normalizedChannel26777(2, x, y)
++        var resolvePhaseSampled26777 = 0
++        var resolvePeriodic26777 = 0
++        var resolveHighGradientPeriodic26777 = 0
++        val resolvePhaseStride26777 = 32
++        var yy26777 = 2
++        while (yy26777 < height - 2) {
++            var xx26777 = 2
++            while (xx26777 < width - 2) {
++                val periodic26777 = maxOf(
++                    axisPeriodic26777(xx26777, yy26777, 1, 0),
++                    axisPeriodic26777(xx26777, yy26777, 0, 1),
++                    axisPeriodic26777(xx26777, yy26777, 1, 1),
++                    axisPeriodic26777(xx26777, yy26777, 1, -1),
++                )
++                val cy26777 = luma26777(xx26777, yy26777)
++                var gradient26777 = 0f
++                val gx26777 = intArrayOf(1, -1, 0, 0)
++                val gy26777 = intArrayOf(0, 0, 1, -1)
++                for (i26777 in 0..3) {
++                    val qy26777 = luma26777(xx26777 + gx26777[i26777], yy26777 + gy26777[i26777])
++                    gradient26777 = max(gradient26777, kotlin.math.abs(qy26777 - cy26777) / max(max(qy26777, cy26777), 0.060f))
++                }
++                resolvePhaseSampled26777++
++                if (periodic26777 > 0.42f) {
++                    resolvePeriodic26777++
++                    if (gradient26777 > 0.28f) resolveHighGradientPeriodic26777++
++                }
++                xx26777 += resolvePhaseStride26777
++            }
++            yy26777 += resolvePhaseStride26777
++        }
++        val phaseDetails26777 =
++            "stage=RESOLVE_PRE_VGN stride=$resolvePhaseStride26777 sampled=$resolvePhaseSampled26777 " +
++                "periodic2Px=$resolvePeriodic26777 highGradientPeriodic2Px=$resolveHighGradientPeriodic26777"
++        PLog.i(SABRE_TAG, "IRIS_26777_RESOLVE_PRE_VGN_PHASE_DIAGNOSTIC $phaseDetails26777")
++        MotionTrace.processingState("IRIS_26777_RESOLVE_PRE_VGN_PHASE_DIAGNOSTIC", phaseDetails26777)
++
+         val details =
+             "stage=RESOLVE_PRE_NORMALIZED_OUTPUT samples=${normalizedMax.size} step=$sampleStep " +
+                 "codeMin=${minimum.contentToString()} codeMax=${maximum.contentToString()} " +
+@@ -6239,69 +6318,6 @@ internal class GlesMgcRawSpatialStacker(
+             exportFullSizeTexture = exportGpuLinearRgbSource,
+         )
+ 
+-    private fun runEdgeFalseColorSuppressor26778(
+-        sourceAndFinal: Int,
+-        temporary: Int,
+-    ): Pair<Int, Int> {
+-        check(edgeFalseColorSuppressor26778Program != 0) { "26778 edge false-color program unavailable" }
+-        val ids = IntArray(1)
+-        GLES31.glGenBuffers(1, ids, 0)
+-        val statsBuffer = ids[0]
+-        check(statsBuffer != 0) { "26778 edge false-color stats buffer allocation failed" }
+-        buffers += statsBuffer
+-        var mapped = false
+-        try {
+-            val zero = ByteBuffer.allocateDirect(Int.SIZE_BYTES * 3).order(ByteOrder.nativeOrder()).apply { putInt(0); putInt(0); putInt(0); rewind() }
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
+-            GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, Int.SIZE_BYTES * 3, zero, GLES31.GL_STREAM_READ)
+-            GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, statsBuffer)
+-            fun dispatch26778(source: Int, destination: Int, statsPass: Int) {
+-                check(source != destination) { "26778 ping-pong source/destination alias" }
+-                GLES31.glUseProgram(edgeFalseColorSuppressor26778Program)
+-                bindTexture(edgeFalseColorSuppressor26778Program, "uSrc", 0, source)
+-                GLES31.glBindImageTexture(1, destination, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+-                uniform1f(edgeFalseColorSuppressor26778Program, "uNoiseFloor", edgeFalseColor26778.noiseFloor)
+-                uniform1f(edgeFalseColorSuppressor26778Program, "uContrastLo", edgeFalseColor26778.contrastLo)
+-                uniform1f(edgeFalseColorSuppressor26778Program, "uContrastHi", edgeFalseColor26778.contrastHi)
+-                uniform1f(edgeFalseColorSuppressor26778Program, "uOutlierLo", edgeFalseColor26778.outlierLo)
+-                uniform1f(edgeFalseColorSuppressor26778Program, "uOutlierHi", edgeFalseColor26778.outlierHi)
+-                uniform1i(edgeFalseColorSuppressor26778Program, "uStatsPass", statsPass)
+-                GLES31.glDispatchCompute(GlesComputeWorkGroup.imageGroupCount(width), GlesComputeWorkGroup.imageGroupCount(height), 1)
+-                GlesGpuScheduler.memoryBarrier()
+-            }
+-            dispatch26778(sourceAndFinal, temporary, statsPass = 1)
+-            dispatch26778(temporary, sourceAndFinal, statsPass = 2)
+-            GLES31.glBindImageTexture(1, 0, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+-            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+-            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+-            GLES31.glUseProgram(0)
+-            checkGlError("26778 edge false-color two-pass submit")
+-            GlesGpuCompletion.awaitSubmittedWork(label = "26778 edge false-color two-pass", checkGlError = ::checkGlError)
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
+-            val bb = GLES31.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER, 0, Int.SIZE_BYTES * 3, GLES31.GL_MAP_READ_BIT) as? ByteBuffer
+-                ?: error("Unable to map 26778 edge false-color stats")
+-            mapped = true
+-            val native = bb.order(ByteOrder.nativeOrder())
+-            val gate = native.getInt(0)
+-            val blendPass1 = native.getInt(Int.SIZE_BYTES)
+-            val blendPass2 = native.getInt(Int.SIZE_BYTES * 2)
+-            check(GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)) { "26778 edge false-color stats buffer invalid" }
+-            mapped = false
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+-            val pixels = Math.multiplyExact(width, height)
+-            check(gate in 0..pixels && blendPass1 in 0..pixels && blendPass2 in 0..pixels) { "26778 edge false-color stats out of range gate=$gate blendPass1=$blendPass1 blendPass2=$blendPass2 pixels=$pixels" }
+-            return intArrayOf(gate, blendPass1, blendPass2)
+-        } finally {
+-            if (mapped) {
+-                GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
+-                GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)
+-            }
+-            GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 0)
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+-            if (buffers.remove(statsBuffer)) GLES31.glDeleteBuffers(1, intArrayOf(statsBuffer), 0)
+-        }
+-    }
+-
+     private fun renderSabreRgb16ToFloat(source: Int, target: Int) {
+         check(sabreRgb16ToFloatProgram != 0) {
+             "MGC Sabre VGN RGB16-to-float program is not initialized"
+@@ -6614,10 +6630,6 @@ internal class GlesMgcRawSpatialStacker(
+                 GlesMgcRawSabreShaders.outputTransformFloat,
+                 "iris_26605_sabre_output_transform_rgba16f_physical_hdr",
+             )
+-            edgeFalseColorSuppressor26778Program = linkComputeProgram(
+-                EDGE_FALSE_COLOR_SUPPRESSOR_26778,
+-                "iris_26778_edge_false_color_suppressor",
+-            )
+             sabreExtendedHdrRestoreProgram = linkProgram(
+                 GlesMgcRawSabreShaders.restoreExtendedHdrAfterVgn,
+                 "iris_26605_sabre_post_vgn_extended_hdr_restore",
+@@ -14994,128 +15006,6 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private val EDGE_FALSE_COLOR_SUPPRESSOR_26778 = """
+-        #version 310 es
+-        // Edge false-color suppressor (reference implementation)
+-        //
+-        // WHERE: run on the reconstructed linear camera-RGB texture (RGBA16F), AFTER
+-        //        Resolve/merge and BEFORE VGN / residual denoise / protected-chroma
+-        //        floor / exposure match / tone. Feed its output to everything
+-        //        downstream (JPEG carrier and anything that derives the DNG sidecar
+-        //        from RGB).
+-        // WHAT:  at high local luminance contrast, replace isolated chroma outliers
+-        //        (R-G, B-G measured in sqrt domain) with the 3x3 median chroma.
+-        //        Luma is preserved. No clipping test and no periodicity test.
+-        // RUN:   two passes, ping-pong (src -> tmp -> dst). Pass 1 fixes the outer
+-        //        fringe pixel, pass 2 fixes the second pixel of the 2px band.
+-        
+-        precision highp float;
+-        precision highp int;
+-        precision highp sampler2D;
+-        
+-        layout(local_size_x = 8, local_size_y = 8) in;
+-        uniform sampler2D uSrc;                                    // linear RGBA16F
+-        layout(rgba16f, binding = 1) writeonly uniform highp image2D uDst;
+-        layout(std430, binding = 0) buffer Iris26778Stats { uint gateGt05; uint blendGt05Pass1; uint blendGt05Pass2; };
+-        uniform int uStatsPass;
+-        
+-        uniform float uNoiseFloor;   // linear floor, ~0.002 of nominal white
+-        uniform float uContrastLo;   // log2(max/min) where gate starts   (default 2.0 = 4x)
+-        uniform float uContrastHi;   // log2(max/min) where gate is full  (default 3.5 = ~11x)
+-        uniform float uOutlierLo;    // sqrt-domain chroma deviation start (default 0.03)
+-        uniform float uOutlierHi;    // sqrt-domain chroma deviation full  (default 0.10)
+-        
+-        float lumaOf(vec3 c) { return 0.25 * c.r + 0.5 * c.g + 0.25 * c.b; }
+-        
+-        void s(inout float a, inout float b) {
+-          float t = min(a, b);
+-          b = max(a, b);
+-          a = t;
+-        }
+-        
+-        // Classic 19-exchange median-of-9 network.
+-        float median9(float p0, float p1, float p2, float p3, float p4,
+-                      float p5, float p6, float p7, float p8) {
+-          s(p1, p2); s(p4, p5); s(p7, p8);
+-          s(p0, p1); s(p3, p4); s(p6, p7);
+-          s(p1, p2); s(p4, p5); s(p7, p8);
+-          s(p0, p3); s(p5, p8); s(p4, p7);
+-          s(p3, p6); s(p1, p4); s(p2, p5);
+-          s(p4, p7); s(p4, p2); s(p6, p4);
+-          s(p4, p2);
+-          return p4;
+-        }
+-        
+-        vec3 fetchLin(ivec2 p, ivec2 sz) {
+-          return max(texelFetch(uSrc, clamp(p, ivec2(0), sz - ivec2(1)), 0).rgb, vec3(0.0));
+-        }
+-        
+-        void main() {
+-          ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+-          ivec2 sz = textureSize(uSrc, 0);
+-          if (p.x >= sz.x || p.y >= sz.y) return;
+-        
+-          vec4 c0 = texelFetch(uSrc, p, 0);
+-        
+-          // 1) local luminance contrast over 5x5 (linear light)
+-          float ymin = 1e9;
+-          float ymax = 0.0;
+-          for (int j = -2; j <= 2; j++) {
+-            for (int i = -2; i <= 2; i++) {
+-              float y = lumaOf(fetchLin(p + ivec2(i, j), sz));
+-              ymin = min(ymin, y);
+-              ymax = max(ymax, y);
+-            }
+-          }
+-          float contrast = log2((ymax + uNoiseFloor) / (ymin + uNoiseFloor));
+-          float gate = smoothstep(uContrastLo, uContrastHi, contrast);
+-          if (uStatsPass == 1 && gate > 0.5) atomicAdd(gateGt05, 1u);
+-          if (gate <= 0.0) {
+-            imageStore(uDst, p, c0);
+-            return;
+-          }
+-        
+-          // 2) 3x3 median of sqrt-domain chroma differences
+-          float d1[9];
+-          float d2[9];
+-          int k = 0;
+-          for (int j = -1; j <= 1; j++) {
+-            for (int i = -1; i <= 1; i++) {
+-              vec3 sq = sqrt(fetchLin(p + ivec2(i, j), sz));
+-              d1[k] = sq.r - sq.g;
+-              d2[k] = sq.b - sq.g;
+-              k++;
+-            }
+-          }
+-          float m1 = median9(d1[0], d1[1], d1[2], d1[3], d1[4], d1[5], d1[6], d1[7], d1[8]);
+-          float m2 = median9(d2[0], d2[1], d2[2], d2[3], d2[4], d2[5], d2[6], d2[7], d2[8]);
+-        
+-          // 3) only touch pixels whose chroma disagrees with their neighbourhood
+-          vec3 lin0 = max(c0.rgb, vec3(0.0));
+-          vec3 s0 = sqrt(lin0);
+-          float e1 = s0.r - s0.g;
+-          float e2 = s0.b - s0.g;
+-          float dev = length(vec2(e1 - m1, e2 - m2));
+-          float w = gate * smoothstep(uOutlierLo, uOutlierHi, dev);
+-          if (w > 0.5) {
+-            if (uStatsPass == 1) atomicAdd(blendGt05Pass1, 1u);
+-            else if (uStatsPass == 2) atomicAdd(blendGt05Pass2, 1u);
+-          }
+-        
+-          float n1 = mix(e1, m1, w);
+-          float n2 = mix(e2, m2, w);
+-        
+-          // 4) rebuild RGB around the unchanged G, then restore luma exactly
+-          vec3 s1 = max(vec3(s0.g + n1, s0.g, s0.g + n2), vec3(0.0));
+-          vec3 rgb1 = s1 * s1;
+-          float y0 = lumaOf(lin0);
+-          float y1 = lumaOf(rgb1);
+-          rgb1 *= (y1 > 1e-8) ? (y0 / y1) : 1.0;
+-        
+-          imageStore(uDst, p, vec4(rgb1, c0.a));
+-        }
+-    """.trimIndent()
+-
+     private companion object {
+         fun gaussianKernel(size: Int, sigma: Float): FloatArray {
+             require(size > 0)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+index 0ce0dafd2c865bb43ccdc16c212bb9fafffd2655..175b713e1c276c17018581351d93ea75e372da14 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+@@ -3,8 +3,6 @@ package com.particlesdevs.photoncamera.processing.processor;
+ import com.particlesdevs.photoncamera.app.PhotonCamera;
+ import com.particlesdevs.photoncamera.settings.PreferenceKeys;
+ import com.particlesdevs.photoncamera.settings.SettingsManager;
+-import com.particlesdevs.photoncamera.settings.TunableInjector;
+-import com.particlesdevs.photoncamera.settings.annotations.Tunable;
+ 
+ import java.util.Locale;
+ 
+@@ -55,42 +53,6 @@ public final class IrisMotionSettings {
+ 
+     private IrisMotionSettings() {}
+ 
+-    /* IRIS_26778_CLAUDE_EDGE_FALSE_COLOR_TUNABLES */
+-    public static final class EdgeFalseColorTunables {
+-        @Tunable(title = "Edge False Color Suppressor", category = "Demosaic", description = "Two-pass post-Resolve/pre-VGN isolated chroma outlier suppression. 1 = on.", min = 0f, max = 1f, step = 1f, defaultValue = 1f)
+-        public int enabled = 1;
+-        @Tunable(title = "Edge False Color Noise Floor", category = "Demosaic", description = "Claude uNoiseFloor.", min = 0f, max = 0.02f, step = 0.0001f, defaultValue = 0.002f)
+-        public float noiseFloor = 0.002f;
+-        @Tunable(title = "Edge False Color Contrast Low", category = "Demosaic", description = "Claude uContrastLo.", min = 0f, max = 8f, step = 0.1f, defaultValue = 2.0f)
+-        public float contrastLo = 2.0f;
+-        @Tunable(title = "Edge False Color Contrast High", category = "Demosaic", description = "Claude uContrastHi.", min = 0f, max = 8f, step = 0.1f, defaultValue = 3.5f)
+-        public float contrastHi = 3.5f;
+-        @Tunable(title = "Edge False Color Outlier Low", category = "Demosaic", description = "Claude uOutlierLo.", min = 0f, max = 0.25f, step = 0.001f, defaultValue = 0.03f)
+-        public float outlierLo = 0.03f;
+-        @Tunable(title = "Edge False Color Outlier High", category = "Demosaic", description = "Claude uOutlierHi.", min = 0f, max = 0.5f, step = 0.001f, defaultValue = 0.10f)
+-        public float outlierHi = 0.10f;
+-        @Tunable(title = "Sabre Demosaic Sharpness", category = "Demosaic", description = "Multiplier over recovered MGC demosaic sharpness. 1 = unchanged, 0 = A/B off.", min = 0f, max = 1f, step = 0.1f, defaultValue = 1f)
+-        public float demosaicSharpness = 1f;
+-
+-        public static Snapshot current() {
+-            EdgeFalseColorTunables values = new EdgeFalseColorTunables();
+-            TunableInjector.inject(values);
+-            float cLo = clamp(values.contrastLo, 0f, 8f);
+-            float cHi = Math.max(cLo + 0.0001f, clamp(values.contrastHi, 0f, 8f));
+-            float oLo = clamp(values.outlierLo, 0f, 0.25f);
+-            float oHi = Math.max(oLo + 0.0001f, clamp(values.outlierHi, 0f, 0.5f));
+-            return new Snapshot(values.enabled != 0, clamp(values.noiseFloor, 0f, 0.02f), cLo, cHi, oLo, oHi, clamp(values.demosaicSharpness, 0f, 1f), "LIVE_TUNABLES");
+-        }
+-        public static Snapshot defaults() { return new Snapshot(true, 0.002f, 2.0f, 3.5f, 0.03f, 0.10f, 1.0f, "DEFAULTS"); }
+-        private static float clamp(float value, float min, float max) { if (!Float.isFinite(value)) return min; return Math.max(min, Math.min(max, value)); }
+-        public static final class Snapshot {
+-            public final boolean enabled; public final float noiseFloor, contrastLo, contrastHi, outlierLo, outlierHi, demosaicSharpness; public final String source;
+-            Snapshot(boolean enabled, float noiseFloor, float contrastLo, float contrastHi, float outlierLo, float outlierHi, float demosaicSharpness, String source) {
+-                this.enabled = enabled; this.noiseFloor = noiseFloor; this.contrastLo = contrastLo; this.contrastHi = contrastHi; this.outlierLo = outlierLo; this.outlierHi = outlierHi; this.demosaicSharpness = demosaicSharpness; this.source = source;
+-            }
+-        }
+-    }
+-
+     public static boolean isLocalLaplacianToneEnabled() {
+         /* IRIS_26704_LOCAL_LAPLACIAN_PERMANENT_OFF
+          * The A/B implementation remains available in source for rollback, but the active Iris
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 9faabdfae59a7fb678f1ced14fdd7d52d1d714ab..d89e371e40c0bb0ceb1950fc43afc3ced96942a1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -267,7 +267,6 @@ object PhotonMotionMgc1271Bridge {
+              * Auto/Custom ownership decision available to Super Res before residual denoise. */
+             val adaptiveSnrChroma26762 = irisSettings.adaptiveSnrChromaDenoise.coerceIn(0.5f, 2.0f)
+             val frozenResidualChromaCustom26762 = !parameters.irisNightActive && irisSettings.residualChromaCustom
+-            val edgeFalseColor26778 = IrisMotionSettings.EdgeFalseColorTunables.current()
+ 
+             if (irisSettings.customNoiseModelEnabled) {
+                 val profile = IrisNoiseProfileStore.loadSelectedProfile(
+@@ -499,7 +498,6 @@ object PhotonMotionMgc1271Bridge {
+                 /* IRIS_26762_FROZEN_ADAPTIVE_CHROMA_TRANSPORT */
+                 adaptiveSnrChromaDenoise = adaptiveSnrChroma26762,
+                 residualChromaCustom = frozenResidualChromaCustom26762,
+-                edgeFalseColor26778 = edgeFalseColor26778,
+                 /* IRIS_26675_PROTECTED_NORMAL_SHORT_ADMISSION_CONTEXT
+                  * Read-only downstream context. This value is already frozen from the selected
+                  * 26674 NORMAL reference and cannot alter sensor/ZSL/capture exposure ownership. */
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/TunableRegistry.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/TunableRegistry.java
+index 18dd0c88dcdafc096a4f1d86ab5674182415d2c6..6dda7362dcb930d8a4da82d3004f31f42cdafbad 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/TunableRegistry.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/TunableRegistry.java
+@@ -25,6 +25,5 @@ public final class TunableRegistry {
+         com.particlesdevs.photoncamera.processing.opengl.postpipeline.ABLC.class,
+         com.particlesdevs.photoncamera.processing.render.Parameters.class,
+         com.particlesdevs.photoncamera.processing.ImageSaverSettings.class,
+-        com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.EdgeFalseColorTunables.class,
+     };
+ }
+diff --git a/app/version.properties b/app/version.properties
+index 7aef26dd340f632ce5b58be8a960e7ce0bcd1cc7..a9bb01e1c8a2300c0f086f74c2015ff5313eb10e 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726778
+-VERSION_BUILD=26778
++VERSION_NAME=0.9726777
++VERSION_BUILD=26777

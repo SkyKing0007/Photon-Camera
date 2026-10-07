@@ -1,0 +1,112 @@
+#version 320 es
+// Edge false-color suppressor (reference implementation)
+//
+// WHERE: run on the reconstructed linear camera-RGB texture (RGBA16F), AFTER
+//        Resolve/merge and BEFORE VGN / residual denoise / protected-chroma
+//        floor / exposure match / tone. Feed its output to everything
+//        downstream (JPEG carrier and anything that derives the DNG sidecar
+//        from RGB).
+// WHAT:  at high local luminance contrast, replace isolated chroma outliers
+//        (R-G, B-G measured in sqrt domain) with the 3x3 median chroma.
+//        Luma is preserved. No clipping test and no periodicity test.
+// RUN:   two passes, ping-pong (src -> tmp -> dst). Pass 1 fixes the outer
+//        fringe pixel, pass 2 fixes the second pixel of the 2px band.
+
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(binding = 0) uniform sampler2D uSrc;               // linear RGBA16F
+layout(rgba16f, binding = 1) writeonly uniform highp image2D uDst;
+
+uniform float uNoiseFloor;   // linear floor, ~0.002 of nominal white
+uniform float uContrastLo;   // log2(max/min) where gate starts   (default 2.0 = 4x)
+uniform float uContrastHi;   // log2(max/min) where gate is full  (default 3.5 = ~11x)
+uniform float uOutlierLo;    // sqrt-domain chroma deviation start (default 0.03)
+uniform float uOutlierHi;    // sqrt-domain chroma deviation full  (default 0.10)
+
+float lumaOf(vec3 c) { return 0.25 * c.r + 0.5 * c.g + 0.25 * c.b; }
+
+void s(inout float a, inout float b) {
+  float t = min(a, b);
+  b = max(a, b);
+  a = t;
+}
+
+// Classic 19-exchange median-of-9 network.
+float median9(float p0, float p1, float p2, float p3, float p4,
+              float p5, float p6, float p7, float p8) {
+  s(p1, p2); s(p4, p5); s(p7, p8);
+  s(p0, p1); s(p3, p4); s(p6, p7);
+  s(p1, p2); s(p4, p5); s(p7, p8);
+  s(p0, p3); s(p5, p8); s(p4, p7);
+  s(p3, p6); s(p1, p4); s(p2, p5);
+  s(p4, p7); s(p4, p2); s(p6, p4);
+  s(p4, p2);
+  return p4;
+}
+
+vec3 fetchLin(ivec2 p, ivec2 sz) {
+  return max(texelFetch(uSrc, clamp(p, ivec2(0), sz - ivec2(1)), 0).rgb, vec3(0.0));
+}
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 sz = textureSize(uSrc, 0);
+  if (p.x >= sz.x || p.y >= sz.y) return;
+
+  vec4 c0 = texelFetch(uSrc, p, 0);
+
+  // 1) local luminance contrast over 5x5 (linear light)
+  float ymin = 1e9;
+  float ymax = 0.0;
+  for (int j = -2; j <= 2; j++) {
+    for (int i = -2; i <= 2; i++) {
+      float y = lumaOf(fetchLin(p + ivec2(i, j), sz));
+      ymin = min(ymin, y);
+      ymax = max(ymax, y);
+    }
+  }
+  float contrast = log2((ymax + uNoiseFloor) / (ymin + uNoiseFloor));
+  float gate = smoothstep(uContrastLo, uContrastHi, contrast);
+  if (gate <= 0.0) {
+    imageStore(uDst, p, c0);
+    return;
+  }
+
+  // 2) 3x3 median of sqrt-domain chroma differences
+  float d1[9];
+  float d2[9];
+  int k = 0;
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      vec3 sq = sqrt(fetchLin(p + ivec2(i, j), sz));
+      d1[k] = sq.r - sq.g;
+      d2[k] = sq.b - sq.g;
+      k++;
+    }
+  }
+  float m1 = median9(d1[0], d1[1], d1[2], d1[3], d1[4], d1[5], d1[6], d1[7], d1[8]);
+  float m2 = median9(d2[0], d2[1], d2[2], d2[3], d2[4], d2[5], d2[6], d2[7], d2[8]);
+
+  // 3) only touch pixels whose chroma disagrees with their neighbourhood
+  vec3 lin0 = max(c0.rgb, vec3(0.0));
+  vec3 s0 = sqrt(lin0);
+  float e1 = s0.r - s0.g;
+  float e2 = s0.b - s0.g;
+  float dev = length(vec2(e1 - m1, e2 - m2));
+  float w = gate * smoothstep(uOutlierLo, uOutlierHi, dev);
+
+  float n1 = mix(e1, m1, w);
+  float n2 = mix(e2, m2, w);
+
+  // 4) rebuild RGB around the unchanged G, then restore luma exactly
+  vec3 s1 = max(vec3(s0.g + n1, s0.g, s0.g + n2), vec3(0.0));
+  vec3 rgb1 = s1 * s1;
+  float y0 = lumaOf(lin0);
+  float y1 = lumaOf(rgb1);
+  rgb1 *= (y1 > 1e-8) ? (y0 / y1) : 1.0;
+
+  imageStore(uDst, p, vec4(rgb1, c0.a));
+}
