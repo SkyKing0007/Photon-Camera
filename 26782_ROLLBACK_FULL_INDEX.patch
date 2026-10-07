@@ -1,0 +1,391 @@
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index cb33823055cd6d57e94e89e4e3df1a26dff0e656..7cc93352b4ccb646e2063133bc1395c4173c93fe 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -4306,11 +4306,6 @@ internal object GlesMgcRawSabreShaders {
+         uniform int uUseFrameWeight;
+         uniform vec4 uPhaseGains;
+         uniform vec4 uPhaseBlackTerms;
+-        /* IRIS_26782_DNG_SOURCE_HEADROOM_OWNER
+-         * Physical sensor white expressed in this frame's black-subtracted normalized domain.
+-         * For NORMAL exposure normalization this equals the frame exposure scale; using it keeps
+-         * source clipping detection independent of exposure normalization. */
+-        uniform float uSourceWhiteNormalized;
+         uniform vec4 uCovRangeRg;
+         uniform vec2 uCovRangeB;
+         layout(location = 0) out vec2 oSignalAndWeight;
+@@ -4363,45 +4358,15 @@ internal object GlesMgcRawSabreShaders {
+             );
+         }
+ 
+-        /* IRIS_26782_DNG_EDGE_SAFE_QUAD_OWNER
+-         * Inherit 26781 exactly: reference NORMAL remains exact identity; R/G1/G2/B stay four
+-         * independent same-phase 2-pixel lattices; one Bayer-quad flow/covariance/rejection owner
+-         * is shared by all four phases. 26782 closes the two real-device residuals without creating
+-         * a color authority: (1) fractional alternate-frame interpolation is vetoed when its shared
+-         * 2x2 quad footprint straddles a strong structural edge; (2) the same consumed footprint is
+-         * rejected as one quad when any phase loses physical sensor headroom. Natural whole-2-pixel
+-         * same-phase translations keep the exact direct-sample path. No G1/G2 pooling, WB, demosaic,
+-         * tone or synthetic highlight hue exists in this DNG owner. */
+-        float quadGuide(ivec2 quadIndex) {
+-            ivec2 q = max(quadIndex, ivec2(0));
+-            ivec2 origin = q * 2;
+-            ivec2 maxOrigin = max(uRawSize - ivec2(2), ivec2(0));
+-            origin = clamp(origin, ivec2(0), maxOrigin);
+-            return 0.25 * (
+-                normalizedRaw(origin) +
+-                normalizedRaw(origin + ivec2(1, 0)) +
+-                normalizedRaw(origin + ivec2(0, 1)) +
+-                normalizedRaw(origin + ivec2(1, 1))
+-            );
+-        }
+-
+-        float phaseHeadroomConfidence(ivec2 quadIndex, int phaseIndex) {
+-            ivec2 p = pixelForPhaseLattice(quadIndex, phaseIndex);
+-            float value = normalizedRaw(p);
+-            float whitePoint = max(uSourceWhiteNormalized, 1.0e-5);
+-            float headroomStart = whitePoint * 0.9925;
+-            return 1.0 - smoothstep(
+-                headroomStart, max(headroomStart + 1.0e-5, whitePoint), value);
+-        }
+-
+-        float quadHeadroomConfidence(ivec2 quadIndex) {
+-            float confidence = 1.0;
+-            for (int phaseIndex = 0; phaseIndex < 4; ++phaseIndex) {
+-                confidence = min(confidence, phaseHeadroomConfidence(quadIndex, phaseIndex));
+-            }
+-            return confidence;
+-        }
+-
++        /* IRIS_26781_DNG_QUAD_COHERENT_PHASE_OWNER
++         * Preserve 26780's exact reference identity and four independent R/G1/G2/B phase lattices,
++         * but make every alternate NORMAL observation use one Bayer-quad geometry owner. Flow,
++         * covariance and temporal admission are shared by all four phases of the destination quad.
++         * Each phase still samples only its own 2-pixel lattice. With one shared translation the
++         * phase offset cancels algebraically, so all four phases receive the exact same fractional
++         * lattice coordinate/kernel while natural whole-2-pixel translations remain direct samples.
++         * The shared temporal weight is the conservative minimum of the four phase-site rejection
++         * samples: an alternate frame may contribute a quad only when all four phase locations agree. */
+         void main() {
+             ivec2 outputPixel = ivec2(gl_FragCoord.xy);
+             int targetPhase = phaseAt(outputPixel);
+@@ -4428,20 +4393,12 @@ internal object GlesMgcRawSabreShaders {
+ 
+             float intensity = 0.0;
+             float accumulatedWeight = 0.0;
+-            float sourceHeadroomConfidence = 1.0;
+-            float fractionalHardEdgeWeight = 1.0;
+-            bool exactSamePhaseSample = max(abs(nearestDelta.x), abs(nearestDelta.y)) < 1.0e-5;
+-            if (exactSamePhaseSample) {
+-                ivec2 q = clampPhaseLattice(nearestLattice, targetPhase);
+-                ivec2 source = pixelForPhaseLattice(q, targetPhase);
++            if (max(abs(nearestDelta.x), abs(nearestDelta.y)) < 1.0e-5) {
++                ivec2 source = pixelForPhaseLattice(nearestLattice, targetPhase);
+                 intensity = normalizedRaw(source);
+                 accumulatedWeight = 1.0;
+-                // Preserve exact whole-2px sampling, but never let a clipped alternate phase own color.
+-                sourceHeadroomConfidence = quadHeadroomConfidence(q);
+             } else {
+                 ivec2 latticeBase = ivec2(floor(latticeCoordinate));
+-                float guideMin = 1.0e9;
+-                float guideMax = 0.0;
+                 for (int ly = 0; ly <= 1; ++ly) {
+                     for (int lx = 0; lx <= 1; ++lx) {
+                         ivec2 q = clampPhaseLattice(latticeBase + ivec2(lx, ly), targetPhase);
+@@ -4450,21 +4407,8 @@ internal object GlesMgcRawSabreShaders {
+                         float w = kernelWeight(sampleCenter - sourcePixel, covariance);
+                         intensity += normalizedRaw(source) * w;
+                         accumulatedWeight += w;
+-                        float guide = quadGuide(q);
+-                        guideMin = min(guideMin, guide);
+-                        guideMax = max(guideMax, guide);
+-                        sourceHeadroomConfidence = min(sourceHeadroomConfidence, quadHeadroomConfidence(q));
+                     }
+                 }
+-                /* IRIS_26782_FRACTIONAL_HARD_EDGE_VETO
+-                 * A fractional 2x2 same-phase kernel is useful only when those four Bayer quads
+-                 * describe one continuous surface. On a strong white-line/roof boundary, preserve
+-                 * reference geometry rather than averaging opposite sides of the edge. This is an
+-                 * alternate-observation veto only; it never changes the reference sample itself. */
+-                float guideRange = max(guideMax - guideMin, 0.0);
+-                float relativeGuideRange = guideRange / max(guideMax, 0.03);
+-                bool hardEdge = guideMax > 0.08 && guideRange > 0.055 && relativeGuideRange > 0.20;
+-                fractionalHardEdgeWeight = hardEdge ? 0.0 : 1.0;
+             }
+ 
+             vec2 invRawSize = 1.0 / rawSize;
+@@ -4478,11 +4422,6 @@ internal object GlesMgcRawSabreShaders {
+             float w01 = texture(uRejection, (vec2(p01) + vec2(0.5)) * invRawSize).r;
+             float w11 = texture(uRejection, (vec2(p11) + vec2(0.5)) * invRawSize).r;
+             float frameWeight = min(min(w00, w10), min(w01, w11));
+-            /* IRIS_26782_BLOCK_UNIFORM_DNG_HEADROOM
+-             * Match the proven RGB source-headroom ownership principle: an alternate observation
+-             * cannot contribute a Bayer quad when any consumed phase sample is physically clipped. */
+-            frameWeight *= clamp(sourceHeadroomConfidence, 0.0, 1.0);
+-            frameWeight *= fractionalHardEdgeWeight;
+             float reconstructed = intensity / max(accumulatedWeight, 1.0e-8);
+             oSignalAndWeight = vec2(reconstructed * frameWeight, frameWeight);
+         }
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index eacfc6a9a2fa1b678b4f616537dadf2cfab3a6ea..a3677c0d5e240fcfa2fd2dea9670f6715923f2bf 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2616,7 +2616,6 @@ internal class GlesMgcRawSpatialStacker(
+                     calibration = referenceCalibration,
+                     accumulator = normalDngAccumulator,
+                     useFrameWeight = false,
+-                    sourceWhiteNormalized = 1f,
+                 )
+             }
+             GlesGpuScheduler.yieldToUiRenderer()
+@@ -2861,7 +2860,6 @@ internal class GlesMgcRawSpatialStacker(
+                         calibration = calibration,
+                         accumulator = normalDngAccumulator,
+                         useFrameWeight = true,
+-                        sourceWhiteNormalized = exposureScale,
+                     )
+                     if (normalDngCoverage != 0) {
+                         renderSabreCoverage(
+@@ -2956,7 +2954,6 @@ internal class GlesMgcRawSpatialStacker(
+                         "sameSabreFlow=true sameSabreRejection=true sameSabreCovariance=true " +
+                         "resolveSabre=false demosaic=false wb=false lsc=false denoise=false " +
+                         "tone=false sharpen=false fullRangeNormalized16=true blackLevel=0 whiteLevel=65535 " +
+-                        "edgeSafeFractional26782=true blockUniformHeadroom26782=true referenceIdentity=true " +
+                         "support=${normalStackedDngSupport}",
+                 )
+             }
+@@ -3148,16 +3145,8 @@ internal class GlesMgcRawSpatialStacker(
+                 if (edgeFalseColor26778.enabled) {
+                     val tmp26778 = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+                     try {
+-                        val counts26778 = runEdgeFalseColorSuppressor26778(
+-                            sourceAndFinal = physicalHdr26605,
+-                            temporary = tmp26778,
+-                            sabreWeightR = sabreRSupport26613,
+-                            sabreWeightsGb = resolveAccumulatedWeightsGb26604,
+-                            sabreValidWeights = accumulatedValidity26614,
+-                            sabreValidityWeightScale = validityWeightScale26614,
+-                        )
+-                        PLog.i(SABRE_TAG, "IRIS_26778_EDGE_FALSE_COLOR_SUPPRESSOR gateGt05Pass1=${counts26778[0]} blendGt05Pass1=${counts26778[1]} blendGt05Pass2=${counts26778[2]} passes=2 settingsSource=${edgeFalseColor26778.source} lumaPreserved=true alphaPreserved=true clipGate=RAW_CFA_VALIDITY_26782 periodicGate=COHERENT_BIPOLAR_26782 physicalWhiteScale=1.0 physicalWhiteOwner=DEMOSAIC_WHITE_NORMALIZED magnitudeOwner=CLEANED_PHYSICAL_HDR noiseFloor=${edgeFalseColor26778.noiseFloor} contrastLo=${edgeFalseColor26778.contrastLo} contrastHi=${edgeFalseColor26778.contrastHi} outlierLo=${edgeFalseColor26778.outlierLo} outlierHi=${edgeFalseColor26778.outlierHi}")
+-                        PLog.i(SABRE_TAG, "IRIS_26782_RESIDUAL_FALSE_COLOR_GUARD coherentGt05=${counts26778[3]} clippedNeutralGt05=${counts26778[4]} rawValidityOwner=IRIS_26614 lumaPreserved=true old26778OutlierPathPreserved=true")
++                        val counts26778 = runEdgeFalseColorSuppressor26778(physicalHdr26605, tmp26778)
++                        PLog.i(SABRE_TAG, "IRIS_26778_EDGE_FALSE_COLOR_SUPPRESSOR gateGt05Pass1=${counts26778[0]} blendGt05Pass1=${counts26778[1]} blendGt05Pass2=${counts26778[2]} passes=2 settingsSource=${edgeFalseColor26778.source} lumaPreserved=true alphaPreserved=true clipGate=false periodicGate=false physicalWhiteScale=1.0 physicalWhiteOwner=DEMOSAIC_WHITE_NORMALIZED magnitudeOwner=CLEANED_PHYSICAL_HDR noiseFloor=${edgeFalseColor26778.noiseFloor} contrastLo=${edgeFalseColor26778.contrastLo} contrastHi=${edgeFalseColor26778.contrastHi} outlierLo=${edgeFalseColor26778.outlierLo} outlierHi=${edgeFalseColor26778.outlierHi}")
+                     } finally {
+                         releaseOwnedTexture(tmp26778, "26778 edge false-color ping-pong")
+                     }
+@@ -3550,7 +3539,6 @@ internal class GlesMgcRawSpatialStacker(
+         calibration: FrameCalibration,
+         accumulator: Int,
+         useFrameWeight: Boolean,
+-        sourceWhiteNormalized: Float,
+     ) {
+         check(exportNormalStackedDng && sabreNormalDngMergeProgram != 0 && accumulator != 0)
+         val program = sabreNormalDngMergeProgram
+@@ -3573,7 +3561,6 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
+         uniform4fv(program, "uPhaseGains", calibration.bayerPhaseGains)
+         uniform4fv(program, "uPhaseBlackTerms", calibration.bayerPhaseBlackTerms)
+-        uniform1f(program, "uSourceWhiteNormalized", sourceWhiteNormalized.coerceAtLeast(1.0e-5f))
+         uniform4f(
+             program,
+             "uCovRangeRg",
+@@ -6266,10 +6253,6 @@ internal class GlesMgcRawSpatialStacker(
+     private fun runEdgeFalseColorSuppressor26778(
+         sourceAndFinal: Int,
+         temporary: Int,
+-        sabreWeightR: Int,
+-        sabreWeightsGb: Int,
+-        sabreValidWeights: Int,
+-        sabreValidityWeightScale: Float,
+     ): IntArray {
+         check(edgeFalseColorSuppressor26778Program != 0) { "26778 edge false-color program unavailable" }
+         val ids = IntArray(1)
+@@ -6279,20 +6262,14 @@ internal class GlesMgcRawSpatialStacker(
+         buffers += statsBuffer
+         var mapped = false
+         try {
+-            val zero = ByteBuffer.allocateDirect(Int.SIZE_BYTES * 5).order(ByteOrder.nativeOrder()).apply {
+-                repeat(5) { putInt(0) }; rewind()
+-            }
++            val zero = ByteBuffer.allocateDirect(Int.SIZE_BYTES * 3).order(ByteOrder.nativeOrder()).apply { putInt(0); putInt(0); putInt(0); rewind() }
+             GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
+-            GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, Int.SIZE_BYTES * 5, zero, GLES31.GL_STREAM_READ)
++            GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, Int.SIZE_BYTES * 3, zero, GLES31.GL_STREAM_READ)
+             GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, statsBuffer)
+             fun dispatch26778(source: Int, destination: Int, statsPass: Int) {
+                 check(source != destination) { "26778 ping-pong source/destination alias" }
+                 GLES31.glUseProgram(edgeFalseColorSuppressor26778Program)
+                 bindTexture(edgeFalseColorSuppressor26778Program, "uSrc", 0, source)
+-                bindTexture(edgeFalseColorSuppressor26778Program, "uSabreWeightR", 2, sabreWeightR)
+-                bindTexture(edgeFalseColorSuppressor26778Program, "uSabreWeightsGb", 3, sabreWeightsGb)
+-                bindTexture(edgeFalseColorSuppressor26778Program, "uSabreValidWeights", 4, sabreValidWeights)
+-                uniform1f(edgeFalseColorSuppressor26778Program, "uSabreValidityWeightScale", sabreValidityWeightScale.coerceAtLeast(1f))
+                 GLES31.glBindImageTexture(1, destination, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+                 uniform1f(edgeFalseColorSuppressor26778Program, "uNoiseFloor", edgeFalseColor26778.noiseFloor)
+                 uniform1f(edgeFalseColorSuppressor26778Program, "uContrastLo", edgeFalseColor26778.contrastLo)
+@@ -6306,34 +6283,25 @@ internal class GlesMgcRawSpatialStacker(
+             dispatch26778(sourceAndFinal, temporary, statsPass = 1)
+             dispatch26778(temporary, sourceAndFinal, statsPass = 2)
+             GLES31.glBindImageTexture(1, 0, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
+-            for (unit in 4 downTo 2) {
+-                GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + unit)
+-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+-            }
+             GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+             GLES31.glUseProgram(0)
+             checkGlError("26778 edge false-color two-pass submit")
+             GlesGpuCompletion.awaitSubmittedWork(label = "26778 edge false-color two-pass", checkGlError = ::checkGlError)
+             GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
+-            val bb = GLES31.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER, 0, Int.SIZE_BYTES * 5, GLES31.GL_MAP_READ_BIT) as? ByteBuffer
+-                ?: error("Unable to map 26778/26782 edge false-color stats")
++            val bb = GLES31.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER, 0, Int.SIZE_BYTES * 3, GLES31.GL_MAP_READ_BIT) as? ByteBuffer
++                ?: error("Unable to map 26778 edge false-color stats")
+             mapped = true
+             val native = bb.order(ByteOrder.nativeOrder())
+             val gate = native.getInt(0)
+             val blendPass1 = native.getInt(Int.SIZE_BYTES)
+             val blendPass2 = native.getInt(Int.SIZE_BYTES * 2)
+-            val coherent = native.getInt(Int.SIZE_BYTES * 3)
+-            val clippedNeutral = native.getInt(Int.SIZE_BYTES * 4)
+-            check(GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)) { "26778/26782 edge false-color stats buffer invalid" }
++            check(GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)) { "26778 edge false-color stats buffer invalid" }
+             mapped = false
+             GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+             val pixels = Math.multiplyExact(width, height)
+-            check(
+-                gate in 0..pixels && blendPass1 in 0..pixels && blendPass2 in 0..pixels &&
+-                    coherent in 0..pixels && clippedNeutral in 0..pixels
+-            ) { "26778/26782 edge false-color stats out of range gate=$gate blendPass1=$blendPass1 blendPass2=$blendPass2 coherent=$coherent clippedNeutral=$clippedNeutral pixels=$pixels" }
+-            return intArrayOf(gate, blendPass1, blendPass2, coherent, clippedNeutral)
++            check(gate in 0..pixels && blendPass1 in 0..pixels && blendPass2 in 0..pixels) { "26778 edge false-color stats out of range gate=$gate blendPass1=$blendPass1 blendPass2=$blendPass2 pixels=$pixels" }
++            return intArrayOf(gate, blendPass1, blendPass2)
+         } finally {
+             if (mapped) {
+                 GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
+@@ -15059,18 +15027,8 @@ internal class GlesMgcRawSpatialStacker(
+         layout(local_size_x = 8, local_size_y = 8) in;
+         uniform sampler2D uSrc;                                    // linear RGBA16F
+         layout(rgba16f, binding = 1) writeonly uniform highp image2D uDst;
+-        layout(std430, binding = 0) buffer Iris26778Stats {
+-          uint gateGt05; uint blendGt05Pass1; uint blendGt05Pass2;
+-          uint coherentGt05; uint clippedNeutralGt05;
+-        };
++        layout(std430, binding = 0) buffer Iris26778Stats { uint gateGt05; uint blendGt05Pass1; uint blendGt05Pass2; };
+         uniform int uStatsPass;
+-        /* IRIS_26782_RAW_VALIDITY_CLIP_GATE
+-         * Reuse the exact 26614 per-channel headroom provenance already consumed by VGN. This is
+-         * measurement validity only; it is not a semantic/highlight classifier. */
+-        uniform sampler2D uSabreWeightR;
+-        uniform sampler2D uSabreWeightsGb;
+-        uniform sampler2D uSabreValidWeights;
+-        uniform float uSabreValidityWeightScale;
+         
+         uniform float uNoiseFloor;   // linear floor, ~0.002 of nominal white
+         uniform float uContrastLo;   // log2(max/min) where gate starts   (default 2.0 = 4x)
+@@ -15102,22 +15060,6 @@ internal class GlesMgcRawSpatialStacker(
+         vec3 fetchLin(ivec2 p, ivec2 sz) {
+           return max(texelFetch(uSrc, clamp(p, ivec2(0), sz - ivec2(1)), 0).rgb, vec3(0.0));
+         }
+-
+-        vec2 sqrtChromaAt(ivec2 p, ivec2 sz) {
+-          vec3 sq = sqrt(fetchLin(p, sz));
+-          return vec2(sq.r - sq.g, sq.b - sq.g);
+-        }
+-
+-        vec3 channelValidity26782(ivec2 p, ivec2 sz) {
+-          ivec2 q = clamp(p, ivec2(0), sz - ivec2(1));
+-          vec3 totalWeight = vec3(
+-            max(texelFetch(uSabreWeightR, q, 0).r, 0.0),
+-            max(texelFetch(uSabreWeightsGb, q, 0).r, 0.0),
+-            max(texelFetch(uSabreWeightsGb, q, 0).g, 0.0));
+-          vec3 validWeight = max(texelFetch(uSabreValidWeights, q, 0).rgb, vec3(0.0)) *
+-            max(uSabreValidityWeightScale, 1.0);
+-          return clamp(validWeight / max(totalWeight, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
+-        }
+         
+         void main() {
+           ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+@@ -15159,60 +15101,23 @@ internal class GlesMgcRawSpatialStacker(
+           float m1 = median9(d1[0], d1[1], d1[2], d1[3], d1[4], d1[5], d1[6], d1[7], d1[8]);
+           float m2 = median9(d2[0], d2[1], d2[2], d2[3], d2[4], d2[5], d2[6], d2[7], d2[8]);
+         
+-          // 3) Preserve the exact 26778 isolated-outlier path.
++          // 3) only touch pixels whose chroma disagrees with their neighbourhood
+           vec3 lin0 = max(c0.rgb, vec3(0.0));
+           vec3 s0 = sqrt(lin0);
+-          vec2 centerC = vec2(s0.r - s0.g, s0.b - s0.g);
+-          vec2 medianC = vec2(m1, m2);
+-          float dev = length(centerC - medianC);
+-          float w26778 = gate * smoothstep(uOutlierLo, uOutlierHi, dev);
+-          if (w26778 > 0.5) {
++          float e1 = s0.r - s0.g;
++          float e2 = s0.b - s0.g;
++          float dev = length(vec2(e1 - m1, e2 - m2));
++          float w = gate * smoothstep(uOutlierLo, uOutlierHi, dev);
++          if (w > 0.5) {
+             if (uStatsPass == 1) atomicAdd(blendGt05Pass1, 1u);
+             else if (uStatsPass == 2) atomicAdd(blendGt05Pass2, 1u);
+           }
+-
+-          /* IRIS_26782_COHERENT_BIPOLAR_EDGE_GUARD
+-           * A long cyan/yellow-red fringe can agree with its 3x3 median and evade 26778. Use the
+-           * dominant luma-gradient axis only to inspect the two +/-2px chroma lobes. Correction is
+-           * allowed only when those lobes are genuinely opposite and their midpoint is near neutral. */
+-          float yLeft = lumaOf(fetchLin(p + ivec2(-2, 0), sz));
+-          float yRight = lumaOf(fetchLin(p + ivec2(2, 0), sz));
+-          float yUp = lumaOf(fetchLin(p + ivec2(0, -2), sz));
+-          float yDown = lumaOf(fetchLin(p + ivec2(0, 2), sz));
+-          bool horizontalNormal = abs(yRight - yLeft) >= abs(yDown - yUp);
+-          ivec2 edgeStep = horizontalNormal ? ivec2(2, 0) : ivec2(0, 2);
+-          vec2 cNeg = sqrtChromaAt(p - edgeStep, sz);
+-          vec2 cPos = sqrtChromaAt(p + edgeStep, sz);
+-          vec2 pairMid = 0.5 * (cNeg + cPos);
+-          float negLen = length(cNeg);
+-          float posLen = length(cPos);
+-          float opposition = clamp(-dot(cNeg, cPos) / max(negLen * posLen, 1.0e-6), 0.0, 1.0);
+-          float bipolarMagnitude = min(negLen, posLen);
+-          float midpointNeutral = 1.0 - smoothstep(0.055, 0.14, length(pairMid));
+-          float coherentW = gate *
+-            smoothstep(max(0.018, uOutlierLo * 0.65), max(0.055, uOutlierHi * 0.80), bipolarMagnitude) *
+-            smoothstep(0.35, 0.80, opposition) * midpointNeutral;
+-
+-          /* IRIS_26782_CLIPPED_NEUTRAL_GUARD
+-           * If the exact 26614 CFA headroom provenance says at least one reconstructed color channel
+-           * is physically invalid, invalid hue may not preserve itself. Require neutral context from
+-           * either the bipolar endpoints or the local median before collapsing only chroma to zero. */
+-          vec3 validity = channelValidity26782(p, sz);
+-          float measuredValidity = min(validity.r, min(validity.g, validity.b));
+-          float invalidity = 1.0 - smoothstep(0.985, 0.9995, measuredValidity);
+-          float medianNeutral = 1.0 - smoothstep(0.050, 0.135, length(medianC));
+-          float neutralContext = max(midpointNeutral, medianNeutral);
+-          float clipW = gate * invalidity * neutralContext;
+-
+-          if (uStatsPass == 1 && coherentW > 0.5) atomicAdd(coherentGt05, 1u);
+-          if (uStatsPass == 1 && clipW > 0.5) atomicAdd(clippedNeutralGt05, 1u);
+-
+-          vec2 correctedC = mix(centerC, medianC, w26778);
+-          correctedC = mix(correctedC, pairMid, coherentW);
+-          correctedC = mix(correctedC, vec2(0.0), clipW);
+         
+-          // 4) rebuild RGB around unchanged G, then restore luma exactly.
+-          vec3 s1 = max(vec3(s0.g + correctedC.x, s0.g, s0.g + correctedC.y), vec3(0.0));
++          float n1 = mix(e1, m1, w);
++          float n2 = mix(e2, m2, w);
++        
++          // 4) rebuild RGB around the unchanged G, then restore luma exactly
++          vec3 s1 = max(vec3(s0.g + n1, s0.g, s0.g + n2), vec3(0.0));
+           vec3 rgb1 = s1 * s1;
+           float y0 = lumaOf(lin0);
+           float y1 = lumaOf(rgb1);
+diff --git b/app/version.properties a/app/version.properties
+index 3dfa815752050d97ffada3ea61a825202b150226..d8f96a081f6eaa68ba9581037f15d8790dc96797 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726782
+-VERSION_BUILD=26782
++VERSION_NAME=0.9726781
++VERSION_BUILD=26781
