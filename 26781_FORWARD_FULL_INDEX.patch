@@ -1,0 +1,210 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index f20c67b0d87ff8ab33c3fb2e7f01961dd519d62a..7cc93352b4ccb646e2063133bc1395c4173c93fe 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -4358,10 +4358,15 @@ internal object GlesMgcRawSabreShaders {
+             );
+         }
+ 
+-        /* IRIS_26780_DNG_PHASE_IDENTITY_OWNER
+-         * Reference NORMAL is exact Bayer identity. Alternate NORMAL frames interpolate only the same
+-         * physical R/G1/G2/B phase lattice as the destination site. G1 and G2 never share samples. Exact
+-         * whole-2-pixel same-phase translations take the direct sample path without resampling. */
++        /* IRIS_26781_DNG_QUAD_COHERENT_PHASE_OWNER
++         * Preserve 26780's exact reference identity and four independent R/G1/G2/B phase lattices,
++         * but make every alternate NORMAL observation use one Bayer-quad geometry owner. Flow,
++         * covariance and temporal admission are shared by all four phases of the destination quad.
++         * Each phase still samples only its own 2-pixel lattice. With one shared translation the
++         * phase offset cancels algebraically, so all four phases receive the exact same fractional
++         * lattice coordinate/kernel while natural whole-2-pixel translations remain direct samples.
++         * The shared temporal weight is the conservative minimum of the four phase-site rejection
++         * samples: an alternate frame may contribute a quad only when all four phase locations agree. */
+         void main() {
+             ivec2 outputPixel = ivec2(gl_FragCoord.xy);
+             int targetPhase = phaseAt(outputPixel);
+@@ -4371,12 +4376,16 @@ internal object GlesMgcRawSabreShaders {
+                 return;
+             }
+ 
+-            vec2 referenceUv = gl_FragCoord.xy / vec2(uRawSize);
+-            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
++            ivec2 quadOrigin = (outputPixel / 2) * 2;
++            vec2 rawSize = vec2(uRawSize);
++            vec2 quadReferenceUv = (vec2(quadOrigin) + vec2(1.0)) / rawSize;
++            vec2 flowUv = quadReferenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec2 flow = texture(uFlow, flowUv).xy;
+-            vec2 sampleUv = mirrorUvs(referenceUv + flow);
+-            vec3 covariance = unpackCovariance(texture(uCovariance, sampleUv).xyz);
+-            vec2 sourcePixel = sampleUv * vec2(uRawSize);
++            vec2 quadSourceUv = mirrorUvs(quadReferenceUv + flow);
++            vec2 sharedTranslationPixels = (quadSourceUv - quadReferenceUv) * rawSize;
++            vec3 covariance = unpackCovariance(texture(uCovariance, quadSourceUv).xyz);
++
++            vec2 sourcePixel = vec2(outputPixel) + vec2(0.5) + sharedTranslationPixels;
+             ivec2 offset = phaseOffset(targetPhase);
+             vec2 latticeCoordinate = 0.5 * (sourcePixel - (vec2(offset) + vec2(0.5)));
+             ivec2 nearestLattice = ivec2(floor(latticeCoordinate + vec2(0.5)));
+@@ -4402,12 +4411,19 @@ internal object GlesMgcRawSabreShaders {
+                 }
+             }
+ 
+-            float frameWeight = texture(uRejection, referenceUv).r;
++            vec2 invRawSize = 1.0 / rawSize;
++            ivec2 maxPixel = uRawSize - ivec2(1);
++            ivec2 p00 = clamp(quadOrigin, ivec2(0), maxPixel);
++            ivec2 p10 = clamp(quadOrigin + ivec2(1, 0), ivec2(0), maxPixel);
++            ivec2 p01 = clamp(quadOrigin + ivec2(0, 1), ivec2(0), maxPixel);
++            ivec2 p11 = clamp(quadOrigin + ivec2(1, 1), ivec2(0), maxPixel);
++            float w00 = texture(uRejection, (vec2(p00) + vec2(0.5)) * invRawSize).r;
++            float w10 = texture(uRejection, (vec2(p10) + vec2(0.5)) * invRawSize).r;
++            float w01 = texture(uRejection, (vec2(p01) + vec2(0.5)) * invRawSize).r;
++            float w11 = texture(uRejection, (vec2(p11) + vec2(0.5)) * invRawSize).r;
++            float frameWeight = min(min(w00, w10), min(w01, w11));
+             float reconstructed = intensity / max(accumulatedWeight, 1.0e-8);
+-            oSignalAndWeight = vec2(
+-                reconstructed * frameWeight,
+-                frameWeight
+-            );
++            oSignalAndWeight = vec2(reconstructed * frameWeight, frameWeight);
+         }
+     """.trimIndent()
+ 
+@@ -4567,51 +4583,6 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26780_MATCHED_BANDWIDTH_CHROMA_OWNER
+-     * JPEG-only, pre-Resolve camera-RGB correction. Chroma differences are built from one common
+-     * 3x3 binomial bandwidth for R/G/B. The original full-resolution luma is then restored as one
+-     * scalar detail term added equally to all three channels, so R-G/B-G cannot contain sharper
+-     * structure than the matched-bandwidth data. Alpha/support is preserved exactly.
+-     */
+-    val matchedBandwidthChroma26780 = """
+-        #version 300 es
+-        // IRIS_26780_MATCHED_BANDWIDTH_CHROMA_OWNER
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uSource;
+-        uniform ivec2 uSize;
+-        layout(location = 0) out vec4 oColor;
+-
+-        ivec2 clampPixel(ivec2 p) {
+-            return clamp(p, ivec2(0), uSize - ivec2(1));
+-        }
+-
+-        float axisWeight(int offset) {
+-            return offset == 0 ? 2.0 : 1.0;
+-        }
+-
+-        float luma(vec3 rgb) {
+-            return dot(rgb, vec3(0.25, 0.50, 0.25));
+-        }
+-
+-        void main() {
+-            ivec2 p = ivec2(gl_FragCoord.xy);
+-            vec4 center = texelFetch(uSource, clampPixel(p), 0);
+-            vec3 matched = vec3(0.0);
+-            float sumWeight = 0.0;
+-            for (int y = -1; y <= 1; ++y) {
+-                for (int x = -1; x <= 1; ++x) {
+-                    float w = axisWeight(x) * axisWeight(y);
+-                    matched += texelFetch(uSource, clampPixel(p + ivec2(x, y)), 0).rgb * w;
+-                    sumWeight += w;
+-                }
+-            }
+-            matched /= max(sumWeight, 1.0e-7);
+-            float sharedDetail = luma(center.rgb) - luma(matched);
+-            oColor = vec4(matched + vec3(sharedDetail), center.a);
+-        }
+-    """.trimIndent()
+-
+     val dehomogenize = """
+         #version 300 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index e5c894309c0a3db2140aa85f97e171d0b32f24ac..a3677c0d5e240fcfa2fd2dea9670f6715923f2bf 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -679,7 +679,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreCopyAlphaProgram = 0
+     private var sabreReciprocalGreenWeightProgram = 0
+     private var sabreDehomogenizeProgram = 0
+-    private var sabreMatchedBandwidthChroma26780Program = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreOutputTransformFloatProgram = 0
+     private var edgeFalseColorSuppressor26778Program = 0
+@@ -3041,25 +3040,20 @@ internal class GlesMgcRawSpatialStacker(
+                 retainedShortPhysicalReverseWeight26648 = 0
+                 retainedShortFlow26648 = null
+             }
+-            /* IRIS_26780_MATCHED_BANDWIDTH_CHROMA_OWNER
+-             * Apply only after the inherited NORMAL/SHORT admission and fusion are complete, so 26780
+-             * cannot perturb SHORT decisions and SHORT cannot reintroduce independently sharp chroma.
+-             * Full-resolution detail remains one shared luma scalar. DNG is corrected independently in
+-             * its phase-preserving CFA owner. */
+-            val preMatchedResolve26780 = resolveExtendedLinear26651
+-            resolveExtendedLinear26651 = renderSabreMatchedBandwidthChroma26780(preMatchedResolve26780)
+-            if (preMatchedResolve26780 != resolveAccumulatedColor26604) {
+-                releaseOwnedTexture(preMatchedResolve26780, "26651 fusedExtendedLinear HDR master after 26780 matched-bandwidth handoff")
+-            }
++            /* IRIS_26781_REMOVE_MATCHED_BANDWIDTH_CHROMA_AMPLIFIER
++             * Device evidence proved 26780's independent 3x3 RGB low-pass + sharp-luma restore can
++             * manufacture complementary cyan/yellow/green chroma on stationary neutral bright edges.
++             * Remove that stage completely. Resolve again consumes the inherited post-SHORT extended-
++             * linear master directly; NORMAL/SHORT admission/fusion and the protected 26778 downstream
++             * false-color suppressor remain byte-owned by their existing stages. */
+             PLog.i(
+                 SABRE_TAG,
+-                "IRIS_26780_MATCHED_BANDWIDTH_CHROMA owner=POST_SHORT_PRE_RESOLVE kernel=BINOMIAL_3X3 " +
+-                    "lumaPreserved=true chromaOwner=MATCHED_RGB_BANDWIDTH alphaPreserved=true shortFusionUnchanged=true",
++                "IRIS_26781_DIRECT_POST_SHORT_RESOLVE matchedBandwidth26780=false " +
++                    "normalShortFusionUnchanged=true edgeSuppressor26778Unchanged=true",
+             )
+-            // Resolve consumes exactly the one post-fusion, matched-bandwidth extended-linear master.
+             sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveExtendedLinear26651)
+             if (resolveExtendedLinear26651 != resolveAccumulatedColor26604) {
+-                releaseOwnedTexture(resolveExtendedLinear26651, "26780 matched-bandwidth HDR master after Resolve input readback")
++                releaseOwnedTexture(resolveExtendedLinear26651, "26651 fusedExtendedLinear HDR master after Resolve input readback")
+             }
+             if (fusionDecision26651 != 0) {
+                 releaseOwnedTexture(fusionDecision26651, "26651 scalar radiance fusion decision telemetry")
+@@ -5346,17 +5340,6 @@ internal class GlesMgcRawSpatialStacker(
+         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+     }
+ 
+-    private fun renderSabreMatchedBandwidthChroma26780(source: Int): Int {
+-        check(sabreMatchedBandwidthChroma26780Program != 0)
+-        val output = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-        val program = sabreMatchedBandwidthChroma26780Program
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uSource", 0, source)
+-        uniform2i(program, "uSize", width, height)
+-        draw(program, width, height, intArrayOf(output))
+-        return output
+-    }
+-
+     private fun renderSabreDehomogenize(
+         accumulatedColor: Int,
+         accumulatedWeightsGb: Int,
+@@ -6621,10 +6604,6 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.reciprocalGreenWeight4x4,
+             "iris_26545_sabre_reciprocal_green_weight_4x4",
+         )
+-        sabreMatchedBandwidthChroma26780Program = linkProgram(
+-            GlesMgcRawSabreShaders.matchedBandwidthChroma26780,
+-            "iris_26780_matched_bandwidth_chroma",
+-        )
+         sabreDehomogenizeProgram = linkProgram(
+             GlesMgcRawSabreShaders.dehomogenize,
+             "mgc_sabre_dehomogenize",
+diff --git a/app/version.properties b/app/version.properties
+index 99df81d80e2cb929abe48c6ca92f75b8dbef9518..d8f96a081f6eaa68ba9581037f15d8790dc96797 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726780
+-VERSION_BUILD=26780
++VERSION_NAME=0.9726781
++VERSION_BUILD=26781
