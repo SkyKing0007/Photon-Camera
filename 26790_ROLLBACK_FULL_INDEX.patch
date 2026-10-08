@@ -1,0 +1,982 @@
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index b46a58c95c77d98545028b1d6bf1685e0e7f52da..a73cff2718d8b710676b9600c1a6b67b1130056f 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2527,9 +2527,8 @@ internal object GlesMgcRawSabreShaders {
+         #version 300 es
+         precision highp float;
+         precision highp int;
+-        precision highp usampler2D;
+         uniform sampler2D uExtractedBayer;
+-        uniform highp usampler2D uRaw26790;
++        uniform sampler2D uReferenceExtractedBayer26789;
+         uniform sampler2D uFlow;
+         uniform sampler2D uCovariance;
+         uniform sampler2D uRejection;
+@@ -2539,22 +2538,21 @@ internal object GlesMgcRawSabreShaders {
+         uniform vec4 uFrameBorderPadded;
+         uniform int uCfaPattern;
+         uniform int uUseFrameWeight;
+-        /* IRIS_26790_EXACT_DNG_FIXED_PHASE_JPEG_OWNER
+-         * 26789 proved that moving the DNG radial coordinate into the generic parity-changing RGB
+-         * RBF is not DNG-equivalent. 26790 mechanically ports the successful 26786 DNG physical
+-         * phase lattice: exact UINT RAW -> physical phase normalization -> fixed 2-pixel same-phase
+-         * lattice -> the same 2x2 kernel/headroom/hard-edge equations. The generic 3x3 Bayer-type
+-         * sampler is forbidden whenever LCA is enabled. Signal and headroom are measured from the
+-         * identical physical phase footprint; G1/G2 remain independent until their camera-green
+-         * contributions are combined. */
+-        uniform int uJpegLcaEnabled26790;
+-        uniform vec2 uJpegLcaKrKb26790;
+-        uniform vec4 uPhaseGains26790;
+-        uniform vec4 uPhaseBlackTerms26790;
+-        uniform vec4 uPhaseWhiteBalance26790;
+-        uniform float uSourceWhiteNormalized26790;
+-        uniform int uDngQuadHeadroom26790;
+-        uniform int uDngEdgeDeAlias26790;
++        /* IRIS_26789_IN_RBF_DNG_GEOMETRY_LCA_OWNER
++         * NORMAL and SHADOW_LONG no longer consume a separately prewarped CFA texture. For each
++         * camera-RGB channel the exact 26786 DNG radial model moves the Bayer-quad flow query and
++         * target sensor center together, then the ordinary Sabre RBF reads signal and physical
++         * headroom from that SAME source coordinate. R and B therefore remain on their own phase
++         * lattices, G stays unwarped, and no stale unwarped validity can certify a shifted sample. */
++        uniform int uJpegLcaEnabled26789;
++        uniform vec2 uJpegLcaKrKb26789;
++        /* IRIS_26789_LONG_NORMAL_CHROMA_ANCHOR
++         * SHADOW_LONG keeps its radiometric/luma contribution, but on an aligned disagreement it
++         * cannot introduce chromaticity unsupported by the corrected NORMAL reference CFA. The
++         * guard is luma-preserving and inactive for NORMAL frames. */
++        uniform int uLongChromaGuard26789;
++        uniform vec4 uReferenceGains26789;
++        uniform vec4 uReferenceBlackTerms26789;
+         /* IRIS_26720_REFERENCE_ROW_FLICKER_MERGE_CONFIDENCE
+          * Reference NORMAL bypasses ordinary rejection, so only it needs this additional merge
+          * reliability. Alternate NORMALs already carry row confidence in their rejection texture.
+@@ -2785,251 +2783,112 @@ internal object GlesMgcRawSabreShaders {
+         }
+ 
+ 
+-        int phaseAt26790(ivec2 p) {
+-            return ((p.y & 1) << 1) + (p.x & 1);
+-        }
+-        ivec2 phaseOffset26790(int phaseIndex) {
+-            return ivec2(phaseIndex & 1, (phaseIndex >> 1) & 1);
+-        }
+-        ivec2 clampPhaseLattice26790(ivec2 q, int phaseIndex) {
+-            ivec2 offset = phaseOffset26790(phaseIndex);
+-            ivec2 maximum = max((uOutputSize - ivec2(1) - offset) / 2, ivec2(0));
+-            return clamp(q, ivec2(0), maximum);
+-        }
+-        ivec2 pixelForPhaseLattice26790(ivec2 q, int phaseIndex) {
+-            return clampPhaseLattice26790(q, phaseIndex) * 2 + phaseOffset26790(phaseIndex);
+-        }
+-        float normalizedRaw26790(ivec2 p) {
+-            p = clamp(p, ivec2(0), uOutputSize - ivec2(1));
+-            int phaseIndex = phaseAt26790(p);
+-            return float(texelFetch(uRaw26790, p, 0).r) * uPhaseGains26790[phaseIndex] +
+-                uPhaseBlackTerms26790[phaseIndex];
+-        }
+-        float quadGuide26790(ivec2 quadIndex) {
+-            ivec2 q = max(quadIndex, ivec2(0));
+-            ivec2 origin = q * 2;
+-            ivec2 maxOrigin = max(uOutputSize - ivec2(2), ivec2(0));
+-            origin = clamp(origin, ivec2(0), maxOrigin);
+-            return 0.25 * (
+-                normalizedRaw26790(origin) +
+-                normalizedRaw26790(origin + ivec2(1, 0)) +
+-                normalizedRaw26790(origin + ivec2(0, 1)) +
+-                normalizedRaw26790(origin + ivec2(1, 1))
+-            );
+-        }
+-        float phaseHeadroomConfidence26790(ivec2 quadIndex, int phaseIndex) {
+-            ivec2 p = pixelForPhaseLattice26790(quadIndex, phaseIndex);
+-            float value = normalizedRaw26790(p);
+-            float whitePoint = max(uSourceWhiteNormalized26790, 1.0e-5);
+-            float headroomStart = whitePoint * 0.9925;
+-            return 1.0 - smoothstep(
+-                headroomStart, max(headroomStart + 1.0e-5, whitePoint), value);
+-        }
+-        float quadHeadroomConfidence26790(ivec2 quadIndex) {
+-            float confidence = 1.0;
+-            for (int phaseIndex = 0; phaseIndex < 4; ++phaseIndex) {
+-                confidence = min(confidence, phaseHeadroomConfidence26790(quadIndex, phaseIndex));
+-            }
+-            return confidence;
+-        }
+-        int redPhase26790() { return uCfaPattern; }
+-        int bluePhase26790() { return 3 - uCfaPattern; }
+-        float phaseLcaK26790(int phaseIndex) {
+-            if (uJpegLcaEnabled26790 == 0) return 0.0;
+-            if (phaseIndex == redPhase26790()) return uJpegLcaKrKb26790.x;
+-            if (phaseIndex == bluePhase26790()) return uJpegLcaKrKb26790.y;
++        float channelLcaK26789(int channel) {
++            if (uJpegLcaEnabled26789 == 0) return 0.0;
++            if (channel == 0) return uJpegLcaKrKb26789.x;
++            if (channel == 2) return uJpegLcaKrKb26789.y;
+             return 0.0;
+         }
+-        float selectedHeadroom26790(ivec2 q, int phaseIndex) {
+-            return uDngQuadHeadroom26790 != 0
+-                ? quadHeadroomConfidence26790(q) : phaseHeadroomConfidence26790(q, phaseIndex);
+-        }
+ 
+-        /* Mechanical port of normalDngMerge's fixed-phase sampling equations. The only extension
+-         * is that RGB demosaic asks the same physical phase lattice for R/G1/G2/B at every output
+-         * center. At a pixel whose parity equals phaseIndex, this equation is exactly the DNG
+-         * equation and is regression-checked as such. */
+-        void sampleFixedPhaseDng26790(
++        void dngGeometrySample26789(
+             ivec2 outputPixel,
+-            int phaseIndex,
+-            out float intensity,
+-            out float accumulatedWeight,
+-            out float validAccumulatedWeight,
+-            out float sourceHeadroomConfidence,
+-            out float fractionalHardEdgeWeight,
+-            out vec2 rowSampleUv
++            int channel,
++            out vec2 sourceSampleUv,
++            out vec2 quadSourceUv
+         ) {
+-            intensity = 0.0;
+-            accumulatedWeight = 0.0;
+-            validAccumulatedWeight = 0.0;
+-            sourceHeadroomConfidence = 1.0;
+-            fractionalHardEdgeWeight = 1.0;
+             vec2 rawSize = vec2(uOutputSize);
+             ivec2 quadOrigin = (outputPixel / 2) * 2;
+-            vec2 quadReferenceUv = (vec2(quadOrigin) + vec2(1.0)) / rawSize;
+-            vec2 sampleReferenceUv = quadReferenceUv;
+-            vec2 targetOutputCenter = vec2(outputPixel) + vec2(0.5);
+-            float k = phaseLcaK26790(phaseIndex);
+-            if (uJpegLcaEnabled26790 != 0) {
+-                vec2 opticalCenter = 0.5 * rawSize;
+-                vec2 correctedQuadCenter = opticalCenter +
+-                    ((vec2(quadOrigin) + vec2(1.0)) - opticalCenter) * (1.0 - k);
+-                sampleReferenceUv = correctedQuadCenter / rawSize;
+-                targetOutputCenter = opticalCenter +
+-                    (targetOutputCenter - opticalCenter) * (1.0 - k);
+-            }
+-
+-            /* Exact DNG reference identity applies only when this RGB query is physically located
+-             * on the requested phase. Cross-phase RGB reconstruction still uses the same fixed
+-             * phase lattice rather than inventing a parity-dependent Bayer topology. */
+-            if (uUseFrameWeight == 0 && phaseAt26790(outputPixel) == phaseIndex &&
+-                    (uJpegLcaEnabled26790 == 0 || abs(k) < 1.0e-12)) {
+-                ivec2 q = outputPixel / 2;
+-                float hr = selectedHeadroom26790(q, phaseIndex);
+-                float wb = uPhaseWhiteBalance26790[phaseIndex];
+-                intensity = normalizedRaw26790(outputPixel) * wb;
+-                accumulatedWeight = 1.0;
+-                validAccumulatedWeight = hr;
+-                sourceHeadroomConfidence = hr;
+-                rowSampleUv = (vec2(outputPixel) + vec2(0.5)) / rawSize;
+-                return;
+-            }
+-
+-            vec2 flowUv = sampleReferenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
++            vec2 quadCenter = vec2(quadOrigin) + vec2(1.0);
++            vec2 targetCenter = vec2(outputPixel) + vec2(0.5);
++            float k = channelLcaK26789(channel);
++            vec2 opticalCenter = 0.5 * rawSize;
++            vec2 correctedQuadCenter = opticalCenter +
++                (quadCenter - opticalCenter) * (1.0 - k);
++            vec2 correctedTargetCenter = opticalCenter +
++                (targetCenter - opticalCenter) * (1.0 - k);
++            vec2 correctedReferenceUv = correctedQuadCenter / rawSize;
++            vec2 flowUv = correctedReferenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+             vec2 flow = texture(uFlow, flowUv).xy;
+-            vec2 quadSourceUv = mirrorUvs(sampleReferenceUv + flow);
+-            vec2 sharedTranslationPixels = (quadSourceUv - sampleReferenceUv) * rawSize;
+-            vec3 covariance = unpackCovariance(texture(uCovariance, quadSourceUv).xyz);
+-            vec2 sourcePixel = targetOutputCenter + sharedTranslationPixels;
+-            rowSampleUv = clamp(sourcePixel / rawSize, vec2(0.0), vec2(1.0));
+-            ivec2 offset = phaseOffset26790(phaseIndex);
+-            vec2 latticeCoordinate = 0.5 * (sourcePixel - (vec2(offset) + vec2(0.5)));
+-            ivec2 nearestLattice = ivec2(floor(latticeCoordinate + vec2(0.5)));
+-            vec2 nearestDelta = latticeCoordinate - vec2(nearestLattice);
+-            float wb = uPhaseWhiteBalance26790[phaseIndex];
++            quadSourceUv = mirrorUvs(correctedReferenceUv + flow);
++            vec2 sharedTranslationPixels = (quadSourceUv - correctedReferenceUv) * rawSize;
++            vec2 sourcePixelCenter = correctedTargetCenter + sharedTranslationPixels;
++            sourceSampleUv = mirrorUvs(sourcePixelCenter / rawSize);
++        }
+ 
+-            bool exactSamePhaseSample = max(abs(nearestDelta.x), abs(nearestDelta.y)) < 1.0e-5;
+-            if (exactSamePhaseSample) {
+-                ivec2 q = clampPhaseLattice26790(nearestLattice, phaseIndex);
+-                ivec2 source = pixelForPhaseLattice26790(q, phaseIndex);
+-                float hr = selectedHeadroom26790(q, phaseIndex);
+-                intensity = normalizedRaw26790(source) * wb;
+-                accumulatedWeight = 1.0;
+-                validAccumulatedWeight = hr;
+-                sourceHeadroomConfidence = hr;
+-            } else {
+-                ivec2 latticeBase = ivec2(floor(latticeCoordinate));
+-                float guideMin = 1.0e9;
+-                float guideMax = 0.0;
+-                float guides26790[4];
+-                float samples26790[4];
+-                float weights26790[4];
+-                float headrooms26790[4];
+-                for (int ly = 0; ly <= 1; ++ly) {
+-                    for (int lx = 0; lx <= 1; ++lx) {
+-                        int i = ly * 2 + lx;
+-                        ivec2 q = clampPhaseLattice26790(latticeBase + ivec2(lx, ly), phaseIndex);
+-                        ivec2 source = q * 2 + offset;
+-                        vec2 sampleCenter = vec2(source) + vec2(0.5);
+-                        float w = kernelWeight(sampleCenter - sourcePixel, covariance);
+-                        float sampleValue = normalizedRaw26790(source) * wb;
+-                        float guide = quadGuide26790(q);
+-                        float hr = selectedHeadroom26790(q, phaseIndex);
+-                        guides26790[i] = guide;
+-                        samples26790[i] = sampleValue;
+-                        weights26790[i] = w;
+-                        headrooms26790[i] = hr;
+-                        intensity += sampleValue * w;
+-                        accumulatedWeight += w;
+-                        validAccumulatedWeight += w * hr;
+-                        guideMin = min(guideMin, guide);
+-                        guideMax = max(guideMax, guide);
+-                        sourceHeadroomConfidence = min(sourceHeadroomConfidence, hr);
+-                    }
+-                }
+-                float guideRange = max(guideMax - guideMin, 0.0);
+-                float relativeGuideRange = guideRange / max(guideMax, 0.03);
+-                bool hardEdge = guideMax > 0.08 && guideRange > 0.055 && relativeGuideRange > 0.20;
+-                if (!hardEdge) {
+-                    fractionalHardEdgeWeight = 1.0;
+-                } else if (uUseFrameWeight == 0 && uJpegLcaEnabled26790 != 0 && abs(k) >= 1.0e-12) {
+-                    fractionalHardEdgeWeight = 1.0;
+-                } else if (uDngEdgeDeAlias26790 == 0) {
+-                    fractionalHardEdgeWeight = 0.0;
+-                } else {
+-                    float acrossX = abs(guides26790[1] - guides26790[0]) + abs(guides26790[3] - guides26790[2]);
+-                    float acrossY = abs(guides26790[2] - guides26790[0]) + abs(guides26790[3] - guides26790[1]);
+-                    int i0; int i1;
+-                    vec2 frac = latticeCoordinate - floor(latticeCoordinate);
+-                    if (acrossX > acrossY) {
+-                        bool right = frac.x >= 0.5;
+-                        i0 = right ? 1 : 0; i1 = right ? 3 : 2;
+-                    } else {
+-                        bool bottom = frac.y >= 0.5;
+-                        i0 = bottom ? 2 : 0; i1 = bottom ? 3 : 1;
+-                    }
+-                    float pairMax = max(guides26790[i0], guides26790[i1]);
+-                    float pairRange = abs(guides26790[i0] - guides26790[i1]);
+-                    bool sameSide = pairRange <= max(0.035, 0.12 * max(pairMax, 0.03));
+-                    if (sameSide) {
+-                        intensity = samples26790[i0] * weights26790[i0] + samples26790[i1] * weights26790[i1];
+-                        accumulatedWeight = weights26790[i0] + weights26790[i1];
+-                        validAccumulatedWeight = weights26790[i0] * headrooms26790[i0] +
+-                            weights26790[i1] * headrooms26790[i1];
+-                        sourceHeadroomConfidence = min(headrooms26790[i0], headrooms26790[i1]);
+-                        fractionalHardEdgeWeight = 1.0;
+-                    } else {
+-                        fractionalHardEdgeWeight = 0.0;
+-                    }
++        ivec2 phaseOffset26789(int phaseIndex) {
++            return ivec2(phaseIndex & 1, (phaseIndex >> 1) & 1);
++        }
++        float referenceComponent26789(vec4 v, int phaseIndex) {
++            if (phaseIndex == 0) return v.r;
++            if (phaseIndex == 1) return v.g;
++            if (phaseIndex == 2) return v.b;
++            return v.a;
++        }
++        float referenceSamePhase26789(vec2 rawPixelCenter, int phaseIndex) {
++            ivec2 offset = phaseOffset26789(phaseIndex);
++            vec2 lattice = 0.5 * (rawPixelCenter - (vec2(offset) + vec2(0.5)));
++            vec2 maximum = vec2(max(uExtractedSize - ivec2(1), ivec2(0)));
++            lattice = clamp(lattice, vec2(0.0), maximum);
++            ivec2 q0 = ivec2(floor(lattice));
++            ivec2 q1 = min(q0 + ivec2(1), uExtractedSize - ivec2(1));
++            vec2 f = fract(lattice);
++            float c00 = referenceComponent26789(texelFetch(uReferenceExtractedBayer26789, q0, 0), phaseIndex);
++            float c10 = referenceComponent26789(texelFetch(uReferenceExtractedBayer26789, ivec2(q1.x, q0.y), 0), phaseIndex);
++            float c01 = referenceComponent26789(texelFetch(uReferenceExtractedBayer26789, ivec2(q0.x, q1.y), 0), phaseIndex);
++            float c11 = referenceComponent26789(texelFetch(uReferenceExtractedBayer26789, q1, 0), phaseIndex);
++            return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
++        }
++        vec3 referenceNormalAnchor26789(ivec2 outputPixel) {
++            vec2 rawSize = vec2(uOutputSize);
++            vec2 opticalCenter = 0.5 * rawSize;
++            vec2 targetCenter = vec2(outputPixel) + vec2(0.5);
++            int rPhase = uCfaPattern;
++            int bPhase = 3 - uCfaPattern;
++            int g0 = -1;
++            int g1 = -1;
++            for (int phase = 0; phase < 4; ++phase) {
++                if (phase != rPhase && phase != bPhase) {
++                    if (g0 < 0) g0 = phase; else g1 = phase;
+                 }
+             }
+-            if (fractionalHardEdgeWeight <= 0.0) {
+-                intensity = 0.0;
+-                accumulatedWeight = 0.0;
+-                validAccumulatedWeight = 0.0;
+-                sourceHeadroomConfidence = 0.0;
+-            }
+-        }
+-
+-        float dngQuadRejection26790(ivec2 outputPixel) {
+-            if (uUseFrameWeight == 0) return 1.0;
++            vec2 rCenter = opticalCenter +
++                (targetCenter - opticalCenter) * (1.0 - channelLcaK26789(0));
++            vec2 bCenter = opticalCenter +
++                (targetCenter - opticalCenter) * (1.0 - channelLcaK26789(2));
++            float rRaw = referenceSamePhase26789(rCenter, rPhase);
++            float bRaw = referenceSamePhase26789(bCenter, bPhase);
+             ivec2 quadOrigin = (outputPixel / 2) * 2;
+-            ivec2 maxPixel = uOutputSize - ivec2(1);
+-            vec2 invRawSize = 1.0 / vec2(uOutputSize);
+-            ivec2 p00 = clamp(quadOrigin, ivec2(0), maxPixel);
+-            ivec2 p10 = clamp(quadOrigin + ivec2(1, 0), ivec2(0), maxPixel);
+-            ivec2 p01 = clamp(quadOrigin + ivec2(0, 1), ivec2(0), maxPixel);
+-            ivec2 p11 = clamp(quadOrigin + ivec2(1, 1), ivec2(0), maxPixel);
+-            float w00 = texture(uRejection, (vec2(p00) + vec2(0.5)) * invRawSize).r;
+-            float w10 = texture(uRejection, (vec2(p10) + vec2(0.5)) * invRawSize).r;
+-            float w01 = texture(uRejection, (vec2(p01) + vec2(0.5)) * invRawSize).r;
+-            float w11 = texture(uRejection, (vec2(p11) + vec2(0.5)) * invRawSize).r;
+-            return min(min(w00, w10), min(w01, w11));
+-        }
+-
+-        float luma26790(vec3 v) { return dot(v, vec3(0.25, 0.50, 0.25)); }
+-        vec2 chroma26790(vec3 v) {
+-            float y = max(luma26790(v), 0.02);
++            vec2 g0Center = vec2(quadOrigin + phaseOffset26789(g0)) + vec2(0.5);
++            vec2 g1Center = vec2(quadOrigin + phaseOffset26789(g1)) + vec2(0.5);
++            float g0Raw = referenceSamePhase26789(g0Center, g0);
++            float g1Raw = referenceSamePhase26789(g1Center, g1);
++            float r = rRaw * uReferenceGains26789.r + uReferenceBlackTerms26789.r;
++            /* Both calculation greens are unified by contract. Average their canonical calibration
++             * terms so the LONG guard stays device-safe even when sensor G1/G2 black levels differ. */
++            float gRaw = 0.5 * (g0Raw + g1Raw);
++            float gGain = 0.5 * (uReferenceGains26789.g + uReferenceGains26789.b);
++            float gBlack = 0.5 * (uReferenceBlackTerms26789.g + uReferenceBlackTerms26789.b);
++            float g = gRaw * gGain + gBlack;
++            float b = bRaw * uReferenceGains26789.a + uReferenceBlackTerms26789.a;
++            return max(vec3(r, g, b), vec3(0.0));
++        }
++        float luma26789(vec3 v) { return dot(v, vec3(0.25, 0.50, 0.25)); }
++        vec2 chroma26789(vec3 v) {
++            float y = max(luma26789(v), 0.02);
+             return vec2(v.r - v.g, v.b - v.g) / y;
+         }
+-        vec3 rgbAtLumaFromChroma26790(float y, vec2 c) {
+-            return max(y * vec3(
+-                1.0 + 0.75 * c.x - 0.25 * c.y,
+-                1.0 - 0.25 * c.x - 0.25 * c.y,
+-                1.0 - 0.25 * c.x + 0.75 * c.y), vec3(0.0));
+-        }
+ 
+         void main() {
+-            ivec2 outputPixel26790 = ivec2(gl_FragCoord.xy);
++            ivec2 outputPixel26789 = ivec2(gl_FragCoord.xy);
+             vec2 referenceUv = gl_FragCoord.xy / vec2(uOutputSize);
+             vec3 accumulatedColor = vec3(0.0);
+             vec3 accumulatedWeight = vec3(0.0);
+             vec3 validAccumulatedWeight = vec3(0.0);
+             float sourceNeighborhoodConfidence = 1.0;
+-            vec2 rowReliabilitySampleUv26790 = referenceUv;
++            vec2 rowReliabilitySampleUv26789 = referenceUv;
+ 
+-            if (uJpegLcaEnabled26790 == 0) {
+-                /* Exact inherited no-LCA RGB equation path. */
++            if (uJpegLcaEnabled26789 == 0) {
++                /* Exact inherited no-LCA equation path. */
+                 vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+                 vec4 flow = texture(uFlow, flowUv);
+                 vec2 sampleUv = mirrorUvs(referenceUv + flow.xy);
+@@ -3042,56 +2901,69 @@ internal object GlesMgcRawSabreShaders {
+                     sourceNeighborhoodConfidence,
+                     validAccumulatedWeight
+                 );
+-                rowReliabilitySampleUv26790 = sampleUv;
++                rowReliabilitySampleUv26789 = sampleUv;
+             } else {
+-                int rPhase = redPhase26790();
+-                int bPhase = bluePhase26790();
+-                int g0 = -1; int g1 = -1;
+-                for (int phase = 0; phase < 4; ++phase) {
+-                    if (phase != rPhase && phase != bPhase) {
+-                        if (g0 < 0) g0 = phase; else g1 = phase;
+-                    }
++                /* IRIS_26789_DNG_GEOMETRY_PER_CHANNEL_RBF
++                 * The R/G/B outputs share Sabre's RBF equation, but each channel owns the DNG
++                 * phase-safe radial coordinate before flow/covariance lookup. Signal, weight and
++                 * validity therefore come from one physical coordinate for that channel. */
++                for (int channel = 0; channel < 3; ++channel) {
++                    vec2 sampleUv26789;
++                    vec2 quadSourceUv26789;
++                    dngGeometrySample26789(outputPixel26789, channel, sampleUv26789, quadSourceUv26789);
++                    vec3 covariance26789 = unpackCovariance(texture(uCovariance, quadSourceUv26789).xyz);
++                    vec3 color26789;
++                    vec3 weight26789;
++                    vec3 valid26789;
++                    float confidence26789;
++                    sampleNeighborhoodRbf(
++                        sampleUv26789,
++                        covariance26789,
++                        color26789,
++                        weight26789,
++                        confidence26789,
++                        valid26789
++                    );
++                    accumulatedColor[channel] = color26789[channel];
++                    accumulatedWeight[channel] = weight26789[channel];
++                    validAccumulatedWeight[channel] = valid26789[channel];
++                    sourceNeighborhoodConfidence = min(sourceNeighborhoodConfidence, confidence26789);
++                    if (channel == 1) rowReliabilitySampleUv26789 = sampleUv26789;
+                 }
+-                float rI; float rW; float rV; float rH; float rE; vec2 rUv;
+-                float g0I; float g0W; float g0V; float g0H; float g0E; vec2 g0Uv;
+-                float g1I; float g1W; float g1V; float g1H; float g1E; vec2 g1Uv;
+-                float bI; float bW; float bV; float bH; float bE; vec2 bUv;
+-                sampleFixedPhaseDng26790(outputPixel26790, rPhase, rI, rW, rV, rH, rE, rUv);
+-                sampleFixedPhaseDng26790(outputPixel26790, g0, g0I, g0W, g0V, g0H, g0E, g0Uv);
+-                sampleFixedPhaseDng26790(outputPixel26790, g1, g1I, g1W, g1V, g1H, g1E, g1Uv);
+-                sampleFixedPhaseDng26790(outputPixel26790, bPhase, bI, bW, bV, bH, bE, bUv);
+-                accumulatedColor = vec3(rI, g0I + g1I, bI);
+-                accumulatedWeight = vec3(rW, g0W + g1W, bW);
+-                validAccumulatedWeight = vec3(rV, g0V + g1V, bV);
+-                sourceNeighborhoodConfidence = min(min(rH, bH), min(g0H, g1H));
+-                rowReliabilitySampleUv26790 = 0.5 * (g0Uv + g1Uv);
+-            }
+-
+-            /* IRIS_26790_LONG_CHROMA_NO_REINTRODUCTION
+-             * Completed NORMAL consensus is the sole chroma anchor. A LONG-only chroma departure
+-             * is sufficient to trigger the guard even when luma agrees; strong disagreement is
+-             * fully replaced at the same LONG luminance. */
+-            if (uLongChromaGuard26790 != 0 &&
++            }
++
++            /* IRIS_26789_LONG_CHROMA_NO_REINTRODUCTION
++             * Exposure-normalized LONG may improve radiance/SNR, but if its aligned luma and
++             * chromaticity both disagree with the corrected NORMAL reference, preserve LONG luma
++             * while pulling only its chromaticity toward that physical NORMAL CFA anchor. This is
++             * inactive for every NORMAL frame and never changes temporal weights. */
++            if (uLongChromaGuard26789 != 0 &&
+                     min(accumulatedWeight.r, min(accumulatedWeight.g, accumulatedWeight.b)) > 1.0e-7) {
+-                vec3 longMean = accumulatedColor / max(accumulatedWeight, vec3(1.0e-7));
+-                vec2 normalChroma = texelFetch(uNormalChromaConsensus26790, outputPixel26790, 0).rg;
+-                vec2 longChroma = chroma26790(longMean);
+-                float chromaMismatch = length(longChroma - normalChroma);
+-                float guard = smoothstep(0.035, 0.12, chromaMismatch);
+-                float longY = luma26790(longMean);
+-                vec3 normalAtLongLuma = rgbAtLumaFromChroma26790(longY, normalChroma);
+-                vec3 guardedLongMean = mix(longMean, normalAtLongLuma, guard);
+-                accumulatedColor = guardedLongMean * accumulatedWeight;
++                vec3 longMean26789 = accumulatedColor / max(accumulatedWeight, vec3(1.0e-7));
++                vec3 normalAnchor26789 = referenceNormalAnchor26789(outputPixel26789);
++                float longY26789 = luma26789(longMean26789);
++                float normalY26789 = luma26789(normalAnchor26789);
++                float lumaMismatch26789 = abs(longY26789 - normalY26789) /
++                    max(max(longY26789, normalY26789), 0.03);
++                float chromaMismatch26789 = length(
++                    chroma26789(longMean26789) - chroma26789(normalAnchor26789));
++                float guard26789 = smoothstep(0.08, 0.24, lumaMismatch26789) *
++                    smoothstep(0.055, 0.18, chromaMismatch26789);
++                guard26789 = min(guard26789, 0.85);
++                vec3 normalAtLongLuma26789 = normalAnchor26789 *
++                    (longY26789 / max(normalY26789, 1.0e-5));
++                vec3 guardedLongMean26789 = mix(longMean26789, normalAtLongLuma26789, guard26789);
++                accumulatedColor = guardedLongMean26789 * accumulatedWeight;
+             }
+ 
+             float frameWeight = uUseFrameWeight != 0
+                 ? texture(uRejection, referenceUv).r
+                 : 1.0;
+-            frameWeight *= iris26720MergeRowReliability(rowReliabilitySampleUv26790.y);
++            frameWeight *= iris26720MergeRowReliability(rowReliabilitySampleUv26789.y);
+             if (uSourceClipGuard != 0) {
+                 frameWeight *= mix(
+-                    uSourceClippedWeight, 1.0,
+-                    clamp(sourceNeighborhoodConfidence, 0.0, 1.0));
++                    uSourceClippedWeight,1.0,
++                    clamp(sourceNeighborhoodConfidence,0.0,1.0));
+             }
+             accumulatedColor *= frameWeight;
+             accumulatedWeight *= frameWeight;
+@@ -5102,69 +4974,6 @@ internal object GlesMgcRawSabreShaders {
+     """.trimIndent()
+ 
+ 
+-    /* IRIS_26790_DNG_EXACT_TWO_GREEN_NEUTRAL_GATE
+-     * Consume the literal NORMAL DNG accumulator weights used by normalizeBayer. No JPEG validity
+-     * proxy is permitted. normalizeBayer always clamps exported sensor-normalized CFA to 1.0; for
+-     * a both-green-censored quad its AsShotNeutral R/B limits also become exactly 1.0 after
+-     * calculation WB. The calculation-WB RGB neutral ceiling is therefore vec3(1.0), not the old
+-     * R/B-only approximation that could leave G extended and manufacture neon green. */
+-    val jpegNeutralHighlightClamp26790 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uSource;
+-        uniform sampler2D uNormalDngAccumulator26790;
+-        uniform ivec2 uOutputSize;
+-        uniform int uCfaPattern26790;
+-        layout(location = 0) out vec4 oColor;
+-        int redPhase26790() { return uCfaPattern26790; }
+-        int bluePhase26790() { return 3 - uCfaPattern26790; }
+-        void main() {
+-            ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uOutputSize - ivec2(1));
+-            vec4 source = texelFetch(uSource, p, 0);
+-            int rPhase = redPhase26790();
+-            int bPhase = bluePhase26790();
+-            ivec2 q = (p / 2) * 2;
+-            int g0 = -1; int g1 = -1;
+-            for (int phase = 0; phase < 4; ++phase) {
+-                if (phase != rPhase && phase != bPhase) {
+-                    if (g0 < 0) g0 = phase; else g1 = phase;
+-                }
+-            }
+-            ivec2 gp0 = min(q + ivec2(g0 & 1, g0 >> 1), uOutputSize - ivec2(1));
+-            ivec2 gp1 = min(q + ivec2(g1 & 1, g1 >> 1), uOutputSize - ivec2(1));
+-            float gw0 = texelFetch(uNormalDngAccumulator26790, gp0, 0).g;
+-            float gw1 = texelFetch(uNormalDngAccumulator26790, gp1, 0).g;
+-            bool bothGreensFullyCensored26790 = gw0 <= 0.000051 && gw1 <= 0.000051;
+-            if (bothGreensFullyCensored26790) {
+-                source.rgb = min(source.rgb, vec3(1.0));
+-            }
+-            oColor = source;
+-        }
+-    """.trimIndent()
+-
+-    /* IRIS_26790_COMPLETED_NORMAL_CHROMA_SNAPSHOT
+-     * Snapshot only two chroma coordinates from the completed NORMAL temporal accumulator. This is
+-     * created once immediately before LONG, so LONG cannot compare against a single reference. */
+-    val normalChromaConsensus26790 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uAccumulatedColor;
+-        uniform sampler2D uAccumulatedWeightsGb;
+-        layout(location = 0) out vec2 oChroma;
+-        float luma26790(vec3 v) { return dot(v, vec3(0.25, 0.50, 0.25)); }
+-        void main() {
+-            ivec2 p = ivec2(gl_FragCoord.xy);
+-            vec4 sums = texelFetch(uAccumulatedColor, p, 0);
+-            vec2 gbw = texelFetch(uAccumulatedWeightsGb, p, 0).rg;
+-            vec3 weights = max(vec3(sums.a, gbw), vec3(1.0e-7));
+-            vec3 mean = sums.rgb / weights;
+-            float y = max(luma26790(mean), 0.02);
+-            oChroma = clamp(vec2(mean.r - mean.g, mean.b - mean.g) / y, vec2(-4.0), vec2(4.0));
+-        }
+-    """.trimIndent()
+-
+     /* IRIS_26787_JPEG_NEUTRAL_HIGHLIGHT_PRE_RESOLVE
+      * The 26786 DNG A/B proved the bounded neutral highlight rule on fully censored green
+      * evidence. Apply the same ownership before native Resolve: only when the accumulated
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index b4495382fb2ed544bc0dfa9478a454b2cb22f88c..8bdb1684b17f233f81e21e06c3b3e8cd0e6df516 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -680,8 +680,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreReciprocalGreenWeightProgram = 0
+     private var sabreDehomogenizeProgram = 0
+     private var sabreJpegNeutralHighlightClampProgram26787 = 0
+-    private var sabreJpegNeutralHighlightClampProgram26790 = 0
+-    private var sabreNormalChromaConsensusProgram26790 = 0
+     private var sabreJpegPhaseSafeCfaLcaProgram26788 = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreOutputTransformFloatProgram = 0
+@@ -2235,7 +2233,7 @@ internal class GlesMgcRawSpatialStacker(
+         PLog.i(
+             SABRE_TAG,
+             "IRIS_26776_CLAUDE_CFA_CHROMA_OWNER commonSourceClipGuard=true " +
+-                "sourceValidityFootprint=NO_LCA_EXACT_3X3__LCA_EXACT_DNG_FIXED_PHASE sharedRgbTemporalWeight=true " +
++                "sourceValidityFootprint=EXACT_CONSUMED_3X3 sharedRgbTemporalWeight=true " +
+                 "phaseValidity=PRE_VGN_MATERIAL_OWNERSHIP periodicProof=FIVE_TAP_2PX " +
+                 "invalidEdgeRequiresMeasuredCfaWeakness=true chromaMedianPasses=1 lumaModified=false",
+         )
+@@ -2440,23 +2438,11 @@ internal class GlesMgcRawSpatialStacker(
+              * covariance and temporal rejection but never ResolveSabre, WB/color transform,
+              * lens shading, denoise, tone, sharpening or JPEG processing.
+              */
+-            /* IRIS_26790_LITERAL_DNG_ACCUMULATOR_SHARED_AUTHORITY
+-             * JPEG neutral censorship reads the exact same NORMAL accumulator weights consumed by
+-             * normalizeBayer. Allocate the literal DNG authority for DNG export or neutral clamp;
+-             * do not recreate its support equation in an RGB sidecar. */
+-            var normalDngAccumulator = if (exportNormalStackedDng || dngOptions26786.neutralClamp) {
++            val normalDngAccumulator = if (exportNormalStackedDng) {
+                 createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
+             } else {
+                 0
+             }
+-            PLog.i(
+-                SABRE_TAG,
+-                "IRIS_26790_EXACT_DNG_AUX_MEMORY literalDngAccumulatorBytes=" +
+-                    "${if (normalDngAccumulator != 0) width.toLong() * height.toLong() * 4L else 0L} " +
+-                    "alreadyRequiredByDngExport=$exportNormalStackedDng " +
+-                    "longConsensusPotentialBytes=${if (shadowLongFrameCount > 0) width.toLong() * height.toLong() * 4L else 0L} " +
+-                    "lifetime=ACCUMULATE_NORMAL_THROUGH_NEUTRAL__CONSENSUS_ONLY_DURING_LONG",
+-            )
+             /* IRIS_26658_GOOGLE_BRACKET_DNG_PRESERVATION
+              * Whenever a SHADOW_LONG exists (Motion bracket or Night), allocate a second
+              * NORMAL-only coverage map so Long support can never leak into stacked DNG statistics.
+@@ -2567,7 +2553,6 @@ internal class GlesMgcRawSpatialStacker(
+              * reserve six units per scheduled evidence frame so additive blending cannot saturate. */
+             val validityWeightScale26614 = 6f * scheduledEvidenceCount26606.coerceAtLeast(1).toFloat()
+             renderSabreMerge(
+-                raw26790 = referenceRaw,
+                 extracted = referenceExtracted,
+                 flow = zeroFlow,
+                 covariance = referenceCovariance,
+@@ -2587,14 +2572,12 @@ internal class GlesMgcRawSpatialStacker(
+                 accumulatedValidity26614 = accumulatedValidity26614,
+                 validityWeightScale26614 = validityWeightScale26614,
+                 rowFlickerFrame26720 = frames.first().takeIf(::hasRowFlickerEvidence26720),
+-                jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
+-                jpegLcaKr26790 = dngOptions26786.kR,
+-                jpegLcaKb26790 = dngOptions26786.kB,
+-                dngQuadHeadroom26790 = dngOptions26786.quadScopedHeadroom,
+-                dngEdgeDeAlias26790 = dngOptions26786.edgeDeAlias,
+-                sourceWhiteNormalized26790 = 1f,
+-                normalChromaConsensus26790 = 0,
+-                longChromaGuard26790 = false,
++                jpegIntegratedLca26789 = dngOptions26786.lcaEnabled,
++                jpegLcaKr26789 = dngOptions26786.kR,
++                jpegLcaKb26789 = dngOptions26786.kB,
++                referenceExtracted26789 = referenceExtracted,
++                referenceCalibration26789 = referenceCalibration,
++                longChromaGuard26789 = false,
+             )
+             if (enableSabreSuperRes) {
+                 val referenceEvidence = persistTrue2xEvidence(
+@@ -2656,16 +2639,6 @@ internal class GlesMgcRawSpatialStacker(
+             var retainedShortFlow26648: SabreConvertedAlignment? = null
+             var retainedShortPhysicalReverseWeight26648 = 0
+             var retainedShortCalibration26648: FrameCalibration? = null
+-            /* IRIS_26790_NORMAL_AUX_ORDER_PROOF
+-             * The bridge already emits all NORMALs, then optional LONG, then optional final SHORT.
+-             * Enforce that contract here because completed-NORMAL chroma must be frozen before LONG. */
+-            val firstAux26790 = frames.indexOfFirst { it.role != RawBurstFrameRole.NORMAL }
+-                .let { if (it < 0) frames.size else it }
+-            require(frames.take(firstAux26790).all { it.role == RawBurstFrameRole.NORMAL } &&
+-                frames.drop(firstAux26790).none { it.role == RawBurstFrameRole.NORMAL }) {
+-                "26790 requires contiguous NORMAL frames before auxiliary evidence"
+-            }
+-            var normalChromaConsensus26790 = 0
+ 
+             for (index in 1 until frames.size) {
+                 val transientTextureStart = textures.size
+@@ -2686,8 +2659,8 @@ internal class GlesMgcRawSpatialStacker(
+                     MotionTrace.processingState("IRIS_26604_LONG_ONE_TUNNEL_METADATA", details26604Long)
+                     PLog.i(
+                         SABRE_TAG,
+-                        "IRIS_26790_LONG_CHROMA_GUARD enabled=true anchor=COMPLETED_NORMAL_CONSENSUS " +
+-                            "lumaPreserved=true temporalWeightUnchanged=true disagreementGate=PURE_CHROMA_ALLOWED",
++                        "IRIS_26789_LONG_CHROMA_GUARD enabled=true anchor=NORMAL_REFERENCE_PHASE_SAFE_CFA " +
++                            "lumaPreserved=true temporalWeightUnchanged=true disagreementGate=LUMA_AND_CHROMA",
+                     )
+                 }
+                 uploadRaw(images[index], currentRaw, "Sabre frame $index")
+@@ -2818,22 +2791,7 @@ internal class GlesMgcRawSpatialStacker(
+                             accumulatedWeightScale,
+                         )
+                     }
+-                    if (frame.role == RawBurstFrameRole.SHADOW_LONG && normalChromaConsensus26790 == 0) {
+-                        require(index == firstAux26790) {
+-                            "26790 SHADOW_LONG must immediately follow completed NORMAL stack"
+-                        }
+-                        normalChromaConsensus26790 = renderSabreNormalChromaConsensus26790(
+-                            accumulatedColor = accumulatedColor,
+-                            accumulatedWeightsGb = accumulatedWeightsGb,
+-                        )
+-                        PLog.i(
+-                            SABRE_TAG,
+-                            "IRIS_26790_COMPLETED_NORMAL_LONG_CHROMA owner=FULL_NORMAL_CONSENSUS " +
+-                                "normalFrames=$normalFrameCount longLumaPreserved=true pureChromaMismatchGuards=true",
+-                        )
+-                    }
+                     renderSabreMerge(
+-                        raw26790 = currentRaw,
+                         extracted = currentExtracted,
+                         flow = flow,
+                         covariance = currentCovariance,
+@@ -2852,14 +2810,12 @@ internal class GlesMgcRawSpatialStacker(
+                         accumulatedValidity26614 = accumulatedValidity26614,
+                         validityWeightScale26614 = validityWeightScale26614,
+                         rowFlickerFrame26720 = frame.takeIf(::hasRowFlickerEvidence26720),
+-                        jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
+-                        jpegLcaKr26790 = dngOptions26786.kR,
+-                        jpegLcaKb26790 = dngOptions26786.kB,
+-                        dngQuadHeadroom26790 = dngOptions26786.quadScopedHeadroom,
+-                        dngEdgeDeAlias26790 = dngOptions26786.edgeDeAlias,
+-                        sourceWhiteNormalized26790 = exposureScale,
+-                        normalChromaConsensus26790 = normalChromaConsensus26790,
+-                        longChromaGuard26790 = frame.role == RawBurstFrameRole.SHADOW_LONG,
++                        jpegIntegratedLca26789 = dngOptions26786.lcaEnabled,
++                        jpegLcaKr26789 = dngOptions26786.kR,
++                        jpegLcaKb26789 = dngOptions26786.kB,
++                        referenceExtracted26789 = referenceExtracted,
++                        referenceCalibration26789 = referenceCalibration,
++                        longChromaGuard26789 = frame.role == RawBurstFrameRole.SHADOW_LONG,
+                     )
+                 } else {
+                     require(index == frames.lastIndex) {
+@@ -2952,25 +2908,11 @@ internal class GlesMgcRawSpatialStacker(
+                         transientTextureStart,
+                         intArrayOf(retainedFlow.texture, retainedShortPhysicalReverseWeight26648),
+                     )
+-                } else if (normalChromaConsensus26790 != 0) {
+-                    /* The consensus may be created during the first LONG frame after
+-                     * transientTextureStart. Retain it across any additional LONG frames. */
+-                    releaseTexturesFromExcept(
+-                        transientTextureStart,
+-                        intArrayOf(normalChromaConsensus26790),
+-                    )
+                 } else {
+                     releaseTexturesFrom(transientTextureStart)
+                 }
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+-            if (normalChromaConsensus26790 != 0) {
+-                releaseOwnedTexture(
+-                    normalChromaConsensus26790,
+-                    "26790 completed NORMAL chroma consensus after all LONG merges",
+-                )
+-                normalChromaConsensus26790 = 0
+-            }
+ 
+             /* IRIS_26545_SABRE_MEASURED_SUPPORT
+              * Match current MGC/Sabre behavior: derive the merged noise coefficient from the
+@@ -2990,8 +2932,7 @@ internal class GlesMgcRawSpatialStacker(
+                     "localResidualRangeQ8=192..256 maxDenoiseIncrease=false",
+             )
+ 
+-            if (exportNormalStackedDng) {
+-                check(normalDngAccumulator != 0) { "26790 DNG export missing literal NORMAL accumulator" }
++            if (normalDngAccumulator != 0) {
+                 val normalizedDngTexture = renderBayer16(
+                     accumulator = normalDngAccumulator,
+                     outputExposureScale = 1f,
+@@ -3070,12 +3011,9 @@ internal class GlesMgcRawSpatialStacker(
+                 val clamped26787 = createTexture(
+                     width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+                 )
+-                check(normalDngAccumulator != 0) {
+-                    "26790 exact DNG neutral clamp requires literal NORMAL DNG accumulator"
+-                }
+-                renderSabreJpegNeutralHighlightClamp26790(
++                renderSabreJpegNeutralHighlightClamp26787(
+                     source = resolveAccumulatedColor26604,
+-                    normalDngAccumulator26790 = normalDngAccumulator,
++                    validWeights = accumulatedValidity26614,
+                     output = clamped26787,
+                 )
+                 releaseOwnedTexture(
+@@ -3084,13 +3022,6 @@ internal class GlesMgcRawSpatialStacker(
+                 )
+                 resolveAccumulatedColor26604 = clamped26787
+             }
+-            if (normalDngAccumulator != 0) {
+-                releaseOwnedTexture(
+-                    normalDngAccumulator,
+-                    "26790 literal NORMAL DNG accumulator after export/neutral ownership",
+-                )
+-                normalDngAccumulator = 0
+-            }
+ 
+             var fusionDecision26651 = 0
+             var shortColorValidity26651 = 0
+@@ -3173,22 +3104,21 @@ internal class GlesMgcRawSpatialStacker(
+                 "IRIS_26781_DIRECT_POST_SHORT_RESOLVE matchedBandwidth26780=false " +
+                     "normalShortFusionUnchanged=true edgeSuppressor26778PeriodicGuard26788=true",
+             )
+-            /* IRIS_26790_EXACT_DNG_FIXED_PHASE_RUNTIME_OWNER
+-             * No independent JPEG approximation remains in the LCA geometry or neutral-censor
+-             * decision: LCA-enabled NORMAL/LONG consume exact UINT RAW on fixed physical 2-pixel
+-             * phase lattices using the DNG radial/kernel/headroom/de-alias equations, and the
+-             * neutral gate reads the literal completed-NORMAL DNG accumulator weights. Sabre RGB
+-             * reconstruction remains the established JPEG owner after those physical CFA rules. */
++            /* IRIS_26789_ONE_IN_RBF_LCA_OWNER
++             * NORMAL/LONG use the DNG radial geometry inside the actual Sabre channel RBF. The
++             * sampled CFA value, clipping/headroom provenance, flow and covariance therefore refer
++             * to the same physical coordinate. 26788's separate NORMAL/LONG packed-CFA prewarp is
++             * retired. The inherited neutral clamp stays after NORMAL dehomogenization because the
++             * audited calculation-WB domain maps DNG AsShotNeutral exactly to R/B <= 1.0. */
+             PLog.i(
+                 SABRE_TAG,
+-                "IRIS_26790_JPEG_CFA_OPTIONS lca=${dngOptions26786.lcaEnabled} " +
++                "IRIS_26789_JPEG_CFA_OPTIONS lca=${dngOptions26786.lcaEnabled} " +
+                     "kR=${dngOptions26786.kR} kB=${dngOptions26786.kB} " +
+-                    "neutralClamp=${dngOptions26786.neutralClamp} neutralGate=LITERAL_NORMAL_DNG_ACCUMULATOR_WEIGHTS__FULL_NEUTRAL_WHITE_CEILING " +
++                    "neutralClamp=${dngOptions26786.neutralClamp} neutralMath=DNG_AS_SHOT_NEUTRAL_WB_EQUIVALENT " +
+                     "headroomScope=${dngOptions26786.headroomScopeName()} " +
+                     "deAlias=${dngOptions26786.edgeDeAlias} settingsSource=${dngOptions26786.source} " +
+-                    "normalLongOwner=EXACT_DNG_FIXED_PHASE_UINT_RAW genericParityRbfForLca=false " +
+-                    "postRgbLcaRetired=true normalLongPrewarpRetired=true " +
+-                    "longChromaAnchor=COMPLETED_NORMAL_CONSENSUS",
++                    "normalLongOwner=IN_RBF_DNG_GEOMETRY sameCoordinateValidity=true " +
++                    "postRgbLcaRetired=true normalLongPrewarpRetired=true longChromaGuard=true",
+             )
+             sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveExtendedLinear26651)
+             if (resolveExtendedLinear26651 != resolveAccumulatedColor26604) {
+@@ -3702,7 +3632,7 @@ internal class GlesMgcRawSpatialStacker(
+         sourceWhiteNormalized: Float,
+         dngOptions26786: IrisMotionSettings.DngOptions.Snapshot,
+     ) {
+-        check(sabreNormalDngMergeProgram != 0 && accumulator != 0)
++        check(exportNormalStackedDng && sabreNormalDngMergeProgram != 0 && accumulator != 0)
+         val program = sabreNormalDngMergeProgram
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uRaw", 0, raw)
+@@ -5163,7 +5093,6 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     private fun renderSabreMerge(
+-        raw26790: Int,
+         extracted: Int,
+         flow: SabreConvertedAlignment,
+         covariance: Int,
+@@ -5179,14 +5108,12 @@ internal class GlesMgcRawSpatialStacker(
+         accumulatedValidity26614: Int = 0,
+         validityWeightScale26614: Float = 1f,
+         rowFlickerFrame26720: RawStackFrame? = null,
+-        jpegIntegratedLca26790: Boolean = false,
+-        jpegLcaKr26790: Float = 0f,
+-        jpegLcaKb26790: Float = 0f,
+-        dngQuadHeadroom26790: Boolean = false,
+-        dngEdgeDeAlias26790: Boolean = false,
+-        sourceWhiteNormalized26790: Float = 1f,
+-        normalChromaConsensus26790: Int = 0,
+-        longChromaGuard26790: Boolean = false,
++        jpegIntegratedLca26789: Boolean = false,
++        jpegLcaKr26789: Float = 0f,
++        jpegLcaKb26789: Float = 0f,
++        referenceExtracted26789: Int,
++        referenceCalibration26789: FrameCalibration,
++        longChromaGuard26789: Boolean = false,
+     ) {
+         val rowFlickerActive26720 = rowFlickerFrame26720?.let(::hasRowFlickerEvidence26720) == true
+         val program = sabreMergeProgram
+@@ -5195,25 +5122,12 @@ internal class GlesMgcRawSpatialStacker(
+         bindTexture(program, "uFlow", 1, flow.texture)
+         bindTexture(program, "uCovariance", 2, covariance)
+         bindTexture(program, "uRejection", 3, weight)
+-        check(raw26790 != 0) { "26790 exact DNG fixed-phase sampling requires raw texture" }
+-        bindTexture(program, "uRaw26790", 4, raw26790)
+-        if (normalChromaConsensus26790 != 0) {
+-            bindTexture(program, "uNormalChromaConsensus26790", 5, normalChromaConsensus26790)
+-        } else {
+-            bindTexture(program, "uNormalChromaConsensus26790", 5, accumulatedWeightsGb)
+-        }
+-        uniform1i(program, "uJpegLcaEnabled26790", if (jpegIntegratedLca26790) 1 else 0)
+-        uniform2f(program, "uJpegLcaKrKb26790", jpegLcaKr26790, jpegLcaKb26790)
+-        uniform1i(program, "uDngQuadHeadroom26790", if (dngQuadHeadroom26790) 1 else 0)
+-        uniform1i(program, "uDngEdgeDeAlias26790", if (dngEdgeDeAlias26790) 1 else 0)
+-        uniform1f(program, "uSourceWhiteNormalized26790", sourceWhiteNormalized26790)
+-        uniform1i(program, "uLongChromaGuard26790", if (longChromaGuard26790) 1 else 0)
+-        uniform4fv(program, "uPhaseGains26790", calibration.bayerPhaseGains)
+-        uniform4fv(program, "uPhaseBlackTerms26790", calibration.bayerPhaseBlackTerms)
+-        val phaseWhiteBalance26790 = FloatArray(4) { phase ->
+-            calculationWhiteBalance[canonicalChannelAtPhase(phase)]
+-        }
+-        uniform4fv(program, "uPhaseWhiteBalance26790", phaseWhiteBalance26790)
++        bindTexture(program, "uReferenceExtractedBayer26789", 4, referenceExtracted26789)
++        uniform1i(program, "uJpegLcaEnabled26789", if (jpegIntegratedLca26789) 1 else 0)
++        uniform2f(program, "uJpegLcaKrKb26789", jpegLcaKr26789, jpegLcaKb26789)
++        uniform1i(program, "uLongChromaGuard26789", if (longChromaGuard26789) 1 else 0)
++        uniform4fv(program, "uReferenceGains26789", referenceCalibration26789.gains)
++        uniform4fv(program, "uReferenceBlackTerms26789", referenceCalibration26789.blackTerms)
+         uniform2i(program, "uExtractedSize", extractedWidth, extractedHeight)
+         uniform2i(program, "uOutputSize", width, height)
+         uniformSabreFlowScaleOffset(program, flow)
+@@ -5551,35 +5465,6 @@ internal class GlesMgcRawSpatialStacker(
+         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+     }
+ 
+-    private fun renderSabreNormalChromaConsensus26790(
+-        accumulatedColor: Int,
+-        accumulatedWeightsGb: Int,
+-    ): Int {
+-        val program = sabreNormalChromaConsensusProgram26790
+-        check(program != 0 && accumulatedColor != 0 && accumulatedWeightsGb != 0)
+-        val output = createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uAccumulatedColor", 0, accumulatedColor)
+-        bindTexture(program, "uAccumulatedWeightsGb", 1, accumulatedWeightsGb)
+-        draw(program, width, height, intArrayOf(output))
+-        return output
+-    }
+-
+-    private fun renderSabreJpegNeutralHighlightClamp26790(
+-        source: Int,
+-        normalDngAccumulator26790: Int,
+-        output: Int,
+-    ) {
+-        val program = sabreJpegNeutralHighlightClampProgram26790
+-        check(program != 0 && source != 0 && normalDngAccumulator26790 != 0 && output != 0)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uSource", 0, source)
+-        bindTexture(program, "uNormalDngAccumulator26790", 1, normalDngAccumulator26790)
+-        uniform2i(program, "uOutputSize", width, height)
+-        uniform1i(program, "uCfaPattern26790", cfaPattern)
+-        draw(program, width, height, intArrayOf(output))
+-    }
+-
+     private fun renderSabreJpegNeutralHighlightClamp26787(
+         source: Int,
+         validWeights: Int,
+@@ -5796,7 +5681,6 @@ internal class GlesMgcRawSpatialStacker(
+         FloatArray(4) { phase -> calibration.blackLevels[canonicalChannelAtPhase(phase)] }
+ 
+     private fun resolveSabreShortNativeExposure26587(
+-        raw26790: Int,
+         extracted: Int,
+         flow: SabreConvertedAlignment,
+         covariance: Int,
+@@ -5810,7 +5694,6 @@ internal class GlesMgcRawSpatialStacker(
+         val coverage = createTexture(1, 1, GLES30.GL_R8, GLES30.GL_NEAREST)
+         clearSabreAccumulators(color, weightsGb, coverage, 1, 1)
+         renderSabreMerge(
+-            raw26790 = raw26790,
+             extracted = extracted,
+             flow = flow,
+             covariance = covariance,
+@@ -5823,8 +5706,10 @@ internal class GlesMgcRawSpatialStacker(
+             useFrameWeight = false,
+             sourceClipGuard = false,
+             sourceClippedWeight = 1f,
+-            jpegIntegratedLca26790 = false,
+-            longChromaGuard26790 = false,
++            jpegIntegratedLca26789 = false,
++            referenceExtracted26789 = extracted,
++            referenceCalibration26789 = calibration,
++            longChromaGuard26789 = false,
+         )
+         renderSabreDehomogenize(
+             accumulatedColor = color,
+@@ -6908,17 +6793,9 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.dehomogenize,
+             "mgc_sabre_dehomogenize",
+         )
+-        /* IRIS_26790_RETIRES_APPROXIMATE_26787_NEUTRAL_GATE
+-         * Preserve source only for rollback provenance. An accidental call must fail rather than
+-         * revive reconstructed-green RGB10 gating. */
+-        sabreJpegNeutralHighlightClampProgram26787 = 0
+-        sabreJpegNeutralHighlightClampProgram26790 = linkProgram(
+-            GlesMgcRawSabreShaders.jpegNeutralHighlightClamp26790,
+-            "iris_26790_dng_exact_two_green_neutral_gate",
+-        )
+-        sabreNormalChromaConsensusProgram26790 = linkProgram(
+-            GlesMgcRawSabreShaders.normalChromaConsensus26790,
+-            "iris_26790_completed_normal_chroma_consensus",
++        sabreJpegNeutralHighlightClampProgram26787 = linkProgram(
++            GlesMgcRawSabreShaders.jpegNeutralHighlightClamp26787,
++            "iris_26787_jpeg_neutral_highlight_pre_resolve",
+         )
+         sabreJpegPhaseSafeCfaLcaProgram26788 = linkProgram(
+             GlesMgcRawSabreShaders.jpegPhaseSafeCfaLca26788,
+diff --git b/app/version.properties a/app/version.properties
+index af00f48ced410753a058f52878d4e7d896e39041..6383463c8d89fcb7eef946c9b2164fbf98a2d3ec 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726790
+-VERSION_BUILD=26790
++VERSION_NAME=0.9726789
++VERSION_BUILD=26789
