@@ -1,0 +1,231 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 950fb6772313d0edd97dc2af7dcdff488ed269ba..3b1bea98838d3627aee38a5841276e9103db3719 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -4756,6 +4756,84 @@ internal object GlesMgcRawSabreShaders {
+     """.trimIndent()
+ 
+ 
++    /* IRIS_26787_JPEG_NEUTRAL_HIGHLIGHT_PRE_RESOLVE
++     * The 26786 DNG A/B proved the bounded neutral highlight rule on fully censored green
++     * evidence. Apply the same ownership before native Resolve: only when the accumulated
++     * measured-green validity is quantized zero do R/B lose unsupported >white authority.
++     * This does not synthesize hue, does not change G/luma, and does not touch VGN/26778. */
++    val jpegNeutralHighlightClamp26787 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uSource;
++        uniform sampler2D uValidWeights;
++        uniform float uZeroValidityThreshold26787;
++        layout(location = 0) out vec4 oColor;
++        void main() {
++            ivec2 p = ivec2(gl_FragCoord.xy);
++            vec4 source = texelFetch(uSource, p, 0);
++            float measuredGreenValidity = texelFetch(uValidWeights, p, 0).g;
++            if (measuredGreenValidity <= uZeroValidityThreshold26787) {
++                source.r = min(source.r, 1.0);
++                source.b = min(source.b, 1.0);
++            }
++            oColor = source;
++        }
++    """.trimIndent()
++
++    /* IRIS_26787_JPEG_LCA_PRE_RESOLVE
++     * Share the measured 26786 radial LCA model with the final Sabre carrier immediately before
++     * native Resolve. G and alpha stay on the output lattice. R/B are sampled at the same fixed
++     * optical-center radial coordinates proven by the DNG A/B. Manual bilinear sampling keeps
++     * this independent of texture filter state and never changes output geometry. */
++    val jpegLcaPreResolve26787 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uSource;
++        uniform ivec2 uSize;
++        uniform vec2 uKrKb26787;
++        layout(location = 0) out vec4 oColor;
++
++        float sampleChannelBilinear26787(vec2 pixelCenter, int channel) {
++            vec2 grid = clamp(
++                pixelCenter - vec2(0.5),
++                vec2(0.0),
++                vec2(uSize - ivec2(1))
++            );
++            ivec2 p0 = ivec2(floor(grid));
++            ivec2 p1 = min(p0 + ivec2(1), uSize - ivec2(1));
++            vec2 f = fract(grid);
++            vec4 c00 = texelFetch(uSource, p0, 0);
++            vec4 c10 = texelFetch(uSource, ivec2(p1.x, p0.y), 0);
++            vec4 c01 = texelFetch(uSource, ivec2(p0.x, p1.y), 0);
++            vec4 c11 = texelFetch(uSource, p1, 0);
++            float a = channel == 0 ? c00.r : c00.b;
++            float b = channel == 0 ? c10.r : c10.b;
++            float c = channel == 0 ? c01.r : c01.b;
++            float d = channel == 0 ? c11.r : c11.b;
++            return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
++        }
++
++        void main() {
++            ivec2 p = ivec2(gl_FragCoord.xy);
++            vec4 center = texelFetch(uSource, p, 0);
++            vec2 outputCenter = vec2(p) + vec2(0.5);
++            vec2 opticalCenter = 0.5 * vec2(uSize);
++            vec2 redCenter = opticalCenter +
++                (outputCenter - opticalCenter) * (1.0 - uKrKb26787.x);
++            vec2 blueCenter = opticalCenter +
++                (outputCenter - opticalCenter) * (1.0 - uKrKb26787.y);
++            oColor = vec4(
++                sampleChannelBilinear26787(redCenter, 0),
++                center.g,
++                sampleChannelBilinear26787(blueCenter, 2),
++                center.a
++            );
++        }
++    """.trimIndent()
++
++
+     /* IRIS_26564_TRUE_2X_GPU_ACCELERATOR
+      * Tile-local GLES implementation of the same direct-CFA/RBF estimator as IrisTrue2xSrNative.
+      * It consumes persisted Sabre evidence; no alignment or manufacturer policy lives here.
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 01b2455634fd1eb8167f435b5f1dad306bba1503..4181edd0210acb85963c9ee89cc3b0d93247230e 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -679,6 +679,8 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreCopyAlphaProgram = 0
+     private var sabreReciprocalGreenWeightProgram = 0
+     private var sabreDehomogenizeProgram = 0
++    private var sabreJpegNeutralHighlightClampProgram26787 = 0
++    private var sabreJpegLcaPreResolveProgram26787 = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreOutputTransformFloatProgram = 0
+     private var edgeFalseColorSuppressor26778Program = 0
+@@ -2983,7 +2985,26 @@ internal class GlesMgcRawSpatialStacker(
+                 alphaBias = 1f / mergedFrameCount.toFloat().coerceAtLeast(1f),
+             )
+             check(sabreRSupport26613 != 0) { "26648 Sabre R support provenance missing" }
+-            val resolveAccumulatedColor26604 = dehomogenizedNormal26604
++            var resolveAccumulatedColor26604 = dehomogenizedNormal26604
++            /* IRIS_26787_SHARE_DNG_NEUTRAL_CLAMP_WITH_JPEG
++             * 26786's best DNG A/B result came from the bounded neutral highlight rule. Keep the
++             * rule before SHORT fusion so a genuinely measured SHORT can still restore highlight
++             * radiance/chromaticity. The gate is measured CFA green validity, not RGB appearance. */
++            if (dngOptions26786.neutralClamp) {
++                val clamped26787 = createTexture(
++                    width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
++                )
++                renderSabreJpegNeutralHighlightClamp26787(
++                    source = resolveAccumulatedColor26604,
++                    validWeights = accumulatedValidity26614,
++                    output = clamped26787,
++                )
++                releaseOwnedTexture(
++                    resolveAccumulatedColor26604,
++                    "26787 unclamped NORMAL pre-Resolve master",
++                )
++                resolveAccumulatedColor26604 = clamped26787
++            }
+ 
+             var fusionDecision26651 = 0
+             var shortColorValidity26651 = 0
+@@ -3063,7 +3084,36 @@ internal class GlesMgcRawSpatialStacker(
+                 "IRIS_26781_DIRECT_POST_SHORT_RESOLVE matchedBandwidth26780=false " +
+                     "normalShortFusionUnchanged=true edgeSuppressor26778Unchanged=true",
+             )
+-            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveExtendedLinear26651)
++            /* IRIS_26787_SHARE_DNG_LCA_WITH_JPEG
++             * Apply LCA after the optional SHORT owner so every source of final pre-Resolve color
++             * receives the same measured radial registration. This is before native Resolve and
++             * leaves 26778/VGN/tone byte-owned downstream. */
++            var jpegResolveCarrier26787 = resolveExtendedLinear26651
++            if (dngOptions26786.lcaEnabled) {
++                val lcaCorrected26787 = createTexture(
++                    width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
++                )
++                renderSabreJpegLcaPreResolve26787(
++                    source = jpegResolveCarrier26787,
++                    output = lcaCorrected26787,
++                    kR = dngOptions26786.kR,
++                    kB = dngOptions26786.kB,
++                )
++                jpegResolveCarrier26787 = lcaCorrected26787
++            }
++            PLog.i(
++                SABRE_TAG,
++                "IRIS_26787_JPEG_CFA_OPTIONS lca=${dngOptions26786.lcaEnabled} " +
++                    "kR=${dngOptions26786.kR} kB=${dngOptions26786.kB} " +
++                    "neutralClamp=${dngOptions26786.neutralClamp} " +
++                    "headroomScope=${dngOptions26786.headroomScopeName()} " +
++                    "deAlias=${dngOptions26786.edgeDeAlias} settingsSource=${dngOptions26786.source} " +
++                    "owner=PRE_RESOLVE_CFA_VALIDITY_AND_RADIAL_REGISTRATION",
++            )
++            sabreAccumulatedReadback = readSabreAccumulatedRgba16f(jpegResolveCarrier26787)
++            if (jpegResolveCarrier26787 != resolveExtendedLinear26651) {
++                releaseOwnedTexture(jpegResolveCarrier26787, "26787 LCA-corrected pre-Resolve carrier after readback")
++            }
+             if (resolveExtendedLinear26651 != resolveAccumulatedColor26604) {
+                 releaseOwnedTexture(resolveExtendedLinear26651, "26651 fusedExtendedLinear HDR master after Resolve input readback")
+             }
+@@ -5380,6 +5430,36 @@ internal class GlesMgcRawSpatialStacker(
+         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+     }
+ 
++    private fun renderSabreJpegNeutralHighlightClamp26787(
++        source: Int,
++        validWeights: Int,
++        output: Int,
++    ) {
++        val program = sabreJpegNeutralHighlightClampProgram26787
++        check(program != 0 && source != 0 && validWeights != 0 && output != 0)
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uSource", 0, source)
++        bindTexture(program, "uValidWeights", 1, validWeights)
++        // RGB10 validity: <= half one 10-bit code means the stored measured-green support is zero.
++        uniform1f(program, "uZeroValidityThreshold26787", 0.5f / 1023f)
++        draw(program, width, height, intArrayOf(output))
++    }
++
++    private fun renderSabreJpegLcaPreResolve26787(
++        source: Int,
++        output: Int,
++        kR: Float,
++        kB: Float,
++    ) {
++        val program = sabreJpegLcaPreResolveProgram26787
++        check(program != 0 && source != 0 && output != 0)
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uSource", 0, source)
++        uniform2i(program, "uSize", width, height)
++        uniform2f(program, "uKrKb26787", kR, kB)
++        draw(program, width, height, intArrayOf(output))
++    }
++
+     private fun renderSabreDehomogenize(
+         accumulatedColor: Int,
+         accumulatedWeightsGb: Int,
+@@ -6667,6 +6747,14 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.dehomogenize,
+             "mgc_sabre_dehomogenize",
+         )
++        sabreJpegNeutralHighlightClampProgram26787 = linkProgram(
++            GlesMgcRawSabreShaders.jpegNeutralHighlightClamp26787,
++            "iris_26787_jpeg_neutral_highlight_pre_resolve",
++        )
++        sabreJpegLcaPreResolveProgram26787 = linkProgram(
++            GlesMgcRawSabreShaders.jpegLcaPreResolve26787,
++            "iris_26787_jpeg_lca_pre_resolve",
++        )
+         sabreOutputTransformProgram = linkProgram(
+             if (preserveExtendedHdrThroughVgn) {
+                 GlesMgcRawSabreShaders.outputTransformHdrDirectionUint16
+diff --git a/app/version.properties b/app/version.properties
+index 21b6f38db565178864927bbba80ca181b6b7f916..6c24e70ee2fa5fb32a7457ceb06e0c108b8edb22 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726786
+-VERSION_BUILD=26786
++VERSION_NAME=0.9726787
++VERSION_BUILD=26787
