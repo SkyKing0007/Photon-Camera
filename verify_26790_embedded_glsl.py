@@ -21,10 +21,19 @@ def reserved_scan(name,src):
  clean=re.sub(r'/\*.*?\*/',' ',src,flags=re.S); clean=re.sub(r'//.*',' ',clean)
  names=set(DECL_RE.findall(clean))|set(FUNC_RE.findall(clean))|set(STRUCT_RE.findall(clean)); bad=sorted(n for n in names if n in RESERVED or n.startswith('gl_') or n.startswith('__')); need(not bad,f'{name}: reserved declared identifiers: {bad}')
  print(f'PASS 26790 reserved-identifier scan {name}: declarations={len(names)} sha256={hashlib.sha256(src.encode()).hexdigest()}')
+def uniform_completeness(name,src):
+ clean=re.sub(r'/\*.*?\*/',' ',src,flags=re.S); clean=re.sub(r'//.*',' ',clean)
+ used=set(re.findall(r'\bu[A-Z][A-Za-z0-9_]*\b',clean))
+ declared=set(re.findall(r'\buniform\s+(?:(?:highp|mediump|lowp)\s+)?[A-Za-z_]\w*\s+(u[A-Z][A-Za-z0-9_]*)',clean))
+ missing=sorted(used-declared)
+ need(not missing,f'{name}: used-but-undeclared uniforms: {missing}')
+ print(f'PASS 26790 uniform declaration completeness {name}: used={len(used)} declared={len(declared)}')
 for name,rel,stage,modified in specs:
  c=shader(CAND,rel,name)
  if not modified: need(shader(BASE,rel,name)==c,f'protected shader changed: {name}')
- reserved_scan(name,c); ext='comp' if stage=='comp' else 'frag'; p=OUT/f'{name}.{ext}'; p.write_text(c)
+ reserved_scan(name,c);
+ if modified: uniform_completeness(name,c)
+ ext='comp' if stage=='comp' else 'frag'; p=OUT/f'{name}.{ext}'; p.write_text(c)
  if a.compiler:
   cp=subprocess.run([a.compiler,'-S',stage,str(p)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
   if cp.returncode: print(cp.stdout); raise SystemExit(f'glslang failed for {name}')

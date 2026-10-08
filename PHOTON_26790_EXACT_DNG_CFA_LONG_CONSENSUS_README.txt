@@ -1,10 +1,10 @@
-PHOTON 26790 — EXACT DNG CFA + LONG CONSENSUS
+PHOTON 26790 — EXACT DNG CFA + LONG CONSENSUS — GLSL COMPILER REPAIR
 
-STATUS BEFORE ACTIONS
-PREPARED / UPLOAD-READY only. Real 26790 GLSL/Kotlin/Java/NDK/full assemble are NOT RUN locally. GitHub Actions is authoritative.
+STATUS BEFORE REPAIR ACTIONS
+PREPARED / UPLOAD-READY only. The first 26790 Actions run (37841638236, commit d07015fc1f84a5ece178171a0d41d5ce684909a0) failed in pinned real glslang before Kotlin/Java/NDK/assemble because merge used two host-bound uniforms without declaring them in GLSL.
 
 RUNTIME AUTHORITY
-Successful 26789 Actions compiled candidate:
+Successful 26789 Actions compiled candidate remains authority:
 - commit 95238f36f31fd6161eb8616fd37f11a4b5928f84
 - run 37808779483
 - artifact 11563604850
@@ -12,29 +12,31 @@ Successful 26789 Actions compiled candidate:
 - candidate TAR SHA-256 a2aa90829353bdb7aeb182327926fd5289d53564b6bc0bbc01f3d6f4908a3056
 
 VERIFICATION MECHANICS
-Exact successful 26789 17-stage build/handoff sequence, root 26752 inherited. No stage, compiler command, native command, assemble command, or ordering change.
+Exact successful 26789 17-stage build/handoff sequence, root 26752 inherited. No stage, compiler command, native command, assemble command, or ordering change. Existing 26790 workflow is unchanged.
 
-RUNTIME SCOPE
-Exactly 3 modified files, 0 added, 0 deleted. See 26790_RUNTIME_CHANGED_PATHS.txt.
+REPAIR SCOPE
+The intended runtime allowlist remains exactly 3 modified files vs successful 26789. Relative to the failed prepared 26790 candidate, runtime behavior changes only in GlesMgcRawSabreShaders.kt by declaring:
+  uniform int uLongChromaGuard26790;
+  uniform sampler2D uNormalChromaConsensus26790;
+No CFA/LCA, DNG-neutral, LONG-consensus, VGN, tone, UHDR, DNG, SHORT, frame, exposure, alignment, native, or vendor math is changed.
 
-IMPLEMENTATION CONTRACT
-26790 does not approximate the DNG correction. The LCA-enabled JPEG branch consumes exact UINT RAW and mechanically inherits the successful DNG fixed 2-pixel same-phase geometry/headroom/de-alias equations. The generic parity-changing 3x3 JPEG RBF cannot execute inside that branch. Neutral censorship reads the literal NORMAL DNG accumulator weights and exact two-green threshold; the old 26787 approximate neutral program is unlinked. LONG chroma is anchored to completed NORMAL consensus and pure chroma disagreement may be rejected without changing LONG luma or temporal weight.
+PERMANENT REGRESSION
+The modified-shader validator now performs a used-vs-declared custom-uniform completeness check. The repaired merge must report 33 custom uniforms used and 33 declared before Actions reaches real glslang.
 
-Important precision statement: this proves exact DNG physical CFA LCA and neutral-censor ownership before JPEG RGB reconstruction. JPEG's later Sabre RGB reconstruction remains the validated JPEG architecture; 26790 does not claim that the final JPEG RGB pipeline is identical to DNG development.
+UPLOAD — TWO COMMITS ONLY
+The 26790 workflow is already present from the failed run. Do NOT replace or add another workflow.
 
-UPLOAD — THREE COMMITS
-Stage 1: upload everything from STAGE_1_UPLOAD_FIRST to repository root, preserving paths. Do NOT manually copy handoff_payload_26790 into app/src. Commit/push:
-  26790: prepare exact DNG CFA correction and LONG consensus guard
-No 26790 Actions run should start yet.
+Stage 1: upload everything from STAGE_1_REPAIR_UPLOAD_FIRST to repository root, preserving paths. Do NOT manually copy handoff_payload_26790 into app/src. Commit/push:
+  26790: repair missing LONG chroma uniforms
+This should not launch the workflow because TRIGGER_26790.txt is unchanged in this stage.
 
-Stage 2: upload only the workflow from STAGE_2_UPLOAD_WORKFLOW_SECOND, preserving .github/workflows path. Commit/push:
-  26790: add exact DNG CFA build workflow
-No push-triggered 26790 run should start yet because TRIGGER_26790.txt is not present.
-
-Stage 3: upload only TRIGGER_26790.txt from STAGE_3_UPLOAD_TRIGGER_LAST. Commit/push:
-  26790: activate exact DNG CFA build
-This launches Build 26790 JPEG Exact DNG CFA Long Consensus.
+Stage 2: upload only TRIGGER_26790.txt from STAGE_2_TRIGGER_REPAIR_LAST. Commit/push:
+  26790: rerun exact DNG CFA build after GLSL repair
+This launches the existing Build 26790 JPEG Exact DNG CFA Long Consensus workflow.
 
 EXPECTED ACTIONS OUTPUT
 Artifact: photon-26790-jpeg-exact-dng-cfa-long-consensus
 APK: IrisCamera-0.9726790-26790-jpeg-exact-dng-cfa-long-consensus-debug.apk
+
+COMPILER STATUS
+Repaired real GLSL/Kotlin/Java/NDK/full assemble: NOT RUN locally. GitHub Actions remains authoritative.

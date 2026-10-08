@@ -29,8 +29,14 @@ for name,(rel,h) in expected.items():
 merge=shader(CAND,S,'merge'); dng=shader(CAND,S,'normalDngMerge'); norm=shader(CAND,SP,'normalizeBayer'); neutral=shader(CAND,S,'jpegNeutralHighlightClamp26790')
 st=(CAND/T).read_text()
 # Literal fixed-phase DNG math, exact UINT RAW input, no parity-changing generic sampler in LCA branch.
-for tok in ['uniform highp usampler2D uRaw26790;','sampleFixedPhaseDng26790(','float(texelFetch(uRaw26790, p, 0).r)','uJpegLcaKrKb26790','uDngQuadHeadroom26790','uDngEdgeDeAlias26790']:
+for tok in ['uniform highp usampler2D uRaw26790;','uniform int uLongChromaGuard26790;','uniform sampler2D uNormalChromaConsensus26790;','sampleFixedPhaseDng26790(','float(texelFetch(uRaw26790, p, 0).r)','uJpegLcaKrKb26790','uDngQuadHeadroom26790','uDngEdgeDeAlias26790']:
  need(tok in merge,f'merge missing {tok}')
+# Permanent regression from failed 26790 Actions run: every custom u* identifier used by merge must be declared.
+clean=re.sub(r'/\*.*?\*/',' ',merge,flags=re.S); clean=re.sub(r'//.*',' ',clean)
+used=set(re.findall(r'\bu[A-Z][A-Za-z0-9_]*\b',clean))
+declared=set(re.findall(r'\buniform\s+(?:(?:highp|mediump|lowp)\s+)?[A-Za-z_]\w*\s+(u[A-Z][A-Za-z0-9_]*)',clean))
+need(not (used-declared),f'merge used-but-undeclared uniforms: {sorted(used-declared)}')
+print(f'PASS 26790 compiler regression: merge uniform declarations complete ({len(used)} used)')
 pairs=[
  ('return ((p.y & 1) << 1) + (p.x & 1);','return ((p.y & 1) << 1) + (p.x & 1);'),
  ('float headroomStart = whitePoint * 0.9925;','float headroomStart = whitePoint * 0.9925;'),

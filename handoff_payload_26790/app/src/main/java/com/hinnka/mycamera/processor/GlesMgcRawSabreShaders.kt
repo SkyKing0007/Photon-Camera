@@ -2539,6 +2539,11 @@ internal object GlesMgcRawSabreShaders {
         uniform vec4 uFrameBorderPadded;
         uniform int uCfaPattern;
         uniform int uUseFrameWeight;
+        /* IRIS_26790_COMPILER_REPAIR_LONG_CHROMA_UNIFORMS
+         * Compile-only repair after Actions exposed two host-bound uniforms used by merge but
+         * omitted from the GLSL declaration block. No CFA/LCA/neutral/LONG math changes. */
+        uniform int uLongChromaGuard26790;
+        uniform sampler2D uNormalChromaConsensus26790;
         /* IRIS_26790_EXACT_DNG_FIXED_PHASE_JPEG_OWNER
          * 26789 proved that moving the DNG radial coordinate into the generic parity-changing RGB
          * RBF is not DNG-equivalent. 26790 mechanically ports the successful 26786 DNG physical
