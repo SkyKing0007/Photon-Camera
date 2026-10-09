@@ -1,0 +1,373 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 9847154a51b52309358e53d7139cf4c9860aced8..a1e0e2cb36526459e49714a64e3b5cdc4ddf48e4 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2691,6 +2691,140 @@ internal object GlesMgcRawSabreShaders {
+             out mat3 sourceValidity
+         );
+ 
++
++        /* IRIS_26793_SAME_LOCATION_CFA_COLOR_DIFFERENCE_OWNER
++         * Sabre remains the sole CFA->RGB topology owner. 26793 changes only the color quantity
++         * accumulated by that existing topology: R/B are represented as same-location R-G/B-G
++         * differences, with G predicted from the immediate orthogonal green CFA evidence using
++         * the already-owned Sabre covariance. Legacy per-frame Sabre luma is preserved exactly.
++         * There is no RGB low-pass, post-RGB neutral mask, new edge detector, or temporal owner. */
++        int relativeCfaGroup26793(int sx, int sy) {
++            if (sx == 1 && sy == 1) return 3;
++            if (sx == 1) return 1;
++            if (sy == 1) return 2;
++            return 0;
++        }
++
++        float component26793(vec4 value, int groupIndex) {
++            if (groupIndex == 0) return value.r;
++            if (groupIndex == 1) return value.g;
++            if (groupIndex == 2) return value.b;
++            return value.a;
++        }
++
++        void buildCalculationCfa26793(
++            mat3 bayerValue,
++            vec4 reorderedGains,
++            vec4 reorderedBlack,
++            out mat3 calculationCfa
++        ) {
++            calculationCfa = mat3(0.0);
++            for (int sx = 0; sx < 3; ++sx) {
++                for (int sy = 0; sy < 3; ++sy) {
++                    int groupIndex = relativeCfaGroup26793(sx, sy);
++                    calculationCfa[sx][sy] =
++                        bayerValue[sx][sy] * component26793(reorderedGains, groupIndex) +
++                        component26793(reorderedBlack, groupIndex);
++                }
++            }
++        }
++
++        float predictSameLocationGreen26793(
++            mat3 calculationCfa,
++            mat3 greenSupport,
++            ivec2 colorLocal,
++            int type,
++            float horizontalGreenWeight,
++            float verticalGreenWeight,
++            int useGreenSupport,
++            out float greenConfidence
++        ) {
++            float numerator = 0.0;
++            float supportedWeight = 0.0;
++            float fullWeight = 0.0;
++            int redGroup = type;
++            int blueGroup = 3 - type;
++            for (int dx = -1; dx <= 1; ++dx) {
++                for (int dy = -1; dy <= 1; ++dy) {
++                    if (abs(dx) + abs(dy) != 1) continue;
++                    ivec2 q = colorLocal + ivec2(dx, dy);
++                    if (q.x < 0 || q.x > 2 || q.y < 0 || q.y > 2) continue;
++                    int groupIndex = relativeCfaGroup26793(q.x, q.y);
++                    if (groupIndex == redGroup || groupIndex == blueGroup) continue;
++                    float spatialWeight = dx != 0
++                        ? horizontalGreenWeight : verticalGreenWeight;
++                    float physicalSupport = useGreenSupport != 0
++                        ? clamp(greenSupport[q.x][q.y], 0.0, 1.0)
++                        : 1.0;
++                    fullWeight += spatialWeight;
++                    supportedWeight += spatialWeight * physicalSupport;
++                    numerator += calculationCfa[q.x][q.y] * spatialWeight * physicalSupport;
++                }
++            }
++            greenConfidence = clamp(
++                supportedWeight / max(fullWeight, 1.0e-7), 0.0, 1.0);
++            if (supportedWeight <= 1.0e-7) return 0.0;
++            return numerator / supportedWeight;
++        }
++
++        void sameLocationChroma26793(
++            mat3 calculationCfa,
++            mat3 sampleWeights,
++            mat3 greenSupport,
++            int type,
++            vec3 covariance,
++            int useGreenSupport,
++            vec3 legacyRgb,
++            out float dR,
++            out float dB
++        ) {
++            int redGroup = type;
++            int blueGroup = 3 - type;
++            float horizontalGreenWeight = kernelWeight(vec2(1.0, 0.0), covariance);
++            float verticalGreenWeight = kernelWeight(vec2(0.0, 1.0), covariance);
++            float redDifferenceSum = 0.0;
++            float blueDifferenceSum = 0.0;
++            float redDifferenceWeight = 0.0;
++            float blueDifferenceWeight = 0.0;
++            float redTotalWeight = 0.0;
++            float blueTotalWeight = 0.0;
++            for (int sx = 0; sx < 3; ++sx) {
++                for (int sy = 0; sy < 3; ++sy) {
++                    int groupIndex = relativeCfaGroup26793(sx, sy);
++                    if (groupIndex != redGroup && groupIndex != blueGroup) continue;
++                    float colorWeight = max(sampleWeights[sx][sy], 0.0);
++                    if (groupIndex == redGroup) redTotalWeight += colorWeight;
++                    else blueTotalWeight += colorWeight;
++                    float greenConfidence = 0.0;
++                    float predictedGreen = predictSameLocationGreen26793(
++                        calculationCfa, greenSupport, ivec2(sx, sy), type,
++                        horizontalGreenWeight, verticalGreenWeight,
++                        useGreenSupport, greenConfidence);
++                    float differenceWeight = colorWeight * greenConfidence;
++                    float difference = calculationCfa[sx][sy] - predictedGreen;
++                    if (groupIndex == redGroup) {
++                        redDifferenceSum += difference * differenceWeight;
++                        redDifferenceWeight += differenceWeight;
++                    } else {
++                        blueDifferenceSum += difference * differenceWeight;
++                        blueDifferenceWeight += differenceWeight;
++                    }
++                }
++            }
++            float legacyDR = legacyRgb.r - legacyRgb.g;
++            float legacyDB = legacyRgb.b - legacyRgb.g;
++            float measuredDR = redDifferenceWeight > 1.0e-7
++                ? redDifferenceSum / redDifferenceWeight : legacyDR;
++            float measuredDB = blueDifferenceWeight > 1.0e-7
++                ? blueDifferenceSum / blueDifferenceWeight : legacyDB;
++            float redPhysicalFraction = clamp(
++                redDifferenceWeight / max(redTotalWeight, 1.0e-7), 0.0, 1.0);
++            float bluePhysicalFraction = clamp(
++                blueDifferenceWeight / max(blueTotalWeight, 1.0e-7), 0.0, 1.0);
++            dR = mix(legacyDR, measuredDR, redPhysicalFraction);
++            dB = mix(legacyDB, measuredDB, bluePhysicalFraction);
++        }
++
+         void sampleNeighborhoodRbf(
+             vec2 sampleUv,
+             vec2 referenceUv26791,
+@@ -2805,16 +2939,31 @@ internal object GlesMgcRawSabreShaders {
+             intensities = swizzleForType(intensities, type);
+             reorderedWeights = swizzleForType(reorderedWeights, type);
+             validReorderedWeights = swizzleForType(validReorderedWeights, type);
+-            accumulatedIntensities = vec3(
+-                intensities.r,
+-                intensities.g + intensities.b,
+-                intensities.a
+-            );
+             accumulatedWeights = vec3(
+                 reorderedWeights.r,
+                 reorderedWeights.g + reorderedWeights.b,
+                 reorderedWeights.a
+             );
++            vec3 legacyRgb26793 = vec3(
++                intensities.r,
++                intensities.g + intensities.b,
++                intensities.a
++            ) / max(accumulatedWeights, vec3(1.0e-7));
++            mat3 calculationCfa26793 = mat3(0.0);
++            buildCalculationCfa26793(
++                bayerValue, reorderedGains, reorderedBlack, calculationCfa26793);
++            float dR26793 = 0.0;
++            float dB26793 = 0.0;
++            sameLocationChroma26793(
++                calculationCfa26793, weights, sourceValidity, type, covariance, 0,
++                legacyRgb26793, dR26793, dB26793);
++            float legacyLuma26793 = dot(legacyRgb26793, vec3(0.25, 0.50, 0.25));
++            float correctedG26793 = legacyLuma26793 - 0.25 * (dR26793 + dB26793);
++            vec3 correctedRgb26793 = vec3(
++                correctedG26793 + dR26793,
++                correctedG26793,
++                correctedG26793 + dB26793);
++            accumulatedIntensities = correctedRgb26793 * accumulatedWeights;
+             validAccumulatedWeights = vec3(
+                 validReorderedWeights.r,
+                 validReorderedWeights.g + validReorderedWeights.b,
+@@ -3370,6 +3519,140 @@ internal object GlesMgcRawSabreShaders {
+             return value.abgr;
+         }
+ 
++
++        /* IRIS_26793_SAME_LOCATION_CFA_COLOR_DIFFERENCE_OWNER
++         * Sabre remains the sole CFA->RGB topology owner. 26793 changes only the color quantity
++         * accumulated by that existing topology: R/B are represented as same-location R-G/B-G
++         * differences, with G predicted from the immediate orthogonal green CFA evidence using
++         * the already-owned Sabre covariance. Legacy per-frame Sabre luma is preserved exactly.
++         * There is no RGB low-pass, post-RGB neutral mask, new edge detector, or temporal owner. */
++        int relativeCfaGroup26793(int sx, int sy) {
++            if (sx == 1 && sy == 1) return 3;
++            if (sx == 1) return 1;
++            if (sy == 1) return 2;
++            return 0;
++        }
++
++        float component26793(vec4 value, int groupIndex) {
++            if (groupIndex == 0) return value.r;
++            if (groupIndex == 1) return value.g;
++            if (groupIndex == 2) return value.b;
++            return value.a;
++        }
++
++        void buildCalculationCfa26793(
++            mat3 bayerValue,
++            vec4 reorderedGains,
++            vec4 reorderedBlack,
++            out mat3 calculationCfa
++        ) {
++            calculationCfa = mat3(0.0);
++            for (int sx = 0; sx < 3; ++sx) {
++                for (int sy = 0; sy < 3; ++sy) {
++                    int groupIndex = relativeCfaGroup26793(sx, sy);
++                    calculationCfa[sx][sy] =
++                        bayerValue[sx][sy] * component26793(reorderedGains, groupIndex) +
++                        component26793(reorderedBlack, groupIndex);
++                }
++            }
++        }
++
++        float predictSameLocationGreen26793(
++            mat3 calculationCfa,
++            mat3 greenSupport,
++            ivec2 colorLocal,
++            int type,
++            float horizontalGreenWeight,
++            float verticalGreenWeight,
++            int useGreenSupport,
++            out float greenConfidence
++        ) {
++            float numerator = 0.0;
++            float supportedWeight = 0.0;
++            float fullWeight = 0.0;
++            int redGroup = type;
++            int blueGroup = 3 - type;
++            for (int dx = -1; dx <= 1; ++dx) {
++                for (int dy = -1; dy <= 1; ++dy) {
++                    if (abs(dx) + abs(dy) != 1) continue;
++                    ivec2 q = colorLocal + ivec2(dx, dy);
++                    if (q.x < 0 || q.x > 2 || q.y < 0 || q.y > 2) continue;
++                    int groupIndex = relativeCfaGroup26793(q.x, q.y);
++                    if (groupIndex == redGroup || groupIndex == blueGroup) continue;
++                    float spatialWeight = dx != 0
++                        ? horizontalGreenWeight : verticalGreenWeight;
++                    float physicalSupport = useGreenSupport != 0
++                        ? clamp(greenSupport[q.x][q.y], 0.0, 1.0)
++                        : 1.0;
++                    fullWeight += spatialWeight;
++                    supportedWeight += spatialWeight * physicalSupport;
++                    numerator += calculationCfa[q.x][q.y] * spatialWeight * physicalSupport;
++                }
++            }
++            greenConfidence = clamp(
++                supportedWeight / max(fullWeight, 1.0e-7), 0.0, 1.0);
++            if (supportedWeight <= 1.0e-7) return 0.0;
++            return numerator / supportedWeight;
++        }
++
++        void sameLocationChroma26793(
++            mat3 calculationCfa,
++            mat3 sampleWeights,
++            mat3 greenSupport,
++            int type,
++            vec3 covariance,
++            int useGreenSupport,
++            vec3 legacyRgb,
++            out float dR,
++            out float dB
++        ) {
++            int redGroup = type;
++            int blueGroup = 3 - type;
++            float horizontalGreenWeight = kernelWeight(vec2(1.0, 0.0), covariance);
++            float verticalGreenWeight = kernelWeight(vec2(0.0, 1.0), covariance);
++            float redDifferenceSum = 0.0;
++            float blueDifferenceSum = 0.0;
++            float redDifferenceWeight = 0.0;
++            float blueDifferenceWeight = 0.0;
++            float redTotalWeight = 0.0;
++            float blueTotalWeight = 0.0;
++            for (int sx = 0; sx < 3; ++sx) {
++                for (int sy = 0; sy < 3; ++sy) {
++                    int groupIndex = relativeCfaGroup26793(sx, sy);
++                    if (groupIndex != redGroup && groupIndex != blueGroup) continue;
++                    float colorWeight = max(sampleWeights[sx][sy], 0.0);
++                    if (groupIndex == redGroup) redTotalWeight += colorWeight;
++                    else blueTotalWeight += colorWeight;
++                    float greenConfidence = 0.0;
++                    float predictedGreen = predictSameLocationGreen26793(
++                        calculationCfa, greenSupport, ivec2(sx, sy), type,
++                        horizontalGreenWeight, verticalGreenWeight,
++                        useGreenSupport, greenConfidence);
++                    float differenceWeight = colorWeight * greenConfidence;
++                    float difference = calculationCfa[sx][sy] - predictedGreen;
++                    if (groupIndex == redGroup) {
++                        redDifferenceSum += difference * differenceWeight;
++                        redDifferenceWeight += differenceWeight;
++                    } else {
++                        blueDifferenceSum += difference * differenceWeight;
++                        blueDifferenceWeight += differenceWeight;
++                    }
++                }
++            }
++            float legacyDR = legacyRgb.r - legacyRgb.g;
++            float legacyDB = legacyRgb.b - legacyRgb.g;
++            float measuredDR = redDifferenceWeight > 1.0e-7
++                ? redDifferenceSum / redDifferenceWeight : legacyDR;
++            float measuredDB = blueDifferenceWeight > 1.0e-7
++                ? blueDifferenceSum / blueDifferenceWeight : legacyDB;
++            float redPhysicalFraction = clamp(
++                redDifferenceWeight / max(redTotalWeight, 1.0e-7), 0.0, 1.0);
++            float bluePhysicalFraction = clamp(
++                blueDifferenceWeight / max(blueTotalWeight, 1.0e-7), 0.0, 1.0);
++            dR = mix(legacyDR, measuredDR, redPhysicalFraction);
++            dB = mix(legacyDB, measuredDB, bluePhysicalFraction);
++        }
++
+         void sampleNeighborhoodRbf(
+             vec2 sampleUv,
+             vec3 covariance,
+@@ -3458,11 +3741,6 @@ internal object GlesMgcRawSabreShaders {
+             intensities = swizzleForType(intensities, type);
+             reorderedWeights = swizzleForType(reorderedWeights, type);
+             validReorderedWeights = swizzleForType(validReorderedWeights, type);
+-            accumulatedIntensities = vec3(
+-                intensities.r,
+-                intensities.g + intensities.b,
+-                intensities.a
+-            );
+             vec3 fullAccumulatedWeights = vec3(
+                 reorderedWeights.r,
+                 reorderedWeights.g + reorderedWeights.b,
+@@ -3476,6 +3754,26 @@ internal object GlesMgcRawSabreShaders {
+             /* RGB is reconstructed only from physically valid SHORT samples. Confidence is the
+              * weakest color's retained RBF support fraction, not the weakest individual sample. */
+             accumulatedWeights = validAccumulatedWeights;
++            vec3 legacyRgb26793 = vec3(
++                intensities.r,
++                intensities.g + intensities.b,
++                intensities.a
++            ) / max(accumulatedWeights, vec3(1.0e-7));
++            mat3 calculationCfa26793 = mat3(0.0);
++            buildCalculationCfa26793(
++                bayerValue, reorderedGains, reorderedBlack, calculationCfa26793);
++            float dR26793 = 0.0;
++            float dB26793 = 0.0;
++            sameLocationChroma26793(
++                calculationCfa26793, validWeights, sourceValidity, type, covariance, 1,
++                legacyRgb26793, dR26793, dB26793);
++            float legacyLuma26793 = dot(legacyRgb26793, vec3(0.25, 0.50, 0.25));
++            float correctedG26793 = legacyLuma26793 - 0.25 * (dR26793 + dB26793);
++            vec3 correctedRgb26793 = vec3(
++                correctedG26793 + dR26793,
++                correctedG26793,
++                correctedG26793 + dB26793);
++            accumulatedIntensities = correctedRgb26793 * accumulatedWeights;
+             sourceNeighborhoodConfidence = minimum3(clamp(
+                 validAccumulatedWeights / max(fullAccumulatedWeights, vec3(1.0e-6)),
+                 vec3(0.0), vec3(1.0)));
+diff --git a/app/version.properties b/app/version.properties
+index e93d1b7ad8396586805ce555a035a680db0e9b23..fdf5c784d40963f48386d4a895671fb3de966719 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726792
+-VERSION_BUILD=26792
++VERSION_NAME=0.9726793
++VERSION_BUILD=26793
