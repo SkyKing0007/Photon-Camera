@@ -1,0 +1,328 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index f9b51cf089b7f4585276acab7589bc3126ed427d..669db8a35c01d84d65e761e4b4fb78f88390057b 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -1327,46 +1327,6 @@ object PhotonMotionMgc1271Bridge {
+         return Iris26728ProtectedChromaFloor(floor, protectedPixels)
+     }
+ 
+-    /* IRIS_26794_POST_DENOISE_SPATIAL_CHROMA_FLOOR
+-     * 26728 correctly preserves physically-supported pre-denoise magnitude, but its final CPU floor
+-     * previously treated "VGN may preserve this color" as "denoise may never reduce this color".
+-     * 26794 separates those decisions. Only pixels the legacy floor would raise are examined. On
+-     * bright/high-luma-gradient structure, restoration is attenuated unless the denoised chroma
+-     * itself survives or is corroborated by an opposite neighbor pair along the same hue direction.
+-     * Dark/midtone protected micro-color keeps the exact 26728 floor. No new hue is ever created. */
+-    private fun smoothstep26794(edge0: Float, edge1: Float, value: Float): Float {
+-        if (edge1 <= edge0) return if (value >= edge1) 1f else 0f
+-        val t = ((value - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+-        return t * t * (3f - 2f * t)
+-    }
+-
+-    private fun markSpatialMask26794(
+-        mask: ByteArray,
+-        gridWidth: Int,
+-        gridHeight: Int,
+-        x: Int,
+-        y: Int,
+-        width: Int,
+-        height: Int,
+-    ) {
+-        val gx = ((x.toLong() * gridWidth) / maxOf(width, 1)).toInt().coerceIn(0, gridWidth - 1)
+-        val gy = ((y.toLong() * gridHeight) / maxOf(height, 1)).toInt().coerceIn(0, gridHeight - 1)
+-        val bit = gy * gridWidth + gx
+-        val byteIndex = bit ushr 3
+-        val bitMask = 1 shl (bit and 7)
+-        mask[byteIndex] = (mask[byteIndex].toInt() or bitMask).toByte()
+-    }
+-
+-    private fun spatialMaskHex26794(mask: ByteArray): String {
+-        val digits = "0123456789abcdef"
+-        val out = StringBuilder(mask.size * 2)
+-        for (value in mask) {
+-            val u = value.toInt() and 0xff
+-            out.append(digits[u ushr 4]).append(digits[u and 15])
+-        }
+-        return out.toString()
+-    }
+-
+     private fun applyIris26728ProtectedChromaFloor(
+         buffer: ByteBuffer,
+         width: Int,
+@@ -1378,222 +1338,72 @@ object PhotonMotionMgc1271Bridge {
+         val pixels = width * height
+         requireParity(shorts.capacity() >= pixels * 4 && state.sqrtFloorQ8.size == pixels,
+             "26728 protected chroma floor buffer mismatch")
+-
+-        // Coarse spatial proof is intentionally tiny: four 32x24 bitmasks = 384 bytes total.
+-        val gridWidth = 32
+-        val gridHeight = 24
+-        val maskBytes = (gridWidth * gridHeight + 7) / 8
+-        val legacyCandidateMask = ByteArray(maskBytes)
+-        val brightRiskMask = ByteArray(maskBytes)
+-        val attenuatedMask = ByteArray(maskBytes)
+-        val allowedRaiseMask = ByteArray(maskBytes)
+-
+         var beforeSum = 0.0
+         var afterSum = 0.0
+         var measuredPixels = 0
+-        var floorCandidatePixels = 0
+-        var legacyWouldRaisePixels = 0
+         var raisedPixels = 0
+-        var attenuatedPixels = 0
+-        var fullyBlockedPixels = 0
+         var directionLostPixels = 0
+-        var brightEdgeCandidates = 0
+-        var spatiallySupportedCandidates = 0
+-        var suppressedMagnitudeSum = 0.0
+-        var maxSuppressedMagnitude = 0f
+-
+-        // First pass: inspect the untouched post-denoise image and replace the old floor code with
+-        // the spatially-authorized target. RGB is not modified until every decision is frozen.
+-        for (pixel in 0 until pixels) {
+-            val code = state.sqrtFloorQ8[pixel].toInt() and 0xFF
+-            if (code == 0) continue
+-            val q = code.toFloat() / 255f
+-            val floorMagnitude = q * q
+-            val base = pixel * 4
+-            val rawR = Half.toFloat(shorts.get(base))
+-            val rawG = Half.toFloat(shorts.get(base + 1))
+-            val rawB = Half.toFloat(shorts.get(base + 2))
+-            if (!rawR.isFinite() || !rawG.isFinite() || !rawB.isFinite()) {
+-                state.sqrtFloorQ8[pixel] = 0
+-                continue
+-            }
+-            val r = rawR.coerceAtLeast(0f)
+-            val g = rawG.coerceAtLeast(0f)
+-            val b = rawB.coerceAtLeast(0f)
+-            val y = 0.25f * r + 0.50f * g + 0.25f * b
+-            val cr = r - y
+-            val cg = g - y
+-            val cb = b - y
+-            val currentMagnitude = kotlin.math.sqrt(cr * cr + cg * cg + cb * cb)
+-            beforeSum += currentMagnitude.toDouble()
+-            measuredPixels += 1
+-            var targetMagnitude = currentMagnitude
+-
+-            if (currentMagnitude + 1.0e-7f < floorMagnitude) {
+-                floorCandidatePixels += 1
+-                val x = pixel % width
+-                val yy = pixel / width
+-                if (currentMagnitude > 1.0e-7f) {
+-                    val inv = 1f / currentMagnitude
+-                    val dr = cr * inv
+-                    val dg = cg * inv
+-                    val db = cb * inv
+-                    var maximumMagnitude = Float.POSITIVE_INFINITY
+-                    if (dr > 1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (1f - y) / dr)
+-                    else if (dr < -1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (0f - y) / dr)
+-                    if (dg > 1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (1f - y) / dg)
+-                    else if (dg < -1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (0f - y) / dg)
+-                    if (db > 1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (1f - y) / db)
+-                    else if (db < -1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (0f - y) / db)
+-                    val legacyTarget = minOf(floorMagnitude, maximumMagnitude.coerceAtLeast(0f))
+-                    if (legacyTarget <= currentMagnitude + 1.0e-7f) {
+-                        targetMagnitude = currentMagnitude
+-                    } else {
+-                    legacyWouldRaisePixels += 1
+-                    markSpatialMask26794(legacyCandidateMask, gridWidth, gridHeight, x, yy, width, height)
+-
+-                    var maxNeighborLuma = y
+-                    var maxLumaDelta = 0f
+-                    var leftProjection = 0f
+-                    var rightProjection = 0f
+-                    var upProjection = 0f
+-                    var downProjection = 0f
+-
+-                    fun consumeNeighbor(np: Int, slot: Int) {
+-                        val nbBase = np * 4
+-                        val nRawR = Half.toFloat(shorts.get(nbBase))
+-                        val nRawG = Half.toFloat(shorts.get(nbBase + 1))
+-                        val nRawB = Half.toFloat(shorts.get(nbBase + 2))
+-                        if (!nRawR.isFinite() || !nRawG.isFinite() || !nRawB.isFinite()) return
+-                        val nrgbR = nRawR.coerceAtLeast(0f)
+-                        val nrgbG = nRawG.coerceAtLeast(0f)
+-                        val nrgbB = nRawB.coerceAtLeast(0f)
+-                        val ny = 0.25f * nrgbR + 0.50f * nrgbG + 0.25f * nrgbB
+-                        maxNeighborLuma = maxOf(maxNeighborLuma, ny)
+-                        maxLumaDelta = maxOf(maxLumaDelta, kotlin.math.abs(ny - y))
+-                        val nr = nrgbR - ny
+-                        val ng = nrgbG - ny
+-                        val nb = nrgbB - ny
+-                        val projection = maxOf(nr * dr + ng * dg + nb * db, 0f)
+-                        when (slot) {
+-                            0 -> leftProjection = projection
+-                            1 -> rightProjection = projection
+-                            2 -> upProjection = projection
+-                            3 -> downProjection = projection
+-                        }
+-                    }
+-                    if (x > 0) consumeNeighbor(pixel - 1, 0)
+-                    if (x + 1 < width) consumeNeighbor(pixel + 1, 1)
+-                    if (yy > 0) consumeNeighbor(pixel - width, 2)
+-                    if (yy + 1 < height) consumeNeighbor(pixel + width, 3)
+-
+-                    val pairSupport = maxOf(
+-                        minOf(leftProjection, rightProjection),
+-                        minOf(upProjection, downProjection),
+-                    )
+-                    val survival = (currentMagnitude / maxOf(floorMagnitude, 1.0e-7f)).coerceIn(0f, 1f)
+-                    val pairSupportRatio = (pairSupport / maxOf(floorMagnitude, 1.0e-7f)).coerceIn(0f, 1f)
+-                    val spatialSupport = maxOf(survival, pairSupportRatio)
+-                    val edgeRisk = smoothstep26794(0.025f, 0.100f, maxLumaDelta)
+-                    val brightRisk = smoothstep26794(0.50f, 0.82f, maxOf(y, maxNeighborLuma))
+-                    val restorationDominance = smoothstep26794(0.20f, 0.65f, 1f - survival)
+-                    val brightEdgeRisk = edgeRisk * brightRisk * restorationDominance
+-                    val supportPermission = smoothstep26794(0.25f, 0.70f, spatialSupport)
+-                    val spatialPermission = (1f - brightEdgeRisk * (1f - supportPermission)).coerceIn(0f, 1f)
+-                    targetMagnitude = currentMagnitude +
+-                        (legacyTarget - currentMagnitude).coerceAtLeast(0f) * spatialPermission
+-
+-                    if (brightEdgeRisk >= 0.25f) {
+-                        brightEdgeCandidates += 1
+-                        markSpatialMask26794(brightRiskMask, gridWidth, gridHeight, x, yy, width, height)
+-                    }
+-                    if (supportPermission >= 0.50f) spatiallySupportedCandidates += 1
+-                    if (targetMagnitude + 1.0e-6f < legacyTarget) {
+-                        attenuatedPixels += 1
+-                        val suppressed = (legacyTarget - targetMagnitude).coerceAtLeast(0f)
+-                        suppressedMagnitudeSum += suppressed.toDouble()
+-                        maxSuppressedMagnitude = maxOf(maxSuppressedMagnitude, suppressed)
+-                        markSpatialMask26794(attenuatedMask, gridWidth, gridHeight, x, yy, width, height)
+-                    }
+-                    if (targetMagnitude <= currentMagnitude + 1.0e-6f) fullyBlockedPixels += 1
+-                    }
+-                } else {
+-                    directionLostPixels += 1
+-                }
+-            }
+-
+-            if (targetMagnitude > currentMagnitude + 1.0e-6f) {
+-                val encodedTarget = (kotlin.math.sqrt(targetMagnitude.coerceIn(0f, 1f)) * 255f)
+-                    .toInt().coerceIn(1, 255)
+-                val encodedQ = encodedTarget.toFloat() / 255f
+-                val quantizedTarget = encodedQ * encodedQ
+-                if (quantizedTarget > currentMagnitude + 1.0e-7f) {
+-                    state.sqrtFloorQ8[pixel] = encodedTarget.toByte()
+-                    targetMagnitude = quantizedTarget
+-                    raisedPixels += 1
+-                    val x = pixel % width
+-                    val yy = pixel / width
+-                    markSpatialMask26794(allowedRaiseMask, gridWidth, gridHeight, x, yy, width, height)
+-                } else {
+-                    state.sqrtFloorQ8[pixel] = 0
+-                    targetMagnitude = currentMagnitude
+-                }
+-            } else {
+-                state.sqrtFloorQ8[pixel] = 0
+-                targetMagnitude = currentMagnitude
+-            }
+-            afterSum += targetMagnitude.toDouble()
+-        }
+-
+-        // Second pass: apply only the frozen target magnitudes. Neighbor evidence above therefore
+-        // always came from the unmodified denoised image, never from already-restored pixels.
+         for (pixel in 0 until pixels) {
+             val base = pixel * 4
+             val code = state.sqrtFloorQ8[pixel].toInt() and 0xFF
+             if (code != 0) {
+                 val q = code.toFloat() / 255f
+-                val targetMagnitude = q * q
++                val floorMagnitude = q * q
+                 val rawR = Half.toFloat(shorts.get(base))
+                 val rawG = Half.toFloat(shorts.get(base + 1))
+                 val rawB = Half.toFloat(shorts.get(base + 2))
+-                if (rawR.isFinite() && rawG.isFinite() && rawB.isFinite()) {
+-                    val r = rawR.coerceAtLeast(0f)
+-                    val g = rawG.coerceAtLeast(0f)
+-                    val b = rawB.coerceAtLeast(0f)
+-                    val y = 0.25f * r + 0.50f * g + 0.25f * b
+-                    var cr = r - y
+-                    var cg = g - y
+-                    var cb = b - y
+-                    val currentMagnitude = kotlin.math.sqrt(cr * cr + cg * cg + cb * cb)
+-                    if (currentMagnitude > 1.0e-7f && targetMagnitude > currentMagnitude + 1.0e-7f) {
+-                        val scale = targetMagnitude / currentMagnitude
+-                        cr *= scale
+-                        cg *= scale
+-                        cb *= scale
+-                        shorts.put(base, Half.toHalf((y + cr).coerceIn(0f, 1f)))
+-                        shorts.put(base + 1, Half.toHalf((y + cg).coerceIn(0f, 1f)))
+-                        shorts.put(base + 2, Half.toHalf((y + cb).coerceIn(0f, 1f)))
++                if (!rawR.isFinite() || !rawG.isFinite() || !rawB.isFinite()) {
++                    shorts.put(base + 3, HALF_ONE)
++                    continue
++                }
++                val r = rawR.coerceAtLeast(0f)
++                val g = rawG.coerceAtLeast(0f)
++                val b = rawB.coerceAtLeast(0f)
++                val y = 0.25f * r + 0.50f * g + 0.25f * b
++                var cr = r - y
++                var cg = g - y
++                var cb = b - y
++                val currentMagnitude = kotlin.math.sqrt(cr * cr + cg * cg + cb * cb)
++                beforeSum += currentMagnitude.toDouble()
++                var finalMagnitude = currentMagnitude
++                if (currentMagnitude + 1.0e-7f < floorMagnitude) {
++                    if (currentMagnitude > 1.0e-7f) {
++                        val inv = 1f / currentMagnitude
++                        val dr = cr * inv
++                        val dg = cg * inv
++                        val db = cb * inv
++                        var maximumMagnitude = Float.POSITIVE_INFINITY
++                        if (dr > 1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (1f - y) / dr)
++                        else if (dr < -1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (0f - y) / dr)
++                        if (dg > 1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (1f - y) / dg)
++                        else if (dg < -1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (0f - y) / dg)
++                        if (db > 1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (1f - y) / db)
++                        else if (db < -1.0e-7f) maximumMagnitude = minOf(maximumMagnitude, (0f - y) / db)
++                        val targetMagnitude = minOf(floorMagnitude, maximumMagnitude.coerceAtLeast(0f))
++                        if (targetMagnitude > currentMagnitude) {
++                            cr = dr * targetMagnitude
++                            cg = dg * targetMagnitude
++                            cb = db * targetMagnitude
++                            shorts.put(base, Half.toHalf((y + cr).coerceIn(0f, 1f)))
++                            shorts.put(base + 1, Half.toHalf((y + cg).coerceIn(0f, 1f)))
++                            shorts.put(base + 2, Half.toHalf((y + cb).coerceIn(0f, 1f)))
++                            finalMagnitude = targetMagnitude
++                            raisedPixels += 1
++                        }
++                    } else {
++                        directionLostPixels += 1
+                     }
+                 }
++                afterSum += finalMagnitude.toDouble()
++                measuredPixels += 1
+             }
+             shorts.put(base + 3, HALF_ONE)
+         }
+-
+         val denominator = maxOf(measuredPixels, 1).toDouble()
+-        val attenuatedDenominator = maxOf(attenuatedPixels, 1).toDouble()
+         PLog.i(TAG, "IRIS_26728_PROTECTED_CHROMA_POST_RESIDUAL_DENOISE protectedPixels=${state.protectedPixels} " +
+             "measuredPixels=$measuredPixels residualDenoiseExecuted=$residualDenoiseExecuted " +
+             "meanBeforeFloor=${beforeSum / denominator} meanAfterFloor=${afterSum / denominator} " +
+             "raisedPixels=$raisedPixels directionLostPixels=$directionLostPixels hueOwner=DENOISED_VGN_DIRECTION")
+-        PLog.i(TAG, "IRIS_26794_POST_DENOISE_SPATIAL_CHROMA_FLOOR floorCandidatePixels=$floorCandidatePixels legacyWouldRaisePixels=$legacyWouldRaisePixels " +
+-            "allowedRaisedPixels=$raisedPixels attenuatedPixels=$attenuatedPixels fullyBlockedPixels=$fullyBlockedPixels " +
+-            "brightEdgeCandidates=$brightEdgeCandidates spatiallySupportedCandidates=$spatiallySupportedCandidates " +
+-            "meanSuppressedMagnitude=${suppressedMagnitudeSum / attenuatedDenominator} " +
+-            "maxSuppressedMagnitude=$maxSuppressedMagnitude grid=${gridWidth}x${gridHeight} origin=GL_BOTTOM_LEFT")
+-        PLog.i(TAG, "IRIS_26794_SPATIAL_MASK legacy=${spatialMaskHex26794(legacyCandidateMask)}")
+-        PLog.i(TAG, "IRIS_26794_SPATIAL_MASK brightRisk=${spatialMaskHex26794(brightRiskMask)}")
+-        PLog.i(TAG, "IRIS_26794_SPATIAL_MASK attenuated=${spatialMaskHex26794(attenuatedMask)}")
+-        PLog.i(TAG, "IRIS_26794_SPATIAL_MASK allowedRaised=${spatialMaskHex26794(allowedRaiseMask)}")
+         buffer.position(0)
+     }
+ 
+diff --git a/app/version.properties b/app/version.properties
+index 22997f231085aab8ea0c5ee5c7a58baad755256d..fdf5c784d40963f48386d4a895671fb3de966719 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726794
+-VERSION_BUILD=26794
++VERSION_NAME=0.9726793
++VERSION_BUILD=26793
