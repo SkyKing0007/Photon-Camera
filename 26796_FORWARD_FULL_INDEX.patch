@@ -1,0 +1,158 @@
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 386711f41fdea1ea4128998873e639035cdad650..04fc7396fa38f14ddf8c1f3c739afcc19c1eead5 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -471,6 +471,111 @@ vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
+     return clamp(vec3(y)+chroma*min(requestedGain,limit),vec3(0.0),vec3(1.0));
+ }
+ 
++/* IRIS_26796_CALIBRATED_BIPOLAR_BRIGHT_CONTOUR_VALIDITY
++ * Motion-only, calibrated linear Display-P3, before presentation gain/tone.
++ *
++ * 26795 proved that bright-edge risk can be detected but also proved that an edge-following
++ * false-color ribbon can validate itself when neighboring ribbon pixels are treated as material
++ * support. 26796 moves the definitive decision after MotionV2ColorTransform/ACR3, where the
++ * neutral axis is truly equal-channel Display-P3, and requires independent support several source
++ * pixels INTO a material along the luminance-gradient normal. Tangent continuity never grants
++ * permission. A correction additionally requires bipolar/opponent evidence across the normal;
++ * therefore a genuine thin colored line with neutral surroundings is not desaturated merely for
++ * being thin. The operation changes only neutral-axis chroma magnitude and preserves Display-P3
++ * luminance exactly. All later default Motion owners are scalar/identity with respect to chroma.
++ */
++vec3 iris26796SampleCalibratedP3(vec2 sourcePixel){
++    vec2 sz=vec2(textureSize(InputBuffer,0));
++    vec2 hi=max(sz-vec2(1.0),vec2(0.0));
++    vec2 p=clamp(sourcePixel,vec2(0.0),hi);
++    return max(texture(InputBuffer,(p+vec2(0.5))/sz).rgb,vec3(0.0));
++}
++vec3 iris26796NormalizedChroma(vec3 rgb){
++    rgb=max(rgb,vec3(0.0));
++    float y=max(luminance(rgb),0.0);
++    float guide=max(y,max3(rgb));
++    return (rgb-vec3(y))/max(guide,0.04);
++}
++float iris26796SameHueProjection(vec3 rgb,vec3 dir){
++    return max(dot(iris26796NormalizedChroma(rgb),dir),0.0);
++}
++float iris26796OpponentProjection(vec3 rgb,vec3 dir){
++    return max(-dot(iris26796NormalizedChroma(rgb),dir),0.0);
++}
++vec3 iris26796CalibratedBrightContour(vec2 sourcePixel,vec3 rgb){
++    rgb=max(rgb,vec3(0.0));
++    float y=max(luminance(rgb),0.0);
++    float guide=max(y,max3(rgb));
++    if(guide<=1.0e-6)return rgb;
++
++    /* Derivatives must be evaluated before any data-dependent return so all fragments in a quad
++     * participate in the gradient operation. */
++    vec2 grad=vec2(dFdx(y),dFdy(y));
++    float gradMag=length(grad);
++
++    vec3 centerFrac=iris26796NormalizedChroma(rgb);
++    float centerMagnitude=length(centerFrac);
++    /* The observed chandelier/bulb defect is a low/moderate chroma reconstruction fringe. Strong
++     * saturated material remains outside this automatic correction domain. */
++    float chromaPresent=smoothstep(0.012,0.045,centerMagnitude);
++    float strongMaterialProtect=1.0-smoothstep(0.30,0.48,centerMagnitude);
++    float chromaRisk=chromaPresent*strongMaterialProtect;
++    if(chromaRisk<=1.0e-5)return rgb;
++
++    /* dFdx/dFdy are in output-pixel units. Compensate only the residual render zoom so this gate
++     * measures the same source-space contour steepness when the final crop is enlarged. */
++    float relativeGradient=(gradMag*max(irisOutputZoom,1.0))/max(guide,0.03);
++    float edgeRisk=smoothstep(0.045,0.18,relativeGradient);
++    if(edgeRisk<=1.0e-5)return rgb;
++
++    /* Use the exact Motion final-tone predictor so a source value that will become visually bright
++     * under a 3x-6x presentation request is classified as bright BEFORE that gain is rendered.
++     * This more expensive predictor runs only after cheap chroma/edge rejection. */
++    float projectedGuide=iris26653MapMotionSdrFinalGuide(guide);
++    float brightRisk=smoothstep(0.70,0.88,projectedGuide);
++    if(brightRisk<=1.0e-5)return rgb;
++
++    vec2 normal=grad/max(gradMag,1.0e-7);
++    vec3 dir=centerFrac/max(centerMagnitude,1.0e-7);
++
++    /* Immediate samples can expose the complementary lobe of a CFA/reconstruction fringe. */
++    vec3 nearPos=iris26796SampleCalibratedP3(sourcePixel+normal);
++    vec3 nearNeg=iris26796SampleCalibratedP3(sourcePixel-normal);
++    float opponent=max(iris26796OpponentProjection(nearPos,dir),
++                       iris26796OpponentProjection(nearNeg,dir));
++    float opponentRatio=opponent/max(centerMagnitude,1.0e-6);
++    float bipolarEvidence=smoothstep(0.14,0.52,opponentRatio);
++    if(bipolarEvidence<=1.0e-5)return rgb;
++
++    /* Independent material evidence must survive at both 3- and 5-pixel depths on one side.
++     * A one/two-pixel fringe therefore cannot authenticate itself. This samples only the edge
++     * normal; tangent/contour continuity is intentionally excluded from permission. */
++    vec3 pos3=iris26796SampleCalibratedP3(sourcePixel+normal*3.0);
++    vec3 pos5=iris26796SampleCalibratedP3(sourcePixel+normal*5.0);
++    vec3 neg3=iris26796SampleCalibratedP3(sourcePixel-normal*3.0);
++    vec3 neg5=iris26796SampleCalibratedP3(sourcePixel-normal*5.0);
++    float posDepth=min(iris26796SameHueProjection(pos3,dir),
++                       iris26796SameHueProjection(pos5,dir));
++    float negDepth=min(iris26796SameHueProjection(neg3,dir),
++                       iris26796SameHueProjection(neg5,dir));
++    float materialMagnitude=max(posDepth,negDepth);
++    float materialRatio=materialMagnitude/max(centerMagnitude,1.0e-6);
++    float materialSupport=smoothstep(0.24,0.68,materialRatio);
++    float unsupported=1.0-materialSupport;
++
++    float correction=clamp(brightRisk*edgeRisk*chromaRisk*bipolarEvidence*unsupported,0.0,1.0);
++    if(correction<=1.0e-5)return rgb;
++
++    /* Keep at least independently supported same-hue material chroma. At full-confidence bipolar
++     * false color, unsupported residue is limited to 8% rather than hard-zeroed, avoiding a seam. */
++    float supportedMagnitude=max(materialMagnitude,centerMagnitude*0.08);
++    float targetMagnitude=mix(centerMagnitude,min(centerMagnitude,supportedMagnitude),correction);
++    float scale=targetMagnitude/max(centerMagnitude,1.0e-7);
++    vec3 corrected=vec3(y)+(rgb-vec3(y))*scale;
++    /* Weighted Display-P3 luminance is algebraically invariant because rgb-y has zero weighted Y. */
++    return max(corrected,vec3(0.0));
++}
++
+ /* IRIS_26718_HIGH_ZOOM_DETAIL_SAMPLE
+  * The sidecar is a centered subset of the global true-2x sensor lattice. It carries only signed
+  * log2 luminance detail; zero and out-of-bounds are exact no-ops.
+@@ -508,6 +613,10 @@ void main() {
+         sourceXY=ivec2(clamp(floor(sourcePixel+vec2(0.5)),
+                             vec2(0.0),vec2(sourceSize-ivec2(1))));
+     }
++    if(iris26592MotionHdrHandoff!=0){
++        /* 26796 definitive calibrated-domain validity runs before any presentation/tone magnitude. */
++        linearSrgb=iris26796CalibratedBrightContour(sourcePixel,linearSrgb);
++    }
+     if(iris26718HighZoomDetailEnabled!=0){
+         linearSrgb=max(linearSrgb*exp2(iris26718HighZoomLogDetail(sourcePixel)),vec3(0.0));
+     }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 83594e1968e6a41f6c2adb1a83e4ff20d4af0c2f..9bf22e1b17ffc9a0e6fa3c19895dcc4d50663327 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1100,6 +1100,15 @@ public final class MotionV2Render extends Node {
+             throw new IllegalStateException("MotionV2Render used outside Motion V2");
+         }
+         iris26702LogThermal("render_begin");
++        if (basePipeline.mParameters.motionV2Active) {
++            Log.i(Name, "IRIS_26796_CALIBRATED_BIPOLAR_BRIGHT_CONTOUR_OWNER"
++                    + " domain=LINEAR_DISPLAY_P3_AFTER_COLOR_TRANSFORM_ACR3"
++                    + " insertion=RENDER_INPUT_BEFORE_PRESENTATION_TONE"
++                    + " support=MATERIAL_INTERIOR_EDGE_NORMAL_DEPTH_3_5"
++                    + " tangentPermission=false bipolarOpponentRequired=true"
++                    + " lumaInvariant=true strongMaterialProtected=true"
++                    + " downstreamDefaultChromaResurrectionOwner=false");
++        }
+ 
+         final GLTexture acquiredExtendedLinearHdr = previousNode.WorkingTexture;
+         GLTexture iris26662CanonicalHdrOwned = null;
+diff --git a/app/version.properties b/app/version.properties
+index ebd96f2ae8a4db06e4c13e9a7c8675b5485268aa..5a82ab5ea5342dcc43b88fcfd3553005024283f8 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726795
+-VERSION_BUILD=26795
++VERSION_NAME=0.9726796
++VERSION_BUILD=26796
