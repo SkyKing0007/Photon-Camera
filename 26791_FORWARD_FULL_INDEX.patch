@@ -1,0 +1,560 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 3a88f3ee6341ee24cb5fa8738c410f00dc7eda7c..79bd3ca9fb6ade6e70f98e4aedcc7723141b3d77 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2544,14 +2544,15 @@ internal object GlesMgcRawSabreShaders {
+          * omitted from the GLSL declaration block. No CFA/LCA/neutral/LONG math changes. */
+         uniform int uLongChromaGuard26790;
+         uniform sampler2D uNormalChromaConsensus26790;
+-        /* IRIS_26790_EXACT_DNG_FIXED_PHASE_JPEG_OWNER
+-         * 26789 proved that moving the DNG radial coordinate into the generic parity-changing RGB
+-         * RBF is not DNG-equivalent. 26790 mechanically ports the successful 26786 DNG physical
+-         * phase lattice: exact UINT RAW -> physical phase normalization -> fixed 2-pixel same-phase
+-         * lattice -> the same 2x2 kernel/headroom/hard-edge equations. The generic 3x3 Bayer-type
+-         * sampler is forbidden whenever LCA is enabled. Signal and headroom are measured from the
+-         * identical physical phase footprint; G1/G2 remain independent until their camera-green
+-         * contributions are combined. */
++        /* IRIS_26791_SABRE_SCALAR_CFA_LCA_OWNER
++         * Ownership correction for 26790. The DNG-derived owner may return only one corrected
++         * physical CFA scalar plus matching headroom for a CFA location. It may not construct RGB.
++         * Sabre keeps one unchanged 3x3 Bayer topology and remains the sole CFA->RGB/demosaic owner.
++         * LCA never changes the phase identity selected by that topology: R/B use the exact DNG
++         * radial coordinate and fixed 2-pixel same-phase interpolation; G1/G2 stay unshifted.
++         * DNG hard-edge rejection remains DNG reconstruction policy. JPEG's scalar producer may
++         * use the same-side DNG de-alias interpolation, but otherwise snaps to the nearest same-
++         * phase physical sample rather than dropping CFA evidence or becoming a second reconstructor. */
+         uniform int uJpegLcaEnabled26790;
+         uniform vec2 uJpegLcaKrKb26790;
+         uniform vec4 uPhaseGains26790;
+@@ -2683,8 +2684,17 @@ internal object GlesMgcRawSabreShaders {
+             return value.abgr;
+         }
+ 
++        void fillCorrectedCfaNeighborhood26791(
++            ivec2 position,
++            vec2 sharedTranslationPixels,
++            vec3 covariance,
++            out mat3 bayerValue,
++            out mat3 sourceValidity
++        );
++
+         void sampleNeighborhoodRbf(
+             vec2 sampleUv,
++            vec2 referenceUv26791,
+             vec3 covariance,
+             out vec3 accumulatedIntensities,
+             out vec3 accumulatedWeights,
+@@ -2697,19 +2707,43 @@ internal object GlesMgcRawSabreShaders {
+             sourceNeighborhoodConfidence = 1.0;
+             vec2 coordinateScaled = sampleUv * (vec2(uExtractedSize) * 2.0);
+             ivec2 position = ivec2(coordinateScaled);
+-            mat3 bayerValue = get3x3FromExtractedBayer(position);
+-            /* 26789: signal and clipping provenance are sampled from the identical CFA footprint. */
+-            mat3 validityBayerValue26789 = bayerValue;
++            mat3 bayerValue = mat3(0.0);
+             mat3 sourceValidity = mat3(1.0);
+-            float headroomStart=max(1.0,uSourceClippingPoint*0.9925);
+-            for (int sx=0;sx<3;++sx) {
+-                for (int sy=0;sy<3;++sy) {
+-                    float sampleConfidence=1.0-smoothstep(
+-                        headroomStart,max(headroomStart+1.0e-4,uSourceClippingPoint),
+-                        validityBayerValue26789[sx][sy]);
+-                    sourceValidity[sx][sy]=sampleConfidence;
+-                    sourceNeighborhoodConfidence=min(
+-                        sourceNeighborhoodConfidence,sampleConfidence);
++            if (uJpegLcaEnabled26790 != 0) {
++                /* IRIS_26791_ONE_RGB_TOPOLOGY
++                 * The flow-aligned Sabre topology is selected once from sampleUv. LCA is allowed
++                 * to alter only each scalar CFA producer beneath that topology, never position/type. */
++                vec2 sharedTranslationPixels26791 =
++                    (sampleUv - referenceUv26791) * vec2(uOutputSize);
++                fillCorrectedCfaNeighborhood26791(
++                    position,
++                    sharedTranslationPixels26791,
++                    covariance,
++                    bayerValue,
++                    sourceValidity
++                );
++                for (int sx = 0; sx < 3; ++sx) {
++                    for (int sy = 0; sy < 3; ++sy) {
++                        sourceNeighborhoodConfidence = min(
++                            sourceNeighborhoodConfidence, sourceValidity[sx][sy]);
++                    }
++                }
++            } else {
++                /* Exact inherited no-LCA signal/headroom path. */
++                bayerValue = get3x3FromExtractedBayer(position);
++                mat3 validityBayerValue26789 = bayerValue;
++                float headroomStart = max(1.0, uSourceClippingPoint * 0.9925);
++                for (int sx = 0; sx < 3; ++sx) {
++                    for (int sy = 0; sy < 3; ++sy) {
++                        float sampleConfidence = 1.0 - smoothstep(
++                            headroomStart,
++                            max(headroomStart + 1.0e-4, uSourceClippingPoint),
++                            validityBayerValue26789[sx][sy]
++                        );
++                        sourceValidity[sx][sy] = sampleConfidence;
++                        sourceNeighborhoodConfidence = min(
++                            sourceNeighborhoodConfidence, sampleConfidence);
++                    }
+                 }
+             }
+             mat3 weights = mat3(0.0);
+@@ -2850,149 +2884,161 @@ internal object GlesMgcRawSabreShaders {
+                 ? quadHeadroomConfidence26790(q) : phaseHeadroomConfidence26790(q, phaseIndex);
+         }
+ 
+-        /* Mechanical port of normalDngMerge's fixed-phase sampling equations. The only extension
+-         * is that RGB demosaic asks the same physical phase lattice for R/G1/G2/B at every output
+-         * center. At a pixel whose parity equals phaseIndex, this equation is exactly the DNG
+-         * equation and is regression-checked as such. */
+-        void sampleFixedPhaseDng26790(
+-            ivec2 outputPixel,
+-            int phaseIndex,
+-            out float intensity,
+-            out float accumulatedWeight,
+-            out float validAccumulatedWeight,
+-            out float sourceHeadroomConfidence,
+-            out float fractionalHardEdgeWeight,
+-            out vec2 rowSampleUv
++        float rawCode26791(ivec2 p) {
++            p = clamp(p, ivec2(0), uOutputSize - ivec2(1));
++            // Match extractBayer's scalar representation so inherited Sabre calibration is unchanged.
++            return float(texelFetch(uRaw26790, p, 0).r) + 1.0e-4;
++        }
++
++        /* IRIS_26791_DNG_DERIVED_SCALAR_CFA_PRODUCER
++         * Producer contract: one nominal physical CFA location in, one same-phase scalar + physical
++         * headroom out. No vec3/RGB output exists here. Sabre owns flow topology and RGB assembly.
++         * To preserve DNG's operation order, remove Sabre's shared flow translation, apply the DNG
++         * radial correction in target space, then restore that same shared translation. */
++        void correctedCfaScalar26791(
++            ivec2 nominalSourcePixel,
++            vec2 sharedTranslationPixels,
++            vec3 covariance,
++            out float rawValue,
++            out float sourceHeadroomConfidence
+         ) {
+-            intensity = 0.0;
+-            accumulatedWeight = 0.0;
+-            validAccumulatedWeight = 0.0;
+-            sourceHeadroomConfidence = 1.0;
+-            fractionalHardEdgeWeight = 1.0;
+-            vec2 rawSize = vec2(uOutputSize);
+-            ivec2 quadOrigin = (outputPixel / 2) * 2;
+-            vec2 quadReferenceUv = (vec2(quadOrigin) + vec2(1.0)) / rawSize;
+-            vec2 sampleReferenceUv = quadReferenceUv;
+-            vec2 targetOutputCenter = vec2(outputPixel) + vec2(0.5);
++            nominalSourcePixel = clamp(
++                nominalSourcePixel, ivec2(0), uOutputSize - ivec2(1));
++            int phaseIndex = phaseAt26790(nominalSourcePixel);
++            ivec2 nominalQ = nominalSourcePixel / 2;
+             float k = phaseLcaK26790(phaseIndex);
+-            if (uJpegLcaEnabled26790 != 0) {
+-                vec2 opticalCenter = 0.5 * rawSize;
+-                vec2 correctedQuadCenter = opticalCenter +
+-                    ((vec2(quadOrigin) + vec2(1.0)) - opticalCenter) * (1.0 - k);
+-                sampleReferenceUv = correctedQuadCenter / rawSize;
+-                targetOutputCenter = opticalCenter +
+-                    (targetOutputCenter - opticalCenter) * (1.0 - k);
+-            }
+-
+-            /* Exact DNG reference identity applies only when this RGB query is physically located
+-             * on the requested phase. Cross-phase RGB reconstruction still uses the same fixed
+-             * phase lattice rather than inventing a parity-dependent Bayer topology. */
+-            if (uUseFrameWeight == 0 && phaseAt26790(outputPixel) == phaseIndex &&
+-                    (uJpegLcaEnabled26790 == 0 || abs(k) < 1.0e-12)) {
+-                ivec2 q = outputPixel / 2;
+-                float hr = selectedHeadroom26790(q, phaseIndex);
+-                float wb = uPhaseWhiteBalance26790[phaseIndex];
+-                intensity = normalizedRaw26790(outputPixel) * wb;
+-                accumulatedWeight = 1.0;
+-                validAccumulatedWeight = hr;
+-                sourceHeadroomConfidence = hr;
+-                rowSampleUv = (vec2(outputPixel) + vec2(0.5)) / rawSize;
++            if (uJpegLcaEnabled26790 == 0 || abs(k) < 1.0e-12) {
++                rawValue = rawCode26791(nominalSourcePixel);
++                sourceHeadroomConfidence = selectedHeadroom26790(nominalQ, phaseIndex);
+                 return;
+             }
+ 
+-            vec2 flowUv = sampleReferenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+-            vec2 flow = texture(uFlow, flowUv).xy;
+-            vec2 quadSourceUv = mirrorUvs(sampleReferenceUv + flow);
+-            vec2 sharedTranslationPixels = (quadSourceUv - sampleReferenceUv) * rawSize;
+-            vec3 covariance = unpackCovariance(texture(uCovariance, quadSourceUv).xyz);
+-            vec2 sourcePixel = targetOutputCenter + sharedTranslationPixels;
+-            rowSampleUv = clamp(sourcePixel / rawSize, vec2(0.0), vec2(1.0));
++            vec2 opticalCenter = 0.5 * vec2(uOutputSize);
++            vec2 nominalSourceCenter = vec2(nominalSourcePixel) + vec2(0.5);
++            vec2 nominalTargetCenter = nominalSourceCenter - sharedTranslationPixels;
++            vec2 correctedTargetCenter = opticalCenter +
++                (nominalTargetCenter - opticalCenter) * (1.0 - k);
++            vec2 correctedSourceCenter = correctedTargetCenter + sharedTranslationPixels;
++
+             ivec2 offset = phaseOffset26790(phaseIndex);
+-            vec2 latticeCoordinate = 0.5 * (sourcePixel - (vec2(offset) + vec2(0.5)));
++            vec2 latticeCoordinate = 0.5 *
++                (correctedSourceCenter - (vec2(offset) + vec2(0.5)));
+             ivec2 nearestLattice = ivec2(floor(latticeCoordinate + vec2(0.5)));
+             vec2 nearestDelta = latticeCoordinate - vec2(nearestLattice);
+-            float wb = uPhaseWhiteBalance26790[phaseIndex];
+-
+-            bool exactSamePhaseSample = max(abs(nearestDelta.x), abs(nearestDelta.y)) < 1.0e-5;
+-            if (exactSamePhaseSample) {
++            if (max(abs(nearestDelta.x), abs(nearestDelta.y)) < 1.0e-5) {
+                 ivec2 q = clampPhaseLattice26790(nearestLattice, phaseIndex);
+                 ivec2 source = pixelForPhaseLattice26790(q, phaseIndex);
+-                float hr = selectedHeadroom26790(q, phaseIndex);
+-                intensity = normalizedRaw26790(source) * wb;
+-                accumulatedWeight = 1.0;
+-                validAccumulatedWeight = hr;
+-                sourceHeadroomConfidence = hr;
+-            } else {
+-                ivec2 latticeBase = ivec2(floor(latticeCoordinate));
+-                float guideMin = 1.0e9;
+-                float guideMax = 0.0;
+-                float guides26790[4];
+-                float samples26790[4];
+-                float weights26790[4];
+-                float headrooms26790[4];
+-                for (int ly = 0; ly <= 1; ++ly) {
+-                    for (int lx = 0; lx <= 1; ++lx) {
+-                        int i = ly * 2 + lx;
+-                        ivec2 q = clampPhaseLattice26790(latticeBase + ivec2(lx, ly), phaseIndex);
+-                        ivec2 source = q * 2 + offset;
+-                        vec2 sampleCenter = vec2(source) + vec2(0.5);
+-                        float w = kernelWeight(sampleCenter - sourcePixel, covariance);
+-                        float sampleValue = normalizedRaw26790(source) * wb;
+-                        float guide = quadGuide26790(q);
+-                        float hr = selectedHeadroom26790(q, phaseIndex);
+-                        guides26790[i] = guide;
+-                        samples26790[i] = sampleValue;
+-                        weights26790[i] = w;
+-                        headrooms26790[i] = hr;
+-                        intensity += sampleValue * w;
+-                        accumulatedWeight += w;
+-                        validAccumulatedWeight += w * hr;
+-                        guideMin = min(guideMin, guide);
+-                        guideMax = max(guideMax, guide);
+-                        sourceHeadroomConfidence = min(sourceHeadroomConfidence, hr);
+-                    }
++                rawValue = rawCode26791(source);
++                sourceHeadroomConfidence = selectedHeadroom26790(q, phaseIndex);
++                return;
++            }
++
++            ivec2 latticeBase = ivec2(floor(latticeCoordinate));
++            float guideMin = 1.0e9;
++            float guideMax = 0.0;
++            float guides26791[4];
++            float samples26791[4];
++            float weights26791[4];
++            float headrooms26791[4];
++            float weightedRaw = 0.0;
++            float weightSum = 0.0;
++            sourceHeadroomConfidence = 1.0;
++            for (int ly = 0; ly <= 1; ++ly) {
++                for (int lx = 0; lx <= 1; ++lx) {
++                    int i = ly * 2 + lx;
++                    ivec2 q = clampPhaseLattice26790(
++                        latticeBase + ivec2(lx, ly), phaseIndex);
++                    ivec2 source = q * 2 + offset;
++                    vec2 sampleCenter = vec2(source) + vec2(0.5);
++                    float w = kernelWeight(sampleCenter - correctedSourceCenter, covariance);
++                    float sampleValue = rawCode26791(source);
++                    float guide = quadGuide26790(q);
++                    float hr = selectedHeadroom26790(q, phaseIndex);
++                    guides26791[i] = guide;
++                    samples26791[i] = sampleValue;
++                    weights26791[i] = w;
++                    headrooms26791[i] = hr;
++                    weightedRaw += sampleValue * w;
++                    weightSum += w;
++                    guideMin = min(guideMin, guide);
++                    guideMax = max(guideMax, guide);
++                    sourceHeadroomConfidence = min(sourceHeadroomConfidence, hr);
+                 }
+-                float guideRange = max(guideMax - guideMin, 0.0);
+-                float relativeGuideRange = guideRange / max(guideMax, 0.03);
+-                bool hardEdge = guideMax > 0.08 && guideRange > 0.055 && relativeGuideRange > 0.20;
+-                if (!hardEdge) {
+-                    fractionalHardEdgeWeight = 1.0;
+-                } else if (uUseFrameWeight == 0 && uJpegLcaEnabled26790 != 0 && abs(k) >= 1.0e-12) {
+-                    fractionalHardEdgeWeight = 1.0;
+-                } else if (uDngEdgeDeAlias26790 == 0) {
+-                    fractionalHardEdgeWeight = 0.0;
++            }
++
++            float guideRange = max(guideMax - guideMin, 0.0);
++            float relativeGuideRange = guideRange / max(guideMax, 0.03);
++            bool hardEdge = guideMax > 0.08 && guideRange > 0.055 &&
++                relativeGuideRange > 0.20;
++            if (hardEdge && uDngEdgeDeAlias26790 != 0) {
++                float acrossX = abs(guides26791[1] - guides26791[0]) +
++                    abs(guides26791[3] - guides26791[2]);
++                float acrossY = abs(guides26791[2] - guides26791[0]) +
++                    abs(guides26791[3] - guides26791[1]);
++                int i0; int i1;
++                vec2 frac = latticeCoordinate - floor(latticeCoordinate);
++                if (acrossX > acrossY) {
++                    bool right = frac.x >= 0.5;
++                    i0 = right ? 1 : 0;
++                    i1 = right ? 3 : 2;
+                 } else {
+-                    float acrossX = abs(guides26790[1] - guides26790[0]) + abs(guides26790[3] - guides26790[2]);
+-                    float acrossY = abs(guides26790[2] - guides26790[0]) + abs(guides26790[3] - guides26790[1]);
+-                    int i0; int i1;
+-                    vec2 frac = latticeCoordinate - floor(latticeCoordinate);
+-                    if (acrossX > acrossY) {
+-                        bool right = frac.x >= 0.5;
+-                        i0 = right ? 1 : 0; i1 = right ? 3 : 2;
+-                    } else {
+-                        bool bottom = frac.y >= 0.5;
+-                        i0 = bottom ? 2 : 0; i1 = bottom ? 3 : 1;
+-                    }
+-                    float pairMax = max(guides26790[i0], guides26790[i1]);
+-                    float pairRange = abs(guides26790[i0] - guides26790[i1]);
+-                    bool sameSide = pairRange <= max(0.035, 0.12 * max(pairMax, 0.03));
+-                    if (sameSide) {
+-                        intensity = samples26790[i0] * weights26790[i0] + samples26790[i1] * weights26790[i1];
+-                        accumulatedWeight = weights26790[i0] + weights26790[i1];
+-                        validAccumulatedWeight = weights26790[i0] * headrooms26790[i0] +
+-                            weights26790[i1] * headrooms26790[i1];
+-                        sourceHeadroomConfidence = min(headrooms26790[i0], headrooms26790[i1]);
+-                        fractionalHardEdgeWeight = 1.0;
+-                    } else {
+-                        fractionalHardEdgeWeight = 0.0;
+-                    }
++                    bool bottom = frac.y >= 0.5;
++                    i0 = bottom ? 2 : 0;
++                    i1 = bottom ? 3 : 1;
++                }
++                float pairMax = max(guides26791[i0], guides26791[i1]);
++                float pairRange = abs(guides26791[i0] - guides26791[i1]);
++                bool sameSide = pairRange <= max(0.035, 0.12 * max(pairMax, 0.03));
++                if (sameSide) {
++                    float pairWeight = weights26791[i0] + weights26791[i1];
++                    rawValue = (
++                        samples26791[i0] * weights26791[i0] +
++                        samples26791[i1] * weights26791[i1]
++                    ) / max(pairWeight, 1.0e-8);
++                    sourceHeadroomConfidence = min(
++                        headrooms26791[i0], headrooms26791[i1]);
++                    return;
+                 }
+             }
+-            if (fractionalHardEdgeWeight <= 0.0) {
+-                intensity = 0.0;
+-                accumulatedWeight = 0.0;
+-                validAccumulatedWeight = 0.0;
+-                sourceHeadroomConfidence = 0.0;
++
++            if (hardEdge) {
++                /* Ownership boundary: DNG may reject this fractional reconstruction entirely,
++                 * but JPEG may not create a second spatial-rejection owner beneath Sabre. Keep
++                 * physical phase identity and snap to the nearest same-phase scalar instead. */
++                ivec2 q = clampPhaseLattice26790(nearestLattice, phaseIndex);
++                ivec2 source = pixelForPhaseLattice26790(q, phaseIndex);
++                rawValue = rawCode26791(source);
++                sourceHeadroomConfidence = selectedHeadroom26790(q, phaseIndex);
++                return;
++            }
++
++            rawValue = weightedRaw / max(weightSum, 1.0e-8);
++        }
++
++        void fillCorrectedCfaNeighborhood26791(
++            ivec2 position,
++            vec2 sharedTranslationPixels,
++            vec3 covariance,
++            out mat3 bayerValue,
++            out mat3 sourceValidity
++        ) {
++            bayerValue = mat3(0.0);
++            sourceValidity = mat3(1.0);
++            for (int sx = 0; sx < 3; ++sx) {
++                for (int sy = 0; sy < 3; ++sy) {
++                    ivec2 physicalPixel = position + ivec2(sx - 1, sy - 1);
++                    float rawValue;
++                    float headroom;
++                    correctedCfaScalar26791(
++                        physicalPixel,
++                        sharedTranslationPixels,
++                        covariance,
++                        rawValue,
++                        headroom
++                    );
++                    bayerValue[sx][sy] = rawValue;
++                    sourceValidity[sx][sy] = headroom;
++                }
+             }
+         }
+ 
+@@ -3033,44 +3079,23 @@ internal object GlesMgcRawSabreShaders {
+             float sourceNeighborhoodConfidence = 1.0;
+             vec2 rowReliabilitySampleUv26790 = referenceUv;
+ 
+-            if (uJpegLcaEnabled26790 == 0) {
+-                /* Exact inherited no-LCA RGB equation path. */
+-                vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
+-                vec4 flow = texture(uFlow, flowUv);
+-                vec2 sampleUv = mirrorUvs(referenceUv + flow.xy);
+-                vec3 covariance = unpackCovariance(texture(uCovariance, sampleUv).xyz);
+-                sampleNeighborhoodRbf(
+-                    sampleUv,
+-                    covariance,
+-                    accumulatedColor,
+-                    accumulatedWeight,
+-                    sourceNeighborhoodConfidence,
+-                    validAccumulatedWeight
+-                );
+-                rowReliabilitySampleUv26790 = sampleUv;
+-            } else {
+-                int rPhase = redPhase26790();
+-                int bPhase = bluePhase26790();
+-                int g0 = -1; int g1 = -1;
+-                for (int phase = 0; phase < 4; ++phase) {
+-                    if (phase != rPhase && phase != bPhase) {
+-                        if (g0 < 0) g0 = phase; else g1 = phase;
+-                    }
+-                }
+-                float rI; float rW; float rV; float rH; float rE; vec2 rUv;
+-                float g0I; float g0W; float g0V; float g0H; float g0E; vec2 g0Uv;
+-                float g1I; float g1W; float g1V; float g1H; float g1E; vec2 g1Uv;
+-                float bI; float bW; float bV; float bH; float bE; vec2 bUv;
+-                sampleFixedPhaseDng26790(outputPixel26790, rPhase, rI, rW, rV, rH, rE, rUv);
+-                sampleFixedPhaseDng26790(outputPixel26790, g0, g0I, g0W, g0V, g0H, g0E, g0Uv);
+-                sampleFixedPhaseDng26790(outputPixel26790, g1, g1I, g1W, g1V, g1H, g1E, g1Uv);
+-                sampleFixedPhaseDng26790(outputPixel26790, bPhase, bI, bW, bV, bH, bE, bUv);
+-                accumulatedColor = vec3(rI, g0I + g1I, bI);
+-                accumulatedWeight = vec3(rW, g0W + g1W, bW);
+-                validAccumulatedWeight = vec3(rV, g0V + g1V, bV);
+-                sourceNeighborhoodConfidence = min(min(rH, bH), min(g0H, g1H));
+-                rowReliabilitySampleUv26790 = 0.5 * (g0Uv + g1Uv);
+-            }
++            /* IRIS_26791_SABRE_SOLE_RGB_OWNER
++             * One flow/covariance/topology invocation for LCA ON and OFF. When LCA is ON only the
++             * scalar CFA producer beneath sampleNeighborhoodRbf changes; RGB topology never does. */
++            vec2 flowUv26791 = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
++            vec4 flow26791 = texture(uFlow, flowUv26791);
++            vec2 sampleUv26791 = mirrorUvs(referenceUv + flow26791.xy);
++            vec3 covariance26791 = unpackCovariance(texture(uCovariance, sampleUv26791).xyz);
++            sampleNeighborhoodRbf(
++                sampleUv26791,
++                referenceUv,
++                covariance26791,
++                accumulatedColor,
++                accumulatedWeight,
++                sourceNeighborhoodConfidence,
++                validAccumulatedWeight
++            );
++            rowReliabilitySampleUv26790 = sampleUv26791;
+ 
+             /* IRIS_26790_LONG_CHROMA_NO_REINTRODUCTION
+              * Completed NORMAL consensus is the sole chroma anchor. A LONG-only chroma departure
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index b4495382fb2ed544bc0dfa9478a454b2cb22f88c..04bc04d9369dbf025d43db8eb6aa12446affa6fa 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -3173,20 +3173,18 @@ internal class GlesMgcRawSpatialStacker(
+                 "IRIS_26781_DIRECT_POST_SHORT_RESOLVE matchedBandwidth26780=false " +
+                     "normalShortFusionUnchanged=true edgeSuppressor26778PeriodicGuard26788=true",
+             )
+-            /* IRIS_26790_EXACT_DNG_FIXED_PHASE_RUNTIME_OWNER
+-             * No independent JPEG approximation remains in the LCA geometry or neutral-censor
+-             * decision: LCA-enabled NORMAL/LONG consume exact UINT RAW on fixed physical 2-pixel
+-             * phase lattices using the DNG radial/kernel/headroom/de-alias equations, and the
+-             * neutral gate reads the literal completed-NORMAL DNG accumulator weights. Sabre RGB
+-             * reconstruction remains the established JPEG owner after those physical CFA rules. */
++            /* IRIS_26791_SCALAR_CFA_LCA_RUNTIME_OWNER
++             * The DNG-derived LCA producer returns one same-phase physical CFA scalar/headroom.
++             * Sabre keeps the single inherited 3x3 topology and is the sole CFA->RGB owner. */
+             PLog.i(
+                 SABRE_TAG,
+-                "IRIS_26790_JPEG_CFA_OPTIONS lca=${dngOptions26786.lcaEnabled} " +
++                "IRIS_26791_JPEG_CFA_OPTIONS lca=${dngOptions26786.lcaEnabled} " +
+                     "kR=${dngOptions26786.kR} kB=${dngOptions26786.kB} " +
+                     "neutralClamp=${dngOptions26786.neutralClamp} neutralGate=LITERAL_NORMAL_DNG_ACCUMULATOR_WEIGHTS__FULL_NEUTRAL_WHITE_CEILING " +
+                     "headroomScope=${dngOptions26786.headroomScopeName()} " +
+                     "deAlias=${dngOptions26786.edgeDeAlias} settingsSource=${dngOptions26786.source} " +
+-                    "normalLongOwner=EXACT_DNG_FIXED_PHASE_UINT_RAW genericParityRbfForLca=false " +
++                    "normalLongCfaOwner=DNG_DERIVED_SCALAR_FIXED_PHASE sabreRgbOwner=true " +
++                    "singleRbfTopology=true directFourPhaseRgb=false lcaChangesPhase=false " +
+                     "postRgbLcaRetired=true normalLongPrewarpRetired=true " +
+                     "longChromaAnchor=COMPLETED_NORMAL_CONSENSUS",
+             )
+@@ -3702,6 +3700,16 @@ internal class GlesMgcRawSpatialStacker(
+         sourceWhiteNormalized: Float,
+         dngOptions26786: IrisMotionSettings.DngOptions.Snapshot,
+     ) {
++        if (sabreNormalDngMergeProgram == 0) {
++            /* IRIS_26791_NEUTRAL_ONLY_DNG_ACCUMULATOR_LIFECYCLE
++             * Night JPEG can require the literal NORMAL DNG accumulator for neutral censorship
++             * even when DNG export is disabled. Link the already-proven accumulator shader lazily;
++             * this does not enable DNG publication or alter NORMAL/LONG reconstruction ownership. */
++            sabreNormalDngMergeProgram = linkProgram(
++                GlesMgcRawSabreShaders.normalDngMerge,
++                "iris_26545_sabre_normal_dng_merge",
++            )
++        }
+         check(sabreNormalDngMergeProgram != 0 && accumulator != 0)
+         val program = sabreNormalDngMergeProgram
+         GLES30.glUseProgram(program)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 642d8035661b6320108e02fc2f5de3801df2bd36..da660bb3cd169baf2759bc48a0d531366d3c6b69 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -269,16 +269,36 @@ object PhotonMotionMgc1271Bridge {
+             val frozenResidualChromaCustom26762 = !parameters.irisNightActive && irisSettings.residualChromaCustom
+             val edgeFalseColor26778 = IrisMotionSettings.EdgeFalseColorTunables.current()
+             val dngOptions26786 = if (parameters.irisNightActive) {
+-                IrisMotionSettings.DngOptions.defaults()
++                /* IRIS_26791_NIGHT_SHARED_PHYSICAL_NEUTRAL_RULE
++                 * Night already uses the same normalDngMerge/normalizeBayer architecture and
++                 * default-on fixed-phase LCA. The physical two-green censor condition is not a
++                 * Motion aesthetic policy, so Night JPEG and Night DNG enable the same neutral
++                 * clamp without changing Night exposure, frames, reconstruction, VGN or tone. */
++                val nightBase26791 = IrisMotionSettings.DngOptions.defaults()
++                IrisMotionSettings.DngOptions.Snapshot(
++                    nightBase26791.lcaEnabled,
++                    nightBase26791.kR,
++                    nightBase26791.kB,
++                    nightBase26791.quadScopedHeadroom,
++                    nightBase26791.edgeDeAlias,
++                    true,
++                    "NIGHT_DEFAULTS_NEUTRAL_26791",
++                )
+             } else {
+                 parameters.motionV2DngOptions26786 ?: IrisMotionSettings.DngOptions.defaults()
+             }
+-            if (!parameters.irisNightActive) {
+-                val line = "lca=${dngOptions26786.lcaEnabled} kR=${dngOptions26786.kR} kB=${dngOptions26786.kB} " +
++            val dngOptionsLine26791 =
++                "lca=${dngOptions26786.lcaEnabled} kR=${dngOptions26786.kR} kB=${dngOptions26786.kB} " +
+                     "headroomScope=${dngOptions26786.headroomScopeName()} deAlias=${dngOptions26786.edgeDeAlias} " +
+                     "neutralClamp=${dngOptions26786.neutralClamp} settingsSource=${dngOptions26786.source}"
+-                PLog.i(TAG, "IRIS_26786_DNG_OPTIONS $line")
+-            }
++            PLog.i(
++                TAG,
++                if (parameters.irisNightActive) {
++                    "IRIS_26791_NIGHT_DNG_JPEG_PHYSICAL_OPTIONS $dngOptionsLine26791"
++                } else {
++                    "IRIS_26786_DNG_OPTIONS $dngOptionsLine26791"
++                },
++            )
+ 
+             if (irisSettings.customNoiseModelEnabled) {
+                 val profile = IrisNoiseProfileStore.loadSelectedProfile(
+diff --git a/app/version.properties b/app/version.properties
+index af00f48ced410753a058f52878d4e7d896e39041..ffa6cfa5b84084c55c1910e80e3a4aebab03d18e 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726790
+-VERSION_BUILD=26790
++VERSION_NAME=0.9726791
++VERSION_BUILD=26791
