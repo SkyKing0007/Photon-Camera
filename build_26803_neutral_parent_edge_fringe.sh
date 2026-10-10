@@ -70,7 +70,7 @@ allowed_prefixes=(
  'verify_26803_patches.py','verify_26803_runtime_glsl.py','handoff_payload_26803/',
  '.github/workflows/build-26803-neutral-parent-edge-fringe.yml','TRIGGER_26803.txt',
  'PHOTON_26803_NEUTRAL_PARENT_EDGE_FRINGE_README.txt')
-paths=subprocess.check_output(['git','diff','--name-only','d4f9539cb523a771aec10c570dc505b2624a2d7c..HEAD'],text=True).splitlines()
+paths=subprocess.check_output(['git','diff','--name-only','d71e8dfc0a0f7951c2d4b7ba4e1e8495a2cb8e18..HEAD'],text=True).splitlines()
 bad=[p for p in paths if not any(p==x or p.startswith(x) for x in allowed_prefixes)]
 assert not bad,bad
 print('PASS 26803 infrastructure scope allowlist')
