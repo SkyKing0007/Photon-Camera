@@ -1,0 +1,265 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 82fb5e868db7cd45b0cf0e407ebe6b80dd383517..25d18eac6edf650023e4d25e71389ba505b69f51 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -218,7 +218,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         /* IRIS_26571_COHERENT_EDGE_COLOR_OWNER
+          * The successful 26768 universal stage remains unchanged and executes first. */
+         dispatchUniversalAdaptiveColor(
+-            finalScratch, filteredYccd, sabreSupportR, sabreSupportGb, sabreValidWeights,
++            finalScratch, filteredYccd, originalYccd, sabreSupportR, sabreSupportGb, sabreValidWeights,
+             sabreValidityWeightScale, preVgnPhysicalRgb,
+         )
+         dispatchBipolarColorTrust26769(
+@@ -509,6 +509,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+     private fun dispatchUniversalAdaptiveColor(
+         source: Int,
+         destination: Int,
++        ownership: Int,
+         sabreSupportR: Int,
+         sabreSupportGb: Int,
+         sabreValidWeights: Int,
+@@ -525,6 +526,7 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+         setImageSize(universalAdaptiveColorProgram)
+         bindImage(0, source, GLES31.GL_READ_ONLY)
+         bindImage(1, destination, GLES31.GL_WRITE_ONLY)
++        bindImage(2, ownership, GLES31.GL_READ_ONLY)
+         GLES31.glUniform1i(
+             host.uniformLocation(universalAdaptiveColorProgram, "uSabreSupportValid"),
+             if (sabreSupportValid) 1 else 0,
+@@ -557,9 +559,9 @@ internal class GlesIris26529SpatialRgbChromaPostprocessor(
+             "IRIS 26614 RAW-CFA-validity-owned universal adaptive color",
+             when {
+                 sabreSupportValid && preVgnPhysicalValid ->
+-                    intArrayOf(source, sabreSupportR, sabreSupportGb, sabreValidWeights, preVgnPhysicalRgb)
+-                sabreSupportValid -> intArrayOf(source, sabreSupportR, sabreSupportGb, sabreValidWeights)
+-                else -> intArrayOf(source)
++                    intArrayOf(source, ownership, sabreSupportR, sabreSupportGb, sabreValidWeights, preVgnPhysicalRgb)
++                sabreSupportValid -> intArrayOf(source, ownership, sabreSupportR, sabreSupportGb, sabreValidWeights)
++                else -> intArrayOf(source, ownership)
+             },
+             intArrayOf(destination),
+         )
+@@ -872,6 +874,11 @@ internal object Iris26529SpatialRgbChromaShaders {
+         // IRIS_26578_FAIL_CLOSED_REAL_COLOR_GATE
+         layout(rgba16ui, binding = 0) readonly uniform highp uimage2D uSource;
+         layout(rgba16ui, binding = 1) writeonly uniform highp uimage2D uDestination;
++        /* IRIS_26807_HIGHLIGHT_CLEANUP_OWNERSHIP_HANDOFF
++         * Read the immutable seed ownership map. Bit 13 means the 26806/26727 bright-color
++         * authority denied reconstructed chroma ownership at this exact pixel. Later recovery and
++         * magnitude-floor stages may not resurrect that denied chroma. */
++        layout(rgba16ui, binding = 2) readonly uniform highp uimage2D uOwnership;
+         uniform ivec2 uImageSize;
+         /* IRIS_26614_RAW_CFA_CHANNEL_VALIDITY_PROVENANCE
+          * Total R/G/B reconstruction weights plus the additive subset backed by source CFA samples
+@@ -921,6 +928,8 @@ internal object Iris26529SpatialRgbChromaShaders {
+             ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+             if (any(greaterThanEqual(p, uImageSize))) return;
+             vec3 center = loadRgb(p);
++            bool highlightCleanupOwned26807 = (int(imageLoad(uOwnership, p).a) & 0x2000) != 0;
++            float highlightCleanupPermission26807 = highlightCleanupOwned26807 ? 0.0 : 1.0;
+             float centerLuma = luminanceOf(center);
+             float centerScale = max(centerLuma, 0.060);
+             vec3 centerChroma = center - vec3(centerLuma);
+@@ -1469,15 +1478,21 @@ internal object Iris26529SpatialRgbChromaShaders {
+                     min(topologyProof, highlightSafe));
+                 float hardArtifactVeto = step(0.50, artifactVeto);
+                 float artifactPermission = (1.0 - artifactVeto) * (1.0 - hardArtifactVeto);
++                /* IRIS_26807_NO_DOWNSTREAM_HIGHLIGHT_CHROMA_RESURRECTION
++                 * 26806 device evidence proved that strong edge/topology evidence could keep or
++                 * rebuild unsupported green/cyan after the seed had already denied color ownership.
++                 * This is a pure ownership veto: it never changes luma and never affects pixels whose
++                 * 26806 bright-material proof opted them back into real-color ownership. */
+                 float restorePermission = strictPhysicalProof * cleanedDirectionPresent *
+-                    preVgnChromaPresent * artifactPermission;
++                    preVgnChromaPresent * artifactPermission * highlightCleanupPermission26807;
+                 float missingMagnitude = max(preVgnMagnitude - cleanedMagnitude, 0.0);
+                 float restoredMagnitude = min(preVgnMagnitude,
+                     cleanedMagnitude + missingMagnitude * restorePermission);
+                 if (cleanedMagnitude > 1.0e-7 && restoredMagnitude > cleanedMagnitude) {
+                     correctedChroma *= restoredMagnitude / cleanedMagnitude;
+                 }
+-                float floorPermission = smoothstep(0.78, 0.92, restorePermission);
++                float floorPermission = smoothstep(0.78, 0.92, restorePermission) *
++                    highlightCleanupPermission26807;
+                 protectedPreVgnMagnitude = floorPermission >= 0.5 ? preVgnMagnitude : 0.0;
+             }
+ 
+@@ -1698,7 +1713,8 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float highFrequencySafe=1.0-smoothstep(0.10,0.24,maxRelativeLumaEdge);
+             float bipolarRecoveryVeto=1.0-smoothstep(0.20,0.55,bipolar*(1.0-coherence));
+             float flattenedHighlight=flattenedHighlight26772(p,postY,max(prePeak,max3_26769(post)));
+-            float recovery=residualProof*supportProof*coherenceProof*measured*headroom*interiorProof*highFrequencySafe*bipolarRecoveryVeto*(1.0-flattenedHighlight)*(1.0-phaseFloorVeto);
++            float highlightCleanupVeto26807=highlightInvalid26772(p)?1.0:0.0;
++            float recovery=residualProof*supportProof*coherenceProof*measured*headroom*interiorProof*highFrequencySafe*bipolarRecoveryVeto*(1.0-flattenedHighlight)*(1.0-phaseFloorVeto)*(1.0-highlightCleanupVeto26807);
+             vec3 recoveredNC=(cleanedNC+centerOwnedCoherentResidual*recovery)*(1.0-flattenedHighlight);
+             float preMagnitude=length(preNC),recoveredMagnitude=length(recoveredNC);
+             if(recoveredMagnitude>preMagnitude&&recoveredMagnitude>1.0e-7)recoveredNC*=preMagnitude/recoveredMagnitude;
+@@ -1708,7 +1724,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+             /* IRIS_26776_NO_PHASE_INVALID_CHROMA_RESURRECTION
+              * The 26728 floor remains available for real supported micro-color, but once this exact
+              * pixel's periodic residual is proven inside a risky CFA block it cannot be re-amplified. */
+-            float finalFloor=(eradicate?0.0:existingFloor)*(1.0-flattenedHighlight)*(1.0-phaseFloorVeto);
++            float finalFloor=(eradicate?0.0:existingFloor)*(1.0-flattenedHighlight)*(1.0-phaseFloorVeto)*(1.0-highlightCleanupVeto26807);
+             if(!eradicate&&flattenedHighlight<0.05&&recovery>=0.80){vec3 finalC=finalRgb-vec3(y26769(finalRgb));finalFloor=max(finalFloor,min(length(finalC),length(pre-vec3(preY))));}
+             imageStore(uDestination,p,uvec4(uvec3(round(finalRgb*65535.0)),uint(round(clamp(finalFloor,0.0,1.0)*65535.0))));
+         }
+@@ -2071,6 +2087,11 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 smoothstep(0.20,0.55,max(legacyEdge,sideCount>0.0?1.0:0.0));
+             float edgeProtection=max(max(max(oneSidedProtection,materialBoundary),legacyEdge),
+                 max(max(topologyProtection,chromaTopologyProtection),frozenBoundaryProtection26769));
++            /* IRIS_26807_HIGHLIGHT_CLEANUP_OUTRANKS_EDGE_PROTECTION
++             * Bit 13 is an earlier immutable color-ownership decision, not a new color classifier.
++             * A strong luma edge or a coherent false-hue neighborhood cannot veto its chroma cleanup.
++             * Real bright material is unaffected because the 26806 opt-in leaves bit 13 clear. */
++            if((int(center.a)&0x2000)!=0)edgeProtection=0.0;
+             /* IRIS_26776_POST_DEMOSAIC_RG_BG_MEDIAN_OWNER
+              * Claude calls for a 1-3 pass R-G/B-G median in high-gradient or clipped regions.
+              * This existing one-pass median is now authoritative for bit-15 phase-invalid centers;
+@@ -2136,6 +2157,8 @@ internal object Iris26529SpatialRgbChromaShaders {
+             if(e.r!=0u&&e.a!=0u)f=filter3(e,p);
+             uvec4 sm=imageLoad(uSmooth,p);
+             vec2 originalChroma=vec2(float(signedChroma(e.g)),float(signedChroma(e.b)));
++            bool highlightCleanupOwned26807=(int(e.a)&0x2000)!=0;
++            float highlightCleanupPermission26807=highlightCleanupOwned26807?0.0:1.0;
+             vec2 smoothChroma=vec2(float(signedChroma(sm.g)),float(signedChroma(sm.b)));
+             vec2 directionalChroma=f.yz;
+             vec2 legacyChroma=length(smoothChroma)<length(directionalChroma)?smoothChroma:directionalChroma;
+@@ -2196,22 +2219,25 @@ internal object Iris26529SpatialRgbChromaShaders {
+                     topologySupport+=sameLuma*mix(1.0,smoothstep(0.82,0.94,farAgreement),centerChromaPresent);
+                 }
+             }
+-            float topologyProtection=smoothstep(1.25,2.75,topologySupport)*smoothstep(0.08,0.30,edgeEvidence);
+-            float edgePreserve=max(smoothstep(0.08,0.30,edgeEvidence)*highlightPreservePermission,topologyProtection);
++            float topologyProtection=smoothstep(1.25,2.75,topologySupport)*smoothstep(0.08,0.30,edgeEvidence)*
++                highlightCleanupPermission26807;
++            float edgePreserve=max(smoothstep(0.08,0.30,edgeEvidence)*highlightPreservePermission,topologyProtection)*
++                highlightCleanupPermission26807;
+             float smoothAgreement=clamp(chromaAgreement(originalChroma,smoothChroma),-1.0,1.0);
+             float directionalAgreement=clamp(chromaAgreement(originalChroma,directionalChroma),-1.0,1.0);
+             vec2 edgeCandidate=directionalAgreement>=smoothAgreement?directionalChroma:smoothChroma;
+             float edgeAgreement=max(smoothAgreement,directionalAgreement);
+             float originalMagnitude=length(originalChroma);
+             float edgeMagnitude=length(edgeCandidate);
+-            if(originalMagnitude>192.0&&edgeMagnitude>1.0&&edgeAgreement>0.82){
++            if(!highlightCleanupOwned26807&&originalMagnitude>192.0&&edgeMagnitude>1.0&&edgeAgreement>0.82){
+                 float protectedMagnitude=clamp(edgeMagnitude,0.80*originalMagnitude,originalMagnitude);
+                 edgeCandidate*=protectedMagnitude/edgeMagnitude;
+             }
+             float coherentEdge=smoothstep(0.72,0.92,edgeAgreement);
+             vec2 selectedChroma=mix(legacyChroma,edgeCandidate,edgePreserve*coherentEdge);
+             selectedChroma=mix(selectedChroma,originalChroma,0.85*topologyProtection);
+-            selectedChroma=mix(selectedChroma,originalChroma,chromaTopologyProtection26767);
++            selectedChroma=mix(selectedChroma,originalChroma,chromaTopologyProtection26767*
++                highlightCleanupPermission26807);
+             ivec2 encodedChroma=ivec2(round(selectedChroma));
+             imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(encodedChroma.x),unsignedChroma(encodedChroma.y),uint(clamp(f.w,0.0,65504.0))));
+         }
+@@ -2273,7 +2299,15 @@ internal object Iris26529SpatialRgbChromaShaders {
+             /* IRIS_26732_IIR_CLEANUP_IS_ONE_WAY
+              * Suspicious/invalid centers may receive trusted recursive state only along an allowed
+              * direction. Their state is never propagated back into a trusted neighbor. */
+-            if(currentNeedsCleanup)return currentAllows&&!previousNeedsCleanup;
++            if(currentNeedsCleanup){
++                if(!currentAllows)return false;
++                if(!previousNeedsCleanup)return true;
++                /* IRIS_26807_CONTIGUOUS_HIGHLIGHT_CLEANUP_TRANSPORT
++                 * A contiguous bit-13 chain may carry already-filtered recursive state through the
++                 * chain. It still cannot flow back into a trusted pixel because the branch below
++                 * rejects any previous cleanup owner when the current pixel is trusted. */
++                return highlightInvalidAt(currentP)&&highlightInvalidAt(previousP);
++            }
+             if(previousNeedsCleanup)return false;
+             return currentAllows&&(previousMask&(1<<opposite))!=0;
+         }
+@@ -2293,8 +2327,10 @@ internal object Iris26529SpatialRgbChromaShaders {
+                  * 26730 validity-owned seed map is frozen before VGN and shared by IIR1 and IIR3.
+                  * A missing reciprocal connection is a hard chroma-state boundary in either scan
+                  * direction, preventing row/column-specific feedback from forming teeth or L blocks. */
+-                bool frozenMaterialBoundary=i>0&&!transportFromPreviousAllowed(p,previousP);
+-                if(i>0&&(strongLumaBoundary||frozenMaterialBoundary)){
++                bool transportAllowed26807=i>0&&transportFromPreviousAllowed(p,previousP);
++                bool frozenMaterialBoundary=i>0&&!transportAllowed26807;
++                bool highlightCleanupReceivesState26807=i>0&&highlightInvalidAt(p)&&transportAllowed26807;
++                if(i>0&&((strongLumaBoundary&&!highlightCleanupReceivesState26807)||frozenMaterialBoundary)){
+                     if(uFilterLuma!=0){float resetY=steadyOutput(currentY,uA10,uB10,true);ys=steady(currentY,resetY);}
+                     float resetCr1=steadyOutput(inCr,uADyn1,uBDyn1,false),resetCb1=steadyOutput(inCb,uADyn1,uBDyn1,false);
+                     float resetCr2=steadyOutput(resetCr1,uADyn2,uBDyn2,false),resetCb2=steadyOutput(resetCb1,uADyn2,uBDyn2,false);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 20de26d633dcc6e2d7a73cff9bc817c530fc0d0a..d19f4b3c45ad13a4229a8d94557c6c571c85fdde 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -58,6 +58,7 @@ import androidx.annotation.StringRes;
+ import androidx.constraintlayout.widget.ConstraintLayout;
+ import androidx.core.app.NotificationCompat;
+ import androidx.core.app.NotificationManagerCompat;
++import androidx.core.content.FileProvider;
+ import androidx.databinding.DataBindingUtil;
+ import androidx.fragment.app.DialogFragment;
+ import androidx.fragment.app.Fragment;
+@@ -961,7 +962,18 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+ 
+     public void launchGallery() {
+         // IRIS_26772_EXTERNAL_GALLERY_ONLY_OWNER: the Iris Gallery app/path is retired entirely.
++        // IRIS_26807_FIRST_PRESS_GALLERY_CONTENT_URI_OWNER
++        // Always close camera chrome before handing control to Android's chooser. Fresh captures
++        // cache a FileProvider content:// URI, never a file:// URI. A stale file:// value is rejected
++        // rather than being exposed to another process.
++        if (cameraFragmentBinding != null && cameraFragmentBinding.getUimodel() != null) {
++            cameraFragmentBinding.getUimodel().setSettingsBarVisibility(false);
++        }
+         Uri latest = cameraFragmentViewModel == null ? null : cameraFragmentViewModel.getLatestImageUri();
++        if (latest != null && "file".equalsIgnoreCase(latest.getScheme())) {
++            Log.e("CameraFragment", "IRIS_26807_REJECT_FILE_URI galleryUri=" + latest);
++            latest = null;
++        }
+         Intent galleryIntent = new Intent(Intent.ACTION_VIEW);
+         if (latest != null) {
+             galleryIntent.setDataAndType(latest, "image/*");
+@@ -969,10 +981,11 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         } else {
+             galleryIntent.setDataAndType(android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/*");
+         }
++        Intent chooserIntent = Intent.createChooser(galleryIntent, null);
+         try {
+-            startActivity(galleryIntent, null);
+-        } catch (android.content.ActivityNotFoundException e) {
+-            Log.w("CameraFragment", "No external gallery activity available");
++            startActivity(chooserIntent, null);
++        } catch (android.content.ActivityNotFoundException | SecurityException | IllegalArgumentException e) {
++            Log.w("CameraFragment", "External gallery launch failed safely", e);
+         }
+     }
+ 
+@@ -1137,7 +1150,19 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+             if (saved) {
+                 Uri imageUri = null;
+                 if (savedFilePath != null) {
+-                    triggerMediaScanner(imageUri = Uri.fromFile(savedFilePath.toFile()));
++                    // Media scanner still receives the filesystem URI internally; the cached thumbnail
++                    // and every external gallery launch use only the app FileProvider content URI.
++                    triggerMediaScanner(Uri.fromFile(savedFilePath.toFile()));
++                    if (activity != null) {
++                        try {
++                            imageUri = FileProvider.getUriForFile(
++                                    activity,
++                                    activity.getPackageName() + ".provider",
++                                    savedFilePath.toFile());
++                        } catch (IllegalArgumentException e) {
++                            Log.e("CameraFragment", "IRIS_26807_FILE_PROVIDER_URI_FAILED", e);
++                        }
++                    }
+                     logD("ImageSaved: " + savedFilePath);
+ //                    showSnackBar("ImageSaved: " + savedFilePath.toString());
+                 }
+diff --git a/app/version.properties b/app/version.properties
+index ae4289fe4ad8382eb81225790ee0db84e487525a..28e65c3e42c6b8c643ac2524cac38b4c4bb2651d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726806
+-VERSION_BUILD=26806
++VERSION_NAME=0.9726807
++VERSION_BUILD=26807
