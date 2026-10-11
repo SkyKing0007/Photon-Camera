@@ -1,0 +1,504 @@
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 0aa2e7e68582ccf338cbfe7d218f5e045dc87897..a1e0e2cb36526459e49714a64e3b5cdc4ddf48e4 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2543,7 +2543,6 @@ internal object GlesMgcRawSabreShaders {
+          * Compile-only repair after Actions exposed two host-bound uniforms used by merge but
+          * omitted from the GLSL declaration block. No CFA/LCA/neutral/LONG math changes. */
+         uniform int uLongChromaGuard26790;
+-        uniform int uLongLumaOnly26812;
+         uniform sampler2D uNormalChromaConsensus26790;
+         /* IRIS_26792_CONTINUOUS_SCALAR_CFA_LCA_NEUTRAL_OWNER
+          * One scalar CFA producer only: physical phase is selected from the nominal Sabre topology,
+@@ -3240,20 +3239,6 @@ internal object GlesMgcRawSabreShaders {
+             accumulatedColor *= frameWeight;
+             accumulatedWeight *= frameWeight;
+             validAccumulatedWeight *= frameWeight;
+-            /* IRIS_26812_LONG_TRUE_LUMA_ONLY_OWNER
+-             * LONG cannot write RGB or independent R/G/B support into the NORMAL accumulator.
+-             * For LONG, location 0 is rebound to an isolated RG16F scalar accumulator containing
+-             * luminance*nCompleteSupport and nCompleteSupport. The normal merge outputs are discarded. */
+-            if (uLongLumaOnly26812 != 0) {
+-                float completeSupport = min(
+-                    accumulatedWeight.r, min(accumulatedWeight.g, accumulatedWeight.b));
+-                vec3 longMean = accumulatedColor / max(accumulatedWeight, vec3(1.0e-7));
+-                float longY = max(luma26790(longMean), 0.0);
+-                oColorAndRWeight = vec4(longY * completeSupport, completeSupport, 0.0, 0.0);
+-                oWeightsGb = vec2(0.0);
+-                oValidWeights = vec4(0.0);
+-                return;
+-            }
+             oColorAndRWeight = vec4(accumulatedColor, accumulatedWeight.r);
+             oWeightsGb = accumulatedWeight.gb;
+             oValidWeights = vec4(
+@@ -5388,53 +5373,6 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
+-    /* IRIS_26812_LONG_TRUE_LUMA_ONLY_SCALE
+-     * Build one scalar multiplier from NORMAL mean/support and isolated LONG luminance/support while
+-     * NORMAL is still homogeneous. No LONG R/G/B ratio exists beyond the merge shader. */
+-    val longLumaScale26812 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uNormalAccumulatedColor;
+-        uniform sampler2D uNormalWeightsGb;
+-        uniform sampler2D uLongLumaAccumulator;
+-        layout(location = 0) out float oLumaScale;
+-        float luma26812(vec3 v) { return 0.25 * (v.r + 2.0 * v.g + v.b); }
+-        void main() {
+-            ivec2 p = ivec2(gl_FragCoord.xy);
+-            vec4 normalNumeratorAndR = texelFetch(uNormalAccumulatedColor, p, 0);
+-            vec2 normalGb = texelFetch(uNormalWeightsGb, p, 0).rg;
+-            vec3 normalWeights = vec3(normalNumeratorAndR.a, normalGb);
+-            float normalSupport = min(normalWeights.r, min(normalWeights.g, normalWeights.b));
+-            vec3 normalMean = normalNumeratorAndR.rgb / max(normalWeights, vec3(1.0e-7));
+-            float normalY = max(luma26812(normalMean), 0.0);
+-            vec2 longAccum = texelFetch(uLongLumaAccumulator, p, 0).rg;
+-            float longSupport = max(longAccum.g, 0.0);
+-            float longY = longSupport > 1.0e-7 ? max(longAccum.r / longSupport, 0.0) : normalY;
+-            float totalSupport = normalSupport + longSupport;
+-            float targetY = totalSupport > 1.0e-7
+-                ? (normalY * normalSupport + longY * longSupport) / totalSupport
+-                : normalY;
+-            oLumaScale = normalY > 1.0e-7 ? max(targetY / normalY, 0.0) : 1.0;
+-        }
+-    """.trimIndent()
+-
+-    /* IRIS_26812_LONG_TRUE_LUMA_ONLY_APPLY
+-     * This fragment is used with multiplicative blending. RGB receives one shared scalar and alpha
+-     * is preserved, making a LONG-induced hue rotation algebraically impossible. */
+-    val applyLumaScale26812 = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uLumaScale;
+-        layout(location = 0) out vec4 oScale;
+-        void main() {
+-            ivec2 p = ivec2(gl_FragCoord.xy);
+-            float scale = max(texelFetch(uLumaScale, p, 0).r, 0.0);
+-            oScale = vec4(vec3(scale), 1.0);
+-        }
+-    """.trimIndent()
+-
+     val dehomogenize = """
+         #version 300 es
+         precision highp float;
+@@ -6862,63 +6800,12 @@ internal object GlesMgcRawSabreShaders {
+         uniform highp usampler2D uResolvedG;
+         uniform highp usampler2D uResolvedB;
+         uniform sampler2D uLensShading;
+-        uniform sampler2D uPreResolveRgb26812;
+         uniform ivec2 uOutputSize;
+         uniform int uUseLensShading;
+-        uniform int uResolveChromaGuard26812;
+         uniform vec3 uFinalBlackLevel;
+-        uniform vec3 uFinalGains26812;
+         uniform float uDemosaicWhiteLevel;
+         uniform float uOutputExposureScale;
+ 
+-        float lumaOut26812(vec3 v) { return 0.25 * (v.r + 2.0 * v.g + v.b); }
+-        vec2 chromaOut26812(vec3 v) {
+-            float y = max(lumaOut26812(v), 1.0e-5);
+-            return vec2((v.r - v.g) / y, (v.b - v.g) / y);
+-        }
+-        vec3 rgbAtLumaFromChromaOut26812(float y, vec2 c) {
+-            float g = y * (1.0 - 0.25 * (c.x + c.y));
+-            return vec3(g + c.x * y, g, g + c.y * y);
+-        }
+-        float smoothGateOut26812(float lo, float hi, float v) {
+-            float t = clamp((v - lo) / max(hi - lo, 1.0e-6), 0.0, 1.0);
+-            return t * t * (3.0 - 2.0 * t);
+-        }
+-        vec3 constrainResolveChroma26812(ivec2 p, vec3 resolvedCamera) {
+-            if (uResolveChromaGuard26812 == 0) return resolvedCamera;
+-            vec3 gains = max(uFinalGains26812, vec3(0.01));
+-            vec3 postCalc = resolvedCamera / gains;
+-            vec3 preCalc = max(texelFetch(uPreResolveRgb26812, p, 0).rgb, vec3(0.0));
+-            float preY = lumaOut26812(preCalc);
+-            float postY = lumaOut26812(postCalc);
+-            if (preY < 0.035 || postY < 0.035) return resolvedCamera;
+-            vec2 preC = chromaOut26812(preCalc);
+-            vec2 postC = chromaOut26812(postCalc);
+-            float preMag = length(preC);
+-            float postMag = length(postC);
+-            float delta = length(postC - preC);
+-            float directionalAgreement = (preMag > 0.04 && postMag > 0.04)
+-                ? dot(preC, postC) / max(preMag * postMag, 1.0e-5)
+-                : 1.0;
+-            float newExcess = postMag - max(preMag, 0.06);
+-            float amplificationExcess = postMag - (1.55 * preMag + 0.08);
+-            float newGate = smoothGateOut26812(0.12, 0.30, newExcess) *
+-                (1.0 - smoothGateOut26812(0.06, 0.16, preMag));
+-            float amplifiedGate = smoothGateOut26812(0.06, 0.24, amplificationExcess) *
+-                smoothGateOut26812(0.14, 0.34, delta);
+-            float rotationGate = smoothGateOut26812(0.16, 0.38, delta) *
+-                smoothGateOut26812(0.10, 0.28, preMag) *
+-                smoothGateOut26812(0.10, 0.28, postMag) *
+-                smoothGateOut26812(0.15, 0.65, 1.0 - directionalAgreement);
+-            float gate = clamp(max(newGate, max(amplifiedGate, rotationGate)), 0.0, 1.0);
+-            if (gate <= 0.0) return resolvedCamera;
+-            vec2 correctedC = mix(postC, preC, gate);
+-            vec3 correctedCalc = max(rgbAtLumaFromChromaOut26812(postY, correctedC), vec3(0.0));
+-            float correctedY = lumaOut26812(correctedCalc);
+-            if (correctedY > 1.0e-7) correctedCalc *= postY / correctedY;
+-            return correctedCalc * gains;
+-        }
+-
+         vec3 transformOutput(ivec2 p) {
+             uvec3 encoded = uvec3(
+                 texelFetch(uResolvedR, p, 0).r,
+@@ -6930,11 +6817,6 @@ internal object GlesMgcRawSabreShaders {
+             // normalized camera domain expected by Photon's linear-RGB pipeline.
+             vec3 resolved = max(vec3(encoded) - uFinalBlackLevel, vec3(0.0)) /
+                 max(vec3(uDemosaicWhiteLevel) - uFinalBlackLevel, vec3(1.0));
+-            /* IRIS_26812_RESOLVE_CHROMA_CONSISTENCY_OWNER
+-             * Native Resolve may refine spatial RGB but cannot become an independent chroma source.
+-             * Only large NEW/AMPLIFIED/HUE-ROTATED departures are projected toward the exact
+-             * pre-Resolve calculation-WB chroma at unchanged post-Resolve luminance. Hue-independent. */
+-            resolved = constrainResolveChroma26812(p, resolved);
+             if (uUseLensShading != 0) {
+                 vec2 uv = (vec2(p) + vec2(0.5)) / vec2(uOutputSize);
+                 vec4 shading = texture(uLensShading, uv);
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 24e85987f5ac38b665ba36a1c017ed5136f2d5c4..6e0df6b7151ba8aac6aaed770e84e28bbcd161e1 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -658,8 +658,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreExtractBayerProgram = 0
+     private var sabreGuideAndCovarianceProgram = 0
+     private var sabreMergeProgram = 0
+-    private var sabreLongLumaScaleProgram26812 = 0
+-    private var sabreApplyLumaScaleProgram26812 = 0
+     private var sabreSuperResDetailMergeProgram = 0
+     private var sabreSuperResDetailResolveProgram = 0
+     private var sabreSuperResLinearRawProgram = 0
+@@ -2426,19 +2424,6 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_RGB10_A2,
+                 GLES30.GL_NEAREST,
+             )
+-            /* IRIS_26812_LONG_TRUE_LUMA_ONLY_OWNER
+-             * LONG receives one isolated RG16F scalar accumulator: R=sum(luma*completeSupport),
+-             * G=sum(completeSupport). It cannot mutate NORMAL RGB, channel weights, or validity. */
+-            var longLumaAccumulator26812 = if (shadowLongFrameCount > 0) {
+-                createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
+-            } else 0
+-            if (longLumaAccumulator26812 != 0) {
+-                bindRenderTargets(intArrayOf(longLumaAccumulator26812), "26812 LONG scalar luma accumulator clear")
+-                GLES30.glViewport(0, 0, width, height)
+-                GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
+-                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-                checkGlError("26812 LONG scalar luma accumulator clear")
+-            }
+             /* IRIS_26564_TRUE_2X_RETIRES_NATIVE_UPSCALE_DETAIL_OWNER
+              * Keep the old carrier functions dormant for rollback provenance, but allocate no
+              * full-frame 2x luma/detail surface. True 2x is direct multiframe CFA reconstruction.
+@@ -2696,15 +2681,14 @@ internal class GlesMgcRawSpatialStacker(
+                         "exposureRatio=$exposureScale exposureTimeNs=${frame.exposureTimeNs} " +
+                             "iso=${frame.sensitivityIso} sensorWhite=$sensorWhiteLevel " +
+                             "black=${calibration.blackLevels.joinToString(prefix="[",postfix="]")} " +
+-                            "commonAccumulator=false scalarLumaAccumulator=true continuousSourceHeadroom=true " +
+-                            "sourceHeadroomStartFraction=0.9925 wholeRgb=false lumaOnly=true srDetailEvidence=false dng=false"
++                            "commonAccumulator=true continuousSourceHeadroom=true " +
++                            "sourceHeadroomStartFraction=0.9925 wholeRgb=true srDetailEvidence=false dng=false"
+                     PLog.i(SABRE_TAG, "IRIS_26604_LONG_ONE_TUNNEL_METADATA $details26604Long")
+                     MotionTrace.processingState("IRIS_26604_LONG_ONE_TUNNEL_METADATA", details26604Long)
+                     PLog.i(
+                         SABRE_TAG,
+-                        "IRIS_26812_LONG_TRUE_LUMA_ONLY_OWNER enabled=true normalRgbAccumulatorMutation=false " +
+-                            "normalChannelWeightMutation=false normalValidityMutation=false sameSabreRbf=true " +
+-                            "longScalarEvidence=LUMINANCE_PLUS_MIN_RGB_SUPPORT chromaOwner=COMPLETED_NORMAL",
++                        "IRIS_26790_LONG_CHROMA_GUARD enabled=true anchor=COMPLETED_NORMAL_CONSENSUS " +
++                            "lumaPreserved=true temporalWeightUnchanged=true disagreementGate=PURE_CHROMA_ALLOWED",
+                     )
+                 }
+                 uploadRaw(images[index], currentRaw, "Sabre frame $index")
+@@ -2846,10 +2830,9 @@ internal class GlesMgcRawSpatialStacker(
+                         PLog.i(
+                             SABRE_TAG,
+                             "IRIS_26790_COMPLETED_NORMAL_LONG_CHROMA owner=FULL_NORMAL_CONSENSUS " +
+-                                "normalFrames=$normalFrameCount longLumaOnly26812=true longCannotMutateNormalChroma=true",
++                                "normalFrames=$normalFrameCount longLumaPreserved=true pureChromaMismatchGuards=true",
+                         )
+                     }
+-                    val longLumaOnly26812 = frame.role == RawBurstFrameRole.SHADOW_LONG
+                     renderSabreMerge(
+                         raw26790 = currentRaw,
+                         extracted = currentExtracted,
+@@ -2862,12 +2845,12 @@ internal class GlesMgcRawSpatialStacker(
+                         extractedWidth = extractedWidth,
+                         extractedHeight = extractedHeight,
+                         useFrameWeight = true,
+-                        /* IRIS_26812_LONG_TRUE_LUMA_ONLY_OWNER
+-                         * NORMAL keeps 26776 validity. LONG uses the same aligned/clipped RBF evidence
+-                         * but the fragment output is rebound to one scalar RG16F accumulator only. */
++                        /* IRIS_26776_BLOCK_UNIFORM_CFA_CLIP_WEIGHT_OWNER
++                         * Apply the same complete-footprint scalar source validity to every NORMAL
++                         * and LONG alternate. Fully lost alternates contribute zero. */
+                         sourceClipGuard = true,
+                         sourceClippedWeight = 0f,
+-                        accumulatedValidity26614 = if (longLumaOnly26812) 0 else accumulatedValidity26614,
++                        accumulatedValidity26614 = accumulatedValidity26614,
+                         validityWeightScale26614 = validityWeightScale26614,
+                         rowFlickerFrame26720 = frame.takeIf(::hasRowFlickerEvidence26720),
+                         jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
+@@ -2877,9 +2860,8 @@ internal class GlesMgcRawSpatialStacker(
+                         dngEdgeDeAlias26790 = dngOptions26786.edgeDeAlias,
+                         jpegNeutralClamp26792 = dngOptions26786.neutralClamp,
+                         sourceWhiteNormalized26790 = exposureScale,
+-                        normalChromaConsensus26790 = 0,
+-                        longChromaGuard26790 = false,
+-                        longLumaOnlyOutput26812 = if (longLumaOnly26812) longLumaAccumulator26812 else 0,
++                        normalChromaConsensus26790 = normalChromaConsensus26790,
++                        longChromaGuard26790 = frame.role == RawBurstFrameRole.SHADOW_LONG,
+                     )
+                 } else {
+                     require(index == frames.lastIndex) {
+@@ -3081,18 +3063,6 @@ internal class GlesMgcRawSpatialStacker(
+             /* IRIS_26651_ONE_EXTENDED_LINEAR_HDR_MASTER
+              * Dehomogenize the NORMAL temporal result first. A physically validated, aligned and
+              * exposure-normalized SHORT is then fused once in extended-linear space with NORMAL-owned chroma plus independently proven SHORT radiance/color authority. This is the sole HDR exposure owner consumed by Resolve/VGN and true-2x. */
+-            var longLumaScale26812 = 0
+-            if (longLumaAccumulator26812 != 0) {
+-                longLumaScale26812 = createTexture(width, height, GLES30.GL_R16F, GLES30.GL_NEAREST)
+-                renderSabreLongLumaScale26812(
+-                    normalAccumulatedColor = accumulatedColor,
+-                    normalWeightsGb = accumulatedWeightsGb,
+-                    longLumaAccumulator = longLumaAccumulator26812,
+-                    output = longLumaScale26812,
+-                )
+-                releaseOwnedTexture(longLumaAccumulator26812, "26812 LONG isolated scalar luma accumulator after scale resolve")
+-                longLumaAccumulator26812 = 0
+-            }
+             val dehomogenizedNormal26604 = accumulatedColor
+             val resolveAccumulatedWeightsGb26604 = accumulatedWeightsGb
+             val sabreRSupport26613 = renderSabreDehomogenize(
+@@ -3103,20 +3073,6 @@ internal class GlesMgcRawSpatialStacker(
+                 alphaBias = 1f / mergedFrameCount.toFloat().coerceAtLeast(1f),
+             )
+             check(sabreRSupport26613 != 0) { "26648 Sabre R support provenance missing" }
+-            if (longLumaScale26812 != 0) {
+-                applySabreLongLumaScale26812(
+-                    lumaScale = longLumaScale26812,
+-                    normalMeanInPlace = dehomogenizedNormal26604,
+-                )
+-                releaseOwnedTexture(longLumaScale26812, "26812 LONG scalar luma multiplier after in-place apply")
+-                longLumaScale26812 = 0
+-                PLog.i(
+-                    SABRE_TAG,
+-                    "IRIS_26812_LONG_TRUE_LUMA_ONLY_OWNER applied=true normalRgbDirectionPreservedExact=true " +
+-                        "longRgbAccumulatorMutation=false longChannelWeightMutation=false " +
+-                        "longValidityMutation=false scalarSupport=minRGB lumaOnly=true",
+-                )
+-            }
+             var resolveAccumulatedColor26604 = dehomogenizedNormal26604
+             /* IRIS_26792_CFA_DOMAIN_NEUTRAL_OWNERSHIP
+              * Neutral censorship is already consumed inside the scalar CFA producer for every
+@@ -3231,12 +3187,12 @@ internal class GlesMgcRawSpatialStacker(
+                     "normalLongCfaOwner=DNG_DERIVED_SCALAR_FIXED_PHASE sabreRgbOwner=true " +
+                     "singleRbfTopology=true directFourPhaseRgb=false lcaChangesPhase=false " +
+                     "postRgbLcaRetired=true normalLongPrewarpRetired=true " +
+-                    "longChromaOwner=COMPLETED_NORMAL_ONLY longRgbContribution=false",
++                    "longChromaAnchor=COMPLETED_NORMAL_CONSENSUS",
+             )
+             sabreAccumulatedReadback = readSabreAccumulatedRgba16f(resolveExtendedLinear26651)
+-            /* IRIS_26812_RESOLVE_CHROMA_CONSISTENCY_OWNER
+-             * Keep the exact Resolve input GPU carrier alive through both output transforms so the
+-             * post-Resolve RGB can be constrained against the same pre-Resolve calculation-WB chroma. */
++            if (resolveExtendedLinear26651 != resolveAccumulatedColor26604) {
++                releaseOwnedTexture(resolveExtendedLinear26651, "26651 fusedExtendedLinear HDR master after Resolve input readback")
++            }
+             if (fusionDecision26651 != 0) {
+                 releaseOwnedTexture(fusionDecision26651, "26651 scalar radiance fusion decision telemetry")
+                 fusionDecision26651 = 0
+@@ -3353,9 +3309,6 @@ internal class GlesMgcRawSpatialStacker(
+                     demosaicWhiteLevel = demosaicWhiteLevel.toFloat(),
+                     output = physicalHdr26605,
+                     program = sabreOutputTransformFloatProgram,
+-                    preResolveRgb26812 = resolveExtendedLinear26651,
+-                    finalGains26812 = sabreResolveFinalGains,
+-                    resolveChromaGuard26812 = true,
+                 )
+                 PLog.i(SABRE_TAG, "IRIS_26699_HDR_PROBE_BARRIER_REMOVED stage=FLOAT_HDR_HANDOFF_PRE_VGN productionHdrUnchanged=true")
+                 if (edgeFalseColor26778.enabled) {
+@@ -3384,19 +3337,7 @@ internal class GlesMgcRawSpatialStacker(
+                 finalBlackLevel = sabreResolveFinalBlackLevel,
+                 demosaicWhiteLevel = demosaicWhiteLevel.toFloat(),
+                 output = chromaPostprocessor.normalizationTargetTexture(),
+-                preResolveRgb26812 = resolveExtendedLinear26651,
+-                finalGains26812 = sabreResolveFinalGains,
+-                resolveChromaGuard26812 = true,
+-            )
+-            PLog.i(
+-                SABRE_TAG,
+-                "IRIS_26812_RESOLVE_CHROMA_CONSISTENCY_OWNER enabled=true preResolveAuthority=EXACT_GPU_RESOLVE_INPUT " +
+-                    "sameCalculationWbDomain=true hueSpecific=false classes=NEW_AMPLIFIED_HUE_ROTATED " +
+-                    "postResolveLumaPreserved=true lensShadingAfterGuard=true",
+             )
+-            if (resolveExtendedLinear26651 != resolveAccumulatedColor26604) {
+-                releaseOwnedTexture(resolveExtendedLinear26651, "26812 fused SHORT Resolve input after chroma-consistent output transforms")
+-            }
+             /* IRIS_26564_TRUE2X_DNG_CARRIER
+              * DNG and JPEG share the same direct-CFA RGB16F carrier. No native-RGB interpolation
+              * or detail multiplication is produced here.
+@@ -5294,7 +5235,6 @@ internal class GlesMgcRawSpatialStacker(
+         sourceWhiteNormalized26790: Float = 1f,
+         normalChromaConsensus26790: Int = 0,
+         longChromaGuard26790: Boolean = false,
+-        longLumaOnlyOutput26812: Int = 0,
+     ) {
+         val rowFlickerActive26720 = rowFlickerFrame26720?.let(::hasRowFlickerEvidence26720) == true
+         val program = sabreMergeProgram
+@@ -5317,7 +5257,6 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1i(program, "uJpegNeutralClamp26792", if (jpegNeutralClamp26792) 1 else 0)
+         uniform1f(program, "uSourceWhiteNormalized26790", sourceWhiteNormalized26790)
+         uniform1i(program, "uLongChromaGuard26790", if (longChromaGuard26790) 1 else 0)
+-        uniform1i(program, "uLongLumaOnly26812", if (longLumaOnlyOutput26812 != 0) 1 else 0)
+         uniform4fv(program, "uPhaseGains26790", calibration.bayerPhaseGains)
+         uniform4fv(program, "uPhaseBlackTerms26790", calibration.bayerPhaseBlackTerms)
+         val phaseWhiteBalance26790 = FloatArray(4) { phase ->
+@@ -5371,9 +5310,7 @@ internal class GlesMgcRawSpatialStacker(
+                 program,
+                 width,
+                 height,
+-                if (longLumaOnlyOutput26812 != 0) {
+-                    intArrayOf(longLumaOnlyOutput26812)
+-                } else if (accumulatedValidity26614 != 0) {
++                if (accumulatedValidity26614 != 0) {
+                     intArrayOf(accumulatedColor, accumulatedWeightsGb, accumulatedValidity26614)
+                 } else {
+                     intArrayOf(accumulatedColor, accumulatedWeightsGb)
+@@ -5874,43 +5811,6 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    private fun renderSabreLongLumaScale26812(
+-        normalAccumulatedColor: Int,
+-        normalWeightsGb: Int,
+-        longLumaAccumulator: Int,
+-        output: Int,
+-    ) {
+-        check(sabreLongLumaScaleProgram26812 != 0)
+-        val program = sabreLongLumaScaleProgram26812
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uNormalAccumulatedColor", 0, normalAccumulatedColor)
+-        bindTexture(program, "uNormalWeightsGb", 1, normalWeightsGb)
+-        bindTexture(program, "uLongLumaAccumulator", 2, longLumaAccumulator)
+-        draw(program, width, height, intArrayOf(output))
+-    }
+-
+-    private fun applySabreLongLumaScale26812(
+-        lumaScale: Int,
+-        normalMeanInPlace: Int,
+-    ) {
+-        check(sabreApplyLumaScaleProgram26812 != 0)
+-        val program = sabreApplyLumaScaleProgram26812
+-        GLES30.glUseProgram(program)
+-        bindTexture(program, "uLumaScale", 0, lumaScale)
+-        GLES30.glEnable(GLES30.GL_BLEND)
+-        try {
+-            GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
+-            GLES30.glBlendFuncSeparate(
+-                GLES30.GL_ZERO, GLES30.GL_SRC_COLOR,
+-                GLES30.GL_ZERO, GLES30.GL_ONE,
+-            )
+-            draw(program, width, height, intArrayOf(normalMeanInPlace), preserveBlend = true)
+-        } finally {
+-            GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
+-            GLES30.glDisable(GLES30.GL_BLEND)
+-        }
+-    }
+-
+     private fun renderSabreOutputTransform(
+         resolvedRgbPlanes: IntArray,
+         lensShadingTexture: Int,
+@@ -5918,9 +5818,6 @@ internal class GlesMgcRawSpatialStacker(
+         demosaicWhiteLevel: Float,
+         output: Int,
+         program: Int = sabreOutputTransformProgram,
+-        preResolveRgb26812: Int = 0,
+-        finalGains26812: FloatArray? = null,
+-        resolveChromaGuard26812: Boolean = false,
+     ) {
+         require(resolvedRgbPlanes.size == 3)
+         require(finalBlackLevel.size == 3)
+@@ -5930,19 +5827,8 @@ internal class GlesMgcRawSpatialStacker(
+         bindTexture(program, "uResolvedG", 1, resolvedRgbPlanes[1])
+         bindTexture(program, "uResolvedB", 2, resolvedRgbPlanes[2])
+         bindTexture(program, "uLensShading", 3, lensShadingTexture)
+-        bindTexture(
+-            program, "uPreResolveRgb26812", 4,
+-            if (preResolveRgb26812 != 0) preResolveRgb26812 else lensShadingTexture,
+-        )
+         uniform2i(program, "uOutputSize", width, height)
+         uniform1i(program, "uUseLensShading", if (hasLensShading()) 1 else 0)
+-        uniform1i(
+-            program, "uResolveChromaGuard26812",
+-            if (resolveChromaGuard26812 && preResolveRgb26812 != 0) 1 else 0,
+-        )
+-        val gains26812 = finalGains26812 ?: floatArrayOf(1f, 1f, 1f)
+-        require(gains26812.size == 3)
+-        uniform3f(program, "uFinalGains26812", gains26812[0], gains26812[1], gains26812[2])
+         uniform3f(
+             program,
+             "uFinalBlackLevel",
+@@ -7397,14 +7283,6 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
+-        sabreLongLumaScaleProgram26812 = linkProgram(
+-            GlesMgcRawSabreShaders.longLumaScale26812,
+-            "iris_26812_long_true_luma_only_scale",
+-        )
+-        sabreApplyLumaScaleProgram26812 = linkProgram(
+-            GlesMgcRawSabreShaders.applyLumaScale26812,
+-            "iris_26812_long_true_luma_only_apply",
+-        )
+         /* IRIS_26604_RETIRED_SEPARATE_SHORT_AUTHORITIES
+          * One-tunnel reconstruction makes every 26595/26600/26602 SHORT boundary/mask/protection/
+          * private-fuse program a duplicate owner. Keep their source/helpers only as rollback
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index 5264febcc9f8769ab24bdc12480adb78cdda0aa6..4d0fe353fe3a1c158523961ce36795c07218ee65 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -971,7 +971,6 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+     }
+ 
+     public void launchGallery() {
+-        Log.d("CameraFragment", "IRIS_26812_GALLERY_THUMB_CLICK_ENTRY launchGallery=true");
+         // IRIS_26772_EXTERNAL_GALLERY_ONLY_OWNER: the Iris Gallery app/path is retired entirely.
+         // IRIS_26811_DIRECT_EXACT_CAPTURE_VIEW_OWNER
+         // 26810 device proof showed that chooser-wrapped ACTION_VIEW + generic image/* still let
+@@ -1014,20 +1013,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+                             "collectionFallback=true chooser=false");
+         }
+         try {
+-            Uri launchData26812 = galleryIntent.getData();
+-            android.content.ComponentName launchComponent26812 =
+-                    galleryIntent.resolveActivity(galleryActivity.getPackageManager());
+-            Log.d(
+-                    "CameraFragment",
+-                    "IRIS_26812_GALLERY_LAUNCH_COMMIT exactItem=" + (exactItem != null) +
+-                            " authority=" + (launchData26812 != null ? launchData26812.getAuthority() : "none") +
+-                            " row=" + (launchData26812 != null ? launchData26812.getLastPathSegment() : "none") +
+-                            " mime=" + mime +
+-                            " resolvedComponent=" +
+-                            (launchComponent26812 != null ? launchComponent26812.flattenToShortString() : "none") +
+-                            " chooser=false launched=false");
+             startActivity(galleryIntent, null);
+-            Log.d("CameraFragment", "IRIS_26812_GALLERY_LAUNCH_COMMIT chooser=false launched=true");
+         } catch (android.content.ActivityNotFoundException | SecurityException | IllegalArgumentException e) {
+             Log.w("CameraFragment", "External direct exact-item gallery launch failed safely", e);
+         }
+diff --git b/app/version.properties a/app/version.properties
+index e60fdba4b340ffb0f013de4bee5954c8e129489f..da57d1f3f3b2b04b653d36d26e23ac27a0f316d4 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726812
+-VERSION_BUILD=26812
++VERSION_NAME=0.9726811
++VERSION_BUILD=26811
