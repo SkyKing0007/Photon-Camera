@@ -1,0 +1,91 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+index 25d18eac6edf650023e4d25e71389ba505b69f51..4663bda4bdf759562cad320cff41c7c168259ae9 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26529SpatialRgbChromaPostprocessor.kt
+@@ -1827,6 +1827,7 @@ internal object Iris26529SpatialRgbChromaShaders {
+             float neighborNeutral[8];
+             float lo=65504.0; float hi=0.0; float centerContinuation=0.0; float centerWithinDelta=65504.0;
+             float brighterNeutralSupport=0.0;
++            float brightNeutralCoreSum26808=0.0; float brightNeutralCoreStrongest26808=0.0;
+             float centerTrust=physicalColorTrust(p);
+             int phaseInvalid26776=phaseInvalidRisk26776(p)>0.42?1:0;
+             float phaseColorOwnershipPermission=phaseInvalid26776!=0?0.0:1.0;
+@@ -1845,6 +1846,18 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 float neighborTrust=physicalColorTrust(p+d[i]);
+                 float trustedCenterNeighbor=min(centerTrust,neighborTrust);
+                 brighterNeutralSupport+=neighborNeutral[i]*smoothstep(0.08,0.35,relativeFirst)*neighborTrust;
++                /* IRIS_26808_LOCAL_HIGHLIGHT_EDGE_ADMISSION
++                 * Keep the successful 26806 absolute highlight core unchanged. This separate,
++                 * bounded proof only recognizes a chromatic edge pixel when at least two immediate
++                 * directions lead into physically trusted, genuinely bright neutral core pixels.
++                 * It therefore follows the local highlight structure without globally lowering the
++                 * 0.72..0.92 headroom curve. */
++                float firstNormalizedY26808=clamp(first/65504.0,0.0,1.0);
++                float brightNeutralCore26808=neighborNeutral[i]*
++                    smoothstep(0.78,0.88,firstNormalizedY26808)*
++                    smoothstep(0.08,0.24,relativeFirst)*neighborTrust;
++                brightNeutralCoreSum26808+=brightNeutralCore26808;
++                brightNeutralCoreStrongest26808=max(brightNeutralCoreStrongest26808,brightNeutralCore26808);
+                 centerWithinDelta=min(centerWithinDelta,mix(65504.0,chromaJump[i],trustedCenterNeighbor));
+                 centerContinuation=max(centerContinuation,lumaCompatible*(1.0-smoothstep(0.020,0.070,chromaJump[i]))*trustedCenterNeighbor);
+             }
+@@ -1889,7 +1902,26 @@ internal object Iris26529SpatialRgbChromaShaders {
+                 smoothstep(0.55,0.82,centerContinuation)*
+                 broadTwoDimensionalMaterial*phaseColorOwnershipPermission;
+             float highlightColorOwnershipPermission=max(inheritedHighlightPermission,realBrightColorProof);
+-            int highlightInvalidCleanup=(1.0-highlightColorOwnershipPermission)>0.35?1:0;
++            /* IRIS_26808_LOCAL_HIGHLIGHT_EDGE_ADMISSION
++             * 26807 device evidence proved that the remaining green/cyan often lives on a
++             * moderately bright antialiased/high-gradient edge beside an already bright neutral
++             * highlight, so the center never reaches the existing bit-13 threshold. Do NOT lower
++             * that global threshold. Admit only a short-range structural extension: at least two
++             * independent immediate bright-neutral-core supports, non-dark center luminance,
++             * moderate (artifact-like rather than strongly saturated) chroma, and no broad 2-D
++             * same-color material. Proven phase invalidity may override only the 2-D material veto. */
++            float secondBrightNeutralCore26808=max(brightNeutralCoreSum26808-brightNeutralCoreStrongest26808,0.0);
++            float localCoreGeometry26808=smoothstep(0.30,0.78,secondBrightNeutralCore26808);
++            float centerLumaPermission26808=smoothstep(0.30,0.46,centerNormalizedY);
++            float moderateChroma26808=smoothstep(0.050,0.105,centerChromaMagnitude)*
++                (1.0-smoothstep(0.22,0.34,centerChromaMagnitude));
++            float nonBroadMaterial26808=1.0-smoothstep(0.38,0.70,broadTwoDimensionalMaterial);
++            if(phaseInvalid26776!=0)nonBroadMaterial26808=1.0;
++            float localHighlightEdgeCleanupProof26808=localCoreGeometry26808*centerLumaPermission26808*
++                moderateChroma26808*nonBroadMaterial26808;
++            int localHighlightEdgeCleanup26808=localHighlightEdgeCleanupProof26808>0.58?1:0;
++            int highlightInvalidCleanup=((1.0-highlightColorOwnershipPermission)>0.35||
++                localHighlightEdgeCleanup26808!=0)?1:0;
+             /* IRIS_26776_PHASE_INVALID_CANNOT_SELF_PROTECT
+              * Bit 15 is an upstream ownership veto: a proven CFA-periodic/high-gradient center may
+              * receive cleanup, but its reconstructed hue cannot establish material protection. */
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+index d19f4b3c45ad13a4229a8d94557c6c571c85fdde..877cc1fa83f5af4fd752830d81c361b88ba67ded 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraFragment.java
+@@ -450,7 +450,15 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
+         auxButtonsViewModel.setAuxButtonListener(null);
+         burstPlayer.release();
+         endPlayer.release();
+-        mSwipe.SwipeDown();
++        /* IRIS_26808_PAUSE_MUST_NOT_OPEN_SETTINGS
++         * SwipeDown is a gesture semantic: when manual controls are already closed it OPENS the
++         * gear/settings bar. External gallery chooser launch pauses CameraFragment, so calling it
++         * unconditionally here made a gallery-thumbnail tap open the gear dropdown underneath the
++         * chooser. On lifecycle pause, only close existing UI; never synthesize an open gesture. */
++        if (manualModeConsole != null && manualModeConsole.isPanelVisible()) {
++            mSwipe.SwipeDown();
++        }
++        cameraFragmentViewModel.setSettingsBarVisible(false);
+         /* IRIS_26670_NO_LEGACY_MANUAL_PAUSE
+          * ManualModeConsoleImpl.onPause() deletes all KnobModel/ManualModeModel observers, including
+          * the Iris slider. Legacy observer stays permanently disabled after camera-model init.
+diff --git a/app/version.properties b/app/version.properties
+index 28e65c3e42c6b8c643ac2524cac38b4c4bb2651d..314084e2e0c09c3ca86757a59f022850fc547920 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726807
+-VERSION_BUILD=26807
++VERSION_NAME=0.9726808
++VERSION_BUILD=26808
