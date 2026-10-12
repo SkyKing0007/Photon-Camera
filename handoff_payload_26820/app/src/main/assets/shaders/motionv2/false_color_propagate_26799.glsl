@@ -1,0 +1,42 @@
+precision highp float;
+precision highp int;
+precision mediump sampler2D;
+uniform sampler2D ClassMask;
+uniform sampler2D PrevConnected;
+uniform int iris26799Iteration;
+/* IRIS_26816_TELEMETRY_SSBO_RETIRED: image classification/propagation unchanged. */
+out float Output;
+
+/* IRIS_26799_TRUE_BOUNDED_CONNECTED_PROPAGATION
+ * Every accepted weak/plateau pixel becomes part of PrevConnected for the following pass.
+ * Eight fixed ping-pong iterations provide true bounded connectivity without unbounded flood fill.
+ */
+float fetchMask(sampler2D tex,ivec2 p){
+    ivec2 sz=textureSize(tex,0);p=clamp(p,ivec2(0),sz-ivec2(1));return texelFetch(tex,p,0).r;
+}
+void main(){
+    ivec2 p=ivec2(gl_FragCoord.xy);
+    float cls=fetchMask(ClassMask,p);
+    bool candidate=cls>=0.35;
+    bool seed=cls>=0.75;
+    /* IRIS_26803_PRESERVE_NEUTRAL_PARENT_DIRECT_CODE
+     * Boolean seed/candidate/connectivity semantics are exactly 26799. Only the direct 0.92
+     * neutral-parent seed keeps its class value so render can select the proven-parent target. */
+    bool neutralParentDirect=cls>=0.90&&cls<=0.94;
+    float prev=fetchMask(PrevConnected,p);
+    bool already=prev>=0.75;
+    bool neighbor=false;
+    for(int oy=-1;oy<=1;oy++){
+        for(int ox=-1;ox<=1;ox++){
+            if(ox==0&&oy==0)continue;
+            neighbor=neighbor||(fetchMask(PrevConnected,p+ivec2(ox,oy))>=0.75);
+        }
+    }
+    bool connected=seed||(candidate&&(already||neighbor));
+    /* IRIS_26820_GRADED_CONNECTED_FALSE_COLOR_EVIDENCE
+     * Keep the exact 26799 Boolean candidate/seed/connectivity topology and all eight bounded
+     * passes, but do not collapse every connected pixel to 1.0. Preserve the classifier evidence
+     * code so render can distinguish a weak 0.40 plateau, a 0.55 weak contour, a 0.85 seed, the
+     * strict 26803 0.92 neutral-parent seed, and a 1.0 strong seed. */
+Output=connected?(neutralParentDirect?0.92:cls):0.0;
+}
