@@ -1,0 +1,334 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index b0e3e7e2b6cefdfb03c277ce73f36719b29712d1..16b9453056347e54b24adfa99a19187e3f5ad145 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -23,6 +23,7 @@ uniform float iris26623ToneAdaptiveSceneWhite;
+ uniform int iris26653HighlightCompressionEnabled;
+ uniform float iris26653HighlightKnee;
+ uniform float iris26653AdaptiveWhitePoint;
++uniform float iris26704BodyToneStrength;
+ /* IRIS_26524_UHDR_ZOOM_GEOMETRY_PARITY */
+ out float Output;
+ 
+@@ -217,6 +218,19 @@ float iris26640SharedSdrGuide(float sourceGuide,vec2 masterSourcePixel){
+ }
+ uniform float iris26792SdrBodyContrast;
+ 
++/* IRIS_26824_ADAPTIVE_BODY_S_CURVE_GAINMAP_MIRROR
++ * Mirror only the new negative 26824 branch in the SDR denominator. Existing positive 26704
++ * local-tone/gain-map behavior is deliberately not broadened. */
++float iris26824AdaptiveBodySGuide(float mappedGuide){
++    float y=max(mappedGuide,0.0);
++    float strength=clamp(-iris26704BodyToneStrength,0.0,1.0);
++    if(strength<=1.0e-7 || y<=0.0)return y;
++    float lowGate=smoothstep(0.055,0.180,y);
++    float highGate=1.0-smoothstep(0.500,0.760,y);
++    float bodyWeight=clamp(lowGate*highGate,0.0,1.0);
++    return mix(y,y*y,0.24*strength*bodyWeight);
++}
++
+ /* IRIS_26770_MIDTONE_PRESENTATION_TRIM_GAINMAP_MIRROR
+  * Exact pointwise mirror of render.glsl so the UHDR quotient uses the published SDR appearance
+  * as its denominator. HDR target ownership is unchanged. */
+@@ -233,7 +247,9 @@ float iris26770MidtonePresentationTrim(float mappedGuide){
+     return mix(y,y*y,clamp(iris26792SdrBodyContrast,0.0,0.35)*w);
+ }
+ float iris26660SharedSdrGuide(float sourceGuide,vec2 masterSourcePixel){
+-    return iris26770MidtonePresentationTrim(iris26660ObjectColorGamma(iris26640SharedSdrGuide(sourceGuide,masterSourcePixel)));
++    float sharedSdr=iris26640SharedSdrGuide(sourceGuide,masterSourcePixel);
++    sharedSdr=iris26824AdaptiveBodySGuide(sharedSdr);
++    return iris26770MidtonePresentationTrim(iris26660ObjectColorGamma(sharedSdr));
+ }
+ float srgbDecode(float x){x=clamp(x,0.0,1.0);return x<=0.04045?x/12.92:pow((x+0.055)/1.055,2.4);}
+ vec3 srgbDecode(vec3 c){return vec3(srgbDecode(c.r),srgbDecode(c.g),srgbDecode(c.b));}
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 75c9087874a52a92e8d45516c0c089bf90a0a79c..f39521a148c132cea1dfea24a1e3c719bfe26e9c 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -318,12 +318,26 @@ float iris26660ObjectColorGamma(float mappedGuide){
+     return mix(gammaOwned,y,release);
+ }
+ 
++/* IRIS_26824_ADAPTIVE_BODY_S_CURVE
++ * Negative iris26704BodyToneStrength is the new scene-adaptive body S curve. It never changes
++ * deep black <=0.055 or upper presentation >=0.76 and only mixes toward a darker quadratic body
++ * guide. The caller rescales RGB by one scalar, so hue/chromaticity are preserved. */
++float iris26824AdaptiveBodySGuide(float mappedGuide){
++    float y=max(mappedGuide,0.0);
++    float strength=clamp(-iris26704BodyToneStrength,0.0,1.0);
++    if(strength<=1.0e-7 || y<=0.0)return y;
++    float lowGate=smoothstep(0.055,0.180,y);
++    float highGate=1.0-smoothstep(0.500,0.760,y);
++    float bodyWeight=clamp(lowGate*highGate,0.0,1.0);
++    float blend=0.24*strength*bodyWeight;
++    return mix(y,y*y,blend);
++}
++
+ /* IRIS_26704_RANGE_SEPARATED_BODY_TONE
+- * Global pointwise toe lift only. True/near black remains protected, dark body/midtones can rise,
+- * and mapped guide >=0.35 is exact identity so the existing recovered highlight owner is untouched.
+- * One scalar is applied to RGB by the caller; no local/spatial/chroma synthesis occurs. */
++ * Positive strength retains the exact legacy toe lift. Negative strength delegates only to 26824. */
+ float iris26704BodyToneGuide(float mappedGuide){
+     float y=max(mappedGuide,0.0);
++    if(iris26704BodyToneStrength < -1.0e-7)return iris26824AdaptiveBodySGuide(y);
+     float strength=clamp(iris26704BodyToneStrength,0.0,1.0);
+     const float anchorGuide=0.35;
+     if(strength<=1.0e-7 || y<=0.0 || y>=anchorGuide)return y;
+@@ -1110,6 +1124,10 @@ void main() {
+              * only after rendered body separation is safely established. */
+             float localStrength=smoothstep(0.030,0.100,globalMapped);
+             float mappedGuide=mix(globalMapped,localMapped,localStrength);
++            /* IRIS_26824_LOCAL_TONE_BODY_S_PARITY
++             * Only the new negative S-curve branch is added here; legacy positive 26704 local-tone
++             * behavior remains unchanged. */
++            mappedGuide=iris26824AdaptiveBodySGuide(mappedGuide);
+             mappedGuide=iris26660ObjectColorGamma(mappedGuide);
+             mappedGuide=iris26770MidtonePresentationTrim(mappedGuide);
+             linearSrgb=sourceRgb*(mappedGuide/sourceGuide);
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 019c8f2bfb4759607d35eed89df8b94637422944..add71072f0ee7074724a61e5d7a5334fc484569e 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -713,10 +713,18 @@ inline float iris26621MapMotionSdrFinalGuide(float sourceGuide,float displayGain
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+ }
+ /* IRIS_26704_RANGE_SEPARATED_BODY_TONE_TRUE2X_CPU
+- * Exact CPU mirror of the 1x Motion global pointwise body toe. It is identity at mapped guide
+- * >=0.35 so recovered highlights remain under the inherited upper-tone owner. */
++ * Positive strength preserves exact 26704 behavior.
++ * IRIS_26824_ADAPTIVE_BODY_S_CURVE_TRUE2X_CPU
++ * Negative strength mirrors the 1x adaptive shadow/lower-mid pull exactly. */
+ inline float iris26704BodyToneGuide(float mappedGuide,float strength){
+-    float y=std::max(mappedGuide,0.f),s=clampf(strength,0.f,1.f);constexpr float anchorGuide=0.35f;
++    float y=std::max(mappedGuide,0.f);
++    float contrast=clampf(-strength,0.f,1.f);
++    if(contrast>1.0e-7f&&y>0.f){
++        float low=smoothstep(0.055f,0.180f,y),high=1.f-smoothstep(0.500f,0.760f,y);
++        float blend=0.24f*contrast*clampf(low*high,0.f,1.f);
++        return y+(y*y-y)*blend;
++    }
++    float s=clampf(strength,0.f,1.f);constexpr float anchorGuide=0.35f;
+     if(s<=1.0e-7f||y<=0.f||y>=anchorGuide)return y;
+     float gamma=1.f-0.28f*s;
+     float toe=anchorGuide*std::pow(clampf(y/anchorGuide,0.f,1.f),gamma);
+@@ -736,12 +744,17 @@ inline Vec3 renderHeadroom(Vec3 rgb,const Params&p,float localMappedGuide){
+     /* IRIS_26621_SINGLE_GLOBAL_PLUS_LOCAL_TONE_OWNER_TRUE2X_CPU */
+     if(p.motionHdrHandoff){
+         float globalMapped=iris26621MapMotionSdrFinalGuide(guide,p.displayGain);
+-        globalMapped=iris26704BodyToneGuide(globalMapped,p.bodyToneStrength);
++        if(p.bodyToneStrength>1.0e-7f){
++            globalMapped=iris26704BodyToneGuide(globalMapped,p.bodyToneStrength);
++        }
+         float mappedFinal=globalMapped;
+         if(localMappedGuide>=0.f){
+             float localStrength=smoothstep(0.030f,0.100f,globalMapped);
+             mappedFinal=globalMapped+(localMappedGuide-globalMapped)*localStrength;
+         }
++        if(p.bodyToneStrength<(-1.0e-7f)){
++            mappedFinal=iris26704BodyToneGuide(mappedFinal,p.bodyToneStrength);
++        }
+         if(guide>1.0e-7f)rgb=mul(rgb,mappedFinal/guide);
+     }else{
+         const float start=0.50f;
+@@ -1072,9 +1085,17 @@ float iris26621MapMotionSdrFinalGuide(float sourceGuide){
+     float excess=x-1.0;
+     return whiteAnchor+reserve*excess/(excess+tailScale);
+ }
+-/* IRIS_26704_RANGE_SEPARATED_BODY_TONE_TRUE2X_GPU */
++/* IRIS_26704_RANGE_SEPARATED_BODY_TONE_TRUE2X_GPU
++ * IRIS_26824_ADAPTIVE_BODY_S_CURVE_TRUE2X_GPU */
+ float iris26704BodyToneGuide(float mappedGuide){
+-    float y=max(mappedGuide,0.0),strength=clamp(uBodyToneStrength,0.0,1.0);const float anchorGuide=0.35;
++    float y=max(mappedGuide,0.0);
++    float contrast=clamp(-uBodyToneStrength,0.0,1.0);
++    if(contrast>1.0e-7&&y>0.0){
++        float low=smoothstep(0.055,0.180,y),high=1.0-smoothstep(0.500,0.760,y);
++        float blend=0.24*contrast*clamp(low*high,0.0,1.0);
++        return mix(y,y*y,blend);
++    }
++    float strength=clamp(uBodyToneStrength,0.0,1.0);const float anchorGuide=0.35;
+     if(strength<=1.0e-7||y<=0.0||y>=anchorGuide)return y;
+     float gamma=1.0-0.28*strength;
+     float toe=anchorGuide*pow(clamp(y/anchorGuide,0.0,1.0),gamma);
+@@ -1093,12 +1114,13 @@ vec3 irisHeadroom(vec3 rgb,float localMappedGuide){
+     /* IRIS_26621_SINGLE_TONE_OWNER_TRUE2X_GPU */
+     if(uMotionHdrHandoff!=0){
+         float globalMapped=iris26621MapMotionSdrFinalGuide(guide);
+-        globalMapped=iris26704BodyToneGuide(globalMapped);
++        if(uBodyToneStrength>1.0e-7)globalMapped=iris26704BodyToneGuide(globalMapped);
+         float mappedFinal=globalMapped;
+         if(localMappedGuide>=0.0){
+             float localStrength=smoothstep(0.030,0.100,globalMapped);
+             mappedFinal=mix(globalMapped,clamp(localMappedGuide,0.0,1.0),localStrength);
+         }
++        if(uBodyToneStrength<(-1.0e-7))mappedFinal=iris26704BodyToneGuide(mappedFinal);
+         if(guide>1.0e-7)rgb*=mappedFinal/guide;
+     }else{
+         float start=0.50;
+@@ -1316,7 +1338,7 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+         jfloatArray jinResidual,jintArray jinReference,jint jinW,jint jinH,jstring gainPath,jfloat gainMaxRatio,jfloat gainContentMaxRatio,jstring path,jint quality){
+     using namespace iris26564render;gIris26576PublicationTelemetry="backend=UNSET callStarted=true";AndroidBitmapInfo info{};if(!bitmap||!renderPath||!path||trueW<=0||trueH<=0||rawW<=0||rawH<=0||cropW<=0||cropH<=0||trueW!=rawW*2||trueH!=rawH*2||cropW>rawW||cropH>rawH||AndroidBitmap_getInfo(e,bitmap,&info)!=ANDROID_BITMAP_RESULT_SUCCESS||info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888){iris26576SetPublicationTelemetry("backend=NONE validationFailed=true");return JNI_FALSE;}
+     int expectedNativeW=(rotation==90||rotation==270)?cropH:rawW,expectedNativeH=(rotation==90||rotation==270)?rawW:cropH;if((int)info.width!=expectedNativeW||(int)info.height!=expectedNativeH)return JNI_FALSE;
+-    Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.saturation=clampf((float)saturation,0.f,2.f);p.bodyToneStrength=clampf((float)bodyToneStrength,0.f,1.f);p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.acr3Enabled=acr3Enabled==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
++    Params p{};p.trueW=trueW;p.trueH=trueH;p.rawW=rawW;p.rawH=rawH;p.cropW=cropW;p.cropH=cropH;p.rotation=rotation;p.mirror=mirror==JNI_TRUE;p.residualZoom=std::max(1.f,(float)residualZoom);p.displayGain=displayGain;p.exposureEv=exposureEv;p.shadows=shadows;p.contrast=contrast;p.saturation=clampf((float)saturation,0.f,2.f);p.bodyToneStrength=clampf((float)bodyToneStrength,-1.f,1.f);p.motionHdrHandoff=motionHdrHandoff==JNI_TRUE;p.acr3Enabled=acr3Enabled==JNI_TRUE;p.sceneWhite=p.motionHdrHandoff?std::max(1.f,(float)sceneWhite):std::max(1.f,std::min(6.f,0.90f*std::max(1.f,p.displayGain)));
+     const bool iris26702LocalToneEnabled=localToneEnabled==JNI_TRUE;
+     if(p.motionHdrHandoff&&iris26702LocalToneEnabled){
+         if(!localToneLogBuffer||localToneLogW<=0||localToneLogH<=0||localToneLogSourceW<=0||localToneLogSourceH<=0)return JNI_FALSE;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 2162e86fe718de1d690ba0f2bc5e80224435ef3e..8904abb9e8edec391b9785577ed1673e54024fbd 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -145,6 +145,12 @@ public final class MotionV2Render extends Node {
+     private static final float IRIS_26660_GAMMA_VALUE = 2.50f;
+     private static final float IRIS_26660_GAMMA_INFLUENCE_POWER = 6.0f;
+     private static final float IRIS_26660_GAMMA_WHITE_SCALE = 0.90f;
++    /* IRIS_26824_ADAPTIVE_BODY_S_CURVE
++     * Preserve 26704's positive dark-scene toe lift exactly. Negative strength is reserved for the
++     * new scene-adaptive Lightroom-reference body S curve. Saturation remains a separate final
++     * presentation control and is trimmed only 5% relative to the frozen per-lens user value. */
++    public static final float IRIS_26824_MOTION_SATURATION_SCALE = 0.95f;
++    private static final float IRIS_26824_BODY_S_MAX_STRENGTH = 0.85f;
+     private static final float IRIS_26626_SOURCE_PRESERVATION_MAX = 0.30f;
+     /* IRIS_26635_SPATIALLY_COHERENT_HIGHLIGHT_ROLLOFF
+      * Recombine the completed Local-Laplacian tone from a 1/32-scale mapped illumination base
+@@ -197,24 +203,46 @@ public final class MotionV2Render extends Node {
+     }
+ 
+     /* IRIS_26704_RANGE_SEPARATED_BODY_TONE
+-     * Pointwise global toe lift for scenes with a large dark body plus a substantial bright region.
+-     * It never samples neighbors, never changes hue, and is exact identity from mapped guide 0.35
+-     * upward so recovered window/highlight structure remains owned by the existing upper-tone path. */
++     * Positive strength preserves the exact 26704 dark-scene toe lift.
++     *
++     * IRIS_26824_ADAPTIVE_BODY_S_CURVE
++     * Negative strength is a new scene-adaptive lower-body contrast owner derived only from the
++     * frozen global tone histogram. It is deliberately inactive for the supplied dark indoor
++     * scenes (low p50), while the brighter 190437-style body receives the Lightroom-reference
++     * shadow/lower-mid pull. Deep blacks <=0.055 and upper presentation >=0.76 stay identity.
++     * The operation is pointwise and scalar-RGB only: no neighbor sampling, no hue rotation, no
++     * highlight lift, and no capture/exposure authority change. */
+     public static float iris26704BodyToneStrength(Parameters p) {
+         if (p == null || !p.motionV2Active) return 0.0f;
+         final float p50 = p.motionV2ToneP50Guide;
+         final float p95 = p.motionV2ToneP95Guide;
+         final float p99 = p.motionV2ToneP99Guide;
+         if (!Float.isFinite(p50) || !Float.isFinite(p95) || !Float.isFinite(p99)) return 0.0f;
++
+         final float darkBody = 1.0f - iris26623Smoothstep(0.025f, 0.070f, p50);
+         final float darkMass = 1.0f - iris26623Smoothstep(0.080f, 0.180f, p95);
+         final float brightArea = iris26623Smoothstep(0.120f, 0.220f, p99);
+-        return iris26582Clamp(darkBody * darkMass * brightArea, 0.0f, 1.0f);
++        final float legacyToeLift = iris26582Clamp(darkBody * darkMass * brightArea, 0.0f, 1.0f);
++
++        final float brightBody = iris26623Smoothstep(0.090f, 0.170f, p50);
++        final float bodyRange = iris26623Smoothstep(0.280f, 0.420f, p95);
++        final float upperSupport = iris26623Smoothstep(0.420f, 0.580f, p99);
++        final float adaptiveSCurve = iris26582Clamp(brightBody * bodyRange * upperSupport, 0.0f, 1.0f);
++        return iris26582Clamp(legacyToeLift - IRIS_26824_BODY_S_MAX_STRENGTH * adaptiveSCurve, -1.0f, 1.0f);
+     }
+ 
+-    static float iris26704ApplyBodyToneGuide(float mappedGuide, float strength) {
++    static float iris26704ApplyBodyToneGuide(float mappedGuide, float signedStrength) {
+         final float y = Math.max(mappedGuide, 0.0f);
+-        final float s = iris26582Clamp(strength, 0.0f, 1.0f);
++        final float contrastStrength = iris26582Clamp(-signedStrength, 0.0f, 1.0f);
++        if (contrastStrength > 1.0e-7f && y > 0.0f) {
++            final float lowGate = iris26623Smoothstep(0.055f, 0.180f, y);
++            final float highGate = 1.0f - iris26623Smoothstep(0.500f, 0.760f, y);
++            final float bodyWeight = iris26582Clamp(lowGate * highGate, 0.0f, 1.0f);
++            final float blend = 0.24f * contrastStrength * bodyWeight;
++            return y + (y * y - y) * blend;
++        }
++
++        final float s = iris26582Clamp(signedStrength, 0.0f, 1.0f);
+         final float anchorGuide = 0.35f;
+         if (s <= 1.0e-7f || y <= 0.0f || y >= anchorGuide) return y;
+         final float gamma = 1.0f - 0.28f * s;
+@@ -1200,8 +1228,12 @@ public final class MotionV2Render extends Node {
+          * receives neutral 1.0; SR uses the same frozen Motion snapshot through the native encoder. */
+         PostPipeline pipeline = (PostPipeline) basePipeline;
+         IrisMotionSettings.Snapshot iris26630Tone = pipeline.motionV2ToneSettingsSnapshot;
+-        float iris26630MotionSaturation = basePipeline.mParameters.motionV2Active
++        final float iris26824FrozenInputSaturation = basePipeline.mParameters.motionV2Active
+                 && iris26630Tone != null ? iris26630Tone.saturation : 1.0f;
++        float iris26630MotionSaturation = iris26824FrozenInputSaturation;
++        if (basePipeline.mParameters.motionV2Active) {
++            iris26630MotionSaturation *= IRIS_26824_MOTION_SATURATION_SCALE;
++        }
+         iris26630MotionSaturation = Math.max(0.0f, Math.min(2.0f, iris26630MotionSaturation));
+         GLTexture iris26799ClassMask = null;
+         GLTexture iris26799PingA = null;
+@@ -1673,16 +1705,27 @@ public final class MotionV2Render extends Node {
+ 
+             final float iris26704BodyToneStrength =
+                     iris26704BodyToneStrength(basePipeline.mParameters);
+-            Log.i(Name, "IRIS_26704_RANGE_SEPARATED_BODY_TONE"
+-                    + " strength=" + iris26704BodyToneStrength
++            Log.i(Name, "IRIS_26824_ADAPTIVE_BODY_S_CURVE"
++                    + " signedStrength=" + iris26704BodyToneStrength
+                     + " p50Guide=" + basePipeline.mParameters.motionV2ToneP50Guide
+                     + " p95Guide=" + basePipeline.mParameters.motionV2ToneP95Guide
+                     + " p99Guide=" + basePipeline.mParameters.motionV2ToneP99Guide
+-                    + " blackIdentityThrough=0.004"
+-                    + " fullToeBy=0.018"
+-                    + " mappedIdentityFrom=0.35"
+-                    + " maxGammaLift=0.72"
+-                    + " scalarRgb=true spatialSampling=false highlightOwnerUnchanged=true");
++                    + " legacyPositiveToePreserved=true"
++                    + " negativeAdaptiveSCurve=true"
++                    + " blackIdentityThrough=0.055"
++                    + " fullBodyFrom=0.18"
++                    + " upperIdentityFrom=0.76"
++                    + " maxAdditionalQuadraticBlend=0.24"
++                    + " at010=" + iris26704ApplyBodyToneGuide(0.10f, iris26704BodyToneStrength)
++                    + " at025=" + iris26704ApplyBodyToneGuide(0.25f, iris26704BodyToneStrength)
++                    + " at050=" + iris26704ApplyBodyToneGuide(0.50f, iris26704BodyToneStrength)
++                    + " at075=" + iris26704ApplyBodyToneGuide(0.75f, iris26704BodyToneStrength)
++                    + " scalarRgb=true spatialSampling=false captureExposureUnchanged=true highlightOwnerUnchanged=true");
++            Log.i(Name, "IRIS_26824_MOTION_SATURATION_TRIM"
++                    + " input=" + iris26824FrozenInputSaturation
++                    + " scale=" + IRIS_26824_MOTION_SATURATION_SCALE
++                    + " output=" + iris26630MotionSaturation
++                    + " relativeToFrozenPerLensSetting=true hueMechanicsUnchanged=true");
+             final float iris26792BodyContrast = iris26582Clamp(
+                     basePipeline.mParameters.motionV2SdrBodyContrast26792, 0.0f, 0.35f);
+             Log.i(Name, "IRIS_26792_SDR_BODY_CONTRAST_UHDR_REBASE"
+@@ -1692,7 +1735,7 @@ public final class MotionV2Render extends Node {
+                     + " upperFade=0.50..0.78"
+                     + " blackAndHighlightAnchorsIdentity=true"
+                     + " scalarRgbChromaticityPreserved=true"
+-                    + " saturationOwnerUnchanged=true"
++                    + " saturationOwner=IRIS_26824_RELATIVE_0P95"
+                     + " gainMapMirrorExact=true decodedUhHdrTargetFrozen=true"
+                     + " identicalInputRequired=true"
+                     + " at025=" + iris26770MidtonePresentationTrim(0.25f, iris26792BodyContrast)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index 5bf357f613a5de94bab9a1561dafbc1522cabe24..c2ef4b9883c6f536c0e7863ae27ff38e151f9ca7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -192,8 +192,12 @@ public final class MotionV2Jpeg444Encoder {
+             /* IRIS_26630_TRUE2X_SATURATION_PARITY
+              * Motion SR consumes the same frozen per-lens saturation snapshot as 1x. Night is
+              * explicitly neutral so Motion presentation settings cannot leak into Night SR. */
++            /* IRIS_26824_MOTION_SATURATION_TRIM_TRUE2X
++             * Match 1x exactly: a small 5% relative trim after the frozen per-lens user setting. */
+             final float saturation = parameters.motionV2Active && toneSettings != null
+-                    ? Math.max(0.0f, Math.min(2.0f, toneSettings.saturation)) : 1.0f;
++                    ? Math.max(0.0f, Math.min(2.0f,
++                        toneSettings.saturation * MotionV2Render.IRIS_26824_MOTION_SATURATION_SCALE))
++                    : 1.0f;
+             final boolean useJin = jinResidual != null && jinResidual.applied
+                     && jinResidual.residual != null && jinResidual.referenceRgb != null
+                     && jinResidual.width > 1 && jinResidual.height > 1;
+diff --git a/app/version.properties b/app/version.properties
+index 76ece0385fafc6e5346699c4787ea19a3d5f27ca..1f26f5b9e3879c937c96d3bc19b489551d44ef94 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726823
+-VERSION_BUILD=26823
++VERSION_NAME=0.9726824
++VERSION_BUILD=26824
