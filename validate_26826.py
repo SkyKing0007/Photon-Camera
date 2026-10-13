@@ -50,6 +50,11 @@ for token in ['WorkingTexture.loadHalfFloatData(fallback)','WorkingTexture.loadH
 post=(C/'app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java').read_text(); assert 'requires exactly one' in post
 # TurboJPEG is only a new primary; exact legacy encoder and package/gainmap owners survive.
 jni=(C/'app/src/main/cpp/motionv2_jpeg444_jni.cpp').read_text(); bjni=(B/'app/src/main/cpp/motionv2_jpeg444_jni.cpp').read_text()
+core_gl='#include <GLES3/gl31.h>'
+ext_gl='#include <GLES2/gl2ext.h>'
+assert jni.count(core_gl)==1 and jni.count(ext_gl)==1,'IRIS_26826_REGRESSION_NDK27_GLES_INCLUDE_COUNT'
+assert jni.index(core_gl)<jni.index(ext_gl),'IRIS_26826_REGRESSION_NDK27_GLES_CORE_BEFORE_EXT'
+assert '#include <GLES2/gl2ext.h>\n#include <GLES3/gl31.h>' not in jni,'IRIS_26826_REGRESSION_NDK27_GLES_BAD_ORDER'
 legacy_start='bool encodeRgbaBitmapP3(const char*path'
 legacy_end='\n}'
 i=jni.index(legacy_start); j=jni.index(legacy_end,i)+2
