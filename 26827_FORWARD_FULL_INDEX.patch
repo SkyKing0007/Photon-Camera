@@ -1,0 +1,521 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 68ecb66e253cfb62000f11dda6f294f3692597ae..23f7a6e09da44dc863d598f241ba2530d481ad4c 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -131,6 +131,46 @@ bool encodeRgbaBitmapP3Turbo(const char*path,const AndroidBitmapInfo&i,const uin
+ }
+ }
+ 
++/* IRIS_26827_GAINMAP_NATIVE_EXACT_REMAP
++ * Direct R8 traversal only. The Java owner still constructs the exact inherited 256-entry LUT.
++ * remapNative validates buffer + all LUT entries before its first write, so Java fallback is safe. */
++extern "C" JNIEXPORT jlong JNICALL
++Java_com_particlesdevs_photoncamera_processing_opengl_postpipeline_MotionV2GainMapNative_scanNative(
++    JNIEnv* e, jclass, jobject codes, jint pixels) {
++    if (!codes || pixels < 0) return static_cast<jlong>(-1);
++    auto* data = static_cast<uint8_t*>(e->GetDirectBufferAddress(codes));
++    const jlong capacity = e->GetDirectBufferCapacity(codes);
++    if (!data || capacity < static_cast<jlong>(pixels)) return static_cast<jlong>(-1);
++    uint32_t nonUnity = 0;
++    uint32_t peak = 0;
++    for (jint i = 0; i < pixels; ++i) {
++        const uint32_t code = data[i];
++        nonUnity += code != 0;
++        peak = std::max(peak, code);
++    }
++    return (static_cast<jlong>(nonUnity) << 32) | static_cast<jlong>(peak);
++}
++
++extern "C" JNIEXPORT jint JNICALL
++Java_com_particlesdevs_photoncamera_processing_opengl_postpipeline_MotionV2GainMapNative_remapNative(
++    JNIEnv* e, jclass, jobject codes, jint pixels, jintArray lutArray) {
++    if (!codes || pixels < 0 || !lutArray || e->GetArrayLength(lutArray) != 256) return -1;
++    auto* data = static_cast<uint8_t*>(e->GetDirectBufferAddress(codes));
++    const jlong capacity = e->GetDirectBufferCapacity(codes);
++    if (!data || capacity < static_cast<jlong>(pixels)) return -1;
++    std::array<jint, 256> lut{};
++    e->GetIntArrayRegion(lutArray, 0, 256, lut.data());
++    if (e->ExceptionCheck()) return -1;
++    for (jint value : lut) if (value < 0 || value > 255) return -1;
++    uint32_t peak = 0;
++    for (jint i = 0; i < pixels; ++i) {
++        const uint8_t output = static_cast<uint8_t>(lut[data[i]]);
++        data[i] = output;
++        peak = std::max<uint32_t>(peak, output);
++    }
++    return static_cast<jint>(peak);
++}
++
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality,jboolean sourceDisplayP3){AndroidBitmapInfo i{};if(!bitmap||!path||AndroidBitmap_getInfo(e,bitmap,&i)!=ANDROID_BITMAP_RESULT_SUCCESS||i.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;void*p=nullptr;if(AndroidBitmap_lockPixels(e,bitmap,&p)!=ANDROID_BITMAP_RESULT_SUCCESS||!p)return JNI_FALSE;U u(e,path);bool ok=u.c&&encodeRgbaBitmapP3(u.c,i,(const uint8_t*)p,(int)quality,sourceDisplayP3==JNI_TRUE);AndroidBitmap_unlockPixels(e,bitmap);return ok?JNI_TRUE:JNI_FALSE;}
+ 
+ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_ultrahdr_MotionV2Jpeg444Encoder_writeTurboNative(JNIEnv*e,jclass,jobject bitmap,jstring path,jint quality,jboolean sourceDisplayP3){
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 05b72025bb2f642cd5da2073b32062bdffd0e501..2dc9f754ea484f289a03446b39aa783b80fe3ca6 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2767,10 +2767,10 @@ internal object GlesMgcRawSabreShaders {
+             return numerator / supportedWeight;
+         }
+ 
+-        /* IRIS_26819_NORMAL_CLIPPED_CHROMA_VALIDITY_OWNER
+-         * NORMAL same-location chroma may use only physically valid CFA color/green evidence.
+-         * As clipping removes support, chroma authority fades toward neutral rather than
+-         * resurrecting legacy R-G / B-G built from clipped measurements. */
++        /* IRIS_26827_NORMAL_CLIPPED_RB_SIGNED_CHROMA_OWNER
++         * Keep signed R-G / B-G evidence when the R/B site itself clips; clipping understates
++         * magnitude but preserves hue sign. Orthogonal-green validity remains the sole confidence
++         * authority, so clipped/invalid green support still fades chroma toward neutral. */
+         void sameLocationChroma26793(
+             mat3 calculationCfa,
+             mat3 sampleWeights,
+@@ -2805,7 +2805,7 @@ internal object GlesMgcRawSabreShaders {
+                         calculationCfa, greenSupport, ivec2(sx, sy), type,
+                         horizontalGreenWeight, verticalGreenWeight,
+                         useGreenSupport, greenConfidence);
+-                    float differenceWeight = colorWeight * greenConfidence * siteValid;
++                    float differenceWeight = colorWeight * greenConfidence;
+                     float difference = calculationCfa[sx][sy] - predictedGreen;
+                     if (groupIndex == redGroup) {
+                         redDifferenceSum += difference * differenceWeight;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2GainMapNative.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2GainMapNative.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..dfa95671d1f099dc72622f5f0903d357c0d76427
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2GainMapNative.java
+@@ -0,0 +1,34 @@
++package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
++
++import java.nio.ByteBuffer;
++
++/** IRIS_26827_GAINMAP_NATIVE_EXACT_REMAP
++ * Native byte traversal only. Java still owns the exact 256-entry exp/log/round LUT, so gain-map
++ * math and stored codes are unchanged; this removes multi-million-element Java boxing/copies.
++ */
++final class MotionV2GainMapNative {
++    static { System.loadLibrary("motionv2jpeg"); }
++
++    static final class Scan {
++        final int nonUnity;
++        final int peakCode;
++        Scan(int nonUnity, int peakCode) { this.nonUnity = nonUnity; this.peakCode = peakCode; }
++    }
++
++    static Scan scan(ByteBuffer codes, int pixels) {
++        long packed = scanNative(codes, pixels);
++        if (packed < 0L) throw new IllegalStateException("26827 native gain-map scan unavailable");
++        return new Scan((int)(packed >>> 32), (int)(packed & 0xffffffffL));
++    }
++
++    static int remap(ByteBuffer codes, int pixels, int[] lut) {
++        int peak = remapNative(codes, pixels, lut);
++        if (peak < 0) throw new IllegalStateException("26827 native gain-map remap unavailable");
++        return peak;
++    }
++
++    private static native long scanNative(ByteBuffer codes, int pixels);
++    private static native int remapNative(ByteBuffer codes, int pixels, int[] lut);
++
++    private MotionV2GainMapNative() {}
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 8904abb9e8edec391b9785577ed1673e54024fbd..4f0ec48866e2b7798887a0518bb31ee4073a2c87 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1430,25 +1430,39 @@ public final class MotionV2Render extends Node {
+                 rgba.position(0);
+ 
+                 int pixels = gainSize.x * gainSize.y;
+-                ByteBuffer alpha = ByteBuffer.allocateDirect(pixels);
+-                /* IRIS_26701_GAINMAP_BYTE_ARRAY_EXACT_REMAP
+-                 * Bulk-copy the exact R8 gain codes once, then scan/remap ordinary byte[] memory.
+-                 * The 256-entry LUT executes the identical 26700 exp/log/round expression for each
+-                 * possible input code; only Java direct-ByteBuffer per-pixel access is removed. */
+-                byte[] gainCodes = new byte[pixels];
+-                ByteBuffer rgbaRead = rgba.duplicate();
+-                rgbaRead.position(0);
+-                if (rgbaRead.remaining() < pixels) {
+-                    throw new IllegalStateException("26701 gain-map readback too small");
+-                }
+-                rgbaRead.get(gainCodes, 0, pixels);
++                /* IRIS_26827_GAINMAP_NATIVE_EXACT_REMAP
++                 * Preserve the exact 26701 Java exp/log/round LUT. Only the two multi-million-byte
++                 * traversals move native and operate in-place on the existing direct R8 readback.
++                 * Any native precondition failure executes the exact inherited Java byte[] path. */
+                 int nonUnity = 0;
+                 int encodedPeakCode = 0;
+-                for (int i = 0; i < pixels; i++) {
+-                    int code = gainCodes[i] & 0xff;
+-                    if (code > 0) nonUnity++;
+-                    encodedPeakCode = Math.max(encodedPeakCode, code);
++                int peakCode = 0;
++                boolean iris26827NativeScan = false;
++                boolean iris26827NativeRemap = false;
++                byte[] gainCodes = null;
++                long iris26827ScanStartNs = System.nanoTime();
++                try {
++                    MotionV2GainMapNative.Scan scan = MotionV2GainMapNative.scan(rgba, pixels);
++                    nonUnity = scan.nonUnity;
++                    encodedPeakCode = scan.peakCode;
++                    iris26827NativeScan = true;
++                } catch (Throwable nativeScanFailure) {
++                    gainCodes = new byte[pixels];
++                    ByteBuffer rgbaRead = rgba.duplicate();
++                    rgbaRead.position(0);
++                    if (rgbaRead.remaining() < pixels) {
++                        throw new IllegalStateException("26701 gain-map readback too small");
++                    }
++                    rgbaRead.get(gainCodes, 0, pixels);
++                    for (int i = 0; i < pixels; i++) {
++                        int code = gainCodes[i] & 0xff;
++                        if (code > 0) nonUnity++;
++                        encodedPeakCode = Math.max(encodedPeakCode, code);
++                    }
++                    Log.w(Name, "IRIS_26827_GAINMAP_NATIVE_SCAN_FALLBACK owner=26701_java reason="
++                            + nativeScanFailure.getClass().getSimpleName());
+                 }
++                long iris26827AfterNativeScanNs = System.nanoTime();
+                 float actualPeakContentRatio = (float)Math.pow(
+                         Math.max(encodingMaxGainRatio, 1.001f), encodedPeakCode / 255.0f);
+                 if (basePipeline.mParameters.motionV2Active) {
+@@ -1457,7 +1471,6 @@ public final class MotionV2Render extends Node {
+                                     actualPeakContentRatio))
+                             : 1.001f;
+                 }
+-                int peakCode = 0;
+                 final double logEncodingMax = Math.log(Math.max(encodingMaxGainRatio, 1.001f));
+                 final double logDeclaredMax = Math.log(Math.max(maxGainRatio, 1.001f));
+                 final int[] iris26701GainRemap = new int[256];
+@@ -1470,13 +1483,49 @@ public final class MotionV2Render extends Node {
+                     }
+                     iris26701GainRemap[encodedCode] = outputCode;
+                 }
+-                for (int i = 0; i < pixels; i++) {
+-                    int outputCode = iris26701GainRemap[gainCodes[i] & 0xff];
+-                    peakCode = Math.max(peakCode, outputCode);
+-                    gainCodes[i] = (byte)outputCode;
++                ByteBuffer alpha;
++                long iris26827RemapStartNs = System.nanoTime();
++                if (iris26827NativeScan) {
++                    try {
++                        peakCode = MotionV2GainMapNative.remap(rgba, pixels, iris26701GainRemap);
++                        alpha = rgba.duplicate();
++                        alpha.position(0);
++                        iris26827NativeRemap = true;
++                    } catch (Throwable nativeRemapFailure) {
++                        // Native remap validates every argument/LUT entry before its first write.
++                        gainCodes = new byte[pixels];
++                        ByteBuffer rgbaRead = rgba.duplicate();
++                        rgbaRead.position(0);
++                        rgbaRead.get(gainCodes, 0, pixels);
++                        for (int i = 0; i < pixels; i++) {
++                            int outputCode = iris26701GainRemap[gainCodes[i] & 0xff];
++                            peakCode = Math.max(peakCode, outputCode);
++                            gainCodes[i] = (byte)outputCode;
++                        }
++                        alpha = ByteBuffer.allocateDirect(pixels);
++                        alpha.put(gainCodes, 0, pixels);
++                        alpha.position(0);
++                        Log.w(Name, "IRIS_26827_GAINMAP_NATIVE_REMAP_FALLBACK owner=26701_java reason="
++                                + nativeRemapFailure.getClass().getSimpleName());
++                    }
++                } else {
++                    for (int i = 0; i < pixels; i++) {
++                        int outputCode = iris26701GainRemap[gainCodes[i] & 0xff];
++                        peakCode = Math.max(peakCode, outputCode);
++                        gainCodes[i] = (byte)outputCode;
++                    }
++                    alpha = ByteBuffer.allocateDirect(pixels);
++                    alpha.put(gainCodes, 0, pixels);
++                    alpha.position(0);
+                 }
+-                alpha.put(gainCodes, 0, pixels);
+-                alpha.position(0);
++                long iris26827AfterRemapNs = System.nanoTime();
++                Log.d(Name, "IRIS_26827_GAINMAP_NATIVE_EXACT_REMAP scanOwner="
++                        + (iris26827NativeScan ? "NATIVE" : "26701_JAVA_FALLBACK")
++                        + " remapOwner=" + (iris26827NativeRemap ? "NATIVE" : "26701_JAVA_FALLBACK")
++                        + " scanMs=" + ((iris26827AfterNativeScanNs - iris26827ScanStartNs) / 1_000_000.0)
++                        + " remapMs=" + ((iris26827AfterRemapNs - iris26827RemapStartNs) / 1_000_000.0)
++                        + " pixels=" + pixels + " encodedPeakCode=" + encodedPeakCode
++                        + " peakCode=" + peakCode + " nonUnity=" + nonUnity);
+                 iris26641AfterScanNs = System.nanoTime();
+ 
+                 /*
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+index 6c15a414a7f9863a92b8d37521eb85117b87750d..07bcdb0ffd8c0955459bf6874b5892f05cf875f1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2ViewfinderExposureMatcher.java
+@@ -17,6 +17,7 @@ import java.nio.FloatBuffer;
+ import java.util.ArrayList;
+ import java.util.Collections;
+ import java.util.Comparator;
++import java.util.Arrays;
+ 
+ import static android.opengl.GLES20.GL_CLAMP_TO_EDGE;
+ import static android.opengl.GLES20.GL_FRAMEBUFFER;
+@@ -168,10 +169,15 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+             }
+ 
+             targetLog = medianLogLuma(previewLuma);
+-            error0 = exposureError(candidate, 0.0f, targetLog);
+-            errorMinus = exposureError(candidate, -0.5f, targetLog);
+-            errorPlus = exposureError(candidate, 0.5f, targetLog);
+-            rawSolvedEv = solveBounded(candidate, targetLog, error0, errorMinus, errorPlus);
++            /* IRIS_26827_VIEWFINDER_PRIMITIVE_SOLVER_SCRATCH
++             * Same candidate set, tone model, log2 values, sort order and median. Reuse one
++             * primitive array across every secant probe instead of allocating/boxing Float lists. */
++            float[] iris26827ExposureScratch = new float[candidate.size()];
++            error0 = exposureError(candidate, 0.0f, targetLog, iris26827ExposureScratch);
++            errorMinus = exposureError(candidate, -0.5f, targetLog, iris26827ExposureScratch);
++            errorPlus = exposureError(candidate, 0.5f, targetLog, iris26827ExposureScratch);
++            rawSolvedEv = solveBounded(candidate, targetLog, error0, errorMinus, errorPlus,
++                    iris26827ExposureScratch);
+             if (iris26550Night) {
+                 float targetLinearLuma = (float)Math.pow(2.0, targetLog);
+                 float daylightness = smoothstep(NIGHT_DARK_LUMA, NIGHT_FULL_MATCH_LUMA, targetLinearLuma);
+@@ -536,29 +542,33 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         return medianSorted(logs);
+     }
+ 
+-    private float exposureError(ArrayList<RgbSample> samples, float ev, float targetLog) {
++    private float exposureError(ArrayList<RgbSample> samples, float ev, float targetLog,
++                                float[] scratch) {
++        int n = samples.size();
++        if (scratch.length < n) throw new IllegalArgumentException("26827 exposure scratch too small");
+         float gain = (float)Math.pow(2.0, ev);
+         ToneDecision tone = iris26586ViewfinderMeterToneDecision(gain);
+-        ArrayList<Float> logs = new ArrayList<>(samples.size());
+-        for (RgbSample sample : samples) {
+-            logs.add(log2(Math.max(presentedLuma(sample, gain, tone.adaptiveSceneWhite), 1.0e-5f)));
++        for (int i = 0; i < n; i++) {
++            RgbSample sample = samples.get(i);
++            scratch[i] = log2(Math.max(
++                    presentedLuma(sample, gain, tone.adaptiveSceneWhite), 1.0e-5f));
+         }
+-        Collections.sort(logs);
+-        return medianSorted(logs) - targetLog;
++        Arrays.sort(scratch, 0, n);
++        return medianSorted(scratch, n) - targetLog;
+     }
+ 
+     private float solveBounded(ArrayList<RgbSample> samples, float targetLog,
+-                                      float e0, float eMinus, float ePlus) {
++                                      float e0, float eMinus, float ePlus, float[] scratch) {
+         float slope = ePlus - eMinus;
+         float guess = Math.abs(slope) > 1.0e-4f
+                 ? clamp(-e0 / slope, MIN_EV, MAX_EV)
+                 : 0.0f;
+         float bestEv = guess;
+-        float bestErr = Math.abs(exposureError(samples, guess, targetLog));
++        float bestErr = Math.abs(exposureError(samples, guess, targetLog, scratch));
+ 
+         float lo = MIN_EV, hi = MAX_EV;
+-        float flo = exposureError(samples, lo, targetLog);
+-        float fhi = exposureError(samples, hi, targetLog);
++        float flo = exposureError(samples, lo, targetLog, scratch);
++        float fhi = exposureError(samples, hi, targetLog, scratch);
+         if (Math.signum(flo) == Math.signum(fhi)) {
+             if (Math.abs(flo) < bestErr) { bestErr = Math.abs(flo); bestEv = lo; }
+             if (Math.abs(fhi) < bestErr) bestEv = hi;
+@@ -572,7 +582,7 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+                     : 0.5f * (lo + hi);
+             float guard = 0.12f * (hi - lo);
+             x = clamp(x, lo + guard, hi - guard);
+-            float fx = exposureError(samples, x, targetLog);
++            float fx = exposureError(samples, x, targetLog, scratch);
+             if (Math.abs(fx) < bestErr) { bestErr = Math.abs(fx); bestEv = x; }
+             if (Math.abs(fx) < 0.01f) break;
+             if (Math.signum(fx) == Math.signum(flo)) { lo = x; flo = fx; }
+@@ -950,6 +960,12 @@ public final class MotionV2ViewfinderExposureMatcher extends Node {
+         return 0.5f * (sorted.get(n / 2 - 1) + sorted.get(n / 2));
+     }
+ 
++    private static float medianSorted(float[] sorted, int n) {
++        if (n == 0) return Float.NaN;
++        if ((n & 1) != 0) return sorted[n / 2];
++        return 0.5f * (sorted[n / 2 - 1] + sorted[n / 2]);
++    }
++
+     private static float log2(float x) { return (float)(Math.log(x) / LOG2); }
+     private static float clamp(float x, float lo, float hi) { return Math.max(lo, Math.min(hi, x)); }
+     private static float mix(float a, float b, float t) { return a + (b - a) * t; }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 6ad6f2ee2d0f9b7f7dab9e8e205580dd75f1da86..f197bcda2b6e49bdfc9b018ada1ef074338c5fd3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -1310,6 +1310,7 @@ object PhotonMotionMgc1271Bridge {
+     }
+ 
+     private data class Iris26728ProtectedChromaFloor(
++        val pixelIndices: IntArray,
+         val sqrtFloorQ8: ByteArray,
+         val protectedPixels: Int,
+     )
+@@ -1327,10 +1328,17 @@ object PhotonMotionMgc1271Bridge {
+         width: Int,
+         height: Int,
+     ): Iris26728ProtectedChromaFloor {
++        val startNs = System.nanoTime()
+         val shorts = buffer.duplicate().order(ByteOrder.nativeOrder()).apply { position(0) }.asShortBuffer()
+         val pixels = width * height
+         requireParity(shorts.capacity() >= pixels * 4, "26728 protected chroma input buffer is short")
+-        val floor = ByteArray(pixels)
++        /* IRIS_26827_SPARSE_PROTECTED_CHROMA_BOOKKEEPING
++         * Only nonzero pre-VGN floors participate in the inherited post-denoise classifier. Keep
++         * their ascending pixel order and exact Q8 codes, rather than allocating/scanning a full
++         * frame byte map again after denoise. RGB math is unchanged. */
++        var capacity = minOf(maxOf(1, 16 * 1024), maxOf(1, pixels))
++        var pixelIndices = IntArray(capacity)
++        var floorCodes = ByteArray(capacity)
+         var protectedPixels = 0
+         var preVgnSum = 0.0
+         var postVgnSum = 0.0
+@@ -1350,8 +1358,15 @@ object PhotonMotionMgc1271Bridge {
+             val postVgnMagnitude = cameraChromaMagnitude26728(r, g, b)
+             val protectedFloor = minOf(preVgnMagnitude, postVgnMagnitude).coerceIn(0f, 1f)
+             if (protectedFloor <= 0f) continue
++            if (protectedPixels == capacity) {
++                val next = minOf(pixels, maxOf(capacity + 1, capacity * 2))
++                pixelIndices = pixelIndices.copyOf(next)
++                floorCodes = floorCodes.copyOf(next)
++                capacity = next
++            }
+             val encoded = (kotlin.math.sqrt(protectedFloor) * 255f).toInt().coerceIn(1, 255)
+-            floor[pixel] = encoded.toByte()
++            pixelIndices[protectedPixels] = pixel
++            floorCodes[protectedPixels] = encoded.toByte()
+             protectedPixels += 1
+             preVgnSum += preVgnMagnitude.toDouble()
+             postVgnSum += postVgnMagnitude.toDouble()
+@@ -1361,8 +1376,11 @@ object PhotonMotionMgc1271Bridge {
+             "meanMagnitude=${preVgnSum / denominator} source=physicalHdr26605 hueOwner=VGN_CLEANED")
+         PLog.i(TAG, "IRIS_26728_PROTECTED_CHROMA_POST_VGN protectedPixels=$protectedPixels " +
+             "meanMagnitude=${postVgnSum / denominator} floorCarrier=RGBA16F_ALPHA directionOwner=VGN_CLEANED")
++        PLog.i(TAG, "IRIS_26827_SPARSE_PROTECTED_CHROMA_CAPTURE entries=$protectedPixels " +
++            "fullPixels=$pixels elapsedMs=${(System.nanoTime() - startNs) / 1_000_000.0}")
+         buffer.position(0)
+-        return Iris26728ProtectedChromaFloor(floor, protectedPixels)
++        return Iris26728ProtectedChromaFloor(
++            pixelIndices.copyOf(protectedPixels), floorCodes.copyOf(protectedPixels), protectedPixels)
+     }
+ 
+     /* IRIS_26795_SCENE_RELATIVE_BRIGHT_EDGE_CHROMA_VALIDITY
+@@ -1401,8 +1419,11 @@ object PhotonMotionMgc1271Bridge {
+     ) {
+         val shorts = buffer.duplicate().order(ByteOrder.nativeOrder()).apply { position(0) }.asShortBuffer()
+         val pixels = width * height
+-        requireParity(shorts.capacity() >= pixels * 4 && state.sqrtFloorQ8.size == pixels,
++        requireParity(shorts.capacity() >= pixels * 4 &&
++            state.sqrtFloorQ8.size == state.protectedPixels &&
++            state.pixelIndices.size == state.protectedPixels,
+             "26728 protected chroma floor buffer mismatch")
++        val iris26827SparseApplyStartNs = System.nanoTime()
+ 
+         /* Scene-relative authority. Keep this deterministic and cheap: a regular <=~50k-sample
+          * grid reads the untouched post-denoise RGB carrier. No presentation gain, tone curve,
+@@ -1464,8 +1485,9 @@ object PhotonMotionMgc1271Bridge {
+         /* First pass: classify from the untouched post-denoise carrier. state.sqrtFloorQ8 is reused
+          * only after each pixel's original floor has been consumed; nonzero values become frozen
+          * target magnitudes for the second pass. */
+-        for (pixel in 0 until pixels) {
+-            val originalCode = state.sqrtFloorQ8[pixel].toInt() and 0xFF
++        for (entry in 0 until state.protectedPixels) {
++            val pixel = state.pixelIndices[entry]
++            val originalCode = state.sqrtFloorQ8[entry].toInt() and 0xFF
+             if (originalCode == 0) continue
+             val q = originalCode.toFloat() / 255f
+             val floorMagnitude = q * q
+@@ -1474,7 +1496,7 @@ object PhotonMotionMgc1271Bridge {
+             val rawG = Half.toFloat(shorts.get(base + 1))
+             val rawB = Half.toFloat(shorts.get(base + 2))
+             if (!rawR.isFinite() || !rawG.isFinite() || !rawB.isFinite()) {
+-                state.sqrtFloorQ8[pixel] = 0
++                state.sqrtFloorQ8[entry] = 0
+                 continue
+             }
+             val r = rawR.coerceAtLeast(0f)
+@@ -1515,7 +1537,7 @@ object PhotonMotionMgc1271Bridge {
+                 }
+             } else {
+                 directionLostPixels += 1
+-                state.sqrtFloorQ8[pixel] = 0
++                state.sqrtFloorQ8[entry] = 0
+                 afterSum += currentMagnitude.toDouble()
+                 continue
+             }
+@@ -1643,11 +1665,11 @@ object PhotonMotionMgc1271Bridge {
+                 val encodedQ = encodedTarget.toFloat() / 255f
+                 val quantizedTarget = encodedQ * encodedQ
+                 if (quantizedTarget > currentMagnitude + 1.0e-7f) {
+-                    state.sqrtFloorQ8[pixel] = encodedTarget.toByte()
++                    state.sqrtFloorQ8[entry] = encodedTarget.toByte()
+                     targetMagnitude = quantizedTarget
+                     raisedPixels += 1
+                 } else {
+-                    state.sqrtFloorQ8[pixel] = 0
++                    state.sqrtFloorQ8[entry] = 0
+                     targetMagnitude = currentMagnitude
+                 }
+             } else if (targetMagnitude + 1.0e-6f < currentMagnitude) {
+@@ -1656,23 +1678,24 @@ object PhotonMotionMgc1271Bridge {
+                 val encodedQ = encodedTarget.toFloat() / 255f
+                 val quantizedTarget = encodedQ * encodedQ
+                 if (quantizedTarget + 1.0e-7f < currentMagnitude) {
+-                    state.sqrtFloorQ8[pixel] = encodedTarget.toByte()
++                    state.sqrtFloorQ8[entry] = encodedTarget.toByte()
+                     targetMagnitude = quantizedTarget
+                 } else {
+-                    state.sqrtFloorQ8[pixel] = 0
++                    state.sqrtFloorQ8[entry] = 0
+                     targetMagnitude = currentMagnitude
+                 }
+             } else {
+-                state.sqrtFloorQ8[pixel] = 0
++                state.sqrtFloorQ8[entry] = 0
+                 targetMagnitude = currentMagnitude
+             }
+             afterSum += targetMagnitude.toDouble()
+         }
+ 
+         // Second pass: apply frozen up/down chroma targets; every classifier read above was untouched.
+-        for (pixel in 0 until pixels) {
++        for (entry in 0 until state.protectedPixels) {
++            val pixel = state.pixelIndices[entry]
+             val base = pixel * 4
+-            val code = state.sqrtFloorQ8[pixel].toInt() and 0xFF
++            val code = state.sqrtFloorQ8[entry].toInt() and 0xFF
+             if (code != 0) {
+                 val q = code.toFloat() / 255f
+                 val targetMagnitude = q * q
+@@ -1699,8 +1722,9 @@ object PhotonMotionMgc1271Bridge {
+                     }
+                 }
+             }
+-            shorts.put(base + 3, HALF_ONE)
+         }
++        // Alpha carried pre-VGN magnitude metadata; clear it exactly once after sparse RGB updates.
++        for (pixel in 0 until pixels) shorts.put(pixel * 4 + 3, HALF_ONE)
+ 
+         val denominator = maxOf(measuredPixels, 1).toDouble()
+         val floorDenominator = maxOf(legacyWouldRaisePixels, 1).toDouble()
+@@ -1709,6 +1733,9 @@ object PhotonMotionMgc1271Bridge {
+             "measuredPixels=$measuredPixels residualDenoiseExecuted=$residualDenoiseExecuted " +
+             "meanBeforeFloor=${beforeSum / denominator} meanAfterFloor=${afterSum / denominator} " +
+             "raisedPixels=$raisedPixels directionLostPixels=$directionLostPixels hueOwner=DENOISED_VGN_DIRECTION")
++        PLog.i(TAG, "IRIS_26827_SPARSE_PROTECTED_CHROMA_APPLY entries=${state.protectedPixels} " +
++            "fullPixels=$pixels elapsedMs=${(System.nanoTime() - iris26827SparseApplyStartNs) / 1_000_000.0} " +
++            "rgbClassifierOrder=ASCENDING_ORIGINAL_PROTECTED alphaNormalizedOnce=true")
+         PLog.i(TAG, "IRIS_26795_SCENE_RELATIVE_BRIGHT_EDGE_CHROMA histogramSamples=$histogramSamples " +
+             "sceneP90=$sceneP90 sceneP98=$sceneP98 sceneP995=$sceneP995 upperTailStart=$upperTailStart upperTailEnd=$upperTailEnd " +
+             "floorCandidatePixels=$floorCandidatePixels legacyWouldRaisePixels=$legacyWouldRaisePixels allowedRaisedPixels=$raisedPixels " +
+diff --git a/app/version.properties b/app/version.properties
+index 37edcf115102d516f3eeb4ff674c7683f6d873cd..8f11468be87cb08447c4499c08b91e5615657afe 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726826
+-VERSION_BUILD=26826
++VERSION_NAME=0.9726827
++VERSION_BUILD=26827
