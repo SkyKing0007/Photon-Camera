@@ -23,7 +23,7 @@ verify_package(){ sha256sum -c 26832_HANDOFF_HASHES.sha256 >/dev/null; bash -n b
 verify_scope(){ [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"; git merge-base --is-ancestor "$RUNTIME_AUTHORITY_COMMIT" HEAD || fail "26831 runtime authority not ancestor"; git merge-base --is-ancestor "$ROOT_MECHANICS_COMMIT" HEAD || fail "26821 root mechanics authority not ancestor"; if git diff --name-only "$RUNTIME_AUTHORITY_COMMIT"..HEAD | grep -E '^app/'; then fail "live app source changed after 26831 authority"; fi; python3 -S - <<'PY_SCOPE'
 import subprocess
 allowed=('26832_','build_26832_cfa_chroma_authority_quarantine.sh','transform_26832.py','validate_26832.py','verify_26832_patches.py','verify_26832_runtime_glsl.py','handoff_payload_26832/','.github/workflows/build-26832-cfa-chroma-authority-quarantine.yml','TRIGGER_26832.txt','PHOTON_26832_CFA_CHROMA_AUTHORITY_QUARANTINE_README.txt')
-paths=subprocess.check_output(['git','diff','--name-only','073603a7909ab63e33945b96c2bd5c748217dd7c..HEAD'],text=True).splitlines()
+paths=subprocess.check_output(['git','diff','--name-only','3aebed62874ef9c98da74479e6a698c226cf184e..HEAD'],text=True).splitlines()
 bad=[p for p in paths if not any(p==x or p.startswith(x) for x in allowed)]
 assert not bad,bad
 print('PASS 26832 infrastructure scope allowlist')
