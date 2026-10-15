@@ -1,0 +1,169 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 13c89d25e0b599754240ad02b0b404c5924ad750..2264f4a79350fd46e13b94689ed1bc2b89261752 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -5634,6 +5634,43 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26837_DEVICE_SAFE_FRAGMENT_EQUIVALENT
++     * Exact per-pixel equivalent of clipZoneApply26834 without imageStore/SSBO. Output is
++     * pre-copied from uRgb; discard at M==0 preserves the exact no-op pixels. */
++    val clipZoneApplyFragment26837 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uRgb;
++        uniform sampler2D uMask;
++        uniform sampler2D uSmall;
++        uniform sampler2D uBigQuarter;
++        uniform ivec2 uSize;
++        uniform float uYFloor;
++        uniform float uAThreshold;
++        uniform vec3 uCalculationWb;
++        layout(location=0) out vec4 oColor;
++        vec2 safeFill(vec4 v){ return v.b>1.0e-3 ? v.rg/v.b : vec2(0.0); }
++        void main(){
++            ivec2 p=ivec2(gl_FragCoord.xy);
++            float m=texelFetch(uMask,p,0).r;
++            if(m<=0.0) discard;
++            vec4 src=texelFetch(uRgb,p,0); vec3 rgb=src.rgb*uCalculationWb;
++            float y=(rgb.r+2.0*rgb.g+rgb.b)*0.25; float yc=max(y,uYFloor);
++            vec2 c=vec2(rgb.r-rgb.g,rgb.b-rgb.g)/yc;
++            vec4 sm=texelFetch(uSmall,p,0);
++            vec2 uv=(vec2(p)+vec2(0.5))/vec2(uSize);
++            vec4 bg=texture(uBigQuarter,uv);
++            float a=clamp(sm.b/max(uAThreshold,1.0e-4),0.0,1.0);
++            vec2 fill=mix(safeFill(bg),safeFill(sm),a);
++            vec2 cp=mix(c,fill,m);
++            float dR=cp.x*yc, dB=cp.y*yc;
++            float g=y-0.25*(dR+dB); vec3 wbDst=vec3(g+dR,g,g+dB);
++            vec3 cameraDst=wbDst/max(uCalculationWb,vec3(1.0e-6));
++            oColor=vec4(cameraDst,src.a);
++        }
++    """.trimIndent()
++
+     val shadowLongLumaAccumulate26833 = """
+         #version 300 es
+         precision highp float;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 5395483c2ba4f9bf657111ab17b7e77e109aba85..3008d0840f02e92ea3fd1aa0bd6f2bf651aa82bf 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -955,13 +955,13 @@ object PhotonMotionMgc1271Bridge {
+             } else {
+                 forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+             }
+-            /* IRIS_26836_TRUE_FINAL_CLIP_ZONE_CHROMA_OWNER
+-             * Claude's required insertion point: residual chroma denoise and 26728 are complete;
+-             * tone/gamut/render have not begun. Camera RGB is converted to the exact calculation-WB
+-             * domain inside the pass, then inverse-WB returns the existing camera-RGB contract. */
++            /* IRIS_26837_DEVICE_SAFE_TRUE_FINAL_CLIP_ZONE_CHROMA_OWNER
++             * Claude math/domain/stage are unchanged from 26836. 26837 changes only execution:
++             * immutable texture storage plus the already-proven GLES3 framebuffer fragment path,
++             * so final chroma no longer depends on compute image-store support. */
+             if (!parameters.irisNightActive && clipZoneMaskTexture26836 != 0) {
+                 val calculationWb26836 = calculationWhiteBalance26836(wb)
+-                applyIris26836FinalClipZoneChroma(
++                applyIris26837FinalClipZoneChroma(
+                     denoiseBuffer, size.x, size.y, clipZoneMaskTexture26836,
+                     calculationWb26836, edgeFalseColor26778,
+                 )
+@@ -1962,7 +1962,7 @@ object PhotonMotionMgc1271Bridge {
+         finally { GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,1); GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0); GLES30.glDeleteFramebuffers(1,fbo,0) }
+     }
+ 
+-    private data class Iris26836Programs(val products:Int,val gaussian:Int,val downsample:Int,val apply:Int)
++    private data class Iris26837Programs(val products:Int,val gaussian:Int,val downsample:Int,val applyFragment:Int)
+ 
+     private fun compileShader26836(type:Int, source:String, label:String):Int {
+         val shader=GLES30.glCreateShader(type); GLES30.glShaderSource(shader,source); GLES30.glCompileShader(shader)
+@@ -1993,12 +1993,14 @@ object PhotonMotionMgc1271Bridge {
+         if(ok[0]==0){val log=GLES31.glGetProgramInfoLog(p);GLES31.glDeleteProgram(p);invalid("26836 $label link failed: $log")};return p
+     }
+ 
+-    private fun createTexture26836(width:Int,height:Int,internalFormat:Int,filter:Int):Int {
+-        val id=IntArray(1);GLES30.glGenTextures(1,id,0);requireParity(id[0]!=0,"26836 texture allocation failed")
++    private fun createTexture26837(width:Int,height:Int,internalFormat:Int,filter:Int):Int {
++        val id=IntArray(1);GLES30.glGenTextures(1,id,0);requireParity(id[0]!=0,"26837 texture allocation failed")
+         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,id[0]);GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MIN_FILTER,filter);GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MAG_FILTER,filter)
+         GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_S,GLES30.GL_CLAMP_TO_EDGE);GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_T,GLES30.GL_CLAMP_TO_EDGE)
+-        val format=if(internalFormat==GLES30.GL_R16F) GLES30.GL_RED else GLES30.GL_RGBA
+-        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D,0,internalFormat,width,height,0,format,GLES30.GL_HALF_FLOAT,null);checkGl("26836 texture init")
++        /* IRIS_26837_PROVEN_IMMUTABLE_GL_STORAGE
++         * Match GlesMgcRawSpatialStacker.allocateTexture/GLTexture: textures used by the final
++         * chroma owner are immutable sized storage, never glTexImage2D mutable storage. */
++        GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D,1,internalFormat,width,height);checkGl("26837 immutable texture init")
+         return id[0]
+     }
+ 
+@@ -2022,34 +2024,41 @@ object PhotonMotionMgc1271Bridge {
+         draw26836(program,target,width,height,fbo)
+     }
+ 
+-    private fun applyIris26836FinalClipZoneChroma(buffer:ByteBuffer,width:Int,height:Int,maskTexture:Int,wb:FloatArray,t:IrisMotionSettings.EdgeFalseColorTunables.Snapshot){
+-        requireParity(wb.size==3&&wb.all{it.isFinite()&&it>0f},"26836 invalid calculation WB=${wb.contentToString()}")
+-        val programs=Iris26836Programs(linkFragment26836(GlesMgcRawSabreShaders.clipZoneProducts26834,"products"),linkFragment26836(GlesMgcRawSabreShaders.clipZoneGaussian26834,"gaussian"),linkFragment26836(GlesMgcRawSabreShaders.clipZoneDownsample4Products26834,"downsample"),linkCompute26836(GlesMgcRawSabreShaders.clipZoneApply26834,"apply"))
+-        val textures=ArrayList<Int>();val fboA=IntArray(1);GLES30.glGenFramebuffers(1,fboA,0);val fbo=fboA[0];var stats=0;var mapped=false
++    private fun applyIris26837FinalClipZoneChroma(buffer:ByteBuffer,width:Int,height:Int,maskTexture:Int,wb:FloatArray,t:IrisMotionSettings.EdgeFalseColorTunables.Snapshot){
++        requireParity(wb.size==3&&wb.all{it.isFinite()&&it>0f},"26837 invalid calculation WB=${wb.contentToString()}")
++        /* IRIS_26837_DEVICE_SAFE_FRAGMENT_BACKEND
++         * Claude's WB-linear equations are byte-for-byte mirrored by clipZoneApplyFragment26837.
++         * The active apply path uses the same GLES3 FBO draw machinery already proven by the
++         * products/Gaussian passes. No glBindImageTexture/imageStore/SSBO capability is required. */
++        val programs=Iris26837Programs(
++            linkFragment26836(GlesMgcRawSabreShaders.clipZoneProducts26834,"products"),
++            linkFragment26836(GlesMgcRawSabreShaders.clipZoneGaussian26834,"gaussian"),
++            linkFragment26836(GlesMgcRawSabreShaders.clipZoneDownsample4Products26834,"downsample"),
++            linkFragment26836(GlesMgcRawSabreShaders.clipZoneApplyFragment26837,"applyFragment"),
++        )
++        val textures=ArrayList<Int>();val fboA=IntArray(1);GLES30.glGenFramebuffers(1,fboA,0);val fbo=fboA[0]
+         try{
+-            val source=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=source;GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,source);GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,8);buffer.position(0);GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D,0,0,0,width,height,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,buffer);checkGl("26836 upload post-26728 carrier")
+-            val products=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=products;val scratch=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=scratch
++            val source=createTexture26837(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=source;GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,source);GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,8);buffer.position(0);GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D,0,0,0,width,height,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,buffer);checkGl("26837 upload post-26728 carrier")
++            val products=createTexture26837(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=products;val scratch=createTexture26837(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=scratch
+             GLES30.glUseProgram(programs.products);bindTexture26836(programs.products,"uRgb",0,source);bindTexture26836(programs.products,"uMask",1,maskTexture);GLES30.glUniform1f(GLES30.glGetUniformLocation(programs.products,"uYFloor"),t.clipZoneYFloor);GLES30.glUniform3f(GLES30.glGetUniformLocation(programs.products,"uCalculationWb"),wb[0],wb[1],wb[2]);draw26836(programs.products,products,width,height,fbo)
+-            val qw=(width+3)/4;val qh=(height+3)/4;val big=createTexture26836(qw,qh,GLES30.GL_RGBA16F,GLES30.GL_LINEAR);textures+=big;val bigScratch=createTexture26836(qw,qh,GLES30.GL_RGBA16F,GLES30.GL_LINEAR);textures+=bigScratch
++            val qw=(width+3)/4;val qh=(height+3)/4;val big=createTexture26837(qw,qh,GLES30.GL_RGBA16F,GLES30.GL_LINEAR);textures+=big;val bigScratch=createTexture26837(qw,qh,GLES30.GL_RGBA16F,GLES30.GL_LINEAR);textures+=bigScratch
+             GLES30.glUseProgram(programs.downsample);bindTexture26836(programs.downsample,"uInput",0,products);GLES30.glUniform2i(GLES30.glGetUniformLocation(programs.downsample,"uInputSize"),width,height);draw26836(programs.downsample,big,qw,qh,fbo)
+             gaussianPass26836(programs.gaussian,big,bigScratch,qw,qh,t.clipZoneSigmaBig/4f,true,fbo);gaussianPass26836(programs.gaussian,bigScratch,big,qw,qh,t.clipZoneSigmaBig/4f,false,fbo)
+             gaussianPass26836(programs.gaussian,products,scratch,width,height,t.clipZoneSigmaSmall,true,fbo);gaussianPass26836(programs.gaussian,scratch,products,width,height,t.clipZoneSigmaSmall,false,fbo)
+-            val output=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=output
++            val output=createTexture26837(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=output
+             val copyFbos=IntArray(2);GLES30.glGenFramebuffers(2,copyFbos,0)
+             try {
+                 GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER,copyFbos[0]);GLES30.glFramebufferTexture2D(GLES30.GL_READ_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,source,0)
+                 GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER,copyFbos[1]);GLES30.glFramebufferTexture2D(GLES30.GL_DRAW_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,output,0)
+-                requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_READ_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE&&GLES30.glCheckFramebufferStatus(GLES30.GL_DRAW_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE,"26836 bit-copy FBO incomplete")
+-                GLES30.glBlitFramebuffer(0,0,width,height,0,0,width,height,GLES30.GL_COLOR_BUFFER_BIT,GLES30.GL_NEAREST);checkGl("26836 M0 bit-copy")
++                requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_READ_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE&&GLES30.glCheckFramebufferStatus(GLES30.GL_DRAW_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE,"26837 bit-copy FBO incomplete")
++                GLES30.glBlitFramebuffer(0,0,width,height,0,0,width,height,GLES30.GL_COLOR_BUFFER_BIT,GLES30.GL_NEAREST);checkGl("26837 M0 bit-copy")
+             } finally { GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0);GLES30.glDeleteFramebuffers(2,copyFbos,0) }
+-            val ids=IntArray(1);GLES31.glGenBuffers(1,ids,0);stats=ids[0];val zero=ByteBuffer.allocateDirect(24).order(ByteOrder.nativeOrder()).apply{repeat(6){putInt(0)};rewind()};GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,stats);GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER,24,zero,GLES31.GL_STREAM_READ);GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER,0,stats)
+-            GLES31.glUseProgram(programs.apply);bindTexture26836(programs.apply,"uRgb",0,source);bindTexture26836(programs.apply,"uMask",1,maskTexture);bindTexture26836(programs.apply,"uSmall",2,products);bindTexture26836(programs.apply,"uBigQuarter",3,big);GLES31.glUniform2i(GLES31.glGetUniformLocation(programs.apply,"uSize"),width,height);GLES31.glUniform2i(GLES31.glGetUniformLocation(programs.apply,"uQuarterSize"),qw,qh);GLES31.glUniform1f(GLES31.glGetUniformLocation(programs.apply,"uYFloor"),t.clipZoneYFloor);GLES31.glUniform1f(GLES31.glGetUniformLocation(programs.apply,"uAThreshold"),t.clipZoneAThreshold);GLES31.glUniform3f(GLES31.glGetUniformLocation(programs.apply,"uCalculationWb"),wb[0],wb[1],wb[2]);GLES31.glBindImageTexture(0,output,0,false,0,GLES31.GL_WRITE_ONLY,GLES30.GL_RGBA16F);GLES31.glDispatchCompute((width+7)/8,(height+7)/8,1);GLES31.glMemoryBarrier(GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT or GLES31.GL_SHADER_STORAGE_BARRIER_BIT);GLES30.glFinish();checkGl("26836 Claude final compute")
+-            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,stats);val bb=GLES31.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER,0,24,GLES31.GL_MAP_READ_BIT) as? ByteBuffer?:invalid("26836 stats map failed");mapped=true;val n=bb.order(ByteOrder.nativeOrder());val zone=n.getInt(0);val changed=n.getInt(4);val sampled=n.getInt(8);val sum=n.getInt(12);val maxD=n.getInt(16);val coord=n.getInt(20);requireParity(GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER),"26836 stats unmap failed");mapped=false
+-            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,fbo);GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,output,0);requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE,"26836 output readback FBO incomplete");GLES30.glReadBuffer(GLES30.GL_COLOR_ATTACHMENT0);GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,8);buffer.position(0);GLES30.glReadPixels(0,0,width,height,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,buffer);checkGl("26836 final readback");buffer.position(0)
+-            val pixels=Math.multiplyExact(width,height);val mean=if(sampled>0)sum.toFloat()/sampled/1000f else 0f;val zx=if(width>0)coord%width else 0;val zy=if(width>0)coord/width else 0
+-            PLog.i(TAG,"IRIS_26836_CLIP_ZONE_CHROMA zoneFraction=${zone.toFloat()/pixels.toFloat()} meanAbsChromaDelta=$mean maxAbsChromaDelta=${maxD/1000f} pixelsChanged=$changed dngUntouched=true maxDeltaPixel=$zx,$zy M0BitExactByCopy=true lumaPreserved=WB_LINEAR colorDomain=WB_LINEAR inverseWbRoundTrip=true insertion=POST_RESIDUAL_POST_26728_PRE_TONE wb=${wb.contentToString()} sigmaSmall=${t.clipZoneSigmaSmall} sigmaBig=${t.clipZoneSigmaBig} aThreshold=${t.clipZoneAThreshold}")
++            GLES30.glUseProgram(programs.applyFragment);bindTexture26836(programs.applyFragment,"uRgb",0,source);bindTexture26836(programs.applyFragment,"uMask",1,maskTexture);bindTexture26836(programs.applyFragment,"uSmall",2,products);bindTexture26836(programs.applyFragment,"uBigQuarter",3,big);GLES30.glUniform2i(GLES30.glGetUniformLocation(programs.applyFragment,"uSize"),width,height);GLES30.glUniform1f(GLES30.glGetUniformLocation(programs.applyFragment,"uYFloor"),t.clipZoneYFloor);GLES30.glUniform1f(GLES30.glGetUniformLocation(programs.applyFragment,"uAThreshold"),t.clipZoneAThreshold);GLES30.glUniform3f(GLES30.glGetUniformLocation(programs.applyFragment,"uCalculationWb"),wb[0],wb[1],wb[2]);checkGl("26837 final fragment bindings")
++            draw26836(programs.applyFragment,output,width,height,fbo);checkGl("26837 final fragment apply")
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,fbo);GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,output,0);requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE,"26837 output readback FBO incomplete");GLES30.glReadBuffer(GLES30.GL_COLOR_ATTACHMENT0);GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,8);buffer.position(0);GLES30.glReadPixels(0,0,width,height,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,buffer);checkGl("26837 final readback");buffer.position(0)
++            PLog.i(TAG,"IRIS_26837_CLIP_ZONE_CHROMA backend=FBO_FRAGMENT_GLES300 immutableStorage=true imageStore=false ssbo=false M0BitExactByCopyDiscard=true lumaPreserved=WB_LINEAR colorDomain=WB_LINEAR inverseWbRoundTrip=true insertion=POST_RESIDUAL_POST_26728_PRE_TONE dngUntouched=true longColorAuthority=false wb=${wb.contentToString()} sigmaSmall=${t.clipZoneSigmaSmall} sigmaBig=${t.clipZoneSigmaBig} aThreshold=${t.clipZoneAThreshold}")
+         }finally{
+-            if(mapped){GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,stats);GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)};GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER,0,0);if(stats!=0)GLES31.glDeleteBuffers(1,intArrayOf(stats),0);if(textures.isNotEmpty())GLES30.glDeleteTextures(textures.size,textures.toIntArray(),0);if(fbo!=0)GLES30.glDeleteFramebuffers(1,intArrayOf(fbo),0);GLES30.glDeleteProgram(programs.products);GLES30.glDeleteProgram(programs.gaussian);GLES30.glDeleteProgram(programs.downsample);GLES31.glDeleteProgram(programs.apply);GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,1);GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,1);GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0)
++            if(textures.isNotEmpty())GLES30.glDeleteTextures(textures.size,textures.toIntArray(),0);if(fbo!=0)GLES30.glDeleteFramebuffers(1,intArrayOf(fbo),0);GLES30.glDeleteProgram(programs.products);GLES30.glDeleteProgram(programs.gaussian);GLES30.glDeleteProgram(programs.downsample);GLES30.glDeleteProgram(programs.applyFragment);GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,1);GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,1);GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0)
+         }
+     }
+ 
+diff --git a/app/version.properties b/app/version.properties
+index 8092e879e5305af06aa0b67602c63a9919f6ae45..f25267ed265751844be7987482c28dbdcc8010a1 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726836
+-VERSION_BUILD=26836
++VERSION_NAME=0.9726837
++VERSION_BUILD=26837
