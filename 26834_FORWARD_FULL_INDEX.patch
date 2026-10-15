@@ -1,0 +1,573 @@
+diff --git a/app/src/main/assets/shaders/motionv2/gainmap.glsl b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+index 5e0fdf51f9d045a15770a08d97959c19dd178a11..380e126d16b15d9c4a6062be93677703b7bc5a71 100644
+--- a/app/src/main/assets/shaders/motionv2/gainmap.glsl
++++ b/app/src/main/assets/shaders/motionv2/gainmap.glsl
+@@ -311,13 +311,15 @@ float iris26718HighZoomLogDetail(vec2 sourcePixel){
+     vec2 local=sourcePixel*iris26752PlanBDetailScale-iris26752PlanBDetailOrigin;
+     ivec2 sz=textureSize(iris26718HighZoomDetail,0);
+     if(any(lessThan(local,vec2(0.0)))||any(greaterThan(local,vec2(sz)-vec2(1.0))))return 0.0;
+-    /* IRIS_26828_HIGH_ZOOM_TRUSTED_INTERIOR_GATE
+-     * Direct-CFA detail is a residual only. Never magnify the reconstructed ROI boundary: two
+-     * sidecar texels are exact native-Sabre fallback and the next two form a smooth transition.
+-     * The enlarged producer halo normally keeps the visible crop fully inside this trusted area. */
++    /* IRIS_26834_UNIVERSAL_HIGH_ZOOM_VISIBLE_CROP_GUARD
++     * High-zoom detail is never trusted near its reconstruction boundary. The producer reserves
++     * a 32-texel target halo per side; keep the outer 16 texels at exact native Sabre/VGN and
++     * transition only from 16..24. Thus a visible 30x/120x crop cannot magnify edge uncertainty
++     * into barcode stripes. This rule is zoom-independent for every high-zoom detail route. */
+     vec2 edgeDistance=min(local,vec2(sz)-vec2(1.0)-local);
+     float minEdge=min(edgeDistance.x,edgeDistance.y);
+-    float trustedInterior=smoothstep(2.0,4.0,minEdge);
++    if(minEdge<=16.0)return 0.0;
++    float trustedInterior=smoothstep(16.0,24.0,minEdge);
+     vec2 uv=(local+vec2(0.5))/vec2(sz);
+     return clamp(texture(iris26718HighZoomDetail,uv).r,-0.56,0.56)*trustedInterior;
+ }
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index 21070a4d0e7d9bbe482f4eee028dfd40abb624ab..1f5999cfe102ab41828f67e9dbfc1a1275e31cc6 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -1067,13 +1067,15 @@ float iris26718HighZoomLogDetail(vec2 sourcePixel){
+     vec2 local=sourcePixel*iris26752PlanBDetailScale-iris26752PlanBDetailOrigin;
+     ivec2 sz=textureSize(iris26718HighZoomDetail,0);
+     if(any(lessThan(local,vec2(0.0)))||any(greaterThan(local,vec2(sz)-vec2(1.0))))return 0.0;
+-    /* IRIS_26828_HIGH_ZOOM_TRUSTED_INTERIOR_GATE
+-     * Direct-CFA detail is a residual only. Never magnify the reconstructed ROI boundary: two
+-     * sidecar texels are exact native-Sabre fallback and the next two form a smooth transition.
+-     * The enlarged producer halo normally keeps the visible crop fully inside this trusted area. */
++    /* IRIS_26834_UNIVERSAL_HIGH_ZOOM_VISIBLE_CROP_GUARD
++     * High-zoom detail is never trusted near its reconstruction boundary. The producer reserves
++     * a 32-texel target halo per side; keep the outer 16 texels at exact native Sabre/VGN and
++     * transition only from 16..24. Thus a visible 30x/120x crop cannot magnify edge uncertainty
++     * into barcode stripes. This rule is zoom-independent for every high-zoom detail route. */
+     vec2 edgeDistance=min(local,vec2(sz)-vec2(1.0)-local);
+     float minEdge=min(edgeDistance.x,edgeDistance.y);
+-    float trustedInterior=smoothstep(2.0,4.0,minEdge);
++    if(minEdge<=16.0)return 0.0;
++    float trustedInterior=smoothstep(16.0,24.0,minEdge);
+     vec2 uv=(local+vec2(0.5))/vec2(sz);
+     return clamp(texture(iris26718HighZoomDetail,uv).r,-0.56,0.56)*trustedInterior;
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index df5f35b8fe07a14b7fb3711c337c4f21f2b892cd..0eb7474b6537a6050651fa4eaa475cf435943f19 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2590,6 +2590,12 @@ internal object GlesMgcRawSabreShaders {
+          * weight multiplied by the actual source-code headroom confidence of each CFA channel.
+          * It never feeds temporal weights, color accumulation, Resolve, VGN, DNG or SR detail. */
+         layout(location = 2) out vec4 oValidWeights;
++        /* IRIS_26834_NORMAL_CLIP_ZONE_PROVENANCE
++         * Fourth MRT is scalar NORMAL-only provenance. x=sum(w*headroomConfidence), y=sum(w).
++         * It is read-only evidence and cannot feed merge weights, RGB, Resolve, VGN, DNG or SR. */
++        layout(location = 3) out vec2 oClipZoneProvenance26834;
++        uniform int uClipZoneEnabled26834;
++        uniform float uClipZoneClipStart26834;
+ 
+         vec2 mirrorUvs(vec2 sampleUv) {
+             if (sampleUv.x <= uFrameBorderPadded.x) {
+@@ -3280,6 +3286,18 @@ internal object GlesMgcRawSabreShaders {
+                 ? texture(uRejection, referenceUv).r
+                 : 1.0;
+             frameWeight *= iris26720MergeRowReliability(rowReliabilitySampleUv26790.y);
++            /* IRIS_26834_NORMAL_CLIP_ZONE_PROVENANCE
++             * Preserve the existing Sabre merge equations exactly. The provenance support is
++             * sampled before the existing source-clip guard so the mask measures headroom loss
++             * rather than the guard's consequence. Default 0.9925 is bit-equivalent confidence;
++             * other clip-start tunings monotonically remap only this read-only sidecar. */
++            float scalarSupport26834 = dot(accumulatedWeight, vec3(0.25, 0.50, 0.25)) * frameWeight;
++            float desiredWidth26834 = max(1.0 - clamp(uClipZoneClipStart26834, 0.97, 0.999), 1.0e-4);
++            float remapExponent26834 = desiredWidth26834 / 0.0075;
++            float clipConfidence26834 = pow(clamp(sourceNeighborhoodConfidence, 0.0, 1.0), remapExponent26834);
++            oClipZoneProvenance26834 = uClipZoneEnabled26834 != 0
++                ? vec2(scalarSupport26834 * clipConfidence26834, scalarSupport26834)
++                : vec2(0.0);
+             if (uSourceClipGuard != 0) {
+                 frameWeight *= mix(
+                     uSourceClippedWeight, 1.0,
+@@ -5488,6 +5506,120 @@ internal object GlesMgcRawSabreShaders {
+      * Each isolated SHADOW_LONG observation is collapsed to weighted scalar luminance plus one
+      * conservative all-channel scalar support. Additive accumulation is scalar-only: no LONG
+      * RGB/chroma/hue leaves this shader or enters NORMAL Resolve/VGN. */
++    /* IRIS_26834_CLIP_ZONE_CHROMA_INPAINT
++     * JPEG-only final structural chroma owner. All masks derive solely from NORMAL RAW headroom
++     * provenance. The final apply preserves Sabre luma exactly and has an explicit M==0 copy path. */
++    val clipZoneMaskDilate26834 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uProvenance;
++        uniform ivec2 uSize;
++        uniform int uRadius;
++        out float oMask;
++        float z0(ivec2 p) {
++            vec2 q=texelFetch(uProvenance,clamp(p,ivec2(0),uSize-ivec2(1)),0).rg;
++            return q.y>1.0e-7 ? clamp(1.0-q.x/q.y,0.0,1.0) : 0.0;
++        }
++        void main(){
++            ivec2 p=ivec2(gl_FragCoord.xy); float m=0.0;
++            for(int y=-4;y<=4;++y) for(int x=-4;x<=4;++x)
++                if(abs(x)<=uRadius && abs(y)<=uRadius) m=max(m,z0(p+ivec2(x,y)));
++            oMask=m;
++        }
++    """.trimIndent()
++
++    val clipZoneGaussian26834 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uInput;
++        uniform ivec2 uSize;
++        uniform ivec2 uDirection;
++        uniform int uRadius;
++        uniform float uKernel[61];
++        uniform float uGain;
++        uniform int uClamp01;
++        out vec4 oFiltered;
++        vec4 at(ivec2 p){return texelFetch(uInput,clamp(p,ivec2(0),uSize-ivec2(1)),0);}
++        void main(){
++            ivec2 p=ivec2(gl_FragCoord.xy); vec4 v=vec4(0.0);
++            for(int i=-30;i<=30;++i) if(abs(i)<=uRadius) v+=uKernel[i+30]*at(p+uDirection*i);
++            v*=uGain; if(uClamp01!=0) v=clamp(v,vec4(0.0),vec4(1.0)); oFiltered=v;
++        }
++    """.trimIndent()
++
++    val clipZoneProducts26834 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uRgb;
++        uniform sampler2D uMask;
++        uniform float uYFloor;
++        out vec4 oProducts;
++        void main(){
++            ivec2 p=ivec2(gl_FragCoord.xy); vec3 rgb=texelFetch(uRgb,p,0).rgb;
++            float m=texelFetch(uMask,p,0).r; float y=(rgb.r+2.0*rgb.g+rgb.b)*0.25;
++            float yc=max(y,uYFloor); vec2 c=vec2(rgb.r-rgb.g,rgb.b-rgb.g)/yc;
++            float w=(1.0-m)*(1.0-m); oProducts=vec4(w*c,w,0.0);
++        }
++    """.trimIndent()
++
++    val clipZoneDownsample4Products26834 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uInput;
++        uniform ivec2 uInputSize;
++        out vec4 oValue;
++        void main(){
++            ivec2 q=ivec2(gl_FragCoord.xy); ivec2 base=q*4; vec4 s=vec4(0.0);
++            for(int y=0;y<4;++y) for(int x=0;x<4;++x)
++                s+=texelFetch(uInput,clamp(base+ivec2(x,y),ivec2(0),uInputSize-ivec2(1)),0);
++            oValue=s*(1.0/16.0);
++        }
++    """.trimIndent()
++
++    val clipZoneApply26834 = """
++        #version 310 es
++        precision highp float;
++        precision highp int;
++        layout(local_size_x=8,local_size_y=8) in;
++        uniform sampler2D uRgb;
++        uniform sampler2D uMask;
++        uniform sampler2D uSmall;
++        uniform sampler2D uBigQuarter;
++        uniform ivec2 uSize;
++        uniform ivec2 uQuarterSize;
++        uniform float uYFloor;
++        uniform float uAThreshold;
++        layout(rgba16f,binding=0) writeonly uniform highp image2D uOut;
++        layout(std430,binding=0) buffer Stats26834 { uint zone; uint changed; uint sampled; uint sumDeltaMilli; uint maxDeltaMilli; uint maxCoord; } stats;
++        vec2 safeFill(vec4 v){ return v.b>1.0e-3 ? v.rg/v.b : vec2(0.0); }
++        void main(){
++            ivec2 p=ivec2(gl_GlobalInvocationID.xy); if(any(greaterThanEqual(p,uSize))) return;
++            vec4 src=texelFetch(uRgb,p,0); float m=texelFetch(uMask,p,0).r;
++            if(m<=0.0){ imageStore(uOut,p,src); return; }
++            float y=(src.r+2.0*src.g+src.b)*0.25; float yc=max(y,uYFloor);
++            vec2 c=vec2(src.r-src.g,src.b-src.g)/yc;
++            vec4 sm=texelFetch(uSmall,p,0);
++            vec2 uv=(vec2(p)+vec2(0.5))/vec2(uSize);
++            vec4 bg=texture(uBigQuarter,uv);
++            float a=clamp(sm.b/max(uAThreshold,1.0e-4),0.0,1.0);
++            vec2 fill=mix(safeFill(bg),safeFill(sm),a);
++            vec2 cp=mix(c,fill,m);
++            float dR=cp.x*yc, dB=cp.y*yc;
++            float g=y-0.25*(dR+dB); vec4 dst=vec4(g+dR,g,g+dB,src.a);
++            imageStore(uOut,p,dst);
++            float delta=0.5*(abs(cp.x-c.x)+abs(cp.y-c.y));
++            if(m>0.3) atomicAdd(stats.zone,1u);
++            if(delta>1.0e-7) atomicAdd(stats.changed,1u);
++            uint dm=uint(clamp(delta*1000.0,0.0,4294967.0));
++            if(((p.x&3)==0)&&((p.y&3)==0)){ atomicAdd(stats.sampled,1u); atomicAdd(stats.sumDeltaMilli,dm); }
++            uint old=atomicMax(stats.maxDeltaMilli,dm); if(dm>old) stats.maxCoord=uint(p.y)*uint(uSize.x)+uint(p.x);
++        }
++    """.trimIndent()
++
+     val shadowLongLumaAccumulate26833 = """
+         #version 300 es
+         precision highp float;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 02b1e9f5a5311f5eb18d07fe4b61e0cd52137768..254c740b97843722f1a3b34e47676e1891f20b48 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -685,6 +685,11 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreShadowLongLumaAccumulateProgram26833 = 0
+     private var sabreShadowLongLumaGainMapProgram26833 = 0
+     private var sabreShadowLongPostVgnLumaApplyProgram26833 = 0
++    private var sabreClipZoneMaskDilateProgram26834 = 0
++    private var sabreClipZoneGaussianProgram26834 = 0
++    private var sabreClipZoneProductsProgram26834 = 0
++    private var sabreClipZoneDownsample4Program26834 = 0
++    private var sabreClipZoneApplyProgram26834 = 0
+     private var sabreJpegPhaseSafeCfaLcaProgram26788 = 0
+     private var sabreOutputTransformProgram = 0
+     private var sabreOutputTransformFloatProgram = 0
+@@ -2437,6 +2442,11 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_RGB10_A2,
+                 GLES30.GL_NEAREST,
+             )
++            /* IRIS_26834_NORMAL_CLIP_ZONE_PROVENANCE
++             * NORMAL-only scalar numerator/denominator. No LONG, SHORT, RGB or DNG ownership. */
++            var clipZoneProvenance26834 = if (edgeFalseColor26778.clipZoneEnabled) {
++                createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
++            } else 0
+             /* IRIS_26564_TRUE_2X_RETIRES_NATIVE_UPSCALE_DETAIL_OWNER
+              * Keep the old carrier functions dormant for rollback provenance, but allocate no
+              * full-frame 2x luma/detail surface. True 2x is direct multiframe CFA reconstruction.
+@@ -2490,6 +2500,13 @@ internal class GlesMgcRawSpatialStacker(
+                 coverageHeight,
+                 accumulatedValidity26614,
+             )
++            if (clipZoneProvenance26834 != 0) {
++                bindRenderTargets(intArrayOf(clipZoneProvenance26834), "26834 clip-zone provenance clear")
++                GLES30.glViewport(0, 0, width, height)
++                GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
++                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++                checkGlError("26834 clip-zone provenance clear")
++            }
+             if (normalDngAccumulator != 0) {
+                 clearSabreNormalDngAccumulator(normalDngAccumulator)
+                 if (normalDngCoverage != 0) {
+@@ -2597,6 +2614,9 @@ internal class GlesMgcRawSpatialStacker(
+                 sourceClippedWeight = 0.001f,
+                 accumulatedValidity26614 = accumulatedValidity26614,
+                 validityWeightScale26614 = validityWeightScale26614,
++                clipZoneProvenance26834 = clipZoneProvenance26834,
++                clipZoneEnabled26834 = edgeFalseColor26778.clipZoneEnabled,
++                clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
+                 rowFlickerFrame26720 = frames.first().takeIf(::hasRowFlickerEvidence26720),
+                 jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
+                 jpegLcaKr26790 = dngOptions26786.kR,
+@@ -2863,6 +2883,9 @@ internal class GlesMgcRawSpatialStacker(
+                         sourceClippedWeight = 0f,
+                         accumulatedValidity26614 = accumulatedValidity26614,
+                         validityWeightScale26614 = validityWeightScale26614,
++                        clipZoneProvenance26834 = clipZoneProvenance26834,
++                        clipZoneEnabled26834 = edgeFalseColor26778.clipZoneEnabled,
++                        clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
+                         rowFlickerFrame26720 = frame.takeIf(::hasRowFlickerEvidence26720),
+                         jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
+                         jpegLcaKr26790 = dngOptions26786.kR,
+@@ -3118,6 +3141,12 @@ internal class GlesMgcRawSpatialStacker(
+              * master is the sole RGB/chroma input to Resolve/VGN; LONG remains scalar-only and is
+              * not published until after VGN. */
+             val dehomogenizedNormal26604 = accumulatedColor
++            var clipZoneMask26834 = if (clipZoneProvenance26834 != 0) {
++                buildClipZoneMask26834(clipZoneProvenance26834).also {
++                    releaseOwnedTexture(clipZoneProvenance26834, "26834 NORMAL clip-zone provenance after mask build")
++                    clipZoneProvenance26834 = 0
++                }
++            } else 0
+             val resolveAccumulatedWeightsGb26604 = accumulatedWeightsGb
+             val sabreRSupport26613 = renderSabreDehomogenize(
+                 dehomogenizedNormal26604,
+@@ -3507,6 +3536,22 @@ internal class GlesMgcRawSpatialStacker(
+                         "rgbScaleOnly=true exactRgbRatioPreserved=true hueAuthority=false chromaAuthority=false",
+                 )
+             }
++            /* IRIS_26834_CLIP_ZONE_CHROMA_INPAINT_FINAL_OWNER
++             * Exact insertion point: after extended-HDR restoration and 26833 LONG scalar luma,
++             * before nativeHdrAuthority26601/tone/UHDR. No later stage may publish new chroma. */
++            if (clipZoneMask26834 != 0) {
++                if (exportedTexture != 0 && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
++                    val inpainted26834 = applyClipZoneChromaInpaint26834(exportedTexture, clipZoneMask26834)
++                    GLES30.glDeleteTextures(1, intArrayOf(exportedTexture), 0)
++                    exportedTexture = inpainted26834
++                    check(textures.remove(inpainted26834)) { "26834 final inpaint output is not owned" }
++                    textureSpecs.remove(inpainted26834)
++                } else {
++                    PLog.i(SABRE_TAG, "IRIS_26834_CLIP_ZONE_CHROMA skipped=true reason=NO_FINAL_RGBA16F_JPEG_CARRIER dngUntouched=true")
++                }
++                releaseOwnedTexture(clipZoneMask26834, "26834 final clip-zone mask")
++                clipZoneMask26834 = 0
++            }
+             /* IRIS_26601_SHARED_NATIVE_HDR_AUTHORITY
+              * Resolve/VGN above consumed only NORMAL plus independently validated SHORT color/radiance.
+              * Native 1x and true-2x share that reconstruction; optional LONG can modify only final
+@@ -3557,7 +3602,8 @@ internal class GlesMgcRawSpatialStacker(
+                         "scale=${hz.scaleX},${hz.scaleY} full=${hz.fullWidth}x${hz.fullHeight} sourceZoom=${hz.sourceZoom} " +
+                         "frames=${hz.frames} activePct=${hz.activePct} strongPct=${hz.strongPct} ms=${hz.reconstructionMs} " +
+                         "detailOwner=DIRECT_CFA_TEMPORAL_ADAPTIVE nativeSabreVgnRgbChromaHighlightOwner=true " +
+-                        "flatHighlightVeto=true unsupportedAliasVeto=true secondScaler=false"
++                        "flatHighlightVeto=true unsupportedAliasVeto=true secondScaler=false " +
++                        "trustedHaloTarget=32 guardZeroThrough=16 guardFullAt=24 universalBarcodeGuard26834=true"
+                     PLog.i(SABRE_TAG, "IRIS_26758_DIRECT_CFA_HIGH_ZOOM_READY $ready")
+                     MotionTrace.processingState("IRIS_26758_DIRECT_CFA_HIGH_ZOOM_READY", ready)
+                 } else {
+@@ -5297,6 +5343,9 @@ internal class GlesMgcRawSpatialStacker(
+         sourceClippedWeight: Float,
+         accumulatedValidity26614: Int = 0,
+         validityWeightScale26614: Float = 1f,
++        clipZoneProvenance26834: Int = 0,
++        clipZoneEnabled26834: Boolean = false,
++        clipZoneClipStart26834: Float = 0.9925f,
+         rowFlickerFrame26720: RawStackFrame? = null,
+         jpegIntegratedLca26790: Boolean = false,
+         jpegLcaKr26790: Float = 0f,
+@@ -5352,6 +5401,8 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1f(program, "uSourceClippingPoint", sabreShadowLongSourceClippingPoint())
+         uniform1f(program, "uSourceClippedWeight", sourceClippedWeight.coerceIn(0f, 1f))
+         uniform1f(program, "uValidityWeightScale", validityWeightScale26614.coerceAtLeast(1f))
++        uniform1i(program, "uClipZoneEnabled26834", if (clipZoneEnabled26834) 1 else 0)
++        uniform1f(program, "uClipZoneClipStart26834", clipZoneClipStart26834.coerceIn(0.97f, 0.999f))
+         uniform1i(program, "uRowFlickerEnabled", if (rowFlickerActive26720) 1 else 0)
+         if (rowFlickerActive26720) {
+             val f = checkNotNull(rowFlickerFrame26720)
+@@ -5382,7 +5433,10 @@ internal class GlesMgcRawSpatialStacker(
+                 program,
+                 width,
+                 height,
+-                if (accumulatedValidity26614 != 0) {
++                if (clipZoneProvenance26834 != 0) {
++                    check(accumulatedValidity26614 != 0) { "26834 provenance requires location-2 validity attachment" }
++                    intArrayOf(accumulatedColor, accumulatedWeightsGb, accumulatedValidity26614, clipZoneProvenance26834)
++                } else if (accumulatedValidity26614 != 0) {
+                     intArrayOf(accumulatedColor, accumulatedWeightsGb, accumulatedValidity26614)
+                 } else {
+                     intArrayOf(accumulatedColor, accumulatedWeightsGb)
+@@ -6705,6 +6759,112 @@ internal class GlesMgcRawSpatialStacker(
+             exportFullSizeTexture = exportGpuLinearRgbSource,
+         )
+ 
++    /* IRIS_26834_CLIP_ZONE_CHROMA_INPAINT_HOST */
++    private fun gaussianKernel26834(sigmaIn: Float): Pair<FloatArray, Int> {
++        val sigma = sigmaIn.coerceIn(0.25f, 20f)
++        val radius = kotlin.math.ceil(3.0 * sigma.toDouble()).toInt().coerceIn(1, 30)
++        val k = FloatArray(61)
++        var sum = 0.0
++        for (i in -radius..radius) {
++            val v = kotlin.math.exp(-0.5 * (i.toDouble() / sigma.toDouble()) * (i.toDouble() / sigma.toDouble()))
++            k[i + 30] = v.toFloat(); sum += v
++        }
++        for (i in k.indices) k[i] = (k[i] / sum.toFloat())
++        return k to radius
++    }
++
++    private fun gaussianPass26834(source: Int, target: Int, w: Int, h: Int, sigma: Float, horizontal: Boolean, gain: Float = 1f, clamp01: Boolean = false) {
++        val (kernel, radius) = gaussianKernel26834(sigma)
++        GLES30.glUseProgram(sabreClipZoneGaussianProgram26834)
++        bindTexture(sabreClipZoneGaussianProgram26834, "uInput", 0, source)
++        uniform2i(sabreClipZoneGaussianProgram26834, "uSize", w, h)
++        uniform2i(sabreClipZoneGaussianProgram26834, "uDirection", if (horizontal) 1 else 0, if (horizontal) 0 else 1)
++        uniform1i(sabreClipZoneGaussianProgram26834, "uRadius", radius)
++        uniform1fv(sabreClipZoneGaussianProgram26834, "uKernel", kernel)
++        uniform1f(sabreClipZoneGaussianProgram26834, "uGain", gain)
++        uniform1i(sabreClipZoneGaussianProgram26834, "uClamp01", if (clamp01) 1 else 0)
++        draw(sabreClipZoneGaussianProgram26834, w, h, intArrayOf(target))
++    }
++
++    private fun buildClipZoneMask26834(provenance: Int): Int {
++        val mask = createTexture(width, height, GLES30.GL_R16F, GLES30.GL_NEAREST)
++        val scratch = createTexture(width, height, GLES30.GL_R16F, GLES30.GL_NEAREST)
++        GLES30.glUseProgram(sabreClipZoneMaskDilateProgram26834)
++        bindTexture(sabreClipZoneMaskDilateProgram26834, "uProvenance", 0, provenance)
++        uniform2i(sabreClipZoneMaskDilateProgram26834, "uSize", width, height)
++        uniform1i(sabreClipZoneMaskDilateProgram26834, "uRadius", edgeFalseColor26778.clipZoneDilation.roundToInt().coerceIn(0, 4))
++        draw(sabreClipZoneMaskDilateProgram26834, width, height, intArrayOf(mask))
++        gaussianPass26834(mask, scratch, width, height, edgeFalseColor26778.clipZoneMaskSigma, true)
++        gaussianPass26834(scratch, mask, width, height, edgeFalseColor26778.clipZoneMaskSigma, false, edgeFalseColor26778.clipZoneMaskGain, true)
++        releaseOwnedTexture(scratch, "26834 clip-zone mask gaussian scratch")
++        PLog.i(SABRE_TAG, "IRIS_26834_CLIP_ZONE_MASK source=NORMAL_ONLY_SOURCE_NEIGHBORHOOD_CONFIDENCE longIncluded=false dilation=${edgeFalseColor26778.clipZoneDilation} sigma=${edgeFalseColor26778.clipZoneMaskSigma} gain=${edgeFalseColor26778.clipZoneMaskGain} clipStart=${edgeFalseColor26778.clipZoneClipStart}")
++        return mask
++    }
++
++    private fun applyClipZoneChromaInpaint26834(source: Int, mask: Int): Int {
++        val products = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++        val scratch = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++        GLES30.glUseProgram(sabreClipZoneProductsProgram26834)
++        bindTexture(sabreClipZoneProductsProgram26834, "uRgb", 0, source)
++        bindTexture(sabreClipZoneProductsProgram26834, "uMask", 1, mask)
++        uniform1f(sabreClipZoneProductsProgram26834, "uYFloor", edgeFalseColor26778.clipZoneYFloor)
++        draw(sabreClipZoneProductsProgram26834, width, height, intArrayOf(products))
++
++        val qw = (width + 3) / 4; val qh = (height + 3) / 4
++        val big = createTexture(qw, qh, GLES30.GL_RGBA16F, GLES30.GL_LINEAR)
++        val bigScratch = createTexture(qw, qh, GLES30.GL_RGBA16F, GLES30.GL_LINEAR)
++        GLES30.glUseProgram(sabreClipZoneDownsample4Program26834)
++        bindTexture(sabreClipZoneDownsample4Program26834, "uInput", 0, products)
++        uniform2i(sabreClipZoneDownsample4Program26834, "uInputSize", width, height)
++        draw(sabreClipZoneDownsample4Program26834, qw, qh, intArrayOf(big))
++        gaussianPass26834(big, bigScratch, qw, qh, edgeFalseColor26778.clipZoneSigmaBig / 4f, true)
++        gaussianPass26834(bigScratch, big, qw, qh, edgeFalseColor26778.clipZoneSigmaBig / 4f, false)
++
++        gaussianPass26834(products, scratch, width, height, edgeFalseColor26778.clipZoneSigmaSmall, true)
++        gaussianPass26834(scratch, products, width, height, edgeFalseColor26778.clipZoneSigmaSmall, false)
++
++        val output = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++        val ids = IntArray(1); GLES31.glGenBuffers(1, ids, 0); val statsBuffer = ids[0]; buffers += statsBuffer
++        var mapped = false
++        try {
++            val zero = ByteBuffer.allocateDirect(Int.SIZE_BYTES * 6).order(ByteOrder.nativeOrder()).apply { repeat(6){putInt(0)}; rewind() }
++            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
++            GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, Int.SIZE_BYTES * 6, zero, GLES31.GL_STREAM_READ)
++            GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, statsBuffer)
++            GLES31.glUseProgram(sabreClipZoneApplyProgram26834)
++            bindTexture(sabreClipZoneApplyProgram26834, "uRgb", 0, source)
++            bindTexture(sabreClipZoneApplyProgram26834, "uMask", 1, mask)
++            bindTexture(sabreClipZoneApplyProgram26834, "uSmall", 2, products)
++            bindTexture(sabreClipZoneApplyProgram26834, "uBigQuarter", 3, big)
++            uniform2i(sabreClipZoneApplyProgram26834, "uSize", width, height)
++            uniform2i(sabreClipZoneApplyProgram26834, "uQuarterSize", qw, qh)
++            uniform1f(sabreClipZoneApplyProgram26834, "uYFloor", edgeFalseColor26778.clipZoneYFloor)
++            uniform1f(sabreClipZoneApplyProgram26834, "uAThreshold", edgeFalseColor26778.clipZoneAThreshold)
++            GLES31.glBindImageTexture(0, output, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES30.GL_RGBA16F)
++            GLES31.glDispatchCompute((width + 7) / 8, (height + 7) / 8, 1)
++            GlesGpuScheduler.memoryBarrier()
++            GlesGpuCompletion.awaitSubmittedWork(label = "26834 clip-zone chroma inpaint", checkGlError = ::checkGlError)
++            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, statsBuffer)
++            val bb = GLES31.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER, 0, Int.SIZE_BYTES * 6, GLES31.GL_MAP_READ_BIT) as? ByteBuffer ?: error("26834 stats map failed")
++            mapped = true; val n=bb.order(ByteOrder.nativeOrder())
++            val zone=n.getInt(0); val changed=n.getInt(4); val sampled=n.getInt(8); val sum=n.getInt(12); val maxD=n.getInt(16); val coord=n.getInt(20)
++            check(GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)); mapped=false
++            val pixels=Math.multiplyExact(width,height); val zx=if(width>0) coord%width else 0; val zy=if(width>0) coord/width else 0
++            val mean=if(sampled>0) sum.toFloat()/sampled.toFloat()/1000f else 0f
++            val maxDelta=maxD.toFloat()/1000f
++            PLog.i(SABRE_TAG, "IRIS_26834_CLIP_ZONE_CHROMA zoneFraction=${zone.toFloat()/pixels.toFloat()} meanAbsChromaDelta=$mean maxAbsChromaDelta=$maxDelta pixelsChanged=$changed dngUntouched=true maxDeltaPixel=$zx,$zy M0BitExact=true lumaPreserved=true sigmaSmall=${edgeFalseColor26778.clipZoneSigmaSmall} sigmaBig=${edgeFalseColor26778.clipZoneSigmaBig} aThreshold=${edgeFalseColor26778.clipZoneAThreshold}")
++        } finally {
++            if(mapped){ GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,statsBuffer); GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER) }
++            GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER,0,0); GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,0)
++            if(buffers.remove(statsBuffer)) GLES31.glDeleteBuffers(1,intArrayOf(statsBuffer),0)
++            releaseOwnedTexture(products, "26834 small chroma gaussian")
++            releaseOwnedTexture(scratch, "26834 small chroma scratch")
++            releaseOwnedTexture(big, "26834 broad chroma gaussian")
++            releaseOwnedTexture(bigScratch, "26834 broad chroma scratch")
++        }
++        return output
++    }
++
+     private fun runEdgeFalseColorSuppressor26778(
+         sourceAndFinal: Int,
+         temporary: Int,
+@@ -6996,6 +7156,11 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
++        sabreClipZoneMaskDilateProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneMaskDilate26834, "iris_26834_clip_zone_mask_dilate")
++        sabreClipZoneGaussianProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneGaussian26834, "iris_26834_clip_zone_gaussian")
++        sabreClipZoneProductsProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneProducts26834, "iris_26834_clip_zone_products")
++        sabreClipZoneDownsample4Program26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneDownsample4Products26834, "iris_26834_clip_zone_downsample4")
++        sabreClipZoneApplyProgram26834 = linkComputeProgram(GlesMgcRawSabreShaders.clipZoneApply26834, "iris_26834_clip_zone_apply")
+         /* IRIS_26604_RETIRED_SEPARATE_SHORT_AUTHORITIES
+          * One-tunnel reconstruction makes every 26595/26600/26602 SHORT boundary/mask/protection/
+          * private-fuse program a duplicate owner. Keep their source/helpers only as rollback
+@@ -15400,15 +15565,23 @@ internal class GlesMgcRawSpatialStacker(
+         val fullWidth=Math.multiplyExact(width,2)
+         val fullHeight=Math.multiplyExact(height,2)
+         fun roundUp4(value:Int):Int = (value + 3) and -4
+-        /* IRIS_26828_HIGH_ZOOM_TRUSTED_INTERIOR_HALO
+-         * 26718/26752 used only +4 true-2x samples total. At extreme local zoom that put the
+-         * visible crop within ~1-3 sidecar texels of the reconstruction boundary, so one 2x2
+-         * residual cell could expand to tens of final pixels. Add six more texels per side; the
+-         * render/gain-map owners independently taper any remaining untrusted edge detail to exact
+-         * zero, exposing the native Sabre/VGN base. */
+-        val detailWidth=roundUp4((kotlin.math.ceil(fullWidth/highZoomSourceZoom.toDouble()).toInt()+16).coerceAtMost(fullWidth)).coerceAtLeast(4).coerceAtMost(fullWidth)
+-        val detailHeight=roundUp4((kotlin.math.ceil(fullHeight/highZoomSourceZoom.toDouble()).toInt()+16).coerceAtMost(fullHeight)).coerceAtLeast(4).coerceAtMost(fullHeight)
++        /* IRIS_26834_UNIVERSAL_HIGH_ZOOM_RECONSTRUCTION_HALO
++         * 26828 left only about eight detail texels per side. At 30x/120x those boundary texels
++         * expand into visible barcode bands. Every high-zoom detail reconstruction now reserves
++         * a target 32-detail-texel halo on every side. Render and gain-map owners reject the outer
++         * 16 texels and finish their transition by 24, so the visible crop begins beyond the
++         * transition. If the sensor lattice cannot provide that geometry, fail closed to native
++         * Sabre/VGN rather than publish reconstruction-edge detail. */
++        val visibleDetailWidth26834=kotlin.math.ceil(fullWidth/highZoomSourceZoom.toDouble()).toInt().coerceAtMost(fullWidth)
++        val visibleDetailHeight26834=kotlin.math.ceil(fullHeight/highZoomSourceZoom.toDouble()).toInt().coerceAtMost(fullHeight)
++        val detailWidth=roundUp4((visibleDetailWidth26834+64).coerceAtMost(fullWidth)).coerceAtLeast(4).coerceAtMost(fullWidth)
++        val detailHeight=roundUp4((visibleDetailHeight26834+64).coerceAtMost(fullHeight)).coerceAtLeast(4).coerceAtMost(fullHeight)
+         require((detailWidth and 3)==0 && (detailHeight and 3)==0)
++        val trustedHaloX26834=0.5f*(detailWidth-visibleDetailWidth26834).toFloat()
++        val trustedHaloY26834=0.5f*(detailHeight-visibleDetailHeight26834).toFloat()
++        require(trustedHaloX26834>=24.0f && trustedHaloY26834>=24.0f) {
++            "26834 high-zoom detail halo insufficient: halo=${trustedHaloX26834},${trustedHaloY26834} zoom=$highZoomSourceZoom"
++        }
+         val originX=(fullWidth-detailWidth)/2
+         val originY=(fullHeight-detailHeight)/2
+         require((originX and 1)==0 && (originY and 1)==0)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+index 14dc9960e1355b27edcccfcd731fb504c886aa6e..5388ca925c2ffffc8596cdb79c2e4a378bb91690 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisMotionSettings.java
+@@ -81,6 +81,27 @@ public final class IrisMotionSettings {
+         public float outlierLo = 0.03f;
+         @Tunable(title = "Edge False Color Outlier High", category = "Demosaic", description = "Claude uOutlierHi.", min = 0f, max = 0.5f, step = 0.001f, defaultValue = 0.10f)
+         public float outlierHi = 0.10f;
++        /* IRIS_26834_CLIP_ZONE_CHROMA_INPAINT_TUNABLES
++         * Final JPEG-only structural chroma continuity pass. These values do not change Sabre RGB,
++         * temporal weights, VGN, DNG, alignment, LONG ownership, tone or gamut. */
++        @Tunable(title = "Clip-Zone Chroma Inpaint", category = "Demosaic", description = "Enable final valid-weighted chroma inpainting only in RAW headroom-loss zones.", defaultValue = 1f)
++        public boolean clipZoneEnabled = true;
++        @Tunable(title = "Clip-Zone Clip Start", category = "Demosaic", description = "Relative source-headroom start; 0.9925 reproduces the existing Sabre clip-start evidence.", min = 0.97f, max = 0.999f, step = 0.0005f, defaultValue = 0.9925f)
++        public float clipZoneClipStart = 0.9925f;
++        @Tunable(title = "Clip-Zone Dilation", category = "Demosaic", description = "Mask dilation radius in pixels.", min = 0f, max = 4f, step = 1f, defaultValue = 2f)
++        public float clipZoneDilation = 2f;
++        @Tunable(title = "Clip-Zone Mask Sigma", category = "Demosaic", description = "Gaussian sigma for the dilated clip-zone mask.", min = 0.25f, max = 3f, step = 0.25f, defaultValue = 1f)
++        public float clipZoneMaskSigma = 1f;
++        @Tunable(title = "Clip-Zone Mask Gain", category = "Demosaic", description = "Gain applied after mask blur.", min = 0f, max = 3f, step = 0.05f, defaultValue = 1.6f)
++        public float clipZoneMaskGain = 1.6f;
++        @Tunable(title = "Clip-Zone Small Sigma", category = "Demosaic", description = "Local valid-chroma Gaussian sigma in full-resolution pixels.", min = 1f, max = 6f, step = 0.25f, defaultValue = 3f)
++        public float clipZoneSigmaSmall = 3f;
++        @Tunable(title = "Clip-Zone Big Sigma", category = "Demosaic", description = "Broad fallback valid-chroma Gaussian sigma in full-resolution pixels.", min = 4f, max = 20f, step = 0.5f, defaultValue = 10f)
++        public float clipZoneSigmaBig = 10f;
++        @Tunable(title = "Clip-Zone Y Floor", category = "Demosaic", description = "Luma floor for normalized chroma.", min = 0.0001f, max = 0.01f, step = 0.0001f, defaultValue = 0.001f)
++        public float clipZoneYFloor = 0.001f;
++        @Tunable(title = "Clip-Zone Local Support", category = "Demosaic", description = "Local-support denominator that transitions to the broad fallback.", min = 0.05f, max = 0.75f, step = 0.01f, defaultValue = 0.25f)
++        public float clipZoneAThreshold = 0.25f;
+         public static Snapshot current(boolean allEdges26792) {
+             EdgeFalseColorTunables values = new EdgeFalseColorTunables();
+             TunableInjector.inject(values);
+@@ -93,15 +114,23 @@ public final class IrisMotionSettings {
+             float oLo = allEdges26792 ? 0.025f : clamp(values.outlierLo, 0f, 0.25f);
+             float oHi = allEdges26792 ? 0.080f : Math.max(oLo + 0.0001f, clamp(values.outlierHi, 0f, 0.5f));
+             return new Snapshot(enabled, allEdges26792, clamp(values.noiseFloor, 0f, 0.02f), cLo, cHi, oLo, oHi,
+-                    demosaicSharpness, allEdges26792 ? "VISIBLE_ALL_EDGES_26792" : "VISIBLE_CURRENT_26792");
++                    demosaicSharpness, allEdges26792 ? "VISIBLE_ALL_EDGES_26792" : "VISIBLE_CURRENT_26792",
++                    values.clipZoneEnabled, clamp(values.clipZoneClipStart, 0.97f, 0.999f),
++                    clamp(values.clipZoneDilation, 0f, 4f), clamp(values.clipZoneMaskSigma, 0.25f, 3f),
++                    clamp(values.clipZoneMaskGain, 0f, 3f), clamp(values.clipZoneSigmaSmall, 1f, 6f),
++                    clamp(values.clipZoneSigmaBig, 4f, 20f), clamp(values.clipZoneYFloor, 0.0001f, 0.01f),
++                    clamp(values.clipZoneAThreshold, 0.05f, 0.75f));
+         }
+         public static Snapshot current() { return current(false); }
+-        public static Snapshot defaults() { return new Snapshot(true, false, 0.002f, 2.0f, 3.5f, 0.03f, 0.10f, 1.0f, "DEFAULTS"); }
++        public static Snapshot defaults() { return new Snapshot(true, false, 0.002f, 2.0f, 3.5f, 0.03f, 0.10f, 1.0f, "DEFAULTS", true, 0.9925f, 2f, 1f, 1.6f, 3f, 10f, 0.001f, 0.25f); }
+         private static float clamp(float value, float min, float max) { if (!Float.isFinite(value)) return min; return Math.max(min, Math.min(max, value)); }
+         public static final class Snapshot {
+             public final boolean enabled, allEdges26792; public final float noiseFloor, contrastLo, contrastHi, outlierLo, outlierHi, demosaicSharpness; public final String source;
+-            Snapshot(boolean enabled, boolean allEdges26792, float noiseFloor, float contrastLo, float contrastHi, float outlierLo, float outlierHi, float demosaicSharpness, String source) {
++            public final boolean clipZoneEnabled; public final float clipZoneClipStart, clipZoneDilation, clipZoneMaskSigma, clipZoneMaskGain, clipZoneSigmaSmall, clipZoneSigmaBig, clipZoneYFloor, clipZoneAThreshold;
++            Snapshot(boolean enabled, boolean allEdges26792, float noiseFloor, float contrastLo, float contrastHi, float outlierLo, float outlierHi, float demosaicSharpness, String source,
++                     boolean clipZoneEnabled, float clipZoneClipStart, float clipZoneDilation, float clipZoneMaskSigma, float clipZoneMaskGain, float clipZoneSigmaSmall, float clipZoneSigmaBig, float clipZoneYFloor, float clipZoneAThreshold) {
+                 this.enabled = enabled; this.allEdges26792 = allEdges26792; this.noiseFloor = noiseFloor; this.contrastLo = contrastLo; this.contrastHi = contrastHi; this.outlierLo = outlierLo; this.outlierHi = outlierHi; this.demosaicSharpness = demosaicSharpness; this.source = source;
++                this.clipZoneEnabled = clipZoneEnabled; this.clipZoneClipStart = clipZoneClipStart; this.clipZoneDilation = clipZoneDilation; this.clipZoneMaskSigma = clipZoneMaskSigma; this.clipZoneMaskGain = clipZoneMaskGain; this.clipZoneSigmaSmall = clipZoneSigmaSmall; this.clipZoneSigmaBig = clipZoneSigmaBig; this.clipZoneYFloor = clipZoneYFloor; this.clipZoneAThreshold = clipZoneAThreshold;
+             }
+         }
+     }
+diff --git a/app/version.properties b/app/version.properties
+index 913360febbc47f53eed2a6c5a6787fca3e4d75cf..74fc8c9e008b424447c17e97e5f589e29e64eddc 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726833
+-VERSION_BUILD=26833
++VERSION_NAME=0.9726834
++VERSION_BUILD=26834
