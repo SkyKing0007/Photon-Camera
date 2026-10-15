@@ -1,0 +1,544 @@
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 3b58f0a5c1bfd2e993b3cbb73211abc407a4cd6c..3aab2617cf77cd97fdc2406ce7303ae4248c81a8 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -444,6 +444,63 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+ }
+ 
+ 
++/* IRIS_26836_SR_FINAL_CLIP_ZONE_CHROMA
++ * Claude's native-grid final chroma decision is authoritative for SR. The native R16F mask is
++ * bilinearly sampled on the true-2x grid. M==0 leaves the RGB16F file bytes untouched. For M>0,
++ * true-2x WB-linear luma/detail is preserved while chroma moves toward the already-corrected final
++ * native guide; direct-CFA never becomes a chroma owner. */
++extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_processing_IrisTrue2xSrNative_applyFinalNativeClipZoneChromaGuide26836(
++        JNIEnv*e,jclass,jstring truePath,jint trueW,jint trueH,jobject nativeRgba,jint nativeW,jint nativeH,
++        jobject nativeMask,jfloatArray wbArray,jfloat yFloor){
++    if(!truePath||!nativeRgba||!nativeMask||!wbArray||trueW<=0||trueH<=0||nativeW<=0||nativeH<=0||
++       e->GetArrayLength(wbArray)!=3||!std::isfinite(yFloor)||yFloor<=0.f)return JNI_FALSE;
++    auto*guide=(const uint16_t*)e->GetDirectBufferAddress(nativeRgba);
++    auto*mask=(const uint16_t*)e->GetDirectBufferAddress(nativeMask);
++    const jlong guideNeed=(jlong)nativeW*nativeH*4*(jlong)sizeof(uint16_t);
++    const jlong maskNeed=(jlong)nativeW*nativeH*(jlong)sizeof(uint16_t);
++    if(!guide||!mask||e->GetDirectBufferCapacity(nativeRgba)<guideNeed||e->GetDirectBufferCapacity(nativeMask)<maskNeed)return JNI_FALSE;
++    float wb[3];e->GetFloatArrayRegion(wbArray,0,3,wb);if(e->ExceptionCheck())return JNI_FALSE;
++    for(int k=0;k<3;k++)if(!std::isfinite(wb[k])||wb[k]<=0.f)return JNI_FALSE;
++    U tp(e,truePath);if(!tp.c)return JNI_FALSE;int fd=open(tp.c,O_RDWR);if(fd<0)return JNI_FALSE;
++    struct stat st{};const uint64_t expected=(uint64_t)trueW*(uint64_t)trueH*6ull;
++    if(fstat(fd,&st)!=0||(uint64_t)st.st_size!=expected){close(fd);return JNI_FALSE;}
++    auto readExact=[](int fd,void*dst,size_t bytes,off_t off)->bool{auto*p=(uint8_t*)dst;size_t d=0;while(d<bytes){ssize_t n=pread(fd,p+d,bytes-d,off+(off_t)d);if(n<=0)return false;d+=(size_t)n;}return true;};
++    auto writeExact=[](int fd,const void*src,size_t bytes,off_t off)->bool{const auto*p=(const uint8_t*)src;size_t d=0;while(d<bytes){ssize_t n=pwrite(fd,p+d,bytes-d,off+(off_t)d);if(n<=0)return false;d+=(size_t)n;}return true;};
++    auto sample=[&](float sx,float sy,float out[3],float& m){
++        sx=clampf(sx,0.f,(float)(nativeW-1));sy=clampf(sy,0.f,(float)(nativeH-1));
++        int x0=(int)floorf(sx),y0=(int)floorf(sy),x1=std::min(x0+1,nativeW-1),y1=std::min(y0+1,nativeH-1);
++        float fx=sx-x0,fy=sy-y0;
++        auto mh=[&](int x,int y){return iris26564::halfToFloat(mask[(size_t)y*nativeW+x]);};
++        float m00=mh(x0,y0),m10=mh(x1,y0),m01=mh(x0,y1),m11=mh(x1,y1);
++        m=(m00+(m10-m00)*fx)+((m01+(m11-m01)*fx)-(m00+(m10-m00)*fx))*fy;m=clampf(m,0.f,1.f);
++        for(int k=0;k<3;k++){
++            auto gh=[&](int x,int y){return iris26564::halfToFloat(guide[((size_t)y*nativeW+x)*4+k]);};
++            float a=gh(x0,y0)+(gh(x1,y0)-gh(x0,y0))*fx,b=gh(x0,y1)+(gh(x1,y1)-gh(x0,y1))*fx;out[k]=a+(b-a)*fy;
++        }
++    };
++    std::vector<uint16_t> row((size_t)trueW*3);bool ok=true;
++    for(int y=0;ok&&y<trueH;y++){
++        const size_t bytes=(size_t)trueW*3*sizeof(uint16_t);off_t off=(off_t)y*(off_t)bytes;if(!readExact(fd,row.data(),bytes,off)){ok=false;break;}
++        for(int x=0;x<trueW;x++){
++            float sx=((float)x+0.5f)*(float)nativeW/(float)trueW-0.5f,sy=((float)y+0.5f)*(float)nativeH/(float)trueH-0.5f;
++            float gcam[3],m=0.f;sample(sx,sy,gcam,m);if(!(m>0.f))continue;
++            size_t q=(size_t)x*3;float srcWb[3],guideWb[3];bool finite=true;
++            for(int k=0;k<3;k++){float c=iris26564::halfToFloat(row[q+k]);finite=finite&&std::isfinite(c)&&std::isfinite(gcam[k]);srcWb[k]=c*wb[k];guideWb[k]=gcam[k]*wb[k];}
++            if(!finite){ok=false;break;}
++            float ySrc=0.25f*srcWb[0]+0.50f*srcWb[1]+0.25f*srcWb[2];
++            float yGuide=0.25f*guideWb[0]+0.50f*guideWb[1]+0.25f*guideWb[2];float ycGuide=std::max(yGuide,yFloor),ycSrc=std::max(ySrc,yFloor);
++            float cSrc[2]={(srcWb[0]-srcWb[1])/ycSrc,(srcWb[2]-srcWb[1])/ycSrc};
++            float cGuide[2]={(guideWb[0]-guideWb[1])/ycGuide,(guideWb[2]-guideWb[1])/ycGuide};
++            float cp0=cSrc[0]+(cGuide[0]-cSrc[0])*m,cp1=cSrc[1]+(cGuide[1]-cSrc[1])*m;
++            float dR=cp0*ycSrc,dB=cp1*ycSrc,g=ySrc-0.25f*(dR+dB);float outWb[3]={g+dR,g,g+dB};
++            for(int k=0;k<3;k++)row[q+k]=iris26564::floatToHalf(std::max(outWb[k]/wb[k],0.f));
++        }
++        if(ok&&!writeExact(fd,row.data(),bytes,off))ok=false;
++    }
++    int syncRc=ok?fsync(fd):-1;close(fd);return (ok&&syncRc==0)?JNI_TRUE:JNI_FALSE;
++}
++
++
+ /* IRIS_26573_CROSS_FRAME_TRUE_DETAIL_LUMA_OWNER
+  * Native Sabre Resolve + VGN remains the sole RGB/chroma/highlight and low-frequency identity owner.
+  * Direct-CFA true2x contributes only bounded temporally-proven zero-mean 2x2 luminance microstructure. The CPU
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 02703c5f09403c3e665c052d358cf8c055fb5d1a..13c89d25e0b599754240ad02b0b404c5924ad750 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -5549,6 +5549,10 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26836_WB_LINEAR_CLIP_ZONE_PRODUCTS
++     * Claude contract: camera RGB is converted to the exact calculation-WB domain before Y/c1/c2.
++     * M is unchanged NORMAL-only RAW provenance; no LONG, post-RGB color, or per-channel validity
++     * imbalance participates in the mask or donor weights. */
+     val clipZoneProducts26834 = """
+         #version 300 es
+         precision highp float;
+@@ -5556,17 +5560,14 @@ internal object GlesMgcRawSabreShaders {
+         uniform sampler2D uRgb;
+         uniform sampler2D uMask;
+         uniform float uYFloor;
++        uniform vec3 uCalculationWb;
+         out vec4 oProducts;
+         void main(){
+-            ivec2 p=ivec2(gl_FragCoord.xy); vec3 rgb=texelFetch(uRgb,p,0).rgb;
++            ivec2 p=ivec2(gl_FragCoord.xy); vec3 cameraRgb=texelFetch(uRgb,p,0).rgb;
++            vec3 rgb=cameraRgb*uCalculationWb;
+             float m=texelFetch(uMask,p,0).r; float y=(rgb.r+2.0*rgb.g+rgb.b)*0.25;
+             float yc=max(y,uYFloor); vec2 c=vec2(rgb.r-rgb.g,rgb.b-rgb.g)/yc;
+-            float w=(1.0-m)*(1.0-m);
+-            /* IRIS_26835_COHERENCE_GATED_CLIP_ZONE_CHROMA
+-             * Preserve the 2-D chroma vector as one object. Alpha carries the weighted squared
+-             * vector magnitude so blurred neighborhoods can prove coherence instead of mixing
+-             * independent R-G and B-G evidence into a synthetic hue. */
+-            oProducts=vec4(w*c,w,w*dot(c,c));
++            float w=(1.0-m)*(1.0-m); oProducts=vec4(w*c,w,0.0);
+         }
+     """.trimIndent()
+ 
+@@ -5585,6 +5586,10 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26836_WB_LINEAR_FINAL_CLIP_ZONE_CHROMA
++     * TRUE final native chroma owner is invoked by PhotonMotionMgc1271Bridge only after residual
++     * chroma denoise and IRIS_26728. Output starts as a bit-copy of input; M==0 returns without
++     * imageStore. For M>0, all Claude chroma math is WB-linear, then inverse-WB returns camera RGB. */
+     val clipZoneApply26834 = """
+         #version 310 es
+         precision highp float;
+@@ -5598,76 +5603,28 @@ internal object GlesMgcRawSabreShaders {
+         uniform ivec2 uQuarterSize;
+         uniform float uYFloor;
+         uniform float uAThreshold;
+-        uniform float uNeutralRms;
+-        uniform float uCoherenceThreshold;
+-        uniform float uDirectionCosThreshold;
+-        uniform float uSectorSupportThreshold;
+-        uniform float uSectorOffsetPx;
++        uniform vec3 uCalculationWb;
+         layout(rgba16f,binding=0) writeonly uniform highp image2D uOut;
+-        layout(std430,binding=0) buffer Stats26834 {
+-            uint zone; uint changed; uint sampled; uint sumDeltaMilli; uint maxDeltaMilli; uint maxCoord;
+-            uint neutralFallback; uint colorDonor; uint mixedRejected; uint broadVeto;
+-        } stats;
+-        struct Field26835 { vec2 mean; float support; float rms; float coherence; };
+-        Field26835 field26835(vec4 v){
+-            Field26835 f; f.support=max(v.b,0.0);
+-            f.mean=f.support>1.0e-3 ? v.rg/f.support : vec2(0.0);
+-            float e2=f.support>1.0e-3 ? max(v.a/f.support,0.0) : 0.0;
+-            f.rms=sqrt(e2);
+-            f.coherence=f.rms>1.0e-5 ? clamp(length(f.mean)/f.rms,0.0,1.0) : 1.0;
+-            return f;
+-        }
+-        vec2 unit26835(vec2 v){ float n=length(v); return n>1.0e-6 ? v/n : vec2(0.0); }
+-        bool agrees26835(Field26835 f,vec2 dir,float donorMag){
+-            if(f.support<uSectorSupportThreshold || f.rms<uNeutralRms || f.coherence<uCoherenceThreshold) return false;
+-            vec2 sd=unit26835(f.mean); float mag=length(f.mean);
+-            float ratio=min(mag,donorMag)/max(max(mag,donorMag),1.0e-5);
+-            return dot(sd,dir)>=uDirectionCosThreshold && ratio>=0.45;
+-        }
++        layout(std430,binding=0) buffer Stats26836 { uint zone; uint changed; uint sampled; uint sumDeltaMilli; uint maxDeltaMilli; uint maxCoord; } stats;
++        vec2 safeFill(vec4 v){ return v.b>1.0e-3 ? v.rg/v.b : vec2(0.0); }
+         void main(){
+             ivec2 p=ivec2(gl_GlobalInvocationID.xy); if(any(greaterThanEqual(p,uSize))) return;
+-            vec4 src=texelFetch(uRgb,p,0); float m=texelFetch(uMask,p,0).r;
+-            if(m<=0.0){ imageStore(uOut,p,src); return; }
+-            float y=(src.r+2.0*src.g+src.b)*0.25; float yc=max(y,uYFloor);
+-            vec2 c=vec2(src.r-src.g,src.b-src.g)/yc;
+-            Field26835 local=field26835(texelFetch(uSmall,p,0));
++            float m=texelFetch(uMask,p,0).r;
++            /* Exact no-op path: uOut was bit-copied from uRgb before dispatch. */
++            if(m<=0.0) return;
++            vec4 src=texelFetch(uRgb,p,0); vec3 rgb=src.rgb*uCalculationWb;
++            float y=(rgb.r+2.0*rgb.g+rgb.b)*0.25; float yc=max(y,uYFloor);
++            vec2 c=vec2(rgb.r-rgb.g,rgb.b-rgb.g)/yc;
++            vec4 sm=texelFetch(uSmall,p,0);
+             vec2 uv=(vec2(p)+vec2(0.5))/vec2(uSize);
+-            Field26835 broad=field26835(texture(uBigQuarter,uv));
+-            bool neutralLocal=local.rms<uNeutralRms || length(local.mean)<0.5*uNeutralRms;
+-            bool localCoherent=local.support>=uAThreshold && local.rms>=uNeutralRms && local.coherence>=uCoherenceThreshold;
+-            vec2 donorDir=unit26835(local.mean); float donorMag=length(local.mean);
+-            int off=int(clamp(round(uSectorOffsetPx),1.0,24.0));
+-            Field26835 leftF=field26835(texelFetch(uSmall,clamp(p+ivec2(-off,0),ivec2(0),uSize-ivec2(1)),0));
+-            Field26835 rightF=field26835(texelFetch(uSmall,clamp(p+ivec2(off,0),ivec2(0),uSize-ivec2(1)),0));
+-            Field26835 upF=field26835(texelFetch(uSmall,clamp(p+ivec2(0,-off),ivec2(0),uSize-ivec2(1)),0));
+-            Field26835 downF=field26835(texelFetch(uSmall,clamp(p+ivec2(0,off),ivec2(0),uSize-ivec2(1)),0));
+-            bool l=localCoherent && agrees26835(leftF,donorDir,donorMag);
+-            bool r=localCoherent && agrees26835(rightF,donorDir,donorMag);
+-            bool u=localCoherent && agrees26835(upF,donorDir,donorMag);
+-            bool d=localCoherent && agrees26835(downF,donorDir,donorMag);
+-            int sectorCount=(l?1:0)+(r?1:0)+(u?1:0)+(d?1:0);
+-            bool multiSector=(l&&r)||(u&&d)||sectorCount>=3;
+-            bool broadAgrees=broad.support>=uSectorSupportThreshold && broad.rms>=uNeutralRms &&
+-                broad.coherence>=uCoherenceThreshold && dot(unit26835(broad.mean),donorDir)>=uDirectionCosThreshold;
+-            /* Broad sigma-10 evidence is a veto/support check only. It can never establish hue. */
+-            bool colorAuthority=localCoherent && multiSector && broadAgrees;
+-            vec2 cp;
+-            if(colorAuthority){
+-                float along=max(dot(c,donorDir),0.0);
+-                vec2 orthogonal=c-donorDir*dot(c,donorDir);
+-                float targetAlong=mix(along,donorMag,m);
+-                cp=donorDir*targetAlong+orthogonal*(1.0-m);
+-                atomicAdd(stats.colorDonor,1u);
+-            } else {
+-                /* Fail closed: clipping only removes unsupported chroma; it cannot synthesize hue. */
+-                cp=c*(1.0-m);
+-                atomicAdd(stats.neutralFallback,1u);
+-                if(!neutralLocal && local.support>=uAThreshold){ atomicAdd(stats.mixedRejected,1u); }
+-                if(localCoherent && multiSector && !broadAgrees){ atomicAdd(stats.broadVeto,1u); }
+-            }
++            vec4 bg=texture(uBigQuarter,uv);
++            float a=clamp(sm.b/max(uAThreshold,1.0e-4),0.0,1.0);
++            vec2 fill=mix(safeFill(bg),safeFill(sm),a);
++            vec2 cp=mix(c,fill,m);
+             float dR=cp.x*yc, dB=cp.y*yc;
+-            float g=y-0.25*(dR+dB); vec4 dst=vec4(g+dR,g,g+dB,src.a);
+-            imageStore(uOut,p,dst);
++            float g=y-0.25*(dR+dB); vec3 wbDst=vec3(g+dR,g,g+dB);
++            vec3 cameraDst=wbDst/max(uCalculationWb,vec3(1.0e-6));
++            imageStore(uOut,p,vec4(cameraDst,src.a));
+             float delta=0.5*(abs(cp.x-c.x)+abs(cp.y-c.y));
+             if(m>0.3) atomicAdd(stats.zone,1u);
+             if(delta>1.0e-7) atomicAdd(stats.changed,1u);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 6e869805f18c125b93e26f26a3da989c8b370e6d..de9e566a847cb63599a14370bb3c24f10c1f987d 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2325,6 +2325,7 @@ internal class GlesMgcRawSpatialStacker(
+          */
+         val highZoomEvidence26718 = ArrayList<True2xFrameEvidence>()
+         var exportedTexture = 0
++        var exportedClipZoneMask26836 = 0
+         /* IRIS_26604_CONTINUOUS_ONE_TUNNEL_TELEMETRY
+          * No private SHORT texture, mask, mean or accumulator survives. These legacy-named booleans
+          * remain only for the existing bridge contract: "maskGenerated" now means the common Sabre
+@@ -3536,24 +3537,21 @@ internal class GlesMgcRawSpatialStacker(
+                         "rgbScaleOnly=true exactRgbRatioPreserved=true hueAuthority=false chromaAuthority=false",
+                 )
+             }
+-            /* IRIS_26834_CLIP_ZONE_CHROMA_INPAINT_FINAL_OWNER
+-             * Exact insertion point remains frozen from successful 26834: after extended-HDR
+-             * restoration and 26833 LONG scalar luma, before nativeHdrAuthority26601/tone/UHDR.
+-             * IRIS_26835_COHERENCE_GATED_CLIP_ZONE_CHROMA changes donor policy only: non-neutral
+-             * hue requires coherent 2-D, multi-sector agreement; otherwise clipped chroma fades
+-             * toward neutral and broad sigma-10 evidence can never establish hue by itself. */
++            /* IRIS_26836_RETIRE_PRE_26728_CLIP_INPAINT
++             * Claude requires this mask to survive residual chroma denoise and 26728. The stacker
++             * therefore transfers ONLY the R16F NORMAL-headroom mask; it performs zero RGB/chroma
++             * modification here. PhotonMotionMgc1271Bridge is the single final chroma owner. */
+             if (clipZoneMask26834 != 0) {
+                 if (exportedTexture != 0 && gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F) {
+-                    val inpainted26834 = applyClipZoneChromaInpaint26834(exportedTexture, clipZoneMask26834)
+-                    GLES30.glDeleteTextures(1, intArrayOf(exportedTexture), 0)
+-                    exportedTexture = inpainted26834
+-                    check(textures.remove(inpainted26834)) { "26834 final inpaint output is not owned" }
+-                    textureSpecs.remove(inpainted26834)
++                    check(textures.remove(clipZoneMask26834)) { "26836 clip-zone mask is not owned" }
++                    textureSpecs.remove(clipZoneMask26834)
++                    exportedClipZoneMask26836 = clipZoneMask26834
++                    clipZoneMask26834 = 0
++                    PLog.i(SABRE_TAG, "IRIS_26836_CLIP_ZONE_MASK_HANDOFF stage=POST_VGN_PRE_26728 maskOnly=true rgbModified=false longIncluded=false")
+                 } else {
+-                    PLog.i(SABRE_TAG, "IRIS_26834_CLIP_ZONE_CHROMA skipped=true reason=NO_FINAL_RGBA16F_JPEG_CARRIER dngUntouched=true")
++                    releaseOwnedTexture(clipZoneMask26834, "26836 unused clip-zone mask")
++                    clipZoneMask26834 = 0
+                 }
+-                releaseOwnedTexture(clipZoneMask26834, "26834 final clip-zone mask")
+-                clipZoneMask26834 = 0
+             }
+             /* IRIS_26601_SHARED_NATIVE_HDR_AUTHORITY
+              * Resolve/VGN above consumed only NORMAL plus independently validated SHORT color/radiance.
+@@ -3718,6 +3716,9 @@ internal class GlesMgcRawSpatialStacker(
+                         height = height,
+                         samplesPerPixel = 4,
+                         storage = gpuLinearRgbStorage,
++                        clipZoneMaskTextureId26836 = exportedClipZoneMask26836,
++                        clipZoneMaskWidth26836 = if (exportedClipZoneMask26836 != 0) width else 0,
++                        clipZoneMaskHeight26836 = if (exportedClipZoneMask26836 != 0) height else 0,
+                     )
+                 },
+                 lensShadingCorrectionApplied = hasLensShading(),
+@@ -3818,6 +3819,9 @@ internal class GlesMgcRawSpatialStacker(
+                 if (exportedTexture != 0) {
+                     GLES30.glDeleteTextures(1, intArrayOf(exportedTexture), 0)
+                 }
++                if (exportedClipZoneMask26836 != 0) {
++                    GLES30.glDeleteTextures(1, intArrayOf(exportedClipZoneMask26836), 0)
++                }
+             }
+         }
+     }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+index 091e7b56e682b8d81e7309694a46b642e762baff..da2e046fcd4ec1a440da7bd80c63cebffe1fb231 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/RawStackContracts.kt
+@@ -17,6 +17,12 @@ data class GpuLinearRgbSource(
+     val samplesPerPixel: Int = 4,
+     val stackCompletionTimeline: GpuStackCompletionTimeline? = null,
+     val storage: GpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16UI,
++    /* IRIS_26836_FINAL_CLIP_ZONE_MASK_HANDOFF
++     * Read-only NORMAL-frame clip/headroom provenance. The stacker transfers this R16F texture
++     * without modifying RGB; the bridge consumes it only after residual chroma + 26728. */
++    val clipZoneMaskTextureId26836: Int = 0,
++    val clipZoneMaskWidth26836: Int = 0,
++    val clipZoneMaskHeight26836: Int = 0,
+ )
+ 
+ data class GpuBayerSource(
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
+index 3e9e7a45409adcda218b35f1496c829eca1de2a7..f751bdc15142bf3a6de20f0d1b33ce6e87eef7dd 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisTrue2xSrNative.java
+@@ -62,6 +62,15 @@ public final class IrisTrue2xSrNative {
+             String true2xRgb16fPath, int true2xWidth, int true2xHeight,
+             String nativeVgnRgb16fPath, int nativeWidth, int nativeHeight);
+ 
++    /** IRIS_26836_SR_FINAL_CLIP_ZONE_CHROMA
++     * After the native carrier has passed residual chroma + 26728 + the WB-linear Claude pass,
++     * propagate only that final native chroma into true-2x where bilinearly upsampled M > 0.
++     * True-2x WB-linear luma/detail is preserved exactly; M==0 file pixels are byte-untouched. */
++    public static native boolean applyFinalNativeClipZoneChromaGuide26836(
++            String true2xRgb16fPath, int true2xWidth, int true2xHeight,
++            ByteBuffer nativeRgba16f, int nativeWidth, int nativeHeight,
++            ByteBuffer nativeMaskR16f, float[] calculationWhiteBalance, float yFloor);
++
+     /**
+      * Build one bounded RGBA16F render tile whose RGB/chroma/highlight authority is exclusively
+      * the native Sabre/VGN guide. Direct-CFA true2x contributes only a phase/support-gated scalar
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index c86409062532dca8c589eb01484cead6497ca707..5395483c2ba4f9bf657111ab17b7e77e109aba85 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -9,11 +9,13 @@ import android.opengl.EGLDisplay
+ import android.opengl.EGLSurface
+ import android.opengl.GLES20
+ import android.opengl.GLES30
++import android.opengl.GLES31
+ import android.os.Build
+ import android.util.Half
+ import com.hinnka.mycamera.model.SafeImage
+ import com.hinnka.mycamera.processor.GlesGpuScheduler
+ import com.hinnka.mycamera.processor.GlesMgcRawFusion
++import com.hinnka.mycamera.processor.GlesMgcRawSabreShaders
+ import com.hinnka.mycamera.processor.GpuLinearRgbStorage
+ import com.hinnka.mycamera.processor.MgcSabreKernelTuning
+ import com.hinnka.mycamera.processor.RawBurstFrameRole
+@@ -102,6 +104,7 @@ object PhotonMotionMgc1271Bridge {
+         var halfBuffer: ByteBuffer? = null
+         var iris26826SharedCarrierForCleanup: MotionV2SharedRgba16fCarrier? = null
+         var resultTexture = 0
++        var clipZoneMaskTexture26836 = 0
+         var true2xLinearRgbPathForCleanup: String? = null
+         var true2xNativeVgnGuidePathForCleanup: String? = null
+         var true2xPhaseSupportPathForCleanup: String? = null
+@@ -691,6 +694,11 @@ object PhotonMotionMgc1271Bridge {
+             requireParity(gpu.storage == GpuLinearRgbStorage.RGBA16F && gpu.samplesPerPixel == 4,
+                 "unexpected GPU RGB storage=${gpu.storage} samples=${gpu.samplesPerPixel}")
+             requireParity(gpu.textureId != 0, "zero GPU RGB texture")
++            clipZoneMaskTexture26836 = gpu.clipZoneMaskTextureId26836
++            if (clipZoneMaskTexture26836 != 0) {
++                requireParity(gpu.clipZoneMaskWidth26836 == size.x && gpu.clipZoneMaskHeight26836 == size.y,
++                    "26836 clip-zone mask geometry=${gpu.clipZoneMaskWidth26836}x${gpu.clipZoneMaskHeight26836} expected=${size.x}x${size.y}")
++            }
+             requireParity(stacked.mergedFrameCount >= 1, "mergedFrameCount=${stacked.mergedFrameCount}")
+             /* IRIS_26833_LONG_ZERO_RGB_SUPPORT_PARITY
+              * RGB/chroma/noise support is NORMAL-only. SHADOW_LONG remains scheduled but publishes
+@@ -947,6 +955,39 @@ object PhotonMotionMgc1271Bridge {
+             } else {
+                 forceOpaqueHalfAlpha(denoiseBuffer, size.x, size.y)
+             }
++            /* IRIS_26836_TRUE_FINAL_CLIP_ZONE_CHROMA_OWNER
++             * Claude's required insertion point: residual chroma denoise and 26728 are complete;
++             * tone/gamut/render have not begun. Camera RGB is converted to the exact calculation-WB
++             * domain inside the pass, then inverse-WB returns the existing camera-RGB contract. */
++            if (!parameters.irisNightActive && clipZoneMaskTexture26836 != 0) {
++                val calculationWb26836 = calculationWhiteBalance26836(wb)
++                applyIris26836FinalClipZoneChroma(
++                    denoiseBuffer, size.x, size.y, clipZoneMaskTexture26836,
++                    calculationWb26836, edgeFalseColor26778,
++                )
++                if (resultTrue2xRenderRgbPath != null && stacked.true2xWidth > 0 && stacked.true2xHeight > 0) {
++                    val maskR16f26836 = readR16f26836(clipZoneMaskTexture26836, size.x, size.y)
++                    try {
++                        requireParity(
++                            com.particlesdevs.photoncamera.processing.IrisTrue2xSrNative.applyFinalNativeClipZoneChromaGuide26836(
++                                resultTrue2xRenderRgbPath, stacked.true2xWidth, stacked.true2xHeight,
++                                denoiseBuffer, size.x, size.y, maskR16f26836, calculationWb26836,
++                                edgeFalseColor26778.clipZoneYFloor,
++                            ),
++                            "26836 true2x bilinear-mask final chroma handoff failed",
++                        )
++                        PLog.i(TAG, "IRIS_26836_SR_CLIP_ZONE_CHROMA maskUpsample=BILINEAR nativeFinalChromaOwner=true true2xLumaPreserved=true dngUntouched=true")
++                    } finally {
++                        LargeDirectBuffer.free(maskR16f26836)
++                    }
++                }
++                GLES30.glDeleteTextures(1, intArrayOf(clipZoneMaskTexture26836), 0)
++                clipZoneMaskTexture26836 = 0
++                checkGl("delete 26836 final clip-zone mask")
++            } else if (clipZoneMaskTexture26836 != 0) {
++                GLES30.glDeleteTextures(1, intArrayOf(clipZoneMaskTexture26836), 0)
++                clipZoneMaskTexture26836 = 0
++            }
+             /* IRIS_26726_UNIVERSAL_RGBA16F_CROSS_CONTEXT_OWNER
+              * Standard-Bayer Motion and Night keep the already-accepted denoised RGBA16F pixels
+              * as the cross-context carrier. Critical reconstruction/shader arithmetic remains
+@@ -1144,6 +1185,9 @@ object PhotonMotionMgc1271Bridge {
+             if (resultTexture != 0) runCatching {
+                 GLES30.glDeleteTextures(1, intArrayOf(resultTexture), 0)
+             }
++            if (clipZoneMaskTexture26836 != 0) runCatching {
++                GLES30.glDeleteTextures(1, intArrayOf(clipZoneMaskTexture26836), 0)
++            }
+             LargeDirectBuffer.free(halfBuffer)
+             runCatching { iris26826SharedCarrierForCleanup?.close() }
+             iris26826SharedCarrierForCleanup = null
+@@ -1886,6 +1930,129 @@ object PhotonMotionMgc1271Bridge {
+     }
+ 
+ 
++    /* IRIS_26836_CLAUDE_WB_DOMAIN_CONTRACT
++     * Mirrors GlesMgcRawSpatialStacker's calculationWhiteBalance exactly. Neutrality is defined
++     * only after these gains; camera-RGB R=G=B is never treated as neutral. */
++    private fun calculationWhiteBalance26836(wb: FloatArray): FloatArray {
++        fun safeGain(channel: Int, fallback: Float): Float = wb.getOrElse(channel) { fallback }
++            .takeIf { it.isFinite() && it > 0f } ?: fallback
++        val greenEven = safeGain(1, 1f)
++        val greenOdd = safeGain(2, greenEven)
++        val greenBase = (0.5f * (greenEven + greenOdd)).takeIf { it.isFinite() && it > 0f } ?: 1f
++        fun relative(v: Float) = (v / greenBase).coerceIn(1.0e-3f, 64f)
++        return floatArrayOf(relative(safeGain(0, greenBase)), 1f, relative(safeGain(3, greenBase)))
++    }
++
++    private fun readR16f26836(texture: Int, width: Int, height: Int): ByteBuffer {
++        val bytes = width.toLong() * height * 2L
++        val output = LargeDirectBuffer.allocate(bytes, "IRIS26836 R16F clip mask")
++            ?: invalid("unable to allocate 26836 R16F mask readback")
++        val fbo = IntArray(1); GLES30.glGenFramebuffers(1, fbo, 0)
++        requireParity(fbo[0] != 0, "26836 mask FBO allocation failed")
++        try {
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo[0])
++            GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
++                GLES30.GL_TEXTURE_2D, texture, 0)
++            requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER) == GLES30.GL_FRAMEBUFFER_COMPLETE,
++                "26836 mask readback FBO incomplete")
++            GLES30.glReadBuffer(GLES30.GL_COLOR_ATTACHMENT0); GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 2)
++            output.position(0); GLES30.glReadPixels(0,0,width,height,GLES30.GL_RED,GLES30.GL_HALF_FLOAT,output)
++            checkGl("read 26836 R16F mask"); output.position(0); return output
++        } catch (t: Throwable) { LargeDirectBuffer.free(output); throw t }
++        finally { GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,1); GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0); GLES30.glDeleteFramebuffers(1,fbo,0) }
++    }
++
++    private data class Iris26836Programs(val products:Int,val gaussian:Int,val downsample:Int,val apply:Int)
++
++    private fun compileShader26836(type:Int, source:String, label:String):Int {
++        val shader=GLES30.glCreateShader(type); GLES30.glShaderSource(shader,source); GLES30.glCompileShader(shader)
++        val ok=IntArray(1); GLES30.glGetShaderiv(shader,GLES30.GL_COMPILE_STATUS,ok,0)
++        if(ok[0]==0){val log=GLES30.glGetShaderInfoLog(shader);GLES30.glDeleteShader(shader);invalid("26836 $label compile failed: $log")}
++        return shader
++    }
++
++    private fun linkFragment26836(fragment:String,label:String):Int {
++        val vertex="""
++            #version 300 es
++            void main(){
++                vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));
++                gl_Position=vec4(p*2.0-1.0,0.0,1.0);
++            }
++        """.trimIndent()
++        val vs=compileShader26836(GLES30.GL_VERTEX_SHADER,vertex,"$label vertex")
++        val fs=compileShader26836(GLES30.GL_FRAGMENT_SHADER,fragment,"$label fragment")
++        val p=GLES30.glCreateProgram(); GLES30.glAttachShader(p,vs);GLES30.glAttachShader(p,fs);GLES30.glLinkProgram(p)
++        GLES30.glDeleteShader(vs);GLES30.glDeleteShader(fs);val ok=IntArray(1);GLES30.glGetProgramiv(p,GLES30.GL_LINK_STATUS,ok,0)
++        if(ok[0]==0){val log=GLES30.glGetProgramInfoLog(p);GLES30.glDeleteProgram(p);invalid("26836 $label link failed: $log")};return p
++    }
++
++    private fun linkCompute26836(source:String,label:String):Int {
++        val cs=compileShader26836(GLES31.GL_COMPUTE_SHADER,source,"$label compute")
++        val p=GLES31.glCreateProgram();GLES31.glAttachShader(p,cs);GLES31.glLinkProgram(p);GLES31.glDeleteShader(cs)
++        val ok=IntArray(1);GLES31.glGetProgramiv(p,GLES31.GL_LINK_STATUS,ok,0)
++        if(ok[0]==0){val log=GLES31.glGetProgramInfoLog(p);GLES31.glDeleteProgram(p);invalid("26836 $label link failed: $log")};return p
++    }
++
++    private fun createTexture26836(width:Int,height:Int,internalFormat:Int,filter:Int):Int {
++        val id=IntArray(1);GLES30.glGenTextures(1,id,0);requireParity(id[0]!=0,"26836 texture allocation failed")
++        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,id[0]);GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MIN_FILTER,filter);GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MAG_FILTER,filter)
++        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_S,GLES30.GL_CLAMP_TO_EDGE);GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_T,GLES30.GL_CLAMP_TO_EDGE)
++        val format=if(internalFormat==GLES30.GL_R16F) GLES30.GL_RED else GLES30.GL_RGBA
++        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D,0,internalFormat,width,height,0,format,GLES30.GL_HALF_FLOAT,null);checkGl("26836 texture init")
++        return id[0]
++    }
++
++    private fun bindTexture26836(program:Int,name:String,unit:Int,texture:Int){GLES30.glActiveTexture(GLES30.GL_TEXTURE0+unit);GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,texture);GLES30.glUniform1i(GLES30.glGetUniformLocation(program,name),unit)}
++
++    private fun draw26836(program:Int,target:Int,width:Int,height:Int,fbo:Int){
++        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,fbo);GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,target,0)
++        requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE,"26836 draw FBO incomplete")
++        GLES30.glViewport(0,0,width,height);GLES30.glDisable(GLES30.GL_BLEND);GLES30.glUseProgram(program);GLES30.glDrawArrays(GLES30.GL_TRIANGLES,0,3);checkGl("26836 draw")
++    }
++
++    private fun gaussianKernel26836(sigmaIn:Float):Pair<FloatArray,Int>{
++        val sigma=sigmaIn.coerceIn(0.25f,20f);val radius=kotlin.math.ceil(3.0*sigma.toDouble()).toInt().coerceIn(1,30);val k=FloatArray(61);var sum=0.0
++        for(i in -radius..radius){val v=kotlin.math.exp(-0.5*(i.toDouble()/sigma)*(i.toDouble()/sigma));k[i+30]=v.toFloat();sum+=v};for(i in k.indices)k[i]/=sum.toFloat();return k to radius
++    }
++
++    private fun gaussianPass26836(program:Int,source:Int,target:Int,width:Int,height:Int,sigma:Float,horizontal:Boolean,fbo:Int){
++        val (k,r)=gaussianKernel26836(sigma);GLES30.glUseProgram(program);bindTexture26836(program,"uInput",0,source)
++        GLES30.glUniform2i(GLES30.glGetUniformLocation(program,"uSize"),width,height);GLES30.glUniform2i(GLES30.glGetUniformLocation(program,"uDirection"),if(horizontal)1 else 0,if(horizontal)0 else 1)
++        GLES30.glUniform1i(GLES30.glGetUniformLocation(program,"uRadius"),r);GLES30.glUniform1fv(GLES30.glGetUniformLocation(program,"uKernel"),61,k,0);GLES30.glUniform1f(GLES30.glGetUniformLocation(program,"uGain"),1f);GLES30.glUniform1i(GLES30.glGetUniformLocation(program,"uClamp01"),0)
++        draw26836(program,target,width,height,fbo)
++    }
++
++    private fun applyIris26836FinalClipZoneChroma(buffer:ByteBuffer,width:Int,height:Int,maskTexture:Int,wb:FloatArray,t:IrisMotionSettings.EdgeFalseColorTunables.Snapshot){
++        requireParity(wb.size==3&&wb.all{it.isFinite()&&it>0f},"26836 invalid calculation WB=${wb.contentToString()}")
++        val programs=Iris26836Programs(linkFragment26836(GlesMgcRawSabreShaders.clipZoneProducts26834,"products"),linkFragment26836(GlesMgcRawSabreShaders.clipZoneGaussian26834,"gaussian"),linkFragment26836(GlesMgcRawSabreShaders.clipZoneDownsample4Products26834,"downsample"),linkCompute26836(GlesMgcRawSabreShaders.clipZoneApply26834,"apply"))
++        val textures=ArrayList<Int>();val fboA=IntArray(1);GLES30.glGenFramebuffers(1,fboA,0);val fbo=fboA[0];var stats=0;var mapped=false
++        try{
++            val source=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=source;GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,source);GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,8);buffer.position(0);GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D,0,0,0,width,height,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,buffer);checkGl("26836 upload post-26728 carrier")
++            val products=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=products;val scratch=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=scratch
++            GLES30.glUseProgram(programs.products);bindTexture26836(programs.products,"uRgb",0,source);bindTexture26836(programs.products,"uMask",1,maskTexture);GLES30.glUniform1f(GLES30.glGetUniformLocation(programs.products,"uYFloor"),t.clipZoneYFloor);GLES30.glUniform3f(GLES30.glGetUniformLocation(programs.products,"uCalculationWb"),wb[0],wb[1],wb[2]);draw26836(programs.products,products,width,height,fbo)
++            val qw=(width+3)/4;val qh=(height+3)/4;val big=createTexture26836(qw,qh,GLES30.GL_RGBA16F,GLES30.GL_LINEAR);textures+=big;val bigScratch=createTexture26836(qw,qh,GLES30.GL_RGBA16F,GLES30.GL_LINEAR);textures+=bigScratch
++            GLES30.glUseProgram(programs.downsample);bindTexture26836(programs.downsample,"uInput",0,products);GLES30.glUniform2i(GLES30.glGetUniformLocation(programs.downsample,"uInputSize"),width,height);draw26836(programs.downsample,big,qw,qh,fbo)
++            gaussianPass26836(programs.gaussian,big,bigScratch,qw,qh,t.clipZoneSigmaBig/4f,true,fbo);gaussianPass26836(programs.gaussian,bigScratch,big,qw,qh,t.clipZoneSigmaBig/4f,false,fbo)
++            gaussianPass26836(programs.gaussian,products,scratch,width,height,t.clipZoneSigmaSmall,true,fbo);gaussianPass26836(programs.gaussian,scratch,products,width,height,t.clipZoneSigmaSmall,false,fbo)
++            val output=createTexture26836(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST);textures+=output
++            val copyFbos=IntArray(2);GLES30.glGenFramebuffers(2,copyFbos,0)
++            try {
++                GLES30.glBindFramebuffer(GLES30.GL_READ_FRAMEBUFFER,copyFbos[0]);GLES30.glFramebufferTexture2D(GLES30.GL_READ_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,source,0)
++                GLES30.glBindFramebuffer(GLES30.GL_DRAW_FRAMEBUFFER,copyFbos[1]);GLES30.glFramebufferTexture2D(GLES30.GL_DRAW_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,output,0)
++                requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_READ_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE&&GLES30.glCheckFramebufferStatus(GLES30.GL_DRAW_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE,"26836 bit-copy FBO incomplete")
++                GLES30.glBlitFramebuffer(0,0,width,height,0,0,width,height,GLES30.GL_COLOR_BUFFER_BIT,GLES30.GL_NEAREST);checkGl("26836 M0 bit-copy")
++            } finally { GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0);GLES30.glDeleteFramebuffers(2,copyFbos,0) }
++            val ids=IntArray(1);GLES31.glGenBuffers(1,ids,0);stats=ids[0];val zero=ByteBuffer.allocateDirect(24).order(ByteOrder.nativeOrder()).apply{repeat(6){putInt(0)};rewind()};GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,stats);GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER,24,zero,GLES31.GL_STREAM_READ);GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER,0,stats)
++            GLES31.glUseProgram(programs.apply);bindTexture26836(programs.apply,"uRgb",0,source);bindTexture26836(programs.apply,"uMask",1,maskTexture);bindTexture26836(programs.apply,"uSmall",2,products);bindTexture26836(programs.apply,"uBigQuarter",3,big);GLES31.glUniform2i(GLES31.glGetUniformLocation(programs.apply,"uSize"),width,height);GLES31.glUniform2i(GLES31.glGetUniformLocation(programs.apply,"uQuarterSize"),qw,qh);GLES31.glUniform1f(GLES31.glGetUniformLocation(programs.apply,"uYFloor"),t.clipZoneYFloor);GLES31.glUniform1f(GLES31.glGetUniformLocation(programs.apply,"uAThreshold"),t.clipZoneAThreshold);GLES31.glUniform3f(GLES31.glGetUniformLocation(programs.apply,"uCalculationWb"),wb[0],wb[1],wb[2]);GLES31.glBindImageTexture(0,output,0,false,0,GLES31.GL_WRITE_ONLY,GLES30.GL_RGBA16F);GLES31.glDispatchCompute((width+7)/8,(height+7)/8,1);GLES31.glMemoryBarrier(GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT or GLES31.GL_SHADER_STORAGE_BARRIER_BIT);GLES30.glFinish();checkGl("26836 Claude final compute")
++            GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,stats);val bb=GLES31.glMapBufferRange(GLES31.GL_SHADER_STORAGE_BUFFER,0,24,GLES31.GL_MAP_READ_BIT) as? ByteBuffer?:invalid("26836 stats map failed");mapped=true;val n=bb.order(ByteOrder.nativeOrder());val zone=n.getInt(0);val changed=n.getInt(4);val sampled=n.getInt(8);val sum=n.getInt(12);val maxD=n.getInt(16);val coord=n.getInt(20);requireParity(GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER),"26836 stats unmap failed");mapped=false
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,fbo);GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER,GLES30.GL_COLOR_ATTACHMENT0,GLES30.GL_TEXTURE_2D,output,0);requireParity(GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)==GLES30.GL_FRAMEBUFFER_COMPLETE,"26836 output readback FBO incomplete");GLES30.glReadBuffer(GLES30.GL_COLOR_ATTACHMENT0);GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,8);buffer.position(0);GLES30.glReadPixels(0,0,width,height,GLES30.GL_RGBA,GLES30.GL_HALF_FLOAT,buffer);checkGl("26836 final readback");buffer.position(0)
++            val pixels=Math.multiplyExact(width,height);val mean=if(sampled>0)sum.toFloat()/sampled/1000f else 0f;val zx=if(width>0)coord%width else 0;val zy=if(width>0)coord/width else 0
++            PLog.i(TAG,"IRIS_26836_CLIP_ZONE_CHROMA zoneFraction=${zone.toFloat()/pixels.toFloat()} meanAbsChromaDelta=$mean maxAbsChromaDelta=${maxD/1000f} pixelsChanged=$changed dngUntouched=true maxDeltaPixel=$zx,$zy M0BitExactByCopy=true lumaPreserved=WB_LINEAR colorDomain=WB_LINEAR inverseWbRoundTrip=true insertion=POST_RESIDUAL_POST_26728_PRE_TONE wb=${wb.contentToString()} sigmaSmall=${t.clipZoneSigmaSmall} sigmaBig=${t.clipZoneSigmaBig} aThreshold=${t.clipZoneAThreshold}")
++        }finally{
++            if(mapped){GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER,stats);GLES31.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)};GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER,0,0);if(stats!=0)GLES31.glDeleteBuffers(1,intArrayOf(stats),0);if(textures.isNotEmpty())GLES30.glDeleteTextures(textures.size,textures.toIntArray(),0);if(fbo!=0)GLES30.glDeleteFramebuffers(1,intArrayOf(fbo),0);GLES30.glDeleteProgram(programs.products);GLES30.glDeleteProgram(programs.gaussian);GLES30.glDeleteProgram(programs.downsample);GLES31.glDeleteProgram(programs.apply);GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT,1);GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,1);GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER,0)
++        }
++    }
++
+     private fun buildTrue2xRenderCarrier(
+         rawPath: String,
+         guidePath: String,
+diff --git a/app/version.properties b/app/version.properties
+index 77ca0d691a0cff53cbc09a731067164fa1b4fcf1..8092e879e5305af06aa0b67602c63a9919f6ae45 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726835
+-VERSION_BUILD=26835
++VERSION_NAME=0.9726836
++VERSION_BUILD=26836
