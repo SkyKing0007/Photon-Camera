@@ -23,7 +23,7 @@ verify_package(){ sha256sum -c 26842_HANDOFF_HASHES.sha256 >/dev/null; bash -n b
 verify_scope(){ [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"; git merge-base --is-ancestor "$RUNTIME_AUTHORITY_COMMIT" HEAD || fail "26841 runtime authority not ancestor"; git merge-base --is-ancestor "$ROOT_MECHANICS_COMMIT" HEAD || fail "26821 root mechanics authority not ancestor"; if git diff --name-only "$RUNTIME_AUTHORITY_COMMIT"..HEAD | grep -E '^app/'; then fail "live app source changed after 26841 authority"; fi; python3 -S - <<'PY_SCOPE'
 import subprocess
 allowed=('26842_','build_26842_clip_mottle.sh','transform_26842.py','validate_26842.py','verify_26842_patches.py','verify_26842_runtime_glsl.py','handoff_payload_26842/','.github/workflows/build-26842-clip-mottle.yml','TRIGGER_26842.txt','26842_README.txt')
-paths=subprocess.check_output(['git','diff','--name-only','c641816db971b7059c2fd511745154f7dc1f4f36..HEAD'],text=True).splitlines()
+paths=subprocess.check_output(['git','diff','--name-only','c7f8cbbf07f927c225bf0a631fc3b79874c4ccac..HEAD'],text=True).splitlines()
 bad=[p for p in paths if not any(p==x or p.startswith(x) for x in allowed)]
 assert not bad,bad
 print('PASS 26842 infrastructure scope allowlist')
