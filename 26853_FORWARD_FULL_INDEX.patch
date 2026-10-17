@@ -1,0 +1,437 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 399b844835a7d639ba74a3f08d038f72f55f4544..4dabcdbbb42ff0f53f097634a10f7157c0cbf5c0 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -5474,6 +5474,11 @@ internal object GlesMgcRawSabreShaders {
+         /* R/G1/G2/B validity is provenance inside the SAME shared temporal admission.
+          * It can protect later SHORT/fusion decisions but can never choose frames per color. */
+         layout(location = 2) out vec4 oPhaseValidity;
++        /* IRIS_26853_LOCAL_TEMPORAL_NOISE_MOMENTS
++         * Shared admission stays single-owner. x accumulates sum(w^2); y accumulates the
++         * weighted square of the same-frame four-phase quad mean. These are local statistics
++         * only: never frame-count authority, never color selection, never global denoise strength. */
++        layout(location = 3) out vec2 oTemporalStats26853;
+ 
+         vec2 mirrorUvs(vec2 uv) {
+             if (uv.x <= uFrameBorderPadded.x) uv.x = 2.0 * uFrameBorderPadded.x - uv.x;
+@@ -5590,9 +5595,113 @@ internal object GlesMgcRawSabreShaders {
+             float desiredWidth = max(1.0 - clamp(uClipZoneClipStart26834, 0.97, 0.999), 1.0e-4);
+             float remapExponent = desiredWidth / 0.0075;
+             float clipConfidence = pow(clamp(sharedHeadroom, 0.0, 1.0), remapExponent);
++            float quadMean26853 = dot(phaseSignal, vec4(0.25));
+             oPhaseSignal = phaseSignal * validWeight;
+             oSharedSupport = vec4(validWeight, baseWeight, baseWeight * clipConfidence, 0.0);
+             oPhaseValidity = phaseHeadroom * validWeight;
++            oTemporalStats26853 = vec2(validWeight * validWeight,
++                quadMean26853 * quadMean26853 * validWeight);
++        }
++    """.trimIndent()
++
++    /* IRIS_26853_MULTIFRAME_NATIVE_CFA_DENOISE_OWNER
++     * Motion NORMAL denoise now lives inside the temporally completed physical CFA carrier.
++     * It consumes only local shared-admission temporal moments plus same-phase spatial neighbors.
++     * No RGB/YUV denoise, cross-phase substitution, hue donation, gray fallback, semantic object
++     * mask, or global effectiveSupport scalar participates. Structured/bright areas collapse toward
++     * identity; flat noisy shadows can use stronger same-phase consensus. */
++    val normalCfaNoiseClean26853 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uPhaseSignal;
++        uniform sampler2D uSharedSupport;
++        uniform sampler2D uPhaseValidity;
++        uniform sampler2D uTemporalStats26853;
++        uniform ivec2 uQuadSize;
++        layout(location = 0) out vec4 oCleanPhaseSignal;
++
++        float irisSmooth0126853(float x) {
++            float t = clamp(x, 0.0, 1.0);
++            return t * t * (3.0 - 2.0 * t);
++        }
++        ivec2 clampQ26853(ivec2 q) {
++            return clamp(q, ivec2(0), uQuadSize - ivec2(1));
++        }
++        float support26853(ivec2 q) {
++            return max(texelFetch(uSharedSupport, clampQ26853(q), 0).x, 1.0e-8);
++        }
++        vec4 mean26853(ivec2 q) {
++            q = clampQ26853(q);
++            return texelFetch(uPhaseSignal, q, 0) / support26853(q);
++        }
++        vec4 validityRatio26853(ivec2 q) {
++            q = clampQ26853(q);
++            return clamp(texelFetch(uPhaseValidity, q, 0) / support26853(q), 0.0, 1.0);
++        }
++        float guide26853(vec4 phases) {
++            return dot(phases, vec4(0.25));
++        }
++        void main() {
++            ivec2 q = clampQ26853(ivec2(gl_FragCoord.xy));
++            vec4 center = mean26853(q);
++            float centerY = guide26853(center);
++            vec4 centerValid = validityRatio26853(q);
++            vec2 stats = max(texelFetch(uTemporalStats26853, q, 0).rg, vec2(0.0));
++            float sumW = support26853(q);
++            float sumW2 = max(stats.x, 1.0e-8);
++            float effectiveLocalN = clamp((sumW * sumW) / sumW2, 1.0, 32.0);
++            float temporalVarianceY = max(stats.y / sumW - centerY * centerY, 0.0);
++            float residualSigmaY = sqrt(temporalVarianceY / effectiveLocalN);
++            float relativeResidual = residualSigmaY / max(abs(centerY), 0.030);
++            float noiseGate = irisSmooth0126853((relativeResidual - 0.012) / 0.080);
++            float supportGate = irisSmooth0126853((effectiveLocalN - 1.20) / 2.80);
++            float shadowGate = 1.0 - irisSmooth0126853((centerY - 0.20) / 0.48);
++
++            float minY = centerY;
++            float maxY = centerY;
++            for (int oy = -1; oy <= 1; ++oy) {
++                for (int ox = -1; ox <= 1; ++ox) {
++                    float y = guide26853(mean26853(q + ivec2(ox, oy)));
++                    minY = min(minY, y);
++                    maxY = max(maxY, y);
++                }
++            }
++            float relativeRange = (maxY - minY) / max(abs(centerY), 0.030);
++            float flatGate = 1.0 - irisSmooth0126853((relativeRange - 0.12) / 0.43);
++            float minimumValidity = min(min(centerValid.r, centerValid.g),
++                min(centerValid.b, centerValid.a));
++            float validityGate = irisSmooth0126853((minimumValidity - 0.70) / 0.25);
++
++            vec4 filtered = center * 1.80;
++            vec4 filteredWeight = vec4(1.80);
++            for (int oy = -1; oy <= 1; ++oy) {
++                for (int ox = -1; ox <= 1; ++ox) {
++                    if (ox == 0 && oy == 0) continue;
++                    ivec2 nq = clampQ26853(q + ivec2(ox, oy));
++                    vec4 neighbor = mean26853(nq);
++                    vec4 neighborValid = validityRatio26853(nq);
++                    float neighborY = guide26853(neighbor);
++                    float relativeGuide = abs(neighborY - centerY) /
++                        max(max(abs(neighborY), abs(centerY)), 0.035);
++                    float guideCompat = 1.0 - irisSmooth0126853((relativeGuide - 0.045) / 0.205);
++                    vec4 relativePhase = abs(neighbor - center) /
++                        max(max(abs(neighbor), abs(center)), vec4(0.035));
++                    vec4 phaseCompat = vec4(1.0) - smoothstep(vec4(0.080), vec4(0.300), relativePhase);
++                    float spatial = (abs(ox) + abs(oy) == 2) ? 0.70 : 1.0;
++                    vec4 w = phaseCompat * neighborValid * (guideCompat * spatial);
++                    filtered += neighbor * w;
++                    filteredWeight += w;
++                }
++            }
++            filtered /= max(filteredWeight, vec4(1.0e-6));
++            float blend = noiseGate * shadowGate * flatGate * validityGate *
++                mix(0.22, 0.78, supportGate);
++            blend = clamp(blend, 0.0, 0.78);
++            vec4 cleaned = mix(center, filtered, blend);
++            /* Preserve the inherited weighted-signal contract so 26852 extraction and the entire
++             * successful 26846-26851 reconstruction topology remain unchanged downstream. */
++            oCleanPhaseSignal = cleaned * sumW;
+         }
+     """.trimIndent()
+ 
+@@ -7277,6 +7386,21 @@ internal object GlesMgcRawSabreShaders {
+             float stabilityGate = 1.0 - irisSmooth01((relativeSigma - 0.060) / 0.120);
+             return clamp(supportGate * stabilityGate, 0.0, 1.0);
+         }
++        /* IRIS_26853_SUPER_RES_LOCAL_NOISE_GATE
++         * The 2x direct-CFA detail owner uses its own already-accumulated local temporal moments.
++         * This is not global effectiveSupport and does not change frame admission. Noisy flat
++         * shadow detail returns toward the cleaned native CFA/VGN guide; stable structure survives. */
++        float irisResidualNoiseGate26853(ivec2 localP) {
++            vec4 moments = texelFetch(uTemporalLumaStats, localP, 0);
++            float sumW = max(moments.z, 0.0);
++            float sumW2 = max(moments.w, 0.0);
++            if (sumW <= 0.08 || sumW2 <= 1.0e-6) return 0.0;
++            float meanY = moments.x / sumW;
++            float varianceY = max(moments.y / sumW - meanY * meanY, 0.0);
++            float effectiveN = max((sumW * sumW) / sumW2, 1.0);
++            float residualRelativeSigma = sqrt(varianceY / effectiveN) / max(abs(meanY), 0.030);
++            return 1.0 - irisSmooth01((residualRelativeSigma - 0.025) / 0.105);
++        }
+         void main() {
+             ivec2 localP = ivec2(gl_FragCoord.xy);
+             ivec2 globalP = uOutputOrigin + localP;
+@@ -7317,6 +7441,10 @@ internal object GlesMgcRawSabreShaders {
+             float t10 = irisTemporalAgreement(q10);
+             float t01 = irisTemporalAgreement(q01);
+             float t11 = irisTemporalAgreement(q11);
++            float n00_26853 = irisResidualNoiseGate26853(q00);
++            float n10_26853 = irisResidualNoiseGate26853(q10);
++            float n01_26853 = irisResidualNoiseGate26853(q01);
++            float n11_26853 = irisResidualNoiseGate26853(q11);
+             /* IRIS_26573_BLOCK_WIDE_TEMPORAL_PROOF
+              * One unstable subpixel invalidates the whole zero-DC 2x2 residual. This prevents a
+              * single phase/alignment outlier from being converted into wire/stem/edge zippering.
+@@ -7405,6 +7533,10 @@ internal object GlesMgcRawSabreShaders {
+             float materialSupportGate = irisSmooth01((materialWeight - 1.15) / 1.10);
+             float directDetail = mix(blockDetail, materialDetail, materialBoundary);
+             float detailConfidence = confidence * mix(1.0, materialSupportGate, materialBoundary);
++            float localNoiseGate26853 = min(min(n00_26853, n10_26853), min(n01_26853, n11_26853));
++            float flatShadow26853 = (1.0 - supportedEdge26758) *
++                (1.0 - irisSmooth01((guideBlockY - 0.18) / 0.42));
++            detailConfidence *= mix(1.0, localNoiseGate26853, 0.85 * flatShadow26853);
+             float detailScaleY = mix(guideBlockY, guideY, materialBoundary);
+             /* IRIS_26759_CONFIDENCE_GATED_DETAIL_REINFORCEMENT
+              * Strengthen only direct-CFA luma microstructure already proven by phase, temporal,
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index f9795f0eb753ce15713d0a9462b880501aafc43d..819ded26c2615538613a5b0058a0985c23dbbfa6 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -659,6 +659,7 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreGuideAndCovarianceProgram = 0
+     private var sabreMergeProgram = 0
+     private var sabreNormalCfaTemporalAccumulateProgram26852 = 0
++    private var sabreNormalCfaNoiseCleanProgram26853 = 0
+     private var sabreNormalCfaExtractProgram26852 = 0
+     private var sabreSuperResDetailMergeProgram = 0
+     private var sabreSuperResDetailResolveProgram = 0
+@@ -2437,9 +2438,12 @@ internal class GlesMgcRawSpatialStacker(
+             val normalCfaValidity26852 = createTexture(
+                 extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+             )
++            val normalCfaTemporalStats26853 = createTexture(
++                extractedWidth, extractedHeight, GLES30.GL_RG16F, GLES30.GL_NEAREST,
++            )
+             clearSabreNormalCfaTemporal26852(
+                 normalCfaSignals26852, normalCfaSupport26852, normalCfaValidity26852,
+-                extractedWidth, extractedHeight,
++                normalCfaTemporalStats26853, extractedWidth, extractedHeight,
+             )
+             /* IRIS_26564_TRUE_2X_RETIRES_NATIVE_UPSCALE_DETAIL_OWNER
+              * Keep the old carrier functions dormant for rollback provenance, but allocate no
+@@ -2588,6 +2592,7 @@ internal class GlesMgcRawSpatialStacker(
+                 phaseSignals = normalCfaSignals26852,
+                 sharedSupport = normalCfaSupport26852,
+                 phaseValidity = normalCfaValidity26852,
++                temporalStats26853 = normalCfaTemporalStats26853,
+                 extractedWidth = extractedWidth,
+                 extractedHeight = extractedHeight,
+                 useFrameWeight = false,
+@@ -2843,6 +2848,7 @@ internal class GlesMgcRawSpatialStacker(
+                         phaseSignals = normalCfaSignals26852,
+                         sharedSupport = normalCfaSupport26852,
+                         phaseValidity = normalCfaValidity26852,
++                        temporalStats26853 = normalCfaTemporalStats26853,
+                         extractedWidth = extractedWidth,
+                         extractedHeight = extractedHeight,
+                         useFrameWeight = true,
+@@ -3012,6 +3018,29 @@ internal class GlesMgcRawSpatialStacker(
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+ 
++            /* IRIS_26853_MULTIFRAME_NATIVE_CFA_DENOISE_HANDOFF
++             * Every requested/admitted NORMAL has already been alignment-attempted by inherited Sabre.
++             * Clean only the completed same-phase CFA carrier using local temporal moments and
++             * structure. referenceExtracted is safely reused as output after reference guide setup. */
++            renderSabreNormalCfaNoiseClean26853(
++                phaseSignals = normalCfaSignals26852,
++                sharedSupport = normalCfaSupport26852,
++                phaseValidity = normalCfaValidity26852,
++                temporalStats26853 = normalCfaTemporalStats26853,
++                outputWeightedSignals = referenceExtracted,
++                extractedWidth = extractedWidth,
++                extractedHeight = extractedHeight,
++            )
++            releaseOwnedTexture(normalCfaSignals26852, "26853 pre-clean temporal CFA signals")
++            releaseOwnedTexture(normalCfaTemporalStats26853, "26853 consumed local temporal moments")
++            PLog.i(
++                SABRE_TAG,
++                "IRIS_26853_MULTIFRAME_NATIVE_CFA_DENOISE_OWNER normalFrames=$mergedFrameCount " +
++                    "allNormalAlignmentAttempted=true sharedFrameAdmission=true localMoments=true " +
++                    "samePhaseSpatial=true crossPhase=false semanticMask=false globalEffectiveSupport=false " +
++                    "superResNativeGuide=${enableSabreSuperRes} srDirectDetailNoiseGate=${enableSabreSuperRes}",
++            )
++
+             /* IRIS_26852_DELAYED_RGB_ADAPTER_ALLOCATION
+              * The retired per-frame RGB temporal owner must not remain resident during the CFA loop.
+              * Allocate the inherited 26851 RGB/support/provenance interface only after NORMAL CFA
+@@ -3047,7 +3076,7 @@ internal class GlesMgcRawSpatialStacker(
+              * the exact successful-26851 extracted/raw-code interface and invoke the inherited
+              * 26846-26851 topology once. Old per-frame NORMAL RGB accumulation is inactive. */
+             val normalCfaExtracted26852 = renderSabreNormalCfaExtract26852(
+-                phaseSignals = normalCfaSignals26852,
++                phaseSignals = referenceExtracted,
+                 sharedSupport = normalCfaSupport26852,
+                 referenceCalibration = referenceCalibration,
+                 extractedWidth = extractedWidth,
+@@ -3082,7 +3111,7 @@ internal class GlesMgcRawSpatialStacker(
+                 sourceWhiteNormalized26790 = 1f,
+                 normalChromaConsensus26790 = 0,
+                 longChromaGuard26790 = false,
+-                temporalCfaSignals26852 = normalCfaSignals26852,
++                temporalCfaSignals26852 = referenceExtracted,
+                 temporalCfaSupport26852 = normalCfaSupport26852,
+                 temporalCfaValidity26852 = normalCfaValidity26852,
+             )
+@@ -3091,10 +3120,10 @@ internal class GlesMgcRawSpatialStacker(
+                 "IRIS_26852_TEMPORAL_CFA_OWNER normalFrames=$mergedFrameCount " +
+                     "reference=FIRST_NORMAL sharedQuadAdmission=true phases=R_G1_G2_B " +
+                     "phaseValidityProvenance=true perFrameRgb=false oneTime26851Reconstruction=true " +
+-                    "crossPhaseTemporalSelection=false",
++                    "crossPhaseTemporalSelection=false mergeNativeDenoise=IRIS_26853_LOCAL_MOMENTS",
+             )
+             releaseOwnedTexture(normalCfaExtracted26852, "26852 one-time extracted CFA adapter")
+-            releaseOwnedTexture(normalCfaSignals26852, "26852 completed temporal CFA signals")
++            releaseOwnedTexture(referenceExtracted, "26853 completed cleaned temporal CFA weighted signals")
+             releaseOwnedTexture(normalCfaSupport26852, "26852 completed temporal CFA shared support")
+             releaseOwnedTexture(normalCfaValidity26852, "26852 completed temporal CFA phase validity")
+ 
+@@ -3702,6 +3731,7 @@ internal class GlesMgcRawSpatialStacker(
+                     "size=${result.width}x${result.height} backend=${result.backend} phaseMean=${result.phaseSupportMean} phaseP10=${result.phaseSupportP10} " +
+                     "reconstruction=${result.reconstructionMs}ms dngBoundary=PRE_VGN sabreRgbChromaOwner=true " +
+                     "highResLumaOwner=DIRECT_CFA_TEMPORAL_ADAPTIVE directChromaOwner=false trueDetail26573=temporal-cross-frame " +
++                    "nativeGuideDenoise=IRIS_26853_MULTIFRAME_CFA srLocalNoiseGate=true " +
+                     "directDng=${result.linearRgbPath!=null} fusedRender=${result.renderRgbPath!=null}"
+                 PLog.i(SABRE_TAG,"IRIS_26568_TRUE2X_READY $readyDetails")
+                 MotionTrace.processingState("IRIS_26576_SR_RECONSTRUCTION_SUMMARY", readyDetails)
+@@ -5376,17 +5406,22 @@ internal class GlesMgcRawSpatialStacker(
+         phaseSignals: Int,
+         sharedSupport: Int,
+         phaseValidity: Int,
++        temporalStats26853: Int,
+         quadWidth: Int,
+         quadHeight: Int,
+     ) {
+-        check(phaseSignals != 0 && sharedSupport != 0 && phaseValidity != 0)
+-        bindRenderTargets(intArrayOf(phaseSignals, sharedSupport, phaseValidity), "26852 temporal CFA clear")
++        check(phaseSignals != 0 && sharedSupport != 0 && phaseValidity != 0 && temporalStats26853 != 0)
++        bindRenderTargets(
++            intArrayOf(phaseSignals, sharedSupport, phaseValidity, temporalStats26853),
++            "26853 temporal CFA + local moments clear",
++        )
+         GLES30.glViewport(0, 0, quadWidth, quadHeight)
+         GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
+         GLES30.glClearBufferfv(GLES30.GL_COLOR, 1, floatArrayOf(0f, 0f, 0f, 0f), 0)
+         GLES30.glClearBufferfv(GLES30.GL_COLOR, 2, floatArrayOf(0f, 0f, 0f, 0f), 0)
++        GLES30.glClearBufferfv(GLES30.GL_COLOR, 3, floatArrayOf(0f, 0f, 0f, 0f), 0)
+         GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-        checkGlError("26852 temporal CFA clear")
++        checkGlError("26853 temporal CFA + local moments clear")
+     }
+ 
+     private fun renderSabreNormalCfaTemporalAccumulate26852(
+@@ -5398,6 +5433,7 @@ internal class GlesMgcRawSpatialStacker(
+         phaseSignals: Int,
+         sharedSupport: Int,
+         phaseValidity: Int,
++        temporalStats26853: Int,
+         extractedWidth: Int,
+         extractedHeight: Int,
+         useFrameWeight: Boolean,
+@@ -5406,7 +5442,8 @@ internal class GlesMgcRawSpatialStacker(
+         clipZoneClipStart26834: Float,
+     ) {
+         val program = sabreNormalCfaTemporalAccumulateProgram26852
+-        check(program != 0 && raw != 0 && phaseSignals != 0 && sharedSupport != 0 && phaseValidity != 0)
++        check(program != 0 && raw != 0 && phaseSignals != 0 && sharedSupport != 0 &&
++            phaseValidity != 0 && temporalStats26853 != 0)
+         val rowFlickerActive26720 = rowFlickerFrame26720?.let(::hasRowFlickerEvidence26720) == true
+         GLES30.glUseProgram(program)
+         bindTexture(program, "uRaw", 0, raw)
+@@ -5451,13 +5488,35 @@ internal class GlesMgcRawSpatialStacker(
+             GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
+             draw(
+                 program, extractedWidth, extractedHeight,
+-                intArrayOf(phaseSignals, sharedSupport, phaseValidity), preserveBlend = true,
++                intArrayOf(phaseSignals, sharedSupport, phaseValidity, temporalStats26853), preserveBlend = true,
+             )
+         } finally {
+             GLES30.glDisable(GLES30.GL_BLEND)
+         }
+     }
+ 
++    private fun renderSabreNormalCfaNoiseClean26853(
++        phaseSignals: Int,
++        sharedSupport: Int,
++        phaseValidity: Int,
++        temporalStats26853: Int,
++        outputWeightedSignals: Int,
++        extractedWidth: Int,
++        extractedHeight: Int,
++    ) {
++        val program = sabreNormalCfaNoiseCleanProgram26853
++        check(program != 0 && phaseSignals != 0 && sharedSupport != 0 &&
++            phaseValidity != 0 && temporalStats26853 != 0 && outputWeightedSignals != 0)
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uPhaseSignal", 0, phaseSignals)
++        bindTexture(program, "uSharedSupport", 1, sharedSupport)
++        bindTexture(program, "uPhaseValidity", 2, phaseValidity)
++        bindTexture(program, "uTemporalStats26853", 3, temporalStats26853)
++        uniform2i(program, "uQuadSize", extractedWidth, extractedHeight)
++        draw(program, extractedWidth, extractedHeight, intArrayOf(outputWeightedSignals))
++        checkGlError("26853 multiframe-native CFA denoise")
++    }
++
+     private fun renderSabreNormalCfaExtract26852(
+         phaseSignals: Int,
+         sharedSupport: Int,
+@@ -7332,6 +7391,10 @@ internal class GlesMgcRawSpatialStacker(
+             GlesMgcRawSabreShaders.normalCfaTemporalAccumulate26852,
+             "iris_26852_normal_cfa_temporal_accumulate",
+         )
++        sabreNormalCfaNoiseCleanProgram26853 = linkProgram(
++            GlesMgcRawSabreShaders.normalCfaNoiseClean26853,
++            "iris_26853_normal_cfa_noise_clean",
++        )
+         sabreNormalCfaExtractProgram26852 = linkProgram(
+             GlesMgcRawSabreShaders.normalCfaExtract26852,
+             "iris_26852_normal_cfa_extract",
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 57ed64e52699eec7ca7735ffd5a809405e075a2a..df7ed0bbde2cacd93512540efeefa2fbdacf3ec0 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -847,8 +847,23 @@ object PhotonMotionMgc1271Bridge {
+             val residualChromaEnabled = customResidualChromaEnabled ||
+                 (customResidualChroma == null && automaticResidualChromaScale26762 > 0f)
+             val denoisePass = MgcFullResolutionDenoise.Pass.SABRE_DEFAULT
+-            val runFullResolutionDenoise = irisSettings.noiseReductionEnabled &&
+-                (lumaScale > 0f || residualChromaEnabled)
++            /* IRIS_26853_MOTION_MERGE_NATIVE_DENOISE_OWNER
++             * 26852 changed Motion temporal statistics to CFA-first reconstruction. The legacy
++             * bjzhou/MGC RGB->YUV residual pass was calibrated for the old completed Sabre RGB
++             * carrier, so Motion now retires it rather than stacking a second noise owner. Night
++             * remains byte-semantic on its inherited path. User luma/chroma values are retained
++             * as settings but do not modify Motion reconstruction in this build. */
++            val motionMergeNativeDenoise26853 = !parameters.irisNightActive
++            val runFullResolutionDenoise = !motionMergeNativeDenoise26853 &&
++                irisSettings.noiseReductionEnabled && (lumaScale > 0f || residualChromaEnabled)
++            if (motionMergeNativeDenoise26853) {
++                PLog.i(
++                    TAG,
++                    "IRIS_26853_MOTION_MERGE_NATIVE_DENOISE_OWNER legacyMgcResidual=false " +
++                        "cfaTemporal=true localMoments=true samePhase=true requestedLuma=$lumaScale " +
++                        "requestedChroma=$chromaScale nightUnaffected=true",
++                )
++            }
+             if (!parameters.irisNightActive) {
+                 PLog.i("MotionTrace", "IRIS_26762_RESIDUAL_CHROMA_CONTROL mode=${if (customResidualChroma != null) "CUSTOM_EXACT" else "AUTO_ADAPTIVE"} levels=${customResidualChroma?.contentToString() ?: "AUTO"} broadScale=$chromaScale adaptiveMultiplier=$adaptiveSnrChroma26762 referenceSnr=$referenceSnr outputTuningSnr=$tuningSnr appliedAutoScale=$automaticResidualChromaScale26762 bypass=${customResidualChroma != null && !customResidualChromaEnabled}")
+             }
+@@ -1028,7 +1043,8 @@ object PhotonMotionMgc1271Bridge {
+                 "stage=PRE_POSTPIPELINE_LINEAR_RGB master=${irisSettings.noiseReductionEnabled} " +
+                 "luma=$lumaScale chroma=$chromaScale automaticLuma26639=$automaticLumaScale26639 " +
+                 "noiseEquivalentSupport=$noiseEquivalentSupport executed=$runFullResolutionDenoise " +
+-                "pass=$denoisePass noiseSource=$noiseAuthority mgcBase=${mgcBase.timestamp} " +
++                "pass=$denoisePass motionNoiseOwner=${if (motionMergeNativeDenoise26853) "IRIS_26853_CFA_MERGE" else "LEGACY_MGC_RESIDUAL"} " +
++                "noiseSource=$noiseAuthority mgcBase=${mgcBase.timestamp} " +
+                 "referenceSnr=$referenceSnr outputTuningSnr=$tuningSnr " +
+                 "noiseEquivalentSupport=$noiseEquivalentSupport " +
+                 "residualMagnitude=physicalBaseNoiseTimesMeasuredSabreMergeScale " +
+@@ -1113,7 +1129,7 @@ object PhotonMotionMgc1271Bridge {
+             PLog.i(TAG, "IRIS_26568_SABRE_ONLY_RECONSTRUCTION_OWNERSHIP " +
+                 "pipeline=${if (parameters.irisNightActive) "NIGHT" else "MOTION"} " +
+                 "owner=SABRE spatialSourceRestoreAllowed=false spatialHighlightNodeAllowed=false " +
+-                "residualDenoise=$denoisePass carrier=RESOLVE_SABRE_LINEAR_RGB " +
++                "residualDenoise=${if (motionMergeNativeDenoise26853) "BYPASSED_IRIS_26853_MERGE_NATIVE" else denoisePass} carrier=RESOLVE_SABRE_LINEAR_RGB " +
+                 "superResRequested=${parameters.motionV2SuperResOutputEnabled} " +
+                 "true2x=${stacked.true2xRenderRgbPath != null || stacked.true2xLinearRgbPath != null} backend=${stacked.true2xBackend} " +
+                 "phaseMean=${stacked.true2xPhaseSupportMean} phaseP10=${stacked.true2xPhaseSupportP10} " +
+diff --git a/app/version.properties b/app/version.properties
+index 392caba25762d5b0484ccf177b79ffb44423936c..6d91b1f565e3825a29380f9b0b050404840a5c2f 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726852
+-VERSION_BUILD=26852
++VERSION_NAME=0.9726853
++VERSION_BUILD=26853
