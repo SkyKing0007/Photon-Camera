@@ -57,7 +57,18 @@ for high_zoom in (0,1):
 clipB=shader(B,S,'clipZoneApplyFragment26840'); clipC=shader(C,S,'clipZoneApplyFragment26840'); need(clipB==clipC,'26849 clip shader must remain byte-identical to successful 26848'); need('IRIS_26842_CONTINUOUS_CLIPPED_COLOR_ROLLOFF' in clipC,'26842 clip marker'); compile_one('clipZoneApplyFragment26840_26842_inherited','frag',clipC)
 SHADOW='app/src/main/assets/shaders/motionv2/shadow_cleanup.glsl'; need((B/SHADOW).read_bytes()==(C/SHADOW).read_bytes(),'26849 shadow cleanup must remain byte-identical to successful 26848'); shadow=asset(C,SHADOW); need('IRIS_26842_TRUE_FLAT_MOTTLING_CLEANUP' in shadow,'26842 mottling marker'); compile_one('motionv2_shadow_cleanup_26842_inherited','frag',shadow)
 # 26849 modifies exactly the existing NORMAL merge shader.
-baseMerge=shader(B,S,'merge'); candMerge=shader(C,S,'merge'); need(baseMerge!=candMerge,'26849 merge unexpectedly unchanged'); need('IRIS_26847_SAME_MATERIAL_GREEN_TOPOLOGY_OWNER' in candMerge,'26847 green topology inheritance missing'); need('IRIS_26848_SAME_MATERIAL_RB_TOPOLOGY_OWNER' in candMerge,'26848 R/B topology inheritance missing'); need('IRIS_26847_SAME_MATERIAL_RB_DIFFERENCE_INPUT' in candMerge,'26847 R/B difference marker missing'); need('IRIS_26846_CFA_PHASE_BALANCED_CHROMA_AUTHORITY' in candMerge,'26846 phase-balance inheritance missing'); need('IRIS_26849_PERIPHERAL_PHASE_SAFE_CFA_LCA_OWNER' in candMerge,'26849 peripheral LCA marker missing'); need('peripheralLcaStrength26849' in candMerge and 'calibratedPhaseLcaK26849' in candMerge,'26849 peripheral phase-safe logic missing'); compile_one('merge_26849','frag',candMerge)
+baseMerge=shader(B,S,'merge'); candMerge=shader(C,S,'merge'); need(baseMerge!=candMerge,'26849 merge unexpectedly unchanged'); need('IRIS_26847_SAME_MATERIAL_GREEN_TOPOLOGY_OWNER' in candMerge,'26847 green topology inheritance missing'); need('IRIS_26848_SAME_MATERIAL_RB_TOPOLOGY_OWNER' in candMerge,'26848 R/B topology inheritance missing'); need('IRIS_26847_SAME_MATERIAL_RB_DIFFERENCE_INPUT' in candMerge,'26847 R/B difference marker missing'); need('IRIS_26846_CFA_PHASE_BALANCED_CHROMA_AUTHORITY' in candMerge,'26846 phase-balance inheritance missing'); need('IRIS_26849_PERIPHERAL_PHASE_SAFE_CFA_LCA_OWNER' in candMerge,'26849 peripheral LCA marker missing'); need('peripheralLcaStrength26849' in candMerge and 'calibratedPhaseLcaK26849' in candMerge,'26849 peripheral phase-safe logic missing'); helperDecl='float peripheralLcaStrength26849(vec2 referenceUv);'; helperCall='peripheralLcaStrength26849(referenceUv26791)'; overloadDecl='''void fillCorrectedCfaNeighborhood26792(
+    ivec2 position,
+    vec2 sharedTranslationPixels,
+    vec3 covariance,
+    float autoPeripheralLcaStrength26849,
+    out mat3 bayerValue,
+    out mat3 sourceValidity
+);'''; overloadCall='''fillCorrectedCfaNeighborhood26792(
+            position,
+            sharedTranslationPixels26791,
+            covariance,
+            autoPeripheralLcaStrength26849,'''; need(helperDecl in candMerge and candMerge.index(helperDecl) < candMerge.index(helperCall),'26849 regression: peripheralLcaStrength26849 must be declared before first call'); need(overloadDecl in candMerge and candMerge.index(overloadDecl) < candMerge.index(overloadCall),'26849 regression: 6-arg fillCorrectedCfaNeighborhood26792 must be declared before first call'); compile_one('merge_26849','frag',candMerge)
 need((B/T).read_bytes()==(C/T).read_bytes(),'26849 spatial stacker must remain byte-identical')
 print('PASS 26849 GLSL ownership: exactly 1 modified NORMAL merge shader; 45 successful-26848 active/protected variants inherited byte-identically')
 print('PASS 26849 CFA safety: 26848 green/RB same-material ownership remains exact; legacy LCA-on remains exact; legacy LCA-off gains only smooth outer-field same-phase R/B correction with exact inner dead zone; green phase, LONG, SHORT and downstream VGN/FCC/26840/final-render protection remain inherited')

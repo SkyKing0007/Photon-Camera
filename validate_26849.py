@@ -23,6 +23,24 @@ b0,b1=bounds(bs); c0,c1=bounds(cs); assert bs[:b0]==cs[:c0] and bs[b1:]==cs[c1:]
 for marker in ['IRIS_26846_CFA_PHASE_BALANCED_CHROMA_AUTHORITY','IRIS_26847_SAME_MATERIAL_GREEN_TOPOLOGY_OWNER','IRIS_26848_SAME_MATERIAL_RB_TOPOLOGY_OWNER','IRIS_26847_SAME_MATERIAL_RB_DIFFERENCE_INPUT']:
     assert cm.count(marker)==1,marker
 assert cm.count('IRIS_26849_PERIPHERAL_PHASE_SAFE_CFA_LCA_OWNER')==1
+assert cm.count('IRIS_26849_GLSLANG_DECLARATION_ORDER_REGRESSION')==1
+helper_decl='float peripheralLcaStrength26849(vec2 referenceUv);'
+helper_call='peripheralLcaStrength26849(referenceUv26791)'
+overload_decl='''void fillCorrectedCfaNeighborhood26792(
+    ivec2 position,
+    vec2 sharedTranslationPixels,
+    vec3 covariance,
+    float autoPeripheralLcaStrength26849,
+    out mat3 bayerValue,
+    out mat3 sourceValidity
+);'''
+overload_call='''fillCorrectedCfaNeighborhood26792(
+            position,
+            sharedTranslationPixels26791,
+            covariance,
+            autoPeripheralLcaStrength26849,'''
+assert helper_decl in cm and helper_call in cm and cm.index(helper_decl) < cm.index(helper_call)
+assert overload_decl in cm and overload_call in cm and cm.index(overload_decl) < cm.index(overload_call)
 # The complete 26848 chroma owner itself is byte-identical.
 assert func(bm,'void sameLocationChroma26793(','void sampleNeighborhoodRbf(')==func(cm,'void sameLocationChroma26793(','void sampleNeighborhoodRbf(')
 # Legacy user-enabled LCA coefficient owner remains exact.

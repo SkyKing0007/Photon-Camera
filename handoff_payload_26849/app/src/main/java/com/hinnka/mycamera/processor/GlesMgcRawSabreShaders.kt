@@ -2876,6 +2876,20 @@ internal object GlesMgcRawSabreShaders {
             return mix(inheritedGreen26847, ownedGreen26847, materialBlend26847);
         }
 
+        /* IRIS_26849_GLSLANG_DECLARATION_ORDER_REGRESSION
+         * Failed Actions run 38999246441 proved GLSL ES requires the new 26849 helper and
+         * six-argument CFA-neighborhood overload to be declared before sampleNeighborhoodRbf
+         * calls them. Declarations only: implementations/math remain byte-identical. */
+        float peripheralLcaStrength26849(vec2 referenceUv);
+        void fillCorrectedCfaNeighborhood26792(
+            ivec2 position,
+            vec2 sharedTranslationPixels,
+            vec3 covariance,
+            float autoPeripheralLcaStrength26849,
+            out mat3 bayerValue,
+            out mat3 sourceValidity
+        );
+
         /* IRIS_26829_GREEN_SUPPORT_HEADROOM_CLIPPED_RB_OWNER
          * Restore source-site validity as the normal chroma authority, but permit one-sided clipped
          * R/B hue evidence only when the orthogonal greens are nearly fully supported and their
