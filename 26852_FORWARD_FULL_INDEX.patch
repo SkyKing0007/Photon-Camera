@@ -1,0 +1,812 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index e532d286c8c9199e950d0c7bb0ebce2d40010795..399b844835a7d639ba74a3f08d038f72f55f4544 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2530,6 +2530,13 @@ internal object GlesMgcRawSabreShaders {
+         precision highp usampler2D;
+         uniform sampler2D uExtractedBayer;
+         uniform highp usampler2D uRaw26790;
++        /* IRIS_26852_TEMPORAL_CFA_RECONSTRUCTION_INPUT
++         * When enabled, scalar CFA comes from the completed shared-weight R/G1/G2/B carrier.
++         * uRaw26790 remains bound only for inherited non-temporal callers (LONG/rollback). */
++        uniform int uTemporalCfaOwner26852;
++        uniform sampler2D uTemporalCfaSignals26852;
++        uniform sampler2D uTemporalCfaSupport26852;
++        uniform sampler2D uTemporalCfaValidity26852;
+         uniform sampler2D uFlow;
+         uniform sampler2D uCovariance;
+         uniform sampler2D uRejection;
+@@ -3062,8 +3069,8 @@ internal object GlesMgcRawSabreShaders {
+             if (uJpegLcaEnabled26790 == 0 && autoPeripheralLcaStrength26849 <= 1.0e-7) {
+                 autoRegistrationSearchGate26851 = centralMaterialRegistrationGate26851(position);
+             }
+-            if (uJpegLcaEnabled26790 != 0 || uJpegNeutralClamp26792 != 0 ||
+-                autoRegistrationSearchGate26851 > 1.0e-7) {
++            if (uTemporalCfaOwner26852 != 0 || uJpegLcaEnabled26790 != 0 ||
++                uJpegNeutralClamp26792 != 0 || autoRegistrationSearchGate26851 > 1.0e-7) {
+                 /* IRIS_26792_ONE_RGB_TOPOLOGY
+                  * LCA and neutral censorship may alter only scalar CFA evidence beneath the one
+                  * inherited Sabre topology. Position/type and CFA->RGB ownership never change. */
+@@ -3211,8 +3218,10 @@ internal object GlesMgcRawSabreShaders {
+         ivec2 pixelForPhaseLattice26790(ivec2 q, int phaseIndex) {
+             return clampPhaseLattice26790(q, phaseIndex) * 2 + phaseOffset26790(phaseIndex);
+         }
++        float temporalNormalized26852(ivec2 p);
+         float normalizedRaw26790(ivec2 p) {
+             p = clamp(p, ivec2(0), uOutputSize - ivec2(1));
++            if (uTemporalCfaOwner26852 != 0) return temporalNormalized26852(p);
+             int phaseIndex = phaseAt26790(p);
+             return float(texelFetch(uRaw26790, p, 0).r) * uPhaseGains26790[phaseIndex] +
+                 uPhaseBlackTerms26790[phaseIndex];
+@@ -3230,7 +3239,14 @@ internal object GlesMgcRawSabreShaders {
+             );
+         }
+         float phaseHeadroomConfidence26790(ivec2 quadIndex, int phaseIndex) {
+-            ivec2 p = pixelForPhaseLattice26790(quadIndex, phaseIndex);
++            ivec2 q = max(quadIndex, ivec2(0));
++            if (uTemporalCfaOwner26852 != 0) {
++                float sharedSupport26852 = max(
++                    texelFetch(uTemporalCfaSupport26852, q, 0).x, 1.0e-8);
++                vec4 valid = texelFetch(uTemporalCfaValidity26852, q, 0);
++                return clamp(valid[phaseIndex] / sharedSupport26852, 0.0, 1.0);
++            }
++            ivec2 p = pixelForPhaseLattice26790(q, phaseIndex);
+             float value = normalizedRaw26790(p);
+             float whitePoint = max(uSourceWhiteNormalized26790, 1.0e-5);
+             float headroomStart = whitePoint * 0.9925;
+@@ -3276,9 +3292,21 @@ internal object GlesMgcRawSabreShaders {
+                 ? quadHeadroomConfidence26790(q) : phaseHeadroomConfidence26790(q, phaseIndex);
+         }
+ 
++        float temporalNormalized26852(ivec2 p) {
++            p = clamp(p, ivec2(0), uOutputSize - ivec2(1));
++            ivec2 q = p / 2;
++            int phaseIndex = ((p.y & 1) << 1) + (p.x & 1);
++            vec4 signal = texelFetch(uTemporalCfaSignals26852, q, 0);
++            float w = max(texelFetch(uTemporalCfaSupport26852, q, 0).x, 1.0e-8);
++            return signal[phaseIndex] / w;
++        }
+         float rawCode26791(ivec2 p) {
+             p = clamp(p, ivec2(0), uOutputSize - ivec2(1));
+-            // Match extractBayer's scalar representation so inherited Sabre calibration is unchanged.
++            if (uTemporalCfaOwner26852 != 0) {
++                int phaseIndex = ((p.y & 1) << 1) + (p.x & 1);
++                return (temporalNormalized26852(p) - uPhaseBlackTerms26790[phaseIndex]) /
++                    max(uPhaseGains26790[phaseIndex], 1.0e-12) + 1.0e-4;
++            }
+             return float(texelFetch(uRaw26790, p, 0).r) + 1.0e-4;
+         }
+ 
+@@ -3574,15 +3602,28 @@ internal object GlesMgcRawSabreShaders {
+             if (uJpegLcaEnabled26790 == 0 && uJpegNeutralClamp26792 == 0 &&
+                     max(abs(autoKrKb26850.x), abs(autoKrKb26850.y)) < 1.0e-12) {
+                 bayerValue = get3x3FromExtractedBayer(position);
+-                mat3 validityBayerValue26850 = bayerValue;
+-                float headroomStart26850 = max(1.0, uSourceClippingPoint * 0.9925);
+-                for (int sx = 0; sx < 3; ++sx) {
+-                    for (int sy = 0; sy < 3; ++sy) {
+-                        sourceValidity[sx][sy] = 1.0 - smoothstep(
+-                            headroomStart26850,
+-                            max(headroomStart26850 + 1.0e-4, uSourceClippingPoint),
+-                            validityBayerValue26850[sx][sy]
+-                        );
++                if (uTemporalCfaOwner26852 != 0) {
++                    for (int sx = 0; sx < 3; ++sx) {
++                        for (int sy = 0; sy < 3; ++sy) {
++                            ivec2 physicalPixel = clamp(
++                                position + ivec2(sx - 1, sy - 1),
++                                ivec2(0), uOutputSize - ivec2(1));
++                            int phaseIndex = phaseAt26790(physicalPixel);
++                            sourceValidity[sx][sy] = phaseHeadroomConfidence26790(
++                                physicalPixel / 2, phaseIndex);
++                        }
++                    }
++                } else {
++                    mat3 validityBayerValue26850 = bayerValue;
++                    float headroomStart26850 = max(1.0, uSourceClippingPoint * 0.9925);
++                    for (int sx = 0; sx < 3; ++sx) {
++                        for (int sy = 0; sy < 3; ++sy) {
++                            sourceValidity[sx][sy] = 1.0 - smoothstep(
++                                headroomStart26850,
++                                max(headroomStart26850 + 1.0e-4, uSourceClippingPoint),
++                                validityBayerValue26850[sx][sy]
++                            );
++                        }
+                     }
+                 }
+                 return;
+@@ -3683,22 +3724,34 @@ internal object GlesMgcRawSabreShaders {
+                 ? texture(uRejection, referenceUv).r
+                 : 1.0;
+             frameWeight *= iris26720MergeRowReliability(rowReliabilitySampleUv26790.y);
+-            /* IRIS_26834_NORMAL_CLIP_ZONE_PROVENANCE
+-             * Preserve the existing Sabre merge equations exactly. The provenance support is
+-             * sampled before the existing source-clip guard so the mask measures headroom loss
+-             * rather than the guard's consequence. Default 0.9925 is bit-equivalent confidence;
+-             * other clip-start tunings monotonically remap only this read-only sidecar. */
+-            float scalarSupport26834 = dot(accumulatedWeight, vec3(0.25, 0.50, 0.25)) * frameWeight;
+-            float desiredWidth26834 = max(1.0 - clamp(uClipZoneClipStart26834, 0.97, 0.999), 1.0e-4);
+-            float remapExponent26834 = desiredWidth26834 / 0.0075;
+-            float clipConfidence26834 = pow(clamp(sourceNeighborhoodConfidence, 0.0, 1.0), remapExponent26834);
+-            oClipZoneProvenance26834 = uClipZoneEnabled26834 != 0
+-                ? vec2(scalarSupport26834 * clipConfidence26834, scalarSupport26834)
+-                : vec2(0.0);
+-            if (uSourceClipGuard != 0) {
+-                frameWeight *= mix(
+-                    uSourceClippedWeight, 1.0,
+-                    clamp(sourceNeighborhoodConfidence, 0.0, 1.0));
++            /* IRIS_26852_TEMPORAL_CFA_SUPPORT_HANDOFF
++             * The temporal carrier already owns NORMAL frame admission and source-headroom gating as one
++             * scalar per Bayer quad. The one-time 26851 reconstruction consumes that support without
++             * re-selecting R/G/B frames. Clip-zone provenance receives the separately accumulated
++             * pre-headroom denominator and tunable numerator from the same carrier. */
++            float spatialSupport26852 = dot(accumulatedWeight, vec3(0.25, 0.50, 0.25));
++            if (uTemporalCfaOwner26852 != 0) {
++                ivec2 supportQ26852 = outputPixel26790 / 2;
++                vec4 temporalSupport26852 = texelFetch(uTemporalCfaSupport26852, supportQ26852, 0);
++                frameWeight *= max(temporalSupport26852.x, 0.0);
++                oClipZoneProvenance26834 = uClipZoneEnabled26834 != 0
++                    ? spatialSupport26852 * vec2(max(temporalSupport26852.z, 0.0),
++                                                 max(temporalSupport26852.y, 0.0))
++                    : vec2(0.0);
++            } else {
++                /* IRIS_26834_NORMAL_CLIP_ZONE_PROVENANCE */
++                float scalarSupport26834 = spatialSupport26852 * frameWeight;
++                float desiredWidth26834 = max(1.0 - clamp(uClipZoneClipStart26834, 0.97, 0.999), 1.0e-4);
++                float remapExponent26834 = desiredWidth26834 / 0.0075;
++                float clipConfidence26834 = pow(clamp(sourceNeighborhoodConfidence, 0.0, 1.0), remapExponent26834);
++                oClipZoneProvenance26834 = uClipZoneEnabled26834 != 0
++                    ? vec2(scalarSupport26834 * clipConfidence26834, scalarSupport26834)
++                    : vec2(0.0);
++                if (uSourceClipGuard != 0) {
++                    frameWeight *= mix(
++                        uSourceClippedWeight, 1.0,
++                        clamp(sourceNeighborhoodConfidence, 0.0, 1.0));
++                }
+             }
+             accumulatedColor *= frameWeight;
+             accumulatedWeight *= frameWeight;
+@@ -5385,6 +5438,188 @@ internal object GlesMgcRawSabreShaders {
+         }
+     """.trimIndent()
+ 
++    /* IRIS_26852_SINGLE_OWNER_TEMPORAL_CFA_ACCUMULATOR
++     * NORMAL temporal authority before RGB: one reference Bayer quad owns one shared temporal
++     * admission weight for physical R/G1/G2/B. Flow/covariance/rejection remain inherited Sabre.
++     * Signal is black-subtracted/exposure-normalized sensor CFA without calculation-WB. Clipping
++     * can reject a frame only as one quad-wide scalar; phases never select different frames. */
++    val normalCfaTemporalAccumulate26852 = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        precision highp usampler2D;
++        uniform highp usampler2D uRaw;
++        uniform sampler2D uFlow;
++        uniform sampler2D uCovariance;
++        uniform sampler2D uRejection;
++        uniform vec4 uFlowScaleOffset;
++        uniform ivec2 uRawSize;
++        uniform ivec2 uQuadSize;
++        uniform vec4 uFrameBorderPadded;
++        uniform int uUseFrameWeight;
++        uniform vec4 uPhaseGains;
++        uniform vec4 uPhaseBlackTerms;
++        uniform float uSourceWhiteNormalized;
++        uniform vec4 uCovRangeRg;
++        uniform vec2 uCovRangeB;
++        uniform int uRowFlickerEnabled;
++        uniform int uRowFlickerHarmonic;
++        uniform vec2 uRowFlickerAB;
++        uniform float uRowFlickerStrength;
++        uniform float uClipZoneClipStart26834;
++        layout(location = 0) out vec4 oPhaseSignal;
++        /* x=merge-valid shared temporal support; y=pre-headroom total support;
++         * z=clip-zone numerator under the existing tunable headroom remap; w reserved. */
++        layout(location = 1) out vec4 oSharedSupport;
++        /* R/G1/G2/B validity is provenance inside the SAME shared temporal admission.
++         * It can protect later SHORT/fusion decisions but can never choose frames per color. */
++        layout(location = 2) out vec4 oPhaseValidity;
++
++        vec2 mirrorUvs(vec2 uv) {
++            if (uv.x <= uFrameBorderPadded.x) uv.x = 2.0 * uFrameBorderPadded.x - uv.x;
++            if (uv.y <= uFrameBorderPadded.y) uv.y = 2.0 * uFrameBorderPadded.y - uv.y;
++            if (uv.x > uFrameBorderPadded.z) uv.x = 2.0 * uFrameBorderPadded.z - uv.x;
++            if (uv.y > uFrameBorderPadded.w) uv.y = 2.0 * uFrameBorderPadded.w - uv.y;
++            return uv;
++        }
++        int phaseAt(ivec2 p) { return ((p.y & 1) << 1) + (p.x & 1); }
++        ivec2 phaseOffset(int phase) { return ivec2(phase & 1, phase >> 1); }
++        ivec2 clampPhaseLattice(ivec2 q, int phase) {
++            ivec2 off = phaseOffset(phase);
++            ivec2 maximum = max((uRawSize - ivec2(1) - off) / 2, ivec2(0));
++            return clamp(q, ivec2(0), maximum);
++        }
++        ivec2 pixelForPhaseLattice(ivec2 q, int phase) {
++            return clampPhaseLattice(q, phase) * 2 + phaseOffset(phase);
++        }
++        float normalizedRaw(ivec2 p) {
++            p = clamp(p, ivec2(0), uRawSize - ivec2(1));
++            int phase = phaseAt(p);
++            return float(texelFetch(uRaw, p, 0).r) * uPhaseGains[phase] + uPhaseBlackTerms[phase];
++        }
++        float headroomAt(ivec2 p) {
++            float whitePoint = max(uSourceWhiteNormalized, 1.0e-5);
++            float start = whitePoint * 0.9925;
++            return 1.0 - smoothstep(start, max(start + 1.0e-5, whitePoint), normalizedRaw(p));
++        }
++        float kernelWeight(vec2 d, vec3 c) {
++            float kd = d.x*d.x*c.x + d.y*d.y*c.y + d.x*d.y*c.z*2.0;
++            return exp2(-0.5 * kd) + 0.00005;
++        }
++        vec3 unpackCovariance(vec3 packedCovariance) {
++            return vec3(
++                packedCovariance.x * uCovRangeRg.y + uCovRangeRg.x,
++                packedCovariance.y * uCovRangeRg.w + uCovRangeRg.z,
++                packedCovariance.z * uCovRangeB.y + uCovRangeB.x);
++        }
++        float rowReliability(float rowUv) {
++            if (uRowFlickerEnabled == 0 || uRowFlickerHarmonic <= 0 || uRowFlickerStrength <= 0.0) return 1.0;
++            float phase = 6.283185307179586 * float(uRowFlickerHarmonic) * clamp(rowUv, 0.0, 1.0);
++            float logModulation = uRowFlickerAB.x * cos(phase) + uRowFlickerAB.y * sin(phase);
++            float amplitude = length(uRowFlickerAB);
++            float darkMagnitude = max(-logModulation, 0.0);
++            float darkBand = smoothstep(0.010, max(0.030, amplitude * 0.90), darkMagnitude);
++            return mix(1.0, 0.08, clamp(darkBand * clamp(uRowFlickerStrength, 0.0, 1.0), 0.0, 1.0));
++        }
++        void samplePhase(vec2 sourceCenter, int phase, vec3 covariance,
++                         out float value, out float headroom) {
++            ivec2 off = phaseOffset(phase);
++            vec2 lattice = 0.5 * (sourceCenter - (vec2(off) + vec2(0.5)));
++            ivec2 nearest = ivec2(floor(lattice + vec2(0.5)));
++            vec2 nearestDelta = lattice - vec2(nearest);
++            if (max(abs(nearestDelta.x), abs(nearestDelta.y)) < 1.0e-5) {
++                ivec2 p = pixelForPhaseLattice(nearest, phase);
++                value = normalizedRaw(p);
++                headroom = headroomAt(p);
++                return;
++            }
++            ivec2 base = ivec2(floor(lattice));
++            float sum = 0.0;
++            float weight = 0.0;
++            headroom = 1.0;
++            for (int ly = 0; ly <= 1; ++ly) {
++                for (int lx = 0; lx <= 1; ++lx) {
++                    ivec2 q = clampPhaseLattice(base + ivec2(lx, ly), phase);
++                    ivec2 p = pixelForPhaseLattice(q, phase);
++                    vec2 center = vec2(p) + vec2(0.5);
++                    float w = kernelWeight(center - sourceCenter, covariance);
++                    sum += normalizedRaw(p) * w;
++                    weight += w;
++                    headroom = min(headroom, headroomAt(p));
++                }
++            }
++            value = sum / max(weight, 1.0e-8);
++        }
++        float quadRejection(ivec2 quadOrigin) {
++            if (uUseFrameWeight == 0) return 1.0;
++            ivec2 maxPixel = uRawSize - ivec2(1);
++            vec2 invRaw = 1.0 / vec2(uRawSize);
++            ivec2 p00 = clamp(quadOrigin, ivec2(0), maxPixel);
++            ivec2 p10 = clamp(quadOrigin + ivec2(1,0), ivec2(0), maxPixel);
++            ivec2 p01 = clamp(quadOrigin + ivec2(0,1), ivec2(0), maxPixel);
++            ivec2 p11 = clamp(quadOrigin + ivec2(1,1), ivec2(0), maxPixel);
++            float w00 = texture(uRejection, (vec2(p00)+vec2(0.5))*invRaw).r;
++            float w10 = texture(uRejection, (vec2(p10)+vec2(0.5))*invRaw).r;
++            float w01 = texture(uRejection, (vec2(p01)+vec2(0.5))*invRaw).r;
++            float w11 = texture(uRejection, (vec2(p11)+vec2(0.5))*invRaw).r;
++            return min(min(w00,w10),min(w01,w11));
++        }
++        void main() {
++            ivec2 q = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uQuadSize - ivec2(1));
++            ivec2 quadOrigin = q * 2;
++            vec2 rawSize = vec2(uRawSize);
++            vec2 referenceUv = (vec2(quadOrigin) + vec2(1.0)) / rawSize;
++            vec2 flowUv = referenceUv * uFlowScaleOffset.xy + uFlowScaleOffset.zw;
++            vec2 sourceUv = mirrorUvs(referenceUv + texture(uFlow, flowUv).xy);
++            vec2 translation = (sourceUv - referenceUv) * rawSize;
++            vec3 covariance = unpackCovariance(texture(uCovariance, sourceUv).xyz);
++            vec4 phaseSignal = vec4(0.0);
++            vec4 phaseHeadroom = vec4(1.0);
++            float sharedHeadroom = 1.0;
++            for (int phase = 0; phase < 4; ++phase) {
++                float v; float h;
++                vec2 targetCenter = vec2(quadOrigin + phaseOffset(phase)) + vec2(0.5) + translation;
++                samplePhase(targetCenter, phase, covariance, v, h);
++                phaseSignal[phase] = v;
++                phaseHeadroom[phase] = h;
++                sharedHeadroom = min(sharedHeadroom, h);
++            }
++            float baseWeight = quadRejection(quadOrigin) * rowReliability(sourceUv.y);
++            float validWeight = baseWeight * (uUseFrameWeight != 0
++                ? sharedHeadroom : mix(0.001, 1.0, sharedHeadroom));
++            float desiredWidth = max(1.0 - clamp(uClipZoneClipStart26834, 0.97, 0.999), 1.0e-4);
++            float remapExponent = desiredWidth / 0.0075;
++            float clipConfidence = pow(clamp(sharedHeadroom, 0.0, 1.0), remapExponent);
++            oPhaseSignal = phaseSignal * validWeight;
++            oSharedSupport = vec4(validWeight, baseWeight, baseWeight * clipConfidence, 0.0);
++            oPhaseValidity = phaseHeadroom * validWeight;
++        }
++    """.trimIndent()
++
++    /* IRIS_26852_TEMPORAL_CFA_TO_26851_EXTRACTED_ADAPTER
++     * Convert the temporally completed physical CFA back to the exact extracted-Bayer raw-code
++     * interface consumed by the successful 26851 merge topology. No DNG neutral-coherence,
++     * demosaic, WB, hue donation or cross-phase substitution occurs here. */
++    val normalCfaExtract26852 = """
++        #version 300 es
++        precision highp float;
++        uniform sampler2D uPhaseSignal;
++        uniform sampler2D uSharedSupport;
++        uniform ivec2 uQuadSize;
++        uniform vec4 uReferencePhaseGains;
++        uniform vec4 uReferencePhaseBlackTerms;
++        layout(location = 0) out vec4 oExtractedBayer;
++        void main() {
++            ivec2 q = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uQuadSize - ivec2(1));
++            vec4 signal = texelFetch(uPhaseSignal, q, 0);
++            float w = max(texelFetch(uSharedSupport, q, 0).x, 1.0e-8);
++            vec4 normalized = signal / w;
++            vec4 rawCode = (normalized - uReferencePhaseBlackTerms) /
++                max(uReferencePhaseGains, vec4(1.0e-12));
++            oExtractedBayer = max(rawCode, vec4(0.0)) + vec4(1.0e-4);
++        }
++    """.trimIndent()
++
+     /**
+      * IRIS_26545_SABRE_NORMALIZED16_DNG
+      * RAW-only companion to Sabre merge. It consumes the exact Sabre sparse flow, covariance
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 4b14e96c763107e64e61e707a6e22a54d8970205..f9795f0eb753ce15713d0a9462b880501aafc43d 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -658,6 +658,8 @@ internal class GlesMgcRawSpatialStacker(
+     private var sabreExtractBayerProgram = 0
+     private var sabreGuideAndCovarianceProgram = 0
+     private var sabreMergeProgram = 0
++    private var sabreNormalCfaTemporalAccumulateProgram26852 = 0
++    private var sabreNormalCfaExtractProgram26852 = 0
+     private var sabreSuperResDetailMergeProgram = 0
+     private var sabreSuperResDetailResolveProgram = 0
+     private var sabreSuperResLinearRawProgram = 0
+@@ -2422,32 +2424,23 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_RGB10_A2,
+                 GLES30.GL_LINEAR,
+             )
+-            val accumulatedColor = createTexture(
+-                width,
+-                height,
+-                GLES30.GL_RGBA16F,
+-                GLES30.GL_NEAREST,
++            /* IRIS_26852_SINGLE_OWNER_TEMPORAL_CFA_CARRIER
++             * Physical phase order is sensor parity 0/1/2/3 = one Bayer quad. Signals and one
++             * shared admission/support vector persist only through NORMAL completion; no RGB is
++             * accumulated per frame. */
++            val normalCfaSignals26852 = createTexture(
++                extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+             )
+-            val accumulatedWeightsGb = createTexture(
+-                width,
+-                height,
+-                GLES30.GL_RG16F,
+-                GLES30.GL_NEAREST,
++            val normalCfaSupport26852 = createTexture(
++                extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+             )
+-            /* IRIS_26614_RAW_CFA_CHANNEL_VALIDITY_OWNER
+-             * Additive per-channel valid-measurement weight. Existing color and total-weight
+-             * accumulators are byte-for-byte equation owners and this sidecar never feeds them. */
+-            val accumulatedValidity26614 = createTexture(
+-                width,
+-                height,
+-                GLES30.GL_RGB10_A2,
+-                GLES30.GL_NEAREST,
++            val normalCfaValidity26852 = createTexture(
++                extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
++            )
++            clearSabreNormalCfaTemporal26852(
++                normalCfaSignals26852, normalCfaSupport26852, normalCfaValidity26852,
++                extractedWidth, extractedHeight,
+             )
+-            /* IRIS_26834_NORMAL_CLIP_ZONE_PROVENANCE
+-             * NORMAL-only scalar numerator/denominator. No LONG, SHORT, RGB or DNG ownership. */
+-            var clipZoneProvenance26834 = if (edgeFalseColor26778.clipZoneEnabled) {
+-                createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
+-            } else 0
+             /* IRIS_26564_TRUE_2X_RETIRES_NATIVE_UPSCALE_DETAIL_OWNER
+              * Keep the old carrier functions dormant for rollback provenance, but allocate no
+              * full-frame 2x luma/detail surface. True 2x is direct multiframe CFA reconstruction.
+@@ -2493,21 +2486,12 @@ internal class GlesMgcRawSpatialStacker(
+             } else {
+                 0
+             }
+-            clearSabreAccumulators(
+-                accumulatedColor,
+-                accumulatedWeightsGb,
++            clearSabreCoverage(
+                 accumulatedCoverage,
+                 coverageWidth,
+                 coverageHeight,
+-                accumulatedValidity26614,
++                "26852 NORMAL coverage clear before temporal CFA",
+             )
+-            if (clipZoneProvenance26834 != 0) {
+-                bindRenderTargets(intArrayOf(clipZoneProvenance26834), "26834 clip-zone provenance clear")
+-                GLES30.glViewport(0, 0, width, height)
+-                GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
+-                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+-                checkGlError("26834 clip-zone provenance clear")
+-            }
+             if (normalDngAccumulator != 0) {
+                 clearSabreNormalDngAccumulator(normalDngAccumulator)
+                 if (normalDngCoverage != 0) {
+@@ -2595,39 +2579,21 @@ internal class GlesMgcRawSpatialStacker(
+              * neighborhood contributes at most five unit-kernel samples to any single channel;
+              * reserve six units per scheduled evidence frame so additive blending cannot saturate. */
+             val validityWeightScale26614 = 6f * scheduledEvidenceCount26606.coerceAtLeast(1).toFloat()
+-            renderSabreMerge(
+-                raw26790 = referenceRaw,
+-                extracted = referenceExtracted,
++            renderSabreNormalCfaTemporalAccumulate26852(
++                raw = referenceRaw,
+                 flow = zeroFlow,
+                 covariance = referenceCovariance,
+                 weight = identityWeight,
+                 calibration = referenceCalibration,
+-                accumulatedColor = accumulatedColor,
+-                accumulatedWeightsGb = accumulatedWeightsGb,
++                phaseSignals = normalCfaSignals26852,
++                sharedSupport = normalCfaSupport26852,
++                phaseValidity = normalCfaValidity26852,
+                 extractedWidth = extractedWidth,
+                 extractedHeight = extractedHeight,
+                 useFrameWeight = false,
+-                /* IRIS_26776_BLOCK_UNIFORM_CFA_CLIP_WEIGHT_OWNER
+-                 * One scalar sourceNeighborhoodConfidence already covers the complete consumed 3x3
+-                 * CFA footprint. Make it authoritative for reference NORMAL as well, so clipping can
+-                 * never create independent R/G/B temporal ownership. */
+-                sourceClipGuard = true,
+-                sourceClippedWeight = 0.001f,
+-                accumulatedValidity26614 = accumulatedValidity26614,
+-                validityWeightScale26614 = validityWeightScale26614,
+-                clipZoneProvenance26834 = clipZoneProvenance26834,
+-                clipZoneEnabled26834 = edgeFalseColor26778.clipZoneEnabled,
+-                clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
++                sourceWhiteNormalized = 1f,
+                 rowFlickerFrame26720 = frames.first().takeIf(::hasRowFlickerEvidence26720),
+-                jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
+-                jpegLcaKr26790 = dngOptions26786.kR,
+-                jpegLcaKb26790 = dngOptions26786.kB,
+-                dngQuadHeadroom26790 = dngOptions26786.quadScopedHeadroom,
+-                dngEdgeDeAlias26790 = dngOptions26786.edgeDeAlias,
+-                jpegNeutralClamp26792 = dngOptions26786.neutralClamp,
+-                sourceWhiteNormalized26790 = 1f,
+-                normalChromaConsensus26790 = 0,
+-                longChromaGuard26790 = false,
++                clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
+             )
+             if (enableSabreSuperRes) {
+                 val referenceEvidence = persistTrue2xEvidence(
+@@ -2868,35 +2834,21 @@ internal class GlesMgcRawSpatialStacker(
+                             accumulatedWeightScale,
+                         )
+                     }
+-                    renderSabreMerge(
+-                        raw26790 = currentRaw,
+-                        extracted = currentExtracted,
++                    renderSabreNormalCfaTemporalAccumulate26852(
++                        raw = currentRaw,
+                         flow = flow,
+                         covariance = currentCovariance,
+                         weight = frameWeight,
+                         calibration = calibration,
+-                        accumulatedColor = accumulatedColor,
+-                        accumulatedWeightsGb = accumulatedWeightsGb,
++                        phaseSignals = normalCfaSignals26852,
++                        sharedSupport = normalCfaSupport26852,
++                        phaseValidity = normalCfaValidity26852,
+                         extractedWidth = extractedWidth,
+                         extractedHeight = extractedHeight,
+                         useFrameWeight = true,
+-                        sourceClipGuard = true,
+-                        sourceClippedWeight = 0f,
+-                        accumulatedValidity26614 = accumulatedValidity26614,
+-                        validityWeightScale26614 = validityWeightScale26614,
+-                        clipZoneProvenance26834 = clipZoneProvenance26834,
+-                        clipZoneEnabled26834 = edgeFalseColor26778.clipZoneEnabled,
+-                        clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
++                        sourceWhiteNormalized = exposureScale,
+                         rowFlickerFrame26720 = frame.takeIf(::hasRowFlickerEvidence26720),
+-                        jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
+-                        jpegLcaKr26790 = dngOptions26786.kR,
+-                        jpegLcaKb26790 = dngOptions26786.kB,
+-                        dngQuadHeadroom26790 = dngOptions26786.quadScopedHeadroom,
+-                        dngEdgeDeAlias26790 = dngOptions26786.edgeDeAlias,
+-                        jpegNeutralClamp26792 = dngOptions26786.neutralClamp,
+-                        sourceWhiteNormalized26790 = exposureScale,
+-                        normalChromaConsensus26790 = 0,
+-                        longChromaGuard26790 = false,
++                        clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
+                     )
+                 } else if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
+                     require(index in firstAux26790 until longAuxEnd26833) {
+@@ -3060,6 +3012,92 @@ internal class GlesMgcRawSpatialStacker(
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+ 
++            /* IRIS_26852_DELAYED_RGB_ADAPTER_ALLOCATION
++             * The retired per-frame RGB temporal owner must not remain resident during the CFA loop.
++             * Allocate the inherited 26851 RGB/support/provenance interface only after NORMAL CFA
++             * completion, immediately before the one-time CFA->RGB adapter. */
++            val accumulatedColor = createTexture(
++                width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
++            )
++            val accumulatedWeightsGb = createTexture(
++                width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST,
++            )
++            val accumulatedValidity26614 = createTexture(
++                width, height, GLES30.GL_RGB10_A2, GLES30.GL_NEAREST,
++            )
++            var clipZoneProvenance26834 = if (edgeFalseColor26778.clipZoneEnabled) {
++                createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
++            } else 0
++            clearRgbAccumulators(accumulatedColor, accumulatedWeightsGb, width, height)
++            bindRenderTargets(intArrayOf(accumulatedValidity26614), "26852 delayed channel-validity clear")
++            GLES30.glViewport(0, 0, width, height)
++            GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
++            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++            checkGlError("26852 delayed channel-validity clear")
++            if (clipZoneProvenance26834 != 0) {
++                bindRenderTargets(intArrayOf(clipZoneProvenance26834), "26852 delayed clip-zone provenance clear")
++                GLES30.glViewport(0, 0, width, height)
++                GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
++                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++                checkGlError("26852 delayed clip-zone provenance clear")
++            }
++
++            /* IRIS_26852_ONE_TIME_CFA_TO_RGB_RECONSTRUCTION_OWNER
++             * All NORMAL frames are complete in physical CFA. Convert that one merged carrier to
++             * the exact successful-26851 extracted/raw-code interface and invoke the inherited
++             * 26846-26851 topology once. Old per-frame NORMAL RGB accumulation is inactive. */
++            val normalCfaExtracted26852 = renderSabreNormalCfaExtract26852(
++                phaseSignals = normalCfaSignals26852,
++                sharedSupport = normalCfaSupport26852,
++                referenceCalibration = referenceCalibration,
++                extractedWidth = extractedWidth,
++                extractedHeight = extractedHeight,
++            )
++            renderSabreMerge(
++                raw26790 = referenceRaw,
++                extracted = normalCfaExtracted26852,
++                flow = zeroFlow,
++                covariance = referenceCovariance,
++                weight = identityWeight,
++                calibration = referenceCalibration,
++                accumulatedColor = accumulatedColor,
++                accumulatedWeightsGb = accumulatedWeightsGb,
++                extractedWidth = extractedWidth,
++                extractedHeight = extractedHeight,
++                useFrameWeight = false,
++                sourceClipGuard = false,
++                sourceClippedWeight = 0f,
++                accumulatedValidity26614 = accumulatedValidity26614,
++                validityWeightScale26614 = validityWeightScale26614,
++                clipZoneProvenance26834 = clipZoneProvenance26834,
++                clipZoneEnabled26834 = edgeFalseColor26778.clipZoneEnabled,
++                clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
++                rowFlickerFrame26720 = null,
++                jpegIntegratedLca26790 = dngOptions26786.lcaEnabled,
++                jpegLcaKr26790 = dngOptions26786.kR,
++                jpegLcaKb26790 = dngOptions26786.kB,
++                dngQuadHeadroom26790 = dngOptions26786.quadScopedHeadroom,
++                dngEdgeDeAlias26790 = dngOptions26786.edgeDeAlias,
++                jpegNeutralClamp26792 = dngOptions26786.neutralClamp,
++                sourceWhiteNormalized26790 = 1f,
++                normalChromaConsensus26790 = 0,
++                longChromaGuard26790 = false,
++                temporalCfaSignals26852 = normalCfaSignals26852,
++                temporalCfaSupport26852 = normalCfaSupport26852,
++                temporalCfaValidity26852 = normalCfaValidity26852,
++            )
++            PLog.i(
++                SABRE_TAG,
++                "IRIS_26852_TEMPORAL_CFA_OWNER normalFrames=$mergedFrameCount " +
++                    "reference=FIRST_NORMAL sharedQuadAdmission=true phases=R_G1_G2_B " +
++                    "phaseValidityProvenance=true perFrameRgb=false oneTime26851Reconstruction=true " +
++                    "crossPhaseTemporalSelection=false",
++            )
++            releaseOwnedTexture(normalCfaExtracted26852, "26852 one-time extracted CFA adapter")
++            releaseOwnedTexture(normalCfaSignals26852, "26852 completed temporal CFA signals")
++            releaseOwnedTexture(normalCfaSupport26852, "26852 completed temporal CFA shared support")
++            releaseOwnedTexture(normalCfaValidity26852, "26852 completed temporal CFA phase validity")
++
+             /* IRIS_26545_SABRE_MEASURED_SUPPORT
+              * Match current MGC/Sabre behavior: derive the merged noise coefficient from the
+              * actual accumulated green weights after all temporal rejection/merge decisions.
+@@ -3183,7 +3221,7 @@ internal class GlesMgcRawSpatialStacker(
+             PLog.i(
+                 SABRE_TAG,
+                 "IRIS_26792_CFA_NEUTRAL_OWNER enabled=${dngOptions26786.neutralClamp} " +
+-                    "normalPerFrameCfa=true longRgbAuthority=false temporalContinuous=true postRgbClamp=false " +
++                    "normalTemporalCfaOwner26852=true normalPerFrameRgb=false sharedQuadAdmission=true longRgbAuthority=false postRgbClamp=false " +
+                     "bothGreenRule=true oneGreenDoesNotForceNeutral=true",
+             )
+             if (normalDngAccumulator != 0) {
+@@ -3285,8 +3323,8 @@ internal class GlesMgcRawSpatialStacker(
+                     "neutralClamp=${dngOptions26786.neutralClamp} neutralGate=LITERAL_NORMAL_DNG_ACCUMULATOR_WEIGHTS__FULL_NEUTRAL_WHITE_CEILING " +
+                     "headroomScope=${dngOptions26786.headroomScopeName()} " +
+                     "deAlias=${dngOptions26786.edgeDeAlias} settingsSource=${dngOptions26786.source} " +
+-                    "normalCfaOwner=DNG_DERIVED_SCALAR_FIXED_PHASE sabreRgbOwner=true " +
+-                    "singleRbfTopology=true directFourPhaseRgb=false lcaChangesPhase=false " +
++                    "normalCfaOwner=26852_SHARED_WEIGHT_TEMPORAL_R_G1_G2_B sabreRgbOwner=true " +
++                    "singleRbfTopology=true perFrameRgb=false oneTimeCfaToRgb=true lcaChangesPhase=false " +
+                     "postRgbLcaRetired=true normalLongPrewarpRetired=true " +
+                     "longRgbAuthority=false longHueAuthority=false longOwner=POST_VGN_SCALAR_LUMINANCE_ONLY",
+             )
+@@ -5334,6 +5372,112 @@ internal class GlesMgcRawSpatialStacker(
+         return (gyroQuality * focusQuality).coerceIn(0.35f, 1f)
+     }
+ 
++    private fun clearSabreNormalCfaTemporal26852(
++        phaseSignals: Int,
++        sharedSupport: Int,
++        phaseValidity: Int,
++        quadWidth: Int,
++        quadHeight: Int,
++    ) {
++        check(phaseSignals != 0 && sharedSupport != 0 && phaseValidity != 0)
++        bindRenderTargets(intArrayOf(phaseSignals, sharedSupport, phaseValidity), "26852 temporal CFA clear")
++        GLES30.glViewport(0, 0, quadWidth, quadHeight)
++        GLES30.glClearBufferfv(GLES30.GL_COLOR, 0, floatArrayOf(0f, 0f, 0f, 0f), 0)
++        GLES30.glClearBufferfv(GLES30.GL_COLOR, 1, floatArrayOf(0f, 0f, 0f, 0f), 0)
++        GLES30.glClearBufferfv(GLES30.GL_COLOR, 2, floatArrayOf(0f, 0f, 0f, 0f), 0)
++        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
++        checkGlError("26852 temporal CFA clear")
++    }
++
++    private fun renderSabreNormalCfaTemporalAccumulate26852(
++        raw: Int,
++        flow: SabreConvertedAlignment,
++        covariance: Int,
++        weight: Int,
++        calibration: FrameCalibration,
++        phaseSignals: Int,
++        sharedSupport: Int,
++        phaseValidity: Int,
++        extractedWidth: Int,
++        extractedHeight: Int,
++        useFrameWeight: Boolean,
++        sourceWhiteNormalized: Float,
++        rowFlickerFrame26720: RawStackFrame?,
++        clipZoneClipStart26834: Float,
++    ) {
++        val program = sabreNormalCfaTemporalAccumulateProgram26852
++        check(program != 0 && raw != 0 && phaseSignals != 0 && sharedSupport != 0 && phaseValidity != 0)
++        val rowFlickerActive26720 = rowFlickerFrame26720?.let(::hasRowFlickerEvidence26720) == true
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uRaw", 0, raw)
++        bindTexture(program, "uFlow", 1, flow.texture)
++        bindTexture(program, "uCovariance", 2, covariance)
++        bindTexture(program, "uRejection", 3, weight)
++        uniformSabreFlowScaleOffset(program, flow)
++        uniform2i(program, "uRawSize", width, height)
++        uniform2i(program, "uQuadSize", extractedWidth, extractedHeight)
++        uniform4f(
++            program, "uFrameBorderPadded",
++            SABRE_SAMPLE_BORDER_PIXELS / width,
++            SABRE_SAMPLE_BORDER_PIXELS / height,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / width,
++            1f - SABRE_SAMPLE_BORDER_PIXELS / height,
++        )
++        uniform1i(program, "uUseFrameWeight", if (useFrameWeight) 1 else 0)
++        uniform4fv(program, "uPhaseGains", calibration.bayerPhaseGains)
++        uniform4fv(program, "uPhaseBlackTerms", calibration.bayerPhaseBlackTerms)
++        uniform1f(program, "uSourceWhiteNormalized", sourceWhiteNormalized.coerceAtLeast(1.0e-5f))
++        uniform4f(
++            program, "uCovRangeRg",
++            COV_MIN_R, COV_MAX_R - COV_MIN_R,
++            COV_MIN_G, COV_MAX_G - COV_MIN_G,
++        )
++        uniform2f(program, "uCovRangeB", COV_MIN_B, COV_MAX_B - COV_MIN_B)
++        uniform1i(program, "uRowFlickerEnabled", if (rowFlickerActive26720) 1 else 0)
++        if (rowFlickerActive26720) {
++            val f = checkNotNull(rowFlickerFrame26720)
++            uniform1i(program, "uRowFlickerHarmonic", f.rowFlickerHarmonic)
++            uniform2f(program, "uRowFlickerAB", f.rowFlickerA, f.rowFlickerB)
++            uniform1f(program, "uRowFlickerStrength", f.rowFlickerStrength.coerceIn(0f, 1f))
++        } else {
++            uniform1i(program, "uRowFlickerHarmonic", 0)
++            uniform2f(program, "uRowFlickerAB", 0f, 0f)
++            uniform1f(program, "uRowFlickerStrength", 0f)
++        }
++        uniform1f(program, "uClipZoneClipStart26834", clipZoneClipStart26834.coerceIn(0.97f, 0.999f))
++        GLES30.glEnable(GLES30.GL_BLEND)
++        try {
++            GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
++            GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
++            draw(
++                program, extractedWidth, extractedHeight,
++                intArrayOf(phaseSignals, sharedSupport, phaseValidity), preserveBlend = true,
++            )
++        } finally {
++            GLES30.glDisable(GLES30.GL_BLEND)
++        }
++    }
++
++    private fun renderSabreNormalCfaExtract26852(
++        phaseSignals: Int,
++        sharedSupport: Int,
++        referenceCalibration: FrameCalibration,
++        extractedWidth: Int,
++        extractedHeight: Int,
++    ): Int {
++        val program = sabreNormalCfaExtractProgram26852
++        check(program != 0 && phaseSignals != 0 && sharedSupport != 0)
++        val output = createTexture(extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++        GLES30.glUseProgram(program)
++        bindTexture(program, "uPhaseSignal", 0, phaseSignals)
++        bindTexture(program, "uSharedSupport", 1, sharedSupport)
++        uniform2i(program, "uQuadSize", extractedWidth, extractedHeight)
++        uniform4fv(program, "uReferencePhaseGains", referenceCalibration.bayerPhaseGains)
++        uniform4fv(program, "uReferencePhaseBlackTerms", referenceCalibration.bayerPhaseBlackTerms)
++        draw(program, extractedWidth, extractedHeight, intArrayOf(output))
++        return output
++    }
++
+     private fun renderSabreMerge(
+         raw26790: Int,
+         extracted: Int,
+@@ -5363,6 +5507,9 @@ internal class GlesMgcRawSpatialStacker(
+         sourceWhiteNormalized26790: Float = 1f,
+         normalChromaConsensus26790: Int = 0,
+         longChromaGuard26790: Boolean = false,
++        temporalCfaSignals26852: Int = 0,
++        temporalCfaSupport26852: Int = 0,
++        temporalCfaValidity26852: Int = 0,
+     ) {
+         val rowFlickerActive26720 = rowFlickerFrame26720?.let(::hasRowFlickerEvidence26720) == true
+         val program = sabreMergeProgram
+@@ -5385,6 +5532,18 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1i(program, "uJpegNeutralClamp26792", if (jpegNeutralClamp26792) 1 else 0)
+         uniform1f(program, "uSourceWhiteNormalized26790", sourceWhiteNormalized26790)
+         uniform1i(program, "uLongChromaGuard26790", if (longChromaGuard26790) 1 else 0)
++        val temporalCfaOwner26852 = temporalCfaSignals26852 != 0 ||
++            temporalCfaSupport26852 != 0 || temporalCfaValidity26852 != 0
++        check(!temporalCfaOwner26852 || (temporalCfaSignals26852 != 0 &&
++            temporalCfaSupport26852 != 0 && temporalCfaValidity26852 != 0)) {
++            "26852 temporal CFA adapter requires signal, shared-support and phase-validity textures"
++        }
++        uniform1i(program, "uTemporalCfaOwner26852", if (temporalCfaOwner26852) 1 else 0)
++        if (temporalCfaOwner26852) {
++            bindTexture(program, "uTemporalCfaSignals26852", 6, temporalCfaSignals26852)
++            bindTexture(program, "uTemporalCfaSupport26852", 7, temporalCfaSupport26852)
++            bindTexture(program, "uTemporalCfaValidity26852", 8, temporalCfaValidity26852)
++        }
+         uniform4fv(program, "uPhaseGains26790", calibration.bayerPhaseGains)
+         uniform4fv(program, "uPhaseBlackTerms26790", calibration.bayerPhaseBlackTerms)
+         val phaseWhiteBalance26790 = FloatArray(4) { phase ->
+@@ -7169,6 +7328,14 @@ internal class GlesMgcRawSpatialStacker(
+             "mgc_sabre_dilate_rejection",
+         )
+         sabreMergeProgram = linkProgram(GlesMgcRawSabreShaders.merge, "mgc_sabre_merge")
++        sabreNormalCfaTemporalAccumulateProgram26852 = linkProgram(
++            GlesMgcRawSabreShaders.normalCfaTemporalAccumulate26852,
++            "iris_26852_normal_cfa_temporal_accumulate",
++        )
++        sabreNormalCfaExtractProgram26852 = linkProgram(
++            GlesMgcRawSabreShaders.normalCfaExtract26852,
++            "iris_26852_normal_cfa_extract",
++        )
+         sabreClipZoneMaskDilateProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneMaskDilate26834, "iris_26834_clip_zone_mask_dilate")
+         sabreClipZoneGaussianProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneGaussian26834, "iris_26834_clip_zone_gaussian")
+         sabreClipZoneProductsProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneProducts26834, "iris_26834_clip_zone_products")
+diff --git a/app/version.properties b/app/version.properties
+index 3a38917d526b9d106c3a37a7f7273d81090a9507..392caba25762d5b0484ccf177b79ffb44423936c 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726851
+-VERSION_BUILD=26851
++VERSION_NAME=0.9726852
++VERSION_BUILD=26852
