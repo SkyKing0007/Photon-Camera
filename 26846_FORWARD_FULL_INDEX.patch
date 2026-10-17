@@ -1,0 +1,128 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index 26897d8ab66d50e899b41b67f2586017b072f69e..6c37898c80f51a00082230c0d62a36832ad0391e 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -2756,6 +2756,13 @@ internal object GlesMgcRawSabreShaders {
+             }
+         }
+ 
++        /* IRIS_26846_CFA_PHASE_BALANCED_GREEN_SUPPORT
++         * Preserve the successful 26829 same-location R-G/B-G owner, but do not collapse unequal
++         * G1/G2 physical support into one apparently healthy green-confidence scalar. Horizontal
++         * and vertical orthogonal greens are the two physical green CFA phases around an R/B site.
++         * Keep the inherited aggregate predictor/value exactly; expose only the weaker phase support
++         * so a single healthy green phase cannot independently authorize false chroma. No phase is
++         * substituted, no neighboring hue is donated, and fully balanced support is unchanged. */
+         float predictSameLocationGreen26793(
+             mat3 calculationCfa,
+             mat3 calculationClipCfa,
+@@ -2766,12 +2773,17 @@ internal object GlesMgcRawSabreShaders {
+             float verticalGreenWeight,
+             int useGreenSupport,
+             out float greenConfidence,
++            out float greenPhaseBalance26846,
+             out float predictedGreenClip
+         ) {
+             float numerator = 0.0;
+             float clipNumerator = 0.0;
+             float supportedWeight = 0.0;
+             float fullWeight = 0.0;
++            float horizontalSupportedWeight26846 = 0.0;
++            float horizontalFullWeight26846 = 0.0;
++            float verticalSupportedWeight26846 = 0.0;
++            float verticalFullWeight26846 = 0.0;
+             int redGroup = type;
+             int blueGroup = 3 - type;
+             for (int dx = -1; dx <= 1; ++dx) {
+@@ -2789,12 +2801,27 @@ internal object GlesMgcRawSabreShaders {
+                     float supportedSpatialWeight = spatialWeight * physicalSupport;
+                     fullWeight += spatialWeight;
+                     supportedWeight += supportedSpatialWeight;
++                    if (dx != 0) {
++                        horizontalFullWeight26846 += spatialWeight;
++                        horizontalSupportedWeight26846 += supportedSpatialWeight;
++                    } else {
++                        verticalFullWeight26846 += spatialWeight;
++                        verticalSupportedWeight26846 += supportedSpatialWeight;
++                    }
+                     numerator += calculationCfa[q.x][q.y] * supportedSpatialWeight;
+                     clipNumerator += calculationClipCfa[q.x][q.y] * supportedSpatialWeight;
+                 }
+             }
+             greenConfidence = clamp(
+                 supportedWeight / max(fullWeight, 1.0e-7), 0.0, 1.0);
++            float horizontalConfidence26846 = horizontalFullWeight26846 > 1.0e-7
++                ? horizontalSupportedWeight26846 / horizontalFullWeight26846
++                : greenConfidence;
++            float verticalConfidence26846 = verticalFullWeight26846 > 1.0e-7
++                ? verticalSupportedWeight26846 / verticalFullWeight26846
++                : greenConfidence;
++            greenPhaseBalance26846 = clamp(
++                min(horizontalConfidence26846, verticalConfidence26846), 0.0, 1.0);
+             if (supportedWeight <= 1.0e-7) {
+                 predictedGreenClip = 0.0;
+                 return 0.0;
+@@ -2843,16 +2870,49 @@ internal object GlesMgcRawSabreShaders {
+                     else blueTotalWeight += colorWeight;
+                     float siteValid = clamp(greenSupport[sx][sy], 0.0, 1.0);
+                     float greenConfidence = 0.0;
++                    float greenPhaseBalance26846 = 0.0;
+                     float predictedGreenClip = 0.0;
+                     float predictedGreen = predictSameLocationGreen26793(
+                         calculationCfa, calculationClipCfa, greenSupport, ivec2(sx, sy), type,
+                         horizontalGreenWeight, verticalGreenWeight, useGreenSupport,
+-                        greenConfidence, predictedGreenClip);
+-                    float gSupport = smoothstep(0.70, 1.00, greenConfidence);
++                        greenConfidence, greenPhaseBalance26846, predictedGreenClip);
++                    /* IRIS_26846_CFA_PHASE_BALANCED_CHROMA_AUTHORITY
++                     * 26829's aggregate green support remains exact when G1/G2 support is balanced.
++                     * Only an actual per-phase support imbalance transitions chroma authority toward
++                     * the weaker green phase. This avoids the failed broad-neutral/cross-phase class:
++                     * no whole observation is rejected, no phase value is replaced, and no RGB hue
++                     * is inferred after reconstruction. Saturated R/B rescue is likewise unchanged
++                     * when both green phases are healthy, preserving the validated real-color case. */
++                    float aggregateGreenSupport26846 = smoothstep(0.70, 1.00, greenConfidence);
++                    float balancedGreenSupport26846 = smoothstep(0.70, 1.00, greenPhaseBalance26846);
++                    float greenDirectionalRatio26846 = min(
++                        horizontalGreenWeight, verticalGreenWeight) /
++                        max(max(horizontalGreenWeight, verticalGreenWeight), 1.0e-7);
++                    /* Existing Sabre covariance remains the topology owner. If it has already made
++                     * one axis strongly directional at a hard edge, do not force the perpendicular
++                     * green phase back into ownership. The new balance gate acts only where both
++                     * orthogonal green phases are geometrically relevant yet their physical source
++                     * validity is unequal. */
++                    float bothGreenDirectionsRelevant26846 = smoothstep(
++                        0.25, 0.65, greenDirectionalRatio26846);
++                    float greenPhaseAsymmetry26846 = smoothstep(
++                        0.03, 0.18, max(greenConfidence - greenPhaseBalance26846, 0.0)) *
++                        bothGreenDirectionsRelevant26846;
++                    float gSupport = mix(
++                        aggregateGreenSupport26846,
++                        balancedGreenSupport26846,
++                        greenPhaseAsymmetry26846);
+                     float greenHeadroomRatio = predictedGreenClip > 1.0e-7
+                         ? predictedGreen / predictedGreenClip : 1.0;
+                     float gHead = 1.0 - smoothstep(0.55, 0.90, greenHeadroomRatio);
+-                    float clippedSiteRescue = smoothstep(0.85, 1.00, greenConfidence) * gHead;
++                    float aggregateClippedRescue26846 =
++                        smoothstep(0.85, 1.00, greenConfidence) * gHead;
++                    float balancedClippedRescue26846 =
++                        smoothstep(0.85, 1.00, greenPhaseBalance26846) * gHead;
++                    float clippedSiteRescue = mix(
++                        aggregateClippedRescue26846,
++                        balancedClippedRescue26846,
++                        greenPhaseAsymmetry26846);
+                     float siteEff = siteValid + (1.0 - siteValid) * clippedSiteRescue;
+                     float differenceWeight = colorWeight * gSupport * siteEff;
+                     float difference = calculationCfa[sx][sy] - predictedGreen;
+diff --git a/app/version.properties b/app/version.properties
+index 613f354463f2168ffb975df4c84d660a9594ee09..896629acf32b39f690ebc615030c0496f26b948c 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726845
+-VERSION_BUILD=26845
++VERSION_NAME=0.9726846
++VERSION_BUILD=26846
