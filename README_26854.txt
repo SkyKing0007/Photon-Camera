@@ -16,3 +16,17 @@ STAGE 3 — TRIGGER
 Upload STAGE_3_TRIGGER_UPLOAD/TRIGGER_26854.txt to repository root, commit and push on the same branch. This launches only the 26854 workflow. Actions downloads and verifies the exact successful 26853 candidate, compiles real GLSL/Kotlin/Java/native, assembles exactly one APK, proves invariance and exports the next compiled-candidate authority. DO NOT modify source during the run.
 
 STATE AT HANDOFF CREATION: PREPARED / UPLOAD-READY, not build-proven. All real 26854 compiler/assemble statuses are NOT RUN locally; Actions is the authority. If Actions fails, report its exact error rather than claiming success.
+
+
+26854 SCOPE REPAIR — AFTER FAILED FIRST TRIGGER
+The previous Stage 1 erroneously included 50 generated shader files in repository-root glsl_static/. They were NOT runtime source and must NOT be committed.
+
+REPAIR STAGE 1: On experimental-clean-photon-rebuild in vscode.dev, DELETE the entire root-level glsl_static/ directory including all 50 tracked files, using Explorer/Source Control. Replace the existing root-level files with ALL files from the corrected STAGE_1_UPLOAD_TO_REPOSITORY (the folder contains NO glsl_static). Preserve .github/workflows exactly; upload the yml separately via Explorer if necessary. Commit and push with: 26854: repair strict handoff scope and remove generated shaders
+
+Before committing, inspect Source Control: exactly 50 glsl_static/ deletions plus the intended corrected infrastructure files. Do NOT delete any app/src/ shader, remove unrelated files, or restore old generated files. Do not add APKs. The existing three runtime payload replacements stay unchanged.
+
+REPAIR STAGE 3: After the repair commit succeeds, REPLACE the existing TRIGGER_26854.txt at repository root with the file in STAGE_3_TRIGGER_UPLOAD (it retains the original trigger identity and adds a unique retry marker). Commit/push with: 26854: rerun guarded build after scope repair
+
+The original workflow remains trigger-path-only. The replacement trigger must have a byte change or GitHub will not start another run. If the corrected workflow fails, STOP and return the failure. No further handoff should be inferred to have succeeded.
+
+This repaired package removes only non-authoritative generated repository files; it does not change the 26854 candidate source, forward/rollback patches, stage order, or compiler commands. The scope regression is enforced before any authority download/compilation.

@@ -38,10 +38,12 @@ verify_package(){
  for p in 26854_FORWARD_FULL_INDEX.patch 26854_ROLLBACK_FULL_INDEX.patch; do ! grep -Eq '^(rename from|rename to|copy from|copy to) ' "$p" || fail "patch rename/copy inference"; done
  grep -Fx 'RUN_26854_CFA_NOISE_CORRECTION' TRIGGER_26854.txt >/dev/null || fail "wrong trigger"
  ! find . -type f -name '*.apk' | grep -q . || fail "APK unexpectedly packaged"
+ [[ ! -e glsl_static ]] || fail "unintended generated glsl_static directory in handoff (26854 scope regression)"
  pass "26854 package hashes/syntax/allowlist/patch identity"
 }
 verify_scope(){
  [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
+ [[ -z "$(git ls-files -- glsl_static)" ]] || fail "generated glsl_static source files accidentally committed (26854 permanent regression)"
  git merge-base --is-ancestor "$MECHANICS_AUTHORITY_COMMIT" HEAD || fail "successful 26852 mechanics ancestor missing"
  python3 -S - <<'PY_SCOPE'
 import subprocess
