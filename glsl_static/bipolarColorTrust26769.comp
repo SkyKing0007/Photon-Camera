@@ -1,0 +1,218 @@
+#version 310 es
+layout(local_size_x=8,local_size_y=8,local_size_z=1) in;
+precision highp float;
+precision highp int;
+precision highp uimage2D;
+layout(rgba16ui,binding=0) readonly uniform highp uimage2D uSource;
+layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uDestination;
+layout(rgba16ui,binding=2) readonly uniform highp uimage2D uOwnership;
+uniform ivec2 uImageSize;
+uniform highp sampler2D uSabreWeightR;
+uniform highp sampler2D uSabreWeightsGb;
+uniform highp sampler2D uSabreValidWeights;
+uniform highp float uSabreValidityWeightScale;
+uniform int uSabreSupportValid;
+uniform highp sampler2D uPhysicalPreVgn;
+uniform int uPhysicalPreVgnValid;
+
+/* IRIS_26770_CENTER_OWNED_BIPOLAR_SUBTRACTION
+ * 26769 proved that replacing a center with a neighbor-derived low-frequency baseline can
+ * create colored outlines on dense foliage. 26770 keeps the same frozen reciprocal material
+ * map, but a proven bipolar event may remove only the center pixel's own oscillating chroma
+ * projection. Neighbor chroma is evidence for the oscillation axis, never replacement RGB. */
+ivec2 safe26769(ivec2 p){return clamp(p,ivec2(0),uImageSize-ivec2(1));}
+bool inside26769(ivec2 p){return all(greaterThanEqual(p,ivec2(0)))&&all(lessThan(p,uImageSize));}
+uvec4 src26769(ivec2 p){return imageLoad(uSource,safe26769(p));}
+uvec4 own26769(ivec2 p){return imageLoad(uOwnership,safe26769(p));}
+vec3 rgb26769(ivec2 p){return vec3(src26769(p).rgb)/65535.0;}
+float y26769(vec3 rgb){return dot(rgb,vec3(0.25,0.50,0.25));}
+vec3 normChroma26769(vec3 rgb){float y=y26769(rgb);return (rgb-vec3(y))/max(y,0.060);}
+float max3_26769(vec3 v){return max(v.r,max(v.g,v.b));}
+float min3_26769(vec3 v){return min(v.r,min(v.g,v.b));}
+float agreement26769(vec3 a,vec3 b){return clamp(dot(a,b)/max(length(a)*length(b),1.0e-7),-1.0,1.0);}
+vec3 preRgb26769(ivec2 p){return max(texelFetch(uPhysicalPreVgn,safe26769(p),0).rgb,vec3(0.0));}
+vec3 preNormChroma26769(ivec2 p){return normChroma26769(preRgb26769(p));}
+vec3 removed26769(ivec2 p){return preNormChroma26769(p)-normChroma26769(rgb26769(p));}
+vec3 validity26769(ivec2 p){
+    if(uSabreSupportValid==0)return vec3(1.0);ivec2 q=safe26769(p);
+    vec3 total=vec3(max(texelFetch(uSabreWeightR,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).g,0.0));
+    vec3 valid=max(texelFetch(uSabreValidWeights,q,0).rgb,vec3(0.0))*max(uSabreValidityWeightScale,1.0);
+    return clamp(valid/max(total,vec3(1.0e-6)),vec3(0.0),vec3(1.0));
+}
+int bit26769(ivec2 d){
+    if(d==ivec2(0,-1))return 0;if(d==ivec2(1,0))return 1;if(d==ivec2(0,1))return 2;if(d==ivec2(-1,0))return 3;
+    if(d==ivec2(1,-1))return 4;if(d==ivec2(1,1))return 5;if(d==ivec2(-1,1))return 6;if(d==ivec2(-1,-1))return 7;return -1;
+}
+int opp26769(int bit){if(bit==0)return 2;if(bit==1)return 3;if(bit==2)return 0;if(bit==3)return 1;if(bit==4)return 6;if(bit==5)return 7;if(bit==6)return 4;if(bit==7)return 5;return -1;}
+bool cleanup26769(ivec2 p){int a=int(own26769(p).a);return (a&0x1000)!=0||(a&0x2000)!=0||(a&0x8000)!=0;}
+bool neutral26769(ivec2 p){return (int(own26769(p).a)&0x4000)!=0;}
+bool strictConnected26769(ivec2 p,ivec2 d){
+    ivec2 q=p+d;if(!inside26769(q))return false;int bit=bit26769(d),opp=opp26769(bit);if(bit<0||opp<0)return false;
+    int pa=int(own26769(p).a),qa=int(own26769(q).a);if(cleanup26769(p)||cleanup26769(q))return false;
+    return (pa&(1<<bit))!=0&&(qa&(1<<opp))!=0;
+}
+bool cleanupReceive26769(ivec2 p,ivec2 d){
+    ivec2 q=p+d;if(!inside26769(q))return false;int bit=bit26769(d),opp=opp26769(bit);if(bit<0||opp<0)return false;
+    int pa=int(own26769(p).a),qa=int(own26769(q).a);bool pc=cleanup26769(p),qc=cleanup26769(q);bool pAllows=(pa&(1<<bit))!=0;
+    if(pc)return pAllows&&!qc;if(qc)return false;return pAllows&&(qa&(1<<opp))!=0;
+}
+bool pairReceive26769(ivec2 p,ivec2 d){return cleanup26769(p)?cleanupReceive26769(p,d):strictConnected26769(p,d);}
+
+bool chain26769(ivec2 p,ivec2 d){
+    if(!pairReceive26769(p,d)||!pairReceive26769(p,-d))return false;
+    return strictConnected26769(p+d,d)&&strictConnected26769(p-d,-d);
+}
+/* IRIS_26770_AXIS_BIPOLAR_COMPONENT
+ * A 5-tap phase test still proves the oscillation, but the cleanup payload is only the
+ * center deviation projected onto the independently witnessed opposite-phase axis. */
+float axisBipolar26769(ivec2 p,ivec2 d,out vec3 component){
+    component=vec3(0.0);if(!chain26769(p,d))return 0.0;
+    vec3 c0=normChroma26769(rgb26769(p));
+    vec3 cm2=normChroma26769(rgb26769(p-2*d)),cm1=normChroma26769(rgb26769(p-d));
+    vec3 cp1=normChroma26769(rgb26769(p+d)),cp2=normChroma26769(rgb26769(p+2*d));
+    vec3 baseline=(cm2+4.0*cm1+6.0*c0+4.0*cp1+cp2)*(1.0/16.0);
+    vec3 centerDev=c0-baseline;
+    vec3 nearDev=0.5*(cm1+cp1)-baseline;
+    vec3 farDev=0.5*(cm2+cp2)-baseline;
+    float centerMag=length(centerDev),nearMag=length(nearDev),farMag=length(farDev);
+    float nearOpp=smoothstep(0.60,0.92,-agreement26769(centerDev,nearDev));
+    float farSame=smoothstep(0.55,0.90,agreement26769(centerDev,farDev));
+    float nearSym=1.0-smoothstep(0.070,0.220,length(cm1-cp1));
+    float farSym=1.0-smoothstep(0.070,0.220,length(cm2-cp2));
+    vec3 witnessAxis=nearMag>1.0e-7?normalize(nearDev):(farMag>1.0e-7?normalize(farDev):vec3(0.0));
+    component=witnessAxis*dot(centerDev,witnessAxis);
+    float projectionProof=smoothstep(0.55,0.85,length(component)/max(centerMag,1.0e-7));
+    float phaseMagnitude=smoothstep(0.012,0.055,min(centerMag,min(nearMag,farMag)));
+    float phaseScore=nearOpp*farSame*nearSym*farSym*phaseMagnitude*projectionProof;
+    float cleanupOutlier=cleanup26769(p)?smoothstep(0.020,0.070,length(component))*nearSym*projectionProof:0.0;
+    return max(phaseScore,0.90*cleanupOutlier);
+}
+/* IRIS_26770_PAIR_RESIDUAL_AXIS_ONLY
+ * Short/curved cleanup no longer treats generic center-vs-neighbor disagreement as enough.
+ * It requires the removed-chroma residual itself to prove the opposite phase, then subtracts
+ * only the center deviation projected onto that residual axis. */
+float pairBipolar26769(ivec2 p,ivec2 a,ivec2 b,out vec3 component){
+    component=vec3(0.0);if(!pairReceive26769(p,a)||!pairReceive26769(p,b))return 0.0;
+    vec3 center=normChroma26769(rgb26769(p));
+    vec3 ca=normChroma26769(rgb26769(p+a)),cb=normChroma26769(rgb26769(p+b));
+    float pairSimilarity=1.0-smoothstep(0.055,0.180,length(ca-cb));
+    vec3 baseline=0.5*(ca+cb);vec3 centerDev=center-baseline;float centerDevMag=length(centerDev);
+    vec3 rr=removed26769(p),ra=removed26769(p+a),rb=removed26769(p+b),rbase=0.5*(ra+rb);
+    float residualOpp=smoothstep(0.55,0.90,-agreement26769(rr,rbase))*smoothstep(0.006,0.030,min(length(rr),length(rbase)));
+    vec3 residualAxis=length(rbase)>1.0e-7?normalize(rbase):vec3(0.0);
+    component=residualAxis*dot(centerDev,residualAxis);
+    float componentProof=smoothstep(0.45,0.80,length(component)/max(centerDevMag,1.0e-7));
+    float outlier=smoothstep(0.020,0.070,centerDevMag);
+    float cleanupOutlier=cleanup26769(p)?smoothstep(0.015,0.055,length(component)):0.0;
+    return pairSimilarity*residualOpp*componentProof*max(outlier,cleanupOutlier);
+}
+vec3 fitNormChroma26769(float y,vec3 nc){
+    vec3 c=nc*max(y,0.060);float scale=1.0;
+    if(c.r>1.0e-7)scale=min(scale,(1.0-y)/c.r);else if(c.r<-1.0e-7)scale=min(scale,y/(-c.r));
+    if(c.g>1.0e-7)scale=min(scale,(1.0-y)/c.g);else if(c.g<-1.0e-7)scale=min(scale,y/(-c.g));
+    if(c.b>1.0e-7)scale=min(scale,(1.0-y)/c.b);else if(c.b<-1.0e-7)scale=min(scale,y/(-c.b));
+    return nc*clamp(scale,0.0,1.0);
+}
+/* IRIS_26770_INTERIOR_ONLY_RECOVERY
+ * Lost-color recovery is deliberately eroded away from material boundaries and high-frequency
+ * luminance structure. All eight immediate reciprocal links and one further step in every
+ * direction must remain in the same frozen material region. This prevents dense foliage/CFA
+ * borders from authorizing chroma resurrection while still permitting broad real-color areas. */
+bool deepInterior26770(ivec2 p){
+    if(cleanup26769(p)||neutral26769(p))return false;
+    const ivec2 qd[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+    for(int i=0;i<8;++i){if(!strictConnected26769(p,qd[i]))return false;ivec2 q=p+qd[i];if(!strictConnected26769(q,qd[i]))return false;}
+    return true;
+}
+/* IRIS_26772_FLATTENED_HIGHLIGHT_CHROMA_OWNER
+ * Bit 13 comes from the frozen 26733 highlight-validity owner. It is set only when a bright
+ * center has lost trustworthy color ownership. Neighbor pixels may prove that the center is
+ * inside a same-material flattened plateau, but they never donate RGB/hue. The correction is
+ * center-local chroma attenuation at constant luminance, so ordinary edges cannot transport color. */
+bool highlightInvalid26772(ivec2 p){return (int(own26769(p).a)&0x2000)!=0;}
+bool phaseInvalid26776(ivec2 p){return (int(own26769(p).a)&0x8000)!=0;}
+bool highlightConnected26772(ivec2 p,ivec2 d){
+    ivec2 q=p+d;if(!inside26769(q))return false;int bit=bit26769(d),opp=opp26769(bit);if(bit<0||opp<0)return false;
+    int pa=int(own26769(p).a),qa=int(own26769(q).a);
+    return (pa&(1<<bit))!=0&&(qa&(1<<opp))!=0;
+}
+float flattenedHighlight26772(ivec2 p,float centerY,float centerPeak){
+    if(!highlightInvalid26772(p))return 0.0;
+    const ivec2 hd[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+    float plateau=0.0;
+    for(int i=0;i<8;++i){
+        ivec2 q=p+hd[i];if(!highlightConnected26772(p,hd[i])||!highlightInvalid26772(q))continue;
+        vec3 qr=rgb26769(q);float qY=y26769(qr),qPeak=max3_26769(qr);
+        float lumaSame=1.0-smoothstep(0.025,0.095,abs(qY-centerY));
+        float peakSame=1.0-smoothstep(0.025,0.095,abs(qPeak-centerPeak));
+        plateau+=lumaSame*peakSame;
+    }
+    float severe=smoothstep(0.86,0.96,centerPeak)*smoothstep(0.72,0.90,centerY);
+    return severe*smoothstep(1.50,3.00,plateau);
+}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
+    uvec4 packed=src26769(p);vec3 post=vec3(packed.rgb)/65535.0;
+    if(uPhysicalPreVgnValid==0||uSabreSupportValid==0){imageStore(uDestination,p,packed);return;}
+    float postY=y26769(post);vec3 postNC=normChroma26769(post);float existingFloor=float(packed.a)/65535.0;
+
+    const ivec2 d[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+    vec3 c0,c1,c2,c3;float s0=axisBipolar26769(p,ivec2(1,0),c0);float s1=axisBipolar26769(p,ivec2(0,1),c1);float s2=axisBipolar26769(p,ivec2(1,-1),c2);float s3=axisBipolar26769(p,ivec2(1,1),c3);
+    float bipolar=s0;vec3 bipolarComponent=c0;if(s1>bipolar){bipolar=s1;bipolarComponent=c1;}if(s2>bipolar){bipolar=s2;bipolarComponent=c2;}if(s3>bipolar){bipolar=s3;bipolarComponent=c3;}
+    for(int i=0;i<8;++i)for(int j=i+1;j<8;++j){vec3 pairComponent;float pairScore=pairBipolar26769(p,d[i],d[j],pairComponent);if(pairScore>bipolar){bipolar=pairScore;bipolarComponent=pairComponent;}}
+    /* IRIS_26776_RESIDUAL_PERIODIC_CHROMA_OWNER
+     * Clip-aware demosaic diagnosis maps here to Iris' Resolve/VGN boundary.
+     * A block warning never replaces RGB and never neutralizes color globally. It only
+     * relaxes the already-proven center-owned bipolar test from 0.60 to 0.28. Therefore a
+     * bright real material with coherent chroma remains untouched unless its own residual
+     * demonstrates the short-period opposing-phase signature. */
+    float blockRisk=phaseInvalid26776(p)?1.0:0.0;
+    float eradicateThreshold=mix(0.60,0.28,blockRisk);
+    bool eradicate=bipolar>=eradicateThreshold;
+    float phaseFloorVeto=blockRisk*smoothstep(0.12,0.30,bipolar);
+    /* Full-strength means 100% of the proven center-owned oscillating projection is removed;
+     * it does not mean replacing the pixel by a neighbor-derived chroma baseline. */
+    vec3 cleanedNC=postNC-(eradicate?bipolarComponent:vec3(0.0));
+
+    vec3 centerRemoved=removed26769(p);vec3 neighborVectorSum=vec3(0.0);float neighborMagnitudeSum=0.0;float support=0.0;
+    float maxRelativeLumaEdge=0.0;
+    for(int i=0;i<8;++i){
+        ivec2 q=p+d[i];if(!strictConnected26769(p,d[i]))continue;
+        float qY=y26769(rgb26769(q));maxRelativeLumaEdge=max(maxRelativeLumaEdge,abs(qY-postY)/max(max(qY,postY),0.060));
+        vec3 rn=removed26769(q);float nearWeight=smoothstep(0.0008,0.0040,length(rn));
+        neighborVectorSum+=rn*nearWeight;neighborMagnitudeSum+=length(rn)*nearWeight;support+=nearWeight;
+        ivec2 q2=q+d[i];
+        if(inside26769(q2)&&strictConnected26769(q,d[i])){
+            vec3 rf=removed26769(q2);float farWeight=0.75*nearWeight*smoothstep(0.0008,0.0040,length(rf));
+            neighborVectorSum+=rf*farWeight;neighborMagnitudeSum+=length(rf)*farWeight;support+=farWeight;
+        }
+    }
+    float coherence=length(neighborVectorSum)/max(neighborMagnitudeSum,1.0e-7);
+    vec3 consensusDirection=length(neighborVectorSum)>1.0e-7?normalize(neighborVectorSum):vec3(0.0);
+    float centerProjection=max(dot(centerRemoved,consensusDirection),0.0);
+    vec3 centerOwnedCoherentResidual=consensusDirection*centerProjection;
+    vec3 pre=preRgb26769(p);float preY=y26769(pre);vec3 preNC=normChroma26769(pre);float prePeak=max3_26769(pre);
+    float measured=smoothstep(0.985,0.9995,min3_26769(validity26769(p)));
+    float headroom=1.0-smoothstep(0.72,0.92,max(prePeak,postY));
+    float supportProof=smoothstep(1.15,1.65,support);
+    float coherenceProof=smoothstep(0.74,0.92,coherence);
+    float residualProof=smoothstep(0.0008,0.0050,centerProjection);
+    float interiorProof=deepInterior26770(p)?1.0:0.0;
+    float highFrequencySafe=1.0-smoothstep(0.10,0.24,maxRelativeLumaEdge);
+    float bipolarRecoveryVeto=1.0-smoothstep(0.20,0.55,bipolar*(1.0-coherence));
+    float flattenedHighlight=flattenedHighlight26772(p,postY,max(prePeak,max3_26769(post)));
+    float highlightCleanupVeto26807=highlightInvalid26772(p)?1.0:0.0;
+    float recovery=residualProof*supportProof*coherenceProof*measured*headroom*interiorProof*highFrequencySafe*bipolarRecoveryVeto*(1.0-flattenedHighlight)*(1.0-phaseFloorVeto)*(1.0-highlightCleanupVeto26807);
+    vec3 recoveredNC=(cleanedNC+centerOwnedCoherentResidual*recovery)*(1.0-flattenedHighlight);
+    float preMagnitude=length(preNC),recoveredMagnitude=length(recoveredNC);
+    if(recoveredMagnitude>preMagnitude&&recoveredMagnitude>1.0e-7)recoveredNC*=preMagnitude/recoveredMagnitude;
+    recoveredNC=fitNormChroma26769(postY,recoveredNC);
+    vec3 finalRgb=clamp(vec3(postY)+recoveredNC*max(postY,0.060),vec3(0.0),vec3(1.0));
+
+    /* IRIS_26776_NO_PHASE_INVALID_CHROMA_RESURRECTION
+     * The 26728 floor remains available for real supported micro-color, but once this exact
+     * pixel's periodic residual is proven inside a risky CFA block it cannot be re-amplified. */
+    float finalFloor=(eradicate?0.0:existingFloor)*(1.0-flattenedHighlight)*(1.0-phaseFloorVeto)*(1.0-highlightCleanupVeto26807);
+    if(!eradicate&&flattenedHighlight<0.05&&recovery>=0.80){vec3 finalC=finalRgb-vec3(y26769(finalRgb));finalFloor=max(finalFloor,min(length(finalC),length(pre-vec3(preY))));}
+    imageStore(uDestination,p,uvec4(uvec3(round(finalRgb*65535.0)),uint(round(clamp(finalFloor,0.0,1.0)*65535.0))));
+}

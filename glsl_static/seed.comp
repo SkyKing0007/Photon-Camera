@@ -1,0 +1,220 @@
+#version 310 es
+precision highp float;
+precision highp int;
+precision highp uimage2D;
+layout(local_size_x=8, local_size_y=8) in;
+layout(rgba16ui,binding=0) readonly uniform highp uimage2D uInput;
+layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uOutput;
+uniform vec3 uCalculationGains;
+uniform float uMinimumDirectionGradient;
+uniform highp sampler2D uPhysicalPreVgn;
+uniform int uPhysicalPreVgnValid;
+uniform ivec2 uImageSize;
+ivec2 safePos(ivec2 p) { return clamp(p, ivec2(0), uImageSize - ivec2(1)); }
+int signedChroma(uint c) { int v = int(c); return v > 32767 ? v - 65536 : v; }
+uint unsignedChroma(int v) { return uint(v & 0xFFFF); }
+float decodeU16(uint value) {
+    uint hi = value >> 8u;
+    uint lo = value & 255u;
+    const float finiteScale = 65504.0 / 65535.0;
+    return float(hi) * (256.0 * finiteScale) + float(lo) * finiteScale;
+}
+/* IRIS_26730_PHYSICAL_VALIDITY_CONTAINMENT_AUTHORITY
+ * The 26729 material-preservation gates may only be established by reconstructed color
+ * whose consumed CFA support remains valid in every RGB channel. Clipped/invalid hue may
+ * still be repaired later, but it cannot grant itself early VGN ownership. */
+uniform highp sampler2D uSabreWeightR;
+uniform highp sampler2D uSabreWeightsGb;
+uniform highp sampler2D uSabreValidWeights;
+uniform highp float uSabreValidityWeightScale;
+uniform int uSabreSupportValid;
+float physicalColorTrust(ivec2 p){
+    if(uSabreSupportValid==0)return 1.0;
+    ivec2 q=safePos(p);
+    vec3 totalWeight=vec3(max(texelFetch(uSabreWeightR,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).r,0.0),max(texelFetch(uSabreWeightsGb,q,0).g,0.0));
+    vec3 validWeight=max(texelFetch(uSabreValidWeights,q,0).rgb,vec3(0.0))*max(uSabreValidityWeightScale,1.0);
+    vec3 channelValidity=clamp(validWeight/max(totalWeight,vec3(1.0e-6)),vec3(0.0),vec3(1.0));
+    float measured=min(channelValidity.r,min(channelValidity.g,channelValidity.b));
+    return smoothstep(0.985,0.9995,measured);
+}
+vec3 calculationRgbAt(ivec2 p) {
+    ivec2 q=safePos(p);
+    if(uPhysicalPreVgnValid!=0){
+        vec3 linearRgb=max(texelFetch(uPhysicalPreVgn,q,0).rgb,vec3(0.0));
+        float physicalMagnitude=max(max(linearRgb.r,max(linearRgb.g,linearRgb.b)),1.0);
+        vec3 directionDomain=clamp(linearRgb/physicalMagnitude,vec3(0.0),vec3(1.0));
+        return clamp(directionDomain*(65504.0*uCalculationGains),vec3(0.0),vec3(65504.0));
+    }
+    uvec3 e=imageLoad(uInput,q).rgb;
+    return clamp(vec3(decodeU16(e.r),decodeU16(e.g),decodeU16(e.b))*uCalculationGains,vec3(0.0),vec3(65504.0));
+}
+float yAt(ivec2 p){ return dot(calculationRgbAt(p),vec3(0.25,0.5,0.25)); }
+vec2 materialChromaAt(ivec2 p){
+    vec3 rgb=calculationRgbAt(p);
+    float sum=max(rgb.r+2.0*rgb.g+rgb.b,1.0);
+    return (rgb.rb-vec2(rgb.g))/sum;
+}
+/* IRIS_26776_CLAUDE_PRE_OWNERSHIP_CFA_VALIDITY
+ * Claude's ~2 px diagnosis must be proven as a real alternating chroma phase, not inferred
+ * from a single 2x2 material edge. Separately, physically weak CFA support may authorize
+ * cleanup only at a high-gradient edge. Both tests happen before material/color ownership,
+ * so false reconstructed hue cannot protect itself. Final-JPEG brightness is never used. */
+float seedAgreement26776(vec2 a,vec2 b){return dot(a,b)/max(length(a)*length(b),1.0e-7);}
+float axisPeriodicRisk26776(ivec2 p,ivec2 d){
+    vec2 cm2=materialChromaAt(p-2*d),cm1=materialChromaAt(p-d);
+    vec2 c0=materialChromaAt(p),cp1=materialChromaAt(p+d),cp2=materialChromaAt(p+2*d);
+    vec2 baseline=(cm2+4.0*cm1+6.0*c0+4.0*cp1+cp2)*(1.0/16.0);
+    vec2 centerDev=c0-baseline;
+    vec2 nearDev=0.5*(cm1+cp1)-baseline;
+    vec2 farDev=0.5*(cm2+cp2)-baseline;
+    float centerMag=length(centerDev),nearMag=length(nearDev),farMag=length(farDev);
+    float nearOpp=smoothstep(0.60,0.92,-seedAgreement26776(centerDev,nearDev));
+    float farSame=smoothstep(0.55,0.90,seedAgreement26776(centerDev,farDev));
+    float nearSym=1.0-smoothstep(0.070,0.220,length(cm1-cp1));
+    float farSym=1.0-smoothstep(0.070,0.220,length(cm2-cp2));
+    float magnitude=smoothstep(0.012,0.055,min(centerMag,min(nearMag,farMag)));
+    return nearOpp*farSame*nearSym*farSym*magnitude;
+}
+float phaseInvalidRisk26776(ivec2 p){
+    float periodic=max(max(axisPeriodicRisk26776(p,ivec2(1,0)),axisPeriodicRisk26776(p,ivec2(0,1))),
+        max(axisPeriodicRisk26776(p,ivec2(1,1)),axisPeriodicRisk26776(p,ivec2(1,-1))));
+    float centerY=yAt(p);
+    const ivec2 gd[4]=ivec2[4](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1));
+    float maximumRelativeGradient=0.0;
+    for(int i=0;i<4;++i){
+        float qY=yAt(p+gd[i]);
+        maximumRelativeGradient=max(maximumRelativeGradient,abs(qY-centerY)/max(max(qY,centerY),0.060));
+    }
+    float gradientRisk=smoothstep(0.10,0.28,maximumRelativeGradient);
+    ivec2 base=(safePos(p)/2)*2;
+    float blockTrust=min(min(physicalColorTrust(base),physicalColorTrust(base+ivec2(1,0))),
+        min(physicalColorTrust(base+ivec2(0,1)),physicalColorTrust(base+ivec2(1,1))));
+    float physicallyInvalidEdge=(1.0-blockTrust)*gradientRisk;
+    /* IRIS_26776_HIGH_GRADIENT_OR_INVALID_GATE
+     * Strong periodic phase is sufficient at any brightness. Non-periodic cleanup requires
+     * measured CFA invalidity AND a high-gradient edge; high gradient alone never erases a
+     * legitimate coherent color boundary. */
+    return max(periodic,physicallyInvalidEdge);
+}
+uint directionMaskAt(ivec2 p){
+    const ivec2 d[8]=ivec2[8](ivec2(0,-1),ivec2(1,0),ivec2(0,1),ivec2(-1,0),ivec2(1,-1),ivec2(1,1),ivec2(-1,1),ivec2(-1,-1));
+    float center=yAt(p); vec2 centerChroma=materialChromaAt(p);
+    float g[8]; float chromaJump[8]; float neighborContinuation[8]; float neighborWithinDelta[8];
+    float neighborNeutral[8];
+    float lo=65504.0; float hi=0.0; float centerContinuation=0.0; float centerWithinDelta=65504.0;
+    float brighterNeutralSupport=0.0;
+    float centerTrust=physicalColorTrust(p);
+    int phaseInvalid26776=phaseInvalidRisk26776(p)>0.42?1:0;
+    float phaseColorOwnershipPermission=phaseInvalid26776!=0?0.0:1.0;
+    for(int i=0;i<8;++i){
+        float first=yAt(p+d[i]); float second=yAt(p+d[i]*2);
+        vec2 firstChroma=materialChromaAt(p+d[i]);
+        vec2 secondChroma=materialChromaAt(p+d[i]*2);
+        float rgbGradient=abs(center-first)+0.5*abs(first-second);
+        g[i]=rgbGradient; lo=min(lo,g[i]); hi=max(hi,g[i]);
+        chromaJump[i]=length(centerChroma-firstChroma);
+        neighborWithinDelta[i]=length(firstChroma-secondChroma);
+        neighborContinuation[i]=1.0-smoothstep(0.020,0.070,neighborWithinDelta[i]);
+        neighborNeutral[i]=1.0-smoothstep(0.055,0.140,length(firstChroma));
+        float relativeFirst=(first-center)/max(max(first,center),3930.0);
+        float lumaCompatible=1.0-smoothstep(0.10,0.30,abs(relativeFirst));
+        float neighborTrust=physicalColorTrust(p+d[i]);
+        float trustedCenterNeighbor=min(centerTrust,neighborTrust);
+        brighterNeutralSupport+=neighborNeutral[i]*smoothstep(0.08,0.35,relativeFirst)*neighborTrust;
+        centerWithinDelta=min(centerWithinDelta,mix(65504.0,chromaJump[i],trustedCenterNeighbor));
+        centerContinuation=max(centerContinuation,lumaCompatible*(1.0-smoothstep(0.020,0.070,chromaJump[i]))*trustedCenterNeighbor);
+    }
+    float threshold=max(uMinimumDirectionGradient,1.5*lo+0.09375*(hi-lo));
+    /* IRIS_26733_INHERITED_HIGHLIGHT_HEADROOM_OWNER
+     * The successful 26727/26728 rule is authoritative before any 26729+ material gate:
+     * near-white color ownership fades from 0.72..0.92 luma. A real bright colored material
+     * may opt back in only with strong all-channel physical support, substantial normalized
+     * chroma and coherent same-material continuation. */
+    float centerNormalizedY=clamp(center/65504.0,0.0,1.0);
+    float centerChromaMagnitude=length(centerChroma);
+    float inheritedHighlightPermission=1.0-smoothstep(0.72,0.92,centerNormalizedY);
+    /* IRIS_26806_BROAD_2D_BRIGHT_COLOR_OPT_IN
+     * 26804/26805 proved that already-reconstructed RGB cannot safely declare a thin bright
+     * structure neutral. Preserve the successful 26727 0.72..0.92 highlight-cleanup
+     * authority by default. A bright chromatic material may opt back into the newer color
+     * protections only when the SAME center chroma and luma continue four pixels away in
+     * at least two opposing, non-collinear direction pairs. A thin subtitle/LED fringe can
+     * continue strongly along its tangent but cannot manufacture broad 2-D material depth.
+     * physicalColorTrust is the existing temporally accumulated CFA-validity provenance,
+     * so clipped/invalid reconstructed hue still cannot authorize its own protection. */
+    float far4Continuation[8];
+    for(int i=0;i<8;++i){
+        ivec2 q4=p+d[i]*4;
+        float far4Y=yAt(q4);
+        vec2 far4Chroma=materialChromaAt(q4);
+        float far4LumaCompatible=1.0-smoothstep(0.10,0.30,
+            abs(far4Y-center)/max(max(far4Y,center),3930.0));
+        float far4SameChroma=1.0-smoothstep(0.020,0.070,length(centerChroma-far4Chroma));
+        float far4Trust=min(centerTrust,physicalColorTrust(q4));
+        far4Continuation[i]=far4LumaCompatible*far4SameChroma*far4Trust;
+    }
+    float broadPair0=min(far4Continuation[0],far4Continuation[2]);
+    float broadPair1=min(far4Continuation[1],far4Continuation[3]);
+    float broadPair2=min(far4Continuation[4],far4Continuation[6]);
+    float broadPair3=min(far4Continuation[5],far4Continuation[7]);
+    float strongestPair=max(max(broadPair0,broadPair1),max(broadPair2,broadPair3));
+    float remainingPairSupport=broadPair0+broadPair1+broadPair2+broadPair3-strongestPair;
+    float broadTwoDimensionalMaterial=smoothstep(0.45,1.10,remainingPairSupport);
+    float realBrightColorProof=centerTrust*
+        smoothstep(0.10,0.18,centerChromaMagnitude)*
+        smoothstep(0.55,0.82,centerContinuation)*
+        broadTwoDimensionalMaterial*phaseColorOwnershipPermission;
+    float highlightColorOwnershipPermission=max(inheritedHighlightPermission,realBrightColorProof);
+    int highlightInvalidCleanup=(1.0-highlightColorOwnershipPermission)>0.35?1:0;
+    /* IRIS_26776_PHASE_INVALID_CANNOT_SELF_PROTECT
+     * Bit 15 is an upstream ownership veto: a proven CFA-periodic/high-gradient center may
+     * receive cleanup, but its reconstructed hue cannot establish material protection. */
+    /* IRIS_26733_EARLY_ACHROMATIC_STRUCTURE_OWNER
+     * Dark/antialiased neutral strokes are recognized before chroma filtering from a neutral
+     * center plus multiple physically trustworthy brighter neutral neighbors. This is a
+     * generic structural/material rule (text, wire, mesh, line art), not OCR. */
+    float neutralCenterProof=(1.0-smoothstep(0.070,0.160,centerChromaMagnitude))*centerTrust;
+    float neutralDarkPermission=1.0-smoothstep(0.42,0.62,centerNormalizedY);
+    float neutralStructureProof=neutralCenterProof*neutralDarkPermission*
+        smoothstep(1.25,3.00,brighterNeutralSupport);
+    int neutralStructure=neutralStructureProof>0.50?1:0;
+    int mask=0; int count=0; int cleanupFallback=0;
+    for(int i=0;i<8;++i){
+        /* IRIS_26729_COLOR_MATERIAL_DIRECTION_GATE
+         * A coherent color boundary blocks chroma transport even when luma is nearly equal.
+         * Isolated false-color dots do not gain protection because the center must continue
+         * coherently in at least one other direction and the neighboring material must also
+         * continue away from the boundary. */
+        float physicalTrust=min(centerTrust,min(physicalColorTrust(p+d[i]),physicalColorTrust(p+d[i]*2)));
+        float withinScale=max(max(centerWithinDelta,neighborWithinDelta[i]),0.006);
+        float materialStepProof=smoothstep(1.35,2.20,chromaJump[i]/withinScale);
+        /* IRIS_26730_TRUE_MATERIAL_STEP_GATE: a smooth within-material hue gradient is not
+         * a boundary. Both sides must be more internally coherent than the interface jump. */
+        float colorBoundary=smoothstep(0.030,0.095,chromaJump[i]) *
+            smoothstep(0.35,0.75,centerContinuation) * neighborContinuation[i] *
+            materialStepProof * physicalTrust * highlightColorOwnershipPermission *
+            phaseColorOwnershipPermission;
+        if(neutralStructure!=0)colorBoundary=max(colorBoundary,1.0-neighborNeutral[i]);
+        if(g[i]<=threshold&&colorBoundary<0.50){ mask|=1<<i; count++; }
+    }
+    if(count==0){
+        /* A coherent tiny structure may legitimately have no safe cross-boundary direction.
+         * Preserve it rather than reopening every direction; isolated false-color has low
+         * centerContinuation and retains the inherited all-direction fallback for cleanup. */
+        if(centerContinuation>0.35){mask=0;count=0;}else{mask=0xFF;count=8;cleanupFallback=1;}
+    }
+    /* IRIS_26731_ISOLATED_FALSE_COLOR_CLEANUP_FLAG
+     * Bit 12 distinguishes the inherited all-direction cleanup fallback from genuine
+     * all-direction same-material connectivity. Downstream filters may pull trusted color
+     * into this suspicious center, but trusted neighbors must never pull from it. */
+    return uint(mask | (count << 8) | (cleanupFallback << 12) |
+        (highlightInvalidCleanup << 13) | (neutralStructure << 14) |
+        (phaseInvalid26776 << 15));
+}
+uvec4 toYccd(vec3 rgb,uint direction){
+    float sum=rgb.r+2.0*rgb.g+rgb.b+1.0;
+    vec2 c=(rgb.rb-vec2(rgb.g))*(32768.0/sum);
+    ivec2 ci=ivec2(clamp(c,vec2(-32768.0),vec2(32767.0)));
+    return uvec4(uint(clamp(0.25*(sum-1.0),0.0,65504.0)),unsignedChroma(ci.x),unsignedChroma(ci.y),direction);
+}
+void main(){ ivec2 p=ivec2(gl_GlobalInvocationID.xy); if(any(greaterThanEqual(p,uImageSize)))return; imageStore(uOutput,p,toYccd(calculationRgbAt(p),directionMaskAt(p))); }

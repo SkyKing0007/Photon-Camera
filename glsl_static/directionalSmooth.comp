@@ -1,0 +1,136 @@
+#version 310 es
+precision highp float; precision highp int; precision highp uimage2D;
+layout(local_size_x=8,local_size_y=8) in;
+layout(rgba16ui,binding=0) readonly uniform highp uimage2D uOriginal;
+layout(rgba16ui,binding=1) readonly uniform highp uimage2D uSmooth;
+layout(rgba16ui,binding=2) writeonly uniform highp uimage2D uOutput;
+uniform ivec2 uImageSize;
+ivec2 safePos(ivec2 p) { return clamp(p, ivec2(0), uImageSize - ivec2(1)); }
+int signedChroma(uint c) { int v = int(c); return v > 32767 ? v - 65536 : v; }
+uint unsignedChroma(int v) { return uint(v & 0xFFFF); }
+float decodeU16(uint value) {
+    uint hi = value >> 8u;
+    uint lo = value & 255u;
+    const float finiteScale = 65504.0 / 65535.0;
+    return float(hi) * (256.0 * finiteScale) + float(lo) * finiteScale;
+}
+vec3 smoothAt(ivec2 p){uvec4 v=imageLoad(uSmooth,safePos(p));return vec3(decodeU16(v.r),float(signedChroma(v.g)),float(signedChroma(v.b)));}
+float chromaAgreement(vec2 a,vec2 b){return dot(a,b)/max(length(a)*length(b),1.0);}
+float chromaDistance(vec2 a,vec2 b){return length(a-b)/max(max(length(a),length(b)),512.0);}
+bool insideImage26769(ivec2 q){return all(greaterThanEqual(q,ivec2(0)))&&all(lessThan(q,uImageSize));}
+bool directionBitSet26769(ivec2 q,int bit){return (int(imageLoad(uOriginal,q).a)&(1<<bit))!=0;}
+bool cleanupFlag26769(ivec2 q){int a=int(imageLoad(uOriginal,q).a);return (a&0x1000)!=0||(a&0x2000)!=0||(a&0x8000)!=0;}
+bool reciprocalConnected26769(ivec2 p,ivec2 delta,int bit,int oppositeBit){
+    ivec2 q=p+delta;if(!insideImage26769(q))return false;
+    bool centerAllows=directionBitSet26769(p,bit);bool centerCleanup=cleanupFlag26769(p);bool neighborCleanup=cleanupFlag26769(q);
+    if(centerCleanup)return centerAllows&&!neighborCleanup;if(neighborCleanup)return false;
+    return centerAllows&&directionBitSet26769(q,oppositeBit);
+}
+vec3 pairCandidate26769(ivec2 p,vec3 center,ivec2 negDelta,int negBit,int negOpp,ivec2 posDelta,int posBit,int posOpp,out float sampleWeight){
+    bool negOk=reciprocalConnected26769(p,negDelta,negBit,negOpp);bool posOk=reciprocalConnected26769(p,posDelta,posBit,posOpp);
+    sampleWeight=float((negOk?1:0)+(posOk?1:0));if(sampleWeight<0.5)return vec3(center.y,center.z,0.0);
+    vec3 directional;if(negOk&&posOk){vec3 x=smoothAt(p+negDelta),y=smoothAt(p+posDelta);float dx=dot(abs(center-x),vec3(1.0/6.0));float dy=dot(abs(center-y),vec3(1.0/6.0));float total=dx+dy;directional=total!=0.0?(x*dy+y*dx)/total:(x+y)*0.5;}else{directional=smoothAt(p+(negOk?negDelta:posDelta));}
+    float scale=min(abs(center.x-directional.x)/max(center.x+directional.x,1.0)*2.0,1.0);return vec3(mix(center.y,directional.y,scale),mix(center.z,directional.z,scale),scale);
+}
+/* IRIS_26769_FROZEN_MAP_DIRECTIONAL_CONTAINMENT
+ * Exact opposite geometry: W/E, N/S, NE/SW, NW/SE. A blocked side contributes zero; if only
+ * one side is owned, the estimate is one-sided. No later directional stage may reinterpret
+ * the material boundary from already-filtered chroma. */
+vec4 filter3(uvec4 encoded,ivec2 p){
+    vec3 center=vec3(decodeU16(encoded.r),float(signedChroma(encoded.g)),float(signedChroma(encoded.b)));vec3 selected=vec3(0.0);float totalWeight=0.0;float minActiveScale=1.0;float w;vec3 candidate;
+    candidate=pairCandidate26769(p,center,ivec2(-1,0),3,1,ivec2(1,0),1,3,w);if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
+    candidate=pairCandidate26769(p,center,ivec2(0,-1),0,2,ivec2(0,1),2,0,w);if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
+    candidate=pairCandidate26769(p,center,ivec2(1,-1),4,6,ivec2(-1,1),6,4,w);if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
+    candidate=pairCandidate26769(p,center,ivec2(-1,-1),7,5,ivec2(1,1),5,7,w);if(w>0.0){selected+=candidate*w;totalWeight+=w;minActiveScale=min(minActiveScale,candidate.z);}
+    if(totalWeight<=0.0)return vec4(center.x,center.y,center.z,0.0);selected/=totalWeight;float yScale=clamp(1.0-center.x/16384.0*minActiveScale,0.0,1.0);return vec4(center.x,yScale*selected.x,yScale*selected.y,selected.z*65504.0);
+}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy);if(any(greaterThanEqual(p,uImageSize)))return;
+    uvec4 e=imageLoad(uOriginal,p);vec4 f=vec4(decodeU16(e.r),float(signedChroma(e.g)),float(signedChroma(e.b)),0.0);
+    if(e.r!=0u&&e.a!=0u)f=filter3(e,p);
+    uvec4 sm=imageLoad(uSmooth,p);
+    vec2 originalChroma=vec2(float(signedChroma(e.g)),float(signedChroma(e.b)));
+    bool highlightCleanupOwned26807=(int(e.a)&0x2000)!=0;
+    float highlightCleanupPermission26807=highlightCleanupOwned26807?0.0:1.0;
+    vec2 smoothChroma=vec2(float(signedChroma(sm.g)),float(signedChroma(sm.b)));
+    vec2 directionalChroma=f.yz;
+    vec2 legacyChroma=length(smoothChroma)<length(directionalChroma)?smoothChroma:directionalChroma;
+
+    /* IRIS_26571_DIRECTIONAL_EDGE_CHROMA_FLOOR
+     * Preserve the exact 26570 lower-chroma choice in interiors. At a real non-highlight
+     * directional edge, prefer the candidate whose hue agrees with the original subject
+     * and prevent that candidate from collapsing below 80% of coherent center chroma.
+     * The cap is the original center magnitude, so this cannot globally boost saturation.
+     */
+    float edgeEvidence=clamp(f.w/65504.0,0.0,1.0);
+    float centerY=clamp(f.x/65504.0,0.0,1.0);
+    float highlightPreservePermission=1.0-smoothstep(0.72,0.92,centerY);
+    /* IRIS_26767_DIRECTIONAL_CHROMA_TOPOLOGY_OWNER
+     * directionalSmooth receives the locally-clamped pre-median center in uOriginal.
+     * Preserve that center only when chroma itself proves a continuing material or a
+     * reciprocal material boundary. This removes the old requirement that real color also
+     * present an 8%+ luma edge, while keeping the lower-chroma legacy choice for isolated
+     * chroma events. Mixing back only the original center cannot transport color across an
+     * arbitrary border; a neutral/background center remains neutral. */
+    float centerChromaMagnitude26767=length(originalChroma);
+    float centerMaterialSupport26767=0.0;
+    float reciprocalBoundaryEvidence26767=0.0;
+    const ivec2 colorDirections26767[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+    for(int i=0;i<8;++i){
+        uvec4 neighborPixel26767=imageLoad(uOriginal,safePos(p+colorDirections26767[i]));
+        uvec4 farPixel26767=imageLoad(uOriginal,safePos(p+colorDirections26767[i]*2));
+        vec2 neighborChroma26767=vec2(float(signedChroma(neighborPixel26767.g)),float(signedChroma(neighborPixel26767.b)));
+        vec2 farChroma26767=vec2(float(signedChroma(farPixel26767.g)),float(signedChroma(farPixel26767.b)));
+        float centerNeighborDelta26767=chromaDistance(originalChroma,neighborChroma26767);
+        float centerFarDelta26767=chromaDistance(originalChroma,farChroma26767);
+        float neighborFarDelta26767=chromaDistance(neighborChroma26767,farChroma26767);
+        float sameImmediate26767=1.0-smoothstep(0.18,0.42,centerNeighborDelta26767);
+        float sameFar26767=1.0-smoothstep(0.18,0.42,centerFarDelta26767);
+        centerMaterialSupport26767+=sameImmediate26767*(0.75+0.75*sameFar26767);
+        float neighborContinuation26767=1.0-smoothstep(0.18,0.42,neighborFarDelta26767);
+        reciprocalBoundaryEvidence26767=max(reciprocalBoundaryEvidence26767,
+            smoothstep(0.35,0.70,centerNeighborDelta26767)*neighborContinuation26767);
+    }
+    float centerMaterialContinuity26767=smoothstep(0.90,1.50,centerMaterialSupport26767);
+    float chromaInteriorProtection26767=centerMaterialContinuity26767*
+        smoothstep(128.0,512.0,centerChromaMagnitude26767)*highlightPreservePermission;
+    float chromaBoundaryProtection26767=centerMaterialContinuity26767*
+        smoothstep(0.35,0.70,reciprocalBoundaryEvidence26767)*highlightPreservePermission;
+    float chromaTopologyProtection26767=max(chromaInteriorProtection26767,chromaBoundaryProtection26767);
+    float topologySupport=0.0;
+    if(centerY>0.58||edgeEvidence>0.08){
+        const ivec2 td[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+        float centerMagnitude=max(length(originalChroma),1.0);
+        for(int i=0;i<8;++i){
+            uvec4 farPixel=imageLoad(uOriginal,safePos(p+td[i]*2));
+            float farY=decodeU16(farPixel.r)/65504.0;
+            float farDelta=abs(farY-centerY)/max(max(farY,centerY),0.060);
+            vec2 farChroma=vec2(float(signedChroma(farPixel.g)),float(signedChroma(farPixel.b)));
+            float farAgreement=clamp(chromaAgreement(originalChroma,farChroma),-1.0,1.0);
+            float sameLuma=1.0-smoothstep(0.10,0.26,farDelta);
+            float centerChromaPresent=smoothstep(128.0,512.0,centerMagnitude);
+            topologySupport+=sameLuma*mix(1.0,smoothstep(0.82,0.94,farAgreement),centerChromaPresent);
+        }
+    }
+    float topologyProtection=smoothstep(1.25,2.75,topologySupport)*smoothstep(0.08,0.30,edgeEvidence)*
+        highlightCleanupPermission26807;
+    float edgePreserve=max(smoothstep(0.08,0.30,edgeEvidence)*highlightPreservePermission,topologyProtection)*
+        highlightCleanupPermission26807;
+    float smoothAgreement=clamp(chromaAgreement(originalChroma,smoothChroma),-1.0,1.0);
+    float directionalAgreement=clamp(chromaAgreement(originalChroma,directionalChroma),-1.0,1.0);
+    vec2 edgeCandidate=directionalAgreement>=smoothAgreement?directionalChroma:smoothChroma;
+    float edgeAgreement=max(smoothAgreement,directionalAgreement);
+    float originalMagnitude=length(originalChroma);
+    float edgeMagnitude=length(edgeCandidate);
+    if(!highlightCleanupOwned26807&&originalMagnitude>192.0&&edgeMagnitude>1.0&&edgeAgreement>0.82){
+        float protectedMagnitude=clamp(edgeMagnitude,0.80*originalMagnitude,originalMagnitude);
+        edgeCandidate*=protectedMagnitude/edgeMagnitude;
+    }
+    float coherentEdge=smoothstep(0.72,0.92,edgeAgreement);
+    vec2 selectedChroma=mix(legacyChroma,edgeCandidate,edgePreserve*coherentEdge);
+    selectedChroma=mix(selectedChroma,originalChroma,0.85*topologyProtection);
+    selectedChroma=mix(selectedChroma,originalChroma,chromaTopologyProtection26767*
+        highlightCleanupPermission26807);
+    ivec2 encodedChroma=ivec2(round(selectedChroma));
+    imageStore(uOutput,p,uvec4(uint(clamp(f.x,0.0,65504.0)),unsignedChroma(encodedChroma.x),unsignedChroma(encodedChroma.y),uint(clamp(f.w,0.0,65504.0))));
+}

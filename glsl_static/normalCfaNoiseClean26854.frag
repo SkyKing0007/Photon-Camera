@@ -1,0 +1,94 @@
+#version 300 es
+precision highp float;
+precision highp int;
+uniform sampler2D uPhaseSignal;
+uniform sampler2D uSharedSupport;
+uniform sampler2D uPhaseValidity;
+uniform sampler2D uTemporalStats26853;
+uniform ivec2 uQuadSize;
+uniform vec4 uCfaNoiseShot26854;
+uniform vec4 uCfaNoiseRead26854;
+layout(location = 0) out vec4 oCleanPhaseSignal;
+float smooth26854(float v) {
+    float x=clamp(v,0.0,1.0);
+    return x*x*(3.0-2.0*x);
+}
+ivec2 bound26854(ivec2 q) {
+    return clamp(q,ivec2(0),uQuadSize-ivec2(1));
+}
+float support26854(ivec2 q) {
+    return max(texelFetch(uSharedSupport,bound26854(q),0).x,1.0e-7);
+}
+vec4 mean26854(ivec2 q) {
+    return texelFetch(uPhaseSignal,bound26854(q),0)/support26854(q);
+}
+vec4 validity26854(ivec2 q) {
+    q=bound26854(q);
+    return clamp(texelFetch(uPhaseValidity,q,0)/support26854(q),0.0,1.0);
+}
+float nEff26854(ivec2 q) {
+    q=bound26854(q);
+    float w=support26854(q);
+    float w2=max(texelFetch(uTemporalStats26853,q,0).x,1.0e-7);
+    return clamp((w*w)/w2,1.0,32.0);
+}
+vec4 sigma26854(vec4 v,float n) {
+    vec4 variance=max(uCfaNoiseShot26854*max(v,vec4(0.0))+
+        uCfaNoiseRead26854,vec4(1.0e-9));
+    return sqrt(variance/max(n,1.0));
+}
+void main() {
+    ivec2 q=bound26854(ivec2(gl_FragCoord.xy));
+    vec4 center=mean26854(q);
+    vec4 centerValid=validity26854(q);
+    float sumW=support26854(q);
+    float n=nEff26854(q);
+    vec4 sigma=sigma26854(center,n);
+    float y=dot(center,vec4(0.25));
+    float noiseY=dot(sigma,vec4(0.25));
+    vec4 numerator=center*2.0;
+    vec4 denominator=vec4(2.0);
+    float structureEnergy=0.0;
+    float structureWeight=0.0;
+    for(int oy=-1;oy<=1;++oy) {
+        for(int ox=-1;ox<=1;++ox) {
+            if(ox==0&&oy==0)continue;
+            ivec2 nq=bound26854(q+ivec2(ox,oy));
+            vec4 neighbor=mean26854(nq);
+            vec4 nv=validity26854(nq);
+            vec4 neighborSigma=sigma26854(neighbor,nEff26854(nq));
+            float ny=dot(neighbor,vec4(0.25));
+            float guideDelta=abs(ny-y);
+            float combinedGuideNoise=noiseY+dot(neighborSigma,vec4(0.25));
+            /* Large coherent steps override noise compatibility and stay untouched. */
+            float reliableStep=max(guideDelta-2.5*combinedGuideNoise,0.0);
+            structureEnergy+=reliableStep;
+            structureWeight+=1.0;
+            vec4 combinedSigma=sqrt(sigma*sigma+neighborSigma*neighborSigma);
+            vec4 normalizedDifference=abs(neighbor-center)/max(combinedSigma,vec4(1.0e-5));
+            /* Reject likely true color transitions, not expected sensor-noise differences. */
+            vec4 sameMaterial=vec4(1.0)-smoothstep(vec4(1.4),vec4(4.0),normalizedDifference);
+            float guideCompatible=1.0-smooth26854((guideDelta-
+                1.5*combinedGuideNoise)/max(4.0*combinedGuideNoise,0.02));
+            float spatial=(abs(ox)+abs(oy)==2)?0.70:1.0;
+            vec4 w=sameMaterial*nv*(guideCompatible*spatial);
+            numerator+=w*neighbor;
+            denominator+=w;
+        }
+    }
+    vec4 consensus=numerator/max(denominator,vec4(1.0e-6));
+    float coherentStructure=structureEnergy/max(structureWeight,1.0);
+    float detailVeto=1.0-smooth26854(coherentStructure/
+        max(3.5*noiseY,0.015));
+    /* Calibrated noise stays >0 when temporal disagreement vanishes or n=1. */
+    float noiseRatio=noiseY/max(abs(y),0.028);
+    float noiseNeed=smooth26854((noiseRatio-0.008)/0.085);
+    float shadowOpportunity=1.0-smooth26854((y-0.24)/0.52);
+    float validityFloor=min(min(centerValid.r,centerValid.g),
+        min(centerValid.b,centerValid.a));
+    float safeValidity=smooth26854((validityFloor-0.60)/0.36);
+    float blend=clamp(0.82*noiseNeed*detailVeto*safeValidity*
+        (0.40+0.60*shadowOpportunity),0.0,0.82);
+    /* Keep each phase independent and preserve the weighted-signal interface. */
+    oCleanPhaseSignal=mix(center,consensus,blend)*sumW;
+}

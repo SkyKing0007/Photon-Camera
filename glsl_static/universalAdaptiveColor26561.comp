@@ -1,0 +1,846 @@
+#version 310 es
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+precision highp float;
+precision highp int;
+// IRIS_26578_FAIL_CLOSED_REAL_COLOR_GATE
+layout(rgba16ui, binding = 0) readonly uniform highp uimage2D uSource;
+layout(rgba16ui, binding = 1) writeonly uniform highp uimage2D uDestination;
+/* IRIS_26807_HIGHLIGHT_CLEANUP_OWNERSHIP_HANDOFF
+ * Read the immutable seed ownership map. Bit 13 means the 26806/26727 bright-color
+ * authority denied reconstructed chroma ownership at this exact pixel. Later recovery and
+ * magnitude-floor stages may not resurrect that denied chroma. */
+layout(rgba16ui, binding = 2) readonly uniform highp uimage2D uOwnership;
+uniform ivec2 uImageSize;
+/* IRIS_26614_RAW_CFA_CHANNEL_VALIDITY_PROVENANCE
+ * Total R/G/B reconstruction weights plus the additive subset backed by source CFA samples
+ * that retained real sensor-code headroom. The ratio is measurement validity, not a color
+ * classifier. Valid measured color is protected; invalid color cannot protect itself merely
+ * because the reconstructed RGB artifact forms a coherent contour. */
+uniform highp sampler2D uSabreWeightR;
+uniform highp sampler2D uSabreWeightsGb;
+uniform highp sampler2D uSabreValidWeights;
+uniform highp float uSabreValidityWeightScale;
+uniform int uSabreSupportValid;
+/* IRIS_26728_PHYSICALLY_SUPPORTED_CHROMA_MAGNITUDE
+ * Read-only pre-VGN physical RGB. It can supply chroma magnitude evidence only; hue/direction
+ * remains owned by the cleaned VGN result below. */
+uniform highp sampler2D uPhysicalPreVgn;
+uniform int uPhysicalPreVgnValid;
+
+vec3 loadRgb(ivec2 p) {
+    uvec4 packedValue = imageLoad(uSource, clamp(p, ivec2(0), uImageSize - ivec2(1)));
+    return vec3(packedValue.rgb) / 65535.0;
+}
+
+vec3 loadSabreChannelValidity(ivec2 p) {
+    if (uSabreSupportValid == 0) return vec3(1.0);
+    ivec2 q = clamp(p, ivec2(0), uImageSize - ivec2(1));
+    vec3 totalWeight = vec3(
+        max(texelFetch(uSabreWeightR, q, 0).r, 0.0),
+        max(texelFetch(uSabreWeightsGb, q, 0).r, 0.0),
+        max(texelFetch(uSabreWeightsGb, q, 0).g, 0.0));
+    vec3 validWeight = max(texelFetch(uSabreValidWeights, q, 0).rgb, vec3(0.0)) *
+        max(uSabreValidityWeightScale, 1.0);
+    return clamp(validWeight / max(totalWeight, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
+}
+
+float minimum3(vec3 v) { return min(v.r, min(v.g, v.b)); }
+float maximum3(vec3 v) { return max(v.r, max(v.g, v.b)); }
+
+float luminanceOf(vec3 rgb) {
+    return dot(rgb, vec3(0.25, 0.50, 0.25));
+}
+
+float hueAgreement(vec3 a, vec3 b) {
+    return clamp(dot(a, b) / max(length(a) * length(b), 1.0e-6), -1.0, 1.0);
+}
+
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, uImageSize))) return;
+    vec3 center = loadRgb(p);
+    bool highlightCleanupOwned26807 = (int(imageLoad(uOwnership, p).a) & 0x2000) != 0;
+    float highlightCleanupPermission26807 = highlightCleanupOwned26807 ? 0.0 : 1.0;
+    float centerLuma = luminanceOf(center);
+    float centerScale = max(centerLuma, 0.060);
+    vec3 centerChroma = center - vec3(centerLuma);
+    vec3 centerNormalizedChroma = centerChroma / centerScale;
+    float centerNormalizedMagnitude = length(centerNormalizedChroma);
+    vec3 centerChannelValidity = loadSabreChannelValidity(p);
+    float centerMeasuredValidity = minimum3(centerChannelValidity);
+    float measuredColorProtection = uSabreSupportValid != 0
+        ? smoothstep(0.985, 0.9995, centerMeasuredValidity) : 0.0;
+    float centerValidConsensusWeight = uSabreSupportValid != 0
+        ? smoothstep(0.90, 0.985, centerMeasuredValidity) : 0.0;
+
+    vec3 normalizedChromaSum = centerNormalizedChroma;
+    float weightSum = 1.0;
+    vec3 validNormalizedChromaSum = centerNormalizedChroma * centerValidConsensusWeight;
+    float validWeightSum = centerValidConsensusWeight;
+    /* IRIS_26815_INDEPENDENT_NEIGHBOR_CHROMA_RESTORE_PROOF
+     * Keep a second physically-valid same-surface consensus that explicitly excludes the
+     * center pixel. The 26728 magnitude owner may consult this as independent evidence,
+     * but the center's own pre-VGN chroma can no longer vote to restore itself. */
+    vec3 independentValidNeighborChromaSum = vec3(0.0);
+    float independentValidNeighborWeight = 0.0;
+    float validNeighborSupport = 0.0;
+    float neighborSupport = 0.0;
+    float neutralNeighborSupport = 0.0;
+    float maximumRelativeLumaDelta = 0.0;
+    int brighterSide = 0;
+    int darkerSide = 0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            if (x == 0 && y == 0) continue;
+            vec3 neighborRgb = loadRgb(p + ivec2(x, y));
+            float neighborLuma = luminanceOf(neighborRgb);
+            float lumaScale = max(max(centerLuma, neighborLuma), 0.060);
+            float signedRelativeLumaDelta = (neighborLuma - centerLuma) / lumaScale;
+            float relativeLumaDelta = abs(signedRelativeLumaDelta);
+            maximumRelativeLumaDelta = max(maximumRelativeLumaDelta, relativeLumaDelta);
+            if (signedRelativeLumaDelta > 0.16) brighterSide++;
+            if (signedRelativeLumaDelta < -0.16) darkerSide++;
+            float sameSurfaceWeight = 1.0 - smoothstep(0.16, 0.55, relativeLumaDelta);
+            vec3 neighborChroma = neighborRgb - vec3(neighborLuma);
+            vec3 neighborNormalizedChroma = neighborChroma / max(neighborLuma, 0.060);
+            normalizedChromaSum += neighborNormalizedChroma * sameSurfaceWeight;
+            weightSum += sameSurfaceWeight;
+            neighborSupport += sameSurfaceWeight;
+            float neighborNormalizedMagnitude = length(neighborNormalizedChroma);
+            neutralNeighborSupport += sameSurfaceWeight *
+                (1.0 - smoothstep(0.035, 0.100, neighborNormalizedMagnitude));
+            if (uSabreSupportValid != 0) {
+                vec3 neighborChannelValidity = loadSabreChannelValidity(p + ivec2(x, y));
+                float neighborMeasuredValidity = minimum3(neighborChannelValidity);
+                float measuredNeighborWeight = smoothstep(0.90, 0.985, neighborMeasuredValidity);
+                float validSameSurfaceWeight = sameSurfaceWeight * measuredNeighborWeight;
+                validNormalizedChromaSum += neighborNormalizedChroma * validSameSurfaceWeight;
+                validWeightSum += validSameSurfaceWeight;
+                independentValidNeighborChromaSum +=
+                    neighborNormalizedChroma * validSameSurfaceWeight;
+                independentValidNeighborWeight += validSameSurfaceWeight;
+                validNeighborSupport += validSameSurfaceWeight;
+            }
+        }
+    }
+
+    vec3 consensusNormalizedChroma = normalizedChromaSum / max(weightSum, 1.0e-6);
+    float chromaDisagreement = length(centerNormalizedChroma - consensusNormalizedChroma);
+    float consensusMagnitude = length(consensusNormalizedChroma);
+    float chromaAgreement = hueAgreement(centerNormalizedChroma, consensusNormalizedChroma);
+    float surfaceSupport = smoothstep(2.5, 5.75, neighborSupport);
+    float neutralSurfaceSupport = smoothstep(2.50, 4.00, neutralNeighborSupport);
+    vec3 validConsensusNormalizedChroma = validWeightSum > 1.0e-6
+        ? validNormalizedChromaSum / validWeightSum : centerNormalizedChroma;
+    vec3 independentValidNeighborConsensus = independentValidNeighborWeight > 1.0e-6
+        ? independentValidNeighborChromaSum / independentValidNeighborWeight : vec3(0.0);
+    float independentValidNeighborSupport = uSabreSupportValid != 0
+        ? clamp(independentValidNeighborWeight / 2.50, 0.0, 1.0) : 0.0;
+    float validConsensusSupport = uSabreSupportValid != 0
+        ? clamp(validNeighborSupport / 3.50, 0.0, 1.0) : 0.0;
+    float physicalChromaDisagreement =
+        length(centerNormalizedChroma - validConsensusNormalizedChroma);
+    /* Physical provenance has no hard "artifact must be this strong" dead zone. Once a
+     * channel is known to be radiometrically invalid, disagreement with valid same-surface
+     * color is continuous evidence rather than another scene-tuned classification gate. */
+    float physicalOutlierEvidence = clamp(physicalChromaDisagreement / 0.180, 0.0, 1.0);
+    float legacyEdgeProtection = smoothstep(0.45, 0.90, maximumRelativeLumaDelta);
+
+    /* IRIS_26571_SAME_SIDE_MATERIAL_BOUNDARY: preserve the proven 26571 material-boundary ownership. */
+    float oneSidedLuma = ((brighterSide >= 4 && darkerSide <= 1) ||
+        (darkerSide >= 4 && brighterSide <= 1)) ? 1.0 : 0.0;
+    float highlightPreservePermission = 1.0 - smoothstep(0.72, 0.92, centerLuma);
+    float materialBoundary = oneSidedLuma *
+        (1.0 - smoothstep(0.72, 0.92, chromaAgreement)) * highlightPreservePermission;
+
+    /* Radius-two evidence inherited from 26574, plus a new near+far chain test. The chain
+     * is the real-color topology proof: a contour/curve/letter/leaf only needs one or more
+     * directions where its own hue continues on the same surface. Conversely, a CFA-like
+     * phase pattern has a far sample that repeats the center while the nearer sample does
+     * not support that hue. That pattern is suspicious but is never sufficient by itself.
+     */
+    float topologySupport = 0.0;
+    float nearTopologySupport = 0.0;
+    float contourChainSupport = 0.0;
+    float phasePatternSupport = 0.0;
+    /* IRIS_26825_TWO_AXIS_HUE_SUPPORT
+     * Reuse the already-fetched cardinal topology samples; no extra texture reads.
+     * This is evidence only for the later 26728 magnitude-restoration guard. */
+    float restoreHorizontalHueSupport26825 = 0.0;
+    float restoreVerticalHueSupport26825 = 0.0;
+    /* IRIS_26825_TWO_AXIS_HUE_SUPPORT_END */
+    /* IRIS_26579_MICRO_OBJECT_COLOR_TOPOLOGY
+     * A real tiny print/icon may contain several different hues inside only a few native
+     * pixels, so same-hue continuation is not a sufficient real-color definition. Measure
+     * non-neutral chroma occupancy over radius two as a 2-D shape instead. The minor second
+     * moment is near zero for a thin edge-following CFA fringe (including diagonal fringes)
+     * but positive for a compact colored area. Hue agreement is deliberately not required.
+     */
+    float microChromaWeight = 0.0;
+    float microNearWeight = 0.0;
+    float microMomentXX = 0.0;
+    float microMomentYY = 0.0;
+    float microMomentXY = 0.0;
+    /* IRIS_26580_MICRO_OBJECT_AREA_VS_RIBBON
+     * Track independent near-field horizontal/vertical occupancy. A genuine tiny printed
+     * object may change hue inside only a few pixels, but it still occupies area in both
+     * image axes. A one-pixel CFA/text fringe remains line-like even when it is diagonal.
+     */
+    float microNearLeft = 0.0;
+    float microNearRight = 0.0;
+    float microNearUp = 0.0;
+    float microNearDown = 0.0;
+    const ivec2 topologyDirections[8] = ivec2[8](
+        ivec2(1,0), ivec2(-1,0), ivec2(0,1), ivec2(0,-1),
+        ivec2(1,1), ivec2(-1,-1), ivec2(1,-1), ivec2(-1,1));
+    float centerChromaPresent = smoothstep(0.035, 0.090, centerNormalizedMagnitude);
+    if (centerLuma > 0.58 || oneSidedLuma > 0.5 || legacyEdgeProtection > 0.25 ||
+        centerChromaPresent > 0.0) {
+        for (int yy = -2; yy <= 2; ++yy) {
+            for (int xx = -2; xx <= 2; ++xx) {
+                if (xx == 0 && yy == 0) continue;
+                vec3 objectRgb = loadRgb(p + ivec2(xx, yy));
+                float objectLuma = luminanceOf(objectRgb);
+                float relativeObjectLuma = abs(objectLuma - centerLuma) /
+                    max(max(objectLuma, centerLuma), 0.060);
+                vec3 objectChroma = (objectRgb - vec3(objectLuma)) / max(objectLuma, 0.060);
+                float chromatic = smoothstep(0.050, 0.115, length(objectChroma));
+                /* Broad luma compatibility rejects unrelated remote surfaces without
+                 * demanding one brightness inside a multicolor micro-print. */
+                float objectCompatibility = 1.0 - smoothstep(0.72, 1.20, relativeObjectLuma);
+                float w = chromatic * objectCompatibility;
+                microChromaWeight += w;
+                if (abs(xx) <= 1 && abs(yy) <= 1) {
+                    microNearWeight += w;
+                    if (xx < 0) microNearLeft = max(microNearLeft, w);
+                    if (xx > 0) microNearRight = max(microNearRight, w);
+                    if (yy < 0) microNearUp = max(microNearUp, w);
+                    if (yy > 0) microNearDown = max(microNearDown, w);
+                }
+                microMomentXX += w * float(xx * xx);
+                microMomentYY += w * float(yy * yy);
+                microMomentXY += w * float(xx * yy);
+            }
+        }
+        for (int i = 0; i < 8; ++i) {
+            vec3 nearRgb = loadRgb(p + topologyDirections[i]);
+            vec3 farRgb = loadRgb(p + topologyDirections[i] * 2);
+            float nearLuma = luminanceOf(nearRgb);
+            float farLuma = luminanceOf(farRgb);
+            float nearLumaDelta = abs(nearLuma - centerLuma) /
+                max(max(nearLuma, centerLuma), 0.060);
+            float farLumaDelta = abs(farLuma - centerLuma) /
+                max(max(farLuma, centerLuma), 0.060);
+            vec3 nearChroma = (nearRgb - vec3(nearLuma)) / max(nearLuma, 0.060);
+            vec3 farChroma = (farRgb - vec3(farLuma)) / max(farLuma, 0.060);
+            float nearAgreement = hueAgreement(centerNormalizedChroma, nearChroma);
+            float farAgreement = hueAgreement(centerNormalizedChroma, farChroma);
+            float nearSameLuma = 1.0 - smoothstep(0.10, 0.26, nearLumaDelta);
+            float farSameLuma = 1.0 - smoothstep(0.10, 0.26, farLumaDelta);
+            float nearSameHue = smoothstep(0.82, 0.94, nearAgreement);
+            float farSameHue = smoothstep(0.82, 0.94, farAgreement);
+
+            /* IRIS_26825_TWO_AXIS_HUE_SUPPORT_ACCUMULATE */
+            float restoreCardinalSupport26825 = nearSameLuma * nearSameHue *
+                centerChromaPresent;
+            if (i < 2) {
+                restoreHorizontalHueSupport26825 = max(restoreHorizontalHueSupport26825,
+                    restoreCardinalSupport26825);
+            } else if (i < 4) {
+                restoreVerticalHueSupport26825 = max(restoreVerticalHueSupport26825,
+                    restoreCardinalSupport26825);
+            }
+            /* IRIS_26825_TWO_AXIS_HUE_SUPPORT_ACCUMULATE_END */
+
+            topologySupport += farSameLuma * mix(1.0, farSameHue, centerChromaPresent);
+            nearTopologySupport += nearSameLuma * nearSameHue * centerChromaPresent;
+            contourChainSupport += nearSameLuma * farSameLuma * nearSameHue * farSameHue *
+                centerChromaPresent;
+            phasePatternSupport += nearSameLuma * farSameLuma * farSameHue *
+                (1.0 - smoothstep(0.20, 0.72, nearAgreement)) * centerChromaPresent;
+        }
+    }
+    /* IRIS_26574_TOPOLOGY_PRESERVED_BRIGHT_SURFACE: radius-two contour/curve continuation remains authoritative. */
+    float radiusTwoTopologyProtection = smoothstep(1.25, 2.75, topologySupport) *
+        smoothstep(0.20, 0.55, max(legacyEdgeProtection, oneSidedLuma));
+    float nearTopologyProtection = smoothstep(0.55, 1.45, nearTopologySupport);
+    float contourTopologyProtection = smoothstep(0.55, 1.60, contourChainSupport);
+    float phaseLikeEvidence = smoothstep(1.10, 2.80, phasePatternSupport);
+    float topologyProtection = max(max(nearTopologyProtection, contourTopologyProtection),
+        radiusTwoTopologyProtection * (1.0 - 0.90 * phaseLikeEvidence));
+    float microTrace = microMomentXX + microMomentYY;
+    float microDeterminant = max(microMomentXX * microMomentYY -
+        microMomentXY * microMomentXY, 0.0);
+    float microMinorMoment = microTrace > 1.0e-6 ?
+        0.5 * (microTrace - sqrt(max(microTrace * microTrace -
+            4.0 * microDeterminant, 0.0))) / max(microChromaWeight, 1.0e-6) : 0.0;
+    float microAreaEvidence = smoothstep(1.35, 3.25, microChromaWeight) *
+        smoothstep(1.15, 2.75, microNearWeight) *
+        smoothstep(0.10, 0.32, microMinorMoment) * centerChromaPresent;
+    float microHorizontalPresence = max(microNearLeft, microNearRight);
+    float microVerticalPresence = max(microNearUp, microNearDown);
+    float microTwoAxisEvidence = smoothstep(0.18, 0.60, microHorizontalPresence) *
+        smoothstep(0.18, 0.60, microVerticalPresence);
+    float microCompactAreaEvidence = microAreaEvidence * microTwoAxisEvidence;
+
+    /* IRIS_26581_OCCLUSION_GAP_BACKGROUND_OWNER
+     * A tiny bright background opening between two darker foreground edges must not be
+     * classified by the local foreground majority. Require an opposing dark near-pair plus
+     * a matching bright/color-consistent far pair before assigning background ownership.
+     * This is deliberately strict: a tiny LED/flower/logo cannot satisfy the far-background
+     * continuation proof merely because it is small or saturated. */
+    const ivec2 gapAxes[4] = ivec2[4](
+        ivec2(1,0), ivec2(0,1), ivec2(1,1), ivec2(1,-1));
+    float gapBackgroundWeight = 0.0;
+    vec3 gapBackgroundChromaSum = vec3(0.0);
+    float gapPairEvidence = 0.0;
+    /* IRIS_26732_INVALID_HIGHLIGHT_PAIR_CONSENSUS + IRIS_26732_NEUTRAL_INK_PAIR_PROOF
+     * Pair evidence is source-measured and symmetric: it can repair a bad center but cannot
+     * invent a hue from a single neighboring edge. */
+    float invalidHighlightPairWeight = 0.0;
+    vec3 invalidHighlightPairChromaSum = vec3(0.0);
+    float invalidHighlightPairEvidence = 0.0;
+    float neutralInkPairWeight = 0.0;
+    vec3 neutralInkPairChromaSum = vec3(0.0);
+    float neutralInkPairEvidence = 0.0;
+    for (int g = 0; g < 4; ++g) {
+        ivec2 d = gapAxes[g];
+        vec3 nearA = loadRgb(p + d);
+        vec3 nearB = loadRgb(p - d);
+        vec3 farA = loadRgb(p + 2 * d);
+        vec3 farB = loadRgb(p - 2 * d);
+        float nearAY = luminanceOf(nearA);
+        float nearBY = luminanceOf(nearB);
+        float farAY = luminanceOf(farA);
+        float farBY = luminanceOf(farB);
+        float nearDarkA = smoothstep(0.18, 0.48,
+            (centerLuma - nearAY) / max(max(centerLuma, nearAY), 0.060));
+        float nearDarkB = smoothstep(0.18, 0.48,
+            (centerLuma - nearBY) / max(max(centerLuma, nearBY), 0.060));
+        float farSameA = 1.0 - smoothstep(0.09, 0.27,
+            abs(farAY - centerLuma) / max(max(farAY, centerLuma), 0.060));
+        float farSameB = 1.0 - smoothstep(0.09, 0.27,
+            abs(farBY - centerLuma) / max(max(farBY, centerLuma), 0.060));
+        vec3 farNormA = (farA - vec3(farAY)) / max(farAY, 0.060);
+        vec3 farNormB = (farB - vec3(farBY)) / max(farBY, 0.060);
+        float farMagA = length(farNormA);
+        float farMagB = length(farNormB);
+        float farNeutralPair = (1.0 - smoothstep(0.035, 0.090, farMagA)) *
+            (1.0 - smoothstep(0.035, 0.090, farMagB));
+        float farHuePair = smoothstep(0.72, 0.92, hueAgreement(farNormA, farNormB));
+        float farColorAgreement = max(farNeutralPair, farHuePair);
+        float pairEvidence = nearDarkA * nearDarkB * farSameA * farSameB *
+            farColorAgreement;
+        gapPairEvidence = max(gapPairEvidence, pairEvidence);
+        gapBackgroundWeight += pairEvidence;
+        gapBackgroundChromaSum += 0.5 * (farNormA + farNormB) * pairEvidence;
+
+        vec3 farValidityA = loadSabreChannelValidity(p + 2 * d);
+        vec3 farValidityB = loadSabreChannelValidity(p - 2 * d);
+        float farPhysicalPair = smoothstep(0.985, 0.9995,
+            min(minimum3(farValidityA), minimum3(farValidityB)));
+        float invalidHighlightSameA = 1.0 - smoothstep(0.18, 0.58,
+            abs(farAY - centerLuma) / max(max(farAY, centerLuma), 0.060));
+        float invalidHighlightSameB = 1.0 - smoothstep(0.18, 0.58,
+            abs(farBY - centerLuma) / max(max(farBY, centerLuma), 0.060));
+        float invalidHighlightPair = farPhysicalPair * invalidHighlightSameA *
+            invalidHighlightSameB * farColorAgreement;
+        invalidHighlightPairEvidence = max(invalidHighlightPairEvidence,
+            invalidHighlightPair);
+        invalidHighlightPairWeight += invalidHighlightPair;
+        invalidHighlightPairChromaSum += 0.5 * (farNormA + farNormB) *
+            invalidHighlightPair;
+
+        float nearBrightA = smoothstep(0.18, 0.50,
+            (nearAY - centerLuma) / max(max(nearAY, centerLuma), 0.060));
+        float nearBrightB = smoothstep(0.18, 0.50,
+            (nearBY - centerLuma) / max(max(nearBY, centerLuma), 0.060));
+        vec3 nearNormA = (nearA - vec3(nearAY)) / max(nearAY, 0.060);
+        vec3 nearNormB = (nearB - vec3(nearBY)) / max(nearBY, 0.060);
+        float nearNeutralPair = (1.0 - smoothstep(0.030, 0.085, length(nearNormA))) *
+            (1.0 - smoothstep(0.030, 0.085, length(nearNormB)));
+        float nearPhysicalPair = smoothstep(0.985, 0.9995,
+            min(minimum3(loadSabreChannelValidity(p + d)),
+                minimum3(loadSabreChannelValidity(p - d))));
+        float neutralInkPair = nearBrightA * nearBrightB * nearNeutralPair *
+            nearPhysicalPair;
+        neutralInkPairEvidence = max(neutralInkPairEvidence, neutralInkPair);
+        neutralInkPairWeight += neutralInkPair;
+        neutralInkPairChromaSum += 0.5 * (nearNormA + nearNormB) * neutralInkPair;
+    }
+    /* IRIS_26580_FAIL_CLOSED_MULTICOLOR_OBJECT_VETO
+     * Compact 2-D chroma wins over weak/moderate phase resemblance, which is common inside
+     * tiny multicolor prints. Only an overwhelming repeated near-opposite/far-matching phase
+     * signature can extinguish this veto; that preserves the proven 26578 neutral CFA-fringe
+     * regression. Uncertain cases remain biased toward keeping scene color. */
+    float phaseOverride = smoothstep(0.78, 0.96, phaseLikeEvidence);
+    float microObjectProtection = max(
+        microAreaEvidence * (1.0 - 0.98 * phaseOverride),
+        microCompactAreaEvidence * (1.0 - phaseOverride));
+    float supportedMaterialBoundary = materialBoundary * nearTopologyProtection;
+
+    /* Coherent center color remains protected. This is intentionally asymmetric: evidence
+     * for real color can veto cleanup, while evidence for false color must pass every gate.
+     */
+    float coherentHue = smoothstep(0.76, 0.95, chromaAgreement) *
+        smoothstep(0.050, 0.180, consensusMagnitude);
+    float centerToConsensusMagnitude = centerNormalizedMagnitude /
+        max(consensusMagnitude, 0.025);
+    float plausibleCenterMagnitude = 1.0 - smoothstep(2.0, 3.5, centerToConsensusMagnitude);
+    /* IRIS_26733_HEADROOM_PRECEDES_COLOR_OWNERSHIP
+     * Restore the successful 26727/26728 hierarchy: near-white/flattened highlights do not
+     * get to self-declare protected hue merely because reconstructed RGB is spatially
+     * coherent. The only exception is a genuinely bright colored material with all-channel
+     * physical support, substantial non-neutral chroma, and coherent real-color topology. */
+    float brightTopologyProof = max(max(nearTopologyProtection, contourTopologyProtection),
+        microObjectProtection);
+    float brightPhysicalColorException = measuredColorProtection *
+        smoothstep(0.10, 0.18, centerNormalizedMagnitude) *
+        smoothstep(0.50, 0.82, brightTopologyProof);
+    float highlightColorOwnershipPermission = max(highlightPreservePermission,
+        brightPhysicalColorException);
+    float coherentCenterProtection = coherentHue * plausibleCenterMagnitude *
+        highlightColorOwnershipPermission;
+    /* A luma edge by itself is no longer a chroma veto. Color topology still protects
+     * ordinary/tiny real color, but cannot bypass the inherited highlight-headroom owner. */
+    float realColorConfidence = clamp(max(max(max(supportedMaterialBoundary,
+        coherentCenterProtection), topologyProtection), microObjectProtection), 0.0, 1.0) *
+        highlightColorOwnershipPermission;
+
+    /* IRIS_26614_PHYSICAL_COLOR_VALIDITY_AUTHORITY
+     * 26613 used total contribution imbalance, then allowed reconstructed-RGB topology to
+     * veto it. That let a coherent magenta rail classify itself as real color. 26614 uses
+     * the ratio of valid source-CFA weight to total reconstruction weight instead. The
+     * correction direction is measured from neighboring pixels whose own R/G/B validity
+     * is high and whose luminance places them on the same local surface. */
+    vec3 channelInvalidity = uSabreSupportValid != 0
+        ? vec3(1.0) - centerChannelValidity : vec3(0.0);
+    vec3 physicalTargetChroma = validConsensusNormalizedChroma * centerScale;
+    vec3 physicalDesiredDelta = physicalTargetChroma - centerChroma;
+    float physicalDesiredLength = length(physicalDesiredDelta);
+    float invalidChannelDirection = physicalDesiredLength > 1.0e-7
+        ? clamp(length(physicalDesiredDelta * channelInvalidity) / physicalDesiredLength,
+            0.0, 1.0) : 0.0;
+    float physicalValidityEvidence = invalidChannelDirection * validConsensusSupport;
+
+    /* Fail-closed false-color proof.
+     * 1) The center must disagree materially with same-surface consensus.
+     * 2) That consensus must be close to neutral; colored-on-colored boundaries are thus
+     *    ambiguous and untouched.
+     * 3) There must be broad same-surface support and several genuinely neutral neighbors;
+     *    opposing real colors that merely average to neutral remain ambiguous and untouched.
+     * 4) A Bayer-like near/far phase signature must be present. Isolation by itself never
+     *    authorizes cleanup, so a tiny LED, flower, fabric thread or saturated object is
+     *    preserved when temporal/CFA certainty is unavailable at this post-VGN boundary.
+     * 5) Any convincing real-color topology vetoes the correction.
+     */
+    float centerOutlierEvidence = smoothstep(0.070, 0.220, chromaDisagreement);
+    float neutralConsensusEvidence = 1.0 - smoothstep(0.070, 0.160, consensusMagnitude);
+    float isolatedEvidence = smoothstep(1.35, 2.75, centerToConsensusMagnitude);
+    float phaseConfidence = phaseLikeEvidence * mix(0.70, 1.0, isolatedEvidence);
+    float legacyFalseColorBase = centerOutlierEvidence * neutralConsensusEvidence *
+        surfaceSupport * neutralSurfaceSupport * (1.0 - realColorConfidence) *
+        (1.0 - measuredColorProtection);
+    float legacyFalseColorScore = legacyFalseColorBase * phaseConfidence;
+
+    /* Physical validity does not require a neutral target. A real red/blue/purple material
+     * with one clipped channel is repaired toward physically valid same-surface color, not
+     * toward grey. Conversely a neutral window/ceiling edge naturally has a neutral valid
+     * consensus. RGB topology is deliberately not a veto on this path. */
+    float physicalFalseColorScore = physicalOutlierEvidence * physicalValidityEvidence;
+
+    vec3 legacyTargetChroma = consensusNormalizedChroma * centerScale;
+    float centerMagnitude = length(centerChroma);
+    float legacyTargetMagnitude = length(legacyTargetChroma);
+    if (legacyTargetMagnitude > centerMagnitude && legacyTargetMagnitude > 1.0e-7) {
+        legacyTargetChroma *= centerMagnitude / legacyTargetMagnitude;
+        legacyTargetMagnitude = centerMagnitude;
+    }
+
+    float targetAgreement = hueAgreement(centerChroma, legacyTargetChroma);
+    float targetNeutral = 1.0 - smoothstep(0.010, 0.045, legacyTargetMagnitude);
+    float supportedTarget = max(targetNeutral, smoothstep(0.82, 0.94, targetAgreement));
+    float legacyCorrection = smoothstep(0.72, 0.90, legacyFalseColorScore) * supportedTarget;
+    vec3 legacyDesiredDelta = legacyTargetChroma - centerChroma;
+    float legacyDesiredLength = length(legacyDesiredDelta);
+    float legacyDecisiveNeutralCfaProof =
+        smoothstep(0.92, 0.985, legacyFalseColorScore) *
+        smoothstep(0.88, 0.985, phaseLikeEvidence) *
+        smoothstep(0.90, 0.995, neutralSurfaceSupport) *
+        smoothstep(0.90, 0.995, targetNeutral) *
+        (1.0 - smoothstep(0.02, 0.12, realColorConfidence)) *
+        (1.0 - measuredColorProtection);
+    float legacyMaximumMove = min(0.050, 0.40 * centerMagnitude);
+    float maximumMove = mix(legacyMaximumMove, legacyDesiredLength,
+        legacyDecisiveNeutralCfaProof);
+    float boundedScale = legacyDesiredLength > 1.0e-7
+        ? min(1.0, maximumMove / legacyDesiredLength) : 0.0;
+    vec3 correctedChroma = centerChroma +
+        legacyDesiredDelta * boundedScale * legacyCorrection;
+    if (length(correctedChroma) > centerMagnitude && length(correctedChroma) > 1.0e-7) {
+        correctedChroma *= centerMagnitude / length(correctedChroma);
+    }
+
+    /* IRIS_26707_VALID_CFA_NEUTRAL_SURFACE_LEAK_REJECT
+     * Radiometrically valid CFA samples do not prove that reconstructed chroma belongs to
+     * the center surface. A narrow neutral conduit/wire can borrow saturated background hue
+     * while every contributing source sample remains unclipped. Bypass measured-color
+     * protection only for an overwhelming signal-defined case: the center is a chroma
+     * outlier, its same-luma neighborhood has a strongly neutral consensus, the center hue
+     * exhibits the inherited near/far CFA-phase signature, and there is no compact/chain
+     * real-color topology. This path changes chroma only; center luminance/geometry are
+     * unchanged, and clean lenses/scenes that lack this signature remain exact pass-through. */
+    float neutralLeakOutlier = smoothstep(0.100, 0.205, chromaDisagreement);
+    float neutralLeakConsensus = smoothstep(0.72, 0.96, neutralConsensusEvidence);
+    float neutralLeakSurface = min(
+        smoothstep(0.78, 0.97, surfaceSupport),
+        smoothstep(0.82, 0.985, neutralSurfaceSupport));
+    float neutralLeakPhase = smoothstep(0.76, 0.94, phaseLikeEvidence);
+    float neutralLeakIsolation = smoothstep(1.55, 2.80, centerToConsensusMagnitude);
+    float neutralLeakRealColorVeto = clamp(max(max(
+        supportedMaterialBoundary,
+        microObjectProtection),
+        contourTopologyProtection * (1.0 - 0.95 * phaseLikeEvidence)), 0.0, 1.0);
+    float validCfaNeutralLeakProof = min(min(neutralLeakOutlier, neutralLeakConsensus),
+        min(neutralLeakSurface, neutralLeakPhase)) *
+        mix(0.80, 1.0, neutralLeakIsolation) * (1.0 - neutralLeakRealColorVeto);
+    float validCfaNeutralLeakAuthority = smoothstep(0.62, 0.88, validCfaNeutralLeakProof);
+    float validCfaNeutralLeakDesiredLength = length(legacyDesiredDelta);
+    float validCfaNeutralLeakMaximumMove = min(0.070, 0.68 * centerMagnitude);
+    float validCfaNeutralLeakScale = validCfaNeutralLeakDesiredLength > 1.0e-7
+        ? min(1.0, validCfaNeutralLeakMaximumMove /
+            validCfaNeutralLeakDesiredLength) : 0.0;
+    vec3 validCfaNeutralLeakCandidate = centerChroma + legacyDesiredDelta *
+        validCfaNeutralLeakScale;
+    correctedChroma = mix(correctedChroma, validCfaNeutralLeakCandidate,
+        0.92 * validCfaNeutralLeakAuthority);
+
+    /* IRIS_26732_NEUTRAL_FINE_STRUCTURE_LOCK
+     * A very dark thin structure bracketed by two trustworthy neutral brighter samples is
+     * treated as neutral material unless the existing real-color topology proves otherwise.
+     * This is geometry/color evidence, not text recognition, so it applies equally to black
+     * printed strokes, neutral wires, mesh and similarly thin achromatic structure. */
+    if (neutralInkPairWeight > 1.0e-6) {
+        vec3 neutralInkTargetNormalized = neutralInkPairChromaSum / neutralInkPairWeight;
+        vec3 neutralInkTarget = neutralInkTargetNormalized * centerScale;
+        float neutralInkDark = 1.0 - smoothstep(0.16, 0.30, centerLuma);
+        float neutralInkOutlier = smoothstep(0.040, 0.135, centerNormalizedMagnitude);
+        float neutralInkRealColorVeto = clamp(max(max(supportedMaterialBoundary,
+            coherentCenterProtection), max(contourTopologyProtection,
+            0.70 * microObjectProtection)), 0.0, 1.0);
+        float neutralInkProof = neutralInkPairEvidence * neutralInkDark * neutralInkOutlier *
+            (1.0 - neutralInkRealColorVeto);
+        float neutralInkAuthority = smoothstep(0.60, 0.88, neutralInkProof);
+        float neutralInkTargetMagnitude = length(neutralInkTarget);
+        if (neutralInkTargetMagnitude > centerMagnitude && neutralInkTargetMagnitude > 1.0e-7) {
+            neutralInkTarget *= centerMagnitude / neutralInkTargetMagnitude;
+        }
+        correctedChroma = mix(correctedChroma, neutralInkTarget,
+            0.94 * neutralInkAuthority);
+    }
+
+    /* The physical path may increase or decrease chroma because its target is measured
+     * neighboring color with high per-channel CFA validity. Only physically invalid RGB
+     * components are replaced. The candidate is then uniformly rescaled back to the center
+     * luminance, so valid measured channels are never independently repainted. This is what
+     * protects true colored objects: no neutral assumption and no post-RGB coherence veto. */
+    float physicalAuthority = uSabreSupportValid != 0
+        ? clamp(physicalFalseColorScore, 0.0, 1.0) *
+            (1.0 - measuredColorProtection)
+        : 0.0;
+    vec3 physicalTargetRgb=max(vec3(centerLuma)+physicalTargetChroma,vec3(0.0));
+    /* Per-channel invalidity is the only component replacement mask. Do not multiply it by
+     * physicalAuthority here and again below: that double attenuation was explicitly
+     * rejected because it can turn strong physical evidence into another visible no-op. */
+    vec3 componentRepair=clamp(channelInvalidity,vec3(0.0),vec3(1.0));
+    vec3 physicalCandidateRgb=mix(center,physicalTargetRgb,componentRepair);
+    float physicalCandidateLuma=luminanceOf(physicalCandidateRgb);
+    if(centerLuma>1.0e-7&&physicalCandidateLuma>1.0e-7){
+        physicalCandidateRgb*=centerLuma/physicalCandidateLuma;
+    }
+    vec3 physicalCandidateChroma=physicalCandidateRgb-vec3(centerLuma);
+    correctedChroma=mix(correctedChroma,physicalCandidateChroma,physicalAuthority);
+
+    /* IRIS_26581_GAP_BACKGROUND_CHROMA_RESTORE
+     * When the strict paired-edge proof succeeds, the far samples are the actual supported
+     * background owner. Restore only toward their observed chroma; never invent a hue or use
+     * surrounding foreground color. This repair is independent of the false-color gate so a
+     * real blue sky opening can be made uniform even though blue itself is real color. */
+    if (gapBackgroundWeight > 1.0e-6) {
+        vec3 gapNormalizedChroma = gapBackgroundChromaSum / gapBackgroundWeight;
+        vec3 gapTargetChroma = gapNormalizedChroma * centerScale;
+        float gapDisagreement = smoothstep(0.045, 0.150,
+            length(centerNormalizedChroma - gapNormalizedChroma));
+        float gapOwnership = smoothstep(0.42, 0.88, gapPairEvidence) * gapDisagreement;
+        correctedChroma = mix(correctedChroma, gapTargetChroma, 0.88 * gapOwnership);
+    }
+
+    /* IRIS_26732_CONNECTED_INVALID_HIGHLIGHT_CLEANUP
+     * 26731 restored transport containment but its isolated fallback was too narrow for short
+     * chains/plateaus of clipped highlight chroma. A physically invalid bright center now
+     * inherits hue only from a symmetric pair of physically valid same-surface samples. If no
+     * such pair exists and the center is nearly white, suppress unsupported chroma rather than
+     * allowing a pink/green dotted highlight chain to self-protect. */
+    float invalidHighlightCenter = (1.0 - measuredColorProtection) *
+        smoothstep(0.58, 0.82, centerLuma);
+    if (invalidHighlightPairWeight > 1.0e-6) {
+        vec3 invalidHighlightTargetNormalized = invalidHighlightPairChromaSum /
+            invalidHighlightPairWeight;
+        vec3 invalidHighlightTarget = invalidHighlightTargetNormalized * centerScale;
+        float invalidHighlightAuthority = invalidHighlightCenter *
+            smoothstep(0.48, 0.86, invalidHighlightPairEvidence);
+        correctedChroma = mix(correctedChroma, invalidHighlightTarget,
+            0.96 * invalidHighlightAuthority);
+    } else {
+        float unresolvedInvalidHighlight = invalidHighlightCenter *
+            smoothstep(0.84, 0.97, centerLuma) *
+            (1.0 - smoothstep(0.20, 0.55, invalidHighlightPairEvidence));
+        correctedChroma *= 1.0 - 0.82 * unresolvedInvalidHighlight;
+    }
+
+    /* IRIS_26728_PHYSICALLY_SUPPORTED_CHROMA_MAGNITUDE
+     * Restore only missing chroma magnitude along the already-cleaned VGN direction.
+     * Pre-VGN RGB never supplies an RGB vector or hue. Strong all-channel CFA validity,
+     * strong pre/clean direction agreement and coherent real-color topology are all
+     * required. Existing false-color/phase/neutral-leak authorities and highlights veto.
+     * Alpha carries only the proven pre-VGN magnitude for the later residual-denoise floor. */
+    float protectedPreVgnMagnitude = 0.0;
+    if (uPhysicalPreVgnValid != 0 && uSabreSupportValid != 0) {
+        vec3 preVgnRgb = max(texelFetch(uPhysicalPreVgn, p, 0).rgb, vec3(0.0));
+        float preVgnPeak = maximum3(preVgnRgb);
+        float preVgnLuma = luminanceOf(preVgnRgb);
+        vec3 preVgnChroma = preVgnRgb - vec3(preVgnLuma);
+        float preVgnMagnitude = length(preVgnChroma);
+        float cleanedMagnitude = length(correctedChroma);
+        float cleanedDirectionPresent = smoothstep(0.010, 0.035, cleanedMagnitude);
+        float preVgnChromaPresent = smoothstep(0.018, 0.060, preVgnMagnitude);
+        float directionAgreement = hueAgreement(preVgnChroma, correctedChroma);
+        float measuredProof = smoothstep(0.992, 0.9995, centerMeasuredValidity);
+        float directionProof = smoothstep(0.94, 0.985, directionAgreement);
+        float topologyProof = smoothstep(0.55, 0.90, realColorConfidence);
+        float highlightSafe = 1.0 - smoothstep(0.78, 0.92, max(preVgnPeak, centerLuma));
+        float phaseArtifactAuthority = smoothstep(0.68, 0.90,
+            phaseConfidence * neutralSurfaceSupport * (1.0 - realColorConfidence));
+        /* IRIS_26733_NEUTRAL_FLOOR_VETO
+         * The residual-denoise magnitude floor must never re-amplify chroma when physically
+         * valid same-surface evidence is neutral. Tiny genuine color keeps the floor through
+         * compact/topological color proof; neutral printed strokes and neutral surfaces do not. */
+        float validNeutralConsensus = 1.0 - smoothstep(0.045, 0.115,
+            length(validConsensusNormalizedChroma));
+        float neutralFloorVeto = smoothstep(0.72, 0.94, neutralSurfaceSupport) *
+            validNeutralConsensus *
+            (1.0 - smoothstep(0.48, 0.82, max(microObjectProtection,
+                contourTopologyProtection)));
+        float artifactVeto = clamp(max(max(
+            smoothstep(0.65, 0.90, legacyFalseColorScore),
+            smoothstep(0.35, 0.70, physicalFalseColorScore)),
+            max(max(validCfaNeutralLeakAuthority, phaseArtifactAuthority), neutralFloorVeto)),
+            0.0, 1.0);
+        float strictPhysicalProof = min(min(measuredProof, directionProof),
+            min(topologyProof, highlightSafe));
+        /* IRIS_26815_INDEPENDENT_NEIGHBOR_CHROMA_RESTORE_PROOF
+         * 26814 device evidence falsified support equalization and the audit then proved
+         * that admitted 26728 pixels retained about 99.6% of pre-VGN chroma magnitude.
+         * Require physically-valid same-surface neighbors, excluding the center itself, to
+         * independently support both the cleaned hue direction and a substantial fraction
+         * of the requested pre-VGN magnitude. This does not target green/cyan or any hue,
+         * never changes luma, and never creates a new chroma vector. */
+        vec3 cleanedNormalizedChroma = correctedChroma / centerScale;
+        float independentNeighborMagnitude =
+            length(independentValidNeighborConsensus) * centerScale;
+        float independentNeighborDirection = hueAgreement(
+            independentValidNeighborConsensus, cleanedNormalizedChroma);
+        float independentNeighborDirectionProof = smoothstep(0.80, 0.94,
+            independentNeighborDirection);
+        /* IRIS_26818_STRICTER_INDEPENDENT_CHROMA_MAGNITUDE_PROOF
+         * Preserve 26815 direction/support ownership and the successful 26816 correction
+         * direction. Raise only the independent-neighbor magnitude proof so questionable
+         * pre-VGN chroma is less likely to be restored onto bright neutral material. */
+        float independentNeighborMagnitudeProof = smoothstep(0.70, 0.90,
+            independentNeighborMagnitude / max(preVgnMagnitude, 1.0e-6));
+        float independentNeighborSupportProof = smoothstep(0.35, 0.80,
+            independentValidNeighborSupport);
+        float independentNeighborRestoreProof = min(independentNeighborDirectionProof,
+            min(independentNeighborMagnitudeProof, independentNeighborSupportProof));
+        float hardArtifactVeto = step(0.50, artifactVeto);
+        float artifactPermission = (1.0 - artifactVeto) * (1.0 - hardArtifactVeto);
+        /* IRIS_26807_NO_DOWNSTREAM_HIGHLIGHT_CHROMA_RESURRECTION
+         * 26806 device evidence proved that strong edge/topology evidence could keep or
+         * rebuild unsupported green/cyan after the seed had already denied color ownership.
+         * This is a pure ownership veto: it never changes luma and never affects pixels whose
+         * 26806 bright-material proof opted them back into real-color ownership. */
+        float restorePermission = strictPhysicalProof * independentNeighborRestoreProof *
+            cleanedDirectionPresent * preVgnChromaPresent * artifactPermission *
+            highlightCleanupPermission26807;
+        float missingMagnitude = max(preVgnMagnitude - cleanedMagnitude, 0.0);
+        float restoredMagnitude = min(preVgnMagnitude,
+            cleanedMagnitude + missingMagnitude * restorePermission);
+
+        /* IRIS_26825_THIN_BRIGHT_MAGNITUDE_AMPLIFICATION_GUARD
+         * 26727 was much cleaner on clipped/thin bright structure but muted legitimate color.
+         * 26728 restored missing pre-VGN chroma magnitude along the cleaned VGN direction;
+         * device evidence now shows that a small phase-colored residual can be amplified into
+         * a saturated cyan/teal/yellow one-pixel line. Do not neutralize or rotate hue here.
+         * Instead, when the requested restoration is large at a bright high-gradient center,
+         * require same-hue continuation in BOTH image axes for unrestricted restoration.
+         * One-dimensional/phase-like support keeps the already-cleaned VGN chroma and only
+         * receives bounded extra magnitude. Broad coherent real color is unchanged. */
+        float restoreTwoAxisSupport26825 =
+            smoothstep(0.35, 0.78, restoreHorizontalHueSupport26825) *
+            smoothstep(0.35, 0.78, restoreVerticalHueSupport26825);
+        float restoreRequestedGain26825 = preVgnMagnitude /
+            max(cleanedMagnitude, 0.010);
+        float restoreLargeGain26825 = smoothstep(1.35, 2.20,
+            restoreRequestedGain26825);
+        float restoreBrightEdge26825 = smoothstep(0.38, 0.68, centerLuma) *
+            smoothstep(0.14, 0.40, maximumRelativeLumaDelta);
+        float restoreThinRisk26825 = restoreLargeGain26825 * restoreBrightEdge26825 *
+            (1.0 - restoreTwoAxisSupport26825);
+        float restoreRiskCeiling26825 = min(preVgnMagnitude,
+            cleanedMagnitude * 1.25 + 0.008);
+        float restoreCeiling26825 = mix(preVgnMagnitude,
+            restoreRiskCeiling26825, restoreThinRisk26825);
+        restoredMagnitude = min(restoredMagnitude, restoreCeiling26825);
+        /* IRIS_26825_THIN_BRIGHT_MAGNITUDE_AMPLIFICATION_GUARD_END */
+
+        if (cleanedMagnitude > 1.0e-7 && restoredMagnitude > cleanedMagnitude) {
+            correctedChroma *= restoredMagnitude / cleanedMagnitude;
+        }
+
+        /* IRIS_26818_SELECTIVE_GREEN_RESIDUAL_DENOISE
+         * Device evidence on the chrome chandelier shows a sparse positive-green residual
+         * after the broader false-color cleanup. Do not reopen Sabre/Resolve and do not
+         * blur RGB. Compare the post-restore chroma with the physically-valid same-surface
+         * neighbor consensus that already excludes the center. Only a bright, broadly
+         * neutral, well-supported material may attenuate a positive-green residual.
+         * Mixing two chroma vectors keeps the VGN luma owner unchanged; coherent green
+         * material is protected because its independent-neighbor target is itself chromatic.
+         * Strength is deliberately bounded to 0.75 rather than forcing neutral grey. */
+        vec3 postRestoreNormalizedChroma = correctedChroma / centerScale;
+        vec3 independentGreenResidual =
+            postRestoreNormalizedChroma - independentValidNeighborConsensus;
+        float positiveGreenResidual = independentGreenResidual.g -
+            0.5 * (independentGreenResidual.r + independentGreenResidual.b);
+        float greenResidualProof = smoothstep(0.030, 0.080, positiveGreenResidual);
+        float greenDominanceProof = smoothstep(0.010, 0.045,
+            independentGreenResidual.g -
+            max(independentGreenResidual.r, independentGreenResidual.b));
+        float independentNeutralMaterialProof = 1.0 - smoothstep(0.045, 0.110,
+            length(independentValidNeighborConsensus));
+        float brightMaterialProof = smoothstep(0.38, 0.72, centerLuma);
+        float greenCleanupAuthority = 0.75 * greenResidualProof * greenDominanceProof *
+            independentNeutralMaterialProof *
+            smoothstep(0.35, 0.80, independentValidNeighborSupport) *
+            neutralSurfaceSupport * brightMaterialProof;
+        vec3 independentNeighborTargetChroma =
+            independentValidNeighborConsensus * centerScale;
+        correctedChroma = mix(correctedChroma, independentNeighborTargetChroma,
+            greenCleanupAuthority);
+
+        /* IRIS_26829_COLORED_PARENT_GREEN_CYAN_RESIDUAL_OWNER
+         * 26828 device evidence leaves a sparse 2-3 px cyan/teal/neon-green line on a real
+         * warm/yellow bright parent. The inherited 26818 cleanup deliberately requires a
+         * neutral parent and therefore cannot own this case. Reuse the successful 26806
+         * physical-material principle at radius four: only physically valid, luma-compatible
+         * opposing far samples that agree as the same chromatic parent can vote. At least
+         * two non-collinear opposing pairs must support that parent. The correction is
+         * additionally restricted to pixels whose 26806 bright-color ownership was denied,
+         * so a genuine broad cyan/green material receives exactly zero authority here.
+         * Chroma only is mixed toward the supported parent; luma is unchanged and target
+         * magnitude is capped so this owner can never increase saturation. */
+        const ivec2 parentDirections26829[8] = ivec2[8](
+            ivec2(1,0), ivec2(-1,0), ivec2(0,1), ivec2(0,-1),
+            ivec2(1,1), ivec2(-1,-1), ivec2(1,-1), ivec2(-1,1));
+        vec3 parentChroma26829[8];
+        float parentSupport26829[8];
+        for (int i = 0; i < 8; ++i) {
+            ivec2 q = p + parentDirections26829[i] * 4;
+            vec3 farRgb = loadRgb(q);
+            float farLuma = luminanceOf(farRgb);
+            float relativeFarLuma = abs(farLuma - centerLuma) /
+                max(max(farLuma, centerLuma), 0.060);
+            parentChroma26829[i] =
+                (farRgb - vec3(farLuma)) / max(farLuma, 0.060);
+            float farPhysicalValidity = smoothstep(0.90, 0.985,
+                minimum3(loadSabreChannelValidity(q)));
+            float farLumaCompatibility = 1.0 - smoothstep(0.12, 0.38,
+                relativeFarLuma);
+            parentSupport26829[i] = farPhysicalValidity * farLumaCompatibility;
+        }
+        float parentPair0 = min(parentSupport26829[0], parentSupport26829[1]) *
+            (1.0 - smoothstep(0.025, 0.090,
+                length(parentChroma26829[0] - parentChroma26829[1])));
+        float parentPair1 = min(parentSupport26829[2], parentSupport26829[3]) *
+            (1.0 - smoothstep(0.025, 0.090,
+                length(parentChroma26829[2] - parentChroma26829[3])));
+        float parentPair2 = min(parentSupport26829[4], parentSupport26829[5]) *
+            (1.0 - smoothstep(0.025, 0.090,
+                length(parentChroma26829[4] - parentChroma26829[5])));
+        float parentPair3 = min(parentSupport26829[6], parentSupport26829[7]) *
+            (1.0 - smoothstep(0.025, 0.090,
+                length(parentChroma26829[6] - parentChroma26829[7])));
+        float strongestParentPair26829 = max(max(parentPair0, parentPair1),
+            max(parentPair2, parentPair3));
+        float remainingParentPairSupport26829 = parentPair0 + parentPair1 +
+            parentPair2 + parentPair3 - strongestParentPair26829;
+        float broadParent2dProof26829 = smoothstep(0.45, 1.10,
+            remainingParentPairSupport26829);
+        float parentWeight26829 = 2.0 * (parentPair0 + parentPair1 +
+            parentPair2 + parentPair3);
+        vec3 broadParentNormalizedChroma26829 = parentWeight26829 > 1.0e-6
+            ? ((parentChroma26829[0] + parentChroma26829[1]) * parentPair0 +
+               (parentChroma26829[2] + parentChroma26829[3]) * parentPair1 +
+               (parentChroma26829[4] + parentChroma26829[5]) * parentPair2 +
+               (parentChroma26829[6] + parentChroma26829[7]) * parentPair3) /
+                parentWeight26829
+            : vec3(0.0);
+        vec3 postGreenNormalizedChroma26829 = correctedChroma / centerScale;
+        vec3 coloredParentResidual26829 = postGreenNormalizedChroma26829 -
+            broadParentNormalizedChroma26829;
+        float positiveGreenExcess26829 = coloredParentResidual26829.g -
+            0.5 * (coloredParentResidual26829.r + coloredParentResidual26829.b);
+        float cyanExcess26829 = 0.5 *
+            (coloredParentResidual26829.g + coloredParentResidual26829.b) -
+            coloredParentResidual26829.r;
+        float greenCyanResidualProof26829 = smoothstep(0.025, 0.075,
+            max(positiveGreenExcess26829, cyanExcess26829)) *
+            smoothstep(0.030, 0.090, length(coloredParentResidual26829));
+        float coloredParentProof26829 = smoothstep(0.035, 0.100,
+            length(broadParentNormalizedChroma26829));
+        float deniedCenterColorOwnership26829 = highlightCleanupOwned26807 ? 1.0 : 0.0;
+        float coloredParentCleanupAuthority26829 = 0.88 *
+            deniedCenterColorOwnership26829 * broadParent2dProof26829 *
+            coloredParentProof26829 * greenCyanResidualProof26829 *
+            smoothstep(0.38, 0.72, centerLuma);
+        vec3 coloredParentTarget26829 = broadParentNormalizedChroma26829 * centerScale;
+        float coloredParentTargetMagnitude26829 = length(coloredParentTarget26829);
+        float currentCorrectedMagnitude26829 = length(correctedChroma);
+        if (coloredParentTargetMagnitude26829 > currentCorrectedMagnitude26829 &&
+            coloredParentTargetMagnitude26829 > 1.0e-7) {
+            coloredParentTarget26829 *= currentCorrectedMagnitude26829 /
+                coloredParentTargetMagnitude26829;
+        }
+        correctedChroma = mix(correctedChroma, coloredParentTarget26829,
+            coloredParentCleanupAuthority26829);
+
+        /* A pixel deliberately cleaned by either physical residual owner must not have the
+         * old pre-VGN magnitude floor re-amplify that same residual downstream. Unaffected
+         * pixels retain the successful 26728/26816 floor contract byte-for-semantics. */
+        float residualCleanupAuthority26829 = max(greenCleanupAuthority,
+            coloredParentCleanupAuthority26829);
+        float floorPermission = smoothstep(0.78, 0.92, restorePermission) *
+            highlightCleanupPermission26807 * (1.0 - residualCleanupAuthority26829);
+        protectedPreVgnMagnitude = floorPermission >= 0.5 ? preVgnMagnitude : 0.0;
+    }
+
+    /* IRIS_26784_RESTORE_26727_VGN_RGB_OWNER
+     * Restore the successful 26727 handoff semantics: the VGN correction owns RGB at this
+     * boundary. Keep the current 26783 alpha/provenance contract intact for downstream
+     * 26769/floor subordination; do not roll back current metadata or CFA validity logic. */
+    vec3 correctedRgb = clamp(vec3(centerLuma) + correctedChroma, 0.0, 1.0);
+    uvec3 encodedRgb = uvec3(round(correctedRgb * 65535.0));
+    uint encodedProtection = uPhysicalPreVgnValid != 0
+        ? uint(round(clamp(protectedPreVgnMagnitude, 0.0, 1.0) * 65535.0))
+        : 65535u;
+    imageStore(uDestination, p, uvec4(encodedRgb, encodedProtection));
+}

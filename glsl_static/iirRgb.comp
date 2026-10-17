@@ -1,0 +1,95 @@
+#version 310 es
+precision highp float; precision highp int; precision highp uimage2D;
+layout(local_size_x=1,local_size_y=1) in;
+layout(rgba16ui,binding=0) readonly uniform highp uimage2D uInput;
+layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uOutput;
+layout(rgba16ui,binding=2) readonly uniform highp uimage2D uOwnership;
+uniform vec4 uA10;uniform vec4 uB10;uniform vec4 uADyn1;uniform vec4 uBDyn1;uniform vec4 uADyn2;uniform vec4 uBDyn2;uniform int uDirection;uniform int uAxis;uniform int uFilterLuma;
+uniform ivec2 uImageSize;
+ivec2 safePos(ivec2 p) { return clamp(p, ivec2(0), uImageSize - ivec2(1)); }
+int signedChroma(uint c) { int v = int(c); return v > 32767 ? v - 65536 : v; }
+uint unsignedChroma(int v) { return uint(v & 0xFFFF); }
+float decodeU16(uint value) {
+    uint hi = value >> 8u;
+    uint lo = value & 255u;
+    const float finiteScale = 65504.0 / 65535.0;
+    return float(hi) * (256.0 * finiteScale) + float(lo) * finiteScale;
+}
+/* Keep the 26730 Sabre-validity interface stable. The validity-owned seed already consumed
+ * this provenance to create uOwnership before any VGN chroma filtering begins. */
+uniform highp sampler2D uSabreWeightR;
+uniform highp sampler2D uSabreWeightsGb;
+uniform highp sampler2D uSabreValidWeights;
+uniform highp float uSabreValidityWeightScale;
+uniform int uSabreSupportValid;
+struct State{float x0;float x1;float y0;float y1;};
+float apply(inout State s,float v,vec4 a,vec4 b,bool unsignedOut){float r=a[0]*v+a[1]*s.x0+a[2]*s.x1-b[1]*s.y0-b[2]*s.y1;s.x1=s.x0;s.y1=s.y0;s.x0=v;s.y0=unsignedOut?clamp(r,0.0,65504.0):r;return s.y0;}
+float steadyOutput(float v,vec4 a,vec4 b,bool u){float r=v*(a[0]+a[1]+a[2])/(1.0+b[1]+b[2]);return u?clamp(r,0.0,65504.0):r;}
+State steady(float x,float y){return State(x,x,y,y);} ivec2 pos(int inner,int outer){return uAxis==0?ivec2(inner,outer):ivec2(outer,inner);}
+bool insideImage(ivec2 q){return all(greaterThanEqual(q,ivec2(0)))&&all(lessThan(q,uImageSize));}
+int directionBitForDelta(ivec2 d){
+    if(d==ivec2(0,-1))return 0; if(d==ivec2(1,0))return 1;
+    if(d==ivec2(0,1))return 2; if(d==ivec2(-1,0))return 3;
+    if(d==ivec2(1,-1))return 4; if(d==ivec2(1,1))return 5;
+    if(d==ivec2(-1,1))return 6; if(d==ivec2(-1,-1))return 7; return -1;
+}
+int oppositeDirectionBit(int bit){
+    if(bit==0)return 2; if(bit==1)return 3; if(bit==2)return 0; if(bit==3)return 1;
+    if(bit==4)return 6; if(bit==5)return 7; if(bit==6)return 4; if(bit==7)return 5; return -1;
+}
+bool cleanupFallbackAt(ivec2 p){return (int(imageLoad(uOwnership,p).a)&0x1000)!=0;}
+bool highlightInvalidAt(ivec2 p){return (int(imageLoad(uOwnership,p).a)&0x2000)!=0;}
+bool phaseInvalidAt26776(ivec2 p){return (int(imageLoad(uOwnership,p).a)&0x8000)!=0;}
+bool transportFromPreviousAllowed(ivec2 currentP,ivec2 previousP){
+    if(!insideImage(currentP)||!insideImage(previousP))return false;
+    ivec2 delta=previousP-currentP; int bit=directionBitForDelta(delta); int opposite=oppositeDirectionBit(bit);
+    if(bit<0||opposite<0)return false;
+    int currentMask=int(imageLoad(uOwnership,currentP).a)&0xFF; int previousMask=int(imageLoad(uOwnership,previousP).a)&0xFF;
+    bool currentAllows=(currentMask&(1<<bit))!=0;
+    bool currentNeedsCleanup=cleanupFallbackAt(currentP)||highlightInvalidAt(currentP)||phaseInvalidAt26776(currentP);
+    bool previousNeedsCleanup=cleanupFallbackAt(previousP)||highlightInvalidAt(previousP)||phaseInvalidAt26776(previousP);
+    /* IRIS_26732_IIR_CLEANUP_IS_ONE_WAY
+     * Suspicious/invalid centers may receive trusted recursive state only along an allowed
+     * direction. Their state is never propagated back into a trusted neighbor. */
+    if(currentNeedsCleanup){
+        if(!currentAllows)return false;
+        if(!previousNeedsCleanup)return true;
+        /* IRIS_26807_CONTIGUOUS_HIGHLIGHT_CLEANUP_TRANSPORT
+         * A contiguous bit-13 chain may carry already-filtered recursive state through the
+         * chain. It still cannot flow back into a trusted pixel because the branch below
+         * rejects any previous cleanup owner when the current pixel is trusted. */
+        return highlightInvalidAt(currentP)&&highlightInvalidAt(previousP);
+    }
+    if(previousNeedsCleanup)return false;
+    return currentAllows&&(previousMask&(1<<opposite))!=0;
+}
+void main(){
+    int outer=uAxis==0?int(gl_GlobalInvocationID.y):int(gl_GlobalInvocationID.x);int outerLimit=uAxis==0?uImageSize.y:uImageSize.x;int innerSize=uAxis==0?uImageSize.x:uImageSize.y;if(outer>=outerLimit)return;
+    int start=uDirection==0?0:innerSize-1;int step=uDirection==0?1:-1;uvec4 boundary=imageLoad(uInput,pos(start,outer));float by=decodeU16(boundary.r),cr=float(signedChroma(boundary.g)),cb=float(signedChroma(boundary.b));
+    float sy=steadyOutput(by,uA10,uB10,true),sc1=steadyOutput(cr,uADyn1,uBDyn1,false),sb1=steadyOutput(cb,uADyn1,uBDyn1,false),sc2=steadyOutput(sc1,uADyn2,uBDyn2,false),sb2=steadyOutput(sb1,uADyn2,uBDyn2,false);
+    State ys=steady(by,sy),c1=steady(cr,sc1),b1=steady(cb,sb1),c2=steady(sc1,sc2),b2=steady(sb1,sb2);float previousY=by;
+    for(int i=0;i<innerSize;++i){
+        ivec2 p=pos(start+i*step,outer);uvec4 px=imageLoad(uInput,p);float currentY=decodeU16(px.r);float inCr=float(signedChroma(px.g)),inCb=float(signedChroma(px.b));
+        float edgeRatio=abs(currentY-previousY)/max(max(currentY,previousY),3930.0);
+        bool strongLumaBoundary=edgeRatio>0.55;
+        ivec2 scanStep=uAxis==0?ivec2(step,0):ivec2(0,step);
+        ivec2 previousP=p-scanStep;
+        /* IRIS_26731_FROZEN_IIR_MATERIAL_OWNERSHIP
+         * Never re-classify material ownership from already-filtered chroma. The exact
+         * 26730 validity-owned seed map is frozen before VGN and shared by IIR1 and IIR3.
+         * A missing reciprocal connection is a hard chroma-state boundary in either scan
+         * direction, preventing row/column-specific feedback from forming teeth or L blocks. */
+        bool transportAllowed26807=i>0&&transportFromPreviousAllowed(p,previousP);
+        bool frozenMaterialBoundary=i>0&&!transportAllowed26807;
+        bool highlightCleanupReceivesState26807=i>0&&highlightInvalidAt(p)&&transportAllowed26807;
+        if(i>0&&((strongLumaBoundary&&!highlightCleanupReceivesState26807)||frozenMaterialBoundary)){
+            if(uFilterLuma!=0){float resetY=steadyOutput(currentY,uA10,uB10,true);ys=steady(currentY,resetY);}
+            float resetCr1=steadyOutput(inCr,uADyn1,uBDyn1,false),resetCb1=steadyOutput(inCb,uADyn1,uBDyn1,false);
+            float resetCr2=steadyOutput(resetCr1,uADyn2,uBDyn2,false),resetCb2=steadyOutput(resetCb1,uADyn2,uBDyn2,false);
+            c1=steady(inCr,resetCr1);b1=steady(inCb,resetCb1);c2=steady(resetCr1,resetCr2);b2=steady(resetCb1,resetCb2);
+        }
+        float y=uFilterLuma!=0?apply(ys,currentY,uA10,uB10,true):currentY;
+        float r=apply(c1,inCr,uADyn1,uBDyn1,false);float q=apply(b1,inCb,uADyn1,uBDyn1,false);r=apply(c2,r,uADyn2,uBDyn2,false);q=apply(b2,q,uADyn2,uBDyn2,false);
+        imageStore(uOutput,p,uvec4(uint(clamp(y,0.0,65504.0)),unsignedChroma(int(r)),unsignedChroma(int(q)),px.a));previousY=currentY;
+    }
+}

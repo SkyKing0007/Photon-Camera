@@ -1,0 +1,276 @@
+#version 310 es
+// Edge false-color suppressor (reference implementation)
+//
+// WHERE: run on the reconstructed linear camera-RGB texture (RGBA16F), AFTER
+//        Resolve/merge and BEFORE VGN / residual denoise / protected-chroma
+//        floor / exposure match / tone. Feed its output to everything
+//        downstream (JPEG carrier and anything that derives the DNG sidecar
+//        from RGB).
+// WHAT:  at high local luminance contrast, replace isolated chroma outliers
+//        (R-G, B-G measured in sqrt domain) with the 3x3 median chroma.
+//        Luma is preserved. No clipping test and no periodicity test.
+// RUN:   two passes, ping-pong (src -> tmp -> dst). Pass 1 fixes the outer
+//        fringe pixel, pass 2 fixes the second pixel of the 2px band.
+
+precision highp float;
+precision highp int;
+precision highp sampler2D;
+
+layout(local_size_x = 8, local_size_y = 8) in;
+uniform sampler2D uSrc;                                    // linear RGBA16F
+layout(rgba16f, binding = 1) writeonly uniform highp image2D uDst;
+layout(std430, binding = 0) buffer Iris26778Stats {
+  uint gateGt05; uint blendGt05Pass1; uint blendGt05Pass2;
+  uint coherentGt05; uint clippedNeutralGt05;
+};
+uniform int uStatsPass;
+/* IRIS_26782_RAW_VALIDITY_CLIP_GATE
+ * Reuse the exact 26614 per-channel headroom provenance already consumed by VGN. This is
+ * measurement validity only; it is not a semantic/highlight classifier. */
+uniform sampler2D uSabreWeightR;
+uniform sampler2D uSabreWeightsGb;
+uniform sampler2D uSabreValidWeights;
+uniform float uSabreValidityWeightScale;
+
+uniform float uNoiseFloor;   // linear floor, ~0.002 of nominal white
+uniform float uContrastLo;   // log2(max/min) where gate starts   (default 2.0 = 4x)
+uniform float uContrastHi;   // log2(max/min) where gate is full  (default 3.5 = ~11x)
+uniform float uOutlierLo;    // sqrt-domain chroma deviation start (default 0.03)
+uniform float uOutlierHi;    // sqrt-domain chroma deviation full  (default 0.10)
+
+float lumaOf(vec3 c) { return 0.25 * c.r + 0.5 * c.g + 0.25 * c.b; }
+
+void s(inout float a, inout float b) {
+  float t = min(a, b);
+  b = max(a, b);
+  a = t;
+}
+
+// Classic 19-exchange median-of-9 network.
+float median9(float p0, float p1, float p2, float p3, float p4,
+              float p5, float p6, float p7, float p8) {
+  s(p1, p2); s(p4, p5); s(p7, p8);
+  s(p0, p1); s(p3, p4); s(p6, p7);
+  s(p1, p2); s(p4, p5); s(p7, p8);
+  s(p0, p3); s(p5, p8); s(p4, p7);
+  s(p3, p6); s(p1, p4); s(p2, p5);
+  s(p4, p7); s(p4, p2); s(p6, p4);
+  s(p4, p2);
+  return p4;
+}
+
+vec3 fetchLin(ivec2 p, ivec2 sz) {
+  return max(texelFetch(uSrc, clamp(p, ivec2(0), sz - ivec2(1)), 0).rgb, vec3(0.0));
+}
+
+vec2 sqrtChromaAt(ivec2 p, ivec2 sz) {
+  vec3 sq = sqrt(fetchLin(p, sz));
+  return vec2(sq.r - sq.g, sq.b - sq.g);
+}
+
+vec3 channelValidity26782(ivec2 p, ivec2 sz) {
+  ivec2 q = clamp(p, ivec2(0), sz - ivec2(1));
+  vec3 totalWeight = vec3(
+    max(texelFetch(uSabreWeightR, q, 0).r, 0.0),
+    max(texelFetch(uSabreWeightsGb, q, 0).r, 0.0),
+    max(texelFetch(uSabreWeightsGb, q, 0).g, 0.0));
+  vec3 validWeight = max(texelFetch(uSabreValidWeights, q, 0).rgb, vec3(0.0)) *
+    max(uSabreValidityWeightScale, 1.0);
+  return clamp(validWeight / max(totalWeight, vec3(1.0e-6)), vec3(0.0), vec3(1.0));
+}
+
+/* IRIS_26831_DIRECTIONAL_PHASE_VALID_THIN_NEUTRAL
+ * A thin neutral highlight can sit beside a different colored material, so the inherited
+ * 26823 2-D median/material-neutral requirement may reject the correct neutral owner. For
+ * each horizontal/vertical/diagonal line through the center, use only neighboring pixels
+ * whose consumed-CFA validity is fully supported, whose own chroma is neutral, and whose
+ * luma is compatible with the center. Either +/-1 or +/-2 may prove each side so a one-pixel
+ * CFA phase shift cannot flip ownership. Opposing proof on the SAME line establishes a
+ * neutral thin structure without borrowing hue from the perpendicular material. */
+float phaseValidNeutralSample26831(ivec2 q, ivec2 sz, float centerY) {
+  vec3 lin = fetchLin(q, sz);
+  vec2 chroma = sqrtChromaAt(q, sz);
+  vec3 validity = channelValidity26782(q, sz);
+  float measuredValidity = min(validity.r, min(validity.g, validity.b));
+  float fullyMeasured = smoothstep(0.985, 0.9995, measuredValidity);
+  float neutral = 1.0 - smoothstep(0.035, 0.090, length(chroma));
+  float y = lumaOf(lin);
+  float lumaRatio = min(y, centerY) / max(max(y, centerY), 1.0e-6);
+  float sameStructure = smoothstep(0.55, 0.82, lumaRatio);
+  return fullyMeasured * neutral * sameStructure;
+}
+
+float directionalNeutralPair26831(
+    ivec2 p, ivec2 stepDir, ivec2 sz, float centerY) {
+  float negativeSide = max(
+    phaseValidNeutralSample26831(p - stepDir, sz, centerY),
+    phaseValidNeutralSample26831(p - stepDir * 2, sz, centerY));
+  float positiveSide = max(
+    phaseValidNeutralSample26831(p + stepDir, sz, centerY),
+    phaseValidNeutralSample26831(p + stepDir * 2, sz, centerY));
+  return min(negativeSide, positiveSide);
+}
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  ivec2 sz = textureSize(uSrc, 0);
+  if (p.x >= sz.x || p.y >= sz.y) return;
+
+  vec4 c0 = texelFetch(uSrc, p, 0);
+
+  // 1) local luminance contrast over 5x5 (linear light)
+  float ymin = 1e9;
+  float ymax = 0.0;
+  for (int j = -2; j <= 2; j++) {
+    for (int i = -2; i <= 2; i++) {
+      float y = lumaOf(fetchLin(p + ivec2(i, j), sz));
+      ymin = min(ymin, y);
+      ymax = max(ymax, y);
+    }
+  }
+  float contrast = log2((ymax + uNoiseFloor) / (ymin + uNoiseFloor));
+  float gate = smoothstep(uContrastLo, uContrastHi, contrast);
+  if (uStatsPass == 1 && gate > 0.5) atomicAdd(gateGt05, 1u);
+  if (gate <= 0.0) {
+    imageStore(uDst, p, c0);
+    return;
+  }
+
+  // 2) 3x3 median of sqrt-domain chroma differences
+  float d1[9];
+  float d2[9];
+  int k = 0;
+  for (int j = -1; j <= 1; j++) {
+    for (int i = -1; i <= 1; i++) {
+      vec3 sq = sqrt(fetchLin(p + ivec2(i, j), sz));
+      d1[k] = sq.r - sq.g;
+      d2[k] = sq.b - sq.g;
+      k++;
+    }
+  }
+  float m1 = median9(d1[0], d1[1], d1[2], d1[3], d1[4], d1[5], d1[6], d1[7], d1[8]);
+  float m2 = median9(d2[0], d2[1], d2[2], d2[3], d2[4], d2[5], d2[6], d2[7], d2[8]);
+
+  // 3) Preserve the exact 26778 isolated-outlier path.
+  vec3 lin0 = max(c0.rgb, vec3(0.0));
+  vec3 s0 = sqrt(lin0);
+  vec2 centerC = vec2(s0.r - s0.g, s0.b - s0.g);
+  vec2 medianC = vec2(m1, m2);
+  float dev = length(centerC - medianC);
+  float w26778 = gate * smoothstep(uOutlierLo, uOutlierHi, dev);
+  if (w26778 > 0.5) {
+    if (uStatsPass == 1) atomicAdd(blendGt05Pass1, 1u);
+    else if (uStatsPass == 2) atomicAdd(blendGt05Pass2, 1u);
+  }
+
+  /* IRIS_26788_MATERIAL_BASELINE_PERIODIC_FALSE_COLOR
+   * 26787's coherent guard required the +/-2px endpoint midpoint itself to be near neutral.
+   * Device evidence shows the remaining 1-2px cyan/yellow/magenta/green alternation can ride
+   * on a legitimate colored material baseline, so neutrality is not a valid prerequisite.
+   * Along the dominant luma-gradient normal, compare +/-1 against +/-2 on BOTH sides. A true
+   * material edge is locally monotonic (same-side near/far chroma agrees); CFA false color
+   * alternates near/far coherently on both sides. Build a nonzero local material baseline
+   * from both phases and remove only the alternating component. */
+  float yLeft = lumaOf(fetchLin(p + ivec2(-2, 0), sz));
+  float yRight = lumaOf(fetchLin(p + ivec2(2, 0), sz));
+  float yUp = lumaOf(fetchLin(p + ivec2(0, -2), sz));
+  float yDown = lumaOf(fetchLin(p + ivec2(0, 2), sz));
+  bool horizontalNormal = abs(yRight - yLeft) >= abs(yDown - yUp);
+  ivec2 step1 = horizontalNormal ? ivec2(1, 0) : ivec2(0, 1);
+  ivec2 step2 = step1 * 2;
+  vec2 cNeg2 = sqrtChromaAt(p - step2, sz);
+  vec2 cNeg1 = sqrtChromaAt(p - step1, sz);
+  vec2 cPos1 = sqrtChromaAt(p + step1, sz);
+  vec2 cPos2 = sqrtChromaAt(p + step2, sz);
+  vec2 farMid = 0.5 * (cNeg2 + cPos2);
+  vec2 nearMid = 0.5 * (cNeg1 + cPos1);
+  vec2 materialBaseline26788 = 0.5 * (farMid + nearMid);
+  vec2 periodicVector26788 = nearMid - farMid;
+  vec2 centerDeviation26788 = centerC - materialBaseline26788;
+  vec2 leftAlternation26788 = cNeg1 - cNeg2;
+  vec2 rightAlternation26788 = cPos1 - cPos2;
+  float periodicMagnitude26788 = length(periodicVector26788);
+  float centerMagnitude26788 = length(centerDeviation26788);
+  float samePhaseOpposition26788 = clamp(
+    -dot(centerDeviation26788, periodicVector26788) /
+      max(centerMagnitude26788 * periodicMagnitude26788, 1.0e-6), 0.0, 1.0);
+  float leftMagnitude26788 = length(leftAlternation26788);
+  float rightMagnitude26788 = length(rightAlternation26788);
+  float bilateralCoherence26788 = clamp(
+    dot(leftAlternation26788, rightAlternation26788) /
+      max(leftMagnitude26788 * rightMagnitude26788, 1.0e-6), 0.0, 1.0);
+  float bilateralMagnitude26788 = min(leftMagnitude26788, rightMagnitude26788);
+  float coherentW = gate *
+    smoothstep(max(0.012, uOutlierLo * 0.45), max(0.050, uOutlierHi * 0.70),
+        min(periodicMagnitude26788, bilateralMagnitude26788)) *
+    smoothstep(0.30, 0.75, samePhaseOpposition26788) *
+    smoothstep(0.45, 0.85, bilateralCoherence26788);
+  /* Keep the residual owner narrow. The causal 26788 CFA-phase registration acts first; this
+   * guard may remove at most 70% of a surviving periodic component in one pass. */
+  coherentW = min(coherentW, 0.70);
+
+  /* IRIS_26823_PHASE_VALID_CLIPPED_NEUTRAL_ATTENUATION
+   * 26822 device evidence isolates the surviving cyan/teal/yellow railing defect to bright,
+   * neutral, high-contrast structure with asymmetric consumed-CFA validity. Keep 26784's
+   * broad clipped-neutral branch retired: ordinary edges must never be changed merely because
+   * one channel has imperfect support. Authorize one pre-VGN attenuation only when ALL are true:
+   *   1) exact IRIS_26614 consumed-CFA validity proves a weak channel,
+   *   2) at least one other channel remains materially more valid (partial/phase-asymmetric loss),
+   *   3) BOTH the local 3x3 median and the +/-1/2 material baseline are neutral,
+   *   4) the center is in the inherited 26727 bright-highlight domain (0.72..0.92),
+   *   5) visible center chroma and the existing high-contrast gate are present.
+   * Correction is pass-1-only and can only attenuate the CENTER chroma magnitude toward zero;
+   * it never donates a neighboring hue and luma is restored exactly below. */
+  vec3 validity = channelValidity26782(p, sz);
+  float measuredValidity = min(validity.r, min(validity.g, validity.b));
+  float strongestValidity = max(validity.r, max(validity.g, validity.b));
+  float invalidity = 1.0 - smoothstep(0.985, 0.9995, measuredValidity);
+  float validitySpread26823 = max(strongestValidity - measuredValidity, 0.0);
+  float asymmetricLoss26823 = smoothstep(0.025, 0.120, validitySpread26823);
+  float medianNeutral = 1.0 - smoothstep(0.050, 0.135, length(medianC));
+  float baselineNeutral26788 = 1.0 - smoothstep(0.050, 0.135, length(materialBaseline26788));
+  float strictNeutralContext26823 = min(baselineNeutral26788, medianNeutral);
+  float centerPeak26823 = max(lin0.r, max(lin0.g, lin0.b));
+  float centerY26831 = lumaOf(lin0);
+  float brightHighlight26823 = smoothstep(0.72, 0.92,
+    max(centerY26831, centerPeak26823));
+  float visibleCenterChroma26823 = smoothstep(0.040, 0.115, length(centerC));
+  float strictClipCandidateW26823 = gate * invalidity * asymmetricLoss26823 *
+    strictNeutralContext26823 * brightHighlight26823 * visibleCenterChroma26823;
+  float strictClipAppliedW26823 = uStatsPass == 1
+    ? min(strictClipCandidateW26823, 0.92) : 0.0;
+
+  /* 26831 closes the shot-angle/CFA-phase hole without changing the 26829 Sabre color
+   * resolver. Strong consumed-CFA asymmetry remains mandatory. The new proof differs only
+   * in material topology: valid neutral support must exist on both sides along one coherent
+   * thin line, while perpendicular pixels are intentionally ignored. */
+  float directionalNeutral26831 = max(
+    max(directionalNeutralPair26831(p, ivec2(1, 0), sz, centerY26831),
+        directionalNeutralPair26831(p, ivec2(0, 1), sz, centerY26831)),
+    max(directionalNeutralPair26831(p, ivec2(1, 1), sz, centerY26831),
+        directionalNeutralPair26831(p, ivec2(1, -1), sz, centerY26831)));
+  float thinNeutralContext26831 = smoothstep(0.60, 0.90, directionalNeutral26831);
+  float thinClipCandidateW26831 = gate * invalidity * asymmetricLoss26823 *
+    thinNeutralContext26831 * brightHighlight26823 * visibleCenterChroma26823;
+  float thinClipAppliedW26831 = uStatsPass == 1
+    ? smoothstep(0.35, 0.70, thinClipCandidateW26831) : 0.0;
+  float phaseValidNeutralAppliedW26831 = max(
+    strictClipAppliedW26823, thinClipAppliedW26831);
+
+  if (uStatsPass == 1 && coherentW > 0.5) atomicAdd(coherentGt05, 1u);
+  if (uStatsPass == 1 && max(strictClipCandidateW26823, thinClipCandidateW26831) > 0.5)
+    atomicAdd(clippedNeutralGt05, 1u);
+
+  vec2 correctedC = mix(centerC, medianC, w26778);
+  correctedC = mix(correctedC, materialBaseline26788, coherentW);
+  correctedC *= 1.0 - min(phaseValidNeutralAppliedW26831, 1.0);
+
+  // 4) rebuild RGB around unchanged G, then restore luma exactly.
+  vec3 s1 = max(vec3(s0.g + correctedC.x, s0.g, s0.g + correctedC.y), vec3(0.0));
+  vec3 rgb1 = s1 * s1;
+  float y0 = lumaOf(lin0);
+  float y1 = lumaOf(rgb1);
+  rgb1 *= (y1 > 1e-8) ? (y0 / y1) : 1.0;
+
+  imageStore(uDst, p, vec4(rgb1, c0.a));
+}

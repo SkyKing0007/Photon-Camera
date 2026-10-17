@@ -1,0 +1,158 @@
+#version 310 es
+precision highp float; precision highp int; precision highp uimage2D;
+layout(local_size_x=8,local_size_y=8) in;
+layout(rgba16ui,binding=0) readonly uniform highp uimage2D uInput;
+layout(rgba16ui,binding=1) writeonly uniform highp uimage2D uOutput;
+uniform float uChromaStrength;
+uniform ivec2 uImageSize;
+ivec2 safePos(ivec2 p) { return clamp(p, ivec2(0), uImageSize - ivec2(1)); }
+int signedChroma(uint c) { int v = int(c); return v > 32767 ? v - 65536 : v; }
+uint unsignedChroma(int v) { return uint(v & 0xFFFF); }
+float decodeU16(uint value) {
+    uint hi = value >> 8u;
+    uint lo = value & 255u;
+    const float finiteScale = 65504.0 / 65535.0;
+    return float(hi) * (256.0 * finiteScale) + float(lo) * finiteScale;
+}
+ivec3 s(ivec2 p){ uvec4 v=imageLoad(uInput,safePos(p)); return ivec3(int(v.r),signedChroma(v.g),signedChroma(v.b)); }
+float chromaAgreement(vec2 a, vec2 b){return dot(a,b)/max(length(a)*length(b),1.0);}
+float chromaDistance(vec2 a,vec2 b){return length(a-b)/max(max(length(a),length(b)),512.0);}
+/* IRIS_26769_FROZEN_MAP_LOCAL_MEDIAN_CONTAINMENT
+ * 26733 is reference-only. Consume only its immutable reciprocal material map. A center may
+ * receive from a trusted neighbor when seed marked it for cleanup, but a trusted center never
+ * receives from a cleanup/highlight-invalid neighbor. If any immediate direction is closed,
+ * the precomputed 3x3 median is forbidden at this center. */
+bool insideImage26769(ivec2 q){return all(greaterThanEqual(q,ivec2(0)))&&all(lessThan(q,uImageSize));}
+int directionBit26769(ivec2 d){
+    if(d==ivec2(0,-1))return 0;if(d==ivec2(1,0))return 1;if(d==ivec2(0,1))return 2;if(d==ivec2(-1,0))return 3;
+    if(d==ivec2(1,-1))return 4;if(d==ivec2(1,1))return 5;if(d==ivec2(-1,1))return 6;if(d==ivec2(-1,-1))return 7;return -1;
+}
+int oppositeBit26769(int bit){
+    if(bit==0)return 2;if(bit==1)return 3;if(bit==2)return 0;if(bit==3)return 1;
+    if(bit==4)return 6;if(bit==5)return 7;if(bit==6)return 4;if(bit==7)return 5;return -1;
+}
+bool cleanupFlag26769(ivec2 q){int a=int(imageLoad(uInput,q).a);return (a&0x1000)!=0||(a&0x2000)!=0||(a&0x8000)!=0;}
+bool reciprocalConnected26769(ivec2 centerP,ivec2 delta){
+    ivec2 q=centerP+delta;if(!insideImage26769(q))return false;
+    int bit=directionBit26769(delta);int opp=oppositeBit26769(bit);if(bit<0||opp<0)return false;
+    int ca=int(imageLoad(uInput,centerP).a),qa=int(imageLoad(uInput,q).a);
+    bool centerAllows=(ca&(1<<bit))!=0;bool centerCleanup=cleanupFlag26769(centerP);bool neighborCleanup=cleanupFlag26769(q);
+    if(centerCleanup)return centerAllows&&!neighborCleanup;if(neighborCleanup)return false;
+    return centerAllows&&(qa&(1<<opp))!=0;
+}
+void main(){
+    ivec2 p=ivec2(gl_GlobalInvocationID.xy); if(any(greaterThanEqual(p,uImageSize)))return;
+    ivec3 a=s(p+ivec2(-1,-1)),b=s(p+ivec2(0,-1)),c=s(p+ivec2(1,-1));
+    ivec2 row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); ivec2 mn=row,mx=row,sum=row;
+    a=s(p+ivec2(-1,0));b=s(p);c=s(p+ivec2(1,0)); row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); sum+=row; mn=min(mn,row); mx=max(mx,row);
+    a=s(p+ivec2(-1,1));b=s(p+ivec2(0,1));c=s(p+ivec2(1,1)); row=a.yz+b.yz+c.yz-min(min(a.yz,b.yz),c.yz)-max(max(a.yz,b.yz),c.yz); sum+=row-min(mn,row)-max(mx,row);
+    uvec4 center=imageLoad(uInput,p);
+    ivec2 centerChroma=ivec2(signedChroma(center.g),signedChroma(center.b));
+    float centerY=float(center.r)/65504.0;
+    float maximumRelativeLumaDelta=0.0;
+    float frozenBoundaryProtection26769=0.0;
+    int brighterSide=0;
+    int darkerSide=0;
+    vec2 brighterChromaSum=vec2(0.0);
+    vec2 darkerChromaSum=vec2(0.0);
+    for(int y=-1;y<=1;++y)for(int x=-1;x<=1;++x){
+        if(x==0&&y==0)continue;
+        uvec4 neighbor=imageLoad(uInput,safePos(p+ivec2(x,y)));
+        float neighborY=float(neighbor.r)/65504.0;
+        float scale=max(max(centerY,neighborY),0.060);
+        float signedDelta=(neighborY-centerY)/scale;
+        maximumRelativeLumaDelta=max(maximumRelativeLumaDelta,abs(signedDelta));
+        vec2 neighborChroma=vec2(float(signedChroma(neighbor.g)),float(signedChroma(neighbor.b)));
+        if(!reciprocalConnected26769(p,ivec2(x,y)))frozenBoundaryProtection26769=1.0;
+        if(signedDelta>0.16){brighterSide++;brighterChromaSum+=neighborChroma;}
+        if(signedDelta<-0.16){darkerSide++;darkerChromaSum+=neighborChroma;}
+    }
+    float oneSidedProtection=((brighterSide>=6&&darkerSide<=1)||(darkerSide>=6&&brighterSide<=1))?1.0:0.0;
+    float sideCount=0.0;
+    vec2 sideChroma=vec2(0.0);
+    if(brighterSide>=4&&darkerSide<=1){sideCount=float(brighterSide);sideChroma=brighterChromaSum/max(sideCount,1.0);}
+    if(darkerSide>=4&&brighterSide<=1){sideCount=float(darkerSide);sideChroma=darkerChromaSum/max(sideCount,1.0);}
+    float sideAgreement=sideCount>0.0?clamp(chromaAgreement(vec2(centerChroma),sideChroma),-1.0,1.0):1.0;
+    float highlightPreservePermission=1.0-smoothstep(0.72,0.92,centerY);
+    /* IRIS_26767_LOCAL_MEDIAN_CHROMA_TOPOLOGY_OWNER
+     * Real color is allowed to prove its own local material continuity without requiring a
+     * luma edge. Support is reciprocal in the sense that a center-compatible neighbor is
+     * strengthened only when the same center color continues to the far sample. A two-pixel
+     * isolated chroma event cannot earn the threshold. Separately, a coherent neighboring
+     * material behind a strong chroma jump establishes a boundary, preserving the center on
+     * either side instead of allowing the 3x3 median to bleed across arbitrary shapes.
+     * The inherited highlight permission remains authoritative, so clipped/flattened bright
+     * centers never self-protect through this new color-only path. */
+    float centerChromaMagnitude=length(vec2(centerChroma));
+    float centerMaterialSupport=0.0;
+    float reciprocalBoundaryEvidence=0.0;
+    const ivec2 colorDirections[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+    for(int i=0;i<8;++i){
+        vec2 neighborChroma=vec2(float(signedChroma(imageLoad(uInput,safePos(p+colorDirections[i])).g)),
+            float(signedChroma(imageLoad(uInput,safePos(p+colorDirections[i])).b)));
+        vec2 farChroma=vec2(float(signedChroma(imageLoad(uInput,safePos(p+colorDirections[i]*2)).g)),
+            float(signedChroma(imageLoad(uInput,safePos(p+colorDirections[i]*2)).b)));
+        float centerNeighborDelta=chromaDistance(vec2(centerChroma),neighborChroma);
+        float centerFarDelta=chromaDistance(vec2(centerChroma),farChroma);
+        float neighborFarDelta=chromaDistance(neighborChroma,farChroma);
+        float sameImmediate=1.0-smoothstep(0.18,0.42,centerNeighborDelta);
+        float sameFar=1.0-smoothstep(0.18,0.42,centerFarDelta);
+        centerMaterialSupport+=sameImmediate*(0.75+0.75*sameFar);
+        float neighborContinuation=1.0-smoothstep(0.18,0.42,neighborFarDelta);
+        reciprocalBoundaryEvidence=max(reciprocalBoundaryEvidence,
+            smoothstep(0.35,0.70,centerNeighborDelta)*neighborContinuation);
+    }
+    float centerMaterialContinuity=smoothstep(0.90,1.50,centerMaterialSupport);
+    float coherentCenterColor=centerMaterialContinuity*
+        smoothstep(128.0,512.0,centerChromaMagnitude);
+    float chromaInteriorProtection=coherentCenterColor*highlightPreservePermission;
+    float chromaBoundaryProtection=centerMaterialContinuity*
+        smoothstep(0.35,0.70,reciprocalBoundaryEvidence)*highlightPreservePermission;
+    float chromaTopologyProtection=max(chromaInteriorProtection,chromaBoundaryProtection);
+    float materialBoundary=(sideCount>0.0?1.0:0.0)*
+        (1.0-smoothstep(0.72,0.92,sideAgreement))*highlightPreservePermission;
+    float legacyEdge=smoothstep(0.45,0.90,maximumRelativeLumaDelta);
+    float topologySupport=0.0;
+    if(centerY>0.58||sideCount>0.0||legacyEdge>0.25){
+        const ivec2 td[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1));
+        float centerMagnitude=max(length(vec2(centerChroma)),1.0);
+        for(int i=0;i<8;++i){
+            uvec4 farPixel=imageLoad(uInput,safePos(p+td[i]*2));
+            float farY=float(farPixel.r)/65504.0;
+            float farDelta=abs(farY-centerY)/max(max(farY,centerY),0.060);
+            vec2 farChroma=vec2(float(signedChroma(farPixel.g)),float(signedChroma(farPixel.b)));
+            float farAgreement=clamp(chromaAgreement(vec2(centerChroma),farChroma),-1.0,1.0);
+            float sameLuma=1.0-smoothstep(0.10,0.26,farDelta);
+            float centerChromaPresent=smoothstep(128.0,512.0,centerMagnitude);
+            float sameHue=smoothstep(0.82,0.94,farAgreement);
+            topologySupport+=sameLuma*mix(1.0,sameHue,centerChromaPresent);
+        }
+    }
+    float topologyProtection=smoothstep(1.25,2.75,topologySupport)*
+        smoothstep(0.20,0.55,max(legacyEdge,sideCount>0.0?1.0:0.0));
+    float edgeProtection=max(max(max(oneSidedProtection,materialBoundary),legacyEdge),
+        max(max(topologyProtection,chromaTopologyProtection),frozenBoundaryProtection26769));
+    /* IRIS_26807_HIGHLIGHT_CLEANUP_OUTRANKS_EDGE_PROTECTION
+     * Bit 13 is an earlier immutable color-ownership decision, not a new color classifier.
+     * A strong luma edge or a coherent false-hue neighborhood cannot veto its chroma cleanup.
+     * Real bright material is unaffected because the 26806 opt-in leaves bit 13 clear. */
+    if((int(center.a)&0x2000)!=0)edgeProtection=0.0;
+    /* IRIS_26776_POST_DEMOSAIC_RG_BG_MEDIAN_OWNER
+     * Claude calls for a 1-3 pass R-G/B-G median in high-gradient or clipped regions.
+     * This existing one-pass median is now authoritative for bit-15 phase-invalid centers;
+     * luma remains exactly center.r and valid coherent material remains protected. */
+    if((int(center.a)&0x8000)!=0)edgeProtection=0.0;
+    float strength=clamp(uChromaStrength,0.0,1.0)*(1.0-edgeProtection);
+    ivec2 corrected=strength<=0.0001?centerChroma:ivec2(mix(vec2(centerChroma),vec2(sum),strength));
+    /* IRIS_26571_CROSS_EDGE_CHROMA_OWNERSHIP
+     * 26570 luma pass-through is preserved. Median chroma cleanup is additionally blocked
+     * at moderate one-sided material/color boundaries, preventing sky color from entering
+     * foliage or any other subject edge without weakening interior surface cleanup.
+     */
+    imageStore(uOutput,p,uvec4(
+        center.r,
+        unsignedChroma(corrected.x),
+        unsignedChroma(corrected.y),
+        center.a
+    ));
+}
