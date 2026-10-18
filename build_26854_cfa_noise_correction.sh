@@ -38,12 +38,17 @@ verify_package(){
  for p in 26854_FORWARD_FULL_INDEX.patch 26854_ROLLBACK_FULL_INDEX.patch; do ! grep -Eq '^(rename from|rename to|copy from|copy to) ' "$p" || fail "patch rename/copy inference"; done
  grep -Fx 'RUN_26854_CFA_NOISE_CORRECTION' TRIGGER_26854.txt >/dev/null || fail "wrong trigger"
  ! find . -type f -name '*.apk' | grep -q . || fail "APK unexpectedly packaged"
- [[ ! -e glsl_static ]] || fail "unintended generated glsl_static directory in handoff (26854 scope regression)"
+ # Generated shader fragments belong to build outputs, never the upload payload.
+ # Their absence from the tracked checkout is verified in verify_scope, not by
+ # rejecting an untracked workspace directory during package verification.
  pass "26854 package hashes/syntax/allowlist/patch identity"
 }
 verify_scope(){
  [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
- [[ -z "$(git ls-files -- glsl_static)" ]] || fail "generated glsl_static source files accidentally committed (26854 permanent regression)"
+ # Strict historical regression: a tracked generated GLSL path is always fatal.
+ # Deleting the 50 previously committed fragments returns this path universe to
+ # the successful 26852 baseline, so no infrastructure allowlist broadening is needed.
+ [[ -z "$(git ls-files -- glsl_static)" ]] || fail "tracked glsl_static remains: delete all previously committed glsl_static files and COMMIT their deletions in Stage 1 before triggering (26854 strict scope)"
  git merge-base --is-ancestor "$MECHANICS_AUTHORITY_COMMIT" HEAD || fail "successful 26852 mechanics ancestor missing"
  python3 -S - <<'PY_SCOPE'
 import subprocess

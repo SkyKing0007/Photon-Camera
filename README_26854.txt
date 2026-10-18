@@ -1,32 +1,33 @@
-PHOTON 26854 — THREE-STAGE VSCODE.DEV HANDOFF
+PHOTON 26854 — STRICT THREE-STAGE REPAIR (after two failed Actions triggers)
 
-BRANCH ONLY: experimental-clean-photon-rebuild; NEVER dev. No backup branch.
-Runtime authority: exact successful 26853 Actions compiled candidate, artifact name photon-26853-multiframe-native-cfa-denoise, ZIP SHA-256 c0c77b698717d4e68e0f4f38a43ab5beedee9979b35f3adfade0c5a50f35ac5e, compiled-candidate TAR SHA-256 cd05d604ed36d6a8ab72548add4dd8024dbb60f7979475ec1e72e75de5258681; 1786 app files.
-Verification mechanics: exact successful 26852 17-stage procedure (inherited 26850/26821), commands and order unchanged. Infrastructure logic differs ONLY for authority/version/scope/semantic and GLSL validators. See 26854_MECHANICS_DIFF_AUDIT.txt.
-Runtime allowlist: exactly GlesMgcRawSabreShaders.kt, GlesMgcRawSpatialStacker.kt, app/version.properties; payload ONLY, no direct app/src replacement outside Actions.
-Candidate 1786 files; protected 1783; no backup.
+Branch: experimental-clean-photon-rebuild ONLY. No backup branch. Never edit dev.
+This package contains NO glsl_static, APK, full candidate, or additional runtime changes.
 
-STAGE 1 — UPLOAD to vscode.dev
-Open experimental-clean-photon-rebuild. Copy contents of STAGE_1_UPLOAD_TO_REPOSITORY/ into repository root, preserving .github/workflows, handoff_payload_26854 and other relative paths. Do not upload STAGE_3 yet. DO NOT replace the repository app/src with payload: Actions reconstructs from compiled authority.
+CRITICAL BEFORE STAGE 1 COMMIT:
+The previous erroneous handoff committed 50 generated shader fragments in repository-root glsl_static/. Those files REMAIN TRACKED on the GitHub branch even though the replacement ZIP omitted them. In vscode.dev Explorer delete the WHOLE root-level glsl_static/ directory and verify Source Control shows the 50 DELETIONS. Deleting files on your computer without committing the deletions does NOT fix GitHub Actions. Do not delete app/src files.
 
-STAGE 2 — COMMIT AND PUSH only stage-1 files
-Review Source Control and ensure only intended new 26854 infrastructure/payload paths are included (not dev, APK, or unrelated files). Commit and push. This should NOT trigger 26852/26853 workflows because their triggers have different names. Do not upload APK.
+STAGE 1 — ROOT FILES + CLEANUP
+Upload contents of STAGE_1_ROOT_FILES to the repository ROOT (not the container folder).
+The workflow YAML belongs ONLY to Stage 2; the trigger belongs ONLY to Stage 3.
+DELETE repository-root glsl_static/ in vscode.dev, and confirm all 50 deletions are staged. If it was already deleted and committed, verify no glsl_static paths are tracked. Do not copy generated shader files back.
+Commit AND push all Stage 1 files AND the 50 generated-fragment deletions:
+26854: remove generated GLSL and restore strict scope
+Do not trigger yet.
 
-STAGE 3 — TRIGGER
-Upload STAGE_3_TRIGGER_UPLOAD/TRIGGER_26854.txt to repository root, commit and push on the same branch. This launches only the 26854 workflow. Actions downloads and verifies the exact successful 26853 candidate, compiles real GLSL/Kotlin/Java/native, assembles exactly one APK, proves invariance and exports the next compiled-candidate authority. DO NOT modify source during the run.
+STAGE 2 — WORKFLOW ONLY
+Upload STAGE_2_WORKFLOW_ONLY/.github/workflows/build-26854-cfa-noise-correction.yml at that exact repository path (create the YAML separately in vscode.dev if folder upload fails).
+Commit AND push:
+26854: restore guarded CFA noise workflow
+Do not trigger yet.
 
-STATE AT HANDOFF CREATION: PREPARED / UPLOAD-READY, not build-proven. All real 26854 compiler/assemble statuses are NOT RUN locally; Actions is the authority. If Actions fails, report its exact error rather than claiming success.
+STAGE 3 — TRIGGER ONLY
+Upload/REPLACE repository-root TRIGGER_26854.txt using STAGE_3_TRIGGER_ONLY/TRIGGER_26854.txt. This file MUST have a changed retry marker compared to previous push.
+Commit AND push:
+26854: trigger strict CFA noise scope repair
 
+DO NOT push APK, modify app/src, upload the outer ZIP/folders, or add glsl_static.
+After stage 1, the Git-tracked file list MUST contain zero glsl_static paths. If it does not, STOP, remove and commit deletions before Stage 3.
 
-26854 SCOPE REPAIR — AFTER FAILED FIRST TRIGGER
-The previous Stage 1 erroneously included 50 generated shader files in repository-root glsl_static/. They were NOT runtime source and must NOT be committed.
+The 26854 patch is still exactly: GlesMgcRawSabreShaders.kt, GlesMgcRawSpatialStacker.kt and app/version.properties (stored under handoff_payload_26854). The protected 26853 compiled-candidate universe is 1,786 files, including 1,783 unchanged files. The exact successful 26852/26853 17-stage mechanics order and compiler commands remain inherited. No backup, source push by ChatGPT or diagnostic-only APK.
 
-REPAIR STAGE 1: On experimental-clean-photon-rebuild in vscode.dev, DELETE the entire root-level glsl_static/ directory including all 50 tracked files, using Explorer/Source Control. Replace the existing root-level files with ALL files from the corrected STAGE_1_UPLOAD_TO_REPOSITORY (the folder contains NO glsl_static). Preserve .github/workflows exactly; upload the yml separately via Explorer if necessary. Commit and push with: 26854: repair strict handoff scope and remove generated shaders
-
-Before committing, inspect Source Control: exactly 50 glsl_static/ deletions plus the intended corrected infrastructure files. Do NOT delete any app/src/ shader, remove unrelated files, or restore old generated files. Do not add APKs. The existing three runtime payload replacements stay unchanged.
-
-REPAIR STAGE 3: After the repair commit succeeds, REPLACE the existing TRIGGER_26854.txt at repository root with the file in STAGE_3_TRIGGER_UPLOAD (it retains the original trigger identity and adds a unique retry marker). Commit/push with: 26854: rerun guarded build after scope repair
-
-The original workflow remains trigger-path-only. The replacement trigger must have a byte change or GitHub will not start another run. If the corrected workflow fails, STOP and return the failure. No further handoff should be inferred to have succeeded.
-
-This repaired package removes only non-authoritative generated repository files; it does not change the 26854 candidate source, forward/rollback patches, stage order, or compiler commands. The scope regression is enforced before any authority download/compilation.
+This repair removes the overbroad directory-existence assertion and preserves the strict tracked-path rejection. No glsl_static allowance is added. A realistic repository-index replay proves rejection before deletions and acceptance after committed deletions; a fresh candidate and protected-file replay is required before claiming PREPARED / UPLOAD-READY. GitHub Actions remains authoritative for real GLSL/Kotlin/Java/native/full APK compilers.
