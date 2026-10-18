@@ -45,16 +45,34 @@ verify_package(){
 }
 verify_scope(){
  [[ "$(git branch --show-current)" == "$EXPECTED_BRANCH" ]] || fail "wrong branch"
- # Strict historical regression: a tracked generated GLSL path is always fatal.
- # Deleting the 50 previously committed fragments returns this path universe to
- # the successful 26852 baseline, so no infrastructure allowlist broadening is needed.
- [[ -z "$(git ls-files -- glsl_static)" ]] || fail "tracked glsl_static remains: delete all previously committed glsl_static files and COMMIT their deletions in Stage 1 before triggering (26854 strict scope)"
+ # First prove the exact previously committed 50 GLSL files have been removed
+ # from the Actions checkout index by the hash-guarded workflow preflight.
+ # Historical HEAD additions are excluded ONLY if all 50 originals are independently
+ # attested and exactly their staged deletions are present. No source exceptions.
+ [[ -z "$(git ls-files -- glsl_static)" ]] || fail "unexpected tracked glsl_static after guarded cleanup"
+ python3 -S - <<'PY_GLSL_SCOPE'
+from pathlib import Path
+import subprocess
+M={line.split('  ',1)[1] for line in Path('26854_ACCIDENTAL_GLSL_EXACT_SHA256.txt').read_text().splitlines()}
+def git(*args):return subprocess.check_output(['git',*args],text=True).splitlines()
+assert len(M)==50
+assert set(git('diff','--cached','--name-only','--diff-filter=D','--','glsl_static'))==M,'unproven generated GLSL removals'
+assert set(git('diff','--name-only','2af0376988ae2fb2a03689f4dd63ac2e743a9835..HEAD','--','glsl_static'))==M,'unexpected historical GLSL scope'
+assert not git('ls-files','--','glsl_static')
+print('PASS exact historical glsl_static regression attested; temporary indexed removals only')
+PY_GLSL_SCOPE
  git merge-base --is-ancestor "$MECHANICS_AUTHORITY_COMMIT" HEAD || fail "successful 26852 mechanics ancestor missing"
  python3 -S - <<'PY_SCOPE'
 import subprocess
-allowed=('26854_','build_26854_cfa_noise_correction.sh','transform_26854.py','validate_26854.py','verify_26854_patches.py','verify_26854_runtime_glsl.py','handoff_payload_26854/','.github/workflows/build-26854-cfa-noise-correction.yml','TRIGGER_26854.txt','README_26854.txt')
+allowed=('26854_','guard_26854_accidental_glsl.py','build_26854_cfa_noise_correction.sh','transform_26854.py','validate_26854.py','verify_26854_patches.py','verify_26854_runtime_glsl.py','handoff_payload_26854/','.github/workflows/build-26854-cfa-noise-correction.yml','TRIGGER_26854.txt','README_26854.txt')
 paths=subprocess.check_output(['git','diff','--name-only','2af0376988ae2fb2a03689f4dd63ac2e743a9835..HEAD'],text=True).splitlines()
 bad=[p for p in paths if not any(p==x or p.startswith(x) or p.startswith('26853_') or p.startswith('build_26853_') or p.startswith('handoff_payload_26853/') or p=='.github/workflows/build-26853-multiframe-native-cfa-denoise.yml' or p=='TRIGGER_26853.txt' or p=='transform_26853.py' or p=='validate_26853.py' or p=='verify_26853_patches.py' or p=='verify_26853_runtime_glsl.py' for x in allowed)]
+# Do not broadly allow glsl_static: exactly the 50 attested accidental paths
+# must be staged for removal in the Actions checkout, as proven above.
+from pathlib import Path
+known={line.split('  ',1)[1] for line in Path('26854_ACCIDENTAL_GLSL_EXACT_SHA256.txt').read_text().splitlines()}
+assert len(known)==50
+bad=[p for p in bad if p not in known]
 assert not bad,('unexpected changes since 26852',bad)
 print('PASS 26854 scope confined to 26853 predecessor and sealed 26854 handoff')
 PY_SCOPE
