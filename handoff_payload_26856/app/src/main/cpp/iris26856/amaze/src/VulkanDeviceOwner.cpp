@@ -1,5 +1,6 @@
 // IRIS_26856_B_ONLY_VULKAN_DEVICE_OWNER
 #include "amaze/VulkanDeviceOwner.hpp"
+#include <vulkan/vulkan_android.h>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
