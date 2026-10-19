@@ -15,6 +15,16 @@ assert B.count('iris26856BOnlyIndependentPublication = !parameters.irisNightActi
 assert 'experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855,' in B
 assert F.count('iris26856BOnlyIndependentPublication = iris26856BOnlyIndependentPublication,')==1
 assert S.count('private val iris26856BOnlyIndependentPublication: Boolean = false,')==1
+# Exact failing Actions condition 39312006859: the fusion adapter accepted a
+# named B-only argument but its intermediate constructor did not declare it.
+# The nonhistorical adapter must forward once; historical 26850 stays sealed.
+I=(R/'com/hinnka/mycamera/processor/GlesIris26545SabreProcessor.kt').read_text()
+assert I.count('private val iris26856BOnlyIndependentPublication: Boolean = false,') == 1
+assert I.count('iris26856BOnlyIndependentPublication = iris26856BOnlyIndependentPublication,') == 1
+nonhistorical=I.split('return GlesMgcRawSpatialStacker(',1)[1]
+historical=I.split('return GlesMgcRawSpatialStacker26850(',1)[1].split('return GlesMgcRawSpatialStacker(',1)[0]
+assert 'iris26856BOnlyIndependentPublication = iris26856BOnlyIndependentPublication,' in nonhistorical
+assert 'iris26856BOnlyIndependentPublication = iris26856BOnlyIndependentPublication,' not in historical
 assert F.count('private val iris26856BOnlyIndependentPublication: Boolean = false,')==1
 assert B.count('enableHighZoomDetail = highZoomDetailEnabled,')==2
 # An ordinary mode table catches A or A+B accidentally entering B-only publication.
