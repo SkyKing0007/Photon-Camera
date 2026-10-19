@@ -51,6 +51,8 @@ internal class GlesIris26545SabreProcessor(
     private val iris26856RawrColor: GlesIris26856RawrColorContract.Snapshot? = null,
     /* 26856 B-only independently phase-reconstructed 2x CFA. Never enables A/VGN 2x. */
     private val iris26856BTrue2x: Boolean = false,
+    /* IRIS_26856_B_ONLY_PUBLICATION_ADAPTER_FORWARDING: historical A remains separate. */
+    private val iris26856BOnlyIndependentPublication: Boolean = false,
 ) {
     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
         if (frames.isEmpty()) return null
@@ -185,6 +187,7 @@ internal class GlesIris26545SabreProcessor(
             iris26856AmazeCfaConsumer = iris26856AmazeCfaConsumer,
             iris26856RawrColor = iris26856RawrColor,
             iris26856BTrue2x = iris26856BTrue2x,
+            iris26856BOnlyIndependentPublication = iris26856BOnlyIndependentPublication,
         ).processFrames(admitted)
     }
 
