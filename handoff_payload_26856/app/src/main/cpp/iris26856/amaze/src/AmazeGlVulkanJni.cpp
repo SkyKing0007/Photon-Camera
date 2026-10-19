@@ -49,11 +49,14 @@ ScopedAHB createAhb(uint32_t w, uint32_t h, bool storage) {
     desc.usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
                  AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                  (storage ? AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER : 0ull);
-    if (!AHardwareBuffer_isSupported(&desc))
-        throw std::runtime_error("26856 exact RGBA16F AHB allocation unsupported");
+    // AHardwareBuffer_isSupported is API 29 and unavailable when this app's
+    // native minSdk is API 26. The API-26 allocation is the authoritative
+    // capability/availability check, and does not require a second AHB.
+    // Keep the existing runtime API 29 guard, exact RGBA16F descriptor,
+    // GPU-only ownership, and fail-closed behavior on allocation failure.
     ScopedAHB owned;
     if (AHardwareBuffer_allocate(&desc, &owned.buffer) != 0 || !owned.buffer)
-        throw std::runtime_error("26856 RGBA16F native AHB allocation failed");
+        throw std::runtime_error("26856 exact RGBA16F AHB allocation unsupported or failed");
     return owned;
 }
 // AHardwareBuffer is already refcounted; use a move-only scope wrapper.

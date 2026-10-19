@@ -31,10 +31,10 @@ for name,count in [('26856_NATIVE_PROTECTED_26855.sha256',818),('26856_DNG_WRITE
  m=manifest(name);assert len(m)==count,(name,len(m));assert all(protected[p]==d and after[p]==d for p,d in m.items()),name
 assert {p for p in after if p.startswith('app/src/') and p not in before}==added
 assert all(p in after and after[p]==v for p,v in manifest('26856_REPLACEMENT_FILES_SHA256.sha256').items())
-# Replay all 12 applicable source-contract regressions on the ACTUAL packaged payload.
+# Replay all 13 applicable source-contract regressions on the ACTUAL packaged payload.
 for test in sorted((R/'TESTS').glob('test_26856*.py')):
  r=subprocess.run([sys.executable,'-B',str(test)],cwd=R,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
  if r.returncode:raise SystemExit(f'FAIL {test.name} exit={r.returncode}\n{r.stdout[-3000:]}')
  print('PASS 26856 permanent regression:',test.name)
-assert len(list((R/'TESTS').glob('test_26856*.py')))==12
-print('PASS 26856 strict source 66 + version 1, 1786/1838 complete file universe, 1771 protected, native/DNG/vendor/shader invariance, 12 regressions')
+assert len(list((R/'TESTS').glob('test_26856*.py')))==13
+print('PASS 26856 strict source 66 + version 1, 1786/1838 complete file universe, 1771 protected, native/DNG/vendor/shader invariance, 13 regressions')
