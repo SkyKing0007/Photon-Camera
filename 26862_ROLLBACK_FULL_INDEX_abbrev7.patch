@@ -1,0 +1,394 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt
+index a441f3ab656baa5cc2b6d8608a772cff6f9f7978..0564bc0eeedf8fe688c1d5fc30ed59e3d35816a0 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt
+@@ -32,15 +32,13 @@ internal object GlesIris26860BBurstNoise {
+     private const val PATCH_STEP = 64
+     private const val N_BINS = 12
+     private const val MIN_BLOCKS_PER_BIN = 10
++    private const val PAIR_MAX = 6
+     private val shifts = intArrayOf(-4, -2, 0, 2, 4)
+     private val pilot = intArrayOf(6, 14, 22, 30)
+     private val evidence = intArrayOf(8, 16, 24, 32)
+ 
+     /** Exposed to regression fixtures independent of the Android GL runtime. */
+-    internal data class BlockEvidence(
+-        val phase: Int, val level: Double, val variance: Double,
+-        val temporal: Boolean = true,
+-    )
++    internal data class BlockEvidence(val phase: Int, val level: Double, val variance: Double)
+ 
+     internal fun fitBlocks(blocks: List<BlockEvidence>, samplePairs: Int): Profile {
+         val shot = FloatArray(4)
+@@ -52,21 +50,8 @@ internal object GlesIris26860BBurstNoise {
+         for (phase in 0..3) {
+             val bins = Array(N_BINS) { ArrayList<Double>() }
+             val levels = Array(N_BINS) { ArrayList<Double>() }
+-            // Use independent temporal evidence when identifiable. If one phase
+-            // cannot be measured temporally, use only that phase's RAW-derived
+-            // spatial bound (never substitute another phase or Camera2 profile).
+-            val temporalBlocks = blocks.filter { it.phase == phase && it.temporal }
+-            val temporalBinCount = IntArray(N_BINS)
+-            for (b in temporalBlocks) if (b.level.isFinite() && b.variance.isFinite() &&
+-                b.variance > 0.0 && b.level in -0.005..0.965) {
+-                temporalBinCount[(max(0.0, b.level) * N_BINS).toInt().coerceIn(0, N_BINS-1)]++
+-            }
+-            val usableTemporal = temporalBinCount.sum() >= 100 &&
+-                temporalBinCount.any { it >= MIN_BLOCKS_PER_BIN }
+-            val phaseBlocks = if (usableTemporal) temporalBlocks else
+-                blocks.filter { it.phase == phase && !it.temporal }
+-            for (b in phaseBlocks) {
+-                if (!b.level.isFinite() || !b.variance.isFinite() ||
++            for (b in blocks) {
++                if (b.phase != phase || !b.level.isFinite() || !b.variance.isFinite() ||
+                     b.variance <= 0.0 || b.level < -0.005 || b.level >= 0.965) continue
+                 val k = (max(0.0, b.level) * N_BINS).toInt().coerceIn(0, N_BINS - 1)
+                 bins[k].add(b.variance)
+@@ -90,8 +75,7 @@ internal object GlesIris26860BBurstNoise {
+             if (count[phase] < 100 || points.isEmpty()) continue
+             var slope = Double.NaN
+             var intercept = Double.NaN
+-            if (phaseBlocks.firstOrNull()?.temporal == true &&
+-                points.size >= 3 && points.last().first - points.first().first >= 0.10) {
++            if (points.size >= 3 && points.last().first - points.first().first >= 0.10) {
+                 val weights = points.map { 1.0 / max(1.0e-16, it.second * it.second) }
+                 val sum = weights.sum()
+                 val mx = points.indices.sumOf { points[it].first * weights[it] } / sum
+@@ -124,7 +108,6 @@ internal object GlesIris26860BBurstNoise {
+         val mode = when {
+             supported == 0 -> "BURST_UNSUPPORTED_MOTION_ONLY"
+             supported == 4 && fullFit == 4 -> "BURST_ALL_PHASE_SHOT_READ"
+-            supported == 4 && blocks.any { !it.temporal } -> "BURST_ALL_PHASE_RAW_BOUNDED"
+             supported == 4 -> "BURST_ALL_PHASE_MEASURED_BINS"
+             else -> "BURST_PARTIAL_MEASURED_BINS"
+         }
+@@ -137,57 +120,35 @@ internal object GlesIris26860BBurstNoise {
+     ): Profile {
+         fun unsupported(why: String) = Profile(FloatArray(4), FloatArray(4), 0,
+             IntArray(4), "BURST_UNSUPPORTED_${why}", IntArray(4), 0)
+-        // IRIS_26862_B_BURST_NOISE_INDEPENDENT_OF_CAPTURE_POLICY:
+-        // Capture owns flicker/EV/ISO admission. The estimator consumes the
+-        // accepted NORMAL RAW samples; none of those metadata values veto a
+-        // burst. Only unreadable/incompatible RAW byte geometry is fatal.
+-        if (normals.size < 2 || (width and 1) != 0 || (height and 1) != 0 ||
++        if (normals.size < 6 || (width and 1) != 0 || (height and 1) != 0 ||
+             width < 192 || height < 384 ||
+             phaseBlackByFrame.size != normals.size || phaseRangeByFrame.size != normals.size ||
+             phaseBlackByFrame.any { it.size != 4 || it.any { v -> !v.isFinite() } } ||
+             phaseRangeByFrame.any { it.size != 4 || it.any { v -> !v.isFinite() || v <= 0f } })
+             return unsupported("GEOMETRY")
++        val first = normals.first()
+         if (normals.any { it.role != RawBurstFrameRole.NORMAL ||
+             it.image.format != ImageFormat.RAW_SENSOR || it.image.width != width ||
+             it.image.height != height || it.image.pixelStrideBytes != 2 ||
+-            it.image.rowStrideBytes < width*2 }) return unsupported("RAW_GEOMETRY")
+-        val order = normals.indices.sortedWith(compareBy({ normals[it].sensorTimestampNs }, { it }))
+-        // Actual sensor exposure metadata is a radiometric conversion, not an
+-        // admission gate; non-positive/absent metadata retains RAW evidence.
+-        fun product(index: Int): Double {
+-            val f = normals[index]
+-            return if (f.exposureTimeNs > 0L && f.sensitivityIso > 0)
+-                f.exposureTimeNs.toDouble() * f.sensitivityIso.toDouble() else Double.NaN
+-        }
+-        val referenceProduct = product(0)
+-        fun gain(index: Int): Double {
+-            val v = product(index)
+-            val g = if (referenceProduct.isFinite() && v.isFinite() && v > 0.0)
+-                referenceProduct / v else 1.0
+-            return if (g.isFinite() && g > 0.0) g else 1.0
+-        }
++            it.image.rowStrideBytes < width*2 || it.physicalCameraId != first.physicalCameraId ||
++            it.sensitivityIso != first.sensitivityIso || it.exposureTimeNs <= 0L ||
++            abs(it.exposureTimeNs.toDouble()/first.exposureTimeNs.toDouble()-1.0)>0.012 })
++            return unsupported("MIXED_FRAME")
++        if (normals.any { it.rowFlickerHarmonic > 0 && it.rowFlickerStrength > 0.12f })
++            return unsupported("ROW_FLICKER")
+         val samples=ArrayList<BlockEvidence>()
+         var acceptedPairs=0
+-        // Chronological nonoverlapping pairs limit CPU time and cover every
+-        // accepted NORMAL. An odd final frame pairs with its nearest neighbor.
+-        val pairs = order.chunked(2).mapIndexed { index, group ->
+-            if (group.size == 2) Pair(group[0],group[1]) else
+-                Pair(order[max(0,index*2-1)],group[0])
+-        }
++        val pairStep=max(1,(normals.size - 1)/PAIR_MAX)
++        val pairs=(0 until normals.size-1 step pairStep).take(PAIR_MAX)
+         try {
+-            for ((i, j) in pairs) {
++            for (i in pairs) {
+                 val f0=normals[i]
+-                val f1=normals[j]
+-                // Cross-physical-camera differences cannot estimate a single
+-                // sensor's noise. They do not veto other compatible pairs.
+-                if (f0.physicalCameraId != f1.physicalCameraId) continue
+-                val gain0 = gain(i)
+-                val gain1 = gain(j)
++                val f1=normals[i+1]
+                 var pairEvidence=0
+                 for (band in 0 until BANDS) {
+                     val top=(((height-STRIP_HEIGHT)*(2*band+1)/(2*BANDS)) and -2)
+                     val ref=readStrip(f0,width,top,STRIP_HEIGHT,phaseBlackByFrame[i],phaseRangeByFrame[i])
+-                    val nxt=readStrip(f1,width,top,STRIP_HEIGHT,phaseBlackByFrame[j],phaseRangeByFrame[j])
++                    val nxt=readStrip(f1,width,top,STRIP_HEIGHT,phaseBlackByFrame[i+1],phaseRangeByFrame[i+1])
+                     fun at(data:FloatArray,x:Int,y:Int,phase:Int):Double =
+                         data[(y+(phase shr 1))*width+x+(phase and 1)].toDouble()
+                     for (bx in 16 until width-50 step PATCH_STEP) {
+@@ -216,41 +177,28 @@ internal object GlesIris26860BBurstNoise {
+                             val differences=DoubleArray(evidence.size*evidence.size)
+                             var k=0;var levelSum=0.0;var clipped=false
+                             for (y in evidence) for (x in evidence) {
+-                                val a=at(ref,bx+x,y,phase)*gain0
+-                                val b=at(nxt,bx+x+bestDx,y+bestDy,phase)*gain1
++                                val a=at(ref,bx+x,y,phase)
++                                val b=at(nxt,bx+x+bestDx,y+bestDy,phase)
+                                 if (a > 0.965 || b > 0.965 || !a.isFinite() || !b.isFinite()) clipped=true
+                                 differences[k++]=a-b
+                                 levelSum+=0.5*(a+b)
+                             }
+                             if (clipped) continue
+-                            // Mains row modulation is structured illumination,
+-                            // not sensor noise. Remove a separate residual mean
+-                            // per observed RAW row (four independent rows).
+-                            // The remaining 12 degrees of freedom prevent the
+-                            // detrend from spuriously lowering shot/read noise.
+-                            val side=evidence.size
+-                            val rowMeans=DoubleArray(side) { row ->
+-                                (0 until side).sumOf { col -> differences[row*side+col] } / side
+-                            }
+-                            val residuals=DoubleArray(differences.size) { index ->
+-                                differences[index]-rowMeans[index/side]
+-                            }
+-                            val variance=0.5*residuals.sumOf { it*it } /
+-                                (differences.size-side).toDouble()
++                            val mean=differences.average()
++                            val variance=0.5*differences.sumOf { (it-mean)*(it-mean) } /(differences.size-1)
+                             if (!variance.isFinite() || variance <= 0.0) continue
+                             // Motion-induced RAW structure is spatially correlated.
+                             // White sensor noise is not; compare disjoint evidence
+                             // residuals, never the pilot sites used for alignment.
+                             var horizontal=0.0; var vertical=0.0
+                             for (yy in evidence.indices) for (xx in evidence.indices) {
+-                                val v=residuals[yy*evidence.size+xx]
+-                                if (xx+1<evidence.size) horizontal+=v*residuals[yy*evidence.size+xx+1]
+-                                if (yy+1<evidence.size) vertical+=v*residuals[(yy+1)*evidence.size+xx]
++                                val v=differences[yy*evidence.size+xx]-mean
++                                if (xx+1<evidence.size) horizontal+=v*(differences[yy*evidence.size+xx+1]-mean)
++                                if (yy+1<evidence.size) vertical+=v*(differences[(yy+1)*evidence.size+xx]-mean)
+                             }
+                             val norm=(2.0*variance)*(evidence.size*(evidence.size-1)).toDouble()
+-                            if (abs(horizontal/norm)>0.50 || abs(vertical/norm)>0.50) continue
++                            if (abs(horizontal/norm)>0.35 || abs(vertical/norm)>0.35) continue
+                             val signal=levelSum/differences.size
+-                            if (!signal.isFinite()) continue
+                             samples.add(BlockEvidence(phase, signal, variance))
+                             pairEvidence++
+                         }
+@@ -259,46 +207,7 @@ internal object GlesIris26860BBurstNoise {
+                 if (pairEvidence >= 64) acceptedPairs++
+             }
+         } catch (_: Exception) { return unsupported("RAW_UNAVAILABLE") }
+-        val fitted = fitBlocks(samples,acceptedPairs)
+-        if (fitted.measuredPhases == 4) return fitted
+-        // When temporal alignment/flicker removes enough independent samples,
+-        // measure conservative spatial same-CFA second differences directly
+-        // from the same accepted RAW burst. This is *not* a shot/read fit:
+-        // structural texture can only increase the variance floor. The spatial
+-        // data never enter another phase's model nor a Camera2 escape hatch.
+-        try {
+-            val needed = (0..3).filter { fitted.acceptedSites[it] < 100 || fitted.signalBins[it] == 0 }
+-            for (i in order) {
+-                for (band in 0 until BANDS) {
+-                    val top=(((height-STRIP_HEIGHT)*(2*band+1)/(2*BANDS)) and -2)
+-                    val raw=readStrip(normals[i],width,top,STRIP_HEIGHT,
+-                        phaseBlackByFrame[i],phaseRangeByFrame[i])
+-                    val g=gain(i)
+-                    for (bx in 16 until width-50 step PATCH_STEP) {
+-                        for (phase in needed) {
+-                            val q=DoubleArray(16)
+-                            var level=0.0
+-                            for (y in 0..3) for (x in 0..3) {
+-                                val cy=8+y*8+(phase shr 1)
+-                                val cx=bx+12+x*8+(phase and 1)
+-                                val at=raw[cy*width+cx].toDouble()*g
+-                                val left=raw[cy*width+cx-2].toDouble()*g
+-                                val right=raw[cy*width+cx+2].toDouble()*g
+-                                q[y*4+x]=at-0.5*(left+right)
+-                                level+=at
+-                            }
+-                            val mean=q.average()
+-                            val variance=q.sumOf { (it-mean)*(it-mean) } /
+-                                (15.0*1.5)
+-                            if (variance.isFinite() && variance > 0.0 &&
+-                                level/16.0 in 0.0..0.965) {
+-                                samples.add(BlockEvidence(phase,level/16.0,variance,false))
+-                            }
+-                        }
+-                    }
+-                }
+-            }
+-        } catch (_: Exception) { return unsupported("RAW_UNAVAILABLE") }
++        if (acceptedPairs<2) return unsupported("MOTION_INSUFFICIENT")
+         return fitBlocks(samples,acceptedPairs)
+     }
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 79214cfcb6de6a28cd44735cd73599dd427858a7..05f696f116513458c395ac06bf6280ecb573f0a8 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2321,12 +2321,7 @@ internal class GlesMgcRawSpatialStacker(
+             highZoomNoiseShot26724 = referenceNoise26724.greenShotNoise.coerceAtLeast(0f)
+             highZoomNoiseRead26724 = referenceNoise26724.greenReadNoise.coerceAtLeast(0f)
+         }
+-        /* IRIS_26862_B_NO_INHERITED_A_PROFILE_PREFLIGHT.
+-         * The shared/A/LONG/DNG paths retain their original noise-source gate.
+-         * For isolated B, the accepted RAW burst has its independent measured
+-         * authority below; A's selectable profile cannot abort it upstream. */
+-        if (!iris26856BOnlyIndependentPublication &&
+-            resolvedNoiseModels.any { it.source == RawNoiseModelSource.UNAVAILABLE }) {
++        if (resolvedNoiseModels.any { it.source == RawNoiseModelSource.UNAVAILABLE }) {
+             PLog.e(
+                 TAG,
+                 "MGC Sabre noise profile is unavailable for ${noiseProfileSelection.id}",
+@@ -2588,16 +2583,16 @@ internal class GlesMgcRawSpatialStacker(
+                 }
+             }
+ 
+-            /* IRIS_26862_B_ONLY_RAW_BURST_NO_CAMERA2_GATE.
+-             * A, DNG, LONG and capture policies are unchanged. B measures the
+-             * successfully admitted NORMAL RAW burst regardless of flicker,
+-             * accepted EV differences or per-frame ISO. A non-identifiable fit
+-             * carries a bounded RAW-measured variance, not Camera2 coefficients.
+-             * Fail explicitly only if the RAW content itself cannot support
+-             * valid per-phase measurements; never disguise it as a profile. */
++            /* IRIS_26861_B_RAW_BURST_PRIMARY_CAMERA2_LAST_RESORT.
++             * A trustworthy, fully identifiable four-phase RAW-burst fit is
++             * the sole normal B noise authority. Partial fits without a
++             * signal-bounded lookup are NOT extrapolated as a global model.
++             * If the burst cannot support that fit, the *physical per-frame*
++             * Camera2 SENSOR_NOISE_PROFILE is a separately labeled LAST RESORT.
++             * It never scales or blends the measured profile, and never reads
++             * the inherited selectable/calibrated/Pixel3 noise source. */
+             val bBurstNoise26860 = if (iris26856AmazeCfaConsumer != null) {
+                 val normals = frames.filter { it.role == RawBurstFrameRole.NORMAL }
+-                check(normals.isNotEmpty()) { "IRIS_26862_NO_NORMAL_RAW_FOR_NOISE" }
+                 val blacks = normals.map { f ->
+                     val canonical = canonicalBlackLevelForFrame(f)
+                     FloatArray(4) { phase -> canonical[canonicalChannelAtPhase(phase)] }
+@@ -2606,20 +2601,24 @@ internal class GlesMgcRawSpatialStacker(
+                     FloatArray(4) { phase -> sensorWhiteLevel-black[phase] }
+                 }
+                 val burst = GlesIris26860BBurstNoise.estimate(normals,width,height,blacks,ranges)
+-                check(burst.measuredPhases == 4) {
+-                    "IRIS_26862_B_RAW_MEASUREMENT_UNAVAILABLE: ${burst.mode}, " +
+-                        "sites=${burst.acceptedSites.joinToString(",")}; " +
+-                        "no Camera2 or Experiment A fallback permitted"
++                check(normals.isNotEmpty()) { "IRIS_26861_NO_NORMAL_RAW_FOR_NOISE" }
++                val chosen = if (burst.mode == "BURST_ALL_PHASE_SHOT_READ") burst else {
++                    // Every NORMAL must have its own valid same-frame Camera2
++                    // record. Never quietly reuse a different frame/ISO/lens.
++                    check(normals.all { bCamera2ProfileForFrame26861(it, burst.mode) != null }) {
++                        "IRIS_26861_NO_VALID_NOISE_PROFILE: unreliable RAW-burst " +
++                            "fit (${burst.mode}) and missing/invalid per-NORMAL Camera2 profile; " +
++                            "abort safely rather than invent noise or save a degraded B image"
++                    }
++                    checkNotNull(bCamera2ProfileForFrame26861(normals.first(), burst.mode))
+                 }
+-                requireBNoiseAuthority26861(burst)
+-                PLog.i(SABRE_TAG,"IRIS_26862_B_NOISE_AUTHORITY " +
+-                    "selected=${burst.mode} measuredPhases=${burst.measuredPhases}/4 " +
+-                    "frames=${normals.size} paired=${burst.samplePairs} " +
+-                    "flickerFrames=${normals.count { it.rowFlickerHarmonic > 0 && it.rowFlickerStrength > 0.12f }} " +
+-                    "sites=${burst.acceptedSites.joinToString(",")} " +
+-                    "bins=${burst.signalBins.joinToString(",")} rawOnly=true " +
+-                    "camera2Fallback=false independentOfCapturePolicy=true")
+-                burst
++                PLog.i(SABRE_TAG,"IRIS_26861_B_NOISE_AUTHORITY " +
++                    "selected=${chosen.mode} burst=${burst.mode} measuredPhases=${burst.measuredPhases}/4 " +
++                    "paired=${burst.samplePairs} sites=${burst.acceptedSites.joinToString(",")} " +
++                    "bins=${burst.signalBins.joinToString(",")} " +
++                    "camera2Fallback=${chosen.mode.startsWith("CAMERA2_FALLBACK_")} " +
++                    "pooledCamera2MomentConsumed=false extraAmazeDenoise=false")
++                chosen
+             } else null
+             val kernelTuning = createBayerKernelTuning(
+                 frame = frames.first(),
+@@ -2999,7 +2998,12 @@ internal class GlesMgcRawSpatialStacker(
+                 renderDilation(reverseWeight, frameWeight)
+                 /* IRIS_26861_B_ONLY_NORMAL_REJECTION. Original frameWeight
+                  * remains DNG/LONG/Sabre provenance. Never feed it into B. */
+-                val bFrameNoise26861 = bBurstNoise26860
++                val bFrameNoise26861 = if (frame.role == RawBurstFrameRole.NORMAL &&
++                    bBurstNoise26860?.mode?.startsWith("CAMERA2_FALLBACK_") == true) {
++                    checkNotNull(bCamera2ProfileForFrame26861(frame,bBurstNoise26860.mode)) {
++                        "IRIS_26861_CAMERA2_FALLBACK_FRAME_LOST: no same-frame valid SENSOR_NOISE_PROFILE"
++                    }
++                } else bBurstNoise26860
+                 val bTemporalWeight26861 = if (frame.role == RawBurstFrameRole.NORMAL &&
+                     bFrameNoise26861 != null) {
+                     val bCal=bEmpiricalCalibration26861(calibration,bFrameNoise26861,exposureScale)
+@@ -3287,7 +3291,7 @@ internal class GlesMgcRawSpatialStacker(
+                 PLog.i(SABRE_TAG, "IRIS_26858_B_RAW_DOMAIN_AUTHORITY normalFrames=$mergedFrameCount " +
+                     "clip=PRE_WB_PRE_LSC_PER_PHASE_ORIGINAL_RAW " +
+                     "support=ACTUAL_LOCAL_SUMW2_NEFF_GPU_3BIN_HISTOGRAM " +
+-                    "noise=IRIS_26862_B_RAW_MEASURED_PRE_AMAZE_TEMPORAL_ONLY noCamera2Noise=true " +
++                    "noise=IRIS_26861_B_EMPIRICAL_PRE_AMAZE_TEMPORAL_ONLY noCamera2Noise=true " +
+                     "histogramNotReadBack=true")
+             } else renderSabreNormalCfaNoiseClean26853(
+                 phaseSignals = normalCfaSignals26852,
+@@ -9015,9 +9019,32 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /** IRIS_26861_B_CAMERA2_LAST_RESORT_PHYSICAL_FRAME_ONLY.
++     * No selectable MGC/Pixel3/calibrated/base-frame model is consulted.
++     * Camera2 pairs are in actual CFA phase order; RawNoiseModel canonicalizes
++     * for the current physical sensor pattern, then we map back to phase order
++     * consumed by B's shaders. All four phases must be valid together.
++     * This helper is NEVER invoked for a valid four-phase burst fit. */
++    private fun bCamera2ProfileForFrame26861(
++        frame: RawStackFrame, reason: String,
++    ): GlesIris26860BBurstNoise.Profile? {
++        val model = frame.channelNoiseProfile
++            ?.let(RawNoiseModel::fromCamera2NoiseProfile)
++            ?.takeIf { it.hasValidCamera2Profile } ?: return null
++        val canonicalShot=model.normalizedShotNoiseForShader(cfaPattern)
++        val canonicalRead=model.normalizedReadNoiseForShader(cfaPattern)
++        val shot=FloatArray(4) { phase -> canonicalShot[canonicalChannelAtPhase(phase)] }
++        val read=FloatArray(4) { phase -> canonicalRead[canonicalChannelAtPhase(phase)] }
++        if (shot.any { !it.isFinite() || it <= 0f } ||
++            read.any { !it.isFinite() || it < 0f }) return null
++        return GlesIris26860BBurstNoise.Profile(
++            shot,read,0,IntArray(4),"CAMERA2_FALLBACK_${reason}",IntArray(4),0)
++    }
++
+     private fun requireBNoiseAuthority26861(profile: GlesIris26860BBurstNoise.Profile) {
+-        require(profile.measuredPhases == 4 && profile.mode.startsWith("BURST_ALL_PHASE_")) {
+-            "IRIS_26862_B_INVALID_NOISE_SOURCE: B must consume four RAW-measured phases"
++        require(profile.mode == "BURST_ALL_PHASE_SHOT_READ" ||
++            profile.mode.startsWith("CAMERA2_FALLBACK_")) {
++            "IRIS_26861_B_INVALID_NOISE_SOURCE: unsupported/partial RAW fit may not control B"
+         }
+         require((0..3).all { p ->
+             val shot=profile.shot[p]; val read=profile.read[p]
+@@ -9029,8 +9056,8 @@ internal class GlesMgcRawSpatialStacker(
+     /** IRIS_26861_B_PRIVATE_SENSOR_NOISE_CALIBRATION
+      * Only B NORMAL guide, covariance, rejection and temporal sampling consume
+      * this model. A, DNG, LONG retain the unmodified legacy calibration.
+-     * Profile is exclusively four-phase RAW-burst measured evidence. A bounded
+-     * variance when shot/read slope is unidentified is explicitly not a fit. */
++     * Profile is either measured four-phase burst or explicitly validated
++     * same-physical-frame Camera2 last resort, never a partial zero fit. */
+     private fun bEmpiricalCalibration26861(
+         original: FrameCalibration, profile: GlesIris26860BBurstNoise.Profile,
+         exposureScale: Float,
+diff --git a/app/version.properties b/app/version.properties
+index 77e1b95a8ae38c8c3351e783303ba8792377597e..64d3166ae761dc878706bd61ff4a552e2cb953a0 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726862
+-VERSION_BUILD=26862
++VERSION_NAME=0.9726861
++VERSION_BUILD=26861
