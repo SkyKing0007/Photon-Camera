@@ -1,0 +1,705 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
+index fb130abf95d540978a37e4e69949c989312e5644..c622918954cabf0b7b11dd6cd6b98a060966134f 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
+@@ -124,11 +124,11 @@ internal object GlesIris26858BNoiseHighlight {
+         }
+     """.trimIndent()
+ 
+-    /** Per-frame independent B clip votes. Physical x/y are original sensor sites.
+-     * Quad-wide motion admission is unchanged; all four phases receive the SAME
+-     * rejection/flow scalar, and all clipped values are measured from the RAW
+-     * code BEFORE calculation-WB, lens shading, AMaZE, RGB/tone or LONG.
+-     * RGBA = weighted R/G1/G2/B clipped votes indexed TL/TR/BL/BR.
++    /** IRIS_26859_B_EXACT_FRACTIONAL_CFA_CLIP_FOOTPRINT
++     * The clip carrier follows the 26858 normalized/guarded RAW phase samples:
++     * exact lattice hit => one site, fractional flow => all four same-phase
++     * corners. Any clipped contributor is flagged, as temporal CFA's minimum
++     * headroom does, BEFORE LSC/temporary WB and before HDR/LONG color routing.
+      */
+     val bClipAccumulate = """
+         #version 300 es
+@@ -138,11 +138,17 @@ internal object GlesIris26858BNoiseHighlight {
+         uniform highp usampler2D uRaw;
+         uniform sampler2D uFlow;
+         uniform sampler2D uReject;
++        uniform sampler2D uVerifiedHotPixelMask26855;
++        uniform int uVerifiedHotPixelMapEnabled26855;
+         uniform vec4 uFlowScaleOffset;
+         uniform ivec2 uRawSize;
+         uniform ivec2 uCellSize;
+         uniform vec4 uFlowBorder;
+-        uniform float uWhite;
++        uniform vec4 uPhaseGains;
++        uniform vec4 uPhaseBlackTerms;
++        uniform vec4 uPhaseNoiseShot26855;
++        uniform vec4 uPhaseNoiseRead26855;
++        uniform float uSourceWhiteNormalized;
+         uniform int uHasReject;
+         uniform int uFlickerHarmonic;
+         uniform vec2 uFlickerAB;
+@@ -171,6 +177,92 @@ internal object GlesIris26858BNoiseHighlight {
+             }
+             return r;
+         }
++        int phaseAt(ivec2 p) { return ((p.y & 1) << 1) + (p.x & 1); }
++        ivec2 phaseOffset(int phase) { return ivec2(phase & 1, phase >> 1); }
++        ivec2 clampPhaseLattice(ivec2 q, int phase) {
++            ivec2 off = phaseOffset(phase);
++            ivec2 maximum = max((uRawSize - ivec2(1) - off) / 2, ivec2(0));
++            return clamp(q, ivec2(0), maximum);
++        }
++        ivec2 pixelForPhaseLattice(ivec2 q, int phase) {
++            return clampPhaseLattice(q, phase) * 2 + phaseOffset(phase);
++        }
++        float normalizedRaw(ivec2 p) {
++            p = clamp(p, ivec2(0), uRawSize - ivec2(1));
++            int phase = phaseAt(p);
++            return float(texelFetch(uRaw, p, 0).r) * uPhaseGains[phase] + uPhaseBlackTerms[phase];
++        }
++        /* IRIS_26855_RAW_CFA_IMPULSE_REPAIR_OWNER
++         * Repair only an extreme, isolated positive SAME-PHASE raw spike before it
++         * reaches the temporal CFA sum. This is not a broad spatial denoiser.
++         * The raw pixel is never replaced merely for chromatic disagreement.
++         * All 14 frames remain eligible; existing Sabre shared-motion admission
++         * and all other CFA/SHORT/LONG/DNG ownership remain unchanged. */
++        float guardedRaw26855(ivec2 p) {
++            float center = normalizedRaw(p);
++            if (p.x < 2 || p.y < 2 || p.x >= uRawSize.x-2 || p.y >= uRawSize.y-2)
++                return center;
++            int phase = phaseAt(p);
++            /* Verified sparse Camera2 defects are corrected independent of
++             * the scene's noise threshold, without filtering adjacent texture.
++             * Coordinates originate in the sensor pixel-array domain and are
++             * used only after exact RAW geometry translation is established. */
++            bool sensorDefect = uVerifiedHotPixelMapEnabled26855 != 0 &&
++                texelFetch(uVerifiedHotPixelMask26855,p,0).r > 0.5;
++            float a = normalizedRaw(p + ivec2(-2,0));
++            float b = normalizedRaw(p + ivec2( 2,0));
++            float c = normalizedRaw(p + ivec2(0,-2));
++            float d = normalizedRaw(p + ivec2(0, 2));
++            if (sensorDefect) {
++                float lowAB=min(a,b), highAB=max(a,b);
++                float lowCD=min(c,d), highCD=max(c,d);
++                return 0.5*(max(lowAB,lowCD)+min(highAB,highCD));
++            }
++            float cardinalMax = max(max(a,b),max(c,d));
++            float cardinalMin = min(min(a,b),min(c,d));
++            float meanCardinal = 0.25*(a+b+c+d);
++            float shot = max(uPhaseNoiseShot26855[phase],0.0);
++            float read = max(uPhaseNoiseRead26855[phase],0.0);
++            float sigma = sqrt(max(shot*max(meanCardinal,0.0)+read,1.0e-9));
++            /* An ordinary fabric strand, colored stitch, or subpixel detail must
++             * never trigger the sparse impulse owner from a single noisy neighbor. */
++            if (center <= cardinalMax + max(9.0*sigma,0.055) ||
++                cardinalMax-cardinalMin > max(3.5*sigma,0.025)) return center;
++            float e = normalizedRaw(p + ivec2(-2,-2));
++            float f = normalizedRaw(p + ivec2( 2,-2));
++            float g = normalizedRaw(p + ivec2(-2, 2));
++            float h = normalizedRaw(p + ivec2( 2, 2));
++            float diagonalMax = max(max(e,f),max(g,h));
++            float diagonalMin = min(min(e,f),min(g,h));
++            float ringMax = max(cardinalMax,diagonalMax);
++            float ringMin = min(cardinalMin,diagonalMin);
++            if (ringMax-ringMin > max(4.0*sigma,0.030) ||
++                center <= ringMax + max(9.0*sigma,0.055)) return center;
++            /* No hue/saturation/green substitution: return only same-phase RAW
++             * evidence when eight local witnesses establish a single-pixel spike. */
++            return 0.125*(a+b+c+d+e+f+g+h);
++        }
++
++        float actualClip(ivec2 p){
++            float v=guardedRaw26855(p);
++            float end=max(uSourceWhiteNormalized,1.0e-5);
++            float start=end*0.9925;
++            return smoothstep(start,max(start+1.0e-5,end),v);
++        }
++        float sameFootprintClip(vec2 sourceCenter,int phase){
++            ivec2 off=phaseOffset(phase);
++            vec2 lattice=0.5*(sourceCenter-(vec2(off)+vec2(0.5)));
++            ivec2 nearest=ivec2(floor(lattice+vec2(0.5)));
++            if(max(abs(lattice.x-float(nearest.x)),abs(lattice.y-float(nearest.y)))<1.0e-5){
++                return actualClip(pixelForPhaseLattice(nearest,phase));
++            }
++            ivec2 base=ivec2(floor(lattice));
++            float clipped=0.0;
++            for(int y=0;y<=1;++y)for(int x=0;x<=1;++x){
++                clipped=max(clipped,actualClip(pixelForPhaseLattice(base+ivec2(x,y),phase)));
++            }
++            return clipped;
++        }
+         void main(){
+             ivec2 q=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uCellSize-ivec2(1));
+             ivec2 quad=q*2;
+@@ -182,18 +274,9 @@ internal object GlesIris26858BNoiseHighlight {
+             float w=frameWeight(quad)*flicker(src.y);
+             vec4 clipped=vec4(0.0);
+             for(int phase=0;phase<4;++phase){
+-                ivec2 off=ivec2(phase&1,phase>>1);
+-                ivec2 p=quad+off;
+-                vec2 c=vec2(p)+vec2(0.5)+d;
+-                vec2 lattice=(c-vec2(off)-vec2(0.5))*0.5;
+-                ivec2 nearest=ivec2(floor(lattice+vec2(0.5)));
+-                ivec2 maximum=max((uRawSize-ivec2(1)-off)/2,ivec2(0));
+-                ivec2 pixel=clamp(nearest,ivec2(0),maximum)*2+off;
+-                float code=float(texelFetch(uRaw,pixel,0).r);
+-                // Same pre-WB sensor 0.9925-white headroom transition as the
+-                // inherited CFA temporal owner, never post-RGB thresholds.
+-                float nearWhite = smoothstep(uWhite*0.9925,uWhite,code);
+-                clipped[phase]=nearWhite*w;
++                ivec2 off=phaseOffset(phase);
++                vec2 c=vec2(quad+off)+vec2(0.5)+d;
++                clipped[phase]=sameFootprintClip(c,phase)*w;
+             }
+             oClipVotes=clipped;
+         }
+@@ -224,6 +307,9 @@ internal object GlesIris26858BNoiseHighlight {
+         uniform sampler2D uSupport;
+         uniform sampler2D uMoments;
+         uniform sampler2D uClip;
++        uniform sampler2D uLensShading;
++        uniform int uUseLensShading;
++        uniform ivec2 uNativeSize;
+         uniform ivec2 uSize;
+         uniform ivec2 uClipCellSize;
+         uniform ivec2 uOrigin;
+@@ -244,6 +330,23 @@ internal object GlesIris26858BNoiseHighlight {
+             float green=max(v.g,0.0);
+             float noise=sqrt(max(texelFetch(uMoments,c,0).y,1.0e-9)) /
+                 max(w,1.0e-6);
++            // 26859: per-physical-channel gain squares variance exactly once
++            // AFTER the B-only sensor-linear lens-map pass. No scalar denoise
++            // coefficient is increased; pre-LSC CFA denoise is unchanged.
++            vec3 gainRgb=vec3(1.0);
++            if(uUseLensShading!=0){
++                vec2 uv=(vec2(uOrigin+p)+vec2(0.5))/
++                    (vec2(uNativeSize)*float(uExpandedScale));
++                vec4 gains=texture(uLensShading,uv);
++                gainRgb=vec3(gains.r,0.5*(gains.g+gains.b),gains.a);
++            }
++            vec3 phaseSigma=noise*gainRgb;
++            vec2 chromaSigma=sqrt(max(vec2(
++                0.5*(phaseSigma.r*phaseSigma.r+phaseSigma.g*phaseSigma.g),
++                0.5*(phaseSigma.b*phaseSigma.b+phaseSigma.g*phaseSigma.g)),
++                vec2(1.0e-9)));
++            float greenSigma=phaseSigma.g;
++            float noiseForNeed=max(chromaSigma.x,chromaSigma.y);
+             vec2 acc=vec2(0.0);float aw=0.0;
+             float structure=0.0;
+             for(int yy=-1;yy<=1;++yy){
+@@ -254,14 +357,14 @@ internal object GlesIris26858BNoiseHighlight {
+                     float gd=abs(z.g-v.g);
+                     structure=max(structure,gd);
+                     vec2 dc=vec2(z.r-z.g,z.b-z.g)-vec2(v.r-v.g,v.b-v.g);
+-                    float affinity=(1.0-smoothstep(1.2,3.5,length(dc)/max(2.0*noise,0.002)))*
+-                        (1.0-smoothstep(1.2,3.0,gd/max(2.0*noise,0.002)));
++                    float affinity=(1.0-smoothstep(1.2,3.5,length(dc/max(2.0*chromaSigma,vec2(0.002)))))*
++                        (1.0-smoothstep(1.2,3.0,gd/max(2.0*greenSigma,0.002)));
+                     acc+=affinity*vec2(z.r-z.g,z.b-z.g);aw+=affinity;
+                 }
+             }
+-            float safe=(1.0-smoothstep(1.8,4.0,structure/max(noise,0.002)))*
++            float safe=(1.0-smoothstep(1.8,4.0,structure/max(greenSigma,0.002)))*
+                 (1.0-smoothstep(0.10,0.50,green))*(1.0-smoothstep(0.0,0.30,sensorClipped));
+-            float need=smoothstep(0.025,0.13,noise/max(green,0.02));
++            float need=smoothstep(0.025,0.13,noiseForNeed/max(green,0.02));
+             float weak=1.0-smoothstep(3.0,10.0,n);
+             float a=clamp(0.30*need*(0.4+0.6*weak)*safe,0.0,0.30);
+             vec2 dc=vec2(v.r-v.g,v.b-v.g);
+@@ -270,23 +373,26 @@ internal object GlesIris26858BNoiseHighlight {
+         }
+     """.trimIndent()
+ 
+-    /** JFA-compatible low-resolution guide: seeded ONLY on wholly unclipped
+-     * genuine camera color near the highlight. No sensor-clipped pixel can seed. */
+-    val bGuideSeed = """
++    /** IRIS_26859_B_SENSOR_PROVEN_SMOOTH_WHITE
++     * Temporary post-WB camera-linear RGB. Sensor-proven clipping only;
++     * no nearby hue guides or color donation. Unclipped RGB is bit-exact.
++     * The shared WB-dependent channel limit is only a brightness floor for
++     * UNKNOWN clipped radiance, NEVER a clamp on reliable real RGB or HDR.
++     */
++    val bHighlightRecover = """
+         #version 300 es
+         precision highp float;
+         uniform sampler2D uWbRgb;
+         uniform sampler2D uClip;
+         uniform ivec2 uSize;
+-        uniform ivec2 uRgbSize;
+         uniform ivec2 uCellSize;
+         uniform int uBayerPattern;
+         uniform ivec2 uOrigin;
+         uniform int uExpandedScale;
+-        layout(location=0) out vec4 oGuide;
++        uniform vec3 uAmazeWb;
++        layout(location=0) out vec4 oRgb;
+         vec3 clipRgb(ivec2 p){
+-            ivec2 global=uOrigin+p;
+-            ivec2 q=clamp(global/(2*uExpandedScale),ivec2(0),uCellSize-ivec2(1));
++            ivec2 q=clamp((uOrigin+p)/(2*uExpandedScale),ivec2(0),uCellSize-ivec2(1));
+             vec4 ph=texelFetch(uClip,q,0);
+             if(uBayerPattern==0)return vec3(ph.r,max(ph.g,ph.b),ph.a);
+             if(uBayerPattern==1)return vec3(ph.g,max(ph.r,ph.a),ph.b);
+@@ -295,96 +401,47 @@ internal object GlesIris26858BNoiseHighlight {
+         }
+         void main(){
+             ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
+-            ivec2 rgb=clamp(p*4+ivec2(2),ivec2(0),uRgbSize-ivec2(1));
+-            vec3 v=max(texelFetch(uWbRgb,rgb,0).rgb,vec3(0.0));
+-            vec3 clip=clipRgb(rgb);
+-            float signal=max(max(v.r,v.g),v.b);
+-            float clear=1.0-smoothstep(0.05,0.25,max(max(clip.r,clip.g),clip.b));
+-            float bright=smoothstep(0.18,0.32,signal);
+-            float good=clear*bright;
+-            float scale=max(v.r+v.g+v.b,1.0e-5);
+-            oGuide=vec4(v/scale,good);
+-        }
+-    """.trimIndent()
+-
+-    val bGuideSpread = """
+-        #version 300 es
+-        precision highp float;
+-        uniform sampler2D uPrior;
+-        uniform sampler2D uWbRgb;
+-        uniform ivec2 uSize;
+-        uniform ivec2 uRgbSize;
+-        uniform int uStride;
+-        layout(location=0) out vec4 oGuide;
+-        void main(){
+-            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
+-            vec4 best=texelFetch(uPrior,p,0);
+-            vec3 here=texelFetch(uWbRgb,clamp(p*4+ivec2(2),ivec2(0),uRgbSize-ivec2(1)),0).rgb;
+-            float luma=max(dot(max(here,vec3(0.0)),vec3(0.25,0.5,0.25)),0.0);
+-            float score=best.a;
+-            for(int y=-1;y<=1;++y){
+-                for(int x=-1;x<=1;++x){
+-                    if(x==0&&y==0)continue;
+-                    ivec2 q=clamp(p+ivec2(x,y)*uStride,ivec2(0),uSize-ivec2(1));
+-                    vec4 g=texelFetch(uPrior,q,0);
+-                    vec3 c=texelFetch(uWbRgb,clamp(q*4+ivec2(2),ivec2(0),uRgbSize-ivec2(1)),0).rgb;
+-                    float nearby=max(dot(max(c,vec3(0.0)),vec3(0.25,0.5,0.25)),0.0);
+-                    float match=1.0-smoothstep(0.08,0.75,abs(luma-nearby));
+-                    float candidate=g.a*match*0.96;
+-                    if(candidate>score){score=candidate;best=vec4(g.rgb,candidate);}
+-                }
+-            }
+-            oGuide=best;
++            vec4 original=texelFetch(uWbRgb,p,0);
++            vec3 clip=clipRgb(p);
++            float unreliable=clamp(max(max(clip.r,clip.g),clip.b),0.0,1.0);
++            if(unreliable<=0.0){oRgb=original;return;}
++            // Smooth endpoints guarantee no abrupt nonzero correction just as
++            // a channel enters the physically evidenced near-white interval.
++            float fade=smoothstep(0.0,1.0,unreliable);
++            vec3 rgb=max(original.rgb,vec3(0.0));
++            float sharedSafeWhite=min(uAmazeWb.r,min(uAmazeWb.g,uAmazeWb.b));
++            // Never reduce a sensor-reconstructed channel, clip HDR >1, or
++            // compress the highlight radiance into an artificial grey shoulder.
++            float neutral=max(max(max(rgb.r,rgb.g),rgb.b),sharedSafeWhite);
++            vec3 white=vec3(neutral);
++            oRgb=vec4(mix(original.rgb,white,fade),original.a);
+         }
+     """.trimIndent()
+ 
+-    /** Apply per-channel ratio from locally propagated unclipped color; no
+-     * global neutral clamp and NO changes when all sensor sites are valid. */
+-    val bHighlightRecover = """
++    /** IRIS_26859_B_PHYSICAL_LENS_LSC_ONCE
++     * Sensor-linear RGB after pinned AMaZE; original clip evidence was already
++     * committed pre-LSC. The same Camera2 RGGB map/origin as Sabre A is used,
++     * but this code is entered ONLY on B. Physical pixel geometry includes
++     * tile origin and 2x output scale, never display crop or zoom guessing.
++     */
++    val bLensShade = """
+         #version 300 es
+         precision highp float;
+-        uniform sampler2D uWbRgb;
+-        uniform sampler2D uClip;
+-        uniform sampler2D uGuide;
++        uniform sampler2D uSensorRgb;
++        uniform sampler2D uLensShading;
+         uniform ivec2 uSize;
+-        uniform ivec2 uCellSize;
+-        uniform int uBayerPattern;
+         uniform ivec2 uOrigin;
++        uniform ivec2 uNativeSize;
+         uniform int uExpandedScale;
+         layout(location=0) out vec4 oRgb;
+-        vec3 clipRgb(ivec2 p){
+-            ivec2 q=clamp((uOrigin+p)/(2*uExpandedScale),ivec2(0),uCellSize-ivec2(1));
+-            vec4 ph=texelFetch(uClip,q,0);
+-            if(uBayerPattern==0)return vec3(ph.r,max(ph.g,ph.b),ph.a);
+-            if(uBayerPattern==1)return vec3(ph.g,max(ph.r,ph.a),ph.b);
+-            if(uBayerPattern==2)return vec3(ph.b,max(ph.r,ph.a),ph.g);
+-            return vec3(ph.a,max(ph.g,ph.b),ph.r);
+-        }
+         void main(){
+             ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
+-            vec4 original=texelFetch(uWbRgb,p,0);
+-            vec3 frac=clipRgb(p);
+-            vec3 bad=smoothstep(vec3(0.65),vec3(0.94),frac);
+-            if(max(max(bad.r,bad.g),bad.b)<0.001){oRgb=original;return;}
+-            vec4 guide=texelFetch(uGuide,p/4,0);
+-            vec3 c=max(original.rgb,vec3(0.0));
+-            vec3 recovered=c;
+-            float surviving=dot(vec3(1.0)-bad,guide.rgb);
+-            float sumActual=dot(vec3(1.0)-bad,c);
+-            if(guide.a>0.22&&surviving>0.015){
+-                float intensity=sumActual/surviving;
+-                // Confidence and channel-selectivity prevent projecting unrelated
+-                // surrounding material colors into physically saturated lamps.
+-                vec3 target=guide.rgb*min(intensity,8.0);
+-                vec3 trust=bad*clamp(guide.a,0.0,1.0);
+-                recovered=mix(c,target,trust);
+-            } else if(min(min(bad.r,bad.g),bad.b)>0.98){
+-                // Only a genuinely ALL-channel clipped core, with no trustworthy
+-                // guide, can move gently toward neutral. Never flatten its luma.
+-                float y=dot(c,vec3(0.25,0.5,0.25));
+-                recovered=mix(c,vec3(y),0.10);
+-            }
+-            oRgb=vec4(recovered,original.a);
++            vec4 rgba=texelFetch(uSensorRgb,p,0);
++            vec2 nativeUv=(vec2(uOrigin+p)+vec2(0.5))/
++                (vec2(uNativeSize)*float(uExpandedScale));
++            vec4 gains=texture(uLensShading,nativeUv);
++            vec3 physical=vec3(gains.r,0.5*(gains.g+gains.b),gains.a);
++            oRgb=vec4(rgba.rgb*physical,rgba.a);
+         }
+     """.trimIndent()
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 46b735b9a504f03690f55f61735ef398894cd574..7a2537b5a984ae76a20eed83e88922d678f52659 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -683,9 +683,11 @@ internal class GlesMgcRawSpatialStacker(
+     private var iris26858BClipAccumulateProgram = 0
+     private var iris26858BClipNormalizeProgram = 0
+     private var iris26858BResidualProgram = 0
+-    private var iris26858BGuideSeedProgram = 0
+-    private var iris26858BGuideSpreadProgram = 0
+     private var iris26858BHighlightProgram = 0
++    private var iris26859BLensShadeProgram = 0
++    // B-only per-capture tiny Camera2 lens map, allocated once and inherited
++    // release() owns cleanup across 1x, true2x tiles and capture exceptions.
++    private var iris26859BLensMapTexture = 0
+     private var iris26856InverseAmazeWbProgram = 0
+     private var iris26856ShortScalarRadianceProgram = 0
+     private var iris26856LabPrepareProgram = 0
+@@ -2732,6 +2734,7 @@ internal class GlesMgcRawSpatialStacker(
+             if (iris26858BClipVotes != 0) {
+                 renderIris26858BClipAccumulate(
+                     referenceRaw, zeroFlow, identityWeight, false,
++                    referenceCalibration, verifiedHotPixelMask26855, verifiedHotPixelMapEnabled26855,
+                     frames.first().takeIf(::hasRowFlickerEvidence26720),
+                     iris26858BClipVotes, extractedWidth, extractedHeight,
+                 )
+@@ -2977,6 +2980,7 @@ internal class GlesMgcRawSpatialStacker(
+                     if (iris26858BClipVotes != 0) {
+                         renderIris26858BClipAccumulate(
+                             currentRaw, flow, frameWeight, true,
++                            calibration, verifiedHotPixelMask26855, verifiedHotPixelMapEnabled26855,
+                             frame.takeIf(::hasRowFlickerEvidence26720),
+                             iris26858BClipVotes, extractedWidth, extractedHeight,
+                         )
+@@ -3607,7 +3611,7 @@ internal class GlesMgcRawSpatialStacker(
+                         bSidecar, width, height, 4,
+                         storage = GpuLinearRgbStorage.RGBA16F,
+                     ),
+-                    lensShadingCorrectionApplied = hasLensShading(),
++                    lensShadingCorrectionApplied = iris26859BLensMapTexture != 0,
+                     mergedFrameCount = mergedFrameCount,
+                     mgcSpatialStrengthMap = sabreResidualStrengthMap26634,
+                     mgcSabreNoiseModelScale = sabreNoiseModelScale,
+@@ -6349,8 +6353,9 @@ internal class GlesMgcRawSpatialStacker(
+      * inherited texture/program ownership lists and fatal error cleanup. */
+     private fun renderIris26858BClipAccumulate(
+         raw: Int, flow: SabreConvertedAlignment, rejection: Int,
+-        useRejection: Boolean, flickerFrame: RawStackFrame?,
+-        destination: Int, cellWidth: Int, cellHeight: Int,
++        useRejection: Boolean, calibration: FrameCalibration,
++        verifiedHotPixelMask26855: Int, verifiedHotPixelMapEnabled26855: Boolean,
++        flickerFrame: RawStackFrame?, destination: Int, cellWidth: Int, cellHeight: Int,
+     ) {
+         if (iris26858BClipAccumulateProgram == 0) {
+             iris26858BClipAccumulateProgram = linkProgram(
+@@ -6362,6 +6367,24 @@ internal class GlesMgcRawSpatialStacker(
+         bindTexture(p, "uRaw", 0, raw)
+         bindTexture(p, "uFlow", 1, flow.texture)
+         bindTexture(p, "uReject", 2, rejection)
++        bindTexture(p, "uVerifiedHotPixelMask26855", 3, verifiedHotPixelMask26855)
++        uniform1i(p, "uVerifiedHotPixelMapEnabled26855", if (verifiedHotPixelMapEnabled26855) 1 else 0)
++        uniform4fv(p, "uPhaseGains", calibration.bayerPhaseGains)
++        uniform4fv(p, "uPhaseBlackTerms", calibration.bayerPhaseBlackTerms)
++        // Match the exact pinned 26855 CFA hot-pixel/noise owner; otherwise
++        // sparse impulse gating would falsely classify genuine highlight detail.
++        val clipShot26859 = FloatArray(4) { phase ->
++            val c = canonicalChannelAtPhase(phase)
++            calibration.shotNoise[c] / calculationWhiteBalance[c]
++        }
++        val clipRead26859 = FloatArray(4) { phase ->
++            val c = canonicalChannelAtPhase(phase)
++            val gain = calculationWhiteBalance[c]
++            calibration.readNoise[c] / (gain * gain)
++        }
++        uniform4fv(p,"uPhaseNoiseShot26855",clipShot26859)
++        uniform4fv(p,"uPhaseNoiseRead26855",clipRead26859)
++        uniform1f(p, "uSourceWhiteNormalized", 1f)
+         uniformSabreFlowScaleOffset(p, flow)
+         uniform2i(p, "uRawSize", width, height)
+         uniform2i(p, "uCellSize", cellWidth, cellHeight)
+@@ -6370,7 +6393,6 @@ internal class GlesMgcRawSpatialStacker(
+             SABRE_SAMPLE_BORDER_PIXELS / height,
+             1f - SABRE_SAMPLE_BORDER_PIXELS / width,
+             1f - SABRE_SAMPLE_BORDER_PIXELS / height)
+-        uniform1f(p, "uWhite", sensorWhiteLevel)
+         uniform1i(p, "uHasReject", if (useRejection) 1 else 0)
+         val enabled = flickerFrame != null && hasRowFlickerEvidence26720(flickerFrame)
+         uniform1i(p, "uFlickerHarmonic", if (enabled) flickerFrame!!.rowFlickerHarmonic else 0)
+@@ -6434,6 +6456,61 @@ internal class GlesMgcRawSpatialStacker(
+         return out
+     }
+ 
++    /* IRIS_26859_B_SINGLE_PHYSICAL_LSC_OWNER: map is frozen for the physical
++     * Camera2 lens and reused through all true2x tiles. Bad/missing maps are
++     * NO-OP with explicit telemetry; do not manufacture generic radial curves.
++     * A never calls this helper or consumes its shader/program/texture. */
++    private fun ensureIris26859BLensMapTexture() {
++        // Tile releaseTexturesFrom(...) may retire a prior B texture; stale GL
++        // names MUST NOT be sampled on following true2x tiles or captures.
++        if (iris26859BLensMapTexture != 0 && iris26859BLensMapTexture in textures) return
++        iris26859BLensMapTexture = 0
++        if (!hasLensShading() || checkNotNull(lensShading).any {
++            !it.isFinite() || it <= 0f
++        }) return
++        iris26859BLensMapTexture = createLensShadingTexture()
++        PLog.i(SABRE_TAG,"IRIS_26859_B_LSC_MAP physicalMap=" +
++            "${lensShadingWidth}x${lensShadingHeight} physicalPerLens=true valid=true")
++    }
++
++    private fun renderIris26859BLensShading(
++        input: Int, outWidth: Int, outHeight: Int,
++        originX: Int, originY: Int, expandedScale: Int,
++    ): Int {
++        val valid = hasLensShading() && checkNotNull(lensShading).all {
++            it.isFinite() && it > 0f
++        }
++        if (!valid) return 0
++        ensureIris26859BLensMapTexture()
++        check(iris26859BLensMapTexture != 0 && iris26859BLensMapTexture in textures) {
++            "26859 B LSC GPU map ownership lost before sampling"
++        }
++        if (iris26859BLensShadeProgram == 0) {
++            iris26859BLensShadeProgram = linkProgram(
++                GlesIris26858BNoiseHighlight.bLensShade, "iris_26859_b_physical_lsc_once",
++            )
++        }
++        val output = createTexture(outWidth, outHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++        var complete = false
++        try {
++            val p=iris26859BLensShadeProgram
++            GLES30.glUseProgram(p)
++            bindTexture(p, "uSensorRgb", 0, input)
++            bindTexture(p, "uLensShading", 1, iris26859BLensMapTexture)
++            uniform2i(p, "uSize", outWidth, outHeight)
++            uniform2i(p, "uOrigin", originX, originY)
++            uniform2i(p, "uNativeSize", width, height)
++            uniform1i(p, "uExpandedScale", expandedScale)
++            draw(p, outWidth, outHeight, intArrayOf(output))
++            GlesGpuScheduler.memoryBarrier()
++            checkGlError("26859 B post-AMaZE sensor-linear optical LSC")
++            complete = true
++            return output
++        } finally {
++            if (!complete) releaseOwnedTexture(output,"26859 B failed lens shade output")
++        }
++    }
++
+     private fun renderIris26858BResidualChroma(
+         rgb: Int, clip: Int, support: Int, moments: Int,
+         outWidth: Int, outHeight: Int, originX: Int, originY: Int,
+@@ -6458,6 +6535,9 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1i(p, "uExpandedScale", expandedScale)
+         uniform4fv(p, "uNoiseShot", shot)
+         uniform4fv(p, "uNoiseRead", read)
++        bindTexture(p,"uLensShading",4,iris26859BLensMapTexture.takeIf{it!=0} ?: rgb)
++        uniform1i(p,"uUseLensShading",if(iris26859BLensMapTexture!=0)1 else 0)
++        uniform2i(p,"uNativeSize",width,height)
+         draw(p, outWidth, outHeight, intArrayOf(out))
+         GlesGpuScheduler.memoryBarrier()
+         checkGlError("26858 B sensor-neutral residual chroma only")
+@@ -6466,74 +6546,35 @@ internal class GlesMgcRawSpatialStacker(
+ 
+     private fun renderIris26858BHighlightColor(
+         temporaryWbRgb: Int, clipRatio: Int, outWidth: Int, outHeight: Int,
+-        originX: Int, originY: Int, expandedScale: Int,
++        originX: Int, originY: Int, expandedScale: Int, wb: FloatArray,
+     ): Int {
+-        require(outWidth > 0 && outHeight > 0 && expandedScale in 1..2)
+-        if (iris26858BGuideSeedProgram == 0) {
+-            iris26858BGuideSeedProgram = linkProgram(
+-                GlesIris26858BNoiseHighlight.bGuideSeed, "iris_26858_b_sensor_highlight_seed",
+-            )
+-            iris26858BGuideSpreadProgram = linkProgram(
+-                GlesIris26858BNoiseHighlight.bGuideSpread, "iris_26858_b_sensor_highlight_spread",
+-            )
++        require(wb.size==3 && wb.all{it.isFinite() && it>0f})
++        if (iris26858BHighlightProgram == 0) {
+             iris26858BHighlightProgram = linkProgram(
+-                GlesIris26858BNoiseHighlight.bHighlightRecover, "iris_26858_b_sensor_highlight_recover",
++                GlesIris26858BNoiseHighlight.bHighlightRecover,
++                "iris_26859_b_sensor_smooth_white_no_color_propagation",
+             )
+         }
+-        val guideW = (outWidth + 3) / 4
+-        val guideH = (outHeight + 3) / 4
+-        var seed = createTexture(guideW, guideH, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-        var scratch = 0
+-        var output = 0
+-        var done = false
++        val output=createTexture(outWidth,outHeight,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++        var done=false
+         try {
+-            scratch = createTexture(guideW, guideH, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-            val p0 = iris26858BGuideSeedProgram
+-            GLES30.glUseProgram(p0)
+-            bindTexture(p0, "uWbRgb", 0, temporaryWbRgb)
+-            bindTexture(p0, "uClip", 1, clipRatio)
+-            uniform2i(p0, "uSize", guideW, guideH)
+-            uniform2i(p0, "uRgbSize", outWidth, outHeight)
+-            uniform2i(p0, "uCellSize", width / 2, height / 2)
+-            uniform1i(p0, "uBayerPattern", cfaPattern)
+-            uniform2i(p0, "uOrigin", originX, originY)
+-            uniform1i(p0, "uExpandedScale", expandedScale)
+-            draw(p0, guideW, guideH, intArrayOf(seed))
++            val p=iris26858BHighlightProgram
++            GLES30.glUseProgram(p)
++            bindTexture(p,"uWbRgb",0,temporaryWbRgb)
++            bindTexture(p,"uClip",1,clipRatio)
++            uniform2i(p,"uSize",outWidth,outHeight)
++            uniform2i(p,"uCellSize",width/2,height/2)
++            uniform1i(p,"uBayerPattern",cfaPattern)
++            uniform2i(p,"uOrigin",originX,originY)
++            uniform1i(p,"uExpandedScale",expandedScale)
++            GLES30.glUniform3f(GLES30.glGetUniformLocation(p,"uAmazeWb"),wb[0],wb[1],wb[2])
++            draw(p,outWidth,outHeight,intArrayOf(output))
+             GlesGpuScheduler.memoryBarrier()
+-            val p1 = iris26858BGuideSpreadProgram
+-            for (stride in intArrayOf(64, 32, 16, 8, 4, 2, 1)) {
+-                GLES30.glUseProgram(p1)
+-                bindTexture(p1, "uPrior", 0, seed)
+-                bindTexture(p1, "uWbRgb", 1, temporaryWbRgb)
+-                uniform2i(p1, "uSize", guideW, guideH)
+-                uniform2i(p1, "uRgbSize", outWidth, outHeight)
+-                uniform1i(p1, "uStride", stride)
+-                draw(p1, guideW, guideH, intArrayOf(scratch))
+-                GlesGpuScheduler.memoryBarrier()
+-                val prior = seed
+-                seed = scratch
+-                scratch = prior
+-            }
+-            output = createTexture(outWidth, outHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-            val p2 = iris26858BHighlightProgram
+-            GLES30.glUseProgram(p2)
+-            bindTexture(p2, "uWbRgb", 0, temporaryWbRgb)
+-            bindTexture(p2, "uClip", 1, clipRatio)
+-            bindTexture(p2, "uGuide", 2, seed)
+-            uniform2i(p2, "uSize", outWidth, outHeight)
+-            uniform2i(p2, "uCellSize", width / 2, height / 2)
+-            uniform1i(p2, "uBayerPattern", cfaPattern)
+-            uniform2i(p2, "uOrigin", originX, originY)
+-            uniform1i(p2, "uExpandedScale", expandedScale)
+-            draw(p2, outWidth, outHeight, intArrayOf(output))
+-            GlesGpuScheduler.memoryBarrier()
+-            checkGlError("26858 B sensor clipped-channel propagation before Lab/FCC")
+-            done = true
++            checkGlError("26859 B sensor-proven white before Lab FCC no-guide")
++            done=true
+             return output
+         } finally {
+-            releaseOwnedTexture(seed, "26858 B consumed propagated low-resolution highlight guide")
+-            if (scratch != 0) releaseOwnedTexture(scratch, "26858 B unused highlight guide ping-pong")
+-            if (!done && output != 0) releaseOwnedTexture(output, "26858 B aborted sensor clip highlight")
++            if(!done) releaseOwnedTexture(output,"26859 aborted B smooth neutral highlight")
+         }
+     }
+ 
+@@ -6566,6 +6607,7 @@ internal class GlesMgcRawSpatialStacker(
+         // temporary WB interval must surround Lab/FCC; it must not leak into
+         // the final Iris calibrated sensor-RGB renderer. 1.0x/zoom/2x share it.
+         var temporaryPostWb = 0
++        var bLensCorrected26859 = 0
+         var bCleaned26858 = 0
+         var bRecovered26858 = 0
+         var defringed = 0
+@@ -6573,6 +6615,12 @@ internal class GlesMgcRawSpatialStacker(
+         var neutral = 0
+         var succeeded = false
+         try {
++            // Original-sensor clipping already recorded before LSC; every B
++            // normal/zoom/true2x output applies this optical correction ONCE.
++            bLensCorrected26859 = renderIris26859BLensShading(
++                amazePostWbCameraRgb, processingWidth, processingHeight,
++                bOriginX26858,bOriginY26858,bExpandedScale26858,
++            )
+             if (iris26857ApplyAmazeWbProgram == 0) {
+                 iris26857ApplyAmazeWbProgram = linkProgram(
+                     GlesIris26856RawrColorContract.applyAmazeWbForLabFcc,
+@@ -6581,7 +6629,8 @@ internal class GlesMgcRawSpatialStacker(
+             }
+             if (bClipRatio26858 != 0 && bSupport26858 != 0 && bMoments26858 != 0) {
+                 bCleaned26858 = renderIris26858BResidualChroma(
+-                    amazePostWbCameraRgb, bClipRatio26858, bSupport26858,
++                    if(bLensCorrected26859!=0)bLensCorrected26859 else amazePostWbCameraRgb,
++                    bClipRatio26858, bSupport26858,
+                     bMoments26858, processingWidth, processingHeight,
+                     bOriginX26858, bOriginY26858, bExpandedScale26858,
+                     checkNotNull(bNoiseShot26858), checkNotNull(bNoiseRead26858),
+@@ -6591,7 +6640,8 @@ internal class GlesMgcRawSpatialStacker(
+             val applyProgram = iris26857ApplyAmazeWbProgram
+             GLES30.glUseProgram(applyProgram)
+             bindTexture(applyProgram, "uSensorNeutralAmazeRgb", 0,
+-                if (bCleaned26858 != 0) bCleaned26858 else amazePostWbCameraRgb)
++                if (bCleaned26858 != 0) bCleaned26858 else
++                    if(bLensCorrected26859!=0)bLensCorrected26859 else amazePostWbCameraRgb)
+             uniform2i(applyProgram, "uSize", processingWidth, processingHeight)
+             val gains = snapshot.amazeWhiteBalance
+             GLES30.glUniform3f(GLES30.glGetUniformLocation(applyProgram, "uAmazeWb"),
+@@ -6603,7 +6653,7 @@ internal class GlesMgcRawSpatialStacker(
+                 bRecovered26858 = renderIris26858BHighlightColor(
+                     temporaryPostWb, bClipRatio26858,
+                     processingWidth, processingHeight,
+-                    bOriginX26858, bOriginY26858, bExpandedScale26858,
++                    bOriginX26858, bOriginY26858, bExpandedScale26858, gains,
+                 )
+             }
+             defringed = renderRawrLabDefringe26856(
+@@ -6640,6 +6690,7 @@ internal class GlesMgcRawSpatialStacker(
+         } finally {
+             if (temporaryPostWb != 0) releaseOwnedTexture(temporaryPostWb, "26857 consumed Lab temporary WB input")
+             if (bCleaned26858 != 0) releaseOwnedTexture(bCleaned26858, "26858 B residual sensor RGB")
++            if (bLensCorrected26859 != 0) releaseOwnedTexture(bLensCorrected26859,"26859 B one-time sensor LSC")
+             if (bRecovered26858 != 0) releaseOwnedTexture(bRecovered26858, "26858 B highlight before Lab")
+             if (defringed != 0) releaseOwnedTexture(defringed, "26856 consumed RAWR Lab result")
+             if (fcc != 0) releaseOwnedTexture(fcc, "26856 consumed RAWR FCC x2 result")
+@@ -17127,6 +17178,10 @@ internal class GlesMgcRawSpatialStacker(
+             linkProgram(GlesIris26856B2xShortGuide.applyGain,
+                 "iris_26856_b_true2x_verified_short_scalar") else 0
+         var completedTiles = 0L
++        // Hold the tiny physical Camera2 map OUTSIDE tile-local scratch lifetime.
++        // Release for each tile starts after this allocation; no repeated LSC
++        // uploads, no stale names and no extra complete-frame texture.
++        ensureIris26859BLensMapTexture()
+         GlesIris26856B2xRgbWriter(width, height, target).use { writer ->
+             for (tile in tiles) {
+                 val initialTextureCount = textures.size
+diff --git a/app/version.properties b/app/version.properties
+index 1e1491ea1b434357f3736ce121c4bc5b70dbdc25..e199b7ab8e30424c61cbbec351a9acf2e39bcc2d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726858
+-VERSION_BUILD=26858
++VERSION_NAME=0.9726859
++VERSION_BUILD=26859
