@@ -1,0 +1,227 @@
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrColorContract.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrColorContract.kt
+index 232e407bbc89e1ac157cacd0da2177abea29ccb9..f9a3a6e42ad1331e3ddf24973f2a58aa6c0daabe 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrColorContract.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrColorContract.kt
+@@ -6,10 +6,10 @@ import kotlin.math.abs
+  * IRIS_26856_B_ONLY_RAWR_COLOR_DOMAIN_OWNER
+  *
+  * Immutable Camera2 calibration for the pinned RAWR pipeline. The normalized
+- * temporal CFA is sensor-neutral. Native AMaZE EXPORT ALREADY removes its
+- * temporary R/G/B WB gains. Lab/FCC need those gains reapplied exactly once
+- * to the sensor-neutral AMaZE output, and removed once after FCC before Iris's
+- * already-calibrated * camera-RGB -> display renderer. Do NOT apply the Camera2 matrix twice.
++ * temporal CFA is sensor-neutral. AMaZE applies relative R/G/B white balance
++ * exactly once, Lab and FCC process that post-WB camera-linear image, and the
++ * final RGB carrier must undo those gains before Iris's already-calibrated
++ * camera-RGB -> display renderer. Do NOT apply the Camera2 matrix twice.
+  *
+  * Rejected calibration never silently becomes identity. Experiment A never
+  * constructs this object and uses the historical 26850 path verbatim.
+@@ -55,24 +55,7 @@ internal object GlesIris26856RawrColorContract {
+         return Snapshot.create(wb, floatArrayOf(1f / wb[0], 1f, 1f / wb[2]), transform)
+     }
+ 
+-    // AMaZE export has already undone temporary WB in Vulkan. Restore it only
+-    // for the calibrated Lab/FCC post-WB domain; preserve HDR and alpha.
+-    val applyAmazeWbForLabFcc = """
+-        #version 300 es
+-        precision highp float;
+-        precision highp int;
+-        uniform sampler2D uSensorNeutralAmazeRgb;
+-        uniform vec3 uAmazeWb;
+-        uniform ivec2 uSize;
+-        layout(location = 0) out vec4 oPostWbCameraRgb;
+-        void main() {
+-            ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uSize - ivec2(1));
+-            vec4 source = texelFetch(uSensorNeutralAmazeRgb, p, 0);
+-            oPostWbCameraRgb = vec4(source.rgb * uAmazeWb, source.a);
+-        }
+-    """.trimIndent()
+-
+-    // Apply only after temporary-WB Lab defringe -> FCC x2.
++    // Apply only after RAWR AMaZE -> calibrated Lab defringe -> FCC x2.
+     // No luminance compression, RGB clipping, gamma or second matrix.
+     val undoAmazeWbToIrisSensorNeutral = """
+         #version 300 es
+diff --git b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 851ded37683c7a4c138e120797673a68db4af492..9263334f1e7a1dfd978d22383f206b0e10306ac3 100644
+--- b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -676,7 +676,6 @@ internal class GlesMgcRawSpatialStacker(
+     private var iris26856B2xResolveProgram = 0
+     private var iris26856B2xPackProgram = 0
+     private var iris26856BLongLumaProgram = 0
+-    private var iris26857ApplyAmazeWbProgram = 0
+     private var iris26856InverseAmazeWbProgram = 0
+     private var iris26856ShortScalarRadianceProgram = 0
+     private var iris26856LabPrepareProgram = 0
+@@ -6259,9 +6258,9 @@ internal class GlesMgcRawSpatialStacker(
+     }
+ 
+     /* IRIS_26856_B_ONLY_POST_AMAZE_CAMERA_RGB_DOMAIN
+-     * Pinned AMaZE exports SENSOR-NEUTRAL camera-linear RGB (native
+-     * amaze_export.comp already divides by temporary WB). Restore those WB
+-     * gains for Lab and FCC only, then remove them exactly once. Iris's existing Camera2-calibrated HDR renderer remains
++     * Pinned RAWR AMaZE emits WB-applied camera-linear RGB. RAWR Lab and FCC
++     * operate on that WB image, then ONLY THIS stage removes the temporary
++     * white balance. Iris's existing Camera2-calibrated HDR renderer remains
+      * the sole sensor-RGB->display-RGB owner, so a second CCM/gamma/shoulder
+      * here would corrupt colors and highlight headroom. No clipping occurs.
+      *
+@@ -6276,36 +6275,13 @@ internal class GlesMgcRawSpatialStacker(
+     ): Int {
+         check(amazePostWbCameraRgb != 0) { "26856 B missing true RAWR AMaZE RGB" }
+         require(labDefringeStrength.isFinite() && labDefringeStrength in 0f..1f)
+-        // B-only: native export is SENSOR-NEUTRAL, never post-WB. The single
+-        // temporary WB interval must surround Lab/FCC; it must not leak into
+-        // the final Iris calibrated sensor-RGB renderer. 1.0x/zoom/2x share it.
+-        var temporaryPostWb = 0
+-        var defringed = 0
++        val defringed = renderRawrLabDefringe26856(
++            amazePostWbCameraRgb, snapshot.postWbCameraToSrgb, labDefringeStrength, processingWidth, processingHeight,
++        )
+         var fcc = 0
+         var neutral = 0
+         var succeeded = false
+         try {
+-            if (iris26857ApplyAmazeWbProgram == 0) {
+-                iris26857ApplyAmazeWbProgram = linkProgram(
+-                    GlesIris26856RawrColorContract.applyAmazeWbForLabFcc,
+-                    "iris_26857_b_temporary_wb_for_lab_fcc",
+-                )
+-            }
+-            temporaryPostWb = createTexture(processingWidth, processingHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+-            val applyProgram = iris26857ApplyAmazeWbProgram
+-            GLES30.glUseProgram(applyProgram)
+-            bindTexture(applyProgram, "uSensorNeutralAmazeRgb", 0, amazePostWbCameraRgb)
+-            uniform2i(applyProgram, "uSize", processingWidth, processingHeight)
+-            val gains = snapshot.amazeWhiteBalance
+-            GLES30.glUniform3f(GLES30.glGetUniformLocation(applyProgram, "uAmazeWb"),
+-                gains[0], gains[1], gains[2])
+-            draw(applyProgram, processingWidth, processingHeight, intArrayOf(temporaryPostWb))
+-            GlesGpuScheduler.memoryBarrier()
+-            checkGlError("26857 B temporary WB for Lab/FCC")
+-            defringed = renderRawrLabDefringe26856(
+-                temporaryPostWb, snapshot.postWbCameraToSrgb, labDefringeStrength,
+-                processingWidth, processingHeight,
+-            )
+             // RAWR default FCC policy: 2 serial median/reconstruction steps,
+             // normalized chroma, no optional bilateral or gamut bound.
+             fcc = renderRawrFalseColor26856(
+@@ -6333,8 +6309,7 @@ internal class GlesMgcRawSpatialStacker(
+             succeeded = true
+             return neutral
+         } finally {
+-            if (temporaryPostWb != 0) releaseOwnedTexture(temporaryPostWb, "26857 consumed Lab temporary WB input")
+-            if (defringed != 0) releaseOwnedTexture(defringed, "26856 consumed RAWR Lab result")
++            releaseOwnedTexture(defringed, "26856 consumed RAWR Lab result")
+             if (fcc != 0) releaseOwnedTexture(fcc, "26856 consumed RAWR FCC x2 result")
+             if (!succeeded && neutral != 0) {
+                 releaseOwnedTexture(neutral, "26856 aborted sensor-neutral RGB")
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 80fd8749577a3e73d640d71dae2b4a6b0d8d5215..b11e8c57dfab28b0cd1639f46e15b024879e5b9b 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -1219,9 +1219,9 @@ private void ApplyHdrX() {
+         final String iris26856Extension = iris26856UseHeic ? ".heic" : ".jpg";
+         final String iris26856BasePath = imageFile.toAbsolutePath().toString();
+         final Path iris26856SecondJpegPath = iris26856Both
+-                ? Paths.get(iris26856BasePath + "_B.jpg") : null;
++                ? Paths.get(iris26856BasePath + "_B_RAWR.jpg") : null;
+         imageFile = Paths.get(iris26856BasePath
+-                + (iris26856Both ? "_A" : iris26856BOnly ? "_B" : "")
++                + (iris26856Both ? "_A_26850" : iris26856BOnly ? "_B_RAWR" : "")
+                 + iris26856Extension);
+         if (iris26856BOnly) {
+             // Arm rollback BEFORE a potentially partially successful encoder.
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index a507e28a63e1b38d59cf0c12b23ae4ece4308c9c..9610c210a99c20792cfba709771fbef115b1849d 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -1190,13 +1190,7 @@ object PhotonMotionMgc1271Bridge {
+              * Motion-only: alpha from the post-VGN RGBA16F carrier is temporary internal metadata
+              * holding strict physically-supported pre-VGN chroma magnitude. Night never enters this
+              * owner. The compact one-byte floor map is sqrt-coded to retain precision at low chroma. */
+-            // 26857: B-only native AMaZE output carries OPAQUE alpha, not A's
+-            // post-VGN chroma-floor metadata. Treating alpha=1 as VGN floor
+-            // selected ~100% of the B image (12-second device regression).
+-            // A and A+B still render A through the unchanged VGN floor owner;
+-            // A+B's independent B sidecar is never supplied to this owner.
+-            val iris26728ChromaFloor = if (!parameters.irisNightActive &&
+-                experiment26856 != Iris26856ABSettings.Mode.AMAZE_26855) {
++            val iris26728ChromaFloor = if (!parameters.irisNightActive) {
+                 captureIris26728ProtectedChromaFloor(denoiseBuffer, size.x, size.y)
+             } else {
+                 null
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index f421ab5d3aa167ef76a8439e66b2bccd6ae2484e..397871455c133816c84dadd442e5a5aa0b9c8f60 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -227,30 +227,33 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+             setThisDevice();
+         }
+         
+-        // IRIS_26857_AB_EXISTING_PER_LENS_SETTINGS_OWNER
+-        // Do not enumerate Camera2 logical/physical IDs in a second category.
+-        // The existing HDRX preference title is already "Lens:<active ID>";
+-        // user selection remains stored under the unchanged 26856 physical
+-        // lens key and capture freezes the selected value at shutter press.
++        // IRIS_26642_PHOTO_PREFIX_SETTINGS_OWNER
+         private void setupIris26856Experiments() {
+-            PreferenceGroup lens = findPreference(mContext.getString(R.string.pref_category_hdrx_key));
+-            if (lens == null || mContext == null) return;
+-            String active = PreferenceKeys.getCameraID();
+-            if (active == null || active.trim().isEmpty()) return;
+-            ListPreference mode = new ListPreference(mContext);
+-            mode.setKey("iris_26856_mode_" + active);
+-            mode.setTitle("Reconstruction experiment");
+-            mode.setEntries(new CharSequence[]{"A", "B", "A+B"});
+-            mode.setEntryValues(new CharSequence[]{"A", "B", "AB"});
+-            mode.setPersistent(false);
+-            mode.setValue(Iris26856ABSettings.read(mContext, active, active).id);
+-            mode.setSummaryProvider(ListPreference.SimpleSummaryProvider.getInstance());
+-            mode.setOnPreferenceChangeListener((preference, newValue) -> {
+-                Iris26856ABSettings.Mode next = Iris26856ABSettings.Mode.parse(String.valueOf(newValue));
+-                Iris26856ABSettings.write(mContext, active, next);
+-                return true;
+-            });
+-            lens.addPreference(mode);
++            PreferenceCategory category = findPreference(getString(R.string.pref_category_photo_key));
++            if (category == null || mContext == null) return;
++            PreferenceCategory group = new PreferenceCategory(mContext);
++            group.setKey("iris_26856_experiments_by_camera2_id");
++            group.setTitle("26856 reconstruction experiments · per physical camera");
++            category.addPreference(group);
++            for (String id : Iris26856ABSettings.cameraIds(mContext)) {
++                ListPreference mode = new ListPreference(mContext);
++                mode.setKey("iris_26856_mode_" + id);
++                mode.setTitle(Iris26856ABSettings.lensLabel(mContext, id));
++                mode.setEntries(new CharSequence[]{
++                    "A · original complete 26850 pipeline",
++                    "B · 26855 CFA + AMaZE / defringe / FCC×2",
++                    "A/B · one frozen RAW burst, two JPEGs"});
++                mode.setEntryValues(new CharSequence[]{"A", "B", "AB"});
++                mode.setPersistent(false);
++                mode.setValue(Iris26856ABSettings.read(mContext, id, id).id);
++                mode.setSummaryProvider(ListPreference.SimpleSummaryProvider.getInstance());
++                mode.setOnPreferenceChangeListener((preference, newValue) -> {
++                    Iris26856ABSettings.Mode next = Iris26856ABSettings.Mode.parse(String.valueOf(newValue));
++                    Iris26856ABSettings.write(mContext, id, next);
++                    return true;
++                });
++                group.addPreference(mode);
++            }
+         }
+ 
+         private void setupPhotoPrefixPreference() {
+diff --git b/app/version.properties a/app/version.properties
+index 4217b1ba5435172ff1f421a5c935d1b024068d45..01bfa9996002c243b6038235bf1aaf426aac465d 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726857
+-VERSION_BUILD=26857
++VERSION_NAME=0.9726856
++VERSION_BUILD=26856
