@@ -1,0 +1,1382 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
+index ca42a61a40722f42bc8d3d1c7b2623630521fd9a..8268ee6d3d9d9a84fba164b5314c9a193d3a63e9 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
+@@ -8,52 +8,128 @@ package com.hinnka.mycamera.processor
+  * not from temporary WB camera RGB, gamma, AMaZE or an SDR RGB heuristic.
+  */
+ internal object GlesIris26858BNoiseHighlight {
+-    /* IRIS_26861_B_MOTION_ONLY_WHEN_UNMEASURED.
+-     * This is not a noise-profile substitute and does not perform denoising:
+-     * estimate exposure-normalized alignment agreement in B's own RAW guide,
+-     * bound every companion's share and reject motion borders. */
+-    val bMotionOnlyWeight26861 = """
++    val bCfaNoise = """
+         #version 300 es
+         precision highp float;
+-        uniform sampler2D uReferenceGuide;
+-        uniform sampler2D uCurrentGuide;
+-        uniform sampler2D uFlow;
+-        uniform ivec2 uCoverageSize;
+-        uniform vec4 uFlowScaleOffset;
+-        layout(location=0) out float oConfidence;
+-        void main(){
+-            vec2 uv=gl_FragCoord.xy/vec2(uCoverageSize);
+-            vec4 f=texture(uFlow,uv*uFlowScaleOffset.xy+uFlowScaleOffset.zw);
+-            vec2 target=uv+f.xy;
+-            float inBounds=float(all(greaterThan(target,vec2(0.01))) &&
+-                all(lessThan(target,vec2(0.99))));
+-            vec3 a=abs(texture(uReferenceGuide,uv).rgb);
+-            vec3 b=abs(texture(uCurrentGuide,clamp(target,vec2(0.0),vec2(1.0))).rgb);
+-            float ref=dot(a,vec3(0.3333333333));
+-            float cur=dot(b,vec3(0.3333333333));
+-            float residual=abs(ref-cur)/max(max(ref,cur),0.06);
+-            float photometric=1.0-smoothstep(0.065,0.19,residual);
+-            float flowGuard=1.0-smoothstep(0.028,0.11,max(f.z,0.0));
+-            oConfidence=0.20*photometric*flowGuard*inBounds;
+-        }
+-    """.trimIndent()
+-
+-    /* IRIS_26861_B_WEIGHTED_CFA_IDENTITY. No spatial denoising is allowed
+-     * between the fully admitted temporal sensor CFA and AMaZE. */
+-    val bWeightedCfaIdentity26861 = """
+-        #version 300 es
+-        precision highp float;
+-        uniform sampler2D uWeightedPhases;
++        precision highp int;
++        uniform sampler2D uPhaseSignal;
++        uniform sampler2D uSupport;
++        uniform sampler2D uValidity;
++        uniform sampler2D uMoments;
+         uniform ivec2 uSize;
+-        layout(location=0) out vec4 oWeighted;
+-        void main(){
+-            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
+-            oWeighted=texelFetch(uWeightedPhases,p,0);
++        uniform vec4 uShot;
++        uniform vec4 uRead;
++        uniform vec4 uBaseShot26860;
++        uniform vec4 uBaseRead26860;
++        uniform int uBayerPattern;
++        layout(location=0) out vec4 oCfaWeighted;
++        ivec2 bound(ivec2 p) { return clamp(p,ivec2(0),uSize-ivec2(1)); }
++        float weight(ivec2 p) { return texelFetch(uSupport,bound(p),0).x; }
++        vec4 mean(ivec2 p) {
++            p=bound(p); float w=weight(p);
++            return w>1.0e-7 ? texelFetch(uPhaseSignal,p,0)/w : vec4(0.0);
++        }
++        float neff(ivec2 p) {
++            p=bound(p);
++            float w=weight(p);
++            float ss=texelFetch(uMoments,p,0).x;
++            return ss>1.0e-7 ? clamp(w*w/ss,1.0,32.0) : 1.0;
++        }
++        vec4 sigmaAt(ivec2 p,vec4 v){
++            p=bound(p);
++            // Actual B per-NORMAL Camera2 variance, weighted by the exact
++            // 26852 shared admission: sum(w_i^2 * var_i)/(sum w_i)^2.
++            float w=weight(p);
++            float inheritedMoment=max(texelFetch(uMoments,p,0).y,0.0)/max(w*w,1.0e-10);
++            vec4 phaseVar=max(uShot*max(v,vec4(0.0))+uRead,vec4(1.0e-9));
++            vec4 baseVar=max(uBaseShot26860*max(v,vec4(0.0))+uBaseRead26860,vec4(1.0e-9));
++            // Shared temporal CFA is byte-identical to successful 26859, including
++            // A's impulse guard. Only B reinterprets the Camera2 noise moment.
++            // N_eff is already in inheritedMoment; neither N_eff nor LSC repeats.
++            float baseMean=max(dot(baseVar,vec4(0.25)),1.0e-9);
++            return sqrt(max(inheritedMoment*phaseVar/baseMean,vec4(1.0e-9)));
++        }
++        void main() {
++            ivec2 p=bound(ivec2(gl_FragCoord.xy));
++            float w=weight(p);
++            if(w<1.0e-7){oCfaWeighted=vec4(0.0);return;}
++            vec4 center=mean(p);
++            float n=neff(p);
++            vec4 noise=sigmaAt(p,center);
++            vec4 admitted=clamp(texelFetch(uValidity,p,0)/max(w,1.0e-7),0.0,1.0);
++            // Physical site order TL/TR/BL/BR, never assume RGGB globally.
++            // Canonical phase mapping must exactly match the pinned 26856 CFA pack.
++            int ri = (uBayerPattern==0 ? 0 : uBayerPattern==1 ? 1 : uBayerPattern==2 ? 2 : 3);
++            int bi = (uBayerPattern==0 ? 3 : uBayerPattern==1 ? 2 : uBayerPattern==2 ? 1 : 0);
++            int g1 = (uBayerPattern==0 ? 1 : uBayerPattern==1 ? 0 : uBayerPattern==2 ? 3 : 2);
++            int g2 = (uBayerPattern==0 ? 2 : uBayerPattern==1 ? 3 : uBayerPattern==2 ? 0 : 1);
++            float green=0.5*(center[g1]+center[g2]);
++            float greenNoise=0.5*(noise[g1]+noise[g2]);
++            float highFreq=0.0;
++            float lumaEdge=0.0;
++            vec2 sum=2.0*vec2(center[ri],center[bi]);
++            vec2 sumW=vec2(2.0);
++            float chromaR=center[ri]-green;
++            float chromaB=center[bi]-green;
++            float chromaNoiseR=sqrt(noise[ri]*noise[ri]+greenNoise*greenNoise);
++            float chromaNoiseB=sqrt(noise[bi]*noise[bi]+greenNoise*greenNoise);
++            float coherentChroma=0.0;
++            // Genuine local three-bin N_eff histogram from the temporally
++            // admitted aligned NORMAL burst, never the old 1/mergeFactor.
++            vec3 supportHistogram=vec3(0.0);
++            for(int dy=-1;dy<=1;++dy){
++                for(int dx=-1;dx<=1;++dx){
++                    if(dx==0&&dy==0)continue;
++                    ivec2 q=bound(p+ivec2(dx,dy));
++                    float nq=neff(q);
++                    supportHistogram+=vec3(float(nq<3.0),
++                        float(nq>=3.0&&nq<8.0),float(nq>=8.0));
++                    vec4 v=mean(q);
++                    vec4 vn=sigmaAt(q,v);
++                    float g=0.5*(v[g1]+v[g2]);
++                    highFreq=max(highFreq,abs(g-green));
++                    float sigmaG=sqrt(greenNoise*greenNoise+
++                        0.25*(vn[g1]+vn[g2])*(vn[g1]+vn[g2]));
++                    float material=1.0-smoothstep(2.0,4.2,abs(g-green)/max(sigmaG,0.001));
++                    vec2 dd=abs(vec2(v[ri]-g,v[bi]-g)-vec2(chromaR,chromaB));
++                    vec2 sn=vec2(chromaNoiseR,chromaNoiseB)+
++                        vec2(sqrt(vn[ri]*vn[ri]+sigmaG*sigmaG),sqrt(vn[bi]*vn[bi]+sigmaG*sigmaG));
++                    coherentChroma=max(coherentChroma,max((dd.x-3.5*sn.x)/max(sn.x,0.001),
++                        (dd.y-3.5*sn.y)/max(sn.y,0.001)));
++                    vec2 chromaAffinity=1.0-smoothstep(vec2(1.2),vec2(3.4),dd/max(sn,vec2(0.001)));
++                    float spatial=(abs(dx)+abs(dy)==2)?0.75:1.0;
++                    vec2 a=chromaAffinity*(material*spatial);
++                    sum+=a*vec2(v[ri],v[bi]);
++                    sumW+=a;
++                    lumaEdge=max(lumaEdge,max(abs(v[g1]-center[g1]),abs(v[g2]-center[g2])));
++                }
++            }
++            float flatEvidence=1.0-smoothstep(2.0,4.0,
++                highFreq/max(greenNoise*1.414,0.001));
++            float structure=1.0-smoothstep(2.3,4.5,
++                lumaEdge/max(greenNoise*1.414,0.001));
++            float colorStructure=1.0-smoothstep(0.0,2.0,coherentChroma);
++            float shadow=1.0-smoothstep(0.12,0.55,green);
++            float need=smoothstep(0.014,0.10,greenNoise/max(green,0.018));
++            float supportNeed=1.0-smoothstep(3.0,9.0,n);
++            // Local support histogram prevents aggressive denoise where most
++            // adjacent sites have strong genuine burst support.
++            float supportDistributionGuard=1.0-0.6*smoothstep(3.0,7.0,
++                supportHistogram.z);
++            float phaseValid=min(min(admitted.r,admitted.g),min(admitted.b,admitted.a));
++            float validity=smoothstep(0.55,0.95,phaseValid);
++            // Independent B pre-AMaZE chroma denoising. Preserve BOTH green phases
++            // and therefore all luminance/high-frequency structure exactly.
++            float alpha=clamp(0.86*need*(0.5+0.5*shadow)*
++                (0.4+0.6*supportNeed)*supportDistributionGuard*
++                flatEvidence*structure*colorStructure*validity,0.0,0.86);
++            vec4 outC=center;
++            outC[ri]=mix(center[ri],sum.x/max(sumW.x,1.0e-6),alpha);
++            outC[bi]=mix(center[bi],sum.y/max(sumW.y,1.0e-6),alpha);
++            oCfaWeighted=outC*w;
+         }
+     """.trimIndent()
+ 
+-
+-
+     /** IRIS_26859_B_EXACT_FRACTIONAL_CFA_CLIP_FOOTPRINT
+      * The clip carrier follows the 26858 normalized/guarded RAW phase samples:
+      * exact lattice hit => one site, fractional flow => all four same-phase
+@@ -230,7 +306,104 @@ internal object GlesIris26858BNoiseHighlight {
+ 
+     /** Camera RGB remains SENSOR-NEUTRAL here, no WB or CCM. RGB luma/detail
+      * stays bit-identical by preserving green and the green-scaled chroma sum. */
+-
++    val bResidualChroma = """
++        #version 300 es
++        precision highp float;
++        uniform sampler2D uRgb;
++        uniform sampler2D uSupport;
++        uniform sampler2D uMoments;
++        uniform sampler2D uClip;
++        uniform sampler2D uLensShading;
++        uniform int uUseLensShading;
++        uniform ivec2 uNativeSize;
++        uniform ivec2 uSize;
++        uniform ivec2 uClipCellSize;
++        uniform ivec2 uOrigin;
++        uniform int uExpandedScale;
++        uniform vec4 uNoiseShot;
++        uniform vec4 uNoiseRead;
++        uniform vec4 uBaseShot26860;
++        uniform vec4 uBaseRead26860;
++        uniform int uBayerPattern;
++        layout(location=0) out vec4 oRgb;
++        void main(){
++            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
++            vec4 v=texelFetch(uRgb,p,0);
++            ivec2 c=clamp((uOrigin+p)/(2*uExpandedScale),
++                ivec2(0),uClipCellSize-ivec2(1));
++            vec4 clip=texelFetch(uClip,c,0);
++            float sensorClipped=max(max(clip.r,clip.g),max(clip.b,clip.a));
++            float w=texelFetch(uSupport,c,0).x;
++            float ss=texelFetch(uMoments,c,0).x;
++            float n=ss>1.0e-7?clamp(w*w/ss,1.0,32.0):1.0;
++            float green=max(v.g,0.0);
++            float noise=sqrt(max(texelFetch(uMoments,c,0).y,1.0e-9)) /
++                max(w,1.0e-6);
++            // 26859: per-physical-channel gain squares variance exactly once
++            // AFTER the B-only sensor-linear lens-map pass. No scalar denoise
++            // coefficient is increased; pre-LSC CFA denoise is unchanged.
++            vec3 gainRgb=vec3(1.0);
++            if(uUseLensShading!=0){
++                vec2 uv=(vec2(uOrigin+p)+vec2(0.5))/
++                    (vec2(uNativeSize)*float(uExpandedScale));
++                vec4 gains=texture(uLensShading,uv);
++                gainRgb=vec3(gains.r,0.5*(gains.g+gains.b),gains.a);
++            }
++            // IRIS_26860_B_BURST_PROFILE_ACTUAL_CONSUMER:
++            // uMoments.y contains sum(w_i^2 * Camera2 per-frame variance)/sum(w)^2
++            // in SENSOR linear units. Recalibrate its per-phase ratios to B's
++            // independently measured RAW-burst shot/read model,
++            // then multiply each post-LSC channel variance by its gain squared
++            // EXACTLY once. Do not multiply by N_eff again or add Camera2.
++            int ri = (uBayerPattern==0 ? 0 : uBayerPattern==1 ? 1 : uBayerPattern==2 ? 2 : 3);
++            int bi = (uBayerPattern==0 ? 3 : uBayerPattern==1 ? 2 : uBayerPattern==2 ? 1 : 0);
++            int g1 = (uBayerPattern==0 ? 1 : uBayerPattern==1 ? 0 : uBayerPattern==2 ? 3 : 2);
++            int g2 = (uBayerPattern==0 ? 2 : uBayerPattern==1 ? 3 : uBayerPattern==2 ? 0 : 1);
++            vec3 sensorRgb=max(v.rgb/max(gainRgb,vec3(1.0e-5)),vec3(0.0));
++            vec4 sensorPhase=vec4(0.0);
++            sensorPhase[ri]=sensorRgb.r;
++            sensorPhase[bi]=sensorRgb.b;
++            sensorPhase[g1]=sensorRgb.g;
++            sensorPhase[g2]=sensorRgb.g;
++            vec4 phaseVar=max(uNoiseShot*sensorPhase+uNoiseRead,vec4(1.0e-9));
++            vec4 basePhase=max(uBaseShot26860*sensorPhase+uBaseRead26860,vec4(1.0e-9));
++            float baseMean=max(dot(basePhase,vec4(0.25)),1.0e-9);
++            vec3 sensorRgbVar=vec3(phaseVar[ri],0.5*(phaseVar[g1]+phaseVar[g2]),phaseVar[bi]);
++            // Inherited GPU moment is Camera2-derived. Replace its variance
++            // calibration with the measured B phase model in sensor-linear
++            // space, then apply physical LSC to standard deviation ONCE.
++            vec3 phaseSigma=sqrt(max((noise*noise)*sensorRgbVar/baseMean,vec3(1.0e-9)))*gainRgb;
++            vec2 chromaSigma=sqrt(max(vec2(
++                0.5*(phaseSigma.r*phaseSigma.r+phaseSigma.g*phaseSigma.g),
++                0.5*(phaseSigma.b*phaseSigma.b+phaseSigma.g*phaseSigma.g)),
++                vec2(1.0e-9)));
++            float greenSigma=phaseSigma.g;
++            float noiseForNeed=max(chromaSigma.x,chromaSigma.y);
++            vec2 acc=vec2(0.0);float aw=0.0;
++            float structure=0.0;
++            for(int yy=-1;yy<=1;++yy){
++                for(int xx=-1;xx<=1;++xx){
++                    if(xx==0&&yy==0)continue;
++                    ivec2 q=clamp(p+ivec2(xx,yy),ivec2(0),uSize-ivec2(1));
++                    vec3 z=texelFetch(uRgb,q,0).rgb;
++                    float gd=abs(z.g-v.g);
++                    structure=max(structure,gd);
++                    vec2 dc=vec2(z.r-z.g,z.b-z.g)-vec2(v.r-v.g,v.b-v.g);
++                    float affinity=(1.0-smoothstep(1.2,3.5,length(dc/max(2.0*chromaSigma,vec2(0.002)))))*
++                        (1.0-smoothstep(1.2,3.0,gd/max(2.0*greenSigma,0.002)));
++                    acc+=affinity*vec2(z.r-z.g,z.b-z.g);aw+=affinity;
++                }
++            }
++            float safe=(1.0-smoothstep(1.8,4.0,structure/max(greenSigma,0.002)))*
++                (1.0-smoothstep(0.10,0.50,green))*(1.0-smoothstep(0.0,0.30,sensorClipped));
++            float need=smoothstep(0.025,0.13,noiseForNeed/max(green,0.02));
++            float weak=1.0-smoothstep(3.0,10.0,n);
++            float a=clamp(0.30*need*(0.4+0.6*weak)*safe,0.0,0.30);
++            vec2 dc=vec2(v.r-v.g,v.b-v.g);
++            vec2 cleaned=mix(dc,acc/max(aw,0.001),a);
++            oRgb=vec4(v.g+cleaned.x,v.g,v.g+cleaned.y,v.a);
++        }
++    """.trimIndent()
+ 
+     /** IRIS_26859_B_SENSOR_PROVEN_SMOOTH_WHITE
+      * Temporary post-WB camera-linear RGB. Sensor-proven clipping only;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt
+index 0564bc0eeedf8fe688c1d5fc30ed59e3d35816a0..7bc8d43eed7e8d606f7e4e74d81aa77306a07d49 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26860BBurstNoise.kt
+@@ -1,233 +1,200 @@
+ package com.hinnka.mycamera.processor
+ 
+ import android.graphics.ImageFormat
++import java.nio.ByteBuffer
+ import java.nio.ByteOrder
+ import kotlin.math.abs
+ import kotlin.math.max
+ import kotlin.math.min
+-import kotlin.math.sqrt
+ 
+ /**
+- * IRIS_26861_B_ONLY_EMPIRICAL_CFA_NOISE.
+- * This owner never reads Camera2 SENSOR_NOISE_PROFILE or another noise model.
+- * Four Bayer phases are fitted independently from consecutive NORMAL RAW-pair
+- * differences after phase-preserving local integer registration. The search and
+- * variance samples are disjoint to avoid fitting down the noise via min-SSD.
+- * Observations in badly aligned, moving or clipped blocks are rejected; only
+- * low-variance static quantiles per radiance bin enter the fit. Fractionally
+- * shifted texture increases residuals and is rejected instead of pretending
+- * correlated interpolated pixels are independent sensor observations.
++ * IRIS_26860_B_SENSOR_BURST_MEASURED_NOISE_OWNER.
++ * Per-physical-phase sensor-linear temporal measurement, independent of Camera2's
++ * shot/read coefficients. Never used by Experiment A, shared alignment/rejection,
++ * DNG, LONG, Sabre or exposure/WB/LSC. Only reliable equal-exposure NORMAL bursts
++ * can override B's denoiser noise coefficients. No RAW frame is discarded.
+  */
+ internal object GlesIris26860BBurstNoise {
+     internal data class Profile(
+         val shot: FloatArray, val read: FloatArray, val measuredPhases: Int,
+         val acceptedSites: IntArray, val mode: String,
+-        val signalBins: IntArray, val samplePairs: Int,
+     ) {
+-        init { require(shot.size == 4 && read.size == 4 && acceptedSites.size == 4 && signalBins.size == 4) }
+-        val fullyMeasured: Boolean get() = measuredPhases == 4
+-    }
+-    private const val STRIP_HEIGHT = 48
+-    private const val BANDS = 6
+-    private const val PATCH_STEP = 64
+-    private const val N_BINS = 12
+-    private const val MIN_BLOCKS_PER_BIN = 10
+-    private const val PAIR_MAX = 6
+-    private val shifts = intArrayOf(-4, -2, 0, 2, 4)
+-    private val pilot = intArrayOf(6, 14, 22, 30)
+-    private val evidence = intArrayOf(8, 16, 24, 32)
+-
+-    /** Exposed to regression fixtures independent of the Android GL runtime. */
+-    internal data class BlockEvidence(val phase: Int, val level: Double, val variance: Double)
+-
+-    internal fun fitBlocks(blocks: List<BlockEvidence>, samplePairs: Int): Profile {
+-        val shot = FloatArray(4)
+-        val read = FloatArray(4)
+-        val count = IntArray(4)
+-        val occupied = IntArray(4)
+-        var supported = 0
+-        var fullFit = 0
+-        for (phase in 0..3) {
+-            val bins = Array(N_BINS) { ArrayList<Double>() }
+-            val levels = Array(N_BINS) { ArrayList<Double>() }
+-            for (b in blocks) {
+-                if (b.phase != phase || !b.level.isFinite() || !b.variance.isFinite() ||
+-                    b.variance <= 0.0 || b.level < -0.005 || b.level >= 0.965) continue
+-                val k = (max(0.0, b.level) * N_BINS).toInt().coerceIn(0, N_BINS - 1)
+-                bins[k].add(b.variance)
+-                levels[k].add(b.level)
+-            }
+-            val points = ArrayList<Pair<Double, Double>>()
+-            for (bin in 0 until N_BINS) {
+-                val vals = bins[bin]
+-                count[phase] += vals.size
+-                if (vals.size < MIN_BLOCKS_PER_BIN) continue
+-                vals.sort()
+-                // Lower-tail rejects motion/edge variance; compensate the low
+-                // chi-square quantile's finite-block downward bias conservatively.
+-                val index = (0.25 * (vals.size - 1)).toInt()
+-                val variance = vals[index] / 0.78
+-                if (!variance.isFinite() || variance <= 0.0) continue
+-                val l = levels[bin].sorted()[levels[bin].size / 2]
+-                points.add(Pair(max(l, 0.0), variance))
+-            }
+-            occupied[phase] = points.size
+-            if (count[phase] < 100 || points.isEmpty()) continue
+-            var slope = Double.NaN
+-            var intercept = Double.NaN
+-            if (points.size >= 3 && points.last().first - points.first().first >= 0.10) {
+-                val weights = points.map { 1.0 / max(1.0e-16, it.second * it.second) }
+-                val sum = weights.sum()
+-                val mx = points.indices.sumOf { points[it].first * weights[it] } / sum
+-                val my = points.indices.sumOf { points[it].second * weights[it] } / sum
+-                val denom = points.indices.sumOf { weights[it] * (points[it].first-mx) * (points[it].first-mx) }
+-                if (denom > 1.0e-15) {
+-                    slope = points.indices.sumOf { weights[it] * (points[it].first-mx) * (points[it].second-my) } / denom
+-                    intercept = my - slope * mx
+-                }
+-                if (!slope.isFinite() || !intercept.isFinite() || slope < 0.0 || intercept < 0.0) {
+-                    slope = Double.NaN
+-                    intercept = Double.NaN
+-                }
+-            }
+-            if (slope.isFinite() && intercept.isFinite() && slope < 0.15 && intercept < 0.025) {
+-                shot[phase] = slope.toFloat()
+-                read[phase] = max(intercept, 1.0e-10).toFloat()
+-                fullFit++
+-                supported++
+-            } else {
+-                // Not a pretend shot/read fit: a measured constant-variance
+-                // profile, marked as such and only used as a conservative proxy
+-                // in the supported brightness range. No Camera2 shape enters.
+-                val v = points.map { it.second }.sorted()
+-                read[phase] = v[v.size / 2].coerceIn(1.0e-10, 0.025).toFloat()
+-                shot[phase] = 0f
+-                supported++
+-            }
+-        }
+-        val mode = when {
+-            supported == 0 -> "BURST_UNSUPPORTED_MOTION_ONLY"
+-            supported == 4 && fullFit == 4 -> "BURST_ALL_PHASE_SHOT_READ"
+-            supported == 4 -> "BURST_ALL_PHASE_MEASURED_BINS"
+-            else -> "BURST_PARTIAL_MEASURED_BINS"
+-        }
+-        return Profile(shot, read, supported, count, mode, occupied, samplePairs)
++        init { require(shot.size == 4 && read.size == 4 && acceptedSites.size == 4) }
+     }
++    private const val BANDS = 4
++    private const val STRIP = 32
++    private const val STEP_X = 24
++    private const val STEP_Y = 4
++    private const val BINS = 12
+ 
++    /**
++     * Input coefficients are **physical TL/TR/BL/BR**, black and range are in RAW16
++     * sensor units. Caller owns and keeps all NORMAL SafeImages alive through fitting.
++     * Camera2 is a non-measured safety fallback, not the input used for fitted slope.
++     */
+     fun estimate(
+         normals: List<RawStackFrame>, width: Int, height: Int,
+         phaseBlackByFrame: List<FloatArray>, phaseRangeByFrame: List<FloatArray>,
++        cameraShot: FloatArray, cameraRead: FloatArray,
+     ): Profile {
+-        fun unsupported(why: String) = Profile(FloatArray(4), FloatArray(4), 0,
+-            IntArray(4), "BURST_UNSUPPORTED_${why}", IntArray(4), 0)
+-        if (normals.size < 6 || (width and 1) != 0 || (height and 1) != 0 ||
+-            width < 192 || height < 384 ||
+-            phaseBlackByFrame.size != normals.size || phaseRangeByFrame.size != normals.size ||
+-            phaseBlackByFrame.any { it.size != 4 || it.any { v -> !v.isFinite() } } ||
+-            phaseRangeByFrame.any { it.size != 4 || it.any { v -> !v.isFinite() || v <= 0f } })
+-            return unsupported("GEOMETRY")
++        require(phaseBlackByFrame.size == normals.size && phaseRangeByFrame.size == normals.size &&
++            phaseBlackByFrame.all { it.size == 4 } && phaseRangeByFrame.all { it.size == 4 } &&
++            cameraShot.size == 4 && cameraRead.size == 4)
++        fun fallback(reason: String) = Profile(cameraShot.copyOf(),cameraRead.copyOf(),0,
++            IntArray(4),"CAMERA2_FALLBACK_$reason")
++        if (normals.size < 6 || width < 192 || height < 256 || (width and 1) != 0 ||
++            (height and 1) != 0 || phaseRangeByFrame.any { ranges ->
++                ranges.any { !it.isFinite() || it <= 0f }
++            }) return fallback("GEOMETRY")
+         val first = normals.first()
+-        if (normals.any { it.role != RawBurstFrameRole.NORMAL ||
+-            it.image.format != ImageFormat.RAW_SENSOR || it.image.width != width ||
+-            it.image.height != height || it.image.pixelStrideBytes != 2 ||
+-            it.image.rowStrideBytes < width*2 || it.physicalCameraId != first.physicalCameraId ||
+-            it.sensitivityIso != first.sensitivityIso || it.exposureTimeNs <= 0L ||
+-            abs(it.exposureTimeNs.toDouble()/first.exposureTimeNs.toDouble()-1.0)>0.012 })
+-            return unsupported("MIXED_FRAME")
+         if (normals.any { it.rowFlickerHarmonic > 0 && it.rowFlickerStrength > 0.12f })
+-            return unsupported("ROW_FLICKER")
+-        val samples=ArrayList<BlockEvidence>()
+-        var acceptedPairs=0
+-        val pairStep=max(1,(normals.size - 1)/PAIR_MAX)
+-        val pairs=(0 until normals.size-1 step pairStep).take(PAIR_MAX)
++            return fallback("ACTIVE_FLICKER")
++        if (normals.any { f -> f.role != RawBurstFrameRole.NORMAL ||
++                f.image.format != ImageFormat.RAW_SENSOR || f.image.width != width || f.image.height != height ||
++                f.image.pixelStrideBytes != 2 || f.image.rowStrideBytes < width*2 ||
++                f.physicalCameraId != first.physicalCameraId ||
++                f.sensitivityIso != first.sensitivityIso ||
++                f.exposureTimeNs <= 0L || first.exposureTimeNs <= 0L ||
++                abs(f.exposureTimeNs.toDouble()/first.exposureTimeNs.toDouble()-1.0)>0.012 }) {
++            return fallback("MIXED_SOURCE")
++        }
++        // Fixed integer CFA sensor coordinates. Avoid resampled/correlated pixels
++        // and spatial patch variance (which contains real texture/fixed-pattern noise).
++        val tops=IntArray(BANDS) { i ->
++            ((height*(2*i+1)/(2*BANDS)-STRIP/2).coerceIn(4,height-STRIP-4)) and -2
++        }
++        val xs=(8 until width-8 step STEP_X).toList()
++        val sitesPerBand=xs.size*((STRIP-4)/STEP_Y)*4
++        val total=sitesPerBand*BANDS
++        val samples=FloatArray(total*normals.size) { Float.NaN }
++        val flat=BooleanArray(total) { true }
+         try {
+-            for (i in pairs) {
+-                val f0=normals[i]
+-                val f1=normals[i+1]
+-                var pairEvidence=0
++            for ((fi, frame) in normals.withIndex()) {
++                val image=frame.image
++                val phaseBlack=phaseBlackByFrame[fi]
++                val phaseRange=phaseRangeByFrame[fi]
++                val mem=if (!image.isFileBacked) image.planes.singleOrNull()?.buffer
++                    ?.duplicate()?.order(ByteOrder.nativeOrder()) else null
++                if (!image.isFileBacked && mem == null) return fallback("MISSING_PLANE")
++                if (mem != null && mem.limit() < image.rowStrideBytes*height) return fallback("PLANE_SIZE")
+                 for (band in 0 until BANDS) {
+-                    val top=(((height-STRIP_HEIGHT)*(2*band+1)/(2*BANDS)) and -2)
+-                    val ref=readStrip(f0,width,top,STRIP_HEIGHT,phaseBlackByFrame[i],phaseRangeByFrame[i])
+-                    val nxt=readStrip(f1,width,top,STRIP_HEIGHT,phaseBlackByFrame[i+1],phaseRangeByFrame[i+1])
+-                    fun at(data:FloatArray,x:Int,y:Int,phase:Int):Double =
+-                        data[(y+(phase shr 1))*width+x+(phase and 1)].toDouble()
+-                    for (bx in 16 until width-50 step PATCH_STEP) {
+-                        // Candidate translation is common to all CFA phases;
+-                        // preserve 2x2 Bayer phase and test separate pixel sites.
+-                        var best=Double.POSITIVE_INFINITY
+-                        var bestDx=0;var bestDy=0
+-                        for (dy in shifts) for (dx in shifts) {
+-                            var loss=0.0
+-                            for (y in pilot) for (x in pilot) {
+-                                val r=bx+x
++                    val region=if (image.isFileBacked)
++                        image.readFileRegion(0,tops[band],width,STRIP) else null
++                    try {
++                        val bytes=(region?.buffer ?: mem!!).duplicate().order(ByteOrder.nativeOrder())
++                        val rowStride=region?.rowStride ?: image.rowStrideBytes
++                        val yBase=if (region!=null) 0 else tops[band]
++                        fun at(x:Int, y:Int):Int {
++                            val ofs=(yBase+y)*rowStride+x*2
++                            return bytes.getShort(ofs).toInt() and 65535
++                        }
++                        for (yi in 0 until (STRIP-4)/STEP_Y) {
++                            val y=2+yi*STEP_Y
++                            for ((xi,x) in xs.withIndex()) {
+                                 for (phase in 0..3) {
+-                                    val a=at(ref,r,y,phase)
+-                                    val b=at(nxt,r+dx,y+dy,phase)
+-                                    val e=abs(a-b)
+-                                    loss += min(e,0.2)
++                                    val px=(x and -2)+(phase and 1)
++                                    val py=y+(phase shr 1)
++                                    val index=band*sitesPerBand+((yi*xs.size+xi)*4+phase)
++                                    val raw=at(px,py)
++                                    val v=((raw.toFloat()-phaseBlack[phase])/phaseRange[phase])
++                                    samples[fi*total+index]=v
++                                    if (fi==0) {
++                                        val neighborRaw=intArrayOf(at(px-2,py),at(px+2,py),
++                                            at(px,py-2),at(px,py+2))
++                                        // Flatness from *same phase* witnesses only; does not
++                                        // interpret hair/denim/fiber as random sensor noise.
++                                        val spread=neighborRaw.max()-neighborRaw.min()
++                                        val maxSpread=max(0.016f,0.045f*v.coerceAtLeast(0f))*phaseRange[phase]
++                                        flat[index]=v in 0.008f..0.965f && spread<=maxSpread
++                                    }
+                                 }
+                             }
+-                            if (loss < best) { best=loss; bestDx=dx; bestDy=dy }
+-                        }
+-                        val averageMismatch=best/(pilot.size*pilot.size*4.0)
+-                        // Reject noninteger residual motion/scene changes rather
+-                        // than blur images to force a false sensor-noise fit.
+-                        if (averageMismatch>0.014) continue
+-                        for (phase in 0..3) {
+-                            val differences=DoubleArray(evidence.size*evidence.size)
+-                            var k=0;var levelSum=0.0;var clipped=false
+-                            for (y in evidence) for (x in evidence) {
+-                                val a=at(ref,bx+x,y,phase)
+-                                val b=at(nxt,bx+x+bestDx,y+bestDy,phase)
+-                                if (a > 0.965 || b > 0.965 || !a.isFinite() || !b.isFinite()) clipped=true
+-                                differences[k++]=a-b
+-                                levelSum+=0.5*(a+b)
+-                            }
+-                            if (clipped) continue
+-                            val mean=differences.average()
+-                            val variance=0.5*differences.sumOf { (it-mean)*(it-mean) } /(differences.size-1)
+-                            if (!variance.isFinite() || variance <= 0.0) continue
+-                            // Motion-induced RAW structure is spatially correlated.
+-                            // White sensor noise is not; compare disjoint evidence
+-                            // residuals, never the pilot sites used for alignment.
+-                            var horizontal=0.0; var vertical=0.0
+-                            for (yy in evidence.indices) for (xx in evidence.indices) {
+-                                val v=differences[yy*evidence.size+xx]-mean
+-                                if (xx+1<evidence.size) horizontal+=v*(differences[yy*evidence.size+xx+1]-mean)
+-                                if (yy+1<evidence.size) vertical+=v*(differences[(yy+1)*evidence.size+xx]-mean)
+-                            }
+-                            val norm=(2.0*variance)*(evidence.size*(evidence.size-1)).toDouble()
+-                            if (abs(horizontal/norm)>0.35 || abs(vertical/norm)>0.35) continue
+-                            val signal=levelSum/differences.size
+-                            samples.add(BlockEvidence(phase, signal, variance))
+-                            pairEvidence++
+                         }
+-                    }
++                    } finally { region?.close() }
+                 }
+-                if (pairEvidence >= 64) acceptedPairs++
+             }
+-        } catch (_: Exception) { return unsupported("RAW_UNAVAILABLE") }
+-        if (acceptedPairs<2) return unsupported("MOTION_INSUFFICIENT")
+-        return fitBlocks(samples,acceptedPairs)
+-    }
+-
+-    private fun readStrip(
+-        frame: RawStackFrame, width:Int, top:Int, rows:Int, black:FloatArray, range:FloatArray,
+-    ):FloatArray {
+-        val image=frame.image
+-        val region=if (image.isFileBacked) image.readFileRegion(0,top,width,rows) else null
+-        try {
+-            val memory=(region?.buffer ?: image.planes.single().buffer).duplicate().order(ByteOrder.nativeOrder())
+-            val stride=region?.rowStride ?: image.rowStrideBytes
+-            val origin=if(region==null)top else 0
+-            require(memory.limit() >= (origin+rows-1)*stride+width*2)
+-            return FloatArray(width*rows) { index ->
+-                val y=index/width
+-                val x=index%width
+-                val phase=((top+y and 1) shl 1) + (x and 1)
+-                val sensor=memory.getShort((origin+y)*stride+x*2).toInt() and 65535
+-                (sensor.toFloat()-black[phase])/range[phase]
++        } catch (_: Exception) { return fallback("UNAVAILABLE_RAW") }
++        // Sites within the same bin represent independent sensor locations.
++        // Temporal per-site variance removes fixed-pattern offsets and texture.
++        val bins=Array(4){Array(BINS){ArrayList<Double>()}}
++        val sums=Array(4){DoubleArray(BINS)}
++        for (site in 0 until total) {
++            if (!flat[site]) continue
++            val phase=site and 3
++            val values=ArrayList<Double>(normals.size)
++            for (fi in normals.indices) {
++                val value=samples[fi*total+site]
++                if (value.isFinite() && value in 0.0f..0.970f) values+=value.toDouble()
+             }
+-        } finally { region?.close() }
++            if (values.size < max(6,(normals.size*4)/5)) continue
++            values.sort()
++            val mid=values[values.size/2]
++            val absdev=values.map{abs(it-mid)}.sorted()
++            val mad=absdev[absdev.size/2]
++            val cap=max(0.015,6.0*mad*1.4826)
++            val kept=values.filter{abs(it-mid)<=cap}
++            if (kept.size < max(6,(normals.size*4)/5)) continue
++            val mean=kept.average()
++            if (mean !in 0.008..0.965) continue
++            val var0=kept.sumOf{(it-mean)*(it-mean)}/(kept.size-1)
++            if (!var0.isFinite() || var0<=0.0) continue
++            val bin=min(BINS-1,(mean*BINS).toInt())
++            bins[phase][bin]+=var0
++            sums[phase][bin]+=mean
++        }
++        val shot=cameraShot.copyOf(); val read=cameraRead.copyOf()
++        val accepted=IntArray(4)
++        var measured=0
++        var fitted=0
++        for (phase in 0..3) {
++            val data=ArrayList<Triple<Double,Double,Double>>()
++            for (bin in 0 until BINS) {
++                val v=bins[phase][bin]
++                accepted[phase]+=v.size
++                if (v.size < 35) continue
++                v.sort()
++                // Unbiased temporal variance with median across sensor locations
++                // resists moving shadows, sensor defects and accidental texture.
++                val variance=v[v.size/2]*1.07
++                val level=sums[phase][bin]/v.size
++                data+=Triple(level,variance,v.size.toDouble())
++            }
++            if (accepted[phase] < 350 || data.isEmpty()) continue
++            var newShot=Double.NaN; var newRead=Double.NaN
++            val dynamic=(data.maxOf{it.first}-data.minOf{it.first})
++            if(data.size>=3 && dynamic>=0.10) {
++                val w=data.sumOf{it.third};val mx=data.sumOf{it.first*it.third}/w
++                val my=data.sumOf{it.second*it.third}/w
++                val d=data.sumOf{it.third*(it.first-mx)*(it.first-mx)}
++                if(d>1e-7){newShot=data.sumOf{it.third*(it.first-mx)*(it.second-my)}/d
++                    newRead=my-newShot*mx}
++                if(newShot>=0.0 && newRead>=0.0 && newShot.isFinite() && newRead.isFinite()) fitted++
++                else {newShot=Double.NaN;newRead=Double.NaN}
++            }
++            if (!newShot.isFinite() || !newRead.isFinite()) {
++                // Insufficient radiometric spread to identify two coefficients:
++                // measure amplitude from temporal variance; retain Camera2 shape.
++                val ratios=data.map { (level,variance,_) ->
++                    variance/max(1e-9,cameraShot[phase].toDouble()*level+cameraRead[phase])
++                }.sorted()
++                val scale=ratios[ratios.size/2].coerceIn(0.25,4.0)
++                newShot=cameraShot[phase].toDouble()*scale;newRead=cameraRead[phase].toDouble()*scale
++            }
++            // A physically implausible or motion-biased burst must not replace
++            // the calibrated fallback. These broad bounds are safety rails,
++            // not a forced Camera2 agreement for ordinary valid measurements.
++            val oldVar=cameraShot[phase]*0.10+cameraRead[phase]
++            val newVar=newShot*0.10+newRead
++            val oldDark=cameraShot[phase]*0.02+cameraRead[phase]
++            val newDark=newShot*0.02+newRead
++            if(newShot>=0.0 && newRead>=0.0 && newShot<0.15 && newRead<0.025 &&
++                newVar>=max(1e-9,oldVar*0.20) && newVar<=max(1e-8,oldVar*5.0) &&
++                newDark>=max(1e-9,oldDark*0.20) && newDark<=max(1e-8,oldDark*5.0)) {
++                shot[phase]=newShot.toFloat();read[phase]=newRead.toFloat();measured++
++            }
++        }
++        return Profile(shot,read,measured,accepted,
++            if(measured==4) "BURST_${if(fitted==4)"SHOT_READ" else "PARTIAL_FIT"}"
++            else if(measured>0) "BURST_PHASE_PARTIAL" else "CAMERA2_FALLBACK_INSUFFICIENT_SUPPORT")
+     }
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 05f696f116513458c395ac06bf6280ecb573f0a8..f1996402753d4f997f401c81f46891f394f4530c 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -679,10 +679,10 @@ internal class GlesMgcRawSpatialStacker(
+     private var iris26857ApplyAmazeWbProgram = 0
+     /* IRIS_26858_B_PRIVATE_PROGRAM_LIFETIME: linkProgram registers each program
+      * in inherited release(); never link any of these on Experiment A. */
+-    private var iris26861BWeightedIdentityProgram = 0
+-    private var iris26861BMotionOnlyProgram = 0
++    private var iris26858BCfaProgram = 0
+     private var iris26858BClipAccumulateProgram = 0
+     private var iris26858BClipNormalizeProgram = 0
++    private var iris26858BResidualProgram = 0
+     private var iris26858BHighlightProgram = 0
+     private var iris26859BLensShadeProgram = 0
+     // B-only per-capture tiny Camera2 lens map, allocated once and inherited
+@@ -2477,16 +2477,6 @@ internal class GlesMgcRawSpatialStacker(
+                 GLES30.GL_RGB10_A2,
+                 GLES30.GL_LINEAR,
+             )
+-            /* IRIS_26861_B_PRIVATE_GUIDE_COV_REJECTION: A/DNG/LONG never
+-             * consume these new GPU targets; exact inherited GL release owns them. */
+-            val bReferenceGuide26861 = if (iris26856AmazeCfaConsumer != null)
+-                createTexture(extractedWidth,extractedHeight,GLES30.GL_RGBA16F,GLES30.GL_LINEAR) else 0
+-            val bCurrentGuide26861 = if (iris26856AmazeCfaConsumer != null)
+-                createTexture(extractedWidth,extractedHeight,GLES30.GL_RGBA16F,GLES30.GL_LINEAR) else 0
+-            val bReferenceCovariance26861 = if (iris26856AmazeCfaConsumer != null)
+-                createTexture(extractedWidth,extractedHeight,GLES30.GL_RGB10_A2,GLES30.GL_LINEAR) else 0
+-            val bCurrentCovariance26861 = if (iris26856AmazeCfaConsumer != null)
+-                createTexture(extractedWidth,extractedHeight,GLES30.GL_RGB10_A2,GLES30.GL_LINEAR) else 0
+             /* IRIS_26852_SINGLE_OWNER_TEMPORAL_CFA_CARRIER
+              * Physical phase order is sensor parity 0/1/2/3 = one Bayer quad. Signals and one
+              * shared admission/support vector persist only through NORMAL completion; no RGB is
+@@ -2583,43 +2573,6 @@ internal class GlesMgcRawSpatialStacker(
+                 }
+             }
+ 
+-            /* IRIS_26861_B_RAW_BURST_PRIMARY_CAMERA2_LAST_RESORT.
+-             * A trustworthy, fully identifiable four-phase RAW-burst fit is
+-             * the sole normal B noise authority. Partial fits without a
+-             * signal-bounded lookup are NOT extrapolated as a global model.
+-             * If the burst cannot support that fit, the *physical per-frame*
+-             * Camera2 SENSOR_NOISE_PROFILE is a separately labeled LAST RESORT.
+-             * It never scales or blends the measured profile, and never reads
+-             * the inherited selectable/calibrated/Pixel3 noise source. */
+-            val bBurstNoise26860 = if (iris26856AmazeCfaConsumer != null) {
+-                val normals = frames.filter { it.role == RawBurstFrameRole.NORMAL }
+-                val blacks = normals.map { f ->
+-                    val canonical = canonicalBlackLevelForFrame(f)
+-                    FloatArray(4) { phase -> canonical[canonicalChannelAtPhase(phase)] }
+-                }
+-                val ranges = blacks.map { black ->
+-                    FloatArray(4) { phase -> sensorWhiteLevel-black[phase] }
+-                }
+-                val burst = GlesIris26860BBurstNoise.estimate(normals,width,height,blacks,ranges)
+-                check(normals.isNotEmpty()) { "IRIS_26861_NO_NORMAL_RAW_FOR_NOISE" }
+-                val chosen = if (burst.mode == "BURST_ALL_PHASE_SHOT_READ") burst else {
+-                    // Every NORMAL must have its own valid same-frame Camera2
+-                    // record. Never quietly reuse a different frame/ISO/lens.
+-                    check(normals.all { bCamera2ProfileForFrame26861(it, burst.mode) != null }) {
+-                        "IRIS_26861_NO_VALID_NOISE_PROFILE: unreliable RAW-burst " +
+-                            "fit (${burst.mode}) and missing/invalid per-NORMAL Camera2 profile; " +
+-                            "abort safely rather than invent noise or save a degraded B image"
+-                    }
+-                    checkNotNull(bCamera2ProfileForFrame26861(normals.first(), burst.mode))
+-                }
+-                PLog.i(SABRE_TAG,"IRIS_26861_B_NOISE_AUTHORITY " +
+-                    "selected=${chosen.mode} burst=${burst.mode} measuredPhases=${burst.measuredPhases}/4 " +
+-                    "paired=${burst.samplePairs} sites=${burst.acceptedSites.joinToString(",")} " +
+-                    "bins=${burst.signalBins.joinToString(",")} " +
+-                    "camera2Fallback=${chosen.mode.startsWith("CAMERA2_FALLBACK_")} " +
+-                    "pooledCamera2MomentConsumed=false extraAmazeDenoise=false")
+-                chosen
+-            } else null
+             val kernelTuning = createBayerKernelTuning(
+                 frame = frames.first(),
+                 image = images.first(),
+@@ -2644,15 +2597,47 @@ internal class GlesMgcRawSpatialStacker(
+                 exposureScale = 1f,
+                 kernelTuning = kernelTuning,
+             )
+-            val bKernel26861 = bBurstNoise26860?.let { bEmpiricalKernelTuning26861(
+-                kernelTuning,it,normalFrameCount) }
+-            val bKernelParameters26861 = bKernel26861?.let { b ->
+-                MgcSabreKernelTuning.build(referenceSnr=b.referenceSnr,
+-                    frameCount=normalFrameCount,mergeGradientThreshold=sabreMergeGradientThreshold)
++            /* IRIS_26860_B_ONLY_BURST_MEASURED_SENSOR_NOISE_SOURCE
++             * RAW16 original sensor measurements, BEFORE lens shading / WB /
++             * AMaZE / FCC, NORMAL only. This cannot change A's pipeline or the
++             * inherited temporal alignment, rejection, motion or DNG weights.
++             * If the burst cannot identify noise robustly, the measured owner
++             * explicitly falls back to current Camera2 reference coefficients.
++             */
++            val bReferenceShot26860 = FloatArray(4) { phase ->
++                val channel = canonicalChannelAtPhase(phase)
++                referenceCalibration.shotNoise[channel] / calculationWhiteBalance[channel]
+             }
+-            val bReferenceCalibration26861 = bBurstNoise26860?.let { profile ->
+-                bEmpiricalCalibration26861(referenceCalibration,profile,1f)
++            val bReferenceRead26860 = FloatArray(4) { phase ->
++                val channel = canonicalChannelAtPhase(phase)
++                val wb = calculationWhiteBalance[channel]
++                referenceCalibration.readNoise[channel] / (wb * wb)
+             }
++            val bBurstNoise26860 = if (iris26856AmazeCfaConsumer != null) {
++                val normalFrames26860 = frames.filter { it.role == RawBurstFrameRole.NORMAL }
++                val phaseBlacks26860 = normalFrames26860.map { frame ->
++                    val levels = canonicalBlackLevelForFrame(frame)
++                    FloatArray(4) { phase -> levels[canonicalChannelAtPhase(phase)] }
++                }
++                val phaseRanges26860 = phaseBlacks26860.map { black ->
++                    FloatArray(4) { phase -> sensorWhiteLevel - black[phase] }
++                }
++                GlesIris26860BBurstNoise.estimate(
++                    normals = normalFrames26860, width = width, height = height,
++                    phaseBlackByFrame = phaseBlacks26860,
++                    phaseRangeByFrame = phaseRanges26860,
++                    cameraShot = bReferenceShot26860, cameraRead = bReferenceRead26860,
++                ).also { evidence ->
++                    PLog.i(SABRE_TAG, "IRIS_26860_B_BURST_NOISE_ACTIVE " +
++                        "owner=B_ONLY_NORMAL_SENSOR_RAW source=${evidence.mode} " +
++                        "measuredPhases=${evidence.measuredPhases}/4 " +
++                        "acceptedSites=${evidence.acceptedSites.joinToString(",")} " +
++                        "shot=${evidence.shot.joinToString(",")} " +
++                        "read=${evidence.read.joinToString(",")} " +
++                        "consumers=B_ONLY_CFA_MOMENT_RECALIBRATION_B_CFA_CLEAN_B_CLIP_GUARD_B_RESIDUAL " +
++                        "A=false LONG=false DNG=false alignment=false postLscGainSquaredOnce=true")
++                }
++            } else null
+             val sabreResolveFinalBlackLevel =
+                 sabreResolveBlackLevel(referenceCalibration.blackLevels)
+             PLog.i(
+@@ -2753,13 +2738,6 @@ internal class GlesMgcRawSpatialStacker(
+                 guideHeight = extractedHeight,
+                 kernelParameters = sabreKernelParameters,
+             )
+-            if (bReferenceCalibration26861 != null) {
+-                val noiseB=createSabreNoiseLut(bReferenceCalibration26861,bReferenceCalibration26861)
+-                renderSabreGuideAndCovariance(referenceExtracted,noiseB,
+-                    bReferenceCalibration26861,bReferenceGuide26861,bReferenceCovariance26861,
+-                    extractedWidth,extractedHeight,checkNotNull(bKernelParameters26861))
+-                releaseOwnedTexture(noiseB,"26861 B reference empirical noise LUT")
+-            }
+             val referenceGrayPyramid = buildGrayPyramid(referenceRaw, referenceCalibration)
+             val referenceAlignmentProducts = buildReferenceAlignmentProducts(referenceGrayPyramid)
+             val zeroFlow = SabreConvertedAlignment.constant(createZeroFlowTexture())
+@@ -2778,7 +2756,7 @@ internal class GlesMgcRawSpatialStacker(
+             renderSabreNormalCfaTemporalAccumulate26852(
+                 raw = referenceRaw,
+                 flow = zeroFlow,
+-                covariance = if(bReferenceCalibration26861!=null)bReferenceCovariance26861 else referenceCovariance,
++                covariance = referenceCovariance,
+                 weight = identityWeight,
+                 calibration = referenceCalibration,
+                 phaseSignals = normalCfaSignals26852,
+@@ -2793,7 +2771,6 @@ internal class GlesMgcRawSpatialStacker(
+                 clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
+                 verifiedHotPixelMask26855 = verifiedHotPixelMask26855,
+                 verifiedHotPixelMapEnabled26855 = verifiedHotPixelMapEnabled26855,
+-                bEmpiricalNoise26861 = bBurstNoise26860,
+             )
+             if (iris26858BClipVotes != 0) {
+                 renderIris26858BClipAccumulate(
+@@ -2807,9 +2784,9 @@ internal class GlesMgcRawSpatialStacker(
+             if (enableSabreSuperRes || iris26856BTrue2x) {
+                 val referenceEvidence = persistTrue2xEvidence(
+                     frameIndex = 0,
+-                    calibration = if(bReferenceCalibration26861!=null)bReferenceCalibration26861 else referenceCalibration,
++                    calibration = referenceCalibration,
+                     flow = zeroFlow,
+-                    covariance = if(bReferenceCalibration26861!=null)bReferenceCovariance26861 else referenceCovariance,
++                    covariance = referenceCovariance,
+                     rejection = identityWeight,
+                     covarianceWidth = extractedWidth,
+                     covarianceHeight = extractedHeight,
+@@ -2819,16 +2796,16 @@ internal class GlesMgcRawSpatialStacker(
+                     existingPhaseEvidence = null,
+                     referenceRawTexture = referenceRaw,
+                     currentRawTexture = referenceRaw,
+-                    referenceCalibration = if(bReferenceCalibration26861!=null)bReferenceCalibration26861 else referenceCalibration,
++                    referenceCalibration = referenceCalibration,
+                 )
+                 true2xEvidence += referenceEvidence
+             }
+             if (enableHighZoomDetail) {
+                 highZoomEvidence26718 += persistTrue2xEvidence(
+                     frameIndex = 0,
+-                    calibration = if(bReferenceCalibration26861!=null)bReferenceCalibration26861 else referenceCalibration,
++                    calibration = referenceCalibration,
+                     flow = zeroFlow,
+-                    covariance = if(bReferenceCalibration26861!=null)bReferenceCovariance26861 else referenceCovariance,
++                    covariance = referenceCovariance,
+                     rejection = identityWeight,
+                     covarianceWidth = extractedWidth,
+                     covarianceHeight = extractedHeight,
+@@ -2838,7 +2815,7 @@ internal class GlesMgcRawSpatialStacker(
+                     existingPhaseEvidence = null,
+                     referenceRawTexture = referenceRaw,
+                     currentRawTexture = referenceRaw,
+-                    referenceCalibration = if(bReferenceCalibration26861!=null)bReferenceCalibration26861 else referenceCalibration,
++                    referenceCalibration = referenceCalibration,
+                     refineForHighZoom26718 = false,
+                 )
+             }
+@@ -2996,34 +2973,6 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.GL_LINEAR,
+                 )
+                 renderDilation(reverseWeight, frameWeight)
+-                /* IRIS_26861_B_ONLY_NORMAL_REJECTION. Original frameWeight
+-                 * remains DNG/LONG/Sabre provenance. Never feed it into B. */
+-                val bFrameNoise26861 = if (frame.role == RawBurstFrameRole.NORMAL &&
+-                    bBurstNoise26860?.mode?.startsWith("CAMERA2_FALLBACK_") == true) {
+-                    checkNotNull(bCamera2ProfileForFrame26861(frame,bBurstNoise26860.mode)) {
+-                        "IRIS_26861_CAMERA2_FALLBACK_FRAME_LOST: no same-frame valid SENSOR_NOISE_PROFILE"
+-                    }
+-                } else bBurstNoise26860
+-                val bTemporalWeight26861 = if (frame.role == RawBurstFrameRole.NORMAL &&
+-                    bFrameNoise26861 != null) {
+-                    val bCal=bEmpiricalCalibration26861(calibration,bFrameNoise26861,exposureScale)
+-                    val bNoiseLut=createSabreNoiseLut(checkNotNull(bReferenceCalibration26861),bCal)
+-                    renderSabreGuideAndCovariance(currentExtracted,bNoiseLut,bCal,
+-                        bCurrentGuide26861,bCurrentCovariance26861,extractedWidth,extractedHeight,
+-                        checkNotNull(bKernelParameters26861))
+-                    val bUnblocker=createTexture(unblockerWidth,unblockerHeight,GLES30.GL_R8,GLES30.GL_LINEAR)
+-                    renderUnblocker(currentRaw,bCal,bUnblocker,unblockerWidth,unblockerHeight)
+-                    val bReverse=createTexture(extractedWidth,extractedHeight,GLES30.GL_R8,GLES30.GL_LINEAR)
+-                    val bPixelDiff=createTexture(extractedWidth,extractedHeight,GLES30.GL_R8,GLES30.GL_NEAREST)
+-                    renderSabreRejection(bReferenceGuide26861,bCurrentGuide26861,flow,
+-                        bUnblocker,bNoiseLut,bReverse,bPixelDiff,0,extractedWidth,extractedHeight,
+-                        durationRobustness,true,frames.first(),frame)
+-                    val bWeight=createTexture(coverageWidth,coverageHeight,GLES30.GL_R8,GLES30.GL_LINEAR)
+-                    renderDilation(bReverse,bWeight)
+-                    // All intermediate resources are owned by current transient
+-                    // frame and freed by the existing releaseTexturesFrom gate.
+-                    bWeight
+-                } else frameWeight
+                 /* IRIS_26699_LONG_PROOF_REDUNDANT_BARRIER_REMOVED
+                  * The disabled isolated proof target never feeds the production accumulator.
+                  * Same-context GPU ordering is sufficient; do not drain the GPU here.
+@@ -3072,18 +3021,18 @@ internal class GlesMgcRawSpatialStacker(
+                     }
+                     if (iris26858BClipVotes != 0) {
+                         renderIris26858BClipAccumulate(
+-                            currentRaw, flow, bTemporalWeight26861, true,
++                            currentRaw, flow, frameWeight, true,
+                             calibration, verifiedHotPixelMask26855, verifiedHotPixelMapEnabled26855,
+                             frame.takeIf(::hasRowFlickerEvidence26720),
+                             iris26858BClipVotes, extractedWidth, extractedHeight,
+-                            bFrameNoise26861,
++                            bBurstNoise26860,
+                         )
+                     }
+                     renderSabreNormalCfaTemporalAccumulate26852(
+                         raw = currentRaw,
+                         flow = flow,
+-                        covariance = if(bFrameNoise26861!=null)bCurrentCovariance26861 else currentCovariance,
+-                        weight = if(bFrameNoise26861!=null)bTemporalWeight26861 else frameWeight,
++                        covariance = currentCovariance,
++                        weight = frameWeight,
+                         calibration = calibration,
+                         phaseSignals = normalCfaSignals26852,
+                         sharedSupport = normalCfaSupport26852,
+@@ -3097,7 +3046,6 @@ internal class GlesMgcRawSpatialStacker(
+                         clipZoneClipStart26834 = edgeFalseColor26778.clipZoneClipStart,
+                         verifiedHotPixelMask26855 = verifiedHotPixelMask26855,
+                         verifiedHotPixelMapEnabled26855 = verifiedHotPixelMapEnabled26855,
+-                        bEmpiricalNoise26861 = bFrameNoise26861,
+                     )
+                 } else if (frame.role == RawBurstFrameRole.SHADOW_LONG) {
+                     require(index in firstAux26790 until longAuxEnd26833) {
+@@ -3186,11 +3134,10 @@ internal class GlesMgcRawSpatialStacker(
+                 if ((enableSabreSuperRes || iris26856BTrue2x) && frame.role == RawBurstFrameRole.NORMAL) {
+                     val candidateEvidence = persistTrue2xEvidence(
+                         frameIndex = index,
+-                        calibration = if(bFrameNoise26861!=null)
+-                            bEmpiricalCalibration26861(calibration,bFrameNoise26861,exposureScale) else calibration,
++                        calibration = calibration,
+                         flow = flow,
+-                        covariance = if(bFrameNoise26861!=null)bCurrentCovariance26861 else currentCovariance,
+-                        rejection = bTemporalWeight26861,
++                        covariance = currentCovariance,
++                        rejection = frameWeight,
+                         covarianceWidth = extractedWidth,
+                         covarianceHeight = extractedHeight,
+                         rejectionWidth = coverageWidth,
+@@ -3199,19 +3146,17 @@ internal class GlesMgcRawSpatialStacker(
+                         existingPhaseEvidence = null,
+                         referenceRawTexture = referenceRaw,
+                         currentRawTexture = currentRaw,
+-                        referenceCalibration = if(bReferenceCalibration26861!=null)
+-                            bReferenceCalibration26861 else referenceCalibration,
++                        referenceCalibration = referenceCalibration,
+                     )
+                     true2xEvidence += candidateEvidence
+                 }
+                 if (enableHighZoomDetail && frame.role == RawBurstFrameRole.NORMAL) {
+                     highZoomEvidence26718 += persistTrue2xEvidence(
+                         frameIndex = index,
+-                        calibration = if(bFrameNoise26861!=null)
+-                            bEmpiricalCalibration26861(calibration,bFrameNoise26861,exposureScale) else calibration,
++                        calibration = calibration,
+                         flow = flow,
+-                        covariance = if(bFrameNoise26861!=null)bCurrentCovariance26861 else currentCovariance,
+-                        rejection = bTemporalWeight26861,
++                        covariance = currentCovariance,
++                        rejection = frameWeight,
+                         covarianceWidth = extractedWidth,
+                         covarianceHeight = extractedHeight,
+                         rejectionWidth = coverageWidth,
+@@ -3220,8 +3165,7 @@ internal class GlesMgcRawSpatialStacker(
+                         existingPhaseEvidence = null,
+                         referenceRawTexture = referenceRaw,
+                         currentRawTexture = currentRaw,
+-                        referenceCalibration = if(bReferenceCalibration26861!=null)
+-                            bReferenceCalibration26861 else referenceCalibration,
++                        referenceCalibration = referenceCalibration,
+                         refineForHighZoom26718 = false,
+                     )
+                 }
+@@ -3265,23 +3209,18 @@ internal class GlesMgcRawSpatialStacker(
+                 GlesGpuScheduler.yieldToUiRenderer()
+             }
+ 
+-            /* IRIS_26861_B_PRIVATE_NOISE_EVIDENCE_RELEASE_AFTER_NORMAL_MERGE.
+-             * No additional B guide/cov survives into the AMaZE, Lab/FCC,
+-             * tone/UHDR, DNG readback, or true2x offline reconstruction. */
+-            if (bBurstNoise26860 != null) {
+-                releaseOwnedTexture(bReferenceGuide26861, "26861 B reference guide completed")
+-                releaseOwnedTexture(bCurrentGuide26861, "26861 B current guide completed")
+-                releaseOwnedTexture(bReferenceCovariance26861, "26861 B reference covariance completed")
+-                releaseOwnedTexture(bCurrentCovariance26861, "26861 B current covariance completed")
+-            }
+             /* IRIS_26853_MULTIFRAME_NATIVE_CFA_DENOISE_HANDOFF
+              * Every requested/admitted NORMAL has already been alignment-attempted by inherited Sabre.
+              * Clean only the completed same-phase CFA carrier using local temporal moments and
+              * structure. referenceExtracted is safely reused as output after reference guide setup. */
+             if (iris26858BClipVotes != 0) {
+-                renderIris26861BWeightedIdentity(
+-                    normalCfaSignals26852, referenceExtracted,
+-                    extractedWidth, extractedHeight,
++                renderIris26858BNoiseClean(
++                    normalCfaSignals26852, normalCfaSupport26852,
++                    normalCfaValidity26852, normalCfaTemporalStats26853,
++                    referenceExtracted, extractedWidth, extractedHeight,
++                    bBurstNoise26860?.shot ?: bReferenceShot26860,
++                    bBurstNoise26860?.read ?: bReferenceRead26860,
++                    bReferenceShot26860, bReferenceRead26860,
+                 )
+                 iris26858BClipRatio = renderIris26858BClipNormalize(
+                     iris26858BClipVotes, normalCfaSupport26852,
+@@ -3291,7 +3230,7 @@ internal class GlesMgcRawSpatialStacker(
+                 PLog.i(SABRE_TAG, "IRIS_26858_B_RAW_DOMAIN_AUTHORITY normalFrames=$mergedFrameCount " +
+                     "clip=PRE_WB_PRE_LSC_PER_PHASE_ORIGINAL_RAW " +
+                     "support=ACTUAL_LOCAL_SUMW2_NEFF_GPU_3BIN_HISTOGRAM " +
+-                    "noise=IRIS_26861_B_EMPIRICAL_PRE_AMAZE_TEMPORAL_ONLY noCamera2Noise=true " +
++                    "noise=IRIS_26860_B_BURST_FIT_OR_CAMERA2_PROVEN_FALLBACK noiseNoALegacy=true " +
+                     "histogramNotReadBack=true")
+             } else renderSabreNormalCfaNoiseClean26853(
+                 phaseSignals = normalCfaSignals26852,
+@@ -3378,6 +3317,12 @@ internal class GlesMgcRawSpatialStacker(
+                     iris26856RawrRgbSidecar = renderRawrBPostAmaze26856(
+                         amazePostWb, rawrColor, labDefringeStrength = 1f,
+                         bClipRatio26858 = iris26858BClipRatio,
++                        bSupport26858 = normalCfaSupport26852,
++                        bMoments26858 = normalCfaTemporalStats26853,
++                        bNoiseShot26858 = bBurstNoise26860?.shot ?: bReferenceShot26860,
++                        bNoiseRead26858 = bBurstNoise26860?.read ?: bReferenceRead26860,
++                        bBaseShot26860 = bReferenceShot26860,
++                        bBaseRead26860 = bReferenceRead26860,
+                     )
+                 } finally {
+                     releaseOwnedTexture(amazePostWb, "26856 consumed AMaZE WB RGB")
+@@ -6076,7 +6021,6 @@ internal class GlesMgcRawSpatialStacker(
+         clipZoneClipStart26834: Float,
+         verifiedHotPixelMask26855: Int,
+         verifiedHotPixelMapEnabled26855: Boolean,
+-        bEmpiricalNoise26861: GlesIris26860BBurstNoise.Profile? = null,
+     ) {
+         val program = sabreNormalCfaTemporalAccumulateProgram26852
+         check(program != 0 && raw != 0 && phaseSignals != 0 && sharedSupport != 0 &&
+@@ -6131,8 +6075,8 @@ internal class GlesMgcRawSpatialStacker(
+             val gain = calculationWhiteBalance[channel]
+             calibration.readNoise[channel] / (gain * gain)
+         }
+-        uniform4fv(program, "uPhaseNoiseShot26855", bEmpiricalNoise26861?.shot ?: shot26855)
+-        uniform4fv(program, "uPhaseNoiseRead26855", bEmpiricalNoise26861?.read ?: read26855)
++        uniform4fv(program, "uPhaseNoiseShot26855", shot26855)
++        uniform4fv(program, "uPhaseNoiseRead26855", read26855)
+         uniform1i(program, "uBNoiseMomentOwner26858", if (iris26856AmazeCfaConsumer != null) 1 else 0)
+         GLES30.glEnable(GLES30.GL_BLEND)
+         try {
+@@ -6460,9 +6404,19 @@ internal class GlesMgcRawSpatialStacker(
+         uniform1i(p, "uVerifiedHotPixelMapEnabled26855", if (verifiedHotPixelMapEnabled26855) 1 else 0)
+         uniform4fv(p, "uPhaseGains", calibration.bayerPhaseGains)
+         uniform4fv(p, "uPhaseBlackTerms", calibration.bayerPhaseBlackTerms)
+-        val measured=checkNotNull(bBurstNoise26860) { "26861 B sensor clip requires burst evidence" }
+-        uniform4fv(p,"uPhaseNoiseShot26855",measured.shot)
+-        uniform4fv(p,"uPhaseNoiseRead26855",measured.read)
++        // Match the exact pinned 26855 CFA hot-pixel/noise owner; otherwise
++        // sparse impulse gating would falsely classify genuine highlight detail.
++        val clipShot26859 = FloatArray(4) { phase ->
++            val c = canonicalChannelAtPhase(phase)
++            calibration.shotNoise[c] / calculationWhiteBalance[c]
++        }
++        val clipRead26859 = FloatArray(4) { phase ->
++            val c = canonicalChannelAtPhase(phase)
++            val gain = calculationWhiteBalance[c]
++            calibration.readNoise[c] / (gain * gain)
++        }
++        uniform4fv(p,"uPhaseNoiseShot26855",bBurstNoise26860?.shot ?: clipShot26859)
++        uniform4fv(p,"uPhaseNoiseRead26855",bBurstNoise26860?.read ?: clipRead26859)
+         uniform1f(p, "uSourceWhiteNormalized", 1f)
+         uniformSabreFlowScaleOffset(p, flow)
+         uniform2i(p, "uRawSize", width, height)
+@@ -6490,48 +6444,32 @@ internal class GlesMgcRawSpatialStacker(
+         checkGlError("26858 B sensor RAW clipping provenance")
+     }
+ 
+-    /** IRIS_26861_B_UNSUPPORTED_EMPIRICAL_MOTION_ONLY_CONFIDENCE.
+-     * Never uses Camera2 coefficients, nor a made-up shot/read curve; every
+-     * NORMAL still passes B's own aligned-CFA motion agreement test. */
+-    private fun renderIris26861BMotionOnlyWeight(
+-        referenceGuide: Int, currentGuide: Int, flow: SabreConvertedAlignment,
+-        width: Int, height: Int,
+-    ): Int {
+-        if (iris26861BMotionOnlyProgram == 0) {
+-            iris26861BMotionOnlyProgram = linkProgram(
+-                GlesIris26858BNoiseHighlight.bMotionOnlyWeight26861,
+-                "iris_26861_b_motion_only_without_empirical_profile",
+-            )
+-        }
+-        val program=iris26861BMotionOnlyProgram
+-        val weight=createTexture(width,height,GLES30.GL_R8,GLES30.GL_LINEAR)
+-        GLES30.glUseProgram(program)
+-        bindTexture(program,"uReferenceGuide",0,referenceGuide)
+-        bindTexture(program,"uCurrentGuide",1,currentGuide)
+-        bindTexture(program,"uFlow",2,flow.texture)
+-        uniform2i(program,"uCoverageSize",width,height)
+-        uniformSabreFlowScaleOffset(program,flow)
+-        draw(program,width,height,intArrayOf(weight))
+-        checkGlError("26861 B unsupported fit motion-only NORMAL admission")
+-        return weight
+-    }
+-
+-    /** IRIS_26861_B_PRE_AMAZE_WEIGHTED_IDENTITY: no spatial denoising. */
+-    private fun renderIris26861BWeightedIdentity(
+-        signals: Int, output: Int, cellWidth: Int, cellHeight: Int,
++    private fun renderIris26858BNoiseClean(
++        signals: Int, support: Int, validity: Int, moments: Int,
++        output: Int, cellWidth: Int, cellHeight: Int,
++        shot: FloatArray, read: FloatArray,
++        baseShot: FloatArray, baseRead: FloatArray,
+     ) {
+-        if (iris26861BWeightedIdentityProgram == 0) {
+-            iris26861BWeightedIdentityProgram = linkProgram(
+-                GlesIris26858BNoiseHighlight.bWeightedCfaIdentity26861,
+-                "iris_26861_b_weighted_temporal_cfa_no_spatial_denoise",
++        if (iris26858BCfaProgram == 0) {
++            iris26858BCfaProgram = linkProgram(
++                GlesIris26858BNoiseHighlight.bCfaNoise, "iris_26858_b_raw_burst_chroma",
+             )
+         }
+-        val program=iris26861BWeightedIdentityProgram
+-        GLES30.glUseProgram(program)
+-        bindTexture(program,"uWeightedPhases",0,signals)
+-        uniform2i(program,"uSize",cellWidth,cellHeight)
+-        draw(program,cellWidth,cellHeight,intArrayOf(output))
+-        checkGlError("26861 B exactly weighted temporal sensor CFA to AMaZE")
++        require(shot.size == 4 && read.size == 4)
++        val p = iris26858BCfaProgram
++        GLES30.glUseProgram(p)
++        bindTexture(p, "uPhaseSignal", 0, signals)
++        bindTexture(p, "uSupport", 1, support)
++        bindTexture(p, "uValidity", 2, validity)
++        bindTexture(p, "uMoments", 3, moments)
++        uniform2i(p, "uSize", cellWidth, cellHeight)
++        uniform4fv(p, "uShot", shot)
++        uniform4fv(p, "uRead", read)
++        uniform4fv(p, "uBaseShot26860", baseShot)
++        uniform4fv(p, "uBaseRead26860", baseRead)
++        uniform1i(p, "uBayerPattern", cfaPattern)
++        draw(p, cellWidth, cellHeight, intArrayOf(output))
++        checkGlError("26858 B RAW-burst same-phase noise with true local N_eff")
+     }
+ 
+     private fun renderIris26858BClipNormalize(
+@@ -6609,6 +6547,43 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    private fun renderIris26858BResidualChroma(
++        rgb: Int, clip: Int, support: Int, moments: Int,
++        outWidth: Int, outHeight: Int, originX: Int, originY: Int,
++        expandedScale: Int, shot: FloatArray, read: FloatArray,
++        baseShot: FloatArray, baseRead: FloatArray,
++    ): Int {
++        require(shot.size == 4 && read.size == 4 && baseShot.size == 4 && baseRead.size == 4)
++        if (iris26858BResidualProgram == 0) {
++            iris26858BResidualProgram = linkProgram(
++                GlesIris26858BNoiseHighlight.bResidualChroma, "iris_26858_b_residual_chroma",
++            )
++        }
++        val out = createTexture(outWidth, outHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++        val p = iris26858BResidualProgram
++        GLES30.glUseProgram(p)
++        bindTexture(p, "uRgb", 0, rgb)
++        bindTexture(p, "uSupport", 1, support)
++        bindTexture(p, "uMoments", 2, moments)
++        bindTexture(p, "uClip", 3, clip)
++        uniform2i(p, "uSize", outWidth, outHeight)
++        uniform2i(p, "uClipCellSize", width / 2, height / 2)
++        uniform2i(p, "uOrigin", originX, originY)
++        uniform1i(p, "uExpandedScale", expandedScale)
++        uniform4fv(p, "uNoiseShot", shot)
++        uniform4fv(p, "uNoiseRead", read)
++        uniform4fv(p, "uBaseShot26860", baseShot)
++        uniform4fv(p, "uBaseRead26860", baseRead)
++        uniform1i(p, "uBayerPattern", cfaPattern)
++        bindTexture(p,"uLensShading",4,iris26859BLensMapTexture.takeIf{it!=0} ?: rgb)
++        uniform1i(p,"uUseLensShading",if(iris26859BLensMapTexture!=0)1 else 0)
++        uniform2i(p,"uNativeSize",width,height)
++        draw(p, outWidth, outHeight, intArrayOf(out))
++        GlesGpuScheduler.memoryBarrier()
++        checkGlError("26858 B sensor-neutral residual chroma only")
++        return out
++    }
++
+     private fun renderIris26858BHighlightColor(
+         temporaryWbRgb: Int, clipRatio: Int, outWidth: Int, outHeight: Int,
+         originX: Int, originY: Int, expandedScale: Int, wb: FloatArray,
+@@ -6659,6 +6634,12 @@ internal class GlesMgcRawSpatialStacker(
+         labDefringeStrength: Float,
+         processingWidth: Int = width, processingHeight: Int = height,
+         bClipRatio26858: Int = 0,
++        bSupport26858: Int = 0,
++        bMoments26858: Int = 0,
++        bNoiseShot26858: FloatArray? = null,
++        bNoiseRead26858: FloatArray? = null,
++        bBaseShot26860: FloatArray? = null,
++        bBaseRead26860: FloatArray? = null,
+         bOriginX26858: Int = 0, bOriginY26858: Int = 0,
+         bExpandedScale26858: Int = 1,
+     ): Int {
+@@ -6669,6 +6650,7 @@ internal class GlesMgcRawSpatialStacker(
+         // the final Iris calibrated sensor-RGB renderer. 1.0x/zoom/2x share it.
+         var temporaryPostWb = 0
+         var bLensCorrected26859 = 0
++        var bCleaned26858 = 0
+         var bRecovered26858 = 0
+         var defringed = 0
+         var fcc = 0
+@@ -6687,11 +6669,22 @@ internal class GlesMgcRawSpatialStacker(
+                     "iris_26857_b_temporary_wb_for_lab_fcc",
+                 )
+             }
++            if (bClipRatio26858 != 0 && bSupport26858 != 0 && bMoments26858 != 0) {
++                bCleaned26858 = renderIris26858BResidualChroma(
++                    if(bLensCorrected26859!=0)bLensCorrected26859 else amazePostWbCameraRgb,
++                    bClipRatio26858, bSupport26858,
++                    bMoments26858, processingWidth, processingHeight,
++                    bOriginX26858, bOriginY26858, bExpandedScale26858,
++                    checkNotNull(bNoiseShot26858), checkNotNull(bNoiseRead26858),
++                    checkNotNull(bBaseShot26860), checkNotNull(bBaseRead26860),
++                )
++            }
+             temporaryPostWb = createTexture(processingWidth, processingHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+             val applyProgram = iris26857ApplyAmazeWbProgram
+             GLES30.glUseProgram(applyProgram)
+             bindTexture(applyProgram, "uSensorNeutralAmazeRgb", 0,
+-                if(bLensCorrected26859!=0)bLensCorrected26859 else amazePostWbCameraRgb)
++                if (bCleaned26858 != 0) bCleaned26858 else
++                    if(bLensCorrected26859!=0)bLensCorrected26859 else amazePostWbCameraRgb)
+             uniform2i(applyProgram, "uSize", processingWidth, processingHeight)
+             val gains = snapshot.amazeWhiteBalance
+             GLES30.glUniform3f(GLES30.glGetUniformLocation(applyProgram, "uAmazeWb"),
+@@ -6739,6 +6732,7 @@ internal class GlesMgcRawSpatialStacker(
+             return neutral
+         } finally {
+             if (temporaryPostWb != 0) releaseOwnedTexture(temporaryPostWb, "26857 consumed Lab temporary WB input")
++            if (bCleaned26858 != 0) releaseOwnedTexture(bCleaned26858, "26858 B residual sensor RGB")
+             if (bLensCorrected26859 != 0) releaseOwnedTexture(bLensCorrected26859,"26859 B one-time sensor LSC")
+             if (bRecovered26858 != 0) releaseOwnedTexture(bRecovered26858, "26858 B highlight before Lab")
+             if (defringed != 0) releaseOwnedTexture(defringed, "26856 consumed RAWR Lab result")
+@@ -9019,103 +9013,6 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
+-    /** IRIS_26861_B_CAMERA2_LAST_RESORT_PHYSICAL_FRAME_ONLY.
+-     * No selectable MGC/Pixel3/calibrated/base-frame model is consulted.
+-     * Camera2 pairs are in actual CFA phase order; RawNoiseModel canonicalizes
+-     * for the current physical sensor pattern, then we map back to phase order
+-     * consumed by B's shaders. All four phases must be valid together.
+-     * This helper is NEVER invoked for a valid four-phase burst fit. */
+-    private fun bCamera2ProfileForFrame26861(
+-        frame: RawStackFrame, reason: String,
+-    ): GlesIris26860BBurstNoise.Profile? {
+-        val model = frame.channelNoiseProfile
+-            ?.let(RawNoiseModel::fromCamera2NoiseProfile)
+-            ?.takeIf { it.hasValidCamera2Profile } ?: return null
+-        val canonicalShot=model.normalizedShotNoiseForShader(cfaPattern)
+-        val canonicalRead=model.normalizedReadNoiseForShader(cfaPattern)
+-        val shot=FloatArray(4) { phase -> canonicalShot[canonicalChannelAtPhase(phase)] }
+-        val read=FloatArray(4) { phase -> canonicalRead[canonicalChannelAtPhase(phase)] }
+-        if (shot.any { !it.isFinite() || it <= 0f } ||
+-            read.any { !it.isFinite() || it < 0f }) return null
+-        return GlesIris26860BBurstNoise.Profile(
+-            shot,read,0,IntArray(4),"CAMERA2_FALLBACK_${reason}",IntArray(4),0)
+-    }
+-
+-    private fun requireBNoiseAuthority26861(profile: GlesIris26860BBurstNoise.Profile) {
+-        require(profile.mode == "BURST_ALL_PHASE_SHOT_READ" ||
+-            profile.mode.startsWith("CAMERA2_FALLBACK_")) {
+-            "IRIS_26861_B_INVALID_NOISE_SOURCE: unsupported/partial RAW fit may not control B"
+-        }
+-        require((0..3).all { p ->
+-            val shot=profile.shot[p]; val read=profile.read[p]
+-            shot.isFinite() && shot >= 0f && read.isFinite() && read >= 0f &&
+-                (shot > 0f || read > 0f)
+-        }) { "IRIS_26861_B_INVALID_NOISE_COEFFICIENT: reject zero or nonfinite variance" }
+-    }
+-
+-    /** IRIS_26861_B_PRIVATE_SENSOR_NOISE_CALIBRATION
+-     * Only B NORMAL guide, covariance, rejection and temporal sampling consume
+-     * this model. A, DNG, LONG retain the unmodified legacy calibration.
+-     * Profile is either measured four-phase burst or explicitly validated
+-     * same-physical-frame Camera2 last resort, never a partial zero fit. */
+-    private fun bEmpiricalCalibration26861(
+-        original: FrameCalibration, profile: GlesIris26860BBurstNoise.Profile,
+-        exposureScale: Float,
+-    ): FrameCalibration {
+-        requireBNoiseAuthority26861(profile)
+-        val physicalShot=FloatArray(4)
+-        val physicalRead=FloatArray(4)
+-        for (phase in 0..3) {
+-            val c=canonicalChannelAtPhase(phase)
+-            physicalShot[c]=profile.shot[phase].coerceAtLeast(0f)
+-            physicalRead[c]=profile.read[phase].coerceAtLeast(0f)
+-        }
+-        val shot=FloatArray(4) { c -> physicalShot[c]*calculationWhiteBalance[c]*exposureScale }
+-        val read=FloatArray(4) { c ->
+-            val gain=calculationWhiteBalance[c]*exposureScale
+-            physicalRead[c]*gain*gain
+-        }
+-        val unblockerShot=FloatArray(4) { c ->
+-            physicalShot[c]*(sensorWhiteLevel-original.blackLevels[c])
+-        }
+-        val unblockerRead=FloatArray(4) { c ->
+-            val range=sensorWhiteLevel-original.blackLevels[c]
+-            physicalRead[c]*range*range
+-        }
+-        val rgbShot=RawNoiseModel.bayerNoiseModelToRgb(physicalShot).also { rgb ->
+-            rgb.indices.forEach { rgb[it]*=exposureScale }
+-        }
+-        val scale2=exposureScale*exposureScale
+-        val rgbRead=RawNoiseModel.bayerNoiseModelToRgb(physicalRead).also { rgb ->
+-            rgb.indices.forEach { rgb[it]*=scale2 }
+-        }
+-        return original.copy(shotNoise=shot,readNoise=read,
+-            unblockerShotNoise=unblockerShot,unblockerReadNoise=unblockerRead,
+-            cameraRgbShotNoise=rgbShot,cameraRgbReadNoise=rgbRead)
+-    }
+-
+-    private fun bEmpiricalKernelTuning26861(
+-        original: BayerKernelTuning, profile: GlesIris26860BBurstNoise.Profile,
+-        normalCount: Int,
+-    ): BayerKernelTuning {
+-        requireBNoiseAuthority26861(profile)
+-        var greenVariance=0f;var greenRead=0f
+-        var greens=0
+-        for (phase in 0..3) {
+-            if (canonicalChannelAtPhase(phase) in 1..2) {
+-                greenVariance+=profile.shot[phase]*original.referenceSignal+profile.read[phase]
+-                greenRead+=profile.read[phase]
+-                greens++
+-            }
+-        }
+-        val variance=(greenVariance/greens.coerceAtLeast(1)).coerceAtLeast(1.0e-10f)
+-        val snr=(original.referenceSignal/sqrt(variance)).coerceAtLeast(0f)
+-        return original.copy(referenceSnr=snr,
+-            referenceShadowReadVariance=greenRead/greens.coerceAtLeast(1),
+-            baseSpatialScale=MgcSpatialMergeTuning.baseSpatialScale(
+-                referenceSnr=snr, frameCount=normalCount, outputMode=outputMode))
+-    }
+-
+     private fun calibrationForFrame(
+         frame: RawStackFrame,
+         exposureScale: Float,
+diff --git a/app/version.properties b/app/version.properties
+index 64d3166ae761dc878706bd61ff4a552e2cb953a0..b6013e206226244e58e471e2c297052b0e9e5895 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726861
+-VERSION_BUILD=26861
++VERSION_NAME=0.9726860
++VERSION_BUILD=26860
