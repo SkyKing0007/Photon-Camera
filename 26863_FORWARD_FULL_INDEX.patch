@@ -1,0 +1,515 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856AmazeCfaHandoff.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856AmazeCfaHandoff.kt
+index 213c4f6acabdad02ffb10ad4f06b4dfc5bda746d..06794141394c6e372f7b96c21132e0c3621e774a 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856AmazeCfaHandoff.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856AmazeCfaHandoff.kt
+@@ -30,10 +30,12 @@ internal object GlesIris26856AmazeCfaHandoff {
+         precision highp int;
+         uniform sampler2D uWeightedPhases;
+         uniform sampler2D uSharedSupport;
++        uniform sampler2D uPhaseNoiseMoments26863;
+         uniform ivec2 uCellSize;
+         uniform int uBayerPattern;
+         layout(location=0) out vec4 oPackedSensorCfa;
+         layout(location=1) out vec4 oPhysicalSupport;
++        layout(location=2) out vec4 oBNoiseVariance26863;
+         void main() {
+             ivec2 q = clamp(ivec2(gl_FragCoord.xy), ivec2(0), uCellSize - ivec2(1));
+             vec4 weighted = texelFetch(uWeightedPhases, q, 0);
+@@ -50,7 +52,17 @@ internal object GlesIris26856AmazeCfaHandoff {
+             // No [0,1] clipping: a future physical SHORT/extended-HDR owner
+             // needs actual camera-linear radiance, not flattened highlights.
+             oPackedSensorCfa = canonical;
+-            oPhysicalSupport = vec4(support, valid, 0.0, 0.0);
++            // The exact same admitted sum(w) normalizes both signal and variance.
++            vec4 physicalVariance = (max(texelFetch(uPhaseNoiseMoments26863,q,0),vec4(0.0))/256.0) /
++                max(support*support,1.0e-12) * valid;
++            vec4 noiseCanonical=physicalVariance;
++            if (uBayerPattern==1) noiseCanonical=physicalVariance.grab;
++            else if (uBayerPattern==2) noiseCanonical=physicalVariance.barg;
++            else if (uBayerPattern==3) noiseCanonical=physicalVariance.abgr;
++            float sumW2=texelFetch(uSharedSupport,q,0).a;
++            float effectiveN=support*support/max(sumW2,1.0e-8);
++            oPhysicalSupport = vec4(support,valid,effectiveN,0.0);
++            oBNoiseVariance26863=noiseCanonical;
+         }
+     """.trimIndent()
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt
+index d172a7d3f4d4395b6a99e0628e5e6722f74d85ec..1c95c8ca465d9f9dc6154d169f61ce6c1e285c23 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856True2xCfa.kt
+@@ -77,7 +77,7 @@ internal object GlesIris26856True2xCfa {
+     // plus the 16 pinned RAWR 160x160 / 34-channel scratch slots. Excludes the
+     // already-owned NORMAL frames and the independent JPEG output file.
+     private const val maximumTemporaryGpuBytes = 96L * 1024 * 1024
+-    private const val bytesPerExpandedPixel = 64L
++    private const val bytesPerExpandedPixel = 66L // 26863 B packed noise attachment
+     private const val rawrScratchBytes = 16L * 34 * 160 * 160 * 4
+ 
+     private fun evenCeiling(v: Double): Int {
+@@ -185,6 +185,8 @@ internal object GlesIris26856True2xCfa {
+         uniform vec4 uFlowScaleOffset;
+         uniform vec4 uPhaseGains;
+         uniform vec4 uPhaseBlackTerms;
++        uniform vec4 uPhaseNoiseShot26863;
++        uniform vec4 uPhaseNoiseRead26863;
+         uniform vec4 uCovRangeRg;
+         uniform vec2 uCovRangeB;
+         uniform float uRawClipThreshold;
+@@ -289,7 +291,7 @@ internal object GlesIris26856True2xCfa {
+             vec3 cov=covarianceAt(sampleUv);
+             float gain=channelAt(uPhaseGains,sensorPhase);
+             float black=channelAt(uPhaseBlackTerms,sensorPhase);
+-            float numerator=0.0,weight=0.0;
++            float numerator=0.0,weight=0.0,weightSquared=0.0;
+             for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx) {
+                 ivec2 p=base+ivec2(dx*2,dy*2);
+                 ivec2 local=p-uRawOrigin;
+@@ -302,12 +304,18 @@ internal object GlesIris26856True2xCfa {
+                 float k=exp2(-0.5*max(dist,0.0));
+                 numerator+=k*max(raw*gain+black,0.0);
+                 weight+=k;
++                weightSquared+=k*k;
+             }
+             float vote=weight>1e-5 ? admission : 0.0;
+             float normalized=weight>1e-5?numerator/weight:0.0;
+             // Pixel value is one observation per frame, never nine independent
+             // temporal measurements from the same RAW frame.
+-            oSignalWeight=vec4(normalized*vote,vote,vote*vote,0.0);
++            // A frame's nine local same-CFA samples are not nine temporal frames.
++            // Preserve their spatial kernel-square variance within one vote.
++            float perFrameVariance=(max(uPhaseNoiseShot26863[targetCanonical],0.0)*
++                max(normalized,0.0)+max(uPhaseNoiseRead26863[targetCanonical],0.0)) *
++                (weight>1.0e-5?weightSquared/(weight*weight):0.0);
++            oSignalWeight=vec4(normalized*vote,vote,vote*vote,256.0*vote*vote*perFrameVariance);
+             vec2 phase=fract(flow.xy*vec2(uRawFullSize));
+             int bin=(phase.x>=0.5?1:0)+(phase.y>=0.5?2:0);
+             oPhaseBins=bin==0?vec4(vote,0,0,0):
+@@ -359,9 +367,15 @@ internal object GlesIris26856True2xCfa {
+         precision highp float;
+         precision highp int;
+         uniform sampler2D uResolved;
++        uniform sampler2D uAccumulatedNoise26863;
+         uniform int uBayerPattern;
+         layout(location=0) out vec4 oPackedCanonical;
+         layout(location=1) out vec4 oSupport;
++        layout(location=2) out vec4 oBNoiseVariance26863;
++        float siteVariance(ivec2 q){
++            vec4 a=texelFetch(uAccumulatedNoise26863,q,0);
++            return a.g>1.0e-6?(max(a.a,0.0)/256.0)/max(a.g*a.g,1.0e-12):0.0;
++        }
+         void main() {
+             ivec2 p=ivec2(gl_FragCoord.xy)*2;
+             vec4 tl=texelFetch(uResolved,p,0);
+@@ -377,6 +391,13 @@ internal object GlesIris26856True2xCfa {
+             oPackedCanonical=valid>0.5?canonical:vec4(0.0);
+             oSupport=vec4(min(min(tl.b,tr.b),min(bl.b,br.b)),valid,
+                           min(min(tl.z,tr.z),min(bl.z,br.z)),0.0);
++            vec4 vPhysical=vec4(siteVariance(p),siteVariance(p+ivec2(1,0)),
++                siteVariance(p+ivec2(0,1)),siteVariance(p+ivec2(1,1)));
++            vec4 vCanonical=vPhysical;
++            if(uBayerPattern==1)vCanonical=vPhysical.yxwz;
++            else if(uBayerPattern==2)vCanonical=vPhysical.zwxy;
++            else if(uBayerPattern==3)vCanonical=vPhysical.wzyx;
++            oBNoiseVariance26863=valid>0.5?vCanonical:vec4(0.0);
+         }
+     """.trimIndent()
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26863BNoiseContinuity.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26863BNoiseContinuity.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..ebe004d1fe3b2024da327bb77d08cb19fc84ffe4
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26863BNoiseContinuity.kt
+@@ -0,0 +1,93 @@
++package com.hinnka.mycamera.processor
++
++/**
++ * IRIS_26863_B_MEASURED_NOISE_POST_LSC_OWNER.
++ * Measured per-phase RAW variance travels through both B CFA routes to this
++ * *post physical-LSC* camera-linear RGB residual pass. This is NOT the A 26853
++ * spatial smoother, an assumed Camera2 noise profile, or a second WB stage.
++ * Demosaic correlations preclude claiming exact RGB covariance; use a bounded
++ * conservative envelope. Neither detail/luma nor the calibrated renderer is
++ * allowed to change. Source remains exposed as a sealed GLSL ES 300 string
++ * for exact compiled runtime expansion and unit-contract checks.
++ */
++internal object GlesIris26863BNoiseContinuity {
++    const val owner = "IRIS_26863_B_MEASURED_NOISE_POST_LSC_OWNER"
++    val residualChroma = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform sampler2D uPostLensSensorRgb;
++        uniform sampler2D uPackedMeasuredNoise;
++        uniform sampler2D uActualTemporalSupport;
++        uniform sampler2D uPhysicalLensShading;
++        uniform ivec2 uSize;
++        uniform ivec2 uOrigin;
++        uniform ivec2 uNativeSize;
++        uniform int uExpandedScale;
++        uniform int uUsePhysicalLsc;
++        layout(location=0) out vec4 oSensorRgb;
++        vec3 cameraLsc(ivec2 p) {
++            vec2 uv=(vec2(uOrigin+p)+vec2(0.5))/
++                (vec2(uNativeSize)*float(uExpandedScale));
++            if(uUsePhysicalLsc == 0) return vec3(1.0);
++            vec4 v=texture(uPhysicalLensShading,uv);
++            return vec3(v.r,0.5*(v.g+v.b),v.a);
++        }
++        vec4 noiseAt(ivec2 p) {
++            ivec2 s=textureSize(uPackedMeasuredNoise,0);
++            return max(texelFetch(uPackedMeasuredNoise,clamp(p/2,ivec2(0),s-ivec2(1)),0),vec4(0.0));
++        }
++        float luma(vec3 c){return dot(c,vec3(0.25,0.50,0.25));}
++        void main() {
++            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
++            vec4 center=texelFetch(uPostLensSensorRgb,p,0);
++            vec2 sup=texelFetch(uActualTemporalSupport,p/2,0).yz;
++            if(sup.x<0.5 || sup.y<1.01){oSensorRgb=center;return;}
++            vec4 phases=noiseAt(p);
++            vec3 gain=cameraLsc(p);
++            // G1 and G2 are correlated after demosaic. Their maximum is a
++            // conservative local camera-green uncertainty envelope, not a
++            // fabricated exact post-AMaZE covariance matrix.
++            vec3 variance=vec3(phases.r,max(phases.g,phases.b),phases.a)*gain*gain;
++            float luminanceSigma=sqrt(max(dot(variance,vec3(0.25,0.50,0.25)),1.0e-12));
++            vec2 chromaSigma=sqrt(max(vec2(variance.r+variance.g,
++                variance.b+variance.g),vec2(1.0e-12)));
++            float sigma=max(chromaSigma.x,chromaSigma.y);
++            if(sigma<0.0025 || sigma>0.8){oSensorRgb=center;return;}
++            float y=luma(center.rgb);
++            vec2 c0=vec2(center.r-center.g,center.b-center.g);
++            vec2 sumC=c0;
++            float sumW=1.0;
++            float maxGradient=0.0;
++            float maxChromaGradient=0.0;
++            for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx){
++                if(dx==0 && dy==0) continue;
++                ivec2 q=clamp(p+ivec2(dx,dy),ivec2(0),uSize-ivec2(1));
++                vec3 neighbor=texelFetch(uPostLensSensorRgb,q,0).rgb;
++                float grad=abs(luma(neighbor)-y);
++                maxGradient=max(maxGradient,grad);
++                vec2 nc=vec2(neighbor.r-neighbor.g,neighbor.b-neighbor.g);
++                vec2 dc=nc-c0;
++                maxChromaGradient=max(maxChromaGradient,length(dc));
++                float yNorm=grad*grad/max(4.0*luminanceSigma*luminanceSigma,0.000004);
++                float cNorm=dot(dc*dc,1.0/max(4.0*chromaSigma*chromaSigma,vec2(0.000002)));
++                float w=exp(-min(16.0,yNorm+cNorm));
++                sumC+=nc*w;sumW+=w;
++            }
++            // Universal structural veto (fabric/foliage/hair/text/mesh alike).
++            // Spatially coherent high-frequency signal remains untouched.
++            float structure=1.0-smoothstep(1.5,4.0,
++                max(maxGradient/max(luminanceSigma,0.001),
++                    maxChromaGradient/max(sigma,0.001)));
++            float noiseGate=smoothstep(0.0025,0.024,sigma);
++            float supportGate=clamp((sup.y-1.0)/3.0,0.15,1.0);
++            float influence=0.45*structure*noiseGate*supportGate;
++            vec2 proposed=(sumC/max(sumW,1.0)-c0)*influence;
++            vec2 bounded=clamp(proposed,-1.25*chromaSigma,1.25*chromaSigma);
++            vec3 rgbDelta=vec3(bounded.x,0.0,bounded.y);
++            // Zero luma residual prevents broad shadow/luma denoise and blur.
++            rgbDelta-=vec3(luma(rgbDelta));
++            oSensorRgb=vec4(center.rgb+rgbDelta,center.a);
++        }
++    """.trimIndent()
++}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+index b14c22b46cd6a52e59eef01d968fbc4e2f448955..b28116a91d22126624ac09be158a56ee047f71db 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSabreShaders.kt
+@@ -5487,11 +5487,11 @@ internal object GlesMgcRawSabreShaders {
+         /* R/G1/G2/B validity is provenance inside the SAME shared temporal admission.
+          * It can protect later SHORT/fusion decisions but can never choose frames per color. */
+         layout(location = 2) out vec4 oPhaseValidity;
+-        /* IRIS_26853_LOCAL_TEMPORAL_NOISE_MOMENTS
+-         * Shared admission stays single-owner. x accumulates sum(w^2); y accumulates the
+-         * weighted square of the same-frame four-phase quad mean. These are local statistics
+-         * only: never frame-count authority, never color selection, never global denoise strength. */
+-        layout(location = 3) out vec2 oTemporalStats26853;
++        /* IRIS_26863_B_PHASE_VARIANCE_CONTINUITY
++         * A: .xy remain exactly the proven 26853 moment pair in RG16F.
++         * B only: RGBA16F stores separate physical-phase sum(w_i^2 Var_i,p).
++         * No fifth MRT, no RGB selection, no extra temporal frame owner. */
++        layout(location = 3) out vec4 oTemporalStats26853;
+ 
+         vec2 mirrorUvs(vec2 uv) {
+             if (uv.x <= uFrameBorderPadded.x) uv.x = 2.0 * uFrameBorderPadded.x - uv.x;
+@@ -5661,14 +5661,22 @@ internal object GlesMgcRawSabreShaders {
+             float clipConfidence = pow(clamp(sharedHeadroom, 0.0, 1.0), remapExponent);
+             float quadMean26853 = dot(phaseSignal, vec4(0.25));
+             oPhaseSignal = phaseSignal * validWeight;
+-            oSharedSupport = vec4(validWeight, baseWeight, baseWeight * clipConfidence, 0.0);
++            // B's formerly reserved .w independently records admitted sum(w_i^2).
++            // A's .w remains exactly zero; A's source and GPU formats are protected.
++            float w2 = validWeight * validWeight;
++            oSharedSupport = vec4(validWeight, baseWeight, baseWeight * clipConfidence,
++                uBNoiseMomentOwner26858!=0 ? w2 : 0.0);
+             oPhaseValidity = phaseHeadroom * validWeight;
+-            float noiseMoment26858=dot(
+-                uPhaseNoiseShot26855*max(phaseSignal,vec4(0.0))+
+-                uPhaseNoiseRead26855,vec4(0.25));
+-            oTemporalStats26853 = vec2(validWeight * validWeight,
+-                uBNoiseMomentOwner26858!=0 ? validWeight*validWeight*noiseMoment26858
+-                    : quadMean26853*quadMean26853*validWeight);
++            // No reduction to four-phase mean: shot/read values are physical phase indexed.
++            // Same-frame spatial interpolation is represented conservatively by
++            // site variance at the interpolated signal (upper envelope).
++            vec4 phaseVariance26863 = max(uPhaseNoiseShot26855,vec4(0.0)) *
++                max(phaseSignal,vec4(0.0)) + max(uPhaseNoiseRead26855,vec4(0.0));
++            // 256x transport scale protects low-noise sensor variance from
++            // RGBA16F subnormal flush; packed handoff reverses it exactly.
++            oTemporalStats26853 = uBNoiseMomentOwner26858!=0 ?
++                (256.0*w2)*phaseVariance26863 :
++                vec4(w2,quadMean26853*quadMean26853*validWeight,0.0,0.0);
+         }
+     """.trimIndent()
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 79214cfcb6de6a28cd44735cd73599dd427858a7..3d2277801260c9551e288d9151a8827d460d836b 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -685,6 +685,7 @@ internal class GlesMgcRawSpatialStacker(
+     private var iris26858BClipNormalizeProgram = 0
+     private var iris26858BHighlightProgram = 0
+     private var iris26859BLensShadeProgram = 0
++    private var iris26863BPostLscNoiseProgram = 0
+     // B-only per-capture tiny Camera2 lens map, allocated once and inherited
+     // release() owns cleanup across 1x, true2x tiles and capture exceptions.
+     private var iris26859BLensMapTexture = 0
+@@ -2506,7 +2507,9 @@ internal class GlesMgcRawSpatialStacker(
+                 extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+             )
+             val normalCfaTemporalStats26853 = createTexture(
+-                extractedWidth, extractedHeight, GLES30.GL_RG16F, GLES30.GL_NEAREST,
++                extractedWidth, extractedHeight,
++                if (iris26856AmazeCfaConsumer != null) GLES30.GL_RGBA16F else GLES30.GL_RG16F,
++                GLES30.GL_NEAREST,
+             )
+             clearSabreNormalCfaTemporal26852(
+                 normalCfaSignals26852, normalCfaSupport26852, normalCfaValidity26852,
+@@ -3354,6 +3357,9 @@ internal class GlesMgcRawSpatialStacker(
+                 val measuredSupport = createTexture(
+                     extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
+                 )
++                val measuredNoise26863 = createTexture(
++                    extractedWidth, extractedHeight, GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
++                )
+                 val rawrColor = checkNotNull(iris26856RawrColor) {
+                     "26856 B cannot execute AMaZE without immutable Camera2 color contract"
+                 }.cloneForCapture()
+@@ -3363,9 +3369,11 @@ internal class GlesMgcRawSpatialStacker(
+                     GLES30.glUseProgram(prog)
+                     bindTexture(prog, "uWeightedPhases", 0, referenceExtracted)
+                     bindTexture(prog, "uSharedSupport", 1, normalCfaSupport26852)
++                    bindTexture(prog, "uPhaseNoiseMoments26863", 2, normalCfaTemporalStats26853)
+                     uniform2i(prog, "uCellSize", extractedWidth, extractedHeight)
+                     uniform1i(prog, "uBayerPattern", cfaPattern)
+-                    draw(prog, extractedWidth, extractedHeight, intArrayOf(packed, measuredSupport))
++                    draw(prog, extractedWidth, extractedHeight,
++                        intArrayOf(packed, measuredSupport, measuredNoise26863))
+                     GlesGpuScheduler.memoryBarrier()
+                     // The support texture is temporary confidence evidence only;
+                     // it may never be substituted for the pinned AMaZE CFA input.
+@@ -3374,11 +3382,14 @@ internal class GlesMgcRawSpatialStacker(
+                     iris26856RawrRgbSidecar = renderRawrBPostAmaze26856(
+                         amazePostWb, rawrColor, labDefringeStrength = 1f,
+                         bClipRatio26858 = iris26858BClipRatio,
++                        bNoiseVariance26863 = measuredNoise26863,
++                        bNoiseSupport26863 = measuredSupport,
+                     )
+                 } finally {
+                     releaseOwnedTexture(amazePostWb, "26856 consumed AMaZE WB RGB")
+                     releaseOwnedTexture(packed, "26856 AMaZE packed CFA short-lived handoff")
+-                    releaseOwnedTexture(measuredSupport, "26856 AMaZE local support short-lived handoff")
++                    releaseOwnedTexture(measuredSupport, "26863 B measured support after post-LSC residual cleanup")
++                    releaseOwnedTexture(measuredNoise26863, "26863 B per-phase uncertainty after post-LSC cleanup")
+                 }
+             }
+ 
+@@ -3651,6 +3662,7 @@ internal class GlesMgcRawSpatialStacker(
+                         iris26856B2xShortGainGuide,
+                         shadowLongLumaGain26833,
+                         iris26858BClipRatio,
++                        bBurstNoise26860,
+                     )
+                     cleanupTrue2xEvidence(true2xEvidence)
+                     true2xEvidence.clear()
+@@ -4324,6 +4336,7 @@ internal class GlesMgcRawSpatialStacker(
+                     iris26856B2xShortGainGuide,
+                     shadowLongLumaGain26833,
+                     iris26858BClipRatio,
++                    bBurstNoise26860,
+                 )
+                 if (iris26856B2xShortGainGuide != 0) {
+                     releaseOwnedTexture(iris26856B2xShortGainGuide,
+@@ -6639,6 +6652,42 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /* IRIS_26863_B_AFTER_PHYSICAL_LSC_BEFORE_TEMPORARY_WB.
++     * Native RGB output is still sensor-neutral. B-derived per-site uncertainty
++     * and independent temporal support are both mandatory and tile-local.
++     * No new CCM, WB, tone mapping, color-domain conversion or A fallback. */
++    private fun renderIris26863BPostLscChroma(
++        input: Int, noise: Int, support: Int, w: Int, h: Int,
++        originX: Int, originY: Int, expandedScale: Int,
++    ): Int {
++        require(input != 0 && noise != 0 && support != 0)
++        if (iris26863BPostLscNoiseProgram == 0) iris26863BPostLscNoiseProgram = linkProgram(
++            GlesIris26863BNoiseContinuity.residualChroma,
++            "iris_26863_b_measured_noise_post_lsc",
++        )
++        val output=createTexture(w,h,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++        var done=false
++        try {
++            val prog=iris26863BPostLscNoiseProgram
++            GLES30.glUseProgram(prog)
++            bindTexture(prog,"uPostLensSensorRgb",0,input)
++            bindTexture(prog,"uPackedMeasuredNoise",1,noise)
++            bindTexture(prog,"uActualTemporalSupport",2,support)
++            bindTexture(prog,"uPhysicalLensShading",3,
++                if (iris26859BLensMapTexture != 0) iris26859BLensMapTexture else noise)
++            uniform1i(prog,"uUsePhysicalLsc",if (iris26859BLensMapTexture != 0) 1 else 0)
++            uniform2i(prog,"uSize",w,h)
++            uniform2i(prog,"uOrigin",originX,originY)
++            uniform2i(prog,"uNativeSize",width,height)
++            uniform1i(prog,"uExpandedScale",expandedScale)
++            draw(prog,w,h,intArrayOf(output))
++            GlesGpuScheduler.memoryBarrier()
++            checkGlError("26863 B measured RAW noise after physical LSC")
++            done=true
++            return output
++        } finally { if(!done)releaseOwnedTexture(output,"26863 aborted B post LSC") }
++    }
++
+     /* IRIS_26856_B_ONLY_POST_AMAZE_CAMERA_RGB_DOMAIN
+      * Pinned AMaZE exports SENSOR-NEUTRAL camera-linear RGB (native
+      * amaze_export.comp already divides by temporary WB). Restore those WB
+@@ -6657,7 +6706,12 @@ internal class GlesMgcRawSpatialStacker(
+         bClipRatio26858: Int = 0,
+         bOriginX26858: Int = 0, bOriginY26858: Int = 0,
+         bExpandedScale26858: Int = 1,
++        bNoiseVariance26863: Int,
++        bNoiseSupport26863: Int,
+     ): Int {
++        require(bNoiseVariance26863 != 0 && bNoiseSupport26863 != 0) {
++            "26863 B cannot discard measured RAW-burst uncertainty after AMaZE"
++        }
+         check(amazePostWbCameraRgb != 0) { "26856 B missing true RAWR AMaZE RGB" }
+         require(labDefringeStrength.isFinite() && labDefringeStrength in 0f..1f)
+         // B-only: native export is SENSOR-NEUTRAL, never post-WB. The single
+@@ -6665,6 +6719,7 @@ internal class GlesMgcRawSpatialStacker(
+         // the final Iris calibrated sensor-RGB renderer. 1.0x/zoom/2x share it.
+         var temporaryPostWb = 0
+         var bLensCorrected26859 = 0
++        var bNoiseCorrected26863 = 0
+         var bRecovered26858 = 0
+         var defringed = 0
+         var fcc = 0
+@@ -6677,6 +6732,15 @@ internal class GlesMgcRawSpatialStacker(
+                 amazePostWbCameraRgb, processingWidth, processingHeight,
+                 bOriginX26858,bOriginY26858,bExpandedScale26858,
+             )
++            // IRIS_26863_B_MEASURED_NOISE_POST_LSC: the actual physical LSC
++            // gains square into phase-derived color uncertainty before the
++            // ONE bounded B-only residual pass, never using A/Camera2 noise.
++            bNoiseCorrected26863 = renderIris26863BPostLscChroma(
++                if(bLensCorrected26859!=0)bLensCorrected26859 else amazePostWbCameraRgb,
++                bNoiseVariance26863, bNoiseSupport26863,
++                processingWidth, processingHeight,
++                bOriginX26858,bOriginY26858,bExpandedScale26858,
++            )
+             if (iris26857ApplyAmazeWbProgram == 0) {
+                 iris26857ApplyAmazeWbProgram = linkProgram(
+                     GlesIris26856RawrColorContract.applyAmazeWbForLabFcc,
+@@ -6687,7 +6751,7 @@ internal class GlesMgcRawSpatialStacker(
+             val applyProgram = iris26857ApplyAmazeWbProgram
+             GLES30.glUseProgram(applyProgram)
+             bindTexture(applyProgram, "uSensorNeutralAmazeRgb", 0,
+-                if(bLensCorrected26859!=0)bLensCorrected26859 else amazePostWbCameraRgb)
++                bNoiseCorrected26863)
+             uniform2i(applyProgram, "uSize", processingWidth, processingHeight)
+             val gains = snapshot.amazeWhiteBalance
+             GLES30.glUniform3f(GLES30.glGetUniformLocation(applyProgram, "uAmazeWb"),
+@@ -6735,6 +6799,8 @@ internal class GlesMgcRawSpatialStacker(
+             return neutral
+         } finally {
+             if (temporaryPostWb != 0) releaseOwnedTexture(temporaryPostWb, "26857 consumed Lab temporary WB input")
++            if (bNoiseCorrected26863 != 0) releaseOwnedTexture(bNoiseCorrected26863,
++                "26863 B noise-aware post-LSC RGB consumed")
+             if (bLensCorrected26859 != 0) releaseOwnedTexture(bLensCorrected26859,"26859 B one-time sensor LSC")
+             if (bRecovered26858 != 0) releaseOwnedTexture(bRecovered26858, "26858 B highlight before Lab")
+             if (defringed != 0) releaseOwnedTexture(defringed, "26856 consumed RAWR Lab result")
+@@ -17254,7 +17320,11 @@ internal class GlesMgcRawSpatialStacker(
+         physicalShortGainGuide: Int,
+         physicalLongLumaGuide: Int,
+         bClipRatio26858: Int,
++        bNoiseProfile26863: GlesIris26860BBurstNoise.Profile?,
+     ): File {
++        check(bNoiseProfile26863?.fullyMeasured == true) {
++            "26863 B true2x requires all four independently measured RAW phases"
++        }
+         val consumer = checkNotNull(iris26856AmazeCfaConsumer) {
+             "26856 B 2x requires the real pinned RAWR Vulkan consumer"
+         }
+@@ -17382,6 +17452,24 @@ internal class GlesMgcRawSpatialStacker(
+                                         ev.flowOffsetX, ev.flowOffsetY)
+                                     uniform4fv(p, "uPhaseGains", ev.calibration.bayerPhaseGains)
+                                     uniform4fv(p, "uPhaseBlackTerms", ev.calibration.bayerPhaseBlackTerms)
++                                    // True2x noise is canonical in the shader but was
++                                    // measured by the burst fit in physical Bayer order.
++                                    val rawNoise26863 = checkNotNull(bNoiseProfile26863)
++                                    val phaseToCanonical26863 = when(cfaPattern) {
++                                        0 -> intArrayOf(0,1,2,3)
++                                        1 -> intArrayOf(1,0,3,2)
++                                        2 -> intArrayOf(2,3,0,1)
++                                        else -> intArrayOf(3,2,1,0)
++                                    }
++                                    val shotCanonical26863 = FloatArray(4)
++                                    val readCanonical26863 = FloatArray(4)
++                                    for (ph in 0..3) {
++                                        val chan=phaseToCanonical26863[ph]
++                                        shotCanonical26863[chan]=rawNoise26863.shot[ph]
++                                        readCanonical26863[chan]=rawNoise26863.read[ph]
++                                    }
++                                    uniform4fv(p, "uPhaseNoiseShot26863", shotCanonical26863)
++                                    uniform4fv(p, "uPhaseNoiseRead26863", readCanonical26863)
+                                     uniform4f(p, "uCovRangeRg", COV_MIN_R, COV_MAX_R-COV_MIN_R,
+                                         COV_MIN_G, COV_MAX_G-COV_MIN_G)
+                                     uniform2f(p, "uCovRangeB", COV_MIN_B, COV_MAX_B-COV_MIN_B)
+@@ -17427,11 +17515,13 @@ internal class GlesMgcRawSpatialStacker(
+                     draw(prog, tw, th, intArrayOf(resolved))
+                     val packed = createTexture(tw / 2, th / 2, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+                     val support = createTexture(tw / 2, th / 2, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++                    val measuredNoise26863 = createTexture(tw/2,th/2,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+                     prog = iris26856B2xPackProgram
+                     GLES30.glUseProgram(prog)
+                     bindTexture(prog, "uResolved", 0, resolved)
++                    bindTexture(prog, "uAccumulatedNoise26863", 1, weighted)
+                     uniform1i(prog, "uBayerPattern", cfaPattern)
+-                    draw(prog, tw / 2, th / 2, intArrayOf(packed, support))
++                    draw(prog, tw / 2, th / 2, intArrayOf(packed, support, measuredNoise26863))
+                     // CPU inspects ONLY the small tile validity carrier. The
+                     // full frame is never transferred or used as fake RGB.
+                     val supportBytes = allocateTrue2xHostBuffer(
+@@ -17460,6 +17550,8 @@ internal class GlesMgcRawSpatialStacker(
+                         bOriginX26858 = tile.expandedLeft,
+                         bOriginY26858 = tile.expandedTop,
+                         bExpandedScale26858 = 2,
++                        bNoiseVariance26863 = measuredNoise26863,
++                        bNoiseSupport26863 = support,
+                     )
+                     try {
+                         if (short2xProgram != 0) {
+diff --git a/app/version.properties b/app/version.properties
+index 77e1b95a8ae38c8c3351e783303ba8792377597e..fec2ed339107d95477005d020f670165406feed6 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726862
+-VERSION_BUILD=26862
++VERSION_NAME=0.9726863
++VERSION_BUILD=26863
