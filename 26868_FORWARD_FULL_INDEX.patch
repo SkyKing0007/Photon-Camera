@@ -1,0 +1,1446 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26868DirectLong.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26868DirectLong.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ab5efc02d457b8dc08861a294c7bcf06f83d5a5
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26868DirectLong.kt
+@@ -0,0 +1,139 @@
++package com.hinnka.mycamera.processor
++
++/**
++ * IRIS_26868_B_ONLY_SABRE_FREE_SINGLE_LONG.
++ * LONG is a different exposure and NEVER enters the multi-frame RAWR HDRq merge.
++ * Its physical RAW16 CFA receives the same black/white/LSC normalization
++ * and the existing genuine AMaZE demosaicer, then only a shadow-luma guide
++ * may influence the finished NORMAL result. No LONG chroma, fusion support,
++ * detail, or DNG output may be published.
++ */
++internal object GlesIris26868DirectLong {
++    val packCalibratedLong = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        precision highp usampler2D;
++        uniform highp usampler2D uPhysicalLongRaw16;
++        uniform highp sampler2D uPhysicalLensShading;
++        uniform ivec2 uSensorSize;
++        uniform vec4 uPhysicalBlack;
++        uniform float uPhysicalWhite;
++        uniform float uReferenceOverLongExposure;
++        uniform int uPhysicalBayer;
++        layout(location=0) out vec4 oAmazeCanonicalCfa;
++        layout(location=1) out vec4 oLongClip;
++        ivec2 site(ivec2 c,int ch) {
++            ivec2 tl=c*2;
++            if(uPhysicalBayer==0) {
++                if(ch==0)return tl;
++                if(ch==1)return tl+ivec2(1,0);
++                if(ch==2)return tl+ivec2(0,1);
++                return tl+ivec2(1,1);
++            }
++            if(uPhysicalBayer==1) {
++                if(ch==0)return tl+ivec2(1,0);
++                if(ch==1)return tl;
++                if(ch==2)return tl+ivec2(1,1);
++                return tl+ivec2(0,1);
++            }
++            if(uPhysicalBayer==2) {
++                if(ch==0)return tl+ivec2(0,1);
++                if(ch==1)return tl+ivec2(1,1);
++                if(ch==2)return tl;
++                return tl+ivec2(1,0);
++            }
++            if(ch==0)return tl+ivec2(1,1);
++            if(ch==1)return tl+ivec2(0,1);
++            if(ch==2)return tl+ivec2(1,0);
++            return tl;
++        }
++        void main(){
++            ivec2 c=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSensorSize/2-1);
++            vec4 values=vec4(0.0);
++            float clipped=0.0;
++            for(int ch=0;ch<4;ch++){
++                ivec2 p=site(c,ch);
++                int phase=(p.y&1)*2+(p.x&1);
++                float raw=float(texelFetch(uPhysicalLongRaw16,p,0).r);
++                float black=uPhysicalBlack[phase];
++                float normalized=clamp((raw-black)/max(1.0,uPhysicalWhite-black),0.0,1.0);
++                // Native pinned RAWR uses the same canonical LSC ordering:
++                // R,G,G,B, with the green map indexed by physical sensor row.
++                // Exactly mirror the pinned native RAWR physical LSC grid:
++                // map x/(sensorW-1) to [0, mapW-1] (GL_LINEAR texel centers).
++                // Green-even/green-odd use PHYSICAL sensor row, not Bayer
++                // channel order; both greens must not sample the same plane.
++                ivec2 mapSize=textureSize(uPhysicalLensShading,0);
++                vec2 sensorRange=vec2(max(uSensorSize-ivec2(1),ivec2(1)));
++                vec2 mapRange=vec2(max(mapSize-ivec2(1),ivec2(0)));
++                vec2 lscUv=(vec2(p)/sensorRange*mapRange+vec2(0.5))/vec2(mapSize);
++                vec4 lsc=texture(uPhysicalLensShading,lscUv);
++                float lensGain=ch==0?lsc.r:(ch==3?lsc.a:
++                    ((p.y&1)==0?lsc.g:lsc.b));
++                float v=normalized*lensGain*uReferenceOverLongExposure;
++                values[ch]=max(0.0,v);
++                clipped=max(clipped,step(0.985,normalized));
++            }
++            oAmazeCanonicalCfa=values;
++            oLongClip=vec4(clipped,0.0,0.0,1.0);
++        }
++    """.trimIndent()
++
++    // This is explicitly NOT a motion estimator: trust is zero when source
++    // contours disagree. A single LONG cannot override a moving NORMAL edge.
++    // The only permitted reduction is low-frequency shadow luminance noise.
++    val trustedShadowGain = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform highp sampler2D uNormalCameraRgb;
++        uniform highp sampler2D uLongCameraRgb;
++        uniform highp sampler2D uLongCfaClip;
++        uniform ivec2 uImageSize;
++        layout(location=0) out vec4 oShadowGain;
++        float lum(vec3 c){return dot(max(c,vec3(0.0)),vec3(0.25,0.5,0.25));}
++        float readLum(sampler2D t,ivec2 p){
++            return lum(texelFetch(t,clamp(p,ivec2(0),uImageSize-1),0).rgb);
++        }
++        void main(){
++            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uImageSize-1);
++            float normalNow=readLum(uNormalCameraRgb,p);
++            float longNow=readLum(uLongCameraRgb,p);
++            float normalLow=0.0;
++            float longLow=0.0;
++            for(int y=-2;y<=2;y++)for(int x=-2;x<=2;x++){
++                ivec2 q=p+ivec2(x,y);
++                normalLow+=readLum(uNormalCameraRgb,q);
++                longLow+=readLum(uLongCameraRgb,q);
++            }
++            normalLow/=25.0;
++            longLow/=25.0;
++            // Large registration, moving subjects, edge disagreement, clipping,
++            // invalid measured light, and well-exposed areas all veto LONG.
++            float highNormal=normalNow-normalLow;
++            float highLong=longNow-longLow;
++            float structureAgreement=1.0-smoothstep(0.012,0.055,
++                abs(highNormal-highLong));
++            float radianceAgreement=1.0-smoothstep(0.12,0.38,
++                abs(longLow-normalLow)/max(max(normalLow,longLow),0.02));
++            float shadowOnly=1.0-smoothstep(0.07,0.32,normalLow);
++            float clip=texelFetch(uLongCfaClip,p/2,0).r;
++            // Uniform black is never a source of reliable shadow structure:
++            // forbid multiplying near-black read noise or negative leakage.
++            float measuredLight=smoothstep(0.008,0.035,max(longLow,normalLow));
++            float valid=measuredLight*(1.0-step(0.5,clip));
++            float trust=clamp(structureAgreement*radianceAgreement*
++                shadowOnly*valid,0.0,1.0);
++            // The detail/high-pass belongs to multi-frame NORMAL. LONG may
++            // replace only a bounded fraction of the low-frequency component.
++            float targetLow=mix(normalLow,longLow,trust*0.6);
++            float target=max(0.0,targetLow+highNormal);
++            float gain=clamp(target/max(normalNow,0.015),0.82,1.18);
++            // Subpixel bias should not multiply shadow grain near black.
++            gain=mix(1.0,gain,trust);
++            if(isnan(gain)||isinf(gain))gain=1.0;
++            oShadowGain=vec4(gain,trust,0.0,1.0);
++        }
++    """.trimIndent()
++}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index 404fe1cf88f343a6b4d6fdfbb60daf285dd0cd50..90b78835957a848141d6917d7c914e211628a9f6 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -58,6 +58,7 @@ internal class GlesMgcRawFusion(
+      * Vulkan callback through Fusion -> Sabre to the live spatial stacker.
+      * Historical A continues with the default false/null arguments. */
+     private val iris26864RealRawrOwnsBurstNoise: Boolean = false,
++    private val iris26868ReferenceTimestampNs: Long = -1L,
+     private val iris26864NativeWronski2x: ((outputRgb: Int, outputSensorClip: Int) -> Unit)? = null,
+ ) {
+     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+@@ -67,6 +68,56 @@ internal class GlesMgcRawFusion(
+             frames.forEach { it.image.close() }
+             return null
+         }
++        /* IRIS_26868_BYPASS_SABRE_WRAPPER
++         * Direct B uses the already-frozen complete RAW population, not
++         * SabreProcessor's frame admission, flow/merge, shader initialization
++         * or reference reordering. The low-level B dispatcher precedes any
++         * MGC/Sabre allocation and invokes pinned native RAWR HDRq directly.
++         * A/NIGHT and the exact >=1.10x A route never enter this branch.
++         */
++        if (iris26856BOnlyIndependentPublication && iris26864RealRawrOwnsBurstNoise) {
++            check(!exactHistorical26850 && iris26856AmazeCfaConsumer != null &&
++                iris26856RawrColor != null) {
++                "26868 direct B requires an explicit real native ownership contract"
++            }
++            return GlesMgcRawSpatialStacker(
++                width = width,
++                height = height,
++                cfaPattern = cfaPattern,
++                blackLevel = blackLevel,
++                whiteLevel = whiteLevel,
++                whiteBalanceGains = whiteBalanceGains,
++                noiseProfileSelection = noiseProfileSelection,
++                lensShading = lensShading,
++                lensShadingWidth = lensShadingWidth,
++                lensShadingHeight = lensShadingHeight,
++                outputMode = MgcSpatialOutputMode.RGB,
++                mergeMethod = MgcMergeMethod.SABRE,
++                outputScale = 1f,
++                useCurrentGlContext = useCurrentGlContext,
++                exportGpuLinearRgbSource = exportGpuLinearRgbSource,
++                gpuLinearRgbStorage = gpuLinearRgbStorage,
++                processorPipeline = MgcRawProcessorPipeline.SABRE,
++                exportNormalStackedDng = exportNormalStackedDng,
++                vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
++                preserveExtendedHdrThroughVgn = preserveExtendedHdrThroughVgn,
++                enableSabreSuperRes = enableSabreSuperRes,
++                sabreSuperResTempDir = sabreSuperResTempDir,
++                enableHighZoomDetail = enableHighZoomDetail,
++                highZoomSourceZoom = highZoomSourceZoom,
++                adaptiveSnrChromaDenoise = adaptiveSnrChromaDenoise,
++                residualChromaCustom = residualChromaCustom,
++                edgeFalseColor26778 = edgeFalseColor26778,
++                referenceProtectionEv = referenceProtectionEv,
++                iris26856AmazeCfaConsumer = iris26856AmazeCfaConsumer,
++                iris26856RawrColor = iris26856RawrColor,
++                iris26856BTrue2x = iris26856BTrue2x,
++                iris26856BOnlyIndependentPublication = true,
++                iris26864RealRawrOwnsBurstNoise = true,
++                iris26868ReferenceTimestampNs = iris26868ReferenceTimestampNs,
++                iris26864NativeWronski2x = iris26864NativeWronski2x,
++            ).processFrames(frames)
++        }
+         return GlesIris26545SabreProcessor(
+             width = width,
+             height = height,
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 06a87d4a4158b4d3e72015b888dc5068acec6e68..ca9cc191a617706ff4f3550d5f42d444c035aa3d 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -132,6 +132,7 @@ internal class GlesMgcRawSpatialStacker(
+      * the fail-closed real Vulkan RAWR owner.
+      */
+     private val iris26864RealRawrOwnsBurstNoise: Boolean = false,
++    private val iris26868ReferenceTimestampNs: Long = -1L,
+     /* A/B capture-owned mode. B-only may leave after its own color + LONG + zoom are ready. */
+     private val iris26856BOnlyIndependentPublication: Boolean = false,
+ ) {
+@@ -843,6 +844,15 @@ internal class GlesMgcRawSpatialStacker(
+                     }}",
+             )
+         }
++        /* IRIS_26868_DIRECT_B_NATIVE_NORMAL_DISPATCH
++         * B's shutter-frozen NORMAL burst bypasses ALL MGC/Sabre shader
++         * initialization, guides, covariance, CFA temporal accumulators,
++         * Resolve and VGN. A/Night retain the old dispatcher unchanged.
++         * This entry uses the same typed AMaZE, 26867 clipping and true2x
++         * renderer with an actual direct Vulkan HDRq invocation. */
++        if (iris26856BOnlyIndependentPublication && iris26864RealRawrOwnsBurstNoise) {
++            return processIris26868DirectB(frames)
++        }
+         if (processorPipeline == MgcRawProcessorPipeline.SABRE) {
+             return processSabreFrames(frames)
+         }
+@@ -2224,6 +2234,241 @@ internal class GlesMgcRawSpatialStacker(
+         }
+     }
+ 
++    /* IRIS_26868_DIRECT_B_NATIVE_HDRQ_CONTRACT
++     * No preceding Sabre passes. The native callback ignores the former
++     * Sabre packed CFA parameter and reads the pinned shutter-frozen NORMAL
++     * RawStackFrames, including their true RAW16/black/exposure provenance.
++     * DO NOT fall back to Sabre on a native/Vulkan/AMaZE error.
++     */
++    private fun processIris26868DirectB(frames: List<RawStackFrame>): RawStackResult? {
++        require(processorPipeline == MgcRawProcessorPipeline.SABRE &&
++            (!enableSabreSuperRes || iris26856BTrue2x) && !enableHighZoomDetail &&
++            iris26856RawrColor != null && iris26856AmazeCfaConsumer != null &&
++            gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F &&
++            exportGpuLinearRgbSource && useCurrentGlContext) {
++            "26868 direct B requires the existing immutable native HDRq + B color contract"
++        }
++        val normals = frames.filter { it.role == RawBurstFrameRole.NORMAL }
++        require(normals.size >= 2 && frames.firstOrNull()?.role == RawBurstFrameRole.NORMAL &&
++            normals.size + frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } +
++            frames.count { it.role == RawBurstFrameRole.HIGHLIGHT_SHORT } == frames.size) {
++            "26868 direct B requires complete frozen NORMAL plus separate auxiliary roles"
++        }
++        val selectedReference = normals.singleOrNull {
++            it.sensorTimestampNs == iris26868ReferenceTimestampNs
++        } ?: error("26868 LONG/RAWR selected shutter NORMAL reference lost")
++        require(normals.map { it.sensorTimestampNs }.distinct().size == normals.size &&
++            normals.map { it.physicalCameraId }.distinct().size == 1 &&
++            normals.all { it.image.width == width && it.image.height == height &&
++                it.image.format == ImageFormat.RAW_SENSOR }) {
++            "26868 direct B immutable NORMAL provenance was lost"
++        }
++        // Motion SHORT is permanently retired, but never silently drop a
++        // resurrected request. DNG remains on the untouched A-owned algorithm
++        // and needs a separate optional source-lifetime adapter before release.
++        check(frames.none { it.role == RawBurstFrameRole.HIGHLIGHT_SHORT } &&
++            !exportNormalStackedDng) {
++            "26868 Motion SHORT retired; optional A DNG adapter still required"
++        }
++        var nativeRgb = 0
++        var nativeClip = 0
++        var sensorNeutralB = 0
++        var bridgeRgb = 0
++        var twoX: Iris26864Wronski2xPublication? = null
++        var longGain26868 = 0
++        var returned = false
++        val oldPriority = GlesGpuScheduler.lowerCurrentThreadPriority("Iris26868DirectB")
++        try {
++            attachCurrentEgl()
++            ensureGles3()
++            renderFbo = createFramebuffer()
++            applyRawRenderState()
++            val contract = checkNotNull(iris26856RawrColor).cloneForCapture()
++            nativeRgb = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
++            nativeClip = checkNotNull(iris26856AmazeCfaConsumer)(
++                0, nativeRgb, width, height, cfaPattern, contract.amazeWhiteBalance.copyOf())
++            check(nativeClip > 0) {
++                "26868 actual native RAWR HDRq did not publish original sensor clipping"
++            }
++            sensorNeutralB = renderRawrBPostAmaze26856(
++                nativeRgb, contract, labDefringeStrength = 1f,
++                nativeSensorClipFullRes26866 = nativeClip,
++                bNoiseVariance26863 = 0, bNoiseSupport26863 = 0,
++                rawrNativeReceipt26864 = Iris26864NativeRawrDomainReceipt(true, true, true),
++            )
++            /* IRIS_26868_DIRECT_B_LONG_SINGLE_FRAME_AMAZE
++             * The separate physical LONG never enters pinned multi-frame
++             * frequency reconstruction, NORMAL noise support, or JPEG color.
++             * It can only provide locally vetted shadow luminance after its
++             * own physical CFA calibration and genuine AMaZE reconstruction.
++             */
++            frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG }?.let { long ->
++                check(frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } == 1) {
++                    "26868 direct B requires one immutable LONG, not a fake temporal burst"
++                }
++                /* A failed/unreliable auxiliary LONG must not invalidate
++                 * a successfully reconstructed complete NORMAL RAWR burst. */
++                longGain26868 = try {
++                    renderIris26868IndependentLongShadowGuide(
++                        long, selectedReference, sensorNeutralB,
++                    )
++                } catch (failure: Exception) {
++                    PLog.w(SABRE_TAG,"IRIS_26868_LONG_REJECTED_NORMAL_INTACT " +
++                        "reason=${failure.javaClass.simpleName} detail=${failure.message}")
++                    0
++                }
++                if (longGain26868 != 0) {
++                    val longApplied = createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++                    renderIris26856BVerifiedLongLuma(sensorNeutralB,longGain26868,
++                        longApplied,width,height,0,0,1)
++                    releaseOwnedTexture(sensorNeutralB,"26868 B NORMAL before trusted LONG luma")
++                    sensorNeutralB = longApplied
++                }
++            }
++            // True Wronski 2x owns the same complete frozen NORMAL batch;
++            // it is never the retired pseudo-phase-bin interpolation.
++            if (iris26856BTrue2x) {
++                twoX = reconstructIris26864PinnedWronski2x(
++                    checkNotNull(iris26864NativeWronski2x), contract.cloneForCapture(),
++                    0, longGain26868)
++            }
++            bridgeRgb = copyPersistentTexture(sensorNeutralB, width, height,
++                GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
++                "26868 direct B independent bridge transport")
++            check(bridgeRgb != sensorNeutralB && bridgeRgb != 0)
++            GlesGpuScheduler.memoryBarrier()
++            checkGlError("26868 native B direct NORMAL final")
++            val result = RawStackResult(
++                fusedBayerBuffer = null, width = width, height = height,
++                isNormalizedSensorData = true, blackLevel = FloatArray(4),
++                bufferLayout = RawStackBufferLayout.LINEAR_RGB,
++                inputRowStepSamples = width * 3, inputColStepSamples = 3,
++                gpuLinearRgbSource = GpuLinearRgbSource(bridgeRgb, width, height, 4,
++                    storage = GpuLinearRgbStorage.RGBA16F,
++                    clipZoneMaskTextureId26836 = nativeClip,
++                    clipZoneMaskWidth26836 = width, clipZoneMaskHeight26836 = height),
++                iris26856RawrRgbSidecar = GpuLinearRgbSource(sensorNeutralB, width, height, 4,
++                    storage = GpuLinearRgbStorage.RGBA16F),
++                lensShadingCorrectionApplied = true,
++                mergedFrameCount = normals.size,
++                iris26856BTrue2xRgbPath = twoX?.rgb?.absolutePath,
++                iris26864BTrue2xClipBitsPath = twoX?.clipBits?.absolutePath,
++                iris26856BTrue2xWidth = if (twoX != null) width * 2 else 0,
++                iris26856BTrue2xHeight = if (twoX != null) height * 2 else 0,
++            )
++            check(textures.remove(bridgeRgb) && textures.remove(sensorNeutralB)) {
++                "26868 direct B transfer is not owned by GPU frame allocator"
++            }
++            textureSpecs.remove(bridgeRgb)
++            textureSpecs.remove(sensorNeutralB)
++            bridgeRgb = 0
++            sensorNeutralB = 0
++            nativeClip = 0
++            returned = true
++            PLog.i("MgcSabre", "IRIS_26868_DIRECT_NATIVE_B_HDRQ " +
++                "normal=${normals.size} sabreFrameExec=0 sabreShaderInit=0 " +
++                "sabreCfaAlloc=0 rawrNativeNoise=true nativeLsc=true " +
++                "trueWronski2x=${twoX != null} owner=B")
++            return result
++        } finally {
++            if (!returned) {
++                twoX?.let {
++                    runCatching { it.rgb.delete() }
++                    runCatching { it.clipBits.delete() }
++                }
++            }
++            if (longGain26868 != 0) releaseOwnedTexture(longGain26868,
++                "26868 B independent LONG scalar guide complete")
++            if (nativeRgb != 0) releaseOwnedTexture(nativeRgb,
++                "26868 B consumed native RAWR post-AMaZE input")
++            if (!returned && nativeClip != 0) GLES30.glDeleteTextures(1, intArrayOf(nativeClip), 0)
++            frames.forEach { runCatching { it.image.close() } }
++            release()
++            GlesGpuScheduler.restoreCurrentThreadPriority(oldPriority, "Iris26868DirectB")
++        }
++    }
++
++    /** Independent LONG RAW16 → sensor-linear CFA → RAWR AMaZE → trusted scalar.
++     * No Sabre program is linked and no LONG pixel enters the NORMAL stack.
++     */
++    private fun renderIris26868IndependentLongShadowGuide(
++        long: RawStackFrame, reference: RawStackFrame, normalRgb: Int,
++    ): Int {
++        check(long.role == RawBurstFrameRole.SHADOW_LONG &&
++            reference.role == RawBurstFrameRole.NORMAL &&
++            long.physicalCameraId == reference.physicalCameraId &&
++            long.sensorTimestampNs != reference.sensorTimestampNs &&
++            long.image.width == width && long.image.height == height &&
++            long.image.format == ImageFormat.RAW_SENSOR)
++        val ratio = reference.exposureProduct / long.exposureProduct
++        if (!ratio.isFinite() || ratio <= 0.0 || ratio >= 1.0 ||
++            !reference.exposureProduct.isFinite() || reference.exposureProduct <= 0.0 ||
++            !long.exposureProduct.isFinite() || long.exposureProduct <= 0.0) {
++            PLog.w(SABRE_TAG,"IRIS_26868_LONG_EXPOSURE_VETO " +
++                "longExposureValid=${long.exposureProduct.isFinite() && long.exposureProduct > 0.0} " +
++                "normalExposureValid=${reference.exposureProduct.isFinite() && reference.exposureProduct > 0.0}")
++            return 0
++        }
++        val black = long.dynamicBlackLevelByCfaPosition ?:
++            FloatArray(4) { phase -> canonicalBlackLevel[canonicalChannelAtPhase(phase)] }
++        require(black.size == 4 && black.all { it.isFinite() && it >= 0f && it < sensorWhiteLevel })
++        var longRaw = 0
++        var lensMap = 0
++        var packed = 0
++        var clip = 0
++        var demosaiced = 0
++        var guide = 0
++        try {
++            longRaw=createTexture(width,height,GLES30.GL_R16UI,GLES30.GL_NEAREST)
++            uploadRaw(long.image,longRaw,"26868 independent physical LONG")
++            lensMap=createLensShadingTexture()
++            packed=createTexture(width/2,height/2,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++            clip=createTexture(width/2,height/2,GLES30.GL_R16F,GLES30.GL_NEAREST)
++            val p=linkProgram(GlesIris26868DirectLong.packCalibratedLong,
++                "iris_26868_b_single_long_raw_pack")
++            GLES30.glUseProgram(p)
++            bindTexture(p,"uPhysicalLongRaw16",0,longRaw)
++            bindTexture(p,"uPhysicalLensShading",1,lensMap)
++            uniform2i(p,"uSensorSize",width,height)
++            uniform4f(p,"uPhysicalBlack",black[0],black[1],black[2],black[3])
++            uniform1f(p,"uPhysicalWhite",sensorWhiteLevel)
++            uniform1f(p,"uReferenceOverLongExposure",ratio.toFloat())
++            uniform1i(p,"uPhysicalBayer",cfaPattern)
++            draw(p,width/2,height/2,intArrayOf(packed,clip))
++            GlesGpuScheduler.memoryBarrier()
++            checkGlError("26868 independent LONG physical calibration")
++            demosaiced=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
++            GlesIris26856AmazeNative.execute(
++                com.particlesdevs.photoncamera.app.PhotonCamera.getApplicationContextStatic(),
++                packed,demosaiced,width,height,cfaPattern,
++                checkNotNull(iris26856RawrColor).amazeWhiteBalance.copyOf())
++            guide=createTexture(width,height,GLES30.GL_RG16F,GLES30.GL_NEAREST)
++            val gain=linkProgram(GlesIris26868DirectLong.trustedShadowGain,
++                "iris_26868_b_single_long_shadow_confidence")
++            GLES30.glUseProgram(gain)
++            bindTexture(gain,"uNormalCameraRgb",0,normalRgb)
++            bindTexture(gain,"uLongCameraRgb",1,demosaiced)
++            bindTexture(gain,"uLongCfaClip",2,clip)
++            uniform2i(gain,"uImageSize",width,height)
++            draw(gain,width,height,intArrayOf(guide))
++            GlesGpuScheduler.memoryBarrier()
++            checkGlError("26868 independent LONG AMaZE confidence")
++            PLog.i(SABRE_TAG,"IRIS_26868_DIRECT_LONG_AMAZE_SINGLE " +
++                "longFrames=1 temporalMerge=false chroma=false " +
++                "normalDetailOwner=true dngOwner=false supportOwner=LOCAL_SHADOW_ONLY")
++            val result=guide
++            guide=0
++            return result
++        } finally {
++            if(longRaw!=0)releaseOwnedTexture(longRaw,"26868 LONG RAW uploaded")
++            if(lensMap!=0)releaseOwnedTexture(lensMap,"26868 LONG LSC consumed")
++            if(packed!=0)releaseOwnedTexture(packed,"26868 LONG packed CFA consumed")
++            if(clip!=0)releaseOwnedTexture(clip,"26868 LONG sensor clipping consumed")
++            if(demosaiced!=0)releaseOwnedTexture(demosaiced,"26868 LONG AMaZE RGB consumed")
++            if(guide!=0)releaseOwnedTexture(guide,"26868 aborted LONG guide")
++        }
++    }
++
+     private fun processSabreFrames(frames: List<RawStackFrame>): RawStackResult? {
+         require(processorPipeline == MgcRawProcessorPipeline.SABRE &&
+             mergeMethod == MgcMergeMethod.SABRE) {
+@@ -14332,6 +14577,7 @@ internal class GlesMgcRawSpatialStacker(
+             GLES30.GL_R16I,
+             GLES30.GL_R16UI -> 2
+             GLES30.GL_R32F,
++            GLES30.GL_RG16F,
+             GLES30.GL_RGB10_A2 -> 4
+             GLES30.GL_RGB16UI -> 6
+             GLES30.GL_RG32F,
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index c52fc9dcd6d52e02bfaf4f03cd49cac076d2e71d..b68d026394b142482f48c54ed852750417b81f05 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -1189,6 +1189,27 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     if (!mZslCapturing && !CaptureController.isProcessing && !burst
+                             && iris26715CameraSettled
+                             && mCameraDevice != null && mCaptureSession != null) {
++                        /* IRIS_26868_B_IDLE_NO_SABRE_PREWARM
++                         * This is an optimization hint from the current per-lens preference,
++                         * never the shutter-frozen routing authority. B's native RAWR GPU
++                         * device/pipelines are currently JNI-run owned, so warming a
++                         * throwaway Vulkan device would provide no first-shot benefit.
++                         * Until a persistent synchronization-safe native owner exists,
++                         * deliberately skip idle GPU warming for B. A keeps the exact
++                         * proven 26715 Sabre warmup; preview/ZSL are never stopped. */
++                        final boolean iris26868BSelected =
++                                com.particlesdevs.photoncamera.settings.Iris26856ABSettings.read(
++                                        com.particlesdevs.photoncamera.app.PhotonCamera.getApplicationContextStatic(),
++                                        physicalID,
++                                        com.particlesdevs.photoncamera.settings.PreferenceKeys.getCameraID())
++                                == com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855;
++                        if (iris26868BSelected) {
++                            // A must remain free to prewarm after a B-to-A settings change.
++                            mMotion26715IdlePrewarmScheduled.set(false);
++                            Log.i(TAG, "IRIS_26868_IDLE_NATIVE_B_PREWARM skipped=no_persistent_native_device "
++                                    + "sabrePrograms=false zslUntouched=true captureMathChanged=false");
++                            return;
++                        }
+                         boolean success = com.particlesdevs.photoncamera.processing.processor
+                                 .PhotonMotionMgc1271Bridge.prewarmCapturePrograms();
+                         Log.i(TAG, "IRIS_26715_IDLE_PIPELINE_PREWARM success=" + success
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 105e869dc8ba11bfaec40690832f4ce56cac8c14..6d81dd544a2ee88780dc9f7dbb98e5ce194cb828 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -735,8 +735,6 @@ private void ApplyHdrX() {
+                 processingParameters.motionV2SuperResOutputEnabled,
+                 processingParameters.motionV2OutputZoom);
+         final boolean iris26856BOnly = iris26856BRequestedOnly && !iris26864BHighZoomExactA;
+-        final boolean iris26856Both = cameraMode == CameraMode.MOTION
+-                && iris26856FrozenMode == Iris26856ABSettings.Mode.BOTH;
+         if (iris26864BHighZoomExactA) {
+             Log.i(TAG, "IRIS_26864_B_HIGH_ZOOM_EXACT_A_PUBLICATION frozen=B effective=A_26850_FULL "
+                     + "zoom=" + processingParameters.motionV2OutputZoom
+@@ -744,9 +742,6 @@ private void ApplyHdrX() {
+         }
+         ByteBuffer iris26856BBuffer = null;
+         MotionV2SharedRgba16fCarrier iris26856BSharedCarrier = null;
+-        Bitmap iris26856BBitmap = null;
+-        PostPipeline iris26856BPostPipeline = null;
+-        Parameters iris26856BPostParameters = null;
+         ByteBuffer output = null;
+         MotionV2SharedRgba16fCarrier iris26826SharedRgba16fCarrier = null;
+         int iris26726LinearRgbCarrierFormat = MotionV2Merger.Result.LINEAR_RGB_CARRIER_NONE;
+@@ -843,12 +838,12 @@ private void ApplyHdrX() {
+                     processingParameters.iris26856BHighZoomDetail != null
+                             ? processingParameters.iris26856BHighZoomDetail.path : null;
+             if (processingParameters.motionV2SuperResOutputEnabled &&
+-                    (iris26856BOnly || iris26856Both) && iris26856BTrue2xRgbPath == null) {
++                    iris26856BOnly && iris26856BTrue2xRgbPath == null) {
+                 throw new IllegalStateException("26856 B true2x missing; native-size JPEG fallback forbidden");
+             }
+             if (iris26856BTrue2xRgbPath != null &&
+                     (!processingParameters.motionV2SuperResOutputEnabled ||
+-                     !(iris26856BOnly || iris26856Both) ||
++                     !iris26856BOnly ||
+                      iris26856BTrue2xWidth != width * 2 ||
+                      iris26856BTrue2xHeight != height * 2)) {
+                 throw new IllegalStateException("26856 B true2x output geometry/mode invalid");
+@@ -874,14 +869,17 @@ private void ApplyHdrX() {
+             iris26522DngSupportMean = iris26409V2.dngSupportMean;
+             iris26522DngSupportMax = iris26409V2.dngSupportMax;
+             iris26522DngNoiseEquivalentSupport = iris26409V2.dngNoiseEquivalentSupport;
++            /* IRIS_26868_STRICT_PUBLICATION_OWNER. A (including B zoom>=1.10
++             * non-SR) and NIGHT require Sabre; direct B must never claim it. */
+             iris26545SabreSelected = iris26409V2.sabreSelected;
+-            if (!iris26545SabreSelected) {
+-                throw new IllegalStateException("26560 Sabre-only Motion returned a non-Sabre reconstruction result");
+-            }
+-            if (processingParameters.motionV2ReconstructionOwner
+-                    != Parameters.MOTION_V2_RECONSTRUCTION_SABRE) {
+-                throw new IllegalStateException("26560 Sabre-only reconstruction owner mismatch parameters="
+-                        + processingParameters.motionV2ReconstructionOwner);
++            final int expected26868Owner = iris26856BOnly
++                    ? Parameters.MOTION_V2_RECONSTRUCTION_RAWR_AMAZE
++                    : Parameters.MOTION_V2_RECONSTRUCTION_SABRE;
++            if (iris26545SabreSelected == iris26856BOnly
++                    || processingParameters.motionV2ReconstructionOwner != expected26868Owner) {
++                throw new IllegalStateException("26868 mismatched native B / Sabre publication owner: "
++                        + "selectedSabre=" + iris26545SabreSelected + " directB=" + iris26856BOnly
++                        + " parameters=" + processingParameters.motionV2ReconstructionOwner);
+             }
+             if (saveRAW >= 1 && iris26480DeferredDng == null) {
+                 throw new IllegalStateException("26545 Motion DNG requested but reconstruction sidecar is missing");
+@@ -928,7 +926,7 @@ private void ApplyHdrX() {
+                         iris26480DeferredDng = null;
+                     }
+                 } else {
+-                    if (processingParameters.motionV2SuperResOutputEnabled && !iris26856BOnly && !iris26856Both) {
++                    if (processingParameters.motionV2SuperResOutputEnabled && !iris26856BOnly) {
+                         Log.critical(TAG, "IRIS_26564_MOTION_TRUE2X_DNG_MISSING rawOnly=true");
+                     }
+                     ByteBuffer iris26520RawOnly = iris26480DeferredDng;
+@@ -1058,31 +1056,6 @@ private void ApplyHdrX() {
+                             + processingParameters.motionV2EffectiveSupport);
+         }
+ 
+-        /* IRIS_26856_AB_SAME_BURST_INDEPENDENT_POST
+-         * B renders from its own post-RAWR sensor-neutral RGB, never from A's
+-         * Sabre/VGN RGB or A's final JPEG bitmap. B runs first in AB so A's
+-         * historic post graph and publisher remain the last primary owner. */
+-        if (iris26856Both) {
+-            iris26856BPostParameters = processingParameters.snapshotForIndependentMotionPost26856();
+-            iris26856BPostParameters.prepareRawrBPublication26856(iris26856BTrue2xRgbPath != null);
+-            iris26856BPostPipeline = new PostPipeline();
+-            mIris26856BPostForCleanup = iris26856BPostPipeline;
+-            // PostPipeline takes full ownership of the carrier on entry.
+-            mIris26856BBufferForCleanup = null;
+-            mIris26856BSharedForCleanup = null;
+-            try {
+-                iris26856BBitmap = iris26856BPostPipeline.RunMotionV2FloatCfa(
+-                        iris26856BBuffer, iris26856BSharedCarrier, null,
+-                        MotionV2Merger.Result.LINEAR_RGB_CARRIER_RGBA16F,
+-                        iris26856BPostParameters);
+-                iris26856BBuffer = null;
+-                iris26856BSharedCarrier = null;
+-            } catch (RuntimeException | Error failure) {
+-                iris26856BBuffer = null; // PostPipeline owns and frees upon entry
+-                iris26856BSharedCarrier = null;
+-                throw failure; // No A-only fallback for a failed AB request
+-            }
+-        }
+         if (iris26856BOnly) {
+             // The A carrier is unselected in B mode and may not reach post.
+             if (output != null) Allocator.free(output);
+@@ -1179,7 +1152,7 @@ private void ApplyHdrX() {
+                     } else {
+                         // 26856 B and A+B deliberately keep the one normalized16
+                         // 26855 DNG owner; only historical A expects A's 2x DNG.
+-                        if (dngParams.motionV2SuperResOutputEnabled && !iris26856BOnly && !iris26856Both)
++                        if (dngParams.motionV2SuperResOutputEnabled && !iris26856BOnly)
+                             Log.critical(TAG, "IRIS_26564_MOTION_TRUE2X_DNG_MISSING deferred=true");
+                         dngBytes.position(0);
+                         saved = ImageSaver.Util.saveNormalized16StackedRaw(
+@@ -1230,13 +1203,11 @@ private void ApplyHdrX() {
+          * AB always saves two JPEGs; HEIC mode remains unchanged for A/B-only.
+          * Both pathnames derive from the single shutter-owned base filename. */
+         final boolean iris26856UseHeic = cameraMode == CameraMode.MOTION
+-                && mMotion26636HeicOutputEnabled && !iris26856Both;
++                && mMotion26636HeicOutputEnabled;
+         final String iris26856Extension = iris26856UseHeic ? ".heic" : ".jpg";
+         final String iris26856BasePath = imageFile.toAbsolutePath().toString();
+-        final Path iris26856SecondJpegPath = iris26856Both
+-                ? Paths.get(iris26856BasePath + "_B.jpg") : null;
+         imageFile = Paths.get(iris26856BasePath
+-                + (iris26856Both ? "_A" : iris26856BRequestedOnly ? "_B" : "")
++                + (iris26856BRequestedOnly ? "_B" : "")
+                 + iris26856Extension);
+         if (iris26856BRequestedOnly) {
+             // Arm rollback BEFORE a potentially partially successful encoder.
+@@ -1246,7 +1217,6 @@ private void ApplyHdrX() {
+         final long iris26513JpegSaveStartNs =
+                 cameraMode == CameraMode.MOTION ? System.nanoTime() : 0L;
+         boolean imageSaved = false;
+-        boolean iris26856BSavedForNotification = false;
+         try {
+         if (cameraMode == CameraMode.MOTION) {
+             /*
+@@ -1295,32 +1265,6 @@ private void ApplyHdrX() {
+                 iris26564True2xRenderRgbPath = null;
+                 mMotion26564True2xRenderRgbPathForCleanup = null;
+             }
+-            /* IRIS_26856_AB_SECOND_INDEPENDENT_HDR_JPEG
+-             * B's own PostPipeline provides its own SDR base, true linear HDR
+-             * gain map, crop and tone snapshot. A single frozen RAW batch and
+-             * DNG sidecar were already consumed; no extra shutter/capture. */
+-            if (iris26856Both) {
+-                if (iris26856BBitmap == null || iris26856BPostPipeline == null
+-                        || iris26856BPostParameters == null || iris26856SecondJpegPath == null)
+-                    throw new IllegalStateException("26856 AB lost independent B post/HDR owner");
+-                iris26856BSavedForNotification = ImageSaver.Util.saveBitmapAsJPGMotionV2(
+-                        iris26856SecondJpegPath, iris26856BBitmap,
+-                        ImageSaver.JPG_QUALITY, exifData,
+-                        iris26856BTrue2xRgbPath, iris26856BTrue2xWidth,
+-                        iris26856BTrue2xHeight, iris26856BPostParameters,
+-                        iris26856BPostPipeline.cropSize,
+-                        iris26856BPostPipeline.motionV2ToneSettingsSnapshot,
+-                        iris26856BPostPipeline.motionV2WatermarkEnabled);
+-                if (iris26856BTrue2xRgbPath != null) {
+-                    try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(iris26856BTrue2xRgbPath)); } catch (Throwable ignored) {}
+-                    iris26856BTrue2xRgbPath = null;
+-                    mIris26856BTrue2xPathForCleanup = null;
+-                }
+-                Log.i(TAG, "IRIS_26856_AB_TWO_JPEGS resultA=" + imageFile
+-                        + " resultB=" + iris26856SecondJpegPath
+-                        + " bSaved=" + iris26856BSavedForNotification
+-                        + " sharedBurst=true dngOwners=1");
+-            }
+         } else {
+             imageSaved = ImageSaver.Util.saveBitmapAsJPG(
+                     imageFile, img, ImageSaver.JPG_QUALITY, exifData);
+@@ -1349,47 +1293,13 @@ private void ApplyHdrX() {
+             throw new IllegalStateException(
+                     "26856 B-only JPEG/HEIC encoder failed; no partial output permitted");
+         }
+-        /* IRIS_26856_AB_PAIR_PUBLICATION_ALL_OR_NOTHING
+-         * A+B is one shutter-owned comparison, not two independent success events.
+-         * Do not notify the gallery of A until B's JPEG-R has also been written.
+-         * On a false return OR exception from either encoder, the enclosing
+-         * finally removes both potentially partial files before the DNG
+-         * publication latch opens. Never silently publish A as a B fallback. */
+-        if (iris26856Both && !(imageSaved && iris26856BSavedForNotification)) {
+-            throw new IllegalStateException(
+-                    "26856 A+B requires both independent JPEGs to be saved; "
+-                    + "A=" + imageSaved + " B=" + iris26856BSavedForNotification);
+-        }
+         try {
+             processingEventsListener.notifyImageSavedStatus(imageSaved, imageFile);
+-            if (iris26856Both) {
+-                processingEventsListener.notifyImageSavedStatus(
+-                        iris26856BSavedForNotification, iris26856SecondJpegPath);
+-            }
+         }
+         catch (Exception e){
+             Log.d(TAG,"Error in processingEventsListener.notifyImageSavedStatus:"+Log.getStackTraceString(e));
+         }
+         } finally {
+-            if (iris26856Both && !(imageSaved && iris26856BSavedForNotification)) {
+-                // A/B partial output is never a successful same-burst comparison.
+-                // Keep the single DNG owner independent of this JPEG rollback.
+-                try { java.nio.file.Files.deleteIfExists(imageFile); }
+-                catch (java.io.IOException | SecurityException deleteFailure) {
+-                    Log.e(TAG, "IRIS_26856_AB_PAIR_ROLLBACK A delete failed", deleteFailure);
+-                }
+-                if (iris26856SecondJpegPath != null) {
+-                    try { java.nio.file.Files.deleteIfExists(iris26856SecondJpegPath); }
+-                    catch (java.io.IOException | SecurityException deleteFailure) {
+-                        Log.e(TAG, "IRIS_26856_AB_PAIR_ROLLBACK B delete failed", deleteFailure);
+-                    }
+-                }
+-                Log.e(TAG, "IRIS_26856_AB_PAIR_ROLLBACK no_partial_success A="
+-                        + imageSaved + " B=" + iris26856BSavedForNotification);
+-                imageSaved = false;
+-                iris26856BSavedForNotification = false;
+-            }
+-            if (iris26856Both) imageSaved &= iris26856BSavedForNotification;
+             if (cameraMode == CameraMode.MOTION) {
+                 iris26826JpegPublishedLatch.countDown();
+             }
+@@ -1455,10 +1365,6 @@ private void ApplyHdrX() {
+ 
+ 
+         pipeline.close();
+-        if (iris26856BPostPipeline != null) {
+-            iris26856BPostPipeline.close();
+-            mIris26856BPostForCleanup = null;
+-        }
+         if (iris26856BBuffer != null) Allocator.free(iris26856BBuffer);
+         if (iris26856BSharedCarrier != null) iris26856BSharedCarrier.close();
+ 
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 18b935a17c3e071448a22232501d5d9506051d4b..1a4123f7b845eac210e0c5e83ccdaeb07b66dd28 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -23,6 +23,7 @@ import com.hinnka.mycamera.processor.RawBurstFrameRole
+ import com.hinnka.mycamera.processor.RawNoiseProfileSelection
+ import com.hinnka.mycamera.processor.RawNoiseModel
+ import com.hinnka.mycamera.processor.RawStackBufferLayout
++import com.hinnka.mycamera.processor.RawStackResult
+ import com.hinnka.mycamera.processor.RawStackFrame
+ import com.hinnka.mycamera.processor.prewarmGlesMgcSabreCapturePrograms
+ import com.hinnka.mycamera.raw.MgcFullResolutionDenoise
+@@ -222,8 +223,31 @@ object PhotonMotionMgc1271Bridge {
+                 "referenceProtectionEv=${parameters.motionV2ReferenceProtectionEv} " +
+                 "normalTemporalOwner=true shortTemporalOwner=false longGlobalBrightnessAuthority=false")
+ 
++            /* IRIS_26868_REAL_RAWR_RAW_VALIDATION_OWNER
++             * Native RAWR derives burst noise from frozen RAW samples; its
++             * admission must not depend on any Sabre/Camera2/custom noise
++             * profile. The complete lens/zoom decision is computed from the
++             * same immutable shutter parameters as the effective route below.
++             * A, NIGHT and the >=1.10x B->exact-A route keep strict profiles.
++             */
++            val frozenModeAtAdmission26868 = if (parameters.irisNightActive) {
++                Iris26856ABSettings.Mode.ORIGINAL_26850
++            } else {
++                Iris26856ABSettings.Mode.parse(reference.motionV2ReconstructionExperiment26856
++                    ?: invalid("26868 missing shutter-frozen B reconstruction intent"))
++            }
++            val selectedBAtAdmission26868 =
++                frozenModeAtAdmission26868 == Iris26856ABSettings.Mode.AMAZE_26855
++            val nativeBAtAdmission26868 = selectedBAtAdmission26868 &&
++                !Iris26864ZoomRoute.shouldRouteBToExactA(
++                    selectedBAtAdmission26868,
++                    parameters.irisNightActive,
++                    parameters.motionV2SuperResOutputEnabled,
++                    parameters.motionV2OutputZoom,
++                )
+             orderedPhysical.forEachIndexed { index, (frame, role) ->
+-                validateFrame(frame, size, role, reference.motionV2ExposureEnergy, index)
++                validateFrame(frame, size, role, reference.motionV2ExposureEnergy,
++                    index, requireSabreNoise = !nativeBAtAdmission26868)
+                 if (role != RawBurstFrameRole.NORMAL) {
+                     val ratioToNormal = frame.motionV2ExposureEnergy /
+                         reference.motionV2ExposureEnergy
+@@ -276,6 +300,9 @@ object PhotonMotionMgc1271Bridge {
+             )
+             val experiment26856 = if (iris26864BHighZoomExactA)
+                 Iris26856ABSettings.Mode.ORIGINAL_26850 else shutterExperiment26856
++            requireParity(nativeBAtAdmission26868 ==
++                (experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855),
++                "26868 frozen raw-admission and reconstruction decisions diverged")
+             if (iris26864BHighZoomExactA) {
+                 val route = "frozen=B effective=A_26850_FULL zoom=${parameters.motionV2OutputZoom} " +
+                     "threshold=1.10 localLens=true superRes=false bNativeMerge=false " +
+@@ -311,9 +338,16 @@ object PhotonMotionMgc1271Bridge {
+             } else {
+                 irisSettings.chromaCorrectionStrength.coerceIn(0.0f, 1.0f)
+             }
+-            parameters.motionV2ReconstructionOwner = Parameters.MOTION_V2_RECONSTRUCTION_SABRE
+-            PLog.i(TAG, "IRIS_26560_SABRE_ONLY_RECONSTRUCTION " +
+-                "method=SABRE localMedianChromaCorrection=$vgnChromaCorrectionStrength localMedianOnly26767=true nightForcedOne=${parameters.irisNightActive} " +
++            /* IRIS_26868_STRICT_B_NATIVE_RESULT_OWNER: A/NIGHT retain Sabre;
++             * genuine direct B acquires a distinct RAWR publication owner. */
++            val nativeB26868 = experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855 &&
++                !parameters.irisNightActive
++            parameters.motionV2ReconstructionOwner = if (nativeB26868)
++                Parameters.MOTION_V2_RECONSTRUCTION_RAWR_AMAZE
++            else Parameters.MOTION_V2_RECONSTRUCTION_SABRE
++            PLog.i(TAG, "IRIS_26868_FROZEN_RECONSTRUCTION_OWNER " +
++                "method=${if (nativeB26868) "RAWR_AMAZE_NATIVE" else "SABRE"} " +
++                "localMedianChromaCorrection=$vgnChromaCorrectionStrength localMedianOnly26767=true nightForcedOne=${parameters.irisNightActive} " +
+                 "night=${parameters.irisNightActive} dngRequested=$produceNormalStackedDng " +
+                 "superResRequested=${parameters.motionV2SuperResOutputEnabled}")
+ 
+@@ -376,7 +410,19 @@ object PhotonMotionMgc1271Bridge {
+                     "decodedUhHdrTargetFrozen=true identicalInputRebase=true",
+             )
+ 
+-            if (irisSettings.customNoiseModelEnabled) {
++            if (nativeBAtAdmission26868) {
++                /* This selection is an inert constructor transport for the
++                 * new direct-B dispatcher, never a Camera2 MGC noise owner.
++                 * No fallback to a Camera2 noise estimator is permitted.
++                 * Native Vulkan's pinned RAW-burst analysis owns B noise. */
++                noiseSelection = RawNoiseProfileSelection.Camera2
++                denoiseNoiseProfileLayout = RawNoiseProfileLayout.CAMERA2_CFA
++                denoiseChannelNoiseProfile = floatArrayOf()
++                noiseAuthority = "PINNED_RAWR_NATIVE_BURST"
++                PLog.i(TAG, "IRIS_26868_B_NOISE_ADMISSION camera2ProfileRequired=false " +
++                    "customProfileRequired=false nativeBurstNoise=true normals=" +
++                    orderedPhysical.count { it.second == RawBurstFrameRole.NORMAL })
++            } else if (irisSettings.customNoiseModelEnabled) {
+                 val profile = IrisNoiseProfileStore.loadSelectedProfile(
+                     PhotonCamera.getApplicationContextStatic())
+                     ?: throw IllegalStateException(
+@@ -470,10 +516,7 @@ object PhotonMotionMgc1271Bridge {
+ 
+             val frames = orderedPhysical.map { (frame, role) ->
+                 RawStackFrame(
+-                    image = safeImage(
+-                        frame, size,
+-                        retainForDual26856 = experiment26856 == Iris26856ABSettings.Mode.BOTH,
+-                    ),
++                    image = safeImage(frame, size),
+                     sensorTimestampNs = frame.motionV2ResultSensorTimestampNs.takeIf { it > 0L }
+                         ?: frame.timestamp,
+                     frameNumber = frame.motionV2FrameNumber,
+@@ -589,7 +632,7 @@ object PhotonMotionMgc1271Bridge {
+                 "localOutputZoom=$localOutputZoom localThreshold=1.10 opticalAnchor=${parameters.motionV2OpticalZoomAnchor} " +
+                 "superResRequested=$sabreSuperResEnabled focusDistanceDiopters=${referenceStackFrame.focusDistanceDiopters} " +
+                 "lensState=${referenceStackFrame.lensState} physicalCameraId=${referenceStackFrame.physicalCameraId} " +
+-                "rgbOwner=${if (experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855) "B_RAWR_AMAZE" else if (experiment26856 == Iris26856ABSettings.Mode.BOTH) "A_AND_B_INDEPENDENT" else "A_SABRE_VGN"} " +
++                "rgbOwner=${if (experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855) "B_RAWR_AMAZE" else "A_SABRE_VGN"} " +
+                 "lumaDetailOwner=${if (highZoomDetailEnabled || sabreSuperResEnabled) "DIRECT_CFA_TEMPORAL_ADAPTIVE" else "NATIVE"} " +
+                 "deviceGate=false cleanNativeFallback=true allNormalsSabre=true detailEvidenceBounded=true directNativePlanB=false " +
+                 "adaptiveReject=true flatHighlightVeto=true secondScaler=false"
+@@ -620,7 +663,8 @@ object PhotonMotionMgc1271Bridge {
+                 useCurrentGlContext = true,
+                 exportGpuLinearRgbSource = true,
+                 gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
+-                exportNormalStackedDng = produceNormalStackedDng,
++                exportNormalStackedDng = produceNormalStackedDng &&
++                    experiment26856 != Iris26856ABSettings.Mode.AMAZE_26855,
+                 vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
+                 /* IRIS_26856_SR_DISJOINT_ACTIVE_OWNERS
+                  * The inherited A true2x path must not execute inside B. A+B
+@@ -668,6 +712,7 @@ object PhotonMotionMgc1271Bridge {
+                  */
+                 iris26864RealRawrOwnsBurstNoise = !parameters.irisNightActive &&
+                     experiment26856 != Iris26856ABSettings.Mode.ORIGINAL_26850,
++                iris26868ReferenceTimestampNs = referenceTimestamp,
+                 iris26864NativeWronski2x = if (sabreSuperResEnabled &&
+                     !parameters.irisNightActive &&
+                     experiment26856 != Iris26856ABSettings.Mode.ORIGINAL_26850) {
+@@ -723,8 +768,7 @@ object PhotonMotionMgc1271Bridge {
+                          * Failure throws: no A/Camera2 fallback. The NORMAL
+                          * SafeImages remain owned until this call completes. */
+                         val isReal26864Hdrq =
+-                            (experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855 ||
+-                             experiment26856 == Iris26856ABSettings.Mode.BOTH) &&
++                            (experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855) &&
+                             // B SR ON at every lens-relative zoom still owns its
+                             // native B base; SR OFF >=1.10x was already
+                             // routed to exact A before this callback.
+@@ -784,6 +828,120 @@ object PhotonMotionMgc1271Bridge {
+                     }
+                 } else null,
+             )
++            /* IRIS_26868_B_EXISTING_A_DNG_ONLY
++             * DNG is optional. Its established A NORMAL-only algorithm runs
++             * on non-owning immutable aliases BEFORE the original B RAW
++             * buffers are consumed. This isolated A invocation is impossible
++             * on a B JPEG-only shot. The A-generated display RGB is discarded;
++             * only A's byte-identical normalized16/DNG sidecar is retained.
++             * No SHADOW_LONG, SHORT or B RAWR RGB enters the DNG producer.
++             */
++            val isolatedADng26868: RawStackResult? = if (
++                experiment26856 == Iris26856ABSettings.Mode.AMAZE_26855 &&
++                !parameters.irisNightActive && produceNormalStackedDng
++            ) {
++                val aliases = ArrayList<RawStackFrame>()
++                try {
++                    frames.filter { it.role == RawBurstFrameRole.NORMAL }
++                        .forEachIndexed { index, frame ->
++                            val original = frame.image
++                            val alias = if (original.isFileBacked) {
++                                original.copyRawBackingTo(
++                                    File(PhotonCamera.getApplicationContextStatic().cacheDir,
++                                        "iris26868_dng_${System.nanoTime()}_${index}.raw"),
++                                    System.nanoTime() + 15_000_000_000L,
++                                )
++                            } else {
++                                val plane = original.planes.single()
++                                SafeImage(original.width,original.height,original.format,
++                                    original.timestamp,plane.buffer.duplicate(),
++                                    plane.rowStride,plane.pixelStride)
++                            }
++                            aliases += frame.copy(image = alias)
++                        }
++                    /* IRIS_26868_A_DNG_NOISE_CONTRACT_UNCHANGED
++                     * Direct B JPEG legitimately needs no Camera2 noise. The
++                     * optional A DNG producer DOES: honor A's exact selected
++                     * custom model or validate original Camera2 metadata for
++                     * every DNG NORMAL. Never feed an inert B noise choice or
++                     * synthesize fake Camera2 coefficients into A DNG.
++                     */
++                    val aDngNoise26868: RawNoiseProfileSelection =
++                        if (irisSettings.customNoiseModelEnabled) {
++                            val profile = IrisNoiseProfileStore.loadSelectedProfile(
++                                PhotonCamera.getApplicationContextStatic())
++                                ?: invalid("26868 requested A DNG custom noise profile unavailable")
++                            frames.filter { it.role == RawBurstFrameRole.NORMAL }
++                                .forEachIndexed { index, frame ->
++                                    val model = profile.evaluate(frame.sensitivityIso)
++                                        ?: invalid("26868 A DNG custom noise model cannot evaluate NORMAL=$index")
++                                    requireParity(model.shotNoise.all { it.isFinite() && it > 0f } &&
++                                        model.readNoise.all { it.isFinite() && it >= 0f } &&
++                                        model.readNoise.any { it > 0f },
++                                        "26868 A DNG custom noise invalid NORMAL=$index")
++                                }
++                            RawNoiseProfileSelection.Calibrated(profile)
++                        } else {
++                            orderedPhysical.filter { it.second == RawBurstFrameRole.NORMAL }
++                                .forEachIndexed { index, pair ->
++                                    requireParity(pair.first.motionV2NoiseProfileSource == "CAMERA2_PER_FRAME" &&
++                                        pair.first.motionV2NoiseProfileValid,
++                                        "26868 A DNG rejects missing Camera2 provenance NORMAL=$index")
++                                }
++                            frames.filter { it.role == RawBurstFrameRole.NORMAL }
++                                .forEachIndexed { index, frame ->
++                                    val profile = frame.channelNoiseProfile
++                                    requireParity(profile != null && profile.size >= 8 &&
++                                        RawNoiseModel.fromCamera2NoiseProfile(profile)
++                                            .hasValidCamera2Profile,
++                                        "26868 A DNG requires real Camera2 NORMAL noise=$index")
++                                }
++                            RawNoiseProfileSelection.Camera2
++                        }
++                    val originalDng = GlesMgcRawFusion(
++                        width = size.x,height = size.y,cfaPattern = cfa,
++                        blackLevel = masterBlack,whiteLevel = whiteLevel,
++                        whiteBalanceGains = wb,noiseProfileSelection = aDngNoise26868,
++                        lensShading = lsc,lensShadingWidth = lscWidth,
++                        lensShadingHeight = lscHeight,
++                        allowSabreShadowLong = false,
++                        preserveExtendedHdrThroughVgn = true,
++                        useCurrentGlContext = true,exportGpuLinearRgbSource = true,
++                        gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
++                        exportNormalStackedDng = true,
++                        vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
++                        enableSabreSuperRes = sabreSuperResEnabled,
++                        sabreSuperResTempDir = PhotonCamera.getApplicationContextStatic().cacheDir,
++                        enableHighZoomDetail = false,
++                        edgeFalseColor26778 = edgeFalseColor26778,
++                        referenceProtectionEv = 0f,
++                        exactHistorical26850 = true,
++                    ).processFrames(aliases) ?: invalid("26868 optional independent A DNG producer failed")
++                    // The unused historical A JPEG is never published.
++                    GLES30.glFinish()
++                    originalDng.gpuLinearRgbSource?.let { source ->
++                        source.stackCompletionTimeline?.releasePending()
++                        GLES30.glDeleteTextures(1,intArrayOf(source.textureId),0)
++                        if (source.clipZoneMaskTextureId26836 != 0)
++                            GLES30.glDeleteTextures(1,
++                                intArrayOf(source.clipZoneMaskTextureId26836),0)
++                    }
++                    originalDng.gpuBayerSource?.let { source ->
++                        source.stackCompletionTimeline?.releasePending()
++                        GLES30.glDeleteTextures(1,intArrayOf(source.textureId),0)
++                    }
++                    originalDng.true2xRenderRgbPath?.let { runCatching { File(it).delete() } }
++                    originalDng.true2xNativeVgnGuidePath?.let { runCatching { File(it).delete() } }
++                    originalDng.true2xPhaseSupportPath?.let { runCatching { File(it).delete() } }
++                    true2xLinearRgbPathForCleanup = originalDng.true2xLinearRgbPath
++                    PLog.i(TAG,"IRIS_26868_OPTIONAL_A_DNG_ONLY " +
++                        "normals=${aliases.size} sabreJpegPublished=false " +
++                        "longAdmitted=false BNormalUnchanged=true")
++                    originalDng
++                } finally {
++                    aliases.forEach { runCatching { it.image.close() } }
++                }
++            } else null
+             val iris26535FusionStartNs = System.nanoTime()
+             val stackB26856 = fusion.processFrames(frames)
+                 ?: invalid("Iris Sabre/RAWR owner returned null")
+@@ -821,129 +979,8 @@ object PhotonMotionMgc1271Bridge {
+                     "zoom=$localOutputZoom ownBGuide=true ready=${parameters.iris26856BHighZoomDetail != null} " +
+                     "aUnchanged=true independentTrue2x=false")
+             }
+-            /* IRIS_26856_AB_TRUE_26850_PLUS_26855_TWO_RECONSTRUCTIONS
+-             * B first completes the 26855 all-NORMAL temporal-CFA + pinned AMaZE
+-             * pipeline. A then reconstructs from independent SafeImage adapters
+-             * over the SAME already-frozen ImageFrame RAW bytes using the exact
+-             * historical 26850 implementation. No second shutter, ring-buffer
+-             * admission, alignment reuse masquerading as A, or post-VGN RGB
+-             * substitution is allowed. The DNG stays owned once by B's 26855
+-             * normal stack; only A produces historical true-2x/zoom extras.
+-             */
+-            val stacked = if (experiment26856 == Iris26856ABSettings.Mode.BOTH) {
+-                val historicalFrames = ArrayList<com.hinnka.mycamera.processor.RawStackFrame>(frames.size)
+-                val historical = try {
+-                    frames.forEachIndexed { index, f ->
+-                        val physical = orderedPhysical[index].first
+-                        historicalFrames.add(f.copy(image = safeImage(physical, size, retainForDual26856 = true)))
+-                    }
+-                    GlesMgcRawFusion(
+-                    width = size.x,
+-                    height = size.y,
+-                    cfaPattern = cfa,
+-                    blackLevel = masterBlack,
+-                    whiteLevel = whiteLevel,
+-                    whiteBalanceGains = wb,
+-                    noiseProfileSelection = noiseSelection,
+-                    lensShading = lsc,
+-                    lensShadingWidth = lscWidth,
+-                    lensShadingHeight = lscHeight,
+-                    allowSabreShadowLong = longFrame != null,
+-                    preserveExtendedHdrThroughVgn = true,
+-                    useCurrentGlContext = true,
+-                    exportGpuLinearRgbSource = true,
+-                    gpuLinearRgbStorage = GpuLinearRgbStorage.RGBA16F,
+-                    exportNormalStackedDng = false, // exactly one 26855 DNG owner
+-                    vgnChromaCorrectionStrength = vgnChromaCorrectionStrength,
+-                    enableSabreSuperRes = sabreSuperResEnabled,
+-                    sabreSuperResTempDir = PhotonCamera.getApplicationContextStatic().cacheDir,
+-                    enableHighZoomDetail = highZoomDetailEnabled,
+-                    highZoomSourceZoom = localOutputZoom,
+-                    adaptiveSnrChromaDenoise = adaptiveSnrChroma26762,
+-                    residualChromaCustom = frozenResidualChromaCustom26762,
+-                    edgeFalseColor26778 = edgeFalseColor26778,
+-                    referenceProtectionEv = 0f,
+-                    exactHistorical26850 = true,
+-                    iris26856AmazeCfaConsumer = null,
+-                    iris26856RawrColor = null,
+-                ).processFrames(historicalFrames)
+-                    ?: invalid("26856 AB exact 26850 reconstruction failed")
+-                } catch (failure: Throwable) {
+-                    // IRIS_26864_AB_B_OWNER_SECOND_RECONSTRUCTION_ROLLBACK
+-                    // B is already complete when independent A begins. If A
+-                    // fails, there is no valid A+B pair, so every B GPU mask,
+-                    // output, DNG and 2x file must be retired before rethrow.
+-                    // Native source buffers remain owned by the immutable batch.
+-                    // Source adapter construction may itself fail before A starts.
+-                    historicalFrames.forEach { frame -> runCatching { frame.image.close() } }
+-                    stackB26856.iris26856RawrRgbSidecar?.let { b ->
+-                        GLES30.glDeleteTextures(1, intArrayOf(b.textureId), 0)
+-                        if (b.clipZoneMaskTextureId26836 != 0 &&
+-                            b.clipZoneMaskTextureId26836 != b.textureId)
+-                            GLES30.glDeleteTextures(1,
+-                                intArrayOf(b.clipZoneMaskTextureId26836), 0)
+-                    }
+-                    stackB26856.gpuLinearRgbSource?.let { first ->
+-                        first.stackCompletionTimeline?.releasePending()
+-                        GLES30.glDeleteTextures(1, intArrayOf(first.textureId), 0)
+-                        if (first.clipZoneMaskTextureId26836 != 0 &&
+-                            first.clipZoneMaskTextureId26836 != first.textureId)
+-                            GLES30.glDeleteTextures(1,
+-                                intArrayOf(first.clipZoneMaskTextureId26836), 0)
+-                    }
+-                    stackB26856.fusedBayerBuffer?.let(LargeDirectBuffer::free)
+-                    stackB26856.normalStackedDngRaw16?.let(LargeDirectBuffer::free)
+-                    stackB26856.iris26856BTrue2xRgbPath?.let { path ->
+-                        runCatching { File(path).delete() }
+-                    }
+-                    throw failure // never publish only one of A+B
+-                }
+-                requireParity(stackB26856.iris26856RawrRgbSidecar != null,
+-                    "26856 AB 26855 did not publish independent RAWR RGB")
+-                requireParity(historical.iris26856RawrRgbSidecar == null,
+-                    "26856 AB historical 26850 illegally generated B RGB")
+-                requireParity(stackB26856.mergedFrameCount == historical.mergedFrameCount,
+-                    "26856 AB actual NORMAL frame population diverged")
+-                requireParity(!produceNormalStackedDng ||
+-                    stackB26856.normalStackedDngRaw16 != null,
+-                    "26856 AB 26855 DNG evidence missing")
+-                // The second (historical A) reconstruction owns its own normal
+-                // RGB. The temporary 26855 post-VGN RGB is NOT B and cannot be
+-                // published, even when it happens to look visually reasonable.
+-                stackB26856.gpuLinearRgbSource?.let { rejected ->
+-                    rejected.stackCompletionTimeline?.releasePending()
+-                    GLES30.glDeleteTextures(1, intArrayOf(rejected.textureId), 0)
+-                    if (rejected.clipZoneMaskTextureId26836 != 0)
+-                        GLES30.glDeleteTextures(
+-                            1, intArrayOf(rejected.clipZoneMaskTextureId26836), 0)
+-                    // The discarded B stacker's primary mask is historical
+-                    // A/Sabre provenance. Its *separate* B clip is owned by
+-                    // iris26856RawrRgbSidecar, not by this discarded output.
+-                    checkGl("26856 discard interim 26855 Sabre RGB")
+-                }
+-                stackB26856.fusedBayerBuffer?.let(LargeDirectBuffer::free)
+-                PLog.i(TAG, "IRIS_26856_AB_TWO_TRUE_RECONSTRUCTIONS " +
+-                    "historicalA=26850 nativeB=26855_AMAZE sameRawBatch=true " +
+-                    "normalFrames=${historical.mergedFrameCount} dngOwner=B_26855 " +
+-                    "shortOwnedByBoth=true noSecondCapture=true")
+-                historical.copy(
+-                    iris26856RawrRgbSidecar = stackB26856.iris26856RawrRgbSidecar,
+-                    iris26856BTrue2xRgbPath = stackB26856.iris26856BTrue2xRgbPath,
+-                    iris26864BTrue2xClipBitsPath = stackB26856.iris26864BTrue2xClipBitsPath,
+-                    iris26856BTrue2xWidth = stackB26856.iris26856BTrue2xWidth,
+-                    iris26856BTrue2xHeight = stackB26856.iris26856BTrue2xHeight,
+-                    normalStackedDngRaw16 = stackB26856.normalStackedDngRaw16,
+-                    normalStackedDngFrameCount = stackB26856.normalStackedDngFrameCount,
+-                    normalStackedDngNoiseProfile = stackB26856.normalStackedDngNoiseProfile,
+-                    normalStackedDngSupportMin = stackB26856.normalStackedDngSupportMin,
+-                    normalStackedDngSupportP01 = stackB26856.normalStackedDngSupportP01,
+-                    normalStackedDngSupportP10 = stackB26856.normalStackedDngSupportP10,
+-                    normalStackedDngSupportMedian = stackB26856.normalStackedDngSupportMedian,
+-                    normalStackedDngSupportMean = stackB26856.normalStackedDngSupportMean,
+-                    normalStackedDngSupportMax = stackB26856.normalStackedDngSupportMax,
+-                    normalStackedDngNoiseEquivalentSupport = stackB26856.normalStackedDngNoiseEquivalentSupport,
+-                )
+-            } else stackB26856
++            // Exactly one frozen reconstruction owner per capture.
++            val stacked = stackB26856
+             parameters.motionV2ShortRadianceAuthorityMask = stacked.shortRadianceAuthorityMask?.copyOf()
+             parameters.motionV2ShortRadianceAuthorityWidth = stacked.shortRadianceAuthorityWidth
+             parameters.motionV2ShortRadianceAuthorityHeight = stacked.shortRadianceAuthorityHeight
+@@ -968,7 +1005,8 @@ object PhotonMotionMgc1271Bridge {
+                 requireParity(b2x26856 == null && bClip2x26864 == null,
+                     "26864 B 2x RGB/clip mask must not run outside selected B/A+B Super Res")
+             }
+-            true2xLinearRgbPathForCleanup = stacked.true2xLinearRgbPath
++            true2xLinearRgbPathForCleanup =
++                stacked.true2xLinearRgbPath ?: isolatedADng26868?.true2xLinearRgbPath
+             true2xRenderRgbPathForCleanup = stacked.true2xRenderRgbPath
+             true2xPhaseSupportPathForCleanup = stacked.true2xPhaseSupportPath
+             true2xNativeVgnGuidePathForCleanup = stacked.true2xNativeVgnGuidePath
+@@ -1116,20 +1154,6 @@ object PhotonMotionMgc1271Bridge {
+                 // Claim any returned B mask immediately, before validating its
+                 // receipt, so even an invalid receipt is freed on failure.
+                 iris26864BClipForCleanup = carrier.clipZoneMaskTextureId26836
+-                if (experiment26856 == Iris26856ABSettings.Mode.BOTH &&
+-                    (sabreSuperResEnabled || localOutputZoom < 1.10f)) {
+-                    requireParity(carrier.clipZoneMaskTextureId26836 != 0 &&
+-                        carrier.clipZoneMaskWidth26836 == size.x &&
+-                        carrier.clipZoneMaskHeight26836 == size.y &&
+-                        carrier.clipZoneMaskTextureId26836 != carrier.textureId,
+-                        "26864 A+B real B HDRq original-sensor clipping mask was not transferred")
+-                }
+-                if (carrier.clipZoneMaskTextureId26836 != 0) {
+-                    requireParity(experiment26856 == Iris26856ABSettings.Mode.BOTH &&
+-                        carrier.clipZoneMaskWidth26836 == size.x &&
+-                        carrier.clipZoneMaskHeight26836 == size.y,
+-                        "26864 B clip mask must belong only to independent A+B publication")
+-                }
+             }
+             val gpu = stacked.gpuLinearRgbSource
+                 ?: invalid("missing GPU Linear RGB source")
+@@ -1200,22 +1224,39 @@ object PhotonMotionMgc1271Bridge {
+             val sabreNoiseScale = stacked.mgcSabreNoiseModelScale
+             requireParity(correlation == null && readNoise == null && shotNoise == null,
+                 "Sabre unexpectedly leaked Spatial-only correlation/noise coefficients")
+-            requireParity(
+-                strength != null &&
+-                    strength.width == (size.x + 3) / 4 &&
+-                    strength.height == (size.y + 3) / 4 &&
+-                    strength.q8.size == strength.width * strength.height &&
+-                    strength.q8.all { (it.toInt() and 0xffff) in 192..256 },
+-                "26634 Sabre local residual-noise support missing/malformed",
+-            )
+-            requireParity(referenceSnr != null && referenceSnr.isFinite() && referenceSnr >= 0f,
+-                "Sabre reference SNR missing/malformed")
+-            requireParity(tuningSnr != null && tuningSnr.isFinite() && tuningSnr >= 0f,
+-                "Sabre output SNR missing/malformed")
+-            requireParity(sabreNoiseScale != null && sabreNoiseScale.isFinite() && sabreNoiseScale > 0f,
+-                "Sabre propagated noise scale missing/malformed")
+-            requireParity(parameters.motionV2ReconstructionOwner == Parameters.MOTION_V2_RECONSTRUCTION_SABRE,
+-                "Sabre reconstruction owner was not durably published")
++            if (nativeB26868) {
++                /* B has no Sabre coefficients or support map. Never synthesize
++                 * false Sabre SNR/noise measurements from a native RAWR receipt. */
++                requireParity(strength == null && referenceSnr == null &&
++                        tuningSnr == null && sabreNoiseScale == null,
++                    "26868 B received forbidden Sabre statistics despite direct dispatch")
++                requireParity(stacked.iris26856RawrRgbSidecar != null &&
++                        stacked.gpuLinearRgbSource != null &&
++                        (stacked.iris26856BTrue2xRgbPath != null) == parameters.motionV2SuperResOutputEnabled,
++                    "26868 direct B native carrier or true2x receipt missing")
++                requireParity(parameters.motionV2ReconstructionOwner ==
++                        Parameters.MOTION_V2_RECONSTRUCTION_RAWR_AMAZE,
++                    "26868 B native reconstruction ownership lost")
++                PLog.i(TAG, "IRIS_26868_B_NATIVE_PROVENANCE verified=true sabreStats=null " +
++                    "nativeBurstNoise=true supportDiagnostic=MINIMUM_CONFIRMED_NORMAL")
++            } else {
++                requireParity(
++                    strength != null &&
++                        strength.width == (size.x + 3) / 4 &&
++                        strength.height == (size.y + 3) / 4 &&
++                        strength.q8.size == strength.width * strength.height &&
++                        strength.q8.all { (it.toInt() and 0xffff) in 192..256 },
++                    "26634 Sabre local residual-noise support missing/malformed",
++                )
++                requireParity(referenceSnr != null && referenceSnr.isFinite() && referenceSnr >= 0f,
++                    "Sabre reference SNR missing/malformed")
++                requireParity(tuningSnr != null && tuningSnr.isFinite() && tuningSnr >= 0f,
++                    "Sabre output SNR missing/malformed")
++                requireParity(sabreNoiseScale != null && sabreNoiseScale.isFinite() && sabreNoiseScale > 0f,
++                    "Sabre propagated noise scale missing/malformed")
++                requireParity(parameters.motionV2ReconstructionOwner == Parameters.MOTION_V2_RECONSTRUCTION_SABRE,
++                    "Sabre reconstruction owner was not durably published")
++            }
+             requireParity(stacked.baselineExposureEv == null,
+                 "Sabre unexpectedly inherited Spatial/Bento BaselineExposure")
+             /* IRIS_26758_DIRECT_CFA_ZOOM_GEOMETRY
+@@ -1298,8 +1339,13 @@ object PhotonMotionMgc1271Bridge {
+              * brightness and preview darkness never independently increase denoise strength.
+              */
+             val requestedLumaScale = irisSettings.lumaDenoise.coerceIn(0f, 2f)
+-            val noiseEquivalentSupport =
++            val noiseEquivalentSupport = if (nativeB26868) {
++                // Lower-bound provenance only. The native HDRq engine owns
++                // actual per-pixel support; the bridge has no Sabre noise scale.
++                1f
++            } else {
+                 (1f / checkNotNull(sabreNoiseScale)).coerceIn(1f, stacked.mergedFrameCount.toFloat())
++            }
+             requireParity(noiseEquivalentSupport.isFinite() && noiseEquivalentSupport >= 1f,
+                 "missing/malformed noise-equivalent temporal support")
+             /* IRIS_26639_NO_SUPPORT_DERIVED_GLOBAL_LUMA
+@@ -1625,48 +1671,54 @@ object PhotonMotionMgc1271Bridge {
+             var resultDngSupportMean = 1f
+             var resultDngSupportMax = 1f
+             var resultDngNoiseEquivalentSupport = 1f
++            val dngOwner26868 = isolatedADng26868 ?: stacked
+             if (produceNormalStackedDng) {
+-                requireParity(stacked.normalStackedDngRaw16 != null,
++                requireParity(dngOwner26868.normalStackedDngRaw16 != null,
+                     "requested Sabre normal stacked DNG buffer is missing")
+-                requireParity(stacked.normalStackedDngFrameCount == expectedNormalDngFrames,
+-                    "normal stacked DNG population=${stacked.normalStackedDngFrameCount} expectedNormals=$expectedNormalDngFrames totalInputs=${inputImages.size}")
+-                requireParity(stacked.normalStackedDngNoiseProfile?.size == 6,
++                requireParity(dngOwner26868.normalStackedDngFrameCount == expectedNormalDngFrames,
++                    "normal stacked DNG population=${dngOwner26868.normalStackedDngFrameCount} expectedNormals=$expectedNormalDngFrames totalInputs=${inputImages.size}")
++                requireParity(dngOwner26868.normalStackedDngNoiseProfile?.size == 6,
+                     "normalized16 stacked DNG noise profile is missing/invalid")
+-                requireParity(stacked.normalStackedDngNoiseEquivalentSupport.isFinite() &&
+-                    stacked.normalStackedDngNoiseEquivalentSupport >= 1f &&
+-                    stacked.normalStackedDngNoiseEquivalentSupport <= expectedNormalDngFrames.toFloat() + 0.01f,
++                requireParity(dngOwner26868.normalStackedDngNoiseEquivalentSupport.isFinite() &&
++                    dngOwner26868.normalStackedDngNoiseEquivalentSupport >= 1f &&
++                    dngOwner26868.normalStackedDngNoiseEquivalentSupport <= expectedNormalDngFrames.toFloat() + 0.01f,
+                     "normalized16 stacked DNG effective support is invalid normalLimit=$expectedNormalDngFrames")
+-                resultDngRaw16 = stacked.normalStackedDngRaw16
+-                resultDngFrameCount = stacked.normalStackedDngFrameCount
+-                resultDngNoiseProfile = stacked.normalStackedDngNoiseProfile
+-                resultDngSupportMin = stacked.normalStackedDngSupportMin
+-                resultDngSupportP01 = stacked.normalStackedDngSupportP01
+-                resultDngSupportP10 = stacked.normalStackedDngSupportP10
+-                resultDngSupportMedian = stacked.normalStackedDngSupportMedian
+-                resultDngSupportMean = stacked.normalStackedDngSupportMean
+-                resultDngSupportMax = stacked.normalStackedDngSupportMax
+-                resultDngNoiseEquivalentSupport = stacked.normalStackedDngNoiseEquivalentSupport
++                resultDngRaw16 = dngOwner26868.normalStackedDngRaw16
++                resultDngFrameCount = dngOwner26868.normalStackedDngFrameCount
++                resultDngNoiseProfile = dngOwner26868.normalStackedDngNoiseProfile
++                resultDngSupportMin = dngOwner26868.normalStackedDngSupportMin
++                resultDngSupportP01 = dngOwner26868.normalStackedDngSupportP01
++                resultDngSupportP10 = dngOwner26868.normalStackedDngSupportP10
++                resultDngSupportMedian = dngOwner26868.normalStackedDngSupportMedian
++                resultDngSupportMean = dngOwner26868.normalStackedDngSupportMean
++                resultDngSupportMax = dngOwner26868.normalStackedDngSupportMax
++                resultDngNoiseEquivalentSupport = dngOwner26868.normalStackedDngNoiseEquivalentSupport
++                if (isolatedADng26868 != null && sabreSuperResEnabled) {
++                    resultTrue2xLinearRawPath = isolatedADng26868.true2xLinearRgbPath
++                    requireParity(resultTrue2xLinearRawPath != null,
++                        "26868 existing A DNG 2x linear RAW source missing")
++                }
+                 PLog.i(TAG, "IRIS_26545_DNG_RECONSTRUCTION_PARITY " +
+-                    "reconstruction=SABRE " +
++                    "reconstruction=SABRE_DNG_ONLY " +
+                     "domain=normalized16_bayer normalFrames=$resultDngFrameCount " +
+                     "blackLevel=0 whiteLevel=65535 postProcessingBaked=false")
+             } else {
+-                requireParity(stacked.normalStackedDngRaw16 == null && stacked.normalStackedDngFrameCount == 0,
++                requireParity(dngOwner26868.normalStackedDngRaw16 == null && dngOwner26868.normalStackedDngFrameCount == 0,
+                     "DNG sidecar produced without request")
+-                requireParity(stacked.normalStackedDngNoiseProfile == null,
++                requireParity(dngOwner26868.normalStackedDngNoiseProfile == null,
+                     "DNG metadata produced without request")
+             }
+ 
+             PLog.i(TAG, "IRIS_26568_SABRE_ONLY_RECONSTRUCTION_OWNERSHIP " +
+                 "pipeline=${if (parameters.irisNightActive) "NIGHT" else "MOTION"} " +
+-                "owner=SABRE spatialSourceRestoreAllowed=false spatialHighlightNodeAllowed=false " +
++                "owner=${if (nativeB26868) "RAWR_AMAZE_NATIVE" else "SABRE"} spatialSourceRestoreAllowed=false spatialHighlightNodeAllowed=false " +
+                 "residualDenoise=${if (motionMergeNativeDenoise26853) "BYPASSED_IRIS_26853_MERGE_NATIVE" else denoisePass} carrier=RESOLVE_SABRE_LINEAR_RGB " +
+                 "superResRequested=${parameters.motionV2SuperResOutputEnabled} " +
+                 "true2x=${stacked.true2xRenderRgbPath != null || stacked.true2xLinearRgbPath != null} backend=${stacked.true2xBackend} " +
+                 "phaseMean=${stacked.true2xPhaseSupportMean} phaseP10=${stacked.true2xPhaseSupportP10} " +
+                 "adaptiveColor=POST_VGN_SHARED")
+             PLog.i(TAG, "IRIS_26545_RECONSTRUCTION_TIMING " +
+-                "method=SABRE srEnabled=$sabreSuperResEnabled fusionMs=$iris26535FusionMs " +
++                "method=${if (nativeB26868) "RAWR_AMAZE_NATIVE" else "SABRE"} srEnabled=$sabreSuperResEnabled fusionMs=$iris26535FusionMs " +
+                 "true2xMs=${stacked.true2xReconstructionMs} true2xRenderPrepMs=$iris26564True2xRenderPrepMs " +
+                 "denoiseMs=$iris26535DenoiseMs srReliabilityGateMs=0 " +
+                 "totalMs=${(System.nanoTime() - iris26535TotalStartNs) / 1_000_000L} " +
+@@ -1677,7 +1729,7 @@ object PhotonMotionMgc1271Bridge {
+                 "long=${if (longFrame != null) 1 else 0} short=${if (shortFrame != null) 1 else 0} " +
+                 "merged=${stacked.mergedFrameCount} cfa=$cfa " +
+                 "lsc=${stacked.lensShadingCorrectionApplied} " +
+-                "denoise=SABRE_RESOLVE_PLUS_SABRE_DEFAULT_RESIDUAL " +
++                "denoise=${if (nativeB26868) "RAWR_HDRQ_BURST_NATIVE" else "SABRE_RESOLVE_PLUS_SABRE_DEFAULT_RESIDUAL"} " +
+                 "baselineEv=${stacked.baselineExposureEv} " +
+                 "displayGain=${parameters.motionV2DisplayGain} " +
+                 "crossContext=${if (outputSharedCarrier != null) "rgba16f_shared_26826" else if (directRgba16fCarrier) "rgba16f_cpu_26726_universal" else "rgba32f_cpu_special_cfa_fallback"} alphaSupport=disabled")
+@@ -1709,7 +1761,7 @@ object PhotonMotionMgc1271Bridge {
+                 stacked.true2xPhaseSupportP10,
+                 stacked.true2xReconstructionMs,
+             ).also { result ->
+-                result.sabreSelected = true
++                result.sabreSelected = !nativeB26868
+                 result.linearRgbCarrierFormat = outputCarrierFormat
+                 result.sharedRgba16fCarrier = outputSharedCarrier
+                 outputSharedCarrier = null // Result owns it now
+@@ -1725,8 +1777,12 @@ object PhotonMotionMgc1271Bridge {
+                 iris26856BBufferForCleanup = null
+                 /* IRIS_26726_CARRIER_OWNERSHIP: direct RGBA16F ownership was transferred above;
+                  * special-CFA RGBA32F remains independently allocated and halfBuffer is released. */
+-                true2xOutputHandedOff = resultTrue2xRenderRgbPath != null &&
+-                    (!produceNormalStackedDng || resultTrue2xLinearRawPath != null)
++                true2xOutputHandedOff = if (isolatedADng26868 != null) {
++                    resultTrue2xLinearRawPath != null && produceNormalStackedDng
++                } else {
++                    resultTrue2xRenderRgbPath != null &&
++                        (!produceNormalStackedDng || resultTrue2xLinearRawPath != null)
++                }
+                 highZoomDetailHandedOff = !highZoomDetailEnabled || parameters.motionV2HighZoomRgbPrepared || parameters.motionV2HighZoomDetailPath != null
+                 highZoomRgbHandedOff = !parameters.motionV2HighZoomRgbPrepared || parameters.motionV2HighZoomRgbPath != null
+             }
+@@ -1808,6 +1864,7 @@ object PhotonMotionMgc1271Bridge {
+         role: RawBurstFrameRole,
+         referenceEnergy: Double,
+         index: Int,
++        requireSabreNoise: Boolean = true,
+     ) {
+         requireParity(frame.hasMotionV2RawBacking(), "frame[$index] $role RAW backing is missing")
+         requireParity(frame.motionV2PlaneLayoutValid,
+@@ -1836,12 +1893,14 @@ object PhotonMotionMgc1271Bridge {
+         requireParity(frame.motionV2ActualExposureNs > 0L && frame.motionV2ActualIso > 0 &&
+                 frame.motionV2ExposureEnergy.isFinite() && frame.motionV2ExposureEnergy > 0.0,
+             "frame[$index] $role exposure metadata invalid")
+-        requireParity(frame.motionV2NoiseProfileValid && frame.motionV2NoiseProfile.size >= 8 &&
+-                (0 until 4).all { phase ->
+-                    val s = frame.motionV2NoiseProfile[phase * 2]
+-                    val o = frame.motionV2NoiseProfile[phase * 2 + 1]
+-                    s.isFinite() && s > 0f && o.isFinite() && o >= 0f
+-                }, "frame[$index] $role Camera2 noise profile invalid")
++        if (requireSabreNoise) {
++            requireParity(frame.motionV2NoiseProfileValid && frame.motionV2NoiseProfile.size >= 8 &&
++                    (0 until 4).all { phase ->
++                        val s = frame.motionV2NoiseProfile[phase * 2]
++                        val o = frame.motionV2NoiseProfile[phase * 2 + 1]
++                        s.isFinite() && s > 0f && o.isFinite() && o >= 0f
++                    }, "frame[$index] $role Camera2 noise profile invalid")
++        }
+         requireParity(frame.motionV2BlackLevelValid && frame.motionV2BlackLevel.all {
+             it.isFinite() && it >= 0f
+         }, "frame[$index] $role dynamic black level invalid")
+@@ -1862,10 +1921,10 @@ object PhotonMotionMgc1271Bridge {
+      * This must not read the ZSL ring again or create duplicate RAW captures.
+      * Inactive until B/A-B no longer fail closed. */
+     private fun safeImage(
+-        frame: ImageFrame, size: Point, retainForDual26856: Boolean = false,
++        frame: ImageFrame, size: Point,
+     ): SafeImage {
+         val closeRawOwner: (() -> Unit)? =
+-            if (retainForDual26856) null else ({ frame.close() })
++            ({ frame.close() })
+         val raw = frame.buffer
+         if (raw != null) {
+             return SafeImage(
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java
+index 48cce1ca228d764d3d0517af1671ef16a473ebaf..dbb67d47283f2fbbd932bb00dd481feba784dc4c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26856ABSettings.java
+@@ -19,14 +19,14 @@ public final class Iris26856ABSettings {
+     private static final String FILE = "iris_26856_physical_lens_ab";
+     private static final String PREFIX = "physical_";
+     public enum Mode {
+-        ORIGINAL_26850("A"), AMAZE_26855("B"), BOTH("AB");
++        ORIGINAL_26850("A"), AMAZE_26855("B");
+         public final String id;
+         Mode(String id) { this.id = id; }
+         public static Mode parse(String id) {
+             // The discontinued A+B setting must never activate the dormant dual
+             // capture path. Preserve a legacy selection as B-only on upgrade.
+             if ("AB".equals(id)) return AMAZE_26855;
+-            for (Mode mode : values()) if (mode != BOTH && mode.id.equals(id)) return mode;
++            for (Mode mode : values()) if (mode.id.equals(id)) return mode;
+             // Fail closed on restored/corrupt values; never silently enable B.
+             return ORIGINAL_26850;
+         }
+@@ -49,7 +49,7 @@ public final class Iris26856ABSettings {
+         return Mode.ORIGINAL_26850;
+     }
+     public static void write(Context context, String lensId, Mode mode) {
+-        if (mode == null || mode == Mode.BOTH)
++        if (mode == null)
+             throw new IllegalArgumentException("26867 only A and B experiments are selectable");
+         store(context).edit().putString(PREFIX + identity(lensId, null), mode.id).apply();
+     }
+diff --git a/app/version.properties b/app/version.properties
+index a81c6177437cf9fbb10e0144304c72c990457d3d..084a66e58f9b13dcfc30ee8d417fff084314c152 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726867
+-VERSION_BUILD=26867
++VERSION_NAME=0.9726868
++VERSION_BUILD=26868
