@@ -27,3 +27,5 @@ COMPILER DISCLOSURE: Shader/GLES/SPIR-V, full Kotlin/Java and Android NDK/assemb
 STRICT SECURITY/PROOF: The script fails closed if branch, prior artifact identity/hash, prior compiler proof, source manifests, 161-path allowlist, 17-stage order, inherited compiler commands, native source lock, real pinned shader compiler, SPIRV-Tools, language/NDK compilers, patch replay, prebuild proof, exactly-one APK, postbuild invariance, or final clean-extract replay fails.
 
 No backup, ChatGPT source commit/push, or APK push is included. Device testing of full-frame tint and JPEG saving is still required after successful Actions.
+
+REPAIR 26864: The failed Actions run 39708593393 exposed missing Kotlin named parameters at Bridge lines 669/671. This revision corrects the existing GlesMgcRawFusion.kt and GlesIris26545SabreProcessor.kt within the unchanged exact 161-file runtime allowlist and preserves the bridge -> fusion -> Sabre -> SpatialStacker B transport. Previous 26864 run FAILED; recompilation on GitHub Actions is still required.

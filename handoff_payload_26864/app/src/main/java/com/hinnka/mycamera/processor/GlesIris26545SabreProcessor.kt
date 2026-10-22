@@ -53,6 +53,12 @@ internal class GlesIris26545SabreProcessor(
     private val iris26856BTrue2x: Boolean = false,
     /* IRIS_26856_B_ONLY_PUBLICATION_ADAPTER_FORWARDING: historical A remains separate. */
     private val iris26856BOnlyIndependentPublication: Boolean = false,
+    /* IRIS_26864_KOTLIN_ADAPTER_TRANSPORT_FAILURE_39708593393
+     * Pass the frozen B-owned RAWR burst-noise authority and synchronous true-2x
+     * Vulkan callback through Fusion -> Sabre to the live spatial stacker.
+     * Historical A continues with the default false/null arguments. */
+    private val iris26864RealRawrOwnsBurstNoise: Boolean = false,
+    private val iris26864NativeWronski2x: ((outputRgb: Int, outputSensorClip: Int) -> Unit)? = null,
 ) {
     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
         if (frames.isEmpty()) return null
@@ -188,6 +194,8 @@ internal class GlesIris26545SabreProcessor(
             iris26856RawrColor = iris26856RawrColor,
             iris26856BTrue2x = iris26856BTrue2x,
             iris26856BOnlyIndependentPublication = iris26856BOnlyIndependentPublication,
+            iris26864RealRawrOwnsBurstNoise = iris26864RealRawrOwnsBurstNoise,
+            iris26864NativeWronski2x = iris26864NativeWronski2x,
         ).processFrames(admitted)
     }
 

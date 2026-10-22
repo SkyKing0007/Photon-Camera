@@ -44,3 +44,60 @@ if a.numeric:
   subprocess.run(['c++','-std=c++17','-O2','-UNDEBUG','-I'+str(mock),str(copied),str(mock/'test.cpp'),'-o',str(exe)],check=True)
   subprocess.run([str(exe)],check=True)
  print('PASS 26864 original-sensor 2x reference/green, 1-bit sidecar and exact-runtime-source GPU lifetime host regressions; host checks only')
+
+# IRIS_26864_KOTLIN_NAMED_ARGUMENT_REGRESSION_39708593393
+# Actions 39708593393 failed at PhotonMotionMgc1271Bridge.kt:669/671 because
+# Fusion and Sabre each dropped two named B-only constructor arguments.
+# All THREE constructor declarations and BOTH intermediate value forwards
+# must be present before a new guarded build is allowed to reach the Kotlin compiler.
+bridge=(root/'src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt').read_text()
+kt_dir=root/'src/main/java/com/hinnka/mycamera/processor'
+fusion=(kt_dir/'GlesMgcRawFusion.kt').read_text()
+sabre=(kt_dir/'GlesIris26545SabreProcessor.kt').read_text()
+spatial=(kt_dir/'GlesMgcRawSpatialStacker.kt').read_text()
+names=('iris26864RealRawrOwnsBurstNoise','iris26864NativeWronski2x')
+def guarded_kotlin_adapter_contract(bridge, fusion, sabre, spatial):
+    if bridge.count('iris26864RealRawrOwnsBurstNoise = !parameters.irisNightActive') != 1: return False
+    if bridge.count('iris26864NativeWronski2x = if (sabreSuperResEnabled') != 1: return False
+    for fragment in (fusion,sabre,spatial):
+        for name in names:
+            if fragment.count('private val '+name+':') != 1: return False
+    for fragment in (fusion,sabre):
+        for name in names:
+            if fragment.count(name+' = '+name+',') != 1:return False
+    if 'if (exactHistorical26850) {' not in sabre:return False
+    legacy=sabre.split('if (exactHistorical26850) {',1)[1].split('return GlesMgcRawSpatialStacker(',1)[0]
+    if 'GlesMgcRawSpatialStacker26850(' not in legacy:return False
+    if any(name+' =' in legacy for name in names):return False
+    return True
+assert guarded_kotlin_adapter_contract(bridge,fusion,sabre,spatial),'exact 39708593393 missing B-only Kotlin adapter parameters/forwarders'
+assert not guarded_kotlin_adapter_contract(bridge,fusion.replace('private val iris26864NativeWronski2x:', 'private val iris26864BROKEN:',1),sabre,spatial)
+assert not guarded_kotlin_adapter_contract(bridge,fusion,sabre.replace('private val iris26864RealRawrOwnsBurstNoise:', 'private val iris26864BROKEN:',1),spatial)
+print('PASS exact Kotlin Actions 39708593393 named-parameter regression: Bridge->Fusion->Sabre->Spatial; A isolated, negative fixture rejected')
+
+# Audit EVERY named constructor argument across the four real runtime edges,
+# not only the two names that happened to fail first on Actions 39708593393.
+import re
+def kt_params(src,stop):
+    header=src[:src.index(stop)]
+    return set(re.findall(r'^    (?:private val\s+)?([A-Za-z]\w*)\s*:',header,flags=re.M))
+def kt_args(src,begin,end,spaces):
+    assert src.count(begin)==1,(begin,src.count(begin))
+    start=src.index(begin)+len(begin)
+    stop=src.index(end,start)
+    return set(re.findall(r'^ {'+str(spaces)+r'}([A-Za-z]\w*)\s*=',src[start:stop],flags=re.M))
+ctors={
+ 'fusion':kt_params(fusion,'    fun processFrames'),
+ 'sabre':kt_params(sabre,'    fun processFrames'),
+ 'spatial':kt_params(spatial,'    private data class TextureLevel'),
+}
+bridges=[
+ ('Bridge B -> Fusion',bridge,'val fusion = GlesMgcRawFusion(','\n            )\n',16,'fusion'),
+ ('Bridge historical A -> Fusion',bridge,'GlesMgcRawFusion(\n                    width','\n                ).processFrames',20,'fusion'),
+ ('Fusion -> Sabre',fusion,'return GlesIris26545SabreProcessor(','\n        ).processFrames',12,'sabre'),
+ ('Sabre B -> Spatial',sabre,'return GlesMgcRawSpatialStacker(','\n        ).processFrames',12,'spatial')]
+for title,source,begin,end,indent,receiver in bridges:
+    args=kt_args(source,begin,end,indent)
+    missing=args-ctors[receiver]
+    assert not missing,(title,'unknown receiver constructor arguments',sorted(missing))
+    print('PASS Kotlin named arguments',title,len(args),'names')
