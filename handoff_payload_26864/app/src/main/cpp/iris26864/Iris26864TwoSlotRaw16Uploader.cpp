@@ -16,7 +16,7 @@ void transition(VkCommandBuffer c,VkImage image,VkImageLayout oldLayout,VkImageL
     b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
     b.image=image;b.srcAccessMask=src;b.dstAccessMask=dst;
     b.subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
-    vkCmdPipelineBarrier(c,srcStage,dstStage,0,0,nullptr,0,1,&b);
+    vkCmdPipelineBarrier(c,srcStage,dstStage,0,0,nullptr,0,nullptr,1,&b);
 }
 }
 TwoSlotRaw16Uploader::TwoSlotRaw16Uploader(VkPhysicalDevice p,VkDevice d,

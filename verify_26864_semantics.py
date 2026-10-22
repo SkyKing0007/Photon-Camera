@@ -101,3 +101,93 @@ for title,source,begin,end,indent,receiver in bridges:
     missing=args-ctors[receiver]
     assert not missing,(title,'unknown receiver constructor arguments',sorted(missing))
     print('PASS Kotlin named arguments',title,len(args),'names')
+
+# IRIS_26864_VULKAN_BARRIER_ARGCOUNT_REGRESSION_39710810277
+# Exact NDK error: a nine-argument vkCmdPipelineBarrier at RAW16 uploader line 19.
+# The Vulkan 1.0 ABI requires 10 args; no legacy compiler bypass is allowed.
+import re as _vkre
+import tempfile as _vktmp
+from pathlib import Path as _vkp
+
+_uploader_path = root/'src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.cpp'
+_uploader_source = _uploader_path.read_text()
+_nine_arg_barrier = 'vkCmdPipelineBarrier(c,srcStage,dstStage,0,0,nullptr,0,1,&b);'
+_ten_arg_barrier = 'vkCmdPipelineBarrier(c,srcStage,dstStage,0,0,nullptr,0,nullptr,1,&b);'
+assert _nine_arg_barrier not in _uploader_source, 'reintroduced exact NDK 39710810277 nine-argument barrier'
+assert _uploader_source.count(_ten_arg_barrier)==1, 'missing corrected RAW16 image barrier'
+
+def _vulkan_call_arguments(source, index):
+    opening=source.index('(',index)
+    level=1
+    count=1
+    k=opening+1
+    while k<len(source) and level:
+        ch=source[k]
+        if ch=='(':level+=1
+        elif ch==')':level-=1
+        elif ch==',' and level==1:count+=1
+        k+=1
+    assert level==0, 'unterminated Vulkan barrier invocation'
+    return count
+
+def _vulkan_barrier_count(source):
+    matches=list(_vkre.finditer(r'\bvkCmdPipelineBarrier\s*\(',source))
+    counts=[_vulkan_call_arguments(source,m.start()) for m in matches]
+    assert all(n==10 for n in counts), ('Vk 1.0 barrier requires ten args', counts)
+    return len(matches)
+
+_all_barrier_calls=0
+for _native in sorted((root/'src/main/cpp/iris26864').rglob('*')):
+    if _native.is_file() and _native.suffix in ('.cpp','.inc','.hpp','.h'):
+        src=_native.read_text()
+        if 'vkCmdPipelineBarrier(' in src:
+            _all_barrier_calls+=_vulkan_barrier_count(src)
+assert _all_barrier_calls>=10, ('incomplete Vulkan barrier source scan',_all_barrier_calls)
+assert _vulkan_call_arguments(_nine_arg_barrier,0)==9, 'historical failure regression no longer represents original error'
+
+if a.numeric:
+    # Compile the EXACT production function body with the authentic ten-parameter
+    # Vulkan ABI shape from NDK 27 (using host declarations as a syntax test).
+    _start=_uploader_source.index('void transition(')
+    _begin=_uploader_source.index('{',_start)
+    _depth=1;_end=_begin+1
+    while _depth:
+        assert _end<len(_uploader_source)
+        if _uploader_source[_end]=='{':_depth+=1
+        elif _uploader_source[_end]=='}':_depth-=1
+        _end+=1
+    _actual_transition=_uploader_source[_start:_end]
+    _vulkan_abi='''#include <cstdint>
+#include <cstddef>
+using VkCommandBuffer=void*;
+using VkImage=void*;
+using VkImageLayout=uint32_t;
+using VkAccessFlags=uint32_t;
+using VkPipelineStageFlags=uint32_t;
+using VkDependencyFlags=uint32_t;
+struct VkMemoryBarrier {};
+struct VkBufferMemoryBarrier {};
+struct VkImageSubresourceRange {uint32_t aspectMask,baseMipLevel,levelCount,baseArrayLayer,layerCount;};
+struct VkImageMemoryBarrier {
+ uint32_t sType; VkAccessFlags srcAccessMask,dstAccessMask;
+ VkImageLayout oldLayout,newLayout; uint32_t srcQueueFamilyIndex,dstQueueFamilyIndex;
+ VkImage image; VkImageSubresourceRange subresourceRange;
+};
+constexpr uint32_t VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER=1;
+constexpr uint32_t VK_QUEUE_FAMILY_IGNORED=~uint32_t{0};
+constexpr uint32_t VK_IMAGE_ASPECT_COLOR_BIT=1;
+void vkCmdPipelineBarrier(VkCommandBuffer,VkPipelineStageFlags,VkPipelineStageFlags,
+    VkDependencyFlags,uint32_t,const VkMemoryBarrier*,uint32_t,
+    const VkBufferMemoryBarrier*,uint32_t,const VkImageMemoryBarrier*);
+'''
+    with _vktmp.TemporaryDirectory(prefix='26864_native_vk_abi_') as _dir:
+        test=_vkp(_dir)/'production_transition.cpp'
+        test.write_text(_vulkan_abi+_actual_transition+'\n')
+        ok=subprocess.run(['c++','-std=c++17','-Werror','-fsyntax-only',str(test)],capture_output=True,text=True)
+        assert ok.returncode==0,('exact source failed Vulkan signature harness',ok.stderr)
+        old_transition=_actual_transition.replace(_ten_arg_barrier,_nine_arg_barrier,1)
+        assert old_transition!=_actual_transition
+        test.write_text(_vulkan_abi+old_transition+'\n')
+        bad=subprocess.run(['c++','-std=c++17','-Werror','-fsyntax-only',str(test)],capture_output=True,text=True)
+        assert bad.returncode!=0 and ('too few arguments' in bad.stderr or 'requires 10 arguments' in bad.stderr),('original NDK error did not reproduce',bad.stderr)
+print('PASS Vulkan NDK 39710810277 regression:',_all_barrier_calls,'native pipeline barriers exact 10-argument ABI; host positive/negative '+('PASS' if a.numeric else 'NOT RUN'))
