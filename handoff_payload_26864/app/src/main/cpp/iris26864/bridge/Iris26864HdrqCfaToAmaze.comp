@@ -1,0 +1,57 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// IRIS_26864_B_HDRQ_CFA_TO_AMAZE_BRIDGE_NOT_YET_PINNED_SPIRV
+// Iris-owned boundary shader, NOT one of RAWR's 23 frequency kernels.
+// RAWR hdrp_finalize writes a black-subtracted, sensor-white-normalized
+// R32F scalar at EACH CFA site. 26863 AMaZE requires a half-resolution
+// rgba16f texel containing canonical {R,G1,G2,B} per Bayer 2x2 cell.
+// This is a CFA repack, NEVER linear RGB/wb/tone/demosaic conversion.
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(set = 0, binding = 0, r32f) readonly uniform image2D mergedCfa;
+layout(set = 0, binding = 1, r16ui) readonly uniform uimage2D referenceRaw;
+layout(set = 0, binding = 2, rgba16f) writeonly uniform image2D packedForAmaze;
+layout(set = 0, binding = 3, r16ui) writeonly uniform uimage2D sensorClipMask;
+layout(push_constant) uniform Handoff {
+    uint rawWidth, rawHeight, pattern, lscWidth;
+    uint lscHeight, originX, originY, fullSensorWidth;
+    uint fullSensorHeight, clipMustUseReference, reserved0, reserved1;
+    vec4 blackPhase;
+    vec4 invRangePhase;
+    float clipThreshold;
+    uint tail0,tail1,tail2;  // explicit 96-byte host push ABI
+} p;
+#define LSC_BINDING 4
+#define LSC_ENABLED (p.lscWidth >= 2u && p.lscHeight >= 2u)
+#define LSC_GRID_SIZE uvec2(p.lscWidth,p.lscHeight)
+#define LSC_SENSOR_SIZE uvec2(p.fullSensorWidth,p.fullSensorHeight)
+#include "lens_shading.glsl"
+#include "cfa_common.glsl"
+void main() {
+    ivec2 cell=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(cell,ivec2(p.rawWidth/2u,p.rawHeight/2u))))return;
+    // Host requires physical-lens origin/parity and exact dimensions. The
+    // passed pattern is the EFFECTIVE CFA for the cropped RAW, not sensor base.
+    ivec2 qr,qg1,qg2,qb;
+    rawrCfaCellCoordinates(p.pattern,cell,qr,qg1,qg2,qb);
+    ivec2 sites[4]=ivec2[4](qr,qg1,qg2,qb);
+    vec4 packedCfaCell=vec4(0.0);
+    uint mask=0u;
+    for(uint ch=0u;ch<4u;++ch){
+        ivec2 q=sites[ch];
+        float value=imageLoad(mergedCfa,q).r;
+        bool invalid=isnan(value)||isinf(value);
+        float normalized=invalid?0.0:clamp(value,0.0,1.0);
+        uint phase=(uint(q.y)&1u)*2u+(uint(q.x)&1u);
+        float sensor=(float(imageLoad(referenceRaw,q).r)-p.blackPhase[phase])*p.invRangePhase[phase];
+        if(invalid||value>=p.clipThreshold||sensor>=p.clipThreshold)mask|=(1u<<ch);
+        ivec2 absoluteSite=q+ivec2(p.originX,p.originY);
+        // Camera2 lens-shading greens are selected by absolute SENSOR ROW;
+        // the logical canonical channel G1/G2 is not the shading-map index.
+        float lsc=lensShadingGain(absoluteSite,ch==1u||ch==2u?1:int(ch));
+        float result=normalized*lsc;
+        packedCfaCell[ch]=(isnan(result)||isinf(result))?0.0:result;
+    }
+    // No LSC or WB elsewhere in B between this bridge and AMaZE import.
+    imageStore(packedForAmaze,cell,packedCfaCell);
+    imageStore(sensorClipMask,cell,uvec4(mask,0,0,0));
+}

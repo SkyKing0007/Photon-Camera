@@ -1,0 +1,107 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// IRIS_26864_WRONSKI_PACKED_CFA_2X_DEV_ONLY — NOT COMPILED, NOT IN ANDROID.
+// Derived strictly from pinned RAWR ce767e80... output/prepare_packed_cfa.comp
+// git blob 796346b30229c01cd04a4c55f7df95e565dec410; upstream GPL-3.0
+// notice must accompany source when integrated. Wronski final output is RGB,
+// NEVER mistake RGBA16F RGB for canonical packed CFA without this re-pack.
+// Preserve per-original-site sensor clipping even at 2x, and choose Camera2
+// green LSC channels from the original absolute physical row (not 2x row).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, rgba16f) readonly uniform image2D mergedRgb;
+layout(set = 0, binding = 1, rgba16f) writeonly uniform image2D packedCfa;
+layout(set = 0, binding = 2, r16ui) writeonly uniform uimage2D clipState;
+layout(std430, set = 0, binding = 3) readonly buffer SensorLsc { vec4 lscGainVec[]; };
+layout(set = 0, binding = 4, r16ui) readonly uniform uimage2D refRaw;
+layout(push_constant) uniform P {
+    uint width, height, lscWidth, lscHeight;
+    uint refWidth, refHeight, cfa, useSensorClip;
+    vec4 black;          // canonical sensor R,G1,G2,B, before lens shading
+    vec4 invRange;       // 1/(whiteLevel - canonical sensor black)
+    float clipThreshold;
+    uint originX, originY, fullSensorWidth, fullSensorHeight;
+} p;
+#include "cfa_common.glsl"
+
+// The two Camera2 green shading channels correspond to ORIGINAL physical
+// SENSOR rows, not to the position of the synthetic output RGB pixel.
+// In RGGB/GRBG G1 belongs to the first row of the source 2x2 Bayer cell;
+// in GBRG/BGGR it belongs to the second. G2 is always the other row.
+// A 2x output has four output rows per original Bayer cell, so selecting
+// by outPixel.y/2 would incorrectly toggle G_even/G_odd inside one CFA cell.
+uint physicalGreenChannel(uint canonical) {
+    bool g1InSecondLocalRow = p.cfa >= 2u;
+    uint siteRow = canonical == 1u ? uint(g1InSecondLocalRow)
+                                     : uint(!g1InSecondLocalRow);
+    return 1u + ((p.originY + siteRow) & 1u);
+}
+vec2 physicalSensorPosition(ivec2 outPixel) {
+    // LSC is defined on the original full physical sensor, not an artificial
+    // 2x sensor. Source coordinate is the 2x output coordinate / 2.
+    return vec2(float(p.originX) + float(outPixel.x) * 0.5,
+                float(p.originY) + float(outPixel.y) * 0.5);
+}
+float physicalLscGain(ivec2 outPixel, uint canonical) {
+    if (p.lscWidth == 0u && p.lscHeight == 0u) return 1.0;
+    // The host preflight *requires* both dimensions >=2, full sensor extent
+    // and an exact 4-channel map; malformed data must never reach dispatch.
+    vec2 original = physicalSensorPosition(outPixel);
+    vec2 normalized = original /
+        vec2(float(p.fullSensorWidth-1u), float(p.fullSensorHeight-1u));
+    vec2 gridPos = clamp(normalized, vec2(0), vec2(1)) *
+        vec2(float(p.lscWidth-1u), float(p.lscHeight-1u));
+    uvec2 a = uvec2(floor(gridPos));
+    uvec2 b = min(a + uvec2(1), uvec2(p.lscWidth-1u, p.lscHeight-1u));
+    vec2 f = fract(gridPos);
+    uint channel = canonical == 1u || canonical == 2u
+        ? physicalGreenChannel(canonical) : canonical;
+    float x00 = lscGainVec[a.y * p.lscWidth + a.x][channel];
+    float x10 = lscGainVec[a.y * p.lscWidth + b.x][channel];
+    float x01 = lscGainVec[b.y * p.lscWidth + a.x][channel];
+    float x11 = lscGainVec[b.y * p.lscWidth + b.x][channel];
+    return mix(mix(x00, x10, f.x), mix(x01, x11, f.x), f.y);
+}
+uint originalSensorClip(ivec2 outCell) {
+    // For true-2x: each 2x2 group of output CFA cells corresponds to one
+    // genuine reference CFA cell, preserving true R/G1/G2/B sensor evidence.
+    ivec2 sourceCell = outCell / 2;
+    ivec2 qr, qg1, qg2, qb;
+    rawrCfaCellCoordinates(p.cfa, sourceCell, qr, qg1, qg2, qb);
+    float r = (float(imageLoad(refRaw, qr).r) - p.black[0]) * p.invRange[0];
+    float g1 = (float(imageLoad(refRaw, qg1).r) - p.black[1]) * p.invRange[1];
+    float g2 = (float(imageLoad(refRaw, qg2).r) - p.black[2]) * p.invRange[2];
+    float b = (float(imageLoad(refRaw, qb).r) - p.black[3]) * p.invRange[3];
+    return (r >= p.clipThreshold ? 1u : 0u) |
+           (g1 >= p.clipThreshold ? 2u : 0u) |
+           (g2 >= p.clipThreshold ? 4u : 0u) |
+           (b >= p.clipThreshold ? 8u : 0u);
+}
+float channelAt(ivec2 outPixel, uint channel, out bool clipped) {
+    float value = imageLoad(mergedRgb, outPixel)[int(channel)];
+    bool invalid = isnan(value) || isinf(value);
+    clipped = invalid || value >= p.clipThreshold;
+    return invalid ? 0.0 : clamp(value, 0.0, 1.0);
+}
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    // Host rejects non-2x geometry before any submission. Shader also refuses
+    // accidental reuse for native-resolution/HDRq or mismatched image views.
+    if (p.useSensorClip != 1u || p.cfa > 3u ||
+        p.refWidth * 2u != p.width || p.refHeight * 2u != p.height ||
+        any(notEqual(imageSize(mergedRgb), ivec2(int(p.width),int(p.height)))) ||
+        any(notEqual(imageSize(refRaw), ivec2(int(p.refWidth),int(p.refHeight)))) ||
+        any(greaterThanEqual(cell, imageSize(packedCfa)))) return;
+    ivec2 r,g1,g2,b;
+    rawrCfaCellCoordinates(p.cfa, cell, r,g1,g2,b);
+    bool cr,cg1,cg2,cb;
+    float rv = channelAt(r,0u,cr), g1v = channelAt(g1,1u,cg1);
+    float g2v = channelAt(g2,1u,cg2), bv = channelAt(b,2u,cb);
+    uint mask = (cr?1u:0u) | (cg1?2u:0u) | (cg2?4u:0u) | (cb?8u:0u);
+    // Unlike pinned 1x implementation, do not silently discard reference
+    // clipping when reference geometry is half the output extent.
+    mask |= originalSensorClip(cell);
+    imageStore(packedCfa, cell, vec4(
+        rv * physicalLscGain(r,0u), g1v * physicalLscGain(g1,1u),
+        g2v * physicalLscGain(g2,2u), bv * physicalLscGain(b,3u)));
+    imageStore(clipState, cell, uvec4(mask,0u,0u,0u));
+}
