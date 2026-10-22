@@ -59,9 +59,9 @@ obtain_authority(){
  [[ -n "$TOKEN" ]] || fail 'GITHUB_TOKEN missing'
  curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
    "https://api.github.com/repos/SkyKing0007/Photon-Camera/actions/runs/${RUNTIME_ACTIONS_RUN}" -o "$WORK/26866_run.json"
- python3 -S - "$WORK/26866_run.json" "$RUNTIME_AUTHORITY_COMMIT" <<'PY_RUN'
+ python3 -S - "$WORK/26866_run.json" "$RUNTIME_AUTHORITY_COMMIT" "$RUNTIME_ACTIONS_RUN" <<'PY_RUN'
 import json,sys
-x=json.load(open(sys.argv[1]));assert x['id']==39719781362 and x['conclusion']=='success' and x['head_sha']==sys.argv[2] and x['head_branch']=='experimental-clean-photon-rebuild'
+x=json.load(open(sys.argv[1]));assert x['id']==int(sys.argv[3]) and x['conclusion']=='success' and x['head_sha']==sys.argv[2] and x['head_branch']=='experimental-clean-photon-rebuild'
 print('PASS real 26866 GitHub Actions run/commit/success')
 PY_RUN
  curl -L --fail --retry 3 -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
