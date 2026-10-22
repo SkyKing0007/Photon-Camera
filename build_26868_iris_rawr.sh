@@ -101,9 +101,16 @@ make_candidate(){
  # and run 26866's exact regression on its own byte-proven 26866 authority.
  local H="$WORK/historical_26866_from_successful_26867_reverse"
  rm -rf "$H";cp -a "$BASE" "$H"
+ # Exact 26868 failure regression: a nested directory WITHOUT its own .git
+ # makes git apply discover the outer checkout and skip patching H.
+ # Give the scratch historical candidate its own independent Git root.
+ git -C "$H" init -q
+ [[ "$(git -C "$H" rev-parse --show-toplevel)" == "$H" ]] || fail 'historical rollback escaped isolated Git root'
  (cd "$H" && git apply --check --reverse "$ROOT/26867_FORWARD_FULL_INDEX.patch" &&
      git apply --reverse "$ROOT/26867_FORWARD_FULL_INDEX.patch" &&
      sha256sum -c "$ROOT/26867_BASE_26866_FULL_APP.sha256" >/dev/null) || fail 'historical 26866 exact rollback/manifest mismatch'
+ (cd "$BASE" && sha256sum -c "$ROOT/26868_BASE_26867_FULL_APP.sha256" >/dev/null) || fail 'historical 26866 replay mutated 26867 successful source authority'
+ [[ -z "$(git diff --name-only -- app/src app/version.properties)" ]] || fail 'historical 26866 replay mutated checkout runtime source'
  python3 -S regressions/26866_b_color_only.py "$H/app"
  python3 -S regressions/26867_b_highlight_ab_retired.py "$BASE/app"
  python3 -S regressions/26868_direct_b_long_retire_ab.py "$CAND/app"
@@ -305,9 +312,15 @@ clean_extract_replay(){
  # and run 26866's exact regression on its own byte-proven 26866 authority.
  local H="$WORK/historical_26866_from_successful_26867_reverse"
  rm -rf "$H";cp -a "$BASE" "$H"
+ # Exact 26868 failure regression: a nested directory WITHOUT its own .git
+ # makes git apply discover the outer checkout and skip patching H.
+ # Give the scratch historical candidate its own independent Git root.
+ git -C "$H" init -q
+ [[ "$(git -C "$H" rev-parse --show-toplevel)" == "$H" ]] || fail 'historical rollback escaped isolated Git root'
  (cd "$H" && git apply --check --reverse "$ROOT/26867_FORWARD_FULL_INDEX.patch" &&
      git apply --reverse "$ROOT/26867_FORWARD_FULL_INDEX.patch" &&
      sha256sum -c "$ROOT/26867_BASE_26866_FULL_APP.sha256" >/dev/null) || fail 'historical 26866 exact rollback/manifest mismatch'
+ (cd "$BASE" && sha256sum -c "$ROOT/26868_BASE_26867_FULL_APP.sha256" >/dev/null) || fail 'historical 26866 replay mutated 26867 successful source authority'
  python3 -S regressions/26866_b_color_only.py "$H/app"
  python3 -S regressions/26867_b_highlight_ab_retired.py "$BASE/app"
  python3 -S regressions/26868_direct_b_long_retire_ab.py "$exp/app"
