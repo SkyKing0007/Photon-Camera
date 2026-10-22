@@ -82,11 +82,9 @@ void ResourceArena::initialize(VkPhysicalDevice p, VkDevice d, const ScratchLayo
             VkImageMemoryRequirementsInfo2 requirementsInfo{};
             requirementsInfo.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
             requirementsInfo.image = a.image;
-            if (vkGetImageMemoryRequirements2) {
-                vkGetImageMemoryRequirements2(d, &requirementsInfo, &requirements);
-            } else {
-                vkGetImageMemoryRequirements(d, a.image, &requirements.memoryRequirements);
-            }
+            // Iris Android owner requires Vulkan 1.1; core memory-requirements2 is mandatory.
+            // Do not test a linked Vulkan symbol address (Clang -Wpointer-bool-conversion).
+            vkGetImageMemoryRequirements2(d, &requirementsInfo, &requirements);
             const auto& mr = requirements.memoryRequirements;
             a.allocationBytes = mr.size;
             if (!images_.emplace(s.name, a).second) throw std::runtime_error("multiframe arena: duplicate image name");
@@ -179,11 +177,8 @@ void ResourceArena::initialize(VkPhysicalDevice p, VkDevice d, const ScratchLayo
             VkBufferMemoryRequirementsInfo2 requirementsInfo{};
             requirementsInfo.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2;
             requirementsInfo.buffer = a.buffer;
-            if (vkGetBufferMemoryRequirements2) {
-                vkGetBufferMemoryRequirements2(d, &requirementsInfo, &requirements);
-            } else {
-                vkGetBufferMemoryRequirements(d, a.buffer, &requirements.memoryRequirements);
-            }
+            // Vulkan 1.1 core requirements2 preserves dedicated-allocation provenance.
+            vkGetBufferMemoryRequirements2(d, &requirementsInfo, &requirements);
             const auto& mr = requirements.memoryRequirements;
             a.allocationBytes = mr.size;
             if (!buffers_.emplace(s.name, a).second)

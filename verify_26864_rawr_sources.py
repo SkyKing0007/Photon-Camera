@@ -17,9 +17,24 @@ two=json.loads((vendor/'IRIS26864_TWOSLOT_RUNTIME_SOURCE_PROOF.json').read_text(
 assert lock['pin']=='ce767e80bfce2e1641abf7dad6b1bf504d844fd9'
 assert len(lock['files'])==97 and lock['expected_source_files']==95
 assert len(two['strict_changed_file_allowlist'])==2
+# IRIS_26864_NDK_VK11_MEMORY_REQUIREMENTS_39712359645
+# The EXACT pinned ResourceArena original stays recorded in the upstream lock;
+# Android 1.1-only API adaptation is separately narrow, with no shader/merge change.
+mem=two.get('android_vk11_memory_requirements_adapter')
+assert mem is not None, 'missing failed Actions 39712359645 Vulkan 1.1 source adapter'
+mem_rel='native/multiframe/pipeline/src/ResourceArena.cpp'
+assert mem['relative_path']==mem_rel
+assert mem['upstream_sha256']==lock['files'][mem_rel]['sha256']=='f4b26c9502402be7c127d33d70c17a7a1fe9120eeb870b6c89c667f1a8e87eea'
+assert mem['candidate_sha256']=='ad3749757076a9e43a6697a36341b081021b6d2252833477ac4defbe34b8ee83'
+assert mem['two_original_conditional_fallbacks_replaced']==2
+assert set(two['strict_changed_file_allowlist'])=={
+ 'native/multiframe/pipeline/include/rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h',
+ 'native/multiframe/pipeline/src/AndroidBurstCoordinator.cpp'}
 for rel,expected in lock['files'].items():
  path=vendor/rel;assert path.is_file(),('absent pinned RAWR',rel)
- if rel in two['strict_changed_file_allowlist']:
+ if rel==mem_rel:
+  assert hashlib.sha256(path.read_bytes()).hexdigest()==mem['candidate_sha256'],('Android Vulkan 1.1 arena adapter changed',rel)
+ elif rel in two['strict_changed_file_allowlist']:
   assert hashlib.sha256(path.read_bytes()).hexdigest()==two['after_sha256'][rel],('pinned two slot adaptation',rel)
  else:
   assert hashlib.sha256(path.read_bytes()).hexdigest()==expected['sha256'],('upstream RAWR changed unexpectedly',rel)
@@ -36,7 +51,7 @@ for var,tail in specs:
  assert path.is_file(),('RAWR CMake shader missing',path)
  files.append(path)
 assert set(files)==set(native.rglob('*.comp')),(len(set(files)),len(list(native.rglob('*.comp'))))
-print('PASS 26864 pinned upstream: 95 unchanged/source-adapted file paths plus LICENSE/NOTICE, 55 original compute shaders, 2 only two-slot adapter edits')
+print('PASS 26864 pinned upstream: 95 unchanged/source-adapted file paths plus LICENSE/NOTICE, 55 original compute shaders, exact 2 two-slot adapters plus one Vulkan 1.1 API compiler adapter')
 if a.compile:
  assert a.out and a.spirv_val and a.spirv_opt
  wrapper=app/'compile_locked_rawr_glslc.py'

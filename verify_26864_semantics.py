@@ -191,3 +191,57 @@ void vkCmdPipelineBarrier(VkCommandBuffer,VkPipelineStageFlags,VkPipelineStageFl
         bad=subprocess.run(['c++','-std=c++17','-Werror','-fsyntax-only',str(test)],capture_output=True,text=True)
         assert bad.returncode!=0 and ('too few arguments' in bad.stderr or 'requires 10 arguments' in bad.stderr),('original NDK error did not reproduce',bad.stderr)
 print('PASS Vulkan NDK 39710810277 regression:',_all_barrier_calls,'native pipeline barriers exact 10-argument ABI; host positive/negative '+('PASS' if a.numeric else 'NOT RUN'))
+
+# IRIS_26864_NDK_VK11_MEMORY_REQUIREMENTS_REGRESSION_39712359645
+# NDK27 clang fails when a directly linked Vulkan 1.1 function symbol is
+# used as a Boolean (Werror,-Wpointer-bool-conversion), ResourceArena.cpp:85/182.
+# Test the actual candidate statements with the authentic Vulkan 1.1 core ABI
+# and demonstrate that reintroducing each original condition causes Clang to fail.
+import hashlib as _v11hash
+import shutil as _v11shutil
+_vendor=cpp/'vendor/rawr'
+_memory_source=(_vendor/'native/multiframe/pipeline/src/ResourceArena.cpp').read_text()
+_memory_proof=__import__('json').loads((_vendor/'IRIS26864_TWOSLOT_RUNTIME_SOURCE_PROOF.json').read_text())
+_memory_lock=__import__('json').loads((_vendor/'IRIS26864_RAWR_VENDOR_SOURCE_LOCK.json').read_text())
+_adapter=_memory_proof['android_vk11_memory_requirements_adapter']
+assert _adapter['upstream_sha256']==_memory_lock['files'][_adapter['relative_path']]['sha256']
+assert _v11hash.sha256(_memory_source.encode()).hexdigest()==_adapter['candidate_sha256']=='ad3749757076a9e43a6697a36341b081021b6d2252833477ac4defbe34b8ee83'
+_device_source=(root/'src/main/cpp/iris26856/amaze/src/VulkanDeviceOwner.cpp').read_text()
+assert 'app.apiVersion = VK_API_VERSION_1_1;' in _device_source
+assert 'if (props.apiVersion < VK_API_VERSION_1_1) continue;' in _device_source
+assert 'vkGetImageMemoryRequirements2(d, &requirementsInfo, &requirements);' in _memory_source
+assert 'vkGetBufferMemoryRequirements2(d, &requirementsInfo, &requirements);' in _memory_source
+assert 'requirements.pNext = &dedicated;' in _memory_source
+assert _memory_source.count('dedicated.requiresDedicatedAllocation == VK_TRUE')==2
+assert not __import__('re').search(r'if\s*\(\s*vkGet(?:Image|Buffer)MemoryRequirements2\s*\)',_memory_source)
+# Broader native source scan for this entire function-address misuse class.
+for _src_file in (root/'src/main/cpp').rglob('*'):
+ if _src_file.is_file() and _src_file.suffix in ('.cpp','.cc','.c','.h','.hpp','.inc'):
+  _data=_src_file.read_text(errors='replace')
+  assert not __import__('re').search(r'if\s*\(\s*(?:vkGetBufferMemoryRequirements2|vkGetImageMemoryRequirements2)\s*\)',_data),('reintroduced NDK 39712359645 function pointer check',_src_file)
+if a.numeric:
+ clang=_v11shutil.which('clang++')
+ assert clang is not None,'real Clang required for Android NDK pointer-bool-conversion regression'
+ # Extract exact new ABI invocation statements rather than rewrite by hand.
+ _call_img='vkGetImageMemoryRequirements2(d, &requirementsInfo, &requirements);'
+ _call_buf='vkGetBufferMemoryRequirements2(d, &requirementsInfo, &requirements);'
+ _header="""#include <cstdint>
+struct VkDevice_T; using VkDevice=VkDevice_T*;
+struct VkImageMemoryRequirementsInfo2{uint32_t sType; void* pNext;};
+struct VkBufferMemoryRequirementsInfo2{uint32_t sType; void* pNext;};
+struct VkMemoryRequirements2{uint32_t sType; void* pNext;};
+void vkGetImageMemoryRequirements2(VkDevice,const VkImageMemoryRequirementsInfo2*,VkMemoryRequirements2*);
+void vkGetBufferMemoryRequirements2(VkDevice,const VkBufferMemoryRequirementsInfo2*,VkMemoryRequirements2*);
+"""
+ with tempfile.TemporaryDirectory(prefix='26864_vk11_ndk_regression_') as _temporary:
+  _cpp=Path(_temporary)/'ResourceArena_abi.cpp'
+  for typ,call in [('Image',_call_img),('Buffer',_call_buf)]:
+   assert _memory_source.count(call)==1
+   def _build(negative):
+    _statement=('if ('+('vkGetImageMemoryRequirements2' if typ=='Image' else 'vkGetBufferMemoryRequirements2')+') {\n '+call+'\n}' if negative else call)
+    _cpp.write_text(_header+f'void runtime(VkDevice d){{Vk{typ}MemoryRequirementsInfo2 requirementsInfo{{}};VkMemoryRequirements2 requirements{{}};'+_statement+'}\n')
+    return subprocess.run([clang,'-std=c++17','-Wall','-Wextra','-Werror=pointer-bool-conversion','-fsyntax-only',str(_cpp)],capture_output=True,text=True)
+   positive=_build(False);assert positive.returncode==0,('real Clang rejects updated Vulkan 1.1 call',positive.stderr)
+   negative=_build(True);assert negative.returncode!=0 and ('pointer-bool-conversion' in negative.stderr or 'always evaluate to' in negative.stderr),('historical NDK failure not detected',negative.stderr)
+ print('PASS real Clang Vulkan 1.1 typed-memory ABI: image+buffer positive and historical two negative fixtures')
+print('PASS exact native 39712359645 regression: Vulkan 1.1 core gate, unchanged dedicated requirements, pinned RAWR lock, no symbol-boolean checks')
