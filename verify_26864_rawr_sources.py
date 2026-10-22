@@ -25,8 +25,9 @@ assert mem is not None, 'missing failed Actions 39712359645 Vulkan 1.1 source ad
 mem_rel='native/multiframe/pipeline/src/ResourceArena.cpp'
 assert mem['relative_path']==mem_rel
 assert mem['upstream_sha256']==lock['files'][mem_rel]['sha256']=='f4b26c9502402be7c127d33d70c17a7a1fe9120eeb870b6c89c667f1a8e87eea'
-assert mem['candidate_sha256']=='ad3749757076a9e43a6697a36341b081021b6d2252833477ac4defbe34b8ee83'
+assert mem['candidate_sha256']=='0e98b658523532ac52381724e15d93ed9fb32335254e47b9351158849b33530a'
 assert mem['two_original_conditional_fallbacks_replaced']==2
+assert mem['device_proc_dispatch_count']==2 and mem['linker_regression_run']==39714213244
 assert set(two['strict_changed_file_allowlist'])=={
  'native/multiframe/pipeline/include/rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h',
  'native/multiframe/pipeline/src/AndroidBurstCoordinator.cpp'}
@@ -51,7 +52,7 @@ for var,tail in specs:
  assert path.is_file(),('RAWR CMake shader missing',path)
  files.append(path)
 assert set(files)==set(native.rglob('*.comp')),(len(set(files)),len(list(native.rglob('*.comp'))))
-print('PASS 26864 pinned upstream: 95 unchanged/source-adapted file paths plus LICENSE/NOTICE, 55 original compute shaders, exact 2 two-slot adapters plus one Vulkan 1.1 API compiler adapter')
+print('PASS 26864 pinned upstream: 95 unchanged/source-adapted file paths plus LICENSE/NOTICE, 55 original compute shaders, exact 2 two-slot adapters plus one Vulkan 1.1 device-proc-dispatch link adapter')
 if a.compile:
  assert a.out and a.spirv_val and a.spirv_opt
  wrapper=app/'compile_locked_rawr_glslc.py'

@@ -44,6 +44,17 @@ void ResourceArena::initialize(VkPhysicalDevice p, VkDevice d, const ScratchLayo
     physical_ = p;
     device_ = d;
     try {
+        // Vulkan 1.1 is enforced by the inherited VulkanDeviceOwner. Android's
+        // link-time libvulkan stub does not necessarily export post-1.0 entry
+        // points: resolve both through the owning device, never direct-link.
+        const auto getImageMemoryRequirements2 =
+            reinterpret_cast<PFN_vkGetImageMemoryRequirements2>(
+                vkGetDeviceProcAddr(d, "vkGetImageMemoryRequirements2"));
+        const auto getBufferMemoryRequirements2 =
+            reinterpret_cast<PFN_vkGetBufferMemoryRequirements2>(
+                vkGetDeviceProcAddr(d, "vkGetBufferMemoryRequirements2"));
+        if (!getImageMemoryRequirements2 || !getBufferMemoryRequirements2)
+            throw std::runtime_error("26864 Vulkan 1.1 memory-requirements2 device entry unavailable");
         struct PendingImage {
             std::string name;
             VkMemoryRequirements requirements{};
@@ -84,7 +95,7 @@ void ResourceArena::initialize(VkPhysicalDevice p, VkDevice d, const ScratchLayo
             requirementsInfo.image = a.image;
             // Iris Android owner requires Vulkan 1.1; core memory-requirements2 is mandatory.
             // Do not test a linked Vulkan symbol address (Clang -Wpointer-bool-conversion).
-            vkGetImageMemoryRequirements2(d, &requirementsInfo, &requirements);
+            getImageMemoryRequirements2(d, &requirementsInfo, &requirements);
             const auto& mr = requirements.memoryRequirements;
             a.allocationBytes = mr.size;
             if (!images_.emplace(s.name, a).second) throw std::runtime_error("multiframe arena: duplicate image name");
@@ -178,7 +189,7 @@ void ResourceArena::initialize(VkPhysicalDevice p, VkDevice d, const ScratchLayo
             requirementsInfo.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2;
             requirementsInfo.buffer = a.buffer;
             // Vulkan 1.1 core requirements2 preserves dedicated-allocation provenance.
-            vkGetBufferMemoryRequirements2(d, &requirementsInfo, &requirements);
+            getBufferMemoryRequirements2(d, &requirementsInfo, &requirements);
             const auto& mr = requirements.memoryRequirements;
             a.allocationBytes = mr.size;
             if (!buffers_.emplace(s.name, a).second)
