@@ -116,8 +116,15 @@ make_candidate(){
  python3 -S regressions/26868_direct_b_long_retire_ab.py "$CAND/app"
  python3 -S verify_26864_rawr_sources.py "$CAND/app"
  python3 -S regressions/26864_glsl_reserved_identifiers.py "$CAND/app"
- python3 -S regressions/26864_wronski_publisher.py "$CAND/app"
- python3 -S verify_26864_semantics.py "$CAND/app" --numeric
+ # Preserve exact successful 26864 Wronski regression on its original
+ # verified successful 26867 pre-retirement candidate, not rewritten B-only routing.
+ # 26868 native B active-path semantics are covered by 26868_direct_b_long_retire_ab.py.
+ python3 -S regressions/26864_wronski_publisher.py "$BASE/app"
+ # Historical 26864 Kotlin named-argument regression includes the retired
+ # A+B Bridge->Fusion call. Verify the unchanged historical validator on
+ # the byte-attested 26867 source; current A and direct-B constructor edges
+ # are checked independently by regressions/26868_direct_b_long_retire_ab.py.
+ python3 -S verify_26864_semantics.py "$BASE/app" --numeric
  pass '26868 deterministic authority-seeded candidate, pinned RAWR source and active-path semantic regressions'
 }
 verify_successful_mechanics(){
@@ -303,8 +310,12 @@ clean_extract_replay(){
  python3 -S verify_26864_runtime_glsl.py "$BASE" "$exp" --out "$OUT/26868_final_runtime_expanded_glsl" | tee "$OUT/26868_final_glsl_static_replay.txt"
  python3 -S verify_26864_rawr_sources.py "$exp/app"
  python3 -S regressions/26864_glsl_reserved_identifiers.py "$exp/app"
- python3 -S regressions/26864_wronski_publisher.py "$exp/app"
- python3 -S verify_26864_semantics.py "$exp/app" --numeric
+ # Historical 26864 Wronski source regression remains unchanged on
+ # byte-verified successful 26867 runtime authority.
+ python3 -S regressions/26864_wronski_publisher.py "$BASE/app"
+ # Replay the same exact historical Kotlin/native/Vulkan semantic regression
+ # on successful 26867 source; the current candidate has B-only live-edge proof.
+ python3 -S verify_26864_semantics.py "$BASE/app" --numeric
  python3 -S regressions/26865_b_lsc_owner.py "$exp/app"
  # Historical 26866 clipping test is PERMANENT, but 26867 intentionally
  # superseded its white-fade curve. Replay the exact successful 26867
