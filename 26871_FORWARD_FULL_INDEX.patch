@@ -1,0 +1,256 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt
+index 0d88549cbb51479ec5a3a59341c1afcda727d582..b8abac801c37faf7121c6a84fb006ef83a81bacb 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt
+@@ -4,6 +4,8 @@ package com.hinnka.mycamera.processor
+  * Sensor-neutral linear camera RGB; AFTER native physical LSC+AMaZE, BEFORE
+  * temporary WB / highlight / Lab / FCC. Corrects chroma only, never luminance.
+  * Small-texture, hue and edge confidence vetoes protect coherent material.
++ * IRIS_26871_B_MULTISCALE_CHROMA: far-ring comparisons suppress broad
++ * incoherent low-light color mottling; no second filter or added full-frame buffer.
+  * This shader FUSES the already-present temporary WB pass and creates NO
+  * extra full-frame RGBA16F intermediate (crucial for 2x output GPU memory).
+  * The future-tone visibility budget is conservative and local-luminance aware;
+@@ -40,8 +42,9 @@ internal object GlesIris26870PostAmazeChroma {
+           if(protectedStructure<=0.0){oPostWbCameraRgb=vec4(raw.rgb*uAmazeWb,raw.a);return;}
+           vec2 center=chr(c,y),acc=vec2(0.0);
+           float sum=0.0;
+-          for(int ring=0;ring<2;ring++){
+-            int radius=ring==0?4:11;
++          for(int ring=0;ring<4;ring++){
++            int radius=ring==0?4:ring==1?11:ring==2?32:72;
++            float ringWeight=ring<2?1.0:0.65;
+             for(int d=0;d<8;d++){
+               ivec2 off=ivec2((d==0||d==4||d==5)?radius:((d==1||d==6||d==7)?-radius:0),
+                                (d==2||d==4||d==6)?radius:((d==3||d==5||d==7)?-radius:0));
+@@ -50,10 +53,10 @@ internal object GlesIris26870PostAmazeChroma {
+               vec2 nc=chr(n,ny);
+               float material=(1.0-smoothstep(0.02,0.11,abs(ny-y)/max(y,0.07)))
+                            *(1.0-smoothstep(0.12,0.44,length(nc-center)));
+-              acc+=nc*material;sum+=material;
++              acc+=nc*(material*ringWeight);sum+=material*ringWeight;
+             }
+           }
+-          float agree=smoothstep(5.0,10.0,sum);
++          float agree=smoothstep(7.0,15.0,sum);
+           if(agree<=0.0){oPostWbCameraRgb=vec4(raw.rgb*uAmazeWb,raw.a);return;}
+           vec2 consensus=acc/max(sum,1.0e-5);
+           float unsupported=length(center-consensus);
+@@ -64,8 +67,8 @@ internal object GlesIris26870PostAmazeChroma {
+           float expectedShadowGain=exp2(clamp(uReferenceProtectionEv,0.0,1.5))
+                                   *(1.0+2.0*(1.0-smoothstep(0.025,0.22,y)));
+           float visible=smoothstep(0.006,0.045,y*expectedShadowGain);
+-          float amount=0.36*agree*protectedStructure*outlier*genuineHueProtect*visible;
+-          vec2 filteredChroma=mix(center,consensus,clamp(amount,0.0,0.36));
++          float amount=0.46*agree*protectedStructure*outlier*genuineHueProtect*visible;
++          vec2 filteredChroma=mix(center,consensus,clamp(amount,0.0,0.46));
+           float span=max(y,0.035);
+           float g=y-0.25*(filteredChroma.x+filteredChroma.y)*span;
+           vec3 rgb=vec3(g+filteredChroma.x*span,g,g+filteredChroma.y*span);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index b68d026394b142482f48c54ed852750417b81f05..6a1c685b9d1f625b4b46f5eb15d2d12bc654b0bd 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -2231,6 +2231,23 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private int mMotion26841PreviewAppliedCompSteps = 0;
+     private float mMotion26841PreviewAeStepEv = 0.0f;
+ 
++    /* IRIS_26871_B_ONLY_EXPOSURE_SELECTION
++     * Use the same persisted physical-lens B choice that is frozen at shutter.
++     * Unknown/invalid selection fails CLOSED to the unchanged A policy.
++     * This read does not own or mutate the repeating request. */
++    private boolean iris26871BExposureSelected() {
++        if (getAuthoritativeCameraMode() != CameraMode.MOTION) return false;
++        try {
++            return com.particlesdevs.photoncamera.settings.Iris26856ABSettings.read(
++                    com.particlesdevs.photoncamera.app.PhotonCamera.getApplicationContextStatic(),
++                    physicalID,
++                    com.particlesdevs.photoncamera.settings.PreferenceKeys.getCameraID())
++                    == com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855;
++        } catch (RuntimeException ignored) {
++            return false;
++        }
++    }
++
+     /* IRIS_26843_FAST_PROTECTIVE_HDR_ARM
+      * This is timing-only. 26713/26841 still own the exact target magnitude. Fresh RAW evidence may
+      * bypass the stationary/stable wait only when it proves that a MORE protective target than the
+@@ -3899,22 +3916,33 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     (float)(iris26714NormalizedP995
+                             * Math.pow(2.0, iris26841HeldProtectionEv))));
+ 
++            /* IRIS_26871_B_SENSOR_CLIP_EXPOSURE
++             * A keeps 26710's HDR headroom/floor policy byte-for-byte.
++             * B stops subtracting EV solely because a bright scene exists.
++             * Demand fresh normalized RAW evidence of a meaningful saturated
++             * area or a high near-white percentile, then protect only the
++             * necessary sensor headroom; never invent a manual preview owner. */
++            final boolean iris26871BExposure = iris26871BExposureSelected();
+             float requestedProtectionEv = 0.0f;
+             if (meaningfulHdr) {
+                 float radiometricGuide = iris26841BaseNormalizedP995;
+-                if (radiometricGuide > MOTION_26710_REFERENCE_HEADROOM_TARGET) {
++                final float headroomTarget = iris26871BExposure
++                        ? 0.94f : MOTION_26710_REFERENCE_HEADROOM_TARGET;
++                if (radiometricGuide > headroomTarget) {
+                     requestedProtectionEv = (float)(Math.log(
+-                            radiometricGuide / MOTION_26710_REFERENCE_HEADROOM_TARGET)
+-                            / Math.log(2.0));
++                            radiometricGuide / headroomTarget) / Math.log(2.0));
+                 }
+-                if (broadOrMixedHdr && radiometricGuide >= 0.45f) {
++                if (!iris26871BExposure && broadOrMixedHdr && radiometricGuide >= 0.45f) {
+                     requestedProtectionEv = Math.max(
+                             requestedProtectionEv, MOTION_26710_HDR_MIN_PROTECTION_EV);
+                 }
+                 boolean broadClip = Float.isFinite(mMotion26710HalBaselineHighlightFraction)
+                         && mMotion26710HalBaselineHighlightFraction
+                             >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER;
+-                boolean meaningfulClip = broadClip || (coherentHighlight && broadOrMixedHdr);
++                boolean meaningfulClip = iris26871BExposure
++                        ? iris26714FractionsDirect && broadClip
++                                && (broadOrMixedHdr || coherentHighlight)
++                        : broadClip || (coherentHighlight && broadOrMixedHdr);
+                 if (meaningfulClip) {
+                     float fraction = Float.isFinite(mMotion26710HalBaselineHighlightFraction)
+                             ? mMotion26710HalBaselineHighlightFraction
+@@ -3923,7 +3951,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                             (fraction - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER)
+                                 / (0.030f - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER));
+                     requestedProtectionEv = Math.max(requestedProtectionEv,
+-                            MOTION_26710_CLIP_MIN_PROTECTION_EV + 0.45f * clipPressure);
++                            (iris26871BExposure ? 0.35f : MOTION_26710_CLIP_MIN_PROTECTION_EV)
++                                    + 0.45f * clipPressure);
+                 }
+             }
+             requestedProtectionEv = Math.max(0.0f,
+@@ -4148,14 +4177,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 final boolean iris26843Coherent = mMotion26709PublishedCoherentCells > 0;
+                 final boolean iris26843MeaningfulHdr = iris26843BroadOrMixed
+                         || (mMotion26709PublishedCompactVotes >= 2 && iris26843Coherent);
++                final boolean iris26871BExposure = iris26871BExposureSelected();
++                final float iris26871HeadroomTarget = iris26871BExposure
++                        ? 0.94f : MOTION_26710_REFERENCE_HEADROOM_TARGET;
+                 float iris26843ProvenProtectionEv = 0.0f;
+                 if (iris26843MeaningfulHdr
+-                        && iris26843BaseP995 > MOTION_26710_REFERENCE_HEADROOM_TARGET) {
++                        && iris26843BaseP995 > iris26871HeadroomTarget) {
+                     iris26843ProvenProtectionEv = (float)(Math.log(
+-                            iris26843BaseP995 / MOTION_26710_REFERENCE_HEADROOM_TARGET)
++                            iris26843BaseP995 / iris26871HeadroomTarget)
+                             / Math.log(2.0));
+                 }
+-                if (iris26843BroadOrMixed && iris26843BaseP995 >= 0.45f) {
++                if (!iris26871BExposure && iris26843BroadOrMixed
++                        && iris26843BaseP995 >= 0.45f) {
+                     iris26843ProvenProtectionEv = Math.max(iris26843ProvenProtectionEv,
+                             MOTION_26710_HDR_MIN_PROTECTION_EV);
+                 }
+@@ -4164,13 +4197,16 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 if (iris26843FractionsDirect && iris26843MeaningfulHdr
+                         && Float.isFinite(mMotion26380RawHighlightFraction)
+                         && mMotion26380RawHighlightFraction
+-                            >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER) {
++                            >= MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER
++                        && (!iris26871BExposure
++                                || (iris26843BroadOrMixed || iris26843Coherent))) {
+                     float iris26843ClipPressure = motion26368Clamp01(
+                             (mMotion26380RawHighlightFraction
+                                     - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER)
+                                     / (0.030f - MOTION_26478_HIGHLIGHT_FRACTION_TRIGGER));
+                     iris26843ProvenProtectionEv = Math.max(iris26843ProvenProtectionEv,
+-                            MOTION_26710_CLIP_MIN_PROTECTION_EV + 0.45f * iris26843ClipPressure);
++                            (iris26871BExposure ? 0.35f : MOTION_26710_CLIP_MIN_PROTECTION_EV)
++                                    + 0.45f * iris26843ClipPressure);
+                 }
+                 iris26843ProvenProtectionEv = Math.max(0.0f,
+                         Math.min(MOTION_26709_MAX_RELATIVE_EV, iris26843ProvenProtectionEv));
+@@ -5124,6 +5160,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         + mMotionActualCandidateFrames
+                         + " ringCleared=false"
+                         + " previewRebuilt=false");
++                /* IRIS_26871_B_HAL_ANTIBANDING_OBSERVED
++                 * This reports HAL's *actual* result, not just the AUTO request.
++                 * Emit only on an existing confirmed AE-group transition. */
++                if (iris26871BExposureSelected()) {
++                    Integer observedAnti = result.get(
++                            CaptureResult.CONTROL_AE_ANTIBANDING_MODE);
++                    Log.i(TAG, "IRIS_26871_B_HAL_ANTIBANDING_OBSERVED"
++                            + " result=" + observedAnti
++                            + " exposureNs=" + actualExposure
++                            + " iso=" + actualIso
++                            + " stableFrames=" + mMotionActualCandidateFrames);
++                }
+             }
+         }
+     }
+@@ -6477,6 +6525,28 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         }
+ 
+         mPreviewRequestBuilder.addTarget(surface);
++        /* IRIS_26871_B_PREVIEW_HAL_ANTIBANDING
++         * Set on the initial B-only preview + ZSL RAW request, not from per-frame
++         * flicker feedback. HAL remains the sole shutter/ISO owner; no manual
++         * flicker shutter, pixel correction or second exposure authority. */
++        if (!mIsRecordingVideo && isZslMode() && iris26871BExposureSelected()
++                && mCameraCharacteristics != null) {
++            int[] modes = mCameraCharacteristics.get(
++                    CameraCharacteristics.CONTROL_AE_AVAILABLE_ANTIBANDING_MODES);
++            boolean supported = false;
++            if (modes != null) for (int mode : modes) {
++                if (mode == CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO) {
++                    supported = true;
++                    break;
++                }
++            }
++            if (supported) {
++                mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_ANTIBANDING_MODE,
++                        CaptureRequest.CONTROL_AE_ANTIBANDING_MODE_AUTO);
++                Log.i(TAG, "IRIS_26871_B_HAL_ANTIBANDING mode=AUTO"
++                        + " previewAndZslSameRepeating=true manualShutter=false");
++            }
++        }
+         synchronized (mZslBufferLock) {
+             while (!mZslRingBuffer.isEmpty()) {
+                 Image img = mZslRingBuffer.pollFirst();
+@@ -10616,10 +10686,27 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         return Math.abs(Math.log(a / b) / Math.log(2.0));
+     }
+ 
++    /* IRIS_26871_B_SHUTTER_FLICKER_GROUP_GUARD
++     * Equal time*ISO is not enough for flickering lights: a 4 ms / ISO 400
++     * frame must not be stacked with an 8 ms / ISO 200 frame merely because
++     * their integrated AE energies match. A keeps its proven energy-only
++     * policy. B requires both equal energy and stable actual shutter time.
++     * No manual sensor request, no row/pixel correction, and no new AE owner.
++     */
+     private boolean motionExposurePairMatches(
+             TotalCaptureResult first, TotalCaptureResult second) {
+-        return motion26486ExposureDeltaEv(first, second)
+-                <= MOTION_26486_EXPOSURE_HALF_WINDOW_EV;
++        if (motion26486ExposureDeltaEv(first, second)
++                > MOTION_26486_EXPOSURE_HALF_WINDOW_EV) return false;
++        if (!iris26871BExposureSelected()) return true;
++        if (first == null || second == null) return false;
++        Long firstNs = first.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++        Long secondNs = second.get(CaptureResult.SENSOR_EXPOSURE_TIME);
++        if (firstNs == null || secondNs == null || firstNs <= 0L || secondNs <= 0L)
++            return false;
++        double shutterDeltaEv = Math.abs(
++                Math.log((double) firstNs / (double) secondNs) / Math.log(2.0));
++        return Double.isFinite(shutterDeltaEv)
++                && shutterDeltaEv <= MOTION_26486_EXPOSURE_HALF_WINDOW_EV;
+     }
+ 
+     /*
+diff --git a/app/version.properties b/app/version.properties
+index 5a62fc222e9ccac61e99518ab461a8a94c709e57..b01fd9082b9862b9b6343dee376ec5c70100d915 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726870
+-VERSION_BUILD=26870
++VERSION_NAME=0.9726871
++VERSION_BUILD=26871
