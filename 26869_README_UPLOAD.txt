@@ -1,12 +1,7 @@
-PHOTON 26869 — THREE COMMIT GUARDED HANDOFF — branch experimental-clean-photon-rebuild only
-Stage 1: upload/replace all included files in their relative repository paths, commit, push.
-Stage 2: upload the single .github/workflows/build-26869-iris-rawr.yml, commit, push.
-Stage 3: upload TRIGGER_26869.txt, commit and push to launch exactly one intended workflow.
-Use vscode.dev. Do NOT copy handoff_payload_26869/app directly to live app/src or app/version.properties.
-The Actions build script reconstructs the exact successful 26868 compiled candidate and overlays only the 12 allowed runtime replacements before incrementing version/build and compiling.
-No APK is provided or committed. No backup branch. Real Kotlin/Java/NDK/pinned GLSL/assemble NOT RUN locally; GitHub Actions is build authority.
-Implementation note: frozen NORMAL reference selector uses a bounded sampled CPU CFA-green coherence score, NOT the optional upstream RAWR Vulkan scorer; keeps shutter-time fallback. This is deliberately disclosed and should be evaluated for performance and accuracy after Actions proof.
-All per-lens B-only controls located below existing Chroma slider. Shadow toe default 0.0; residual cleanup defaults enabled with 50% strength and can be OFF to retain pure 26868 RAWR path.
-
-26869 R2 is a verification-only repair following Actions 39894413063. Stage 1 changes guarded script and manifests, not runtime payload; Stage 2 adds a permanent failing-condition preflight; Stage 3 changes trigger content to force a fresh event.
-Never regard static checks as real compiler/assemble proof.
+PHOTON 26869 R3 — PREPARED / UPLOAD READY for vscode.dev, branch experimental-clean-photon-rebuild.
+Runtime authority: successful 26868 Actions 39863379652, commit 7800265e6a5909ddea770c93cfeaed244c489247; exact successful compiled-candidate 1992-file TAR sha256 7ac33dfa920060b97465e6a1815573f56cdaf5548e444abd20d9366063ec5596.
+This fixes ONLY Actions 39897292954 AAPT2 invalid app:max on two AndroidX SeekBarPreference controls (use android:max=100). Exact negative fixture added to permanent 26869 regression. Other 11 runtime payloads, existing 26869 build script and workflow unchanged. Candidate-first allowlist remains exactly 12; protected 1984 unchanged; exact 17-stage successful 26868 mechanics retained.
+S1: upload/replace every file beneath S1/ at its exact repository-relative path, commit and push.
+S2: EMPTY, SKIP upload and commit because workflow YAML is byte-identical to committed R2.
+S3: upload/replace TRIGGER_26869.txt ONLY AFTER S1, commit and push to trigger Actions exactly once.
+Do not upload S1/S2/S3 folder names. Do not place handoff_payload_26869/app into live app/src directly. No APK included. No backup, no source push made here. Real Android AAPT2, pinned GLSL, Kotlin/Java/NDK/full assemble NOT RUN locally; GitHub Actions decides build success.

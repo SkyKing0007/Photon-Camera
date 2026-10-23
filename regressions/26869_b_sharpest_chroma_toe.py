@@ -29,6 +29,37 @@ assert 'setPersistent(false)' in activity and 'setupIris26869BControls();' in ac
 xml=(cand/'src/main/res/xml/preferences.xml').read_text()
 assert xml.index('pref_iris_chroma_denoise')<xml.index('iris_26869_b_chroma_enable')<xml.index('iris_26869_b_chroma_strength')<xml.index('iris_26869_b_shadow_toe')
 ET.fromstring(xml)
+# Permanent exact AAPT2 failure regression from Actions 39897292954:
+# AndroidX SeekBarPreference's max belongs to android:max, NOT app:max.
+# Test expanded namespaces (prefix-agnostic) and reject the actual failing XML.
+ANDROID = 'http://schemas.android.com/apk/res/android'
+APP = 'http://schemas.android.com/apk/res-auto'
+def assert_26869_seekbar_bounds(xml_bytes):
+ root=ET.fromstring(xml_bytes)
+ sliders={}
+ for node in root.iter():
+  if node.tag.endswith('SeekBarPreference'):
+   assert '{'+APP+'}max' not in node.attrib, ('AAPT2 39897292954 app:max invalid',node.attrib.get('{'+ANDROID+'}key'))
+   key=node.attrib.get('{'+ANDROID+'}key')
+   if key in ('iris_26869_b_chroma_strength','iris_26869_b_shadow_toe'):
+    assert key not in sliders,('duplicate 26869 SeekBarPreference',key)
+    assert node.attrib.get('{'+ANDROID+'}max')=='100',('expected android:max=100',key)
+    assert node.attrib.get('{'+APP+'}min')=='0',('expected app:min=0',key)
+    assert node.attrib.get('{'+APP+'}seekBarIncrement')=='5',('expected increment 5',key)
+    sliders[key]=node
+ assert len(sliders)==2,('26869 missing slider',sorted(sliders))
+ return True
+assert assert_26869_seekbar_bounds(xml)
+# Reproduce exact error with app:max instead of android:max on both sliders.
+invalid=xml.replace('ns0:max="100"','ns1:max="100"')
+assert invalid != xml and invalid.count('ns1:max="100"')==2
+try:
+ assert_26869_seekbar_bounds(invalid)
+except AssertionError as err:
+ assert 'AAPT2 39897292954 app:max invalid' in str(err)
+else:
+ raise AssertionError('Actions 39897292954 AAPT2 failure escaped regression')
+print('PASS 39897292954 two AndroidX seekbar android:max bounds; actual app:max AAPT2 failure reproduced/rejected')
 assert 'if(cleanupStrength<=0.0001' in chroma and 'float fraction=0.24' in chroma
 assert 'lumaUntouched=true' in read('src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/Iris26869BResidualChroma.java')
 assert 'if(bShadowToe26869>0.0001)' in tone and 'bShadowToe26869' not in (base/'src/main/assets/shaders/motionv2/iris_tone_controls.glsl').read_text()
