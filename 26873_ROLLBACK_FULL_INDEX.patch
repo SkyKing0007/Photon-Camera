@@ -1,0 +1,353 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+index e260e13bb07314fc36bb5adc4e383ec3c5ecf8e6..08eccc3e24caa6e8f55582d22be3e852d7f897af 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+@@ -1,11 +1,6 @@
+ #include "Iris26864FrozenDirectRawrRunner.hpp"
+ #include <cmath>
+-#include <algorithm>
+-#include <chrono>
+-#include <memory>
+-#include <android/log.h>
+ #include <stdexcept>
+-#include <string>
+ #include <utility>
+ namespace iris26864 {
+ void runRealRawrFromFrozenDirectNormals(
+@@ -16,46 +11,10 @@ void runRealRawrFromFrozenDirectNormals(
+        request.localCfa>3u||request.referenceIndex>=request.normals.size()||
+        request.normals.size()<2u||request.normals.size()>64u||!consume)
+         throw std::invalid_argument("26864 B frozen direct NORMAL run invalid");
+-    // IRIS_26873_B_RESIDENT_INPUT_OWNER. One capture scoped owner, not a
+-    // second camera ZSL ring, not a new JNI/GL/Vulkan context.
+-    // RAWR Wronski 2x intentionally remains exactly inherited two-slot.
+-    const bool hdrq=request.algorithm==RealBEngine::HdrPlusFrequency;
+-    const uint64_t rawBytes=uint64_t(request.width)*request.height*2u;
+-    bool residentEligible=hdrq && request.normals.size()<=30u;
+-    if(residentEligible) {
+-        VkPhysicalDeviceMemoryProperties mem{};
+-        vkGetPhysicalDeviceMemoryProperties(request.physical,&mem);
+-        uint64_t largestDeviceHeap=0;
+-        for(uint32_t j=0;j<mem.memoryHeapCount;++j)
+-            if(mem.memoryHeaps[j].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+-                largestDeviceHeap=std::max(largestDeviceHeap,uint64_t(mem.memoryHeaps[j].size));
+-        // Heap size is NOT free bytes. Leave at least 1.5 GiB nominal for
+-        // HDRq ~845MiB, AMaZE, GLES preview and driver allocations, with
+-        // actual vkAllocateMemory failures triggering exact two-slot fallback.
+-        const uint64_t reserve=1536ull*1024ull*1024ull;
+-        const uint64_t want=rawBytes*request.normals.size();
+-        residentEligible=largestDeviceHeap>=reserve &&
+-            want<=largestDeviceHeap-reserve;
+-    }
+-    std::unique_ptr<TwoSlotRaw16Uploader> inputs;
+-    bool resident=false;
+-    if(residentEligible) {
+-        try {
+-            inputs.reset(new TwoSlotRaw16Uploader(request.physical,request.device,
+-                inheritedUploads,request.width,request.height,
+-                uint32_t(request.normals.size())));
+-            resident=true;
+-        } catch(const std::exception& e) {
+-            // No submitted command has occurred yet: fully safe to retry
+-            // with exactly the proven two-slot GPU algorithm and all frames.
+-            __android_log_print(ANDROID_LOG_WARN,"Iris26873",
+-                "B_RESIDENT_ALLOC_FALLBACK normals=%zu why=%s",request.normals.size(),e.what());
+-        }
+-    }
+-    if(!inputs) inputs.reset(new TwoSlotRaw16Uploader(request.physical,request.device,
+-        inheritedUploads,request.width,request.height));
+-    const auto ref=inputs->referenceImage();
+-    const auto companion=inputs->companionImage();
++    TwoSlotRaw16Uploader twoSlots(request.physical,request.device,
++                                   inheritedUploads,request.width,request.height);
++    const auto ref=twoSlots.referenceImage();
++    const auto companion=twoSlots.companionImage();
+     RealRawrRunRequest merge{};
+     merge.physical=request.physical;
+     merge.device=request.device;
+@@ -65,7 +24,6 @@ void runRealRawrFromFrozenDirectNormals(
+     merge.effectiveCfa=request.localCfa;
+     merge.referenceIndex=request.referenceIndex;
+     merge.algorithm=request.algorithm;
+-    merge.inputLayout=resident?FrozenRawInputLayout::CaptureResident:FrozenRawInputLayout::FencedTwoSlot;
+     std::vector<Raw16PlaneBorrow> raw;
+     raw.reserve(request.normals.size());
+     merge.normals.reserve(request.normals.size());
+@@ -76,8 +34,7 @@ void runRealRawrFromFrozenDirectNormals(
+            !std::isfinite(f.exposureProduct)||f.exposureProduct<=0.f||
+            !std::isfinite(f.whiteLevel)||f.whiteLevel<=0.f)
+             throw std::invalid_argument("26864 B frozen normal bytes/lens/exposure invalid");
+-        const auto gpu=resident?inputs->imageAt(uint32_t(i)):
+-            ((i==request.referenceIndex)?ref:companion);
++        const auto gpu=(i==request.referenceIndex)?ref:companion;
+         RealRawrNormal frame{};
+         frame.borrowedRaw.ref.frameId=i+1u;
+         frame.borrowedRaw.ref.timestampNs=f.borrowed.timestamp;
+@@ -95,103 +52,18 @@ void runRealRawrFromFrozenDirectNormals(
+         merge.normals.push_back(frame);
+         raw.push_back(f.borrowed);
+     }
+-    auto now=[] {return std::chrono::steady_clock::now();};
+-    const auto uploadBegin=now();
+-    uint32_t uploadCalls=0;
+-    double uploadMs=0.0;
+-    if(resident) {
+-        try {
+-            // Every frozen direct RAW16 buffer remains borrowed until all
+-            // uploads are individually fence-complete. No post-shutter frame
+-            // collection or Camera2 exposure policy is touched.
+-            for(uint32_t i=0;i<raw.size();++i) {
+-                const auto t=now();
+-                inputs->uploadInto(i,i,raw);
+-                uploadMs+=std::chrono::duration<double,std::milli>(now()-t).count();
+-                ++uploadCalls;
+-            }
+-        } catch(...) {
+-            const VkResult idle=vkQueueWaitIdle(request.inheritedQueue);
+-            if(idle!=VK_SUCCESS) inputs->quarantineUnresolved();
+-            throw; // fence uncertainty: no silent alternate capture
+-        }
+-        merge.prepareNormal=[](std::uint32_t){}; // 4 passes reuse pinned views
+-    } else {
+-        merge.prepareNormal=[&](std::uint32_t index){
+-            const auto t=now();
+-            inputs->upload(index,request.referenceIndex,raw);
+-            uploadMs+=std::chrono::duration<double,std::milli>(now()-t).count();
+-            ++uploadCalls;
+-        };
+-    }
++    merge.prepareNormal=[&](std::uint32_t index){
++        twoSlots.upload(index,request.referenceIndex,raw);
++    };
+     // The pinned coordinator callback runs BEFORE it frees native GPU scratch;
+     // the post-merge packer/AMaZE may ONLY consume its result synchronously.
+-    bool enteredConsumer=false;
+-    bool arenaRetry=false;
+-    auto wrappedConsume=[&](const rawr::raw_gpu_pipeline::BurstRunResult& result,
+-                           const RealRawrRunRequest& frozen){
+-        enteredConsumer=true;
+-        consume(result,frozen);
+-    };
+     try {
+-        try {
+-            runRealPinnedRawrB(merge,wrappedConsume);
+-        } catch(const std::exception& error) {
+-            // A larger resident input set can starve HDRq's ~845MiB scratch
+-            // arena even though the input images themselves allocated. Retry
+-            // ONLY documented allocation failures, before any output consumer
+-            // was entered. The pinned native coordinator has already settled
+-            // its chunk fences, but the shared queue must also prove idle.
+-            const std::string why=error.what();
+-            const bool allocationFailure=
+-                why.find("multiframe arena: allocate")!=std::string::npos||
+-                why.find("multiframe arena: create image")!=std::string::npos||
+-                why.find("multiframe host buffer memory")!=std::string::npos||
+-                why.find("std::bad_alloc")!=std::string::npos;
+-            if(!resident||enteredConsumer||!allocationFailure)
+-                throw;
+-            if(vkQueueWaitIdle(request.inheritedQueue)!=VK_SUCCESS) {
+-                inputs->quarantineUnresolved();
+-                throw; // no device/fence proof: do not free images or retry
+-            }
+-            inputs.reset(); // no unresolved GPU use; free failed resident set
+-            inputs.reset(new TwoSlotRaw16Uploader(request.physical,request.device,
+-                inheritedUploads,request.width,request.height));
+-            resident=false;
+-            arenaRetry=true;
+-            merge.inputLayout=FrozenRawInputLayout::FencedTwoSlot;
+-            const auto safeRef=inputs->referenceImage();
+-            const auto safeCompanion=inputs->companionImage();
+-            for(std::size_t i=0;i<merge.normals.size();++i) {
+-                const auto safe=(i==request.referenceIndex)?safeRef:safeCompanion;
+-                merge.normals[i].borrowedRaw.image=safe.image;
+-                merge.normals[i].borrowedRaw.view=safe.view;
+-                merge.normals[i].borrowedRaw.format=safe.format;
+-            }
+-            uploadCalls=0;
+-            uploadMs=0.0;
+-            merge.prepareNormal=[&](std::uint32_t index){
+-                const auto t=now();
+-                inputs->upload(index,request.referenceIndex,raw);
+-                uploadMs+=std::chrono::duration<double,std::milli>(now()-t).count();
+-                ++uploadCalls;
+-            };
+-            __android_log_print(ANDROID_LOG_WARN,"Iris26873",
+-                "B_RESIDENT_SCRATCH_FALLBACK normals=%zu why=%s",
+-                raw.size(),error.what());
+-            runRealPinnedRawrB(merge,wrappedConsume); // exact math, all frames
+-        }
+-        const double uploadWallMs=std::chrono::duration<double,std::milli>(now()-uploadBegin).count();
+-        __android_log_print(ANDROID_LOG_INFO,"Iris26873",
+-            "B_GPU_INPUT mode=%s normals=%zu uploads=%u expected=%zu upload_ms=%.2f total_span_ms=%.2f retry=%d frame_drop=0",
+-            resident?"resident":"two_slot",raw.size(),uploadCalls,
+-            resident?raw.size():(size_t(1)+4u*(raw.size()-1u)),uploadMs,uploadWallMs,
+-            arenaRetry?1:0);
++        runRealPinnedRawrB(merge,consume);
+     }catch(...){
+         // Every upstream chunk and upload uses a waited fence. Retain GPU
+         // input allocations if the queue entered an unresolved state.
+         const VkResult idle=vkQueueWaitIdle(request.inheritedQueue);
+-        if(idle!=VK_SUCCESS) inputs->quarantineUnresolved();
++        if(idle!=VK_SUCCESS) twoSlots.quarantineUnresolved();
+         throw;
+     }
+ }
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index 0862a09d1d0df5b90d9efc6013d69f61ec8140b0..ff7d2fffbafe80e1867a8916926c197d5026a095 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -15,27 +15,16 @@ void checkFrozen(const RealRawrRunRequest& r) {
+        r.effectiveCfa>=4u||r.normals.size()<2u||r.normals.size()>64u||
+        r.referenceIndex>=r.normals.size())
+         throw std::invalid_argument("26864 missing real B Vulkan/frozen NORMAL provenance");
+-    if(!r.prepareNormal) throw std::invalid_argument("26873 missing real fenced RAW16 source owner");
+-    if(r.inputLayout==FrozenRawInputLayout::CaptureResident &&
+-       r.algorithm!=RealBEngine::HdrPlusFrequency)
+-        throw std::invalid_argument("26873 resident inputs B-HDRq ONLY");
++    if(!r.prepareNormal) throw std::invalid_argument("26864 missing real fenced two-slot RAW16 source owner");
+     const uint64_t physical=r.normals.front().physicalLensIdentity;
+     if(!physical) throw std::invalid_argument("26864 missing physical lens identity");
+     std::unordered_set<uint64_t> timestamps;
+     const auto referenceRaw=r.normals[r.referenceIndex].borrowedRaw;
+     VkImage companion=VK_NULL_HANDLE;
+     VkImageView companionView=VK_NULL_HANDLE;
+-    std::unordered_set<VkImage> residentImages;
+-    std::unordered_set<VkImageView> residentViews;
+     for(std::size_t index=0;index<r.normals.size();++index) {
+         const auto& f=r.normals[index];
+-        if(r.inputLayout==FrozenRawInputLayout::CaptureResident) {
+-            // All per-frame RAW views must be unique, immutable until the
+-            // synchronous downstream consumer returns, and never alias scratch.
+-            if(!residentImages.insert(f.borrowedRaw.image).second||
+-               !residentViews.insert(f.borrowedRaw.view).second)
+-                throw std::invalid_argument("26873 resident RAW images must be distinct per frame");
+-        } else if(index!=r.referenceIndex) {
++        if(index!=r.referenceIndex) {
+             if(!companion) { companion=f.borrowedRaw.image; companionView=f.borrowedRaw.view; }
+             if(f.borrowedRaw.image!=companion||f.borrowedRaw.view!=companionView||
+                f.borrowedRaw.image==referenceRaw.image||
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+index b690100ffe9d970b17bdaf82c65fc0b776ee2daa..6e1432774aab2e0093d860b2aa7dbeaccd9b54e2 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+@@ -13,7 +13,6 @@
+ 
+ namespace iris26864 {
+ enum class RealBEngine { HdrPlusFrequency, WronskiTrue2x };
+-enum class FrozenRawInputLayout { FencedTwoSlot, CaptureResident };
+ struct RealRawrNormal final {
+     rawr::zsl_ring::GpuRawImageView borrowedRaw{};
+     uint64_t timestampNs = 0;
+@@ -32,7 +31,6 @@ struct RealRawrRunRequest final {
+     uint32_t effectiveCfa=0;
+     uint32_t referenceIndex=0;
+     RealBEngine algorithm=RealBEngine::HdrPlusFrequency;
+-    FrozenRawInputLayout inputLayout=FrozenRawInputLayout::FencedTwoSlot;
+     // Native RAW images, acquired through the existing 26863 fenced uploader,
+     // remain owned by the JNI caller through the entire synchronous callback.
+     std::vector<RealRawrNormal> normals;
+diff --git a/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.cpp b/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.cpp
+index 9cf4c5fe77c92f2cf36555790f9e386d80ab4987..097ebd06798b3f779f373968308d40420cc66c61 100644
+--- a/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.cpp
+@@ -20,21 +20,19 @@ void transition(VkCommandBuffer c,VkImage image,VkImageLayout oldLayout,VkImageL
+ }
+ }
+ TwoSlotRaw16Uploader::TwoSlotRaw16Uploader(VkPhysicalDevice p,VkDevice d,
+-    amaze::CommandSubmissionOwner& submit,uint32_t width,uint32_t height,uint32_t slots)
+-  : physical_(p),device_(d),submit_(submit),width_(width),height_(height),slots_(slots) {
++    amaze::CommandSubmissionOwner& submit,uint32_t width,uint32_t height)
++  : physical_(p),device_(d),submit_(submit),width_(width),height_(height) {
+     if(!p||!d||width<32u||height<32u||(width&1u)||(height&1u)||
+-       width>16384u||height>16384u||uint64_t(width)*height*2u>INT32_MAX||
+-       slots<2u||slots>64u)
++       width>16384u||height>16384u||uint64_t(width)*height*2u>INT32_MAX)
+         throw std::invalid_argument("26864 invalid frozen RAW16 two-slot extent");
+     stagingBytes_=uint64_t(width)*height*2u;
+     try {
+-        // IRIS_26873_CAPTURE_SCOPED_RESIDENCY: two slots remain exactly the
+-        // previous fallback; N independent slots are pinned only per capture.
+-        // The arena checks true driver memory requirements for every image.
+-        images_.reset(new VulkanImageArena(p,d,stagingBytes_*slots_+(uint64_t(slots_)<<20u)));
++        // Exactly two device-local R16_UINT images regardless of burst length.
++        // 16 MiB padding headroom is for allocation granularity, not a third image.
++        images_.reset(new VulkanImageArena(p,d,stagingBytes_*2u+(16ull<<20u)));
+         const auto usage=VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+-        for(uint32_t i=0;i<slots_;++i)
+-            images_->allocate(width,height,VK_FORMAT_R16_UINT,usage);
++        images_->allocate(width,height,VK_FORMAT_R16_UINT,usage);
++        images_->allocate(width,height,VK_FORMAT_R16_UINT,usage);
+         VkBufferCreateInfo bi{};bi.sType=VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+         bi.size=stagingBytes_;bi.usage=VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+         bi.sharingMode=VK_SHARING_MODE_EXCLUSIVE;
+@@ -73,19 +71,14 @@ TwoSlotRaw16Uploader::~TwoSlotRaw16Uploader(){
+ }
+ TransientImageView TwoSlotRaw16Uploader::referenceImage()const{return images_->at(0);}
+ TransientImageView TwoSlotRaw16Uploader::companionImage()const{return images_->at(1);}
+-TransientImageView TwoSlotRaw16Uploader::imageAt(uint32_t i)const{return images_->at(i);}
+ void TwoSlotRaw16Uploader::quarantineUnresolved()noexcept{
+     quarantined_=true;
+     (void)images_.release(); // device teardown retains ownership on lost fence
+ }
+ void TwoSlotRaw16Uploader::upload(uint32_t index,uint32_t referenceIndex,
+     const std::vector<Raw16PlaneBorrow>& frames){
+-    uploadInto(index,index==referenceIndex?0u:1u,frames);
+-}
+-void TwoSlotRaw16Uploader::uploadInto(uint32_t index,uint32_t slot,
+-    const std::vector<Raw16PlaneBorrow>& frames){
+-    if(quarantined_||index>=frames.size()||slot>=slots_||
+-       !stagingMapped_)throw std::invalid_argument("26873 invalid/poisoned RAW16 transfer slot");
++    if(quarantined_||index>=frames.size()||referenceIndex>=frames.size()||
++       !stagingMapped_)throw std::invalid_argument("26864 invalid/poisoned two-slot transfer");
+     const auto& frame=frames[index];
+     if(!frame.source||frame.width!=width_||frame.height!=height_||!frame.timestamp||
+        frame.rowStride<width_*2u||(frame.rowStride&1u)||
+@@ -97,7 +90,7 @@ void TwoSlotRaw16Uploader::uploadInto(uint32_t index,uint32_t slot,
+     for(uint32_t row=0;row<height_;++row)
+         std::memcpy(dst+uint64_t(row)*width_*2u,
+                     frame.source+uint64_t(row)*frame.rowStride,width_*2u);
+-    const auto output=imageAt(slot);
++    const auto output=index==referenceIndex?referenceImage():companionImage();
+     try {
+         submit_.execute([&](VkCommandBuffer cmd){
+             images_->recordInitialGeneralTransitions(cmd);
+diff --git a/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp b/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp
+index 24e70af6581b0a0672d91717a1b0de738b4e33f1..3c8f66376fcb44968b00bbffd7552d82e24ae359 100644
+--- a/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864TwoSlotRaw16Uploader.hpp
+@@ -20,14 +20,12 @@ struct Raw16PlaneBorrow final {
+ class TwoSlotRaw16Uploader final {
+ public:
+     TwoSlotRaw16Uploader(VkPhysicalDevice, VkDevice, amaze::CommandSubmissionOwner&,
+-                         uint32_t width, uint32_t height, uint32_t slots=2u);
++                         uint32_t width, uint32_t height);
+     ~TwoSlotRaw16Uploader();
+     TwoSlotRaw16Uploader(const TwoSlotRaw16Uploader&)=delete;
+     TwoSlotRaw16Uploader& operator=(const TwoSlotRaw16Uploader&)=delete;
+     TransientImageView referenceImage() const;
+     TransientImageView companionImage() const;
+-    TransientImageView imageAt(uint32_t index) const;
+-    void uploadInto(uint32_t index, uint32_t slot, const std::vector<Raw16PlaneBorrow>& frames);
+     void upload(uint32_t index, uint32_t referenceIndex,
+                 const std::vector<Raw16PlaneBorrow>& frames);
+     // If a queue/fence failure prevents demonstrating completion, allow the
+@@ -42,7 +40,7 @@ private:
+     VkBuffer staging_=VK_NULL_HANDLE;
+     VkDeviceMemory stagingMemory_=VK_NULL_HANDLE;
+     void* stagingMapped_=nullptr;
+-    uint32_t width_=0,height_=0,slots_=2;
++    uint32_t width_=0,height_=0;
+     uint64_t stagingBytes_=0;
+     bool quarantined_=false;
+ };
+diff --git a/app/version.properties b/app/version.properties
+index 71d332a8c11d704b52e7ae09ed7c63291b099948..3d55fd605d91f6cd6290bcfa7361c64c9db12474 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726873
+-VERSION_BUILD=26873
++VERSION_NAME=0.9726872
++VERSION_BUILD=26872
