@@ -1,0 +1,549 @@
+diff --git a/app/src/main/assets/shaders/motionv2/iris_26869_b_residual_chroma.glsl b/app/src/main/assets/shaders/motionv2/iris_26869_b_residual_chroma.glsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..cbddc72ae978b4e915611bcc84c6d8cba61b8f86
+--- /dev/null
++++ b/app/src/main/assets/shaders/motionv2/iris_26869_b_residual_chroma.glsl
+@@ -0,0 +1,70 @@
++precision highp float;
++precision highp sampler2D;
++uniform sampler2D InputBuffer;
++uniform float cleanupStrength;
++uniform float presentationGain;
++out vec3 Output;
++
++const vec3 YW=vec3(0.22897456,0.69173852,0.07928691);
++float lum(vec3 a){return dot(max(a,vec3(0.0)),YW);}
++vec2 chroma(vec3 a,float y){
++    return vec2(a.r-y,a.b-y)/max(0.045,y);
++}
++vec3 at(ivec2 p,ivec2 wh){
++    return max(texelFetch(InputBuffer,clamp(p,ivec2(0),wh-1),0).rgb,vec3(0.0));
++}
++void main(){
++    ivec2 p=ivec2(gl_FragCoord.xy);
++    ivec2 wh=textureSize(InputBuffer,0);
++    vec3 original=at(p,wh);
++    float y=lum(original);
++    float visibleY=y*max(presentationGain,1.0e-4);
++    if(cleanupStrength<=0.0001||y<0.006){Output=original;return;}
++    vec2 c=chroma(original,y);
++    // Protect coherent weak structure in BOTH luminance and chroma.
++    float structure=0.0;
++    for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) {
++        if(dx==0&&dy==0)continue;
++        vec3 n=at(p+ivec2(dx,dy),wh);
++        float yn=lum(n);
++        vec2 cn=chroma(n,yn);
++        structure=max(structure,abs(y-yn)/max(0.035,y));
++        structure=max(structure,length(c-cn)*0.28);
++    }
++    float protect=1.0-smoothstep(0.055,0.16,structure);
++    // Same-material, bounded chroma-only consensus on separated taps.
++    // 16 outer samples target broad mottling rather than weave-frequency
++    // variations, while rejecting both luminance and chroma boundaries.
++    const ivec2 dirs[8]=ivec2[8](ivec2(1,0),ivec2(-1,0),
++        ivec2(0,1),ivec2(0,-1),ivec2(1,1),ivec2(-1,1),
++        ivec2(1,-1),ivec2(-1,-1));
++    vec2 acc=vec2(0.0);
++    float weight=0.0;
++    for(int ring=0;ring<2;ring++) {
++        int stepSize=ring==0?4:12;
++        for(int j=0;j<8;j++){
++            vec3 n=at(p+dirs[j]*stepSize,wh);
++            float yn=lum(n);
++            vec2 cn=chroma(n,yn);
++            float lightAgreement=1.0-smoothstep(0.02,0.12,
++                abs(y-yn)/max(0.065,y));
++            float hueAgreement=1.0-smoothstep(0.10,0.45,length(c-cn));
++            float w=lightAgreement*hueAgreement;
++            acc+=cn*w;weight+=w;
++        }
++    }
++    // Flatness and cross-material guard; never 'black implies flat'.
++    float support=smoothstep(5.0,10.0,weight);
++    // Estimate eventual shadow visibility using the same final display-gain
++    // authority as MotionV2Render; never infer texturelessness from darkness.
++    float visible=smoothstep(0.004,0.025,visibleY);
++    float fraction=0.24*clamp(cleanupStrength,0.0,1.0)*protect*support*visible;
++    vec2 updated=mix(c,acc/max(weight,1.0e-5),fraction);
++    float rr=y+updated.x*max(0.045,y);
++    float bb=y+updated.y*max(0.045,y);
++    float gg=(y-YW.r*rr-YW.b*bb)/YW.g;
++    vec3 corrected=max(vec3(rr,gg,bb),vec3(0.0));
++    // Preserve luminance despite numerical bounds, avoid white clipping.
++    corrected*=y/max(lum(corrected),1.0e-5);
++    Output=max(corrected,vec3(0.0));
++}
+diff --git a/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl b/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl
+index f5334739afc99db22d7bbffddb64247d097d2f67..4d9cdfe3c1293f2f1e691a45cfd6e8dd3a9c1fd7 100644
+--- a/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl
++++ b/app/src/main/assets/shaders/motionv2/iris_tone_controls.glsl
+@@ -5,6 +5,7 @@ uniform float exposureEv;
+ uniform float shadowsControl;
+ uniform float contrastControl;
+ uniform float brightnessTargetGain;
++uniform float bShadowToe26869;
+ out vec3 Output;
+ 
+ float irisLuma(vec3 c) {
+@@ -54,5 +55,13 @@ void main() {
+     virtualRgb *= exp2(exposureEv);
+     virtualRgb = applyShadows(virtualRgb, shadowsControl);
+     virtualRgb = applyContrast(virtualRgb, contrastControl);
++    // IRIS_26869_B_ONLY_GENTLE_SHADOW_TOE. Local smooth derivative,
++    // luminance-only; zero is byte-equivalent to the prior tone program.
++    if(bShadowToe26869>0.0001){
++        float yy=irisLuma(virtualRgb);
++        float toeMask=1.0-smoothstep(0.02,0.22,yy);
++        float targetY=yy*(1.0-0.20*bShadowToe26869*toeMask);
++        virtualRgb=scaleToLuma(virtualRgb,yy,targetY);
++    }
+     Output = max(virtualRgb/targetGain, vec3(0.0));
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26869Sharpest.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26869Sharpest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b4166f43d9fe7851f042e47d6392c46bde74c7c
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26869Sharpest.kt
+@@ -0,0 +1,89 @@
++package com.hinnka.mycamera.processor
++
++import java.nio.ByteBuffer
++import kotlin.math.abs
++import kotlin.math.max
++import kotlin.math.min
++
++/** IRIS_26869_B_FROZEN_NORMAL_SHARPEST_REFERENCE
++ * An immutable RAW16 green-phase spatial-coherence ranker. Scores only
++ * shutter-frozen NORMAL planes. This is CPU sampling, NOT upstream RAWR's
++ * Vulkan sharpness kernel. No additional frame, RAW rewrite, or exposure
++ * policy changes. All output metadata is selected by index in native HDRq.
++ */
++internal object GlesIris26869Sharpest {
++    private fun value(buf: ByteBuffer, stride: Int, x: Int, y: Int): Int =
++        buf.getShort(y * stride + x * 2).toInt() and 0xffff
++
++    fun select(
++        frozen: GlesIris26864FrozenRawrIngress,
++        cfa: Int,
++        shutterIndex: Int,
++    ): Int {
++        frozen.assertUsable()
++        require(cfa in 0..3 && shutterIndex in frozen.buffers.indices)
++        val w=frozen.width
++        val h=frozen.height
++        if(w<64||h<64) return shutterIndex
++        val scores=DoubleArray(frozen.buffers.size)
++        val samples=IntArray(frozen.buffers.size)
++        val shutterExposure=frozen.exposures[shutterIndex].toDouble()
++        for(i in frozen.buffers.indices) {
++            val e=frozen.exposures[i].toDouble()
++            if(!e.isFinite()||e<=0.0||abs(e/shutterExposure-1.0)>0.20) continue
++            val buf=frozen.buffers[i]
++            val row=frozen.stridesBytes[i]
++            val white=frozen.sensorWhiteByFrame[i].toDouble()
++            var score=0.0
++            var usable=0
++            // Both physical green phases, every twelve sensor pixels.
++            // Same-phase neighbors are displaced TWO physical pixels.
++            for(phase in 0..1) {
++                val yParity=phase
++                val greenX=if(cfa==0||cfa==3) 1-yParity else yParity
++                val black=frozen.blackByFrameByPhase[i*4+yParity*2+greenX].toDouble()
++                val span=white-black
++                if(span<=32.0) continue
++                for(y in (h/12).coerceAtLeast(4) until (h-h/12).coerceAtMost(h-4) step 12) {
++                    val py=(y and -2)+yParity
++                    if(py<2||py>=h-2) continue
++                    for(x in (w/12).coerceAtLeast(4) until (w-w/12).coerceAtMost(w-4) step 12) {
++                        val px=(x and -2)+greenX
++                        if(px<2||px>=w-2) continue
++                        val c=(value(buf,row,px,py)-black)/span
++                        val left=(value(buf,row,px-2,py)-black)/span
++                        val right=(value(buf,row,px+2,py)-black)/span
++                        val up=(value(buf,row,px,py-2)-black)/span
++                        val down=(value(buf,row,px,py+2)-black)/span
++                        // Bright clipping, near-black read noise and defective sites
++                        // are not evidence of actual scene sharpness.
++                        if(min(min(left,right),min(up,down))<0.045 ||
++                           max(max(left,right),max(up,down))>0.94 ||
++                           c<0.045 || c>0.94) continue
++                        val gx=abs(right-left)
++                        val gy=abs(down-up)
++                        val lap=abs(4*c-left-right-up-down)
++                        // Reward coherent edges, not isolated hot-pixel spikes.
++                        val coherence=(gx+gy).coerceIn(0.0,0.5)
++                        if(coherence<0.007) continue
++                        score += min(lap,0.25)*coherence
++                        usable++
++                    }
++                }
++            }
++            // Never nominate a sparse high-contrast light as the base.
++            if(usable>=160) {scores[i]=score/usable;samples[i]=usable}
++        }
++        val baseline=scores[shutterIndex]
++        val best=scores.indices.maxByOrNull { scores[it] } ?: shutterIndex
++        val peak=scores[best]
++        // No structure, marginal improvements, or unreliable scoring ->
++        // preserve the true shutter-time reference and its metadata.
++        if(peak<0.00008 || samples[best]<160) return shutterIndex
++        if(baseline>0.0 && peak<baseline*1.08) return shutterIndex
++        // Favor nearer timestamps for statistically equivalent sharpness.
++        val shutterTime=frozen.timestampsNs[shutterIndex]
++        val near=scores.indices.filter { samples[it]>=160 && scores[it]>=peak*0.98 }
++        return near.minByOrNull { abs(frozen.timestampsNs[it]-shutterTime) } ?: best
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/Iris26869BResidualChroma.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/Iris26869BResidualChroma.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..06b581e19d22d3c3787de04cf578f23087e9cb23
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/Iris26869BResidualChroma.java
+@@ -0,0 +1,37 @@
++package com.particlesdevs.photoncamera.processing.opengl.postpipeline;
++
++import com.particlesdevs.photoncamera.processing.opengl.nodes.Node;
++import com.particlesdevs.photoncamera.processing.render.Parameters;
++import com.particlesdevs.photoncamera.util.Log;
++
++/** IRIS_26869_B_ONLY_TONE_AWARE_CHROMA.
++ * The post-profile, post-display-exposure, pre-render input lets this stage
++ * see actual presentation-domain shadow magnitude. Exactly zero is a literal
++ * bypass to the successful 26868 RAWR output. No temporal noise model is
++ * fabricated or borrowed from A/Camera2; structure gating is conservative.
++ */
++public final class Iris26869BResidualChroma extends Node {
++    private final float strength;
++    public Iris26869BResidualChroma(float strength) {
++        super("", "Iris26869BResidualChroma");
++        if(!Float.isFinite(strength)||strength<=0f||strength>1f)
++            throw new IllegalArgumentException("26869 invalid B-only chroma strength");
++        this.strength=strength;
++    }
++    @Override public void Compile() { }
++    @Override public void Run() {
++        if(!basePipeline.mParameters.motionV2Active ||
++            basePipeline.mParameters.motionV2ReconstructionOwner !=
++                Parameters.MOTION_V2_RECONSTRUCTION_RAWR_AMAZE)
++            throw new IllegalStateException("26869 residual chroma outside native B");
++        glProg.useAssetProgram("motionv2/iris_26869_b_residual_chroma");
++        glProg.setTexture("InputBuffer",previousNode.WorkingTexture);
++        glProg.setVar("cleanupStrength",strength);
++        glProg.setVar("presentationGain",Math.max(0.0001f,basePipeline.mParameters.motionV2DisplayGain)*MotionV2Render.OUTPUT_EXPOSURE_SCALE);
++        WorkingTexture=basePipeline.getMain();
++        glProg.drawBlocks(WorkingTexture);
++        glProg.closed=true;
++        Log.d(Name,"IRIS_26869_B_TONE_CHROMA strength="+strength+
++            " renderer=afterExposure beforeRender lumaUntouched=true");
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java
+index f1220a8eb54e513bc891271485e3ab34cda73856..d717d8b09ba44eb11fe382724377e832d4d12b55 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/IrisMotionToneControls.java
+@@ -13,12 +13,14 @@ public final class IrisMotionToneControls extends Node {
+     private final float exposureEv;
+     private final float shadows;
+     private final float contrast;
++    private final float bShadowToe26869;
+ 
+-    public IrisMotionToneControls(IrisMotionSettings.Snapshot settings) {
++    public IrisMotionToneControls(IrisMotionSettings.Snapshot settings, float bShadowToe26869) {
+         super("", "IrisMotionToneControls");
+         exposureEv = settings.exposureEv;
+         shadows = settings.shadows;
+         contrast = settings.contrast;
++        this.bShadowToe26869 = Math.max(0f,Math.min(1f,bShadowToe26869));
+     }
+ 
+     @Override public void Compile() {}
+@@ -33,6 +35,7 @@ public final class IrisMotionToneControls extends Node {
+         glProg.setVar("exposureEv", exposureEv);
+         glProg.setVar("shadowsControl", shadows);
+         glProg.setVar("contrastControl", contrast);
++        glProg.setVar("bShadowToe26869", bShadowToe26869);
+         glProg.setVar("brightnessTargetGain", basePipeline.mParameters.motionV2DisplayGain);
+         WorkingTexture = basePipeline.getMain();
+         glProg.drawBlocks(WorkingTexture);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index a4489398901558fd68b7f3ff73bc5cd9e1692d6c..c48826c2aa5b17e041ec8bf20d5fc597e3f788b7 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -637,10 +637,20 @@ public class PostPipeline extends GLBasePipeline {
+              */
+             IrisMotionSettings.Snapshot irisMotionSettings = IrisMotionSettings.current();
+             motionV2ToneSettingsSnapshot = irisMotionSettings;
+-            if (irisMotionSettings.hasToneAdjustment()) {
+-                add(new IrisMotionToneControls(irisMotionSettings));
++            final boolean b26869 =
++                    mParameters.motionV2ReconstructionOwner ==
++                        Parameters.MOTION_V2_RECONSTRUCTION_RAWR_AMAZE &&
++                    !mParameters.irisNightActive;
++            final float toe26869 = b26869 ? mParameters.iris26869BShadowToe : 0f;
++            if (irisMotionSettings.hasToneAdjustment() || toe26869 > 0f) {
++                add(new IrisMotionToneControls(irisMotionSettings,toe26869));
+                 add(new StageTelemetry("IRIS_26514_LINEAR_PRESENTATION_CONTROLS"));
+             }
++            if(b26869 && mParameters.iris26869BResidualChromaStrength > 0f) {
++                add(new Iris26869BResidualChroma(
++                    mParameters.iris26869BResidualChromaStrength));
++                add(new StageTelemetry("IRIS_26869_B_RESIDUAL_CHROMA_POST_PRESENTATION"));
++            }
+ 
+             /* IRIS_26560_SABRE_PRIMARY_RECONSTRUCTION_DENOISE
+              * No legacy Photon residual spatial-denoise stage is reintroduced after Sabre.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 1a4123f7b845eac210e0c5e83ccdaeb07b66dd28..74624067f55fb13b3dd3fd25dd1c5807d7222075 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -345,6 +345,18 @@ object PhotonMotionMgc1271Bridge {
+             parameters.motionV2ReconstructionOwner = if (nativeB26868)
+                 Parameters.MOTION_V2_RECONSTRUCTION_RAWR_AMAZE
+             else Parameters.MOTION_V2_RECONSTRUCTION_SABRE
++            /* IRIS_26869_B_PER_LENS_FROZEN_RENDER: read a single physical-ID
++             * snapshot at processing-generation admission, not inside GPU work.
++             * A/NIGHT/exact-A-high-zoom are unchanged. */
++            val bControls26869 = if (nativeB26868) {
++                val physicalId = reference.motionV2PhysicalCameraId
++                if (physicalId.isNullOrBlank()) null else
++                    com.particlesdevs.photoncamera.settings.Iris26869BSettings.read(
++                        PhotonCamera.getApplicationContextStatic(),physicalId)
++            } else null
++            parameters.iris26869BResidualChromaStrength =
++                if (bControls26869?.enable == true) bControls26869.strength else 0f
++            parameters.iris26869BShadowToe = bControls26869?.toe ?: 0f
+             PLog.i(TAG, "IRIS_26868_FROZEN_RECONSTRUCTION_OWNER " +
+                 "method=${if (nativeB26868) "RAWR_AMAZE_NATIVE" else "SABRE"} " +
+                 "localMedianChromaCorrection=$vgnChromaCorrectionStrength localMedianOnly26767=true nightForcedOne=${parameters.irisNightActive} " +
+@@ -733,16 +745,21 @@ object PhotonMotionMgc1271Bridge {
+                             frames, size.x, size.y, parameters.blackLevel.copyOfRange(0, 4),
+                             whiteLevel,
+                         )
+-                        ingress.use { frozen ->
++                        val chosenReference = ingress.use { frozen ->
++                            val chosen = com.hinnka.mycamera.processor.GlesIris26869Sharpest.select(
++                                frozen, cfa, refIndex)
+                             com.hinnka.mycamera.processor.GlesIris26864NativeRawr.run(
+                                 PhotonCamera.getApplicationContextStatic(), frozen,
+                                 wb, lsc, lscWidth, lscHeight, cfa,
+-                                0, 0, size.x, size.y, refIndex,
++                                0, 0, size.x, size.y, chosen,
+                                 true, rgb2x, clip2x, physicalIdentity,
+                             )
++                            chosen
+                         }
++                        PLog.i(TAG, "IRIS_26869_B_SHARPEST_REF native=WRONSKI " +
++                            "shutterIndex=$refIndex selected=$chosenReference normals=${normals.size}")
+                         PLog.i(TAG, "IRIS_26864_REAL_WRONSKI_B_2X_DISPATCH " +
+-                            "selectedReference=$refIndex normals=${normals.size} " +
++                            "selectedReference=$chosenReference normals=${normals.size} " +
+                             "nativeTrue2x=true nativeBurstNoiseMandatory=true " +
+                             "glRgb=$rgb2x originalSensorClip=$clip2x")
+                     }
+@@ -799,15 +816,21 @@ object PhotonMotionMgc1271Bridge {
+                                 rawWidth, rawHeight,
+                             )
+                             try {
+-                                ingress.use { frozen ->
++                                val chosenReference = ingress.use { frozen ->
++                                    val chosen = com.hinnka.mycamera.processor.GlesIris26869Sharpest.select(
++                                        frozen, pattern, nativeReferenceIndex)
+                                     com.hinnka.mycamera.processor.GlesIris26864NativeRawr.run(
+                                         PhotonCamera.getApplicationContextStatic(), frozen,
+                                         gains, lsc, lscWidth, lscHeight,
+                                         pattern, 0, 0, rawWidth, rawHeight,
+-                                        nativeReferenceIndex,
++                                        chosen,
+                                         false, output, clipTexture, physicalIdentity,
+                                     )
++                                    chosen
+                                 }
++                                PLog.i(TAG, "IRIS_26869_B_SHARPEST_REF native=HDRQ " +
++                                    "shutterIndex=$nativeReferenceIndex selected=$chosenReference " +
++                                    "normals=${nativeNormalFrames.size}")
+                                 PLog.i(TAG,"IRIS_26864_REAL_RAWR_HDRQ_B_ACTIVE " +
+                                     "normals=${frames.count { it.role == RawBurstFrameRole.NORMAL }} " +
+                                     "rawBurstNoise=PINNED_RAWR frequencyMerge=TRUE " +
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 5b59826124dffa00d7df6bf9124a8529e1ca4482..e818b54e47efcc075f1cdfdd6bc2989cde918a20 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -114,6 +114,9 @@ public class Parameters {
+     /* 26856: B has its own RAWR CFA reconstruction, never an alias for Sabre. */
+     public static final int MOTION_V2_RECONSTRUCTION_RAWR_AMAZE = 3;
+     public int motionV2ReconstructionOwner = MOTION_V2_RECONSTRUCTION_NONE;
++    /* IRIS_26869_B_TONE_CHROMA_GENERATION_SNAPSHOT. Defaults reproduce 26868. */
++    public float iris26869BResidualChromaStrength = 0.0f;
++    public float iris26869BShadowToe = 0.0f;
+     /* IRIS_26792_FROZEN_VISIBLE_AB_OPTIONS
+      * One processing-generation snapshot feeds both the residual suppressor choice and the paired
+      * SDR-base/gain-map body-contrast owner. */
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26869BSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26869BSettings.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..77f67fe3fd7ebe0ae9245930f512a4b67297b4d6
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26869BSettings.java
+@@ -0,0 +1,48 @@
++package com.particlesdevs.photoncamera.settings;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++
++/** IRIS_26869_B_ONLY_PER_PHYSICAL_LENS_RENDER_CONTROLS.
++ * Completely independent from historical global Chroma, A, NIGHT and routing.
++ * The snapshot is read once for the immutable B processing generation.
++ */
++public final class Iris26869BSettings {
++    private static final String STORE = "iris_26869_b_render_by_physical_lens";
++    public static final String ENABLE = "iris_26869_b_chroma_enable";
++    public static final String STRENGTH = "iris_26869_b_chroma_strength";
++    public static final String TOE = "iris_26869_b_shadow_toe";
++    private Iris26869BSettings() { }
++    public static final class Snapshot {
++        public final boolean enable;
++        public final float strength;
++        public final float toe;
++        public Snapshot(boolean enabled,float s,float t) {
++            enable=enabled;
++            strength=Float.isFinite(s) ? Math.max(0f,Math.min(1f,s)) : 0f;
++            toe=Float.isFinite(t) ? Math.max(0f,Math.min(1f,t)) : 0f;
++        }
++    }
++    private static String id(String physical) {
++        return "lens_"+Iris26856ABSettings.identity(physical,null)+"_";
++    }
++    private static SharedPreferences store(Context context) {
++        return context.getApplicationContext().getSharedPreferences(STORE,Context.MODE_PRIVATE);
++    }
++    public static Snapshot read(Context context,String physical) {
++        SharedPreferences p=store(context);
++        String k=id(physical);
++        return new Snapshot(p.getBoolean(k+ENABLE,true),
++            p.getInt(k+STRENGTH,50)/100f,
++            p.getInt(k+TOE,0)/100f);
++    }
++    public static void updateEnabled(Context context,String physical,boolean value) {
++        store(context).edit().putBoolean(id(physical)+ENABLE,value).apply();
++    }
++    public static void updateStrength(Context context,String physical,int percent) {
++        store(context).edit().putInt(id(physical)+STRENGTH,Math.max(0,Math.min(100,percent))).apply();
++    }
++    public static void updateToe(Context context,String physical,int percent) {
++        store(context).edit().putInt(id(physical)+TOE,Math.max(0,Math.min(100,percent))).apply();
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index 8b6d9c22fa9e7c5b9bbcf2dde83a3cd8939862a6..457a73ed5f07f36ea7d34ffad2ac43f9c2435ef5 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -29,6 +29,9 @@ import androidx.preference.EditTextPreference;
+ import androidx.preference.ListPreference;
+ import androidx.preference.PreferenceCategory;
+ import com.particlesdevs.photoncamera.settings.Iris26856ABSettings;
++import com.particlesdevs.photoncamera.settings.Iris26869BSettings;
++import androidx.preference.SwitchPreferenceCompat;
++import androidx.preference.SeekBarPreference;
+ import androidx.preference.Preference;
+ import androidx.preference.PreferenceFragmentCompat;
+ import androidx.preference.PreferenceGroup;
+@@ -211,6 +214,7 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+             // IRIS_26856_SETTINGS_PERSISTENCE_OWNER: physical camera ID, independent of
+             // the legacy per-lens JSON toggle and keyed by the exact Camera2 ID.
+             setupIris26856Experiments();
++            setupIris26869BControls();
+             setupPhotoPrefixPreference();
+             showHideHdrxSettings();
+             setFramesSummary();
+@@ -248,11 +252,55 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+             mode.setOnPreferenceChangeListener((preference, newValue) -> {
+                 Iris26856ABSettings.Mode next = Iris26856ABSettings.Mode.parse(String.valueOf(newValue));
+                 Iris26856ABSettings.write(mContext, active, next);
++                refreshIris26869BVisibility(next == Iris26856ABSettings.Mode.AMAZE_26855);
+                 return true;
+             });
+             lens.addPreference(mode);
+         }
+ 
++        private void refreshIris26869BVisibility(boolean isB) {
++            Preference on=findPreference(Iris26869BSettings.ENABLE);
++            Preference strength=findPreference(Iris26869BSettings.STRENGTH);
++            Preference toe=findPreference(Iris26869BSettings.TOE);
++            if(on!=null)on.setVisible(isB);
++            if(strength!=null)strength.setVisible(isB);
++            if(toe!=null)toe.setVisible(isB);
++        }
++
++        private void setupIris26869BControls() {
++            if (mContext == null) return;
++            String physical=PreferenceKeys.getCameraID();
++            if (physical==null || physical.trim().isEmpty()) return;
++            SwitchPreferenceCompat enabled=findPreference(Iris26869BSettings.ENABLE);
++            SeekBarPreference strength=findPreference(Iris26869BSettings.STRENGTH);
++            SeekBarPreference toe=findPreference(Iris26869BSettings.TOE);
++            if(enabled==null||strength==null||toe==null) return;
++            Iris26869BSettings.Snapshot snap=Iris26869BSettings.read(mContext,physical);
++            // No global/per-lens PreferenceManager writes; exclusively physical-ID store.
++            enabled.setPersistent(false);
++            strength.setPersistent(false);
++            toe.setPersistent(false);
++            enabled.setChecked(snap.enable);
++            strength.setValue(Math.round(snap.strength*100f));
++            toe.setValue(Math.round(snap.toe*100f));
++            strength.setDependency(Iris26869BSettings.ENABLE);
++            enabled.setOnPreferenceChangeListener((preference, v) -> {
++                Iris26869BSettings.updateEnabled(mContext,physical,(Boolean)v);
++                return true;
++            });
++            strength.setOnPreferenceChangeListener((preference, v) -> {
++                Iris26869BSettings.updateStrength(mContext,physical,(Integer)v);
++                return true;
++            });
++            toe.setOnPreferenceChangeListener((preference, v) -> {
++                Iris26869BSettings.updateToe(mContext,physical,(Integer)v);
++                return true;
++            });
++            refreshIris26869BVisibility(
++                Iris26856ABSettings.read(mContext,physical,physical)==
++                    Iris26856ABSettings.Mode.AMAZE_26855);
++        }
++
+         private void setupPhotoPrefixPreference() {
+             EditTextPreference prefix = findPreference(PreferenceKeys.Key.KEY_PHOTO_PREFIX_NAME.mValue);
+             if (prefix == null) return;
+@@ -401,6 +449,9 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_IMPORT_NOISE_MODEL);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_LUMA_DENOISE);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_CHROMA_DENOISE);
++                    removePreferenceAnywhere(Iris26869BSettings.ENABLE);
++                    removePreferenceAnywhere(Iris26869BSettings.STRENGTH);
++                    removePreferenceAnywhere(Iris26869BSettings.TOE);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_CHROMA_CORRECTION_STRENGTH);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_ADAPTIVE_SNR_CHROMA_DENOISE);
+                     removePreferenceAnywhere(IrisMotionSettings.KEY_RESIDUAL_CHROMA_CUSTOM);
+diff --git a/app/src/main/res/xml/preferences.xml b/app/src/main/res/xml/preferences.xml
+index 07f98f16697caa79ae0e3b1bd272b80f2b2a908b..d505f6bd9ff6dfdfcdaa05f8da47104c3241f3fa 100644
+--- a/app/src/main/res/xml/preferences.xml
++++ b/app/src/main/res/xml/preferences.xml
+@@ -36,6 +36,10 @@
+         <Preference ns0:key="pref_iris_import_noise_model" ns0:layout="@layout/preference_with_margin" ns0:title="@string/iris_import_noise_model" ns0:summary="@string/iris_import_noise_model_summary" ns0:icon="@drawable/ic_save" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_luma_denoise_v2" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_luma_denoise" ns0:summary="@string/iris_luma_denoise_summary" ns0:defaultValue="@string/pref_iris_luma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_grain_black_24dp" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_chroma_denoise" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_chroma_denoise" ns0:summary="@string/iris_chroma_denoise_summary" ns0:defaultValue="@string/pref_iris_chroma_denoise_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_gradient_black_24dp" />
++        <!-- IRIS_26869_B_PER_LENS_CONTROLS immediately after existing Motion Chroma slider. -->
++        <androidx.preference.SwitchPreferenceCompat ns0:key="iris_26869_b_chroma_enable" ns0:title="B residual chroma cleanup" ns0:summary="Structure-protected color cleanup; OFF preserves pure RAWR" ns0:defaultValue="true" ns0:layout="@layout/preference_with_margin" />
++        <androidx.preference.SeekBarPreference ns0:key="iris_26869_b_chroma_strength" ns0:title="B residual chroma strength" ns0:summary="Per-lens cleanup (0 to 100%)" ns0:defaultValue="50" ns1:min="0" ns1:max="100" ns1:seekBarIncrement="5" ns1:showSeekBarValue="true" ns0:layout="@layout/preference_with_margin" />
++        <androidx.preference.SeekBarPreference ns0:key="iris_26869_b_shadow_toe" ns0:title="B gentle shadow toe" ns0:summary="Optional near-black shaping (0 = unchanged)" ns0:defaultValue="0" ns1:min="0" ns1:max="100" ns1:seekBarIncrement="5" ns1:showSeekBarValue="true" ns0:layout="@layout/preference_with_margin" />
+         <!-- IRIS_26844_RETIRED_DIAGNOSTIC_UI: 11 historical A/B controls removed; runtime defaults fixed in IrisMotionSettings. -->
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_saturation" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_saturation" ns0:summary="@string/iris_saturation_summary" ns0:defaultValue="@string/pref_iris_saturation_default" ns1:maxValue="2.0" ns1:minValue="0.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+         <com.particlesdevs.photoncamera.ui.settings.custompreferences.UniversalSeekBarPreference ns0:key="pref_iris_exposure_ev" ns0:layout="@layout/preference_seekbar" ns0:title="@string/iris_exposure" ns0:summary="" ns0:defaultValue="@string/pref_iris_exposure_default" ns1:maxValue="1.0" ns1:minValue="-1.0" ns1:isFloat="true" ns1:stepPerUnit="10" ns0:icon="@drawable/ic_saturation" />
+diff --git a/app/version.properties b/app/version.properties
+index 084a66e58f9b13dcfc30ee8d417fff084314c152..e929a4a6644ba67af2ec602a80473d97b73b3143 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726868
+-VERSION_BUILD=26868
++VERSION_NAME=0.9726869
++VERSION_BUILD=26869
