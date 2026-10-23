@@ -7,3 +7,6 @@ The Actions build script reconstructs the exact successful 26868 compiled candid
 No APK is provided or committed. No backup branch. Real Kotlin/Java/NDK/pinned GLSL/assemble NOT RUN locally; GitHub Actions is build authority.
 Implementation note: frozen NORMAL reference selector uses a bounded sampled CPU CFA-green coherence score, NOT the optional upstream RAWR Vulkan scorer; keeps shutter-time fallback. This is deliberately disclosed and should be evaluated for performance and accuracy after Actions proof.
 All per-lens B-only controls located below existing Chroma slider. Shadow toe default 0.0; residual cleanup defaults enabled with 50% strength and can be OFF to retain pure 26868 RAWR path.
+
+26869 R2 is a verification-only repair following Actions 39894413063. Stage 1 changes guarded script and manifests, not runtime payload; Stage 2 adds a permanent failing-condition preflight; Stage 3 changes trigger content to force a fresh event.
+Never regard static checks as real compiler/assemble proof.

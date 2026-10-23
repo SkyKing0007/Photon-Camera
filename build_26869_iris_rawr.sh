@@ -33,6 +33,30 @@ STATUS
 verify_package(){
  sha256sum -c 26869_HANDOFF_HASHES.sha256 >/dev/null
  bash -n build_26869_iris_rawr.sh
+ # PERMANENT 26869 Actions 39894413063 exact historical nested-validator
+ # destination regression. Catch missing parent before any Actions download.
+ python3 -S - <<'PY_26869_NESTED_PATH'
+from pathlib import Path
+import re,tempfile
+s=Path('build_26869_iris_rawr.sh').read_text()
+body=s.split('verify_successful_mechanics(){',1)[1].split('\nprepare_glslang(){',1)[0]
+assert 'regressions/26868_direct_b_long_retire_ab.py' in body
+assert 'local prior="$WORK/prior_$validator"' in body
+assert 'mkdir -p "$(dirname "$prior")"' in body
+assert 'git show "$RUNTIME_AUTHORITY_COMMIT:$validator" > "$prior"' in body
+assert body.index('mkdir -p "$(dirname "$prior")"') < body.index('git show "$RUNTIME_AUTHORITY_COMMIT:$validator" > "$prior"')
+# Actual previously failing pathname, not merely a generic flat fixture.
+with tempfile.TemporaryDirectory() as d:
+ f=Path(d)/'prior_regressions/26868_direct_b_long_retire_ab.py'
+ assert not f.parent.exists()
+ try: f.write_bytes(b'')
+ except FileNotFoundError: pass
+ else: raise AssertionError('26869 prior_regressions negative fixture did not reproduce')
+ f.parent.mkdir(parents=True)
+ f.write_bytes(b'historical source')
+ assert f.read_bytes()==b'historical source'
+print('PASS 26869 permanent 39894413063 nested historical-validator parent regression')
+PY_26869_NESTED_PATH
  python3 -S -m py_compile verify_26869_candidate.py verify_26869_patches.py verify_26864_rawr_sources.py verify_26864_runtime_glsl.py verify_26864_semantics.py regressions/26864_glsl_reserved_identifiers.py regressions/26864_wronski_publisher.py regressions/26865_b_lsc_owner.py regressions/26866_b_color_only.py regressions/26867_b_highlight_ab_retired.py regressions/26868_direct_b_long_retire_ab.py regressions/26869_b_sharpest_chroma_toe.py verify_26869_runtime_shader.py verify_26868_runtime_shader.py verify_26867_runtime_shader.py
  rm -rf __pycache__ regressions/__pycache__
  ! grep -Eq '^(rename from|rename to|copy from|copy to) ' 26869_FORWARD_FULL_INDEX.patch
@@ -127,8 +151,12 @@ verify_successful_mechanics(){
  git show "$RUNTIME_AUTHORITY_COMMIT:build_26868_iris_rawr.sh" > "$WORK/26868_successful_mechanics.sh"
  [[ "$(git hash-object "$WORK/26868_successful_mechanics.sh")" == "$MECHANICS_GIT_BLOB" ]] || fail 'exact successful 26868 implementation changed'
  for validator in verify_26864_rawr_sources.py verify_26864_runtime_glsl.py verify_26864_semantics.py verify_26868_runtime_shader.py regressions/26868_direct_b_long_retire_ab.py;do
-   git show "$RUNTIME_AUTHORITY_COMMIT:$validator" > "$WORK/prior_$validator"
-   cmp -s "$WORK/prior_$validator" "$ROOT/$validator" || fail "inherited 26868 validator changed: $validator"
+   # PERMANENT 39894413063 regression: inherited validators may contain
+   # nested paths. Materialize each destination parent before shell redirect.
+   local prior="$WORK/prior_$validator"
+   mkdir -p "$(dirname "$prior")"
+   git show "$RUNTIME_AUTHORITY_COMMIT:$validator" > "$prior"
+   cmp -s "$prior" "$ROOT/$validator" || fail "inherited 26868 validator changed: $validator"
  done
  python3 -S - "$WORK/26868_successful_mechanics.sh" "$ROOT/build_26869_iris_rawr.sh" <<'PY_STAGES'
 from pathlib import Path
@@ -292,6 +320,30 @@ clean_extract_replay(){
  rm -rf "$replay" "$exp";mkdir -p "$exp"
  sha256sum -c 26869_HANDOFF_HASHES.sha256 >/dev/null
  bash -n build_26869_iris_rawr.sh
+ # PERMANENT 26869 Actions 39894413063 exact historical nested-validator
+ # destination regression. Catch missing parent before any Actions download.
+ python3 -S - <<'PY_26869_NESTED_PATH'
+from pathlib import Path
+import re,tempfile
+s=Path('build_26869_iris_rawr.sh').read_text()
+body=s.split('verify_successful_mechanics(){',1)[1].split('\nprepare_glslang(){',1)[0]
+assert 'regressions/26868_direct_b_long_retire_ab.py' in body
+assert 'local prior="$WORK/prior_$validator"' in body
+assert 'mkdir -p "$(dirname "$prior")"' in body
+assert 'git show "$RUNTIME_AUTHORITY_COMMIT:$validator" > "$prior"' in body
+assert body.index('mkdir -p "$(dirname "$prior")"') < body.index('git show "$RUNTIME_AUTHORITY_COMMIT:$validator" > "$prior"')
+# Actual previously failing pathname, not merely a generic flat fixture.
+with tempfile.TemporaryDirectory() as d:
+ f=Path(d)/'prior_regressions/26868_direct_b_long_retire_ab.py'
+ assert not f.parent.exists()
+ try: f.write_bytes(b'')
+ except FileNotFoundError: pass
+ else: raise AssertionError('26869 prior_regressions negative fixture did not reproduce')
+ f.parent.mkdir(parents=True)
+ f.write_bytes(b'historical source')
+ assert f.read_bytes()==b'historical source'
+print('PASS 26869 permanent 39894413063 nested historical-validator parent regression')
+PY_26869_NESTED_PATH
  python3 -S -m py_compile verify_26869_candidate.py verify_26869_patches.py verify_26864_rawr_sources.py verify_26864_runtime_glsl.py verify_26864_semantics.py regressions/26864_glsl_reserved_identifiers.py regressions/26864_wronski_publisher.py regressions/26865_b_lsc_owner.py regressions/26866_b_color_only.py regressions/26867_b_highlight_ab_retired.py regressions/26868_direct_b_long_retire_ab.py regressions/26869_b_sharpest_chroma_toe.py verify_26869_runtime_shader.py verify_26868_runtime_shader.py verify_26867_runtime_shader.py
  rm -rf __pycache__ regressions/__pycache__
  python3 -S verify_26869_candidate.py "$BASE" "$replay" --root "$ROOT" --transform
