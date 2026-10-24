@@ -21,6 +21,21 @@ assert 'textures.remove(guideRgb) && textures.remove(guideClip)' not in new_fn
 assert 'textureSpecs.remove(guideRgb)' not in new_fn
 assert 'textureSpecs.remove(guideClip)' not in new_fn
 assert 'releaseTexturesFromExcept(firstTexture,intArrayOf(guideRgb,guideClip))' in new_fn
+# Permanent Actions 40132856346 *real Kotlin compiler* scope regression:
+# The successful 26876 source and first 26877 candidate both used local
+# guideRgb/guideClip declarations inside try; the latter accessed them from
+# finally and the real :app:compileDebugKotlin failed with 2 unresolved refs.
+# Both names MUST be in enclosing function scope before the try, while the
+# texture allocations and ownership actions stay inside its original try.
+header, _, try_body = new_fn.partition('        try {')
+assert '        var guideRgb=0\n' in header and '        var guideClip=0\n' in header, \
+    '40132856346 Kotlin unresolved guideRgb / guideClip outside try'
+assert '            guideRgb=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)' in try_body
+assert '            guideClip=createTexture(width,height,GLES30.GL_R16F,GLES30.GL_NEAREST)' in try_body
+assert '            var guideRgb=createTexture' not in try_body and '            val guideClip=createTexture' not in try_body
+assert header.index('var guideRgb=0') < header.index('var guideClip=0')
+assert try_body.index('guideRgb=createTexture(') < try_body.index('if (completed) {')
+assert try_body.index('guideClip=createTexture(') < try_body.index('if (completed) {')
 assert 'textures.contains(guideRgb) && textures.contains(guideClip)' in new_fn
 outer=new.split('private fun processIris26868DirectB(',1)[1].split('private fun renderIris26868IndependentLongShadowGuide(',1)[0]
 assert outer.index('bridgeRgb = copyPersistentTexture(sensorNeutralB') < outer.index('textures.remove(bridgeRgb) && textures.remove(sensorNeutralB)')

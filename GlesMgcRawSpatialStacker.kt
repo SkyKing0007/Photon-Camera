@@ -17966,6 +17966,8 @@ internal class GlesMgcRawSpatialStacker(
         val firstTexture=textures.size
         var packedOwner: com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier?=null
         var completed=false
+        var guideRgb=0
+        var guideClip=0
         try {
             val nativeRgb=createTexture(outputW,outputH,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
             val nativeClip=createTexture(outputW,outputH,GLES30.GL_R16F,GLES30.GL_NEAREST)
@@ -17978,8 +17980,8 @@ internal class GlesMgcRawSpatialStacker(
                 bNoiseVariance26863=0,bNoiseSupport26863=0,
                 nativeSensorClipFullRes26866=nativeClip,
                 rawrNativeReceipt26864=Iris26864NativeRawrDomainReceipt(true,true,true))
-            var guideRgb=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
-            val guideClip=createTexture(width,height,GLES30.GL_R16F,GLES30.GL_NEAREST)
+            guideRgb=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+            guideClip=createTexture(width,height,GLES30.GL_R16F,GLES30.GL_NEAREST)
             val p=linkProgram(iris26876DerivedGuideShader,"iris_26876_wronski_2x_derived_1x_guide")
             GLES30.glUseProgram(p)
             bindTexture(p,"uTwoXLinear",0,sensorRgb)
