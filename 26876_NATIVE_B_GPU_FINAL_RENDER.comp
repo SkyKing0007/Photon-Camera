@@ -1,0 +1,342 @@
+#version 310 es
+precision highp float;
+precision highp int;
+precision highp usampler2D;
+/* IRIS_26571_TRUE2X_PUBLICATION_COMPUTE */
+layout(local_size_x=16,local_size_y=8,local_size_z=1) in;
+layout(binding=0) uniform highp sampler2D uSource;
+uniform highp sampler2D uLocalToneLogMap;
+layout(rgba8ui,binding=0) writeonly uniform highp uimage2D uOutput;
+layout(std430,binding=1) readonly buffer IrisGammaLut { float gammaLut[]; };
+layout(std430,binding=2) readonly buffer IrisAcr3Curve { float acr3Curve[]; };
+/* IRIS_26876_B_GPU_DCP_WATERMARK_FULL_PROFILE */
+layout(std430,binding=3) readonly buffer Iris26876BFirstDcp { float irisBFirstDcp[]; };
+layout(std430,binding=4) readonly buffer Iris26876BSecondDcp { float irisBSecondDcp[]; };
+uniform ivec3 uBFirstDcpDims;
+uniform ivec3 uBSecondDcpDims;
+uniform int uBWatermarkEnabled;
+uniform sampler2D uBWatermark;
+uniform vec2 uBWatermarkAspect;
+
+uniform ivec2 uSrcOrigin;
+uniform ivec2 uSrcSize;
+uniform ivec2 uTrueSize;
+uniform ivec2 uOutputSize;
+uniform ivec2 uRawSize;
+uniform ivec2 uCropSize;
+uniform int uRotation;
+uniform int uMirror;
+uniform int uBandTop;
+uniform int uBandH;
+uniform int uGenerateGain;
+uniform float uResidualZoom;
+uniform float uDisplayGain;
+uniform float uExposureEv;
+uniform float uShadows;
+uniform float uContrast;
+uniform float uSaturation;
+uniform float uSceneWhite;
+uniform float uBodyToneStrength;
+uniform int uMotionHdrHandoff;
+uniform int uAcr3Enabled;
+uniform int uLocalToneLogEnabled;
+uniform ivec2 uLocalToneLogSize;
+uniform ivec2 uLocalToneLogSourceSize;
+uniform float uGainMax;
+uniform float uGainContentMax;
+uniform vec3 uSensorRow0;
+uniform vec3 uSensorRow1;
+uniform vec3 uSensorRow2;
+uniform vec3 uDisplayRow0;
+uniform vec3 uDisplayRow1;
+uniform vec3 uDisplayRow2;
+
+float irisLuma(vec3 c){return dot(c,vec3(0.22897456,0.69173852,0.07928691));}
+float irisPeak(vec3 c){return max(c.r,max(c.g,c.b));}
+vec3 irisClampNonnegative(vec3 c){return max(c,vec3(0.0));}
+float irisComponentGainLimit(float y,float c){
+    if(c>1.0e-7)return max(1.0,(1.0-y)/c);
+    if(c<(-1.0e-7))return max(1.0,(0.0-y)/c);
+    return 4.0;
+}
+/* IRIS_26638_USER_SATURATION_ONLY_TRUE2X_GPU */
+float iris26638ChromaGainLimit(float y,float c){
+    if(c>1.0e-8)return max(1.0,(1.0-y)/c);
+    if(c<(-1.0e-8))return max(1.0,y/(-c));
+    return 1.0e6;
+}
+vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
+    rgb=clamp(rgb,vec3(0.0),vec3(1.0));float sat=clamp(userSaturation,0.0,2.0);if(abs(sat-1.0)<=1.0e-7)return rgb;
+    float y=clamp(irisLuma(rgb),0.0,1.0);vec3 c=rgb-vec3(y);float black=smoothstep(0.018,0.050,y),highlight=1.0-smoothstep(0.78,0.95,y);
+    float requested=max(1.0+black*highlight*(sat-1.0),0.0);float limit=1.0e6;
+    limit=min(limit,iris26638ChromaGainLimit(y,c.r));limit=min(limit,iris26638ChromaGainLimit(y,c.g));limit=min(limit,iris26638ChromaGainLimit(y,c.b));
+    return clamp(vec3(y)+c*min(requested,limit),vec3(0.0),vec3(1.0));
+}
+vec3 irisMatRows(vec3 r0,vec3 r1,vec3 r2,vec3 v){return vec3(dot(r0,v),dot(r1,v),dot(r2,v));}
+vec3 irisCameraAt(ivec2 fullP){
+    fullP=clamp(fullP,ivec2(0),uTrueSize-ivec2(1));
+    ivec2 local=fullP-uSrcOrigin;
+    local=clamp(local,ivec2(0),uSrcSize-ivec2(1));
+    return max(texelFetch(uSource,local,0).rgb,vec3(0.0));
+}
+float iris26638SampleAcr3(float value){
+    const int n=1025;if(value>1.0){const float dx=0.001;float y1=acr3Curve[n-1];float pos=(1.0-dx)*float(n-1);int i0=int(floor(pos)),i1=min(i0+1,n-1);float y0=mix(acr3Curve[i0],acr3Curve[i1],pos-float(i0));return y1+((y1-y0)/dx)*(value-1.0);}
+    float pos=clamp(value,0.0,1.0)*float(n-1);int i0=int(floor(pos)),i1=min(i0+1,n-1);return mix(acr3Curve[i0],acr3Curve[i1],pos-float(i0));
+}
+void iris26638AdobeRgbTone(inout float mx,inout float md,inout float mn){float oldMx=mx,oldMd=md,oldMn=mn;mx=iris26638SampleAcr3(oldMx);mn=iris26638SampleAcr3(oldMn);md=abs(oldMx-oldMn)<1.0e-6?mn:mn+(mx-mn)*(oldMd-oldMn)/(oldMx-oldMn);}
+vec3 iris26638ApplyAcr3(vec3 color){
+    float r=color.r,g=color.g,b=color.b;if(r>=g){if(g>b)iris26638AdobeRgbTone(r,g,b);else if(b>r)iris26638AdobeRgbTone(b,r,g);else if(b>g)iris26638AdobeRgbTone(r,b,g);else{r=iris26638SampleAcr3(r);g=iris26638SampleAcr3(g);b=g;}}
+    else{if(r>=b)iris26638AdobeRgbTone(g,r,b);else if(b>g)iris26638AdobeRgbTone(b,g,r);else iris26638AdobeRgbTone(g,b,r);}return vec3(r,g,b);
+}
+
+/* Mathematically matched to 26875 CPU iris26628* DCP ownership. All tables
+ * remain in original index layout: (v*hDiv*sDiv+h*sDiv+s)*3, never a 3D
+ * texture with shifted axes or arbitrary color-channel reinterpretation. */
+vec3 iris26876RgbToHsv(vec3 rgb){
+    float mx=max(rgb.r,max(rgb.g,rgb.b)),mn=min(rgb.r,min(rgb.g,rgb.b));
+    float d=mx-mn,h=0.0;
+    if(d>1.0e-6){
+        if(mx==rgb.r)h=mod((rgb.g-rgb.b)/d,6.0);
+        else if(mx==rgb.g)h=(rgb.b-rgb.r)/d+2.0;
+        else h=(rgb.r-rgb.g)/d+4.0;
+    }
+    if(h<0.0)h+=6.0;
+    return vec3(h,mx>1.0e-6?d/mx:0.0,mx);
+}
+vec3 iris26876HsvToRgb(vec3 hsv){
+    float h=mod(hsv.r,6.0);if(h<0.0)h+=6.0;
+    float sat=max(hsv.g,0.0),v=max(hsv.b,0.0);
+    float c=v*sat,x=c*(1.0-abs(mod(h,2.0)-1.0));vec3 rgb;
+    if(h<1.0)rgb=vec3(c,x,0.0);
+    else if(h<2.0)rgb=vec3(x,c,0.0);
+    else if(h<3.0)rgb=vec3(0.0,c,x);
+    else if(h<4.0)rgb=vec3(0.0,x,c);
+    else if(h<5.0)rgb=vec3(x,0.0,c);
+    else rgb=vec3(c,0.0,x);
+    return rgb+vec3(v-c);
+}
+vec3 iris26876DcpAt(int which,ivec3 dims,int s,int h,int v){
+    int si=clamp(s,0,dims.y-1),hi=clamp(h,0,dims.x-1),vi=clamp(v,0,dims.z-1);
+    int q=(vi*dims.x*dims.y+hi*dims.y+si)*3;
+    if(which==0)return vec3(irisBFirstDcp[q],irisBFirstDcp[q+1],irisBFirstDcp[q+2]);
+    return vec3(irisBSecondDcp[q],irisBSecondDcp[q+1],irisBSecondDcp[q+2]);
+}
+vec3 iris26876SampleDcp(int which,ivec3 dims,vec3 hsv){
+    float hs=hsv.r*float(dims.x)/6.0;
+    float ss=clamp(hsv.g,0.0,1.0)*float(max(dims.y-1,0));
+    float vs=clamp(hsv.b,0.0,1.0)*float(max(dims.z-1,0));
+    int h0=int(floor(hs)),h1=h0+1;
+    if(h0>=dims.x-1){h0=dims.x-1;h1=0;}
+    int s0=min(int(floor(ss)),max(dims.y-2,0)),s1=min(s0+1,dims.y-1);
+    int v0=min(int(floor(vs)),max(dims.z-2,0)),v1=min(v0+1,dims.z-1);
+    float hf=hs-float(h0),sf=ss-float(s0),vf=vs-float(v0);
+    vec3 a=iris26876DcpAt(which,dims,s0,h0,v0),b=iris26876DcpAt(which,dims,s0,h1,v0);
+    vec3 c=iris26876DcpAt(which,dims,s1,h0,v0),d=iris26876DcpAt(which,dims,s1,h1,v0);
+    if(dims.z>1){
+        a=mix(a,iris26876DcpAt(which,dims,s0,h0,v1),vf);
+        b=mix(b,iris26876DcpAt(which,dims,s0,h1,v1),vf);
+        c=mix(c,iris26876DcpAt(which,dims,s1,h0,v1),vf);
+        d=mix(d,iris26876DcpAt(which,dims,s1,h1,v1),vf);
+    }
+    return mix(mix(a,b,hf),mix(c,d,hf),sf);
+}
+vec3 iris26876ApplyDcp(vec3 rgb,int which,ivec3 dims){
+    if(any(lessThanEqual(dims,ivec3(0)))||min(rgb.r,min(rgb.g,rgb.b))<0.0)return rgb;
+    vec3 hsv=iris26876RgbToHsv(rgb),m=iris26876SampleDcp(which,dims,hsv);
+    hsv.r=mod(hsv.r+m.r/60.0,6.0);if(hsv.r<0.0)hsv.r+=6.0;
+    hsv.g=clamp(hsv.g*m.g,0.0,1.0);hsv.b=max(hsv.b*m.b,0.0);
+    return iris26876HsvToRgb(hsv);
+}
+vec3 irisProfileColor(ivec2 p){
+    vec3 camera=irisCameraAt(p),profile=irisMatRows(uSensorRow0,uSensorRow1,uSensorRow2,camera);
+    profile=iris26876ApplyDcp(profile,0,uBFirstDcpDims);
+    profile=iris26876ApplyDcp(profile,1,uBSecondDcpDims);
+    vec3 original=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,profile),linear=original;
+    if(uAcr3Enabled!=0&&min(profile.r,min(profile.g,profile.b))>=0.0&&min(original.r,min(original.g,original.b))>=0.0){vec3 rendered=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,iris26638ApplyAcr3(profile));float targetY=irisLuma(original),renderedY=irisLuma(rendered);if(targetY>=0.0&&renderedY>1.0e-8){linear=rendered*(targetY/renderedY);float baselineSpan=irisPeak(original)-min(original.r,min(original.g,original.b));float renderedSpan=irisPeak(linear)-min(linear.r,min(linear.g,linear.b));if(renderedSpan+1.0e-8<baselineSpan){if(renderedSpan>1.0e-8){vec3 c=linear-vec3(targetY);linear=vec3(targetY)+c*(baselineSpan/renderedSpan);}else linear=original;}}}
+    float floorV=min(linear.r,min(linear.g,linear.b));if(floorV<0.0)linear-=vec3(floorV);return irisClampNonnegative(linear);
+}
+vec3 irisTone(vec3 rgb){
+    bool manualActive=abs(uExposureEv)>=0.0001||abs(uShadows)>=0.0001||abs(uContrast)>=0.0001;
+    float virtualGain=uMotionHdrHandoff!=0&&manualActive?max(uDisplayGain,1.0e-6):1.0;
+    rgb=irisClampNonnegative(rgb)*virtualGain*exp2(uExposureEv);
+    if(abs(uShadows)>=0.0001){
+        float y=irisLuma(rgb),mask=1.0-smoothstep(0.08,0.55,y),target=y;
+        if(uShadows<0.0)target=y+(-uShadows)*0.08*mask*(1.0-clamp(y,0.0,1.0));
+        else target=y*(1.0-0.75*uShadows*mask);
+        rgb=y<=1.0e-7?vec3(max(target,0.0)):irisClampNonnegative(rgb)*(max(target,0.0)/y);
+    }
+    if(abs(uContrast)>=0.0001){
+        float y=irisLuma(rgb);
+        if(y>1.0e-7){
+            const float pivot=0.18;
+            float slope=1.0+0.25*uContrast;
+            float target=pivot*exp2(log2(max(y/pivot,1.0e-6))*slope);
+            rgb=irisClampNonnegative(rgb)*(max(target,0.0)/y);
+        }
+    }
+    if(virtualGain!=1.0)rgb/=virtualGain;
+    return irisClampNonnegative(rgb);
+}
+vec3 irisPreRenderAt(ivec2 p){vec3 c=irisProfileColor(p);if(uMotionHdrHandoff==0)c*=max(uDisplayGain,1.0e-6);return irisTone(c);}
+vec3 irisSamplePreRender(vec2 p){
+    p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
+    if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
+    ivec2 p0=ivec2(floor(p)),p1=min(p0+ivec2(1),uTrueSize-ivec2(1));
+    vec2 f=p-vec2(p0);
+    vec3 a=irisPreRenderAt(p0),b=irisPreRenderAt(ivec2(p1.x,p0.y));
+    vec3 c=irisPreRenderAt(ivec2(p0.x,p1.y)),d=irisPreRenderAt(p1);
+    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
+}
+vec2 irisOutputToSource(ivec2 op){
+    float bx=(float(op.x)+0.5)*0.5-0.5,by=(float(op.y)+0.5)*0.5-0.5;
+    float ux=0.0,uy=0.0;
+    if(uRotation==90){
+        float xx=bx;if(uMirror!=0)xx=float(uCropSize.y)-xx;ux=by;uy=float(uRawSize.y)-xx;
+    }else if(uRotation==180){
+        float yy=by;if(uMirror!=0)yy=float(uRawSize.y)-yy;ux=float(uRawSize.x)-bx;uy=float(uRawSize.y)-yy;
+    }else if(uRotation==270){
+        float xx=bx+float(uRawSize.y-uCropSize.y);if(uMirror!=0)xx=float(uCropSize.y)-xx;ux=float(uRawSize.x)-by;uy=xx;
+    }else{
+        float yy=by+float(uRawSize.y-uCropSize.y);if(uMirror!=0)yy=float(uRawSize.y)-yy;ux=bx;uy=yy;
+    }
+    float cx=(float(uRawSize.x)-1.0)*0.5,cy=(float(uRawSize.y)-1.0)*0.5;
+    float sx=cx+(ux-cx)/uResidualZoom,sy=cy+(uy-cy)/uResidualZoom;
+    return clamp(2.0*(vec2(sx,sy)+vec2(0.5))-vec2(0.5),vec2(0.0),vec2(uTrueSize-ivec2(1)));
+}
+/* IRIS_26621_TRUE2X_LOCAL_LAPLACIAN_GPU_SHARED_FIELD */
+float irisLocalToneMappedGuide(vec2 trueSource){
+    if(uLocalToneLogEnabled==0)return -1.0;
+    vec2 oneSource=(trueSource+vec2(0.5))*vec2(uLocalToneLogSourceSize)/max(vec2(uTrueSize),vec2(1.0))-vec2(0.5);
+    vec2 mapCoord=(oneSource+vec2(0.5))*vec2(uLocalToneLogSize)/max(vec2(uLocalToneLogSourceSize),vec2(1.0))-vec2(0.5);
+    vec2 uv=(mapCoord+vec2(0.5))/max(vec2(uLocalToneLogSize),vec2(1.0));
+    vec2 texel=vec2(0.5)/max(vec2(uLocalToneLogSize),vec2(1.0));
+    uv=clamp(uv,texel,vec2(1.0)-texel);
+    return exp2(clamp(texture(uLocalToneLogMap,uv).r,-12.0,0.0));
+}
+float iris26621MapMotionSdrFinalGuide(float sourceGuide){
+    const float scale=0.80;
+    float x=max(sourceGuide,0.0);
+    float requested=max(uDisplayGain,1.0e-6)*scale;
+    float whiteAnchor=min(0.95,requested);
+    float bodyGain=requested;
+    if(requested>whiteAnchor)bodyGain=min(requested,4.0*whiteAnchor-1.0e-4);
+    float safeWhite=max(whiteAnchor,1.0e-6);
+    float ratio=max(bodyGain/safeWhite-1.0,0.0);
+    if(x<=1.0){
+        float oneMinus=1.0-x;
+        float cubic=whiteAnchor*x+(bodyGain-whiteAnchor)*x*oneMinus*oneMinus;
+        float rational=bodyGain*x/(1.0+ratio*x);
+        return 0.5*(cubic+rational);
+    }
+    float rationalSlopeAtWhite=bodyGain/((1.0+ratio)*(1.0+ratio));
+    float bodySlopeAtWhite=0.5*(whiteAnchor+rationalSlopeAtWhite);
+    float reserve=max(1.0-whiteAnchor,0.0);
+    if(reserve<=1.0e-6)return whiteAnchor;
+    float tailScale=reserve/max(bodySlopeAtWhite,1.0e-6);
+    float excess=x-1.0;
+    return whiteAnchor+reserve*excess/(excess+tailScale);
+}
+/* IRIS_26704_RANGE_SEPARATED_BODY_TONE_TRUE2X_GPU
+ * IRIS_26824_ADAPTIVE_BODY_S_CURVE_TRUE2X_GPU */
+float iris26704BodyToneGuide(float mappedGuide){
+    float y=max(mappedGuide,0.0);
+    float contrast=clamp(-uBodyToneStrength,0.0,1.0);
+    if(contrast>1.0e-7&&y>0.0){
+        float low=smoothstep(0.055,0.180,y),high=1.0-smoothstep(0.500,0.760,y);
+        float blend=0.24*contrast*clamp(low*high,0.0,1.0);
+        return mix(y,y*y,blend);
+    }
+    float strength=clamp(uBodyToneStrength,0.0,1.0);const float anchorGuide=0.35;
+    if(strength<=1.0e-7||y<=0.0||y>=anchorGuide)return y;
+    float gamma=1.0-0.28*strength;
+    float toe=anchorGuide*pow(clamp(y/anchorGuide,0.0,1.0),gamma);
+    float blackGate=smoothstep(0.004,0.018,y);
+    return mix(y,toe,blackGate);
+}
+float iris26638ShadowFloorGuide(float guide){
+    const float floorEnd=0.050,deepScale=0.72;float x=max(guide,0.0);if(x>=floorEnd)return x;float t=clamp(x/floorEnd,0.0,1.0),smoothFactor=t*t*(3.0-2.0*t);return x*mix(deepScale,1.0,smoothFactor);
+}
+vec3 iris26638ApplyShadowFloorGuard(vec3 rgb){
+    if(uMotionHdrHandoff==0)return rgb;rgb=irisClampNonnegative(rgb);float guide=max(irisLuma(rgb),irisPeak(rgb));if(guide<=1.0e-7)return rgb;return rgb*(iris26638ShadowFloorGuide(guide)/guide);
+}
+vec3 irisHeadroom(vec3 rgb,float localMappedGuide){
+    rgb=irisClampNonnegative(rgb);
+    float y=max(irisLuma(rgb),0.0),pk=irisPeak(rgb),guide=max(y,pk);
+    /* IRIS_26621_SINGLE_TONE_OWNER_TRUE2X_GPU */
+    if(uMotionHdrHandoff!=0){
+        float globalMapped=iris26621MapMotionSdrFinalGuide(guide);
+        if(uBodyToneStrength>1.0e-7)globalMapped=iris26704BodyToneGuide(globalMapped);
+        float mappedFinal=globalMapped;
+        if(localMappedGuide>=0.0){
+            float localStrength=smoothstep(0.030,0.100,globalMapped);
+            mappedFinal=mix(globalMapped,clamp(localMappedGuide,0.0,1.0),localStrength);
+        }
+        if(uBodyToneStrength<(-1.0e-7))mappedFinal=iris26704BodyToneGuide(mappedFinal);
+        if(guide>1.0e-7)rgb*=mappedFinal/guide;
+    }else{
+        float start=0.50;
+        if(guide>1.0e-7&&guide>start){float white=max(uSceneWhite,start+0.05);float u=max((guide-start)/max(white-start,1.0e-6),0.0);float x=clamp(u,0.0,1.0);float shaped=log(1.0+6.0*x)/log(7.0);float mapped=start+(1.25-start)*shaped;rgb*=mapped/guide;}
+        rgb*=0.80;
+    }
+    rgb=iris26638ApplyShadowFloorGuard(rgb);
+    float pk2=irisPeak(rgb);if(pk2>1.0)rgb*=1.0/max(pk2,1.0e-6);
+    return iris26638UserSaturation(irisClampNonnegative(rgb),uSaturation);
+}
+float irisGamma(float x){
+    x=clamp(x,0.0,1.0);float q=x*16384.0;int a=int(q),b=min(a+1,16384);
+    return mix(gammaLut[a],gammaLut[b],q-float(a));
+}
+vec3 iris26876WatermarkP3(vec3 encoded){
+    vec3 l=vec3(encoded.r<=0.04045?encoded.r/12.92:pow((encoded.r+0.055)/1.055,2.4),
+                encoded.g<=0.04045?encoded.g/12.92:pow((encoded.g+0.055)/1.055,2.4),
+                encoded.b<=0.04045?encoded.b/12.92:pow((encoded.b+0.055)/1.055,2.4));
+    return vec3(irisGamma(0.8224619687*l.r+0.1775380313*l.g),
+                irisGamma(0.0331941989*l.r+0.9668058011*l.g),
+                irisGamma(0.0170826307*l.r+0.0723974407*l.g+0.9105199286*l.b));
+}
+uint irisByte(float x){return uint(clamp(floor(clamp(x,0.0,1.0)*255.0+0.5),0.0,255.0));}
+void main(){
+    ivec2 local=ivec2(gl_GlobalInvocationID.xy);
+    if(local.x>=uOutputSize.x||local.y>=uBandH)return;
+    ivec2 op=ivec2(local.x,uBandTop+local.y);
+    vec2 trueSource=irisOutputToSource(op);
+    vec3 hdr=irisSamplePreRender(trueSource);
+    float localMapped=irisLocalToneMappedGuide(trueSource);
+    vec3 sdr=irisHeadroom(hdr,localMapped);
+    uint gainCode=0u;
+    if(uGenerateGain!=0){
+        const float off=0.015625;float safeMax=max(uGainMax,1.001);
+        float contentMax=clamp(uGainContentMax,1.0,safeMax);
+        float ratio;
+        if(uMotionHdrHandoff!=0){
+            /* IRIS_26639_SELECTIVE_RECOVERABLE_HEADROOM_TRUE2X_GPU */
+            const float hdrEntry=0.65,hdrFullEntry=0.85;
+            vec3 hp=irisClampNonnegative(hdr);float sourceY=max(irisLuma(hp),0.0);float sourceGuide=max(sourceY,irisPeak(hp));
+            float eligibility=smoothstep(hdrEntry,hdrFullEntry,sourceGuide);
+            if(sourceGuide<=hdrEntry||eligibility<=1.0e-7){ratio=1.0;}
+            else{float globalSdr=max(iris26621MapMotionSdrFinalGuide(sourceGuide),0.0);float requested=max(uDisplayGain,1.0e-6)*0.80;float recoverable=max(globalSdr,sourceY*requested);float desired=clamp((recoverable+off)/(globalSdr+off),1.0,contentMax);float sdrY=max(irisLuma(irisClampNonnegative(sdr)),0.0);float pixelCeiling=clamp((recoverable+off)/(sdrY+off),1.0,contentMax);float eligible=min(desired,pixelCeiling);ratio=clamp(exp2(log2(max(eligible,1.0))*eligibility),1.0,contentMax);}
+        }else{
+            float hdrY=max(irisLuma(irisClampNonnegative(hdr)),0.0);
+            float sdrY=max(irisLuma(irisClampNonnegative(sdr)),0.0);
+            ratio=clamp((hdrY+off)/(sdrY+off),1.0,contentMax);
+        }
+        float code=clamp(log2(ratio)/max(log2(safeMax),1.0e-6),0.0,1.0);
+        gainCode=irisByte(code);
+    }
+    vec3 encoded=vec3(irisGamma(sdr.r),irisGamma(sdr.g),irisGamma(sdr.b));
+    if(uBWatermarkEnabled!=0){
+        float wmW=float(uOutputSize.x)*0.115;
+        float wmH=wmW*uBWatermarkAspect.y/uBWatermarkAspect.x;
+        float margin=max(2.0,float(min(uOutputSize.x,uOutputSize.y))*0.025);
+        vec2 leftTop=vec2(float(uOutputSize.x)-margin-wmW,float(uOutputSize.y)-margin-wmH);
+        vec2 xy=vec2(op);
+        if(xy.x>=leftTop.x&&xy.x<=leftTop.x+wmW&&
+           xy.y>=leftTop.y&&xy.y<=leftTop.y+wmH){
+            vec2 uv=(xy-leftTop)/vec2(wmW,wmH);
+            vec4 wm=texture(uBWatermark,uv);
+            if(wm.a>0.0)encoded=mix(encoded,iris26876WatermarkP3(wm.rgb),wm.a);
+        }
+    }
+    uvec4 outv=uvec4(irisByte(encoded.r),irisByte(encoded.g),irisByte(encoded.b),gainCode);
+    imageStore(uOutput,local,outv);
+}
