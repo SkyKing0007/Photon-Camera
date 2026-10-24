@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """26876 exact 26875 successful compiled-candidate source authority; strict all-file proof."""
-import hashlib,re,sys
+import hashlib,re,sys,shutil,argparse
 from pathlib import Path
 P=Path(__file__).resolve().parent
-base=Path(sys.argv[1]);cand=Path(sys.argv[2])
+p=argparse.ArgumentParser()
+p.add_argument('base',type=Path);p.add_argument('candidate',type=Path)
+p.add_argument('--root',type=Path,default=Path(__file__).resolve().parent)
+p.add_argument('--transform',action='store_true')
+a=p.parse_args()
+base=a.base.resolve();cand=a.candidate.resolve();source=a.root.resolve()
 def sha(path):return hashlib.sha256(path.read_bytes()).hexdigest()
 def entries(path):return {f:sha for sha,f in (line.split('  ',1) for line in (P/path).read_text().splitlines())}
 prior=entries('26876_BASE_26875_FULL_APP.sha256')
@@ -14,6 +19,28 @@ assert len(prior)==1997 and len(expected)==2001 and len(protect)==1985
 assert len(allow)==16 and allow==sorted(set(allow))
 assert set(protect)=={k for k in prior.keys()&expected.keys() if prior[k]==expected[k]}
 assert set(allow)=={k for k in prior.keys()|expected.keys() if prior.get(k)!=expected.get(k)}
+# IRIS_26876_REGRESSION_ACTIONS_40115605739: inherited guard invokes
+# --transform; source verification alone must never silently skip reconstruction.
+assert base!=cand and not base.is_relative_to(cand) and not cand.is_relative_to(base)
+assert (base/'app').is_dir(), '26875 authority source app missing'
+baseuniverse={'app/'+f.relative_to(base/'app').as_posix() for f in (base/'app').rglob('*') if f.is_file() and f.relative_to(base/'app').parts[0] not in ('build','.cxx') and '.git' not in f.parts}
+assert baseuniverse==set(prior),'prior successful artifact universe mismatch before candidate writes'
+for name,digest in prior.items():assert sha(base/name)==digest,('prior authority sha',name)
+old=entries('26876_PRIOR_CHANGED_SHA256.txt')
+new=entries('26876_NEW_CHANGED_SHA256.txt')
+assert set(old)==set(allow)&set(prior) and set(new)==set(allow) and all(prior[x]==old[x] for x in old) and all(expected[x]==new[x] for x in new)
+if a.transform:
+ assert (source/'26876_CHANGED_ALLOWLIST.txt').is_file(),'missing intended handoff source domain'
+ assert (source/'26876_CHANGED_ALLOWLIST.txt').read_text().splitlines()==allow,'handoff source allowlist drift'
+ for name in allow:
+  incoming=source/'handoff_payload_26876'/name
+  assert incoming.is_file() and sha(incoming)==new[name],('payload integrity',name)
+ if cand.exists():shutil.rmtree(cand)
+ shutil.copytree(base,cand)
+ for name in allow:
+  incoming=source/'handoff_payload_26876'/name
+  dst=cand/name;dst.parent.mkdir(parents=True,exist_ok=True)
+  shutil.copyfile(incoming,dst)
 for root,man in ((base,prior),(cand,expected)):
  universe={'app/'+f.relative_to(root/'app').as_posix() for f in (root/'app').rglob('*') if f.is_file() and f.relative_to(root/'app').parts[0] not in ('build','.cxx') and '.git' not in f.parts}
  assert universe==set(man),f'full source file-universe discrepancy missing={set(man)-universe} extra={universe-set(man)}'
