@@ -58,6 +58,24 @@ def authority(s):
              'build_26875_iris_rawr_outputs/26875_candidate_app_source.tar.gz')
  s=s.replace('photon-26874-b-native-jpeg','photon-26875-b-device-correction')
  s=s.replace('26874','26875')  # this stage is solely the preceding runtime artifact
+ # IRIS_26876_REGRESSION_ACTIONS_40114425831: the inherited 26874
+ # inline artifact assertion must be advanced to the REAL successful 26875
+ # artifact (ID AND digest), not just the shell's RUNTIME_ARTIFACT_ID.
+ old_assert=("x=json.load(open(sys.argv[1]));assert x['id']==12543720749 and "
+             "x['name']=='photon-26875-b-device-correction' and not x['expired'] and "
+             "x['digest']=='sha256:d95e693fe840c956cc03df456d6dc3417ba82740ca0eff6ef9a5a12c353f5b5b'")
+ assert s.count(old_assert)==1, 'exact old failing 26876 metadata guard not found'
+ new_assert=("x=json.load(open(sys.argv[1]))\n"
+             "want={'id':12544774681,'name':'photon-26875-b-device-correction',\n"
+             "      'digest':'sha256:afd2efb8b8512bdff721809d9a15898821c1cdd2f37c9542a8101afe528997f7','expired':False}\n"
+             "got={k:x.get(k) for k in want}\n"
+             "if got != want:\n"
+             " print(f'ERROR 26875 successful artifact metadata mismatch: expected={want} actual={got}',file=sys.stderr)\n"
+             " raise SystemExit(1)")
+ s=s.replace(old_assert,new_assert)
+ assert "'id':12544774681" in s and '12543720749' not in s
+ assert 'sha256:afd2efb8b8512bdff721809d9a15898821c1cdd2f37c9542a8101afe528997f7' in s
+ assert 'sha256:d95e693fe840c956cc03df456d6dc3417ba82740ca0eff6ef9a5a12c353f5b5b' not in s
  s=s.replace('26876_candidate_app_source.tar.gz','26875_candidate_app_source.tar.gz')
  s=s.replace('build_26876_iris_rawr_outputs/','build_26875_iris_rawr_outputs/')
  s=s.replace('1997 ]] || fail','1997 ]] || fail')
