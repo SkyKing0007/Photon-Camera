@@ -142,10 +142,29 @@ def replay(s):
  s=s.replace('regressions/26875_device_failures.py "$WORK/historical_26874_from_26875" "$BASE"',
              'regressions/26875_device_failures.py "$WORK/historical_26874_from_26875" "$WORK/historical_26875_from_26876"')
  s=s.replace('verify_26877_expanded_shaders.py','verify_26876_expanded_shaders.py')
+ # PERMANENT EXACT ACTIONS 40135903086 REGRESSION: final replay inherited
+ # py_compile still named regressions/26877_superres_ownership.py, although
+ # real Kotlin/Java/GLSL/NDK and full APK assembly already passed. Fix every
+ # remaining reference inside the final replay stage, not just the old
+ # invocation ending in "$BASE" "$exp". Preserve its order and checks.
+ assert 'regressions/26877_superres_ownership.py' in s, 'expected prior final-replay stale regression not reproduced'
+ s=s.replace('regressions/26877_superres_ownership.py','regressions/26877_runtime_ownership_spektra.py')
+ assert 'regressions/26877_superres_ownership.py' not in s, 'old 26877 final-clean-extract validator survived'
+ assert re.search(r'python3 -S -m py_compile [^\n]*regressions/26877_runtime_ownership_spektra\.py',s), 'final replay py_compile must use staged actual regression path'
  assert 'regressions/26877_runtime_ownership_spektra.py "$BASE" "$exp"' in s
  assert 'verify_26877_candidate.py "$BASE" "$exp"' in s
  return s
 edit('clean_extract_replay',replay)
+# Final-stage source-path closure: all 26877 Python validators in the whole
+# GENERATED script must exist in the canonical checkout at generator time.
+# Check this after all stage-specific inherited transformations, BEFORE a
+# guarded builder can be exported or its SHA computed.
+refs=set(re.findall(r'(?<![A-Za-z0-9_./])(?:regressions/)?[A-Za-z0-9_]*26877[A-Za-z0-9_]*\.py\b',body))
+expected_26877_python={'verify_26877_candidate.py','verify_26877_patches.py','regressions/26877_runtime_ownership_spektra.py'}
+assert expected_26877_python <= refs,('required 26877 Python validators missing from generated runner',sorted(expected_26877_python-refs))
+for rel in sorted(refs):
+ assert (p/rel).is_file(),('generated runner references missing source',rel)
+assert 'regressions/26877_superres_ownership.py' not in body, 'real 40135903086 missing path regression'
 # Freeze proven 17 ordered functions and unchanged real project compilers.
 STAGES=['verify_package','verify_scope','obtain_authority','make_candidate',
 'verify_successful_mechanics','prepare_glslang','compile_modified_runtime_shaders',
