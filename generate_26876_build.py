@@ -6,7 +6,11 @@ p=Path(sys.argv[1]).resolve() if len(sys.argv)>1 else Path('.').resolve()
 prior=(p/'build_26875_iris_rawr.sh').read_text()
 PARENT_SHA='b6c6f1db9f9910a0bff2175af756e3e92896d33eb6a82776de746eda645fa7a1'
 assert hashlib.sha256(prior.encode()).hexdigest()==PARENT_SHA,'exact successful 26875 17-stage runner mismatch'
-PARENT_GIT_BLOB=subprocess.run(['git','hash-object',str(p/'build_26875_iris_rawr.sh')],capture_output=True,text=True,check=True).stdout.strip()
+# IRIS_26876_REGRESSION_GITHUB_FAILED_RUN_40060844244
+# The 26875 successful build-script SHA256 and committed generator Git blob
+# are different identities. Never hash build_26875_iris_rawr.sh and claim it
+# is the committed generate_26875_build.py blob.
+PARENT_GIT_BLOB='4894b6ebeae1434d7713b690f218062c0e62f71b'
 assert re.fullmatch(r'[a-f0-9]{40}',PARENT_GIT_BLOB)
 body=prior.replace('26875','26876').replace('0.9726875','0.9726876')
 def edit(fn,transform):
@@ -20,7 +24,7 @@ def replace_anchor(s,old,new,label):
  return s.replace(old,new)
 # Identity substitutions only; no compiler, NDK, assembler or stage reordering.
 for before,after in (
- ('REPO_SCAFFOLD_BASE_COMMIT="d69751ed0aaf4ef3597fb1af5ce274deeee17928"','REPO_SCAFFOLD_BASE_COMMIT="23c3f94222e6585690aee866277ed2ca82cca61c"'),
+ ('REPO_SCAFFOLD_BASE_COMMIT="d69751ed0aaf4ef3597fb1af5ce274deeee17928"','REPO_SCAFFOLD_BASE_COMMIT="c3ad383c9d4b3695b6a3ef65b7837d23029903d3"'),
  ('RUNTIME_AUTHORITY_COMMIT="d69751ed0aaf4ef3597fb1af5ce274deeee17928"','RUNTIME_AUTHORITY_COMMIT="23c3f94222e6585690aee866277ed2ca82cca61c"'),
  ('RUNTIME_ARTIFACT_ID="12543720749"; RUNTIME_ACTIONS_RUN="40050271749"','RUNTIME_ARTIFACT_ID="12544774681"; RUNTIME_ACTIONS_RUN="40054980042"'),
  ('RUNTIME_ARTIFACT_SHA="d95e693fe840c956cc03df456d6dc3417ba82740ca0eff6ef9a5a12c353f5b5b"','RUNTIME_ARTIFACT_SHA="afd2efb8b8512bdff721809d9a15898821c1cdd2f37c9542a8101afe528997f7"'),
@@ -34,7 +38,10 @@ for before,after in (
 
 def pkg(s):
  s=s.replace('regressions/26876_device_failures.py','regressions/26876_superres_ownership.py')
- s=s.replace('RUN_26876_B_DEVICE_CORRECTION','RUN_26876_B_50MP_WRONSKI_FAST')
+ s=s.replace('RUN_26876_B_DEVICE_CORRECTION','RUN_26876_B_50MP_WRONSKI_FAST_V2')
+ # exact 16-file allowlist for 1997-file successful 26875 compiled candidate
+ s=s.replace('-eq 3 ]] || fail', '-eq 16 ]] || fail')
+ s=s.replace('three-file strict runtime upload scope','sixteen-file strict runtime upload scope')
  return s
 edit('verify_package',pkg)
 def scope(s):
@@ -76,7 +83,7 @@ def candidate(s):
  '''regressions/26875_device_failures.py "$H74" "$BASE"
  python3 -S regressions/26876_superres_ownership.py "$BASE" "$CAND"
  python3 -S verify_26876_candidate.py "$BASE" "$CAND"
- python3 -S verify_26876_expanded_shaders.py "$CAND"''')
+ python3 -S verify_26876_expanded_shaders.py "$CAND" --source-only''')
  assert 'verify_26876_candidate.py "$BASE" "$CAND"' in s
  return s
 edit('make_candidate',candidate)
@@ -89,36 +96,35 @@ def mechanics(s):
  return s
 edit('verify_successful_mechanics',mechanics)
 def shaders(s):
- # The existing compiler stage remains in the SAME 17-stage slot, and keeps
- # every existing 26875 shader gate first. Append only applicable real GLSL.
+ # Keep every inherited 26875 shader/compiler invocation first and in the
+ # same stage, then validate EXACT runtime expanded new 26876 sources with
+ # pinned real glslang 16.5, never with a mock or static-only parser.
  needle='\n}'
  assert s.endswith(needle)
  insert='''
- python3 -S verify_26876_expanded_shaders.py "$CAND" || fail '26876 exact runtime-expanded shader source mismatch'
  local realGlslang=""
  realGlslang="$(command -v glslangValidator || true)"
  if [[ -z "$realGlslang" ]]; then
   realGlslang="$(find "$WORK" -type f -name glslangValidator -perm /111 -print -quit)"
  fi
- [[ -n "$realGlslang" && -x "$realGlslang" ]] || fail 'pinned real glslangValidator is required for 26876 shaders'
- "$realGlslang" --version | grep -E '16\\.5' >/dev/null || fail '26876 must use pinned glslang 16.5'
- "$realGlslang" -S comp "$ROOT/26876_NATIVE_B_GPU_FINAL_RENDER.comp" >/dev/null || fail '26876 B true50MP GPU compute compiler failure'
- "$realGlslang" -S frag "$ROOT/26876_B_GUIDE_1X_RGB.frag" >/dev/null || fail '26876 1x guide real GLSL compiler failure'
- "$realGlslang" -S frag "$ROOT/26876_B_SENSOR_CLIP_OR.frag" >/dev/null || fail '26876 clip OR real GLSL compiler failure'
+ [[ -n "$realGlslang" && -x "$realGlslang" ]] || fail '26876 pinned real glslangValidator unavailable'
+ export IRIS_PINNED_GLSLANG_VALIDATOR="$realGlslang"
+ python3 -S verify_26876_expanded_shaders.py "$CAND" || fail '26876 true runtime-expanded GLSL failed pinned compiler'
 '''
  return s[:-len(needle)]+insert+needle
 edit('compile_modified_runtime_shaders',shaders)
 def patches(s):
- s=s.replace('exact 26876 3-file binary','exact 26876 3-file binary')
+ s=s.replace('exact 26876 3-file binary','exact 26876 16-file binary')
  return s+'\n' if False else s.replace('verify_26876_patches.py', 'verify_26876_patches.py')+'\n' if False else s
 # Inherited patch stage unchanged except global 26876 version and exact new patch inputs.
 def safety(s):
  s=s.replace('successful 26874','successful 26875')
  s=s.replace('only B JPEG publication + true2x WB/highlight routing + guarded version',
-             'only B Wronski single merge + B clipping/GPU publication + guarded version')
- s=s.replace('prior_files=1997','prior_files=1997').replace('candidate_files=1997','candidate_files=1997')
+             'only B single-merge 50MP GPU/clip/private JPEG-R + exact guarded version')
+ s=s.replace('runtime_changed_files=3','runtime_changed_files=16')
+ s=s.replace('candidate_files=1997','candidate_files=2001')
  s=s.replace('protected_source=1994 files byte-identical to successful 26874',
-             'protected_source=1994 files byte-identical to successful 26875')
+             'protected_source=1985 files byte-identical to successful 26875')
  return s
 edit('prebuild_safety',safety)
 def replay(s):

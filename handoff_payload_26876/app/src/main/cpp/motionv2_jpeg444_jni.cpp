@@ -490,96 +490,9 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
             float a=gh(x0,y0)+(gh(x1,y0)-gh(x0,y0))*fx,b=gh(x0,y1)+(gh(x1,y1)-gh(x0,y1))*fx;out[k]=a+(b-a)*fy;
         }
     };
-    /* IRIS_26876_B_ONLY_PARALLEL_SENSOR_CLIP_CORRECTION
-     * Identical per-pixel 26836 math. The native 2x Wronski bit sidecar is
-     * the B-only admission token. Its rows and 50MP RGB rows are independent,
-     * so the B correction can operate on disjoint MAP_SHARED rows concurrently
-     * rather than serializing 50 million half-float decode/encode operations.
-     * Never parallelize or modify A's historical null-sidecar implementation.
-     * No new 50MP allocation, no changed camera/color domains, no fallback
-     * to weaker clipping when a required B sidecar is malformed.
-     */
-    bool ok=true;
-    if(mfd>=0){
-        auto*mappedRgb=(uint16_t*)mmap(nullptr,(size_t)expected,
-            PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
-        const size_t sidecarBytes=maskRowBytes*(size_t)trueH;
-        auto*mappedBits=(const uint8_t*)mmap(nullptr,sidecarBytes,
-            PROT_READ,MAP_PRIVATE,mfd,0);
-        const bool haveMap=mappedRgb!=MAP_FAILED&&mappedBits!=MAP_FAILED;
-        if(haveMap){
-            const auto t0=std::chrono::steady_clock::now();
-            const unsigned hardware=std::thread::hardware_concurrency();
-            const int workers=std::max(1,std::min(6,(int)(hardware?hardware:2)));
-            std::atomic<int> nextRow{0};std::atomic<bool> valid{true};
-            auto computeRow=[&](int y)->bool{
-                uint16_t*row=mappedRgb+(size_t)y*(size_t)trueW*3u;
-                const uint8_t*exact2xBits=mappedBits+(size_t)y*maskRowBytes;
-                for(int x=0;x<trueW;x++){
-                    float sx=((float)x+0.5f)*(float)nativeW/(float)trueW-0.5f;
-                    float sy=((float)y+0.5f)*(float)nativeH/(float)trueH-0.5f;
-                    float gcam[3],m=0.f;sample(sx,sy,gcam,m);
-                    if(exact2xBits[(size_t)x>>3]&(1u<<(x&7)))m=1.f;
-                    if(!(m>0.f))continue;
-                    size_t q=(size_t)x*3;float srcWb[3],guideWb[3];bool finite=true;
-                    for(int k=0;k<3;k++){
-                        float c=iris26564::halfToFloat(row[q+k]);
-                        finite=finite&&std::isfinite(c)&&std::isfinite(gcam[k]);
-                        srcWb[k]=c*wb[k];guideWb[k]=gcam[k]*wb[k];
-                    }
-                    if(!finite)return false;
-                    float ySrc=0.25f*srcWb[0]+0.50f*srcWb[1]+0.25f*srcWb[2];
-                    float yGuide=0.25f*guideWb[0]+0.50f*guideWb[1]+0.25f*guideWb[2];
-                    float ycGuide=std::max(yGuide,yFloor),ycSrc=std::max(ySrc,yFloor);
-                    float cSrc[2]={(srcWb[0]-srcWb[1])/ycSrc,(srcWb[2]-srcWb[1])/ycSrc};
-                    float cGuide[2]={(guideWb[0]-guideWb[1])/ycGuide,(guideWb[2]-guideWb[1])/ycGuide};
-                    float cp0=cSrc[0]+(cGuide[0]-cSrc[0])*m,cp1=cSrc[1]+(cGuide[1]-cSrc[1])*m;
-                    float dR=cp0*ycSrc,dB=cp1*ycSrc,g=ySrc-0.25f*(dR+dB);
-                    float outWb[3]={g+dR,g,g+dB};
-                    for(int k=0;k<3;k++)row[q+k]=iris26564::floatToHalf(std::max(outWb[k]/wb[k],0.f));
-                }
-                return true;
-            };
-            auto work=[&](){
-                while(valid.load(std::memory_order_relaxed)){
-                    int y=nextRow.fetch_add(1,std::memory_order_relaxed);
-                    if(y>=trueH)break;
-                    if(!computeRow(y)){valid.store(false,std::memory_order_relaxed);break;}
-                }
-            };
-            std::vector<std::thread> threads;threads.reserve((size_t)workers);
-            bool couldLaunch=true;
-            try {
-                for(int i=0;i<workers;i++)threads.emplace_back(work);
-            } catch(const std::system_error&) {
-                // Always join launched workers before leaving the mapping;
-                // the output cannot be published if any row never ran.
-                couldLaunch=false;
-                valid.store(false,std::memory_order_relaxed);
-            }
-            for(auto&thread:threads)if(thread.joinable())thread.join();
-            ok=couldLaunch&&valid.load(std::memory_order_relaxed);
-            // A successful fsync below also covers dirty MAP_SHARED pages.
-            // Failed rows cannot be published; the caller removes the output.
-            const auto ms=(std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now()-t0)).count();
-            __android_log_print(ANDROID_LOG_INFO,TAG,
-                "IRIS_26876_B_CLIP_PARALLEL workers=%d wallMs=%lld valid=%d bytes=%llu",
-                workers,(long long)ms,ok?1:0,(unsigned long long)expected);
-        }
-        if(mappedRgb!=MAP_FAILED)munmap(mappedRgb,(size_t)expected);
-        if(mappedBits!=MAP_FAILED)munmap((void*)mappedBits,sidecarBytes);
-        if(haveMap){
-            int syncRc=ok?fsync(fd):-1;
-            close(mfd);close(fd);
-            return (ok&&syncRc==0)?JNI_TRUE:JNI_FALSE;
-        }
-        __android_log_print(ANDROID_LOG_WARN,TAG,
-            "IRIS_26876_B_CLIP_PARALLEL mmap_unavailable exactSerial=true");
-    }
     std::vector<uint16_t> row((size_t)trueW*3);
     std::vector<uint8_t> exact2xBits(mfd>=0?maskRowBytes:0u);
-    ok=true;
+    bool ok=true;
     for(int y=0;ok&&y<trueH;y++){
         const size_t bytes=(size_t)trueW*3*sizeof(uint16_t);off_t off=(off_t)y*(off_t)bytes;if(!readExact(fd,row.data(),bytes,off)){ok=false;break;}
         if(mfd>=0&&!readExact(mfd,exact2xBits.data(),maskRowBytes,(off_t)y*(off_t)maskRowBytes)){
@@ -1413,367 +1326,21 @@ void main(){
     imageStore(uOutput,local,outv);
 }
 )GLSL";
-/* B-only native GPU renderer; original 26571 shader above remains byte-for-byte unchanged for A. */
-static const char*kIris26876BPublicationCompute=R"GLSL(#version 310 es
-precision highp float;
-precision highp int;
-precision highp usampler2D;
-/* IRIS_26571_TRUE2X_PUBLICATION_COMPUTE */
-layout(local_size_x=16,local_size_y=8,local_size_z=1) in;
-layout(binding=0) uniform highp sampler2D uSource;
-uniform highp sampler2D uLocalToneLogMap;
-layout(rgba8ui,binding=0) writeonly uniform highp uimage2D uOutput;
-layout(std430,binding=1) readonly buffer IrisGammaLut { float gammaLut[]; };
-layout(std430,binding=2) readonly buffer IrisAcr3Curve { float acr3Curve[]; };
-/* IRIS_26876_B_GPU_DCP_WATERMARK_FULL_PROFILE */
-layout(std430,binding=3) readonly buffer Iris26876BFirstDcp { float irisBFirstDcp[]; };
-layout(std430,binding=4) readonly buffer Iris26876BSecondDcp { float irisBSecondDcp[]; };
-uniform ivec3 uBFirstDcpDims;
-uniform ivec3 uBSecondDcpDims;
-uniform int uBWatermarkEnabled;
-uniform sampler2D uBWatermark;
-uniform vec2 uBWatermarkAspect;
-
-uniform ivec2 uSrcOrigin;
-uniform ivec2 uSrcSize;
-uniform ivec2 uTrueSize;
-uniform ivec2 uOutputSize;
-uniform ivec2 uRawSize;
-uniform ivec2 uCropSize;
-uniform int uRotation;
-uniform int uMirror;
-uniform int uBandTop;
-uniform int uBandH;
-uniform int uGenerateGain;
-uniform float uResidualZoom;
-uniform float uDisplayGain;
-uniform float uExposureEv;
-uniform float uShadows;
-uniform float uContrast;
-uniform float uSaturation;
-uniform float uSceneWhite;
-uniform float uBodyToneStrength;
-uniform int uMotionHdrHandoff;
-uniform int uAcr3Enabled;
-uniform int uLocalToneLogEnabled;
-uniform ivec2 uLocalToneLogSize;
-uniform ivec2 uLocalToneLogSourceSize;
-uniform float uGainMax;
-uniform float uGainContentMax;
-uniform vec3 uSensorRow0;
-uniform vec3 uSensorRow1;
-uniform vec3 uSensorRow2;
-uniform vec3 uDisplayRow0;
-uniform vec3 uDisplayRow1;
-uniform vec3 uDisplayRow2;
-
-float irisLuma(vec3 c){return dot(c,vec3(0.22897456,0.69173852,0.07928691));}
-float irisPeak(vec3 c){return max(c.r,max(c.g,c.b));}
-vec3 irisClampNonnegative(vec3 c){return max(c,vec3(0.0));}
-float irisComponentGainLimit(float y,float c){
-    if(c>1.0e-7)return max(1.0,(1.0-y)/c);
-    if(c<(-1.0e-7))return max(1.0,(0.0-y)/c);
-    return 4.0;
-}
-/* IRIS_26638_USER_SATURATION_ONLY_TRUE2X_GPU */
-float iris26638ChromaGainLimit(float y,float c){
-    if(c>1.0e-8)return max(1.0,(1.0-y)/c);
-    if(c<(-1.0e-8))return max(1.0,y/(-c));
-    return 1.0e6;
-}
-vec3 iris26638UserSaturation(vec3 rgb,float userSaturation){
-    rgb=clamp(rgb,vec3(0.0),vec3(1.0));float sat=clamp(userSaturation,0.0,2.0);if(abs(sat-1.0)<=1.0e-7)return rgb;
-    float y=clamp(irisLuma(rgb),0.0,1.0);vec3 c=rgb-vec3(y);float black=smoothstep(0.018,0.050,y),highlight=1.0-smoothstep(0.78,0.95,y);
-    float requested=max(1.0+black*highlight*(sat-1.0),0.0);float limit=1.0e6;
-    limit=min(limit,iris26638ChromaGainLimit(y,c.r));limit=min(limit,iris26638ChromaGainLimit(y,c.g));limit=min(limit,iris26638ChromaGainLimit(y,c.b));
-    return clamp(vec3(y)+c*min(requested,limit),vec3(0.0),vec3(1.0));
-}
-vec3 irisMatRows(vec3 r0,vec3 r1,vec3 r2,vec3 v){return vec3(dot(r0,v),dot(r1,v),dot(r2,v));}
-vec3 irisCameraAt(ivec2 fullP){
-    fullP=clamp(fullP,ivec2(0),uTrueSize-ivec2(1));
-    ivec2 local=fullP-uSrcOrigin;
-    local=clamp(local,ivec2(0),uSrcSize-ivec2(1));
-    return max(texelFetch(uSource,local,0).rgb,vec3(0.0));
-}
-float iris26638SampleAcr3(float value){
-    const int n=1025;if(value>1.0){const float dx=0.001;float y1=acr3Curve[n-1];float pos=(1.0-dx)*float(n-1);int i0=int(floor(pos)),i1=min(i0+1,n-1);float y0=mix(acr3Curve[i0],acr3Curve[i1],pos-float(i0));return y1+((y1-y0)/dx)*(value-1.0);}
-    float pos=clamp(value,0.0,1.0)*float(n-1);int i0=int(floor(pos)),i1=min(i0+1,n-1);return mix(acr3Curve[i0],acr3Curve[i1],pos-float(i0));
-}
-void iris26638AdobeRgbTone(inout float mx,inout float md,inout float mn){float oldMx=mx,oldMd=md,oldMn=mn;mx=iris26638SampleAcr3(oldMx);mn=iris26638SampleAcr3(oldMn);md=abs(oldMx-oldMn)<1.0e-6?mn:mn+(mx-mn)*(oldMd-oldMn)/(oldMx-oldMn);}
-vec3 iris26638ApplyAcr3(vec3 color){
-    float r=color.r,g=color.g,b=color.b;if(r>=g){if(g>b)iris26638AdobeRgbTone(r,g,b);else if(b>r)iris26638AdobeRgbTone(b,r,g);else if(b>g)iris26638AdobeRgbTone(r,b,g);else{r=iris26638SampleAcr3(r);g=iris26638SampleAcr3(g);b=g;}}
-    else{if(r>=b)iris26638AdobeRgbTone(g,r,b);else if(b>g)iris26638AdobeRgbTone(b,g,r);else iris26638AdobeRgbTone(g,b,r);}return vec3(r,g,b);
-}
-
-/* Mathematically matched to 26875 CPU iris26628* DCP ownership. All tables
- * remain in original index layout: (v*hDiv*sDiv+h*sDiv+s)*3, never a 3D
- * texture with shifted axes or arbitrary color-channel reinterpretation. */
-vec3 iris26876RgbToHsv(vec3 rgb){
-    float mx=max(rgb.r,max(rgb.g,rgb.b)),mn=min(rgb.r,min(rgb.g,rgb.b));
-    float d=mx-mn,h=0.0;
-    if(d>1.0e-6){
-        if(mx==rgb.r)h=mod((rgb.g-rgb.b)/d,6.0);
-        else if(mx==rgb.g)h=(rgb.b-rgb.r)/d+2.0;
-        else h=(rgb.r-rgb.g)/d+4.0;
-    }
-    if(h<0.0)h+=6.0;
-    return vec3(h,mx>1.0e-6?d/mx:0.0,mx);
-}
-vec3 iris26876HsvToRgb(vec3 hsv){
-    float h=mod(hsv.r,6.0);if(h<0.0)h+=6.0;
-    float sat=max(hsv.g,0.0),v=max(hsv.b,0.0);
-    float c=v*sat,x=c*(1.0-abs(mod(h,2.0)-1.0));vec3 rgb;
-    if(h<1.0)rgb=vec3(c,x,0.0);
-    else if(h<2.0)rgb=vec3(x,c,0.0);
-    else if(h<3.0)rgb=vec3(0.0,c,x);
-    else if(h<4.0)rgb=vec3(0.0,x,c);
-    else if(h<5.0)rgb=vec3(x,0.0,c);
-    else rgb=vec3(c,0.0,x);
-    return rgb+vec3(v-c);
-}
-vec3 iris26876DcpAt(int which,ivec3 dims,int s,int h,int v){
-    int si=clamp(s,0,dims.y-1),hi=clamp(h,0,dims.x-1),vi=clamp(v,0,dims.z-1);
-    int q=(vi*dims.x*dims.y+hi*dims.y+si)*3;
-    if(which==0)return vec3(irisBFirstDcp[q],irisBFirstDcp[q+1],irisBFirstDcp[q+2]);
-    return vec3(irisBSecondDcp[q],irisBSecondDcp[q+1],irisBSecondDcp[q+2]);
-}
-vec3 iris26876SampleDcp(int which,ivec3 dims,vec3 hsv){
-    float hs=hsv.r*float(dims.x)/6.0;
-    float ss=clamp(hsv.g,0.0,1.0)*float(max(dims.y-1,0));
-    float vs=clamp(hsv.b,0.0,1.0)*float(max(dims.z-1,0));
-    int h0=int(floor(hs)),h1=h0+1;
-    if(h0>=dims.x-1){h0=dims.x-1;h1=0;}
-    int s0=min(int(floor(ss)),max(dims.y-2,0)),s1=min(s0+1,dims.y-1);
-    int v0=min(int(floor(vs)),max(dims.z-2,0)),v1=min(v0+1,dims.z-1);
-    float hf=hs-float(h0),sf=ss-float(s0),vf=vs-float(v0);
-    vec3 a=iris26876DcpAt(which,dims,s0,h0,v0),b=iris26876DcpAt(which,dims,s0,h1,v0);
-    vec3 c=iris26876DcpAt(which,dims,s1,h0,v0),d=iris26876DcpAt(which,dims,s1,h1,v0);
-    if(dims.z>1){
-        a=mix(a,iris26876DcpAt(which,dims,s0,h0,v1),vf);
-        b=mix(b,iris26876DcpAt(which,dims,s0,h1,v1),vf);
-        c=mix(c,iris26876DcpAt(which,dims,s1,h0,v1),vf);
-        d=mix(d,iris26876DcpAt(which,dims,s1,h1,v1),vf);
-    }
-    return mix(mix(a,b,hf),mix(c,d,hf),sf);
-}
-vec3 iris26876ApplyDcp(vec3 rgb,int which,ivec3 dims){
-    if(any(lessThanEqual(dims,ivec3(0)))||min(rgb.r,min(rgb.g,rgb.b))<0.0)return rgb;
-    vec3 hsv=iris26876RgbToHsv(rgb),m=iris26876SampleDcp(which,dims,hsv);
-    hsv.r=mod(hsv.r+m.r/60.0,6.0);if(hsv.r<0.0)hsv.r+=6.0;
-    hsv.g=clamp(hsv.g*m.g,0.0,1.0);hsv.b=max(hsv.b*m.b,0.0);
-    return iris26876HsvToRgb(hsv);
-}
-vec3 irisProfileColor(ivec2 p){
-    vec3 camera=irisCameraAt(p),profile=irisMatRows(uSensorRow0,uSensorRow1,uSensorRow2,camera);
-    profile=iris26876ApplyDcp(profile,0,uBFirstDcpDims);
-    profile=iris26876ApplyDcp(profile,1,uBSecondDcpDims);
-    vec3 original=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,profile),linear=original;
-    if(uAcr3Enabled!=0&&min(profile.r,min(profile.g,profile.b))>=0.0&&min(original.r,min(original.g,original.b))>=0.0){vec3 rendered=irisMatRows(uDisplayRow0,uDisplayRow1,uDisplayRow2,iris26638ApplyAcr3(profile));float targetY=irisLuma(original),renderedY=irisLuma(rendered);if(targetY>=0.0&&renderedY>1.0e-8){linear=rendered*(targetY/renderedY);float baselineSpan=irisPeak(original)-min(original.r,min(original.g,original.b));float renderedSpan=irisPeak(linear)-min(linear.r,min(linear.g,linear.b));if(renderedSpan+1.0e-8<baselineSpan){if(renderedSpan>1.0e-8){vec3 c=linear-vec3(targetY);linear=vec3(targetY)+c*(baselineSpan/renderedSpan);}else linear=original;}}}
-    float floorV=min(linear.r,min(linear.g,linear.b));if(floorV<0.0)linear-=vec3(floorV);return irisClampNonnegative(linear);
-}
-vec3 irisTone(vec3 rgb){
-    bool manualActive=abs(uExposureEv)>=0.0001||abs(uShadows)>=0.0001||abs(uContrast)>=0.0001;
-    float virtualGain=uMotionHdrHandoff!=0&&manualActive?max(uDisplayGain,1.0e-6):1.0;
-    rgb=irisClampNonnegative(rgb)*virtualGain*exp2(uExposureEv);
-    if(abs(uShadows)>=0.0001){
-        float y=irisLuma(rgb),mask=1.0-smoothstep(0.08,0.55,y),target=y;
-        if(uShadows<0.0)target=y+(-uShadows)*0.08*mask*(1.0-clamp(y,0.0,1.0));
-        else target=y*(1.0-0.75*uShadows*mask);
-        rgb=y<=1.0e-7?vec3(max(target,0.0)):irisClampNonnegative(rgb)*(max(target,0.0)/y);
-    }
-    if(abs(uContrast)>=0.0001){
-        float y=irisLuma(rgb);
-        if(y>1.0e-7){
-            const float pivot=0.18;
-            float slope=1.0+0.25*uContrast;
-            float target=pivot*exp2(log2(max(y/pivot,1.0e-6))*slope);
-            rgb=irisClampNonnegative(rgb)*(max(target,0.0)/y);
-        }
-    }
-    if(virtualGain!=1.0)rgb/=virtualGain;
-    return irisClampNonnegative(rgb);
-}
-vec3 irisPreRenderAt(ivec2 p){vec3 c=irisProfileColor(p);if(uMotionHdrHandoff==0)c*=max(uDisplayGain,1.0e-6);return irisTone(c);}
-vec3 irisSamplePreRender(vec2 p){
-    p=clamp(p,vec2(0.0),vec2(uTrueSize-ivec2(1)));
-    if(uResidualZoom<=1.00001)return irisPreRenderAt(ivec2(floor(p+vec2(0.5))));
-    ivec2 p0=ivec2(floor(p)),p1=min(p0+ivec2(1),uTrueSize-ivec2(1));
-    vec2 f=p-vec2(p0);
-    vec3 a=irisPreRenderAt(p0),b=irisPreRenderAt(ivec2(p1.x,p0.y));
-    vec3 c=irisPreRenderAt(ivec2(p0.x,p1.y)),d=irisPreRenderAt(p1);
-    return mix(mix(a,b,f.x),mix(c,d,f.x),f.y);
-}
-vec2 irisOutputToSource(ivec2 op){
-    float bx=(float(op.x)+0.5)*0.5-0.5,by=(float(op.y)+0.5)*0.5-0.5;
-    float ux=0.0,uy=0.0;
-    if(uRotation==90){
-        float xx=bx;if(uMirror!=0)xx=float(uCropSize.y)-xx;ux=by;uy=float(uRawSize.y)-xx;
-    }else if(uRotation==180){
-        float yy=by;if(uMirror!=0)yy=float(uRawSize.y)-yy;ux=float(uRawSize.x)-bx;uy=float(uRawSize.y)-yy;
-    }else if(uRotation==270){
-        float xx=bx+float(uRawSize.y-uCropSize.y);if(uMirror!=0)xx=float(uCropSize.y)-xx;ux=float(uRawSize.x)-by;uy=xx;
-    }else{
-        float yy=by+float(uRawSize.y-uCropSize.y);if(uMirror!=0)yy=float(uRawSize.y)-yy;ux=bx;uy=yy;
-    }
-    float cx=(float(uRawSize.x)-1.0)*0.5,cy=(float(uRawSize.y)-1.0)*0.5;
-    float sx=cx+(ux-cx)/uResidualZoom,sy=cy+(uy-cy)/uResidualZoom;
-    return clamp(2.0*(vec2(sx,sy)+vec2(0.5))-vec2(0.5),vec2(0.0),vec2(uTrueSize-ivec2(1)));
-}
-/* IRIS_26621_TRUE2X_LOCAL_LAPLACIAN_GPU_SHARED_FIELD */
-float irisLocalToneMappedGuide(vec2 trueSource){
-    if(uLocalToneLogEnabled==0)return -1.0;
-    vec2 oneSource=(trueSource+vec2(0.5))*vec2(uLocalToneLogSourceSize)/max(vec2(uTrueSize),vec2(1.0))-vec2(0.5);
-    vec2 mapCoord=(oneSource+vec2(0.5))*vec2(uLocalToneLogSize)/max(vec2(uLocalToneLogSourceSize),vec2(1.0))-vec2(0.5);
-    vec2 uv=(mapCoord+vec2(0.5))/max(vec2(uLocalToneLogSize),vec2(1.0));
-    vec2 texel=vec2(0.5)/max(vec2(uLocalToneLogSize),vec2(1.0));
-    uv=clamp(uv,texel,vec2(1.0)-texel);
-    return exp2(clamp(texture(uLocalToneLogMap,uv).r,-12.0,0.0));
-}
-float iris26621MapMotionSdrFinalGuide(float sourceGuide){
-    const float scale=0.80;
-    float x=max(sourceGuide,0.0);
-    float requested=max(uDisplayGain,1.0e-6)*scale;
-    float whiteAnchor=min(0.95,requested);
-    float bodyGain=requested;
-    if(requested>whiteAnchor)bodyGain=min(requested,4.0*whiteAnchor-1.0e-4);
-    float safeWhite=max(whiteAnchor,1.0e-6);
-    float ratio=max(bodyGain/safeWhite-1.0,0.0);
-    if(x<=1.0){
-        float oneMinus=1.0-x;
-        float cubic=whiteAnchor*x+(bodyGain-whiteAnchor)*x*oneMinus*oneMinus;
-        float rational=bodyGain*x/(1.0+ratio*x);
-        return 0.5*(cubic+rational);
-    }
-    float rationalSlopeAtWhite=bodyGain/((1.0+ratio)*(1.0+ratio));
-    float bodySlopeAtWhite=0.5*(whiteAnchor+rationalSlopeAtWhite);
-    float reserve=max(1.0-whiteAnchor,0.0);
-    if(reserve<=1.0e-6)return whiteAnchor;
-    float tailScale=reserve/max(bodySlopeAtWhite,1.0e-6);
-    float excess=x-1.0;
-    return whiteAnchor+reserve*excess/(excess+tailScale);
-}
-/* IRIS_26704_RANGE_SEPARATED_BODY_TONE_TRUE2X_GPU
- * IRIS_26824_ADAPTIVE_BODY_S_CURVE_TRUE2X_GPU */
-float iris26704BodyToneGuide(float mappedGuide){
-    float y=max(mappedGuide,0.0);
-    float contrast=clamp(-uBodyToneStrength,0.0,1.0);
-    if(contrast>1.0e-7&&y>0.0){
-        float low=smoothstep(0.055,0.180,y),high=1.0-smoothstep(0.500,0.760,y);
-        float blend=0.24*contrast*clamp(low*high,0.0,1.0);
-        return mix(y,y*y,blend);
-    }
-    float strength=clamp(uBodyToneStrength,0.0,1.0);const float anchorGuide=0.35;
-    if(strength<=1.0e-7||y<=0.0||y>=anchorGuide)return y;
-    float gamma=1.0-0.28*strength;
-    float toe=anchorGuide*pow(clamp(y/anchorGuide,0.0,1.0),gamma);
-    float blackGate=smoothstep(0.004,0.018,y);
-    return mix(y,toe,blackGate);
-}
-float iris26638ShadowFloorGuide(float guide){
-    const float floorEnd=0.050,deepScale=0.72;float x=max(guide,0.0);if(x>=floorEnd)return x;float t=clamp(x/floorEnd,0.0,1.0),smoothFactor=t*t*(3.0-2.0*t);return x*mix(deepScale,1.0,smoothFactor);
-}
-vec3 iris26638ApplyShadowFloorGuard(vec3 rgb){
-    if(uMotionHdrHandoff==0)return rgb;rgb=irisClampNonnegative(rgb);float guide=max(irisLuma(rgb),irisPeak(rgb));if(guide<=1.0e-7)return rgb;return rgb*(iris26638ShadowFloorGuide(guide)/guide);
-}
-vec3 irisHeadroom(vec3 rgb,float localMappedGuide){
-    rgb=irisClampNonnegative(rgb);
-    float y=max(irisLuma(rgb),0.0),pk=irisPeak(rgb),guide=max(y,pk);
-    /* IRIS_26621_SINGLE_TONE_OWNER_TRUE2X_GPU */
-    if(uMotionHdrHandoff!=0){
-        float globalMapped=iris26621MapMotionSdrFinalGuide(guide);
-        if(uBodyToneStrength>1.0e-7)globalMapped=iris26704BodyToneGuide(globalMapped);
-        float mappedFinal=globalMapped;
-        if(localMappedGuide>=0.0){
-            float localStrength=smoothstep(0.030,0.100,globalMapped);
-            mappedFinal=mix(globalMapped,clamp(localMappedGuide,0.0,1.0),localStrength);
-        }
-        if(uBodyToneStrength<(-1.0e-7))mappedFinal=iris26704BodyToneGuide(mappedFinal);
-        if(guide>1.0e-7)rgb*=mappedFinal/guide;
-    }else{
-        float start=0.50;
-        if(guide>1.0e-7&&guide>start){float white=max(uSceneWhite,start+0.05);float u=max((guide-start)/max(white-start,1.0e-6),0.0);float x=clamp(u,0.0,1.0);float shaped=log(1.0+6.0*x)/log(7.0);float mapped=start+(1.25-start)*shaped;rgb*=mapped/guide;}
-        rgb*=0.80;
-    }
-    rgb=iris26638ApplyShadowFloorGuard(rgb);
-    float pk2=irisPeak(rgb);if(pk2>1.0)rgb*=1.0/max(pk2,1.0e-6);
-    return iris26638UserSaturation(irisClampNonnegative(rgb),uSaturation);
-}
-float irisGamma(float x){
-    x=clamp(x,0.0,1.0);float q=x*16384.0;int a=int(q),b=min(a+1,16384);
-    return mix(gammaLut[a],gammaLut[b],q-float(a));
-}
-vec3 iris26876WatermarkP3(vec3 encoded){
-    vec3 l=vec3(encoded.r<=0.04045?encoded.r/12.92:pow((encoded.r+0.055)/1.055,2.4),
-                encoded.g<=0.04045?encoded.g/12.92:pow((encoded.g+0.055)/1.055,2.4),
-                encoded.b<=0.04045?encoded.b/12.92:pow((encoded.b+0.055)/1.055,2.4));
-    return vec3(irisGamma(0.8224619687*l.r+0.1775380313*l.g),
-                irisGamma(0.0331941989*l.r+0.9668058011*l.g),
-                irisGamma(0.0170826307*l.r+0.0723974407*l.g+0.9105199286*l.b));
-}
-uint irisByte(float x){return uint(clamp(floor(clamp(x,0.0,1.0)*255.0+0.5),0.0,255.0));}
-void main(){
-    ivec2 local=ivec2(gl_GlobalInvocationID.xy);
-    if(local.x>=uOutputSize.x||local.y>=uBandH)return;
-    ivec2 op=ivec2(local.x,uBandTop+local.y);
-    vec2 trueSource=irisOutputToSource(op);
-    vec3 hdr=irisSamplePreRender(trueSource);
-    float localMapped=irisLocalToneMappedGuide(trueSource);
-    vec3 sdr=irisHeadroom(hdr,localMapped);
-    uint gainCode=0u;
-    if(uGenerateGain!=0){
-        const float off=0.015625;float safeMax=max(uGainMax,1.001);
-        float contentMax=clamp(uGainContentMax,1.0,safeMax);
-        float ratio;
-        if(uMotionHdrHandoff!=0){
-            /* IRIS_26639_SELECTIVE_RECOVERABLE_HEADROOM_TRUE2X_GPU */
-            const float hdrEntry=0.65,hdrFullEntry=0.85;
-            vec3 hp=irisClampNonnegative(hdr);float sourceY=max(irisLuma(hp),0.0);float sourceGuide=max(sourceY,irisPeak(hp));
-            float eligibility=smoothstep(hdrEntry,hdrFullEntry,sourceGuide);
-            if(sourceGuide<=hdrEntry||eligibility<=1.0e-7){ratio=1.0;}
-            else{float globalSdr=max(iris26621MapMotionSdrFinalGuide(sourceGuide),0.0);float requested=max(uDisplayGain,1.0e-6)*0.80;float recoverable=max(globalSdr,sourceY*requested);float desired=clamp((recoverable+off)/(globalSdr+off),1.0,contentMax);float sdrY=max(irisLuma(irisClampNonnegative(sdr)),0.0);float pixelCeiling=clamp((recoverable+off)/(sdrY+off),1.0,contentMax);float eligible=min(desired,pixelCeiling);ratio=clamp(exp2(log2(max(eligible,1.0))*eligibility),1.0,contentMax);}
-        }else{
-            float hdrY=max(irisLuma(irisClampNonnegative(hdr)),0.0);
-            float sdrY=max(irisLuma(irisClampNonnegative(sdr)),0.0);
-            ratio=clamp((hdrY+off)/(sdrY+off),1.0,contentMax);
-        }
-        float code=clamp(log2(ratio)/max(log2(safeMax),1.0e-6),0.0,1.0);
-        gainCode=irisByte(code);
-    }
-    vec3 encoded=vec3(irisGamma(sdr.r),irisGamma(sdr.g),irisGamma(sdr.b));
-    if(uBWatermarkEnabled!=0){
-        float wmW=float(uOutputSize.x)*0.115;
-        float wmH=wmW*uBWatermarkAspect.y/uBWatermarkAspect.x;
-        float margin=max(2.0,float(min(uOutputSize.x,uOutputSize.y))*0.025);
-        vec2 leftTop=vec2(float(uOutputSize.x)-margin-wmW,float(uOutputSize.y)-margin-wmH);
-        vec2 xy=vec2(op);
-        if(xy.x>=leftTop.x&&xy.x<=leftTop.x+wmW&&
-           xy.y>=leftTop.y&&xy.y<=leftTop.y+wmH){
-            vec2 uv=(xy-leftTop)/vec2(wmW,wmH);
-            vec4 wm=texture(uBWatermark,uv);
-            if(wm.a>0.0)encoded=mix(encoded,iris26876WatermarkP3(wm.rgb),wm.a);
-        }
-    }
-    uvec4 outv=uvec4(irisByte(encoded.r),irisByte(encoded.g),irisByte(encoded.b),gainCode);
-    imageStore(uOutput,local,outv);
-}
-)GLSL";
 
 inline GLuint iris26571Compile(GLenum type,const char*src,std::string*error){
     GLuint s=glCreateShader(type);if(!s)return 0;glShaderSource(s,1,&src,nullptr);glCompileShader(s);GLint ok=0;glGetShaderiv(s,GL_COMPILE_STATUS,&ok);
     if(!ok){GLint n=0;glGetShaderiv(s,GL_INFO_LOG_LENGTH,&n);std::vector<char>log((size_t)std::max(n,1));glGetShaderInfoLog(s,n,nullptr,log.data());if(error)*error=log.data();glDeleteShader(s);return 0;}return s;
 }
-inline GLuint iris26571Program(std::string*error,bool iris26876B=false){
-    GLuint sh=iris26571Compile(GL_COMPUTE_SHADER,
-        iris26876B?kIris26876BPublicationCompute:kIris26571PublicationCompute,error);if(!sh)return 0;GLuint p=glCreateProgram();if(!p){glDeleteShader(sh);return 0;}glAttachShader(p,sh);glLinkProgram(p);glDeleteShader(sh);GLint ok=0;glGetProgramiv(p,GL_LINK_STATUS,&ok);
+inline GLuint iris26571Program(std::string*error){
+    GLuint sh=iris26571Compile(GL_COMPUTE_SHADER,kIris26571PublicationCompute,error);if(!sh)return 0;GLuint p=glCreateProgram();if(!p){glDeleteShader(sh);return 0;}glAttachShader(p,sh);glLinkProgram(p);glDeleteShader(sh);GLint ok=0;glGetProgramiv(p,GL_LINK_STATUS,&ok);
     if(!ok){GLint n=0;glGetProgramiv(p,GL_INFO_LOG_LENGTH,&n);std::vector<char>log((size_t)std::max(n,1));glGetProgramInfoLog(p,n,nullptr,log.data());if(error)*error=log.data();glDeleteProgram(p);return 0;}return p;
 }
 
 class Iris26571GpuPublisher {
 public:
     ~Iris26571GpuPublisher(){destroy();}
-    bool init(const Params&p,const SrgbLut&lut,const Watermark&water,bool bGpuOwner26876,
-              int outW,int outH,int bandRows,bool useExplicitFenceSync,std::string*reason){
-        params=&p;bOwner26876=bGpuOwner26876;outWidth=outW;outHeight=outH;maxBandRows=bandRows;explicitFenceSync=useExplicitFenceSync;
+    bool init(const Params&p,const SrgbLut&lut,int outW,int outH,int bandRows,bool useExplicitFenceSync,std::string*reason){
+        params=&p;outWidth=outW;outHeight=outH;maxBandRows=bandRows;explicitFenceSync=useExplicitFenceSync;
         display=eglGetDisplay(EGL_DEFAULT_DISPLAY);if(display==EGL_NO_DISPLAY){set(reason,"eglGetDisplay");return false;}
         EGLint maj=0,min=0;if(!eglInitialize(display,&maj,&min)){set(reason,"eglInitialize");return false;}
         if(!eglBindAPI(EGL_OPENGL_ES_API)){set(reason,"eglBindAPI");return false;}
@@ -1785,7 +1352,7 @@ public:
         GLint major=0,minor=0,maxTex=0;glGetIntegerv(GL_MAJOR_VERSION,&major);glGetIntegerv(GL_MINOR_VERSION,&minor);glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maxTex);
         if(major<3||(major==3&&minor<1)){set(reason,"OpenGL ES < 3.1");return false;}
         if(maxTex<std::max(outWidth,std::max(p.trueW,p.trueH))){set(reason,"GL_MAX_TEXTURE_SIZE");return false;}
-        std::string compileError;program=iris26571Program(&compileError,bOwner26876);if(!program){set(reason,("compute:"+compileError).c_str());return false;}
+        std::string compileError;program=iris26571Program(&compileError);if(!program){set(reason,("compute:"+compileError).c_str());return false;}
         glGenTextures(1,&sourceTex);glBindTexture(GL_TEXTURE_2D,sourceTex);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
         if(p.motionHdrHandoff&&p.localToneLogMap&&p.localToneLogW>0&&p.localToneLogH>0){
             glGenTextures(1,&localToneLogTex);glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,localToneLogTex);
@@ -1799,40 +1366,9 @@ public:
         glGenFramebuffers(1,&fbo);glBindFramebuffer(GL_FRAMEBUFFER,fbo);glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,outputTex,0);if(glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE){set(reason,"RGBA8UI framebuffer");return false;}
         glGenBuffers(1,&lutSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,lutSsbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(lut.v.size()*sizeof(float)),lut.v.data(),GL_STATIC_DRAW);
         if(p.acr3Curve.size()!=1025u){set(reason,"ACR3 size");return false;}glGenBuffers(1,&acr3Ssbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,acr3Ssbo);glBufferData(GL_SHADER_STORAGE_BUFFER,(GLsizeiptr)(p.acr3Curve.size()*sizeof(float)),p.acr3Curve.data(),GL_STATIC_DRAW);
-
-        if(bOwner26876){
-            // Validated immutable B DCP maps; one compact SSBO per original
-            // Lightroom/Adobe domain. No 50MP or per-frame CPU allocation.
-            const float empty[3]={0.f,1.f,1.f};
-            glGenBuffers(1,&firstDcpSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,firstDcpSsbo);
-            glBufferData(GL_SHADER_STORAGE_BUFFER,
-                (GLsizeiptr)(p.dcpHueSatMap.empty()?sizeof(empty):p.dcpHueSatMap.size()*sizeof(float)),
-                p.dcpHueSatMap.empty()?empty:p.dcpHueSatMap.data(),GL_STATIC_DRAW);
-            glGenBuffers(1,&secondDcpSsbo);glBindBuffer(GL_SHADER_STORAGE_BUFFER,secondDcpSsbo);
-            glBufferData(GL_SHADER_STORAGE_BUFFER,
-                (GLsizeiptr)(p.dcpLookMap.empty()?sizeof(empty):p.dcpLookMap.size()*sizeof(float)),
-                p.dcpLookMap.empty()?empty:p.dcpLookMap.data(),GL_STATIC_DRAW);
-            if(water.enabled()){
-                glGenTextures(1,&watermarkTex);glActiveTexture(GL_TEXTURE2);
-                glBindTexture(GL_TEXTURE_2D,watermarkTex);
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
-                glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
-                glPixelStorei(GL_UNPACK_ALIGNMENT,1);
-                glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,water.w,water.h,0,GL_RGBA,
-                    GL_UNSIGNED_BYTE,water.rgba.data());
-                glActiveTexture(GL_TEXTURE0);
-            }
-            useWatermark26876=water.enabled();watermarkWidth26876=water.w;
-            watermarkHeight26876=water.h;
-        }
         const size_t maxBytes=(size_t)outWidth*maxBandRows*4;glGenBuffers(2,pbo);for(int i=0;i<2;i++){glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[i]);glBufferData(GL_PIXEL_PACK_BUFFER,(GLsizeiptr)maxBytes,nullptr,GL_STREAM_READ);}
         glBindBuffer(GL_PIXEL_PACK_BUFFER,0);GLenum err=glGetError();if(err!=GL_NO_ERROR){set(reason,"GL allocation");return false;}
-        glUseProgram(program);glUniform1i(loc("uSource"),0);
-        glUniform1i(loc("uLocalToneLogMap"),1);
-        if(bOwner26876)glUniform1i(loc("uBWatermark"),2);
-        setParams();return true;
+        glUseProgram(program);glUniform1i(loc("uSource"),0);glUniform1i(loc("uLocalToneLogMap"),1);setParams();return true;
     }
     bool renderReadback(int fd,float gainMax,float gainContentMax,bool generateGain,int top,int h,int slot,Iris26571ReadyBand*out,Iris26571GpuTiming*timing,std::string*reason){
         if(!params||slot<0||slot>1){set(reason,"render_invalid_state");return false;}
@@ -1841,11 +1377,7 @@ public:
         if(src.w>sourceAllocW||src.h>sourceAllocH){sourceAllocW=std::max(sourceAllocW,src.w);sourceAllocH=std::max(sourceAllocH,src.h);glTexImage2D(GL_TEXTURE_2D,0,GL_RGB16F,sourceAllocW,sourceAllocH,0,GL_RGB,GL_HALF_FLOAT,nullptr);}
         glTexSubImage2D(GL_TEXTURE_2D,0,0,0,src.w,src.h,GL_RGB,GL_HALF_FLOAT,src.rgb.data());
         glUseProgram(program);glUniform2i(loc("uSrcOrigin"),src.x0,src.y0);glUniform2i(loc("uSrcSize"),src.w,src.h);glUniform1i(loc("uBandTop"),top);glUniform1i(loc("uBandH"),h);glUniform1i(loc("uGenerateGain"),generateGain?1:0);glUniform1f(loc("uGainMax"),gainMax);glUniform1f(loc("uGainContentMax"),gainContentMax);
-        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,lutSsbo);glBindBufferBase(GL_SHADER_STORAGE_BUFFER,2,acr3Ssbo);if(bOwner26876){
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER,3,firstDcpSsbo);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER,4,secondDcpSsbo);
-            if(watermarkTex){glActiveTexture(GL_TEXTURE2);glBindTexture(GL_TEXTURE_2D,watermarkTex);glActiveTexture(GL_TEXTURE0);}
-        }glBindImageTexture(0,outputTex,0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8UI);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,1,lutSsbo);glBindBufferBase(GL_SHADER_STORAGE_BUFFER,2,acr3Ssbo);glBindImageTexture(0,outputTex,0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8UI);
         glDispatchCompute((GLuint)((outWidth+15)/16),(GLuint)((h+7)/8),1);glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT|GL_FRAMEBUFFER_BARRIER_BIT);
         glBindFramebuffer(GL_FRAMEBUFFER,fbo);glReadBuffer(GL_COLOR_ATTACHMENT0);glPixelStorei(GL_PACK_ALIGNMENT,1);glBindBuffer(GL_PIXEL_PACK_BUFFER,pbo[slot]);glReadPixels(0,0,outWidth,h,GL_RGBA_INTEGER,GL_UNSIGNED_BYTE,(void*)0);
         if(fence[slot]){glDeleteSync(fence[slot]);fence[slot]=0;}if(explicitFenceSync)fence[slot]=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);glFlush();auto ue=std::chrono::steady_clock::now();if(timing)timing->uploadDispatchNs+=iris26569Ns(us,ue);
@@ -1862,11 +1394,7 @@ public:
     }
 private:
     EGLDisplay display=EGL_NO_DISPLAY;EGLConfig config=nullptr;EGLSurface surface=EGL_NO_SURFACE;EGLContext context=EGL_NO_CONTEXT;
-    GLuint program=0,sourceTex=0,localToneLogTex=0,outputTex=0,fbo=0,lutSsbo=0,acr3Ssbo=0;
-    GLuint firstDcpSsbo=0,secondDcpSsbo=0,watermarkTex=0;
-    bool bOwner26876=false,useWatermark26876=false;
-    int watermarkWidth26876=0,watermarkHeight26876=0;
-    GLuint pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
+    GLuint program=0,sourceTex=0,localToneLogTex=0,outputTex=0,fbo=0,lutSsbo=0,acr3Ssbo=0,pbo[2]{0,0};GLsync fence[2]{0,0};int pendingTop[2]{0,0},pendingH[2]{0,0};int sourceAllocW=0,sourceAllocH=0,outWidth=0,outHeight=0,maxBandRows=0;bool explicitFenceSync=true;const Params*params=nullptr;
     GLint loc(const char*n){return glGetUniformLocation(program,n);}
     static void set(std::string*r,const char*m){if(r)*r=m?m:"unknown";}
     static void setGl(std::string*r,const char*stage,GLenum err){if(!r)return;char b[96];std::snprintf(b,sizeof(b),"%s_gl_error_0x%04x",stage?stage:"gl",(unsigned int)err);*r=b;}
@@ -1874,24 +1402,16 @@ private:
         glUseProgram(program);glUniform2i(loc("uTrueSize"),params->trueW,params->trueH);glUniform2i(loc("uOutputSize"),outWidth,outHeight);glUniform2i(loc("uRawSize"),params->rawW,params->rawH);glUniform2i(loc("uCropSize"),params->cropW,params->cropH);glUniform1i(loc("uRotation"),params->rotation);glUniform1i(loc("uMirror"),params->mirror?1:0);glUniform1f(loc("uResidualZoom"),params->residualZoom);glUniform1f(loc("uDisplayGain"),params->displayGain);glUniform1f(loc("uExposureEv"),params->exposureEv);glUniform1f(loc("uShadows"),params->shadows);glUniform1f(loc("uContrast"),params->contrast);glUniform1f(loc("uSaturation"),params->saturation);glUniform1f(loc("uSceneWhite"),params->sceneWhite);glUniform1f(loc("uBodyToneStrength"),params->bodyToneStrength);glUniform1i(loc("uMotionHdrHandoff"),params->motionHdrHandoff?1:0);glUniform1i(loc("uAcr3Enabled"),params->acr3Enabled?1:0);glUniform1i(loc("uLocalToneLogEnabled"),(params->motionHdrHandoff&&params->localToneLogMap&&params->localToneLogW>0&&params->localToneLogH>0&&params->localToneLogSourceW>0&&params->localToneLogSourceH>0)?1:0);glUniform2i(loc("uLocalToneLogSize"),params->localToneLogW,params->localToneLogH);glUniform2i(loc("uLocalToneLogSourceSize"),params->localToneLogSourceW,params->localToneLogSourceH);
         glUniform3f(loc("uSensorRow0"),params->sensorToProfile[0],params->sensorToProfile[1],params->sensorToProfile[2]);glUniform3f(loc("uSensorRow1"),params->sensorToProfile[3],params->sensorToProfile[4],params->sensorToProfile[5]);glUniform3f(loc("uSensorRow2"),params->sensorToProfile[6],params->sensorToProfile[7],params->sensorToProfile[8]);
         glUniform3f(loc("uDisplayRow0"),params->profileToDisplay[0],params->profileToDisplay[1],params->profileToDisplay[2]);glUniform3f(loc("uDisplayRow1"),params->profileToDisplay[3],params->profileToDisplay[4],params->profileToDisplay[5]);glUniform3f(loc("uDisplayRow2"),params->profileToDisplay[6],params->profileToDisplay[7],params->profileToDisplay[8]);
-        if(bOwner26876){
-            glUniform3i(loc("uBFirstDcpDims"),params->dcpHueDivisions,params->dcpSatDivisions,params->dcpValueDivisions);
-            glUniform3i(loc("uBSecondDcpDims"),params->lookHueDivisions,params->lookSatDivisions,params->lookValueDivisions);
-            glUniform1i(loc("uBWatermarkEnabled"),useWatermark26876?1:0);
-            glUniform2f(loc("uBWatermarkAspect"),(float)watermarkWidth26876,(float)watermarkHeight26876);
-        }
     }
     void destroy(){
         if(display!=EGL_NO_DISPLAY&&context!=EGL_NO_CONTEXT&&surface!=EGL_NO_SURFACE)eglMakeCurrent(display,surface,surface,context);
-        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(firstDcpSsbo)glDeleteBuffers(1,&firstDcpSsbo);
-        if(secondDcpSsbo)glDeleteBuffers(1,&secondDcpSsbo);
-        if(acr3Ssbo)glDeleteBuffers(1,&acr3Ssbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(watermarkTex)glDeleteTextures(1,&watermarkTex);if(localToneLogTex)glDeleteTextures(1,&localToneLogTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
+        for(int i=0;i<2;i++)if(fence[i]){glDeleteSync(fence[i]);fence[i]=0;}if(pbo[0]||pbo[1])glDeleteBuffers(2,pbo);if(acr3Ssbo)glDeleteBuffers(1,&acr3Ssbo);if(lutSsbo)glDeleteBuffers(1,&lutSsbo);if(fbo)glDeleteFramebuffers(1,&fbo);if(outputTex)glDeleteTextures(1,&outputTex);if(localToneLogTex)glDeleteTextures(1,&localToneLogTex);if(sourceTex)glDeleteTextures(1,&sourceTex);if(program)glDeleteProgram(program);
         if(display!=EGL_NO_DISPLAY){eglMakeCurrent(display,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(context!=EGL_NO_CONTEXT)eglDestroyContext(display,context);if(surface!=EGL_NO_SURFACE)eglDestroySurface(display,surface);eglTerminate(display);}
-        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=localToneLogTex=outputTex=fbo=lutSsbo=acr3Ssbo=0;firstDcpSsbo=secondDcpSsbo=watermarkTex=0;pbo[0]=pbo[1]=0;
+        display=EGL_NO_DISPLAY;surface=EGL_NO_SURFACE;context=EGL_NO_CONTEXT;program=sourceTex=localToneLogTex=outputTex=fbo=lutSsbo=acr3Ssbo=0;pbo[0]=pbo[1]=0;
     }
 };
 
-inline bool iris26571EncodeGpuPublication(int sourceFd,float gainMax,float gainContentMax,const Params&p,const SrgbLut&lut,const Watermark&water,bool bGpuOwner26876,int outW,int outH,int bandRows,bool generateGain,const char*basePath,const char*gainPath,int quality,bool useExplicitFenceSync,Iris26571GpuTiming*gpuTiming,uint64_t*baseJpegNs,uint64_t*gainJpegNs,std::string*reason){
+inline bool iris26571EncodeGpuPublication(int sourceFd,float gainMax,float gainContentMax,const Params&p,const SrgbLut&lut,int outW,int outH,int bandRows,bool generateGain,const char*basePath,const char*gainPath,int quality,bool useExplicitFenceSync,Iris26571GpuTiming*gpuTiming,uint64_t*baseJpegNs,uint64_t*gainJpegNs,std::string*reason){
     /* IRIS_26579_GPU_DIRECT_INTERMEDIATE_PUBLICATION
      * basePath is the Java-authorized JPEG target (hidden base intermediate when JPEG_R is active,
      * final SDR target otherwise); gainPath is the Java-owned gain intermediate. Open them before
@@ -1908,7 +1428,7 @@ inline bool iris26571EncodeGpuPublication(int sourceFd,float gainMax,float gainC
     FILE*gainOut=nullptr;if(generateGain){gainOut=fopen(gainPath,"wb");if(!gainOut){setErrnoReason("open_gain");fclose(baseOut);unlink(basePath);return false;}}
     Iris26571BandQueue queue;auto producerStart=std::chrono::steady_clock::now();
     std::thread producer([&](){
-        Iris26571GpuPublisher gpu;std::string why;if(!gpu.init(p,lut,water,bGpuOwner26876,outW,outH,bandRows,useExplicitFenceSync,&why)){queue.finish(false,why.c_str());return;}
+        Iris26571GpuPublisher gpu;std::string why;if(!gpu.init(p,lut,outW,outH,bandRows,useExplicitFenceSync,&why)){queue.finish(false,why.c_str());return;}
         int bandIndex=0;bool ok=true;for(int top=0;top<outH&&ok;top+=bandRows,bandIndex++){
             int h=std::min(bandRows,outH-top),slot=bandIndex&1;if(bandIndex>=2){Iris26571ReadyBand ready;if(!gpu.resolve(slot,generateGain,&ready,gpuTiming,&why)){ok=false;break;}if(!queue.push(std::move(ready))){ok=false;why="queue_cancelled";break;}}
             if(!gpu.renderReadback(sourceFd,gainMax,gainContentMax,generateGain,top,h,slot,nullptr,gpuTiming,&why)){ok=false;break;}
@@ -2013,13 +1533,11 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
      * bounded PBOs while allowing glMapBufferRange itself to synchronize, matching the proven Sabre
      * PBO behavior on-device. CPU remains the final exact 26570 fallback.
      */
-    const bool iris26876BSource=std::strstr(rp.c,"/iris26864_b_wronski_")!=nullptr;
-    const bool gpuEligible=motionFast&&(iris26876BSource||
-        (!water.enabled()&&p.dcpHueSatMap.empty()&&p.dcpLookMap.empty()));bool gpuEncoded=false;bool gpuCompatUsed=false;Iris26571GpuTiming gpuTiming{},gpuCompatTiming{};uint64_t gpuBaseJpegNs=0,gpuGainJpegNs=0,gpuCompatBaseJpegNs=0,gpuCompatGainJpegNs=0,gpuCompatTotalNs=0;std::string gpuReason,gpuCompatReason;
+    bool gpuEligible=motionFast&&!water.enabled()&&p.dcpHueSatMap.empty()&&p.dcpLookMap.empty();bool gpuEncoded=false;bool gpuCompatUsed=false;Iris26571GpuTiming gpuTiming{},gpuCompatTiming{};uint64_t gpuBaseJpegNs=0,gpuGainJpegNs=0,gpuCompatBaseJpegNs=0,gpuCompatGainJpegNs=0,gpuCompatTotalNs=0;std::string gpuReason,gpuCompatReason;
     unlink(op.c);if(generateGain)unlink(gp.c);auto gpuStart=std::chrono::steady_clock::now();
-    if(gpuEligible)gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,gainContentMax,p,lut,water,iris26876BSource,outW,outH,bandRows,generateGain,op.c,generateGain?gp.c:nullptr,(int)quality,true,&gpuTiming,&gpuBaseJpegNs,&gpuGainJpegNs,&gpuReason);
+    if(gpuEligible)gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,gainContentMax,p,lut,outW,outH,bandRows,generateGain,op.c,generateGain?gp.c:nullptr,(int)quality,true,&gpuTiming,&gpuBaseJpegNs,&gpuGainJpegNs,&gpuReason);
     auto gpuEnd=std::chrono::steady_clock::now();uint64_t gpuTotalNs=iris26569Ns(gpuStart,gpuEnd);
-    if(gpuEligible&&!gpuEncoded){unlink(op.c);if(generateGain)unlink(gp.c);auto compatStart=std::chrono::steady_clock::now();gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,gainContentMax,p,lut,water,iris26876BSource,outW,outH,bandRows,generateGain,op.c,generateGain?gp.c:nullptr,(int)quality,false,&gpuCompatTiming,&gpuCompatBaseJpegNs,&gpuCompatGainJpegNs,&gpuCompatReason);auto compatEnd=std::chrono::steady_clock::now();gpuCompatTotalNs=iris26569Ns(compatStart,compatEnd);gpuCompatUsed=gpuEncoded;__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26579_TRUE2X_GPU_COMPAT_RESULT asyncReason=%s asyncMs=%.3f compatUsed=%d compatReason=%s compatMs=%.3f",gpuReason.empty()?"missing_reason":gpuReason.c_str(),(double)gpuTotalNs/1000000.0,gpuCompatUsed?1:0,gpuCompatReason.empty()?(gpuCompatUsed?"none":"missing_reason"):gpuCompatReason.c_str(),(double)gpuCompatTotalNs/1000000.0);}
+    if(gpuEligible&&!gpuEncoded){unlink(op.c);if(generateGain)unlink(gp.c);auto compatStart=std::chrono::steady_clock::now();gpuEncoded=iris26571EncodeGpuPublication(sourceFd,(float)gainMaxRatio,gainContentMax,p,lut,outW,outH,bandRows,generateGain,op.c,generateGain?gp.c:nullptr,(int)quality,false,&gpuCompatTiming,&gpuCompatBaseJpegNs,&gpuCompatGainJpegNs,&gpuCompatReason);auto compatEnd=std::chrono::steady_clock::now();gpuCompatTotalNs=iris26569Ns(compatStart,compatEnd);gpuCompatUsed=gpuEncoded;__android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26579_TRUE2X_GPU_COMPAT_RESULT asyncReason=%s asyncMs=%.3f compatUsed=%d compatReason=%s compatMs=%.3f",gpuReason.empty()?"missing_reason":gpuReason.c_str(),(double)gpuTotalNs/1000000.0,gpuCompatUsed?1:0,gpuCompatReason.empty()?(gpuCompatUsed?"none":"missing_reason"):gpuCompatReason.c_str(),(double)gpuCompatTotalNs/1000000.0);}
     if(gpuEncoded){
         close(sourceFd);const Iris26571GpuTiming&usedTiming=gpuCompatUsed?gpuCompatTiming:gpuTiming;uint64_t usedBaseJpegNs=gpuCompatUsed?gpuCompatBaseJpegNs:gpuBaseJpegNs,usedGainJpegNs=gpuCompatUsed?gpuCompatGainJpegNs:gpuGainJpegNs,usedTotalNs=gpuCompatUsed?gpuCompatTotalNs:gpuTotalNs;
         iris26576SetPublicationTelemetry("backend=GPU gpuEligible=1 gpuUsed=1 gpuMode=%s asyncAttemptMs=%.3f asyncFailureReason=%s sourceReadMs=%.3f uploadDispatchMs=%.3f readbackWaitMs=%.3f deinterleaveMs=%.3f producerMs=%.3f baseJpegMs=%.3f gainJpegMs=%.3f totalMs=%.3f bandRows=%d pboSlots=2 gain1to1=%d",gpuCompatUsed?"MAP_SYNC_COMPAT":"ASYNC_FENCE",(double)gpuTotalNs/1000000.0,gpuCompatUsed?(gpuReason.empty()?"missing_reason":gpuReason.c_str()):"none",(double)usedTiming.sourceReadNs/1000000.0,(double)usedTiming.uploadDispatchNs/1000000.0,(double)usedTiming.readbackWaitNs/1000000.0,(double)usedTiming.deinterleaveNs/1000000.0,(double)usedTiming.producerNs/1000000.0,(double)usedBaseJpegNs/1000000.0,(double)usedGainJpegNs/1000000.0,(double)usedTotalNs/1000000.0,bandRows,generateGain?1:0);
@@ -2857,4 +2375,270 @@ Java_com_particlesdevs_photoncamera_processing_processor_MotionV2ProtectedChroma
     e->ReleaseByteArrayElements(codesArray,codes,0);
     e->ReleaseDoubleArrayElements(metricsArray,metrics,0);
     return JNI_TRUE;
+}
+
+/* IRIS_26876_B_WRONSKI_EXACT_2X_AHB_DIRECT_RENDER
+ * Requires the existing real Vulkan->GLES signaled fence, post-AMaZE B-only
+ * sensor-neutral RGB (LONG only luminance) and the independent ORIGINAL 2x
+ * sensor clip R16F. No CPU/full-size RGB16F disk carrier is generated.
+ * The EGLImage is the ONE output surface; avoid allocating an additional
+ * 50MP intermediate for clipping transport. Never borrowed by A/NIGHT/DNG.
+ */
+namespace {
+constexpr const char* kIris26876BPackVertex=R"IRIS26876(#version 310 es
+precision highp float;
+void main(){
+ vec2 p=vec2(float((gl_VertexID<<1)&2),float(gl_VertexID&2));
+ gl_Position=vec4(p*2.0-1.0,0.0,1.0);
+}
+)IRIS26876";
+constexpr const char* kIris26876BPackFrag=R"IRIS26876(#version 310 es
+precision highp float;
+precision highp int;
+uniform highp sampler2D uBLinearRgb;
+uniform highp sampler2D uBExactSensorClip;
+uniform ivec2 uSize;
+uniform int uRequireOriginal2xBinary;
+layout(std430,binding=4) buffer Iris26876B2xFault { uint invalidCount; };
+layout(location=0) out vec4 oB2x;
+void main(){
+    ivec2 p=ivec2(gl_FragCoord.xy);
+    if(any(greaterThanEqual(p,uSize))){oB2x=vec4(0.0);return;}
+    vec3 rgb=texelFetch(uBLinearRgb,p,0).rgb;
+    float clip=texelFetch(uBExactSensorClip,p,0).r;
+    if(any(isnan(rgb))||any(isinf(rgb))||isnan(clip)||isinf(clip)||
+        clip<0.0||clip>1.0||
+        (uRequireOriginal2xBinary!=0 && !(clip==0.0||clip==1.0))){
+        atomicAdd(invalidCount,1u);oB2x=vec4(0.0);return;
+    }
+    oB2x=vec4(rgb,clip);
+}
+)IRIS26876";
+
+GLuint iris26876CompileSimple(GLenum kind,const char*src){
+    GLuint sh=glCreateShader(kind);
+    if(!sh)return 0;
+    glShaderSource(sh,1,&src,nullptr);glCompileShader(sh);
+    GLint compiled=0;glGetShaderiv(sh,GL_COMPILE_STATUS,&compiled);
+    if(!compiled){
+        char log[1024]{};glGetShaderInfoLog(sh,sizeof(log),nullptr,log);
+        __android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26876_B_AHB_SHADER_FAIL %s",log);
+        glDeleteShader(sh);return 0;
+    }
+    return sh;
+}
+
+bool iris26876PackRgbClipIntoAhb(JNIEnv*env,jobject target,GLuint rgb,GLuint clip,
+                                 int w,int h,bool strict2x){
+    if(!target||!rgb||!clip||w<2||h<2||w>8192||h>8192||
+        uint64_t(w)*h>uint64_t(8192)*8192||eglGetCurrentContext()==EGL_NO_CONTEXT)
+        return false;
+    GLenum pre=glGetError();
+    if(pre!=GL_NO_ERROR)return false; // inherited GL error is a hard blocker
+    GLint maxTexture=0,major=0,minor=0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maxTexture);
+    glGetIntegerv(GL_MAJOR_VERSION,&major);glGetIntegerv(GL_MINOR_VERSION,&minor);
+    if(maxTexture<std::max(w,h)||major<3||(major==3&&minor<1))return false;
+    GLint priorProgram=0,priorReadFbo=0,priorDrawFbo=0,priorVao=0;
+    GLint priorActiveTexture=0,priorUnit0=0,priorUnit1=0,priorTex2D=0;
+    GLint priorSsbo=0,priorSsbo4=0,priorViewport[4]{0,0,0,0};
+    GLboolean priorMask[4]{GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE};
+    glGetIntegerv(GL_CURRENT_PROGRAM,&priorProgram);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&priorReadFbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&priorDrawFbo);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING,&priorVao);
+    glGetIntegerv(GL_ACTIVE_TEXTURE,&priorActiveTexture);
+    glActiveTexture(GL_TEXTURE0);glGetIntegerv(GL_TEXTURE_BINDING_2D,&priorUnit0);
+    glActiveTexture(GL_TEXTURE1);glGetIntegerv(GL_TEXTURE_BINDING_2D,&priorUnit1);
+    glActiveTexture(GL_TEXTURE2);glGetIntegerv(GL_TEXTURE_BINDING_2D,&priorTex2D);
+    glGetIntegerv(GL_SHADER_STORAGE_BUFFER_BINDING,&priorSsbo);
+    glGetIntegeri_v(GL_SHADER_STORAGE_BUFFER_BINDING,4,&priorSsbo4);
+    glGetIntegerv(GL_VIEWPORT,priorViewport);
+    glGetBooleanv(GL_COLOR_WRITEMASK,priorMask);
+    const GLboolean blend=glIsEnabled(GL_BLEND),depth=glIsEnabled(GL_DEPTH_TEST),
+        stencil=glIsEnabled(GL_STENCIL_TEST),scissor=glIsEnabled(GL_SCISSOR_TEST),
+        cull=glIsEnabled(GL_CULL_FACE),raster=glIsEnabled(GL_RASTERIZER_DISCARD);
+    GLuint eglTexture=0,fb=0,vtx=0,frag=0,program=0,vao=0,errors=0;
+    EGLImageKHR eglImage=EGL_NO_IMAGE_KHR;
+    bool ok=false;
+    do {
+        glActiveTexture(GL_TEXTURE2);glGenTextures(1,&eglTexture);
+        if(!eglTexture||!iris26826BindHardwareBufferTexture(env,target,w,h,eglTexture,&eglImage))break;
+        glGenFramebuffers(1,&fb);if(!fb)break;
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,fb);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,eglTexture,0);
+        if(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE)break;
+        vtx=iris26876CompileSimple(GL_VERTEX_SHADER,kIris26876BPackVertex);
+        frag=iris26876CompileSimple(GL_FRAGMENT_SHADER,kIris26876BPackFrag);
+        if(!vtx||!frag)break;
+        program=glCreateProgram();if(!program)break;
+        glAttachShader(program,vtx);glAttachShader(program,frag);glLinkProgram(program);
+        GLint linked=0;glGetProgramiv(program,GL_LINK_STATUS,&linked);
+        if(!linked)break;
+        uint32_t zero=0;
+        glGenBuffers(1,&errors);if(!errors)break;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER,errors);
+        glBufferData(GL_SHADER_STORAGE_BUFFER,sizeof(zero),&zero,GL_DYNAMIC_READ);
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER,4,errors);
+        glGenVertexArrays(1,&vao);if(!vao)break;
+        glBindVertexArray(vao);
+        glDisable(GL_BLEND);glDisable(GL_DEPTH_TEST);glDisable(GL_STENCIL_TEST);
+        glDisable(GL_SCISSOR_TEST);glDisable(GL_CULL_FACE);glDisable(GL_RASTERIZER_DISCARD);
+        glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        glViewport(0,0,w,h);
+        glUseProgram(program);
+        glUniform1i(glGetUniformLocation(program,"uBLinearRgb"),0);
+        glUniform1i(glGetUniformLocation(program,"uBExactSensorClip"),1);
+        glUniform2i(glGetUniformLocation(program,"uSize"),w,h);
+        glUniform1i(glGetUniformLocation(program,"uRequireOriginal2xBinary"),strict2x?1:0);
+        glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,rgb);
+        glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,clip);
+        glDrawArrays(GL_TRIANGLES,0,3);
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT|GL_BUFFER_UPDATE_BARRIER_BIT|
+                        GL_FRAMEBUFFER_BARRIER_BIT);
+        glFinish();
+        if(glGetError()!=GL_NO_ERROR)break;
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER,errors);
+        auto*mapped=static_cast<uint32_t*>(glMapBufferRange(GL_SHADER_STORAGE_BUFFER,0,4,GL_MAP_READ_BIT));
+        if(!mapped)break;
+        const uint32_t faults=*mapped;
+        const GLboolean unmapped=glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+        if(faults||!unmapped||glGetError()!=GL_NO_ERROR){
+            __android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26876_B_AHB_INVALID_PIXELS count=%u",faults);
+            break;
+        }
+        ok=true;
+    } while(false);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)priorReadFbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,(GLuint)priorDrawFbo);
+    glBindVertexArray((GLuint)priorVao);
+    glUseProgram((GLuint)priorProgram);
+    glActiveTexture(GL_TEXTURE0);glBindTexture(GL_TEXTURE_2D,(GLuint)priorUnit0);
+    glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D,(GLuint)priorUnit1);
+    glActiveTexture(GL_TEXTURE2);glBindTexture(GL_TEXTURE_2D,(GLuint)priorTex2D);
+    glActiveTexture((GLenum)priorActiveTexture);
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER,4,(GLuint)priorSsbo4);
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER,(GLuint)priorSsbo);
+    glViewport(priorViewport[0],priorViewport[1],priorViewport[2],priorViewport[3]);
+    glColorMask(priorMask[0],priorMask[1],priorMask[2],priorMask[3]);
+    auto restore=[](GLenum what,GLboolean enabled){if(enabled)glEnable(what);else glDisable(what);};
+    restore(GL_BLEND,blend);restore(GL_DEPTH_TEST,depth);restore(GL_STENCIL_TEST,stencil);
+    restore(GL_SCISSOR_TEST,scissor);restore(GL_CULL_FACE,cull);restore(GL_RASTERIZER_DISCARD,raster);
+    if(vao)glDeleteVertexArrays(1,&vao);
+    if(errors)glDeleteBuffers(1,&errors);
+    if(program)glDeleteProgram(program);
+    if(frag)glDeleteShader(frag);
+    if(vtx)glDeleteShader(vtx);
+    if(fb)glDeleteFramebuffers(1,&fb);
+    if(eglTexture)glDeleteTextures(1,&eglTexture);
+    if(eglImage!=EGL_NO_IMAGE_KHR){
+        auto destroy=iris26826EglProc<PFNEGLDESTROYIMAGEKHRPROC>("eglDestroyImageKHR");
+        if(!destroy||!destroy(eglGetCurrentDisplay(),eglImage))ok=false;
+    }
+    if(glGetError()!=GL_NO_ERROR)ok=false;
+    __android_log_print(ok?ANDROID_LOG_INFO:ANDROID_LOG_ERROR,TAG,
+        "IRIS_26876_B_AHB_EXACT_CLIP_GPU_RENDER ok=%d w=%d h=%d noDiskOrCpuFallback=1",
+        (int)ok,w,h);
+    return ok;
+}
+}
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_particlesdevs_photoncamera_processing_processor_MotionV2SharedRgba16fCarrier_packWronskiRgbAndClipNative26876(
+    JNIEnv*env,jclass,jobject buffer,jint rgbTexture,jint clipTexture,
+    jint width,jint height,jboolean original2xBinary){
+    return iris26876PackRgbClipIntoAhb(env,buffer,(GLuint)rgbTexture,(GLuint)clipTexture,
+                                       width,height,original2xBinary==JNI_TRUE)?JNI_TRUE:JNI_FALSE;
+}
+
+/* IRIS_26876_B_GL_AHB_CROSS_CONTEXT_IMPORT
+ * Native EGLImage handles are deliberately opaque and short-lived. The Java
+ * caller holds each HardwareBuffer across its binding; handles cannot outlive
+ * the current EGL context/display or migrate to another GL thread.
+ */
+namespace {
+struct Iris26876BImportedAhb {
+    EGLDisplay display=EGL_NO_DISPLAY;
+    EGLImageKHR image=EGL_NO_IMAGE_KHR;
+    GLuint texture=0;
+};
+void iris26876ReleaseImportedAhb(Iris26876BImportedAhb *entry){
+    if(!entry)return;
+    if(entry->display==eglGetCurrentDisplay()&&
+       eglGetCurrentContext()!=EGL_NO_CONTEXT){
+        if(entry->texture)glDeleteTextures(1,&entry->texture);
+        if(entry->image!=EGL_NO_IMAGE_KHR){
+            auto destroy=iris26826EglProc<PFNEGLDESTROYIMAGEKHRPROC>("eglDestroyImageKHR");
+            if(destroy)destroy(entry->display,entry->image);
+        }
+    } else {
+        __android_log_print(ANDROID_LOG_ERROR,TAG,
+          "IRIS_26876_B_EGL_OWNER_CONTEXT_LOST resource_release_unverified=1");
+    }
+    delete entry;
+}
+}
+extern "C" JNIEXPORT jlong JNICALL
+Java_com_particlesdevs_photoncamera_processing_ultrahdr_Iris26876BGlAhbBinding_bindNative(
+    JNIEnv *env,jclass,jobject hb,jint w,jint h,jboolean finalRgba8){
+    if(!hb||w<=0||h<=0||w>8192||h>8192||
+       eglGetCurrentDisplay()==EGL_NO_DISPLAY||eglGetCurrentContext()==EGL_NO_CONTEXT)
+       return 0;
+    AHardwareBuffer *native=AHardwareBuffer_fromHardwareBuffer(env,hb);
+    if(!native)return 0;
+    AHardwareBuffer_Desc desc{};AHardwareBuffer_describe(native,&desc);
+    const uint32_t format=finalRgba8==JNI_TRUE?
+        AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM:AHARDWAREBUFFER_FORMAT_R16G16B16A16_FLOAT;
+    if(desc.width!=(uint32_t)w||desc.height!=(uint32_t)h||
+       desc.layers!=1||desc.format!=format||
+       !(desc.usage&AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE)||
+       (finalRgba8==JNI_TRUE&&!(desc.usage&AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER)))
+       return 0;
+    if(glGetError()!=GL_NO_ERROR)return 0;
+    auto getClient=iris26826EglProc<PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC>(
+        "eglGetNativeClientBufferANDROID");
+    auto create=iris26826EglProc<PFNEGLCREATEIMAGEKHRPROC>("eglCreateImageKHR");
+    auto bind=iris26826EglProc<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
+        "glEGLImageTargetTexture2DOES");
+    if(!getClient||!create||!bind)return 0;
+    EGLClientBuffer client=getClient(native);if(!client)return 0;
+    const EGLint attrs[]={EGL_IMAGE_PRESERVED_KHR,EGL_TRUE,EGL_NONE};
+    auto *entry=new(std::nothrow) Iris26876BImportedAhb();
+    if(!entry)return 0;
+    entry->display=eglGetCurrentDisplay();
+    entry->image=create(entry->display,EGL_NO_CONTEXT,EGL_NATIVE_BUFFER_ANDROID,client,attrs);
+    GLint old=0,unit=0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE,&unit);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D,&old);
+    bool ok=entry->image!=EGL_NO_IMAGE_KHR;
+    if(ok){
+        glGenTextures(1,&entry->texture);
+        ok=entry->texture!=0;
+        if(ok){
+            glBindTexture(GL_TEXTURE_2D,entry->texture);
+            bind(GL_TEXTURE_2D,entry->image);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+            ok=glGetError()==GL_NO_ERROR;
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D,(GLuint)old);
+    glActiveTexture((GLenum)unit);
+    if(!ok){iris26876ReleaseImportedAhb(entry);return 0;}
+    return reinterpret_cast<jlong>(entry);
+}
+extern "C" JNIEXPORT jint JNICALL
+Java_com_particlesdevs_photoncamera_processing_ultrahdr_Iris26876BGlAhbBinding_textureNative(
+    JNIEnv*,jclass,jlong ptr){
+    if(!ptr||eglGetCurrentContext()==EGL_NO_CONTEXT)return 0;
+    auto *entry=reinterpret_cast<Iris26876BImportedAhb*>(ptr);
+    if(entry->display!=eglGetCurrentDisplay())return 0;
+    return (jint)entry->texture;
+}
+extern "C" JNIEXPORT void JNICALL
+Java_com_particlesdevs_photoncamera_processing_ultrahdr_Iris26876BGlAhbBinding_releaseNative(
+    JNIEnv*,jclass,jlong ptr){
+    if(ptr)iris26876ReleaseImportedAhb(reinterpret_cast<Iris26876BImportedAhb*>(ptr));
 }

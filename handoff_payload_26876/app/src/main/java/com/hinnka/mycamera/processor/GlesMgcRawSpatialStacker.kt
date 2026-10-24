@@ -2245,7 +2245,9 @@ internal class GlesMgcRawSpatialStacker(
     private fun processIris26868DirectB(frames: List<RawStackFrame>): RawStackResult? {
         require(processorPipeline == MgcRawProcessorPipeline.SABRE &&
             (!enableSabreSuperRes || iris26856BTrue2x) && !enableHighZoomDetail &&
-            iris26856RawrColor != null && iris26856AmazeCfaConsumer != null &&
+            iris26856RawrColor != null &&
+            (if (iris26856BTrue2x) iris26864NativeWronski2x != null
+             else iris26856AmazeCfaConsumer != null) &&
             gpuLinearRgbStorage == GpuLinearRgbStorage.RGBA16F &&
             exportGpuLinearRgbSource && useCurrentGlContext) {
             "26868 direct B requires the existing immutable native HDRq + B color contract"
@@ -2276,7 +2278,7 @@ internal class GlesMgcRawSpatialStacker(
         var nativeClip = 0
         var sensorNeutralB = 0
         var bridgeRgb = 0
-        var twoX: Iris26864Wronski2xPublication? = null
+        var twoX: com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier? = null
         var longGain26868 = 0
         var returned = false
         val oldPriority = GlesGpuScheduler.lowerCurrentThreadPriority("Iris26868DirectB")
@@ -2287,68 +2289,55 @@ internal class GlesMgcRawSpatialStacker(
             applyRawRenderState()
             val contract = checkNotNull(iris26856RawrColor).cloneForCapture()
             if (iris26856BTrue2x) {
-                /* IRIS_26876_B_ONE_WRONSKI_MERGE: true50MP source is now the
-                 * only NORMAL burst merge. The native 1x guide/clip are
-                 * derived from its already-corrected camera-linear RGB and
-                 * original physical 2x clipping texture, respectively.
-                 * The separate LONG remains a physical 1x luminance guide.
-                 * B Super Res OFF remains exact 26875 HDRq behavior. */
-                twoX = reconstructIris26864PinnedWronski2x(
+                /* IRIS_26876_SINGLE_WRONSKI_NO_HDRQ
+                 * The actual 2x Wronski NORMAL merge is the sole temporal
+                 * reconstruction. Produce the post-Lab/FCC 1x color and clip
+                 * guide by sampling its linear result, not a second HDRq merge.
+                 * The separate physical LONG is admitted once, as luminance.
+                 */
+                check(frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } <= 1) {
+                    "26876 B permits only one independently exposed LONG"
+                }
+                val owned = reconstructIris26876B2xGpu(
                     checkNotNull(iris26864NativeWronski2x), contract.cloneForCapture(),
-                    0, 0,
-                    selectedReference26876 = selectedReference,
-                    physicalLong26876 = frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG },
-                )
-                sensorNeutralB = checkNotNull(twoX).nativeGuide1x
-                nativeClip = checkNotNull(twoX).nativeClip1x
-                check(sensorNeutralB != 0 && nativeClip != 0) {
-                    "26876 Wronski derived native 1x RGB/sensor clip missing"
-                }
-                PLog.i(SABRE_TAG,"IRIS_26876_B_SINGLE_WRONSKI_NORMAL " +
-                    "merged=${normals.size} output50Mp=true hdrqPasses=0 " +
-                    "nativeGuide=WRONSKI_DOWNSAMPLE longLumaOnly=true")
+                    frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG },
+                    selectedReference)
+                twoX = owned.true2x
+                sensorNeutralB = owned.oneXSensorRgb
+                nativeClip = owned.oneXClip
             } else {
-            nativeRgb = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
-            nativeClip = checkNotNull(iris26856AmazeCfaConsumer)(
-                0, nativeRgb, width, height, cfaPattern, contract.amazeWhiteBalance.copyOf())
-            check(nativeClip > 0) {
-                "26868 actual native RAWR HDRq did not publish original sensor clipping"
-            }
-            sensorNeutralB = renderRawrBPostAmaze26856(
-                nativeRgb, contract, labDefringeStrength = 1f,
-                nativeSensorClipFullRes26866 = nativeClip,
-                bNoiseVariance26863 = 0, bNoiseSupport26863 = 0,
-                rawrNativeReceipt26864 = Iris26864NativeRawrDomainReceipt(true, true, true),
-            )
-            /* IRIS_26868_DIRECT_B_LONG_SINGLE_FRAME_AMAZE
-             * The separate physical LONG never enters pinned multi-frame
-             * frequency reconstruction, NORMAL noise support, or JPEG color.
-             * It can only provide locally vetted shadow luminance after its
-             * own physical CFA calibration and genuine AMaZE reconstruction.
-             */
-            frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG }?.let { long ->
-                check(frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } == 1) {
-                    "26868 direct B requires one immutable LONG, not a fake temporal burst"
+                nativeRgb = createTexture(width, height, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
+                nativeClip = checkNotNull(iris26856AmazeCfaConsumer)(
+                    0, nativeRgb, width, height, cfaPattern, contract.amazeWhiteBalance.copyOf())
+                check(nativeClip > 0) {
+                    "26868 actual native RAWR HDRq did not publish original sensor clipping"
                 }
-                /* A failed/unreliable auxiliary LONG must not invalidate
-                 * a successfully reconstructed complete NORMAL RAWR burst. */
-                longGain26868 = try {
-                    renderIris26868IndependentLongShadowGuide(
-                        long, selectedReference, sensorNeutralB,
-                    )
-                } catch (failure: Exception) {
-                    PLog.w(SABRE_TAG,"IRIS_26868_LONG_REJECTED_NORMAL_INTACT " +
-                        "reason=${failure.javaClass.simpleName} detail=${failure.message}")
-                    0
+                sensorNeutralB = renderRawrBPostAmaze26856(
+                    nativeRgb, contract, labDefringeStrength = 1f,
+                    nativeSensorClipFullRes26866 = nativeClip,
+                    bNoiseVariance26863 = 0, bNoiseSupport26863 = 0,
+                    rawrNativeReceipt26864 = Iris26864NativeRawrDomainReceipt(true, true, true),
+                )
+                frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG }?.let { long ->
+                    check(frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } == 1) {
+                        "26868 direct B requires one immutable LONG"
+                    }
+                    longGain26868 = try {
+                        renderIris26868IndependentLongShadowGuide(
+                            long, selectedReference, sensorNeutralB)
+                    } catch (failure: Exception) {
+                        PLog.w(SABRE_TAG,"IRIS_26868_LONG_REJECTED_NORMAL_INTACT " +
+                            "reason=${failure.javaClass.simpleName} detail=${failure.message}")
+                        0
+                    }
+                    if (longGain26868 != 0) {
+                        val applied=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+                        renderIris26856BVerifiedLongLuma(sensorNeutralB,longGain26868,
+                            applied,width,height,0,0,1)
+                        releaseOwnedTexture(sensorNeutralB,"26868 B NORMAL before trusted LONG")
+                        sensorNeutralB=applied
+                    }
                 }
-                if (longGain26868 != 0) {
-                    val longApplied = createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
-                    renderIris26856BVerifiedLongLuma(sensorNeutralB,longGain26868,
-                        longApplied,width,height,0,0,1)
-                    releaseOwnedTexture(sensorNeutralB,"26868 B NORMAL before trusted LONG luma")
-                    sensorNeutralB = longApplied
-                }
-            }
             }
             bridgeRgb = copyPersistentTexture(sensorNeutralB, width, height,
                 GLES30.GL_RGBA16F, GLES30.GL_NEAREST,
@@ -2369,44 +2358,48 @@ internal class GlesMgcRawSpatialStacker(
                     storage = GpuLinearRgbStorage.RGBA16F),
                 lensShadingCorrectionApplied = true,
                 mergedFrameCount = normals.size,
-                iris26856BTrue2xRgbPath = twoX?.rgb?.absolutePath,
-                iris26864BTrue2xClipBitsPath = twoX?.clipBits?.absolutePath,
+                iris26876B2xGpuPacked = twoX,
                 iris26856BTrue2xWidth = if (twoX != null) width * 2 else 0,
                 iris26856BTrue2xHeight = if (twoX != null) height * 2 else 0,
             )
-            check(textures.remove(bridgeRgb) && textures.remove(sensorNeutralB)) {
-                "26868 direct B transfer is not owned by GPU frame allocator"
+            /* IRIS_26876_B_GUIDE_TRANSFER_NO_DOUBLE_RELEASE
+             * Wronski's derived 1x RGB was detached from the temporary
+             * texture allocator before its 2x resources were released.
+             * HDRq's 1x source remains allocator-owned as before.
+             */
+            val bridgeTransportOwned = textures.remove(bridgeRgb)
+            val sourceTransportOwned = if (iris26856BTrue2x)
+                !textures.contains(sensorNeutralB)
+            else if (bridgeTransportOwned) textures.remove(sensorNeutralB) else false
+            check(bridgeTransportOwned && sourceTransportOwned) {
+                "26868 direct B RGB/guide ownership transfer invalid"
             }
             textureSpecs.remove(bridgeRgb)
             textureSpecs.remove(sensorNeutralB)
-            if (twoX != null) {
-                check(textures.remove(nativeClip)) {
-                    "26876 B 1x original-sensor clip texture lifetime missing"
-                }
-                textureSpecs.remove(nativeClip)
-            }
             bridgeRgb = 0
             sensorNeutralB = 0
             nativeClip = 0
             returned = true
-            PLog.i("MgcSabre", "IRIS_26868_DIRECT_NATIVE_B_HDRQ " +
+            PLog.i("MgcSabre", (if (iris26856BTrue2x)
+                "IRIS_26876_B_SINGLE_WRONSKI_GPU " else "IRIS_26868_DIRECT_NATIVE_B_HDRQ ") +
                 "normal=${normals.size} sabreFrameExec=0 sabreShaderInit=0 " +
                 "sabreCfaAlloc=0 rawrNativeNoise=true nativeLsc=true " +
                 "trueWronski2x=${twoX != null} owner=B")
             return result
         } finally {
             if (!returned) {
-                twoX?.let {
-                    runCatching { it.rgb.delete() }
-                    runCatching { it.clipBits.delete() }
-                }
+                runCatching { twoX?.close() }
             }
             if (longGain26868 != 0) releaseOwnedTexture(longGain26868,
                 "26868 B independent LONG scalar guide complete")
             if (nativeRgb != 0) releaseOwnedTexture(nativeRgb,
                 "26868 B consumed native RAWR post-AMaZE input")
-            if (!returned && nativeClip != 0 && twoX == null)
-                GLES30.glDeleteTextures(1, intArrayOf(nativeClip), 0)
+            if (!returned && nativeClip != 0) GLES30.glDeleteTextures(1, intArrayOf(nativeClip), 0)
+            if (!returned && iris26856BTrue2x && sensorNeutralB != 0 &&
+                !textures.contains(sensorNeutralB)) {
+                GLES30.glDeleteTextures(1,intArrayOf(sensorNeutralB),0)
+                sensorNeutralB=0
+            }
             frames.forEach { runCatching { it.image.close() } }
             release()
             GlesGpuScheduler.restoreCurrentThreadPriority(oldPriority, "Iris26868DirectB")
@@ -17747,53 +17740,13 @@ internal class GlesMgcRawSpatialStacker(
      * A failure discards the unpublished RGB16F file; no old tile merge or A
      * reconstruction can replace the missing B result.
      */
-    /* IRIS_26876_B_SINGLE_WRONSKI_NATIVE_GUIDE_SHADERS
-     * Downsample only the already-calibrated linear camera RGB, never JPEG
-     * gamma/tone pixels. The Wronski sensor clip is a binary 2x texture:
-     * logical OR gives conservative original-sensor 1x clipping provenance. */
-    private val iris26876BDownsampleNativeRgb = """
-        #version 300 es
-        precision highp float;
-        precision highp int;
-        uniform highp sampler2D uWronski2xRgb;
-        layout(location=0) out vec4 oBOneX;
-        void main() {
-            ivec2 p=ivec2(gl_FragCoord.xy)*2;
-            vec4 a=texelFetch(uWronski2xRgb,p,0);
-            vec4 b=texelFetch(uWronski2xRgb,p+ivec2(1,0),0);
-            vec4 c=texelFetch(uWronski2xRgb,p+ivec2(0,1),0);
-            vec4 d=texelFetch(uWronski2xRgb,p+ivec2(1,1),0);
-            oBOneX=(a+b+c+d)*0.25;
-        }
-    """.trimIndent()
-    private val iris26876BDownsampleSensorClip = """
-        #version 300 es
-        precision highp float;
-        precision highp int;
-        uniform highp sampler2D uWronski2xClip;
-        layout(location=0) out float oBOneXClip;
-        void main() {
-            ivec2 p=ivec2(gl_FragCoord.xy)*2;
-            float a=texelFetch(uWronski2xClip,p,0).r;
-            float b=texelFetch(uWronski2xClip,p+ivec2(1,0),0).r;
-            float c=texelFetch(uWronski2xClip,p+ivec2(0,1),0).r;
-            float d=texelFetch(uWronski2xClip,p+ivec2(1,1),0).r;
-            oBOneXClip=max(max(a,b),max(c,d));
-        }
-    """.trimIndent()
-
-    private data class Iris26864Wronski2xPublication(
-        val rgb: File, val clipBits: File,
-        val nativeGuide1x: Int = 0, val nativeClip1x: Int = 0,
-    )
+    private data class Iris26864Wronski2xPublication(val rgb: File, val clipBits: File)
 
     private fun reconstructIris26864PinnedWronski2x(
         runPinnedGpu: (outputRgb: Int, outputSensorClip: Int) -> Unit,
         snapshot: GlesIris26856RawrColorContract.Snapshot,
         physicalShortGainGuide: Int,
         physicalLongLumaGuide: Int,
-        selectedReference26876: RawStackFrame? = null,
-        physicalLong26876: RawStackFrame? = null,
     ): Iris26864Wronski2xPublication {
         val outputW = Math.multiplyExact(width, 2)
         val outputH = Math.multiplyExact(height, 2)
@@ -17810,9 +17763,6 @@ internal class GlesMgcRawSpatialStacker(
         val target = File(directory, "$stem.rgb16f")
         val nativeClipBits = File(directory, "$stem.clipbits")
         val firstTexture = textures.size
-        var retainedNativeGuide26876 = 0
-        var retainedNativeClip26876 = 0
-        var completed26876 = false
         try {
             val nativeRgb = createTexture(outputW, outputH, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
             val nativeClip = createTexture(outputW, outputH, GLES30.GL_R16F, GLES30.GL_NEAREST)
@@ -17829,58 +17779,6 @@ internal class GlesMgcRawSpatialStacker(
                 rawrNativeReceipt26864 = Iris26864NativeRawrDomainReceipt(true, true, true),
             )
             try {
-                /* The extra HDRq 1x result is not an authority for Super
-                 * Res ON. Derive the native 1x guide and physical clip BEFORE
-                 * any auxiliary LONG luminance or final 50MP publication. */
-                var derivedLong26876 = 0
-                if (selectedReference26876 != null) {
-                    retainedNativeGuide26876 = createTexture(
-                        width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
-                    val rgbDown=linkProgram(iris26876BDownsampleNativeRgb,
-                        "iris_26876_b_one_wronski_1x_rgb")
-                    try {
-                        GLES30.glUseProgram(rgbDown)
-                        bindTexture(rgbDown,"uWronski2xRgb",0,sensorRgb)
-                        draw(rgbDown,width,height,intArrayOf(retainedNativeGuide26876))
-                        GlesGpuScheduler.memoryBarrier()
-                        checkGlError("26876 single Wronski native RGB guide")
-                    } finally {
-                        GLES30.glDeleteProgram(rgbDown)
-                    }
-                    retainedNativeClip26876 = createTexture(
-                        width,height,GLES30.GL_R16F,GLES30.GL_NEAREST)
-                    val clipDown=linkProgram(iris26876BDownsampleSensorClip,
-                        "iris_26876_b_one_wronski_sensor_clip")
-                    try {
-                        GLES30.glUseProgram(clipDown)
-                        bindTexture(clipDown,"uWronski2xClip",0,nativeClip)
-                        draw(clipDown,width,height,intArrayOf(retainedNativeClip26876))
-                        GlesGpuScheduler.memoryBarrier()
-                        checkGlError("26876 Wronski sensor clipping OR transfer")
-                    } finally {
-                        GLES30.glDeleteProgram(clipDown)
-                    }
-                    if (physicalLong26876 != null) {
-                        derivedLong26876 = try {
-                            renderIris26868IndependentLongShadowGuide(
-                                physicalLong26876,selectedReference26876,retainedNativeGuide26876)
-                        } catch (failure: Exception) {
-                            PLog.w(SABRE_TAG,"IRIS_26868_LONG_REJECTED_NORMAL_INTACT " +
-                                "reason=${failure.javaClass.simpleName} detail=${failure.message}")
-                            0
-                        }
-                        if (derivedLong26876 != 0) {
-                            val longOneX=createTexture(
-                                width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
-                            renderIris26856BVerifiedLongLuma(
-                                retainedNativeGuide26876,derivedLong26876,
-                                longOneX,width,height,0,0,1)
-                            releaseOwnedTexture(retainedNativeGuide26876,
-                                "26876 B pre-LONG native 1x guide")
-                            retainedNativeGuide26876=longOneX
-                        }
-                    }
-                }
                 if (physicalShortGainGuide != 0) {
                     val prog = linkProgram(
                         GlesIris26856B2xShortGuide.applyGain,
@@ -17902,17 +17800,13 @@ internal class GlesMgcRawSpatialStacker(
                         GLES30.glDeleteProgram(prog)
                     }
                 }
-                val finalLong26876 = if (selectedReference26876 != null)
-                    derivedLong26876 else physicalLongLumaGuide
-                if (finalLong26876 != 0) {
+                if (physicalLongLumaGuide != 0) {
                     val extended = createTexture(outputW, outputH, GLES30.GL_RGBA16F, GLES30.GL_NEAREST)
-                    renderIris26856BVerifiedLongLuma(sensorRgb, finalLong26876,
+                    renderIris26856BVerifiedLongLuma(sensorRgb, physicalLongLumaGuide,
                         extended, outputW, outputH, 0, 0, 2)
                     releaseOwnedTexture(sensorRgb, "26864 Wronski before B LONG luminance")
                     sensorRgb = extended
                 }
-                if (derivedLong26876 != 0) releaseOwnedTexture(derivedLong26876,
-                    "26876 LONG scalar consumed at native and 2x resolutions")
                 // This RGB file and its independently serialized native 2x
                 // clipping evidence belong to the B final JPEG correction.
                 // Keep nativeClip live until the complete mask has been read.
@@ -17993,20 +17887,146 @@ internal class GlesMgcRawSpatialStacker(
             PLog.i(SABRE_TAG, "IRIS_26864_PINNED_WRONSKI_2X_OUTPUT " +
                 "size=${outputW}x${outputH} realGpu=true noLegacyFallback=true " +
                 "preAmazePhysicalLsc=true burstNoiseFitted=true shortLongLumaOnly=true")
-            completed26876 = true
-            return Iris26864Wronski2xPublication(target, nativeClipBits,
-                retainedNativeGuide26876, retainedNativeClip26876)
+            return Iris26864Wronski2xPublication(target, nativeClipBits)
         } catch (failure: Throwable) {
             runCatching { nativeClipBits.delete() }
             runCatching { target.delete() }
             throw failure
         } finally {
-            if (completed26876 && retainedNativeGuide26876 != 0 &&
-                retainedNativeClip26876 != 0) {
-                releaseTexturesFromExcept(firstTexture,
-                    intArrayOf(retainedNativeGuide26876,retainedNativeClip26876))
-            } else {
-                releaseTexturesFrom(firstTexture)
+            releaseTexturesFrom(firstTexture)
+        }
+    }
+
+    private data class Iris26876SingleMergeCarriers(
+        val true2x: com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier,
+        val oneXSensorRgb: Int,
+        val oneXClip: Int,
+    )
+
+    /* IRIS_26876_B_2X_TO_1X_SENSOR_GUIDE: one linear 2x Wronski owner,
+     * sensor-relative GL sampling. RGB is box-integrated in camera-linear
+     * coordinates. Clip coverage is fractional ONLY for the 1x guide;
+     * the original 2x clip remains exactly binary in the 2x AHB. */
+    private val iris26876DerivedGuideShader = """#version 300 es
+        precision highp float;
+        precision highp sampler2D;
+        uniform sampler2D uTwoXLinear;
+        uniform sampler2D uTwoXOriginalClip;
+        uniform ivec2 uOneXExtent;
+        layout(location=0) out vec4 oLinear;
+        layout(location=1) out float oClipCoverage;
+        void main() {
+            ivec2 q=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uOneXExtent-1)*2;
+            vec4 a=texelFetch(uTwoXLinear,q,0);
+            vec4 b=texelFetch(uTwoXLinear,q+ivec2(1,0),0);
+            vec4 c=texelFetch(uTwoXLinear,q+ivec2(0,1),0);
+            vec4 d=texelFetch(uTwoXLinear,q+ivec2(1,1),0);
+            oLinear=vec4(0.25*(a.rgb+b.rgb+c.rgb+d.rgb),1.0);
+            float ca=texelFetch(uTwoXOriginalClip,q,0).r;
+            float cb=texelFetch(uTwoXOriginalClip,q+ivec2(1,0),0).r;
+            float cc=texelFetch(uTwoXOriginalClip,q+ivec2(0,1),0).r;
+            float cd=texelFetch(uTwoXOriginalClip,q+ivec2(1,1),0).r;
+            oClipCoverage=clamp(0.25*(ca+cb+cc+cd),0.0,1.0);
+        }
+    """.trimIndent()
+
+    /* IRIS_26876_SINGLE_NATIVE_WRONSKI_NO_DUPLICATE_HDRQ
+     * No additional NORMAL burst reconstruction, no 50MP readback and no
+     * RGB16F file. Wronski's exact 2x source clipping is preserved binary;
+     * the 1x reference guide and selected clip coverage derive from this
+     * same Wronski result after its owned Lab/FCC color processing. LONG is
+     * separately admitted once as a trusted luminance-only scalar.
+     */
+    private fun reconstructIris26876B2xGpu(
+        runPinnedGpu: (outputRgb: Int, outputSensorClip: Int) -> Unit,
+        snapshot: GlesIris26856RawrColorContract.Snapshot,
+        physicalLongFrame: RawStackFrame?,
+        selectedReference: RawStackFrame,
+    ): Iris26876SingleMergeCarriers {
+        val outputW=Math.multiplyExact(width,2)
+        val outputH=Math.multiplyExact(height,2)
+        val limit=IntArray(1)
+        GLES30.glGetIntegerv(GLES30.GL_MAX_TEXTURE_SIZE,limit,0)
+        require(outputW<=limit[0] && outputH<=limit[0] && outputW>0 && outputH>0) {
+            "26876 B Wronski GPU source unsupported full-size texture"
+        }
+        val firstTexture=textures.size
+        var packedOwner: com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier?=null
+        var completed=false
+        try {
+            val nativeRgb=createTexture(outputW,outputH,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+            val nativeClip=createTexture(outputW,outputH,GLES30.GL_R16F,GLES30.GL_NEAREST)
+            runPinnedGpu(nativeRgb,nativeClip)
+            GlesGpuScheduler.memoryBarrier()
+            checkGlError("26876 native Vulkan Wronski RGB and original 2x clip")
+            var sensorRgb=renderRawrBPostAmaze26856(
+                nativeRgb,snapshot,labDefringeStrength=1f,
+                processingWidth=outputW,processingHeight=outputH,
+                bNoiseVariance26863=0,bNoiseSupport26863=0,
+                nativeSensorClipFullRes26866=nativeClip,
+                rawrNativeReceipt26864=Iris26864NativeRawrDomainReceipt(true,true,true))
+            var guideRgb=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+            val guideClip=createTexture(width,height,GLES30.GL_R16F,GLES30.GL_NEAREST)
+            val p=linkProgram(iris26876DerivedGuideShader,"iris_26876_wronski_2x_derived_1x_guide")
+            GLES30.glUseProgram(p)
+            bindTexture(p,"uTwoXLinear",0,sensorRgb)
+            bindTexture(p,"uTwoXOriginalClip",1,nativeClip)
+            uniform2i(p,"uOneXExtent",width,height)
+            draw(p,width,height,intArrayOf(guideRgb,guideClip))
+            GlesGpuScheduler.memoryBarrier()
+            checkGlError("26876 single Wronski 2x-derived 1x guide")
+            if (physicalLongFrame!=null) {
+                val gain=try {
+                    renderIris26868IndependentLongShadowGuide(
+                        physicalLongFrame,selectedReference,guideRgb)
+                } catch(failure:Exception) {
+                    PLog.w(SABRE_TAG,"IRIS_26876_LONG_REJECTED_NORMAL_INTACT " +
+                        "reason=${failure.javaClass.simpleName} detail=${failure.message}")
+                    0
+                }
+                if(gain!=0)try {
+                    val applied1=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+                    renderIris26856BVerifiedLongLuma(guideRgb,gain,
+                        applied1,width,height,0,0,1)
+                    val applied2=createTexture(outputW,outputH,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+                    renderIris26856BVerifiedLongLuma(sensorRgb,gain,
+                        applied2,outputW,outputH,0,0,2)
+                    releaseOwnedTexture(guideRgb,"26876 1x pre LONG reference")
+                    releaseOwnedTexture(sensorRgb,"26876 2x pre LONG Wronski RGB")
+                    guideRgb=applied1
+                    sensorRgb=applied2
+                } finally {
+                    releaseOwnedTexture(gain,"26876 B independent LONG scalar consumed")
+                }
+            }
+            packedOwner=com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier
+                .tryCreate(outputW,outputH)
+                ?: error("26876 cannot allocate 50MP GPU carrier")
+            check(packedOwner.packWronskiRgbAndClip26876(sensorRgb,nativeClip)) {
+                "26876 exact 2x RGB/clip AHB GPU export failed; file fallback forbidden"
+            }
+            /* The REAL selected-reference 1x final color/clipping guide is
+             * packed once by PhotonMotionMgc1271Bridge after post denoising.
+             * Do NOT pack this early Wronski sample as a second authority.
+             * The early 1x RGB and clip textures below are transferred into
+             * the existing 1x denoise, mask and final-guide producer. */
+            GlesGpuScheduler.memoryBarrier()
+            checkGlError("26876 Wronski-derived B 2x GPU plus live 1x guide frozen")
+            check(textures.remove(guideRgb) && textures.remove(guideClip)) {
+                "26876 1x output textures cannot escape without ownership"
+            }
+            textureSpecs.remove(guideRgb)
+            textureSpecs.remove(guideClip)
+            completed=true
+            PLog.i(SABRE_TAG,"IRIS_26876_B_SINGLE_WRONSKI_GPU " +
+                "size=${outputW}x${outputH} hdrqCalls=0 1xGuide=DERIVED_POST_COLOR " +
+                "clip2x=ORIGINAL_SENSOR_BINARY transport=AHB rgb16fFileBytes=0")
+            return Iris26876SingleMergeCarriers(
+                checkNotNull(packedOwner),guideRgb,guideClip)
+        } finally {
+            releaseTexturesFrom(firstTexture)
+            if(!completed) {
+                runCatching{packedOwner?.close()}
             }
         }
     }
