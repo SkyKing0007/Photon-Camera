@@ -42,6 +42,7 @@ def pkg(s):
  # exact 16-file allowlist for 1997-file successful 26875 compiled candidate
  s=s.replace('-eq 3 ]] || fail', '-eq 16 ]] || fail')
  s=s.replace('three-file strict runtime upload scope','sixteen-file strict runtime upload scope')
+ s=s.replace('three-file and inherited 26874 guarded package','sixteen-file and inherited successful 26875 guarded package')
  return s
 edit('verify_package',pkg)
 def scope(s):
@@ -50,6 +51,7 @@ def scope(s):
  s=s.replace('build_26874_iris_rawr.sh','build_26875_iris_rawr.sh')
  s=s.replace('3b48818fd6cd6376f97cecca5a34b85ce4788e10a37435e3273beb2eddf3282a',PARENT_SHA)
  s=s.replace('successful 26874','successful 26875')
+ s=s.replace('exact 26873 build and strict','exact successful 26875 build and strict')
  return s
 edit('verify_scope',scope)
 def authority(s):
@@ -120,21 +122,18 @@ def shaders(s):
  needle='\n}'
  assert s.endswith(needle)
  insert='''
- local realGlslang=""
- realGlslang="$(command -v glslangValidator || true)"
- if [[ -z "$realGlslang" ]]; then
-  realGlslang="$(find "$WORK" -type f -name glslangValidator -perm /111 -print -quit)"
- fi
- [[ -n "$realGlslang" && -x "$realGlslang" ]] || fail '26876 pinned real glslangValidator unavailable'
- export IRIS_PINNED_GLSLANG_VALIDATOR="$realGlslang"
- python3 -S verify_26876_expanded_shaders.py "$CAND" || fail '26876 true runtime-expanded GLSL failed pinned compiler'
+ # IRIS_26876_REGRESSION_ACTIONS_40120907467: the successful inherited
+ # prepare_glslang stage already found and verified the PINNED real executable.
+ # Do not look up glslangValidator a second time: the official binary can be
+ # named "glslang", and its absolute location need not be on PATH.
+ [[ -n "${IRIS26864_GLSLANG:-}" && -x "$IRIS26864_GLSLANG" &&
+    "$IRIS26864_GLSLANG" == "${IRIS26681_SPEKTRA_GLSLANG:-}" ]] || fail '26876 inherited pinned glslang handle missing or changed'
+ export IRIS_PINNED_GLSLANG_VALIDATOR="$IRIS26864_GLSLANG"
+ python3 -S verify_26876_expanded_shaders.py "$CAND" || fail '26876 true runtime-expanded GLSL failed inherited pinned compiler'
 '''
  return s[:-len(needle)]+insert+needle
 edit('compile_modified_runtime_shaders',shaders)
-def patches(s):
- s=s.replace('exact 26876 3-file binary','exact 26876 16-file binary')
- return s+'\n' if False else s.replace('verify_26876_patches.py', 'verify_26876_patches.py')+'\n' if False else s
-# Inherited patch stage unchanged except global 26876 version and exact new patch inputs.
+# Inherited patch stage is unchanged; the exact 26876 binary proof remains enforced.
 def safety(s):
  s=s.replace('successful 26874','successful 26875')
  s=s.replace('only B JPEG publication + true2x WB/highlight routing + guarded version',
@@ -161,6 +160,13 @@ STAGES=['verify_package','verify_scope','obtain_authority','make_candidate','ver
 old=[m.group(1) for m in re.finditer(r'\n([a-z_]+)\(\)\{',prior)]
 new=[m.group(1) for m in re.finditer(r'\n([a-z_]+)\(\)\{',body)]
 assert old==new and [x for x in new if x in STAGES]==STAGES,(old,new)
+# Stage-local GLSL regression: prevent reverting to the failed extra executable lookup.
+shader_stage=body[body.index('\ncompile_modified_runtime_shaders(){'):]
+shader_stage=shader_stage[:shader_stage.index('\n}',0)]
+assert 'export IRIS_PINNED_GLSLANG_VALIDATOR="$IRIS26864_GLSLANG"' in shader_stage
+assert 'command -v glslangValidator' not in shader_stage
+assert 'find "$WORK" -type f -name glslangValidator' not in shader_stage
+assert 'verify_26876_expanded_shaders.py "$CAND"' in shader_stage
 for cmd in ['./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace',"./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDebug[armeabi-v7a]' --stacktrace",'./gradlew :app:assembleDebug --stacktrace']:
  assert cmd in prior and cmd in body,'real inherited compiler/assemble invocation missing'
 for marker in ('snapshot_live_authority_seeded','GLSLANG_VERSION="16.5.0"','PRE-BUILD SAFETY PROOF PASSED','RUNTIME_ARTIFACT_ID="12544774681"','VERSION_NAME="0.9726876"','verify_26876_candidate.py "$BASE" "$CAND"'):
