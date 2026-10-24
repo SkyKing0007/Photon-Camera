@@ -1,0 +1,544 @@
+diff --git a/app/src/main/cpp/CMakeLists.txt b/app/src/main/cpp/CMakeLists.txt
+index c8842eea66c850182c4e7db784e872b0eb625aeb..757146a673a20c23b3ed309dcffa9b85d9faabb7 100644
+--- a/app/src/main/cpp/CMakeLists.txt
++++ b/app/src/main/cpp/CMakeLists.txt
+@@ -267,6 +267,56 @@ target_include_directories(motionv2jpeg PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR})
+ target_link_libraries(motionv2jpeg PRIVATE turbojpeg-static jpeg-static iris26507-ultrahdr log jnigraphics android z EGL GLESv3)
+ 
++# IRIS_26874_B_PRIVATE_OPTIMIZED_JPEG_LIBRARY
++# RAWR-style independent optimized codec in Debug. A's original turbojpeg-static,
++# jpeg-static and motionv2jpeg compile options/links are deliberately unchanged.
++# The 26874 JNI library hides all static codec symbols to avoid cross-owner ELF binding.
++include(ExternalProject)
++set(IRIS26874_B_CODEC_BUILD "${CMAKE_CURRENT_BINARY_DIR}/iris26874-b-codec")
++ExternalProject_Add(iris26874_b_codec_external
++    SOURCE_DIR "${IRIS26507_JPEG}"
++    BINARY_DIR "${IRIS26874_B_CODEC_BUILD}"
++    CMAKE_ARGS
++        "-DCMAKE_MAKE_PROGRAM:FILEPATH=${CMAKE_MAKE_PROGRAM}"
++        "-DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}"
++        "-DANDROID_ABI=${ANDROID_ABI}"
++        "-DANDROID_PLATFORM=${ANDROID_PLATFORM}"
++        -DCMAKE_BUILD_TYPE=RelWithDebInfo
++        -DENABLE_SHARED=OFF
++        -DENABLE_STATIC=ON
++        -DWITH_TURBOJPEG=ON
++        -DWITH_SIMD=ON
++        -DREQUIRE_SIMD=ON
++        -DWITH_TESTS=OFF
++        -DWITH_TOOLS=OFF
++        -DWITH_JAVA=OFF
++    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target turbojpeg-static jpeg-static
++    INSTALL_COMMAND ""
++    BUILD_BYPRODUCTS "${IRIS26874_B_CODEC_BUILD}/libturbojpeg.a" "${IRIS26874_B_CODEC_BUILD}/libjpeg.a")
++add_library(iris26874_b_turbojpeg STATIC IMPORTED GLOBAL)
++set_target_properties(iris26874_b_turbojpeg PROPERTIES
++    IMPORTED_LOCATION "${IRIS26874_B_CODEC_BUILD}/libturbojpeg.a")
++add_dependencies(iris26874_b_turbojpeg iris26874_b_codec_external)
++add_library(iris26874_b_libjpeg STATIC IMPORTED GLOBAL)
++set_target_properties(iris26874_b_libjpeg PROPERTIES
++    IMPORTED_LOCATION "${IRIS26874_B_CODEC_BUILD}/libjpeg.a")
++add_dependencies(iris26874_b_libjpeg iris26874_b_codec_external)
++add_library(iris26874bjpeg SHARED iris26874_b_jpeg_writer.cpp)
++set_target_properties(iris26874bjpeg PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
++target_compile_options(iris26874bjpeg PRIVATE -O3 -fvisibility=hidden)
++target_link_options(iris26874bjpeg PRIVATE "-Wl,--exclude-libs,ALL" "-Wl,-Bsymbolic")
++target_include_directories(iris26874bjpeg PRIVATE
++    "${IRIS26507_JPEG}/src"
++    "${IRIS26874_B_CODEC_BUILD}"
++    "${IRIS26507_UHDR}"
++    "${IRIS26507_UHDR}/lib/include")
++# Linking the UHDr archive by filename, rather than its transitive target,
++# prevents the A-owned jpeg-static dependency leaking into the private B codec.
++add_dependencies(iris26874bjpeg iris26507-ultrahdr iris26874_b_codec_external)
++target_link_libraries(iris26874bjpeg PRIVATE
++    iris26874_b_turbojpeg "${CMAKE_CURRENT_BINARY_DIR}/libiris26507-ultrahdr.a"
++    iris26874_b_libjpeg log jnigraphics android z)
++
+ # IRIS_26512_MGC1271_ISOLATED_NATIVE_OWNER
+ add_subdirectory(mgc1271_upstream)
+ 
+diff --git a/app/src/main/cpp/iris26874_b_jpeg_writer.cpp b/app/src/main/cpp/iris26874_b_jpeg_writer.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd23294d31e747ccf895159d22b92d70a1b3c9d0
+--- /dev/null
++++ b/app/src/main/cpp/iris26874_b_jpeg_writer.cpp
+@@ -0,0 +1,272 @@
++/*
++ * IRIS_26874_B_NATIVE_JPEG_OWNER
++ * Experiment B only. No image-development math, color conversion or gain-map fitting.
++ * RAWR v0.5.0 strip/worker architecture independently adapted from the GPL-3.0
++ * implementation by adityawarmanfw (92bd2196d9cee337695d76e107520034248568f3).
++ * Photon/Iris and RAWR both distribute under GPL-3.0; preserve source provenance.
++ * Boundaries: caller-owned finalized P3 RGBA8; already-frozen Android gain-map codes;
++ * byte-equivalent ICC and libultrahdr compressed-image container parameters.
++ */
++#include <jni.h>
++#include <android/bitmap.h>
++#include <android/log.h>
++#include <turbojpeg.h>
++#include <ultrahdr_api.h>
++#include <ultrahdr/icc.h>
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <memory>
++#include <string>
++#include <thread>
++#include <vector>
++#include <cerrno>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <sys/resource.h>
++
++namespace {
++constexpr char TAG[] = "Iris26874BJpeg";
++constexpr size_t kMaxOutput = static_cast<size_t>(std::numeric_limits<int>::max());
++thread_local std::string gTelemetry = "state=NOT_RUN";
++struct Utf { JNIEnv* e; jstring s; const char* p;
++    Utf(JNIEnv* x,jstring y):e(x),s(y),p(y?x->GetStringUTFChars(y,nullptr):nullptr){}
++    ~Utf(){if(p)e->ReleaseStringUTFChars(s,p);} };
++struct LockedBitmap { JNIEnv* e; jobject object; AndroidBitmapInfo info{}; const uint8_t* pixels=nullptr;
++    LockedBitmap(JNIEnv* env,jobject b):e(env),object(b){
++        if(b && AndroidBitmap_getInfo(e,b,&info)==ANDROID_BITMAP_RESULT_SUCCESS){
++            void* p=nullptr;
++            if(AndroidBitmap_lockPixels(e,b,&p)==ANDROID_BITMAP_RESULT_SUCCESS) pixels=(const uint8_t*)p;
++        }
++    }
++    ~LockedBitmap(){if(pixels)AndroidBitmap_unlockPixels(e,object);}
++};
++struct Turbo { tjhandle h=tj3Init(TJINIT_COMPRESS); ~Turbo(){if(h)tj3Destroy(h);} };
++struct TurboBytes {unsigned char* p=nullptr; size_t n=0; ~TurboBytes(){if(p)tj3Free(p);} TurboBytes()=default;
++    TurboBytes(const TurboBytes&)=delete; TurboBytes&operator=(const TurboBytes&)=delete;};
++struct Encoder { uhdr_codec_private_t* p=uhdr_create_encoder(); ~Encoder(){if(p)uhdr_release_encoder(p);} };
++struct Segment {int top=0,rows=0;TurboBytes bytes;std::string error;size_t sofHeight=0,sos=0,scan=0;};
++inline unsigned be16(const uint8_t* p){return (unsigned(p[0])<<8)|p[1];}
++inline void put16(std::vector<uint8_t>&o,unsigned v){o.push_back(uint8_t(v>>8));o.push_back(uint8_t(v));}
++static bool setup(tjhandle h,int quality,int subsamp){
++    return h && tj3Set(h,TJPARAM_QUALITY,quality)==0 && tj3Set(h,TJPARAM_SUBSAMP,subsamp)==0 &&
++        tj3Set(h,TJPARAM_FASTDCT,0)==0 && tj3Set(h,TJPARAM_OPTIMIZE,0)==0 &&
++        tj3Set(h,TJPARAM_PROGRESSIVE,0)==0 && tj3Set(h,TJPARAM_ARITHMETIC,0)==0 &&
++        tj3Set(h,TJPARAM_RESTARTBLOCKS,0)==0 && tj3Set(h,TJPARAM_RESTARTROWS,0)==0;
++}
++static bool parseSegment(Segment& s){
++    auto*d=s.bytes.p;size_t n=s.bytes.n;
++    if(!d||n<8||d[0]!=0xff||d[1]!=0xd8||d[n-2]!=0xff||d[n-1]!=0xd9)return false;
++    size_t i=2;bool sof=false;
++    while(i+4<=n){
++        if(d[i]!=0xff)return false;
++        const uint8_t marker=d[i+1];const unsigned len=be16(d+i+2);
++        if(len<2 || i+2+len>n)return false;
++        if(marker==0xc0){if(len<7)return false;s.sofHeight=i+5;sof=true;}
++        else if(marker==0xda){if(!sof)return false;s.sos=i;s.scan=i+2+len;return true;}
++        else if(marker==0xdd || (marker>=0xc1&&marker<=0xcf&&marker!=0xc4&&marker!=0xc8&&marker!=0xcc))return false;
++        i+=2+len;
++    }
++    return false;
++}
++static void encodeOne(const uint8_t* rgba,int width,int stride,int quality,int subsamp,Segment& s){
++    Turbo t;if(!setup(t.h,quality,subsamp)){s.error="configure";return;}
++    if(tj3Compress8(t.h,rgba+size_t(s.top)*stride,width,stride,s.rows,TJPF_RGBA,&s.bytes.p,&s.bytes.n)!=0)
++        s.error="compress";
++}
++static bool parallelStrips(const uint8_t* rgba,int width,int height,int stride,int quality,int subsamp,
++                           std::vector<uint8_t>&output,int&stripCount){
++    stripCount=1;
++    const unsigned threads=std::min(8u,std::max(1u,std::thread::hardware_concurrency()));
++    if(threads<2||uint64_t(width)*height<1000000u||stride!=width*4)return false;
++    const int mcuW=tjMCUWidth[subsamp],mcuH=tjMCUHeight[subsamp];
++    if(mcuW<=0||mcuH<=0)return false;
++    const int mcusPerRow=(width+mcuW-1)/mcuW, mcuRows=(height+mcuH-1)/mcuH;
++    const int cap=65535/mcusPerRow;if(cap<1)return false;
++    const int stripMcuRows=std::min(cap,(mcuRows+int(threads)-1)/int(threads));
++    const int count=(mcuRows+stripMcuRows-1)/stripMcuRows;if(count<2)return false;
++    std::vector<Segment> strips(static_cast<size_t>(count));
++    for(int i=0;i<count;++i){strips[i].top=i*stripMcuRows*mcuH;strips[i].rows=std::min(stripMcuRows*mcuH,height-strips[i].top);}
++    std::atomic<int> next{0};
++    auto work=[&](){::setpriority(PRIO_PROCESS,0,10);for(int i=next.fetch_add(1);i<count;i=next.fetch_add(1))
++        encodeOne(rgba,width,stride,quality,subsamp,strips[static_cast<size_t>(i)]);};
++    std::vector<std::thread> workers;
++    try {for(int i=1;i<std::min(count,int(threads));++i)workers.emplace_back(work);}catch(...){/* finish with available workers */}
++    work();for(auto&thread:workers)thread.join();
++    for(auto& s:strips){if(!s.error.empty()||!parseSegment(s))return false;}
++    const auto& first=strips[0];
++    for(int i=1;i<count;++i){const auto& s=strips[static_cast<size_t>(i)];
++        if(s.sofHeight!=first.sofHeight||s.scan!=first.scan||
++           memcmp(first.bytes.p,s.bytes.p,s.sofHeight)!=0||
++           memcmp(first.bytes.p+first.sofHeight+2,s.bytes.p+s.sofHeight+2,
++                  first.scan-first.sofHeight-2)!=0)return false;
++    }
++    // SOF height is full-height, and each independent entropy stream begins at a restart boundary.
++    size_t size=first.scan+6+2;for(const auto&s:strips){size+=s.bytes.n-2-s.scan+2;}
++    if(size>kMaxOutput)return false;
++    output.clear();output.reserve(size);
++    output.insert(output.end(),first.bytes.p,first.bytes.p+first.sos);
++    // Restart interval is exactly the number of MCUs encoded by one full strip.
++    output.push_back(0xff);output.push_back(0xdd);put16(output,4);put16(output,unsigned(mcusPerRow*stripMcuRows));
++    output.insert(output.end(),first.bytes.p+first.sos,first.bytes.p+first.scan);
++    output[first.sofHeight]=uint8_t(height>>8);output[first.sofHeight+1]=uint8_t(height);
++    for(int i=0;i<count;++i){auto&s=strips[static_cast<size_t>(i)];
++        if(i){output.push_back(0xff);output.push_back(uint8_t(0xd0+((i-1)&7)));}
++        output.insert(output.end(),s.bytes.p+s.scan,s.bytes.p+s.bytes.n-2);
++    }
++    output.push_back(0xff);output.push_back(0xd9);stripCount=count;return true;
++}
++static bool compress(const uint8_t*rgba,int w,int h,int stride,int q,int subsamp,int pixelFormat,
++                     std::vector<uint8_t>&result,int&strips){
++    strips=1;
++    if(!rgba||w<=0||h<=0||w>32767||h>32767||stride<=0)return false;
++    if(pixelFormat==TJPF_RGBA){
++        try {if(parallelStrips(rgba,w,h,stride,q,subsamp,result,strips))return true;}
++        catch(...){/* Allocation/thread failure: retry the proven one-thread TurboJPEG path. */}
++        result.clear();strips=1;
++    }
++    Turbo t;TurboBytes bytes;
++    if(!setup(t.h,q,subsamp)||tj3Compress8(t.h,rgba,w,stride,h,pixelFormat,&bytes.p,&bytes.n)!=0
++       ||!bytes.p||!bytes.n)return false;
++    result.assign(bytes.p,bytes.p+bytes.n);return true;
++}
++// Embed the same profile bytes as the established Iris motionv2jpeg writer, not RAWR's color profile.
++static bool addDisplayP3Icc(std::vector<uint8_t>&base){
++    auto profile=ultrahdr::IccHelper::writeIccProfile(UHDR_CT_SRGB,UHDR_CG_DISPLAY_P3);
++    if(!profile||profile->getLength()<=ultrahdr::kICCIdentifierSize||base.size()<2||base[0]!=0xff||base[1]!=0xd8)return false;
++    const size_t n=profile->getLength()-ultrahdr::kICCIdentifierSize;
++    if(n+16>65535)return false;
++    const uint8_t*data=static_cast<const uint8_t*>(profile->getData())+ultrahdr::kICCIdentifierSize;
++    std::vector<uint8_t> tagged;tagged.reserve(base.size()+n+18);tagged.push_back(0xff);tagged.push_back(0xd8);
++    tagged.push_back(0xff);tagged.push_back(0xe2);put16(tagged,unsigned(n+16));
++    static constexpr char ident[]="ICC_PROFILE";
++    tagged.insert(tagged.end(),ident,ident+sizeof(ident)); // includes NUL; 12 bytes
++    tagged.push_back(1);tagged.push_back(1); // seq 1 of 1; APP2 header 14 bytes
++    tagged.insert(tagged.end(),data,data+n);tagged.insert(tagged.end(),base.begin()+2,base.end());
++    base.swap(tagged);return true;
++}
++static bool readFile(const char*path,std::vector<uint8_t>&out){
++    if(!path)return false;FILE*f=fopen(path,"rb");if(!f)return false;
++    if(fseek(f,0,SEEK_END)!=0){fclose(f);return false;}
++    long n=ftell(f);if(n<=0||size_t(n)>kMaxOutput||fseek(f,0,SEEK_SET)!=0){fclose(f);return false;}
++    out.resize(size_t(n));const size_t got=fread(out.data(),1,out.size(),f);const int rc=fclose(f);
++    return got==out.size()&&rc==0;
++}
++static bool writeAtomic(const char*path,const std::vector<uint8_t>&buf){
++    if(!path||buf.empty())return false;std::string pending=std::string(path)+".26874-pending";
++    unlink(pending.c_str());int fd=open(pending.c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC,0600);
++    if(fd<0)return false;
++    bool ok=true;size_t done=0;
++    while(done<buf.size()){ssize_t n=::write(fd,buf.data()+done,buf.size()-done);
++        if(n<0&&errno==EINTR)continue;if(n<=0){ok=false;break;}done+=size_t(n);}
++    if(ok&&fsync(fd)!=0)ok=false;
++    if(close(fd)!=0)ok=false;
++    if(ok&&rename(pending.c_str(),path)!=0)ok=false;
++    if(!ok)unlink(pending.c_str());return ok;
++}
++struct Metadata {std::array<float,3> lo{},hi{},gamma{},epsS{},epsH{};float minHdr=1.f,maxHdr=2.f;bool useBase=true;};
++static bool fetch(JNIEnv*env,jfloatArray src,std::array<float,3>&dst){
++    if(!src||env->GetArrayLength(src)!=3)return false;
++    env->GetFloatArrayRegion(src,0,3,dst.data());return !env->ExceptionCheck();
++}
++static bool buildMetadata(JNIEnv*e,jfloatArray min,jfloatArray max,jfloatArray gamma,jfloatArray es,jfloatArray eh,
++                          float ds,float dh,bool use,Metadata& m){
++    m.minHdr=ds;m.maxHdr=dh;m.useBase=use;
++    return fetch(e,min,m.lo)&&fetch(e,max,m.hi)&&fetch(e,gamma,m.gamma)&&fetch(e,es,m.epsS)&&fetch(e,eh,m.epsH);
++}
++static bool publish(const char*path,const std::vector<uint8_t>&base,const std::vector<uint8_t>&gain,
++                    const Metadata*meta){
++    if(base.empty()||base.size()>kMaxOutput)return false;
++    if(!meta) return writeAtomic(path,base);
++    if(gain.empty()||gain.size()>kMaxOutput)return false;
++    Encoder owner;if(!owner.p)return false;
++    uhdr_compressed_image_t b{};b.data=const_cast<uint8_t*>(base.data());b.data_sz=b.capacity=base.size();
++    b.cg=UHDR_CG_DISPLAY_P3;b.ct=UHDR_CT_SRGB;b.range=UHDR_CR_FULL_RANGE;
++    uhdr_compressed_image_t g{};g.data=const_cast<uint8_t*>(gain.data());g.data_sz=g.capacity=gain.size();
++    g.cg=UHDR_CG_UNSPECIFIED;g.ct=UHDR_CT_UNSPECIFIED;g.range=UHDR_CR_UNSPECIFIED;
++    uhdr_gainmap_metadata_t m{};for(int i=0;i<3;i++){
++        m.min_content_boost[i]=meta->lo[i];m.max_content_boost[i]=meta->hi[i];m.gamma[i]=meta->gamma[i];
++        m.offset_sdr[i]=meta->epsS[i];m.offset_hdr[i]=meta->epsH[i];}
++    m.hdr_capacity_min=meta->minHdr;m.hdr_capacity_max=meta->maxHdr;m.use_base_cg=meta->useBase?1:0;
++    if(uhdr_enc_set_compressed_image(owner.p,&b,UHDR_BASE_IMG).error_code!=UHDR_CODEC_OK||
++       uhdr_enc_set_gainmap_image(owner.p,&g,&m).error_code!=UHDR_CODEC_OK||
++       uhdr_enc_set_output_format(owner.p,UHDR_CODEC_JPG).error_code!=UHDR_CODEC_OK||
++       uhdr_encode(owner.p).error_code!=UHDR_CODEC_OK)return false;
++    auto*out=uhdr_get_encoded_stream(owner.p);
++    if(!out||!out->data||out->data_sz==0||out->data_sz>kMaxOutput||!is_uhdr_image(out->data,int(out->data_sz)))return false;
++    return writeAtomic(path,std::vector<uint8_t>(static_cast<const uint8_t*>(out->data),
++                                                 static_cast<const uint8_t*>(out->data)+out->data_sz));
++}
++static long ms(const std::chrono::steady_clock::time_point&then){
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-then).count();
++}
++} // namespace
++
++extern "C" JNIEXPORT jboolean JNICALL
++Java_com_particlesdevs_photoncamera_processing_ultrahdr_Iris26874BJpegPublisher_publishBitmapNative(
++        JNIEnv* e,jclass,jobject bitmap,jobject gainBitmap,jstring output,jint quality,
++        jfloatArray min,jfloatArray max,jfloatArray gamma,jfloatArray es,jfloatArray eh,jfloat ds,jfloat dh,jboolean use){
++    Utf dest(e,output);if(!dest.p||quality!=98)return JNI_FALSE;
++    LockedBitmap base(e,bitmap);if(!base.pixels||base.info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)return JNI_FALSE;
++    LockedBitmap gain(e,gainBitmap);
++    if(gainBitmap&&(!gain.pixels||(gain.info.format!=ANDROID_BITMAP_FORMAT_A_8&&gain.info.format!=ANDROID_BITMAP_FORMAT_RGBA_8888)))return JNI_FALSE;
++    const bool uhdr=gainBitmap!=nullptr;
++    Metadata md{};if(uhdr&&!buildMetadata(e,min,max,gamma,es,eh,ds,dh,use==JNI_TRUE,md))return JNI_FALSE;
++    std::vector<uint8_t> b,g;int strips=1,gainStrips=1;
++    const auto start=std::chrono::steady_clock::now();
++    // Two independent compressors consume locked and immutable Android Bitmap buffers.
++    bool baseOk=false,gainOk=!uhdr;
++    try {
++        auto baseEncode=[&](){try {
++            baseOk=compress(base.pixels,int(base.info.width),int(base.info.height),int(base.info.stride),
++                            quality,TJSAMP_444,TJPF_RGBA,b,strips)&&addDisplayP3Icc(b);
++        }catch(...){baseOk=false;}};
++        std::thread baseWorker;
++        try { baseWorker=std::thread([&](){::setpriority(PRIO_PROCESS,0,10);baseEncode();}); }
++        catch (...) { /* No thread resources: preserve ordinary single-thread encoding. */ }
++        struct JoinOnExit { std::thread& t; ~JoinOnExit(){if(t.joinable())t.join();} } join{baseWorker};
++        if(uhdr) gainOk=compress(gain.pixels,int(gain.info.width),int(gain.info.height),int(gain.info.stride),
++                                95,gain.info.format==ANDROID_BITMAP_FORMAT_A_8?TJSAMP_GRAY:TJSAMP_444,
++                                gain.info.format==ANDROID_BITMAP_FORMAT_A_8?TJPF_GRAY:TJPF_RGBA,g,gainStrips);
++        if(baseWorker.joinable())baseWorker.join();else baseEncode();
++        const long encodedMs=ms(start);
++        const bool ok=baseOk&&gainOk&&publish(dest.p,b,g,uhdr?&md:nullptr);
++        gTelemetry="mode=normal codec=optimized_isolated_26874 strips="+std::to_string(strips)
++                +" gainStrips="+std::to_string(gainStrips)+" encodedWallMs="+std::to_string(encodedMs)
++                +" totalMs="+std::to_string(ms(start))+" published="+(ok?"true":"false");
++        __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26874_B_JPEG_OWNER %s",gTelemetry.c_str());
++        return ok?JNI_TRUE:JNI_FALSE;
++    }catch(const std::exception&ex){gTelemetry=std::string("mode=normal failure=")+ex.what();}
++    catch(...){gTelemetry="mode=normal failure=native_exception";}
++    __android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26874_B_JPEG_OWNER %s",gTelemetry.c_str());
++    return JNI_FALSE;
++}
++
++extern "C" JNIEXPORT jboolean JNICALL
++Java_com_particlesdevs_photoncamera_processing_ultrahdr_Iris26874BJpegPublisher_publishPrecompressedNative(
++        JNIEnv*e,jclass,jstring bp,jstring gp,jstring op,
++        jfloatArray min,jfloatArray max,jfloatArray gamma,jfloatArray es,jfloatArray eh,jfloat ds,jfloat dh,jboolean use){
++    Utf base(e,bp),gain(e,gp),out(e,op);if(!base.p||!gain.p||!out.p)return JNI_FALSE;
++    std::vector<uint8_t> b,g;Metadata md{};
++    if(!buildMetadata(e,min,max,gamma,es,eh,ds,dh,use==JNI_TRUE,md)||!readFile(base.p,b)||!readFile(gain.p,g))return JNI_FALSE;
++    try {
++        const auto start=std::chrono::steady_clock::now();bool ok=publish(out.p,b,g,&md);
++        gTelemetry="mode=true2x_encoded_stream codec=original_stream_renderer packageMs="+std::to_string(ms(start))
++                +" published="+(ok?"true":"false");
++        __android_log_print(ANDROID_LOG_INFO,TAG,"IRIS_26874_B_JPEG_OWNER %s",gTelemetry.c_str());
++        return ok?JNI_TRUE:JNI_FALSE;
++    }catch(const std::exception&ex){gTelemetry=std::string("mode=true2x failure=")+ex.what();}
++    catch(...){gTelemetry="mode=true2x failure=native_exception";}
++    __android_log_print(ANDROID_LOG_ERROR,TAG,"IRIS_26874_B_JPEG_OWNER %s",gTelemetry.c_str());
++    return JNI_FALSE;
++}
++
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_particlesdevs_photoncamera_processing_ultrahdr_Iris26874BJpegPublisher_getLastTelemetryNative(
++        JNIEnv*env,jclass){return env->NewStringUTF(gTelemetry.c_str());}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+index 12e931d16b65771fc2086cde2823ab3019d741b9..9bbf253be45791992a81165e0d1fa7bcf7472f6d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -422,7 +422,8 @@ public class ImageSaver {
+                 int true2xWidth,
+                 int true2xHeight,
+                 com.particlesdevs.photoncamera.processing.render.Parameters parameters,
+-                Point cropSize, IrisMotionSettings.Snapshot toneSettings, boolean watermarkEnabled) {
++                Point cropSize, IrisMotionSettings.Snapshot toneSettings, boolean watermarkEnabled,
++                boolean iris26874EffectiveBOwner) {
+             exifData.COMPRESSION = String.valueOf(jpgQuality);
+             try {
+                 /* IRIS_26507_MOTION_JPEG444
+@@ -440,7 +441,7 @@ public class ImageSaver {
+                     saved = MotionV2Jpeg444Encoder.writeTrue2x(
+                             fileToSave, img, jpgQuality, true2xRenderRgbPath,
+                             true2xWidth, true2xHeight, parameters, cropSize, toneSettings,
+-                            watermarkEnabled, null);
++                            watermarkEnabled, null, iris26874EffectiveBOwner);
+                     if (!saved) {
+                         Log.critical("ImageSaver",
+                                 "IRIS_26566_MOTION_TRUE2X_PUBLICATION_FAILED native12mpFallback=false multiframeSabre=true");
+@@ -448,7 +449,10 @@ public class ImageSaver {
+                         return false;
+                     }
+                 } else {
+-                    saved = MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
++                    saved = iris26874EffectiveBOwner
++                            ? com.particlesdevs.photoncamera.processing.ultrahdr.Iris26874BJpegPublisher
++                                .writeNormal(fileToSave, img, jpgQuality)
++                            : MotionV2Jpeg444Encoder.write(fileToSave, img, jpgQuality);
+                 }
+                 if (!saved) return false;
+                 final long iris26699EncoderMs =
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 6d81dd544a2ee88780dc9f7dbb98e5ce194cb828..86997bb1f16d93c1501ad46a546c4553f91d5967 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -1250,7 +1250,7 @@ private void ApplyHdrX() {
+                         imageFile, img, ImageSaver.JPG_QUALITY, exifData,
+                         iris26856Primary2x, iris26856Primary2xWidth, iris26856Primary2xHeight,
+                         processingParameters, pipeline.cropSize, pipeline.motionV2ToneSettingsSnapshot,
+-                        pipeline.motionV2WatermarkEnabled);
++                        pipeline.motionV2WatermarkEnabled, iris26856BOnly);
+             }
+             // The B-only 2x file is deleted only after synchronous JPEG/HEIC use.
+             if (iris26856BOnly && iris26856BTrue2xRgbPath != null) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26874BJpegPublisher.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26874BJpegPublisher.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..47918886bf609b554a308e82b5024214c7b4ba66
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26874BJpegPublisher.java
+@@ -0,0 +1,76 @@
++package com.particlesdevs.photoncamera.processing.ultrahdr;
++
++import android.graphics.Bitmap;
++import android.graphics.ColorSpace;
++import android.graphics.Gainmap;
++import android.os.Build;
++import com.particlesdevs.photoncamera.util.Log;
++import com.particlesdevs.photoncamera.util.MotionTrace;
++import java.nio.file.Path;
++
++/**
++ * IRIS_26874_B_JPEG_PUBLISHER: Experiment B output-only JPEG ownership.
++ * No RAW, gain-map creation, tone, white balance, ICC conversion or color math.
++ * Ordinary B consumes final Display-P3 RGBA + Android gain map; true-2x consumes
++ * the existing streaming renderer's full-resolution precompressed JPEG pair.
++ * A, effective-A high zoom, HEIC, Night and DNG must never enter this owner.
++ */
++public final class Iris26874BJpegPublisher {
++    private static final String TAG = "Iris26874BJpeg";
++    static { System.loadLibrary("iris26874bjpeg"); }
++    private Iris26874BJpegPublisher() {}
++
++    private static boolean validP3(Bitmap b) {
++        return b != null && !b.isRecycled() && b.getConfig() == Bitmap.Config.ARGB_8888
++                && Build.VERSION.SDK_INT >= 26 && b.getColorSpace() != null
++                && b.getColorSpace().equals(ColorSpace.get(ColorSpace.Named.DISPLAY_P3));
++    }
++
++    public static boolean writeNormal(Path output, Bitmap bitmap, int quality) {
++        if (output == null || quality != 98 || !validP3(bitmap)) return false;
++        Gainmap gm = Build.VERSION.SDK_INT >= 34 && bitmap.hasGainmap() ? bitmap.getGainmap() : null;
++        Bitmap contents = gm != null ? gm.getGainmapContents() : null;
++        if (gm != null && (contents == null || contents.isRecycled())) return false;
++        long start = System.nanoTime();
++        boolean ok = publishBitmapNative(bitmap, contents, output.toString(), quality,
++                gm != null ? gm.getRatioMin() : null, gm != null ? gm.getRatioMax() : null,
++                gm != null ? gm.getGamma() : null, gm != null ? gm.getEpsilonSdr() : null,
++                gm != null ? gm.getEpsilonHdr() : null,
++                gm != null ? gm.getMinDisplayRatioForHdrTransition() : 1.0f,
++                gm != null ? gm.getDisplayRatioForFullHdr() : 2.0f, true);
++        long ms = (System.nanoTime() - start) / 1_000_000L;
++        String detail = getLastTelemetryNative();
++        Log.i(TAG, "IRIS_26874_B_NATIVE_SAVE mode=normal published=" + ok
++                + " gain=" + (gm != null) + " saveMs=" + ms + " " + detail);
++        MotionTrace.processingState("IRIS_26874_B_JPEG_PUBLICATION",
++                "mode=normal published=" + ok + " saveMs=" + ms + " exclusiveOwner=true " + detail);
++        return ok;
++    }
++
++    /** Preserve the proven true-2x streaming rasterizer and full-size gain map.
++     * This B-only entry point replaces only JPEG/R packaging; it never rescales
++     * a bitmap, decodes/re-encodes its 50 MP SDR body, or regenerates gains.
++     */
++    public static boolean publishTrue2xEncoded(Path output, Path base, Path gain, Gainmap gm) {
++        if (output == null || base == null || gain == null || gm == null) return false;
++        long start = System.nanoTime();
++        boolean ok = publishPrecompressedNative(base.toString(), gain.toString(), output.toString(),
++                gm.getRatioMin(), gm.getRatioMax(), gm.getGamma(), gm.getEpsilonSdr(), gm.getEpsilonHdr(),
++                gm.getMinDisplayRatioForHdrTransition(), gm.getDisplayRatioForFullHdr(), true);
++        long ms = (System.nanoTime() - start) / 1_000_000L;
++        String detail = getLastTelemetryNative();
++        Log.i(TAG, "IRIS_26874_B_NATIVE_SAVE mode=true2x_streamed published=" + ok
++                + " packageMs=" + ms + " " + detail);
++        MotionTrace.processingState("IRIS_26874_B_JPEG_PUBLICATION",
++                "mode=true2x_streamed published=" + ok + " packageMs=" + ms + " exclusiveOwner=true " + detail);
++        return ok;
++    }
++
++    private static native String getLastTelemetryNative();
++    private static native boolean publishBitmapNative(Bitmap base, Bitmap gain, String output, int quality,
++            float[] min, float[] max, float[] gamma, float[] epsilonSdr, float[] epsilonHdr,
++            float minHdr, float maxHdr, boolean useBase);
++    private static native boolean publishPrecompressedNative(String base, String gain, String output,
++            float[] min, float[] max, float[] gamma, float[] epsilonSdr, float[] epsilonHdr,
++            float minHdr, float maxHdr, boolean useBase);
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index 5a5c4ecc52497eee76e695345c9f11ee58114bc6..7b6e65457500bcf56fd424a3c0c23df66e613580 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -170,14 +170,25 @@ public final class MotionV2Jpeg444Encoder {
+      * the exact final native dimensions. No native-RGB bilinear scene upscale or luma-detail map is
+      * consumed by this path.
+      */
++    // Exact legacy signature retained for Night and Experiment A. No behavioral change.
+     public static boolean writeTrue2x(
+             Path output, Bitmap bitmap, int quality, String renderRgb16fPath,
+             int trueWidth, int trueHeight, Parameters parameters, Point cropSize,
+             IrisMotionSettings.Snapshot toneSettings, boolean watermarkEnabled,
+             IrisNightNeuralEnhancer.True2xResidual jinResidual) {
++        return writeTrue2x(output, bitmap, quality, renderRgb16fPath, trueWidth,
++                trueHeight, parameters, cropSize, toneSettings, watermarkEnabled,
++                jinResidual, false);
++    }
++
++    public static boolean writeTrue2x(
++            Path output, Bitmap bitmap, int quality, String renderRgb16fPath,
++            int trueWidth, int trueHeight, Parameters parameters, Point cropSize,
++            IrisMotionSettings.Snapshot toneSettings, boolean watermarkEnabled,
++            IrisNightNeuralEnhancer.True2xResidual jinResidual, boolean iris26874EffectiveBOwner) {
+         return writeTrue2xInternal(output, bitmap, quality, renderRgb16fPath,
+                 trueWidth, trueHeight, parameters, cropSize, toneSettings, watermarkEnabled,
+-                jinResidual, false, null);
++                jinResidual, false, null, iris26874EffectiveBOwner);
+     }
+ 
+     /* IRIS_26646_TRUE2X_HEIC_SHARED_RENDER_OWNER
+@@ -191,7 +202,7 @@ public final class MotionV2Jpeg444Encoder {
+             ParseExif.ExifData exifData) {
+         return writeTrue2xInternal(output, bitmap, quality, renderRgb16fPath,
+                 trueWidth, trueHeight, parameters, cropSize, toneSettings, watermarkEnabled,
+-                null, true, exifData);
++                null, true, exifData, false);
+     }
+ 
+     private static boolean writeTrue2xInternal(
+@@ -199,7 +210,8 @@ public final class MotionV2Jpeg444Encoder {
+             int trueWidth, int trueHeight, Parameters parameters, Point cropSize,
+             IrisMotionSettings.Snapshot toneSettings, boolean watermarkEnabled,
+             IrisNightNeuralEnhancer.True2xResidual jinResidual,
+-            boolean heicUltraHdr, ParseExif.ExifData exifData) {
++            boolean heicUltraHdr, ParseExif.ExifData exifData,
++            boolean iris26874EffectiveBOwner) {
+         if (output == null || bitmap == null || bitmap.isRecycled() || parameters == null
+                 || renderRgb16fPath == null || renderRgb16fPath.isEmpty()
+                 || trueWidth <= 0 || trueHeight <= 0) return false;
+@@ -400,9 +412,11 @@ public final class MotionV2Jpeg444Encoder {
+             }
+             final long packageStartNs = System.nanoTime();
+             boolean jpegR = gainReady
+-                    && packageJpegRNative(base.toString(), gain.toString(), output.toString(), 1,
++                    && (iris26874EffectiveBOwner
++                        ? Iris26874BJpegPublisher.publishTrue2xEncoded(output, base, gain, gm)
++                        : packageJpegRNative(base.toString(), gain.toString(), output.toString(), 1,
+                             gm.getRatioMin(), gm.getRatioMax(), gm.getGamma(), gm.getEpsilonSdr(), gm.getEpsilonHdr(),
+-                            gm.getMinDisplayRatioForHdrTransition(), gm.getDisplayRatioForFullHdr(), true)
++                            gm.getMinDisplayRatioForHdrTransition(), gm.getDisplayRatioForFullHdr(), true))
+                     && isJpegRNative(output.toString());
+             final long packageMs = (System.nanoTime() - packageStartNs) / 1_000_000L;
+             Log.i(TAG, "IRIS_26569_TRUE2X_PACKAGE_TIMING jpegRPackageMs=" + packageMs
+diff --git a/app/version.properties b/app/version.properties
+index 71d332a8c11d704b52e7ae09ed7c63291b099948..f152248c473cacf6caa7b4125d802afc7d760d31 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726873
+-VERSION_BUILD=26873
++VERSION_NAME=0.9726874
++VERSION_BUILD=26874
