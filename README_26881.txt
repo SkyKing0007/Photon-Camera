@@ -18,3 +18,16 @@ Actions attempt-4 provenance; the original failing condition is a permanent
 regression. Stage 2 workflow and Stage 3 trigger use an R1 marker, so only the
 intended new Stage 3 commit launches an Actions run. All app runtime bytes and
 source changed-file allowlist remain identical to original 26881 handoff.
+
+26881 R2 repair after Actions run 40396314031 / job 121830171563.
+The real generated 17-stage runner was present, but R1's new validator
+incorrectly required one literal text occurrence of the project compiler
+command across the entire script. R2 validates executable compiler calls
+inside their owning stage against the exact successful 26880 runner,
+requires preservation of eight unchanged high-risk stages and historical
+validator domains, checks the actual artifact name, digest, event/checkout
+S H A identities, and prevents orphaned stage commands. The R2 workflow
+pins the R1 generated runner exact SHA from the failed build before its
+regressions. The full 26881 runtime candidate, binary patch, previous
+successful source authority, and all runtime-domain owners remain unchanged.
+R2 final footer proof matches the successful 26880 stage-call trailer, including its PASS message; no stage-body spill.
