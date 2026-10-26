@@ -31,3 +31,14 @@ pins the R1 generated runner exact SHA from the failed build before its
 regressions. The full 26881 runtime candidate, binary patch, previous
 successful source authority, and all runtime-domain owners remain unchanged.
 R2 final footer proof matches the successful 26880 stage-call trailer, including its PASS message; no stage-body spill.
+
+26881 R3 repairs after Actions run 40399946468 / job 121842790936:
+R2 incorrectly compared version-specific compiler output filenames literally.
+R3 validates the same exact Gradle compiler/NDK/assembly commands and stream
+semantics while canonicalizing ONLY the 26881 vs 26880 log basename prefix.
+Also fixes an independently found future Bash set -u failure: H79 was declared
+local to make_candidate and referenced from compile_modified_runtime_shaders.
+It now uses the actual persisted historical candidate path in $WORK.
+The inherited successful 26880 runner remains SHA-pinned; the R3 successor
+is generated twice and byte-compared, plus its full stage/semantic replay.
+No 26881 runtime source, allowlist, binary patch, or version byte changed.

@@ -130,7 +130,8 @@ edit('verify_successful_mechanics',mechanics)
 def shaders(s):
  # Replay the successful 26880 highlight proof on its actual compiled candidate.
  s=s.replace('verify_26880_highlight_runtime_shader.py "$CAND"','verify_26880_highlight_runtime_shader.py "$BASE"')
- s=s.replace('verify_26880_runtime_glsl_scope.py "$BASE" "$CAND"','verify_26880_runtime_glsl_scope.py "$H79" "$BASE"')
+ s=s.replace('verify_26880_runtime_glsl_scope.py "$BASE" "$CAND"','verify_26880_runtime_glsl_scope.py "$WORK/historical_26879_from_26880" "$BASE"')
+ # H79 is local to make_candidate; later stages use the persisted WORK path.
  # Historical 26880 exact-original shader proof uses its own expected marker unchanged.
  s+='''
  python3 -S verify_26881_expanded_glsl.py "$CAND" --compiler "$IRIS26864_GLSLANG" --out "$OUT/26881_real_current_glsl" | tee "$OUT/26881_shader_compiler_proof.txt"

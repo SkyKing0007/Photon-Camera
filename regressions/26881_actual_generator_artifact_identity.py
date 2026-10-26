@@ -84,8 +84,19 @@ if len(sys.argv)>1:
   current=actual_calls(stage_body(runner,stage))
   inherited=actual_calls(stage_body(predecessor,stage))
   assert inherited,('prior successful stage contains no real compiler calls',stage)
-  assert current==inherited,('modified real compiler command sequence',stage,current,inherited)
+  # Versioned output log filenames legitimately differ; executable Gradle
+  # invocation, ABI targets, stream redirection and tee path ownership MUST NOT.
+  normalized=[line.replace('$OUT/26881_','$OUT/26880_') for line in current]
+  assert normalized==inherited,('modified real compiler command sequence',stage,current,inherited)
   assert sum(x.startswith(command) for x in current)==1,('missing/duplicate executable project compiler',stage,command,current)
+ # The 40399946468 failure is reproduced: the real source generated
+ # version 26881 log path while the correct predecessor wrote 26880 logs.
+ sample_prior='./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace 2>&1 | tee "$OUT/26880_gradle_language_compilers.log"'
+ sample_new=sample_prior.replace('26880_gradle','26881_gradle')
+ assert sample_new!=sample_prior
+ assert sample_new.replace('$OUT/26881_','$OUT/26880_')==sample_prior
+ assert sample_new.replace('compileDebugKotlin','compileReleaseKotlin').replace('$OUT/26881_','$OUT/26880_')!=sample_prior
+ assert (sample_new+'\n'+sample_new).count('./gradlew ')==2
  # New candidate belongs only in 26881 checks. The original vendor ABI,
  # altered highlight and 26880 history must be validated on historical bytes.
  for stage in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
@@ -99,6 +110,10 @@ if len(sys.argv)>1:
     assert required in frag,('missing guarded active/historical semantic owner',stage,required)
   if stage=='compile_modified_runtime_shaders':
    assert 'verify_26881_expanded_glsl.py "$CAND" --compiler "$IRIS26864_GLSLANG"' in frag
+   # R2 did not catch this real Bash set -u failure: H79 was declared local
+   # in make_candidate; no later stage may access it as an unbound variable.
+   assert '$H79' not in frag, 'cross-stage local H79 leaked into shader stage'
+   assert 'verify_26880_runtime_glsl_scope.py "$WORK/historical_26879_from_26880" "$BASE"' in frag
   if stage=='clean_extract_replay':
    assert 'verify_26881_expanded_glsl.py "$exp"' in frag
    assert 'verify_26880_spektra_abi.py "$BASE/app"' in frag
