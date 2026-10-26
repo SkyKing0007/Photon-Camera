@@ -49,7 +49,7 @@ def package(s):
  # scope but have no replacement payload. Do not weaken allowlist equality.
  s=s.replace('diff -u 26881_CHANGED_ALLOWLIST.txt <(find handoff_payload_26881 -type f',
              'diff -u <(grep -vxf 26881_DELETIONS.txt 26881_CHANGED_ALLOWLIST.txt) <(find handoff_payload_26881 -type f')
- s=s.replace('RUN_26881_ORIGINAL_125_WRONSKI_WAVELET_HIGHLIGHT_V1','RUN_26881_SPEKTRA112_FOV_CHROMA_HIGHLIGHT_R5')
+ s=s.replace('RUN_26881_ORIGINAL_125_WRONSKI_WAVELET_HIGHLIGHT_V1','RUN_26881_SPEKTRA112_FOV_CHROMA_HIGHLIGHT_R6')
  # 26880 packed SO proof is historical; new native is exact 26692 and verified by 26881 candidate validator.
  s=s.replace(' sha256sum -c 26881_ORIGINAL_NATIVE_ZLIB_SHA256.txt >/dev/null || fail \'original native compressed source drift\'','')
  s=s.replace(' sha256sum -c 26881_FLAT_SOURCE_SHA256.txt >/dev/null || fail \'flat source staging drift\'','')

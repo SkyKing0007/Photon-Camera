@@ -60,3 +60,14 @@ while current 26881 modified GLSL is separately required and compiled. A new
 permanent regression validates the real generated compile stage against both
 unchanged successful 26880 verifier sources before entering guarded build.
 No runtime source or patches changed from R4.
+
+26881 R6 repair after failed 40410435003 / job 121879466542:
+The pre-build regression searched for a grep invocation anchored at the
+start of a Bash line, but the exact inherited successful verify_package()
+gate is `test -f ... && grep -Fx ... || fail`. This created a false failure
+while the actual runner and Stage 3 marker could be correct. R6 replaces
+that synthetic bare-grep parser with an exact combined-command parser and
+actually executes the inherited shell gate. Correct R6, stale R5 and missing
+marker cases are checked, first on the real transformed package() function
+and again on the generated runner in GitHub Actions before guarded build.
+No app source, native library, candidate hashes or patches changed from R5.
