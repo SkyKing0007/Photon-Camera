@@ -124,6 +124,28 @@ def replay(s):
              'regressions/26878_runtime_ownership_spektra.py regressions/26879_runtime_ownership_spektra.py regressions/26880_runtime_ownership_spektra.py regressions/26880_wr_no_fit_optional_wavelet.py')
  return s
 edit('clean_extract_replay',replay)
+# 40324502022: The original 55-shader RAWR validator must stay identical to
+# successful 26879. On the expanded 26880 candidate, invoke a candidate-specific
+# wrapper that runs the unchanged validator on a read-only original-domain view
+# and enforces all four new wavelet shader hashes/counts separately. Never
+# weaken or edit the historical file, nor bypass its real GLSL compilation.
+for _stage in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
+ def _fix_candidate_shader_scope(old):
+  before='python3 -S verify_26864_rawr_sources.py '
+  after='python3 -S verify_26880_rawr_shader_universe.py '
+  assert old.count(before)==1, (_stage,'unexpected original source verifier call count',old.count(before))
+  return old.replace(before,after,1)
+ edit(_stage,_fix_candidate_shader_scope)
+def _compile_new_scope(s):
+ needle='python3 -S -m py_compile verify_26880_candidate.py verify_26880_patches.py '
+ assert needle in s
+ return s.replace(needle,needle+'verify_26880_rawr_shader_universe.py ',1)
+edit('verify_package',_compile_new_scope)
+def _compile_final_scope(s):
+ needle='python3 -S -m py_compile verify_26880_candidate.py verify_26880_patches.py '
+ assert needle in s
+ return s.replace(needle,needle+'verify_26880_rawr_shader_universe.py ',1)
+edit('clean_extract_replay',_compile_final_scope)
 stages=['verify_package','verify_scope','obtain_authority','make_candidate','verify_successful_mechanics','prepare_glslang','compile_modified_runtime_shaders','compile_spektra_raw_shader','install_frozen_candidate_live','compile_languages','verify_native_glslang_handoff','compile_native','verify_candidate_patches','prebuild_safety','assemble','postbuild_proof','clean_extract_replay']
 def names(s):return [m.group(1) for m in re.finditer(r'\n([a-z_]+)\(\)\{',s)]
 assert names(prior)==names(body) and [x for x in names(body) if x in stages]==stages
@@ -133,7 +155,7 @@ for required in ('GLSLANG_VERSION="16.5.0"','PRE-BUILD SAFETY PROOF PASSED','sna
  assert required in body,required
 assert 'regressions/26877_superres_ownership.py' not in body
 # Preserve all historical regression validators. Local staging duplicates only the latest.
-for rel in {'verify_26880_candidate.py','verify_26880_patches.py','verify_26880_native_shaders.py','verify_26880_spektra_abi.py','regressions/26880_runtime_ownership_spektra.py','regressions/26880_wr_no_fit_optional_wavelet.py','regressions/26879_runtime_ownership_spektra.py','regressions/26878_runtime_ownership_spektra.py','regressions/26877_runtime_ownership_spektra.py'}:
+for rel in {'verify_26880_candidate.py','verify_26880_patches.py','verify_26880_native_shaders.py','verify_26880_spektra_abi.py','regressions/26880_runtime_ownership_spektra.py','regressions/26880_wr_no_fit_optional_wavelet.py','verify_26880_rawr_shader_universe.py','regressions/26879_runtime_ownership_spektra.py','regressions/26878_runtime_ownership_spektra.py','regressions/26877_runtime_ownership_spektra.py'}:
  assert (P/rel).is_file(),rel
 (P/'build_26880_iris_rawr.sh').write_text(body)
 (P/'26880_BUILD_INFRASTRUCTURE_DIFF.txt').write_text(''.join(difflib.unified_diff(prior.splitlines(True),body.splitlines(True),fromfile='exact_successful_26879_guarded_17_stage_runner',tofile='26880_inherited_17_stage_runner')))
