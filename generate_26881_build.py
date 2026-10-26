@@ -49,13 +49,14 @@ def package(s):
  # scope but have no replacement payload. Do not weaken allowlist equality.
  s=s.replace('diff -u 26881_CHANGED_ALLOWLIST.txt <(find handoff_payload_26881 -type f',
              'diff -u <(grep -vxf 26881_DELETIONS.txt 26881_CHANGED_ALLOWLIST.txt) <(find handoff_payload_26881 -type f')
- s=s.replace('RUN_26881_ORIGINAL_125_WRONSKI_WAVELET_HIGHLIGHT_V1','RUN_26881_SPEKTRA112_FOV_CHROMA_HIGHLIGHT_V1')
+ s=s.replace('RUN_26881_ORIGINAL_125_WRONSKI_WAVELET_HIGHLIGHT_V1','RUN_26881_SPEKTRA112_FOV_CHROMA_HIGHLIGHT_R1')
  # 26880 packed SO proof is historical; new native is exact 26692 and verified by 26881 candidate validator.
  s=s.replace(' sha256sum -c 26881_ORIGINAL_NATIVE_ZLIB_SHA256.txt >/dev/null || fail \'original native compressed source drift\'','')
  s=s.replace(' sha256sum -c 26881_FLAT_SOURCE_SHA256.txt >/dev/null || fail \'flat source staging drift\'','')
  return s+'''
- python3 -S -m py_compile verify_26881_candidate.py verify_26881_patches.py verify_26881_expanded_glsl.py regressions/26881_spektra_chroma_clip.py stage_26881_root.py
+ python3 -S -m py_compile verify_26881_candidate.py verify_26881_patches.py verify_26881_expanded_glsl.py regressions/26881_spektra_chroma_clip.py regressions/26881_actual_generator_artifact_identity.py stage_26881_root.py
  python3 -S stage_26881_root.py --verify-only
+ python3 -S regressions/26881_actual_generator_artifact_identity.py build_26881_iris_rawr.sh
 '''
 edit('verify_package',package)
 def scope(s):
@@ -64,9 +65,24 @@ def scope(s):
  return s
 edit('verify_scope',scope)
 def authority(s):
- s=s.replace('26879','26880').replace("'id':12600241817","'id':12658293287")
- s=s.replace("'name':'photon-26879-b-50mp-neon-spektra-fov'","'name':'photon-26880-original-spektra125-rawwavelet-highlights'")
- s=s.replace('sha256:bf060a690ee8792e0d3ab4fd58d25cabb2c0a2d35d6ffcd8a186508bb7132930','sha256:5516d6deffd486de6d5dd18a51ebeb6d216883b7a4df325cc70ad09d80bee455')
+ # Permanent regression from failed Actions 40392745967 / job 121817713609:
+ # prior source identifiers have already undergone the historic 26879->26880
+ # stage-local substitution when we update the *artifact name*. A silent
+ # missed .replace() caused an assertion before any real compiler ran.
+ historical_name="photon-26880-b-50mp-neon-spektra-fov"
+ actual_name="photon-26880-original-spektra125-rawwavelet-highlights"
+ assert s.count("12600241817")==1, ('old successful artifact ID not unique',s.count("12600241817"))
+ assert s.count('sha256:bf060a690ee8792e0d3ab4fd58d25cabb2c0a2d35d6ffcd8a186508bb7132930')==1, 'old artifact digest missing/duplicated'
+ # This operation must run BEFORE verifying the artifact-name anchor: the
+ # previous successful 26880 runner references the prior 26879 artifact.
+ s=s.replace('26879','26880')
+ assert s.count(historical_name)==1, ('successful 26879 artifact name anchor missing',s.count(historical_name))
+ assert actual_name not in s, 'current artifact name was already present before targeted migration'
+ s=s.replace(historical_name,actual_name,1)
+ s=s.replace("12600241817","12658293287",1)
+ s=s.replace('sha256:bf060a690ee8792e0d3ab4fd58d25cabb2c0a2d35d6ffcd8a186508bb7132930','sha256:5516d6deffd486de6d5dd18a51ebeb6d216883b7a4df325cc70ad09d80bee455',1)
+ assert s.count(actual_name)==1 and s.count("12658293287")==1, 'exact current successful artifact metadata was not installed'
+ assert historical_name not in s, 'stale previous artifact name left behind'
  # Successful 26880 attempt 4 added 14 source files: unlike 26879's 2001,
  # exact 26880 artifact authority contains 2015 files. This is distinct from
  # the candidate's final 2009 count and must not be conflated.

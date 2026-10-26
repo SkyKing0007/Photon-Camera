@@ -9,3 +9,12 @@ Stage 3: upload only stage 3/TRIGGER_26881.txt to repository ROOT. Commit once. 
 Runtime scope: 18 paths (12 replacements, six deletions), protected 1997 files, source authority 2015 -> candidate 2009. Original Spektra 26692 compiled native library restored SHA f40b4707..., source B chroma edge topology and clipped-white safety corrected. 26880 DNG/Motion/Night/A/native RAWR owners preserved except explicit Spektra lib restoration.
 
 The exact successful 26880 generated runner SHA 312bc... is reconstructed and checked before generating the 26881 successor, never replaced with a synthetic runner. Required real GLSL, Kotlin/Java, native both ABIs, full Android APK compilation, 17-stage guarded proof, final postbuild/clean extract run in Actions. CI proof is not yet supplied by this prepared upload. On-device visual and preview outcomes must be tested on the built APK.
+
+26881 R1 repair after failed 40392745967 job 121817713609:
+The stage 1 artifact-name conversion previously used a stale string after
+prior-version renaming and failed before actual compiler gates. The corrected
+generator enforces exact unique transformed artifact name, ID, digest and
+Actions attempt-4 provenance; the original failing condition is a permanent
+regression. Stage 2 workflow and Stage 3 trigger use an R1 marker, so only the
+intended new Stage 3 commit launches an Actions run. All app runtime bytes and
+source changed-file allowlist remain identical to original 26881 handoff.
