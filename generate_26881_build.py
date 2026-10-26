@@ -49,7 +49,7 @@ def package(s):
  # scope but have no replacement payload. Do not weaken allowlist equality.
  s=s.replace('diff -u 26881_CHANGED_ALLOWLIST.txt <(find handoff_payload_26881 -type f',
              'diff -u <(grep -vxf 26881_DELETIONS.txt 26881_CHANGED_ALLOWLIST.txt) <(find handoff_payload_26881 -type f')
- s=s.replace('RUN_26881_ORIGINAL_125_WRONSKI_WAVELET_HIGHLIGHT_V1','RUN_26881_SPEKTRA112_FOV_CHROMA_HIGHLIGHT_R1')
+ s=s.replace('RUN_26881_ORIGINAL_125_WRONSKI_WAVELET_HIGHLIGHT_V1','RUN_26881_SPEKTRA112_FOV_CHROMA_HIGHLIGHT_R5')
  # 26880 packed SO proof is historical; new native is exact 26692 and verified by 26881 candidate validator.
  s=s.replace(' sha256sum -c 26881_ORIGINAL_NATIVE_ZLIB_SHA256.txt >/dev/null || fail \'original native compressed source drift\'','')
  s=s.replace(' sha256sum -c 26881_FLAT_SOURCE_SHA256.txt >/dev/null || fail \'flat source staging drift\'','')
@@ -131,6 +131,19 @@ def shaders(s):
  # Replay the successful 26880 highlight proof on its actual compiled candidate.
  s=s.replace('verify_26880_highlight_runtime_shader.py "$CAND"','verify_26880_highlight_runtime_shader.py "$BASE"')
  s=s.replace('verify_26880_runtime_glsl_scope.py "$BASE" "$CAND"','verify_26880_runtime_glsl_scope.py "$WORK/historical_26879_from_26880" "$BASE"')
+ # This success stdout is produced by byte-unchanged successful 26880
+ # validators. Global version migration changes the current runner's output
+ # paths, NOT the historical validators' printed success strings.
+ hist=(
+  ("grep -Fx 'PASS REAL 26881 FIVE ORIGINAL RAWR WAVELET SPIR-V COMPILERS'",
+   "grep -Fx 'PASS REAL 26880 FIVE ORIGINAL RAWR WAVELET SPIR-V COMPILERS'"),
+  ("grep -Fx 'PASS 26881 THREE CURRENT HIGHROOM/SMOOTH-WHITE SHADERS REAL GLSL'",
+   "grep -Fx 'PASS 26880 THREE CURRENT HIGHROOM/SMOOTH-WHITE SHADERS REAL GLSL'"),
+ )
+ for stale,historical in hist:
+  assert s.count(stale)==1,('missing or duplicated stale generated output check',stale,s.count(stale))
+  s=s.replace(stale,historical,1)
+  assert s.count(historical)==1,('historical immutable validator output contract absent',historical)
  # H79 is local to make_candidate; later stages use the persisted WORK path.
  # Historical 26880 exact-original shader proof uses its own expected marker unchanged.
  s+='''

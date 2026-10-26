@@ -42,3 +42,21 @@ It now uses the actual persisted historical candidate path in $WORK.
 The inherited successful 26880 runner remains SHA-pinned; the R3 successor
 is generated twice and byte-compared, plus its full stage/semantic replay.
 No 26881 runtime source, allowlist, binary patch, or version byte changed.
+
+26881 R4 repair after failed 40402359994 / job 121851243719:
+Original workflow and stage3 requested R3 marker while generated 17-stage
+verify_package() continued to expect R1, stopping after successful stage
+runner generation / inherited GLSL cleanup. R4 migrates the exact guarded
+runner marker to R4 and installs a permanent exact-generator regression
+using the actual package() function plus the generated runner body. The R4
+workflow checks runner/workflow/trigger agreement BEFORE executing the guarded
+script. Strict runtime source, binary patch and compiler sequence unchanged.
+
+26881 R5 correction after read-only R4 audit: the generator's global
+version migration would make the real pinned 26880 wavelet and highlight
+verifiers print 26880 PASS while the new compile stage grepped for 26881 PASS.
+Both historical output contracts now remain 26880 (the real proven emitter),
+while current 26881 modified GLSL is separately required and compiled. A new
+permanent regression validates the real generated compile stage against both
+unchanged successful 26880 verifier sources before entering guarded build.
+No runtime source or patches changed from R4.
