@@ -241,6 +241,7 @@ internal object GlesIris26858BNoiseHighlight {
     val bHighlightRecover = """
         #version 300 es
         precision highp float;
+        precision highp int;
         uniform sampler2D uWbRgb;
         uniform sampler2D uClip;
         uniform ivec2 uSize;
@@ -250,35 +251,60 @@ internal object GlesIris26858BNoiseHighlight {
         uniform int uExpandedScale;
         uniform vec3 uAmazeWb;
         layout(location=0) out vec4 oRgb;
-        vec3 clipRgb(ivec2 p){
-            ivec2 q=clamp((uOrigin+p)/(2*uExpandedScale),ivec2(0),uCellSize-ivec2(1));
-            vec4 ph=texelFetch(uClip,q,0);
-            if(uBayerPattern==0)return vec3(ph.r,max(ph.g,ph.b),ph.a);
-            if(uBayerPattern==1)return vec3(ph.g,max(ph.r,ph.a),ph.b);
-            if(uBayerPattern==2)return vec3(ph.b,max(ph.r,ph.a),ph.g);
-            return vec3(ph.a,max(ph.g,ph.b),ph.r);
+        vec3 phaseClip(ivec2 q){
+            ivec2 bounded=clamp(q,ivec2(0),uCellSize-ivec2(1));
+            vec4 ph=texelFetch(uClip,bounded,0);
+            if(uBayerPattern==0)return vec3(ph.r,0.5*(ph.g+ph.b),ph.a);
+            if(uBayerPattern==1)return vec3(ph.g,0.5*(ph.r+ph.a),ph.b);
+            if(uBayerPattern==2)return vec3(ph.b,0.5*(ph.r+ph.a),ph.g);
+            return vec3(ph.a,0.5*(ph.g+ph.b),ph.r);
+        }
+        float independentlyClipped(ivec2 q){
+            vec3 physical=phaseClip(q);
+            // Single-phase neon red/blue never establishes a white object.
+            // Two independent CFA colors including green are required.
+            return min(clamp(physical.g,0.0,1.0),
+                       max(clamp(physical.r,0.0,1.0),
+                           clamp(physical.b,0.0,1.0)));
         }
         void main(){
             ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
             vec4 original=texelFetch(uWbRgb,p,0);
-            vec3 clip=clipRgb(p);
-            float unreliable=clamp(max(max(clip.r,clip.g),clip.b),0.0,1.0);
-            if(unreliable<=0.0){oRgb=original;return;}
-            // Smooth endpoints guarantee no abrupt nonzero correction just as
-            // a channel enters the physically evidenced near-white interval.
+            // The 26859 clipping fraction is native-CFA-cell geometry;
+            // interpolate confidence continuously within that geometry,
+            // NOT with nearest-cell blocks, pseudo-random dithering, or RGB
+            // borrowing from a different material/object. A red-only clipped
+            // neon sign has ZERO independently-clipped Bayer support.
+            vec2 cell=(vec2(uOrigin+p)+vec2(0.5)) /
+                      max(float(2*uExpandedScale),1.0)-vec2(0.5);
+            ivec2 q=ivec2(floor(cell));
+            vec2 f=clamp(fract(cell),vec2(0.0),vec2(1.0));
+            float cross=mix(mix(independentlyClipped(q),
+                                independentlyClipped(q+ivec2(1,0)),f.x),
+                            mix(independentlyClipped(q+ivec2(0,1)),
+                                independentlyClipped(q+ivec2(1,1)),f.x),f.y);
             vec3 rgb=max(original.rgb,vec3(0.0));
             float hi=max(max(rgb.r,rgb.g),rgb.b);
-            float lo=min(min(rgb.r,rgb.g),rgb.b);
-            float colorStrength=(hi-lo)/max(hi,0.0001);
-            float fade=smoothstep(0.0,1.0,unreliable)*
-                (1.0-smoothstep(0.045,0.18,colorStrength));
+            float second=max(min(rgb.r,rgb.g),min(max(rgb.r,rgb.g),rgb.b));
+            float wbSafe=max(min(uAmazeWb.r,min(uAmazeWb.g,uAmazeWb.b)),0.0001);
+            // Green-only saturation can still indicate a clipped white core
+            // if independently observed R and B radiance also approach their
+            // own sensor-white levels. A red-only neon never qualifies.
+            float green=mix(mix(phaseClip(q).g,phaseClip(q+ivec2(1,0)).g,f.x),
+                            mix(phaseClip(q+ivec2(0,1)).g,
+                                phaseClip(q+ivec2(1,1)).g,f.x),f.y);
+            float rbBright=smoothstep(0.80,0.98,
+                min(rgb.r/max(uAmazeWb.r,0.0001),
+                    rgb.b/max(uAmazeWb.b,0.0001)));
+            float opticalBrightness=smoothstep(0.72,1.10,second/wbSafe);
+            float fade=smoothstep(0.12,0.93,max(cross,green*rbBright)) *
+                       opticalBrightness;
             if(fade<=0.0){oRgb=original;return;}
-            float sharedSafeWhite=min(uAmazeWb.r,min(uAmazeWb.g,uAmazeWb.b));
-            // Never reduce a sensor-reconstructed channel, clip HDR >1, or
-            // compress the highlight radiance into an artificial grey shoulder.
-            float neutral=max(max(max(rgb.r,rgb.g),rgb.b),sharedSafeWhite);
-            vec3 white=vec3(neutral);
-            oRgb=vec4(mix(original.rgb,white,fade),original.a);
+            // Preserve unclipped material and camera color outside the
+            // sensor-proven, genuinely visually bright multicolor core.
+            // Continuous white convergence is post-WB and inverse-WB safe.
+            float neutral=max(hi,wbSafe);
+            oRgb=vec4(mix(original.rgb,vec3(neutral),fade),original.a);
         }
     """.trimIndent()
 
@@ -323,47 +349,82 @@ internal object GlesIris26858BNoiseHighlight {
         uniform sampler2D uNativeSensorClip;
         uniform ivec2 uSize;
         uniform vec3 uAmazeWb;
+        uniform int uBayerPattern;
         layout(location=0) out vec4 oRgb;
+        float clipAt(ivec2 p){
+            return clamp(texelFetch(uNativeSensorClip,
+                clamp(p,ivec2(0),uSize-ivec2(1)),0).r,0.0,1.0);
+        }
+        // Only independent Bayer colors, not a single blown red pixel,
+        // can establish a white highlight. The stored R16F mask retains
+        // its ORIGINAL pre-WB physical-site phase at full 2x resolution.
+        // Sensor clipping has four independent measured Bayer phase owners.
+        // Interpolate EACH physical color's confidence before asking whether
+        // at least two different sensor colors are clipped. Never quantize
+        // a continuous fade by min(center-cell,interpolated-cell): that
+        // resurrects square two-pixel plateaus in the red-neon border.
+        vec3 phaseColorClipAt(ivec2 cell){
+            ivec2 cellMax=max((uSize-ivec2(1))/2,ivec2(0));
+            ivec2 base=2*clamp(cell,ivec2(0),cellMax);
+            float phase[4]=float[4](clipAt(base),clipAt(base+ivec2(1,0)),
+                clipAt(base+ivec2(0,1)),clipAt(base+ivec2(1,1)));
+            int r=clamp(uBayerPattern,0,3);
+            int b=3-r;
+            int g0=(r==0||r==3)?1:0;
+            int g1=3-g0;
+            return vec3(phase[r],0.5*(phase[g0]+phase[g1]),phase[b]);
+        }
         void main(){
             ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
             vec4 original=texelFetch(uWbRgb,p,0);
             // Full-resolution original-sensor evidence, not a rescaled
             // 2x2 packed CFA phase field or a late RGB saturation estimate.
-            // A symmetric three-tap [1,2,1] footprint suppresses sensor-CFA
-            // checkerboard seams without contributing neighboring RGB values.
-            float k[3]=float[3](1.0,2.0,1.0);
-            float clippedCoverage=0.0;
-            for(int y=-1;y<=1;y++){
-                for(int x=-1;x<=1;x++){
-                    ivec2 q=clamp(p+ivec2(x,y),ivec2(0),uSize-ivec2(1));
-                    float hit=clamp(texelFetch(uNativeSensorClip,q,0).r,0.0,1.0);
-                    clippedCoverage += k[x+1]*k[y+1]*hit;
-                }
-            }
-            clippedCoverage *= 1.0/16.0;
+            // Symmetric sensor-only coverage. Inward cross-color authority
+            // prevents a clipped red neon phase borrowing a neighboring white
+            // object's mask. The 3x3 cells damp pixel-grid/checkerboard edges.
+            // Five-tap inward isotropic confidence: fewer original-sensor
+            // texture reads on the 50MP path than a full 3x3 box kernel.
+            // Center contributes half; each immediate physical neighbor 1/8.
+            float clippedCoverage=(4.0*clipAt(p)+
+                clipAt(p+ivec2(-1,0))+clipAt(p+ivec2(1,0))+
+                clipAt(p+ivec2(0,-1))+clipAt(p+ivec2(0,1)))*0.125;
             if(clippedCoverage<=0.0){oRgb=original;return;}
-            // A single clipped site has a small fractional fade; dense clipped
-            // regions approach neutral without a hard Bayer phase edge.
-            // The native mask is original-sensor clipping evidence. One saturated
-            // Bayer phase among four already invalidates reliable white hue.
-            // Reach neutral at one quarter coverage, not only when every site
-            // is saturated. Tiny partial coverage begins fading continuously.
-            // No RGB-derived clipping and no neighboring RGB/color donation.
+            // Same continuous physical-sensor coordinate as the FULL native
+            // R16F evidence, independent of 2x reconstruction's RGB phase.
+            // Only evidence is interpolated; no neighboring RGB is borrowed.
+            // The local five-tap clippedCoverage is an independent smooth
+            // veto against donating clipping from a different object.
+            vec2 cellPosition=(vec2(p)+vec2(0.5))*0.5-vec2(0.5);
+            ivec2 baseCell=ivec2(floor(cellPosition));
+            vec2 blend=clamp(fract(cellPosition),vec2(0.0),vec2(1.0));
+            vec3 colorClip=mix(
+                mix(phaseColorClipAt(baseCell),
+                    phaseColorClipAt(baseCell+ivec2(1,0)),blend.x),
+                mix(phaseColorClipAt(baseCell+ivec2(0,1)),
+                    phaseColorClipAt(baseCell+ivec2(1,1)),blend.x),blend.y);
+            float inwardCross=min(colorClip.g,max(colorClip.r,colorClip.b));
             vec3 rgb=max(original.rgb,vec3(0.0));
             float hi=max(max(rgb.r,rgb.g),rgb.b);
-            float lo=min(min(rgb.r,rgb.g),rgb.b);
-            // IRIS_26879_NATIVE_B_COLORED_NEON_HUE_GUARD:
-            // A clipped RED/BLUE CFA site is not proof that its material is
-            // WHITE. Retain reconstructed saturated RGB verbatim. Restrict
-            // the inherited sensor-clip neutral intervention to genuinely
-            // near-neutral RGB; no neighbor-hue invention or RGB threshold
-            // clipping, and no changes at all outside the native mask.
-            float colorStrength=(hi-lo)/max(hi,0.0001);
-            float nearNeutral=1.0-smoothstep(0.045,0.18,colorStrength);
-            float fade=smoothstep(0.0,0.25,clippedCoverage)*nearNeutral;
+            float second=max(min(rgb.r,rgb.g),min(max(rgb.r,rgb.g),rgb.b));
+            float wbSafe=max(min(uAmazeWb.r,min(uAmazeWb.g,uAmazeWb.b)),0.0001);
+            // A green-only sensor plateau can also conceal the color of a
+            // high-energy white source. Require BOTH remaining channels to
+            // be near their individual sensor-white WB-scaled limit.
+            float greenOnly=colorClip.g *
+                smoothstep(0.80,0.98,min(rgb.r/max(uAmazeWb.r,0.0001),
+                                        rgb.b/max(uAmazeWb.b,0.0001)));
+            // Continuous cross-color evidence cannot become a white halo
+            // outside the locally clipped footprint, and red-only neon has
+            // neither an independent green clip nor an RB-bright green witness.
+            float opticalSupport=min(clippedCoverage,max(inwardCross,greenOnly));
+            float brightSupport=smoothstep(0.70,1.10,second/wbSafe);
+            float fade=smoothstep(0.14,0.90,clippedCoverage)*
+                smoothstep(0.05,0.82,opticalSupport)*brightSupport;
             if(fade<=0.0){oRgb=original;return;}
-            float sharedSafeWhite=min(uAmazeWb.r,min(uAmazeWb.g,uAmazeWb.b));
-            float neutral=max(hi,sharedSafeWhite);
+            // Continuous non-object-specific sensor clipping transition:
+            // red-only clipped neon and un-clipped color remain unchanged;
+            // truly censored multicolor cores approach scene-linear white.
+            float neutral=max(hi,wbSafe);
             oRgb=vec4(mix(original.rgb,vec3(neutral),fade),original.a);
         }
     """.trimIndent()

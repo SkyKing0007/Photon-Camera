@@ -297,6 +297,9 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
     // The dedicated Spektra SurfaceView occupies the exact same bounds under existing overlays.
     public void setSpektraPreviewVisible(boolean spektraVisible) {
         if (spektraSurfaceView != null) {
+            // A previous preparing state must never leave the successful
+            // native viewfinder transparent, or the next Photo view invisible.
+            spektraSurfaceView.setAlpha(1.0f);
             if (spektraVisible) {
                 // Apply before showing an already-measured host; retry after
                 // layout on first launch/rotation, before the first RAW frame.
@@ -321,6 +324,23 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
         }
     }
 
+    /**
+     * IRIS_26880_SPEKTRA_READY_GATED_PRESENTATION:
+     * Keep the incumbent viewfinder visible until Vulkan successfully draws
+     * the first Spektra frame. A visible SurfaceView remains attached for the
+     * native renderer even while alpha is zero. Never declare it READY just
+     * because the Camera2 session started.
+     */
+    private void setSpektraPreviewPreparing26880() {
+        if (spektraSurfaceView != null) {
+            updateSpektraViewportBounds26877();
+            spektraSurfaceView.setVisibility(View.VISIBLE);
+            spektraSurfaceView.setAlpha(0.0f);
+            spektraSurfaceView.post(this::updateSpektraViewportBounds26877);
+        }
+        if (textureView != null) textureView.setVisibility(View.VISIBLE);
+    }
+
     private void setModelsToLayout() {
         //bind the model to the ui, it applies changes when the model values get changed
         cameraFragmentBinding.setUimodel(cameraFragmentViewModel.getCameraFragmentModel());
@@ -340,7 +360,7 @@ public class CameraFragment extends Fragment implements BaseActivity.BackPressed
         this.captureController = new CaptureController(activity, processExecutorService,
                 new CameraEventsListenerImpl(), new SpektraModeController.Host() {
                     @Override public void onSpektraPreviewPreparing() {
-                        if (activity != null) activity.runOnUiThread(() -> setSpektraPreviewVisible(true));
+                        if (activity != null) activity.runOnUiThread(() -> setSpektraPreviewPreparing26880());
                     }
                     @Override public void onSpektraPreviewReady() {
                         if (activity != null) activity.runOnUiThread(() -> {

@@ -117,10 +117,30 @@ public final class SpektraModeController {
     @NonNull
     private synchronized RawVulkanPreviewController ensureControllerForActivation() {
         if (shutdown) throw new IllegalStateException("Spektra controller is shut down");
+        // The USER-SUPPLIED original UnspektrAwesome 1.2.5 APK supplies only
+        // arm64-v8a renderer JNI. Iris still ships an unrelated 32-bit camera
+        // library for other modes; never invoke 1.2.5 signatures against it.
+        // resume/restart catch this failure and restore Iris camera ownership.
+        if (!android.os.Process.is64Bit()) {
+            throw new IllegalStateException(
+                    "Original UnspektrAwesome 1.2.5 Spektra requires a 64-bit Android process");
+        }
         if (controller != null) return controller;
         RawVulkanPreviewController created = new RawVulkanPreviewController(
                 activity.getApplicationContext(), spektraRepository);
         created.setHistogramListener(histogramListener);
+        created.setFirstFrameListener(() -> {
+            // Only an actual successful native Vulkan render can expose the
+            // Spektra SurfaceView. An OPENING or Camera2 STREAMING state is
+            // insufficient (26879 black-viewfinder regression).
+            final int token = generation.get();
+            activity.runOnUiThread(() -> {
+                if (!shutdown && active && controller == created && generation.get() == token) {
+                    Log.i("SpektraModeController", "IRIS_26880_SPEKTRA_FIRST_FRAME_READY generation=" + token);
+                    host.onSpektraPreviewReady();
+                }
+            });
+        });
         created.setCaptureListener(new RawVulkanPreviewController.CaptureListener() {
             @Override public void onCaptureAccepted(long revisionId) {
                 bridgeCaptureAccepted(created, revisionId);
@@ -263,6 +283,7 @@ public final class SpektraModeController {
         selectedCamera = null;
         bridgeError = error.getClass().getSimpleName() + ": "
                 + (error.getMessage() == null ? "Spektra initialization failed" : error.getMessage());
+        Log.e("SpektraModeController", "IRIS_26880_SPEKTRA_ACTIVATION_FAILED " + bridgeError);
         activity.runOnUiThread(host::onSpektraPreviewStopped);
     }
 
@@ -320,6 +341,7 @@ public final class SpektraModeController {
                 if (token != generation.get()) return;
                 bridgeError = error.getClass().getSimpleName() + ": "
                         + (error.getMessage() == null ? "camera configuration failed" : error.getMessage());
+                Log.e("SpektraModeController", "IRIS_26880_SPEKTRA_CAMERA_SELECTION_FAILED " + bridgeError);
                 selectedCamera = null;
                 activeController.configure(null, preferences);
             }

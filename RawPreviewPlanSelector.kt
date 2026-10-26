@@ -39,24 +39,15 @@ object RawPreviewPlanSelector {
             importCapabilities[RawImportStreamKey.from(camera.route.routeId, output)]?.state !=
                 RawImportCapabilityState.INCOMPATIBLE
         }
-        // IRIS_26692_UNSPEKTRAWESOME_RAW10_PREFERENCE
-        // The audited 1.1.2 APK prefers RAW10 where usable, then packed alternatives, with
-        // RAW_SENSOR as a real fallback. Do not pre-filter the plan to RAW_SENSOR here;
-        // RawPreviewPolicy owns the format ranking for the complete eligible set.
-        /* IRIS_26879_SPEKTRA_CAPTURE_MATCHED_RAW_FOV
-         * The 26878 SurfaceView already has the exact 3:4 presentation ratio,
-         * yet the screenshot loses its left/right field of view versus the
-         * captured 4096x3072 RAW10 still. Small preview RAW streams may carry
-         * HAL center crops on this camera despite identical aspect ratios.
-         * Choose the same largest importable regular RAW stream as the saved
-         * still when there is no explicit user stream override. Preserve the
-         * standalone format order, camera identity and independent GPU quality
-         * scaling, rather than stretching or cropping the final 2D surface.
-         * If explicit preference exists, respect it as original code did.
-         */
-        val previewOutputs = selectedOutput?.let(::listOf) ?: listOf(
-            RawPreviewPolicy.selectCaptureOutput(eligibleOutputs, candidateFormats),
-        )
+        // IRIS_26880_SPEKTRA_RELIABLE_STREAM_NEGOTIATION:
+        // The 26879 forced largest still-size RAW stream can be too slow or
+        // unusable as a repeating Camera2/Vulkan viewfinder stream. Keep ALL
+        // import-compatible regular RAW outputs available to RawPreviewPolicy:
+        // it independently ranks Camera2 FPS, format and processing resolution.
+        // User explicit stream preference still wins, as originally specified.
+        // FULL affects the processing lattice only, not a mandatory 30fps
+        // capture-stream allocation of the maximum still dimension.
+        val previewOutputs = selectedOutput?.let(::listOf) ?: eligibleOutputs
         require(previewOutputs.isNotEmpty()) {
             "No advertised RAW stream remains compatible with the Unspektrawesome RAW importer"
         }

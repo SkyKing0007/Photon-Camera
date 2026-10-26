@@ -739,6 +739,7 @@ internal class GlesMgcRawSpatialStacker(
     private var sabreShadowLongLumaAccumulateProgram26833 = 0
     private var sabreShadowLongLumaGainMapProgram26833 = 0
     private var sabreShadowLongPostVgnLumaApplyProgram26833 = 0
+    private var sabreClipZonePreserveOriginalHeadroomProgram26880 = 0
     private var sabreClipZoneMaskDilateProgram26834 = 0
     private var sabreClipZoneGaussianProgram26834 = 0
     private var sabreClipZoneProductsProgram26834 = 0
@@ -7026,6 +7027,7 @@ internal class GlesMgcRawSpatialStacker(
             bindTexture(program,"uWbRgb",0,postWb)
             bindTexture(program,"uNativeSensorClip",1,sensorClipFullRes)
             uniform2i(program,"uSize",w,h)
+            uniform1i(program,"uBayerPattern",cfaPattern)
             GLES30.glUniform3f(GLES30.glGetUniformLocation(program,"uAmazeWb"),wb[0],wb[1],wb[2])
             draw(program,w,h,intArrayOf(output))
             GlesGpuScheduler.memoryBarrier()
@@ -8778,8 +8780,25 @@ internal class GlesMgcRawSpatialStacker(
         gaussianPass26834(mask, scratch, width, height, edgeFalseColor26778.clipZoneMaskSigma, true)
         gaussianPass26834(scratch, mask, width, height, edgeFalseColor26778.clipZoneMaskSigma, false, edgeFalseColor26778.clipZoneMaskGain, true)
         releaseOwnedTexture(scratch, "26834 clip-zone mask gaussian scratch")
+        // Preserve expanded-mask RED exactly but attach the NON-DILATED NORMAL
+        // physical headroom in GREEN before this original provenance dies.
+        // This is not a new fusion or RGB denoiser; the 26879 .r consumer is unchanged.
+        val physical = createTexture(width, height, GLES30.GL_RG16F, GLES30.GL_NEAREST)
+        var composed = false
+        try {
+            GLES30.glUseProgram(sabreClipZonePreserveOriginalHeadroomProgram26880)
+            bindTexture(sabreClipZonePreserveOriginalHeadroomProgram26880, "uInheritedMask", 0, mask)
+            bindTexture(sabreClipZonePreserveOriginalHeadroomProgram26880, "uNormalHeadroom", 1, provenance)
+            draw(sabreClipZonePreserveOriginalHeadroomProgram26880, width, height, intArrayOf(physical))
+            GlesGpuScheduler.memoryBarrier()
+            checkGlError("26880 NORMAL true-headroom/expanded-mask same-owner packing")
+            composed = true
+        } finally {
+            releaseOwnedTexture(mask, "26880 inherited R16F mask packed into RG16F")
+            if (!composed) releaseOwnedTexture(physical, "26880 failed original headroom packing")
+        }
         PLog.i(SABRE_TAG, "IRIS_26834_CLIP_ZONE_MASK source=NORMAL_ONLY_SOURCE_NEIGHBORHOOD_CONFIDENCE longIncluded=false dilation=${edgeFalseColor26778.clipZoneDilation} sigma=${edgeFalseColor26778.clipZoneMaskSigma} gain=${edgeFalseColor26778.clipZoneMaskGain} clipStart=${edgeFalseColor26778.clipZoneClipStart}")
-        return mask
+        return physical
     }
 
     private fun applyClipZoneChromaInpaint26834(source: Int, mask: Int): Int {
@@ -9155,6 +9174,9 @@ internal class GlesMgcRawSpatialStacker(
             GlesMgcRawSabreShaders.normalCfaExtract26852,
             "iris_26852_normal_cfa_extract",
         )
+        sabreClipZonePreserveOriginalHeadroomProgram26880 = linkProgram(
+            GlesMgcRawSabreShaders.clipZonePreserveOriginalHeadroom26880,
+            "iris_26880_normal_original_headroom_mask_carrier")
         sabreClipZoneMaskDilateProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneMaskDilate26834, "iris_26834_clip_zone_mask_dilate")
         sabreClipZoneGaussianProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneGaussian26834, "iris_26834_clip_zone_gaussian")
         sabreClipZoneProductsProgram26834 = linkProgram(GlesMgcRawSabreShaders.clipZoneProducts26834, "iris_26834_clip_zone_products")
@@ -17899,7 +17921,7 @@ internal class GlesMgcRawSpatialStacker(
             }
             PLog.i(SABRE_TAG, "IRIS_26864_PINNED_WRONSKI_2X_OUTPUT " +
                 "size=${outputW}x${outputH} realGpu=true noLegacyFallback=true " +
-                "preAmazePhysicalLsc=true burstNoiseFitted=true shortLongLumaOnly=true")
+                "preAmazePhysicalLsc=true burstNoiseFitted=unreportedAtGlPublication shortLongLumaOnly=true")
             return Iris26864Wronski2xPublication(target, nativeClipBits)
         } catch (failure: Throwable) {
             runCatching { nativeClipBits.delete() }

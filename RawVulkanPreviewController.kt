@@ -97,6 +97,11 @@ class RawVulkanPreviewController(
     private val cameraManager = context.applicationContext
         .getSystemService(CameraManager::class.java)
     private val renderer = VulkanRenderer(context.applicationContext)
+    // Original APK Lu14 loads these from the video_recording preference store:
+    // temporal_strength default .3; temporal_frames default 4 (clamped 2..16).
+    private val original125RecordingPreferences =
+        context.applicationContext.getSharedPreferences("video_recording", Context.MODE_PRIVATE)
+    private val original125Cadence = Original125Cadence()
     private val jpegWriter = JpegMediaStoreWriter(context.applicationContext.contentResolver)
     private val captureWriter = Executors.newSingleThreadExecutor { task ->
         Thread(task, "UnspektrawesomeJpegWriter")
@@ -137,6 +142,13 @@ class RawVulkanPreviewController(
     // Acquisition lives with the Unspektrawesome preview owner, never in an Iris worker/poller.
     private var histogramListener: HistogramListener? = null
     private var captureListener: CaptureListener? = null
+    // IRIS_26880_SPEKTRA_FIRST_RENDER_OWNER: native frame presentation,
+    // never camera-open or a SurfaceView resize, licenses UI readiness.
+    private var firstFrameListener: Runnable? = null
+    private var firstFramePresented = false
+    // Per-surface/session generation baseline. Never accept a previous lens's
+    // native success counter as proof that THIS Surface displayed a frame.
+    private var presentedFramesBaseline125 = 0L
     private var lastHistogramPublishAtMs = 0L
     private var lastExposureMeterLogAtMs = 0L
     // IRIS_26694_STANDALONE_AE_METER_INPUT: the carrier is bidirectional. Configure the
@@ -158,6 +170,10 @@ class RawVulkanPreviewController(
     val captureStatus: StateFlow<RawCaptureStatus> = mutableCaptureStatus.asStateFlow()
     val rawImportCapabilities: StateFlow<Map<RawImportStreamKey, RawImportCapability>> =
         mutableRawImportCapabilities.asStateFlow()
+
+    fun setFirstFrameListener(listener: Runnable?) = synchronized(lock) {
+        firstFrameListener = listener
+    }
 
     fun isStreaming(): Boolean = synchronized(lock) {
         !closed && resumed && active?.session?.state() == Camera2RawSession.State.STREAMING &&
@@ -342,6 +358,8 @@ class RawVulkanPreviewController(
             publishLocked(RawPreviewPhase.ERROR, "Vulkan rejected the viewfinder surface")
             return@synchronized
         }
+        presentedFramesBaseline125 = renderer.presentedFrames125()
+        firstFramePresented = false
         reconcileLocked()
     }
 
@@ -367,6 +385,10 @@ class RawVulkanPreviewController(
                 publishLocked(RawPreviewPhase.ERROR, "Vulkan surface resize refresh failed")
                 return@synchronized
             }
+            // The Surface remained the same Java object but the underlying
+            // swapchain was recreated. Demand a newly presented native frame.
+            presentedFramesBaseline125 = renderer.presentedFrames125()
+            firstFramePresented = false
             Log.i(TAG, "IRIS_26878_SPEKTRA_SURFACE_EXTENT_REFRESH " +
                 "from=${oldExtent.width}x${oldExtent.height} to=${width}x${height} " +
                 "nativeRebind=true cameraSessionPreserved=true")
@@ -410,9 +432,18 @@ class RawVulkanPreviewController(
         clearHistogramLocked()
         histogramListener = null
         captureListener = null
+        firstFrameListener = null
+        firstFramePresented = false
         renderer.close()
         exposureMeterPoller.shutdownNow()
-        captureWriter.shutdownNow()
+        // An accepted shutter may already have completed synchronous RAW/Vulkan
+        // development and queued an immutable, owned ARGB bitmap for JPEG/EXIF.
+        // shutdownNow() interrupts that final save when the user exits Spektra
+        // or Android destroys the view, leaving a photo uncaptured despite a
+        // successful RCD. Retire Camera2/native owners immediately, but let
+        // the one JPEG writer drain already accepted bitmap transactions.
+        // pendingCapture is cleared above so no stale UI callback is emitted.
+        captureWriter.shutdown()
         publishLocked(RawPreviewPhase.CLOSED, "RAW preview is closed")
     }
 
@@ -510,27 +541,35 @@ class RawVulkanPreviewController(
             )
             val outputSize = request.geometry.outputSize
             val bitmap = Bitmap.createBitmap(outputSize.width, outputSize.height, Bitmap.Config.ARGB_8888)
-            val rendered = renderer.captureRcd(
-                frame.hardwareBuffer,
-                frame.packedRawBytes,
-                raw.writeTo(rawParameterBuffer),
-                rawColor.writeTo(rawColorParameterBuffer),
-                GeometryShaderParameters.from(request.geometry).writeTo(geometryParameterBuffer),
-                request.spektraParameters,
-                lensShadingByteBuffer(captureLensShading),
-                bitmap,
-                request.spektraTimeSeconds,
-            )
-            if (!rendered) {
-                bitmap.recycle()
-                error(renderer.diagnostics())
+            try {
+                // RAW must be developed synchronously inside the Camera2
+                // borrowed-frame callback. No JPEG worker may retain a raw
+                // HardwareBuffer or plane ByteBuffer after this scope.
+                val rendered = renderer.captureRcd(
+                    frame.hardwareBuffer,
+                    frame.packedRawBytes,
+                    raw.writeTo(rawParameterBuffer),
+                    rawColor.writeTo(rawColorParameterBuffer),
+                    GeometryShaderParameters.from(request.geometry).writeTo(geometryParameterBuffer),
+                    request.spektraParameters,
+                    lensShadingByteBuffer(captureLensShading),
+                    bitmap,
+                    request.spektraTimeSeconds,
+                )
+                check(rendered) { renderer.diagnostics() }
+                Log.i(
+                    TAG,
+                    "IRIS_26691_SPEKTRA_RCD_OK output=${outputSize.width}x${outputSize.height} " +
+                        "lsc=${lensShadingSummary(captureLensShading)}",
+                )
+                bitmap
+            } catch (failure: Throwable) {
+                // The RCD JNI may throw, not just return false (notably
+                // when a native renderer is unavailable during migration).
+                // Never leak a full-resolution ARGB bitmap on that path.
+                if (!bitmap.isRecycled) bitmap.recycle()
+                throw failure
             }
-            Log.i(
-                TAG,
-                "IRIS_26691_SPEKTRA_RCD_OK output=${outputSize.width}x${outputSize.height} " +
-                    "lsc=${lensShadingSummary(captureLensShading)}",
-            )
-            bitmap
         }
 
         resumePreviewAfterStillLocked(request.owner)
@@ -765,7 +804,10 @@ class RawVulkanPreviewController(
         applyStoredManualControls(owner)
         session.setManualFocus(manualFocusDistance)
         resetExposureMeterStateLocked()
+        original125Cadence.reset()
         active = owner
+        firstFramePresented = false
+        presentedFramesBaseline125 = renderer.presentedFrames125()
         publishLocked(
             RawPreviewPhase.OPENING,
             "Opening ${camera.displayName()} at ${plan.processingSize}",
@@ -790,6 +832,8 @@ class RawVulkanPreviewController(
     private fun stopActiveLocked() {
         clearHistogramLocked()
         resetExposureMeterStateLocked()
+        firstFramePresented = false
+        original125Cadence.reset()
         val current = active ?: return
         if (pendingCapture?.owner === current &&
             mutableCaptureStatus.value.phase == RawCapturePhase.CAPTURING
@@ -809,7 +853,8 @@ class RawVulkanPreviewController(
                 Camera2RawSession.State.OPENING, Camera2RawSession.State.CONFIGURING ->
                     publishLocked(RawPreviewPhase.OPENING, "Configuring RAW-only Camera2 session")
                 Camera2RawSession.State.STREAMING ->
-                    publishLocked(RawPreviewPhase.STREAMING, "RAW Vulkan preview streaming")
+                    publishLocked(RawPreviewPhase.OPENING,
+                        "RAW stream active; waiting for a Vulkan-presented frame")
                 Camera2RawSession.State.CLOSED -> {
                     active = null
                     reconcileLocked()
@@ -904,19 +949,67 @@ class RawVulkanPreviewController(
                 latestLensShadingMap,
             )
             meterGeneration = prepareExposureMeterForFrameLocked(owner, frame)
-            val rendered = renderer.render(
-                frame.hardwareBuffer,
-                frame.packedRawBytes,
-                raw.writeTo(rawParameterBuffer),
-                rawColor.writeTo(rawColorParameterBuffer),
-                GeometryShaderParameters.from(geometry).writeTo(geometryParameterBuffer),
-                previewSpektraParameters(state.state),
-                lensShadingByteBuffer(),
-                geometry.outputSize.width,
-                geometry.outputSize.height,
-                previewTimingBuffer,
-                exposureMeterBuffer,
+            // The original 1.2.5 JNI render tail is not a Camera2 RAW format
+            // integer pair. Lou2 emits the first sensor timestamp and cadence
+            // position; original Lns1 default cadence is exactly 1 / 1.
+            val receipt = original125Cadence.next(
+                cycleLength = 1,
+                samplesPerCycle = 1,
+                timestampNs = frame.metadata.sensorTimestampNs,
+            ) ?: run {
+                skippedFrames++
+                return@synchronized
+            }
+            val temporalStrength = original125RecordingPreferences
+                .getFloat("temporal_strength", 0.3f)
+                .takeIf(Float::isFinite)?.coerceIn(0f, 1f) ?: 0.3f
+            val temporalFrames = original125RecordingPreferences
+                .getInt("temporal_frames", 4).coerceIn(2, 16)
+            // Lf03's original no-PerformanceHintManager-session return is
+            // literally 0L. The Iris shell has no original hint session owner.
+            val noPerformanceHintSession = 0L
+            // Original DEX uses a signed frame identity ticket with 31-based
+            // hash mixing. Preserve the real sensor frame number and current
+            // borrowed callback frame identity; never clamp to nonnegative.
+            val presentationTicket =
+                31L * frame.metadata.frameNumber + System.identityHashCode(frame).toLong()
+            val originalFrame = VulkanRenderer.NativeFrame125(
+                frameIdentity = receipt.firstSensorTimestampNs,
+                sequenceIdentity = noPerformanceHintSession,
+                originalBoundedIndex = receipt.index,
+                originalBoundedCount = receipt.count,
+                originalTimeNs = frame.metadata.sensorTimestampNs,
+                originalNormalizedValue = temporalStrength,
+                originalMode = temporalFrames,
+                presentationTimestampNs = frame.metadata.sensorTimestampNs,
+                presentationSequence = presentationTicket,
             )
+            // RAW from Camera2 is borrowed only during this callback. Native
+            // copy owns its bytes; RAW upload is retired after synchronous
+            // nativeRender returns, even on error/early failure.
+            val upload = frame.packedRawBytes?.let { packed ->
+                renderer.original125Uploads().copy(frame.metadata.sensorTimestampNs, packed)
+                    ?: error("Original 1.2.5 native RAW pool failed to copy Camera2 plane")
+            }
+            val rendered = try {
+                renderer.renderOriginal125(
+                    frame.hardwareBuffer,
+                    frame.packedRawBytes,
+                    raw.writeTo(rawParameterBuffer),
+                    rawColor.writeTo(rawColorParameterBuffer),
+                    GeometryShaderParameters.from(geometry).writeTo(geometryParameterBuffer),
+                    previewSpektraParameters(state.state),
+                    lensShadingByteBuffer(),
+                    geometry.outputSize.width,
+                    geometry.outputSize.height,
+                    previewTimingBuffer,
+                    exposureMeterBuffer,
+                    upload,
+                    originalFrame,
+                )
+            } finally {
+                upload?.close()
+            }
             if (rendered) {
                 consumeExposureMeterCarrierLocked(owner, "render")
                 scheduleExposureMeterPollLocked()
@@ -931,8 +1024,31 @@ class RawVulkanPreviewController(
                     ),
                 )
                 renderedFrames++
+                val nativePresented = renderer.presentedFrames125()
+                val confirmedPresentation = nativePresented > presentedFramesBaseline125
+                if (!firstFramePresented && confirmedPresentation) {
+                    firstFramePresented = true
+                    Log.i(TAG, "IRIS_26880_SPEKTRA_FIRST_NATIVE_FRAME " +
+                        "route=${owner.camera.route.routeId} raw=" +
+                        "${frame.output.format} ${frame.output.size.width}x${frame.output.size.height} " +
+                        "processing=${owner.plan.processingSize.width}x${owner.plan.processingSize.height} " +
+                        "viewport=${viewportSize?.width}x${viewportSize?.height}")
+                    firstFrameListener?.run()
+                }
                 val now = SystemClock.elapsedRealtime()
                 publishHistogramFromRenderedFrameLocked(owner, now)
+                // No visible-frame claim based on a successful CPU/JNI
+                // submission alone: original native counter must advance.
+                if (!firstFramePresented) {
+                    if (renderedFrames <= 2L || renderedFrames % 60L == 0L) {
+                        Log.w(TAG, "IRIS_26880_SPEKTRA_NATIVE_PRESENTATION_PENDING " +
+                            "presented=$nativePresented baseline=$presentedFramesBaseline125 " +
+                            "rendered=$renderedFrames")
+                    }
+                    publishLocked(RawPreviewPhase.OPENING,
+                        "RAW streaming; awaiting native Surface presentation",owner,state.revisionId)
+                    return@synchronized
+                }
                 val previous = mutableStatus.value
                 if (previous.phase != RawPreviewPhase.STREAMING ||
                     previous.spektraRevision != state.revisionId ||
@@ -1153,6 +1269,17 @@ class RawVulkanPreviewController(
         owner: ActiveSession? = active,
         revision: Long? = mutableStatus.value.spektraRevision,
     ) {
+        val oldPhase = mutableStatus.value.phase
+        if (phase != oldPhase || phase == RawPreviewPhase.ERROR) {
+            val evidence = "IRIS_26880_SPEKTRA_PREVIEW_PHASE " +
+                "from=$oldPhase to=$phase message=$message " +
+                "route=${owner?.camera?.route?.routeId ?: configuredCamera?.route?.routeId ?: "none"} " +
+                "raw=${owner?.plan?.acquisitionOutput?.format} " +
+                "${owner?.plan?.acquisitionOutput?.size} " +
+                "renderer=${renderer.diagnostics()}"
+            if (phase == RawPreviewPhase.ERROR) Log.e(TAG, evidence)
+            else Log.i(TAG, evidence)
+        }
         mutableStatus.value = RawPreviewStatus(
             phase = phase,
             message = message,
@@ -1162,6 +1289,46 @@ class RawVulkanPreviewController(
             droppedCameraFrames = owner?.session?.droppedPendingFrames() ?: 0L,
             spektraRevision = revision,
         )
+    }
+
+    /** Original UnspektrAwesome 1.2.5 Lou2.a(IIJ) cadence state machine.
+     * Lnu2 receipt indexes refer to a preview cycle, NOT Camera2 pixel format.
+     * A duplicate or nonmonotonic sensor timestamp cannot be presented twice.
+     */
+    private class Original125Cadence {
+        data class Receipt(val firstSensorTimestampNs: Long, val index: Int, val count: Int)
+        private var cycleLength = -1
+        private var samplesPerCycle = -1
+        private var index = 0
+        private var firstSensorTimestampNs = 0L
+        private var lastTimestampNs = 0L
+
+        fun reset() {
+            cycleLength = -1
+            samplesPerCycle = -1
+            index = 0
+            firstSensorTimestampNs = 0L
+            lastTimestampNs = 0L
+        }
+
+        fun next(cycleLength: Int, samplesPerCycle: Int, timestampNs: Long): Receipt? {
+            require(cycleLength in 1..120 && samplesPerCycle in 1..cycleLength)
+            require(timestampNs > 0L)
+            if (this.cycleLength != cycleLength || this.samplesPerCycle != samplesPerCycle ||
+                timestampNs < lastTimestampNs
+            ) {
+                this.cycleLength = cycleLength
+                this.samplesPerCycle = samplesPerCycle
+                index = 0
+            }
+            if (timestampNs == lastTimestampNs) return null
+            lastTimestampNs = timestampNs
+            if (index == 0) firstSensorTimestampNs = timestampNs
+            val receipt = if (index < samplesPerCycle)
+                Receipt(firstSensorTimestampNs, index, samplesPerCycle) else null
+            index = (index + 1) % cycleLength
+            return receipt
+        }
     }
 
     private data class ConfigurationKey(
