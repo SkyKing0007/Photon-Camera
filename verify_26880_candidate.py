@@ -53,6 +53,16 @@ assert v.count('private external fun nativeRender(')==1 and 'fun render(' not in
 assert 'exact125Default()' in s and 'exact112Default()' not in s
 assert 'RawPreviewQuality.FULL' in (C/'app/src/main/java/com/particlesdevs/photoncamera/spektra/SpektraModeController.java').read_text()
 wave=(C/'app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc').read_text()
+# Actions 40324502022 attempt 3, real NDK Clang: both ANDROID_LOG_ERROR
+# and ANDROID_LOG_WARN were undefined because the native JNI included file
+# did not include <android/log.h>. Reproduce the exact ORIGINAL failed bytes
+# after removing only the intended include and reject the regression.
+assert wave.count('#include <android/log.h>\n')==1, 'missing exact NDK Android logger header (40324502022 attempt 3)'
+assert wave.count('__android_log_print(ANDROID_LOG_ERROR')==1
+assert wave.count('__android_log_print(ANDROID_LOG_WARN')==1
+historical_failed=wave.replace('#include <android/log.h>\n','',1)
+assert hashlib.sha256(historical_failed.encode()).hexdigest()=='823c714ac132b17766c524f96e89a89e912ef66f5f4a521c747813bde5b0a180', 'real Actions 121615500842 negative source fixture drifted'
+assert 'target_link_libraries(iris26856amaze PRIVATE iris26856-rawr-amaze android EGL GLESv3 vulkan log)' in (C/'app/src/main/cpp/CMakeLists.txt').read_text(), 'native Android log library ownership drift'
 for txt in ['raw_denoise::DenoisePipeline','params.maxScale=7','params.forceY=0.f','params.forceUv=.75f','params.noiseA=f.burstGreenNoisePerMergedSample[0]','params.noiseB=f.burstGreenNoisePerMergedSample[1]']:
  assert txt in wave,('missing actual RAWR wavelet',txt)
 coord=(C/'app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp').read_text()

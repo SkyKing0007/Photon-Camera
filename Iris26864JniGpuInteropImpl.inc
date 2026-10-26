@@ -11,6 +11,7 @@
 #include "iris26880_wavelet_threshold.h"
 #include "iris26880_wavelet_backtransform.h"
 #include "iris26880_wavelet_copy.h"
+#include <android/log.h>
 #include <algorithm>
 #include <vector>
 #include <cstring>
