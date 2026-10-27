@@ -1,0 +1,148 @@
+#include "Iris26864Wronski2xSingleOwnerBridge.hpp"
+#include <cmath>
+#include <stdexcept>
+#include <vector>
+#include <utility>
+
+namespace iris26864::wronski2x {
+namespace {
+std::vector<BoundResource> resources(const SingleOwner2xFrames& f) {
+    auto img=[](uint32_t binding, const SurfaceSpec& s) {
+        BoundResource out{}; out.binding=binding;
+        out.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        out.imageView=VkImageView(s.view);return out;
+    };
+    BoundResource lsc{};lsc.binding=3u;lsc.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    lsc.buffer=f.lscBuffer;lsc.bufferRange=f.lscBytes;
+    return {img(0,f.mergedCameraRgb),img(1,f.packedCfa),
+            img(2,f.sensorClip),lsc,img(4,f.originalReferenceRaw)};
+}
+void computeWriteReadBarrier(VkCommandBuffer cmd){
+    VkMemoryBarrier b{};b.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    b.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
+    b.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1u,&b,0,nullptr,0,nullptr);
+}
+}
+PreparedSingleOwner2x prepareSingleOwner2x(
+    const SingleOwner2xFrames& f,
+    const VulkanKernelExecutor& packedKernel,
+    const amaze::AmazePipeline& amaze) {
+    // Wronski reconstruction and the optional profiled wavelet have
+    // distinct noise requirements. RAWR's merge may finish successfully
+    // without a valid burst fit. The caller tests the measured green a/b
+    // before invoking the VST; a missing/invalid fit explicitly retains
+    // this same completed Wronski -> AMaZE output and logs the bypass.
+    // Requiring a > 0 HERE aborted valid fallback frames before that
+    // downstream decision could run. Never insert a Camera2 noise model.
+    if (f.burstNormalCount < 2u)
+        throw std::invalid_argument("26880 Wronski requires at least two merged NORMAL frames");
+    auto p=validatePacked2xOutput(f.geometry,f.lsc,f.mergedCameraRgb,
+        f.originalReferenceRaw,f.packedCfa,f.sensorClip);
+    if (!f.lscBuffer || f.lscBytes <
+            (f.lsc.texels.empty()?16u:uint64_t(f.lsc.texels.size())*16u) ||
+        f.geometry.outWidth<32u||f.geometry.outHeight<32u ||
+        f.geometry.outWidth>16384u||f.geometry.outHeight>16384u ||
+        !f.amazeRgb.image||!f.amazeRgb.view||
+        f.amazeRgb.format!=RGBA16_SFLOAT ||
+        f.amazeRgb.width!=f.geometry.outWidth ||
+        f.amazeRgb.height!=f.geometry.outHeight ||
+        f.amazeRgb.image==f.packedCfa.image ||
+        f.amazeRgb.image==f.mergedCameraRgb.image ||
+        f.amazeRgb.image==f.originalReferenceRaw.image ||
+        f.amazeRgb.image==f.sensorClip.image ||
+        f.amazeRgb.view==f.packedCfa.view ||
+        f.amazeRgb.view==f.sensorClip.view ||
+        f.amazeRgb.view==f.originalReferenceRaw.view ||
+        f.amazeRgb.view==f.mergedCameraRgb.view)
+        throw std::invalid_argument("26864 Wronski output/Amaze/LSC ownership invalid");
+    for (auto wb:f.whiteBalance)
+        if (!std::isfinite(wb) || wb<=0.f)
+            throw std::invalid_argument("26864 Wronski non-physical WB gain");
+    const auto& cfg=amaze.config();
+    if (cfg.inputMode!=amaze::InputMode::PackedCfaRgba16fImage ||
+        cfg.width!=f.geometry.outWidth||cfg.height!=f.geometry.outHeight ||
+        uint32_t(cfg.pattern)!=localPattern(f.geometry))
+        throw std::invalid_argument("26864 26863 AMaZE compiled pipeline config mismatch");
+    packedKernel.preflight(resources(f),sizeof(PackedPc),
+                           f.packedCfa.width,f.packedCfa.height);
+    PreparedSingleOwner2x a{};a.kernel=p;
+    a.amazeInput.image=VkImage(f.packedCfa.image);
+    a.amazeInput.view=VkImageView(f.packedCfa.view);
+    a.amazeInput.format=VK_FORMAT_R16G16B16A16_SFLOAT;
+    a.amazeInput.layout=VK_IMAGE_LAYOUT_GENERAL;
+    a.amazeInput.width=f.packedCfa.width;
+    a.amazeInput.height=f.packedCfa.height;
+    a.amazeInput.rawWidth=f.geometry.outWidth;
+    a.amazeInput.rawHeight=f.geometry.outHeight;
+    a.amazeInput.pattern=amaze::BayerPattern(localPattern(f.geometry));
+    a.amazeOutput.image=VkImage(f.amazeRgb.image);
+    a.amazeOutput.view=VkImageView(f.amazeRgb.view);
+    a.amazeOutput.format=VK_FORMAT_R16G16B16A16_SFLOAT;
+    a.amazeOutput.layout=VK_IMAGE_LAYOUT_GENERAL;
+    a.amazeOutput.width=f.amazeRgb.width;
+    a.amazeOutput.height=f.amazeRgb.height;
+    a.clipping={VkImage(f.sensorClip.image),VkImageView(f.sensorClip.view),
+        f.sensorClip.width,f.sensorClip.height,localPattern(f.geometry)};
+    // Map absent is a valid RAWR identity-LSC stage, not evidence that any
+    // legacy Iris post-AMaZE correction may run on this RAWR output.
+    a.clipping.preAmazeLscStageComplete = true;
+    a.clipping.physicalLscMapPresent = !f.lsc.texels.empty();
+    return a;
+}
+ClipSidecarReceipt recordWronski2xToAmaze(VkCommandBuffer cmd,
+    const SingleOwner2xFrames& f,
+    const VulkanKernelExecutor& packedKernel,
+    const VulkanKernelExecutor& chromaGuide,
+    amaze::AmazePipeline& amaze) {
+    if (cmd==VK_NULL_HANDLE)
+        throw std::invalid_argument("26864 Wronski missing inherited command buffer");
+    // CPU preflight of every owner and image BEFORE issuing a Vulkan command.
+    const auto a=prepareSingleOwner2x(f,packedKernel,amaze);
+    // Complete all color-guide resource/preflight checks BEFORE recording any
+    // packed CFA or AMaZE compute, preserving the inherited fail-closed owner.
+    if (f.amazeRgb.image==f.mergedCameraRgb.image||
+        f.amazeRgb.view==f.mergedCameraRgb.view)
+        throw std::invalid_argument("26885 B-ON guide/Amaze output alias");
+    struct alignas(16) GuidePc {
+        PackedPc packed;
+        alignas(16) std::array<float,4> wb;
+    } pc{a.kernel.push,{f.whiteBalance[0],f.whiteBalance[1],f.whiteBalance[2],1.f}};
+    static_assert(offsetof(GuidePc,wb)==96u&&sizeof(GuidePc)==112u,
+                  "26885 exact Vulkan shader push constant ABI");
+    std::vector<BoundResource> colorBindings;
+    for (const auto item: {
+         std::pair<uint32_t,VkImageView>{0u,VkImageView(f.amazeRgb.view)},
+         {1u,VkImageView(f.mergedCameraRgb.view)},
+         {2u,VkImageView(f.sensorClip.view)}}) {
+        BoundResource b{};b.binding=item.first;
+        b.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;b.imageView=item.second;
+        colorBindings.push_back(b);
+    }
+    BoundResource shading{};shading.binding=3u;
+    shading.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    shading.buffer=f.lscBuffer;shading.bufferRange=f.lscBytes;
+    colorBindings.push_back(shading);
+    chromaGuide.preflight(colorBindings,sizeof(pc),f.geometry.outWidth,f.geometry.outHeight);
+
+    // Prior RAWR a11_finalize writes camera RGB; packing reads that image.
+    computeWriteReadBarrier(cmd);
+    packedKernel.record(cmd,resources(f),&a.kernel.push,sizeof(PackedPc),
+                        f.packedCfa.width,f.packedCfa.height,1u,false);
+    // AMaZE reads the exact same packed image/view after this barrier.
+    computeWriteReadBarrier(cmd);
+    amaze.record(cmd,a.amazeInput,a.amazeOutput,f.whiteBalance);
+    // The RAW Wronski camera RGB is STILL immutable here. The later optional
+    // original RAWR wavelet reuses it as its destination, so chroma evidence
+    // MUST be consumed now, before that write. AMaZE AHB is read-modify-written
+    // one uniquely owned pixel per invocation; neighbors read Wronski ONLY.
+    computeWriteReadBarrier(cmd); // AMaZE -> single-pixel guide read/write
+    chromaGuide.record(cmd,colorBindings,&pc,sizeof(pc),
+                       f.geometry.outWidth,f.geometry.outHeight,1u,false);
+    // Mandatory write->read visibility before wavelet (or clip/GL publish).
+    computeWriteReadBarrier(cmd);
+    // Sensor clip is NOT consumed by AMaZE; caller owns its sidecar lifetime.
+    return a.clipping;
+}
+} // namespace iris26864::wronski2x

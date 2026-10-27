@@ -1,0 +1,118 @@
+#version 450
+// IRIS_26885_B_SR_ON_WRONSKI_RGB_CHROMA_EVIDENCE
+// B Super Res ON only. AMaZE's already-computed 2x luminance remains intact.
+// Wronski RGB is original camera-linear/pre-LSC; AMaZE AHB is camera-linear
+// POST physical LSC (its export divided the temporary AMaZE WB).
+// Both estimates are compared ONLY after applying the identical physical
+// sensor LSC and temporary WB for evidence. Output is back in camera linear.
+// A work item reads and writes only its own AMaZE pixel; all neighbor reads
+// are exclusively from the immutable Wronski guide. No cross-workgroup race.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,rgba16f) uniform image2D amazeRgbInPlace;
+layout(set=0,binding=1,rgba16f) readonly uniform image2D wronskiRgb;
+layout(set=0,binding=2,r16ui) readonly uniform uimage2D originalSensorClip;
+layout(std430,set=0,binding=3) readonly buffer PhysicalLsc {vec4 lscMap[];};
+layout(push_constant) uniform GuidePush {
+    uint width,height,lscWidth,lscHeight;
+    uint refWidth,refHeight,cfa,useSensorClip;
+    vec4 black;
+    vec4 invRange;
+    float clipThreshold;
+    uint originX,originY,fullSensorWidth,fullSensorHeight;
+    vec4 wb;
+} p;
+
+float mapGain(vec2 uv,int channel){
+    if(p.lscWidth==0u&&p.lscHeight==0u)return 1.0;
+    vec2 at=clamp(uv,vec2(0),vec2(1))*
+        vec2(float(p.lscWidth-1u),float(p.lscHeight-1u));
+    uvec2 a=uvec2(floor(at));
+    uvec2 b=min(a+uvec2(1u),uvec2(p.lscWidth-1u,p.lscHeight-1u));
+    vec2 f=fract(at);
+    float aa=lscMap[a.y*p.lscWidth+a.x][channel];
+    float ba=lscMap[a.y*p.lscWidth+b.x][channel];
+    float ab=lscMap[b.y*p.lscWidth+a.x][channel];
+    float bb=lscMap[b.y*p.lscWidth+b.x][channel];
+    return mix(mix(aa,ba,f.x),mix(ab,bb,f.x),f.y);
+}
+vec3 lscGain(ivec2 px){
+    vec2 full=vec2(float(p.originX),float(p.originY))+vec2(px)*0.5;
+    vec2 uv=full/vec2(float(p.fullSensorWidth-1u),float(p.fullSensorHeight-1u));
+    // Camera2 greens are original PHYSICAL even/odd sensor rows. A full RGB
+    // pixel has no Bayer-site identity, so use the exact mean of both green
+    // row gains; never mistakenly toggle G1/G2 by synthetic 2x output rows.
+    float green=0.5*(mapGain(uv,1)+mapGain(uv,2));
+    return vec3(mapGain(uv,0),green,mapGain(uv,3));
+}
+float yOf(vec3 v){return dot(v,vec3(0.2126,0.7152,0.0722));}
+bool finiteRgb(vec3 v){return !any(isnan(v))&&!any(isinf(v));}
+float colorStrength(vec3 wbRgb){
+    float y=yOf(wbRgb);
+    return length(wbRgb-vec3(y))/max(y,0.025);
+}
+void main(){
+    ivec2 px=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(px,ivec2(p.width,p.height))))return;
+    if(p.useSensorClip!=1u||p.cfa>3u||p.refWidth*2u!=p.width||
+       p.refHeight*2u!=p.height||p.fullSensorWidth<2u||p.fullSensorHeight<2u||
+       any(notEqual(imageSize(amazeRgbInPlace),ivec2(p.width,p.height)))||
+       any(notEqual(imageSize(wronskiRgb),ivec2(p.width,p.height)))||
+       any(notEqual(imageSize(originalSensorClip),ivec2(p.width/2u,p.height/2u))))return;
+    vec4 src=imageLoad(amazeRgbInPlace,px);
+    vec3 guideRaw=imageLoad(wronskiRgb,px).rgb;
+    if(!finiteRgb(src.rgb)||!finiteRgb(guideRaw))return;
+    if(any(lessThan(src.rgb,vec3(0)))||any(lessThan(guideRaw,vec3(0))))return;
+    if(any(lessThanEqual(p.wb.rgb,vec3(0))))return;
+    vec3 gain=lscGain(px);
+    if(!finiteRgb(gain)||any(lessThanEqual(gain,vec3(0))))return;
+    vec3 cand=src.rgb*p.wb.rgb;
+    vec3 guide=guideRaw*gain*p.wb.rgb;
+    if(!finiteRgb(cand)||!finiteRgb(guide))return;
+    float yc=yOf(cand),yg=yOf(guide);
+    // Dark/noisy or unusable reconstructed RGB has no trustworthy witness.
+    if(yc<0.012||yg<0.012||yc>8.0||yg>8.0)return;
+    vec3 candidateChroma=cand-vec3(yc);
+    vec3 guideChroma=guide-vec3(yg);
+    float cNorm=colorStrength(cand),gNorm=colorStrength(guide);
+    float mismatch=length(candidateChroma-guideChroma)/max(max(yc,yg),0.035);
+    if(mismatch<0.035||cNorm<0.025)return;
+    // A true colored thin feature may peak one/two Wronski pixels away.
+    // Consult ONLY the immutable Wronski guide, not neighboring AMaZE pixels,
+    // so in-place correction has no inter-invocation read/write conflict.
+    float nearby=max(gNorm,0.0);
+    const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    for(int j=0;j<4;++j){
+        ivec2 q=clamp(px+offs[j],ivec2(0),ivec2(p.width-1u,p.height-1u));
+        vec3 nearbyRaw=imageLoad(wronskiRgb,q).rgb;
+        if(!finiteRgb(nearbyRaw)||any(lessThan(nearbyRaw,vec3(0))))return;
+        nearby=max(nearby,colorStrength(nearbyRaw*lscGain(q)*p.wb.rgb));
+    }
+    // Strong independent color in the same subpixel neighborhood is a veto.
+    // In neutral periodic geometry Wronski is achromatic but AMaZE may be
+    // alternating teal/yellow; neither brightness nor an object class sets hue.
+    float neutralEvidence=1.0-smoothstep(0.025,0.110,nearby);
+    float supportGap=smoothstep(0.025,0.20,max(cNorm-nearby,0.0));
+    float chromaDisagreement=smoothstep(0.035,0.25,mismatch);
+    float unsupported=neutralEvidence*supportGap*chromaDisagreement;
+    // Never take the guide as reliable through multichannel RAW clipping.
+    uint originalBits=imageLoad(originalSensorClip,px/2).r&15u;
+    int clippedChannels=bitCount(originalBits);
+    float clipReliability=clippedChannels==0?1.0:(clippedChannels==1?0.40:0.0);
+    float weight=0.82*unsupported*clipReliability;
+    if(weight<=0.0001)return;
+    // Conserve EXACT white-balanced AMaZE luminance; replace only opponent
+    // chroma. Bounds prevent negative channels/colored dark rings.
+    vec3 difference=guideChroma-candidateChroma;
+    for(int channel=0;channel<3;++channel){
+        if(difference[channel]<0.0)
+            weight=min(weight,cand[channel]/max(-difference[channel],1e-7));
+    }
+    weight=clamp(weight,0.0,0.82);
+    if(weight<=0.0001)return;
+    vec3 outWb=cand+difference*weight;
+    if(!finiteRgb(outWb)||any(lessThan(outWb,vec3(-0.00001))))return;
+    vec3 outCam=outWb/p.wb.rgb;
+    if(!finiteRgb(outCam))return;
+    // No luma blur, no edge movement, no output-domain WB or LSC duplication.
+    imageStore(amazeRgbInPlace,px,vec4(max(outCam,vec3(0)),src.a));
+}
