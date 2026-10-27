@@ -1,0 +1,263 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
+index b4a6ed311f457fcf4df8a2b1b4f02a2e256c4301..73f8da90258ce8cf3121738c3369bf8f91ee157e 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26858BNoiseHighlight.kt
+@@ -346,6 +346,7 @@ internal object GlesIris26858BNoiseHighlight {
+         #version 300 es
+         precision highp float;
+         uniform sampler2D uWbRgb;
++        uniform sampler2D uPreLabWbRgb;
+         uniform sampler2D uNativeSensorClip;
+         uniform ivec2 uSize;
+         uniform vec3 uAmazeWb;
+@@ -355,14 +356,11 @@ internal object GlesIris26858BNoiseHighlight {
+             return clamp(texelFetch(uNativeSensorClip,
+                 clamp(p,ivec2(0),uSize-ivec2(1)),0).r,0.0,1.0);
+         }
+-        // Only independent Bayer colors, not a single blown red pixel,
+-        // can establish a white highlight. The stored R16F mask retains
+-        // its ORIGINAL pre-WB physical-site phase at full 2x resolution.
+-        // Sensor clipping has four independent measured Bayer phase owners.
+-        // Interpolate EACH physical color's confidence before asking whether
+-        // at least two different sensor colors are clipped. Never quantize
+-        // a continuous fade by min(center-cell,interpolated-cell): that
+-        // resurrects square two-pixel plateaus in the red-neon border.
++        // The original selected Bayer RAW footprint remains BINARY. Its
++        // external R16F sidecar is also used by the 26876 native true-2x
++        // JPEG packer and MUST remain exactly 0/1; never encode confidence
++        // in that published mask. The four CFA patterns retain their exact
++        // physical R/G1/G2/B orientation from successful 26882.
+         vec3 phaseColorClipAt(ivec2 cell){
+             ivec2 cellMax=max((uSize-ivec2(1))/2,ivec2(0));
+             ivec2 base=2*clamp(cell,ivec2(0),cellMax);
+@@ -377,23 +375,71 @@ internal object GlesIris26858BNoiseHighlight {
+         void main(){
+             ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uSize-ivec2(1));
+             vec4 original=texelFetch(uWbRgb,p,0);
+-            // Full-resolution original-sensor evidence, not a rescaled
+-            // 2x2 packed CFA phase field or a late RGB saturation estimate.
+-            // Symmetric sensor-only coverage. Inward cross-color authority
+-            // prevents a clipped red neon phase borrowing a neighboring white
+-            // object's mask. The 3x3 cells damp pixel-grid/checkerboard edges.
+-            // Five-tap inward isotropic confidence: fewer original-sensor
+-            // texture reads on the 50MP path than a full 3x3 box kernel.
+-            // Center contributes half; each immediate physical neighbor 1/8.
++            // Post-Lab/FCC is the final colour we correct; original camera
++            // radiance evidence must NOT be sourced from the chroma that
++            // Lab/FCC may already have distorted in clipped highlights.
++            // This pre-Lab post-WB texture already exists for BOTH B routes;
++            // the extra read introduces no new 50MP allocations.
++            vec3 evidenceRgb=max(texelFetch(uPreLabWbRgb,p,0).rgb,vec3(0.0));
++            vec3 rgb=max(original.rgb,vec3(0.0));
++            vec3 gains=max(uAmazeWb,vec3(0.0001));
++            // Temporary WB is inverted for the pre-clipping brightness
++            // test on the existing BEFORE-Lab/FCC post-AMaZE RGB. This is
++            // NOT an independently measured original-Bayer soft-clipping
++            // sidecar; original Bayer HARD clipping remains independent and
++            // strictly binary. No Wronski/HDRq reconstruction is changed.
++            vec3 cameraRgb=evidenceRgb/gains;
++            float wbSafe=max(min(gains.r,min(gains.g,gains.b)),0.0001);
++            // RAWR OFF's shared WB-safe ceiling means a visually white
++            // highlight can approach saturation BEFORE two RAW channels
++            // approach sensor-white (for example high red WB gain). Test
++            // visual shoulder against one shared WB ceiling; separately
++            // require reconstructed pre-WB brightness for sensor plausibility.
++            vec3 nearChannel=smoothstep(vec3(0.72),vec3(1.01),
++                clamp(evidenceRgb/wbSafe,vec3(0.0),vec3(3.0)));
++            float brightOne=max(max(rgb.r,rgb.g),rgb.b);
++            float sourceOne=max(max(evidenceRgb.r,evidenceRgb.g),evidenceRgb.b);
++            float sourceTwo=max(min(evidenceRgb.r,evidenceRgb.g),
++                min(max(evidenceRgb.r,evidenceRgb.g),evidenceRgb.b));
++            float weakestCam=min(cameraRgb.r,min(cameraRgb.g,cameraRgb.b));
++            float strongestCam=max(cameraRgb.r,max(cameraRgb.g,cameraRgb.b));
++            // A genuinely colored saturated source needs a third-channel
++            // witness. Red/blue/yellow lamps with negligible one-channel
++            // response remain unchanged even when two other channels clip.
++            float sourceColorBalance=smoothstep(0.27,0.61,
++                weakestCam/max(strongestCam,0.0001));
++            float weakestVisible=min(evidenceRgb.r,min(evidenceRgb.g,evidenceRgb.b));
++            float visibleWhiteBalance=smoothstep(0.47,0.70,
++                weakestVisible/max(sourceOne,0.0001));
++            // Use BOTH sensor-referenced and currently-visible evidence:
++            // strong yellow/red/blue emitters cannot qualify as white just
++            // because two individual camera channels approach saturation.
++            float whiteWitness=sourceColorBalance*visibleWhiteBalance;
++            float sensorApproach=smoothstep(0.48,0.80,strongestCam);
++            // Post-WB shared safe ceiling is ONE common level for R/G/B,
++            // unlike a channel-by-channel colored clamp. Output intensity
++            // follows the local second-brightest/brightest signal rather
++            // than a constant grey shoulder or fixed normalized plateau.
++            float brightWitness=smoothstep(0.68,1.04,
++                max(sourceTwo/wbSafe,weakestCam));
++            // 26882 defect: an immediate clippedCoverage==0 early return
++            // makes the near-clipped white shoulder completely unreachable.
++            // Only this reconstructed near-headroom branch can act before
++            // hard clipping; it does not touch/publish the binary RAW mask.
++            float rgNear=min(nearChannel.r,nearChannel.g);
++            float gbNear=min(nearChannel.g,nearChannel.b);
++            float rbNear=min(nearChannel.r,nearChannel.b) *
++                smoothstep(0.35,0.80,cameraRgb.g);
++            float earlyWhite=max(max(rgNear,gbNear),rbNear);
++            float earlyFade=smoothstep(0.06,0.89,earlyWhite) *
++                whiteWitness*brightWitness*sensorApproach;
++            // Preserve the full original Bayer binary check, including a
++            // continuous 5-tap footprint and separately oriented CFA phases.
++            // It can increase certainty for truly physically clipped whites
++            // but does not gate the visually earlier near-clip shoulder.
+             float clippedCoverage=(4.0*clipAt(p)+
+                 clipAt(p+ivec2(-1,0))+clipAt(p+ivec2(1,0))+
+                 clipAt(p+ivec2(0,-1))+clipAt(p+ivec2(0,1)))*0.125;
+-            if(clippedCoverage<=0.0){oRgb=original;return;}
+-            // Same continuous physical-sensor coordinate as the FULL native
+-            // R16F evidence, independent of 2x reconstruction's RGB phase.
+-            // Only evidence is interpolated; no neighboring RGB is borrowed.
+-            // The local five-tap clippedCoverage is an independent smooth
+-            // veto against donating clipping from a different object.
+             vec2 cellPosition=(vec2(p)+vec2(0.5))*0.5-vec2(0.5);
+             ivec2 baseCell=ivec2(floor(cellPosition));
+             vec2 blend=clamp(fract(cellPosition),vec2(0.0),vec2(1.0));
+@@ -402,50 +448,23 @@ internal object GlesIris26858BNoiseHighlight {
+                     phaseColorClipAt(baseCell+ivec2(1,0)),blend.x),
+                 mix(phaseColorClipAt(baseCell+ivec2(0,1)),
+                     phaseColorClipAt(baseCell+ivec2(1,1)),blend.x),blend.y);
+-            float inwardCross=min(colorClip.g,max(colorClip.r,colorClip.b));
+-            vec3 rgb=max(original.rgb,vec3(0.0));
+-            float hi=max(max(rgb.r,rgb.g),rgb.b);
+-            float second=max(min(rgb.r,rgb.g),min(max(rgb.r,rgb.g),rgb.b));
+-            float wbSafe=max(min(uAmazeWb.r,min(uAmazeWb.g,uAmazeWb.b)),0.0001);
+-            // A green-only sensor plateau can also conceal the color of a
+-            // high-energy white source. Require BOTH remaining channels to
+-            // be near their individual sensor-white WB-scaled limit.
++            float greenCross=min(colorClip.g,max(colorClip.r,colorClip.b));
+             float greenOnly=colorClip.g *
+-                smoothstep(0.80,0.98,min(rgb.r/max(uAmazeWb.r,0.0001),
+-                                        rgb.b/max(uAmazeWb.b,0.0001)));
+-            // Continuous cross-color evidence cannot become a white halo
+-            // outside the locally clipped footprint, and red-only neon has
+-            // neither an independent green clip nor an RB-bright green witness.
+-            // A sensor-proven multi-color clipped lamp can be only ONE
+-            // physical pixel wide. 26880 multiplied two coverage smoothsteps,
+-            // rejecting 65% of precisely that clipping even though the CFA
+-            // phase evidence already showed separate physically clipped colors.
+-            // IRIS_26882_B_RAWR_OFF_CONTINUOUS_WHITE: two independently
+-            // clipped CFA colors can form a genuinely white emitter even if
+-            // its third channel is attenuated by the sensor spectrum and WB.
+-            // The old 0.35..0.65 third-channel gate discarded such partial
+-            // white clips, leaving magenta housings untouched. Keep a THIRD
+-            // physical-channel witness, but admit its nonzero low-energy tail
+-            // continuously. A red/yellow neon with near-zero blue does not
+-            // qualify. Fully unclipped pixels still bypass this shader above.
+-            vec3 physicalWbRgb=rgb/max(uAmazeWb,vec3(0.0001));
+-            float thirdWitness=smoothstep(0.055,0.28,
+-                min(physicalWbRgb.r,min(physicalWbRgb.g,physicalWbRgb.b)));
+-            float tripleClip=min(colorClip.r,min(colorClip.g,colorClip.b));
+-            float multiColor=max(tripleClip,inwardCross*thirdWitness);
+-            float opticalSupport=min(clippedCoverage,max(multiColor,greenOnly));
+-            float brightSupport=max(smoothstep(0.70,1.10,second/wbSafe),
+-                smoothstep(0.10,0.50,tripleClip));
+-            // ONE smooth spatial evidence gate, not a double product.
+-            // The five-tap coverage still prohibits whitening outside the
+-            // original physical clipped footprint and bounds fringe leakage.
+-            float fade=smoothstep(0.13,0.38,opticalSupport)*brightSupport;
++                smoothstep(0.80,0.98,min(cameraRgb.r,cameraRgb.b));
++            float rbWithGreen=min(colorClip.r,colorClip.b) *
++                smoothstep(0.35,0.75,cameraRgb.g);
++            float allColors=min(colorClip.r,min(colorClip.g,colorClip.b));
++            float sensorWhite=max(allColors,max(greenCross,max(greenOnly,rbWithGreen)));
++            float sensorFade=smoothstep(0.07,0.46,
++                min(clippedCoverage,sensorWhite)) *
++                whiteWitness*brightWitness;
++            float fade=max(earlyFade,sensorFade);
+             if(fade<=0.0){oRgb=original;return;}
+-            // Continuous non-object-specific sensor clipping transition:
+-            // red-only clipped neon and un-clipped color remain unchanged;
+-            // truly censored multicolor cores approach scene-linear white.
+-            float neutral=max(hi,wbSafe);
+-            oRgb=vec4(mix(original.rgb,vec3(neutral),fade),original.a);
++            // Source highlight brightness remains monotone: mixing to a
++            // common-white target MAXIMUM cannot darken a clipped channel.
++            float neutral=max(max(brightOne,sourceOne),wbSafe);
++            oRgb=vec4(mix(original.rgb,vec3(neutral),
++                clamp(fade,0.0,1.0)),original.a);
+         }
+     """.trimIndent()
+ 
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 2645e1006aef2a8246d2bf3f1063b1286ae15fff..de5b25fbd7aa74006ac181dfcac0cc8c1971faa5 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -7009,9 +7009,10 @@ internal class GlesMgcRawSpatialStacker(
+     /* IRIS_26866_B_NATIVE_CLIP_ONLY_FADE: actual native R16F sensor evidence,
+      * same 26859 WB-domain smooth-to-white law; no Iris chroma/noise passes. */
+     private fun renderIris26866BNativeSensorSmoothWhite(
+-        postWb: Int, sensorClipFullRes: Int, w: Int, h: Int, wb: FloatArray,
++        postWb: Int, preLabWb: Int, sensorClipFullRes: Int,
++        w: Int, h: Int, wb: FloatArray,
+     ): Int {
+-        require(postWb != 0 && sensorClipFullRes != 0 && w > 0 && h > 0)
++        require(postWb != 0 && preLabWb != 0 && sensorClipFullRes != 0 && w > 0 && h > 0)
+         require(wb.size == 3 && wb.all { it.isFinite() && it > 0f })
+         if (iris26866BNativeSmoothWhiteProgram == 0) {
+             iris26866BNativeSmoothWhiteProgram = linkProgram(
+@@ -7026,6 +7027,7 @@ internal class GlesMgcRawSpatialStacker(
+             GLES30.glUseProgram(program)
+             bindTexture(program,"uWbRgb",0,postWb)
+             bindTexture(program,"uNativeSensorClip",1,sensorClipFullRes)
++            bindTexture(program,"uPreLabWbRgb",2,preLabWb)
+             uniform2i(program,"uSize",w,h)
+             uniform1i(program,"uBayerPattern",cfaPattern)
+             GLES30.glUniform3f(GLES30.glGetUniformLocation(program,"uAmazeWb"),wb[0],wb[1],wb[2])
+@@ -7215,8 +7217,12 @@ internal class GlesMgcRawSpatialStacker(
+                 check(rawrNativeReceipt26864 != null) {
+                     "26867 native sensor clipping must have pinned RAWR receipt"
+                 }
++                // Both native HDRq and native Wronski feed the exact same
++                // early-white owner. Keep the existing pre-Lab texture alive
++                // until after this final post-FCC colour correction; no
++                // second 50MP intermediate is allocated.
+                 bRecovered26858 = renderIris26866BNativeSensorSmoothWhite(
+-                    fcc, nativeSensorClipFullRes26866,
++                    fcc, temporaryPostWb, nativeSensorClipFullRes26866,
+                     processingWidth, processingHeight, gains,
+                 )
+             }
+diff --git a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+index cc976c58c8993b152bb3e1a2f16266de8d383996..58ba8ca101ae6a098af757ed8ba718b1565bde49 100644
+--- a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
++++ b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+@@ -917,6 +917,15 @@ class RawVulkanPreviewController(
+             }
+             val state = spektraRepository.captureSnapshot()
+             val capture = VulkanCaptureSnapshot.from(state, frame.metadata)
++            // IRIS_26883_UNCROPPED_PREVIEW_LATTICE: post-RAW GPU output
++            // only. Keep FULL 4096x3072 Camera2 RAW acquisition, mapped
++            // sensor source crop (0,0) and full-resolution still route.
++            // The inherited geometry owner aspect-fits without cropping;
++            // portrait is rotated 1920x1440 -> 1440x1920 afterward.
++            val gpuPreviewLimit26883 = Size2d(
++                minOf(owner.plan.processingSize.width, 1920),
++                minOf(owner.plan.processingSize.height, 1440),
++            )
+             val geometry = FrameGeometrySnapshot.createFullActivePreview(
+                 owner.camera.sensorMetadata,
+                 frame.output,
+@@ -926,7 +935,7 @@ class RawVulkanPreviewController(
+                     owner.camera.facing,
+                 ),
+                 requireNotNull(viewportSize) { "Viewfinder dimensions are unavailable" },
+-                owner.plan.processingSize,
++                gpuPreviewLimit26883,
+             )
+             val raw = RawShaderParameters.forPreview(
+                 frame.output,
+diff --git a/app/version.properties b/app/version.properties
+index 2cf46c6df8fb4694d9b2315116a5275744c96817..435243511070607c8ca134618f402f18e83c4c36 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726882
+-VERSION_BUILD=26882
++VERSION_NAME=0.9726883
++VERSION_BUILD=26883
