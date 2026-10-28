@@ -41,10 +41,20 @@ assert "len(matches)==1" in gen
 assert "26884 historical-domain leak" in gen and "26885 chroma regression rebound to 26886" in gen
 assert 'verify_26880_rawr_shader_universe.py' in gen
 assert 'real compiler' in gen.lower()
+# Exact Actions 40628296093 pre-build failure: prior 26884 TAR path leaked
+# into the current successful 26885 artifact reader. This regression is
+# REQUIRED before generating the runner, then verify emitted stage separately.
+assert "edit('obtain_authority',fix_current_authority)" in gen
+assert 'build_26885_iris_rawr_outputs/26885_candidate_app_source.tar.gz' in gen
+assert 'build_26885_iris_rawr_outputs/26885_COMPILER_STATUS.txt' in gen
+assert '26886_BASE_26885_FULL_APP.sha256' in gen
+assert "assert s.count('-eq 2009')==1" in gen
+assert "('26886_BASE_26884_FULL_APP.sha256','26886_BASE_26885_FULL_APP.sha256')" in gen
+assert "('runtime_authority=successful 26884','runtime_authority=successful 26885')" in gen
 assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in gen
 assert 'python3 -S stage_26885_root.py' in gen and 'regressions/26885_successor_contract.py' in gen
 assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in (R/'TRIGGER_26886.txt').read_text()
-assert 'REPAIR_26886_ACTIONS_40623130600_EXACT_26885_V2_REAL_RUNNER_V3' in (R/'TRIGGER_26886.txt').read_text()
+assert 'REPAIR_26886_ACTIONS_40628296093_EXACT_REAL_26885_AUTHORITY_V4' in (R/'TRIGGER_26886.txt').read_text()
 for x in ('run: |','branches: [experimental-clean-photon-rebuild]','permissions:','actions: read','contents: read','uses: actions/checkout@v5','uses: actions/setup-java@v5','uses: actions/setup-python@v5'):
  assert x in workflow
 assert workflow.count('actions/upload-artifact@v4')==1

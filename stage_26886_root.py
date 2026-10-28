@@ -23,7 +23,7 @@ base=R/'handoff_payload_26886'
 actual={'app/'+f.relative_to(base/'app').as_posix() for f in (base/'app').rglob('*') if f.is_file()}
 assert actual==set(allow) and all(sha(base/k)==new[k] for k in allow)
 assert man('26886_PAYLOAD_SHA256.txt')=={'handoff_payload_26886/'+k:new[k] for k in allow}
-assert (R/'TRIGGER_26886.txt').read_bytes()==b'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1\nREPAIR_26886_ACTIONS_40623130600_EXACT_26885_V2_REAL_RUNNER_V3\n'
+assert (R/'TRIGGER_26886.txt').read_bytes()==b'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1\nREPAIR_26886_ACTIONS_40628296093_EXACT_REAL_26885_AUTHORITY_V4\n'
 w=(R/'.github/workflows/build-26886-iris-rawr.yml').read_text()
 assert "      - 'TRIGGER_26886.txt'" in w and "      - 'TRIGGER_26885.txt'" not in w
 assert w.count('bash build_26886_iris_rawr.sh')==1 and 'bash build_26885_iris_rawr.sh' not in w

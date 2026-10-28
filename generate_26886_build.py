@@ -68,6 +68,39 @@ def authority(s):
  assert '12783521315' in s and '40610009610' in body
  return s
 edit('obtain_authority',authority)
+# Permanent actual 40628296093 regression: 26885 V2 inherited the 26884
+# download paths because 26884 WAS its parent. Only the *current* authority
+# reader below advances. Historic 26884->26885 replay is elsewhere unchanged.
+def fix_current_authority(s):
+ assert s.count('build_26884_iris_rawr_outputs/26884_candidate_app_source.tar.gz')==1
+ assert s.count('build_26884_iris_rawr_outputs/26884_COMPILER_STATUS.txt')==1
+ assert s.count('26886_BASE_26884_FULL_APP.sha256')==1
+ assert s.count('-eq 2009')==1
+ for old,new in (
+  ('26884_run.json','26885_run.json'),
+  ('26884_artifact_metadata.json','26885_artifact_metadata.json'),
+  ('26884 authority artifact hash drift','26885 authority artifact hash drift'),
+  ('build_26884_iris_rawr_outputs/26884_candidate_app_source.tar.gz','build_26885_iris_rawr_outputs/26885_candidate_app_source.tar.gz'),
+  ('exact successful 26884 compiled candidate TAR drift','exact successful 26885 compiled candidate TAR drift'),
+  ('build_26884_iris_rawr_outputs/26884_COMPILER_STATUS.txt','build_26885_iris_rawr_outputs/26885_COMPILER_STATUS.txt'),
+  ('26884 prior compiler authority missing','26885 prior compiler authority missing'),
+  ('-eq 2009','-eq 2010'),
+  ('not successful 26884 compiled file universe','not successful 26885 compiled file universe'),
+  ('26886_BASE_26884_FULL_APP.sha256','26886_BASE_26885_FULL_APP.sha256'),
+  ('26884 authority manifest mismatch','26885 authority manifest mismatch'),
+  ('real successful 26884 exact source universe/complete manifest/prior compilers','real successful 26885 exact source universe/complete manifest/prior compilers'),
+  ('successful 26884 Actions run/HEAD/branch','successful 26885 Actions run/HEAD/branch'),
+  ('26884 successful artifact metadata mismatch','26885 successful artifact metadata mismatch'),
+  ('successful 26884 artifact identity and digest','successful 26885 artifact identity and digest'),
+ ):
+  assert s.count(old)==(2 if old in ('26884_run.json','26884_artifact_metadata.json') else 1),(old,s.count(old))
+  s=s.replace(old,new)
+ for old in ('26884_run.json','26884_artifact_metadata.json','build_26884_iris_rawr_outputs/',
+             '26886_BASE_26884_FULL_APP.sha256','-eq 2009','successful 26884'):
+  assert old not in s,('stale ACTIVE predecessor authority',old)
+ return s
+edit('obtain_authority',fix_current_authority)
+
 # Explicitly inherit previous runtime mechanics and sealed generator, no reroute.
 def mechanics(s):
  # Permanent regression: Actions 40621816379/job 122597388924 exposed two
@@ -204,6 +237,18 @@ def safety(s):
  s=s.replace('runtime_changed_files=8','runtime_changed_files=2').replace('prior_files=2009','prior_files=2010').replace('protected_source=2002','protected_source=2008').replace('8-file','2-file')
  return s.replace('candidate_files=2010','candidate_files=2010')
 edit('prebuild_safety',safety)
+# 26886 prebuild safety receipt must accurately name the actual successful parent.
+def accurate_safety(s):
+ for old,new in (
+  ('runtime_authority=successful 26884','runtime_authority=successful 26885'),
+  ('verification_mechanics=exact successful 26884','verification_mechanics=exact successful 26885'),
+  ('protected_source=2008 files byte-identical to successful 26884',
+   'protected_source=2008 files byte-identical to successful 26885'),
+ ):
+  assert s.count(old)==1,(old,s.count(old))
+  s=s.replace(old,new,1)
+ return s
+edit('prebuild_safety',accurate_safety)
 def patches(s):
  return s.replace('8-file','2-file')
 edit('verify_candidate_patches',patches)
@@ -230,6 +275,17 @@ for stage in ('make_candidate','compile_modified_runtime_shaders','clean_extract
  expected='"$H84" "$BASE"' if stage=='make_candidate' else '"$WORK/historical_26884_from_26885" "$BASE"'
  assert expected in legacy[0] and '"$ROOT/build_26885_iris_rawr.sh"' in legacy[0],(stage,legacy[0])
 assert 'verify_26886_expanded_glsl.py "$CAND" --compiler "$IRIS26864_GLSLANG"' in body
+# Static regression guards complement, NEVER replace, execution against the
+# verified actual successful 26885 artifact TAR and compiler receipts.
+active_authority=stage_text(body,'obtain_authority')
+for expected in ('build_26885_iris_rawr_outputs/26885_candidate_app_source.tar.gz',
+                 'build_26885_iris_rawr_outputs/26885_COMPILER_STATUS.txt',
+                 '26886_BASE_26885_FULL_APP.sha256','-eq 2010',
+                 'RUNTIME_TAR_SHA','RUNTIME_ARTIFACT_SHA'):
+ assert expected in active_authority,('40628296093 active authority missing',expected)
+for forbidden in ('build_26884_iris_rawr_outputs/',
+                  '26886_BASE_26884_FULL_APP.sha256','-eq 2009'):
+ assert forbidden not in active_authority,('40628296093 stale authority',forbidden)
 pkg=stage_text(body,'verify_package')
 assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in pkg
 assert 'RUN_26886_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V2_SCOPE_REPAIR' not in pkg
