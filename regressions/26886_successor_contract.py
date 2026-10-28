@@ -51,10 +51,27 @@ assert '26886_BASE_26885_FULL_APP.sha256' in gen
 assert "assert s.count('-eq 2009')==1" in gen
 assert "('26886_BASE_26884_FULL_APP.sha256','26886_BASE_26885_FULL_APP.sha256')" in gen
 assert "('runtime_authority=successful 26884','runtime_authority=successful 26885')" in gen
+# Exact failed 40631900747/job 122629967691: V5 patch checker accepted
+# only 2 positional operands, but the inherited successful runner passes
+# BASE CAND FORWARD PATCH ROLLBACK PATCH (4) in TWO stages. Static and
+# actual command execution must both pass before any handoff.
+patch_validator=(R/'verify_26886_patches.py').read_text()
+assert "assert len(sys.argv)==5" in patch_validator
+assert "['26886_FORWARD_FULL_INDEX.patch','26886_ROLLBACK_FULL_INDEX.patch']" in patch_validator
+assert 'assert len(sys.argv)==3' not in patch_validator
+actual_runner=R/'build_26886_iris_rawr.sh'
+if actual_runner.is_file():
+ actual=actual_runner.read_text()
+ for stage,dirvar in [('verify_candidate_patches','$CAND'),('clean_extract_replay','$exp')]:
+  a=actual.index('\n'+stage+'(){')+1;b=actual.index('\n}',a)+2
+  body=actual[a:b]
+  expected='verify_26886_patches.py "$BASE" "'+dirvar+'" 26886_FORWARD_FULL_INDEX.patch 26886_ROLLBACK_FULL_INDEX.patch'
+  assert body.count(expected)==1,('Actions 40631900747 emitted patch-cli drift',stage)
+ assert actual.count('python3 -S verify_26886_patches.py')==2
 assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in gen
 assert 'python3 -S stage_26885_root.py' in gen and 'regressions/26885_successor_contract.py' in gen
 assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in (R/'TRIGGER_26886.txt').read_text()
-assert 'REPAIR_26886_ACTIONS_40630270318_RESERVED_SAMPLE_GLSL_V5' in (R/'TRIGGER_26886.txt').read_text()
+assert 'REPAIR_26886_ACTIONS_40631900747_PATCH_VALIDATOR_CLI_V6' in (R/'TRIGGER_26886.txt').read_text()
 for x in ('run: |','branches: [experimental-clean-photon-rebuild]','permissions:','actions: read','contents: read','uses: actions/checkout@v5','uses: actions/setup-java@v5','uses: actions/setup-python@v5'):
  assert x in workflow
 assert workflow.count('actions/upload-artifact@v4')==1

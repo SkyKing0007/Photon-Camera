@@ -48,3 +48,18 @@ The real glslang 16.5.0 executable is unavailable in this local environment;
 LOCAL REAL GLSL / Kotlin / Java / NDK / APK are NOT RUN. GitHub Actions MUST
 compile and build before 26886 can be called successful. This ZIP is a
 prepared upload for Actions, not proof of build success. Do NOT use V1–V4.
+
+REPAIR V6 — ACTIONS 40631900747 EXACT PATCH-VALIDATOR CLI FAILURE:
+All new pinned GLSL/SPIR-V, Kotlin, Java, and real two-ABI NDK compilers PASSED
+on GitHub Actions, but verify_candidate_patches rejected the successful
+inherited runner's four-operand CLI (BASE, CAND, forward patch, rollback
+patch) because the new validator had `assert len(sys.argv)==3`. V6 changes
+ONLY the validator's argument contract to require exactly those four
+operands and exact forward/rollback filenames, with permanent regression in
+the existing successor contract for BOTH patch invocations. The generated
+17-stage runner, real compiler/NDK/assemble commands, workflow, runtime
+shader and version, 2-file runtime allowlist, all 2008 protected files,
+full-index patches and 26885 authority are byte-identical to V5. Verified
+new four-argument patch gate against the exact real 26885 compiled-candidate
+and frozen V5/26886 candidate. Local APK assemble remains NOT RUN; Actions
+must complete full 17 stages and prove one APK. Do not reuse V1-V5.

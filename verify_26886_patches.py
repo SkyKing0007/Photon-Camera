@@ -2,8 +2,13 @@
 """Full-index deterministic 7/12/40 real source forward/rollback, zero fuzz."""
 from pathlib import Path
 import hashlib,subprocess,sys,tempfile,shutil
-assert len(sys.argv)==3
-B,C=map(Path,sys.argv[1:]);R=Path(__file__).resolve().parent
+# Actions 40631900747: the exact inherited 26885 runner supplies FOUR
+# operands: successful-26885 BASE, frozen 26886 CAND, forward, rollback.
+# V5's len==3 check rejected that valid runner after all real compilers.
+# Treat both patch names as mandatory, not optional or silently ignored.
+assert len(sys.argv)==5, ('26886 patch validator requires BASE CAND FORWARD ROLLBACK',sys.argv)
+B,C=map(Path,sys.argv[1:3]);R=Path(__file__).resolve().parent
+assert sys.argv[3:] == ['26886_FORWARD_FULL_INDEX.patch','26886_ROLLBACK_FULL_INDEX.patch'], ('unexpected full-index patch contract',sys.argv[3:])
 sha=lambda f:hashlib.sha256(f.read_bytes()).hexdigest()
 f=(R/'26886_FORWARD_FULL_INDEX.patch').read_bytes();back=(R/'26886_ROLLBACK_FULL_INDEX.patch').read_bytes()
 assert f and back and b'index ' in f and b'index ' in back
