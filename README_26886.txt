@@ -34,3 +34,17 @@ patch proof, clean source and negative tamper protections all passed locally.
 New 26886 GLSL 16.5.0 / Java / Kotlin / NDK / full assemble remain NOT RUN
 until GitHub Actions. This is PREPARED for Actions, never called build-proven.
 Do not upload earlier V1/V2/V3 ZIPs.
+
+REPAIR V5 — ACTIONS 40630270318 EXACT REAL SHADER COMPILER FAILURE:
+Pinned real glslang 16.5.0 reached Iris26885WronskiChromaGuide.comp line 98,
+and rejected GLSL reserved variable `sample`: unexpected SAMPLE. In V5 exactly
+four code identifier occurrences become `wronskiNeighborRgb`, with NO change
+to math, ownership, GPU layout, FOV, version, camera routing or frame count.
+verify_26886_expanded_glsl.py permanently detects that reserved declaration,
+including a negative/positive failing-token regression. The existing actual
+compile_locked_rawr_glslc.py --target-env=vulkan1.1 -O pinned real
+compiler invocation is unchanged. Historical/authority fixes from V4 retained.
+The real glslang 16.5.0 executable is unavailable in this local environment;
+LOCAL REAL GLSL / Kotlin / Java / NDK / APK are NOT RUN. GitHub Actions MUST
+compile and build before 26886 can be called successful. This ZIP is a
+prepared upload for Actions, not proof of build success. Do NOT use V1–V4.

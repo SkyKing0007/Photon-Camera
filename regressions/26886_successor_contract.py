@@ -54,7 +54,7 @@ assert "('runtime_authority=successful 26884','runtime_authority=successful 2688
 assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in gen
 assert 'python3 -S stage_26885_root.py' in gen and 'regressions/26885_successor_contract.py' in gen
 assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in (R/'TRIGGER_26886.txt').read_text()
-assert 'REPAIR_26886_ACTIONS_40628296093_EXACT_REAL_26885_AUTHORITY_V4' in (R/'TRIGGER_26886.txt').read_text()
+assert 'REPAIR_26886_ACTIONS_40630270318_RESERVED_SAMPLE_GLSL_V5' in (R/'TRIGGER_26886.txt').read_text()
 for x in ('run: |','branches: [experimental-clean-photon-rebuild]','permissions:','actions: read','contents: read','uses: actions/checkout@v5','uses: actions/setup-java@v5','uses: actions/setup-python@v5'):
  assert x in workflow
 assert workflow.count('actions/upload-artifact@v4')==1
