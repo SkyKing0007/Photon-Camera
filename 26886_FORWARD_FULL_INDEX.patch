@@ -1,0 +1,197 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp b/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp
+index c167abec7a1ab8b0e0da36b2a7919bf5ddbe271c..ad17e483ac520ae2487e2bc940f5a5f82c0223e6 100644
+--- a/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp
++++ b/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp
+@@ -1,12 +1,15 @@
+ #version 450
+-// IRIS_26885_B_SR_ON_WRONSKI_RGB_CHROMA_EVIDENCE
++// IRIS_26886_B_SR_ON_UNSUPPORTED_CHROMA_AND_BURST_FALLBACK
+ // B Super Res ON only. AMaZE's already-computed 2x luminance remains intact.
+ // Wronski RGB is original camera-linear/pre-LSC; AMaZE AHB is camera-linear
+ // POST physical LSC (its export divided the temporary AMaZE WB).
+ // Both estimates are compared ONLY after applying the identical physical
+ // sensor LSC and temporary WB for evidence. Output is back in camera linear.
+-// A work item reads and writes only its own AMaZE pixel; all neighbor reads
+-// are exclusively from the immutable Wronski guide. No cross-workgroup race.
++// B-ON's fitted native RAWR seven-scale chroma wavelet remains unchanged;
++// this single-pixel guide also provides bounded color-noise/alias cleanup
++// when the genuine burst fit is not usable, WITHOUT fabricating a noise fit.
++// All neighborhood reads use the immutable original Wronski RGB; this stage
++// neither reads adjacent AMaZE pixels nor changes AMaZE luminance/geometry.
+ layout(local_size_x=16,local_size_y=16) in;
+ layout(set=0,binding=0,rgba16f) uniform image2D amazeRgbInPlace;
+ layout(set=0,binding=1,rgba16f) readonly uniform image2D wronskiRgb;
+@@ -59,60 +62,110 @@ void main(){
+        any(notEqual(imageSize(wronskiRgb),ivec2(p.width,p.height)))||
+        any(notEqual(imageSize(originalSensorClip),ivec2(p.width/2u,p.height/2u))))return;
+     vec4 src=imageLoad(amazeRgbInPlace,px);
+-    vec3 guideRaw=imageLoad(wronskiRgb,px).rgb;
+-    if(!finiteRgb(src.rgb)||!finiteRgb(guideRaw))return;
+-    if(any(lessThan(src.rgb,vec3(0)))||any(lessThan(guideRaw,vec3(0))))return;
+-    if(any(lessThanEqual(p.wb.rgb,vec3(0))))return;
++    vec3 originalRgb=imageLoad(wronskiRgb,px).rgb;
++    if(!finiteRgb(src.rgb)||!finiteRgb(originalRgb)||
++       any(lessThan(src.rgb,vec3(0)))||any(lessThan(originalRgb,vec3(0)))||
++       !finiteRgb(p.wb.rgb)||any(lessThanEqual(p.wb.rgb,vec3(0))))return;
+     vec3 gain=lscGain(px);
+     if(!finiteRgb(gain)||any(lessThanEqual(gain,vec3(0))))return;
+-    vec3 cand=src.rgb*p.wb.rgb;
+-    vec3 guide=guideRaw*gain*p.wb.rgb;
+-    if(!finiteRgb(cand)||!finiteRgb(guide))return;
+-    float yc=yOf(cand),yg=yOf(guide);
+-    // Dark/noisy or unusable reconstructed RGB has no trustworthy witness.
+-    if(yc<0.012||yg<0.012||yc>8.0||yg>8.0)return;
+-    vec3 candidateChroma=cand-vec3(yc);
+-    vec3 guideChroma=guide-vec3(yg);
+-    float cNorm=colorStrength(cand),gNorm=colorStrength(guide);
+-    float mismatch=length(candidateChroma-guideChroma)/max(max(yc,yg),0.035);
+-    if(mismatch<0.035||cNorm<0.025)return;
+-    // A true colored thin feature may peak one/two Wronski pixels away.
+-    // Consult ONLY the immutable Wronski guide, not neighboring AMaZE pixels,
+-    // so in-place correction has no inter-invocation read/write conflict.
+-    float nearby=max(gNorm,0.0);
+-    const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+-    for(int j=0;j<4;++j){
+-        ivec2 q=clamp(px+offs[j],ivec2(0),ivec2(p.width-1u,p.height-1u));
+-        vec3 nearbyRaw=imageLoad(wronskiRgb,q).rgb;
+-        if(!finiteRgb(nearbyRaw)||any(lessThan(nearbyRaw,vec3(0))))return;
+-        nearby=max(nearby,colorStrength(nearbyRaw*lscGain(q)*p.wb.rgb));
++    // BOTH images in matched physical-LSC and WB evidence domain.
++    vec3 candidate=src.rgb*p.wb.rgb;
++    vec3 guide=originalRgb*gain*p.wb.rgb;
++    if(!finiteRgb(candidate)||!finiteRgb(guide))return;
++    float yc=yOf(candidate),yg=yOf(guide);
++    if(yc<0.003||yg<0.003||yc>8.0||yg>8.0)return;
++    vec3 cc=candidate-vec3(yc),gc=guide-vec3(yg);
++    float cMag=length(cc)/max(yc,0.012);
++    float gMag=length(gc)/max(yg,0.012);
++    float difference=length(cc/max(yc,0.012)-gc/max(yg,0.012));
++    if(difference<0.022||cMag<0.018)return;
++
++    // Look for real chromatic evidence matching THIS candidate's hue in
++    // original Wronski RGB. An isolated different-hue noise spike must not
++    // veto neutral-metal correction as the old 4-neighbor max did.
++    float centerCos=dot(cc,gc)/max(length(cc)*length(gc),1e-9);
++    float witness=smoothstep(0.085,0.20,gMag)*smoothstep(0.55,0.86,centerCos);
++    vec3 chromaSum=gc/max(yg,0.012);
++    float sumWeight=1.0;
++    float localAgreement=0.0;
++    const ivec2 offsets[8]=ivec2[8](
++        ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
++        ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1),ivec2(1,1));
++    for(int j=0;j<8;++j){
++        ivec2 q=clamp(px+offsets[j],ivec2(0),ivec2(p.width-1u,p.height-1u));
++        vec3 sampleRaw=imageLoad(wronskiRgb,q).rgb;
++        if(!finiteRgb(sampleRaw)||any(lessThan(sampleRaw,vec3(0))))continue;
++        vec3 sample=sampleRaw*lscGain(q)*p.wb.rgb;
++        if(!finiteRgb(sample))continue;
++        float sy=yOf(sample);
++        if(sy<0.002||sy>8.0)continue;
++        vec3 sc=sample-vec3(sy);
++        float sn=length(sc)/max(sy,0.012);
++        float sameHue=dot(cc,sc)/max(length(cc)*length(sc),1e-9);
++        // Preserve an actual thin colored wire even if subpixel phase
++        // shifts the true Wronski color by one sample. Color evidence must
++        // be hue-consistent AND roughly same material/luminance.
++        float similar=1.0-smoothstep(0.12,0.46,
++            abs(sy-yg)/max(max(sy,yg),0.012));
++        float chromaticWitness=smoothstep(0.07,0.18,sn)*
++            smoothstep(0.64,0.90,sameHue)*similar;
++        witness=max(witness,chromaticWitness);
++        // Edge-aware original-RGB neighborhood is an independent chroma
++        // consensus, never a blur of post-AMaZE pixels or luminance.
++        float w=similar;
++        chromaSum+=w*sc/max(sy,0.012);
++        sumWeight+=w;
++        localAgreement+=w*chromaticWitness;
+     }
+-    // Strong independent color in the same subpixel neighborhood is a veto.
+-    // In neutral periodic geometry Wronski is achromatic but AMaZE may be
+-    // alternating teal/yellow; neither brightness nor an object class sets hue.
+-    float neutralEvidence=1.0-smoothstep(0.025,0.110,nearby);
+-    float supportGap=smoothstep(0.025,0.20,max(cNorm-nearby,0.0));
+-    float chromaDisagreement=smoothstep(0.035,0.25,mismatch);
+-    float unsupported=neutralEvidence*supportGap*chromaDisagreement;
+-    // Never take the guide as reliable through multichannel RAW clipping.
+-    uint originalBits=imageLoad(originalSensorClip,px/2).r&15u;
+-    int clippedChannels=bitCount(originalBits);
+-    float clipReliability=clippedChannels==0?1.0:(clippedChannels==1?0.40:0.0);
+-    float weight=0.82*unsupported*clipReliability;
+-    if(weight<=0.0001)return;
+-    // Conserve EXACT white-balanced AMaZE luminance; replace only opponent
+-    // chroma. Bounds prevent negative channels/colored dark rings.
+-    vec3 difference=guideChroma-candidateChroma;
+-    for(int channel=0;channel<3;++channel){
+-        if(difference[channel]<0.0)
+-            weight=min(weight,cand[channel]/max(-difference[channel],1e-7));
++    vec3 consensus=chromaSum/sumWeight;
++    float consensusMag=length(consensus);
++    float chromaExcess=max(cMag-consensusMag,0.0);
++    float neutral=1.0-smoothstep(0.055,0.23,consensusMag);
++    float falseColor=neutral*smoothstep(0.018,0.19,chromaExcess)*
++        smoothstep(0.022,0.20,difference);
++    // In underexposed smooth regions, a weak incoherent independent guide
++    // supports a separate conservative chroma-only cleanup. This remains
++    // useful when noiseEstimated is false and the valid fitted RAWR wavelet
++    // must skip; no Camera2 "fitted" profile and no made-up noise floor.
++    float shadow=1.0-smoothstep(0.008,0.095,min(yc,yg));
++    float localSupport=clamp(localAgreement/max(sumWeight-1.0,1e-4),0.0,1.0);
++    float incoherent=(1.0-localSupport)*
++        (1.0-smoothstep(0.075,0.23,consensusMag));
++    float noiseCleanup=0.34*shadow*incoherent*
++        smoothstep(0.035,0.18,chromaExcess)*
++        smoothstep(0.022,0.20,difference);
++    float unsupported=max(falseColor,noiseCleanup)*(1.0-witness);
++    if(unsupported<0.0001)return;
++
++    uint bits=imageLoad(originalSensorClip,px/2).r&15u;
++    int clipped=bitCount(bits);
++    // Never reconstruct a clipped colored pixel by donating a neighboring
++    // hue. Multichannel-clipped neutral reflection may fade ONLY toward
++    // neutral when independent Wronski consensus itself is neutral.
++    float clipWeight=clipped==0?1.0:(clipped==1?0.50:0.30*neutral);
++    float weight=clamp(0.86*falseColor+noiseCleanup,0.0,0.86)*
++        (1.0-witness)*clipWeight;
++    if(weight<0.0001)return;
++    vec3 targetN=mix(gc/max(yg,0.012),consensus,0.48);
++    // Do not synthesize a target hue when the independent guide is near
++    // neutral or disagrees in direction with the apparent AMaZE color.
++    float targetNorm=length(targetN);
++    if(targetNorm>consensusMag+0.015)
++        targetN*= (consensusMag+0.015)/max(targetNorm,1e-8);
++    if(clipped>=2)targetN=mix(targetN,vec3(0),neutral);
++    vec3 targetChroma=targetN*yc;
++    // Exact zero-y chroma invariant, even after interpolation and clipping.
++    targetChroma-=vec3(yOf(targetChroma));
++    vec3 move=targetChroma-cc;
++    for(int k=0;k<3;++k){
++        if(move[k]<0.0)
++            weight=min(weight,candidate[k]/max(-move[k],1e-8));
+     }
+-    weight=clamp(weight,0.0,0.82);
+-    if(weight<=0.0001)return;
+-    vec3 outWb=cand+difference*weight;
+-    if(!finiteRgb(outWb)||any(lessThan(outWb,vec3(-0.00001))))return;
+-    vec3 outCam=outWb/p.wb.rgb;
+-    if(!finiteRgb(outCam))return;
+-    // No luma blur, no edge movement, no output-domain WB or LSC duplication.
+-    imageStore(amazeRgbInPlace,px,vec4(max(outCam,vec3(0)),src.a));
++    weight=clamp(weight,0.0,0.86);
++    if(weight<0.0001)return;
++    vec3 corrected=candidate+weight*move;
++    if(!finiteRgb(corrected)||any(lessThan(corrected,vec3(-0.00001))))return;
++    vec3 outRgb=corrected/p.wb.rgb;
++    if(!finiteRgb(outRgb))return;
++    imageStore(amazeRgbInPlace,px,vec4(max(outRgb,vec3(0)),src.a));
+ }
+diff --git a/app/version.properties b/app/version.properties
+index 6005145999adc1f8c7012fa4467bb2e10876645a..2ab6d1c77b2c6821223ce2a6d2ad4a0ba5c7d723 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726885
+-VERSION_BUILD=26885
++VERSION_NAME=0.9726886
++VERSION_BUILD=26886
