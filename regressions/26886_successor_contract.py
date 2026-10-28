@@ -41,6 +41,10 @@ assert "len(matches)==1" in gen
 assert "26884 historical-domain leak" in gen and "26885 chroma regression rebound to 26886" in gen
 assert 'verify_26880_rawr_shader_universe.py' in gen
 assert 'real compiler' in gen.lower()
+assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in gen
+assert 'python3 -S stage_26885_root.py' in gen and 'regressions/26885_successor_contract.py' in gen
+assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in (R/'TRIGGER_26886.txt').read_text()
+assert 'REPAIR_26886_ACTIONS_40623130600_EXACT_26885_V2_REAL_RUNNER_V3' in (R/'TRIGGER_26886.txt').read_text()
 for x in ('run: |','branches: [experimental-clean-photon-rebuild]','permissions:','actions: read','contents: read','uses: actions/checkout@v5','uses: actions/setup-java@v5','uses: actions/setup-python@v5'):
  assert x in workflow
 assert workflow.count('actions/upload-artifact@v4')==1

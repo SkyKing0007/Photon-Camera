@@ -108,25 +108,23 @@ edit('make_candidate',historical)
 # Historical source hash predicates MUST never receive new 26886 bytes.
 # Update source operand ONLY, NOT the old validators or compiler options.
 def route_historical(s,name):
- historic=('"$H84' if name=='make_candidate' else '"$WORK/historical_26884_from_26885')
+ # The historical variable must be quoted as a *complete* shell operand.
+ # Exact failed Actions 40623130600 would create: "$H84 "$BASE".
+ historic_var=('$H84' if name=='make_candidate' else '$WORK/historical_26884_from_26885')
+ historic='"'+historic_var+'"'
+ historic_app='"'+historic_var+'/app"'
  if name in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
   lines=s.splitlines(keepends=True)
   matches=[i for i,x in enumerate(lines) if re.search(r'\bpython3 -S verify_26880_rawr_shader_universe\.py\b',x)]
   assert len(matches)==1,('26880 old real validator count',name,matches)
   i=matches[0]
   assert '"$BASE/app"' in lines[i],('unexpected 26885 V2 validator source binding',name,lines[i])
-  lines[i]=lines[i].replace('"$BASE/app"',historic+'/app"',1)
+  lines[i]=lines[i].replace('"$BASE/app"',historic_app,1)
   s=''.join(lines)
- # 26884 checker was originally run on 26884 BASE. Preserve that historical
- # source domain instead of accidentally checking 26885 or 26886.
  lines=s.splitlines(keepends=True)
  for i,line in enumerate(lines):
   if re.search(r'\b(?:python3 -S )?(?:verify_26884_|regressions/26884_)',line):
-   lines[i]=line.replace('"$BASE"',historic+'"').replace('"$exp"',historic+'"')
- # Permanent real-history contract: the global rename was already
- # reversed ABOVE, so the inherited failed-26885 validator is named 26885.
- # Matching the already-restored 26885 path is mandatory; otherwise the
- # 26885 historical validator runs on the wrong 26885->26886 source domain.
+   lines[i]=line.replace('"$BASE"',historic).replace('"$exp"',historic)
  matches=[i for i,line in enumerate(lines)
           if 'python3 -S regressions/26885_actions_40604341240_historical_scope.py' in line]
  assert len(matches)==1,('expected one inherited 26885 historical CMake checker',name,matches)
@@ -136,7 +134,11 @@ def route_historical(s,name):
  assert 'build_26886_iris_rawr.sh' in line,('historical CMake checker runner changed',name,line)
  line=line.replace(expected,historic+' "$BASE"',1)
  line=line.replace('build_26886_iris_rawr.sh','build_26885_iris_rawr.sh',1)
- assert historic+' "$BASE"' in line and 'build_26885_iris_rawr.sh' in line
+ import shlex
+ parsed=shlex.split(line.strip())
+ expected_args=['python3','-S','regressions/26885_actions_40604341240_historical_scope.py',
+                historic_var,'$BASE','$ROOT/build_26885_iris_rawr.sh']
+ assert parsed==expected_args,(name,'malformed historical validator invocation',parsed,expected_args)
  lines[i]=line
  return ''.join(lines)
 for n in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
@@ -152,7 +154,8 @@ def previous_source(s,stage):
  python3 -S verify_26885_expanded_glsl.py "$BASE"
  python3 -S regressions/26886_historical_scope_all_stages.py "$H84" "$BASE" "$CAND" "$ROOT/build_26885_iris_rawr.sh" "$ROOT/build_26886_iris_rawr.sh"'''
  elif stage=='compile_modified_runtime_shaders':
-  z=''' python3 -S verify_26885_expanded_glsl.py "$BASE" --compiler "$IRIS26864_GLSLANG" --spirv-val "$(command -v spirv-val)" --spirv-opt "$(command -v spirv-opt)" --out "$OUT/26886_historical_26885_chroma_spirv"
+  z=''' python3 -S regressions/26885_chroma_controls.py "$BASE" "$WORK/historical_26884_from_26885"
+ python3 -S verify_26885_expanded_glsl.py "$BASE" --compiler "$IRIS26864_GLSLANG" --spirv-val "$(command -v spirv-val)" --spirv-opt "$(command -v spirv-opt)" --out "$OUT/26886_historical_26885_chroma_spirv"
  python3 -S regressions/26886_historical_scope_all_stages.py "$WORK/historical_26884_from_26885" "$BASE" "$CAND" "$ROOT/build_26885_iris_rawr.sh" "$ROOT/build_26886_iris_rawr.sh"'''
  else:
   z=''' python3 -S verify_26885_candidate.py "$WORK/historical_26884_from_26885" "$BASE"
@@ -173,6 +176,24 @@ def package(s):
  # The inherited package counted EIGHT 26885 handoff files; successor has TWO.
  # This is an identity/scope update only, not relaxation of the allowlist.
  s=s.replace('-eq 8 ]]','-eq 2 ]]').replace('8-file','2-file').replace('8-source','2-source')
+ # Real 26886 trigger is unchanged V1 plus a repair nonce. Do not let the
+ # previous 26885 V2 *caption* become the 26886 trigger token.
+ s=s.replace('RUN_26886_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V2_SCOPE_REPAIR',
+             'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1')
+ # Inherited 26885 *package checks* are historical validators, not current
+ # 26886 validators. Restore them exactly, then append 26886 scope checks.
+ old_current=''' python3 -S -m py_compile verify_26886_candidate.py verify_26886_patches.py verify_26886_expanded_glsl.py verify_26886_semantics.py stage_26886_root.py regressions/26886_successor_contract.py regressions/26886_chroma_controls.py
+ python3 -S stage_26886_root.py
+ python3 -S regressions/26886_successor_contract.py
+'''
+ historic=''' python3 -S -m py_compile verify_26885_candidate.py verify_26885_patches.py verify_26885_expanded_glsl.py verify_26885_semantics.py stage_26885_root.py regressions/26885_successor_contract.py regressions/26885_chroma_controls.py
+ python3 -S stage_26885_root.py
+ python3 -S regressions/26885_successor_contract.py
+'''
+ assert s.count(old_current)==1,('renamed prior 26885 package checks expected once',s.count(old_current))
+ assert historic in stage_text(original,'verify_package'),'prior 26885 V2 historical package checks must be exact'
+ s=s.replace(old_current,historic,1)
+ assert "python3 -S stage_26885_root.py" in s
  return append(s,''' python3 -S stage_26886_root.py
  python3 -S -m py_compile generate_26886_build.py stage_26886_root.py verify_26886_candidate.py verify_26886_patches.py verify_26886_expanded_glsl.py verify_26886_semantics.py regressions/26886_chroma_controls.py regressions/26886_successor_contract.py regressions/26886_historical_scope_all_stages.py
  python3 -S regressions/26886_successor_contract.py
@@ -209,6 +230,13 @@ for stage in ('make_candidate','compile_modified_runtime_shaders','clean_extract
  expected='"$H84" "$BASE"' if stage=='make_candidate' else '"$WORK/historical_26884_from_26885" "$BASE"'
  assert expected in legacy[0] and '"$ROOT/build_26885_iris_rawr.sh"' in legacy[0],(stage,legacy[0])
 assert 'verify_26886_expanded_glsl.py "$CAND" --compiler "$IRIS26864_GLSLANG"' in body
+pkg=stage_text(body,'verify_package')
+assert 'RUN_26886_B_ON_WRONSKI_CHROMA_NOISE_ALIAS_V1' in pkg
+assert 'RUN_26886_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V2_SCOPE_REPAIR' not in pkg
+assert pkg.count('python3 -S stage_26885_root.py')==1
+assert pkg.count('python3 -S stage_26886_root.py')==1
+assert pkg.index('python3 -S stage_26885_root.py') < pkg.index('python3 -S stage_26886_root.py')
+assert 'python3 -S regressions/26885_successor_contract.py' in pkg
 assert 'verify_26886_candidate.py' in body and 'verify_26886_patches.py' in body
 (R/'build_26886_iris_rawr.sh').write_text(body)
 newhash=hashlib.sha256(body.encode()).hexdigest()

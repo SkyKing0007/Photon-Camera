@@ -6,7 +6,7 @@ candidate or 26885 CMake. Original validator code and compiler invocation
 are retained unchanged; historical 26885 regression runs on actual H84/BASE.
 """
 from pathlib import Path
-import hashlib,re,sys
+import hashlib,re,sys,shlex
 assert len(sys.argv)==6,'usage: historical26884 successful26885 candidate26886 exact26885runner generated26886runner'
 H84,B,C,OLD,NEW=map(Path,sys.argv[1:]);sha=lambda f:hashlib.sha256(f.read_bytes()).hexdigest()
 rel='app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake'
@@ -26,6 +26,15 @@ for name in stages:
  assert normalized==a[0].replace('26885','26886') or normalized==a[0],(name,'unexpected historical command/options change')
  assert 'regressions/26886_historical_scope_all_stages.py' in new
  assert 'regressions/26885_actions_40604341240_historical_scope.py' in new
+ # Actions 40623130600: actual malformed `"$H84 "$BASE"` must never be generated.
+ legacy=[line.strip() for line in new.splitlines() if 'python3 -S regressions/26885_actions_40604341240_historical_scope.py' in line]
+ assert len(legacy)==1,(name,'inherited historical invocation missing/duplicated',legacy)
+ hist_var='$H84' if name=='make_candidate' else '$WORK/historical_26884_from_26885'
+ expected=['python3','-S','regressions/26885_actions_40604341240_historical_scope.py',hist_var,'$BASE','$ROOT/build_26885_iris_rawr.sh']
+ assert shlex.split(legacy[0])==expected,(name,'bad historical validator shell tokenization',legacy[0])
+ try: shlex.split('python3 -S regressions/26885_actions_40604341240_historical_scope.py "$H84 "$BASE" "$ROOT/build_26885_iris_rawr.sh"')
+ except ValueError: pass
+ else: raise AssertionError('40623130600 malformed shell quoting was not reproduced')
  assert 'regressions/26885_chroma_controls.py' in new
  if name=='compile_modified_runtime_shaders':
   def multiline(block,needle):
