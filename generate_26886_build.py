@@ -70,7 +70,21 @@ def authority(s):
 edit('obtain_authority',authority)
 # Explicitly inherit previous runtime mechanics and sealed generator, no reroute.
 def mechanics(s):
- return once(once(once(s,'build_26884_iris_rawr.sh','build_26885_iris_rawr.sh'),'generate_26884_build.py','generate_26885_build.py'),'f8aff63b074ee6195d6b137858ad5a3f23cb149a40c9f72cb69b51f315b4679f',old_sha)
+ # Permanent regression: Actions 40621816379/job 122597388924 exposed two
+ # legitimate parent-runner references. Preserve the successful 26885 V2
+ # stage's complete replacement semantics, NEVER require a single occurrence.
+ # Check observed exact parent cardinality; preserve all other stage bytes.
+ anchors=(
+  ('build_26884_iris_rawr.sh','build_26885_iris_rawr.sh'),
+  ('generate_26884_build.py','generate_26885_build.py'),
+  ('f8aff63b074ee6195d6b137858ad5a3f23cb149a40c9f72cb69b51f315b4679f',old_sha),
+ )
+ assert s.count(anchors[0][0])==2,('26885 V2 actual historical runner changed; check both references before replacing',s.count(anchors[0][0]))
+ for before,after in anchors:
+  assert before in s,('missing successful V2 mechanics reference',before)
+  s=s.replace(before,after) # successful 26885 V2 used full replace, not once
+ assert all(old not in s for old,_ in anchors),'unmigrated active mechanics reference'
+ return s
 edit('verify_successful_mechanics',mechanics)
 def scope(s):
  s=s.replace('build_26884_iris_rawr.sh','build_26885_iris_rawr.sh').replace('generate_26884_build.py','generate_26885_build.py')
@@ -109,14 +123,21 @@ def route_historical(s,name):
  for i,line in enumerate(lines):
   if re.search(r'\b(?:python3 -S )?(?:verify_26884_|regressions/26884_)',line):
    lines[i]=line.replace('"$BASE"',historic+'"').replace('"$exp"',historic+'"')
- # Rebind the REAL failed 40604341240 regression to historical 26884->26885.
- for i,line in enumerate(lines):
-  if '26886_actions_40604341240_historical_scope.py' in line:
-   line=line.replace('26886_actions_40604341240_historical_scope.py','26885_actions_40604341240_historical_scope.py')
-   line=line.replace('"$BASE" "$CAND"',historic+'" "$BASE"')
-   line=line.replace('"$BASE" "$exp"',historic+'" "$BASE"')
-   line=line.replace('build_26886_iris_rawr.sh','build_26885_iris_rawr.sh')
-   lines[i]=line
+ # Permanent real-history contract: the global rename was already
+ # reversed ABOVE, so the inherited failed-26885 validator is named 26885.
+ # Matching the already-restored 26885 path is mandatory; otherwise the
+ # 26885 historical validator runs on the wrong 26885->26886 source domain.
+ matches=[i for i,line in enumerate(lines)
+          if 'python3 -S regressions/26885_actions_40604341240_historical_scope.py' in line]
+ assert len(matches)==1,('expected one inherited 26885 historical CMake checker',name,matches)
+ i=matches[0];line=lines[i]
+ expected='"$BASE" "$exp"' if name=='clean_extract_replay' else '"$BASE" "$CAND"'
+ assert expected in line,('historical CMake checker source changed',name,line)
+ assert 'build_26886_iris_rawr.sh' in line,('historical CMake checker runner changed',name,line)
+ line=line.replace(expected,historic+' "$BASE"',1)
+ line=line.replace('build_26886_iris_rawr.sh','build_26885_iris_rawr.sh',1)
+ assert historic+' "$BASE"' in line and 'build_26885_iris_rawr.sh' in line
+ lines[i]=line
  return ''.join(lines)
 for n in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
  edit(n,lambda s,n=n:route_historical(s,n))
@@ -176,6 +197,17 @@ for stage in ('make_candidate','compile_modified_runtime_shaders','clean_extract
  calls=[line for line in s.splitlines() if 'python3 -S verify_26880_rawr_shader_universe.py' in line]
  assert len(calls)==1 and ('"$H84/app"' if stage=='make_candidate' else '"$WORK/historical_26884_from_26885/app"') in calls[0],(stage,'historical 26880 hash-scope regression',calls)
  assert 'regressions/26886_historical_scope_all_stages.py' in s
+ # No sealed 26884/26885 source predicate may silently read the 26886
+ # candidate (or current final export) after renaming a historical runner.
+ for line in s.splitlines():
+  if 'python3 -S verify_26884_' in line or 'python3 -S regressions/26884_' in line:
+   assert '"$BASE"' not in line and '"$CAND"' not in line and '"$exp"' not in line,(stage,'26884 historical-domain leak',line)
+  if 'python3 -S regressions/26885_chroma_controls.py' in line:
+   assert '"$CAND"' not in line and '"$exp"' not in line,(stage,'26885 chroma regression rebound to 26886',line)
+ legacy=[line for line in s.splitlines() if 'python3 -S regressions/26885_actions_40604341240_historical_scope.py' in line]
+ assert len(legacy)==1,(stage,'historical 26885 CMake regression missing or duplicate',legacy)
+ expected='"$H84" "$BASE"' if stage=='make_candidate' else '"$WORK/historical_26884_from_26885" "$BASE"'
+ assert expected in legacy[0] and '"$ROOT/build_26885_iris_rawr.sh"' in legacy[0],(stage,legacy[0])
 assert 'verify_26886_expanded_glsl.py "$CAND" --compiler "$IRIS26864_GLSLANG"' in body
 assert 'verify_26886_candidate.py' in body and 'verify_26886_patches.py' in body
 (R/'build_26886_iris_rawr.sh').write_text(body)

@@ -25,6 +25,20 @@ assert "sha256sum -c 26886_HANDOFF_HASHES.sha256" in workflow
 assert 'bash -n build_26886_iris_rawr.sh' in workflow
 assert all(x in gen for x in ('17-stage','sha256','make_candidate','compile_modified_runtime_shaders','clean_extract_replay','2138db01cbfb3a8421c12e54ba29d4f0a893d1cdd4a219ee34a40a4dc0c54379','26885_actions_40604341240_historical_scope.py'))
 assert 'regressions/26886_historical_scope_all_stages.py' in gen
+# Permanent exact Actions 40621816379 generator-mechanics failure regression.
+# The 26885 V2 prior stage has TWO references to the original 26884 runner.
+# Its proven generator used complete replace; no ambiguity-prone once assertion.
+mechanics=gen[gen.index('def mechanics(s):'):gen.index("edit('verify_successful_mechanics',mechanics)")]
+assert "s.count(anchors[0][0])==2" in mechanics
+assert "s=s.replace(before,after)" in mechanics
+assert "return once(once(once" not in mechanics
+assert "build_26884_iris_rawr.sh" in mechanics and "build_26885_iris_rawr.sh" in mechanics
+# Permanent second defect: the 26885 historical regression was already
+# restored to its original name before source-domain rewriting.
+assert "if '26886_actions_40604341240_historical_scope.py' in line" not in gen
+assert "if 'python3 -S regressions/26885_actions_40604341240_historical_scope.py' in line" in gen
+assert "len(matches)==1" in gen
+assert "26884 historical-domain leak" in gen and "26885 chroma regression rebound to 26886" in gen
 assert 'verify_26880_rawr_shader_universe.py' in gen
 assert 'real compiler' in gen.lower()
 for x in ('run: |','branches: [experimental-clean-photon-rebuild]','permissions:','actions: read','contents: read','uses: actions/checkout@v5','uses: actions/setup-java@v5','uses: actions/setup-python@v5'):
