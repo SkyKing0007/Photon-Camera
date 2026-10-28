@@ -22,7 +22,7 @@ for old,new in [
 ('ARTZIP="$WORK/26883_artifact.zip"; ARTDIR="$WORK/artifact_26883"','ARTZIP="$WORK/26884_artifact.zip"; ARTDIR="$WORK/artifact_26884"'),
 ('BASE="$WORK/exact_successful_26883_compiled_candidate"','BASE="$WORK/exact_successful_26884_compiled_candidate"')]:
  assert old in body,old;body=body.replace(old,new,1)
-TRIG='RUN_26885_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V1'
+TRIG='RUN_26885_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V2_SCOPE_REPAIR'
 def package(s):
  s=s.replace('-eq 3 ]]','-eq 8 ]]').replace('3-file','8-file').replace('3-source','8-source')
  s=s.replace('RUN_26885_RAWR_HIGHLIGHT_OFF_SHARED_B_V1',TRIG)
@@ -116,6 +116,61 @@ def replay(s):
  python3 -S verify_26885_expanded_glsl.py "$exp"
 '''.rstrip())
 edit('clean_extract_replay',replay)
+
+# IRIS_26885_ACTIONS_40604341240 / job 122539975456.
+# The unchanged 26880 validator HASH-PINS Iris26864VendorRawr.cmake.
+# This file intentionally changes in 26885 to embed the new Wronski RGB
+# chroma guide. The historical wavelet check must run against the EXACT
+# successful 26884 artifact, while the 26885 candidate is independently
+# checked by its strict manifest, CMake delta regression and real GLSL gate.
+# Preserve the original validator, compiler flags, stage order and stage
+# execution; change ONLY the historical validator's SOURCE INPUT domain.
+def _rebind_original_26880_wavelet(stage, previous_domain):
+ def apply(h):
+  lines=h.splitlines(keepends=True)
+  matches=[i for i,line in enumerate(lines)
+           if re.search(r'\bpython3 -S verify_26880_rawr_shader_universe\.py\b',line)]
+  assert len(matches)==1,(stage,'expected exactly one real 26880 validator invocation',matches)
+  i=matches[0]
+  assert previous_domain in lines[i],(stage,'stale/renamed 26880 current-domain token',lines[i])
+  assert lines[i].count(previous_domain)==1,(stage,'ambiguous historical source binding')
+  lines[i]=lines[i].replace(previous_domain,'"$BASE/app"',1)
+  assert '--compile' in lines[i] or stage!='compile_modified_runtime_shaders',('real historical compiler args lost',lines[i])
+  assert all(lines[j]==h.splitlines(keepends=True)[j] for j in range(len(lines)) if j!=i),('accidental build mechanic change',stage)
+  return ''.join(lines)
+ edit(stage,apply)
+for _stage,_input in (
+ ('make_candidate','"$CAND/app"'),
+ ('compile_modified_runtime_shaders','"$CAND/app"'),
+ ('clean_extract_replay','"$exp/app"'),
+):
+ _rebind_original_26880_wavelet(_stage,_input)
+
+# Exact failed condition regression (real 26884/26885 CMake bytes) remains
+# in 26885's candidate gate, shader compiler gate and final clean extraction.
+def _regression_stage(s):
+ assert 'python3 -S -m py_compile verify_26885_candidate.py' in s
+ return s.replace('python3 -S -m py_compile verify_26885_candidate.py',
+                  'python3 -S -m py_compile regressions/26885_actions_40604341240_historical_scope.py verify_26885_candidate.py',1)
+edit('verify_package',_regression_stage)
+def _prebuild_domain_regression(s):
+ return append(s,' python3 -S regressions/26885_actions_40604341240_historical_scope.py "$BASE" "$CAND" "$ROOT/build_26885_iris_rawr.sh"')
+edit('make_candidate',_prebuild_domain_regression)
+edit('compile_modified_runtime_shaders',_prebuild_domain_regression)
+def _final_domain_regression(s):
+ return append(s,' python3 -S regressions/26885_actions_40604341240_historical_scope.py "$BASE" "$exp" "$ROOT/build_26885_iris_rawr.sh"')
+edit('clean_extract_replay',_final_domain_regression)
+
+# Reject ALL remaining current-candidate invocations of the sealed 26880
+# validator; the regression checks these exact generated stage bodies again.
+for _stage in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
+ _start=body.index('\n'+_stage+'(){')
+ _end=body.index('\n}',_start)+2
+ _block=body[_start:_end]
+ _calls=[line for line in _block.splitlines() if re.search(r'\bpython3 -S verify_26880_rawr_shader_universe\.py\b',line)]
+ assert len(_calls)==1 and '"$BASE/app"' in _calls[0],('failed 40604341240 historical domain resurrected',_stage,_calls)
+ assert '"$CAND/app"' not in _calls[0] and '"$exp/app"' not in _calls[0],_stage
+
 STAGES=['verify_package','verify_scope','obtain_authority','make_candidate','verify_successful_mechanics','prepare_glslang','compile_modified_runtime_shaders','compile_spektra_raw_shader','install_frozen_candidate_live','compile_languages','verify_native_glslang_handoff','compile_native','verify_candidate_patches','prebuild_safety','assemble','postbuild_proof','clean_extract_replay']
 get=lambda s:[m.group(1) for m in re.finditer(r'\n([a-z_]+)\(\)\{',s)]
 assert get(original)==get(body) and [x for x in get(body) if x in STAGES]==STAGES

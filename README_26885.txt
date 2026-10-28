@@ -11,3 +11,5 @@ Scope: exactly eight runtime files versus successful compiled 26884 (seven modif
 Actual GLSL/SPIRV, Kotlin, Java, NDK, Gradle :app:assembleDebug, PRE-BUILD SAFETY PROOF, exactly one APK, final post-build and clean-extract proof: NOT RUN LOCALLY. GitHub Actions MUST provide authoritative proof. Do not call 26885 successful/build-proven until new successful Actions artifact and device IQ evidence exist. Upload only if local package proof reports PASS.
 
 NO backup branch, NO source commit or push by assistant, NO dev modification.
+
+REPAIR V2 (Actions 40604341240): rebind three 26880 sealed-wavelet source-domain checks to successful 26884 authority, add exact-failure regression at candidate, real compiler, and final clean extract; runtime 8-file source unchanged. TRIGGER_26885.txt V2 changed bytes to ensure one new commit/push runs the intended guarded job.

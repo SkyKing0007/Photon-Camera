@@ -25,15 +25,15 @@ actual={'app/'+p.relative_to(base/'app').as_posix() for p in (base/'app').rglob(
 assert actual==set(allow),('runtime payload mismatch',actual^set(allow))
 assert all(sha(base/k)==new[k] for k in allow)
 assert man('26885_PAYLOAD_SHA256.txt')=={'handoff_payload_26885/'+k:new[k] for k in allow}
-assert (R/'TRIGGER_26885.txt').read_bytes()==b'RUN_26885_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V1\n'
+assert (R/'TRIGGER_26885.txt').read_bytes()==b'RUN_26885_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V2_SCOPE_REPAIR\n'
 w=(R/'.github/workflows/build-26885-iris-rawr.yml').read_text()
 assert "      - 'TRIGGER_26885.txt'" in w and "      - 'TRIGGER_26884.txt'" not in w
 assert w.count('bash build_26885_iris_rawr.sh')==1 and 'bash build_26884_iris_rawr.sh' not in w
 assert 'sha256sum -c 26884_GENERATED_BUILD_SHA256.txt' in w
 assert 'sha256sum -c 26885_GENERATED_BUILD_SHA256.txt' in w
-assert "test -f TRIGGER_26885.txt && grep -Fx 'RUN_26885_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V1'" in w
+assert "test -f TRIGGER_26885.txt && grep -Fx 'RUN_26885_B_ON_WRONSKI_RGB_CHROMA_CONSISTENCY_V2_SCOPE_REPAIR'" in w
 assert (R/'generate_26885_build.py').is_file() and 'f8aff63b074ee6195d6b137858ad5a3f23cb149a40c9f72cb69b51f315b4679f' in (R/'generate_26885_build.py').read_text()
-for n in ('generate_26885_build.py','verify_26885_candidate.py','verify_26885_patches.py','verify_26885_semantics.py','verify_26885_expanded_glsl.py','regressions/26885_successor_contract.py','regressions/26885_chroma_controls.py','regressions/26885_wronski_chroma_evidence.py','regressions/26885_universal_pattern_controls.py','regressions/_26885_vector_math.py'):
+for n in ('generate_26885_build.py','verify_26885_candidate.py','verify_26885_patches.py','verify_26885_semantics.py','verify_26885_expanded_glsl.py','regressions/26885_successor_contract.py','regressions/26885_actions_40604341240_historical_scope.py','regressions/26885_chroma_controls.py','regressions/26885_wronski_chroma_evidence.py','regressions/26885_universal_pattern_controls.py','regressions/_26885_vector_math.py'):
  assert (R/n).is_file(),('missing guarded validator',n)
 package=man('26885_HANDOFF_HASHES.sha256')
 assert all((R/k).is_file() and sha(R/k)==h for k,h in package.items())
