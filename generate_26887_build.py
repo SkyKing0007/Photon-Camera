@@ -175,7 +175,49 @@ def candidate(s):
 edit('make_candidate',candidate)
 
 def shader(s):
- return append(s,''' python3 -S verify_26887_expanded_glsl.py "$CAND" --compiler "$IRIS26864_GLSLANG" --spirv-val "$(command -v spirv-val)" --spirv-opt "$(command -v spirv-opt)" --out "$OUT/26887_modified_shader_spirv"''')
+ # Actual 40804993462 Stage 7 regression: inherited CURRENT 26887 validator
+ # compiled 11 real SPIR-V variants, but its 26885-style grep looked for a
+ # success sentence that the 26887 validator never emits. Keep the pinned
+ # compiler command and its tee receipt, correcting ONLY the proof consumer.
+ # Match the actual inherited 26885/V6 guard as a complete line, refusing
+ # a changed callsite or a second guard rather than silently skipping either.
+ lines=s.splitlines(keepends=True)
+ failing=[i for i,line in enumerate(lines) if 'B ON real GLSL/SPIRV proof missing' in line]
+ assert len(failing)==1,('40804993462 wrong number of inherited B-ON receipt guards',failing)
+ i=failing[0]
+ assert "grep -F 'PASS 26887 PINNED REAL GLSLANG 16.5.0 and SPIRV-VAL pre/post optimized'" in lines[i],('changed inherited receipt command',lines[i])
+ assert '26887_new_chroma_pinned_shader.txt' in lines[i]
+ assert s.count('26887_new_chroma_spirv')==1 and s.count('26887_new_chroma_pinned_shader.txt')==2,('current compiler output anchors changed',s.count('26887_new_chroma_spirv'),s.count('26887_new_chroma_pinned_shader.txt'))
+ assert s.count('verify_26887_expanded_glsl.py "$CAND" --compiler')==1,('current real pinned 26887 compiler call count',s.count('verify_26887_expanded_glsl.py "$CAND" --compiler'))
+ # The old verifier already compiles all eleven 26887 real SPIR-V variants;
+ # DO NOT append a duplicate compiler invocation after its failing check.
+ line=lines[i].replace('PASS 26887 PINNED REAL GLSLANG 16.5.0 and SPIRV-VAL pre/post optimized',
+  'PASS pinned REAL glslang 16.5.0/spirv-val/spirv-opt 11 compiled 26887 shader variants')
+ assert line!=lines[i] and "|| fail '26887 B ON real GLSL/SPIRV proof missing'" in line
+ line=line.replace('26887 B ON real GLSL/SPIRV proof missing','26887 current shader real GLSL/SPIR-V proof missing')
+ lines[i]=line
+ s=''.join(lines)
+ s=s.replace('26887_new_chroma_spirv','26887_modified_shader_spirv')
+ s=s.replace('26887_new_chroma_pinned_shader.txt','26887_modified_shader_compile_receipt.txt')
+ # Validate the precise compiled SPIR-V receipt, not just echoed stdout.
+ proof=""" python3 -S - "$OUT/26887_modified_shader_spirv" <<'PY_26887_SHADER_RECEIPT'
+import hashlib,pathlib,sys
+p=pathlib.Path(sys.argv[1]); m=p/'26887_REAL_COMPILED_SHADER_SHA256.txt'
+assert m.is_file(),('26887 real compiler manifest missing',m)
+lines=m.read_text().splitlines()
+assert len(lines)==11,('26887 wrong number of compiled shader variants',len(lines))
+names=set()
+for line in lines:
+ h,sep,name=line.partition('  ')
+ assert sep=='  ' and len(h)==64 and all(c in '0123456789abcdef' for c in h)
+ assert name not in names and name.endswith('.spv') and '/' not in name and '..' not in name,(name,'duplicate or unsafe path')
+ names.add(name); b=(p/name).read_bytes()
+ assert len(b)>=84 and b[:4]==bytes.fromhex('03022307'),('26887 invalid SPIR-V',name)
+ assert hashlib.sha256(b).hexdigest()==h,('26887 compiled SPIR-V hash drift',name)
+assert len(list(p.glob('*.spv')))==11,('26887 additional/untracked SPIR-V')
+print('PASS 26887 B ON actual pinned compiler receipt: 11 unique SPIR-V variants and byte-matched SHA-256')
+PY_26887_SHADER_RECEIPT"""
+ return append(s,proof)
 edit('compile_modified_runtime_shaders',shader)
 
 def patch(s):
@@ -235,6 +277,11 @@ for cmd in ('./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJa
 assert 'GLSLANG_VERSION="16.5.0"' in body and 'PRE-BUILD SAFETY PROOF PASSED' in body
 for n in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
  assert 'verify_26887_expanded_glsl.py' in stage(body,n)
+assert stage(body,'compile_modified_runtime_shaders').count('verify_26887_expanded_glsl.py "$CAND" --compiler')==1
+assert 'PASS pinned REAL glslang 16.5.0/spirv-val/spirv-opt 11 compiled 26887 shader variants' in stage(body,'compile_modified_runtime_shaders')
+assert '26887_REAL_COMPILED_SHADER_SHA256.txt' in stage(body,'compile_modified_runtime_shaders')
+assert 'PY_26887_SHADER_RECEIPT' in stage(body,'compile_modified_runtime_shaders')
+assert '26887_modified_shader_spirv' not in stage(body,'compile_modified_runtime_shaders')
 assert 'verify_26887_patches.py "$BASE" "$CAND" 26887_FORWARD_FULL_INDEX.patch 26887_ROLLBACK_FULL_INDEX.patch' in body
 assert 'verify_26887_patches.py "$BASE" "$exp" 26887_FORWARD_FULL_INDEX.patch 26887_ROLLBACK_FULL_INDEX.patch' in body
 assert 'RUNTIME_TAR_SHA="e2a03925cafa2196884fff02d9320f6ac4020823130b896de7166eb77ded144b"' in body

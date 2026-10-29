@@ -43,6 +43,19 @@ if sys.argv[1:]==['--generated']:
  for x in ('./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace',"./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDebug[armeabi-v7a]' --stacktrace",'./gradlew :app:assembleDebug --stacktrace'):
   assert x in base and x in s
  assert 'GLSLANG_VERSION="16.5.0"' in s
+ # Permanent 40804993462 failure: actual compiler successfully produced 11
+ # 26887 SPIR-V variants, then the stale B-ON proof grep rejected them.
+ block=s[s.index('\ncompile_modified_runtime_shaders(){')+1:s.index('\n}',s.index('\ncompile_modified_runtime_shaders(){')+1)+2]
+ assert block.count('verify_26887_expanded_glsl.py "$CAND" --compiler')==1,('duplicate or missing current 26887 compiler',block)
+ assert block.count('26887_modified_shader_spirv')==2,('current shader output path mismatch',block)
+ assert block.count('26887_modified_shader_compile_receipt.txt')==2,('current shader tee/grep receipt mismatch',block)
+ assert 'PASS pinned REAL glslang 16.5.0/spirv-val/spirv-opt 11 compiled 26887 shader variants' in block
+ assert '26887_REAL_COMPILED_SHADER_SHA256.txt' in block and 'PY_26887_SHADER_RECEIPT' in block
+ assert '26887_new_chroma_spirv' not in block and '26887_new_chroma_pinned_shader.txt' not in block
+ assert '26887 B ON real GLSL/SPIRV proof missing' not in block
+ assert block.index('verify_26887_expanded_glsl.py "$CAND" --compiler') < block.index('26887 current shader real GLSL/SPIR-V proof missing') < block.index('26887_REAL_COMPILED_SHADER_SHA256.txt')
+ assert 'regressions/26886_historical_scope_all_stages.py' in block
+ assert 'verify_26885_expanded_glsl.py "$WORK/historical_26885_from_26886"' in block
  for stage in ('make_candidate','compile_modified_runtime_shaders','clean_extract_replay'):
   block=s[s.index('\n'+stage+'(){')+1:s.index('\n}',s.index('\n'+stage+'(){')+1)+2]
   assert 'verify_26887_expanded_glsl.py' in block,(stage,'shader guard absent')
