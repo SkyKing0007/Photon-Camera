@@ -1,0 +1,151 @@
+#version 450
+// Port of hdr-plus-swift calculate_abs_diff_rgba + calculate_mismatch_rgba
+// raised-cosine-weighted mean |ref - aligned| over twice
+// the tile support, relative to the tile's shot noise (Liba 2019 "spatially
+// varying temporal merging"). One 16x16 workgroup per tile, one lane per
+// window pixel, tree reduction (upstream sums sequentially in one thread).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, rgba32f) readonly uniform image2D refRgba;
+layout(set = 0, binding = 1, rgba32f) readonly uniform image2D alignedRgba;
+layout(set = 0, binding = 2, rgba32f) readonly uniform image2D rms;
+layout(set = 0, binding = 3, r32f) writeonly uniform image2D mismatch;
+// Uniform B only: tile confidence stored in existing bracket-only weightSum
+// image at the tile coordinate; B bracketed never writes this binding.
+layout(set = 0, binding = 4, r32f) writeonly uniform image2D independentSupport;
+layout(push_constant) uniform P {
+    ivec2 tiles;
+    ivec2 rgbaSize;
+    float exposureFactor;  // companion exposure / reference exposure (1 = uniform)
+    float unused0;
+    float unused1;
+    float unused2;
+    vec4 slopeRaw;
+    vec4 offsetRaw;
+    vec4 referenceBlack;
+    int measuredNoise;
+    int uniformExposure;
+    float referenceWhite;
+    float gainForMask;
+} p;
+
+const float PI = 3.14159265358979323846;
+shared vec4 sDiff[256];
+shared float sWeight[256];
+shared float sSupport[64];
+// Tile-local 10x10 halo staging: 200 global image reads per tile instead of
+// 1152 overlapping reads. The shared cache is populated by the 16x16 group.
+shared vec4 sReferenceHalo[100];
+shared vec4 sAlignedHalo[100];
+
+// Wronski 2019, Section 5.2, noise-corrected mean-color difference.
+// This is a B-private support decision, not a Fourier/Wiener noise weight.
+float pointSupport(ivec2 pix, ivec2 t0) {
+    vec4 sumRef = vec4(0.0), sumAl = vec4(0.0), sumRefSq = vec4(0.0);
+    bool clipped = false;
+    for (int yy = -1; yy <= 1; ++yy) {
+        for (int xx = -1; xx <= 1; ++xx) {
+            ivec2 q = clamp(pix + ivec2(xx, yy), ivec2(0), p.rgbaSize - 1);
+            ivec2 localHalo = pix - t0 + ivec2(xx + 1, yy + 1);
+            int h = localHalo.y * 10 + localHalo.x;
+            vec4 r = sReferenceHalo[h];
+            vec4 a = sAlignedHalo[h];
+            sumRef += r;
+            sumAl += a;
+            sumRefSq += r * r;
+            clipped = clipped || any(greaterThan(r, vec4(p.referenceWhite * 0.985))) ||
+                                 any(greaterThan(a, vec4(p.referenceWhite * 0.985)));
+        }
+    }
+    if (clipped) return 1.0; // Preserve established clipped behavior.
+    vec4 refMean = sumRef / 9.0;
+    vec4 alMean = sumAl / 9.0;
+    // Bounded companion exposure gain from the exact captured frame metadata.
+    // It does not replace separate scene-flicker detection, which remains
+    // outside the confident-rejection domain.
+    vec4 alCorrected = p.referenceBlack +
+        (alMean - p.referenceBlack) / clamp(p.gainForMask, 0.94, 1.06);
+    vec4 structuralVar = max(sumRefSq / 9.0 - refMean * refMean, vec4(0.0));
+    vec4 sensorVar = max(p.slopeRaw * max(refMean-p.referenceBlack, vec4(0.0)) + p.offsetRaw,
+                         vec4(1.0e-5));
+    vec4 sigma = max(sqrt(structuralVar), sqrt(sensorVar));
+    vec4 modeledDiff = sqrt(2.0 * sensorVar) / 3.0;
+    vec4 meanDiff = abs(refMean - alCorrected);
+    vec4 corrected = meanDiff * meanDiff * meanDiff /
+                    (meanDiff * meanDiff + modeledDiff * modeledDiff + vec4(1.0e-6));
+    vec4 z = corrected / max(sigma,vec4(1.0e-5));
+    vec4 c = clamp(vec4(3.5) * exp(-(z * z)) - vec4(1.0), vec4(0.0), vec4(1.0));
+    // Robust median of CFA sites; a single aliasing channel must not classify
+    // a stationary real high-frequency structure as moving foreground.
+    float hi = max(max(c.x,c.y),max(c.z,c.w));
+    float lo = min(min(c.x,c.y),min(c.z,c.w));
+    return clamp((c.x+c.y+c.z+c.w-hi-lo)*0.5,0.0,1.0);
+}
+
+void main() {
+    ivec2 g = ivec2(gl_WorkGroupID.xy);
+    if (any(greaterThanEqual(g, p.tiles))) return;
+    const int ts = 8;
+    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+    uint lane = gl_LocalInvocationIndex;
+    ivec2 t0 = g * ts;
+    // Upstream clamps the end to size-1 (exclusive), dropping the last row/column.
+    ivec2 start = max(ivec2(0), t0 - ts / 2);
+    ivec2 end = min(p.rgbaSize - 1, t0 + ts * 3 / 2);
+    ivec2 q = t0 - ts / 2 + l;  // window pixel; l is its offset (dx + shift)
+    float angle = -2.0 * PI / float(ts);
+    vec4 d = vec4(0.0);
+    float w = 0.0;
+    if (all(greaterThanEqual(q, start)) && all(lessThan(q, end))) {
+        w = (0.5 - 0.17 * cos(-angle * (float(l.x) + 0.5))) * (0.5 - 0.17 * cos(-angle * (float(l.y) + 0.5)));
+        d = w * abs(imageLoad(refRgba, q) - imageLoad(alignedRgba, q));
+    }
+    sDiff[lane] = d;
+    sWeight[lane] = w;
+    barrier();
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lane < stride) {
+            sDiff[lane] += sDiff[lane + stride];
+            sWeight[lane] += sWeight[lane + stride];
+        }
+        barrier();
+    }
+    // Every invocation participates in the shared-memory barrier, including
+    // lanes not used by the 8x8 support values.
+    if (p.uniformExposure != 0 && p.measuredNoise != 0 && lane < 100u) {
+        ivec2 h = ivec2(int(lane % 10u), int(lane / 10u));
+        ivec2 q = clamp(t0 + h - ivec2(1), ivec2(0), p.rgbaSize - 1);
+        sReferenceHalo[lane] = imageLoad(refRgba, q);
+        sAlignedHalo[lane] = imageLoad(alignedRgba, q);
+    }
+    barrier();
+    if (p.uniformExposure != 0 && p.measuredNoise != 0 && lane < 64u) {
+        ivec2 local = ivec2(int(lane % 8u), int(lane / 8u));
+        sSupport[lane] = pointSupport(t0 + local, t0);
+    } else if (lane < 64u) {
+        sSupport[lane] = 1.0; // No empirical support: no false motion.
+    }
+    barrier();
+    if (lane != 0u) return;
+    if (p.uniformExposure != 0) {
+        // 25th percentile of 8x8 local confidence, insensitive to an isolated
+        // bad pixel but protective when a moving edge occupies part of a tile.
+        // Four overlapping 8x8 Fourier passes soften tile transitions.
+        float worst16[16];
+        for (int k=0;k<16;++k) worst16[k]=2.0;
+        for (int k=0;k<64;++k) {
+            float v=sSupport[k];
+            for (int j=0;j<16;++j) {
+                if (v<worst16[j]) {
+                    float tmp=worst16[j];
+                    worst16[j]=v;
+                    v=tmp;
+                }
+            }
+        }
+        imageStore(independentSupport,g,vec4(clamp(worst16[15],0.0,1.0)));
+    }
+    vec4 noise = imageLoad(rms, g);
+    vec4 diff = sDiff[0] / sWeight[0];
+    vec4 m4 = diff / sqrt(0.5 * noise + 0.5 * noise / p.exposureFactor + 1.0);
+    imageStore(mismatch, g, vec4(0.25 * (m4.x + m4.y + m4.z + m4.w)));
+}

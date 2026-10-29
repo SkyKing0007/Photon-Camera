@@ -1,0 +1,2286 @@
+diff --git b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+index e76fe123b9fbc68df5bf0015e4f1497d692ac39c..cd2eef1925d94d66760a35ef4907845bad74a4a8 100644
+--- b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
++++ a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+@@ -32,15 +32,6 @@ set(GLSLC "${Python3_EXECUTABLE};${CMAKE_CURRENT_SOURCE_DIR}/iris26864/compile_l
+ # download, writes to app/src/vendor, or alteration to Wronski kernels.
+ set(IRIS26887_VENDOR_SHADOW "${CMAKE_CURRENT_BINARY_DIR}/iris26887_b_only_vendor/native")
+ file(COPY "${IRIS26864_VENDOR_ROOT}/" DESTINATION "${IRIS26887_VENDOR_SHADOW}")
+-# IRIS_26888_B_OFF_HDRQ_LIBA_WRONSKI_MOTION_SUPPORT: build-shadow only.
+-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffHdrqMismatch.comp"
+-    "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_mismatch.comp" COPYONLY)
+-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp"
+-    "${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline/src/AndroidBurstCoordinator.cpp" COPYONLY)
+-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp"
+-    "${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline/src/VulkanExecutor.cpp" COPYONLY)
+-configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp"
+-    "${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline/include/rawr/raw_gpu_pipeline/HdrPlusRecorder.h" COPYONLY)
+ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqMerge.comp"
+     "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_merge.comp" COPYONLY)
+ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp"
+diff --git b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+index 42e0213bd68c656cace907cd4079d50b81ee76e7..a9e343a8a5ddcfa44ccdbbf65be832b77208f382 100644
+--- b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
++++ a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+@@ -28,9 +28,6 @@ layout(std430, set = 0, binding = 5) readonly buffer ShiftTable { vec2 v[]; } sh
+ layout(set = 0, binding = 6, r32f) readonly uniform image2D highlights;
+ // Per-bin weight sum (bracketed only), one texel per bin at (t*8 + (dm, dn)).
+ layout(set = 0, binding = 7, r32f) uniform image2D weightSum;
+-// Reuse the exact per-companion, pass-0 alignment vectors already consumed
+-// by the fused raw warp. No synthetic confidence or stale frame ownership.
+-layout(std430, set = 0, binding = 8) readonly buffer Align { ivec2 v[]; } align;
+ layout(push_constant) uniform P {
+     ivec2 tiles;
+     float robustnessNorm;
+@@ -38,13 +35,6 @@ layout(push_constant) uniform P {
+     float maxMotionNorm;
+     int uniformExposure;
+     float frameWeight;
+-    ivec2 alignTiles;
+-    int alignHalfTile;
+-    int cropX;
+-    int cropY;
+-    int offsetX;
+-    int offsetY;
+-    int supportMeasured; // Actual RAW-burst-noise-fit validity, NOT image mean.
+ } p;
+ 
+ shared vec4 sRefRe[64], sRefIm[64], sAlRe[64], sAlIm[64];  // index dn*8 + dm
+@@ -92,41 +82,12 @@ void main() {
+     }
+     barrier();
+     float mm = imageLoad(mismatch, t).x;
+-    // Wronski 2019 Sec. 5.2.3: a neighborhood of highly varying alignment
+-    // vectors indicates moving/occluded geometry or unreliable registration.
+-    // B-only uniform burst: the alignment prior controls REF SUBSTITUTION;
+-    // the separately noise-corrected mismatch controls DENOISING STRENGTH.
+-    float alignmentPrior = 0.0;
+-    if (p.uniformExposure != 0 && all(greaterThan(p.alignTiles, ivec2(0)))) {
+-        vec2 center = 2.0 * vec2(t * 8 + ivec2(4)) +
+-                      vec2(p.cropX + p.offsetX, p.cropY + p.offsetY);
+-        vec2 grid = (center + 0.5) / float(max(1, p.alignHalfTile)) - 1.0;
+-        ivec2 k = clamp(ivec2(floor(grid + 0.5)), ivec2(0), p.alignTiles - 1);
+-        ivec2 lo = ivec2(2147483647), hi = ivec2(-2147483647);
+-        for (int dy = -1; dy <= 1; ++dy)
+-            for (int dx = -1; dx <= 1; ++dx) {
+-                ivec2 b = clamp(k + ivec2(dx, dy), ivec2(0), p.alignTiles - 1);
+-                ivec2 v = align.v[b.y * p.alignTiles.x + b.x];
+-                lo = min(lo, v);
+-                hi = max(hi, v);
+-            }
+-        float spanRawPixels = 2.0 * length(vec2(hi - lo));
+-        alignmentPrior = smoothstep(2.0, 7.0, spanRawPixels);
+-    }
+     // IRIS_26887_B_OFF_MOTION_LOCAL: original RAWR vendor is unchanged.
+     // This modified shader is only compiled into Iris's B-only mirrored build.
+     // Uniform exposures: retain the configured 13 strength in static tiles,
+     // transition to strength-8-equivalent for noise-inconsistent tiles.
+     // Bracketed-exposure path remains byte/mathematically unchanged below.
+-    float independentSupport = p.uniformExposure != 0 && p.supportMeasured != 0
+-        ? clamp(imageLoad(weightSum, t).x, 0.0, 1.0) : 1.0;
+-    // The motion signal comes from noise-calibrated RAW temporal support,
+-    // rather than reducing denoising merely because Fourier tile mismatch
+-    // is high. Preserve prior behavior if burst fit has no valid samples.
+-    float localMotion = p.uniformExposure == 0 ? 0.0 :
+-        (p.supportMeasured != 0
+-            ? smoothstep(0.20, 0.85, 1.0 - independentSupport)
+-            : smoothstep(0.10, 0.38, mm));
++    float localMotion = p.uniformExposure != 0 ? smoothstep(0.10, 0.38, mm) : 0.0;
+     const float strength8Robustness = 0.29730178;
+     const float strength8ReadNoise = 2.29739671;
+     const float strength8MaxMotion = 1.58270825;
+@@ -147,7 +108,7 @@ void main() {
+     vec4 alIm = s * sAlRe[lane] + c * sAlIm[lane];
+     float magnitudeNorm = 1.0;
+     // Magnitude norm only for uniform exposure (brighter frames have larger magnitudes).
+-    if (dm + dn > 0 && p.uniformExposure != 0) {
++    if (dm + dn > 0 && mm < 0.3 && p.uniformExposure != 0) {
+         vec4 refMag = sqrt(refRe * refRe + refIm * refIm);
+         vec4 alMag = sqrt(alRe * alRe + alIm * alIm);
+         float refEnergy = refMag.x + refMag.y + refMag.z + refMag.w;
+@@ -156,7 +117,7 @@ void main() {
+         // NaN to Wiener weights; retain the neutral magnitude prior instead.
+         if (refEnergy > 1.0e-12) {
+             float ratio = (alMag.x + alMag.y + alMag.z + alMag.w) / refEnergy;
+-            magnitudeNorm = max(1.0e-4, mismatchWeight * clamp(ratio * ratio * ratio * ratio, 0.5, 3.0));
++            magnitudeNorm = mismatchWeight * clamp(ratio * ratio * ratio * ratio, 0.5, 3.0);
+         }
+     }
+     vec4 w4 = (refRe - alRe) * (refRe - alRe) + (refIm - alIm) * (refIm - alIm);
+@@ -167,16 +128,7 @@ void main() {
+     if (p.uniformExposure != 0) {
+         // Do not omit a rejected companion from the fixed-count uniform
+         // denominator: substitute reference frequencies to preserve energy.
+-        // Moving regions must reject displaced companions AT LEAST as early
+-        // as their adaptive HDRQ denoising strength is reduced. The smooth
+-        // alignment prior is independently observed, not a strength slider.
+-        // Independent temporal contribution veto, not a Wiener noise weight.
+-        // Unmeasured burst noise retains the successful 26887 fallback.
+-        float reject = p.supportMeasured != 0
+-            ? max(1.0 - independentSupport,
+-                  alignmentPrior * smoothstep(0.08, 0.28, mm))
+-            : max(localMotion, smoothstep(0.18, 0.60, mm));
+-        reject = max(reject, alignmentPrior * smoothstep(0.08, 0.28, mm));
++        float reject = smoothstep(0.24, 0.60, mm);
+         weight = mix(weight, 1.0, reject);
+         imageStore(outFt, o, imageLoad(outFt, o) + (1.0 - weight) * alRe + weight * refRe);
+         imageStore(outFt, o + ivec2(1, 0), imageLoad(outFt, o + ivec2(1, 0)) + (1.0 - weight) * alIm + weight * refIm);
+diff --git b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
+index 664c013ce6ea457d6238fec2e846a63d238927a2..e1d11ffd5c8c05d063b47be549f5d941a41a459c 100644
+--- b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
++++ a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
+@@ -16,10 +16,10 @@ void main() {
+     ivec2 g = ivec2(gl_GlobalInvocationID.xy);
+     if (any(greaterThanEqual(g, p.tiles))) return;
+     // Preserve upstream exact for exposure-bracketed runs; B uniform burst
+-    // uses the physical noise-calibrated local mismatch exactly, independent
+-    // of whether motion elsewhere changes the frame-wide mean.
++    // never lets moving subjects elsewhere suppress the local RAW mismatch
++    // below 75% of its original noise-normalized magnitude.
+     float upstreamScale = 0.12 / (mean.v[0] + 1e-12);
+-    float scale = p.uniformExposure != 0 ? 1.0 : upstreamScale;
++    float scale = p.uniformExposure != 0 ? max(upstreamScale, 0.75) : upstreamScale;
+     float m = clamp(imageLoad(mismatch, g).x * scale, 0.0, 1.0);
+     imageStore(mismatch, g, vec4(m));
+     imageStore(total, g, vec4(imageLoad(total, g).x + m * p.invFrames));
+diff --git b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+index e4f7ce0c5c6c0320f0f30541ab5e2bcc330187be..21f9ff3fe736f184e68fe35f43f218dd8529aeb0 100644
+--- b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
++++ a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -354,12 +354,7 @@ VkDeviceSize alignUp256(VkDeviceSize v) { return (v + 255u) / 256u * 256u; }
+ struct MismatchPc {
+     std::int32_t tilesX, tilesY, rgbaWidth, rgbaHeight;
+     float exposureFactor;
+-    float pad0, pad1, pad2;  // 16-byte alignment for GLSL vec4 fields
+-    float slopeRaw[4], offsetRaw[4], referenceBlack[4];
+-    std::int32_t measuredNoise, uniformExposure;
+-    float referenceWhite, gainForMask;
+ };
+-static_assert(sizeof(MismatchPc) == 96u, "26888 B-only mismatch GLSL push ABI");
+ struct HighlightsPc {
+     std::int32_t tilesX, tilesY;
+     float exposureFactor, whiteLevel, blackLevelMean;
+@@ -378,11 +373,7 @@ struct FreqMergePc {
+     float robustnessNorm, readNoise, maxMotionNorm;
+     std::int32_t uniformExposure;
+     float frameWeight;
+-    std::int32_t alignTilesX, alignTilesY, alignHalfTile;
+-    std::int32_t cropX, cropY, offsetX, offsetY;
+-    std::int32_t supportMeasured;
+ };
+-static_assert(sizeof(FreqMergePc) == 60u, "26888 B-only merge GLSL push ABI");
+ struct BackwardPc {
+     std::int32_t tilesX, tilesY;
+     float frames;
+@@ -537,8 +528,6 @@ void HdrPlusFrequencyRecorder::recordCompanionAlignFinest(VkCommandBuffer c, std
+ }
+ 
+ void HdrPlusFrequencyRecorder::recordReference(VkCommandBuffer c, VkImageView rawU16, const RawNormalization& frame) {
+-    referenceBlack_ = frame.blackByPhase;
+-    referenceWhite_ = frame.whiteLevel;
+     substitutionReady_ = false;
+     pyramidClamp_ = 0.0f;
+     if (pass_ == 0u) {
+@@ -616,24 +605,10 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
+                      &wp, sizeof(wp), divUp(geometry_.rgbaWidth, 16), divUp(geometry_.rgbaHeight, 16));
+     computeWriteBarrier(c);
+     if (mark) mark(1u);
+-    MismatchPc mp{};
+-    mp.tilesX = std::int32_t(tx); mp.tilesY = std::int32_t(ty);
+-    mp.rgbaWidth = std::int32_t(geometry_.rgbaWidth);
+-    mp.rgbaHeight = std::int32_t(geometry_.rgbaHeight);
+-    mp.exposureFactor = exposureFactor;
+-    mp.uniformExposure = uniformExposure_ ? 1 : 0;
+-    mp.measuredNoise = rawNoiseMeasured_ ? 1 : 0;
+-    mp.referenceWhite = referenceWhite_;
+-    mp.gainForMask = frameGain(slot);
+-    for (std::size_t s = 0; s < 4u; ++s) {
+-        const float span = std::max(1.0f, referenceWhite_ - referenceBlack_[s]);
+-        mp.slopeRaw[s] = rawNoiseSlope_[s] * span;
+-        mp.offsetRaw[s] = rawNoiseOffset_[s] * span * span;
+-        mp.referenceBlack[s] = referenceBlack_[s];
+-    }
++    MismatchPc mp{std::int32_t(tx), std::int32_t(ty), std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight),
++                  exposureFactor};
+     executor_.record(c, ShaderId::HdrqMismatch,
+-                     {{ib(0, refRgba), ib(1, alignedRgba), ib(2, arena_.image("hdrq_rms")), ib(3, mismatch),
+-                       ib(4, arena_.image("hdrq_weight_sum"))}, {}}, &mp,
++                     {{ib(0, refRgba), ib(1, alignedRgba), ib(2, arena_.image("hdrq_rms")), ib(3, mismatch)}, {}}, &mp,
+                      sizeof(mp), tx, ty);
+     if (mark) {
+         computeWriteBarrier(c);
+@@ -669,20 +644,12 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
+     const auto norms = uniformExposure_ ? hp::frequencyNorms(config_.strength)
+                                         : hp::bracketedFrequencyNorms(config_.strength, exposureFactor);
+     FreqMergePc fm{std::int32_t(tx), std::int32_t(ty), norms.robustnessNorm, norms.readNoise, norms.maxMotionNorm,
+-                   uniformExposure_ ? 1 : 0, exposureFactor,
+-                   std::int32_t(level0.tilesX), std::int32_t(level0.tilesY), std::int32_t(level0.tileSize),
+-                   std::int32_t(geometry_.cropX), std::int32_t(geometry_.cropY), offset[0], offset[1],
+-                   rawNoiseMeasured_ ? 1 : 0};
++                   uniformExposure_ ? 1 : 0, exposureFactor};
+     executor_.record(c, ShaderId::HdrqMerge,
+                      {{ib(0, arena_.image("hdrq_ref_ft")), ib(1, arena_.image("hdrq_aligned_ft")),
+                        ib(2, arena_.image("hdrq_final_ft")), ib(3, arena_.image("hdrq_rms")), ib(4, mismatch),
+                        ib(6, highlights), ib(7, arena_.image("hdrq_weight_sum"))},
+-                      {bb(5, arena_.buffer("hdrq_shift_table")),
+-                       config_.frequencyAlignOnce
+-                          ? BufferBinding{8u, arena_.buffer("hdrq_align_store").buffer,
+-                                          slot * alignSlotBytes(),
+-                                          VkDeviceSize(level0.tilesX) * level0.tilesY * 8u}
+-                          : bb(8, arena_.buffer("hdrp_align_a"))}},
++                      {bb(5, arena_.buffer("hdrq_shift_table"))}},
+                      &fm, sizeof(fm), tx, ty);
+     computeWriteBarrier(c);
+ }
+diff --git b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+deleted file mode 100644
+index c86d24abf11398bdd2a6fef3f93dce228ded53ad..0000000000000000000000000000000000000000
+--- b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
++++ /dev/null
+@@ -1,966 +0,0 @@
+-#include <rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h>
+-#include <rawr/raw_gpu_pipeline/BurstNoiseEstimate.h>
+-#include <rawr/raw_gpu_pipeline/HdrPlusRecorder.h>
+-#include <rawr/raw_gpu_pipeline/MergeMath.h>
+-
+-#include <algorithm>
+-#include <array>
+-#include <chrono>
+-#include <cmath>
+-#include <cstdio>
+-#include <cstdlib>
+-#include <cstring>
+-#include <stdexcept>
+-#include <string>
+-#include <utility>
+-namespace rawr::raw_gpu_pipeline {
+-namespace {
+-constexpr std::uint32_t kTimestampQueryCapacity = 64u;
+-void check(VkResult r, const char* what) {
+-    if (r != VK_SUCCESS) throw std::runtime_error(what);
+-}
+-struct NoiseEstimatePc {
+-    float referenceBlack[4];
+-    float neighbourBlack[4];
+-    float referenceWhite, neighbourWhite;
+-    std::int32_t width, height, blocksX;
+-};
+-// Uniform HDR+ merges: gain that scales frame i to the reference exposure
+-// (AE may still be settling across the ZSL ring). Upstream compensates any
+-// exposure-time x ISO difference; unequal frames merged as equal leave a
+-// half-tile grid in the frequency merge. 1 when unknown or within 0.1%.
+-float exposureGain(const std::vector<BurstFrame>& frames, std::uint32_t ref, std::uint32_t i) {
+-    const float r = frames[ref].exposure, e = frames[i].exposure;
+-    if (!(r > 0.0f) || !(e > 0.0f)) return 1.0f;
+-    const float gain = r / e;
+-    return std::fabs(gain - 1.0f) > 1.0e-3f ? gain : 1.0f;
+-}
+-}  // namespace
+-void AndroidBurstCoordinator::ensureHostBuffer(HostBuffer& hb, VkDeviceSize bytes) {
+-    if (hb.buffer && hb.bytes >= bytes) return;
+-    destroyHostBuffer(hb);
+-    VkBufferCreateInfo bi{};
+-    bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+-    bi.size = bytes;
+-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+-    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+-    check(vkCreateBuffer(device_, &bi, nullptr, &hb.buffer), "multiframe host buffer");
+-    VkMemoryRequirements mr{};
+-    vkGetBufferMemoryRequirements(device_, hb.buffer, &mr);
+-    VkPhysicalDeviceMemoryProperties props{};
+-    vkGetPhysicalDeviceMemoryProperties(physical_, &props);
+-    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+-    std::uint32_t type = UINT32_MAX;
+-    for (std::uint32_t i = 0; i < props.memoryTypeCount; ++i)
+-        if ((mr.memoryTypeBits & (1u << i)) && (props.memoryTypes[i].propertyFlags & want) == want) {
+-            type = i;
+-            break;
+-        }
+-    if (type == UINT32_MAX) {
+-        destroyHostBuffer(hb);
+-        throw std::runtime_error("multiframe host buffer: no host-visible memory");
+-    }
+-    VkMemoryAllocateInfo ai{};
+-    ai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+-    ai.allocationSize = mr.size;
+-    ai.memoryTypeIndex = type;
+-    check(vkAllocateMemory(device_, &ai, nullptr, &hb.memory), "multiframe host buffer memory");
+-    check(vkBindBufferMemory(device_, hb.buffer, hb.memory, 0), "multiframe host buffer bind");
+-    check(vkMapMemory(device_, hb.memory, 0, VK_WHOLE_SIZE, 0, &hb.mapped), "multiframe host buffer map");
+-    hb.bytes = bytes;
+-}
+-void AndroidBurstCoordinator::destroyHostBuffer(HostBuffer& hb) noexcept {
+-    if (!device_) return;
+-    if (hb.mapped) vkUnmapMemory(device_, hb.memory);
+-    if (hb.buffer) vkDestroyBuffer(device_, hb.buffer, nullptr);
+-    if (hb.memory) vkFreeMemory(device_, hb.memory, nullptr);
+-    hb = {};
+-}
+-void AndroidBurstCoordinator::destroyHostBuffers() noexcept {
+-    destroyHostBuffer(noiseStats_);
+-    destroyHostBuffer(hotPixels_);
+-}
+-void AndroidBurstCoordinator::warmPipelines(VkPhysicalDevice physical, VkDevice device, std::uint32_t qf) {
+-    if (!physical || !device) throw std::invalid_argument("multiframe burst: invalid warmup handles");
+-    std::lock_guard<std::mutex> lock(initMutex_);
+-    if (!(executionReady_ && device_ == device && queueFamily_ == qf)) {
+-        // New (or no) device: everything device-bound, including any arena, is stale.
+-        resetLocked();
+-    }
+-    ensureExecutionInfra(physical, device, qf);
+-}
+-
+-void AndroidBurstCoordinator::warmAll(VkPhysicalDevice physical, VkDevice device, std::uint32_t qf, std::uint32_t w,
+-                                      std::uint32_t h) {
+-    if (!physical || !device || !w || !h) throw std::invalid_argument("multiframe burst: invalid warmup handles");
+-    std::lock_guard<std::mutex> lock(initMutex_);
+-    if (!(executionReady_ && device_ == device && queueFamily_ == qf)) {
+-        resetLocked();
+-    }
+-    ensureExecutionInfra(physical, device, qf);
+-    algorithm_ = lastAlgorithm_;
+-    hdrplus_ = lastHdrPlus_;
+-    const float scale = algorithm_ != MergeAlgorithm::Wronski ? 1.0f : lastScale_;
+-    if (arenaReady_ && width_ == w && height_ == h && std::abs(outputScale_ - scale) <= 1.0e-6f &&
+-        arenaMatchesSelection())
+-        return;
+-    width_ = w;
+-    height_ = h;
+-    outputScale_ = scale;
+-    initializeArenaLocked(physical, device);
+-    arenaReady_ = true;
+-    layoutsInitialized_ = false;
+-}
+-
+-void AndroidBurstCoordinator::resetInfraLocked() noexcept {
+-    destroyHostBuffers();
+-    executor_.reset();
+-    if (device_ && timestampPool_) vkDestroyQueryPool(device_, timestampPool_, nullptr);
+-    if (device_ && fence_) vkDestroyFence(device_, fence_, nullptr);
+-    if (device_ && commandPool_) vkDestroyCommandPool(device_, commandPool_, nullptr);
+-    commandPool_ = VK_NULL_HANDLE;
+-    command_ = VK_NULL_HANDLE;
+-    fence_ = VK_NULL_HANDLE;
+-    initialWait_ = VK_NULL_HANDLE;
+-    executionReady_ = false;
+-    timestampPool_ = VK_NULL_HANDLE;
+-    timestampPeriodNs_ = 0.0f;
+-    timestampsSupported_ = false;
+-    physical_ = VK_NULL_HANDLE;
+-    device_ = VK_NULL_HANDLE;
+-    queueFamily_ = 0;
+-}
+-
+-void AndroidBurstCoordinator::ensureExecutionInfra(VkPhysicalDevice physical, VkDevice device, std::uint32_t qf) {
+-    if (executionReady_ && device_ == device && queueFamily_ == qf) return;
+-    resetInfraLocked();
+-    physical_ = physical;
+-    device_ = device;
+-    queueFamily_ = qf;
+-    executor_.initialize(device, false);
+-    VkCommandPoolCreateInfo pi{};
+-    pi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+-    pi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+-    pi.queueFamilyIndex = qf;
+-    check(vkCreateCommandPool(device, &pi, nullptr, &commandPool_), "multiframe command pool");
+-    VkCommandBufferAllocateInfo ai{};
+-    ai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+-    ai.commandPool = commandPool_;
+-    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+-    ai.commandBufferCount = 1;
+-    check(vkAllocateCommandBuffers(device, &ai, &command_), "multiframe command buffer");
+-    VkFenceCreateInfo fi{};
+-    fi.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+-    fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+-    check(vkCreateFence(device, &fi, nullptr, &fence_), "multiframe fence");
+-    VkPhysicalDeviceProperties properties{};
+-    vkGetPhysicalDeviceProperties(physical, &properties);
+-    std::uint32_t familyCount = 0;
+-    vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, nullptr);
+-    std::vector<VkQueueFamilyProperties> families(familyCount);
+-    vkGetPhysicalDeviceQueueFamilyProperties(physical, &familyCount, families.data());
+-    timestampsSupported_ = qf < familyCount && families[qf].timestampValidBits != 0u;
+-    timestampPeriodNs_ = properties.limits.timestampPeriod;
+-    if (timestampsSupported_) {
+-        VkQueryPoolCreateInfo qi{};
+-        qi.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+-        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+-        qi.queryCount = kTimestampQueryCapacity;
+-        check(vkCreateQueryPool(device, &qi, nullptr, &timestampPool_), "multiframe timestamp query pool");
+-    }
+-    executionReady_ = true;
+-}
+-
+-bool AndroidBurstCoordinator::arenaMatchesSelection() const noexcept {
+-    // Frequency and bracketed merges share one layout.
+-    if (arenaAlgorithm_ != algorithm_ && !(usesFrequencyMerge(arenaAlgorithm_) && usesFrequencyMerge(algorithm_)))
+-        return false;
+-    return algorithm_ == MergeAlgorithm::Wronski || (arenaHdrPlus_.tileSize == hdrplus_.tileSize &&
+-                                                     arenaHdrPlus_.searchDistance == hdrplus_.searchDistance);
+-}
+-void AndroidBurstCoordinator::initializeArenaLocked(VkPhysicalDevice physical, VkDevice device) {
+-    if (algorithm_ == MergeAlgorithm::HdrPlusSpatial) {
+-        arena_.initialize(physical, device,
+-                          makeHdrPlusScratchLayout(rawr::raw_merge_hdrplus_gpu::makeGeometry(width_, height_, hdrplus_)));
+-        arenaHdrPlus_ = hdrplus_;
+-    } else if (usesFrequencyMerge(algorithm_)) {
+-        arena_.initialize(physical, device,
+-                          makeHdrPlusFrequencyScratchLayout(
+-                              rawr::raw_merge_hdrplus_gpu::makeFrequencyGeometry(width_, height_, hdrplus_), width_, height_));
+-        arenaHdrPlus_ = hdrplus_;
+-    } else {
+-        arena_.initialize(physical, device, makeMultiframeScratchLayout(makeMultiframeGeometry(width_, height_, outputScale_)));
+-    }
+-    arenaAlgorithm_ = algorithm_;
+-}
+-void AndroidBurstCoordinator::initialize(VkPhysicalDevice physical, VkDevice device, std::uint32_t qf, Submit submit,
+-                                         std::uint32_t w, std::uint32_t h, float scale, StageSink stageSink,
+-                                         rawr::raw_alignment_gpu::Config alignment,
+-                                         rawr::raw_merge_wronski_gpu::Config merge, MergeAlgorithm algorithm,
+-                                         rawr::raw_merge_hdrplus_gpu::Config hdrplus) {
+-    if (!physical || !device || !submit || !w || !h)
+-        throw std::invalid_argument("multiframe burst: invalid initialize");
+-    // HDR+ merges on the RAW grid only.
+-    if (algorithm != MergeAlgorithm::Wronski) {
+-        scale = 1.0f;
+-        if (!rawr::raw_merge_hdrplus_gpu::valid(hdrplus))
+-            throw std::invalid_argument("multiframe burst: invalid HDR+ tuning");
+-    }
+-    merge.outputScale = scale;
+-    if (!rawr::raw_alignment_gpu::valid(alignment) ||
+-        !(std::isfinite(alignment.hessianEpsilon) && alignment.hessianEpsilon > 0.0f) ||
+-        !rawr::raw_merge_wronski_gpu::valid(merge))
+-        throw std::invalid_argument("multiframe burst: invalid tuning");
+-    std::lock_guard<std::mutex> lock(initMutex_);
+-    if (algorithm == MergeAlgorithm::Wronski) lastScale_ = scale;
+-    lastAlgorithm_ = algorithm;
+-    lastHdrPlus_ = hdrplus;
+-    if (device_ == device && physical_ == physical && queueFamily_ == qf && width_ == w && height_ == h &&
+-        std::abs(outputScale_ - scale) <= 1.0e-6f) {
+-        alignment_ = alignment;
+-        merge_ = merge;
+-        algorithm_ = algorithm;
+-        hdrplus_ = hdrplus;
+-        submit_ = std::move(submit);
+-        stageSink_ = std::move(stageSink);
+-        pipelineCacheReused_ = executionReady_;
+-        if (arenaReady_ && !arenaMatchesSelection()) {
+-            arena_.reset();
+-            arenaReady_ = false;
+-            layoutsInitialized_ = false;
+-        }
+-        resourcesReused_ = arenaReady_;
+-        if (!arenaReady_) {
+-            const auto initializeBegin = std::chrono::steady_clock::now();
+-            if (stageSink_) stageSink_(Stage::ArenaInitializeBegin, 0, 0);
+-            initializeArenaLocked(physical, device);
+-            arenaReady_ = true;
+-            layoutsInitialized_ = false;
+-            if (stageSink_)
+-                stageSink_(Stage::ArenaInitializeEnd, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-            pendingInitializeMs_ = std::chrono::duration<double, std::milli>(
+-                                       std::chrono::steady_clock::now() - initializeBegin)
+-                                       .count();
+-        } else {
+-            pendingInitializeMs_ = 0.0;
+-        }
+-        return;
+-    }
+-    // Full path: geometry (arena) always rebuilt. Warmed pipelines/pools on the
+-    // same device are preserved; everything else is torn down. Stale semaphore
+-    // arms are always cleared (a previous failed run must not inject a wait).
+-    if (device_ && fence_ && submissionInFlight_) {
+-        (void)vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+-        submissionInFlight_ = false;
+-    }
+-    const bool warmedInfra = executionReady_ && device_ == device && physical_ == physical && queueFamily_ == qf;
+-    if (!warmedInfra) resetInfraLocked();
+-    initialWait_ = VK_NULL_HANDLE;
+-    arena_.reset();
+-    arenaReady_ = false;
+-    layoutsInitialized_ = false;
+-    submissionInFlight_ = false;
+-    resourcesReused_ = false;
+-    pipelineCacheReused_ = false;
+-    pendingInitializeMs_ = 0.0;
+-    submit_ = {};
+-    stageSink_ = {};
+-    const auto initializeBegin = std::chrono::steady_clock::now();
+-    alignment_ = alignment;
+-    merge_ = merge;
+-    algorithm_ = algorithm;
+-    hdrplus_ = hdrplus;
+-    submit_ = std::move(submit);
+-    stageSink_ = std::move(stageSink);
+-    width_ = w;
+-    height_ = h;
+-    outputScale_ = scale;
+-    if (stageSink_) stageSink_(Stage::ArenaInitializeBegin, 0, 0);
+-    ensureExecutionInfra(physical, device, qf);
+-    initializeArenaLocked(physical, device);
+-    arenaReady_ = true;
+-    if (stageSink_) stageSink_(Stage::ArenaInitializeEnd, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-    resourcesReused_ = false;
+-    pipelineCacheReused_ = warmedInfra;
+-    pendingInitializeMs_ =
+-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - initializeBegin).count();
+-}
+-AndroidBurstCoordinator::ChunkTiming AndroidBurstCoordinator::executeChunk(std::uint32_t chunkCode,
+-                                                                          std::uint32_t frameIndex,
+-                                                                          std::uint32_t queryCount,
+-                                                                          const std::function<void()>& record) {
+-    if (queryCount == 0u || queryCount > kTimestampQueryCapacity) throw std::invalid_argument("multiframe timestamp query count");
+-    using Clock = std::chrono::steady_clock;
+-    const auto begin = Clock::now();
+-    if (stageSink_) stageSink_(Stage::ChunkBegin, chunkCode, frameIndex);
+-    try {
+-        if (submissionInFlight_) {
+-            const VkResult prior = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+-            submissionInFlight_ = false;
+-            check(prior, "multiframe prior fence");
+-        }
+-        check(vkResetCommandBuffer(command_, 0), "multiframe reset command buffer");
+-        executor_.beginBatch();
+-        if (stageSink_) stageSink_(Stage::RecordBegin, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-        VkCommandBufferBeginInfo bi{};
+-        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+-        check(vkBeginCommandBuffer(command_, &bi), "multiframe begin");
+-        if (timestampsSupported_) vkCmdResetQueryPool(command_, timestampPool_, 0u, queryCount);
+-        record();
+-        check(vkEndCommandBuffer(command_), "multiframe end");
+-        if (stageSink_) stageSink_(Stage::RecordEnd, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-        VkSubmitInfo si{};
+-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+-        si.commandBufferCount = 1;
+-        si.pCommandBuffers = &command_;
+-        // One-shot cross-queue edge (e.g. prior-queue writes to borrowed
+-        // inputs before a multiframe queue takes over). Consumed once.
+-        // NB: stage/semaphore must be locals: pWaitSemaphores must stay
+-        // valid through submit_, so they cannot alias the cleared member.
+-        VkSemaphore initialWait = initialWait_;
+-        VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+-        initialWait_ = VK_NULL_HANDLE;
+-        if (initialWait != VK_NULL_HANDLE) {
+-            si.waitSemaphoreCount = 1;
+-            si.pWaitSemaphores = &initialWait;
+-            si.pWaitDstStageMask = &waitStage;
+-        }
+-        check(vkResetFences(device_, 1, &fence_), "multiframe reset fence");
+-        if (stageSink_) stageSink_(Stage::SubmitBegin, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-        submit_(si, fence_);
+-        submissionInFlight_ = true;
+-        if (stageSink_) stageSink_(Stage::SubmitEnd, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-        if (stageSink_)
+-            stageSink_(Stage::FenceWaitBegin, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-        const VkResult executed = vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+-        submissionInFlight_ = false;
+-        if (stageSink_) stageSink_(Stage::FenceWaitEnd, arena_.physicalImageBytes(), arena_.physicalBufferBytes());
+-        check(executed, "multiframe execute");
+-    } catch (const std::exception& e) {
+-        throw std::runtime_error("multiframe chunk=" + std::to_string(chunkCode) +
+-                                 " frame=" + std::to_string(frameIndex) + ": " + e.what());
+-    }
+-    if (stageSink_) stageSink_(Stage::ChunkEnd, chunkCode, frameIndex);
+-    std::vector<double> gpuIntervals;
+-    if (timestampsSupported_ && queryCount > 1u) {
+-        std::array<std::uint64_t, kTimestampQueryCapacity> values{};
+-        check(vkGetQueryPoolResults(device_, timestampPool_, 0u, queryCount, queryCount * sizeof(values[0]),
+-                                    values.data(), sizeof(values[0]), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+-              "multiframe timestamp results");
+-        gpuIntervals.reserve(queryCount - 1u);
+-        for (std::uint32_t i = 1u; i < queryCount; ++i) {
+-            gpuIntervals.push_back(double(values[i] - values[i - 1u]) * double(timestampPeriodNs_) / 1.0e6);
+-        }
+-    }
+-    const double wall = std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+-    return std::pair<double, std::vector<double>>(wall, std::move(gpuIntervals));
+-}
+-void AndroidBurstCoordinator::recordTimestamp(std::uint32_t query) {
+-    if (timestampsSupported_)
+-        vkCmdWriteTimestamp(command_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestampPool_, query);
+-}
+-BurstRunResult AndroidBurstCoordinator::run(const std::vector<BurstFrame>& frames, std::uint32_t ref,
+-                                            FrameConsumed frameConsumed, FramePrepared framePrepared) {
+-    if (!device_ || !arenaReady_ || frames.size() < 2 || ref >= frames.size())
+-        throw std::invalid_argument("multiframe burst: invalid run");
+-    if (frames[ref].raw.ref.width != width_ || frames[ref].raw.ref.height != height_)
+-        throw std::invalid_argument("multiframe burst: RAW geometry mismatch");
+-    // Chunk codes are stable trace ABI for device diagnostics. Companion work
+-    // deliberately remains split at scheduling boundaries so preview submits can
+-    // interleave on the shared graphics queue. Alignment is additionally split
+-    // per coarse-to-fine level (chunk 11 repeats): a whole companion's
+-    // alignment holds the GPU for ~35ms, starving 30/60fps preview, while a
+-    // single level holds it for ~1-20ms. Recorded commands are unchanged.
+-    // 1=reference, 11=prepare/alignment, 12=kernel/stats,
+-    // 13=robustness, 14=accumulate, 20=finalize.
+-    using Clock = std::chrono::steady_clock;
+-    const auto runBegin = Clock::now();
+-    BurstStageTimings timings{};
+-    timings.initializeMs = pendingInitializeMs_;
+-    const auto timestamp = [&](std::uint32_t query) { recordTimestamp(query); };
+-    // Original reference is uploaded once and NEVER overwritten by any
+-    // companion. Upstream chunk fences serialize every later callback.
+-    if (framePrepared) framePrepared(ref);
+-    if (algorithm_ == MergeAlgorithm::HdrPlusSpatial) return runHdrPlus(frames, ref, frameConsumed, framePrepared);
+-    if (usesFrequencyMerge(algorithm_)) return runHdrPlusFrequency(frames, ref, frameConsumed, framePrepared);
+-    // Burst noise estimation: the profile it fits drives everything below
+-    // (robustness LUT, kernel GAT, aperture gate), so it runs first. The
+-    // configured profile is restored after the run (also on failure).
+-    struct RestoreMerge {
+-        rawr::raw_merge_wronski_gpu::Config& target;
+-        rawr::raw_merge_wronski_gpu::Config saved;
+-        ~RestoreMerge() { target = saved; }
+-    } restoreMerge{merge_, merge_};
+-    bool noiseEstimated = false;
+-    if (merge_.estimateNoiseFromBurst) {
+-        const std::uint32_t neighbour = ref + 1u < frames.size() ? ref + 1u : ref - 1u;
+-        // Empirical per-site noise MUST be measured before any Wronski
+-        // merge, even if this neighbour is revisited during fusion.
+-        if (framePrepared) framePrepared(neighbour);
+-        const std::uint32_t blocksX = (width_ + kNoiseBlockSize - 1u) / kNoiseBlockSize;
+-        const std::uint32_t blocksY = (height_ + kNoiseBlockSize - 1u) / kNoiseBlockSize;
+-        ensureHostBuffer(noiseStats_, VkDeviceSize(blocksX) * blocksY * kNoiseBlockFloats * sizeof(float));
+-        NoiseEstimatePc pc{};
+-        for (std::size_t s = 0; s < 4u; ++s) {
+-            pc.referenceBlack[s] = frames[ref].parameters.normalization.blackByPhase[s];
+-            pc.neighbourBlack[s] = frames[neighbour].parameters.normalization.blackByPhase[s];
+-        }
+-        pc.referenceWhite = frames[ref].parameters.normalization.whiteLevel;
+-        pc.neighbourWhite = frames[neighbour].parameters.normalization.whiteLevel;
+-        pc.width = std::int32_t(width_);
+-        pc.height = std::int32_t(height_);
+-        pc.blocksX = std::int32_t(blocksX);
+-        const auto noiseTiming = executeChunk(2u, neighbour, 2u, [&] {
+-            timestamp(0u);
+-            executor_.record(command_, ShaderId::NoiseEstimate,
+-                             {{{0u, frames[ref].raw.view}, {1u, frames[neighbour].raw.view}},
+-                              {{2u, noiseStats_.buffer}}},
+-                             &pc, sizeof(pc), blocksX, blocksY, 1u);
+-            VkMemoryBarrier toHost{};
+-            toHost.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+-            toHost.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+-            toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+-            vkCmdPipelineBarrier(command_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1,
+-                                 &toHost, 0, nullptr, 0, nullptr);
+-            timestamp(1u);
+-        });
+-        timings.noiseEstimateMs = noiseTiming.second.empty() ? noiseTiming.first : noiseTiming.second.front();
+-        const auto fit = fitBurstNoise(static_cast<const float*>(noiseStats_.mapped), blocksX * blocksY);
+-        if (fit) {
+-            merge_.sensorNoiseProfile = fit->profile;
+-            merge_.highSignalNoiseProfile.reset();
+-            merge_.noiseKneeBySite.fill(0.0f);
+-            noiseEstimated = true;
+-        }
+-    }
+-    std::array<float, 3u * 1001u> stdc{}, diffc{};
+-    auto siteVariance = [&](std::uint32_t site, float x) {
+-        if (!merge_.sensorNoiseProfile) return merge_.noiseAlpha * x + merge_.noiseBeta;
+-        const auto* profile = &*merge_.sensorNoiseProfile;
+-        if (merge_.highSignalNoiseProfile && merge_.noiseKneeBySite[site] > 0.0f && x >= merge_.noiseKneeBySite[site])
+-            profile = &*merge_.highSignalNoiseProfile;
+-        return profile->slopeBySite[site] * x + profile->offsetBySite[site];
+-    };
+-    std::array<std::uint32_t, 4> physical{{0u, 1u, 2u, 3u}};
+-    if (merge_.sensorNoiseProfile) {
+-        switch (merge_.cfa) {
+-            case rawr::raw_merge_wronski_gpu::CfaPattern::RGGB:
+-                physical = {0u, 1u, 2u, 3u};
+-                break;
+-            case rawr::raw_merge_wronski_gpu::CfaPattern::GRBG:
+-                physical = {1u, 0u, 3u, 2u};
+-                break;
+-            case rawr::raw_merge_wronski_gpu::CfaPattern::GBRG:
+-                physical = {2u, 3u, 0u, 1u};
+-                break;
+-            case rawr::raw_merge_wronski_gpu::CfaPattern::BGGR:
+-                physical = {3u, 2u, 1u, 0u};
+-                break;
+-        }
+-    }
+-    for (std::size_t i = 0; i < 1001u; ++i) {
+-        const float x = float(i) / 1000.f;
+-        const std::array<float, 3> variance{{siteVariance(physical[0], x),
+-                                             .25f * (siteVariance(physical[1], x) + siteVariance(physical[2], x)),
+-                                             siteVariance(physical[3], x)}};
+-        const float sqrtBrightness = std::sqrt(x);
+-        const auto noise = mergemath::aggregateRobustnessNoise(
+-            mergemath::sqrtDomainNoiseVariance(sqrtBrightness, variance[0]),
+-            mergemath::sqrtDomainNoiseVariance(sqrtBrightness, variance[1]),
+-            mergemath::sqrtDomainNoiseVariance(sqrtBrightness, variance[2]));
+-        // Aggregate brightness-indexed LUT contract. Only the first plane is
+-        // consumed; repeating it keeps the fixed descriptor/buffer layout.
+-        for (std::size_t c = 0; c < 3; ++c) {
+-            stdc[c * 1001u + i] = noise.sigmaSquared;
+-            diffc[c * 1001u + i] = noise.distanceSquared;
+-        }
+-    }
+-    // The merge path owns a full-height output accumulator. At 1x this happened
+-    // to equal the RAW height; scaled output must use the reconstructed extent or
+-    // the recorder incorrectly classifies the full allocation as a stripe.
+-    const std::uint32_t reconstructionHeight = arena_.image("linear_output").extent.height;
+-    MultiframeRecorder recorder(arena_, executor_, alignment_, merge_, reconstructionHeight);
+-    {
+-        // Sensor hot-pixel list, shared by every frame of the burst (one
+-        // sensor, one map). Capped defensively; Camera2 maps are small.
+-        const std::size_t pairs = std::min<std::size_t>(merge_.hotPixels.size() / 2u, 1u << 20);
+-        if (pairs > 0u) {
+-            ensureHostBuffer(hotPixels_, VkDeviceSize(pairs) * 2u * sizeof(std::int32_t));
+-            std::memcpy(hotPixels_.mapped, merge_.hotPixels.data(), pairs * 2u * sizeof(std::int32_t));
+-            recorder.setHotPixels(hotPixels_.buffer, std::uint32_t(pairs));
+-        }
+-    }
+-    const bool initializeLayouts = !layoutsInitialized_;
+-    const auto referenceTiming = executeChunk(1u, ref, 3u, [&] {
+-        timestamp(0u);
+-        if (initializeLayouts) arena_.recordInitializeLayouts(command_);
+-        arena_.recordClearBurstState(command_);
+-        recorder.recordUploadNoiseCurves(command_, stdc.data(), diffc.data());
+-        recorder.recordReferencePrepare(command_, frames[ref].raw.view, frames[ref].parameters);
+-        timestamp(1u);
+-        recorder.recordReferenceStats(command_, frames[ref].parameters);
+-        timestamp(2u);
+-    });
+-    if (initializeLayouts) layoutsInitialized_ = true;
+-    if (referenceTiming.second.size() == 2u) {
+-        timings.referencePrepareMs = referenceTiming.second[0];
+-        timings.referenceStatsMs = referenceTiming.second[1];
+-    } else {
+-        timings.referencePrepareMs = referenceTiming.first;
+-    }
+-    std::uint32_t companions = 0;
+-    for (std::uint32_t i = 0; i < frames.size(); ++i) {
+-        if (i == ref) continue;
+-        if (frames[i].raw.ref.width != width_ || frames[i].raw.ref.height != height_)
+-            throw std::invalid_argument("multiframe burst: RAW geometry mismatch");
+-        if (framePrepared) framePrepared(i);
+-        const auto prepareTiming = executeChunk(11u, i, 2u, [&] {
+-            timestamp(0u);
+-            recorder.recordCompanionPrepare(command_, frames[i].raw.view, frames[i].parameters);
+-            timestamp(1u);
+-        });
+-        if (prepareTiming.second.size() == 1u) {
+-            timings.companionPrepareMs += prepareTiming.second.front();
+-        } else {
+-            timings.companionPrepareMs += prepareTiming.first;
+-        }
+-        for (std::uint32_t l = 0; l < 4; ++l) {
+-            const auto levelTiming = executeChunk(11u, i, 2u, [&] {
+-                timestamp(0u);
+-                recorder.recordCompanionAlignmentLevel(command_, l);
+-                timestamp(1u);
+-            });
+-            if (levelTiming.second.size() == 1u) {
+-                timings.alignmentMs += levelTiming.second.front();
+-            } else {
+-                timings.alignmentMs += levelTiming.first;
+-            }
+-        }
+-        const auto statsTiming = executeChunk(12u, i, 2u, [&] {
+-            timestamp(0u);
+-            recorder.recordCompanionStats(command_, frames[i].parameters);
+-            timestamp(1u);
+-        });
+-        timings.kernelStatsMs += statsTiming.second.empty() ? statsTiming.first : statsTiming.second.front();
+-        const auto robustnessTiming = executeChunk(13u, i, 2u, [&] {
+-            timestamp(0u);
+-            recorder.recordCompanionRobustness(command_);
+-            timestamp(1u);
+-        });
+-        timings.robustnessMs +=
+-            robustnessTiming.second.empty() ? robustnessTiming.first : robustnessTiming.second.front();
+-        const auto accumulationTiming = executeChunk(14u, i, 2u, [&] {
+-            timestamp(0u);
+-            recorder.recordCompanionAccumulate(command_);
+-            timestamp(1u);
+-        });
+-        timings.accumulationMs +=
+-            accumulationTiming.second.empty() ? accumulationTiming.first : accumulationTiming.second.front();
+-        ++companions;
+-        if (frameConsumed) frameConsumed(i);
+-    }
+-    const auto finalizeTiming = executeChunk(20u, ref, 2u, [&] {
+-        timestamp(0u);
+-        recorder.recordFinalize(command_, companions);
+-        timestamp(1u);
+-    });
+-    timings.finalizeMs = finalizeTiming.second.empty() ? finalizeTiming.first : finalizeTiming.second.front();
+-    timings.totalMs = std::chrono::duration<double, std::milli>(Clock::now() - runBegin).count();
+-    const auto& out = arena_.image("linear_output");
+-    BurstRunResult result{ref,
+-            std::uint32_t(frames.size()),
+-            out.image,
+-            out.view,
+-            out.format,
+-            out.extent,
+-            arena_.physicalImageBytes(),
+-            arena_.physicalBufferBytes(),
+-            static_cast<std::uint32_t>(2u + companions * 8u),
+-            resourcesReused_,
+-            pipelineCacheReused_,
+-            timings};
+-    result.noiseEstimated = noiseEstimated;
+-    if (noiseEstimated) result.estimatedNoise = *merge_.sensorNoiseProfile;
+-    return result;
+-}
+-BurstRunResult AndroidBurstCoordinator::runHdrPlus(const std::vector<BurstFrame>& frames, std::uint32_t ref,
+-                                                   const FrameConsumed& frameConsumed,
+-                                                    const FramePrepared& framePrepared) {
+-    // Chunks reuse the Wronski trace codes: 1=reference, 11=prepare and
+-    // alignment (two submissions), 14=merge/accumulate, 20=finalize. Splitting
+-    // each companion lets preview work interleave on a shared queue.
+-    using Clock = std::chrono::steady_clock;
+-    const auto runBegin = Clock::now();
+-    BurstStageTimings timings{};
+-    timings.initializeMs = pendingInitializeMs_;
+-    const auto gpuOrWall = [](const ChunkTiming& t) { return t.second.empty() ? t.first : t.second.front(); };
+-    const auto geometry = rawr::raw_merge_hdrplus_gpu::makeGeometry(width_, height_, hdrplus_);
+-    HdrPlusRecorder recorder(arena_, executor_, hdrplus_, geometry);
+-    const std::size_t pairs = std::min<std::size_t>(merge_.hotPixels.size() / 2u, 1u << 20);
+-    if (pairs > 0u) {
+-        ensureHostBuffer(hotPixels_, VkDeviceSize(pairs) * 2u * sizeof(std::int32_t));
+-        std::memcpy(hotPixels_.mapped, merge_.hotPixels.data(), pairs * 2u * sizeof(std::int32_t));
+-        recorder.setHotPixels(hotPixels_.buffer, std::uint32_t(pairs));
+-    }
+-    const auto frameCount = std::uint32_t(frames.size());
+-    const bool initializeLayouts = !layoutsInitialized_;
+-    timings.referencePrepareMs = gpuOrWall(executeChunk(1u, ref, 2u, [&] {
+-        recordTimestamp(0u);
+-        if (initializeLayouts) arena_.recordInitializeLayouts(command_);
+-        recorder.recordReference(command_, frames[ref].raw.view, frames[ref].parameters.normalization, frameCount);
+-        recordTimestamp(1u);
+-    }));
+-    if (initializeLayouts) layoutsInitialized_ = true;
+-    std::uint32_t companions = 0;
+-    for (std::uint32_t i = 0; i < frameCount; ++i) {
+-        if (i == ref) continue;
+-        if (frames[i].raw.ref.width != width_ || frames[i].raw.ref.height != height_)
+-            throw std::invalid_argument("multiframe burst: RAW geometry mismatch");
+-        // Keep the expensive finest level in its own submission so preview
+-        // can interleave. Preparation and the much smaller coarse levels share
+-        // one submission instead of a fence round-trip for every level.
+-        const bool profile = std::getenv("RAWR_HDRP_PROFILE") != nullptr;
+-        const std::uint32_t coarseLevels = recorder.levelCount() - 1u;
+-        if (framePrepared) framePrepared(i);
+-        recorder.setCompanionGain(exposureGain(frames, ref, i));
+-        const auto prepareTiming = executeChunk(11u, i, profile ? 2u + 3u * coarseLevels : 3u, [&] {
+-            recordTimestamp(0u);
+-            recorder.recordCompanionPrepare(command_, frames[i].raw.view, frames[i].parameters.normalization);
+-            recordTimestamp(1u);
+-            for (std::uint32_t level = recorder.levelCount(); --level > 0u;) {
+-                const std::uint32_t start = 1u + 3u * (coarseLevels - level);
+-                recorder.recordCompanionAlignLevel(command_, level, [&](std::uint32_t k) {
+-                    if (profile) recordTimestamp(start + k);
+-                });
+-                if (profile) recordTimestamp(start + 3u);
+-            }
+-            if (!profile) recordTimestamp(2u);
+-        });
+-        if (prepareTiming.second.empty()) {
+-            timings.companionPrepareMs += prepareTiming.first;
+-        } else {
+-            timings.companionPrepareMs += prepareTiming.second.front();
+-            for (std::size_t k = 1; k < prepareTiming.second.size(); ++k)
+-                timings.alignmentMs += prepareTiming.second[k];
+-            if (profile) {
+-                for (std::uint32_t n = 0; n < coarseLevels; ++n) {
+-                    const auto k = 1u + 3u * n;
+-                    std::fprintf(stderr, "hdrp_profile frame=%u level=%u correct=%.3f cost=%.3f best=%.3f\n", i,
+-                                 coarseLevels - n, prepareTiming.second[k], prepareTiming.second[k + 1u],
+-                                 prepareTiming.second[k + 2u]);
+-                }
+-            }
+-        }
+-        const auto levelTiming = executeChunk(11u, i, 4u, [&] {
+-            recordTimestamp(0u);
+-            recorder.recordCompanionAlignLevel(command_, 0u, [&](std::uint32_t k) { recordTimestamp(k); });
+-            recordTimestamp(3u);
+-        });
+-        double alignmentMs = levelTiming.first;
+-        if (!levelTiming.second.empty()) {
+-            alignmentMs = 0.0;
+-            for (const double ms : levelTiming.second) alignmentMs += ms;
+-        }
+-        timings.alignmentMs += alignmentMs;
+-        if (profile && levelTiming.second.size() == 3u)
+-            std::fprintf(stderr, "hdrp_profile frame=%u level=0 correct=%.3f cost=%.3f best=%.3f\n", i,
+-                         levelTiming.second[0], levelTiming.second[1], levelTiming.second[2]);
+-        const auto mergeTiming = executeChunk(14u, i, 5u, [&] {
+-            recordTimestamp(0u);
+-            recorder.recordCompanionMerge(command_, frameCount, [&](std::uint32_t k) { recordTimestamp(k); });
+-            recordTimestamp(4u);
+-        });
+-        double mergeMs = mergeTiming.first;
+-        if (!mergeTiming.second.empty()) {
+-            mergeMs = 0.0;
+-            for (const double ms : mergeTiming.second) mergeMs += ms;
+-            if (std::getenv("RAWR_HDRP_PROFILE") && mergeTiming.second.size() == 4u)
+-                std::fprintf(stderr, "hdrp_profile frame=%u warp=%.3f blur=%.3f weight=%.3f accumulate=%.3f\n", i,
+-                             mergeTiming.second[0], mergeTiming.second[1], mergeTiming.second[2], mergeTiming.second[3]);
+-        }
+-        timings.accumulationMs += mergeMs;
+-        ++companions;
+-        if (frameConsumed) frameConsumed(i);
+-    }
+-    timings.finalizeMs = gpuOrWall(executeChunk(20u, ref, 2u, [&] {
+-        recordTimestamp(0u);
+-        recorder.recordFinalize(command_);
+-        recordTimestamp(1u);
+-    }));
+-    timings.totalMs = std::chrono::duration<double, std::milli>(Clock::now() - runBegin).count();
+-    const auto& out = arena_.image("hdrp_output");
+-    const auto& cfa = arena_.image("hdrp_cfa");
+-    BurstRunResult result{ref,
+-                          frameCount,
+-                          out.image,
+-                          out.view,
+-                          out.format,
+-                          out.extent,
+-                          arena_.physicalImageBytes(),
+-                          arena_.physicalBufferBytes(),
+-                          2u + companions * 3u,
+-                          resourcesReused_,
+-                          pipelineCacheReused_,
+-                          timings};
+-    result.cfaImage = cfa.image;
+-    result.cfaView = cfa.view;
+-    return result;
+-}
+-BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency(const std::vector<BurstFrame>& frames, std::uint32_t ref,
+-                                                            const FrameConsumed& frameConsumed,
+-                                                             const FramePrepared& framePrepared) {
+-    // Four half-tile-shifted passes. Companions are aligned in pass 0 only
+-    // (align-once, default) or re-aligned on each pass's padding (upstream).
+-    // Chunk codes: 1=pass reference, 11=companion prepare/alignment,
+-    // 14=frequency merge, 15=pass finish, 20=finalize. Ring frames are
+-    // consumed only after the last pass.
+-    using Clock = std::chrono::steady_clock;
+-    const auto runBegin = Clock::now();
+-    BurstStageTimings timings{};
+-    timings.initializeMs = pendingInitializeMs_;
+-    const auto gpuOrWall = [](const ChunkTiming& t) { return t.second.empty() ? t.first : t.second.front(); };
+-    const auto geometry = rawr::raw_merge_hdrplus_gpu::makeFrequencyGeometry(width_, height_, hdrplus_);
+-    HdrPlusFrequencyRecorder recorder(arena_, executor_, hdrplus_, geometry);
+-    if (algorithm_ == MergeAlgorithm::HdrPlusBracketed) {
+-        std::vector<float> factors(frames.size(), 1.0f), whites(frames.size(), 65535.0f);
+-        const float refExposure = frames[ref].exposure;
+-        for (std::size_t i = 0; i < frames.size(); ++i) {
+-            if (refExposure > 0.0f && frames[i].exposure > 0.0f) factors[i] = frames[i].exposure / refExposure;
+-            whites[i] = frames[i].parameters.normalization.whiteLevel;
+-        }
+-        recorder.setExposure(std::move(factors), std::move(whites));
+-    } else {
+-        std::vector<float> gains(frames.size(), 1.0f);
+-        for (std::uint32_t i = 0; i < frames.size(); ++i) gains[i] = exposureGain(frames, ref, i);
+-        recorder.setExposureNormalization(std::move(gains));
+-    }
+-    const std::size_t pairs = std::min<std::size_t>(merge_.hotPixels.size() / 2u, 1u << 20);
+-    if (pairs > 0u) {
+-        ensureHostBuffer(hotPixels_, VkDeviceSize(pairs) * 2u * sizeof(std::int32_t));
+-        std::memcpy(hotPixels_.mapped, merge_.hotPixels.data(), pairs * 2u * sizeof(std::int32_t));
+-        recorder.alignment().setHotPixels(hotPixels_.buffer, std::uint32_t(pairs));
+-    }
+-    const auto frameCount = std::uint32_t(frames.size());
+-    for (std::uint32_t i = 0; i < frameCount; ++i)
+-        if (frames[i].raw.ref.width != width_ || frames[i].raw.ref.height != height_)
+-            throw std::invalid_argument("multiframe burst: RAW geometry mismatch");
+-    // Bracketed bursts merge the companions as dark as the reference first:
+-    // their running merge is the substitute for brighter frames' clipped cells.
+-    // Brighter ones follow by exposure, so each shares one pyramid clamp.
+-    std::vector<std::uint32_t> order;
+-    for (std::uint32_t i = 0; i < frameCount; ++i)
+-        if (i != ref) order.push_back(i);
+-    std::stable_sort(order.begin(), order.end(), [&](std::uint32_t a, std::uint32_t b) {
+-        const float ka = recorder.brighterCompanion(a) ? recorder.exposureFactor(a) : 0.0f;
+-        const float kb = recorder.brighterCompanion(b) ? recorder.exposureFactor(b) : 0.0f;
+-        return ka < kb;
+-    });
+-    std::uint32_t companions = 0;
+-    for (std::uint32_t pass = 0; pass < 4u; ++pass) {
+-        recorder.beginPass(pass);
+-        const bool initializeLayouts = !layoutsInitialized_;
+-        timings.referencePrepareMs += gpuOrWall(executeChunk(1u, ref, 2u, [&] {
+-            recordTimestamp(0u);
+-            if (initializeLayouts) arena_.recordInitializeLayouts(command_);
+-            recorder.recordReference(command_, frames[ref].raw.view, frames[ref].parameters.normalization);
+-            recordTimestamp(1u);
+-        }));
+-        if (initializeLayouts) layoutsInitialized_ = true;
+-        for (const std::uint32_t i : order) {
+-            if (recorder.needsSubstitutionSource(i))
+-                timings.accumulationMs += gpuOrWall(executeChunk(14u, i, 2u, [&] {
+-                    recordTimestamp(0u);
+-                    recorder.recordSubstitutionSource(command_);
+-                    recordTimestamp(1u);
+-                }));
+-            // Aligning passes: prepare + coarse levels, then the finest level
+-            // (+ shift store) as its own submission. One submission held the
+-            // GPU ~70 ms per companion on Adreno and dropped preview frames.
+-            // Other passes: only the padded frame.
+-            // Frequency pass 0..3 may revisit the same NORMAL. Upload
+-            // each pass just in time, after the previous fenced chunk.
+-            if (framePrepared) framePrepared(i);
+-            // IRIS_26888_B_OFF_NATIVE_RAW_BURST_NOISE: the original Wronski
+-            // fitter in run() is unreachable from HDRQ's early return. Execute
+-            // the SAME pinned empirical RAW estimator on already prepared
+-            // reference and first companion, once, before any frequency merge.
+-            // No Camera2 preset and no duplicate prepared-frame callback.
+-            if (pass == 0u && i == order.front() &&
+-                algorithm_ == MergeAlgorithm::HdrPlusFrequency) {
+-                const std::uint32_t bx = (width_ + kNoiseBlockSize - 1u) / kNoiseBlockSize;
+-                const std::uint32_t by = (height_ + kNoiseBlockSize - 1u) / kNoiseBlockSize;
+-                ensureHostBuffer(noiseStats_, VkDeviceSize(bx) * by * kNoiseBlockFloats * sizeof(float));
+-                NoiseEstimatePc pc{};
+-                for (std::size_t s = 0; s < 4u; ++s) {
+-                    pc.referenceBlack[s] = frames[ref].parameters.normalization.blackByPhase[s];
+-                    pc.neighbourBlack[s] = frames[i].parameters.normalization.blackByPhase[s];
+-                }
+-                pc.referenceWhite = frames[ref].parameters.normalization.whiteLevel;
+-                pc.neighbourWhite = frames[i].parameters.normalization.whiteLevel;
+-                pc.width = std::int32_t(width_); pc.height = std::int32_t(height_);
+-                pc.blocksX = std::int32_t(bx);
+-                const auto estimated = executeChunk(2u, i, 2u, [&] {
+-                    recordTimestamp(0u);
+-                    executor_.record(command_, ShaderId::NoiseEstimate,
+-                                     {{{0u, frames[ref].raw.view}, {1u, frames[i].raw.view}},
+-                                      {{2u, noiseStats_.buffer}}},
+-                                     &pc, sizeof(pc), bx, by, 1u);
+-                    VkMemoryBarrier toHost{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+-                        VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT};
+-                    vkCmdPipelineBarrier(command_, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+-                                         VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost,
+-                                         0, nullptr, 0, nullptr);
+-                    recordTimestamp(1u);
+-                });
+-                timings.noiseEstimateMs = estimated.second.empty() ? estimated.first : estimated.second.front();
+-                const auto fit = fitBurstNoise(static_cast<const float*>(noiseStats_.mapped), bx * by);
+-                std::array<float, 4> slopes{}, offsets{};
+-                bool measured = false;
+-                if (fit) {
+-                    slopes = fit->profile.slopeBySite;
+-                    offsets = fit->profile.offsetBySite;
+-                    measured = true;
+-                } else {
+-                    // A robust, signal-independent BURST fallback remains
+-                    // data-derived even when a four-bin slope fit is impossible.
+-                    // Do not manufacture Camera2 coefficients or consume A's
+-                    // protection controls. If no valid RAW blocks exist, mark
+-                    // the motion classifier UNKNOWN and retain strength 13.
+-                    const float* stats = static_cast<const float*>(noiseStats_.mapped);
+-                    bool usable = true;
+-                    for (std::size_t s = 0; s < 4u; ++s) {
+-                        std::vector<float> variances;
+-                        variances.reserve(bx * by);
+-                        for (std::uint32_t b = 0; b < bx * by; ++b) {
+-                            const float* q = stats + std::size_t(b) * kNoiseBlockFloats + s * 4u;
+-                            if (!(q[0] >= 128.0f)) continue;
+-                            const float var = (q[3] - q[2] * q[2] / q[0]) / (q[0] - 1.0f) * 0.5f;
+-                            if (std::isfinite(var) && var > 0.0f) variances.push_back(var);
+-                        }
+-                        if (variances.empty()) {usable = false; break;}
+-                        const std::size_t q = (variances.size() - 1u) / 5u;
+-                        std::nth_element(variances.begin(), variances.begin() + q, variances.end());
+-                        offsets[s] = std::max(variances[q], 1.0e-10f);
+-                    }
+-                    measured = usable;
+-                }
+-                recorder.setMeasuredRawNoise(slopes, offsets, measured);
+-                std::fprintf(stderr, "IRIS_26888_B_OFF_RAW_BURST_NOISE measured=%d fallback=%d\n",
+-                             measured ? 1 : 0, (!fit && measured) ? 1 : 0);
+-            }
+-            const bool aligns = recorder.alignsThisPass();
+-            double alignMs = 0.0;
+-            if (aligns) {
+-                alignMs += gpuOrWall(executeChunk(11u, i, 2u, [&] {
+-                    recordTimestamp(0u);
+-                    recorder.recordCompanionAlignCoarse(command_, frames[i].raw.view,
+-                                                        frames[i].parameters.normalization, i);
+-                    recordTimestamp(1u);
+-                }));
+-                alignMs += gpuOrWall(executeChunk(11u, i, 2u, [&] {
+-                    recordTimestamp(0u);
+-                    recorder.recordCompanionAlignFinest(command_, i);
+-                    recordTimestamp(1u);
+-                }));
+-            } else {
+-                alignMs = gpuOrWall(executeChunk(11u, i, 2u, [&] {
+-                    recordTimestamp(0u);
+-                    recorder.recordCompanionAlign(command_, frames[i].raw.view, frames[i].parameters.normalization, i);
+-                    recordTimestamp(1u);
+-                }));
+-            }
+-            (aligns ? timings.alignmentMs : timings.companionPrepareMs) += alignMs;
+-            const bool profile = std::getenv("RAWR_HDRP_PROFILE") != nullptr;
+-            // Query order: 0 start, 1 warp, [2 mismatch when profiling], then fft, norm, merge.
+-            const auto mergeTiming = executeChunk(14u, i, profile ? 6u : 5u, [&] {
+-                recordTimestamp(0u);
+-                recorder.recordCompanionMerge(command_, frameCount, i, [&](std::uint32_t k) {
+-                    if (k == 5u) {
+-                        if (profile) recordTimestamp(2u);  // mismatch boundary, profiling only
+-                    } else {
+-                        recordTimestamp(profile && k >= 2u ? k + 1u : k);
+-                    }
+-                });
+-                recordTimestamp(profile ? 5u : 4u);
+-            });
+-            double mergeMs = mergeTiming.first;
+-            if (!mergeTiming.second.empty()) {
+-                mergeMs = 0.0;
+-                for (const double ms : mergeTiming.second) mergeMs += ms;
+-            }
+-            timings.accumulationMs += mergeMs;
+-            if (profile && mergeTiming.second.size() == 5u)
+-                std::fprintf(stderr, "hdrq_profile pass=%u frame=%u warp=%.3f mismatch=%.3f fft=%.3f norm=%.3f merge=%.3f\n",
+-                             pass, i, mergeTiming.second[0], mergeTiming.second[1], mergeTiming.second[2],
+-                             mergeTiming.second[3], mergeTiming.second[4]);
+-            if (pass == 3u) {
+-                ++companions;
+-                if (frameConsumed) frameConsumed(i);
+-            }
+-        }
+-        timings.finalizeMs += gpuOrWall(executeChunk(15u, ref, 2u, [&] {
+-            recordTimestamp(0u);
+-            recorder.recordPassFinish(command_, frameCount);
+-            recordTimestamp(1u);
+-        }));
+-    }
+-    timings.finalizeMs += gpuOrWall(executeChunk(20u, ref, 2u, [&] {
+-        recordTimestamp(0u);
+-        recorder.recordFinalize(command_);
+-        recordTimestamp(1u);
+-    }));
+-    timings.totalMs = std::chrono::duration<double, std::milli>(Clock::now() - runBegin).count();
+-    const auto& out = arena_.image("hdrp_output");
+-    const auto& cfa = arena_.image("hdrp_cfa");
+-    BurstRunResult result{ref,
+-                          frameCount,
+-                          out.image,
+-                          out.view,
+-                          out.format,
+-                          out.extent,
+-                          arena_.physicalImageBytes(),
+-                          arena_.physicalBufferBytes(),
+-                          4u * (2u + companions * 2u) + 1u,
+-                          resourcesReused_,
+-                          pipelineCacheReused_,
+-                          timings};
+-    result.cfaImage = cfa.image;
+-    result.cfaView = cfa.view;
+-    return result;
+-}
+-void AndroidBurstCoordinator::releaseScratch() noexcept {
+-    if (device_ && fence_ && submissionInFlight_) {
+-        (void)vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+-        submissionInFlight_ = false;
+-    }
+-    destroyHostBuffers();
+-    arena_.reset();
+-    arenaReady_ = false;
+-    layoutsInitialized_ = false;
+-    resourcesReused_ = false;
+-    pendingInitializeMs_ = 0.0;
+-}
+-void AndroidBurstCoordinator::reset() noexcept {
+-    std::lock_guard<std::mutex> lock(initMutex_);
+-    resetLocked();
+-}
+-void AndroidBurstCoordinator::resetLocked() noexcept {
+-    if (device_ && fence_ && submissionInFlight_) {
+-        (void)vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+-        submissionInFlight_ = false;
+-    }
+-    resetInfraLocked();
+-    arena_.reset();
+-    queueFamily_ = width_ = height_ = 0;
+-    outputScale_ = 0.0f;
+-    arenaReady_ = false;
+-    layoutsInitialized_ = false;
+-    submissionInFlight_ = false;
+-    resourcesReused_ = false;
+-    pipelineCacheReused_ = false;
+-    pendingInitializeMs_ = 0.0;
+-    submit_ = {};
+-    stageSink_ = {};
+-}
+-}  // namespace rawr::raw_gpu_pipeline
+diff --git b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+deleted file mode 100644
+index 51b1d7147ae0844091cfec5aa9ad8e231a3d7f0b..0000000000000000000000000000000000000000
+--- b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
++++ /dev/null
+@@ -1,151 +0,0 @@
+-#version 450
+-// Port of hdr-plus-swift calculate_abs_diff_rgba + calculate_mismatch_rgba
+-// raised-cosine-weighted mean |ref - aligned| over twice
+-// the tile support, relative to the tile's shot noise (Liba 2019 "spatially
+-// varying temporal merging"). One 16x16 workgroup per tile, one lane per
+-// window pixel, tree reduction (upstream sums sequentially in one thread).
+-layout(local_size_x = 16, local_size_y = 16) in;
+-layout(set = 0, binding = 0, rgba32f) readonly uniform image2D refRgba;
+-layout(set = 0, binding = 1, rgba32f) readonly uniform image2D alignedRgba;
+-layout(set = 0, binding = 2, rgba32f) readonly uniform image2D rms;
+-layout(set = 0, binding = 3, r32f) writeonly uniform image2D mismatch;
+-// Uniform B only: tile confidence stored in existing bracket-only weightSum
+-// image at the tile coordinate; B bracketed never writes this binding.
+-layout(set = 0, binding = 4, r32f) writeonly uniform image2D independentSupport;
+-layout(push_constant) uniform P {
+-    ivec2 tiles;
+-    ivec2 rgbaSize;
+-    float exposureFactor;  // companion exposure / reference exposure (1 = uniform)
+-    float unused0;
+-    float unused1;
+-    float unused2;
+-    vec4 slopeRaw;
+-    vec4 offsetRaw;
+-    vec4 referenceBlack;
+-    int measuredNoise;
+-    int uniformExposure;
+-    float referenceWhite;
+-    float gainForMask;
+-} p;
+-
+-const float PI = 3.14159265358979323846;
+-shared vec4 sDiff[256];
+-shared float sWeight[256];
+-shared float sSupport[64];
+-// Tile-local 10x10 halo staging: 200 global image reads per tile instead of
+-// 1152 overlapping reads. The shared cache is populated by the 16x16 group.
+-shared vec4 sReferenceHalo[100];
+-shared vec4 sAlignedHalo[100];
+-
+-// Wronski 2019, Section 5.2, noise-corrected mean-color difference.
+-// This is a B-private support decision, not a Fourier/Wiener noise weight.
+-float pointSupport(ivec2 pix, ivec2 t0) {
+-    vec4 sumRef = vec4(0.0), sumAl = vec4(0.0), sumRefSq = vec4(0.0);
+-    bool clipped = false;
+-    for (int yy = -1; yy <= 1; ++yy) {
+-        for (int xx = -1; xx <= 1; ++xx) {
+-            ivec2 q = clamp(pix + ivec2(xx, yy), ivec2(0), p.rgbaSize - 1);
+-            ivec2 localHalo = pix - t0 + ivec2(xx + 1, yy + 1);
+-            int h = localHalo.y * 10 + localHalo.x;
+-            vec4 r = sReferenceHalo[h];
+-            vec4 a = sAlignedHalo[h];
+-            sumRef += r;
+-            sumAl += a;
+-            sumRefSq += r * r;
+-            clipped = clipped || any(greaterThan(r, vec4(p.referenceWhite * 0.985))) ||
+-                                 any(greaterThan(a, vec4(p.referenceWhite * 0.985)));
+-        }
+-    }
+-    if (clipped) return 1.0; // Preserve established clipped behavior.
+-    vec4 refMean = sumRef / 9.0;
+-    vec4 alMean = sumAl / 9.0;
+-    // Bounded companion exposure gain from the exact captured frame metadata.
+-    // It does not replace separate scene-flicker detection, which remains
+-    // outside the confident-rejection domain.
+-    vec4 alCorrected = p.referenceBlack +
+-        (alMean - p.referenceBlack) / clamp(p.gainForMask, 0.94, 1.06);
+-    vec4 structuralVar = max(sumRefSq / 9.0 - refMean * refMean, vec4(0.0));
+-    vec4 sensorVar = max(p.slopeRaw * max(refMean-p.referenceBlack, vec4(0.0)) + p.offsetRaw,
+-                         vec4(1.0e-5));
+-    vec4 sigma = max(sqrt(structuralVar), sqrt(sensorVar));
+-    vec4 modeledDiff = sqrt(2.0 * sensorVar) / 3.0;
+-    vec4 meanDiff = abs(refMean - alCorrected);
+-    vec4 corrected = meanDiff * meanDiff * meanDiff /
+-                    (meanDiff * meanDiff + modeledDiff * modeledDiff + vec4(1.0e-6));
+-    vec4 z = corrected / max(sigma,vec4(1.0e-5));
+-    vec4 c = clamp(vec4(3.5) * exp(-(z * z)) - vec4(1.0), vec4(0.0), vec4(1.0));
+-    // Robust median of CFA sites; a single aliasing channel must not classify
+-    // a stationary real high-frequency structure as moving foreground.
+-    float hi = max(max(c.x,c.y),max(c.z,c.w));
+-    float lo = min(min(c.x,c.y),min(c.z,c.w));
+-    return clamp((c.x+c.y+c.z+c.w-hi-lo)*0.5,0.0,1.0);
+-}
+-
+-void main() {
+-    ivec2 g = ivec2(gl_WorkGroupID.xy);
+-    if (any(greaterThanEqual(g, p.tiles))) return;
+-    const int ts = 8;
+-    ivec2 l = ivec2(gl_LocalInvocationID.xy);
+-    uint lane = gl_LocalInvocationIndex;
+-    ivec2 t0 = g * ts;
+-    // Upstream clamps the end to size-1 (exclusive), dropping the last row/column.
+-    ivec2 start = max(ivec2(0), t0 - ts / 2);
+-    ivec2 end = min(p.rgbaSize - 1, t0 + ts * 3 / 2);
+-    ivec2 q = t0 - ts / 2 + l;  // window pixel; l is its offset (dx + shift)
+-    float angle = -2.0 * PI / float(ts);
+-    vec4 d = vec4(0.0);
+-    float w = 0.0;
+-    if (all(greaterThanEqual(q, start)) && all(lessThan(q, end))) {
+-        w = (0.5 - 0.17 * cos(-angle * (float(l.x) + 0.5))) * (0.5 - 0.17 * cos(-angle * (float(l.y) + 0.5)));
+-        d = w * abs(imageLoad(refRgba, q) - imageLoad(alignedRgba, q));
+-    }
+-    sDiff[lane] = d;
+-    sWeight[lane] = w;
+-    barrier();
+-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+-        if (lane < stride) {
+-            sDiff[lane] += sDiff[lane + stride];
+-            sWeight[lane] += sWeight[lane + stride];
+-        }
+-        barrier();
+-    }
+-    // Every invocation participates in the shared-memory barrier, including
+-    // lanes not used by the 8x8 support values.
+-    if (p.uniformExposure != 0 && p.measuredNoise != 0 && lane < 100u) {
+-        ivec2 h = ivec2(int(lane % 10u), int(lane / 10u));
+-        ivec2 q = clamp(t0 + h - ivec2(1), ivec2(0), p.rgbaSize - 1);
+-        sReferenceHalo[lane] = imageLoad(refRgba, q);
+-        sAlignedHalo[lane] = imageLoad(alignedRgba, q);
+-    }
+-    barrier();
+-    if (p.uniformExposure != 0 && p.measuredNoise != 0 && lane < 64u) {
+-        ivec2 local = ivec2(int(lane % 8u), int(lane / 8u));
+-        sSupport[lane] = pointSupport(t0 + local, t0);
+-    } else if (lane < 64u) {
+-        sSupport[lane] = 1.0; // No empirical support: no false motion.
+-    }
+-    barrier();
+-    if (lane != 0u) return;
+-    if (p.uniformExposure != 0) {
+-        // 25th percentile of 8x8 local confidence, insensitive to an isolated
+-        // bad pixel but protective when a moving edge occupies part of a tile.
+-        // Four overlapping 8x8 Fourier passes soften tile transitions.
+-        float worst16[16];
+-        for (int k=0;k<16;++k) worst16[k]=2.0;
+-        for (int k=0;k<64;++k) {
+-            float v=sSupport[k];
+-            for (int j=0;j<16;++j) {
+-                if (v<worst16[j]) {
+-                    float tmp=worst16[j];
+-                    worst16[j]=v;
+-                    v=tmp;
+-                }
+-            }
+-        }
+-        imageStore(independentSupport,g,vec4(clamp(worst16[15],0.0,1.0)));
+-    }
+-    vec4 noise = imageLoad(rms, g);
+-    vec4 diff = sDiff[0] / sWeight[0];
+-    vec4 m4 = diff / sqrt(0.5 * noise + 0.5 * noise / p.exposureFactor + 1.0);
+-    imageStore(mismatch, g, vec4(0.25 * (m4.x + m4.y + m4.z + m4.w)));
+-}
+diff --git b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
+deleted file mode 100644
+index e6c31792c8e019fdcccc960296ed78aedde45e7a..0000000000000000000000000000000000000000
+--- b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqPrivateHeader.hpp
++++ /dev/null
+@@ -1,183 +0,0 @@
+-#pragma once
+-#include <rawr/raw_gpu_pipeline/MultiframeRecorder.h>
+-#include <rawr/raw_gpu_pipeline/ResourceArena.h>
+-#include <rawr/raw_gpu_pipeline/VulkanExecutor.h>
+-#include <rawr/raw_merge_hdrplus_gpu/RawMergeHdrPlusGpu.h>
+-#include <array>
+-#include <cstdint>
+-#include <functional>
+-#include <vector>
+-
+-namespace rawr::raw_gpu_pipeline {
+-
+-// Scratch for the HDR+ spatial merge (~0.5 GB at 12.5 MP vs ~1.3 GB Wronski):
+-// padded raw-domain reference/companion frames, their pyramids, one aligned
+-// companion, blur/weight planes, the accumulator and the RGBA16F output.
+-ScratchLayout makeHdrPlusScratchLayout(const rawr::raw_merge_hdrplus_gpu::Geometry& geometry);
+-
+-// Records the HDR+ spatial merge against an arena built from
+-// makeHdrPlusScratchLayout. Frames stay in raw units (reference black) until
+-// recordFinalize normalizes into "hdrp_output". Every method leaves its
+-// results in the arena, so each may run in a separate submission.
+-class HdrPlusRecorder final {
+-   public:
+-    HdrPlusRecorder(ResourceArena& arena, VulkanExecutor& executor, rawr::raw_merge_hdrplus_gpu::Config config,
+-                    rawr::raw_merge_hdrplus_gpu::Geometry geometry);
+-    void setHotPixels(VkBuffer buffer, std::uint32_t count) noexcept {
+-        hotPixelBuffer_ = buffer;
+-        hotPixelCount_ = count;
+-    }
+-    // Scale applied to the next companion's black-subtracted signal
+-    // (reference exposure / companion exposure); 1 when they match.
+-    void setCompanionGain(float gain) noexcept { companionGain_ = gain; }
+-    // Bracketed bursts: rebuilds the reference pyramid with its finest-level
+-    // input clamped to clampTo (raw units); later companion pyramids use the
+-    // same clamp. 0 restores unclamped pyramids for later builds.
+-    void recordClampedReferencePyramid(VkCommandBuffer command, float clampTo);
+-    void setPyramidClamp(float clampTo) noexcept { pyramidClamp_ = clampTo; }
+-    [[nodiscard]] const std::array<float, 4>& referenceBlack() const noexcept { return reference_.blackByPhase; }
+-    // Reference: padded frame, pyramid, blurred copy, noise level, and the
+-    // accumulator initialized with ref / frameCount.
+-    void recordReference(VkCommandBuffer command, VkImageView rawU16, const RawNormalization& frame,
+-                         std::uint32_t frameCount);
+-    // Reference padded frame and pyramid only (frequency merge passes).
+-    void recordReferencePrepare(VkCommandBuffer command, VkImageView rawU16, const RawNormalization& frame);
+-    // Per-pass padding offsets inside the fixed padded extent (frequency merge).
+-    void setPads(std::uint32_t left, std::uint32_t top) noexcept {
+-        geometry_.padLeft = left;
+-        geometry_.padTop = top;
+-    }
+-    // Companion padded frame only (frequency merge passes reusing alignment).
+-    void recordCompanionPadded(VkCommandBuffer command, VkImageView rawU16, const RawNormalization& frame);
+-    // Companion: padded frame and pyramid.
+-    void recordCompanionPrepare(VkCommandBuffer command, VkImageView rawU16, const RawNormalization& frame);
+-    // Companion: one coarse-to-fine alignment level against the reference
+-    // pyramid. Record levels levelCount()-1 down to 0 in order; each may be a
+-    // separate submission (bounds GPU stalls for interleaved preview work).
+-    [[nodiscard]] std::uint32_t levelCount() const noexcept { return std::uint32_t(geometry_.levels.size()); }
+-    // mark(k), when set, is called after upsample+correction (1) and tile cost (2).
+-    void recordCompanionAlignLevel(VkCommandBuffer command, std::uint32_t level,
+-                                   const std::function<void(std::uint32_t)>& mark = {});
+-    // Companion: warp, blur, robust weight and weighted accumulation.
+-    // mark(k), when set, is called after warp (1), blur (2) and weight (3)
+-    // so callers can write sub-stage GPU timestamps.
+-    void recordCompanionMerge(VkCommandBuffer command, std::uint32_t frameCount,
+-                              const std::function<void(std::uint32_t)>& mark = {});
+-    void recordFinalize(VkCommandBuffer command);
+-
+-   private:
+-    ResourceArena& arena_;
+-    VulkanExecutor& executor_;
+-    rawr::raw_merge_hdrplus_gpu::Config config_{};
+-    rawr::raw_merge_hdrplus_gpu::Geometry geometry_{};
+-    RawNormalization reference_{};
+-    VkBuffer hotPixelBuffer_ = VK_NULL_HANDLE;
+-    std::uint32_t hotPixelCount_ = 0;
+-    float companionGain_ = 1.0f;
+-    float pyramidClamp_ = 0.0f;  // finest-level pyramid input clamp (raw units), 0 = none
+-
+-    void recordPrepare(VkCommandBuffer, bool reference, VkImageView rawU16, const RawNormalization&);
+-    void recordPyramid(VkCommandBuffer, bool reference);
+-    // Separable binomial blur of a width x height window (x pass into tmp).
+-    void recordBlur(VkCommandBuffer, const ArenaImage& src, std::array<std::int32_t, 2> srcOffset,
+-                    const ArenaImage& tmp, const ArenaImage& dst, std::uint32_t width, std::uint32_t height,
+-                    std::int32_t kernelSize, std::int32_t stride, bool quantizeHalf);
+-};
+-
+-// Scratch for the HDR+ frequency merge: the alignment resources of the
+-// spatial layout plus RGBA tiles, three spectra, per-tile statistics and the
+-// raw accumulator (~0.85 GB at 12.5 MP).
+-ScratchLayout makeHdrPlusFrequencyScratchLayout(const rawr::raw_merge_hdrplus_gpu::FrequencyGeometry& geometry,
+-                                                std::uint32_t width, std::uint32_t height);
+-
+-// Records the HDR+ frequency-domain merge (upstream "Higher quality"): four
+-// half-tile-shifted passes; per pass the reference spectrum, then per
+-// companion alignment (via HdrPlusRecorder) and a per-frequency Wiener merge,
+-// then deconvolution, inverse transform and accumulation.
+-class HdrPlusFrequencyRecorder final {
+-   public:
+-    HdrPlusFrequencyRecorder(ResourceArena& arena, VulkanExecutor& executor, rawr::raw_merge_hdrplus_gpu::Config config,
+-                             rawr::raw_merge_hdrplus_gpu::FrequencyGeometry geometry);
+-    HdrPlusRecorder& alignment() noexcept { return align_; }
+-    // Bracketed exposure: exposureFactors[i] = frame i exposure / reference
+-    // exposure (all 1, or empty, merges exactly like the uniform path) and
+-    // each frame's white level for the clipped-highlights norm.
+-    void setExposure(std::vector<float> exposureFactors, std::vector<float> whiteLevels);
+-    // Uniform merges of frames whose exposure drifted (AE settling in the
+-    // ZSL ring): gains[i] = reference exposure / frame i exposure scales each
+-    // companion to the reference before alignment and merge, as upstream's
+-    // prepare_texture does; the merge itself stays the uniform one.
+-    void setExposureNormalization(std::vector<float> gains) { normalizationGains_ = std::move(gains); }
+-    // Measured from the actual RAW burst, never the Camera2 profile. Missing
+-    // evidence remains UNKNOWN; it never silently substitutes a preset.
+-    void setMeasuredRawNoise(const std::array<float, 4>& slope, const std::array<float, 4>& offset,
+-                             bool measured) noexcept {
+-        rawNoiseSlope_ = slope; rawNoiseOffset_ = offset; rawNoiseMeasured_ = measured;
+-    }
+-    void beginPass(std::uint32_t pass) noexcept;
+-    // Align-once mode: companions are aligned (and the reference prepared)
+-    // only in pass 0; later passes read through a coordinate offset.
+-    [[nodiscard]] bool alignsThisPass() const noexcept { return !config_.frequencyAlignOnce || pass_ == 0u; }
+-    void recordReference(VkCommandBuffer command, VkImageView rawU16, const RawNormalization& frame);
+-    // Companion for this pass: padded frame + pyramid + all alignment levels
+-    // when alignsThisPass() (storing the shifts in slot), else the padded frame.
+-    void recordCompanionAlign(VkCommandBuffer command, VkImageView rawU16, const RawNormalization& frame,
+-                              std::uint32_t slot);
+-    // The same as two submissions, so preview work can interleave: padded
+-    // frame, pyramid and the coarse levels; then the finest level (most of
+-    // the cost) and the shift store. Only when alignsThisPass().
+-    void recordCompanionAlignCoarse(VkCommandBuffer command, VkImageView rawU16, const RawNormalization& frame,
+-                                    std::uint32_t slot);
+-    void recordCompanionAlignFinest(VkCommandBuffer command, std::uint32_t slot);
+-    // mark(k), when set, is called after warp (1), mismatch+spectrum (2) and
+-    // mismatch normalization (3) for sub-stage GPU timestamps.
+-    void recordCompanionMerge(VkCommandBuffer command, std::uint32_t frameCount, std::uint32_t slot,
+-                              const std::function<void(std::uint32_t)>& mark = {});
+-    void recordPassFinish(VkCommandBuffer command, std::uint32_t frameCount);
+-    void recordFinalize(VkCommandBuffer command) { align_.recordFinalize(command); }
+-    // Bracketed bursts: companions brighter than the reference. Merge the
+-    // others first, then call recordSubstitutionSource once per pass before
+-    // the first brighter companion: it captures the running merge (reference
+-    // + dark companions) as the source for brighter frames' clipped cells.
+-    [[nodiscard]] bool brighterCompanion(std::uint32_t slot) const noexcept {
+-        return !uniformExposure_ && frameExposure(slot) > 1.001f;
+-    }
+-    // Bracketed bursts: frame exposure / reference exposure (1 otherwise).
+-    [[nodiscard]] float exposureFactor(std::uint32_t slot) const noexcept { return frameExposure(slot); }
+-    void recordSubstitutionSource(VkCommandBuffer command);
+-    [[nodiscard]] bool needsSubstitutionSource(std::uint32_t slot) const noexcept {
+-        return brighterCompanion(slot) && !substitutionReady_;
+-    }
+-
+-   private:
+-    ResourceArena& arena_;
+-    VulkanExecutor& executor_;
+-    rawr::raw_merge_hdrplus_gpu::Config config_{};
+-    rawr::raw_merge_hdrplus_gpu::FrequencyGeometry geometry_{};
+-    HdrPlusRecorder align_;
+-    std::uint32_t pass_ = 0;
+-    std::vector<float> exposureFactors_{};
+-    std::vector<float> whiteLevels_{};
+-    std::vector<float> normalizationGains_{};
+-    bool uniformExposure_ = true;
+-    std::array<float, 4> rawNoiseSlope_{};
+-    std::array<float, 4> rawNoiseOffset_{};
+-    std::array<float, 4> referenceBlack_{};
+-    float referenceWhite_ = 65535.0f;
+-    bool rawNoiseMeasured_ = false;
+-    bool substitutionReady_ = false;  // this pass's hdrq_out_rgba holds the dark-frame estimate
+-    float pyramidClamp_ = 0.0f;       // reference pyramid clamp this pass (raw units), 0 = none
+-    float frameExposure(std::uint32_t slot) const noexcept {
+-        return slot < exposureFactors_.size() ? exposureFactors_[slot] : 1.0f;
+-    }
+-    // Companion prepare gain: bracketed exposure, else the drift normalization.
+-    float frameGain(std::uint32_t slot) const noexcept {
+-        if (!exposureFactors_.empty()) return 1.0f / frameExposure(slot);
+-        return slot < normalizationGains_.size() ? normalizationGains_[slot] : 1.0f;
+-    }
+-    // Raw-pixel offset from this pass's padded coordinates into the prepared frame.
+-    std::array<std::int32_t, 2> passOffset() const noexcept;
+-    VkDeviceSize alignSlotBytes() const noexcept;
+-};
+-
+-}  // namespace rawr::raw_gpu_pipeline
+diff --git b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp a/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
+deleted file mode 100644
+index 59b8009dfda4bc76ab15e41b926ae524fe8fdad2..0000000000000000000000000000000000000000
+--- b/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp
++++ /dev/null
+@@ -1,717 +0,0 @@
+-#include <rawr/raw_gpu_pipeline/VulkanExecutor.h>
+-
+-#include <algorithm>
+-#include <array>
+-#include <stdexcept>
+-#include <string>
+-
+-#include "mf_a11_finalize_prod.h"
+-#include "mf_a11_finalize_trace.h"
+-#include "mf_accumulate_prod.h"
+-#include "mf_accumulate_trace.h"
+-#include "mf_affine_fit_prod.h"
+-#include "mf_affine_fit_trace.h"
+-#include "mf_affine_gate_prod.h"
+-#include "mf_noise_estimate_prod.h"
+-#include "mf_noise_estimate_trace.h"
+-#include "mf_fallback_chroma_prod.h"
+-#include "mf_fallback_chroma_trace.h"
+-#include "mf_hot_pixel_conceal_prod.h"
+-#include "mf_hot_pixel_conceal_trace.h"
+-#include "mf_hdrp_prepare_prod.h"
+-#include "mf_hdrp_prepare_trace.h"
+-#include "mf_hdrp_hot_pixel_prod.h"
+-#include "mf_hdrp_hot_pixel_trace.h"
+-#include "mf_hdrp_avg_pool_prod.h"
+-#include "mf_hdrp_avg_pool_trace.h"
+-#include "mf_hdrp_blur_prod.h"
+-#include "mf_hdrp_blur_trace.h"
+-#include "mf_hdrp_upsample_align_prod.h"
+-#include "mf_hdrp_upsample_align_trace.h"
+-#include "mf_hdrp_correct_upsampling_prod.h"
+-#include "mf_hdrp_correct_upsampling_trace.h"
+-#include "mf_hdrp_tile_diff_prod.h"
+-#include "mf_hdrp_tile_diff_trace.h"
+-#include "mf_hdrp_best_tile_prod.h"
+-#include "mf_hdrp_best_tile_trace.h"
+-#include "mf_hdrp_warp_prod.h"
+-#include "mf_hdrp_warp_trace.h"
+-#include "mf_hdrp_color_diff_prod.h"
+-#include "mf_hdrp_color_diff_trace.h"
+-#include "mf_hdrp_column_sum_prod.h"
+-#include "mf_hdrp_column_sum_trace.h"
+-#include "mf_hdrp_mean_prod.h"
+-#include "mf_hdrp_mean_trace.h"
+-#include "mf_hdrp_merge_weight_prod.h"
+-#include "mf_hdrp_merge_weight_trace.h"
+-#include "mf_hdrp_accumulate_prod.h"
+-#include "mf_hdrp_accumulate_trace.h"
+-#include "mf_hdrp_finalize_prod.h"
+-#include "mf_hdrp_finalize_trace.h"
+-#include "mf_hdrq_to_rgba_prod.h"
+-#include "mf_hdrq_to_rgba_trace.h"
+-#include "mf_hdrq_warp_rgba_prod.h"
+-#include "mf_hdrq_warp_rgba_trace.h"
+-#include "mf_hdrq_rms_prod.h"
+-#include "mf_hdrq_rms_trace.h"
+-#include "mf_hdrq_mismatch_prod.h"
+-#include "mf_hdrq_mismatch_trace.h"
+-#include "mf_hdrq_region_mean_prod.h"
+-#include "mf_hdrq_region_mean_trace.h"
+-#include "mf_hdrq_mismatch_norm_prod.h"
+-#include "mf_hdrq_mismatch_norm_trace.h"
+-#include "mf_hdrq_seed_dft_prod.h"
+-#include "mf_hdrq_seed_dft_trace.h"
+-#include "mf_hdrq_forward_dft_prod.h"
+-#include "mf_hdrq_forward_dft_trace.h"
+-#include "mf_hdrq_merge_prod.h"
+-#include "mf_hdrq_merge_trace.h"
+-#include "mf_hdrq_deconvolute_prod.h"
+-#include "mf_hdrq_deconvolute_trace.h"
+-#include "mf_hdrq_backward_dft_prod.h"
+-#include "mf_hdrq_backward_dft_trace.h"
+-#include "mf_hdrq_border_prod.h"
+-#include "mf_hdrq_border_trace.h"
+-#include "mf_hdrq_accumulate_prod.h"
+-#include "mf_hdrq_accumulate_trace.h"
+-#include "mf_hdrq_shift_table_prod.h"
+-#include "mf_hdrq_shift_table_trace.h"
+-#include "mf_hdrq_highlights_norm_prod.h"
+-#include "mf_hdrq_highlights_norm_trace.h"
+-#include "mf_hdrq_normalize_prod.h"
+-#include "mf_hdrq_normalize_trace.h"
+-#include "mf_affine_gate_trace.h"
+-#include "mf_alignment_local5_prod.h"
+-#include "mf_alignment_local5_trace.h"
+-#include "mf_block_match_prod.h"
+-#include "mf_block_match_trace.h"
+-#include "mf_flow_dense_smooth_prod.h"
+-#include "mf_flow_dense_smooth_trace.h"
+-#include "mf_flow_upsample_prod.h"
+-#include "mf_flow_upsample_trace.h"
+-#include "mf_kernel_estimate_prod.h"
+-#include "mf_kernel_estimate_trace.h"
+-#include "mf_lk_refine_prod.h"
+-#include "mf_lk_refine_trace.h"
+-#include "mf_pyramid_decimate_prod.h"
+-#include "mf_pyramid_decimate_trace.h"
+-#include "mf_pyramid_gaussian_prod.h"
+-#include "mf_pyramid_gaussian_trace.h"
+-#include "mf_raw_normalize_prod.h"
+-#include "mf_raw_normalize_trace.h"
+-#include "mf_reference_accumulate_prod.h"
+-#include "mf_reference_accumulate_trace.h"
+-#include "mf_robust_erode5_prod.h"
+-#include "mf_robust_erode5_trace.h"
+-#include "mf_robust_flow_scale_prod.h"
+-#include "mf_robust_flow_scale_trace.h"
+-#include "mf_robust_guide_prod.h"
+-#include "mf_robust_guide_trace.h"
+-#include "mf_robust_photometric_prod.h"
+-#include "mf_robust_photometric_trace.h"
+-#include "mf_robust_stats_prod.h"
+-#include "mf_robust_stats_trace.h"
+-#include "mf_robust_warp_prod.h"
+-#include "mf_robust_warp_trace.h"
+-#include "mf_support_accumulate_prod.h"
+-#include "mf_support_accumulate_trace.h"
+-namespace rawr::raw_gpu_pipeline {
+-namespace {
+-struct B {
+-    uint32_t n;
+-    VkDescriptorType t;
+-};
+-struct Spec {
+-    const char* name;
+-    const unsigned char* prod;
+-    size_t prodN;
+-    const unsigned char* trace;
+-    size_t traceN;
+-    std::vector<B> b;
+-};
+-const std::array<Spec, static_cast<size_t>(ShaderId::Count)> specs{{{"raw_normalize",
+-                                   mf_raw_normalize_prod_spv,
+-                                   mf_raw_normalize_prod_spv_size,
+-                                   mf_raw_normalize_trace_spv,
+-                                   mf_raw_normalize_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"alignment_local5",
+-                                   mf_alignment_local5_prod_spv,
+-                                   mf_alignment_local5_prod_spv_size,
+-                                   mf_alignment_local5_trace_spv,
+-                                   mf_alignment_local5_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"pyramid_gaussian",
+-                                   mf_pyramid_gaussian_prod_spv,
+-                                   mf_pyramid_gaussian_prod_spv_size,
+-                                   mf_pyramid_gaussian_trace_spv,
+-                                   mf_pyramid_gaussian_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"pyramid_decimate",
+-                                   mf_pyramid_decimate_prod_spv,
+-                                   mf_pyramid_decimate_prod_spv_size,
+-                                   mf_pyramid_decimate_trace_spv,
+-                                   mf_pyramid_decimate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"flow_upsample",
+-                                   mf_flow_upsample_prod_spv,
+-                                   mf_flow_upsample_prod_spv_size,
+-                                   mf_flow_upsample_trace_spv,
+-                                   mf_flow_upsample_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"block_match",
+-                                   mf_block_match_prod_spv,
+-                                   mf_block_match_prod_spv_size,
+-                                   mf_block_match_trace_spv,
+-                                   mf_block_match_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"lk_refine",
+-                                   mf_lk_refine_prod_spv,
+-                                   mf_lk_refine_prod_spv_size,
+-                                   mf_lk_refine_trace_spv,
+-                                   mf_lk_refine_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"flow_dense_smooth",
+-                                   mf_flow_dense_smooth_prod_spv,
+-                                   mf_flow_dense_smooth_prod_spv_size,
+-                                   mf_flow_dense_smooth_trace_spv,
+-                                   mf_flow_dense_smooth_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"kernel_estimate",
+-                                   mf_kernel_estimate_prod_spv,
+-                                   mf_kernel_estimate_prod_spv_size,
+-                                   mf_kernel_estimate_trace_spv,
+-                                   mf_kernel_estimate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"robust_guide",
+-                                   mf_robust_guide_prod_spv,
+-                                   mf_robust_guide_prod_spv_size,
+-                                   mf_robust_guide_trace_spv,
+-                                   mf_robust_guide_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"robust_stats",
+-                                   mf_robust_stats_prod_spv,
+-                                   mf_robust_stats_prod_spv_size,
+-                                   mf_robust_stats_trace_spv,
+-                                   mf_robust_stats_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"robust_warp",
+-                                   mf_robust_warp_prod_spv,
+-                                   mf_robust_warp_prod_spv_size,
+-                                   mf_robust_warp_trace_spv,
+-                                   mf_robust_warp_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"robust_flow_scale",
+-                                   mf_robust_flow_scale_prod_spv,
+-                                   mf_robust_flow_scale_prod_spv_size,
+-                                   mf_robust_flow_scale_trace_spv,
+-                                   mf_robust_flow_scale_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"robust_photometric",
+-                                   mf_robust_photometric_prod_spv,
+-                                   mf_robust_photometric_prod_spv_size,
+-                                   mf_robust_photometric_trace_spv,
+-                                   mf_robust_photometric_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+-                                    {7, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+-                                    {8, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"robust_erode5",
+-                                   mf_robust_erode5_prod_spv,
+-                                   mf_robust_erode5_prod_spv_size,
+-                                   mf_robust_erode5_trace_spv,
+-                                   mf_robust_erode5_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"affine_fit",
+-                                   mf_affine_fit_prod_spv,
+-                                   mf_affine_fit_prod_spv_size,
+-                                   mf_affine_fit_trace_spv,
+-                                   mf_affine_fit_trace_spv_size,
+-                                  {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+-                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+-                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+-                                    {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"affine_gate",
+-                                   mf_affine_gate_prod_spv,
+-                                   mf_affine_gate_prod_spv_size,
+-                                   mf_affine_gate_trace_spv,
+-                                   mf_affine_gate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+-                                    {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"support_accumulate",
+-                                   mf_support_accumulate_prod_spv,
+-                                   mf_support_accumulate_prod_spv_size,
+-                                   mf_support_accumulate_trace_spv,
+-                                   mf_support_accumulate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"accumulate",
+-                                   mf_accumulate_prod_spv,
+-                                   mf_accumulate_prod_spv_size,
+-                                   mf_accumulate_trace_spv,
+-                                   mf_accumulate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"reference_accumulate",
+-                                   mf_reference_accumulate_prod_spv,
+-                                   mf_reference_accumulate_prod_spv_size,
+-                                   mf_reference_accumulate_trace_spv,
+-                                   mf_reference_accumulate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"a11_finalize",
+-                                   mf_a11_finalize_prod_spv,
+-                                   mf_a11_finalize_prod_spv_size,
+-                                   mf_a11_finalize_trace_spv,
+-                                   mf_a11_finalize_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"noise_estimate",
+-                                   mf_noise_estimate_prod_spv,
+-                                   mf_noise_estimate_prod_spv_size,
+-                                   mf_noise_estimate_trace_spv,
+-                                   mf_noise_estimate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"fallback_chroma",
+-                                   mf_fallback_chroma_prod_spv,
+-                                   mf_fallback_chroma_prod_spv_size,
+-                                   mf_fallback_chroma_trace_spv,
+-                                   mf_fallback_chroma_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                                    {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hot_pixel_conceal",
+-                                   mf_hot_pixel_conceal_prod_spv,
+-                                   mf_hot_pixel_conceal_prod_spv_size,
+-                                   mf_hot_pixel_conceal_trace_spv,
+-                                   mf_hot_pixel_conceal_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_prepare",
+-                                   mf_hdrp_prepare_prod_spv,
+-                                   mf_hdrp_prepare_prod_spv_size,
+-                                   mf_hdrp_prepare_trace_spv,
+-                                   mf_hdrp_prepare_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrp_hot_pixel",
+-                                   mf_hdrp_hot_pixel_prod_spv,
+-                                   mf_hdrp_hot_pixel_prod_spv_size,
+-                                   mf_hdrp_hot_pixel_trace_spv,
+-                                   mf_hdrp_hot_pixel_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_avg_pool",
+-                                   mf_hdrp_avg_pool_prod_spv,
+-                                   mf_hdrp_avg_pool_prod_spv_size,
+-                                   mf_hdrp_avg_pool_trace_spv,
+-                                   mf_hdrp_avg_pool_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrp_blur",
+-                                   mf_hdrp_blur_prod_spv,
+-                                   mf_hdrp_blur_prod_spv_size,
+-                                   mf_hdrp_blur_trace_spv,
+-                                   mf_hdrp_blur_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrp_upsample_align",
+-                                   mf_hdrp_upsample_align_prod_spv,
+-                                   mf_hdrp_upsample_align_prod_spv_size,
+-                                   mf_hdrp_upsample_align_trace_spv,
+-                                   mf_hdrp_upsample_align_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_correct_upsampling",
+-                                   mf_hdrp_correct_upsampling_prod_spv,
+-                                   mf_hdrp_correct_upsampling_prod_spv_size,
+-                                   mf_hdrp_correct_upsampling_trace_spv,
+-                                   mf_hdrp_correct_upsampling_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_tile_diff",
+-                                   mf_hdrp_tile_diff_prod_spv,
+-                                   mf_hdrp_tile_diff_prod_spv_size,
+-                                   mf_hdrp_tile_diff_trace_spv,
+-                                   mf_hdrp_tile_diff_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_best_tile",
+-                                   mf_hdrp_best_tile_prod_spv,
+-                                   mf_hdrp_best_tile_prod_spv_size,
+-                                   mf_hdrp_best_tile_trace_spv,
+-                                   mf_hdrp_best_tile_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_warp",
+-                                   mf_hdrp_warp_prod_spv,
+-                                   mf_hdrp_warp_prod_spv_size,
+-                                   mf_hdrp_warp_trace_spv,
+-                                   mf_hdrp_warp_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_color_diff",
+-                                   mf_hdrp_color_diff_prod_spv,
+-                                   mf_hdrp_color_diff_prod_spv_size,
+-                                   mf_hdrp_color_diff_trace_spv,
+-                                   mf_hdrp_color_diff_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrp_column_sum",
+-                                   mf_hdrp_column_sum_prod_spv,
+-                                   mf_hdrp_column_sum_prod_spv_size,
+-                                   mf_hdrp_column_sum_trace_spv,
+-                                   mf_hdrp_column_sum_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_mean",
+-                                   mf_hdrp_mean_prod_spv,
+-                                   mf_hdrp_mean_prod_spv_size,
+-                                   mf_hdrp_mean_trace_spv,
+-                                   mf_hdrp_mean_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_merge_weight",
+-                                   mf_hdrp_merge_weight_prod_spv,
+-                                   mf_hdrp_merge_weight_prod_spv_size,
+-                                   mf_hdrp_merge_weight_trace_spv,
+-                                   mf_hdrp_merge_weight_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrp_accumulate",
+-                                   mf_hdrp_accumulate_prod_spv,
+-                                   mf_hdrp_accumulate_prod_spv_size,
+-                                   mf_hdrp_accumulate_trace_spv,
+-                                   mf_hdrp_accumulate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrp_finalize",
+-                                   mf_hdrp_finalize_prod_spv,
+-                                   mf_hdrp_finalize_prod_spv_size,
+-                                   mf_hdrp_finalize_trace_spv,
+-                                   mf_hdrp_finalize_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_to_rgba",
+-                                   mf_hdrq_to_rgba_prod_spv,
+-                                   mf_hdrq_to_rgba_prod_spv_size,
+-                                   mf_hdrq_to_rgba_trace_spv,
+-                                   mf_hdrq_to_rgba_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_warp_rgba",
+-                                   mf_hdrq_warp_rgba_prod_spv,
+-                                   mf_hdrq_warp_rgba_prod_spv_size,
+-                                   mf_hdrq_warp_rgba_trace_spv,
+-                                   mf_hdrq_warp_rgba_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_rms",
+-                                   mf_hdrq_rms_prod_spv,
+-                                   mf_hdrq_rms_prod_spv_size,
+-                                   mf_hdrq_rms_trace_spv,
+-                                   mf_hdrq_rms_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_mismatch",
+-                                   mf_hdrq_mismatch_prod_spv,
+-                                   mf_hdrq_mismatch_prod_spv_size,
+-                                   mf_hdrq_mismatch_trace_spv,
+-                                   mf_hdrq_mismatch_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_region_mean",
+-                                   mf_hdrq_region_mean_prod_spv,
+-                                   mf_hdrq_region_mean_prod_spv_size,
+-                                   mf_hdrq_region_mean_trace_spv,
+-                                   mf_hdrq_region_mean_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrq_mismatch_norm",
+-                                   mf_hdrq_mismatch_norm_prod_spv,
+-                                   mf_hdrq_mismatch_norm_prod_spv_size,
+-                                   mf_hdrq_mismatch_norm_trace_spv,
+-                                   mf_hdrq_mismatch_norm_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrq_forward_dft",
+-                                   mf_hdrq_forward_dft_prod_spv,
+-                                   mf_hdrq_forward_dft_prod_spv_size,
+-                                   mf_hdrq_forward_dft_trace_spv,
+-                                   mf_hdrq_forward_dft_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_merge",
+-                                   mf_hdrq_merge_prod_spv,
+-                                   mf_hdrq_merge_prod_spv_size,
+-                                   mf_hdrq_merge_trace_spv,
+-                                   mf_hdrq_merge_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}, {6, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {7, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {8, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrq_deconvolute",
+-                                   mf_hdrq_deconvolute_prod_spv,
+-                                   mf_hdrq_deconvolute_prod_spv_size,
+-                                   mf_hdrq_deconvolute_trace_spv,
+-                                   mf_hdrq_deconvolute_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_backward_dft",
+-                                   mf_hdrq_backward_dft_prod_spv,
+-                                   mf_hdrq_backward_dft_prod_spv_size,
+-                                   mf_hdrq_backward_dft_trace_spv,
+-                                   mf_hdrq_backward_dft_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_border",
+-                                   mf_hdrq_border_prod_spv,
+-                                   mf_hdrq_border_prod_spv_size,
+-                                   mf_hdrq_border_trace_spv,
+-                                   mf_hdrq_border_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_accumulate",
+-                                   mf_hdrq_accumulate_prod_spv,
+-                                   mf_hdrq_accumulate_prod_spv_size,
+-                                   mf_hdrq_accumulate_trace_spv,
+-                                   mf_hdrq_accumulate_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_shift_table",
+-                                   mf_hdrq_shift_table_prod_spv,
+-                                   mf_hdrq_shift_table_prod_spv_size,
+-                                   mf_hdrq_shift_table_trace_spv,
+-                                   mf_hdrq_shift_table_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}},
+-                                  {"hdrq_highlights_norm",
+-                                   mf_hdrq_highlights_norm_prod_spv,
+-                                   mf_hdrq_highlights_norm_prod_spv_size,
+-                                   mf_hdrq_highlights_norm_trace_spv,
+-                                   mf_hdrq_highlights_norm_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_normalize",
+-                                   mf_hdrq_normalize_prod_spv,
+-                                   mf_hdrq_normalize_prod_spv_size,
+-                                   mf_hdrq_normalize_trace_spv,
+-                                   mf_hdrq_normalize_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}},
+-                                  {"hdrq_seed_dft",
+-                                   mf_hdrq_seed_dft_prod_spv,
+-                                   mf_hdrq_seed_dft_prod_spv_size,
+-                                   mf_hdrq_seed_dft_trace_spv,
+-                                   mf_hdrq_seed_dft_trace_spv_size,
+-                                   {{0, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}, {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}}}}};
+-void ck(VkResult r, const char* w) {
+-    if (r != VK_SUCCESS) throw std::runtime_error(std::string(w) + " VkResult=" + std::to_string(r));
+-}
+-VkShaderModule sm(VkDevice d, const unsigned char* p, size_t n) {
+-    VkShaderModuleCreateInfo c{};
+-    c.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+-    c.codeSize = n;
+-    c.pCode = reinterpret_cast<const uint32_t*>(p);
+-    VkShaderModule m = VK_NULL_HANDLE;
+-    ck(vkCreateShaderModule(d, &c, nullptr, &m), "mf shader module");
+-    return m;
+-}
+-}  // namespace
+-void VulkanExecutor::initialize(VkDevice d, bool wantTrace) {
+-    reset();
+-    if (!d) throw std::invalid_argument("multiframe executor: null device");
+-    // specs[] is indexed positionally by ShaderId: a misordered entry silently
+-    // binds the wrong pipeline. Verify the full order on every initialize.
+-    static constexpr const char* kOrder[] = {
+-        "raw_normalize",      "alignment_local5",   "pyramid_gaussian",  "pyramid_decimate",  "flow_upsample",
+-        "block_match",        "lk_refine",          "flow_dense_smooth", "kernel_estimate",   "robust_guide",
+-        "robust_stats",       "robust_warp",        "robust_flow_scale", "robust_photometric", "robust_erode5",
+-        "affine_fit",         "affine_gate",        "support_accumulate", "accumulate",       "reference_accumulate",
+-        "a11_finalize",       "noise_estimate",     "fallback_chroma",    "hot_pixel_conceal",
+-        "hdrp_prepare", "hdrp_hot_pixel", "hdrp_avg_pool", "hdrp_blur", "hdrp_upsample_align", "hdrp_correct_upsampling", "hdrp_tile_diff", "hdrp_best_tile", "hdrp_warp", "hdrp_color_diff", "hdrp_column_sum", "hdrp_mean", "hdrp_merge_weight", "hdrp_accumulate", "hdrp_finalize",
+-        "hdrq_to_rgba", "hdrq_warp_rgba", "hdrq_rms", "hdrq_mismatch", "hdrq_region_mean", "hdrq_mismatch_norm", "hdrq_forward_dft", "hdrq_merge", "hdrq_deconvolute", "hdrq_backward_dft", "hdrq_border", "hdrq_accumulate", "hdrq_shift_table",
+-        "hdrq_highlights_norm", "hdrq_normalize", "hdrq_seed_dft",
+-    };
+-    static_assert(sizeof(kOrder) / sizeof(kOrder[0]) == static_cast<size_t>(ShaderId::Count),
+-                  "executor spec order table out of sync with ShaderId");
+-    if (specs.size() != static_cast<size_t>(ShaderId::Count))
+-        throw std::logic_error("multiframe executor: spec count out of sync with ShaderId");
+-    for (size_t i = 0; i < specs.size(); ++i)
+-        if (std::string(specs[i].name) != kOrder[i])
+-            throw std::logic_error(std::string("multiframe executor: spec/enum order mismatch at ") +
+-                                   std::to_string(i));
+-    device_ = d;
+-    trace_ = wantTrace;
+-    for (size_t i = 0; i < specs.size(); ++i) {
+-        const auto& s = specs[i];
+-        auto& p = programs_[i];
+-        std::vector<VkDescriptorSetLayoutBinding> bs;
+-        for (auto b : s.b) bs.push_back({b.n, b.t, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+-        if (wantTrace) bs.push_back({31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr});
+-        VkDescriptorSetLayoutCreateInfo dc{};
+-        dc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+-        dc.bindingCount = uint32_t(bs.size());
+-        dc.pBindings = bs.data();
+-        ck(vkCreateDescriptorSetLayout(d, &dc, nullptr, &p.dsl), "mf descriptor layout");
+-        VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 128};
+-        VkPipelineLayoutCreateInfo lc{};
+-        lc.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+-        lc.setLayoutCount = 1;
+-        lc.pSetLayouts = &p.dsl;
+-        lc.pushConstantRangeCount = 1;
+-        lc.pPushConstantRanges = &pr;
+-        ck(vkCreatePipelineLayout(d, &lc, nullptr, &p.layout), "mf pipeline layout");
+-        auto mk = [&](const unsigned char* bytes, size_t n, VkPipeline* out) {
+-            auto m = sm(d, bytes, n);
+-            VkPipelineShaderStageCreateInfo st{};
+-            st.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+-            st.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+-            st.module = m;
+-            st.pName = "main";
+-            VkComputePipelineCreateInfo pc{};
+-            pc.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+-            pc.stage = st;
+-            pc.layout = p.layout;
+-            auto r = vkCreateComputePipelines(d, VK_NULL_HANDLE, 1, &pc, nullptr, out);
+-            vkDestroyShaderModule(d, m, nullptr);
+-            ck(r, "mf compute pipeline");
+-        };
+-        mk(s.prod, s.prodN, &p.prod);
+-        if (wantTrace) mk(s.trace, s.traceN, &p.trace);
+-        std::vector<VkDescriptorPoolSize> ps;
+-        uint32_t ni = 0, nb = 0;
+-        for (auto b : s.b) (b.t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? ni : nb)++;
+-        if (wantTrace) nb++;
+-        if (ni) ps.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, ni});
+-        if (nb) ps.push_back({VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nb});
+-        constexpr uint32_t kSetsPerProgram = 256;
+-        for (auto& q : ps) q.descriptorCount *= kSetsPerProgram;
+-        VkDescriptorPoolCreateInfo pci{};
+-        pci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+-        pci.flags = 0;
+-        pci.maxSets = kSetsPerProgram;
+-        pci.poolSizeCount = uint32_t(ps.size());
+-        pci.pPoolSizes = ps.data();
+-        ck(vkCreateDescriptorPool(d, &pci, nullptr, &p.pool), "mf descriptor pool");
+-    }
+-}
+-void VulkanExecutor::record(VkCommandBuffer cmd, ShaderId id, const DispatchBindings& in, const void* push,
+-                            uint32_t pushN, uint32_t gx, uint32_t gy, uint32_t gz, const TraceTarget* tr) {
+-    if (!device_ || !cmd || !gx || !gy || !gz || pushN > 128 || (pushN && !push))
+-        throw std::invalid_argument("multiframe executor: invalid dispatch");
+-    size_t i = static_cast<size_t>(id);
+-    if (i >= specs.size()) throw std::invalid_argument("multiframe executor: invalid shader");
+-    const auto& s = specs[i];
+-    auto& p = programs_[i];
+-    bool useTrace = tr && tr->buffer;
+-    if (useTrace && !trace_) throw std::logic_error("multiframe executor: trace pipeline not initialized");
+-    for (const auto expected : s.b) {
+-        uint32_t count = 0;
+-        for (const auto& x : in.images)
+-            if (x.binding == expected.n) {
+-                if (expected.t != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+-                    throw std::invalid_argument("multiframe executor: descriptor type mismatch");
+-                ++count;
+-            }
+-        for (const auto& x : in.buffers)
+-            if (x.binding == expected.n) {
+-                if (expected.t != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+-                    throw std::invalid_argument("multiframe executor: descriptor type mismatch");
+-                ++count;
+-            }
+-        if (count != 1) throw std::invalid_argument("multiframe executor: missing/duplicate required binding");
+-    }
+-    for (const auto& x : in.images) {
+-        bool known = false;
+-        for (const auto e : s.b) known |= e.n == x.binding;
+-        if (!known) throw std::invalid_argument("multiframe executor: unexpected image binding");
+-    }
+-    for (const auto& x : in.buffers) {
+-        bool known = false;
+-        for (const auto e : s.b) known |= e.n == x.binding;
+-        if (!known) throw std::invalid_argument("multiframe executor: unexpected buffer binding");
+-    }
+-    VkDescriptorSet set = VK_NULL_HANDLE;
+-    VkDescriptorSetAllocateInfo ai{};
+-    ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+-    ai.descriptorPool = p.pool;
+-    ai.descriptorSetCount = 1;
+-    ai.pSetLayouts = &p.dsl;
+-    ck(vkAllocateDescriptorSets(device_, &ai, &set), "mf transient descriptor set");
+-    std::vector<VkDescriptorImageInfo> ii;
+-    std::vector<VkDescriptorBufferInfo> bi;
+-    std::vector<VkWriteDescriptorSet> w;
+-    ii.reserve(in.images.size());
+-    bi.reserve(in.buffers.size() + 1);
+-    w.reserve(in.images.size() + in.buffers.size() + 1);
+-    for (auto x : in.images) {
+-        ii.push_back({VK_NULL_HANDLE, x.view, x.layout});
+-        VkWriteDescriptorSet z{};
+-        z.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-        z.dstSet = set;
+-        z.dstBinding = x.binding;
+-        z.descriptorCount = 1;
+-        z.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+-        z.pImageInfo = &ii.back();
+-        w.push_back(z);
+-    }
+-    for (auto x : in.buffers) {
+-        bi.push_back({x.buffer, x.offset, x.range});
+-        VkWriteDescriptorSet z{};
+-        z.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-        z.dstSet = set;
+-        z.dstBinding = x.binding;
+-        z.descriptorCount = 1;
+-        z.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-        z.pBufferInfo = &bi.back();
+-        w.push_back(z);
+-    }
+-    if (useTrace) {
+-        bi.push_back({tr->buffer, 0, tr->range});
+-        VkWriteDescriptorSet z{};
+-        z.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+-        z.dstSet = set;
+-        z.dstBinding = 31;
+-        z.descriptorCount = 1;
+-        z.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-        z.pBufferInfo = &bi.back();
+-        w.push_back(z);
+-    }
+-    vkUpdateDescriptorSets(device_, uint32_t(w.size()), w.data(), 0, nullptr);
+-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, useTrace ? p.trace : p.prod);
+-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.layout, 0, 1, &set, 0, nullptr);
+-    if (pushN) vkCmdPushConstants(cmd, p.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, pushN, push);
+-    vkCmdDispatch(cmd, gx, gy, gz);
+-}
+-void VulkanExecutor::beginBatch() {
+-    if (!device_) throw std::logic_error("multiframe executor: not initialized");
+-    for (auto& p : programs_)
+-        if (p.pool) ck(vkResetDescriptorPool(device_, p.pool, 0), "mf reset descriptor pool");
+-}
+-void computeWriteBarrier(VkCommandBuffer c) {
+-    VkMemoryBarrier b{};
+-    b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+-    b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+-    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &b, 0,
+-                         nullptr, 0, nullptr);
+-}
+-void VulkanExecutor::reset() noexcept {
+-    if (device_)
+-        for (auto& p : programs_) {
+-            if (p.pool) vkDestroyDescriptorPool(device_, p.pool, nullptr);
+-            if (p.trace) vkDestroyPipeline(device_, p.trace, nullptr);
+-            if (p.prod) vkDestroyPipeline(device_, p.prod, nullptr);
+-            if (p.layout) vkDestroyPipelineLayout(device_, p.layout, nullptr);
+-            if (p.dsl) vkDestroyDescriptorSetLayout(device_, p.dsl, nullptr);
+-            p = {};
+-        }
+-    device_ = VK_NULL_HANDLE;
+-    trace_ = false;
+-}
+-}  // namespace rawr::raw_gpu_pipeline
+diff --git b/app/version.properties a/app/version.properties
+index 27c94deadf0f9124d6084c1d9b2e0b7a27cf71a7..953e08b615b2d4c8f886886bb7de93fa9cbafd97 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726888
+-VERSION_BUILD=26888
++VERSION_NAME=0.9726887
++VERSION_BUILD=26887
