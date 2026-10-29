@@ -319,3 +319,4 @@ new_sha=hashlib.sha256(body.encode()).hexdigest()
 (R/'26887_GENERATED_BUILD_SHA256.txt').write_text(new_sha+'  '+out.name+'\n')
 (R/'26887_BUILD_INFRASTRUCTURE_DIFF.txt').write_text(''.join(difflib.unified_diff(original.splitlines(True),body.splitlines(True),fromfile='SUCCESSFUL_26886_SHA_'+old_sha,tofile='26887_SUCCESSOR_17_STAGES')))
 print('PASS generated 26887 exact-successful-26886 parent SHA, inherited 17 stage order; new',new_sha)
+# 26887 V4 trigger repair: retain generated runner bytes; touch this watched generator on the same push as workflow self-path activation.
