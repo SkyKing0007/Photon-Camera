@@ -1,0 +1,207 @@
+#version 450
+// IRIS_26886_B_SR_ON_UNSUPPORTED_CHROMA_AND_BURST_FALLBACK
+// B Super Res ON only. AMaZE's already-computed 2x luminance remains intact.
+// Wronski RGB is original camera-linear/pre-LSC; AMaZE AHB is camera-linear
+// POST physical LSC (its export divided the temporary AMaZE WB).
+// Both estimates are compared ONLY after applying the identical physical
+// sensor LSC and temporary WB for evidence. Output is back in camera linear.
+// B-ON's fitted native RAWR seven-scale chroma wavelet remains unchanged;
+// this single-pixel guide also provides bounded color-noise/alias cleanup
+// when the genuine burst fit is not usable, WITHOUT fabricating a noise fit.
+// All neighborhood reads use the immutable original Wronski RGB; this stage
+// neither reads adjacent AMaZE pixels nor changes AMaZE luminance/geometry.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,rgba16f) uniform image2D amazeRgbInPlace;
+layout(set=0,binding=1,rgba16f) readonly uniform image2D wronskiRgb;
+layout(set=0,binding=2,r16ui) readonly uniform uimage2D originalSensorClip;
+layout(std430,set=0,binding=3) readonly buffer PhysicalLsc {vec4 lscMap[];};
+layout(push_constant) uniform GuidePush {
+    uint width,height,lscWidth,lscHeight;
+    uint refWidth,refHeight,cfa,useSensorClip;
+    vec4 black;
+    vec4 invRange;
+    float clipThreshold;
+    uint originX,originY,fullSensorWidth,fullSensorHeight;
+    vec4 wb;
+} p;
+
+float mapGain(vec2 uv,int channel){
+    if(p.lscWidth==0u&&p.lscHeight==0u)return 1.0;
+    vec2 at=clamp(uv,vec2(0),vec2(1))*
+        vec2(float(p.lscWidth-1u),float(p.lscHeight-1u));
+    uvec2 a=uvec2(floor(at));
+    uvec2 b=min(a+uvec2(1u),uvec2(p.lscWidth-1u,p.lscHeight-1u));
+    vec2 f=fract(at);
+    float aa=lscMap[a.y*p.lscWidth+a.x][channel];
+    float ba=lscMap[a.y*p.lscWidth+b.x][channel];
+    float ab=lscMap[b.y*p.lscWidth+a.x][channel];
+    float bb=lscMap[b.y*p.lscWidth+b.x][channel];
+    return mix(mix(aa,ba,f.x),mix(ab,bb,f.x),f.y);
+}
+vec3 lscGain(ivec2 px){
+    vec2 full=vec2(float(p.originX),float(p.originY))+vec2(px)*0.5;
+    vec2 uv=full/vec2(float(p.fullSensorWidth-1u),float(p.fullSensorHeight-1u));
+    // Camera2 greens are original PHYSICAL even/odd sensor rows. A full RGB
+    // pixel has no Bayer-site identity, so use the exact mean of both green
+    // row gains; never mistakenly toggle G1/G2 by synthetic 2x output rows.
+    float green=0.5*(mapGain(uv,1)+mapGain(uv,2));
+    return vec3(mapGain(uv,0),green,mapGain(uv,3));
+}
+float yOf(vec3 v){return dot(v,vec3(0.2126,0.7152,0.0722));}
+bool finiteRgb(vec3 v){return !any(isnan(v))&&!any(isinf(v));}
+float colorStrength(vec3 wbRgb){
+    float y=yOf(wbRgb);
+    return length(wbRgb-vec3(y))/max(y,0.025);
+}
+// IRIS_26887_ON_ONLY_NEUTRAL_WRONSKI_SOURCE: paired source observations,
+// not a consensus of post-AMaZE RGB and not a generic chroma filter.
+// The 26886 single-pixel guide remains authoritative for genuine colors.
+float sourceNeutralAt(ivec2 q, float centerY){
+    if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.width,p.height))))return 0.0;
+    vec3 v=imageLoad(wronskiRgb,q).rgb;
+    if(!finiteRgb(v)||any(lessThan(v,vec3(0))))return 0.0;
+    vec3 g=lscGain(q);
+    if(!finiteRgb(g)||any(lessThanEqual(g,vec3(0))))return 0.0;
+    vec3 w=v*g*p.wb.rgb;
+    float y=yOf(w);
+    if(!finiteRgb(w)||y<0.025||y>8.0)return 0.0;
+    float similarY=1.0-smoothstep(0.06,0.17,
+                    abs(y-centerY)/max(max(y,centerY),0.025));
+    float neutral=1.0-smoothstep(0.018,0.039,colorStrength(w));
+    return similarY*neutral;
+}
+void main(){
+    ivec2 px=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(px,ivec2(p.width,p.height))))return;
+    if(p.useSensorClip!=1u||p.cfa>3u||p.refWidth*2u!=p.width||
+       p.refHeight*2u!=p.height||p.fullSensorWidth<2u||p.fullSensorHeight<2u||
+       any(notEqual(imageSize(amazeRgbInPlace),ivec2(p.width,p.height)))||
+       any(notEqual(imageSize(wronskiRgb),ivec2(p.width,p.height)))||
+       any(notEqual(imageSize(originalSensorClip),ivec2(p.width/2u,p.height/2u))))return;
+    vec4 src=imageLoad(amazeRgbInPlace,px);
+    vec3 originalRgb=imageLoad(wronskiRgb,px).rgb;
+    if(!finiteRgb(src.rgb)||!finiteRgb(originalRgb)||
+       any(lessThan(src.rgb,vec3(0)))||any(lessThan(originalRgb,vec3(0)))||
+       !finiteRgb(p.wb.rgb)||any(lessThanEqual(p.wb.rgb,vec3(0))))return;
+    vec3 gain=lscGain(px);
+    if(!finiteRgb(gain)||any(lessThanEqual(gain,vec3(0))))return;
+    // BOTH images in matched physical-LSC and WB evidence domain.
+    vec3 candidate=src.rgb*p.wb.rgb;
+    vec3 guide=originalRgb*gain*p.wb.rgb;
+    if(!finiteRgb(candidate)||!finiteRgb(guide))return;
+    float yc=yOf(candidate),yg=yOf(guide);
+    if(yc<0.003||yg<0.003||yc>8.0||yg>8.0)return;
+    vec3 cc=candidate-vec3(yc),gc=guide-vec3(yg);
+    float cMag=length(cc)/max(yc,0.012);
+    float gMag=length(gc)/max(yg,0.012);
+    float difference=length(cc/max(yc,0.012)-gc/max(yg,0.012));
+    if(difference<0.022||cMag<0.018)return;
+    // The independent original Wronski RGB must be accurately neutral at
+    // this source point AND have two-sided same-luma neutral witnesses along
+    // a real image axis. Never infer neutrality from center AMaZE alternation.
+    float neutralPair=0.0;
+    if(gMag<0.025&&cMag>0.055&&difference>0.045){
+        float h=min(max(sourceNeutralAt(px+ivec2(2,0),yg),
+                        sourceNeutralAt(px+ivec2(6,0),yg)),
+                    max(sourceNeutralAt(px-ivec2(2,0),yg),
+                        sourceNeutralAt(px-ivec2(6,0),yg)));
+        float v=min(max(sourceNeutralAt(px+ivec2(0,2),yg),
+                        sourceNeutralAt(px+ivec2(0,6),yg)),
+                    max(sourceNeutralAt(px-ivec2(0,2),yg),
+                        sourceNeutralAt(px-ivec2(0,6),yg)));
+        neutralPair=max(h,v)*smoothstep(0.055,0.105,cMag);
+        neutralPair=smoothstep(0.77,0.96,neutralPair);
+    }
+
+    // Look for real chromatic evidence matching THIS candidate's hue in
+    // original Wronski RGB. An isolated different-hue noise spike must not
+    // veto neutral-metal correction as the old 4-neighbor max did.
+    float centerCos=dot(cc,gc)/max(length(cc)*length(gc),1e-9);
+    float witness=smoothstep(0.085,0.20,gMag)*smoothstep(0.55,0.86,centerCos);
+    vec3 chromaSum=gc/max(yg,0.012);
+    float sumWeight=1.0;
+    float localAgreement=0.0;
+    const ivec2 offsets[8]=ivec2[8](
+        ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
+        ivec2(-1,-1),ivec2(1,-1),ivec2(-1,1),ivec2(1,1));
+    for(int j=0;j<8;++j){
+        ivec2 q=clamp(px+offsets[j],ivec2(0),ivec2(p.width-1u,p.height-1u));
+        vec3 sampleRaw=imageLoad(wronskiRgb,q).rgb;
+        if(!finiteRgb(sampleRaw)||any(lessThan(sampleRaw,vec3(0))))continue;
+        vec3 wronskiNeighborRgb=sampleRaw*lscGain(q)*p.wb.rgb;
+        if(!finiteRgb(wronskiNeighborRgb))continue;
+        float sy=yOf(wronskiNeighborRgb);
+        if(sy<0.002||sy>8.0)continue;
+        vec3 sc=wronskiNeighborRgb-vec3(sy);
+        float sn=length(sc)/max(sy,0.012);
+        float sameHue=dot(cc,sc)/max(length(cc)*length(sc),1e-9);
+        // Preserve an actual thin colored wire even if subpixel phase
+        // shifts the true Wronski color by one sample. Color evidence must
+        // be hue-consistent AND roughly same material/luminance.
+        float similar=1.0-smoothstep(0.12,0.46,
+            abs(sy-yg)/max(max(sy,yg),0.012));
+        float chromaticWitness=smoothstep(0.07,0.18,sn)*
+            smoothstep(0.64,0.90,sameHue)*similar;
+        witness=max(witness,chromaticWitness);
+        // Edge-aware original-RGB neighborhood is an independent chroma
+        // consensus, never a blur of post-AMaZE pixels or luminance.
+        float w=similar;
+        chromaSum+=w*sc/max(sy,0.012);
+        sumWeight+=w;
+        localAgreement+=w*chromaticWitness;
+    }
+    vec3 consensus=chromaSum/sumWeight;
+    float consensusMag=length(consensus);
+    float chromaExcess=max(cMag-consensusMag,0.0);
+    float neutral=1.0-smoothstep(0.055,0.23,consensusMag);
+    float falseColor=neutral*smoothstep(0.018,0.19,chromaExcess)*
+        smoothstep(0.022,0.20,difference);
+    // In underexposed smooth regions, a weak incoherent independent guide
+    // supports a separate conservative chroma-only cleanup. This remains
+    // useful when noiseEstimated is false and the valid fitted RAWR wavelet
+    // must skip; no Camera2 "fitted" profile and no made-up noise floor.
+    float shadow=1.0-smoothstep(0.008,0.095,min(yc,yg));
+    float localSupport=clamp(localAgreement/max(sumWeight-1.0,1e-4),0.0,1.0);
+    float incoherent=(1.0-localSupport)*
+        (1.0-smoothstep(0.075,0.23,consensusMag));
+    float noiseCleanup=0.34*shadow*incoherent*
+        smoothstep(0.035,0.18,chromaExcess)*
+        smoothstep(0.022,0.20,difference);
+    float unsupported=max(max(falseColor,noiseCleanup),0.55*neutralPair)*(1.0-witness);
+    if(unsupported<0.0001)return;
+
+    uint bits=imageLoad(originalSensorClip,px/2).r&15u;
+    int clipped=bitCount(bits);
+    // Never reconstruct a clipped colored pixel by donating a neighboring
+    // hue. Multichannel-clipped neutral reflection may fade ONLY toward
+    // neutral when independent Wronski consensus itself is neutral.
+    float clipWeight=clipped==0?1.0:(clipped==1?0.50:0.30*neutral);
+    float weight=max(clamp(0.86*falseColor+noiseCleanup,0.0,0.86),
+                     0.55*neutralPair)*(1.0-witness)*clipWeight;
+    if(weight<0.0001)return;
+    vec3 targetN=mix(gc/max(yg,0.012),consensus,0.48);
+    // Do not synthesize a target hue when the independent guide is near
+    // neutral or disagrees in direction with the apparent AMaZE color.
+    float targetNorm=length(targetN);
+    if(targetNorm>consensusMag+0.015)
+        targetN*= (consensusMag+0.015)/max(targetNorm,1e-8);
+    if(clipped>=2)targetN=mix(targetN,vec3(0),neutral);
+    // Only genuinely source-neutral evidence can extend the old guide; a
+    // true chromatic microstructure must retain its original Wronski hue.
+    targetN=mix(targetN,vec3(0),neutralPair);
+    vec3 targetChroma=targetN*yc;
+    // Exact zero-y chroma invariant, even after interpolation and clipping.
+    targetChroma-=vec3(yOf(targetChroma));
+    vec3 move=targetChroma-cc;
+    for(int k=0;k<3;++k){
+        if(move[k]<0.0)
+            weight=min(weight,candidate[k]/max(-move[k],1e-8));
+    }
+    weight=clamp(weight,0.0,0.86);
+    if(weight<0.0001)return;
+    vec3 corrected=candidate+weight*move;
+    if(!finiteRgb(corrected)||any(lessThan(corrected,vec3(-0.00001))))return;
+    vec3 outRgb=corrected/p.wb.rgb;
+    if(!finiteRgb(outRgb))return;
+    imageStore(amazeRgbInPlace,px,vec4(max(outRgb,vec3(0)),src.a));
+}

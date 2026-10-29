@@ -1,0 +1,2100 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+index e260e13bb07314fc36bb5adc4e383ec3c5ecf8e6..a399f67d99fd469e3976bc8341f40a1c4b09d078 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+@@ -128,9 +128,17 @@ void runRealRawrFromFrozenDirectNormals(
+     // the post-merge packer/AMaZE may ONLY consume its result synchronously.
+     bool enteredConsumer=false;
+     bool arenaRetry=false;
++    // The B-OFF RAW color witness can revisit existing borrowed inputs only
++    // AFTER the original merge has completed. Keep the original 26873 upload
++    // count/latency receipt tied strictly to the original merge, not the
++    // additional B-only evidence reads made inside the downstream consumer.
++    uint32_t originalMergeUploads=0;
++    double originalMergeUploadMs=0.;
+     auto wrappedConsume=[&](const rawr::raw_gpu_pipeline::BurstRunResult& result,
+                            const RealRawrRunRequest& frozen){
+         enteredConsumer=true;
++        originalMergeUploads=uploadCalls;
++        originalMergeUploadMs=uploadMs;
+         consume(result,frozen);
+     };
+     try {
+@@ -184,9 +192,15 @@ void runRealRawrFromFrozenDirectNormals(
+         const double uploadWallMs=std::chrono::duration<double,std::milli>(now()-uploadBegin).count();
+         __android_log_print(ANDROID_LOG_INFO,"Iris26873",
+             "B_GPU_INPUT mode=%s normals=%zu uploads=%u expected=%zu upload_ms=%.2f total_span_ms=%.2f retry=%d frame_drop=0",
+-            resident?"resident":"two_slot",raw.size(),uploadCalls,
+-            resident?raw.size():(size_t(1)+4u*(raw.size()-1u)),uploadMs,uploadWallMs,
++            resident?"resident":"two_slot",raw.size(),originalMergeUploads,
++            resident?raw.size():(size_t(1)+4u*(raw.size()-1u)),originalMergeUploadMs,uploadWallMs,
+             arenaRetry?1:0);
++        // Separate minimal sidecar receipt; never misattribute extra RAW
++        // transfers to original HDR+ merge or frame-count degradation.
++        if(uploadCalls>originalMergeUploads)
++            __android_log_print(ANDROID_LOG_INFO,"Iris26887",
++                "B_OFF_WITNESS_REUPLOAD normals=%zu extraUploads=%u extraUploadMs=%.2f",
++                raw.size(),uploadCalls-originalMergeUploads,uploadMs-originalMergeUploadMs);
+     }catch(...){
+         // Every upstream chunk and upload uses a waited fence. Retain GPU
+         // input allocations if the queue entered an unresolved state.
+diff --git a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+index 95e805f62dfea3911266e21235ed7526ae82eb5b..2f124751c100b159dbf5e9fe5b5eed60b735fd0b 100644
+--- a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
++++ b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+@@ -4,6 +4,8 @@
+ #include "Iris26864FrozenDirectRawrRunner.hpp"
+ #include "Iris26864NativeBridgeShaders.hpp"
+ #include "bridge/Iris26864HdrqCanonicalGpuBridge.hpp"
++#include "bridge/Iris26887BOffRawPhaseDiversity.hpp"
++#include "bridge/Iris26887BOffRawWitnessGlobalSeeds.hpp"
+ #include "Iris26864Wronski2xSingleOwnerBridge.hpp"
+ #include "raw_denoise/DenoisePipeline.hpp"
+ #include "iris26880_wavelet_precondition.h"
+@@ -88,6 +90,25 @@ template<class Resource> struct Iris26880WaitedVulkanRetire {
+         }
+     }
+ };
++// IRIS_26887_B_OFF_OPTIONAL_WITNESS_IMAGE_LIFETIME.
++// A failed CommandSubmissionOwner fence wait can leave submitted GPU work
++// unresolved. The optional RAW witness arena is declared AFTER that command
++// owner, so ordinary unique_ptr destruction could free a live VkImage while
++// the driver still owns its descriptors. Settle the SAME inherited queue
++// before releasing these B-only images. If completion cannot be proven,
++// quarantine them until the owning Vulkan device is torn down.
++struct Iris26887WaitedWitnessArenaRetire {
++    VkQueue queue=VK_NULL_HANDLE;
++    void operator()(iris26864::VulkanImageArena* arena) const noexcept {
++        if(!arena)return;
++        if(queue!=VK_NULL_HANDLE&&vkQueueWaitIdle(queue)==VK_SUCCESS){
++            delete arena;
++        }else{
++            __android_log_print(ANDROID_LOG_ERROR,"Iris26887",
++                "B_OFF_WITNESS_IMAGE_QUARANTINE unresolved Vulkan queue; retaining images");
++        }
++    }
++};
+ std::vector<float> iris26864ReadFloats(JNIEnv* e,jfloatArray v){
+     if(!v)return {};
+     const jsize n=e->GetArrayLength(v);
+@@ -195,6 +216,25 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+         f.whiteBalance={gainsVec[0],gainsVec[1],gainsVec[2]};
+         req.normals.push_back(f);
+     }
++    // B OFF is independent of optional A DNG and uses ONLY original NORMAL
++    // sensor RAW16. Coarse seeds authorize NOTHING; every GPU tile and pixel
++    // must independently verify physical R/G/B support before color changes.
++    std::vector<iris26887::Raw16Frame> bOffOriginalRaw;
++    std::vector<iris26887::RawColorSeed> bOffCoarse;
++    if(!sr){
++        bOffOriginalRaw.reserve(req.normals.size());
++        for(const auto& normal:req.normals){
++            iris26887::Raw16Frame f{};
++            f.bytes=normal.borrowed.source;f.byteCount=normal.borrowed.bytes;
++            f.stride=normal.borrowed.rowStride;f.width=normal.borrowed.width;
++            f.height=normal.borrowed.height;f.white=normal.whiteLevel;
++            f.exposure=normal.exposureProduct;
++            for(size_t k=0;k<4u;++k)f.black[k]=normal.blackByPhase[k];
++            bOffOriginalRaw.push_back(f);
++        }
++        bOffCoarse=iris26887::estimateOriginalRawSensorSeeds(
++            bOffOriginalRaw,size_t(referenceIndex),localCfa);
++    }
+     iris26864::VulkanImageArena surfaces(ctx.physicalDevice,ctx.device,
+                                 VkDeviceSize(outWidth)*outHeight*12ull+(16ull<<20u));
+     surfaces.allocate(outWidth/2u,outHeight/2u,VK_FORMAT_R16G16B16A16_SFLOAT,
+@@ -202,6 +242,29 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     surfaces.allocate(outWidth/2u,outHeight/2u,VK_FORMAT_R16_UINT,
+                       VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_SAMPLED_BIT);
+     const auto packed=surfaces.at(0), rawClip=surfaces.at(1);
++    // 4 bytes per physical RAW output pixel (~48 MiB at 3072x4096), NOT a
++    // second 50MP RGB allocation; shifts are ~0.2 MiB at 32-site tiles.
++    // A low-memory device fails this OPTIONAL evidence stage closed: its JPEG
++    // remains the inherited successful B output with no unsafe color rewrite.
++    size_t bOffWitnessSlot=SIZE_MAX,bOffShiftSlot=SIZE_MAX;
++    // Independent optional arena: partial allocation failure frees all
++    // witness resources and cannot retain 48 MiB needed by AMaZE/JPEG.
++    std::unique_ptr<iris26864::VulkanImageArena,
++        Iris26887WaitedWitnessArenaRetire> bOffArena(nullptr,{device.queue()});
++    bool bOffWitnessAllocated=false;
++    // A full RGB witness needs at least two physical observations of each
++    // Bayer channel. No 48-MiB allocation on flat, ambiguous or short bursts
++    // which have fewer than six independently registered original frames.
++    const size_t seedCount=std::count_if(bOffCoarse.begin(),bOffCoarse.end(),
++        [](const iris26887::RawColorSeed& seed){return seed.valid;});
++    // Important: do NOT allocate the extra ~48 MiB sidecar before HDR+ runs.
++    // Its scratch arena needs memory first. Optional color evidence is
++    // allocated only AFTER the pinned merge has completed successfully.
++    // Avoid optional witness allocation on equal-phase bursts: with the
++    // current exact-integer tile acceptance there is not enough independent
++    // physical RGB information at ANY pixel, regardless of GPU speed.
++    const bool bOffWitnessPotential=(!sr&&seedCount>=6u&&
++        iris26887::canSupplyTwiceEachBayerColor(bOffCoarse,localCfa));
+     auto hdrqShader=sr?nullptr:iris26864::makeRealHdrqCfaBridge(ctx.device);
+     auto wronskiShader=sr?iris26864::makeRealWronskiCfaBridge(ctx.device):nullptr;
+     // The evidence shader exists ONLY for Super Res ON; under failure,
+@@ -211,6 +274,12 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+         bOnChromaEvidence(nullptr,{device.queue()});
+     if(sr) bOnChromaEvidence.reset(
+         iris26864::makeRealWronskiChromaGuide(ctx.device).release());
++    // B OFF four independent source-of-truth compute kernels. Each separate
++    // descriptor set remains owned through CommandSubmissionOwner's fence.
++    using BOffKernel=std::unique_ptr<iris26864::VulkanKernelExecutor,
++        Iris26880WaitedVulkanRetire<iris26864::VulkanKernelExecutor>>;
++    BOffKernel bOffTile(nullptr,{device.queue()}),bOffAcc(nullptr,{device.queue()}),
++               bOffFinish(nullptr,{device.queue()}),bOffReconcile(nullptr,{device.queue()});
+     auto clipShader=iris26864::makeRealSensorClipToGlBridge(ctx.device);
+     // Capture scope is the GPU lifetime. The real RAWR original tiled wavelet
+     // and its final copy descriptor/pipeline are created before command record
+@@ -228,6 +297,181 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     iris26864::runRealRawrFromFrozenDirectNormals(req,commands,[&](
+         const rawr::raw_gpu_pipeline::BurstRunResult& result,
+         const iris26864::RealRawrRunRequest& original){
++        // IRIS_26887_B_OFF_PIXEL_LOCAL_ORIGINAL_RAW_COLOR_WITNESS.
++        // The original RAWR merge has finished and its GPU scratch is held.
++        // In fenced-two-slot mode, the existing upload callback safely
++        // revisits each original DirectByteBuffer after the pinned merge;
++        // resident mode reuses its already loaded unique immutable views.
++        // Extra uploads MUST be accounted for separately in source receipts.
++        // Optional sidecar creation is deferred until AFTER HDR+ succeeds;
++        // a low-memory device must never sacrifice primary RAW reconstruction
++        // or optional-DNG independence to make room for this color witness.
++        if(bOffWitnessPotential){
++            try {
++                bOffArena.reset(new iris26864::VulkanImageArena(
++                    ctx.physicalDevice,ctx.device,
++                    VkDeviceSize(outWidth)*outHeight*6ull+(4ull<<20u)));
++                bOffWitnessSlot=bOffArena->allocate(outWidth,outHeight,VK_FORMAT_R32_UINT,
++                    VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT);
++                bOffShiftSlot=bOffArena->allocate((outWidth+31u)/32u,(outHeight+31u)/32u,
++                    VK_FORMAT_R32G32B32A32_SINT,VK_IMAGE_USAGE_STORAGE_BIT);
++                bOffWitnessAllocated=true;
++            } catch (const std::exception& error) {
++                bOffArena.reset(); // free any successful partial allocation
++                bOffWitnessSlot=SIZE_MAX;bOffShiftSlot=SIZE_MAX;
++                __android_log_print(ANDROID_LOG_WARN,"Iris26887",
++                    "B_OFF_RAW_WITNESS_NO_MEMORY inherited HDRQ fallback: %s",error.what());
++            }
++            if(bOffWitnessAllocated){
++                try {
++                    bOffTile.reset(iris26864::makeRealBOffRawTileRefine(ctx.device).release());
++                    bOffAcc.reset(iris26864::makeRealBOffRawAccumulate(ctx.device).release());
++                    bOffFinish.reset(iris26864::makeRealBOffRawFinalize(ctx.device).release());
++                    bOffReconcile.reset(iris26864::makeRealBOffStrictWitnessReconcile(ctx.device).release());
++                } catch (const std::exception& error) {
++                    // No evidence has been dispatched yet. Fail this optional
++                    // color guide closed, preserving the successful HDRQ JPEG.
++                    __android_log_print(ANDROID_LOG_WARN,"Iris26887",
++                        "B_OFF_WITNESS_PIPELINE_UNAVAILABLE fallback: %s",error.what());
++                    bOffReconcile.reset();bOffFinish.reset();bOffAcc.reset();bOffTile.reset();
++                    bOffArena.reset(); // no GPU use started, free optional arena
++                    bOffWitnessSlot=SIZE_MAX;bOffShiftSlot=SIZE_MAX;
++                    bOffWitnessAllocated=false;
++                }
++            }
++            if(bOffWitnessAllocated){
++                // Layout initialization and its transfer-clear are separate
++                // fence-waited submissions, preventing a COMPUTE->TRANSFER race.
++                commands.execute([&](VkCommandBuffer cmd){
++                    bOffArena->recordInitialGeneralTransitions(cmd);
++                });
++                commands.execute([&](VkCommandBuffer cmd){
++                    VkClearColorValue zero{};
++                    VkImageSubresourceRange whole{VK_IMAGE_ASPECT_COLOR_BIT,0u,1u,0u,1u};
++                    vkCmdClearColorImage(cmd,bOffArena->at(bOffWitnessSlot).image,
++                        VK_IMAGE_LAYOUT_GENERAL,&zero,1u,&whole);
++                    VkMemoryBarrier cleared{};cleared.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++                    cleared.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
++                    cleared.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
++                    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,
++                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1u,&cleared,0,nullptr,0,nullptr);
++                });
++            }
++        }
++        bool bOffWitnessReady=false;
++        uint32_t bOffEvidenceFrames=0;
++        if(bOffWitnessAllocated && bOffCoarse.size()==original.normals.size() &&
++           bOffTile && bOffAcc && bOffFinish && bOffReconcile){
++            const auto state=bOffArena->at(bOffWitnessSlot), shifts=bOffArena->at(bOffShiftSlot);
++            const auto refView=original.normals[size_t(referenceIndex)].borrowedRaw.view;
++            for(size_t i=0;i<original.normals.size();++i){
++                if(!bOffCoarse[i].valid)continue;
++                const auto& n=original.normals[i];
++                const auto& ref=original.normals[size_t(referenceIndex)];
++                if(!(n.exposureProduct>0.f&&ref.exposureProduct>0.f)||
++                   std::abs(n.exposureProduct/ref.exposureProduct-1.f)>.025f)continue;
++                // Original 26873 fenced RAW16 upload owner and receipt;
++                // no new camera frame collection, no change to merge count.
++                // The reference image is permanently pinned in slot 0 by
++                // the successful HDR+ merge. Only companions may occupy the
++                // recycled two-slot upload and therefore need re-uploading.
++                if(i!=size_t(referenceIndex)) original.prepareNormal(uint32_t(i));
++                const VkImageView view=n.borrowedRaw.view;
++                // Missing OPTIONAL evidence must never fail an otherwise
++                // successful B HDR+ JPEG. The incomplete per-pixel witness
++                // remains invalid and cannot authorize a color correction.
++                if(!view||!refView){
++                    __android_log_print(ANDROID_LOG_WARN,"Iris26887",
++                        "B_OFF_RAW_WITNESS_SOURCE_MISSING frame=%zu no_color_evidence",i);
++                    continue;
++                }
++                struct alignas(16) TileParams {
++                    uint32_t extent[4];int32_t initial[4];
++                    float referenceBlack[4];float companionBlack[4];float values[4];
++                } tile{};
++                static_assert(sizeof(TileParams)==80u,"26887 tile push ABI");
++                tile.extent[0]=outWidth;tile.extent[1]=outHeight;
++                tile.extent[2]=32u;tile.extent[3]=localCfa;
++                tile.initial[0]=bOffCoarse[i].dx;tile.initial[1]=bOffCoarse[i].dy;
++                for(uint32_t c=0;c<4u;++c){
++                    tile.referenceBlack[c]=ref.phaseBlack[c];
++                    tile.companionBlack[c]=n.phaseBlack[c];
++                }
++                tile.values[0]=ref.sensorWhite;tile.values[1]=n.sensorWhite;
++                tile.values[2]=ref.exposureProduct;tile.values[3]=n.exposureProduct;
++                struct alignas(16) AccParams {
++                    uint32_t extent[4];float black[4],refBlack[4],exposure[4];
++                    uint32_t flags[4];
++                } acc{};
++                static_assert(sizeof(AccParams)==80u,"26887 accumulation push ABI");
++                acc.extent[0]=outWidth;acc.extent[1]=outHeight;
++                acc.extent[2]=32u;acc.extent[3]=localCfa;
++                for(uint32_t c=0;c<4u;++c){
++                    acc.black[c]=n.phaseBlack[c];acc.refBlack[c]=ref.phaseBlack[c];
++                }
++                for(int c=0;c<4;++c)acc.exposure[c]=tile.values[c];
++                acc.flags[0]=uint32_t(i==size_t(referenceIndex));
++                acc.flags[1]=1u;acc.flags[2]=uint32_t(i);
++                commands.execute([&](VkCommandBuffer cmd){
++                    if(i!=size_t(referenceIndex)){
++                        std::vector<iris26864::BoundResource> b;
++                        for(const auto& [slot,imageView]:{
++                            std::pair<uint32_t,VkImageView>{0u,refView},
++                            {1u,view},{2u,shifts.view}}){
++                            iris26864::BoundResource t{};t.binding=slot;
++                            t.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;t.imageView=imageView;
++                            b.push_back(t);
++                        }
++                        bOffTile->record(cmd,b,&tile,sizeof(tile),shifts.width,shifts.height);
++                        VkMemoryBarrier shiftReady{};
++                        shiftReady.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++                        shiftReady.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
++                        shiftReady.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
++                        vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1u,&shiftReady,
++                            0,nullptr,0,nullptr);
++                    }
++                    std::vector<iris26864::BoundResource> b;
++                    for(const auto& [slot,imageView]:{
++                            std::pair<uint32_t,VkImageView>{0u,view},
++                            {1u,refView},{2u,shifts.view},{3u,state.view}}){
++                        iris26864::BoundResource t{};t.binding=slot;
++                        t.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;t.imageView=imageView;
++                        b.push_back(t);
++                    }
++                    bOffAcc->record(cmd,b,&acc,sizeof(acc),outWidth,outHeight);
++                });
++                ++bOffEvidenceFrames;
++            }
++            if(bOffEvidenceFrames>=6u){
++                struct FinishArgs{uint32_t width,height;};
++                FinishArgs a{outWidth,outHeight};
++                static_assert(sizeof(FinishArgs)==8u,"26887 finalize push ABI");
++                commands.execute([&](VkCommandBuffer cmd){
++                    iris26864::BoundResource b{};b.binding=0u;
++                    b.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;b.imageView=state.view;
++                    bOffFinish->record(cmd,{b},&a,sizeof(a),outWidth,outHeight);
++                });
++                bOffWitnessReady=true;
++            }
++        }
++        // If frame filtering leaves too few independent observations, the
++        // optional evidence will never be read by the AMaZE path. Retire its
++        // kernels and release its 48-MiB sidecar NOW, not after AMaZE/JPEG.
++        // CommandSubmissionOwner::execute synchronously waits every preceding
++        // optional compute submission's fence before reaching this block.
++        // Never destroy a descriptor/image while a submitted command is live.
++        if(bOffWitnessAllocated && !bOffWitnessReady){
++            bOffFinish.reset();bOffAcc.reset();bOffTile.reset();bOffReconcile.reset();
++            bOffArena.reset();
++            bOffWitnessSlot=SIZE_MAX;bOffShiftSlot=SIZE_MAX;
++            bOffWitnessAllocated=false;
++            __android_log_print(ANDROID_LOG_INFO,"Iris26887",
++                "B_OFF_RAW_WITNESS_INSUFFICIENT_LOCAL_SUPPORT optional GPU memory released before AMaZE");
++        }
++        __android_log_print(ANDROID_LOG_INFO,"Iris26887",
++            "B_OFF_PIXEL_RAW_WITNESS prepared=%d sourceFrames=%u selectedFrames=%zu",
++            int(bOffWitnessReady),bOffEvidenceFrames,original.normals.size());
+         amaze::LinearRgbImage output{};
+         output.image=rgb.image();output.view=rgb.view();
+         output.format=VK_FORMAT_R16G16B16A16_SFLOAT;
+@@ -420,6 +664,44 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+                 packedInput.format=VK_FORMAT_R16G16B16A16_SFLOAT;
+                 packedInput.layout=VK_IMAGE_LAYOUT_GENERAL;
+                 amaze.record(cmd,packedInput,output,{gainsVec[0],gainsVec[1],gainsVec[2]});
++                if(bOffWitnessReady){
++                    // Strict color-only reconciliation from physically measured
++                    // R/G/B at the SAME sensor scene point, repeated twice.
++                    // The R32UI marker is 0 for any unverified pixel, so no
++                    // color is modified there. No extra 50MP RGB allocation.
++                    VkMemoryBarrier ready{};
++                    ready.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++                    ready.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
++                    ready.dstAccessMask=VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT;
++                    vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,0,1u,&ready,
++                        0,nullptr,0,nullptr);
++                    struct alignas(16) ReconcileArgs {
++                        uint32_t imageAndLsc[4];uint32_t geometry[4];
++                        uint32_t flags[4];float wb[4];
++                    } a{};
++                    static_assert(sizeof(ReconcileArgs)==64u,"26887 WB witness push ABI");
++                    a.imageAndLsc[0]=outWidth;a.imageAndLsc[1]=outHeight;
++                    a.imageAndLsc[2]=uint32_t(lscWidth);a.imageAndLsc[3]=uint32_t(lscHeight);
++                    a.geometry[0]=uint32_t(fullSensorWidth);
++                    a.geometry[1]=uint32_t(fullSensorHeight);
++                    a.geometry[2]=uint32_t(cropX);a.geometry[3]=uint32_t(cropY);
++                    a.flags[0]=1u;
++                    for(uint32_t j=0;j<3u;++j)a.wb[j]=gainsVec[j];
++                    a.wb[3]=1.f;
++                    std::vector<iris26864::BoundResource> b;
++                    for(const auto& [slot,imageView]:{
++                            std::pair<uint32_t,VkImageView>{0u,rgb.view()},
++                            {1u,bOffArena->at(bOffWitnessSlot).view}}){
++                        iris26864::BoundResource d{};d.binding=slot;
++                        d.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;d.imageView=imageView;
++                        b.push_back(d);
++                    }
++                    iris26864::BoundResource l{};l.binding=2u;
++                    l.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;l.buffer=lsc.buffer;
++                    l.bufferRange=lsc.bytes;b.push_back(l);
++                    bOffReconcile->record(cmd,b,&a,sizeof(a),outWidth,outHeight);
++                }
+             }
+             // The sidecar is computed from ORIGINAL sensor clip bits before
+             // pre-AMaZE LSC. Expand into the full-resolution Iris clip-owner
+diff --git a/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.cpp b/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.cpp
+index cb3aed6ae82fde3d27fa5fea4326c23f1f575e16..28bef0edb8c3ae38a11a12d69594d4540a0fa174 100644
+--- a/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.cpp
+@@ -3,6 +3,10 @@
+ #include "iris26864_wronski_cfa_bridge.h"
+ #include "iris26864_clip_to_gl_bridge.h"
+ #include "iris26864_wronski_chroma_guide.h"
++#include "iris26864_b_off_raw_tile_refine.h"
++#include "iris26864_b_off_raw_accumulate.h"
++#include "iris26864_b_off_raw_finalize.h"
++#include "iris26864_b_off_strict_witness_reconcile.h"
+ #include <stdexcept>
+ #include <vector>
+ namespace iris26864 {
+@@ -62,6 +66,45 @@ std::unique_ptr<VulkanKernelExecutor> makeRealWronskiChromaGuide(VkDevice device
+                                     {2,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+                                     {3,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}},112u,1u);
+ }
++// These four kernels are intentionally B-SR-OFF only. The per-NORMAL
++// recorders need a distinct descriptor set for every frame: N<=64.
++namespace {
++std::unique_ptr<VulkanKernelExecutor> createBOffRawWitness(VkDevice device,
++   const unsigned char* bytes,size_t byteCount,const std::vector<ComputeBinding>& bindings,
++   uint32_t pushSize,uint32_t maxDispatches){
++    if(!device||!bytes||byteCount<84u||byteCount%4u!=0u||
++       reinterpret_cast<uintptr_t>(bytes)%alignof(uint32_t)||
++       reinterpret_cast<const uint32_t*>(bytes)[0]!=0x07230203u)
++        throw std::runtime_error("26887 B OFF genuine SPIR-V color witness invalid");
++    ShaderBinary shader{};shader.words=reinterpret_cast<const uint32_t*>(bytes);
++    shader.wordCount=byteCount/sizeof(uint32_t);
++    shader.workgroupX=16u;shader.workgroupY=16u;shader.workgroupZ=1u;
++    return std::make_unique<VulkanKernelExecutor>(device,shader,bindings,pushSize,maxDispatches);
++}
++}
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffRawTileRefine(VkDevice device){
++    return createBOffRawWitness(device,iris26864_b_off_raw_tile_refine_spv,
++      iris26864_b_off_raw_tile_refine_spv_size,
++      {{0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
++       {2,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}},80u,64u);
++}
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffRawAccumulate(VkDevice device){
++    return createBOffRawWitness(device,iris26864_b_off_raw_accumulate_spv,
++      iris26864_b_off_raw_accumulate_spv_size,
++      {{0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
++       {2,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},{3,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}},80u,64u);
++}
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffRawFinalize(VkDevice device){
++    return createBOffRawWitness(device,iris26864_b_off_raw_finalize_spv,
++      iris26864_b_off_raw_finalize_spv_size,
++      {{0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}},8u,1u);
++}
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffStrictWitnessReconcile(VkDevice device){
++    return createBOffRawWitness(device,iris26864_b_off_strict_witness_reconcile_spv,
++      iris26864_b_off_strict_witness_reconcile_spv_size,
++      {{0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
++       {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}},64u,1u);
++}
+ std::unique_ptr<VulkanKernelExecutor> makeRealWronskiCfaBridge(VkDevice device){
+     return create(device,iris26864_wronski_cfa_bridge_spv,
+                   iris26864_wronski_cfa_bridge_spv_size,true);
+diff --git a/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.hpp b/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.hpp
+index 47dfd813c11d0dcc472157b0896ddf185b3351eb..1a24db4ee49936328e8c0e80492a60aeca4cac90 100644
+--- a/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864NativeBridgeShaders.hpp
+@@ -10,4 +10,9 @@ std::unique_ptr<VulkanKernelExecutor> makeRealHdrqCfaBridge(VkDevice device);
+ std::unique_ptr<VulkanKernelExecutor> makeRealWronskiCfaBridge(VkDevice device);
+ std::unique_ptr<VulkanKernelExecutor> makeRealWronskiChromaGuide(VkDevice device);
+ std::unique_ptr<VulkanKernelExecutor> makeRealSensorClipToGlBridge(VkDevice device);
++// B OFF pixel-local ORIGINAL-RAW color witness, developer integration stage.
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffRawTileRefine(VkDevice device);
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffRawAccumulate(VkDevice device);
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffRawFinalize(VkDevice device);
++std::unique_ptr<VulkanKernelExecutor> makeRealBOffStrictWitnessReconcile(VkDevice device);
+ }
+diff --git a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+index f850b70b14d8114c4d2566e525a06aefd9715ac1..cd2eef1925d94d66760a35ef4907845bad74a4a8 100644
+--- a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
++++ b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+@@ -26,7 +26,23 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
+ set(GLSLC "${Python3_EXECUTABLE};${CMAKE_CURRENT_SOURCE_DIR}/iris26864/compile_locked_rawr_glslc.py;--validator=${IRIS26681_GLSLANG};--spirv-val=${IRIS26864_SPIRV_VAL};--spirv-opt=${IRIS26864_SPIRV_OPT}")
+ # Unmodified upstream target, shader registry, descriptor layouts, source
+ # order, 2-slot coordinator and burst noise logic. No competing owner.
+-add_subdirectory("${IRIS26864_VENDOR_PIPELINE}"
++# IRIS_26887_B_OFF_SOURCE_SEALED_SHADER_OVERLAY
++# The sealed vendor tree remains byte-for-byte pinned in app/src. Only a
++# GENERATED PRIVATE BUILD copy is compiled for native B HDRQ; no source
++# download, writes to app/src/vendor, or alteration to Wronski kernels.
++set(IRIS26887_VENDOR_SHADOW "${CMAKE_CURRENT_BINARY_DIR}/iris26887_b_only_vendor/native")
++file(COPY "${IRIS26864_VENDOR_ROOT}/" DESTINATION "${IRIS26887_VENDOR_SHADOW}")
++configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqMerge.comp"
++    "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_merge.comp" COPYONLY)
++configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp"
++    "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_mismatch_norm.comp" COPYONLY)
++configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqDeconvolute.comp"
++    "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_deconvolute.comp" COPYONLY)
++configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp"
++    "${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline/src/HdrPlusRecorder.cpp" COPYONLY)
++# CMake's existing upstream shader-list, target names and GLSLC adapter
++# remain exactly the same. Binary/prod/trace all compile from the B copy.
++add_subdirectory("${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline"
+                  "${CMAKE_CURRENT_BINARY_DIR}/iris26864_vendor_pipeline")
+ set_target_properties(raw_gpu_pipeline PROPERTIES POSITION_INDEPENDENT_CODE ON)
+ target_link_libraries(iris26856amaze PRIVATE raw_gpu_pipeline)
+@@ -37,13 +53,21 @@ target_link_libraries(iris26856amaze PRIVATE raw_gpu_pipeline)
+ set(IRIS26864_BRIDGE_SPV_DIR "${CMAKE_CURRENT_BINARY_DIR}/iris26864_bridge_spv")
+ file(MAKE_DIRECTORY "${IRIS26864_BRIDGE_SPV_DIR}")
+ set(IRIS26864_BRIDGE_EMBED "${IRIS26864_VENDOR_ROOT}/vk_common/cmake/EmbedBinary.cmake")
+-foreach(BRIDGE_NAME IN ITEMS hdrq_cfa_bridge wronski_cfa_bridge clip_to_gl_bridge wronski_chroma_guide)
++foreach(BRIDGE_NAME IN ITEMS hdrq_cfa_bridge wronski_cfa_bridge clip_to_gl_bridge wronski_chroma_guide b_off_raw_tile_refine b_off_raw_accumulate b_off_raw_finalize b_off_strict_witness_reconcile)
+   if(BRIDGE_NAME STREQUAL "hdrq_cfa_bridge")
+     set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26864HdrqCfaToAmaze.comp")
+   elseif(BRIDGE_NAME STREQUAL "wronski_cfa_bridge")
+     set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/Iris26864WronskiPackedCfa2x.comp")
+   elseif(BRIDGE_NAME STREQUAL "wronski_chroma_guide")
+     set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/Iris26885WronskiChromaGuide.comp")
++  elseif(BRIDGE_NAME STREQUAL "b_off_raw_tile_refine")
++    set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffRawWitnessTileRefineRaw16.comp")
++  elseif(BRIDGE_NAME STREQUAL "b_off_raw_accumulate")
++    set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffRawWitnessAccumulate.comp")
++  elseif(BRIDGE_NAME STREQUAL "b_off_raw_finalize")
++    set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffRawWitnessFinalize.comp")
++  elseif(BRIDGE_NAME STREQUAL "b_off_strict_witness_reconcile")
++    set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26887BOffStrictWitnessReconcile.comp")
+   else()
+     set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/iris26864/Iris26864PackedSensorClipToGl.comp")
+   endif()
+diff --git a/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp b/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp
+index 51b756c864e27450caf2ba1fd7ce67f9fb96a6f9..6daf508a5f19d313b7db5373e7684498c74974b9 100644
+--- a/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp
++++ b/app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp
+@@ -53,6 +53,23 @@ float colorStrength(vec3 wbRgb){
+     float y=yOf(wbRgb);
+     return length(wbRgb-vec3(y))/max(y,0.025);
+ }
++// IRIS_26887_ON_ONLY_NEUTRAL_WRONSKI_SOURCE: paired source observations,
++// not a consensus of post-AMaZE RGB and not a generic chroma filter.
++// The 26886 single-pixel guide remains authoritative for genuine colors.
++float sourceNeutralAt(ivec2 q, float centerY){
++    if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.width,p.height))))return 0.0;
++    vec3 v=imageLoad(wronskiRgb,q).rgb;
++    if(!finiteRgb(v)||any(lessThan(v,vec3(0))))return 0.0;
++    vec3 g=lscGain(q);
++    if(!finiteRgb(g)||any(lessThanEqual(g,vec3(0))))return 0.0;
++    vec3 w=v*g*p.wb.rgb;
++    float y=yOf(w);
++    if(!finiteRgb(w)||y<0.025||y>8.0)return 0.0;
++    float similarY=1.0-smoothstep(0.06,0.17,
++                    abs(y-centerY)/max(max(y,centerY),0.025));
++    float neutral=1.0-smoothstep(0.018,0.039,colorStrength(w));
++    return similarY*neutral;
++}
+ void main(){
+     ivec2 px=ivec2(gl_GlobalInvocationID.xy);
+     if(any(greaterThanEqual(px,ivec2(p.width,p.height))))return;
+@@ -79,6 +96,22 @@ void main(){
+     float gMag=length(gc)/max(yg,0.012);
+     float difference=length(cc/max(yc,0.012)-gc/max(yg,0.012));
+     if(difference<0.022||cMag<0.018)return;
++    // The independent original Wronski RGB must be accurately neutral at
++    // this source point AND have two-sided same-luma neutral witnesses along
++    // a real image axis. Never infer neutrality from center AMaZE alternation.
++    float neutralPair=0.0;
++    if(gMag<0.025&&cMag>0.055&&difference>0.045){
++        float h=min(max(sourceNeutralAt(px+ivec2(2,0),yg),
++                        sourceNeutralAt(px+ivec2(6,0),yg)),
++                    max(sourceNeutralAt(px-ivec2(2,0),yg),
++                        sourceNeutralAt(px-ivec2(6,0),yg)));
++        float v=min(max(sourceNeutralAt(px+ivec2(0,2),yg),
++                        sourceNeutralAt(px+ivec2(0,6),yg)),
++                    max(sourceNeutralAt(px-ivec2(0,2),yg),
++                        sourceNeutralAt(px-ivec2(0,6),yg)));
++        neutralPair=max(h,v)*smoothstep(0.055,0.105,cMag);
++        neutralPair=smoothstep(0.77,0.96,neutralPair);
++    }
+ 
+     // Look for real chromatic evidence matching THIS candidate's hue in
+     // original Wronski RGB. An isolated different-hue noise spike must not
+@@ -134,7 +167,7 @@ void main(){
+     float noiseCleanup=0.34*shadow*incoherent*
+         smoothstep(0.035,0.18,chromaExcess)*
+         smoothstep(0.022,0.20,difference);
+-    float unsupported=max(falseColor,noiseCleanup)*(1.0-witness);
++    float unsupported=max(max(falseColor,noiseCleanup),0.55*neutralPair)*(1.0-witness);
+     if(unsupported<0.0001)return;
+ 
+     uint bits=imageLoad(originalSensorClip,px/2).r&15u;
+@@ -143,8 +176,8 @@ void main(){
+     // hue. Multichannel-clipped neutral reflection may fade ONLY toward
+     // neutral when independent Wronski consensus itself is neutral.
+     float clipWeight=clipped==0?1.0:(clipped==1?0.50:0.30*neutral);
+-    float weight=clamp(0.86*falseColor+noiseCleanup,0.0,0.86)*
+-        (1.0-witness)*clipWeight;
++    float weight=max(clamp(0.86*falseColor+noiseCleanup,0.0,0.86),
++                     0.55*neutralPair)*(1.0-witness)*clipWeight;
+     if(weight<0.0001)return;
+     vec3 targetN=mix(gc/max(yg,0.012),consensus,0.48);
+     // Do not synthesize a target hue when the independent guide is near
+@@ -153,6 +186,9 @@ void main(){
+     if(targetNorm>consensusMag+0.015)
+         targetN*= (consensusMag+0.015)/max(targetNorm,1e-8);
+     if(clipped>=2)targetN=mix(targetN,vec3(0),neutral);
++    // Only genuinely source-neutral evidence can extend the old guide; a
++    // true chromatic microstructure must retain its original Wronski hue.
++    targetN=mix(targetN,vec3(0),neutralPair);
+     vec3 targetChroma=targetN*yc;
+     // Exact zero-y chroma invariant, even after interpolation and clipping.
+     targetChroma-=vec3(yOf(targetChroma));
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqDeconvolute.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqDeconvolute.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b9c9322b2267a00857ad9ce030e920e9d05d3fd5
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqDeconvolute.comp
+@@ -0,0 +1,38 @@
++#version 450
++// Port of hdr-plus-swift deconvolute_frequency_domain (tile size 8): mild
++// per-frequency gain against blur from residual misalignment, faded out for
++// high-mismatch tiles and strong frequencies. One lane per bin; bin (0,0)
++// is never modified, so every lane may read it.
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 0, rgba32f) uniform image2D ft;
++layout(set = 0, binding = 1, r32f) readonly uniform image2D totalMismatch;
++layout(push_constant) uniform P {
++    ivec2 tiles;
++} p;
++
++const float CW[8] = float[8](0.00, 0.02, 0.04, 0.08, 0.04, 0.08, 0.04, 0.02);
++
++void main() {
++    ivec2 t = ivec2(gl_WorkGroupID.xy);
++    if (any(greaterThanEqual(t, p.tiles))) return;
++    int dm = int(gl_LocalInvocationID.x), dn = int(gl_LocalInvocationID.y);
++    float mm = imageLoad(totalMismatch, t).x;
++    if (dm + dn == 0 || !(mm < 0.3)) return;
++    ivec2 t0 = t * 8;
++    float mismatchWeight = clamp(1.0 - 10.0 * (mm - 0.2), 0.0, 1.0);
++    vec4 zRe = imageLoad(ft, ivec2(2 * t0.x, t0.y)), zIm = imageLoad(ft, ivec2(2 * t0.x + 1, t0.y));
++    vec4 zMag = sqrt(zRe * zRe + zIm * zIm);
++    float magnitudeZero = zMag.x + zMag.y + zMag.z + zMag.w;
++    // A truly black/empty reference Fourier tile carries no usable DC energy.
++    // The original divide by zero below would make an undefined gain and
++    // potentially poison a tile. Keep its frequency unchanged instead.
++    if (!(magnitudeZero > 1.0e-12)) return;
++    ivec2 o = ivec2(2 * (t0.x + dm), t0.y + dn);
++    vec4 re = imageLoad(ft, o), im = imageLoad(ft, o + ivec2(1, 0));
++    vec4 mag = sqrt(re * re + im * im);
++    float magnitude = mag.x + mag.y + mag.z + mag.w;
++    float weight = mismatchWeight * clamp(1.25 - 25.0 * magnitude / magnitudeZero, 0.0, 1.0);
++    float gain = (1.0 + weight * CW[dm]) * (1.0 + weight * CW[dn]);
++    imageStore(ft, o, gain * re);
++    imageStore(ft, o + ivec2(1, 0), gain * im);
++}
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9e343a8a5ddcfa44ccdbbf65be832b77208f382
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+@@ -0,0 +1,142 @@
++#version 450
++// Port of hdr-plus-swift merge_frequency_domain: per tile,
++// pick the best of 7x7 sub-pixel Fourier shifts of the aligned tile, then
++// merge each frequency bin with a Wiener-shrinkage weight (Hasinoff 2016,
++// Liba 2019 motion norm, Delbracio 2015 magnitude norm). One 8x8 workgroup
++// per tile, then every lane merges its own bin.
++// Shift search: upstream minimizes sum_k |ref_k - e^{i theta}·al_k|^2 over
++// channels. Rotation preserves |al_k|, so this equals a shift-independent
++// constant minus 2 * sum_k (cos·A_k + sin·B_k) with per-bin cross terms
++// A_k = sum_ch(refRe·alRe + refIm·alIm), B_k = sum_ch(refIm·alRe - refRe·alIm):
++// the same argmin from 2 floats per bin instead of 16 (shared-memory bound on
++// mobile GPUs); first maximum wins like upstream's first minimum.
++// Bracketed bursts (Rawr): instead of upstream's equal-weight mean of
++// (1-w)*aligned + w*ref, each frame adds frameWeight*(1-w)*aligned and its
++// weight to a per-bin sum seeded with the reference at weight 1
++// (hdrq_normalize divides). frameWeight is the exposure factor, the inverse
++// shot-noise variance of a frame scaled to the reference exposure, so the
++// brighter frames carry the shadows and rejected bins add nothing.
++layout(local_size_x = 8, local_size_y = 8) in;
++layout(set = 0, binding = 0, rgba32f) readonly uniform image2D refFt;
++layout(set = 0, binding = 1, rgba32f) readonly uniform image2D alignedFt;
++layout(set = 0, binding = 2, rgba32f) uniform image2D outFt;
++layout(set = 0, binding = 3, rgba32f) readonly uniform image2D rms;
++layout(set = 0, binding = 4, r32f) readonly uniform image2D mismatch;
++// (cos, sin) per shift and bin, index shift * 64 + n * 8 + m (hdrq_shift_table).
++layout(std430, set = 0, binding = 5) readonly buffer ShiftTable { vec2 v[]; } shiftTable;
++// Per-tile clipped-highlights factor (hdrq_highlights_norm; 1 when uniform).
++layout(set = 0, binding = 6, r32f) readonly uniform image2D highlights;
++// Per-bin weight sum (bracketed only), one texel per bin at (t*8 + (dm, dn)).
++layout(set = 0, binding = 7, r32f) uniform image2D weightSum;
++layout(push_constant) uniform P {
++    ivec2 tiles;
++    float robustnessNorm;
++    float readNoise;
++    float maxMotionNorm;
++    int uniformExposure;
++    float frameWeight;
++} p;
++
++shared vec4 sRefRe[64], sRefIm[64], sAlRe[64], sAlIm[64];  // index dn*8 + dm
++shared float sDiff[49];
++shared float sA[64], sB[64];
++shared int sBest;
++
++void main() {
++    ivec2 t = ivec2(gl_WorkGroupID.xy);
++    if (any(greaterThanEqual(t, p.tiles))) return;
++    int dm = int(gl_LocalInvocationID.x), dn = int(gl_LocalInvocationID.y);
++    int lane = dn * 8 + dm;
++    const int ts = 8;
++    ivec2 t0 = t * ts;
++    ivec2 o = ivec2(2 * (t0.x + dm), t0.y + dn);
++    sRefRe[lane] = imageLoad(refFt, o);
++    sRefIm[lane] = imageLoad(refFt, o + ivec2(1, 0));
++    sAlRe[lane] = imageLoad(alignedFt, o);
++    sAlIm[lane] = imageLoad(alignedFt, o + ivec2(1, 0));
++    {
++        vec4 a = sRefRe[lane] * sAlRe[lane] + sRefIm[lane] * sAlIm[lane];
++        vec4 b = sRefIm[lane] * sAlRe[lane] - sRefRe[lane] * sAlIm[lane];
++        sA[lane] = a.x + a.y + a.z + a.w;
++        sB[lane] = b.x + b.y + b.z + b.w;
++    }
++    barrier();
++    if (lane < 49) {
++        float total = 0.0;
++        for (int k = 0; k < 64; ++k) {
++            vec2 cs = shiftTable.v[lane * 64 + k];
++            total += cs.x * sA[k] + cs.y * sB[k];
++        }
++        sDiff[lane] = total;
++    }
++    barrier();
++    if (lane == 0) {
++        float best = -1e30;
++        int bi = 0;
++        for (int i = 0; i < 49; ++i)
++            if (sDiff[i] > best) {
++                best = sDiff[i];
++                bi = i;
++            }
++        sBest = bi;
++    }
++    barrier();
++    float mm = imageLoad(mismatch, t).x;
++    // IRIS_26887_B_OFF_MOTION_LOCAL: original RAWR vendor is unchanged.
++    // This modified shader is only compiled into Iris's B-only mirrored build.
++    // Uniform exposures: retain the configured 13 strength in static tiles,
++    // transition to strength-8-equivalent for noise-inconsistent tiles.
++    // Bracketed-exposure path remains byte/mathematically unchanged below.
++    float localMotion = p.uniformExposure != 0 ? smoothstep(0.10, 0.38, mm) : 0.0;
++    const float strength8Robustness = 0.29730178;
++    const float strength8ReadNoise = 2.29739671;
++    const float strength8MaxMotion = 1.58270825;
++    float adaptiveRobustness = mix(p.robustnessNorm,
++          min(p.robustnessNorm, strength8Robustness), localMotion);
++    float adaptiveReadNoise = mix(p.readNoise,
++          min(p.readNoise, strength8ReadNoise), localMotion);
++    float adaptiveMaxMotion = mix(p.maxMotionNorm,
++          min(p.maxMotionNorm, strength8MaxMotion), localMotion);
++    vec4 noiseNorm = (imageLoad(rms, t) + adaptiveReadNoise) * float(ts * ts) * adaptiveRobustness;
++    float mismatchWeight = clamp(1.0 - 10.0 * (mm - 0.2), 0.0, 1.0);
++    float motionNorm = clamp(adaptiveMaxMotion - (mm - 0.02) *
++          (adaptiveMaxMotion - 1.0) / 0.15, 1.0, adaptiveMaxMotion);
++    vec2 cs = shiftTable.v[sBest * 64 + lane];
++    float c = cs.x, s = cs.y;
++    vec4 refRe = sRefRe[lane], refIm = sRefIm[lane];
++    vec4 alRe = c * sAlRe[lane] - s * sAlIm[lane];
++    vec4 alIm = s * sAlRe[lane] + c * sAlIm[lane];
++    float magnitudeNorm = 1.0;
++    // Magnitude norm only for uniform exposure (brighter frames have larger magnitudes).
++    if (dm + dn > 0 && mm < 0.3 && p.uniformExposure != 0) {
++        vec4 refMag = sqrt(refRe * refRe + refIm * refIm);
++        vec4 alMag = sqrt(alRe * alRe + alIm * alIm);
++        float refEnergy = refMag.x + refMag.y + refMag.z + refMag.w;
++        // A completely dark/empty reference frequency tile cannot define an
++        // aligned/reference magnitude ratio. Never divide by zero and feed
++        // NaN to Wiener weights; retain the neutral magnitude prior instead.
++        if (refEnergy > 1.0e-12) {
++            float ratio = (alMag.x + alMag.y + alMag.z + alMag.w) / refEnergy;
++            magnitudeNorm = mismatchWeight * clamp(ratio * ratio * ratio * ratio, 0.5, 3.0);
++        }
++    }
++    vec4 w4 = (refRe - alRe) * (refRe - alRe) + (refIm - alIm) * (refIm - alIm);
++    w4 = w4 / (w4 + magnitudeNorm * motionNorm * noiseNorm * imageLoad(highlights, t).x);
++    float lo = min(w4.x, min(w4.y, min(w4.z, w4.w))), hi = max(w4.x, max(w4.y, max(w4.z, w4.w)));
++    // Mean of the two central channel weights (upstream's robust variant of Liba's max).
++    float weight = clamp(0.5 * (w4.x + w4.y + w4.z + w4.w - lo - hi), 0.0, 1.0);
++    if (p.uniformExposure != 0) {
++        // Do not omit a rejected companion from the fixed-count uniform
++        // denominator: substitute reference frequencies to preserve energy.
++        float reject = smoothstep(0.24, 0.60, mm);
++        weight = mix(weight, 1.0, reject);
++        imageStore(outFt, o, imageLoad(outFt, o) + (1.0 - weight) * alRe + weight * refRe);
++        imageStore(outFt, o + ivec2(1, 0), imageLoad(outFt, o + ivec2(1, 0)) + (1.0 - weight) * alIm + weight * refIm);
++    } else {
++        float w = p.frameWeight * (1.0 - weight);
++        ivec2 bin = t0 + ivec2(dm, dn);
++        imageStore(outFt, o, imageLoad(outFt, o) + w * alRe);
++        imageStore(outFt, o + ivec2(1, 0), imageLoad(outFt, o + ivec2(1, 0)) + w * alIm);
++        imageStore(weightSum, bin, imageLoad(weightSum, bin) + w);
++    }
++}
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1d11ffd5c8c05d063b47be549f5d941a41a459c
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMismatchNorm.comp
+@@ -0,0 +1,26 @@
++#version 450
++// Port of hdr-plus-swift normalize_mismatch + add_texture: rescales so the
++// mean mismatch is 0.12 (just below the 0.17 threshold), clamps to [0,1] and
++// accumulates the pass-total mismatch (mean over frames) for deconvolution.
++layout(local_size_x = 16, local_size_y = 16) in;
++layout(set = 0, binding = 0, r32f) uniform image2D mismatch;
++layout(set = 0, binding = 1, r32f) uniform image2D total;
++layout(std430, set = 0, binding = 2) readonly buffer Mean { float v[]; } mean;
++layout(push_constant) uniform P {
++    ivec2 tiles;
++    float invFrames;
++    int uniformExposure;
++} p;
++
++void main() {
++    ivec2 g = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(g, p.tiles))) return;
++    // Preserve upstream exact for exposure-bracketed runs; B uniform burst
++    // never lets moving subjects elsewhere suppress the local RAW mismatch
++    // below 75% of its original noise-normalized magnitude.
++    float upstreamScale = 0.12 / (mean.v[0] + 1e-12);
++    float scale = p.uniformExposure != 0 ? max(upstreamScale, 0.75) : upstreamScale;
++    float m = clamp(imageLoad(mismatch, g).x * scale, 0.0, 1.0);
++    imageStore(mismatch, g, vec4(m));
++    imageStore(total, g, vec4(imageLoad(total, g).x + m * p.invFrames));
++}
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..21f9ff3fe736f184e68fe35f43f218dd8529aeb0
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -0,0 +1,710 @@
++#include <rawr/raw_gpu_pipeline/HdrPlusRecorder.h>
++
++#include <algorithm>
++#include <cmath>
++#include <stdexcept>
++#include <string>
++#include <utility>
++
++namespace rawr::raw_gpu_pipeline {
++namespace {
++namespace hp = rawr::raw_merge_hdrplus_gpu;
++
++constexpr std::uint32_t divUp(std::uint32_t x, std::uint32_t y) { return (x + y - 1u) / y; }
++ImageBinding ib(std::uint32_t b, const ArenaImage& i) { return {b, i.view, VK_IMAGE_LAYOUT_GENERAL}; }
++BufferBinding bb(std::uint32_t b, const ArenaBuffer& buf) { return {b, buf.buffer, 0, buf.bytes}; }
++std::string levelName(bool reference, std::size_t level) {
++    return std::string(reference ? "hdrp_ref_l" : "hdrp_comp_l") + std::to_string(level);
++}
++
++struct PreparePc {
++    float blackDelta[4];
++    float refBlack[4];
++    std::int32_t padX, padY, width, height, paddedWidth, paddedHeight;
++    float gain;
++};
++// Push-constant structs mirror the GLSL blocks (ivec2 members are 8-byte aligned).
++struct HotPixelPc {
++    std::int32_t count, alignPad, padX, padY, width, height;
++};
++struct SizePc {
++    std::int32_t width, height;
++};
++struct AvgPoolPc {
++    std::int32_t width, height;
++    float clampTo;
++};
++struct BlurPc {
++    std::int32_t width, height, srcX, srcY, dstX, dstY, kernelSize, stride, direction, quantizeHalf;
++};
++struct UpsamplePc {
++    std::int32_t srcX, srcY, dstX, dstY;
++    float scaleX, scaleY;
++};
++struct TileCostPc {
++    std::int32_t levelWidth, levelHeight, tilesX, tilesY, downscale, tileSize, useSsd, exposureRatio;
++};
++struct BestTilePc {
++    std::int32_t tilesX, tilesY, downscale;
++};
++struct WarpPc {
++    std::int32_t width, height, padX, padY, paddedWidth, paddedHeight, tilesX, tilesY, halfTileSize;
++};
++struct ColorDiffPc {
++    std::int32_t cellsX, cellsY, aX, aY, bX, bY;
++};
++struct MeanPc {
++    std::int32_t count;
++    float pixels;
++};
++struct WeightPc {
++    std::int32_t cellsX, cellsY;
++    float robustness;
++};
++struct AccumulatePc {
++    std::int32_t width, height, padX, padY, cellsX, cellsY;
++    float invCount;
++    std::int32_t mode;
++};
++struct FinalizePc {
++    float black[4];
++    float white;
++    std::int32_t alignPad, width, height;
++};
++}  // namespace
++
++ScratchLayout makeHdrPlusScratchLayout(const hp::Geometry& g) {
++    ScratchLayout l{};
++    const Extent2D raw{g.width, g.height}, padded{g.paddedWidth, g.paddedHeight}, cells{g.width / 2u, g.height / 2u};
++    const auto add = [&](const char* name, Extent2D e, PixelStorage s, Lifetime life) {
++        l.images.push_back({name, e, s, life});
++        l.logicalImageBytes += std::uint64_t(e.width) * e.height * bytesPerPixel(s);
++    };
++    add("hdrp_ref_padded", padded, PixelStorage::R32Float, Lifetime::Burst);
++    add("hdrp_comp_padded", padded, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrp_aligned", raw, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrp_ref_blur", raw, PixelStorage::R32Float, Lifetime::Burst);
++    add("hdrp_comp_blur", raw, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrp_blur_tmp", raw, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrp_diff", cells, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrp_weight", cells, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrp_accum", raw, PixelStorage::R32Float, Lifetime::Output);
++    add("hdrp_output", raw, PixelStorage::RGBA16Float, Lifetime::Output);
++    add("hdrp_cfa", raw, PixelStorage::R32Float, Lifetime::Output);
++    const Extent2D level0{g.levels.front().width, g.levels.front().height};
++    add("hdrp_pyr_tmp_a", level0, PixelStorage::R32Float, Lifetime::PyramidTemp);
++    add("hdrp_pyr_tmp_b", level0, PixelStorage::R32Float, Lifetime::PyramidTemp);
++    std::uint64_t maxTiles = 1u;
++    for (std::size_t i = 0; i < g.levels.size(); ++i) {
++        const Extent2D e{g.levels[i].width, g.levels[i].height};
++        l.images.push_back({levelName(true, i), e, PixelStorage::R32Float, Lifetime::Burst});
++        l.images.push_back({levelName(false, i), e, PixelStorage::R32Float, Lifetime::Companion});
++        l.logicalImageBytes += 2ull * e.width * e.height * 4ull;
++        maxTiles = std::max<std::uint64_t>(maxTiles, std::uint64_t(g.levels[i].tilesX) * g.levels[i].tilesY);
++    }
++    const auto addBuffer = [&](const char* name, std::uint64_t bytes) {
++        l.buffers.push_back({name, bytes, Lifetime::Companion});
++        l.logicalBufferBytes += bytes;
++    };
++    addBuffer("hdrp_align_a", maxTiles * 8u);
++    addBuffer("hdrp_align_b", maxTiles * 8u);
++    addBuffer("hdrp_align_c", maxTiles * 8u);
++    addBuffer("hdrp_tile_cost", maxTiles * 25u * 4u);
++    addBuffer("hdrp_columns", std::uint64_t(cells.width) * 4u);
++    addBuffer("hdrp_noise", 16u);
++    return l;
++}
++
++HdrPlusRecorder::HdrPlusRecorder(ResourceArena& arena, VulkanExecutor& executor, hp::Config config,
++                                 hp::Geometry geometry)
++    : arena_(arena), executor_(executor), config_(config), geometry_(std::move(geometry)) {
++    if (geometry_.levels.empty()) throw std::invalid_argument("hdrplus recorder: empty geometry");
++}
++
++void HdrPlusRecorder::recordPrepare(VkCommandBuffer c, bool reference, VkImageView rawU16,
++                                    const RawNormalization& frame) {
++    const auto& dst = arena_.image(reference ? "hdrp_ref_padded" : "hdrp_comp_padded");
++    PreparePc pc{};
++    for (int i = 0; i < 4; ++i) {
++        pc.blackDelta[i] = reference_.blackByPhase[i] - frame.blackByPhase[i];
++        pc.refBlack[i] = reference_.blackByPhase[i];
++    }
++    pc.gain = reference ? 1.0f : companionGain_;
++    pc.padX = std::int32_t(geometry_.padLeft);
++    pc.padY = std::int32_t(geometry_.padTop);
++    pc.width = std::int32_t(geometry_.width);
++    pc.height = std::int32_t(geometry_.height);
++    pc.paddedWidth = std::int32_t(geometry_.paddedWidth);
++    pc.paddedHeight = std::int32_t(geometry_.paddedHeight);
++    executor_.record(c, ShaderId::HdrpPrepare, {{{0u, rawU16, VK_IMAGE_LAYOUT_GENERAL}, ib(1, dst)}, {}}, &pc,
++                     sizeof(pc), divUp(geometry_.paddedWidth, 16), divUp(geometry_.paddedHeight, 16));
++    computeWriteBarrier(c);
++    if (hotPixelBuffer_ && hotPixelCount_) {
++        HotPixelPc hpc{std::int32_t(hotPixelCount_), 0, pc.padX, pc.padY, pc.width, pc.height};
++        executor_.record(c, ShaderId::HdrpHotPixel, {{ib(0, dst)}, {BufferBinding{1u, hotPixelBuffer_}}}, &hpc,
++                         sizeof(hpc), divUp(hotPixelCount_, 64), 1);
++        computeWriteBarrier(c);
++    }
++}
++
++void HdrPlusRecorder::recordBlur(VkCommandBuffer c, const ArenaImage& src, std::array<std::int32_t, 2> srcOffset,
++                                 const ArenaImage& tmp, const ArenaImage& dst, std::uint32_t w, std::uint32_t h,
++                                 std::int32_t kernelSize, std::int32_t stride, bool quantizeHalf) {
++    BlurPc x{std::int32_t(w), std::int32_t(h), srcOffset[0], srcOffset[1], 0, 0, kernelSize, stride, 0,
++             quantizeHalf ? 1 : 0};
++    executor_.record(c, ShaderId::HdrpBlur, {{ib(0, src), ib(1, tmp)}, {}}, &x, sizeof(x), divUp(w, 16),
++                     divUp(h, 16));
++    computeWriteBarrier(c);
++    BlurPc y = x;
++    y.srcX = y.srcY = 0;
++    y.direction = 1;
++    executor_.record(c, ShaderId::HdrpBlur, {{ib(0, tmp), ib(1, dst)}, {}}, &y, sizeof(y), divUp(w, 16),
++                     divUp(h, 16));
++    computeWriteBarrier(c);
++}
++
++void HdrPlusRecorder::recordPyramid(VkCommandBuffer c, bool reference) {
++    const auto& padded = arena_.image(reference ? "hdrp_ref_padded" : "hdrp_comp_padded");
++    const auto& tmpA = arena_.image("hdrp_pyr_tmp_a");
++    const auto& tmpB = arena_.image("hdrp_pyr_tmp_b");
++    for (std::size_t i = 0; i < geometry_.levels.size(); ++i) {
++        const auto& level = geometry_.levels[i];
++        const auto& dst = arena_.image(levelName(reference, i));
++        const ArenaImage* src = &padded;
++        if (i > 0) {
++            // Upstream build_pyramid: blur(previous level, pattern 1, kernel 2), then pool.
++            const auto& prev = geometry_.levels[i - 1];
++            recordBlur(c, arena_.image(levelName(reference, i - 1)), {0, 0}, tmpA, tmpB, prev.width, prev.height, 2,
++                       1, true);
++            src = &tmpB;
++        }
++        AvgPoolPc pc{std::int32_t(level.width), std::int32_t(level.height), i == 0 ? pyramidClamp_ : 0.0f};
++        executor_.record(c, ShaderId::HdrpAvgPool, {{ib(0, *src), ib(1, dst)}, {}}, &pc, sizeof(pc),
++                         divUp(level.width, 16), divUp(level.height, 16));
++        computeWriteBarrier(c);
++    }
++}
++
++void HdrPlusRecorder::recordReference(VkCommandBuffer c, VkImageView rawU16, const RawNormalization& frame,
++                                      std::uint32_t frameCount) {
++    reference_ = frame;
++    pyramidClamp_ = 0.0f;
++    recordPrepare(c, true, rawU16, frame);
++    recordPyramid(c, true);
++    const auto& padded = arena_.image("hdrp_ref_padded");
++    const auto& blur = arena_.image("hdrp_ref_blur");
++    const std::array<std::int32_t, 2> pad{std::int32_t(geometry_.padLeft), std::int32_t(geometry_.padTop)};
++    recordBlur(c, padded, pad, arena_.image("hdrp_blur_tmp"), blur, geometry_.width, geometry_.height, 16, 2, false);
++    // Noise level: mean per-cell |ref - blur(ref)| (upstream estimate_color_noise).
++    const std::uint32_t cellsX = geometry_.width / 2u, cellsY = geometry_.height / 2u;
++    const auto& diff = arena_.image("hdrp_diff");
++    ColorDiffPc cd{std::int32_t(cellsX), std::int32_t(cellsY), pad[0], pad[1], 0, 0};
++    executor_.record(c, ShaderId::HdrpColorDiff, {{ib(0, padded), ib(1, blur), ib(2, diff)}, {}}, &cd, sizeof(cd),
++                     divUp(cellsX, 16), divUp(cellsY, 16));
++    computeWriteBarrier(c);
++    SizePc cs{std::int32_t(cellsX), std::int32_t(cellsY)};
++    executor_.record(c, ShaderId::HdrpColumnSum, {{ib(0, diff)}, {bb(1, arena_.buffer("hdrp_columns"))}}, &cs,
++                     sizeof(cs), divUp(cellsX, 64), 1);
++    computeWriteBarrier(c);
++    MeanPc mp{std::int32_t(cellsX), float(cellsX) * float(cellsY)};
++    executor_.record(c, ShaderId::HdrpMean, {{}, {bb(0, arena_.buffer("hdrp_columns")), bb(1, arena_.buffer("hdrp_noise"))}},
++                     &mp, sizeof(mp), 1, 1);
++    computeWriteBarrier(c);
++    // Accumulator starts as ref / N; companions add lerp(ref, aligned, w) / N.
++    AccumulatePc ap{std::int32_t(geometry_.width), std::int32_t(geometry_.height), pad[0], pad[1],
++                    std::int32_t(cellsX), std::int32_t(cellsY), 1.0f / float(frameCount), 0};
++    executor_.record(c, ShaderId::HdrpAccumulate,
++                     {{ib(0, padded), ib(1, arena_.image("hdrp_aligned")), ib(2, arena_.image("hdrp_weight")),
++                       ib(3, arena_.image("hdrp_accum"))},
++                      {}},
++                     &ap, sizeof(ap), divUp(geometry_.width, 16), divUp(geometry_.height, 16));
++    computeWriteBarrier(c);
++}
++
++void HdrPlusRecorder::recordCompanionPadded(VkCommandBuffer c, VkImageView rawU16, const RawNormalization& frame) {
++    recordPrepare(c, false, rawU16, frame);
++}
++
++void HdrPlusRecorder::recordReferencePrepare(VkCommandBuffer c, VkImageView rawU16, const RawNormalization& frame) {
++    reference_ = frame;
++    pyramidClamp_ = 0.0f;
++    recordPrepare(c, true, rawU16, frame);
++    recordPyramid(c, true);
++}
++
++void HdrPlusRecorder::recordClampedReferencePyramid(VkCommandBuffer c, float clampTo) {
++    pyramidClamp_ = clampTo;
++    recordPyramid(c, true);
++}
++
++void HdrPlusRecorder::recordCompanionPrepare(VkCommandBuffer c, VkImageView rawU16, const RawNormalization& frame) {
++    recordPrepare(c, false, rawU16, frame);
++    recordPyramid(c, false);
++}
++
++void HdrPlusRecorder::recordCompanionAlignLevel(VkCommandBuffer c, std::uint32_t n,
++                                                const std::function<void(std::uint32_t)>& mark) {
++    if (n >= geometry_.levels.size()) throw std::invalid_argument("hdrplus recorder: invalid alignment level");
++    const auto& cur = arena_.buffer("hdrp_align_a");
++    const auto& prev = arena_.buffer("hdrp_align_b");
++    const auto& corrected = arena_.buffer("hdrp_align_c");
++    const auto& cost = arena_.buffer("hdrp_tile_cost");
++    const auto& level = geometry_.levels[n];
++    const bool coarsest = n + 1u == geometry_.levels.size();
++    // Alignment from the next-coarser level, in its (2x smaller) pixel units.
++    const std::int32_t srcX = coarsest ? 1 : std::int32_t(geometry_.levels[n + 1u].tilesX);
++    const std::int32_t srcY = coarsest ? 1 : std::int32_t(geometry_.levels[n + 1u].tilesY);
++    const std::int32_t downscale = coarsest ? 0 : 2;
++    UpsamplePc up{srcX, srcY, std::int32_t(level.tilesX), std::int32_t(level.tilesY),
++                  float(double(level.tilesX) / double(srcX)), float(double(level.tilesY) / double(srcY))};
++    executor_.record(c, ShaderId::HdrpUpsampleAlign, {{}, {bb(0, cur), bb(1, prev)}}, &up, sizeof(up),
++                     divUp(level.tilesX, 16), divUp(level.tilesY, 16));
++    computeWriteBarrier(c);
++    const auto& refLevel = arena_.image(levelName(true, n));
++    const auto& compLevel = arena_.image(levelName(false, n));
++    TileCostPc tc{std::int32_t(level.width), std::int32_t(level.height), std::int32_t(level.tilesX),
++                  std::int32_t(level.tilesY), downscale, std::int32_t(level.tileSize), n != 0u ? 1 : 0,
++                  std::fabs(companionGain_ - 1.0f) > 1.0e-3f ? 1 : 0};
++    executor_.record(c, ShaderId::HdrpCorrectUpsampling,
++                     {{ib(0, refLevel), ib(1, compLevel)}, {bb(2, prev), bb(3, corrected)}}, &tc, sizeof(tc),
++                     level.tilesX, level.tilesY);
++    computeWriteBarrier(c);
++    if (mark) mark(1u);
++    executor_.record(c, ShaderId::HdrpTileDiff, {{ib(0, refLevel), ib(1, compLevel)}, {bb(2, corrected), bb(3, cost)}},
++                     &tc, sizeof(tc), level.tilesX, level.tilesY);
++    computeWriteBarrier(c);
++    if (mark) mark(2u);
++    BestTilePc bt{std::int32_t(level.tilesX), std::int32_t(level.tilesY), downscale};
++    executor_.record(c, ShaderId::HdrpBestTile, {{}, {bb(0, cost), bb(1, corrected), bb(2, cur)}}, &bt, sizeof(bt),
++                     divUp(level.tilesX, 16), divUp(level.tilesY, 16));
++    computeWriteBarrier(c);
++}
++
++void HdrPlusRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint32_t frameCount,
++                                           const std::function<void(std::uint32_t)>& mark) {
++    const auto& level0 = geometry_.levels.front();
++    const auto& aligned = arena_.image("hdrp_aligned");
++    WarpPc wp{std::int32_t(geometry_.width), std::int32_t(geometry_.height), std::int32_t(geometry_.padLeft),
++              std::int32_t(geometry_.padTop), std::int32_t(geometry_.paddedWidth),
++              std::int32_t(geometry_.paddedHeight), std::int32_t(level0.tilesX), std::int32_t(level0.tilesY),
++              std::int32_t(level0.tileSize)};
++    executor_.record(c, ShaderId::HdrpWarp,
++                     {{ib(0, arena_.image("hdrp_comp_padded")), ib(1, aligned)}, {bb(2, arena_.buffer("hdrp_align_a"))}},
++                     &wp, sizeof(wp), divUp(geometry_.width, 16), divUp(geometry_.height, 16));
++    computeWriteBarrier(c);
++    if (mark) mark(1u);
++    const auto& compBlur = arena_.image("hdrp_comp_blur");
++    recordBlur(c, aligned, {0, 0}, arena_.image("hdrp_blur_tmp"), compBlur, geometry_.width, geometry_.height, 16, 2,
++               false);
++    if (mark) mark(2u);
++    const std::uint32_t cellsX = geometry_.width / 2u, cellsY = geometry_.height / 2u;
++    const auto& diff = arena_.image("hdrp_diff");
++    const auto& weight = arena_.image("hdrp_weight");
++    ColorDiffPc cd{std::int32_t(cellsX), std::int32_t(cellsY), 0, 0, 0, 0};
++    executor_.record(c, ShaderId::HdrpColorDiff, {{ib(0, arena_.image("hdrp_ref_blur")), ib(1, compBlur), ib(2, diff)}, {}},
++                     &cd, sizeof(cd), divUp(cellsX, 16), divUp(cellsY, 16));
++    computeWriteBarrier(c);
++    WeightPc wt{std::int32_t(cellsX), std::int32_t(cellsY), hp::robustness(config_.strength)};
++    executor_.record(c, ShaderId::HdrpMergeWeight, {{ib(0, diff), ib(1, weight)}, {bb(2, arena_.buffer("hdrp_noise"))}},
++                     &wt, sizeof(wt), divUp(cellsX, 16), divUp(cellsY, 16));
++    computeWriteBarrier(c);
++    if (mark) mark(3u);
++    AccumulatePc ap{std::int32_t(geometry_.width), std::int32_t(geometry_.height), std::int32_t(geometry_.padLeft),
++                    std::int32_t(geometry_.padTop), std::int32_t(cellsX), std::int32_t(cellsY),
++                    1.0f / float(frameCount), 1};
++    executor_.record(c, ShaderId::HdrpAccumulate,
++                     {{ib(0, arena_.image("hdrp_ref_padded")), ib(1, aligned), ib(2, weight),
++                       ib(3, arena_.image("hdrp_accum"))},
++                      {}},
++                     &ap, sizeof(ap), divUp(geometry_.width, 16), divUp(geometry_.height, 16));
++    computeWriteBarrier(c);
++}
++
++void HdrPlusRecorder::recordFinalize(VkCommandBuffer c) {
++    FinalizePc fp{};
++    for (int i = 0; i < 4; ++i) fp.black[i] = reference_.blackByPhase[i];
++    fp.white = reference_.whiteLevel;
++    fp.width = std::int32_t(geometry_.width);
++    fp.height = std::int32_t(geometry_.height);
++    executor_.record(c, ShaderId::HdrpFinalize,
++                     {{ib(0, arena_.image("hdrp_accum")), ib(1, arena_.image("hdrp_output")),
++                       ib(2, arena_.image("hdrp_cfa"))},
++                      {}},
++                     &fp, sizeof(fp),
++                     divUp(geometry_.width, 16), divUp(geometry_.height, 16));
++    computeWriteBarrier(c);
++}
++
++namespace {
++struct TilesPc {
++    std::int32_t tilesX, tilesY;
++};
++struct ToRgbaPc {
++    std::int32_t width, height, cropX, cropY, offsetX, offsetY, paddedWidth, paddedHeight;
++};
++struct WarpRgbaPc {
++    std::int32_t width, height, cropX, cropY, paddedWidth, paddedHeight, tilesX, tilesY, halfTileSize;
++    std::int32_t alignPad;  // ivec2 offset is 8-byte aligned in the GLSL block
++    std::int32_t offsetX, offsetY;
++    std::int32_t continuous;
++    float exposureFactor, whiteLevel, blackLevelMean;
++    std::int32_t windowedSubstitute;
++};
++VkDeviceSize alignUp256(VkDeviceSize v) { return (v + 255u) / 256u * 256u; }
++struct MismatchPc {
++    std::int32_t tilesX, tilesY, rgbaWidth, rgbaHeight;
++    float exposureFactor;
++};
++struct HighlightsPc {
++    std::int32_t tilesX, tilesY;
++    float exposureFactor, whiteLevel, blackLevelMean;
++};
++struct RegionPc {
++    std::int32_t originX, originY, width, height;
++};
++struct MismatchNormPc {
++    std::int32_t tilesX, tilesY;
++    float invFrames;
++    std::int32_t uniformExposure;
++};
++static_assert(sizeof(MismatchNormPc)==16u, "26887 B-only mismatch push ABI");
++struct FreqMergePc {
++    std::int32_t tilesX, tilesY;
++    float robustnessNorm, readNoise, maxMotionNorm;
++    std::int32_t uniformExposure;
++    float frameWeight;
++};
++struct BackwardPc {
++    std::int32_t tilesX, tilesY;
++    float frames;
++};
++struct BorderPc {
++    std::int32_t width, height;
++    float minValue;
++};
++struct NormalizePc {
++    std::int32_t width, height, multiply;
++};
++struct FreqAccumulatePc {
++    std::int32_t width, height, offsetX, offsetY, mode;
++};
++}  // namespace
++
++ScratchLayout makeHdrPlusFrequencyScratchLayout(const hp::FrequencyGeometry& f, std::uint32_t width,
++                                                std::uint32_t height) {
++    ScratchLayout l{};
++    const auto& g = f.align;
++    const Extent2D raw{width, height}, padded{g.paddedWidth, g.paddedHeight};
++    const Extent2D rgba{f.rgbaWidth, f.rgbaHeight}, spectrum{2u * f.rgbaWidth, f.rgbaHeight}, tiles{f.tilesX, f.tilesY};
++    const auto add = [&](const std::string& name, Extent2D e, PixelStorage s, Lifetime life) {
++        l.images.push_back({name, e, s, life});
++        l.logicalImageBytes += std::uint64_t(e.width) * e.height * bytesPerPixel(s);
++    };
++    add("hdrp_ref_padded", padded, PixelStorage::R32Float, Lifetime::Burst);
++    add("hdrp_comp_padded", padded, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrp_pyr_tmp_a", {g.levels.front().width, g.levels.front().height}, PixelStorage::R32Float, Lifetime::PyramidTemp);
++    add("hdrp_pyr_tmp_b", {g.levels.front().width, g.levels.front().height}, PixelStorage::R32Float, Lifetime::PyramidTemp);
++    std::uint64_t maxTiles = 1u;
++    for (std::size_t i = 0; i < g.levels.size(); ++i) {
++        const Extent2D e{g.levels[i].width, g.levels[i].height};
++        add(levelName(true, i), e, PixelStorage::R32Float, Lifetime::Burst);
++        add(levelName(false, i), e, PixelStorage::R32Float, Lifetime::Companion);
++        maxTiles = std::max<std::uint64_t>(maxTiles, std::uint64_t(g.levels[i].tilesX) * g.levels[i].tilesY);
++    }
++    add("hdrq_ref_rgba", rgba, PixelStorage::RGBA32Float, Lifetime::Burst);
++    add("hdrq_aligned_rgba", rgba, PixelStorage::RGBA32Float, Lifetime::Companion);
++    add("hdrq_out_rgba", rgba, PixelStorage::RGBA32Float, Lifetime::Output);
++    add("hdrq_ref_ft", spectrum, PixelStorage::RGBA32Float, Lifetime::Burst);
++    add("hdrq_aligned_ft", spectrum, PixelStorage::RGBA32Float, Lifetime::Companion);
++    add("hdrq_final_ft", spectrum, PixelStorage::RGBA32Float, Lifetime::Output);
++    add("hdrq_rms", tiles, PixelStorage::RGBA32Float, Lifetime::Burst);
++    add("hdrq_mismatch", tiles, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrq_total_mismatch", tiles, PixelStorage::R32Float, Lifetime::Output);
++    add("hdrq_highlights", tiles, PixelStorage::R32Float, Lifetime::Companion);
++    add("hdrq_weight_sum", rgba, PixelStorage::R32Float, Lifetime::Output);
++    add("hdrp_accum", raw, PixelStorage::R32Float, Lifetime::Output);
++    add("hdrp_output", raw, PixelStorage::RGBA16Float, Lifetime::Output);
++    add("hdrp_cfa", raw, PixelStorage::R32Float, Lifetime::Output);
++    const auto addBuffer = [&](const char* name, std::uint64_t bytes) {
++        l.buffers.push_back({name, bytes, Lifetime::Companion});
++        l.logicalBufferBytes += bytes;
++    };
++    addBuffer("hdrp_align_a", maxTiles * 8u);
++    addBuffer("hdrp_align_b", maxTiles * 8u);
++    addBuffer("hdrp_align_c", maxTiles * 8u);
++    addBuffer("hdrp_tile_cost", maxTiles * 25u * 4u);
++    addBuffer("hdrq_mean", 16u);
++    addBuffer("hdrq_shift_table", 49u * 64u * 8u);
++    const auto& level0 = g.levels.front();
++    addBuffer("hdrq_align_store",
++              hp::kMaxFrequencyFrames * alignUp256(std::uint64_t(level0.tilesX) * level0.tilesY * 8u));
++    return l;
++}
++
++HdrPlusFrequencyRecorder::HdrPlusFrequencyRecorder(ResourceArena& arena, VulkanExecutor& executor, hp::Config config,
++                                                   hp::FrequencyGeometry geometry)
++    : arena_(arena), executor_(executor), config_(config), geometry_(std::move(geometry)),
++      align_(arena, executor, config, geometry_.align) {}
++
++void HdrPlusFrequencyRecorder::setExposure(std::vector<float> exposureFactors, std::vector<float> whiteLevels) {
++    if (!exposureFactors.empty() && whiteLevels.size() != exposureFactors.size())
++        throw std::invalid_argument("hdrplus frequency: exposure/white level count mismatch");
++    for (const float f : exposureFactors)
++        if (!(std::isfinite(f) && f > 0.0f)) throw std::invalid_argument("hdrplus frequency: invalid exposure factor");
++    uniformExposure_ = hp::uniformExposure(exposureFactors);
++    exposureFactors_ = uniformExposure_ ? std::vector<float>{} : std::move(exposureFactors);
++    whiteLevels_ = uniformExposure_ ? std::vector<float>{} : std::move(whiteLevels);
++}
++
++void HdrPlusFrequencyRecorder::beginPass(std::uint32_t pass) noexcept {
++    pass_ = pass;
++    // Align-once keeps every frame in the pass-0 padding; passOffset() maps.
++    const std::uint32_t prepared = config_.frequencyAlignOnce ? 0u : pass;
++    align_.setPads(geometry_.padLeft(prepared), geometry_.padTop(prepared));
++}
++
++std::array<std::int32_t, 2> HdrPlusFrequencyRecorder::passOffset() const noexcept {
++    if (!config_.frequencyAlignOnce) return {0, 0};
++    return {std::int32_t(geometry_.padLeft(0)) - std::int32_t(geometry_.padLeft(pass_)),
++            std::int32_t(geometry_.padTop(0)) - std::int32_t(geometry_.padTop(pass_))};
++}
++
++VkDeviceSize HdrPlusFrequencyRecorder::alignSlotBytes() const noexcept {
++    const auto& level0 = geometry_.align.levels.front();
++    return alignUp256(VkDeviceSize(level0.tilesX) * level0.tilesY * 8u);
++}
++
++void HdrPlusFrequencyRecorder::recordCompanionAlign(VkCommandBuffer c, VkImageView rawU16, const RawNormalization& frame,
++                                                    std::uint32_t slot) {
++    if (!alignsThisPass()) {
++        align_.setCompanionGain(frameGain(slot));
++        align_.recordCompanionPadded(c, rawU16, frame);
++        return;
++    }
++    recordCompanionAlignCoarse(c, rawU16, frame, slot);
++    recordCompanionAlignFinest(c, slot);
++}
++
++void HdrPlusFrequencyRecorder::recordCompanionAlignCoarse(VkCommandBuffer c, VkImageView rawU16,
++                                                          const RawNormalization& frame, std::uint32_t slot) {
++    if (!alignsThisPass()) throw std::logic_error("hdrplus frequency: coarse alignment outside an aligning pass");
++    const float gain = frameGain(slot);
++    align_.setCompanionGain(gain);
++    if (brighterCompanion(slot)) {
++        // Brighter companions (merged after the dark ones, by exposure) align
++        // against a reference pyramid clamped just below their own clip
++        // point; theirs gets the same clamp. Rebuilt whenever that point
++        // moves, so each exposure gets its own clamp.
++        float refBlack = 0.0f, black = 0.0f;
++        for (int i = 0; i < 4; ++i) {
++            refBlack += 0.25f * align_.referenceBlack()[std::size_t(i)];
++            black += 0.25f * frame.blackByPhase[std::size_t(i)];
++        }
++        const float clampTo = refBlack + 0.9f * (frame.whiteLevel - black) * gain;
++        if (std::fabs(clampTo - pyramidClamp_) > 0.005f * clampTo) {
++            align_.recordClampedReferencePyramid(c, clampTo);
++            pyramidClamp_ = clampTo;
++        }
++    }
++    align_.recordCompanionPrepare(c, rawU16, frame);
++    for (std::uint32_t level = align_.levelCount(); --level > 0u;) align_.recordCompanionAlignLevel(c, level);
++}
++
++void HdrPlusFrequencyRecorder::recordCompanionAlignFinest(VkCommandBuffer c, std::uint32_t slot) {
++    align_.recordCompanionAlignLevel(c, 0u);
++    if (!config_.frequencyAlignOnce) return;
++    if (slot >= hp::kMaxFrequencyFrames) throw std::invalid_argument("hdrplus frequency: too many frames");
++    const auto& level0 = geometry_.align.levels.front();
++    VkMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT,
++                               VK_ACCESS_TRANSFER_READ_BIT};
++    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toTransfer, 0,
++                         nullptr, 0, nullptr);
++    const VkBufferCopy copy{0, slot * alignSlotBytes(), VkDeviceSize(level0.tilesX) * level0.tilesY * 8u};
++    vkCmdCopyBuffer(c, arena_.buffer("hdrp_align_a").buffer, arena_.buffer("hdrq_align_store").buffer, 1, &copy);
++    VkMemoryBarrier toCompute{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
++                              VK_ACCESS_SHADER_READ_BIT};
++    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &toCompute, 0,
++                         nullptr, 0, nullptr);
++}
++
++void HdrPlusFrequencyRecorder::recordReference(VkCommandBuffer c, VkImageView rawU16, const RawNormalization& frame) {
++    substitutionReady_ = false;
++    pyramidClamp_ = 0.0f;
++    if (pass_ == 0u) {
++        executor_.record(c, ShaderId::HdrqShiftTable, {{}, {bb(0, arena_.buffer("hdrq_shift_table"))}}, nullptr, 0u,
++                         divUp(49u * 64u, 64u), 1);
++    }
++    if (alignsThisPass()) align_.recordReferencePrepare(c, rawU16, frame);
++    const auto& rgba = arena_.image("hdrq_ref_rgba");
++    const std::uint32_t tx = geometry_.tilesX, ty = geometry_.tilesY;
++    const auto offset = passOffset();
++    ToRgbaPc tr{std::int32_t(geometry_.rgbaWidth),         std::int32_t(geometry_.rgbaHeight),
++                std::int32_t(geometry_.cropX),             std::int32_t(geometry_.cropY),
++                offset[0],                                 offset[1],
++                std::int32_t(geometry_.align.paddedWidth), std::int32_t(geometry_.align.paddedHeight)};
++    executor_.record(c, ShaderId::HdrqToRgba, {{ib(0, arena_.image("hdrp_ref_padded")), ib(1, rgba)}, {}}, &tr,
++                     sizeof(tr), divUp(geometry_.rgbaWidth, 16), divUp(geometry_.rgbaHeight, 16));
++    computeWriteBarrier(c);
++    TilesPc tp{std::int32_t(tx), std::int32_t(ty)};
++    executor_.record(c, ShaderId::HdrqRms, {{ib(0, rgba), ib(1, arena_.image("hdrq_rms"))}, {}}, &tp, sizeof(tp),
++                     divUp(tx, 16), divUp(ty, 16));
++    // The reference spectrum seeds both the reference and the running merge.
++    // Each shifted pass has its own input/window; only the two identical
++    // transforms within this pass are shared.
++    executor_.record(c, ShaderId::HdrqSeedDft,
++                     {{ib(0, rgba), ib(1, arena_.image("hdrq_ref_ft")), ib(2, arena_.image("hdrq_final_ft"))}, {}},
++                     &tp, sizeof(tp), tx, ty);
++    // Per-pass total mismatch starts at zero.
++    VkMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
++                               VK_ACCESS_TRANSFER_WRITE_BIT};
++    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toTransfer, 0,
++                         nullptr, 0, nullptr);
++    const VkClearColorValue zero{};
++    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++    vkCmdClearColorImage(c, arena_.image("hdrq_total_mismatch").image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
++    // Bracketed merges seed each bin's weight sum with the reference's weight.
++    if (!uniformExposure_) {
++        VkClearColorValue one{};
++        one.float32[0] = 1.0f;
++        vkCmdClearColorImage(c, arena_.image("hdrq_weight_sum").image, VK_IMAGE_LAYOUT_GENERAL, &one, 1, &range);
++    }
++    VkMemoryBarrier toCompute{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT,
++                              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
++    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &toCompute, 0, nullptr, 0, nullptr);
++}
++
++void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint32_t frameCount, std::uint32_t slot,
++                                                    const std::function<void(std::uint32_t)>& mark) {
++    const auto& a = geometry_.align;
++    const auto& level0 = a.levels.front();
++    const std::uint32_t tx = geometry_.tilesX, ty = geometry_.tilesY;
++    const auto& refRgba = arena_.image("hdrq_ref_rgba");
++    const auto& alignedRgba = arena_.image("hdrq_aligned_rgba");
++    const auto& mismatch = arena_.image("hdrq_mismatch");
++    const auto offset = passOffset();
++    const float exposureFactor = frameExposure(slot);
++    const float whiteLevel = slot < whiteLevels_.size() ? whiteLevels_[slot] : 65535.0f;
++    float blackMean = 0.0f;
++    for (const float b : align_.referenceBlack()) blackMean += 0.25f * b;
++    WarpRgbaPc wp{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), std::int32_t(geometry_.cropX),
++                  std::int32_t(geometry_.cropY), std::int32_t(a.paddedWidth), std::int32_t(a.paddedHeight),
++                  std::int32_t(level0.tilesX), std::int32_t(level0.tilesY), std::int32_t(level0.tileSize), 0,
++                  offset[0], offset[1], config_.frequencyAlignOnce ? 1 : 0, exposureFactor, whiteLevel, blackMean,
++                  substitutionReady_ ? 1 : 0};
++    // Clipped cells: the dark-frame estimate once captured, else the reference.
++    const auto& substitute = substitutionReady_ ? arena_.image("hdrq_out_rgba") : refRgba;
++    // Align-once: this companion's pass-0 shifts from its store slot.
++    const BufferBinding shifts =
++        config_.frequencyAlignOnce
++            ? BufferBinding{2u, arena_.buffer("hdrq_align_store").buffer, slot * alignSlotBytes(),
++                            VkDeviceSize(level0.tilesX) * level0.tilesY * 8u}
++            : bb(2, arena_.buffer("hdrp_align_a"));
++    executor_.record(c, ShaderId::HdrqWarpRgba,
++                     {{ib(0, arena_.image("hdrp_comp_padded")), ib(1, alignedRgba), ib(3, substitute)}, {shifts}},
++                     &wp, sizeof(wp), divUp(geometry_.rgbaWidth, 16), divUp(geometry_.rgbaHeight, 16));
++    computeWriteBarrier(c);
++    if (mark) mark(1u);
++    MismatchPc mp{std::int32_t(tx), std::int32_t(ty), std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight),
++                  exposureFactor};
++    executor_.record(c, ShaderId::HdrqMismatch,
++                     {{ib(0, refRgba), ib(1, alignedRgba), ib(2, arena_.image("hdrq_rms")), ib(3, mismatch)}, {}}, &mp,
++                     sizeof(mp), tx, ty);
++    if (mark) {
++        computeWriteBarrier(c);
++        mark(5u);
++    }
++    TilesPc tp{std::int32_t(tx), std::int32_t(ty)};
++    executor_.record(c, ShaderId::HdrqForwardDft, {{ib(0, alignedRgba), ib(1, arena_.image("hdrq_aligned_ft"))}, {}}, &tp,
++                     sizeof(tp), tx, ty);
++    computeWriteBarrier(c);
++    if (mark) mark(2u);
++    // Mean mismatch excluding the tile row/column introduced by this pass's shift.
++    const std::uint32_t left = hp::FrequencyGeometry::shiftLeft(pass_) ? 1u : 0u;
++    const std::uint32_t right = hp::FrequencyGeometry::shiftLeft(pass_) ? 0u : 1u;
++    const std::uint32_t top = hp::FrequencyGeometry::shiftTop(pass_) ? 1u : 0u;
++    const std::uint32_t bottom = hp::FrequencyGeometry::shiftTop(pass_) ? 0u : 1u;
++    RegionPc rp{std::int32_t(left), std::int32_t(top), std::int32_t(tx - left - right), std::int32_t(ty - top - bottom)};
++    executor_.record(c, ShaderId::HdrqRegionMean, {{ib(0, mismatch)}, {bb(1, arena_.buffer("hdrq_mean"))}}, &rp,
++                     sizeof(rp), 1, 1);
++    computeWriteBarrier(c);
++    MismatchNormPc np{std::int32_t(tx), std::int32_t(ty),
++                      1.0f / float(frameCount), uniformExposure_ ? 1 : 0};
++    executor_.record(c, ShaderId::HdrqMismatchNorm,
++                     {{ib(0, mismatch), ib(1, arena_.image("hdrq_total_mismatch"))}, {bb(2, arena_.buffer("hdrq_mean"))}},
++                     &np, sizeof(np), divUp(tx, 16), divUp(ty, 16));
++    computeWriteBarrier(c);
++    if (mark) mark(3u);
++    // Clipped-highlights factor per tile (all 1 for frames no brighter than the reference).
++    const auto& highlights = arena_.image("hdrq_highlights");
++    HighlightsPc hl{std::int32_t(tx), std::int32_t(ty), exposureFactor, whiteLevel, blackMean};
++    executor_.record(c, ShaderId::HdrqHighlightsNorm, {{ib(0, alignedRgba), ib(1, highlights)}, {}}, &hl, sizeof(hl),
++                     divUp(tx, 16), divUp(ty, 16));
++    computeWriteBarrier(c);
++    const auto norms = uniformExposure_ ? hp::frequencyNorms(config_.strength)
++                                        : hp::bracketedFrequencyNorms(config_.strength, exposureFactor);
++    FreqMergePc fm{std::int32_t(tx), std::int32_t(ty), norms.robustnessNorm, norms.readNoise, norms.maxMotionNorm,
++                   uniformExposure_ ? 1 : 0, exposureFactor};
++    executor_.record(c, ShaderId::HdrqMerge,
++                     {{ib(0, arena_.image("hdrq_ref_ft")), ib(1, arena_.image("hdrq_aligned_ft")),
++                       ib(2, arena_.image("hdrq_final_ft")), ib(3, arena_.image("hdrq_rms")), ib(4, mismatch),
++                       ib(6, highlights), ib(7, arena_.image("hdrq_weight_sum"))},
++                      {bb(5, arena_.buffer("hdrq_shift_table"))}},
++                     &fm, sizeof(fm), tx, ty);
++    computeWriteBarrier(c);
++}
++
++void HdrPlusFrequencyRecorder::recordSubstitutionSource(VkCommandBuffer c) {
++    if (uniformExposure_ || substitutionReady_) return;
++    // Weighted mean of the reference and the dark companions merged so far,
++    // inverse transformed into hdrq_out_rgba (free until recordPassFinish);
++    // the running spectrum is restored afterwards.
++    const auto& finalFt = arena_.image("hdrq_final_ft");
++    const auto& weights = arena_.image("hdrq_weight_sum");
++    const std::uint32_t gx = divUp(geometry_.rgbaWidth, 16), gy = divUp(geometry_.rgbaHeight, 16);
++    NormalizePc np{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), 0};
++    executor_.record(c, ShaderId::HdrqNormalize, {{ib(0, finalFt), ib(1, weights)}, {}}, &np, sizeof(np), gx, gy);
++    computeWriteBarrier(c);
++    BackwardPc bp{std::int32_t(geometry_.tilesX), std::int32_t(geometry_.tilesY), 1.0f};
++    executor_.record(c, ShaderId::HdrqBackwardDft, {{ib(0, finalFt), ib(1, arena_.image("hdrq_out_rgba"))}, {}}, &bp,
++                     sizeof(bp), geometry_.tilesX, geometry_.tilesY);
++    computeWriteBarrier(c);
++    np.multiply = 1;
++    executor_.record(c, ShaderId::HdrqNormalize, {{ib(0, finalFt), ib(1, weights)}, {}}, &np, sizeof(np), gx, gy);
++    computeWriteBarrier(c);
++    substitutionReady_ = true;
++}
++
++void HdrPlusFrequencyRecorder::recordPassFinish(VkCommandBuffer c, std::uint32_t frameCount) {
++    const std::uint32_t tx = geometry_.tilesX, ty = geometry_.tilesY;
++    const auto& finalFt = arena_.image("hdrq_final_ft");
++    const auto& out = arena_.image("hdrq_out_rgba");
++    TilesPc tp{std::int32_t(tx), std::int32_t(ty)};
++    if (!uniformExposure_) {
++        NormalizePc np{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), 0};
++        executor_.record(c, ShaderId::HdrqNormalize, {{ib(0, finalFt), ib(1, arena_.image("hdrq_weight_sum"))}, {}}, &np,
++                         sizeof(np), divUp(geometry_.rgbaWidth, 16), divUp(geometry_.rgbaHeight, 16));
++        computeWriteBarrier(c);
++    }
++    executor_.record(c, ShaderId::HdrqDeconvolute, {{ib(0, finalFt), ib(1, arena_.image("hdrq_total_mismatch"))}, {}}, &tp,
++                     sizeof(tp), tx, ty);
++    computeWriteBarrier(c);
++    // Bracketed spectra are already a weighted mean (hdrq_normalize).
++    BackwardPc bp{std::int32_t(tx), std::int32_t(ty), uniformExposure_ ? float(frameCount) : 1.0f};
++    executor_.record(c, ShaderId::HdrqBackwardDft, {{ib(0, finalFt), ib(1, out)}, {}}, &bp, sizeof(bp), tx, ty);
++    computeWriteBarrier(c);
++    // Exposure control off: upstream passes black level -1, so the clamp floor is -2 * window.
++    BorderPc bd{std::int32_t(geometry_.rgbaWidth), std::int32_t(geometry_.rgbaHeight), -2.0f};
++    executor_.record(c, ShaderId::HdrqBorder, {{ib(0, out), ib(1, arena_.image("hdrq_ref_rgba"))}, {}}, &bd, sizeof(bd),
++                     divUp(geometry_.rgbaWidth, 16), divUp(geometry_.rgbaHeight, 16));
++    computeWriteBarrier(c);
++    const auto& accum = arena_.image("hdrp_accum");
++    FreqAccumulatePc ap{std::int32_t(accum.extent.width), std::int32_t(accum.extent.height),
++                        std::int32_t(geometry_.padLeft(pass_) - geometry_.cropX),
++                        std::int32_t(geometry_.padTop(pass_) - geometry_.cropY), pass_ == 0u ? 0 : 1};
++    executor_.record(c, ShaderId::HdrqAccumulate, {{ib(0, out), ib(1, accum)}, {}}, &ap, sizeof(ap),
++                     divUp(accum.extent.width, 16), divUp(accum.extent.height, 16));
++    computeWriteBarrier(c);
++}
++
++}  // namespace rawr::raw_gpu_pipeline
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawPhaseDiversity.hpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawPhaseDiversity.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..57a3c742275002fdc68591920a0549b1aa00072c
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawPhaseDiversity.hpp
+@@ -0,0 +1,130 @@
++#pragma once
++// IRIS_26887_B_OFF_INDEPENDENT_RAW_PHASE_COVERAGE
++// A deliberately strict CAPTURE-LEVEL precondition for B's post-AMaZE guide.
++// Two CFA arrays at the SAME Bayer phase are not independent material-color
++// evidence. Require actual sub-CFA-cell sensor displacement measured from the
++// separate ORIGINAL raw normals, never inferred from merged/post-AMaZE RGB.
++// This does not alter RAW buffers, shutter, reference selection or frame count.
++// In flat, repeated, occluded, low-correlation or ambiguous scenes it returns
++// false; the B temporal chroma stage then passes all pixels through unchanged.
++#include <algorithm>
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++#include <vector>
++
++namespace iris26887 {
++struct Raw16Frame {
++    const std::uint8_t* bytes=nullptr;
++    std::size_t byteCount=0;
++    std::uint32_t stride=0,width=0,height=0;
++    float black[4]{},white=0,exposure=0;
++};
++struct PhaseCoverage {
++    bool verified=false;
++    std::uint32_t reliableCompanions=0;
++    float minReliableCfaShift=0.f;
++};
++namespace detail {
++inline float green(const Raw16Frame& f,std::uint32_t pattern,int x,int y){
++    if(!f.bytes||x<0||y<0||x*2+1>=int(f.width)||y*2+1>=int(f.height))return -1.f;
++    const bool diagonal=pattern==1u||pattern==2u;
++    const int off[4]={diagonal?0:1,diagonal?0:0,diagonal?1:0,diagonal?1:1};
++    float value=0.f;
++    for(int k=0;k<2;++k){
++        const int xx=x*2+off[2*k], yy=y*2+off[2*k+1];
++        const std::size_t index=std::size_t(yy)*f.stride+std::size_t(xx)*2u;
++        if(index+1u>=f.byteCount)return -1.f;
++        const float raw=float(std::uint16_t(f.bytes[index])|(std::uint16_t(f.bytes[index+1])<<8u));
++        const int phase=(off[2*k+1]<<1)+off[2*k];
++        const float range=f.white-f.black[phase];
++        if(!(range>1.f))return -1.f;
++        value+=std::clamp((raw-f.black[phase])/range,0.f,1.f);
++    }
++    return value*.5f;
++}
++struct Cost {
++    float value=std::numeric_limits<float>::infinity();
++    std::uint32_t n=0;
++};
++inline Cost cost(const Raw16Frame& a,const Raw16Frame& b,std::uint32_t pattern,
++                 int dx,int dy,int width,int height,int quadrant){
++    double e=0.;std::uint32_t n=0;
++    const int nx=width/2,ny=height/2;
++    const int startx=std::max(4,nx/5),endx=std::min(nx-5,4*nx/5);
++    const int starty=std::max(4,ny/5),endy=std::min(ny-5,4*ny/5);
++    if(endx<=startx||endy<=starty)return {};
++    const int stepX=std::max(1,(endx-startx)/22),stepY=std::max(1,(endy-starty)/22);
++    const float gain=a.exposure/b.exposure;
++    for(int y=starty;y<endy;y+=stepY){
++        for(int x=startx;x<endx;x+=stepX){
++            const int q=(x>=(startx+endx)/2?1:0)+(y>=(starty+endy)/2?2:0);
++            if(quadrant!=4&&q!=quadrant)continue;
++            float va=green(a,pattern,x,y),vb=green(b,pattern,x+dx,y+dy);
++            if(va<.002f||va>.90f||vb<.002f||vb>.90f)continue;
++            float delta=va-vb*gain;
++            e+=std::min(double(delta)*delta,0.04*0.04);
++            ++n;
++        }
++    }
++    if(n<40u/(quadrant==4?1u:4u))return {};
++    return {float(e/double(n)),n};
++}
++struct Estimate {bool good=false;float dx=0.f,dy=0.f;};
++inline Estimate estimate(const Raw16Frame& a,const Raw16Frame& b,std::uint32_t pattern,
++                         int width,int height,int quadrant){
++    float best=std::numeric_limits<float>::infinity();int bx=0,by=0;
++    for(int yy=-3;yy<=3;++yy)for(int xx=-3;xx<=3;++xx){
++        const auto c=cost(a,b,pattern,xx,yy,width,height,quadrant);
++        if(c.value<best){best=c.value;bx=xx;by=yy;}
++    }
++    if(bx<=-3||bx>=3||by<=-3||by>=3||!std::isfinite(best))return {};
++    const auto cxm=cost(a,b,pattern,bx-1,by,width,height,quadrant).value;
++    const auto cxp=cost(a,b,pattern,bx+1,by,width,height,quadrant).value;
++    const auto cym=cost(a,b,pattern,bx,by-1,width,height,quadrant).value;
++    const auto cyp=cost(a,b,pattern,bx,by+1,width,height,quadrant).value;
++    const float xcur=cxm+cxp-2.f*best,ycur=cym+cyp-2.f*best;
++    // A nearly flat or repeating patch does NOT provide measured phase.
++    if(!(xcur>0.000002f||ycur>0.000002f))return {};
++    if(best>.0012f)return {}; // avoid unstable apparent shifts on moving patterns
++    float fx=xcur>0.000002f?std::clamp(0.5f*(cxm-cxp)/xcur,-0.5f,0.5f):0.f;
++    float fy=ycur>0.000002f?std::clamp(0.5f*(cym-cyp)/ycur,-0.5f,0.5f):0.f;
++    return {true,float(bx)+fx,float(by)+fy};
++}
++} // detail
++inline PhaseCoverage measurePhaseCoverage(const std::vector<Raw16Frame>& frames,
++                                         std::size_t reference,std::uint32_t localCfa){
++    PhaseCoverage proof{};
++    if(frames.size()<3u||frames.size()>64u||reference>=frames.size()||localCfa>3u)return proof;
++    const Raw16Frame& ref=frames[reference];
++    if(ref.width<128u||ref.height<128u||(ref.width&1u)||(ref.height&1u)||
++       !(std::isfinite(ref.white)&&ref.white>1.f)||
++       !(std::isfinite(ref.exposure)&&ref.exposure>0.f))return proof;
++    for(std::size_t k=0;k<frames.size();++k){
++        if(k==reference)continue;
++        const auto& f=frames[k];
++        if(!f.bytes||f.width!=ref.width||f.height!=ref.height||
++           f.stride<f.width*2u||!(std::isfinite(f.exposure)&&f.exposure>0.f)||
++           std::abs(std::log(f.exposure/ref.exposure))>0.025f)continue;
++        auto full=detail::estimate(ref,f,localCfa,int(ref.width),int(ref.height),4);
++        if(!full.good)continue;
++        std::uint32_t agreeing=0;
++        for(int quad=0;quad<4;++quad){
++            auto local=detail::estimate(ref,f,localCfa,int(ref.width),int(ref.height),quad);
++            if(local.good&&std::hypot(local.dx-full.dx,local.dy-full.dy)<0.28f)++agreeing;
++        }
++        if(agreeing<3u)continue;
++        // Fractional cell displacement is *independent Bayer sampling*.
++        // Integer whole CFA-cell displacements keep the same CFA phase.
++        const float fx=full.dx-std::round(full.dx),fy=full.dy-std::round(full.dy);
++        const float fractional=std::hypot(fx,fy);
++        if(fractional<0.15f)continue;
++        ++proof.reliableCompanions;
++        if(proof.minReliableCfaShift==0.f||fractional<proof.minReliableCfaShift)
++            proof.minReliableCfaShift=fractional;
++    }
++    proof.verified=proof.reliableCompanions>=2u;
++    return proof;
++}
++} // namespace iris26887
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessAccumulate.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessAccumulate.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..b5c1e8196965a314470ead1a8ab7cfc0c98d239b
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessAccumulate.comp
+@@ -0,0 +1,132 @@
++#version 450
++// DEVELOPMENT ONLY -- not registered/compiled in Android yet.
++// Stream one distinct ORIGINAL RAW16 NORMAL frame into a 4-byte/pixel state.
++// The reference is immutable. A frame may be accumulated ONCE ONLY (HDR+ has
++// four pass merges; caller must dispatch this witness ONLY during pass zero).
++// A verified local integer RAW-site shift, not Bayer-preserving HDR+ mixing,
++// selects the real physically observed R/G/B site at the same scene pixel.
++// The local shift texture is produced by independent, uniquely registered
++// sensor-domain patch matching. z=1 means a valid, unique local fit.
++layout(local_size_x=16,local_size_y=16) in;
++layout(set=0,binding=0,r16ui) readonly uniform uimage2D originalRaw;
++layout(set=0,binding=1,r16ui) readonly uniform uimage2D immutableReferenceRaw;
++layout(set=0,binding=2,rgba32i) readonly uniform iimage2D localShifts;
++layout(set=0,binding=3,r32ui) uniform uimage2D witnessAcc;
++layout(push_constant) uniform P {
++    uvec4 extent;       // width, height, verified-shift tileSize, local CFA pattern
++    vec4 black;        // this NORMAL's raw site-order black levels
++    vec4 referenceBlack;
++    vec4 exposure;     // referenceWhite, companionWhite, referenceExposure, companionExposure
++    uvec4 flags;       // isReference, isUniformExposure, frameIndex, reserved
++} p;
++int channelForCfa(ivec2 v){
++    const int codes[16]=int[16](0,1,1,2, 1,0,2,1, 1,2,0,1, 2,1,1,0);
++    int q=(v.x&1)+2*(v.y&1);
++    return codes[int(p.extent.w)*4+q];
++}
++float rawLinear(ivec2 q,bool reference){
++    if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.extent.xy))))return -1.0;
++    uint phase=uint((q.x&1)+2*(q.y&1));
++    vec4 b=reference?p.referenceBlack:p.black;
++    float white=reference?p.exposure.x:p.exposure.y;
++    float val=float(reference?imageLoad(immutableReferenceRaw,q).r:imageLoad(originalRaw,q).r);
++    // Check ORIGINAL physical sensor headroom before exposure normalization.
++    // A slightly longer companion exposure can turn a near-clipped native
++    // sample into an apparently safe <0.975 reference-domain value. That is
++    // NOT independent color evidence and must never be certified.
++    float native=(val-b[phase])/max(white-b[phase],1.0);
++    if(isnan(native)||isinf(native)||native<=0.012||native>=0.975)return -1.0;
++    float v=reference?native:native*(p.exposure.z/max(p.exposure.w,1.0e-9));
++    return v;
++}
++// Green is ONLY for registration/motion validation, not a reconstructed RGB
++// source. Physical R/G/B votes always come from actual source sensor sites.
++float greenLuma(ivec2 q,bool reference){
++    if(channelForCfa(q)==1)return rawLinear(q,reference);
++    const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
++    float sum=0.0;int n=0;
++    for(int i=0;i<4;++i){
++        ivec2 t=q+offs[i];
++        if(any(lessThan(t,ivec2(0)))||any(greaterThanEqual(t,ivec2(p.extent.xy))))continue;
++        if(channelForCfa(t)!=1)continue;
++        float v=rawLinear(t,reference);
++        if(v<.025||v>.95)return -1.0;
++        sum+=v;++n;
++    }
++    return n>=2?sum/float(n):-1.0;
++}
++// Workgroups are 16x16 while verified shift tiles are 32x32, so a full
++// workgroup owns exactly ONE verified sensor offset. Cache the 20x20 green
++// guide window (2-site halo) ONCE per workgroup instead of repeating 5x
++// ref/companion neighborhood loads at each of 256 output pixels.
++// The cache changes NO physical RAW observations, channel-vote criteria,
++// occlusion tests, or interpolation contract. All lanes must reach barrier.
++const int GUIDE_W=20;
++shared float referenceGuide[400];
++shared float companionGuide[400];
++void populateGreenGuide(ivec2 groupOrigin,ivec2 shift){
++    for(int i=int(gl_LocalInvocationIndex);i<400;i+=256){
++        ivec2 offset=ivec2(i%GUIDE_W,i/GUIDE_W)-ivec2(2);
++        ivec2 position=groupOrigin+offset;
++        referenceGuide[i]=greenLuma(position,true);
++        companionGuide[i]=greenLuma(position+shift,false);
++    }
++    barrier(); // immutable shared cache used by every lane in the workgroup
++}
++bool localAgreementFromCache(ivec2 pixelInWorkgroup){
++    const ivec2 offsets[5]=ivec2[5](ivec2(0,0),ivec2(-2,0),
++       ivec2(2,0),ivec2(0,-2),ivec2(0,2));
++    int valid=0;float error=0.0;
++    for(int i=0;i<5;++i){
++        ivec2 at=pixelInWorkgroup+ivec2(2)+offsets[i];
++        int k=at.y*GUIDE_W+at.x;
++        float a=referenceGuide[k],b=companionGuide[k];
++        if(a<.025||a>.95||b<.025||b>.95)continue;
++        float d=a-b;
++        error+=min(d*d,.0064);++valid;
++    }
++    return valid>=4&&error/float(max(valid,1))<.00018;
++}
++void main(){
++    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
++    // These checks are WORKGROUP-UNIFORM; no lane exits around a barrier.
++    if(p.extent.w>3u||p.extent.z!=32u||p.flags.y!=1u||
++       any(notEqual(imageSize(originalRaw),ivec2(p.extent.xy)))||
++       any(notEqual(imageSize(immutableReferenceRaw),ivec2(p.extent.xy)))||
++       any(notEqual(imageSize(witnessAcc),ivec2(p.extent.xy))))return;
++    ivec2 shift=ivec2(0);
++    if(p.flags.x==0u){
++        // Workgroup 16x16 is strictly contained within one 32x32 tile.
++        ivec2 tile=ivec2(gl_WorkGroupID.xy)/2;
++        if(any(greaterThanEqual(tile,imageSize(localShifts))))return;
++        ivec4 fit=imageLoad(localShifts,tile);
++        if(fit.z!=1)return;
++        shift=fit.xy;
++        populateGreenGuide(ivec2(gl_WorkGroupID.xy)*16,shift);
++    }
++    // Per-lane checks come AFTER all lanes have finished the shared barrier.
++    if(any(greaterThanEqual(q,ivec2(p.extent.xy))))return;
++    if(p.flags.x==0u && !localAgreementFromCache(ivec2(gl_LocalInvocationID.xy)))return;
++    ivec2 sensor=q+shift;
++    if(any(lessThan(sensor,ivec2(0)))||any(greaterThanEqual(sensor,ivec2(p.extent.xy))))return;
++    float v=rawLinear(sensor,false);
++    if(v<=.012||v>=.975||isnan(v)||isinf(v))return;
++    int ch=channelForCfa(sensor);
++    uint bit=1u<<uint(ch);
++    uint quant=uint(clamp(round(v*255.0),0.0,255.0));
++    uint state=imageLoad(witnessAcc,q).r;
++    if((state&(1u<<30u))!=0u)return;
++    uint seen=(state>>24u)&7u;
++    uint repeated=(state>>27u)&7u;
++    uint old=(state>>(8u*uint(ch)))&255u;
++    if((seen&bit)==0u){
++        state=(state&~(255u<<(8u*uint(ch))))|(quant<<(8u*uint(ch)));
++        seen|=bit;
++    }else{
++        // Disagreement rejects the ENTIRE witness; never donate a wrong hue.
++        if(abs(int(old)-int(quant))>5){state|=1u<<30u;}
++        else repeated|=bit;
++    }
++    state=(state&0xC0FFFFFFu)|(seen<<24u)|(repeated<<27u);
++    imageStore(witnessAcc,q,uvec4(state,0u,0u,0u));
++}
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessFinalize.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessFinalize.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5b61bc7f807f30612a6f94a83fc196396c32f37
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessFinalize.comp
+@@ -0,0 +1,26 @@
++#version 450
++// DEVELOPMENT ONLY. Runs after ALL distinct NORMAL witness accumulation
++// dispatches and their compute-write/read barriers have completed.
++// The same R32UI image changes from accumulation ABI to read-only RGB10A2
++// color-witness ABI. Zero means abstain. Marker 3 requires independently
++// verified TWO physical RAW observations of EACH of R, G and B.
++layout(local_size_x=16,local_size_y=16) in;
++layout(set=0,binding=0,r32ui) uniform uimage2D witness;
++layout(push_constant) uniform P {uvec2 size;} p;
++void main(){
++    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
++    if(any(greaterThanEqual(q,ivec2(p.size))))return;
++    uint state=imageLoad(witness,q).r;
++    uint seen=(state>>24u)&7u,repeated=(state>>27u)&7u;
++    uint done=((state&(1u<<30u))==0u && seen==7u && repeated==7u)?3u:0u;
++    uint result=0u;
++    if(done==3u){
++        for(uint c=0u;c<3u;++c){
++            uint v=(state>>(c*8u))&255u;
++            uint ten=(v*1023u+127u)/255u;
++            result|=(ten&1023u)<<(c*10u);
++        }
++        result|=3u<<30u;
++    }
++    imageStore(witness,q,uvec4(result,0u,0u,0u));
++}
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessGlobalSeeds.hpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessGlobalSeeds.hpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff0e45892fc90542cbfabfad030a17fe3eea9148
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessGlobalSeeds.hpp
+@@ -0,0 +1,62 @@
++#pragma once
++// Development-only coarse global RAW-alignment seeds. The GPU must locally
++// re-estimate and verify each TILE and then each PIXEL before counting even
++// one sensor color measurement. These offsets are NOT color truth by themselves.
++#include "Iris26887BOffRawPhaseDiversity.hpp"
++#include <vector>
++namespace iris26887 {
++struct RawColorSeed {bool valid=false;int dx=0,dy=0;};
++// A necessary, not sufficient, GPU allocation prerequisite. The accepted
++// tile shift must equal its integer coarse seed (the local kernel rejects
++// nonzero delta), so source color-site parity at each reference pixel is
++// completely determined by these seeds. If no pixel parity can observe
++// TWO physical R/G/B samples, allocating ~48 MiB of witness state cannot
++// produce one valid pixel. This check NEVER authorizes a color correction:
++// every GPU tile and pixel still has to prove independent alignment,
++// clipping and repeated per-channel agreement.
++inline bool canSupplyTwiceEachBayerColor(
++        const std::vector<RawColorSeed>& seeds,std::uint32_t cfa){
++    if(cfa>3u||seeds.size()<6u)return false;
++    constexpr unsigned channels[4][4]={{0,1,1,2},{1,0,2,1},
++                                       {1,2,0,1},{2,1,1,0}};
++    for(int y=0;y<2;++y)for(int x=0;x<2;++x){
++        unsigned count[3]={0u,0u,0u};
++        for(const auto& seed:seeds){
++            if(!seed.valid)continue;
++            const unsigned ix=unsigned((x+seed.dx)&1);
++            const unsigned iy=unsigned((y+seed.dy)&1);
++            ++count[channels[cfa][ix+2u*iy]];
++        }
++        if(count[0]>=2u&&count[1]>=2u&&count[2]>=2u)return true;
++    }
++    return false;
++}
++inline std::vector<RawColorSeed> estimateOriginalRawSensorSeeds(
++    const std::vector<Raw16Frame>& frames,std::size_t reference,uint32_t cfa){
++    std::vector<RawColorSeed> seeds(frames.size());
++    if(frames.size()<2||frames.size()>64||reference>=frames.size()||cfa>3)return seeds;
++    const auto& ref=frames[reference];
++    if(ref.width<128u||ref.height<128u||!(ref.exposure>0.f))return seeds;
++    seeds[reference]={true,0,0};
++    for(std::size_t i=0;i<frames.size();++i){
++      if(i==reference)continue;
++      const auto& f=frames[i];
++      if(!f.bytes||f.width!=ref.width||f.height!=ref.height||
++         !std::isfinite(f.exposure)||f.exposure<=0.f||
++         std::abs(f.exposure/ref.exposure-1.f)>.025f)continue;
++      auto global=detail::estimate(ref,f,cfa,int(ref.width),int(ref.height),4);
++      if(!global.good)continue;
++      unsigned agree=0;
++      for(int j=0;j<4;++j){
++         auto local=detail::estimate(ref,f,cfa,int(ref.width),int(ref.height),j);
++         if(local.good&&std::hypot(local.dx-global.dx,local.dy-global.dy)<.28f)++agree;
++      }
++      if(agree<3)continue;
++      // The original alignment search operates on 2x2 Bayer cells.
++      // Convert to raw-site units, but the GPU must validate odd CFA shifts.
++      seeds[i]={true,int(std::lround(2.f*global.dx)),
++                     int(std::lround(2.f*global.dy))};
++    }
++    return seeds;
++}
++} // namespace iris26887
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessTileRefineRaw16.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessTileRefineRaw16.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e8f71f2991c64d5f0d52f982e923c49efac7ee3
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffRawWitnessTileRefineRaw16.comp
+@@ -0,0 +1,113 @@
++#version 450
++// DEVELOPMENT ONLY; B-SR-OFF sensor RAW16 local registration (not full S-R).
++// The CPU's sparse whole-frame RAW registration supplies ONLY a coarse seed.
++// This GPU search independently checks that same-scene ORIGINAL physical RAW
++// green structure has a unique local shift, including odd CFA site offsets.
++// Green estimates are used ONLY to authorize geometric alignment, never as
++// fabricated true-color evidence. Frame-chroma agreement is checked later.
++layout(local_size_x=16,local_size_y=16) in;
++layout(set=0,binding=0,r16ui) readonly uniform uimage2D rawReference;
++layout(set=0,binding=1,r16ui) readonly uniform uimage2D rawCompanion;
++layout(set=0,binding=2,rgba32i) writeonly uniform iimage2D shiftsOut;
++layout(push_constant) uniform P {
++    uvec4 extent;         // rawW, rawH, shiftTileSize, local CFA pattern
++    ivec4 initial;        // coarse integer sensor shiftX/shiftY, others reserved
++    vec4 referenceBlack;
++    vec4 companionBlack;
++    vec4 values;         // referenceWhite, companionWhite, refExposure, cmpExposure
++} p;
++const int codes[16]=int[16](0,1,1,2,1,0,2,1,1,2,0,1,2,1,1,0);
++int channel(ivec2 q){return codes[int(p.extent.w)*4+(q.x&1)+2*(q.y&1)];}
++float measured(ivec2 q,bool reference){
++    if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.extent.xy))))return -1.0;
++    int phase=(q.x&1)+2*(q.y&1);
++    vec4 black=reference?p.referenceBlack:p.companionBlack;
++    float white=reference?p.values.x:p.values.y;
++    float raw=float(reference?imageLoad(rawReference,q).r:imageLoad(rawCompanion,q).r);
++    // Registration evidence must also reject near-saturated ORIGINAL sites,
++    // not merely values that become smaller after exposure normalization.
++    float native=(raw-black[phase])/max(white-black[phase],1.0);
++    if(isnan(native)||isinf(native)||native<=0.025||native>=0.95)return -1.0;
++    return reference?native:native*(p.values.z/max(p.values.w,1.0e-9));
++}
++float greenGuide(ivec2 q,bool reference){
++    if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.extent.xy))))return -1.0;
++    if(channel(q)==1)return measured(q,reference);
++    const ivec2 d[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
++    float sum=0.0;int count=0;
++    for(int k=0;k<4;++k){
++        ivec2 t=q+d[k];
++        if(any(lessThan(t,ivec2(0)))||any(greaterThanEqual(t,ivec2(p.extent.xy))))continue;
++        if(channel(t)!=1)continue;
++        float v=measured(t,reference);
++        if(v<.025||v>.95)return -1.0;
++        sum+=v;++count;
++    }
++    return count>=2?sum/float(count):-1.0;
++}
++void main(){
++    ivec2 tile=ivec2(gl_GlobalInvocationID.xy);
++    if(any(greaterThanEqual(tile,imageSize(shiftsOut))))return;
++    imageStore(shiftsOut,tile,ivec4(0));
++    if(p.extent.x<32u||p.extent.y<32u||p.extent.z!=32u||p.extent.w>3u||
++       any(notEqual(imageSize(rawReference),ivec2(p.extent.xy)))||
++       any(notEqual(imageSize(rawCompanion),ivec2(p.extent.xy)))||
++       p.values.x<=1.0||p.values.y<=1.0||p.values.z<=0.0||p.values.w<=0.0||
++       abs(p.values.z-p.values.w)/p.values.z>.025)return;
++    ivec2 center=tile*int(p.extent.z)+ivec2(int(p.extent.z)/2);
++    if(any(greaterThanEqual(center,ivec2(p.extent.xy))))return;
++    float best=1e30,second=1e30,variation=0.0;
++    ivec2 chosen=ivec2(0);
++    // Retain the 3x3 local cost surface. Integer RAW-site registration
++    // cannot certify per-pixel COLOR at an appreciably fractional shift:
++    // separate Bayer sites then observe different physical scene positions.
++    float neighborhood[9];
++    for(int i=0;i<9;++i)neighborhood[i]=1e30;
++    for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx){
++        ivec2 offset=p.initial.xy+ivec2(dx,dy);
++        int count=0;float total=0.0,totalSquare=0.0,error=0.0;
++        for(int sy=-4;sy<=4;sy+=2)for(int sx=-4;sx<=4;sx+=2){
++            ivec2 pRef=center+ivec2(sx,sy);
++            float a=greenGuide(pRef,true),b=greenGuide(pRef+offset,false);
++            if(a<.025||a>.95||b<.025||b>.95)continue;
++            float residual=a-b;
++            error+=min(residual*residual,.0064);
++            total+=a;totalSquare+=a*a;++count;
++        }
++        if(count<18)continue;
++        float score=error/float(count);
++        neighborhood[(dy+1)*3+(dx+1)]=score;
++        float variance=max(0.0,totalSquare/float(count)-pow(total/float(count),2.0));
++        // Every actually measured candidate competes, even if that candidate
++        // has weak texture. Filtering weak candidates BEFORE choosing the
++        // winner can manufacture a "unique" match at the wrong RAW offset.
++        // Check the winner's independent texture confidence ONLY below.
++        if(score<best){second=best;best=score;chosen=offset;variation=variance;}
++        else second=min(second,score);
++    }
++    // A unique winner is meaningful only when the competing fits are real.
++    // An unmeasured neighbor keeps the 1e30 sentinel, which previously made
++    // second-best arbitrarily large and could certify an unverified RAW shift.
++    // Require a complete finite 3x3 cost surface; insufficient evidence
++    // MUST abstain rather than authorize physical R/G/B color votes.
++    for(int i=0;i<9;++i){
++        if(isnan(neighborhood[i])||isinf(neighborhood[i])||
++           neighborhood[i]>=1e20)return;
++    }
++    // The coarse CPU seed must be within the one-site refinement window.
++    // Reject boundary minima, where a complete symmetric subpixel fit is
++    // unavailable: no invented fractional color registration is permitted.
++    ivec2 delta=chosen-p.initial.xy;
++    if(any(notEqual(delta,ivec2(0))))return;
++    float left=neighborhood[3],right=neighborhood[5];
++    float up=neighborhood[1],down=neighborhood[7];
++    float cx=left+right-2.0*best,cy=up+down-2.0*best;
++    if(cx<=1e-8||cy<=1e-8)return;
++    float fx=0.5*(left-right)/cx,fy=0.5*(up-down)/cy;
++    // Strict physical-site confidence, not a subpixel-interpolated RGB vote.
++    // Mid-phase shifts are useful for SR but UNSAFE for the packed color
++    // witness until a full fractional sensor integration model exists.
++    if(abs(fx)>0.15||abs(fy)>0.15)return;
++    if(best<.00015&&second-best>.00006&&variation>=.00004)
++        imageStore(shiftsOut,tile,ivec4(chosen,1,0));
++}
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffStrictWitnessReconcile.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffStrictWitnessReconcile.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..db1276e04983b0bfbae535d469780e61db918a0f
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffStrictWitnessReconcile.comp
+@@ -0,0 +1,67 @@
++#version 450
++#extension GL_GOOGLE_include_directive : require
++// DEVELOPMENT ONLY -- NOT YET BOUND TO A REAL PER-PIXEL GPU RAW WITNESS.
++// Owns only B HDR+ (<1.10x, SR OFF) post-AMaZE camera-linear chroma.
++// In-place same-pixel RGB read/write; immutable independently measured RAW
++// guide. No classifying or neutralizing from a capture-wide phase flag.
++layout(local_size_x=16,local_size_y=16) in;
++layout(set=0,binding=0,rgba16f) uniform image2D amazeCameraRgb;
++layout(set=0,binding=1,r32ui) readonly uniform uimage2D independentRgb10;
++// LensShadingGains at binding 2 is declared by lens_shading.glsl ONLY.
++layout(push_constant) uniform P {
++    uvec4 imageAndLsc; // output width,height, LSC width,height
++    uvec4 geometry;    // full sensor width,height,cropX,cropY
++    uvec4 flags;       // bit0 B-only input/color witness verified, rest reserved
++    vec4 wb;           // temporary white-balance channels (rgb), positive
++} p;
++#define LSC_BINDING 2
++#define LSC_ENABLED (p.imageAndLsc.z>=2u && p.imageAndLsc.w>=2u)
++#define LSC_GRID_SIZE uvec2(p.imageAndLsc.z,p.imageAndLsc.w)
++#define LSC_SENSOR_SIZE uvec2(p.geometry.xy)
++#include "lens_shading.glsl"
++const vec3 kY=vec3(0.25,0.50,0.25);
++float luminance(vec3 c){return dot(c,kY);}
++vec2 opponent(vec3 c){return vec2(c.r-c.g,c.b-c.g)/max(luminance(c),0.035);}
++bool finite3(vec3 c){return !any(isnan(c))&&!any(isinf(c));}
++void main(){
++    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
++    if(any(greaterThanEqual(q,ivec2(p.imageAndLsc.xy))))return;
++    if((p.flags.x&1u)==0u ||
++       any(notEqual(imageSize(amazeCameraRgb),ivec2(p.imageAndLsc.xy))) ||
++       any(notEqual(imageSize(independentRgb10),imageSize(amazeCameraRgb))) ||
++       p.geometry.x<2u || p.geometry.y<2u)return;
++    uint raw=imageLoad(independentRgb10,q).r;
++    // Bits 30..31 == 3 only if the producer independently validated TWO
++    // physically observed RAW samples each of R,G,B at this scene location.
++    // A source with missing colors must store ZERO, never guessed RGB.
++    if((raw>>30u)!=3u)return;
++    if(any(lessThanEqual(p.wb.rgb,vec3(0.0)))||!finite3(p.wb.rgb))return;
++    vec3 witness=vec3(float(raw&1023u),float((raw>>10u)&1023u),
++                      float((raw>>20u)&1023u))/1023.0;
++    ivec2 absolute=q+ivec2(p.geometry.zw);
++    witness*=vec3(lensShadingGain(absolute,0),lensShadingGain(absolute,1),
++                   lensShadingGain(absolute,3));
++    vec4 src=imageLoad(amazeCameraRgb,q);
++    if(!finite3(witness)||!finite3(src.rgb)||
++       any(lessThan(witness,vec3(0)))||any(lessThan(src.rgb,vec3(0))))return;
++    witness*=p.wb.rgb;
++    vec3 candidate=src.rgb*p.wb.rgb;
++    float y=luminance(candidate),wy=luminance(witness);
++    if(y<0.05||y>3.0||wy<0.05||wy>3.0||
++       abs(y-wy)/max(y,0.05)>0.08)return;
++    vec2 c=opponent(candidate),w=opponent(witness);
++    if(length(w)>=0.030||length(c)<0.080)return;
++    float d=length(c-w);
++    if(d<0.070)return;
++    float weight=0.46*clamp((d-0.070)/0.100,0.0,1.0);
++    if(weight<=0.0)return;
++    vec2 corrected=mix(c,w,weight);
++    float scale=max(y,0.035);
++    float green=y-0.25*(corrected.x+corrected.y)*scale;
++    vec3 rgb=vec3(green+corrected.x*scale,green,green+corrected.y*scale);
++    if(!finite3(rgb)||any(lessThan(rgb,vec3(0))))return;
++    // Preserve EXACT temporary-WB luminance, alpha, and clipped input status.
++    // Inverse WB returns pre-WB camera RGB; camera-space weighted Y is not
++    // mathematically invariant under channel-specific WB, by design.
++    imageStore(amazeCameraRgb,q,vec4(rgb/p.wb.rgb,src.a));
++}
+diff --git a/app/version.properties b/app/version.properties
+index 2ab6d1c77b2c6821223ce2a6d2ad4a0ba5c7d723..953e08b615b2d4c8f886886bb7de93fa9cbafd97 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726886
+-VERSION_BUILD=26886
++VERSION_NAME=0.9726887
++VERSION_BUILD=26887

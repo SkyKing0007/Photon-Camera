@@ -1,0 +1,132 @@
+#version 450
+// DEVELOPMENT ONLY -- not registered/compiled in Android yet.
+// Stream one distinct ORIGINAL RAW16 NORMAL frame into a 4-byte/pixel state.
+// The reference is immutable. A frame may be accumulated ONCE ONLY (HDR+ has
+// four pass merges; caller must dispatch this witness ONLY during pass zero).
+// A verified local integer RAW-site shift, not Bayer-preserving HDR+ mixing,
+// selects the real physically observed R/G/B site at the same scene pixel.
+// The local shift texture is produced by independent, uniquely registered
+// sensor-domain patch matching. z=1 means a valid, unique local fit.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,r16ui) readonly uniform uimage2D originalRaw;
+layout(set=0,binding=1,r16ui) readonly uniform uimage2D immutableReferenceRaw;
+layout(set=0,binding=2,rgba32i) readonly uniform iimage2D localShifts;
+layout(set=0,binding=3,r32ui) uniform uimage2D witnessAcc;
+layout(push_constant) uniform P {
+    uvec4 extent;       // width, height, verified-shift tileSize, local CFA pattern
+    vec4 black;        // this NORMAL's raw site-order black levels
+    vec4 referenceBlack;
+    vec4 exposure;     // referenceWhite, companionWhite, referenceExposure, companionExposure
+    uvec4 flags;       // isReference, isUniformExposure, frameIndex, reserved
+} p;
+int channelForCfa(ivec2 v){
+    const int codes[16]=int[16](0,1,1,2, 1,0,2,1, 1,2,0,1, 2,1,1,0);
+    int q=(v.x&1)+2*(v.y&1);
+    return codes[int(p.extent.w)*4+q];
+}
+float rawLinear(ivec2 q,bool reference){
+    if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,ivec2(p.extent.xy))))return -1.0;
+    uint phase=uint((q.x&1)+2*(q.y&1));
+    vec4 b=reference?p.referenceBlack:p.black;
+    float white=reference?p.exposure.x:p.exposure.y;
+    float val=float(reference?imageLoad(immutableReferenceRaw,q).r:imageLoad(originalRaw,q).r);
+    // Check ORIGINAL physical sensor headroom before exposure normalization.
+    // A slightly longer companion exposure can turn a near-clipped native
+    // sample into an apparently safe <0.975 reference-domain value. That is
+    // NOT independent color evidence and must never be certified.
+    float native=(val-b[phase])/max(white-b[phase],1.0);
+    if(isnan(native)||isinf(native)||native<=0.012||native>=0.975)return -1.0;
+    float v=reference?native:native*(p.exposure.z/max(p.exposure.w,1.0e-9));
+    return v;
+}
+// Green is ONLY for registration/motion validation, not a reconstructed RGB
+// source. Physical R/G/B votes always come from actual source sensor sites.
+float greenLuma(ivec2 q,bool reference){
+    if(channelForCfa(q)==1)return rawLinear(q,reference);
+    const ivec2 offs[4]=ivec2[4](ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1));
+    float sum=0.0;int n=0;
+    for(int i=0;i<4;++i){
+        ivec2 t=q+offs[i];
+        if(any(lessThan(t,ivec2(0)))||any(greaterThanEqual(t,ivec2(p.extent.xy))))continue;
+        if(channelForCfa(t)!=1)continue;
+        float v=rawLinear(t,reference);
+        if(v<.025||v>.95)return -1.0;
+        sum+=v;++n;
+    }
+    return n>=2?sum/float(n):-1.0;
+}
+// Workgroups are 16x16 while verified shift tiles are 32x32, so a full
+// workgroup owns exactly ONE verified sensor offset. Cache the 20x20 green
+// guide window (2-site halo) ONCE per workgroup instead of repeating 5x
+// ref/companion neighborhood loads at each of 256 output pixels.
+// The cache changes NO physical RAW observations, channel-vote criteria,
+// occlusion tests, or interpolation contract. All lanes must reach barrier.
+const int GUIDE_W=20;
+shared float referenceGuide[400];
+shared float companionGuide[400];
+void populateGreenGuide(ivec2 groupOrigin,ivec2 shift){
+    for(int i=int(gl_LocalInvocationIndex);i<400;i+=256){
+        ivec2 offset=ivec2(i%GUIDE_W,i/GUIDE_W)-ivec2(2);
+        ivec2 position=groupOrigin+offset;
+        referenceGuide[i]=greenLuma(position,true);
+        companionGuide[i]=greenLuma(position+shift,false);
+    }
+    barrier(); // immutable shared cache used by every lane in the workgroup
+}
+bool localAgreementFromCache(ivec2 pixelInWorkgroup){
+    const ivec2 offsets[5]=ivec2[5](ivec2(0,0),ivec2(-2,0),
+       ivec2(2,0),ivec2(0,-2),ivec2(0,2));
+    int valid=0;float error=0.0;
+    for(int i=0;i<5;++i){
+        ivec2 at=pixelInWorkgroup+ivec2(2)+offsets[i];
+        int k=at.y*GUIDE_W+at.x;
+        float a=referenceGuide[k],b=companionGuide[k];
+        if(a<.025||a>.95||b<.025||b>.95)continue;
+        float d=a-b;
+        error+=min(d*d,.0064);++valid;
+    }
+    return valid>=4&&error/float(max(valid,1))<.00018;
+}
+void main(){
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+    // These checks are WORKGROUP-UNIFORM; no lane exits around a barrier.
+    if(p.extent.w>3u||p.extent.z!=32u||p.flags.y!=1u||
+       any(notEqual(imageSize(originalRaw),ivec2(p.extent.xy)))||
+       any(notEqual(imageSize(immutableReferenceRaw),ivec2(p.extent.xy)))||
+       any(notEqual(imageSize(witnessAcc),ivec2(p.extent.xy))))return;
+    ivec2 shift=ivec2(0);
+    if(p.flags.x==0u){
+        // Workgroup 16x16 is strictly contained within one 32x32 tile.
+        ivec2 tile=ivec2(gl_WorkGroupID.xy)/2;
+        if(any(greaterThanEqual(tile,imageSize(localShifts))))return;
+        ivec4 fit=imageLoad(localShifts,tile);
+        if(fit.z!=1)return;
+        shift=fit.xy;
+        populateGreenGuide(ivec2(gl_WorkGroupID.xy)*16,shift);
+    }
+    // Per-lane checks come AFTER all lanes have finished the shared barrier.
+    if(any(greaterThanEqual(q,ivec2(p.extent.xy))))return;
+    if(p.flags.x==0u && !localAgreementFromCache(ivec2(gl_LocalInvocationID.xy)))return;
+    ivec2 sensor=q+shift;
+    if(any(lessThan(sensor,ivec2(0)))||any(greaterThanEqual(sensor,ivec2(p.extent.xy))))return;
+    float v=rawLinear(sensor,false);
+    if(v<=.012||v>=.975||isnan(v)||isinf(v))return;
+    int ch=channelForCfa(sensor);
+    uint bit=1u<<uint(ch);
+    uint quant=uint(clamp(round(v*255.0),0.0,255.0));
+    uint state=imageLoad(witnessAcc,q).r;
+    if((state&(1u<<30u))!=0u)return;
+    uint seen=(state>>24u)&7u;
+    uint repeated=(state>>27u)&7u;
+    uint old=(state>>(8u*uint(ch)))&255u;
+    if((seen&bit)==0u){
+        state=(state&~(255u<<(8u*uint(ch))))|(quant<<(8u*uint(ch)));
+        seen|=bit;
+    }else{
+        // Disagreement rejects the ENTIRE witness; never donate a wrong hue.
+        if(abs(int(old)-int(quant))>5){state|=1u<<30u;}
+        else repeated|=bit;
+    }
+    state=(state&0xC0FFFFFFu)|(seen<<24u)|(repeated<<27u);
+    imageStore(witnessAcc,q,uvec4(state,0u,0u,0u));
+}

@@ -1,0 +1,67 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// DEVELOPMENT ONLY -- NOT YET BOUND TO A REAL PER-PIXEL GPU RAW WITNESS.
+// Owns only B HDR+ (<1.10x, SR OFF) post-AMaZE camera-linear chroma.
+// In-place same-pixel RGB read/write; immutable independently measured RAW
+// guide. No classifying or neutralizing from a capture-wide phase flag.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,rgba16f) uniform image2D amazeCameraRgb;
+layout(set=0,binding=1,r32ui) readonly uniform uimage2D independentRgb10;
+// LensShadingGains at binding 2 is declared by lens_shading.glsl ONLY.
+layout(push_constant) uniform P {
+    uvec4 imageAndLsc; // output width,height, LSC width,height
+    uvec4 geometry;    // full sensor width,height,cropX,cropY
+    uvec4 flags;       // bit0 B-only input/color witness verified, rest reserved
+    vec4 wb;           // temporary white-balance channels (rgb), positive
+} p;
+#define LSC_BINDING 2
+#define LSC_ENABLED (p.imageAndLsc.z>=2u && p.imageAndLsc.w>=2u)
+#define LSC_GRID_SIZE uvec2(p.imageAndLsc.z,p.imageAndLsc.w)
+#define LSC_SENSOR_SIZE uvec2(p.geometry.xy)
+#include "lens_shading.glsl"
+const vec3 kY=vec3(0.25,0.50,0.25);
+float luminance(vec3 c){return dot(c,kY);}
+vec2 opponent(vec3 c){return vec2(c.r-c.g,c.b-c.g)/max(luminance(c),0.035);}
+bool finite3(vec3 c){return !any(isnan(c))&&!any(isinf(c));}
+void main(){
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+    if(any(greaterThanEqual(q,ivec2(p.imageAndLsc.xy))))return;
+    if((p.flags.x&1u)==0u ||
+       any(notEqual(imageSize(amazeCameraRgb),ivec2(p.imageAndLsc.xy))) ||
+       any(notEqual(imageSize(independentRgb10),imageSize(amazeCameraRgb))) ||
+       p.geometry.x<2u || p.geometry.y<2u)return;
+    uint raw=imageLoad(independentRgb10,q).r;
+    // Bits 30..31 == 3 only if the producer independently validated TWO
+    // physically observed RAW samples each of R,G,B at this scene location.
+    // A source with missing colors must store ZERO, never guessed RGB.
+    if((raw>>30u)!=3u)return;
+    if(any(lessThanEqual(p.wb.rgb,vec3(0.0)))||!finite3(p.wb.rgb))return;
+    vec3 witness=vec3(float(raw&1023u),float((raw>>10u)&1023u),
+                      float((raw>>20u)&1023u))/1023.0;
+    ivec2 absolute=q+ivec2(p.geometry.zw);
+    witness*=vec3(lensShadingGain(absolute,0),lensShadingGain(absolute,1),
+                   lensShadingGain(absolute,3));
+    vec4 src=imageLoad(amazeCameraRgb,q);
+    if(!finite3(witness)||!finite3(src.rgb)||
+       any(lessThan(witness,vec3(0)))||any(lessThan(src.rgb,vec3(0))))return;
+    witness*=p.wb.rgb;
+    vec3 candidate=src.rgb*p.wb.rgb;
+    float y=luminance(candidate),wy=luminance(witness);
+    if(y<0.05||y>3.0||wy<0.05||wy>3.0||
+       abs(y-wy)/max(y,0.05)>0.08)return;
+    vec2 c=opponent(candidate),w=opponent(witness);
+    if(length(w)>=0.030||length(c)<0.080)return;
+    float d=length(c-w);
+    if(d<0.070)return;
+    float weight=0.46*clamp((d-0.070)/0.100,0.0,1.0);
+    if(weight<=0.0)return;
+    vec2 corrected=mix(c,w,weight);
+    float scale=max(y,0.035);
+    float green=y-0.25*(corrected.x+corrected.y)*scale;
+    vec3 rgb=vec3(green+corrected.x*scale,green,green+corrected.y*scale);
+    if(!finite3(rgb)||any(lessThan(rgb,vec3(0))))return;
+    // Preserve EXACT temporary-WB luminance, alpha, and clipped input status.
+    // Inverse WB returns pre-WB camera RGB; camera-space weighted Y is not
+    // mathematically invariant under channel-specific WB, by design.
+    imageStore(amazeCameraRgb,q,vec4(rgb/p.wb.rgb,src.a));
+}
