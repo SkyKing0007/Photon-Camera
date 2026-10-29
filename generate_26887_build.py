@@ -253,6 +253,27 @@ def current_mechanics_scope(s):
  return s
 edit('verify_scope',current_mechanics_scope)
 
+# Precisely recognize the already-committed, SHA-pinned runner-recovery workflow.
+def recovered_runner_infrastructure(s):
+ old=' diff -u 26887_REPOSITORY_UPLOAD_ALLOWLIST.txt <(git diff --name-only "$RUNTIME_AUTHORITY_COMMIT"..HEAD | LC_ALL=C sort) >/dev/null || fail \'unexpected uploaded infrastructure/source file\''
+ new=' [[ "$(git rev-parse HEAD:.github/workflows/recover-26886-runner.yml)" == \'0a03cd0d75b6ee3d70f8fe10d581789d396d7350\' ]] || fail \'exact successful 26886 runner-recovery workflow changed or missing\'\n diff -u <( { cat 26887_REPOSITORY_UPLOAD_ALLOWLIST.txt; printf \'%s\\n\' \'.github/workflows/recover-26886-runner.yml\'; } | LC_ALL=C sort) <(git diff --name-only "$RUNTIME_AUTHORITY_COMMIT"..HEAD | LC_ALL=C sort) >/dev/null || fail \'unexpected uploaded infrastructure/source file including exact runner recovery\''
+ assert s.count(old)==1,("repository scope anchor drift",s.count(old))
+ return s.replace(old,new,1)
+edit('verify_scope',recovered_runner_infrastructure)
+
+# Rename stale ACTIVE authority labels; preserve historical commands/receipts.
+def current_scope_labels(s):
+ for a,b in (
+  ("fail '26876 authority not ancestor'", "fail '26886 authority not ancestor'"),
+  ("fail 'successful 26878 mechanics generator blob mismatch'", "fail 'successful 26886 mechanics generator blob mismatch'"),
+  ("fail 'successful 26878 17-stage source script drift'", "fail 'successful 26886 17-stage source script drift'"),
+  ("pass '26887 branch/HEAD, exact successful 26878 build and strict no-live-source/upload scope'", "pass '26887 branch/HEAD, exact successful 26886 V6 mechanics and strict no-live-source/upload scope'"),
+ ): s=once(s,a,b)
+ return s
+edit('verify_scope',current_scope_labels)
+body=once(body,'# Successful 26874 Actions compiled candidate is runtime authority.','# Successful 26886 V6 Actions compiled candidate is runtime authority.')
+body=once(body,'# Keep successful 26874 17-stage verification mechanics unchanged by default.','# Keep successful 26886 V6 17-stage verification mechanics unchanged by default.')
+
 def current_authority_receipt(s):
  s=once(s,'mechanics_generated_script_sha256=2138db01cbfb3a8421c12e54ba29d4f0a893d1cdd4a219ee34a40a4dc0c54379','mechanics_generated_script_sha256=3f816088f564bfd575d5dc8e1681b9b1b18ec435de41ed34f2c22df866c5e8fa')
  s=s.replace('26885 prior compiler authority','26886 prior compiler authority').replace('26885 successful','26886 successful').replace('26885 authority','26886 authority').replace('successful 26885','successful 26886').replace('not successful 26885','not successful 26886')
@@ -281,7 +302,8 @@ assert stage(body,'compile_modified_runtime_shaders').count('verify_26887_expand
 assert 'PASS pinned REAL glslang 16.5.0/spirv-val/spirv-opt 11 compiled 26887 shader variants' in stage(body,'compile_modified_runtime_shaders')
 assert '26887_REAL_COMPILED_SHADER_SHA256.txt' in stage(body,'compile_modified_runtime_shaders')
 assert 'PY_26887_SHADER_RECEIPT' in stage(body,'compile_modified_runtime_shaders')
-assert '26887_modified_shader_spirv' not in stage(body,'compile_modified_runtime_shaders')
+assert stage(body,'compile_modified_runtime_shaders').count('26887_modified_shader_spirv')==2, 'current shader output directory must appear in compiler and receipt validator'
+assert '0a03cd0d75b6ee3d70f8fe10d581789d396d7350' in stage(body,'verify_scope')
 assert 'verify_26887_patches.py "$BASE" "$CAND" 26887_FORWARD_FULL_INDEX.patch 26887_ROLLBACK_FULL_INDEX.patch' in body
 assert 'verify_26887_patches.py "$BASE" "$exp" 26887_FORWARD_FULL_INDEX.patch 26887_ROLLBACK_FULL_INDEX.patch' in body
 assert 'RUNTIME_TAR_SHA="e2a03925cafa2196884fff02d9320f6ac4020823130b896de7166eb77ded144b"' in body
