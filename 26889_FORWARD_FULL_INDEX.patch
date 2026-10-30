@@ -1,0 +1,556 @@
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+index 42e0213bd68c656cace907cd4079d50b81ee76e7..f8e076356bb7c63716f3d6f72b8b96b4af457fc5 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqMerge.comp
+@@ -71,6 +71,21 @@ void main() {
+         sB[lane] = b.x + b.y + b.z + b.w;
+     }
+     barrier();
++    // IRIS_26889_B_OFF_MISSING_BURST_NOISE_FAIL_CLOSED:
++    // When no RAW noise blocks were measurable the per-companion motion
++    // detector has no calibrated uncertainty. A displaced exposure must not
++    // be admitted merely because its motion score is UNKNOWN. Preserve
++    // the chosen NORMAL reference spectrum for every companion, with no
++    // fractional companion shift. Fixed-count FFT normalization then
++    // reconstructs a single reference exposure, not a double contour.
++    // This is private to the B-OFF uniform burst; vendor and bracketed
++    // frequency merges are byte-identical elsewhere.
++    if (p.uniformExposure != 0 && p.supportMeasured == 0) {
++        imageStore(outFt, o, imageLoad(outFt, o) + sRefRe[lane]);
++        imageStore(outFt, o + ivec2(1, 0),
++                   imageLoad(outFt, o + ivec2(1, 0)) + sRefIm[lane]);
++        return;
++    }
+     if (lane < 49) {
+         float total = 0.0;
+         for (int k = 0; k < 64; ++k) {
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+index e4f7ce0c5c6c0320f0f30541ab5e2bcc330187be..f8aebf00d70b865a7c2241e478e88ec2c8b009c4 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26887BOffHdrqRecorder.cpp
+@@ -1,6 +1,7 @@
+ #include <rawr/raw_gpu_pipeline/HdrPlusRecorder.h>
+ 
+ #include <algorithm>
++#include <cstddef>
+ #include <cmath>
+ #include <stdexcept>
+ #include <string>
+@@ -378,11 +379,24 @@ struct FreqMergePc {
+     float robustnessNorm, readNoise, maxMotionNorm;
+     std::int32_t uniformExposure;
+     float frameWeight;
++    // IRIS_26889_B_OFF_SPIRV_PC_ABI: the compiled GLSL ivec2 alignTiles
++    // starts at byte 32 (8-byte alignment), not byte 28. The successful
++    // 26888 host push omitted this padding and supplied only 60 bytes,
++    // leaving supportMeasured at SPIR-V byte 60 UNINITIALIZED.
++    std::int32_t alignVectorPad = 0;
+     std::int32_t alignTilesX, alignTilesY, alignHalfTile;
+     std::int32_t cropX, cropY, offsetX, offsetY;
+     std::int32_t supportMeasured;
+ };
+-static_assert(sizeof(FreqMergePc) == 60u, "26888 B-only merge GLSL push ABI");
++static_assert(sizeof(FreqMergePc) == 64u, "26889 B-only merge GLSL push ABI");
++static_assert(offsetof(FreqMergePc, alignTilesX) == 32u, "SPIR-V: alignTiles.x @32");
++static_assert(offsetof(FreqMergePc, alignTilesY) == 36u, "SPIR-V: alignTiles.y @36");
++static_assert(offsetof(FreqMergePc, alignHalfTile) == 40u, "SPIR-V: alignHalfTile @40");
++static_assert(offsetof(FreqMergePc, cropX) == 44u, "SPIR-V: cropX @44");
++static_assert(offsetof(FreqMergePc, cropY) == 48u, "SPIR-V: cropY @48");
++static_assert(offsetof(FreqMergePc, offsetX) == 52u, "SPIR-V: offsetX @52");
++static_assert(offsetof(FreqMergePc, offsetY) == 56u, "SPIR-V: offsetY @56");
++static_assert(offsetof(FreqMergePc, supportMeasured) == 60u, "SPIR-V: supportMeasured @60");
+ struct BackwardPc {
+     std::int32_t tilesX, tilesY;
+     float frames;
+@@ -669,7 +683,7 @@ void HdrPlusFrequencyRecorder::recordCompanionMerge(VkCommandBuffer c, std::uint
+     const auto norms = uniformExposure_ ? hp::frequencyNorms(config_.strength)
+                                         : hp::bracketedFrequencyNorms(config_.strength, exposureFactor);
+     FreqMergePc fm{std::int32_t(tx), std::int32_t(ty), norms.robustnessNorm, norms.readNoise, norms.maxMotionNorm,
+-                   uniformExposure_ ? 1 : 0, exposureFactor,
++                   uniformExposure_ ? 1 : 0, exposureFactor, 0, // SPIR-V offset 28 padding
+                    std::int32_t(level0.tilesX), std::int32_t(level0.tilesY), std::int32_t(level0.tileSize),
+                    std::int32_t(geometry_.cropX), std::int32_t(geometry_.cropY), offset[0], offset[1],
+                    rawNoiseMeasured_ ? 1 : 0};
+@@ -719,9 +733,19 @@ void HdrPlusFrequencyRecorder::recordPassFinish(VkCommandBuffer c, std::uint32_t
+                          sizeof(np), divUp(geometry_.rgbaWidth, 16), divUp(geometry_.rgbaHeight, 16));
+         computeWriteBarrier(c);
+     }
+-    executor_.record(c, ShaderId::HdrqDeconvolute, {{ib(0, finalFt), ib(1, arena_.image("hdrq_total_mismatch"))}, {}}, &tp,
+-                     sizeof(tp), tx, ty);
+-    computeWriteBarrier(c);
++    // IRIS_26889_B_OFF_REFERENCE_ONLY_NO_NOISE_PROOF: when burst statistics
++    // are unavailable the uniform HDRQ merge inserts ONLY the actual
++    // reference spectrum in place of every companion. The normal HDRQ
++    // deconvolution is a multi-frame residual-alignment correction and can
++    // sharpen reference-only high-contrast edges into artificial halos.
++    // Preserve the reference spectrum unamplified in this fail-closed case.
++    // The bracketed/exposure path remains unchanged.
++    if (!uniformExposure_ || rawNoiseMeasured_) {
++        executor_.record(c, ShaderId::HdrqDeconvolute,
++                         {{ib(0, finalFt), ib(1, arena_.image("hdrq_total_mismatch"))}, {}},
++                         &tp, sizeof(tp), tx, ty);
++        computeWriteBarrier(c);
++    }
+     // Bracketed spectra are already a weighted mean (hdrq_normalize).
+     BackwardPc bp{std::int32_t(tx), std::int32_t(ty), uniformExposure_ ? float(frameCount) : 1.0f};
+     executor_.record(c, ShaderId::HdrqBackwardDft, {{ib(0, finalFt), ib(1, out)}, {}}, &bp, sizeof(bp), tx, ty);
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+index 51b1d7147ae0844091cfec5aa9ad8e231a3d7f0b..272f24b444767e30ad262d3138584e100edbcec6 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqMismatch.comp
+@@ -56,7 +56,6 @@ float pointSupport(ivec2 pix, ivec2 t0) {
+                                  any(greaterThan(a, vec4(p.referenceWhite * 0.985)));
+         }
+     }
+-    if (clipped) return 1.0; // Preserve established clipped behavior.
+     vec4 refMean = sumRef / 9.0;
+     vec4 alMean = sumAl / 9.0;
+     // Bounded companion exposure gain from the exact captured frame metadata.
+@@ -67,6 +66,18 @@ float pointSupport(ivec2 pix, ivec2 t0) {
+     vec4 structuralVar = max(sumRefSq / 9.0 - refMean * refMean, vec4(0.0));
+     vec4 sensorVar = max(p.slopeRaw * max(refMean-p.referenceBlack, vec4(0.0)) + p.offsetRaw,
+                          vec4(1.0e-5));
++    // EXPERIMENT ONLY: when one frame contains a genuinely different clipped
++    // bright contour, the old unconditional support=1 hides moving highlights.
++    // Allow subpixel motion at a *stationary* saturated edge through a
++    // structure/noise envelope. Unknown clipping is not evidence of motion.
++    if (clipped) {
++        vec4 delta = abs(refMean - alCorrected);
++        vec4 uncertainty = 0.8 * sqrt(structuralVar) + 3.0 * sqrt(sensorVar);
++        bvec4 movingBright = greaterThan(delta, uncertainty);
++        int reliable = int(movingBright.x) + int(movingBright.y) +
++                       int(movingBright.z) + int(movingBright.w);
++        return reliable >= 2 ? 0.0 : 1.0;
++    }
+     vec4 sigma = max(sqrt(structuralVar), sqrt(sensorVar));
+     vec4 modeledDiff = sqrt(2.0 * sensorVar) / 3.0;
+     vec4 meanDiff = abs(refMean - alCorrected);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26868DirectLong.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26868DirectLong.kt
+index 9ab5efc02d457b8dc08861a294c7bcf06f83d5a5..8c62a68b6b4e37668cd629662ff68ea16a58f2f3 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26868DirectLong.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26868DirectLong.kt
+@@ -136,4 +136,106 @@ internal object GlesIris26868DirectLong {
+             oShadowGain=vec4(gain,trust,0.0,1.0);
+         }
+     """.trimIndent()
++
++    // IRIS_26889_PRIVATE_B_OFF_LONG_MOTION_SHADOW_GUARD
++    val trustedShadowGainBOffMotionSafe = """
++        #version 300 es
++        precision highp float;
++        precision highp int;
++        uniform highp sampler2D uNormalCameraRgb;
++        uniform highp sampler2D uLongCameraRgb;
++        uniform highp sampler2D uLongCfaClip;
++        uniform ivec2 uImageSize;
++        layout(location=0) out vec4 oShadowGain;
++        float lum(vec3 c){return dot(max(c,vec3(0.0)),vec3(0.25,0.5,0.25));}
++        float readLum(sampler2D t,ivec2 p){
++            return lum(texelFetch(t,clamp(p,ivec2(0),uImageSize-1),0).rgb);
++        }
++        void main(){
++            ivec2 p=clamp(ivec2(gl_FragCoord.xy),ivec2(0),uImageSize-1);
++            float normalNow=readLum(uNormalCameraRgb,p);
++            float longNow=readLum(uLongCameraRgb,p);
++            float normalLow=0.0;
++            float longLow=0.0;
++            float residualSum=0.0;
++            float residualSumSq=0.0;
++            float worstRelativeResidual=0.0;
++            float widestRelativeSourceEdge=0.0;
++            for(int y=-2;y<=2;y++)for(int x=-2;x<=2;x++){
++                ivec2 q=p+ivec2(x,y);
++                float normalLocal=readLum(uNormalCameraRgb,q);
++                float longLocal=readLum(uLongCameraRgb,q);
++                normalLow+=normalLocal;
++                longLow+=longLocal;
++                float residual=longLocal-normalLocal;
++                residualSum+=residual;
++                residualSumSq+=residual*residual;
++                worstRelativeResidual=max(worstRelativeResidual,
++                    abs(residual)/max(max(normalLocal,longLocal),0.06));
++                // If either exposure has local structure, LONG cannot safely
++                // inject a displaced contour. Reuse the existing 5x5 reads;
++                // never suppress NORMAL's detail or its HDRQ denoising.
++                widestRelativeSourceEdge=max(widestRelativeSourceEdge,
++                    max(abs(normalLocal-normalNow),abs(longLocal-longNow)) /
++                        max(max(normalNow,longNow),0.06));
++            }
++            normalLow/=25.0;
++            longLow/=25.0;
++            // Large registration, moving subjects, edge disagreement, clipping,
++            // invalid measured light, and well-exposed areas all veto LONG.
++            float highNormal=normalNow-normalLow;
++            float highLong=longNow-longLow;
++            float structureAgreement=1.0-smoothstep(0.012,0.055,
++                abs(highNormal-highLong));
++            float radianceAgreement=1.0-smoothstep(0.12,0.38,
++                abs(longLow-normalLow)/max(max(normalLow,longLow),0.02));
++            float shadowOnly=1.0-smoothstep(0.07,0.32,normalLow);
++            float clip=texelFetch(uLongCfaClip,p/2,0).r;
++            // Uniform black is never a source of reliable shadow structure:
++            // forbid multiplying near-black read noise or negative leakage.
++            float measuredLight=smoothstep(0.008,0.035,max(longLow,normalLow));
++            float valid=measuredLight*(1.0-step(0.5,clip));
++            float trust=clamp(structureAgreement*radianceAgreement*
++                shadowOnly*valid,0.0,1.0);
++            // B OFF only: LONG is another exposure/timestamp and cannot
++            // introduce a displaced low-frequency contour in NORMAL HDRQ.
++            // Coherent signed disagreement guards quiet shadow structure;
++            // noisy/unobservable regions default to reference-only luminance.
++            float residualMean=residualSum/25.0;
++            float residualVariance=max(0.0,
++                residualSumSq/25.0-residualMean*residualMean);
++            float residualSigma=sqrt(residualVariance);
++            // IRIS_26889_B_OFF_LONG_V9_STATIONARY_SHADOW:
++            // A low-frequency radiance disagreement is legitimate in quiet
++            // static shadows: higher-exposure LONG has a different noise and
++            // sometimes a bounded calibration residual. The v8 z-score
++            // mistakenly called every nonzero mean "motion", nulling LONG
++            // even for featureless stationary shadow patches.
++            // Keep only bounded, low-frequency contributions; reject the
++            // edge/residual structures that could introduce another contour.
++            float localMeanDiff=abs(residualMean)/
++                max(max(normalLow,longLow),0.02);
++            float meanGuard=1.0-smoothstep(0.065,0.14,localMeanDiff);
++            float shapeGuard=1.0-smoothstep(0.003,0.012,residualSigma);
++            float edgeGuard=1.0-smoothstep(0.010,0.035,
++                widestRelativeSourceEdge);
++            // A single outlier in the 5x5 window must not create a gain halo.
++            // Compare each pixel against local common exposure discrepancy,
++            // not against zero; the latter punished stationary radiance bias.
++            float maxCenteredResidual=max(0.0,
++                worstRelativeResidual-localMeanDiff);
++            float centeredGuard=1.0-smoothstep(0.030,0.10,
++                maxCenteredResidual);
++            trust*=meanGuard*shapeGuard*edgeGuard*centeredGuard;
++            // The detail/high-pass belongs to multi-frame NORMAL. LONG may
++            // replace only a bounded fraction of the low-frequency component.
++            float targetLow=mix(normalLow,longLow,trust*0.6);
++            float target=max(0.0,targetLow+highNormal);
++            float gain=clamp(target/max(normalNow,0.015),0.82,1.18);
++            // Subpixel bias should not multiply shadow grain near black.
++            gain=mix(1.0,gain,trust);
++            if(isnan(gain)||isinf(gain))gain=1.0;
++            oShadowGain=vec4(gain,trust,0.0,1.0);
++        }
++    """.trimIndent()
+ }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt
+index 7fffb20d71b070120f8ca23ec1f9c241d8f2cc27..a32e02ca7369b09412492a057c93009d60c67b6e 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870GpuSharpest.kt
+@@ -99,9 +99,12 @@ internal object GlesIris26870GpuSharpest {
+     private fun state(id:Int):Int{
+         val v=IntArray(1);GLES30.glGetIntegerv(id,v,0);return v[0]
+     }
+-    fun select(frozen:GlesIris26864FrozenRawrIngress,cfa:Int,shutterIndex:Int):Int {
++    fun select(frozen:GlesIris26864FrozenRawrIngress,cfa:Int,shutterIndex:Int,
++               eligibleIndices:Set<Int>?=null):Int {
+         frozen.assertUsable()
+         require(cfa in 0..3 && shutterIndex in frozen.buffers.indices)
++        require(eligibleIndices==null || (shutterIndex in eligibleIndices &&
++            eligibleIndices.all { it in frozen.buffers.indices }))
+         val w=frozen.width;val h=frozen.height
+         val maxTex=state(GLES30.GL_MAX_TEXTURE_SIZE)
+         if(w<128||h<128||w>maxTex||h>maxTex)return shutterIndex
+@@ -177,6 +180,7 @@ internal object GlesIris26870GpuSharpest {
+             check(baseline.isFinite() && baseline>0)
+             val host=ByteBuffer.allocateDirect(GRID*GRID*4).order(ByteOrder.nativeOrder())
+             for(i in frozen.buffers.indices){
++                if(eligibleIndices!=null && i !in eligibleIndices)continue
+                 val exp=frozen.exposures[i].toDouble()
+                 // Reference-dependent exposure/black/clip metadata MUST be
+                 // comparable to shutter when downstream capture metadata stays frozen.
+@@ -205,11 +209,12 @@ internal object GlesIris26870GpuSharpest {
+                 }
+                 if(count>=500){scores[i]=sum/count;supports[i]=count}
+             }
+-            val best=scores.indices.maxByOrNull{scores[it]} ?: shutterIndex
++            val best=(eligibleIndices ?: scores.indices.toSet()).maxByOrNull { scores[it] } ?: shutterIndex
+             if(supports[best]<500 || scores[best]<0.04 ||
+                (scores[shutterIndex]>0.0 && scores[best]<scores[shutterIndex]*1.10))return shutterIndex
+             val peak=scores[best]
+-            val near=scores.indices.filter { supports[it]>=500 && scores[it]>=peak*0.985 }
++            val near=scores.indices.filter { (eligibleIndices==null || it in eligibleIndices) &&
++                supports[it]>=500 && scores[it]>=peak*0.985 }
+             val t=frozen.timestampsNs[shutterIndex]
+             return near.minByOrNull{ abs(frozen.timestampsNs[it]-t) } ?: shutterIndex
+         } catch(ignored: Throwable) {
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26889BOffSceneMotion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26889BOffSceneMotion.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..842b47c6075da8e6c48cb625c30c509a852a6549
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26889BOffSceneMotion.kt
+@@ -0,0 +1,144 @@
++package com.hinnka.mycamera.processor
++
++import java.nio.ByteBuffer
++import kotlin.math.abs
++import kotlin.math.max
++import kotlin.math.min
++
++/**
++ * IRIS_26889_B_OFF_SHUTTER_ADJACENT_REFERENCE_AND_LONG_POLICY
++ * Capture-local, RAW-only static/motion confidence. No semantic object labels,
++ * no A, Wronski B ON, Night, DNG or vendor producer participation.
++ *
++ * The camera may shake while the scene is static: fit local translations
++ * BEFORE detecting independently moving structures. Ambiguous results never
++ * grant a later whole-burst reference or a separate LONG exposure.
++ */
++internal object GlesIris26889BOffSceneMotion {
++    internal data class Decision(
++        val staticTrusted: Boolean,
++        val shutterAdjacent: Set<Int>,
++        val reliablePatches: Int,
++        val movingPatches: Int,
++        val unexplainedPatches: Int,
++        val comparedFrames: Int,
++    )
++
++    private data class Match(val dx:Int, val dy:Int, val loss:Float, val atZero:Float, val structure:Float)
++
++    private fun median(values:List<Int>):Int = values.sorted()[values.size/2]
++
++    fun classify(frozen:GlesIris26864FrozenRawrIngress, cfa:Int, shutterIndex:Int):Decision {
++        frozen.assertUsable()
++        require(cfa in 0..3 && shutterIndex in frozen.buffers.indices)
++        val t0=frozen.timestampsNs[shutterIndex]
++        require(t0>0L && frozen.timestampsNs.toSet().size==frozen.buffers.size)
++        // Processing order begins with the shutter frame; chronological order
++        // must be reconstructed from sensor timestamps, never list position.
++        val nearest=frozen.buffers.indices.sortedWith(compareBy<Int> {
++            val dt=if(frozen.timestampsNs[it]>t0) frozen.timestampsNs[it]-t0
++                   else t0-frozen.timestampsNs[it]
++            dt
++        }.thenBy { frozen.timestampsNs[it] })
++        val adjacent=nearest.take(min(3,nearest.size)).toSet()
++        if (frozen.width<128 || frozen.height<128 || frozen.buffers.size<3) {
++            return Decision(false,adjacent,0,0,0,0)
++        }
++        // Restrict checks to the exposures closest to the shutter. Capture
++        // geometry is constant and the physical lens has already been verified.
++        val peers=nearest.filter { it!=shutterIndex }
++        val referenceExposure=frozen.exposures[shutterIndex]
++        if(!referenceExposure.isFinite() || referenceExposure<=0f) {
++            return Decision(false,adjacent,0,0,0,0)
++        }
++        val greenX=if(cfa==0 || cfa==3) 1 else 0
++        val centers=ArrayList<Pair<Int,Int>>(48)
++        for (y in 1..6) for (x in 1..8) {
++            val px=((frozen.width.toLong()*x/9).toInt() and -2)+greenX
++            val py=((frozen.height.toLong()*y/7).toInt() and -2)
++            if(px in 32 until frozen.width-32 && py in 32 until frozen.height-32) centers.add(px to py)
++        }
++        if(centers.size<20)return Decision(false,adjacent,0,0,0,0)
++        val ref=frozen.buffers[shutterIndex]
++        val refStride=frozen.stridesBytes[shutterIndex]
++        val blackRef=frozen.blackByFrameByPhase[shutterIndex*4+greenX]
++        val whiteRef=frozen.sensorWhiteByFrame[shutterIndex]
++        if(!(whiteRef>blackRef+1f))return Decision(false,adjacent,0,0,0,0)
++        fun read(b:ByteBuffer,stride:Int,x:Int,y:Int,black:Float,white:Float,expRatio:Float):Float {
++            val raw=b.getShort(y*stride+x*2).toInt() and 0xffff
++            return ((raw-black)/max(1f,white-black)*expRatio).coerceIn(0f,1.5f)
++        }
++        var good=0;var moving=0;var unexplained=0;var compared=0
++        for(peer in peers) {
++            val exposure=frozen.exposures[peer]
++            if(!exposure.isFinite() || exposure<=0f || abs(exposure/referenceExposure-1f)>0.06f)
++                return Decision(false,adjacent,good,moving,unexplained,compared)
++            val other=frozen.buffers[peer]
++            val stride=frozen.stridesBytes[peer]
++            val black=frozen.blackByFrameByPhase[peer*4+greenX]
++            val white=frozen.sensorWhiteByFrame[peer]
++            val ratio=referenceExposure/exposure
++            if(!(white>black+1f))return Decision(false,adjacent,good,moving,unexplained,compared)
++            val matches=ArrayList<Match>(centers.size)
++            for((cx,cy) in centers) {
++                val src=FloatArray(25)
++                var k=0;var low=Float.POSITIVE_INFINITY;var high=0f
++                for(iy in -2..2) for(ix in -2..2){
++                    val value=read(ref,refStride,cx+ix*4,cy+iy*4,blackRef,whiteRef,1f)
++                    src[k++]=value
++                    low=min(low,value);high=max(high,value)
++                }
++                val structure=high-low
++                // Only structurally supported tiles can yield a motion vector.
++                // Flat high-ISO noise must not be mistaken for a moving object.
++                if (structure<0.08f || low<0.015f || high>0.96f) continue
++                var bestLoss=Float.POSITIVE_INFINITY;var bestDx=0;var bestDy=0;var zeroLoss=0f
++                for(dy in -12..12 step 2) for(dx in -12..12 step 2) {
++                    var loss=0f;k=0
++                    for(iy in -2..2) for(ix in -2..2) {
++                        val v=read(other,stride,cx+ix*4+dx,cy+iy*4+dy,black,white,ratio)
++                        loss+=abs(v-src[k++])
++                    }
++                    loss/=25f
++                    if(dx==0 && dy==0)zeroLoss=loss
++                    if(loss<bestLoss-0.000001f ||
++                       (abs(loss-bestLoss)<=0.000001f && abs(dx)+abs(dy)<abs(bestDx)+abs(bestDy))) {
++                        bestLoss=loss;bestDx=dx;bestDy=dy
++                    }
++                }
++                matches.add(Match(bestDx,bestDy,bestLoss,zeroLoss,structure))
++            }
++            compared++
++            val coherent=matches.filter { it.loss<0.13f && it.structure>0.10f }
++            good+=coherent.size
++            if (coherent.size<max(8,centers.size/4)) {
++                return Decision(false,adjacent,good,moving,unexplained,compared)
++            }
++            val globalX=median(coherent.map { it.dx })
++            val globalY=median(coherent.map { it.dy })
++            if(abs(globalX)>=12 || abs(globalY)>=12) {
++                // Insufficient support for large camera motion: never promote
++                // LONG or a temporally distant sharpest frame.
++                return Decision(false,adjacent,good,moving,unexplained,compared)
++            }
++            var localOutliers=0;var inconsistent=0
++            for(m in matches) {
++                if(m.structure<0.10f) continue
++                val difference=abs(m.dx-globalX)+abs(m.dy-globalY)
++                if(m.loss<0.12f && difference>=6 && m.atZero-m.loss>=0.025f)
++                    localOutliers++
++                // Structural changes that *no* 2D translation could match,
++                // such as a changing TV image or a moving occlusion.
++                if(m.loss>0.115f && m.loss>0.50f*m.structure)
++                    inconsistent++
++            }
++            moving+=localOutliers
++            unexplained+=inconsistent
++            if(localOutliers>=max(3,centers.size/12) || inconsistent>=max(3,centers.size/10)) {
++                return Decision(false,adjacent,good,moving,unexplained,compared)
++            }
++        }
++        return Decision(compared>=2 && good>=24 && moving==0 && unexplained==0,
++                        adjacent,good,moving,unexplained,compared)
++    }
++}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+index 90b78835957a848141d6917d7c914e211628a9f6..d12a7769619ba213c4a49bf4b7aa6cd6d43f8673 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawFusion.kt
+@@ -59,6 +59,7 @@ internal class GlesMgcRawFusion(
+      * Historical A continues with the default false/null arguments. */
+     private val iris26864RealRawrOwnsBurstNoise: Boolean = false,
+     private val iris26868ReferenceTimestampNs: Long = -1L,
++    private val iris26889BOffLongAllowed: () -> Boolean = { true },
+     private val iris26864NativeWronski2x: ((outputRgb: Int, outputSensorClip: Int) -> Unit)? = null,
+ ) {
+     fun processFrames(frames: List<RawStackFrame>): RawStackResult? {
+@@ -115,6 +116,7 @@ internal class GlesMgcRawFusion(
+                 iris26856BOnlyIndependentPublication = true,
+                 iris26864RealRawrOwnsBurstNoise = true,
+                 iris26868ReferenceTimestampNs = iris26868ReferenceTimestampNs,
++                iris26889BOffLongAllowed = iris26889BOffLongAllowed,
+                 iris26864NativeWronski2x = iris26864NativeWronski2x,
+             ).processFrames(frames)
+         }
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 63890fd815003e19afbd0a11d48c9fadbc3ea8a2..bb2b17b417c65c6b90674d4329387ad5ec20cc57 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -133,6 +133,9 @@ internal class GlesMgcRawSpatialStacker(
+      */
+     private val iris26864RealRawrOwnsBurstNoise: Boolean = false,
+     private val iris26868ReferenceTimestampNs: Long = -1L,
++    // B Super Res OFF capture-local same-decision gate; B ON and other modes
++    // do not call this provider and retain their successful long behavior.
++    private val iris26889BOffLongAllowed: () -> Boolean = { true },
+     /* A/B capture-owned mode. B-only may leave after its own color + LONG + zoom are ready. */
+     private val iris26856BOnlyIndependentPublication: Boolean = false,
+ ) {
+@@ -2322,9 +2325,12 @@ internal class GlesMgcRawSpatialStacker(
+                     check(frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } == 1) {
+                         "26868 direct B requires one immutable LONG"
+                     }
+-                    longGain26868 = try {
++                    if (!iris26889BOffLongAllowed()) {
++                        PLog.i(SABRE_TAG,"IRIS_26889_B_OFF_LONG_REJECTED reason=MOTION_OR_UNCERTAIN reference=NORMAL_HDRQ")
++                    } else longGain26868 = try {
+                         renderIris26868IndependentLongShadowGuide(
+-                            long, selectedReference, sensorNeutralB)
++                            long, selectedReference, sensorNeutralB,
++                            bOffLongMotionSafe = true)
+                     } catch (failure: Exception) {
+                         PLog.w(SABRE_TAG,"IRIS_26868_LONG_REJECTED_NORMAL_INTACT " +
+                             "reason=${failure.javaClass.simpleName} detail=${failure.message}")
+@@ -2424,6 +2430,7 @@ internal class GlesMgcRawSpatialStacker(
+      */
+     private fun renderIris26868IndependentLongShadowGuide(
+         long: RawStackFrame, reference: RawStackFrame, normalRgb: Int,
++        bOffLongMotionSafe: Boolean = false,
+     ): Int {
+         check(long.role == RawBurstFrameRole.SHADOW_LONG &&
+             reference.role == RawBurstFrameRole.NORMAL &&
+@@ -2474,7 +2481,12 @@ internal class GlesMgcRawSpatialStacker(
+                 packed,demosaiced,width,height,cfaPattern,
+                 checkNotNull(iris26856RawrColor).amazeWhiteBalance.copyOf())
+             guide=createTexture(width,height,GLES30.GL_RG16F,GLES30.GL_NEAREST)
+-            val gain=linkProgram(GlesIris26868DirectLong.trustedShadowGain,
++            val longGuideShader = if (bOffLongMotionSafe) {
++                GlesIris26868DirectLong.trustedShadowGainBOffMotionSafe
++            } else {
++                GlesIris26868DirectLong.trustedShadowGain
++            }
++            val gain=linkProgram(longGuideShader,
+                 "iris_26868_b_single_long_shadow_confidence")
+             GLES30.glUseProgram(gain)
+             bindTexture(gain,"uNormalCameraRgb",0,normalRgb)
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index c5d0ebf13d2dd6764b8a618eed058be9a4d4b5eb..9657830bbb1ef7bec5cd94ad690181ba603e9d0d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -653,6 +653,10 @@ object PhotonMotionMgc1271Bridge {
+                 "dngOwner=${if (sabreSuperResEnabled && produceNormalStackedDng) "SABRE_LINEAR_RAW_2X" else "NORMALIZED16_NATIVE"}")
+ 
+             egl = EglOwner.create()
++            // One capture-local decision shared between the B-OFF native reference
++            // selector and its later independent LONG luminance stage.
++            // Default false fails closed on any exception before classification.
++            val bOffLongStaticSafe26889 = AtomicBoolean(false)
+             val fusion = GlesMgcRawFusion(
+                 width = size.x,
+                 height = size.y,
+@@ -719,6 +723,7 @@ object PhotonMotionMgc1271Bridge {
+                 iris26864RealRawrOwnsBurstNoise = !parameters.irisNightActive &&
+                     experiment26856 != Iris26856ABSettings.Mode.ORIGINAL_26850,
+                 iris26868ReferenceTimestampNs = referenceTimestamp,
++                iris26889BOffLongAllowed = { bOffLongStaticSafe26889.get() },
+                 iris26864NativeWronski2x = if (sabreSuperResEnabled &&
+                     !parameters.irisNightActive &&
+                     experiment26856 != Iris26856ABSettings.Mode.ORIGINAL_26850) {
+@@ -816,9 +821,19 @@ object PhotonMotionMgc1271Bridge {
+                             )
+                             try {
+                                 ingress.use { frozen ->
++                                    val motion26889 = try {
++                                        com.hinnka.mycamera.processor.GlesIris26889BOffSceneMotion.classify(
++                                            frozen,pattern,nativeReferenceIndex)
++                                    } catch (failure: Throwable) {
++                                        PLog.w(TAG,"IRIS_26889_B_OFF_MOTION_UNCERTAIN reason=${failure.javaClass.simpleName}")
++                                        null
++                                    }
++                                    val staticSafe26889=motion26889?.staticTrusted==true
++                                    bOffLongStaticSafe26889.set(staticSafe26889)
+                                     val chosenRef26870 = com.hinnka.mycamera.processor.GlesIris26870GpuSharpest.select(
+-                                        frozen,pattern,nativeReferenceIndex)
+-                                    PLog.i(TAG, "IRIS_26870_B_GPU_REFERENCE HDRq shutter=$nativeReferenceIndex selected=$chosenRef26870 normals=${nativeNormalFrames.size}")
++                                        frozen,pattern,nativeReferenceIndex,
++                                        if(staticSafe26889) null else motion26889?.shutterAdjacent ?: setOf(nativeReferenceIndex))
++                                    PLog.i(TAG, "IRIS_26889_B_OFF_REFERENCE_POLICY shutter=$nativeReferenceIndex selected=$chosenRef26870 static=$staticSafe26889 longAllowed=$staticSafe26889 compared=${motion26889?.comparedFrames ?: 0} moving=${motion26889?.movingPatches ?: 0} inconsistent=${motion26889?.unexplainedPatches ?: 0} normals=${nativeNormalFrames.size}")
+                                     com.hinnka.mycamera.processor.GlesIris26864NativeRawr.run(
+                                         PhotonCamera.getApplicationContextStatic(), frozen,
+                                         gains, lsc, lscWidth, lscHeight,
+diff --git a/app/version.properties b/app/version.properties
+index 27c94deadf0f9124d6084c1d9b2e0b7a27cf71a7..1ff5fba542a9ac42355b4310879ade3aac931946 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726888
+-VERSION_BUILD=26888
++VERSION_NAME=0.9726889
++VERSION_BUILD=26889
