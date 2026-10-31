@@ -22,13 +22,14 @@ payload=R/'handoff_payload_26893';files={p.relative_to(payload).as_posix() for p
 assert files=={k[4:] for k in modified}
 assert all(H(payload/p)==new['app/'+p] for p in files)
 assert (R/'TRIGGER_26893.txt').read_bytes()==b'RUN_26893_BACKLIT_FOREGROUND_DARKEN_ONLY_CONTRAST_V1\n'
+assert (R/'TRIGGER_26893_RETRY_V2.txt').read_bytes()==b'RUN_26893_BACKLIT_FOREGROUND_DARKEN_ONLY_CONTRAST_V2\n'
 workflow=R/'.github/workflows/build-26893-iris-rawr.yml'
 w=workflow.read_text()
 assert w.startswith('name: Build 26893')
-assert "  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26893.txt'\n  workflow_dispatch:" in w
+assert "  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26893_RETRY_V2.txt'\n  workflow_dispatch:" in w
 p=w.split('  push:\n',1)[1].split('  workflow_dispatch:',1)[0]
-assert p.count("      - '")==1 and p.count('TRIGGER_26893.txt')==1
-assert all(x not in p for x in ['generate_26893_build.py','handoff_payload_26893','build-26893-iris-rawr.yml'])
+assert p.count("      - '")==1 and p.count('TRIGGER_26893_RETRY_V2.txt')==1
+assert all(x not in p for x in ['generate_26893_build.py','handoff_payload_26893','build-26893-iris-rawr.yml','TRIGGER_26893.txt'])
 seq=['Replay SHA-pinned successful 26892 historical runner','Derive SHA-sealed 26893 successor guarded runner','Run inherited 17-stage 26893 build','Prove single intended 26893 APK','Seal exact EXECUTED 26893 runner','Upload authoritative 26893 proof and APK']
 for x in seq: assert w.count('      - name: '+x)==1,x
 assert all(w.index(a)<w.index(b) for a,b in zip(seq,seq[1:]))
@@ -48,7 +49,7 @@ sealed=load('26893_HANDOFF_HASHES.sha256');assert all((R/p).is_file() and H(R/p)
 upload=(R/'26893_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines()
 assert upload==sorted(set(upload))
 assert set(upload)==set(sealed)|{'26893_HANDOFF_HASHES.sha256','26893_REPOSITORY_UPLOAD_ALLOWLIST.txt'}
-assert '.github/workflows/build-26893-iris-rawr.yml' in upload and 'TRIGGER_26893.txt' in upload
+assert '.github/workflows/build-26893-iris-rawr.yml' in upload and 'TRIGGER_26893.txt' in upload and 'TRIGGER_26893_RETRY_V2.txt' in upload
 assert 'build_26893_iris_rawr.sh' not in upload and 'build_26890_iris_rawr.sh' not in upload
 assert not any('__pycache__' in x or x.endswith('.pyc') for x in upload)
 print('PASS sealed four changes, 2021 protected, all three stages, trigger-only path filter, deterministic runner SHA')

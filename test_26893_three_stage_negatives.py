@@ -7,7 +7,7 @@ w=(R/'.github/workflows/build-26893-iris-rawr.yml').read_text()
 start=w.index('  push:\n')
 end=w.index('  workflow_dispatch:',start)
 old=w[start:end]
-assert old=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26893.txt'\n",'trigger stage not sole push path'
+assert old=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26893_RETRY_V2.txt'\n",'trigger stage not sole push path'
 for extra in ("      - 'generate_26893_build.py'\n", "      - '.github/workflows/build-26893-iris-rawr.yml'\n", "      - '26893_HANDOFF_HASHES.sha256'\n", "      - 'handoff_payload_26893/**'\n"):
  tam=w[:end]+extra+w[end:]
  assert tam[tam.index('  push:\n'):tam.index('  workflow_dispatch:')]!=old
@@ -16,7 +16,7 @@ stage1=(R/'26893_STAGE_1_UPLOAD_PATHS.txt').read_text().splitlines()
 stage2=(R/'26893_STAGE_2_UPLOAD_PATHS.txt').read_text().splitlines()
 stage3=(R/'26893_STAGE_3_UPLOAD_PATHS.txt').read_text().splitlines()
 assert stage2==['.github/workflows/build-26893-iris-rawr.yml']
-assert stage3==['TRIGGER_26893.txt']
+assert stage3==['TRIGGER_26893_RETRY_V2.txt']
 assert not set(stage1)&set(stage2+stage3)
 assert set(stage1)|set(stage2)|set(stage3)==set((R/'26893_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines())
 print('PASS real 26893 one-path trigger, 4 premature-trigger negatives, strict Stage1(all)/Stage2(YAML)/Stage3(TXT) partition')

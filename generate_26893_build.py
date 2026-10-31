@@ -43,6 +43,12 @@ for a,b in [
  ('# IRIS_26892_AUTHORITATIVE_ACTIONS_STAGE_ORDER','# IRIS_26893_AUTHORITATIVE_ACTIONS_STAGE_ORDER')]: once(a,b)
 # Only new-run output directory names change, never historical shader or previous-test source names.
 s=s.replace('$OUT/26892_','$OUT/26893_')
+# The authority artifact root is now the SUCCESSFUL 26892 output directory.
+# Repoint ONLY the historical 26888 compiled-SPIR-V ABI operand to that
+# artifact's real entry; the original 26889 historical verifier and source
+# universes stay byte-identical. Previous 26893 run 41236666825 failed here.
+once('"$ARTDIR/build_26891_iris_rawr_outputs/26888_modified_shader_spirv/Iris26887BOffHdrqMerge_prod.spv"',
+     '"$ARTDIR/build_26892_iris_rawr_outputs/26888_modified_shader_spirv/Iris26887BOffHdrqMerge_prod.spv"')
 
 # Clean extract's transforming CURRENT candidate must use successor transform.
 s=s.replace('verify_26892_candidate.py "$BASE" "$replay" --transform','verify_26893_candidate.py "$BASE" "$replay" --transform')
@@ -201,6 +207,7 @@ s=s.replace('runtime_changed_files=4 (4 existing, 0 additions/deletions); 2021 p
 s=s.replace('protected_source=2021 files byte-identical to successful 26891 compiled candidate','protected_source=2021 files byte-identical to successful 26892 compiled candidate')
 s=s.replace('26892 4-path full-index','26893 4-path full-index')
 # Current 26893 image math must be generated and handed off EXACTLY as shipped.
+assert not any('"$ARTDIR/build_26891_iris_rawr_outputs/' in line for line in s.splitlines()),'stale 26891 artifact directory used under 26892 authority'
 assert tuple(x for x in rex.findall(s) if x in STAGES)==STAGES,(rex.findall(s),STAGES)
 for call in ['./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace',"./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDebug[armeabi-v7a]' --stacktrace",'./gradlew :app:assembleDebug --stacktrace']:
  assert call in s,call
