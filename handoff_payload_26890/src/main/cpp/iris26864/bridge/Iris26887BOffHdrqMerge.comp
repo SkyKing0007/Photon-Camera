@@ -1,0 +1,207 @@
+#version 450
+// Port of hdr-plus-swift merge_frequency_domain: per tile,
+// pick the best of 7x7 sub-pixel Fourier shifts of the aligned tile, then
+// merge each frequency bin with a Wiener-shrinkage weight (Hasinoff 2016,
+// Liba 2019 motion norm, Delbracio 2015 magnitude norm). One 8x8 workgroup
+// per tile, then every lane merges its own bin.
+// Shift search: upstream minimizes sum_k |ref_k - e^{i theta}·al_k|^2 over
+// channels. Rotation preserves |al_k|, so this equals a shift-independent
+// constant minus 2 * sum_k (cos·A_k + sin·B_k) with per-bin cross terms
+// A_k = sum_ch(refRe·alRe + refIm·alIm), B_k = sum_ch(refIm·alRe - refRe·alIm):
+// the same argmin from 2 floats per bin instead of 16 (shared-memory bound on
+// mobile GPUs); first maximum wins like upstream's first minimum.
+// Bracketed bursts (Rawr): instead of upstream's equal-weight mean of
+// (1-w)*aligned + w*ref, each frame adds frameWeight*(1-w)*aligned and its
+// weight to a per-bin sum seeded with the reference at weight 1
+// (hdrq_normalize divides). frameWeight is the exposure factor, the inverse
+// shot-noise variance of a frame scaled to the reference exposure, so the
+// brighter frames carry the shadows and rejected bins add nothing.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba32f) readonly uniform image2D refFt;
+layout(set = 0, binding = 1, rgba32f) readonly uniform image2D alignedFt;
+layout(set = 0, binding = 2, rgba32f) uniform image2D outFt;
+layout(set = 0, binding = 3, rgba32f) readonly uniform image2D rms;
+layout(set = 0, binding = 4, r32f) readonly uniform image2D mismatch;
+// (cos, sin) per shift and bin, index shift * 64 + n * 8 + m (hdrq_shift_table).
+layout(std430, set = 0, binding = 5) readonly buffer ShiftTable { vec2 v[]; } shiftTable;
+// Per-tile clipped-highlights factor (hdrq_highlights_norm; 1 when uniform).
+layout(set = 0, binding = 6, r32f) readonly uniform image2D highlights;
+// Per-bin weight sum (bracketed only), one texel per bin at (t*8 + (dm, dn)).
+layout(set = 0, binding = 7, r32f) uniform image2D weightSum;
+// Reuse the exact per-companion, pass-0 alignment vectors already consumed
+// by the fused raw warp. No synthetic confidence or stale frame ownership.
+layout(std430, set = 0, binding = 8) readonly buffer Align { ivec2 v[]; } align;
+layout(push_constant) uniform P {
+    ivec2 tiles;
+    float robustnessNorm;
+    float readNoise;
+    float maxMotionNorm;
+    int uniformExposure;
+    float frameWeight;
+    ivec2 alignTiles;
+    int alignHalfTile;
+    int cropX;
+    int cropY;
+    int offsetX;
+    int offsetY;
+    int supportMeasured; // Actual RAW-burst-noise-fit validity, NOT image mean.
+} p;
+
+shared vec4 sRefRe[64], sRefIm[64], sAlRe[64], sAlIm[64];  // index dn*8 + dm
+shared float sDiff[49];
+shared float sA[64], sB[64];
+shared int sBest;
+
+void main() {
+    ivec2 t = ivec2(gl_WorkGroupID.xy);
+    if (any(greaterThanEqual(t, p.tiles))) return;
+    int dm = int(gl_LocalInvocationID.x), dn = int(gl_LocalInvocationID.y);
+    int lane = dn * 8 + dm;
+    const int ts = 8;
+    ivec2 t0 = t * ts;
+    ivec2 o = ivec2(2 * (t0.x + dm), t0.y + dn);
+    sRefRe[lane] = imageLoad(refFt, o);
+    sRefIm[lane] = imageLoad(refFt, o + ivec2(1, 0));
+    sAlRe[lane] = imageLoad(alignedFt, o);
+    sAlIm[lane] = imageLoad(alignedFt, o + ivec2(1, 0));
+    {
+        vec4 a = sRefRe[lane] * sAlRe[lane] + sRefIm[lane] * sAlIm[lane];
+        vec4 b = sRefIm[lane] * sAlRe[lane] - sRefRe[lane] * sAlIm[lane];
+        sA[lane] = a.x + a.y + a.z + a.w;
+        sB[lane] = b.x + b.y + b.z + b.w;
+    }
+    barrier();
+    // IRIS_26889_B_OFF_MISSING_BURST_NOISE_FAIL_CLOSED:
+    // When no RAW noise blocks were measurable the per-companion motion
+    // detector has no calibrated uncertainty. A displaced exposure must not
+    // be admitted merely because its motion score is UNKNOWN. Preserve
+    // the chosen NORMAL reference spectrum for every companion, with no
+    // fractional companion shift. Fixed-count FFT normalization then
+    // reconstructs a single reference exposure, not a double contour.
+    // This is private to the B-OFF uniform burst; vendor and bracketed
+    // frequency merges are byte-identical elsewhere.
+    if (p.uniformExposure != 0 && p.supportMeasured == 0) {
+        imageStore(outFt, o, imageLoad(outFt, o) + sRefRe[lane]);
+        imageStore(outFt, o + ivec2(1, 0),
+                   imageLoad(outFt, o + ivec2(1, 0)) + sRefIm[lane]);
+        return;
+    }
+    if (lane < 49) {
+        float total = 0.0;
+        for (int k = 0; k < 64; ++k) {
+            vec2 cs = shiftTable.v[lane * 64 + k];
+            total += cs.x * sA[k] + cs.y * sB[k];
+        }
+        sDiff[lane] = total;
+    }
+    barrier();
+    if (lane == 0) {
+        float best = -1e30;
+        int bi = 0;
+        for (int i = 0; i < 49; ++i)
+            if (sDiff[i] > best) {
+                best = sDiff[i];
+                bi = i;
+            }
+        sBest = bi;
+    }
+    barrier();
+    float mm = imageLoad(mismatch, t).x;
+    // Wronski 2019 Sec. 5.2.3: a neighborhood of highly varying alignment
+    // vectors indicates moving/occluded geometry or unreliable registration.
+    // B-only uniform burst: the alignment prior controls REF SUBSTITUTION;
+    // the separately noise-corrected mismatch controls DENOISING STRENGTH.
+    float alignmentPrior = 0.0;
+    if (p.uniformExposure != 0 && all(greaterThan(p.alignTiles, ivec2(0)))) {
+        vec2 center = 2.0 * vec2(t * 8 + ivec2(4)) +
+                      vec2(p.cropX + p.offsetX, p.cropY + p.offsetY);
+        vec2 grid = (center + 0.5) / float(max(1, p.alignHalfTile)) - 1.0;
+        ivec2 k = clamp(ivec2(floor(grid + 0.5)), ivec2(0), p.alignTiles - 1);
+        ivec2 lo = ivec2(2147483647), hi = ivec2(-2147483647);
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx) {
+                ivec2 b = clamp(k + ivec2(dx, dy), ivec2(0), p.alignTiles - 1);
+                ivec2 v = align.v[b.y * p.alignTiles.x + b.x];
+                lo = min(lo, v);
+                hi = max(hi, v);
+            }
+        float spanRawPixels = 2.0 * length(vec2(hi - lo));
+        alignmentPrior = smoothstep(2.0, 7.0, spanRawPixels);
+    }
+    // IRIS_26887_B_OFF_MOTION_LOCAL: original RAWR vendor is unchanged.
+    // This modified shader is only compiled into Iris's B-only mirrored build.
+    // Uniform exposures: retain the configured 13 strength in static tiles,
+    // transition to strength-11.5-equivalent for noise-inconsistent tiles.
+    // Bracketed-exposure path remains byte/mathematically unchanged below.
+    float independentSupport = p.uniformExposure != 0 && p.supportMeasured != 0
+        ? clamp(imageLoad(weightSum, t).x, 0.0, 1.0) : 1.0;
+    // The motion signal comes from noise-calibrated RAW temporal support,
+    // rather than reducing denoising merely because Fourier tile mismatch
+    // is high. Preserve prior behavior if burst fit has no valid samples.
+    float localMotion = p.uniformExposure == 0 ? 0.0 :
+        (p.supportMeasured != 0
+            ? smoothstep(0.20, 0.85, 1.0 - independentSupport)
+            : smoothstep(0.10, 0.38, mm));
+    // Exact strength 11.5 uses the continuous RAWR HDRQ frequencyNorms
+    // equations, rather than frequencyNorms(11.5), which rounds to 12.
+    const float strength115Robustness = 1.0;
+    const float strength115ReadNoise = 16.0;
+    const float strength115MaxMotion = 2.50496541;
+    float adaptiveRobustness = mix(p.robustnessNorm,
+          min(p.robustnessNorm, strength115Robustness), localMotion);
+    float adaptiveReadNoise = mix(p.readNoise,
+          min(p.readNoise, strength115ReadNoise), localMotion);
+    float adaptiveMaxMotion = mix(p.maxMotionNorm,
+          min(p.maxMotionNorm, strength115MaxMotion), localMotion);
+    vec4 noiseNorm = (imageLoad(rms, t) + adaptiveReadNoise) * float(ts * ts) * adaptiveRobustness;
+    float mismatchWeight = clamp(1.0 - 10.0 * (mm - 0.2), 0.0, 1.0);
+    float motionNorm = clamp(adaptiveMaxMotion - (mm - 0.02) *
+          (adaptiveMaxMotion - 1.0) / 0.15, 1.0, adaptiveMaxMotion);
+    vec2 cs = shiftTable.v[sBest * 64 + lane];
+    float c = cs.x, s = cs.y;
+    vec4 refRe = sRefRe[lane], refIm = sRefIm[lane];
+    vec4 alRe = c * sAlRe[lane] - s * sAlIm[lane];
+    vec4 alIm = s * sAlRe[lane] + c * sAlIm[lane];
+    float magnitudeNorm = 1.0;
+    // Magnitude norm only for uniform exposure (brighter frames have larger magnitudes).
+    if (dm + dn > 0 && p.uniformExposure != 0) {
+        vec4 refMag = sqrt(refRe * refRe + refIm * refIm);
+        vec4 alMag = sqrt(alRe * alRe + alIm * alIm);
+        float refEnergy = refMag.x + refMag.y + refMag.z + refMag.w;
+        // A completely dark/empty reference frequency tile cannot define an
+        // aligned/reference magnitude ratio. Never divide by zero and feed
+        // NaN to Wiener weights; retain the neutral magnitude prior instead.
+        if (refEnergy > 1.0e-12) {
+            float ratio = (alMag.x + alMag.y + alMag.z + alMag.w) / refEnergy;
+            magnitudeNorm = max(1.0e-4, mismatchWeight * clamp(ratio * ratio * ratio * ratio, 0.5, 3.0));
+        }
+    }
+    vec4 w4 = (refRe - alRe) * (refRe - alRe) + (refIm - alIm) * (refIm - alIm);
+    w4 = w4 / (w4 + magnitudeNorm * motionNorm * noiseNorm * imageLoad(highlights, t).x);
+    float lo = min(w4.x, min(w4.y, min(w4.z, w4.w))), hi = max(w4.x, max(w4.y, max(w4.z, w4.w)));
+    // Mean of the two central channel weights (upstream's robust variant of Liba's max).
+    float weight = clamp(0.5 * (w4.x + w4.y + w4.z + w4.w - lo - hi), 0.0, 1.0);
+    if (p.uniformExposure != 0) {
+        // Do not omit a rejected companion from the fixed-count uniform
+        // denominator: substitute reference frequencies to preserve energy.
+        // Moving regions must reject displaced companions AT LEAST as early
+        // as their adaptive HDRQ denoising strength is reduced. The smooth
+        // alignment prior is independently observed, not a strength slider.
+        // Independent temporal contribution veto, not a Wiener noise weight.
+        // Unmeasured burst noise retains the successful 26887 fallback.
+        float reject = p.supportMeasured != 0
+            ? max(1.0 - independentSupport,
+                  alignmentPrior * smoothstep(0.08, 0.28, mm))
+            : max(localMotion, smoothstep(0.18, 0.60, mm));
+        reject = max(reject, alignmentPrior * smoothstep(0.08, 0.28, mm));
+        weight = mix(weight, 1.0, reject);
+        imageStore(outFt, o, imageLoad(outFt, o) + (1.0 - weight) * alRe + weight * refRe);
+        imageStore(outFt, o + ivec2(1, 0), imageLoad(outFt, o + ivec2(1, 0)) + (1.0 - weight) * alIm + weight * refIm);
+    } else {
+        float w = p.frameWeight * (1.0 - weight);
+        ivec2 bin = t0 + ivec2(dm, dn);
+        imageStore(outFt, o, imageLoad(outFt, o) + w * alRe);
+        imageStore(outFt, o + ivec2(1, 0), imageLoad(outFt, o + ivec2(1, 0)) + w * alIm);
+        imageStore(weightSum, bin, imageLoad(weightSum, bin) + w);
+    }
+}
