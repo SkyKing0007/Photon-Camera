@@ -23,12 +23,13 @@ payload=R/'handoff_payload_26894';files={p.relative_to(payload).as_posix() for p
 assert files=={k[4:] for k in modified}
 assert all(H(payload/p)==new['app/'+p] for p in files)
 assert (R/'TRIGGER_26894.txt').read_bytes()==b'RUN_26894_SPATIAL_FOREGROUND_NOISE_SAFE_FLAT_CONTRAST_V1\n'
+assert (R/'TRIGGER_26894_RETRY_V2.txt').read_bytes()==b'RUN_26894_SPATIAL_FOREGROUND_NOISE_SAFE_FLAT_CONTRAST_V2\n'
 workflow=R/'.github/workflows/build-26894-iris-rawr.yml';w=workflow.read_text()
 assert w.startswith('name: Build 26894')
-trigger="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26894.txt'\n  workflow_dispatch:"
+trigger="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26894_RETRY_V2.txt'\n  workflow_dispatch:"
 assert trigger in w
 p=w.split('  push:\n',1)[1].split('  workflow_dispatch:',1)[0]
-assert p.count("      - '")==1 and p.count('TRIGGER_26894.txt')==1
+assert p.count("      - '")==1 and p.count('TRIGGER_26894_RETRY_V2.txt')==1
 assert all(x not in p for x in ['generate_26894_build.py','handoff_payload_26894','build-26894-iris-rawr.yml','26894_HANDOFF_HASHES.sha256'])
 seq=['Replay SHA-pinned successful 26893 historical runner','Derive SHA-sealed 26894 successor guarded runner','Run inherited 17-stage 26894 build','Prove single intended 26894 APK','Seal exact EXECUTED 26894 runner','Upload authoritative 26894 proof and APK']
 for x in seq:assert w.count('      - name: '+x)==1,x
@@ -47,7 +48,7 @@ sealed=load('26894_HANDOFF_HASHES.sha256');assert all((R/p).is_file() and H(R/p)
 upload=(R/'26894_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines()
 assert upload==sorted(set(upload))
 assert set(upload)==set(sealed)|{'26894_HANDOFF_HASHES.sha256','26894_REPOSITORY_UPLOAD_ALLOWLIST.txt'}
-assert '.github/workflows/build-26894-iris-rawr.yml' in upload and 'TRIGGER_26894.txt' in upload
+assert '.github/workflows/build-26894-iris-rawr.yml' in upload and 'TRIGGER_26894.txt' in upload and 'TRIGGER_26894_RETRY_V2.txt' in upload
 assert 'build_26894_iris_rawr.sh' not in upload and 'build_26893_iris_rawr.sh' not in upload
 assert not any('__pycache__' in x or x.endswith('.pyc') for x in upload)
 print('PASS 26894 full sealed source scope, 2021 protected, sole trigger, exact derived runner, three stages')

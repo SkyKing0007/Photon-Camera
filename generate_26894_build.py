@@ -186,6 +186,19 @@ edit('clean_extract_replay',lambda o:append(o,''' python3 -S verify_26894.py can
  (cd "$CAND" && sha256sum -c "$ROOT/26894_UNCHANGED_PROTECTED.sha256" >/dev/null)
  sha256sum -c "$OUT/26894_candidate_app_source.tar.gz.sha256" >/dev/null
 '''))
+# SUCCESSOR RELEASE GATE: the successful 26893 runner rightly checked 26893;
+# the current 26894 *compiled candidate* must be checked against 26894 in the
+# exact same final clean-extract stage. Never weaken or skip this guard.
+_version_old = (" grep -Fx 'VERSION_NAME=0.9726893' \"$exp/app/version.properties\" >/dev/null\n"
+                " grep -Fx 'VERSION_BUILD=26893' \"$exp/app/version.properties\" >/dev/null")
+_version_new = (" grep -Fx 'VERSION_NAME=0.9726894' \"$exp/app/version.properties\" >/dev/null\n"
+                " grep -Fx 'VERSION_BUILD=26894' \"$exp/app/version.properties\" >/dev/null")
+def _fix_26894_clean_extract_version(original):
+ assert original.count(_version_old)==1, 'historical 26893 current-candidate version guards drifted'
+ return original.replace(_version_old,_version_new,1)
+edit('clean_extract_replay', _fix_26894_clean_extract_version)
+assert section('clean_extract_replay').count(_version_new)==1
+assert _version_old not in section('clean_extract_replay')
 # inherited pre-existing 17 stage ordering and compiler commands untouched
 assert tuple(x for x in rex.findall(s) if x in STAGES)==STAGES
 assert s.count(' ./gradlew :app:assembleDebug --stacktrace 2>&1 | tee')==1
@@ -194,6 +207,8 @@ assert s.count(" ./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDeb
 assert s.count('python3 -S verify_26889_compiled_push_abi.py ')==1
 assert 'build_26893_iris_rawr_outputs/26888_modified_shader_spirv/Iris26887BOffHdrqMerge_prod.spv' in s
 assert 'VERSION_NAME="0.9726894"; VERSION_BUILD="26894"' in s
+assert 'VERSION_NAME=0.9726893' not in section('clean_extract_replay')
+assert 'VERSION_BUILD=26893' not in section('clean_extract_replay')
 out=R/'build_26894_iris_rawr.sh';out.write_text(s)
 sha=H(out)
 (R/'26894_GENERATED_BUILD_SHA256.txt').write_text(sha+'  build_26894_iris_rawr.sh\n')
