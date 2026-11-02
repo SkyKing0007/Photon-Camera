@@ -14,7 +14,7 @@ def files(r):
  return {p.relative_to(r).as_posix():H(p) for p in r.rglob('*') if p.is_file() and '.git' not in p.parts}
 OLD=read('26896_BASE_FULL_APP.sha256');NEW=read('26896_EXPECTED_CANDIDATE_FULL_APP.sha256');PRO=read('26896_UNCHANGED_PROTECTED.sha256')
 ALLOW=(R/'26896_CHANGED_ALLOWLIST.txt').read_text().splitlines()
-assert len(OLD)==len(NEW)==2025 and len(PRO)==2014 and len(ALLOW)==11
+assert len(OLD)==len(NEW)==2025 and len(PRO)==2012 and len(ALLOW)==13
 assert not set(OLD)^set(NEW)
 assert sorted(k for k in OLD if OLD[k]!=NEW[k])==ALLOW
 assert all(OLD[k]==NEW[k]==v for k,v in PRO.items())
@@ -33,7 +33,7 @@ def assert_source(base,cand,transform=False):
    shutil.copyfile(PAYLOAD/p.removeprefix('app/'),dst)
  assert files(cand)==NEW,'frozen 26896 candidate manifest mismatch'
  assert all(H(cand/k)==v for k,v in PRO.items()),'protected source changed'
- print('PASS 26896 exact successful 26895 2025->2025 candidate, 11 modifications, 2014 protected, no additions/deletions')
+ print('PASS 26896 exact successful 26895 2025->2025 candidate, 13 modifications, 2012 protected, no additions/deletions')
 
 def semantics(base,cand):
  assert_source(base,cand)
@@ -42,7 +42,14 @@ def semantics(base,cand):
  # Pixel Motion retains exact 26895 burst, color, DNG, A/B, Wronski
  assert 'VK_EXT_MEMORY_BUDGET_EXTENSION_NAME' in source('src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp')
  s=source('src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp')
- assert 'vkGetPhysicalDeviceMemoryProperties2' in s and 'heapBudget[j]' in s and 'heapUsage[j]' in s
+ assert 'PFN_vkGetPhysicalDeviceMemoryProperties2 queryBudget = nullptr' in s and 'heapBudget[j]' in s and 'heapUsage[j]' in s
+ assert 'vkGetInstanceProcAddr(request.instance, "vkGetPhysicalDeviceMemoryProperties2")' in s
+ assert 'queryBudget(request.physical,&props);' in s
+ assert 'vkGetPhysicalDeviceMemoryProperties2(request.physical,&props);' not in s
+ assert 'if(!request.instance||!request.physical' in s
+ assert 'VkInstance instance=VK_NULL_HANDLE;' in source('src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.hpp')
+ assert 'VkInstance instance() const noexcept { return instance_; }' in source('src/main/cpp/iris26856/amaze/include/amaze/VulkanDeviceOwner.hpp')
+ assert 'req.instance=device.instance();req.physical=ctx.physicalDevice' in source('src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc')
  assert 'want<=available-reserve' in s and 'FrozenRawInputLayout::FencedTwoSlot' in s
  assert 'residentEligible?"RESIDENT":"FENCED_TWO_SLOT"' in s
  assert 'largestDeviceHeap' not in s
@@ -121,6 +128,10 @@ def negative(base,cand):
   protected=copy/'app/src/main/assets/shaders/motionv2/render.glsl';protected.write_bytes(protected.read_bytes()+b'\n')
   assert files(copy)!=NEW
   shutil.copyfile(cand/protected.relative_to(copy),protected);assert files(copy)==NEW
+  bad=copy/'app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp'
+  bad.write_text(bad.read_text().replace('queryBudget(request.physical,&props);','vkGetPhysicalDeviceMemoryProperties2(request.physical,&props);'))
+  assert files(copy)!=NEW
+  shutil.copyfile(cand/bad.relative_to(copy),bad);assert files(copy)==NEW
   wrong=copy/'app/src/main/java/com/unspektrawesome/camera/RawPreviewPolicy.java';wrong.write_text(wrong.read_text().replace('output.maximumResolutionMode == nativeMaximumResolution','true'))
   assert files(copy)!=NEW
   shutil.copyfile(cand/wrong.relative_to(copy),wrong);assert files(copy)==NEW
@@ -128,7 +139,7 @@ def negative(base,cand):
   assert files(copy)!=NEW
   shutil.copyfile(cand/bug.relative_to(copy),bug);assert files(copy)==NEW
   ver=copy/'app/version.properties';ver.write_text(ver.read_text().replace('VERSION_BUILD=26896','VERSION_BUILD=26895'));assert files(copy)!=NEW
-  print('PASS 26896 actual candidate negative: protected shader tamper, wrong native mode, canceled saver, stale version')
+  print('PASS 26896 actual candidate negative: protected shader tamper, unresolved Android Vulkan linker symbol, wrong native mode, canceled saver, stale version')
 
 if __name__=='__main__':
  assert len(sys.argv)>1

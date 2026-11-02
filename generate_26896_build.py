@@ -139,11 +139,12 @@ PY_AUTH_96
 
 rewrite('verify_package',lambda old:append(old,''' test -f TRIGGER_26896.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1' TRIGGER_26896.txt >/dev/null || fail '26896 original immutable V1 trigger drift'
  test -f TRIGGER_26896_V2.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2' TRIGGER_26896_V2.txt >/dev/null || fail '26896 unique immutable V2 trigger drift'
- test -f TRIGGER_26896_V3.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3' TRIGGER_26896_V3.txt >/dev/null || fail '26896 new immutable V3 trigger drift'
+ test -f TRIGGER_26896_V3.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3' TRIGGER_26896_V3.txt >/dev/null || fail '26896 original immutable V3 trigger drift'
+ test -f TRIGGER_26896_V4.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V4' TRIGGER_26896_V4.txt >/dev/null || fail '26896 new immutable V4 trigger drift'
  python3 -S stage_26896_root.py
  sha256sum -c 26896_HANDOFF_HASHES.sha256 >/dev/null || fail '26896 final staged upload bytes drift'
  python3 -S -m py_compile generate_26896_build.py verify_26896.py stage_26896_root.py test_26896_three_stage_negatives.py test_26896_java_selection.py
- test "$(find handoff_payload_26896 -type f | wc -l)" -eq 11 || fail '26896 11-file B/Spektra exact allowlist drift'
+ test "$(find handoff_payload_26896 -type f | wc -l)" -eq 13 || fail '26896 13-file B/Spektra exact allowlist drift'
 '''))
 rewrite('verify_successful_mechanics',lambda old:append(old,''' python3 -S verify_26896.py candidate "$BASE" "$CAND"
  python3 -S verify_26896.py semantics "$BASE" "$CAND"
@@ -166,7 +167,7 @@ rewrite('prebuild_safety',lambda old:append(old,''' python3 -S verify_26896.py c
  cat >> "$OUT/26896_PREBUILD_SAFETY.txt" <<'EOF_26896_SAFETY'
 26896_actual_successful_26895_compiled_TAR=9df70bdc87756847b7c5a479cb3b22fee7a47920ac277a70d14a5402e3cb6942
 26896_successful_26895_runner_SHA=a6c341d9389887329a55545c78c5c25e727655fbae73ccedc2c353d321165b2b
-26896_runtime=2025 source files, 11 modified, 2014 protected, zero additions/deletions
+26896_runtime=2025 source files, 13 modified, 2012 protected, zero additions/deletions
 26896_spektra=OFF normal RAW, ON genuine advertised maximum RAW; immutable shutter stream; independent from B Wronski
 26896_save=accepted developed bitmap transaction persists after Camera2 lifecycle release and closes after JPEG worker drain
 26896_motion=Vulkan resident input requires real heapBudget-heapUsage, otherwise fenced two-slot; full frames preserved; Android previous native process exit reasons + bounded native phases
@@ -180,9 +181,9 @@ def safety_header(o):
  old=o[start:end]
  new=old.replace('runtime_authority=successful 26894','runtime_authority=successful 26895')
  new=new.replace('verification_mechanics=EXACT successful 26894 executed 17 stages','verification_mechanics=EXACT successful 26895 executed 17 stages')
- new=new.replace('runtime_changed_files=5 (4 modified existing plus one deleted 26894 scene shader), 2021 protected; candidate byte-identical to successful 26893 except Java saturation and version','runtime_changed_files=11 modified existing, 2014 protected; explicit Pixel B memory-budget and diagnostics plus isolated Spektra capture/save fixes')
+ new=new.replace('runtime_changed_files=5 (4 modified existing plus one deleted 26894 scene shader), 2021 protected; candidate byte-identical to successful 26893 except Java saturation and version','runtime_changed_files=13 modified existing, 2012 protected; explicit Pixel B memory-budget and diagnostics plus isolated Spektra capture/save fixes')
  new=new.replace('prior_files=2026\ncandidate_files=2025','prior_files=2025\ncandidate_files=2025')
- new=new.replace('protected_source=2021 files byte-identical to successful 26894 compiled candidate; Spektra/A/A+B/Night/LONG/DNG/UHDR and vendor protected','protected_source=2014 files byte-identical to successful 26895 compiled candidate; A/A+B/Night/LONG/DNG/UHDR/vendor/GLSL protected')
+ new=new.replace('protected_source=2021 files byte-identical to successful 26894 compiled candidate; Spektra/A/A+B/Night/LONG/DNG/UHDR and vendor protected','protected_source=2012 files byte-identical to successful 26895 compiled candidate; A/A+B/Night/LONG/DNG/UHDR/vendor/GLSL protected')
  assert old!=new;return o[:start]+new+o[end:]
 rewrite('prebuild_safety',safety_header)
 # Historical 26895 source archive is separate from CURRENT compiled 26896.
@@ -242,7 +243,7 @@ rewrite('clean_extract_replay',lambda old:append(old,''' python3 -S verify_26896
  grep -Fx 'VERSION_NAME=0.9726896' "$exp96/app/version.properties" >/dev/null || fail '26896 clean-extract version name mismatch'
  grep -Fx 'VERSION_BUILD=26896' "$exp96/app/version.properties" >/dev/null || fail '26896 clean-extract version build mismatch'
  (cd "$exp96" && sha256sum -c "$ROOT/26896_EXPECTED_CANDIDATE_FULL_APP.sha256" >/dev/null)
- pass '26896 inherited exact seventeen-stage real Actions build, byte-perfect sealed candidate, 11-source ownership, actual compiler receipts and final replay'
+ pass '26896 inherited exact seventeen-stage real Actions build, byte-perfect sealed candidate, 13-source ownership, actual compiler receipts and final replay'
 '''))
 # Inherited 26895 prebuild historic `test -s $OUT/26896_RESTORED...` is correct
 # since it was a historical compiler receipt written to this OUT.

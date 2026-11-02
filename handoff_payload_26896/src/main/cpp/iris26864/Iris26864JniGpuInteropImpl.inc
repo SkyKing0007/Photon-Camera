@@ -199,7 +199,7 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
     });
     Iris26864LscGpu lsc(ctx.physicalDevice,ctx.device,lensVec);
     iris26864::FrozenDirectBRequest req{};
-    req.physical=ctx.physicalDevice;req.device=ctx.device;req.inheritedQueue=device.queue();
+    req.instance=device.instance();req.physical=ctx.physicalDevice;req.device=ctx.device;req.inheritedQueue=device.queue();
     req.queueFamily=ctx.queueFamilyIndex;req.width=uint32_t(rawWidth);
     req.height=uint32_t(rawHeight);req.localCfa=localCfa;
     req.referenceIndex=uint32_t(referenceIndex);

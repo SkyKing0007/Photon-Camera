@@ -13,7 +13,7 @@ namespace iris26864 {
 void runRealRawrFromFrozenDirectNormals(
     const FrozenDirectBRequest& request, amaze::CommandSubmissionOwner& inheritedUploads,
     const ConsumePinnedRawrGpuResult& consume) {
-    if(!request.physical||!request.device||!request.inheritedQueue||
+    if(!request.instance||!request.physical||!request.device||!request.inheritedQueue||
        request.width<32u||request.height<32u||(request.width&1u)||(request.height&1u)||
        request.localCfa>3u||request.referenceIndex>=request.normals.size()||
        request.normals.size()<2u||request.normals.size()>64u||!consume)
@@ -42,6 +42,17 @@ void runRealRawrFromFrozenDirectNormals(
                         supported=true;
             }
         }
+        // IRIS_26896_V4_ANDROID_API26_VULKAN_LINK_SAFE.
+        // Android API26's libvulkan.so does NOT export the Vulkan 1.1
+        // physical-device-memory-properties2 entrypoint. Resolve it from the
+        // exact owning VkInstance; never call it as a direct linker symbol.
+        // Missing instance dispatch => fail closed to fenced two-slot.
+        PFN_vkGetPhysicalDeviceMemoryProperties2 queryBudget = nullptr;
+        if(supported) {
+            queryBudget = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties2>(
+                vkGetInstanceProcAddr(request.instance, "vkGetPhysicalDeviceMemoryProperties2"));
+            supported = queryBudget != nullptr;
+        }
         uint64_t available=0;
         if(supported){
             VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
@@ -49,7 +60,7 @@ void runRealRawrFromFrozenDirectNormals(
             VkPhysicalDeviceMemoryProperties2 props{};
             props.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
             props.pNext=&budget;
-            vkGetPhysicalDeviceMemoryProperties2(request.physical,&props);
+            queryBudget(request.physical,&props);
             for(uint32_t j=0;j<props.memoryProperties.memoryHeapCount;++j){
                 if(!(props.memoryProperties.memoryHeaps[j].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))continue;
                 // Never sum independent heaps or mistake allocation capacity

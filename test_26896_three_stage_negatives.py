@@ -6,14 +6,15 @@ R=Path(__file__).resolve().parent
 workflow=R/'.github/workflows/build-26896-iris-rawr.yml'
 if not workflow.is_file():workflow=R.parent/'STAGE_2_WORKFLOW/.github/workflows/build-26896-iris-rawr.yml'
 w=workflow.read_text();p=w.index('  push:\n');q=w.index('  workflow_dispatch:',p)
-assert w[p:q]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896_V3.txt'\n"
+assert w[p:q]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896_V4.txt'\n"
 for add in ["      - 'generate_26896_build.py'\n","      - '.github/workflows/build-26896-iris-rawr.yml'\n","      - '26896_HANDOFF_HASHES.sha256'\n","      - 'handoff_payload_26896/**'\n"]:
  tam=w[:q]+add+w[q:];assert tam.count("      - '")>1 and tam[p:tam.index('  workflow_dispatch:',p)]!=w[p:q]
 s1=(R/'26896_STAGE_1_UPLOAD_PATHS.txt').read_text().splitlines();s2=(R/'26896_STAGE_2_UPLOAD_PATHS.txt').read_text().splitlines();s3=(R/'26896_STAGE_3_UPLOAD_PATHS.txt').read_text().splitlines()
-assert s2==['.github/workflows/build-26896-iris-rawr.yml'] and s3==['TRIGGER_26896_V3.txt']
-assert 'TRIGGER_26896.txt' in s1 and 'TRIGGER_26896_V2.txt' in s1 and all(x not in s3 for x in ('TRIGGER_26896.txt','TRIGGER_26896_V2.txt'))
+assert s2==['.github/workflows/build-26896-iris-rawr.yml'] and s3==['TRIGGER_26896_V4.txt']
+assert 'TRIGGER_26896.txt' in s1 and 'TRIGGER_26896_V2.txt' in s1 and 'TRIGGER_26896_V3.txt' in s1 and all(x not in s3 for x in ('TRIGGER_26896.txt','TRIGGER_26896_V2.txt','TRIGGER_26896_V3.txt'))
 assert (R/'TRIGGER_26896.txt').read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1\n'
 assert (R/'TRIGGER_26896_V2.txt').read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2\n'
+assert (R/'TRIGGER_26896_V3.txt').read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3\n'
 assert not set(s1)&set(s2+s3)
 assert set(s1)|set(s2)|set(s3)==set((R/'26896_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines())
 # Reproduce V2 failed workflow's exact guard in the REAL checked-out source-root layout.
@@ -26,23 +27,53 @@ run_end=w.index('      - name: Run inherited 17-stage 26896 build',run_start)
 commands=[x[10:] for x in w[run_start:run_end].splitlines() if x.startswith('          ')]
 assert commands[0]=='set -euo pipefail'
 actual_guard=commands[1]
-assert actual_guard=="test -f TRIGGER_26896_V3.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3' TRIGGER_26896_V3.txt"
+assert actual_guard=="test -f TRIGGER_26896_V4.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V4' TRIGGER_26896_V4.txt"
 def execute_shell(cmd):
  return subprocess.run(['bash','--noprofile','--norc','-e','-o','pipefail','-c','set -euo pipefail\n'+cmd],cwd=R,capture_output=True,text=True)
 old_guard="test -f TRIGGER_26896_V2.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1' TRIGGER_26896_V2.txt"
 assert execute_shell(old_guard).returncode!=0,'Historical 41385473550 failed guard must reproduce'
 now=execute_shell(actual_guard)
-assert now.returncode==0 and now.stdout.strip()=='RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3',now.stderr
-for wrong in ("RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1", "RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2", "RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V4"):
- assert execute_shell(actual_guard.replace('RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3',wrong)).returncode!=0
+assert now.returncode==0 and now.stdout.strip()=='RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V4',now.stderr
+for wrong in ("RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1", "RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2", "RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3", "RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V5"):
+ assert execute_shell(actual_guard.replace('RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V4',wrong)).returncode!=0
+# 26896 V3 REAL API26 NDK link failure: vkGetPhysicalDeviceMemoryProperties2
+# is NOT in API26 libvulkan.so. Reproduce negative direct-link failure using
+# a minimal API26-export-shape library, then prove resolver-safe link+fallback.
+# This is ADDITIONAL real host C++ linker proof; not a substitute for Android NDK.
+def native_link_history():
+ import tempfile,os
+ from pathlib import Path
+ cc=shutil.which('clang++') or shutil.which('g++')
+ assert cc,'C++ compiler missing (native linker regression must not silently skip)'
+ with tempfile.TemporaryDirectory(prefix='26896_v3_link_failure_') as tmp:
+  d=Path(tmp)
+  (d/'api26.cpp').write_text('extern "C" void* vkGetInstanceProcAddr(void*,const char*) { return nullptr; }\n')
+  (d/'old.cpp').write_text('extern "C" void vkGetPhysicalDeviceMemoryProperties2(void*,void*); int main(){vkGetPhysicalDeviceMemoryProperties2(nullptr,nullptr);}\n')
+  (d/'new.cpp').write_text('extern "C" void* vkGetInstanceProcAddr(void*,const char*); int main(){auto p=(void(*)(void*,void*))vkGetInstanceProcAddr((void*)1,"vkGetPhysicalDeviceMemoryProperties2"); if(p){p(nullptr,nullptr);return 1;}return 0;}\n')
+  subprocess.run([cc,'-c',str(d/'api26.cpp'),'-o',str(d/'api26.o')],check=True,capture_output=True)
+  old=subprocess.run([cc,str(d/'old.cpp'),str(d/'api26.o'),'-o',str(d/'old')],capture_output=True,text=True)
+  assert old.returncode!=0 and 'vkGetPhysicalDeviceMemoryProperties2' in old.stderr,old.stderr
+  subprocess.run([cc,str(d/'new.cpp'),str(d/'api26.o'),'-o',str(d/'new')],check=True,capture_output=True)
+  subprocess.run([str(d/'new')],check=True,capture_output=True)
+  source=(R/'handoff_payload_26896/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp').read_text()
+  assert 'queryBudget(request.physical,&props);' in source
+  assert 'vkGetInstanceProcAddr(request.instance, "vkGetPhysicalDeviceMemoryProperties2")' in source
+  assert 'vkGetPhysicalDeviceMemoryProperties2(request.physical,&props);' not in source
+ print('PASS real C++ linker reproduces Actions 41386766592 direct Vulkan 1.1 undefined symbol; instance-dispatch link/fallback passes')
+native_link_history()
 # All exact workflow pre-build commands executed by the final clean-checkout replay.
-print('PASS REAL Actions 41385473550 V2 shell guard fails, exact emitted V3 guard succeeds, wrong triggers rejected')
+print('PASS REAL Actions 41385473550 V2 shell guard fails, exact emitted V4 guard succeeds, wrong triggers rejected')
 assert sys.argv[1:] in ([],['--runner'])
 if sys.argv[1:]==['--runner']:
  runner=(R/'build_26896_iris_rawr.sh').read_text()
  stages=('verify_package','verify_scope','obtain_authority','make_candidate','verify_successful_mechanics','prepare_glslang','compile_modified_runtime_shaders','compile_spektra_raw_shader','install_frozen_candidate_live','compile_languages','verify_native_glslang_handoff','compile_native','verify_candidate_patches','prebuild_safety','assemble','postbuild_proof','clean_extract_replay')
  assert tuple(x for x in re.findall(r'\n([a-z_]+)\(\)\{',runner) if x in stages)==stages
  assert runner.count('clean_extract_replay(){')==1
+ assert 'test "$(find handoff_payload_26896 -type f | wc -l)" -eq 13' in runner
+ assert '26896 13-file B/Spektra exact allowlist drift' in runner
+ assert '26896 11-file B/Spektra exact allowlist drift' not in runner
+ assert 'protected_source=2012 files byte-identical to successful 26895 compiled candidate' in runner
+ assert 'protected_source=2014 files byte-identical to successful 26895 compiled candidate' not in runner
  p=runner.index('\nclean_extract_replay(){');body=runner[p:runner.index('\n}',p)]
  assert body.count("VERSION_BUILD=26895")==1 and body.count("VERSION_BUILD=26896")==1
  assert '26895_historical_candidate_app_source.tar.gz' in body and '26896_candidate_app_source.tar.gz' in body
