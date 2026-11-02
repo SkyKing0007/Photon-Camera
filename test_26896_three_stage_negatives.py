@@ -6,15 +6,37 @@ R=Path(__file__).resolve().parent
 workflow=R/'.github/workflows/build-26896-iris-rawr.yml'
 if not workflow.is_file():workflow=R.parent/'STAGE_2_WORKFLOW/.github/workflows/build-26896-iris-rawr.yml'
 w=workflow.read_text();p=w.index('  push:\n');q=w.index('  workflow_dispatch:',p)
-assert w[p:q]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896_V2.txt'\n"
+assert w[p:q]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896_V3.txt'\n"
 for add in ["      - 'generate_26896_build.py'\n","      - '.github/workflows/build-26896-iris-rawr.yml'\n","      - '26896_HANDOFF_HASHES.sha256'\n","      - 'handoff_payload_26896/**'\n"]:
  tam=w[:q]+add+w[q:];assert tam.count("      - '")>1 and tam[p:tam.index('  workflow_dispatch:',p)]!=w[p:q]
 s1=(R/'26896_STAGE_1_UPLOAD_PATHS.txt').read_text().splitlines();s2=(R/'26896_STAGE_2_UPLOAD_PATHS.txt').read_text().splitlines();s3=(R/'26896_STAGE_3_UPLOAD_PATHS.txt').read_text().splitlines()
-assert s2==['.github/workflows/build-26896-iris-rawr.yml'] and s3==['TRIGGER_26896_V2.txt']
-assert 'TRIGGER_26896.txt' in s1 and 'TRIGGER_26896.txt' not in s3
+assert s2==['.github/workflows/build-26896-iris-rawr.yml'] and s3==['TRIGGER_26896_V3.txt']
+assert 'TRIGGER_26896.txt' in s1 and 'TRIGGER_26896_V2.txt' in s1 and all(x not in s3 for x in ('TRIGGER_26896.txt','TRIGGER_26896_V2.txt'))
 assert (R/'TRIGGER_26896.txt').read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1\n'
+assert (R/'TRIGGER_26896_V2.txt').read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2\n'
 assert not set(s1)&set(s2+s3)
 assert set(s1)|set(s2)|set(s3)==set((R/'26896_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines())
+# Reproduce V2 failed workflow's exact guard in the REAL checked-out source-root layout.
+# Then EXECUTE the emitted V3 workflow guard with identical shell flags and cwd.
+# The previous locally validated ZIP failed precisely because this wasn't done.
+import os
+stage=w.index('      - name: Derive SHA-sealed 26896 successor guarded runner')
+run_start=w.index('        run: |\n',stage)+len('        run: |\n')
+run_end=w.index('      - name: Run inherited 17-stage 26896 build',run_start)
+commands=[x[10:] for x in w[run_start:run_end].splitlines() if x.startswith('          ')]
+assert commands[0]=='set -euo pipefail'
+actual_guard=commands[1]
+assert actual_guard=="test -f TRIGGER_26896_V3.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3' TRIGGER_26896_V3.txt"
+def execute_shell(cmd):
+ return subprocess.run(['bash','--noprofile','--norc','-e','-o','pipefail','-c','set -euo pipefail\n'+cmd],cwd=R,capture_output=True,text=True)
+old_guard="test -f TRIGGER_26896_V2.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1' TRIGGER_26896_V2.txt"
+assert execute_shell(old_guard).returncode!=0,'Historical 41385473550 failed guard must reproduce'
+now=execute_shell(actual_guard)
+assert now.returncode==0 and now.stdout.strip()=='RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3',now.stderr
+for wrong in ("RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1", "RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2", "RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V4"):
+ assert execute_shell(actual_guard.replace('RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3',wrong)).returncode!=0
+# All exact workflow pre-build commands executed by the final clean-checkout replay.
+print('PASS REAL Actions 41385473550 V2 shell guard fails, exact emitted V3 guard succeeds, wrong triggers rejected')
 assert sys.argv[1:] in ([],['--runner'])
 if sys.argv[1:]==['--runner']:
  runner=(R/'build_26896_iris_rawr.sh').read_text()

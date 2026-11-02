@@ -139,6 +139,7 @@ PY_AUTH_96
 
 rewrite('verify_package',lambda old:append(old,''' test -f TRIGGER_26896.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1' TRIGGER_26896.txt >/dev/null || fail '26896 original immutable V1 trigger drift'
  test -f TRIGGER_26896_V2.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2' TRIGGER_26896_V2.txt >/dev/null || fail '26896 unique immutable V2 trigger drift'
+ test -f TRIGGER_26896_V3.txt && grep -Fx 'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V3' TRIGGER_26896_V3.txt >/dev/null || fail '26896 new immutable V3 trigger drift'
  python3 -S stage_26896_root.py
  sha256sum -c 26896_HANDOFF_HASHES.sha256 >/dev/null || fail '26896 final staged upload bytes drift'
  python3 -S -m py_compile generate_26896_build.py verify_26896.py stage_26896_root.py test_26896_three_stage_negatives.py test_26896_java_selection.py
