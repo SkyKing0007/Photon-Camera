@@ -6,11 +6,13 @@ R=Path(__file__).resolve().parent
 workflow=R/'.github/workflows/build-26896-iris-rawr.yml'
 if not workflow.is_file():workflow=R.parent/'STAGE_2_WORKFLOW/.github/workflows/build-26896-iris-rawr.yml'
 w=workflow.read_text();p=w.index('  push:\n');q=w.index('  workflow_dispatch:',p)
-assert w[p:q]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896.txt'\n"
+assert w[p:q]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896_V2.txt'\n"
 for add in ["      - 'generate_26896_build.py'\n","      - '.github/workflows/build-26896-iris-rawr.yml'\n","      - '26896_HANDOFF_HASHES.sha256'\n","      - 'handoff_payload_26896/**'\n"]:
  tam=w[:q]+add+w[q:];assert tam.count("      - '")>1 and tam[p:tam.index('  workflow_dispatch:',p)]!=w[p:q]
 s1=(R/'26896_STAGE_1_UPLOAD_PATHS.txt').read_text().splitlines();s2=(R/'26896_STAGE_2_UPLOAD_PATHS.txt').read_text().splitlines();s3=(R/'26896_STAGE_3_UPLOAD_PATHS.txt').read_text().splitlines()
-assert s2==['.github/workflows/build-26896-iris-rawr.yml'] and s3==['TRIGGER_26896.txt']
+assert s2==['.github/workflows/build-26896-iris-rawr.yml'] and s3==['TRIGGER_26896_V2.txt']
+assert 'TRIGGER_26896.txt' in s1 and 'TRIGGER_26896.txt' not in s3
+assert (R/'TRIGGER_26896.txt').read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1\n'
 assert not set(s1)&set(s2+s3)
 assert set(s1)|set(s2)|set(s3)==set((R/'26896_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines())
 assert sys.argv[1:] in ([],['--runner'])

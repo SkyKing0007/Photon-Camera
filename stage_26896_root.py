@@ -30,8 +30,8 @@ if not workflow.exists():workflow=R.parent/'STAGE_2_WORKFLOW/.github/workflows/b
 assert workflow.is_file();w=workflow.read_text()
 assert w.startswith('name: Build 26896')
 start=w.index('  push:\n');end=w.index('  workflow_dispatch:',start)
-assert w[start:end]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896.txt'\n"
-assert w.count("      - 'TRIGGER_26896.txt'")==1
+assert w[start:end]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26896_V2.txt'\n"
+assert w.count("      - 'TRIGGER_26896_V2.txt'")==1
 assert w.count('      - name: ')==6
 seq=['Replay SHA-pinned successful 26894 historical runner','Derive SHA-sealed 26896 successor guarded runner','Run inherited 17-stage 26896 build','Prove single intended 26896 APK','Seal exact EXECUTED 26896 runner','Upload authoritative 26896 proof and APK']
 assert all(w.count('      - name: '+x)==1 for x in seq)
@@ -44,9 +44,10 @@ assert 'build_26896_iris_rawr_outputs/' in w
 assert 'a6c341d9389887329a55545c78c5c25e727655fbae73ccedc2c353d321165b2b' in w
 sha=(R/'26896_GENERATED_BUILD_SHA256.txt').read_text().split('  ',1)[0]
 assert re.fullmatch('[a-f0-9]{64}',sha) and sha in w
-trigger=R/'TRIGGER_26896.txt'
-if not trigger.exists():trigger=R.parent/'STAGE_3_UPLOAD_LAST/TRIGGER_26896.txt'
-assert trigger.read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1\n'
+trigger=R/'TRIGGER_26896_V2.txt'
+if not trigger.exists():trigger=R.parent/'STAGE_3_UPLOAD_LAST/TRIGGER_26896_V2.txt'
+assert (R/'TRIGGER_26896.txt').read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V1\n'
+assert trigger.read_bytes()==b'RUN_26896_PIXEL_MOTION_GPU_BUDGET_SPEKTRA_NATIVE_RES_AND_SAVE_V2\n'
 assert not any(f.suffix=='.apk' for f in R.rglob('*') if f.is_file())
 sealed=load('26896_HANDOFF_HASHES.sha256')
 if '--draft' in sys.argv:
@@ -58,14 +59,14 @@ def resolve(p):
  if r.exists():return r
  if p.startswith('.github/workflows/'):
   r=R.parent/'STAGE_2_WORKFLOW'/p
- elif p=='TRIGGER_26896.txt':
+ elif p=='TRIGGER_26896_V2.txt':
   r=R.parent/'STAGE_3_UPLOAD_LAST'/p
  return r
 assert all(resolve(p).is_file() and H(resolve(p))==h for p,h in sealed.items()),'sealed upload SHA mismatch'
 list_paths=(R/'26896_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines()
 assert list_paths==sorted(set(list_paths))
 assert set(list_paths)==set(sealed)|{'26896_HANDOFF_HASHES.sha256','26896_REPOSITORY_UPLOAD_ALLOWLIST.txt'}
-assert '.github/workflows/build-26896-iris-rawr.yml' in list_paths and 'TRIGGER_26896.txt' in list_paths
+assert '.github/workflows/build-26896-iris-rawr.yml' in list_paths and 'TRIGGER_26896.txt' in list_paths and 'TRIGGER_26896_V2.txt' in list_paths
 assert 'build_26896_iris_rawr.sh' not in list_paths and 'build_26895_iris_rawr.sh' not in list_paths
 assert not any('__pycache__' in p or p.endswith('.pyc') for p in list_paths)
 print('PASS 26896 exact 26895 compiled source, 11 changed, 2014 protected, zero additions or deletions, sealed three stages')
