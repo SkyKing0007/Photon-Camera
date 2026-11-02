@@ -1,0 +1,465 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+index a399f67d99fd469e3976bc8341f40a1c4b09d078..3c0f8fa4b14a483f9ef75b70200a594ffc1dca5d 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+@@ -1,5 +1,7 @@
+ #include "Iris26864FrozenDirectRawrRunner.hpp"
+ #include <cmath>
++#include <cstring>
++#include <vector>
+ #include <algorithm>
+ #include <chrono>
+ #include <memory>
+@@ -23,19 +25,51 @@ void runRealRawrFromFrozenDirectNormals(
+     const uint64_t rawBytes=uint64_t(request.width)*request.height*2u;
+     bool residentEligible=hdrq && request.normals.size()<=30u;
+     if(residentEligible) {
+-        VkPhysicalDeviceMemoryProperties mem{};
+-        vkGetPhysicalDeviceMemoryProperties(request.physical,&mem);
+-        uint64_t largestDeviceHeap=0;
+-        for(uint32_t j=0;j<mem.memoryHeapCount;++j)
+-            if(mem.memoryHeaps[j].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+-                largestDeviceHeap=std::max(largestDeviceHeap,uint64_t(mem.memoryHeaps[j].size));
+-        // Heap size is NOT free bytes. Leave at least 1.5 GiB nominal for
+-        // HDRq ~845MiB, AMaZE, GLES preview and driver allocations, with
+-        // actual vkAllocateMemory failures triggering exact two-slot fallback.
++        // IRIS_26896_B_PIXEL_MEMORY_BUDGET_FAIL_CLOSED.
++        // Physical heap.size is CAPACITY, not availability. On shared-memory
++        // ARM/Mali a one-shot resident burst can allocate hundreds of MiB
++        // before RAWR HDRq (~845 MiB), the AHB export and AMaZE run.
++        // Require explicit VK_EXT_memory_budget evidence; otherwise retain the
++        // existing correct fenced-two-slot algorithm, all NORMAL frames and
++        // identical frequency-merge/color/AMaZE math.
++        bool supported=false;
++        uint32_t count=0;
++        if(vkEnumerateDeviceExtensionProperties(request.physical,nullptr,&count,nullptr)==VK_SUCCESS && count>0u){
++            std::vector<VkExtensionProperties> exts(count);
++            if(vkEnumerateDeviceExtensionProperties(request.physical,nullptr,&count,exts.data())==VK_SUCCESS){
++                for(const auto& extension:exts)
++                    if(std::strcmp(extension.extensionName,VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)==0)
++                        supported=true;
++            }
++        }
++        uint64_t available=0;
++        if(supported){
++            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
++            budget.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
++            VkPhysicalDeviceMemoryProperties2 props{};
++            props.sType=VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
++            props.pNext=&budget;
++            vkGetPhysicalDeviceMemoryProperties2(request.physical,&props);
++            for(uint32_t j=0;j<props.memoryProperties.memoryHeapCount;++j){
++                if(!(props.memoryProperties.memoryHeaps[j].flags&VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))continue;
++                // Never sum independent heaps or mistake allocation capacity
++                // for free memory. No budgets => no resident permission.
++                const uint64_t b=uint64_t(budget.heapBudget[j]);
++                const uint64_t u=uint64_t(budget.heapUsage[j]);
++                if(b>u) available=std::max(available,b-u);
++            }
++        }
++        // Reserve for native HDRq arena, both output AHBs, AMaZE and GL/driver.
++        // This is deliberately conservative and allows transparent two-slot.
+         const uint64_t reserve=1536ull*1024ull*1024ull;
+         const uint64_t want=rawBytes*request.normals.size();
+-        residentEligible=largestDeviceHeap>=reserve &&
+-            want<=largestDeviceHeap-reserve;
++        residentEligible=supported&&available>=reserve&&want<=available-reserve;
++        __android_log_print(ANDROID_LOG_INFO,"Iris26896",
++            "MOTION_OFF_MEMORY_BUDGET extension=%d freeMiB=%llu residentMiB=%llu reserveMiB=%llu route=%s normals=%zu",
++            int(supported),static_cast<unsigned long long>(available/(1024u*1024u)),
++            static_cast<unsigned long long>(want/(1024u*1024u)),
++            static_cast<unsigned long long>(reserve/(1024u*1024u)),
++            residentEligible?"RESIDENT":"FENCED_TWO_SLOT",request.normals.size());
+     }
+     std::unique_ptr<TwoSlotRaw16Uploader> inputs;
+     bool resident=false;
+diff --git a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+index 2f124751c100b159dbf5e9fe5b5eed60b735fd0b..3cf26f10748aba80673d9f14801d05479502b477 100644
+--- a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
++++ b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+@@ -164,8 +164,12 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     const uint32_t outHeight=uint32_t(rawHeight)*(sr?2u:1u);
+     if(outWidth>16384u||outHeight>16384u)
+         throw std::invalid_argument("26864 native B output exceeds physical GPU dimension");
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896",
++        "MOTION_B_NATIVE_ENTER sr=%d raw=%dx%d normals=%d output=%ux%u",
++        int(sr),rawWidth,rawHeight,int(count),outWidth,outHeight);
+     amaze::VulkanDeviceOwner device;
+     const auto ctx=device.context();
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_VULKAN_DEVICE_READY sr=%d",int(sr));
+     amaze::CommandSubmissionOwner commands(ctx.physicalDevice,ctx.device,
+                                             device.queue(),ctx.queueFamilyIndex);
+     amaze::PipelineConfig config{};
+@@ -176,8 +180,11 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     config.inputMode=amaze::InputMode::PackedCfaRgba16fImage;
+     config.tileSlots=16u;
+     amaze::AmazePipeline amaze(ctx,amaze::makePinnedSpirvProvider(assets),config);
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_AMAZE_PIPELINE_READY sr=%d",int(sr));
+     ScopedAHB rgbAhb=createAhb(outWidth,outHeight,true);
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_RGB_AHB_READY sr=%d",int(sr));
+     ScopedAHB clipAhb=createAhb(outWidth,outHeight,true);
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_CLIP_AHB_READY sr=%d",int(sr));
+     amaze::HardwareBufferImport rgb(ctx.physicalDevice,ctx.device,rgbAhb.get(),
+                                     outWidth,outHeight,VK_IMAGE_USAGE_STORAGE_BIT);
+     amaze::HardwareBufferImport clip(ctx.physicalDevice,ctx.device,clipAhb.get(),
+@@ -294,6 +301,7 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+     bool publishedClip=false;
+     // This callback executes while RAWR still owns the exact completed GPU
+     // merge scratch. The B engines cannot return an alias of inherited A RGB.
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_RAWR_BEGIN sr=%d normals=%d",int(sr),int(count));
+     iris26864::runRealRawrFromFrozenDirectNormals(req,commands,[&](
+         const rawr::raw_gpu_pipeline::BurstRunResult& result,
+         const iris26864::RealRawrRunRequest& original){
+@@ -472,6 +480,7 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+         __android_log_print(ANDROID_LOG_INFO,"Iris26887",
+             "B_OFF_PIXEL_RAW_WITNESS prepared=%d sourceFrames=%u selectedFrames=%zu",
+             int(bOffWitnessReady),bOffEvidenceFrames,original.normals.size());
++        __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_RAWR_MERGE_CONSUMER sr=%d",int(sr));
+         amaze::LinearRgbImage output{};
+         output.image=rgb.image();output.view=rgb.view();
+         output.format=VK_FORMAT_R16G16B16A16_SFLOAT;
+@@ -736,11 +745,13 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+         waitCurrentGlOnVulkanFence(std::move(glFence));
+         publishedClip=true;
+     });
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_RAWR_AMAZE_COMPLETED sr=%d",int(sr));
+     if(!publishedClip)throw std::runtime_error("26864 original sensor clip not GPU-generated/GL-published");
+     GlBufferImage glRgb(rgbAhb.get());GlBufferImage glClip(clipAhb.get());
+     blitTexture(glRgb.texture,GLuint(outputRgbTexture),outWidth,outHeight);
+     blitTexture(glClip.texture,GLuint(outputClipTexture),outWidth,outHeight);
+     glFlush();glFinish();
++    __android_log_print(ANDROID_LOG_INFO,"Iris26896","MOTION_B_GL_EXPORT_COMPLETE sr=%d",int(sr));
+ }
+ } // namespace
+ extern "C" JNIEXPORT void JNICALL
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+index 1cb5a9f86d86e5e57197550c14766f60c6ad91e9..61927934a36f09b8b9dea1ac5c29a078a91d2127 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/PreferenceKeys.java
+@@ -485,6 +485,23 @@ public class PreferenceKeys {
+         preferenceKeys.settingsManager.set(SCOPE_GLOBAL, Key.KEY_BRACKETING_MODE, value);
+     }
+ 
++    /** IRIS_26896_SPEKTRA_ISOLATED_NATIVE_MAX_RES_PREFERENCE.
++     * An independent persistent value; the public Spektra toggle never
++     * modifies Experiment B's global Wronski Super Res preference. Do not put
++     * this key into per-lens JSON or the normal photo RAW/HEIC ownership.
++     */
++    private static final String SPEKTRA_NATIVE_MAX_KEY = "pref_iris_spektra_native_max_raw_26896";
++
++    public static boolean isSpektraNativeHighResOn() {
++        return preferenceKeys.settingsManager.getDefaultPreferences()
++                .getBoolean(SPEKTRA_NATIVE_MAX_KEY, false);
++    }
++
++    public static void setSpektraNativeHighRes(boolean enabled) {
++        preferenceKeys.settingsManager.getDefaultPreferences().edit()
++                .putBoolean(SPEKTRA_NATIVE_MAX_KEY, enabled).apply();
++    }
++
+     /** IRIS_26532_FIXED_2X_SUPER_RES_TOGGLE */
+     public static boolean isIrisSuperResOn() {
+         return preferenceKeys.settingsManager.getBoolean(SCOPE_GLOBAL, Key.KEY_IRIS_SUPER_RES);
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+index 136916065b5027e01141e4fa6a6674db46bd2024..d4878a5ba7b49246a29a0f1870e3940a5b0ce1ed 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/CameraUIController.java
+@@ -382,8 +382,19 @@ case R.id.flash_button:
+                          * exact capture preference without broad diagnostic logging.
+                          */
+                         final boolean iris26575RequestedSuperRes = value.equals(1);
+-                        PreferenceKeys.setIrisSuperRes(iris26575RequestedSuperRes);
+-                        final boolean iris26575StoredSuperRes = PreferenceKeys.isIrisSuperResOn();
++                        final boolean spektra26896 =
++                                cameraFragment.captureController.getAuthoritativeCameraMode() == CameraMode.SPEKTRA;
++                        if (spektra26896) {
++                            PreferenceKeys.setSpektraNativeHighRes(iris26575RequestedSuperRes);
++                        } else {
++                            PreferenceKeys.setIrisSuperRes(iris26575RequestedSuperRes);
++                        }
++                        final boolean iris26575StoredSuperRes = spektra26896
++                                ? PreferenceKeys.isSpektraNativeHighResOn()
++                                : PreferenceKeys.isIrisSuperResOn();
++                        Log.i(TAG, "IRIS_26896_SPEKTRA_SUPER_RES_OWNER mode=" +
++                                (spektra26896 ? "SPEKTRA_NATIVE_RAW" : "IRIS_MOTION") +
++                                " maxNative=" + (spektra26896 && iris26575StoredSuperRes));
+                         Log.i(TAG, "IRIS_26575_SUPER_RES_UI_COMMIT requested="
+                                 + iris26575RequestedSuperRes
+                                 + " stored=" + iris26575StoredSuperRes
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
+index 329ad891982769605cf2d7527b9bbe713ee2080c..59c46fd507f968be0f16343d780a266be713fa44 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/camera/viewmodel/SettingsBarEntryProvider.java
+@@ -77,7 +77,11 @@ public class SettingsBarEntryProvider extends ViewModel {
+         updateEntry(eisEntry, PreferenceKeys.isEisPhotoOn());
+         updateEntry(fpsEntry, PreferenceKeys.getFpsMode());
+         updateEntry(quadEntry, PreferenceKeys.isQuadBayerOn());
+-        updateEntry(superResEntry, PreferenceKeys.isIrisSuperResOn());
++        updateEntry(superResEntry,
++                com.particlesdevs.photoncamera.app.PhotonCamera.getSettings().selectedMode
++                        == com.particlesdevs.photoncamera.api.CameraMode.SPEKTRA
++                    ? PreferenceKeys.isSpektraNativeHighResOn()
++                    : PreferenceKeys.isIrisSuperResOn());
+     }
+ 
+     public void addObserver(Observer<TopBarSettingsData<?, ?>> observer) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+index dda00d03962d054484d5f970d15ac7049058cc5c..33ba8d25d2082da7c72765178e72877b4086d311 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/util/Log.java
+@@ -1,5 +1,7 @@
+ package com.particlesdevs.photoncamera.util;
+ 
++import android.app.ActivityManager;
++import android.app.ApplicationExitInfo;
+ import android.content.ContentResolver;
+ import android.content.ContentUris;
+ import android.content.ContentValues;
+@@ -95,7 +97,40 @@ public class Log {
+     }
+ 
+     public static void initProcessDiagnostics(Context context) {
+-        // IRIS_26634: dedicated lifecycle persistence intentionally retired.
++        // IRIS_26896_NATIVE_EXIT_REASON_RECOVERY. Asynchronous one-time startup
++        // inspection, NOT per-frame fsync or the removed lifecycle file writer.
++        // Android may provide a past native crash, low-memory or signal reason
++        // even when Iris's old async file log lost the last GPU phase.
++        if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return;
++        final Context app = context.getApplicationContext();
++        logHandler.post(() -> {
++            try {
++                ActivityManager manager = (ActivityManager)
++                        app.getSystemService(Context.ACTIVITY_SERVICE);
++                if (manager == null) return;
++                long last = app.getSharedPreferences("iris_native_exit_diagnostics", Context.MODE_PRIVATE)
++                        .getLong("last_reported_exit_time", 0L);
++                long newest = last;
++                for (ApplicationExitInfo info : manager.getHistoricalProcessExitReasons(
++                        app.getPackageName(), 0, 12)) {
++                    if (info.getTimestamp() <= last) continue;
++                    newest = Math.max(newest, info.getTimestamp());
++                    final String receipt = "IRIS_26896_PREVIOUS_PROCESS_EXIT timestamp=" +
++                            info.getTimestamp() + " reason=" + info.getReason() +
++                            " status=" + info.getStatus() + " importance=" +
++                            info.getImportance() + " pssKB=" + info.getPss() +
++                            " rssKB=" + info.getRss() +
++                            " description=" + info.getDescription();
++                    android.util.Log.w("Iris26896Exit", receipt);
++                    i("Iris26896Exit", receipt);
++                }
++                if (newest > last) app.getSharedPreferences(
++                        "iris_native_exit_diagnostics", Context.MODE_PRIVATE)
++                        .edit().putLong("last_reported_exit_time", newest).apply();
++            } catch (RuntimeException error) {
++                android.util.Log.w("Iris26896Exit", "Process exit reason unavailable", error);
++            }
++        });
+     }
+ 
+     public static void critical(String tag, String message) {
+diff --git a/app/src/main/java/com/unspektrawesome/camera/RawPreviewPolicy.java b/app/src/main/java/com/unspektrawesome/camera/RawPreviewPolicy.java
+index a81e498e65789742e7b74f6100e80785764b4907..63d5465340cdd70b77233f5a75da5e75ba3a88fe 100644
+--- a/app/src/main/java/com/unspektrawesome/camera/RawPreviewPolicy.java
++++ b/app/src/main/java/com/unspektrawesome/camera/RawPreviewPolicy.java
+@@ -74,6 +74,19 @@ public final class RawPreviewPolicy {
+ 
+     public static RawOutput selectCaptureOutput(List<RawOutput> outputs,
+                                                  Set<RawFormat> importableFormats) {
++        // Legacy exact RAW tier owner, retained for historical callers.
++        return selectCaptureOutput(outputs, importableFormats, true);
++    }
++
++    /** IRIS_26896_SPEKTRA_INDEPENDENT_NATIVE_RAW_TOGGLE.
++     * Normal mode NEVER enters a maximum-resolution Camera2 pixel mode.
++     * High-resolution mode requires an actually advertised maximum-resolution
++     * RAW output, not an Iris/Wronski upsample or regular stream enlargement.
++     */
++    public static RawOutput selectCaptureOutput(List<RawOutput> outputs,
++                                                 Set<RawFormat> importableFormats,
++                                                 boolean nativeMaximumResolution) {
++        Objects.requireNonNull(outputs);
+         Objects.requireNonNull(importableFormats);
+         // IRIS_26692_UNSPEKTRAWESOME_CAPTURE_FORMAT_OWNER
+         // Exact 1.1.2 behavior prefers the largest usable RAW10 stream, then RAW12, with
+@@ -82,14 +95,17 @@ public final class RawPreviewPolicy {
+         for (RawFormat format : new RawFormat[]{RawFormat.RAW10, RawFormat.RAW12, RawFormat.RAW_SENSOR}) {
+             if (!importableFormats.contains(format)) continue;
+             RawOutput selected = outputs.stream()
+-                    .filter(output -> output.format == format)
++                    .filter(output -> output.format == format
++                            && output.maximumResolutionMode == nativeMaximumResolution)
+                     .max(Comparator
+                             .comparingLong((RawOutput value) -> value.size.area())
+                             .thenComparing(value -> value.maximumResolutionMode))
+                     .orElse(null);
+             if (selected != null) return selected;
+         }
+-        throw new IllegalArgumentException("No RAW capture output");
++        throw new IllegalArgumentException(nativeMaximumResolution
++                ? "Spektra native maximum-resolution RAW is not advertised by this camera"
++                : "Spektra normal-resolution RAW is not advertised by this camera");
+     }
+ 
+     static Size2d scaledEven(Size2d source, float scale) {
+diff --git a/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java b/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java
+index dc367ed15114bb1c91df1c32c2f98d9d4f1a6d00..7d40f738383b5afada118b6f8ee7d66684f620d7 100644
+--- a/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java
++++ b/app/src/main/java/com/unspektrawesome/camera/session/Camera2RawSession.java
+@@ -200,6 +200,17 @@ public final class Camera2RawSession implements AutoCloseable {
+                                           RawStillCaptureCallback callback) {
+         RawOutput selected = StillCapturePlanner.select(
+                 state, availableOutputs, importableFormats);
++        captureStillFrozen(selected, callback);
++    }
++
++    /** IRIS_26896_SPEKTRA_FROZEN_CAPTURE_STREAM_IDENTITY.
++     * No second RAW stream selection can disagree with the orientation/crop
++     * geometry frozen at the accepted shutter. Selected output was verified
++     * against this CameraDescriptor's advertised streams by the caller.
++     */
++    public synchronized void captureStillFrozen(RawOutput frozenOutput,
++                                                 RawStillCaptureCallback callback) {
++        RawOutput selected = StillCapturePlanner.selectFrozen(state, frozenOutput);
+         Objects.requireNonNull(callback);
+         if (selected.maximumResolutionMode && Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+             throw new IllegalArgumentException(
+diff --git a/app/src/main/java/com/unspektrawesome/camera/session/StillCapturePlanner.java b/app/src/main/java/com/unspektrawesome/camera/session/StillCapturePlanner.java
+index a04324302c84d71f33888f0da8e402f5170d3f8a..c79a300f00131c790d7582d14bb005d4dd8893d7 100644
+--- a/app/src/main/java/com/unspektrawesome/camera/session/StillCapturePlanner.java
++++ b/app/src/main/java/com/unspektrawesome/camera/session/StillCapturePlanner.java
+@@ -19,6 +19,15 @@ final class StillCapturePlanner {
+         return RawPreviewPolicy.selectCaptureOutput(outputs, importableFormats);
+     }
+ 
++    /** Frozen capture output is selected exactly once by the Spektra shutter owner. */
++    static RawOutput selectFrozen(Camera2RawSession.State state, RawOutput selected) {
++        if (state != Camera2RawSession.State.STREAMING) {
++            throw new IllegalStateException("Still capture requires an active RAW preview");
++        }
++        if (selected == null) throw new IllegalArgumentException("Missing frozen RAW capture output");
++        return selected;
++    }
++
+     static boolean canResume(Camera2RawSession.State state) {
+         return state == Camera2RawSession.State.STILL_CAPTURED
+                 || state == Camera2RawSession.State.STILL_FAILED;
+diff --git a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+index 58ba8ca101ae6a098af757ed8ba718b1565bde49..0fcbd13cc6d83843a4ca9973d263c0f56c282ccb 100644
+--- a/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
++++ b/app/src/main/java/com/unspektrawesome/preview/RawVulkanPreviewController.kt
+@@ -122,6 +122,9 @@ class RawVulkanPreviewController(
+     private var latestWhiteBalance: WhiteBalanceGains? = null
+     private var latestLensShadingMap: LensShadingMapParameters? = null
+     private var pendingCapture: PendingCapture? = null
++    // A fully developed bitmap is an immutable JPEG publication transaction;
++    // it no longer belongs to a closing Camera2 session or preview generation.
++    private var publishingCapture26896: PendingCapture? = null
+     private var renderedFrames = 0L
+     private var skippedFrames = 0L
+     private val rawParameterBuffer = directBuffer(RawShaderParameters.SIZE_BYTES)
+@@ -261,10 +264,15 @@ class RawVulkanPreviewController(
+                     "rotation=$motionCameraRotation mirror=${transform.mirrorHorizontal} " +
+                     "source=PhotonCamera.Gravity activeOwner=RawVulkanPreviewController",
+             )
++            val spektraNativeMax = PreferenceKeys.isSpektraNativeHighResOn()
+             val captureOutput = RawPreviewPolicy.selectCaptureOutput(
+                 owner.camera.rawOutputs,
+                 VulkanRawImportPolicy.candidateFormats,
++                spektraNativeMax,
+             )
++            Log.i(TAG, "IRIS_26896_SPEKTRA_RESOLUTION_FROZEN max=$spektraNativeMax " +
++                "raw=${captureOutput.size.width}x${captureOutput.size.height} " +
++                "pixelMode=${if (captureOutput.maximumResolutionMode) "MAXIMUM" else "DEFAULT"}")
+             val geometry = FrameGeometrySnapshot.createFullFrameStill(
+                 owner.camera.sensorMetadata,
+                 captureOutput,
+@@ -312,11 +320,7 @@ class RawVulkanPreviewController(
+         )
+         notifyCaptureAcceptedLocked(request.snapshot.revisionId)
+         runCatching {
+-            owner.session.captureStill(
+-                owner.camera.rawOutputs,
+-                VulkanRawImportPolicy.candidateFormats,
+-                stillCallback(request),
+-            )
++            owner.session.captureStillFrozen(request.captureOutput, stillCallback(request))
+         }.onFailure { error ->
+             pendingCapture = null
+             publishCaptureErrorLocked(
+@@ -424,7 +428,7 @@ class RawVulkanPreviewController(
+         active?.session?.close()
+         active = null
+         attachedSurface = null
+-        pendingCapture = null
++        if (pendingCapture !== publishingCapture26896) pendingCapture = null
+         resetExposureMeterStateLocked()
+         clearHistogramLocked()
+         histogramListener = null
+@@ -439,7 +443,8 @@ class RawVulkanPreviewController(
+         // or Android destroys the view, leaving a photo uncaptured despite a
+         // successful RCD. Retire Camera2/native owners immediately, but let
+         // the one JPEG writer drain already accepted bitmap transactions.
+-        // pendingCapture is cleared above so no stale UI callback is emitted.
++        // The JPEG transaction is intentionally retained; UI listener is closed,
++        // but the owned bitmap worker must still publish its MediaStore row.
+         captureWriter.shutdown()
+         publishLocked(RawPreviewPhase.CLOSED, "RAW preview is closed")
+     }
+@@ -453,9 +458,16 @@ class RawVulkanPreviewController(
+             clearHistogramLocked()
+             val owner = active
+             if (owner != null && pendingCapture?.owner === owner) {
+-                val revision = pendingCapture?.snapshot?.revisionId
+-                pendingCapture = null
+-                publishCaptureErrorLocked("RAW capture was canceled by mode handoff", revision)
++                val request = pendingCapture
++                if (request != null && publishingCapture26896 === request) {
++                    // RAW callback finished synchronously; a separately-owned
++                    // bitmap/JPEG worker may still be writing after camera release.
++                    Log.i(TAG, "IRIS_26896_SPEKTRA_SAVE_SURVIVES_HANDOFF revision=${request.snapshot.revisionId}")
++                } else {
++                    val revision = request?.snapshot?.revisionId
++                    pendingCapture = null
++                    publishCaptureErrorLocked("RAW capture was canceled before development by mode handoff", revision)
++                }
+             }
+             active = null
+             owner
+@@ -571,6 +583,8 @@ class RawVulkanPreviewController(
+ 
+         resumePreviewAfterStillLocked(request.owner)
+         processed.onSuccess { image ->
++            check(publishingCapture26896 == null) { "Concurrent Spektra JPEG publication" }
++            publishingCapture26896 = request
+             mutableCaptureStatus.value = RawCaptureStatus(
+                 phase = RawCapturePhase.SAVING,
+                 message = "Saving full-resolution RCD capture",
+@@ -622,8 +636,15 @@ class RawVulkanPreviewController(
+                 image.recycle()
+             }
+             synchronized(lock) {
+-                if (pendingCapture !== request) return@synchronized
+-                pendingCapture = null
++                // Do not confuse camera/session handoff with immutable MediaStore
++                // publication. This remains valid after close(), view teardown,
++                // or a new preview generation. Publish the result exactly once.
++                if (publishingCapture26896 !== request) {
++                    Log.e(TAG, "IRIS_26896_SPEKTRA_PUBLICATION_DUPLICATE revision=${request.snapshot.revisionId}")
++                    return@synchronized
++                }
++                publishingCapture26896 = null
++                if (pendingCapture === request) pendingCapture = null
+                 result.onSuccess { uri ->
+                     Log.i(TAG, "IRIS_26691_SPEKTRA_JPEG_SAVED uri=$uri revision=${request.snapshot.revisionId}")
+                     mutableCaptureStatus.value = RawCaptureStatus(
+diff --git a/app/version.properties b/app/version.properties
+index fb4b9b6ca3701cb3544176ee2b8405fb486a7711..49164fe219f9da5f297a89927adb407ac6558c73 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726895
+-VERSION_BUILD=26895
++VERSION_NAME=0.9726896
++VERSION_BUILD=26896
