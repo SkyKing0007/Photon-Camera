@@ -1,0 +1,293 @@
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 0b1ee6c26db25dd1cec8010ab4b980c8d249e73d..9657830bbb1ef7bec5cd94ad690181ba603e9d0d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -35,7 +35,6 @@ import com.particlesdevs.photoncamera.app.PhotonCamera
+ import com.particlesdevs.photoncamera.processing.ImageFrame
+ import com.particlesdevs.photoncamera.processing.MotionBatch
+ import com.particlesdevs.photoncamera.processing.render.Parameters
+-import com.particlesdevs.photoncamera.util.Allocator
+ import com.particlesdevs.photoncamera.util.MotionTrace
+ import java.io.File
+ import java.io.RandomAccessFile
+@@ -91,15 +90,6 @@ object PhotonMotionMgc1271Bridge {
+         }
+     }
+ 
+-    /* DNG independent publication: the producer is Sabre A; the B native JPEG
+-     * path must not be able to cancel an already accepted normalized16 DNG.
+-     * Only direct B uses this early receipt. Existing Night/A callers retain
+-     * their original overload without any publication behavior change. */
+-    fun interface EarlyDngPublisher {
+-        fun publish(original: RawStackResult): Boolean
+-    }
+-
+-    @JvmOverloads
+     @JvmStatic
+     fun reconstruct(
+         size: Point,
+@@ -109,15 +99,11 @@ object PhotonMotionMgc1271Bridge {
+         shortSlot: MotionBatch.ShortHighlightSlot?,
+         /* IRIS_26520_V4_LIVE_MGC_NORMAL_DNG_REQUEST */
+         produceNormalStackedDng: Boolean,
+-        earlyDngPublisher: EarlyDngPublisher? = null,
+     ): MotionV2Merger.Result {
+         var shortFrame: ImageFrame? = null
+         var longFrame: ImageFrame? = null
+         var egl: EglOwner? = null
+         var halfBuffer: ByteBuffer? = null
+-        // Own the optional A DNG allocation until the completed B result
+-        // transfers it to Hdrx. A failed B call must not leak the sidecar.
+-        var ownedIndependentDngForCleanup: ByteBuffer? = null
+         var iris26826SharedCarrierForCleanup: MotionV2SharedRgba16fCarrier? = null
+         // 26856 B: distinct post-RAWR camera-linear RGBA16F result, never Sabre/VGN.
+         var iris26856BTextureForCleanup = 0
+@@ -985,55 +971,11 @@ object PhotonMotionMgc1271Bridge {
+                     PLog.i(TAG,"IRIS_26868_OPTIONAL_A_DNG_ONLY " +
+                         "normals=${aliases.size} sabreJpegPublished=false " +
+                         "longAdmitted=false BNormalUnchanged=true")
+-                    // IRIS_DNG_INDEPENDENT_PRE_B: validate A's immutable NORMAL
+-                    // DNG before the B Vulkan/GL import can fail. A missing or
+-                    // failed publication receipt is never counted as success.
+-                    if (nativeB26868 && earlyDngPublisher != null) {
+-                        ownedIndependentDngForCleanup = originalDng.normalStackedDngRaw16
+-                        val dngBytes = originalDng.normalStackedDngRaw16
+-                        val n = frames.count { it.role == RawBurstFrameRole.NORMAL }
+-                        requireParity(dngBytes != null && originalDng.normalStackedDngFrameCount == n,
+-                            "DNG independent NORMAL population mismatch")
+-                        requireParity(originalDng.normalStackedDngNoiseProfile?.size == 6 &&
+-                            originalDng.normalStackedDngNoiseEquivalentSupport.isFinite() &&
+-                            originalDng.normalStackedDngNoiseEquivalentSupport >= 1f &&
+-                            originalDng.normalStackedDngNoiseEquivalentSupport <= n + 0.01f,
+-                            "DNG independent noise/support invalid")
+-                        if (sabreSuperResEnabled) requireParity(
+-                            originalDng.true2xLinearRgbPath != null &&
+-                            originalDng.true2xWidth == size.x * 2 &&
+-                            originalDng.true2xHeight == size.y * 2,
+-                            "DNG independent true-2x A source invalid")
+-                        val saved = earlyDngPublisher.publish(originalDng)
+-                        PLog.i(TAG,"IRIS_DNG_INDEPENDENT_PRE_B saved=$saved frames=$n " +
+-                            "superRes=$sabreSuperResEnabled jpegBNotStarted=true")
+-                    }
+                     originalDng
+                 } finally {
+                     aliases.forEach { runCatching { it.image.close() } }
+                 }
+             } else null
+-            // GL errors are sticky per context. The isolated Sabre DNG owner
+-            // has finished its GL work before the B AHB importer starts; any
+-            // preceding error must be attributed here, never falsely assigned
+-            // to glEGLImageTargetTexture2DOES by the downstream import check.
+-            // Drain only at the optional A->native B boundary; A, Night, JPEG-
+-            // only B and their original GL error behavior remain unchanged.
+-            if (nativeB26868 && isolatedADng26868 != null) {
+-                var priorErrors = 0
+-                var last = 0
+-                while (priorErrors < 32) {
+-                    val error = GLES30.glGetError()
+-                    if (error == GLES30.GL_NO_ERROR) break
+-                    priorErrors++
+-                    last = error
+-                    PLog.w(TAG, "IRIS_DNG_A_TO_B_PRIOR_GL_ERROR ordinal=$priorErrors gl=0x${error.toString(16)}")
+-                }
+-                requireParity(GLES30.glGetError() == GLES30.GL_NO_ERROR,
+-                    "DNG->B GL error state did not drain")
+-                PLog.i(TAG, "IRIS_DNG_A_TO_B_GL_HANDOFF priorErrors=$priorErrors last=0x${last.toString(16)} " +
+-                    "dngIndependent=true")
+-            }
+             val iris26535FusionStartNs = System.nanoTime()
+             val stackB26856 = fusion.processFrames(frames)
+                 ?: invalid("Iris Sabre/RAWR owner returned null")
+@@ -1912,8 +1854,6 @@ object PhotonMotionMgc1271Bridge {
+                 iris26876B1xHandedOff = result.iris26876B1xGuideGpuPacked != null
+                 iris26876B2xForCleanup = null
+                 iris26876B1xForCleanup = null
+-                // Bridge result now owns A's normalized DNG bytes.
+-                ownedIndependentDngForCleanup = null
+             }
+         } catch (error: Throwable) {
+             PLog.e(TAG, "MGC PARITY ARCHITECTURE INVALID", error)
+@@ -1931,10 +1871,6 @@ object PhotonMotionMgc1271Bridge {
+                 GLES30.glDeleteTextures(1, intArrayOf(clipZoneMaskTexture26836), 0)
+             }
+             LargeDirectBuffer.free(halfBuffer)
+-            ownedIndependentDngForCleanup?.let { bytes ->
+-                runCatching { Allocator.free(bytes) }
+-            }
+-            ownedIndependentDngForCleanup = null
+             if (iris26864BClipForCleanup != 0) runCatching {
+                 GLES30.glDeleteTextures(1, intArrayOf(iris26864BClipForCleanup), 0)
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index ae7b402ebff44d56a5cd922be581653fce2dbc2e..69c532fe0f1f554d9e9a83e6d830863b9c6d0e1f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -100,9 +100,6 @@ public class HdrxProcessor extends ProcessorBase {
+     private int alignAlgorithm;
+     private int saveRAW;
+     private CameraMode cameraMode;
+-    // Completion is owned by this accepted capture, not the B JNI return.
+-    private volatile boolean mIrisDngIndependentAttempted;
+-    private volatile boolean mIrisDngIndependentSaved;
+     private ArrayList<GyroBurst> BurstShakiness;
+ 
+ 
+@@ -153,8 +150,6 @@ public class HdrxProcessor extends ProcessorBase {
+         mIris26876B1xGuideForCleanup = null;
+         mIris26876BExactClipWhiteBalance = null;
+         mIris26876BExactClipYFloor = 0f;
+-        mIrisDngIndependentAttempted = false;
+-        mIrisDngIndependentSaved = false;
+ 
+         Log.d(TAG, "HdrxProcessor called start()");
+         Run();
+@@ -235,16 +230,6 @@ public class HdrxProcessor extends ProcessorBase {
+ //                ApplyStabilization();
+ //            }
+         } catch (Exception e) {
+-            // RAW-only publication is already complete before B starts.
+-            // A subsequent B-only GL failure must not revoke the DNG.
+-            if (cameraMode == CameraMode.MOTION && saveRAW == 2 &&
+-                    mIrisDngIndependentSaved) {
+-                Log.w(TAG,"IRIS_DNG_INDEPENDENT_RAW_ONLY_B_FAILURE_IGNORED " +
+-                        "dngSaved=true bFailure=" + e.getClass().getSimpleName());
+-                processingEventsListener.onProcessingFinished("Motion stacked RAW Processing Finished");
+-                callback.onFinished();
+-                return;
+-            }
+             Log.e(TAG, ProcessingEventsListener.FAILED_MSG);
+             Log.e(TAG, "Error in HdrX Processing:"
+                     + Log.getStackTraceString(e));
+@@ -844,53 +829,7 @@ private void ApplyHdrX() {
+                             iris26363ReferenceTimestamp,
+                             processingParameters,
+                             mMotion26486ShortSlot,
+-                            saveRAW >= 1,
+-                            saveRAW >= 1 ? originalDng -> {
+-                                // Called only after direct B's independent A Sabre
+-                                // DNG is complete and before the risky B native GL
+-                                // handoff. The original DNG writers and metadata
+-                                // remain byte-identical to the 26895 implementation.
+-                                mIrisDngIndependentAttempted = true;
+-                                boolean saved = false;
+-                                try {
+-                                    if (processingParameters.motionV2SuperResOutputEnabled) {
+-                                        saved = com.particlesdevs.photoncamera.processing.IrisSabreSuperResDngWriter.write(
+-                                                dngFile, java.nio.file.Paths.get(originalDng.getTrue2xLinearRgbPath()),
+-                                                originalDng.getTrue2xWidth(), originalDng.getTrue2xHeight(),
+-                                                processingParameters, originalDng.getNormalStackedDngFrameCount(),
+-                                                originalDng.getNormalStackedDngSupportMin(),
+-                                                originalDng.getNormalStackedDngSupportP01(),
+-                                                originalDng.getNormalStackedDngSupportP10(),
+-                                                originalDng.getNormalStackedDngSupportMedian(),
+-                                                originalDng.getNormalStackedDngSupportMean(),
+-                                                originalDng.getNormalStackedDngSupportMax(),
+-                                                originalDng.getNormalStackedDngNoiseEquivalentSupport());
+-                                    } else {
+-                                        java.nio.ByteBuffer bytes = originalDng.getNormalStackedDngRaw16().duplicate();
+-                                        bytes.position(0);
+-                                        saved = ImageSaver.Util.saveNormalized16StackedRaw(
+-                                                dngFile, bytes, processingParameters,
+-                                                originalDng.getNormalStackedDngNoiseProfile(),
+-                                                originalDng.getNormalStackedDngFrameCount(),
+-                                                originalDng.getNormalStackedDngSupportMin(),
+-                                                originalDng.getNormalStackedDngSupportP01(),
+-                                                originalDng.getNormalStackedDngSupportP10(),
+-                                                originalDng.getNormalStackedDngSupportMedian(),
+-                                                originalDng.getNormalStackedDngSupportMean(),
+-                                                originalDng.getNormalStackedDngSupportMax(),
+-                                                originalDng.getNormalStackedDngNoiseEquivalentSupport());
+-                                    }
+-                                } catch (Exception dngError) {
+-                                    Log.e(TAG, "IRIS_DNG_INDEPENDENT_PRE_B_WRITE_FAILED " +
+-                                            Log.getStackTraceString(dngError));
+-                                }
+-                                mIrisDngIndependentSaved = saved;
+-                                processingEventsListener.notifyImageSavedStatus(saved, dngFile);
+-                                Log.i(TAG,"IRIS_DNG_INDEPENDENT_PRE_B_PUBLISHED saved=" + saved +
+-                                        " rawOnly=" + (saveRAW == 2) +
+-                                        " jpegPlusDng=" + (saveRAW == 1));
+-                                return saved;
+-                            } : null);
++                            saveRAW >= 1);
+             /* IRIS_26856_AB_RESULT_SPLIT_SINGLE_BURST
+              * Both independently reconstructed RGB carriers were produced by
+              * the same frozen NORMAL+SHORT batch in one stacker invocation.
+@@ -992,7 +931,7 @@ private void ApplyHdrX() {
+                         + "selectedSabre=" + iris26545SabreSelected + " directB=" + iris26856BOnly
+                         + " parameters=" + processingParameters.motionV2ReconstructionOwner);
+             }
+-            if (saveRAW >= 1 && iris26480DeferredDng == null && !mIrisDngIndependentAttempted) {
++            if (saveRAW >= 1 && iris26480DeferredDng == null) {
+                 throw new IllegalStateException("26545 Motion DNG requested but reconstruction sidecar is missing");
+             }
+             if (saveRAW >= 1 && iris26409V2.dngStackFrames != iris26520ExpectedNormalFrames) {
+@@ -1025,15 +964,7 @@ private void ApplyHdrX() {
+                         && iris26564True2xLinearRgbPath != null
+                         && iris26564True2xWidth > 0 && iris26564True2xHeight > 0;
+                 boolean iris26520RawSaved;
+-                if (mIrisDngIndependentAttempted) {
+-                    // The Sabre NORMAL DNG was already written before B.
+-                    // Never reopen the same URI/path or publish twice.
+-                    iris26520RawSaved = mIrisDngIndependentSaved;
+-                    if (iris26480DeferredDng != null) {
+-                        try { Allocator.free(iris26480DeferredDng); } catch (Throwable ignored) {}
+-                        iris26480DeferredDng = null;
+-                    }
+-                } else if (iris26564SrDng) {
++                if (iris26564SrDng) {
+                     iris26520RawSaved = com.particlesdevs.photoncamera.processing.IrisSabreSuperResDngWriter.write(
+                             dngFile, java.nio.file.Paths.get(iris26564True2xLinearRgbPath),
+                             iris26564True2xWidth, iris26564True2xHeight,
+@@ -1059,10 +990,7 @@ private void ApplyHdrX() {
+                             iris26522DngNoiseEquivalentSupport);
+                     try { Allocator.free(iris26520RawOnly); } catch (Throwable ignored) {}
+                 }
+-                if (!mIrisDngIndependentAttempted)
+-                    processingEventsListener.notifyImageSavedStatus(iris26520RawSaved, dngFile);
+-                if (!iris26520RawSaved)
+-                    throw new IllegalStateException("Motion stacked RAW DNG publication failed");
++                processingEventsListener.notifyImageSavedStatus(iris26520RawSaved, dngFile);
+                 if (output != null) { try { Allocator.free(output); } catch (Throwable ignored) {} output = null; }
+                 if (iris26826SharedRgba16fCarrier != null) {
+                     try { iris26826SharedRgba16fCarrier.close(); } catch (Throwable ignored) {}
+@@ -1270,8 +1198,7 @@ private void ApplyHdrX() {
+          * after PostPipeline has finished mutating presentation Parameters, then overlap its
+          * background file I/O with JPEG-R compression. Gallery notification remains JPEG-first.
+          */
+-        if (cameraMode == CameraMode.MOTION && iris26480DeferredDng != null &&
+-                !mIrisDngIndependentAttempted) {
++        if (cameraMode == CameraMode.MOTION && iris26480DeferredDng != null) {
+             final ByteBuffer dngBytes = iris26480DeferredDng;
+             final Path dngPath = dngFile;
+             final Parameters dngParams = processingParameters;
+@@ -1336,18 +1263,6 @@ private void ApplyHdrX() {
+                 Log.w(TAG, "IRIS_26826_DNG_OVERLAP_FALLBACK reason=executor_rejected serialAfterJpeg=true");
+             }
+         }
+-        // The DNG was already written before B; never resubmit or retain a
+-        // second owned normalized16 buffer for the final JPEG publication.
+-        if (cameraMode == CameraMode.MOTION && mIrisDngIndependentAttempted &&
+-                iris26480DeferredDng != null) {
+-            try { Allocator.free(iris26480DeferredDng); } catch (Throwable ignored) {}
+-            iris26480DeferredDng = null;
+-            if (iris26564True2xLinearRgbPath != null) {
+-                try { java.nio.file.Files.deleteIfExists(java.nio.file.Paths.get(iris26564True2xLinearRgbPath)); }
+-                catch (Exception ignored) {}
+-                iris26564True2xLinearRgbPath = null;
+-            }
+-        }
+         /* Keep non-Motion completion timing equivalent to 26512.
+          * Only Motion waits for its actual JPEG_R save/publication boundary.
+          */
+diff --git a/app/version.properties b/app/version.properties
+index 830e48f087107fde0f1a588a609f87bb4d90a68a..fb4b9b6ca3701cb3544176ee2b8405fb486a7711 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726897
+-VERSION_BUILD=26897
++VERSION_NAME=0.9726895
++VERSION_BUILD=26895
