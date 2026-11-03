@@ -1,0 +1,179 @@
+diff --git a/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl b/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
+deleted file mode 100644
+index 21c1a84ce772219386d2501bee551d93e1a7a98b..0000000000000000000000000000000000000000
+--- a/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
++++ /dev/null
+@@ -1,63 +0,0 @@
+-precision highp float;
+-precision mediump sampler2D;
+-
+-/* IRIS_26899_SHUTTER_FROZEN_B_SR_OFF_HIGH_ZOOM_ONLY
+- * This shader is invoked only after the existing SDR renderer has completed;
+- * no changes to original Sabre/VGN, RAW, Bayer, DNG, color or UHDR math.
+- * Luma weights operate in the final encoded SDR display domain. A bounded
+- * scalar applied uniformly to RGB preserves local channel proportions.
+- */
+-uniform sampler2D InputBuffer;
+-uniform float iris26899AdditionalPct;
+-out vec3 Output;
+-
+-float iris26899Luma(vec3 rgb) {
+-    return dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+-}
+-float iris26899ReadY(ivec2 p, ivec2 hi) {
+-    return iris26899Luma(clamp(texelFetch(InputBuffer, clamp(p, ivec2(0), hi), 0).rgb,
+-                                 vec3(0.0), vec3(1.0)));
+-}
+-
+-void main() {
+-    ivec2 sz = textureSize(InputBuffer, 0);
+-    ivec2 hi = max(sz - ivec2(1), ivec2(0));
+-    ivec2 p = clamp(ivec2(gl_FragCoord.xy), ivec2(0), hi);
+-    vec3 rgb = clamp(texelFetch(InputBuffer, p, 0).rgb, vec3(0.0), vec3(1.0));
+-    float y = iris26899Luma(rgb);
+-    if (y < 0.006 || y > 0.994) { Output = rgb; return; }
+-
+-    float l = iris26899ReadY(p + ivec2(-1, 0), hi);
+-    float r = iris26899ReadY(p + ivec2( 1, 0), hi);
+-    float u = iris26899ReadY(p + ivec2( 0,-1), hi);
+-    float d = iris26899ReadY(p + ivec2( 0, 1), hi);
+-    float fineMean = (4.0*y + l+r+u+d) * 0.125;
+-
+-    float farAxial = iris26899ReadY(p+ivec2(-2, 0),hi) +
+-                     iris26899ReadY(p+ivec2( 2, 0),hi) +
+-                     iris26899ReadY(p+ivec2( 0,-2),hi) +
+-                     iris26899ReadY(p+ivec2( 0, 2),hi);
+-    float diagonal = iris26899ReadY(p+ivec2(-2,-2),hi) +
+-                     iris26899ReadY(p+ivec2(-2, 2),hi) +
+-                     iris26899ReadY(p+ivec2( 2,-2),hi) +
+-                     iris26899ReadY(p+ivec2( 2, 2),hi);
+-    float mediumMean = (4.0*y + farAxial + diagonal) / 12.0;
+-
+-    /* A conservative low-contrast gate protects flat skies and shadow grain;
+-     * a bounded edge amplitude prevents white/dark overshoot at high zoom.
+-     * Double the nominal baseline at 1.10..10x; 2.5x at 20x; 3x >=30x.
+-     */
+-    float detail = 0.74*(y-fineMean) + 0.26*(y-mediumMean);
+-    float contrastEvidence = max(abs(y-fineMean), 0.65*abs(y-mediumMean));
+-    float evidence = smoothstep(0.0025, 0.012, contrastEvidence);
+-    float shadowGate = smoothstep(0.012, 0.08, y);
+-    float highlightGate = 1.0 - smoothstep(0.88, 0.992, y);
+-    float gate = evidence * shadowGate * highlightGate;
+-    float relativeGain = 1.0 + clamp(iris26899AdditionalPct, 100.0, 200.0)/100.0;
+-    float boundedDelta = clamp(relativeGain * 1.20 * gate * detail, -0.082, 0.082);
+-    float sharpY = clamp(y + boundedDelta, 0.0, 1.0);
+-    /* Do not introduce independent R/G/B edge decisions or false chroma.
+-     * Uniform RGB scaling retains hue unless an extreme channel clips. */
+-    float ratio = clamp(sharpY / max(y, 1.0e-5), 0.55, 1.60);
+-    Output = clamp(rgb * ratio, vec3(0.0), vec3(1.0));
+-}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 623566370cd860232ac0a3237ad69ea98dec6af1..65f565a0b41f2a61de0b409c9eac9448dde518f8 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1399,48 +1399,6 @@ public final class MotionV2Render extends Node {
+ 
+             WorkingTexture = basePipeline.getMain();
+             glProg.drawBlocks(WorkingTexture);
+-            /* IRIS_26899_B_OFF_ONLY_FINAL_SDR_EDGE_AWARE_LUMA_SHARPEN
+-             * The inherited Motion renderer finishes exactly as before. Apply
+-             * a single bounded two-scale detail pass ONLY for shutter-selected
+-             * B, SR OFF and user-visible zoom >=1.10x. Both A and B->A use
+-             * identical reconstruction; the frozen shutter owner isolates
+-             * sharpening from real Experiment A, A+B, Night and B SR ON.
+-             * Sharpen before UHDR gain-map creation so the existing matched
+-             * SDR/HDR quotient observes the actual published SDR base.
+-             */
+-            final float iris26899Zoom = basePipeline.mParameters.motionV2GlobalZoom;
+-            final boolean iris26899Sharpen = basePipeline.mParameters.iris26899BOffZoomSharpenEnabled
+-                    && basePipeline.mParameters.motionV2Active
+-                    && !basePipeline.mParameters.irisNightActive
+-                    && !basePipeline.mParameters.motionV2SuperResOutputEnabled
+-                    && Float.isFinite(iris26899Zoom) && iris26899Zoom >= 1.10f;
+-            if (iris26899Sharpen) {
+-                final float iris26899AdditionalPct = iris26899Zoom <= 10.0f
+-                        ? 100.0f
+-                        : iris26899Zoom <= 20.0f
+-                        ? 100.0f + 5.0f * (iris26899Zoom - 10.0f)
+-                        : Math.min(200.0f, 150.0f + 5.0f * (iris26899Zoom - 20.0f));
+-                final GLTexture iris26899UnsharpenedSdr = WorkingTexture;
+-                /* The ping-pong getMain() target may contain the HDR reference
+-                 * needed immediately afterward for UHDR gain-map generation.
+-                 * Never overwrite it: a dedicated registry-owned SDR texture
+-                 * survives through gain-map readback, then closeAll() releases it.
+-                 */
+-                GLTexture iris26899Destination = new GLTexture(
+-                        new Point(iris26899UnsharpenedSdr.mSize),
+-                        iris26899UnsharpenedSdr.mFormat, null, GL_LINEAR, GL_CLAMP_TO_EDGE);
+-                glProg.useAssetProgram("motionv2/iris26899_b_off_zoom_luma_sharpen");
+-                glProg.setTexture("InputBuffer", iris26899UnsharpenedSdr);
+-                glProg.setVar("iris26899AdditionalPct", iris26899AdditionalPct);
+-                glProg.drawBlocks(iris26899Destination);
+-                WorkingTexture = iris26899Destination;
+-                Log.i(Name, "IRIS_26899_B_OFF_ZOOM_LUMA_SHARPEN"
+-                        + " owner=B_FROZEN_ONLY superRes=false globalZoom=" + iris26899Zoom
+-                        + " additionalPct=" + iris26899AdditionalPct
+-                        + " relativeNominalSharpenGain=" + (1.0f + iris26899AdditionalPct/100.0f)
+-                        + " sameOutputSize=true twoScale=true colorRatioPreserved=true"
+-                        + " beforeGainMap=true sourceUnmodified=true");
+-            }
+             /* IRIS_26816_RETIRE_FALSE_COLOR_DECISION_TELEMETRY
+              * Classification, propagation and final correction remain active. Telemetry-only
+              * counters, global atomics and synchronous CPU readbacks are retired. */
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 856f66a33a3db21a2a4eaf70fa8078e3822c6ad6..7dfbb87654f4e545b0e8da0db5b12cbc16d767ea 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -771,22 +771,6 @@ private void ApplyHdrX() {
+                 : Iris26856ABSettings.Mode.ORIGINAL_26850;
+         final boolean iris26856BRequestedOnly = cameraMode == CameraMode.MOTION
+                 && iris26856FrozenMode == Iris26856ABSettings.Mode.AMAZE_26855;
+-        /* IRIS_26899_FROZEN_B_OFF_ZOOM_SHARPEN_GATE
+-         * Frozen shutter B (not effective Sabre route) and frozen SR OFF are the
+-         * only permitted owners. The user's displayed/global zoom controls
+-         * strength across physical lens switches; no mutable UI settings read.
+-         */
+-        final float iris26899GlobalZoom = processingParameters.motionV2GlobalZoom;
+-        processingParameters.iris26899BOffZoomSharpenEnabled =
+-                iris26856BRequestedOnly && !processingParameters.motionV2SuperResOutputEnabled
+-                && Float.isFinite(iris26899GlobalZoom) && iris26899GlobalZoom >= 1.10f;
+-        Log.i(TAG, "IRIS_26899_B_OFF_ZOOM_SHARPEN_OWNER enabled="
+-                + processingParameters.iris26899BOffZoomSharpenEnabled
+-                + " frozenExperiment=" + iris26856FrozenMode
+-                + " srOn=" + processingParameters.motionV2SuperResOutputEnabled
+-                + " globalZoom=" + iris26899GlobalZoom
+-                + " independentOfEffectiveAHighZoomRoute=true");
+-
+         /* IRIS_26864_B_HIGH_ZOOM_EXACT_A_PUBLICATION
+          * Only the selected B-only 1.10x+ non-SR route uses exact historical A.
+          * The shutter's B selection remains unchanged for file naming; the
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index caa2b0242f61dbc09e5b57c8b389e999168f698f..5b59826124dffa00d7df6bf9124a8529e1ca4482 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -148,14 +148,6 @@ public class Parameters {
+      */
+     public float motionV2RenderResidualZoom = 1.0f;
+     public boolean motionV2SuperResOutputEnabled = false;
+-    /* IRIS_26899_B_OFF_ZOOM_SHARPEN_FROZEN_OWNER
+-     * Only shutter-selected Experiment B, Super Res OFF, with displayed zoom
+-     * >=1.10x may enable the optional post-SDR luminance sharpening pass.
+-     * This is intentionally independent of the effective reconstruction owner:
+-     * the B->A high-zoom routing must not accidentally grant sharpening to A.
+-     */
+-    public boolean iris26899BOffZoomSharpenEnabled = false;
+-
+     /* IRIS_26786_DNG_OPTIONS_FROZEN_PROCESSING_CARRIER */
+     public com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.DngOptions.Snapshot
+             motionV2DngOptions26786 = com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.DngOptions.defaults();
+diff --git a/app/version.properties b/app/version.properties
+index 42a23ad3768552b4eb4794945f1ba7463faaf709..7311fe74b658d78efa6115750177d02612db7d97 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726899
+-VERSION_BUILD=26899
++VERSION_NAME=0.9726898
++VERSION_BUILD=26898
