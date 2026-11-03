@@ -26,7 +26,7 @@ wf=R/'.github/workflows/build-26899-iris-rawr.yml'
 if not wf.exists():wf=R.parent/'STAGE_2_WORKFLOW/.github/workflows/build-26899-iris-rawr.yml'
 assert wf.is_file()
 s=wf.read_text();a=s.index('  push:\n');b=s.index('  workflow_dispatch:',a)
-assert s[a:b]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26899.txt'\n"
+assert s[a:b]=="  push:\n    branches: [experimental-clean-photon-rebuild]\n    paths:\n      - 'TRIGGER_26899_V2.txt'\n"
 assert s.count('      - name: ')==6
 steps=('Replay SHA-pinned successful 26898 historical runner','Derive SHA-sealed 26899 successor guarded runner','Run inherited 17-stage 26899 build','Prove single intended 26899 APK','Seal exact EXECUTED 26899 runner','Upload authoritative 26899 proof and APK')
 assert all(s.count('      - name: '+x)==1 for x in steps)
@@ -39,9 +39,13 @@ assert 'build_26899_iris_rawr_outputs/' in s
 assert '9c97ed074b1d4ec48528e1d63103aed3198d44406a0c3f4820ad3309c203c99a' in s
 expected=(R/'26899_GENERATED_BUILD_SHA256.txt').read_text().split('  ',1)[0]
 assert re.fullmatch('[0-9a-f]{64}',expected) and expected in s
-tr=R/'TRIGGER_26899.txt'
-if not tr.exists():tr=R.parent/'STAGE_3_UPLOAD_LAST/TRIGGER_26899.txt'
-assert tr.read_bytes()==b'RUN_26899_B_OFF_ONLY_ZOOM_LUMA_SHARPEN_V1\n'
+tr=R/'TRIGGER_26899_V2.txt'
+if not tr.exists():tr=R.parent/'STAGE_3_UPLOAD_LAST/TRIGGER_26899_V2.txt'
+assert tr.read_bytes()==b'RUN_26899_B_OFF_ONLY_ZOOM_LUMA_SHARPEN_V2\n'
+# The failed V1 exact-byte trigger stays unchanged in the repository.
+original_trigger=R/'TRIGGER_26899.txt'
+if original_trigger.exists():
+ assert original_trigger.read_bytes()==b'RUN_26899_B_OFF_ONLY_ZOOM_LUMA_SHARPEN_V1\n', '26899 V1 trigger must remain untouched'
 assert not any(x.suffix=='.apk' for x in R.rglob('*') if x.is_file())
 if '--draft' in sys.argv:
  assert sys.argv[1:]==['--draft'];print('PASS 26899 draft candidate 2025->2026, B SR OFF one new GLSL, 2021 protected, correct six-step workflow');sys.exit(0)
@@ -52,18 +56,18 @@ def resolve(p):
  if f.is_file():return f
  if p.startswith('.github/workflows/'):
   return R.parent/'STAGE_2_WORKFLOW'/p
- if p=='TRIGGER_26899.txt':return R.parent/'STAGE_3_UPLOAD_LAST'/p
+ if p=='TRIGGER_26899_V2.txt':return R.parent/'STAGE_3_UPLOAD_LAST'/p
  return f
 assert all(resolve(p).is_file() and H(resolve(p))==h for p,h in seal.items()),'26899 staged byte/hash mismatch'
 allow=(R/'26899_REPOSITORY_UPLOAD_ALLOWLIST.txt').read_text().splitlines()
 assert allow==sorted(set(allow))
-assert set(allow)==set(seal)|{'26899_HANDOFF_HASHES.sha256','26899_REPOSITORY_UPLOAD_ALLOWLIST.txt'}
-assert '.github/workflows/build-26899-iris-rawr.yml' in allow and 'TRIGGER_26899.txt' in allow
+assert set(allow)==set(seal)|{'26899_HANDOFF_HASHES.sha256','26899_REPOSITORY_UPLOAD_ALLOWLIST.txt','TRIGGER_26899.txt'}
+assert '.github/workflows/build-26899-iris-rawr.yml' in allow and 'TRIGGER_26899_V2.txt' in allow and 'TRIGGER_26899.txt' in allow
 assert 'build_26899_iris_rawr.sh' not in allow
 assert not any('__pycache__' in x or x.endswith('.pyc') for x in allow)
 paths=[(R/f'26899_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
-assert set(sum(paths,[]))==set(allow)
+assert set(sum(paths,[]))==set(allow)-{'TRIGGER_26899.txt'}
 assert set(paths[0]).isdisjoint(paths[1]+paths[2])
 assert paths[1]==['.github/workflows/build-26899-iris-rawr.yml']
-assert paths[2]==['TRIGGER_26899.txt']
+assert paths[2]==['TRIGGER_26899_V2.txt']
 print('PASS 26899 3-stage exact SHA-sealed output; full source manifest, frozen protected, B-only 1.1-30+ zoom; exact trigger/runner')

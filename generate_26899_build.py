@@ -46,6 +46,13 @@ for a,b in [
 ]:once(a,b)
 # Only GENERATED output receipt paths migrate. All historical validators keep their original names.
 s=s.replace('$OUT/26898_','$OUT/26899_')
+# The ABI regression verifies exact *26888 compiled* SPIR-V as archived by
+# the SUCCESSFUL PARENT artifact; only the artifact's containing output
+# directory changes, never the historical source / CLI / compiled bytes.
+# This line was missed in 26899 V1 (run 41690087548) and caused a real
+# GitHub Actions failure BEFORE any Android/shader compiler ran.
+once('verify_26889_compiled_push_abi.py "$ARTDIR/build_26897_iris_rawr_outputs/26888_modified_shader_spirv/Iris26887BOffHdrqMerge_prod.spv"',
+     'verify_26889_compiled_push_abi.py "$ARTDIR/build_26898_iris_rawr_outputs/26888_modified_shader_spirv/Iris26887BOffHdrqMerge_prod.spv"')
 # Adapt existing 26898 original generator to the parent artifact's verified historical TAR.
 old=section('make_candidate')
 historical=old.replace('make_candidate(){','historical_26898_make_candidate(){',1).replace(
@@ -207,6 +214,7 @@ append('clean_extract_replay','''
 ''')
 # Fix the last inherited 26898 source archive block in clean_extract_replay
 # without touching any earlier historical 26897 and 26894 archive checks.
+assert '$ARTDIR/build_26897_iris_rawr_outputs/' not in s, 'stale historical artifact path in final runner'
 assert tuple(n for n in rx.findall(s) if n in STAGES)==STAGES
 for n,cli in [('compile_languages','./gradlew clean :app:compileDebugKotlin :app:compileDebugJavaWithJavac --stacktrace'),
 ('compile_native',"./gradlew ':app:buildCMakeDebug[arm64-v8a]' ':app:buildCMakeDebug[armeabi-v7a]' --stacktrace"),
