@@ -1,0 +1,290 @@
+diff --git a/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl b/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
+index a791bb7914dea8119157a8191f56336baacb0505..3baa16870bcb12ddd4cc819e2f4edb271d53bdaa 100644
+--- a/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
++++ b/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
+@@ -9,9 +9,9 @@ precision mediump sampler2D;
+  */
+ uniform sampler2D InputBuffer;
+ uniform float iris26899AdditionalPct;
+-/* IRIS_26901_DISPLAYED_TOTAL_ZOOM_SCALE_AWARE_RADIUS:
+- * Global zoom displayed in Iris, independent of physical-lens activation. */
+-uniform float iris26901DisplayedZoomForRadius;
++/* IRIS_26900_B_OFF_SCALE_AWARE_RADIUS: this is source-to-output renderer
++ * magnification, NOT user/global zoom, optical zoom or frame count. */
++uniform float iris26900RenderPixelScale;
+ out vec3 Output;
+ 
+ float iris26899Luma(vec3 rgb) {
+@@ -37,11 +37,11 @@ void main() {
+     float fineMean = (4.0*y + l+r+u+d) * 0.125;
+ 
+     /* Preserve the original 12-neighbor fetch count. Expand only the medium
+-     * detector's physical footprint: a high displayed digital zoom requires
++     * detector's physical footprint: a 12x-enlarged native pixel requires
+      * a farther comparison than +/-2 output pixels to expose curvature.
+      * Smooth source ramps remain unsharpened unless source evidence bends. */
+-    float displayedZoom=clamp(iris26901DisplayedZoomForRadius,1.0,120.0);
+-    int radius=int(clamp(floor(1.0+0.80*max(displayedZoom-1.0,0.0)+0.5),2.0,24.0));
++    float physicalScale=clamp(iris26900RenderPixelScale,1.0,64.0);
++    int radius=int(clamp(floor(1.0+0.80*max(physicalScale-1.0,0.0)+0.5),2.0,24.0));
+     float farAxial = iris26899ReadY(p+ivec2(-radius, 0),hi) +
+                      iris26899ReadY(p+ivec2( radius, 0),hi) +
+                      iris26899ReadY(p+ivec2( 0,-radius),hi) +
+@@ -57,7 +57,7 @@ void main() {
+      * weakening their +100..+200% sharpening. Keep only near-black/near-white
+      * clipping protection and the original strict luminance delta ceiling.
+      * Scale-aware sampling never changes the requested nominal zoom curve. */
+-    float mediumWeight=mix(0.26,0.50,smoothstep(3.0,12.0,displayedZoom));
++    float mediumWeight=mix(0.26,0.50,smoothstep(3.0,12.0,physicalScale));
+     float detail=(1.0-mediumWeight)*(y-fineMean)+mediumWeight*(y-mediumMean);
+     float shadowGate=smoothstep(0.006,0.018,y);
+     float highlightGate=1.0-smoothstep(0.965,0.994,y);
+diff --git a/app/src/main/assets/shaders/motionv2/render.glsl b/app/src/main/assets/shaders/motionv2/render.glsl
+index d19fd243d8b9524d73727cc02ce5cf1913839e25..dc4d390a5ab99c9d87e6e341cadbc4d791e5270e 100644
+--- a/app/src/main/assets/shaders/motionv2/render.glsl
++++ b/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -115,16 +115,15 @@ vec3 iris26524BilinearInput(vec2 sourcePixel) {
+ }
+ 
+ 
+-/* IRIS_26901_B_FROZEN_OFF_FULL_RGB_BICUBIC
+- * Retain exact 26900 crop/source coordinates and original 4x4 separable
+- * Catmull-Rom weights. Reconstruct all three RGB channels independently in
+- * linear RGB, with each channel bounded by its central 2x2 source extrema.
+- * No new denoise, chroma neutralization, extra sharpening, RGB normalization,
+- * or change to the original bilinear branch used by other camera modes.
+- * Host enables only for shutter-frozen B Super Res OFF, >=1.10x lens-local
+- * software zoom, AND actual nonidentity source-to-output enlargement.
++/* IRIS_26900_B_FROZEN_OFF_BICUBIC_LUMA_RESAMPLE
++ * The baseline fused RGB/chroma owner is unchanged. At actual output enlargement,
++ * reconstruct the luminance with a separable Catmull-Rom (a=-0.5) bicubic kernel;
++ * preserve the bilinear color direction with a single nonnegative RGB scalar.
++ * Clamp bicubic Y to the original four center sample extrema: no invented color,
++ * no negative luma, and no cubic overshoot beyond the supplied RAW RGB values.
++ * This shader branch is enabled ONLY by shutter-frozen B + Super Res OFF.
+  */
+-uniform int iris26901BOffFullRgbBicubic;
++uniform int iris26900BOffBicubic;
+ vec4 iris26900CubicWeights(float t) {
+     float t2=t*t;
+     float t3=t2*t;
+@@ -133,29 +132,34 @@ vec4 iris26900CubicWeights(float t) {
+                 0.5*t+2.0*t2-1.5*t3,
+                 -0.5*t2+0.5*t3);
+ }
+-vec3 iris26901BicubicRgb(vec2 sourcePixel) {
++vec3 iris26900BicubicLumaPreserveChroma(vec2 sourcePixel) {
+     ivec2 size=textureSize(InputBuffer,0);
+     vec2 p=clamp(sourcePixel,vec2(0.0),vec2(size-ivec2(1)));
+     ivec2 origin=ivec2(floor(p));
+     vec2 t=fract(p);
+     vec4 wx=iris26900CubicWeights(t.x);
+     vec4 wy=iris26900CubicWeights(t.y);
+-    vec3 cubicRgb=vec3(0.0);
+-    vec3 centerMin=vec3(1.0e20);
+-    vec3 centerMax=vec3(-1.0e20);
++    float cubicY=0.0;
++    float localMin=1.0e20;
++    float localMax=-1.0e20;
+     for(int iy=0;iy<4;iy++) {
+         int sy=clamp(origin.y+iy-1,0,size.y-1);
+         for(int ix=0;ix<4;ix++) {
+             int sx=clamp(origin.x+ix-1,0,size.x-1);
+             vec3 rgb=max(texelFetch(InputBuffer,ivec2(sx,sy),0).rgb,vec3(0.0));
+-            cubicRgb+=wx[ix]*wy[iy]*rgb;
++            float y=luminance(rgb);
++            cubicY+=wx[ix]*wy[iy]*y;
+             if(ix>=1 && ix<=2 && iy>=1 && iy<=2) {
+-                centerMin=min(centerMin,rgb);
+-                centerMax=max(centerMax,rgb);
++                localMin=min(localMin,y);
++                localMax=max(localMax,y);
+             }
+         }
+     }
+-    return clamp(cubicRgb,centerMin,centerMax);
++    vec3 bilinear=max(iris26524BilinearInput(p),vec3(0.0));
++    float baseY=max(luminance(bilinear),0.0);
++    if(baseY<=1.0e-7)return bilinear;
++    float targetY=clamp(cubicY,localMin,localMax);
++    return bilinear*(max(targetY,0.0)/baseY);
+ }
+ 
+ /* IRIS_26632_SMOOTHER_UPPER_TONE
+@@ -1185,9 +1189,9 @@ void main() {
+     } else {
+         vec2 center=(vec2(sourceSize)-vec2(1.0))*0.5;
+         sourcePixel=center+(vec2(xy)-center)/zoom;
+-        /* IRIS_26901_B_OFF_ONLY_OUTPUT_INDEPENDENT_RGB_BICUBIC */
+-        linearSrgb=max(iris26901BOffFullRgbBicubic!=0
+-                ? iris26901BicubicRgb(sourcePixel)
++        /* IRIS_26900_B_OFF_ONLY_OUTPUT_LUMA_BICUBIC */
++        linearSrgb=max(iris26900BOffBicubic!=0
++                ? iris26900BicubicLumaPreserveChroma(sourcePixel)
+                 : iris26524BilinearInput(sourcePixel),vec3(0.0));
+         sourceXY=ivec2(clamp(floor(sourcePixel+vec2(0.5)),
+                             vec2(0.0),vec2(sourceSize-ivec2(1))));
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 85ac1dbe618bb7dca13eb2ac77af4bffbb6c5fc7..46099175791cdc463af699043c2a84f83a341158 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1376,25 +1376,18 @@ public final class MotionV2Render extends Node {
+             if (basePipeline.mParameters.motionV2Active && iris26799ConnectedMask != null) {
+                 glProg.setTexture("iris26799ConnectedMask", iris26799ConnectedMask);
+             }
+-            /* IRIS_26901_UNIVERSAL_PHYSICAL_LENS_RELATIVE_ACTIVATION
+-             * Reuse the frozen shutter B/SR-OFF and >=1.10x active physical-lens
+-             * output zoom from HdrxProcessor. Actual RGB bicubic runs only
+-             * when this renderer enlarges its input (>1x residual scale).
+-             * Other experiments and native optical images stay unchanged.
+-             */
+-            final float iris26901LensLocalZoom = basePipeline.mParameters.motionV2OutputZoom;
+-            final boolean iris26901DigitalZoomEnhancement =
+-                    basePipeline.mParameters.iris26901BOffDigitalZoomEnhancementEnabled
++            /* IRIS_26900_ONLY_FROZEN_B_OFF_FINAL_RGB_LUMA_BICUBIC
++             * The global B SR-OFF shutter flag is required in addition to
++             * residual software enlargement. Other modes remain bit-identical
++             * to the original bilinear shader branch. */
++            glProg.setVar("iris26900BOffBicubic",
++                    basePipeline.mParameters.iris26899BOffZoomSharpenEnabled
+                     && basePipeline.mParameters.motionV2Active
+                     && !basePipeline.mParameters.irisNightActive
+                     && !basePipeline.mParameters.motionV2SuperResOutputEnabled
+-                    && Float.isFinite(iris26901LensLocalZoom)
+-                    && iris26901LensLocalZoom >= 1.10f
+                     && Float.isFinite(basePipeline.mParameters.motionV2GlobalZoom)
+-                    && basePipeline.mParameters.motionV2GlobalZoom > 0.0f;
+-            final boolean iris26901FullRgbBicubic = iris26901DigitalZoomEnhancement
+-                    && Float.isFinite(irisOutputZoom) && irisOutputZoom > 1.00001f;
+-            glProg.setVar("iris26901BOffFullRgbBicubic", iris26901FullRgbBicubic ? 1 : 0);
++                    && basePipeline.mParameters.motionV2GlobalZoom >= 1.10f
++                    && irisOutputZoom > 1.00001f ? 1 : 0);
+             glProg.setVar("iris26718HighZoomDetailEnabled", iris26718HighZoomDetailEnabled ? 1 : 0);
+             glProg.setVar("iris26752PlanBDetailScale",
+ 
+@@ -1418,14 +1411,21 @@ public final class MotionV2Render extends Node {
+ 
+             WorkingTexture = basePipeline.getMain();
+             glProg.drawBlocks(WorkingTexture);
+-            /* IRIS_26901_B_OFF_ONLY_POST_RGB_BICUBIC_SDR_SHARPEN
+-             * Lens-relative zoom >=1.10x selects owner/eligibility ONLY.
+-             * Global zoom displayed in Iris controls +100..+200% strength
+-             * and the scale-aware two-scale sampling radius exactly as agreed.
+-             * The SDR sharpening pass still precedes UHDR gain-map generation.
++            /* IRIS_26899_B_OFF_ONLY_FINAL_SDR_EDGE_AWARE_LUMA_SHARPEN
++             * The inherited Motion renderer finishes exactly as before. Apply
++             * a single bounded two-scale detail pass ONLY for shutter-selected
++             * B, SR OFF and user-visible zoom >=1.10x. Both A and B->A use
++             * identical reconstruction; the frozen shutter owner isolates
++             * sharpening from real Experiment A, A+B, Night and B SR ON.
++             * Sharpen before UHDR gain-map creation so the existing matched
++             * SDR/HDR quotient observes the actual published SDR base.
+              */
+             final float iris26899Zoom = basePipeline.mParameters.motionV2GlobalZoom;
+-            final boolean iris26899Sharpen = iris26901DigitalZoomEnhancement;
++            final boolean iris26899Sharpen = basePipeline.mParameters.iris26899BOffZoomSharpenEnabled
++                    && basePipeline.mParameters.motionV2Active
++                    && !basePipeline.mParameters.irisNightActive
++                    && !basePipeline.mParameters.motionV2SuperResOutputEnabled
++                    && Float.isFinite(iris26899Zoom) && iris26899Zoom >= 1.10f;
+             if (iris26899Sharpen) {
+                 final float iris26899AdditionalPct = iris26899Zoom <= 10.0f
+                         ? 100.0f
+@@ -1444,22 +1444,18 @@ public final class MotionV2Render extends Node {
+                 glProg.useAssetProgram("motionv2/iris26899_b_off_zoom_luma_sharpen");
+                 glProg.setTexture("InputBuffer", iris26899UnsharpenedSdr);
+                 glProg.setVar("iris26899AdditionalPct", iris26899AdditionalPct);
+-                /* IRIS_26901_DISPLAYED_ZOOM_SCALE_AWARE_RADIUS
+-                 * Do not substitute the lens-local activation factor here.
+-                 * The total viewfinder zoom governs BOTH strength and sampling.
+-                 */
+-                glProg.setVar("iris26901DisplayedZoomForRadius", iris26899Zoom);
++                /* Local pixel enlargement (NOT global zoom and NOT the SR frame
++                 * scale): the exact final FOV renderer's source->output factor. */
++                glProg.setVar("iris26900RenderPixelScale", irisOutputZoom);
+                 glProg.drawBlocks(iris26899Destination);
+                 WorkingTexture = iris26899Destination;
+                 Log.i(Name, "IRIS_26899_B_OFF_ZOOM_LUMA_SHARPEN"
+                         + " owner=B_FROZEN_ONLY superRes=false globalZoom=" + iris26899Zoom
+                         + " additionalPct=" + iris26899AdditionalPct
+                         + " relativeNominalSharpenGain=" + (1.0f + iris26899AdditionalPct/100.0f)
+-                        + " iris26901FullRgbBicubic=" + iris26901FullRgbBicubic
+-                        + " lensLocalZoom=" + iris26901LensLocalZoom
+-                        + " iris26901DisplayedZoomForRadius=" + iris26899Zoom
+-                        + " actualRenderEnlargement=" + irisOutputZoom
+-                        + " sameOutputSize=true twoScale=true independentlyInterpolatedRGB=true"
++                        + " iris26900LumaBicubic=" + (irisOutputZoom > 1.00001f)
++                        + " iris26900TrueRenderPixelScale=" + irisOutputZoom
++                        + " sameOutputSize=true twoScale=true colorRatioPreserved=true"
+                         + " beforeGainMap=true sourceUnmodified=true");
+             }
+             /* IRIS_26816_RETIRE_FALSE_COLOR_DECISION_TELEMETRY
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 57eda4fca92fc07c791ef16b3a6ca3512ecc74f7..856f66a33a3db21a2a4eaf70fa8078e3822c6ad6 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -771,29 +771,21 @@ private void ApplyHdrX() {
+                 : Iris26856ABSettings.Mode.ORIGINAL_26850;
+         final boolean iris26856BRequestedOnly = cameraMode == CameraMode.MOTION
+                 && iris26856FrozenMode == Iris26856ABSettings.Mode.AMAZE_26855;
+-        /* IRIS_26901_B_OFF_UNIVERSAL_LENS_LOCAL_ACTIVATION
+-         * Only shutter-selected B SR OFF, and only after >=1.10x software zoom
+-         * relative to ANY physical lens. The global viewfinder zoom remains
+-         * independent and controls the unchanged aggressive sharpening curve
+-         * and scale-aware radius. Physical lens native zoom must stay untouched.
+-         * Reuse the SAME frozen lens-relative zoom authority used by the
+-         * inherited A/Sabre high-zoom route, never a device-specific anchor.
++        /* IRIS_26899_FROZEN_B_OFF_ZOOM_SHARPEN_GATE
++         * Frozen shutter B (not effective Sabre route) and frozen SR OFF are the
++         * only permitted owners. The user's displayed/global zoom controls
++         * strength across physical lens switches; no mutable UI settings read.
+          */
+-        final float iris26901LensLocalZoom = processingParameters.motionV2OutputZoom;
+-        final float iris26901DisplayedZoom = processingParameters.motionV2GlobalZoom;
+-        processingParameters.iris26901BOffDigitalZoomEnhancementEnabled =
++        final float iris26899GlobalZoom = processingParameters.motionV2GlobalZoom;
++        processingParameters.iris26899BOffZoomSharpenEnabled =
+                 iris26856BRequestedOnly && !processingParameters.motionV2SuperResOutputEnabled
+-                && Float.isFinite(iris26901LensLocalZoom)
+-                && iris26901LensLocalZoom >= Iris26864ZoomRoute.A_EXACT_ZOOM_THRESHOLD
+-                && Float.isFinite(iris26901DisplayedZoom) && iris26901DisplayedZoom > 0.0f;
+-        Log.i(TAG, "IRIS_26901_B_OFF_DIGITAL_ZOOM_OWNER enabled="
+-                + processingParameters.iris26901BOffDigitalZoomEnhancementEnabled
++                && Float.isFinite(iris26899GlobalZoom) && iris26899GlobalZoom >= 1.10f;
++        Log.i(TAG, "IRIS_26899_B_OFF_ZOOM_SHARPEN_OWNER enabled="
++                + processingParameters.iris26899BOffZoomSharpenEnabled
+                 + " frozenExperiment=" + iris26856FrozenMode
+                 + " srOn=" + processingParameters.motionV2SuperResOutputEnabled
+-                + " displayedGlobalZoom=" + iris26901DisplayedZoom
+-                + " physicalLensLocalZoom=" + iris26901LensLocalZoom
+-                + " activationThreshold=" + Iris26864ZoomRoute.A_EXACT_ZOOM_THRESHOLD
+-                + " nativeOpticalIsUnsharpened=true");
++                + " globalZoom=" + iris26899GlobalZoom
++                + " independentOfEffectiveAHighZoomRoute=true");
+ 
+         /* IRIS_26864_B_HIGH_ZOOM_EXACT_A_PUBLICATION
+          * Only the selected B-only 1.10x+ non-SR route uses exact historical A.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 0899a088abd76142660f501c4c11da0191d85564..caa2b0242f61dbc09e5b57c8b389e999168f698f 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -154,7 +154,7 @@ public class Parameters {
+      * This is intentionally independent of the effective reconstruction owner:
+      * the B->A high-zoom routing must not accidentally grant sharpening to A.
+      */
+-    public boolean iris26901BOffDigitalZoomEnhancementEnabled = false;
++    public boolean iris26899BOffZoomSharpenEnabled = false;
+ 
+     /* IRIS_26786_DNG_OPTIONS_FROZEN_PROCESSING_CARRIER */
+     public com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.DngOptions.Snapshot
+diff --git a/app/version.properties b/app/version.properties
+index 533dedb707147c0c37297cffd238011cc7cbc81a..ce5c6907b1a26bfa030d20e74ff35c55fa8feb04 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726901
+-VERSION_BUILD=26901
++VERSION_NAME=0.9726900
++VERSION_BUILD=26900
