@@ -1,0 +1,188 @@
+diff --git b/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl a/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
+index 3baa16870bcb12ddd4cc819e2f4edb271d53bdaa..21c1a84ce772219386d2501bee551d93e1a7a98b 100644
+--- b/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
++++ a/app/src/main/assets/shaders/motionv2/iris26899_b_off_zoom_luma_sharpen.glsl
+@@ -9,9 +9,6 @@ precision mediump sampler2D;
+  */
+ uniform sampler2D InputBuffer;
+ uniform float iris26899AdditionalPct;
+-/* IRIS_26900_B_OFF_SCALE_AWARE_RADIUS: this is source-to-output renderer
+- * magnification, NOT user/global zoom, optical zoom or frame count. */
+-uniform float iris26900RenderPixelScale;
+ out vec3 Output;
+ 
+ float iris26899Luma(vec3 rgb) {
+@@ -36,32 +33,26 @@ void main() {
+     float d = iris26899ReadY(p + ivec2( 0, 1), hi);
+     float fineMean = (4.0*y + l+r+u+d) * 0.125;
+ 
+-    /* Preserve the original 12-neighbor fetch count. Expand only the medium
+-     * detector's physical footprint: a 12x-enlarged native pixel requires
+-     * a farther comparison than +/-2 output pixels to expose curvature.
+-     * Smooth source ramps remain unsharpened unless source evidence bends. */
+-    float physicalScale=clamp(iris26900RenderPixelScale,1.0,64.0);
+-    int radius=int(clamp(floor(1.0+0.80*max(physicalScale-1.0,0.0)+0.5),2.0,24.0));
+-    float farAxial = iris26899ReadY(p+ivec2(-radius, 0),hi) +
+-                     iris26899ReadY(p+ivec2( radius, 0),hi) +
+-                     iris26899ReadY(p+ivec2( 0,-radius),hi) +
+-                     iris26899ReadY(p+ivec2( 0, radius),hi);
+-    float diagonal = iris26899ReadY(p+ivec2(-radius,-radius),hi) +
+-                     iris26899ReadY(p+ivec2(-radius, radius),hi) +
+-                     iris26899ReadY(p+ivec2( radius,-radius),hi) +
+-                     iris26899ReadY(p+ivec2( radius, radius),hi);
++    float farAxial = iris26899ReadY(p+ivec2(-2, 0),hi) +
++                     iris26899ReadY(p+ivec2( 2, 0),hi) +
++                     iris26899ReadY(p+ivec2( 0,-2),hi) +
++                     iris26899ReadY(p+ivec2( 0, 2),hi);
++    float diagonal = iris26899ReadY(p+ivec2(-2,-2),hi) +
++                     iris26899ReadY(p+ivec2(-2, 2),hi) +
++                     iris26899ReadY(p+ivec2( 2,-2),hi) +
++                     iris26899ReadY(p+ivec2( 2, 2),hi);
+     float mediumMean = (4.0*y + farAxial + diagonal) / 12.0;
+ 
+-    /* IRIS_26900_NONCONSERVATIVE_DETAIL: user reports no visible zoom noise;
+-     * remove 26899 low-contrast/noise-evidence suppression instead of silently
+-     * weakening their +100..+200% sharpening. Keep only near-black/near-white
+-     * clipping protection and the original strict luminance delta ceiling.
+-     * Scale-aware sampling never changes the requested nominal zoom curve. */
+-    float mediumWeight=mix(0.26,0.50,smoothstep(3.0,12.0,physicalScale));
+-    float detail=(1.0-mediumWeight)*(y-fineMean)+mediumWeight*(y-mediumMean);
+-    float shadowGate=smoothstep(0.006,0.018,y);
+-    float highlightGate=1.0-smoothstep(0.965,0.994,y);
+-    float gate=shadowGate*highlightGate;
++    /* A conservative low-contrast gate protects flat skies and shadow grain;
++     * a bounded edge amplitude prevents white/dark overshoot at high zoom.
++     * Double the nominal baseline at 1.10..10x; 2.5x at 20x; 3x >=30x.
++     */
++    float detail = 0.74*(y-fineMean) + 0.26*(y-mediumMean);
++    float contrastEvidence = max(abs(y-fineMean), 0.65*abs(y-mediumMean));
++    float evidence = smoothstep(0.0025, 0.012, contrastEvidence);
++    float shadowGate = smoothstep(0.012, 0.08, y);
++    float highlightGate = 1.0 - smoothstep(0.88, 0.992, y);
++    float gate = evidence * shadowGate * highlightGate;
+     float relativeGain = 1.0 + clamp(iris26899AdditionalPct, 100.0, 200.0)/100.0;
+     float boundedDelta = clamp(relativeGain * 1.20 * gate * detail, -0.082, 0.082);
+     float sharpY = clamp(y + boundedDelta, 0.0, 1.0);
+diff --git b/app/src/main/assets/shaders/motionv2/render.glsl a/app/src/main/assets/shaders/motionv2/render.glsl
+index dc4d390a5ab99c9d87e6e341cadbc4d791e5270e..7c85c580c5f7230eefd94b0f80ae242aa5ecd54e 100644
+--- b/app/src/main/assets/shaders/motionv2/render.glsl
++++ a/app/src/main/assets/shaders/motionv2/render.glsl
+@@ -114,54 +114,6 @@ vec3 iris26524BilinearInput(vec2 sourcePixel) {
+     return mix(a,b,f.y);
+ }
+ 
+-
+-/* IRIS_26900_B_FROZEN_OFF_BICUBIC_LUMA_RESAMPLE
+- * The baseline fused RGB/chroma owner is unchanged. At actual output enlargement,
+- * reconstruct the luminance with a separable Catmull-Rom (a=-0.5) bicubic kernel;
+- * preserve the bilinear color direction with a single nonnegative RGB scalar.
+- * Clamp bicubic Y to the original four center sample extrema: no invented color,
+- * no negative luma, and no cubic overshoot beyond the supplied RAW RGB values.
+- * This shader branch is enabled ONLY by shutter-frozen B + Super Res OFF.
+- */
+-uniform int iris26900BOffBicubic;
+-vec4 iris26900CubicWeights(float t) {
+-    float t2=t*t;
+-    float t3=t2*t;
+-    return vec4(-0.5*t+t2-0.5*t3,
+-                1.0-2.5*t2+1.5*t3,
+-                0.5*t+2.0*t2-1.5*t3,
+-                -0.5*t2+0.5*t3);
+-}
+-vec3 iris26900BicubicLumaPreserveChroma(vec2 sourcePixel) {
+-    ivec2 size=textureSize(InputBuffer,0);
+-    vec2 p=clamp(sourcePixel,vec2(0.0),vec2(size-ivec2(1)));
+-    ivec2 origin=ivec2(floor(p));
+-    vec2 t=fract(p);
+-    vec4 wx=iris26900CubicWeights(t.x);
+-    vec4 wy=iris26900CubicWeights(t.y);
+-    float cubicY=0.0;
+-    float localMin=1.0e20;
+-    float localMax=-1.0e20;
+-    for(int iy=0;iy<4;iy++) {
+-        int sy=clamp(origin.y+iy-1,0,size.y-1);
+-        for(int ix=0;ix<4;ix++) {
+-            int sx=clamp(origin.x+ix-1,0,size.x-1);
+-            vec3 rgb=max(texelFetch(InputBuffer,ivec2(sx,sy),0).rgb,vec3(0.0));
+-            float y=luminance(rgb);
+-            cubicY+=wx[ix]*wy[iy]*y;
+-            if(ix>=1 && ix<=2 && iy>=1 && iy<=2) {
+-                localMin=min(localMin,y);
+-                localMax=max(localMax,y);
+-            }
+-        }
+-    }
+-    vec3 bilinear=max(iris26524BilinearInput(p),vec3(0.0));
+-    float baseY=max(luminance(bilinear),0.0);
+-    if(baseY<=1.0e-7)return bilinear;
+-    float targetY=clamp(cubicY,localMin,localMax);
+-    return bilinear*(max(targetY,0.0)/baseY);
+-}
+-
+ /* IRIS_26632_SMOOTHER_UPPER_TONE
+  * 26632 preserves the same pointwise/global owner and 0.65 entry but reserves more ordered SDR
+  * range through source white. No spatial mask, edge boost, or local-protection change.
+@@ -1189,10 +1141,7 @@ void main() {
+     } else {
+         vec2 center=(vec2(sourceSize)-vec2(1.0))*0.5;
+         sourcePixel=center+(vec2(xy)-center)/zoom;
+-        /* IRIS_26900_B_OFF_ONLY_OUTPUT_LUMA_BICUBIC */
+-        linearSrgb=max(iris26900BOffBicubic!=0
+-                ? iris26900BicubicLumaPreserveChroma(sourcePixel)
+-                : iris26524BilinearInput(sourcePixel),vec3(0.0));
++        linearSrgb=max(iris26524BilinearInput(sourcePixel),vec3(0.0));
+         sourceXY=ivec2(clamp(floor(sourcePixel+vec2(0.5)),
+                             vec2(0.0),vec2(sourceSize-ivec2(1))));
+     }
+diff --git b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+index 46099175791cdc463af699043c2a84f83a341158..623566370cd860232ac0a3237ad69ea98dec6af1 100644
+--- b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
++++ a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java
+@@ -1376,18 +1376,6 @@ public final class MotionV2Render extends Node {
+             if (basePipeline.mParameters.motionV2Active && iris26799ConnectedMask != null) {
+                 glProg.setTexture("iris26799ConnectedMask", iris26799ConnectedMask);
+             }
+-            /* IRIS_26900_ONLY_FROZEN_B_OFF_FINAL_RGB_LUMA_BICUBIC
+-             * The global B SR-OFF shutter flag is required in addition to
+-             * residual software enlargement. Other modes remain bit-identical
+-             * to the original bilinear shader branch. */
+-            glProg.setVar("iris26900BOffBicubic",
+-                    basePipeline.mParameters.iris26899BOffZoomSharpenEnabled
+-                    && basePipeline.mParameters.motionV2Active
+-                    && !basePipeline.mParameters.irisNightActive
+-                    && !basePipeline.mParameters.motionV2SuperResOutputEnabled
+-                    && Float.isFinite(basePipeline.mParameters.motionV2GlobalZoom)
+-                    && basePipeline.mParameters.motionV2GlobalZoom >= 1.10f
+-                    && irisOutputZoom > 1.00001f ? 1 : 0);
+             glProg.setVar("iris26718HighZoomDetailEnabled", iris26718HighZoomDetailEnabled ? 1 : 0);
+             glProg.setVar("iris26752PlanBDetailScale",
+ 
+@@ -1444,17 +1432,12 @@ public final class MotionV2Render extends Node {
+                 glProg.useAssetProgram("motionv2/iris26899_b_off_zoom_luma_sharpen");
+                 glProg.setTexture("InputBuffer", iris26899UnsharpenedSdr);
+                 glProg.setVar("iris26899AdditionalPct", iris26899AdditionalPct);
+-                /* Local pixel enlargement (NOT global zoom and NOT the SR frame
+-                 * scale): the exact final FOV renderer's source->output factor. */
+-                glProg.setVar("iris26900RenderPixelScale", irisOutputZoom);
+                 glProg.drawBlocks(iris26899Destination);
+                 WorkingTexture = iris26899Destination;
+                 Log.i(Name, "IRIS_26899_B_OFF_ZOOM_LUMA_SHARPEN"
+                         + " owner=B_FROZEN_ONLY superRes=false globalZoom=" + iris26899Zoom
+                         + " additionalPct=" + iris26899AdditionalPct
+                         + " relativeNominalSharpenGain=" + (1.0f + iris26899AdditionalPct/100.0f)
+-                        + " iris26900LumaBicubic=" + (irisOutputZoom > 1.00001f)
+-                        + " iris26900TrueRenderPixelScale=" + irisOutputZoom
+                         + " sameOutputSize=true twoScale=true colorRatioPreserved=true"
+                         + " beforeGainMap=true sourceUnmodified=true");
+             }
+diff --git b/app/version.properties a/app/version.properties
+index ce5c6907b1a26bfa030d20e74ff35c55fa8feb04..42a23ad3768552b4eb4794945f1ba7463faaf709 100644
+--- b/app/version.properties
++++ a/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726900
+-VERSION_BUILD=26900
++VERSION_NAME=0.9726899
++VERSION_BUILD=26899
