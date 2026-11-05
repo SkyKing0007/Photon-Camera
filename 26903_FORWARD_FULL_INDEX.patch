@@ -1,0 +1,1088 @@
+diff --git a/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag b/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag
+index 589a47d3bc3da5bcfe0b6d5766e0e841e3926da5..350771ef44fc80feeb0f48a46a71a25e83d4a7bc 100644
+--- a/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag
++++ b/app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag
+@@ -55,6 +55,11 @@ uniform vec3 uSensorRow2;
+ uniform vec3 uDisplayRow0;
+ uniform vec3 uDisplayRow1;
+ uniform vec3 uDisplayRow2;
++/* IRIS_26903_NIGHT_B_ONLY_JIN_TRUE2X: 512 learned residual/reference textures. */
++uniform int uNightBJinEnabled;
++uniform ivec2 uNightBJinSize;
++uniform highp sampler2D uNightBJinReference;
++uniform highp sampler2D uNightBJinResidual;
+ 
+ 
+ /* IRIS_26876_B_EXACT_CLIP_PREINTERPOLATION_DEV
+@@ -381,6 +386,75 @@ vec3 iris26876WatermarkP3(vec3 encoded){
+                 irisGamma(0.0331941989*l.r+0.9668058011*l.g),
+                 irisGamma(0.0170826307*l.r+0.0723974407*l.g+0.9105199286*l.b));
+ }
++/* Exact 26564 Night Jin guidance concept ported to B's already existing 50MP
++ * render pass. Residuals and reference guides were pre-converted into encoded P3
++ * at 512x512 from the same Java ONNX output. Float textures sampled by integer
++ * texelFetch avoid unsupported driver-specific linear filtering of RGBA32F.
++ * Bound each channel by the bilinear learned residual; never synthesize new
++ * high-frequency luminance detail or change the pre-Jin sensor-aware HDR owner.
++ */
++vec3 iris26903JinGuide(ivec2 q){
++    return texelFetch(uNightBJinReference,clamp(q,ivec2(0),uNightBJinSize-ivec2(1)),0).rgb;
++}
++vec3 iris26903JinResidual(ivec2 q){
++    return texelFetch(uNightBJinResidual,clamp(q,ivec2(0),uNightBJinSize-ivec2(1)),0).rgb;
++}
++float iris26903JinColorDistance(vec3 a,vec3 b){
++    vec3 d=a-b;return sqrt(dot(d,d)/3.0);
++}
++vec3 iris26903ApplyJin(ivec2 op,vec3 nativeP3){
++    vec2 f=(vec2(op)+vec2(0.5))*vec2(uNightBJinSize)/vec2(uOutputSize)-vec2(0.5);
++    f=clamp(f,vec2(0.0),vec2(uNightBJinSize)-vec2(1.0));
++    ivec2 lo=ivec2(floor(f)),hi=min(lo+ivec2(1),uNightBJinSize-ivec2(1));
++    vec2 t=fract(f);
++    ivec2 q0=lo,q1=ivec2(hi.x,lo.y),q2=ivec2(lo.x,hi.y),q3=hi;
++    vec3 d0=iris26903JinResidual(q0),d1=iris26903JinResidual(q1);
++    vec3 d2=iris26903JinResidual(q2),d3=iris26903JinResidual(q3);
++    vec3 bil=mix(mix(d0,d1,t.x),mix(d2,d3,t.x),t.y);
++    float y=irisLuma(nativeP3);
++    float nativeEdge=max(abs(dFdx(y)),abs(dFdy(y)));
++    vec3 g0=iris26903JinGuide(q0),g1=iris26903JinGuide(q1);
++    vec3 g2=iris26903JinGuide(q2),g3=iris26903JinGuide(q3);
++    float span=max(max(iris26903JinColorDistance(g0,g1),
++                       iris26903JinColorDistance(g0,g2)),
++                   max(max(iris26903JinColorDistance(g0,g3),
++                           iris26903JinColorDistance(g1,g2)),
++                       max(iris26903JinColorDistance(g1,g3),
++                           iris26903JinColorDistance(g2,g3))));
++    float gate=max(smoothstep(0.025,0.120,nativeEdge),
++                   smoothstep(0.060,0.200,span));
++    vec3 reduced=bil;
++    if(gate>0.0001){
++        ivec2 center=clamp(ivec2(floor(f+vec2(0.5))),ivec2(0),uNightBJinSize-ivec2(1));
++        vec3 sum=vec3(0.0);float weight=0.0;
++        for(int yy=-1;yy<=1;yy++)for(int xx=-1;xx<=1;xx++){
++            ivec2 q=center+ivec2(xx,yy);
++            if(any(lessThan(q,ivec2(0)))||any(greaterThanEqual(q,uNightBJinSize)))continue;
++            vec2 dist=vec2(q)-f;
++            vec3 compatDiff=nativeP3-iris26903JinGuide(q);
++            float wd=1.0/(1.0+dot(dist,dist));
++            float wc=1.0/(1.0+80.0*dot(compatDiff,compatDiff)/3.0);
++            float w=wd*wc;
++            sum+=w*iris26903JinResidual(q);weight+=w;
++        }
++        if(weight>1.0e-8){
++            vec3 mean=sum/weight;
++            for(int c=0;c<3;c++){
++                float before=bil[c],now=mean[c];
++                if(before!=0.0&&abs(now)<abs(before))
++                    reduced[c]=before*now<=0.0?0.0:now;
++            }
++        }
++    }
++    vec3 rr=mix(bil,reduced,gate);
++    rr=clamp(rr,-abs(bil),abs(bil));
++    return clamp(nativeP3+rr,vec3(0.0),vec3(1.0));
++}
++vec3 iris26903P3Decode(vec3 encoded){
++    return vec3(encoded.r<=0.04045?encoded.r/12.92:pow((encoded.r+0.055)/1.055,2.4),
++                encoded.g<=0.04045?encoded.g/12.92:pow((encoded.g+0.055)/1.055,2.4),
++                encoded.b<=0.04045?encoded.b/12.92:pow((encoded.b+0.055)/1.055,2.4));
++}
+ uint irisByte(float x){return uint(clamp(floor(clamp(x,0.0,1.0)*255.0+0.5),0.0,255.0));}
+ void main(){
+     ivec2 local=ivec2(gl_FragCoord.xy);
+@@ -424,6 +498,22 @@ void main(){
+             if(wm.a>0.0)encoded=mix(encoded,iris26876WatermarkP3(wm.rgb),wm.a);
+         }
+     }
++    if(uNightBJinEnabled!=0){
++        vec3 nativeEncoded=encoded;
++        encoded=iris26903ApplyJin(op,encoded);
++        if(uGenerateGain!=0){
++            /* Preserve the old linear HDR target after Jin moves the SDR.
++             * This is identical in intent to existing IrisNightUltraHdr rebase. */
++            const float off=0.015625;
++            float safeMax=max(uGainMax,1.001);
++            float contentMax=clamp(uGainContentMax,1.0,safeMax);
++            float oldRatio=exp2((float(gainCode)/255.0)*log2(safeMax));
++            float pre=max(irisLuma(iris26903P3Decode(nativeEncoded)),0.0);
++            float fin=max(irisLuma(iris26903P3Decode(encoded)),0.0);
++            float newRatio=clamp(oldRatio*(pre+off)/(fin+off),1.0,contentMax);
++            gainCode=irisByte(log2(newRatio)/max(log2(safeMax),1.0e-6));
++        }
++    }
+     uvec4 outv=uvec4(irisByte(encoded.r),irisByte(encoded.g),irisByte(encoded.b),gainCode);
+     oBFinalP3Gain=vec4(outv)/255.0;
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 582f18ae2a8e9e871f8ab3a83510cdaf4aec4597..d3792b3b1dbc7d129242409beaa4f2ca5b7a5512 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -7986,6 +7986,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private boolean mIrisNight26540Binning = false;
+     private String mIrisNight26540CameraId = "0";
+     private IrisMotionSettings.Snapshot mIrisNight26540IrisSettings = null;
++    /* IRIS_26903_NIGHT_B_SHUTTER_FROZEN_OWNER, never shared with Motion or Spektra. */
++    private boolean mIrisNight26903ExperimentB = false;
++    private com.particlesdevs.photoncamera.control.IrisZoomController.ZoomSnapshot mIrisNight26903Zoom;
++    private IrisMotionSettings.DngOptions.Snapshot mIrisNight26903DngOptions;
++    private int mIrisNight26903Align = 0;
+     private CameraCharacteristics mIrisNight26540Characteristics = null;
+     private int mIrisNight26540Rotation = 0;
+     private static final String IRIS_26541_NIGHT_SHORT_TAG = "IRIS_26541_NIGHT_SHORT";
+@@ -8061,7 +8066,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     private void prepareIrisNight26540CaptureState(IrisNightFrameSelector.Plan framePlan, int saveRaw,
+             boolean superRes, boolean heicOutput, boolean aspect169, boolean energySaving, boolean watermark,
+             boolean binning, String cameraId, IrisMotionSettings.Snapshot irisSettings,
+-            CameraCharacteristics characteristics, int rotation) {
++            CameraCharacteristics characteristics, int rotation,
++            boolean nightB, com.particlesdevs.photoncamera.control.IrisZoomController.ZoomSnapshot nightBZoom,
++            IrisMotionSettings.DngOptions.Snapshot nightBDngOptions, int nightBAlign) {
+         if (framePlan == null) throw new IllegalArgumentException("26552 Night frozen frame plan is null");
+         final int expectedFrames = framePlan.totalFrames;
+         if (expectedFrames < IrisNightFrameSelector.MIN_NIGHT_FRAMES
+@@ -8086,18 +8093,24 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             mIrisNight26540Dispatched = false;
+             mIrisNight26540SaveRaw = saveRaw;
+             mIrisNight26540SuperRes = superRes;
+-            mIrisNight26636Heic = heicOutput && !superRes;
++            mIrisNight26636Heic = heicOutput && (!superRes || nightB);
+             mIrisNight26540Aspect169 = aspect169;
+             mIrisNight26540EnergySaving = energySaving;
+             mIrisNight26540Watermark = watermark;
+             mIrisNight26540Binning = binning;
+             mIrisNight26540CameraId = cameraId == null ? "0" : cameraId;
+             mIrisNight26540IrisSettings = irisSettings;
++            mIrisNight26903ExperimentB = nightB;
++            mIrisNight26903Zoom = nightBZoom;
++            mIrisNight26903DngOptions = nightBDngOptions;
++            mIrisNight26903Align = nightBAlign;
+             mIrisNight26540Characteristics = characteristics;
+             mIrisNight26540Rotation = rotation;
+-            if (mIrisNight26540IrisSettings == null || mIrisNight26540IrisSettings.customNoiseModelEnabled
+-                    || mIrisNight26540Characteristics == null) {
+-                throw new IllegalStateException("26540 Night requires frozen exact-Camera2 Iris settings");
++            if (mIrisNight26540IrisSettings == null ||
++                    (!nightB && mIrisNight26540IrisSettings.customNoiseModelEnabled) ||
++                    mIrisNight26540Characteristics == null ||
++                    (nightB && (nightBZoom == null || nightBDngOptions == null || framePlan.longFrames != 0))) {
++                throw new IllegalStateException("26903 Night frozen owner/settings invalid");
+             }
+             mIrisNight26540CaptureActive = true;
+             CaptureController.isProcessing = true;
+@@ -8334,7 +8347,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     /* IRIS_26540_NIGHT_EXACT_FRAME_METADATA_OWNER */
+     private static void populateIrisNight26540FrameMetadata(@NonNull ImageFrame frame,
+             @NonNull TotalCaptureResult result, @NonNull CaptureRequest request,
+-            @NonNull CameraCharacteristics characteristics) {
++            @NonNull CameraCharacteristics characteristics, boolean nightB) {
+         Long exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+         Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+         Long ts = result.get(CaptureResult.SENSOR_TIMESTAMP);
+@@ -8414,7 +8427,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             frame.motionV2NoiseS = (n[0] + 0.5f * (n[2] + n[4]) + n[6]) / 3.0f;
+             frame.motionV2NoiseO = (n[1] + 0.5f * (n[3] + n[5]) + n[7]) / 3.0f;
+         }
+-        if (!frame.motionV2BlackLevelValid || !frame.motionV2WhiteLevelValid || !valid) {
++        if (!frame.motionV2BlackLevelValid || !frame.motionV2WhiteLevelValid || (!nightB && !valid)) {
+             throw new IllegalStateException("26540 Night exact sensor metadata incomplete timestamp=" + ts);
+         }
+     }
+@@ -8436,7 +8449,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 if (mIrisNight26540Results.containsKey(frame.timestamp)
+                         && mIrisNight26540Requests.containsKey(frame.timestamp)) matchedCount++;
+             }
+-            if (matchedCount >= 2) {
++            if (matchedCount >= 2 && (!mIrisNight26903ExperimentB || matchedCount == requestedCount)) {
+                 // IRIS_26554_NIGHT_ACTUAL_DELIVERED_ROLE_RECOVERY
+                 // The slider is the immutable requested maximum. If the HAL truly delivers fewer
+                 // exact RAW/result/request pairs after the bounded drain, process that exact
+@@ -8497,7 +8510,23 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     TotalCaptureResult exact = mIrisNight26540Results.get(frame.timestamp);
+                     CaptureRequest exactRequest = mIrisNight26540Requests.get(frame.timestamp);
+                     populateIrisNight26540FrameMetadata(frame, exact, exactRequest,
+-                            mIrisNight26540Characteristics);
++                            mIrisNight26540Characteristics, mIrisNight26903ExperimentB);
++                    if (mIrisNight26903ExperimentB) {
++                        if (frame.motionV2FrameRole != ImageFrame.MotionV2FrameRole.NORMAL)
++                            throw new IllegalStateException("26903 Night B captured non-NORMAL frame");
++                        /* IRIS_26903_NIGHT_B_PHYSICAL_FRAME_OWNER: the ordinary B
++                         * native RAW ingress requires every NORMAL frame to carry
++                         * its actual Camera2 physical owner. Night A does not
++                         * previously populate or use this field. Fail closed if
++                         * the captured physical lens differs from shutter freeze. */
++                        final String actualPhysical26903 = iris26754PhysicalCameraId(exact);
++                        if (actualPhysical26903 == null || mIrisNight26903Zoom == null
++                                || !actualPhysical26903.equals(mIrisNight26903Zoom.ownerCameraId))
++                            throw new IllegalStateException(
++                                    "26903 Night B actual frame physical camera drift");
++                        frame.motionV2PhysicalCameraId = actualPhysical26903;
++                        frame.motionV2ReconstructionExperiment26856 = "B";
++                    }
+                     frame.irisNightExactCaptureResult = exact;
+                     frame.irisNightExactCaptureRequest = exactRequest;
+                 }
+@@ -8541,7 +8570,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                         mIrisNight26540SaveRaw, mIrisNight26540SuperRes, mIrisNight26636Heic,
+                         mIrisNight26540Aspect169, mIrisNight26540EnergySaving,
+                         mIrisNight26540Watermark, mIrisNight26540Binning,
+-                        mIrisNight26540CameraId, mIrisNight26540IrisSettings);
++                        mIrisNight26540CameraId, mIrisNight26540IrisSettings,
++                        mIrisNight26903ExperimentB, mIrisNight26903Zoom,
++                        mIrisNight26903DngOptions, mIrisNight26903Align);
+                 mIrisNight26540Dispatched = true;
+                 mIrisNight26540CaptureActive = false;
+                 mIrisNight26540Frames.clear();
+@@ -8586,7 +8617,10 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             processExecutor.execute(() -> {
+                 Log.processState(TAG, "NIGHT_PROCESSOR_THREAD_ENTER");
+                 Log.critical(TAG, "IRIS_26544_NIGHT_PROCESSOR_ENTER frames=" + batch.frames.size());
+-                IrisNightProcessor.process(batch, cameraEventsListener);
++                if (batch.experimentB)
++                    com.particlesdevs.photoncamera.processing.processor.IrisNightBProcessor26903.process(
++                            batch, cameraEventsListener);
++                else IrisNightProcessor.process(batch, cameraEventsListener);
+             });
+         } catch (Throwable dispatchFailure) {
+             for (ImageFrame frame : batch.frames) {
+@@ -11802,20 +11836,38 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             final boolean iris26540EnergySaving = iris26540ShutterSettings.energySaving;
+             final boolean iris26540Binning = iris26540ShutterSettings.binning;
+             final String iris26540CameraId = iris26540ShutterSettings.mCameraID;
++            /* IRIS_26903_NIGHT_B_SELECT_ONLY_IN_NIGHT at one shutter, same per-lens selector as Motion. */
++            final boolean iris26903NightB = iris26533CaptureMode == CameraMode.NIGHT &&
++                    com.particlesdevs.photoncamera.settings.Iris26856ABSettings.read(
++                            PhotonCamera.getApplicationContextStatic(), physicalID,
++                            iris26540CameraId) ==
++                    com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855;
++            final com.particlesdevs.photoncamera.control.IrisZoomController.ZoomSnapshot iris26903NightZoom =
++                    iris26903NightB ? com.particlesdevs.photoncamera.control.IrisZoomController.snapshot() : null;
++            if (iris26903NightB && (iris26903NightZoom == null
++                    || iris26903NightZoom.ownerCameraId == null
++                    || !iris26903NightZoom.ownerCameraId.equals(physicalID))) {
++                throw new IllegalStateException("26903 Night B requested physical lens differs from committed zoom owner");
++            }
++            final IrisMotionSettings.DngOptions.Snapshot iris26903NightDng =
++                    iris26903NightB ? IrisMotionSettings.DngOptions.current() : null;
+             final boolean iris26540SuperRes = iris26533CaptureMode == CameraMode.NIGHT
+                     && PreferenceKeys.isIrisSuperResOn();
+             final boolean iris26636HeicOutput = iris26533CaptureMode == CameraMode.NIGHT
+-                    && !iris26540SuperRes
++                    && (iris26903NightB || !iris26540SuperRes)
+                     && PreferenceKeys.isIrisHeicOutputOn()
+                     && com.particlesdevs.photoncamera.processing.ultrahdr.IrisHardwareHevcEncoder.isHeicUltraHdrAvailable();
+             final boolean iris26540Watermark = iris26533CaptureMode == CameraMode.NIGHT
+                     && PreferenceKeys.isShowWatermarkOn();
+             final IrisMotionSettings.Snapshot iris26540IrisSettings =
+                     iris26533CaptureMode == CameraMode.NIGHT
+-                            ? IrisMotionSettings.exactCamera2NightSnapshot() : null;
++                            ? (iris26903NightB ? IrisMotionSettings.current() :
++                                    IrisMotionSettings.exactCamera2NightSnapshot()) : null;
+             final IrisNightFrameSelector.Plan iris26552NightFramePlan =
+                     iris26533CaptureMode == CameraMode.NIGHT
+-                            ? IrisNightFrameSelector.freezePlan(iris26540RequestedFrames) : null;
++                            ? (iris26903NightB
++                                ? IrisNightFrameSelector.freezeNormalOnlyB(iris26540RequestedFrames)
++                                : IrisNightFrameSelector.freezePlan(iris26540RequestedFrames)) : null;
+             final IrisNightExposureSelector.Plan iris26540NightPlan =
+                     iris26533CaptureMode == CameraMode.NIGHT
+                             ? IrisNightExposureSelector.freezePlan(
+@@ -11889,6 +11941,21 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             //int rotation = Interface.getGravity().getCameraRotation();//activity.getWindowManager().getDefaultDisplay().getRotation();
+             captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, PhotonCamera.getGravity().getCameraRotation(mSensorOrientation));
+             VendorTagUtils.builderSessionApply(captureBuilder, true, useMaximumResolutionKey, physicalID);
++            if (iris26903NightB) {
++                /* IRIS_26903_NIGHT_B_CAPTURE_ZOOM: Night A request remains untouched.
++                 * Apply the same current-B Camera2 hardware crop to the fresh Night
++                 * still request, preserving the frozen physical lens and all N frames.
++                 * The original B residual software zoom is applied once at B render. */
++                float requestResidual = IrisZoomController.applyToRequest(
++                        captureBuilder, mCameraCharacteristics, physicalID);
++                if (!Float.isFinite(requestResidual) || requestResidual < 1.0f
++                        || Math.abs(requestResidual - iris26903NightZoom.residualSoftwareZoom) > 0.15f)
++                    throw new IllegalStateException("26903 Night B hardware/software zoom mismatch at shutter");
++                Log.i(TAG, "IRIS_26903_NIGHT_B_FROZEN_CAPTURE_ZOOM global="
++                        + iris26903NightZoom.globalZoom + " local="
++                        + iris26903NightZoom.outputLocalZoom + " hardware="
++                        + iris26903NightZoom.hardwareLocalZoom + " residual=" + requestResidual);
++            }
+             /* IRIS_26855_OPTIONAL_SENSOR_DEFECT_METADATA_REQUEST
+              * Map request never changes HAL's RAW pixel correction or AE.
+              * Absent/unsupported device data leaves the burst detector intact. */
+@@ -11913,7 +11980,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                 prepareIrisNight26540CaptureState(iris26552NightFramePlan, iris26540SaveRaw,
+                         iris26540SuperRes, iris26636HeicOutput, iris26540Aspect169, iris26540EnergySaving,
+                         iris26540Watermark, iris26540Binning, iris26540CameraId,
+-                        iris26540IrisSettings, mCameraCharacteristics, cameraRotation);
++                        iris26540IrisSettings, mCameraCharacteristics, cameraRotation,
++                        iris26903NightB, iris26903NightZoom, iris26903NightDng,
++                        iris26540AlignAlgorithm);
+                 releaseIrisNight26553ShutterDispatch("capture_state_active");
+                 iris26553NightDispatchReserved = false;
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+index a2fb838b5edb2686ee206f52b9a8f6e0fe1e3ba0..6bd8e488b02df099d1ec093410857d3d7c89ae14 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ImageSaver.java
+@@ -426,6 +426,20 @@ public class ImageSaver {
+                 com.particlesdevs.photoncamera.processing.render.Parameters params,
+                 Point crop,IrisMotionSettings.Snapshot tone,boolean watermarkEnabled,
+                 float[] exactWhiteBalance,float clipYFloor){
++            return saveB26876SuperResGpuHeic(fileToSave,preview,quality,exif,
++                    source2x,finalGuide1x,params,crop,tone,watermarkEnabled,
++                    exactWhiteBalance,clipYFloor,null);
++        }
++
++        public static boolean saveB26876SuperResGpuHeic(
++                Path fileToSave,Bitmap preview,int quality,
++                ParseExif.ExifData exif,
++                com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier source2x,
++                com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier finalGuide1x,
++                com.particlesdevs.photoncamera.processing.render.Parameters params,
++                Point crop,IrisMotionSettings.Snapshot tone,boolean watermarkEnabled,
++                float[] exactWhiteBalance,float clipYFloor,
++                IrisNightNeuralEnhancer.True2xResidual nightBFullJin){
+             if(fileToSave==null||preview==null||preview.isRecycled()||exif==null||quality!=98)
+                 return false;
+             exif.COMPRESSION=String.valueOf(quality);
+@@ -433,7 +447,7 @@ public class ImageSaver {
+             try{
+                 published=MotionV2Jpeg444Encoder.writeB26876True2xGpuHeic(
+                     fileToSave,preview,source2x,finalGuide1x,params,crop,tone,
+-                    watermarkEnabled,exactWhiteBalance,clipYFloor,exif);
++                    watermarkEnabled,exactWhiteBalance,clipYFloor,exif,nightBFullJin);
+                 if(published){
+                     if(!preview.isRecycled())preview.recycle();
+                     iris26642ScheduleUltraHdrDecodeProof(fileToSave,"HEIC");
+@@ -460,6 +474,20 @@ public class ImageSaver {
+                 com.particlesdevs.photoncamera.processing.render.Parameters parameters,
+                 Point cropSize, IrisMotionSettings.Snapshot toneSettings, boolean watermarkEnabled,
+                 float[] exactClippingWhiteBalance, float exactClippingYFloor) {
++            return saveB26876SuperResGpuJpeg(fileToSave,preview,jpgQuality,exifData,
++                    source2x,finalGuide1x,parameters,cropSize,toneSettings,watermarkEnabled,
++                    exactClippingWhiteBalance,exactClippingYFloor,null);
++        }
++
++        public static boolean saveB26876SuperResGpuJpeg(
++                Path fileToSave, Bitmap preview, int jpgQuality,
++                ParseExif.ExifData exifData,
++                com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier source2x,
++                com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier finalGuide1x,
++                com.particlesdevs.photoncamera.processing.render.Parameters parameters,
++                Point cropSize, IrisMotionSettings.Snapshot toneSettings, boolean watermarkEnabled,
++                float[] exactClippingWhiteBalance, float exactClippingYFloor,
++                IrisNightNeuralEnhancer.True2xResidual nightBFullJin) {
+             if(fileToSave==null||preview==null||preview.isRecycled()||exifData==null||
+                 jpgQuality!=98||source2x==null||finalGuide1x==null||
+                 parameters==null||!parameters.motionV2SuperResOutputEnabled||
+@@ -475,7 +503,8 @@ public class ImageSaver {
+                 long start=System.nanoTime();
+                 encoderWritten=MotionV2Jpeg444Encoder.writeB26876True2xGpu(
+                     fileToSave,preview,source2x,finalGuide1x,parameters,cropSize,
+-                    toneSettings,watermarkEnabled,exactClippingWhiteBalance,exactClippingYFloor);
++                    toneSettings,watermarkEnabled,exactClippingWhiteBalance,exactClippingYFloor,
++                    nightBFullJin);
+                 if(!encoderWritten)return false;
+                 final long jpegMs=(System.nanoTime()-start)/1_000_000L;
+                 // Preserve the exact successful 26875 EXIF writer, including
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
+index be7ff76f1436c738348cb7b34645a54842743722..08532973d066a6e80b945cb0e1bf05b6bc661ac3 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/IrisNightBatch.java
+@@ -5,6 +5,8 @@ import android.hardware.camera2.CaptureRequest;
+ import android.hardware.camera2.TotalCaptureResult;
+ 
+ import com.particlesdevs.photoncamera.control.GyroBurst;
++import com.particlesdevs.photoncamera.control.IrisZoomController;
++import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings;
+ import com.particlesdevs.photoncamera.processing.parameters.IrisNightFrameSelector;
+ 
+ import java.util.ArrayList;
+@@ -48,6 +50,11 @@ public final class IrisNightBatch {
+     public final boolean binning;
+     public final String cameraId;
+     public final com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.Snapshot irisSettings;
++    /* IRIS_26903_NIGHT_B_FROZEN_ISOLATION: these fields are inert for A Night. */
++    public final boolean experimentB;
++    public final IrisZoomController.ZoomSnapshot nightBZoom;
++    public final IrisMotionSettings.DngOptions.Snapshot nightBDngOptions;
++    public final int nightBAlignAlgorithm;
+ 
+     public IrisNightBatch(
+             List<ImageFrame> frames,
+@@ -69,7 +76,9 @@ public final class IrisNightBatch {
+             boolean watermarkEnabled,
+             boolean binning,
+             String cameraId,
+-            com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.Snapshot irisSettings) {
++            com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.Snapshot irisSettings,
++            boolean experimentB, IrisZoomController.ZoomSnapshot nightBZoom,
++            IrisMotionSettings.DngOptions.Snapshot nightBDngOptions, int nightBAlignAlgorithm) {
+         if (frames == null || frames.size() < 2)
+             throw new IllegalArgumentException("26541 NightBatch requires at least two exact RAW frames");
+         if (results == null || requests == null || characteristics == null)
+@@ -105,7 +114,8 @@ public final class IrisNightBatch {
+                 throw new IllegalArgumentException("26541 NightBatch timestamp mismatch image=" + frame.timestamp
+                         + " result=" + resultTimestamp);
+             if (frame.motionV2ActualExposureNs <= 0L || frame.motionV2ActualIso <= 0
+-                    || !frame.motionV2NoiseProfileValid || !frame.motionV2BlackLevelValid
++                    || (!experimentB && !frame.motionV2NoiseProfileValid)
++                    || !frame.motionV2BlackLevelValid
+                     || !frame.motionV2WhiteLevelValid)
+                 throw new IllegalArgumentException("26541 NightBatch exact radiometric metadata missing timestamp=" + frame.timestamp);
+             if (frame.motionV2FrameRole == ImageFrame.MotionV2FrameRole.HIGHLIGHT_SHORT)
+@@ -155,16 +165,31 @@ public final class IrisNightBatch {
+         this.degradedBracket = shortCount != requestedShortFrames || longCount != requestedLongFrames;
+         this.saveRaw = saveRaw;
+         this.superResEnabled = superResEnabled;
+-        if (superResEnabled && heicOutputEnabled)
+-            throw new IllegalArgumentException("26636 Night HEIC must never coexist with Super Res");
++        if (!experimentB && superResEnabled && heicOutputEnabled)
++            throw new IllegalArgumentException("26636 Night A HEIC must never coexist with Super Res");
+         this.heicOutputEnabled = heicOutputEnabled;
+         this.aspect169 = aspect169;
+         this.energySaving = energySaving;
+         this.watermarkEnabled = watermarkEnabled;
+         this.binning = binning;
+         this.cameraId = cameraId == null ? "0" : cameraId;
+-        if (irisSettings == null || irisSettings.customNoiseModelEnabled)
+-            throw new IllegalArgumentException("26541 NightBatch requires exact-Camera2 Iris settings");
++        if (irisSettings == null || (!experimentB && irisSettings.customNoiseModelEnabled))
++            throw new IllegalArgumentException("26541 NightBatch invalid Iris setting provenance");
++        if (experimentB) {
++            if (nightBZoom == null || nightBDngOptions == null || longCount != 0 ||
++                    requestedLongFrames != 0 || requestedShortFrames != frameBudget ||
++                    shortCount != frameBudget || !"B".equals(reference.motionV2ReconstructionExperiment26856))
++                throw new IllegalArgumentException("26903 Night B freeze requires exact NORMAL B burst");
++            for (ImageFrame frame : ordered) {
++                if (frame.motionV2FrameRole != ImageFrame.MotionV2FrameRole.NORMAL ||
++                        !"B".equals(frame.motionV2ReconstructionExperiment26856))
++                    throw new IllegalArgumentException("26903 Night B mixed owner or roles");
++            }
++        }
+         this.irisSettings = irisSettings;
++        this.experimentB = experimentB;
++        this.nightBZoom = nightBZoom;
++        this.nightBDngOptions = nightBDngOptions;
++        this.nightBAlignAlgorithm = nightBAlignAlgorithm;
+     }
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+index 8c4af0e3caac12cededc1440c8a86b6ca7c2ad93..a243ab02de4999fb37cb583f34022ae5b314b098 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/PostPipeline.java
+@@ -340,7 +340,7 @@ public class PostPipeline extends GLBasePipeline {
+     public Bitmap Run(ByteBuffer inBuffer, Parameters parameters) {
+         mParameters = parameters;
+         mSettings = mParameters.irisNightActive ? null : PhotonCamera.getSettings();
+-        motionV2WatermarkEnabled = mParameters.irisNightActive
++        motionV2WatermarkEnabled = (mParameters.irisNightActive || mParameters.iris26903NightB)
+                 ? mParameters.irisNightWatermarkEnabled
+                 : (mSettings != null && mSettings.watermark);
+         workSize = new Point(mParameters.rawSize.x, mParameters.rawSize.y);
+@@ -376,7 +376,7 @@ public class PostPipeline extends GLBasePipeline {
+         }
+         Point rawSliced = parameters.rawSize;
+         cropSize = new Point(parameters.rawSize);
+-        final boolean iris26540Aspect169 = mParameters.irisNightActive
++        final boolean iris26540Aspect169 = (mParameters.irisNightActive || mParameters.iris26903NightB)
+                 ? mParameters.irisNightAspect169 : PhotonCamera.getSettings().aspect169;
+         if (iris26540Aspect169) {
+             if (rawSliced.x > rawSliced.y) {
+@@ -387,7 +387,7 @@ public class PostPipeline extends GLBasePipeline {
+             cropSize =  new Point(rawSliced);
+         }
+         Point rotatedSize = getRotatedCoords(rawSliced);
+-        final boolean iris26540EnergySaving = mParameters.irisNightActive
++        final boolean iris26540EnergySaving = (mParameters.irisNightActive || mParameters.iris26903NightB)
+                 ? mParameters.irisNightEnergySaving : PhotonCamera.getSettings().energySaving;
+         if (iris26540EnergySaving || mParameters.rawSize.x * mParameters.rawSize.y < ResolutionSolution.smallRes) {
+             GLDrawParams.TileSize = 8;
+@@ -439,7 +439,8 @@ public class PostPipeline extends GLBasePipeline {
+                     + " maxRatio=" + motionV2GainMapMaxRatio
+                     + " attachedPreJin=false postJinRebaseRequired=true");
+         }
+-        if (mParameters.motionV2Active && motionV2GainMapBitmap != null) {
++        if (mParameters.motionV2Active && !mParameters.iris26903NightB
++                && motionV2GainMapBitmap != null) {
+             boolean attached = MotionV2UltraHdr.attachMotion(
+                     res,
+                     motionV2GainMapBitmap,
+@@ -635,7 +636,10 @@ public class PostPipeline extends GLBasePipeline {
+              * Manual Iris Exposure/Shadows/Contrast remain independent of the automatic
+              * viewfinder match and operate afterward on the common extended-linear source.
+              */
+-            IrisMotionSettings.Snapshot irisMotionSettings = IrisMotionSettings.current();
++            IrisMotionSettings.Snapshot irisMotionSettings = mParameters.iris26903NightB
++                    ? mParameters.iris26903NightBFrozenSettings : IrisMotionSettings.current();
++            if (irisMotionSettings == null)
++                throw new IllegalStateException("26903 Night B missing frozen tone snapshot");
+             motionV2ToneSettingsSnapshot = irisMotionSettings;
+             // Native B needs the inherited presentation owner even with neutral
+             // manual controls: the optional automatic toe is decided at RUN
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java
+index f08f9149a22e6e17a2f5bb2da665a15678bdedf4..b93b3c6cb8ba357472ad48a1d60346f1e4a7267c 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightFrameSelector.java
+@@ -14,7 +14,7 @@ public final class IrisNightFrameSelector {
+         public final int shortFrames;
+         public final int longFrames;
+ 
+-        private Plan(int totalFrames, int shortFrames, int longFrames) {
++        private Plan(int totalFrames, int shortFrames, int longFrames, boolean bNormalOnly) {
+             if (totalFrames < MIN_NIGHT_FRAMES || totalFrames > MAX_NIGHT_FRAMES)
+                 throw new IllegalArgumentException("26552 Night total out of range=" + totalFrames);
+             if (shortFrames < 2 || longFrames < 0 || shortFrames + longFrames != totalFrames)
+@@ -22,8 +22,10 @@ public final class IrisNightFrameSelector {
+                         + " long=" + longFrames + " total=" + totalFrames);
+             if (totalFrames == 2 && longFrames != 0)
+                 throw new IllegalArgumentException("26552 two-frame Night must be 2 SHORT + 0 LONG");
+-            if (totalFrames >= 3 && longFrames < 1)
+-                throw new IllegalArgumentException("26552 Night >=3 frames requires LONG evidence");
++            if (!bNormalOnly && totalFrames >= 3 && longFrames < 1)
++                throw new IllegalArgumentException("26552 Night A >=3 frames requires LONG evidence");
++            if (bNormalOnly && (shortFrames != totalFrames || longFrames != 0))
++                throw new IllegalArgumentException("26903 Night B requires exactly N NORMAL frames");
+             this.totalFrames = totalFrames;
+             this.shortFrames = shortFrames;
+             this.longFrames = longFrames;
+@@ -46,7 +48,13 @@ public final class IrisNightFrameSelector {
+         final int total = clampNightFrames(requestedMaximum);
+         // round(N/5) for integer N, written without floating-point ambiguity.
+         final int longFrames = total == 2 ? 0 : Math.max(1, (total + 2) / 5);
+-        return new Plan(total, total - longFrames, longFrames);
++        return new Plan(total, total - longFrames, longFrames, false);
++    }
++
++    /** Only Night-selected B uses the Photo B N-NORMAL budget, never Night A LONG. */
++    public static Plan freezeNormalOnlyB(int selectedBFrameCount) {
++        final int n = clampNightFrames(selectedBFrameCount);
++        return new Plan(n, n, 0, true);
+     }
+ 
+     public static int getFrames(int requestedMaximum) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+index 57eda4fca92fc07c791ef16b3a6ca3512ecc74f7..cb960c24cde0cbefb12ff4417d5980c0d72f6dfe 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java
+@@ -57,6 +57,24 @@ public class HdrxProcessor extends ProcessorBase {
+     private boolean mMotion26636HeicOutputEnabled = false;
+     private boolean mMotion26702LocalLaplacianEnabled = true;
+     private IrisMotionSettings.DngOptions.Snapshot mMotion26786DngOptions = IrisMotionSettings.DngOptions.defaults();
++    /* IRIS_26903_NIGHT_B_ONLY: distinct frozen Night subowner, never set in Photo Motion. */
++    private boolean mIris26903NightB = false;
++    private boolean mIris26903NightBWatermark = false;
++    private boolean mIris26903NightBAspect169 = false;
++    private boolean mIris26903NightBEnergySaving = false;
++    private IrisMotionSettings.Snapshot mIris26903NightBFrozenSettings;
++    private com.particlesdevs.photoncamera.processing.processor.IrisNightNeuralEnhancer.True2xResidual
++            mIris26903NightBJin2x;
++    public void configureIris26903NightB(IrisMotionSettings.Snapshot snapshot,
++            boolean watermark, boolean aspect169, boolean energySaving) {
++        if (cameraMode != CameraMode.MOTION || snapshot == null)
++            throw new IllegalArgumentException("26903 Night B requires isolated Motion/B adapter");
++        mIris26903NightB = true;
++        mIris26903NightBFrozenSettings = snapshot;
++        mIris26903NightBWatermark = watermark;
++        mIris26903NightBAspect169 = aspect169;
++        mIris26903NightBEnergySaving = energySaving;
++    }
+     /* IRIS_26564_TRUE2X_EXCEPTION_CLEANUP_OWNER
+      * Bridge handoff transfers disk-backed true-2x carriers to HdrxProcessor. These processor-level
+      * references let Run() clean them on every exception path. Deferred DNG explicitly clears its
+@@ -155,6 +173,7 @@ public class HdrxProcessor extends ProcessorBase {
+         mIris26876BExactClipYFloor = 0f;
+         mIrisDngIndependentAttempted = false;
+         mIrisDngIndependentSaved = false;
++        mIris26903NightBJin2x = null;
+ 
+         Log.d(TAG, "HdrxProcessor called start()");
+         Run();
+@@ -416,6 +435,16 @@ private void ApplyHdrX() {
+             processingParameters.motionV2LocalLaplacianToneEnabled =
+                     mMotion26702LocalLaplacianEnabled;
+             processingParameters.motionV2DngOptions26786 = mMotion26786DngOptions;
++            if (mIris26903NightB) {
++                if (mIris26903NightBFrozenSettings == null)
++                    throw new IllegalStateException("26903 missing frozen B Night settings");
++                processingParameters.iris26903NightB = true;
++                processingParameters.iris26903NightBFrozenSettings = mIris26903NightBFrozenSettings;
++                /* These are capture-owned flags, not mutable Photo preferences. */
++                processingParameters.irisNightWatermarkEnabled = mIris26903NightBWatermark;
++                processingParameters.irisNightAspect169 = mIris26903NightBAspect169;
++                processingParameters.irisNightEnergySaving = mIris26903NightBEnergySaving;
++            }
+             Log.i(TAG, "IRIS_26702_LOCAL_LAPLACIAN_PROCESSING_SNAPSHOT frozen="
+                     + mMotion26702LocalLaplacianEnabled
+                     + " livePreferenceDiagnosticOnly=" + IrisMotionSettings.isLocalLaplacianToneEnabled()
+@@ -1297,6 +1326,46 @@ private void ApplyHdrX() {
+         }
+ 
+         img = overlay(img, pipeline.debugData.toArray(new Bitmap[0]));
++        /* IRIS_26903_NIGHT_B_POST_B_ONLY_JIN.
++         * Independent B stacked-DNG publication already finished in the bridge BEFORE
++         * B GPU reconstruction. RAW-only returned there and never enters this renderer.
++         * The normal B Photo/Jin-free path is byte-behavior equivalent at this guard.
++         * The true2x residual must also be transferred to the private GPU final writer.
++         */
++        if (mIris26903NightB) {
++            if (saveRAW == 2 || !iris26856BRequestedOnly || img == null || img.isRecycled())
++                throw new IllegalStateException("26903 Night B only JPEG must have final B bitmap");
++            final boolean nightBFull2x = iris26856BOnly
++                    && processingParameters.motionV2SuperResOutputEnabled;
++            com.particlesdevs.photoncamera.processing.ultrahdr.IrisNightUltraHdr.Prepared
++                    nightBGain = null;
++            try {
++                if (pipeline.motionV2GainMapBitmap != null) {
++                    nightBGain = com.particlesdevs.photoncamera.processing.ultrahdr.IrisNightUltraHdr.prepare(
++                            img, pipeline.motionV2GainMapBitmap,
++                            pipeline.motionV2GainMapMaxRatio, cameraRotation);
++                    pipeline.motionV2GainMapBitmap = null;
++                }
++                final boolean nightBJinApplied;
++                if (nightBFull2x) {
++                    mIris26903NightBJin2x = IrisNightNeuralEnhancer.enhanceInPlaceForTrue2x(img);
++                    nightBJinApplied = mIris26903NightBJin2x.applied;
++                } else {
++                    nightBJinApplied = IrisNightNeuralEnhancer.enhanceInPlace(img);
++                }
++                final boolean nightBUhdr =
++                        com.particlesdevs.photoncamera.processing.ultrahdr.IrisNightUltraHdr
++                                .attachPostJin(img, nightBGain);
++                nightBGain = null;
++                Log.i(TAG, "IRIS_26903_NIGHT_B_JIN_AFTER_B applied=" + nightBJinApplied
++                        + " full50mp=" + nightBFull2x + " uHdrRebased=" + nightBUhdr
++                        + " dngPriorPublication=" + mIrisDngIndependentSaved
++                        + " photoBUnaffected=true");
++            } finally {
++                com.particlesdevs.photoncamera.processing.ultrahdr.IrisNightUltraHdr
++                        .release(nightBGain);
++            }
++        }
+         /* IRIS_26826_DNG_JPEG_OVERLAP
+          * The normalized DNG carrier is a separate immutable reconstruction sidecar. Start only
+          * after PostPipeline has finished mutating presentation Parameters, then overlap its
+@@ -1467,7 +1536,8 @@ private void ApplyHdrX() {
+                     mIris26876B2xGpuForCleanup,mIris26876B1xGuideForCleanup,
+                     processingParameters,pipeline.cropSize,
+                     pipeline.motionV2ToneSettingsSnapshot,pipeline.motionV2WatermarkEnabled,
+-                    mIris26876BExactClipWhiteBalance,mIris26876BExactClipYFloor);
++                    mIris26876BExactClipWhiteBalance,mIris26876BExactClipYFloor,
++                    mIris26903NightB ? mIris26903NightBJin2x : null);
+                 if (!imageSaved) {
+                     throw new IllegalStateException(
+                         "26876 B 50MP GPU→private JPEG/R failed; 1x legacy route forbidden");
+@@ -1478,7 +1548,8 @@ private void ApplyHdrX() {
+                     mIris26876B2xGpuForCleanup,mIris26876B1xGuideForCleanup,
+                     processingParameters,pipeline.cropSize,
+                     pipeline.motionV2ToneSettingsSnapshot,pipeline.motionV2WatermarkEnabled,
+-                    mIris26876BExactClipWhiteBalance,mIris26876BExactClipYFloor);
++                    mIris26876BExactClipWhiteBalance,mIris26876BExactClipYFloor,
++                    mIris26903NightB ? mIris26903NightBJin2x : null);
+                 if(!imageSaved)throw new IllegalStateException(
+                     "26876 B 50MP fused GPU HEIC grid failed; fallback forbidden");
+             } else if (iris26856UseHeic) {
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightBProcessor26903.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightBProcessor26903.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..521b9de5c63b130d9b360b8b17dd6890398f7fd7
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/IrisNightBProcessor26903.java
+@@ -0,0 +1,136 @@
++package com.particlesdevs.photoncamera.processing.processor;
++
++import android.hardware.camera2.CameraCharacteristics;
++import android.util.Range;
++
++import com.particlesdevs.photoncamera.api.CameraMode;
++import com.particlesdevs.photoncamera.api.ParseExif;
++import com.particlesdevs.photoncamera.capture.CaptureController;
++import com.particlesdevs.photoncamera.control.GyroBurst;
++import com.particlesdevs.photoncamera.control.IrisZoomController;
++import com.particlesdevs.photoncamera.processing.ImageFrame;
++import com.particlesdevs.photoncamera.processing.ImagePath;
++import com.particlesdevs.photoncamera.processing.IrisNightBatch;
++import com.particlesdevs.photoncamera.processing.ProcessingEventsListener;
++import com.particlesdevs.photoncamera.processing.parameters.IsoExpoSelector;
++import com.particlesdevs.photoncamera.util.Log;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++
++/**
++ * IRIS_26903_NIGHT_B_ISOLATED_SNAPSHOT_ADAPTER.
++ * The selected Night B capture is a fresh post-shutter, N NORMAL, one-exposure RAW batch.
++ * This class alone reuses the working Motion/B processor with an explicit immutable Night B
++ * context. There is NO global mode override, no Motion ZSL takeover, no Night A mutation,
++ * and no Spektra camera/session operation. All paths fail closed.
++ */
++public final class IrisNightBProcessor26903 {
++    private static final String TAG = "IrisNightBProcessor26903";
++    private IrisNightBProcessor26903() { }
++
++    public static void process(IrisNightBatch batch, ProcessingEventsListener listener) {
++        boolean handedToHdrx = false;
++        CaptureController.isProcessing = true;
++        try {
++            if (batch == null || !batch.experimentB || batch.nightBZoom == null
++                    || batch.irisSettings == null || batch.nightBDngOptions == null
++                    || batch.frames.size() != batch.frameBudget || batch.frameBudget < 2
++                    || batch.longFrameCount != 0 || batch.requestedLongFrames != 0
++                    || batch.shortFrameCount != batch.frameBudget
++                    || batch.imageFormat != CaptureController.RAW_FORMAT
++                    || batch.referenceResult == null || batch.referenceRequest == null) {
++                throw new IllegalStateException("26903 Night B requires frozen N NORMAL Camera2 RAWs");
++            }
++            final IrisZoomController.ZoomSnapshot zoom = batch.nightBZoom;
++            /* The existing Night cameraId is logical for some vendor physical cameras.
++             * The owner-vs-physical proof is performed at the actual shutter in
++             * CaptureController, never compare physical ID to logical Camera2 ID. */
++            final List<ImageFrame> frozen = batch.frames;
++            final int width = frozen.get(0).motionV2PlaneLogicalWidth;
++            final int height = frozen.get(0).motionV2PlaneLogicalHeight;
++            if (width <= 0 || height <= 0) {
++                throw new IllegalStateException("26903 invalid logical RAW dimensions");
++            }
++            Range<Long> expoBounds = batch.characteristics.get(
++                    CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE);
++            Range<Integer> isoBounds = batch.characteristics.get(
++                    CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE);
++            Integer analogMax = batch.characteristics.get(
++                    CameraCharacteristics.SENSOR_MAX_ANALOG_SENSITIVITY);
++            if (expoBounds == null || isoBounds == null) {
++                throw new IllegalStateException("26903 missing physical sensor exposure/ISO bounds");
++            }
++            long baseExposure = frozen.get(0).motionV2ActualExposureNs;
++            int baseIso = frozen.get(0).motionV2ActualIso;
++            if (baseExposure <= 0 || baseIso <= 0)
++                throw new IllegalStateException("26903 invalid Night B exposure authority");
++            ArrayList<ImageFrame> inputs = new ArrayList<>(frozen);
++            ArrayList<IsoExpoSelector.ExpoPair> pairs = new ArrayList<>();
++            ArrayList<GyroBurst> gyro = new ArrayList<>();
++            HashMap<Long, Double> exposure = new HashMap<>();
++            for (int i = 0; i < inputs.size(); i++) {
++                ImageFrame frame = inputs.get(i);
++                if (frame.motionV2FrameRole != ImageFrame.MotionV2FrameRole.NORMAL
++                        || !"B".equals(frame.motionV2ReconstructionExperiment26856)
++                        || !frame.motionV2PlaneLayoutValid
++                        || frame.motionV2PlaneLogicalWidth != width
++                        || frame.motionV2PlaneLogicalHeight != height
++                        || frame.motionV2ActualExposureNs != baseExposure
++                        || frame.motionV2ActualIso != baseIso
++                        || !batch.results.containsKey(frame.timestamp)
++                        || !batch.requests.containsKey(frame.timestamp)) {
++                    throw new IllegalStateException("26903 Night B mixed capture/geometry/ISO/exposure " + i);
++                }
++                exposure.put(frame.timestamp, frame.motionV2ExposureEnergy);
++                pairs.add(new IsoExpoSelector.ExpoPair(frame.motionV2ActualExposureNs,
++                        expoBounds.getLower(), expoBounds.getUpper(),
++                        frame.motionV2ActualIso, isoBounds.getLower(), isoBounds.getUpper(),
++                        analogMax == null ? isoBounds.getLower() : analogMax));
++                GyroBurst frameGyro = !batch.gyro.isEmpty()
++                        ? batch.gyro.get(i % batch.gyro.size()) : frame.frameGyro;
++                gyro.add(frameGyro != null ? frameGyro.clone() : new GyroBurst(1));
++            }
++            if (inputs.get(0).buffer == null) {
++                throw new IllegalStateException("26903 reference RAW must remain in memory");
++            }
++            final HdrxProcessor processor = new HdrxProcessor(listener);
++            processor.configure(batch.nightBAlignAlgorithm, batch.saveRaw, CameraMode.MOTION);
++            processor.configureIris26903NightB(batch.irisSettings,
++                    batch.watermarkEnabled, batch.aspect169, batch.energySaving);
++            Log.i(TAG, "IRIS_26903_NIGHT_B_PROCESS_ENTRY n=" + inputs.size()
++                    + " iso=" + baseIso + " exposureNs=" + baseExposure
++                    + " localZoom=" + zoom.outputLocalZoom
++                    + " sr=" + batch.superResEnabled + " raw=" + batch.saveRaw
++                    + " independentDng=true jinAfterB=true");
++            handedToHdrx = true;
++            processor.startMotion(ImagePath.newDNGFilePath(),
++                    ImagePath.newImageFilePath(),
++                    ParseExif.parse(batch.referenceResult, batch.referenceRequest),
++                    gyro, inputs, exposure, batch.imageFormat, batch.rotation,
++                    batch.characteristics, batch.referenceResult, batch.referenceRequest,
++                    pairs, null, zoom.globalZoom, zoom.opticalAnchor, zoom.outputLocalZoom,
++                    zoom.hardwareLocalZoom, zoom.residualSoftwareZoom,
++                    batch.superResEnabled, batch.heicOutputEnabled,
++                    false, /* permanent 26704 global-tone-only policy, no live preference reread */
++                    batch.nightBDngOptions,
++                    new ProcessorBase.ProcessingCallback() {
++                        @Override public void onStarted() { }
++                        @Override public void onFailed() { }
++                        @Override public void onFinished() { }
++                    });
++        } catch (Throwable failure) {
++            Log.e(TAG, "IRIS_26903_NIGHT_B_SETUP_FAILED", failure);
++            if (!handedToHdrx) listener.onProcessingError(
++                    failure.getClass().getSimpleName() + ": " + String.valueOf(failure.getMessage()));
++        } finally {
++            // The Hdrx B normal path consumes its own carriers. RAW backing is idempotent:
++            // Hdrx may already have consumed/closed some frames and this closes any spooled tail.
++            if (batch != null && batch.frames != null) for (ImageFrame frame : batch.frames) {
++                if (frame != null) try { frame.close(); } catch (Throwable ignored) { }
++            }
++            CaptureController.isProcessing = false;
++        }
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index a600b2a61f08609e7deab205a0c73a65f9520089..6a13d8fe912e8e4d5f48826fe026262e16d2e41d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -347,6 +347,9 @@ object PhotonMotionMgc1271Bridge {
+             val irisSettings = if (parameters.irisNightActive) {
+                 parameters.irisNightSettingsSnapshot
+                     ?: throw IllegalStateException("26540 Night missing frozen Iris settings")
++            } else if (parameters.iris26903NightB) {
++                parameters.iris26903NightBFrozenSettings
++                    ?: throw IllegalStateException("26903 Night B missing shutter-frozen Motion tone/noise settings")
+             } else {
+                 IrisMotionSettings.current()
+             }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+index 0899a088abd76142660f501c4c11da0191d85564..cf49286cac2c773938465ec5dd16298109e3f4bc 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java
+@@ -121,6 +121,10 @@ public class Parameters {
+     public float motionV2SdrBodyContrast26792 = 0.35f;
+     /* IRIS_26533_NIGHT_DOMAIN_OWNER */
+     public boolean irisNightActive = false;
++    /** IRIS_26903_NIGHT_B: frozen internal owner, never enables A Night or changes Photo B. */
++    public boolean iris26903NightB = false;
++    public com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings.Snapshot
++            iris26903NightBFrozenSettings = null;
+     /* IRIS_26540_NIGHT_FROZEN_PRESENTATION_SETTINGS */
+     public boolean irisNightAspect169 = false;
+     public boolean irisNightEnergySaving = false;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
+index bcec809cc505bfd384c19380ddb2f4c0c1675d04..513bcd222204c10120ada016acf809511c5d4efb 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/Iris26876BGpuFinalRenderer.java
+@@ -14,6 +14,7 @@ import android.opengl.GLES31;
+ import com.particlesdevs.photoncamera.app.PhotonCamera;
+ import com.particlesdevs.photoncamera.processing.processor.IrisMotionSettings;
+ import com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier;
++import com.particlesdevs.photoncamera.processing.processor.IrisNightNeuralEnhancer;
+ import com.particlesdevs.photoncamera.processing.render.Parameters;
+ import com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionV2Acr3Curve;
+ import com.particlesdevs.photoncamera.processing.opengl.postpipeline.MotionV2Render;
+@@ -147,6 +148,75 @@ public final class Iris26876BGpuFinalRenderer {
+                              GLES30.GL_RED,GLES30.GL_HALF_FLOAT,read);
+         return id[0];
+     }
++    /* IRIS_26903_NIGHT_B_JIN_50MP: only a 512x512 immutable learned residual/reference
++     * is uploaded; B's original 50MP color/clip/GPU render remains one pass.
++     * Reference and output are converted from Jin's sRGB to encoded Display P3
++     * exactly like the existing 26564 CPU true2x encoder. GL_RGBA32F is sampled
++     * via texelFetch (manual bilinear), so float-linear extensions are unnecessary.
++     */
++    private static float nightBJinDecode(float x) {
++        x=Math.max(0f,Math.min(1f,x));
++        return x<=0.04045f?x/12.92f:(float)Math.pow((x+0.055f)/1.055f,2.4);
++    }
++    private static float nightBJinEncode(float x) {
++        x=Math.max(0f,Math.min(1f,x));
++        return x<=0.0031308f?12.92f*x:(float)(1.055*Math.pow(x,1.0/2.4)-0.055);
++    }
++    private static void nightBJinP3(float r,float g,float b,float[] out) {
++        float lr=nightBJinDecode(r),lg=nightBJinDecode(g),lb=nightBJinDecode(b);
++        out[0]=nightBJinEncode(0.8224619687f*lr+0.1775380313f*lg);
++        out[1]=nightBJinEncode(0.0331941989f*lr+0.9668058011f*lg);
++        out[2]=nightBJinEncode(0.0170826307f*lr+0.0723974407f*lg+0.9105199286f*lb);
++    }
++    private static int nightBJinTexture(int w,int h,float[] rgba) {
++        int[] ids=new int[1];GLES30.glGenTextures(1,ids,0);
++        if(ids[0]==0)return 0;
++        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,ids[0]);
++        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MIN_FILTER,GLES30.GL_NEAREST);
++        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_MAG_FILTER,GLES30.GL_NEAREST);
++        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_S,GLES30.GL_CLAMP_TO_EDGE);
++        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D,GLES30.GL_TEXTURE_WRAP_T,GLES30.GL_CLAMP_TO_EDGE);
++        GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT,4);
++        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D,0,GLES30.GL_RGBA32F,w,h,0,
++                GLES30.GL_RGBA,GLES30.GL_FLOAT,floatBuffer(rgba));
++        if(GLES30.glGetError()!=GLES30.GL_NO_ERROR){
++            GLES30.glDeleteTextures(1,ids,0);return 0;
++        }
++        return ids[0];
++    }
++    private static int[] nightBJinTextures(IrisNightNeuralEnhancer.True2xResidual jin) {
++        if(jin==null||!jin.applied||jin.width!=512||jin.height!=512||
++                jin.referenceRgb==null||jin.referenceRgb.length!=512*512||
++                jin.residual==null||jin.residual.length!=512*512*3)
++            throw new IllegalArgumentException("26903 Jin 50MP residual/source proof missing");
++        int w=jin.width,h=jin.height;
++        float[] reference=new float[w*h*4],delta=new float[w*h*4];
++        float[] b=new float[3],a=new float[3];
++        for(int i=0;i<w*h;i++) {
++            int px=jin.referenceRgb[i];
++            float sr=((px>>16)&255)/255.0f,sg=((px>>8)&255)/255.0f,sb=(px&255)/255.0f;
++            int j=i*3,k=i*4;
++            float dr=jin.residual[j],dg=jin.residual[j+1],db=jin.residual[j+2];
++            if(!Float.isFinite(dr)||!Float.isFinite(dg)||!Float.isFinite(db))
++                throw new IllegalArgumentException("26903 Jin residual not finite");
++            nightBJinP3(sr,sg,sb,b);
++            nightBJinP3(Math.max(0f,Math.min(1f,sr+dr)),
++                       Math.max(0f,Math.min(1f,sg+dg)),
++                       Math.max(0f,Math.min(1f,sb+db)),a);
++            for(int c=0;c<3;c++){reference[k+c]=b[c];delta[k+c]=a[c]-b[c];}
++            reference[k+3]=1f;delta[k+3]=1f;
++        }
++        int rt=0,dt=0;
++        try {
++            rt=nightBJinTexture(w,h,reference);dt=nightBJinTexture(w,h,delta);
++            if(rt==0||dt==0)throw new IllegalStateException("26903 Jin 512 texture upload failed");
++            return new int[]{rt,dt};
++        }catch(Throwable t){
++            if(rt!=0)GLES30.glDeleteTextures(1,new int[]{rt},0);
++            if(dt!=0)GLES30.glDeleteTextures(1,new int[]{dt},0);
++            throw new IllegalStateException("26903 Jin GPU texture setup failed",t);
++        }
++    }
+     private static int watermarkTexture(Bitmap watermark){
+         if(watermark==null||watermark.isRecycled()||watermark.getConfig()!=Bitmap.Config.ARGB_8888)
+             return 0;
+@@ -172,6 +242,19 @@ public final class Iris26876BGpuFinalRenderer {
+             IrisMotionSettings.Snapshot tone,boolean watermarkEnabled,
+             Bitmap watermark,float[] exactCalculationWb,float clipYFloor,
+             boolean withGain) {
++        return render(source2x,guide1x,preview,params,crop,tone,watermarkEnabled,
++                watermark,exactCalculationWb,clipYFloor,withGain,null);
++    }
++
++    static Iris26876BFinalRgbaGainCarrier render(
++            MotionV2SharedRgba16fCarrier source2x,
++            MotionV2SharedRgba16fCarrier guide1x,
++            Bitmap preview,Parameters params,Point crop,
++            IrisMotionSettings.Snapshot tone,boolean watermarkEnabled,
++            Bitmap watermark,float[] exactCalculationWb,float clipYFloor,
++            boolean withGain,IrisNightNeuralEnhancer.True2xResidual nightBFullJin) {
++        if(nightBFullJin!=null && (params==null || !params.iris26903NightB))
++            throw new IllegalStateException("26903 Jin 50MP payload prohibited in normal B Photo");
+         if(source2x==null||guide1x==null||preview==null||preview.isRecycled()||
+            params==null||tone==null||crop==null||
+            exactCalculationWb==null||exactCalculationWb.length!=3||
+@@ -195,7 +278,7 @@ public final class Iris26876BGpuFinalRenderer {
+         EGLSurface priorDraw=EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW);
+         EGLSurface priorRead=EGL14.eglGetCurrentSurface(EGL14.EGL_READ);
+         Iris26876BGlAhbBinding input=null,guide=null,output=null;
+-        int program=0,fbo=0,vao=0,localTex=0,wmTex=0;
++        int program=0,fbo=0,vao=0,localTex=0,wmTex=0,jinRefTex=0,jinDeltaTex=0;
+         int[] storage=new int[5];boolean complete=false;
+         try {
+             display=EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+@@ -294,6 +377,21 @@ public final class Iris26876BGpuFinalRenderer {
+             GLES30.glActiveTexture(GLES30.GL_TEXTURE7);
+             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,guide.textureId());
+             uniform1i(program,"uBFinal1x",7);
++            /* One optional 512x512 Jin learned residual/reference; not a 50MP pass.
++             * When disabled the proven 26876/26902 shader is mathematically unchanged. */
++            final boolean nightBJinApply=nightBFullJin!=null && nightBFullJin.applied;
++            uniform1i(program,"uNightBJinEnabled",nightBJinApply?1:0);
++            if(nightBJinApply){
++                int[] jinTextures=nightBJinTextures(nightBFullJin);
++                jinRefTex=jinTextures[0];jinDeltaTex=jinTextures[1];
++                GLES30.glActiveTexture(GLES30.GL_TEXTURE3);
++                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,jinRefTex);
++                uniform1i(program,"uNightBJinReference",3);
++                GLES30.glActiveTexture(GLES30.GL_TEXTURE4);
++                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D,jinDeltaTex);
++                uniform1i(program,"uNightBJinResidual",4);
++                uniform2i(program,"uNightBJinSize",nightBFullJin.width,nightBFullJin.height);
++            }
+             if(params.motionV2LocalLaplacianToneEnabled){
+                 GLES30.glActiveTexture(GLES30.GL_TEXTURE1);
+                 localTex=localToneTexture(params);
+@@ -324,7 +422,8 @@ public final class Iris26876BGpuFinalRenderer {
+             complete=true;
+             Log.i(TAG,"IRIS_26876_B_GPU_FINAL_COMPLETE size="+outW+"x"+outH+
+                     " clip=original2x_OR_selected1xMath gain="+withGain+
+-                    " p3=true rgb16fFile=false cpu50mPass=false");
++                    " p3=true rgb16fFile=false cpu50mPass=false"
++                    + " jin2x=" + (nightBFullJin!=null && nightBFullJin.applied));
+             return target;
+         }catch(Throwable failed){
+             Log.e(TAG,"IRIS_26876_B_GPU_RENDER_FAILED noFallback=true",failed);
+@@ -339,6 +438,8 @@ public final class Iris26876BGpuFinalRenderer {
+             if(vao!=0)GLES30.glDeleteVertexArrays(1,new int[]{vao},0);
+             if(localTex!=0)GLES30.glDeleteTextures(1,new int[]{localTex},0);
+             if(wmTex!=0)GLES30.glDeleteTextures(1,new int[]{wmTex},0);
++            if(jinRefTex!=0)GLES30.glDeleteTextures(1,new int[]{jinRefTex},0);
++            if(jinDeltaTex!=0)GLES30.glDeleteTextures(1,new int[]{jinDeltaTex},0);
+             if(program!=0)GLES30.glDeleteProgram(program);
+             for(int x:storage)if(x!=0)GLES31.glDeleteBuffers(1,new int[]{x},0);
+             if(display!=EGL14.EGL_NO_DISPLAY){
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+index ad362c8b6450d270fa8df80b3342709202c76fea..781ca6c34d49f10c1e22c51b76095da7987f2b38 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/ultrahdr/MotionV2Jpeg444Encoder.java
+@@ -79,8 +79,19 @@ public final class MotionV2Jpeg444Encoder {
+             com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier guide1X,
+             Parameters parameters, Point cropSize, IrisMotionSettings.Snapshot tone,
+             boolean watermarkEnabled, float[] clippingWhiteBalance, float clippingYFloor) {
++        return writeB26876True2xGpu(output,oneXPreview,twoX,guide1X,parameters,
++            cropSize,tone,watermarkEnabled,clippingWhiteBalance,clippingYFloor,null);
++    }
++
++    public static boolean writeB26876True2xGpu(
++            Path output, Bitmap oneXPreview,
++            com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier twoX,
++            com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier guide1X,
++            Parameters parameters, Point cropSize, IrisMotionSettings.Snapshot tone,
++            boolean watermarkEnabled, float[] clippingWhiteBalance, float clippingYFloor,
++            IrisNightNeuralEnhancer.True2xResidual nightBFullJin) {
+         return writeB26876GpuInternal(output,oneXPreview,twoX,guide1X,parameters,
+-            cropSize,tone,watermarkEnabled,clippingWhiteBalance,clippingYFloor,false,null);
++            cropSize,tone,watermarkEnabled,clippingWhiteBalance,clippingYFloor,false,null,nightBFullJin);
+     }
+ 
+     public static boolean writeB26876True2xGpuHeic(
+@@ -90,8 +101,19 @@ public final class MotionV2Jpeg444Encoder {
+             Parameters parameters, Point cropSize, IrisMotionSettings.Snapshot tone,
+             boolean watermarkEnabled, float[] clippingWhiteBalance, float clippingYFloor,
+             ParseExif.ExifData exif) {
++        return writeB26876True2xGpuHeic(output,oneXPreview,twoX,guide1X,parameters,
++            cropSize,tone,watermarkEnabled,clippingWhiteBalance,clippingYFloor,exif,null);
++    }
++
++    public static boolean writeB26876True2xGpuHeic(
++            Path output, Bitmap oneXPreview,
++            com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier twoX,
++            com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier guide1X,
++            Parameters parameters, Point cropSize, IrisMotionSettings.Snapshot tone,
++            boolean watermarkEnabled, float[] clippingWhiteBalance, float clippingYFloor,
++            ParseExif.ExifData exif, IrisNightNeuralEnhancer.True2xResidual nightBFullJin) {
+         return writeB26876GpuInternal(output,oneXPreview,twoX,guide1X,parameters,
+-            cropSize,tone,watermarkEnabled,clippingWhiteBalance,clippingYFloor,true,exif);
++            cropSize,tone,watermarkEnabled,clippingWhiteBalance,clippingYFloor,true,exif,nightBFullJin);
+     }
+ 
+     private static boolean writeB26876GpuInternal(
+@@ -100,7 +122,8 @@ public final class MotionV2Jpeg444Encoder {
+             com.particlesdevs.photoncamera.processing.processor.MotionV2SharedRgba16fCarrier guide1X,
+             Parameters parameters, Point cropSize, IrisMotionSettings.Snapshot tone,
+             boolean watermarkEnabled, float[] clippingWhiteBalance, float clippingYFloor,
+-            boolean heic, ParseExif.ExifData exif) {
++            boolean heic, ParseExif.ExifData exif,
++            IrisNightNeuralEnhancer.True2xResidual nightBFullJin) {
+         if(output==null||oneXPreview==null||oneXPreview.isRecycled()||twoX==null||guide1X==null||
+             !parameters.motionV2SuperResOutputEnabled||parameters.irisNightActive||
+             !parameters.motionV2Active)return false;
+@@ -115,7 +138,7 @@ public final class MotionV2Jpeg444Encoder {
+             }
+             gpu=Iris26876BGpuFinalRenderer.render(twoX,guide1X,oneXPreview,
+                 parameters,cropSize,tone,watermarkEnabled,watermark,
+-                clippingWhiteBalance,clippingYFloor,withGain);
++                clippingWhiteBalance,clippingYFloor,withGain,nightBFullJin);
+             if(gpu==null)return false;
+             Gainmap metadata=withGain?oneXPreview.getGainmap():null;
+             boolean saved=heic?gpu.publishHeic(output,metadata,exif):
+diff --git a/app/version.properties b/app/version.properties
+index 6d3ad98609d57d0ab29c8a474e37258cdae0a680..12d21ddff47012989522cecfe793b5fe86d8fb15 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726902
+-VERSION_BUILD=26902
++VERSION_NAME=0.9726903
++VERSION_BUILD=26903
