@@ -1,0 +1,106 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Writes one tile's AMaZE result into the caller's RGBA16F image, removing the
+// white balance applied for AMaZE so the output is camera-linear like RCD's.
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "amaze_tile.glsl"
+layout(std430, set = 0, binding = 2) readonly buffer TileOutput { vec4 rgb[]; } result;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D outputImage;
+layout(set = 0, binding = 5) uniform sampler2D packedInput;
+layout(std430, set = 0, binding = 7) readonly buffer Normalized { float bayer255[]; } normalizedInput;
+
+/* IRIS_26904_B_NATIVE_AMAZE_PHYSICAL_BORDER_CFA_CONSENSUS
+ * The pinned AMaZE tiles have finite source at the physical sensor boundary;
+ * 16px exterior halo is not available. Never invent an interior texture or
+ * copy a color from elsewhere. For only truly invalid low-chroma border output,
+ * cross-check it against CFA-parity-mirrored, locally sampled ORIGINAL linear
+ * Bayer observations. Preserve AMaZE luminance, native interior pixels and
+ * genuine unclipped high-frequency color. The default path remains original
+ * native RAWR AMaZE + unchanged postprocessing.
+ * This is not a replacement for the 19-stage AMaZE demosaicer.
+ */
+int iris26904ReflectBayerParity(int value, int length) {
+    // Only a +/-1 CFA neighbor may lie outside the physical image. Reflection
+    // maps -1->+1 and N->N-2, preserving Bayer parity for even dimensions.
+    return value < 0 ? -value : (value >= length ? 2 * length - 2 - value : value);
+}
+float iris26904Cfa(ivec2 p) {
+    ivec2 sensorSize = imageSize(outputImage);
+    ivec2 q = ivec2(iris26904ReflectBayerParity(p.x, sensorSize.x),
+                    iris26904ReflectBayerParity(p.y, sensorSize.y));
+    if (tile.inputMode > 0.5) {
+        return normalizedInput.bayer255[uint(q.y) * uint(tile.inputWidth) + uint(q.x)] * (1.0/255.0);
+    }
+    return texelFetch(packedInput, q >> 1, 0)[cfaComponent(q, uint(tile.pattern))];
+}
+vec3 iris26904BilinearPhysicalCfa(ivec2 p) {
+    float c = iris26904Cfa(p);
+    float cross = (iris26904Cfa(p + ivec2(-1, 0)) + iris26904Cfa(p + ivec2(1, 0))
+                 + iris26904Cfa(p + ivec2(0, -1)) + iris26904Cfa(p + ivec2(0, 1))) * 0.25;
+    float diag = (iris26904Cfa(p + ivec2(-1, -1)) + iris26904Cfa(p + ivec2(1, -1))
+                + iris26904Cfa(p + ivec2(-1, 1)) + iris26904Cfa(p + ivec2(1, 1))) * 0.25;
+    int phase = cfaComponent(p, uint(tile.pattern));
+    if (phase == 0) return vec3(c, cross, diag);
+    if (phase == 3) return vec3(diag, cross, c);
+    float horizontal = 0.5 * (iris26904Cfa(p + ivec2(-1, 0))
+                            + iris26904Cfa(p + ivec2(1, 0)));
+    float vertical = 0.5 * (iris26904Cfa(p + ivec2(0, -1))
+                          + iris26904Cfa(p + ivec2(0, 1)));
+    return cfaComponent(p + ivec2(1, 0), uint(tile.pattern)) == 0
+            ? vec3(horizontal, c, vertical) : vec3(vertical, c, horizontal);
+}
+float iris26904SensorLuma(vec3 rgb) { return dot(rgb, vec3(0.25,0.5,0.25)); }
+float iris26904Smooth(float a, float b, float x) {
+    float t = clamp((x-a)/max(b-a,1e-6), 0.0, 1.0);
+    return t*t*(3.0-2.0*t);
+}
+vec3 iris26904RepairOnlySupportedBorderChroma(ivec2 p, vec3 amazeRgb) {
+    ivec2 sz = imageSize(outputImage);
+    int left = p.x, right = sz.x - 1 - p.x;
+    int bottom = p.y, top = sz.y - 1 - p.y;
+    int outerDistance = min(min(left,right),min(bottom,top));
+    if (outerDistance >= 14) return amazeRgb;
+    vec3 source = max(iris26904BilinearPhysicalCfa(p),vec3(0.0));
+    float sourceY = iris26904SensorLuma(source);
+    float amazeY = iris26904SensorLuma(max(amazeRgb,vec3(0.0)));
+    // Never reconstruct sensor-dark read noise or saturated/clipped highlights.
+    if (sourceY < 0.035 || amazeY < 0.035 || sourceY >= 0.94 || amazeY >= 0.94)
+        return amazeRgb;
+    vec3 sourceC = source - vec3(sourceY);
+    vec3 amazeC = amazeRgb - vec3(amazeY);
+    float rawStrength = length(sourceC) / max(sourceY,0.035);
+    float amazeStrength = length(amazeC) / max(amazeY,0.035);
+    if (rawStrength < 0.14 || amazeStrength >= rawStrength * 0.78) return amazeRgb;
+    // Real material hue must persist across multiple two-dimensional CFA
+    // neighborhoods, toward the scene interior rather than the invalid halo.
+    ivec2 inward = left <= right && left <= bottom && left <= top ? ivec2(1,0)
+                 : right <= bottom && right <= top ? ivec2(-1,0)
+                 : bottom <= top ? ivec2(0,1) : ivec2(0,-1);
+    ivec2 p2 = clamp(p + inward*3, ivec2(0), sz-ivec2(1));
+    ivec2 p3 = clamp(p + inward*7, ivec2(0), sz-ivec2(1));
+    vec3 raw2 = max(iris26904BilinearPhysicalCfa(p2),vec3(0.0));
+    vec3 raw3 = max(iris26904BilinearPhysicalCfa(p3),vec3(0.0));
+    float y2 = iris26904SensorLuma(raw2), y3 = iris26904SensorLuma(raw3);
+    vec3 c2 = raw2 - vec3(y2), c3 = raw3 - vec3(y3);
+    float hueAgreement = min(dot(normalize(sourceC),normalize(c2 + vec3(1e-8))),
+                             dot(normalize(sourceC),normalize(c3 + vec3(1e-8))));
+    float sceneContinuity = (1.0-iris26904Smooth(0.075,0.27,
+             max(abs(sourceY-y2),abs(sourceY-y3))/max(sourceY,0.035)))
+             *iris26904Smooth(0.89,0.98,hueAgreement);
+    if (sceneContinuity <= 0.0) return amazeRgb;
+    float deficit = 1.0 - amazeStrength/max(rawStrength,0.0001);
+    float confidence = (1.0-iris26904Smooth(2.0,14.0,float(outerDistance)))
+             * iris26904Smooth(0.24,0.55,deficit)*sceneContinuity;
+    // True Bayer-derived local chroma at native sensor coordinates. Keep
+    // original AMaZE luminance exactly and do not extrapolate any new signal.
+    vec3 reconstructed = max(vec3(amazeY) + sourceC*(amazeY/sourceY),vec3(0.0));
+    return mix(amazeRgb,reconstructed,clamp(confidence,0.0,1.0));
+}
+void main() {
+    uvec2 l = gl_GlobalInvocationID.xy;
+    if (l.x >= tile.outWidth || l.y >= tile.outHeight) return;
+    vec3 rgb = result.rgb[TILE_SLOT * kOutPix + l.y * tile.outWidth + l.x].rgb / vec3(tile.wbR, tile.wbG, tile.wbB);
+    ivec2 physical = ivec2(tile.outOriginX + l.x, tile.outOriginY + l.y);
+    rgb = iris26904RepairOnlySupportedBorderChroma(physical, rgb);
+    imageStore(outputImage, physical, vec4(rgb * tile.outputScale, tile.outputAlpha));
+}
