@@ -5,7 +5,7 @@ import hashlib,re,sys
 R=Path(__file__).resolve().parent
 OLDWF='.github/workflows/build-26905-change-aware.yml'
 WF='.github/workflows/build-26906-change-aware.yml'
-TRIGGER=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V2_SOURCE_SCOPE_FIX\n'
+TRIGGER=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V3_NATIVE_CACHE_PATCH_REPLAY\n'
 CHANGED=['app/version.properties','app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java','app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java','app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java','app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java','app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java','app/src/main/assets/shaders/motionv2/render.glsl','app/src/main/assets/shaders/motionv2/gainmap.glsl','app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag']
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def must(condition,why):
@@ -46,6 +46,10 @@ def check():
  must('26906_TONE_SHADER_REAL_COMPILER.txt' in (R/'build_26906_incremental.py').read_text(),'missing real modified shader compiler gate')
  must('ACTUAL_EXECUTED_build_26906_incremental.py' in (R/'build_26906_incremental.py').read_text(),'missing actual executed script archival')
  must('26905_success.zip' in (R/'build_26906_incremental.py').read_text(),'missing exact prior published archive fetch')
+ must(w.count('verify_26906_native_cache.py preflight')==1 and w.count('verify_26906_native_cache.py postflight')==1,'native cache replay gate missing')
+ must(w.count('python3 -S test_26906_native_cache.py')==1,'cache replay independent regressions missing')
+ must(w.index('actions/cache/restore@v4',w.index('id: native-cache')) < w.index('verify_26906_native_cache.py preflight') < w.index('compile_26904_shaders_v2.sh'),'native cache replay gate order')
+ must(w.index(':app:assembleDebug') < w.index('verify_26906_native_cache.py postflight') < w.index('build_26906_incremental.py finalize'),'native postflight gate order')
  print('PASS exact 26906 3-stage seal, 2027 source and 2018 protected files, pinned 26905 workflow, real shader/native/Java/Kotlin and one Android assemble sequence')
 if __name__=='__main__':
  try:check()

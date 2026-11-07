@@ -61,7 +61,7 @@ def seal():
  want=set(stage1)-{'26906_HANDOFF_HASHES.sha256'}
  want|={'.github/workflows/build-26906-change-aware.yml','TRIGGER_26906.txt'}
  if set(entries)!=want:fail('wrong stage bundle scope')
- if (R/'TRIGGER_26906.txt').read_bytes()!=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V2_SOURCE_SCOPE_FIX\n':fail('trigger bytes')
+ if (R/'TRIGGER_26906.txt').read_bytes()!=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V3_NATIVE_CACHE_PATCH_REPLAY\n':fail('trigger bytes')
  changed=(R/'26906_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines()
  if len(changed)!=9 or len(set(changed))!=9:fail('scope list not nine')
  if {p for p in want if p.startswith('handoff_payload_26906/')}!= {'handoff_payload_26906/'+p for p in changed}:fail('runtime payload not exact allowlist')
