@@ -32,9 +32,16 @@ def parse(p):
  return d
 def scan(src):
  d={}
- for p in (src/'app').rglob('*'):
+ # Exact 26905 compiled-source universe: app/src, build.gradle, version.properties.
+ # Repository-only scaffolding outside this scope must not be interpreted as
+ # new runtime source; unknown app/src files must still fail the full manifest.
+ source_root=src/'app/src'
+ if source_root.is_symlink() or not source_root.is_dir():fail('Android runtime source directory missing or symlinked')
+ source_files=list(source_root.rglob('*'))
+ source_files.extend([src/'app/build.gradle',src/'app/version.properties'])
+ for p in source_files:
   if p.is_symlink():fail('unapproved source symlink '+str(p))
-  if p.is_file() and p.relative_to(src/'app').parts[0] not in ('build','.cxx'):
+  if p.is_file():
    d[p.relative_to(src).as_posix()]=sha(p)
  return d
 def exact(src,manifest,title):
@@ -54,7 +61,7 @@ def seal():
  want=set(stage1)-{'26906_HANDOFF_HASHES.sha256'}
  want|={'.github/workflows/build-26906-change-aware.yml','TRIGGER_26906.txt'}
  if set(entries)!=want:fail('wrong stage bundle scope')
- if (R/'TRIGGER_26906.txt').read_bytes()!=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V1\n':fail('trigger bytes')
+ if (R/'TRIGGER_26906.txt').read_bytes()!=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V2_SOURCE_SCOPE_FIX\n':fail('trigger bytes')
  changed=(R/'26906_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines()
  if len(changed)!=9 or len(set(changed))!=9:fail('scope list not nine')
  if {p for p in want if p.startswith('handoff_payload_26906/')}!= {'handoff_payload_26906/'+p for p in changed}:fail('runtime payload not exact allowlist')

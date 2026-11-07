@@ -5,7 +5,7 @@ import hashlib,re,sys
 R=Path(__file__).resolve().parent
 OLDWF='.github/workflows/build-26905-change-aware.yml'
 WF='.github/workflows/build-26906-change-aware.yml'
-TRIGGER=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V1\n'
+TRIGGER=b'RUN_26906_B_VISUAL_MIDTONE_TOE_NIGHT_EXPOSURE_V2_SOURCE_SCOPE_FIX\n'
 CHANGED=['app/version.properties','app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java','app/src/main/java/com/particlesdevs/photoncamera/processing/render/Parameters.java','app/src/main/java/com/particlesdevs/photoncamera/processing/parameters/IrisNightExposureSelector.java','app/src/main/java/com/particlesdevs/photoncamera/processing/processor/HdrxProcessor.java','app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2Render.java','app/src/main/assets/shaders/motionv2/render.glsl','app/src/main/assets/shaders/motionv2/gainmap.glsl','app/src/main/assets/shaders/iris26876/b_fused_final_p3_gain.frag']
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def must(condition,why):
