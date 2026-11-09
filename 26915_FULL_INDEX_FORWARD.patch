@@ -1,0 +1,392 @@
+diff --git a/app/src/main/cpp/iris26915_rgba16f_guide.h b/app/src/main/cpp/iris26915_rgba16f_guide.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..185ed9cd922a141396765f38e9e98690b33f0529
+--- /dev/null
++++ b/app/src/main/cpp/iris26915_rgba16f_guide.h
+@@ -0,0 +1,67 @@
++#pragma once
++/* IRIS_26915_TELEPHOTO_ROW_STRIDE_GUIDE
++ * CPU-only 1x RGBA16F guide packer. Testable without Android headers.
++ * Inputs: camera-linear 1x post-denoise RGBA16F and unmodified R16F sensor
++ * clipping evidence. The final true-2x reconstruction remains GPU-resident.
++ */
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++
++namespace iris26915guide {
++constexpr size_t kPixelBytes = 8u;
++constexpr size_t kMaskBytes = 2u;
++
++inline bool sizes(int width, int height, size_t stridePixels,
++                  size_t* rgbBytes, size_t* maskBytes, size_t* strideBytes) {
++    if (width <= 0 || height <= 0 || stridePixels < static_cast<size_t>(width) ||
++        stridePixels > std::numeric_limits<size_t>::max() / kPixelBytes) return false;
++    const size_t w = static_cast<size_t>(width);
++    const size_t h = static_cast<size_t>(height);
++    if (w > std::numeric_limits<size_t>::max() / h ||
++        w * h > std::numeric_limits<size_t>::max() / kPixelBytes ||
++        h > std::numeric_limits<size_t>::max() / (stridePixels * kPixelBytes)) return false;
++    *rgbBytes = w * h * kPixelBytes;
++    *maskBytes = w * h * kMaskBytes;
++    *strideBytes = stridePixels * kPixelBytes;
++    return true;
++}
++
++inline bool validMask(const uint8_t* mask, size_t pixels) {
++    if (!mask) return false;
++    for (size_t i = 0; i < pixels; ++i) {
++        uint16_t half = 0;
++        std::memcpy(&half, mask + i * kMaskBytes, kMaskBytes);
++        // Reject Inf/NaN, negatives other than -0, and values greater than +1.
++        if ((half & 0x7c00u) == 0x7c00u ||
++            ((half & 0x8000u) && half != 0x8000u) ||
++            (!(half & 0x8000u) && half > 0x3c00u)) return false;
++    }
++    return true;
++}
++
++inline bool pack(uint8_t* mapped, size_t stridePixels,
++                 int width, int height,
++                 const uint8_t* rgba, size_t rgbaCapacity,
++                 const uint8_t* mask, size_t maskCapacity) {
++    size_t rgbBytes=0,maskBytes=0,strideBytes=0;
++    if (!mapped || !rgba || !mask ||
++        !sizes(width,height,stridePixels,&rgbBytes,&maskBytes,&strideBytes) ||
++        rgbaCapacity != rgbBytes || maskCapacity != maskBytes ||
++        !validMask(mask,static_cast<size_t>(width) * static_cast<size_t>(height))) return false;
++    const size_t rowBytes=static_cast<size_t>(width)*kPixelBytes;
++    for (int y=0;y<height;++y) {
++        uint8_t* dst=mapped+static_cast<size_t>(y)*strideBytes;
++        const uint8_t* src=rgba+static_cast<size_t>(y)*rowBytes;
++        std::memcpy(dst,src,rowBytes);
++        for (int x=0;x<width;++x) {
++            const size_t pixel=static_cast<size_t>(y)*static_cast<size_t>(width)+static_cast<size_t>(x);
++            // memcpy preserves every original half bit, including signed zero.
++            std::memcpy(dst+static_cast<size_t>(x)*kPixelBytes+6u,
++                        mask+pixel*kMaskBytes,kMaskBytes);
++        }
++    }
++    return true;
++}
++} // namespace iris26915guide
+diff --git a/app/src/main/cpp/motionv2_jpeg444_jni.cpp b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+index 26421a5ca9d785cf0bdb9478c236f13ed4fc0363..8ff2466bf75f428bb304981729558c6ea77ef9dc 100644
+--- a/app/src/main/cpp/motionv2_jpeg444_jni.cpp
++++ b/app/src/main/cpp/motionv2_jpeg444_jni.cpp
+@@ -2175,6 +2175,8 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+ }
+ 
+ 
++#include "iris26915_rgba16f_guide.h"
++
+ /* IRIS_26826_SHARED_RGBA16F_CARRIER_NATIVE
+  * Shared HardwareBuffer is only transport/storage. Existing Sabre/VGN, CPU denoiser and post
+  * math are unchanged. Producer/consumer use same-format RGBA16F framebuffer blits and glFinish
+@@ -2251,6 +2253,65 @@ extern "C" JNIEXPORT jboolean JNICALL Java_com_particlesdevs_photoncamera_proces
+     return ok?JNI_TRUE:JNI_FALSE;
+ }
+ 
++/* IRIS_26915_FINAL_1X_STRIDE_AWARE_CPU_PACK
++ * Lock only after proving exact buffer capacities and clip validity.
++ * The 1x producer is CPU-written / GPU-sampled; never assume physical
++ * AHardwareBuffer stride == width. The original 2x GPU transport is untouched.
++ */
++extern "C" JNIEXPORT jboolean JNICALL
++Java_com_particlesdevs_photoncamera_processing_processor_MotionV2SharedRgba16fCarrier_writeFinal1xGuideNative(
++    JNIEnv* env, jclass, jobject hardwareBuffer, jobject rgbaBuffer,
++    jobject maskBuffer, jint width, jint height) {
++    AHardwareBuffer* buffer=nullptr;
++    AHardwareBuffer_Desc desc{};
++    size_t rgbBytesPlaceholder=0,maskBytesPlaceholder=0,strideBytesPlaceholder=0;
++    if (!iris26826Describe(env,hardwareBuffer,&buffer,&desc,width,height) ||
++        !rgbaBuffer || !maskBuffer ||
++        !iris26915guide::sizes(width,height,static_cast<size_t>(desc.stride),
++                                &rgbBytesPlaceholder,&maskBytesPlaceholder,&strideBytesPlaceholder)) {
++        __android_log_print(ANDROID_LOG_WARN,TAG,
++              "IRIS_26915_GUIDE_FAILURE stage=describe_or_stride width=%d height=%d",width,height);
++        return JNI_FALSE;
++    }
++    const jlong rgbaCap=env->GetDirectBufferCapacity(rgbaBuffer);
++    const jlong maskCap=env->GetDirectBufferCapacity(maskBuffer);
++    const auto* rgba=static_cast<const uint8_t*>(env->GetDirectBufferAddress(rgbaBuffer));
++    const auto* mask=static_cast<const uint8_t*>(env->GetDirectBufferAddress(maskBuffer));
++    if (!rgba || !mask || rgbaCap<0 || maskCap<0 ||
++        static_cast<uint64_t>(rgbaCap)!=rgbBytesPlaceholder ||
++        static_cast<uint64_t>(maskCap)!=maskBytesPlaceholder ||
++        !iris26915guide::validMask(mask,
++                 static_cast<size_t>(width)*static_cast<size_t>(height))) {
++        __android_log_print(ANDROID_LOG_WARN,TAG,
++              "IRIS_26915_GUIDE_FAILURE stage=direct_or_mask width=%d height=%d",width,height);
++        return JNI_FALSE;
++    }
++    void* pixels=nullptr;
++    const int lockRc=AHardwareBuffer_lock(buffer,AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
++                                          -1,nullptr,&pixels);
++    if (lockRc!=0 || !pixels) {
++        __android_log_print(ANDROID_LOG_WARN,TAG,
++              "IRIS_26915_GUIDE_FAILURE stage=cpu_lock rc=%d stride=%u width=%d height=%d",
++              lockRc,desc.stride,width,height);
++        return JNI_FALSE;
++    }
++    const bool packed=iris26915guide::pack(static_cast<uint8_t*>(pixels),
++                         static_cast<size_t>(desc.stride),width,height,
++                         rgba,static_cast<size_t>(rgbaCap),
++                         mask,static_cast<size_t>(maskCap));
++    const int unlockRc=AHardwareBuffer_unlock(buffer,nullptr);
++    if (!packed || unlockRc!=0) {
++        __android_log_print(ANDROID_LOG_WARN,TAG,
++              "IRIS_26915_GUIDE_FAILURE stage=cpu_pack_or_unlock packed=%d rc=%d stride=%u width=%d",
++              packed?1:0,unlockRc,desc.stride,width);
++        return JNI_FALSE;
++    }
++    __android_log_print(ANDROID_LOG_INFO,TAG,
++              "IRIS_26915_GUIDE_STRIDE_PACK_PASS width=%d height=%d stride=%u rgbExact=true clipExact=true",
++              width,height,desc.stride);
++    return JNI_TRUE;
++}
++
+ extern "C" JNIEXPORT jobject JNICALL Java_com_particlesdevs_photoncamera_processing_processor_MotionV2SharedRgba16fCarrier_lockCpuNative(
+         JNIEnv*env,jclass,jobject hardwareBuffer,jint width,jint height){
+     AHardwareBuffer*buffer=nullptr;AHardwareBuffer_Desc desc{};if(!iris26826Describe(env,hardwareBuffer,&buffer,&desc,width,height))return nullptr;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index 8e1a9451b87231dd8eb8c14c6653d47a427cb225..f21b81f93e6e3f5e88dc1b2f4b58b673b9cb3326 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -2070,15 +2070,22 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+     }
+ 
+     private boolean motion26713ResultMatchesTarget(@NonNull TotalCaptureResult result,
+-            long targetExposureNs, int targetIso) {
++            long targetExposureNs, int targetIso, boolean frozenExperimentB) {
+         Long exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+         Integer iso = result.get(CaptureResult.SENSOR_SENSITIVITY);
+         if (exp == null || exp <= 0L || iso == null || iso <= 0
+                 || targetExposureNs <= 0L || targetIso <= 0) return false;
+-        double actual = (double) exp * (double) iso;
+-        double target = (double) targetExposureNs * (double) targetIso;
+-        return Math.abs(Math.log(actual / target) / Math.log(2.0))
+-                <= MOTION_26486_EXPOSURE_HALF_WINDOW_EV;
++        /* IRIS_26915_B_EARLY_PAIR_MATCHES_FINAL
++         * Early NORMAL ticket admission must agree with the later B temporal
++         * group selector: equal shutter*ISO alone cannot approve 1/100s ISO1464
++         * for a frozen 1/16.6s ISO240 burst. Reject immediately so the same
++         * logical slot can follow its existing bounded retry and deadline.
++         * A retains its original energy-only admission policy.
++         */
++        return Iris26910CaptureSafety.frozenNormalPairMatches(
++                exp, iso, targetExposureNs, targetIso,
++                MOTION_26486_EXPOSURE_HALF_WINDOW_EV,
++                frozenExperimentB);
+     }
+ 
+     private void motion26713ClearRecipeAfterPhysicalBatch() {
+@@ -10406,7 +10413,8 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+                     return;
+                 }
+                 ticket.exposureAccepted = motion26713ResultMatchesTarget(
+-                        result, plan.normalTargetExposureNs, plan.normalTargetIso);
++                        result, plan.normalTargetExposureNs, plan.normalTargetIso,
++                        plan.iris26906BOffAllNormal);
+                 if (!ticket.exposureAccepted) {
+                     markMotion26724NormalAttemptFailed(ticket, "EXPOSURE_REJECTED", ts);
+                     Long iris26725ActualExposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME);
+@@ -10948,16 +10956,18 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+      * Never postpone shutter intent for a future nine-phase recipe; its
+      * metadata generation guard and the exact RAW-ticket checks remain.
+      */
+-    /* IRIS_26905_B_OFF_NORMAL_FRAME_BUDGET_HELPER
+-     * Capture mode must be selected independently of mutable preference reads
+-     * later in the native pipeline. Keep this pure for isolated Java regression.
++    /* IRIS_26915_B_SUPER_RES_FULL_NORMAL_BURST
++     * Both B reconstruction paths use the full frozen slider count of
++     * equal-exposure NORMAL RAW frames; 2x Wronski may not reserve a LONG.
++     * The historical predicate name is retained because the 26905 capture
++     * plan owns it, but its result is intentionally independent of SR mode.
++     * A and Night's separate capture planners remain untouched.
+      */
+     private static boolean iris26905BOffNormalOnly(
+             com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode experiment,
+             boolean superResAtShutter) {
+         return experiment ==
+-                com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855
+-                && !superResAtShutter;
++                com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855;
+     }
+ 
+     /* IRIS_26912_SHUTTER_FIRST_MANUAL_B
+@@ -11191,11 +11201,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+         final boolean iris26480ShortHighlightRequested = false;
+         clearMotion26490CaptureShortTicket(iris26486ShortTicket, "26710_short_retired_reference_owns_highlights");
+ 
+-        /* IRIS_26905_B_OFF_ALL_NORMAL_BUDGET
++        /* IRIS_26915_B_OFF_AND_ON_ALL_NORMAL_BUDGET
+          * Freeze the existing physical-lens Experiment B owner BEFORE auxiliary
+          * exposure allocation. In B with Super Res OFF, every slider slot is a
+-         * NORMAL RAW; do not submit a physically distinct LONG that B's motion
+-         * safety gate generally cannot admit. Other modes keep their old policy.
++         * NORMAL RAW in both Super Res ON and OFF. The RAWR/Wronski true-2x
++         * path receives the complete frozen NORMAL count (no auxiliary LONG).
++         * Non-B modes keep their proven separate allocation policy.
+          */
+         final com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode iris26856FrozenExperiment =
+                 com.particlesdevs.photoncamera.settings.Iris26856ABSettings.read(
+@@ -11264,7 +11275,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+          * Only selected B/A+B replaces the old SR maximum/no-wait policy.
+          * Preserve exact 26850 A-only SR and non-SR behavior. Snapshot the same
+          * physical-lens selector once for both frame count and immutable plan.
+-         * B Super Res OFF now schedules all 15 NORMAL with no LONG;
++         * Both B Super Res OFF and ON schedule every slider slot as NORMAL;
+          * missing NORMALs are attempted by the inherited generation-owned bounded
+          * top-up, with the original deadline and no degraded admission.
+          */
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26910CaptureSafety.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26910CaptureSafety.java
+index cd68e84f6357ec691dd389afbabdb3161a2d6f33..d0fdfdfa7c0c16127e8096d56921de151c74d148 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26910CaptureSafety.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26910CaptureSafety.java
+@@ -40,6 +40,30 @@ public final class Iris26910CaptureSafety {
+         return started && elapsedSinceProgressMs >= 1600L;
+     }
+ 
++    /** IRIS_26915_EARLY_FROZEN_NORMAL_PAIR
++     * Test the sensor-applied NORMAL exposure, never the submitted request.
++     * Mirrors B's later motionExposurePairMatches: energy delta plus separate
++     * physical shutter delta. A deliberately retains energy-only matching.
++     * This is an early admission guard, not permission to drop a frame:
++     * rejected logical top-up slots use their existing bounded replacement.
++     */
++    public static boolean frozenNormalPairMatches(long actualShutterNs, int actualIso,
++                                                   long frozenShutterNs, int frozenIso,
++                                                   double halfWindowEv,
++                                                   boolean requireShutter) {
++        if (actualShutterNs <= 0L || actualIso <= 0 || frozenShutterNs <= 0L
++                || frozenIso <= 0 || !Double.isFinite(halfWindowEv)
++                || halfWindowEv < 0.0) return false;
++        double actualEnergy = (double) actualShutterNs * actualIso;
++        double frozenEnergy = (double) frozenShutterNs * frozenIso;
++        double energyEv = Math.log(actualEnergy / frozenEnergy) / Math.log(2.0);
++        if (!Double.isFinite(energyEv) || Math.abs(energyEv) > halfWindowEv) return false;
++        if (!requireShutter) return true;
++        double shutterEv = Math.log((double) actualShutterNs / frozenShutterNs)
++                / Math.log(2.0);
++        return Double.isFinite(shutterEv) && Math.abs(shutterEv) <= halfWindowEv;
++    }
++
+     /** Preview-only low-light midtone lift, never sensor AE or RAW/JPEG gain.
+      * RAW p99.5 and actual ISO exclude bright scenes and strongly clipped scenes.
+      * The already-existing white-anchored shader leaves display white unchanged.
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2SharedRgba16fCarrier.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2SharedRgba16fCarrier.java
+index 0771fbcd8f6e1ba74a26f6202a1976a1fb80783a..61fbb431f4bf0b1624437857561876866c51c71a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2SharedRgba16fCarrier.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/MotionV2SharedRgba16fCarrier.java
+@@ -57,6 +57,41 @@ public final class MotionV2SharedRgba16fCarrier implements AutoCloseable {
+         }
+     }
+ 
++    /** IRIS_26915_1X_GUIDE_CPU_PRODUCER
++     * The selected 1x guide is CPU-written and GPU-sampled, not an EGL
++     * framebuffer render target. This avoids requiring GPU_COLOR_OUTPUT
++     * support for physical lens widths such as 4080. Keep the original
++     * allocation as a compatibility fallback, but NEVER upscale the 2x RGB.
++     */
++    public static MotionV2SharedRgba16fCarrier tryCreateFinal1xGuide(int width, int height) {
++        if (Build.VERSION.SDK_INT >= 26 && width > 0 && height > 0) {
++            final long usage = HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
++                    | HardwareBuffer.USAGE_CPU_WRITE_OFTEN;
++            try {
++                if (Build.VERSION.SDK_INT < 29 ||
++                        HardwareBuffer.isSupported(width, height, HardwareBuffer.RGBA_FP16, 1, usage)) {
++                    HardwareBuffer hb = HardwareBuffer.create(width, height,
++                            HardwareBuffer.RGBA_FP16, 1, usage);
++                    if (hb != null) return new MotionV2SharedRgba16fCarrier(hb, width, height);
++                }
++            } catch (Throwable t) {
++                Log.w(TAG, "IRIS_26915_GUIDE_CPU_ALLOCATION_UNAVAILABLE reason="
++                        + t.getClass().getSimpleName());
++            }
++        }
++        return tryCreate(width, height);
++    }
++
++    /** Native packs post-denoise linear RGB and exact selected sensor clip
++     * to physical-stride-aware RGBA16F, then unlocks before GPU consumer.
++     */
++    public boolean writeFinal1xGuideCpu(ByteBuffer linearRgba16f, ByteBuffer maskR16f) {
++        HardwareBuffer hb = buffer;
++        return !cpuLocked && hb != null && linearRgba16f != null && maskR16f != null
++                && linearRgba16f.isDirect() && maskR16f.isDirect()
++                && writeFinal1xGuideNative(hb, linearRgba16f, maskR16f, width, height);
++    }
++
+     /** Only the B-only 26876 renderer may borrow this GPU handle. The result
+      * object stays the sole owner and MUST not close before GL completion. */
+     public HardwareBuffer borrowGpuHandle26876() {
+@@ -159,6 +194,9 @@ public final class MotionV2SharedRgba16fCarrier implements AutoCloseable {
+             HardwareBuffer buffer, int sourceTextureId, int width, int height);
+     private static native boolean copyToCurrentGlTextureNative(
+             HardwareBuffer buffer, int destinationTextureId, int width, int height);
++    private static native boolean writeFinal1xGuideNative(
++            HardwareBuffer buffer, ByteBuffer linearRgba16f, ByteBuffer maskR16f,
++            int width, int height);
+     private static native ByteBuffer lockCpuNative(HardwareBuffer buffer, int width, int height);
+     private static native boolean unlockCpuNative(HardwareBuffer buffer);
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+index 35ce7913a92034206096de1d815130e3a7b9f6e5..37bcae10840c6c6ef447f84608dbfdf1efc2cc0a 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/processor/PhotonMotionMgc1271Bridge.kt
+@@ -2116,37 +2116,12 @@ object PhotonMotionMgc1271Bridge {
+         try {
+             requireParity(sensorMask.isDirect && sensorMask.capacity().toLong() == pixels * 2L,
+                 "26878 selected 1x R16F mask readback size invalid")
+-            val next = MotionV2SharedRgba16fCarrier.tryCreate(w, h)
+-                ?: invalid("26878 1x final guide hardware buffer unavailable")
++            val next = MotionV2SharedRgba16fCarrier.tryCreateFinal1xGuide(w, h)
++                ?: invalid("26915 1x final guide hardware buffer unavailable")
+             owner = next
+-            val mapped = next.lockCpu()
+-                ?: invalid("26878 1x final guide CPU write map failed")
+-            try {
+-                requireParity(mapped.capacity().toLong() == rgbBytes,
+-                    "26878 1x final guide hardware stride/capacity mismatch")
+-                val rgbSource = rgba.duplicate().order(ByteOrder.nativeOrder())
+-                rgbSource.position(0)
+-                rgbSource.limit(rgbBytes.toInt())
+-                mapped.order(ByteOrder.nativeOrder())
+-                mapped.position(0)
+-                mapped.put(rgbSource)
+-                val mask = sensorMask.duplicate().order(ByteOrder.nativeOrder())
+-                for (i in 0 until pixels.toInt()) {
+-                    // Half-float [0,1], including negative zero, exactly as the
+-                    // 26876 GPU shader validates. Reject NaN/Inf and outliers;
+-                    // do not silently clamp or invent replacement sensor bits.
+-                    val bits = mask.getShort(i * 2).toInt() and 0xffff
+-                    if ((bits and 0x7c00) == 0x7c00 ||
+-                        ((bits and 0x8000) != 0 && bits != 0x8000) ||
+-                        ((bits and 0x8000) == 0 && bits > 0x3c00)) {
+-                        invalid("26878 selected sensor R16F mask invalid pixel=$i half=0x${bits.toString(16)}")
+-                    }
+-                    mapped.putShort(i * 8 + 6, bits.toShort())
+-                }
+-            } finally {
+-                requireParity(next.unlockCpu(), "26878 1x final guide CPU unmap failed")
+-            }
+-            PLog.i(TAG, "IRIS_26878_B_FINAL_GUIDE_ONE_X_CPU_PACK " +
++            requireParity(next.writeFinal1xGuideCpu(rgba, sensorMask),
++                "26915 1x final guide stride-aware CPU pack failed")
++            PLog.i(TAG, "IRIS_26915_B_FINAL_GUIDE_STRIDE_AWARE " +
+                 "postDenoiseRgbExact=true sensorR16fClipExact=true " +
+                 "twoXWronskiGpuUnchanged=true noSecondEglDraw=true")
+             handedOff = true
+diff --git a/app/version.properties b/app/version.properties
+index 22dadf4d06a65f67c1dc6d488158e3be25b5ec79..d2c7a101bf7c25743fef1bf80986aa8ea6007b02 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726914
+-VERSION_BUILD=26914
++VERSION_NAME=0.9726915
++VERSION_BUILD=26915
