@@ -1,0 +1,126 @@
+diff --git a/app/src/main/assets/shaders/motionv2/preview_hue_match_26907.glsl b/app/src/main/assets/shaders/motionv2/preview_hue_match_26907.glsl
+index f996f783b33aa5d37c163fbaa7da5cf4ec665d08..81febd69c34b0bfa56e9564b4525c93c0d4dc9f7 100644
+--- a/app/src/main/assets/shaders/motionv2/preview_hue_match_26907.glsl
++++ b/app/src/main/assets/shaders/motionv2/preview_hue_match_26907.glsl
+@@ -9,6 +9,7 @@ out vec3 Output;
+  * Accepts only independently measured, spatially aligned shutter-preview hue residuals.
+  * Input and output are linear Display-P3. Keep Display-P3 luminance EXACT and preserve the
+  * perceptual chroma magnitude. Do not alter tone, exposure, white point, or saturation policy.
++ * IRIS_26916: preserve hue continuity for every color, including gamut-boundary colors.
+  * Unmatched scenes never invoke this shader. No static hue direction or offset is hardcoded.
+  */
+ const float PI = 3.14159265358979323846;
+@@ -76,8 +77,24 @@ void main(){
+     if(abs(delta)<0.0001)return;
+     vec3 result=rotateHueWithoutTone(src,lab,delta);
+     if(any(lessThan(result,vec3(-0.000005)))||any(isnan(result))||any(isinf(result))){
+-        result=rotateHueWithoutTone(src,lab,0.5*delta);
+-        if(any(lessThan(result,vec3(-0.000005)))||any(isnan(result))||any(isinf(result)))return;
++        // The old full/half/identity decision introduced an abrupt color step
++        // at the Display-P3 boundary. Instead find the greatest feasible hue
++        // angle continuously, without rotating outside positive P3 or changing
++        // source luminance/chroma merely to force a target into gamut.
++        float lo=0.0;
++        float hi=1.0;
++        for(int i=0;i<12;i++){
++            float mid=0.5*(lo+hi);
++            vec3 trial=rotateHueWithoutTone(src,lab,delta*mid);
++            bool valid=all(greaterThanEqual(trial,vec3(-0.000005)))
++                    && !any(isnan(trial)) && !any(isinf(trial));
++            if(valid)lo=mid;
++            else hi=mid;
++        }
++        if(lo<0.0002442)return;
++        result=rotateHueWithoutTone(src,lab,delta*lo);
++        if(any(isnan(result))||any(isinf(result))||any(lessThan(result,vec3(-0.000005))))return;
+     }
++    // Numerical negative epsilon only, not a chroma desaturation stage.
+     Output=max(result,vec3(0.0));
+ }
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PreviewHueCalibration.java b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PreviewHueCalibration.java
+index 32a0b061119d69644da014f25031f36daf47ffad..01c3fe035d9084e057c71f9683e3abdc686121d1 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PreviewHueCalibration.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/processing/opengl/postpipeline/MotionV2PreviewHueCalibration.java
+@@ -16,7 +16,7 @@ public final class MotionV2PreviewHueCalibration {
+     public static final int NO_OFFSET = 0;
+     private static final float PI = (float)Math.PI;
+     private static final float TWO_PI = 2.0f * PI;
+-    private static final float MAX_HUE_CHANGE = 0.46f; // Safety bound (~26deg), never an assigned correction.
++    private static final float MAX_HUE_CHANGE = 0.32f; // Bounded measured residual (~18 degrees), never a fixed hue adjustment.
+     private MotionV2PreviewHueCalibration() {}
+ 
+     public static final class Decision {
+@@ -201,38 +201,47 @@ public final class MotionV2PreviewHueCalibration {
+         if(matched<150)return new Decision(new float[BINS],false,"insufficient_consistent_color_pairs",matched,0,bestO,bestDx,bestDy,best);
+         float[] median=new float[BINS],weight=new float[BINS];
+         int supported=0;
++        // A sparse global hue table must NEVER propagate a supported color's shift
++        // through an unrelated material or an unmeasured part of the hue circle.
++        // Evidence is owned by each measured circular sector, with only a narrow
++        // adjacent-sector feather for continuity at the red/violet wrap boundary.
+         for(int j=0;j<BINS;j++){
+             ArrayList<Float> list=bins[j];
+-            if(list.size()<32)continue;
++            if(list.size()<48)continue;
+             Collections.sort(list);
+             float med=list.get(list.size()/2);
+             float[] dev=new float[list.size()];
+-            for(int k=0;k<dev.length;k++)dev[k]=Math.abs(list.get(k)-med);
++            for(int k=0;k<dev.length;k++)dev[k]=Math.abs(wrap(list.get(k)-med));
+             Arrays.sort(dev);
+             float mad=dev[dev.length/2];
+-            if(mad>0.22f)continue;
++            if(mad>=0.14f)continue;
+             median[j]=clamp(med,-MAX_HUE_CHANGE,MAX_HUE_CHANGE);
+-            weight[j]=smooth(32,110,list.size())*(1-smooth(0.06f,0.17f,mad));
+-            if(weight[j]>0.05f)supported++;
++            weight[j]=smooth(48,192,list.size())*(1-smooth(0.04f,0.14f,mad));
++            if(weight[j]>=0.06f)supported++;
+         }
+         if(supported<2)return neutral("insufficient_supported_hues",best);
+         float[] deltas=new float[BINS];
+         int nonzero=0;
+         for(int j=0;j<BINS;j++){
+             float total=0,wsum=0;
+-            for(int off=-2;off<=2;off++){
++            // Circular, compact-support reconstruction. Unmeasured sectors more
++            // than one sector away stay at identity instead of acquiring a guess.
++            for(int off=-1;off<=1;off++){
+                 int k=(j+off+BINS)%BINS;
+-                float d=Math.abs(median[k]-median[j]);
+-                // Never interpolate between inconsistent hues across a nearby boundary.
+-                if(weight[j]>0.05f&&weight[k]>0.05f&&d>0.23f)continue;
+-                float w=weight[k]/(1+off*off);
++                if(weight[k]<0.06f)continue;
++                // Direct measurements take precedence. Do not mix contradictory
++                // neighboring residuals and smear real yellow/orange boundaries.
++                if(weight[j]>=0.06f && off!=0
++                        && Math.abs(wrap(median[k]-median[j]))>0.14f)continue;
++                float w=weight[k]*(off==0?1.0f:0.25f);
+                 total+=w*median[k];wsum+=w;
+             }
+-            float estimated=wsum>0.03f?clamp(total/wsum,-MAX_HUE_CHANGE,MAX_HUE_CHANGE):0;
+-            float support=clamp(wsum/1.2f,0,1);
+-            if(Math.abs(estimated)<0.055f)estimated=0; // Measurement deadband, NOT a fixed hue offset.
+-            deltas[j]=estimated*support;
+-            if(Math.abs(deltas[j])>=0.04f)nonzero++;
++            if(wsum<0.06f)continue;
++            float estimated=clamp(total/wsum,-MAX_HUE_CHANGE,MAX_HUE_CHANGE);
++            float confidence=clamp(wsum/1.30f,0.0f,1.0f);
++            float significance=smooth(0.015f,0.065f,Math.abs(estimated));
++            deltas[j]=estimated*confidence*significance;
++            if(Math.abs(deltas[j])>=0.025f)nonzero++;
+         }
+         if(nonzero<2)return neutral("already_consistent",best);
+         return new Decision(deltas,true,"measured_pixel_correspondence",matched,supported,bestO,bestDx,bestDy,best);
+diff --git a/app/version.properties b/app/version.properties
+index d2c7a101bf7c25743fef1bf80986aa8ea6007b02..01a85a5393cb54ee9709559ff278deeb3911fea0 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726915
+-VERSION_BUILD=26915
++VERSION_NAME=0.9726916
++VERSION_BUILD=26916
