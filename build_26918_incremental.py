@@ -146,8 +146,28 @@ def verify_compiled():
  include=R/'app/src/main/cpp/iris26856/amaze/shaders/amaze_tile.glsl'
  expanded=import_shader.read_text().replace('#include "amaze_tile.glsl"','#line 1 20\n'+include.read_text()+'\n#line 6 21')
  if (target/'amaze_import_expanded.comp').read_text()!=expanded or (target/'amaze_import.spv').read_bytes()!=(R/'app/src/main/assets/iris26856/rawr/amaze/spv/amaze_import.spv').read_bytes():fail('26917 preserved AMaZE compiler input/SPV mismatch')
- for p in [OUT/'26917_AMAZE_IMPORT_SHADER_REAL_COMPILER.txt',OUT/'26917_AMAZE_IMPORT_SPIRV_VALIDATED.txt']:
-  if not p.is_file() or 'PASS' not in p.read_text():fail('26917 real native SPV compiler gate absent')
+ # The inherited 26917 compiler is re-executed above, but its script still
+ # writes receipts to photon_26917_outputs/ (not the new 26918 output folder).
+ # This gate verifies CURRENT-RUN native compiler evidence, never an assumed
+ # old receipt or a synthetic PASS; the source and SPV were checked above.
+ prior_native=R/'photon_26917_outputs'
+ native_glsl=prior_native/'26917_AMAZE_IMPORT_SHADER_REAL_COMPILER.txt'
+ native_spirv=prior_native/'26917_AMAZE_IMPORT_SPIRV_VALIDATED.txt'
+ native_optimized=target/'amaze_import.opt.spv'
+ for p in (native_glsl,native_spirv,native_optimized):
+  if not p.is_file() or p.stat().st_size<64:fail('26917 real native SPV compiler gate absent: '+str(p))
+ glsl_receipt=native_glsl.read_text()
+ spirv_receipt=native_spirv.read_text()
+ if ('REAL PINNED GLSL COMPILE: PASS' not in glsl_receipt or
+     'glslang 16.5.0' not in glsl_receipt or
+     sha(target/'amaze_import_expanded.comp') not in glsl_receipt or
+     sha(target/'amaze_import.spv') not in glsl_receipt):
+  fail('26917 pinned native compiler receipt does not match executed source and SPV')
+ if ('REAL SPIR-V VALIDATION: PASS' not in spirv_receipt or
+     'spirv-opt --target-env=vulkan1.1 -O' not in spirv_receipt or
+     sha(target/'amaze_import.spv') not in spirv_receipt or
+     sha(native_optimized) not in spirv_receipt):
+  fail('26917 real Vulkan SPIR-V optimization/validation receipt mismatch')
  # New source is ESSL300. Compile exact runtime bytes as ESSL300; a second
  # semantically identical ESSL310 test variant runs genuine spirv-val/opt.
  c=R/'.photon_26904_incremental_work/real_shader_tools/26918_chroma'

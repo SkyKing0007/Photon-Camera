@@ -16,7 +16,7 @@ PRIOR_ARTIFACT=13786011058
 PRIOR_ART_SHA='ae09ca810fee66057f173ccc65efbe18772c2561b0c96e8931763da748b2e57b'
 PRIOR_TAR_SHA='d82d550362b22a5486098335a41e3817b1417256205c356c6ef837aceb7d68a1'
 PRIOR_APK_SHA='3846787d39e59084098d1771f7b8084fd12c86e36157cc098c0961fdf9773c18'
-TRIGGER=b'RUN_26918_B_OFF_POST_AMAZE_CHROMA_BYPASS_FROM_26917_V1\n'
+TRIGGER=b'RUN_26918_B_OFF_POST_AMAZE_CHROMA_BYPASS_FROM_26917_V2_RECEIPT_PATH_FIX\n'
 CHANGED={
  'app/src/main/java/com/hinnka/mycamera/processor/GlesIris26870PostAmazeChroma.kt',
  'app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt',
@@ -91,6 +91,22 @@ def verify():
                 "'ACTUAL_EXECUTED_build_26918_incremental.py'","'ACTUAL_EXECUTED_build-26918-change-aware.yml'"]:
   need(marker in builder,'builder missing real authority/invariance gate '+marker)
  need("'26916_candidate_app_source.tar.gz'" not in builder and "'26915_success.zip'" not in builder,'stale authority in builder')
+
+ # 26918 V2 regression: the *successful* 26917 compiler's actual output
+ # directory remains photon_26917_outputs. The wrong 26918-folder lookup
+ # caused Actions run 42890269282 to fail after real compilers succeeded.
+ need("prior_native=R/'photon_26917_outputs'" in builder and
+      "native_glsl=prior_native/'26917_AMAZE_IMPORT_SHADER_REAL_COMPILER.txt'" in builder and
+      "native_spirv=prior_native/'26917_AMAZE_IMPORT_SPIRV_VALIDATED.txt'" in builder and
+      "native_optimized=target/'amaze_import.opt.spv'" in builder and
+      "sha(native_optimized) not in spirv_receipt" in builder and
+      "sha(target/'amaze_import_expanded.comp') not in glsl_receipt" in builder and
+      "'glslang 16.5.0' not in glsl_receipt" in builder,
+      '26918 V2 inherited real native compiler evidence path/integrity gate missing')
+ need("OUT/'26917_AMAZE_IMPORT_SHADER_REAL_COMPILER.txt'" not in builder and
+      "OUT/'26917_AMAZE_IMPORT_SPIRV_VALIDATED.txt'" not in builder,
+      'stale incorrect 26918 output-directory reference for 26917 compiler receipts')
+
  need('on:\n  push:\n    branches:\n      - experimental-clean-photon-rebuild\n    paths:\n      - TRIGGER_26918.txt' in wf,'wrong branch/trigger')
  need('TRIGGER_26917.txt' not in wf and 'TRIGGER_26916.txt' not in wf,'old triggers in new workflow')
  need(wf.count('actions/upload-artifact@v4')==1 and wf.count('./gradlew --no-daemon --build-cache :app:assembleDebug')==1,'mandatory real build altered')

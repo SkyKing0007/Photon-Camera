@@ -1,4 +1,4 @@
-# Photon 26918 — B Photo Super Res OFF post-AMaZE chroma-bypass experiment
+# Photon 26918 V2 — corrected inherited 26917 compiler-receipt path, same B Photo OFF chroma bypass
 
 **Delivery state: LOCALLY VALIDATED / PREPARED FOR ACTIONS, not BUILD-PROVEN.** This ZIP contains **no APK**, no compiled-source TAR and no instruction for the user to run scripts. The only intended delivery is a **three-stage manual upload through vscode.dev**. A new successful GitHub Actions job and its published artifact are mandatory before claiming 26918 BUILD-PROVEN. These sources have not been device-tested, and bypassing this filter may expose extra random chroma noise or leave broad peach blotches unchanged.
 
@@ -27,15 +27,24 @@ The 26917 office JPEGs 12:13:30 and 12:42:17 show broad peach/cyan patches, but 
 
 `26918_FROZEN_26917_BORDER.sha256` carries the exact seven compiled-26917 file hashes for native AMaZE header, pipeline, import shader source, JNI bridge, Java, Kotlin and **actual generated `amaze_import.spv`**. The 26918 builder verifies them before transformation, after transformation, after the real GLSL/Vulkan compile, and after full assembly. Re-running the original `test_26917_border.py --live` checks the four sides, all corners, all Bayer patterns and border ownership (440,800 coordinate/phase checks); all historical 26917 payload regressions remain. Any drift blocks the build.
 
+
+## 26918 V2 correction of failed Actions run 42890269282 (no successful 26918 APK)
+
+- **Runtime authority remains the most recent successful Actions artifact 26917**. The preceding 26918 run **42890269282** failed at `build_26918_incremental.py verify-compiled` before full Android compilation and published no artifact. A failed run cannot become source/runtime authority.
+- The original 26917 `compile_26917_amaze_import.sh` writes genuine Vulkan SPIR-V receipts to `photon_26917_outputs/`. The 26918 V1 builder wrongly searched `photon_26918_outputs/` for those two inherited receipts, despite real 26917 and 26918 shader compilation having succeeded. The 26918 V2 builder now points to the **actual prior compiler's current-run output directory**; it additionally checks pinned glslang version, compiled source digest, shipped native SPV digest, and optimized SPV digest against the real compiler receipts.
+- **No runtime source, source manifest, changed-file allowlist, forward patch, shader compiler, 26917 physical-border asset, or workflow file differs from the previously prepared 26918 ZIP.** Only `build_26918_incremental.py`, `verify_26918_handoff.py`, the SHA seal, this README, and the trigger contents are revised.
+- The trigger is V2 by design: uploading identical V1 trigger contents would not create a new push event. Re-upload stage 1, review unchanged stage 2 workflow, then upload the V2 trigger **last**. Never rerun failed 26918 V1 unchanged or bypass the blocked gate.
+- The workflow stage order and historical 26886/26887, 26903, 26904 V1/V2/V3, 26914 Kotlin and 26917 physical-border source/regression protections remain exactly as inherited. The V2 correction is limited to the expected receipt path and corresponding fail-closed regression.
+
 ## Exactly 3 manual vscode.dev upload stages
 
-1. **STAGE 1:** Upload exactly all **19 files** in `26918_STAGE1_PATHS.txt` to the matching repository-relative paths, including `handoff_payload_26918/...`. Keep every pre-existing 26917/26916 source, validator, builder, and workflow exactly as-is. Do **not** upload the README, ZIP itself, any APK, prior TAR, or local workspace.
-2. **STAGE 2:** Upload **only** `.github/workflows/build-26918-change-aware.yml` to that exact path.
-3. **STAGE 3:** Upload **only** `TRIGGER_26918.txt` to repository root **LAST**. Its bytes must be `RUN_26918_B_OFF_POST_AMAZE_CHROMA_BYPASS_FROM_26917_V1\n` (one trailing LF). This is the only new workflow push trigger; the new workflow also offers manual dispatch.
+1. **STAGE 1:** Replace/upload exactly all **19 files** in `26918_STAGE1_PATHS.txt` to the matching repository-relative paths, including `handoff_payload_26918/...`. Keep every pre-existing 26917/26916 source, validator, builder, and workflow exactly as-is. Do **not** upload the README, ZIP itself, any APK, prior TAR, or local workspace.
+2. **STAGE 2:** Upload **only** `.github/workflows/build-26918-change-aware.yml` to that exact path. Its bytes are unchanged from the previously uploaded 26918 V1 workflow; do not edit the workflow.
+3. **STAGE 3:** Upload **only** `TRIGGER_26918.txt` to repository root **LAST**. Its bytes must be `RUN_26918_B_OFF_POST_AMAZE_CHROMA_BYPASS_FROM_26917_V2_RECEIPT_PATH_FIX\n` (one trailing LF). This is the only new workflow push trigger; the new workflow also offers manual dispatch.
 
-After the three stages are uploaded and reviewed, **you** may commit/push on `experimental-clean-photon-rebuild`. No assistant commit/push or backup was performed. Suggested single commit message:
+After the three stages are uploaded and reviewed, **you** may commit/push on `experimental-clean-photon-rebuild`. No assistant commit/push or backup was performed. Suggested corrected-handoff commit message:
 
-`Photon 26918: B OFF bypass legacy post-AMaZE chroma cleanup, protect 26917 borders`
+`Photon 26918 V2: fix inherited 26917 shader receipt path without weakening build gates`
 
 ## EXACT successful 26917 build and verification procedure — no weakening
 
