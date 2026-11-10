@@ -1,0 +1,42 @@
+#version 450
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copies one tile of the CFA into the AMaZE source buffer as f32 bits
+// (amaze.wgsl reads them with sourceIsFloat = 1 and applies WB). Input is either
+// the packed half-resolution RGBA16F image (inputMode 0) or a full-resolution
+// float buffer in the 0..255 working domain (inputMode 1, rcd::NormalizedBayerBufferView).
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "amaze_tile.glsl"
+layout(std430, set = 0, binding = 0) writeonly buffer Source { uint words[]; } source;
+layout(set = 0, binding = 5) uniform sampler2D packedInput;
+layout(std430, set = 0, binding = 7) readonly buffer Normalized { float bayer255[]; } normalizedInput;
+// Repeated even-period reflection preserves physical Bayer x/y phase on
+// every edge and corner, including raw dimensions smaller than one tile.
+// It does not import/alter any RGB or synthetic CFA data.
+int iris26917ReflectPhysicalBayer(int v, int count) {
+    int period = 2 * (count - 1);
+    int folded = v % period;
+    if (folded < 0) folded += period;
+    return folded < count ? folded : period - folded;
+}
+void main() {
+    uvec2 l = gl_GlobalInvocationID.xy;
+    if (l.x >= tile.srcWidth || l.y >= tile.srcHeight) return;
+    // Native B OFF uses a signed virtual source origin (-16 at left/top).
+    // Old routes use exactly their previous nonnegative coordinates.
+    ivec2 g = ivec2(int(tile.srcOriginX) + int(l.x),
+                    int(tile.srcOriginY) + int(l.y));
+    if (tile.reserved > 0.5) {
+        // In packed mode outputImage has raw physical dimensions; use the
+        // exact width/height provided by normalized/raw input contract.
+        ivec2 extent = textureSize(packedInput, 0) * 2;
+        g = ivec2(iris26917ReflectPhysicalBayer(g.x, extent.x),
+                  iris26917ReflectPhysicalBayer(g.y, extent.y));
+    }
+    float v;
+    if (tile.inputMode > 0.5) {
+        v = normalizedInput.bayer255[uint(g.y) * uint(tile.inputWidth) + uint(g.x)] * (1.0 / 255.0);
+    } else {
+        v = texelFetch(packedInput, g >> 1, 0)[cfaComponent(g, uint(tile.pattern))];
+    }
+    source.words[TILE_SLOT * kSrcPix + l.y * tile.srcWidth + l.x] = floatBitsToUint(v);
+}
