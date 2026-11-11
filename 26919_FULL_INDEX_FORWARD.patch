@@ -1,0 +1,222 @@
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrFalseColor.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrFalseColor.kt
+index ad20ec6874d81fe3783cd50190137713d212f809..75e1cea9d188c4ce5d1acab6393d5d000bc13066 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrFalseColor.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26856RawrFalseColor.kt
+@@ -26,6 +26,12 @@ internal object GlesIris26856RawrFalseColor {
+         uniform sampler2D uRgb;
+         uniform ivec2 uSize;
+         uniform int uNormalizedChroma;
++        // IRIS_26919_B_OFF_CLIPPED_COLOR_BOUNDARY: original physical CFA
++        // clipping is 1.0 in R16F for a clipped sensor site (not RGB alpha).
++        // Enabled only for B Photo SR OFF. Unclipped and all other routes
++        // retain the original RAWR FCC median mathematics exactly.
++        uniform sampler2D uOriginalSensorClip26919;
++        uniform int uClipAwareBOff26919;
+         layout(location=0) out vec2 oIQ;
+ 
+         vec2 toIQ(vec3 c) {
+@@ -71,6 +77,19 @@ internal object GlesIris26856RawrFalseColor {
+             cswap(v3,v4);
+             return v3;
+         }
++        bool nearOriginalClipping(ivec2 p) {
++            // No reads outside physical sensor; the successful 26917 AMaZE
++            // edge/halo implementation is frozen and this guard avoids
++            // changing the outer four pixels at all.
++            const ivec2 taps[13]=ivec2[13](
++                ivec2(0,0),ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),
++                ivec2(1,1),ivec2(1,-1),ivec2(-1,1),ivec2(-1,-1),
++                ivec2(2,0),ivec2(-2,0),ivec2(0,2),ivec2(0,-2));
++            for(int i=0;i<13;++i)
++                if(texelFetch(uOriginalSensorClip26919,p+taps[i],0).r>0.5)
++                    return true;
++            return false;
++        }
+         void main() {
+             ivec2 p=ivec2(gl_FragCoord.xy);
+             int W=uSize.x, H=uSize.y;
+@@ -79,6 +98,16 @@ internal object GlesIris26856RawrFalseColor {
+                 oIQ=iqAt(x,y);
+                 return;
+             }
++            // A clipped sensor-site chroma is not a trustworthy donor.
++            // Keep the center's actual chroma, rather than allowing the
++            // neighborhood median to propagate a clipped lamp's hue.
++            // The later reconstruction also rejects clipped neighbor donors.
++            if (uClipAwareBOff26919!=0 &&
++                x>=4 && x<W-4 && y>=4 && y<H-4 &&
++                nearOriginalClipping(p)) {
++                oIQ=iqAt(x,y);
++                return;
++            }
+             vec2 upL=iqAt(x-1,y-1),midL=iqAt(x-1,y),downL=iqAt(x-1,y+1);
+             vec2 upC=iqAt(x,y-1),midC=iqAt(x,y),downC=iqAt(x,y+1);
+             vec2 upR=iqAt(x+1,y-1),midR=iqAt(x+1,y),downR=iqAt(x+1,y+1);
+@@ -103,6 +132,8 @@ internal object GlesIris26856RawrFalseColor {
+         uniform int uNormalizedChroma;
+         uniform float uEdgeSigma;
+         uniform float uChromaBound;
++        uniform sampler2D uOriginalSensorClip26919;
++        uniform int uClipAwareBOff26919;
+         layout(location=0) out vec4 oRgb;
+ 
+         float Yof(vec3 c) { return 0.299*c.r+0.587*c.g+0.114*c.b; }
+@@ -131,9 +162,47 @@ internal object GlesIris26856RawrFalseColor {
+             ivec2 p=ivec2(gl_FragCoord.xy);
+             vec4 src=texelFetch(uRgb,p,0);
+             if(p.y==0||p.y==uSize.y-1) { oRgb=src; return; }
++            // Leave the original physical border alone; guard only an actual
++            // sensor-clipped area and only on independent B Photo SR OFF.
++            bool gate=uClipAwareBOff26919!=0 &&
++                p.x>=4 && p.y>=4 && p.x<uSize.x-4 && p.y<uSize.y-4;
++            bool clippedCenter=false, nearClip=false;
++            if(gate) {
++                clippedCenter=texelFetch(uOriginalSensorClip26919,p,0).r>0.5;
++                if(clippedCenter){oRgb=src;return;} // Preserve existing white fade.
++                const ivec2 nearTaps[12]=ivec2[12](
++                    ivec2(1,0),ivec2(-1,0),ivec2(0,1),ivec2(0,-1),
++                    ivec2(1,1),ivec2(-1,1),ivec2(1,-1),ivec2(-1,-1),
++                    ivec2(2,0),ivec2(-2,0),ivec2(0,2),ivec2(0,-2));
++                for(int i=0;i<12;++i){
++                    if(texelFetch(uOriginalSensorClip26919,p+nearTaps[i],0).r>0.5){
++                        nearClip=true;break;
++                    }
++                }
++            }
+             vec2 iq=vec2(0.0);
+             if(p.x==0||p.x==uSize.x-1) {
+                 iq=texelFetch(uMedianIq,p,0).rg;
++            } else if(nearClip) {
++                // Original CFA clipping, not RGB saturation inference, owns
++                // this boundary. Keep color evidence on the same luminance
++                // side and NEVER import chroma from an actually clipped site.
++                // Distant clean ceiling and non-B routes remain exact RAWR.
++                float Yc=Yof(src.rgb);
++                float sigma=max(0.018,0.22*max(Yc,0.025));
++                float inv2s2=1.0/(sigma*sigma);
++                float wSum=0.0;
++                for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx) {
++                    ivec2 q=p+ivec2(dx,dy);
++                    if(texelFetch(uOriginalSensorClip26919,q,0).r>0.5) continue;
++                    float Yn=Yof(texelFetch(uRgb,q,0).rgb);
++                    float d=Yn-Yc;
++                    float w=exp(-d*d*inv2s2);
++                    iq+=w*texelFetch(uMedianIq,q,0).rg;
++                    wSum+=w;
++                }
++                if(wSum<=1.0e-6){oRgb=src;return;}
++                iq/=wSum;
+             } else if(uEdgeSigma>0.0) {
+                 float Yc=Yof(src.rgb);
+                 float inv2s2=1.0/max(uEdgeSigma*uEdgeSigma,1.0e-8);
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 7de1d0b109491ba21723d96dc0942bdc95625107..eed54b929a3863eceb74586f75240e44b79adda0 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2321,6 +2321,7 @@ internal class GlesMgcRawSpatialStacker(
+                     bNoiseVariance26863 = 0, bNoiseSupport26863 = 0,
+                     rawrNativeReceipt26864 = Iris26864NativeRawrDomainReceipt(true, true, true),
+                     bPhotoSrOffChromaBypass26918 = true,
++                    bPhotoSrOffClipAwareFcc26919 = true,
+                 )
+                 frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG }?.let { long ->
+                     check(frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } == 1) {
+@@ -6680,8 +6681,16 @@ internal class GlesMgcRawSpatialStacker(
+         edgeSigma: Float,
+         chromaBound: Float,
+         processingWidth: Int = width, processingHeight: Int = height,
++        bPhotoSrOffOriginalSensorClip26919: Int = 0,
+     ): Int {
+         check(defringedCameraLinearRgb != 0) { "26856 B requires AMaZE + defringe RGB owner" }
++        if (bPhotoSrOffOriginalSensorClip26919 != 0) {
++            check(iris26856BOnlyIndependentPublication &&
++                iris26864RealRawrOwnsBurstNoise && !iris26856BTrue2x &&
++                !enableSabreSuperRes && !enableHighZoomDetail) {
++                "26919 clip-aware FCC must be B Photo native HDRq Super Res OFF only"
++            }
++        }
+         if (iris26856FccMedianProgram == 0) {
+             iris26856FccMedianProgram = linkProgram(
+                 GlesIris26856RawrFalseColor.medianChroma,
+@@ -6706,6 +6715,14 @@ internal class GlesMgcRawSpatialStacker(
+                 bindTexture(medianProgram, "uRgb", 0, src)
+                 uniform2i(medianProgram, "uSize", processingWidth, processingHeight)
+                 uniform1i(medianProgram, "uNormalizedChroma", if (normalizedChroma) 1 else 0)
++                // A real native R16F per-physical-CFA-site clipping mask exists
++                // only for the proven B Photo OFF caller. Its lifetime spans
++                // both FCC passes. Explicit uniforms prevent cross-shot leaks.
++                uniform1i(medianProgram, "uClipAwareBOff26919",
++                    if (bPhotoSrOffOriginalSensorClip26919 != 0) 1 else 0)
++                if (bPhotoSrOffOriginalSensorClip26919 != 0)
++                    bindTexture(medianProgram, "uOriginalSensorClip26919", 2,
++                        bPhotoSrOffOriginalSensorClip26919)
+                 draw(medianProgram, processingWidth, processingHeight, intArrayOf(iq))
+                 val reconstructionProgram = iris26856FccReconstructProgram
+                 GLES30.glUseProgram(reconstructionProgram)
+@@ -6715,6 +6732,11 @@ internal class GlesMgcRawSpatialStacker(
+                 uniform1i(reconstructionProgram, "uNormalizedChroma", if (normalizedChroma) 1 else 0)
+                 uniform1f(reconstructionProgram, "uEdgeSigma", edgeSigma)
+                 uniform1f(reconstructionProgram, "uChromaBound", chromaBound)
++                uniform1i(reconstructionProgram, "uClipAwareBOff26919",
++                    if (bPhotoSrOffOriginalSensorClip26919 != 0) 1 else 0)
++                if (bPhotoSrOffOriginalSensorClip26919 != 0)
++                    bindTexture(reconstructionProgram, "uOriginalSensorClip26919", 2,
++                        bPhotoSrOffOriginalSensorClip26919)
+                 val dst = if (step == 0) firstPass else finalPass
+                 draw(reconstructionProgram, processingWidth, processingHeight, intArrayOf(dst))
+                 src = dst
+@@ -7089,6 +7111,7 @@ internal class GlesMgcRawSpatialStacker(
+         bNoiseSupport26863: Int,
+         rawrNativeReceipt26864: Iris26864NativeRawrDomainReceipt? = null,
+         bPhotoSrOffChromaBypass26918: Boolean = false,
++        bPhotoSrOffClipAwareFcc26919: Boolean = false,
+     ): Int {
+         if (rawrNativeReceipt26864 == null) {
+             require(bNoiseVariance26863 != 0 && bNoiseSupport26863 != 0) {
+@@ -7112,6 +7135,16 @@ internal class GlesMgcRawSpatialStacker(
+                 "26918 bypass restricted to direct NORMAL B Photo Super Res OFF"
+             }
+         }
++        if (bPhotoSrOffClipAwareFcc26919) {
++            // Original per-physical-site sensor clipping, no threshold inferred
++            // from tone, and no Wronski/Night/Sabre/A/legacy routing.
++            check(bPhotoSrOffChromaBypass26918 && nativeSensorClipFullRes26866 != 0 &&
++                rawrNativeReceipt26864 != null &&
++                iris26856BOnlyIndependentPublication && iris26864RealRawrOwnsBurstNoise &&
++                !iris26856BTrue2x && !enableSabreSuperRes && !enableHighZoomDetail) {
++                "26919 requires true B Photo SR OFF native HDRq clipping provenance"
++            }
++        }
+         check(amazePostWbCameraRgb != 0) { "26856 B missing true RAWR AMaZE RGB" }
+         require(labDefringeStrength.isFinite() && labDefringeStrength in 0f..1f)
+         // B-only: native export is SENSOR-NEUTRAL, never post-WB. The single
+@@ -7193,12 +7226,16 @@ internal class GlesMgcRawSpatialStacker(
+                 snapshot.postWbCameraToSrgb, labDefringeStrength,
+                 processingWidth, processingHeight,
+             )
+-            // RAWR default FCC policy: 2 serial median/reconstruction steps,
+-            // normalized chroma, no optional bilateral or gamut bound.
++            // Historical RAWR FCC remains byte-mathematically unchanged on
++            // every other route. Only direct B Photo OFF has a native original
++            // sensor clip sidecar; preserve smooth white WB/common ceiling
++            // unchanged and block clipped CFA chroma from crossing its edge.
+             fcc = renderRawrFalseColor26856(
+                 defringed, normalizedChroma = true,
+                 edgeSigma = 0f, chromaBound = 0f,
+                 processingWidth = processingWidth, processingHeight = processingHeight,
++                bPhotoSrOffOriginalSensorClip26919 =
++                    if (bPhotoSrOffClipAwareFcc26919) nativeSensorClipFullRes26866 else 0,
+             )
+             // RAWR Highlight Reconstruction OFF now runs inside the native
+             // B-only temporary-WB shader BEFORE the inherited Lab -> FCC.
+diff --git a/app/version.properties b/app/version.properties
+index 0abbe331745f0e214de5f0f9d03c33e5df312139..d4afbafe4c8144fc093bb1c3fb409321facb7fba 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726918
+-VERSION_BUILD=26918
++VERSION_NAME=0.9726919
++VERSION_BUILD=26919
