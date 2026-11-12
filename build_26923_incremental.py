@@ -72,6 +72,8 @@ def seal():
  if parse(R/'26923_PROTECTED_SOURCE.sha256')!={p:h for p,h in old.items() if p not in CHANGE}:fail('2031 protected-path mismatch')
  if '26923_FORWARD_FULLINDEX.patch' not in files or 'compile_26923_shaders.sh' not in files or 'compile_26923_lk_shaders.py' not in files:fail('missing mandatory compiler or patch')
  if 'test_26923_workflow_refs.py' not in files:fail('missing 43280180906 workflow dependency regression')
+ if 'test_26923_shader_contract.py' not in files:fail('missing real 43299831723 shader uniform ABI regression')
+ if 'python3 -S test_26923_shader_contract.py' not in (R/'.github/workflows/build-26923-change-aware.yml').read_text():fail('missing actual shader precompile stage')
  if '26923_EXPECTED_ACTION_EXECUTABLES.txt' not in files:fail('missing exact executable dependency inventory')
  wf=(R/'.github/workflows/build-26923-change-aware.yml').read_text()
  if 'python3 -S test_26923_workflow_refs.py' not in wf or 'test_26922_guard.py' in wf or wf.count('python3 -S test_26922_source.py --payload')!=3:fail('stale/incomplete historical workflow dependency gate')

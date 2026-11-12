@@ -81,8 +81,8 @@ if __name__=='__main__':
     assert trigger.is_file(), 'Missing actual stage-3 trigger file'
     trigger_text=trigger.read_text()
     assert '      - TRIGGER_26923.txt' in wf, 'Workflow push path filter excludes the uploaded stage-3 trigger'
-    assert 'revision=V3_AFTER_V2_NO_PUSH_PATH_CHANGE' in trigger_text, 'Uploaded trigger is not the new V3 Actions trigger'
-    assert 'previous_commit=39df1eefe71c753456e5a8ded25f424533fb38a3' in trigger_text, 'Trigger not bound to failed V2 branch state'
-    assert hashlib.sha256(trigger.read_bytes()).hexdigest() != 'bf597ab0c885bca3cea12999f287b868571a6047393bda7629a8ca0385459574', 'Stale V1/V2 trigger cannot fire push-path-filter'
-    print('PASS 26923 V3 trigger explicitly differs from V1/V2, matches workflow push path, and is SHA-sealed')
+    assert 'revision=V4_SHADER_ABI_CHECK_BEFORE_REAL_COMPILE' in trigger_text, 'Uploaded trigger is not the new V4 Actions trigger'
+    assert 'previous_commit=00b64be3dec8e683dd90632fa0e9c7a5047df2a6' in trigger_text, 'Trigger not bound to failed V3 branch state'
+    assert hashlib.sha256(trigger.read_bytes()).hexdigest() not in {'bf597ab0c885bca3cea12999f287b868571a6047393bda7629a8ca0385459574', 'd374554400be2b294f5fc28553d44de1d4bb63b20628a51949b8145495a136b6'}, 'Stale V1/V2/V3 trigger cannot fire push-path-filter'
+    print('PASS 26923 V4 trigger differs from V1/V2/V3, matches workflow push path, and is SHA-sealed')
     print(f'PASS 26923 {len(refs)} executable references exist in checked-out source (including indirect compiler wrappers), 26922 payload correctly scoped')

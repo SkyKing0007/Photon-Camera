@@ -17,6 +17,7 @@ assert '.github/workflows/build-26923-change-aware.yml' in paths
 assert 'compile_26923_hr_spirv.sh' in paths
 assert 'test_26923_patch_proof.py' in paths
 assert 'test_26923_workflow_refs.py' in paths
+assert 'test_26923_shader_contract.py' in paths
 assert '26923_EXPECTED_ACTION_EXECUTABLES.txt' in paths
 with tempfile.TemporaryDirectory(prefix='p26923_seal_mutations_') as tmp:
  d=Path(tmp)

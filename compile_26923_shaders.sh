@@ -51,7 +51,8 @@ assert s.count('val shader="""')==1
 src=s.split('val shader="""',1)[1].split('""".trimIndent()',1)[0]
 assert src.lstrip().startswith('#version 300 es')
 src=textwrap.dedent(src).strip()+'\n'
-assert src.count('uniform int uIris26923SrOn;')==1 and 'IRIS_26922_SR_ON_UNCERTAINTY_AWARE_CHROMA' in src
+# 26923 V4: exact successful 26922 inline shader ABI keeps its 26922 uniform.
+assert src.count('uniform int uIris26922SrOn;')==1 and 'IRIS_26922_SR_ON_UNCERTAINTY_AWARE_CHROMA' in src
 out=Path('.photon_26904_incremental_work/real_shader_tools/26923_sr_shaders')
 (out/'chroma_es300.frag').write_text(src)
 (out/'chroma_es310.frag').write_text(src.replace('#version 300 es','#version 310 es',1))
