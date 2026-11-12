@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Additive strict prebuild compile of the ACTUAL Vulkan 26920 active shaders,
-# both production and trace variants. Original pinned 26919 gates retained.
+# both production and trace variants. Successful 26919 verification gates and actual 26917 runtime preserved.
 set -euo pipefail
 cd "$(dirname "$0")"
 TOOLROOT="$PWD/.photon_26904_incremental_work/real_shader_tools"
@@ -26,7 +26,7 @@ python3 -S test_26920_source.py --live
       if [ "$variant" = trace ]; then ARG+=('-DRAWR_PARITY_TRACE=1'); fi
       "$COMPILER" -V --target-env vulkan1.1 -S comp "${ARG[@]}" -o "$OUT/${shader}_${variant}.spv" "$SRC"
       spirv-val --target-env vulkan1.1 "$OUT/${shader}_${variant}.spv"
-      spirv-opt --target-env vulkan1.1 -O "$OUT/${shader}_${variant}.spv" -o "$OUT/${shader}_${variant}.opt.spv"
+      spirv-opt --target-env=vulkan1.1 -O "$OUT/${shader}_${variant}.spv" -o "$OUT/${shader}_${variant}.opt.spv"
       spirv-val --target-env vulkan1.1 "$OUT/${shader}_${variant}.opt.spv"
       sha256sum "$SRC" "$OUT/${shader}_${variant}.spv" "$OUT/${shader}_${variant}.opt.spv"
     done

@@ -1,7 +1,33 @@
-# Photon 26920 V2 — ACTIVE per-physical-lens Lucas–Kanade SR, built on clean 26917
+# Photon 26920 V3 — Active Lucas–Kanade SR with corrected mandatory SPIR-V optimizer CLI (26917 source)
 
-**Delivery state: LOCALLY VALIDATED / PREPARED FOR ACTIONS. NOT BUILD-PROVEN.**
-This is the revised **functional image-path** handoff, replacing the earlier
+## Why V2 failed and exact V3 correction
+
+The actual 26920 V2 GitHub Actions run **43144114124**, job **130937798460**, commit
+`efa3a48ec652714e7c874eddf28b6f057677503a`, **FAILED** in the mandatory
+new GLSL/SPIR-V compiler at step 24. This is a targeted historical 26904 V1
+regression. The new `compile_26920_lk_shaders.sh` had mistakenly used
+`spirv-opt --target-env vulkan1.1 -O`, but real SPIRV-Tools requires
+`spirv-opt --target-env=vulkan1.1 -O`. The optimizer treated `vulkan1.1`
+as an input filename and aborted with `error: More than one input file specified`.
+The pinned glslang compiler generated the first LK shader SPIR-V and its
+first spirv-val passed; optimization then failed before completing val-opt-val.
+No Kotlin, Java, Android NDK or APK assembly ran. No Actions
+artifact was published. This is a build-infrastructure failure, not evidence
+about physical-device LK image quality.
+
+V3 fixes precisely that optimizer argument, adds a verifier semantic assertion
+and hostile **resealed** negative test that rejects the former malformed
+optimizer invocation, and refreshes only the SHA handoff seal, workflow name,
+trigger, verifier and this README. **Every one of the 16 26920 V2 runtime
+source payload files is byte-identical in V3**; 26917 is still the authority.
+All original 26917/26919 historical compiler stages and full-APK assembly
+remain mandatory, in the same order, without skips. If the next real compile
+reveals a separate GLSL/NDK problem, fix that exact problem without weakening
+the compiler rather than claiming a successful build.
+
+
+**V3 delivery state: LOCALLY VALIDATED / PREPARED FOR ACTIONS. NOT BUILD-PROVEN.**
+This is the corrected **functional image-path** handoff, superseding the failed V2 and earlier
 26920 shadow/diagnostic-only ZIP. It does not contain a 26920 APK, compiled
 26920 source TAR, or published 26920 Actions artifact. After the user's
 standard three-stage vscode.dev upload, a real successful GitHub Actions job
@@ -29,10 +55,10 @@ alone does not prove better image quality, halo removal, or device timing.
   procedure and ALL historical receipts, plus the exact successful 26917
   runtime authority. The last successful 26919 Actions job was
   `42947897865` / commit `22a389f9c61396979fc5ba7a9b312244e85ffc5b`
-  / artifact `13823509427`. This is **not** source authority for V2 because
+  / artifact `13823509427`. This is **not** source authority for V3 because
   the user identified clean 26917 Super Res ON output as preferable.
 
-## Actual 26920 V2 behavior (NOT shadow-only)
+## Actual 26920 V3 behavior (NOT shadow-only)
 
 - New native `SwitchPreferenceCompat` called **Lucas-Kanade SR** directly
   beneath **Reconstruction experiment**, using the identical standard AndroidX
@@ -99,7 +125,7 @@ original Wronski/AMaZE provenance log entries remain available.
 ## Exact source scope and protected invariance
 
 The actual successfully compiled 26917 source is **2,036 files**.
-The 26920 V2 candidate is **2,038 files**; exactly **16 source paths changed**,
+The 26920 V3 candidate is **2,038 files**; exactly **16 source paths changed**,
 including **two new Java classes**, zero runtime deletions, **2,022
 predecessor source files byte-identical**. Only the paths in
 `26920_CHANGED_RUNTIME_ALLOWLIST.txt` may differ. Sixteen includes the new
@@ -127,21 +153,22 @@ changes; all other native/vendor source and assets stay byte-identical.
 
 1. **Stage 1:** Upload exactly all **33 paths** in `26920_STAGE1_PATHS.txt`
    to the matching repository-relative locations, replacing previously staged
-   26920 shadow files and adding the two new Java payload files, new active
-   shader compiler script and revised builder/validators. Do not upload
+   26920 V2 staged files with the corrected real shader compiler
+   and strengthened fail-closed validator/negative test. The two existing
+   V2 Java payloads are unchanged; no new runtime paths are introduced. Do not upload
    this README, ZIP itself, authority TAR, an APK or temporary workspace.
 2. **Stage 2:** Upload only
    `.github/workflows/build-26920-change-aware.yml`, replacing the old 26920
    shadow workflow. **Retain the successful previous workflows untouched.**
 3. **Stage 3:** Upload only `TRIGGER_26920.txt` to the repository root **LAST**.
    Its exact bytes are
-   `RUN_26920_V2_ACTIVE_PER_PHYSICAL_LENS_B_ON_LK_FROM_SUCCESSFUL_26917_NO_SHADOW\n`
+   `RUN_26920_V3_ACTIVE_LK_26904_SPIRV_OPT_EQUALS_FIX_FROM_CLEAN_26917\n`
    (the `\n` denotes one trailing newline). A new trigger is necessary so
    the corrected handoff gets a fresh GitHub push event rather than replaying
    the older diagnostic-only job.
 
 Suggested commit message, for the **user only after all uploads**:
-`Photon 26920 V2: active per-lens B Super Res ON bounded LK and RAW confidence from clean 26917`
+`Photon 26920 V3: correct pinned SPIR-V optimizer CLI without changing active LK source`
 
 ## Mandatory unchanged guarded verification, plus additive shader gate
 
@@ -181,8 +208,8 @@ sealed 3-stage package and hostile mutation checks, clean-extract replay.
 SPIR-V validation/optimization, Android Kotlin/Java, native both ABIs,
 full APK assembly and final source invariance are mandatory in Actions.
 They are **NOT RUN locally** (Android SDK/pinned shader tools unavailable
-in this local container). Therefore no 26920 APK SHA, new Actions job or
-published artifact can yet be claimed.
+in this local container). Therefore no 26920 APK SHA, successful V3 Actions job or
+published artifact can yet be claimed. The prior V2 Actions job failed.
 
 **Real device image quality NOT PROVEN.** Even a successful Actions APK cannot
 prove no pink highlights, halos, blockiness, blotches, ghosting or processing

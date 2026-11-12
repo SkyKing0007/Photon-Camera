@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact three-stage fail-closed active 26920 V2 source and runner seal."""
+"""Exact three-stage fail-closed active 26920 V3 source, compiler CLI and runner seal."""
 from pathlib import Path
 import hashlib,re
 R=Path(__file__).resolve().parent
@@ -7,7 +7,7 @@ WF='.github/workflows/build-26920-change-aware.yml'
 STAGE='26920_STAGE1_PATHS.txt'
 HASHES='26920_HANDOFF_HASHES.sha256'
 PREV_EXEC='31eebc26fa69a71da1c82bd7a304bd7d8c4e8158d598df12a92a5b8e21a535bf'
-TRIGGER='RUN_26920_V2_ACTIVE_PER_PHYSICAL_LENS_B_ON_LK_FROM_SUCCESSFUL_26917_NO_SHADOW\n'
+TRIGGER='RUN_26920_V3_ACTIVE_LK_26904_SPIRV_OPT_EQUALS_FIX_FROM_CLEAN_26917\n'
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def verify():
  paths=(R/STAGE).read_text().splitlines()
@@ -42,10 +42,22 @@ def verify():
  assert w.count('build_26920_incremental.py prepare')==1
  assert w.count('build_26920_incremental.py finalize')==1
  assert not any(t in w for t in ['--skip','--offline','continue-on-error: true','SKIP_COMPILER'])
+ # Historical 26904 V1 regression: spirv-opt does NOT accept a separate
+ # target-env token. It requires --target-env=vulkan1.1, unlike spirv-val.
+ # This gate is semantic, not just a SHA seal: a new, consistently-resealed
+ # package with the old malformed optimizer command must still be rejected.
+ compiler=(R/'compile_26920_lk_shaders.sh').read_text()
+ assert compiler.count('spirv-opt --target-env=vulkan1.1 -O ')==1, 'wrong SPIR-V optimizer CLI'
+ assert not re.search(r'\bspirv-opt\s+--target-env\s+vulkan',compiler), '26904 V1 optimizer CLI regression'
+ for exact in ['for variant in prod trace;', 'for shader in lk_refine robust_photometric;',
+  'spirv-val --target-env vulkan1.1', 'spirv-opt --target-env=vulkan1.1 -O',
+  'spirv-val --target-env vulkan1.1 "$OUT/${shader}_${variant}.opt.spv"']:
+  assert exact in compiler, 'missing production/trace Vulkan compiler gate '+exact
+
  for t in ['26918','26919','26917','26916','26915','26914','26904']:
   assert 'test_'+t in w or 'verify_'+t in w
  new=(R/'handoff_payload_26920/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java').read_text()
  assert 'nativeArm(' in new and 'nativeTakeLastReport()' in new and 'nativeClear()' in new
  assert 'no image change' not in (R/'build_26920_incremental.py').read_text().lower()
- print('PASS 26920 V2 sealed stages='+str(len(paths))+' +1 workflow +1 trigger, SHA-bound active source, 26917 executed runner, real Vulkan and all inherited compiler gates')
+ print('PASS 26920 V3 sealed stages='+str(len(paths))+' +1 workflow +1 trigger, SHA-bound active source, 26917 executed runner, real Vulkan and all inherited compiler gates')
 if __name__=='__main__':verify()
