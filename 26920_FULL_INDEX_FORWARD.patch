@@ -1,0 +1,706 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+index 727460417b70c588dae0853e9e99dd12d8454eda..48fa4da0e411b8deb55e4002394d845f35c1a5c8 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+@@ -1,5 +1,7 @@
+ #include "Iris26864FrozenDirectRawrRunner.hpp"
+ #include <cmath>
++#include <jni.h>
++#include <sstream>
+ #include <algorithm>
+ #include <chrono>
+ #include <memory>
+@@ -8,6 +10,15 @@
+ #include <string>
+ #include <utility>
+ namespace iris26864 {
++namespace {
++struct Iris26920Arm {
++    bool armed=false;
++    bool enabled=false;
++    uint64_t lens=0, referenceTimestamp=0;
++};
++thread_local Iris26920Arm iris26920Arm{};
++thread_local std::string iris26920Report="NOT_EXECUTED";
++} // namespace
+ void runRealRawrFromFrozenDirectNormals(
+     const FrozenDirectBRequest& request, amaze::CommandSubmissionOwner& inheritedUploads,
+     const ConsumePinnedRawrGpuResult& consume) {
+@@ -16,6 +27,18 @@ void runRealRawrFromFrozenDirectNormals(
+        request.localCfa>3u||request.referenceIndex>=request.normals.size()||
+        request.normals.size()<2u||request.normals.size()>64u||!consume)
+         throw std::invalid_argument("26864 B frozen direct NORMAL run invalid");
++    const bool iris26920Enabled = iris26920Arm.armed && iris26920Arm.enabled;
++    if (iris26920Arm.armed) {
++        const auto& reference=request.normals[request.referenceIndex];
++        if (request.algorithm!=RealBEngine::WronskiTrue2x ||
++            iris26920Arm.lens!=reference.physicalLensIdentity ||
++            iris26920Arm.referenceTimestamp!=reference.borrowed.timestamp)
++            throw std::runtime_error("26920 wrong B SR ON physical lens or reference shutter snapshot");
++        // Consume exactly once. A failed enabled dispatch cannot silently be
++        // repeated without another explicit per-lens shutter-time arm.
++        iris26920Arm.armed=false;
++    }
++    iris26920Report = iris26920Enabled ? "ON_EXECUTION_PENDING" : "OFF_BASELINE_WRONSKI";
+     // IRIS_26873_B_RESIDENT_INPUT_OWNER. One capture scoped owner, not a
+     // second camera ZSL ring, not a new JNI/GL/Vulkan context.
+     // RAWR Wronski 2x intentionally remains exactly inherited two-slot.
+@@ -65,6 +88,7 @@ void runRealRawrFromFrozenDirectNormals(
+     merge.effectiveCfa=request.localCfa;
+     merge.referenceIndex=request.referenceIndex;
+     merge.algorithm=request.algorithm;
++    merge.iris26920Active=iris26920Enabled;
+     merge.bOffNoiseByPhase=request.bOffNoiseByPhase;
+     merge.hasBOffCustomNoise=request.hasBOffCustomNoise;
+     merge.inputLayout=resident?FrozenRawInputLayout::CaptureResident:FrozenRawInputLayout::FencedTwoSlot;
+@@ -141,6 +165,32 @@ void runRealRawrFromFrozenDirectNormals(
+         enteredConsumer=true;
+         originalMergeUploads=uploadCalls;
+         originalMergeUploadMs=uploadMs;
++        if (iris26920Enabled) {
++            if (!result.iris26920Enabled)
++                throw std::runtime_error("26920 enabled Wronski GPU did not execute LK shader");
++            const auto& c=result.iris26920Counts;
++            std::ostringstream o;
++            o << "mode=EXPERIMENT_B_SR_ON toggle=ON captureRef="
++              << frozen.normals[frozen.referenceIndex].timestampNs
++              << " lensHash=" << frozen.normals[frozen.referenceIndex].physicalLensIdentity
++              << " normalFrames=" << frozen.normals.size()
++              << " totalGpuMs=" << result.timings.totalMs
++              << " alignmentGpuMs=" << result.timings.alignmentMs
++              << " robustnessGpuMs=" << result.timings.robustnessMs
++              << " rawConsistency=EXECUTED lkAttempts=" << c[0]
++              << " lkAccepted=" << c[1]
++              << " contributorChecks=" << c[2]
++              << " contributorAdjusted=" << c[3]
++              << " boundedLK=EXECUTED final=ACTIVE_WRONSKI"
++              << " enhancedPathApplied=true"
++              << " acceptedLKMayChangePixels=" << (c[1]?"true":"false")
++              << " confidenceAdjustedSampleBlocks=" << c[3]
++              << " pixelDiffNotMeasured=true"
++              << " reason=" << ((c[1]||c[3])?"RAW_EVIDENCE_ACCEPTED":"NO_MEASURED_ACCEPTED_CORRECTION")
++              << " outputScale=2";
++            iris26920Report=o.str();
++            __android_log_print(ANDROID_LOG_INFO,"IRIS_26920_LK","%s",iris26920Report.c_str());
++        }
+         consume(result,frozen);
+     };
+     try {
+@@ -204,6 +254,13 @@ void runRealRawrFromFrozenDirectNormals(
+                 "B_OFF_WITNESS_REUPLOAD normals=%zu extraUploads=%u extraUploadMs=%.2f",
+                 raw.size(),uploadCalls-originalMergeUploads,uploadMs-originalMergeUploadMs);
+     }catch(...){
++        if (iris26920Enabled) {
++            // No quiet return to the 26917 image if the enabled executor fails.
++            // JNI->MotionTrace will still publish this terminal FAILED receipt.
++            iris26920Report = "mode=EXPERIMENT_B_SR_ON toggle=ON "
++                "final=FAILED enhancedPathApplied=false reason=GPU_RUN_OR_CONSUMER_FAILURE";
++            __android_log_print(ANDROID_LOG_ERROR,"IRIS_26920_LK","%s",iris26920Report.c_str());
++        }
+         // Every upstream chunk and upload uses a waited fence. Retain GPU
+         // input allocations if the queue entered an unresolved state.
+         const VkResult idle=vkQueueWaitIdle(request.inheritedQueue);
+@@ -212,3 +269,30 @@ void runRealRawrFromFrozenDirectNormals(
+     }
+ }
+ } // namespace iris26864
++
++// This JNI is intentionally in an UNPROTECTED runner. The 26917 native
++// AMaZE/border/JNI glue stays SHA-identical. Same thread as synchronous B run.
++extern "C" JNIEXPORT void JNICALL
++Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeArm(
++    JNIEnv* env,jclass,jboolean enabled,jlong lens,jlong timestamp) {
++    if(iris26864::iris26920Arm.armed) {
++        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
++            "26920 nested LK shutter arm");return;
++    }
++    if(lens==0 || timestamp<=0) {
++        env->ThrowNew(env->FindClass("java/lang/IllegalArgumentException"),
++            "26920 missing lens/reference identity");return;
++    }
++    iris26864::iris26920Arm={true,enabled==JNI_TRUE,uint64_t(lens),uint64_t(timestamp)};
++    iris26864::iris26920Report="ARMED_WAITING_FOR_WRONSKI";
++}
++extern "C" JNIEXPORT void JNICALL
++Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeClear(
++    JNIEnv*,jclass) {iris26864::iris26920Arm={};}
++extern "C" JNIEXPORT jstring JNICALL
++Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeTakeLastReport(
++    JNIEnv* env,jclass) {
++    auto report=iris26864::iris26920Report;
++    iris26864::iris26920Report="NOT_EXECUTED";
++    return env->NewStringUTF(report.c_str());
++}
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index 8d015c306d474400b38f88e43985619b2ae22b8b..bf638e38086b0ca27b38f9faa02de569c9302d87 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -120,6 +120,7 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+         wronski.fallbackLumaGain=2.0f;
+         wronski.fallbackChromaMaxSigma=16.0f;
+     }
++    wronski.iris26920Active = sr && frozen.iris26920Active;
+     rawr::raw_merge_hdrplus_gpu::Config hdrq{};
+     // RAWR's chunk fence can fail after a successful VkQueueSubmit. Keep the
+     // coordinator alive until an explicit queue-idle proof has settled every
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+index 96ae383fd4b5d1b2409618fac790ed821306b74e..8480c9c37d62abc75c69f2c7f8b8ff4e5794d6bc 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.hpp
+@@ -35,6 +35,7 @@ struct RealRawrRunRequest final {
+     FrozenRawInputLayout inputLayout=FrozenRawInputLayout::FencedTwoSlot;
+     std::array<float,8> bOffNoiseByPhase{};
+     bool hasBOffCustomNoise=false;
++    bool iris26920Active=false;
+     // Native RAW images, acquired through the existing 26863 fenced uploader,
+     // remain owned by the JNI caller through the entire synchronous callback.
+     std::vector<RealRawrNormal> normals;
+diff --git a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/alignment/shaders/lk_refine.comp b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/alignment/shaders/lk_refine.comp
+index 64dd1beaeba4af4eb64768a3fdab05403a6fd508..79d50af4e9c654c4f9f18422cba5c7919db873d3 100644
+--- a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/alignment/shaders/lk_refine.comp
++++ b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/alignment/shaders/lk_refine.comp
+@@ -52,6 +52,9 @@ layout(set = 0, binding = 2, rg32f) uniform image2D flow;
+ // Bound at every level; coarse levels only touch a prefix of the fine-tile
+ // grid and the fine level (dispatched last) overwrites every tile.
+ layout(set = 0, binding = 3, rgba32f) writeonly uniform image2D tensorOut;
++// 26920 B SR ON only. 16 bytes, cleared per burst; 0 attempted tiles,
++// 1 accepted bounded updates, 2 sampled confidence blocks, 3 changed blocks.
++layout(set = 0, binding = 4, std430) buffer Iris26920Stats { uint counters[4]; } iris26920;
+ layout(push_constant) uniform P {
+     int ts;
+     int tilesX;
+@@ -63,6 +66,7 @@ layout(push_constant) uniform P {
+     // for the tensor's expected noise-gradient energy.
+     float noiseSlope;
+     float noiseOffset;
++    int iris26920Active;
+ }
+ p;
+ 
+@@ -102,6 +106,10 @@ shared float h00, h01, h11, hdet;
+ shared float reduce0[64];
+ shared float reduce1[64];
+ shared float reduce2[64];
++shared vec2 iris26920Step;
++shared int iris26920Candidate;
++shared float iris26920HeldoutBefore;
++shared float iris26920TestCount;
+ 
+ void reduceThree(float a, float b, float c, out float ra, out float rb, out float rc) {
+     uint lane = gl_LocalInvocationIndex;
+@@ -200,6 +208,85 @@ void main() {
+             barrier();
+         }
+     }
++    // IRIS_26920_ACTIVE_LK_B_ON: a single *additional* subpixel step using
++    // RAW-domain forward consistency. The existing five LK iterations remain
++    // exactly as-is. One 16x16 physical tile is one workgroup; disjoint 2x2
++    // CFA block parities train and validate the proposal to avoid Bayer bias.
++    // This is deliberately not the paper's learned, repeated full-frame CNN.
++    if (p.iris26920Active != 0 && p.ts == 16) {
++        if (lane == 0u) {
++            iris26920Step = vec2(0.0);
++            iris26920Candidate = 0;
++            iris26920HeldoutBefore = 0.0;
++            iris26920TestCount = 0.0;
++            atomicAdd(iris26920.counters[0], 1u);
++        }
++        barrier();
++        float aa = 0.0, ab = 0.0, ac = 0.0;
++        float ba = 0.0, bb = 0.0, ntrain = 0.0;
++        for (int pi = int(lane); pi < count; pi += 64) {
++            int yy = pi / p.ts, xx = pi - yy * p.ts;
++            bool train = (((xx >> 1) + (yy >> 1)) & 1) == 0;
++            if (!train || xx < 2 || yy < 2 || xx >= p.ts-2 || yy >= p.ts-2) continue;
++            ivec2 q = t * p.ts + ivec2(xx, yy);
++            float ref = z(q), mov = bil(q, sf);
++            if (!(ref > 0.015 && ref < 0.965 && mov > 0.015 && mov < 0.965)) continue;
++            float gx = 0.5 * sgx[pi], gy = 0.5 * sgy[pi];
++            float e = mov - ref;
++            // Dynamic/misaligned contributors may not drive a new alignment.
++            if (abs(e) > 0.075) continue;
++            float w = 1.0 / max(p.noiseSlope * ref + p.noiseOffset, 1.e-5);
++            aa += w * gx * gx; ab += w * gx * gy; ac += w * gy * gy;
++            ba -= w * gx * e; bb -= w * gy * e;
++            ntrain += 1.0;
++        }
++        float A, B, C, D, E, N;
++        reduceThree(aa, ab, ac, A, B, C);
++        reduceThree(ba, bb, ntrain, D, E, N);
++        if (lane == 0u) {
++            float det = A*C-B*B;
++            float stability = det / max(A*C, 1.0e-18);
++            if (N >= 32.0 && det > 1.0e-8 && stability > 0.20 &&
++                tileSum / float(count) > 0.020 && tileSum / float(count) < 0.92) {
++                vec2 update = vec2((C*D-B*E)/det, (A*E-B*D)/det);
++                if (!any(isnan(update)) && !any(isinf(update)) &&
++                    max(abs(update.x), abs(update.y)) > 0.001 &&
++                    max(abs(update.x), abs(update.y)) <= 0.125) {
++                    iris26920Step = update;
++                    iris26920Candidate = 1;
++                }
++            }
++        }
++        barrier();
++        float holdBefore=0.0, holdAfter=0.0, ntest=0.0;
++        if (iris26920Candidate == 1) {
++            for (int pi=int(lane); pi<count; pi+=64) {
++                int yy=pi/p.ts, xx=pi-yy*p.ts;
++                if ((((xx>>1)+(yy>>1))&1)==0 || xx<2 || yy<2 ||
++                    xx>=p.ts-2 || yy>=p.ts-2) continue;
++                ivec2 q=t*p.ts+ivec2(xx,yy);
++                float ref=z(q), before=bil(q,sf), after=bil(q,sf+iris26920Step);
++                if (!(ref>0.015 && ref<0.965 && before>0.015 && before<0.965 &&
++                      after>0.015 && after<0.965)) continue;
++                float variance=max(p.noiseSlope*ref+p.noiseOffset,1.e-5);
++                holdBefore+=(before-ref)*(before-ref)/variance;
++                holdAfter+=(after-ref)*(after-ref)/variance;
++                ntest+=1.0;
++            }
++        }
++        float H0,H1,HN;
++        reduceThree(holdBefore,holdAfter,ntest,H0,H1,HN);
++        if (lane==0u && iris26920Candidate==1 && HN>=32.0 && H0>1.e-4 &&
++            H1 < H0 * 0.85) {
++            // The held-out CFA blocks independently validate the update.
++            // Bilinear interpolation of neighboring tile flows below fusion
++            // ensures continuous rather than rectangular confidence edges.
++            sf += iris26920Step;
++            atomicAdd(iris26920.counters[1], 1u);
++            rawrTrace4(26920u,t,0u,vec4(iris26920Step,H0/HN,H1/HN));
++        }
++        barrier();
++    }
+     if (lane == 0u) {
+         imageStore(flow, t, vec4(sf, 0, 0));
+         if (all(lessThan(t, imageSize(tensorOut)))) {
+diff --git a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/include/rawr/raw_merge_wronski_gpu/RawMergeWronskiGpu.h b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/include/rawr/raw_merge_wronski_gpu/RawMergeWronskiGpu.h
+index bc9150d1ccb5c19b5fd8474f4b10ff8c11cb647b..3a03ae56f198aacb88717ada13794e71ae8e19a9 100644
+--- a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/include/rawr/raw_merge_wronski_gpu/RawMergeWronskiGpu.h
++++ b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/include/rawr/raw_merge_wronski_gpu/RawMergeWronskiGpu.h
+@@ -61,6 +61,8 @@ struct Config {
+     // right after normalization; empty disables the pass.
+     std::vector<std::int32_t> hotPixels{};
+     float normalizedSupportThreshold = .995f;
++    // 26920 independent B Super Res ON switch; false retains exact 26917 math.
++    bool iris26920Active = false;
+     bool noiseDomainClamp = true;
+     float outputScale = 1.f;
+     std::uint32_t workgroupX = 16, workgroupY = 16;
+diff --git a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/shaders/robust_photometric.comp b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/shaders/robust_photometric.comp
+index 7f88a66881f14b26fc894d423db085ee773b5abe..71bc4f02a8bf141f9376e4296693dd91d9a4358e 100644
+--- a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/shaders/robust_photometric.comp
++++ b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/shaders/robust_photometric.comp
+@@ -195,12 +195,14 @@ layout(set = 0, binding = 5, r32f) readonly uniform image2D scaleTile;
+ layout(std430, set = 0, binding = 6) readonly buffer S { float stdc[]; };
+ layout(std430, set = 0, binding = 7) readonly buffer D { float diffc[]; };
+ layout(set = 0, binding = 8, r32f) writeonly uniform image2D pre;
++layout(std430, set = 0, binding = 9) buffer Iris26920Stats {uint counters[4];} iris26920;
+ layout(push_constant) uniform P {
+     float t;
+     int clampNoise;
+     int tileSize;
+     int w;
+     int h;
++    int iris26920Active;
+ }
+ p;
+ float dq(float x) {
+@@ -573,5 +575,24 @@ void main() {
+     rawrTrace4(120u, q, 0u, vec4(flow, ds, ss));
+     rawrTrace4(121u, q, 0u, vec4(scale, r, float(tile.x), float(tile.y)));
+     rawrTrace4(122u, q, 0u, vec4(norm, ee, r, 0));
+-    imageStore(pre, q, vec4(clamp(r, 0, 1)));
++    // IRIS_26920_ACTIVE_RAW_CONSISTENCY_CONFIDENCE.
++    // Reuse existing physical CFA-derived per-channel noise statistics and
++    // motion/affine gates; only an already trusted positive contributor can
++    // be gently down-weighted. No synthetic hue, clipping, border or RGB edit.
++    float contribution = clamp(r, 0.0, 1.0);
++    if (p.iris26920Active != 0) {
++        // Whitened cross-frame residual is our low-resolution RAW-forward
++        // consistency proxy. The existing RAWR_MIN_GATE is retained entirely.
++        float excess = clamp((norm - 1.5) / 5.0, 0.0, 1.0);
++        float factor = 1.0 - 0.10 * excess;
++        if (contribution > 0.0 && excess > 0.0) contribution *= factor;
++        // One unbiased pixel per 16x16 block, instead of millions of atomics.
++        // Logs report sampled affected blocks, not an invented all-pixel count.
++        if (gl_LocalInvocationIndex == 0u) {
++            atomicAdd(iris26920.counters[2], 1u);
++            if (excess > 0.0 && r > 0.0)
++                atomicAdd(iris26920.counters[3], 1u);
++        }
++    }
++    imageStore(pre, q, vec4(contribution));
+ }
+diff --git a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/include/rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/include/rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h
+index 03fbc6df8ce345cc10159ba22da7cd589cad30a1..0770bb20aad9e37ed405d41337101c1978b16211 100644
+--- a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/include/rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h
++++ b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/include/rawr/raw_gpu_pipeline/AndroidBurstCoordinator.h
+@@ -70,6 +70,9 @@ struct BurstRunResult {
+     // Set when estimateNoiseFromBurst produced the profile this run merged with.
+     bool noiseEstimated = false;
+     rawr::raw_merge_wronski_gpu::CfaNoiseProfile estimatedNoise{};
++    // 26920 read from completed, fence-waited GPU tile counters. OFF = zero.
++    bool iris26920Enabled = false;
++    std::array<std::uint32_t,4> iris26920Counts{};
+ };
+ // Synchronous correctness executor. The app runs it on a background worker while
+ // borrowing pinned RAW16 images from RawImageRing. It uses the app's existing Vulkan queue via Submit.
+@@ -189,6 +192,7 @@ class AndroidBurstCoordinator final {
+     };
+     HostBuffer noiseStats_{};
+     HostBuffer hotPixels_{};
++    HostBuffer iris26920Counts_{};
+     void ensureHostBuffer(HostBuffer& buffer, VkDeviceSize bytes);
+     void destroyHostBuffer(HostBuffer& buffer) noexcept;
+     void destroyHostBuffers() noexcept;
+diff --git a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/AndroidBurstCoordinator.cpp b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/AndroidBurstCoordinator.cpp
+index 03f54ebfbf08384e7ecd6ae553a6f460d3aff004..a89b7e95aa2d504f82d2fa737553a88a47339a51 100644
+--- a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/AndroidBurstCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/AndroidBurstCoordinator.cpp
+@@ -42,7 +42,7 @@ void AndroidBurstCoordinator::ensureHostBuffer(HostBuffer& hb, VkDeviceSize byte
+     VkBufferCreateInfo bi{};
+     bi.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+     bi.size = bytes;
+-    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
++    bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+     check(vkCreateBuffer(device_, &bi, nullptr, &hb.buffer), "multiframe host buffer");
+     VkMemoryRequirements mr{};
+@@ -79,6 +79,7 @@ void AndroidBurstCoordinator::destroyHostBuffer(HostBuffer& hb) noexcept {
+ void AndroidBurstCoordinator::destroyHostBuffers() noexcept {
+     destroyHostBuffer(noiseStats_);
+     destroyHostBuffer(hotPixels_);
++    destroyHostBuffer(iris26920Counts_);
+ }
+ void AndroidBurstCoordinator::warmPipelines(VkPhysicalDevice physical, VkDevice device, std::uint32_t qf) {
+     if (!physical || !device) throw std::invalid_argument("multiframe burst: invalid warmup handles");
+@@ -481,6 +482,7 @@ BurstRunResult AndroidBurstCoordinator::run(const std::vector<BurstFrame>& frame
+     // the recorder incorrectly classifies the full allocation as a stripe.
+     const std::uint32_t reconstructionHeight = arena_.image("linear_output").extent.height;
+     MultiframeRecorder recorder(arena_, executor_, alignment_, merge_, reconstructionHeight);
++    if (merge_.iris26920Active) ensureHostBuffer(iris26920Counts_, 16u);
+     {
+         // Sensor hot-pixel list, shared by every frame of the burst (one
+         // sensor, one map). Capped defensively; Camera2 maps are small.
+@@ -563,6 +565,24 @@ BurstRunResult AndroidBurstCoordinator::run(const std::vector<BurstFrame>& frame
+     const auto finalizeTiming = executeChunk(20u, ref, 2u, [&] {
+         timestamp(0u);
+         recorder.recordFinalize(command_, companions);
++        if (merge_.iris26920Active) {
++            // Fence-waited readback piggybacks on EXISTING final chunk: no
++            // extra GPU submission, CPU imaging buffer, or queue-wide idle.
++            VkMemoryBarrier ready{};
++            ready.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++            ready.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT;
++            ready.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
++            vkCmdPipelineBarrier(command_,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                VK_PIPELINE_STAGE_TRANSFER_BIT,0u,1u,&ready,0u,nullptr,0u,nullptr);
++            VkBufferCopy range{}; range.size=16u;
++            vkCmdCopyBuffer(command_,arena_.buffer("iris26920_stats").buffer,
++                iris26920Counts_.buffer,1u,&range);
++            VkMemoryBarrier host{};host.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER;
++            host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;
++            host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
++            vkCmdPipelineBarrier(command_,VK_PIPELINE_STAGE_TRANSFER_BIT,
++                VK_PIPELINE_STAGE_HOST_BIT,0u,1u,&host,0u,nullptr,0u,nullptr);
++        }
+         timestamp(1u);
+     });
+     timings.finalizeMs = finalizeTiming.second.empty() ? finalizeTiming.first : finalizeTiming.second.front();
+@@ -582,6 +602,20 @@ BurstRunResult AndroidBurstCoordinator::run(const std::vector<BurstFrame>& frame
+             timings};
+     result.noiseEstimated = noiseEstimated;
+     if (noiseEstimated) result.estimatedNoise = *merge_.sensorNoiseProfile;
++    if (merge_.iris26920Active) {
++        if (!iris26920Counts_.mapped) throw std::runtime_error("26920 missing waited GPU counter proof");
++        std::memcpy(result.iris26920Counts.data(),iris26920Counts_.mapped,16u);
++        result.iris26920Enabled = true;
++        // Counters cannot legitimately exceed the tile population or sample
++        // rectangles; fail the enhanced exposure instead of false diagnostics.
++        const auto tiles=arena_.image("tile_flow_l3").extent;
++        const std::uint64_t tileMax=std::uint64_t(tiles.width)*tiles.height*
++            std::uint64_t(frames.size()-1u);
++        if (result.iris26920Counts[0] != tileMax ||
++            result.iris26920Counts[1] > result.iris26920Counts[0] ||
++            result.iris26920Counts[3] > result.iris26920Counts[2])
++            throw std::runtime_error("26920 GPU refinement counters failed source-integrity proof");
++    }
+     return result;
+ }
+ BurstRunResult AndroidBurstCoordinator::runHdrPlus(const std::vector<BurstFrame>& frames, std::uint32_t ref,
+diff --git a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/MultiframeRecorder.cpp b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/MultiframeRecorder.cpp
+index b78818a41b9afd5b689ab7595a7dce935a5f44d5..3fc1121403aced7834be5529edc0dcf59bde1f0f 100644
+--- a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/MultiframeRecorder.cpp
++++ b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/MultiframeRecorder.cpp
+@@ -46,6 +46,7 @@ struct LkPc {
+     float eps;
+     float clipRadius;
+     float noiseSlope, noiseOffset;
++    std::int32_t iris26920Active;
+ };
+ struct KernelPc {
+     float alpha[4], beta[4], highAlpha[4], highBeta[4], knee[4];
+@@ -64,6 +65,7 @@ struct FlowScalePc {
+ struct PhotoPc {
+     float t;
+     std::int32_t clampNoise, tileSize, w, h;
++    std::int32_t iris26920Active;
+ };
+ struct ErodePc {
+     std::int32_t w, h;
+@@ -239,9 +241,11 @@ void MultiframeRecorder::recordAlignmentLevel(VkCommandBuffer c, std::uint32_t l
+         noiseOffset = .25f * (n.offsetBySite[0] + n.offsetBySite[1] + n.offsetBySite[2] + n.offsetBySite[3]);
+     }
+     LkPc lp{std::int32_t(ts), std::int32_t(flow.extent.width), std::int32_t(flow.extent.height),
+-            std::int32_t(alignment_.lkIterations), alignment_.hessianEpsilon, float(radius), noiseSlope, noiseOffset};
++            std::int32_t(alignment_.lkIterations), alignment_.hessianEpsilon, float(radius), noiseSlope, noiseOffset,
++            (merge_.iris26920Active && l == 3u) ? 1 : 0};
+     executor_.record(c, ShaderId::LkRefine,
+-                     {{ib(0, ri), ib(1, mi), ib(2, flow), ib(3, arena_.image("tile_tensor_l3"))}, {}}, &lp,
++                     {{ib(0, ri), ib(1, mi), ib(2, flow), ib(3, arena_.image("tile_tensor_l3"))},
++                       {bb(4, arena_.buffer("iris26920_stats"))}}, &lp,
+                      // One workgroup per tile (tile-parallel LK): dispatch the full tile grid.
+                      sizeof(lp), flow.extent.width, flow.extent.height, 1, tr);
+     computeWriteBarrier(c);
+@@ -302,6 +306,12 @@ void MultiframeRecorder::recordKernelAndStats(VkCommandBuffer c, bool ref, const
+ 
+ void MultiframeRecorder::recordReferencePrepare(VkCommandBuffer c, VkImageView rawU16, const MultiframeFrameParameters& f,
+                                                const TraceTarget* tr) const {
++    if (merge_.iris26920Active) {
++        // 16-byte device-local counters; a transfer->shader barrier before
++        // the first enabled tile may atomically update them.
++        vkCmdFillBuffer(c, arena_.buffer("iris26920_stats").buffer, 0, 16u, 0u);
++        transferToCompute(c);
++    }
+     recordNormalize(c, true, rawU16, f, tr);
+     recordAlignmentInput(c, true, tr);
+     recordPyramid(c, true, tr);
+@@ -341,10 +351,11 @@ void MultiframeRecorder::recordCompanionRobustness(VkCommandBuffer c, const Trac
+     const auto& pre = arena_.image("robust_a");
+     const auto robustnessExtent = arena_.image("reference_guide").extent;
+     PhotoPc pp{merge_.robustnessT, merge_.noiseDomainClamp ? 1 : 0, 16, std::int32_t(robustnessExtent.width),
+-               std::int32_t(robustnessExtent.height)};
++               std::int32_t(robustnessExtent.height), merge_.iris26920Active ? 1 : 0};
+     DispatchBindings pb{{ib(0, arena_.image("reference_mean_lr")), ib(1, arena_.image("reference_var_lr")),
+                          ib(2, arena_.image("companion_mean_lr")), ib(3, flow), ib(4, valid), ib(5, scale), ib(8, pre)},
+-                        {bb(6, arena_.buffer("noise_std_curve")), bb(7, arena_.buffer("noise_diff_curve"))}};
++                        {bb(6, arena_.buffer("noise_std_curve")), bb(7, arena_.buffer("noise_diff_curve")),
++                         bb(9, arena_.buffer("iris26920_stats"))}};
+     executor_.record(c, ShaderId::RobustPhotometric, pb, &pp, sizeof(pp), divUp(robustnessExtent.width, 16),
+                      divUp(robustnessExtent.height, 16), 1, tr);
+     computeWriteBarrier(c);
+diff --git a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/ScratchLayout.cpp b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/ScratchLayout.cpp
+index 1ce24b26f1ed8346935067d27a8d32cd597229bc..294f39e84f7a9dd5b3a225819717e6a2e72cdc69 100644
+--- a/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/ScratchLayout.cpp
++++ b/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/ScratchLayout.cpp
+@@ -125,6 +125,8 @@ ScratchLayout makeMultiframeScratchLayout(const MultiframeGeometry& g, std::uint
+     // brightness-indexed model replicates the same curve into all three planes.
+     buf("noise_std_curve", 3u * 1001u * sizeof(float), Lifetime::Burst);
+     buf("noise_diff_curve", 3u * 1001u * sizeof(float), Lifetime::Burst);
++    // Small, GPU-owned telemetry. Cleared only for enabled 26920 B SR ON.
++    buf("iris26920_stats", 4u * sizeof(std::uint32_t), Lifetime::Burst);
+ 
+     for (const auto& q : r.images) r.logicalImageBytes += imageBytes(q);
+     for (const auto& q : r.buffers) r.logicalBufferBytes += q.bytes;
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index bb2b17b417c65c6b90674d4329387ad5ec20cc57..c5b43c856cdd8abdf5f4a7e4411879d43deb7441 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -2301,10 +2301,32 @@ internal class GlesMgcRawSpatialStacker(
+                 check(frames.count { it.role == RawBurstFrameRole.SHADOW_LONG } <= 1) {
+                     "26876 B permits only one independently exposed LONG"
+                 }
+-                val owned = reconstructIris26876B2xGpu(
+-                    checkNotNull(iris26864NativeWronski2x), contract.cloneForCapture(),
+-                    frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG },
+-                    selectedReference)
++                // The switch is frozen with the actual shutter-admitted RAW.
++                // Always arm and report this physical-lens decision even OFF.
++                val refLens26920 = requireNotNull(selectedReference.physicalCameraId) { "26920 B SR ON physical lens reference absent" }
++                val refNs26920 = selectedReference.sensorTimestampNs
++                val enabled26920 = com.particlesdevs.photoncamera.settings.Iris26920LensSettings
++                    .frozenForReference(refNs26920, refLens26920)
++                val lensHash26920 = com.particlesdevs.photoncamera.settings.Iris26920LensSettings
++                    .hash(refLens26920)
++                Iris26920NativeProbe.arm(enabled26920, lensHash26920, refNs26920)
++                val owned = try {
++                    reconstructIris26876B2xGpu(
++                        checkNotNull(iris26864NativeWronski2x), contract.cloneForCapture(),
++                        frames.firstOrNull { it.role == RawBurstFrameRole.SHADOW_LONG },
++                        selectedReference)
++                } finally {
++                    // Synchronous runner has already finished or failed. An
++                    // enabled failure is fatal, never rerouted to Wronski OFF.
++                    try {
++                        val receipt = Iris26920NativeProbe.takeLastReport()
++                        val proof = "lens=$refLens26920 ref=$refNs26920 enabled=$enabled26920 $receipt"
++                        PLog.i(SABRE_TAG,"IRIS_26920_B_ON_LK $proof")
++                        MotionTrace.processingState("IRIS_26920_B_ON_LK", proof)
++                    } finally {
++                        Iris26920NativeProbe.clear()
++                    }
++                }
+                 twoX = owned.true2x
+                 sensorNeutralB = owned.oneXSensorRgb
+                 nativeClip = owned.oneXClip
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java b/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0ed85d5622fe43a2b0e0b2a9300966feb4bf02c
+--- /dev/null
++++ b/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java
+@@ -0,0 +1,16 @@
++package com.hinnka.mycamera.processor;
++
++/** Experiment B Super Res ON only, synchronous same-thread Vulkan dispatch arm. */
++public final class Iris26920NativeProbe {
++    private Iris26920NativeProbe() { }
++    static { System.loadLibrary("iris26856amaze"); }
++    /** Must be paired with finally { clear(); }; no whole-merge fallback when ON. */
++    public static void arm(boolean enabled, long lensIdentity, long referenceTimestamp) {
++        nativeArm(enabled, lensIdentity, referenceTimestamp);
++    }
++    public static void clear() { nativeClear(); }
++    public static String takeLastReport() { return nativeTakeLastReport(); }
++    private static native void nativeArm(boolean enabled, long lensIdentity, long referenceTimestamp);
++    private static native void nativeClear();
++    private static native String nativeTakeLastReport();
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+index f21b81f93e6e3f5e88dc1b2f4b58b673b9cb3326..cc86828ccac246d71097b130baab16acd93f2c48 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java
+@@ -12034,6 +12034,16 @@ private long mMotionUnifiedLastUpdateMs = 0L;
+             frame.motionV2ActualIso = actualIso;
+             frame.motionV2ExposureEnergy = ExposureIndex.time2sec(actualExposureNs) * actualIso;
+             populateMotion26480FrameMetadata(frame, frameResult, false);
++            // 26920: freeze the per-physical-lens switch at actual NORMAL RAW
++            // admission, before processing can run on a different worker.
++            // No exposure/frame-selection/Camera2 request contract changes.
++            if ("B".equals(frame.motionV2ReconstructionExperiment26856) &&
++                    mMotion26575SuperResAtShutter) {
++                com.particlesdevs.photoncamera.settings.Iris26920LensSettings.freezeNormal(
++                        com.particlesdevs.photoncamera.app.PhotonCamera.getApplicationContextStatic(),
++                        frame.motionV2PhysicalCameraId, frame.timestamp,
++                        true, true);
++            }
+             if (applyMotion26678NormalRowFlickerCorrection(frame)) {
+                 // Permanent regression sentinel: this must remain unreachable in 26720.
+                 iris26678CorrectedNormals++;
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26920LensSettings.java b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26920LensSettings.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e4e6d0b0a6111a25f8ec77030375ce88d081a27
+--- /dev/null
++++ b/app/src/main/java/com/particlesdevs/photoncamera/settings/Iris26920LensSettings.java
+@@ -0,0 +1,64 @@
++package com.particlesdevs.photoncamera.settings;
++
++import android.content.Context;
++import android.content.SharedPreferences;
++import java.util.concurrent.ConcurrentHashMap;
++
++/** Physical-lens Experiment B SR selection, snapshotted with each admitted RAW timestamp. */
++public final class Iris26920LensSettings {
++    private static final String FILE = "iris26920_lucas_kanade_physical";
++    private static final ConcurrentHashMap<Long, Snapshot> BY_TIMESTAMP = new ConcurrentHashMap<>();
++    private static final int MAX_PENDING = 4096;
++    private static final class Snapshot {
++        final long lens;
++        final boolean enabled;
++        Snapshot(long lens, boolean enabled) { this.lens = lens; this.enabled = enabled; }
++    }
++    private Iris26920LensSettings() { }
++    public static long hash(String physical) {
++        if (physical == null || physical.trim().isEmpty())
++            throw new IllegalArgumentException("26920 missing physical camera ID");
++        long result = 1469598103934665603L;
++        for (int i=0;i<physical.length();++i) {
++            result = (result ^ physical.charAt(i)) * 1099511628211L;
++        }
++        return result == 0L ? 1L : result;
++    }
++    private static SharedPreferences prefs(Context context) {
++        return context.getApplicationContext().getSharedPreferences(FILE, Context.MODE_PRIVATE);
++    }
++    private static String key(String physical) {
++        return "physical_" + Iris26856ABSettings.identity(physical, null);
++    }
++    public static boolean get(Context context, String physical) {
++        return prefs(context).getBoolean(key(physical), false);
++    }
++    public static void set(Context context, String physical, boolean on) {
++        prefs(context).edit().putBoolean(key(physical), on).apply();
++    }
++    /** Called on actual admitted NORMAL RAW, never on intermediate preview frames. */
++    public static void freezeNormal(Context context, String physical, long timestamp,
++                                    boolean experimentB, boolean superResAtShutter) {
++        if (timestamp <= 0L || physical == null || physical.isEmpty())
++            throw new IllegalArgumentException("26920 missing timestamp or physical-lens provenance");
++        boolean on = experimentB && superResAtShutter && get(context, physical);
++        Snapshot old = BY_TIMESTAMP.putIfAbsent(timestamp, new Snapshot(hash(physical), on));
++        if (old != null && (old.lens != hash(physical) || old.enabled != on))
++            throw new IllegalStateException("26920 inconsistent RAW timestamp settings");
++        if (BY_TIMESTAMP.size() > MAX_PENDING) {
++            // Only raw timestamps older than the current capture can be retired;
++            // do not silently evict the just frozen frame.
++            for (Long t : BY_TIMESTAMP.keySet()) if (t < timestamp - 12_000_000_000L)
++                BY_TIMESTAMP.remove(t);
++            if (BY_TIMESTAMP.size() > MAX_PENDING)
++                throw new IllegalStateException("26920 pending per-frame snapshot overflow");
++        }
++    }
++    /** Synchronous read of shutter-frozen intent, NOT a mutable preference read. */
++    public static boolean frozenForReference(long timestamp, String physical) {
++        Snapshot entry = BY_TIMESTAMP.get(timestamp);
++        if (entry == null || entry.lens != hash(physical))
++            throw new IllegalStateException("26920 missing physical-lens shutter snapshot for RAW reference " + timestamp);
++        return entry.enabled;
++    }
++}
+diff --git a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+index 65498a6f0d5f6bb90f2348eeab116cef196cea19..10d7a1cdca06998770837ad86600e60b0057c52d 100644
+--- a/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
++++ b/app/src/main/java/com/particlesdevs/photoncamera/ui/settings/SettingsActivity.java
+@@ -29,6 +29,7 @@ import androidx.preference.EditTextPreference;
+ import androidx.preference.ListPreference;
+ import androidx.preference.PreferenceCategory;
+ import com.particlesdevs.photoncamera.settings.Iris26856ABSettings;
++import com.particlesdevs.photoncamera.settings.Iris26920LensSettings;
+ import androidx.preference.Preference;
+ import androidx.preference.PreferenceFragmentCompat;
+ import androidx.preference.PreferenceGroup;
+@@ -258,8 +259,21 @@ public class SettingsActivity extends BaseActivity implements PreferenceFragment
+                 return true;
+             });
+             lens.addPreference(mode);
+-
+-
++            // IRIS_26920_PER_PHYSICAL_LENS_EXPERIMENT_B_SR.
++            // Native Preference switch: identical font, padding and switch layout to
++            // the existing per-lens settings. No new category or duplicate lens list.
++            SwitchPreferenceCompat lk = new SwitchPreferenceCompat(mContext);
++            lk.setKey("iris26920_lk_view_" + active);
++            lk.setTitle("Lucas-Kanade SR");
++            lk.setSummary("Experiment B + Super Res ON: RAW-evidence alignment and contributor refinement");
++            lk.setPersistent(false); // physical-lens owner is Iris26920LensSettings
++            lk.setIconSpaceReserved(mode.isIconSpaceReserved());
++            lk.setChecked(Iris26920LensSettings.get(mContext, active));
++            lk.setOnPreferenceChangeListener((preference, value) -> {
++                Iris26920LensSettings.set(mContext, active, Boolean.TRUE.equals(value));
++                return true;
++            });
++            lens.addPreference(lk);
+         }
+ 
+         private void setupPhotoPrefixPreference() {
+diff --git a/app/version.properties b/app/version.properties
+index d788ffb0dcd7bc2d7b588f4b99d8fb3abbb964f1..0c8c56c77236f9dd26cd457095cca53a89d8daac 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726917
+-VERSION_BUILD=26917
++VERSION_NAME=0.9726920
++VERSION_BUILD=26920
