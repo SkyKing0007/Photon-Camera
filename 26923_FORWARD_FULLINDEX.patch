@@ -1,0 +1,487 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+index 5b919bcdf1b8c5469ffa1d1e5a10ff8e9d529e1b..4ce34fbeb01c823a3449133e6804db0a006dcd12 100644
+--- a/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864FrozenDirectRawrRunner.cpp
+@@ -18,6 +18,8 @@ struct Iris26920Arm {
+ };
+ thread_local Iris26920Arm iris26920Arm{};
+ thread_local std::string iris26920Report="NOT_EXECUTED";
++struct Iris26923NoiseReceipt { bool ready=false, custom=false; std::uint32_t count=0; std::array<float,8> phase{}; };
++thread_local Iris26923NoiseReceipt iris26923Noise{};
+ } // namespace
+ void runRealRawrFromFrozenDirectNormals(
+     const FrozenDirectBRequest& request, amaze::CommandSubmissionOwner& inheritedUploads,
+@@ -50,6 +52,7 @@ void runRealRawrFromFrozenDirectNormals(
+         iris26920Arm.armed=false;
+     }
+     iris26920Report = iris26920Enabled ? "ON_EXECUTION_PENDING" : "OFF_BASELINE_WRONSKI";
++    iris26923Noise = {};
+     // IRIS_26873_B_RESIDENT_INPUT_OWNER. One capture scoped owner, not a
+     // second camera ZSL ring, not a new JNI/GL/Vulkan context.
+     // RAWR Wronski 2x intentionally remains exactly inherited two-slot.
+@@ -176,6 +179,20 @@ void runRealRawrFromFrozenDirectNormals(
+         enteredConsumer=true;
+         originalMergeUploads=uploadCalls;
+         originalMergeUploadMs=uploadMs;
++        if (request.algorithm == RealBEngine::WronskiTrue2x) {
++            if (!result.noiseEstimated || !rawr::raw_merge_wronski_gpu::valid(result.estimatedNoise))
++                throw std::runtime_error("26923 B SR ON noise authority absent");
++            iris26923Noise.ready = true;
++            iris26923Noise.custom = request.hasBOffCustomNoise;
++            iris26923Noise.count = result.frameCount;
++            for (std::size_t site=0; site<4u; ++site) {
++                iris26923Noise.phase[2u*site] = result.estimatedNoise.slopeBySite[site];
++                iris26923Noise.phase[2u*site+1u] = result.estimatedNoise.offsetBySite[site];
++            }
++            __android_log_print(ANDROID_LOG_INFO,"Iris26923",
++                "SR_ON_NOISE_AUTHORITY source=%s frames=%u coefficientSites=4 noCamera2=true",
++                iris26923Noise.custom ? "CUSTOM_C" : "RAW_BURST", iris26923Noise.count);
++        }
+         if (iris26920Enabled) {
+             if (!result.iris26920Enabled)
+                 throw std::runtime_error("26920 enabled Wronski GPU did not execute LK shader");
+@@ -298,6 +315,7 @@ Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeArm(
+     }
+     iris26864::iris26920Arm={true,enabled==JNI_TRUE,uint64_t(lens),uint64_t(timestamp)};
+     iris26864::iris26920Report="ARMED_WAITING_FOR_WRONSKI";
++    iris26864::iris26923Noise={};
+ }
+ extern "C" JNIEXPORT void JNICALL
+ Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeClear(
+@@ -309,3 +327,22 @@ Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeTakeLastReport(
+     iris26864::iris26920Report="NOT_EXECUTED";
+     return env->NewStringUTF(report.c_str());
+ }
++
++// IRIS_26923_B_SR_ON_NOISE_RECEIPT: synchronous, one-time retrieval on
++// the SAME native thread as the successful Wronski Vulkan submission.
++extern "C" JNIEXPORT jfloatArray JNICALL
++Java_com_hinnka_mycamera_processor_Iris26920NativeProbe_nativeTakeLastNoise(
++    JNIEnv* env,jclass) {
++    auto& receipt=iris26864::iris26923Noise;
++    if (!receipt.ready || receipt.count < 2u) {
++        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
++            "26923 mandatory SR ON RAW burst/custom noise receipt missing");
++        return nullptr;
++    }
++    float values[10]{receipt.custom ? 1.f : 0.f, float(receipt.count)};
++    for (std::size_t i=0u;i<8u;++i) values[i+2u]=receipt.phase[i];
++    receipt={};
++    jfloatArray out=env->NewFloatArray(10);
++    if (out) env->SetFloatArrayRegion(out,0,10,values);
++    return out;
++}
+diff --git a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+index bf638e38086b0ca27b38f9faa02de569c9302d87..d451e13adeb8ffd48fd133940470fa792ec99504 100644
+--- a/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/Iris26864RealRawrCoordinator.cpp
+@@ -100,12 +100,12 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+         alignment.lkIterations=5u;
+         alignment.hessianEpsilon=1.0e-10f;
+         wronski.kDetail=0.150f;
+-        wronski.kDenoise=5.0f;
++        wronski.kDenoise=5.0f; // kDenoise is bypassed when flatSigma >= 0 (pinned kernel shader)
+         wronski.dThreshold=0.710f;
+         wronski.dTransition=1.0f;
+         wronski.kStretch=2.0f;
+         wronski.kShrink=8.0f;
+-        wronski.flatSigma=1.0f;
++        wronski.flatSigma=0.90f; // IRIS_26923_B_SR_ON_ACTIVE_FLAT_KERNEL_BANDWIDTH: measured 2x detail, B OFF unchanged
+         wronski.detailFloorSigma=0.150f;
+         wronski.scaleBandwidthGain=1.0f;
+         wronski.coverageNeffLo=1.0f;
+@@ -170,6 +170,8 @@ void runRealPinnedRawrB(const RealRawrRunRequest& frozen,
+             result.noiseEstimated=true;
+             result.estimatedNoise=*wronski.sensorNoiseProfile;
+         }
++        if(sr && (!result.noiseEstimated || !rawr::raw_merge_wronski_gpu::valid(result.estimatedNoise)))
++            throw std::runtime_error("26923 B SR ON mandatory RAW burst/custom .c noise missing");
+         if(!result.output||!result.outputView||result.frameCount!=upstream.size()||
+            result.referenceIndex!=frozen.referenceIndex)
+             throw std::runtime_error("26864 real RAWR output missing or frame-count degraded");
+diff --git a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+index e76fe123b9fbc68df5bf0015e4f1497d692ac39c..5f1cbf4e62a3d377cd908baf7220fbbf3db8230e 100644
+--- a/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
++++ b/app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake
+@@ -33,6 +33,9 @@ set(GLSLC "${Python3_EXECUTABLE};${CMAKE_CURRENT_SOURCE_DIR}/iris26864/compile_l
+ set(IRIS26887_VENDOR_SHADOW "${CMAKE_CURRENT_BINARY_DIR}/iris26887_b_only_vendor/native")
+ file(COPY "${IRIS26864_VENDOR_ROOT}/" DESTINATION "${IRIS26887_VENDOR_SHADOW}")
+ # IRIS_26888_B_OFF_HDRQ_LIBA_WRONSKI_MOTION_SUPPORT: build-shadow only.
++# 26923: B Wronski true2x-only final shader. Vendor files never modified.
++configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26923WronskiFinalize.comp"
++    "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_wronski/shaders/a11_finalize.comp" COPYONLY)
+ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffHdrqMismatch.comp"
+     "${IRIS26887_VENDOR_SHADOW}/multiframe/merge_hdrplus/shaders/hdrq_mismatch.comp" COPYONLY)
+ configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp"
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+index 6cade55a4ca008e8b719a9e57ad6f6a0948906e8..ea88348ee3591c9115f3ff0e99afb8c66ccc3b3b 100644
+--- a/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
++++ b/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp
+@@ -29,6 +29,57 @@ struct NoiseEstimatePc {
+     float referenceWhite, neighbourWhite;
+     std::int32_t width, height, blocksX;
+ };
++
++// IRIS_26923_B_SR_ON_BURST_ONLY_LOW_INFORMATION_ESTIMATOR.
++// The strict 24-bin fit cannot describe a nearly-flat/underexposed RAW scene.
++// Retain empirical RAW-pair noise rather than the configured Camera2 profile.
++// The extra floor is numerical stability, NOT a replacement noise source.
++std::optional<BurstNoiseFit> iris26923MeasuredMoments(const float* data, std::uint32_t blocks) {
++    if (!data || blocks == 0u) return std::nullopt;
++    BurstNoiseFit out{};
++    for (std::uint32_t site = 0u; site < 4u; ++site) {
++        struct Point { double level, variance; };
++        std::vector<Point> points;
++        points.reserve(blocks);
++        for (std::uint32_t i = 0u; i < blocks; ++i) {
++            const float* s = data + std::size_t(i) * kNoiseBlockFloats + 4u * site;
++            const double n = s[0];
++            if (!(std::isfinite(n) && n >= 2.0)) continue;
++            const double level = s[1] / n;
++            const double dv = (double(s[3]) - double(s[2]) * double(s[2]) / n) / (n - 1.0);
++            if (!std::isfinite(level) || !std::isfinite(dv) || level < 0.0) continue;
++            points.push_back({level, std::max(dv * 0.5, 0.0)});
++        }
++        if (points.empty()) return std::nullopt; // no valid RAW evidence: clean failure
++        if (site == 0u) out.usableBlocks = std::uint32_t(points.size());
++        std::sort(points.begin(), points.end(), [](const Point& a, const Point& b){ return a.level < b.level; });
++        auto lowerMoment = [&](std::size_t lo, std::size_t hi) {
++            std::vector<double> v;
++            v.reserve(hi - lo);
++            for (std::size_t i = lo; i < hi; ++i) v.push_back(points[i].variance);
++            const std::size_t k = v.size() / 5u;
++            std::nth_element(v.begin(), v.begin() + k, v.end());
++            return v[k];
++        };
++        const std::size_t half = std::max<std::size_t>(1u, points.size() / 2u);
++        const double lo = lowerMoment(0u, half);
++        const double hi = lowerMoment(std::min(half, points.size()-1u), points.size());
++        const double x0 = points[half / 2u].level;
++        const double x1 = points[std::min(points.size()-1u, half + (points.size() - half) / 2u)].level;
++        // Empirical floor from actual frame differences, even for flat scenes.
++        // The strictly-positive slope satisfies the sealed RAWR shader ABI.
++        const double a = (x1 > x0 + 1e-7) ? std::max(1e-10, (hi - lo) / (x1 - x0)) : 1e-10;
++        const double b = std::max(1e-10, lo - a * x0);
++        if (!std::isfinite(a) || !std::isfinite(b) || a > 1e6 || b > 1e6)
++            return std::nullopt;
++        out.profile.slopeBySite[site] = float(a);
++        out.profile.offsetBySite[site] = float(b);
++    }
++    out.bins = 0; // measured moments, not a fabricated successful multi-bin fit
++    return rawr::raw_merge_wronski_gpu::valid(out.profile)
++        ? std::optional<BurstNoiseFit>(out) : std::nullopt;
++}
++
+ // Uniform HDR+ merges: gain that scales frame i to the reference exposure
+ // (AE may still be settling across the ZSL ring). Upstream compensates any
+ // exposure-time x ISO difference; unequal frames merged as equal leave a
+@@ -431,7 +482,14 @@ BurstRunResult AndroidBurstCoordinator::run(const std::vector<BurstFrame>& frame
+             timestamp(1u);
+         });
+         timings.noiseEstimateMs = noiseTiming.second.empty() ? noiseTiming.first : noiseTiming.second.front();
+-        const auto fit = fitBurstNoise(static_cast<const float*>(noiseStats_.mapped), blocksX * blocksY);
++        auto fit = fitBurstNoise(static_cast<const float*>(noiseStats_.mapped), blocksX * blocksY);
++        if (merge_.outputScale > 1.5f && !fit) {
++            fit = iris26923MeasuredMoments(static_cast<const float*>(noiseStats_.mapped), blocksX * blocksY);
++            if (!fit) throw std::runtime_error("26923 B SR ON no finite RAW-pair noise measurements");
++            __android_log_print(ANDROID_LOG_WARN, "Iris26923",
++                "SR_ON_RAW_BURST_MOMENTS_ONLY lowInformation=true blocks=%u; Camera2 forbidden",
++                fit->usableBlocks);
++        }
+         if (fit) {
+             merge_.sensorNoiseProfile = fit->profile;
+             merge_.highSignalNoiseProfile.reset();
+diff --git a/app/src/main/cpp/iris26864/bridge/Iris26923WronskiFinalize.comp b/app/src/main/cpp/iris26864/bridge/Iris26923WronskiFinalize.comp
+new file mode 100644
+index 0000000000000000000000000000000000000000..aa8ab08b23bc3cafaaa2654da4774413b47865ac
+--- /dev/null
++++ b/app/src/main/cpp/iris26864/bridge/Iris26923WronskiFinalize.comp
+@@ -0,0 +1,186 @@
++#version 450
++
++// RAWR parity scalar trace ABI. Normal production shaders compile this out.
++#ifdef RAWR_PARITY_TRACE
++layout(std430, set = 0, binding = 31) buffer RawrTraceBuffer {
++    uint writeCount;
++    uint droppedCount;
++    uint _tracePad0;
++    uint _tracePad1;
++    uvec4 cfg0;
++    ivec4 cfg1;
++    uvec4 meta[];
++}
++rawrTrace;
++const uint RAWR_TRACE_STAGE = 7u;
++bool rawrTraceMatch(ivec2 q) {
++    if (rawrTrace.cfg0.x == 0u) return false;
++    if (rawrTrace.cfg0.y != 0u && rawrTrace.cfg0.y != RAWR_TRACE_STAGE) return false;
++    int tx = int(rawrTrace.cfg0.z), ty = int(rawrTrace.cfg0.w);
++    return (tx < 0 || q.x == tx) && (ty < 0 || q.y == ty);
++}
++void rawrTrace4(uint checkpoint, ivec2 q, uint aux, vec4 v) {
++    if (!rawrTraceMatch(q)) return;
++    uint i = atomicAdd(rawrTrace.writeCount, 1u);
++    uint cap = uint(max(rawrTrace.cfg1.x, 0));
++    if (i >= cap) {
++        atomicAdd(rawrTrace.droppedCount, 1u);
++        return;
++    }
++    uint b = i * 2u;
++    rawrTrace.meta[b] = uvec4(RAWR_TRACE_STAGE, checkpoint, uint(q.x), uint(q.y));
++    rawrTrace.meta[b + 1u] = uvec4(aux, floatBitsToUint(v.x), floatBitsToUint(v.y), floatBitsToUint(v.z));
++}
++#else
++void rawrTrace4(uint checkpoint, ivec2 q, uint aux, vec4 v) {}
++#endif
++void rawrTrace1(uint checkpoint, ivec2 q, uint aux, float x) { rawrTrace4(checkpoint, q, aux, vec4(x, 0, 0, 0)); }
++uint rawrHalfBitsRte(float v) {
++    uint f = floatBitsToUint(v), sign = (f >> 16u) & 0x8000u, a = f & 0x7fffffffu;
++    uint mant = a & 0x007fffffu, exp = (a >> 23u) & 0xffu;
++    if (exp == 0xffu) {
++        uint hm = mant >> 13u;
++        if (mant != 0u && hm == 0u) hm = 1u;
++        return sign | 0x7c00u | hm;
++    }
++    int he = int(exp) - 112;
++    if (he <= 0) {
++        if (he < -10) return sign;
++        uint sig = mant | 0x00800000u, shift = uint(14 - he);
++        uint q = sig >> shift, rem = sig & ((1u << shift) - 1u), mid = 1u << (shift - 1u);
++        if (rem > mid || (rem == mid && (q & 1u) != 0u)) q++;
++        return sign | q;
++    }
++    if (he >= 31) return sign | 0x7c00u;
++    uint q = mant >> 13u, rem = mant & 0x1fffu;
++    if (rem > 0x1000u || (rem == 0x1000u && (q & 1u) != 0u)) q++;
++    if (q == 0x400u) {
++        q = 0u;
++        he++;
++        if (he >= 31) return sign | 0x7c00u;
++    }
++    return sign | (uint(he) << 10u) | q;
++}
++float rawrHalfBitsToFloat(uint h) {
++    uint sign = (h & 0x8000u) << 16u, exp = (h >> 10u) & 31u, mant = h & 0x3ffu;
++    if (exp == 0u) {
++        if (mant == 0u) return uintBitsToFloat(sign);
++        int p = findMSB(mant);
++        return uintBitsToFloat(sign | (uint(p + 103) << 23u) | ((mant - (1u << uint(p))) << uint(23 - p)));
++    }
++    if (exp == 31u) return uintBitsToFloat(sign | 0x7f800000u | (mant << 13u));
++    return uintBitsToFloat(sign | ((exp + 112u) << 23u) | (mant << 13u));
++}
++float rawrRoundHalfRte(float v) { return rawrHalfBitsToFloat(rawrHalfBitsRte(v)); }
++vec4 rawrRoundHalfRte(vec4 v) {
++    return vec4(rawrRoundHalfRte(v.x), rawrRoundHalfRte(v.y), rawrRoundHalfRte(v.z), rawrRoundHalfRte(v.w));
++}
++float rawrDivF32(float af, float bf) {
++    uint ab = floatBitsToUint(af), bb = floatBitsToUint(bf);
++    uint amag = ab & 0x7fffffffu, bmag = bb & 0x7fffffffu;
++    if (amag == 0u || bmag == 0u) return af / bf;
++    uint ae = (ab >> 23) & 255u, be = (bb >> 23) & 255u;
++    if (ae == 0u || be == 0u || ae == 255u || be == 255u) return af / bf;
++    uint am = 0x800000u | (ab & 0x7fffffu), bm = 0x800000u | (bb & 0x7fffffu);
++    int e = int(ae) - int(be) + 127;
++    uint q, rem;
++    int steps;
++    if (am >= bm) {
++        q = 1u;
++        rem = am - bm;
++        steps = 23;
++    } else {
++        q = 0u;
++        rem = am;
++        steps = 24;
++        e--;
++    }
++    for (int j = 0; j < 24; j++) {
++        if (j >= steps) break;
++        rem <<= 1;
++        q <<= 1;
++        if (rem >= bm) {
++            rem -= bm;
++            q |= 1u;
++        }
++    }
++    uint twice = rem << 1;
++    bool up = (twice > bm) || (twice == bm && ((q & 1u) != 0u));
++    if (up) {
++        q++;
++        if (q == 0x1000000u) {
++            q >>= 1;
++            e++;
++        }
++    }
++    if (e <= 0 || e >= 255) return af / bf;
++    return uintBitsToFloat(((ab ^ bb) & 0x80000000u) | (uint(e) << 23) | (q & 0x7fffffu));
++}
++layout(local_size_x = 16, local_size_y = 16) in;
++layout(set = 0, binding = 0, rgba32f) readonly uniform image2D sumI;
++layout(set = 0, binding = 1, rgba32f) readonly uniform image2D weightI;
++layout(set = 0, binding = 2, rgba16f) writeonly uniform image2D outI;
++layout(push_constant) uniform P { int yBase; }
++p;
++void main() {
++    ivec2 lq = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(lq, imageSize(sumI)))) return;
++    ivec2 q = ivec2(lq.x, lq.y + p.yBase);
++    rawrTrace4(1u, q, 0u, vec4(gl_GlobalInvocationID.xy, 0, 0));
++    if (any(greaterThanEqual(q, imageSize(outI)))) return;
++    vec3 s = imageLoad(sumI, lq).xyz, w = imageLoad(weightI, lq).xyz;
++    precise float r = w.x > 1e-12 ? rawrDivF32(s.x, w.x) : 0.0;
++    precise float g = w.y > 1e-12 ? rawrDivF32(s.y, w.y) : 0.0;
++    precise float b = w.z > 1e-12 ? rawrDivF32(s.z, w.z) : 0.0;
++    vec3 rgb = vec3(r, g, b);
++    // IRIS_26923_B_SR_ON_NINE_BOUNDED_HR_UPDATES.
++    // All data targets are the ORIGINAL, noise-/motion-weighted Wronski
++    // 15-frame high-resolution sums, NOT independently synthesized texture.
++    // Unlike RawLens LK-R, this conservative hybrid does NOT re-warp every
++    // original LR RAW sample through a new forward model. It projects the
++    // already-aligned fused HR data towards sensor-evidenced local detail.
++    // Never change RGB channel ratios: updates are multiplicative and chromaticity-neutral.
++    const vec3 lumWeights = vec3(0.25, 0.5, 0.25);
++    float baselineY = dot(rgb, lumWeights);
++    float nearSum = 0.0;
++    float nearMass = 0.0;
++    ivec2 extent = imageSize(sumI);
++    for (int d = 0; d < 4; ++d) {
++        ivec2 off = d == 0 ? ivec2(1,0) : d == 1 ? ivec2(-1,0)
++                  : d == 2 ? ivec2(0,1) : ivec2(0,-1);
++        ivec2 z = clamp(lq + off, ivec2(0), extent-1);
++        vec3 ww = imageLoad(weightI,z).xyz;
++        if (min(ww.r,min(ww.g,ww.b)) <= 1e-8) continue;
++        vec3 sumNear = imageLoad(sumI,z).xyz;
++        vec3 targetNear = sumNear / max(ww,vec3(1e-8));
++        nearSum += dot(targetNear,lumWeights);
++        nearMass += 1.0;
++    }
++    float chromaBalance = min(w.r,min(w.g,w.b)) / max(max(w.r,max(w.g,w.b)),1e-8);
++    if (nearMass >= 3.0 && chromaBalance > 0.04 && baselineY > 0.006 &&
++        baselineY < 0.94 && min(rgb.r,min(rgb.g,rgb.b)) > 0.003) {
++        float localContrast = baselineY - nearSum/nearMass;
++        // A wide enough luma response must be present in the fused 15-frame
++        // data before any detail is retained. Limit the update to <1% white.
++        float detailFloor = 0.0009 + 0.001*sqrt(max(baselineY,0.0));
++        float measuredDetail = sign(localContrast)*max(abs(localContrast)-detailFloor,0.0);
++        float bounded = clamp(measuredDetail,-0.008,0.008);
++        float support = smoothstep(0.04,0.30,chromaBalance);
++        // 3 reconstruction iterations x 3 HR gradient updates. The immutable
++        // target is the input weighted burst data; no extra 50MP attachment,
++        // no extra raw frame collection and no inter-pixel write hazards.
++        for (int t = 0; t < 3; ++t) {
++            for (int step = 0; step < 3; ++step) {
++                float currentY = dot(rgb,lumWeights);
++                float dataResidual = baselineY - currentY;
++                float update = support*(0.20*dataResidual+0.045*bounded);
++                // A shared multiplicative luminance correction preserves
++                // raw RGB chromaticity under subsequent per-channel white
++                // balance; adding the same RGB amount would not do so.
++                rgb *= max(currentY+update,1e-6)/max(currentY,1e-6);
++            }
++        }
++    }
++    imageStore(outI, q, rawrRoundHalfRte(vec4(rgb, 1)));
++    rawrTrace1(250u, q, 0u, 1.0);
++}
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+index 0b279836c335c993076fa970693f9df05876de6a..a16ba71d5659e771e3e9f5d9632abf5378821428 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
++++ b/app/src/main/java/com/hinnka/mycamera/processor/GlesMgcRawSpatialStacker.kt
+@@ -7108,7 +7108,7 @@ internal class GlesMgcRawSpatialStacker(
+         bExpandedScale26858: Int = 1,
+         bNoiseVariance26863: Int,
+         bNoiseSupport26863: Int,
+-        iris26922SrOnNoiseReference: RawStackFrame? = null,
++        iris26923SrOnNoise: FloatArray? = null,
+         rawrNativeReceipt26864: Iris26864NativeRawrDomainReceipt? = null,
+     ): Int {
+         if (rawrNativeReceipt26864 == null) {
+@@ -7186,16 +7186,20 @@ internal class GlesMgcRawSpatialStacker(
+             if (rawrNativeReceipt26864 != null) {
+                 uniform1f(applyProgram,"uReferenceProtectionEv",referenceProtectionEv)
+                 val srOn26922 = iris26856BTrue2x &&
+-                    iris26922SrOnNoiseReference != null &&
++                    iris26923SrOnNoise != null &&
+                     processingWidth == width * 2 && processingHeight == height * 2
+                 uniform1i(applyProgram,"uIris26922SrOn",if(srOn26922) 1 else 0)
+                 if(srOn26922) {
+-                    val ref26922 = checkNotNull(iris26922SrOnNoiseReference)
+-                    val n26922 = noiseModelForFrame(ref26922)
+-                    val shot26922 = n26922.normalizedShotNoiseForShader(cfaPattern)
+-                    val read26922 = n26922.normalizedReadNoiseForShader(cfaPattern)
+-                    val greenShot26922 = 0.5f*(shot26922[1]+shot26922[2])
+-                    val greenRead26922 = 0.5f*(read26922[1]+read26922[2])
++                    val n26923 = checkNotNull(iris26923SrOnNoise)
++                    val greenIndices = if (cfaPattern==1 || cfaPattern==2) intArrayOf(0,3) else intArrayOf(1,2)
++                    // Native coefficients are normalized sensor RAW variance.
++                    // Fused guide shot/read variance divides by NORMAL count;
++                    // chroma residual support independently handles local rejection.
++                    val nFrames = n26923[1].coerceAtLeast(1f)
++                    val greenShot26922 = 0.5f*(n26923[2+greenIndices[0]*2]+
++                        n26923[2+greenIndices[1]*2])/nFrames
++                    val greenRead26922 = 0.5f*(n26923[3+greenIndices[0]*2]+
++                        n26923[3+greenIndices[1]*2])/nFrames
+                     check(greenShot26922.isFinite() && greenShot26922>=0f &&
+                           greenRead26922.isFinite() && greenRead26922>=0f) {
+                         "26922 SR ON invalid frozen-normal sensor noise model"
+@@ -7203,8 +7207,9 @@ internal class GlesMgcRawSpatialStacker(
+                     uniform1f(applyProgram,"uIris26922ShotVariance",greenShot26922)
+                     uniform1f(applyProgram,"uIris26922ReadVariance",greenRead26922)
+                     PLog.i(SABRE_TAG,"IRIS_26922_SR_ON_CHROMA_NOISE_REFERENCE " +
+-                        "iso=${ref26922.sensitivityIso} shot=$greenShot26922 read=$greenRead26922 " +
+-                        "nativeRawBurstNoiseRemainsOwner=true localResidualUncertainty=true")
++                        "source=${if(n26923[0]>0.5f) "CUSTOM_C" else "RAW_BURST"} " +
++                        "shot=$greenShot26922 read=$greenRead26922 normals=$nFrames " +
++                        "nativeRawBurstNoiseIsOwner=true noCamera2=true localResidualUncertainty=true")
+                 }
+             }
+             draw(applyProgram, processingWidth, processingHeight, intArrayOf(temporaryPostWb))
+@@ -18006,13 +18011,21 @@ internal class GlesMgcRawSpatialStacker(
+             val nativeRgb=createTexture(outputW,outputH,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+             val nativeClip=createTexture(outputW,outputH,GLES30.GL_R16F,GLES30.GL_NEAREST)
+             runPinnedGpu(nativeRgb,nativeClip)
++            val nativeNoise26923 = Iris26920NativeProbe.takeLastNoise()
++            check(nativeNoise26923.size==10 && nativeNoise26923[1]>=2f &&
++                  nativeNoise26923.sliceArray(2..9).all { it.isFinite() && it>=0f }) {
++                "26923 SR ON mandatory native RAW/custom noise provenance invalid"
++            }
++            PLog.i(SABRE_TAG,"IRIS_26923_SR_ON_NOISE " +
++                "source=${if(nativeNoise26923[0]>0.5f) "CUSTOM_C" else "RAW_BURST"} " +
++                "normals=${nativeNoise26923[1]} phase=${nativeNoise26923.sliceArray(2..9).contentToString()}")
+             GlesGpuScheduler.memoryBarrier()
+             checkGlError("26876 native Vulkan Wronski RGB and original 2x clip")
+             var sensorRgb=renderRawrBPostAmaze26856(
+                 nativeRgb,snapshot,labDefringeStrength=1f,
+                 processingWidth=outputW,processingHeight=outputH,
+                 bNoiseVariance26863=0,bNoiseSupport26863=0,
+-                iris26922SrOnNoiseReference = selectedReference,
++                iris26923SrOnNoise = nativeNoise26923,
+                 nativeSensorClipFullRes26866=nativeClip,
+                 rawrNativeReceipt26864=Iris26864NativeRawrDomainReceipt(true,true,true))
+             guideRgb=createTexture(width,height,GLES30.GL_RGBA16F,GLES30.GL_NEAREST)
+diff --git a/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java b/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java
+index d0ed85d5622fe43a2b0e0b2a9300966feb4bf02c..a722fb19c51765ea45795b0e29ce6609230320bd 100644
+--- a/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java
++++ b/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java
+@@ -10,6 +10,10 @@ public final class Iris26920NativeProbe {
+     }
+     public static void clear() { nativeClear(); }
+     public static String takeLastReport() { return nativeTakeLastReport(); }
++    /** One-shot source, actual contributing NORMAL count, four CFA-site (shot,read) pairs.
++     * [0]=0 RAW burst,1 custom .c; [1]=frame count; [2..9] = shot/read x4. */
++    public static float[] takeLastNoise() { return nativeTakeLastNoise(); }
++    private static native float[] nativeTakeLastNoise();
+     private static native void nativeArm(boolean enabled, long lensIdentity, long referenceTimestamp);
+     private static native void nativeClear();
+     private static native String nativeTakeLastReport();
+diff --git a/app/version.properties b/app/version.properties
+index 12d2ab12137a07df4b899b2e357cf1e1a7a0c904..f5241cb290dea905855e03b0d2ecfa3f44e662f8 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726922
+-VERSION_BUILD=26922
++VERSION_NAME=0.9726923
++VERSION_BUILD=26923
