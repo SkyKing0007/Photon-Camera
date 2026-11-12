@@ -71,6 +71,16 @@ def seal():
  if set((R/'26923_ADDED_RUNTIME_PATHS.txt').read_text().splitlines())!=ADDED or (R/'26923_DELETED_RUNTIME_PATHS.txt').read_text():fail('incorrect new shader or deleted path')
  if parse(R/'26923_PROTECTED_SOURCE.sha256')!={p:h for p,h in old.items() if p not in CHANGE}:fail('2031 protected-path mismatch')
  if '26923_FORWARD_FULLINDEX.patch' not in files or 'compile_26923_shaders.sh' not in files or 'compile_26923_lk_shaders.py' not in files:fail('missing mandatory compiler or patch')
+ if 'test_26923_workflow_refs.py' not in files:fail('missing 43280180906 workflow dependency regression')
+ if '26923_EXPECTED_ACTION_EXECUTABLES.txt' not in files:fail('missing exact executable dependency inventory')
+ wf=(R/'.github/workflows/build-26923-change-aware.yml').read_text()
+ if 'python3 -S test_26923_workflow_refs.py' not in wf or 'test_26922_guard.py' in wf or wf.count('python3 -S test_26922_source.py --payload')!=3:fail('stale/incomplete historical workflow dependency gate')
+
+ import re
+ inv=set((R/'26923_EXPECTED_ACTION_EXECUTABLES.txt').read_text().splitlines())
+ actual=set(re.findall(r'\b(?:python3?\s+-S\s+|bash\s+|chmod\s+\+x\s+)(?:\./)?([\w./-]+\.(?:py|sh)|gradlew)\b',wf))
+ indirect={'compile_26906_tone_glsl.sh','compile_26920_lk_shaders.sh','test_26920_source.py','test_26920_vulkan_abi.py','test_26921_guard.py','test_26922_source.py','test_26923_source.py','test_26923_math_host.py','build_26923_incremental.py'}
+ if len(inv)<80 or inv!=(actual|indirect):fail('sealed workflow executable reference inventory diverged; stale/new script or omitted gate')
  if files.get('.github/workflows/build-26923-change-aware.yml')!=sha(R/'.github/workflows/build-26923-change-aware.yml'):fail('workflow mutation')
  print('PASS 26923 sealed three-stage upload, 2039 sources, 7 changed, 1 new, 2031 protected')
 def fetch():
