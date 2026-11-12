@@ -48,7 +48,7 @@ def border(root):
   if not (root/p).is_file() or sha(root/p)!=h:fail('modified successful 26917 physical CFA border '+p)
 def seal():
  from verify_26920_handoff import verify
- verify();print('PASS 26920 sealed staged handoff, 26917 authority, 2021 protected')
+ verify();print('PASS 26920 sealed staged handoff, 26917 authority, 2019 protected')
 def gh(path,token):
  request=urllib.request.Request('https://api.github.com/repos/'+REPO+'/'+path,
   headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'})
@@ -101,14 +101,14 @@ def prepare():
  shutil.copytree(BASE,CAND)
  changed=(R/'26920_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines()
  added=set((R/'26920_ADDED_RUNTIME_PATHS.txt').read_text().splitlines())
- if len(changed)!=17 or len(set(changed))!=17 or len(added)!=2 or (R/'26920_DELETED_RUNTIME_PATHS.txt').read_text():fail('wrong 26920 source scope')
+ if len(changed)!=19 or len(set(changed))!=19 or len(added)!=2 or (R/'26920_DELETED_RUNTIME_PATHS.txt').read_text():fail('wrong 26920 source scope')
  for name in changed:
   dst=CAND/name;src=R/'handoff_payload_26920'/name
   if not src.is_file() or (name in added)==dst.exists():fail('overlay is not approved source '+name)
   dst.parent.mkdir(parents=True,exist_ok=True)
   shutil.copy2(src,dst)
  before=parse(R/'26920_BASE_26917_FULL_APP.sha256')
- after=exact(CAND,R/'26920_PRECOMPILE_EXPECTED_FULL_APP.sha256','exact candidate-first seventeen-path transformation')
+ after=exact(CAND,R/'26920_PRECOMPILE_EXPECTED_FULL_APP.sha256','exact candidate-first nineteen-path transformation')
  if set(after)-set(before)!=added or set(before)-set(after) or {p for p in before if before[p]!=after[p]}!=set(changed)-added:fail('protected-source mutation')
  border(CAND)
  if not (R/'gradlew').is_file() or not (R/'app').is_dir():fail('real Android Gradle project unavailable')
@@ -120,7 +120,7 @@ def prepare():
  exact(R,R/'26920_PRECOMPILE_EXPECTED_FULL_APP.sha256','authority-seeded live Android source')
  border(R)
  OUT.mkdir(exist_ok=True)
- (OUT/'26920_SOURCE_SCOPE.txt').write_text('BASE=26917-success run='+str(RUN)+' commit='+COMMIT+' artifact='+str(ART_ID)+'\nsource=2038 runtime_changed=17 added=2 protected=2021 deleted=0 border_frozen=7 mode=ACTIVE_PER_LENS_LK\nchanged='+'\n'.join(changed)+'\n')
+ (OUT/'26920_SOURCE_SCOPE.txt').write_text('BASE=26917-success run='+str(RUN)+' commit='+COMMIT+' artifact='+str(ART_ID)+'\nsource=2038 runtime_changed=19 added=2 protected=2019 deleted=0 border_frozen=7 mode=ACTIVE_PER_LENS_LK\nchanged='+'\n'.join(changed)+'\n')
  print('PASS recovered actual 26917, active 26920 per-physical-lens B SR ON LK shaders and actual MotionTrace dual logs; seven frozen physical border files unchanged')
 def verify_compiled():
  seal()
@@ -214,7 +214,7 @@ def finalize():
    info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0
    with f.open('rb') as source:t.addfile(info,source)
  (OUT/'26920_candidate_app_source.tar.gz.sha256').write_text(sha(target)+'  26920_candidate_app_source.tar.gz\n')
- print('PASS genuine 26920 APK + published candidate receipts with protected 2021 and frozen 26917 baseline',sha(R/APKNAME))
+ print('PASS genuine 26920 APK + published candidate receipts with protected 2019 and frozen 26917 baseline',sha(R/APKNAME))
 if __name__=='__main__':
  parser=argparse.ArgumentParser();parser.add_argument('command',choices=['seal','fetch','prepare','verify-compiled','finalize']);args=parser.parse_args()
  try:globals()[args.command.replace('-','_')]()

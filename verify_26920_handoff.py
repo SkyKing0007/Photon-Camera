@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact three-stage fail-closed active 26920 V4 source, compiler CLI and runner seal."""
+"""Exact three-stage fail-closed active 26920 V5 source, CMake shadow ABI, compiler CLI and runner seal."""
 from pathlib import Path
 import hashlib,re
 R=Path(__file__).resolve().parent
@@ -7,7 +7,7 @@ WF='.github/workflows/build-26920-change-aware.yml'
 STAGE='26920_STAGE1_PATHS.txt'
 HASHES='26920_HANDOFF_HASHES.sha256'
 PREV_EXEC='31eebc26fa69a71da1c82bd7a304bd7d8c4e8158d598df12a92a5b8e21a535bf'
-TRIGGER='RUN_26920_V4_B_ON_LK_DESCRIPTOR_ABI_REPAIR_FROM_SUCCESSFUL_26917\n'
+TRIGGER='RUN_26920_V5_ACTUAL_CMAKE_SHADOW_ABI_REPAIR_FROM_SUCCESSFUL_26917\n'
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def verify():
  paths=(R/STAGE).read_text().splitlines()
@@ -23,13 +23,13 @@ def verify():
  for p,h in provided.items():assert (R/p).is_file() and sha(R/p)==h,p
  changed=(R/'26920_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines()
  added=(R/'26920_ADDED_RUNTIME_PATHS.txt').read_text().splitlines()
- assert len(changed)==17 and len(set(changed))==17 and len(added)==2
+ assert len(changed)==19 and len(set(changed))==19 and len(added)==2
  assert (R/'26920_DELETED_RUNTIME_PATHS.txt').read_text()==''
  assert all('handoff_payload_26920/'+p in paths for p in changed)
  assert (R/'build_26917_incremental.py').is_file() and sha(R/'build_26917_incremental.py')==PREV_EXEC
  assert (R/'TRIGGER_26920.txt').read_text()==TRIGGER
  w=(R/WF).read_text()
- assert 'photon-26920-v2-active-b-on-lk-per-lens-clean-26917' in w
+ assert 'photon-26920-v5-shadow-abi-b-on-lk-per-lens-clean-26917' in w
  for text in ['test_26920_source.py --live','test_26920_math_host.py',
   'test_26920_patch_proof.py --live','test_26917_border.py --live',
   'build_26920_incremental.py fetch','build_26920_incremental.py prepare',
@@ -65,9 +65,29 @@ def verify():
   descriptors=dict((int(n),typ) for n,typ in re.findall(r'\{(\d+), VK_DESCRIPTOR_TYPE_(STORAGE_BUFFER|STORAGE_IMAGE)\}',part))
   assert descriptors.get(binding)=='STORAGE_BUFFER', '26920 V3 Vulkan pipeline crash: '+shader+' SSBO binding='+str(binding)
  assert 'mf compute pipeline shader=' in ex and ' variant=' in ex
+ # ACTUAL compiled CMake shadow: successful 26917 replaces the upstream
+ # VulkanExecutor.cpp AND AndroidBurstCoordinator.cpp from Iris26888 bridge.
+ # V4 mistakenly fixed the upstream file only. Both shadows are required,
+ # regardless of the user switch state and even if every SHA receipt passes.
+ shadow_ex=(R/'handoff_payload_26920/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp').read_text()
+ for shader,nxt,binding in [('lk_refine','flow_dense_smooth',4),('robust_photometric','robust_erode5',9)]:
+  part=shadow_ex.split('{"'+shader+'",',1)[1].split('{"'+nxt+'",',1)[0]
+  descriptors=dict((int(n),typ) for n,typ in re.findall(r'\{(\d+), VK_DESCRIPTOR_TYPE_(STORAGE_BUFFER|STORAGE_IMAGE)\}',part))
+  assert descriptors.get(binding)=='STORAGE_BUFFER', '26920 V4 CMake shadow ABI failure: '+shader+' SSBO binding='+str(binding)
+ assert 'mf compute pipeline shader=' in shadow_ex and ' variant=' in shadow_ex
+ assert 'shadow=iris26887_b_only_vendor' in shadow_ex
+ shadow_co=(R/'handoff_payload_26920/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp').read_text()
+ for piece in ('VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT',
+               'destroyHostBuffer(iris26920Counts_)',
+               'if (merge_.iris26920Active) ensureHostBuffer(iris26920Counts_, 16u);',
+               'vkCmdCopyBuffer(command_',
+               'arena_.buffer("iris26920_stats").buffer',
+               'result.iris26920Enabled = true',
+               'result.iris26920Counts[0] != tileMax'):
+  assert piece in shadow_co, '26920 V4 CMake shadow Wronski path missing '+piece
  assert 'test_26920_vulkan_abi.py' in paths
  new=(R/'handoff_payload_26920/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java').read_text()
  assert 'nativeArm(' in new and 'nativeTakeLastReport()' in new and 'nativeClear()' in new
  assert 'no image change' not in (R/'build_26920_incremental.py').read_text().lower()
- print('PASS 26920 V4 sealed stages='+str(len(paths))+' +1 workflow +1 trigger, SHA-bound active source, 26917 executed runner, real Vulkan and all inherited compiler gates')
+ print('PASS 26920 V5 sealed stages='+str(len(paths))+' +1 workflow +1 trigger, SHA-bound ACTUAL CMake shadow, active source, 26917 executed runner, real Vulkan and all inherited compiler gates')
 if __name__=='__main__':verify()

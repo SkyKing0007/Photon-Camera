@@ -1,171 +1,59 @@
-# Photon 26920 V4 — Fix native Vulkan descriptor ABI crash, preserve active per-lens Lucas–Kanade SR
+# PHOTON 26920 V5 — Actual CMake build-shadow Vulkan descriptor / counter integration repair
 
-**DELIVERY STATUS: LOCALLY VALIDATED / PREPARED FOR ACTIONS. NOT BUILD-PROVEN.**
-This is a standalone replacement for 26920 V3, for the user's existing **three-stage vscode.dev upload**.
-It contains the exact revised source, strict allowlist/patch/manifests, builder, verifier and workflow;
-**it does not contain a compiled 26920 V4 APK** or a successful V4 Actions artifact.
+**DELIVERY: LOCALLY VALIDATED / PREPARED FOR ACTIONS. NOT BUILD-PROVEN.**
+Use this V5 package INSTEAD of V2, V3, or V4. This is one standalone guarded **three-stage vscode.dev ZIP**, not an APK and not user-executed scripts. No commits or pushes have been performed by the assistant.
 
-## Device failure evidence and concrete repair
+## Proven new device failure and corrected runtime ownership
 
-The user's `26920.zip` contains two failed Experiment B Super Res ON captures,
-22:46:45 with Lucas–Kanade SR **OFF** and 22:47:01 with it **ON**.
-Both admitted 15 frames before native processing failed with:
+The user's `26920v4.zip` contains one 15-NORMAL-frame Experiment B Super Res ON capture at 2026-11-11 23:33:10, physical camera 2, LK toggle OFF. Frame capture succeeded, but native Vulkan pipeline creation failed before fusion:
 
-    mf compute pipeline VkResult=-13
+    java.lang.IllegalStateException: mf compute pipeline VkResult=-13
 
-The prior V3 shaders add two unconditional descriptor declarations:
-- `lk_refine.comp`: `set=0,binding=4`, `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`;
-- `robust_photometric.comp`: `set=0,binding=9`, `VK_DESCRIPTOR_TYPE_STORAGE_BUFFER`.
+The V4 fix edited `app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/VulkanExecutor.cpp`. That file does **not** determine the executor actually compiled in Iris: the successful inherited `iris26864/Iris26864VendorRawr.cmake` copies the vendor tree to **`${CMAKE_CURRENT_BINARY_DIR}/iris26887_b_only_vendor/native`**, then **overwrites** the copied `VulkanExecutor.cpp` with the preserved `iris26864/bridge/Iris26888BOffVulkanExecutor.cpp`. It likewise overwrites `AndroidBurstCoordinator.cpp` with `iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp`. `add_subdirectory` builds the shadow, not the original vendor source. The unchanged bridge executor still had the old (no storage-buffer 4/9) shader descriptors and the exact old generic exception message seen on the device. The shadow coordinator additionally lacked the new LK GPU counter copy, retention and results checks; fixing only the executor would cause an ON capture to fail later.
 
-V3's native `VulkanExecutor.cpp` still had the successful 26917 layout without
-these bindings. `VulkanExecutor::initialize` creates *all* shader pipelines,
-even when the per-lens toggle is OFF; thus both OFF and ON crashed before
-fusion. This is a concrete source-level shader/native ABI mismatch; the Vulkan
-error alone does not identify the failed shader, so a secondary driver failure
-cannot be ruled out without a V4 device capture.
+V5 corrects **both actual CMake shadow owners** and leaves CMake itself and all 7 successful 26917 Bayer-border files unchanged:
 
-**V4's only runtime change relative to V3** is:
+1. `app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp`: declare set 0 binding **4** storage buffer in `lk_refine`, binding **9** storage buffer in `robust_photometric` for *both* ON/OFF and production/trace (shaders declare these unconditionally); on future pipeline error print `shader=<name> variant=<prod/trace> shadow=iris26887_b_only_vendor VkResult=<code>`.
+2. `app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp`: preserve all B OFF HDR+ specialized code while adding the already-specified 26920 ON-only Wronski 16-byte statistics host allocation, final-chunk transfer/correct memory barriers, cleanup, and validated counter publication, matching the 26920 vendor implementation. It does not change B OFF HDRq reconstruction/shot selection.
 
-    app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/VulkanExecutor.cpp
+All previous V4 runtime files (17 source changes, including the two new Java classes) are **byte-identical to V4**. The two modified bridge files are newly allowlisted V5 corrections; therefore V5's source scope is 19 changed paths. The original 26917 authority is still the runtime base. The diagnostic-only V1 handoff is NOT restored.
 
-It adds storage-buffer descriptors 4 and 9 with the exact types of the active
-shader interfaces, and on any remaining pipeline-creation failure names the
-failed shader and `prod`/`trace` variant, rather than only `VkResult=-13`.
-The existing `MultiframeRecorder` already supplies both buffers in OFF and ON
-and is byte-identical to V3. **All 16 existing V3 changed runtime paths are
-byte-identical in V4**, including the active LK math, confidence math, per-lens
-Settings switch, capture snapshot, logs and JNI integration.
+The failure's root cause is **a stale CMake shadow source**, NOT a failed RAW capture, ON-toggle arithmetic or a missing Android runtime file. The V4 generic error strongly supports the shadow-ownership diagnosis. A corrected native pipeline still needs real Actions compilation and physical-device retesting; do not describe V5 as crash-proven from source alone.
 
-## Runtime source and guarded build authority
+## Authority, hashes and verification method
 
-- Repository: `SkyKing0007/Photon-Camera`; branch: `experimental-clean-photon-rebuild` only.
-- Successful **26917 runtime/image authority**: Actions run `42859946714`,
-  commit `83ad93725baf8de8fa7653235e93e4fc0ffeaebb`, published artifact
-  `13786011058`, artifact SHA-256
-  `ae09ca810fee66057f173ccc65efbe18772c2561b0c96e8931763da748b2e57b`.
-- Exact successful 26917 compiled candidate TAR SHA-256
-  `d82d550362b22a5486098335a41e3817b1417256205c356c6ef837aceb7d68a1`.
-- Exact executed 26917 builder SHA-256
-  `31eebc26fa69a71da1c82bd7a304bd7d8c4e8158d598df12a92a5b8e21a535bf`;
-  workflow SHA-256 `8d75c66c70ab0c2a6be029a5707e52fea05d3c4a1075ec8be70c04e27ea4afcb`;
-  APK SHA-256 `3846787d39e59084098d1771f7b8084fd12c86e36157cc098c0961fdf9773c18`.
-- Verification mechanics inherited unchanged from last successful **26919**
-  Actions run `42947897865`, commit `22a389f9c61396979fc5ba7a9b312244e85ffc5b`,
-  artifact `13823509427`, and from the previous 26920 V3 guarded procedure.
-  The compiled 26919 *source* is NOT the active runtime base for V4.
-- Separate historical failure: 26920 V2 run `43144114124`, job
-  `130937798460`, failed on `spirv-opt --target-env vulkan1.1`. Its fixed
-  `spirv-opt --target-env=vulkan1.1` remains mandatory in V4.
+- Successful runtime baseline **26917**, run `42859946714`, commit `83ad93725baf8de8fa7653235e93e4fc0ffeaebb`, artifact ID `13786011058`, artifact ZIP SHA-256 `ae09ca810fee66057f173ccc65efbe18772c2561b0c96e8931763da748b2e57b`.
+- Actual 26917 compiled source TAR SHA-256 `d82d550362b22a5486098335a41e3817b1417256205c356c6ef837aceb7d68a1`.
+- Actual executed 26917 builder SHA-256 `31eebc26fa69a71da1c82bd7a304bd7d8c4e8158d598df12a92a5b8e21a535bf`, workflow SHA-256 `8d75c66c70ab0c2a6be029a5707e52fea05d3c4a1075ec8be70c04e27ea4afcb`; successful 26917 APK SHA-256 `3846787d39e59084098d1771f7b8084fd12c86e36157cc098c0961fdf9773c18`.
+- Build/verification mechanics: successful **26919** Actions `42947897865`, commit `22a389f9c61396979fc5ba7a9b312244e85ffc5b`, artifact `13823509427`, inherited through the existing V4 GitHub Actions workflow. Do NOT use compiled 26919 source as image runtime authority; 26917 is the agreed cleanest B Super Res ON baseline.
+- Actual compiled 26917 candidate: 2,036 file SHA entries. V5 intended source: **2,038** entries; **19 changed paths, including 2 additions, 0 deletions; 2,019 original paths byte-identical**. Every changed byte is in `26920_CHANGED_RUNTIME_ALLOWLIST.txt` and `26920_FULL_INDEX_FORWARD.patch`. All seven successful 26917 physical-Bayer-border paths retain their **exact** SHA-256 per `26920_FROZEN_26917_BORDER.sha256`.
+- `app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake` is **protected and unchanged**. V5 testing must prove that its `configure_file` and `add_subdirectory` continue to compile the correct overridden CMake build-shadow owner, not validate an unused upstream file.
+- V2 SPIR-V optimizer failure `43144114124` remains covered: correct `spirv-opt --target-env=vulkan1.1 -O`, not `--target-env vulkan1.1`. Retain V3 real GLSL/SPIR-V compiler check and V4 SPIR-V descriptor/ABI binary reflection for both production and trace. For BOTH ABIs, add strong **actual CMake-configured shadow-source byte equality** checks to compiled-output verification, not just a vendor-source static check.
+- Historical 26886, 26887, 26903, 26904 V1 optimizer/V2 Spektra CMake/V3 success, 26914 Kotlin, 26915 Normal and tele, 26917 border, 26918 and 26919 shader/receipt tests remain unchanged in workflow.
 
-## Source allowlist / protected invariance
+## Actual intended device behavior
 
-Successful 26917 compiled authority: **2,036 source files**.
-V4 exact candidate: **2,038 files**, **17 changed paths including two added
-Java files**, zero deletions, **2,021 original files byte-identical**.
-Every intended runtime change is in `26920_CHANGED_RUNTIME_ALLOWLIST.txt`;
-additional protected files (including native/vendor code) are SHA-256 frozen.
-The seven 26917 physical-Bayer-border components are explicitly checked by
-`26920_FROZEN_26917_BORDER.sha256` and remain bit-identical, including JNI,
-AMaZE and `amaze_import.spv`. The 26917 440,800 border checks remain in the
-inherited workflow. The entire 17-path full-index Git patch must apply/reverse
-with zero fuzz at `core.abbrev=7,12,40`.
+For each physical lens, the native AndroidX `Lucas-Kanade SR` switch stays immediately below `Reconstruction experiment` with Iris's existing Settings font, icon spacing, switch row and per-lens storage.
 
-## Actual image-processing semantics (not a diagnostic-only APK)
+- Experiment B PHOTO, Super Res ON, LK **OFF**: original 26917 Wronski true-2x reconstruction, no 26920 alignment/confidence application. Descriptor buffers are still declared and provided during eager pipeline initialization.
+- Experiment B PHOTO, Super Res ON, LK **ON**: in the actual native GPU reconstruction, additional RAW-consistency-gated stationary subpixel LK correction (<=0.125 sensor pixel, one step, held-out evidence) and <=10% confidence reduction on already eligible contributors. They modify actual fusion inputs before accumulation, NOT merely run as diagnostics. Unsafe individual pixels/tiles are rejected, but there is no automatic whole-capture fallback to LK OFF on native failure.
+- Preserve 26917 Wronski image geometry, 50MP, 15-frame raw admission, native clipping/AMaZE, SDR/UHDR/DNG, Night, Experiment A, B Super Res OFF, Spektra, optical lens routing and physical-border regressions. No native/vendor source may differ outside the 19 allowed paths.
+- `log.txt` and `motiontrace.txt` must expose native activation, physical lens, frame count, reference shutter, accepted/rejected corrections, GPU timings, and reasons. If a driver fails again, shader+variant+CMake shadow identity must be visible.
 
-The **Lucas-Kanade SR** AndroidX switch sits directly below the per-physical-lens
-**Reconstruction experiment** setting, using the same native Settings style,
-icon spacing, font and toggle. Default OFF, persisted by physical lens.
+## Upload: exactly 3 stages to experimental-clean-photon-rebuild
 
-- **B Photo, Super Res ON, LK OFF:** original clean 26917 Wronski true-2× math
-  with no extra alignment/weight correction. Shader buffers remain *declared*
-  and *bound* but their new branches are not executed.
-- **B Photo, Super Res ON, LK ON:** active existing Wronski true-2× path with
-  RAW-derived consistency gating, bounded confidence reductions for already
-  valid contributors, and one additional at-most-0.125-sensor-pixel subpixel
-  Lucas–Kanade correction on stationary tiles only when independent held-out
-  measurements improve. These actually modify flow and fusion weights before
-  output. No separate full-frame reconstruction or neural SR model.
-- Experiment A, Night, DNG, UHDR, Spektra, B Super Res OFF, genuine color,
-  original 50MP output and physical borders preserve their previous ownership.
-- If an **ON** capture suffers a native/GPU infrastructure failure, it fails
-  explicitly rather than silently routing the whole capture back to OFF.
-  Local noisy/moving/clipped regions reject unsafe refinements as an inherent
-  part of the algorithm, not an opaque entire-image fallback.
-- Existing `log.txt` and `motiontrace.txt` emit `IRIS_26920_B_ON_LK`, lens,
-  frame/ref provenance, toggles, GPU timings, accepted/rejected LK candidates,
-  sampled contributor confidence updates, and reasons for zero accepted work.
+1. Stage 1: upload all **37 files** listed in `26920_STAGE1_PATHS.txt` to their exact relative repository paths. This includes replacing the 26920 V4 builder, tests, patch, source allowlist and overlays plus adding the TWO original 26917 bridge C++ paths to the handoff overlay. Historical source and workflow are retained.
+2. Stage 2: upload **ONLY** `.github/workflows/build-26920-change-aware.yml` to the same exact repository-relative path, replacing prior 26920 workflow. No other existing workflow is modified.
+3. Stage 3: upload **ONLY** `TRIGGER_26920.txt` LAST, one trailing newline. Trigger content is `RUN_26920_V5_ACTUAL_CMAKE_SHADOW_ABI_REPAIR_FROM_SUCCESSFUL_26917`.
 
-## Additional targeted V4 regression, without weakening previous gates
+Suggested user commit message (after all uploads):
 
-New `test_26920_vulkan_abi.py` verifies the *four-way contract* for each
-new shader: GLSL interface, VulkanExecutor `VkDescriptorSetLayoutBinding`
-types, exact MultiframeRecorder runtime bindings and resource lifetime.
-The script also independently reflects **real binary SPIR-V** via
-`OpDecorate Binding`/`DescriptorSet` and `OpVariable`/`OpTypePointer` storage
-classes, comparing it to the native descriptor table:
+    Photon 26920 V5: fix actual CMake-shadow Vulkan ABI and Wronski GPU counters
 
-1. Before the Android build, the pinned glslang 16.5.0 compiles the **actual**
-   production and trace shaders (`lk_refine`, `robust_photometric`). The
-   existing real `spirv-val -> spirv-opt --target-env=vulkan1.1 -O -> spirv-val`
-   chain remains mandatory. The new script checks all **four compiled SPIR-V
-   binaries and four optimized binaries**, including trace binding 31.
-2. After full native CMake compilation, the script independently validates
-   **all eight** actual CMake-generated SPIR-V binaries for **arm64-v8a** and
-   **armeabi-v7a**, production and trace. A missing, duplicated, mis-typed
-   or stale descriptor causes a hard FAIL, without publishing the APK.
-3. Static source gate and a consistently resealed hostile mutation reproduce
-   the previous V3 missing/wrong `binding=4` error and require rejection.
-   The V2 malformed optimizer CLI is separately reseal-tested and rejected.
+**No source commit/push or backup branch by the assistant. Never touch `dev`. Never push an APK.**
 
-All existing 26919/26920 V3 steps stay: exact run/artifact/TAR/builder
-receipts, strict protected-source scan, prior 26886/26887, 26903, 26904
-V1 optimizer/V2 Spektra CMake/V3 success, 26914 Kotlin, 26915 tele/normal,
-26916 colors, 26917 border, 26918 and 26919 regressions, pinned GLSL,
-SPIR-V, real two-ABI NDK and Spektra CMake, real Java/Kotlin compilation,
-`./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace`,
-source-matched cache provenance, clean-extract/patch/mutation proofs and
-successful APK+receipt publication **only after real compilation passes**.
-Do not substitute an old compiled binary or disable optimization to pass.
+## Build and test scope — cannot weaken any gate
 
-## Exactly three vscode.dev upload stages — no user-run scripts
+Keep the V4 26920 Actions compiler and delivery flow: SHA-verified exact 26917 artifact fetch; 19-path candidate-first source reconstruction and protected 2019; inherited historical receipts and 440,800 border checks; real pinned glslang 16.5.0 and shader SPIR-V compile -> val -> opt -> val; actual production/trace LK and photometric shaders; Android CMake/NDK arm64-v8a + armeabi-v7a including Spektra, Kotlin, Java and `:app:assembleDebug`; 7/12/40 full-index Git patch forward/back; hard-negative sealed mutation replay; exact NDK generated shaders and their CMake **overridden shadow sources** for both ABIs; compiled source immutability; APK SHA, full compiler receipts, builder SHA, workflow SHA; actual successful Actions job AND published artifact.
 
-**Stage 1:** Upload exactly all **35 paths** in `26920_STAGE1_PATHS.txt` to
-the corresponding repository-relative locations. Replace any existing 26920
-V2/V3 staging paths. This adds the new native `VulkanExecutor.cpp` payload
-and `test_26920_vulkan_abi.py`. Do **not** upload the ZIP, README, APK,
-authority TAR or temporary workspace.
-
-**Stage 2:** Replace ONLY
-`.github/workflows/build-26920-change-aware.yml` with the included new
-workflow. Retain older successful workflows untouched.
-
-**Stage 3:** Upload ONLY `TRIGGER_26920.txt` to the repository root **LAST**.
-Exact bytes are the ASCII line (with one terminating newline):
-
-    RUN_26920_V4_B_ON_LK_DESCRIPTOR_ABI_REPAIR_FROM_SUCCESSFUL_26917
-
-**Suggested commit message for the user:**
-
-    Photon 26920 V4: fix eager Vulkan descriptor ABI for Lucas-Kanade SR ON and OFF
-
-Never modify or push `dev`, create backup branches, push APKs, or commit/push
-source from the assistant without explicit approval. The user performs the
-usual three-stage upload and commits only after all three stages are staged.
-
-## Verified/unknown state and how to judge device results
-
-**LOCALLY VALIDATED:** exact compiled 26917 source, full 2,038-file V4
-candidate, 17-path allowlist/2,021 protected and seven frozen border SHA
-checks, real full-index patch forward/reverse at 7/12/40, source-level
-Vulkan-executor/recorder/shader ABI, 100,000 host LK math cases, hostile
-sealed package mutations and clean-extracted handoff proof.
-
-**PREPARED FOR ACTIONS, NOT BUILD-PROVEN:** Real pinned GLSL+SPIR-V binary
-reflection, both Android ABIs' actual CMake shaders, Kotlin, Java, NDK,
-Spektra CMake and full APK assembly are **NOT RUN locally** (the required
-Android SDK/pinned GLSL toolchain is not installed). No V4 APK, V4 APK SHA,
-new successful Actions artifact or successful V4 Actions job is claimed.
-
-**Physical device not verified:** Even a successful APK cannot establish
-no crash on the user's Vulkan driver, no halo/ghost/color/border regression,
-or better real-world IQ without matched OFF/ON captures and logs.
+**LOCAL SOURCE AND PACKAGE PROOFS:** source count/allowlist and protected files, locked source-owner CMake analysis, native shader ABI source checks for BOTH vendor and compiled bridge, targeted mutations with fully resealed broken shadow files, exact patch and rollback, host C++ numerical tests, clean ZIP replay. All actual production Android/SPIR-V/NDK/Java/Kotlin/assemble compiler gates are **NOT RUN for V5** in this container; do not claim V5 APK or APK hash. An installed V4 APK with a crash does not prove V5. Physical-device visual quality and performance still require V5 APK tests after Actions publication.

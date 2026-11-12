@@ -78,5 +78,38 @@ with tempfile.TemporaryDirectory(prefix='26920_active_negative_') as td:
     native.write_bytes(original_native)
     man.write_bytes(original_manifest)
   v.verify()
-  print('PASS 26920 V4 '+str(mutated+4)+' hostile staged mutations incl resealed optimizer CLI and both Vulkan descriptor mismatches fail closed')
+  # Regression for actual 26920 V4 phone crash: the compiled B OFF HDRq
+  # CMake shadow overwrote both V4-corrected vendor files. Independently
+  # reseal each shadow defect and insist the semantics reject it.
+  semantic_cases=[
+   ('handoff_payload_26920/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp',
+    b'// 26920 ABI: the active LK shader unconditionally declares set0 binding4.\n                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}',
+    b'// 26920 ABI: the active LK shader unconditionally declares set0 binding4.\n                                    {4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}'),
+   ('handoff_payload_26920/app/src/main/cpp/iris26864/bridge/Iris26888BOffVulkanExecutor.cpp',
+    b'// 26920 ABI: the photometric shader unconditionally declares set0 binding9.\n                                    {9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}',
+    b'// 26920 ABI: the photometric shader unconditionally declares set0 binding9.\n                                    {9, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}'),
+   ('handoff_payload_26920/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp',
+    b'if (merge_.iris26920Active) ensureHostBuffer(iris26920Counts_, 16u);',
+    b'if (false) ensureHostBuffer(iris26920Counts_, 16u);'),
+   ('handoff_payload_26920/app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp',
+    b'result.iris26920Enabled = true;', b'result.iris26920Enabled = false;'),
+  ]
+  for target,good,bad in semantic_cases:
+   path=root/target
+   before=path.read_bytes();original_manifest=man.read_bytes()
+   assert before.count(good)==1,(target,good)
+   changed=before.replace(good,bad)
+   path.write_bytes(changed)
+   h1=hashlib.sha256(before).hexdigest().encode()
+   h2=hashlib.sha256(changed).hexdigest().encode()
+   assert original_manifest.count(h1)==1
+   man.write_bytes(original_manifest.replace(h1,h2))
+   try:
+    try:v.verify()
+    except AssertionError:pass
+    else:raise RuntimeError('RESEALED 26920 V4 CMAKE SHADOW REGRESSION ACCEPTED: '+target)
+   finally:
+    path.write_bytes(before);man.write_bytes(original_manifest)
+  v.verify()
+  print('PASS 26920 V5 '+str(mutated+8)+' hostile staged mutations incl resealed optimizer CLI, vendor and CMake-shadow Vulkan ABI defects fail closed')
  finally:v.R=original

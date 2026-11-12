@@ -17,6 +17,13 @@ REC=ROOT/CP/'MultiframeRecorder.cpp'
 SCR=ROOT/CP/'ScratchLayout.cpp'
 ANDROID=ROOT/CP/'AndroidBurstCoordinator.cpp'
 NATIVE_CMAKE=ROOT/'app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/CMakeLists.txt'
+# CRITICAL 26920 V5: the successful 26917 CMake path clones vendor source
+# to a private HDRq shadow and then REPLACES these exact two files. Checking
+# only the vendor originals produced the V4 false-positive and phone crash.
+BUILD_CMAKE=ROOT/'app/src/main/cpp/iris26864/Iris26864VendorRawr.cmake'
+BRIDGE_ROOT='app/src/main/cpp/iris26864/bridge/'
+BRIDGE_EX=ROOT/(BRIDGE_ROOT+'Iris26888BOffVulkanExecutor.cpp')
+BRIDGE_CO=ROOT/(BRIDGE_ROOT+'Iris26888BOffHdrqCoordinator.cpp')
 MODS={
  'lk_refine': {
   'shader':'app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/alignment/shaders/lk_refine.comp',
@@ -36,7 +43,53 @@ MODS={
  },
 }
 
+def validate_shadow_ownership():
+    shadow_ex=BRIDGE_EX.read_text()
+    shadow_co=BRIDGE_CO.read_text()
+    native_ex=EXEC.read_text()
+    native_co=ANDROID.read_text()
+    for source,label in ((native_ex,'vendor source'),(shadow_ex,'CMake compiled shadow')):
+        for name,spec in MODS.items():
+            section=source.split('{"'+name+'",',1)[1].split('{"'+spec['next']+'",',1)[0]
+            entries=re.findall(r'\{(\d+), VK_DESCRIPTOR_TYPE_(STORAGE_IMAGE|STORAGE_BUFFER)\}',section)
+            actual={int(n):'image' if t=='STORAGE_IMAGE' else 'buffer' for n,t in entries}
+            assert len(entries)==len(actual) and actual==spec['expected'],(label,name,actual)
+        assert 'mf compute pipeline shader=' in source and ' variant=' in source,(label,'unidentified failed pipeline')
+    for co,label in ((native_co,'vendor'),(shadow_co,'CMake compiled shadow')):
+        for expected in ('VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT',
+                         'destroyHostBuffer(iris26920Counts_)',
+                         'if (merge_.iris26920Active) ensureHostBuffer(iris26920Counts_, 16u);',
+                         'vkCmdCopyBuffer(command_',
+                         'arena_.buffer("iris26920_stats").buffer',
+                         'result.iris26920Enabled = true',
+                         'result.iris26920Counts[0] != tileMax'):
+            assert expected in co,(label,'missing active Wronski counter owner',expected)
+    # Old B OFF/HDRq specializations must remain selected by CMake, but the
+    # overlay sources must now also support the common Wronski ON executor.
+    if ROOT==R:
+        cm=BUILD_CMAKE.read_text()
+        for path in ('Iris26888BOffVulkanExecutor.cpp','Iris26888BOffHdrqCoordinator.cpp'):
+            assert 'configure_file("${CMAKE_CURRENT_SOURCE_DIR}/iris26864/bridge/'+path+'"' in cm,('CMake build-shadow wiring lost',path)
+        assert 'file(COPY "${IRIS26864_VENDOR_ROOT}/" DESTINATION "${IRIS26887_VENDOR_SHADOW}")' in cm
+        assert 'add_subdirectory("${IRIS26887_VENDOR_SHADOW}/multiframe/pipeline"' in cm
+        assert 'add_subdirectory("${IRIS26864_VENDOR_ROOT}/multiframe/pipeline"' not in cm
+        for path in ('AndroidBurstCoordinator.cpp','VulkanExecutor.cpp'):
+            assert '  src/'+path in NATIVE_CMAKE.read_text(),('missing compiled shadow target',path)
+    print('PASS 26920 V5 ACTUAL-CMAKE-SHADOW-OWNER: copied bridge Vulkan descriptor ABI and Wronski GPU counter ownership match active source; no unused-vendor-source false PASS')
+
+def validate_generated_shadow():
+    """After real NDK build, prove CMake's effective per-ABI copies contain fixes."""
+    root=R/'app/.cxx'
+    for abi in ('arm64-v8a','armeabi-v7a'):
+        for file,source in (('VulkanExecutor.cpp',BRIDGE_EX),('AndroidBurstCoordinator.cpp',BRIDGE_CO)):
+            matches=[p for p in root.glob('**/iris26887_b_only_vendor/native/multiframe/pipeline/src/'+file)
+                     if abi in p.parts]
+            assert len(matches)==1,(abi,file,'expected exactly one actual CMake generated shadow source; got',matches)
+            assert matches[0].read_bytes()==source.read_bytes(),(abi,file,'actual CMake shadow source diverges from SHA-sealed runtime')
+    print('PASS 26920 V5 ACTUAL-CMAKE-SHADOW-BINARY-OWNER: both ABI configured copies byte-identical to guarded bridge files; real APK compilation required')
+
 def validate_source():
+ validate_shadow_ownership()
  executor=EXEC.read_text();record=REC.read_text();scratch=SCR.read_text();android=ANDROID.read_text()
  if ROOT==R:
   assert 'src/VulkanExecutor.cpp' in NATIVE_CMAKE.read_text(), 'actual CMake executor not checked'
@@ -70,7 +123,7 @@ def validate_source():
  assert 'if (merge_.iris26920Active)' in android and 'iris26920Counts_' in android
  # Neither the OFF toggle nor trace mode removes the SSBO from compiled shaders;
  # descriptor layouts must therefore contain these bindings in BOTH modes.
- print('PASS 26920 V4 source Vulkan ABI: LK SSBO binding4, photo SSBO binding9, prod/trace 31, runtime resources, count=16 bytes, push constants, eager initialization')
+ print('PASS 26920 V5 source Vulkan ABI: LK SSBO binding4, photo SSBO binding9, prod/trace 31, runtime resources, count=16 bytes, push constants, eager initialization')
 
 def parse_spv(path):
  data=path.read_bytes()
@@ -112,7 +165,7 @@ def validate_compiled(paths):
   actual=parse_spv(path)
   exp=MODS[name]['expected'] | ({31:'buffer'} if variant=='trace' else {})
   assert actual==exp,f'{path}: binary SPIR-V interface differs, expected={exp} actual={actual}'
- print('PASS 26920 V4 compiled SPIR-V REFLECTION: exact descriptor sets/binding types, production+trace for BOTH LK shaders; count='+str(len(paths)))
+ print('PASS 26920 V5 compiled SPIR-V REFLECTION: exact descriptor sets/binding types, production+trace for BOTH LK shaders; count='+str(len(paths)))
 
 if __name__=='__main__':
  validate_source()
@@ -121,6 +174,7 @@ if __name__=='__main__':
   validate_compiled({(n,v):folder/f'{n}_{v}.spv' for n in MODS for v in ('prod','trace')})
   validate_compiled({(n,v):folder/f'{n}_{v}.opt.spv' for n in MODS for v in ('prod','trace')})
  if '--cmake' in sys.argv:
+  validate_generated_shadow()
   cxx=R/'app/.cxx'
   found={}
   for abi in ('arm64-v8a','armeabi-v7a'):
