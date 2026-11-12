@@ -8,9 +8,9 @@ added=set((R/'26920_ADDED_RUNTIME_PATHS.txt').read_text().splitlines())
 before={p:h for h,p in (s.split('  ',1) for s in (R/'26920_BASE_26917_FULL_APP.sha256').read_text().splitlines())}
 after={p:h for h,p in (s.split('  ',1) for s in (R/'26920_PRECOMPILE_EXPECTED_FULL_APP.sha256').read_text().splitlines())}
 patch=R/'26920_FULL_INDEX_FORWARD.patch';s=patch.read_text()
-assert len(changed)==16 and len(added)==2 and s.count('diff --git ')==16
+assert len(changed)==17 and len(added)==2 and s.count('diff --git ')==17
 indices=re.findall(r'^diff --git a/([^\n]+) b/([^\n]+)\n(?:new file mode 100644\n)?index ([0-9a-f]{40})\.\.([0-9a-f]{40})(?: 100644)?$',s,re.M)
-assert len(indices)==16,len(indices)
+assert len(indices)==17,len(indices)
 for a,b,old,new in indices:
  assert a==b and a in changed
  f=R/'handoff_payload_26920'/a
@@ -33,4 +33,4 @@ for n in (7,12,40):
    assert q.returncode==0,(n,flags,q.stderr)
    if flags==[]:assert all(hashlib.sha256((root/p).read_bytes()).hexdigest()==after[p] for p in changed)
    if flags==['--reverse']:assert all(not (root/p).exists() if p in added else hashlib.sha256((root/p).read_bytes()).hexdigest()==before[p] for p in changed)
-print('PASS exact 26920 full-index 16-path patch '+('real compiled 26917 forward/reverse 7/12/40' if '--live' in sys.argv else 'SHA/provenance, authority replay pending'))
+print('PASS exact 26920 full-index 17-path patch '+('real compiled 26917 forward/reverse 7/12/40' if '--live' in sys.argv else 'SHA/provenance, authority replay pending'))

@@ -52,6 +52,31 @@ with tempfile.TemporaryDirectory(prefix='26920_active_negative_') as td:
    sh.write_bytes(original_script)
    man.write_bytes(original_manifest)
   v.verify()
+  # Both unconditional buffer interfaces must survive even a RESEALED
+  # malformed native descriptor. Test each pipeline independently.
+  native=root/'handoff_payload_26920/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/VulkanExecutor.cpp'
+  original_native=native.read_bytes(); original_manifest=man.read_bytes()
+  for current,next_shader,slot in [(b'lk_refine',b'flow_dense_smooth',4),
+                                   (b'robust_photometric',b'robust_erode5',9)]:
+   prefix,rest=original_native.split(b'{"'+current+b'",',1)
+   section,suffix=rest.split(b'{"'+next_shader+b'",',1)
+   old_binding=('{%d, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}'%slot).encode()
+   new_binding=('{%d, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}'%slot).encode()
+   bad_section=section.replace(old_binding,new_binding)
+   assert bad_section!=section
+   broken_native=prefix+b'{"'+current+b'",'+bad_section+b'{"'+next_shader+b'",'+suffix
+   native.write_bytes(broken_native)
+   before=hashlib.sha256(original_native).hexdigest().encode()
+   after=hashlib.sha256(broken_native).hexdigest().encode()
+   assert original_manifest.count(before)==1
+   man.write_bytes(original_manifest.replace(before,after))
+   try:
+    try:v.verify()
+    except AssertionError:pass
+    else:raise RuntimeError('RESEALED Vulkan descriptor mismatch accepted for '+current.decode())
+   finally:
+    native.write_bytes(original_native)
+    man.write_bytes(original_manifest)
   v.verify()
-  print('PASS 26920 V3 '+str(mutated+2)+' hostile staged-file mutations incl resealed optimizer CLI fail closed')
+  print('PASS 26920 V4 '+str(mutated+4)+' hostile staged mutations incl resealed optimizer CLI and both Vulkan descriptor mismatches fail closed')
  finally:v.R=original

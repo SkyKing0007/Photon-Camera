@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact three-stage fail-closed active 26920 V3 source, compiler CLI and runner seal."""
+"""Exact three-stage fail-closed active 26920 V4 source, compiler CLI and runner seal."""
 from pathlib import Path
 import hashlib,re
 R=Path(__file__).resolve().parent
@@ -7,7 +7,7 @@ WF='.github/workflows/build-26920-change-aware.yml'
 STAGE='26920_STAGE1_PATHS.txt'
 HASHES='26920_HANDOFF_HASHES.sha256'
 PREV_EXEC='31eebc26fa69a71da1c82bd7a304bd7d8c4e8158d598df12a92a5b8e21a535bf'
-TRIGGER='RUN_26920_V3_ACTIVE_LK_26904_SPIRV_OPT_EQUALS_FIX_FROM_CLEAN_26917\n'
+TRIGGER='RUN_26920_V4_B_ON_LK_DESCRIPTOR_ABI_REPAIR_FROM_SUCCESSFUL_26917\n'
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
 def verify():
  paths=(R/STAGE).read_text().splitlines()
@@ -23,7 +23,7 @@ def verify():
  for p,h in provided.items():assert (R/p).is_file() and sha(R/p)==h,p
  changed=(R/'26920_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines()
  added=(R/'26920_ADDED_RUNTIME_PATHS.txt').read_text().splitlines()
- assert len(changed)==16 and len(set(changed))==16 and len(added)==2
+ assert len(changed)==17 and len(set(changed))==17 and len(added)==2
  assert (R/'26920_DELETED_RUNTIME_PATHS.txt').read_text()==''
  assert all('handoff_payload_26920/'+p in paths for p in changed)
  assert (R/'build_26917_incremental.py').is_file() and sha(R/'build_26917_incremental.py')==PREV_EXEC
@@ -36,7 +36,8 @@ def verify():
   'build_26920_incremental.py verify-compiled','build_26920_incremental.py finalize',
   ':app:assembleDebug','compile_26917_amaze_import.sh','compile_26920_lk_shaders.sh',
   'verify_26906_native_cache.py postflight','verify_26904_v3_cmake_handoff.py --handoff',
-  'test_26920_sealed_negatives.py']:
+  'test_26920_sealed_negatives.py', 'test_26920_vulkan_abi.py --live',
+  'test_26920_vulkan_abi.py --live --cmake']:
   assert text in w,'missing inherited build gate '+text
  assert w.count('build_26920_incremental.py fetch')==1
  assert w.count('build_26920_incremental.py prepare')==1
@@ -56,8 +57,17 @@ def verify():
 
  for t in ['26918','26919','26917','26916','26915','26914','26904']:
   assert 'test_'+t in w or 'verify_'+t in w
+ # Semantic safety gate against the successful 26920 V3 phone crash:
+ # Both SSBOs are always declared in the shader even when the lens toggle is OFF.
+ ex=(R/'handoff_payload_26920/app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/VulkanExecutor.cpp').read_text()
+ for shader,nxt,binding in [('lk_refine','flow_dense_smooth',4),('robust_photometric','robust_erode5',9)]:
+  part=ex.split('{"'+shader+'",',1)[1].split('{"'+nxt+'",',1)[0]
+  descriptors=dict((int(n),typ) for n,typ in re.findall(r'\{(\d+), VK_DESCRIPTOR_TYPE_(STORAGE_BUFFER|STORAGE_IMAGE)\}',part))
+  assert descriptors.get(binding)=='STORAGE_BUFFER', '26920 V3 Vulkan pipeline crash: '+shader+' SSBO binding='+str(binding)
+ assert 'mf compute pipeline shader=' in ex and ' variant=' in ex
+ assert 'test_26920_vulkan_abi.py' in paths
  new=(R/'handoff_payload_26920/app/src/main/java/com/hinnka/mycamera/processor/Iris26920NativeProbe.java').read_text()
  assert 'nativeArm(' in new and 'nativeTakeLastReport()' in new and 'nativeClear()' in new
  assert 'no image change' not in (R/'build_26920_incremental.py').read_text().lower()
- print('PASS 26920 V3 sealed stages='+str(len(paths))+' +1 workflow +1 trigger, SHA-bound active source, 26917 executed runner, real Vulkan and all inherited compiler gates')
+ print('PASS 26920 V4 sealed stages='+str(len(paths))+' +1 workflow +1 trigger, SHA-bound active source, 26917 executed runner, real Vulkan and all inherited compiler gates')
 if __name__=='__main__':verify()

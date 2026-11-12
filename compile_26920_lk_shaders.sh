@@ -13,6 +13,7 @@ mkdir -p "$OUT"
 "$COMPILER" --version > "$OUT/glslang-version.txt"
 grep -F '16.5.0' "$OUT/glslang-version.txt" >/dev/null || { echo 'BLOCKED: wrong glslang'; exit 4; }
 python3 -S test_26920_source.py --live
+python3 -S test_26920_vulkan_abi.py --live
 {
   for variant in prod trace; do
     for shader in lk_refine robust_photometric; do
@@ -35,5 +36,6 @@ python3 -S test_26920_source.py --live
   spirv-opt --version
   spirv-val --version
 } > "$PWD/photon_26920_outputs/26920_LK_GLSL_SPIRV_REAL_COMPILER.txt"
+python3 -S test_26920_vulkan_abi.py --live --compiled | tee "$PWD/photon_26920_outputs/26920_VULKAN_DESCRIPTOR_ABI_PROOF.txt"
 grep -F 'lk_refine.comp' "$PWD/photon_26920_outputs/26920_LK_GLSL_SPIRV_REAL_COMPILER.txt" >/dev/null
 grep -F 'robust_photometric.comp' "$PWD/photon_26920_outputs/26920_LK_GLSL_SPIRV_REAL_COMPILER.txt" >/dev/null

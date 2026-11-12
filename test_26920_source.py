@@ -19,11 +19,11 @@ def read(name):
 old=read('26920_BASE_26917_FULL_APP.sha256');new=read('26920_PRECOMPILE_EXPECTED_FULL_APP.sha256')
 allow=(R/'26920_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines()
 added=(R/'26920_ADDED_RUNTIME_PATHS.txt').read_text().splitlines()
-assert len(old)==2036 and len(new)==2038 and len(allow)==16 and len(added)==2
+assert len(old)==2036 and len(new)==2038 and len(allow)==17 and len(added)==2
 assert len(allow)==len(set(allow)) and len(added)==len(set(added))
 assert set(new)-set(old)==set(added) and not(set(old)-set(new))
 assert {p for p in old if old[p]!=new[p]}==set(allow)-set(added)
-assert len(old)-len(allow)+len(added)==2022
+assert len(old)-len(allow)+len(added)==2021
 for ln in (R/'26920_FROZEN_26917_BORDER.sha256').read_text().splitlines():
  h,p=ln.split('  ',1);assert old[p]==h and new[p]==h,p
 for p in old:
@@ -70,5 +70,8 @@ assert 'merge_.iris26920Active' in android and 'vkCmdCopyBuffer' in android and 
 assert 'if (p.iris26920Active != 0 && p.ts == 16)' in lk and 'H1 < H0 * 0.85' in lk and 'sf += iris26920Step;' in lk
 assert 'p.iris26920Active != 0' in rob and 'contribution *= factor;' in rob
 assert 'VERSION_BUILD=26920' in (ROOT/'app/version.properties').read_text()
+ex=(ROOT/'app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/pipeline/src/VulkanExecutor.cpp').read_text()
+assert 'mf compute pipeline shader=' in ex and ' variant=' in ex
+assert '{4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}}' in ex and '{9, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}}}' in ex
 assert not any(p.startswith('app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc') for p in allow)
-print('PASS 26920 '+('LIVE' if LIVE else 'PAYLOAD')+' 2036->2038, 16 changed incl 2 added, 2022 protected, 7 frozen 26917 border paths, physical-lens ON active shader-to-fusion and dual log ownership')
+print('PASS 26920 '+('LIVE' if LIVE else 'PAYLOAD')+' 2036->2038, 17 changed incl 2 added, 2021 protected, 7 frozen 26917 border paths, physical-lens ON active shader-to-fusion and dual log ownership')
