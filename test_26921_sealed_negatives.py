@@ -15,5 +15,6 @@ with tempfile.TemporaryDirectory(prefix='neg26921_') as tmp:
  payload.unlink();assert seal()!=0,'missing native source accepted';payload.write_bytes(raw)
  allow=d/'26921_CHANGED_RUNTIME_ALLOWLIST.txt';raw=allow.read_bytes();allow.write_bytes(raw+b'app/src/main/java/NotAllowed.java\n');assert seal()!=0,'expanded allowlist accepted';allow.write_bytes(raw)
  wf=d/'.github/workflows/build-26921-change-aware.yml';raw=wf.read_bytes();wf.write_bytes(raw+b'# tampered\n');assert seal()!=0,'altered workflow accepted';wf.write_bytes(raw)
+ wrapper=d/'compile_26921_lk_shaders.py';raw=wrapper.read_bytes();wrapper.write_bytes(raw+b'# tampered\n');assert seal()!=0,'altered shader wrapper accepted';wrapper.write_bytes(raw)
  assert seal()==0,'valid handoff not restored'
 print('PASS 26921 clean-stage handoff, altered/missing payload, allowlist expansion, workflow tampering rejected')
