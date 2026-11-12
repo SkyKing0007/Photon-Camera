@@ -6,6 +6,7 @@ before modifying app/src. Standard-library only; do not depend on generated APK
 or toolchain. Includes wrapper-indirected historical compiler dependencies.
 """
 from pathlib import Path
+import hashlib
 import re
 import sys
 import tempfile
@@ -73,4 +74,15 @@ if __name__=='__main__':
     assert len(refs)>=80, f'Unexplained historical regression commands removed: {len(refs)}'
     assert not forbidden, f'Historical nonexistent references in workflow: {forbidden}'
     assert not missing, f'Missing required top-level or indirect workflow references: {missing}'
+    # V1/V2 upload silently failed to trigger because its SHA-sealed trigger
+    # was byte-identical to the file that had already fired V1. This is a
+    # workflow path-filter regression, not a compilation failure.
+    trigger=ROOT/'TRIGGER_26923.txt'
+    assert trigger.is_file(), 'Missing actual stage-3 trigger file'
+    trigger_text=trigger.read_text()
+    assert '      - TRIGGER_26923.txt' in wf, 'Workflow push path filter excludes the uploaded stage-3 trigger'
+    assert 'revision=V3_AFTER_V2_NO_PUSH_PATH_CHANGE' in trigger_text, 'Uploaded trigger is not the new V3 Actions trigger'
+    assert 'previous_commit=39df1eefe71c753456e5a8ded25f424533fb38a3' in trigger_text, 'Trigger not bound to failed V2 branch state'
+    assert hashlib.sha256(trigger.read_bytes()).hexdigest() != 'bf597ab0c885bca3cea12999f287b868571a6047393bda7629a8ca0385459574', 'Stale V1/V2 trigger cannot fire push-path-filter'
+    print('PASS 26923 V3 trigger explicitly differs from V1/V2, matches workflow push path, and is SHA-sealed')
     print(f'PASS 26923 {len(refs)} executable references exist in checked-out source (including indirect compiler wrappers), 26922 payload correctly scoped')
