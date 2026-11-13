@@ -1,4 +1,4 @@
-PHOTON 26925 — ONE FINAL THREE-STAGE vscode.dev HANDOFF
+PHOTON 26925 V2 — PREPARED THREE-STAGE vscode.dev HANDOFF; REAL COMPILERS RUN IN GITHUB ACTIONS
 ==========================================================
 Experimental branch ONLY: experimental-clean-photon-rebuild
 Do not touch dev. Never create a backup branch or commit/push without approval.
@@ -32,7 +32,7 @@ STAGE 3 — unique trigger LAST
  If GitHub Actions doesn't trigger, use workflow_dispatch on that named workflow;
  never run unguarded commands or weaken source checks.
 
-26925 B SUPER RES ON IMPLEMENTATION — NON-OPTIONAL
+26925 V2 GLSL COMPILER CORRECTION + B SUPER RES ON IMPLEMENTATION
  Keep Wronski true-2x 50MP + 3 outer x 3 fresh RAW backprojection updates.
  One initial full 4-level alignment per original companion; store exact per-frame fine
  flow+valid data in device-local cache for up to 16 original RAW frames (usual 15).
@@ -69,3 +69,15 @@ Historical safety regressions protected:
 Pre-upload status: LOCALLY VALIDATED / PREPARED FOR ACTIONS, NOT BUILD-PROVEN.
  Actions run success + actually published artifact required for BUILD-PROVEN.
  No claim device chroma parity or processing-time guarantee until real captures.
+
+V2 PRECOMPILER FAILURE CORRECTION (no modified algorithm or reduced checks):
+ 26925 V1 GitHub Actions run 43365207385, job 131687883560 failed in
+ bash compile_26925_shaders.sh at real pinned ESSL compiler stage. The inline
+ GLES fragment declared `float coherent`, a GLSL ES reserved keyword.
+ V2 changes only that token and two uses to `localCoherence` in the active
+ Kotlin inline shader; actual runtime math is unchanged. A synthetic negative
+ proves the old typo is rejected before Actions. Compiler wrapper now emits
+ failed compiler receipt in Actions logs without suppressing exit status or
+ skipping any real GLSL/SPIR-V/NDK/Kotlin/Java step. Stage-3 trigger bytes are
+ unique from failed V1, still uploaded LAST.
+ Compiler/NDK/assemble remain NOT RUN locally; the unmodified mandatory real compiler and Android assembly gates execute in the triggered GitHub Actions job. A locally prepared handoff is NOT evidence of a successful build.

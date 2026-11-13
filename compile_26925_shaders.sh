@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Exact successful 26923 V4 glslang16.5 ESSL/GLSL/SPIRV gates plus changed
 # current 26925 clip-aware shaders. Missing tools MUST fail, not mock PASS.
-set -euo pipefail
+set -eEuo pipefail
 cd "$(dirname "$0")"
 python3 -S build_26925_incremental.py regress
 python3 -S - <<'PY'
@@ -29,6 +29,11 @@ TOOLS="$PWD/.photon_26904_incremental_work/real_shader_tools"
 DIR="$TOOLS/26925_current_shaders"
 OUT="$PWD/photon_26925_outputs"
 mkdir -p "$DIR" "$OUT"
+# The original V1 hid glslang stdout inside the receipt when ESSL compilation
+# failed. Preserve the entire unchanged compiler commands and show the receipt
+# at the first error without masking or retrying the failure.
+exec 3>&1
+trap 'rc=$?; trap - ERR; echo "26925 BLOCKED: pinned shader compiler failed (exit $rc); captured diagnostics:" >&3; if [ -f "$OUT/26925_CURRENT_GLSL_SPIRV_REAL_COMPILER.txt" ]; then tail -n 120 "$OUT/26925_CURRENT_GLSL_SPIRV_REAL_COMPILER.txt" >&3; fi; exit "$rc"' ERR
 COMPILER="$(find "$TOOLS/glslang" -type f \( -name glslang -o -name glslangValidator \) -print -quit)"
 [ -x "$COMPILER" ] || { echo 'BLOCKED: pinned glslang 16.5.0 missing'; exit 4; }
 "$COMPILER" --version > "$OUT/26925_GLSLANG_VERSION.txt"
@@ -72,3 +77,5 @@ PY
  spirv-opt --version
  spirv-val --version
 } > "$OUT/26925_CURRENT_GLSL_SPIRV_REAL_COMPILER.txt"
+trap - ERR
+exec 3>&-

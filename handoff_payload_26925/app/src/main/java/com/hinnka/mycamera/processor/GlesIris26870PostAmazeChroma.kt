@@ -197,13 +197,13 @@ internal object GlesIris26870PostAmazeChroma {
               // Require a coherent neighborhood and an outlier larger than
               // the locally calibrated burst uncertainty. This is a bounded
               // CHROMA-only update; luminance is reconstructed unchanged.
-              float coherent=1.0-smoothstep(0.08,0.24,dispersion);
+              float localCoherence=1.0-smoothstep(0.08,0.24,dispersion);
               float outlierConfidence=smoothstep(0.70,2.5,
                             outlier/max(0.70*sigmaRelative,0.008));
               float supportPenalty=1.0-smoothstep(3.0,
                                  max(7.0,uIris26925OriginalFrames*0.85),neff);
               float strength=clamp((0.20+0.46*supportPenalty)*
-                  coherent*outlierConfidence*protectedStructure*
+                  localCoherence*outlierConfidence*protectedStructure*
                   (1.0-smoothstep(0.24,0.40,y)),0.0,0.66);
               filteredChroma=mix(filteredChroma,localMean,strength);
             }

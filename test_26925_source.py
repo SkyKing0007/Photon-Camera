@@ -56,6 +56,7 @@ for t in ('uIris26925SupportPresent','uIris26925OriginalFrames','uIris26925ShotB
  check(t in k,'native support/chroma contract '+t)
 check('uIris26922ShotVariance' not in k and 'uIris26922ReadVariance' not in k,'stale global divided variance uniform')
 check('uIris26923SrOn;' not in k,'26923 V3 wrong uniform regression')
+check('float localCoherence=' in k and 'float coherent=' not in k,'26925 V2 GLSL reserved local variable not reintroduced')
 check('if(uIris26924BOff!=0 && ring>=2)' in k,'B OFF long donor safety kept')
 kt=(J/'GlesMgcRawSpatialStacker.kt').read_text()
 check('uniform1i(applyProgram,"uIris26925SupportPresent",1)' in kt and 'uniform1f(applyProgram,"uIris26925OriginalFrames",nFrames)' in kt,'producer to GLSL support owner')
