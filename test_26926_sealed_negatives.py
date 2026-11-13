@@ -18,23 +18,47 @@ with tempfile.TemporaryDirectory(prefix='p26926_sealneg_') as d:
  p=Path(d)/'changed';v=(R/'build_26926_incremental.py').read_bytes();p.write_bytes(v+b'\n')
  assert sha(p)!=m['build_26926_incremental.py']
  p.unlink();assert not p.exists()
-# Replay the actual 26926 V1 failure mechanism: remove the mandatory
-# original 26902 successful runner, or mutate its bytes. Keep all original
-# 26903 historical tests intact in the Actions job.
-with tempfile.TemporaryDirectory(prefix='p26926_real_26902_parent_negative_') as d:
- t=Path(d)
+# The extra historical 26903 V3 sealed-negative test is not part of 26923's
+# successful procedure; enforce it is not accidentally invoked again.
+workflow=(R/'.github/workflows/build-26926-change-aware.yml').read_text()
+assert 'test_26903_v3_sealed_negatives.py' not in workflow
+assert 'build_26902_iris_rawr.sh' not in workflow
+assert 'test_26903_v3_archive_receipt.py' in workflow
+print('PASS 26926 V3 original successful 26923 gates contain no orphan generated runner')
+# Actually execute the sealed checker on a *clean extracted* staging fixture;
+# no historical runner is needed. Missing or tampered new source/validator and
+# even a manually resealed broad workflow trigger must fail closed.
+import subprocess
+with tempfile.TemporaryDirectory(prefix='p26926_v3_sealed_negative_') as td:
+ t=Path(td)
  for rel in m:
-  f=R/rel; dst=t/rel;dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(f,dst)
+  src=R/rel;dst=t/rel;dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dst)
  shutil.copyfile(R/'26926_HANDOFF_HASHES.sha256',t/'26926_HANDOFF_HASHES.sha256')
- import subprocess
- def seal_failed():
-  result=subprocess.run([sys.executable,'-S','build_26926_incremental.py','seal'],cwd=t,text=True,capture_output=True)
-  return result.returncode!=0, result.stderr+result.stdout
- ok,log=seal_failed();assert not ok,('clean original stage already invalid',log)
- p=t/'build_26902_iris_rawr.sh';original=p.read_bytes()
- p.unlink();ok,log=seal_failed();assert ok and ('build_26902_iris_rawr.sh' in log or 'missing' in log),('missing historical runner accepted',log)
- p.write_bytes(original+b'\nDANGEROUS_MUTATION\n');ok,log=seal_failed();assert ok and ('build_26902_iris_rawr.sh' in log or 'mismatch' in log),('tampered original runner accepted',log)
- p.write_bytes(original);ok,log=seal_failed();assert not ok,('SHA recovered historical runner not accepted',log)
-print('PASS 26926 V2 exact original 26902 runner absence and mutation FAIL CLOSED, clean restore PASS')
+ def check():
+  return subprocess.run([sys.executable,'-S','build_26926_incremental.py','seal'],cwd=t,capture_output=True,text=True)
+ r=check();assert r.returncode==0,('untampered clean extracted staging rejected',r.stdout,r.stderr)
+ for rel in ('build_26926_incremental.py',
+             'test_26926_workflow_refs.py',
+             'compile_26926_shaders.sh',
+             'handoff_payload_26926/app/version.properties',
+             '.github/workflows/build-26926-change-aware.yml',
+             'TRIGGER_26926.txt'):
+  f=t/rel;old=f.read_bytes();f.unlink();r=check()
+  assert r.returncode!=0,('missing file accepted',rel)
+  f.write_bytes(old+b'\nMUTATED\n');r=check()
+  assert r.returncode!=0,('changed file accepted',rel)
+  f.write_bytes(old);r=check();assert r.returncode==0,('restored file rejected',rel,r.stdout,r.stderr)
+ # Reseal a workflow that illegally restores the old runner dependency.
+ wf=t/'.github/workflows/build-26926-change-aware.yml';original=wf.read_bytes()
+ wf.write_bytes(original.replace(b'python3 -S test_26903_v3_archive_receipt.py',
+ b'python3 -S test_26903_v3_archive_receipt.py\n          python3 -S test_26903_v3_sealed_negatives.py',1))
+ mfile=t/'26926_HANDOFF_HASHES.sha256';old=mfile.read_text();new=[]
+ for line in old.splitlines():
+  h,name=line.split('  ',1)
+  new.append((sha(wf) if name=='.github/workflows/build-26926-change-aware.yml' else h)+'  '+name)
+ mfile.write_text('\n'.join(new)+'\n')
+ r=check();assert r.returncode!=0,('resealed historical orphan runner added and accepted',r.stdout,r.stderr)
+ wf.write_bytes(original);mfile.write_text(old);assert check().returncode==0
+print('PASS 26926 V3 exact missing/tampered and resealed obsolete-runner negative regressions')
 # Prior V1/V2 reserved GLSL, V3 CMake ABI tests stay in existing 26925 verifiers.
 print('PASS 26926 sealed SHA, missing/unexpected/tampered stage and runtime source negative guards')

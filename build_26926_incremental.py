@@ -75,18 +75,16 @@ def seal():
   '26926_PROTECTED_SOURCE.sha256','26926_CHANGED_RUNTIME_ALLOWLIST.txt',
   '26926_ADDED_RUNTIME_PATHS.txt','26926_DELETED_RUNTIME_PATHS.txt',
   '26926_EXPECTED_ACTION_EXECUTABLES.txt','TRIGGER_26926.txt',
-  'build_26902_iris_rawr.sh','26926_V2_HISTORICAL_RUNNER_PROVENANCE.txt',
-  '26926_V2_STAGE_1_UPLOAD_PATHS.txt','26926_V2_STAGE_2_UPLOAD_PATHS.txt','26926_V2_STAGE_3_UPLOAD_PATHS.txt'}
+  '26926_V3_STAGE_1_UPLOAD_PATHS.txt','26926_V3_STAGE_2_UPLOAD_PATHS.txt','26926_V3_STAGE_3_UPLOAD_PATHS.txt'}
  if not essential.issubset(files):fail('one or more 26926 mandatory verifier/compiler/trigger stages missing')
  # Stage 1 must contain EVERY uploaded file except the YAML and trigger;
  # stage 2 contains the YAML only; stage 3 contains the changed trigger only.
- stages=[(R/f'26926_V2_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
+ stages=[(R/f'26926_V3_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
  assert all(len(x)==len(set(x)) and x==sorted(x) for x in stages)
  wfpath='.github/workflows/build-26926-change-aware.yml'
  trigger='TRIGGER_26926.txt'
  sealed=set(files)|{'26926_HANDOFF_HASHES.sha256'}
- if stages[1]!=[wfpath] or stages[2]!=[trigger] or set(stages[0])!=sealed-{wfpath,trigger} or set(stages[0])&set(stages[1]+stages[2]):fail('26926 V2 three-stage upload path universe/ordering violates exactly 1=ALL, 2=YML, 3=TRIGGER')
- if sha(R/'build_26902_iris_rawr.sh')!='348b2d617ed36b40744d15eeba762bb64c589e45327f60f18454d54cbc4c64dc':fail('26903 historical V3 needs EXACT 26902 runner SHA; prior 26926 V1 failure')
+ if stages[1]!=[wfpath] or stages[2]!=[trigger] or set(stages[0])!=sealed-{wfpath,trigger} or set(stages[0])&set(stages[1]+stages[2]):fail('26926 V3 three-stage upload path universe/ordering violates exactly 1=ALL, 2=YML, 3=TRIGGER')
  staged={k.removeprefix('handoff_payload_26926/') for k in files if k.startswith('handoff_payload_26926/')}
  actual={p.relative_to(R/'handoff_payload_26926').as_posix() for p in (R/'handoff_payload_26926').rglob('*') if p.is_file()}
  if staged!=(changes|added) or actual!=staged:fail('staged overlay differs from EXACT runtime changed-file scope')
@@ -96,6 +94,8 @@ def seal():
              'build_26926_incremental.py verify-compiled','build_26926_incremental.py finalize',':app:assembleDebug']:
   if pin not in wf:fail('historical/live proof missing from 26926 workflow '+pin)
  if wf.count('actions/upload-artifact@v4')!=1 or 'test_26922_guard.py' in wf:fail('unexpected upload/historical stale dependency')
+ if 'test_26903_v3_sealed_negatives.py' in wf or 'build_26902_iris_rawr.sh' in wf:fail('not part of successful 26923 V4 change-aware procedure: obsolete runner dependency')
+ if 'test_26903_v3_archive_receipt.py' not in wf or 'test_26903_modes.py .' not in wf:fail('26903 source/archive regression lost')
  if wf.index('build_26926_incremental.py prepare') >= wf.index('Restore native CMake'):fail('native cache restored before authority source-seed')
  if sha(R/'build_26926_incremental.py')!=files['build_26926_incremental.py'] or sha(R/'.github/workflows/build-26926-change-aware.yml')!=files['.github/workflows/build-26926-change-aware.yml']:fail('executed builder/workflow mutated')
  subprocess.run(['python3','-S','test_26926_workflow_refs.py'],cwd=R,check=True)
