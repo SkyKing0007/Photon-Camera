@@ -74,8 +74,19 @@ def seal():
   '26926_BASE_26923_FULL_APP.sha256','26926_EXPECTED_FULL_APP.sha256',
   '26926_PROTECTED_SOURCE.sha256','26926_CHANGED_RUNTIME_ALLOWLIST.txt',
   '26926_ADDED_RUNTIME_PATHS.txt','26926_DELETED_RUNTIME_PATHS.txt',
-  '26926_EXPECTED_ACTION_EXECUTABLES.txt','TRIGGER_26926.txt'}
+  '26926_EXPECTED_ACTION_EXECUTABLES.txt','TRIGGER_26926.txt',
+  'build_26902_iris_rawr.sh','26926_V2_HISTORICAL_RUNNER_PROVENANCE.txt',
+  '26926_V2_STAGE_1_UPLOAD_PATHS.txt','26926_V2_STAGE_2_UPLOAD_PATHS.txt','26926_V2_STAGE_3_UPLOAD_PATHS.txt'}
  if not essential.issubset(files):fail('one or more 26926 mandatory verifier/compiler/trigger stages missing')
+ # Stage 1 must contain EVERY uploaded file except the YAML and trigger;
+ # stage 2 contains the YAML only; stage 3 contains the changed trigger only.
+ stages=[(R/f'26926_V2_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
+ assert all(len(x)==len(set(x)) and x==sorted(x) for x in stages)
+ wfpath='.github/workflows/build-26926-change-aware.yml'
+ trigger='TRIGGER_26926.txt'
+ sealed=set(files)|{'26926_HANDOFF_HASHES.sha256'}
+ if stages[1]!=[wfpath] or stages[2]!=[trigger] or set(stages[0])!=sealed-{wfpath,trigger} or set(stages[0])&set(stages[1]+stages[2]):fail('26926 V2 three-stage upload path universe/ordering violates exactly 1=ALL, 2=YML, 3=TRIGGER')
+ if sha(R/'build_26902_iris_rawr.sh')!='348b2d617ed36b40744d15eeba762bb64c589e45327f60f18454d54cbc4c64dc':fail('26903 historical V3 needs EXACT 26902 runner SHA; prior 26926 V1 failure')
  staged={k.removeprefix('handoff_payload_26926/') for k in files if k.startswith('handoff_payload_26926/')}
  actual={p.relative_to(R/'handoff_payload_26926').as_posix() for p in (R/'handoff_payload_26926').rglob('*') if p.is_file()}
  if staged!=(changes|added) or actual!=staged:fail('staged overlay differs from EXACT runtime changed-file scope')
