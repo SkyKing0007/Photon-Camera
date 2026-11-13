@@ -1,0 +1,46 @@
+#version 450
+// IRIS_26925_B_ONLY_CFA_COHERENT_RAW_WEIGHTS. One original RAW frame at a
+// time; 3x3 jointly evaluates Bayer colours, then reuses that SAME rejection
+// for the current R/G/B source sample. Never treat 9 image updates as 9 frames.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,r32f) readonly uniform image2D rawResidual;
+layout(set=0,binding=1,r32f) readonly uniform image2D rawVariance;
+layout(set=0,binding=2,r32f) writeonly uniform image2D weightedResidual;
+layout(set=0,binding=3,r32f) writeonly uniform image2D weightedPrecision;
+layout(push_constant) uniform Push {int width,height,reference,pad;}p;
+void main(){
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+    if(q.x>=p.width||q.y>=p.height)return;
+    float variance=imageLoad(rawVariance,q).x;
+    float residual=imageLoad(rawResidual,q).x;
+    if(!(variance>0.0)||isnan(residual)||isinf(residual)){
+        imageStore(weightedResidual,q,vec4(0.0));
+        imageStore(weightedPrecision,q,vec4(0.0));return;
+    }
+    float e=0.0, total=0.0;
+    // All four CFA sites share the neighbourhood decision. Normalize the
+    // innovation by the empirically measured burst variance, not Camera2.
+    for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx){
+        ivec2 s=q+ivec2(dx,dy);
+        if(any(lessThan(s,ivec2(0)))||
+           any(greaterThanEqual(s,ivec2(p.width,p.height))))continue;
+        float v=imageLoad(rawVariance,s).x;
+        float d=imageLoad(rawResidual,s).x;
+        if(!(v>0.0)||isnan(d)||isinf(d))continue;
+        e+=min(d*d/max(v,1e-8),625.0);total+=1.0;
+    }
+    // Local movement/occlusion must not admit a misleading isolated CFA
+    // color, while isolated valid source sites remain safe as references.
+    float w=1.0;
+    if(p.reference==0){
+        if(total<5.0)w=0.0;
+        else {
+            float t=(e/total)/12.25;
+            w=1.0/(1.0+t*t);
+            if(abs(residual)>0.12)w=0.0;
+        }
+    }
+    float precision=clamp(w/variance,0.0,50000.0);
+    imageStore(weightedResidual,q,vec4(precision*residual));
+    imageStore(weightedPrecision,q,vec4(precision));
+}

@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""26925 exact authority-seeded three-stage Actions builder, no commit/push.
+Inherits the successful 26924 V2 complete real shader/NDK/Kotlin/Java/assemble
+and 26904 V1/V2/V3 + 26886/26887/26903 historical regressions.
+"""
+from __future__ import annotations
+import argparse, gzip, hashlib, json, os, pathlib, shutil, subprocess, sys, tarfile, urllib.request, zipfile
+R=pathlib.Path(__file__).resolve().parent
+TMP=R/'.photon_26925_work';OUT=R/'photon_26925_outputs'
+ART=TMP/'26924-success.zip';BASE=TMP/'authority_26924';CAND=TMP/'candidate_26925'
+RUN=43350320435; COMMIT='f5c25c329b46bffec91a3f7684000d7d8b85b58d'; ART_ID=14003598716
+ART_SHA='0907d6e5ad26c23161e5eb0906d8c1fd450164004a4f410277ba95f8a514852c'
+TAR_SHA='99ee52a7ec42980a11be66387ff2e9d2c0d85f32b554bc5fbff7f37e5c0edca1'
+BUILDER_SHA='7865d857a26971510bc2366a25d9bf73396a9c3f2d2beaa31b551a5404158873'
+WORKFLOW_SHA='9de9ed6e0ebef60009016c682528e8927a31bce997c38445cffe9ba75712c565'
+PRIOR_APK_SHA='2da9a88ed184f80f810b0218ec82fe3cabac708dbe27f522a4e760cd05d44241'
+REPO='SkyKing0007/Photon-Camera';BRANCH='experimental-clean-photon-rebuild'
+APKNAME='IrisCamera-0.9726924-26925-iris-rawr-debug.apk'
+NBASE=2048; NFILES=2051; NCHANGE=13; NADD=3; NPROTECTED=2035
+
+def fail(s):raise RuntimeError('26925 BLOCKED: '+str(s))
+def sha(p):
+ h=hashlib.sha256()
+ with open(p,'rb') as f:
+  for block in iter(lambda:f.read(4*1024*1024),b''):h.update(block)
+ return h.hexdigest()
+def parse(p):
+ result={}
+ for line in p.read_text().splitlines():
+  h,name=line.split('  ',1)
+  if len(h)!=64 or name in result or not name.startswith('app/') or '..' in pathlib.PurePosixPath(name).parts: fail('invalid source manifest entry '+line)
+  result[name]=h
+ return result
+def listfiles(root):
+ d={}
+ for p in [*(root/'app/src').rglob('*'),root/'app/build.gradle',root/'app/version.properties']:
+  if p.is_symlink():fail('source symlink '+str(p))
+  if p.is_file():d[p.relative_to(root).as_posix()]=sha(p)
+ return d
+def exact(root,manifest,label):
+ e=parse(R/manifest);d=listfiles(root)
+ if d!=e:fail(label+f' missing={list(e.keys()-d.keys())[:6]} extra={list(d.keys()-e.keys())[:6]} wrong={[x for x in e if d.get(x)!=e[x]][:6]}')
+ print('PASS',label,len(d));return d
+def scope():
+ old=parse(R/'26925_BASE_26924_FULL_APP.sha256');new=parse(R/'26925_EXPECTED_FULL_APP.sha256')
+ changes=set((R/'26925_CHANGED_RUNTIME_ALLOWLIST.txt').read_text().splitlines())
+ added=set((R/'26925_ADDED_RUNTIME_PATHS.txt').read_text().splitlines())
+ removed=(R/'26925_DELETED_RUNTIME_PATHS.txt').read_text().strip()
+ if len(old)!=NBASE or len(new)!=NFILES or len(changes)!=NCHANGE or len(added)!=NADD or removed:fail('runtime file count or deleted scope')
+ if {x for x in old if new.get(x)!=old[x]}!=changes:fail('changed source differs from exact allowlist')
+ if set(new)-set(old)!=added:fail('added runtime path differs')
+ if set(old)-set(new):fail('protected runtime deletion')
+ protected={x:h for x,h in old.items() if x not in changes}
+ if parse(R/'26925_PROTECTED_SOURCE.sha256')!=protected or len(protected)!=NPROTECTED:fail('protected source drift')
+ for p in changes|added:
+  if p.startswith('app/src/main/cpp/iris26864/vendor/') or '/jniLibs/' in p or p.endswith('.so'):fail('native/vendor protected file in allowlist '+p)
+ return changes,added,old,new
+def seal():
+ change,added,old,new=scope()
+ lines=(R/'26925_HANDOFF_HASHES.sha256').read_text().splitlines()
+ expected={}
+ for line in lines:
+  h,p=line.split('  ',1)
+  if p in expected or not (R/p).is_file() or sha(R/p)!=h:fail('staged SHA mismatch or duplicate '+p)
+  expected[p]=h
+ need=set(change|added)
+ if {p.removeprefix('handoff_payload_26925/') for p in expected if p.startswith('handoff_payload_26925/')}!=need:fail('overlay not exact runtime changed-file equality')
+ for p in ['26925_FORWARD_FULLINDEX.patch','26925_ROLLBACK_FULLINDEX.patch','compile_26925_shaders.sh','compile_26925_hr_spirv.sh','compile_26925_lk_shaders.py','build_26925_incremental.py','test_26925_source.py','test_26925_math_host.py','test_26925_shader_shadow.py','test_26925_workflow_refs.py','test_26925_shader_contract.py','.github/workflows/build-26925-change-aware.yml','TRIGGER_26925.txt']:
+  if p not in expected:fail('mandatory executable/trigger/mathematical or shader gate missing '+p)
+ wf=(R/'.github/workflows/build-26925-change-aware.yml').read_text()
+ for pin in ['TRIGGER_26925.txt','verify_26904_v3_safety.py','verify_26904_v2_safety.py','compile_26904_shaders_v2.sh','verify_26906_native_cache.py preflight','test_26924_source.py --payload','test_26925_shader_shadow.py --live --cmake','build_26925_incremental.py verify-compiled','build_26925_incremental.py finalize',':app:assembleDebug']:
+  if pin not in wf:fail('successful verification gate lost '+pin)
+ if 'test_26922_guard.py' in wf:fail('stale nonexistent tool reference')
+ if wf.count('build_26924_incremental.py regress') != 1 or wf.index('build_26924_incremental.py regress') > wf.index('build_26925_incremental.py prepare'):fail('26924 historical regression must run only before 26925 source')
+ if wf.count('actions/upload-artifact@v4')!=1:fail('publish once')
+ file_roots=('handoff_payload_26925/',)
+ actual_overlay={p.relative_to(R).as_posix() for p in (R/'handoff_payload_26925').rglob('*') if p.is_file()}
+ listed_overlay={p for p in expected if p.startswith(file_roots)}
+ if actual_overlay != listed_overlay:fail('extra or missing overlay files')
+ if sha(R/'build_26925_incremental.py')!=expected['build_26925_incremental.py']:fail('runner mutated')
+ print('PASS 26925 exact sealed source 2048->2051, 13 changed, 3 added, 2035 protected, no vendor mutation')
+def fetch():
+ seal();token=os.getenv('GITHUB_TOKEN','')
+ if not token:fail('Actions authentication unavailable')
+ if os.getenv('GITHUB_REPOSITORY',REPO)!=REPO or os.getenv('GITHUB_REF_NAME',BRANCH)!=BRANCH:fail('wrong Actions repo/branch')
+ def gh(path):
+  req=urllib.request.Request('https://api.github.com/repos/'+REPO+'/'+path,headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json'})
+  with urllib.request.urlopen(req,timeout=120) as x:return json.load(x)
+ run=gh('actions/runs/'+str(RUN));art=gh('actions/artifacts/'+str(ART_ID))
+ if run.get('id')!=RUN or run.get('conclusion')!='success' or run.get('head_sha')!=COMMIT or run.get('head_branch')!=BRANCH:fail('26924 successful Actions runtime authority')
+ if art.get('id')!=ART_ID or art.get('expired') or art.get('digest')!='sha256:'+ART_SHA:fail('26924 published artifact digest')
+ TMP.mkdir(exist_ok=True)
+ subprocess.run(['curl','--fail','--location','--retry','3','--silent','--show-error','-H','Authorization: Bearer '+token,'-H','Accept: application/vnd.github+json',f'https://api.github.com/repos/{REPO}/actions/artifacts/{ART_ID}/zip','-o',str(ART)],check=True)
+ if sha(ART)!=ART_SHA:fail('26924 Actions ZIP corrupt')
+ print('PASS exact successful 26924 V2 run, published artifact and SHA-256')
+def safe_tar(p,d):
+ with tarfile.open(p,'r:gz') as t:
+  for m in t:
+   x=pathlib.PurePosixPath(m.name)
+   if x.is_absolute() or '..' in x.parts or not x.parts or x.parts[0]!='app' or not(m.isfile() or m.isdir()):fail('unsafe authority tar '+m.name)
+  t.extractall(d,filter='data')
+def prepare():
+ seal()
+ if not ART.is_file() or sha(ART)!=ART_SHA:fail('prior published Actions ZIP missing/corrupt')
+ for d in (BASE,CAND):
+  if d.exists():shutil.rmtree(d)
+ BASE.mkdir(parents=True)
+ with zipfile.ZipFile(ART) as z:
+  def get(name):
+   p='photon_26924_outputs/'+name
+   if p not in z.namelist():fail('26924 required receipt missing '+p)
+   return z.read(p)
+  data=get('26924_candidate_app_source.tar.gz')
+  if hashlib.sha256(data).hexdigest()!=TAR_SHA:fail('26924 compiled candidate TAR mismatch')
+  if get('26924_PREBUILD_SEALED_APP.sha256')!=(R/'26925_BASE_26924_FULL_APP.sha256').read_bytes():fail('26924 executed compiled source manifest mismatch')
+  if hashlib.sha256(get('ACTUAL_EXECUTED_build_26924_incremental.py')).hexdigest()!=BUILDER_SHA or BUILDER_SHA not in get('26924_ACTUAL_EXECUTED_BUILDER.sha256').decode():fail('26924 actual executed builder missing')
+  if hashlib.sha256(get('ACTUAL_EXECUTED_build-26924-change-aware.yml')).hexdigest()!=WORKFLOW_SHA or WORKFLOW_SHA not in get('26924_ACTUAL_EXECUTED_WORKFLOW.sha256').decode():fail('26924 actual executed workflow changed')
+  if PRIOR_APK_SHA not in get('26924_APK.sha256').decode():fail('26924 actual published APK SHA missing')
+  for key in ['REAL PINNED GLSL COMPILE: PASS','REAL SPIR-V VALIDATION: PASS','REAL KOTLIN COMPILE: PASS','REAL JAVA COMPILE: PASS','NATIVE/NDK COMPILE: PASS','REAL ANDROID Gradle :app:assembleDebug: PASS','RUNTIME SOURCE INVARIANCE: PASS']:
+   if key not in get('26924_COMPILER_STATUS.txt').decode():fail('26924 baseline lacks '+key)
+  (TMP/'26924_candidate.tar.gz').write_bytes(data)
+ safe_tar(TMP/'26924_candidate.tar.gz',BASE)
+ exact(BASE,'26925_BASE_26924_FULL_APP.sha256','actual successful 26924 compiled source')
+ changes,added,_,_=scope()
+ shutil.copytree(BASE,CAND)
+ for p in sorted(changes|added):
+  src=R/'handoff_payload_26925'/p;dst=CAND/p
+  if not src.is_file() or (p in changes and not dst.is_file()) or (p in added and dst.exists()):fail('unsafe candidate overlay '+p)
+  dst.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(src,dst)
+ exact(CAND,'26925_EXPECTED_FULL_APP.sha256','frozen candidate-first 26925')
+ if not (R/'gradlew').is_file() or not (R/'app/build.gradle').is_file():fail('GitHub checkout Gradle project missing')
+ if (R/'app/src').exists():shutil.rmtree(R/'app/src')
+ shutil.copytree(CAND/'app/src',R/'app/src')
+ shutil.copy2(CAND/'app/version.properties',R/'app/version.properties')
+ shutil.copy2(CAND/'app/build.gradle',R/'app/build.gradle')
+ exact(R,'26925_EXPECTED_FULL_APP.sha256','real live Android candidate')
+ OUT.mkdir(exist_ok=True)
+ (OUT/'26925_SOURCE_SCOPE.txt').write_text(f'authority_run={RUN} commit={COMMIT} artifact={ART_ID} ZIP_SHA256={ART_SHA} TAR_SHA256={TAR_SHA}\nfiles={NFILES} changed={NCHANGE} added={NADD} protected={NPROTECTED} deleted=0\n'+'\n'.join(sorted(changes|added))+'\n')
+ print('PASS 26925 source seeded solely from successful V4, no stale repo source substitution')
+def regress():
+ seal();exact(R,'26925_EXPECTED_FULL_APP.sha256','26925 live source')
+ for cmd in [['python3','-S','test_26925_source.py','--live'],['python3','-S','test_26925_math_host.py','--live'],['python3','-S','test_26925_shader_shadow.py','--live']]:subprocess.run(cmd,cwd=R,check=True)
+ print('PASS 26925 B-only owners, original RAW projection, preserved source/vendor and partial clip boundary constraints')
+def verify_compiled():
+ regress()
+ for name in ('26925_CURRENT_GLSL_SPIRV_REAL_COMPILER.txt','26925_ORIGINAL_RAW_SPIRV_REAL_COMPILER.txt','26925_PINNED_LK_SPIRV_REAL_COMPILER.txt'):
+  f=OUT/name
+  if not f.is_file() or '16.5.0' not in f.read_text() or 'PASS' not in f.read_text():fail('real 26925 current pinned shader compiler receipt missing '+name)
+ for name in ('26925_current_chroma_es300.frag','26925_current_fcc_median_es300.frag','26925_current_fcc_reconstruct_es300.frag'):
+  if not (OUT/name).is_file():fail('full current expanded GLES shader not compiled '+name)
+ for p in ['app/src/main/cpp/iris26864/bridge/Iris26924_raw_residual.comp',
+           'app/src/main/cpp/iris26864/bridge/Iris26924_raw_adjoint.comp',
+           'app/src/main/cpp/iris26864/bridge/Iris26924_raw_update.comp',
+           'app/src/main/cpp/iris26864/bridge/Iris26924_reference_model.comp',
+           'app/src/main/cpp/iris26864/bridge/Iris26925_raw_cfa_weight.comp',
+           'app/src/main/cpp/iris26864/bridge/Iris26925_support_finish.comp',
+           'app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp']:
+  if sha(R/p) not in (OUT/'26925_ORIGINAL_RAW_SPIRV_REAL_COMPILER.txt').read_text():fail('compiled live Vulkan source hash not proven '+p)
+
+ (OUT/'26925_PREBUILD_SEALED_APP.sha256').write_bytes((R/'26925_EXPECTED_FULL_APP.sha256').read_bytes())
+ print('PASS 26925 actual pinned shader/SPIR-V prebuild freeze and historical regressions')
+def finalize():
+ regress()
+ if (OUT/'26925_PREBUILD_SEALED_APP.sha256').read_bytes()!=(R/'26925_EXPECTED_FULL_APP.sha256').read_bytes():fail('prebuild source mutated')
+ log=(OUT/'26925_gradle_assemble.log').read_text(errors='replace')
+ tasks=[':app:compileDebugKotlin',':app:compileDebugJavaWithJavac',':app:configureCMakeDebug[arm64-v8a]',':app:buildCMakeDebug[arm64-v8a]',':app:configureCMakeDebug[armeabi-v7a]',':app:buildCMakeDebug[armeabi-v7a]',':app:assembleDebug','BUILD SUCCESSFUL']
+ for t in tasks:
+  if t not in log:fail('real Android compiler/assembly gate missing '+t)
+ subprocess.run(['python3','-S','test_26925_shader_shadow.py','--live','--cmake'],cwd=R,check=True)
+ apks=list((R/'app/build/outputs/apk').rglob('*.apk'))
+ if len(apks)!=1:fail('exactly one APK required '+repr(apks))
+ shutil.copy2(apks[0],R/APKNAME)
+ if (R/APKNAME).stat().st_size<1_000_000:fail('APK suspiciously small')
+ (OUT/'26925_COMPILER_STATUS.txt').write_text('REAL PINNED GLSL COMPILE: PASS\nREAL SPIR-V VALIDATION: PASS\nREAL KOTLIN COMPILE: PASS\nREAL JAVA COMPILE: PASS\nNATIVE/NDK COMPILE: PASS (arm64-v8a, armeabi-v7a)\nREAL ANDROID Gradle :app:assembleDebug: PASS\nRUNTIME SOURCE INVARIANCE: PASS\nDEVICE IMAGE QUALITY: NOT RUN\n')
+ (OUT/'26925_REAL_GRADLE_TASKS.txt').write_text(''.join('PASS '+t+'\n' for t in tasks))
+ (OUT/'26925_APK.sha256').write_text(sha(R/APKNAME)+'  '+APKNAME+'\n')
+ wf=R/'.github/workflows/build-26925-change-aware.yml'
+ (OUT/'26925_ACTUAL_EXECUTED_BUILDER.sha256').write_text(sha(R/'build_26925_incremental.py')+'  build_26925_incremental.py\n')
+ (OUT/'26925_ACTUAL_EXECUTED_WORKFLOW.sha256').write_text(sha(wf)+'  .github/workflows/build-26925-change-aware.yml\n')
+ (OUT/'26925_ACTIONS_IDENTITY.txt').write_text('git_sha='+os.getenv('GITHUB_SHA','unknown')+'\ngithub_run_id='+os.getenv('GITHUB_RUN_ID','unknown')+'\n')
+ for p in ['26925_BASE_26924_FULL_APP.sha256','26925_EXPECTED_FULL_APP.sha256','26925_PROTECTED_SOURCE.sha256','26925_CHANGED_RUNTIME_ALLOWLIST.txt','26925_ADDED_RUNTIME_PATHS.txt']:shutil.copy2(R/p,OUT/p)
+ shutil.copy2(R/'build_26925_incremental.py',OUT/'ACTUAL_EXECUTED_build_26925_incremental.py')
+ shutil.copy2(wf,OUT/'ACTUAL_EXECUTED_build-26925-change-aware.yml')
+ with (OUT/'26925_candidate_app_source.tar.gz').open('wb') as f:
+  with gzip.GzipFile(filename='',mode='wb',compresslevel=1,mtime=0,fileobj=f) as gz:
+   with tarfile.open(fileobj=gz,mode='w') as t:
+    for p in sorted(parse(R/'26925_EXPECTED_FULL_APP.sha256')):
+     src=R/p;info=t.gettarinfo(str(src),arcname=p);info.uid=info.gid=0;info.uname=info.gname='';info.mtime=0
+     with src.open('rb') as x:t.addfile(info,x)
+ (OUT/'26925_candidate_app_source.tar.gz.sha256').write_text(sha(OUT/'26925_candidate_app_source.tar.gz')+'  26925_candidate_app_source.tar.gz\n')
+ print('PASS 26925 complete Android APK, source TAR, dual ABI compiled shadow shaders and published receipts ready')
+if __name__=='__main__':
+ try:
+  arg=argparse.ArgumentParser();arg.add_argument('command',choices=('seal','fetch','prepare','regress','verify-compiled','finalize'));mode=arg.parse_args().command
+  globals()[mode.replace('-','_')]()
+ except Exception as e:print('ERROR '+str(e),file=sys.stderr);sys.exit(1)
