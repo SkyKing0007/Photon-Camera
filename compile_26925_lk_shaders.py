@@ -29,7 +29,7 @@ for required in ('spirv-val --target-env vulkan1.1','spirv-opt --target-env=vulk
 assert trans.replace(new,old,1).replace(new1,old1,1).replace(new2,old2,1)==orig
 # Catch accidentally mutating the two original/vendor LK/robustness GPU shader bytes.
 def parse(name):return dict((p,h) for h,p in (line.split('  ',1) for line in (R/name).read_text().splitlines()))
-a,b=parse('26925_BASE_26923_FULL_APP.sha256'),parse('26925_EXPECTED_FULL_APP.sha256')
+a,b=parse('26925_BASE_26924_FULL_APP.sha256'),parse('26925_EXPECTED_FULL_APP.sha256')
 for p in ('app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/alignment/shaders/lk_refine.comp',
           'app/src/main/cpp/iris26864/vendor/rawr/native/multiframe/merge_wronski/shaders/robust_photometric.comp'):
  assert a[p]==b[p] and hashlib.sha256((R/p).read_bytes()).hexdigest()==a[p],p

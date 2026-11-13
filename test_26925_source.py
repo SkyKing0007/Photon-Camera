@@ -46,6 +46,7 @@ check('iris26925_flow_cache' in (B/'bridge/Iris26925ScratchLayout.cpp').read_tex
 f=(B/'bridge/Iris26925_raw_cfa_weight.comp').read_text()
 check('dy=-1;dy<=1' in f and 'dx=-1;dx<=1' in f and 'float v=imageLoad(rawVariance,s).x' in f and 'e+=min(d*d/max(v,1e-8),625.0)' in f,'actual 3x3 Bayer-coherent residual normalized by native burst noise')
 check('if(p.reference==0)' in f and 'if(total<5.0)w=0.0' in f,'reference preservation and incomplete neighborhood rejection')
+check('float samplePrecision=' in f and 'float precision=' not in f and 'samplePrecision*residual' in f,'26925 V3 reserved GLSL keyword fix from Actions V2 failure')
 s=(B/'bridge/Iris26925_support_finish.comp').read_text()
 check('sw[c]*sw[c]/ss[c]' in s and 'min(n.r,min(n.g,n.b))' in s,'original-frame effective temporal support per color')
 check('original.rgb,safe' in s,'luma and color unchanged by support-finish')

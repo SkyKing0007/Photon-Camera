@@ -1,4 +1,4 @@
-PHOTON 26925 V2 — PREPARED THREE-STAGE vscode.dev HANDOFF; REAL COMPILERS RUN IN GITHUB ACTIONS
+PHOTON 26925 V3 — PREPARED THREE-STAGE vscode.dev HANDOFF; REAL COMPILERS RUN IN GITHUB ACTIONS
 ==========================================================
 Experimental branch ONLY: experimental-clean-photon-rebuild
 Do not touch dev. Never create a backup branch or commit/push without approval.
@@ -32,7 +32,7 @@ STAGE 3 — unique trigger LAST
  If GitHub Actions doesn't trigger, use workflow_dispatch on that named workflow;
  never run unguarded commands or weaken source checks.
 
-26925 V2 GLSL COMPILER CORRECTION + B SUPER RES ON IMPLEMENTATION
+26925 V3 NATIVE SHADER COMPILER CORRECTION + B SUPER RES ON IMPLEMENTATION
  Keep Wronski true-2x 50MP + 3 outer x 3 fresh RAW backprojection updates.
  One initial full 4-level alignment per original companion; store exact per-frame fine
  flow+valid data in device-local cache for up to 16 original RAW frames (usual 15).
@@ -81,3 +81,28 @@ V2 PRECOMPILER FAILURE CORRECTION (no modified algorithm or reduced checks):
  skipping any real GLSL/SPIR-V/NDK/Kotlin/Java step. Stage-3 trigger bytes are
  unique from failed V1, still uploaded LAST.
  Compiler/NDK/assemble remain NOT RUN locally; the unmodified mandatory real compiler and Android assembly gates execute in the triggered GitHub Actions job. A locally prepared handoff is NOT evidence of a successful build.
+
+V3 PINNED VULKAN SHADER FAILURE CORRECTION — RETAINS EVERY REAL ACTIONS GATE:
+ 26925 V2 Actions run 43368337237 / job 131697958967 failed at the
+ real pinned Vulkan1.1 compile of Iris26925_raw_cfa_weight.comp, line 43:
+ `unexpected PRECISION`. The C++/GLSL variable `float precision` used a
+ reserved GLSL keyword, distinct from the V1 GLES `float coherent` error.
+ Only the native variable name and two uses change to `samplePrecision`.
+ No numerical weights, chroma/luma formulas, 3x3 iteration count, frame
+ acceptance, ABI descriptors, vendor source, or protected files are changed.
+ New source and precompiler gates scan ALL six native shaders plus original
+ Wronski guide and the actual GLES shader; V1 and V2 exact failures replay
+ as negative tests. The original pinned 16.5.0 GLSL, SPIR-V optimize/validate,
+ generated CMake dual-ABI shadow checks, and real NDK/Kotlin/Java/assemble
+ remain MANDATORY inside GitHub Actions; locally NOT RUN.
+ V3 stage-3 trigger is unique vs failed V1/V2 and must be uploaded last.
+V3 INDIRECT-REFERENCE / COMPILED-OUTPUT-CLOSURE FIX (detected before handoff):
+ The nested historical LK compiler wrapper still referenced nonexistent
+ `26925_BASE_26923_FULL_APP.sha256`; now correctly uses SHA-sealed
+ `26925_BASE_26924_FULL_APP.sha256`. The current SPIR-V ABI checker
+ looked under output receipts, not the actual pinned compiler output under
+ `.photon_26904_incremental_work/real_shader_tools/26925_raw_projection/`.
+ Both executable-internal file dependencies and compiled binary inspection
+ now resolve to the real current paths; V3 preflight fails closed on regression.
+ All original pinned GLSL/SPIR-V compiler invocations and reflection gates
+ remain mandatory and unchanged. No reduced compilation or fake proof.

@@ -8,7 +8,7 @@ R=Path(__file__).resolve().parent
 P=R/'handoff_payload_26925' if '--payload' in __import__('sys').argv else R
 B=P/'app/src/main/cpp/iris26864/bridge'
 s=(B/'Iris26925_raw_cfa_weight.comp').read_text()
-for token in ('float t=(e/total)/12.25','w=1.0/(1.0+t*t)','float precision=clamp(w/variance,0.0,50000.0)','if(p.reference==0)','total<5.0'):
+for token in ('float t=(e/total)/12.25','w=1.0/(1.0+t*t)','float samplePrecision=clamp(w/variance,0.0,50000.0)','if(p.reference==0)','total<5.0'):
  assert token in s,('test must match actual 26925 shader math',token)
 f=(B/'Iris26925_support_finish.comp').read_text()
 assert 'sw[c]*sw[c]/ss[c]' in f

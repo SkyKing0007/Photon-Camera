@@ -38,7 +38,8 @@ if '--compiled' in sys.argv:
  from importlib.util import spec_from_file_location,module_from_spec
  sp=spec_from_file_location('historical26920abi',R/'test_26920_vulkan_abi.py')
  m=module_from_spec(sp);sp.loader.exec_module(m)
- root=R/'photon_26925_outputs/26925_raw_projection'
+ root=R/'.photon_26904_incremental_work/real_shader_tools/26925_raw_projection'
+ assert 'DIR="$TOOLS/26925_raw_projection"' in (R/'compile_26925_hr_spirv.sh').read_text(), 'actual pinned compiler output path differs from SPIR-V reflector'
  assert root.is_dir(),('missing actual pinned compiled SPIRV',root)
  for key,(file,n) in shaders.items():
   src=Path(file).stem

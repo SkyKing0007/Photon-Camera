@@ -42,6 +42,45 @@ assert 'uniform int uIris26923SrOn;' not in body
 assert 'uIris26922ShotVariance;' not in body and 'uIris26922ReadVariance;' not in body
 assert 'uniform int uIris26924BOff;' in body and 'uniform int uIris26924ClipPresent;' in body
 assert (B/'Iris26925_raw_cfa_weight.comp').read_text().count('void main()')==1
+# V3: the actual V2 Actions job 131697958967 failed in pinned Vulkan GLSL:
+#   Iris26925_raw_cfa_weight.comp:43 unexpected PRECISION.
+# `precision` is a GLSL keyword even under #version 450. The V2 static gate
+# checked only the Kotlin GLES fragment; check EVERY newly compiled native
+# Vulkan shader before invoking the unchanged mandatory real compiler.
+compiled_shader_names=('Iris26924_raw_residual','Iris26924_raw_adjoint',
+    'Iris26924_raw_update','Iris26924_reference_model',
+    'Iris26925_raw_cfa_weight','Iris26925_support_finish')
+native_compiler=(R/'compile_26925_hr_spirv.sh').read_text()
+assert all(name in native_compiler for name in compiled_shader_names)
+# The handoff contains ONLY the declared 13+3 changed-file overlay. The
+# protected 26924 raw_update and reference_model shaders must NOT be copied
+# into the payload just to satisfy an audit; they come from the exact compiled
+# authority and are checked against BOTH full-index source manifests.
+def source_hashes(path):
+    return {n:h for h,n in (line.split('  ',1) for line in path.read_text().splitlines())}
+base_hash=source_hashes(R/'26925_BASE_26924_FULL_APP.sha256')
+expected_hash=source_hashes(R/'26925_EXPECTED_FULL_APP.sha256')
+for name in compiled_shader_names:
+    src_rel='app/src/main/cpp/iris26864/bridge/'+name+'.comp'
+    source_path=B/(name+'.comp')
+    if not source_path.is_file():
+        assert '--payload' in sys.argv and name in ('Iris26924_raw_update','Iris26924_reference_model'), ('missing nonprotected compiler input',name)
+        assert src_rel in base_hash and expected_hash.get(src_rel)==base_hash[src_rel], ('historical native shader mutated',name)
+        continue
+    shader=source_path.read_text()
+    assert shader.startswith('#version 450') and shader.count('void main()')==1, name
+    offenders=reserved_declarations(shader)
+    assert not offenders, ('26925 native Vulkan GLSL reserved identifier',name,offenders)
+# This is the precise failing production source mutation, not a synthetic
+# unrelated keyword. Assert the negative catches V2's real compiler error.
+cfa=(B/'Iris26925_raw_cfa_weight.comp').read_text()
+assert cfa.count('float samplePrecision=')==1
+assert cfa.count('samplePrecision*residual')==1
+assert cfa.count('vec4(samplePrecision)')==1
+mutant=cfa.replace('float samplePrecision=','float precision=',1)
+assert reserved_declarations(mutant)==['precision'],reserved_declarations(mutant)
+guide=(P/'app/src/main/cpp/iris26864/Iris26885WronskiChromaGuide.comp').read_text()
+assert guide.startswith('#version 450') and not reserved_declarations(guide), 'original Wronski guide GLSL regression'
 assert (B/'Iris26925_support_finish.comp').read_text().count('void main()')==1
 assert 'binding=6,r32f' in (B/'Iris26924_raw_adjoint.comp').read_text()
 assert 'Iris26925_raw_cfa_weight' in (R/'compile_26925_hr_spirv.sh').read_text()
@@ -61,4 +100,4 @@ with tempfile.TemporaryDirectory(prefix='p26925_glsl_fail_visible_') as d:
     assert out.returncode==1,(out.returncode,out.stdout,out.stderr)
     assert 'glslang REAL FAIL: reserved keyword coherent' in out.stdout,(out.stdout,out.stderr)
     assert '26925 BLOCKED: pinned shader compiler failed (exit 1)' in out.stdout
-print('PASS 26925 exact shader ABI, native per-CFA variance, actual original RAW GLSL and unchanged historical compiler gates; REAL glslang/NDK PENDING')
+print('PASS 26925 V3 exact GLES+six native Vulkan shaders reserved-keyword gates with V1 coherent/V2 precision negative regressions, actual ABI and unchanged mandatory pinned real compilers')
