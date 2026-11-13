@@ -1,0 +1,98 @@
+#version 450
+// IRIS_26924_B_ONLY_ORIGINAL_RAW_LKR_STYLE_MODEL. Unlike 26923's nine
+// HR-fused-image passes, these evaluate the same Bayer RAW forward operator
+// and its bilinear transpose against each immutable original frame.
+layout(local_size_x=16,local_size_y=16) in;
+layout(set=0,binding=0,r16ui) readonly uniform uimage2D originalRaw;
+layout(set=0,binding=1,rgba16f) readonly uniform image2D hrEstimate;
+layout(set=0,binding=2,rg32f) readonly uniform image2D tileFlow;
+layout(set=0,binding=3,r8ui) readonly uniform uimage2D validI;
+layout(set=0,binding=4,r32f) writeonly uniform image2D outResidual;
+layout(set=0,binding=5,r32f) writeonly uniform image2D outWeight;
+layout(push_constant) uniform Push {
+    vec4 black;
+    vec4 slope;
+    vec4 offset;
+    float white;
+    int rawW,rawH,tileSize,cfa,reference;
+} p;
+
+int bayerCfa(ivec2 q,int cfa) {
+    int x=(q.x ^ ((cfa==1||cfa==3)?1:0)) & 1;
+    int y=(q.y ^ ((cfa==2||cfa==3)?1:0)) & 1;
+    return (x==0&&y==0)?0:((x==1&&y==1)?2:1);
+}
+// The pinned Wronski tile flow maps reference into companion RAW sensor grid.
+// We use the *same* spatial interpolation for U and the explicit U^T gather.
+bool flowAt(vec2 ref, out vec2 f) {
+    precise vec2 x=(ref+vec2(0.5))/float(p.tileSize)-vec2(0.5);
+    ivec2 b=ivec2(floor(x));vec2 a=fract(x);
+    vec2 total=vec2(0.0);float weight=0.0;
+    for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++){
+        ivec2 t=clamp(b+ivec2(dx,dy),ivec2(0),imageSize(tileFlow)-1);
+        if(imageLoad(validI,t).x==0u)continue;
+        float w=(dx==0?1.0-a.x:a.x)*(dy==0?1.0-a.y:a.y);
+        total+=w*imageLoad(tileFlow,t).xy;weight+=w;
+    }
+    if(!(weight>0.000001)) {f=vec2(0.0);return false;}
+    f=total/weight;return all(lessThan(abs(f),vec2(128.0)));
+}
+// Solve q=r+flow(r) for reference r with bounded fixed-point iteration.
+// Identical geometry is called from both the forward and adjoint shaders.
+bool refForRaw(ivec2 q,out vec2 r) {
+    r=vec2(q);
+    if(p.reference!=0)return true;
+    vec2 f;
+    for(int it=0;it<3;it++){
+        if(!flowAt(r,f))return false;
+        r=vec2(q)-f;
+    }
+    if(!flowAt(r,f))return false;
+    return length(r+f-vec2(q))<0.65;
+}
+// Each source pixel integrates the corresponding four 2x subpixel centres.
+// The bilinear basis is the same in the forward image prediction and adjoint.
+vec2 subSample(vec2 r,int sx,int sy){
+    return 2.0*r+vec2(0.5)+vec2(float(sx)-0.5,float(sy)-0.5);
+}
+float basis(ivec2 z,vec2 h) {
+    vec2 d=abs(h-vec2(z));
+    return max(1.0-d.x,0.0)*max(1.0-d.y,0.0);
+}
+
+float sampleRgbChannel(vec2 h,int c) {
+    ivec2 b=ivec2(floor(h));vec2 t=fract(h);ivec2 extent=imageSize(hrEstimate);
+    if(any(lessThan(b,ivec2(0)))||any(greaterThanEqual(b+ivec2(1),extent)))return 0.0;
+    vec4 v00=imageLoad(hrEstimate,b),v10=imageLoad(hrEstimate,b+ivec2(1,0));
+    vec4 v01=imageLoad(hrEstimate,b+ivec2(0,1)),v11=imageLoad(hrEstimate,b+ivec2(1));
+    return mix(mix(v00[c],v10[c],t.x),mix(v01[c],v11[c],t.x),t.y);
+}
+void main(){
+    ivec2 q=ivec2(gl_GlobalInvocationID.xy);
+    if(q.x>=p.rawW||q.y>=p.rawH)return;
+    vec2 r;
+    float wr=0.0,res=0.0;
+    // Exclude badly conditioned displacement, borders, censored measurements.
+    if(refForRaw(q,r) && all(greaterThanEqual(r,vec2(1.0))) &&
+       all(lessThan(r,vec2(p.rawW-2,p.rawH-2)))) {
+        int site=(q.y&1)*2+(q.x&1),c=bayerCfa(q,p.cfa);
+        float code=float(imageLoad(originalRaw,q).x);
+        float y=(code-p.black[site])/max(p.white-p.black[site],1.0);
+        if(y>-0.05&&y<0.975){
+            float predicted=0.0;
+            for(int dy=0;dy<2;dy++)for(int dx=0;dx<2;dx++)
+                predicted+=0.25*sampleRgbChannel(subSample(r,dx,dy),c);
+            float variance=max(p.slope[site]*max(y,0.0)+p.offset[site],1e-8);
+            float delta=predicted-y;
+            // Noise-normalized Cauchy robustness, per original CFA site.
+            // Strong disagreement must not create moving-object ghosts.
+            float chi=(delta*delta)/(variance*12.25);
+            float robust=1.0/(1.0+chi*chi);
+            wr=clamp(robust/variance,0.0,50000.0);
+            if(abs(delta)>0.12)wr=0.0;
+            res=wr*delta;
+        }
+    }
+    imageStore(outResidual,q,vec4(res));
+    imageStore(outWeight,q,vec4(wr));
+}
