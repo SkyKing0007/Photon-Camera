@@ -23,13 +23,14 @@ with tempfile.TemporaryDirectory(prefix='p26926_sealneg_') as d:
 workflow=(R/'.github/workflows/build-26926-change-aware.yml').read_text()
 assert 'test_26903_v3_sealed_negatives.py' not in workflow
 assert 'build_26902_iris_rawr.sh' not in workflow
+assert 'python3 -S compile_26923_lk_shaders.py' not in workflow, 'V3 failed post-overlay LK owner restored'
 assert 'test_26903_v3_archive_receipt.py' in workflow
-print('PASS 26926 V3 original successful 26923 gates contain no orphan generated runner')
+print('PASS 26926 V4 original successful 26923 gates contain no orphan generated runner')
 # Actually execute the sealed checker on a *clean extracted* staging fixture;
 # no historical runner is needed. Missing or tampered new source/validator and
 # even a manually resealed broad workflow trigger must fail closed.
 import subprocess
-with tempfile.TemporaryDirectory(prefix='p26926_v3_sealed_negative_') as td:
+with tempfile.TemporaryDirectory(prefix='p26926_v4_sealed_negative_') as td:
  t=Path(td)
  for rel in m:
   src=R/rel;dst=t/rel;dst.parent.mkdir(parents=True,exist_ok=True);shutil.copyfile(src,dst)
@@ -40,6 +41,7 @@ with tempfile.TemporaryDirectory(prefix='p26926_v3_sealed_negative_') as td:
  for rel in ('build_26926_incremental.py',
              'test_26926_workflow_refs.py',
              'compile_26926_shaders.sh',
+             'compile_26926_lk_shaders.py',
              'handoff_payload_26926/app/version.properties',
              '.github/workflows/build-26926-change-aware.yml',
              'TRIGGER_26926.txt'):
@@ -59,6 +61,16 @@ with tempfile.TemporaryDirectory(prefix='p26926_v3_sealed_negative_') as td:
  mfile.write_text('\n'.join(new)+'\n')
  r=check();assert r.returncode!=0,('resealed historical orphan runner added and accepted',r.stdout,r.stderr)
  wf.write_bytes(original);mfile.write_text(old);assert check().returncode==0
-print('PASS 26926 V3 exact missing/tampered and resealed obsolete-runner negative regressions')
+ # Reseal the exact V3 failing late historical LK entrypoint; must fail.
+ wf.write_bytes(original.replace(b'python3 -S compile_26926_lk_shaders.py',
+                                 b'python3 -S compile_26923_lk_shaders.py'))
+ resealed=[]
+ for line in old.splitlines():
+  h,name=line.split('  ',1)
+  resealed.append((sha(wf) if name=='.github/workflows/build-26926-change-aware.yml' else h)+'  '+name)
+ mfile.write_text('\n'.join(resealed)+'\n')
+ assert check().returncode!=0, 'resealed V3 exact LK obsolete source-era caller accepted'
+ wf.write_bytes(original);mfile.write_text(old);assert check().returncode==0
+print('PASS 26926 V4 exact missing/tampered and resealed obsolete-runner negative regressions')
 # Prior V1/V2 reserved GLSL, V3 CMake ABI tests stay in existing 26925 verifiers.
 print('PASS 26926 sealed SHA, missing/unexpected/tampered stage and runtime source negative guards')

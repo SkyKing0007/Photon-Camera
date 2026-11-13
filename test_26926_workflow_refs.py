@@ -19,6 +19,14 @@ assert body.index('build_26926_incremental.py prepare') < body.index('Restore na
 # retain real Night mode tests on the compiled candidate. No extra orphan runner.
 assert 'test_26903_v3_sealed_negatives.py' not in body
 assert 'build_26902_iris_rawr.sh' not in body
+# 26926 V3 Actions run 43484663638 failed because the 26923 LK wrapper
+# re-ran 26923 full-source equality after 26926 had already been installed.
+assert 'python3 -S compile_26923_lk_shaders.py' not in body, 'V3 failed LK source-era wrapper restored'
+assert body.count('python3 -S compile_26926_lk_shaders.py')==2, 'missing preflight or real LK compiler'
+assert body.index('build_26923_incremental.py regress')<body.index('build_26926_incremental.py prepare'), 'historical 26923 regress after source overlay'
+post=body.split('build_26926_incremental.py prepare',1)[1]
+assert 'build_26923_incremental.py regress' not in post, 'strict historical source equality in 26926 live scope'
+assert 'test_26923_source.py --live' not in post, 'historical 26923 source exactness on current candidate'
 for required in ('python3 -S build_26923_incremental.py fetch',
                  'python3 -S build_26923_incremental.py prepare',
                  'python3 -S test_26923_shader_contract.py',
@@ -35,7 +43,7 @@ for required in ('python3 -S build_26923_incremental.py fetch',
                  'bash compile_26907_hue_glsl.sh',
                  'bash compile_26908_render_glsl.sh',
                  'bash compile_26917_amaze_import.sh',
-                 'python3 -S compile_26923_lk_shaders.py',
+                 'python3 -S compile_26926_lk_shaders.py',
                  'test_26926_shader_shadow.py --live --cmake',
                  ':app:assembleDebug',
                  'build_26926_incremental.py finalize'):
@@ -54,11 +62,11 @@ if '--all' in sys.argv:
  assert needed.issubset(used),('missing successful 26923 historical preflights',sorted(needed-used))
 # All historical files are part of the existing successful Actions checkout;
 # local staging contains only the new uploader contents.
-new={'build_26926_incremental.py','test_26926_workflow_refs.py','test_26926_sealed_negatives.py','test_26926_source.py','test_26926_math_host.py','test_26926_shader_contract.py','test_26926_shader_shadow.py','test_26926_patch_proof.py','compile_26926_shaders.sh','compile_26926_hr_spirv.sh'}
+new={'build_26926_incremental.py','test_26926_workflow_refs.py','test_26926_sealed_negatives.py','test_26926_source.py','test_26926_math_host.py','test_26926_shader_contract.py','test_26926_shader_shadow.py','test_26926_patch_proof.py','compile_26926_shaders.sh','compile_26926_hr_spirv.sh','compile_26926_lk_shaders.py'}
 assert new.issubset(used)
 for f in new:assert (R/f).is_file(),('26926 uploaded stage missing executable',f)
 if '--all' in sys.argv or (R/'gradlew').is_file():
  for f in expected:assert (R/f).is_file(),('historical executable missing from actual checkout',f)
  for f in ['26926_HANDOFF_HASHES.sha256','26926_BASE_26923_FULL_APP.sha256','26926_EXPECTED_FULL_APP.sha256','26926_PROTECTED_SOURCE.sha256','26926_CHANGED_RUNTIME_ALLOWLIST.txt','26926_ADDED_RUNTIME_PATHS.txt','26926_FORWARD_FULLINDEX.patch','26926_ROLLBACK_FULLINDEX.patch']:
   assert (R/f).is_file(),('sealed stage prerequisite missing',f)
-print('PASS 26926 one workflow, exact referenced real compiler/build/test scripts, no stale Actions commands',len(expected))
+print('PASS 26926 V4 era-scoped original 26923 LK and complete Actions references, no stale commands',len(expected))
