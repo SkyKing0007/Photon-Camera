@@ -551,7 +551,7 @@ void MultiframeRecorder::record26925FineRefine(VkCommandBuffer c, VkImageView ra
     if(!raw)throw std::invalid_argument("26925 missing original RAW in fine-only alignment");
     // Only fine LK against the newly synthesized reference. DO NOT run any
     // coarse pyramid, block matching, or upsample that overwrites cached flow.
-    recordNormalize(c,false,raw,frame);
+    recordNormalize(c,false,raw,frame,nullptr);
     recordAlignmentInput(c,false,nullptr);
     const auto& flow=arena_.image("tile_flow_l3");
     const auto& ri=arena_.image(alignment_.cfaSuppressionLocal5

@@ -76,3 +76,34 @@ for shot,read,light in ((.00009,.000002,.1),(.00012,.000004,.01)):
  sigmas=[((shot*light+read)/n)**0.5 for n in (1,3,15)]
  assert sigmas[0]>sigmas[1]>sigmas[2]
 print('PASS 26925 fixed-luma chroma correction, protected natural fine grain, actual local support noise ordering N=1/3/15')
+
+# V4: exact NDK failure from Actions 43370294678 job 131704220755:
+# the 26925 per-outer fine-LK recorder called recordNormalize with four args
+# but the actual declaration and implementation require a TraceTarget* fifth.
+import re as _re
+rec=(B/'Iris26924MultiframeRecorder.cpp').read_text()
+hdr=(B/'Iris26924MultiframeRecorder.h').read_text()
+_ndk_call=_re.search(r'\brecordNormalize\(\s*c\s*,\s*false\s*,\s*raw\s*,\s*frame\s*(?:,\s*nullptr\s*)?\)\s*;',rec)
+assert _ndk_call and _ndk_call.group(0).replace(' ','')=='recordNormalize(c,false,raw,frame,nullptr);', '26925 V4: original NDK four-argument failure reappeared'
+assert _re.search(r'void\s+recordNormalize\(VkCommandBuffer,\s*bool reference,\s*VkImageView rawU16,\s*const MultiframeFrameParameters&,\s*const TraceTarget\*\) const;',hdr,_re.S), '26925 V4: actual header missing required fifth arg'
+# Compile a minimal C++17 owner with the precise extracted call and equivalent
+# signature; the prior four-argument mutation MUST fail compilation.
+_ndk_fixture_prefix=r'''
+struct TraceTarget {};
+struct MultiframeFrameParameters {};
+using VkCommandBuffer = int;
+using VkImageView = int;
+struct MultiframeRecorder {
+ void recordNormalize(VkCommandBuffer, bool, VkImageView, const MultiframeFrameParameters&, const TraceTarget*) const;
+ void record26925FineRefine(VkCommandBuffer c, VkImageView raw, const MultiframeFrameParameters& frame) const {
+'''
+_ndk_fixture_suffix='\n }\n};\n'
+with tempfile.TemporaryDirectory(prefix='p26925_v4_ndk_arity_') as d:
+ _p=Path(d)/'ndk_arity.cpp'
+ _p.write_text(_ndk_fixture_prefix+_ndk_call.group(0)+_ndk_fixture_suffix)
+ _good=subprocess.run(['g++','-std=c++17','-fsyntax-only','-Wall','-Wextra','-Werror',str(_p)],capture_output=True,text=True)
+ assert _good.returncode==0, ('correct five-argument NDK host check failed',_good.stderr)
+ _p.write_text(_ndk_fixture_prefix+'recordNormalize(c,false,raw,frame);'+_ndk_fixture_suffix)
+ _bad=subprocess.run(['g++','-std=c++17','-fsyntax-only','-Wall','-Wextra','-Werror',str(_p)],capture_output=True,text=True)
+ assert _bad.returncode!=0 and ('no matching function' in _bad.stderr or 'candidate expects 5 arguments' in _bad.stderr), ('missing NDK V3 negative',_bad.stderr)
+print('PASS 26925 V4 real host C++17 recorder API arity; V3 exact four-argument compiler error rejected; real Android NDK remains mandatory in Actions')

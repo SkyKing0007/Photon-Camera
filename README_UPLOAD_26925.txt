@@ -1,4 +1,4 @@
-PHOTON 26925 V3 — PREPARED THREE-STAGE vscode.dev HANDOFF; REAL COMPILERS RUN IN GITHUB ACTIONS
+PHOTON 26925 V4 — PREPARED THREE-STAGE vscode.dev HANDOFF; REAL COMPILERS RUN IN GITHUB ACTIONS
 ==========================================================
 Experimental branch ONLY: experimental-clean-photon-rebuild
 Do not touch dev. Never create a backup branch or commit/push without approval.
@@ -32,7 +32,7 @@ STAGE 3 — unique trigger LAST
  If GitHub Actions doesn't trigger, use workflow_dispatch on that named workflow;
  never run unguarded commands or weaken source checks.
 
-26925 V3 NATIVE SHADER COMPILER CORRECTION + B SUPER RES ON IMPLEMENTATION
+26925 V4 ANDROID NDK RECORDER SIGNATURE CORRECTION + B SUPER RES ON IMPLEMENTATION
  Keep Wronski true-2x 50MP + 3 outer x 3 fresh RAW backprojection updates.
  One initial full 4-level alignment per original companion; store exact per-frame fine
  flow+valid data in device-local cache for up to 16 original RAW frames (usual 15).
@@ -106,3 +106,20 @@ V3 INDIRECT-REFERENCE / COMPILED-OUTPUT-CLOSURE FIX (detected before handoff):
  now resolve to the real current paths; V3 preflight fails closed on regression.
  All original pinned GLSL/SPIR-V compiler invocations and reflection gates
  remain mandatory and unchanged. No reduced compilation or fake proof.
+
+V4 REAL NDK COMPILER FAILURE — FIXED PRIVATE BRIDGE, HISTORICAL PROCEDURE UNCHANGED:
+ Actions run 43370294678 / job 131704220755 passed all earlier source,
+ historical and pinned GLSL/SPIR-V prod+trace compiler gates. Real NDK CMake
+ arm64-v8a compilation failed in the copied private shadow source
+ iris26887_b_only_vendor/native/multiframe/pipeline/src/MultiframeRecorder.cpp
+ line 554: recordNormalize(c,false,raw,frame) had four arguments but the
+ existing real member function requires a fifth `const TraceTarget*`.
+ Corrected ONLY that call to recordNormalize(c,false,raw,frame,nullptr)
+ inside the private bridge Iris26924MultiframeRecorder.cpp (the actual
+ compiled CMake-copy origin). No original RAWR vendor file is modified.
+ Added fail-closed source ABI proof plus real host C++17 syntax check and
+ negative test that exactly reproduces the old four-argument rejection.
+ Both pinned GLSL/SPIR-V, real dual-ABI Android NDK, Kotlin, Java and full
+ :app:assembleDebug remain MANDATORY in GitHub Actions. No bypass or reduced
+ native compilation, no promises of device image quality or runtime speed.
+ V4 trigger must be uploaded LAST; never reuse the V1/V2/V3 trigger.
