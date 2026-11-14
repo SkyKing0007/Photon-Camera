@@ -1,0 +1,117 @@
+#version 450
+// IRIS_26929_B_ON_LOCAL_NOISE_AWARE_CHROMA_GRAIN.
+// One existing, pre-WB Wronski -> AMaZE -> profiled wavelet copy dispatch.
+// Source image (irisRgb) is the UNFILTERED AMaZE output and the per-pixel
+// original RAW Wronski confidence in alpha. Destination is the same image:
+// ONLY read its own pixel, never neighboring pixels (no Vulkan write/read race).
+// All spatial donors come from IMMUTABLE denoisedRgb, the native RAWR output.
+// No extra image, pass, colour-space transform, post-WB luminance denoiser,
+// fabricated camera noise profile, frame-count slider assumption or fake grain.
+layout(local_size_x=16,local_size_y=16,local_size_z=1) in;
+layout(set=0,binding=0,rgba16f) readonly uniform image2D denoisedRgb;
+layout(set=0,binding=1,rgba16f) coherent uniform image2D irisRgb;
+layout(push_constant) uniform CopyArgs {
+    uint width;uint height;
+    float singleShotA;float singleReadB;
+    float mergedFrames;float wbRed;float wbBlue;float reserved;
+} p;
+const vec3 kLuma=vec3(0.25,0.50,0.25);
+const ivec2 kDonor[12]=ivec2[12](
+    ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
+    ivec2(-3,0),ivec2(3,0),ivec2(0,-3),ivec2(0,3),
+    ivec2(-5,0),ivec2(5,0),ivec2(0,-5),ivec2(0,5));
+float saturate(float x){return clamp(x,0.0,1.0);}
+bool finite3(vec3 v){return !any(isnan(v))&&!any(isinf(v));}
+void main(){
+    uvec2 coord=gl_GlobalInvocationID.xy;
+    if(coord.x>=p.width||coord.y>=p.height)return;
+    ivec2 q=ivec2(coord);
+    vec4 source=imageLoad(irisRgb,q);
+    vec3 denoised=imageLoad(denoisedRgb,q).rgb;
+    float confidence=saturate(source.a);
+    if(!finite3(source.rgb)||!finite3(denoised)||
+       any(lessThan(source.rgb,vec3(0)))||any(lessThan(denoised,vec3(0)))||
+       !(p.singleShotA>0.0)||!(p.singleReadB>=0.0)||
+       !(p.mergedFrames>=2.0)||!(p.wbRed>0.0)||!(p.wbBlue>0.0)){
+        imageStore(irisRgb,q,vec4(denoised,confidence));return;
+    }
+    vec3 wb=vec3(p.wbRed,1.0,p.wbBlue);
+    vec3 center=denoised*wb;
+    float y=dot(center,kLuma);
+    vec3 chroma=center-vec3(y);
+    // Preserve real natural fine luminance fluctuations already reconstructed
+    // by original Wronski/AMaZE. The RAWR wavelet is configured forceY=0,
+    // but its non-linear YUV/VST round trip can shift a little fine luminance.
+    // Never inject synthetic grain or restore large, unverified differences.
+    float srcY=dot(source.rgb*wb,kLuma);
+    float singleVar=max(p.singleShotA*max(source.rgb.g,0.0)+p.singleReadB,1e-12);
+    float fullSigma=sqrt(singleVar/max(p.mergedFrames,2.0));
+    float diffY=srcY-y;
+    float allowableY=2.0*fullSigma+0.006*max(y,0.0);
+    float yRestore=(abs(diffY)<=allowableY && srcY>0.0 && y<0.98)?diffY:0.0;
+    // Actual per-pixel Neff is not exported by the unchanged vendor finalizer.
+    // Do NOT call confidence an exact count. It is the REAL Wronski minimum
+    // four-phase coverage certainty; use it only to bound the uncertainty
+    // between fully merged and reference-only measured single-frame variance.
+    float localVar=mix(singleVar,singleVar/max(p.mergedFrames,2.0),confidence);
+    float sigma=sqrt(localVar)*max(1.0,max(p.wbRed,p.wbBlue));
+    float shadow=1.0-smoothstep(0.075,0.32,y);
+    float need=(0.16+0.84*(1.0-confidence))*shadow;
+    float chromaGain=0.0;
+    vec3 target=chroma;
+    if(need>0.005 && y>0.003 && y<0.85 &&
+       max(source.rgb.r,max(source.rgb.g,source.rgb.b))<0.97){
+        vec3 sum=vec3(0.0);
+        float sumSq=0.0,total=0.0;
+        ivec2 limit=ivec2(int(p.width)-1,int(p.height)-1);
+        // Same-material donors selected by LUMINANCE, not by the potentially
+        // contaminated centre hue. We will separately test their dispersion.
+        for(int i=0;i<12;i++){
+            ivec2 at=clamp(q+kDonor[i],ivec2(0),limit);
+            vec3 otherRaw=imageLoad(denoisedRgb,at).rgb;
+            if(!finite3(otherRaw)||any(lessThan(otherRaw,vec3(0))))continue;
+            vec3 other=otherRaw*wb;
+            float ny=dot(other,kLuma);
+            float dist=abs(ny-y)/max(max(ny,y),0.03);
+            float same=1.0-smoothstep(0.055,0.16,dist);
+            if(same<0.01)continue;
+            // A short donor near the centre is more trustworthy than one
+            // five pixels away, except when it crosses a real luma edge.
+            float w=same*(i<4?1.0:i<8?0.70:0.46);
+            vec3 nc=other-vec3(ny);
+            sum+=w*nc;sumSq+=w*dot(nc,nc);total+=w;
+        }
+        if(total>=3.2){
+            vec3 mean=sum/total;
+            float spread=sqrt(max(sumSq/total-dot(mean,mean),0.0));
+            float delta=length(chroma-mean);
+            // A real coloured edge/ridge has either inconsistent neighbours
+            // or a large centre transition relative to the RAW noise model.
+            // Do not bleach strongly supported colour or relocate luminance.
+            float floorColor=max(1.35*sigma,0.018*max(y,0.03));
+            float coherent=1.0-smoothstep(1.5*floorColor,3.5*floorColor,spread);
+            float suspect=smoothstep(0.45*floorColor,1.65*floorColor,delta)*
+                (1.0-smoothstep(3.0*floorColor,5.5*floorColor,delta));
+            float supportedMicroColor=smoothstep(0.19,0.44,
+                length(chroma)/max(y,0.035))*smoothstep(0.35,0.85,confidence);
+            chromaGain=0.52*need*coherent*suspect*(1.0-supportedMicroColor)*
+                smoothstep(3.2,6.0,total);
+            target=mean;
+        }
+    }
+    // Camera-linear, pre-WB owner: correction changes only opponent colour
+    // in white-balanced evidence coordinates, not output brightness. Natural
+    // luminance variation is sourced directly from the original fused result.
+    vec3 shift=(target-chroma);
+    shift-=vec3(dot(shift,kLuma));
+    chromaGain=saturate(chromaGain);
+    for(int k=0;k<3;k++){
+        if(shift[k]<0.0)chromaGain=min(chromaGain,
+            max(center[k],0.0)/max(-shift[k],1e-8));
+    }
+    vec3 changed=center+chromaGain*shift+vec3(yRestore);
+    vec3 outColor=changed/wb;
+    if(!finite3(outColor)||any(lessThan(outColor,vec3(-0.00001))))
+        outColor=denoised;
+    imageStore(irisRgb,q,vec4(max(outColor,vec3(0)),confidence));
+}
