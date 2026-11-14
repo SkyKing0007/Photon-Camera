@@ -1,0 +1,383 @@
+diff --git a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+index 31da6e82968dcce78ee69fb5708857796907e328..3179252828de2f5f9506fc7aaf13bfea035f6791 100644
+--- a/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
++++ b/app/src/main/cpp/iris26864/Iris26864JniGpuInteropImpl.inc
+@@ -600,10 +600,8 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+                     program.workgroupX=16u;program.workgroupY=16u;program.workgroupZ=1u;
+                     bWaveletCopy.reset(new iris26864::VulkanKernelExecutor(ctx.device,
+                         program,std::vector<iris26864::ComputeBinding>{
+-                            {0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                            {1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},
+-                            {2,VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}},
+-                        80u,1u));
++                            {0,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE},{1,VK_DESCRIPTOR_TYPE_STORAGE_IMAGE}},
++                        32u,1u));
+ 
+                 if(!bWavelet||!bWaveletCopy||!result.output||!result.outputView||
+                    result.output==rgb.image()||result.outputView==rgb.view()||
+@@ -647,53 +645,25 @@ void iris26864RunRealBGl(JNIEnv* env,AAssetManager* assets,jobjectArray javaNorm
+                     b.binding=pair.first;b.type=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                     b.imageView=pair.second;rb.push_back(b);
+                 }
+-                // IRIS_26930_B_ON_PHYSICAL_LSC_SHADOW_CHROMA_VARIANCE.
+-                // The original RAWR wavelet remains pinned and is unchanged.
+-                // Its historical /N green-noise model is global. The already
+-                // existing SINGLE wavelet output-copy now receives independent
+-                // measured physical R,G,B noise models and the original LSC
+-                // buffer so that corner shadow chroma can use a real variance
+-                // envelope in the correct post-LSC, pre-WB camera domain.
+-                // Keep the 26926 min-phase support certainty (not exact Neff)
+-                // in AHB alpha; no additional full-resolution allocations.
+-                struct alignas(16) WaveletCopy26930Pc {
+-                    uint32_t extent[4];
+-                    uint32_t sensor[4];
+-                    float shot[4];
+-                    float readNoise[4];
+-                    float wb[4];
++                // IRIS_26929_B_ON_LOCAL_NOISE_AWARE_CHROMA_GRAIN:
++                // Pass the UNDIVIDED measured single-frame GREEN noise model
++                // and actual merged burst size to the existing copy dispatch.
++                // This repairs residual chroma locally from the wavelet output,
++                // using the original RAW coverage confidence in the AMaZE AHB
++                // alpha. Never mistake that scalar for exact per-colour Neff.
++                struct alignas(4) WaveletCopy26929Pc {
++                    uint32_t width,height;
++                    float singleShotA,singleReadB;
++                    float mergedFrames,wbRed,wbBlue,reserved;
+                 };
+-                static_assert(sizeof(WaveletCopy26930Pc)==80u &&
+-                    alignof(WaveletCopy26930Pc)==16u,
+-                    "26930 physical LSC and per-CFA-noise copy Vulkan ABI");
+-                const auto& fitted=result.estimatedNoise;
+-                const uint32_t redSite=localCfa,blueSite=3u-localCfa;
+-                const uint32_t green0=(localCfa==1u||localCfa==2u)?0u:1u;
+-                const uint32_t green1=(localCfa==1u||localCfa==2u)?3u:2u;
+-                const WaveletCopy26930Pc copyArgs{
+-                    {outWidth,outHeight,uint32_t(lscWidth),uint32_t(lscHeight)},
+-                    {uint32_t(cropX),uint32_t(cropY),
+-                     uint32_t(fullSensorWidth),uint32_t(fullSensorHeight)},
+-                    {fitted.slopeBySite[redSite],
+-                     0.5f*(fitted.slopeBySite[green0]+fitted.slopeBySite[green1]),
+-                     fitted.slopeBySite[blueSite],float(f.burstNormalCount)},
+-                    {fitted.offsetBySite[redSite],
+-                     0.5f*(fitted.offsetBySite[green0]+fitted.offsetBySite[green1]),
+-                     fitted.offsetBySite[blueSite],0.f},
+-                    {gainsVec[0]/gainsVec[1],1.f,gainsVec[2]/gainsVec[1],0.f}};
+-                __android_log_print(ANDROID_LOG_INFO,"Iris26930",
+-                    "B_ON_PHYSICAL_LSC_NOISE_COPY_ACTIVE normals=%u lsc=%ux%u "
+-                    "aRGB=%.8g,%.8g,%.8g bRGB=%.8g,%.8g,%.8g confidence=MIN_CFA_CERTAINTY",
+-                    f.burstNormalCount,uint32_t(lscWidth),uint32_t(lscHeight),
+-                    double(copyArgs.shot[0]),double(copyArgs.shot[1]),double(copyArgs.shot[2]),
+-                    double(copyArgs.readNoise[0]),double(copyArgs.readNoise[1]),
+-                    double(copyArgs.readNoise[2]));
+-                iris26864::BoundResource lscResource{};
+-                lscResource.binding=2u;
+-                lscResource.type=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+-                lscResource.buffer=lsc.buffer;
+-                lscResource.bufferRange=lsc.bytes;
+-                rb.push_back(lscResource);
++                static_assert(sizeof(WaveletCopy26929Pc)==32u,
++                    "26929 wavelet copy Vulkan push constant ABI");
++                const WaveletCopy26929Pc copyArgs{
++                    outWidth,outHeight,
++                    f.burstGreenNoisePerMergedSample[0]*float(f.burstNormalCount),
++                    f.burstGreenNoisePerMergedSample[1]*float(f.burstNormalCount),
++                    float(f.burstNormalCount),
++                    gainsVec[0]/gainsVec[1],gainsVec[2]/gainsVec[1],0.f};
+                 bWaveletCopy->record(cmd,rb,&copyArgs,sizeof(copyArgs),outWidth,outHeight);
+                 } else {
+                     __android_log_print(ANDROID_LOG_WARN,"Iris26880",
+diff --git a/app/src/main/cpp/iris26864/Iris26880WaveletCopy.comp b/app/src/main/cpp/iris26864/Iris26880WaveletCopy.comp
+index 37ff4e8e788a8c5d9181461cf573f16483ccacca..13899deb1b17502443816849203f3d768fa1cb83 100644
+--- a/app/src/main/cpp/iris26864/Iris26880WaveletCopy.comp
++++ b/app/src/main/cpp/iris26864/Iris26880WaveletCopy.comp
+@@ -1,181 +1,117 @@
+ #version 450
+-// IRIS_26930_B_ON_PHYSICAL_LSC_SHADOW_CHROMA_VARIANCE.
+-// This is the existing single pre-WB Wronski->AMaZE->wavelet copy pass.
+-// Do not change the reference RAW, Wronski geometry, frame count, three
+-// fallback sliders, native RAWR wavelet kernels or final image brightness.
+-// The original wavelet's single global noise assumption remains untouched;
+-// THIS pass accounts for measured CFA noise by colour, spatial physical LSC
+-// amplification, and an explicitly CONSERVATIVE local coverage envelope.
+-// In-place destination irisRgb reads ONLY its own center; every spatial donor
+-// comes from immutable denoisedRgb. No extra 50MP allocation or dispatch.
++// IRIS_26929_B_ON_LOCAL_NOISE_AWARE_CHROMA_GRAIN.
++// One existing, pre-WB Wronski -> AMaZE -> profiled wavelet copy dispatch.
++// Source image (irisRgb) is the UNFILTERED AMaZE output and the per-pixel
++// original RAW Wronski confidence in alpha. Destination is the same image:
++// ONLY read its own pixel, never neighboring pixels (no Vulkan write/read race).
++// All spatial donors come from IMMUTABLE denoisedRgb, the native RAWR output.
++// No extra image, pass, colour-space transform, post-WB luminance denoiser,
++// fabricated camera noise profile, frame-count slider assumption or fake grain.
+ layout(local_size_x=16,local_size_y=16,local_size_z=1) in;
+ layout(set=0,binding=0,rgba16f) readonly uniform image2D denoisedRgb;
+ layout(set=0,binding=1,rgba16f) coherent uniform image2D irisRgb;
+-layout(std430,set=0,binding=2) readonly buffer PhysicalLsc {vec4 lscMap[];};
+ layout(push_constant) uniform CopyArgs {
+-    uvec4 extent;    // full 2x width,height, physical LSC width,height
+-    uvec4 sensor;    // physical originX,originY,full sensor width,height
+-    vec4 shot;      // single-frame RAW R,G,B shot slopes; actual merged count
+-    vec4 readNoise; // single-frame RAW R,G,B read offsets
+-    vec4 wb;        // camera-linear -> green-normalized WB R,1,B
++    uint width;uint height;
++    float singleShotA;float singleReadB;
++    float mergedFrames;float wbRed;float wbBlue;float reserved;
+ } p;
+ const vec3 kLuma=vec3(0.25,0.50,0.25);
+-const ivec2 kDonor[24]=ivec2[24](
+-    ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2),
+-    ivec2(-6,0),ivec2(6,0),ivec2(0,-6),ivec2(0,6),
+-    ivec2(-16,0),ivec2(16,0),ivec2(0,-16),ivec2(0,16),
+-    ivec2(-48,0),ivec2(48,0),ivec2(0,-48),ivec2(0,48),
+-    ivec2(-96,0),ivec2(96,0),ivec2(0,-96),ivec2(0,96),
+-    ivec2(-12,-12),ivec2(12,-12),ivec2(-12,12),ivec2(12,12));
++const ivec2 kDonor[12]=ivec2[12](
++    ivec2(-1,0),ivec2(1,0),ivec2(0,-1),ivec2(0,1),
++    ivec2(-3,0),ivec2(3,0),ivec2(0,-3),ivec2(0,3),
++    ivec2(-5,0),ivec2(5,0),ivec2(0,-5),ivec2(0,5));
++float saturate(float x){return clamp(x,0.0,1.0);}
+ bool finite3(vec3 v){return !any(isnan(v))&&!any(isinf(v));}
+-float lightness(vec3 v){return dot(v,kLuma);}
+-float saturate1(float v){return clamp(v,0.0,1.0);}
+-float gainAt(vec2 uv,int channel){
+-    if(p.extent.z<2u||p.extent.w<2u)return 1.0;
+-    vec2 at=clamp(uv,vec2(0.0),vec2(1.0))*vec2(p.extent.z-1u,p.extent.w-1u);
+-    uvec2 a=uvec2(floor(at));
+-    uvec2 b=min(a+uvec2(1u),p.extent.zw-uvec2(1u));
+-    vec2 frac=fract(at);
+-    float aa=lscMap[a.y*p.extent.z+a.x][channel];
+-    float ba=lscMap[a.y*p.extent.z+b.x][channel];
+-    float ab=lscMap[b.y*p.extent.z+a.x][channel];
+-    float bb=lscMap[b.y*p.extent.z+b.x][channel];
+-    return mix(mix(aa,ba,frac.x),mix(ab,bb,frac.x),frac.y);
+-}
+-vec3 lscAt(ivec2 q){
+-    if(p.extent.z<2u||p.extent.w<2u)return vec3(1.0);
+-    vec2 sensorPx=vec2(p.sensor.xy)+vec2(q)*0.5;
+-    vec2 uv=sensorPx/max(vec2(p.sensor.zw)-vec2(1.0),vec2(1.0));
+-    return vec3(gainAt(uv,0),0.5*(gainAt(uv,1)+gainAt(uv,2)),gainAt(uv,3));
+-}
+ void main(){
+     uvec2 coord=gl_GlobalInvocationID.xy;
+-    if(any(greaterThanEqual(coord,p.extent.xy)))return;
++    if(coord.x>=p.width||coord.y>=p.height)return;
+     ivec2 q=ivec2(coord);
+-    vec4 original=imageLoad(irisRgb,q); // sole in-place load
++    vec4 source=imageLoad(irisRgb,q);
+     vec3 denoised=imageLoad(denoisedRgb,q).rgb;
+-    float confidence=saturate1(original.a); // real minimum CFA coverage CERTAINTY, not Neff
+-    if(!finite3(original.rgb)||!finite3(denoised)||
+-       any(lessThan(original.rgb,vec3(0.0)))||any(lessThan(denoised,vec3(0.0)))||
+-       !finite3(p.shot.rgb)||!finite3(p.readNoise.rgb)||!finite3(p.wb.rgb)||
+-       any(lessThanEqual(p.shot.rgb,vec3(0.0)))||
+-       any(lessThan(p.readNoise.rgb,vec3(0.0)))||
+-       any(lessThanEqual(p.wb.rgb,vec3(0.0)))||
+-       p.shot.a<2.0||p.sensor.z<2u||p.sensor.w<2u){
+-        imageStore(irisRgb,q,vec4(denoised,confidence));return;
+-    }
+-    // SOURCE/OUTPUT ARE camera-linear after physical LSC and before WB.
+-    // Recover the original sensor domain for the measured RAW shot/read model
+-    // and then propagate each CFA-colour variance through LSC squared and WB
+-    // squared. Lower-right lens-shading gains must NOT be treated as noise=1.
+-    vec3 lsc=lscAt(q);
+-    if(!finite3(lsc)||any(lessThanEqual(lsc,vec3(0.0)))||
+-       any(greaterThan(lsc,vec3(64.0)))){
++    float confidence=saturate(source.a);
++    if(!finite3(source.rgb)||!finite3(denoised)||
++       any(lessThan(source.rgb,vec3(0)))||any(lessThan(denoised,vec3(0)))||
++       !(p.singleShotA>0.0)||!(p.singleReadB>=0.0)||
++       !(p.mergedFrames>=2.0)||!(p.wbRed>0.0)||!(p.wbBlue>0.0)){
+         imageStore(irisRgb,q,vec4(denoised,confidence));return;
+     }
+-    vec3 srcSensor=max(original.rgb/lsc,vec3(0.0));
+-    vec3 channelVar=(p.shot.rgb*srcSensor+p.readNoise.rgb)*lsc*lsc*p.wb.rgb*p.wb.rgb;
+-    if(!finite3(channelVar)||any(lessThan(channelVar,vec3(0.0)))){
+-        imageStore(irisRgb,q,vec4(denoised,confidence));return;
+-    }
+-    vec3 center=denoised*p.wb.rgb;
+-    float y=lightness(center);
++    vec3 wb=vec3(p.wbRed,1.0,p.wbBlue);
++    vec3 center=denoised*wb;
++    float y=dot(center,kLuma);
+     vec3 chroma=center-vec3(y);
+-    float originalY=lightness(original.rgb*p.wb.rgb);
+-    // Preserve ORIGINAL natural fine luminance from Wronski/AMaZE, never add
+-    // synthetic grain. Only restore bounded wavelet YUV/VST round-trip drift.
+-    float singleLumaVar=dot(channelVar,kLuma*kLuma);
+-    float ySigma=sqrt(max(singleLumaVar,1e-12));
+-    float yDiff=originalY-y;
+-    float yLimit=2.0*ySigma/sqrt(max(p.shot.a,2.0))+0.006*max(y,0.0);
+-    float restoreY=(abs(yDiff)<=yLimit && originalY>0.0 && y<0.98)?yDiff:0.0;
+-    // Min-phase confidence saturates near three effective samples, so it is
+-    // WRONG to interpolate it directly to N exact frames. Use a conservative
+-    // 1..3 contributor ENVELOPE only for noise-tolerant colour decisions.
+-    float conservativeSupport=mix(1.0,min(3.0,p.shot.a),confidence);
+-    float sigmaChroma=sqrt(max(dot(channelVar,vec3(1.0)),1e-12)/conservativeSupport);
+-    float sigmaLuma=sqrt(max(singleLumaVar,1e-12)/conservativeSupport);
+-    // Unlike 26929, do not reject genuinely dark areas at y=0.003 nor
+-    // automatically reject a large outlier at >5.5 estimated sigma.
+-    float shadow=1.0-smoothstep(0.10,0.32,y);
+-    float correction=0.0;
++    // Preserve real natural fine luminance fluctuations already reconstructed
++    // by original Wronski/AMaZE. The RAWR wavelet is configured forceY=0,
++    // but its non-linear YUV/VST round trip can shift a little fine luminance.
++    // Never inject synthetic grain or restore large, unverified differences.
++    float srcY=dot(source.rgb*wb,kLuma);
++    float singleVar=max(p.singleShotA*max(source.rgb.g,0.0)+p.singleReadB,1e-12);
++    float fullSigma=sqrt(singleVar/max(p.mergedFrames,2.0));
++    float diffY=srcY-y;
++    float allowableY=2.0*fullSigma+0.006*max(y,0.0);
++    float yRestore=(abs(diffY)<=allowableY && srcY>0.0 && y<0.98)?diffY:0.0;
++    // Actual per-pixel Neff is not exported by the unchanged vendor finalizer.
++    // Do NOT call confidence an exact count. It is the REAL Wronski minimum
++    // four-phase coverage certainty; use it only to bound the uncertainty
++    // between fully merged and reference-only measured single-frame variance.
++    float localVar=mix(singleVar,singleVar/max(p.mergedFrames,2.0),confidence);
++    float sigma=sqrt(localVar)*max(1.0,max(p.wbRed,p.wbBlue));
++    float shadow=1.0-smoothstep(0.075,0.32,y);
++    float need=(0.16+0.84*(1.0-confidence))*shadow;
++    float chromaGain=0.0;
+     vec3 target=chroma;
+-    if(y>0.00035 && y<0.85 && shadow>0.003 &&
+-       max(original.rgb.r,max(original.rgb.g,original.rgb.b))<0.97){
+-        vec3 nearSum=vec3(0.0),farSum=vec3(0.0);
+-        float nearWt=0.0,farWt=0.0;
+-        float farAxis[4]=float[4](0.0,0.0,0.0,0.0);
+-        ivec2 limit=ivec2(p.extent.xy)-ivec2(1);
+-        float lumaGate=max(0.055*max(y,0.02),1.55*sigmaLuma);
+-        for(int i=0;i<24;i++){
+-            ivec2 off=kDonor[i];
+-            ivec2 at=q+off;
+-            if(any(lessThan(at,ivec2(0)))||any(greaterThan(at,limit)))continue;
+-            vec3 sampleRgb=imageLoad(denoisedRgb,at).rgb;
+-            if(!finite3(sampleRgb)||any(lessThan(sampleRgb,vec3(0.0))))continue;
+-            vec3 donorColor=sampleRgb*p.wb.rgb;
+-            float sy=lightness(donorColor);
+-            float dy=abs(sy-y);
+-            float similarity=1.0-smoothstep(lumaGate,2.8*lumaGate,dy);
+-            if(similarity<=0.01)continue;
+-            // Large-radius samples may be on an unrelated surface behind a
+-            // bright/dark feature even if both endpoints have the same luma.
+-            if(i>=12&&i<20){
+-                ivec2 mid=q+off/2;
+-                vec3 crossing=imageLoad(denoisedRgb,mid).rgb*p.wb.rgb;
+-                if(!finite3(crossing)||any(lessThan(crossing,vec3(0.0))))continue;
+-                float midDiff=abs(lightness(crossing)-y);
+-                similarity*=1.0-smoothstep(lumaGate,2.5*lumaGate,midDiff);
+-            }
+-            if(similarity<=0.01)continue;
+-            // Normalize chroma by brightness to keep the correct wall/curtain
+-            // hue across modest illumination gradients, then rescale at center.
+-            vec3 color=(donorColor-vec3(sy))/max(sy,0.012);
+-            float spatial=i<4?1.0:(i<8?0.76:(i<12?0.72:(i<16?0.65:(i<20?0.48:0.58))));
+-            float weight=similarity*spatial;
+-            if(i<8){nearSum+=weight*color;nearWt+=weight;}
+-            else {
+-                farSum+=weight*color;farWt+=weight;
+-                if(i>=8&&i<20)farAxis[(i-8)%4]+=weight;
+-            }
++    if(need>0.005 && y>0.003 && y<0.85 &&
++       max(source.rgb.r,max(source.rgb.g,source.rgb.b))<0.97){
++        vec3 sum=vec3(0.0);
++        float sumSq=0.0,total=0.0;
++        ivec2 limit=ivec2(int(p.width)-1,int(p.height)-1);
++        // Same-material donors selected by LUMINANCE, not by the potentially
++        // contaminated centre hue. We will separately test their dispersion.
++        for(int i=0;i<12;i++){
++            ivec2 at=clamp(q+kDonor[i],ivec2(0),limit);
++            vec3 otherRaw=imageLoad(denoisedRgb,at).rgb;
++            if(!finite3(otherRaw)||any(lessThan(otherRaw,vec3(0))))continue;
++            vec3 other=otherRaw*wb;
++            float ny=dot(other,kLuma);
++            float dist=abs(ny-y)/max(max(ny,y),0.03);
++            float same=1.0-smoothstep(0.055,0.16,dist);
++            if(same<0.01)continue;
++            // A short donor near the centre is more trustworthy than one
++            // five pixels away, except when it crosses a real luma edge.
++            float w=same*(i<4?1.0:i<8?0.70:0.46);
++            vec3 nc=other-vec3(ny);
++            sum+=w*nc;sumSq+=w*dot(nc,nc);total+=w;
+         }
+-        float pairX=min(farAxis[0],farAxis[1]);
+-        float pairY=min(farAxis[2],farAxis[3]);
+-        float twoSided=smoothstep(0.25,0.85,max(pairX,pairY));
+-        if(nearWt>=2.3 && farWt>=1.25 && twoSided>0.001){
+-            vec3 fineMean=nearSum/nearWt;
+-            vec3 wideMean=farSum/farWt;
+-            float wideInfluence=0.60*smoothstep(1.5,4.5,farWt)*twoSided;
+-            vec3 relativeTarget=mix(fineMean,wideMean,wideInfluence);
+-            target=relativeTarget*max(y,0.012);
+-            target-=vec3(lightness(target));
+-            vec3 move=target-chroma;
+-            float residual=length(move);
+-            // Real saturated local colour supported by both near/far donors
+-            // is retained; a large isolated hue shift is NOT automatically
+-            // protected just because its magnitude exceeds 5.5 sigma.
+-            float coloredCenter=length(chroma)/max(y,0.018);
+-            float coloredDonors=length(target)/max(y,0.018);
+-            float sameHue=dot(chroma,target)/max(length(chroma)*length(target),1e-12);
+-            float realHue=smoothstep(0.13,0.38,min(coloredCenter,coloredDonors))*
+-                         smoothstep(0.65,0.93,sameHue);
+-            float noiseSignificance=smoothstep(0.55*sigmaChroma,2.6*sigmaChroma,residual);
+-            // Strongest repair in dim flat material; preserve genuine hue,
+-            // hard luma boundaries and original luminance/50MP fine grain.
+-            float totalEvidence=smoothstep(2.3,5.4,nearWt)*twoSided;
+-            correction=0.65*shadow*(0.80+0.20*(1.0-confidence))*
+-                       totalEvidence*noiseSignificance*(1.0-0.90*realHue);
+-            correction=min(correction,0.65);
++        if(total>=3.2){
++            vec3 mean=sum/total;
++            float spread=sqrt(max(sumSq/total-dot(mean,mean),0.0));
++            float delta=length(chroma-mean);
++            // A real coloured edge/ridge has either inconsistent neighbours
++            // or a large centre transition relative to the RAW noise model.
++            // Do not bleach strongly supported colour or relocate luminance.
++            float floorColor=max(1.35*sigma,0.018*max(y,0.03));
++            float donorCoherence=1.0-smoothstep(1.5*floorColor,3.5*floorColor,spread);
++            float suspect=smoothstep(0.45*floorColor,1.65*floorColor,delta)*
++                (1.0-smoothstep(3.0*floorColor,5.5*floorColor,delta));
++            float supportedMicroColor=smoothstep(0.19,0.44,
++                length(chroma)/max(y,0.035))*smoothstep(0.35,0.85,confidence);
++            chromaGain=0.52*need*donorCoherence*suspect*(1.0-supportedMicroColor)*
++                smoothstep(3.2,6.0,total);
++            target=mean;
+         }
+     }
+-    // Chroma only: keep the EXACT original luminance and protect nonnegative
+-    // camera-linear RGB, including the physical colour and WB domain.
+-    vec3 adjustment=target-chroma;
+-    adjustment-=vec3(lightness(adjustment));
+-    for(int c=0;c<3;c++)if(adjustment[c]<0.0)
+-        correction=min(correction,max(center[c],0.0)/max(-adjustment[c],1e-8));
+-    correction=saturate1(correction);
+-    vec3 revised=(center+correction*adjustment+vec3(restoreY))/p.wb.rgb;
+-    if(!finite3(revised)||any(lessThan(revised,vec3(-0.00001))))revised=denoised;
+-    imageStore(irisRgb,q,vec4(max(revised,vec3(0.0)),confidence));
++    // Camera-linear, pre-WB owner: correction changes only opponent colour
++    // in white-balanced evidence coordinates, not output brightness. Natural
++    // luminance variation is sourced directly from the original fused result.
++    vec3 shift=(target-chroma);
++    shift-=vec3(dot(shift,kLuma));
++    chromaGain=saturate(chromaGain);
++    for(int k=0;k<3;k++){
++        if(shift[k]<0.0)chromaGain=min(chromaGain,
++            max(center[k],0.0)/max(-shift[k],1e-8));
++    }
++    vec3 changed=center+chromaGain*shift+vec3(yRestore);
++    vec3 outColor=changed/wb;
++    if(!finite3(outColor)||any(lessThan(outColor,vec3(-0.00001))))
++        outColor=denoised;
++    imageStore(irisRgb,q,vec4(max(outColor,vec3(0)),confidence));
+ }
+diff --git a/app/version.properties b/app/version.properties
+index 0e3a3cd98fea1ff9302879ff35ad3b89fee20ce8..92e8a5867c9ba162d3e88e54313871370d95047d 100644
+--- a/app/version.properties
++++ b/app/version.properties
+@@ -1,4 +1,4 @@
+ VERSION_MAJOR=0
+ VERSION_MINOR=9726440
+-VERSION_NAME=0.9726930
+-VERSION_BUILD=26930
++VERSION_NAME=0.9726929
++VERSION_BUILD=26929

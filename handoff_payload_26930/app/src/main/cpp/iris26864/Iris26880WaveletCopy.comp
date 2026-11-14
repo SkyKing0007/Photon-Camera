@@ -1,0 +1,181 @@
+#version 450
+// IRIS_26930_B_ON_PHYSICAL_LSC_SHADOW_CHROMA_VARIANCE.
+// This is the existing single pre-WB Wronski->AMaZE->wavelet copy pass.
+// Do not change the reference RAW, Wronski geometry, frame count, three
+// fallback sliders, native RAWR wavelet kernels or final image brightness.
+// The original wavelet's single global noise assumption remains untouched;
+// THIS pass accounts for measured CFA noise by colour, spatial physical LSC
+// amplification, and an explicitly CONSERVATIVE local coverage envelope.
+// In-place destination irisRgb reads ONLY its own center; every spatial donor
+// comes from immutable denoisedRgb. No extra 50MP allocation or dispatch.
+layout(local_size_x=16,local_size_y=16,local_size_z=1) in;
+layout(set=0,binding=0,rgba16f) readonly uniform image2D denoisedRgb;
+layout(set=0,binding=1,rgba16f) coherent uniform image2D irisRgb;
+layout(std430,set=0,binding=2) readonly buffer PhysicalLsc {vec4 lscMap[];};
+layout(push_constant) uniform CopyArgs {
+    uvec4 extent;    // full 2x width,height, physical LSC width,height
+    uvec4 sensor;    // physical originX,originY,full sensor width,height
+    vec4 shot;      // single-frame RAW R,G,B shot slopes; actual merged count
+    vec4 readNoise; // single-frame RAW R,G,B read offsets
+    vec4 wb;        // camera-linear -> green-normalized WB R,1,B
+} p;
+const vec3 kLuma=vec3(0.25,0.50,0.25);
+const ivec2 kDonor[24]=ivec2[24](
+    ivec2(-2,0),ivec2(2,0),ivec2(0,-2),ivec2(0,2),
+    ivec2(-6,0),ivec2(6,0),ivec2(0,-6),ivec2(0,6),
+    ivec2(-16,0),ivec2(16,0),ivec2(0,-16),ivec2(0,16),
+    ivec2(-48,0),ivec2(48,0),ivec2(0,-48),ivec2(0,48),
+    ivec2(-96,0),ivec2(96,0),ivec2(0,-96),ivec2(0,96),
+    ivec2(-12,-12),ivec2(12,-12),ivec2(-12,12),ivec2(12,12));
+bool finite3(vec3 v){return !any(isnan(v))&&!any(isinf(v));}
+float lightness(vec3 v){return dot(v,kLuma);}
+float saturate1(float v){return clamp(v,0.0,1.0);}
+float gainAt(vec2 uv,int channel){
+    if(p.extent.z<2u||p.extent.w<2u)return 1.0;
+    vec2 at=clamp(uv,vec2(0.0),vec2(1.0))*vec2(p.extent.z-1u,p.extent.w-1u);
+    uvec2 a=uvec2(floor(at));
+    uvec2 b=min(a+uvec2(1u),p.extent.zw-uvec2(1u));
+    vec2 frac=fract(at);
+    float aa=lscMap[a.y*p.extent.z+a.x][channel];
+    float ba=lscMap[a.y*p.extent.z+b.x][channel];
+    float ab=lscMap[b.y*p.extent.z+a.x][channel];
+    float bb=lscMap[b.y*p.extent.z+b.x][channel];
+    return mix(mix(aa,ba,frac.x),mix(ab,bb,frac.x),frac.y);
+}
+vec3 lscAt(ivec2 q){
+    if(p.extent.z<2u||p.extent.w<2u)return vec3(1.0);
+    vec2 sensorPx=vec2(p.sensor.xy)+vec2(q)*0.5;
+    vec2 uv=sensorPx/max(vec2(p.sensor.zw)-vec2(1.0),vec2(1.0));
+    return vec3(gainAt(uv,0),0.5*(gainAt(uv,1)+gainAt(uv,2)),gainAt(uv,3));
+}
+void main(){
+    uvec2 coord=gl_GlobalInvocationID.xy;
+    if(any(greaterThanEqual(coord,p.extent.xy)))return;
+    ivec2 q=ivec2(coord);
+    vec4 original=imageLoad(irisRgb,q); // sole in-place load
+    vec3 denoised=imageLoad(denoisedRgb,q).rgb;
+    float confidence=saturate1(original.a); // real minimum CFA coverage CERTAINTY, not Neff
+    if(!finite3(original.rgb)||!finite3(denoised)||
+       any(lessThan(original.rgb,vec3(0.0)))||any(lessThan(denoised,vec3(0.0)))||
+       !finite3(p.shot.rgb)||!finite3(p.readNoise.rgb)||!finite3(p.wb.rgb)||
+       any(lessThanEqual(p.shot.rgb,vec3(0.0)))||
+       any(lessThan(p.readNoise.rgb,vec3(0.0)))||
+       any(lessThanEqual(p.wb.rgb,vec3(0.0)))||
+       p.shot.a<2.0||p.sensor.z<2u||p.sensor.w<2u){
+        imageStore(irisRgb,q,vec4(denoised,confidence));return;
+    }
+    // SOURCE/OUTPUT ARE camera-linear after physical LSC and before WB.
+    // Recover the original sensor domain for the measured RAW shot/read model
+    // and then propagate each CFA-colour variance through LSC squared and WB
+    // squared. Lower-right lens-shading gains must NOT be treated as noise=1.
+    vec3 lsc=lscAt(q);
+    if(!finite3(lsc)||any(lessThanEqual(lsc,vec3(0.0)))||
+       any(greaterThan(lsc,vec3(64.0)))){
+        imageStore(irisRgb,q,vec4(denoised,confidence));return;
+    }
+    vec3 srcSensor=max(original.rgb/lsc,vec3(0.0));
+    vec3 channelVar=(p.shot.rgb*srcSensor+p.readNoise.rgb)*lsc*lsc*p.wb.rgb*p.wb.rgb;
+    if(!finite3(channelVar)||any(lessThan(channelVar,vec3(0.0)))){
+        imageStore(irisRgb,q,vec4(denoised,confidence));return;
+    }
+    vec3 center=denoised*p.wb.rgb;
+    float y=lightness(center);
+    vec3 chroma=center-vec3(y);
+    float originalY=lightness(original.rgb*p.wb.rgb);
+    // Preserve ORIGINAL natural fine luminance from Wronski/AMaZE, never add
+    // synthetic grain. Only restore bounded wavelet YUV/VST round-trip drift.
+    float singleLumaVar=dot(channelVar,kLuma*kLuma);
+    float ySigma=sqrt(max(singleLumaVar,1e-12));
+    float yDiff=originalY-y;
+    float yLimit=2.0*ySigma/sqrt(max(p.shot.a,2.0))+0.006*max(y,0.0);
+    float restoreY=(abs(yDiff)<=yLimit && originalY>0.0 && y<0.98)?yDiff:0.0;
+    // Min-phase confidence saturates near three effective samples, so it is
+    // WRONG to interpolate it directly to N exact frames. Use a conservative
+    // 1..3 contributor ENVELOPE only for noise-tolerant colour decisions.
+    float conservativeSupport=mix(1.0,min(3.0,p.shot.a),confidence);
+    float sigmaChroma=sqrt(max(dot(channelVar,vec3(1.0)),1e-12)/conservativeSupport);
+    float sigmaLuma=sqrt(max(singleLumaVar,1e-12)/conservativeSupport);
+    // Unlike 26929, do not reject genuinely dark areas at y=0.003 nor
+    // automatically reject a large outlier at >5.5 estimated sigma.
+    float shadow=1.0-smoothstep(0.10,0.32,y);
+    float correction=0.0;
+    vec3 target=chroma;
+    if(y>0.00035 && y<0.85 && shadow>0.003 &&
+       max(original.rgb.r,max(original.rgb.g,original.rgb.b))<0.97){
+        vec3 nearSum=vec3(0.0),farSum=vec3(0.0);
+        float nearWt=0.0,farWt=0.0;
+        float farAxis[4]=float[4](0.0,0.0,0.0,0.0);
+        ivec2 limit=ivec2(p.extent.xy)-ivec2(1);
+        float lumaGate=max(0.055*max(y,0.02),1.55*sigmaLuma);
+        for(int i=0;i<24;i++){
+            ivec2 off=kDonor[i];
+            ivec2 at=q+off;
+            if(any(lessThan(at,ivec2(0)))||any(greaterThan(at,limit)))continue;
+            vec3 sampleRgb=imageLoad(denoisedRgb,at).rgb;
+            if(!finite3(sampleRgb)||any(lessThan(sampleRgb,vec3(0.0))))continue;
+            vec3 donorColor=sampleRgb*p.wb.rgb;
+            float sy=lightness(donorColor);
+            float dy=abs(sy-y);
+            float similarity=1.0-smoothstep(lumaGate,2.8*lumaGate,dy);
+            if(similarity<=0.01)continue;
+            // Large-radius samples may be on an unrelated surface behind a
+            // bright/dark feature even if both endpoints have the same luma.
+            if(i>=12&&i<20){
+                ivec2 mid=q+off/2;
+                vec3 crossing=imageLoad(denoisedRgb,mid).rgb*p.wb.rgb;
+                if(!finite3(crossing)||any(lessThan(crossing,vec3(0.0))))continue;
+                float midDiff=abs(lightness(crossing)-y);
+                similarity*=1.0-smoothstep(lumaGate,2.5*lumaGate,midDiff);
+            }
+            if(similarity<=0.01)continue;
+            // Normalize chroma by brightness to keep the correct wall/curtain
+            // hue across modest illumination gradients, then rescale at center.
+            vec3 color=(donorColor-vec3(sy))/max(sy,0.012);
+            float spatial=i<4?1.0:(i<8?0.76:(i<12?0.72:(i<16?0.65:(i<20?0.48:0.58))));
+            float weight=similarity*spatial;
+            if(i<8){nearSum+=weight*color;nearWt+=weight;}
+            else {
+                farSum+=weight*color;farWt+=weight;
+                if(i>=8&&i<20)farAxis[(i-8)%4]+=weight;
+            }
+        }
+        float pairX=min(farAxis[0],farAxis[1]);
+        float pairY=min(farAxis[2],farAxis[3]);
+        float twoSided=smoothstep(0.25,0.85,max(pairX,pairY));
+        if(nearWt>=2.3 && farWt>=1.25 && twoSided>0.001){
+            vec3 fineMean=nearSum/nearWt;
+            vec3 wideMean=farSum/farWt;
+            float wideInfluence=0.60*smoothstep(1.5,4.5,farWt)*twoSided;
+            vec3 relativeTarget=mix(fineMean,wideMean,wideInfluence);
+            target=relativeTarget*max(y,0.012);
+            target-=vec3(lightness(target));
+            vec3 move=target-chroma;
+            float residual=length(move);
+            // Real saturated local colour supported by both near/far donors
+            // is retained; a large isolated hue shift is NOT automatically
+            // protected just because its magnitude exceeds 5.5 sigma.
+            float coloredCenter=length(chroma)/max(y,0.018);
+            float coloredDonors=length(target)/max(y,0.018);
+            float sameHue=dot(chroma,target)/max(length(chroma)*length(target),1e-12);
+            float realHue=smoothstep(0.13,0.38,min(coloredCenter,coloredDonors))*
+                         smoothstep(0.65,0.93,sameHue);
+            float noiseSignificance=smoothstep(0.55*sigmaChroma,2.6*sigmaChroma,residual);
+            // Strongest repair in dim flat material; preserve genuine hue,
+            // hard luma boundaries and original luminance/50MP fine grain.
+            float totalEvidence=smoothstep(2.3,5.4,nearWt)*twoSided;
+            correction=0.65*shadow*(0.80+0.20*(1.0-confidence))*
+                       totalEvidence*noiseSignificance*(1.0-0.90*realHue);
+            correction=min(correction,0.65);
+        }
+    }
+    // Chroma only: keep the EXACT original luminance and protect nonnegative
+    // camera-linear RGB, including the physical colour and WB domain.
+    vec3 adjustment=target-chroma;
+    adjustment-=vec3(lightness(adjustment));
+    for(int c=0;c<3;c++)if(adjustment[c]<0.0)
+        correction=min(correction,max(center[c],0.0)/max(-adjustment[c],1e-8));
+    correction=saturate1(correction);
+    vec3 revised=(center+correction*adjustment+vec3(restoreY))/p.wb.rgb;
+    if(!finite3(revised)||any(lessThan(revised,vec3(-0.00001))))revised=denoised;
+    imageStore(irisRgb,q,vec4(max(revised,vec3(0.0)),confidence));
+}
