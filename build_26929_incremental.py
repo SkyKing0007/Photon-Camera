@@ -75,11 +75,11 @@ def seal():
   '26929_PROTECTED_SOURCE.sha256','26929_CHANGED_RUNTIME_ALLOWLIST.txt',
   '26929_ADDED_RUNTIME_PATHS.txt','26929_DELETED_RUNTIME_PATHS.txt',
   '26929_EXPECTED_ACTION_EXECUTABLES.txt','TRIGGER_26929.txt',
-  '26929_V1_STAGE_1_UPLOAD_PATHS.txt','26929_V1_STAGE_2_UPLOAD_PATHS.txt','26929_V1_STAGE_3_UPLOAD_PATHS.txt'}
+  '26929_V2_STAGE_1_UPLOAD_PATHS.txt','26929_V2_STAGE_2_UPLOAD_PATHS.txt','26929_V2_STAGE_3_UPLOAD_PATHS.txt'}
  if not essential.issubset(files):fail('one or more 26929 mandatory verifier/compiler/trigger stages missing')
  # Stage 1 must contain EVERY uploaded file except the YAML and trigger;
  # stage 2 contains the YAML only; stage 3 contains the changed trigger only.
- stages=[(R/f'26929_V1_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
+ stages=[(R/f'26929_V2_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
  assert all(len(x)==len(set(x)) and x==sorted(x) for x in stages)
  wfpath='.github/workflows/build-26929-change-aware.yml'
  trigger='TRIGGER_26929.txt'
@@ -143,6 +143,15 @@ def prepare():
   if hashlib.sha256(get('ACTUAL_EXECUTED_build_26928_incremental.py')).hexdigest()!=BUILDER_SHA or BUILDER_SHA not in get('26928_ACTUAL_EXECUTED_BUILDER.sha256').decode():fail('actual 26928 executed builder changed')
   if hashlib.sha256(get('ACTUAL_EXECUTED_build-26928-change-aware.yml')).hexdigest()!=WORKFLOW_SHA or WORKFLOW_SHA not in get('26928_ACTUAL_EXECUTED_WORKFLOW.sha256').decode():fail('actual 26928 workflow changed')
   if PRIOR_APK_SHA not in get('26928_APK.sha256').decode():fail('actual published 26928 APK receipt missing')
+  prior_tasks=get('26928_REAL_GRADLE_TASKS.txt').decode()
+  for t in [':app:compileDebugKotlin',':app:compileDebugJavaWithJavac',
+            ':app:configureCMakeDebug[arm64-v8a]',':app:buildCMakeDebug[arm64-v8a]',
+            ':app:configureCMakeDebug[armeabi-v7a]',':app:buildCMakeDebug[armeabi-v7a]',
+            ':app:assembleDebug','BUILD SUCCESSFUL']:
+   if 'PASS '+t not in prior_tasks:fail('published 26928 missing genuine ABI/Kotlin/Java/assemble task '+t)
+  if 'BUILD SUCCESSFUL' not in get('26928_gradle_assemble.log').decode(errors='replace'):
+   fail('26928 published original real Gradle build not successful')
+
   for text in ['REAL PINNED GLSL COMPILE: PASS','REAL SPIR-V VALIDATION: PASS','REAL KOTLIN COMPILE: PASS','REAL JAVA COMPILE: PASS','NATIVE/NDK COMPILE: PASS','REAL ANDROID Gradle :app:assembleDebug: PASS','RUNTIME SOURCE INVARIANCE: PASS']:
    if text not in get('26928_COMPILER_STATUS.txt').decode():fail('successful 26928 lacks actual compiler '+text)
   (TMP/'26928_candidate.tar.gz').write_bytes(data)

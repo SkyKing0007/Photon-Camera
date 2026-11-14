@@ -19,5 +19,18 @@ assert '32u,1u));' in inc
 assert shader.count('imageLoad(irisRgb,')==1  # center only: no neighbor RAW hazards
 assert 'imageStore(irisRgb,q,vec4(denoised,confidence));return;' in shader
 assert 'imageStore(irisRgb,q,vec4(max(outColor,vec3(0)),confidence));' in shader
-assert not re.search(r'\b(?:coherent|volatile|restrict|readonly|writeonly)\s*\(',shader)
+# 26929 V1 FAILURE REGRESSION: compile error at line 92 was caused by
+# "float coherent=". A qualifier is legal before a uniform declaration, never
+# as an identifier. This lint is additional; the real 16.5 compiler remains mandatory.
+reserved=r'(?:coherent|volatile|restrict|readonly|writeonly|uniform|buffer|shared|layout|precision|sample|patch|attribute|varying|flat|smooth|noperspective|invariant)'
+assert not re.search(r'\b(?:float|int|uint|bool|vec[234]|ivec[234]|uvec[234]|mat[234])\s+'+reserved+r'\b',shader), 'GLSL reserved-identifier regression'
+assert not re.search(r'\b'+reserved+r'\s*(?==)',shader), 'GLSL qualifier used as variable name'
+# Negative test: the prior broken fragment must be rejected by the same guard.
+def reserved_variable(text):
+ return bool(re.search(r'\b(?:float|int|uint|bool|vec[234])\s+'+reserved+r'\b',text))
+assert reserved_variable('float coherent=0.5;')
+assert reserved_variable('float precision=0.5;')
+assert reserved_variable('vec3 sample=vec3(0);')
+assert not reserved_variable('float donorCoherence=0.5;')
+
 print('PASS exact 32-byte push constants, immutable donor reads and in-place write ownership; real SPIR-V mandatory')

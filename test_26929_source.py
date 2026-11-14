@@ -22,7 +22,7 @@ for t in ('IRIS_26929_B_ON_LOCAL_NOISE_AWARE_CHROMA_GRAIN',
           'float yRestore=',
           'for(int i=0;i<12;i++)',
           'vec3 otherRaw=imageLoad(denoisedRgb,at).rgb;',
-          'chromaGain=0.52*need*coherent*suspect',
+          'chromaGain=0.52*need*donorCoherence*suspect',
           'shift-=vec3(dot(shift,kLuma));',
           'imageStore(irisRgb,q,vec4(max(outColor,vec3(0)),confidence));'):
  assert t in sh,t

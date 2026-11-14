@@ -26,7 +26,7 @@ with tempfile.TemporaryDirectory(prefix='26929_hostile_') as t:
   ('patch','26929_FORWARD_FULLINDEX.patch'),
   ('manifest','26929_EXPECTED_FULL_APP.sha256'),
   ('allowlist','26929_CHANGED_RUNTIME_ALLOWLIST.txt'),
-  ('stage_order','26929_V1_STAGE_3_UPLOAD_PATHS.txt'),
+  ('stage_order','26929_V2_STAGE_3_UPLOAD_PATHS.txt'),
   ('script','test_26929_chroma_math.py'),
  ]
  for name,rel in attacks:
