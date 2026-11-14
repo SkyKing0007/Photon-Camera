@@ -9,7 +9,7 @@ def main():
  needed=('TRIGGER_26933.txt','verify_26904_v3_safety.py','verify_26904_v2_safety.py',
     'test_26903_v3_archive_receipt.py','test_26925_shader_abi.py --payload',
     'test_26930_shader_contract.py --payload',
-    'test_26931_native_integrity.py --apk','prepare_26931_rawlens_binaries.py',
+    'test_26931_native_integrity.py --apk','prepare_26933_lkr_from_successful_26932.py',
     'build_26931_incremental.py seal','build_26932_incremental.py seal',
     'test_26932_shader_contract.py --payload','test_26932_math.py --payload',
     'build_26933_incremental.py seal','build_26933_incremental.py fetch',
@@ -21,6 +21,8 @@ def main():
     'actions/cache/restore@v4','actions/cache/save@v4','actions/upload-artifact@v4')
  for key in needed:
   if key not in s:fail('missing real compiler/targeted regression/source contract '+key)
+ if 'python3 -S prepare_26931_rawlens_binaries.py' in s or 'releases/tags/2.2.86' in s:
+  fail('live Actions workflow must never query external RawLens release API')
  if s.count('actions/upload-artifact@v4')!=1 or s.count('./gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace')!=1:fail('duplicate APK build/publisher')
  # No previous published source is reconstructed: only the successful 26932
  # Actions artifact is fetched, authenticated and directly seeded.
@@ -38,6 +40,7 @@ def main():
         'build_26933_incremental.py fetch','build_26933_incremental.py prepare',
         'test_26933_patch_proof.py --live','verify_26906_native_cache.py preflight',
         'compile_26904_shaders_v2.sh','verify_26904_v3_cmake_handoff.py --handoff',
+        'prepare_26933_lkr_from_successful_26932.py','test_26931_native_integrity.py --native',
         'compile_26933_shaders.sh','build_26933_incremental.py verify-compiled',
         './gradlew --no-daemon --build-cache :app:assembleDebug --stacktrace',
         'test_26931_native_integrity.py --apk','build_26933_incremental.py finalize',

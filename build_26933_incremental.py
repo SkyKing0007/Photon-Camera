@@ -24,7 +24,7 @@ STAGE1_FILES=[
  'README_PHOTON_26933_V1.md','build_26933_incremental.py',
  'test_26933_source.py','test_26933_shader_contract.py','test_26933_highlight_math.py',
  'test_26933_patch_proof.py','test_26933_sealed_negatives.py','test_26933_workflow_refs.py',
- 'compile_26933_shaders.sh','26933_FORWARD_FULLINDEX.patch','26933_ROLLBACK_FULLINDEX.patch',
+ 'compile_26933_shaders.sh','prepare_26933_lkr_from_successful_26932.py','26933_FORWARD_FULLINDEX.patch','26933_ROLLBACK_FULLINDEX.patch',
  '26933_BASE_26932_FULL_APP.sha256','26933_EXPECTED_FULL_APP.sha256','26933_PROTECTED_SOURCE.sha256',
  '26933_CHANGED_RUNTIME_ALLOWLIST.txt','26933_ADDED_RUNTIME_PATHS.txt',
  '26933_DELETED_RUNTIME_PATHS.txt','26933_EXPECTED_ACTION_EXECUTABLES.txt',
@@ -93,7 +93,8 @@ def seal():
  pins=('verify_26904_v3_safety.py','verify_26904_v2_safety.py','test_26903_v3_archive_receipt.py',
    'test_26931_native_integrity.py --apk','build_26932_incremental.py seal',
    'test_26932_shader_contract.py --payload','build_26933_incremental.py fetch',
-   'build_26933_incremental.py prepare','compile_26933_shaders.sh',
+   'build_26933_incremental.py prepare','prepare_26933_lkr_from_successful_26932.py',
+   'test_26931_native_integrity.py --native','compile_26933_shaders.sh',
    'build_26933_incremental.py verify-compiled','build_26933_incremental.py finalize',
    ':app:assembleDebug')
  for p in pins:
@@ -177,6 +178,26 @@ def regress():
   subprocess.run([sys.executable,'-S',t,'--live'],cwd=R,check=True)
  print('PASS no B/OFF change, LKR 3x2 pinned unchanged, original clip binary untouched')
 
+def verify_inherited_native_receipt():
+ rec=OUT/'26933_INHERITED_LKR_NATIVE_RECEIPT.txt'
+ if not rec.is_file():fail('missing original RawLens LKR reuse receipt from authenticated 26932 published APK')
+ r=rec.read_text()
+ for phrase in ('origin=SUCCESSFUL 26932 Actions run='+str(RUN),
+                '26932 artifact sha256='+ART_SHA,
+                '26932 prior APK sha256='+PRIOR_APK_SHA,
+                'external GitHub release API/download=NOT USED',
+                'previous APK rebuild=NOT USED'):
+  if phrase not in r:fail('invalid 26932 inherited native provenance receipt '+phrase)
+ for abi,lib,hashvalue in (("arm64-v8a","liblkrpipeline.so","af1d4caff00b3b189d23d1d53c7c9d11256f5b050af2590c5407191ce32cd39b"),
+                           ("arm64-v8a","libsrpipeline.so","a91e0a33226db0e08b5355e2fac189cc9b91af7106530f6577d5084f1f39865d"),
+                           ("armeabi-v7a","liblkrpipeline.so","46de04ea3b1d37fbcc9bb380f94d56e7d7ad74d110e990e8413589e4e7eb8450"),
+                           ("armeabi-v7a","libsrpipeline.so","61fdaab8881684999c03bf6d9a3cbe1d9b3da63effe0f364eaca103f97efe78c")):
+  if 'PASS original RawLens 2.2.86 lib/'+abi+'/'+lib+' sha256='+hashvalue not in r:
+   fail('missing inherited native binary SHA receipt '+abi+'/'+lib)
+  p=R/'app/build/verified_rawlens26931/jniLibs'/abi/lib
+  if not p.is_file() or sha(p)!=hashvalue:fail('original LKR ABI library missing/modified '+abi+'/'+lib)
+ print('PASS rawLens 2.2.86 verified binaries from successful 26932 APK, both ABIs, offline')
+
 def verify_compiled():
  regress()
  rep=OUT/'26933_REAL_GLSL_SPIRV_COMPILER.txt'
@@ -187,6 +208,7 @@ def verify_compiled():
   for suffix in (('es310.frag',) if name=='b_native_final' else ('es300.frag','es310.frag')):
    f=OUT/('26933_'+name+'_'+suffix)
    if not f.is_file() or sha(f) not in log:fail('actual compiled shader source SHA mismatch '+name+' '+suffix)
+ verify_inherited_native_receipt()
  subprocess.run([sys.executable,'-S','test_26931_native_integrity.py','--native'],cwd=R,check=True)
  (OUT/'26933_PREBUILD_SEALED_APP.sha256').write_bytes((R/'26933_EXPECTED_FULL_APP.sha256').read_bytes())
  print('PASS real actual 26933 ESSL and SPIR-V compiler receipts, original RawLens both ABI SHA intact')
@@ -212,7 +234,8 @@ def finalize():
   if z.testzip():fail('APK contains invalid ZIP entry')
   for k in ('AndroidManifest.xml','classes.dex'):
    if k not in z.namelist():fail('APK missing '+k)
- (OUT/'26933_COMPILER_STATUS.txt').write_text('REAL PINNED GLSL COMPILE: PASS (26933 current live shader)\nREAL SPIR-V VALIDATION: PASS (real optimizer/validator)\nREAL KOTLIN COMPILE: PASS\nREAL JAVA COMPILE: PASS\nNATIVE/NDK COMPILE: PASS (arm64-v8a, armeabi-v7a)\nREAL ANDROID Gradle :app:assembleDebug: PASS\nORIGINAL RAWLENS LKR NATIVE: PASS\nRUNTIME SOURCE INVARIANCE: PASS\nDEVICE IMAGE QUALITY: NOT RUN\n')
+ verify_inherited_native_receipt()
+ (OUT/'26933_COMPILER_STATUS.txt').write_text('REAL PINNED GLSL COMPILE: PASS (26933 current live shader)\nREAL SPIR-V VALIDATION: PASS (real optimizer/validator)\nREAL KOTLIN COMPILE: PASS\nREAL JAVA COMPILE: PASS\nNATIVE/NDK COMPILE: PASS (arm64-v8a, armeabi-v7a)\nREAL ANDROID Gradle :app:assembleDebug: PASS\nORIGINAL RAWLENS LKR NATIVE: PASS (26932 published APK offline reuse)\nRUNTIME SOURCE INVARIANCE: PASS\nDEVICE IMAGE QUALITY: NOT RUN\n')
  (OUT/'26933_REAL_GRADLE_TASKS.txt').write_text(''.join('PASS '+t+'\n' for t in tasks))
  (OUT/'26933_APK.sha256').write_text(sha(R/APKNAME)+'  '+APKNAME+'\n')
  wf=R/'.github/workflows/build-26933-change-aware.yml'

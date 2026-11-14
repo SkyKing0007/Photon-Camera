@@ -23,6 +23,7 @@ def main():
  sample='handoff_payload_26933/app/src/main/java/com/hinnka/mycamera/processor/GlesIris26932LkrSmoothWhite.kt'
  negative(lambda p:(p/sample).write_bytes((p/sample).read_bytes()+b'\n// stale corrupt'), 'corrupted current GLSL')
  negative(lambda p:(p/'compile_26933_shaders.sh').unlink(), 'missing real GLSL/SPIR-V compiler')
+ negative(lambda p:(p/'prepare_26933_lkr_from_successful_26932.py').unlink(), 'missing authenticated native dependency reuse')
  negative(lambda p:(p/'26933_EXPECTED_ACTION_EXECUTABLES.txt').write_text('gradlew\n'), 'unlisted/unused Actions executable references')
  negative(lambda p:(p/'.github/workflows/build-26933-change-aware.yml').write_text('name: stale\n'), 'truncated workflow / absent Android compilation')
  def extra(p):
@@ -40,7 +41,7 @@ def main():
   # The checker depends only on shader source; build import does not invoke seal.
   x=subprocess.run([sys.executable,'-S','test_26933_shader_contract.py'],cwd=t,capture_output=True,text=True)
   if x.returncode==0 or 'coherent' not in x.stderr:fail('GLSL coherent keyword erroneously allowed')
- print('PASS six sealed fail-closed tests + explicit reserved GLSL keyword executable parser rejection')
+ print('PASS seven sealed fail-closed tests + explicit reserved GLSL keyword executable parser rejection')
 if __name__=='__main__':
  try:main()
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

@@ -1,4 +1,4 @@
-# Photon 26933 V1 — Only Experiment B / Super Res ON clipped-highlight correction
+# Photon 26933 V1 R2 — Verified offline RawLens native reuse after Actions 403
 
 **One guarded three-stage vscode.dev handoff.** Nothing here is a built APK. GitHub Actions performs all real pinned GLSL/SPIR-V, NDK, Kotlin/Java compilation, and full APK assembly. **Do not run any scripts manually**, build a previous APK again, modify `dev`, or commit/push runtime source outside the explicitly approved handoff.
 
@@ -18,7 +18,20 @@
 2. **Stage 2**: Upload **only** `.github/workflows/build-26933-change-aware.yml`, exactly at that path.
 3. **Stage 3**: Upload **only** `TRIGGER_26933.txt`, then commit those three upload stages together on `experimental-clean-photon-rebuild`. One 26933 workflow triggers and runs the entire guarded build.
 
-**Exact commit message:** `Photon 26933 V1: B SR ON LKR physical-clip and white-balanced highlight fade, preserve successful 26932 B OFF SDR-UHDR`
+**Exact commit message:** `Photon 26933 V1 R2: B SR ON clip-white fix, original LKR binaries from verified 26932 artifact (no RawLens API)`
+
+## 26933 V1 R2 dependency-stage correction (NO RUNTIME SOURCE CHANGES FROM V1)
+
+The first 26933 run `43646333796` failed before GLSL/NDK/Kotlin/Java compile at the historical
+`prepare_26931_rawlens_binaries.py` external unauthenticated RawLens GitHub release API call (HTTP 403).
+This R2 package uses the **same exact successful 26932 Actions artifact**, authenticated by
+run/commit/artifact/TAR/APK/workflow/builder SHA as before, to extract the **four ORIGINAL
+RawLens 2.2.86 binaries already packaged in the successfully built 26932 APK**.
+It verifies the full prior APK SHA-256 and the SHA-256 of every native original library
+for ARM64 and armeabi-v7a, and reuses the exact inherited 26931 ELF/JNI/in-APK checks.
+No external RawLens API request, no previous APK compilation, no APK upload to Git, no
+native/vendor/runtime shader changes, no weakening of historical real compiler checks.
+The new verifier and receipt are Stage 1 infrastructure only.
 
 ## One intentional runtime correction
 
@@ -30,7 +43,7 @@
 ## Fail-closed Actions checks
 
 - Exact prior **successful** Actions artifact identity, published ZIP SHA, compiled TAR SHA, actual builder/workflow SHA and prior APK SHA; strict 2,048-path full manifest, 2,046 unchanged protected files; full-index forward/reverse and separate rollback from the actual 26932 compiled source. The workflow **never fetches, reconstructs, or rebuilds any earlier source base**.
-- Six packaging corruption/missing executable/missing workflow/unlisted source tests plus an executable GLSL reserved-word `coherent` negative test.
+- Seven packaging corruption/missing executable/missing workflow/unlisted source tests plus an executable GLSL reserved-word `coherent` negative test.
 - Runtime B-only selection and sampler/clip/WB uniforms, physical 2× clip indexing, sensor/CFA mask orientation, numerical near-white/color-light regressions, and exact source-compiled ESSL300/310 and optimized/validated OpenGL SPIR-V with **pinned glslang 16.5.0**.
 - Preserve targeted historical 26886/26887, 26903 receipt, 26904 V1/V2 SPIR-V/CMake, 26925, and 26930/26931/26932 sealed source and failure regressions. Retrieve and reconstruct **ONLY 26932 successful compiled source** (never another earlier base); its successful NDK/GLSL/Kotlin/Java receipts are verified by SHA. Compile all five currently relevant GLES shaders with real glslang and optimize/validate SPIR-V. Both original RawLens native ABIs are verified; original Gradle/CMake unchanged.
 - **Exactly ONE new 26933** Android Gradle dual-ABI NDK, Kotlin, Java, assembleDebug and APK integrity/sha checks. **26932 APK is NOT rebuilt.** Exactly one published APK+compiled candidate TAR artifact.
