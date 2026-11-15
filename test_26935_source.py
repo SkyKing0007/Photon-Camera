@@ -21,7 +21,7 @@ def main():
  ver=content('app/version.properties')
  contracts={
  'capture':(capture,('iris26856FrozenExperiment','mMotion26575SuperResAtShutter','Iris26935BOnProcessingRelay','mMotion26636HeicAtShutter',
-                 'iris26593Plan.normalTargetFrames > 0','mIris26935BOnAcquisition','IRIS_26935_NO_POST_LKR_DEFERRED_SHUTTER_REPLAY','processExecutor.execute','RejectedExecutionException','finishIfMissing',
+                 'iris26593Plan.normalTargetFrames > 0','iris26593Plan.iris26935BOnJpegAtShutter','final boolean iris26935BOnJpegAtShutter =','mIris26935BOnAcquisition','IRIS_26935_NO_POST_LKR_DEFERRED_SHUTTER_REPLAY','processExecutor.execute','RejectedExecutionException','finishIfMissing',
                  'Iris26935BOnSession.isActive()','IRIS_26713_CAPTURE_RECIPE_OWNER_ENDS_AT_PHYSICAL_BATCH')),
  'session':(session,('WeakReference<Listener>','static long activeToken','if (!active || token != activeToken)',
                 'if (active) throw new IllegalStateException','active = false','unsubscribe')),

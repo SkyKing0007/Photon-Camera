@@ -1,7 +1,69 @@
 #!/usr/bin/env python3
 """Compile and exercise real 26935 Java session/relay through javac/JVM, not strings-only mock."""
-import pathlib,shutil,subprocess,sys,tempfile
+import pathlib,shutil,subprocess,sys,tempfile,re
 from build_26935_incremental import R,fail
+
+def test_actual_capture_scope(root):
+ # Reproduce the exact 26935 completion-method Java expression in a standalone
+ # real javac fixture. V1's shutter-local variable was invisible in this method
+ # but the old relay-only host test never compiled CaptureController itself.
+ capture=(root/'app/src/main/java/com/particlesdevs/photoncamera/capture/CaptureController.java').read_text()
+ required=(
+   'final boolean iris26935BOnJpegAtShutter;',
+   'boolean iris26935BOnJpegAtShutter,',
+   'this.iris26935BOnJpegAtShutter = iris26935BOnJpegAtShutter;',
+   'final boolean iris26935BOnJpegAtShutter =',
+   'mIris26935BOnAcquisition = iris26935BOnJpegAtShutter;',
+   'iris26856FrozenExperiment.id,\n                iris26935BOnJpegAtShutter,',
+   'iris26593Plan.iris26935BOnJpegAtShutter',
+ )
+ for part in required:
+  if part not in capture:fail('immutable capture-time owner absent '+part)
+ start=capture.find('private void finalizeMotionZslCapture(')
+ end=capture.find('private void captureStillPicture()',start)
+ if start<0 or end<start:fail('cannot determine separate immutable-batch handoff method')
+ finalizer=capture[start:end]
+ match=list(re.finditer(r'final boolean iris26935BOnJpeg\s*=\s*.*?;',finalizer,flags=re.S))
+ if len(match)!=1:fail('duplicate or missing B ON immutable completion expression')
+ expr=match[0].group(0)
+ if 'iris26856FrozenExperiment' in expr or 'PhotonCamera.getSettings()' in expr or 'mMotion26575SuperResAtShutter' in expr:
+  fail('cross-method shutter local/mutable settings leaked into processing method')
+ if not re.search(r'iris26593Plan\.iris26935BOnJpegAtShutter',expr):
+  fail('completion must use frozen per-shot B ON JPEG owner')
+ java_template='''public final class Iris26935CaptureScopeSmoke {
+  static final class Motion26593CapturePlan {
+    final boolean iris26935BOnJpegAtShutter;
+    final int normalTargetFrames;
+    Motion26593CapturePlan(boolean b,int n){this.iris26935BOnJpegAtShutter=b;this.normalTargetFrames=n;}
+  }
+  static boolean tested(Motion26593CapturePlan iris26593Plan) {
+  EXPR_HERE
+    return iris26935BOnJpeg;
+  }
+  public static void main(String[] args) {
+    if (!tested(new Motion26593CapturePlan(true,15))) throw new AssertionError("B ON 15 RAW lost");
+    if (tested(new Motion26593CapturePlan(false,15))) throw new AssertionError("B OFF leaked");
+    if (tested(new Motion26593CapturePlan(true,0))) throw new AssertionError("no NORMALs leaked");
+    System.out.println("PASS actual 26935 CaptureController cross-method frozen owner real javac+java");
+  }
+}
+'''
+ with tempfile.TemporaryDirectory(prefix='26935_capture_scope_') as tmp:
+  t=pathlib.Path(tmp);file=t/'Iris26935CaptureScopeSmoke.java'
+  def compile_expr(statement):
+   file.write_text(java_template.replace('EXPR_HERE',statement))
+   return subprocess.run(['javac','-encoding','UTF-8','-d',str(t),str(file)],capture_output=True,text=True)
+  success=compile_expr(expr)
+  if success.returncode:fail('CaptureController completion expression real javac failed '+success.stderr[-1200:])
+  run=subprocess.run(['java','-ea','-cp',str(t),'Iris26935CaptureScopeSmoke'],capture_output=True,text=True)
+  if run.returncode:fail('capture frozen owner runtime regression '+run.stderr[-1000:])
+  print(run.stdout.strip())
+  # Explicit historical V1 regression: real javac must reject the exact
+  # out-of-scope shutter variable which failed the user's 26935 V1 Actions.
+  bad=compile_expr('final boolean iris26935BOnJpeg = iris26856FrozenExperiment == null && iris26593Plan.normalTargetFrames > 0;')
+  if bad.returncode==0 or 'cannot find symbol' not in bad.stderr or 'iris26856FrozenExperiment' not in bad.stderr:
+   fail('historical 26935 V1 out-of-scope Java variable accepted by host compile')
+  print('PASS historical 26935 V1 Java scope compilation error reproduced and rejected')
 
 def main():
  root=R if '--live' in sys.argv else R/'handoff_payload_26935'
@@ -102,6 +164,7 @@ public class Iris26935Host {
   p=subprocess.run(['java','-ea','-cp',str(t/'classes'),'com.particlesdevs.photoncamera.capture.Iris26935Host'],capture_output=True,text=True)
   if p.returncode:fail('real Java 26935 ownership regression failed '+p.stderr[-1300:])
   print(p.stdout.strip())
+  test_actual_capture_scope(root)
 if __name__=='__main__':
  try:main()
  except Exception as e:print(str(e),file=sys.stderr);sys.exit(1)

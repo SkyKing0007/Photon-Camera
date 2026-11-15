@@ -9727,6 +9727,9 @@ private long mMotionUnifiedLastUpdateMs = 0L;
         final long cameraHealthGeneration;
         final String physicalCameraId;
         final String reconstructionExperiment26856;
+        /* IRIS_26935_FROZEN_B_ON_JPEG_CAPTURE_OWNER: immutable across the
+         * capture->processing method boundary and later settings changes. */
+        final boolean iris26935BOnJpegAtShutter;
         final boolean iris26906BOffAllNormal;
         final boolean alternativeHighlight26912;
         final float previewHighlightP99526912;
@@ -9751,6 +9754,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 Motion26598PreShutterNormals preShutter,
                 long cameraHealthGeneration, String physicalCameraId,
                 String reconstructionExperiment26856,
+                boolean iris26935BOnJpegAtShutter,
                 boolean iris26906BOffAllNormal,
                 boolean alternativeHighlight26912, float previewHighlightP99526912,
                 int frozenAfMode, float frozenFocusDistance) {
@@ -9774,6 +9778,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
             this.cameraHealthGeneration = cameraHealthGeneration;
             this.physicalCameraId = physicalCameraId == null ? "" : physicalCameraId;
             this.reconstructionExperiment26856 = reconstructionExperiment26856;
+            this.iris26935BOnJpegAtShutter = iris26935BOnJpegAtShutter;
             this.iris26906BOffAllNormal = iris26906BOffAllNormal;
             this.alternativeHighlight26912 = alternativeHighlight26912;
             this.previewHighlightP99526912 = previewHighlightP99526912;
@@ -11220,11 +11225,12 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                         com.particlesdevs.photoncamera.app.PhotonCamera.getApplicationContextStatic(),
                         iris26593NormalReference == null ? physicalID : iris26754PhysicalCameraId(iris26593NormalReference),
                         com.particlesdevs.photoncamera.settings.PreferenceKeys.getCameraID());
-        mIris26935BOnAcquisition =
+        final boolean iris26935BOnJpegAtShutter =
                 iris26856FrozenExperiment ==
                         com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855
                 && mMotion26575SuperResAtShutter
                 && PhotonCamera.getSettings().rawSaver != 2;
+        mIris26935BOnAcquisition = iris26935BOnJpegAtShutter;
         if (mIris26935BOnAcquisition) {
             // No old deferred-shutter intent may survive into this 15-RAW LKR batch.
             mMotion26598DeferredShutter.set(false);
@@ -11329,6 +11335,7 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 iris26593StartMs, iris26593TimeoutMs,
                 iris26598PreShutterNormals, mIris26548CameraHealthGeneration, physicalID,
                 iris26856FrozenExperiment.id,
+                iris26935BOnJpegAtShutter,
                 iris26905BOffAllNormal,
                 iris26912AltHighlightsAtShutter, iris26912PreviewP995,
                 mPreviewAFMode, mFocus);
@@ -12169,13 +12176,11 @@ private long mMotionUnifiedLastUpdateMs = 0L;
                 + (iris26593Plan.normalFramesAtPress < iris26593Plan.normalTargetFrames));
 
         /* IRIS_26486_MOTIONBATCH_SOLE_PROCESSING_OWNER */
-        /* IRIS_26935_CAPTURE_FROZEN_B_ON_ONLY: never infer this ownership from
-         * mutable settings at completion. The original LKR/15-RAW batch is unchanged. */
+        /* IRIS_26935_CAPTURE_FROZEN_B_ON_ONLY: use the immutable plan's
+         * shutter-time B/SR-ON/JPEG eligibility, never a local variable from
+         * another method or mutable settings during the 15-RAW LKR handoff. */
         final boolean iris26935BOnJpeg =
-                iris26856FrozenExperiment == com.particlesdevs.photoncamera.settings.Iris26856ABSettings.Mode.AMAZE_26855
-                && mMotion26575SuperResAtShutter
-                /* DNG-only mode intentionally has no JPEG publication. */
-                && PhotonCamera.getSettings().rawSaver != 2
+                iris26593Plan.iris26935BOnJpegAtShutter
                 && iris26593Plan.normalTargetFrames > 0;
         final Iris26935BOnProcessingRelay iris26935Relay = iris26935BOnJpeg
                 ? new Iris26935BOnProcessingRelay(cameraEventsListener, mMotion26636HeicAtShutter) : null;

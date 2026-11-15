@@ -27,7 +27,7 @@ ADDED={
  'app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnSession.java',
  'app/src/main/java/com/particlesdevs/photoncamera/capture/Iris26935BOnProcessingRelay.java',
 }
-STAGE1_FILES=['README_PHOTON_26935_V1.md', '26935_LOCAL_VERIFICATION.txt', '26935_COMMIT_MESSAGE.txt', 'build_26935_incremental.py', 'test_26935_source.py', 'test_26935_guard_host.py', 'test_26935_patch_proof.py', 'test_26935_sealed_negatives.py', 'test_26935_workflow_refs.py', 'compile_26935_shaders.sh', 'prepare_26935_lkr_from_successful_26934.py', '26935_FORWARD_FULLINDEX.patch', '26935_ROLLBACK_FULLINDEX.patch', '26935_BASE_26934_FULL_APP.sha256', '26935_EXPECTED_FULL_APP.sha256', '26935_PROTECTED_SOURCE.sha256', '26935_CHANGED_RUNTIME_ALLOWLIST.txt', '26935_ADDED_RUNTIME_PATHS.txt', '26935_DELETED_RUNTIME_PATHS.txt', '26935_EXPECTED_ACTION_EXECUTABLES.txt', '26935_V1_STAGE_1_UPLOAD_PATHS.txt', '26935_V1_STAGE_2_UPLOAD_PATHS.txt', '26935_V1_STAGE_3_UPLOAD_PATHS.txt']
+STAGE1_FILES=['README_PHOTON_26935_V2.md', '26935_LOCAL_VERIFICATION.txt', '26935_COMMIT_MESSAGE.txt', 'build_26935_incremental.py', 'test_26935_source.py', 'test_26935_guard_host.py', 'test_26935_patch_proof.py', 'test_26935_sealed_negatives.py', 'test_26935_workflow_refs.py', 'compile_26935_shaders.sh', 'prepare_26935_lkr_from_successful_26934.py', '26935_FORWARD_FULLINDEX.patch', '26935_ROLLBACK_FULLINDEX.patch', '26935_BASE_26934_FULL_APP.sha256', '26935_EXPECTED_FULL_APP.sha256', '26935_PROTECTED_SOURCE.sha256', '26935_CHANGED_RUNTIME_ALLOWLIST.txt', '26935_ADDED_RUNTIME_PATHS.txt', '26935_DELETED_RUNTIME_PATHS.txt', '26935_EXPECTED_ACTION_EXECUTABLES.txt', '26935_V2_STAGE_1_UPLOAD_PATHS.txt', '26935_V2_STAGE_2_UPLOAD_PATHS.txt', '26935_V2_STAGE_3_UPLOAD_PATHS.txt']
 
 def fail(msg):raise RuntimeError('26935 BLOCKED: '+str(msg))
 def sha(path):
@@ -80,7 +80,7 @@ def seal():
  wf='.github/workflows/build-26935-change-aware.yml';tr='TRIGGER_26935.txt'
  need=set(STAGE1_FILES)|{wf,tr}|{'handoff_payload_26935/'+p for p in ch|ad}
  if set(sealed)!=need:fail('missing/unlisted handoff paths '+str(sorted(need-set(sealed)))+' extras '+str(sorted(set(sealed)-need)))
- stages=[(R/f'26935_V1_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
+ stages=[(R/f'26935_V2_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
  if stages[0]!=sorted((set(sealed)|{'26935_HANDOFF_HASHES.sha256'})-{wf,tr}) or stages[1]!=[wf] or stages[2]!=[tr]:fail('three-stage upload scope invalid')
  staged={p.relative_to(R/'handoff_payload_26935').as_posix() for p in (R/'handoff_payload_26935').rglob('*') if p.is_file()}
  if staged!=ch|ad:fail('missing/unused overlay files '+str(staged))
