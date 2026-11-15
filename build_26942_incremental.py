@@ -18,7 +18,7 @@ NBASE=NFILES=2050;NCHANGE=2;NPROTECTED=2048
 REQUIRED={'app/version.properties',
  'app/src/main/cpp/iris26864/bridge/Iris26888BOffHdrqCoordinator.cpp'}
 STAGE1_FILES=[
- 'README_PHOTON_26942_V1.md','26942_LOCAL_VERIFICATION.txt','26942_COMMIT_MESSAGE.txt',
+ 'README_PHOTON_26942_V2.md','26942_LOCAL_VERIFICATION.txt','26942_COMMIT_MESSAGE.txt',
  'build_26942_incremental.py','test_26942_source.py','test_26942_native_host.py','test_26942_shader_contract.py',
  'compile_26942_shaders.sh',
  'test_26942_patch_proof.py','test_26942_sealed_negatives.py','test_26942_workflow_refs.py',
@@ -28,8 +28,8 @@ STAGE1_FILES=[
  '26942_PROTECTED_SOURCE.sha256','26942_CHANGED_RUNTIME_ALLOWLIST.txt',
  '26942_ADDED_RUNTIME_PATHS.txt','26942_DELETED_RUNTIME_PATHS.txt',
  '26942_EXPECTED_ACTION_EXECUTABLES.txt',
- '26942_V1_STAGE_1_UPLOAD_PATHS.txt','26942_V1_STAGE_2_UPLOAD_PATHS.txt',
- '26942_V1_STAGE_3_UPLOAD_PATHS.txt']
+ '26942_V2_STAGE_1_UPLOAD_PATHS.txt','26942_V2_STAGE_2_UPLOAD_PATHS.txt',
+ '26942_V2_STAGE_3_UPLOAD_PATHS.txt']
 
 def fail(msg):raise RuntimeError('26942 BLOCKED: '+str(msg))
 def sha(path):
@@ -84,7 +84,7 @@ def seal():
  wf='.github/workflows/build-26942-change-aware.yml';trigger='TRIGGER_26942.txt'
  wanted=set(STAGE1_FILES)|{wf,trigger}|{'handoff_payload_26942/'+p for p in ch}
  if set(sealed)!=wanted:fail('sealed file set differs '+str(sorted(wanted^set(sealed))))
- st=[(R/f'26942_V1_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
+ st=[(R/f'26942_V2_STAGE_{i}_UPLOAD_PATHS.txt').read_text().splitlines() for i in (1,2,3)]
  if st[0]!=sorted((wanted|{'26942_HANDOFF_HASHES.sha256'})-{wf,trigger}) or st[1]!=[wf] or st[2]!=[trigger]:fail('three-stage upload sequence differs')
  overlay={p.relative_to(R/'handoff_payload_26942').as_posix() for p in (R/'handoff_payload_26942').rglob('*') if p.is_file()}
  if overlay!=ch:fail('overlay paths unexpectedly changed')

@@ -18,6 +18,9 @@
 #include <utility>
 namespace rawr::raw_gpu_pipeline {
 thread_local std::optional<std::array<float,8>> iris26912BOffNoiseOverride;
+// Linked to the unchanged 26941 B-OFF Vulkan executor (same namespace).
+// 26942 V1 NDK failure regression: never use the TLS guard without a declaration.
+extern thread_local bool iris26941BOffHdrqLazyPoolReset;
 namespace {
 constexpr std::uint32_t kTimestampQueryCapacity = 64u;
 void check(VkResult r, const char* what) {

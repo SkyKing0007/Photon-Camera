@@ -29,7 +29,7 @@ def main():
    mutate('mutated Vulkan frequency chunk scheduler',p,p.read_bytes()+b'\n// MODIFIED')
    p=t/'test_26942_shader_contract.py';mutate('missing shader validator',p,b'')
    p=t/'26942_CHANGED_RUNTIME_ALLOWLIST.txt';mutate('unexpected source changed',p,p.read_bytes()+b'app/src/main/cpp/native/INVALID.cpp\n')
-   p=t/'26942_V1_STAGE_2_UPLOAD_PATHS.txt';mutate('missing actual workflow',p,b'.github/workflows/WRONG.yml\n')
+   p=t/'26942_V2_STAGE_2_UPLOAD_PATHS.txt';mutate('missing actual workflow',p,b'.github/workflows/WRONG.yml\n')
    p=t/'26942_EXPECTED_ACTION_EXECUTABLES.txt';mutate('missing actual script reference',p,p.read_bytes().replace(b'compile_26942_shaders.sh',b'compile_26942_fake.sh'))
    p=t/'26942_HANDOFF_HASHES.sha256';mutate('missing hash manifest entry',p,p.read_bytes().replace(b'test_26942_source.py',b'unreferenced_absent.py'))
    m.seal()

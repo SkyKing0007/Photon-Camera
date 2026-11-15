@@ -36,6 +36,16 @@ def main():
  if not ('if (batchPadMerge26942) {' in f and '            } else {\n                const bool aligns =' in f):fail('original split branch absent')
  if 'vkQueueWaitIdle' in f.split('IRIS_26942_B_OFF_FREQUENCY_CHUNK_FUSION',1)[1].split('            if (pass == 3u) {',1)[0]:
   fail('B OFF optimization added new GPU-idle fence')
+ # NDK V1 failure: this B OFF coordinator TU must declare (not define)
+ # the TLS switch exported from the protected 26941 Vulkan executor TU.
+ declaration='// Linked to the unchanged 26941 B-OFF Vulkan executor (same namespace).\n// 26942 V1 NDK failure regression: never use the TLS guard without a declaration.\nextern thread_local bool iris26941BOffHdrqLazyPoolReset;\n'
+ key='thread_local std::optional<std::array<float,8>> iris26912BOffNoiseOverride;\n'
+ if s.count(declaration)!=1 or s.count('extern thread_local bool iris26941BOffHdrqLazyPoolReset;')!=1:
+  fail('26942 V1 undeclared native TLS symbol regression')
+ if s.index(declaration)!=s.index(key)+len(key):
+  fail('TLS declaration not at known 26941 native coordinator namespace scope')
+ if s.index('namespace rawr::raw_gpu_pipeline {')>s.index(declaration) or s.index(declaration)>s.index('namespace {'):
+  fail('TLS declaration outside external RAWR pipeline namespace')
  if live:
   exact(R,'26942_EXPECTED_FULL_APP.sha256','live 26942 source authority')
   p=BASE/SHADOW
@@ -44,7 +54,7 @@ def main():
   z=prev.index('            if (pass == 3u) {',a)
   aa=s.index(marker,s.index('BurstRunResult AndroidBurstCoordinator::runHdrPlusFrequency('))
   zz=s.index('            if (pass == 3u) {',aa)
-  if prev[:a]!=s[:aa] or prev[z:]!=s[zz:]:fail('outside B OFF per-companion scheduling was altered')
+  if prev[:a]!=s[:aa].replace(declaration,'',1) or prev[z:]!=s[zz:]:fail('outside B OFF per-companion scheduling was altered')
   protected_old=prev[a:z]
   branch=s[s.index(fallback,aa)+len('            } else {\n'):zz]
   # Guarded else has one additional closing brace for the if/else; remove
